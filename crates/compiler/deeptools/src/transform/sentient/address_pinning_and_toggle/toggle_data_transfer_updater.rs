@@ -79,10 +79,150 @@
 //! | `e551_updateConstantMutableAddr` | 551 | 4 | 29 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2009` |
 
 
-// crustify:todo: e276_updateImmutableAddr
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1936  (12 body lines, level 1)
-//   original  : const EvaluatedValue &ToggleDataTransferUpdater::updateImmutableAddr()
-//   calls     : e009_createOffsetValue
+use super::looping_chain_mutable_addr_descriptor::TransferEnd;
+use super::{DataTransferDescriptor, ToggleDataTransferUpdater, create_offset_value};
+use crate::formats::Bits;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{Op, Val, sentient};
+use crate::transform::sentient::analyses::{EvaluatedValue, PinningSchemeManager};
+
+impl ToggleDataTransferUpdater {
+    /// Replaces: e276_updateImmutableAddr
+    ///
+    /// Pins the transfer's immutable address: the closest pinned address to the toggling PAIR
+    /// (`:1939-1941`) becomes `op`'s immutable-addr operand, and the pair's own answer is handed back
+    /// for the mutable half to re-base against.
+    ///
+    /// ⛔ BOTH ADDRESSES, NOT `getBaseAddr()`: the one-address `findClosestPinnedAddr` is a degenerate
+    /// `X == Y` of this call (`Analyses/AddressPinningScheme.h:208-219`) and would minimise the wrong
+    /// distance for a toggle. `element_size` is in BITS (`:229-232`), and `ty` is
+    /// `mutable_addr_[0].get().getType()`, which is what `createOffsetValue` builds with (`:1029`).
+    pub fn update_immutable_addr(
+        &self,
+        dtd: &DataTransferDescriptor,
+        op: &mut Op,
+        end: TransferEnd,
+        ty: ScalarTy,
+        ps_manager: &impl PinningSchemeManager,
+        element_size: Bits,
+    ) -> EvaluatedValue {
+        // `*dtd_.getBaseAddrList()[0], *dtd_.getBaseAddrList()[1]` (`:1940`) — the toggle's X and Y.
+        let [ev_x, ev_y] = match dtd.base_addrs.as_slice() {
+            [ev_x, ev_y, ..] => [*ev_x, *ev_y],
+            addrs => todo!(
+                "updateImmutableAddr: `getBaseAddrList()[1]` on a toggle descriptor holding {} \
+                 base address(es) (AddressPinningAndToggle.cpp:1940)",
+                addrs.len()
+            ),
+        };
+        let new_immut_addr_ev =
+            ps_manager.find_closest_pinned_addr(ev_x, ev_y, dtd.region, element_size);
+        // `immutable_addr_.assign(createOffsetValue(&dtd_.getOperation(), new_immut_addr_ev))`.
+        *immutable_addr_mut(op, end) = create_offset_value(new_immut_addr_ev, ty);
+        new_immut_addr_ev
+    }
+}
+
+/// THE IMMUTABLE-ADDR OPERAND AS A PLACE — what `immutable_addr_.assign(v)` (`:1943`) writes through,
+/// `mlir::MutableOperandRange` being a reference into the op the descriptor describes.
+///
+/// ⛔ THE THREE OPS `collectDataTransfers` ADMITS (`:1400-1402`) AND NO OTHER, which is why the stop
+/// names that filter rather than `getMutableAndImmutableAddr`'s wider `DT_CHECK`.
+fn immutable_addr_mut(op: &mut Op, end: TransferEnd) -> &mut Val {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { immutable_addr, .. }
+            | sentient::Op::ReceiveAndStore { immutable_addr, .. },
+        ) => immutable_addr,
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src_immutable_addr,
+            dst_immutable_addr,
+            ..
+        }) => match end {
+            TransferEnd::Src => src_immutable_addr,
+            TransferEnd::Dst => dst_immutable_addr,
+        },
+        _ => todo!(
+            "updateImmutableAddr: `immutable_addr_` on {op:?}, which \
+             `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>` rejects \
+             (AddressPinningAndToggle.cpp:1400-1402)"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Elements;
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
+    use crate::transform::sentient::analyses::RegionSite;
+
+    /// 276/656 — the pinned address chosen for the PAIR is handed back, and the transfer's immutable
+    /// address is the offset value built for it. ⛔ `create_offset_value` is
+    /// `EvaluatedValue::buildOffsetValue`, out of campaign scope, so the assignment stops there — the
+    /// choice of address is what this can check.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e276_pins_the_toggling_pair_and_then_needs_the_out_of_scope_offset_builder() {
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn find_closest_pinned_addr(
+                &self,
+                ev_x: EvaluatedValue,
+                ev_y: EvaluatedValue,
+                region: RegionSite,
+                element_size: Bits,
+            ) -> EvaluatedValue {
+                assert_eq!((ev_x, ev_y), (EvaluatedValue(7), EvaluatedValue(9)));
+                assert_eq!(region, RegionSite::ProgramUnitBody);
+                assert_eq!(element_size, Bits(16));
+                EvaluatedValue(21)
+            }
+        }
+
+        let dtd = DataTransferDescriptor {
+            pattern_desc: None,
+            base_addrs: vec![EvaluatedValue(7), EvaluatedValue(9)],
+            region: RegionSite::ProgramUnitBody,
+        };
+        let mut op = Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr: Val(1),
+            immutable_addr: Val(2),
+            increment: Val(3),
+            consumer: SendEnd::to_self(Val(98)),
+            result: Val(4),
+            extent: sentient::Extent {
+                total_elements: Elements(64),
+                element_size: Bits(16),
+                chunk_size: Elements(1),
+                chunk_stride: Elements(1),
+                burst_size: Elements(1),
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        });
+        let updater = ToggleDataTransferUpdater {
+            toggle_sub: super::super::ToggleSub::of(Val(5)),
+        };
+        updater.update_immutable_addr(
+            &dtd,
+            &mut op,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            &StatedScheme,
+            Bits(16),
+        );
+    }
+}
 
 // crustify:todo: e550_updateVariableOffsetCalculation
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1990  (17 body lines, level 4)

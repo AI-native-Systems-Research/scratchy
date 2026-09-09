@@ -1891,6 +1891,11 @@ pub enum Op {
         /// ports without treating it as a compute, then removes the attribute (`:703`) — so a dummy
         /// MAC that lost this flag is port-assigned as if it computed something.
         data_transfer_only: bool,
+        /// `isDataWeight` — a DISCARDABLE attribute (no `.td` field), set by
+        /// `AnnotateMacXRFWtPtrRange` (`AnnotateMacXRFWtRange.cpp:110`) on an mx-precision PT MAC:
+        /// whether this MAC's XRF WRITE pointer lands in the data-weight range (`< 64`) or the
+        /// scale-weight range. `None` is the un-annotated MAC, whose range ProgIR lowering derives.
+        is_data_weight: Option<bool>,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -3105,11 +3110,18 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             xrf_read_incr,
             xrf_write_incr,
             data_transfer_only,
+            is_data_weight,
             dbg_name,
         } => {
             let mut specific = vec![attr("mode", &quoted(mode.spelling()))];
             if *data_transfer_only {
                 specific.push(attr("DataTransferOnly", "true"));
+            }
+            if let Some(is_data_weight) = is_data_weight {
+                specific.push(attr(
+                    "isDataWeight",
+                    if *is_data_weight { "true" } else { "false" },
+                ));
             }
             if *xrf_read_incr != 0 {
                 specific.push(attr("xrfReadIncr", &format!("{xrf_read_incr} : i32")));

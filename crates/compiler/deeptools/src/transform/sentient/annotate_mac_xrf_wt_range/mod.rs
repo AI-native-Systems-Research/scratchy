@@ -78,10 +78,140 @@
 //! | `e429_runOnOperation` | 429 | 2 | 40 | `dcc/src/Transform/Sentient/AnnotateMacXRFWtRange.cpp:116` |
 
 
-// crustify:todo: e284_annotateMacOp
-//   authority : dcc/src/Transform/Sentient/AnnotateMacXRFWtRange.cpp:66  (48 body lines, level 1)
-//   original  : void AnnotateMacXRFWtPtrRangePass::annotateMacOp( sentient::MacOp fma_op, XRFRegisterAnalyzer *xrf_reg_analyzer)
-//   calls     : e252_size
+use crate::islands::sentient::dialects::{Op, sentient};
+use crate::transform::sentient::analyses::{MinMax, XrfRegisterAnalyzer};
+
+/// Replaces: e284_annotateMacOp
+///
+/// Sets `isDataWeight` on an mx-precision PT MAC that reads N-link into `opC` and zero into A or B:
+/// its XRF WRITE pointer's constant range decides data weights (`< 64`) from scale weights (`:104`).
+///
+/// ⛔ NO POINTERS IS A `return`, NOT `false` (`:88-95`): the pass runs before
+/// `LoopSplittingAndUnrolling`, so an un-annotated MAC is the range being left to ProgIR lowering —
+/// writing `Some(false)` there would state the scale range for a MAC nobody measured.
+pub(crate) fn annotate_mac_op(fma_op: &mut Op, xrf_reg_analyzer: &mut impl XrfRegisterAnalyzer) {
+    let Op::Sentient(sentient::Op::VectorMac {
+        xrf_write_ptr,
+        op_a,
+        op_b,
+        op_c,
+        compute_precision,
+        is_data_weight,
+        ..
+    }) = fma_op
+    else {
+        return;
+    };
+    if !matches!(
+        compute_precision,
+        sentient::Precision::Mxfp8 | sentient::Precision::Mxfp4 | sentient::Precision::Mxint4
+    ) || !(op_a.port == sentient::Port::Zero || op_b.port == sentient::Port::Zero)
+        || op_c.port != sentient::Port::North
+    {
+        return;
+    }
+    if !matches!(
+        op_c.precision,
+        sentient::Precision::Fp4 | sentient::Precision::Fp8
+    ) {
+        panic!(
+            "DT_CHECK(N-link has to be in fp4/fp8 precision) (`AnnotateMacXRFWtRange.cpp:79-81`): {:?}",
+            op_c.precision
+        );
+    }
+    // `fma_op.getPointers()[0]` — the WRITE pointer, which is `$pointers` front (`:89`).
+    let Some(wt_ptr_result) = *xrf_write_ptr else {
+        return;
+    };
+    let min_val = xrf_reg_analyzer.min_max_val_if_constant(wt_ptr_result, MinMax::Min);
+    let max_val = xrf_reg_analyzer.min_max_val_if_constant(wt_ptr_result, MinMax::Max);
+    let (Some(min_val), Some(max_val)) = (min_val, max_val) else {
+        panic!(
+            "DT_CHECK(min_val.has_value() && max_val.has_value()) (`AnnotateMacXRFWtRange.cpp:103`): {min_val:?}, {max_val:?}"
+        );
+    };
+    let data_weight = min_val < 64;
+    if data_weight != (max_val < 64) {
+        panic!(
+            "DT_CHECK(XRF-related SSA variable has values in both data and scale ranges) \
+             (`AnnotateMacXRFWtRange.cpp:105-108`): {min_val}..={max_val}"
+        );
+    }
+    *is_data_weight = Some(data_weight);
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::sentient::dialects::Val;
+    use crate::islands::sentient::dialects::sentient::{
+        FmaMode, Operand, Port, Precision, ResultPorts, UnrollFactor,
+    };
+    use crate::transform::sentient::analyses::MinMax;
+
+    /// A `mxfp8` MAC reading zero into B and N-link `fp8` into C, writing XRF through `%7`.
+    fn mac(xrf_write_ptr: Option<Val>, op_c_port: Port) -> Op {
+        Op::Sentient(sentient::Op::VectorMac {
+            mask: None,
+            xrf_write_ptr,
+            xrf_read_ptr: None,
+            results: vec![Val(1)],
+            op_a: Operand::from(Port::Xrf),
+            op_b: Operand::from(Port::Zero),
+            op_c: Operand {
+                precision: Precision::Fp8,
+                ..Operand::from(op_c_port)
+            },
+            result: ResultPorts::default(),
+            mode: FmaMode::FusedMulAdd,
+            compute_precision: Precision::Mxfp8,
+            fold_mode: None,
+            unroll_factor: UnrollFactor::X1,
+            xrf_read_incr: 0,
+            xrf_write_incr: 0,
+            data_transfer_only: false,
+            is_data_weight: None,
+            dbg_name: None,
+        })
+    }
+
+    fn annotation(op: &Op) -> Option<bool> {
+        match op {
+            Op::Sentient(sentient::Op::VectorMac { is_data_weight, .. }) => *is_data_weight,
+            _ => None,
+        }
+    }
+
+    /// A `[8, 40]` write pointer is the data range; the same MAC without pointers, and one whose
+    /// `opC` is not N-link, are both left un-annotated for ProgIR lowering to decide.
+    #[test]
+    fn e284_annotates_a_constant_data_range_and_leaves_the_pointerless_mac_alone() {
+        struct StatedAnalyzer;
+
+        impl XrfRegisterAnalyzer for StatedAnalyzer {
+            fn min_max_val_if_constant(&mut self, value: Val, end: MinMax) -> Option<i64> {
+                assert_eq!(value, Val(7));
+                Some(match end {
+                    MinMax::Min => 8,
+                    MinMax::Max => 40,
+                })
+            }
+        }
+
+        let mut annotated = mac(Some(Val(7)), Port::North);
+        annotate_mac_op(&mut annotated, &mut StatedAnalyzer);
+        assert_eq!(annotation(&annotated), Some(true));
+
+        let mut pointerless = mac(None, Port::North);
+        annotate_mac_op(&mut pointerless, &mut StatedAnalyzer);
+        assert_eq!(annotation(&pointerless), None);
+
+        let mut not_north = mac(Some(Val(7)), Port::West);
+        annotate_mac_op(&mut not_north, &mut StatedAnalyzer);
+        assert_eq!(annotation(&not_north), None);
+    }
+}
+
 
 // crustify:todo: e429_runOnOperation
 //   authority : dcc/src/Transform/Sentient/AnnotateMacXRFWtRange.cpp:116  (40 body lines, level 2)

@@ -11,9 +11,11 @@
 //! a constant for its result.
 
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
+use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{Op, Val};
+use crate::transform::sentient::canonicalize_xrf_pointers::XrfMinExpr;
 
 /// AN `EvaluatedValue` THE EXPRESSION EVALUATOR OWNS — an identity, not a value.
 ///
@@ -235,6 +237,17 @@ pub trait ExpressionEvaluator {
         )
     }
 
+    /// `EvaluatedValue::operator==` (`Analyses/ExpressionEvaluatorUtils.h:63`) — whether two arena
+    /// entries hold the SAME value, which is not the handle identity `==` on [`EvaluatedValue`] gives:
+    /// `*val == *(*it_next)->getLB()` (`CFGSimplificationSentientLevel.cpp:438`) asks about a value
+    /// the evaluator has just summed, and only the analysis can compare the two.
+    fn values_equal(&mut self, lhs: EvaluatedValue, rhs: EvaluatedValue) -> bool {
+        let _ = (lhs, rhs);
+        todo!(
+            "EvaluatedValue::operator== (Analyses/ExpressionEvaluatorUtils.h:63) — out of campaign scope"
+        )
+    }
+
     /// `ExpressionEvaluator::evaluateMultiplyByConst`
     /// (`Analyses/ExpressionEvaluatorUtils.h:285`) — `ev * by`.
     fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
@@ -303,6 +316,107 @@ impl ExpressionEvaluator for OutOfScopeEvaluator {
         )
     }
 }
+
+/// WHICH REGION OF WHICH REGION-OWNING OP A DATA TRANSFER SITS IN — the reference's
+/// `std::pair<mlir::Operation *, int> region_op_and_region_num` (`AddressPinningAndToggle.cpp:1937`),
+/// the key a DYNAMIC pinning scheme looks the unit up by when an address is unit-independent
+/// (`Analyses/AddressPinningScheme.h:196-198`, `:225-227`).
+///
+/// ⛔ AN ENUM BECAUSE ONLY TWO OPS EVER OWN ONE HERE, and `collectDataTransfers` is where both are
+/// spelled: the `dataflow.program_unit` itself with region `0` (`:1319`) and a
+/// `uniform.uniformize_regions` with the region's own index (`:1306`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RegionSite {
+    /// `collectDataTransfers(comp, op, memory_unit, unit, 0)` (`:1319`) — the unit's own body.
+    ///
+    /// ⭐ THE DEFAULT, because a descriptor built without one describes a transfer the walk found
+    /// directly in the unit (`:1319` is the walk's OWN fall-through, `:1306` its uniformized branch).
+    #[default]
+    ProgramUnitBody,
+    /// `collectDataTransfers(comp, oper, memory_unit, uniform_op, i)` (`:1306`) — region `i` of the
+    /// `uniform.uniformize_regions` at position `at` of the unit body, position being this island's op
+    /// identity (see [`OpId`]).
+    UniformizedRegion {
+        /// Where that `uniform.uniformize_regions` sits.
+        at: BodyIndex,
+        /// Which of its regions — `i`, the walk's own region index.
+        region: RegionNum,
+    },
+}
+
+/// A POSITION IN A UNIT BODY — `uniform_op`, named the way this island names an op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyIndex(pub usize);
+
+/// WHICH REGION OF ITS OWNER — the `int` half of `region_op_and_region_num`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionNum(pub usize);
+
+/// THE `const PinningSchemeManager&` A PASS IS HANDED — a trait, for the reason
+/// [`ExpressionEvaluator`] is one: `Analyses/AddressPinningScheme.{h,cpp}` is not in this campaign and
+/// a test must still be able to state which pinned address it chose.
+pub trait PinningSchemeManager {
+    /// `PinningSchemeManager::findClosestPinnedAddr(ev_x, ev_y, region_op_and_region_num,
+    /// element_size_in_bits)` (`Analyses/AddressPinningScheme.h:229-233`) — the closest pinned
+    /// address, in ELEMENT addresses, for a pair of toggling addresses.
+    ///
+    /// ⭐ THE ONE-ADDRESS OVERLOAD (`:208-219`) IS THIS SAME CALL WITH `X == Y`, by its own body, and
+    /// it is out-of-scope code rather than a campaign unit — so a caller with one address passes it
+    /// twice instead of there being a second method here.
+    fn find_closest_pinned_addr(
+        &self,
+        ev_x: EvaluatedValue,
+        ev_y: EvaluatedValue,
+        region: RegionSite,
+        element_size: Bits,
+    ) -> EvaluatedValue {
+        let _ = (ev_x, ev_y, region, element_size);
+        todo!(
+            "PinningSchemeManager::findClosestPinnedAddr (Analyses/AddressPinningScheme.h:229) — out of campaign scope"
+        )
+    }
+}
+
+/// THE ONE CRATE IMPLEMENTATION, for the reason [`OutOfScopeEvaluator`] is the evaluator's.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopePinningSchemeManager;
+
+impl PinningSchemeManager for OutOfScopePinningSchemeManager {}
+
+/// THE `XRFRegisterAnalyzer *` A PT PASS IS HANDED — a trait for the same reason
+/// [`ExpressionEvaluator`] is one: the analyzer is not in this campaign, and a test must still be
+/// able to state its answers.
+///
+/// ⛔ `Analyses/XRFRegisterAnalyzer.{h,cpp}` IS OUT OF CAMPAIGN SCOPE, so the crate's only
+/// implementation is [`OutOfScopeXrfRegisterAnalyzer`] and every method of it is a `todo!`.
+pub trait XrfRegisterAnalyzer {
+    /// `getMinMaxValIfConstant(value, min)` (`Analyses/XRFRegisterAnalyzer.h:97`) — the smallest or
+    /// largest value `value` is known to take, `None` when it is not a constant range.
+    fn min_max_val_if_constant(&mut self, value: Val, end: MinMax) -> Option<i64> {
+        let _ = (value, end);
+        todo!(
+            "XRFRegisterAnalyzer::getMinMaxValIfConstant (Analyses/XRFRegisterAnalyzer.h:97) — out of campaign scope"
+        )
+    }
+
+    /// `XRFRegisterAnalyzer(unit)` then `getValToMinExprMap()` — every xrf-related value whose
+    /// minimal expression the analyzer computed for THIS unit, each with `getValIfConstant`'s answer.
+    ///
+    /// ⭐ THE PAIR IS [`XrfMinExpr`], which `replace_const_xrf_expressions` already declared for the
+    /// same reason: the analyzer is out of scope, so both of its answers arrive as data.
+    fn val_to_min_expr(&mut self, unit: &[Op]) -> Vec<XrfMinExpr> {
+        let _ = unit;
+        todo!(
+            "XRFRegisterAnalyzer::getValToMinExprMap (Analyses/XRFRegisterAnalyzer.h:76) — out of campaign scope"
+        )
+    }
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the analyzer is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeXrfRegisterAnalyzer;
+
+impl XrfRegisterAnalyzer for OutOfScopeXrfRegisterAnalyzer {}
 
 /// AN INSTRUCTION COUNT FROM `InstructionEstimatorImpl` — the reference's `int`.
 ///

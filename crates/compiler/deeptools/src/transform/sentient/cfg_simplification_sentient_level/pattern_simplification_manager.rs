@@ -1740,6 +1740,19 @@ mod unit_tests {
             self.intern(text)
         }
 
+        fn evaluate_sum(
+            &mut self,
+            lhs: EvaluatedValueId,
+            rhs: EvaluatedValueId,
+        ) -> EvaluatedValueId {
+            let text = format!("({} + {})", self.text(lhs), self.text(rhs));
+            self.intern(text)
+        }
+
+        fn evaluate_value(&mut self, value: Val) -> EvaluatedValueId {
+            self.intern(format!("%{}", value.0))
+        }
+
         fn equal(&self, lhs: EvaluatedValueId, rhs: EvaluatedValueId) -> bool {
             self.text(lhs) == self.text(rhs)
         }

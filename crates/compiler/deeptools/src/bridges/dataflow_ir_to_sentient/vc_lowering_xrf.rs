@@ -1508,6 +1508,7 @@ mod unit_tests {
             xrf_read_incr: 0,
             xrf_write_incr: 0,
             data_transfer_only: false,
+            is_data_weight: None,
             dbg_name: None,
         }
     }
@@ -2952,6 +2953,7 @@ pub fn insert_dummy_mac_op(vals: &mut Values) -> XrfPtrAdvance {
                 xrf_read_incr: 0,
                 xrf_write_incr: 0,
                 data_transfer_only: false,
+                is_data_weight: None,
                 dbg_name: Some("LoweringXRF dummy Mac".to_owned()),
             }),
         ],

@@ -96,11 +96,12 @@
 use core::num::NonZeroI64;
 use core::ops::{AddAssign, Mul, Sub, SubAssign};
 
+pub(crate) mod pattern_simplification_manager;
+
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{Op, Val};
-
-pub(crate) mod pattern_simplification_manager;
+use pattern_simplification_manager::OpPath;
 
 /// `EnableNonZeroStrideSeqSimplifications` (`:76-80`) — *"Allow replacing fixed non-zero stride
 /// sequences of values yielded by conditionals with iterator arguments."*, `cl::init(false)`.
@@ -196,6 +197,16 @@ impl Sub for IntervalMarker {
 
     fn sub(self, rhs: IntervalMarker) -> IntervalDelta {
         IntervalDelta(self.0 - rhs.0)
+    }
+}
+
+impl Sub<IntervalDelta> for IntervalMarker {
+    type Output = IntervalMarker;
+
+    /// `seq->getIntervalMarker().value() - interval_step * (length_remaining - 1)` (`:427-429`) — the
+    /// marker of the FIRST element of a monotone sequence, the stored one being the LAST's.
+    fn sub(self, rhs: IntervalDelta) -> IntervalMarker {
+        IntervalMarker(self.0 - rhs.0)
     }
 }
 
@@ -495,26 +506,148 @@ impl TableSlice {
     pub(crate) const fn set_prev_val(&mut self, prev_val: EvaluatedValueId) {
         self.prev_val = prev_val;
     }
+
+    /// Replaces: e286_recomputeAsDefaultVals
+    ///
+    /// Every sequence of this slice re-expressed as default values: padding (length 0) is dropped, a
+    /// monotone sequence of length 1 or stride 0 is simply relabelled (`:405-410`), and any other
+    /// monotone sequence becomes one length-1 default sequence PER ELEMENT.
+    ///
+    /// ⛔ THE LAST ELEMENT IS ABSORBED INTO THE **NEXT** SEQUENCE, NOT THE NEW LIST (`:436-440`): when
+    /// its value equals that sequence's LB the next sequence grows LEFTWARD, which is why its interval
+    /// marker is deliberately left alone and why the walk must be able to mutate a sequence it has not
+    /// reached yet. ⭐ AND THE MARKERS RUN FORWARDS FROM `marker - step * (length - 1)`: the stored
+    /// marker is the LAST element's (`:425-429`).
+    pub(crate) fn recompute_as_default_vals(&mut self, evaluator: &mut impl ExpressionEvaluator) {
+        let zero = evaluator.get_constant(0);
+        let mut new_sequences: Vec<Sequence> = Vec::new();
+        let mut index = 0usize;
+        while index < self.sequences.len() {
+            let mut seq = self.sequences[index];
+            // `if (seq->getLength() == 0)` (`:402-405`) — a padding sequence is dropped.
+            if seq.length == Entries(0) {
+                index += 1;
+                continue;
+            }
+            // `*seq->getStride() == evaluator_.getConstant(0)` (`:408-409`) — a CONTENT comparison,
+            // so it is the analysis's `operator==` and not this file's handle identity.
+            let stride_is_zero = match seq.stride {
+                Some(stride) => evaluator.equal(stride, zero),
+                None => false,
+            };
+            if seq.kind == SequenceKind::MonotoneSequence
+                && (seq.length == Entries(1) || stride_is_zero)
+            {
+                seq.kind = SequenceKind::DefaultValue;
+            }
+            if seq.kind == SequenceKind::DefaultValue {
+                new_sequences.push(seq);
+                index += 1;
+                continue;
+            }
+            // `DT_CHECK(stride && ..)` and `DT_CHECK(getIntervalMarker().has_value() && ..)`
+            // (`:418-423`) — a non-template sequence has both.
+            let (Some(mut val), Some(stride), Some(marker)) =
+                (seq.lb, seq.stride, seq.interval_marker)
+            else {
+                panic!(
+                    "DT_CHECK(Expect non-template sequences to have a valid stride and interval \
+                     marker) (`CFGSimplificationSentientLevel.cpp:418-423`): {seq:?}"
+                );
+            };
+            let interval_step = seq.interval_stride();
+            let mut interval_marker = marker - interval_step * Entries(seq.length.0 - 1);
+            for _ in 0..seq.length.0 - 1 {
+                new_sequences.push(Sequence::new(
+                    val,
+                    zero,
+                    Entries(1),
+                    interval_marker,
+                    interval_step,
+                    SequenceKind::DefaultValue,
+                ));
+                val = evaluator.evaluate_sum(val, stride);
+                interval_marker += interval_step * Entries(1);
+            }
+            // `auto it_next = std::next(it_seq, 1)` (`:437`) — the sequence AFTER this one, in the
+            // list still being walked, which is why this grows `self.sequences[index + 1]`.
+            let absorbed = match self.sequences.get(index + 1).and_then(|next| next.lb) {
+                Some(next_lb) => evaluator.equal(val, next_lb),
+                None => false,
+            };
+            if absorbed {
+                self.sequences[index + 1].increment_length(Entries(1));
+            } else {
+                new_sequences.push(Sequence::new(
+                    val,
+                    zero,
+                    Entries(1),
+                    interval_marker,
+                    interval_step,
+                    SequenceKind::DefaultValue,
+                ));
+            }
+            index += 1;
+        }
+        self.sequences = new_sequences;
+    }
+}
+
+/// WHICH ARM OF AN `if` A LEAF IS — `isThenNode()` / `isElseNode()` (`Analysis/ConditionalTree.hpp:98`,
+/// `:100`), whose third case is `llvm_unreachable("should only be called from Then/Else node")`
+/// (`:103`) and therefore not a state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IfRegion {
+    /// `getParentNode()->getThenRegion()`.
+    Then,
+    /// `getParentNode()->getElseRegion()`.
+    Else,
+}
+
+/// THE BLOCK OF CODE AT A LEAF — `CondNode::getBlock()` (`Analysis/ConditionalTree.hpp:96-106`).
+///
+/// ⭐ IT IS NOT AN ARBITRARY BLOCK. `getBlock()` returns `&getParentNode()->getThenRegion().front()`
+/// or the else region's front, so an if-op path plus which arm names it exactly — and this island has
+/// no `Block *` to hold instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockPath {
+    /// The `sentient.if` owning the region — `getParentNode()`'s operation.
+    pub(crate) if_op: OpPath,
+    /// Which of its two regions.
+    pub(crate) region: IfRegion,
+}
+
+/// WHAT `createTableEntryAtIdx` READS OFF A `dcc::CFGSCondNode *leaf` — and nothing else.
+///
+/// ⛔ `Analyses/CFGSSentientLevelConditionalTree.*` IS OUT OF CAMPAIGN SCOPE, so this is the leaf's
+/// PROJECTION rather than the node: exactly `getResults()` (`:469-471`) and `getBlock()` (`:472`),
+/// which is every field of the entry the reference builds from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Leaf {
+    /// `getResults()` (`Analyses/CFGSSentientLevelConditionalTree.hpp:77`) — what this leaf yields.
+    pub(crate) results: Vec<Val>,
+    /// `getBlock()` — `None` for a node with children, which the reference gives `nullptr`
+    /// (`Analysis/ConditionalTree.hpp:97`).
+    pub(crate) block: Option<BlockPath>,
 }
 
 /// ONE LEAF'S ENTRY IN THE TABLE — `class TableEntry` (`:456`).
-///
-/// ⛔ `Block *block_` (`:460`) IS NOT DECLARED YET, and neither is `getBlock` (`:479`, an excluded
-/// field accessor). It is `leaf->getBlock()` on a `dcc::CFGSCondNode` (`:472`), which arrives with
-/// `e288_createTableEntryAtIdx`; declare it there rather than guess an island spelling for it now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableEntry {
     /// `ev_` (`:458`) — `None` is the reference's dummy `nullptr` for a conditional with no results,
     /// which still gets a table so dead branches can be removed (`:463-467`).
     ev: Option<EvaluatedValueId>,
+    /// `block_` (`:460`) — the block of code at this leaf, read through `getBlock` (`:479`, an
+    /// excluded field accessor).
+    pub(crate) block: Option<BlockPath>,
 }
 
 impl TableEntry {
     /// `TableEntry(dcc::CFGSCondNode *leaf, ExpressionEvaluator &evaluator)` (`:468-472`), whose
     /// `ev_` is `nullptr` when the leaf yields nothing and `evaluator.evaluateValue(..)` otherwise —
     /// both the leaf and the evaluator being out of campaign scope, that choice is the caller's.
-    pub(crate) const fn new(ev: Option<EvaluatedValueId>) -> TableEntry {
-        TableEntry { ev }
+    pub(crate) const fn new(ev: Option<EvaluatedValueId>, block: Option<BlockPath>) -> TableEntry {
+        TableEntry { ev, block }
     }
 
     /// Replaces: e029_getEV
@@ -581,6 +714,60 @@ impl Table {
     pub(crate) fn is_full(&self) -> bool {
         self.entries.iter().all(Option::is_some)
     }
+
+    /// Replaces: e287_getTableEntryAtIdx
+    ///
+    /// The entry at `idx`, `None` where the reference returns its `nullptr` — a tuple of IV values no
+    /// leaf covered (`:512-515`).
+    ///
+    /// ⛔ THE OUTER `None` AND THE INNER ONE ARE DIFFERENT ANSWERS and only one is a state: an index
+    /// past the end is `DT_CHECK_MSG(idx < table_entries_.size(), "Expect valid index to table.")`
+    /// (`:513`), which stops, while a hole is what every caller's own `DT_CHECK_MSG` tests (`:2187`).
+    #[must_use]
+    pub(crate) fn table_entry_at_idx(&self, idx: TableIndex) -> Option<&TableEntry> {
+        match usize::try_from(idx.0)
+            .ok()
+            .filter(|at| *at < self.entries.len())
+        {
+            Some(at) => self.entries[at].as_ref(),
+            None => panic!(
+                "DT_CHECK(idx < table_entries_.size()) Expect valid index to table. \
+                 (`CFGSimplificationSentientLevel.cpp:513`): {idx:?} of {}",
+                self.entries.len()
+            ),
+        }
+    }
+
+    /// Replaces: e288_createTableEntryAtIdx
+    ///
+    /// The entry for `leaf` at `idx` (`:517-521`) — its value is the evaluation of the leaf's FIRST
+    /// result, and a leaf yielding nothing gets the reference's dummy (`:469-471`).
+    ///
+    /// ⛔ THE BOUNDS `DT_CHECK` COMES FIRST, BEFORE THE ENTRY IS BUILT (`:518`), so an out-of-range
+    /// index never reaches the evaluator; and this OVERWRITES, exactly as `table_entries_[idx] = new
+    /// TableEntry(..)` does — the reference leaks the old entry rather than refusing.
+    pub(crate) fn create_table_entry_at_idx(
+        &mut self,
+        idx: TableIndex,
+        leaf: &Leaf,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) {
+        let Some(at) = usize::try_from(idx.0)
+            .ok()
+            .filter(|at| *at < self.entries.len())
+        else {
+            panic!(
+                "DT_CHECK(idx < table_entries_.size()) Expect valid index to table. \
+                 (`CFGSimplificationSentientLevel.cpp:518`): {idx:?} of {}",
+                self.entries.len()
+            )
+        };
+        let ev = leaf
+            .results
+            .first()
+            .map(|result| evaluator.evaluate_value(*result));
+        self.entries[at] = Some(TableEntry::new(ev, leaf.block.clone()));
+    }
 }
 
 /// THE OUT-OF-SCOPE `ExpressionEvaluator` (`Analyses/ExpressionEvaluatorUtils.h:196`) AS A SEAM —
@@ -605,6 +792,15 @@ pub(crate) trait ExpressionEvaluator {
 
     /// `const EvaluatedValue &evaluateSub(const EvaluatedValue &, const EvaluatedValue &)` (`:260`).
     fn evaluate_sub(&mut self, lhs: EvaluatedValueId, rhs: EvaluatedValueId) -> EvaluatedValueId;
+
+    /// `const EvaluatedValue &evaluateSum(const EvaluatedValue &, const EvaluatedValue &)` (`:242`) —
+    /// `*val = &evaluator_.evaluateSum(*val, *seq->getStride())` (`:433`), one step along a monotone
+    /// sequence being expanded.
+    fn evaluate_sum(&mut self, lhs: EvaluatedValueId, rhs: EvaluatedValueId) -> EvaluatedValueId;
+
+    /// `const EvaluatedValue &evaluateValue(Value)` (`:219`) — an SSA value's evaluated form, which is
+    /// what a table entry holds for its leaf's result (`:470`).
+    fn evaluate_value(&mut self, value: Val) -> EvaluatedValueId;
 
     /// `const EvaluatedValue &evaluateMultiplyByConst(const EvaluatedValue &, int64_t)` (`:285`) —
     /// the factor is always a count of table entries at these call sites.
@@ -645,21 +841,6 @@ pub(crate) struct Builders<'a> {
     pub(crate) values: &'a mut Values,
 }
 
-// crustify:todo: e286_recomputeAsDefaultVals
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:396  (58 body lines, level 1)
-//   original  : void recomputeAsDefaultVals()
-//   calls     : e023_incrementLength, e025_getIntervalStride
-
-// crustify:todo: e287_getTableEntryAtIdx
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:512  (4 body lines, level 1)
-//   original  : TableEntry *getTableEntryAtIdx(dcc::WidestIntType idx) const
-//   calls     : e252_size
-
-// crustify:todo: e288_createTableEntryAtIdx
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:517  (4 body lines, level 1)
-//   original  : void createTableEntryAtIdx(dcc::WidestIntType idx, dcc::CFGSCondNode *leaf)
-//   calls     : e252_size
-
 // crustify:todo: e594_runOnOperation
 //   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:713  (201 body lines, level 5)
 //   original  : void CFGSimplificationSentientLevelPass::runOnOperation()
@@ -668,9 +849,82 @@ pub(crate) struct Builders<'a> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
 
     fn ev(id: u32) -> EvaluatedValueId {
         EvaluatedValueId::new(id)
+    }
+
+    /// THE OUT-OF-SCOPE EVALUATOR AS AN ARENA THAT NEVER REUSES AN ENTRY — which is the point:
+    /// `getConstant(0)` and a sum that happens to BE zero get different ids, so `equal` answers about
+    /// contents and [`EvaluatedValueId`]'s own `==` about identity.
+    ///
+    /// ⛔ TEST ONLY, like `pattern_simplification_manager`'s `FakeEvaluator`: `Analyses/` is outside
+    /// this campaign and no implementation of [`ExpressionEvaluator`] may ship in it.
+    #[derive(Debug, Default)]
+    struct StatedEvaluator {
+        arena: Vec<i64>,
+    }
+
+    impl StatedEvaluator {
+        fn intern(&mut self, value: i64) -> EvaluatedValueId {
+            self.arena.push(value);
+            EvaluatedValueId::new(
+                u32::try_from(self.arena.len() - 1).expect("a fixture arena is small"),
+            )
+        }
+
+        fn value_of(&self, id: EvaluatedValueId) -> i64 {
+            self.arena[id.0 as usize]
+        }
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn get_constant(&mut self, value: i64) -> EvaluatedValueId {
+            self.intern(value)
+        }
+
+        fn evaluate_sum(
+            &mut self,
+            lhs: EvaluatedValueId,
+            rhs: EvaluatedValueId,
+        ) -> EvaluatedValueId {
+            let sum = self.value_of(lhs) + self.value_of(rhs);
+            self.intern(sum)
+        }
+
+        fn evaluate_value(&mut self, value: Val) -> EvaluatedValueId {
+            self.intern(i64::from(value.0))
+        }
+
+        fn equal(&self, lhs: EvaluatedValueId, rhs: EvaluatedValueId) -> bool {
+            self.value_of(lhs) == self.value_of(rhs)
+        }
+
+        fn evaluate_sub(
+            &mut self,
+            _lhs: EvaluatedValueId,
+            _rhs: EvaluatedValueId,
+        ) -> EvaluatedValueId {
+            todo!("no unit of this batch subtracts two evaluated values")
+        }
+
+        fn evaluate_multiply_by_const(
+            &mut self,
+            _value: EvaluatedValueId,
+            _factor: Entries,
+        ) -> EvaluatedValueId {
+            todo!("no unit of this batch scales an evaluated value")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _value: EvaluatedValueId,
+            _ty: ScalarTy,
+            _builders: &mut Builders<'_>,
+        ) -> Val {
+            todo!("no unit of this batch materialises an offset")
+        }
     }
 
     fn stride(step: i64) -> IntervalStride {
@@ -761,8 +1015,8 @@ mod unit_tests {
     /// (so its dead branches can still be removed) has none.
     #[test]
     fn ev_is_absent_for_a_leaf_that_yields_nothing() {
-        assert_eq!(TableEntry::new(Some(ev(5))).ev(), Some(ev(5)));
-        assert_eq!(TableEntry::new(None).ev(), None);
+        assert_eq!(TableEntry::new(Some(ev(5)), None).ev(), Some(ev(5)));
+        assert_eq!(TableEntry::new(None, None).ev(), None);
     }
 
     /// e030 — full means EVERY index has an entry. A result-less entry still counts: the reference
@@ -772,10 +1026,156 @@ mod unit_tests {
         let mut table = Table::new(TableSize(2), ScalarTy::Int(1), ScalarTy::Index);
         assert!(!table.is_full());
 
-        table.entries[0] = Some(TableEntry::new(None));
+        table.entries[0] = Some(TableEntry::new(None, None));
         assert!(!table.is_full());
 
-        table.entries[1] = Some(TableEntry::new(Some(ev(1))));
+        table.entries[1] = Some(TableEntry::new(Some(ev(1)), None));
+        assert!(table.is_full());
+    }
+
+    /// e286 — a length-0 pad is dropped, a monotone run of 3 from 10 by 5 becomes `10` and `15` in the
+    /// new list while its LAST element (20) is ABSORBED by the following default sequence, whose length
+    /// grows to 3 and whose marker does not move. The markers run FORWARDS from `30 - 2*(3-1)`.
+    #[test]
+    fn e286_expands_a_monotone_run_and_absorbs_its_last_element_leftward() {
+        let mut evaluator = StatedEvaluator::default();
+        let ten = evaluator.get_constant(10);
+        let five = evaluator.get_constant(5);
+        let twenty = evaluator.get_constant(20);
+
+        let mut slice = TableSlice::new(TableIndex(0), IndexStride(1), Entries(6), ten, true);
+        slice.sequences = vec![
+            Sequence::new(
+                ten,
+                five,
+                Entries(0),
+                IntervalMarker(0),
+                stride(2),
+                SequenceKind::MonotoneSequence,
+            ),
+            Sequence::new(
+                ten,
+                five,
+                Entries(3),
+                IntervalMarker(30),
+                stride(2),
+                SequenceKind::MonotoneSequence,
+            ),
+            Sequence::new(
+                twenty,
+                five,
+                Entries(2),
+                IntervalMarker(40),
+                stride(2),
+                SequenceKind::DefaultValue,
+            ),
+        ];
+
+        slice.recompute_as_default_vals(&mut evaluator);
+
+        assert_eq!(slice.sequences.len(), 3);
+        assert!(
+            slice
+                .sequences
+                .iter()
+                .all(|seq| seq.kind == SequenceKind::DefaultValue)
+        );
+        // The two expanded elements: values 10 and 15, markers 26 then 28.
+        let lbs: Vec<i64> = slice
+            .sequences
+            .iter()
+            .map(|seq| evaluator.value_of(seq.lb.expect("every new sequence has an lb")))
+            .collect();
+        assert_eq!(lbs, vec![10, 15, 20]);
+        assert_eq!(
+            slice
+                .sequences
+                .iter()
+                .map(|seq| seq.interval_marker)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(IntervalMarker(26)),
+                Some(IntervalMarker(28)),
+                Some(IntervalMarker(40)),
+            ]
+        );
+        assert_eq!(
+            slice
+                .sequences
+                .iter()
+                .map(|seq| seq.length)
+                .collect::<Vec<_>>(),
+            vec![Entries(1), Entries(1), Entries(3)]
+        );
+    }
+
+    /// e287 — a filled index answers with its entry, an index no leaf covered answers `None`, and an
+    /// index past the end is the reference's `DT_CHECK`.
+    #[test]
+    fn e287_answers_a_hole_with_none_and_stops_past_the_end() {
+        let mut table = Table::new(TableSize(2), ScalarTy::Int(1), ScalarTy::Index);
+        table.entries[1] = Some(TableEntry::new(Some(ev(3)), None));
+
+        assert_eq!(table.table_entry_at_idx(TableIndex(0)), None);
+        assert_eq!(
+            table
+                .table_entry_at_idx(TableIndex(1))
+                .and_then(TableEntry::ev),
+            Some(ev(3))
+        );
+    }
+
+    /// e287 — the bounds check, which stops rather than answering.
+    #[test]
+    #[should_panic(expected = "Expect valid index to table.")]
+    fn e287_stops_on_an_index_past_the_end() {
+        let _ = Table::new(TableSize(2), ScalarTy::Int(1), ScalarTy::Index)
+            .table_entry_at_idx(TableIndex(2));
+    }
+
+    /// e288 — the entry holds the evaluation of the leaf's FIRST result and the leaf's block; a leaf
+    /// yielding nothing gets the reference's dummy value and still records its block, so its dead
+    /// branch can be removed.
+    #[test]
+    fn e288_evaluates_the_first_result_and_keeps_the_leaf_block() {
+        let mut evaluator = StatedEvaluator::default();
+        let mut table = Table::new(TableSize(2), ScalarTy::Int(1), ScalarTy::Index);
+        let block = BlockPath {
+            if_op: OpPath::at(&[(0, 0)]),
+            region: IfRegion::Then,
+        };
+
+        table.create_table_entry_at_idx(
+            TableIndex(0),
+            &Leaf {
+                results: vec![Val(7), Val(8)],
+                block: Some(block.clone()),
+            },
+            &mut evaluator,
+        );
+        table.create_table_entry_at_idx(
+            TableIndex(1),
+            &Leaf {
+                results: Vec::new(),
+                block: Some(block.clone()),
+            },
+            &mut evaluator,
+        );
+
+        let first = table
+            .table_entry_at_idx(TableIndex(0))
+            .expect("just created");
+        // `evaluateValue(getResults().front())` — the FIRST result, so `Val(7)` and not `Val(8)`.
+        assert_eq!(
+            evaluator.value_of(first.ev().expect("the leaf yields results")),
+            7
+        );
+        assert_eq!(first.block, Some(block.clone()));
+        let second = table
+            .table_entry_at_idx(TableIndex(1))
+            .expect("just created");
+        assert_eq!(second.ev(), None);
+        assert_eq!(second.block, Some(block));
         assert!(table.is_full());
     }
 }

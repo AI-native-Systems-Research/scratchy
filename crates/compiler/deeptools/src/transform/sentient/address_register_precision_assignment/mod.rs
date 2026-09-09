@@ -117,6 +117,12 @@ pub enum PrecisionAssigned {
     /// `Operation *` survives an insertion into its own block and a position does not, so the caller
     /// must re-derive the positions it holds; the ones this type keeps are re-keyed for it.
     Substituted(Val),
+    /// `def_op->emitError("Unknown parent op for precision calculation"); signalPassFailure();`
+    /// (`:170-172`) — `val` is a region argument of something that is not a `sentient.for`.
+    ///
+    /// ⭐ CARRIED AS A VALUE for the same reason [`PrecisionAssigned::DifferentPrecisions`] is: the
+    /// reference's failure IS the pass stopping, and no slot was written.
+    UnknownParentOp,
     /// `op->emitError("Different precisions assigned to same SSA"); signalPassFailure();`
     ///
     /// ⭐ CARRIED AS A VALUE BECAUSE THAT IS WHAT THE REFERENCE'S FAILURE IS — the pass stops, and
@@ -305,6 +311,33 @@ impl PrecisionAssignments {
         self.assignments.get(at).map(Vec::as_slice)
     }
 
+    /// Replaces: e283_assignPrecision
+    ///
+    /// Assigns `element_size` to the slot `val` ITSELF occupies on the op that binds it: an iter
+    /// arg's `i + 1` (`:167`) or a result's `i + offset`, `offset = 1 + getNumRegionIterArgs()`
+    /// (`:180-190`) — which is the layout [`PrecisionAssignments::initialize_precision`] gives an op.
+    ///
+    /// ⛔ A `val` THIS BODY DOES NOT BIND IS THE REFERENCE'S `else` ARM, NOT ITS `return false`: the
+    /// only values left are region arguments of something other than a `sentient.for` — the program
+    /// unit's own, or a `uniform` region's — which is `emitError("Unknown parent op for precision
+    /// calculation")` (`:170-173`). Its `return false` is [`PrecisionAssigned::Unchanged`], and
+    /// [`PrecisionAssignments::assign_precision_helper`] is the only thing that reaches it.
+    pub fn assign_precision(
+        &mut self,
+        body: &mut Vec<Op>,
+        values: &mut Values,
+        val: Val,
+        element_size: Bits,
+        user: &OpId,
+    ) -> PrecisionAssigned {
+        match bound_slot(val, body, &[], 0) {
+            Some((at, index)) => {
+                self.assign_precision_helper(body, values, &at, index, element_size, user)
+            }
+            None => PrecisionAssigned::UnknownParentOp,
+        }
+    }
+
     /// EVERY KEY AT OR AFTER `at` IN ITS OWN BLOCK MOVES DOWN ONE — the price of a positional
     /// identity, paid where the insertion happens rather than left for a reader to discover.
     fn shift_keys_at_or_after(&mut self, at: &[u32]) {
@@ -323,6 +356,45 @@ impl PrecisionAssignments {
             })
             .collect();
     }
+}
+
+/// WHERE A VALUE IS BOUND AND WHICH SLOT IS ITS OWN — `isa<BlockArgument>(val)` and
+/// `val.getDefiningOp()` as ONE search, because a position has to be looked for where a pointer is
+/// merely followed. `base` numbers a nested body the way [`op_at`] reads it: region after region.
+///
+/// ⭐ THE ISLAND'S OWN BLOCK-ARGUMENT INDEX **IS** THE REFERENCE'S `i + 1`
+/// ([`crate::islands::sentient::dialects::sentient::block_args`] puts the induction variable at 0),
+/// and `sentient.for` is the only op of this dialect that binds any.
+fn bound_slot(val: Val, scope: &[Op], prefix: &[u32], base: usize) -> Option<(OpId, usize)> {
+    for (position, op) in scope.iter().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(u32::try_from(base + position).unwrap_or_default());
+        if let Op::Sentient(inner) = op
+            && let Some(index) = sentient::block_args(inner)
+                .iter()
+                .position(|arg| *arg == val)
+        {
+            return Some((OpId::at(&path), index));
+        }
+        if let Some(index) = dialects::results(op)
+            .iter()
+            .position(|result| *result == val)
+        {
+            let offset = match op {
+                Op::Sentient(sentient::Op::For { carried, .. }) => 1 + carried.len(),
+                _ => 0,
+            };
+            return Some((OpId::at(&path), index + offset));
+        }
+        let mut region_base = 0usize;
+        for region in dialects::regions_ref(op) {
+            if let Some(found) = bound_slot(val, region, &path, region_base) {
+                return Some(found);
+            }
+            region_base += region.len();
+        }
+    }
+    None
 }
 
 /// The op at a position — this rung's copy of `vc_lowering_pt_masks::op_at`, regions concatenated,
@@ -378,11 +450,6 @@ fn insert_at(block: &mut Vec<Op>, path: &[u32], op: Op) -> Option<Op> {
     }
     Some(op)
 }
-
-// crustify:todo: e283_assignPrecision
-//   authority : dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:164  (31 body lines, level 1)
-//   original  : bool AddressRegisterPrecisionAssignmentPass::assignPrecision(Value val, int element_size, Value &new_val, Operation *user)
-//   calls     : e020_assignPrecisionHelper
 
 // crustify:todo: e428_addToWorkListAndAssignPrecision
 //   authority : dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:204  (10 body lines, level 2)
@@ -512,6 +579,54 @@ mod unit_tests {
         assert_eq!(
             assignments.slots(&OpId::at(&[2])),
             Some(&[Some(Bits(16))][..])
+        );
+    }
+
+    /// 283/656 — a loop-carried address takes the slot AFTER the induction variable's, and the loop's
+    /// own result takes one past every carried value; a `uniform` region argument the loop does not
+    /// bind is the pass's `Unknown parent op` failure and writes no slot.
+    #[test]
+    fn e283_assigns_the_iter_arg_slot_after_the_iv_and_the_result_slot_after_the_carried_values() {
+        let carried = Carried {
+            init: Val(1),
+            arg: Val(2),
+            result: Val(3),
+            reg: Reg {
+                locale: RegType::Lbr,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        };
+        let mut body = vec![Op::Sentient(sentient::Op::For {
+            iv: Val(4),
+            bound: Val(5),
+            carried: vec![carried],
+            dbg_name: None,
+            body: vec![copy(Val(2), Val(6), RegType::Lbr)],
+        })];
+        let mut values = Values::default();
+        let user = OpId::at(&[0, 0]);
+
+        let mut assignments = PrecisionAssignments::default();
+        assignments.initialize_precision(OpId::at(&[0]), &body[0]);
+
+        assert_eq!(
+            assignments.assign_precision(&mut body, &mut values, Val(2), Bits(32), &user),
+            PrecisionAssigned::Assigned
+        );
+        assert_eq!(
+            assignments.assign_precision(&mut body, &mut values, Val(3), Bits(16), &user),
+            PrecisionAssigned::Assigned
+        );
+        // `[iv, arg, result]` — the iv's slot is untouched.
+        assert_eq!(
+            assignments.slots(&OpId::at(&[0])),
+            Some(&[None, Some(Bits(32)), Some(Bits(16))][..])
+        );
+        assert_eq!(
+            assignments.assign_precision(&mut body, &mut values, Val(99), Bits(32), &user),
+            PrecisionAssigned::UnknownParentOp
         );
     }
 }

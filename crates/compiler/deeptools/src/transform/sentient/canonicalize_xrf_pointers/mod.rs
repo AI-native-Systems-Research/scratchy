@@ -84,8 +84,12 @@ use crate::bridges::dataflow_ir_to_sentient::vc_lowering_xrf::{
 };
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::transform::sentient::analyses::XrfRegisterAnalyzer;
+use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 /// WHICH SIDE OF A MARKER'S DEFINITION AN OP GOES ON — the two `OpBuilder` insertion points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,17 +400,52 @@ pub fn replace_const_xrf_expressions<A: Arch>(
     }
 }
 
-// crustify:todo: e296_runOnOperation
-//   authority : dcc/src/Transform/Sentient/CanonicalizeXRFPointers.cpp:172  (33 body lines, level 1)
-//   original  : void CanonicalizeXRFPointersPass::runOnOperation()
-//   calls     : e037_replaceXRFImplicitIncrWithAdd, e038_replaceConstXRFExpressions, e252_size
+/// Replaces: e296_runOnOperation
+///
+/// Canonicalizes the XRF pointers of every PT unit: the implicit increments become explicit adds,
+/// then the constant pointer expressions become constants (`:193-201`).
+///
+/// ⛔ THE DEAD `unit_precision` LOCAL IS NOT DEAD (`:196`): it is
+/// `unit_op.getPrecision().value().str()`, so a PT unit carrying NO precision is a
+/// `bad_optional_access` — the one observable effect of a local nothing reads.
+/// ⭐ `DT_CHECK(getUnits().size() >= 1)` and the `stringToSenComponents` miss are both types here —
+/// [`Units`](crate::islands::dataflow_ir::Units) cannot be empty and [`DfirUnit`] is closed — and
+/// `WalkResult::skip()` needs no expression: a program's units are a flat list on this island.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+    xrf_reg_analyzer: &mut impl XrfRegisterAnalyzer,
+) {
+    let Program {
+        preamble, units, ..
+    } = program;
+    for unit in units.iter_mut() {
+        // `senCompToGenericComp.at(...) == PT` — every PT row is the one generic component.
+        if !matches!(unit.on.kind(), DfirUnit::PtRow(_)) {
+            continue;
+        }
+        if unit.precision.is_none() {
+            panic!(
+                "std::bad_optional_access: `unit_op.getPrecision().value()` on {:?}, a PT unit with \
+                 no precision (`CanonicalizeXRFPointers.cpp:196`)",
+                unit.on.kind()
+            );
+        }
+        replace_xrf_implicit_incr_with_add(preamble, unit, values);
+        let val_to_min_expr = xrf_reg_analyzer.val_to_min_expr(&unit.body);
+        replace_const_xrf_expressions(unit, values, &val_to_min_expr);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
-    use crate::islands::dataflow_ir::Units;
-    use crate::units::DfirUnit;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::dialects::dataflow;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
+    use crate::units::{DfirUnit, Row};
 
     /// A unit running `body` on one PE — the pass reads nothing else off the unit.
     fn unit(body: Vec<Op>) -> ProgramUnit<Dd2> {
@@ -455,6 +494,7 @@ mod unit_tests {
             xrf_read_incr: 3,
             xrf_write_incr: 5,
             data_transfer_only: false,
+            is_data_weight: None,
             dbg_name: None,
         });
         let mut unit = unit(vec![
@@ -580,5 +620,101 @@ mod unit_tests {
                 reader(Val(0), Val(22)),
             ]
         );
+    }
+
+    /// A model and rung, for the same reason [`ProgramUnit`] needs an arch: the pass reads neither.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e296 — the PT row is canonicalized and the LXLU beside it is not visited at all: the analyzer
+    /// is asked about ONE body, and only the PT unit's constant add becomes a constant.
+    #[test]
+    fn e296_canonicalizes_the_pt_unit_and_skips_the_lxlu() {
+        struct StatedAnalyzer {
+            asked: Vec<Vec<Op>>,
+        }
+
+        impl XrfRegisterAnalyzer for StatedAnalyzer {
+            fn val_to_min_expr(&mut self, unit: &[Op]) -> Vec<XrfMinExpr> {
+                self.asked.push(unit.to_vec());
+                vec![XrfMinExpr {
+                    val: Val(20),
+                    constant: Some(7),
+                }]
+            }
+        }
+
+        let add = Op::Sentient(sentient::Op::ScalarAdd {
+            lhs: Val(30),
+            rhs: Val(31),
+            result: Val(20),
+            reg: Some(sentient::Reg {
+                locale: sentient::RegType::XrfRdPtr,
+                index: None,
+            }),
+            ty: ScalarTy::Index,
+            element_size: None,
+        });
+        let lxlu_body = vec![reader(Val(40), Val(41))];
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(0)),
+                    precision: None,
+                    body: lxlu_body.clone(),
+                    arch: core::marker::PhantomData,
+                },
+                vec![ProgramUnit {
+                    on: Units::one(DfirUnit::PtRow(Row::checked(0).expect("row 0")), Val(1)),
+                    precision: Some(dataflow::Precision::Int8),
+                    body: vec![add, reader(Val(20), Val(22))],
+                    arch: core::marker::PhantomData,
+                }],
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+        let mut analyzer = StatedAnalyzer { asked: Vec::new() };
+
+        run_on_operation(&mut program, &mut values, &mut analyzer);
+
+        let units: Vec<&ProgramUnit<Dd2>> = program.units.iter().collect();
+        assert_eq!(units[0].body, lxlu_body);
+        assert_eq!(
+            units[1].body,
+            vec![
+                Op::Sentient(sentient::Op::ScalarConstant {
+                    value: 7,
+                    result: Val(0),
+                    reg_locale: sentient::RegType::Imm,
+                    ty: ScalarTy::Index,
+                    is_symbol: false,
+                }),
+                reader(Val(0), Val(22)),
+            ]
+        );
+        assert_eq!(analyzer.asked.len(), 1);
     }
 }

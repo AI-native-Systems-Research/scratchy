@@ -82,7 +82,7 @@
 use crate::arch::{Arch, Elements};
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::sentient::ProgramUnit;
-use crate::islands::sentient::dialects::{Op, sentient};
+use crate::islands::sentient::dialects::{self as dialects, Op, sentient};
 use crate::units::DfirUnit;
 
 /// A MEMORY OP THIS PASS MAY SPLIT, WITH THE BURST IT CARRIES.
@@ -168,10 +168,50 @@ pub fn split_burst<A: Arch>(
     )
 }
 
-// crustify:todo: e285_runOn
-//   authority : dcc/src/Transform/Sentient/BurstSplitting.cpp:161  (29 body lines, level 1)
-//   original  : void runOn(dataflow::ProgramUnitOp unit, SenComponents comp)
-//   calls     : e021_splitBurst
+/// Replaces: e285_runOn
+///
+/// Splits every burst in the unit that exceeds `max_burst`, in walk order.
+///
+/// ⛔ `LoadAndExtractScalar` IS DELIBERATELY ABSENT (`:166`) — it carries no burst — and that filter
+/// is [`BurstCandidate::of`]. The `emitError` + `signalPassFailure` arm (`:180-183`) is unreachable
+/// from here: [`split_burst`] hands the rewrite to the out-of-scope `burst_utils`, which is where the
+/// reference's failure comes from, so the pass stops there rather than at a `LogicalResult`.
+pub(crate) fn run_on<A: Arch>(unit: &mut ProgramUnit<A>, comp: DfirUnit, max_burst: Elements) {
+    // `DT_CHECK_MSG(max_burst != -1, "Cannot determine max burst size!")` (`:163`).
+    if max_burst == Elements(0) {
+        panic!(
+            "DT_CHECK(max_burst != -1) Cannot determine max burst size! (`BurstSplitting.cpp:163`): \
+             {:?}",
+            unit.on.kind()
+        );
+    }
+    let mut candidates = Vec::new();
+    collect_candidates(&unit.body, &mut Vec::new(), 0, &mut candidates);
+    for candidate in candidates {
+        if candidate.burst_size > max_burst {
+            split_burst(unit, &candidate, comp, max_burst);
+        }
+    }
+}
+
+/// `unit.walk(...)` (`:165`) — every op of the unit, nested ops included, outermost first.
+fn collect_candidates(
+    scope: &[Op],
+    prefix: &mut Vec<u32>,
+    base: usize,
+    out: &mut Vec<BurstCandidate>,
+) {
+    for (position, op) in scope.iter().enumerate() {
+        prefix.push(u32::try_from(base + position).unwrap_or_default());
+        out.extend(BurstCandidate::of(OpId::at(prefix), op));
+        let mut region_base = 0usize;
+        for region in dialects::regions_ref(op) {
+            collect_candidates(region, prefix, region_base, out);
+            region_base += region.len();
+        }
+        prefix.pop();
+    }
+}
 
 // crustify:todo: e430_runOn
 //   authority : dcc/src/Transform/Sentient/BurstSplitting.cpp:191  (21 body lines, level 2)
@@ -187,7 +227,9 @@ pub fn split_burst<A: Arch>(
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
+    use crate::formats::Bits;
     use crate::islands::dataflow_ir::Units;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::Val;
 
     /// The file header's own example: a burst of 264 where 64 is the maximum needs a loop of four
@@ -206,5 +248,64 @@ mod unit_tests {
             burst_size: Elements(264),
         };
         split_burst(&mut unit, &candidate, DfirUnit::L3lu, Elements(64));
+    }
+
+    /// e285 — the walk reaches a transfer NESTED IN A LOOP and splits it at `[1, 0]`, and the
+    /// unbursted `sentient.for` sitting beside it is no candidate at all.
+    #[test]
+    #[should_panic(expected = "path: [1, 0]")]
+    fn e285_splits_the_oversized_burst_nested_in_a_loop() {
+        let transfer = Op::Sentient(sentient::Op::LoadAndStore {
+            src: Val(10),
+            dst: Val(11),
+            src_mutable_addr: Val(12),
+            src_immutable_addr: Val(13),
+            src_inc: Val(14),
+            dst_mutable_addr: Val(15),
+            dst_immutable_addr: Val(16),
+            dst_inc: Val(17),
+            multicast_info: None,
+            results: (Val(18), Val(19)),
+            extent: sentient::Extent {
+                burst_size: Elements(264),
+                ..sentient::Extent::of(Elements(264), Bits(16))
+            },
+            stride: 1,
+            rotate_val: None,
+            shuffle_mode: sentient::ShuffleMode::NoShuffle,
+            src_reg: sentient::Reg {
+                locale: sentient::RegType::Lar,
+                index: None,
+            },
+            dst_reg: sentient::Reg {
+                locale: sentient::RegType::Lbr,
+                index: None,
+            },
+            dir: None,
+            is_ibr_write: false,
+            dbg_name: None,
+        });
+        let mut unit = ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::L3lu, Val(0)),
+            precision: None,
+            body: vec![
+                Op::Sentient(sentient::Op::ScalarConstant {
+                    value: 4,
+                    result: Val(1),
+                    reg_locale: sentient::RegType::Imm,
+                    ty: ScalarTy::Index,
+                    is_symbol: false,
+                }),
+                Op::Sentient(sentient::Op::For {
+                    iv: Val(2),
+                    bound: Val(1),
+                    carried: Vec::new(),
+                    dbg_name: None,
+                    body: vec![transfer],
+                }),
+            ],
+            arch: core::marker::PhantomData,
+        };
+        run_on(&mut unit, DfirUnit::L3lu, Elements(64));
     }
 }

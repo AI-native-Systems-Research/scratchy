@@ -614,6 +614,7 @@ mod unit_tests {
             xrf_read_incr: 0,
             xrf_write_incr: 0,
             data_transfer_only: false,
+            is_data_weight: None,
             dbg_name: None,
         })
     }
@@ -655,6 +656,7 @@ mod unit_tests {
             xrf_read_incr,
             xrf_write_incr,
             data_transfer_only,
+            is_data_weight: None,
             dbg_name,
         })
     }

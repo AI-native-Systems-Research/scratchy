@@ -893,6 +893,7 @@ pub fn pattern_agnostic_fuse_non_compute_ops_helper<A: Arch>(
             xrf_read_incr: 0,
             xrf_write_incr: 0,
             data_transfer_only: false,
+            is_data_weight: None,
             dbg_name: op_dbg_name,
         }));
     } else if use_immcopy {
@@ -1338,6 +1339,7 @@ fn dummy_mac(
         xrf_write_incr: 0,
         // `mac_op->setAttr("DataTransferOnly", builder.getBoolAttr(true));` (`:1341`).
         data_transfer_only: !west_receive,
+        is_data_weight: None,
         // `auto op_dbg_name = dataflow::getDbgNameAttr(op);`
         dbg_name: dbg_name(op).map(str::to_owned),
     });

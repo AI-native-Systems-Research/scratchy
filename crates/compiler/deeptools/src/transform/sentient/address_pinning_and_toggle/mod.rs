@@ -1278,6 +1278,7 @@ mod unit_tests {
     use crate::formats::Bits;
     use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{LocalRegion, Val, sentient};
+    use crate::transform::sentient::analyses::RegionSite;
     use crate::transform::sentient::{ForRef, IterArgIndex};
     use crate::units::Residency;
 
@@ -1347,6 +1348,7 @@ mod unit_tests {
         DataTransferDescriptor {
             pattern_desc,
             base_addrs: (0..base_addrs).map(|i| EvaluatedValue(i as u32)).collect(),
+            region: RegionSite::default(),
         }
     }
 
@@ -1558,6 +1560,7 @@ mod unit_tests {
         DataTransferDescriptor {
             pattern_desc: Some(kind),
             base_addrs: vec![EvaluatedValue(64)],
+            region: RegionSite::default(),
         }
     }
 

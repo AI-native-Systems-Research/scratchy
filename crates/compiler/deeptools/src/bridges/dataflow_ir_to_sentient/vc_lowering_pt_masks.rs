@@ -450,6 +450,7 @@ mod insert_pt_mask_ops_tests {
             xrf_read_incr: 0,
             xrf_write_incr: 0,
             data_transfer_only: false,
+            is_data_weight: None,
             dbg_name: None,
         });
         let mut unit_body = vec![sen::Op::Sentient(sentient::Op::For {
@@ -634,6 +635,7 @@ mod update_loop_mask_tree_tests {
             xrf_read_incr: 0,
             xrf_write_incr: 0,
             data_transfer_only: false,
+            is_data_weight: None,
             dbg_name: None,
         });
         let body = vec![sen::Op::Sentient(sentient::Op::For {

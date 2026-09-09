@@ -90,6 +90,7 @@
 //   calls     : e002_getAllConstants, e015_getInit, e016_ConditionalConstantDescriptor, e252_size, e278_isValid, e279_canBeSimplified, e280_IntegerSequenceDescriptor, e281_DiscreteIntegerSetDescriptor, e282_LoopingChainMutableAddrDescriptor, e407_getInit, e408_getAllConstants, e411_getInit, e414_getInit, e485_getX …
 
 use super::{BaseAddrList, PatternDescriptor};
+use crate::transform::sentient::analyses::RegionSite;
 
 /// ONE DATA TRANSFER'S BASE-ADDRESS STORY — `class DataTransferDescriptor`
 /// (`AddressPinningAndToggle.cpp:632-790`), one per `load_and_send`/`receive_and_store`/
@@ -114,6 +115,10 @@ pub struct DataTransferDescriptor {
     /// `base_addrs_` — the possible constant values `base_addr_` can take (one, or two for a
     /// toggle); the list [`super::ConditionalConstantDescriptor::get_all_constants`] appends into.
     pub base_addrs: BaseAddrList,
+    /// `region_op_` and `region_num_` as one value — `getRegionOp()` (`:760`) and `getRegionNum()`,
+    /// both excluded field accessors, and never read apart: every caller pairs them for
+    /// `findClosestPinnedAddr` (`:1897`, `:1937`, `:2054`, `:2120`). See [`RegionSite`].
+    pub region: RegionSite,
 }
 
 impl DataTransferDescriptor {
@@ -203,6 +208,7 @@ mod unit_tests {
         DataTransferDescriptor {
             pattern_desc: pattern,
             base_addrs: (0..base_addrs).map(EvaluatedValue).collect(),
+            region: RegionSite::default(),
         }
     }
 

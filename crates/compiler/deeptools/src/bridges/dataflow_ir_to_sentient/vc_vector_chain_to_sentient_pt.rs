@@ -471,6 +471,7 @@ fn pt_dummy_mac(
         xrf_read_incr: 0,
         xrf_write_incr: 0,
         data_transfer_only: false,
+        is_data_weight: None,
         dbg_name: dbg_name(op).map(str::to_owned),
     });
     PtMac::Emitted(PtDummyMac {
@@ -868,6 +869,7 @@ pub fn fuse_non_compute_ops<A: Arch>(
                 xrf_read_incr: 0,
                 xrf_write_incr: 0,
                 data_transfer_only: false,
+                is_data_weight: None,
                 dbg_name: dbg_name(op).map(str::to_owned),
             });
 
@@ -1390,6 +1392,7 @@ pub fn fuse_compute_ops<A: Arch>(
                             xrf_read_incr: 0,
                             xrf_write_incr: 0,
                             data_transfer_only: false,
+                            is_data_weight: None,
                             dbg_name: op_dbg_name,
                         })],
                         send_dsts,
@@ -1449,6 +1452,7 @@ pub fn fuse_compute_ops<A: Arch>(
                             xrf_read_incr: 0,
                             xrf_write_incr: 0,
                             data_transfer_only: false,
+                            is_data_weight: None,
                             dbg_name: op_dbg_name,
                         })],
                         send_dsts,
