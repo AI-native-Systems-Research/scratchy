@@ -1169,7 +1169,7 @@ impl VectorOperand {
     /// arm asks the same question of the same input it guards it three ways and then rewrites the
     /// answer: `hasOneUse()`, the input's defining op being in the SAME BLOCK, and
     /// `on_the_fly_conv_precision_ = getPrecisionInString(getElementType(cast_op.getType()))`
-    /// (`:541-556`). This function keeps neither guard and touches neither precision, so a caller that
+    /// (`:541-565`). This function keeps neither guard and touches neither precision, so a caller that
     /// swapped one for the other would report the producer's precision through a multi-use cast.
     /// ⛔ NO CALL SITE IN THE REFERENCE — only the declaration at `VectorOperands.hpp:56`; entry 304
     /// spells the same three lines out inline. Ported for the seam it names, not for a caller.

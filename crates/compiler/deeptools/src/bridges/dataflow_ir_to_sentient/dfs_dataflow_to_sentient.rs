@@ -3371,7 +3371,7 @@ pub enum SyncLowering {
 
 /// The source's family, off the one `type` every source agreed on — ⛔ [`None`] IS
 /// `stringToSenComponents.find(src_unit_name)->second` DEREFERENCING `end()`, which is what a source
-/// that is no sync-capable unit reaches (`:245`, `:397`, `:487`, `:686`).
+/// that is no sync-capable unit reaches (`:245`, `:397`, `:487`, `:685`).
 const fn sync_source(unit: DfirUnit) -> Option<SyncSrc> {
     match unit {
         DfirUnit::L0lu => Some(SyncSrc::L0Lx(L0LxSrc::L0(L0Half::Load))),
@@ -3454,7 +3454,7 @@ pub fn lower_sync_operation(
             values,
         )
         .map(SyncLowering::L0Lx),
-        // `:1968-1973`.
+        // `:1969-1973`.
         DfirOp::Dataflow(dataflow::Op::CreateGroup { .. }) => lower_sync_for_a_group(
             src,
             op,
@@ -3465,7 +3465,7 @@ pub fn lower_sync_operation(
             values,
         )
         .map(SyncLowering::L0Lx),
-        // `:1974-1979` — the map's pairs, which the reference's callee reads off the op itself.
+        // `:1975-1979` — the map's pairs, which the reference's callee reads off the op itself.
         DfirOp::Uniform(uniform::Op::QueryMap { map, .. }) => {
             let Some(DfirOp::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) =
                 defining_op(*map, scope)
@@ -3475,7 +3475,7 @@ pub fn lower_sync_operation(
             lower_sync_for_a_query_map(src, op, pairs, scope, dbg_name, values)
                 .map(SyncLowering::QueryMap)
         }
-        // `return LogicalResult::failure();` (`:1980`) — a destination that is none of the three.
+        // `return LogicalResult::failure();` (`:1981`) — a destination that is none of the three.
         _ => None,
     }
 }

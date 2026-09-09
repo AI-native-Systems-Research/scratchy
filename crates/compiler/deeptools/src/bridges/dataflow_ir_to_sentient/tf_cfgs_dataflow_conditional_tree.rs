@@ -3622,12 +3622,12 @@ pub fn replace_if_op_by_iter_arg(
 /// `affine.if` pair must share an integer set AND have equivalent operands, an `scf.if` pair
 /// equivalent CONDITIONS, and a mixed pair never matches (`:308-309`, the reference's own `else`).
 ///
-/// ⛔ THE AFFINE ARM COMPARES EVERY OPERAND, THE SCF ARM ONLY OPERAND 0 (`:287`, `:304-305`) —
+/// ⛔ THE AFFINE ARM COMPARES EVERY OPERAND, THE SCF ARM ONLY OPERAND 0 (`:287`, `:305-306`) —
 /// `affine.if`'s operands are the set's dims and its symbols, and an `scf.if` has none but the `i1`.
-/// ⛔ A BLOCK-ARG PAIR IS `owner0 == owner1 && idx0 == idx1` (`:295`), WHICH HERE IS `Val` EQUALITY:
+/// ⛔ A BLOCK-ARG PAIR IS `owner0 == owner1 && idx0 == idx1` (`:297`), WHICH HERE IS `Val` EQUALITY:
 /// two distinct [`Val`]s are never one argument of one region — see
 /// [`BlockArgEquivalence::SameOwnerAndIndex`].
-/// ⛔ ONE SIDE A BLOCK ARG AND THE OTHER A RESULT IS A MISMATCH BEFORE ANY COMPARISON (`:296-297`),
+/// ⛔ ONE SIDE A BLOCK ARG AND THE OTHER A RESULT IS A MISMATCH BEFORE ANY COMPARISON (`:298-299`),
 /// which is also what keeps the `getDefiningOp()` on the line after it off a null.
 #[must_use]
 pub fn top_level_conditions_match(
@@ -3637,7 +3637,7 @@ pub fn top_level_conditions_match(
     scope: &[DfirOp],
 ) -> bool {
     match (if_op0, if_op1) {
-        // `:281-301` — both `affine.if`.
+        // `:281-302` — both `affine.if`.
         (
             DfirOp::Affine(affine::Op::If { set: set0, .. }),
             DfirOp::Affine(affine::Op::If { set: set1, .. }),
@@ -3646,7 +3646,7 @@ pub fn top_level_conditions_match(
             if set0 != set1 {
                 return false;
             }
-            // `:287-300` — `llvm::zip(if_op0->getOperands(), if_op1->getOperands())`.
+            // `:287-302` — `llvm::zip(if_op0->getOperands(), if_op1->getOperands())`.
             for (read0, read1) in dfir_op::operands(if_op0)
                 .into_iter()
                 .zip(dfir_op::operands(if_op1))
@@ -3655,19 +3655,19 @@ pub fn top_level_conditions_match(
                     dfir_op::defining_op(read0, scope),
                     dfir_op::defining_op(read1, scope),
                 ) {
-                    // `:293-299` — both block arguments.
+                    // `:292-297` — both block arguments.
                     (None, None) => {
                         if read0 != read1 {
                             return false;
                         }
                     }
-                    // `:300-302` — neither is, so both have a definition to compare.
+                    // `:298-301` — neither is, so both have a definition to compare.
                     (Some(def0), Some(def1)) => {
                         if !ops_are_equivalent(def0, def1, scope, oe.preference, oe.block_args) {
                             return false;
                         }
                     }
-                    // `:300-301` — `is_if0_operand_block_arg || is_if1_operand_block_arg`.
+                    // `:298` — `is_if0_operand_block_arg || is_if1_operand_block_arg`.
                     (Some(_), None) | (None, Some(_)) => return false,
                 }
             }
@@ -3685,7 +3685,7 @@ pub fn top_level_conditions_match(
                 ops_are_equivalent(def0, def1, scope, oe.preference, oe.block_args)
             }
             // ⭐ THE REFERENCE DEREFERENCES A NULL HERE: a condition that is a region argument has no
-            // defining op, and `*if_op0->getOperand(0).getDefiningOp()` (`:304`) is undefined for it.
+            // defining op, and `*if_op0->getOperand(0).getDefiningOp()` (`:305`) is undefined for it.
             _ => false,
         },
         // `:308-309` — a mixed pair, or an operation that is not a conditional at all.
@@ -3744,7 +3744,7 @@ pub fn single_op_branch_to_yield_val(
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// AN `scf.if`, THE ONLY CONDITIONAL LOOP-INVARIANT HOISTING CONSIDERS — `DT_CHECK_MSG(scf_if,
-/// "Expect valid scf::IfOp")` (`:685`) as a minting rule, so an `affine.if` is not an argument.
+/// "Expect valid scf::IfOp")` (`:686`) as a minting rule, so an `affine.if` is not an argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScfConditional<'a> {
     /// The operation, whose two arms are `getRegions()[0]` and `getRegions()[1]`.
@@ -3772,7 +3772,7 @@ impl<'a> ScfConditional<'a> {
 /// `CFGSDataflowConditionalTree::isLoopInvariant` (`:681`) — whether a conditional's condition and
 /// everything its arms yield can be computed outside `parent_for_op`.
 ///
-/// ⛔ AN ARM IS EITHER A LEAF OR EXACTLY ONE NESTED CONDITIONAL (`:706-708`, `:724-726`): a leaf must
+/// ⛔ AN ARM IS EITHER A LEAF OR EXACTLY ONE NESTED CONDITIONAL (`:706-708`, `:725-727`): a leaf must
 /// hold its terminator alone and contributes the value it yields to the worklist, and a non-leaf
 /// recurses AND must hold only `arith.cmpi`, `scf.if`, an index `arith.constant` and `scf.yield`.
 /// ⛔ THE DEPENDENCE IS ON THE **OWNER**, NOT THE VALUE (`:736-738`): a region argument fails only
@@ -3783,10 +3783,10 @@ impl<'a> ScfConditional<'a> {
 /// equality, which is what tells one loop's argument from another's.
 #[must_use]
 pub fn is_loop_invariant(n: ScfConditional<'_>, parent_for_op: &DfirOp, scope: &[DfirOp]) -> bool {
-    // `:690` — "Worklist of values needed to be checked for dependencies on loop iterator arguments."
+    // `:688-690` — "Worklist of values needed to be checked for dependencies on loop iterator arguments."
     let mut worklist: Vec<Val> = Vec::new();
 
-    // `:692-729` — the `then` node then the `else` node, the same seven lines twice.
+    // `:692-728` — the `then` node then the `else` node, the same seven lines twice.
     for arm in [Arm::Then, Arm::Else] {
         let body = dfir_op::regions(n.op)[arm.index()];
         // `n->getThenNode()->isLeaf()` — a tree node's children are the conditionals whose closest
@@ -3795,7 +3795,7 @@ pub fn is_loop_invariant(n: ScfConditional<'_>, parent_for_op: &DfirOp, scope: &
         sibling_group(body, &mut children);
 
         if children.is_empty() {
-            // `:694-700` — `if (bb.getOperations().size() != 1) return false;` and then the value the
+            // `:694-697` — `if (bb.getOperations().size() != 1) return false;` and then the value the
             // terminator yields.
             let [terminator] = body else {
                 return false;
@@ -3805,7 +3805,7 @@ pub fn is_loop_invariant(n: ScfConditional<'_>, parent_for_op: &DfirOp, scope: &
             };
             worklist.push(yielded);
         } else {
-            // `:703-708` — one child, and it must itself be loop invariant.
+            // `:700-703` — one child, and it must itself be loop invariant.
             if children.len() != 1 {
                 return false;
             }
@@ -3817,7 +3817,7 @@ pub fn is_loop_invariant(n: ScfConditional<'_>, parent_for_op: &DfirOp, scope: &
             if !is_loop_invariant(child, parent_for_op, scope) {
                 return false;
             }
-            // `:710-714` — "The then-branch body must be simple (only contain certain op types)."
+            // `:704-708` — "The then-branch body must be simple (only contain certain op types)."
             for op in body {
                 if !matches!(
                     op,
@@ -3830,10 +3830,10 @@ pub fn is_loop_invariant(n: ScfConditional<'_>, parent_for_op: &DfirOp, scope: &
         }
     }
 
-    // `:731-732` — "Check the condition for dependencies."
+    // `:730-731` — "Check the condition for dependencies."
     worklist.push(n.condition);
 
-    // `:734-745`
+    // `:733-746`
     while let Some(val) = worklist.pop() {
         match dfir_op::defining_op(val, scope) {
             // `:736-739` — a region argument: whose region is it?
@@ -3849,7 +3849,7 @@ pub fn is_loop_invariant(n: ScfConditional<'_>, parent_for_op: &DfirOp, scope: &
         }
     }
 
-    // `:746`
+    // `:747`
     true
 }
 

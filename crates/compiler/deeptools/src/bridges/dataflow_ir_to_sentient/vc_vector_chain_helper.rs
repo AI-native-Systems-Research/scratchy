@@ -2939,7 +2939,7 @@ pub fn analyze_non_compute_ops_for_fusion<A: Arch>(
 }
 
 /// WHETHER THE OP AT A POSITION IS A STORE — `isa<agen::VectorStoreOp, vector::StoreOp>`
-/// (`VectorChainHelper.cpp:632-633`).
+/// (`VectorChainHelper.cpp:627-628`).
 fn is_store(id: &OpId, scope: &[DfirOp]) -> bool {
     matches!(
         op_at(id, scope),
@@ -2951,7 +2951,7 @@ fn is_store(id: &OpId, scope: &[DfirOp]) -> bool {
 }
 
 /// WHETHER IT IS A SEND OR A STORE — `isa<dataflow::SendOp, vector::StoreOp, agen::VectorStoreOp>`
-/// (`VectorChainHelper.cpp:618-619`, `:672-674`), the class that may fuse into a compute.
+/// (`VectorChainHelper.cpp:620-621`, `:673-674`), the class that may fuse into a compute.
 fn is_send_or_store(id: &OpId, scope: &[DfirOp]) -> bool {
     matches!(
         op_at(id, scope),
@@ -3021,7 +3021,7 @@ pub fn analyze_and_fill_result_forwarding<A: Arch>(
 }
 
 /// WHETHER THE OP AT A POSITION IS ONE OF THE THREE CONVERSIONS THAT SIT BETWEEN A COMPUTE AND ITS
-/// SEND — `isa<arith::FPToSIOp, arith::SIToFPOp, vectorchain::CastOp>` (`VectorChainHelper.hpp:175`).
+/// SEND — `isa<arith::FPToSIOp, arith::SIToFPOp, vectorchain::CastOp>` (`VectorChainHelper.hpp:174-175`).
 ///
 /// ⛔ THREE CLASSES AND NOT [`is_intermediate`]'S FIVE: a `neg` or a `select` here is NOT stepped
 /// over, so its own port is the destination.

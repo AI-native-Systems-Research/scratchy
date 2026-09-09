@@ -2957,7 +2957,7 @@ struct PartialXrfPtrs {
 
 impl PartialXrfPtrs {
     /// `map[op].at(0).at(i) = …` and `map[op].at(1).at(i) = …` — the two bookkeeping lines, which
-    /// both access arms write together (`LoweringXRF.cpp:449`, `:453`, `:459`, `:462`).
+    /// both access arms write together (`LoweringXRF.cpp:452`, `:456`, `:462`, `:465`).
     fn set(&mut self, ptr: XrfPtr, argument: Val, results: Val) {
         match ptr {
             XrfPtr::Write => {
@@ -3051,7 +3051,7 @@ impl XrfPass<'_> {
             .unwrap_or_default()
     }
 
-    /// The type-1 scenario for the ACTIVE pointer (`LoweringXRF.cpp:427-454`) — the ops to insert in
+    /// The type-1 scenario for the ACTIVE pointer (`LoweringXRF.cpp:426-456`) — the ops to insert in
     /// front of the access.
     fn active_access(&mut self, at: &OpId) -> Vec<sen::Op> {
         // `expr_map[op].constant_val`, `operator[]` defaulting a missing key to zero.
@@ -3061,7 +3061,7 @@ impl XrfPass<'_> {
             .map_or(StickOffset(0), |e| e.constant_val);
         // ⭐ *"the default xrf ptr increment value of sentient.mac is included in the total"*.
         // ⛔⛔ THE STACK GETS `curr_const + incr` AND THE OFFSET OP GETS THE RAW `curr_const`
-        // (`LoweringXRF.cpp:429-432` against `:446`): the increment is what the MAC itself will do, so
+        // (`LoweringXRF.cpp:433-436` against `:447`): the increment is what the MAC itself will do, so
         // it counts towards the NEXT access's distance and not towards this one's.
         if let Some(level) = self.offsets.last_mut() {
             level.push(StickOffset(constant.0 + self.incr_after_prev_mac));
@@ -3094,7 +3094,7 @@ impl XrfPass<'_> {
         ops
     }
 
-    /// *"type 1 scenario for inactive xrf ptr"* (`LoweringXRF.cpp:456-463`) — the placeholder alone,
+    /// *"type 1 scenario for inactive xrf ptr"* (`LoweringXRF.cpp:458-465`) — the placeholder alone,
     /// with NO offset op: this pointer does not move at the other pointer's access.
     fn inactive_access(&mut self, at: &OpId) -> Vec<sen::Op> {
         let argument = self.value;
@@ -3107,7 +3107,7 @@ impl XrfPass<'_> {
         dummy.ops
     }
 
-    /// A `sentient.for`/`sentient.if` WITH xrf accesses under it (`LoweringXRF.cpp:391-421`).
+    /// A `sentient.for`/`sentient.if` WITH xrf accesses under it (`LoweringXRF.cpp:398-425`).
     fn enter(&mut self, at: &OpId, op: &mut sen::Op) {
         // `forop_stack.push(op)` is this recursion; the other two stacks are these.
         self.offsets.push(Vec::new());
@@ -3135,7 +3135,7 @@ impl XrfPass<'_> {
         }
     }
 
-    /// The type-2 and type-3 scenarios (`LoweringXRF.cpp:464-509`) — close one region over the
+    /// The type-2 and type-3 scenarios (`LoweringXRF.cpp:466-521`) — close one region over the
     /// pointer, and for a loop return the ops that undo its travel AFTER it.
     fn close(&mut self, op: &mut sen::Op, region: YieldRegion) -> Vec<sen::Op> {
         // `dyn_cast<sentient::YieldOp>(op)` — the walk only reaches this on a terminator.
@@ -3289,7 +3289,7 @@ impl XrfPass<'_> {
 /// **345/384** `LoweringXRF::processXrfPtrPerUnit` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337` (190L).
 ///
 /// ⛔ `isXrfRelated(op)` IS READ OFF THE MAPS, NOT RE-ASKED: entry 367 keys `expr_maps[0]` with
-/// exactly the xrf-related STORES and `expr_maps[1]` with the LOADS (`:630-646`), which is the same
+/// exactly the xrf-related STORES and `expr_maps[1]` with the LOADS (`:631-648`), which is the same
 /// population the four `isa<>` tests here select — so membership in `expr_maps[i]` IS the active arm
 /// and membership in `expr_maps[1 - i]` IS the inactive one.
 /// ⛔ THE `use_empty` CHECK ON A LOOP'S OLD INIT MOVES TO THE END OF **BOTH** PASSES. The reference
@@ -3533,7 +3533,7 @@ fn is_xrf_access(op: &sen::Op, scope: &[DfirOp]) -> bool {
 /// of the op itself.
 /// ⛔ ONLY REGION 0 MARKS THE OWNER: `for_op.getBody()` and `if_op.getBody(0)` (`:585`, `:595`), so an
 /// access in an `else` region is rebuilt but does not make its `sentient.if` carry the pointers.
-/// ⛔ THE ERASE AT `:615`/`:619` IS NOT A RETRACTION — step 4 refills the mark over a rebuilt body
+/// ⛔ THE ERASE AT `:616`/`:621` IS NOT A RETRACTION — step 4 refills the mark over a rebuilt body
 /// that still holds the same accesses, which is why a rebuilt op marks its owner here.
 fn mark_and_rebuild(region: &mut Vec<sen::Op>, scope: &[DfirOp], vals: &mut Values) -> bool {
     let mut marks_owner = false;

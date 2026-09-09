@@ -573,7 +573,7 @@ pub const fn get_sentient_cmp_i_predicate(condop: CmpIPredicate) -> sen::CmpPred
 ///
 /// ⛔ THE `i1` CONSTANTS ARE NOT INSIDE THE NEST: `builder.clone` copies the `if` alone, so a grafted
 /// copy still reads the original constant — which is why the reference prints four constants above two
-/// `if`s (`dcc/test/Conversion/SentientToProgIR/simplify_or_op.mlir:59-63`).
+/// `if`s (`dcc/test/Conversion/SentientToProgIR/simplify_or_op.mlir:52-55` above `:56` and `:59`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nest {
     /// The `sentient.scalar_constant`s the recursion created, emitted ahead of [`Nest::op`].
@@ -591,7 +591,7 @@ pub struct Nest {
 ///
 /// ⛔ THE RIGHT-HAND NEST IS THE OUTER `if`; the left is CLONED into every `yield` of the seam value —
 /// `true_value` for `and`, `false_value` for `or` — and the original left nest erased (`:146-203`).
-/// ⛔ A CONDITION THAT IS NEITHER is compared `eq` against a fresh `i1` true (`:204-238`); any other
+/// ⛔ A CONDITION THAT IS NEITHER is compared `eq` against a fresh `i1` true (`:205-238`); any other
 /// result count is the reference's `emitError` + `signalPassFailure`, so [`None`].
 #[must_use]
 pub fn construct_if_recursively(
@@ -622,7 +622,7 @@ pub fn construct_if_recursively(
             ops_to_be_erased.push(*result);
             Some(nest)
         }
-        // The `andi` arm (`:146-176`) and the `ori` arm (`:177-203`), which differ only in WHICH
+        // The `andi` arm (`:146-175`) and the `ori` arm (`:176-204`), which differ only in WHICH
         // yielded value the left nest is grafted onto.
         DfirOp::Arith(arith::Op::Logic {
             result,
@@ -635,7 +635,7 @@ pub fn construct_if_recursively(
             let arms = (true_value, false_value);
             let mut left = recurse_into(original, lhs, arms, scope, values, ops_to_be_erased)?;
             let mut nest = recurse_into(original, rhs, arms, scope, values, ops_to_be_erased)?;
-            // ⛔ THE NAME LANDS ON BOTH SIDES (`:157-160`, `:185-188`), not on one.
+            // ⛔ THE NAME LANDS ON BOTH SIDES (`:155-156`, `:185-186`), not on one.
             if let Some(name) = dbg_name(current) {
                 name_if(&mut left.op, name);
                 name_if(&mut nest.op, name);
@@ -646,7 +646,7 @@ pub fn construct_if_recursively(
             } else {
                 false_value
             };
-            // `rhs_if_op->walk(..)` — `:161-172`, `:189-200`.
+            // `rhs_if_op->walk(..)` — `:161-171`, `:190-200`.
             graft(&mut nest.op, seam, &left, values);
             // `ops_to_be_erased.push_back(and_op); lhs_if_op->erase(); return rhs_if_op;`
             ops_to_be_erased.push(*result);
@@ -654,7 +654,7 @@ pub fn construct_if_recursively(
             nest.constants = left.constants;
             Some(nest)
         }
-        // `} else if (current_op->getNumResults() == 1) {`  `:204-238`
+        // `} else if (current_op->getNumResults() == 1) {`  `:205-238`
         current => {
             let [only] = results(current)[..] else {
                 // `emitError("The input condition to std.select should come from CMPI/AND/OR
@@ -662,7 +662,7 @@ pub fn construct_if_recursively(
                 return None;
             };
             // ⛔ AND THIS ARM ERASES NOTHING: the op supplying the condition is still read.
-            // ⛔ THE NAME IS THE `arith.select`'S HERE, not this op's (`:222-223`).
+            // ⛔ THE NAME IS THE `arith.select`'S HERE, not this op's (`:221-222`).
             Some(eq_true_nest(
                 dbg_name(original),
                 only,
@@ -680,7 +680,7 @@ pub fn construct_if_recursively(
 /// operand at the `sentient.if` it produced, so the reference's `dyn_cast`s all miss and it takes the
 /// one-result arm. The vendor's own output shows it — `sentient.if eq, %[[VAL_20]], %[[VAL_23]] : i1`
 /// over an `if`, not over a comparison
-/// (`dcc/test/Conversion/SentientToProgIR/simplify_or_op.mlir:63-70`).
+/// (`dcc/test/Conversion/SentientToProgIR/simplify_or_op.mlir:59`, `%[[VAL_20]]` being the `if` at `:47`).
 /// ⛔ [`None`] IS THE REGION ARGUMENT the reference dereferences as a null defining op.
 fn recurse_into(
     original: &DfirOp,
@@ -708,7 +708,7 @@ fn recurse_into(
 }
 
 /// THE `getNumResults() == 1` ARM OF ENTRY 338 — `cond == true` against a fresh `i1` 1
-/// (`StandardToSentient.cpp:204-238`). ⭐ ENTRY 362 REACHES IT TOO, because a condition entry 363
+/// (`StandardToSentient.cpp:205-238`). ⭐ ENTRY 362 REACHES IT TOO, because a condition entry 363
 /// already lowered is no longer an `arith` op at all; see [`lower_select_op_to_sentient`].
 fn eq_true_nest(
     dbg_name: Option<&str>,
@@ -716,7 +716,7 @@ fn eq_true_nest(
     arms: (Val, Val),
     values: &mut dfir::Values,
 ) -> Nest {
-    // `auto val_true = sentient::ConstantOp::create(.., builder.getI1Type(), 1);`  `:210-212`
+    // `auto val_true = sentient::ConstantOp::create(.., builder.getI1Type(), 1);`  `:214-215`
     let val_true = values.mint();
     let mut nest = one_if(
         sen::CmpPredicate::Eq,
@@ -740,7 +740,7 @@ fn i1_constant(value: i64, result: Val) -> SenOp {
     })
 }
 
-/// ONE `sentient.if` WITH ITS TWO YIELDING ARMS — `:123-142`, built again at `:213-231`.
+/// ONE `sentient.if` WITH ITS TWO YIELDING ARMS — `:123-142`, built again at `:210-231`.
 /// ⛔ `regLocales` IS ONE `unknown` AND `regIndices` IS EMPTY.
 fn one_if(
     predicate: sen::CmpPredicate,
@@ -913,7 +913,7 @@ pub fn simplify_or_i_op(or_result: Val, scope: &mut Vec<DfirOp>, values: &mut df
         return;
     };
     // `cmpi_op_neg = dyn_cast<CmpIOp>(andi_op.getOperand(0)..); int other_operand_num = 1;` and the
-    // retry on operand 1 (`:409-414`).
+    // retry on operand 1 (`:409-413`).
     let (neg_val, other) = if cmpi_at(and_first, scope).is_some() {
         (and_first, and_second)
     } else {

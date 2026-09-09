@@ -1137,7 +1137,7 @@ pub struct DanglingLowering {
     /// One per unabsorbed receive or load, in walk order.
     pub macs: Vec<DummyMac>,
     /// `result` — ⛔ THE MACS AND THE ERASURES STAND EVEN ON A FAILURE: the walk interrupts *after*
-    /// them and `tobe_deleted` is drained unconditionally (`:1363-1365`).
+    /// them and `tobe_deleted` is drained unconditionally (`:1365-1367`).
     pub outcome: DanglingOutcome,
 }
 
@@ -1149,14 +1149,14 @@ pub enum DanglingOutcome {
     Success,
     /// `emitError("There is still a receive or load with uses, that shouldn't happen")` (`:1283`).
     UsedLoad(OpId),
-    /// `emitError("Dangling non-compute op has no use\n")` (`:1342`) — ⛔ IT NAMES `from.op_`, the
+    /// `emitError("Dangling non-compute op has no use\n")` (`:1344`) — ⛔ IT NAMES `from.op_`, the
     /// origin, not the dangling load the walk is standing on.
     NoAbsorption(OpId),
     /// `emitError("There is still a create_affine_mask with uses - that shouldn't happen")` (`:1354`).
     UsedMask(OpId),
-    /// ⛔ THE REFERENCE'S OWN ABORTS, WHICH ARE NOT `emitError`s: `getOperand(…).value()` (`:1289`),
-    /// `symbolizeSentientPrecision`/`ComputePort(…).value()` (`:1313-1326`) and
-    /// `llvm_unreachable("unexpected number of elements …")` (`Utils.cpp:452`). A stop either way.
+    /// ⛔ THE REFERENCE'S OWN ABORTS, WHICH ARE NOT `emitError`s: `getOperand(…).value()` (`:1288`),
+    /// `symbolizeSentientPrecision`/`ComputePort(…).value()` (`:1315-1339`) and
+    /// `llvm_unreachable("unexpected number of elements …")` (`Utils.cpp:450-451`). A stop either way.
     Unrepresentable(OpId),
 }
 
@@ -1169,7 +1169,7 @@ pub enum FoldModeAttr {
     Absent,
     /// The attribute a PE or SFP compute carries.
     Present(sentient::FoldMode),
-    /// `llvm_unreachable("unexpected number of elements for given compute precision")` (`:452`), and
+    /// `llvm_unreachable("unexpected number of elements for given compute precision")` (`:450-451`), and
     /// the `DT_CHECK(vector_type.has_value())` above it (`:433`).
     Unsupported,
 }
@@ -1178,10 +1178,10 @@ pub enum FoldModeAttr {
 /// (`dcc/src/Dialect/Sentient/Utils.cpp:427`) in full.
 ///
 /// ⛔ THE THIRD ARGUMENT IS WHAT MAKES THE 24-BIT REMAP REACHABLE, and it has exactly one caller
-/// that passes `true`: entry 364 for a PE reading the PT FIFO on sen1p5 (`:198`, `:206`). Every other
-/// call takes the declaration's `false` default. ⛔ AND THE 16 -> 24 REWRITE RUNS **FIRST** (`:436`),
-/// so a 16-bit element on that path ends at 32 through the `24 -> 32` arm below — a 128-lane vector
-/// folds `fold_A` at 16 bits and is UNSUPPORTED at 32.
+/// that passes `true`: entry 364 for a PE reading the PT FIFO on sen1p5
+/// (`VectorChainToSentientPESFP.cpp:198`, `:206`); every other takes the `false` default. ⛔ AND
+/// THE 16 -> 24 REWRITE RUNS **FIRST** (`dcc/src/Dialect/Sentient/Utils.cpp:436`), so a 16-bit
+/// element ends at 32 through the `24 -> 32` arm — a 128-lane vector folds `fold_A` at 16, not 32.
 pub(super) fn fold_mode_attr_for_operation(
     op: &DfirOp,
     comp: ComputeComp,

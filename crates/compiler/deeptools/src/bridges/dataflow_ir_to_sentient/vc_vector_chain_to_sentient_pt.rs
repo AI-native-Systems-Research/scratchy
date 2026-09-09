@@ -221,7 +221,7 @@ pub fn run_on_operation<A: Arch>(program: &mut dfir::Program<A>, values: &mut Va
 /// ONE DUMMY MAC THE PT DANGLING LOWERING EMITS, and where the op it replaces stood.
 ///
 /// ⛔ THE MASK-TREE ENTRY TRAVELS WITH IT. `updateLoopMaskTreeForConstantMask(pt_masking_tree, op,
-/// &mac_op, 0)` (`VectorChainToSentientPT.cpp:933`, `:947`) keys the tree by the MAC's own position,
+/// &mac_op, 0)` (`VectorChainToSentientPT.cpp:932`, `:947`) keys the tree by the MAC's own position,
 /// which it does not have until the caller places it — so the constant mask is carried here and
 /// [`update_loop_mask_tree_for_constant_mask`](super::vc_lowering_pt_masks::update_loop_mask_tree_for_constant_mask)
 /// is called with it then. ⭐ IT IS THE LITERAL `0` IN BOTH ARMS.
@@ -262,7 +262,7 @@ pub enum PtDangling {
 /// is a recorded pass failure ([`PtDangling`]) that the walk carries on past.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PtMac {
-    /// `:906-948` ran to the end.
+    /// `:902-948` ran to the end.
     Emitted(PtDummyMac),
     /// One of the aborts on the way, named.
     Refused(PtDangling),
@@ -282,8 +282,8 @@ pub struct PtDanglingLowering {
 /// **346/384** `VectorChainToSentientPTLoweringPass::lowerDanglingNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:882` (88L).
 ///
 /// ⛔ THE PT MAC IS NOT THE PESFP MAC: it takes **no mask** (the `sentient.scalar_constant` is still
-/// emitted, and `nullptr` is passed — `:920`, `:935`), all FOUR precisions are the operand's (`:925-928`,
-/// no `"none"` marker), the non-west arm is `opA = from, opB = one, opC = zero` (`:937-939`) and there
+/// emitted, and `nullptr` is passed — `:920`, `:935`), all FOUR precisions are the operand's (`:926-929`,
+/// no `"none"` marker), the non-west arm is `opA = from, opB = one, opC = zero` (`:937-938`) and there
 /// is NO `DataTransferOnly` attribute. ⛔ AND `pointers` IS SET FOR AN `agen.vector_load` ONLY
 /// (`:903-905`) — `at(0)` is the ARGUMENT pair, so the MAC binds both xrf pointers.
 /// ⛔ AN OFFENDING OP IS NOT ERASED and does not stop the walk; see [`PtDangling`].
@@ -376,7 +376,7 @@ pub fn lower_dangling_non_compute_ops<A: Arch>(
 }
 
 /// The `sentient.scalar_constant` and `sentient.vector_mac` one dangling PT op becomes
-/// (`VectorChainToSentientPT.cpp:906-948`).
+/// (`VectorChainToSentientPT.cpp:902-948`).
 #[allow(clippy::too_many_arguments)]
 fn pt_dummy_mac(
     op: &DfirOp,
@@ -410,9 +410,9 @@ fn pt_dummy_mac(
     ) else {
         return PtMac::Refused(PtDangling::Unrepresentable(at.clone()));
     };
-    // ⛔ `sen1p5_receive_from_pt` IS `false` HERE AND CANNOT BE ANYTHING ELSE: the flag's own
-    // definition tests `comp == PE` (`VectorChainToSentientPESFP.cpp:165`, `Utils.cpp:436`) and this
-    // pass runs on the PT, which folds nothing.
+    // ⛔ `sen1p5_receive_from_pt` IS `false` HERE AND CANNOT BE ANYTHING ELSE: this pass calls the
+    // TWO-argument overload (`:916`), taking the `Utils.hpp:103` default — and the flag only ever
+    // reaches a `comp == PE` gate (`dcc/src/Dialect/Sentient/Utils.cpp:436`), never the PT's.
     let fold_mode = match fold_mode_attr_for_operation(op, comp, false) {
         FoldModeAttr::Absent => None,
         FoldModeAttr::Present(mode) => Some(mode),
@@ -426,7 +426,7 @@ fn pt_dummy_mac(
     };
 
     // ⭐ THE MASK CONSTANT IS STILL BUILT, AND STILL NOT USED — *"PT masking is not attached to
-    // operations"* (`:936`), the mask tree carrying it instead.
+    // operations"* (`:934`), the mask tree carrying it instead.
     let mask_const = sen::Op::Sentient(sentient::Op::ScalarConstant {
         value: 0,
         result: values.mint(),

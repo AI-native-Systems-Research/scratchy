@@ -83,7 +83,7 @@ pub enum ToggleDuplication {
     /// `DT_CHECK_MSG(iter_arg, "expecting second operand of toggle op to be an iter_arg")` (`:40-42`).
     SubtrahendIsNotAnIterArg,
     /// `DT_CHECK_MSG(user->getParentOp() == toggle_parent, "[DuplicateReusedToggle] Toggle user is a
-    /// yield for an operation other than owning loop")` (`:51-54`), carrying the offending yield —
+    /// yield for an operation other than owning loop")` (`:51-53`), carrying the offending yield —
     /// `dcc/test/Transform/CanonicalizeToggle/invalid_toggle_use.mlir` is exactly this case, a toggle
     /// yielded out of an `scf.if`.
     YieldOutsideOwningLoop(OpId),
@@ -91,19 +91,20 @@ pub enum ToggleDuplication {
     /// initialiser, which every duplicate's own chain starts from.
     ChainInitIsNotConstant(Val),
     /// `DT_CHECK(num_orig_args > 0)` (`:101`) with its two siblings
-    /// `DT_CHECK(isa<affine::AffineYieldOp>(yield_op))` (`:96`, `:99`): a loop of the chain that
+    /// `DT_CHECK(isa<affine::AffineYieldOp>(yield_op))` (`:91`, `:97`): a loop of the chain that
     /// carries nothing, or whose body does not end in a yield, cannot be widened.
     LoopCannotGrow(OpId),
     /// `DT_CHECK(res.getUsers().empty() || isa<affine::AffineYieldOp, scf::ForOp>(*(res.getUsers()
-    /// .begin())))` (`:118-121`), carrying the user that is none of those.
+    /// .begin())))` (`:119-121`), carrying the user that is none of those.
     ///
     /// ⛔⛔ AND THE REFERENCE'S `isa<>` LIST OMITS `scf::YieldOp`, WHICH ITS OWN GOLDEN NEEDS. In
-    /// `multiple_toggle_uses.mlir` — a SUCCESS case — the mid `affine.for`'s results are read by the
-    /// enclosing `scf.for`'s `scf.yield` (`:118` of that file), so the check as written aborts on the
-    /// program it is documented to rewrite. This port admits the three the comment *"These should only
-    /// be yield operations"* and the golden agree on: `affine.yield`, `scf.yield`, `scf.for`.
+    /// `multiple_toggle_uses.mlir` — a SUCCESS case — the mid `affine.for` `%33`'s only result is read
+    /// by the enclosing `scf.for`'s `scf.yield %320, %33` (its INPUT `:234`), so the check as written
+    /// aborts on the program it is documented to rewrite. This port admits the three the comment
+    /// *"These should only be yield operations"* and the golden agree on: `affine.yield`, `scf.yield`,
+    /// `scf.for`.
     InnerResultUserUnknown(OpId),
-    /// `DT_CHECK(loop->getResult(j).getUsers().empty())` (`:147-148`) — *"The outermost loop is
+    /// `DT_CHECK(loop->getResult(j).getUsers().empty())` (`:148-149`) — *"The outermost loop is
     /// expected to have no uses of the results. If there were uses, we would have to be able to
     /// determine how they were used to figure out how to use the new additional results properly."*
     OutermostResultsUsed(OpId),
@@ -135,10 +136,10 @@ struct AddedIterArgs {
 ///
 /// ⛔ THE CLONE-AND-ERASE MECHANISM IS DROPPED, NOT THE EMISSION. The reference builds each widened
 /// loop with entry 264 (`:83-84`), remaps `toggle_op`, the chain and the candidates through the
-/// `IRMapping`, then erases the original (`:167-179`); the island has no parent pointers, so the loops
+/// `IRMapping`, then erases the original (`:163-179`); the island has no parent pointers, so the loops
 /// are widened IN PLACE and every remap — `rewriter.replaceAllUsesWith(res, new_loop->getResult(j))`
 /// included (`:122`) — is the identity. The fill constants entry 264 would emit are dropped with it:
-/// `setIterArgInit` overwrites all of them (`:127-133`, `:153-155`), so none survives the reference
+/// `setIterArgInit` overwrites all of them (`:127-132`, `:153-154`), so none survives the reference
 /// either.
 #[must_use]
 pub fn match_and_rewrite(
@@ -181,7 +182,7 @@ pub fn match_and_rewrite(
             user,
             DfirOp::Affine(affine::Op::Yield { .. }) | DfirOp::Scf(scf::Op::Yield { .. })
         ) {
-            // `DT_CHECK_MSG(user->getParentOp() == toggle_parent, ..)` (`:51-54`) — a yield's parent
+            // `DT_CHECK_MSG(user->getParentOp() == toggle_parent, ..)` (`:51-53`) — a yield's parent
             // op is its block, which is its position without the last ordinal.
             if at.block() != owner.path() {
                 return ToggleDuplication::YieldOutsideOwningLoop(at);
@@ -231,14 +232,14 @@ pub fn match_and_rewrite(
                     return ToggleDuplication::InnerResultUserUnknown(bad);
                 }
                 // *"The new iter_args for this loop should be initialized to the new iter_args added
-                // to the previous created loop to continue the chain."* (`:124-133`) — `j` from
+                // to the previous created loop to continue the chain."* (`:125-132`) — `j` from
                 // `num_orig_args`, `k` from `prev_upd_iter_args.size() - candidates.size()`, which is
                 // the parent's own `num_orig_args`.
                 let Some(grown) = add_iter_args(loop_at, &parent.args, vals, body) else {
                     return ToggleDuplication::LoopCannotGrow(loop_at.clone());
                 };
                 // *"The yield op of the previous created parent loop needs to yield the results
-                // associated to the new iter_args of the current loop."* (`:135-141`), whose
+                // associated to the new iter_args of the current loop."* (`:134-141`), whose
                 // `operand_idx = prev_yield_op->getNumOperands() - candidates.size()` is again the
                 // parent's `num_orig_args` — and `DT_CHECK(operand_idx > 0)` (`:137`) is the parent's
                 // own [`ToggleDuplication::LoopCannotGrow`], already answered.
@@ -247,15 +248,15 @@ pub fn match_and_rewrite(
                 }
                 prev = Some((loop_at.clone(), grown));
             }
-            // `} else { // OUTERMOST LOOPS` (`:142-156`), which `i == b` selects on the first pass.
+            // `} else { // OUTERMOST LOOPS` (`:142-155`), which `i == b` selects on the first pass.
             None => {
                 // `for (unsigned j = 0, e = loop->getNumResults(); j < e; ++j)
-                //    DT_CHECK(loop->getResult(j).getUsers().empty());` (`:147-148`)
+                //    DT_CHECK(loop->getResult(j).getUsers().empty());` (`:148-149`)
                 if let Some(used) = any_result_user(loop_at, body) {
                     return ToggleDuplication::OutermostResultsUsed(used);
                 }
                 // *"The new iter_args in the new outer loop should be initialized to the same value as
-                // the original toggle."* (`:150-155`)
+                // the original toggle."* (`:151-154`)
                 let inits = vec![init_val; candidates.len()];
                 let Some(grown) = add_iter_args(loop_at, &inits, vals, body) else {
                     return ToggleDuplication::LoopCannotGrow(loop_at.clone());
@@ -410,8 +411,8 @@ fn any_result_user(at: &OpId, scope: &[DfirOp]) -> Option<OpId> {
 /// `replaceAllUsesWith` (`:122`, `:167-177`) have nothing to do here.
 ///
 /// ⛔ AND NO FILL CONSTANT. Entry 264 initialises each added arg to a fresh `arith.constant` 0 or 1
-/// (`Utils.cpp:43`, `:65`) that `setIterArgInit` then overwrites in EVERY caller path here
-/// (`:127-133`, `:153-155`), so the init is passed in instead of emitted and replaced.
+/// (`dcc/src/Transform/Dataflow/Utils.cpp:43`, `:65`) that `setIterArgInit` then overwrites in EVERY
+/// caller path here (`:127-132`, `:153-154`), so the init is passed in instead of emitted+replaced.
 fn add_iter_args(
     at: &OpId,
     inits: &[Val],
@@ -445,8 +446,9 @@ fn add_iter_args(
         args.push(arg);
         added.push(result);
     }
-    // `DT_CHECK(isa<affine::AffineYieldOp>(yield_op))` (`:96`, `:99`), then the added arg yielding
-    // itself — entry 264's `Utils.cpp:47-50` and `:69-72`, the identity the outer loop then rewires.
+    // `DT_CHECK(isa<affine::AffineYieldOp>(yield_op))` (`:91`, `:97`), then the added arg yielding
+    // itself — `copyLoopBody`'s *"Adding new yield arguments"* under entry 264
+    // (`dcc/src/Utils/Utils.cpp:374-379`), the identity the outer loop then rewires.
     match body.last_mut() {
         Some(DfirOp::Affine(affine::Op::Yield { operands })) => {
             operands.extend(args.iter().copied())
@@ -641,12 +643,12 @@ mod unit_tests {
     /// `dcc/test/Transform/CanonicalizeToggle/multiple_toggle_uses.mlir`.
     ///
     /// One toggle in a four-deep nest is read by two extra views and an `arith.addi`, so all four
-    /// loops grow three iter_args (1→4, 2→5, 1→4, 1→4 as that file's `:49`, `:56`, `:64` and `:74`
-    /// print them), three clones appear under the toggle reading the innermost added args (`:81-84`),
+    /// loops grow three iter_args (1→4, 2→5, 1→4, 1→4 as that file's `:49`, `:56`, `:62` and `:67`
+    /// print them), three clones appear under the toggle reading the innermost added args (`:70-72`),
     /// and each reader takes a clone in REVERSE creation order (`:87`, `:96`, `:104`).
     ///
-    /// ⛔ AND THE MID LOOP'S RESULTS ARE READ BY AN `scf.yield` (`:118`), which the reference's own
-    /// `DT_CHECK` at `DuplicateReusedToggle.cpp:118-121` does not admit — see
+    /// ⛔ AND THE MID LOOP'S RESULTS ARE READ BY AN `scf.yield` (that file's INPUT `:234`), which the
+    /// reference's own `DT_CHECK` at `DuplicateReusedToggle.cpp:119-121` does not admit — see
     /// [`ToggleDuplication::InnerResultUserUnknown`]. A port that copied that list would abort here.
     #[test]
     fn one_toggle_read_by_three_ops_becomes_four_chains_through_every_loop_of_the_nest() {
@@ -706,7 +708,7 @@ mod unit_tests {
                 dbg_name: None,
             }),
             // `affine.yield %52#0` — the outermost loop yields the scf's FIRST result, and its own
-            // result is read by nothing (`:120` of the golden, and `:147-148` of the pass).
+            // result is read by nothing (`:120` of the golden, and `:148-149` of the pass).
             affine_yield(&[q1]),
         ];
         let mut body = vec![
@@ -729,13 +731,13 @@ mod unit_tests {
         let (mid, mid_body) = loop_of(&[3, 0, 1], &body);
         let (inner, inner_body) = loop_of(&[3, 0, 1, 0], &body);
 
-        // `:49`, `:56`, `:64`, `:74` — one added iter_arg per candidate on every loop of the chain.
+        // The golden's `:49`, `:56`, `:62`, `:67` — one added iter_arg per candidate per loop.
         assert_eq!(
             (outer.len(), scf.len(), mid.len(), inner.len()),
             (4, 5, 4, 4)
         );
 
-        // `setIterArgInit(upd_iter_args[j], init_val)` (`:153-155`) — the outermost loop's added args
+        // `setIterArgInit(upd_iter_args[j], init_val)` (`:153-154`) — the outermost loop's added args
         // all start from the toggle's own initialiser, `%29` in the golden.
         let outer_added = added(&outer, 1);
         assert_eq!(
@@ -743,7 +745,7 @@ mod unit_tests {
             vec![c_init; 4]
         );
 
-        // `setIterArgInit(upd_iter_args[j], prev_upd_iter_args[k])` (`:127-133`) — each inner loop's
+        // `setIterArgInit(upd_iter_args[j], prev_upd_iter_args[k])` (`:127-132`) — each inner loop's
         // added args start from its PARENT's added args, `k` beginning at the parent's `num_orig`.
         let scf_added = added(&scf, 2);
         let mid_added = added(&mid, 1);
@@ -762,7 +764,7 @@ mod unit_tests {
         );
 
         // `prev_yield_op->setOperand(j, new_loop->getResult(k))` (`:138-141`) — every parent yields
-        // the child's added results, its original operands untouched (`:116`, `:118`, `:120`).
+        // the child's added results, its original operands untouched (golden `:116`, `:118`, `:120`).
         assert_eq!(yielded(&outer_body), [vec![q1], scf_added.results].concat());
         assert_eq!(
             yielded(&scf_body),
@@ -770,12 +772,12 @@ mod unit_tests {
         );
         assert_eq!(yielded(&mid_body), [vec![r3], inner_added.results].concat());
         // `prev_yield_op->setOperand(num_orig_args + i, new_toggle_op->getResult(0))` (`:201`) — the
-        // innermost yield carries the original toggle and the three duplicates (`:114`).
+        // innermost yield carries the original toggle and the three duplicates (golden `:114`).
         assert_eq!(yielded(&inner_body), [vec![toggle], dups.clone()].concat());
 
         // `builder.clone(*toggle_op)` with `setOperand(1, upd_iter_args[num_orig_args + i])`
         // (`:188-193`) — three `arith.subi` immediately below the toggle, each reading one added arg
-        // (`:81-84`).
+        // (golden `:70-72`).
         assert_eq!(
             inner_body[2..5].to_vec(),
             dups.iter()

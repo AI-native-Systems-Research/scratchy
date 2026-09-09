@@ -12994,7 +12994,7 @@ pub fn adjust_mutable_addr_init_for_indirect(
 pub enum AccessInfoCount {
     /// `size() == n` on all three containers (`:3118`, `:3139`, `:3160`).
     Exactly(usize),
-    /// `size() >= n` on all three (`:3371`).
+    /// `size() >= n` on all three, and only entry 334 has one (`:3369-3370`).
     AtLeast(usize),
 }
 
@@ -13199,8 +13199,8 @@ pub fn lower_composite_load_and_store_op<'a>(
 
 /// Replaces: e334_lowerCompositeIndirectLoadAndStoreOp
 ///
-/// **334/384** `Helper.cpp:3358` (18L). Entry 331 with the two indirect flags read off the op, so a
-/// two-sided indirect transfer describes up to FOUR operands — hence `>= 2`, not `== 2` (`:3371`).
+/// **334/384** `Helper.cpp:3359` (20L). Entry 331 with the two indirect flags read off the op, so a
+/// two-sided indirect transfer describes up to FOUR operands — hence `>= 2`, not `== 2` (`:3369-3370`).
 pub fn lower_composite_indirect_load_and_store_op<'a>(
     op: &'a DfirOp,
     position: usize,
