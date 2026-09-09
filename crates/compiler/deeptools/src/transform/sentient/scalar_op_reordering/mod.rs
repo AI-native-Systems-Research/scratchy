@@ -88,12 +88,18 @@
 //! | `e579_runOn` | 579 | 4 | 15 | `dcc/src/Transform/Sentient/ScalarOpReordering.cpp:191` |
 
 #![allow(dead_code)]
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e367_runOnOperation` (level 1) is what calls
-// [`ScalarOpReordering::run_on_program`], and every item below is reachable only from this file's own
-// tests until it lands. CI runs clippy with `-D warnings`. ⭐ REMOVE THIS WITH e367.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`ScalarOpReordering::run_on_operation`] (e367) is
+// the entry, and nothing outside this file's own tests constructs the pass to call it. CI runs clippy
+// with `-D warnings`. ⭐ REMOVE THIS WHEN THE PASS IS REGISTERED IN THE PIPELINE.
 
 use std::collections::BTreeMap;
 
+use sys_arch_spec::regfile::Component;
+
+use super::analyses::RegisterPressure;
+use super::local_region_splitting_for_value_commoning::{
+    MaxRegNum, PretendRegLimits, get_max_reg_num,
+};
 use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient};
@@ -217,8 +223,8 @@ impl ScalarResult {
 ///
 /// ⚠️ `dcc_ext_ctx_` AND `opts_` ARE NOT CARRIED YET: `dccExtContext()` is read by e370 alone (for
 /// `getMaxRegNum`) and `opts_` by e579 (the include-list gate), so both enter with those units. The two
-/// use caches — `val_to_first_use_in_block_cache_` and `val_to_last_use_in_block_cache_` — enter with
-/// e368 and e369, which are what fill and read them.
+/// use caches — `val_to_first_use_in_block_cache_` and `val_to_last_use_in_block_cache_` — are NOT
+/// carried at all: see [`first_use_within_block`] for the three reasons e368 and e369 dropped them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScalarOpReordering {
     /// `op_to_idx_` — ⛔ KEYED BY POSITION, WHICH IS NOT WHAT `Operation *` IS: an [`OpId`] moves when
@@ -376,25 +382,134 @@ fn walk_pre_order<'a>(
     }
 }
 
-// crustify:todo: e367_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:74  (5 body lines, level 1)
-//   original  : void runOnOperation()
-//   calls     : e175_runOn
+/// `-dcc-scalar-op-reordering-disable`, `cl::init(false)` (`ScalarOpReordering.cpp:39-42`).
+const DISABLE_THIS_PASS: bool = false;
 
-// crustify:todo: e368_getFirstUseWithinBlock
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:383  (23 body lines, level 1)
-//   original  : Operation *ScalarOpReorderingPass::getFirstUseWithinBlock(Value v)
-//   calls     : e178_findAncestorInBlock
+impl ScalarOpReordering {
+    /// Replaces: e367_runOnOperation
+    ///
+    /// The pass entry: reorders the scalar ops of every unit of one module, unless it is disabled.
+    ///
+    /// ⭐ `getOperation()` IS THE ARGUMENT, and `DisableThisPass` is a `dcc-opt` `cl::opt<bool>` this
+    /// crate has no command line for, so it is the constant it initialises to — the precedent is
+    /// [`super::multicast_canonicalization::run_on_operation`].
+    pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+    ) {
+        if DISABLE_THIS_PASS {
+            return;
+        }
+        self.run_on_program(program);
+    }
+}
 
-// crustify:todo: e369_getLastUseWithinBlock
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:407  (23 body lines, level 1)
-//   original  : Operation *ScalarOpReorderingPass::getLastUseWithinBlock(Value v, Block *bb)
-//   calls     : e178_findAncestorInBlock
+/// Replaces: e368_getFirstUseWithinBlock
+///
+/// The earliest op of `v`'s OWN block that reads `v`, directly or from inside a region it encloses —
+/// `None` when nothing does.
+///
+/// ⭐ DOMINANCE INSIDE ONE BLOCK IS ORDER INSIDE ONE BLOCK, so `dom_info_->dominates` is a `min` over
+/// [`ancestor_in_block`]'s answers, and `v.use_empty()` is that minimum being empty.
+/// ⛔ BOTH USE CACHES ARE DROPPED, and not merely as the memoisation they look like: e531 clears this
+/// one after every move it makes (`:352-353`); [`last_use_within_block`]'s is keyed on `v` alone though
+/// its answer depends on the block too (`:412-413`), which is a defect, not a saving; and an [`OpId`]
+/// is a position, so an entry made before a move names a different op afterwards.
+/// ⛔ `!isa<BlockArgument>(v)` IS A `DT_CHECK` (`:384-385`) — an iter arg has no defining op to take a
+/// block from, so it panics here rather than answering.
+#[must_use]
+pub fn first_use_within_block(v: Val, unit: &[Op]) -> Option<OpId> {
+    let Some(at_def) = defining_position(v, unit) else {
+        panic!(
+            "getFirstUseWithinBlock on a value with no defining op — the `!isa<BlockArgument>` \
+             DT_CHECK (ScalarOpReordering.cpp:384)"
+        )
+    };
+    use_ancestors_in_block(v, at_def.block(), unit).min()
+}
 
-// crustify:todo: e370_localeHasFreeRegs
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:431  (30 body lines, level 1)
-//   original  : bool ScalarOpReorderingPass::localeHasFreeRegs(SentientRegType locale)
-//   calls     : e056_set, e063_getMaxRegNum
+/// Replaces: e369_getLastUseWithinBlock
+///
+/// The latest op of `block` that reads `v`, directly or from inside a region it encloses — `None` when
+/// nothing in `block` does.
+///
+/// ⭐ `bb` IS THE CALLER'S BLOCK, NOT `v`'S, which is the whole difference from
+/// [`first_use_within_block`]; the `dominates` test runs the other way round, so this is a `max`.
+/// ⭐ THE `DT_CHECK` ON A BLOCK ARGUMENT (`:408-409`) GUARDS NOTHING HERE: the block is given, so an
+/// iter arg's uses are found like any other value's.
+#[must_use]
+pub fn last_use_within_block(v: Val, block: &[u32], unit: &[Op]) -> Option<OpId> {
+    use_ancestors_in_block(v, block, unit).max()
+}
+
+/// Where in `unit` the op binding `v` sits — `v.getDefiningOp()`, positioned.
+fn defining_position(v: Val, unit: &[Op]) -> Option<OpId> {
+    let mut at_def = None;
+    walk_pre_order(unit, 0, &mut Vec::new(), &mut |at, op| {
+        if dialects::results(op).contains(&v) {
+            at_def = Some(at);
+        }
+    });
+    at_def
+}
+
+/// `for (auto &use : v.getUses())` with each user's ancestor in `block` taken and the users outside it
+/// dropped — the loop e368 and e369 share, ordered by position.
+fn use_ancestors_in_block(v: Val, block: &[u32], unit: &[Op]) -> impl Iterator<Item = OpId> {
+    let mut ancestors = Vec::new();
+    walk_pre_order(unit, 0, &mut Vec::new(), &mut |at, op| {
+        if dialects::operands(op).contains(&v) {
+            ancestors.extend(ancestor_in_block(&at, block));
+        }
+    });
+    ancestors.into_iter()
+}
+
+impl ScalarOpReordering {
+    /// Replaces: e370_localeHasFreeRegs
+    ///
+    /// Whether `locale` still has a register free on `comp`: the bitvector, then the overestimate, and
+    /// only when both are inconclusive a fresh register-pressure measurement, which updates both.
+    ///
+    /// ⛔ TRAP: `MaxRegNum > 0` IS A VALUE TEST (`:453-454`), UNLIKE e063's occurrence test, so
+    /// `-scalar-op-reordering-max-register-number=0` means "ask the machine" — hence `None` here, and
+    /// hence the default [`PretendRegLimits`]: the reference asks `DccExtContext::getMaxRegNum`, which
+    /// is exactly [`get_max_reg_num`]'s fall-through with neither of THAT pass's flags given.
+    /// ⛔ REFERENCE DEFECT: `num_regs - rf_size` UNDERFLOWS unsigned in the has-room case (`:459-460`);
+    /// the huge overestimate is unobservable only because the bit set on the next line short-circuits
+    /// every later call. `saturating_sub` is the number it meant.
+    /// ⭐ `Liveness` AND `RegisterPressure` ARE OUT OF CAMPAIGN SCOPE — [`RegisterPressure`] is the seam.
+    pub fn locale_has_free_regs<A: Arch>(
+        &mut self,
+        locale: sentient::RegType,
+        comp: Component,
+        max_reg_num: Option<MaxRegNum>,
+        pressure: &mut dyn RegisterPressure,
+    ) -> bool {
+        if matches!(locale, sentient::RegType::Imm | sentient::RegType::Unknown)
+            || self.locale_has_free_regs.get(locale)
+        {
+            return true;
+        }
+        let exceeded = self.locale_to_num_regs_exceeded.get(locale);
+        if exceeded > 0 {
+            // Reordering one scalar op frees at most one register, so the overestimate loses one.
+            self.locale_to_num_regs_exceeded.set(locale, exceeded - 1);
+            return false;
+        }
+        let rf_size = max_reg_num
+            .unwrap_or_else(|| get_max_reg_num::<A>(locale, comp, PretendRegLimits::default()))
+            .0;
+        let num_regs = pressure.num_registers(locale);
+        let has_free_regs = num_regs < rf_size;
+        self.locale_to_num_regs_exceeded
+            .set(locale, num_regs.saturating_sub(rf_size));
+        if has_free_regs {
+            self.locale_has_free_regs.set(locale, true);
+        }
+        has_free_regs
+    }
+}
 
 // crustify:todo: e470_isCandidateForReordering
 //   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:462  (67 body lines, level 2)
@@ -413,7 +528,12 @@ fn walk_pre_order<'a>(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{LiverangeIndex, PerLocale, ScalarOpReordering, ScalarResult, ancestor_in_block};
+    use sys_arch_spec::regfile::Component;
+
+    use super::{
+        LiverangeIndex, MaxRegNum, PerLocale, RegisterPressure, ScalarOpReordering, ScalarResult,
+        ancestor_in_block, first_use_within_block, last_use_within_block,
+    };
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::generated::OpFunc;
@@ -588,6 +708,102 @@ mod unit_tests {
         // The `DT_CHECK_MSG` this type replaces: a `sentient.for` with one carried value binds one
         // result, and its body op is not a result of the unit's block.
         assert_eq!(ScalarResult::of(&unit[2]).map(|r| r.val()), Some(Val(92)));
+    }
+
+    /// The out-of-scope register pressure analysis, stating one count for every locale.
+    struct StatedPressure(u32);
+
+    impl RegisterPressure for StatedPressure {
+        fn num_registers(&mut self, _locale: sentient::RegType) -> u32 {
+            self.0
+        }
+    }
+
+    /// e367 — the gate is off, so the entry reaches the unit pass, which is e579.
+    #[test]
+    #[should_panic(expected = "e579_runOn")]
+    fn the_pass_entry_is_not_disabled() {
+        let mut program = program_of(vec![constant(Val(0))]);
+        ScalarOpReordering::new().run_on_operation(&mut program);
+    }
+
+    /// e368 + e369 — the first and last user of one value, a nested user counted as the op enclosing
+    /// it, and the block e369 is asked about deciding its answer where e368 has only `v`'s own.
+    #[test]
+    fn the_first_and_last_use_are_the_bounds_of_the_users_in_one_block() {
+        let unit = vec![
+            constant(Val(0)),
+            add(Val(0), Val(0), Val(3)),
+            for_op(Val(1), Val(0), vec![add(Val(0), Val(91), Val(2))]),
+            add(Val(0), Val(0), Val(4)),
+        ];
+        assert_eq!(first_use_within_block(Val(0), &unit), Some(OpId::at(&[1])));
+        assert_eq!(
+            last_use_within_block(Val(0), &[], &unit),
+            Some(OpId::at(&[3]))
+        );
+        // ⛔ THE SAME VALUE, A DIFFERENT BLOCK, A DIFFERENT ANSWER — which is what the reference's
+        // cache key cannot tell apart.
+        assert_eq!(
+            last_use_within_block(Val(0), &[2], &unit),
+            Some(OpId::at(&[2, 0]))
+        );
+        // `v.use_empty()` — the last add's result is read by nothing.
+        assert_eq!(first_use_within_block(Val(4), &unit), None);
+        assert_eq!(last_use_within_block(Val(4), &[], &unit), None);
+    }
+
+    /// e370 — `imm` and `unknown` are free by fiat, the overestimate answers and pays one register per
+    /// answer, and a measurement both answers and records how far past the file it went.
+    #[test]
+    fn a_locale_is_measured_only_once_both_caches_are_inconclusive() {
+        let mut pressure = StatedPressure(5);
+        let mut pass = ScalarOpReordering::new();
+        for free in [sentient::RegType::Imm, sentient::RegType::Unknown] {
+            assert!(pass.locale_has_free_regs::<Dd2>(free, Component::L3lu, None, &mut pressure));
+        }
+        pass.locale_to_num_regs_exceeded
+            .set(sentient::RegType::Lrf, 2);
+        assert!(!pass.locale_has_free_regs::<Dd2>(
+            sentient::RegType::Lrf,
+            Component::L3lu,
+            Some(MaxRegNum(8)),
+            &mut pressure,
+        ));
+        assert_eq!(
+            pass.locale_to_num_regs_exceeded.get(sentient::RegType::Lrf),
+            1
+        );
+        // Inconclusive: 5 of a pretended 8 are live, so there is room, and the bit is set for good.
+        pass.locale_to_num_regs_exceeded
+            .set(sentient::RegType::Lrf, 0);
+        assert!(pass.locale_has_free_regs::<Dd2>(
+            sentient::RegType::Lrf,
+            Component::L3lu,
+            Some(MaxRegNum(8)),
+            &mut pressure,
+        ));
+        assert!(pass.locale_has_free_regs.get(sentient::RegType::Lrf));
+        // ⛔ THE REFERENCE'S UNDERFLOW: `5 - 8` saturates instead of wrapping to 4294967293.
+        assert_eq!(
+            pass.locale_to_num_regs_exceeded.get(sentient::RegType::Lrf),
+            0
+        );
+        // And with no flag, the machine's own bound: an L3 half has no LRF at all, so all 5 exceed it.
+        let mut fresh = ScalarOpReordering::new();
+        assert!(!fresh.locale_has_free_regs::<Dd2>(
+            sentient::RegType::Lrf,
+            Component::L3su,
+            None,
+            &mut pressure,
+        ));
+        assert!(!fresh.locale_has_free_regs.get(sentient::RegType::Lrf));
+        assert_eq!(
+            fresh
+                .locale_to_num_regs_exceeded
+                .get(sentient::RegType::Lrf),
+            5
+        );
     }
 
     /// e178 — an op already in the block is its own ancestor, a nested op answers the enclosing op,

@@ -88,8 +88,10 @@
 
 pub(crate) mod sentient;
 
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient::CmpPredicate;
-use crate::islands::sentient::dialects::{Op, sentient as ops};
+use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
 
 /// THE `$predicate` SLOT OF ONE `sentient.if` — `IfOp& if_op` reduced to the single field
 /// `updateCmpIPredicate` writes, so "not a `sentient.if`" is not a case it has to answer.
@@ -132,10 +134,184 @@ pub fn update_cmp_i_predicate(if_op: IfPredicate<'_>, new_predicate: CmpPredicat
     }
 }
 
-// crustify:todo: e371_transformIfCondition
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:77  (109 body lines, level 1)
-//   original  : void ScalarSimplificationsPass::transformIfCondition( IfOp& if_op, OpBuilder& builder, const affine::FlatAffineValueConstraints& constraints)
-//   calls     : e179_updateCmpIPredicate, e252_size
+/// THE WHOLE COMPARISON OF ONE `sentient.if` — the predicate plus the two operands e371 rewrites,
+/// which is [`IfPredicate`] widened by exactly `setOperand(0)` and `setOperand(1)`.
+pub struct IfCondition<'a> {
+    /// `$predicate`.
+    predicate: &'a mut CmpPredicate,
+    /// `if_op->getOperand(0)`.
+    lhs: &'a mut Val,
+    /// `if_op->getOperand(1)`.
+    rhs: &'a mut Val,
+}
+
+impl<'a> IfCondition<'a> {
+    /// The comparison of `op`, or `None` when `op` is not a `sentient.if`.
+    #[must_use]
+    pub fn of(op: &'a mut Op) -> Option<IfCondition<'a>> {
+        match op {
+            Op::Sentient(ops::Op::If {
+                predicate,
+                lhs,
+                rhs,
+                ..
+            }) => Some(IfCondition {
+                predicate,
+                lhs,
+                rhs,
+            }),
+            _ => None,
+        }
+    }
+
+    /// `if_op.getPredicate()`.
+    #[must_use]
+    pub fn get(&self) -> CmpPredicate {
+        *self.predicate
+    }
+
+    /// The predicate slot alone, which is what [`update_cmp_i_predicate`] takes.
+    fn predicate(&mut self) -> IfPredicate<'_> {
+        IfPredicate(self.predicate)
+    }
+}
+
+/// ONE DIMENSION OF THE ROW — `constraints.getValue(dim_id)` with the type the `DT_CHECK` at `:130-134`
+/// compares and the coefficient the sort at `:89-101` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstraintDim {
+    /// `constraints.getValue(dim_id)`.
+    pub value: Val,
+    /// `V.getType()` — what `arg_type` is taken from.
+    pub ty: ScalarTy,
+    /// `coefficients[dim_id]`.
+    pub coeff: i64,
+}
+
+/// THE ONE ROW OF A `FlatAffineValueConstraints` THIS PASS READS (`:79-82`).
+///
+/// ⭐ EQUALITY-OR-INEQUALITY IS THE CALLER'S CHOICE: `getNumEqualities() == 1 ? getEquality(0) :
+/// getInequality(0)` is decided where the counts are known, which is e471, and only the row arrives.
+/// ⛔ THE SYMBOL AND LOCAL COLUMNS ARE NOT CARRIED — the loop stops at `getNumDimVars()` and the only
+/// other column ever read is `coefficients.back()`, which is [`ConstraintRow::constant`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConstraintRow {
+    /// One entry per dimension variable, in the row's own order.
+    pub dims: Vec<ConstraintDim>,
+    /// `coefficients.back()` — the row's constant term.
+    pub constant: i64,
+}
+
+/// WHICH SIDE OF THE COMPARISON THE ROW'S CONSTANT LANDED ON (`:113-124`).
+///
+/// ⛔ THE TWO ARE MUTUALLY EXCLUSIVE, SO THIS IS ONE `Option` AND NOT TWO VECTORS:
+/// `transformed_lhs_constant_arg` is filled only for a constant `>= 0` and
+/// `transformed_rhs_constant_arg` only for one `< 0`. That makes the reference's both-constants arm
+/// (`:167-175`) unreachable — along with the `transformed_rhs_constant_arg[0] +
+/// transformed_rhs_constant_arg[0]` in it, which cannot be written here at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformedConst {
+    /// `transformed_lhs_constant_arg` — the constant belongs on the LEFT.
+    Lhs(i64),
+    /// `transformed_rhs_constant_arg`, already negated as `:120` negates it.
+    Rhs(i64),
+}
+
+/// Replaces: e371_transformIfCondition
+///
+/// Rewrites one `sentient.if`'s comparison into the two operands its constraint row states, creating a
+/// constant for the row's constant term where a side needs one, and leaves the op alone otherwise.
+///
+/// ⛔ A NON-UNIT COEFFICIENT, THREE OPERANDS, OR ANY OTHER SHAPE IS A NO-OP — five of the reference's
+/// exits are `return`s that have already changed nothing (`:100`, `:123`, `:177`, `:180`).
+/// ⛔ `-1 >= 0` BECOMES `> 0` AND THE CONSTANT BECOMES ZERO (`:109-112`), which then takes the
+/// non-negative branch below; `update_cmp_i_predicate` is what refuses to apply `sge` to an `eq`.
+/// ⭐ THE `DT_CHECK` ON THE OPERAND TYPES (`:130-134`) IS THE CALLER'S INVARIANT: `arg_type` is one
+/// dimension's, and a row mixing types is a broken constraint system, not an input.
+pub fn transform_if_condition(
+    mut if_op: IfCondition<'_>,
+    row: &ConstraintRow,
+    consts: &mut Vec<Op>,
+    values: &mut Values,
+) {
+    let mut lhs_args: Vec<ConstraintDim> = Vec::new();
+    let mut rhs_args: Vec<ConstraintDim> = Vec::new();
+    for dim in &row.dims {
+        match dim.coeff {
+            1 => lhs_args.push(*dim),
+            -1 => rhs_args.push(*dim),
+            0 => {}
+            // "We don't support multiplication with non-unit value in the simplification."
+            _ => return,
+        }
+    }
+
+    let lhs_rhs_arg_present = !lhs_args.is_empty() && !rhs_args.is_empty();
+    let mut const_coeff = row.constant;
+    let mut new_predicate = CmpPredicate::Sge;
+    if const_coeff == -1 && if_op.get() == CmpPredicate::Sge {
+        const_coeff = 0;
+        new_predicate = CmpPredicate::Sgt;
+    }
+
+    let constant = if const_coeff >= 0 && !lhs_rhs_arg_present {
+        Some(TransformedConst::Lhs(const_coeff))
+    } else if const_coeff < 0 {
+        Some(TransformedConst::Rhs(-const_coeff))
+    } else if const_coeff == 0 {
+        // Reaching here IS `lhs_rhs_arg_present` (`:122`); a non-zero constant beside both sides would
+        // need a third operand.
+        None
+    } else {
+        return;
+    };
+
+    let arg_type = lhs_args
+        .last()
+        .or_else(|| rhs_args.last())
+        .map_or(ScalarTy::Int(32), |dim| dim.ty);
+
+    // `sentient.if` supports only two variables at max!
+    if lhs_args.len() + rhs_args.len() + usize::from(constant.is_some()) > 2 {
+        return;
+    }
+    match (lhs_args.as_slice(), rhs_args.as_slice(), constant) {
+        ([lhs], [rhs], None) => {
+            *if_op.lhs = lhs.value;
+            *if_op.rhs = rhs.value;
+        }
+        ([lhs], [], Some(TransformedConst::Lhs(const_arg))) => {
+            *if_op.lhs = lhs.value;
+            *if_op.rhs = constant_val(-const_arg, arg_type, consts, values);
+        }
+        ([lhs], [], Some(TransformedConst::Rhs(const_arg))) => {
+            *if_op.lhs = lhs.value;
+            *if_op.rhs = constant_val(const_arg, arg_type, consts, values);
+        }
+        // ⭐ THE REFERENCE'S TWO rhs-ARG ARMS ARE ONE ARM: both put the constant on the left, and
+        // neither negates it (`:155-166`).
+        ([], [rhs], Some(TransformedConst::Lhs(const_arg) | TransformedConst::Rhs(const_arg))) => {
+            *if_op.lhs = constant_val(const_arg, arg_type, consts, values);
+            *if_op.rhs = rhs.value;
+        }
+        _ => return,
+    }
+    update_cmp_i_predicate(if_op.predicate(), new_predicate);
+}
+
+/// `sentient::ConstantOp::create(builder, if_op->getLoc(), arg_type, value)` — one constant in the
+/// const builder's own block, which is why it goes to `consts` and not beside the `sentient.if`.
+fn constant_val(value: i64, ty: ScalarTy, consts: &mut Vec<Op>, values: &mut Values) -> Val {
+    let result = values.mint();
+    consts.push(Op::Sentient(ops::Op::ScalarConstant {
+        value,
+        result,
+        reg_locale: ops::RegType::Imm,
+        ty,
+        is_symbol: false,
+    }));
+    result
+}
 
 // crustify:todo: e471_simplifyConditionals
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:194  (118 body lines, level 2)
@@ -159,7 +335,12 @@ pub fn update_cmp_i_predicate(if_op: IfPredicate<'_>, new_predicate: CmpPredicat
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{IfPredicate, update_cmp_i_predicate};
+    use super::{
+        ConstraintDim, ConstraintRow, IfCondition, IfPredicate, transform_if_condition,
+        update_cmp_i_predicate,
+    };
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::sentient::CmpPredicate;
     use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
 
@@ -174,6 +355,94 @@ mod unit_tests {
             then_body: Vec::new(),
             else_body: Vec::new(),
         })
+    }
+
+    /// One dimension of a constraint row.
+    fn dim(value: Val, coeff: i64) -> ConstraintDim {
+        ConstraintDim {
+            value,
+            ty: ScalarTy::Index,
+            coeff,
+        }
+    }
+
+    /// The `sentient.scalar_constant` a transformed side is given.
+    fn constant_of(value: i64, result: Val) -> Op {
+        Op::Sentient(ops::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: ops::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// e371 — `%a - %b - 1 >= 0` becomes `%a > %b`, a one-sided row takes a created constant for its
+    /// other operand, and a row this `sentient.if` cannot hold changes nothing.
+    #[test]
+    fn a_constraint_row_becomes_the_ifs_two_operands() {
+        let mut values = Values::default();
+        let mut consts: Vec<Op> = Vec::new();
+
+        // Both sides present and the constant is the `-1` that turns `sge` into `sgt`.
+        let mut op = if_op(CmpPredicate::Sge);
+        transform_if_condition(
+            IfCondition::of(&mut op).expect("a sentient.if"),
+            &ConstraintRow {
+                dims: vec![dim(Val(7), 1), dim(Val(8), -1), dim(Val(9), 0)],
+                constant: -1,
+            },
+            &mut consts,
+            &mut values,
+        );
+        assert_eq!(
+            op,
+            Op::Sentient(ops::Op::If {
+                predicate: CmpPredicate::Sgt,
+                lhs: Val(7),
+                rhs: Val(8),
+                yielded: Vec::new(),
+                dbg_name: None,
+                then_body: Vec::new(),
+                else_body: Vec::new(),
+            })
+        );
+        // Nothing was created: neither operand is a constant.
+        assert!(consts.is_empty());
+
+        // `%a + 4 >= 0` — the left arg keeps operand 0 and the NEGATED constant becomes operand 1.
+        let mut op = if_op(CmpPredicate::Slt);
+        transform_if_condition(
+            IfCondition::of(&mut op).expect("a sentient.if"),
+            &ConstraintRow {
+                dims: vec![dim(Val(7), 1)],
+                constant: 4,
+            },
+            &mut consts,
+            &mut values,
+        );
+        let created = Val(0);
+        assert_eq!(consts, vec![constant_of(-4, created)]);
+        assert_eq!(
+            IfCondition::of(&mut op).map(|c| (c.get(), *c.lhs, *c.rhs)),
+            Some((CmpPredicate::Sge, Val(7), created))
+        );
+
+        // ⛔ THE NO-OP THE FIVE `return`s ARE: a coefficient of 2 is a multiplication this pass does
+        // not simplify, so the op and the const builder are both left exactly as they were.
+        let mut op = if_op(CmpPredicate::Sge);
+        let before = op.clone();
+        transform_if_condition(
+            IfCondition::of(&mut op).expect("a sentient.if"),
+            &ConstraintRow {
+                dims: vec![dim(Val(7), 2)],
+                constant: -1,
+            },
+            &mut consts,
+            &mut values,
+        );
+        assert_eq!(op, before);
+        assert_eq!(consts.len(), 1);
     }
 
     /// e179 — an ordering is rewritten and `eq`/`ne` are left exactly as they were.

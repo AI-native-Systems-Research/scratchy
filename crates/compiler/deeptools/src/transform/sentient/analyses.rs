@@ -14,6 +14,7 @@ use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::sentient::RegType;
 use crate::islands::sentient::dialects::{Op, Val};
 use crate::transform::sentient::canonicalize_xrf_pointers::XrfMinExpr;
 
@@ -272,6 +273,23 @@ pub trait ExpressionEvaluator {
         let _ = (ev, bound);
         todo!(
             "EvaluatedValue::isAnyValLessThan (Analyses/ExpressionEvaluatorUtils.h:71) — out of campaign scope"
+        )
+    }
+
+    /// THE FOUR QUERIES OF [`Evaluation`] ASKED OF A STORED HANDLE — `isKnownAbsolute()`, `baseValue()`
+    /// and the offsets (`Analyses/ExpressionEvaluatorUtils.h:103-104`, `:118`, `:141`) read off the
+    /// arena entry `ev` names, exactly as [`ExpressionEvaluator::evaluate_value`] reads them off the
+    /// entry it has just made.
+    ///
+    /// ⛔ THE DECODE IS THE ANALYSIS'S, NOT OURS — see the note on
+    /// [`ExpressionEvaluator::build_offset_value_of`]: nothing here may reconstruct an [`Evaluation`]
+    /// from a handle. It is a seam because a pass that MEMOISES still has to ask a ported range test a
+    /// question about what it stored: `ScalarOpMerging::isFieldUnrollCandidate` (`:1160`) hands
+    /// `doesImmutableImmExceedRange` a `const EvaluatedValue &` it has been carrying for two loops.
+    fn evaluation_of(&mut self, ev: EvaluatedValue) -> Evaluation {
+        let _ = ev;
+        todo!(
+            "EvaluatedValue::isKnownAbsolute/baseValue/offsetValue (Analyses/ExpressionEvaluatorUtils.h:103) — out of campaign scope"
         )
     }
 }
@@ -855,5 +873,33 @@ impl ExprInfoMap {
     pub fn expr_info_at(&self, unit: UnitIndex) -> Option<&PropagatedExpr> {
         let bucket = *self.buckets.get(unit.0 as usize)?;
         self.exprs.get(bucket)?.as_ref()
+    }
+}
+
+/// THE `RegisterPressure` A PASS CONSTRUCTS OVER ONE UNIT — a trait, for the same reason
+/// [`ExpressionEvaluator`] is one: the analysis is not in this campaign and a test must still be able
+/// to state its answers.
+///
+/// ⛔ `Analyses/RegisterPressureAnalysis.{h,cpp}` IS OUT OF CAMPAIGN SCOPE — and so is the
+/// `Liveness` every constructor of it takes (`RegisterPressureAnalysis.h:54-56`) — so the crate's only
+/// implementation is [`OutOfScopeRegisterPressure`] and its one method is a `todo!`.
+///
+/// ⭐ ONE METRIC, NOT THE `enum class Metric`: `kNumRegisters` is `kDefault` (`:37-39`) and is the only
+/// one any ported caller asks for; the other three need the `dcc_ctx` this seam does not carry (`:53`).
+pub trait RegisterPressure {
+    /// `getOrComputeRegisterPressure(locale, Metric::kNumRegisters)` (`:71`) — how many registers of
+    /// `locale` the unit is estimated to need.
+    fn num_registers(&mut self, locale: RegType) -> u32;
+}
+
+/// THE ONE CRATE IMPLEMENTATION: register pressure is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeRegisterPressure;
+
+impl RegisterPressure for OutOfScopeRegisterPressure {
+    fn num_registers(&mut self, _locale: RegType) -> u32 {
+        todo!(
+            "RegisterPressure::getOrComputeRegisterPressure (Analyses/RegisterPressureAnalysis.h:71) — out of campaign scope"
+        )
     }
 }
