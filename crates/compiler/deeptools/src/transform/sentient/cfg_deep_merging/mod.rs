@@ -76,8 +76,64 @@
 //! |---|---|---|---|---|
 //! | `e022_runOnOperation` | 022 | 0 | 27 | `dcc/src/Transform/Sentient/CFGDeepMerging.cpp:62` |
 
+use crate::arch::Arch;
+use crate::islands::sentient::ProgramUnits;
 
-// crustify:todo: e022_runOnOperation
-//   authority : dcc/src/Transform/Sentient/CFGDeepMerging.cpp:62  (27 body lines, level 0)
-//   original  : void CFGDeepMergingPass::runOnOperation()
+/// `-dcc-cfg-deep-merging-disable`, `cl::init(false)` (`CFGDeepMerging.cpp:37-39`).
+const DISABLE_THIS_PASS: bool = false;
 
+/// `-dcc-cfg-deep-merging-max-num-merges`, `cl::init(50)` — the bound on the merge loop
+/// (`CFGDeepMerging.cpp:41-44`).
+const MAX_NUM_OF_MERGES: u32 = 50;
+
+/// Replaces: e022_runOnOperation
+///
+/// Deeply merges sibling conditionals in each program unit, one merge per turn of a loop bounded by
+/// [`MAX_NUM_OF_MERGES`].
+/// ⛔ THE WHOLE EFFECT OF THIS PASS IS `CFGDeepMergingConditionalTree`'s, and that analysis is out of
+/// campaign scope (`Analyses/`, ~11,700 lines). `compute`, `empty` and `mergeConditionals` decide
+/// which conditionals merge and perform the merge; the loop around them cannot be written without its
+/// cursor type, so the walk is ported and the body is a `todo!` naming what is missing. ⛔ Do not
+/// substitute a guess at which siblings would have merged.
+pub fn run_on_operation<A: Arch>(units: &mut ProgramUnits<A>) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for unit in units.iter() {
+        todo!(
+            "CFGDeepMergingConditionalTree::{{compute,empty,mergeConditionals}} \
+             (Analyses/CFGDeepMergingConditionalTree, out of campaign scope) — the do/while merging \
+             siblings over the {} ops of this {:?} unit, bounded at {MAX_NUM_OF_MERGES} merges \
+             (CFGDeepMerging.cpp:66-85)",
+            unit.body.len(),
+            unit.on.kind()
+        )
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
+    use crate::islands::sentient::ProgramUnit;
+    use crate::islands::sentient::dialects::Val;
+    use crate::units::DfirUnit;
+
+    /// ⭐ THE WALK IS WHAT IS TESTABLE HERE: reaching the seam proves the pass visits a unit at all,
+    /// which is the half of this function that IS ported.
+    #[test]
+    #[should_panic(expected = "CFGDeepMergingConditionalTree")]
+    fn e022_walks_every_program_unit_and_stops_at_the_tree() {
+        let mut units = ProgramUnits::of(
+            ProgramUnit::<Dd2> {
+                on: Units::one(DfirUnit::Pe, Val(0)),
+                precision: None,
+                body: Vec::new(),
+                arch: core::marker::PhantomData,
+            },
+            Vec::new(),
+        );
+        run_on_operation(&mut units);
+    }
+}

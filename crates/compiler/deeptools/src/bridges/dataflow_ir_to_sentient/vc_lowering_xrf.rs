@@ -427,6 +427,23 @@ impl<'a> MacXrfIncrements<'a> {
             _ => None,
         }
     }
+
+    /// `MacOp::isXrfRdRelated()` — already answered by [`MacXrfIncrements::of`].
+    ///
+    /// ⭐ READABLE BECAUSE A SECOND CALLER ASKS THE QUESTION WITHOUT SETTING THE ATTRIBUTES.
+    /// `replaceXRFImplicitIncrWithAdd` (senpass e037) branches on both predicates and then writes
+    /// the increments itself, so the two bools have to leave this type; recomputing them at that call
+    /// site would be a second copy of a ported predicate.
+    #[must_use]
+    pub const fn rd_related(&self) -> bool {
+        self.rd_related
+    }
+
+    /// `MacOp::isXrfWtRelated()` — see [`MacXrfIncrements::rd_related`].
+    #[must_use]
+    pub const fn wt_related(&self) -> bool {
+        self.wt_related
+    }
 }
 
 /// HOW FAR THE XRF READ POINTER MOVES PER MAC — `DccExtContext::getXrfRdPtrIncrValAfterMAC`.

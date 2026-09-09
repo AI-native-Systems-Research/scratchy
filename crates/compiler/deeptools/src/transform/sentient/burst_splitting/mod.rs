@@ -79,10 +79,94 @@
 //! | `e430_runOn` | 430 | 2 | 21 | `dcc/src/Transform/Sentient/BurstSplitting.cpp:191` |
 //! | `e495_runOnOperation` | 495 | 3 | 5 | `dcc/src/Transform/Sentient/BurstSplitting.cpp:213` |
 
+use crate::arch::{Arch, Elements};
+use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
+use crate::islands::sentient::ProgramUnit;
+use crate::islands::sentient::dialects::{Op, sentient};
+use crate::units::DfirUnit;
 
-// crustify:todo: e021_splitBurst
-//   authority : dcc/src/Transform/Sentient/BurstSplitting.cpp:112  (47 body lines, level 0)
-//   original  : LogicalResult splitBurst(dataflow::ProgramUnitOp &unit, Operation *op, SenComponents comp)
+/// A MEMORY OP THIS PASS MAY SPLIT, WITH THE BURST IT CARRIES.
+///
+/// ⭐ THE `DT_CHECK` AT `BurstSplitting.cpp:113-116` AS A TYPE. Only `sentient.load_and_send`,
+/// `sentient.receive_and_store` and `sentient.load_and_store` carry a burst this pass understands,
+/// and "Unsupported operation for burst splitting" is then a state [`split_burst`] cannot be reached
+/// in rather than one it aborts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BurstCandidate {
+    /// Where the op is, so the split can be inserted after it.
+    at: OpId,
+    /// `op->getAttr("burst_size")`.
+    burst_size: Elements,
+}
+
+impl BurstCandidate {
+    /// The candidate at `at`, or nothing when that op has no splittable burst.
+    #[must_use]
+    pub fn of(at: OpId, op: &Op) -> Option<BurstCandidate> {
+        let Op::Sentient(
+            sentient::Op::LoadAndSend { extent, .. }
+            | sentient::Op::ReceiveAndStore { extent, .. }
+            | sentient::Op::LoadAndStore { extent, .. },
+        ) = op
+        else {
+            return None;
+        };
+        Some(BurstCandidate {
+            at,
+            burst_size: extent.burst_size,
+        })
+    }
+
+    /// Where it is.
+    #[must_use]
+    pub fn at(&self) -> &OpId {
+        &self.at
+    }
+
+    /// The burst it carries.
+    #[must_use]
+    pub fn burst_size(&self) -> Elements {
+        self.burst_size
+    }
+}
+
+/// Replaces: e021_splitBurst
+///
+/// Costs the split in IBuff — one entry when more than one full burst fits and so a `sentient.for` is
+/// needed, one more for a residual op — then hands the rewrite itself to `burst_utils`.
+/// ⛔ `getMaxBurstSize` IS A PARAMETER, NOT A LOOKUP: it reads the per-unit table on
+/// `dcc_ext_ctx_`, which is outside this campaign, and `DT_CHECK_MSG(max_burst != -1)` (`:126`)
+/// becomes [`Elements`] having no negative value.
+/// ⭐ THE TWO IBUFF WARNINGS COST THIS PORT NOTHING: `haveIbuffSpace` and `getRemainingIbuffSpace`
+/// only feed `LLVM_DEBUG` (`:120-124`, `:143-149`) and change no IR, so `InstructionEstimator` being
+/// out of scope removes no effect.
+pub fn split_burst<A: Arch>(
+    unit: &mut ProgramUnit<A>,
+    candidate: &BurstCandidate,
+    comp: DfirUnit,
+    max_burst: Elements,
+) -> ! {
+    // `DT_CHECK_MSG(burst_size > max_burst)` — and `Elements(0)`, this island's "unbursted", is where
+    // the reference's `-1` sentinel for an undeterminable max burst lands.
+    if max_burst == Elements(0) || candidate.burst_size <= max_burst {
+        todo!(
+            "splitBurst: expected burst_size {:?} to be larger than max_burst {max_burst:?} \
+             (BurstSplitting.cpp:126-133)",
+            candidate.burst_size
+        )
+    }
+    let full_iterations = candidate.burst_size.0 / max_burst.0;
+    let residual = candidate.burst_size.0 % max_burst.0;
+    let required_ibuff = u32::from(full_iterations > 1) + u32::from(residual != 0);
+    todo!(
+        "burst_utils::processBurstSplitOrInterleave (Analyses/BurstUtils.cpp, out of campaign \
+         scope) — splitting {:?} on {:?}/{comp:?} into {full_iterations} bursts of {max_burst:?} \
+         plus a residual of {residual} needs {required_ibuff} additional IBuff \
+         (BurstSplitting.cpp:151-158)",
+        candidate.at,
+        unit.on.kind()
+    )
+}
 
 // crustify:todo: e285_runOn
 //   authority : dcc/src/Transform/Sentient/BurstSplitting.cpp:161  (29 body lines, level 1)
@@ -99,3 +183,28 @@
 //   original  : void runOnOperation()
 //   calls     : e285_runOn, e430_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
+    use crate::islands::sentient::dialects::Val;
+
+    /// The file header's own example: a burst of 264 where 64 is the maximum needs a loop of four
+    /// full bursts AND a residual of 8, so both extra IBuff entries (`BurstSplitting.cpp:10-35`).
+    #[test]
+    #[should_panic(expected = "needs 2 additional IBuff")]
+    fn e021_costs_the_vendors_264_over_64_example_at_two_ibuff() {
+        let mut unit = ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::L3lu, Val(0)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        };
+        let candidate = BurstCandidate {
+            at: OpId::at(&[0]),
+            burst_size: Elements(264),
+        };
+        split_burst(&mut unit, &candidate, DfirUnit::L3lu, Elements(64));
+    }
+}

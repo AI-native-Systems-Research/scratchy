@@ -78,11 +78,6 @@
 //! | `e552_ToggleDescriptor` | 552 | 4 | 68 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2642` |
 //! | `e553_dump` | 553 | 4 | 16 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2724` |
 
-
-// crustify:todo: e015_getInit
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2713  (10 body lines, level 0)
-//   original  : const EvaluatedValue &ToggleDescriptor::getInit() const
-
 // crustify:todo: e552_ToggleDescriptor
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2642  (68 body lines, level 4)
 //   original  : ToggleDescriptor::ToggleDescriptor(ExpressionEvaluator &evaluator, Value base_addr) : DynamicPatternDescriptorBase(PatternKind::kToggle, evaluator)
@@ -93,7 +88,7 @@
 //   original  : void ToggleDescriptor::dump() const
 //   calls     : e278_isValid, e279_canBeSimplified, e401_getC1, e485_getX
 
-
+use crate::islands::sentient::dialects::{Op, Val, defining_op, sentient};
 use crate::transform::sentient::analyses::EvaluatedValue;
 use crate::transform::sentient::{ForRef, IterArgIndex};
 
@@ -111,4 +106,120 @@ pub struct ToggleDescriptor {
     pub iter_arg_index: Option<IterArgIndex>,
     /// `c1_` — the constant term in `X = c1 - Y`.
     pub c1: Option<EvaluatedValue>,
+}
+
+impl ToggleDescriptor {
+    /// Replaces: e015_getInit
+    ///
+    /// The evaluated constant the outer loop's iter arg starts at —
+    /// `getIterOperands()[iter_arg_index_]`.
+    /// ⭐ BOTH `DT_CHECK`s AT `:2714-2715` ARE THE TWO `Option`s THIS TYPE ALREADY CARRIES:
+    /// `iter_arg_index_ >= 0` and `outer_loop_ != nullptr` are absence, not comparisons.
+    /// ⛔ ONLY THE EVALUATION IS MISSING: `evaluator_.evaluateValue(init)` belongs to
+    /// `ExpressionEvaluator` (`Analyses/ExpressionEvaluatorUtils`, out of campaign scope), so it is a
+    /// `todo!` — resolving the operand and proving it constant, everything before that call, is here.
+    #[must_use]
+    pub fn init(&self, body: &[Op]) -> EvaluatedValue {
+        let (Some(outer_loop), Some(iter_arg_index)) = (self.outer_loop, self.iter_arg_index)
+        else {
+            todo!(
+                "getInit on an invalid ToggleDescriptor — `DT_CHECK(iter_arg_index_ >= 0)` and \
+                 `DT_CHECK(outer_loop_)` (AddressPinningAndToggle.cpp:2714-2715), with \
+                 outer_loop_ {:?} and iter_arg_index_ {:?}",
+                self.outer_loop,
+                self.iter_arg_index
+            )
+        };
+        let Some(init) = iter_operand(outer_loop, iter_arg_index, body) else {
+            todo!(
+                "getInit: {outer_loop:?} carries no value at {iter_arg_index:?} in this body, which \
+                 is a loop and an index a valid ToggleDescriptor resolved together \
+                 (AddressPinningAndToggle.cpp:2716-2717)"
+            )
+        };
+        // `DT_CHECK(dcc::utils::isConstant<sentient::ConstantOp>(init))`.
+        let Some(Op::Sentient(sentient::Op::ScalarConstant { .. })) = defining_op(init, body)
+        else {
+            todo!(
+                "getInit: iter arg init {init:?} is expected to be constant in ToggleDescriptor \
+                 (AddressPinningAndToggle.cpp:2718-2719)"
+            )
+        };
+        todo!(
+            "ExpressionEvaluator::evaluateValue (Analyses/ExpressionEvaluatorUtils, out of campaign \
+             scope) on the constant iter arg init {init:?} that {outer_loop:?} starts \
+             {iter_arg_index:?} at (AddressPinningAndToggle.cpp:2720-2721)"
+        )
+    }
+}
+
+/// `outer_loop.getIterOperands()[iter_arg_index]` — the loop named by its induction variable, then
+/// the initial value of the one carried entry that index picks out.
+fn iter_operand(outer_loop: ForRef, iter_arg_index: IterArgIndex, scope: &[Op]) -> Option<Val> {
+    for op in scope {
+        if let Op::Sentient(inner) = op {
+            if let sentient::Op::For { iv, carried, .. } = inner
+                && *iv == outer_loop.0
+            {
+                return carried
+                    .get(iter_arg_index.0 as usize)
+                    .map(|entry| entry.init);
+            }
+            for region in sentient::regions(inner) {
+                if let Some(init) = iter_operand(outer_loop, iter_arg_index, region) {
+                    return Some(init);
+                }
+            }
+        }
+        if let Op::AffineFor(loop_op) = op
+            && let Some(init) = iter_operand(outer_loop, iter_arg_index, &loop_op.body)
+        {
+            return Some(init);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType};
+
+    /// The resolution IS the ported half, so the seam it stops at names the value it resolved.
+    #[test]
+    #[should_panic(expected = "evaluateValue")]
+    fn e015_resolves_the_iter_arg_to_its_constant_init() {
+        let body = vec![
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: 4096,
+                result: Val(1),
+                reg_locale: RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(2),
+                bound: Val(0),
+                carried: vec![Carried {
+                    init: Val(1),
+                    arg: Val(3),
+                    result: Val(4),
+                    reg: Reg {
+                        locale: RegType::Lbr,
+                        index: None,
+                    },
+                    program_header: false,
+                }],
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+        ];
+        let toggle = ToggleDescriptor {
+            outer_loop: Some(ForRef(Val(2))),
+            iter_arg_index: Some(IterArgIndex(0)),
+            c1: None,
+        };
+        let _evaluated = toggle.init(&body);
+    }
 }
