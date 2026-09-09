@@ -127,7 +127,7 @@
 //! both.
 
 pub mod dcg;
-pub(crate) mod ddc;
+pub mod ddc;
 pub(crate) mod ddl;
 pub(crate) mod l3;
 
