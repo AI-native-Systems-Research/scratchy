@@ -323,12 +323,23 @@ impl SetActiveMaskValueGenValue {
     pub(crate) fn mask_values_are_equivalent(a: Option<Val>, b: Option<Val>) -> bool {
         a == b
     }
-}
 
-// crustify:todo: e374_isEqual
-//   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:30  (8 body lines, level 1)
-//   original  : bool isEqual(const DataFlowDefinitionBase &rhs) const final override
-//   calls     : e184_maskValuesAreEquivalent
+    /// Replaces: e374_isEqual
+    ///
+    /// Two SAMV definitions are equal when their mask values are equivalent AND their attribute
+    /// dictionaries are the same — the test the RDE tree commons two `sentient.samv`s on.
+    ///
+    /// ⛔ THE `dynamic_cast` AND ITS `DT_CHECK_MSG` BECAME THE PARAMETER TYPE, exactly as in
+    /// [`Self::copy_to`]: a definition of another subclass is not expressible at this call.
+    ///
+    /// ⛔ `is_optimized_` IS INTENTIONALLY LEFT OUT — the reference says so — and so is `is_dead_` and
+    /// `op_`. That is also why the type does not derive `PartialEq`: it would answer differently.
+    #[must_use]
+    pub(crate) fn is_equal(&self, rhs: &SetActiveMaskValueGenValue) -> bool {
+        SetActiveMaskValueGenValue::mask_values_are_equivalent(self.mask_value, rhs.mask_value())
+            && self.attrs.as_ref() == rhs.attrs()
+    }
+}
 
 // crustify:todo: e473_runOn
 //   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:54  (18 body lines, level 2)
@@ -367,11 +378,48 @@ mod unit_tests {
         })
     }
 
+    /// [`samv`] AT ANOTHER PRECISION — the same mask value, a different attribute dictionary.
+    fn samv_with_precision(mask_value: Val) -> Op {
+        let mut op = samv(mask_value);
+        let Op::Sentient(sentient::Op::Samv { precision, .. }) = &mut op else {
+            unreachable!("`samv` builds a `sentient.samv`")
+        };
+        *precision = RawPrecision(8);
+        op
+    }
+
     /// The attribute dictionary [`samv`] carries.
     fn attrs() -> SamvAttrs {
         SetActiveMaskValueGenValue::of_samv(&samv(Val(7)))
             .and_then(|value| value.attrs().cloned())
             .expect("a samv carries its dictionary")
+    }
+
+    /// e374 — the mask value and the dictionary decide; `is_optimized_`, `is_dead_` and `op_` do not.
+    #[test]
+    fn equal_compares_the_mask_value_and_the_attrs_and_neither_flag() {
+        let value = SetActiveMaskValueGenValue::of(Val(7), attrs(), samv(Val(7)));
+
+        assert!(value.is_equal(&flagged(SetActiveMaskValueGenValue::of(
+            Val(7),
+            attrs(),
+            samv(Val(9))
+        ))));
+        assert!(!value.is_equal(&SetActiveMaskValueGenValue::of(
+            Val(8),
+            attrs(),
+            samv(Val(8))
+        )));
+        assert!(!value.is_equal(&SetActiveMaskValueGenValue::unknown()));
+
+        let other_attrs = SetActiveMaskValueGenValue::of_samv(&samv_with_precision(Val(7)))
+            .and_then(|value| value.attrs().cloned())
+            .expect("a samv carries its dictionary");
+        assert!(!value.is_equal(&SetActiveMaskValueGenValue::of(
+            Val(7),
+            other_attrs,
+            samv(Val(7))
+        )));
     }
 
     /// A GenValue with both base flags set.

@@ -86,6 +86,7 @@
 #![allow(dead_code)]
 
 use crate::islands::dataflow_ir::print;
+use super::set_mask_rde_tree_optimizer::DataflowGen;
 use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 use crate::transform::sentient::cfg_simplification_sentient_level::pattern_simplification_manager::OpPath;
 
@@ -237,15 +238,32 @@ impl SetMaskGenValue {
     }
 }
 
-// crustify:todo: e376_isEqual
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:235  (7 body lines, level 1)
-//   original  : bool SetMaskGenValue::isEqual(const DataFlowDefinitionBase &rhs) const
-//   calls     : e189_maskValuesAreEquivalent
+impl SetMaskGenValue {
+    /// Replaces: e376_isEqual
+    ///
+    /// Two set-mask definitions are equal when their mask values are equivalent — the test the RDE
+    /// tree commons two `sentient.set_mask`es on.
+    ///
+    /// ⛔ THE PARAMETER IS THE WHOLE [`DataflowGen`] AND NOT A `SetMaskGenValue`: unlike e187's
+    /// `assert`, `if (!rhs_p) return false` is an ANSWER, and the answer for an incrmask definition is
+    /// `false` — a `&SetMaskGenValue` here would delete that arm.
+    ///
+    /// ⛔ `is_optimized_`, `is_dead_` AND `op_` ARE LEFT OUT, which is also why the type derives no
+    /// `PartialEq`.
+    #[must_use]
+    pub(crate) fn is_equal(&self, rhs: &DataflowGen, defs: Definitions<'_>) -> bool {
+        let DataflowGen::SetMask(rhs) = rhs else {
+            return false;
+        };
+        SetMaskGenValue::mask_values_are_equivalent(self.mask_value, rhs.mask_value(), defs)
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::transform::sentient::set_mask_re::incr_mask_gen_value::IncrMaskGenValue;
 
     /// `%result = sentient.scalar_constant {value = <value>}`.
     fn constant(result: u32, value: i64) -> Op {
@@ -314,6 +332,31 @@ mod unit_tests {
         assert!(
             !equivalent(Some(Val(1)), Some(Val(9))),
             "nothing defines %9"
+        );
+    }
+
+    /// e376 — equivalent mask values are equal whatever the flags say, and an incrmask definition
+    /// never is.
+    #[test]
+    fn equal_follows_the_mask_values_and_refuses_an_incrmask_definition() {
+        let scope = vec![constant(1, 4), constant(2, 4), constant(3, 5)];
+        let module = [scope.as_slice()];
+        let defs = Definitions::from_innermost(&module);
+        let value = SetMaskGenValue::of(Val(1), OpPath::at(&[(0, 3)]));
+
+        let equal = |rhs| value.is_equal(&rhs, defs);
+        assert!(equal(DataflowGen::SetMask(flagged(SetMaskGenValue::of(
+            Val(2),
+            OpPath::at(&[(0, 9)])
+        )))));
+        assert!(!equal(DataflowGen::SetMask(SetMaskGenValue::of(
+            Val(3),
+            OpPath::at(&[(0, 3)])
+        ))));
+        assert!(!equal(DataflowGen::SetMask(SetMaskGenValue::unknown())));
+        assert!(
+            !equal(DataflowGen::IncrMask(IncrMaskGenValue::unknown())),
+            "`if (!rhs_p) return false` is an answer, not an abort"
         );
     }
 }

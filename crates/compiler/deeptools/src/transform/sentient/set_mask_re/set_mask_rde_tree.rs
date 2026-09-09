@@ -84,8 +84,12 @@
 // ⭐ REMOVE THIS WITH e474: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
+use super::incr_mask_gen_value::IncrMaskGenValue;
+use super::set_mask_gen_value::SetMaskGenValue;
+use super::set_mask_rde_tree_optimizer::DataflowGen;
 use crate::islands::sentient::dialects::{Op, sentient};
 use crate::transform::sentient::analyses::RdeNode;
+use crate::transform::sentient::cfg_simplification_sentient_level::pattern_simplification_manager::OpPath;
 
 /// Replaces: e185_isOperationAUse
 ///
@@ -140,10 +144,49 @@ pub(crate) fn is_simplifiable(node: &RdeNode<'_>) -> bool {
     )
 }
 
-// crustify:todo: e375_initializeDataflowInfo
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:203  (17 body lines, level 1)
-//   original  : void SetMaskRDETree::initializeDataflowInfo(RDENode *node)
-//   calls     : e044_isOperationADef, e185_isOperationAUse
+/// `SetMaskRDETree::isOperationADef` (`SetMaskRE.cpp:199`) — the two ops that generate a definition.
+///
+/// ⛔ NOT `e044_isOperationADef`, WHICH THE WORKLIST NAMES BY COLLISION: that unit is
+/// `ImplicitSyncRDETree`'s override (`ImplicitSyncRE.cpp:94`, a `sentient.sync` with a positive
+/// boundary). This pass's override is a different predicate on a different set of ops and is no
+/// scheduled unit of its own, so it lives here as a helper rather than being borrowed from that pass.
+fn is_operation_a_def(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Sentient(sentient::Op::SetMask { .. } | sentient::Op::IncrMask { .. })
+    )
+}
+
+/// Replaces: e375_initializeDataflowInfo
+///
+/// The node's `setDataflowGen`: a `sentient.set_mask` generates its mask value, a `sentient.incrmask`
+/// its increment, and every other selected node the unknown set-mask value.
+///
+/// ⛔ `None` IS THE EARLY `return`, AND IT IS NOT THE UNKNOWN VALUE: a use that is not also a
+/// definition — the four compute ops — is left with NO gen at all, which is what makes e193's
+/// `if (!sib_gen) break` and e194's `else { break }` stop at one.
+///
+/// ⛔ `assert(setmask_op.getMaskValue())` IS THE ISLAND: `sentient.set_mask` carries a non-optional
+/// `mask_value`, so the abort has no input left to fire on.
+#[must_use]
+pub(crate) fn initialize_dataflow_info(node: &RdeNode<'_>, at: OpPath) -> Option<DataflowGen> {
+    let RdeNode::At { op, .. } = node else {
+        // The root has no operation, so it is neither a use nor a set_mask nor an incrmask.
+        return Some(DataflowGen::SetMask(SetMaskGenValue::unknown()));
+    };
+    if is_operation_a_use(op) && !is_operation_a_def(op) {
+        return None;
+    }
+    match op {
+        Op::Sentient(sentient::Op::SetMask { mask_value, .. }) => Some(DataflowGen::SetMask(
+            SetMaskGenValue::of(*mask_value, at),
+        )),
+        Op::Sentient(sentient::Op::IncrMask { .. }) => IncrMaskGenValue::of_incr_mask(op, at)
+            .map(DataflowGen::IncrMask)
+            .or_else(|| Some(DataflowGen::SetMask(SetMaskGenValue::unknown()))),
+        _ => Some(DataflowGen::SetMask(SetMaskGenValue::unknown())),
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -168,12 +211,68 @@ mod unit_tests {
         Op::Sentient(sentient::Op::Nop { dbg_name: None })
     }
 
+    /// `sentient.vector_unary` — a use of the mask that is not a definition of it.
+    fn vector_unary() -> Op {
+        Op::Sentient(sentient::Op::VectorUnary {
+            mask: Val(90),
+            op_a: sentient::Operand::from(sentient::Port::North),
+            unary_op: sentient::UnaryOp::Floor,
+            result: sentient::ResultPorts::default(),
+            compute_precision: sentient::Precision::Fp16,
+            fold_mode: None,
+            unroll_factor: sentient::UnrollFactor::X1,
+            dbg_name: None,
+        })
+    }
+
     /// e185 — `incrmask` is a use, `set_mask` is not, and neither is anything else.
     #[test]
     fn the_compute_ops_and_incrmask_are_uses() {
         assert!(is_operation_a_use(&incrmask()));
         assert!(!is_operation_a_use(&set_mask(1)));
         assert!(!is_operation_a_use(&nop()));
+    }
+
+    /// e375 — a `set_mask` generates its mask value, an `incrmask` an increment, a use-only op NO gen
+    /// at all, and anything else the unknown set-mask value.
+    #[test]
+    fn only_a_set_mask_or_an_incrmask_generates_a_real_definition() {
+        let at = OpPath::at(&[(0, 2)]);
+        fn node(op: &Op) -> RdeNode<'_> {
+            RdeNode::At { op, leaf: true }
+        }
+
+        let mask = set_mask(4);
+        let Some(DataflowGen::SetMask(mask_gen)) =
+            initialize_dataflow_info(&node(&mask), at.clone())
+        else {
+            unreachable!("a set_mask generates a set-mask definition")
+        };
+        assert_eq!(mask_gen.mask_value(), Some(Val(4)));
+        assert_eq!(mask_gen.op(), Some(&at));
+
+        let incr = incrmask();
+        let Some(DataflowGen::IncrMask(incr_gen)) =
+            initialize_dataflow_info(&node(&incr), at.clone())
+        else {
+            unreachable!("an incrmask is both a use and a definition")
+        };
+        assert!(!incr_gen.is_unknown_value());
+        assert_eq!(incr_gen.op(), Some(&at));
+
+        let unary = vector_unary();
+        assert!(
+            initialize_dataflow_info(&node(&unary), at.clone()).is_none(),
+            "a use that is not a definition gets no gen, which is what ends a sibling search"
+        );
+
+        let other = nop();
+        let Some(DataflowGen::SetMask(unknown)) =
+            initialize_dataflow_info(&node(&other), at.clone())
+        else {
+            unreachable!("every other selected node gets the unknown set-mask value")
+        };
+        assert!(unknown.is_unknown_value());
     }
 
     /// e186 — the root and the six mask-relevant ops stay; any other leaf goes.

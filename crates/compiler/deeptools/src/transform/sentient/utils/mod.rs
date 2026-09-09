@@ -1026,8 +1026,9 @@ const fn ldstiu_imm_info(comp: fields::Comp) -> (ImmWidth, Sign) {
     }
 }
 
-/// `str::eq` is not `const`, and [`ldstiu_imm_info`] needs the opcode spelling compared at build time.
-const fn str_eq(a: &str, b: &str) -> bool {
+/// `str::eq` is not `const`, and [`ldstiu_imm_info`] — like `SetMaskRE`'s e377 — needs the opcode
+/// spelling compared at build time.
+pub(crate) const fn str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;

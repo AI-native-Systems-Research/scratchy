@@ -80,16 +80,160 @@
 //! | `e534_lightWeightSimplifyBinaryArithmetic` | 534 | 3 | 183 | `dcc/src/Transform/Sentient/ScalarSimplifications.cpp:504` |
 //! | `e580_runOldLightWeightSimplifications` | 580 | 4 | 25 | `dcc/src/Transform/Sentient/ScalarSimplifications.cpp:690` |
 
+// ⛔ THE TWO PORTED PREDICATES ARE REACHED ONLY FROM THIS FILE'S TESTS until `e472_createNewOpOrMap`
+// and `e534_lightWeightSimplifyBinaryArithmetic` (levels 2/3) land and call them. CI runs clippy with
+// `-D warnings`, so without this the first ported leaf fails the gate.
+// ⭐ REMOVE THIS WITH e534: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e372_areAllExprsValidToTransform
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:716  (50 body lines, level 1)
-//   original  : bool sentient::areAllExprsValidToTransform( std::vector<FlatExprType>& flat_exprs, SmallVector<unsigned>& indices, PropagationAnalysis::ExprInfoMap* result_info, bool is_load_store)
-//   calls     : e252_size
+use crate::islands::sentient::dialects::{Definitions, Val};
+use crate::transform::sentient::analyses::{ExprInfoMap, UnitIndex};
 
-// crustify:todo: e373_areFlatExprsAndArgsIdentical
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:840  (29 body lines, level 1)
-//   original  : bool sentient::areFlatExprsAndArgsIdentical( std::vector<FlatExprType>& flat_exprs, SmallVector<unsigned>& indices, PropagationAnalysis::ExprInfoMap* result_info, unsigned dim_idx)
-//   calls     : e252_size
+/// `FlatExprType` (`ScalarSimplifications.cpp:35`) FOR ONE UNIT — every flattened affine expression
+/// of that unit's propagated map, each a coefficient per dim then per local var then the constant.
+///
+/// ⛔ ONE UNIT, NOT ONE EXPRESSION: `std::vector<FlatExprType> flat_exprs` is indexed by the unit's
+/// POSITION in `indices` (`:339-359`), and both predicates below then reject any unit whose list holds
+/// more than the one expression `getFlattenedAffineExprs` produced.
+pub type FlatExpr = Vec<Vec<i64>>;
+
+/// `dcc::utils::isInductionVariable` (`Analyses/Utils.cpp:128`) — a `sentient.for`'s own induction
+/// variable, and nothing else.
+///
+/// ⭐ STRUCTURAL, SO NOT AN OUT-OF-SCOPE `todo!`: [`Definitions::for_arg_of`] performs the reference's
+/// `cast<BlockArgument>(val).getOwner()->getParentOp()` walk, and its position 0 IS `getInductionVar()`
+/// — so a carried iter arg, an op result and a region argument of anything else all answer `false`.
+fn is_induction_variable(val: Val, defs: Definitions<'_>) -> bool {
+    matches!(defs.for_arg_of(val), Some((_, 0)))
+}
+
+/// `result_info->getExprInfoAt(indices[unit_idx])->propagated_args_`.
+///
+/// ⛔⛔ THE TWO INDEXES ARE NOT THE SAME NUMBER: `flat_exprs` is read by POSITION in the walk while
+/// `result_info` is read by `indices[position]`, the unit's index in
+/// [`UnitIndexMap`](crate::transform::sentient::analyses::UnitIndexMap). Reading `result_info` by the
+/// position would silently take another unit's arguments.
+fn propagated_args<'a>(
+    result_info: &'a ExprInfoMap,
+    indices: &[UnitIndex],
+    unit_idx: usize,
+) -> Option<&'a [Val]> {
+    let expr_info = result_info.expr_info_at(*indices.get(unit_idx)?)?;
+    Some(&expr_info.propagated_args)
+}
+
+/// Replaces: e372_areAllExprsValidToTransform
+///
+/// Whether every selected unit's flattened expression is one the uniformizing rewrite can build: one
+/// expression, the same dim count throughout, unit coefficients, and no loop iterator among its args.
+///
+/// ⛔ A MISSING `ExprInfo` REJECTS RATHER THAN ABORTS. `simplifyBinaryOperation` builds `flat_exprs`
+/// out of these very buckets behind `DT_CHECK_MSG(expr_info, "Expecting valid ExprInfo for unit")`
+/// (`:344`), so this is unreachable — and refusing the transform is the conservative answer.
+///
+/// ⭐ `expression.size() > 3 || < 1` IS AN `else if` CHAIN, so a size of 1 (a bare constant) passes
+/// every test and a `is_load_store` expression is already capped at 2.
+#[must_use]
+pub fn are_all_exprs_valid_to_transform(
+    flat_exprs: &[FlatExpr],
+    indices: &[UnitIndex],
+    result_info: &ExprInfoMap,
+    is_load_store: bool,
+    defs: Definitions<'_>,
+) -> bool {
+    // `unsigned dim_size = flat_exprs[0][0].size()` — vacuous when no unit was selected.
+    let Some(dim_size) = flat_exprs.first().and_then(|first| first.first()).map(Vec::len) else {
+        return true;
+    };
+    for (unit_idx, flat_expr_at_idx) in flat_exprs.iter().enumerate() {
+        if flat_expr_at_idx.len() > 1 {
+            return false;
+        }
+        let Some(expression) = flat_expr_at_idx.first() else {
+            return false;
+        };
+        if is_load_store && expression.len() > 2 {
+            return false;
+        }
+        if dim_size != expression.len() {
+            return false;
+        }
+        if expression.len() > 3 || expression.is_empty() {
+            return false;
+        } else if expression.len() == 2 {
+            let Some(args) = propagated_args(result_info, indices, unit_idx) else {
+                return false;
+            };
+            if args.first().is_some_and(|arg| is_induction_variable(*arg, defs))
+                || expression[0] != 1
+            {
+                return false;
+            }
+            if is_load_store && expression[1] != 0 {
+                return false;
+            }
+        } else if expression.len() == 3 {
+            let Some(args) = propagated_args(result_info, indices, unit_idx) else {
+                return false;
+            };
+            if args.iter().any(|arg| is_induction_variable(*arg, defs))
+                || expression[2] != 0
+                || expression[0] != 1
+                || expression[1] != 1
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Replaces: e373_areFlatExprsAndArgsIdentical
+///
+/// Whether every selected unit agrees with the first on dim count, on the `dim_idx` coefficient and on
+/// the propagated arguments — the test that one op can stand for all of them.
+///
+/// ⛔ `DT_CHECK(num_flat_exprs > 1)` (`:844`) IS VACUOUS HERE RATHER THAN AN ABORT: with one
+/// expression there is nothing to disagree with, which is the answer the loop already gives.
+///
+/// ⛔ THE ARGUMENT CHECKS ARE GATED ON THE SIZE, NOT ON THE ARGUMENT LIST: `>= 2` reads arg 0 and
+/// `== 3` reads arg 1, because a flattened expression is one coefficient per dim plus the constant
+/// and the caller has already refused any local variables (`:355-357`).
+#[must_use]
+pub fn are_flat_exprs_and_args_identical(
+    flat_exprs: &[FlatExpr],
+    indices: &[UnitIndex],
+    result_info: &ExprInfoMap,
+    dim_idx: usize,
+) -> bool {
+    let Some(first_flat_expr) = flat_exprs.first().and_then(|first| first.first()) else {
+        return true;
+    };
+    let first_args = propagated_args(result_info, indices, 0);
+    for (unit_idx, flat_expr_at_idx) in flat_exprs.iter().enumerate().skip(1) {
+        let Some(flat_expr_at_idx) = flat_expr_at_idx.first() else {
+            return false;
+        };
+        if flat_expr_at_idx.len() != first_flat_expr.len() {
+            return false;
+        }
+        if flat_expr_at_idx.get(dim_idx) != first_flat_expr.get(dim_idx) {
+            return false;
+        }
+        let (Some(args), Some(first_args)) =
+            (propagated_args(result_info, indices, unit_idx), first_args)
+        else {
+            return false;
+        };
+        if flat_expr_at_idx.len() >= 2 && args.first() != first_args.first() {
+            return false;
+        }
+        if flat_expr_at_idx.len() == 3 && args.get(1) != first_args.get(1) {
+            return false;
+        }
+    }
+    true
+}
 
 // crustify:todo: e472_createNewOpOrMap
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:769  (63 body lines, level 2)
@@ -106,3 +250,109 @@
 //   original  : LogicalResult sentient::runOldLightWeightSimplifications(Operation* op)
 //   calls     : e534_lightWeightSimplifyBinaryArithmetic
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::sentient::dialects::{Op, sentient};
+    use crate::transform::sentient::analyses::PropagatedExpr;
+
+    /// `sentient.for %iv = %bound { }` — the loop whose induction variable both predicates see.
+    fn loop_over(iv: Val, bound: Val) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
+            carried: Vec::new(),
+            dbg_name: None,
+            body: Vec::new(),
+        })
+    }
+
+    /// An `ExprInfoMap` of one bucket per unit, in unit order — `getListIdxFromUnitIdx` is the identity.
+    fn expr_info_map(args_per_unit: &[&[Val]]) -> ExprInfoMap {
+        ExprInfoMap {
+            exprs: args_per_unit
+                .iter()
+                .map(|args| {
+                    Some(PropagatedExpr {
+                        propagated_args: args.to_vec(),
+                        ..PropagatedExpr::default()
+                    })
+                })
+                .collect(),
+            buckets: (0..args_per_unit.len()).collect(),
+        }
+    }
+
+    /// e372 — `1 * %arg + 0` on both units transforms; an induction variable argument, a coefficient
+    /// other than 1 and a non-zero constant under `is_load_store` each refuse. The last assertion is
+    /// the index trap: swapping `indices` makes position 1 read the bucket holding the iterator.
+    #[test]
+    fn every_unit_needs_a_unit_coefficient_expression_over_a_non_iterator() {
+        let scope = vec![loop_over(Val(10), Val(11))];
+        let regions: [&[Op]; 1] = [scope.as_slice()];
+        let defs = Definitions::from_innermost(&regions);
+        let indices = [UnitIndex(0), UnitIndex(1)];
+        let identity: Vec<FlatExpr> = vec![vec![vec![1, 0]], vec![vec![1, 0]]];
+
+        let info = expr_info_map(&[&[Val(2)], &[Val(3)]]);
+        assert!(are_all_exprs_valid_to_transform(
+            &identity, &indices, &info, true, defs
+        ));
+
+        let with_iterator = expr_info_map(&[&[Val(10)], &[Val(3)]]);
+        assert!(!are_all_exprs_valid_to_transform(
+            &identity,
+            &indices,
+            &with_iterator,
+            true,
+            defs
+        ));
+
+        let scaled: Vec<FlatExpr> = vec![vec![vec![2, 0]], vec![vec![2, 0]]];
+        assert!(!are_all_exprs_valid_to_transform(
+            &scaled, &indices, &info, true, defs
+        ));
+
+        let offset: Vec<FlatExpr> = vec![vec![vec![1, 4]], vec![vec![1, 4]]];
+        assert!(!are_all_exprs_valid_to_transform(
+            &offset, &indices, &info, true, defs
+        ));
+        assert!(
+            are_all_exprs_valid_to_transform(&offset, &indices, &info, false, defs),
+            "the non-zero constant is refused only for a load or a store"
+        );
+
+        let swapped = [UnitIndex(1), UnitIndex(0)];
+        assert!(
+            !are_all_exprs_valid_to_transform(&identity, &swapped, &with_iterator, true, defs),
+            "position 1 reads `indices[1]`, which is bucket 0 and holds the iterator"
+        );
+    }
+
+    /// e373 — two units agree when the dim count, the `dim_idx` coefficient and the arguments all
+    /// match; a differing argument and a differing coefficient each refuse.
+    #[test]
+    fn identical_means_the_same_dim_count_coefficient_and_arguments() {
+        let indices = [UnitIndex(0), UnitIndex(1)];
+        let identity: Vec<FlatExpr> = vec![vec![vec![1, 0]], vec![vec![1, 0]]];
+
+        let same = expr_info_map(&[&[Val(2)], &[Val(2)]]);
+        assert!(are_flat_exprs_and_args_identical(
+            &identity, &indices, &same, 0
+        ));
+
+        let differing = expr_info_map(&[&[Val(2)], &[Val(3)]]);
+        assert!(!are_flat_exprs_and_args_identical(
+            &identity, &indices, &differing, 0
+        ));
+
+        let scaled: Vec<FlatExpr> = vec![vec![vec![1, 0]], vec![vec![2, 0]]];
+        assert!(!are_flat_exprs_and_args_identical(
+            &scaled, &indices, &same, 0
+        ));
+        assert!(
+            are_flat_exprs_and_args_identical(&scaled, &indices, &same, 1),
+            "only the `dim_idx` coefficient is compared"
+        );
+    }
+}

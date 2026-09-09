@@ -110,6 +110,9 @@ use crate::islands::sentient::dialects::{
     value_reg_locale,
 };
 use crate::islands::sentient::print;
+// The analysis's OWN data types moved to the out-of-scope seam when e372/e373 became their second
+// consumer; the pass still names them unqualified, and so do its existing citations.
+pub use crate::transform::sentient::analyses::{ExprInfoMap, PropagatedMap};
 
 /// `affine::FlatAffineValueConstraints` — THE LOCAL-VARIABLE CONSTRAINT SYSTEM OF ONE FLATTENED
 /// AFFINE EXPRESSION, opaque here.
@@ -443,35 +446,6 @@ fn print_value(val: Val, defs: Definitions<'_>, out: &mut String) {
     }
 }
 
-/// `AffineMap` AS THIS PASS USES ONE — an identity, plus the single structural fact `getBaseExpr`
-/// reads off it.
-///
-/// ⛔ MLIR UPSTREAM AND OUT OF CAMPAIGN SCOPE, exactly like [`FlatAffineValueConstraints`]: the map is
-/// built by `PropagationAnalysis` and flattened by `mlir::getFlattenedAffineExpr`, neither of which is
-/// in this scope. `getResult(0)` is the only expression ever taken from it (`:308`), so the map does
-/// not have to be indexable here.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PropagatedMap {
-    /// WHICH map — `propagated_map_`, held by identity.
-    pub id: u32,
-    /// `getNumDims()` (`:328`) — how many of the flattened coefficients are dimension coefficients.
-    pub num_dims: usize,
-}
-
-/// `PropagationAnalysis::ExprInfo` (`Analyses/PropagationAnalysis.h:38`) — ONE UNIT'S PROPAGATED
-/// EXPRESSION.
-///
-/// ⛔ NOT THIS PASS'S OWN [`ExprInfo`], which is a different class of the same name (`:116`).
-#[derive(Debug, Clone, Default)]
-pub struct PropagatedExpr {
-    /// `propagated_map_`.
-    pub propagated_map: PropagatedMap,
-    /// `propagated_args_` — the SSA values the map's dimensions stand for.
-    pub propagated_args: Vec<Val>,
-    /// `cannot_be_resolved_`.
-    pub cannot_be_resolved: bool,
-}
-
 /// `mlir::getFlattenedAffineExpr`'S THREE OUTPUTS for one expression (`:308-310`).
 #[derive(Debug, Clone, Default)]
 pub struct FlattenedExpr {
@@ -483,31 +457,14 @@ pub struct FlattenedExpr {
     pub num_local_vars: usize,
 }
 
-/// `PropagationAnalysis::ExprInfoMap` (`Analyses/PropagationAnalysis.h:106`) — the BUCKETS of
-/// propagated expressions for one value, and which bucket each unit reads.
-///
-/// ⭐ [`Self::buckets`]`.len()` IS `getUnitNumber()`, so the unit count and the unit→bucket map cannot
-/// disagree; `unit_number() == 0` is the reference's `isGlobal()`.
-#[derive(Debug, Clone, Default)]
-pub struct ExprInfoMap {
-    /// `getExprInfoList()` — `None` is the reference's null bucket.
-    pub exprs: Vec<Option<PropagatedExpr>>,
-    /// `getListIdxFromUnitIdx(i)` for every unit `i`, in unit order.
-    pub buckets: Vec<usize>,
-}
-
-impl ExprInfoMap {
-    /// `getUnitNumber()` (`:223`).
-    #[must_use]
-    pub fn unit_number(&self) -> usize {
-        self.buckets.len()
-    }
-}
-
 /// `PropagationAnalysis` (`Analyses/PropagationAnalysis.h`) — THE SEAM ONTO AN ANALYSIS THIS CAMPAIGN
 /// DOES NOT PORT, the same arrangement [`crate::transform::sentient::analyses`] uses for the others.
 ///
-/// ⛔ SCOPED TO THIS FILE UNTIL A SECOND CONSUMER APPEARS. Hoist it beside those seams when one does;
+/// ⛔ THE TRAIT IS STILL SCOPED TO THIS FILE, BUT ITS DATA TYPES ARE NOT: [`ExprInfoMap`],
+/// [`PropagatedMap`] and
+/// [`PropagatedExpr`](crate::transform::sentient::analyses::PropagatedExpr) sit beside the other seams
+/// now that e372/e373 read a result of this analysis without calling it. Hoist the trait when a second
+/// CALLER appears;
 /// `crustify-senpass/OUTSIDE-DEPS.tsv` names this analysis for several more passes.
 pub trait PropagationAnalysis {
     /// `getAffineExpression(Value)` (`Analyses/PropagationAnalysis.h:308`).
@@ -989,6 +946,7 @@ pub fn clone_value_to_region(val: Val, target: SecondRegion<'_>, vals: &mut Valu
 
 #[cfg(test)]
 mod unit_tests {
+    use crate::transform::sentient::analyses::PropagatedExpr;
     use super::*;
     use crate::arch::Elements;
     use crate::formats::Bits;

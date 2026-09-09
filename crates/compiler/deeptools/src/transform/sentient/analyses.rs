@@ -795,3 +795,65 @@ impl UnitIndexMap for OutOfScopeUnitIndexMap {
         )
     }
 }
+
+/// `AffineMap` AS THE PORTED PASSES USE ONE — an identity, plus the single structural fact
+/// `getBaseExpr` reads off it.
+///
+/// ⛔ MLIR UPSTREAM AND OUT OF CAMPAIGN SCOPE, exactly like `affine::FlatAffineValueConstraints`: the
+/// map is built by `PropagationAnalysis` and flattened by `mlir::getFlattenedAffineExpr`, neither of
+/// which is in this scope. `getResult(0)` is the only expression ever taken from it
+/// (`LiveRangeReduction.cpp:308`), so the map does not have to be indexable here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PropagatedMap {
+    /// WHICH map — `propagated_map_`, held by identity.
+    pub id: u32,
+    /// `getNumDims()` (`:328`) — how many of the flattened coefficients are dimension coefficients.
+    pub num_dims: usize,
+}
+
+/// `PropagationAnalysis::ExprInfo` (`Analyses/PropagationAnalysis.h:38`) — ONE UNIT'S PROPAGATED
+/// EXPRESSION.
+///
+/// ⛔ NOT `LiveRangeReductionPass::ExprInfo`, a different class of the same name
+/// (`LiveRangeReduction.cpp:116`) that lives with the pass that owns it.
+#[derive(Debug, Clone, Default)]
+pub struct PropagatedExpr {
+    /// `propagated_map_`.
+    pub propagated_map: PropagatedMap,
+    /// `propagated_args_` — the SSA values the map's dimensions stand for.
+    pub propagated_args: Vec<Val>,
+    /// `cannot_be_resolved_`.
+    pub cannot_be_resolved: bool,
+}
+
+/// `PropagationAnalysis::ExprInfoMap` (`Analyses/PropagationAnalysis.h:106`) — the BUCKETS of
+/// propagated expressions for one value, and which bucket each unit reads.
+///
+/// ⭐ [`Self::buckets`]`.len()` IS `getUnitNumber()`, so the unit count and the unit→bucket map cannot
+/// disagree; `unit_number() == 0` is the reference's `isGlobal()`.
+#[derive(Debug, Clone, Default)]
+pub struct ExprInfoMap {
+    /// `getExprInfoList()` — `None` is the reference's null bucket.
+    pub exprs: Vec<Option<PropagatedExpr>>,
+    /// `getListIdxFromUnitIdx(i)` for every unit `i`, in unit order.
+    pub buckets: Vec<usize>,
+}
+
+impl ExprInfoMap {
+    /// `getUnitNumber()` (`:223`).
+    #[must_use]
+    pub fn unit_number(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// `getExprInfoAt(idx)` (`Analyses/PropagationAnalysis.h:254`) — the bucket unit `idx` reads.
+    ///
+    /// ⛔ `None` COVERS BOTH OF THE REFERENCE'S ABORTS: `.at()` out of range and the null bucket its
+    /// callers guard with `DT_CHECK_MSG(expr_info, "Expecting valid ExprInfo for unit")`
+    /// (`ScalarSimplifications.cpp:344`).
+    #[must_use]
+    pub fn expr_info_at(&self, unit: UnitIndex) -> Option<&PropagatedExpr> {
+        let bucket = *self.buckets.get(unit.0 as usize)?;
+        self.exprs.get(bucket)?.as_ref()
+    }
+}
