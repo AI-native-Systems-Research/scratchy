@@ -352,6 +352,11 @@ fn regions_of(op: &Op) -> Vec<&[Op]> {
     match op {
         Op::Sentient(inner) => sentient::regions(inner),
         Op::AffineFor(loop_op) => vec![loop_op.body.as_slice()],
+        Op::UniformRegions(regions) => regions
+            .regions()
+            .iter()
+            .map(|region| region.body.as_slice())
+            .collect(),
         Op::Dataflow(_)
         | Op::Agen(_)
         | Op::VectorChain(_)
@@ -369,6 +374,11 @@ fn regions_mut_of(op: &mut Op) -> Vec<&mut Vec<Op>> {
     match op {
         Op::Sentient(inner) => sentient::regions_mut(inner),
         Op::AffineFor(loop_op) => vec![&mut loop_op.body],
+        Op::UniformRegions(regions) => regions
+            .regions_mut()
+            .iter_mut()
+            .map(|region| &mut region.body)
+            .collect(),
         Op::Dataflow(_)
         | Op::Agen(_)
         | Op::VectorChain(_)

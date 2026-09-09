@@ -395,6 +395,11 @@ fn walk(
                 }
             }
             Op::AffineFor(loop_op) => walk(&loop_op.body, at, 0, visit),
+            Op::UniformRegions(regions) => {
+                for (sub_region, region) in regions.regions().iter().enumerate() {
+                    walk(&region.body, at, sub_region as u32, visit);
+                }
+            }
             Op::Dataflow(_)
             | Op::Agen(_)
             | Op::VectorChain(_)
@@ -426,6 +431,11 @@ fn walk_mut(
                 }
             }
             Op::AffineFor(loop_op) => walk_mut(&mut loop_op.body, at, 0, visit),
+            Op::UniformRegions(regions) => {
+                for (sub_region, region) in regions.regions_mut().iter_mut().enumerate() {
+                    walk_mut(&mut region.body, at, sub_region as u32, visit);
+                }
+            }
             Op::Dataflow(_)
             | Op::Agen(_)
             | Op::VectorChain(_)
@@ -465,6 +475,8 @@ fn op_at<'a>(root: &'a [Op], path: &[(u32, u32)]) -> Option<&'a Op> {
             rest,
         ),
         Op::AffineFor(loop_op) => op_at(&loop_op.body, rest),
+        // The path [`walk`] hands out numbers a local region, so this resolves one.
+        Op::UniformRegions(regions) => op_at(&regions.regions().get(region as usize)?.body, rest),
         Op::Dataflow(_)
         | Op::Agen(_)
         | Op::VectorChain(_)
@@ -560,7 +572,8 @@ fn const_value(val: Val, root: &[Op]) -> Option<i64> {
         | Op::Vector(_)
         | Op::Scf(_)
         | Op::Symbol(_)
-        | Op::Uniform(_) => None,
+        | Op::Uniform(_)
+        | Op::UniformRegions(_) => None,
     }
 }
 
@@ -622,7 +635,8 @@ fn scalar_ty_of(val: Val, root: &[Op]) -> Option<ScalarTy> {
         | Op::Vector(_)
         | Op::Scf(_)
         | Op::Symbol(_)
-        | Op::Uniform(_) => None,
+        | Op::Uniform(_)
+        | Op::UniformRegions(_) => None,
     }
 }
 

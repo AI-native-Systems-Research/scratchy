@@ -231,6 +231,7 @@ fn constant_of(op: &Op) -> Option<(ConstKey, Val)> {
         // ⛔ NO `_` ARM — a dialect reaching this rung must be a build error, per the island's rule.
         Op::Sentient(_)
         | Op::Arith(_)
+        | Op::UniformRegions(_)
         | Op::Dataflow(_)
         | Op::Agen(_)
         | Op::VectorChain(_)

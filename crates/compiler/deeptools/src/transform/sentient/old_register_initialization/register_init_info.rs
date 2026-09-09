@@ -346,7 +346,10 @@ pub fn has_uniformize_region(unit_body: &[Op]) -> bool {
     unit_body.iter().any(|op| match op {
         Op::Uniform(
             uniform::Op::UniformizeRegions { .. } | uniform::Op::EqualizePattern { .. },
-        ) => true,
+        )
+        // ⭐ THE SAME TWO OPS, ONE RUNG UP — `isa<UniformizeRegionsOp, EqualizePatternOp>` cannot
+        // tell them apart, so neither may this.
+        | Op::UniformRegions(_) => true,
         Op::Sentient(inner) => sentient::regions(inner)
             .iter()
             .any(|region| has_uniformize_region(region)),

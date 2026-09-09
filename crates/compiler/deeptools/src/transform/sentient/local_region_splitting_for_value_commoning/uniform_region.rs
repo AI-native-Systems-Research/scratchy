@@ -76,7 +76,6 @@
 //! |---|---|---|---|---|
 //! | `e065_dump` | 065 | 0 | 6 | `dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:468` |
 
-
 use super::local_region::{Indent, LocalRegion};
 use crate::islands::sentient::dialects::{Definitions, Val};
 
@@ -134,8 +133,8 @@ impl UniformRegion {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::*;
     use super::super::local_region::OriginalRegion;
+    use super::*;
 
     #[test]
     fn dump_names_the_local_region_count_and_closes_the_brace() {
@@ -145,7 +144,10 @@ mod unit_tests {
             local_regions: Vec::new(),
             original_uro: UniformizeRegions(Val(3)),
         };
-        assert_eq!(ur.dump(defs), "uniform region (with 0 local regions) {\n}\n");
+        assert_eq!(
+            ur.dump(defs),
+            "uniform region (with 0 local regions) {\n}\n"
+        );
     }
 
     /// e064 HAS LANDED, so the seam that used to `todo!` here is a real call: one local region is one
@@ -167,4 +169,3 @@ mod unit_tests {
         );
     }
 }
-

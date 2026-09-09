@@ -13,7 +13,8 @@
 use std::fmt::Write as _;
 
 use crate::islands::sentient::dialects::{
-    Op, affine, agen, arith, dataflow, scf, sentient, symbol, uniform, vector, vectorchain,
+    LocalRegion, Op, UniformRegions, affine, agen, arith, dataflow, scf, sentient, symbol, uniform,
+    vector, vectorchain,
 };
 use crate::islands::sentient::{Program, Run};
 
@@ -127,5 +128,105 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::VectorChain(op) => vectorchain::emit(out, op),
         Op::Symbol(op) => symbol::emit(out, op),
         Op::Uniform(op) => uniform::emit(out, op, depth),
+        // ⭐ THROUGH [`uniform`]'S OWN HEADER FUNCTIONS, so a local region prints identically
+        // whichever rung its body has reached — the same arrangement `Op::AffineFor` above has with
+        // [`affine::for_header`]. Only the BODY loop differs, because only the body's type does.
+        Op::UniformRegions(regions) => {
+            out.push_str(&match regions {
+                UniformRegions::UniformizeRegions { results, .. } => {
+                    uniform::uniformize_header(results)
+                }
+                UniformRegions::EqualizePattern { .. } => uniform::equalize_header(),
+            });
+            for region in regions.regions() {
+                local_region(out, region, depth + 1);
+            }
+            indent(out, depth);
+            out.push_str("}\n");
+        }
+    }
+}
+
+/// ONE LOCAL REGION OF A `uniform.uniformize_regions` AT THIS RUNG — its header, its body and its
+/// closing brace.
+///
+/// ⭐ THE TERMINATOR PRINTS. `printRegion(region, /*printEntryBlockArgs=*/false,
+/// /*printBlockTerminators=*/true)` (`Uniform.cpp:112`) — the region argument is already in the
+/// header, the `uniform.yield` is not.
+fn local_region(out: &mut String, region: &LocalRegion, depth: usize) {
+    indent(out, depth);
+    out.push_str(&uniform::region_header(region.arg, &region.units));
+    for inner in &region.body {
+        emit(out, inner, depth + 1);
+    }
+    indent(out, depth);
+    out.push_str("}\n");
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use crate::islands::dataflow_ir::dialects::{self as lower, Val, uniform as lower_uniform};
+    use crate::islands::sentient::dialects::{LocalRegion, Op, UniformRegions, sentient, uniform};
+    use crate::islands::sentient::print::emit;
+
+    /// ⭐ THE TWO RUNGS CANNOT DISAGREE ABOUT A CHARACTER — the same op, once with a lower-rung body
+    /// and once with this rung's, printed through the same three header functions.
+    ///
+    /// The shape is `dcc/test/Transform/FlatteningLocalRegions/flatten_local_region.mlir:86-88`, the
+    /// one the rung below asserts byte for byte.
+    #[test]
+    fn a_local_region_prints_the_same_at_both_rungs() {
+        let here = Op::UniformRegions(UniformRegions::UniformizeRegions {
+            regions: vec![LocalRegion {
+                arg: Val(1),
+                units: vec![Val(0), Val(2)],
+                body: vec![Op::Uniform(uniform::Op::Yield {
+                    operands: Vec::new(),
+                })],
+            }],
+            results: Vec::new(),
+        });
+        let below = lower::Op::Uniform(lower_uniform::Op::UniformizeRegions {
+            regions: vec![lower_uniform::LocalRegion {
+                arg: Val(1),
+                units: vec![Val(0), Val(2)],
+                body: vec![lower::Op::Uniform(lower_uniform::Op::Yield {
+                    operands: Vec::new(),
+                })],
+            }],
+            results: Vec::new(),
+        });
+
+        let mut got = String::new();
+        emit(&mut got, &here, 0);
+        let mut want = String::new();
+        crate::islands::dataflow_ir::print::emit(&mut want, &below, 0);
+        assert_eq!(got, want);
+
+        // AND A `sentient.*` OP IN THE BODY IS WHY THIS VARIANT EXISTS: it has no lower-rung twin.
+        let sunk = Op::UniformRegions(UniformRegions::EqualizePattern {
+            regions: vec![LocalRegion {
+                arg: Val(1),
+                units: vec![Val(0)],
+                body: vec![Op::Sentient(sentient::Op::ScalarCopy {
+                    input: Val(3),
+                    result: Val(4),
+                    reg: sentient::Reg {
+                        locale: sentient::RegType::Ebr,
+                        index: None,
+                    },
+                    element_size: None,
+                    program_header: false,
+                })],
+            }],
+        });
+        let mut got = String::new();
+        emit(&mut got, &sunk, 0);
+        assert!(
+            got.starts_with(
+                "uniform.equalize_pattern {\n  (%1 -> %0){\n    %4 = sentient.scalar_copy"
+            ),
+            "{got}"
+        );
     }
 }

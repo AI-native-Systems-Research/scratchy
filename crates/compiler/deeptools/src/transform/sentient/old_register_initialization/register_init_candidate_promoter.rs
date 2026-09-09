@@ -121,6 +121,8 @@ fn binds_as_region_arg(op: &Op, val: Val) -> bool {
         Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
             regions.iter().any(|region| region.arg == val)
         }
+        // THE SAME `$arg` LIST, one rung up.
+        Op::UniformRegions(regions) => regions.regions().iter().any(|region| region.arg == val),
         _ => false,
     }
 }
@@ -150,11 +152,20 @@ fn ancestry(val: Val, scope: &[Op], under_uniform: bool) -> Ancestry {
                 Ancestry::Unbound => {}
                 found => return found,
             },
-            // ⭐ THE ONE ARM THAT CAN ANSWER `false`, AND ITS REGIONS ARE A RUNG LOWER: a local
-            // region's body holds [`lower::Op`], so the candidates reachable inside one are the
-            // SHARED ops — `dataflow.get_unit`, `symbol.create_symbol`, `uniform.query_map` — which
-            // is exactly the set entry 112 pairs. A `sentient.*` value bound inside a uniform region
-            // is not expressible here, so no answer is being guessed at.
+            // ⭐ THE OTHER ARM THAT CAN ANSWER `false`, and its regions ARE this rung's — so a
+            // `sentient.*` value sunk into a local region is answered here, not guessed at.
+            Op::UniformRegions(regions) => {
+                for region in regions.regions() {
+                    match ancestry(val, &region.body, true) {
+                        Ancestry::Unbound => {}
+                        found => return found,
+                    }
+                }
+            }
+            // ⭐ THE ONE ARM THAT CAN ANSWER `false` A RUNG LOWER: a local region's body holds
+            // [`lower::Op`], so the candidates reachable inside one are the SHARED ops —
+            // `dataflow.get_unit`, `symbol.create_symbol`, `uniform.query_map` — which is exactly the
+            // set entry 112 pairs.
             Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
                 if regions
                     .iter()

@@ -239,6 +239,12 @@ fn collect(tree: &mut OperationTreeBase<LoopNode>, parent: LoopNodeId, scope: &[
                 }
             }
             Op::AffineFor(loop_op) => collect(tree, parent, &loop_op.body),
+            // ⭐ A LOCAL REGION AT THIS RUNG CAN HOLD ONE, and it is not a loop itself.
+            Op::UniformRegions(regions) => {
+                for region in regions.regions() {
+                    collect(tree, parent, &region.body);
+                }
+            }
             // ⛔ A SHARED-DIALECT REGION CANNOT HOLD A `sentient.for` AT ALL: its body is typed
             // `Vec<`[`crate::islands::dataflow_ir::dialects::Op`]`>`, the rung below, which has no
             // sentient arm.

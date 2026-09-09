@@ -202,6 +202,11 @@ fn insert_nops(block: &mut Vec<Op>, marker: &mut Marker) {
                 }
             }
             Op::AffineFor(loop_op) => insert_nops(&mut loop_op.body, marker),
+            Op::UniformRegions(regions) => {
+                for region in regions.regions_mut() {
+                    insert_nops(&mut region.body, marker);
+                }
+            }
             // ⛔ PROVED ABSENT BY THE TYPE: a lower-rung region holds
             // `crate::islands::dataflow_ir::dialects::Op`, which has no `Sentient` arm — so neither a
             // `sentient.sync` nor any op in the clear list can be inside one.

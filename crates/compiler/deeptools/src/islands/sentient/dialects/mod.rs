@@ -83,6 +83,85 @@ pub struct AffineFor {
     pub dbg_name: Option<String>,
 }
 
+/// ONE REGION OF A [`UniformRegions`], WITH THE UNITS IT IS MAPPED ONTO — the same record as
+/// [`uniform::LocalRegion`], with a body that has reached THIS rung.
+///
+/// ⛔⛔ IT IS THE SAME REGION, NOT A SECOND KIND OF ONE. Every field means what
+/// [`uniform::LocalRegion`]'s means and every citation there applies here; only [`Self::body`]'s
+/// element type differs. See [`UniformRegions`] for why that one difference needs a type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRegion {
+    /// `getRegionArg(i)` (`Uniform.td:96`) — *"whichever unit of [`Self::units`] is running this
+    /// region"*, and the value that NAMES this region: each region binds its own.
+    pub arg: Val,
+    /// The units this region runs on — `getRegionUnitList(i)` (`Uniform.cpp:184`).
+    pub units: Vec<Val>,
+    /// What the region runs, AT THIS RUNG, ending in a `uniform.yield`
+    /// ([`Op::Uniform`]`(`[`uniform::Op::Yield`]`)`).
+    pub body: Vec<Op>,
+}
+
+/// A `uniform.uniformize_regions` OR `uniform.equalize_pattern` WHOSE REGIONS HOLD OPS OF **THIS**
+/// RUNG — the op [`Op::Uniform`] cannot hold.
+///
+/// # ⛔⛔ WITHOUT IT NOTHING CAN BE PUT INTO A LOCAL REGION, AND `SinkScalarCopy` EXISTS TO DO THAT
+///
+/// [`uniform::LocalRegion::body`] is `Vec<`[`crate::islands::dataflow_ir::dialects::Op`]`>` — the rung
+/// BELOW, which has no arm for a `sentient.scalar_copy` at all. `SinkScalarCopyPass::sinkCopyOps`
+/// clones exactly that op into a local region (`OpBuilder builder(region.getPointer()); Operation
+/// *new_op = builder.clone(orig_op)`, `Transform/Sentient/SinkScalarCopy.cpp:222-223`), so with only
+/// [`Op::Uniform`] the pass's whole effect is a type error rather than a port.
+///
+/// ⚠️ THE GAP WAS ALREADY RECORDED, by
+/// [`OriginalRegion`](crate::transform::sentient::local_region_splitting_for_value_commoning::local_region::OriginalRegion),
+/// which names *"a sentient-rung `uniform.uniformize_regions` beside [`AffineFor`]"* as the fix and
+/// e444_analyze/e505_transform as the other units that need it. This is that op.
+///
+/// ⭐ AN ENUM AND NOT A `kind` FIELD, BECAUSE ONLY ONE OF THE TWO BINDS RESULTS.
+/// `EqualizePatternOp` declares `$units`, `$list_sizes` and a `VariadicRegion` and no `let results` at
+/// all (`Uniform.td:196-198`) — so `EqualizePattern { results: .. }` must be unwritable, exactly as it
+/// is in [`uniform::Op`].
+///
+/// ⭐ IT PRINTS THROUGH [`uniform`]'S OWN HEADER FUNCTIONS, so the two rungs cannot disagree about a
+/// character — the same arrangement [`AffineFor`] has with [`affine::for_header`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UniformRegions {
+    /// `uniform.uniformize_regions -> (..) { (%arg -> %0, %2){ .. } .. }` — see
+    /// [`uniform::Op::UniformizeRegions`].
+    UniformizeRegions {
+        /// One record per region, in region order.
+        regions: Vec<LocalRegion>,
+        /// `Variadic<AnyType>:$results` (`Uniform.td:90`) — one per operand of every region's
+        /// `uniform.yield`.
+        results: Vec<Val>,
+    },
+    /// `uniform.equalize_pattern { (%arg -> %0, %2){ .. } .. }` — see
+    /// [`uniform::Op::EqualizePattern`].
+    EqualizePattern {
+        /// One record per region, in region order.
+        regions: Vec<LocalRegion>,
+    },
+}
+
+impl UniformRegions {
+    /// ITS REGIONS, whichever of the two ops this is.
+    #[must_use]
+    pub fn regions(&self) -> &[LocalRegion] {
+        match self {
+            UniformRegions::UniformizeRegions { regions, .. }
+            | UniformRegions::EqualizePattern { regions } => regions,
+        }
+    }
+
+    /// ITS REGIONS, FOR A REWRITE — what a sink writes into.
+    pub fn regions_mut(&mut self) -> &mut Vec<LocalRegion> {
+        match self {
+            UniformRegions::UniformizeRegions { regions, .. }
+            | UniformRegions::EqualizePattern { regions } => regions,
+        }
+    }
+}
+
 /// ONE SENTIENTIR OPERATION, under the dialect that declares it.
 ///
 /// ⛔ NO `_` ARM WHERE THIS IS MATCHED. A new dialect reaching this rung must be a build error.
@@ -142,8 +221,12 @@ pub enum Op {
     /// could not be lifted at all.
     ///
     /// ⭐ ITS REGIONS STAY `Vec<`[`crate::islands::dataflow_ir::dialects::Op`]`>`, like every other
-    /// shared dialect's — the op is the same op whichever rung holds it.
+    /// shared dialect's — the op is the same op whichever rung holds it. ⛔ WHICH IS WHY
+    /// [`Op::UniformRegions`] EXISTS: a local region holding a `sentient.*` op is not this variant.
     Uniform(uniform::Op),
+    /// `Uniform.td` — one of the two region-carrying `uniform` ops whose regions hold ops of THIS
+    /// rung. See [`UniformRegions`].
+    UniformRegions(UniformRegions),
 }
 
 /// ONE SHARED-DIALECT OP AS ITS LOWER-RUNG SELF — `None` for this rung's own dialect.
@@ -166,7 +249,7 @@ pub enum Op {
 pub fn lowered(op: &Op) -> Option<crate::islands::dataflow_ir::dialects::Op> {
     use crate::islands::dataflow_ir::dialects::Op as LowerOp;
     match op {
-        Op::Sentient(_) | Op::AffineFor(_) => None,
+        Op::Sentient(_) | Op::AffineFor(_) | Op::UniformRegions(_) => None,
         Op::Dataflow(op) => Some(LowerOp::Dataflow(op.clone())),
         Op::Agen(op) => Some(LowerOp::Agen(op.clone())),
         Op::VectorChain(op) => Some(LowerOp::VectorChain(op.clone())),
@@ -213,7 +296,22 @@ pub fn results(op: &Op) -> Vec<Val> {
         // ⭐ AN `iter_args` LOOP BINDS ONE RESULT PER CARRIED ADDRESS — the same answer
         // `affine::Op::For` gets from the rung below.
         Op::AffineFor(loop_op) => loop_op.carried.iter().map(|c| c.result).collect(),
-        other => lowered(other).map_or_else(Vec::new, |op| {
+        // ⭐ THE SAME ANSWER [`uniform::Op`] GETS FROM THE RUNG BELOW — `$results`
+        // (`Uniform.td:90`) for `uniformize_regions`, and none at all for `equalize_pattern`, which
+        // declares no `let results` (`:196-198`).
+        Op::UniformRegions(UniformRegions::UniformizeRegions { results, .. }) => results.clone(),
+        Op::UniformRegions(UniformRegions::EqualizePattern { .. }) => Vec::new(),
+        // ⛔ BOUND RATHER THAN A BARE `_`: the shared dialects delegate, and a variant of THIS rung
+        // that fell in here would be answered "no results" instead of being a build error.
+        other @ (Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_)) => lowered(other).map_or_else(Vec::new, |op| {
             crate::islands::dataflow_ir::dialects::results(&op)
         }),
     }
@@ -264,7 +362,25 @@ pub fn operands(op: &Op) -> Vec<Val> {
             reads.extend(loop_op.carried.iter().map(|carried| carried.init));
             reads
         }
-        other => lowered(other).map_or_else(Vec::new, |op| {
+        // ⭐ THE UNITS, CONCATENATED IN REGION ORDER — the one flat `$units` range the reference
+        // slices by the prefix sum of `$list_sizes` (`Uniform.cpp:184-192`), exactly as the rung
+        // below answers for [`uniform::Op`]. ⛔ THE REGION ARGUMENTS ARE NOT HERE: they are block
+        // arguments (`Uniform.td:96`), which is what [`parent_uniform_region_units`] answers for.
+        Op::UniformRegions(regions) => regions
+            .regions()
+            .iter()
+            .flat_map(|region| region.units.iter().copied())
+            .collect(),
+        // ⛔ BOUND RATHER THAN A BARE `_` — see [`results`].
+        other @ (Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_)) => lowered(other).map_or_else(Vec::new, |op| {
             crate::islands::dataflow_ir::dialects::operands(&op)
         }),
     }
@@ -309,7 +425,29 @@ pub fn set_operand(op: &mut Op, at: usize, val: Val) {
                 slot += 1;
             }
         }
-        other => {
+        // ⭐ THE SAME ORDER [`operands`] ANSWERS IN — region by region, units within a region.
+        Op::UniformRegions(regions) => {
+            let mut slot = 0usize;
+            for region in regions.regions_mut() {
+                for unit in &mut region.units {
+                    if slot == at {
+                        *unit = val;
+                        return;
+                    }
+                    slot += 1;
+                }
+            }
+        }
+        // ⛔ BOUND RATHER THAN A BARE `_` — see [`results`].
+        other @ (Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_)) => {
             if let Some(mut lower) = lowered(other) {
                 if let Some(slot) = crate::islands::dataflow_ir::dialects::operands_mut(&mut lower)
                     .into_iter()
@@ -344,7 +482,23 @@ pub fn regions(op: &Op) -> Vec<Vec<Op>> {
             .map(<[Op]>::to_vec)
             .collect(),
         Op::AffineFor(loop_op) => vec![loop_op.body.clone()],
-        other => lowered(other).map_or_else(Vec::new, |op| {
+        // ⭐ ALREADY THIS RUNG'S TYPE, so this is the one variant the clone costs nothing to state;
+        // [`regions_ref`] is the borrowing form.
+        Op::UniformRegions(regions) => regions
+            .regions()
+            .iter()
+            .map(|region| region.body.clone())
+            .collect(),
+        // ⛔ BOUND RATHER THAN A BARE `_` — see [`results`].
+        other @ (Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_)) => lowered(other).map_or_else(Vec::new, |op| {
             crate::islands::dataflow_ir::dialects::regions(&op)
                 .into_iter()
                 .map(|region| region.iter().cloned().map(raised).collect())
@@ -383,11 +537,29 @@ pub fn defining_op(val: Val, scope: &[Op]) -> Option<&Op> {
                     return Some(found);
                 }
             }
+            // ⭐ A LOCAL REGION AT THIS RUNG IS DESCENDED INTO AND ITS ANSWER RETURNED, unlike the
+            // shared-dialect arm below — its ops are values of THIS island's type.
+            Op::UniformRegions(regions) => {
+                for region in regions.regions() {
+                    if let Some(found) = defining_op(val, &region.body) {
+                        return Some(found);
+                    }
+                }
+            }
             // ⛔ A DEFINITION INSIDE A LOWER-RUNG REGION IS PROVED ABSENT, NOT ASSUMED ABSENT. The
             // DataflowIR island's own walk descends into the region and answers for the whole
             // subtree; only if it finds the definition is there nothing this signature can return,
             // because the op it found is a value of the other island's type.
-            other => {
+            // ⛔ BOUND RATHER THAN A BARE `_` — see [`results`].
+            other @ (Op::Dataflow(_)
+            | Op::Agen(_)
+            | Op::VectorChain(_)
+            | Op::Affine(_)
+            | Op::Vector(_)
+            | Op::Arith(_)
+            | Op::Scf(_)
+            | Op::Symbol(_)
+            | Op::Uniform(_)) => {
                 if let Some(op) = lowered(other)
                     && crate::islands::dataflow_ir::dialects::defining_op(
                         val,
@@ -445,7 +617,29 @@ pub fn replace_all_uses_with(scope: &mut [Op], of: Val, with: Val) {
                 }
                 replace_all_uses_with(&mut loop_op.body, of, with);
             }
-            other => {
+            // ⭐ THE UNITS ARE THE USES AND THE BODIES ARE DESCENDED INTO. ⛔ NOT
+            // [`LocalRegion::arg`]: a region argument is BOUND by the region, not read by the op, so
+            // rewriting it would rename a definition (see [`operands`]).
+            Op::UniformRegions(regions) => {
+                for region in regions.regions_mut() {
+                    for unit in &mut region.units {
+                        if *unit == of {
+                            *unit = with;
+                        }
+                    }
+                    replace_all_uses_with(&mut region.body, of, with);
+                }
+            }
+            // ⛔ BOUND RATHER THAN A BARE `_` — see [`results`].
+            other @ (Op::Dataflow(_)
+            | Op::Agen(_)
+            | Op::VectorChain(_)
+            | Op::Affine(_)
+            | Op::Vector(_)
+            | Op::Arith(_)
+            | Op::Scf(_)
+            | Op::Symbol(_)
+            | Op::Uniform(_)) => {
                 if let Some(mut lower) = lowered(other) {
                     replace_all_uses_in_lower(&mut lower, of, with);
                     *other = raised(lower);
@@ -516,8 +710,25 @@ pub fn use_count(of: Val, scope: &[Op]) -> usize {
                     .count();
                 count += use_count(of, &loop_op.body);
             }
+            // ⭐ ARM FOR ARM WITH [`replace_all_uses_with`], which is what makes the count the number
+            // of slots that rewrite would touch.
+            Op::UniformRegions(regions) => {
+                for region in regions.regions() {
+                    count += region.units.iter().filter(|unit| **unit == of).count();
+                    count += use_count(of, &region.body);
+                }
+            }
             // ⭐ THE RUNG BELOW ANSWERS FOR ITS OWN OPS, REGIONS INCLUDED — see [`lowered`].
-            other => {
+            // ⛔ BOUND RATHER THAN A BARE `_` — see [`results`].
+            other @ (Op::Dataflow(_)
+            | Op::Agen(_)
+            | Op::VectorChain(_)
+            | Op::Affine(_)
+            | Op::Vector(_)
+            | Op::Arith(_)
+            | Op::Scf(_)
+            | Op::Symbol(_)
+            | Op::Uniform(_)) => {
                 if let Some(lower) = lowered(other) {
                     count += crate::islands::dataflow_ir::dialects::uses(
                         of,
@@ -553,8 +764,24 @@ pub fn erase_defining_op(scope: &mut Vec<Op>, val: Val) {
                 }
             }
             Op::AffineFor(loop_op) => erase_defining_op(&mut loop_op.body, val),
+            // ⭐ DESCENDED INTO, as in [`defining_op`] — a copy sunk into a local region is erased
+            // from that region.
+            Op::UniformRegions(regions) => {
+                for region in regions.regions_mut() {
+                    erase_defining_op(&mut region.body, val);
+                }
+            }
             // ⛔ PROVED ABSENT, as in [`defining_op`].
-            other => {
+            // ⛔ BOUND RATHER THAN A BARE `_` — see [`results`].
+            other @ (Op::Dataflow(_)
+            | Op::Agen(_)
+            | Op::VectorChain(_)
+            | Op::Affine(_)
+            | Op::Vector(_)
+            | Op::Arith(_)
+            | Op::Scf(_)
+            | Op::Symbol(_)
+            | Op::Uniform(_)) => {
                 if let Some(op) = lowered(other)
                     && crate::islands::dataflow_ir::dialects::defining_op(
                         val,
@@ -655,6 +882,16 @@ pub fn parent_for_arg(val: Val, scope: &[Op]) -> Option<(&Op, usize)> {
             Op::AffineFor(loop_op) => {
                 if let Some(found) = parent_for_arg(val, &loop_op.body) {
                     return Some(found);
+                }
+            }
+            // ⭐ DESCENDED INTO, UNLIKE [`Op::Uniform`] BELOW: a local region at THIS rung CAN hold a
+            // `sentient.for`. ⛔ AND ITS OWN REGION ARGUMENTS ARE NOT CHECKED — they are not a
+            // `sentient.for`'s, which is the `DT_CHECK_MSG(for_op, ..)` this signature encodes.
+            Op::UniformRegions(regions) => {
+                for region in regions.regions() {
+                    if let Some(found) = parent_for_arg(val, &region.body) {
+                        return Some(found);
+                    }
                 }
             }
             // ⛔ NO `_` ARM: the remaining dialects bind region arguments of their own — a
@@ -1033,6 +1270,11 @@ pub fn regions_ref(op: &Op) -> Vec<&[Op]> {
     match op {
         Op::Sentient(inner) => sentient::regions(inner),
         Op::AffineFor(loop_op) => vec![loop_op.body.as_slice()],
+        Op::UniformRegions(regions) => regions
+            .regions()
+            .iter()
+            .map(|region| region.body.as_slice())
+            .collect(),
         // ⛔ NO `_` ARM — a twelfth dialect reaching this rung must be a build error here, not a
         // region tree every walk quietly stops at.
         Op::Dataflow(_)
@@ -1052,6 +1294,12 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
     match op {
         Op::Sentient(inner) => sentient::regions_mut(inner),
         Op::AffineFor(loop_op) => vec![&mut loop_op.body],
+        // ⭐ WHAT A SINK WRITES INTO — see [`UniformRegions`].
+        Op::UniformRegions(regions) => regions
+            .regions_mut()
+            .iter_mut()
+            .map(|region| &mut region.body)
+            .collect(),
         // ⛔ NO `_` ARM — see [`regions_ref`].
         Op::Dataflow(_)
         | Op::Agen(_)
@@ -1245,35 +1493,60 @@ fn collect_unit_ops(units: &[Val], defs: Definitions<'_>) -> Vec<Val> {
     keys
 }
 
-/// THE REGION OF A `uniform.uniformize_regions` OR `uniform.equalize_pattern` THAT BINDS A VALUE AS
-/// ITS ARGUMENT — the `getRegionUnitList(block_arg)` both ops declare (`Uniform.td:98`, `:206`).
+/// THE UNITS OF THE REGION THAT BINDS A VALUE AS ITS ARGUMENT — the
+/// `getRegionUnitList(block_arg)` both `uniform.uniformize_regions` and `uniform.equalize_pattern`
+/// declare (`Uniform.td:98`, `:206`).
+///
+/// ⭐⭐ THE UNIT LIST AND NOT THE REGION, BECAUSE THE REGION HAS TWO TYPES AT THIS RUNG AND ONE
+/// ANSWER. A local region whose body has reached this rung is a [`LocalRegion`] and one that has not
+/// is a [`uniform::LocalRegion`] (see [`UniformRegions`]) — so a signature returning either could
+/// only answer for half the island, while `getRegionUnitList`'s own answer, `ValueRange`, is the same
+/// list in both. Every caller reads exactly that: [`uniform_mapping_values`] looks the units up in a
+/// `uniform.def_immutable_mapping`.
 #[must_use]
-pub fn parent_uniform_region(val: Val, scope: &[Op]) -> Option<&uniform::LocalRegion> {
+pub fn parent_uniform_region_units(val: Val, scope: &[Op]) -> Option<&[Val]> {
     for op in scope {
-        if let Op::Uniform(
-            uniform::Op::UniformizeRegions { regions, .. } | uniform::Op::EqualizePattern { regions },
-        ) = op
-            && let Some(region) = regions.iter().find(|region| region.arg == val)
-        {
-            return Some(region);
-        }
         match op {
+            Op::Uniform(
+                uniform::Op::UniformizeRegions { regions, .. }
+                | uniform::Op::EqualizePattern { regions },
+            ) => {
+                if let Some(region) = regions.iter().find(|region| region.arg == val) {
+                    return Some(&region.units);
+                }
+            }
+            // ⭐ THE SAME QUESTION OF THE SAME OP WITH ITS REGIONS REWRITTEN — and its bodies ARE
+            // descended into, unlike the arm above, because they hold ops of this island's type.
+            Op::UniformRegions(regions) => {
+                if let Some(region) = regions.regions().iter().find(|region| region.arg == val) {
+                    return Some(&region.units);
+                }
+                for region in regions.regions() {
+                    if let Some(found) = parent_uniform_region_units(val, &region.body) {
+                        return Some(found);
+                    }
+                }
+            }
             Op::Sentient(inner) => {
                 for region in sentient::regions(inner) {
-                    if let Some(found) = parent_uniform_region(val, region) {
+                    if let Some(found) = parent_uniform_region_units(val, region) {
                         return Some(found);
                     }
                 }
             }
             Op::AffineFor(loop_op) => {
-                if let Some(found) = parent_uniform_region(val, &loop_op.body) {
+                if let Some(found) = parent_uniform_region_units(val, &loop_op.body) {
                     return Some(found);
                 }
             }
-            // ⛔ NO `_` ARM. A shared dialect's regions hold ops of the rung BELOW this one, whose
-            // `uniform` ops are values of the other island's type — a region found there could not be
-            // returned from this signature. [`defining_op`] records the same limitation.
-            Op::Uniform(_)
+            // ⛔ NO `_` ARM. A shared dialect's regions hold ops of the rung BELOW this one, so a
+            // `uniform` op nested inside one is a value of the other island's type and its regions
+            // are not walked from here. [`defining_op`] records the same limitation.
+            Op::Uniform(
+                uniform::Op::Yield { .. }
+                | uniform::Op::DefImmutableMapping { .. }
+                | uniform::Op::QueryMap { .. },
+            )
             | Op::Dataflow(_)
             | Op::Agen(_)
             | Op::VectorChain(_)
@@ -1288,12 +1561,13 @@ pub fn parent_uniform_region(val: Val, scope: &[Op]) -> Option<&uniform::LocalRe
 }
 
 impl<'a> Definitions<'a> {
-    /// THE UNIFORM REGION THAT BINDS A VALUE AS ITS ARGUMENT — see [`parent_uniform_region`].
+    /// THE UNITS OF THE UNIFORM REGION THAT BINDS A VALUE AS ITS ARGUMENT — see
+    /// [`parent_uniform_region_units`].
     #[must_use]
-    pub fn uniform_region_of(&self, val: Val) -> Option<&'a uniform::LocalRegion> {
+    pub fn uniform_region_units_of(&self, val: Val) -> Option<&'a [Val]> {
         self.regions
             .iter()
-            .find_map(|region| parent_uniform_region(val, region))
+            .find_map(|region| parent_uniform_region_units(val, region))
     }
 }
 
@@ -1315,8 +1589,8 @@ pub fn uniform_mapping_keys(key: Val, defs: Definitions<'_>) -> Vec<Val> {
         Some(_) => Vec::new(),
         // No defining op: a block argument, so the parent op's unit list for that region.
         None => defs
-            .uniform_region_of(key)
-            .map_or_else(Vec::new, |region| collect_unit_ops(&region.units, defs)),
+            .uniform_region_units_of(key)
+            .map_or_else(Vec::new, |units| collect_unit_ops(units, defs)),
     }
 }
 

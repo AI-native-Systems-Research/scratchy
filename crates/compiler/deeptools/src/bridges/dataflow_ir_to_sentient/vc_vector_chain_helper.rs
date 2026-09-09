@@ -979,6 +979,12 @@ pub fn reset_sentient_fmas_if_exists<A: Arch>(unit: &mut SentientProgramUnit<A>)
 fn reset_data_ids(ops: &mut [SenOp]) {
     for op in ops {
         match op {
+            // A LOCAL REGION AT THIS RUNG DOES HOLD COMPUTES — see [`SenOp::UniformRegions`].
+            SenOp::UniformRegions(regions) => {
+                for region in regions.regions_mut() {
+                    reset_data_ids(&mut region.body);
+                }
+            }
             SenOp::Sentient(sentient_op) => match sentient_op {
                 sen::Op::VectorMac {
                     op_a, op_b, op_c, ..

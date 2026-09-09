@@ -225,43 +225,68 @@ pub enum Op {
     },
 }
 
+/// THE OPENING LINE OF A `uniform.uniformize_regions` — the bound results, the name and the arrow
+/// type list, up to and including the `{`.
+///
+/// ⛔ `printArrowTypeList` IS NOT OPTIONAL AND PARENTHESISES ALL BUT ONE. The printer's first act is
+/// `p.printArrowTypeList(op.getResultTypes())` (`Uniform.cpp:103`), and MLIR's own rule is bare for a
+/// single non-function type and parenthesised otherwise — which is exactly the three forms the
+/// vendor's files contain: `-> ()` (305 times), `-> index` (46) and `-> (index, index)` (1).
+///
+/// ⚠️ MLIR NUMBERS AN UNNAMED MULTI-RESULT OP AS `%171:2 = `, and this island writes the
+/// comma-separated form its `scf.if` already writes — see [`super::scf::Op::If::results`]. Nothing
+/// here emits one: `flatten` builds its replacement with `mlir::TypeRange()`
+/// (`FlatteningLocalRegions.cpp:421`).
+///
+/// ⭐ A FUNCTION AND NOT AN INLINE `writeln!` SO THAT BOTH RUNGS WRITE ONE TEXT, exactly as
+/// [`super::affine::for_header`] serves `affine::Op::For` and
+/// [`crate::islands::sentient::dialects::AffineFor`]. The Sentient rung's
+/// [`crate::islands::sentient::dialects::UniformRegions`] is this op with its regions rewritten in
+/// place, so a second rendering of the header would be a second thing to keep in step.
+#[must_use]
+pub(crate) fn uniformize_header(results: &[Val]) -> String {
+    let result_tys = match results.len() {
+        0 => " -> ()".to_string(),
+        1 => " -> index".to_string(),
+        n => format!(" -> ({})", vec!["index"; n].join(", ")),
+    };
+    let bound = if results.is_empty() {
+        String::new()
+    } else {
+        format!("{} = ", print::vals(results))
+    };
+    format!("{bound}uniform.uniformize_regions{result_tys} {{\n")
+}
+
+/// THE OPENING LINE OF A `uniform.equalize_pattern`.
+///
+/// ⛔ NO RESULT LIST AND NO ARROW. `p << " {"` is the printer's first act (`Uniform.cpp:280`); the
+/// region headers below it are `uniformize_regions`' character for character (`:284-287` against
+/// `:109-112`). See [`uniformize_header`] for why this is a function.
+#[must_use]
+pub(crate) fn equalize_header() -> String {
+    "uniform.equalize_pattern {\n".to_string()
+}
+
+/// ONE REGION'S HEADER — `(%arg1 -> %0, %2){`, up to and including the newline.
+///
+/// ⛔ NO SPACE BEFORE THE BRACE. `p << '(' << arg << " -> "; printOperands(units); p << ')';
+/// p.printRegion(..)` (`Uniform.cpp:109-112`) puts the region's own `{` straight after the `)`, and
+/// the vendor's text is `(%arg1 -> %0, %2){` (`flatten_local_region.mlir:87`) — one character apart
+/// from every other region header in this island.
+#[must_use]
+pub(crate) fn region_header(arg: Val, units: &[Val]) -> String {
+    format!("({} -> {}){{\n", print::val(arg), print::vals(units))
+}
+
 /// ONE `uniform` OP AS TEXT. The caller has already indented the opening line.
 pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
     match op {
         Op::UniformizeRegions { regions, results } => {
-            // ⛔ `printArrowTypeList` IS NOT OPTIONAL AND PARENTHESISES ALL BUT ONE. The printer's
-            // first act is `p.printArrowTypeList(op.getResultTypes())` (`Uniform.cpp:103`), and
-            // MLIR's own rule is bare for a single non-function type and parenthesised otherwise —
-            // which is exactly the three forms the vendor's files contain: `-> ()` (305 times),
-            // `-> index` (46) and `-> (index, index)` (1).
-            let result_tys = match results.len() {
-                0 => " -> ()".to_string(),
-                1 => " -> index".to_string(),
-                n => format!(" -> ({})", vec!["index"; n].join(", ")),
-            };
-            // ⚠️ MLIR NUMBERS AN UNNAMED MULTI-RESULT OP AS `%171:2 = `, and this island writes the
-            // comma-separated form its `scf.if` already writes — see
-            // [`super::scf::Op::If::results`]. Nothing here emits one: `flatten` builds its
-            // replacement with `mlir::TypeRange()` (`FlatteningLocalRegions.cpp:421`).
-            let bound = if results.is_empty() {
-                String::new()
-            } else {
-                format!("{} = ", print::vals(results))
-            };
-            let _ = writeln!(out, "{bound}uniform.uniformize_regions{result_tys} {{");
+            out.push_str(&uniformize_header(results));
             for region in regions {
                 print::indent(out, depth + 1);
-                // ⛔ NO SPACE BEFORE THE BRACE. `p << '(' << arg << " -> "; printOperands(units);
-                // p << ')'; p.printRegion(..)` (`Uniform.cpp:109-112`) puts the region's own `{`
-                // straight after the `)`, and the vendor's text is `(%arg1 -> %0, %2){`
-                // (`flatten_local_region.mlir:87`) — one character apart from every other region
-                // header in this island.
-                let _ = writeln!(
-                    out,
-                    "({} -> {}){{",
-                    print::val(region.arg),
-                    print::vals(&region.units)
-                );
+                out.push_str(&region_header(region.arg, &region.units));
                 // ⭐ THE TERMINATOR PRINTS. `printRegion(region, /*printEntryBlockArgs=*/false,
                 // /*printBlockTerminators=*/true)` (`:112`) — the argument is already in the header
                 // above, the `uniform.yield` is not.
@@ -275,18 +300,10 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             out.push_str("}\n");
         }
         Op::EqualizePattern { regions } => {
-            // ⛔ NO RESULT LIST AND NO ARROW. `p << " {"` is the printer's first act
-            // (`Uniform.cpp:280`); the region headers below are `uniformize_regions`' character for
-            // character (`:284-287` against `:109-112`).
-            let _ = writeln!(out, "uniform.equalize_pattern {{");
+            out.push_str(&equalize_header());
             for region in regions {
                 print::indent(out, depth + 1);
-                let _ = writeln!(
-                    out,
-                    "({} -> {}){{",
-                    print::val(region.arg),
-                    print::vals(&region.units)
-                );
+                out.push_str(&region_header(region.arg, &region.units));
                 for inner in &region.body {
                     print::emit(out, inner, depth + 2);
                 }

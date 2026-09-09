@@ -131,6 +131,14 @@ fn insert_beside(body: &mut Vec<Op>, marker: Val, side: Beside, op: Op) -> Optio
                 carried
             }
             Op::AffineFor(loop_op) => insert_beside(&mut loop_op.body, marker, side, op),
+            Op::UniformRegions(regions) => {
+                let mut carried = Some(op);
+                for region in regions.regions_mut() {
+                    let Some(op) = carried.take() else { break };
+                    carried = insert_beside(&mut region.body, marker, side, op);
+                }
+                carried
+            }
             // ⛔ NO `_` ARM. None of these holds a region of THIS rung's ops — every shared
             // dialect's region is a `Vec<dataflow_ir::dialects::Op>` — so a `sentient.vector_mac`
             // or a `sentient.scalar_add` cannot be defined inside one.
@@ -264,6 +272,11 @@ fn plan_xrf_incr_adds<A: Arch>(body: &mut [Op], values: &mut Values, plan: &mut 
                 }
             }
             Op::AffineFor(loop_op) => plan_xrf_incr_adds::<A>(&mut loop_op.body, values, plan),
+            Op::UniformRegions(regions) => {
+                for region in regions.regions_mut() {
+                    plan_xrf_incr_adds::<A>(&mut region.body, values, plan);
+                }
+            }
             // ⛔ NO `_` ARM — no `sentient.vector_mac` can sit in a lower-rung region; see
             // [`insert_beside`].
             Op::Dataflow(_)

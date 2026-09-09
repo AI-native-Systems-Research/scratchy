@@ -190,9 +190,16 @@ fn walk_pre_order(ops: &[Op], visit: &mut impl FnMut(&sentient::Op)) {
                 }
             }
             Op::AffineFor(loop_op) => walk_pre_order(&loop_op.body, visit),
+            // ⭐ THE GAP [`OriginalRegion`] NAMES IS CLOSED: this variant's regions hold THIS rung's
+            // ops, so a `sentient.scalar_copy` inside a local region is visited.
+            Op::UniformRegions(regions) => {
+                for region in regions.regions() {
+                    walk_pre_order(&region.body, visit);
+                }
+            }
             // ⛔ NO `_` ARM: a new dialect at this rung must be a build error here rather than a
-            // subtree this walk quietly skips. None of these can hold a `sentient.scalar_copy` —
-            // `Op::Uniform`'s own regions are the rung below's, the gap [`OriginalRegion`] names.
+            // subtree this walk quietly skips. None of the rest can hold a `sentient.scalar_copy` —
+            // `Op::Uniform`'s own regions are the rung below's.
             Op::Dataflow(_)
             | Op::Agen(_)
             | Op::VectorChain(_)

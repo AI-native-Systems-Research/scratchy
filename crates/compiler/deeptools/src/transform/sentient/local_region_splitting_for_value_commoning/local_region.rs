@@ -76,7 +76,6 @@
 //! |---|---|---|---|---|
 //! | `e064_dump` | 064 | 0 | 10 | `dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:457` |
 
-
 // ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
 // file's own tests until `e624_runOnOperation` (level 6) lands and something calls it. CI runs clippy
 // with `-D warnings`, so without this the first ported leaf of a 9-unit module fails the gate.
@@ -95,14 +94,11 @@ use crate::units::{NumFolds, Residency};
 /// ([`uniform::LocalRegion::arg`](crate::islands::sentient::dialects::uniform::LocalRegion::arg),
 /// `Uniform.td:96`), so that argument names exactly one region.
 ///
-/// ⚠️⚠️ AND THE REGION'S OPS ARE NOT REACHABLE THROUGH IT YET — AN ISLAND GAP, NOT A CHOICE.
-/// [`uniform::LocalRegion::body`](crate::islands::sentient::dialects::uniform::LocalRegion::body) is
-/// `Vec<`[`dataflow_ir::dialects::Op`](crate::islands::dataflow_ir::dialects::Op)`>`, the rung BELOW,
-/// which has no arm for the `sentient.scalar_copy`s this pass reads out of a local region — so
-/// [`super::collect_uniform_maps`] is handed the region's ops directly instead. The fix is a
-/// sentient-rung `uniform.uniformize_regions` beside
-/// [`AffineFor`](crate::islands::sentient::dialects::AffineFor), which is this exact problem already
-/// solved once for `affine.for`; e444_analyze and e505_transform are the units that need it.
+/// ⚠️ AND THE REGION'S OPS ARE STILL NOT REACHABLE THROUGH IT HERE — but the island gap is CLOSED:
+/// [`Op::UniformRegions`](crate::islands::sentient::dialects::Op::UniformRegions) is the sentient-rung
+/// `uniform.uniformize_regions`, whose regions hold THIS rung's ops. `e444_analyze` and
+/// `e505_transform` are the units that must take this identity to it; until then
+/// [`super::collect_uniform_maps`] is handed the region's ops directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OriginalRegion(pub Val);
 
@@ -120,9 +116,11 @@ pub struct LocalRegion {
 
 /// HOW FAR A DUMP IS INDENTED — `llvm::raw_ostream::indent(int)`'s argument (`:458`).
 ///
-/// ⛔ A TYPE AND NOT A BARE COUNT, so the only caller cannot pass the region's index, its unit count
-/// or any other number that happens to be in scope: [`super::uniform_region::UniformRegion::dump`]
-/// indents every local region by 2 (`:471`).
+/// ⛔ A TYPE AND NOT A BARE COUNT, so a caller cannot pass the region's index, its unit count or any
+/// other number that happens to be in scope: [`super::uniform_region::UniformRegion::dump`] indents
+/// every local region by 2 (`:471`), and
+/// [`RegionInfo::dump`](crate::transform::sentient::sink_scalar_copy::RegionInfo::dump) is the other
+/// `raw_ostream::indent` this crate ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Indent(pub usize);
 
@@ -234,4 +232,3 @@ mod unit_tests {
         );
     }
 }
-

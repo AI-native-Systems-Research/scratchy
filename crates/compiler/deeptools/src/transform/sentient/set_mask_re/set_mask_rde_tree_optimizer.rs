@@ -208,6 +208,9 @@ fn op_at<'a>(root: &'a [Op], path: &[(u32, u32)]) -> Option<&'a Op> {
             rest,
         ),
         Op::AffineFor(loop_op) => op_at(&loop_op.body, rest),
+        // The [`OpPath`] numbers a `uniform.regions` local region like any other sub-region, so this
+        // resolves one — same descent as [`pattern_simplification_manager::op_at`], which builds them.
+        Op::UniformRegions(regions) => op_at(&regions.regions().get(region as usize)?.body, rest),
         Op::Dataflow(_)
         | Op::Agen(_)
         | Op::VectorChain(_)
@@ -236,6 +239,10 @@ fn op_at_mut<'a>(root: &'a mut [Op], path: &[(u32, u32)]) -> Option<&'a mut Op> 
             rest,
         ),
         Op::AffineFor(loop_op) => op_at_mut(&mut loop_op.body, rest),
+        Op::UniformRegions(regions) => op_at_mut(
+            &mut regions.regions_mut().get_mut(region as usize)?.body,
+            rest,
+        ),
         Op::Dataflow(_)
         | Op::Agen(_)
         | Op::VectorChain(_)

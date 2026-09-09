@@ -351,6 +351,12 @@ fn regions_of(op: &Op) -> Vec<&[Op]> {
     match op {
         Op::Sentient(inner) => sentient::regions(inner),
         Op::AffineFor(loop_op) => vec![&loop_op.body],
+        // ⭐ THIS ONE'S REGIONS ARE THIS RUNG'S, so a `sentient.for` CAN sit in one.
+        Op::UniformRegions(regions) => regions
+            .regions()
+            .iter()
+            .map(|region| region.body.as_slice())
+            .collect(),
         Op::Arith(_)
         | Op::Scf(_)
         | Op::Affine(_)

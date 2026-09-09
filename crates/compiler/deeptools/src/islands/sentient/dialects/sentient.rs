@@ -2719,7 +2719,6 @@ pub fn block_args(op: &Op) -> Vec<Val> {
     }
 }
 
-
 /// THE VALUES ONE `sentient.*` OP BINDS AS RESULTS, **ASSIGNABLE IN PLACE** — [`results`]' twin.
 ///
 /// # 🛑 IT EXISTS SO AN OP OF THIS DIALECT CAN BE *BLANKED*
@@ -2737,8 +2736,14 @@ pub fn block_args(op: &Op) -> Vec<Val> {
 #[must_use]
 pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
     match op {
-        Op::For { carried, .. } => carried.iter_mut().map(|carried| &mut carried.result).collect(),
-        Op::If { yielded, .. } => yielded.iter_mut().map(|yielded| &mut yielded.result).collect(),
+        Op::For { carried, .. } => carried
+            .iter_mut()
+            .map(|carried| &mut carried.result)
+            .collect(),
+        Op::If { yielded, .. } => yielded
+            .iter_mut()
+            .map(|yielded| &mut yielded.result)
+            .collect(),
         Op::VectorMac { results, .. } => results.iter_mut().collect(),
         Op::LoadAndStore { results, .. } => vec![&mut results.0, &mut results.1],
         Op::LoadAndExtractScalar {
