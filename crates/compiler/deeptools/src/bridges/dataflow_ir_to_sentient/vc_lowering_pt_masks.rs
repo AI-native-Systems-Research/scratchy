@@ -454,6 +454,7 @@ mod insert_pt_mask_ops_tests {
             dbg_name: None,
         });
         let mut unit_body = vec![sen::Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: vals.mint(),
             bound: vals.mint(),
             carried: Vec::new(),
@@ -639,6 +640,7 @@ mod update_loop_mask_tree_tests {
             dbg_name: None,
         });
         let body = vec![sen::Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv,
             bound: vals.mint(),
             carried: Vec::new(),

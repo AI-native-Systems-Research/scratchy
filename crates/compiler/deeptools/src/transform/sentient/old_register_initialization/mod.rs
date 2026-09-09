@@ -394,6 +394,7 @@ mod unit_tests {
     /// One carried position at a width, in or out of the program header.
     fn carried(init: u32, arg: u32, result: u32, element_size: Option<Bits>) -> sentient::Carried {
         sentient::Carried {
+            result_reg: sentient::Reg::UNALLOCATED,
             init: Val(init),
             arg: Val(arg),
             result: Val(result),
@@ -423,6 +424,7 @@ mod unit_tests {
     #[test]
     fn e108_clears_the_program_header_flag_everywhere() {
         let mut body = vec![Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(3),
             bound: Val(4),
             carried: vec![carried(1, 5, 6, None)],
@@ -433,6 +435,7 @@ mod unit_tests {
         assert_eq!(
             body,
             vec![Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(3),
                 bound: Val(4),
                 carried: vec![sentient::Carried {
@@ -472,6 +475,7 @@ mod unit_tests {
                 ty: ScalarTy::Index,
             }),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(6),
                 bound: Val(7),
                 carried: vec![carried(2, 8, 9, Some(Bits(16)))],
@@ -527,6 +531,7 @@ mod unit_tests {
         let loop_op = |first: bool, second: bool, header: bool| {
             vec![Op::Sentient(sentient::Op::For {
                 iv: Val(3),
+                iv_reg: sentient::Reg::UNALLOCATED,
                 bound: Val(4),
                 carried: vec![
                     sentient::Carried {

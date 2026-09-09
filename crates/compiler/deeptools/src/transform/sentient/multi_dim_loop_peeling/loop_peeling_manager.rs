@@ -521,6 +521,7 @@ mod unit_tests {
             constant(8, bound),
             constant(4, four),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv,
                 bound,
                 carried: Vec::new(),
@@ -587,6 +588,7 @@ mod unit_tests {
             constant(8, bound),
             constant(1, one),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv,
                 bound,
                 carried: Vec::new(),
@@ -630,6 +632,7 @@ mod unit_tests {
             constant(7, init),
             Op::Sentient(sentient::Op::For {
                 iv,
+                iv_reg: sentient::Reg::UNALLOCATED,
                 bound,
                 carried: vec![carried(init, arg, result)],
                 dbg_name: None,
@@ -693,6 +696,7 @@ mod unit_tests {
                 locale: sentient::RegType::Lrf,
                 index: None,
             },
+            result_reg: sentient::Reg::UNALLOCATED,
             program_header: false,
             element_size: None,
         }

@@ -1845,6 +1845,7 @@ mod unit_tests {
 
     fn for_op(carried: Vec<Carried>, body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(1),
             bound: Val(20),
             carried,
@@ -1921,6 +1922,7 @@ mod unit_tests {
             constant(0, Val(12)),
             for_op(
                 vec![Carried {
+                    result_reg: Reg::UNALLOCATED,
                     init: Val(10),
                     arg: Val(2),
                     result: Val(3),

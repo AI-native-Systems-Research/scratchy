@@ -511,6 +511,7 @@ mod unit_tests {
     /// A `sentient.for` around `body`.
     fn loop_over(body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(1),
             bound: Val(2),
             carried: Vec::new(),

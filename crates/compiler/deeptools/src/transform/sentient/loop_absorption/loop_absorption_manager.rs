@@ -663,6 +663,7 @@ mod unit_tests {
     /// One `sentient.for` with no carried values.
     fn for_op(iv: Val, bound: Val, body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv,
             bound,
             carried: Vec::new(),
@@ -674,6 +675,7 @@ mod unit_tests {
     /// One `$initArgs` slot of a loop — the five facts a [`sentient::Carried`] keeps together.
     fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
         sentient::Carried {
+            result_reg: sentient::Reg::UNALLOCATED,
             init,
             arg,
             result,
@@ -693,6 +695,7 @@ mod unit_tests {
             results: vec![carried.arg],
         }));
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv,
             bound,
             carried: vec![carried],

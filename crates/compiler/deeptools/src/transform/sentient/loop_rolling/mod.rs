@@ -1225,6 +1225,7 @@ mod unit_tests {
             index: None,
         };
         let carried_of = |init: Val, arg: Val, result: Val| sentient::Carried {
+            result_reg: sentient::Reg::UNALLOCATED,
             init,
             arg,
             result,

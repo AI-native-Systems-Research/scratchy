@@ -607,6 +607,7 @@ mod unit_tests {
 
     fn carried(init: Val, arg: Val, result: Val, element_size: Option<Bits>) -> Carried {
         Carried {
+            result_reg: Reg::UNALLOCATED,
             init,
             arg,
             result,
@@ -621,6 +622,7 @@ mod unit_tests {
 
     fn for_op(entries: Vec<Carried>, body: Vec<Op>) -> Op {
         Op::Sentient(ops::Op::For {
+            iv_reg: ops::Reg::UNALLOCATED,
             iv: Val(0),
             bound: Val(1),
             carried: entries,

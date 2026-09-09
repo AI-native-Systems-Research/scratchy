@@ -1512,6 +1512,7 @@ mod unit_tests {
     #[test]
     fn integer_sequence_get_offset_is_the_carried_arg() {
         let carried = sentient::Carried {
+            result_reg: sentient::Reg::UNALLOCATED,
             init: Val(4),
             arg: Val(5),
             result: Val(6),

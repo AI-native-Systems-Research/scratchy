@@ -508,6 +508,7 @@ mod unit_tests {
             element_size: None,
         });
         let carrier = |init, arg, result| Carried {
+            result_reg: Reg::UNALLOCATED,
             init,
             arg,
             result,
@@ -519,6 +520,7 @@ mod unit_tests {
             element_size: None,
         };
         let loop_op = Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(4),
             bound: Val(5),
             carried: vec![
@@ -588,6 +590,7 @@ mod unit_tests {
     #[test]
     fn e283_assigns_the_iter_arg_slot_after_the_iv_and_the_result_slot_after_the_carried_values() {
         let carried = Carried {
+            result_reg: Reg::UNALLOCATED,
             init: Val(1),
             arg: Val(2),
             result: Val(3),
@@ -599,6 +602,7 @@ mod unit_tests {
             element_size: None,
         };
         let mut body = vec![Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(4),
             bound: Val(5),
             carried: vec![carried],

@@ -402,6 +402,7 @@ mod unit_tests {
             store(StoreSource::Multicast(handle), Val(10)),
             store(StoreSource::Constant(other), Val(11)),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(20),
                 bound: Val(21),
                 carried: Vec::new(),

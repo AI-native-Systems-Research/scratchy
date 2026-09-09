@@ -981,6 +981,7 @@ mod unit_tests {
             ty: ScalarTy::Index,
         }))];
         let for_op = sen::Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(4),
             bound: Val(13),
             carried: Vec::new(),
@@ -1018,6 +1019,7 @@ mod unit_tests {
             ty: ScalarTy::Index,
         }))];
         let for_op = sen::Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(4),
             bound: Val(13),
             carried: Vec::new(),
@@ -1081,6 +1083,7 @@ mod unit_tests {
             ty: ScalarTy::Index,
         }))];
         let for_op = sen::Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(4),
             bound: Val(13),
             carried: Vec::new(),

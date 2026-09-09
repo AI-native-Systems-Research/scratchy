@@ -1119,6 +1119,7 @@ mod unit_tests {
 
     fn carried(init: Val, arg: Val, result: Val) -> ops::Carried {
         ops::Carried {
+            result_reg: ops::Reg::UNALLOCATED,
             init,
             arg,
             result,
@@ -1133,6 +1134,7 @@ mod unit_tests {
 
     fn for_loop(carried: Vec<ops::Carried>, body: Vec<Op>) -> Op {
         Op::Sentient(ops::Op::For {
+            iv_reg: ops::Reg::UNALLOCATED,
             iv: Val(30),
             bound: Val(31),
             carried,

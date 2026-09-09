@@ -947,6 +947,7 @@ mod unit_tests {
             arg: Val(arg),
             result: Val(result),
             reg: reg(locale),
+            result_reg: sentient::Reg::UNALLOCATED,
             program_header: false,
             element_size: None,
         }
@@ -1011,6 +1012,7 @@ mod unit_tests {
     /// `sentient.for %iv = %bound` carrying whatever is given.
     fn for_op(iv: u32, bound: u32, carried: Vec<Carried>, body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(iv),
             bound: Val(bound),
             carried,
@@ -1155,6 +1157,7 @@ mod unit_tests {
     #[test]
     fn the_candidate_subset_follows_the_carried_chain_outwards() {
         let inner_carried = vec![Carried {
+            result_reg: Reg::UNALLOCATED,
             init: Val(2),
             arg: Val(5),
             result: Val(6),
@@ -1173,6 +1176,7 @@ mod unit_tests {
             0,
             10,
             vec![Carried {
+                result_reg: Reg::UNALLOCATED,
                 init: Val(1),
                 arg: Val(2),
                 result: Val(3),

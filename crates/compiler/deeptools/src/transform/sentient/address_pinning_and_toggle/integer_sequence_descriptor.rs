@@ -376,9 +376,11 @@ mod unit_tests {
             constant(5, Val(2)),
             constant(3, Val(3)),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(10),
                 bound,
                 carried: vec![Carried {
+                    result_reg: Reg::UNALLOCATED,
                     init: Val(1),
                     arg: Val(11),
                     result: Val(12),

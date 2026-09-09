@@ -266,6 +266,7 @@ mod unit_tests {
 
         let scope = vec![Op::Sentient(sentient::Op::For {
             iv: Val(1),
+            iv_reg: sentient::Reg::UNALLOCATED,
             bound: Val(0),
             carried: Vec::new(),
             dbg_name: None,

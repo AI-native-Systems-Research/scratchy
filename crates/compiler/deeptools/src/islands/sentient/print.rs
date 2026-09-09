@@ -13,8 +13,8 @@
 use std::fmt::Write as _;
 
 use crate::islands::sentient::dialects::{
-    LocalRegion, Op, UniformRegions, affine, agen, arith, dataflow, scf, sentient, symbol, uniform,
-    vector, vectorchain,
+    LocalRegion, Op, UniformRegions, Val, affine, agen, arith, dataflow, scf, sentient, symbol,
+    uniform, vector, vectorchain,
 };
 use crate::islands::sentient::{Program, Run};
 
@@ -136,7 +136,8 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::UniformRegions(regions) => {
             out.push_str(&match regions {
                 UniformRegions::UniformizeRegions { results, .. } => {
-                    uniform::uniformize_header(results)
+                    let vals: Vec<Val> = results.iter().map(|result| result.val).collect();
+                    uniform::uniformize_header(&vals)
                 }
                 UniformRegions::EqualizePattern { .. } => uniform::equalize_header(),
             });
@@ -144,7 +145,16 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 local_region(out, region, depth + 1);
             }
             indent(out, depth);
-            out.push_str("}\n");
+            out.push('}');
+            // ⛔ THE TRAILING ATTRIBUTE DICT IS PART OF THIS OP'S TEXT — `printOptionalAttrDict` runs
+            // after the closing brace (`Uniform.cpp:118-121`), so an allocated `regIndices` prints
+            // here and nowhere else.
+            if let UniformRegions::UniformizeRegions { results, .. } = regions {
+                out.push_str(&sentient::uniform_reg_dict(
+                    results.iter().map(|result| result.reg),
+                ));
+            }
+            out.push('\n');
         }
     }
 }

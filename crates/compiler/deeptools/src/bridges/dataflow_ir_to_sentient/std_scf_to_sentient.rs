@@ -832,9 +832,11 @@ mod unit_tests {
                     ty: ScalarTy::Index,
                 })),
                 SenOp::Sentient(sen::Op::For {
+                    iv_reg: sen::Reg::UNALLOCATED,
                     iv,
                     bound: n_iterations,
                     carried: vec![sen::Carried {
+                        result_reg: sen::Reg::UNALLOCATED,
                         init,
                         arg,
                         result,
@@ -956,10 +958,10 @@ pub fn match_and_rewrite(scf_for_loop: ScfForLoop<'_>, values: &mut Values) -> V
             // `regLocales` — one `SentientRegTypeAttr::unknown` per result. ⭐ THE `lccr` PUSH-BACK IS
             // COMMENTED OUT in the reference (`:101-103`): *"It should be set in the
             // registerTypeAssignment"*.
-            reg: sen::Reg {
-                locale: sen::RegType::Unknown,
-                index: None,
-            },
+            reg: sen::Reg::UNALLOCATED,
+            // ⭐ THE SAME `unknown`, one slot further along the same array — `RegisterTypeAssignment`
+            // fills the result half too, and it has not run at this rung either.
+            result_reg: sen::Reg::UNALLOCATED,
             program_header: false,
         })
         .collect();
@@ -979,6 +981,7 @@ pub fn match_and_rewrite(scf_for_loop: ScfForLoop<'_>, values: &mut Values) -> V
         })),
         SenOp::Sentient(sen::Op::For {
             iv: scf_for_loop.iv,
+            iv_reg: sen::Reg::UNALLOCATED,
             bound: n_iterations,
             carried,
             dbg_name: scf_for_loop.dbg_name.map(str::to_owned),

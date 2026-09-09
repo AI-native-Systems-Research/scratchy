@@ -1517,6 +1517,28 @@ impl RegIndex {
         RegIndex(Bounded::at::<I>())
     }
 
+    /// AN INDEX AN ALLOCATOR COUNTED OUT — the one constructor for a genuinely computed one.
+    ///
+    /// ⛔ CHECKED AGAINST THE ISA CEILING ONLY, WHICH IS WEAKER THAN THE FILE'S OWN DEPTH. That
+    /// tighter bound is an arch fact (`lccr` is [`crate::arch::Arch::LCCR_REGISTERS`] deep) and this
+    /// crate carries it for one of the nine files; `RegisterPressureAnalysis` is what decides the
+    /// rest and it is outside this campaign.
+    ///
+    /// ⛔ PAST THE CEILING IS A PANIC, NOT A `None`. `naivelyAllocate`'s nine counters are bare
+    /// `int`s written straight into `regIndices` with no check at all
+    /// (`RegisterAllocation.cpp:41-49`), so the reference discovers an overrun as the backend's
+    /// `Register initialization out of boundary`; there is no answer a caller could give instead.
+    #[must_use]
+    pub fn counted(index: u32) -> RegIndex {
+        match Bounded::checked(index) {
+            Some(within) => RegIndex(within),
+            None => panic!(
+                "register index {index} is past kMaxCompRegs (progir.h:508-509) — the overrun the \
+                 backend reports as `Register initialization out of boundary`"
+            ),
+        }
+    }
+
     /// The index.
     #[must_use]
     pub const fn get(self) -> u32 {
@@ -1560,6 +1582,16 @@ pub struct Reg {
     pub index: Option<RegIndex>,
 }
 
+impl Reg {
+    /// NEITHER FACT KNOWN YET — the state every slot is in before `RegisterTypeAssignment` fills the
+    /// locale arrays (`RegisterTypeAssignment.cpp:441-484`) and before an allocator fills the indices,
+    /// and the state the reference prints as `regLocales = [], regIndices = []`.
+    pub const UNALLOCATED: Reg = Reg {
+        locale: RegType::Unknown,
+        index: None,
+    };
+}
+
 /// ONE VALUE A LOOP CARRIES — its initial value, the value it yields, and where it lives.
 ///
 /// # 🛑 FIVE PARALLEL VECTORS WERE FIVE FACTS TRUSTED TO LINE UP
@@ -1595,8 +1627,18 @@ pub struct Carried {
     pub arg: Val,
     /// The matching result — what leaves it.
     pub result: Val,
-    /// Where it lives, from `$regLocales` and `$regIndices` at this position.
+    /// Where it lives — the ITER-ARGUMENT slot, `1 + i`, of `$regLocales` and `$regIndices`.
     pub reg: Reg,
+    /// THE RESULT SLOT, `1 + n + i`, OF THE SAME TWO ARRAYS — ⛔ NOT [`Carried::reg`].
+    ///
+    /// ⛔⛔ THE SAME CARRIED VALUE OWNS TWO SLOTS AND THEY ARE FILLED SEPARATELY.
+    /// `getValueRegIndex` reads an iter argument at `indices[i + 1]` and a RESULT at
+    /// `indices[resultNum + 1 + n]` (`SentientOps.cpp:2001-2004, 2046-2052`), and
+    /// `RegisterTypeAssignment` takes the result slot's locale from the result's own uses rather than
+    /// the argument's (`RegisterTypeAssignment.cpp:445-473`). One `Reg` per carried value made
+    /// `naivelyAllocate`'s answer inexpressible: it draws a fresh counter for every slot and writes
+    /// `-1` into the result slot when the result is unused (`RegisterAllocation.cpp:56-64`).
+    pub result_reg: Reg,
     /// This position's `$programHeader` flag.
     pub program_header: bool,
     /// This position's slot of the `element_sizes` ARRAY — see [`Op::ScalarAdd`] for what an element
@@ -1609,6 +1651,35 @@ pub struct Carried {
     /// convention this island already collapses to one entry per carried value for the register
     /// arrays. One collapse, applied to both, is what keeps the two from disagreeing.
     pub element_size: Option<Bits>,
+}
+
+/// A `sentient.for`'S `regLocales`/`regIndices` IN THE ORDER THE REFERENCE LAYS THEM OUT —
+/// `[iv, iter_args…, results…]`, `1 + 2n` entries for `n` carried values (`SentientOps.cpp:1989`).
+#[must_use]
+pub fn for_reg_slots(iv_reg: Reg, carried: &[Carried]) -> Vec<Reg> {
+    let mut slots = Vec::with_capacity(1 + 2 * carried.len());
+    slots.push(iv_reg);
+    slots.extend(carried.iter().map(|value| value.reg));
+    slots.extend(carried.iter().map(|value| value.result_reg));
+    slots
+}
+
+/// THE SAME SLOTS, WRITABLE — so a pass that rewrites the array cannot put an entry at the wrong end
+/// or disagree with `carried` about how long the array is.
+#[must_use]
+pub fn for_reg_slots_mut<'a>(iv_reg: &'a mut Reg, carried: &'a mut [Carried]) -> Vec<&'a mut Reg> {
+    let count = carried.len();
+    let mut args: Vec<&'a mut Reg> = Vec::with_capacity(count);
+    let mut results: Vec<&'a mut Reg> = Vec::with_capacity(count);
+    for value in carried.iter_mut() {
+        args.push(&mut value.reg);
+        results.push(&mut value.result_reg);
+    }
+    let mut slots = Vec::with_capacity(1 + 2 * count);
+    slots.push(iv_reg);
+    slots.extend(args);
+    slots.extend(results);
+    slots
 }
 
 /// ONE VALUE A `sentient.if` REGION YIELDS.
@@ -1807,6 +1878,15 @@ pub enum Op {
         /// (`VectorChainToSentientPT/Helper.cpp:160`) — so a loop with no nameable induction variable
         /// cannot be the parent of any mask this pipeline accepts.
         iv: Val,
+        /// SLOT 0 OF `$regLocales`/`$regIndices` — THE INDUCTION VARIABLE'S OWN REGISTER.
+        ///
+        /// ⛔⛔ THE ARRAYS ARE `1 + getNumRegionIterArgs() + getNumResults()` LONG and this is the
+        /// entry the loop counter lands in: `setValueRegIndex` writes `reg_indices[0]` for
+        /// `forOp.getInductionVar()` (`SentientOps.cpp:1989-1993`) and `RegisterTypeAssignment` pushes
+        /// the induction variable's locale first (`RegisterTypeAssignment.cpp:443-449`). Without it a
+        /// loop's own `lccr` was unaddressable — see [`super::set_value_reg_index`] — and every index
+        /// `naivelyAllocate` computes landed one slot early.
+        iv_reg: Reg,
         /// `$bound` — the trip count.
         bound: Val,
         /// THE VALUES THE LOOP CARRIES — ⛔ ONE ENTRY EACH, so the iter-operand list and the register
@@ -2509,6 +2589,7 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
         // the loop — which is why an `iter_args` value can be rewritten without touching the body.
         Op::For {
             iv: _,
+            iv_reg: _,
             bound,
             carried,
             dbg_name: _,
@@ -2971,6 +3052,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         // the region (`SentientOps.cpp:998-1010`).
         Op::For {
             iv,
+            iv_reg,
             bound,
             carried,
             dbg_name,
@@ -2985,9 +3067,19 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 format!(" -> ({})", tys.join(", "))
             };
             let results: Vec<Val> = carried.iter().map(|c| c.result).collect();
+            // ⛔ `[iv, iter_args…, results…]`, AND `[]` WHILE NOTHING IN IT IS KNOWN. The reference
+            // has no attribute at all until `RegisterTypeAssignment` fills the locales, and prints
+            // `regLocales = [], regIndices = []` until then — every `sentient.for` of the committed
+            // golden corpus is in exactly that state.
+            let slots = for_reg_slots(*iv_reg, carried);
+            let slots: &[Reg] = if slots.iter().all(|slot| *slot == Reg::UNALLOCATED) {
+                &[]
+            } else {
+                &slots
+            };
             let mut attrs = vec![
-                attr("regLocales", &locale_array(carried.iter().map(|c| c.reg))),
-                attr("regIndices", &index_array(carried.iter().map(|c| c.reg))),
+                attr("regLocales", &locale_array(slots.iter().copied())),
+                attr("regIndices", &index_array(slots.iter().copied())),
             ];
             if carried.iter().any(|c| c.program_header) {
                 attrs.push(attr(
@@ -4048,6 +4140,22 @@ fn extent_attrs(extent: &Extent) -> Vec<String> {
         ));
     }
     attrs
+}
+
+/// `{regIndices = [..], regLocales = [..]}` FOR A `uniform.uniformize_regions` — or nothing while
+/// both are still the absent `OptionalAttr` the `.td` declares (`Uniform.td:87-88`).
+///
+/// ⛔ IT PRINTS AFTER THE CLOSING BRACE AND IN ALPHABETICAL ORDER: `printOptionalAttrDict` is the
+/// printer's last act and hides only `list_sizes` and `newly_added` (`Uniform.cpp:118-121`).
+pub(crate) fn uniform_reg_dict(regs: impl Iterator<Item = Reg>) -> String {
+    let slots: Vec<Reg> = regs.collect();
+    if slots.iter().all(|slot| *slot == Reg::UNALLOCATED) {
+        return String::new();
+    }
+    dict(&[
+        attr("regIndices", &index_array(slots.iter().copied())),
+        attr("regLocales", &locale_array(slots.iter().copied())),
+    ])
 }
 
 /// A `SentientRegTypeArrayAttr` — one locale per carried value.

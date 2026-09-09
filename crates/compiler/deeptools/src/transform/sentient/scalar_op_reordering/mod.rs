@@ -592,9 +592,11 @@ mod unit_tests {
     /// A `sentient.for` carrying one value, running `body`.
     fn for_op(iv: Val, bound: Val, body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv,
             bound,
             carried: vec![sentient::Carried {
+                result_reg: sentient::Reg::UNALLOCATED,
                 init: Val(90),
                 arg: Val(91),
                 result: Val(92),

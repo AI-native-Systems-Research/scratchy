@@ -428,6 +428,7 @@ mod unit_tests {
                 results: Vec::new(),
             }),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(4),
                 bound: Val(1),
                 carried: Vec::new(),
@@ -458,6 +459,7 @@ mod unit_tests {
                 max_value: None,
             }),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(5),
                 bound: Val(3),
                 carried: Vec::new(),

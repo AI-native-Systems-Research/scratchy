@@ -15,7 +15,7 @@ use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient::RegType;
-use crate::islands::sentient::dialects::{Op, Val};
+use crate::islands::sentient::dialects::{Op, Val, sentient};
 use crate::transform::sentient::canonicalize_xrf_pointers::XrfMinExpr;
 
 /// AN `EvaluatedValue` THE EXPRESSION EVALUATOR OWNS — an identity, not a value.
@@ -393,6 +393,23 @@ pub trait PinningSchemeManager {
             "PinningSchemeManager::findClosestPinnedAddr (Analyses/AddressPinningScheme.h:229) — out of campaign scope"
         )
     }
+
+    /// `PinningSchemeManager::findMatchingPinnedAddr(ev, element_size_in_bits)`
+    /// (`Analyses/AddressPinningScheme.h:245`) — WHICH POSITION the already-pinned address `ev`
+    /// occupies, one answer per unit, because the manager holds a scheme per unit (`:254-255`).
+    ///
+    /// ⭐ `None` IS THE REFERENCE'S NEGATIVE `IndexTy`, its "no matching pinned address" — and the one
+    /// thing `computeNewRegisterIndices` refuses on (`ReadOnlyRegisterRenumbering.cpp:126-129`).
+    fn find_matching_pinned_addr(
+        &self,
+        ev: EvaluatedValue,
+        element_size: Bits,
+    ) -> Vec<(Val, Option<sentient::RegIndex>)> {
+        let _ = (ev, element_size);
+        todo!(
+            "PinningSchemeManager::findMatchingPinnedAddr (Analyses/AddressPinningScheme.h:245) — out of campaign scope"
+        )
+    }
 }
 
 /// THE ONE CRATE IMPLEMENTATION, for the reason [`OutOfScopeEvaluator`] is the evaluator's.
@@ -511,11 +528,15 @@ pub trait CandidateCollector {
 
 /// THE `EvaluatorInterface &` THE `Driver` IS HANDED (`RegisterInitialization/Evaluator.h:36`).
 ///
-/// ⛔ OUT OF CAMPAIGN SCOPE — see [`OutOfScopeCandidateEvaluator`]. Only the two methods
-/// `runLocalAnalysis` calls are declared; `evaluateGlobally` lands with e346.
+/// ⛔ OUT OF CAMPAIGN SCOPE — see [`OutOfScopeCandidateEvaluator`]. Only the methods the `Driver`'s
+/// three phases call are declared.
 pub trait CandidateEvaluator {
     /// `evaluateLocally(candidates)` — weights, sorts and re-prioritises IN PLACE.
     fn evaluate_locally(&mut self, candidates: &mut Vec<Candidate>);
+
+    /// `evaluateGlobally(candidates)` (`RegisterInitialization/Evaluator.h:56`) — the global-analysis
+    /// phase's re-weighting, in place, after the grouper has rewritten the list.
+    fn evaluate_globally(&mut self, candidates: &mut Vec<Candidate>);
 
     /// `mergeInto(result, sublist)` (`Evaluator.h:66`) — inserts `sublist` keeping `result` sorted.
     fn merge_into(&mut self, result: &mut Vec<Candidate>, sublist: &[Candidate]);
@@ -523,8 +544,12 @@ pub trait CandidateEvaluator {
 
 /// THE `SelectorInterface &` THE `Driver` IS HANDED (`RegisterInitialization/Selector.h:38`).
 ///
-/// ⛔ OUT OF CAMPAIGN SCOPE — see [`OutOfScopeCandidateSelector`]. `selectGlobally` lands with e346.
+/// ⛔ OUT OF CAMPAIGN SCOPE — see [`OutOfScopeCandidateSelector`].
 pub trait CandidateSelector {
+    /// `selectGlobally(candidates)` (`RegisterInitialization/Selector.h:81`) — the global-analysis
+    /// phase's own purge, over the one list.
+    fn select_globally(&mut self, candidates: &mut Vec<Candidate>);
+
     /// `selectLocally(local, global, core)` (`Selector.h:68`) — PURGES both lists in place; neither
     /// can grow.
     fn select_locally(
@@ -584,6 +609,12 @@ impl CandidateEvaluator for OutOfScopeCandidateEvaluator {
         )
     }
 
+    fn evaluate_globally(&mut self, _candidates: &mut Vec<Candidate>) {
+        todo!(
+            "EvaluatorInterface::evaluateGlobally (RegisterInitialization/Evaluator.h:56) — out of campaign scope"
+        )
+    }
+
     fn merge_into(&mut self, _result: &mut Vec<Candidate>, _sublist: &[Candidate]) {
         todo!(
             "EvaluatorInterface::mergeInto (RegisterInitialization/Evaluator.h:66) — out of campaign scope"
@@ -596,6 +627,12 @@ impl CandidateEvaluator for OutOfScopeCandidateEvaluator {
 pub struct OutOfScopeCandidateSelector;
 
 impl CandidateSelector for OutOfScopeCandidateSelector {
+    fn select_globally(&mut self, _candidates: &mut Vec<Candidate>) {
+        todo!(
+            "SelectorInterface::selectGlobally (RegisterInitialization/Selector.h:81) — out of campaign scope"
+        )
+    }
+
     fn select_locally(
         &mut self,
         _local: &mut Vec<Candidate>,
@@ -628,6 +665,51 @@ impl UniformGroups for OutOfScopeUniformGroups {
     fn group_members_led_by(&self, _leader: Val) -> Vec<Val> {
         todo!(
             "UniformGroupAnalyzer::getGroupMembersLedBy (Analyses/UniformGroupAnalysis.h:72) — out of campaign scope"
+        )
+    }
+}
+
+/// THE `UniformGrouper &` THE `Driver` IS HANDED (`RegisterInitialization/UniformGrouper.h:23`).
+///
+/// ⛔ OUT OF CAMPAIGN SCOPE — see [`OutOfScopeUniformGrouper`]. ⚠️ NOT [`UniformGroups`], which is the
+/// `UniformGroupAnalyzer` the driver reads its group leaders from; this one REWRITES the candidate
+/// list.
+pub trait UniformGrouper {
+    /// `UniformGrouper::run(candidates)` (`RegisterInitialization/UniformGrouper.h:36`) — input AND
+    /// output: the local candidates it groups leave the list and the grouped globals join it.
+    fn run(&mut self, candidates: &mut Vec<Candidate>);
+}
+
+/// THE ONE CRATE IMPLEMENTATION of [`UniformGrouper`]: asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeUniformGrouper;
+
+impl UniformGrouper for OutOfScopeUniformGrouper {
+    fn run(&mut self, _candidates: &mut Vec<Candidate>) {
+        todo!(
+            "UniformGrouper::run (RegisterInitialization/UniformGrouper.h:36) — out of campaign scope"
+        )
+    }
+}
+
+/// THE `Transformer &` THE `Driver` IS HANDED (`RegisterInitialization/Transformer.h:25`) — phase 3,
+/// the one phase that touches the IR and the liveness object.
+///
+/// ⛔ OUT OF CAMPAIGN SCOPE — see [`OutOfScopeCandidateTransformer`].
+pub trait CandidateTransformer {
+    /// `Transformer::run(candidates)` (`RegisterInitialization/Transformer.h:34`) — READ-ONLY over the
+    /// list, which is why the reference's parameter is a `ConstListOfCandidatesRef`.
+    fn run(&mut self, candidates: &[Candidate]);
+}
+
+/// THE ONE CRATE IMPLEMENTATION of [`CandidateTransformer`]: asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeCandidateTransformer;
+
+impl CandidateTransformer for OutOfScopeCandidateTransformer {
+    fn run(&mut self, _candidates: &[Candidate]) {
+        todo!(
+            "Transformer::run (RegisterInitialization/Transformer.h:34) — out of campaign scope"
         )
     }
 }

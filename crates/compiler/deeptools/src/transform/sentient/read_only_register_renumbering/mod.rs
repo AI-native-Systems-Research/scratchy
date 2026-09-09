@@ -94,7 +94,22 @@ use crate::islands::sentient::dialects::{
 };
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
+use crate::transform::sentient::analyses::{ExpressionEvaluator, PinningSchemeManager};
 use crate::workload::Workload;
+
+/// `-dcc-read-only-register-renumbering-disable`, `cl::init(false)` (`:58-61`).
+const DISABLE_THIS_PASS: bool = false;
+
+/// `-dcc-read-only-register-renumbering-force`, `cl::init(false)` (`:63-66`).
+const FORCE_IT_DESPITE_PROG_STITCH: bool = false;
+
+/// `dsc_global_->doProgStitch` as `DccExtContext::getProgStitch()` reads it
+/// (`Utils/DccExtContext.cpp:329`) — whether this compilation stitches programs together.
+///
+/// ⛔ THIS CRATE CARRIES NO `dcc_ext_ctx_` YET (the same gap `register_type_assignment` records), so
+/// the one unit that reads it takes it, rather than a context being invented for one bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProgStitch(pub(crate) bool);
 
 /// THE LBR ADDRESS A CANDIDATE WAS INITIALISED WITH — `AddrTy val_`, the constant its copy reads.
 ///
@@ -108,6 +123,12 @@ impl LbrAddress {
     /// The constant as an address — `None` is the reference's untouched `-1`.
     fn of(value: i64) -> Option<LbrAddress> {
         u64::try_from(value).ok().map(LbrAddress)
+    }
+
+    /// Back to the `AddrTy` the evaluator's `getConstant` takes — TOTAL, because [`Self::of`] built
+    /// this from exactly such an `i64`.
+    fn as_addr(self) -> i64 {
+        i64::try_from(self.0).unwrap_or_default()
     }
 }
 
@@ -142,6 +163,27 @@ pub(crate) struct ReadOnlyRegisterRenumbering {
 }
 
 impl ReadOnlyRegisterRenumbering {
+    /// Replaces: e342_runOnOperation
+    ///
+    /// The pass entry: two gates, then the module walk (`:109-114`).
+    ///
+    /// ⛔ THE PASS IS OFF UNLESS THE PROGRAMS ARE BEING STITCHED. Renumbering an LBR is only sound
+    /// when the pinning scheme it renumbers against is the stitched one, so `-force` is the only other
+    /// way in — and both `cl::opt`s default false, which makes the flag the whole decision.
+    pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+        prog_stitch: ProgStitch,
+    ) {
+        if DISABLE_THIS_PASS {
+            return;
+        }
+        if !prog_stitch.0 && !FORCE_IT_DESPITE_PROG_STITCH {
+            return;
+        }
+        self.run_on_program(program);
+    }
+
     /// Replaces: e127_runOn
     ///
     /// Runs the pass over every `dataflow.program_unit` of the module.
@@ -172,6 +214,51 @@ impl ReadOnlyRegisterRenumbering {
              (ReadOnlyRegisterRenumbering.cpp:183) is not ported yet, and this {} op unit needs it",
             unit.body.len()
         )
+    }
+
+    /// Replaces: e343_computeNewRegisterIndices
+    ///
+    /// Gives every candidate the position its already-pinned address occupies, which becomes its new
+    /// register index (`:117-139`).
+    ///
+    /// ⛔ ONE INDEX FOR EVERY UNIT OR NOTHING: the manager answers per unit, the first answer is taken
+    /// and the rest must agree — the reference's `all_of` — because ONE register index is written onto
+    /// a copy that every unit of the group runs.
+    pub(crate) fn compute_new_register_indices(
+        &mut self,
+        sps_manager: &dyn PinningSchemeManager,
+        evaluator: &mut dyn ExpressionEvaluator,
+    ) {
+        if self.unsafe_to_renumber {
+            return;
+        }
+        for candidate in self.candidates.iter_mut() {
+            let val_ev = evaluator.constant(candidate.address.as_addr());
+            let unit_to_index =
+                sps_manager.find_matching_pinned_addr(val_ev, candidate.element_size);
+            let Some((_unit, first)) = unit_to_index.first() else {
+                todo!(
+                    "computeNewRegisterIndices: DT_CHECK(!unit_to_index.empty()) on {:?} (:125)",
+                    candidate.copy
+                )
+            };
+            let Some(index) = *first else {
+                todo!(
+                    "computeNewRegisterIndices: DT_CHECK_MSG(index >= 0, \"Unable to find matching \
+                     pinned address! Make sure to run this pass after the address-pinning pass.\") \
+                     on {:?} (:127-129)",
+                    candidate.copy
+                )
+            };
+            if !unit_to_index.iter().all(|(_unit, at)| *at == Some(index)) {
+                todo!(
+                    "computeNewRegisterIndices: DT_CHECK(… && \"Expecting same position index for \
+                     all matching pinned addresses\") on {:?} (:130-136)",
+                    candidate.copy
+                )
+            }
+            candidate.new_register_index = Some(index);
+        }
     }
 
     /// Replaces: e128_doRenumbering
@@ -328,16 +415,6 @@ fn constant_target_values(map: Val, defs: Definitions<'_>) -> Vec<i64> {
     values
 }
 
-// crustify:todo: e342_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:109  (6 body lines, level 1)
-//   original  : void runOnOperation()
-//   calls     : e127_runOn
-
-// crustify:todo: e343_computeNewRegisterIndices
-//   authority : dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:117  (23 body lines, level 1)
-//   original  : void computeNewRegisterIndices(StaticPinningSchemeManager &sps_manager, ExpressionEvaluator &evaluator)
-//   calls     : e132_setNewRegisterIndex
-
 // crustify:todo: e456_runOn
 //   authority : dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:183  (15 body lines, level 2)
 //   original  : void ReadOnlyRegisterRenumberingPass::runOn(dataflow::ProgramUnitOp unit)
@@ -352,6 +429,9 @@ mod unit_tests {
     use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::ProgramUnits;
     use crate::islands::sentient::dialects::sentient::{Reg, RegIndex, RegType};
+    use crate::transform::sentient::analyses::{
+        EvaluatedValue, Evaluation, OffsetSites, OutOfScopeEvaluator,
+    };
     use crate::units::DfirUnit;
 
     /// A model, so a program is typed; nothing here reads it.
@@ -525,5 +605,115 @@ mod unit_tests {
             bound: core::marker::PhantomData,
         };
         ReadOnlyRegisterRenumbering::default().run_on_program(&mut program);
+    }
+
+    /// A one-unit program, for the two units that take one.
+    fn one_unit_program() -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::L3lu, Val(0)),
+                    iter_arg: None,
+                    precision: None,
+                    body: vec![scalar_const(1, 384)],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// e342 — without program stitching the pass never looks at the module, and with it the walk runs
+    /// (and lands on the unported e456), which is the whole of the gate.
+    #[test]
+    fn e342_runs_only_when_the_programs_are_stitched() {
+        let mut off = one_unit_program();
+        ReadOnlyRegisterRenumbering::default().run_on_operation(&mut off, ProgStitch(false));
+
+        let mut on = one_unit_program();
+        let stitched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ReadOnlyRegisterRenumbering::default().run_on_operation(&mut on, ProgStitch(true));
+        }));
+        assert!(stitched.is_err());
+    }
+
+    /// A manager answering with a fixed position per unit, and an evaluator that hands back the
+    /// address as its own handle so the fixture can be read.
+    struct Pinned(Vec<(Val, Option<RegIndex>)>);
+    impl PinningSchemeManager for Pinned {
+        fn find_matching_pinned_addr(
+            &self,
+            _ev: EvaluatedValue,
+            _element_size: Bits,
+        ) -> Vec<(Val, Option<RegIndex>)> {
+            self.0.clone()
+        }
+    }
+
+    /// An evaluator that hands the address back as its own handle, and refuses the rest exactly as
+    /// [`OutOfScopeEvaluator`] does — the three required methods delegate to it.
+    struct Constants(OutOfScopeEvaluator);
+    impl ExpressionEvaluator for Constants {
+        fn constant(&mut self, value: i64) -> EvaluatedValue {
+            EvaluatedValue(u32::try_from(value).unwrap_or_default())
+        }
+
+        fn evaluate_value(&mut self, value: Val) -> Evaluation {
+            self.0.evaluate_value(value)
+        }
+
+        fn evaluate_sum(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation {
+            self.0.evaluate_sum(lhs, rhs)
+        }
+
+        fn build_offset_value(
+            &mut self,
+            evaluation: &Evaluation,
+            sites: &mut OffsetSites<'_>,
+            walked: &mut Vec<Op>,
+            ty: ScalarTy,
+        ) -> Val {
+            self.0.build_offset_value(evaluation, sites, walked, ty)
+        }
+    }
+
+    /// e343 — the agreed position becomes the candidate's new index; a give-up before it means the
+    /// candidate is never touched at all.
+    #[test]
+    fn e343_takes_the_position_every_unit_agrees_on() {
+        let candidate = Candidate {
+            copy: Val(2),
+            address: LbrAddress(384),
+            element_size: Bits(16),
+            new_register_index: None,
+        };
+        let pinned = Pinned(vec![
+            (Val(0), Some(RegIndex::at::<5>())),
+            (Val(1), Some(RegIndex::at::<5>())),
+        ]);
+
+        let mut pass = ReadOnlyRegisterRenumbering {
+            unsafe_to_renumber: false,
+            candidates: vec![candidate],
+        };
+        pass.compute_new_register_indices(&pinned, &mut Constants(OutOfScopeEvaluator));
+        assert_eq!(
+            pass.candidates[0].new_register_index,
+            Some(RegIndex::at::<5>())
+        );
+
+        let mut given_up = ReadOnlyRegisterRenumbering {
+            unsafe_to_renumber: true,
+            candidates: vec![candidate],
+        };
+        given_up.compute_new_register_indices(&pinned, &mut Constants(OutOfScopeEvaluator));
+        assert_eq!(given_up.candidates[0].new_register_index, None);
     }
 }

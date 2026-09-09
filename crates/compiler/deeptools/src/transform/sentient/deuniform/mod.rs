@@ -293,6 +293,8 @@ fn only_region(op: Op) -> Option<(Val, Vec<Op>, Vec<Val>)> {
     match op {
         Op::UniformRegions(dialects::UniformRegions::UniformizeRegions { regions, results }) => {
             let region = only(regions)?;
+            // ⭐ ONLY THE VALUES — the op is about to be erased, so its register slots go with it.
+            let results = results.into_iter().map(|result| result.val).collect();
             Some((region.arg, region.body, results))
         }
         Op::UniformRegions(dialects::UniformRegions::EqualizePattern { regions }) => {
@@ -555,7 +557,7 @@ mod unit_tests {
                             }),
                         ],
                     }],
-                    results: vec![Val(12)],
+                    results: vec![dialects::UniformResult::unallocated(Val(12))],
                 }),
                 // No unit in common: erased outright.
                 Op::UniformRegions(UniformRegions::EqualizePattern {

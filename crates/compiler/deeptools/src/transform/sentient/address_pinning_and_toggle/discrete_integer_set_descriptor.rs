@@ -478,6 +478,7 @@ mod unit_tests {
 
     fn carried(init: Val, arg: Val, result: Val) -> Carried {
         Carried {
+            result_reg: Reg::UNALLOCATED,
             init,
             arg,
             result,
@@ -524,6 +525,7 @@ mod unit_tests {
     /// `+3` and `-4` to the chain, `outer_bound` being the OUTER loop's.
     fn chained_nest(outer_bound: Val) -> Vec<Op> {
         let inner = Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(20),
             bound: Val(2),
             carried: vec![carried(Val(11), Val(21), Val(22))],
@@ -543,6 +545,7 @@ mod unit_tests {
             constant(3, Val(4)),
             constant(-4, Val(5)),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(10),
                 bound: outer_bound,
                 carried: vec![carried(Val(3), Val(11), Val(12))],

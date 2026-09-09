@@ -301,6 +301,7 @@ mod unit_tests {
     /// One carried value, at the register defaults a fixture needs none of.
     fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
         sentient::Carried {
+            result_reg: sentient::Reg::UNALLOCATED,
             init,
             arg,
             result,
@@ -319,6 +320,7 @@ mod unit_tests {
         vec![
             minuend,
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(11),
                 bound: Val(12),
                 carried: vec![carried(Val(2), Val(20), Val(21))],

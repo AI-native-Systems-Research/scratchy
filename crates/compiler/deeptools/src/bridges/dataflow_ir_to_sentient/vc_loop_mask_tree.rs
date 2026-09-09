@@ -2347,6 +2347,7 @@ mod compute_loops_tests {
 
     fn a_loop(vals: &mut Values, body: Vec<sen::Op>) -> sen::Op {
         sen::Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: vals.mint(),
             bound: vals.mint(),
             carried: Vec::new(),
@@ -2425,6 +2426,7 @@ mod loop_mask_tree_new_tests {
     fn the_only_constructor_returns_a_rooted_tree_with_the_units_loops_in_it() {
         let mut vals = Values::default();
         let unit_body = vec![sen::Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: vals.mint(),
             bound: vals.mint(),
             carried: Vec::new(),

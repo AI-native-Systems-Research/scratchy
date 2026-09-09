@@ -210,6 +210,7 @@ mod unit_tests {
     fn sentient_for(iv: Val, bound: Val, carried: sentient::Carried, body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
             iv,
+            iv_reg: sentient::Reg::UNALLOCATED,
             bound,
             carried: vec![carried],
             dbg_name: None,
@@ -227,6 +228,7 @@ mod unit_tests {
                 locale: sentient::RegType::Lrf,
                 index: None,
             },
+            result_reg: sentient::Reg::UNALLOCATED,
             program_header: false,
             element_size: None,
         }

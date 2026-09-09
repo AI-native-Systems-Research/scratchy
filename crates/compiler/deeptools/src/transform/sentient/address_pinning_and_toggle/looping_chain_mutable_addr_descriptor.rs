@@ -600,6 +600,7 @@ mod unit_tests {
 
     fn carried(init: Val, arg: Val, result: Val) -> Carried {
         Carried {
+            result_reg: Reg::UNALLOCATED,
             init,
             arg,
             result,
@@ -647,6 +648,7 @@ mod unit_tests {
     /// outside the nest advancing by 7. `inner_bound` is the inner loop's trip count.
     fn looping_chain(inner_bound: Val) -> Vec<Op> {
         let inner = Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(20),
             bound: inner_bound,
             carried: vec![carried(Val(11), Val(21), Val(22))],
@@ -666,6 +668,7 @@ mod unit_tests {
             constant(2, Val(5)),
             constant(7, Val(6)),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(10),
                 bound: Val(1),
                 carried: vec![carried(Val(3), Val(11), Val(12))],

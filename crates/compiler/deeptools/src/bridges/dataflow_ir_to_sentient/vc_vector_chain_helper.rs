@@ -3873,6 +3873,7 @@ mod unit_tests {
         let mut unit = sentient_unit(std::vec![
             mac(1, 2, 3),
             SenOp::Sentient(sen::Op::For {
+                iv_reg: sen::Reg::UNALLOCATED,
                 // ⭐ THE INDUCTION VARIABLE IS SYNTAX, NOT AN OPERAND — see [`sen::Op::For::iv`]. The
                 // walk under test ignores it; it is here because the op always names one.
                 iv: Val(11),

@@ -1460,11 +1460,13 @@ mod unit_tests {
     /// A `sentient.for` carrying the two xrf pointers, write then read.
     fn loop_carrying(bound: Val, iv: Val, ptrs: [(Val, Val, Val); 2]) -> sen::Op {
         sen::Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv,
             bound,
             carried: ptrs
                 .into_iter()
                 .map(|(init, arg, result)| sentient::Carried {
+                    result_reg: sentient::Reg::UNALLOCATED,
                     init,
                     arg,
                     result,
@@ -2741,6 +2743,7 @@ pub fn create_for_op_with_return_value(
 ) -> Option<XrfCarryingOp> {
     let sen::Op::Sentient(sentient::Op::For {
         iv,
+        iv_reg,
         bound,
         carried,
         dbg_name,
@@ -2786,10 +2789,8 @@ pub fn create_for_op_with_return_value(
             init,
             arg: vals.mint(),
             result,
-            reg: sentient::Reg {
-                locale: sentient::RegType::Unknown,
-                index: None,
-            },
+            reg: sentient::Reg::UNALLOCATED,
+            result_reg: sentient::Reg::UNALLOCATED,
             element_size: None,
             program_header: false,
         });
@@ -2815,6 +2816,7 @@ pub fn create_for_op_with_return_value(
         // and the old loop is erased on the next line either way.
         op: sen::Op::Sentient(sentient::Op::For {
             iv: *iv,
+            iv_reg: *iv_reg,
             bound: *bound,
             carried: new_carried,
             dbg_name: dbg_name.clone(),
@@ -3810,6 +3812,7 @@ mod xrf_lowering_unit_tests {
     fn a_for_carries_two_more_values_initialised_by_the_two_locale_constants() {
         let mut vals = Values::default();
         let carried = sentient::Carried {
+            result_reg: sentient::Reg::UNALLOCATED,
             init: Val(1),
             arg: Val(2),
             result: Val(3),
@@ -3821,6 +3824,7 @@ mod xrf_lowering_unit_tests {
             element_size: None,
         };
         let for_op = sen::Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(4),
             bound: Val(5),
             carried: vec![carried],
@@ -4128,6 +4132,7 @@ mod xrf_lowering_unit_tests {
                 ty: flat.clone(),
             }),
             sen::Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: vals.mint(),
                 bound: Val(0),
                 carried: Vec::new(),

@@ -207,9 +207,11 @@ mod unit_tests {
                 is_symbol: false,
             }),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(2),
                 bound: Val(0),
                 carried: vec![Carried {
+                    result_reg: Reg::UNALLOCATED,
                     init: Val(1),
                     arg: Val(3),
                     result: Val(4),

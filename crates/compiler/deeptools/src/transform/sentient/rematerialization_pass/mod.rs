@@ -268,6 +268,7 @@ mod unit_tests {
     /// A `sentient.for` carrying one value, running `body`.
     fn for_op(iv: Val, bound: Val, carried: sentient::Carried, body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv,
             bound,
             carried: vec![carried],
@@ -279,6 +280,7 @@ mod unit_tests {
     /// One carried value, with nothing assigned to it yet.
     fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
         sentient::Carried {
+            result_reg: sentient::Reg::UNALLOCATED,
             init,
             arg,
             result,

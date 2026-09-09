@@ -634,6 +634,7 @@ mod unit_tests {
     #[test]
     fn a_trivial_loop_hoists_its_body_and_hands_back_what_it_yielded() {
         let carried = Carried {
+            result_reg: Reg::UNALLOCATED,
             init: Val(1),
             arg: Val(3),
             result: Val(4),
@@ -648,6 +649,7 @@ mod unit_tests {
             constant(1, Val(0)),
             constant(5, Val(1)),
             Op::Sentient(ops::Op::For {
+                iv_reg: ops::Reg::UNALLOCATED,
                 iv: Val(2),
                 bound: Val(0),
                 carried: vec![carried],
@@ -670,6 +672,7 @@ mod unit_tests {
         assert_eq!(
             block[3],
             Op::Sentient(ops::Op::For {
+                iv_reg: ops::Reg::UNALLOCATED,
                 iv: Val(2),
                 bound: Val(0),
                 carried: vec![carried],

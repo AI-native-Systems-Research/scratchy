@@ -648,6 +648,7 @@ mod unit_tests {
     /// `sentient.for` over `body`.
     fn sentient_for(body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(0),
             bound: Val(1),
             carried: Vec::new(),
@@ -759,6 +760,7 @@ mod unit_tests {
     fn sentient_for_carrying(bound: Val, carried: Vec<sentient::Carried>, body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
             iv: Val(0),
+            iv_reg: sentient::Reg::UNALLOCATED,
             bound,
             carried,
             dbg_name: None,
@@ -776,6 +778,7 @@ mod unit_tests {
                 locale: sentient::RegType::Lar,
                 index: None,
             },
+            result_reg: sentient::Reg::UNALLOCATED,
             program_header: false,
             element_size: None,
         }

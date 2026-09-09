@@ -260,6 +260,7 @@ mod unit_tests {
     fn loop_over(iv: Val, bound: Val) -> Op {
         Op::Sentient(sentient::Op::For {
             iv,
+            iv_reg: sentient::Reg::UNALLOCATED,
             bound,
             carried: Vec::new(),
             dbg_name: None,

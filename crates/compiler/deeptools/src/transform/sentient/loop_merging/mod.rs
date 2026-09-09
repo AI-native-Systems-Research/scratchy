@@ -449,6 +449,7 @@ mod unit_tests {
     /// `sentient.for` carrying `dbg_name`.
     fn sentient_for(dbg_name: Option<&str>) -> Op {
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(0),
             bound: Val(1),
             carried: Vec::new(),
@@ -472,6 +473,7 @@ mod unit_tests {
     fn loop_over(bound: Val, iv: Val, dbg_name: Option<&str>) -> Op {
         Op::Sentient(sentient::Op::For {
             iv,
+            iv_reg: sentient::Reg::UNALLOCATED,
             bound,
             carried: Vec::new(),
             dbg_name: dbg_name.map(str::to_owned),

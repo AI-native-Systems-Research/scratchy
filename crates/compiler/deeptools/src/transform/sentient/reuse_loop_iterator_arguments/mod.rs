@@ -357,6 +357,7 @@ mod unit_tests {
     /// One carried value, with nothing assigned to it yet.
     fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
         sentient::Carried {
+            result_reg: sentient::Reg::UNALLOCATED,
             init,
             arg,
             result,

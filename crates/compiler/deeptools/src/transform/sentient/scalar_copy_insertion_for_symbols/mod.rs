@@ -697,6 +697,7 @@ mod unit_tests {
     /// One carried value, all three of its handles distinct and no width.
     fn a_carried(init: Val, arg: Val, result: Val, locale: RegType) -> Carried {
         Carried {
+            result_reg: Reg::UNALLOCATED,
             init,
             arg,
             result,
@@ -739,6 +740,7 @@ mod unit_tests {
                 key: Val(21),
             }),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(2),
                 bound: Val(3),
                 carried: Vec::new(),
@@ -746,6 +748,7 @@ mod unit_tests {
                 body: vec![
                     a_copy(Val(1), Val(4), RegType::Jcr),
                     Op::Sentient(sentient::Op::For {
+                        iv_reg: sentient::Reg::UNALLOCATED,
                         iv: Val(5),
                         bound: Val(6),
                         carried: Vec::new(),
@@ -777,6 +780,7 @@ mod unit_tests {
             a_copy(Val(0), Val(1), RegType::Jcr),
             an_add(Val(0), Val(0), Val(2), RegType::Jcr, None),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(3),
                 bound: Val(4),
                 carried: vec![
@@ -843,6 +847,7 @@ mod unit_tests {
                 key: Val(1),
             }),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(7),
                 bound: Val(8),
                 carried: vec![
@@ -954,6 +959,7 @@ mod unit_tests {
     #[test]
     fn the_locale_of_a_use_comes_from_the_user() {
         let loop_op = Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(0),
             bound: Val(1),
             carried: vec![a_carried(Val(2), Val(3), Val(4), RegType::Lccr)],
@@ -1010,6 +1016,7 @@ mod unit_tests {
 
         // `element_sizes[operandNumber + 1]` of the enclosing loop, for the value the yield carries.
         let loop_op = Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(5),
             bound: Val(6),
             carried: vec![Carried {

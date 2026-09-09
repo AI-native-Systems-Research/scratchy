@@ -393,6 +393,7 @@ mod unit_tests {
             sync(sentient::SyncMode::Send, false, Some(1), "implicit"),
             sync(sentient::SyncMode::Recv, false, None, "recv"),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(3),
                 bound: Val(4),
                 carried: Vec::new(),
@@ -418,6 +419,7 @@ mod unit_tests {
                 sync(sentient::SyncMode::Send, false, Some(1), "implicit"),
                 sync(sentient::SyncMode::Recv, false, None, "recv"),
                 Op::Sentient(sentient::Op::For {
+                    iv_reg: sentient::Reg::UNALLOCATED,
                     iv: Val(3),
                     bound: Val(4),
                     carried: Vec::new(),

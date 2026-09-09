@@ -834,6 +834,7 @@ mod unit_tests {
     /// One `iter_args` position.
     fn carried(init: u32, arg: u32, result: u32) -> Carried {
         Carried {
+            result_reg: Reg::UNALLOCATED,
             init: Val(init),
             arg: Val(arg),
             result: Val(result),
@@ -849,6 +850,7 @@ mod unit_tests {
     /// `sentient.for %iv = %bound iter_args(..) { body }`.
     fn for_op(iv: u32, bound: u32, iter_args: Vec<Carried>, body: Vec<Op>) -> Op {
         Op::Sentient(sentient::Op::For {
+            iv_reg: sentient::Reg::UNALLOCATED,
             iv: Val(iv),
             bound: Val(bound),
             carried: iter_args,

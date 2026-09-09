@@ -754,7 +754,7 @@ fn is_uniformize_regions(op: &Op) -> bool {
 fn uniformize_result_source(op: &Op, val: Val) -> Option<Val> {
     let (results, yielded, region_count, second_len) = match op {
         Op::UniformRegions(UniformRegions::UniformizeRegions { regions, results }) => (
-            results.as_slice(),
+            results.iter().map(|result| result.val).collect::<Vec<Val>>(),
             regions.first().and_then(|region| match region.body.last() {
                 Some(Op::Uniform(uniform::Op::Yield { operands })) => Some(operands.as_slice()),
                 _ => None,
@@ -763,7 +763,7 @@ fn uniformize_result_source(op: &Op, val: Val) -> Option<Val> {
             regions.get(1).map(|region| region.body.len()),
         ),
         Op::Uniform(uniform::Op::UniformizeRegions { regions, results }) => (
-            results.as_slice(),
+            results.clone(),
             regions.first().and_then(|region| match region.body.last() {
                 Some(lower::Op::Uniform(uniform::Op::Yield { operands })) => {
                     Some(operands.as_slice())
@@ -1267,9 +1267,11 @@ mod unit_tests {
             add(Val(1), Val(2), Val(3)),
             extract(Val(3), (Val(4), Val(5)), 16, RegType::Lar),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(60),
                 bound: Val(1),
                 carried: vec![sentient::Carried {
+                    result_reg: sentient::Reg::UNALLOCATED,
                     init: Val(4),
                     arg: Val(61),
                     result: Val(62),

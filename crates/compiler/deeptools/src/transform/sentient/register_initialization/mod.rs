@@ -87,7 +87,8 @@
 // clippy with `-D warnings`. ⭐ REMOVE THIS WITH e521.
 
 use crate::transform::sentient::analyses::{
-    Candidate, CandidateCollector, CandidateEvaluator, CandidateSelector, UniformGroups,
+    Candidate, CandidateCollector, CandidateEvaluator, CandidateSelector, CandidateTransformer,
+    UniformGrouper, UniformGroups,
 };
 
 /// Replaces: e131_runLocalAnalysis
@@ -120,20 +121,54 @@ pub fn run_local_analysis(
     evaluator.merge_into(result, &global_candidates);
 }
 
-// crustify:todo: e345_run
-//   authority : dcc/src/Transform/Sentient/RegisterInitialization.cpp:121  (14 body lines, level 1)
-//   original  : void run()
-//   calls     : e131_runLocalAnalysis, e252_size, e346_runGlobalAnalysis, e347_runTransformation
+/// Replaces: e345_run
+///
+/// The whole `Driver`: one candidate list threaded through local analysis, global analysis and
+/// transformation, in that order (`RegisterInitialization.cpp:121-133`).
+///
+/// ⭐ THE TWO `LLVM_DEBUG` DUMPS BETWEEN THE PHASES ARE DROPPED — `dcc::reginit::dump` writes to
+/// `dbgs()` and the list it prints is the one the next phase reads unchanged.
+pub fn run(
+    collector: &mut dyn CandidateCollector,
+    evaluator: &mut dyn CandidateEvaluator,
+    selector: &mut dyn CandidateSelector,
+    grouper: &mut dyn UniformGrouper,
+    transformer: &mut dyn CandidateTransformer,
+    groups: &dyn UniformGroups,
+) {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    run_local_analysis(&mut candidates, collector, evaluator, selector, groups);
+    run_global_analysis(&mut candidates, grouper, evaluator, selector);
+    run_transformation(&candidates, transformer);
+}
 
-// crustify:todo: e346_runGlobalAnalysis
-//   authority : dcc/src/Transform/Sentient/RegisterInitialization.cpp:158  (5 body lines, level 1)
-//   original  : void runGlobalAnalysis(ListOfCandidatesRef candidates)
-//   calls     : e345_run
+/// Replaces: e346_runGlobalAnalysis
+///
+/// Phase 2: the grouper rewrites the list, then it is re-evaluated and purged globally.
+///
+/// ⛔ EVERY COLLABORATOR IS OUT OF CAMPAIGN SCOPE (`RegisterInitialization/`), so what is ported is
+/// the sequence — and the grouper runs FIRST, because the two calls after it weigh and select over the
+/// grouped globals it put in place of the local candidates it consumed.
+pub fn run_global_analysis(
+    candidates: &mut Vec<Candidate>,
+    grouper: &mut dyn UniformGrouper,
+    evaluator: &mut dyn CandidateEvaluator,
+    selector: &mut dyn CandidateSelector,
+) {
+    grouper.run(candidates);
+    evaluator.evaluate_globally(candidates);
+    selector.select_globally(candidates);
+}
 
-// crustify:todo: e347_runTransformation
-//   authority : dcc/src/Transform/Sentient/RegisterInitialization.cpp:164  (3 body lines, level 1)
-//   original  : void runTransformation(ConstListOfCandidatesRef candidates)
-//   calls     : e345_run
+/// Replaces: e347_runTransformation
+///
+/// Phase 3: the `Transformer` applies every surviving candidate to the IR and to the liveness object.
+///
+/// ⭐ READ-ONLY OVER THE LIST — the reference's parameter is a `ConstListOfCandidatesRef`, so this
+/// phase cannot add or drop a candidate, only act on the ones the two analyses agreed on.
+pub fn run_transformation(candidates: &[Candidate], transformer: &mut dyn CandidateTransformer) {
+    transformer.run(candidates);
+}
 
 // crustify:todo: e458_runOn
 //   authority : dcc/src/Transform/Sentient/RegisterInitialization.cpp:182  (68 body lines, level 2)
@@ -160,6 +195,10 @@ mod unit_tests {
         CollectLocal(Val),
         SelectLocally(Val),
         MergeInto(Vec<Candidate>),
+        GroupUniforms,
+        EvaluateGlobally,
+        SelectGlobally,
+        Transform(Vec<Candidate>),
     }
 
     /// The one log the four seams write to — the reference's four references are four distinct
@@ -169,6 +208,8 @@ mod unit_tests {
     struct Collector(Log);
     struct Evaluator(Log);
     struct Selector(Log);
+    struct Grouper(Log);
+    struct Transformer(Log);
     struct Groups(Vec<Val>);
 
     impl CandidateCollector for Collector {
@@ -194,6 +235,10 @@ mod unit_tests {
             self.0.borrow_mut().push(Call::MergeInto(sublist.to_vec()));
             result.extend_from_slice(sublist);
         }
+
+        fn evaluate_globally(&mut self, _candidates: &mut Vec<Candidate>) {
+            self.0.borrow_mut().push(Call::EvaluateGlobally);
+        }
     }
 
     impl CandidateSelector for Selector {
@@ -206,6 +251,25 @@ mod unit_tests {
             self.0.borrow_mut().push(Call::SelectLocally(core));
             // The purge the reference's note is about: this selector keeps no global candidate.
             global.clear();
+        }
+
+        fn select_globally(&mut self, _candidates: &mut Vec<Candidate>) {
+            self.0.borrow_mut().push(Call::SelectGlobally);
+        }
+    }
+
+    impl UniformGrouper for Grouper {
+        fn run(&mut self, candidates: &mut Vec<Candidate>) {
+            self.0.borrow_mut().push(Call::GroupUniforms);
+            candidates.push(Candidate(9));
+        }
+    }
+
+    impl CandidateTransformer for Transformer {
+        fn run(&mut self, candidates: &[Candidate]) {
+            self.0
+                .borrow_mut()
+                .push(Call::Transform(candidates.to_vec()));
         }
     }
 
@@ -259,5 +323,39 @@ mod unit_tests {
             ]
         );
         assert_eq!(result, vec![Candidate(1), Candidate(2)]);
+    }
+
+    /// e345/e346/e347 — the three phases in order, over ONE list: what local analysis produced is
+    /// what the grouper rewrites and what the transformer is finally handed.
+    #[test]
+    fn e345_run_drives_three_phases_over_one_list() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let mut collector = Collector(Rc::clone(&log));
+        let mut evaluator = Evaluator(Rc::clone(&log));
+        let mut selector = Selector(Rc::clone(&log));
+        let mut grouper = Grouper(Rc::clone(&log));
+        let mut transformer = Transformer(Rc::clone(&log));
+        let groups = Groups(vec![Val(1)]);
+
+        run(
+            &mut collector,
+            &mut evaluator,
+            &mut selector,
+            &mut grouper,
+            &mut transformer,
+            &groups,
+        );
+
+        assert_eq!(
+            log.borrow()[7..],
+            [
+                // Phase 2, grouper first (`:159-161`).
+                Call::GroupUniforms,
+                Call::EvaluateGlobally,
+                Call::SelectGlobally,
+                // Phase 3 sees the local candidate AND the one the grouper added.
+                Call::Transform(vec![Candidate(1), Candidate(9)]),
+            ]
+        );
     }
 }

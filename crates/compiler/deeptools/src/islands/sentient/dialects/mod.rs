@@ -135,8 +135,8 @@ pub enum UniformRegions {
         /// One record per region, in region order.
         regions: Vec<LocalRegion>,
         /// `Variadic<AnyType>:$results` (`Uniform.td:90`) — one per operand of every region's
-        /// `uniform.yield`.
-        results: Vec<Val>,
+        /// `uniform.yield`, each carrying its own slot of the op's two register arrays.
+        results: Vec<UniformResult>,
     },
     /// `uniform.equalize_pattern { (%arg -> %0, %2){ .. } .. }` — see
     /// [`uniform::Op::EqualizePattern`].
@@ -144,6 +144,35 @@ pub enum UniformRegions {
         /// One record per region, in region order.
         regions: Vec<LocalRegion>,
     },
+}
+
+/// ONE RESULT OF A `uniform.uniformize_regions` AND THE REGISTER IT LIVES IN.
+///
+/// ⛔⛔ `regIndices` AND `regLocales` ARE THE OP'S OWN DECLARED `OptionalAttr`s (`Uniform.td:87-88`)
+/// AND ARE INDEXED BY RESULT NUMBER — `getValueRegLocale` reads `reg_locales[getResultNum(op, val)]`
+/// (`SentientOps.cpp:1831-1841`) and `naivelyAllocate` rewrites every entry of the pair
+/// (`RegisterAllocation.cpp:86-118`). Two parallel `Vec`s beside `results` would have been three
+/// facts trusted to line up; see [`sentient::Carried`] for the same lockdown on a loop.
+///
+/// ⭐ ALL-[`sentient::Reg::UNALLOCATED`] IS THE ABSENT ATTRIBUTE, which is exactly the
+/// `unif_regions->hasAttr(locale_attr_str)` gate `naivelyAllocate` opens with (`:87-89`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UniformResult {
+    /// The result value.
+    pub val: Val,
+    /// Its slot of `$regLocales`/`$regIndices`.
+    pub reg: sentient::Reg,
+}
+
+impl UniformResult {
+    /// A RESULT WITH NEITHER ARRAY SET — the shape everything that is not an allocator mints.
+    #[must_use]
+    pub const fn unallocated(val: Val) -> UniformResult {
+        UniformResult {
+            val,
+            reg: sentient::Reg::UNALLOCATED,
+        }
+    }
 }
 
 impl UniformRegions {
@@ -302,7 +331,9 @@ pub fn results(op: &Op) -> Vec<Val> {
         // ⭐ THE SAME ANSWER [`uniform::Op`] GETS FROM THE RUNG BELOW — `$results`
         // (`Uniform.td:90`) for `uniformize_regions`, and none at all for `equalize_pattern`, which
         // declares no `let results` (`:196-198`).
-        Op::UniformRegions(UniformRegions::UniformizeRegions { results, .. }) => results.clone(),
+        Op::UniformRegions(UniformRegions::UniformizeRegions { results, .. }) => {
+            results.iter().map(|result| result.val).collect()
+        }
         Op::UniformRegions(UniformRegions::EqualizePattern { .. }) => Vec::new(),
         // ⛔ BOUND RATHER THAN A BARE `_`: the shared dialects delegate, and a variant of THIS rung
         // that fell in here would be answered "no results" instead of being a build error.
@@ -1122,14 +1153,12 @@ pub fn value_reg_locale(val: Val, defs: Definitions<'_>) -> sentient::RegType {
         Some(Op::Sentient(
             sentient::Op::ScalarAdd { reg, .. } | sentient::Op::ScalarSub { reg, .. },
         )) => reg.map_or(sentient::RegType::Unknown, |reg| reg.locale),
-        // ⛔ ONE LOCALE PER CARRIED VALUE WHERE THE REFERENCE HAS TWO. Its `regLocales` is
-        // `1 + 2n` long and a RESULT reads `attrs[index + 1 + numRegionIterArgs]` (`:1846-1858`)
-        // while the matching region argument reads `attrs[i + 1]`; this island's one
-        // `Carried::reg` is that position's whole answer, so it serves both.
+        // ⭐ THE RESULT SLOT, `attrs[index + 1 + numRegionIterArgs]` (`:1846-1858`) — which is
+        // [`sentient::Carried::result_reg`] and NOT the iter argument's `reg`.
         Some(Op::Sentient(sentient::Op::For { carried, .. })) => carried
             .iter()
             .find(|value| value.result == val)
-            .map_or(sentient::RegType::Unknown, |value| value.reg.locale),
+            .map_or(sentient::RegType::Unknown, |value| value.result_reg.locale),
         // ⛔ THE `sentient.mac` ARM IS A WORKAROUND THE REFERENCE LABELS AS ONE (`:1810-1820`): the
         // op declares no register arrays, so its first result is the XRF write pointer and its
         // second the read pointer by position alone.
@@ -1186,19 +1215,24 @@ pub fn set_value_reg_index(scope: &mut [Op], val: Val, index: Option<sentient::R
 /// region arguments it binds.
 fn set_reg_index_on(op: &mut sentient::Op, val: Val, index: Option<sentient::RegIndex>) {
     match op {
-        sentient::Op::For { iv, carried, .. } => {
+        sentient::Op::For {
+            iv,
+            iv_reg,
+            carried,
+            ..
+        } => {
+            // ⭐ SLOT 0 — `reg_indices[0] = index` for the induction variable (`:1990-1993`).
             if *iv == val {
-                todo!(
-                    "setValueRegIndex on a sentient.for induction variable writes regIndices[0] \
-                     (Dialect/Sentient/SentientOps.cpp:1992), and this island's `For` has a `Reg` \
-                     per CARRIED value and none for the bound the induction variable counts against"
-                );
+                iv_reg.index = index;
             }
-            // ⭐ ONE ENTRY FOR THE ARGUMENT AND THE RESULT, where the reference has `[i + 1]` and
-            // `[i + numRegionIterArgs + 1]` of one `1 + 2n` array — see [`sentient::Carried`].
+            // ⭐ `[i + 1]` FOR THE ARGUMENT AND `[i + numRegionIterArgs + 1]` FOR THE RESULT
+            // (`:2001-2004, 2046-2052`) — two slots of the one `1 + 2n` array, and two fields here.
             for value in carried.iter_mut() {
-                if value.arg == val || value.result == val {
+                if value.arg == val {
                     value.reg.index = index;
+                }
+                if value.result == val {
+                    value.result_reg.index = index;
                 }
             }
         }
@@ -1491,7 +1525,9 @@ fn clone_op(op: &Op, values: &mut Values, mapping: &mut ValueMapping) -> Op {
             }
             if let UniformRegions::UniformizeRegions { results, .. } = regions {
                 for result in results {
-                    *result = minted(*result, values, mapping);
+                    // ⭐ THE REGISTER SLOT RIDES ALONG UNCHANGED — a clone copies the op's attributes,
+                    // and only the value it binds is a fresh one.
+                    result.val = minted(result.val, values, mapping);
                 }
             }
             for region in regions.regions_mut() {
@@ -1891,6 +1927,7 @@ mod unit_tests {
     fn clone_ops_mints_every_value_the_copy_defines() {
         let ops = vec![Op::Sentient(sentient::Op::For {
             iv: Val(1),
+            iv_reg: sentient::Reg::UNALLOCATED,
             bound: Val(0),
             carried: Vec::new(),
             dbg_name: None,

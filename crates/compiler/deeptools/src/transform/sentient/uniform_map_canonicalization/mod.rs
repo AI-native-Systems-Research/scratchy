@@ -418,6 +418,7 @@ mod unit_tests {
             constant(9, Val(2), sentient::RegType::Imm),
             adds(Val(1), Val(3)),
             Op::Sentient(sentient::Op::For {
+                iv_reg: sentient::Reg::UNALLOCATED,
                 iv: Val(4),
                 bound: Val(2),
                 carried: Vec::new(),
@@ -443,6 +444,7 @@ mod unit_tests {
             vec![
                 adds(Val(1), Val(3)),
                 Op::Sentient(sentient::Op::For {
+                    iv_reg: sentient::Reg::UNALLOCATED,
                     iv: Val(4),
                     bound: Val(2),
                     carried: Vec::new(),
