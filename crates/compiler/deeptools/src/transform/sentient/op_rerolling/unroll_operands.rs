@@ -93,8 +93,8 @@
 
 use crate::arch::Elements;
 use crate::formats::Bits;
-use crate::islands::sentient::dialects::Val;
 use crate::islands::sentient::dialects::sentient as sen;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, dataflow, uniform};
 use crate::units::DfirUnit;
 
 /// WHICH OPERAND SLOT OF A COMPUTE OP — `enum OperandName` (`OpRerolling.hpp:30-36`), the key of
@@ -719,6 +719,492 @@ impl UnrollOperands {
         self.result_address = other.result_address;
         self.fold_mode = other.fold_mode;
     }
+
+    /// Replaces: e335_fill
+    ///
+    /// Snapshots one op's unroll-relevant fields, keying each compute operand by the PORT that
+    /// port assignment gave it rather than by its own `opA`/`opB`/`opC` name (`:502`).
+    ///
+    /// ⛔ AN `nfwd` OPERAND ABANDONS THE SNAPSHOT: `reset()` and return, leaving `op_name` at the
+    /// `"NA"` sentinel that [`Self::matches`] refuses (`:533-537`, `:575-579`).
+    /// ⭐ FORWARDING LISTS ARE SORTED BY SPELLING, so `lrf10` precedes `lrf2` — [`Self::matches`]
+    /// and [`Self::update_unroll_info`] walk them index-by-index and inherit that order (`:505-512`).
+    pub(crate) fn fill(&mut self, op: &Op, component: DfirUnit, defs: Definitions<'_>) {
+        self.reset();
+        let sorted = |ports: &[sen::Port]| {
+            let mut ret = ports.to_vec();
+            ret.sort_by_key(|port| port.spelling());
+            ret
+        };
+        let slot_of = |port_id: Option<i32>| {
+            Self::unroll_operand_using_port(component, ComputePortId::from_port_id(port_id))
+        };
+        // `contains_insensitive("nfwd")` over a `stringifySentientComputePort` (`:533-535`).
+        let is_nfwd = |port: Option<sen::Port>| {
+            matches!(port, Some(sen::Port::Nfwd0 | sen::Port::Nfwd2))
+        };
+        let Op::Sentient(sen_op) = op else {
+            return;
+        };
+        if let sen::Op::VectorMac {
+            mask,
+            op_a,
+            op_b,
+            op_c,
+            result,
+            compute_precision,
+            fold_mode,
+            unroll_factor,
+            xrf_read_incr,
+            xrf_write_incr,
+            ..
+        } = sen_op
+        {
+            self.op_name = Some(RolledOp::Mac);
+            self.mask_value = *mask;
+            let a = slot_of(op_a.port_id);
+            let b = slot_of(op_b.port_id);
+            let c = slot_of(op_c.port_id);
+            self.operand_list[a.slot()] = Some(op_a.port);
+            self.operand_list[b.slot()] = Some(op_b.port);
+            self.operand_list[c.slot()] = Some(op_c.port);
+            if let Some(mode) = fold_mode {
+                self.fold_mode = *mode;
+            }
+            if is_nfwd(Some(op_a.port)) || is_nfwd(Some(op_b.port)) || is_nfwd(Some(op_c.port)) {
+                self.reset();
+                return;
+            }
+            self.forwarding_list[a.slot()] = sorted(&op_a.forwarding);
+            self.forwarding_list[b.slot()] = sorted(&op_b.forwarding);
+            self.forwarding_list[c.slot()] = sorted(&op_c.forwarding);
+            self.forwarding_list[OperandName::Result.slot()] = sorted(&result.forwarding);
+            self.is_field_unroll[a.slot()] = op_a.unroll_incr;
+            self.is_field_unroll[b.slot()] = op_b.unroll_incr;
+            self.is_field_unroll[c.slot()] = op_c.unroll_incr;
+            self.is_field_unroll[OperandName::Result.slot()] = result.unroll_incr;
+            self.precisions = vec![
+                op_a.precision,
+                op_b.precision,
+                op_c.precision,
+                *compute_precision,
+                result.precision,
+            ];
+            self.unroll_size = UnrollSize(unroll_factor.count());
+            if self.unroll_size == UnrollSize(3) {
+                panic!(
+                    "DT_CHECK_MSG(unroll_size_ != 3, \"Only reduction can have unroll factor of 3.\") (`OpRerolling.cpp:561`): {op:?}"
+                );
+            }
+            self.xrf_read_incr = XrfIncr(*xrf_read_incr as i32);
+            self.xrf_write_incr = XrfIncr(*xrf_write_incr as i32);
+        } else if let sen::Op::VectorBinary {
+            mask,
+            op_a,
+            op_b,
+            binary_op,
+            result,
+            unroll_factor,
+            ..
+        } = sen_op
+        {
+            self.op_name = Some(RolledOp::Binary(binary_op.op()));
+            self.mask_value = Some(*mask);
+            let a = slot_of(op_a.port_id);
+            let b = slot_of(op_b.port_id);
+            self.operand_list[a.slot()] = Some(op_a.port);
+            self.operand_list[b.slot()] = Some(op_b.port);
+            if is_nfwd(Some(op_a.port)) || is_nfwd(Some(op_b.port)) {
+                self.reset();
+                return;
+            }
+            self.forwarding_list[a.slot()] = sorted(&op_a.forwarding);
+            self.forwarding_list[b.slot()] = sorted(&op_b.forwarding);
+            self.forwarding_list[OperandName::Result.slot()] = sorted(&result.forwarding);
+            if let sen::Binary::Forwarding { to, .. } = binary_op {
+                self.forwarding_list[OperandName::LogicalResult.slot()].push(*to);
+            }
+            self.is_field_unroll[a.slot()] = op_a.unroll_incr;
+            self.is_field_unroll[b.slot()] = op_b.unroll_incr;
+            self.is_field_unroll[OperandName::Result.slot()] = result.unroll_incr;
+            self.is_field_unroll[OperandName::LogicalResult.slot()] = match binary_op {
+                sen::Binary::Plain(_) => false,
+                sen::Binary::Forwarding { unroll_incr, .. } => *unroll_incr,
+            };
+            self.unroll_size = UnrollSize(unroll_factor.count());
+            if self.unroll_size == UnrollSize(3) {
+                panic!(
+                    "DT_CHECK_MSG(unroll_size_ != 3, \"Only reduction can have unroll factor of 3.\") (`OpRerolling.cpp:598`): {op:?}"
+                );
+            }
+        } else if let sen::Op::VectorUnary {
+            mask,
+            op_a,
+            unary_op,
+            result,
+            unroll_factor,
+            ..
+        } = sen_op
+        {
+            self.op_name = Some(RolledOp::Unary(*unary_op));
+            self.mask_value = Some(*mask);
+            let a = slot_of(op_a.port_id);
+            self.operand_list[a.slot()] = Some(op_a.port);
+            self.forwarding_list[a.slot()] = sorted(&op_a.forwarding);
+            self.forwarding_list[OperandName::Result.slot()] = sorted(&result.forwarding);
+            self.is_field_unroll[a.slot()] = op_a.unroll_incr;
+            self.is_field_unroll[OperandName::Result.slot()] = result.unroll_incr;
+            self.unroll_size = UnrollSize(unroll_factor.count());
+            // ⭐ THE UNARY ARM HAS NO `nfwd` GUARD IN THE REFERENCE, and none is added here.
+            let is_reduction = matches!(
+                unary_op,
+                sen::UnaryOp::ReductionAbsMax
+                    | sen::UnaryOp::ReductionAbsMin
+                    | sen::UnaryOp::ReductionAdd
+                    | sen::UnaryOp::ReductionMax
+                    | sen::UnaryOp::ReductionMin
+            );
+            if is_reduction && self.unroll_size == UnrollSize(8) {
+                panic!(
+                    "DT_CHECK_MSG(unroll_size_ != 8, \"Reduction has no unroll factor of 8.\") (`OpRerolling.cpp:619`): {op:?}"
+                );
+            }
+            if !is_reduction && self.unroll_size == UnrollSize(3) {
+                panic!(
+                    "DT_CHECK_MSG(unroll_size_ != 3, \"Only reduction can have unroll factor of 3.\") (`OpRerolling.cpp:621`): {op:?}"
+                );
+            }
+        } else if let sen::Op::Splat {
+            input,
+            output,
+            mask,
+            pad,
+            precision,
+            program_header,
+            unroll_factor,
+            unroll_incr_result,
+            ..
+        } = sen_op
+        {
+            if *program_header {
+                self.is_splat_promoted = true;
+            }
+            self.op_name = Some(RolledOp::Splat);
+            self.mask_value = Some(*mask);
+            self.is_field_unroll[OperandName::Result.slot()] = *unroll_incr_result;
+            self.unroll_size = UnrollSize(unroll_factor.count());
+            self.precisions = vec![*precision];
+            self.splat_pad = *pad;
+            self.splat_input = Some(*input);
+            match defs.of(*output) {
+                Some(Op::Sentient(sen::Op::LogicalPort { port_name, .. })) => {
+                    self.operand_list[OperandName::Result.slot()] = Some(*port_name);
+                }
+                other => panic!(
+                    "DT_CHECK_MSG(output_port, \"expected output port to be specified through logical_port\") (`OpRerolling.cpp:634`): {other:?}"
+                ),
+            }
+        } else if let sen::Op::LoadAndSend {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            consumer,
+            result,
+            extent,
+            ..
+        } = sen_op
+        {
+            self.op_name = Some(RolledOp::LoadAndSend);
+            self.is_memory_unit = true;
+            self.unroll_size = burst_unroll_size(extent.burst_size);
+            self.fill_mem_op_attrs(sen_op);
+            self.src_dst.push(consumer.val());
+            self.addr_offsets.push(*immutable_addr);
+            self.addr_offsets.push(*increment);
+            self.mutable_address = Some(*mutable_addr);
+            self.result_address = Some(*result);
+        } else if let sen::Op::ReceiveAndStore {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            producer,
+            result,
+            extent,
+            ..
+        } = sen_op
+        {
+            self.op_name = Some(RolledOp::ReceiveAndStore);
+            self.is_memory_unit = true;
+            self.unroll_size = burst_unroll_size(extent.burst_size);
+            self.fill_mem_op_attrs(sen_op);
+            self.src_dst.push(producer.val());
+            self.addr_offsets.push(*immutable_addr);
+            self.addr_offsets.push(*increment);
+            self.mutable_address = Some(*mutable_addr);
+            self.result_address = Some(*result);
+        }
+    }
+
+    /// Replaces: e336_match
+    ///
+    /// Whether `new_operand_list` is the next instance of the statement this snapshot holds, and so
+    /// may be rerolled onto it (`:731`). Named `matches` because `match` is a Rust keyword.
+    ///
+    /// ⛔ A MEMORY OP MATCHES ONLY IF THE CANDIDATE'S `mutable_addr` CHAINS BACK TO THIS OP'S RESULT
+    /// (`:746-761`) — the two transfers must be consecutive halves of one double-buffered walk.
+    /// ⭐ `op->getAttrs()` OVER A `$consumer`/`$producer` IS ITS `dataflow.get_unit`'s THREE
+    /// ATTRIBUTES, as `agen_helper::get_unit_attrs` already establishes (`:769-773`).
+    pub(crate) fn matches(&self, new_operand_list: &Self, defs: Definitions<'_>) -> bool {
+        if new_operand_list.op_name.is_none() {
+            return false;
+        }
+        if self.op_name != new_operand_list.op_name || self.precisions != new_operand_list.precisions
+        {
+            return false;
+        }
+
+        if self.is_memory_unit {
+            if self.src_dst.len() != new_operand_list.src_dst.len()
+                || self.addr_offsets.len() != new_operand_list.addr_offsets.len()
+            {
+                return false;
+            }
+            // Walk the candidate's mutable address back until it reaches this op's result.
+            let mut curr = new_operand_list.mutable_address;
+            while curr != self.result_address {
+                match curr.and_then(|val| defs.of(val)) {
+                    Some(Op::Sentient(
+                        sen::Op::LoadAndSend { mutable_addr, .. }
+                        | sen::Op::ReceiveAndStore { mutable_addr, .. },
+                    )) => curr = Some(*mutable_addr),
+                    _ => return false,
+                }
+            }
+            for (mine, theirs) in self.src_dst.iter().zip(&new_operand_list.src_dst) {
+                if !src_dst_attrs_match(defs.of(*mine), defs.of(*theirs)) {
+                    return false;
+                }
+            }
+            for (mine, theirs) in self.addr_offsets.iter().zip(&new_operand_list.addr_offsets) {
+                if constant_offset(defs.of(*mine)) != constant_offset(defs.of(*theirs)) {
+                    return false;
+                }
+            }
+            // ⭐ ONE COMPARISON FOR THE WHOLE MAP: a missing entry is the reference's `.at()` throw,
+            // and a differing KIND cannot arise — `op_name_` already agreed.
+            return self.memory_op_attrs == new_operand_list.memory_op_attrs;
+        }
+
+        for name in OperandName::ALL {
+            if !self.are_operands_matching(
+                self.operand_list[name.slot()],
+                self.is_field_unroll[name.slot()],
+                new_operand_list.operand_list[name.slot()],
+                new_operand_list.is_field_unroll[name.slot()],
+                new_operand_list,
+                true,
+            ) {
+                return false;
+            }
+        }
+
+        for name in OperandName::ALL {
+            let mine = &self.forwarding_list[name.slot()];
+            let theirs = &new_operand_list.forwarding_list[name.slot()];
+            if mine.len() != theirs.len() {
+                return false;
+            }
+            for (fwd, new_fwd) in mine.iter().zip(theirs) {
+                if !self.are_operands_matching(
+                    Some(*fwd),
+                    self.is_field_unroll[name.slot()],
+                    Some(*new_fwd),
+                    new_operand_list.is_field_unroll[name.slot()],
+                    new_operand_list,
+                    false,
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        if self.is_splat_promoted
+            || new_operand_list.is_splat_promoted
+            || self.splat_pad != new_operand_list.splat_pad
+        {
+            return false;
+        }
+        match (self.splat_input, new_operand_list.splat_input) {
+            (None, None) => {}
+            (None, Some(_)) | (Some(_), None) => return false,
+            (Some(mine), Some(theirs)) => {
+                // A constant input is not translated into a SPLAT in ProgIR, so it never rerolls.
+                let is_constant = |val: Val| {
+                    matches!(
+                        defs.of(val),
+                        Some(Op::Sentient(
+                            sen::Op::ScalarConstant { .. } | sen::Op::VectorConstant { .. }
+                        ))
+                    )
+                };
+                if is_constant(mine) || is_constant(theirs) {
+                    return false;
+                }
+                let port_of = |val: Val| match defs.of(val) {
+                    Some(Op::Sentient(sen::Op::LogicalPort { port_name, .. })) => Some(*port_name),
+                    _ => None,
+                };
+                match (port_of(mine), port_of(theirs)) {
+                    (Some(mine), Some(theirs)) if mine == theirs => {}
+                    _ => return false,
+                }
+            }
+        }
+
+        // In PT there is no mask operand at all, so two empty masks match.
+        let mask_of = |val: Option<Val>| match val.and_then(|val| defs.of(val)) {
+            Some(Op::Sentient(sen::Op::ScalarConstant { value, .. })) => Some(*value),
+            _ => None,
+        };
+        match (mask_of(self.mask_value), mask_of(new_operand_list.mask_value)) {
+            (Some(mine), Some(theirs)) if mine != theirs => return false,
+            (Some(_), None) | (None, Some(_)) => return false,
+            _ => {}
+        }
+
+        self.fold_mode == new_operand_list.fold_mode
+    }
+
+    /// Replaces: e337_updateUnrollInfo
+    ///
+    /// Marks every slot whose register index ADVANCES from this snapshot to the next one as
+    /// field-unrolled, so the rerolled op increments it per instance (`:881`).
+    ///
+    /// ⛔ ONCE ONLY — `are_unroll_fields_updated_` latches, because the second candidate's gap is
+    /// measured against the reference and not against its predecessor (`:883-885`).
+    pub(crate) fn update_unroll_info(&mut self, new_operand_list: &Self) {
+        if self.are_unroll_fields_updated {
+            return;
+        }
+        self.are_unroll_fields_updated = true;
+        if self.is_memory_unit {
+            return;
+        }
+
+        for name in OperandName::ALL {
+            if let (Some(sen::Port::Lrf(lhs)), Some(sen::Port::Lrf(rhs))) = (
+                self.operand_list[name.slot()],
+                new_operand_list.operand_list[name.slot()],
+            ) && rhs.get() > lhs.get()
+            {
+                self.is_field_unroll[name.slot()] = true;
+            }
+        }
+
+        let result = OperandName::Result.slot();
+        let (mine, theirs) = (
+            &self.forwarding_list[result],
+            &new_operand_list.forwarding_list[result],
+        );
+        if mine.len() != theirs.len() {
+            panic!(
+                "DT_CHECK(fwd_result_list.size() == new_operand_list.forwarding_list_[result].size()) (`OpRerolling.cpp:906`): {} vs {}",
+                mine.len(),
+                theirs.len()
+            );
+        }
+        let result_advances = mine.iter().zip(theirs).any(|pair| match pair {
+            (sen::Port::Lrf(lhs), sen::Port::Lrf(rhs)) => rhs.get() > lhs.get(),
+            _ => false,
+        });
+        if result_advances {
+            self.is_field_unroll[result] = true;
+        }
+
+        let logical = OperandName::LogicalResult.slot();
+        if self.forwarding_list[logical].is_empty() {
+            return;
+        }
+        if self.forwarding_list[logical].len() != 1 || new_operand_list.forwarding_list[logical].len() != 1
+        {
+            panic!(
+                "DT_CHECK(fwd_logical_result_list.size() == 1 && new_operand_list.forwarding_list_[logical_result].size() == 1) (`OpRerolling.cpp:918`): {} vs {}",
+                self.forwarding_list[logical].len(),
+                new_operand_list.forwarding_list[logical].len()
+            );
+        }
+        if let (sen::Port::IState(lhs), sen::Port::IState(rhs)) = (
+            self.forwarding_list[logical][0],
+            new_operand_list.forwarding_list[logical][0],
+        ) && rhs.get() > lhs.get()
+        {
+            self.is_field_unroll[logical] = true;
+        }
+    }
+}
+
+/// `getBurstSize() == 0 ? 1 : getBurstSize()` (`:643`, `:656`) — an unbursted transfer still stands
+/// for one op.
+fn burst_unroll_size(burst_size: Elements) -> UnrollSize {
+    if burst_size.0 == 0 {
+        UnrollSize::ONE
+    } else {
+        UnrollSize(burst_size.0 as u32)
+    }
+}
+
+/// `for (auto attr : this_op->getAttrs()) if (attr.getValue() != other_op->getAttr(...))` over the op
+/// behind a `$consumer` or `$producer` (`:764-783`).
+///
+/// ⭐ THE ATTRIBUTES OF A `dataflow.get_unit` ARE ITS RESIDENCY, UNIT AND FOLD COUNT — the same three
+/// `bridges::dataflow_ir_to_sentient::agen_helper`'s `get_unit_attrs` compares, the `$unit` result
+/// being a binding and not an attribute.
+///
+/// ⛔ EXACTLY ONE `uniform.query_map` IS THE REFERENCE'S OWN `// conservative` FALSE (`:781`).
+fn src_dst_attrs_match(this_op: Option<&Op>, other_op: Option<&Op>) -> bool {
+    match (this_op, other_op) {
+        (
+            Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })),
+            Some(Op::Uniform(uniform::Op::QueryMap {
+                map: other_map,
+                key: other_key,
+                ..
+            })),
+        ) => map == other_map && key == other_key,
+        (Some(Op::Uniform(uniform::Op::QueryMap { .. })), _)
+        | (_, Some(Op::Uniform(uniform::Op::QueryMap { .. }))) => false,
+        (
+            Some(Op::Dataflow(dataflow::Op::GetUnit {
+                residency,
+                unit,
+                num_folds,
+                ..
+            })),
+            Some(Op::Dataflow(dataflow::Op::GetUnit {
+                residency: other_residency,
+                unit: other_unit,
+                num_folds: other_num_folds,
+                ..
+            })),
+        ) => {
+            residency == other_residency && unit == other_unit && num_folds == other_num_folds
+        }
+        _ => todo!(
+            "op->getAttrs() over an unmodelled $consumer/$producer defining op (`OpRerolling.cpp:769-771`): {this_op:?} vs {other_op:?}"
+        ),
+    }
+}
+
+/// `addr_offsets[i].getDefiningOp<sentient::ConstantOp>().getValue()` (`:787-791`).
+///
+/// ⛔ A NON-CONSTANT OFFSET IS THE REFERENCE'S OWN NULL DEREFERENCE, not a case it answers.
+fn constant_offset(op: Option<&Op>) -> i64 {
+    match op {
+        Some(Op::Sentient(sen::Op::ScalarConstant { value, .. })) => *value,
+        other => todo!(
+            "getDefiningOp<ConstantOp>()->getValue() on a non-constant address offset (`OpRerolling.cpp:787-791`): {other:?}"
+        ),
+    }
 }
 
 /// `symbolizeSentientComputePort("lrf" + std::to_string(index))` for a COMPUTED index (`:929-933`,
@@ -1036,19 +1522,125 @@ mod unit_tests {
             )
         );
     }
+
+    /// A mac reading `a`, `b` and `c` from ports 1, 0 and 2, computing in `precision`.
+    fn keyed_mac(a: sen::Port, b: sen::Port, c: sen::Port, precision: sen::Precision) -> Op {
+        let at = |port: sen::Port, port_id: i32| sen::Operand {
+            port_id: Some(port_id),
+            ..sen::Operand::from(port)
+        };
+        Op::Sentient(sen::Op::VectorMac {
+            mask: None,
+            xrf_write_ptr: None,
+            xrf_read_ptr: None,
+            results: vec![Val(10)],
+            op_a: at(a, 1),
+            op_b: at(b, 0),
+            op_c: at(c, 2),
+            result: sen::ResultPorts::default(),
+            mode: sen::FmaMode::FusedMulAdd,
+            compute_precision: precision,
+            fold_mode: None,
+            unroll_factor: sen::UnrollFactor::X1,
+            xrf_read_incr: 0,
+            xrf_write_incr: 0,
+            data_transfer_only: false,
+            is_data_weight: None,
+            dbg_name: None,
+        })
+    }
+
+    /// e335_fill — an operand lands in the slot its PORT names, not the one its own `opX` field does,
+    /// and an `nfwd` operand abandons the snapshot back to the `"NA"` sentinel.
+    #[test]
+    fn fill_keys_operands_by_port_and_an_nfwd_abandons_the_snapshot() {
+        let mut snapshot = UnrollOperands::default();
+        snapshot.fill(
+            &keyed_mac(
+                sen::Port::West,
+                sen::Port::Lx,
+                sen::Port::Zero,
+                sen::Precision::Fp16,
+            ),
+            DfirUnit::Sfp,
+            Definitions::from_innermost(&[]),
+        );
+        assert_eq!(snapshot.op_name, Some(RolledOp::Mac));
+        // op_a sits on port 1 -> the OpB slot; op_b on port 0 -> OpA; op_c on port 2 -> OpC.
+        assert_eq!(
+            snapshot.operand_list[OperandName::OpB.slot()],
+            Some(sen::Port::West)
+        );
+        assert_eq!(
+            snapshot.operand_list[OperandName::OpA.slot()],
+            Some(sen::Port::Lx)
+        );
+        assert_eq!(
+            snapshot.operand_list[OperandName::OpC.slot()],
+            Some(sen::Port::Zero)
+        );
+        assert_eq!(snapshot.unroll_size, UnrollSize::ONE);
+
+        snapshot.fill(
+            &keyed_mac(
+                sen::Port::West,
+                sen::Port::Nfwd0,
+                sen::Port::Zero,
+                sen::Precision::Fp16,
+            ),
+            DfirUnit::Sfp,
+            Definitions::from_innermost(&[]),
+        );
+        assert_eq!(snapshot.op_name, None);
+        assert_eq!(snapshot.operand_list[OperandName::OpB.slot()], None);
+    }
+
+    /// e336_match — two snapshots of the same statement reroll onto each other; a differing compute
+    /// precision refuses before an operand is even looked at.
+    #[test]
+    fn match_accepts_the_same_statement_and_refuses_a_changed_precision() {
+        let fill_of = |op: &Op| {
+            let mut snapshot = UnrollOperands::default();
+            snapshot.fill(op, DfirUnit::Sfp, Definitions::from_innermost(&[]));
+            snapshot
+        };
+        let same = keyed_mac(
+            sen::Port::West,
+            sen::Port::Lx,
+            sen::Port::Zero,
+            sen::Precision::Fp16,
+        );
+        let reference = fill_of(&same);
+        assert!(reference.matches(&fill_of(&same), Definitions::from_innermost(&[])));
+
+        let other_precision = keyed_mac(
+            sen::Port::West,
+            sen::Port::Lx,
+            sen::Port::Zero,
+            sen::Precision::Fp8,
+        );
+        assert!(
+            !reference.matches(&fill_of(&other_precision), Definitions::from_innermost(&[]))
+        );
+    }
+
+    /// e337_updateUnrollInfo — a slot whose `lrf` advances becomes field-unrolled, and the flag
+    /// LATCHES: a second candidate cannot add another slot.
+    #[test]
+    fn update_unroll_info_marks_an_advancing_lrf_once_and_then_latches() {
+        let mut reference = with_operand(OperandName::OpA, Some(sen::Port::Lrf(sen::LrfIndex::L4)));
+        reference.operand_list[OperandName::OpB.slot()] = Some(sen::Port::Lrf(sen::LrfIndex::L0));
+        let mut candidate = with_operand(OperandName::OpA, Some(sen::Port::Lrf(sen::LrfIndex::L6)));
+        candidate.operand_list[OperandName::OpB.slot()] = Some(sen::Port::Lrf(sen::LrfIndex::L0));
+
+        reference.update_unroll_info(&candidate);
+        assert!(reference.are_unroll_fields_updated);
+        assert!(reference.is_field_unroll[OperandName::OpA.slot()]);
+        assert!(!reference.is_field_unroll[OperandName::OpB.slot()]);
+
+        // The second candidate advances OpB, and the latch throws it away.
+        candidate.operand_list[OperandName::OpB.slot()] = Some(sen::Port::Lrf(sen::LrfIndex::L2));
+        reference.update_unroll_info(&candidate);
+        assert!(!reference.is_field_unroll[OperandName::OpB.slot()]);
+    }
 }
-
-// crustify:todo: e335_fill
-//   authority : dcc/src/Transform/Sentient/OpRerolling.cpp:502  (165 body lines, level 1)
-//   original  : void UnrollOperands::fill(Operation *op, SenComponents type)
-//   calls     : e115_reset, e116_getUnrollOperandUsingPort, e117_fillMemOpAttrs
-
-// crustify:todo: e336_match
-//   authority : dcc/src/Transform/Sentient/OpRerolling.cpp:731  (149 body lines, level 1)
-//   original  : bool UnrollOperands::match(UnrollOperands &new_operand_list)
-//   calls     : e118_areOperandsMatching, e252_size
-
-// crustify:todo: e337_updateUnrollInfo
-//   authority : dcc/src/Transform/Sentient/OpRerolling.cpp:881  (44 body lines, level 1)
-//   original  : void UnrollOperands::updateUnrollInfo(UnrollOperands &new_operand_list)
-//   calls     : e252_size

@@ -641,6 +641,36 @@ impl UniformGroups for OutOfScopeUniformGroups {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LiveRange;
 
+/// WHERE A LIVE RANGE OPENS — `getIntervals()[0].first`, the instruction index its first labelled
+/// interval starts at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RangeStart(pub u32);
+
+impl LiveRange {
+    /// `getIntervals()[0].first` (`PortAssignment.cpp:751`).
+    ///
+    /// ⛔ `Analyses/LiveRange.{hpp,cpp}` IS OUT OF CAMPAIGN SCOPE, so this is where
+    /// `e341_addReuseToDummyOperands` stops — everything up to and including the owners-differ
+    /// short-circuit is ported, and the interval comparison is not.
+    #[must_use]
+    pub fn first_interval_start(self) -> RangeStart {
+        todo!("LiveRange::getIntervals (Analyses/LiveRange.hpp:44) — out of campaign scope")
+    }
+}
+
+/// A NODE OF A COLOURING GRAPH — `GraphNode::index_`, which for port assignment is the operand's data
+/// id (`Analyses/GraphColoring.cpp:58`).
+///
+/// ⛔ THERE IS NO NODE FOR THE REFERENCE'S `-1`: `getOrAddNode(-1)` answers `nullptr` and its callers
+/// dereference it, so an unassigned data id is a crash there (`GraphColoring.cpp:61`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphNodeId(pub u32);
+
+/// ONE COLOUR A NODE MAY TAKE — an element of `GraphNode::possible_values_`, which port assignment
+/// colours with the three compute ports (`Analyses/GraphColoring.hpp:41`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphColor(pub u32);
+
 /// THE `GraphColoring` A PASS OWNS — a trait, for the same reason [`ExpressionEvaluator`] is one: the
 /// analysis is not in this campaign and a test must still be able to observe what a pass asks it.
 ///
@@ -656,6 +686,25 @@ pub trait ColoringGraph {
     /// constructor's own `clear()` ran on an empty object. Whoever gives this an interior must never
     /// write `*self = Self::default()`.
     fn clear(&mut self);
+
+    /// `GraphColoring::getOrAddNode(int)` (`Analyses/GraphColoring.cpp:58-68`).
+    ///
+    /// ⭐ CREATING THE NODE IS THE WHOLE EFFECT — the `GraphNode *` it hands back is the mechanism for
+    /// reaching it, which is why the two questions asked of a node are keyed by id here instead.
+    fn get_or_add_node(&mut self, node: GraphNodeId);
+
+    /// `GraphNode::addValidValues(v)` at its default `addon = false`
+    /// (`Analyses/GraphColoring.cpp:45-56`).
+    ///
+    /// ⛔⛔ IT **REPLACES** THE NODE'S LIST, IT DOES NOT ADD TO IT. Every call in
+    /// `e339_addNodesToGraph` omits `addon`, so the last one to name a node wins outright — which is
+    /// what makes the trivial-FMA and `DataTransferOnly` calls at the end of that unit overrides
+    /// rather than intersections.
+    fn add_valid_values(&mut self, node: GraphNodeId, values: &[GraphColor]);
+
+    /// `GraphNode::getValidValues()` (`Analyses/GraphColoring.hpp:37`) — empty for a node nothing has
+    /// constrained, which is `possible_values_`'s own initial state.
+    fn valid_values(&self, node: GraphNodeId) -> Vec<GraphColor>;
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
@@ -665,6 +714,27 @@ pub struct OutOfScopeColoringGraph;
 impl ColoringGraph for OutOfScopeColoringGraph {
     fn clear(&mut self) {
         todo!("GraphColoring::clear (Analyses/GraphColoring.hpp:52) — out of campaign scope")
+    }
+
+    fn get_or_add_node(&mut self, node: GraphNodeId) {
+        todo!(
+            "GraphColoring::getOrAddNode({node:?}) (Analyses/GraphColoring.cpp:58) — out of \
+             campaign scope"
+        )
+    }
+
+    fn add_valid_values(&mut self, node: GraphNodeId, values: &[GraphColor]) {
+        todo!(
+            "GraphNode::addValidValues({node:?}, {values:?}) (Analyses/GraphColoring.cpp:45) — out \
+             of campaign scope"
+        )
+    }
+
+    fn valid_values(&self, node: GraphNodeId) -> Vec<GraphColor> {
+        todo!(
+            "GraphNode::getValidValues({node:?}) (Analyses/GraphColoring.hpp:37) — out of campaign \
+             scope"
+        )
     }
 }
 

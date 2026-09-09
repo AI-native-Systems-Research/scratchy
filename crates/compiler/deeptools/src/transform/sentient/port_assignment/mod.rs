@@ -88,18 +88,18 @@
 //! | `e632_doPortAssignments` | 632 | 6 | 12 | `dcc/src/Transform/Sentient/PortAssignment.cpp:776` |
 //! | `e645_runOnOperation` | 645 | 7 | 21 | `dcc/src/Transform/Sentient/PortAssignment.cpp:793` |
 
-// ⛔ NINE OF THE THIRTEEN ANCHORS BELOW ARE UNFILLED, so the pass state has no writer and
-// `getPortAttr` no caller until they land; CI runs clippy with `-D warnings`
+// ⛔ SIX OF THE THIRTEEN ANCHORS BELOW ARE UNFILLED, so the pass state still has no writer and
+// nothing outside this file calls the seven that have landed; CI runs clippy with `-D warnings`
 // (the `lexical_ordering/mod.rs:83` precedent).
 // ⭐ REMOVE THIS WITH `e645_runOnOperation`.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
-use super::analyses::{ColoringGraph, LiveRange};
+use super::analyses::{ColoringGraph, GraphColor, GraphNodeId, LiveRange};
 use crate::arch::{Arch, IsaGen};
 use crate::islands::sentient::dialects::sentient::{BinaryOp, Port, Precision, TernaryOp, UnaryOp};
-use crate::islands::sentient::dialects::{Op, sentient};
+use crate::islands::sentient::dialects::{Op, regions_mut, sentient};
 use crate::units::DfirUnit;
 
 /// WHICH OF THE THREE COMPUTE PORTS — the count is fixed at `performGraphColoring(3)` (`:784`).
@@ -527,20 +527,420 @@ pub(crate) fn is_swappable_per_algebraic_reassociation(op: &Op) -> Option<MacOpe
     }
 }
 
-// crustify:todo: e339_addNodesToGraph
-//   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:473  (131 body lines, level 1)
-//   original  : void PortAssignmentPass::addNodesToGraph(Operation *op, const SenComponents comp)
-//   calls     : e125_getValidPorts, e126_IsSwappablePerAlgebraicReassociation
+/// WHY `addNodesToGraph` GAVE UP ON AN OP — one variant per `emitError` it can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphNodesRejection {
+    /// The ISA table itself refused an operand (`:481`, `:487`, and the six other call sites).
+    Operand(PortRejection),
+    /// "No valid port for opC in unit" (`:506`).
+    NoValidPortForOpC,
+    /// "No valid port for sub operation in unit" (`:544`).
+    NoValidPortForSub,
+    /// "No valid port for marge/pack/fcmp operation in unit" (`:565`) — the vendor's own spelling.
+    NoValidPortForMergePackFcmp,
+    /// "No valid port for select operation in unit" (`:598`).
+    NoValidPortForSelect,
+}
 
-// crustify:todo: e340_updateSentientIRPorts
-//   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:682  (52 body lines, level 1)
-//   original  : void PortAssignmentPass::updateSentientIRPorts(dataflow::ProgramUnitOp &unit)
-//   calls     : e124_getPortAttr, e252_size
+/// WHETHER THE ISA CONSTRAINTS WENT INTO THE GRAPH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphNodes {
+    /// Every operand of this op got its list.
+    Added,
+    /// `signalPassFailure()` — the compilation is over.
+    Rejected(GraphNodesRejection),
+}
 
-// crustify:todo: e341_addReuseToDummyOperands
-//   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:739  (36 body lines, level 1)
-//   original  : void PortAssignmentPass::addReuseToDummyOperands()
-//   calls     : e124_getPortAttr, e252_size
+/// `getOpXDataID()` AS A GRAPH NODE.
+///
+/// ⛔ BOTH REFUSALS ARE THE REFERENCE'S OWN AND NEITHER IS A CHECK ADDED HERE: `getOrAddNode(-1)`
+/// answers `nullptr` and `nodeX->addValidValues(..)` dereferences it (`GraphColoring.cpp:61`), while
+/// `getPortAttr(-1)` throws out of `port_assignment_.at` (`:207`). Port assignment runs before
+/// anything duplicates a data id, so reaching either means `processDataID` never ran.
+fn data_id_of(data_id: Option<i32>) -> DataId {
+    match data_id {
+        Some(id) if id >= 0 => DataId(id.unsigned_abs()),
+        _ => todo!(
+            "getOrAddNode(-1) answers nullptr and getPortAttr(-1) throws — this operand's data id \
+             was never assigned (GraphColoring.cpp:61, PortAssignment.cpp:207)"
+        ),
+    }
+}
+
+/// A data id as the node it indexes.
+const fn node_of(data_id: DataId) -> GraphNodeId {
+    GraphNodeId(data_id.0)
+}
+
+/// The colours a port list names.
+fn colors(ports: &[PortId]) -> Vec<GraphColor> {
+    ports.iter().map(|port| GraphColor(port.get() as u32)).collect()
+}
+
+/// `getValidPorts`'s answer AS THE REFERENCE READS IT: an `emitError` arm has already failed the pass
+/// and hands back `{}`, which the caller then goes on to use as an empty list (`:466-470`).
+fn constrained(answer: ValidPorts, rejection: &mut Option<GraphNodesRejection>) -> Vec<PortId> {
+    match answer {
+        ValidPorts::Ports(ports) => ports,
+        ValidPorts::Rejected(why) => {
+            if rejection.is_none() {
+                *rejection = Some(GraphNodesRejection::Operand(why));
+            }
+            Vec::new()
+        }
+    }
+}
+
+impl<G: ColoringGraph> PortAssignment<G> {
+    /// Replaces: e339_addNodesToGraph
+    ///
+    /// Turns one compute op's ISA port constraints into colouring-graph nodes, narrowing opC to the
+    /// component's accumulate port and `sub`/`merge`/`pack`/`fcvt`/`gcvt`/`fcmp`/`select` to their
+    /// fixed pairs (`:473`).
+    ///
+    /// ⛔ `addValidValues` REPLACES, so the trivial-FMA and `DataTransferOnly` calls at the end
+    /// OVERRIDE what the ISA table said, and a dummy operand ends up free on all three ports (`:517`,
+    /// `:521-528`).
+    pub(crate) fn add_nodes_to_graph<A: Arch>(&mut self, op: &Op, comp: DfirUnit) -> GraphNodes {
+        let mut rejection = None;
+        let pe_or_sfp = matches!(comp, DfirUnit::Pe | DfirUnit::Sfp);
+        if let Op::Sentient(sentient::Op::VectorMac {
+            op_a,
+            op_b,
+            op_c,
+            compute_precision,
+            data_transfer_only,
+            ..
+        }) = op
+        {
+            let (node_a, node_b, node_c) = (
+                node_of(data_id_of(op_a.data_id)),
+                node_of(data_id_of(op_b.data_id)),
+                node_of(data_id_of(op_c.data_id)),
+            );
+            for node in [node_a, node_b, node_c] {
+                self.graph.get_or_add_node(node);
+            }
+            for (node, operand) in [(node_a, op_a), (node_b, op_b)] {
+                let list = constrained(
+                    valid_ports::<A>(op, operand.port, comp, operand.precision, *compute_precision),
+                    &mut rejection,
+                );
+                self.graph.add_valid_values(node, &colors(&list));
+            }
+            let c_ports = constrained(
+                valid_ports::<A>(op, op_c.port, comp, op_c.precision, *compute_precision),
+                &mut rejection,
+            );
+            // `IsSwappablePerAlgebraicReassociation(op) != -1` leaves opC free; otherwise it is pinned
+            // to the component's accumulate port or the op is refused (`:485-508`).
+            if is_swappable_per_algebraic_reassociation(op).is_some() {
+                self.graph.add_valid_values(node_c, &colors(&c_ports));
+            } else if matches!(comp, DfirUnit::PtRow(_)) && c_ports.contains(&PortId::P1) {
+                self.graph.add_valid_values(node_c, &colors(&[PortId::P1]));
+            } else if pe_or_sfp && c_ports.contains(&PortId::P2) {
+                self.graph.add_valid_values(node_c, &colors(&[PortId::P2]));
+            } else {
+                return GraphNodes::Rejected(GraphNodesRejection::NoValidPortForOpC);
+            }
+            // `0.0 * x + 1.0`-shaped: nothing is computed, so opA may sit on the multiplier port.
+            let trivial_fma_computation =
+                op_a.port == Port::Zero && (op_b.port == Port::One || op_c.port == Port::One);
+            if pe_or_sfp && trivial_fma_computation {
+                self.graph.add_valid_values(node_a, &colors(&[PortId::P2]));
+            }
+            if *data_transfer_only {
+                let free = colors(&[PortId::P0, PortId::P1, PortId::P2]);
+                self.graph.add_valid_values(node_b, &free);
+                self.graph.add_valid_values(node_c, &free);
+                self.reuse_nodes.push(DataId(node_a.0));
+                self.dummy_nodes.push(DataId(node_b.0));
+                self.dummy_nodes.push(DataId(node_c.0));
+            }
+        } else if let Op::Sentient(sentient::Op::VectorBinary {
+            op_a,
+            op_b,
+            binary_op,
+            compute_precision,
+            ..
+        }) = op
+        {
+            let (node_a, node_b) = (
+                node_of(data_id_of(op_a.data_id)),
+                node_of(data_id_of(op_b.data_id)),
+            );
+            self.graph.get_or_add_node(node_a);
+            self.graph.get_or_add_node(node_b);
+            let a_ports = constrained(
+                valid_ports::<A>(op, op_a.port, comp, op_a.precision, *compute_precision),
+                &mut rejection,
+            );
+            let b_ports = constrained(
+                valid_ports::<A>(op, op_b.port, comp, op_b.precision, *compute_precision),
+                &mut rejection,
+            );
+            // ⛔ `StringRef::contains` ON THE OPERATOR'S SPELLING, kept because that is what selects
+            // the group: every `merge<w><half>`, `pack<n>`, `gcvt_imm<n>` and `fcvt_imm<n>` (`:556`).
+            let spelling = binary_op.op().spelling();
+            let fixed_pair = spelling.contains("merge")
+                || spelling.contains("pack")
+                || spelling.contains("gcvt")
+                || spelling.contains("fcvt")
+                || matches!(
+                    binary_op.op(),
+                    BinaryOp::CompareEq
+                        | BinaryOp::CompareNeq
+                        | BinaryOp::CompareLe
+                        | BinaryOp::CompareLt
+                );
+            if matches!(binary_op.op(), BinaryOp::Sub) {
+                if a_ports.contains(&PortId::P2) && b_ports.contains(&PortId::P0) {
+                    self.graph.add_valid_values(node_a, &colors(&[PortId::P2]));
+                    self.graph.add_valid_values(node_b, &colors(&[PortId::P0]));
+                } else {
+                    return GraphNodes::Rejected(GraphNodesRejection::NoValidPortForSub);
+                }
+            } else if fixed_pair {
+                if a_ports.contains(&PortId::P0) && b_ports.contains(&PortId::P2) {
+                    self.graph.add_valid_values(node_a, &colors(&[PortId::P0]));
+                    self.graph.add_valid_values(node_b, &colors(&[PortId::P2]));
+                } else {
+                    return GraphNodes::Rejected(GraphNodesRejection::NoValidPortForMergePackFcmp);
+                }
+            } else {
+                self.graph.add_valid_values(node_a, &colors(&a_ports));
+                self.graph.add_valid_values(node_b, &colors(&b_ports));
+            }
+        } else if let Op::Sentient(sentient::Op::VectorUnary {
+            op_a,
+            compute_precision,
+            ..
+        }) = op
+        {
+            let node_a = node_of(data_id_of(op_a.data_id));
+            self.graph.get_or_add_node(node_a);
+            let a_ports = constrained(
+                valid_ports::<A>(op, op_a.port, comp, op_a.precision, *compute_precision),
+                &mut rejection,
+            );
+            self.graph.add_valid_values(node_a, &colors(&a_ports));
+        } else if let Op::Sentient(sentient::Op::VectorTernary {
+            op_b,
+            op_c,
+            ternary_op,
+            compute_precision,
+            ..
+        }) = op
+        {
+            // `DT_CHECK(ternary_op == select)` and the `if` guarding the same thing are both total:
+            // [`TernaryOp`] has the one variant. `A ? C : B`, so opA gets no node at all.
+            let TernaryOp::Select = ternary_op;
+            let (node_b, node_c) = (
+                node_of(data_id_of(op_b.data_id)),
+                node_of(data_id_of(op_c.data_id)),
+            );
+            self.graph.get_or_add_node(node_b);
+            self.graph.get_or_add_node(node_c);
+            let b_ports = constrained(
+                valid_ports::<A>(op, op_b.port, comp, op_b.precision, *compute_precision),
+                &mut rejection,
+            );
+            let c_ports = constrained(
+                valid_ports::<A>(op, op_c.port, comp, op_c.precision, *compute_precision),
+                &mut rejection,
+            );
+            if c_ports.contains(&PortId::P0) && b_ports.contains(&PortId::P2) {
+                self.graph.add_valid_values(node_c, &colors(&[PortId::P0]));
+                self.graph.add_valid_values(node_b, &colors(&[PortId::P2]));
+            } else {
+                return GraphNodes::Rejected(GraphNodesRejection::NoValidPortForSelect);
+            }
+        }
+        // ⭐ EVERY OTHER OP IS SILENTLY SKIPPED: the walk visits the whole unit and only the four
+        // compute ops have ports to constrain (`:473-604`).
+        match rejection {
+            Some(why) => GraphNodes::Rejected(why),
+            None => GraphNodes::Added,
+        }
+    }
+
+    /// Replaces: e340_updateSentientIRPorts
+    ///
+    /// Writes the colouring's answer into every compute op's `opXPortID` and resets each `opXDataID`
+    /// to the `.td`'s `-1` (`:682`).
+    ///
+    /// ⛔ A `DataTransferOnly` MAC'S opC TAKES THE **LAST** VALID VALUE THAT IS NEITHER opA'S NOR
+    /// opB'S — the reference's loop has no `break` — and if every candidate collides opC keeps
+    /// whatever it had (`:690-701`).
+    pub(crate) fn update_sentient_ir_ports(&mut self, body: &mut [Op]) {
+        // `if (port_assignment_.size() == 0) return;`
+        if self.port_assignment.is_empty() {
+            return;
+        }
+        self.update_ports_in(body);
+    }
+
+    /// `unit.walk<WalkOrder::PreOrder>(..)` (`:686`).
+    fn update_ports_in(&mut self, scope: &mut [Op]) {
+        for op in scope.iter_mut() {
+            if let Op::Sentient(sen_op) = op {
+                self.update_ports_of(sen_op);
+            }
+            for region in regions_mut(op) {
+                self.update_ports_in(region);
+            }
+        }
+    }
+
+    /// The four compute arms of [`Self::update_sentient_ir_ports`]'s walk.
+    fn update_ports_of(&mut self, op: &mut sentient::Op) {
+        if let sentient::Op::VectorMac {
+            op_a,
+            op_b,
+            op_c,
+            data_transfer_only,
+            ..
+        } = op
+        {
+            let (a_id, b_id) = (data_id_of(op_a.data_id), data_id_of(op_b.data_id));
+            let (a_port, b_port) = (self.port_attr(a_id), self.port_attr(b_id));
+            op_a.port_id = Some(a_port.get());
+            op_b.port_id = Some(b_port.get());
+            if *data_transfer_only {
+                let node_c = node_of(data_id_of(op_c.data_id));
+                self.graph.get_or_add_node(node_c);
+                for color in self.graph.valid_values(node_c) {
+                    let candidate = color.0 as i32;
+                    if candidate != a_port.get() && candidate != b_port.get() {
+                        op_c.port_id = Some(candidate);
+                    }
+                }
+                // `op->removeAttr("DataTransferOnly")` — the island carries it as a flag.
+                *data_transfer_only = false;
+            } else {
+                op_c.port_id = Some(self.port_attr(data_id_of(op_c.data_id)).get());
+            }
+            op_a.data_id = None;
+            op_b.data_id = None;
+            op_c.data_id = None;
+        } else if let sentient::Op::VectorBinary { op_a, op_b, .. } = op {
+            op_a.port_id = Some(self.port_attr(data_id_of(op_a.data_id)).get());
+            op_b.port_id = Some(self.port_attr(data_id_of(op_b.data_id)).get());
+            op_a.data_id = None;
+            op_b.data_id = None;
+        } else if let sentient::Op::VectorUnary { op_a, .. } = op {
+            op_a.port_id = Some(self.port_attr(data_id_of(op_a.data_id)).get());
+            op_a.data_id = None;
+        } else if let sentient::Op::VectorTernary {
+            op_a,
+            op_b,
+            op_c,
+            ternary_op,
+            ..
+        } = op
+        {
+            let TernaryOp::Select = ternary_op;
+            op_b.port_id = Some(self.port_attr(data_id_of(op_b.data_id)).get());
+            op_c.port_id = Some(self.port_attr(data_id_of(op_c.data_id)).get());
+            // ⭐ opA'S DATA ID IS CLEARED WITHOUT ITS PORT ID EVER BEING WRITTEN (`:725-727`).
+            op_a.data_id = None;
+            op_b.data_id = None;
+            op_c.data_id = None;
+        }
+    }
+
+    /// Replaces: e341_addReuseToDummyOperands
+    ///
+    /// Where one reused operand's live range opens no later than another's, rewrites the second
+    /// operand's owning MAC to read that port from the `latch` instead (`:739`).
+    ///
+    /// ⛔ THE OWNERS-DIFFER TEST SHORT-CIRCUITS FIRST, so a pair sharing its first owner never asks
+    /// the live ranges — which is as far as this gets, [`LiveRange::first_interval_start`] being out
+    /// of campaign scope.
+    pub(crate) fn add_reuse_to_dummy_operands(&self, body: &mut [Op]) {
+        for reuse_nodes in &self.reuse_nodes_per_op {
+            for i in 0..reuse_nodes.len() {
+                for j in (i + 1)..reuse_nodes.len() {
+                    let (node1, node2) = (reuse_nodes[i], reuse_nodes[j]);
+                    // `operand_to_owners_[n][0]` — `operator[]` default-constructs an empty vector and
+                    // `[0]` on it is the reference's own out-of-bounds read.
+                    let owner_of = |node: DataId| match self.operand_to_owners.get(&node) {
+                        Some(owners) => match owners.first() {
+                            Some(owner) => *owner,
+                            None => todo!(
+                                "operand_to_owners_[{node:?}][0] on an empty owner list \
+                                 (PortAssignment.cpp:749)"
+                            ),
+                        },
+                        None => todo!(
+                            "operand_to_owners_[{node:?}][0] on an operand with no recorded owner \
+                             (PortAssignment.cpp:749)"
+                        ),
+                    };
+                    let (owner1, owner2) = (owner_of(node1), owner_of(node2));
+                    if owner1 == owner2 {
+                        continue;
+                    }
+                    let range_of = |node: DataId| match self.operand_to_liverange.get(&node) {
+                        Some(range) => *range,
+                        None => todo!(
+                            "operand_to_liverange_[{node:?}] on an operand with no live range \
+                             (PortAssignment.cpp:751)"
+                        ),
+                    };
+                    if range_of(node1).first_interval_start()
+                        > range_of(node2).first_interval_start()
+                    {
+                        continue;
+                    }
+                    let Some(Op::Sentient(sentient::Op::VectorMac {
+                        op_a,
+                        op_b,
+                        op_c,
+                        ..
+                    })) = op_at_mut(body, owner2.0, &mut 0)
+                    else {
+                        panic!(
+                            "DT_CHECK(mac_op) (`PortAssignment.cpp:757`): the second reuse node's \
+                             owner is not a vector_mac"
+                        )
+                    };
+                    let node1_port = Some(self.port_attr(node1).get());
+                    for operand in [op_a, op_b, op_c] {
+                        if operand.port_id == node1_port {
+                            // `DT_CHECK(mac_op.getOpX() != latch)` — two reuse nodes cannot both claim
+                            // the same port of the same MAC (`:761`, `:765`, `:769`).
+                            if operand.port == Port::Latch {
+                                panic!(
+                                    "DT_CHECK(mac_op.getOpX() != SentientComputePort::latch) \
+                                     (`PortAssignment.cpp:761`)"
+                                )
+                            }
+                            operand.port = Port::Latch;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The op one [`OpAt`] names — its position in the unit's pre-order walk, which is how
+/// `operand_to_owners_` holds an `Operation *` without borrowing into the tree being rewritten.
+fn op_at_mut<'a>(scope: &'a mut [Op], target: u32, seen: &mut u32) -> Option<&'a mut Op> {
+    for op in scope.iter_mut() {
+        if *seen == target {
+            return Some(op);
+        }
+        *seen += 1;
+        for region in regions_mut(op) {
+            if let Some(found) = op_at_mut(region, target, seen) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
 
 // crustify:todo: e455_buildGraphNodes
 //   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:636  (6 body lines, level 2)
@@ -582,14 +982,36 @@ mod unit_tests {
 
     /// A colouring graph that only records being cleared — `OutOfScopeColoringGraph::clear` is a
     /// `todo!`, and `clean`'s whole contract is that it asks the graph rather than replacing it.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     struct CountingGraph {
         clears: u32,
+        values: BTreeMap<GraphNodeId, Vec<GraphColor>>,
     }
 
     impl ColoringGraph for CountingGraph {
         fn clear(&mut self) {
             self.clears += 1;
+        }
+
+        fn get_or_add_node(&mut self, node: GraphNodeId) {
+            self.values.entry(node).or_default();
+        }
+
+        // ⛔ REPLACES, like the reference's default `addon = false`.
+        fn add_valid_values(&mut self, node: GraphNodeId, values: &[GraphColor]) {
+            self.values.insert(node, values.to_vec());
+        }
+
+        fn valid_values(&self, node: GraphNodeId) -> Vec<GraphColor> {
+            self.values.get(&node).cloned().unwrap_or_default()
+        }
+    }
+
+    /// An operand reading `port`, carrying the data id the colouring keys on.
+    fn operand_at(port: Port, data_id: i32) -> Operand {
+        Operand {
+            data_id: Some(data_id),
+            ..Operand::from(port)
         }
     }
 
@@ -711,7 +1133,13 @@ mod unit_tests {
             operand_to_liverange: BTreeMap::from([(DataId(1), LiveRange)]),
         };
         pass.clean();
-        assert_eq!(pass.graph, CountingGraph { clears: 1 });
+        assert_eq!(
+            pass.graph,
+            CountingGraph {
+                clears: 1,
+                ..CountingGraph::default()
+            }
+        );
         assert!(pass.dummy_nodes.is_empty());
         assert!(pass.reuse_nodes.is_empty());
         assert!(pass.reuse_nodes_per_op.is_empty());
@@ -917,5 +1345,146 @@ mod unit_tests {
         );
         // A non-mac op is the reference's `-1` too.
         assert_eq!(is_swappable_per_algebraic_reassociation(&scalar_copy()), None);
+    }
+
+    /// e339 — a PE mac's opC is pinned to the accumulate port, and `DataTransferOnly` then OVERRIDES
+    /// that with all three while booking opA as reused and opB/opC as dummies.
+    #[test]
+    fn adding_nodes_pins_opc_then_lets_a_data_transfer_override_it() {
+        let Op::Sentient(sentient::Op::VectorMac {
+            mask,
+            xrf_write_ptr,
+            xrf_read_ptr,
+            results,
+            result,
+            mode,
+            compute_precision,
+            fold_mode,
+            unroll_factor,
+            xrf_read_incr,
+            xrf_write_incr,
+            dbg_name,
+            ..
+        }) = mac(Port::Lx, Precision::Fp16, Precision::Fp16)
+        else {
+            unreachable!("`mac` builds a vector_mac")
+        };
+        let transfer = Op::Sentient(sentient::Op::VectorMac {
+            mask,
+            xrf_write_ptr,
+            xrf_read_ptr,
+            results,
+            op_a: operand_at(Port::Lx, 7),
+            op_b: operand_at(Port::Lx, 8),
+            op_c: operand_at(Port::Lx, 9),
+            result,
+            mode,
+            compute_precision,
+            fold_mode,
+            unroll_factor,
+            xrf_read_incr,
+            xrf_write_incr,
+            data_transfer_only: true,
+            is_data_weight: None,
+            dbg_name,
+        });
+        let mut pass = PortAssignment::<CountingGraph>::default();
+        assert_eq!(
+            pass.add_nodes_to_graph::<Dd2>(&transfer, DfirUnit::Pe),
+            GraphNodes::Added
+        );
+        let free = colors(&[PortId::P0, PortId::P1, PortId::P2]);
+        assert_eq!(pass.graph.valid_values(GraphNodeId(7)), free);
+        assert_eq!(pass.graph.valid_values(GraphNodeId(8)), free);
+        assert_eq!(pass.graph.valid_values(GraphNodeId(9)), free);
+        assert_eq!(pass.reuse_nodes, vec![DataId(7)]);
+        assert_eq!(pass.dummy_nodes, vec![DataId(8), DataId(9)]);
+    }
+
+    /// e340 — the colouring's answer lands in `opXPortID`, every `opXDataID` goes back to `-1`, and a
+    /// `DataTransferOnly` mac's opC takes the LAST valid value that is neither opA's nor opB's.
+    #[test]
+    fn updating_ports_writes_the_colouring_and_clears_every_data_id() {
+        let Op::Sentient(sentient::Op::VectorMac {
+            mask,
+            xrf_write_ptr,
+            xrf_read_ptr,
+            results,
+            result,
+            mode,
+            compute_precision,
+            fold_mode,
+            unroll_factor,
+            xrf_read_incr,
+            xrf_write_incr,
+            dbg_name,
+            ..
+        }) = mac(Port::Lx, Precision::Fp16, Precision::Fp16)
+        else {
+            unreachable!("`mac` builds a vector_mac")
+        };
+        let mut body = vec![Op::Sentient(sentient::Op::VectorMac {
+            mask,
+            xrf_write_ptr,
+            xrf_read_ptr,
+            results,
+            op_a: operand_at(Port::Lx, 7),
+            op_b: operand_at(Port::Lx, 8),
+            op_c: operand_at(Port::Lx, 9),
+            result,
+            mode,
+            compute_precision,
+            fold_mode,
+            unroll_factor,
+            xrf_read_incr,
+            xrf_write_incr,
+            data_transfer_only: true,
+            is_data_weight: None,
+            dbg_name,
+        })];
+        let mut graph = CountingGraph::default();
+        graph.add_valid_values(GraphNodeId(9), &colors(&[PortId::P0, PortId::P1, PortId::P2]));
+        let mut pass = PortAssignment::<CountingGraph> {
+            graph,
+            port_assignment: BTreeMap::from([(DataId(7), PortId::P0), (DataId(8), PortId::P1)]),
+            ..PortAssignment::default()
+        };
+        pass.update_sentient_ir_ports(&mut body);
+        let Op::Sentient(sentient::Op::VectorMac {
+            op_a,
+            op_b,
+            op_c,
+            data_transfer_only,
+            ..
+        }) = &body[0]
+        else {
+            unreachable!("the mac is still a mac")
+        };
+        assert_eq!(
+            (op_a.port_id, op_b.port_id, op_c.port_id),
+            (Some(0), Some(1), Some(2))
+        );
+        assert_eq!((op_a.data_id, op_b.data_id, op_c.data_id), (None, None, None));
+        assert!(!*data_transfer_only);
+    }
+
+    /// e341 — two reuse nodes sharing their FIRST owner short-circuit before the live ranges are
+    /// asked, so the mac keeps the ports it had.
+    #[test]
+    fn reuse_nodes_sharing_an_owner_leave_the_mac_alone() {
+        let mut body = vec![mac(Port::Lx, Precision::Fp16, Precision::Fp16)];
+        let pass = PortAssignment::<CountingGraph> {
+            reuse_nodes_per_op: vec![vec![DataId(7), DataId(8)]],
+            operand_to_owners: BTreeMap::from([
+                (DataId(7), vec![OpAt(0)]),
+                (DataId(8), vec![OpAt(0)]),
+            ]),
+            ..PortAssignment::default()
+        };
+        pass.add_reuse_to_dummy_operands(&mut body);
+        let Op::Sentient(sentient::Op::VectorMac { op_a, .. }) = &body[0] else {
+            unreachable!("the mac is still a mac")
+        };
+        assert_eq!(op_a.port, Port::Lx);
     }
 }
