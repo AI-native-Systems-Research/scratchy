@@ -30,10 +30,10 @@ use super::transfer::{
     ReceiveAndStore, StickCounts, construct_data_transfer,
 };
 use super::utils::{
-    Neighbourhood, error_diagnostic, initialize_uniformized_unit, initialize_unit,
-    set_precision_in_unit_op,
+    DscKind, Neighbourhood, TranslatorVersion, error_diagnostic, initialize_uniformized_unit,
+    initialize_unit, set_precision_in_unit_op, translator_version,
 };
-use crate::arch::Arch;
+use crate::arch::{Arch, Target};
 use crate::generated::{DataType, SyncSignal};
 use crate::islands::dataflow_ir::dialects::{Op, Val, dataflow};
 use crate::islands::dataflow_ir::link::RecvEnd;
@@ -41,7 +41,7 @@ use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::dataflow_ir::{
     Grid, Program, ProgramName, ProgramUnit, ProgramUnits, Units, Values,
 };
-use crate::units::{Core, Corelet, DfirUnit, NumFolds};
+use crate::units::{Core, Corelet, DfirUnit, NumFolds, Row};
 use core::marker::PhantomData;
 use std::collections::VecDeque;
 
@@ -975,7 +975,100 @@ pub fn convert_v4<'c, A: Arch, D: Dsc<'c>>(
     assembled.close(scaffold)
 }
 
-// crustify:todo: e110_runTranslator
+/// `PTROW0`, WHICH BOTH ARCH LISTS OPEN WITH — a build-time guard like [`BOTH_CORELETS`]: an arch with
+/// no PT row cannot spell it, and const evaluation is where such a build stops.
+const ROW_ZERO: Row = match Row::checked(0) {
+    Some(row) => row,
+    None => panic!("both component lists open with PTROW0; this arch has no PT row"),
+};
+
+/// `sen_components_` — THE COMPONENTS BOTH DRIVERS WALK, PT ROWS FIRST (`:537-543`).
+///
+/// ⛔⛔ THE ARCH `if` IS THE PT ROW COUNT AND NOTHING ELSE. The two hard-coded lists share their
+/// whole six-unit tail and differ only in how many `PTROW`s stand ahead of it — four from SEN1P5
+/// (`:538-539`), eight before it (`:541-542`) — which is [`Arch::PT_ROWS`]. So [`Row`]'s own bound is
+/// the answer to the reference's own `// TODO: Is there some global config we can grab this list
+/// from?`, and a hard-coded eight would walk four rows SEN1P5 has not got.
+///
+/// ⛔ AND `L0LUROW0` IS [`DfirUnit::L0lu`], not a ninth row spelling — see [`super::sync::SyncEnd`].
+#[must_use]
+pub fn sen_components() -> Used<DfirUnit> {
+    let rest = (1..Target::PT_ROWS)
+        .filter_map(Row::checked)
+        .map(DfirUnit::PtRow)
+        .chain([
+            DfirUnit::Pe,
+            DfirUnit::Sfp,
+            DfirUnit::L0lu,
+            DfirUnit::L0su,
+            DfirUnit::Lxlu,
+            DfirUnit::Lxsu,
+        ])
+        .collect();
+    Used::of(DfirUnit::PtRow(ROW_ZERO), rest)
+}
+
+/// `uniformization_` — WHICH DRIVER THE TRANSLATOR WAS CONSTRUCTED TO RUN
+/// (`DSC2ToDataflowIR.hpp:37,76`).
+///
+/// ⛔⛔ NOT [`super::transfer::Uniformization`], WHICH IS A DIFFERENT FLAG OF THE SAME NAME.
+/// `uniformization_enabled_` reaches the lowering as a LITERAL — `false` from entry 106 (`:338`) and
+/// `true` from entry 107 (`:426`) — so entry 109's corelet-1 fix pass lowers with it OFF while this
+/// one is ON. One type for both would make that disagreement unspellable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uniformize {
+    /// `this->uniformization_` — entry 109.
+    Enabled,
+    /// `!this->uniformization_` — entry 108.
+    Disabled,
+}
+
+/// WHAT ONE RUN OF THE TRANSLATOR LEFT — its `LogicalResult` and its module read as one answer.
+///
+/// ⛔⛔ THERE IS NO VERSION-2 ARM AND THAT ABSENCE IS THE GUARD. `DT_ERROR("Translator version 2 is
+/// deprecated and removed")` (`:550-551`) THROWS (`util/dt_exception.hpp:121`), so the reference
+/// ABORTS there rather than answering; [`TranslatorVersion`] cannot spell a 2, which makes the arm
+/// both unreachable and unwritable.
+pub enum Translated<A: Arch> {
+    /// `translator_version == 3`, `success()` — what the chosen driver left in the module.
+    Ran(Converted<A>),
+    /// The trailing `else` (`:560-561`) on [`TranslatorVersion::V1`] — no driver ran.
+    Dsc1,
+    /// `failed(getTranslatorVersion(..))` (`:546-548`) — [`TranslatorVersion::V1NoComputeOp`].
+    NoComputeOp,
+}
+
+/// Replaces: e110_runTranslator
+///
+/// THE WHOLE CONVERSION — the component list, the version question, and the one driver it picks
+/// (`:534`).
+///
+/// ⛔ THE VERSION IS ASKED OF THE DSC LIST THE DRIVERS THEN WALK. `getTranslatorVersion(*sdsc_, ..)`
+/// reads the same `dscs_` (`DSC2ToDataflowIRUtils.hpp:25`), so taking it as a caller's argument would
+/// let a schedule be lowered under a version measured off a different list.
+///
+/// ⭐ AND THE COMPONENT LIST IS BUILT BEFORE THE VERSION IS ASKED, as it is at `:537`: a refused
+/// version leaves it built and unused, which is what makes it a per-run value rather than state.
+#[must_use]
+pub fn run_translator<'c, A: Arch, D: Dsc<'c>>(
+    vals: &mut Values,
+    uniformize: Uniformize,
+    name: ProgramName,
+    grid: Grid,
+    fold_dims: &[NumFolds],
+    dscs: &[D],
+) -> Translated<A> {
+    let components = sen_components();
+    let kinds: Vec<DscKind> = dscs.iter().map(|dsc| dsc.kind()).collect();
+    match translator_version(&kinds) {
+        TranslatorVersion::V1NoComputeOp => Translated::NoComputeOp,
+        TranslatorVersion::V1 => Translated::Dsc1,
+        TranslatorVersion::V3 => Translated::Ran(match uniformize {
+            Uniformize::Enabled => convert_v4(vals, name, grid, &components, fold_dims, dscs),
+            Uniformize::Disabled => convert_v3(vals, name, grid, &components, fold_dims, dscs),
+        }),
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 106/110 · 107/110 — THE TWO WALKS OVER ONE SCHEDULE, PAIRED
@@ -1712,6 +1805,12 @@ pub trait Dsc<'c>: 'c {
     /// `dsc.numCoreletsUsed_DSC2_` — read by entry 109 only.
     fn num_corelets_used(&self) -> u32;
 
+    /// `computeOp_.empty()` and `isDSC2()` as entry 006 reads them — which translator this DSC needs.
+    ///
+    /// ⛔ ON THE DSC AND NOT A PARALLEL LIST: `getTranslatorVersion` walks the same `dscs_` the
+    /// drivers do, and a caller-supplied slice of kinds could be a different length from it.
+    fn kind(&self) -> DscKind;
+
     /// `areFoldsNeeded(dsc, comp)` — entry 043's answer, asked only where the fold product exceeds one.
     fn folds_needed(&self, comp: DfirUnit) -> bool;
 
@@ -1794,16 +1893,17 @@ mod unit_tests {
     use super::super::stick_mask::StickMaskView;
     use super::super::sync::{SyncKind, SyncUnits};
     use super::super::transfer::Latch;
+    use super::super::utils::DscKind;
     use super::{
         Component, CondStatement, ConstructedProgramUnit, Converted, Dsc, Emitted, FoldDimFunc,
         FoldedAddresses, Made, ParametricIters, Placed, Raised, ScheduleView, Scheduled,
-        ScheduledCond, StartAddrOf, Statement, SwitchInputs, Transfer, UnitHandles, Used, Viewed,
-        Viewing, construct_a_program_unit, construct_a_uniformized_program_unit,
-        construct_operations_recursively, convert_v3, convert_v4, corelets_used,
-        folded_addresses_are_same, folds_are_needed, start_dataflow_ir_generation,
-        stop_dataflow_ir_generation, terminate,
+        ScheduledCond, StartAddrOf, Statement, SwitchInputs, Transfer, Translated, Uniformize,
+        UnitHandles, Used, Viewed, Viewing, construct_a_program_unit,
+        construct_a_uniformized_program_unit, construct_operations_recursively, convert_v3,
+        convert_v4, corelets_used, folded_addresses_are_same, folds_are_needed, run_translator,
+        sen_components, start_dataflow_ir_generation, stop_dataflow_ir_generation, terminate,
     };
-    use crate::arch::{Dd2, Elements};
+    use crate::arch::{Arch, Dd2, Elements, Target};
     use crate::generated::{DataType, OpFunc, OpaqueFunc, SyncSignal};
     use crate::islands::dataflow_ir::dialects::agen::MaskCounts;
     use crate::islands::dataflow_ir::dialects::{Op, Val, affine, dataflow, uniform};
@@ -2539,15 +2639,23 @@ mod unit_tests {
         asked: RefCell<Vec<(DfirUnit, Viewed)>>,
         /// Every `areFoldsNeeded` it was asked for.
         folds_asked: RefCell<Vec<DfirUnit>>,
+        /// What entry 006 sees of it.
+        kind: DscKind,
     }
 
     impl MaskOnLxlu {
         fn on(cores: Vec<Core>, num_corelets_used: u32) -> MaskOnLxlu {
+            MaskOnLxlu::seen_as(DscKind::Dsc2, cores, num_corelets_used)
+        }
+
+        /// The same DSC as entry 006 sees it — the one thing entry 110 asks before it walks anything.
+        fn seen_as(kind: DscKind, cores: Vec<Core>, num_corelets_used: u32) -> MaskOnLxlu {
             MaskOnLxlu {
                 cores,
                 num_corelets_used,
                 asked: RefCell::default(),
                 folds_asked: RefCell::default(),
+                kind,
             }
         }
     }
@@ -2564,6 +2672,10 @@ mod unit_tests {
 
         fn num_corelets_used(&self) -> u32 {
             self.num_corelets_used
+        }
+
+        fn kind(&self) -> DscKind {
+            self.kind
         }
 
         fn folds_needed(&self, comp: DfirUnit) -> bool {
@@ -2746,5 +2858,100 @@ mod unit_tests {
         );
         let units = converted.program.expect("the uniformized unit").units;
         assert_eq!(units.iter().count(), 1);
+    }
+
+    /// 🎯 110/110 — ⛔⛔ THE FLAG PICKS THE DRIVER, AND THE COMPONENT LIST IS THIS ARCH'S ROW COUNT:
+    /// every PT row in index order, then the six units both of the reference's lists share.
+    ///
+    /// Hard-coding RCUDD1A's eight rows would walk four rows SEN1P5 has not got, and reading the flag
+    /// backwards would build one uniformized unit per component where 108 builds one per corelet pair.
+    #[test]
+    fn the_flag_picks_the_driver_and_the_components_are_this_archs_rows() {
+        let walked: Vec<DfirUnit> = sen_components().iter().collect();
+        let rows = Target::PT_ROWS as usize;
+        assert_eq!(walked.len(), rows + 6);
+        for (index, unit) in walked[..rows].iter().enumerate() {
+            let row = Row::checked(index as u32).expect("a row of this arch");
+            assert_eq!(*unit, DfirUnit::PtRow(row));
+        }
+        assert_eq!(
+            walked[rows..],
+            [
+                DfirUnit::Pe,
+                DfirUnit::Sfp,
+                // ⛔ `L0LUROW0`, WHOSE ROWS 1-7 ARE NEVER BOUND — one entry, not eight.
+                DfirUnit::L0lu,
+                DfirUnit::L0su,
+                DfirUnit::Lxlu,
+                DfirUnit::Lxsu,
+            ]
+        );
+
+        let core = Core::checked(0).expect("core 0");
+        let mut vals = Values::default();
+
+        // ⛔ DISABLED IS ENTRY 108: one view per (core, corelet) pair, so twice the component list.
+        let off = MaskOnLxlu::on(vec![core], super::NUM_CORELETS);
+        let ran: Translated<Dd2> = run_translator(
+            &mut vals,
+            Uniformize::Disabled,
+            program_name(),
+            Grid::single(),
+            &[NumFolds::ONE],
+            core::slice::from_ref(&off),
+        );
+        assert!(matches!(ran, Translated::Ran(_)));
+        let asked = off.asked.borrow();
+        assert_eq!(asked.len(), (rows + 6) * super::NUM_CORELETS as usize);
+        assert!(asked.iter().all(|(_, at)| matches!(at, Viewed::OnPair(..))));
+
+        // ⭐ AND ENABLED IS ENTRY 109: one view per component, over every pair at once.
+        let on = MaskOnLxlu::on(vec![core], super::NUM_CORELETS);
+        let ran: Translated<Dd2> = run_translator(
+            &mut vals,
+            Uniformize::Enabled,
+            program_name(),
+            Grid::single(),
+            &[NumFolds::ONE],
+            core::slice::from_ref(&on),
+        );
+        assert!(matches!(ran, Translated::Ran(_)));
+        let asked = on.asked.borrow();
+        assert_eq!(asked.len(), rows + 6);
+        assert!(asked.iter().all(|(_, at)| *at == Viewed::OverEveryPair));
+    }
+
+    /// 🎯 110/110 — ⛔ NEITHER V1 STATE RUNS A DRIVER, AND THE TWO STAY APART: the compute-less DSC is
+    /// `getTranslatorVersion`'s own `failure()`, the DSC1.0 is the trailing `else`'s.
+    ///
+    /// Collapsing them would report one cause for two, and asking the version after the walk would
+    /// lower a DSC1.0 schedule through the DSC2.0 drivers.
+    #[test]
+    fn a_dsc1_or_compute_less_schedule_runs_no_driver() {
+        let core = Core::checked(0).expect("core 0");
+        for (kind, expected) in [
+            (DscKind::Dsc1, "Dsc1"),
+            (DscKind::NoComputeOp, "NoComputeOp"),
+        ] {
+            let dsc = MaskOnLxlu::seen_as(kind, vec![core], super::NUM_CORELETS);
+            let mut vals = Values::default();
+            let ran: Translated<Dd2> = run_translator(
+                &mut vals,
+                Uniformize::Disabled,
+                program_name(),
+                Grid::single(),
+                &[NumFolds::ONE],
+                core::slice::from_ref(&dsc),
+            );
+            let got = match ran {
+                Translated::Ran(_) => "Ran",
+                Translated::Dsc1 => "Dsc1",
+                Translated::NoComputeOp => "NoComputeOp",
+            };
+            assert_eq!(got, expected);
+            // ⛔ AND NOTHING WAS WALKED AND NOTHING MINTED: the version is asked first.
+            assert!(dsc.asked.borrow().is_empty());
+            assert_eq!(vals.issued(), 0);
+        }
     }
 }
