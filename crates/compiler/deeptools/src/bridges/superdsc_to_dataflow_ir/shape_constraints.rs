@@ -344,8 +344,11 @@ pub struct Constraint<'a, S> {
     pub max: Option<f32>,
     /// `values_` — the permitted `float(size) / refSize` ratios (`:909-912`).
     ///
-    /// ⛔ EXACT FLOAT EQUALITY, as the reference's `std::set<float>::count` is. A `std::set`'s
-    /// ordering is not observable through `count`, so a list is the same question.
+    /// ⛔ EXACT FLOAT EQUALITY, as the reference's `std::set<float>::count` is — and `count` cannot
+    /// tell an order apart, so a list answers it identically.
+    ///
+    /// ⚠️ THE ORDER IS OBSERVABLE ELSEWHERE, THROUGH ONE FUNCTION ONLY: `std::set<float>` iterates
+    /// ascending, so [`Constraint::dump`] sorts and deduplicates this list rather than trusting it.
     pub values: Option<Vec<f32>>,
 }
 

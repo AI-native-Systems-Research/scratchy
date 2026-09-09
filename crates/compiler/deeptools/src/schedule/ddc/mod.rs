@@ -192,10 +192,10 @@ pub trait NodeNames {
 }
 
 /// WHICH SIDE OF THE DATAFLOW THE REFERENCE NODE SITS ON — `CoordPropInfoType::refIsProducer`
-/// (`dsc/dsc2.h:1091`).
+/// (`dsc/dsc2.h:1092`).
 ///
 /// ⛔ AN ENUM, NOT A `bool`, BECAUSE `scaleDown` IS THE FIELD BESIDE IT: the reference initialises
-/// both positionally in one aggregate (`ddc/ddc.h:424-426`) and two `bool`s in a row transpose
+/// both positionally in one aggregate (`ddc/ddc.h:424-427`) and two `bool`s in a row transpose
 /// silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RefRole {
@@ -207,7 +207,7 @@ pub enum RefRole {
 }
 
 /// WHETHER THIS STEP CROSSES FROM A VALUE TENSOR TO ITS MX SCALE TENSOR — `scaleDown`
-/// (`dsc/dsc2.h:1093`), the flag that makes `buildFoldForAllocation` compress the reference
+/// (`dsc/dsc2.h:1095`), the flag that makes `buildFoldForAllocation` compress the reference
 /// coordinate through `scaleDownCoord` (`ddc/ddc_fold.cpp:2402`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum ScaleDown {
@@ -239,7 +239,7 @@ pub enum PropState {
 pub struct Propagation {
     /// `refNode`, `nodeToFold` and `dataConnect` as entry 091's match reads them.
     pub ends: CoordPropInfo,
-    /// `refNode`'s SCHEDULE-TREE identity — `refsAdded_`'s inner key (`ddc/ddc.h:534`). An allocate
+    /// `refNode`'s SCHEDULE-TREE identity — `refsAdded_`'s inner key (`ddc/ddc.h:541-544`). An allocate
     /// end also carries an `AllocId` inside [`Propagation::ends`]; that is the allocation's
     /// identity and this is the node's.
     pub ref_node: NodeId,
@@ -251,7 +251,7 @@ pub struct Propagation {
     pub scale_down: ScaleDown,
 }
 
-/// ONE ENTRY OF `itemsToProcess_` (`ddc/ddc.h:531`).
+/// ONE ENTRY OF `itemsToProcess_` (`ddc/ddc.h:537`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedProp {
     /// The step.
@@ -271,16 +271,16 @@ pub struct QueuedProp {
 pub struct QueuePos(pub usize);
 
 /// HOW MANY TIMES ONE `(nodeToFold, refNode, dim)` PROPAGATION HAS BEEN RETRIED — `refsAdded_`'s
-/// innermost value (`ddc/ddc.h:534`), bounded by the reference's own threshold.
+/// innermost value (`ddc/ddc.h:540-544`), bounded by the reference's own threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct RetryCount(u8);
 
 impl RetryCount {
-    /// What a first retry records — the reference stores 0 and not 1 (`ddc/ddc.h:439,455`), so a
+    /// What a first retry records — the reference stores 0 and not 1 (`ddc/ddc.h:418,457`), so a
     /// dim's count is the number of retries BEFORE the one being charged.
     const FIRST: RetryCount = RetryCount(0);
 
-    /// The count the reference aborts on: `retryCount == 15` (`ddc/ddc.h:445`).
+    /// The count the reference aborts on: `retryCount == 15` (`ddc/ddc.h:448`).
     const THRESHOLD: RetryCount = RetryCount(15);
 
     /// The next count, or [`None`] at the threshold.
@@ -315,7 +315,7 @@ impl CoordPropTracker {
     /// Queues one propagation step for every dim of `dims` NOT already recorded against this
     /// `(nodeToFold, refNode)` pair, and records each of those as retried zero times.
     ///
-    /// ⛔ NOTHING IS QUEUED WHEN EVERY DIM WAS ALREADY SEEN (`ddc/ddc.h:415-418`): the ledger, not
+    /// ⛔ NOTHING IS QUEUED WHEN EVERY DIM WAS ALREADY SEEN (`ddc/ddc.h:420-423`): the ledger, not
     /// the queue, is what stops one propagation from being walked twice.
     /// ⛔ THE QUEUED ENTRY CARRIES THE UNSEEN SUBSET, not the list it was asked for.
     /// ⭐ A DIM REPEATED IN `dims` IS TAKEN ONCE — the ledger is written inside the loop, so the
@@ -356,12 +356,12 @@ impl CoordPropTracker {
     /// Re-queues a step for `dims` and charges each of those dims one retry.
     ///
     /// ⛔⛔ THE RE-QUEUED STEP LOSES `scaleDown`. The reference's aggregate initialiser stops at
-    /// `dimsToPropagate` (`ddc/ddc.h:437-441`), so the seventh member falls back to its `= false`
+    /// `dimsToPropagate` (`ddc/ddc.h:438-441`), so the seventh member falls back to its `= false`
     /// default and a value-to-scale-tensor step comes back as an ordinary one. Reproduced, and it is
     /// the one field this function overwrites.
-    /// ⛔ A DIM WITH NO LEDGER ENTRY IS CHARGED ZERO (`:446-455`), so a fresh dim's first retry does
+    /// ⛔ A DIM WITH NO LEDGER ENTRY IS CHARGED ZERO (`:443-455`), so a fresh dim's first retry does
     /// not count against the threshold.
-    /// 🛑 THE 16TH RETRY OF ONE DIM IS THE REFERENCE'S `DT_ERROR` (`:445`) and it ends the run. No
+    /// 🛑 THE 16TH RETRY OF ONE DIM IS THE REFERENCE'S `DT_ERROR` (`:448-453`) and it ends the run. No
     /// type can state "the fold builder kept failing", so this one stays a stop.
     pub fn retry<N: NodeNames + ?Sized>(
         &mut self,
@@ -419,7 +419,7 @@ impl CoordPropTracker {
     }
 }
 
-/// WHICH ROW-BUNDLING CASE A ROW GROUP IS — `Ddc::RowGroupInfo::Category` (`ddc/ddc.h:562`).
+/// WHICH ROW-BUNDLING CASE A ROW GROUP IS — `Ddc::RowGroupInfo::Category` (`ddc/ddc.h:556`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RowBundling {
     /// `ROW_TO_SAME_ROW`.
@@ -430,13 +430,13 @@ pub enum RowBundling {
     RowToNonRow,
     /// `ROW_NORTH_SOUTH`.
     RowNorthSouth,
-    /// `NO_BUNDLING` — the field's own default (`ddc/ddc.h:567`).
+    /// `NO_BUNDLING` — the field's own default (`ddc/ddc.h:562`).
     #[default]
     NoBundling,
 }
 
 impl RowBundling {
-    /// The reference's spelling (`ddc/ddc.h:585-601`).
+    /// The reference's spelling (`ddc/ddc.h:585-597`).
     #[must_use]
     pub const fn spelling(self) -> &'static str {
         match self {
@@ -459,7 +459,7 @@ pub enum RowOrder {
     Descending,
 }
 
-/// ONE MEMBER OF A ROW GROUP — `RowGroupInfo::RowGroupNodeInfo` (`ddc/ddc.h:571`).
+/// ONE MEMBER OF A ROW GROUP — `RowGroupInfo::RowGroupNodeInfo` (`ddc/ddc.h:566`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowGroupNodeInfo {
     /// `node`.
@@ -467,11 +467,11 @@ pub struct RowGroupNodeInfo {
     /// `row` — the PT row `getCompRowId` reported, absent for its `-1`.
     pub row: Option<Row>,
     /// `beta` — WHICH of the node's row betas this grouping uses, since a compute node has several
-    /// (`ddc/ddc.h:573-576`).
+    /// (`ddc/ddc.h:569-572`).
     pub beta: Beta,
 }
 
-/// ONE ROW-SPLIT GROUP — `Ddc::RowGroupInfo` (`ddc/ddc.h:561`).
+/// ONE ROW-SPLIT GROUP — `Ddc::RowGroupInfo` (`ddc/ddc.h:555`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RowGroupInfo {
     /// `cat`.
@@ -494,7 +494,7 @@ impl RowGroupInfo {
     /// Writes the group out: its category, then one `(name, row, beta)` triple per member.
     ///
     /// ⛔ AN UNSET ROW PRINTS `-1` — the reference prints the `int` field whose default is `-1`
-    /// (`ddc/ddc.h:573`), so absence is that number and not a blank.
+    /// (`ddc/ddc.h:568`), so absence is that number and not a blank.
     /// ⭐ `", row= "` HAS A SPACE AFTER THE `=` AND `", beta="` HAS NONE (`:604-605`).
     /// ⚠️ The reference's closing `out.flush()` has no `fmt::Write` counterpart: the sink is the
     /// caller's and so is flushing it.
@@ -517,10 +517,10 @@ impl RowGroupInfo {
 ///
 /// The fold list as one `(alpha, beta, cardinality, label) ` group per level, outermost first.
 ///
-/// ⭐ THE SINK IS THE CALLER'S: the reference writes to `std::cout` (`ddc/ddc.h:611`) and the text is
+/// ⭐ THE SINK IS THE CALLER'S: the reference writes to `std::cout` (`ddc/ddc.h:613`) and the text is
 /// the whole of what this function decides.
 /// ⛔ AN UNLABELLED LEVEL PRINTS AN EMPTY FIELD — `foldDimLabel`'s default is `""`
-/// (`dsc/dsc2.h:1083`), so the `, )` that leaves is the reference's own.
+/// (`dsc/dsc2.h:1084`), so the `, )` that leaves is the reference's own.
 #[must_use]
 pub fn print_fold_params(fold_params: &[FoldParamInfo]) -> String {
     let mut out = String::new();
@@ -629,7 +629,7 @@ mod tests_e073_e077 {
     }
 
     /// e074, the negative: the reference aborts once one dim of one pair has been charged 15 times
-    /// (`ddc/ddc.h:445`), and the message names both ends.
+    /// (`ddc/ddc.h:448`), and the message names both ends.
     #[test]
     #[should_panic(expected = "Retry threshold for propagation reached for refNode -> nodeToFold")]
     fn retrying_one_dim_past_the_threshold_is_the_references_own_stop() {

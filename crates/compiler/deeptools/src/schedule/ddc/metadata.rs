@@ -145,11 +145,11 @@ use sys_arch_spec::arch_enums::OpFunc;
 // ═══ `Constraints` — THE FIELDS `dump` OBSERVES, AND THE THREE UPDATERS ══════════════════════════
 
 /// WHICH LOOP EXTENT A DATASTAGE CONSTRAINT NAMES — `MetaDimKind` (`dsc/dims.h:59`) less its `Count`
-/// terminator, which is the field's UNSET sentinel (`ddc/ddc_metadata.h:35`) and so is absence here.
+/// terminator, which is the field's UNSET sentinel (`ddc/ddc_metadata.h:36`) and so is absence here.
 ///
 /// ⛔ THE LABELS ARE `stringToMetaDimKind`'s (`dsc/dims.cpp:50-57`), which `e184_setMetaDimKind`
 /// parses back. `Count`'s own label there is `"undefined"` — a string [`Constraint::dump`] never
-/// prints, because it prints `NOT_SET` for that case instead (`ddc/ddc_metadata.h:51-54`).
+/// prints, because it prints `NOT_SET` for that case instead (`ddc/ddc_metadata.h:51-56`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MetaDimKind {
     /// `unpadded`.
@@ -199,14 +199,14 @@ impl NoEpilogueDimKind {
     }
 }
 
-/// `mustBeMultiple_` AND `loopDimKind_` ON A RELATIVE CONSTRAINT (`ddc/ddc_metadata.h:34-35`).
+/// `mustBeMultiple_` AND `loopDimKind_` ON A RELATIVE CONSTRAINT (`ddc/ddc_metadata.h:34-36`).
 ///
 /// ⛔⛔ `loopDimKind_` OUTLIVES `mustBeMultiple_`, WHICH IS WHY `Off` STILL CARRIES A KIND:
 /// `ddc/ddc_transformation.cpp:968-1035` sets `Unpadded` on constraints that are not multiples, and
 /// `dump` prints the kind unconditionally — a fold that dropped it could not state that constraint.
 ///
-/// ⛔ THE TWO `DT_ERROR`s STAY UNREPRESENTABLE: `mustBeMultiple_` with no kind (`ddc/ddcv1.cpp:871-874`)
-/// and with a kind outside `{Unpadded, Padded, WindowDim}` (`:893-901`) have no variant here.
+/// ⛔ THE TWO `DT_ERROR`s STAY UNREPRESENTABLE: `mustBeMultiple_` with no kind (`ddc/ddcv1.cpp:857-859`)
+/// and with a kind outside `{Unpadded, Padded, WindowDim}` (`:881-886`) have no variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopMultiple {
     /// `mustBeMultiple_` false, with whatever `loopDimKind_` holds — [`None`] for `Count`.
@@ -273,8 +273,9 @@ impl<S> Constraint<'_, S> {
     /// THE CONSTRAINT AS `std::cerr` STATES IT — `ddc/ddc_metadata.h:49`, one trailing-newline line,
     /// returned rather than written because the caller owns the stream.
     ///
-    /// ⛔ AN UNSET `loopDimKind_` PRINTS `NOT_SET`, not the conversion map's `"undefined"` (`:51-54`),
+    /// ⛔ AN UNSET `loopDimKind_` PRINTS `NOT_SET`, not the conversion map's `"undefined"` (`:51-56`),
     /// and an unset bound prints `-inf` / `inf` — the bound it is ABSENT of, not one it holds.
+    /// ⛔ AND `values_` IS A `std::set<float>` (`:38`): ascending, once each, observable ONLY here.
     #[must_use]
     pub fn dump(&self) -> String {
         let (must_be_multiple, dim_kind, min) = match self.kind {
@@ -308,8 +309,11 @@ impl<S> Constraint<'_, S> {
         }
         out.push_str(", values_= {");
         if let Some(values) = &self.values {
-            for value in values {
-                out.push_str(&format!("{} ", stream_float(*value)));
+            let mut ascending = values.clone();
+            ascending.sort_by(f32::total_cmp);
+            ascending.dedup();
+            for value in ascending {
+                out.push_str(&format!("{} ", stream_float(value)));
             }
         }
         out.push_str("}\n");
@@ -482,8 +486,9 @@ impl Ends {
     /// when it did, so the walk it cuts short is one already taken. It is ALSO what terminates a
     /// `prev_` cycle.
     ///
-    /// ⭐ FIRST-TOUCH ORDER where the reference's `unordered_set` has none, which its only consumer
-    /// (`ddc/ddc_transformation_util.cpp:400-435`, a membership test) cannot tell apart.
+    /// ⭐ FIRST-TOUCH ORDER where the reference's `unordered_set` has none, which BOTH its consumers
+    /// (`ddc/ddc_transformation_util.cpp:411,446` and `ddc/ddc_transformation.cpp:1514`, all
+    /// `.count()` membership tests) cannot tell apart.
     fn loops<T: OwnerLoops + ?Sized>(base_nodes: &[NodeIndex], tree: &T) -> Vec<LoopIndex> {
         let mut loops: Vec<LoopIndex> = Vec::new();
         for base_node in base_nodes {
@@ -516,11 +521,11 @@ impl Ends {
 // their `Constraint`/`Ends`/`MetaDimKind` vocabulary is REUSED below, never restated.
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
-// THE DDC METADATA — the state entry 104 resets (`ddc/ddc_metadata.h:31-243`).
+// THE DDC METADATA — the state entry 104 resets (`ddc/ddc_metadata.h:31-239`).
 //
 // ⭐ THE FIELD LIST *IS* THIS UNIT'S CONTENT. The reference spells the reset
 // `this->~Metadata(); new (this) Metadata();` (:225) because `Metadata` carries TWO `const int`
-// members (`core_dstgid`, `chunk_dstgid`, :210-211) and therefore has no assignment operator at
+// members (`core_dstgid`, `chunk_dstgid`, :211-212) and therefore has no assignment operator at
 // all. Here those two are associated consts rather than state, so the reset is ONE assignment and
 // every field a later batch adds is reset by construction.
 //
@@ -571,7 +576,7 @@ impl Default for StoredConstraint {
 /// ONE DATASTAGE'S EXPLORATION STATE — `Metadata::Datastage` (`ddc/ddc_metadata.h:32`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Datastage {
-    /// `constraints_` (:74-76) — outer key is the REFERENCE datastage, [`None`] for the `-1`
+    /// `constraints_` (:73-76) — outer key is the REFERENCE datastage, [`None`] for the `-1`
     /// absolute constraints; the inner `std::map` key is a [`DimSet`], which has no ordering of its
     /// own here.
     pub constraints: BTreeMap<Option<DatastageId>, Vec<(DimSet, StoredConstraint)>>,
@@ -599,7 +604,7 @@ impl Default for Datastage {
 }
 
 /// WHICH DESTINATION of a multi-destination transfer — an index into `dstLdsAndLoopOffsets_`
-/// (`ddc/ddcv1.cpp:2947-2957`).
+/// (`ddc/ddcv1.cpp:2948-2957`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DestIdx(pub u32);
 
@@ -628,7 +633,7 @@ pub struct DataTransfer {
     /// `replicated_`.
     pub replicated: bool,
     /// `offset_src_`. ⛔ NOTHING IN THE AUTHORITY TREE WRITES THIS FIELD OR `offset_dest_`: both are
-    /// only ever READ, as `> 0` tests (`ddc/ddcv1.cpp:2914,2932,2947`), so on this revision they
+    /// only ever READ, as `> 0` tests (`ddc/ddcv1.cpp:2914,2933,2948`), so on this revision they
     /// hold their defaults throughout and the branches they gate are dead.
     pub offset_src: Elements,
     /// `offset_dest_` — per destination, its offset.
@@ -701,7 +706,7 @@ pub enum TransferEnd {
 /// A `data_connect=` SLOT STILL TO BE FILLED — the reference's `std::string*`
 /// (`ddc/ddc_metadata.h:138`). ⛔ NON-OWNING: entry 104 drops the locator and destroys nothing,
 /// while the DDL writes through it later (`*prefilledIt->second = ...`,
-/// `ddc/ddl/ddl_conversion.cpp:938`).
+/// `ddc/ddl/ddl_conversion.cpp:939`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DataConnectSlot {
     /// The transfer node holding the slot.
@@ -722,7 +727,7 @@ pub enum ExternalStorage {
     L3LuIbr,
 }
 
-/// A MEMORY DDC ALLOCATES IN — `ddc::memories` (`ddc/ddc_metadata.h:19-21`).
+/// A MEMORY DDC ALLOCATES IN — `ddc::memories` (`ddc/ddc_metadata.h:20-21`).
 ///
 /// ⛔ NOT [`crate::generated::Memory`]: that is the `ddl.allocate` census and has neither `HBM` nor
 /// `PTIRF`, so it cannot spell this key.
@@ -746,7 +751,7 @@ pub enum DdcMemory {
     Hbm,
 }
 
-/// ONE OPAQUE COMPUTE'S REGISTERS — `Metadata::OpaqueOp` (`ddc/ddc_metadata.h:193`).
+/// ONE OPAQUE COMPUTE'S REGISTERS — `Metadata::OpaqueOp` (`ddc/ddc_metadata.h:196`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpaqueOp {
     /// `inOutRegAllocs_` — which allocation supplies each in/out register's address
@@ -785,7 +790,7 @@ impl OpaqueOp {
     }
 }
 
-/// `Metadata::DDCTransformationConfigT` (`ddc/ddc_metadata.h:229`).
+/// `Metadata::DDCTransformationConfigT` (`ddc/ddc_metadata.h:230`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransformationConfig {
     /// `enableMovingDataTransfer`, whose default is TRUE — `run_v1` hoists transfers for reuse
@@ -821,46 +826,46 @@ pub struct Metadata {
     pub external_nodes: BTreeSet<NodeId>,
     /// `TransferNodesInterSliceTranspose_` (:141).
     pub transfer_nodes_inter_slice_transpose: BTreeSet<NodeId>,
-    /// `dataConnects_` (:191) — keyed by the connect's NAME, holding the [`Ends`] entries 100-103
+    /// `dataConnects_` (:194) — keyed by the connect's NAME, holding the [`Ends`] entries 100-103
     /// maintain.
     pub data_connects: BTreeMap<DataConnect, Ends>,
-    /// `opaqueOps_` (:203), keyed by the compute node.
+    /// `opaqueOps_` (:204), keyed by the compute node.
     pub opaque_ops: BTreeMap<NodeId, OpaqueOp>,
-    /// `implicitSyncs_` (:205) — the allocation each implicit sync stands for.
+    /// `implicitSyncs_` (:206) — the allocation each implicit sync stands for.
     pub implicit_syncs: BTreeMap<NodeId, AllocId>,
-    /// `dimToCoreChunkLoops_` (:207).
+    /// `dimToCoreChunkLoops_` (:208-209).
     pub dim_to_core_chunk_loops: BTreeMap<PrimaryDim, Vec<NodeId>>,
-    /// `rowSplitDim` (:212) — `PrimaryDimTypesCount` is UNSET, which is not dimension zero.
+    /// `rowSplitDim` (:213) — `PrimaryDimTypesCount` is UNSET, which is not dimension zero.
     pub row_split_dim: Option<PrimaryDim>,
-    /// `clSplitDims_` (:213).
+    /// `clSplitDims_` (:214).
     pub cl_split_dims: BTreeSet<PrimaryDim>,
-    /// `peSfpSplitDims_` (:214).
+    /// `peSfpSplitDims_` (:215).
     pub pe_sfp_split_dims: BTreeSet<PrimaryDim>,
-    /// `nodeCloningMap_` (:215).
+    /// `nodeCloningMap_` (:216-217).
     pub node_cloning_map: BTreeMap<NodeId, Vec<NodeId>>,
-    /// `discardAboveLxSchedule_` (:217).
+    /// `discardAboveLxSchedule_` (:218).
     pub discard_above_lx_schedule: bool,
-    /// `belowLxScheduleInsertBlock` (:218) — the block named `lx_below_schedule` where the tree has
-    /// one (`ddc/ddcv1.cpp:2341-2345`).
+    /// `belowLxScheduleInsertBlock` (:219) — the block named `lx_below_schedule` where the tree has
+    /// one (`ddc/ddcv1.cpp:2342-2345`).
     pub below_lx_schedule_insert_block: Option<BlockId>,
-    /// `opFuncBackup_` (:221) — `OpFuncs::NONE` is none.
+    /// `opFuncBackup_` (:222) — `OpFuncs::NONE` is none.
     ///
     /// ⛔ THE FULL `OpFuncs`, NOT [`crate::generated::OpFunc`]: the only value the reference ever
     /// stores here is `EXX2` (`ddc/ddcv1.cpp:2064-2078`), which the DDL census does not carry, so the
     /// censused enum cannot express what entry 132 puts back.
     pub op_func_backup: Option<OpFunc>,
-    /// `transformationConfig_` (:229).
+    /// `transformationConfig_` (:232).
     pub transformation_config: TransformationConfig,
-    /// `ldsIdxAfterDdc` (:234) — each labeled DS index before DDC to its index after.
+    /// `ldsIdxAfterDdc` (:235) — each labeled DS index before DDC to its index after.
     pub lds_idx_after_ddc: BTreeMap<LdsIdx, LdsIdx>,
-    /// `intermLdsIdxToExtLds` (:237).
+    /// `intermLdsIdxToExtLds` (:238).
     pub interm_lds_idx_to_ext_lds: BTreeMap<LdsIdx, LdsIdx>,
 }
 
 impl Metadata {
-    /// `core_dstgid` (`ddc/ddc_metadata.h:210`) — a `const int` in the reference, so not state.
+    /// `core_dstgid` (`ddc/ddc_metadata.h:211`) — a `const int` in the reference, so not state.
     pub const CORE_DSTGID: DatastageId = DatastageId(0);
-    /// `chunk_dstgid` (:211).
+    /// `chunk_dstgid` (:212).
     pub const CHUNK_DSTGID: DatastageId = DatastageId(1);
 
     /// Replaces: e104_clear
@@ -873,8 +878,9 @@ impl Metadata {
     /// `force_num_elements_` and `ldsIdx_` come back UNSET rather than zero.
     /// ⛔ AND IT FREES: `externalTransfers_`'s `unique_ptr`s are destroyed here, while the
     /// non-owning `std::string*` slots beside them are only dropped.
-    /// ⚠️ 25 OTHER UNITS LIST `e104_clear` AS A CALLEE IN `UNITS.tsv`; every one of those is a
-    /// container `.clear()` resolved by name, not this method.
+    /// ⚠️ 31 OTHER UNITS LIST `e104_clear` AS A CALLEE IN `UNITS.tsv`; every one of those is a
+    /// container `.clear()` resolved by name, not this method — `metadata.clear()` occurs ONCE in
+    /// the whole tree.
     pub fn clear(&mut self) {
         *self = Self::default();
     }
@@ -1018,12 +1024,12 @@ mod unit_tests {
         let mut constraint = absolute(AbsoluteMin::Multiple(1.0 / 3.0));
         constraint.max = Some(1e7);
         constraint.values = Some(vec![0.5, 64.0, 1e-5]);
-        // ⛔ `0.333333`, NOT Rust's round-tripping `0.33333334`; and `%g` leaves `[1e-4, 1e6)` at both
-        // ends of the value list.
+        // ⛔ `0.333333`, NOT Rust's round-tripping `0.33333334`; `%g` leaves `[1e-4, 1e6)` at both
+        // ends of the value list; and the values come out ASCENDING, not in the order given.
         assert_eq!(
             constraint.dump(),
             "mustBeMultiple_= T loopDimKind_= NOT_SET , min_= 0.333333 , max_= 1e+07 , \
-             values_= {0.5 64 1e-05 }\n"
+             values_= {1e-05 0.5 64 }\n"
         );
         // A kind on a constraint that is NOT a multiple is exactly what `ddc_transformation.cpp:968`
         // sets, and both bounds absent print as the infinities they are.
