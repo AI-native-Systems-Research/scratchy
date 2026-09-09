@@ -147,6 +147,23 @@
 //! | `e379_run_v1` | 379 | 7 | 109 | `Ddc` | `ddc/ddcv1.cpp:3692` |
 //! | `e381_run` | 381 | 8 | 15 | `Ddc` | `ddc/ddcv1.cpp:3802` |
 
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐ USES FOR ENTRIES 132-136. Union these into this file's top block when its other entries land.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
+
+use crate::arch::{Arch, IsaGen};
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+use crate::generated::ComputeType;
+use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::schedule::ddc::fold::NodeId;
+use crate::schedule::ddc::metadata::{DatastageId, Metadata};
+use crate::schedule::ddc::transformation::LoopId;
+use crate::schedule::dsc2::{ComputeNode, LdsIdx, TransferNode, generic_comp};
+use crate::units::{Core, Corelet};
 
 // crustify:todo: e124_getLdsOrConstNameOfAllocNode
 //   authority : ddc/ddcv1.cpp:20  (10 body lines, level 0)
@@ -195,35 +212,464 @@
 //   original  : void setPeFoldsIfPtInteraction(DesignSpaceConfig* currDsc, const DesignSpaceConfigGlobal& dscGlobal)
 //   extract   : crustify-ddc/cpp/ddc.cpp:2364-2387
 
-// crustify:todo: e132_restoreDsc
-//   authority : ddc/ddcv1.cpp:2272  (5 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::restoreDsc()
-//   extract   : crustify-ddc/cpp/ddc.cpp:2397-2402
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE `run_v1` FIX-UP VOCABULARY — as entries 132-136 read it.
+//
+// ⭐ THE TRAITS ARE THE MECHANISM FOR REACHING OPERANDS, the one part the campaign statement names
+// as droppable: `traverseTreeDFSMutable`, `getOwnerLoop`, `getRelevantCoreCl`, `moveNode`,
+// `deleteChildNode` and `getStickDims` are all `dsc/dsc2.cpp` and `dsc/designSpaceConfig.h` —
+// outside this campaign's file list. What these five units OWN is the decision and the mutation.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 
-// crustify:todo: e133_adjustLoopOffsetsAndAddresses
-//   authority : ddc/ddcv1.cpp:3201  (81 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::adjustLoopOffsetsAndAddresses()
-//   extract   : crustify-ddc/cpp/ddc.cpp:2412-2493
+/// ONE `loopEleOffsets_` ENTRY — how many elements of that dim to step per trip of that loop, an
+/// `int` in `DataInfo::loopEleOffsets_` (`dsc/dsc2.h:729`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopEleOffset(pub i32);
 
-// crustify:todo: e134_simplifyScheduleTree
-//   authority : ddc/ddcv1.cpp:3457  (27 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::simplifyScheduleTree()
-//   extract   : crustify-ddc/cpp/ddc.cpp:2503-2530
+/// WHICH INPUT OF A COMPUTE — an index into `inputs_`/`inputsLdsAndLoopOffsets_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InputIdx(pub usize);
 
-// crustify:todo: e135_updateLdsIdxMetadata
-//   authority : ddc/ddcv1.cpp:3667  (5 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::updateLdsIdxMetadata(DesignSpaceConfig& dsc)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2540-2545
+/// `computeOp_` (`dsc/designSpaceConfig.h:89`) PROJECTED ONTO `opFuncName`, and NON-EMPTY.
+///
+/// ⛔ THE NON-EMPTINESS IS WHAT MAKES ENTRY 132 TOTAL: `computeOp_.at(0)` throws on an op-less DSC,
+/// and a DSC with no compute op has nothing for DDC to schedule. `OpFuncs::NONE` is [`None`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpFuncs {
+    first: Option<OpFunc>,
+    rest: Vec<Option<OpFunc>>,
+}
 
-// crustify:todo: e136_initGlobalData
-//   authority : ddc/ddcv1.cpp:3673  (9 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::initGlobalData()
-//   extract   : crustify-ddc/cpp/ddc.cpp:2555-2564
+impl OpFuncs {
+    /// A DSC has at least one compute op, and this is how that is stated.
+    #[must_use]
+    pub const fn new(first: Option<OpFunc>, rest: Vec<Option<OpFunc>>) -> Self {
+        Self { first, rest }
+    }
+
+    /// `computeOp_.at(0).opFuncName` — total.
+    #[must_use]
+    pub const fn first(&self) -> Option<OpFunc> {
+        self.first
+    }
+
+    /// Every op's `opFuncName`, in `computeOp_`'s order.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<Option<OpFunc>> {
+        core::iter::once(self.first)
+            .chain(self.rest.iter().copied())
+            .collect()
+    }
+}
+
+/// `DesignSpaceConfig::computeOp_` — the flat op list entries 132 and 133 read `opFuncName` off.
+pub trait ComputeOps {
+    /// `computeOp_`, one `opFuncName` per entry.
+    fn op_funcs(&self) -> OpFuncs;
+    /// `computeOp_.at(0).opFuncName = op_func`.
+    fn set_first_op_func(&mut self, op_func: OpFunc);
+}
+
+/// WHAT ENTRY 133 REACHES THROUGH — the two schedule walks, the loop nesting above a node, the
+/// input's stick dims, and the loop element offsets it writes.
+pub trait LoopOffsets {
+    /// `0 .. numCoreletsUsed_DSC2_` as corelets, so the loop index cannot be an out-of-range `int`.
+    fn corelets(&self) -> Vec<Corelet>;
+    /// `traverseTreeDFSMutable(nullptr, {TRANSFER})`, in the traversal's order.
+    fn transfers(&self) -> Vec<NodeId>;
+    /// `src_`/`srcLdsAndLoopOffsets_` and `dstVias_`/`dstLdsAndLoopOffsets_`, each pair zipped so
+    /// they cannot disagree in length.
+    fn transfer(&self, node: NodeId) -> TransferNode;
+    /// `traverseTreeDFSMutable(nullptr, {COMPUTE})`, in the traversal's order.
+    fn computes(&self) -> Vec<NodeId>;
+    /// `type_`, `exUnit_` and `inputs_` zipped with `inputsLdsAndLoopOffsets_`.
+    fn compute(&self, node: NodeId) -> ComputeNode;
+    /// `getStickDims(lds)` — `primaryDsInfo_.at(labeledDs_.at(lds).dsType_).stickDimOrder_`
+    /// (`dsc/designSpaceConfig.h:241-246`).
+    fn stick_dims(&self, lds: LdsIdx) -> Vec<PrimaryDim>;
+    /// `node->getOwnerLoop()` (`dsc/dsc2.h:465`), absent for its `nullptr`.
+    fn owner_loop(&self, node: NodeId) -> Option<LoopId>;
+    /// `srcLdsAndLoopOffsets_.loopEleOffsets_.at(corelet)` — the loops it keys and the dims each of
+    /// those holds; EMPTY where the reference's `.at()` finds no entry for that corelet.
+    fn src_loop_ele_offsets(
+        &self,
+        node: NodeId,
+        corelet: Corelet,
+    ) -> Vec<(LoopId, Vec<PrimaryDim>)>;
+    /// `srcLdsAndLoopOffsets_.loopEleOffsets_.at(cl).at(dim_loop).at(dim) = offset` — a write over
+    /// three keys [`RestickifySite`] proved present.
+    fn set_src_loop_ele_offset(
+        &mut self,
+        node: NodeId,
+        corelet: Corelet,
+        dim_loop: LoopId,
+        dim: PrimaryDim,
+        offset: LoopEleOffset,
+    );
+    /// `inputsLdsAndLoopOffsets_.at(input).loopEleOffsets_[cl][dim_loop][dim] = offset`.
+    ///
+    /// ⛔ `operator[]`, SO IT INSERTS all three keys, and ⛔ `dim_loop` MAY BE ABSENT: the reference
+    /// keys this map by `getOwnerLoop()` without checking it, and a null `LoopNode*` is a legitimate
+    /// key of an `unordered_map<const LoopNode*, ..>` (`ddc/ddcv1.cpp:3260-3263`).
+    fn set_input_loop_ele_offset(
+        &mut self,
+        node: NodeId,
+        input: InputIdx,
+        corelet: Corelet,
+        dim_loop: Option<LoopId>,
+        dim: PrimaryDim,
+        offset: LoopEleOffset,
+    );
+}
+
+/// A CORE/CORELET SET — `getRelevantCoreCl`'s `std::map<int, std::set<int>>` (`dsc/dsc2.h:471`),
+/// whose EQUALITY is the whole of entry 134's branch test.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoreClSet(pub BTreeMap<Core, BTreeSet<Corelet>>);
+
+/// A RESTICKIFY TRANSFER WHOSE FOUR `DT_CHECK`S ALREADY HELD — the `L0LU`→`PT` transfer, the two
+/// loops around it, and the one stick dim to step.
+///
+/// ⛔ THE REFERENCE DEREFERENCES `innerLoop` UNGUARDED (`ddc/ddcv1.cpp:3236-3237`) and then throws
+/// four ways: the corelet's `loopEleOffsets_` must key EXACTLY those two loops, each must carry the
+/// dim, and `getStickDims` must have returned exactly one. Constructing this proves all of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestickifySite {
+    /// The `dsc2::TransferNode*` whose source offsets get stepped.
+    pub transfer: NodeId,
+    /// `transfer->getOwnerLoop()` — steps 2 elements.
+    pub inner: LoopId,
+    /// `innerLoop->getOwnerLoop()` — steps 1.
+    pub outer: LoopId,
+    /// `inputStickDim.at(0)`, the sole stick dim of the LXLU-sourced input.
+    pub dim: PrimaryDim,
+}
+
+impl RestickifySite {
+    /// The site, or [`None`] wherever the reference would dereference a null loop or throw.
+    #[must_use]
+    pub fn of<T: LoopOffsets + ?Sized>(dsc: &T, transfer: NodeId, dim: PrimaryDim) -> Option<Self> {
+        let node = dsc.transfer(transfer);
+        if is_skipped(node.src.unit) || generic_comp(node.src.unit) != Some(GenericComp::L0lu) {
+            return None;
+        }
+        let to_pt = node
+            .dsts
+            .iter()
+            .any(|dst| !is_skipped(dst.unit) && generic_comp(dst.unit) == Some(GenericComp::Pt));
+        if !to_pt {
+            return None;
+        }
+        let inner = dsc.owner_loop(transfer)?;
+        let outer = dsc.owner_loop(inner.0)?;
+        for corelet in dsc.corelets() {
+            let offsets = dsc.src_loop_ele_offsets(transfer, corelet);
+            if offsets.len() != 2 {
+                return None;
+            }
+            let steps = |dim_loop: LoopId| {
+                offsets
+                    .iter()
+                    .any(|(keyed, dims)| *keyed == dim_loop && dims.contains(&dim))
+            };
+            if !steps(inner) || !steps(outer) {
+                return None;
+            }
+        }
+        Some(Self {
+            transfer,
+            inner,
+            outer,
+            dim,
+        })
+    }
+}
+
+/// AN LXLU `fmul` WHOSE TWO INPUTS ENTRY 133 HAS SEEN, AND WHICH OF THEM CARRIES THE STEP.
+///
+/// ⛔ `DT_CHECK(compute->inputs_.size() == 2)` (`ddc/ddcv1.cpp:3252`) is what this makes a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LxluScaleSite {
+    /// The `dsc2::ComputeNode*` to step.
+    pub compute: NodeId,
+    /// `idx` — input 1 when the pair is exactly (`LXLUSCALEREG`, `LATCH`), input 0 otherwise.
+    pub input: InputIdx,
+}
+
+impl LxluScaleSite {
+    /// The site, or [`None`] where the compute does not read exactly two inputs.
+    #[must_use]
+    pub fn of(compute: NodeId, node: &ComputeNode) -> Option<Self> {
+        let [scale, latch] = node.inputs.as_slice() else {
+            return None;
+        };
+        let latched = scale.unit == SenComponent::Lxluscalereg && latch.unit == SenComponent::Latch;
+        Some(Self {
+            compute,
+            input: InputIdx(usize::from(latched)),
+        })
+    }
+}
+
+/// WHAT ENTRY 134 REACHES THROUGH — the condition walk, each node's core/corelet census, and the
+/// two tree edits it makes.
+pub trait ConditionSimplification {
+    /// `scheduleTree_.getHead()` (`dsc/dsc2.h:637`), which is a `LoopNode`.
+    fn head(&self) -> LoopId;
+    /// `relevantComps_`'s keys (`dsc/dsc2.h:516`) — entry 134 reads only whether there are any.
+    fn relevant_comps(&self, node: LoopId) -> Vec<SenComponent>;
+    /// `traverseTreeDFSMutable(head, {CONDITION})`, in the traversal's order.
+    fn conditions(&self, head: LoopId) -> Vec<NodeId>;
+    /// `node->getRelevantCoreCl()` with its default `comp = ALL`.
+    fn relevant_core_cl(&self, node: NodeId) -> CoreClSet;
+    /// `cn->hasCoreClCond()` — TRUE when `loopCond_.twoLevelOrOfAnds_` is EMPTY (`dsc/dsc2.h:693`).
+    fn has_core_cl_cond(&self, condition: NodeId) -> bool;
+    /// `cn->next_` — the "then" and "else" regions, at most two `BLOCK`s (`dsc/dsc2.h:685-688`).
+    fn branches(&self, condition: NodeId) -> Vec<NodeId>;
+    /// `node->moveNode(currDsc, sibling->getMutableParent(), false, sibling)` — into the sibling's
+    /// own parent, AFTER the sibling.
+    fn move_after(&mut self, node: NodeId, sibling: NodeId);
+    /// `node->prev_->deleteChildNode(currDsc, node)`.
+    fn delete_node(&mut self, node: NodeId);
+}
+
+/// THE SCHEDULE HEAD WITH ITS RELEVANT COMPONENTS ALREADY FILLED — entry 134's
+/// `DT_CHECK(!scheduleTree_.getHead()->relevantComps_.empty())` (`ddc/ddcv1.cpp:3458`) as a value.
+///
+/// ⛔ IT IS ALSO WHERE THE WALK STARTS: `traverseTreeDFSMutable(nullptr, ..)` means "from the head",
+/// so the node whose census the reference asserts is the same node it then traverses — carrying the
+/// head makes the assertion and the traversal one fact rather than two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduleHead {
+    /// `scheduleTree_.getHead()`.
+    pub head: LoopId,
+}
+
+impl ScheduleHead {
+    /// The head, or [`None`] where its `relevantComps_` is still empty.
+    #[must_use]
+    pub fn of<T: ConditionSimplification + ?Sized>(tree: &T) -> Option<Self> {
+        let head = tree.head();
+        (!tree.relevant_comps(head).is_empty()).then_some(Self { head })
+    }
+}
+
+/// WHAT ENTRY 135 READS OFF THE DSC — `labeledDs_`'s own `ldsIdx_` field, entry by entry.
+pub trait LabeledDsIndices {
+    /// `labeledDs_.at(i).ldsIdx_` for every entry, in order.
+    fn labeled_ds_indices(&self) -> Vec<LdsIdx>;
+}
+
+/// THE PER-DATASTAGE SPLIT STRATEGY ENTRY 136 CONSULTS.
+pub trait DataStages {
+    /// `dataStageParam_.at(stage).ss_.coreletSplit_`'s keys (`dsc/dims.h:206`) in `std::map`'s own
+    /// order — EMPTY where the reference's `.at()` finds no such data stage.
+    fn corelet_split_dims(&self, stage: DatastageId) -> BTreeSet<PrimaryDim>;
+}
+
+/// `Ddc`'s OWN PER-DSC STATE (`ddc/ddc.h:105-110`), narrowed to what entry 136 writes.
+///
+/// ⛔ NOT PART OF [`Metadata`]: `coreletSplitDim` is a member of `Ddc` itself, so it survives
+/// `Metadata::clear` and is reset by `initGlobalData` instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GlobalData {
+    /// `coreletSplitDim` (`ddc/ddc.h:109`) — `PrimaryDimTypesCount` is UNSET, not dim zero.
+    pub corelet_split_dim: Option<PrimaryDim>,
+}
+
+/// `is_any_of(unit, skip_units)` with entry 133's `skip_units = {NO_COMPONENT, CONSTANT}`.
+const fn is_skipped(unit: SenComponent) -> bool {
+    matches!(unit, SenComponent::NoComponent | SenComponent::Constant)
+}
+
+/// Replaces: e132_restoreDsc
+///
+/// Puts the backed-up `opFuncName` back on the first compute op, undoing the `EXX2` →
+/// `EXX2_ZEROMEAN` swap `prepDsc` made there (`ddc/ddcv1.cpp:2064-2078`).
+///
+/// ⛔ ENTRY 0 IS BOTH ENDS OF THE PAIR: the backup is a single slot taken from `computeOp_.at(0)`,
+/// so the restore cannot land on the wrong op — and ⛔ it is NOT cleared, so a second call restores
+/// the same name again over whatever the first left.
+pub fn restore_dsc<T: ComputeOps + ?Sized>(metadata: &Metadata, dsc: &mut T) {
+    if let Some(op_func) = metadata.op_func_backup {
+        dsc.set_first_op_func(op_func);
+    }
+}
+
+/// The FIRST LXLU-sourced transfer's stick dim, where it has exactly one — entry 133's
+/// `inputStickDim` and the `DT_CHECK(inputStickDim.size() == 1)` that guards its `.at(0)`.
+///
+/// ⛔ THE REFERENCE `break`s AT THE FIRST LXLU TRANSFER, so a second one with a single stick dim
+/// does not rescue a first one with two: this answers about that first transfer only.
+fn restickify_stick_dim<T: LoopOffsets + ?Sized>(dsc: &T) -> Option<PrimaryDim> {
+    for node in dsc.transfers() {
+        let transfer = dsc.transfer(node);
+        if is_skipped(transfer.src.unit) {
+            continue;
+        }
+        if generic_comp(transfer.src.unit) != Some(GenericComp::Lxlu) {
+            continue;
+        }
+        let lds = transfer.src.data.my_lds_idx?;
+        return match dsc.stick_dims(lds).as_slice() {
+            [dim] => Some(*dim),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// `adjustLoopOffsetsForRestickify` (`ddc/ddcv1.cpp:3207-3249`) — 2 elements of the input's stick
+/// dim per trip of the inner loop, 1 per trip of the outer, on every corelet in use.
+fn adjust_loop_offsets_for_restickify<T: LoopOffsets + ?Sized>(dsc: &mut T) {
+    let Some(dim) = restickify_stick_dim(dsc) else {
+        return;
+    };
+    let sites: Vec<RestickifySite> = dsc
+        .transfers()
+        .into_iter()
+        .filter_map(|node| RestickifySite::of(dsc, node, dim))
+        .collect();
+    for site in sites {
+        for corelet in dsc.corelets() {
+            dsc.set_src_loop_ele_offset(
+                site.transfer,
+                corelet,
+                site.inner,
+                site.dim,
+                LoopEleOffset(2),
+            );
+            dsc.set_src_loop_ele_offset(
+                site.transfer,
+                corelet,
+                site.outer,
+                site.dim,
+                LoopEleOffset(1),
+            );
+        }
+    }
+}
+
+/// `adjustLoopOffsetsForLXLUCompute` (`ddc/ddcv1.cpp:3251-3264`) — one `in` element per trip of the
+/// compute's own loop, on the input that is not the latched scale register.
+fn adjust_loop_offsets_for_lxlu_compute<T: LoopOffsets + ?Sized>(dsc: &mut T, site: LxluScaleSite) {
+    let parent_loop = dsc.owner_loop(site.compute);
+    for corelet in dsc.corelets() {
+        dsc.set_input_loop_ele_offset(
+            site.compute,
+            site.input,
+            corelet,
+            parent_loop,
+            PrimaryDim::In,
+            LoopEleOffset(1),
+        );
+    }
+}
+
+/// Replaces: e133_adjustLoopOffsetsAndAddresses
+///
+/// On SEN1P5 and later only: steps the two loops around every `L0LU`→`PT` transfer by 2 and 1
+/// elements of the restickified input's stick dim once per restickify op in `computeOp_`, then gives
+/// every LXLU `fmul` a one-element `in` step on its own loop.
+///
+/// ⛔ IT ADJUSTS NO ADDRESSES despite the name — the body writes loop element offsets only.
+/// ⛔ THE RESTICKIFY PASS RE-RUNS ONCE PER MATCHING OP (`ddc/ddcv1.cpp:3267-3272`); its writes are
+/// absolute, so the repeats land on the same values.
+pub fn adjust_loop_offsets_and_addresses<A, T>(dsc: &mut T)
+where
+    A: Arch,
+    T: LoopOffsets + ComputeOps + ?Sized,
+{
+    if A::GEN < IsaGen::Sen1p5 {
+        return;
+    }
+    for op_func in dsc.op_funcs().to_vec() {
+        if matches!(
+            op_func,
+            Some(OpFunc::ReStickifyOpLx | OpFunc::ReStickifyOpHbm)
+        ) {
+            adjust_loop_offsets_for_restickify(dsc);
+        }
+    }
+    let latched: Vec<LxluScaleSite> = dsc
+        .computes()
+        .into_iter()
+        .filter_map(|node| {
+            let compute = dsc.compute(node);
+            (compute.op == ComputeType::Fmul && compute.ex_unit == SenComponent::Lxlu)
+                .then(|| LxluScaleSite::of(node, &compute))
+                .flatten()
+        })
+        .collect();
+    for site in latched {
+        adjust_loop_offsets_for_lxlu_compute(dsc, site);
+    }
+}
+
+/// Replaces: e134_simplifyScheduleTree
+///
+/// Drops every core/corelet condition that decides nothing: one relevant to no core/corelet at all
+/// goes away, and one whose "then" or "else" region covers exactly the condition's own core/corelet
+/// set is hoisted into the condition's place. Walked in REVERSE so a deletion cannot invalidate the
+/// rest of the traversal, and external conditions are left to the DSC that owns them.
+///
+/// ⛔ `hasCoreClCond()` IS A QUESTION ABOUT `loopCond_`, NOT `coreClCond_` (`dsc/dsc2.h:693`): a
+/// node with no loop condition answers TRUE even with an empty `coreClCond_`.
+pub fn simplify_schedule_tree<T: ConditionSimplification + ?Sized>(
+    tree: &mut T,
+    metadata: &Metadata,
+    head: ScheduleHead,
+) {
+    let mut conditions = tree.conditions(head.head);
+    conditions.reverse();
+    for condition in conditions {
+        if metadata.external_nodes.contains(&condition) {
+            continue;
+        }
+        let relevant = tree.relevant_core_cl(condition);
+        if relevant.0.is_empty() {
+            tree.delete_node(condition);
+            continue;
+        }
+        if !tree.has_core_cl_cond(condition) {
+            continue;
+        }
+        for child in tree.branches(condition) {
+            if tree.relevant_core_cl(child) == relevant {
+                tree.move_after(child, condition);
+                tree.delete_node(condition);
+                break;
+            }
+        }
+    }
+}
+
+/// Replaces: e135_updateLdsIdxMetadata
+///
+/// Seeds `ldsIdxAfterDdc` with the IDENTITY over the DSC's labelled data structures — the map DDC
+/// then rewrites as it renumbers them.
+///
+/// ⛔ THE KEY IS THE ENTRY'S OWN `ldsIdx_`, NOT ITS POSITION in `labeledDs_`, and ⛔ the seeding
+/// ADDS to whatever is already there rather than replacing it.
+pub fn update_lds_idx_metadata<T: LabeledDsIndices + ?Sized>(metadata: &mut Metadata, dsc: &T) {
+    for lds in dsc.labeled_ds_indices() {
+        metadata.lds_idx_after_ddc.insert(lds, lds);
+    }
+}
+
+/// Replaces: e136_initGlobalData
+///
+/// Resets the corelet split dim to the FIRST dim the core data stage splits across corelets, or to
+/// unset where it splits none.
+///
+/// ⛔ "FIRST" IS `std::map`'s ORDER, i.e. `PrimaryDimTypes`' ordinal order, not the DDL's; and ⛔ the
+/// reset happens either way, so a stale dim from the previous DSC cannot survive.
+pub fn init_global_data<T: DataStages + ?Sized>(global: &mut GlobalData, dsc: &T) {
+    global.corelet_split_dim = dsc
+        .corelet_split_dims(Metadata::CORE_DSTGID)
+        .into_iter()
+        .next();
+}
 
 // crustify:todo: e258_allocAllMem
 //   authority : ddc/ddcv1.cpp:132  (306 body lines, level 1)
@@ -315,3 +761,301 @@
 //   extract   : crustify-ddc/cpp/ddc.cpp:15267-15282
 //   calls     : e379_run_v1
 
+#[cfg(test)]
+mod tests_e132_e136 {
+    use super::*;
+    use crate::arch::{Dd2, Sen1p5};
+    use crate::schedule::dsc2::{DataInfo, Dsts, NodeName, Operand};
+
+    /// The one corelet every build has, which is all these fixtures need.
+    fn corelet0() -> Corelet {
+        Corelet::checked(0).expect("every core has a corelet 0")
+    }
+
+    fn operand(unit: SenComponent, lds: Option<u32>) -> Operand {
+        Operand {
+            unit,
+            data: DataInfo {
+                data_connect: None,
+                my_lds_idx: lds.map(LdsIdx),
+            },
+        }
+    }
+
+    /// `computeOp_` with one entry.
+    struct Ops(Option<OpFunc>);
+
+    impl ComputeOps for Ops {
+        fn op_funcs(&self) -> OpFuncs {
+            OpFuncs::new(self.0, Vec::new())
+        }
+        fn set_first_op_func(&mut self, op_func: OpFunc) {
+            self.0 = Some(op_func);
+        }
+    }
+
+    #[test]
+    fn the_backup_is_restored_onto_the_first_op_and_only_when_one_was_taken() {
+        let mut metadata = Metadata::default();
+        let mut dsc = Ops(Some(OpFunc::Exx2Zeromean));
+        // `OpFuncs::NONE` — `prepDsc` never swapped, so nothing is put back.
+        restore_dsc(&metadata, &mut dsc);
+        assert_eq!(dsc.0, Some(OpFunc::Exx2Zeromean));
+        metadata.op_func_backup = Some(OpFunc::Exx2);
+        restore_dsc(&metadata, &mut dsc);
+        assert_eq!(dsc.0, Some(OpFunc::Exx2));
+    }
+
+    /// The inner loop around the restickify transfer, and the outer loop around that.
+    const INNER: LoopId = LoopId(NodeId(10));
+    const OUTER: LoopId = LoopId(NodeId(11));
+    /// The `fmul`'s own loop.
+    const FMUL_LOOP: LoopId = LoopId(NodeId(12));
+
+    /// One offset write, as entry 133 made it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Write {
+        Src(NodeId, LoopId, PrimaryDim, LoopEleOffset),
+        Input(NodeId, InputIdx, Option<LoopId>, PrimaryDim, LoopEleOffset),
+    }
+
+    /// An LXLU-sourced transfer stating one stick dim, an `L0LU`→`PT` transfer under two loops, and
+    /// an LXLU `fmul` reading (`LXLUSCALEREG`, `LATCH`).
+    #[derive(Default)]
+    struct Offsets(Vec<Write>);
+
+    impl ComputeOps for Offsets {
+        fn op_funcs(&self) -> OpFuncs {
+            OpFuncs::new(Some(OpFunc::ReStickifyOpLx), Vec::new())
+        }
+        fn set_first_op_func(&mut self, _op_func: OpFunc) {}
+    }
+
+    impl LoopOffsets for Offsets {
+        fn corelets(&self) -> Vec<Corelet> {
+            vec![corelet0()]
+        }
+        fn transfers(&self) -> Vec<NodeId> {
+            vec![NodeId(0), NodeId(1)]
+        }
+        fn transfer(&self, node: NodeId) -> TransferNode {
+            let (src, dst) = if node == NodeId(0) {
+                (SenComponent::Lxlu, SenComponent::Lx)
+            } else {
+                (SenComponent::L0lu, SenComponent::Ptrow3)
+            };
+            TransferNode {
+                name: NodeName("t".to_owned()),
+                src: operand(src, Some(0)),
+                dsts: Dsts::new(operand(dst, Some(0)), Vec::new()),
+            }
+        }
+        fn computes(&self) -> Vec<NodeId> {
+            vec![NodeId(2)]
+        }
+        fn compute(&self, _node: NodeId) -> ComputeNode {
+            ComputeNode {
+                name: NodeName("mul".to_owned()),
+                op: ComputeType::Fmul,
+                ex_unit: SenComponent::Lxlu,
+                inputs: vec![
+                    operand(SenComponent::Lxluscalereg, None),
+                    operand(SenComponent::Latch, None),
+                ],
+                outputs: Vec::new(),
+            }
+        }
+        fn stick_dims(&self, _lds: LdsIdx) -> Vec<PrimaryDim> {
+            vec![PrimaryDim::Out]
+        }
+        fn owner_loop(&self, node: NodeId) -> Option<LoopId> {
+            match node {
+                NodeId(1) => Some(INNER),
+                NodeId(10) => Some(OUTER),
+                NodeId(2) => Some(FMUL_LOOP),
+                _ => None,
+            }
+        }
+        fn src_loop_ele_offsets(
+            &self,
+            node: NodeId,
+            _corelet: Corelet,
+        ) -> Vec<(LoopId, Vec<PrimaryDim>)> {
+            if node == NodeId(1) {
+                vec![
+                    (INNER, vec![PrimaryDim::Out]),
+                    (OUTER, vec![PrimaryDim::Out]),
+                ]
+            } else {
+                Vec::new()
+            }
+        }
+        fn set_src_loop_ele_offset(
+            &mut self,
+            node: NodeId,
+            _corelet: Corelet,
+            dim_loop: LoopId,
+            dim: PrimaryDim,
+            offset: LoopEleOffset,
+        ) {
+            self.0.push(Write::Src(node, dim_loop, dim, offset));
+        }
+        fn set_input_loop_ele_offset(
+            &mut self,
+            node: NodeId,
+            input: InputIdx,
+            _corelet: Corelet,
+            dim_loop: Option<LoopId>,
+            dim: PrimaryDim,
+            offset: LoopEleOffset,
+        ) {
+            self.0
+                .push(Write::Input(node, input, dim_loop, dim, offset));
+        }
+    }
+
+    #[test]
+    fn restickify_steps_two_then_one_and_the_latched_fmul_steps_its_second_input() {
+        // ⛔ RCUDD1A IS BELOW SEN1P5: the whole body is skipped, and that is a compile-time fact.
+        let mut before = Offsets::default();
+        adjust_loop_offsets_and_addresses::<Dd2, _>(&mut before);
+        assert_eq!(before.0, Vec::new());
+
+        let mut dsc = Offsets::default();
+        adjust_loop_offsets_and_addresses::<Sen1p5, _>(&mut dsc);
+        assert_eq!(
+            dsc.0,
+            vec![
+                Write::Src(NodeId(1), INNER, PrimaryDim::Out, LoopEleOffset(2)),
+                Write::Src(NodeId(1), OUTER, PrimaryDim::Out, LoopEleOffset(1)),
+                Write::Input(
+                    NodeId(2),
+                    InputIdx(1),
+                    Some(FMUL_LOOP),
+                    PrimaryDim::In,
+                    LoopEleOffset(1),
+                ),
+            ]
+        );
+    }
+
+    /// What entry 134 did to the tree, in the order it did it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Edit {
+        Moved(NodeId, NodeId),
+        Deleted(NodeId),
+    }
+
+    /// Three conditions: 3 is external, 4 is relevant to nobody, 5 has a "then" region matching its
+    /// own core/corelet set.
+    #[derive(Default)]
+    struct Conditions(Vec<Edit>);
+
+    fn core_cl(corelets: &[u32]) -> CoreClSet {
+        let core = Core::checked(0).expect("core 0");
+        CoreClSet(BTreeMap::from([(
+            core,
+            corelets
+                .iter()
+                .filter_map(|cl| Corelet::checked(*cl))
+                .collect(),
+        )]))
+    }
+
+    impl ConditionSimplification for Conditions {
+        fn head(&self) -> LoopId {
+            LoopId(NodeId(0))
+        }
+        fn relevant_comps(&self, _node: LoopId) -> Vec<SenComponent> {
+            vec![SenComponent::Pe]
+        }
+        fn conditions(&self, _head: LoopId) -> Vec<NodeId> {
+            vec![NodeId(3), NodeId(4), NodeId(5)]
+        }
+        fn relevant_core_cl(&self, node: NodeId) -> CoreClSet {
+            match node {
+                NodeId(4) => CoreClSet::default(),
+                _ => core_cl(&[0]),
+            }
+        }
+        fn has_core_cl_cond(&self, _condition: NodeId) -> bool {
+            true
+        }
+        fn branches(&self, condition: NodeId) -> Vec<NodeId> {
+            if condition == NodeId(5) {
+                vec![NodeId(6)]
+            } else {
+                Vec::new()
+            }
+        }
+        fn move_after(&mut self, node: NodeId, sibling: NodeId) {
+            self.0.push(Edit::Moved(node, sibling));
+        }
+        fn delete_node(&mut self, node: NodeId) {
+            self.0.push(Edit::Deleted(node));
+        }
+    }
+
+    #[test]
+    fn a_matching_branch_is_hoisted_an_empty_condition_is_dropped_and_an_external_one_is_left() {
+        let mut metadata = Metadata::default();
+        metadata.external_nodes.insert(NodeId(3));
+        let mut tree = Conditions::default();
+        let head = ScheduleHead::of(&tree).expect("the head's relevantComps_ was filled");
+        simplify_schedule_tree(&mut tree, &metadata, head);
+        // Reverse order: 5 hoists its branch, 4 goes away, 3 is external and untouched.
+        assert_eq!(
+            tree.0,
+            vec![
+                Edit::Moved(NodeId(6), NodeId(5)),
+                Edit::Deleted(NodeId(5)),
+                Edit::Deleted(NodeId(4)),
+            ]
+        );
+    }
+
+    /// `labeledDs_` whose own `ldsIdx_` fields are NOT its positions.
+    struct Labeled(Vec<LdsIdx>);
+
+    impl LabeledDsIndices for Labeled {
+        fn labeled_ds_indices(&self) -> Vec<LdsIdx> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn the_seeded_map_is_the_identity_over_each_entrys_own_lds_index() {
+        let mut metadata = Metadata::default();
+        update_lds_idx_metadata(&mut metadata, &Labeled(vec![LdsIdx(4), LdsIdx(2)]));
+        assert_eq!(
+            metadata.lds_idx_after_ddc,
+            BTreeMap::from([(LdsIdx(4), LdsIdx(4)), (LdsIdx(2), LdsIdx(2))])
+        );
+    }
+
+    /// One data stage's `coreletSplit_`, keyed by its id.
+    struct Stages(BTreeMap<DatastageId, BTreeSet<PrimaryDim>>);
+
+    impl DataStages for Stages {
+        fn corelet_split_dims(&self, stage: DatastageId) -> BTreeSet<PrimaryDim> {
+            self.0.get(&stage).cloned().unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn the_corelet_split_dim_is_the_lowest_dim_the_core_stage_splits() {
+        let mut global = GlobalData {
+            corelet_split_dim: Some(PrimaryDim::X1),
+        };
+        // `Y` is declared after `Out` in `PrimaryDimTypes`, so `begin()` lands on `Out`.
+        let split = BTreeSet::from([PrimaryDim::Y, PrimaryDim::Out]);
+        init_global_data(
+            &mut global,
+            &Stages(BTreeMap::from([(Metadata::CORE_DSTGID, split)])),
+        );
+        assert_eq!(global.corelet_split_dim, Some(PrimaryDim::Out));
+        // No such data stage: the stale dim is still cleared.
+        init_global_data(&mut global, &Stages(BTreeMap::new()));
+        assert_eq!(global.corelet_split_dim, None);
+    }
+}
