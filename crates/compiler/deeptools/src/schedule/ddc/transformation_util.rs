@@ -1113,6 +1113,7 @@ mod tests_e110_e117 {
     fn operand(connect: Option<DataConnect>) -> Operand {
         Operand {
             unit: SenComponent::Pe,
+            storage: SenComponent::NoComponent,
             data: DataInfo {
                 data_connect: connect,
                 my_lds_idx: None,

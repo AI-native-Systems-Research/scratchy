@@ -752,6 +752,7 @@ mod tests_e105_e109 {
     fn operand(unit: SenComponent, connect: Option<DataConnect>, lds: Option<u32>) -> Operand {
         Operand {
             unit,
+            storage: SenComponent::NoComponent,
             data: DataInfo {
                 data_connect: connect,
                 my_lds_idx: lds.map(LdsIdx),

@@ -1335,6 +1335,7 @@ mod tests_e132_e136 {
     fn operand(unit: SenComponent, lds: Option<u32>) -> Operand {
         Operand {
             unit,
+            storage: SenComponent::NoComponent,
             data: DataInfo {
                 data_connect: None,
                 my_lds_idx: lds.map(LdsIdx),
@@ -1769,6 +1770,7 @@ mod tests_e124_e131 {
     fn operand(unit: SenComponent) -> Operand {
         Operand {
             unit,
+            storage: SenComponent::NoComponent,
             data: DataInfo::default(),
         }
     }
