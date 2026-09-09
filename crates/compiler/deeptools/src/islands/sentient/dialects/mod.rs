@@ -1479,7 +1479,12 @@ pub fn replace_if_with_region(
 /// ⛔ A KEY THAT IS NEITHER STOPS THE WALK. `op->emitError("Key has to be GetUnitOp or
 /// CreateGroupOp."); break;` (`:110-113`) — the reference returns the PARTIAL list it has built and
 /// carries on, which is what the `break` here reproduces.
-fn collect_unit_ops(units: &[Val], defs: Definitions<'_>) -> Vec<Val> {
+///
+/// ⭐ `collectUnitVals` (`Utils.cpp:117-133`) IS A BYTE-IDENTICAL SECOND COPY of `collectUnitOps`
+/// (`:98-115`) under another name, so both spellings land here — `AddressPinningAndToggle`'s
+/// `turnHBMConstantOpAddrsToQueryMapsHelper` calls it by the second (`:1608`, `:1613`).
+#[must_use]
+pub fn collect_unit_ops(units: &[Val], defs: Definitions<'_>) -> Vec<Val> {
     let mut keys = Vec::new();
     for value in units {
         match defs.of(*value) {

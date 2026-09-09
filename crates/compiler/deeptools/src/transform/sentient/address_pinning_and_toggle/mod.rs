@@ -169,9 +169,13 @@ pub(crate) mod simple_constant_descriptor;
 pub(crate) mod toggle_data_transfer_updater;
 pub(crate) mod toggle_descriptor;
 
+use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::Val;
+use crate::islands::sentient::dialects::{
+    self, Definitions, Op, UniformRegions, Val, dataflow, sentient, uniform,
+};
 use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::units::DfirUnit;
 
 pub use conditional_constant_descriptor::ConditionalConstantDescriptor;
 pub use data_transfer_descriptor::DataTransferDescriptor;
@@ -501,6 +505,231 @@ pub fn dump(immut: &[&dyn DumpDescriptor], mutable: &[&dyn DumpDescriptor]) -> S
     out
 }
 
+impl DataTransferDescriptorContainer {
+    /// Replaces: e273_isHeadOfChain
+    ///
+    /// Whether `desc` heads its chain — `kHeadOfChain`, and only for a descriptor that is in a chain
+    /// at all.
+    ///
+    /// ⭐ THE `isPartOfSomeChain` GUARD CANNOT FIRE AND IS KEPT ANYWAY: `computeChainingInfo` sets
+    /// `kHeadOfChain` only alongside `kPartOfChain` (`:2231-2232`, `:2245-2246`), so nothing in the
+    /// reference makes the two bits observably independent — but the reference asks, and a later
+    /// writer could part them.
+    #[must_use]
+    pub fn is_head_of_chain(&self, desc: DescriptorId) -> bool {
+        self.is_part_of_some_chain(desc)
+            && self
+                .chaining_info
+                .get(&desc)
+                .is_some_and(|flags| flags.get(ChainFlag::HeadOfChain))
+    }
+}
+
+impl DataTransferDescriptorContainer {
+    /// Replaces: e274_validate
+    ///
+    /// ⭐ THE `DT_CHECK_MSG` IS GONE, NOT SKIPPED — *"parallel list is out of sync with the main
+    /// list"* (`:930-931`) compares `sorted_list_.size()` against `size()` (the `e252_size` the
+    /// anchor names), and this container has no `sorted_list_` at all
+    /// ([`DataTransferDescriptorContainer`] says why): one `Vec`, one length, nothing to fall out of
+    /// sync with. Same shape as e252_size itself (`utils/units_and_their_values.rs`).
+    pub const fn validate(&self) {}
+}
+
+/// WHICH END OF A `sentient.load_and_store` SITS ON THE HBM — the reference's `if
+/// (getUnitType(src_unit) == HBM) .. else if (getUnitType(dst_unit) == HBM)`, whose `else if` gives
+/// the source the win when both ends are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HbmEnd {
+    /// `getSrcImmutableAddr()`, assigned through `getSrcImmutableAddrMutable()`.
+    Src,
+    /// `getDstImmutableAddr()`, assigned through `getDstImmutableAddrMutable()`.
+    Dst,
+}
+
+/// ONE CONSTANT IMMUTABLE ADDRESS ON AN HBM END, RECORDED BEFORE ANYTHING IS WRITTEN.
+///
+/// ⭐ TWO PHASES BECAUSE THE LOOKUP RUNS OUTWARDS AND THE WRITE RUNS INWARDS: `getDefiningOp()` needs
+/// the enclosing scopes borrowed while the walk sits inside the very region it is about to rewrite.
+/// The op is named by its first result, which is its SSA identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConstantHbmAddr {
+    /// `results.0` of the `sentient.load_and_store`.
+    transfer: Val,
+    /// Which end the HBM is, and so which address is rewritten.
+    end: HbmEnd,
+    /// `const_immut_addr.getValue()`.
+    value: i64,
+}
+
+/// `dcc::getUnitType(val.getDefiningOp()) == HBM` (`dcc/src/Utils/DccExtContext.cpp:191-206`), for the
+/// two arms a transfer end can take.
+///
+/// ⚠️ DIVERGENCE ON A BLOCK ARGUMENT: `DT_CHECK_MSG(op, "expected valid op")` (`:192`) aborts where
+/// this answers `false`. And the reference's fourth arm — an op that is none of the three — answers
+/// with the ENCLOSING `dataflow.program_unit`'s own type, which is never the HBM.
+fn is_hbm(val: Val, defs: Definitions<'_>) -> bool {
+    match defs.of(val) {
+        Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) => *unit == DfirUnit::Hbm,
+        // `getUnitType(QueryMapOp)`: every QUERIED VALUE must be a `get_unit`, and
+        // `DT_CHECK_MSG(type == unit_type, ..)` says they all agree — so "all HBM" is "is HBM", and
+        // the empty mapping its `DT_CHECK_MSG(!units.empty(), ..)` rejects answers `false`.
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => match defs.of(*map) {
+            Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => {
+                !pairs.is_empty()
+                    && pairs.iter().all(|(_, value)| {
+                        matches!(
+                            defs.of(*value),
+                            Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) if *unit == DfirUnit::Hbm
+                        )
+                    })
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `curr_region.walk<WalkOrder::PreOrder>([&](sentient::LoadAndStoreOp) { .. })`, recording what it
+/// would rewrite — the op before its own regions, and `scopes` grown one level per descent so
+/// `getDefiningOp()` still searches outwards.
+fn plan_constant_hbm_addrs(body: &[Op], enclosing: &[&[Op]], out: &mut Vec<ConstantHbmAddr>) {
+    let mut scopes: Vec<&[Op]> = Vec::with_capacity(enclosing.len() + 1);
+    scopes.push(body);
+    scopes.extend_from_slice(enclosing);
+    let defs = Definitions::from_innermost(&scopes);
+    for op in body {
+        if let Op::Sentient(sentient::Op::LoadAndStore {
+            src,
+            dst,
+            src_immutable_addr,
+            dst_immutable_addr,
+            results,
+            ..
+        }) = op
+        {
+            let end = if is_hbm(*src, defs) {
+                Some((HbmEnd::Src, *src_immutable_addr))
+            } else if is_hbm(*dst, defs) {
+                Some((HbmEnd::Dst, *dst_immutable_addr))
+            } else {
+                None
+            };
+            // `dyn_cast<sentient::ConstantOp>(..getDefiningOp())` — anything else is left alone.
+            if let Some((end, addr)) = end
+                && let Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) =
+                    defs.of(addr)
+            {
+                out.push(ConstantHbmAddr {
+                    transfer: results.0,
+                    end,
+                    value: *value,
+                });
+            }
+        }
+        for region in dialects::regions_ref(op) {
+            plan_constant_hbm_addrs(region, &scopes, out);
+        }
+    }
+}
+
+/// `load_and_store.getSrcImmutableAddrMutable().assign(new_immut_addr)` — the one operand the walk
+/// came back to change, found again by the result that named it.
+fn assign_immutable_addr(body: &mut [Op], transfer: Val, end: HbmEnd, addr: Val) {
+    for op in body {
+        if let Op::Sentient(sentient::Op::LoadAndStore {
+            src_immutable_addr,
+            dst_immutable_addr,
+            results,
+            ..
+        }) = op
+            && results.0 == transfer
+        {
+            match end {
+                HbmEnd::Src => *src_immutable_addr = addr,
+                HbmEnd::Dst => *dst_immutable_addr = addr,
+            }
+            return;
+        }
+        for region in dialects::regions_mut(op) {
+            assign_immutable_addr(region, transfer, end, addr);
+        }
+    }
+}
+
+/// Replaces: e275_turnHBMConstantOpAddrsToQueryMapsHelper
+///
+/// Turns every constant HBM-end immutable address inside `region_op`'s regions into a
+/// `uniform.query_map` mapping that region's whole unit list to one copy each of the constant, and
+/// hands the new `sentient.scalar_constant`s back for the caller's `const_builder` to place — e419
+/// puts them at the front of [`crate::islands::sentient::Program::preamble`].
+///
+/// ⚠️ DIVERGENCE ON AN EMPTY UNIT LIST: `createQueryMapFromOperationsWithOneResults` returns
+/// `nullptr` and the reference `assign`s it (`dcc/src/Dialect/Uniform/Utils.cpp:359`), leaving the
+/// transfer with no immutable address at all; here the address is left as it was.
+#[must_use]
+pub fn turn_hbm_constant_op_addrs_to_query_maps_helper(
+    region_op: &mut UniformRegions,
+    enclosing: &[&[Op]],
+    values: &mut Values,
+) -> Vec<Op> {
+    let mut constants: Vec<Op> = Vec::new();
+    for region_idx in 0..region_op.regions().len() {
+        // `getRegionArg(region_idx)` and `collectUnitVals(getRegionUnitList(region_idx))`, which BOTH
+        // arms of the reference's `dyn_cast` chain read identically — and the enum has no third arm,
+        // so the unwritten `else` that would leave `key` NULL is unreachable here.
+        let (key, units, planned) = {
+            let region = &region_op.regions()[region_idx];
+            let mut planned = Vec::new();
+            plan_constant_hbm_addrs(&region.body, enclosing, &mut planned);
+            let units =
+                dialects::collect_unit_ops(&region.units, Definitions::from_innermost(enclosing));
+            (region.arg, units, planned)
+        };
+        if units.is_empty() {
+            continue;
+        }
+        let body = &mut region_op.regions_mut()[region_idx].body;
+        // `OpBuilder query_map_builder(&curr_region)` inserts at the region's start and then advances
+        // past what it built, so successive pairs land in creation order ahead of their readers.
+        let mut at = 0;
+        for planned in planned {
+            // `for (auto unit_op : units) const_list.push_back(const_immut_addr.getValue());` then
+            // one `sentient::ConstantOp` per entry — ⭐ `DT_CHECK(keys.size() == const_vals.size())`
+            // (`Utils.cpp:371`) IS GONE, NOT SKIPPED: the two lists are built from one iteration.
+            let mut pairs = Vec::with_capacity(units.len());
+            for &unit in &units {
+                let result = values.mint();
+                constants.push(Op::Sentient(sentient::Op::ScalarConstant {
+                    value: planned.value,
+                    result,
+                    reg_locale: sentient::RegType::Imm,
+                    ty: ScalarTy::Index,
+                    is_symbol: false,
+                }));
+                pairs.push((unit, result));
+            }
+            let map = values.mint();
+            let queried = values.mint();
+            body.insert(
+                at,
+                Op::Uniform(uniform::Op::DefImmutableMapping { result: map, pairs }),
+            );
+            body.insert(
+                at + 1,
+                Op::Uniform(uniform::Op::QueryMap {
+                    result: queried,
+                    map,
+                    key,
+                }),
+            );
+            at += 2;
+            assign_immutable_addr(body, planned.transfer, planned.end, queried);
+        }
+    }
+    constants
+}
+
 // THE FIVE DESCRIPTORS' OWN `isValid()` — `:263`, `:318`, `:356`, `:468`, `:562`, each one to three
 // lines reading its own fields, and each on `EXCLUSIONS.tsv` as "a struct field in Rust, not a
 // function". ⛔ NONE OF THEM IS `DataTransferDescriptor::isValid()`, which is e278
@@ -793,21 +1022,6 @@ impl DataTransferDescriptor {
     }
 }
 
-// crustify:todo: e273_isHeadOfChain
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:907  (6 body lines, level 1)
-//   original  : bool isHeadOfChain(const DataTransferDescriptor &desc) const
-//   calls     : e007_isPartOfSomeChain
-
-// crustify:todo: e274_validate
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:929  (4 body lines, level 1)
-//   original  : void validate() const
-//   calls     : e252_size
-
-// crustify:todo: e275_turnHBMConstantOpAddrsToQueryMapsHelper
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1595  (59 body lines, level 1)
-//   original  : void AddressPinningAndTogglePass::turnHBMConstantOpAddrsToQueryMapsHelper( OpBuilder &const_builder, Operation &region_op)
-//   calls     : e252_size
-
 // crustify:todo: e399_getMin
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:182  (4 body lines, level 2)
 //   original  : const EvaluatedValue &getMin() override
@@ -1036,8 +1250,65 @@ impl DataTransferDescriptor {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::islands::sentient::dialects::{Val, sentient};
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
+    use crate::islands::sentient::dialects::{LocalRegion, Val, sentient};
     use crate::transform::sentient::{ForRef, IterArgIndex};
+    use crate::units::Residency;
+
+    /// `%u = dataflow.get_unit {type = <unit>}` at func scope.
+    fn get_unit(result: u32, unit: DfirUnit) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result: Val(result),
+            residency: Residency::Global,
+            unit,
+            num_folds: None,
+        })
+    }
+
+    /// `%c = sentient.scalar_constant {value = N : si64} : index`.
+    fn scalar_const(result: u32, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result: Val(result),
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// A `sentient.load_and_store` between two unit handles, with `src_immutable_addr` the only
+    /// address that matters here.
+    fn load_and_store(src: u32, dst: u32, src_immutable_addr: u32, result: u32) -> Op {
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src: Val(src),
+            dst: Val(dst),
+            src_mutable_addr: Val(0),
+            src_immutable_addr: Val(src_immutable_addr),
+            src_inc: Val(0),
+            dst_mutable_addr: Val(0),
+            dst_immutable_addr: Val(0),
+            dst_inc: Val(0),
+            multicast_info: None,
+            results: (Val(result), Val(result + 1)),
+            extent: Extent::of(Elements(8), Bits(16)),
+            stride: 1,
+            rotate_val: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            src_reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dst_reg: Reg {
+                locale: RegType::Lbr,
+                index: None,
+            },
+            dir: None,
+            is_ibr_write: false,
+            dbg_name: None,
+        })
+    }
 
     /// A matched-looking descriptor field set, so an `invalidate()` has something to clear.
     fn loop_and_arg() -> (Option<ForRef>, Option<IterArgIndex>) {
@@ -1526,5 +1797,92 @@ mod unit_tests {
             one_addr.pattern_desc,
             Some(PatternDescriptor::Toggle(_))
         ));
+    }
+
+    #[test]
+    fn head_of_chain_needs_both_bits_and_an_entry() {
+        let mut container = DataTransferDescriptorContainer::default();
+        let desc = DescriptorId(0);
+        // No entry at all — the `chaining_info_.find` miss.
+        assert!(!container.is_head_of_chain(desc));
+        // ⭐ THE GUARD: `kHeadOfChain` alone is not an answer of true.
+        container.set_chaining_info(desc, ChainFlag::HeadOfChain, true);
+        assert!(!container.is_head_of_chain(desc));
+        container.set_chaining_info(desc, ChainFlag::PartOfChain, true);
+        assert!(container.is_head_of_chain(desc));
+    }
+
+    #[test]
+    fn an_hbm_source_constant_addr_becomes_a_query_map_over_the_regions_two_units() {
+        // Func scope: the two HBM units the region runs on, a PE destination and the constant.
+        let scope = vec![
+            get_unit(1, DfirUnit::Hbm),
+            get_unit(2, DfirUnit::Hbm),
+            get_unit(3, DfirUnit::Pe),
+            scalar_const(4, 64),
+        ];
+        let mut region_op = UniformRegions::EqualizePattern {
+            regions: vec![LocalRegion {
+                arg: Val(5),
+                units: vec![Val(1), Val(2)],
+                body: vec![load_and_store(1, 3, 4, 6)],
+            }],
+        };
+        let mut values = Values::default();
+        for _ in 0..7 {
+            let _ = values.mint();
+        }
+        let enclosing: [&[Op]; 1] = [&scope];
+        let constants = turn_hbm_constant_op_addrs_to_query_maps_helper(
+            &mut region_op,
+            &enclosing,
+            &mut values,
+        );
+
+        // One `sentient.scalar_constant` per unit, all carrying the original address.
+        assert_eq!(constants, vec![scalar_const(7, 64), scalar_const(8, 64)]);
+        let body = &region_op.regions()[0].body;
+        assert_eq!(
+            body[0],
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(9),
+                pairs: vec![(Val(1), Val(7)), (Val(2), Val(8))],
+            })
+        );
+        // ⭐ THE `query_map`'S KEY IS THE REGION ARGUMENT, and the pair sits AHEAD of its reader.
+        assert_eq!(
+            body[1],
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(10),
+                map: Val(9),
+                key: Val(5),
+            })
+        );
+        assert_eq!(body[2], load_and_store(1, 3, 10, 6));
+    }
+
+    #[test]
+    fn an_empty_region_unit_list_leaves_the_address_alone() {
+        let scope = vec![get_unit(1, DfirUnit::Hbm), scalar_const(4, 64)];
+        let mut region_op = UniformRegions::EqualizePattern {
+            regions: vec![LocalRegion {
+                arg: Val(5),
+                units: Vec::new(),
+                body: vec![load_and_store(1, 3, 4, 6)],
+            }],
+        };
+        let mut values = Values::default();
+        let enclosing: [&[Op]; 1] = [&scope];
+        let constants = turn_hbm_constant_op_addrs_to_query_maps_helper(
+            &mut region_op,
+            &enclosing,
+            &mut values,
+        );
+        // ⚠️ THE DIVERGENCE THE DOC NAMES: the reference assigns the NULL `createQueryMap..` returns.
+        assert!(constants.is_empty());
+        assert_eq!(
+            region_op.regions()[0].body,
+            vec![load_and_store(1, 3, 4, 6)]
+        );
     }
 }
