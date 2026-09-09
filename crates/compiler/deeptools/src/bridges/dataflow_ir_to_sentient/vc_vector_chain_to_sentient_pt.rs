@@ -1648,6 +1648,7 @@ mod unit_tests {
     /// transfer resolves to a port.
     fn unit_handle(result: Val, unit: DfirUnit) -> DfirOp {
         DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result,
             residency: Residency::Global,
             unit,

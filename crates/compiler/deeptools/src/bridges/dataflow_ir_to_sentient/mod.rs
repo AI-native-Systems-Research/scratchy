@@ -195,6 +195,7 @@ fn program<A: Arch, M: Model, W: Workload>(input: &dfir::Program<A>) -> sentient
     for op in &input.preamble {
         match op {
             DfirOp::Dataflow(dfir_op::dataflow::Op::GetUnit {
+                reg_locale: _,
                 result,
                 residency,
                 unit,
@@ -210,6 +211,7 @@ fn program<A: Arch, M: Model, W: Workload>(input: &dfir::Program<A>) -> sentient
                 let fresh = vals.mint();
                 bound.units.insert(*result, fresh);
                 preamble.push(SenOp::Dataflow(dfir_op::dataflow::Op::GetUnit {
+                    reg_locale: None,
                     result: fresh,
                     residency: *residency,
                     unit: *unit,

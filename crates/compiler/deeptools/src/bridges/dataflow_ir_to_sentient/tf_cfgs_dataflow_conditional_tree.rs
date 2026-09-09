@@ -1099,6 +1099,7 @@ mod unit_tests {
     /// the fact under test.
     fn a_dataflow_op() -> DfirOp {
         DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(9),
             residency: Residency::Global,
             unit: DfirUnit::Pe,

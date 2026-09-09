@@ -656,6 +656,7 @@ mod unit_tests {
     /// `%r = dataflow.get_unit` — one `uniform.def_immutable_mapping` key.
     fn get_unit(result: u32, residency: Residency, unit: DfirUnit) -> Op {
         Op::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(result),
             residency,
             unit,

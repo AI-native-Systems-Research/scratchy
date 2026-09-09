@@ -1131,6 +1131,7 @@ mod unit_tests {
     fn a_query_map_is_symbolic_only_for_the_key_that_selects_the_symbol() {
         let a_unit = |result| {
             Op::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result,
                 residency: Residency::Global,
                 unit: DfirUnit::Sfp,

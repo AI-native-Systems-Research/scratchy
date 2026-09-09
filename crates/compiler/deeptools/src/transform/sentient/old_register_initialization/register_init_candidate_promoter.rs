@@ -380,6 +380,7 @@ mod unit_tests {
     /// `%r = dataflow.get_unit`, at whichever rung the region holding it is.
     fn get_unit(result: u32) -> dataflow::Op {
         dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(result),
             residency: Residency::Global,
             unit: DfirUnit::L3lu,
@@ -390,6 +391,7 @@ mod unit_tests {
     /// `%r = dataflow.create_multicast_group(%1 -> ())`.
     fn multicast_group(result: u32) -> dataflow::Op {
         dataflow::Op::CreateMulticastGroup {
+            reg_locale: None,
             result: Val(result),
             producer: Val(1),
             consumers: Vec::new(),

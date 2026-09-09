@@ -1888,6 +1888,7 @@ mod unit_tests {
     fn lx_to_sfp_bypass_1() -> Vec<DfirOp> {
         let unit = |result: Val, unit: DfirUnit| {
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result,
                 residency: at_corelet_zero(),
                 unit,
@@ -2106,6 +2107,7 @@ mod unit_tests {
             multicast_info: None,
         });
         let pt = DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: PT,
             residency: at_corelet_zero(),
             unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
@@ -2450,6 +2452,7 @@ mod unit_tests {
                 value: 0,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(13),
                 residency: Residency::Global,
                 unit: DfirUnit::LxVirtualIbr,
@@ -3018,6 +3021,7 @@ mod unit_tests {
         };
         vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(11),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
@@ -3031,6 +3035,7 @@ mod unit_tests {
                 ty: ty.clone(),
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(13),
                 residency: Residency::Global,
                 unit: DfirUnit::LxVirtualIbr,
@@ -3178,6 +3183,7 @@ mod unit_tests {
         let (_, from) = Link::<PtRowUnit<0>, LxluUnit>::between(PT, LXLU).ends();
         let received = vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: PT,
                 residency: at_corelet_zero(),
                 unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
@@ -3344,6 +3350,7 @@ mod unit_tests {
     #[test]
     fn the_first_region_builds_the_op_and_the_last_clears_the_flag() {
         let in_loop = DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(92),
             residency: at_corelet_zero(),
             unit: DfirUnit::Lxlu,
@@ -3387,6 +3394,7 @@ mod unit_tests {
                 results: vec![Val(1)],
             }),
             hoisted: vec![DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(0),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lxlu,
@@ -4003,6 +4011,7 @@ mod unit_tests {
             .0;
         let get_unit = |result: Val| {
             SenOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result,
                 residency: at_corelet_zero(),
                 unit: DfirUnit::L0su,
@@ -4050,12 +4059,14 @@ mod unit_tests {
         }
         let body = vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(329),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
                 num_folds: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(328),
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,
@@ -4228,12 +4239,14 @@ mod unit_tests {
         }
         let body = vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(12),
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,
                 num_folds: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(11),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
@@ -4658,6 +4671,7 @@ mod unit_tests {
         };
         vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(60),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
@@ -4684,6 +4698,7 @@ mod unit_tests {
                 multicast_info: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(64),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::LxVirtualIbr,
@@ -4729,6 +4744,7 @@ mod unit_tests {
         };
         vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(71),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::LxVirtualIbr,
@@ -4746,6 +4762,7 @@ mod unit_tests {
                 ty: ibr_ty.clone(),
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(74),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lxlu,
@@ -4854,6 +4871,7 @@ mod unit_tests {
         let (to_pt, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, PT).ends();
         let mut body = extract_load_body()[..4].to_vec();
         body.push(DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: PT,
             residency: at_corelet_zero(),
             unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
@@ -5058,6 +5076,7 @@ mod unit_tests {
         let predicate = mask.binds_predicate().expect("the mask binds one");
         let body = vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(80),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
@@ -5075,6 +5094,7 @@ mod unit_tests {
                 ty: lx_ty.clone(),
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(83),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::LxluScaleReg,
@@ -5143,6 +5163,7 @@ mod unit_tests {
                 ty: LANES,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(93),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
@@ -8566,6 +8587,7 @@ pub fn cleanup_trivially_redundant_set_send_destination<A: Arch>(
     body.insert(
         0,
         SenOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: get_unit,
             residency,
             unit,

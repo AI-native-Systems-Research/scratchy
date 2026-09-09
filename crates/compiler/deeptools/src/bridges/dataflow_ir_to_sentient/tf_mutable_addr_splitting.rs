@@ -5469,6 +5469,7 @@ mod unit_tests {
         let mut vals = Values::default();
         let get_unit = |result: Val, unit: DfirUnit, residency: Residency| {
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result,
                 residency,
                 unit,

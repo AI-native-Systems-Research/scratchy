@@ -1285,6 +1285,7 @@ mod unit_tests {
     /// `%u = dataflow.get_unit {type = <unit>}` at func scope.
     fn get_unit(result: u32, unit: DfirUnit) -> Op {
         Op::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(result),
             residency: Residency::Global,
             unit,

@@ -933,6 +933,7 @@ mod unit_tests {
     /// `%r = dataflow.get_unit`.
     fn get_unit(result: u32) -> Op {
         Op::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(result),
             residency: crate::units::Residency::Global,
             unit: crate::units::DfirUnit::L3lu,
@@ -999,6 +1000,7 @@ mod unit_tests {
     /// `%g = dataflow.create_multicast_group(%p -> ())`, optimisable or not.
     fn multicast(result: u32, optimisable: bool) -> Op {
         Op::Dataflow(dataflow::Op::CreateMulticastGroup {
+            reg_locale: None,
             result: Val(result),
             producer: Val(90),
             consumers: Vec::new(),
@@ -1083,6 +1085,7 @@ mod unit_tests {
     fn a_uniformized_gtr_needs_every_units_group_optimisable() {
         let unit = |result: u32| {
             Op::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(result),
                 residency: crate::units::Residency::Global,
                 unit: crate::units::DfirUnit::L3lu,

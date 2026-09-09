@@ -1301,6 +1301,160 @@ fn set_reg_index_on(op: &mut sentient::Op, val: Val, index: Option<sentient::Reg
     }
 }
 
+/// WRITE THE REGISTER FILE A VALUE LIVES IN — the write twin of [`value_reg_locale`], and what
+/// `e352_updateProgramUnit` sets (`Transform/Sentient/RegisterTypeAssignment.cpp:441-490`).
+///
+/// ⛔⛔ THE REFERENCE WRITES ONE `regLocales` ARRAY PER OP AND THIS WRITES ONE VALUE. Its walk
+/// collects every locale an op's induction variable, iter args and results are assigned and stores
+/// them as one attribute, choosing the singular `regLocale` spelling for a one-entry op with no
+/// regions (`:481-488`) — but each slot of that array belongs to exactly one value, so writing them
+/// one value at a time reaches the same state. This island already holds them per value.
+///
+/// ⛔ NOT [`set_value_reg_index`]'S WALK: that one descends through [`sentient::regions_mut`] and so
+/// only ever enters a `sentient` op's regions. `e352_updateProgramUnit` also assigns a
+/// `dataflow.get_unit`, a `dataflow.create_multicast_group` and a `uniform.uniformize_regions`, and
+/// the last of those is a region-bearing op of ANOTHER dialect — a locale written to a value bound
+/// inside one would be unreachable. This uses the total [`regions_mut`].
+///
+/// ⛔ AN OP WITH NO REGISTER FIELD AT THAT POSITION IS A NO-OP. `sentient.mac` is the reference's own
+/// such case: it is in the `isa<>` list so the array IS written, and `getValueRegLocale` answers its
+/// results `xrfwrptr`/`xrfrdptr` positionally and never reads it back (`:1810-1820`).
+pub fn set_value_reg_locale(scope: &mut [Op], val: Val, locale: sentient::RegType) {
+    for op in scope {
+        set_reg_locale_on(op, val, locale);
+        for region in regions_mut(op) {
+            set_value_reg_locale(region, val, locale);
+        }
+    }
+}
+
+/// [`set_value_reg_locale`] against one op — the value is one of its results, or one of the region
+/// arguments it binds.
+fn set_reg_locale_on(op: &mut Op, val: Val, locale: sentient::RegType) {
+    match op {
+        Op::Sentient(sentient::Op::For {
+            iv,
+            iv_reg,
+            carried,
+            ..
+        }) => {
+            // ⭐ SLOT 0, THEN `[i + 1]` PER ITER ARG AND `[i + n + 1]` PER RESULT (`:444-457`) — the
+            // three fields [`set_reg_index_on`] writes for the same three slots.
+            if *iv == val {
+                iv_reg.locale = locale;
+            }
+            for value in carried.iter_mut() {
+                if value.arg == val {
+                    value.reg.locale = locale;
+                }
+                if value.result == val {
+                    value.result_reg.locale = locale;
+                }
+            }
+        }
+        Op::Sentient(sentient::Op::If { yielded, .. }) => {
+            for value in yielded.iter_mut() {
+                if value.result == val {
+                    value.reg.locale = locale;
+                }
+            }
+        }
+        Op::Sentient(
+            sentient::Op::LoadAndSend { result, reg, .. }
+            | sentient::Op::ReceiveAndStore { result, reg, .. }
+            | sentient::Op::LoadComputeAndSend { result, reg, .. }
+            | sentient::Op::ScalarCopy { result, reg, .. }
+            | sentient::Op::ReceiveAndExtractScalar { result, reg, .. },
+        ) => {
+            if *result == val {
+                reg.locale = locale;
+            }
+        }
+        Op::Sentient(sentient::Op::LoadAndStore {
+            results,
+            src_reg,
+            dst_reg,
+            ..
+        }) => {
+            if results.0 == val {
+                src_reg.locale = locale;
+            }
+            if results.1 == val {
+                dst_reg.locale = locale;
+            }
+        }
+        Op::Sentient(sentient::Op::LoadAndExtractScalar {
+            addr_result,
+            data_result,
+            addr_reg,
+            data_reg,
+            ..
+        }) => {
+            if *addr_result == val {
+                addr_reg.locale = locale;
+            }
+            if *data_result == val {
+                data_reg.locale = locale;
+            }
+        }
+        // ⭐ AN ABSENT `reg` BECOMES ONE, as the reference creates the attribute where none stood.
+        Op::Sentient(
+            sentient::Op::ScalarAdd { result, reg, .. }
+            | sentient::Op::ScalarSub { result, reg, .. },
+        ) => {
+            if *result == val {
+                *reg = Some(sentient::Reg {
+                    locale,
+                    index: reg.and_then(|reg| reg.index),
+                });
+            }
+        }
+        Op::Sentient(sentient::Op::ScalarConstant {
+            result, reg_locale, ..
+        }) => {
+            if *result == val {
+                *reg_locale = locale;
+            }
+        }
+        // ⭐ THE DISCARDABLE `regLocale` ON A `dataflow` OP — the `get_unit` half only when the unit
+        // is an L3LU or L3SU (`:472-475`), which is the CALLER's guard, not this writer's.
+        Op::Dataflow(
+            dataflow::Op::GetUnit {
+                result, reg_locale, ..
+            }
+            | dataflow::Op::CreateMulticastGroup {
+                result, reg_locale, ..
+            },
+        ) => {
+            if *result == val {
+                *reg_locale = Some(locale);
+            }
+        }
+        // ⭐ THE SLOT TRAVELS WITH ITS RESULT ([`UniformResult`]), so there is no array length to
+        // grow and no way for the two to fall out of step.
+        Op::UniformRegions(UniformRegions::UniformizeRegions { results, .. }) => {
+            for result in results.iter_mut() {
+                if result.val == val {
+                    result.reg.locale = locale;
+                }
+            }
+        }
+        // ⛔ NO REGISTER FIELD TO WRITE — see this function's doc for why `sentient.mac` is here.
+        Op::Sentient(_)
+        | Op::Dataflow(_)
+        | Op::UniformRegions(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::AffineFor(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_) => {}
+    }
+}
+
 impl<'a> Definitions<'a> {
     /// THE `sentient.for` THAT BINDS A VALUE AS A REGION ARGUMENT, and at which position — see
     /// [`parent_for_arg`].

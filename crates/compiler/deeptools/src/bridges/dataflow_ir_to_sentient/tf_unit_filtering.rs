@@ -459,6 +459,7 @@ mod unit_tests {
     /// the unit the vendor's edge case binds 32 of (`core_filtering_edge_case.mlir:710-741`).
     fn lxlu_of_core(result: Val, index: u32) -> DfirOp {
         DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result,
             residency: Residency::Corelet {
                 core: core(index),
@@ -520,6 +521,7 @@ mod unit_tests {
         let scope = vec![
             lxlu_of_core(Val(100), 0),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(101),
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,
@@ -544,6 +546,7 @@ mod unit_tests {
     #[test]
     fn an_absent_corelet_survives_a_corelet_filter() {
         let scope = vec![DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(100),
             residency: Residency::Scratchpad { core: core(0) },
             unit: DfirUnit::Lx,
@@ -568,6 +571,7 @@ mod unit_tests {
     #[test]
     fn a_core_wide_unit_is_filtered_as_corelet_zero() {
         let scope = vec![DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(100),
             residency: Residency::CoreWide { core: core(0) },
             unit: DfirUnit::L3lu,
@@ -592,6 +596,7 @@ mod unit_tests {
         let scope = vec![
             lxlu_of_core(Val(100), 0),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(101),
                 residency: Residency::Corelet {
                     core: core(1),
@@ -862,6 +867,7 @@ mod unit_tests {
             vec![
                 // ⭐ REBUILT: the same handle, name, type and residency, plus the attribute.
                 DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    reg_locale: None,
                     result: Val(100),
                     residency: Residency::Corelet {
                         core: core(0),
@@ -1042,6 +1048,7 @@ mod unit_tests {
             lxlu_of_core(Val(100), 0),
             lxlu_of_core(Val(101), 1),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(102),
                 residency: Residency::Corelet {
                     core: core(0),

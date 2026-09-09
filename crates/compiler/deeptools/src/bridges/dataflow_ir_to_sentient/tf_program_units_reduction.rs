@@ -636,6 +636,7 @@ mod unit_tests {
 
     fn get_unit(result: u32, residency: Residency, unit: DfirUnit) -> DfirOp {
         DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(result),
             residency,
             unit,

@@ -467,6 +467,20 @@ pub enum Op {
         /// carries `num_folds = 1 : i32` (`dcc/test/PT/fp8-bmm-1p5.mlir:104`). A mandatory field
         /// would print the attribute on ops the reference prints bare.
         num_folds: Option<crate::units::NumFolds>,
+        /// WHERE THE UNIT HANDLE LIVES — `regLocale` as a DISCARDABLE attribute, and [`None`] until
+        /// something writes one.
+        ///
+        /// ⛔⛔ A `sentient`-DIALECT ATTRIBUTE ON A `dataflow` OP, WHICH IS WHY THE TYPE COMES FROM
+        /// THE RUNG ABOVE. `getValueRegLocale`'s `dataflow.get_unit` arm reads
+        /// `op->getAttr("regLocale")` by name and answers `unknown` when there is none
+        /// (`Dialect/Sentient/SentientOps.cpp:1793-1800`), and `e352_updateProgramUnit` writes it for
+        /// an L3LU or L3SU program unit (`RegisterTypeAssignment.cpp:461-465`) — the "EAR
+        /// optimization" `e350_createCopyOperationAndUpdateAssignment` names (`:274`). With no field
+        /// the whole L3 arm of that walk had nowhere to land.
+        ///
+        /// ⭐ [`None`] PRINTS NOTHING, so every `dataflow.get_unit` this crate emits today is
+        /// unchanged character for character.
+        reg_locale: Option<crate::islands::sentient::dialects::sentient::RegType>,
     },
 
     /// `dataflow.get_local_unit %unit {name} : index` — a register file of a unit already held.
@@ -557,6 +571,18 @@ pub enum Op {
         /// `init_packet_opt_en = true` (`SentientToProgIR/uniform_scalar_sub.mlir:65`) and absent
         /// entirely otherwise (`StandardToSentient/cmpi_select_different_BB.mlir:86`).
         init_packet_opt_en: bool,
+        /// WHERE THE GROUP HANDLE LIVES — `regLocales` entry 0, and [`None`] until something writes
+        /// one.
+        ///
+        /// ⛔ A `sentient`-DIALECT ATTRIBUTE ON A `dataflow` OP, like [`Op::GetUnit::reg_locale`],
+        /// and this one is NOT inert: `getValueRegLocale`'s generic tail reads
+        /// `regLocales[resultIndex]` for every op it names no arm for
+        /// (`Dialect/Sentient/SentientOps.cpp:1846-1858`), and `e352_updateProgramUnit` writes it —
+        /// the op is in that walk's `isa<>` list (`RegisterTypeAssignment.cpp:344`).
+        ///
+        /// ⭐ ONE ENTRY BECAUSE THE OP BINDS ONE RESULT, so an array would be a length to keep in
+        /// step with nothing.
+        reg_locale: Option<crate::islands::sentient::dialects::sentient::RegType>,
     },
 
     /// `dataflow.get_unit_collection {name} : vector<Nxindex>` — ONE HANDLE FOR N UNITS THAT RUN
@@ -759,6 +785,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             residency,
             unit,
             num_folds,
+            reg_locale,
         } => {
             use crate::units::Residency;
 
@@ -794,9 +821,15 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 Some(folds) => format!("num_folds = {} : i32, ", folds.0),
                 None => String::new(),
             };
+            // ⛔ AND `regLocale` SITS BETWEEN `num_folds` AND `type` for the same reason — see
+            // [`Op::GetUnit::reg_locale`], which is [`None`] on every op this crate emits today.
+            let locale = match reg_locale {
+                Some(locale) => format!("regLocale = #sentient<reg_type {}>, ", locale.spelling()),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = dataflow.get_unit {{{attrs}name = \"{name}\", {folds}type = \"{spelling}\"}} : index",
+                "{} = dataflow.get_unit {{{attrs}name = \"{name}\", {folds}{locale}type = \"{spelling}\"}} : index",
                 print::val(*result),
             );
         }
@@ -878,19 +911,25 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             group_id,
             count,
             init_packet_opt_en,
+            reg_locale,
         } => {
             // ⭐ NO SPACE BEFORE THE PAREN and the attribute dictionary is ALPHABETICAL — the
             // assembly format opens with a literal `(` (`Dataflow.td:182`) and MLIR sorts
-            // `attr-dict` by name, which puts `init_packet_opt_en` between the other two.
+            // `attr-dict` by name, which puts `init_packet_opt_en` between the other two and
+            // `regLocale` last of all.
             let opt = if *init_packet_opt_en {
                 ", init_packet_opt_en = true"
             } else {
                 ""
             };
+            let locale = match reg_locale {
+                Some(locale) => format!(", regLocale = #sentient<reg_type {}>", locale.spelling()),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
                 "{} = dataflow.create_multicast_group({} -> ({})) \
-                 {{count = {} : i32, group_id = {} : i32{opt}, num_consumers = {} : i32}} : index",
+                 {{count = {} : i32, group_id = {} : i32{opt}, num_consumers = {} : i32{locale}}} : index",
                 print::val(*result),
                 print::val(*producer),
                 print::vals(consumers),
@@ -1146,6 +1185,7 @@ mod tests {
         let mut next = 0u32;
         let mut unit = |residency, unit| {
             let op = dialects::Op::Dataflow(Op::GetUnit {
+                reg_locale: None,
                 result: Val(next),
                 residency,
                 unit,
@@ -1308,6 +1348,7 @@ mod tests {
     fn reproduces_ibms_multicast_group() {
         let group = |result, producer, count, group_id, num_consumers, opt| {
             dialects::Op::Dataflow(Op::CreateMulticastGroup {
+                reg_locale: None,
                 result: Val(result),
                 producer: Val(producer),
                 consumers: Vec::new(),

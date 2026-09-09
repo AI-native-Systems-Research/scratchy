@@ -485,6 +485,7 @@ mod unit_tests {
     fn skipped_ops() -> Vec<Op> {
         vec![
             Op::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(2),
                 residency: Residency::Global,
                 unit: DfirUnit::L3lu,

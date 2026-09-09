@@ -204,6 +204,7 @@ mod unit_tests {
     fn dump_indents_then_interleaves_the_units_hardware_names() {
         let ops = vec![
             Op::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(7),
                 residency: Residency::Corelet {
                     core: Core::checked(0).expect("core 0 exists"),
@@ -213,6 +214,7 @@ mod unit_tests {
                 num_folds: Some(NumFolds(2)),
             }),
             Op::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(9),
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,

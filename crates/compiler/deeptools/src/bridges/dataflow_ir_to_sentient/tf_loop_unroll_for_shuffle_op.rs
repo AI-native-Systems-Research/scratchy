@@ -2243,6 +2243,7 @@ scf.for %1 = %2 to %3 step %4 {
     /// unrelated to this entry, and the keys are the operands [`is_arith_constant`] never reads.
     fn a_unit_key(result: Val, core_index: u32) -> DfirOp {
         DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result,
             residency: Residency::Corelet {
                 core: Core::checked(core_index).expect("the arch has 32 cores"),

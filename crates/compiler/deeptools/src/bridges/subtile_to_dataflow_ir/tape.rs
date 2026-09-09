@@ -245,6 +245,7 @@ fn node_program<
     // `memory="lx"` on an allocation instead — so they are bound from the residences, not the walk.
     let hbm = vals.mint();
     body.push(Op::Dataflow(dataflow::Op::GetUnit {
+        reg_locale: None,
         result: hbm,
         residency: Residency::Global,
         unit: DfirUnit::Hbm,
@@ -252,6 +253,7 @@ fn node_program<
     }));
     let lx = vals.mint();
     body.push(Op::Dataflow(dataflow::Op::GetUnit {
+        reg_locale: None,
         result: lx,
         residency: Residency::Scratchpad { core },
         unit: DfirUnit::Lx,
@@ -273,6 +275,7 @@ fn node_program<
         let val = vals.mint();
         bound.push((unit, val));
         body.push(Op::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: val,
             residency: crate::units::residency_of(unit, core, corelet),
             unit,
@@ -706,6 +709,7 @@ fn nest<
             // (`/tmp/ktir_ref/export/debug/dfir.mlir:95-98`).
             let mover = vals.mint();
             step_body.push(Op::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: mover,
                 residency: Residency::Corelet {
                     core: Core::checked(0).expect("every arch has a core 0"),

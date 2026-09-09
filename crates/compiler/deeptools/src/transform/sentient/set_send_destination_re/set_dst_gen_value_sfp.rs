@@ -267,6 +267,7 @@ mod unit_tests {
     fn scope() -> Vec<Op> {
         let unit = |result| {
             Op::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result,
                 residency: crate::units::Residency::Global,
                 unit: crate::units::DfirUnit::Sfp,

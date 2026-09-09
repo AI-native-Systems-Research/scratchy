@@ -289,6 +289,7 @@ impl SpecializedCanonicalization {
         program: &mut Program<A, M, W>,
     ) {
         let dataflow::Op::GetUnit {
+            reg_locale: _,
             result,
             residency,
             unit,
@@ -475,6 +476,7 @@ mod unit_tests {
     /// `%r = dataflow.get_unit`.
     fn get_unit(result: u32, residency: Residency, unit: DfirUnit) -> dataflow::Op {
         dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(result),
             residency,
             unit,

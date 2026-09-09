@@ -4888,6 +4888,7 @@ mod unit_tests {
                 dir: None,
             }),
             DfirOp::Dataflow(dfir_op::dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(21),
                 residency: Residency::Global,
                 unit: DfirUnit::Lxsu,
@@ -4967,6 +4968,7 @@ mod unit_tests {
                 ty: v,
             }),
             DfirOp::Dataflow(dfir_op::dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(21),
                 residency: Residency::Global,
                 unit: DfirUnit::Lxsu,
@@ -5039,6 +5041,7 @@ mod unit_tests {
                 dir: None,
             }),
             DfirOp::Dataflow(dfir_op::dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(21),
                 residency: Residency::Global,
                 unit: DfirUnit::Sfp,

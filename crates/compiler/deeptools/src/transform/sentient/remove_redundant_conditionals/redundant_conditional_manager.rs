@@ -79,11 +79,49 @@
 //! | `e466_updateIfOpFeedingDynLoopBound` | 466 | 2 | 77 | `dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:217` |
 //! | `e526_processIfOp` | 526 | 3 | 22 | `dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:98` |
 
+// The other three units of this file are unported, so this file's first leaf has no caller yet and the
+// crate is built with `-D warnings`.
+// ⭐ REMOVE THIS WITH `e526_processIfOp`: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e354_getReturnValsIfSimpleConditional
-//   authority : dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:121  (27 body lines, level 1)
-//   original  : std::optional<std::pair<WidestIntType, WidestIntType>> RedundantConditionalManager::getReturnValsIfSimpleConditional( sentient::IfOp if_op, int idx)
-//   calls     : e252_size
+use crate::islands::sentient::dialects::{Definitions, Op, sentient};
+
+/// Replaces: e354_getReturnValsIfSimpleConditional
+///
+/// The `(then, else)` constants an `sentient.if` hands back at result `idx`, when BOTH its branches
+/// hold nothing but their `sentient.yield` and both yield a `sentient.scalar_constant` there.
+///
+/// ⛔ TRAP: `getOperations().size() != 1` COUNTS THE TERMINATOR (`:125-127`), so "one op" means the
+/// yield ALONE — a branch that computes anything at all is not simple.
+/// ⛔ TRAP: AN `sentient.if` WITH NO `else` REGION ANSWERS `None` HERE, not "then only". An empty
+/// `else_body` has no terminator to read, which is the reference's `front()` on an empty region.
+#[must_use]
+pub fn return_vals_if_simple_conditional(
+    if_op: &Op,
+    idx: usize,
+    defs: Definitions<'_>,
+) -> Option<(i64, i64)> {
+    let Op::Sentient(sentient::Op::If {
+        then_body,
+        else_body,
+        ..
+    }) = if_op
+    else {
+        return None;
+    };
+    let yielded_const = |body: &[Op]| match body {
+        [Op::Sentient(sentient::Op::Yield { results })] => {
+            match defs.of(*results.get(idx)?)? {
+                Op::Sentient(sentient::Op::ScalarConstant { value, .. }) => Some(*value),
+                // `dyn_cast_or_null<ConstantOp>` failing — including the null the reference tolerates
+                // here for a yielded iter arg (`:130`, `:139`).
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    Some((yielded_const(then_body)?, yielded_const(else_body)?))
+}
 
 // crustify:todo: e465_updateIfOpBasedOnParentIfOp
 //   authority : dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:151  (65 body lines, level 2)
@@ -100,3 +138,78 @@
 //   original  : void RedundantConditionalManager::processIfOp()
 //   calls     : e465_updateIfOpBasedOnParentIfOp, e466_updateIfOpFeedingDynLoopBound
 
+#[cfg(test)]
+mod unit_tests {
+    use super::return_vals_if_simple_conditional;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{CmpPredicate, RegType, Yielded};
+    use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+
+    /// `%r = sentient.scalar_constant {value = <value>}`.
+    fn constant(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `sentient.if eq, %0, %1 -> (index)` with the two branch bodies given.
+    fn if_op(then_body: Vec<Op>, else_body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::If {
+            predicate: CmpPredicate::Eq,
+            lhs: Val(0),
+            rhs: Val(1),
+            yielded: vec![Yielded {
+                result: Val(20),
+                reg: sentient::Reg {
+                    locale: RegType::Unknown,
+                    index: None,
+                },
+            }],
+            dbg_name: None,
+            then_body,
+            else_body,
+        })
+    }
+
+    /// `sentient.yield %results`.
+    fn yield_op(results: Vec<Val>) -> Op {
+        Op::Sentient(sentient::Op::Yield { results })
+    }
+
+    /// Both branches yielding nothing but a constant answer the pair; an extra op in a branch, a
+    /// non-constant yielded value and a missing `else` region each answer `None`.
+    #[test]
+    fn a_simple_conditional_is_a_yield_of_a_constant_in_both_branches() {
+        let (c3, c4) = (Val(10), Val(11));
+        let outer = vec![
+            constant(c3, 3),
+            constant(c4, 4),
+            if_op(vec![yield_op(vec![c3])], vec![yield_op(vec![c4])]),
+        ];
+        let scopes: [&[Op]; 1] = [&outer];
+        let defs = Definitions::from_innermost(&scopes);
+        assert_eq!(
+            return_vals_if_simple_conditional(&outer[2], 0, defs),
+            Some((3, 4))
+        );
+        // ⛔ THE TERMINATOR IS COUNTED: a branch that computes anything is not simple.
+        let busy = if_op(
+            vec![constant(Val(12), 5), yield_op(vec![c3])],
+            vec![yield_op(vec![c4])],
+        );
+        assert_eq!(return_vals_if_simple_conditional(&busy, 0, defs), None);
+        // A value no `sentient.scalar_constant` binds, and an index no branch yields.
+        let opaque = if_op(vec![yield_op(vec![Val(99)])], vec![yield_op(vec![c4])]);
+        assert_eq!(return_vals_if_simple_conditional(&opaque, 0, defs), None);
+        assert_eq!(return_vals_if_simple_conditional(&outer[2], 1, defs), None);
+        // No `else` region at all.
+        let then_only = if_op(vec![yield_op(vec![c3])], Vec::new());
+        assert_eq!(return_vals_if_simple_conditional(&then_only, 0, defs), None);
+        // Not a conditional.
+        assert_eq!(return_vals_if_simple_conditional(&outer[0], 0, defs), None);
+    }
+}

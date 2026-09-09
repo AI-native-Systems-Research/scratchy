@@ -558,6 +558,7 @@ mod unit_tests {
     fn get_unit(result: u32, unit: DfirUnit) -> DfirOp {
         let core = Core::checked(0).expect("every arch has core 0");
         DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(result),
             residency: crate::units::residency_of(unit, core, corelet0()),
             unit,
@@ -938,6 +939,7 @@ mod unit_tests {
     fn get_unit_on(result: u32, unit: DfirUnit, corelet: Corelet) -> DfirOp {
         let core = Core::checked(0).expect("every arch has core 0");
         DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(result),
             residency: crate::units::residency_of(unit, core, corelet),
             unit,
@@ -1470,6 +1472,7 @@ mod unit_tests {
         let corelet1 = Corelet::checked(1).expect("Target::CORELETS_PER_CORE is 2");
         let unit = |result: u32, unit: DfirUnit, corelet: Corelet| {
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(result),
                 residency: Residency::Corelet {
                     core: Core::checked(0).expect("every arch has core 0"),
@@ -3671,12 +3674,14 @@ mod pass_unit_tests {
         let corelet = Corelet::checked(0).expect("every arch has corelet 0");
         let preamble = vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(0),
                 residency: crate::units::residency_of(DfirUnit::Lxsu, core, corelet),
                 unit: DfirUnit::Lxsu,
                 num_folds: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(1),
                 residency: crate::units::residency_of(DfirUnit::Lxlu, core, corelet),
                 unit: DfirUnit::Lxlu,

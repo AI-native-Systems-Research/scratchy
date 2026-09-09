@@ -199,6 +199,16 @@ impl OpAt {
         }
     }
 
+    /// `OpBuilder::setInsertionPointAfter(op)` — the slot immediately after this op in its own block,
+    /// which is where [`insert_at`] then puts the new op.
+    #[must_use]
+    pub fn after(&self) -> OpAt {
+        OpAt {
+            enclosing: self.enclosing.clone(),
+            index: InBlock(self.index.0 + 1),
+        }
+    }
+
     /// `Operation::getParentOp()`, and `None` when that parent is the `dataflow.program_unit` — which
     /// is the `dyn_cast<dataflow::ProgramUnitOp>` arm at `:91`.
     #[must_use]
@@ -409,7 +419,7 @@ fn block_of_mut<'a>(
 /// ⭐ THE WHOLE UNIT IS SEARCHED RATHER THAN THE VISIBLE SCOPES, because a [`Val`] is bound once
 /// ([`crate::islands::dataflow_ir::Values`]) and the answer must stay right as ops move between
 /// blocks.
-fn path_of(unit_body: &[Op], val: Val) -> Option<OpAt> {
+pub(crate) fn path_of(unit_body: &[Op], val: Val) -> Option<OpAt> {
     fn walk(block: &[Op], val: Val, enclosing: &mut Vec<(InBlock, usize)>) -> Option<OpAt> {
         for (index, op) in block.iter().enumerate() {
             if results(op).contains(&val) {
@@ -449,7 +459,7 @@ fn remove_at(unit_body: &mut Vec<Op>, at: &OpAt) -> Option<Op> {
 }
 
 /// `Operation::moveBefore(at)` — the second half, `at` naming the op to land in front of.
-fn insert_at(unit_body: &mut Vec<Op>, at: &OpAt, op: Op) {
+pub(crate) fn insert_at(unit_body: &mut Vec<Op>, at: &OpAt, op: Op) {
     if let Some(block) = block_of_mut(unit_body, &at.enclosing) {
         let index = at.index.0.min(block.len());
         block.insert(index, op);

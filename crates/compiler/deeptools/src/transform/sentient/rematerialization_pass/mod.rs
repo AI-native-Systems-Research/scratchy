@@ -196,10 +196,52 @@ pub fn last_use_within_block(v: Defined, block: &[Op]) -> Option<InBlock> {
         .map(InBlock::at)
 }
 
-// crustify:todo: e353_increasesOperandLiverange
-//   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:109  (52 body lines, level 1)
-//   original  : bool RematerializationPass::increasesOperandLiverange(Operation *op, Operation *user)
-//   calls     : e146_getLastUseWithinBlock
+/// Replaces: e353_increasesOperandLiverange
+///
+/// Whether cloning `op` immediately before `user` would keep one of `op`'s own operands alive longer
+/// than it already is — true unless every non-constant operand is still read at or after `user`.
+///
+/// ⛔ TRAP: NO OPERANDS TO CHECK ANSWERS `true`, NOT `false` (`:130`). It is the answer for an op the
+/// three casts decline AND for one whose every operand is a constant, so a `scalar_copy` of a constant
+/// — the very shape [`is_candidate_for_rematerialization`] admits — is REFUSED here and is
+/// rematerialized only when `dcc-remat-allow-operand-live-range-increase` is on (`:193`).
+/// ⛔ TRAP: A BLOCK ARGUMENT IS SKIPPED, NOT CHECKED (`:151`) — an iter arg lives across the whole loop
+/// body already, so no clone can extend it.
+#[must_use]
+pub fn increases_operand_liverange(
+    op: &Op,
+    user: InBlock,
+    block: &[Op],
+    defs: Definitions<'_>,
+) -> bool {
+    let operands: Vec<Val> = match op {
+        Op::Sentient(sentient::Op::ScalarCopy { input, .. }) => vec![*input],
+        Op::Sentient(
+            sentient::Op::ScalarAdd { lhs, rhs, .. } | sentient::Op::ScalarSub { lhs, rhs, .. },
+        ) => vec![*lhs, *rhs],
+        _ => Vec::new(),
+    };
+    let mut to_check = operands
+        .into_iter()
+        .filter(|val| !is_constant(*val, defs))
+        .peekable();
+    if to_check.peek().is_none() {
+        return true;
+    }
+    to_check
+        .filter_map(|val| Defined::of(val, defs))
+        .any(|operand| {
+            // ⭐ `DT_CHECK_MSG(operand_last_use, "Op itself is a use of its operands")` (`:153`) — `op` is in
+            // `block` and reads `val`, so [`last_use_within_block`] always answers. `None` would mean the
+            // caller passed an `op` from elsewhere, and the reference's refusal becomes "extends it".
+            let Some(last_use) = last_use_within_block(operand, block) else {
+                return true;
+            };
+            // `!dominates(user_ancestor, operand_last_use)`, both ops of one block, so position decides —
+            // and `dominates` is reflexive, so the last use BEING `user` does not extend anything.
+            user.index() > last_use.index()
+        })
+}
 
 // crustify:todo: e464_runOn
 //   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:175  (42 body lines, level 2)
@@ -213,7 +255,10 @@ pub fn last_use_within_block(v: Defined, block: &[Op]) -> Option<InBlock> {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Defined, InBlock, is_candidate_for_rematerialization, last_use_within_block};
+    use super::{
+        Defined, InBlock, increases_operand_liverange, is_candidate_for_rematerialization,
+        last_use_within_block,
+    };
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 
@@ -317,6 +362,57 @@ mod unit_tests {
             .collect();
         // `%10` is the loop's iter arg, so it is a `BlockArgument` and never a constant.
         assert_eq!(verdicts, vec![true, false, false, true, false]);
+    }
+
+    /// An operand still read after the user extends nothing; one whose last use is earlier does; an
+    /// all-constant operand list refuses outright; and a block argument is skipped, not checked.
+    #[test]
+    fn only_an_operand_whose_last_use_precedes_the_user_is_extended() {
+        let (c1, computed, candidate) = (Val(0), Val(1), Val(2));
+        let block = vec![
+            constant(c1),
+            mul(c1, c1, computed),
+            add(computed, c1, candidate),
+            copy(computed, Val(3)),
+            copy(candidate, Val(4)),
+        ];
+        let scopes: [&[Op]; 1] = [&block];
+        let defs = Definitions::from_innermost(&scopes);
+        // `%1`'s last use is index 3, so cloning `%2` before index 4 would keep `%1` alive longer.
+        assert!(increases_operand_liverange(
+            &block[2],
+            InBlock::at(4),
+            &block,
+            defs
+        ));
+        // `dominates` is reflexive: the last use BEING the user extends nothing.
+        assert!(!increases_operand_liverange(
+            &block[2],
+            InBlock::at(3),
+            &block,
+            defs
+        ));
+        // ⛔ NO NON-CONSTANT OPERAND ANSWERS `true` — the shape e145 admits is refused here.
+        let all_constant = add(c1, c1, Val(5));
+        assert!(increases_operand_liverange(
+            &all_constant,
+            InBlock::at(4),
+            &block,
+            defs
+        ));
+        // A loop iter arg is a `BlockArgument`: queued, then skipped, so the answer is `false`.
+        let inner = vec![add(Val(10), c1, Val(11))];
+        let outer = vec![
+            constant(c1),
+            for_op(Val(20), c1, carried(c1, Val(10), Val(21)), inner.clone()),
+        ];
+        let nested: [&[Op]; 2] = [&inner, &outer];
+        assert!(!increases_operand_liverange(
+            &inner[0],
+            InBlock::at(0),
+            &inner,
+            Definitions::from_innermost(&nested)
+        ));
     }
 
     /// The last use is the later position in the block, a use inside a loop body counts for the loop

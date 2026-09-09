@@ -2363,6 +2363,7 @@ mod unit_tests {
     fn a_view_over_a_unit_type_is_not_xrf_related() {
         let scope = vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(81),
                 residency: Residency::Corelet {
                     core: Core::checked(0).expect("the arch has core 0"),

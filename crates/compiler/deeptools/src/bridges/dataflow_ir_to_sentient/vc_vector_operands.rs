@@ -3791,6 +3791,7 @@ mod unit_tests {
                 dir: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(21),
                 residency: Residency::Corelet {
                     core: Core::checked(0).expect("the arch has core 0"),
@@ -3882,6 +3883,7 @@ mod unit_tests {
         let (_, from) = Link::<PtRowUnit<7>, Pe>::between(Val(195), Val(196)).ends();
         let scope = vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(193),
                 residency: Residency::Corelet {
                     core: Core::checked(31).expect("the arch has core 31"),

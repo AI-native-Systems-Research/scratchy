@@ -577,6 +577,7 @@ mod unit_tests {
     /// `dataflow.get_unit` — the other.
     fn get_unit() -> Op {
         Op::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: Val(4),
             residency: Residency::Global,
             unit: DfirUnit::L3lu,

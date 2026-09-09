@@ -503,6 +503,7 @@ mod unit_tests {
     /// A `dataflow.get_unit` binding `result`.
     fn get_unit(result: Val) -> Op {
         Op::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result,
             residency: Residency::Global,
             unit: DfirUnit::L3lu,

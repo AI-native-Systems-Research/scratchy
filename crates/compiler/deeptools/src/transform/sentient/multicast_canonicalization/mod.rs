@@ -356,6 +356,7 @@ mod unit_tests {
     /// `%g = dataflow.create_multicast_group(%p -> ())`.
     fn group(result: Val, producer: Val) -> Op {
         Op::Dataflow(dataflow::Op::CreateMulticastGroup {
+            reg_locale: None,
             result,
             producer,
             consumers: Vec::new(),
@@ -501,6 +502,7 @@ mod unit_tests {
         let (mapping, qmap) = (Val(3), Val(4));
         let mut body = vec![
             Op::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: key,
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,

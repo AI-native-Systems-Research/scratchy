@@ -1901,12 +1901,14 @@ mod unit_tests {
             precision: None,
             body: vec![
                 DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    reg_locale: None,
                     result: lxlu,
                     residency: corelet0(),
                     unit: DfirUnit::Lxlu,
                     num_folds: None,
                 }),
                 DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    reg_locale: None,
                     result: sfp_unit,
                     residency: corelet0(),
                     unit: DfirUnit::Sfp,
@@ -2084,6 +2086,7 @@ mod unit_tests {
                     })
                 })
                 .chain(core::iter::once(DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    reg_locale: None,
                     result: from.val(),
                     residency: Residency::Corelet {
                         core: Core::checked(0).expect("the arch has core 0"),
@@ -2183,12 +2186,14 @@ mod unit_tests {
                     // ⛔ BOTH ENDS NEED THEIR `get_unit` IN THE BODY, or neither operand resolves —
                     // see the 344 fixture's note.
                     DfirOp::Dataflow(dataflow::Op::GetUnit {
+                        reg_locale: None,
                         result: from.val(),
                         residency: Residency::Global,
                         unit: DfirUnit::Lxlu,
                         num_folds: None,
                     }),
                     DfirOp::Dataflow(dataflow::Op::GetUnit {
+                        reg_locale: None,
                         result: to.val(),
                         residency: Residency::Global,
                         unit: DfirUnit::Lxsu,
@@ -2251,6 +2256,7 @@ mod unit_tests {
         };
         let scope = vec![
             DfirOp::Dataflow(dataflow::Op::GetUnit {
+                reg_locale: None,
                 result: Val(10),
                 residency: Residency::Global,
                 unit: DfirUnit::Lxlu,

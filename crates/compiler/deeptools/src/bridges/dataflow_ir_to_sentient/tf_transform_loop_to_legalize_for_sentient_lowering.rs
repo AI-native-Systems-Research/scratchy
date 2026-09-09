@@ -2067,6 +2067,7 @@ mod unit_tests {
         let viewed_unit = match case.viewed {
             Viewed::Unit(dfir_unit) => {
                 scope.push(DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    reg_locale: None,
                     result: unit,
                     residency: at_corelet_zero(),
                     unit: dfir_unit,
@@ -2076,6 +2077,7 @@ mod unit_tests {
             }
             Viewed::LocalUnit(which) | Viewed::PagedLocalUnit(which) => {
                 scope.push(DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    reg_locale: None,
                     result: unit,
                     residency: at_corelet_zero(),
                     unit: owner_of(which),

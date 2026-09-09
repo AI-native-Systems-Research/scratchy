@@ -85,11 +85,13 @@
 // ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
 // file's own tests until `e355_runOnOperation` lands and something calls it. CI runs clippy with
 // `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e355_runOnOperation`: at that point an unused item here is a real defect again.
+// ⭐ REMOVE THIS WITH `e467_replaceCorrelatedIterArgsInEquivClass`, WHICH IS THE ONE CALLER MISSING.
+// `e355_runOnOperation` is now ported and reaches e147 and e634, but e148 and e357 are read only from
+// e467, so an unused item here stays indistinguishable from a real defect until that lands.
 #![allow(dead_code)]
 
 use crate::arch::Arch;
-use crate::islands::sentient::dialects::{self, Op, Val, sentient};
+use crate::islands::sentient::dialects::{self, Definitions, Op, Val, sentient};
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
 use crate::workload::Workload;
@@ -282,20 +284,123 @@ fn result_corresponding_to_operand_num(op: &Op, operand_num: usize) -> Option<Va
     }
 }
 
-// crustify:todo: e355_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:102  (5 body lines, level 1)
-//   original  : void runOnOperation()
-//   calls     : e147_runOn
+/// Replaces: e355_runOnOperation
+///
+/// The pass entry — `ReuseLoopIteratorArguments` over one whole program (`:102-106`).
+///
+/// ⛔ `dcc-reuse-loop-iterator-arguments-disable` IS DROPPED, as every `cl::opt` of this campaign is:
+/// it is a flag of `dcc-opt`, not a property of a program, and this crate has no flags. `cl::init(false)`
+/// (`:58-60`) makes running the pass the answer it always gives here.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    run_on_program(program);
+}
 
-// crustify:todo: e356_reuseIdenticalIterArgs
-//   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:345  (64 body lines, level 1)
-//   original  : void ReuseLoopIteratorArgumentsPass::reuseIdenticalIterArgs( sentient::ForOp for_op, PropagationAnalysis &expr_prop_analysis)
-//   calls     : e252_size
+/// Replaces: e356_reuseIdenticalIterArgs
+///
+/// Collapses a loop's iterator arguments onto one representative per group of arguments that carry the
+/// same affine expression in the same register file at the same element size (`:345-409`).
+///
+/// ⛔ THE GROUPING PREDICATE IS `PropagationAnalysis::areExpressionsSame`, WHICH IS OUT OF CAMPAIGN
+/// SCOPE — a loop with two or more still-ungrouped candidates reaches the `todo!` below. Everything
+/// around it is ported: the two early exits, the locale/element-size filter and the rewrite.
+/// ⛔ TRAP: THE GROUP HEAD IS THE LOWEST INDEX AND `curr_iter` SKIPS ANY ARGUMENT ALREADY ASSIGNED ONE
+/// (`:373`, `:380`), so grouping is not transitive through a middle argument that was claimed first.
+pub fn reuse_identical_iter_args(for_op: &mut Op) {
+    let Op::Sentient(sentient::Op::For { carried, body, .. }) = for_op else {
+        return;
+    };
+    // `if (n_iter_args == 0) return;` (`:348`).
+    if carried.is_empty() {
+        return;
+    }
+    // ⭐ `if (!locales || !element_sizes) return;` (`:352`). `getRegLocalesAttr()` CANNOT BE ABSENT ON
+    // THIS ISLAND — [`sentient::Carried::reg`] is a field of the loop, not an optional attribute — so
+    // the surviving half is the `element_sizes` array, whose absence is every slot being `None`.
+    // ⭐ AND `DT_CHECK_MSG(getRegLocales().size() == 2 * n_iter_args + 1, ...)` (`:353-354`) IS THAT
+    // SAME FIELD: one `Reg` per carried value is the shape, so the check has nothing left to refuse.
+    if carried.iter().all(|value| value.element_size.is_none()) {
+        return;
+    }
 
-// crustify:todo: e357_areUsersLiverangesOverlapping
-//   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:458  (23 body lines, level 1)
-//   original  : bool ReuseLoopIteratorArgumentsPass::areUsersLiverangesOverlapping( BlockArgument iter_arg1, BlockArgument iter_arg2, const Liveness &liveness) const
-//   calls     : e148_collectResultsOfNonYieldFeedingUsers
+    // `iter_arg_idx_to_head_idx`, initialised to the identity (`:366-368`).
+    let mut head_of: Vec<usize> = (0..carried.len()).collect();
+    for curr in 0..carried.len() {
+        if head_of[curr] != curr {
+            continue;
+        }
+        for next in curr + 1..carried.len() {
+            if head_of[next] != next {
+                continue;
+            }
+            // `locales[curr+1] != locales[next+1] || element_sizes[curr+1] != element_sizes[next+1]`
+            // (`:384-387`) — the `+ 1` is the induction variable's slot, which `carried` does not have.
+            if carried[curr].reg.locale != carried[next].reg.locale
+                || carried[curr].element_size != carried[next].element_size
+            {
+                continue;
+            }
+            if expressions_are_same(carried[curr].arg, carried[next].arg) {
+                head_of[next] = curr;
+            }
+        }
+    }
+
+    // `curr_iter_arg.replaceAllUsesWith(replace_with_arg)` (`:407`) — ⭐ WITHIN THE BODY, because a
+    // region argument has no use outside the region that binds it.
+    for curr in 0..carried.len() {
+        if head_of[curr] == curr {
+            continue;
+        }
+        dialects::replace_all_uses_with(body, carried[curr].arg, carried[head_of[curr]].arg);
+    }
+}
+
+/// `PropagationAnalysis::areExpressionsSame` (`:389-390`) — whether two iterator arguments advance by
+/// the same affine expression. `Analyses/PropagationAnalysis` is not in this campaign.
+fn expressions_are_same(a: Val, b: Val) -> bool {
+    todo!("PropagationAnalysis::areExpressionsSame({a:?}, {b:?}) — out of campaign scope")
+}
+
+/// Replaces: e357_areUsersLiverangesOverlapping
+///
+/// Whether any non-yield-feeding user of `first` and any of `second` bind results that are live at the
+/// same time — the reason a correlated pair must NOT be collapsed (`:458-482`).
+///
+/// ⛔ `Liveness::isLiveRangeOverlaps` IS OUT OF CAMPAIGN SCOPE. The pair that shares a defining op is
+/// answered here, since *"if both results belong to the same operation, their live ranges automatically
+/// overlap"* (`:475-476`); anything else reaches the `todo!`.
+/// ⛔ TRAP: EMPTY EITHER SIDE ANSWERS `false` — the cross product runs zero times (`:472`), so an
+/// iterator argument whose every user feeds the yield never blocks the collapse.
+#[must_use]
+pub fn are_users_liveranges_overlapping(
+    first: IterArg,
+    second: IterArg,
+    body: &[Op],
+    defs: Definitions<'_>,
+) -> bool {
+    let firsts = collect_results_of_non_yield_feeding_users(first, body);
+    let seconds = collect_results_of_non_yield_feeding_users(second, body);
+    firsts.iter().any(|result1| {
+        seconds.iter().any(|result2| {
+            share_a_defining_op(*result1, *result2, defs) || live_range_overlaps(*result1, *result2)
+        })
+    })
+}
+
+/// `result1.getDefiningOp() == result2.getDefiningOp()` (`:475`) — ⛔ NOT `result1 == result2`: one
+/// `sentient.load_and_store` binds a source result AND a destination result, and
+/// [`result_corresponding_to_operand_num`] hands back either, so two distinct values can share an op.
+fn share_a_defining_op(a: Val, b: Val, defs: Definitions<'_>) -> bool {
+    a == b
+        || defs
+            .of(a)
+            .is_some_and(|op| dialects::results(op).contains(&b))
+}
+
+/// `Liveness::isLiveRangeOverlaps` (`:478`) — `Analyses/Liveness` is not in this campaign.
+fn live_range_overlaps(a: Val, b: Val) -> bool {
+    todo!("Liveness::isLiveRangeOverlaps({a:?}, {b:?}) — out of campaign scope")
+}
 
 // crustify:todo: e467_replaceCorrelatedIterArgsInEquivClass
 //   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:259  (81 body lines, level 2)
@@ -309,10 +414,14 @@ fn result_corresponding_to_operand_num(op: &Op, operand_num: usize) -> Option<Va
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{IterArg, collect_results_of_non_yield_feeding_users};
+    use super::{
+        IterArg, are_users_liveranges_overlapping, collect_results_of_non_yield_feeding_users,
+        reuse_identical_iter_args,
+    };
     use crate::arch::Elements;
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::Definitions;
     use crate::islands::sentient::dialects::sentient::StoreSource;
     use crate::islands::sentient::dialects::{Op, Val, sentient};
 
@@ -408,5 +517,88 @@ mod unit_tests {
             collect_results_of_non_yield_feeding_users(iter_arg, &body),
             vec![aside, aside]
         );
+    }
+
+    /// A `sentient.for` carrying `carried` and running `body`.
+    fn for_op(carried: Vec<sentient::Carried>, body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv: Val(1),
+            bound: Val(2),
+            carried,
+            iv_reg: sentient::Reg::UNALLOCATED,
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// Both early exits, and a loop with a single carried value that has nothing to group with — the
+    /// three shapes that never reach `PropagationAnalysis::areExpressionsSame`.
+    #[test]
+    fn a_loop_with_nothing_to_group_is_left_exactly_as_it_was() {
+        let sized = |mut value: sentient::Carried| {
+            value.element_size = Some(Bits(16));
+            value
+        };
+        let body = vec![
+            add(Val(10), Val(11), Val(12)),
+            Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(12)],
+            }),
+        ];
+        // `n_iter_args == 0`.
+        let mut none = for_op(Vec::new(), body.clone());
+        let before = none.clone();
+        reuse_identical_iter_args(&mut none);
+        assert_eq!(none, before);
+        // `!element_sizes` — every slot unset is the array being absent.
+        let mut unsized_loop = for_op(vec![carried(Val(1), Val(10), Val(2))], body.clone());
+        let before = unsized_loop.clone();
+        reuse_identical_iter_args(&mut unsized_loop);
+        assert_eq!(unsized_loop, before);
+        // One sized carried value: the inner loop has no `next_iter`, so it is its own head.
+        let mut single = for_op(vec![sized(carried(Val(1), Val(10), Val(2)))], body);
+        let before = single.clone();
+        reuse_identical_iter_args(&mut single);
+        assert_eq!(single, before);
+    }
+
+    /// Two iterator arguments read by one op overlap by construction; two whose every user feeds the
+    /// yield have nothing to compare and do not overlap.
+    #[test]
+    fn users_sharing_a_defining_op_overlap_and_yield_feeding_users_are_not_compared() {
+        let (arg1, arg2, step1, step2) = (Val(10), Val(11), Val(20), Val(21));
+        let (advanced1, advanced2, shared) = (Val(12), Val(13), Val(14));
+        let carried_values = [carried(Val(1), arg1, Val(2)), carried(Val(3), arg2, Val(4))];
+        // Every user is the arithmetic that advances its own slot.
+        let feeding = vec![
+            add(arg1, step1, advanced1),
+            add(arg2, step2, advanced2),
+            Op::Sentient(sentient::Op::Yield {
+                results: vec![advanced1, advanced2],
+            }),
+        ];
+        let scopes: [&[Op]; 1] = [&feeding];
+        let defs = Definitions::from_innermost(&scopes);
+        let first = IterArg::at(&carried_values, &feeding, 0).expect("slot 0 exists");
+        let second = IterArg::at(&carried_values, &feeding, 1).expect("slot 1 exists");
+        assert!(!are_users_liveranges_overlapping(
+            first, second, &feeding, defs
+        ));
+        // ⭐ ONE `scalar_add` READING BOTH: `result1.getDefiningOp() == result2.getDefiningOp()`.
+        let together = vec![
+            add(arg1, arg2, shared),
+            add(arg1, step1, advanced1),
+            add(arg2, step2, advanced2),
+            Op::Sentient(sentient::Op::Yield {
+                results: vec![advanced1, advanced2],
+            }),
+        ];
+        let scopes: [&[Op]; 1] = [&together];
+        let defs = Definitions::from_innermost(&scopes);
+        let first = IterArg::at(&carried_values, &together, 0).expect("slot 0 exists");
+        let second = IterArg::at(&carried_values, &together, 1).expect("slot 1 exists");
+        assert!(are_users_liveranges_overlapping(
+            first, second, &together, defs
+        ));
     }
 }

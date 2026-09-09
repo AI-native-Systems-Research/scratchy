@@ -102,10 +102,14 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 
 use crate::formats::Bits;
-use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient};
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, Op, UniformRegions, Val, dataflow, sentient, symbol, uniform,
+};
 use crate::islands::sentient::print;
-use crate::transform::sentient::utils::{self, Hoisted, NewUse, OpAt};
-use crate::units::{Core, DfirUnit};
+use crate::transform::sentient::utils::{self, ConstKind, Hoisted, NewUse, OpAt};
+use crate::units::Core;
 
 /// `RegisterLocales` (`:87-102`) IS THE ISLAND'S [`sentient::RegType`], not a second enum.
 ///
@@ -137,11 +141,16 @@ pub(crate) struct PerUnit {
     pub(crate) cst_aliases: BTreeMap<i64, BTreeMap<AliasKey, Val>>,
     /// `query_map_aliases_`, keyed by the `uniform.query_map` result (`:280`).
     pub(crate) query_map_aliases: BTreeMap<Val, BTreeMap<AliasKey, Val>>,
-    /// `unit_aliases_`, keyed by `dcc::getCoreId(get_unit_op)` then the unit's type (`:276`, `:317`).
+    /// `unit_aliases_`, keyed by `dcc::getCoreId(get_unit_op)` then `dcc::getUnitType(get_unit_op)`
+    /// (`:276`, `:317`).
     ///
     /// ⛔ `None` IS THE REFERENCE'S `-1`: a `dataflow.get_unit` the whole device shares carries no
     /// `core` attribute at all ([`crate::units::Residency::core`]).
-    pub(crate) unit_aliases: BTreeMap<Option<Core>, BTreeMap<DfirUnit, Val>>,
+    ///
+    /// ⛔ THE INNER KEY IS THE **GENERIC** COMPONENT, NOT THE UNIT. `getUnitType` is
+    /// `senCompToGenericComp.at(op.getType())` (`Utils/DccExtContext.cpp:126-131`), which this crate
+    /// already spells [`DfirUnit::generic`] — so two `ptrow*` handles on one core share ONE alias.
+    pub(crate) unit_aliases: BTreeMap<Option<Core>, BTreeMap<GenericComp, Val>>,
 }
 
 /// THE STATE THAT OUTLIVES A UNIT — ⛔⛔ `clear()` TOUCHES NEITHER FIELD, AND THAT IS THE POINT.
@@ -396,20 +405,420 @@ fn owner_of<'a>(val: Val, scope: &[&'a [Op]]) -> Option<&'a Op> {
         })
 }
 
-// crustify:todo: e350_createCopyOperationAndUpdateAssignment
-//   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:255  (120 body lines, level 1)
-//   original  : Value RegisterTypeAssignmentPass::createCopyOperationAndUpdateAssignment( Value val, const RegisterLocales locale, Operation* user, const bool is_mutable_addr_or_xrf_ptr, int element_size)
-//   calls     : e140_moveToCommonDominator
+/// WHICH OF THE FIVE OPS A COPY IS BEING MADE OF, and therefore which alias cache records it —
+/// `DT_CHECK(op && isa<ConstantOp, GetUnitOp, CreateMulticastGroupOp, QueryMapOp, CreateSymbolOp>(op))`
+/// (`:259-261`) as a type.
+///
+/// ⛔ THE FIVE `dyn_cast`s, NOT THE FOUR `is_*` PREDICATES. The predicates see THROUGH a
+/// `uniform.query_map` to what its mapping holds (`Analyses/Utils.cpp:141-153, 221-255`) and decide
+/// whether commoning happens at all; the cast decides which cache the copy lands in, and a query map
+/// gets its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopySource {
+    /// `sentient::ConstantOp`, cached by `getValue()`.
+    Constant(i64),
+    /// `symbol::CreateSymbolOp`, cached by `getSymbolID()`.
+    Symbol(i64),
+    /// `dataflow::GetUnitOp`, cached by `dcc::getCoreId` then `dcc::getUnitType`.
+    GetUnit(Option<Core>, GenericComp),
+    /// `uniform::QueryMapOp`, cached by the query map's own result.
+    QueryMap,
+    /// `dataflow::CreateMulticastGroupOp` — ⛔ THE ONE SOURCE WITH NO CACHE AND NO COMMONING, and the
+    /// one whose copy lands AFTER the definition instead of before the use.
+    Multicast,
+}
 
-// crustify:todo: e351_addToWorkListAndUpdateAssignment
-//   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:399  (4 body lines, level 1)
-//   original  : void RegisterTypeAssignmentPass::addToWorkListAndUpdateAssignment( Value val, RegisterLocales locale)
-//   calls     : e141_addToWorkList, e143_updateAssignment
+impl CopySource {
+    /// The witness, or `None` for a value the reference's `DT_CHECK` would refuse.
+    #[must_use]
+    pub(crate) fn of(val: Val, defs: Definitions<'_>) -> Option<CopySource> {
+        match defs.of(val)? {
+            Op::Sentient(sentient::Op::ScalarConstant { value, .. }) => {
+                Some(CopySource::Constant(*value))
+            }
+            Op::Symbol(symbol::Op::CreateSymbol { symbol_id, .. }) => {
+                Some(CopySource::Symbol(*symbol_id))
+            }
+            Op::Dataflow(dataflow::Op::GetUnit {
+                residency, unit, ..
+            }) => Some(CopySource::GetUnit(residency.core(), unit.generic())),
+            Op::Uniform(uniform::Op::QueryMap { .. }) => Some(CopySource::QueryMap),
+            Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. }) => Some(CopySource::Multicast),
+            _ => None,
+        }
+    }
+}
 
-// crustify:todo: e352_updateProgramUnit
-//   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:441  (45 body lines, level 1)
-//   original  : void RegisterTypeAssignmentPass::updateProgramUnit()
-//   calls     : e252_size
+/// ONE `createCopyOperationAndUpdateAssignment` CALL — its five parameters, plus the [`CopySource`]
+/// that stands for its `DT_CHECK`.
+#[derive(Debug, Clone)]
+pub(crate) struct CopyRequest {
+    /// `val` — what is being copied.
+    pub(crate) val: Val,
+    /// Which of the five ops binds it.
+    pub(crate) source: CopySource,
+    /// `locale` — the register file the use demands.
+    pub(crate) locale: RegisterLocale,
+    /// `user` — the op that reads the copy, which is where it is inserted and what it must dominate.
+    pub(crate) user: OpAt,
+    /// `is_mutable_addr_or_xrf_ptr` — ⛔ THE REAL COMMONING SWITCH; see the anchor.
+    pub(crate) is_mutable_addr_or_xrf_ptr: bool,
+    /// `element_size`, half of the cache key.
+    pub(crate) element_size: Option<Bits>,
+}
+
+impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
+    /// Replaces: e350_createCopyOperationAndUpdateAssignment
+    ///
+    /// An existing `scalar_copy` of the same constant, symbol, unit handle or query map when one can be
+    /// hoisted to dominate the user; otherwise a fresh one, cached and recorded as `locale`.
+    ///
+    /// ⛔ `dcc-register-type-assignment-const-commoning` IS DROPPED — a flag of `dcc-opt`, not a
+    /// program property, and `cl::init(true)` (`:57-60`) leaves commoning always on.
+    /// ⛔ TRAP: A FAILED HOIST FALLS THROUGH TO THE CREATE, and only the arm the source picks is
+    /// tried — a cached alias under any other key never blocks a second copy.
+    /// ⛔ TRAP: THE CACHE WRITE IS UNCONDITIONAL (`:371-375`) even where commoning was off, and the
+    /// `assignments_` write is DIRECT (`:376`), not e143.
+    pub(crate) fn create_copy_operation_and_update_assignment(
+        &mut self,
+        request: &CopyRequest,
+        unit_body: &mut Vec<Op>,
+        values: &mut Values,
+    ) -> Val {
+        let key = AliasKey {
+            locale: request.locale,
+            element_size: request.element_size,
+        };
+        // ⭐ EVERY READ OF THE IR HAPPENS HERE, before the body is borrowed mutably to insert.
+        let (is_multicast, alias, source_at) = {
+            let regions: [&[Op]; 1] = [unit_body.as_slice()];
+            let defs = Definitions::from_innermost(&regions);
+            let commoning = (utils::is_constant(request.val, ConstKind::ScalarConstant, defs)
+                || is_symbol(request.val, defs)
+                || is_get_unit(request.val, defs))
+                && !request.is_mutable_addr_or_xrf_ptr;
+            let alias = if commoning {
+                match request.source {
+                    CopySource::Constant(value) => self
+                        .per_unit
+                        .cst_aliases
+                        .get(&value)
+                        .and_then(|by_key| by_key.get(&key)),
+                    CopySource::Symbol(id) => self
+                        .per_module
+                        .sym_aliases
+                        .get(&id)
+                        .and_then(|by_key| by_key.get(&key)),
+                    CopySource::GetUnit(core, comp) => self
+                        .per_unit
+                        .unit_aliases
+                        .get(&core)
+                        .and_then(|by_comp| by_comp.get(&comp)),
+                    // ⭐ THE EXACT KEY FIRST, THEN THE SCAN (`:344-368`): unrolling duplicates an
+                    // immutable mapping, so two query maps holding the same constants are different
+                    // values and both would otherwise get their own copy.
+                    CopySource::QueryMap => {
+                        self.per_unit
+                            .query_map_aliases
+                            .get(&request.val)
+                            .and_then(|by_key| by_key.get(&key))
+                            .or_else(|| {
+                                self.per_unit.query_map_aliases.iter().find_map(
+                                    |(other, by_key)| {
+                                        let copy = by_key.get(&key)?;
+                                        are_constant_query_maps_identical(*other, request.val, defs)
+                                            .then_some(copy)
+                                    },
+                                )
+                            })
+                    }
+                    CopySource::Multicast => None,
+                }
+                .copied()
+            } else {
+                None
+            };
+            (
+                is_multicast(request.val, defs),
+                alias,
+                utils::path_of(unit_body, request.val),
+            )
+        };
+
+        // `if (succeeded(moveToCommonDominator(alias.getDefiningOp(), user))) return alias;`
+        if let Some(alias) = alias
+            && let Some(at) = utils::path_of(unit_body, alias)
+            && let Some(copy) = CopyAt::of(at, unit_body)
+            && move_to_common_dominator(unit_body, copy, &NewUse::SameUnit(request.user.clone()))
+                == Hoisted::Done
+        {
+            return alias;
+        }
+
+        // ⛔ `op->getResult(0)` IS `val` ITSELF for all five sources: each binds exactly one result in
+        // this island, and a query map's is the value that was asked for.
+        let result = values.mint();
+        let copy = Op::Sentient(sentient::Op::ScalarCopy {
+            input: request.val,
+            result,
+            reg: sentient::Reg {
+                locale: request.locale,
+                index: None,
+            },
+            // `CopyOp::create(builder, loc, type, input, regLocale)` sets neither.
+            element_size: None,
+            program_header: false,
+        });
+        let at = match source_at {
+            Some(source_at) if is_multicast => source_at.after(),
+            Some(_) | None => request.user.clone(),
+        };
+        utils::insert_at(unit_body, &at, copy);
+
+        match request.source {
+            CopySource::Constant(value) => {
+                self.per_unit
+                    .cst_aliases
+                    .entry(value)
+                    .or_default()
+                    .insert(key, result);
+            }
+            CopySource::Symbol(id) => {
+                self.per_module
+                    .sym_aliases
+                    .entry(id)
+                    .or_default()
+                    .insert(key, result);
+            }
+            CopySource::GetUnit(core, comp) => {
+                self.per_unit
+                    .unit_aliases
+                    .entry(core)
+                    .or_default()
+                    .insert(comp, result);
+            }
+            CopySource::QueryMap => {
+                self.per_unit
+                    .query_map_aliases
+                    .entry(request.val)
+                    .or_default()
+                    .insert(key, result);
+            }
+            CopySource::Multicast => {}
+        }
+        self.per_unit.assignments.insert(result, request.locale);
+        result
+    }
+
+    /// Replaces: e351_addToWorkListAndUpdateAssignment
+    ///
+    /// Queues `val` and records `locale` for it.
+    ///
+    /// ⛔ TRAP: THE ORDER IS THE WHOLE FUNCTION. e141 skips a value that already has an assignment, so
+    /// recording first would drop the value from the worklist.
+    pub(crate) fn add_to_work_list_and_update_assignment(
+        &mut self,
+        val: Val,
+        locale: RegisterLocale,
+    ) {
+        self.add_to_work_list(val);
+        self.update_assignment(val, locale);
+    }
+
+    /// Replaces: e352_updateProgramUnit
+    ///
+    /// Writes every locale this pass assigned back into the unit's ops, pre-order: a loop's induction
+    /// variable and iter args, then the results of the fifteen ops that carry a register file.
+    ///
+    /// ⛔ THE `get_unit` ARM IS GATED ON THE UNIT (`:472-475`) — only an L3LU or L3SU program unit
+    /// assigns its own unit handles, and `element_sizes` is untouched.
+    /// ⛔ TRAP: AN UNRECORDED VALUE IS WRITTEN AS `unknown`, NOT SKIPPED — `getLocaleAsString` answers
+    /// for every value ([`Locale::Unrecorded`]), so this OVERWRITES a locale an earlier pass set.
+    /// ⛔ TRAP: THE ARGUMENT AND THE RESULT OF ONE CARRIED VALUE SHARE ONE SLOT HERE where the
+    /// reference has two of a `1 + 2n` array ([`sentient::Carried::reg`]), so the result's locale
+    /// stands; they agree in a loop whose carried register is one register.
+    pub(crate) fn update_program_unit(&self, unit_body: &mut Vec<Op>, unit_type: GenericComp) {
+        // ⭐ DECIDE, THEN WRITE: the walk reads the ops that the writes then mutate.
+        let mut assigned: Vec<(Val, RegisterLocale)> = Vec::new();
+        self.collect_locales(unit_body, unit_type, &mut assigned);
+        for (val, locale) in assigned {
+            dialects::set_value_reg_locale(unit_body, val, locale);
+        }
+    }
+
+    /// The pre-order half of [`Self::update_program_unit`] — `(value, locale)` in the order the
+    /// reference fills its `reg_locales_vector`.
+    fn collect_locales(
+        &self,
+        block: &[Op],
+        unit_type: GenericComp,
+        out: &mut Vec<(Val, RegisterLocale)>,
+    ) {
+        for op in block {
+            if let Op::Sentient(sentient::Op::For { iv, carried, .. }) = op {
+                out.push((*iv, self.locale(*iv).reg_type()));
+                out.extend(
+                    carried
+                        .iter()
+                        .map(|value| (value.arg, self.locale(value.arg).reg_type())),
+                );
+            }
+            if assigns_result_locales(op, unit_type) {
+                out.extend(
+                    dialects::results(op)
+                        .into_iter()
+                        .map(|result| (result, self.locale(result).reg_type())),
+                );
+            }
+            for region in dialects::regions_ref(op) {
+                self.collect_locales(region, unit_type, out);
+            }
+        }
+    }
+}
+
+/// The `isa<>` list whose results `e352_updateProgramUnit` assigns (`:462-475`).
+///
+/// ⛔ `sentient.mac` IS IN IT AND HAS NO REGISTER FIELD — see [`dialects::set_value_reg_locale`].
+fn assigns_result_locales(op: &Op, unit_type: GenericComp) -> bool {
+    match op {
+        Op::Sentient(
+            sentient::Op::ScalarAdd { .. }
+            | sentient::Op::ScalarSub { .. }
+            | sentient::Op::ScalarCopy { .. }
+            | sentient::Op::If { .. }
+            | sentient::Op::For { .. }
+            | sentient::Op::VectorMac { .. }
+            | sentient::Op::ScalarConstant { .. }
+            | sentient::Op::LoadAndSend { .. }
+            | sentient::Op::ReceiveAndStore { .. }
+            | sentient::Op::LoadAndStore { .. }
+            | sentient::Op::ReceiveAndExtractScalar { .. }
+            | sentient::Op::LoadAndExtractScalar { .. }
+            | sentient::Op::LoadComputeAndSend { .. },
+        )
+        | Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. })
+        | Op::UniformRegions(UniformRegions::UniformizeRegions { .. }) => true,
+        Op::Dataflow(dataflow::Op::GetUnit { .. }) => {
+            matches!(unit_type, GenericComp::L3lu | GenericComp::L3su)
+        }
+        _ => false,
+    }
+}
+
+/// `dcc::utils::isSymbol` (`Transform/Sentient/Analyses/Utils.cpp:141-153`) — a `symbol.create_symbol`,
+/// or a `uniform.query_map` ANY of whose mapped values is one.
+///
+/// ⛔ `any`, NOT `all`: [`utils::is_constant`] with [`ConstKind::CreateSymbol`] is the OTHER predicate
+/// (`isConstant<CreateSymbolOp>`, `Utils/Utils.cpp:424`) and demands every value.
+fn is_symbol(val: Val, defs: Definitions<'_>) -> bool {
+    match defs.of(val) {
+        Some(Op::Symbol(symbol::Op::CreateSymbol { .. })) => true,
+        Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })) => {
+            dialects::uniform_mapping_values(*map, *key, defs)
+                .into_iter()
+                .any(|value| {
+                    matches!(
+                        defs.of(value),
+                        Some(Op::Symbol(symbol::Op::CreateSymbol { .. }))
+                    )
+                })
+        }
+        Some(_) | None => false,
+    }
+}
+
+/// `dcc::utils::isMulticast` (`:221-238`) — a `dataflow.create_multicast_group`, or a
+/// `uniform.query_map` all of whose mapped values are ones.
+///
+/// ⚠️ DIVERGENCE: AN EMPTY MAPPING ANSWERS `true` HERE AND THROWS THERE (`DT_CHECK(values.size() > 0)`),
+/// the same one [`utils::is_constant`] records.
+fn is_multicast(val: Val, defs: Definitions<'_>) -> bool {
+    match defs.of(val) {
+        Some(Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. })) => true,
+        Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })) => {
+            dialects::uniform_mapping_values(*map, *key, defs)
+                .into_iter()
+                .all(|value| {
+                    matches!(
+                        defs.of(value),
+                        Some(Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. }))
+                    )
+                })
+        }
+        Some(_) | None => false,
+    }
+}
+
+/// `dcc::utils::isGetUnit` (`:240-255`) — see [`is_multicast`], which it is the twin of.
+fn is_get_unit(val: Val, defs: Definitions<'_>) -> bool {
+    match defs.of(val) {
+        Some(Op::Dataflow(dataflow::Op::GetUnit { .. })) => true,
+        Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })) => {
+            dialects::uniform_mapping_values(*map, *key, defs)
+                .into_iter()
+                .all(|value| {
+                    matches!(
+                        defs.of(value),
+                        Some(Op::Dataflow(dataflow::Op::GetUnit { .. }))
+                    )
+                })
+        }
+        Some(_) | None => false,
+    }
+}
+
+/// `dcc::uniform::utils::areConstantQueryMapsIdentical` (`Dialect/Uniform/Utils.cpp:234-256`) — two
+/// query maps whose per-key constants differ by zero everywhere.
+///
+/// ⛔ NOT AN ANCHORED UNIT — the scan half of e350's query-map arm, and `getDeltasBetweenValuesOfUniform`
+/// `Mappings` (`:204-231`) inlined: every delta must exist and be zero, so a non-constant value or a
+/// key either map lacks answers `false` rather than producing a delta.
+fn are_constant_query_maps_identical(a: Val, b: Val, defs: Definitions<'_>) -> bool {
+    let (
+        Some(Op::Uniform(uniform::Op::QueryMap {
+            map: map_a,
+            key: key_a,
+            ..
+        })),
+        Some(Op::Uniform(uniform::Op::QueryMap {
+            map: map_b,
+            key: key_b,
+            ..
+        })),
+    ) = (defs.of(a), defs.of(b))
+    else {
+        return false;
+    };
+    if a == b {
+        return true;
+    }
+    let keys_a = dialects::uniform_mapping_keys(*key_a, defs);
+    // `if (key_vals_a.size() != key_vals_b.size()) return nullopt;` — then A's list indexes BOTH.
+    if keys_a.len() != dialects::uniform_mapping_keys(*key_b, defs).len() {
+        return false;
+    }
+    let (
+        Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs: pairs_a, .. })),
+        Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs: pairs_b, .. })),
+    ) = (defs.of(*map_a), defs.of(*map_b))
+    else {
+        return false;
+    };
+    keys_a.iter().all(|sought| {
+        let value_of = |pairs: &[(Val, Val)]| {
+            let (_, value) = pairs.iter().find(|(mapped, _)| mapped == sought)?;
+            match defs.of(*value)? {
+                Op::Sentient(sentient::Op::ScalarConstant { value, .. }) => Some(*value),
+                _ => None,
+            }
+        };
+        match (value_of(pairs_a), value_of(pairs_b)) {
+            (Some(from), Some(to)) => to == from,
+            _ => false,
+        }
+    })
+}
 
 // crustify:todo: e463_addToWorkListCreateCopyAndUpdateAssignment
 //   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:405  (17 body lines, level 2)
@@ -446,6 +855,7 @@ mod unit_tests {
     use super::*;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::sentient::{Reg, RegType};
+    use crate::transform::sentient::utils::InBlock;
 
     /// `%r = sentient.scalar_constant {value = <value>}`.
     fn constant(result: Val, value: i64) -> Op {
@@ -516,9 +926,10 @@ mod unit_tests {
         pass.per_unit
             .query_map_aliases
             .insert(Val(3), BTreeMap::from([(key, Val(4))]));
-        pass.per_unit
-            .unit_aliases
-            .insert(Core::checked(0), BTreeMap::from([(DfirUnit::Sfp, Val(5))]));
+        pass.per_unit.unit_aliases.insert(
+            Core::checked(0),
+            BTreeMap::from([(GenericComp::Sfp, Val(5))]),
+        );
         pass.per_module
             .global_const_assignments
             .insert(Val(6), RegType::Imm);
@@ -569,6 +980,140 @@ mod unit_tests {
         pass.update_assignment(Val(1), RegType::Imm);
         pass.update_assignment(Val(1), RegType::Lrf);
         assert_eq!(pass.locale(Val(1)), Locale::Recorded(RegType::Imm));
+    }
+
+    /// A `sentient.for` carrying one value.
+    fn for_op(iv: Val, bound: Val, carried: Vec<sentient::Carried>, body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
+            carried,
+            iv_reg: Reg::UNALLOCATED,
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// One carried value, with nothing assigned to it yet.
+    fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
+        sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: Reg::UNALLOCATED,
+            result_reg: Reg::UNALLOCATED,
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// The first request for a constant in a locale builds the copy before its user and caches it; the
+    /// second reuses that copy, hoisted to dominate the new user rather than duplicated.
+    #[test]
+    fn a_second_use_of_one_constant_in_one_locale_reuses_the_first_copy() {
+        let mut pass = TypesAndCopies::new();
+        let mut values = Values::default();
+        for _ in 0..3 {
+            let _ = values.mint();
+        }
+        let mut body = vec![constant(Val(1), 7), copy(Val(1), Val(2))];
+        let request = CopyRequest {
+            val: Val(1),
+            source: CopySource::Constant(7),
+            locale: RegType::Lrf,
+            user: OpAt::top(InBlock(1)),
+            is_mutable_addr_or_xrf_ptr: false,
+            element_size: None,
+        };
+        let first =
+            pass.create_copy_operation_and_update_assignment(&request, &mut body, &mut values);
+        assert_eq!(body.len(), 3);
+        assert!(
+            matches!(&body[1], Op::Sentient(sentient::Op::ScalarCopy { input, result, reg, .. })
+            if *input == Val(1) && *result == first && reg.locale == RegType::Lrf)
+        );
+        let key = AliasKey {
+            locale: RegType::Lrf,
+            element_size: None,
+        };
+        assert_eq!(pass.per_unit.cst_aliases[&7][&key], first);
+        assert_eq!(pass.locale(first), Locale::Recorded(RegType::Lrf));
+
+        // ⭐ THE SECOND REQUEST ADDS NO OP: the cached copy already dominates the later user.
+        let later = CopyRequest {
+            user: OpAt::top(InBlock(2)),
+            ..request.clone()
+        };
+        assert_eq!(
+            pass.create_copy_operation_and_update_assignment(&later, &mut body, &mut values),
+            first
+        );
+        assert_eq!(body.len(), 3);
+        // ⛔ A DIFFERENT LOCALE IS A DIFFERENT KEY, so it gets its own copy.
+        let elsewhere = CopyRequest {
+            locale: RegType::Lbr,
+            ..request.clone()
+        };
+        let second =
+            pass.create_copy_operation_and_update_assignment(&elsewhere, &mut body, &mut values);
+        assert_ne!(second, first);
+        assert_eq!(body.len(), 4);
+    }
+
+    /// Queueing happens before recording, so the value is on the worklist AND assigned; a repeat leaves
+    /// both alone.
+    #[test]
+    fn the_value_is_queued_before_it_is_assigned() {
+        let mut pass = TypesAndCopies::new();
+        pass.add_to_work_list_and_update_assignment(Val(1), RegType::Lrf);
+        assert_eq!(pass.worklist, VecDeque::from([Val(1)]));
+        assert_eq!(pass.locale(Val(1)), Locale::Recorded(RegType::Lrf));
+        // e141 declines an already-assigned value and e143 keeps the first locale.
+        pass.add_to_work_list_and_update_assignment(Val(1), RegType::Lbr);
+        assert_eq!(pass.worklist, VecDeque::from([Val(1)]));
+        assert_eq!(pass.locale(Val(1)), Locale::Recorded(RegType::Lrf));
+    }
+
+    /// The loop's induction variable takes slot 0, its carried value takes slot 1, and an op in the
+    /// `isa<>` list has its own result's locale written — an unrecorded value included, as `unknown`.
+    #[test]
+    fn the_walk_writes_slot_zero_the_iter_args_and_then_every_listed_results_locale() {
+        let mut pass = TypesAndCopies::new();
+        let (iv, arg, carried_result) = (Val(10), Val(11), Val(12));
+        pass.update_assignment(iv, RegType::Lccr);
+        pass.update_assignment(arg, RegType::Lrf);
+        pass.update_assignment(Val(2), RegType::Lbr);
+        let mut body = vec![
+            constant(Val(1), 7),
+            for_op(
+                iv,
+                Val(1),
+                vec![carried(Val(1), arg, carried_result)],
+                vec![copy(arg, Val(2))],
+            ),
+        ];
+        pass.update_program_unit(&mut body, GenericComp::Sfp);
+        let Op::Sentient(sentient::Op::For {
+            iv_reg,
+            carried,
+            body: inner,
+            ..
+        }) = &body[1]
+        else {
+            unreachable!("the loop is still a loop")
+        };
+        assert_eq!(iv_reg.locale, RegType::Lccr);
+        // ⛔⛔ TWO SLOTS, TWO WRITES, AND THE SECOND MUST NOT LAND ON THE FIRST. `[i + 1]` is the
+        // iter arg's, written from this walk's own `getRegionIterArgs()` list, and `[i + n + 1]` is
+        // the result's, written by its generic half (`:444-457`). `%11` is recorded `lrf` and `%12`
+        // is not recorded at all, so a single collapsed slot would read `unknown` — the arg's answer
+        // silently overwritten by its result's.
+        assert_eq!(carried[0].reg.locale, RegType::Lrf);
+        assert_eq!(carried[0].result_reg.locale, RegType::Unknown);
+        assert!(
+            matches!(&inner[0], Op::Sentient(sentient::Op::ScalarCopy { reg, .. })
+            if reg.locale == RegType::Lbr)
+        );
     }
 
     #[test]

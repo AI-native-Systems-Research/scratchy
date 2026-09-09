@@ -178,6 +178,7 @@ pub fn enumerate_collection_unit(
         // — ⛔ THE NAME IS STRUCTURAL HERE, derived from the residency and the unit by the printer.
         let unit_val = vals.mint();
         out.push(DfirOp::Dataflow(dataflow::Op::GetUnit {
+            reg_locale: None,
             result: unit_val,
             residency: member.residency,
             unit: member.unit,

@@ -29,7 +29,7 @@ use crate::generated::{DataType, Unit};
 /// them. This crate never runtime-refuses, so they are their own images here — a total function
 /// where the reference has a partial one. That is safe for every rule built on this: each asks
 /// `generic() == <a specific component>`, and these three answer no.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GenericComp {
     /// `PT` — the matrix unit, including every row, row span and per-fold copy of it.
     Pt,
