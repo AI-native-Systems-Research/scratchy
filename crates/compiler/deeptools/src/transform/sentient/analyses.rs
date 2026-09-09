@@ -414,6 +414,28 @@ impl ColoringGraph for OutOfScopeColoringGraph {
     }
 }
 
+/// `RegisterGraphs` (`Analyses/GraphColoring.hpp:152`) — one [`ColoringGraph`] per register locale,
+/// plus their hyper-graphs and the value-to-locale cache, as the allocator holds it.
+pub trait RegisterGraphs {
+    /// `RegisterGraphs::clean()` (`Analyses/GraphColoring.hpp:179-183`).
+    ///
+    /// ⛔⛔ IT LEAVES `ec_map_` STANDING. Three of the four members are cleared and the same-colour
+    /// equivalence classes are not, so they survive into the next program unit the allocator visits —
+    /// the same shape of trap as [`ColoringGraph::clear`], and for the same reason nobody giving this
+    /// an interior may write `*self = Self::default()`.
+    fn clean(&mut self);
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeRegisterGraphs;
+
+impl RegisterGraphs for OutOfScopeRegisterGraphs {
+    fn clean(&mut self) {
+        todo!("RegisterGraphs::clean (Analyses/GraphColoring.hpp:179) — out of campaign scope")
+    }
+}
+
 /// `RDENode` (`Analyses/RedundantDefinitionEliminationTree.hpp:34`) AS THE PORTED PASSES READ IT —
 /// the tree itself is out of campaign scope, so only the two facts an `initializeDataflowInfo` or an
 /// `isSimplifiable` asks of a node are represented.

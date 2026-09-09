@@ -80,14 +80,88 @@
 //! | `e478_doRegisterAllocation` | 478 | 2 | 5 | `dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:81` |
 //! | `e540_runOnOperation` | 540 | 3 | 8 | `dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:626` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
+// file's own tests until `e540_runOnOperation` lands and something calls it. CI runs clippy with
+// `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH `e540_runOnOperation`: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e216_clean
-//   authority : dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:59  (4 body lines, level 0)
-//   original  : void clean()
+use super::analyses::RegisterGraphs;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 
-// crustify:todo: e217_isKnownToHaveSameValues
-//   authority : dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:87  (46 body lines, level 0)
-//   original  : bool SmartRegisterAllocationPass::isKnownToHaveSameValues(mlir::Value op_1, mlir::Value op_2)
+/// THE ALLOCATOR'S OWN STATE (`:54-55`) — the graphs it colours and the assignment it hands back.
+///
+/// ⛔ `register_assignment_` IS DEAD IN THE AUTHORITY TREE: nothing reads or writes it, and the
+/// `RegAssignment()` (`:66`) that would have is declared and never defined. It is represented because
+/// [`SmartRegisterAllocation::clean`] clears it, and clearing it is half of e216.
+///
+/// ⭐ GENERIC OVER THE OUT-OF-SCOPE GRAPHS, as [`super::analyses::RegisterGraphs`] requires — the
+/// reference owns a concrete `RegisterGraphs`, and a parameter is what lets a test observe `clean()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SmartRegisterAllocation<G: RegisterGraphs> {
+    /// `reg_graphs_`.
+    pub(crate) reg_graphs: G,
+    /// `register_assignment_` — `DenseMap<Value, int>`, the register each value was given.
+    pub(crate) register_assignment: Vec<(Val, sentient::RegIndex)>,
+}
+
+impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
+    /// Replaces: e216_clean
+    ///
+    /// Drops both halves of the allocator's state before the next program unit.
+    ///
+    /// ⛔ TRAP: NOT A RESET. `RegisterGraphs::clean` leaves `ec_map_` standing, so the same-colour
+    /// equivalence classes cross the unit boundary — see [`RegisterGraphs::clean`].
+    pub(crate) fn clean(&mut self) {
+        self.reg_graphs.clean();
+        self.register_assignment.clear();
+    }
+}
+
+/// Replaces: e217_isKnownToHaveSameValues
+///
+/// Whether one of the two values is the result of a self-addressed transfer over the other: a
+/// `load_and_send`, `receive_and_store` or `load_compute_and_send` whose increment is the constant 0
+/// and whose `mutable_addr` IS the other value. Symmetric, `op_1` tested first.
+///
+/// ⛔ TRAP: THE REFERENCE DEREFERENCES A NULL HERE. `getIncrement().getDefiningOp<ConstantOp>()
+/// .getValue()` is unguarded (`:92-94`), so an increment that is not a `sentient.scalar_constant`
+/// crashes it; this answers `false`, which is the arm the reference would have taken had it checked.
+/// ⛔ AND IT HAS NO CALLER in the authority tree — declared at `:64`, defined at `:87`, called nowhere.
+#[must_use]
+pub(crate) fn is_known_to_have_same_values(op_1: Val, op_2: Val, defs: Definitions<'_>) -> bool {
+    addresses(op_1, op_2, defs) || addresses(op_2, op_1, defs)
+}
+
+/// One direction of [`is_known_to_have_same_values`] — `addr` is `value`'s own `mutable_addr` and the
+/// transfer never advances it.
+fn addresses(value: Val, addr: Val, defs: Definitions<'_>) -> bool {
+    let Some(Op::Sentient(op)) = defs.of(value) else {
+        return false;
+    };
+    let (mutable_addr, increment) = match op {
+        sentient::Op::LoadAndSend {
+            mutable_addr,
+            increment,
+            ..
+        }
+        | sentient::Op::ReceiveAndStore {
+            mutable_addr,
+            increment,
+            ..
+        }
+        | sentient::Op::LoadComputeAndSend {
+            mutable_addr,
+            increment,
+            ..
+        } => (*mutable_addr, *increment),
+        _ => return false,
+    };
+    matches!(
+        defs.of(increment),
+        Some(Op::Sentient(sentient::Op::ScalarConstant { value: 0, .. }))
+    ) && mutable_addr == addr
+}
 
 // crustify:todo: e382_performGraphColoring
 //   authority : dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:136  (484 body lines, level 1)
@@ -104,3 +178,98 @@
 //   original  : void SmartRegisterAllocationPass::runOnOperation()
 //   calls     : e478_doRegisterAllocation
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{RegisterGraphs, SmartRegisterAllocation, is_known_to_have_same_values};
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
+    use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+
+    /// A `RegisterGraphs` THAT ONLY RECORDS BEING CLEANED — the analysis is out of campaign scope, so
+    /// `clean()` is the whole of its observable surface.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct CountingGraphs {
+        cleaned: u32,
+    }
+
+    impl RegisterGraphs for CountingGraphs {
+        fn clean(&mut self) {
+            self.cleaned += 1;
+        }
+    }
+
+    /// `%r = sentient.scalar_constant {value = N : si64} : index`.
+    fn scalar_const(result: u32, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result: Val(result),
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `sentient.load_and_send` addressed by `mutable_addr` and advanced by `increment`.
+    fn load_and_send(mutable_addr: u32, increment: u32, result: u32) -> Op {
+        Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr: Val(mutable_addr),
+            immutable_addr: Val(99),
+            increment: Val(increment),
+            consumer: SendEnd::to_self(Val(98)),
+            result: Val(result),
+            extent: sentient::Extent {
+                total_elements: Elements(64),
+                element_size: Bits(32),
+                chunk_size: Elements(1),
+                chunk_stride: Elements(1),
+                burst_size: Elements(1),
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    /// e216 — both halves go: the graphs are cleaned and the assignment is emptied.
+    #[test]
+    fn e216_cleans_the_graphs_and_empties_the_assignment() {
+        let mut pass = SmartRegisterAllocation {
+            reg_graphs: CountingGraphs::default(),
+            register_assignment: vec![(Val(7), sentient::RegIndex::at::<3>())],
+        };
+
+        pass.clean();
+
+        assert_eq!(pass.reg_graphs, CountingGraphs { cleaned: 1 });
+        assert_eq!(pass.register_assignment, Vec::new());
+    }
+
+    /// e217 — the vendor's own shape, symmetric in both argument orders, and the two ways it says no.
+    #[test]
+    fn e217_a_never_advancing_transfer_over_the_other_value_is_the_same_value() {
+        let ops = vec![
+            scalar_const(1, 0),
+            scalar_const(2, 1),
+            // `%20`'s transfer reads `%10` and never advances it.
+            load_and_send(10, 1, 20),
+            // `%21`'s advances by one.
+            load_and_send(11, 2, 21),
+        ];
+        let regions: [&[Op]; 1] = [&ops];
+        let defs = Definitions::from_innermost(&regions);
+
+        assert!(is_known_to_have_same_values(Val(20), Val(10), defs));
+        assert!(is_known_to_have_same_values(Val(10), Val(20), defs));
+        assert!(!is_known_to_have_same_values(Val(21), Val(11), defs));
+        assert!(!is_known_to_have_same_values(Val(20), Val(11), defs));
+    }
+}
