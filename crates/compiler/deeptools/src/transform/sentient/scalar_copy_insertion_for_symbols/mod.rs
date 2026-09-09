@@ -360,25 +360,28 @@ fn is_constant(val: Val, defs: dialects::Definitions<'_>) -> bool {
     )
 }
 
-/// `dcc::utils::isSymbol` (`Analyses/Utils.cpp:141`) — a `symbol.create_symbol`, or a
-/// `uniform.query_map` any of whose mapped values is one.
+/// `dcc::utils::isSymbol` (`Analyses/Utils.cpp:141-154`) — a `symbol.create_symbol`, or a
+/// `uniform.query_map` any of whose ANSWERABLE values is one.
 ///
-/// ⭐ STRUCTURAL, SO NOT AN OUT-OF-SCOPE `todo!`: it reads defining ops and one mapping's values, and
-/// the mapped values are all of them — `getListOfKeyOpsFromUniformMapping` answers the enclosing
-/// uniformize/equalize/program-unit's whole unit list (`Dialect/Uniform/Utils.cpp:194-202`).
+/// ⭐ STRUCTURAL, SO NOT AN OUT-OF-SCOPE `todo!`: it reads defining ops and the values the query's own
+/// key selects — `getListOfValueOpsFromUniformMapping` (`Dialect/Uniform/Utils.cpp:194-202`), which
+/// the island already ports as [`dialects::uniform_mapping_values`].
+/// ⛔ TRAP: THE KEY IS LOAD-BEARING, so scanning every pair of the `uniform.def_immutable_mapping`
+/// over-reports. A concrete `dataflow.get_unit` key stands for ITSELF and selects one pair
+/// (`getListOfKeyOpsFromUniformMapping`, `:187-190`); only a region-argument key stands for the
+/// enclosing uniformize/equalize unit list (`:154-186`).
 fn is_symbol(val: Val, defs: dialects::Definitions<'_>) -> bool {
     match defs.of(val) {
-        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => match defs.of(*map) {
-            Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => {
-                pairs.iter().any(|(_, value)| {
+        Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })) => {
+            dialects::uniform_mapping_values(*map, *key, defs)
+                .iter()
+                .any(|value| {
                     matches!(
                         defs.of(*value),
                         Some(Op::Symbol(symbol::Op::CreateSymbol { .. }))
                     )
                 })
-            }
-            _ => false,
-        },
+        }
         Some(Op::Symbol(symbol::Op::CreateSymbol { .. })) => true,
         _ => false,
     }
@@ -493,7 +496,7 @@ pub fn clear(state: &mut PerUnitState) {
 /// `regLocales` entry for a `sentient.yield`, or the `scalar_add`/`scalar_sub`'s own `regLocale`.
 ///
 /// ⛔ TRAP: DELIBERATE DIVERGENCE FOR A YIELD. The reference indexes `regLocales[getOperandNumber()]`,
-/// but that array is `[bound, initArgs.., results..]` (`SentientOps.td:57-61`) so yield operand 0
+/// but that array is `[bound, initArgs.., results..]` (`SentientOps.td:58-61`) so yield operand 0
 /// reads the BOUND's entry; sibling `e154` adds the `+ 1` on the very same layout (`:490-492`). This
 /// answers the carried value's own locale.
 /// ⭐ `Unknown` IS THE TAIL — `emitError` then `DT_ERROR` then `return unknown` (`:471-473`), and the
@@ -501,9 +504,11 @@ pub fn clear(state: &mut PerUnitState) {
 #[must_use]
 pub fn locale_of_use(user: &Op, operand: usize, parent: Option<&Op>) -> RegType {
     match user {
-        // `getValueRegLocale(for_op.getBody()->getArgument(operand))`: argument 0 is the induction
-        // variable, whose `regLocales[0]` entry this island does not carry (see
-        // [`dialects::value_reg_locale`]), and argument `i + 1` is `carried[i]`'s.
+        // `getValueRegLocale(for_op.getBody()->getArgument(operand))`: argument `i + 1` is
+        // `carried[i]`'s. ⚠️ OPERAND 0 IS `$bound` AND THAT CASE IS REACHABLE — a symbol used as a
+        // loop bound. Its argument 0 is the induction variable, whose `regLocales[0]` entry this
+        // island does not carry (see [`dialects::value_reg_locale`]), so this answers `Unknown`
+        // where the reference answers that entry.
         Op::Sentient(sentient::Op::For { carried, .. }) => operand
             .checked_sub(1)
             .and_then(|position| carried.get(position))
@@ -656,7 +661,9 @@ pub fn dump_candidates(candidates: &[CandidateEntry], scope: &[Op]) -> String {
 mod unit_tests {
     use super::*;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::dataflow;
     use crate::islands::sentient::dialects::sentient::Carried;
+    use crate::units::{DfirUnit, Residency};
 
     /// A `sentient.scalar_copy` with no width, as `CopyOp::create`'s five-argument builder makes one.
     fn a_copy(input: Val, result: Val, locale: RegType) -> Op {
@@ -699,6 +706,16 @@ mod unit_tests {
             },
             program_header: false,
             element_size: None,
+        }
+    }
+
+    /// `Liveness&` recording what it is told, which is the only way to observe [`pessimize_liveness`]'s
+    /// selection.
+    #[derive(Default)]
+    struct Recorder(Vec<Val>);
+    impl Liveness for Recorder {
+        fn update_live_ranges_for_program_header_promotion(&mut self, candidate: Val) {
+            self.0.push(candidate);
         }
     }
 
@@ -747,15 +764,6 @@ mod unit_tests {
     /// initialiser is neither a constant nor a symbol is not.
     #[test]
     fn pessimize_liveness_promotes_the_copy_and_the_symbolic_iter_arg() {
-        /// `Liveness&` recording what it is told, which is the only way to observe the selection.
-        #[derive(Default)]
-        struct Recorder(Vec<Val>);
-        impl Liveness for Recorder {
-            fn update_live_ranges_for_program_header_promotion(&mut self, candidate: Val) {
-                self.0.push(candidate);
-            }
-        }
-
         let body = vec![
             Op::Symbol(symbol::Op::CreateSymbol {
                 result: Val(0),
@@ -785,6 +793,72 @@ mod unit_tests {
         pessimize_liveness(&state, &body, &mut liveness);
 
         assert_eq!(liveness.0, vec![Val(1), Val(5)]);
+    }
+
+    /// `e150` NEGATIVE — ⛔ THE KEY DECIDES WHICH VALUE `isSymbol` SEES. One
+    /// `uniform.def_immutable_mapping` holds a non-symbol under `%0` and a symbol under `%1`; only the
+    /// iter arg initialised by the query that asks for `%1` is promoted. Scanning both pairs — the
+    /// shape this file carried before — promotes them both.
+    #[test]
+    fn a_query_map_is_symbolic_only_for_the_key_that_selects_the_symbol() {
+        let a_unit = |result| {
+            Op::Dataflow(dataflow::Op::GetUnit {
+                result,
+                residency: Residency::Global,
+                unit: DfirUnit::Sfp,
+                num_folds: None,
+            })
+        };
+        let body = vec![
+            a_unit(Val(0)),
+            a_unit(Val(1)),
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: 4,
+                result: Val(2),
+                reg_locale: RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Symbol(symbol::Op::CreateSymbol {
+                result: Val(3),
+                symbol_id: 7,
+                max_value: None,
+            }),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(4),
+                pairs: vec![(Val(0), Val(2)), (Val(1), Val(3))],
+            }),
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(5),
+                map: Val(4),
+                key: Val(0),
+            }),
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(6),
+                map: Val(4),
+                key: Val(1),
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(7),
+                bound: Val(8),
+                carried: vec![
+                    a_carried(Val(5), Val(9), Val(10), RegType::Jcr),
+                    a_carried(Val(6), Val(11), Val(12), RegType::Jcr),
+                ],
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+        ];
+        let state = PerUnitState {
+            ops: collect_ops_of_interest(&body),
+            symbol_to_usage: SymbolUsage::default(),
+            symbolic_locales: vec![RegType::Jcr],
+        };
+
+        let mut liveness = Recorder::default();
+        pessimize_liveness(&state, &body, &mut liveness);
+
+        assert_eq!(liveness.0, vec![Val(11)]);
     }
 
     /// `e151` — one copy for two uses, placed after the `symbol.query_map` that defines the symbol.

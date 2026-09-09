@@ -107,11 +107,11 @@ use crate::islands::sentient::print;
 use crate::transform::sentient::utils::{self, Hoisted, NewUse, OpAt};
 use crate::units::{Core, DfirUnit};
 
-/// `RegisterLocales` (`:83-97`) IS THE ISLAND'S [`sentient::RegType`], not a second enum.
+/// `RegisterLocales` (`:87-102`) IS THE ISLAND'S [`sentient::RegType`], not a second enum.
 ///
 /// ⭐ THE FOURTEEN NAMES AND THEIR FOURTEEN SPELLINGS ARE THE SAME SET, and the pass itself says so:
 /// every locale it records leaves through `getLocaleAsString` into `symbolizeSentientRegType(..)`
-/// (`:474-476`), so a locale that did not spell a `SentientRegType` could not be written back.
+/// (`:446-472`), so a locale that did not spell a `SentientRegType` could not be written back.
 /// ⛔ ONLY THE DECLARATION ORDER DIFFERS (the pass puts `LCCR` third, `SentientTypes.td:268-286` puts
 /// `JCR` there) and nothing observes it: `enum_to_strings_reg_locales_` is read by `.at()` alone, and
 /// the one iteration over an assignment map is over `assignments_`, not over the enum.
@@ -201,7 +201,7 @@ pub(crate) enum CopyNeeded {
 }
 
 /// A `sentient.scalar_copy` OP — ⛔ `DT_CHECK_MSG(isa<sentient::CopyOp>(op), "expected a copy op")`
-/// (`:250`) AS A TYPE, and `DT_CHECK_MSG(op && new_use, "expected valid ops")` (`:249`) as a reference.
+/// (`:251`) AS A TYPE, and `DT_CHECK_MSG(op && new_use, "expected valid ops")` (`:250`) as a reference.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CopyOp<'a>(&'a Op);
 
@@ -219,17 +219,18 @@ impl<'a> CopyOp<'a> {
     }
 }
 
-/// `RegisterTypeAssignmentPass`'s state (`:129-149`).
+/// `RegisterTypeAssignmentPass`'s state (`:133-149`).
 ///
 /// ⛔⛔ `addScalarCopies` IS A CONST GENERIC BECAUSE IT DECIDES WHICH OPS EXIST. The `.td` declares it
-/// an `Option<"addScalarCopies", .., /*default=*/"true">` (`Passes.td:392-394`) and the pipeline
+/// an `Option<"addScalarCopies", .., /*default=*/"true">` (`Passes.td:393-394`) and the pipeline
 /// instantiates the pass BOTH WAYS in one build — see [`TypesOnly`] and [`TypesAndCopies`] — so it is
 /// not a build-wide constant either. With it in the type, `RegisterTypeAssignment<false>` cannot
 /// reach `createCopyOperationAndUpdateAssignment` at all: [`Self::is_copy_needed`] is statically
 /// [`CopyNeeded::No`], which is the crate's rule that a flag must REMOVE ops rather than be consulted.
 ///
 /// ⚠️ `dcc_ext_ctx_` IS NOT CARRIED YET. `dccExtContext()` is read by e524 alone (`:692-954`, for
-/// `getArch()` and `getProgPatch()`), and `opts_` by nothing in the file; both enter with e524.
+/// `getArch()`, `getProgPatch()` and the `memoryOpRequiresImmutAddrScalarCopy` it forwards to), and
+/// `opts_` by nothing in the file; both enter with e524.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RegisterTypeAssignment<const ADD_SCALAR_COPIES: bool> {
     /// The maps `clear()` resets at each unit.

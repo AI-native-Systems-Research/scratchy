@@ -129,7 +129,7 @@ fn run_on_unit<A: Arch>(unit: &mut ProgramUnit<A>) -> ! {
 /// # ⛔⛔ THE OFF-BY-ONE IS THE INDUCTION VARIABLE AND NO CALLER SHOULD REPEAT IT
 ///
 /// `getArgNumber()` counts the region's arguments and slot 0 is the `$iv`
-/// (`SentientOps.td:100-102`), so carried value `i` arrives as argument `i + 1` and is yielded at
+/// (`SentientOps.td:96-99`), so carried value `i` arrives as argument `i + 1` and is yielded at
 /// operand `i`. Pairing the two here is what stops a caller indexing the `sentient.yield` by the
 /// ARGUMENT number: that reads the NEIGHBOURING slot's yielded value, which skips a user that should
 /// have been collected and collects one that should have been skipped.
@@ -147,7 +147,7 @@ impl IterArg {
     ///
     /// ⭐ `None` WHERE EITHER SIDE HAS NO SUCH SLOT, which stands for the two handles the reference
     /// has already checked before it gets here — `for_op` and the `dyn_cast<YieldOp>` of its
-    /// terminator (e357, `:462-466`).
+    /// terminator (e357, `:461-464`).
     #[must_use]
     pub fn at(carried: &[sentient::Carried], body: &[Op], at: usize) -> Option<IterArg> {
         let Some(Op::Sentient(sentient::Op::Yield { results })) = body.last() else {
@@ -167,11 +167,13 @@ impl IterArg {
 ///
 /// ⛔ TRAP: THE SKIP IS THE YIELD-FEEDING ARITHMETIC, NOT THE `sentient.yield` ITSELF. A loop that
 /// yields its iter arg unchanged has the terminator among its users, and a terminator binds nothing —
-/// so that shape reaches the reference's `DT_CHECK(user_result)` (`:428`) rather than being skipped by
+/// so that shape reaches the reference's `DT_CHECK(user_result)` (`:427`) rather than being skipped by
 /// it. See [`result_corresponding_to_operand_num`].
 ///
 /// ⭐ ONE ENTRY PER **USE**, NOT PER USER: `%1 = scalar_add %arg1, %arg1` contributes `%1` twice,
 /// because `iter_arg.getUses()` yields two uses that the same `getResults()[0]` answers.
+/// ⚠️ IN PROGRAM ORDER, WHERE `getUses()` IS IN MLIR'S USE-LIST ORDER — inert, because the one
+/// consumer runs the two lists as a full cross product with an early `return true` (`:472-481`).
 #[must_use]
 pub fn collect_results_of_non_yield_feeding_users(iter_arg: IterArg, body: &[Op]) -> Vec<Val> {
     let mut results: Vec<Val> = Vec::new();
@@ -190,13 +192,13 @@ fn collect_into(iter_arg: IterArg, scope: &[Op], out: &mut Vec<Val>) {
             }
             match result_corresponding_to_operand_num(op, operand_num) {
                 Some(result) => out.push(result),
-                // `DT_CHECK(user_result);` (`:428`) — the reference aborts, and it is not this
+                // `DT_CHECK(user_result);` (`:427`) — the reference aborts, and it is not this
                 // function's decision to turn that into a skip: a dropped user is a liverange
                 // overlap e357 would then fail to see.
                 None => todo!(
                     "collectResultsOfNonYieldFeedingUsers: DT_CHECK(user_result) — no result of \
                      {op:?} corresponds to operand {operand_num} \
-                     (ReuseLoopIteratorArguments.cpp:428, Analyses/Utils.cpp:674)"
+                     (ReuseLoopIteratorArguments.cpp:427, Analyses/Utils.cpp:674)"
                 ),
             }
         }
@@ -208,7 +210,7 @@ fn collect_into(iter_arg: IterArg, scope: &[Op], out: &mut Vec<Val>) {
 
 /// `isa<sentient::AddOp, sentient::SubOp>(user) && yield_op.getOperand(..) == user->getResults()[0]`
 /// (`:418-421`) — the arithmetic that advances this slot, *"ignored as they would be removed if the
-/// iterator argument is replaced by another plus an offset"* (`:454-456`).
+/// iterator argument is replaced by another plus an offset"* (`:455-457`).
 fn feeds_the_yield(op: &Op, yielded: Val) -> bool {
     match op {
         Op::Sentient(
@@ -233,7 +235,7 @@ fn feeds_the_yield(op: &Op, yielded: Val) -> bool {
 /// present (`SentientOps.td:237-239`) — so on a MASKED mac the write pointer at operand 1 reads back
 /// the READ pointer's result and the read pointer at operand 2 indexes past a two-result op. This port
 /// maps by POINTER POSITION instead, which is the unmasked case's answer and the documented intent,
-/// *"the result value corresponding to the operand number"* (`Analyses/Utils.hpp:227-231`).
+/// *"the result value corresponding to the operand number"* (`Analyses/Utils.hpp:226-232`).
 fn result_corresponding_to_operand_num(op: &Op, operand_num: usize) -> Option<Val> {
     let Op::Sentient(inner) = op else {
         return None;
@@ -269,7 +271,7 @@ fn result_corresponding_to_operand_num(op: &Op, operand_num: usize) -> Option<Va
         }
         // The source end's three addresses answer `$src_res` and the destination's answer `$dst_res`
         // (`:685-692`); `$src`, `$dst` and `$multicast_info` answer neither. ⭐ THE POSITIONS ARE
-        // [`dialects::operands`]'S, which is the `.td`'s own order (`SentientOps.td:722-733`).
+        // [`dialects::operands`]'S, which is the `.td`'s own order (`SentientOps.td:722-730`).
         sentient::Op::LoadAndStore { results, .. } => match operand_num {
             2..=4 => Some(results.0),
             5..=7 => Some(results.1),
