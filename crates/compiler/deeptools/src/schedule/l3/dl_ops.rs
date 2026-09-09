@@ -3106,10 +3106,10 @@ mod tests_e041_e048 {
 /// non-broadcast dim's stick count, walked until the one corelet-split dim, accumulated corelet by
 /// corelet.
 ///
-/// ⛔⛔ THE CHECKED STRIDE IS NOT THE USED STRIDE. All four `DT_CHECK`s of the padded arm test
-/// `dsNode` — one of them worded *"Expect padding sizes in chunk data stage params"* — while the
-/// arithmetic multiplies `dsChunk.paddingSizes_.at(dim).stride_` and `dsChunk.coreletSplit_`; entry
-/// 219, the near-duplicate, checks `dsChunk`. Both stages are asked here, so neither reading is lost.
+/// ⛔⛔ THE CHECKED STRIDE IS NOT THE USED STRIDE. Both stage checks of the padded arm read `dsNode`
+/// (`:4886`, `:4890`), one of them worded *"Expect padding sizes in chunk data stage params"*, while
+/// the arithmetic multiplies `dsChunk.paddingSizes_.at(dim).stride_` and `dsChunk.coreletSplit_`
+/// (`:4892-4893`); entry 219, the near-duplicate, checks `dsChunk`. Both stages are asked here.
 /// ⛔ THE OPERANDS COME FROM CORELET `id - 1` WHILE THE OFFSET LANDS ON CORELET `id`.
 /// ⛔ The reference accumulates in `int` and returns `int64_t`, with `bytesPerStick` multiplied in
 /// FIRST; this checks in `u64` and answers [`None`] on overflow instead of wrapping.
@@ -3182,8 +3182,8 @@ pub fn calculate_corelet_offset_in_byte<A: Arch, N: DimStage + ?Sized, C: DimSta
 /// ⛔ CORELET 0 IS BOUND HERE, NOT BY THE CALLER: the reference OVERWRITES `coord.at(1)`, so a
 /// caller's corelet is discarded and only the core and the super-DSC folds behind it survive.
 /// ⛔ [`None`] IS EVERY REFUSAL AT ONCE — no `LX` in `memOrg_`, a null LX allocate node, a
-/// `numBuffers_` the field's comment does not name, an unplaced address, and any buffering but
-/// [`Buffering::None`] on a DS that is not HBM pinned, where the reference demands one buffer.
+/// `numBuffers_` the field's comment does not name, an unplaced address, and a buffering NEITHER arm
+/// admits: `{1, 2}` when HBM pinned (`:4940-4941`) and `{1}` alone when not (`:4947`).
 #[must_use]
 pub fn initial_start_address_and_offset<M: MemOrg + ?Sized>(
     mem: &M,
@@ -3197,6 +3197,9 @@ pub fn initial_start_address_and_offset<M: MemOrg + ?Sized>(
     let buffering = mem.lx_buffering()?;
     let start = mem.lx_start_address(&at)?;
     let buffer_offset = if mem.hbm_pinned() {
+        // `DT_CHECK_MSG(numBuffers_ == 1 || numBuffers_ == 2, "Expect no buffering or double
+        // buffering.")` — [`Buffering::Streaming`] is a third name entry 016 can mint.
+        matches!(buffering, Buffering::None | Buffering::Double).then_some(())?;
         mem.lx_buffer_offset(at.core, at.corelet)?
     } else {
         // "There is always only one buffer in this case, so the offset is zero."
@@ -3213,10 +3216,10 @@ pub fn initial_start_address_and_offset<M: MemOrg + ?Sized>(
 ///
 /// The L3 scheduler's own copy of [`v1::get_lds_or_const_name_of_alloc_node`].
 ///
-/// ⭐⭐ IT DELEGATES BECAUSE THE REFERENCE SAYS TO: *"This function is mostly copied from DDC. We may
-/// have to frequently synchronize with the one in DDC. And eventually we should try to combine"*
-/// (`L3DlOpsScheduler.cpp:5504-5507`). The two bodies are identical but for `currDsc` being a
-/// parameter here and a member there, so a second name resolver would be the drift that TODO fears.
+/// ⭐⭐ IT DELEGATES BECAUSE THE TWO BODIES ARE IDENTICAL — `Ddc::getLdsOrConstNameOfAllocNode`
+/// (`ddc/ddcv1.cpp:20-30`) differs only in `currDsc` being a member there and a parameter here.
+/// ⚠️ The *"mostly copied from DDC ... frequently synchronize"* TODO the file carries is NOT on this
+/// function: it sits on `allocAllMem` (`:5505`) and `fillLoopOffsetsAndAddresses` (`:5747`).
 #[must_use]
 pub fn get_lds_or_const_name_of_alloc_node(
     anode: &AllocateNode,
@@ -3637,7 +3640,7 @@ mod tests_e049_e056 {
     }
 
     /// e050 — a pinned DS takes its buffer offset from the node while an unpinned one is always at
-    /// zero, and double buffering off the pinned path is the check that refuses.
+    /// zero, and each arm refuses the buffering its own `numBuffers_` check excludes.
     #[test]
     fn initial_placement_reads_corelet_zero() {
         let coord = AddressCoord {
@@ -3670,6 +3673,18 @@ mod tests_e049_e056 {
             initial_start_address_and_offset(
                 &MemOrgStub {
                     buffering: Some(Buffering::Double),
+                    ..MemOrgStub::default()
+                },
+                &coord,
+            ),
+            None
+        );
+        // The pinned arm admits `{1, 2}` and no more, so streaming refuses there too.
+        assert_eq!(
+            initial_start_address_and_offset(
+                &MemOrgStub {
+                    pinned: true,
+                    buffering: Some(Buffering::Streaming),
                     ..MemOrgStub::default()
                 },
                 &coord,
@@ -3908,9 +3923,10 @@ pub fn get_new_data_stage_index<D: Default>(
 /// THE DSC'S PAGED DIMS — every INDEX-TENSOR allocation's layout dim that its own pages span, in
 /// layout order, each dim once, over `labeledDs_` in order.
 ///
-/// ⛔ BOTH `DT_CHECK`s ARE GONE BY CONSTRUCTION: an indirection is only ever reported by an allocate
-/// node that EXISTS, which is *"Expect a valid HBM allocate node."*, and [`crate::schedule::dsc2::
-/// LayoutDims`] is non-empty, which is *"Expect valid layoutDimOrder_."*.
+/// ⛔ *"Expect valid layoutDimOrder_."* IS GONE BY CONSTRUCTION — [`crate::schedule::dsc2::
+/// LayoutDims`] is non-empty. ⚠️ *"Expect a valid HBM allocate node."* (`:6715`) is WIDER THERE than
+/// here: it guards EVERY lds with an HBM entry, so one holding no node aborts the reference where
+/// this skips it. Same answer wherever the reference answers at all.
 #[must_use]
 pub fn get_paged_dimensions<M: MemOrg + ?Sized>(labeled_ds: &[&M]) -> Vec<PrimaryDim> {
     let mut dims: Vec<PrimaryDim> = Vec::new();
@@ -3938,7 +3954,9 @@ pub fn get_paged_dimensions<M: MemOrg + ?Sized>(labeled_ds: &[&M]) -> Vec<Primar
 /// ⛔ [`None`] IS *"Expect a valid allocate node."* — a DS that states `isPresent` while its HBM
 /// entry holds none; *"Expect HBM in memOrg_."* cannot be reached from a true `isHbmPinned()`.
 /// ⚠️ The reference hands back NON-const pointers out of a `const` DSC; a later write to one is that
-/// unit's own `memOrg_` read, so what travels out of here is the node's name.
+/// unit's own `memOrg_` read, so what travels out of here is the node's name. The sole caller
+/// `propagateCoordinateDSC` (`:7763`) uses them only as worklist and visited-set IDENTITIES, and
+/// entry 053 is what makes a name one: node names are distinct within a tree.
 #[must_use]
 pub fn get_hbm_allocations<M: MemOrg + ?Sized>(labeled_ds: &[&M]) -> Option<Vec<NodeName>> {
     labeled_ds
@@ -4049,7 +4067,7 @@ pub enum LoopDistribution {
 }
 
 /// ONE LOOP, THE DIM OF IT THAT MATCHED AND WHERE IT SITS — `LoopDistributionInfo`
-/// (`dsc/dsc2.h:1137`); a `VectorOfLoopAndDim` (`:1170`) is a [`Vec`] of these.
+/// (`dsc/dsc2.h:1137`); a `VectorOfLoopAndDim` (`:1172`) is a [`Vec`] of these.
 ///
 /// ⚠️ dsc2 VOCABULARY HOMED HERE because [`LoopNode`] is; moving both belongs to whichever batch
 /// first needs this in a second module.
@@ -4083,9 +4101,10 @@ pub enum AccessPad<'a> {
 /// `WindowDim` the sought dim's own padding windows.
 ///
 /// ⛔ `dimAndKind.dim_ == dimToFind` COMPARES A WHOLE `PrimaryDimAndKind` WITH A BARE DIM
-/// (`dsc/dims.h:85`), so the implicit constructor ALSO demands the sought kind be `Unpadded` — which
-/// the dsc2 twin `isLoopDimRelated` (`dsc/dsc2.cpp:6550`) does not. ⛔ AND `relatedDims` IS NEVER
-/// READ: the reference takes the set and consults it nowhere.
+/// (`dsc/dims.h:79-81`), so the implicit constructor ALSO demands the sought kind be `Unpadded` and
+/// DISCARDS the loop's own `kind_` — which the dsc2 twin `isLoopDimRelated` (`dsc/dsc2.cpp:6550`)
+/// does not; the only callsite passes a bare dim and says so (`:7405-7406`). ⛔ AND `relatedDims` IS
+/// NEVER READ: the reference takes the set and consults it nowhere.
 pub fn find_and_store_loop_with_dim<'a>(
     to_find: PrimaryDimAndKind,
     loop_node: &'a LoopNode,
@@ -4475,10 +4494,10 @@ impl GroupCorelet {
     }
 }
 
-/// *"Unknown corelet id."* MADE UNSPELLABLE — the callers walk `0..numCoreletsUsed_DSC2_`
-/// (`L3DlOpsScheduler.cpp:2781`, `:5828`), and `CORELETS_PER_CORE` is `2` on both generations
-/// (`src/arch.rs:275`, `:308`). An arch that grew a third corelet would fail HERE rather than take
-/// [`GroupCorelet::of`]'s second arm for it.
+/// *"Unknown corelet id."* MADE UNSPELLABLE — the one caller that varies the corelet walks
+/// `0..numCoreletsUsed_DSC2_` (`L3DlOpsScheduler.cpp:2780`) and the other passes a FIXED
+/// `constexpr int corelet1Id = 1` (`:5827`, `:5831`), while `CORELETS_PER_CORE` is `2` on both
+/// generations (`src/arch.rs:281`, `:315`). A third corelet would fail HERE, not take arm two.
 const _: () = {
     assert!(Corelet::checked(1).is_some());
     assert!(Corelet::checked(2).is_none());
@@ -4501,7 +4520,7 @@ impl CrossCoreReductionGroup {
     /// reachable: `coreIdToWkSlice_` iterates by core id (`dsc/superdsc.h:70`) while the reduce
     /// slice counts a different set of dims, so the two orders need not agree. `back()` — the core
     /// [`ReductionGroupCores::end_core_at_corelet`] hands a sync — would then be a truncated tail.
-    /// Growing only is the *"Use slice ids to order them"* the comment states (`:2755`).
+    /// Growing only is the *"Use slice ids to order them"* the comment states (`:2754`).
     pub fn add_core(&mut self, core: Core, slice: ReduceSlice) {
         let slot = slice.0 as usize;
         if self.core_ids.len() <= slot {
@@ -4512,7 +4531,7 @@ impl CrossCoreReductionGroup {
         }
     }
 
-    /// `getCores()` (`:32`) WITH `isEmpty()` DISCHARGED (`:52`) — the non-empty view both end
+    /// `getCores()` (`:33`) WITH `isEmpty()` DISCHARGED (`:52`) — the non-empty view both end
     /// queries need, or [`None`] for their `DT_CHECK(!coreIds.empty())`. A group is genuinely
     /// empty when no work slice lands in it: `getCrossCoreReductionGroupInfo` default-constructs
     /// `numGroups` of them and fills only the ones cores map to (`:2755-2767`).
@@ -4536,6 +4555,8 @@ impl ReductionGroupCores<'_> {
     ///
     /// ⛔ [`None`] IS THE `-1` HOLE AND NOT AN ABORT: [`CrossCoreReductionGroup::add_core`] fills
     /// only the slices work landed on, and the reference returns that `-1` as if it were a core.
+    /// ⚠️ DEAD IN THE REFERENCE: defined at `.h:34` and called from nowhere in the tree, unlike
+    /// [`Self::end_core_at_corelet`]. Ported because the corelet symmetry is the pair's contract.
     #[must_use]
     pub fn start_core_at_corelet(&self, corelet: GroupCorelet) -> Option<Core> {
         match corelet {
@@ -4573,7 +4594,7 @@ impl ReductionGroupCores<'_> {
 /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:113`).
 ///
 /// ⛔ NOT DDC'S [`StoredConstraint`](crate::schedule::ddc::metadata::StoredConstraint): the L3 copy
-/// has NO `loopDimKind_` and NO `cannotBeSymbolic_` (`ddc/ddc_metadata.h:35`, `:39`), so it cannot
+/// has NO `loopDimKind_` and NO `cannotBeSymbolic_` (`ddc/ddc_metadata.h:36`, `:39`), so it cannot
 /// carry a [`LoopMultiple`](crate::schedule::ddc::metadata::LoopMultiple) and the two are distinct
 /// types rather than one shared with two spellings.
 ///
