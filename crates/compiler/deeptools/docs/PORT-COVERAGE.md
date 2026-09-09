@@ -16,10 +16,10 @@ builds, since `dbo-opt` is the binary scratchy shells out to. Three files define
 |---|---|---|---|---|
 | A | `sbf-dsm-cl-split` corelet split | `dsm` (entry `runDsmClSplit`) | — | ⛔ not ported |
 | B | `sbf-ddc` L3 schedule + data-connect | `ddc` (`ddl` 4,956 · `transformations` 1,795 · `ddcv1.cpp`) | 20,869 | ⛔ 2 units only (bridge 1) |
-| C | **`sbf-dcg` L3 program generation → PCFG** | `dcg` (`dcg_fe` 41,921 · `dcg_be` 11,481 · `dcg_manager` 1,241) | **56,893** | ⛔ **never scoped** |
+| C | `sbf-dcg` L3 program generation → PCFG | `dcg` (`dcg_fe` 41,921 · `dcg_be` 11,481 · `dcg_manager` 1,241) | 56,893 | ✂️ **off our path** — see below |
 | D | `sbf-perf-ideal-cycles` | `perfdsc` | 13,445 | performance estimate, not correctness |
 | E | `dcc-prep-fill` / `dip-prep-fill` | `dsc-based-utils/dcc_prep` 447 · `dip_prep` 369 | 816 | ⛔ not ported |
-| F | `sbf-sdsc-to-dataflow-ir` — **three parts**, see below | | 15,024 | ◐ one of three |
+| F | `sbf-sdsc-to-dataflow-ir` — three parts, see below | | 15,024 | ✅ the one part that applies |
 | G | `dcc` D1–D28 → SentientIR | `Conversion/AgenToSentient` · `DataflowToSentient` · `VectorChainLowering` · `Transform/Dataflow` · `StandardToSentient` | ~16,000 | ✅ bridge 2, 384 units |
 | H | `dcc` D29–D75 in place | `Transform/Sentient` | 34,438 | 🔄 campaign 5 running |
 | I | `dcc` D76 → ProgIR | `Conversion/SentientToProgIR` | 8,380 | ✅ bridge 3, 130 units |
@@ -32,28 +32,38 @@ builds, since `dbo-opt` is the binary scratchy shells out to. Three files define
 `dsc-based-utils/SdscToDataflowIR/SdscToDataflowIR.cpp` is 48 lines and does exactly this:
 
 1. `DSC2ToDataflowIR` over `sdsc->dscs_` — the **DL (compute) DSCs**. 7,156 lines. ✅ **bridge 1, 110 units.**
-2. `PCFGToDFManager` over the **data DSCs** — 6,991 lines. ⛔ **not ported.**
-3. `ModuleStitcher` — stitches DL + data modules into one. 877 lines. ⛔ **not ported.**
+2. `PCFGToDFManager` over the **data DSCs** — 6,991 lines. ✂️ off our path.
+3. `ModuleStitcher` — stitches DL + data modules into one. 877 lines. ✂️ off our path: a cited
+   pass-through at `ModuleStitcher.cpp:54` when there are no data modules.
 
 Part 2 consumes the PCFG that stage C (`dcg`, 56,893 lines) produces from `SuperDsc::dataOpdscs_`.
 
-## Why C and F.2 may be structurally inapplicable — A CHECK, NOT A CONCLUSION
+## C and F.2 are OFF OUR PATH — decided, and here is the evidence
+
+**Decision (user, 2026-09-09): we do not need PCFG, because our input is a simple SuperDSC.**
+What the reference itself says, so the decision is checkable rather than taken on faith:
 
 `SuperDsc` (`dsc/superdsc.h:67,75,97,98`) carries `dscs_` (DL DSCs) and `dataOpdscs_` (data ops),
-with `pcfgMap_`/`pcfgPool_` for what DCG generates from the latter.
+with `pcfg_`/`pcfgPool_` for what DCG generates. Our emission writes `dscs_`, `numCoresUsed_` and
+`coreIdToDscSchedule` and nothing else: `subtile/src/superdsc_opspec.rs`'s `OpSpec` is a compute op,
+and `grep -rio "datadsc|data_dsc|pcfg|l3_prog"` over `crates/compiler` returns no relevant hit.
 
-**Our emission produces `dscs_` only.** `crates/compiler/subtile/src/superdsc_opspec.rs`'s `OpSpec`
-is a compute op (`op`, `iter`, `args`, epilogue); nothing in `crates/compiler` mentions a data op,
-a PCFG, or an L3 program (`grep -rio "datadsc|data_dsc|pcfg|l3_prog"` → 0 relevant hits).
-Transfers reach DataflowIR through the DL DSC's own lowering — `SNTransferLowering.cpp`, which is
-29 of bridge 1's 110 units.
+1. **`PCFGToDFManager::run` converts `sdsc_.pcfg_` and `sdsc_.dataOpdscs_`** (`PCFGToDFManager.cpp:34,43`).
+   Both are empty for us, so it emits no program-bearing module.
+2. **`ModuleStitcher::stitch` returns the DL module unchanged** when there are no data modules —
+   `if (dsc_module && data_modules.empty()) return dsc_module;` (`ModuleStitcher.cpp:54`). The
+   reference's own answer for the DL-only case is "the DL module *is* the DataflowIR".
+3. **The L3 transfers come out of the DL path, which we ported.** `runDcgForDlOpsStandalone`
+   (`dcg_manager.cpp:449-513`) exists to fill `pcfg_[core][L3LU]`/`[L3SU]` — the L3 load- and
+   store-unit programs — and its ACT3 codegen is skipped outright because `SchedulerStages.cpp:47`
+   sets `createSenProg = false`. Those same programs are what `SNTransferLowering.cpp` emits on the
+   DL path: bridge 1's port of it, `bridges/superdsc_to_dataflow_ir/transfer.rs`, carries 61 L3LU/L3SU
+   references, with 26 more in `dsc_lowering.rs` and 20 in `utils.rs`. **DCG's L3 PCFG generation is
+   the other pathway to the same programs, for data-op-only SuperDSCs — not an additional stage our
+   input has to pass through.**
 
-⛔ So the claim "DCG is not needed" rests on our SuperDSC never carrying data ops. That is true of
-what we emit today; it is NOT established that the DL path expresses every transfer the reference
-routes through DCG. **Do not treat C and F.2 as winnowed until an end-to-end run proves the DL path
-alone reaches a correct `init_binary`.** The prior hand-written L3 work on `deeptools-islands`
-(`bridges/1.rs` — burst derivation, L3 loop levels, coalescing) is evidence the L3 side *was* needed
-there; that tree emitted DataflowIR directly and never had a SuperDSC to carry data ops.
+So stage C (56,893), F.2 (6,991) and F.3 (877) — **64,761 lines — are off our path**, and stage F is
+bridge 1 alone.
 
 ## `dcc` directories no campaign covers
 
@@ -73,6 +83,8 @@ there; that tree emitted DataflowIR directly and never had a SuperDSC to carry d
 
 - **Ported: 657 units** over roughly **35,000 lines** of C++ (bridges 1–4).
 - **Running: 34,438** (`Transform/Sentient`, campaign 5).
-- **Unscoped on the per-program path: ~65,000**, of which **56,893 is DCG** — see the caveat above.
+- **Off our path, decided: 64,761** — DCG + PCFGToDataflowIR + ModuleStitcher, per the section above.
+- **Still unported and still needed: ~25,000** — `Ddc` 20,869 (bridge 1 took 2 units of `ddcv1.cpp`),
+  `DsmClSplit`, the fill passes 816, `ProgirOpt` 90, and `dcc`'s `Analysis` 1,991 + `Utils` 1,618.
 - `dcc` alone is 102,074 lines; the whole `deeptools-src` tree is far larger and most of it
   (`dsm` 236,994 · `dr5` 68,081 · `senulator` 52,031 · `dvs` 43,663) is off this path entirely.
