@@ -173,7 +173,8 @@
 //! | `e362_get_shuffle` | 362 | 4 | 61 | `AutoShuffler` | `ddc/transformations/automatic_shuffle/shuffle.cpp:1161` |
 //! | `e371_replace_assign` | 371 | 5 | 119 | `AutoShuffler` | `ddc/transformations/automatic_shuffle/shuffle.cpp:788` |
 
-use crate::arch::Sticks;
+use crate::arch::{Arch, Sticks};
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{PrimaryDim, StickDims};
 use crate::formats::DataFormat;
 use crate::schedule::ddc::fold::AllocId;
 use crate::schedule::ddc::metadata::OwnedAllocateNode;
@@ -502,6 +503,35 @@ const PACK27: [ShuffleIndex; 16] =
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PseudoReg(pub String);
 
+/// WHETHER `insert_packmerge` WIDENS THE INDEX TABLE — its `expand_indices` (`shuffle.h:190`).
+///
+/// ⛔ AN ENUM AND NOT THE REFERENCE'S DEFAULTED `bool`: `false` is spelled at exactly two callsites
+/// (`shuffle.cpp:631`, `:676`) among seven, and a transposed flag is a different instruction rather
+/// than a type error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexExpansion {
+    /// `expand_indices == true` — `expand_indices(indices, elem_bitwidth)` widens each lane selector
+    /// by the input format's element width before it becomes the instruction's `indices_`
+    /// (`ddc/ddc_transformation.cpp:1966-1971`).
+    ByElementWidth,
+    /// `expand_indices == false` — the table is the instruction's `indices_` as written, which is
+    /// what the two GCVT actions want.
+    AsWritten,
+}
+
+/// WHAT BOTH OF AN OP'S `codegen` CLOSURES CAPTURE, AS ONE VALUE (`shuffle.h:207-216`): the lane
+/// table, and whether `insert_packmerge` widens it.
+///
+/// ⛔ THE PSEUDOCODE CLOSURE CAPTURES ONLY `indices` (`shuffle.cpp:149`, `:170`) — so a change of
+/// [`IndexExpansion`] alone is invisible in the pseudocode and visible in the emitted instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Packmerge {
+    /// `indices`.
+    pub indices: Vec<ShuffleIndex>,
+    /// `expand_indices`, `insert_packmerge`'s last argument.
+    pub expansion: IndexExpansion,
+}
+
 /// ONE STICK COMPUTATION — which (partial) stick indices it reads, and which it writes
 /// (`shuffle.h:199`).
 ///
@@ -515,10 +545,11 @@ pub struct ComputationOp {
     pub output: StickIndex,
     /// Whether the op reads one stick more than once (`unary_op`, `shuffle.cpp:163`).
     pub reuses_sticks: bool,
-    /// `codegen_psuedocode`, the `std::function` (`shuffle.h:213`), AS DATA: both setters emit ONE
-    /// `packmerge` line from an index table and differ only in whether the second input register is
-    /// the first one again (`shuffle.cpp:149-154`, `:169-174`). Absent until e264/e265 set it.
-    pub packmerge_indices: Option<Vec<ShuffleIndex>>,
+    /// `codegen` AND `codegen_psuedocode`, the two `std::function`s (`shuffle.h:207-216`), AS DATA:
+    /// both setters emit ONE `packmerge` from an index table and differ only in whether the second
+    /// input is the first one again (`shuffle.cpp:140-155`, `:165-176`). Absent until e264/e265 set
+    /// it, which is the reference's empty `std::function`.
+    pub packmerge: Option<Packmerge>,
 }
 
 /// Replaces: e137_int_log2
@@ -616,6 +647,53 @@ pub fn packmerge_psuedostring(
 }
 
 impl ComputationOp {
+    /// Replaces: e264_bin_op
+    ///
+    /// THE TWO-STICK PACKMERGE: reads the LOW half of `dim` and then its HIGH half, and writes one
+    /// stick from `indices`.
+    ///
+    /// ⛔ INPUT ORDER IS PART OF THE OP — `insert_packmerge(input[0], input[1], ..)`
+    /// (`shuffle.cpp:145`) takes the low-half stick first, so transposing the two pushes emits a
+    /// different instruction rather than a compile error.
+    /// ⛔ THE OUTPUT INDEX IS EMPTY HERE, and `repeat_over_dims` (e140) is what fills it: the absent
+    /// set is computed from `inputs` alone, so `dim` is already accounted for on both sides.
+    #[must_use]
+    pub fn bin_op(dim: DimSymbol, indices: Vec<ShuffleIndex>, expansion: IndexExpansion) -> Self {
+        Self {
+            inputs: vec![
+                [(dim, Half::Low)].into_iter().collect(),
+                [(dim, Half::High)].into_iter().collect(),
+            ],
+            output: StickIndex::new(),
+            reuses_sticks: false,
+            packmerge: Some(Packmerge { indices, expansion }),
+        }
+    }
+
+    /// Replaces: e265_unary_op
+    ///
+    /// THE ONE-STICK PACKMERGE — needs A stick, no particular index (`shuffle.cpp:162`), and feeds
+    /// it to `insert_packmerge` as BOTH operands.
+    ///
+    /// ⛔ `reuses_sticks` IS THE WHOLE DIFFERENCE from a [`Self::bin_op`] of one input:
+    /// `check_single_inorder_accesses` (e269) reads it and refuses in-order reading outright, since
+    /// the same stick is read twice.
+    /// ⛔ AND IT TAKES THE DEFAULTED [`IndexExpansion::ByElementWidth`] (`shuffle.cpp:167`), which is
+    /// not a choice this constructor offers because the reference never spells the other one here.
+    #[must_use]
+    pub fn unary_op(indices: Vec<ShuffleIndex>) -> Self {
+        Self {
+            // "Need a stick, no particular index."
+            inputs: vec![StickIndex::new()],
+            output: StickIndex::new(),
+            reuses_sticks: true,
+            packmerge: Some(Packmerge {
+                indices,
+                expansion: IndexExpansion::ByElementWidth,
+            }),
+        }
+    }
+
     /// Replaces: e140_repeat_over_dims
     ///
     /// Appends this op once per assignment of the `dims` it does not already index — 2^N copies for
@@ -661,9 +739,9 @@ impl ComputationOp {
     /// `DT_CHECK`s ARE that choice, so neither is a stop here.
     #[must_use]
     pub fn codegen_psuedocode(&self, in_regs: &[PseudoReg], out_reg: &PseudoReg) -> Vec<String> {
-        match (&self.packmerge_indices, in_regs) {
-            (Some(indices), [first, rest @ ..]) => vec![packmerge_psuedostring(
-                indices,
+        match (&self.packmerge, in_regs) {
+            (Some(packmerge), [first, rest @ ..]) => vec![packmerge_psuedostring(
+                &packmerge.indices,
                 first,
                 rest.first().unwrap_or(first),
                 out_reg,
@@ -1356,6 +1434,53 @@ impl AutoShuffler {
         self.worklist.len()
     }
 
+    /// Replaces: e266_canonicalize_layout
+    ///
+    /// THIS LAYOUT AS THE GOAL RENUMBERS IT: every dimension the goal does not hold becomes the
+    /// dummy, which is what lets two paths to the same reachable state share one graph node.
+    ///
+    /// ⛔ THE SLICE KEEPS ITS POSITIONS AND THE STICK SET DOES NOT — a dropped slice dimension leaves
+    /// a dummy in its slot (`shuffle.cpp:702`) where a dropped stick dimension is simply absent, and
+    /// that is why `numSticks()` shrinks under canonicalization and the slice width never does.
+    /// ⛔ THE FORMAT IS THE LAYOUT'S OWN, NOT THE GOAL'S (`:694`): canonicalizing does not convert.
+    #[must_use]
+    pub fn canonicalize_layout(layout: &AbstractLayout, goal: &AbstractLayout) -> AbstractLayout {
+        let mut slice_dims = [DimSymbol::DUMMY; DIMS_PER_SLICE];
+        for (slot, dim) in slice_dims.iter_mut().zip(layout.slice_dims) {
+            if goal.contains(dim) {
+                *slot = dim;
+            }
+        }
+        AbstractLayout::new(
+            layout
+                .stick_dims
+                .iter()
+                .copied()
+                .filter(|&dim| goal.contains(dim))
+                .collect(),
+            slice_dims,
+            layout.format,
+        )
+    }
+
+    /// Replaces: e267_reset_graph
+    ///
+    /// DROPS THE SEARCH STATE so the shuffler can be reused: the layout memo, the worklist and its
+    /// tie-breaking counter.
+    ///
+    /// ⛔ THE NODE ARENA IS DELIBERATELY KEPT. The reference holds its nodes by `shared_ptr` and the
+    /// path `get_shuffle` already returned owns the ones on it, so a reset there invalidates NOTHING
+    /// a caller still holds; truncating the arena here would dangle every [`GraphNodeId`] handed out.
+    /// What makes the graph fresh is the empty memo — the next `get_node` manifests a new node for a
+    /// layout at infinite cost, exactly as the reference does. So [`Self::graph_len`] keeps counting
+    /// the abandoned nodes, and only a test can tell.
+    pub fn reset_graph(&mut self) {
+        self.layout_to_nodes.clear();
+        // "clear priority queue by assigning a new one"
+        self.worklist = BinaryHeap::new();
+        self.worklist_counter = WorklistSeq(0);
+    }
+
     /// Replaces: e157_get_node
     ///
     /// THE NODE FOR THIS LAYOUT, manifesting it on first sight and returning the existing one after
@@ -1388,6 +1513,113 @@ impl AutoShuffler {
         self.worklist_counter = WorklistSeq(seq.0 + 1);
         self.worklist
             .push(Reverse(WorklistEntry { cost, seq, node }));
+    }
+
+    /// Replaces: e270_inferLayouts
+    ///
+    /// THE INPUT AND OUTPUT LAYOUTS ONE SHUFFLE MOVES BETWEEN, minted from the two ends' stick dims
+    /// broken into subdimensions of two: each end's remaining subdims become its slice, and a subdim
+    /// the OTHER end cannot fit in its slice becomes a stick dimension of THIS one.
+    ///
+    /// ⛔ THE TOP `log2(SLICES_PER_STICK)` SUBDIMS CROSS SLICES AND MUST AGREE END TO END — [`None`]
+    /// is that `DT_CHECK` (`shuffle.cpp:1082`) together with the `.back()` it does on a stick that
+    /// has fewer subdims than that.
+    /// ⛔ THE PAD SYMBOLS ARE SHARED BY BOTH ENDS: `low_dim_symbol` restarts from `next_symbol` inside
+    /// the per-end loop (`:1121`), which is what makes an untouched low-precision dim the SAME
+    /// dimension in both layouts instead of two the search would have to shuffle together.
+    /// ⛔ AND IT IGNORES `layoutDimOrder_` BY DESIGN — the vendor's own warning (`shuffle.h:320-327`):
+    /// the producer need not follow it, so the stick order is assumed low-significance-first.
+    #[must_use]
+    pub fn infer_layouts<A: Arch>(
+        input: &SubdividedSticks,
+        output: &SubdividedSticks,
+    ) -> Option<(ConcreteLayout, ConcreteLayout)> {
+        /// `do_in == true`.
+        const IN: usize = 0;
+        /// `do_in == false`.
+        const OUT: usize = 1;
+
+        // We are given a layout with coarse-grain dimensions, already broken down into
+        // subdimensions of size 2 by [`SubdividedSticks`].
+        let mut subdims: [Vec<PrimaryDim>; 2] = [Vec::new(), Vec::new()];
+        let mut involved: BTreeSet<PrimaryDim> = BTreeSet::new();
+        for (side, end) in [(IN, input), (OUT, output)] {
+            for &(pdim, count) in &end.0 {
+                involved.insert(pdim);
+                subdims[side].extend(std::iter::repeat_n(pdim, count.0 as usize));
+            }
+        }
+
+        // We need to ignore dimensions that go across slices, and they need to be the same for both
+        // input and output. `int_log2(num_slices)` (e137) on the arch's own slice count.
+        for _ in 0..A::SLICES_PER_STICK.trailing_zeros() {
+            if subdims[IN].last()? != subdims[OUT].last()? {
+                return None;
+            }
+            subdims[IN].pop();
+            subdims[OUT].pop();
+        }
+
+        // `in_dim_counts` / `out_dim_counts` AS A QUESTION rather than a maintained map: the
+        // reference's counter is the number of that dim's subdims still standing on that side, and
+        // every read of it (`:1092-1093`, `:1113`) happens after the pops above.
+        let remaining = |side: usize, pdim: PrimaryDim| {
+            subdims[side].iter().filter(|&&dim| dim == pdim).count()
+        };
+
+        // Prepare IDs for each subdim that we can match across in/out.
+        let mut dim_mapping: BTreeMap<PrimaryDim, Vec<DimSymbol>> = BTreeMap::new();
+        let mut next_symbol = DimSymbol::DEFAULT;
+        for &pdim in &involved {
+            let width = remaining(IN, pdim).max(remaining(OUT, pdim));
+            let symbols = dim_mapping.entry(pdim).or_default();
+            for _ in 0..width {
+                symbols.push(next_symbol);
+                next_symbol = next_symbol.next();
+            }
+        }
+
+        // Iterate over subdims and add their ids to the layout. Ids not consumed in the slice must be
+        // located in the stick.
+        let mut slice_dims: [Vec<DimSymbol>; 2] = [Vec::new(), Vec::new()];
+        let mut stick_dims: [Vec<DimSymbol>; 2] = [Vec::new(), Vec::new()];
+        for (side, other) in [(IN, OUT), (OUT, IN)] {
+            let mut symbol_index: BTreeMap<PrimaryDim, usize> = BTreeMap::new();
+            for &pdim in &subdims[side] {
+                let idx = symbol_index.entry(pdim).or_insert(0);
+                let symbol = *dim_mapping.get(&pdim)?.get(*idx)?;
+                slice_dims[side].push(symbol);
+                if *idx >= remaining(other, pdim) {
+                    // Not accounted for in other slice, so must come from other stick (in order).
+                    stick_dims[other].push(symbol);
+                }
+                *idx += 1;
+            }
+        }
+
+        // Fill in symbols for the untouched low-precision dimensions.
+        for side in [IN, OUT] {
+            let mut low_dim_symbol = next_symbol;
+            let mut insert_loc = 0;
+            while slice_dims[side].len() < DIMS_PER_SLICE {
+                slice_dims[side].insert(insert_loc, low_dim_symbol);
+                low_dim_symbol = low_dim_symbol.next();
+                insert_loc += 1;
+            }
+        }
+
+        let [in_slice, out_slice] = slice_dims;
+        let [in_stick, out_stick] = stick_dims;
+        Some((
+            ConcreteLayout {
+                stick_dims: in_stick,
+                slice_dims: in_slice,
+            },
+            ConcreteLayout {
+                stick_dims: out_stick,
+                slice_dims: out_slice,
+            },
+        ))
     }
 }
 
@@ -1445,6 +1677,73 @@ pub fn make_stick_number_key(stick_ordering: &[DimSymbol]) -> StickNumberKey {
     StickNumberKey { masks }
 }
 
+/// Replaces: e268_sort_by_stick_key
+///
+/// `sort_by_stick_key<true>` — ORDERS THE COMPUTATIONS BY THE STICK THEIR FIRST INPUT READS, which
+/// is how the walk finds out whether the reads can come out in order.
+///
+/// ⛔ STABLE WHERE `std::sort` IS NOT (`shuffle.cpp:748`): ops with equal keys keep the order
+/// `repeat_over_dims` (e140) appended them in, rather than an unspecified one. A stronger guarantee
+/// than the reference's, not a different sort.
+/// ⛔ AN OP WITH NO INPUTS SORTS FIRST. That is the reference's `DT_CHECK(a.inputs.size() > 0)`
+/// (`:751`), and every op reaching here was built by `bin_op`/`unary_op` and has one.
+pub fn sort_ops_by_input_stick(key: &StickNumberKey, ops: &mut [ComputationOp]) {
+    ops.sort_by_key(|op| op.inputs.first().map(|input| key.key(input)));
+}
+
+/// Replaces: e268_sort_by_stick_key
+///
+/// `sort_by_stick_key<false>` — ORDERS THE COMPUTATIONS BY THE STICK THEY WRITE. Same stability note
+/// as [`sort_ops_by_input_stick`], and no arity precondition: every op has exactly one output.
+pub fn sort_ops_by_output_stick(key: &StickNumberKey, ops: &mut [ComputationOp]) {
+    ops.sort_by_key(|op| key.key(&op.output));
+}
+
+/// Replaces: e269_check_single_inorder_accesses
+///
+/// `check_single_inorder_accesses<true>` — WHETHER THE INPUT STICKS ARE READ 0, 1, 2, .. ONCE EACH,
+/// so the sticks can be streamed instead of loaded into registers first. Unlike
+/// [`sort_ops_by_input_stick`] this disallows gaps and repeats.
+///
+/// ⛔ `reuses_sticks` FAILS IT OUTRIGHT (`shuffle.cpp:775`) — a `unary_op` reads its stick twice, so
+/// no ordering of the ops can make the reads single and in order.
+/// ⛔ IT WALKS EVERY OP EVEN ONCE THE ANSWER IS KNOWN, as the reference does: `flag` is latched and
+/// the counter keeps advancing, which is only observable if this ever gains a side effect.
+#[must_use]
+pub fn inputs_read_single_inorder(key: &StickNumberKey, ops: &[ComputationOp]) -> bool {
+    let mut next_access = StickNumber(0);
+    let mut flag = true;
+    for op in ops {
+        if op.reuses_sticks {
+            flag = false;
+        }
+        for access in &op.inputs {
+            if key.key(access) != next_access {
+                flag = false;
+            }
+            next_access = StickNumber(next_access.0 + 1);
+        }
+    }
+    flag
+}
+
+/// Replaces: e269_check_single_inorder_accesses
+///
+/// `check_single_inorder_accesses<false>` — WHETHER THE OUTPUT STICKS ARE WRITTEN 0, 1, 2, .. ONCE
+/// EACH. One access per op, and `reuses_sticks` says nothing about writing, so it is not consulted.
+#[must_use]
+pub fn outputs_written_single_inorder(key: &StickNumberKey, ops: &[ComputationOp]) -> bool {
+    let mut next_access = StickNumber(0);
+    let mut flag = true;
+    for op in ops {
+        if key.key(&op.output) != next_access {
+            flag = false;
+        }
+        next_access = StickNumber(next_access.0 + 1);
+    }
+    flag
+}
+
 /// HOW MANY TIMES ONE STICK DIMENSION IS REPLICATED — `PrimaryDsInfo::stickRepl_`'s element, where
 /// 1 means not replicated at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1459,6 +1758,44 @@ pub struct StickRepl(pub i32);
 #[must_use]
 pub fn all_one(stick_repl: &[StickRepl]) -> bool {
     stick_repl.iter().all(|repl| repl.0 == 1)
+}
+
+/// HOW MANY 2-ELEMENT SUBDIMENSIONS ONE STICK DIM BREAKS INTO — `int_log2(stickSize_[j])`
+/// (`shuffle.cpp:1071`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Subdims(pub u32);
+
+/// WHAT `inferLayouts` (e270) READS OF ONE END'S `PrimaryDsInfo` (`dsc/dscdefn.h:474`): its stick dim
+/// order with each dim's size ALREADY COUNTED IN SUBDIMENSIONS OF TWO.
+///
+/// ⛔ BOTH OF THE REFERENCE'S `DT_CHECK`s ARE THE CONSTRUCTOR — `all_one(stickRepl_)`
+/// (`shuffle.cpp:1043-1045`) and `stickSize_[j] == (1 << num_subdims)` (`:1072`) — so
+/// [`AutoShuffler::infer_layouts`] has no arm that can refuse a stick it is handed, and a caller that
+/// cannot state one learns it at the point the fact is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubdividedSticks(Vec<(PrimaryDim, Subdims)>);
+
+impl SubdividedSticks {
+    /// One end's `stickDimOrder_` zipped with `stickSize_`, plus its `stickRepl_`. [`None`] for a
+    /// replicated stick, or for an extent that is not a power of two.
+    ///
+    /// ⭐ THE POWER-OF-TWO TEST *IS* `int_log2` (e137) FOR EVERY VALUE THAT PASSES IT, so there is no
+    /// second definition of the log here — and no `double`-to-`int` narrowing to reproduce, since the
+    /// reference's own `DT_CHECK` is what rules out every extent where the two would differ.
+    #[must_use]
+    pub fn new(dims: &StickDims, stick_repl: &[StickRepl]) -> Option<Self> {
+        if !all_one(stick_repl) {
+            return None;
+        }
+        let mut subdivided = Vec::with_capacity(dims.0.len());
+        for &(pdim, extent) in &dims.0 {
+            if !extent.0.is_power_of_two() {
+                return None;
+            }
+            subdivided.push((pdim, Subdims(extent.0.trailing_zeros())));
+        }
+        Some(Self(subdivided))
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -1693,51 +2030,6 @@ impl DataEdge {
     }
 }
 
-// crustify:todo: e264_bin_op
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:137  (19 body lines, level 1)
-//   original  : ComputationOp bin_op(DimSymbol dim, const std::vector<int>& indices, bool expand_indices = true)
-//   extract   : crustify-ddc/cpp/ddc.cpp:7856-7876
-//   calls     : e139_packmerge_psuedostring
-
-// crustify:todo: e265_unary_op
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:160  (17 body lines, level 1)
-//   original  : ComputationOp unary_op(const std::vector<int>& indices)
-//   extract   : crustify-ddc/cpp/ddc.cpp:7885-7902
-//   calls     : e139_packmerge_psuedostring
-
-// crustify:todo: e266_canonicalize_layout
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:690  (18 body lines, level 1)
-//   class     : AutoShuffler
-//   original  : AbstractLayout AutoShuffler::canonicalize_layout(const AbstractLayout& layout, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:7912-7931
-//   calls     : e156_contains
-
-// crustify:todo: e267_reset_graph
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:710  (6 body lines, level 1)
-//   class     : AutoShuffler
-//   original  : void AutoShuffler::reset_graph()
-//   extract   : crustify-ddc/cpp/ddc.cpp:7941-7947
-//   calls     : e104_clear
-
-// crustify:todo: e268_sort_by_stick_key
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:746  (15 body lines, level 1)
-//   original  : template <bool sort_inputs> void sort_by_stick_key(const std::function<uint32_t(const StickIndex&)> key, std::vector<ComputationOp>& ops)
-//   extract   : crustify-ddc/cpp/ddc.cpp:7956-7973
-//   calls     : e163_constexpr
-
-// crustify:todo: e269_check_single_inorder_accesses
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:767  (17 body lines, level 1)
-//   original  : template <bool check_inputs> bool check_single_inorder_accesses( const std::function<uint32_t(const StickIndex&)> key, const std::vector<ComputationOp>& ops)
-//   extract   : crustify-ddc/cpp/ddc.cpp:7982-8002
-//   calls     : e163_constexpr
-
-// crustify:todo: e270_inferLayouts
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:1047  (90 body lines, level 1)
-//   class     : AutoShuffler
-//   original  : std::pair<ConcreteLayout, ConcreteLayout> AutoShuffler::inferLayouts( const PrimaryDsInfo& in, const PrimaryDsInfo& out)
-//   extract   : crustify-ddc/cpp/ddc.cpp:8012-8103
-//   calls     : e137_int_log2, e159_all_one
-
 // crustify:todo: e310_add_valid_actions
 //   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:226  (11 body lines, level 2)
 //   class     : MergeAction
@@ -1928,7 +2220,7 @@ mod tests_e137_e144 {
             inputs: vec![[(A, Half::Low)].into_iter().collect::<StickIndex>()],
             output: StickIndex::new(),
             reuses_sticks: false,
-            packmerge_indices: None,
+            packmerge: None,
         };
         let mut appended = Vec::new();
         op.repeat_over_dims(&[A, B], &mut appended);
@@ -1946,7 +2238,7 @@ mod tests_e137_e144 {
             inputs: vec![[(A, Half::Low)].into_iter().collect::<StickIndex>()],
             output: [(B, Half::High)].into_iter().collect::<StickIndex>(),
             reuses_sticks: false,
-            packmerge_indices: None,
+            packmerge: None,
         };
         let mut appended = Vec::new();
         with_output.repeat_over_dims(&[B], &mut appended);
@@ -2439,8 +2731,8 @@ mod tests_e153_e160 {
 mod tests_e161_e164 {
     use super::{
         AbstractLayout, CodegenGeneric, ComputationOp, ConcreteLayout, DIMS_PER_SLICE, DataEdge,
-        DimSymbol, InsertPoint, ShuffleCodegen, ShuffleIndex, StickIds, StickIndex, StickNumber,
-        narrow_to_usize,
+        DimSymbol, IndexExpansion, InsertPoint, Packmerge, ShuffleCodegen, ShuffleIndex, StickIds,
+        StickIndex, StickNumber, narrow_to_usize,
     };
     use crate::formats::DataFormat;
     use crate::generated::ComputeType;
@@ -2476,7 +2768,10 @@ mod tests_e161_e164 {
                 inputs: Vec::new(),
                 output: StickIndex::new(),
                 reuses_sticks: false,
-                packmerge_indices: Some(vec![ShuffleIndex(0), ShuffleIndex(16)]),
+                packmerge: Some(Packmerge {
+                    indices: vec![ShuffleIndex(0), ShuffleIndex(16)],
+                    expansion: IndexExpansion::ByElementWidth,
+                }),
             };
             for node in shuffle {
                 let mut edges = codegen.edges_for_node(node);
@@ -2582,5 +2877,304 @@ mod tests_e161_e164 {
         already_there.insert_before(&mut point);
         assert_eq!(point.preceding().count(), 1);
         assert_eq!(point.node().name, NodeName("packmerge".to_owned()));
+    }
+}
+
+// ⭐ TESTS FOR ENTRIES 264-270. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e264_e270 {
+    use super::{
+        AbstractLayout, AutoShuffler, ComputationOp, ConcreteLayout, DIMS_PER_SLICE, DimSymbol,
+        Half, IndexExpansion, Packmerge, PseudoReg, ShuffleCost, ShuffleIndex, StickDims, StickIndex,
+        StickNumber, StickRepl, SubdividedSticks, Subdims, WorklistSeq, inputs_read_single_inorder,
+        make_stick_number_key, outputs_written_single_inorder, sort_ops_by_input_stick,
+        sort_ops_by_output_stick,
+    };
+    use crate::arch::{Dd2, Elements, Sticks};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+    use crate::formats::DataFormat;
+    use std::collections::BTreeSet;
+
+    /// Symbols 1..8 — `getDefaultSymbol()` and its successors, which is the run `inferLayouts` mints.
+    const A: DimSymbol = DimSymbol::DEFAULT;
+    const B: DimSymbol = A.next();
+    const C: DimSymbol = B.next();
+    const D: DimSymbol = C.next();
+    const E: DimSymbol = D.next();
+    const F: DimSymbol = E.next();
+    const G: DimSymbol = F.next();
+    const H: DimSymbol = G.next();
+    const DUMMY: DimSymbol = DimSymbol::DUMMY;
+
+    /// A (partial) stick index over the dims it names.
+    fn index<const N: usize>(halves: [(DimSymbol, Half); N]) -> StickIndex {
+        halves.into_iter().collect()
+    }
+
+    /// One computation reading one stick and writing one, which is what both e269 checks walk.
+    fn one_in_one_out(input: StickIndex, output: StickIndex, reuses_sticks: bool) -> ComputationOp {
+        ComputationOp {
+            inputs: vec![input],
+            output,
+            reuses_sticks,
+            packmerge: None,
+        }
+    }
+
+    /// One end of a shuffle, stated as `inferLayouts` needs it.
+    fn sticks(dims: &[(PrimaryDim, u64)]) -> SubdividedSticks {
+        let stick_dims = StickDims(
+            dims.iter()
+                .map(|&(pdim, extent)| (pdim, Elements(extent)))
+                .collect(),
+        );
+        let repl = vec![StickRepl(1); dims.len()];
+        SubdividedSticks::new(&stick_dims, &repl).expect("a power-of-two, unreplicated stick")
+    }
+
+    /// e264: the low half first and the high half second, the table carried with its expansion, and
+    /// the two input registers used in that order.
+    #[test]
+    fn bin_op_reads_the_low_half_then_the_high_half_of_its_dim() {
+        let op = ComputationOp::bin_op(
+            A,
+            vec![ShuffleIndex(0), ShuffleIndex(16)],
+            IndexExpansion::AsWritten,
+        );
+
+        assert_eq!(op.inputs, vec![index([(A, Half::Low)]), index([(A, Half::High)])]);
+        assert_eq!(op.output, StickIndex::new(), "e140 is what fills the output");
+        assert!(!op.reuses_sticks);
+        assert_eq!(
+            op.packmerge,
+            Some(Packmerge {
+                indices: vec![ShuffleIndex(0), ShuffleIndex(16)],
+                expansion: IndexExpansion::AsWritten,
+            })
+        );
+        assert_eq!(
+            op.codegen_psuedocode(
+                &[PseudoReg("r0".to_owned()), PseudoReg("r1".to_owned())],
+                &PseudoReg("r2".to_owned())
+            ),
+            vec!["r2 = packmerge r0 r1 [ 0 16 ]".to_owned()]
+        );
+    }
+
+    /// e265: a stick with no particular index, marked as reused, and fed to BOTH operands.
+    #[test]
+    fn unary_op_takes_any_one_stick_and_feeds_it_to_both_operands() {
+        let op = ComputationOp::unary_op(vec![ShuffleIndex(12), ShuffleIndex(13)]);
+
+        assert_eq!(op.inputs, vec![StickIndex::new()]);
+        assert!(op.reuses_sticks, "the same stick is read twice");
+        assert_eq!(
+            op.packmerge.as_ref().map(|packmerge| packmerge.expansion),
+            Some(IndexExpansion::ByElementWidth),
+            "the reference defaults it here"
+        );
+        assert_eq!(
+            op.codegen_psuedocode(&[PseudoReg("r0".to_owned())], &PseudoReg("r1".to_owned())),
+            vec!["r1 = packmerge r0 r0 [ 12 13 ]".to_owned()]
+        );
+    }
+
+    /// e266: a dropped slice dim leaves a dummy in its slot, a dropped stick dim is simply gone, and
+    /// the format is the layout's own.
+    #[test]
+    fn canonicalize_layout_dummies_the_dims_the_goal_dropped_and_keeps_the_format() {
+        let layout = AbstractLayout::new(
+            [A, B].into_iter().collect(),
+            [C, D, DUMMY, DUMMY, DUMMY, DUMMY],
+            DataFormat::Senint8,
+        );
+        let goal = AbstractLayout::new(
+            [A].into_iter().collect(),
+            [C, DUMMY, DUMMY, DUMMY, DUMMY, DUMMY],
+            DataFormat::Sen169Fp16,
+        );
+
+        let canonical = AutoShuffler::canonicalize_layout(&layout, &goal);
+
+        assert_eq!(canonical.stick_dims, [A].into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(canonical.slice_dims, [C, DUMMY, DUMMY, DUMMY, DUMMY, DUMMY]);
+        assert_eq!(canonical.format, DataFormat::Senint8, "not the goal's format");
+        assert_eq!(canonical.num_sticks(), Sticks(2), "B is gone; the slice never shrinks");
+    }
+
+    /// e267: the memo, the worklist and the tie-break counter go; the arena stays, so a node handed
+    /// out before the reset is still readable and the layout re-manifests fresh.
+    #[test]
+    fn reset_graph_empties_the_memo_and_the_worklist_and_keeps_the_arena() {
+        let mut shuffler = AutoShuffler::new();
+        let layout = AbstractLayout::new(
+            BTreeSet::new(),
+            [DUMMY; DIMS_PER_SLICE],
+            DataFormat::Senint8,
+        );
+        let node = shuffler.get_node(&layout);
+        shuffler.node_mut(node).cost_origin_to_here = ShuffleCost(2.0);
+        shuffler.update_worklist(node);
+        assert_eq!(shuffler.worklist_len(), 1);
+
+        shuffler.reset_graph();
+
+        assert_eq!(shuffler.worklist_len(), 0);
+        let again = shuffler.get_node(&layout);
+        assert_ne!(again, node, "the memo was emptied, so the layout re-manifests");
+        assert_eq!(
+            shuffler.node(again).cost_origin_to_here,
+            ShuffleCost(f64::INFINITY)
+        );
+        assert_eq!(
+            shuffler.node(node).cost_origin_to_here,
+            ShuffleCost(2.0),
+            "the abandoned node still answers, which is what keeps a returned path valid"
+        );
+        shuffler.update_worklist(again);
+        assert_eq!(
+            shuffler.pop_worklist().map(|entry| entry.seq),
+            Some(WorklistSeq(0)),
+            "the tie-break counter restarted"
+        );
+    }
+
+    /// e268: both instantiations — by the stick the first input reads, and by the stick the op writes.
+    #[test]
+    fn sort_by_stick_key_orders_by_first_input_or_by_output() {
+        let key = make_stick_number_key(&[A, B]);
+        let unsorted = || {
+            vec![
+                one_in_one_out(index([(A, Half::High), (B, Half::High)]), index([]), false),
+                one_in_one_out(
+                    index([(A, Half::Low), (B, Half::High)]),
+                    index([(A, Half::High)]),
+                    false,
+                ),
+                one_in_one_out(
+                    index([(A, Half::High), (B, Half::Low)]),
+                    index([(B, Half::High)]),
+                    false,
+                ),
+            ]
+        };
+
+        let mut by_input = unsorted();
+        sort_ops_by_input_stick(&key, &mut by_input);
+        assert_eq!(
+            by_input
+                .iter()
+                .map(|op| key.key(&op.inputs[0]))
+                .collect::<Vec<_>>(),
+            vec![StickNumber(1), StickNumber(2), StickNumber(3)]
+        );
+
+        let mut by_output = unsorted();
+        sort_ops_by_output_stick(&key, &mut by_output);
+        assert_eq!(
+            by_output
+                .iter()
+                .map(|op| key.key(&op.output))
+                .collect::<Vec<_>>(),
+            vec![StickNumber(0), StickNumber(1), StickNumber(2)]
+        );
+    }
+
+    /// e269: both instantiations — 0, 1, 2 once each, no gap, no repeat, and no reused stick on the
+    /// reading side only.
+    #[test]
+    fn single_inorder_accesses_needs_no_gap_no_repeat_and_no_reuse() {
+        let key = make_stick_number_key(&[A, B]);
+        let ops = |reuses_sticks| {
+            vec![
+                one_in_one_out(index([]), index([]), reuses_sticks),
+                one_in_one_out(
+                    index([(A, Half::High)]),
+                    index([(A, Half::High)]),
+                    false,
+                ),
+                one_in_one_out(index([(B, Half::High)]), index([(B, Half::High)]), false),
+            ]
+        };
+
+        assert!(inputs_read_single_inorder(&key, &ops(false)));
+        assert!(outputs_written_single_inorder(&key, &ops(false)));
+        assert!(
+            !inputs_read_single_inorder(&key, &ops(true)),
+            "a reused stick is read twice"
+        );
+        assert!(
+            outputs_written_single_inorder(&key, &ops(true)),
+            "and says nothing about writing"
+        );
+
+        let mut gap = ops(false);
+        gap.remove(1);
+        assert!(!inputs_read_single_inorder(&key, &gap), "stick 1 is skipped");
+        assert!(!outputs_written_single_inorder(&key, &gap));
+
+        let repeat = vec![
+            one_in_one_out(index([]), index([]), false),
+            one_in_one_out(index([]), index([]), false),
+        ];
+        assert!(!inputs_read_single_inorder(&key, &repeat));
+        assert!(!outputs_written_single_inorder(&key, &repeat));
+
+        let two_inputs = vec![ComputationOp {
+            inputs: vec![index([]), index([(A, Half::High)])],
+            output: index([]),
+            reuses_sticks: false,
+            packmerge: None,
+        }];
+        assert!(
+            inputs_read_single_inorder(&key, &two_inputs),
+            "the counter advances per ACCESS, not per op"
+        );
+    }
+
+    /// e270: a stick of 32 `Out` elements against one of 4 `X` by 8 `Out`. Three subdims cross the
+    /// slices and match, `Out`'s remaining two become the input's slice and the output's sticks, `X`'s
+    /// two the reverse, and the four low-precision slots are padded with symbols BOTH ends share.
+    #[test]
+    fn infer_layouts_moves_the_subdims_the_other_slice_cannot_hold_into_the_sticks() {
+        let input = sticks(&[(PrimaryDim::Out, 32)]);
+        let output = sticks(&[(PrimaryDim::X, 4), (PrimaryDim::Out, 8)]);
+
+        let (layout_in, layout_out) =
+            AutoShuffler::infer_layouts::<Dd2>(&input, &output).expect("ends that agree");
+
+        assert_eq!(
+            layout_in,
+            ConcreteLayout {
+                stick_dims: vec![C, D],
+                slice_dims: vec![E, F, G, H, A, B],
+            }
+        );
+        assert_eq!(
+            layout_out,
+            ConcreteLayout {
+                stick_dims: vec![A, B],
+                slice_dims: vec![E, F, G, H, C, D],
+            }
+        );
+
+        // The cross-slice subdims must agree end to end, and there must be enough of them.
+        let all_x = sticks(&[(PrimaryDim::X, 32)]);
+        assert!(AutoShuffler::infer_layouts::<Dd2>(&input, &all_x).is_none());
+        let thin = sticks(&[(PrimaryDim::Out, 4)]);
+        assert!(AutoShuffler::infer_layouts::<Dd2>(&thin, &thin).is_none());
+
+        // Both `DT_CHECK`s are the constructor.
+        let one_dim = StickDims(vec![(PrimaryDim::Out, Elements(32))]);
+        assert_eq!(
+            SubdividedSticks::new(&one_dim, &[StickRepl(1)]),
+            Some(SubdividedSticks(vec![(PrimaryDim::Out, Subdims(5))]))
+        );
+        assert!(SubdividedSticks::new(&one_dim, &[StickRepl(2)]).is_none(), "replicated");
+        assert!(
+            SubdividedSticks::new(&StickDims(vec![(PrimaryDim::Out, Elements(12))]), &[StickRepl(1)])
+                .is_none(),
+            "not a power of two"
+        );
     }
 }
