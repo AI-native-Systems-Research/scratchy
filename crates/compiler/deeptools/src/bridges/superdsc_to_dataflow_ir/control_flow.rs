@@ -1260,10 +1260,22 @@ pub enum CondPlace<'n> {
     /// `hasCoreClCond() && uniformization_enabled_` — one `uniform.uniformize_regions` region per
     /// branch that has any unit at all.
     UniformCoreCl {
-        /// `getThenCoreCl(comp_)`'s units, as `unit_to_value_map_` resolves them (`:5425-5434`).
-        then_units: &'n [Val],
+        /// `getThenCoreCl(comp_)`'s units, as `unit_to_value_map_` resolves them (`:5425-5434`),
+        /// paired with the `block.addArgument(builder.getIndexType(), ..)` the region is entered
+        /// under (`:5474`).
+        ///
+        /// ⛔⛔ THE ARGUMENT IS THE CALLER'S, AND THAT IS ENTRY 106'S JOIN. The reference creates it
+        /// here and a LATER walk hands it to the leaves through `setUniformRegionArg`
+        /// (`DSC2ToDataflowIR.cpp:154`); this port runs the statement walk FIRST, so those leaves
+        /// already hold it as an operand and minting a second one here would leave every one of them
+        /// naming a value no region declares.
+        ///
+        /// ⛔ [`None`] IS A BRANCH WITH NO UNIT, WHICH IS A BRANCH WITH NO REGION (`:5477-5479`) — an
+        /// empty unit list standing beside an argument would be that same absence said twice, and the
+        /// child-index shift below reads the answer off this.
+        then_: Option<(Val, &'n [Val])>,
         /// `getElseCoreCl(comp_)`'s, read only where the node has two branches.
-        else_units: &'n [Val],
+        else_: Option<(Val, &'n [Val])>,
     },
 }
 
@@ -1682,27 +1694,24 @@ fn construct_condition(vals: &mut Values, cond: &Cond<'_>) -> Option<Lowered> {
             })
         }
         CondPlace::CoreCl => construct_loops_recursive(vals, core::slice::from_ref(first), None),
-        CondPlace::UniformCoreCl {
-            then_units,
-            else_units,
-        } => {
+        CondPlace::UniformCoreCl { then_, else_ } => {
             let mut hoisted = Vec::new();
             let mut results = Vec::new();
             let mut regions = Vec::new();
-            // `if (max_num_regions == 2)` — a single-child node never reads the else units.
-            let else_units: &[Val] = if cond.children.len() == 2 {
-                else_units
+            // `if (max_num_regions == 2)` — a single-child node never reads the else branch.
+            let else_: Option<(Val, &[Val])> = if cond.children.len() == 2 {
+                *else_
             } else {
-                &[]
+                None
             };
             // `int child_index = i; if (!has_then_region && has_else_region) child_index = i + 1;`
             // — a branch with no unit of its own gets NO REGION, and the child index shifts up by one
             // where it is the `then` branch that has none (`:5477-5479`).
-            let shift = usize::from(then_units.is_empty());
-            for units in [*then_units, else_units] {
-                if units.is_empty() {
+            let shift = usize::from(then_.is_none());
+            for branch in [*then_, else_] {
+                let Some((arg, units)) = branch else {
                     continue;
-                }
+                };
                 let child = cond.children.get(regions.len() + shift)?;
                 let mut built =
                     construct_loops_recursive(vals, core::slice::from_ref(child), None)?;
@@ -1713,8 +1722,8 @@ fn construct_condition(vals: &mut Values, cond: &Cond<'_>) -> Option<Lowered> {
                     operands: Vec::new(),
                 }));
                 regions.push(uniform::LocalRegion {
-                    // `block.addArgument(builder.getIndexType(), ..)` (`:5474`).
-                    arg: vals.mint(),
+                    // ⛔ THE CALLER'S, NOT A FRESH ONE — see [`CondPlace::UniformCoreCl::then_`].
+                    arg,
                     units: units.to_vec(),
                     body: built.ops,
                 });
