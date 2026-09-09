@@ -438,10 +438,22 @@ impl Dependencies {
     }
 }
 
-// crustify:todo: e391_getIndexOfEntry
-//   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:131  (6 body lines, level 1)
-//   original  : int TransformForExposedPipelinePass::getIndexOfEntry( std::vector<Dependency> &op_and_gap_list, mlir::Operation *op)
-//   calls     : e252_size
+impl Dependencies {
+    /// Replaces: e391_getIndexOfEntry
+    ///
+    /// The position of the entry already recorded for source op `src`, which is how a second hazard
+    /// out of one MAC is recognised instead of appended.
+    ///
+    /// ⭐ `-1` IS [`None`]: all three callers (`:211`, `:248`, `:273`) compare against `-1` and then
+    /// either push a fresh entry or index the found one — an `Option<usize>` with no sentinel.
+    /// ⭐ THE `std::vector<Dependency> &` PARAMETER IS ALWAYS `dependencies_with_min_gap_`, so the list
+    /// searched is `self`'s rather than an argument.
+    pub(crate) fn index_of_entry(&self, src: &OpId) -> Option<usize> {
+        self.with_min_gap
+            .iter()
+            .position(|dependency| dependency.src == *src)
+    }
+}
 
 // crustify:todo: e482_computeDependenciesSameBlock
 //   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:139  (82 body lines, level 2)
@@ -695,5 +707,29 @@ mod unit_tests {
                 before[2].clone(),
             ]
         );
+    }
+
+    /// 🎯 e391 — a recorded source is found at its position and an unrecorded one answers `None`.
+    #[test]
+    fn an_entry_is_found_by_its_source_and_a_source_with_no_entry_answers_none() {
+        let dependencies = Dependencies {
+            debug: Default::default(),
+            with_min_gap: vec![
+                Dependency {
+                    src: OpId::at(&[0]),
+                    dst: OpId::at(&[1]),
+                    gap: Cycles(1),
+                },
+                Dependency {
+                    src: OpId::at(&[2]),
+                    dst: OpId::at(&[3]),
+                    gap: Cycles(4),
+                },
+            ],
+        };
+
+        assert_eq!(dependencies.index_of_entry(&OpId::at(&[0])), Some(0));
+        assert_eq!(dependencies.index_of_entry(&OpId::at(&[2])), Some(1));
+        assert_eq!(dependencies.index_of_entry(&OpId::at(&[1])), None);
     }
 }

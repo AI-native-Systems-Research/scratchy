@@ -499,6 +499,18 @@ pub trait InstructionEstimator {
     /// ⭐ IT ANSWERS ONLY WHAT THE LAST [`Self::recalculate`] COUNTED, which is why every caller
     /// recalculates immediately before asking (`ScalarOpMergingAndHoisting.cpp:2313-2315`).
     fn remaining_ibuff_space(&mut self, unit: &[Op]) -> InstructionCount;
+
+    /// `haveIbuffSpace(ctx, unit)` (`Analyses/InstructionEstimation.h:64`) — whether the unit's
+    /// instructions still fit its instruction buffer, which is what a `-O0` pass skips a unit on.
+    ///
+    /// ⭐ DEFAULTED TO THE OUT-OF-SCOPE `todo!` SO AN IMPLEMENTOR STATES ONLY WHAT IT KNOWS, the same
+    /// shape as [`ExpressionEvaluator`]'s unported methods; the estimator itself is not in this
+    /// campaign, so there is nothing for a real implementor to inherit yet.
+    fn have_ibuff_space(&mut self, _unit: &[Op]) -> bool {
+        todo!(
+            "InstructionEstimatorImpl::haveIbuffSpace (Analyses/InstructionEstimation.h:64) — out of campaign scope"
+        )
+    }
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the estimator is not ported, so asking it anything is a `todo!`.

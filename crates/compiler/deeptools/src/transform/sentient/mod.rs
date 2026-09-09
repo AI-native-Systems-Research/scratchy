@@ -147,6 +147,28 @@ use crate::islands::sentient::dialects::Val;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ForRef(pub Val);
 
+/// WHICH `-O` THE DRIVER WAS GIVEN — `dcc::CommonPassOptions::OptLevel`
+/// (`dcc/tools/Options/dcc-pass-option.h:120`), whose values are `dcc::OptLevel`
+/// (`dcc/src/Driver/dcc.hpp:61`).
+///
+/// ⛔ `Unset` IS THE FIELD'S OWN `-1` DEFAULT AND IS NOT `O0`: every reader tests `OptLevel == 0`, and
+/// a level nobody set is not that level.
+/// ⛔ NO `Ord`: no reader compares two levels, and a level is a choice from a closed set rather than a
+/// magnitude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptLevel {
+    /// `OptLevel = -1` — no `-O` on the command line.
+    Unset,
+    /// `-O0`, the one level the passes branch on.
+    O0,
+    /// `-O1`.
+    O1,
+    /// `-O2`.
+    O2,
+    /// `-O3`.
+    O3,
+}
+
 /// WHICH VALUE A LOOP CARRIES — an index into `Op::For::carried`.
 ///
 /// ⛔ `Option<IterArgIndex>` IS THE REFERENCE'S `int iter_arg_index_ = -1`: absence, never a

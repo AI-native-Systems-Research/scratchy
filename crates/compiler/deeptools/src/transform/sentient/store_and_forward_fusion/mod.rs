@@ -93,6 +93,7 @@
 #![allow(dead_code)]
 
 use super::rematerialization_pass::InBlock;
+use super::utils::fold_mode_attribute_if_exists;
 use crate::islands::sentient::dialects::sentient::{Operand, Port, Precision, ResultPorts};
 use crate::islands::sentient::dialects::{Op, dataflow, sentient};
 
@@ -136,6 +137,8 @@ pub struct MacOp<'a> {
     pub op_c: &'a Operand,
     /// `getResultForwarding()` and `getResultPrecision()`.
     pub result: &'a ResultPorts,
+    /// `getUnrollFactorVal()` — the unroll rule [`is_eligible_to_fuse`] fuses under.
+    pub unroll_factor: sentient::UnrollFactor,
 }
 
 impl<'a> MacOp<'a> {
@@ -148,12 +151,14 @@ impl<'a> MacOp<'a> {
                 op_b,
                 op_c,
                 result,
+                unroll_factor,
                 ..
             }) => Some(MacOp {
                 op_a,
                 op_b,
                 op_c,
                 result,
+                unroll_factor: *unroll_factor,
             }),
             _ => None,
         }
@@ -172,6 +177,8 @@ pub struct BinaryOp<'a> {
     pub op: sentient::Binary,
     /// `getResultForwarding()` and `getResultPrecision()`.
     pub result: &'a ResultPorts,
+    /// `getUnrollFactorVal()`.
+    pub unroll_factor: sentient::UnrollFactor,
 }
 
 impl<'a> BinaryOp<'a> {
@@ -184,12 +191,14 @@ impl<'a> BinaryOp<'a> {
                 op_b,
                 binary_op,
                 result,
+                unroll_factor,
                 ..
             }) => Some(BinaryOp {
                 op_a,
                 op_b,
                 op: *binary_op,
                 result,
+                unroll_factor: *unroll_factor,
             }),
             _ => None,
         }
@@ -206,6 +215,8 @@ pub struct UnaryOp<'a> {
     pub op: sentient::UnaryOp,
     /// `getResultForwarding()` and `getResultPrecision()`.
     pub result: &'a ResultPorts,
+    /// `getUnrollFactorVal()`.
+    pub unroll_factor: sentient::UnrollFactor,
 }
 
 impl<'a> UnaryOp<'a> {
@@ -217,11 +228,13 @@ impl<'a> UnaryOp<'a> {
                 op_a,
                 unary_op,
                 result,
+                unroll_factor,
                 ..
             }) => Some(UnaryOp {
                 op_a,
                 op: *unary_op,
                 result,
+                unroll_factor: *unroll_factor,
             }),
             _ => None,
         }
@@ -731,22 +744,279 @@ mod unit_tests {
             )
         );
     }
+
+    /// The same compute op with its unroll factor and result increment set.
+    fn unrolled(mut op: Op, factor: UnrollFactor, unroll_incr_result: bool) -> Op {
+        if let Op::Sentient(
+            sentient::Op::VectorMac {
+                unroll_factor,
+                result,
+                ..
+            }
+            | sentient::Op::VectorBinary {
+                unroll_factor,
+                result,
+                ..
+            }
+            | sentient::Op::VectorUnary {
+                unroll_factor,
+                result,
+                ..
+            },
+        ) = &mut op
+        {
+            *unroll_factor = factor;
+            result.unroll_incr = unroll_incr_result;
+        }
+        op
+    }
+
+    /// e385: the four lists flatten in `opA`, `opB`, `opC`, result order, and the empty one a
+    /// `vector_binary` leaves at the null `ArrayAttr` contributes nothing (`:100-105`).
+    #[test]
+    fn the_forwarding_lists_flatten_in_operand_then_result_order() {
+        let mut value_forwardings = Vec::new();
+        Forwardings {
+            op_a: vec![Port::West],
+            op_b: vec![Port::East],
+            op_c: Vec::new(),
+            result: vec![Port::Lrf(LrfIndex::L0)],
+            result_precision: Precision::Fp16,
+        }
+        .append_value_forwarding(&mut value_forwardings);
+        assert_eq!(
+            value_forwardings,
+            vec![Port::West, Port::East, Port::Lrf(LrfIndex::L0)]
+        );
+    }
+
+    /// e386: `lrf0 or0 zero` forwarding `west` fuses into a mac that reads `lrf0` and forwards
+    /// nothing — and each of the three refusals fires: a port no operand of the trivial op reads
+    /// (`:257-262`), an LRF on both sides (`:280-287`) and a differing unroll factor (`:299-301`).
+    #[test]
+    fn a_foreign_port_an_lrf_on_both_sides_and_a_differing_unroll_factor_each_refuse() {
+        let trivial = binary(
+            operand(Port::Lrf(LrfIndex::L0), &[Port::West]),
+            operand(Port::Zero, &[]),
+            sentient::BinaryOp::Or,
+            result(&[], Precision::Fp16),
+        );
+        let fusible = mac(
+            operand(Port::Zero, &[]),
+            operand(Port::West, &[]),
+            operand(Port::Zero, &[]),
+            result(&[], Precision::Fp16),
+        );
+        assert!(is_eligible_to_fuse(&[Port::West], &[], &trivial, &fusible));
+        assert!(!is_eligible_to_fuse(
+            &[Port::West],
+            &[Port::East],
+            &trivial,
+            &fusible
+        ));
+        assert!(!is_eligible_to_fuse(
+            &[Port::Lrf(LrfIndex::L0)],
+            &[Port::Lrf(LrfIndex::L0)],
+            &trivial,
+            &fusible
+        ));
+        assert!(!is_eligible_to_fuse(
+            &[Port::West],
+            &[],
+            &trivial,
+            &unrolled(fusible, UnrollFactor::X2, false)
+        ));
+    }
+
+    /// e387: a trivial `lrf0 or0 zero` hands back its forwardings with an empty `opC`, a mac that
+    /// computes is [`None`], and so is a `vector_unary` — *"there is no trivial UnaryOp"* (`:335`).
+    #[test]
+    fn only_a_trivial_mac_or_binary_contributes_forwardings() {
+        let trivial_binary = binary(
+            operand(Port::Lrf(LrfIndex::L0), &[Port::West]),
+            operand(Port::Zero, &[]),
+            sentient::BinaryOp::Or,
+            result(&[], Precision::Int8),
+        );
+        assert_eq!(
+            Forwardings::of_trivial_op(&trivial_binary),
+            Some(Forwardings {
+                op_a: vec![Port::West],
+                op_b: Vec::new(),
+                op_c: Vec::new(),
+                result: Vec::new(),
+                result_precision: Precision::Int8,
+            })
+        );
+        let computing_mac = mac(
+            operand(Port::West, &[]),
+            operand(Port::North, &[]),
+            operand(Port::Lrf(LrfIndex::L0), &[]),
+            result(&[Port::Lrf(LrfIndex::L1)], Precision::Fp16),
+        );
+        assert_eq!(Forwardings::of_trivial_op(&computing_mac), None);
+        let forwarding_unary = unary(
+            operand(Port::Lrf(LrfIndex::L0), &[Port::West]),
+            sentient::UnaryOp::Rec,
+            result(&[], Precision::Fp16),
+        );
+        assert_eq!(Forwardings::of_trivial_op(&forwarding_unary), None);
+    }
 }
 
-// crustify:todo: e385_appendValueForwarding
-//   authority : dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:100  (6 body lines, level 1)
-//   original  : static void appendValueForwarding( std::vector<mlir::Attribute> &value_forwardings, mlir::ArrayAttr &opA_forwarding, mlir::ArrayAttr &opB_forwarding, mlir::ArrayAttr &opC_forwarding, mlir::ArrayAttr &result_forwarding)
-//   calls     : e223_appendToVector
+impl Forwardings {
+    /// Replaces: e385_appendValueForwarding
+    ///
+    /// Flattens one compute op's four forwarding lists into the running list e386 weighs and e228
+    /// writes back, in `opA`, `opB`, `opC`, result order (`:100-105`).
+    ///
+    /// ⛔ THE ORDER IS EMITTED, NOT INTERNAL: [`update_fusible_op`] stores the trivial op's flattened
+    /// list into the fusible op's `ResultForwarding` verbatim, so this is the attribute's own order.
+    pub fn append_value_forwarding(&self, value_forwardings: &mut Vec<Port>) {
+        append_to_vector(value_forwardings, &self.op_a);
+        append_to_vector(value_forwardings, &self.op_b);
+        append_to_vector(value_forwardings, &self.op_c);
+        append_to_vector(value_forwardings, &self.result);
+    }
+}
 
-// crustify:todo: e386_isEligibleToFuse
-//   authority : dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:219  (87 body lines, level 1)
-//   original  : bool StoreAndForwardFusionPass::isEligibleToFuse( std::vector<mlir::Attribute> &value_forwardings_for_trivial, std::vector<mlir::Attribute> &value_forwardings_for_fusible, mlir::Operation *trivial_op, mlir::Operation *fusible_op)
-//   calls     : e248_getFoldModeAttributeIfExists
+/// Replaces: e386_isEligibleToFuse
+///
+/// Whether the trivial op's forwardings may move onto the fusible op: compatible fold modes, every
+/// port the fusible op forwards read by an operand of the trivial op, no forwarding target shared and
+/// never an LRF on both sides, and one matching unroll rule (`:219-306`).
+///
+/// ⛔ THE `x1`/ALL-`false` DEFAULTS BELONG TO THE THIRD ARM (`:222-223`): a trivial op that is neither
+/// a `vector_mac` nor a `vector_binary` also SKIPS the operand test, so it is judged on the unroll
+/// rules alone. e480 only ever asks about the two e387 admits.
+/// ⛔ THE FOUR `unrollIncrOp*` ARE ONLY EVER OR-ED TOGETHER (`:302-304`), so this carries the OR — and
+/// a `vector_binary`'s `op_unrollIncrOpC` stays `false` there, which the OR drops anyway.
+/// ⛔ AN LRF IN THE TRIVIAL LIST REFUSES ON **ANY** LRF IN THE FUSIBLE LIST (`:280-287`), not the same
+/// one; a non-LRF refuses only on that exact port (`:272-278`).
+#[must_use]
+pub fn is_eligible_to_fuse(
+    value_forwardings_for_trivial: &[Port],
+    value_forwardings_for_fusible: &[Port],
+    trivial_op: &Op,
+    fusible_op: &Op,
+) -> bool {
+    let trivial_op_fold = fold_mode_attribute_if_exists(trivial_op);
+    let fusible_op_fold = fold_mode_attribute_if_exists(fusible_op);
+    let one_sided_non_fold_a = |one: Option<sentient::FoldMode>,
+                                other: Option<sentient::FoldMode>| {
+        matches!(one, Some(fold) if fold != sentient::FoldMode::FoldA) && other.is_none()
+    };
+    if one_sided_non_fold_a(trivial_op_fold, fusible_op_fold)
+        || one_sided_non_fold_a(fusible_op_fold, trivial_op_fold)
+    {
+        return false;
+    }
+    if let (Some(trivial_fold), Some(fusible_fold)) = (trivial_op_fold, fusible_op_fold)
+        && trivial_fold != fusible_fold
+    {
+        return false;
+    }
 
-// crustify:todo: e387_fillOperandForTrivialOp
-//   authority : dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:318  (19 body lines, level 1)
-//   original  : bool StoreAndForwardFusionPass::fillOperandForTrivialOp( mlir::Operation *op, mlir::ArrayAttr &opA_forwarding, mlir::ArrayAttr &opB_forwarding, mlir::ArrayAttr &opC_forwarding, mlir::ArrayAttr &result_forwarding, SentientPrecision &result_precision)
-//   calls     : e225_isOpTrivialMacOp, e226_isOpTrivialBinaryOp
+    let (op_unroll_factor, op_unroll_incr) = if let Some(mac_op) = MacOp::of(trivial_op) {
+        if value_forwardings_for_fusible.iter().any(|&port| {
+            port != mac_op.op_a.port && port != mac_op.op_b.port && port != mac_op.op_c.port
+        }) {
+            return false;
+        }
+        (
+            mac_op.unroll_factor,
+            mac_op.op_a.unroll_incr
+                || mac_op.op_b.unroll_incr
+                || mac_op.op_c.unroll_incr
+                || mac_op.result.unroll_incr,
+        )
+    } else if let Some(binary_op) = BinaryOp::of(trivial_op) {
+        if value_forwardings_for_fusible
+            .iter()
+            .any(|&port| port != binary_op.op_a.port && port != binary_op.op_b.port)
+        {
+            return false;
+        }
+        (
+            binary_op.unroll_factor,
+            binary_op.op_a.unroll_incr
+                || binary_op.op_b.unroll_incr
+                || binary_op.result.unroll_incr,
+        )
+    } else {
+        (sentient::UnrollFactor::X1, false)
+    };
+
+    for &port in value_forwardings_for_trivial {
+        if matches!(port, Port::Lrf(_)) {
+            if value_forwardings_for_fusible
+                .iter()
+                .any(|&fusible_port| matches!(fusible_port, Port::Lrf(_)))
+            {
+                return false;
+            }
+        } else if value_forwardings_for_fusible.contains(&port) {
+            return false;
+        }
+    }
+
+    let (fusible_op_unroll_factor, fusible_op_unroll_incr_result) =
+        if let Some(fusible_mac_op) = MacOp::of(fusible_op) {
+            (
+                fusible_mac_op.unroll_factor,
+                fusible_mac_op.result.unroll_incr,
+            )
+        } else if let Some(fusible_binary_op) = BinaryOp::of(fusible_op) {
+            (
+                fusible_binary_op.unroll_factor,
+                fusible_binary_op.result.unroll_incr,
+            )
+        } else if let Some(fusible_unary_op) = UnaryOp::of(fusible_op) {
+            (
+                fusible_unary_op.unroll_factor,
+                fusible_unary_op.result.unroll_incr,
+            )
+        } else {
+            (sentient::UnrollFactor::X1, false)
+        };
+    if op_unroll_factor != fusible_op_unroll_factor {
+        return false;
+    }
+    op_unroll_factor == sentient::UnrollFactor::X1
+        || fusible_op_unroll_incr_result == op_unroll_incr
+}
+
+impl Forwardings {
+    /// Replaces: e387_fillOperandForTrivialOp
+    ///
+    /// The forwardings and result precision of a TRIVIAL compute — a `vector_mac` or `vector_binary`
+    /// that computes nothing but a forward (`:318-336`).
+    ///
+    /// ⛔ [`None`] MERGES THE REFERENCE'S TWO `false` ARMS and loses nothing: e480 discards the filled
+    /// out-params on `if (!trivialOps.first) return failure()` (`:452-453`).
+    /// ⛔ *"there is no trivial UnaryOp, TernaryOp in Sentient"* (`:335`) — a `vector_unary` is [`None`]
+    /// here even though [`Forwardings::of_fusible_op`] accepts one on the other side of the fusion.
+    #[must_use]
+    pub fn of_trivial_op(op: &Op) -> Option<Forwardings> {
+        if let Some(mac_op) = MacOp::of(op) {
+            return is_op_trivial_mac_op(mac_op).then(|| Forwardings {
+                op_a: mac_op.op_a.forwarding.clone(),
+                op_b: mac_op.op_b.forwarding.clone(),
+                op_c: mac_op.op_c.forwarding.clone(),
+                result: mac_op.result.forwarding.clone(),
+                result_precision: mac_op.result.precision,
+            });
+        }
+        let binary_op = BinaryOp::of(op)?;
+        is_op_trivial_binary_op(binary_op).then(|| Forwardings {
+            op_a: binary_op.op_a.forwarding.clone(),
+            op_b: binary_op.op_b.forwarding.clone(),
+            op_c: Vec::new(),
+            result: binary_op.result.forwarding.clone(),
+            result_precision: binary_op.result.precision,
+        })
+    }
+}
 
 // crustify:todo: e480_FuseStoreAndForward
 //   authority : dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:434  (119 body lines, level 2)

@@ -80,16 +80,24 @@
 //! | `e388_isSubSet` | 388 | 1 | 5 | `dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:60` |
 //! | `e389_runOnOperation` | 389 | 1 | 26 | `dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:120` |
 
-// ⛔ THE PASS DRIVER IS `e389_runOnOperation`, STILL AN OPEN ANCHOR BELOW, so nothing outside this
-// file calls any of it yet and CI's `-D warnings` would fail on the first ported leaf.
-// ⭐ REMOVE THIS WITH `e389_runOnOperation`.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET: `e389_runOnOperation` is the pass ENTRY and is now
+// ported, but nothing calls the entry either, so this is still what keeps the module warning-free
+// under CI's `-D warnings`.
+// ⭐ REMOVE THIS WHEN THE PASS IS WIRED — the precedent is
+// [`super::nop_insertion_for_back_to_back_syncs`], whose entry is ported and equally uncalled.
 #![allow(dead_code)]
 
+use super::OptLevel;
+use super::analyses::InstructionEstimator;
+use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
     DbgNamePrefix, new_dbg_name_from_list,
 };
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::sentient::SyncHalf;
-use crate::islands::sentient::dialects::{Op, dataflow, sentient, symbol, uniform};
+use crate::islands::sentient::dialects::{Op, dataflow, regions_mut, sentient, symbol, uniform};
+use crate::model::Model;
+use crate::workload::Workload;
 
 /// WHERE AN OP SITS IN ITS BLOCK — the `Operation *` the pass carries in `to_be_deleted` and hands to
 /// [`fuse_sync_send_recv`] as the pair to fuse (`:123`, `:137-139`).
@@ -106,12 +114,10 @@ pub fn is_in(a: SyncHalf, b: &[SyncHalf]) -> bool {
 
 /// `isEqualSets` (`:66`) — mutual containment of the two syncs' peer lists.
 ///
-/// ⛔ ITS `isSubSet` HALF IS `e388_isSubSet`, WHOSE ANCHOR IS STILL OPEN BELOW, so each direction is
-/// written here as the one `all(is_in)` line `:60` is. e388's porter should collapse both onto it.
-/// `isEqualSets` itself is no ledger unit at all — one body line, and it is private here for that
-/// reason.
+/// ⭐ BOTH DIRECTIONS ARE [`is_subset`] (e388), which is the whole of the reference's own body; it is
+/// no ledger unit itself, and private here for that reason.
 fn is_equal_sets(a: &[SyncHalf], b: &[SyncHalf]) -> bool {
-    a.iter().all(|a| is_in(*a, b)) && b.iter().all(|b| is_in(*b, a))
+    is_subset(a, b) && is_subset(b, a)
 }
 
 /// THE FIVE OPS THE ELIGIBILITY WALK STEPS OVER — `dataflow.get_unit`, `sentient.scalar_constant`,
@@ -217,21 +223,189 @@ pub fn fuse_sync_send_recv(
     })
 }
 
-// crustify:todo: e388_isSubSet
-//   authority : dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:60  (5 body lines, level 1)
-//   original  : static bool isSubSet(mlir::ArrayAttr A, mlir::ArrayAttr B)
-//   calls     : e229_isIn
+/// Replaces: e388_isSubSet
+///
+/// Whether every peer of `a` is also a peer of `b` (`:60-64`).
+///
+/// ⭐ AN EMPTY `a` IS A SUBSET OF ANYTHING, which is the reference's loop not running — and it is
+/// reached: a `sentient.sync` with no peers is what [`fuse_sync_send_recv`]'s own tests fuse.
+#[must_use]
+pub fn is_subset(a: &[SyncHalf], b: &[SyncHalf]) -> bool {
+    a.iter().all(|&a| is_in(a, b))
+}
 
-// crustify:todo: e389_runOnOperation
-//   authority : dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:120  (26 body lines, level 1)
-//   original  : void SyncSendRecvFusionPass::runOnOperation()
-//   calls     : e230_FuseSyncSendRecv, e231_getNextEligableNode
+/// `-dcc-sync-send-recv-fusion-disable`, `cl::init(false)` (`:33-36`) — a `dcc-opt` command-line flag
+/// this crate has no command line for, so it is the constant it initialises to.
+const DISABLE_THIS_PASS: bool = false;
+
+/// ONE BLOCK'S FUSIONS AND THEIR DEFERRED ERASE — the body of the `unit_op.walk` (`:134-142`) plus its
+/// share of the module-wide `to_be_deleted` (`:145`).
+///
+/// ⛔⛔ THE ERASE IS WHAT MUST STAY DEFERRED, not merely what the reference happens to defer: the ops
+/// queued for deletion are still IN the block while the walk runs, and membership in the queue is the
+/// walk's only guard against fusing one of them again (`:135-136`).
+/// ⭐ ONE QUEUE PER BLOCK IS THE REFERENCE'S ONE QUEUE PER MODULE: [`fuse_sync_send_recv`] inserts and
+/// consumes within a single block, so no recorded position ever names an op of another one.
+/// ⭐ INNERMOST REGIONS FIRST is MLIR's default `WalkOrder::PostOrder` (`:134`); a fusion inside a
+/// region cannot change its parent block, so descending before the block is the same order that walk
+/// visits in.
+fn fuse_syncs_in_block(block: &mut Vec<Op>) {
+    for op in block.iter_mut() {
+        for region in regions_mut(op) {
+            fuse_syncs_in_block(region);
+        }
+    }
+    let mut to_be_deleted: Vec<InBlock> = Vec::new();
+    let mut at = 0;
+    while at < block.len() {
+        let op = InBlock(at);
+        if !to_be_deleted.contains(&op) {
+            let op_next = get_next_eligable_node(block, op);
+            if let Some(fused) = fuse_sync_send_recv(block, op, op_next) {
+                // The `sendrecv` went in AT `op`, so every position already queued from here on names
+                // one op later than it did.
+                for deleted in &mut to_be_deleted {
+                    if deleted.0 >= fused.fused.0 {
+                        deleted.0 += 1;
+                    }
+                }
+                to_be_deleted.push(fused.consumed.0);
+                to_be_deleted.push(fused.consumed.1);
+                // ⭐ THE WALK RESUMES AT THE FUSED-OVER OP'S SUCCESSOR, which is where `getNextNode()`
+                // stood before the insert — the reference's iterator holds it across the fusion.
+                at = fused.consumed.0.0;
+            }
+        }
+        at += 1;
+    }
+    to_be_deleted.sort_unstable();
+    to_be_deleted.dedup();
+    for deleted in to_be_deleted.iter().rev() {
+        block.remove(deleted.0);
+    }
+}
+
+/// Replaces: e389_runOnOperation
+///
+/// The pass entry: fuses the send/recv pairs of every program unit of one module, skipping a unit that
+/// still fits its instruction buffer when the driver was given `-O0` (`:120-146`).
+///
+/// ⛔ `getChildAnalysis<InstructionEstimator>(unit_op)` IS THE `E` PARAMETER — the estimator is
+/// per-unit there and asked about `unit_op` here, and `haveIbuffSpace` is out of campaign scope, so a
+/// caller at [`OptLevel::O0`] gets its `todo!`.
+/// ⭐ THE SKIP IS `continue`, NOT A RETURN: the walk's lambda returns per unit (`:130`).
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload, E: InstructionEstimator>(
+    program: &mut Program<A, M, W>,
+    instruction_estimator: &mut E,
+    opt_level: OptLevel,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for unit in program.units.iter_mut() {
+        if opt_level == OptLevel::O0 && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        fuse_syncs_in_block(&mut unit.body);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Fused, InBlock, fuse_sync_send_recv, get_next_eligable_node, is_in};
+    use super::{
+        Fused, InBlock, InstructionEstimator, OptLevel, fuse_sync_send_recv,
+        get_next_eligable_node, is_in, is_subset, run_on_operation,
+    };
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::{Op, Val, sentient, symbol};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
+    use crate::transform::sentient::analyses::InstructionCount;
+    use crate::units::DfirUnit;
+    use crate::workload::Workload;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// AN ESTIMATOR THAT ANSWERS THE ONE QUESTION e389 ASKS. ⛔ `InstructionEstimatorImpl` is out of
+    /// campaign scope, so a test states its answer rather than computing one.
+    struct StatedIbuffSpace(bool);
+
+    impl InstructionEstimator for StatedIbuffSpace {
+        fn recalculate(&mut self, _unit: &[Op]) {
+            todo!("e389 never recalculates")
+        }
+
+        fn estimated_instruction_count_of_op(&mut self, _op: &Op) -> InstructionCount {
+            todo!("e389 never counts instructions")
+        }
+
+        fn estimated_instruction_count_of_region(&mut self, _region: &[Op]) -> InstructionCount {
+            todo!("e389 never counts instructions")
+        }
+
+        fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
+            todo!("e389 never asks for the remaining space, only whether there is any")
+        }
+
+        fn have_ibuff_space(&mut self, _unit: &[Op]) -> bool {
+            self.0
+        }
+    }
+
+    /// A two-unit program, both units running the same body.
+    fn program_of(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        let unit = |body: Vec<Op>| ProgramUnit {
+            iter_arg: None,
+            on: Units::one(DfirUnit::L0su, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(body.clone()), vec![unit(body)]),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// `sentient.for` around `body`.
+    fn for_op(body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv: Val(7),
+            iv_reg: sentient::Reg::UNALLOCATED,
+            bound: Val(8),
+            carried: Vec::new(),
+            dbg_name: None,
+            body,
+        })
+    }
 
     /// One half of a rendezvous, from the arm that names a lowered destination.
     fn peer(dst: sentient::Consumer) -> sentient::SyncHalf {
@@ -252,6 +426,58 @@ mod unit_tests {
             implicit_sync_memory_boundary: Some(4),
             dbg_name: Some(dbg_name.to_owned()),
         })
+    }
+
+    /// 🎯 e388 — every peer of a subset is in the superset, one that is not refuses, and the empty
+    /// list is a subset of anything.
+    #[test]
+    fn a_peer_list_is_a_subset_only_when_every_peer_of_it_is_in_the_other() {
+        let units = [
+            peer(sentient::Consumer::L3lu),
+            peer(sentient::Consumer::L0su),
+        ];
+        assert!(is_subset(&[peer(sentient::Consumer::L0su)], &units));
+        assert!(!is_subset(&[peer(sentient::Consumer::L3su)], &units));
+        assert!(is_subset(&[], &units));
+    }
+
+    /// 🎯 e389 — the pass fuses every pair of every unit, at the top of a block and inside a
+    /// `sentient.for`, and erases the two halves; at `-O0` a unit that still fits its instruction
+    /// buffer is left untouched.
+    #[test]
+    fn the_pass_fuses_and_erases_in_every_block_and_skips_a_unit_with_ibuff_space_at_o0() {
+        let pair = || {
+            vec![
+                sync(sentient::SyncMode::Send, Vec::new(), false, "a"),
+                sync(sentient::SyncMode::Recv, Vec::new(), false, "b"),
+            ]
+        };
+        let body = || {
+            let mut body = pair();
+            body.push(for_op(pair()));
+            body
+        };
+        // ⭐ `implicit_sync_memory_boundary` IS `None` ON THE FUSED OP, which is why this is not the
+        // `sync` helper's op.
+        let fused = Op::Sentient(sentient::Op::Sync {
+            mode: sentient::SyncMode::SendRecv,
+            peers: Vec::new(),
+            soft: false,
+            implicit_sync_memory_boundary: None,
+            dbg_name: Some("SSRF(a, b)".to_owned()),
+        });
+
+        let mut program = program_of(body());
+        run_on_operation(&mut program, &mut StatedIbuffSpace(true), OptLevel::O1);
+        for unit in program.units.iter() {
+            assert_eq!(unit.body, vec![fused.clone(), for_op(vec![fused.clone()])]);
+        }
+
+        let mut at_o0 = program_of(body());
+        run_on_operation(&mut at_o0, &mut StatedIbuffSpace(true), OptLevel::O0);
+        for unit in at_o0.units.iter() {
+            assert_eq!(unit.body, body());
+        }
     }
 
     /// 🎯 e229 — a peer set is searched by identity, and a peer that is not in it is not found.
