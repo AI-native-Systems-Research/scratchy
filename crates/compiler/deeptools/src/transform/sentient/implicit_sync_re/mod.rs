@@ -82,8 +82,86 @@
 //! | `e501_runOn` | 501 | 3 | 4 | `dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:77` |
 //! | `e559_runOnOperation` | 559 | 4 | 5 | `dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:82` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so `ImplicitSyncGenValue` is reachable only
+// from `implicit_sync_rde_tree` and its tests until `e559_runOnOperation` (level 4) lands. CI runs
+// clippy with `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH e559: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
+
+use core::num::NonZeroU32;
+
+use crate::islands::sentient::dialects::Op;
+
 pub(crate) mod implicit_sync_rde_tree;
 
+/// `ImplicitSyncGenValue::tile_size_` WHEN IT IS KNOWN.
+///
+/// ⛔ `isUnknownValue()` IS `tile_size_ < 0` (`ImplicitSyncRE.hpp:24`) and the constructor's default
+/// is `-1`, so the two states are a `NonZeroU32` and its ABSENCE — never a sentinel in the number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TileSize(NonZeroU32);
+
+impl TileSize {
+    /// The boundary a defining `sentient.sync` carries.
+    #[must_use]
+    pub(crate) const fn of(size: NonZeroU32) -> TileSize {
+        TileSize(size)
+    }
+
+    /// `getTileSize()` (`ImplicitSyncRE.hpp:26`).
+    #[must_use]
+    pub(crate) const fn get(self) -> NonZeroU32 {
+        self.0
+    }
+}
+
+/// `ImplicitSyncGenValue` (`ImplicitSyncRE.hpp:19`) — the dataflow definition an RDE node generates.
+///
+/// ⭐ DECLARED HERE, WHERE ITS OWN METHODS BELONG: e047-e049 are `isEqual`/`copyTo`/`print` on this
+/// class and are scheduled into this file. e045 (in [`implicit_sync_rde_tree`]) constructs it, which
+/// is why the type lands first — a batch filling those anchors should UNION with this, not duplicate.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImplicitSyncGenValue {
+    /// `tile_size_` — `None` is the constructor's `-1`, i.e. `isUnknownValue()`.
+    tile_size: Option<TileSize>,
+    /// `op_` — absent for the default-constructed unknown value.
+    op: Option<Op>,
+}
+
+impl ImplicitSyncGenValue {
+    /// `ImplicitSyncGenValue()` — the unknown value.
+    #[must_use]
+    pub(crate) fn unknown() -> ImplicitSyncGenValue {
+        ImplicitSyncGenValue::default()
+    }
+
+    /// `ImplicitSyncGenValue(tile_size, op)`.
+    #[must_use]
+    pub(crate) fn of(tile_size: TileSize, op: Op) -> ImplicitSyncGenValue {
+        ImplicitSyncGenValue {
+            tile_size: Some(tile_size),
+            op: Some(op),
+        }
+    }
+
+    /// `isUnknownValue()` (`ImplicitSyncRE.hpp:24`).
+    #[must_use]
+    pub(crate) const fn is_unknown_value(&self) -> bool {
+        self.tile_size.is_none()
+    }
+
+    /// `getTileSize()`, absent when the value is unknown.
+    #[must_use]
+    pub(crate) const fn tile_size(&self) -> Option<TileSize> {
+        self.tile_size
+    }
+
+    /// The op that generated it.
+    #[must_use]
+    pub(crate) const fn op(&self) -> Option<&Op> {
+        self.op.as_ref()
+    }
+}
 
 // crustify:todo: e047_isEqual
 //   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.hpp:28  (7 body lines, level 0)
@@ -115,4 +193,3 @@ pub(crate) mod implicit_sync_rde_tree;
 //   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:82  (5 body lines, level 4)
 //   original  : void runOnOperation()
 //   calls     : e438_runOn, e501_runOn
-

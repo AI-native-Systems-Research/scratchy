@@ -78,16 +78,179 @@
 //! | `e045_initializeDataflowInfo` | 045 | 0 | 12 | `dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:101` |
 //! | `e046_isSimplifiable` | 046 | 0 | 7 | `dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:114` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
+// file's own tests until `e559_runOnOperation` (level 4) lands and something calls it. CI runs clippy
+// with `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH e559: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e044_isOperationADef
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:94  (6 body lines, level 0)
-//   original  : bool ImplicitSyncRDETree::isOperationADef(const Operation &op) const
+use core::num::NonZeroU32;
 
-// crustify:todo: e045_initializeDataflowInfo
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:101  (12 body lines, level 0)
-//   original  : void ImplicitSyncRDETree::initializeDataflowInfo(RDENode *node)
+use super::{ImplicitSyncGenValue, TileSize};
+use crate::islands::sentient::dialects::{Op, sentient};
 
-// crustify:todo: e046_isSimplifiable
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:114  (7 body lines, level 0)
-//   original  : bool ImplicitSyncRDETree::isSimplifiable(const RDENode &node) const
+/// `RDENode` (`Analyses/RedundantDefinitionEliminationTree.hpp`) AS THIS FILE READS IT — the tree
+/// itself is out of campaign scope, so only the facts e045 and e046 ask of a node are represented.
+///
+/// ⭐ `Root` IS THE IDENTITY TEST, NOT A FLAG: `root_ = root_ ? root_ : new RDENode(nullptr)`
+/// (`Analyses/RedundantDefinitionEliminationTree.cpp:294`) makes the root the ONLY node without an
+/// operation, so `getRoot() == &node` is a CASE of this enum rather than a pointer comparison.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RdeNode<'a> {
+    /// The tree's root — `getOperation()` is null.
+    Root,
+    /// A node over one op.
+    At {
+        /// `getOperation()`.
+        op: &'a Op,
+        /// `isLeaf()` (`src/Analysis/OperationTree.hpp:70`).
+        leaf: bool,
+    },
+}
 
+/// A `sentient.sync` WHOSE `implicit_sync_memory_boundary` IS POSITIVE.
+///
+/// ⭐ ONE WITNESS DISCHARGES TWO UNITS: it is e044's `true`, and it is also e045's `DT_CHECK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DefiningSync(TileSize);
+
+impl DefiningSync {
+    /// Replaces: e044_isOperationADef
+    ///
+    /// A `sentient.sync` is a definition exactly when its `implicit_sync_memory_boundary` is present
+    /// and positive — `Some` here IS the reference's `true`.
+    ///
+    /// ⛔ TRAP: `None` is the `.td`'s `-1` (see [`sentient::Op::Sync`]), so an absent boundary and a
+    /// non-positive one give the same answer.
+    #[must_use]
+    pub(crate) fn of(op: &Op) -> Option<DefiningSync> {
+        let Op::Sentient(sentient::Op::Sync {
+            implicit_sync_memory_boundary,
+            ..
+        }) = op
+        else {
+            return None;
+        };
+        u32::try_from(implicit_sync_memory_boundary.unwrap_or(0))
+            .ok()
+            .and_then(NonZeroU32::new)
+            .map(|size| DefiningSync(TileSize::of(size)))
+    }
+
+    /// The boundary that made it a definition.
+    #[must_use]
+    pub(crate) const fn tile_size(self) -> TileSize {
+        self.0
+    }
+}
+
+/// Replaces: e045_initializeDataflowInfo
+///
+/// The node's `setDataflowGen`: a defining `sentient.sync` generates its boundary as a tile size,
+/// every other node the unknown value.
+///
+/// ⛔ TRAP: `DT_CHECK(has_value())` (`:107`) IS UNREACHABLE AND IS NOW A TYPE. `isOperationSelected`
+/// admits a `sentient.sync` only through `isOperationADef` and `compute()` calls this on selected
+/// nodes alone (`Analyses/RedundantDefinitionEliminationTree.cpp:217,247-294`), so [`DefiningSync`]
+/// is the check — and unlike the abort it has an answer for the input the check cannot get.
+#[must_use]
+pub(crate) fn initialize_dataflow_info(node: &RdeNode<'_>) -> ImplicitSyncGenValue {
+    let RdeNode::At { op, .. } = node else {
+        return ImplicitSyncGenValue::unknown();
+    };
+    DefiningSync::of(op).map_or_else(ImplicitSyncGenValue::unknown, |sync| {
+        ImplicitSyncGenValue::of(sync.tile_size(), (*op).clone())
+    })
+}
+
+/// Replaces: e046_isSimplifiable
+///
+/// A subtree may go when it is neither the root nor a `sentient.sync`, and is a leaf — or a
+/// statically dead loop.
+///
+/// ⛔ TRAP: `isStaticallyDeadLoop` is `Analyses/` work and OUT OF CAMPAIGN SCOPE. The `||`
+/// short-circuits, so a leaf never reaches it.
+#[must_use]
+pub(crate) fn is_simplifiable(node: &RdeNode<'_>) -> bool {
+    let RdeNode::At { op, leaf } = node else {
+        // `getRoot() == &node` — the root is the only node without an operation.
+        return false;
+    };
+    if matches!(op, Op::Sentient(sentient::Op::Sync { .. })) {
+        return false;
+    }
+    if *leaf {
+        return true;
+    }
+    todo!(
+        "RedundantDefinitionEliminationTree::isStaticallyDeadLoop \
+         (Analyses/RedundantDefinitionEliminationTree.hpp:247) — out of campaign scope"
+    )
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// `sentient.sync` with the given `implicit_sync_memory_boundary`.
+    fn sync(boundary: Option<i32>) -> Op {
+        Op::Sentient(sentient::Op::Sync {
+            mode: sentient::SyncMode::Send,
+            peers: Vec::new(),
+            soft: false,
+            implicit_sync_memory_boundary: boundary,
+            dbg_name: None,
+        })
+    }
+
+    /// `sentient.nop` — an op that is not a sync.
+    fn nop() -> Op {
+        Op::Sentient(sentient::Op::Nop { dbg_name: None })
+    }
+
+    #[test]
+    fn only_a_sync_with_a_positive_boundary_is_a_definition() {
+        assert!(DefiningSync::of(&sync(Some(4096))).is_some());
+        assert!(DefiningSync::of(&sync(Some(0))).is_none());
+        assert!(DefiningSync::of(&sync(Some(-1))).is_none());
+        assert!(DefiningSync::of(&sync(None)).is_none());
+        assert!(DefiningSync::of(&nop()).is_none());
+    }
+
+    #[test]
+    fn a_defining_sync_generates_its_boundary_and_every_other_node_the_unknown_value() {
+        let defining = sync(Some(4096));
+        let generated = initialize_dataflow_info(&RdeNode::At {
+            op: &defining,
+            leaf: true,
+        });
+        assert_eq!(
+            generated.tile_size().map(|size| size.get().get()),
+            Some(4096)
+        );
+        let other = nop();
+        assert!(
+            initialize_dataflow_info(&RdeNode::At {
+                op: &other,
+                leaf: true
+            })
+            .is_unknown_value()
+        );
+        assert!(initialize_dataflow_info(&RdeNode::Root).is_unknown_value());
+    }
+
+    #[test]
+    fn neither_the_root_nor_a_sync_is_simplifiable_but_a_leaf_is() {
+        let defining = sync(Some(4096));
+        assert!(!is_simplifiable(&RdeNode::Root));
+        assert!(!is_simplifiable(&RdeNode::At {
+            op: &defining,
+            leaf: true
+        }));
+        let other = nop();
+        assert!(is_simplifiable(&RdeNode::At {
+            op: &other,
+            leaf: true
+        }));
+    }
+}
