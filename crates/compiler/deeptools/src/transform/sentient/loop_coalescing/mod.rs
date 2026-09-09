@@ -81,14 +81,116 @@
 //! | `e445_coalesceLoops` | 445 | 2 | 165 | `dcc/src/Transform/Sentient/LoopCoalescing.cpp:135` |
 //! | `e563_runOnOperation` | 563 | 4 | 74 | `dcc/src/Transform/Sentient/LoopCoalescing.cpp:302` |
 
+// ⛔ NOTHING CALLS THESE TWO UNTIL `e312_splitBounds` / `e445_coalesceLoops` LAND, and CI runs clippy
+// with `-D warnings`. ⭐ REMOVE THIS WITH e445.
+#![allow(dead_code)]
 
-// crustify:todo: e071_getLargestDivisor
-//   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:379  (27 body lines, level 0)
-//   original  : int64_t LoopCoalescingPass::getLargestDivisor(int64_t input, int limit)
+/// A loop's trip count — `sentient.for`'s `$bound`, and what coalescing multiplies together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct TripCount(pub i64);
 
-// crustify:todo: e072_isAllLessThanMax
-//   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:408  (6 body lines, level 0)
-//   original  : bool LoopCoalescingPass::isAllLessThanMax(std::vector<int64_t> new_bounds, int64_t max)
+/// THE WIDEST TRIP COUNT A LOOP-CONTROL REGISTER CAN HOLD — `limit`, and why coalescing splits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct TripLimit(pub i64);
+
+impl TripLimit {
+    /// `MAX_LCCR_VALUE` (`SentientOps.hpp:34`) — one LCCR, as `splitBounds` (`:421`) asks it.
+    pub(crate) const LCCR: Self = Self(65535);
+
+    /// `(int64_t)(MAX_LCCR_VALUE) * MAX_LCCR_VALUE` (`:204`) — what two LCCRs together can hold.
+    pub(crate) const LCCR_SQUARED: Self = Self(Self::LCCR.0 * Self::LCCR.0);
+}
+
+/// A prime small enough to be worth trial-dividing by — `prime_pool`'s element type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SmallPrime(i64);
+
+impl SmallPrime {
+    /// `std::vector<int> prime_pool = {11, 7, 5, 3, 2};` (`:386`), in the reference's order — largest
+    /// first, so each step takes the biggest available bite.
+    const POOL: [Self; 5] = [Self(11), Self(7), Self(5), Self(3), Self(2)];
+}
+
+/// What [`get_largest_divisor`] found.
+///
+/// ⛔ `DT_ERROR("No valid prime factor but input still too large!")` (`:399`) IS THE SECOND ARM: the
+/// reference aborts, so the arm must be impossible to mistake for a usable trip count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LargestDivisor {
+    /// A divisor of the input that fits the limit.
+    Fits(TripCount),
+    /// The input has no factor in [`SmallPrime::POOL`] and is still over the limit — the cofactor
+    /// reached when the reference gives up. ⚠️ NOT a divisor that fits.
+    NoSmallPrimeFactor(TripCount),
+}
+
+/// Replaces: e071_getLargestDivisor
+///
+/// Divide `input` by primes from [`SmallPrime::POOL`] until it fits `limit`, and answer with what is
+/// left — always a divisor of the original, which is what makes `new_bounds[i] / new_bounds0[i]`
+/// (`:422`) exact.
+///
+/// ⛔ TRAP: THE NAME PROMISES THE *LARGEST* DIVISOR AND THE BODY IS GREEDY, NOT MAXIMAL — `29 * 32`
+/// with limit 100 reduces by 2 five times to 29, though 32 also fits. The reference's own comment
+/// (`:384-385`) states the assumption: the loop is not a large prime.
+pub(crate) fn get_largest_divisor(mut input: TripCount, limit: TripLimit) -> LargestDivisor {
+    // `if (input <= limit) return input;` (`:380-382`).
+    while input.0 > limit.0 {
+        // `for (auto &p : prime_pool) if (input % p == 0) { input /= p; found = true; break; }`
+        // (`:388-395`).
+        let Some(p) = SmallPrime::POOL.iter().find(|p| input.0 % p.0 == 0) else {
+            return LargestDivisor::NoSmallPrimeFactor(input);
+        };
+        input = TripCount(input.0 / p.0);
+    }
+    LargestDivisor::Fits(input)
+}
+
+/// Replaces: e072_isAllLessThanMax
+///
+/// Whether every coalesced bound still fits `max`.
+///
+/// ⛔ TRAP: THE NAME SAYS "LESS THAN" AND THE BODY TESTS `bound > max` (`:411`) — a bound EQUAL to the
+/// max passes. That is the right reading: `max` is a representable value, not an exclusive bound.
+pub(crate) fn is_all_less_than_max(new_bounds: &[TripCount], max: TripLimit) -> bool {
+    new_bounds.iter().all(|bound| bound.0 <= max.0)
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// `splitBounds`' own use (`:421-422`): a bound over one LCCR reduces to a divisor that fits, and
+    /// the cofactor is exact.
+    #[test]
+    fn largest_divisor_is_a_divisor_that_fits() {
+        let bound = TripCount(65536 * 3);
+        let LargestDivisor::Fits(divisor) = get_largest_divisor(bound, TripLimit::LCCR) else {
+            panic!("65536 * 3 is a power of two times three");
+        };
+        assert!(divisor.0 <= TripLimit::LCCR.0);
+        assert_eq!(bound.0 % divisor.0, 0);
+    }
+
+    /// The `DT_ERROR` arm: a prime beyond the pool cannot be reduced at all.
+    #[test]
+    fn a_large_prime_has_no_small_prime_factor() {
+        assert_eq!(
+            get_largest_divisor(TripCount(65537), TripLimit::LCCR),
+            LargestDivisor::NoSmallPrimeFactor(TripCount(65537))
+        );
+    }
+
+    /// e072's boundary: equal to the max passes, one over does not.
+    #[test]
+    fn all_less_than_max_admits_the_max_itself() {
+        assert!(is_all_less_than_max(
+            &[TripCount(1), TripCount(65535)],
+            TripLimit::LCCR
+        ));
+        assert!(!is_all_less_than_max(&[TripCount(65536)], TripLimit::LCCR));
+    }
+}
 
 // crustify:todo: e311_getCandidateLoops
 //   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:76  (56 body lines, level 1)
@@ -109,4 +211,3 @@
 //   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:302  (74 body lines, level 4)
 //   original  : void runOnOperation()
 //   calls     : e252_size, e311_getCandidateLoops, e445_coalesceLoops, e498_updateForOperation, e546_findAndReplaceRedundantIterArgsUsedInConditions
-

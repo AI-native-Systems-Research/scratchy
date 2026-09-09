@@ -118,8 +118,8 @@ use crate::islands::sentient::dialects::{self as sen, sentient};
 ///
 /// ⛔ IDS ARE MINTED ONLY BY THE TREE THAT OWNS THEM, which is why every read below indexes without
 /// a bounds question: an `OperationNodeId` can only have come from [`OperationTreeBase::with_root`]
-/// or one of its two inserts, the field is private, and nothing removes a node (the C++
-/// `unlink`/`clear` are entry 179's, in the other family's file).
+/// or one of its two inserts, the field is private, and [`OperationTreeBase::remove`] unlinks a
+/// subtree without freeing its storage — so no id an id-holder holds can ever dangle.
 ///
 /// ⚠️ WHAT THAT DOES *NOT* RULE OUT is an id minted by one tree being read against another. It cannot
 /// happen in this pass: the walk builds one `LoopMaskTree` per PT `dataflow::ProgramUnitOp` and
@@ -556,6 +556,78 @@ impl<N> OperationTreeBase<N> {
         node: N,
     ) -> OperationNodeId {
         self.insert_child(parent, Some(op), node)
+    }
+
+    /// `OperationNode::unlink()` — `OperationTree.hpp:134-143`.
+    ///
+    /// ```cpp
+    /// // Unlinks the subtree rooted at this node, but does not free any storage.
+    /// void unlink() {
+    ///   OperationNode *prev_sibling = getPrevSibling();
+    ///   if (prev_sibling)
+    ///     prev_sibling->setNextSibling(getNextSibling());
+    ///   else  // this was the first child of the parent
+    ///     getParentNode()->setFirstChild(getNextSibling());
+    ///   setNextSibling(nullptr);
+    ///   setParentNode(nullptr);
+    /// }
+    /// ```
+    ///
+    /// ⚠️ NOT A SCHEDULED UNIT, DELIBERATELY WRITTEN HERE, for the same reason the arena above is:
+    /// `src/Analysis/` carries no entry number, and `e070_removeNodesFromWorklistAndTree` IS
+    /// `tree_.remove(n)`. Its one caller is [`Self::remove`].
+    ///
+    /// ⛔⛔ THE `else` BRANCH DEREFERENCES NULL FOR THE ROOT, AND THIS DOES NOT COPY THAT. The root
+    /// has no previous sibling and no parent (see [`Self::root`]), so the reference reaches
+    /// `getParentNode()->setFirstChild(…)` on a null parent. Here that case is the documented no-op it
+    /// has to be: an already-unlinked node stays unlinked, and the tree keeps its root.
+    fn unlink(&mut self, n: OperationNodeId) {
+        let next = self.next_sibling(n);
+        match self.prev_sibling(n) {
+            // `prev_sibling->setNextSibling(getNextSibling())` (`:137-138`).
+            Some(prev) => self.nodes[prev.0].links.next_sibling = next,
+            // `getParentNode()->setFirstChild(getNextSibling())` (`:140`) — the first-child case, and
+            // for the root there is no parent to repoint.
+            None => {
+                if let Some(parent) = self.parent_node(n) {
+                    self.nodes[parent.0].links.first_child = next;
+                }
+            }
+        }
+        // `setNextSibling(nullptr); setParentNode(nullptr);` (`:141-142`).
+        self.nodes[n.0].links.next_sibling = None;
+        self.nodes[n.0].links.parent = None;
+    }
+
+    /// `OperationTreeBase::remove(start)` — `OperationTree.hpp:216`, `{ clear(start); }`, whose body is
+    /// `OperationTree.cpp:270-281`:
+    ///
+    /// ```cpp
+    /// void OperationTreeBase::clear(OperationNode *start) {
+    ///   DT_CHECK_MSG(start, "expected valid node");
+    ///   if (root_ && start == root_) clear();
+    ///   start->unlink();
+    ///   SmallVector<OperationNode *> to_be_deleted;
+    ///   OperationNode::walk<OperationNode::WalkOrder::kPostOrder>(
+    ///       start, [&](OperationNode *n) { to_be_deleted.push_back(n); return nullptr; });
+    ///   for (OperationNode *n : to_be_deleted) delete n;
+    /// }
+    /// ```
+    ///
+    /// ⭐ THE POST-ORDER WALK AND THE `delete` ARE THE ARENA'S JOB, NOT THIS FUNCTION'S — the same
+    /// argument as `e179_clear` (`tf_flattening_local_regions.rs`): the nodes live in one `Vec` this
+    /// tree owns, so what remains of the reference is the LINK SURGERY, which is [`Self::unlink`].
+    /// The storage stays; an [`OperationNodeId`] a caller kept therefore reads as an unlinked node
+    /// rather than as freed memory, which is what makes ids safe to hold across a removal.
+    ///
+    /// ⛔⛔ AND THE ROOT ARM IS A DEFECT NOT WORTH COPYING: `if (root_ && start == root_) clear();`
+    /// **falls through** — it deletes every node and sets `root_ = nullptr`, then calls
+    /// `start->unlink()` on the memory it just freed and walks it. Here removing the root is a no-op
+    /// (see [`Self::unlink`]) and the tree survives intact — a deliberate divergence from a body that
+    /// touches freed memory. No caller asks it: `e070_removeNodesFromWorklistAndTree`
+    /// (`LoopAbsorption.cpp:410-413`) removes the absorbed loops' nodes.
+    pub fn remove(&mut self, start: OperationNodeId) {
+        self.unlink(start);
     }
 }
 

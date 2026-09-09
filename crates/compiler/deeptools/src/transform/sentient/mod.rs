@@ -98,6 +98,7 @@ pub(crate) mod loop_elimination_via_rerolling;
 pub(crate) mod loop_merging;
 pub(crate) mod loop_rolling;
 pub(crate) mod loop_splitting_and_unrolling;
+pub(crate) mod loop_tree;
 pub(crate) mod multi_dim_loop_peeling;
 pub(crate) mod multicast_canonicalization;
 pub(crate) mod nop_insertion_for_back_to_back_syncs;
