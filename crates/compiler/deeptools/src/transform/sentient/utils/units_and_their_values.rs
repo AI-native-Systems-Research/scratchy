@@ -78,12 +78,88 @@
 //! | `e394_dump` | 394 | 1 | 6 | `dcc/src/Transform/Sentient/Utils.cpp:615` |
 
 
-// crustify:todo: e249_normalizeNullValues
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:600  (14 body lines, level 0)
-//   original  : void UnitsAndTheirValues::normalizeNullValues()
+// ⛔ NOTHING CALLS THIS TYPE YET. `add` (e251), `size` (e252), `replaceValue` (e396) and
+// `areAllValuesEqual` (e253) are anchored in the PARENT module (`super`, `Utils.hpp:165-185`) and its
+// one consumer is `RegisterInitCandidatePromoter` (e606, e517, e570); every one of those anchors is
+// still open. ⭐ REMOVE THIS WITH THE FIRST OF THEM: an unused item here is a real defect from then on.
+#![allow(dead_code)]
+
+use crate::islands::sentient::dialects::Val;
+
+/// EVERY UNIT OF A UNIFORMIZED PROGRAM PAIRED WITH ITS VALUE — `dcc::utils::UnitsAndTheirValues`
+/// (`dcc/src/Transform/Sentient/Utils.hpp:161-190`).
+///
+/// ⛔⛔ ONE LIST OF PAIRS, NOT THE REFERENCE'S TWO PARALLEL `ListTy`s. `size()`'s
+/// `DT_CHECK(values_.size() == units_.size())` (`Utils.hpp:171`) is the ONE invariant the class exists
+/// to hold, and it is the only thing `add` — the sole way to grow either list — enforces. A pair
+/// cannot be half-pushed, so the check has nothing left to guard and the `units()[index]` /
+/// `values()[index]` reads its callers do (`OldRegisterInitialization.cpp:996-1009`) stay one index.
+///
+/// ⛔ `Option<Val>` IS THE `mlir::Value` NULL A VALUE MAY BE. A unit is never null — `add` is always
+/// called with a real one — but a value is deliberately left absent until
+/// [`Self::normalize_null_values`] fills it, which is why that method exists at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UnitsAndTheirValues {
+    /// `units_` zipped with `values_`, in `add` order.
+    pub(crate) pairs: Vec<(Val, Option<Val>)>,
+}
+
+impl UnitsAndTheirValues {
+    /// Replaces: e249_normalizeNullValues
+    ///
+    /// Fills every null value with the FIRST non-null one, so the list ends up wholly filled or
+    /// wholly null.
+    ///
+    /// ⛔ AN ALL-NULL (OR EMPTY) LIST IS A FIXED POINT, NOT A REFUSAL: `non_null_val` stays null and
+    /// the reference's second loop writes null over null. The early return is that, without the write.
+    pub(crate) fn normalize_null_values(&mut self) {
+        let Some(non_null) = self.pairs.iter().find_map(|(_unit, value)| *value) else {
+            return;
+        };
+        for (_unit, value) in &mut self.pairs {
+            if value.is_none() {
+                *value = Some(non_null);
+            }
+        }
+    }
+}
 
 // crustify:todo: e394_dump
 //   authority : dcc/src/Transform/Sentient/Utils.cpp:615  (6 body lines, level 1)
 //   original  : void UnitsAndTheirValues::dump()
 //   calls     : e252_size
 
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// e249 — the holes take the first non-null value, and an all-null list is left alone.
+    #[test]
+    fn normalize_null_values_fills_the_holes_and_leaves_an_all_null_list() {
+        let mut uvs = UnitsAndTheirValues {
+            pairs: vec![
+                (Val(10), None),
+                (Val(11), Some(Val(20))),
+                (Val(12), None),
+                (Val(13), Some(Val(21))),
+            ],
+        };
+        uvs.normalize_null_values();
+        assert_eq!(
+            uvs.pairs,
+            vec![
+                (Val(10), Some(Val(20))),
+                (Val(11), Some(Val(20))),
+                (Val(12), Some(Val(20))),
+                (Val(13), Some(Val(21))),
+            ]
+        );
+
+        let mut all_null = UnitsAndTheirValues {
+            pairs: vec![(Val(10), None), (Val(11), None)],
+        };
+        all_null.normalize_null_values();
+        assert_eq!(all_null.pairs, vec![(Val(10), None), (Val(11), None)]);
+    }
+}

@@ -81,17 +81,157 @@
 //! | `e398_runOn` | 398 | 1 | 44 | `dcc/src/Transform/Sentient/VectorRegisterInitialization.cpp:80` |
 
 
-// crustify:todo: e254_runOn
-//   authority : dcc/src/Transform/Sentient/VectorRegisterInitialization.cpp:59  (6 body lines, level 0)
-//   original  : void runOn(ModuleOp module_op)
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET: `runOnOperation` (e397) and the per-unit `runOn`
+// (e398) are still open below, so every item here is reachable only from this file's own tests.
+// ⭐ REMOVE THIS WITH `e397_runOnOperation`: an unused item here is a real defect from then on.
+#![allow(dead_code)]
 
-// crustify:todo: e255_isCandidate
-//   authority : dcc/src/Transform/Sentient/VectorRegisterInitialization.cpp:125  (32 body lines, level 0)
-//   original  : bool VectorRegisterInitializationPass::isCandidate( Operation &op, const PortListTy &set_of_accessed_ports)
+use std::collections::BTreeSet;
 
-// crustify:todo: e256_markForRegisterInit
-//   authority : dcc/src/Transform/Sentient/VectorRegisterInitialization.cpp:159  (6 body lines, level 0)
-//   original  : void VectorRegisterInitializationPass::markForRegisterInit(Operation &op)
+use crate::arch::Arch;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient, uniform};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::units::DfirUnit;
+use crate::workload::Workload;
+
+/// THE PORTS ALREADY READ OR WRITTEN AT ONE POINT IN PROGRAM ORDER — `PortListTy =
+/// std::set<SentientComputePort>` (`dcc/src/Dialect/Sentient/Utils.hpp:27`), whose element is this
+/// island's [`sentient::Port`].
+pub(crate) type PortList = BTreeSet<sentient::Port>;
+
+/// `Statistic<"vector_register_init_count", "num-vector-register-inits", "Number of vector register
+/// initializations moved to the program header">` (`Transform/Sentient/Passes.td:162`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct VectorRegisterInitCount(pub(crate) u32);
+
+/// `VectorRegisterInitializationPass`'s OWN STATE (`:51-78`) — the statistic these units share.
+///
+/// ⭐ `opts_` IS DELIBERATELY ABSENT. Its one reader is the `opts_.OptLevel == 0` test inside the
+/// `#if 0` that the FIXME at `:84-92` disables, so the C++ carries the option and nothing reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct VectorRegisterInitialization {
+    /// How many splats this pass has moved into the program header.
+    pub(crate) vector_register_init_count: VectorRegisterInitCount,
+}
+
+impl VectorRegisterInitialization {
+    /// Replaces: e254_runOn
+    ///
+    /// Runs the pass on the PE and SFP program units of the module, and on no others.
+    ///
+    /// ⛔ NAMED FOR ITS ARGUMENT: `runOn(ModuleOp)` and `runOn(dataflow::ProgramUnitOp)` (e398) are
+    /// one C++ overload set and cannot both be `run_on` here.
+    /// ⭐ `getUnitType(unit.getUnits()[0].getDefiningOp())` IS `Units::kind()` — the list is
+    /// constructed BY kind and has a head, so its first element's type is the list's.
+    pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+    ) {
+        for unit in program.units.iter_mut() {
+            // `if (is_any_of(type, PE, SFP)) runOn(unit);` — the LRF this pass initialises is the
+            // vector register file, which only the two vector compute units have.
+            if matches!(unit.on.kind(), DfirUnit::Pe | DfirUnit::Sfp) {
+                self.run_on_unit(unit);
+            }
+        }
+    }
+
+    /// `VectorRegisterInitializationPass::runOn(dataflow::ProgramUnitOp)` — e254's ONE callee, and
+    /// SENPASS UNIT e398, whose anchor is still open below. Isolating the delegation in a private seam
+    /// is the `2a8195231` precedent; e398's TODO is left untouched.
+    fn run_on_unit<A: Arch>(&mut self, unit: &mut ProgramUnit<A>) {
+        todo!(
+            "VectorRegisterInitializationPass::runOn(dataflow::ProgramUnitOp) — senpass e398 \
+             (VectorRegisterInitialization.cpp:80) is not ported yet, and this {} op unit needs it",
+            unit.body.len()
+        )
+    }
+
+    /// Replaces: e255_isCandidate
+    ///
+    /// Whether one op is a `sentient.splat` of constants into a port nothing has accessed yet.
+    ///
+    /// ⛔ THE PORT RULE IS DELIBERATELY CONSERVATIVE (`:151-155`): the splat must be the FIRST access
+    /// through its output port, so a port already in `accessed_ports` disqualifies it outright.
+    /// ⛔ A `uniform.query_map` INPUT NEEDS **EVERY** ENTRY of the mapping behind it to be constant,
+    /// not just the entry this unit would read — the marked splat becomes one program header for all.
+    pub(crate) fn is_candidate(
+        &self,
+        op: &Op,
+        accessed_ports: &PortList,
+        defs: Definitions<'_>,
+    ) -> bool {
+        // `if (!isa<sentient::SplatOp>(op)) return false;`
+        let Op::Sentient(sentient::Op::Splat { input, output, .. }) = op else {
+            return false;
+        };
+        // The three `getDefiningOp<T>()`s, then `if (!const_input && !vector_const && !query_map)
+        // return false;` and the query map's own walk.
+        match defs.of(*input) {
+            Some(Op::Sentient(
+                sentient::Op::ScalarConstant { .. } | sentient::Op::VectorConstant { .. },
+            )) => {}
+            Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => {
+                if !all_mapped_values_are_constants(*map, defs) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        // `auto output_port = splat_op.getOutput().getDefiningOp<sentient::LogicalPortOp>();`
+        let Some(Op::Sentient(sentient::Op::LogicalPort { port_name, .. })) = defs.of(*output)
+        else {
+            todo!(
+                "isCandidate: DT_CHECK_MSG(output_port, \"expected output port to be specified \
+                 through logical_port\") on {output:?} (:147-150)"
+            )
+        };
+        // `if (set_of_accessed_ports.count(output_port.getPortName())) return false; return true;`
+        !accessed_ports.contains(port_name)
+    }
+
+    /// Replaces: e256_markForRegisterInit
+    ///
+    /// Sets `programHeader = true` on a candidate `sentient.splat` and counts it — THE PASS'S WHOLE
+    /// EFFECT on the IR; `ConstructProgIRHelper` reads the attribute instead of emitting an IMMCOPY.
+    ///
+    /// ⛔ THE `DT_CHECK_MSG(isa<sentient::SplatOp>(op), ..)` IS NOT UNREPRESENTABLE HERE: the argument
+    /// is `Operation &op` in the reference and any [`Op`] here, so it stays a named stop.
+    pub(crate) fn mark_for_register_init(&mut self, op: &mut Op) {
+        let Op::Sentient(sentient::Op::Splat { program_header, .. }) = op else {
+            todo!(
+                "markForRegisterInit: DT_CHECK_MSG(isa<sentient::SplatOp>(op), \"expected a splat \
+                 operation\") on {op:?} (:160)"
+            )
+        };
+        *program_header = true;
+        self.vector_register_init_count.0 += 1;
+    }
+}
+
+/// `dyn_cast<mlir::uniform::DefImmutableMappingOp>(query_map.getMap().getDefiningOp())` and the
+/// `isa<sentient::ConstantOp, sentient::VectorConstantOp>` walk over its values (`:136-145`).
+///
+/// ⛔ AN ENTRY WITH NO DEFINING OP ANSWERS `false`, WHICH IS THE REFERENCE'S INTENT AND NOT ITS
+/// BEHAVIOUR: `isa<>` on the null `Operation *` of a region argument aborts there. An empty mapping is
+/// vacuously constant, exactly as the reference's loop is.
+fn all_mapped_values_are_constants(map: Val, defs: Definitions<'_>) -> bool {
+    let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(map) else {
+        todo!(
+            "isCandidate: a uniform.query_map's $map is not a uniform.def_immutable_mapping, which \
+             `dyn_cast` + `target_map.getValues()` dereferences unchecked (:136-138)"
+        )
+    };
+    pairs.iter().all(|(_key, value)| {
+        matches!(
+            defs.of(*value),
+            Some(Op::Sentient(
+                sentient::Op::ScalarConstant { .. } | sentient::Op::VectorConstant { .. }
+            ))
+        )
+    })
+}
 
 // crustify:todo: e397_runOnOperation
 //   authority : dcc/src/Transform/Sentient/VectorRegisterInitialization.cpp:66  (6 body lines, level 1)
@@ -103,3 +243,167 @@
 //   original  : void VectorRegisterInitializationPass::runOn(dataflow::ProgramUnitOp unit)
 //   calls     : e255_isCandidate, e256_markForRegisterInit
 
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
+    use crate::islands::sentient::dialects::sentient::{
+        LrfIndex, Port, Precision, RegType, SplatPad, UnrollFactor,
+    };
+
+    /// A model, so a program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// `%r = sentient.scalar_constant {value = N : si64} : index`.
+    fn scalar_const(result: u32, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result: Val(result),
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `%p = sentient.logical_port {portName = port}`.
+    fn logical_port(result: u32, port_name: Port) -> Op {
+        Op::Sentient(sentient::Op::LogicalPort {
+            port_name,
+            result: Val(result),
+        })
+    }
+
+    /// `sentient.splat %in, %out, %mask {..}`.
+    fn splat(input: u32, output: u32) -> Op {
+        Op::Sentient(sentient::Op::Splat {
+            input: Val(input),
+            output: Val(output),
+            mask: Val(99),
+            pad: SplatPad::None,
+            precision: Precision::Fp16,
+            program_header: false,
+            unroll_factor: UnrollFactor::X1,
+            unroll_incr_result: false,
+            dbg_name: None,
+        })
+    }
+
+    /// One program with one unit on `kind`, holding `body`.
+    fn program_on(kind: DfirUnit, body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(kind, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// e254 — a unit that is neither PE nor SFP is not visited at all, which is the whole content of
+    /// this overload: reaching one would panic on the unported e398.
+    #[test]
+    fn run_on_program_skips_a_unit_that_is_not_pe_or_sfp() {
+        let mut program = program_on(DfirUnit::L3lu, vec![scalar_const(1, 7)]);
+        let mut pass = VectorRegisterInitialization::default();
+        pass.run_on_program(&mut program);
+        assert_eq!(pass, VectorRegisterInitialization::default());
+    }
+
+    /// e254 — and a PE unit IS visited, by e398, which is not ported.
+    #[test]
+    #[should_panic(expected = "senpass e398")]
+    fn run_on_program_delegates_a_pe_unit_to_the_unported_e398() {
+        let mut program = program_on(DfirUnit::Pe, vec![scalar_const(1, 7)]);
+        VectorRegisterInitialization::default().run_on_program(&mut program);
+    }
+
+    /// e255 — the vendor's own shape: a splat of a `sentient.scalar_constant` into a port nothing has
+    /// touched is a candidate.
+    #[test]
+    fn is_candidate_accepts_a_constant_splat_into_an_untouched_port() {
+        let body = vec![
+            scalar_const(1, 7),
+            logical_port(2, Port::Lrf(LrfIndex::L0)),
+            splat(1, 2),
+        ];
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let pass = VectorRegisterInitialization::default();
+        assert!(pass.is_candidate(&body[2], &PortList::new(), defs));
+    }
+
+    /// e255 — and the conservative rule: the same splat is refused once its output port has been
+    /// accessed by an earlier op.
+    #[test]
+    fn is_candidate_refuses_a_splat_into_an_already_accessed_port() {
+        let body = vec![
+            scalar_const(1, 7),
+            logical_port(2, Port::Lrf(LrfIndex::L0)),
+            splat(1, 2),
+        ];
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let pass = VectorRegisterInitialization::default();
+        let accessed = PortList::from([Port::Lrf(LrfIndex::L0)]);
+        assert!(!pass.is_candidate(&body[2], &accessed, defs));
+    }
+
+    /// e256 — the effect: `programHeader` goes true on the splat and the statistic counts it.
+    #[test]
+    fn mark_for_register_init_sets_the_program_header_and_counts() {
+        let mut op = splat(1, 2);
+        let mut pass = VectorRegisterInitialization::default();
+        pass.mark_for_register_init(&mut op);
+        assert_eq!(
+            (op, pass.vector_register_init_count),
+            (
+                Op::Sentient(sentient::Op::Splat {
+                    input: Val(1),
+                    output: Val(2),
+                    mask: Val(99),
+                    pad: SplatPad::None,
+                    precision: Precision::Fp16,
+                    program_header: true,
+                    unroll_factor: UnrollFactor::X1,
+                    unroll_incr_result: false,
+                    dbg_name: None,
+                }),
+                VectorRegisterInitCount(1)
+            )
+        );
+    }
+}
