@@ -455,7 +455,7 @@ impl RegisterGraphs for OutOfScopeRegisterGraphs {
 /// `isSimplifiable` asks of a node are represented.
 ///
 /// ⭐ `Root` IS THE IDENTITY TEST, NOT A FLAG: `root_ = root_ ? root_ : new RDENode(nullptr)`
-/// (`Analyses/RedundantDefinitionEliminationTree.cpp:294`) makes the root the ONLY node without an
+/// (`Analyses/RedundantDefinitionEliminationTree.cpp:223`) makes the root the ONLY node without an
 /// operation, so `getRoot() == &node` is a CASE of this enum rather than a pointer comparison.
 ///
 /// ⭐ ONE DEFINITION FOR THE WHOLE CAMPAIGN. Four RDE passes (`ImplicitSyncRE`,

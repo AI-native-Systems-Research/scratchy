@@ -106,12 +106,12 @@ fn is_operation_a_use(op: &Op) -> bool {
 /// `setDataflowGen`, so a `load_and_send` node keeps the null the tree constructed it with — a
 /// distinction `SetActiveMaskValueGenValue::unknown()` would erase.
 ///
-/// ⛔ TRAP: `DT_CHECK(samv_op.getMaskValue())` (`:110`) IS NOW THE TYPE — `$mask_value` is a required
+/// ⛔ TRAP: `DT_CHECK(samv_op.getMaskValue())` (`:109`) IS NOW THE TYPE — `$mask_value` is a required
 /// operand (`SentientOps.td:1019`), so the island cannot hold a `samv` without one.
 ///
 /// ⛔ TRAP: THE REFERENCE DEREFERENCES A NULL OPERATION FOR THE ROOT (`*node->getOperation()` at
 /// `:101`), which `compute()` never reaches because it calls this on selected nodes only
-/// (`Analyses/RedundantDefinitionEliminationTree.cpp:217,247-294`). The root takes the "not a samv"
+/// (`Analyses/RedundantDefinitionEliminationTree.cpp:213-219,225,294`). The root takes the "not a samv"
 /// arm here and generates the unknown value.
 #[must_use]
 pub(crate) fn initialize_dataflow_info(node: &RdeNode<'_>) -> Option<SetActiveMaskValueGenValue> {

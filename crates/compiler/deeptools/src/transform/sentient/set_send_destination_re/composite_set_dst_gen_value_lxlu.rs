@@ -78,12 +78,12 @@
 
 use super::QueryMapOp;
 
-/// `CompositeSetDstGenValueLXLU` (`SetSendDestinationRE.hpp:58`) — where an LXLU's sends go when the
+/// `CompositeSetDstGenValueLXLU` (`SetSendDestinationRE.hpp:59`) — where an LXLU's sends go when the
 /// destination is per-unit and so comes out of a uniformization mapping.
 ///
 /// ⛔ THE QUERY MAP IS NOT OPTIONAL. `isInitialized()` is `qmap_` (`:66`) and the default constructor
 /// takes `nullptr`, but the only constructor that ever produces one of these inside a GenValue
-/// `DT_CHECK(qmap)`s first (`:90`) — so the null state is [`super::set_dst_gen_value_lxlu::GenValue`]'s
+/// `DT_CHECK(qmap)`s first (`:93`) — so the null state is [`super::set_dst_gen_value_lxlu::GenValue`]'s
 /// `Unknown` kind, not a null field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompositeSetDstGenValueLxlu {

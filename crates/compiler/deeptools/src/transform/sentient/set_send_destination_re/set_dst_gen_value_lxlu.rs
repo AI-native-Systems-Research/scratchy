@@ -84,7 +84,7 @@ use super::simple_set_dst_gen_value_lxlu::{SendDestination, SimpleSetDstGenValue
 use crate::islands::sentient::dialects::Op;
 
 /// `SetDstGenValueLXLU::Kind` AND ITS `union GenValue` AS ONE VALUE
-/// (`SetSendDestinationRE.hpp:81-85,113-122`).
+/// (`SetSendDestinationRE.hpp:82-86,114-123`).
 ///
 /// ⛔⛔ THE TAG AND THE UNION ARE ONE THING, WHICH IS WHAT MAKES `llvm_unreachable("unhandled case")`
 /// AND `llvm_unreachable("kind of gen value not fully implemented")` UNREPRESENTABLE. In the
@@ -102,11 +102,11 @@ pub(crate) enum GenValue {
     Composite(CompositeSetDstGenValueLxlu),
 }
 
-/// `SetDstGenValueLXLU` (`SetSendDestinationRE.hpp:78`) — the dataflow definition an RDE node
+/// `SetDstGenValueLXLU` (`SetSendDestinationRE.hpp:80`) — the dataflow definition an RDE node
 /// generates when this pass is optimizing the LXLU's `SETDSTMASK`.
 ///
 /// ⭐ THE BASE CLASS'S THREE FIELDS ARE HELD HERE. `DataFlowDefinitionBase`
-/// (`Analyses/RedundantDefinitionEliminationTree.hpp:290`) is OUT OF CAMPAIGN SCOPE, and e199 writes
+/// (`Analyses/RedundantDefinitionEliminationTree.hpp:327`) is OUT OF CAMPAIGN SCOPE, and e199 writes
 /// `op_` while e200 prints both flags — so the subclass carries them, exactly as
 /// [`crate::transform::sentient::implicit_sync_re::ImplicitSyncGenValue`] does.
 #[derive(Debug, Clone, Default)]
@@ -127,7 +127,7 @@ impl SetDstGenValueLxlu {
         SetDstGenValueLxlu::default()
     }
 
-    /// `SetDstGenValueLXLU(mode, op)` (`:94`).
+    /// `SetDstGenValueLXLU(mode, op)` (`:95`).
     #[must_use]
     pub(crate) fn simple(value: SendDestination, op: Op) -> SetDstGenValueLxlu {
         SetDstGenValueLxlu {
@@ -138,7 +138,7 @@ impl SetDstGenValueLxlu {
         }
     }
 
-    /// `SetDstGenValueLXLU(qmap, op)` (`:88`).
+    /// `SetDstGenValueLXLU(qmap, op)` (`:90`).
     #[must_use]
     pub(crate) fn composite(qmap: QueryMapOp, op: Op) -> SetDstGenValueLxlu {
         SetDstGenValueLxlu {
@@ -149,7 +149,7 @@ impl SetDstGenValueLxlu {
         }
     }
 
-    /// `isUnknownValue()` — `!isSimple() && !isComposite()` (`:106-108`).
+    /// `isUnknownValue()` — `!isSimple() && !isComposite()` (`:107-109`).
     #[must_use]
     pub(crate) const fn is_unknown_value(&self) -> bool {
         matches!(self.gen_value, GenValue::Unknown)
@@ -186,12 +186,12 @@ impl SetDstGenValueLxlu {
         match (self.gen_value, rhs.gen_value) {
             (GenValue::Unknown, _) | (_, GenValue::Unknown) => false,
             (GenValue::Simple(lhs), GenValue::Simple(rhs)) => lhs.value() == rhs.value(),
-            // "todo: for now we establish equality based on shallow SSA value comparison" (`:337`).
+            // "todo: for now we establish equality based on shallow SSA value comparison" (`:338-340`).
             (GenValue::Composite(lhs), GenValue::Composite(rhs)) => {
                 lhs.query_map() == rhs.query_map()
             }
             // "We don't have valid scenarios where we need to optimize across simple and composite
-            // nodes" (`:328-330`).
+            // nodes" (`:328-329`).
             (GenValue::Simple(_), GenValue::Composite(_))
             | (GenValue::Composite(_), GenValue::Simple(_)) => false,
         }

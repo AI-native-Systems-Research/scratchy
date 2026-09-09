@@ -78,11 +78,11 @@
 
 use super::QueryMapOp;
 
-/// `CompositeSetDstGenValueSFP` (`SetSendDestinationRE.hpp:150`) — where an SFP's sends go when the
+/// `CompositeSetDstGenValueSFP` (`SetSendDestinationRE.hpp:152`) — where an SFP's sends go when the
 /// destination is per-unit and so comes out of a uniformization mapping.
 ///
 /// ⛔ THE QUERY MAP IS NOT OPTIONAL, for the same reason as its LXLU twin: `SetDstGenValueSFP(qmap,
-/// op)` `DT_CHECK(qmap)`s (`:182`), so the null `isInitialized()` state is
+/// op)` `DT_CHECK(qmap)`s (`:186`), so the null `isInitialized()` state is
 /// [`super::set_dst_gen_value_sfp::GenValue`]'s `Unknown` kind rather than a null field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompositeSetDstGenValueSfp {
@@ -96,7 +96,7 @@ impl CompositeSetDstGenValueSfp {
         CompositeSetDstGenValueSfp { qmap }
     }
 
-    /// `getQueryMap()` (`:161`).
+    /// `getQueryMap()` (`:162`).
     #[must_use]
     pub(crate) const fn query_map(self) -> QueryMapOp {
         self.qmap

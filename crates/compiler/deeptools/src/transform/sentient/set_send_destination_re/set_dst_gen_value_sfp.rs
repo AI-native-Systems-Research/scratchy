@@ -87,7 +87,7 @@ use crate::islands::sentient::dialects::{
 use crate::units::{Core, Corelet};
 
 /// `SetDstGenValueSFP::Kind` AND ITS `union GenValue` AS ONE VALUE
-/// (`SetSendDestinationRE.hpp:170-174,203-212`) — see
+/// (`SetSendDestinationRE.hpp:175-179,208-217`) — see
 /// [`super::set_dst_gen_value_lxlu::GenValue`] for why the tag and the union are one thing here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum GenValue {
@@ -100,7 +100,7 @@ pub(crate) enum GenValue {
     Composite(CompositeSetDstGenValueSfp),
 }
 
-/// `SetDstGenValueSFP` (`SetSendDestinationRE.hpp:167`) — the dataflow definition an RDE node
+/// `SetDstGenValueSFP` (`SetSendDestinationRE.hpp:173`) — the dataflow definition an RDE node
 /// generates when this pass is optimizing the SFP's `SETDEST`.
 ///
 /// ⭐ THE BASE CLASS'S THREE FIELDS ARE HELD HERE, for the reason
@@ -123,7 +123,7 @@ impl SetDstGenValueSfp {
         SetDstGenValueSfp::default()
     }
 
-    /// `SetDstGenValueSFP(core_id, corelet_id, op)` (`:186`).
+    /// `SetDstGenValueSFP(core_id, corelet_id, op)` (`:188`).
     #[must_use]
     pub(crate) fn simple(core: Core, corelet: Corelet, op: Op) -> SetDstGenValueSfp {
         SetDstGenValueSfp {
@@ -134,7 +134,7 @@ impl SetDstGenValueSfp {
         }
     }
 
-    /// `SetDstGenValueSFP(qmap, op)` (`:180`).
+    /// `SetDstGenValueSFP(qmap, op)` (`:183`).
     #[must_use]
     pub(crate) fn composite(qmap: QueryMapOp, op: Op) -> SetDstGenValueSfp {
         SetDstGenValueSfp {
@@ -145,7 +145,7 @@ impl SetDstGenValueSfp {
         }
     }
 
-    /// `isUnknownValue()` — `!isSimple() && !isComposite()` (`:198-200`).
+    /// `isUnknownValue()` — `!isSimple() && !isComposite()` (`:202-204`).
     #[must_use]
     pub(crate) const fn is_unknown_value(&self) -> bool {
         matches!(self.gen_value, GenValue::Unknown)
@@ -170,7 +170,7 @@ impl SetDstGenValueSfp {
     ///
     /// ⭐⭐ THE COMPOSITE CASE HAS A SECOND CHANCE THE LXLU TWIN DOES NOT: two DIFFERENT
     /// `uniform.query_map` ops are still equal when they resolve to the same key list and the same
-    /// value list (`SetSendDestinationRE.cpp:437-448`), which is why `defs` is a parameter here.
+    /// value list (`SetSendDestinationRE.cpp:440-449`), which is why `defs` is a parameter here.
     /// ⛔ THE ORDER OF BOTH LISTS COUNTS — the reference's own todo says so; positional equality is
     /// the contract, not set equality.
     ///

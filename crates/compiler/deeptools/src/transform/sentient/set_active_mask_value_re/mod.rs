@@ -94,8 +94,12 @@ use crate::islands::sentient::print;
 
 pub(crate) mod set_active_mask_value_rde_tree;
 
-/// A `sentient.samv`'S WHOLE ATTRIBUTE DICTIONARY — `samv_op->getAttrDictionary()`, which is what
+/// A `sentient.samv`'S INHERENT ATTRIBUTE DICTIONARY — `samv_op->getAttrDictionary()`, which is what
 /// `SetActiveMaskValueGenValue::attrs_` holds and compares.
+///
+/// ⛔ THE REFERENCE'S DICTIONARY ALSO CARRIES THE DISCARDABLE ATTRIBUTES `regIndices`/`regLocales`
+/// (`SentientOps.td:1015-1016`), which the island's `Op::Samv` does not model — so two `samv`s
+/// differing only in an assigned register compare EQUAL here and unequal in the reference.
 ///
 /// ⛔ THE DICTIONARY IS THE OP'S ATTRIBUTES AND `$mask_value` IS AN OPERAND (`SentientOps.td:1019`),
 /// so the mask value is NOT in here — it is the GenValue's other field, compared by its own rule.
@@ -161,7 +165,7 @@ pub(crate) struct SetActiveMaskValueGenValue {
     /// `op_` — absent for the default-constructed unknown value.
     op: Option<Op>,
     /// `DataFlowDefinitionBase::is_optimized_`
-    /// (`Analyses/RedundantDefinitionEliminationTree.hpp:290`) — the base class is OUT OF CAMPAIGN
+    /// (`Analyses/RedundantDefinitionEliminationTree.hpp:327`) — the base class is OUT OF CAMPAIGN
     /// SCOPE, but e183 prints this flag, so the subclass holds it exactly as it holds `op_`.
     is_optimized: bool,
     /// `DataFlowDefinitionBase::is_dead_`, printed by e183 for the same reason.

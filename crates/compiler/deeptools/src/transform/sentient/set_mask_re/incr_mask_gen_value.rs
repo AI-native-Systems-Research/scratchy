@@ -89,7 +89,7 @@ use crate::transform::sentient::cfg_simplification_sentient_level::pattern_simpl
 
 /// HOW MUCH A `sentient.incrmask` INCREMENTS THE MASK — a witness, because the answer is a constant.
 ///
-/// ⛔ `int getIncrement() { return 1; }` (`SentientOps.td:1081`) — the op has NO operands and no
+/// ⛔ `int getIncrement() { return 1; }` (`SentientOps.td:1074`) — the op has NO operands and no
 /// increment attribute, so ONE is the only value `IncrMaskGenValue::increment_` can ever hold and
 /// nothing in the tree calls `setIncrement`. A field would invite a second answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +128,7 @@ pub(crate) struct IncrMaskGenValue {
     /// identity has to be the position, which is what [`OpPath`] is the stand-in for.
     op: Option<OpPath>,
     /// `DataFlowDefinitionBase::is_optimized_`
-    /// (`Analyses/RedundantDefinitionEliminationTree.hpp:290`) — the base class is OUT OF CAMPAIGN
+    /// (`Analyses/RedundantDefinitionEliminationTree.hpp:327`) — the base class is OUT OF CAMPAIGN
     /// SCOPE, but e192 prints this flag, so the subclass holds it exactly as it holds `op_`.
     is_optimized: bool,
     /// `DataFlowDefinitionBase::is_dead_`, printed by e192 for the same reason.
