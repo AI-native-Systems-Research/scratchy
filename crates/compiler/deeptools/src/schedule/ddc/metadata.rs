@@ -319,12 +319,12 @@ impl<S> Constraint<'_, S> {
 
 /// `std::max` ON TWO LOWER BOUNDS — spelled as the comparison it is, because `f32::max` prefers the
 /// non-NaN operand where `std::max(a, b)` returns `a` whenever the comparison is false.
-fn stricter_min(held: f32, new_val: f32) -> f32 {
+pub(crate) fn stricter_min(held: f32, new_val: f32) -> f32 {
     if held < new_val { new_val } else { held }
 }
 
 /// `std::min` ON TWO UPPER BOUNDS — likewise `(b < a) ? b : a`.
-fn stricter_max(held: f32, new_val: f32) -> f32 {
+pub(crate) fn stricter_max(held: f32, new_val: f32) -> f32 {
     if new_val < held { new_val } else { held }
 }
 
