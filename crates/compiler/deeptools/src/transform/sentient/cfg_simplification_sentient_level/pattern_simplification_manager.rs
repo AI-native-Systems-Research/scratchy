@@ -180,7 +180,7 @@ impl Marks {
     }
 }
 
-/// One entry of `lhs_to_for_op_or_null_` (`:537-690`): the loop a predicate's LHS is the IV of, with
+/// One entry of `lhs_to_for_op_or_null_` (`:540-543`): the loop a predicate's LHS is the IV of, with
 /// the four bounds `getOrCreateTupleForIV` records
 /// (`Analyses/CFGSSentientLevelConditionalTree.hpp:363-368`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,14 +191,14 @@ pub struct LoopInfo {
     pub lb: i64,
     /// `std::get<2>` — the upper bound.
     pub ub: i64,
-    /// `std::get<3>` — ⭐ NON-ZERO AS A TYPE, which is what `DT_CHECK_MSG(step != 0, ..)` (`:931`)
+    /// `std::get<3>` — ⭐ NON-ZERO AS A TYPE, which is what `DT_CHECK_MSG(step != 0, ..)` (`:933`)
     /// asks for at runtime.
     pub step: NonZeroI64,
     /// `std::get<4>` — the number of iterations.
     pub iterations: i64,
 }
 
-/// One entry of `ivs_dimensions_multipliers_` (`:537-690`): an IV, the size of the table dimension it
+/// One entry of `ivs_dimensions_multipliers_` (`:550-551`): an IV, the size of the table dimension it
 /// spans and the multiplier that dimension contributes (`:780-830`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IvDim {
@@ -210,7 +210,7 @@ pub struct IvDim {
     pub multiplier: i64,
 }
 
-/// A TABLE INDEX THAT IS IN RANGE BY CONSTRUCTION — `is_idx_valid` (`:934`) as a type, so a filter
+/// A TABLE INDEX THAT IS IN RANGE BY CONSTRUCTION — `is_idx_valid` (`:936`) as a type, so a filter
 /// bit cannot be addressed outside the array the IV's iteration count sized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableIdx(usize);
@@ -244,7 +244,7 @@ struct IvEntry {
 
 impl IvValuesAndFilters {
     /// One entry per IV, each with that IV's `num_iterations` filter bits — the reference's
-    /// `new bool[num_iterations]` (`:806`).
+    /// `new bool[num_iterations]` (`:805`).
     #[must_use]
     pub fn of(ivs: impl IntoIterator<Item = (Val, i64)>) -> Self {
         let mut table = Self::default();
@@ -334,7 +334,7 @@ pub struct Branch {
     pub child: Option<Box<CondNode>>,
 }
 
-/// `PatternSimplificationManager` (`:537-690`) — the members the units in this file read.
+/// `PatternSimplificationManager` (`:537-695`) — the members the units in this file read.
 #[derive(Debug, Clone, Default)]
 pub struct PatternSimplificationManager {
     /// `lhs_to_for_op_or_null_`.
@@ -352,7 +352,7 @@ pub struct PatternSimplificationManager {
 pub struct IterArgTarget {
     /// `target_lb`.
     pub lb: Val,
-    /// `target_step`; `None` is the case where `monotone_seq_val_step_` stands in for it (`:1519`).
+    /// `target_step`; `None` is the case where `monotone_seq_val_step_` stands in for it (`:1522-1523`).
     pub step: Option<EvaluatedValue>,
     /// `type`.
     pub ty: ScalarTy,
@@ -366,7 +366,7 @@ pub struct IterArgTarget {
 #[derive(Debug, Clone, Copy)]
 pub struct EvaluatedValue(pub Val);
 
-/// `*step_as_ev == evaluator_.evaluateMultiplyByConst(*target_step, multiplier)` (`:1508-1515`).
+/// `*step_as_ev == evaluator_.evaluateMultiplyByConst(*target_step, multiplier)` (`:1519-1520`).
 fn step_matches_target(step: Val, target_step: EvaluatedValue, multiplier: i64) -> bool {
     let _ = (step, target_step, multiplier);
     todo!(
@@ -689,7 +689,7 @@ impl PatternSimplificationManager {
     ) {
         let iv = n.lhs;
         let rhs_val = n.rhs_val;
-        // `DT_CHECK_MSG(step != 0, ..)` (`:931`) is [`LoopInfo::step`]'s type; an IV with no recorded
+        // `DT_CHECK_MSG(step != 0, ..)` (`:933`) is [`LoopInfo::step`]'s type; an IV with no recorded
         // loop is the state that check catches, and there is no table dimension to populate for it.
         let (iterations, idx) = {
             let Some(info) = self.lhs_to_for_op_or_null.get(&iv) else {
@@ -697,7 +697,7 @@ impl PatternSimplificationManager {
             };
             (info.iterations, TableIdx::of(rhs_val, info))
         };
-        // `DT_CHECK_MSG(is_idx_valid || n->getThenNode()->isDead(), ..)` (`:935`) is a pure
+        // `DT_CHECK_MSG(is_idx_valid || n->getThenNode()->isDead(), ..)` (`:937`) is a pure
         // assertion about the tree the caller handed over: nothing here refuses at runtime.
         let chosen = ivs.chosen(iv);
         let disallowed = idx.is_some_and(|at| ivs.filter(iv, at, iterations));
@@ -776,7 +776,7 @@ impl PatternSimplificationManager {
                 continue;
             }
             // The candidate may only be read by conditionals, by the next inner loop, by the yield,
-            // by a dead op, or by a `scalar_add` that feeds nothing but the yield (`:1478-1503`) —
+            // by a dead op, or by a `scalar_add` that feeds nothing but the yield (`:1477-1499`) —
             // otherwise reusing it would mismatch register types.
             let mut is_candidate = true;
             for use_path in uses_of(candidate, root) {
@@ -832,7 +832,7 @@ impl PatternSimplificationManager {
                     }
                 }
             }
-            // `DT_CHECK_MSG(lower_bound, ..)` (`:1523`): a loop has one init per carried value.
+            // `DT_CHECK_MSG(lower_bound, ..)` (`:1527`): a loop has one init per carried value.
             let lower_bound = carried[index].init;
             if rest.is_empty() {
                 if is_same_constant(lower_bound, target.lb, root) {

@@ -97,7 +97,7 @@ use crate::islands::sentient::dialects::Val;
 /// Whether this unit is already a member of one of the collected sets of units.
 ///
 /// TRAP: the identity is the `Val` the `dataflow.get_unit` BINDS — every `unit_op` this pass compares
-/// arrives through `unit.getDefiningOp()` (`dcc/src/Transform/Sentient/Deuniform.cpp:509`), so equal
+/// arrives through `unit.getDefiningOp()` (`dcc/src/Transform/Sentient/Deuniform.cpp:505-506`), so equal
 /// values are the same op.
 pub fn exists_in_collection(unit_op: Val, collection: &[Vec<Val>]) -> bool {
     collection.iter().any(|set| set.contains(&unit_op))

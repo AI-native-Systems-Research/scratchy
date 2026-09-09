@@ -134,9 +134,9 @@ impl DefiningSync {
 /// The node's `setDataflowGen`: a defining `sentient.sync` generates its boundary as a tile size,
 /// every other node the unknown value.
 ///
-/// ⛔ TRAP: `DT_CHECK(has_value())` (`:107`) IS UNREACHABLE AND IS NOW A TYPE. `isOperationSelected`
+/// ⛔ TRAP: `DT_CHECK(has_value())` (`:108`) IS UNREACHABLE AND IS NOW A TYPE. `isOperationSelected`
 /// admits a `sentient.sync` only through `isOperationADef` and `compute()` calls this on selected
-/// nodes alone (`Analyses/RedundantDefinitionEliminationTree.cpp:217,247-294`), so [`DefiningSync`]
+/// nodes alone (`Analyses/RedundantDefinitionEliminationTree.cpp:217,244-294`), so [`DefiningSync`]
 /// is the check — and unlike the abort it has an answer for the input the check cannot get.
 #[must_use]
 pub(crate) fn initialize_dataflow_info(node: &RdeNode<'_>) -> ImplicitSyncGenValue {

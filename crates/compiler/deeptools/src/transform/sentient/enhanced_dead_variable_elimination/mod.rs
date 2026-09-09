@@ -102,7 +102,7 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient, symbol};
 use crate::islands::sentient::print;
 
-/// `InfluenceType` (`EnhancedDeadVariableElimination.hpp:36`) — what an SSA value's value decides.
+/// `InfluenceType` (`EnhancedDeadVariableElimination.hpp:42`) — what an SSA value's value decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Influence {
     /// `kControlFlow`.
@@ -189,7 +189,7 @@ pub(crate) struct Assignment {
     owner: Owner,
 }
 
-/// The message the disagreement carries (`EnhancedDeadVariableElimination.cpp:97`).
+/// The message the disagreement carries (`EnhancedDeadVariableElimination.cpp:94`).
 pub(crate) const INFLUENCE_CONFLICT: &str = "A SSA variable has influence over control and memory";
 
 /// `op->emitError(...)` + `signalPassFailure()` AS DATA — one recorded disagreement.
@@ -235,7 +235,7 @@ impl EnhancedDeadVariableElimination {
     /// Records `val`'s influence and queues it; a differing second influence is a conflict unless the
     /// owner is a `sentient.scalar_constant` or a `symbol.create_symbol`.
     ///
-    /// ⛔ TRAP: `Operation *user` IS UNUSED IN THE BODY (`:66-96`) — dropped here, though e300 and
+    /// ⛔ TRAP: `Operation *user` IS UNUSED IN THE BODY (`:66-99`) — dropped here, though e300 and
     /// e301 still pass it.
     /// ⛔ TRAP: the early return on a `dataflow.program_unit` iter_arg is why [`Assignment`] holds an
     /// [`Owner`] unconditionally.
@@ -283,7 +283,11 @@ impl EnhancedDeadVariableElimination {
     /// Per record, in key order: the owning op as text, then `influence: <spelling>`.
     ///
     /// ⛔ TRAP: `llvm::outs()` is a PARAMETER here, so the pass writes into a caller's buffer rather
-    /// than the process's stdout and a test can read what it wrote.
+    /// than the process's stdout and a test can read what it wrote. ONE BUFFER FOR BOTH HALVES IS
+    /// THIS PORT'S CHOICE: `Operation::dump()` (`:115`, `:117`) does not write to `llvm::outs()`, so
+    /// the reference's two halves land on different streams and their interleaving was never
+    /// observable. No MLIR header ships in `/Users/nickm/git/deeptools-src`, so which stream `dump()`
+    /// takes could not be read here; debug trace only, and no golden compares these bytes.
     pub(crate) fn print_assignments(&self, out: &mut String) {
         for record in self.assignments.values() {
             print::emit(out, &record.owner.0, 0);
