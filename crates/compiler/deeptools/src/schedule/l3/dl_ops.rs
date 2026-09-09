@@ -276,6 +276,7 @@ use crate::schedule::l3::dsc::{
 };
 use crate::units::Core;
 use std::collections::{BTreeMap, BTreeSet};
+use sys_arch_spec::arch_enums::OpFunc;
 
 /// THE WITNESS `isSameDscGroup` HANDS BACK — constructible only from a [`SuperDsc`], whose DSC list
 /// is non-empty by type, so the caller's `DT_CHECK` on the result has nothing left to test.
@@ -862,53 +863,331 @@ mod tests_e001_e008 {
 //   original  : bool L3DlOpsScheduler::isOpFuncConv2dOs1(const OpFuncs opFuncName) const
 //   extract   : crustify-ddc/cpp/l3.cpp:640-646
 
-// crustify:todo: e025_isOpFuncBmmInt4
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:769  (6 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncBmmInt4(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:656-662
+/// Replaces: e025_isOpFuncBmmInt4
+///
+/// The int4-weight batch matmuls — plain, sparse-KG3 and both XRF spellings.
+#[must_use]
+pub const fn is_op_func_bmm_int4(op_func: OpFunc) -> bool {
+    matches!(
+        op_func,
+        OpFunc::BatchmatmulInt4Fwd
+            | OpFunc::BatchmatmulInt4FwdSparsekg3
+            | OpFunc::BatchmatmulXrfInt4Fwd
+            | OpFunc::BatchmatmulXrfchInt4Fwd
+    )
+}
 
-// crustify:todo: e026_isOpFuncBmmInt8
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:776  (7 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncBmmInt8(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:672-679
+/// Replaces: e026_isOpFuncBmmInt8
+///
+/// The int8-weight batch matmuls, five of them; `_MBKG3` is int8's only multi-batch spelling.
+#[must_use]
+pub const fn is_op_func_bmm_int8(op_func: OpFunc) -> bool {
+    matches!(
+        op_func,
+        OpFunc::BatchmatmulInt8Fwd
+            | OpFunc::BatchmatmulInt8FwdMbkg3
+            | OpFunc::BatchmatmulInt8FwdSparsekg3
+            | OpFunc::BatchmatmulXrfInt8Fwd
+            | OpFunc::BatchmatmulXrfchInt8Fwd
+    )
+}
 
-// crustify:todo: e027_isOpFuncBmmFp8NonXrf
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:784  (6 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncBmmFp8NonXrf(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:689-695
+/// Replaces: e027_isOpFuncBmmFp8NonXrf
+///
+/// The fp8 batch matmuls that are not XRF-spelled — plain, `_MB` and sparse-KG3.
+///
+/// ⛔ TRAP: `_MB` HERE, `_MBKG3` IN [`is_op_func_bmm_int8`] — the two multi-batch spellings are
+/// different ops, and `getMinParamBmm` reaches this family and int8 through ONE arm (`:965`).
+#[must_use]
+pub const fn is_op_func_bmm_fp8_non_xrf(op_func: OpFunc) -> bool {
+    matches!(
+        op_func,
+        OpFunc::BatchmatmulFp8Fwd
+            | OpFunc::BatchmatmulFp8FwdMb
+            | OpFunc::BatchmatmulFp8FwdSparsekg3
+    )
+}
 
-// crustify:todo: e028_isOpFuncBmmFp8Xrf
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:791  (5 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncBmmFp8Xrf(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:705-710
+/// Replaces: e028_isOpFuncBmmFp8Xrf
+///
+/// The two XRF-spelled fp8 batch matmuls, `XRF` and `XRFCH`.
+#[must_use]
+pub const fn is_op_func_bmm_fp8_xrf(op_func: OpFunc) -> bool {
+    matches!(
+        op_func,
+        OpFunc::BatchmatmulXrfFp8Fwd | OpFunc::BatchmatmulXrfchFp8Fwd
+    )
+}
 
-// crustify:todo: e029_isOpFuncBmmFp16
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:797  (6 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncBmmFp16(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:720-726
+/// Replaces: e029_isOpFuncBmmFp16
+///
+/// The four batch matmuls whose names carry no format token at all.
+///
+/// ⛔ TRAP: THE NAME SAYS FP16 AND NO MEMBER SAYS ANYTHING — `BATCHMATMUL_FWD` with its sparse-KG3
+/// and XRF spellings is the DEFAULT-format op, so this family is "the format the op does not name",
+/// not a stated fp16.
+#[must_use]
+pub const fn is_op_func_bmm_fp16(op_func: OpFunc) -> bool {
+    matches!(
+        op_func,
+        OpFunc::BatchmatmulFwd
+            | OpFunc::BatchmatmulFwdSparsekg3
+            | OpFunc::BatchmatmulXrfFwd
+            | OpFunc::BatchmatmulXrfchFwd
+    )
+}
 
-// crustify:todo: e030_isOpFuncScalarBroadcast
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:810  (18 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncScalarBroadcast(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:736-754
+/// Replaces: e030_isOpFuncScalarBroadcast
+///
+/// Seven activations plus `ADD`, `STRIDED_ADD`, `MUL`, `SUB`, `REVSUB`, `BIASADD`, `BATCHNORM_FWD`.
+///
+/// ⛔ TRAP: THIS IS NOT "ELEMENTWISE". `REALDIV`, `MAXIMUM`, `MINIMUM`, `FNMS`, `WHERE3` and every
+/// other unary transcendental (`EXP_FWD`, `SILU_FWD`, `SQRT_FWD`, `RSQRT`, …) have the same operand
+/// shape and are ABSENT, so `getMinParamForDimFromOpFunc` (`:1137`) hands them its default 1.
+#[must_use]
+pub const fn is_op_func_scalar_broadcast(op_func: OpFunc) -> bool {
+    matches!(
+        op_func,
+        OpFunc::ReluFwd
+            | OpFunc::Relu6Fwd
+            | OpFunc::LeakyreluFwd
+            | OpFunc::GeluFwd
+            | OpFunc::TanhFwd
+            | OpFunc::SigmoidFwd
+            | OpFunc::FastSigmoidFwd
+            | OpFunc::Add
+            | OpFunc::StridedAdd
+            | OpFunc::Mul
+            | OpFunc::Sub
+            | OpFunc::Revsub
+            | OpFunc::Biasadd
+            | OpFunc::BatchnormFwd
+    )
+}
 
-// crustify:todo: e031_isOpFuncReduction
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:829  (7 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncReduction(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:764-771
+/// Replaces: e031_isOpFuncReduction
+///
+/// `SUM`, `MAX`, `MEAN`, `EXX2` and four of the non-stick reductions.
+///
+/// ⛔ TRAP: SIX REDUCTIONS THE SET DOES NOT CLAIM — `ABSMAX`, `MIN`, `ABSMAX_NONSTICK`,
+/// `MIN_NONSTICK`, `EXX2_ZEROMEAN` and `GENERIC_PARTIAL_REDUCTION` all reduce and all answer
+/// `false`, so they take the default min param instead of `getMinParamReduction`.
+#[must_use]
+pub const fn is_op_func_reduction(op_func: OpFunc) -> bool {
+    matches!(
+        op_func,
+        OpFunc::Sum
+            | OpFunc::Max
+            | OpFunc::Mean
+            | OpFunc::Exx2
+            | OpFunc::SumNonstick
+            | OpFunc::MaxNonstick
+            | OpFunc::MeanNonstick
+            | OpFunc::ProdNonstick
+    )
+}
 
-// crustify:todo: e032_isOpFuncPooling
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:837  (5 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncPooling(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:781-786
+/// Replaces: e032_isOpFuncPooling
+///
+/// `MAXPOOL_FWD`, `AVGPOOL_FWD` and `AVGPOOL_NMAP_FWD` — every pooling op the sealed set spells.
+#[must_use]
+pub const fn is_op_func_pooling(op_func: OpFunc) -> bool {
+    matches!(
+        op_func,
+        OpFunc::MaxpoolFwd | OpFunc::AvgpoolFwd | OpFunc::AvgpoolNmapFwd
+    )
+}
+
+#[cfg(test)]
+mod tests_e025_e032 {
+    use super::*;
+
+    /// The five BMM predicates, in the order `isOpFuncBmm` (`:804`) ORs them.
+    const BMM_FAMILIES: [fn(OpFunc) -> bool; 5] = [
+        is_op_func_bmm_fp16,
+        is_op_func_bmm_fp8_xrf,
+        is_op_func_bmm_fp8_non_xrf,
+        is_op_func_bmm_int4,
+        is_op_func_bmm_int8,
+    ];
+
+    fn claiming(op_func: OpFunc) -> usize {
+        BMM_FAMILIES.iter().filter(|is_bmm| is_bmm(op_func)).count()
+    }
+
+    /// e025 — the four int4 batch matmuls, and the identically spelled int8 sibling is not one.
+    #[test]
+    fn bmm_int4_is_the_four_int4_batchmatmuls() {
+        assert!(
+            [
+                OpFunc::BatchmatmulInt4Fwd,
+                OpFunc::BatchmatmulInt4FwdSparsekg3,
+                OpFunc::BatchmatmulXrfInt4Fwd,
+                OpFunc::BatchmatmulXrfchInt4Fwd,
+            ]
+            .into_iter()
+            .all(is_op_func_bmm_int4)
+        );
+        assert!(!is_op_func_bmm_int4(OpFunc::BatchmatmulXrfInt8Fwd));
+    }
+
+    /// e026 — the five int8 batch matmuls, and `MATMUL_INT8_FWD` is not a BATCH matmul.
+    #[test]
+    fn bmm_int8_is_the_five_int8_batchmatmuls() {
+        assert!(
+            [
+                OpFunc::BatchmatmulInt8Fwd,
+                OpFunc::BatchmatmulInt8FwdMbkg3,
+                OpFunc::BatchmatmulInt8FwdSparsekg3,
+                OpFunc::BatchmatmulXrfInt8Fwd,
+                OpFunc::BatchmatmulXrfchInt8Fwd,
+            ]
+            .into_iter()
+            .all(is_op_func_bmm_int8)
+        );
+        assert!(!is_op_func_bmm_int8(OpFunc::MatmulInt8Fwd));
+    }
+
+    /// e027 — the three non-XRF fp8 batch matmuls, and the XRF ones belong to e028 instead.
+    #[test]
+    fn bmm_fp8_non_xrf_excludes_the_xrf_spellings() {
+        assert!(
+            [
+                OpFunc::BatchmatmulFp8Fwd,
+                OpFunc::BatchmatmulFp8FwdMb,
+                OpFunc::BatchmatmulFp8FwdSparsekg3,
+            ]
+            .into_iter()
+            .all(is_op_func_bmm_fp8_non_xrf)
+        );
+        assert!(!is_op_func_bmm_fp8_non_xrf(OpFunc::BatchmatmulXrfFp8Fwd));
+        assert!(!is_op_func_bmm_fp8_non_xrf(OpFunc::BatchmatmulXrfchFp8Fwd));
+    }
+
+    /// e028 — the two XRF fp8 batch matmuls, and the plain fp8 one is not among them.
+    #[test]
+    fn bmm_fp8_xrf_is_the_two_xrf_spellings() {
+        assert!(is_op_func_bmm_fp8_xrf(OpFunc::BatchmatmulXrfFp8Fwd));
+        assert!(is_op_func_bmm_fp8_xrf(OpFunc::BatchmatmulXrfchFp8Fwd));
+        assert!(!is_op_func_bmm_fp8_xrf(OpFunc::BatchmatmulFp8Fwd));
+    }
+
+    /// e029 — the four format-less batch matmuls; the two MX-format ones are NOT this family, even
+    /// though nothing else claims them either.
+    #[test]
+    fn bmm_fp16_is_the_batchmatmuls_that_name_no_format() {
+        assert!(
+            [
+                OpFunc::BatchmatmulFwd,
+                OpFunc::BatchmatmulFwdSparsekg3,
+                OpFunc::BatchmatmulXrfFwd,
+                OpFunc::BatchmatmulXrfchFwd,
+            ]
+            .into_iter()
+            .all(is_op_func_bmm_fp16)
+        );
+        assert!(!is_op_func_bmm_fp16(OpFunc::BatchmatmulMxfp8Fwd));
+        assert!(!is_op_func_bmm_fp16(OpFunc::BatchmatmulMxfp4WFwd));
+    }
+
+    /// ⭐ THE CENSUS THE FIVE FAMILIES OWE THE SEALED SET: they are pairwise disjoint, they claim 18
+    /// of its 21 batch matmuls, and `BATCHMATMULV2`, `BATCHMATMUL_MXFP4W_FWD` and
+    /// `BATCHMATMUL_MXFP8_FWD` are claimed by NONE — so `isOpFuncBmm` is false for all three and
+    /// `getMinParamForDimFromOpFunc` (`:1169`) gives them its default min param of 1.
+    #[test]
+    fn the_five_bmm_families_partition_eighteen_of_twenty_one_batchmatmuls() {
+        let spelled_bmm = OpFunc::ALL
+            .into_iter()
+            .filter(|op_func| op_func.spelling().starts_with("batchmatmul"));
+        assert_eq!(spelled_bmm.clone().count(), 21);
+        assert!(
+            OpFunc::ALL
+                .into_iter()
+                .all(|op_func| claiming(op_func) <= 1)
+        );
+        assert_eq!(
+            spelled_bmm
+                .clone()
+                .filter(|op_func| claiming(*op_func) == 1)
+                .count(),
+            18
+        );
+        assert_eq!(
+            spelled_bmm
+                .filter(|op_func| claiming(*op_func) == 0)
+                .collect::<Vec<_>>(),
+            vec![
+                OpFunc::Batchmatmulv2,
+                OpFunc::BatchmatmulMxfp4WFwd,
+                OpFunc::BatchmatmulMxfp8Fwd
+            ]
+        );
+    }
+
+    /// e030 — the fourteen scalar/broadcast ops, and `REALDIV` shares `SUB`'s shape without sharing
+    /// its arm.
+    #[test]
+    fn scalar_broadcast_is_fourteen_ops_and_not_every_elementwise_one() {
+        assert_eq!(
+            OpFunc::ALL
+                .into_iter()
+                .filter(|op_func| is_op_func_scalar_broadcast(*op_func))
+                .count(),
+            14
+        );
+        assert!(is_op_func_scalar_broadcast(OpFunc::Sub));
+        assert!(is_op_func_scalar_broadcast(OpFunc::Revsub));
+        assert!(!is_op_func_scalar_broadcast(OpFunc::Realdiv));
+        assert!(!is_op_func_scalar_broadcast(OpFunc::SiluFwd));
+    }
+
+    /// e031 — the eight it claims, and the six reductions it does not.
+    #[test]
+    fn reduction_leaves_six_reductions_unclaimed() {
+        assert!(
+            [
+                OpFunc::Sum,
+                OpFunc::Max,
+                OpFunc::Mean,
+                OpFunc::Exx2,
+                OpFunc::SumNonstick,
+                OpFunc::MaxNonstick,
+                OpFunc::MeanNonstick,
+                OpFunc::ProdNonstick,
+            ]
+            .into_iter()
+            .all(is_op_func_reduction)
+        );
+        assert!(
+            ![
+                OpFunc::Absmax,
+                OpFunc::Min,
+                OpFunc::AbsmaxNonstick,
+                OpFunc::MinNonstick,
+                OpFunc::Exx2Zeromean,
+                OpFunc::GenericPartialReduction,
+            ]
+            .into_iter()
+            .any(is_op_func_reduction)
+        );
+    }
+
+    /// e032 — the three pooling ops, and no op the sealed set spells with `pool` is left out.
+    #[test]
+    fn pooling_is_every_pool_op_in_the_sealed_set() {
+        assert!(is_op_func_pooling(OpFunc::MaxpoolFwd));
+        assert!(is_op_func_pooling(OpFunc::AvgpoolFwd));
+        assert!(is_op_func_pooling(OpFunc::AvgpoolNmapFwd));
+        assert_eq!(
+            OpFunc::ALL
+                .into_iter()
+                .filter(|op_func| op_func.spelling().contains("pool"))
+                .filter(|op_func| !is_op_func_pooling(*op_func))
+                .collect::<Vec<_>>(),
+            Vec::new()
+        );
+    }
+}
 
 // crustify:todo: e033_isOpFuncDepthwiseConv
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:843  (5 body lines, level 0)
