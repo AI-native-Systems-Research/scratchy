@@ -541,45 +541,126 @@ pub fn dump(immut: &[&dyn DumpDescriptor], mutable: &[&dyn DumpDescriptor]) -> S
 //   original  : const ToggleDescriptor &getToggleDescriptor() const
 //   calls     : e258_isToggle
 
-// crustify:todo: e265_getConditionalConstantDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:714  (4 body lines, level 1)
-//   original  : ConditionalConstantDescriptor &getConditionalConstantDescriptor()
-//   calls     : e259_isConditionalConstant
+// ⭐ THE EIGHT PATTERN GETTERS ARE ONE `match` ON [`DataTransferDescriptor::pattern_desc`]: the
+// reference's `cast<T>(pattern_desc_)` IS the variant, and the `pattern_desc_ != nullptr` conjunct
+// of each `DT_CHECK(isX())` IS the `Option`. The `panic!` IS the `DT_CHECK` — the reference aborts
+// here, and `ConditionalConstDataTransferUpdater::updateImmutableAddr` (`:2050`) calls the getter
+// with no `isConditionalConstant()` of its own, so this is a live abort and not a precondition some
+// caller has already discharged.
+// ⛔ THE `isValid()` CONJUNCT OF EACH `DT_CHECK` IS NOT HERE: `DataTransferDescriptor::isValid()`
+// (e278, `:2478`) is the SCC edge the scheduler cut out of this batch, so a variant-matching but
+// INVALID descriptor is RETURNED where the reference aborts. Each guard gains `self.is_valid() &&`
+// when e278 lands; until then nothing silently accepts one, because every in-tree caller re-tests
+// validity itself (`DT_CHECK_MSG(cc.isValid(), "descriptor may be corrupt")`, `:2051`).
+impl DataTransferDescriptor {
+    /// Replaces: e265_getConditionalConstantDescriptor
+    ///
+    /// The pattern as a mutable [`ConditionalConstantDescriptor`] (`:714-717`).
+    #[must_use]
+    pub fn conditional_constant_descriptor_mut(&mut self) -> &mut ConditionalConstantDescriptor {
+        match &mut self.pattern_desc {
+            Some(PatternDescriptor::ConditionalConstant(cc)) => cc,
+            other => panic!(
+                "DT_CHECK(isConditionalConstant()) (`AddressPinningAndToggle.cpp:715`): {other:?}"
+            ),
+        }
+    }
 
-// crustify:todo: e266_getConditionalConstantDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:718  (4 body lines, level 1)
-//   original  : const ConditionalConstantDescriptor &getConditionalConstantDescriptor() const
-//   calls     : e259_isConditionalConstant
+    /// Replaces: e266_getConditionalConstantDescriptor
+    ///
+    /// The pattern as a shared [`ConditionalConstantDescriptor`] (`:718-722`).
+    #[must_use]
+    pub fn conditional_constant_descriptor(&self) -> &ConditionalConstantDescriptor {
+        match &self.pattern_desc {
+            Some(PatternDescriptor::ConditionalConstant(cc)) => cc,
+            other => panic!(
+                "DT_CHECK(isConditionalConstant()) (`AddressPinningAndToggle.cpp:720`): {other:?}"
+            ),
+        }
+    }
 
-// crustify:todo: e267_getIntegerSequenceDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:723  (4 body lines, level 1)
-//   original  : IntegerSequenceDescriptor &getIntegerSequenceDescriptor()
-//   calls     : e260_isIntegerSequence
+    /// Replaces: e267_getIntegerSequenceDescriptor
+    ///
+    /// The pattern as a mutable [`IntegerSequenceDescriptor`] (`:723-726`).
+    #[must_use]
+    pub fn integer_sequence_descriptor_mut(&mut self) -> &mut IntegerSequenceDescriptor {
+        match &mut self.pattern_desc {
+            Some(PatternDescriptor::IntegerSequence(isq)) => isq,
+            other => panic!(
+                "DT_CHECK(isIntegerSequence()) (`AddressPinningAndToggle.cpp:724`): {other:?}"
+            ),
+        }
+    }
 
-// crustify:todo: e268_getIntegerSequenceDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:727  (4 body lines, level 1)
-//   original  : const IntegerSequenceDescriptor &getIntegerSequenceDescriptor() const
-//   calls     : e260_isIntegerSequence
+    /// Replaces: e268_getIntegerSequenceDescriptor
+    ///
+    /// The pattern as a shared [`IntegerSequenceDescriptor`] (`:727-730`).
+    #[must_use]
+    pub fn integer_sequence_descriptor(&self) -> &IntegerSequenceDescriptor {
+        match &self.pattern_desc {
+            Some(PatternDescriptor::IntegerSequence(isq)) => isq,
+            other => panic!(
+                "DT_CHECK(isIntegerSequence()) (`AddressPinningAndToggle.cpp:728`): {other:?}"
+            ),
+        }
+    }
 
-// crustify:todo: e269_getDiscreteIntegerSetDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:731  (4 body lines, level 1)
-//   original  : DiscreteIntegerSetDescriptor &getDiscreteIntegerSetDescriptor()
-//   calls     : e261_isDiscreteIntegerSet
+    /// Replaces: e269_getDiscreteIntegerSetDescriptor
+    ///
+    /// The pattern as a mutable [`DiscreteIntegerSetDescriptor`] (`:731-734`).
+    #[must_use]
+    pub fn discrete_integer_set_descriptor_mut(&mut self) -> &mut DiscreteIntegerSetDescriptor {
+        match &mut self.pattern_desc {
+            Some(PatternDescriptor::DiscreteIntegerSet(dis)) => dis,
+            other => panic!(
+                "DT_CHECK(isDiscreteIntegerSet()) (`AddressPinningAndToggle.cpp:732`): {other:?}"
+            ),
+        }
+    }
 
-// crustify:todo: e270_getDiscreteIntegerSetDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:735  (4 body lines, level 1)
-//   original  : const DiscreteIntegerSetDescriptor &getDiscreteIntegerSetDescriptor() const
-//   calls     : e261_isDiscreteIntegerSet
+    /// Replaces: e270_getDiscreteIntegerSetDescriptor
+    ///
+    /// The pattern as a shared [`DiscreteIntegerSetDescriptor`] (`:735-738`).
+    #[must_use]
+    pub fn discrete_integer_set_descriptor(&self) -> &DiscreteIntegerSetDescriptor {
+        match &self.pattern_desc {
+            Some(PatternDescriptor::DiscreteIntegerSet(dis)) => dis,
+            other => panic!(
+                "DT_CHECK(isDiscreteIntegerSet()) (`AddressPinningAndToggle.cpp:736`): {other:?}"
+            ),
+        }
+    }
 
-// crustify:todo: e271_getLoopingChainMutableAddrDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:739  (4 body lines, level 1)
-//   original  : LoopingChainMutableAddrDescriptor &getLoopingChainMutableAddrDescriptor()
-//   calls     : e262_isLoopingChainMutableAddr
+    /// Replaces: e271_getLoopingChainMutableAddrDescriptor
+    ///
+    /// The pattern as a mutable [`LoopingChainMutableAddrDescriptor`] (`:739-742`).
+    #[must_use]
+    pub fn looping_chain_mutable_addr_descriptor_mut(
+        &mut self,
+    ) -> &mut LoopingChainMutableAddrDescriptor {
+        match &mut self.pattern_desc {
+            Some(PatternDescriptor::LoopingChainMutableAddr(lcma)) => lcma,
+            other => panic!(
+                "DT_CHECK(isLoopingChainMutableAddr()) (`AddressPinningAndToggle.cpp:740`): \
+                 {other:?}"
+            ),
+        }
+    }
 
-// crustify:todo: e272_getLoopingChainMutableAddrDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:743  (4 body lines, level 1)
-//   original  : const LoopingChainMutableAddrDescriptor & getLoopingChainMutableAddrDescriptor() const
-//   calls     : e262_isLoopingChainMutableAddr
+    /// Replaces: e272_getLoopingChainMutableAddrDescriptor
+    ///
+    /// The pattern as a shared [`LoopingChainMutableAddrDescriptor`] (`:743-747`).
+    #[must_use]
+    pub fn looping_chain_mutable_addr_descriptor(&self) -> &LoopingChainMutableAddrDescriptor {
+        match &self.pattern_desc {
+            Some(PatternDescriptor::LoopingChainMutableAddr(lcma)) => lcma,
+            other => panic!(
+                "DT_CHECK(isLoopingChainMutableAddr()) (`AddressPinningAndToggle.cpp:745`): \
+                 {other:?}"
+            ),
+        }
+    }
+}
 
 // crustify:todo: e273_isHeadOfChain
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:907  (6 body lines, level 1)
@@ -1015,5 +1096,106 @@ mod unit_tests {
             dump(&immut, &mutable),
             "Immutable transfer descriptors:\nimmut-a\nimmut-b\nMutable transfer descriptors:\nmut-c\n"
         );
+    }
+
+    /// A descriptor whose pattern is `kind` and whose one base address makes the fixture realistic —
+    /// the reference's `base_addrs_` is what the absent `isValid()` conjunct would read.
+    fn with_pattern(kind: PatternDescriptor) -> DataTransferDescriptor {
+        DataTransferDescriptor {
+            pattern_desc: Some(kind),
+            base_addrs: vec![EvaluatedValue(64)],
+        }
+    }
+
+    /// 265+266/656 — both overloads reach the same `ConditionalConstantDescriptor`, and a write
+    /// through the mutable one is visible to the shared one.
+    ///
+    /// ⛔ NO IN-TREE CALLER ACTUALLY WRITES THROUGH THE NON-CONST OVERLOAD: it exists because
+    /// `updateImmutableAddr` binds `ConditionalConstantDescriptor &cc` (`:2050`) on a non-const
+    /// `dtd_`, and what its `updateVariableOffsetCalculation` then rewrites is the IR, not the
+    /// descriptor.
+    #[test]
+    fn conditional_constant_descriptor_is_read_and_written_through_both_overloads() {
+        let cc = ConditionalConstantDescriptor {
+            yielded_constants: vec![EvaluatedValue(16), EvaluatedValue(48)],
+            can_be_simplified: false,
+        };
+        let mut dtd = with_pattern(PatternDescriptor::ConditionalConstant(cc.clone()));
+        assert_eq!(dtd.conditional_constant_descriptor(), &cc);
+        dtd.conditional_constant_descriptor_mut().can_be_simplified = true;
+        assert!(dtd.conditional_constant_descriptor().can_be_simplified);
+    }
+
+    /// 267+268/656 — `updateImmutableAddr` (`:2117`) binds the mutable overload; the sequence it
+    /// hands back is the same one the shared overload sees.
+    #[test]
+    fn integer_sequence_descriptor_is_read_and_written_through_both_overloads() {
+        let isq = IntegerSequenceDescriptor {
+            outer_loop: Some(ForRef(Val(7))),
+            iter_arg_index: Some(IterArgIndex(1)),
+            init: Some(EvaluatedValue(4)),
+            stride: Some(EvaluatedValue(8)),
+            size: SequenceSize::Terms(3),
+        };
+        let mut dtd = with_pattern(PatternDescriptor::IntegerSequence(isq));
+        assert_eq!(dtd.integer_sequence_descriptor(), &isq);
+        dtd.integer_sequence_descriptor_mut().size = SequenceSize::Cleared;
+        assert_eq!(
+            dtd.integer_sequence_descriptor().size,
+            SequenceSize::Cleared
+        );
+    }
+
+    /// 269+270/656 — the discrete set, whose only in-tree reader is `canBeSimplified()` (`:2511`).
+    #[test]
+    fn discrete_integer_set_descriptor_is_read_and_written_through_both_overloads() {
+        let dis = DiscreteIntegerSetDescriptor {
+            outer_loop: Some(ForRef(Val(7))),
+            iter_arg_index: Some(IterArgIndex(0)),
+            init: Some(EvaluatedValue(4)),
+            total_positive_delta: Some(EvaluatedValue(24)),
+            total_negative_delta: Some(EvaluatedValue(0)),
+        };
+        let mut dtd = with_pattern(PatternDescriptor::DiscreteIntegerSet(dis));
+        assert_eq!(dtd.discrete_integer_set_descriptor(), &dis);
+        dtd.discrete_integer_set_descriptor_mut().init = None;
+        assert_eq!(dtd.discrete_integer_set_descriptor().init, None);
+    }
+
+    /// 271+272/656 — the looping chain head, whose only in-tree reader is `canBeSimplified()` (`:2513`).
+    #[test]
+    fn looping_chain_mutable_addr_descriptor_is_read_and_written_through_both_overloads() {
+        let lcma = LoopingChainMutableAddrDescriptor {
+            is_head_of_chain: true,
+            outer_loop: Some(ForRef(Val(7))),
+            iter_arg_index: Some(IterArgIndex(2)),
+            size: ChainSize(3),
+            init: Some(EvaluatedValue(4)),
+            increment: Some(EvaluatedValue(8)),
+        };
+        let mut dtd = with_pattern(PatternDescriptor::LoopingChainMutableAddr(lcma));
+        assert_eq!(dtd.looping_chain_mutable_addr_descriptor(), &lcma);
+        dtd.looping_chain_mutable_addr_descriptor_mut()
+            .is_head_of_chain = false;
+        assert!(!dtd.looping_chain_mutable_addr_descriptor().is_head_of_chain);
+    }
+
+    /// The `isa<>` conjunct of the `DT_CHECK`: a pattern of ANOTHER kind aborts, it does not coerce.
+    #[test]
+    #[should_panic(expected = "DT_CHECK(isIntegerSequence())")]
+    fn asking_a_toggle_for_the_integer_sequence_descriptor_is_the_dt_check() {
+        let toggle = ToggleDescriptor {
+            outer_loop: Some(ForRef(Val(7))),
+            iter_arg_index: Some(IterArgIndex(1)),
+            c1: Some(EvaluatedValue(3)),
+        };
+        let _ = with_pattern(PatternDescriptor::Toggle(toggle)).integer_sequence_descriptor();
+    }
+
+    /// The `pattern_desc_ != nullptr` conjunct: an unmatched transfer aborts too.
+    #[test]
+    #[should_panic(expected = "DT_CHECK(isConditionalConstant())")]
+    fn asking_an_unmatched_transfer_for_a_pattern_descriptor_is_the_dt_check() {
+        let _ = DataTransferDescriptor::default().conditional_constant_descriptor();
     }
 }
