@@ -131,11 +131,42 @@
 pub(crate) mod conversion;
 pub(crate) mod ops;
 
+use ops::{DdlOp, Dialect, Unverified, Value, Verified};
 
-// crustify:todo: e171_performActions
-//   authority : ddc/ddl/ddl.cpp:36  (22 body lines, level 0)
-//   original  : OwningOpRef<Operation*> performActions( const std::shared_ptr<llvm::SourceMgr>& sourceMgr, MLIRContext* context)
-//   extract   : crustify-ddc/cpp/ddl.cpp:252-275
+/// WHAT A GENERIC MLIR PARSE OF A `.ddl` YIELDS — the defining-op table and the ops that carry a
+/// verifier. Everything else in the module is stated by the framework's own generic parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedDdl {
+    /// What defines each SSA value — all `getDefiningOp()` is ever asked for here.
+    pub defining: Vec<(Value, DdlOp)>,
+    /// Every op with `hasVerifier = 1`, in the order the module states them.
+    pub verifiable: Vec<Unverified>,
+}
+
+/// A DDL SOURCE — a buffer `parseSourceFileForTool` can read (`ddl.cpp:57`).
+///
+/// ⭐ A TRAIT BECAUSE MLIR'S GENERIC PARSE IS THE FRAMEWORK'S, not this campaign's: `performActions`
+/// states only the CONFIG it hands over, and our own text parse of the same templates is `build.rs`.
+pub trait DdlSource {
+    /// The module this source states, or [`None`] where it is not well-formed for `dialect`.
+    fn parse(&self, dialect: &Dialect) -> Option<ParsedDdl>;
+}
+
+/// Replaces: e171_performActions
+///
+/// PARSE, THEN RUN EVERY VERIFIER — `ParserConfig(context, /*verifyAfterParse=*/true, ..)`
+/// (`ddl.cpp:51-52`) is the flag that makes the four ported verifiers load-bearing instead of dead
+/// predicates: one rejection anywhere and the parse yields nothing.
+///
+/// ⭐ THE THREADING SAVE / DISABLE / RESTORE (`:39-40`, `:57`) IS PERFORMANCE-ONLY — it drops
+/// `MLIRContext` synchronisation for the duration — and there is no context here.
+/// ⭐ `PassReproducerOptions` + `FallbackAsmResourceMap` (`:48-52`) make unhandled external
+/// resources PASSTHROUGH; no vendored template states one.
+#[must_use]
+pub fn perform_actions(source: &(impl DdlSource + ?Sized), dialect: &Dialect) -> Option<Verified> {
+    let parsed = source.parse(dialect)?;
+    Verified::of(parsed.defining.as_slice(), parsed.verifiable)
+}
 
 // crustify:todo: e273_processBuffer
 //   authority : ddc/ddl/ddl.cpp:62  (13 body lines, level 1)
@@ -162,3 +193,47 @@ pub(crate) mod ops;
 //   extract   : crustify-ddc/cpp/ddl.cpp:4297-4306
 //   calls     : e321_DdlMain, e344_DdlMain
 
+#[cfg(test)]
+mod tests_e171 {
+    use super::ops::{DdlOp, Dialect, StorageBits, Unverified, Value};
+    use super::{DdlSource, ParsedDdl, perform_actions};
+
+    /// A source that hands back a fixed module, standing in for `parseSourceFileForTool`.
+    struct Fixed(ParsedDdl);
+
+    impl DdlSource for Fixed {
+        fn parse(&self, _dialect: &Dialect) -> Option<ParsedDdl> {
+            Some(self.0.clone())
+        }
+    }
+
+    fn module(bit_width: Option<StorageBits>) -> Fixed {
+        Fixed(ParsedDdl {
+            defining: vec![(Value::sole("l0_allocation"), DdlOp::Allocate)],
+            verifiable: vec![
+                Unverified::Datatype {
+                    data_type: "SEN143_FP8".to_owned(),
+                    bit_width,
+                },
+                Unverified::ImplicitSync {
+                    allocate: Value::sole("l0_allocation"),
+                },
+            ],
+        })
+    }
+
+    /// ⭐⭐ `verifyAfterParse=true` IS THE WHOLE POINT: the same module differing only in a
+    /// `bit_width=` too narrow for its format yields NOTHING, so a rejected verifier is a rejected
+    /// parse rather than a logged complaint.
+    #[test]
+    fn perform_actions_gates_the_module_on_every_verifier() {
+        let dialect = Dialect::initialize();
+        let ok =
+            perform_actions(&module(Some(StorageBits(16))), &dialect).expect("both verifiers pass");
+        assert_eq!(ok.ops().len(), 2);
+        assert_eq!(
+            perform_actions(&module(Some(StorageBits(4))), &dialect),
+            None
+        );
+    }
+}
