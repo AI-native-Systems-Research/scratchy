@@ -17,6 +17,7 @@
 
 use crate::arch::{Arch, Elements, Target};
 use crate::generated::DataConnect;
+use crate::schedule::ddc::metadata::{Ends, LoopMultiple, MetaDimKind, NodeIndex};
 use crate::units::{Corelet, Row};
 
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
@@ -315,6 +316,9 @@ pub enum ConstraintKind<'a, S> {
     Absolute {
         /// `cannotBeSymbolic_` — ⛔ ONLY HERE, by the `DT_CHECK` above.
         cannot_be_symbolic: bool,
+        /// `loopDimKind_`, which this arm's check never reads and `dump` always prints — set on
+        /// absolute constraints at `ddc/ddc_transformation.cpp:968-1035`.
+        dim_kind: Option<MetaDimKind>,
         /// `min_`, and whether the size must be a multiple of it.
         min: AbsoluteMin,
     },
@@ -324,9 +328,9 @@ pub enum ConstraintKind<'a, S> {
         reference: &'a S,
         /// `min_` — a lower bound on `size / refSize`, with no multiple relationship.
         min: Option<f32>,
-        /// `mustBeMultiple_`, and the dim kind its no-epilogue test reads. ⛔ STILL GATED BY
+        /// `mustBeMultiple_` and `loopDimKind_`. ⛔ THE NO-EPILOGUE ARM IS STILL GATED BY
         /// `allowEpilogue` at the call (`:870`).
-        no_epilogue: Option<NoEpilogueDimKind>,
+        multiple: LoopMultiple,
     },
 }
 
@@ -413,7 +417,7 @@ impl<'a, S> DimConstraint<'a, S> {
         let multi_dim_no_epilogue = matches!(
             constraint.kind,
             ConstraintKind::Relative {
-                no_epilogue: Some(_),
+                multiple: LoopMultiple::NoEpilogue(_),
                 ..
             }
         ) && dims.len() > 1;
@@ -584,7 +588,7 @@ fn constraint_holds<S: Stage>(
         }
         ConstraintKind::Relative {
             reference: refer,
-            no_epilogue: Some(kind),
+            multiple: LoopMultiple::NoEpilogue(kind),
             ..
         } if !allow_epilogue => {
             let loops = match kind {
@@ -638,15 +642,6 @@ fn constraint_holds<S: Stage>(
 
 // ═══ e002 — THE DATA-CONNECT CENSUS ═════════════════════════════════════════════════════════════
 
-/// WHERE A SCHEDULE NODE SITS IN THE WALK — its identity in the producer and consumer lists.
-///
-/// ⭐ POSITIONAL, BECAUSE THE REFERENCE'S IS A POINTER. `insertProducer(node)` stores the
-/// `ScheduleNode*` and deduplicates on it (`ddc/ddc_metadata.h:147-157`); an index into the DFS order
-/// is that identity without the walk, which is the mechanism for reaching the nodes rather than the
-/// census.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NodeIndex(pub usize);
-
 /// ONE END A NODE READS FROM — the `data_connect=` and whether the unit feeding it is the CONSTANT
 /// source.
 ///
@@ -688,29 +683,6 @@ pub enum ScheduleNode {
     },
 }
 
-/// ONE DATA CONNECT'S TWO ENDS — `ddc::DataConnect`'s `producers_` and `consumers_`
-/// (`ddc/ddc_metadata.h:144-145`), each deduplicated and in first-touch order as `insertProducer`
-/// and `insertConsumer` keep them.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Ends {
-    producers: Vec<NodeIndex>,
-    consumers: Vec<NodeIndex>,
-}
-
-impl Ends {
-    /// The nodes that write this connect — NON-EMPTY in every [`DataConnects::Census`].
-    #[must_use]
-    pub fn producers(&self) -> &[NodeIndex] {
-        &self.producers
-    }
-
-    /// The nodes that read it, which may be none: a connect nothing consumes is legal.
-    #[must_use]
-    pub fn consumers(&self) -> &[NodeIndex] {
-        &self.consumers
-    }
-}
-
 /// THE CENSUS' ANSWER — `metadata.dataConnects_`, or the label that has no producer.
 ///
 /// ⛔⛔ `DT_ERROR("Illegal DDL: data_connect " + label + " does not have any producer.")`
@@ -747,11 +719,11 @@ pub fn create_data_connect_metadata(nodes: &[ScheduleNode]) -> DataConnects {
             ScheduleNode::Transfer { src, dsts } => {
                 if !src.from_constant {
                     let at = ends_of(&mut census, src.data_connect);
-                    insert(&mut census[at].1.consumers, NodeIndex(index));
+                    census[at].1.insert_consumer(NodeIndex(index));
                 }
                 for dst in dsts {
                     let at = ends_of(&mut census, *dst);
-                    insert(&mut census[at].1.producers, NodeIndex(index));
+                    census[at].1.insert_producer(NodeIndex(index));
                 }
                 continue;
             }
@@ -767,26 +739,26 @@ pub fn create_data_connect_metadata(nodes: &[ScheduleNode]) -> DataConnects {
             for input in inputs {
                 if !input.from_constant {
                     let at = ends_of(&mut census, input.data_connect);
-                    insert(&mut census[at].1.consumers, NodeIndex(index));
+                    census[at].1.insert_consumer(NodeIndex(index));
                 }
             }
             for output in outputs {
                 let at = ends_of(&mut census, *output);
-                insert(&mut census[at].1.producers, NodeIndex(index));
+                census[at].1.insert_producer(NodeIndex(index));
             }
             for read in opaque_reads {
                 let at = ends_of(&mut census, *read);
-                insert(&mut census[at].1.consumers, NodeIndex(index));
+                census[at].1.insert_consumer(NodeIndex(index));
             }
             for write in opaque_writes {
                 let at = ends_of(&mut census, *write);
-                insert(&mut census[at].1.producers, NodeIndex(index));
+                census[at].1.insert_producer(NodeIndex(index));
             }
         }
     }
 
     for (label, ends) in &census {
-        if ends.producers.is_empty() {
+        if ends.producers().is_empty() {
             return DataConnects::NoProducer(*label);
         }
     }
@@ -805,19 +777,12 @@ fn ends_of(census: &mut Vec<(DataConnect, Ends)>, connect: DataConnect) -> usize
     }
 }
 
-/// `insertProducer` / `insertConsumer` — append unless already present (`ddc/ddc_metadata.h:147-157`).
-fn insert(nodes: &mut Vec<NodeIndex>, node: NodeIndex) {
-    if !nodes.contains(&node) {
-        nodes.push(node);
-    }
-}
-
 #[cfg(test)]
 mod unit_tests {
     use super::{
         AbsoluteMin, Constraint, ConstraintKind, DataConnects, DimConstraint, DimSet, Ends, Extent,
-        NoEpilogueDimKind, NodeIndex, PaddedExtent, PrimaryDim, Reads, Sample, ScheduleNode,
-        SliceElems, Stage, StickDims, StickPart, VectorComp, check_constraints,
+        LoopMultiple, NoEpilogueDimKind, NodeIndex, PaddedExtent, PrimaryDim, Reads, Sample,
+        ScheduleNode, SliceElems, Stage, StickDims, StickPart, VectorComp, check_constraints,
         create_data_connect_metadata, cumulative_stick_sizes, stick_sizes,
     };
     use crate::arch::{Arch, Dd2, Elements, Target};
@@ -975,6 +940,7 @@ mod unit_tests {
                 Constraint {
                     kind: ConstraintKind::Absolute {
                         cannot_be_symbolic: false,
+                        dim_kind: None,
                         min,
                     },
                     max,
@@ -1017,7 +983,7 @@ mod unit_tests {
                     kind: ConstraintKind::Relative {
                         reference: refer,
                         min: None,
-                        no_epilogue: Some(NoEpilogueDimKind::Unpadded),
+                        multiple: LoopMultiple::NoEpilogue(NoEpilogueDimKind::Unpadded),
                     },
                     max: None,
                     values: None,
@@ -1059,6 +1025,19 @@ mod unit_tests {
         ));
     }
 
+    /// The two lists of one connect, through the inserts that own them
+    /// (`schedule::ddc::metadata`).
+    fn ends(producers: &[usize], consumers: &[usize]) -> Ends {
+        let mut ends = Ends::default();
+        for producer in producers {
+            ends.insert_producer(NodeIndex(*producer));
+        }
+        for consumer in consumers {
+            ends.insert_consumer(NodeIndex(*consumer));
+        }
+        ends
+    }
+
     /// 🎯 002/110 WHICH SIDE EACH END LANDS ON, AND THAT A CONSTANT SOURCE CONSUMES NOTHING —
     /// `ddc/ddcv1.cpp:3290-3321`.
     #[test]
@@ -1088,20 +1067,8 @@ mod unit_tests {
         assert_eq!(
             census,
             DataConnects::Census(vec![
-                (
-                    DataConnect::PeHtOut,
-                    Ends {
-                        producers: vec![NodeIndex(0)],
-                        consumers: vec![NodeIndex(1)],
-                    }
-                ),
-                (
-                    DataConnect::OuttensorToSfp,
-                    Ends {
-                        producers: vec![NodeIndex(1)],
-                        consumers: vec![],
-                    }
-                ),
+                (DataConnect::PeHtOut, ends(&[0], &[1])),
+                (DataConnect::OuttensorToSfp, ends(&[1], &[])),
             ])
         );
     }

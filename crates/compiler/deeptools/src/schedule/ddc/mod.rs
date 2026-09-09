@@ -133,7 +133,7 @@
 //! | `e296_rollBackNodesInBlock` | 296 | 2 | 15 | `CoordPropTracker` | `ddc/ddc.h:511` |
 
 pub mod fold;
-pub(crate) mod metadata;
+pub mod metadata;
 pub(crate) mod shuffle;
 pub(crate) mod transformation;
 pub(crate) mod transformation_util;
