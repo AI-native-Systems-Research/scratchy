@@ -96,7 +96,7 @@ use std::collections::BTreeMap;
 
 use sys_arch_spec::regfile::Component;
 
-use super::analyses::RegisterPressure;
+use super::analyses::{RegisterCount, RegisterPressure};
 use super::local_region_splitting_for_value_commoning::{
     MaxRegNum, PretendRegLimits, get_max_reg_num,
 };
@@ -500,7 +500,7 @@ impl ScalarOpReordering {
         let rf_size = max_reg_num
             .unwrap_or_else(|| get_max_reg_num::<A>(locale, comp, PretendRegLimits::default()))
             .0;
-        let num_regs = pressure.num_registers(locale);
+        let num_regs = pressure.num_registers(locale).0;
         let has_free_regs = num_regs < rf_size;
         self.locale_to_num_regs_exceeded
             .set(locale, num_regs.saturating_sub(rf_size));
@@ -531,7 +531,8 @@ mod unit_tests {
     use sys_arch_spec::regfile::Component;
 
     use super::{
-        LiverangeIndex, MaxRegNum, PerLocale, RegisterPressure, ScalarOpReordering, ScalarResult,
+        LiverangeIndex, MaxRegNum, PerLocale, RegisterCount, RegisterPressure, ScalarOpReordering,
+        ScalarResult,
         ancestor_in_block, first_use_within_block, last_use_within_block,
     };
     use crate::arch::Dd2;
@@ -713,10 +714,14 @@ mod unit_tests {
     }
 
     /// The out-of-scope register pressure analysis, stating one count for every locale.
-    struct StatedPressure(u32);
+    struct StatedPressure(RegisterCount);
 
     impl RegisterPressure for StatedPressure {
-        fn num_registers(&mut self, _locale: sentient::RegType) -> u32 {
+        fn num_free_registers(&mut self, _locale: sentient::RegType) -> RegisterCount {
+            self.0
+        }
+
+        fn num_registers(&mut self, _locale: sentient::RegType) -> RegisterCount {
             self.0
         }
     }
@@ -759,7 +764,7 @@ mod unit_tests {
     /// answer, and a measurement both answers and records how far past the file it went.
     #[test]
     fn a_locale_is_measured_only_once_both_caches_are_inconclusive() {
-        let mut pressure = StatedPressure(5);
+        let mut pressure = StatedPressure(RegisterCount(5));
         let mut pass = ScalarOpReordering::new();
         for free in [sentient::RegType::Imm, sentient::RegType::Unknown] {
             assert!(pass.locale_has_free_regs::<Dd2>(free, Component::L3lu, None, &mut pressure));

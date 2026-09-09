@@ -95,12 +95,21 @@
 
 use std::num::NonZeroU32;
 
-use super::analyses::{EvaluatedValue, Evaluation, InstructionCount, ScalarOffset};
+use super::analyses::{
+    EvaluatedValue, Evaluation, ExpressionEvaluator, InstructionCount, InstructionEstimator,
+    ScalarOffset,
+};
+use super::loop_tree::{LoopTree, WalkOrder};
+use super::utils::{LDSTI_IMM_L0LU, LDSTI_IMM_L0SU, LDSTI_IMM_LXLU, LDSTI_IMM_LXSU};
 use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
+use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::sentient as ops;
-use crate::islands::sentient::dialects::{Op, Val, results};
+use crate::islands::sentient::dialects::{Op, Val, regions_mut, results};
+use scalar_op_hoisting::IbuffSpace;
+use sys_arch_spec::fields::Sign;
 
 pub(crate) mod scalar_op_hoisting;
 pub(crate) mod scalar_op_merging;
@@ -587,15 +596,251 @@ impl ScalarOpMergingBlock {
     }
 }
 
-// crustify:todo: e361_isImmutableValueInRange
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:232  (28 body lines, level 1)
-//   original  : bool isImmutableValueInRange(const EvaluatedValue &new_immutable_ev, const EvaluatedValue &original_immutable_ev, int element_size, mlir::Operation *op) const
-//   calls     : e157_doesImmutableImmExceedRange, e158_doesValueExceedLRFRange
+/// Replaces: e361_isImmutableValueInRange
+///
+/// Whether a merged or hoisted immutable address may still be reached — inside the LDSTI immediate,
+/// or outside it only when the ORIGINAL was outside too and the LRF can hold it.
+///
+/// ⛔ TRAP: pushing an address out of IMM range is refused ONLY when the original was IN range
+/// (`:238-247`) — an op already riding an LRF is not asked about IMM again.
+/// ⛔ `op` IS DROPPED: it is the `LLVM_DEBUG` message's subject and nothing else (`:241`, `:255`).
+#[must_use]
+pub(crate) fn is_immutable_value_in_range<A: Arch>(
+    new_immutable_ev: &Evaluation,
+    original_immutable_ev: &Evaluation,
+    element_size: Bits,
+    comp: ScalarOpComp,
+    ldsti_imm_range: ImmRange,
+    address_granularity_scale: AddressScale,
+) -> bool {
+    if does_immutable_imm_exceed_range(
+        new_immutable_ev,
+        element_size,
+        ldsti_imm_range,
+        address_granularity_scale,
+    ) {
+        if !does_immutable_imm_exceed_range(
+            original_immutable_ev,
+            element_size,
+            ldsti_imm_range,
+            address_granularity_scale,
+        ) {
+            return false;
+        }
+        if does_value_exceed_lrf_range::<A>(
+            new_immutable_ev,
+            element_size,
+            comp,
+            address_granularity_scale,
+        ) {
+            return false;
+        }
+    }
+    true
+}
 
-// crustify:todo: e366_runOn
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2258  (130 body lines, level 1)
-//   original  : void runOn(dataflow::ProgramUnitOp unit, ModuleOp module_op)
-//   calls     : e252_size
+/// `getImmRange()` (`:2274-2290`) — the LDSTI immediate field's reach for this component.
+///
+/// ⛔ TRAP: THE UNSIGNED MAXIMUM IS ONE PAST THE LARGEST VALUE THE FIELD HOLDS — `1 << imm_bits`, not
+/// `(1 << imm_bits) - 1` (`:2288`), and `MODULO_UNSIGNED` takes that same arm because the reference
+/// only tests `== SIGNED`. ⭐ `None` (not LX/L0) IS `(0, 0)`, which excludes every non-zero offset.
+#[must_use]
+pub(crate) fn ldsti_imm_range(comp: Option<ScalarOpComp>) -> ImmRange {
+    let Some(comp) = comp else {
+        return ImmRange { min: 0, max: 0 };
+    };
+    let (bits, sign) = match comp {
+        ScalarOpComp::L0lu => LDSTI_IMM_L0LU,
+        ScalarOpComp::L0su => LDSTI_IMM_L0SU,
+        ScalarOpComp::Lxlu => LDSTI_IMM_LXLU,
+        ScalarOpComp::Lxsu => LDSTI_IMM_LXSU,
+    };
+    let width = i32::from(bits.get());
+    match sign {
+        Sign::Signed => {
+            let max_val = 1 << (width - 1);
+            ImmRange {
+                min: -max_val,
+                max: max_val - 1,
+            }
+        }
+        Sign::Unsigned | Sign::ModuloUnsigned => ImmRange {
+            min: 0,
+            max: 1 << width,
+        },
+    }
+}
+
+/// `ScalarOpMerging(opt_context, region, ibuff_space)` (`:460-464`) — ⛔ THE CONSTRUCTOR IS THE CALL,
+/// and what it calls is `e611_runScalarOpMerging` (`:569`, level **5**), not ported yet.
+///
+/// ⛔ A NAMED DIVERGING FUNCTION RATHER THAN AN INLINE `todo!` so the two call sites below keep the
+/// arguments the reference passes and the reader sees WHICH region each one runs on.
+fn run_scalar_op_merging<E: ExpressionEvaluator>(
+    region: &mut Vec<Op>,
+    ibuff_space: IbuffSpace,
+    ldsti_imm_range: ImmRange,
+    comp: GenericComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    values: &mut Values,
+) {
+    let _ = (
+        region,
+        ibuff_space,
+        ldsti_imm_range,
+        comp,
+        scale,
+        evaluator,
+        values,
+    );
+    todo!(
+        "ScalarOpMerging::runScalarOpMerging (e611, ScalarOpMergingAndHoisting.cpp:569) — scheduled at level 5, not ported yet"
+    )
+}
+
+/// `ScalarOpHoisting(opt_context, &for_op, ibuff_space, is_inner_most)` (`:509-517`) — ⛔ THE
+/// CONSTRUCTOR IS THE CALL, and what it calls is `e635_runScalarOpHoisting` (`:2184`, level **6**).
+fn run_scalar_op_hoisting<E: ExpressionEvaluator>(
+    unit_body: &mut Vec<Op>,
+    for_op: Val,
+    ibuff_space: IbuffSpace,
+    is_inner_most: bool,
+    ldsti_imm_range: ImmRange,
+    comp: GenericComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    values: &mut Values,
+) {
+    let _ = (
+        unit_body,
+        for_op,
+        ibuff_space,
+        is_inner_most,
+        ldsti_imm_range,
+        comp,
+        scale,
+        evaluator,
+        values,
+    );
+    todo!(
+        "ScalarOpHoisting::runScalarOpHoisting (e635, ScalarOpMergingAndHoisting.cpp:2184) — scheduled at level 6, not ported yet"
+    )
+}
+
+/// Replaces: e366_runOn
+///
+/// Runs Scalar Op Merging then Scalar Op Hoisting over every loop of one program unit in REVERSE-BFS
+/// order — deepest nest first — and Scalar Op Merging once more over the unit's own region.
+///
+/// ⛔ TRAP: MERGING IS LX/L0-ONLY AND HOISTING IS NOT (`:2313`, `:2334`), so a PT or L3 unit still
+/// hoists, with an LDSTI range of `(0, 0)`.
+/// ⛔ TRAP: THE OUTERMOST-REGION MERGE IS NOT PART OF THE WALK (`:2364-2388`) — it runs after it, once,
+/// even when the unit has no loop at all and the walk did nothing.
+/// ⛔ `DisableScalarOpMerging`, `DisableScalarOpHoisting` and `MaxHoists` are `dcc-opt` `cl::opt`s at
+/// their defaults (`:36-54`), not program properties; `module_op` is the `LLVM_DEBUG` dump's subject.
+pub(crate) fn run_on<A: Arch, E: ExpressionEvaluator, I: InstructionEstimator>(
+    unit: &mut ProgramUnit<A>,
+    evaluator: &mut E,
+    instruction_estimator: &mut I,
+    values: &mut Values,
+) {
+    // `DT_CHECK_MSG(get_unit_op, "Cannot determine GetUnitOp!")` (`:2263-2265`) — ⭐ A TYPE-LEVEL FACT
+    // HERE: [`crate::islands::dataflow_ir::Units`] carries the kind, so there is no unit list whose
+    // component cannot be determined.
+    let comp = unit.on.kind().generic();
+    let is_lx_l0 = ScalarOpComp::of(comp);
+    let ldsti_imm_range = ldsti_imm_range(is_lx_l0);
+    // `computeAddressScale` returns -1 off LX/L0 (`:272`), and every reader of the scale is behind
+    // `is_LX_L0` — so the scale exists exactly where it is asked for.
+    let scale = is_lx_l0.map_or(AddressScale::ONE, compute_address_scale::<A>);
+
+    // `loopTree.walk(optimizeNode, kReverseBFS)`, guarded by `!loopTree.empty()` (`:2360-2361`).
+    // ⭐ THE ORDER IS TAKEN BEFORE THE BODY IS TOUCHED: the reference walks `Operation *` nodes while
+    // its action rewrites them; here the loop is re-found by its induction variable each step, which is
+    // also why a loop the action DELETES is simply not found (the reference's own contract says nodes
+    // the action adds are not visited either).
+    let tree = LoopTree::<false>::of(&unit.body);
+    let loops: Vec<(Val, bool)> = tree
+        .walk(WalkOrder::ReverseBfs)
+        .into_iter()
+        .filter_map(|n| {
+            tree.loop_of(n)
+                .map(|for_op| (for_op.0, tree.is_innermost_loop(n)))
+        })
+        .collect();
+    for (for_op, is_inner_most) in loops {
+        if is_lx_l0.is_some() {
+            instruction_estimator.recalculate(&unit.body);
+            let ibuff_space = IbuffSpace(instruction_estimator.remaining_ibuff_space(&unit.body).0);
+            // `Region &loop_body = for_op.getLoopBody()` — the merge runs on the loop's OWN body, and
+            // a loop the previous step deleted is simply no longer there.
+            if let Some(loop_body) = loop_body_of(&mut unit.body, for_op) {
+                run_scalar_op_merging(
+                    loop_body,
+                    ibuff_space,
+                    ldsti_imm_range,
+                    comp,
+                    scale,
+                    evaluator,
+                    values,
+                );
+            }
+        }
+        instruction_estimator.recalculate(&unit.body);
+        let ibuff_space = IbuffSpace(instruction_estimator.remaining_ibuff_space(&unit.body).0);
+        run_scalar_op_hoisting(
+            &mut unit.body,
+            for_op,
+            ibuff_space,
+            is_inner_most,
+            ldsti_imm_range,
+            comp,
+            scale,
+            evaluator,
+            values,
+        );
+    }
+
+    // Run Scalar Op Merging on the main region of the unit (outermost region).
+    if is_lx_l0.is_some() {
+        instruction_estimator.recalculate(&unit.body);
+        let ibuff_space = IbuffSpace(instruction_estimator.remaining_ibuff_space(&unit.body).0);
+        run_scalar_op_merging(
+            &mut unit.body,
+            ibuff_space,
+            ldsti_imm_range,
+            comp,
+            scale,
+            evaluator,
+            values,
+        );
+    }
+}
+
+/// `for_op.getLoopBody()` — the body of the `sentient.for` bound to `iv`, at any depth.
+///
+/// ⭐ THE MECHANISM FOR REACHING THE LOOP, not part of the port: the reference's node holds an
+/// `Operation *` and cannot be asked for a loop that is gone, so `None` is the case it has no name for.
+fn loop_body_of(scope: &mut Vec<Op>, iv: Val) -> Option<&mut Vec<Op>> {
+    for op in scope.iter_mut() {
+        if let Op::Sentient(ops::Op::For { iv: at, body, .. }) = op {
+            if *at == iv {
+                return Some(body);
+            }
+            if let Some(found) = loop_body_of(body, iv) {
+                return Some(found);
+            }
+            continue;
+        }
+        for region in regions_mut(op) {
+            if let Some(found) = loop_body_of(region, iv) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
 
 // crustify:todo: e636_runOn
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2389  (14 body lines, level 6)
@@ -612,7 +857,10 @@ mod unit_tests {
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
     use crate::islands::dataflow_ir::link::SendEnd;
-    use crate::transform::sentient::analyses::Offsets;
+    use crate::islands::dataflow_ir::Units;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::transform::sentient::analyses::{OffsetSites, Offsets};
+    use crate::units::DfirUnit;
 
     /// An evaluation of one all-unit offset.
     fn all_unit(offset: i64) -> Evaluation {
@@ -738,6 +986,132 @@ mod unit_tests {
             Some(ScalarOpComp::L0su)
         );
         assert_eq!(ScalarOpComp::of(GenericComp::L3lu), None);
+    }
+
+    /// e361 — ⛔ THE ASYMMETRIC REFUSAL. `element_size = 32` and `scale = 1` make the immediate
+    /// `offset * 4`, so a ±127 window admits offset 31 and refuses 32, and Dd2's 10-bit L0 LRF admits
+    /// up to offset 255. An address already outside the immediate is judged on the LRF alone.
+    #[test]
+    fn a_new_immutable_out_of_imm_range_is_refused_only_when_the_original_was_inside_it() {
+        let range = ImmRange {
+            min: -128,
+            max: 127,
+        };
+        let inside = |new: &Evaluation, original: &Evaluation| {
+            is_immutable_value_in_range::<Dd2>(
+                new,
+                original,
+                Bits(32),
+                ScalarOpComp::L0lu,
+                range,
+                AddressScale::ONE,
+            )
+        };
+
+        // The new address is inside the immediate: nothing else is asked.
+        assert!(inside(&all_unit(31), &all_unit(400)));
+        // ⛔ THE REFUSAL: it leaves an immediate the original was inside.
+        assert!(!inside(&all_unit(32), &all_unit(31)));
+        // Both outside it, and the LRF holds the new one.
+        assert!(inside(&all_unit(32), &all_unit(64)));
+        // Both outside it, and the LRF does NOT hold the new one.
+        assert!(!inside(&all_unit(400), &all_unit(64)));
+    }
+
+    /// An evaluator and an estimator that answer without deriving anything — [`run_on`] reads the ibuff
+    /// and hands both on, and what is under test is WHICH pass it dispatches on WHICH region.
+    struct SilentEvaluator;
+
+    impl ExpressionEvaluator for SilentEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            Evaluation {
+                known_absolute: true,
+                base: None,
+                offsets: Offsets::AllUnit(ScalarOffset(0)),
+            }
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            self.evaluate_value(Val(0))
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            Val(0)
+        }
+    }
+
+    struct StatedIbuff(InstructionCount);
+
+    impl InstructionEstimator for StatedIbuff {
+        fn recalculate(&mut self, _unit: &[Op]) {}
+
+        fn estimated_instruction_count_of_op(&mut self, _op: &Op) -> InstructionCount {
+            InstructionCount(0)
+        }
+
+        fn estimated_instruction_count_of_region(&mut self, _region: &[Op]) -> InstructionCount {
+            InstructionCount(0)
+        }
+
+        fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
+            self.0
+        }
+    }
+
+    /// A unit of `kind` running `body` — [`run_on`] reads the kind and the body and nothing else.
+    fn a_unit(kind: DfirUnit, body: Vec<Op>) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            iter_arg: None,
+            on: Units::one(kind, Val(100)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    fn a_loop(iv: Val, bound: Val, body: Vec<Op>) -> Op {
+        Op::Sentient(ops::Op::For {
+            iv,
+            bound,
+            iv_reg: ops::Reg::UNALLOCATED,
+            carried: Vec::new(),
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// e366 — ⛔ THE OUTERMOST-REGION MERGE IS NOT PART OF THE WALK: an LXLU unit with NO loop at all
+    /// still reaches it, which is the merge this panic names.
+    #[test]
+    #[should_panic(expected = "runScalarOpMerging")]
+    fn the_outermost_region_is_merged_even_when_the_unit_has_no_loop() {
+        let mut unit = a_unit(DfirUnit::Lxlu, Vec::new());
+        run_on(
+            &mut unit,
+            &mut SilentEvaluator,
+            &mut StatedIbuff(InstructionCount(8)),
+            &mut Values::default(),
+        );
+    }
+
+    /// e366 — ⛔ MERGING IS LX/L0-ONLY AND HOISTING IS NOT: a PE unit's loop is hoisted, and the panic
+    /// naming HOISTING is what says merging was skipped for it and for the outermost region.
+    #[test]
+    #[should_panic(expected = "runScalarOpHoisting")]
+    fn a_non_lx_l0_unit_hoists_its_loop_and_merges_nothing() {
+        let mut unit = a_unit(DfirUnit::Pe, vec![a_loop(Val(1), Val(2), Vec::new())]);
+        run_on(
+            &mut unit,
+            &mut SilentEvaluator,
+            &mut StatedIbuff(InstructionCount(8)),
+            &mut Values::default(),
+        );
     }
 
     /// ⛔ THE THREE ARMS FILL DIFFERENT FIELDS. An unbursted LAS reports `burst = 1`, a RAS that

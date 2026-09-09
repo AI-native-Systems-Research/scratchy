@@ -101,11 +101,13 @@ use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::{GenericComp, ScalarTy};
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, defining_op, erase_defining_op, operands, regions_ref,
-    replace_all_uses_with, results, uniform, use_count,
+    Definitions, Op, Val, defining_op, erase_defining_op, operands, regions_mut, regions_ref,
+    replace_all_uses_with, results, set_operand, uniform, use_count,
 };
 use crate::transform::sentient::IterArgIndex;
-use crate::transform::sentient::analyses::{Evaluation, ExpressionEvaluator, OffsetSites};
+use crate::transform::sentient::analyses::{
+    Evaluation, ExpressionEvaluator, OffsetSites, ScalarOffset,
+};
 
 /// `ibuff_space_` — how many instruction-buffer entries are left for the ops this pass creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -274,6 +276,75 @@ fn scalar_element_size(val: Val, block: &[Op]) -> Option<Bits> {
         )) => *element_size,
         _ => None,
     }
+}
+
+/// `dcc::utils::isTargetConstant` (`Analyses/Utils.cpp:156`) at the arms this pass reaches — a
+/// `sentient.scalar_constant` holding `target`, or a query map whose constants all do.
+///
+/// ⛔ A NON-CONSTANT VALUE IN THE MAP IS SKIPPED, NOT REJECTED (`:169-178`), so a map of entirely
+/// non-constant values answers TRUE. ⭐ A value with no definition here is the reference's
+/// `isa<BlockArgument>` arm (`:158`) and answers false, as does a mapping this island cannot enumerate
+/// — the same treatment [`has_non_zero_constants`] gives it.
+fn is_target_constant(val: Val, target: ScalarOffset, defs: Definitions<'_>) -> bool {
+    let holds_target = |op: Option<&Op>| match op {
+        Some(Op::Sentient(ops::Op::ScalarConstant { value, .. })) => Some(*value == target.0),
+        _ => None,
+    };
+    match defs.of(val) {
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => {
+            let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(*map)
+            else {
+                return false;
+            };
+            pairs
+                .iter()
+                .all(|(_, value)| holds_target(defs.of(*value)).unwrap_or(true))
+        }
+        op => holds_target(op).unwrap_or(false),
+    }
+}
+
+/// [`defining_op`]'s mutable twin — the op binding `val`, regions included, so a rewritten operand
+/// lands on the op wherever in the walked block it sits.
+fn defining_op_mut<'a>(scope: &'a mut [Op], val: Val) -> Option<&'a mut Op> {
+    for op in scope.iter_mut() {
+        if results(op).contains(&val) {
+            return Some(op);
+        }
+        for region in regions_mut(op) {
+            if let Some(found) = defining_op_mut(region, val) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// WHERE A REWRITTEN CONSTANT GOES — the two shapes [`apply_operation_data`]'s five arms collapse to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rewritten {
+    /// An add's or a sub's constant operand slot, in [`operands`]'s order.
+    Operand(usize),
+    /// A composite transfer's `immutable_addr`, and whether its `increment` takes the value too.
+    Address { update_mode: bool },
+}
+
+/// `OperationData` (`:340-368`) — one op a hoist has decided to modify, and by how much.
+///
+/// ⭐ THE OP IS NAMED BY THE VALUE IT BINDS rather than by a pointer: each of the five arms
+/// [`apply_operation_data`] dispatches on binds exactly one result, and a [`Val`] survives the
+/// insertions that building a new constant performs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperationData {
+    /// `op_` — the op to modify, by the value it binds.
+    pub(crate) op: Val,
+    /// `mod_` — the amount to modify by.
+    pub(crate) modifier: Evaluation,
+    /// `merging_increment_` — the merging increment AT this op. ⛔ [`apply_operation_data`] never
+    /// reads it; `processMergeableChain` (`:1645`) is what records and re-reads it.
+    pub(crate) merging_increment: Evaluation,
+    /// `replace_with_mod_` — ⛔ default `AddTo` (`:367`), the three-argument constructor's value.
+    pub(crate) replace_with_mod: Modification,
 }
 
 /// Replaces: e170_addForOpResultAdjustment
@@ -483,10 +554,110 @@ pub(crate) fn hoist_candidate_out_of_loop(
     }
 }
 
-// crustify:todo: e365_applyOperationData
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1740  (54 body lines, level 1)
-//   original  : void ScalarOpHoisting::applyOperationData( SmallVector<OperationData> &ops_to_update)
-//   calls     : e172_addToOrReplaceOp
+/// Replaces: e365_applyOperationData
+///
+/// Rewrites each listed op's constant — an add/sub's first constant operand, a composite transfer's
+/// immutable address — to the modifier, or to the modifier plus what that constant already held.
+///
+/// ⛔ TRAP: a `scalar_sub`'s modifier is NEGATED before it is added (`:1757`) — subtracting more is
+/// adding less — but NOT when it replaces.
+/// ⛔ TRAP: a transfer whose increment is not already the constant 0 has that increment assigned THE
+/// SAME new value as its immutable address (`:1772-1773`), which is one value read by two operands.
+pub(crate) fn apply_operation_data<E: ExpressionEvaluator>(
+    ops_to_update: &[OperationData],
+    comp: GenericComp,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+    walked: &mut Vec<Op>,
+) {
+    for op_data in ops_to_update {
+        // What is being rewritten, decided before anything is built: building a constant inserts into
+        // this very block, and only the values named here survive that.
+        let Some((constant, negate, rewritten)) = ({
+            let regions: [&[Op]; 1] = [walked];
+            let defs = Definitions::from_innermost(&regions);
+            // ⭐ THE MISSING OP IS THE REFERENCE'S `llvm_unreachable("Unexpected operation
+            // encountered!")` (`:1795`), reported by leaving the op alone.
+            let Some(op) = defining_op(op_data.op, walked) else {
+                continue;
+            };
+            if is_scalar_add_or_sub(op) {
+                // ⛔ `None` IS `getFirstConstOperandIndex() == -1`, which the reference feeds straight
+                // to `getOperand(-1)`; here it leaves the op alone.
+                let Some(index) = first_const_operand_index(op, defs) else {
+                    continue;
+                };
+                let negate = matches!(op, Op::Sentient(ops::Op::ScalarSub { .. }));
+                operands(op)
+                    .get(index)
+                    .copied()
+                    .and_then(|constant| ConstantValue::of(constant, defs))
+                    .map(|constant| (constant, negate, Rewritten::Operand(index)))
+            } else {
+                // `DT_CHECK(is_any_of(getComp(), LXLU, LXSU, L0LU, L0SU))` (`:1765`) — every caller
+                // has already declined on this component, so the check has nothing left to abort on.
+                let Some(mem_info) = MemoryOpInfo::of(op) else {
+                    continue;
+                };
+                if ScalarOpComp::of(comp).is_none() {
+                    continue;
+                }
+                let update_mode = !is_target_constant(mem_info.increment, ScalarOffset(0), defs);
+                ConstantValue::of(mem_info.immutable_addr, defs)
+                    .map(|constant| (constant, false, Rewritten::Address { update_mode }))
+            }
+        }) else {
+            continue;
+        };
+        // `modifier = &getEvaluator().evaluateMultiplyByConst(*modifier, -1)` (`:1757`).
+        let modifier = if negate && op_data.replace_with_mod == Modification::AddTo {
+            evaluator.evaluate_multiply_by_const(&op_data.modifier, -1)
+        } else {
+            op_data.modifier.clone()
+        };
+        let new_const = add_to_or_replace_op(
+            constant,
+            &modifier,
+            op_data.replace_with_mod,
+            evaluator,
+            sites,
+            walked,
+        );
+        let Some(op) = defining_op_mut(walked, op_data.op) else {
+            continue;
+        };
+        match op {
+            Op::Sentient(
+                ops::Op::LoadAndSend {
+                    immutable_addr,
+                    increment,
+                    ..
+                }
+                | ops::Op::ReceiveAndStore {
+                    immutable_addr,
+                    increment,
+                    ..
+                }
+                | ops::Op::LoadComputeAndSend {
+                    immutable_addr,
+                    increment,
+                    ..
+                },
+            ) => {
+                *immutable_addr = new_const;
+                if rewritten == (Rewritten::Address { update_mode: true }) {
+                    *increment = new_const;
+                }
+            }
+            // `op->setOperand(const_idx, new_const)` for the add and the sub.
+            op => {
+                if let Rewritten::Operand(index) = rewritten {
+                    set_operand(op, index, new_const);
+                }
+            }
+        }
+    }
+}
 
 // crustify:todo: e468_processMergeableChain
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1645  (58 body lines, level 2)
@@ -877,5 +1048,101 @@ mod unit_tests {
                 vec![add(Val(3), Val(7), Val(8), None)]
             )
         );
+    }
+    /// e365 — ⛔ BOTH TRAPS AT ONCE. A `scalar_sub` asked to ADD its modifier has it negated first, and
+    /// a composite transfer whose increment is not already the constant 0 has that increment assigned
+    /// THE SAME new value as its immutable address.
+    #[test]
+    fn applying_the_data_negates_a_subs_modifier_and_assigns_the_increment_too() {
+        /// The evaluator of the two tests above with the `-1` multiply recorded.
+        struct NegatingEvaluator {
+            factors: Vec<i64>,
+        }
+
+        impl ExpressionEvaluator for NegatingEvaluator {
+            fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+                absolute(ScalarOffset(4))
+            }
+
+            fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+                absolute(ScalarOffset(20))
+            }
+
+            fn evaluate_multiply_by_const(
+                &mut self,
+                ev: &Evaluation,
+                factor: i64,
+            ) -> Evaluation {
+                self.factors.push(factor);
+                ev.clone()
+            }
+
+            fn build_offset_value(
+                &mut self,
+                _evaluation: &Evaluation,
+                _sites: &mut OffsetSites<'_>,
+                _walked: &mut Vec<Op>,
+                _ty: ScalarTy,
+            ) -> Val {
+                Val(9)
+            }
+        }
+
+        let sub = |lhs, rhs, result| {
+            Op::Sentient(ops::Op::ScalarSub {
+                lhs,
+                rhs,
+                result,
+                reg: None,
+                element_size: None,
+                ty: ScalarTy::Index,
+            })
+        };
+        let mut walked = vec![
+            constant(64, Val(2)),
+            sub(Val(20), Val(2), Val(3)),
+            constant(64, Val(5)),
+            // ⭐ NOT THE CONSTANT 0, which is what puts the transfer in update mode.
+            constant(8, Val(6)),
+            load_and_send(Val(1), Val(5), Val(6)),
+        ];
+        let modifier = absolute(ScalarOffset(16));
+        let ops_to_update = [
+            OperationData {
+                op: Val(3),
+                modifier: modifier.clone(),
+                merging_increment: modifier.clone(),
+                replace_with_mod: Modification::AddTo,
+            },
+            OperationData {
+                op: Val(31),
+                modifier: modifier.clone(),
+                merging_increment: modifier.clone(),
+                replace_with_mod: Modification::Replace,
+            },
+        ];
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+        let mut evaluator = NegatingEvaluator {
+            factors: Vec::new(),
+        };
+
+        apply_operation_data(
+            &ops_to_update,
+            GenericComp::Lxlu,
+            &mut evaluator,
+            &mut sites,
+            &mut walked,
+        );
+
+        // The sub's ONE constant operand is its rhs, and the negation was asked for exactly once.
+        assert_eq!(walked[1], sub(Val(20), Val(9), Val(3)));
+        assert_eq!(evaluator.factors, vec![-1]);
+        assert_eq!(walked[4], load_and_send(Val(1), Val(9), Val(9)));
     }
 }

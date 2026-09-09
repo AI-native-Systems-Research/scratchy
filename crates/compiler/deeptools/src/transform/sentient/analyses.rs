@@ -160,6 +160,18 @@ pub trait ExpressionEvaluator {
         )
     }
 
+    /// `ExpressionEvaluator::evaluateMultiplyByConst` (`Analyses/ExpressionEvaluatorUtils.h:285`) —
+    /// the evaluation of `ev * factor`, which is how a hoist NEGATES a modifier before adding it to a
+    /// `sentient.scalar_sub`'s constant (`ScalarOpMergingAndHoisting.cpp:1757`).
+    ///
+    /// ⭐ DEFAULTED for the same reason [`ExpressionEvaluator::evaluate_sub`] is.
+    fn evaluate_multiply_by_const(&mut self, ev: &Evaluation, factor: i64) -> Evaluation {
+        let _ = (ev, factor);
+        todo!(
+            "ExpressionEvaluator::evaluateMultiplyByConst (Analyses/ExpressionEvaluatorUtils.h:285) — out of campaign scope"
+        )
+    }
+
     /// `EvaluatedValue::buildOffsetValue` (`Analyses/ExpressionEvaluatorUtils.h:126`) — materialises
     /// the offset as a value, creating ops in `sites` (`walked` when `sites.query_maps` is `None`).
     fn build_offset_value(
@@ -250,8 +262,10 @@ pub trait ExpressionEvaluator {
     }
 
     /// `ExpressionEvaluator::evaluateMultiplyByConst`
-    /// (`Analyses/ExpressionEvaluatorUtils.h:285`) — `ev * by`.
-    fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+    /// (`Analyses/ExpressionEvaluatorUtils.h:285`) — `ev * by`, ⭐ THE HANDLE FLAVOUR, suffixed like
+    /// [`ExpressionEvaluator::build_offset_value_of`] because its [`Evaluation`] twin above holds the
+    /// bare name.
+    fn evaluate_multiply_by_const_of(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
         let _ = (ev, by);
         todo!(
             "ExpressionEvaluator::evaluateMultiplyByConst (Analyses/ExpressionEvaluatorUtils.h:285) — out of campaign scope"
@@ -478,6 +492,13 @@ pub trait InstructionEstimator {
 
     /// `getEstimatedInstructionCount(ctx, Region *)` (`Analyses/InstructionEstimation.h:62`).
     fn estimated_instruction_count_of_region(&mut self, region: &[Op]) -> InstructionCount;
+
+    /// `getRemainingIbuffSpace(ctx, unit)` (`Analyses/InstructionEstimation.h:69`) — how many more
+    /// instructions the unit's instruction buffer will take, ⛔ NEGATIVE once it already overruns.
+    ///
+    /// ⭐ IT ANSWERS ONLY WHAT THE LAST [`Self::recalculate`] COUNTED, which is why every caller
+    /// recalculates immediately before asking (`ScalarOpMergingAndHoisting.cpp:2313-2315`).
+    fn remaining_ibuff_space(&mut self, unit: &[Op]) -> InstructionCount;
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the estimator is not ported, so asking it anything is a `todo!`.
@@ -500,6 +521,54 @@ impl InstructionEstimator for OutOfScopeInstructionEstimator {
     fn estimated_instruction_count_of_region(&mut self, _region: &[Op]) -> InstructionCount {
         todo!(
             "InstructionEstimatorImpl::getEstimatedInstructionCount (Analyses/InstructionEstimation.h:62) — out of campaign scope"
+        )
+    }
+
+    fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
+        todo!(
+            "InstructionEstimatorImpl::getRemainingIbuffSpace (Analyses/InstructionEstimation.h:69) — out of campaign scope"
+        )
+    }
+}
+
+/// A COUNT OF REGISTERS IN ONE LOCALE — `RegisterPressure`'s `unsigned`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RegisterCount(pub u32);
+
+/// THE `RegisterPressure&` A PASS IS HANDED — a trait for the same reason [`ExpressionEvaluator`] is
+/// one: the analysis is not in this campaign, and a test must still be able to state its answers.
+///
+/// ⛔ `Analyses/RegisterPressureAnalysis.{h,cpp}` IS OUT OF CAMPAIGN SCOPE — and so is the `Liveness`
+/// every constructor of it takes (`RegisterPressureAnalysis.h:54-56`) — so the crate's only
+/// implementation is [`OutOfScopeRegisterPressure`] and both its methods are `todo!`s.
+/// ⭐ `Metric` IS FOLDED INTO THE METHOD NAME rather than passed: the enum is a closed set of five
+/// (`RegisterPressureAnalysis.h:38-44`) selecting what the `unsigned` MEANS, and only two of them are
+/// asked for by a ported unit — a second metric earns a second method, not a return value whose units
+/// depend on an argument. The other three need the `dcc_ctx` this seam does not carry (`:53`).
+pub trait RegisterPressure {
+    /// `getOrComputeRegisterPressure(locale, Metric::kNumFreeRegisters)`
+    /// (`Analyses/RegisterPressureAnalysis.h:71`) — how many registers of `locale` are still free.
+    fn num_free_registers(&mut self, locale: RegType) -> RegisterCount;
+
+    /// `getOrComputeRegisterPressure(locale, Metric::kNumRegisters)` (`:71`, and `kDefault` at
+    /// `:37-39`) — how many registers of `locale` the unit is estimated to need.
+    fn num_registers(&mut self, locale: RegType) -> RegisterCount;
+}
+
+/// THE ONE CRATE IMPLEMENTATION: register pressure is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeRegisterPressure;
+
+impl RegisterPressure for OutOfScopeRegisterPressure {
+    fn num_free_registers(&mut self, _locale: RegType) -> RegisterCount {
+        todo!(
+            "RegisterPressure::getOrComputeRegisterPressure (Analyses/RegisterPressureAnalysis.h:71) — out of campaign scope"
+        )
+    }
+
+    fn num_registers(&mut self, _locale: RegType) -> RegisterCount {
+        todo!(
+            "RegisterPressure::getOrComputeRegisterPressure (Analyses/RegisterPressureAnalysis.h:71) — out of campaign scope"
         )
     }
 }
@@ -1025,33 +1094,5 @@ impl ExprInfoMap {
     pub fn expr_info_at(&self, unit: UnitIndex) -> Option<&PropagatedExpr> {
         let bucket = *self.buckets.get(unit.0 as usize)?;
         self.exprs.get(bucket)?.as_ref()
-    }
-}
-
-/// THE `RegisterPressure` A PASS CONSTRUCTS OVER ONE UNIT — a trait, for the same reason
-/// [`ExpressionEvaluator`] is one: the analysis is not in this campaign and a test must still be able
-/// to state its answers.
-///
-/// ⛔ `Analyses/RegisterPressureAnalysis.{h,cpp}` IS OUT OF CAMPAIGN SCOPE — and so is the
-/// `Liveness` every constructor of it takes (`RegisterPressureAnalysis.h:54-56`) — so the crate's only
-/// implementation is [`OutOfScopeRegisterPressure`] and its one method is a `todo!`.
-///
-/// ⭐ ONE METRIC, NOT THE `enum class Metric`: `kNumRegisters` is `kDefault` (`:37-39`) and is the only
-/// one any ported caller asks for; the other three need the `dcc_ctx` this seam does not carry (`:53`).
-pub trait RegisterPressure {
-    /// `getOrComputeRegisterPressure(locale, Metric::kNumRegisters)` (`:71`) — how many registers of
-    /// `locale` the unit is estimated to need.
-    fn num_registers(&mut self, locale: RegType) -> u32;
-}
-
-/// THE ONE CRATE IMPLEMENTATION: register pressure is not ported, so asking it anything is a `todo!`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OutOfScopeRegisterPressure;
-
-impl RegisterPressure for OutOfScopeRegisterPressure {
-    fn num_registers(&mut self, _locale: RegType) -> u32 {
-        todo!(
-            "RegisterPressure::getOrComputeRegisterPressure (Analyses/RegisterPressureAnalysis.h:71) — out of campaign scope"
-        )
     }
 }

@@ -55,6 +55,27 @@ pub enum LoopNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubtreeHeight(pub u16);
 
+/// `OperationNode::WalkOrder` (`OperationTree.hpp:80-125`) at the orders that are an ORDER.
+///
+/// ⛔ THE TWO GUIDED ORDERS ARE A DIFFERENT PROTOCOL AND ARE NOT HERE: `kPreOrderGuided` and
+/// `kPostOrderGuided` let the action pick the sibling to continue from (`OperationTree.cpp:145-170`),
+/// so they cannot be handed back as a list of nodes. `LoopMerging` is the only pass that takes one, and
+/// it does so through a `cl::opt` whose default is `kReverseBFS` (`LoopMerging.cpp:44-50`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkOrder {
+    /// `kPostOrder` — children in syntactic order, then the node.
+    PostOrder,
+    /// `kPreOrder` — the node, then children in syntactic order.
+    PreOrder,
+    /// `kBFS` — level by level from the root, siblings left to right.
+    Bfs,
+    /// `kReverseBFS` — the BFS order REVERSED, so the deepest level comes first and siblings come
+    /// right to left. What `ScalarOpMergingAndHoisting` and `LoopSplittingAndUnrolling` walk.
+    ReverseBfs,
+    /// `kKeepOrderRBFS` — bottom-up, but siblings kept in program order.
+    KeepOrderRbfs,
+}
+
 /// `dcc::LoopTree<LoopOp, ProgramUnit>` — one program unit's loop forest.
 ///
 /// # ⭐⭐ `compute_subtree_heights_` IS A CONST GENERIC, WHICH DELETES ITS `DT_CHECK`
@@ -160,6 +181,86 @@ impl<const HEIGHTS: bool> LoopTree<HEIGHTS> {
     /// for what "does not free the storage" buys.
     pub fn remove(&mut self, n: LoopNodeId) {
         self.tree.remove(n.0);
+    }
+
+    /// `LoopNode::isInnermostLoop()` — `LoopTree.hpp:56`, which is `isLeaf()`
+    /// (`OperationTree.hpp:69`) and nothing more.
+    #[must_use]
+    pub fn is_innermost_loop(&self, n: LoopNodeId) -> bool {
+        self.first_child(n).is_none()
+    }
+
+    /// `LoopTree::walk(action, walk_order)` — `LoopTree.hpp:115-141`, FROM THE ROOT.
+    ///
+    /// ⭐ THE ORDER IS HANDED BACK RATHER THAN A CALLBACK CALLED. The C++ action mutates the IR while
+    /// the tree it walks holds `Operation *`; this tree holds [`ForRef`]s over a body the caller owns
+    /// mutably, so a callback would need that body borrowed twice. Every caller's action re-finds its
+    /// loop anyway — and the reference's own contract already says nodes the action adds are not
+    /// visited (`OperationTree.hpp:105-107`), which is exactly what a fixed list gives.
+    ///
+    /// ⛔ THE ROOT IS IN THE LIST, and it names no loop: `optimizeNode` opens with
+    /// `if (n == loopTree.getRoot() || !n) return nullptr` (`ScalarOpMergingAndHoisting.cpp:2301`).
+    #[must_use]
+    pub fn walk(&self, order: WalkOrder) -> Vec<LoopNodeId> {
+        match order {
+            WalkOrder::PreOrder => self.walk_preorder(),
+            WalkOrder::PostOrder => {
+                let mut out = Vec::new();
+                self.push_postorder(self.root(), &mut out);
+                out
+            }
+            WalkOrder::Bfs => self.walk_bfs(false),
+            // ⭐ THE STACK IS THE REVERSAL — `reverseBreadthFirstWalk` queues BFS into a stack and then
+            // pops it (`OperationTree.cpp:200-236`), so the answer is the BFS order reversed.
+            WalkOrder::ReverseBfs => {
+                let mut out = self.walk_bfs(false);
+                out.reverse();
+                out
+            }
+            // `keep_order` queues each node's children in REVERSE so the stack pop restores program
+            // order (`OperationTree.cpp:220-231`).
+            WalkOrder::KeepOrderRbfs => {
+                let mut out = self.walk_bfs(true);
+                out.reverse();
+                out
+            }
+        }
+    }
+
+    /// `breadthFirstWalk` (`OperationTree.cpp:181-196`), `keep_order` queueing children right to left.
+    #[must_use]
+    fn walk_bfs(&self, keep_order: bool) -> Vec<LoopNodeId> {
+        let mut out = Vec::new();
+        let mut queue = std::collections::VecDeque::from([self.root()]);
+        while let Some(n) = queue.pop_front() {
+            out.push(n);
+            let mut kids = self.children(n);
+            if keep_order {
+                kids.reverse();
+            }
+            queue.extend(kids);
+        }
+        out
+    }
+
+    /// `postOrderWalk` (`OperationTree.cpp:118-125`).
+    fn push_postorder(&self, n: LoopNodeId, out: &mut Vec<LoopNodeId>) {
+        for child in self.children(n) {
+            self.push_postorder(child, out);
+        }
+        out.push(n);
+    }
+
+    /// One node's children in syntactic order.
+    #[must_use]
+    fn children(&self, n: LoopNodeId) -> Vec<LoopNodeId> {
+        let mut out = Vec::new();
+        let mut child = self.first_child(n);
+        while let Some(c) = child {
+            out.push(c);
+            child = self.next_sibling(c);
+        }
+        out
     }
 
     /// Every node, root first — the pre-order walk the two total helpers here need.

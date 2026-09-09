@@ -880,6 +880,8 @@ mod unit_tests {
         recalculated: usize,
         /// What every op costs.
         per_op: i32,
+        /// What is left of the instruction buffer.
+        remaining_ibuff: i32,
     }
 
     impl InstructionEstimator for StatedEstimator {
@@ -893,6 +895,10 @@ mod unit_tests {
 
         fn estimated_instruction_count_of_region(&mut self, region: &[Op]) -> InstructionCount {
             InstructionCount(region.len() as i32)
+        }
+
+        fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
+            InstructionCount(self.remaining_ibuff)
         }
     }
 
@@ -1091,6 +1097,7 @@ mod unit_tests {
         let mut ie = StatedEstimator {
             recalculated: 0,
             per_op: 7,
+            remaining_ibuff: 0,
         };
         let mut canonicalizer = RecordingCanonicalizer::default();
         cleanup_and_recalculate(&mut pass, &mut tree, &mut ie, &mut canonicalizer, &mut unit);

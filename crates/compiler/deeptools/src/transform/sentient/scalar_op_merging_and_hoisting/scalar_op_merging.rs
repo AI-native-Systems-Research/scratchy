@@ -502,7 +502,7 @@ pub(crate) fn is_field_unroll_candidate(
             }
 
             for i in (0..count(mem_info.il)).rev() {
-                let scaled_increment = evaluator.evaluate_multiply_by_const(increment_ev, i);
+                let scaled_increment = evaluator.evaluate_multiply_by_const_of(increment_ev, i);
                 let unrolled_immutable_ev =
                     evaluator.evaluate_sum_handle(immutable_addr_ev, scaled_increment);
                 // The op is unrolled into no-update ops, so the increment is folded out here.
@@ -1051,7 +1051,7 @@ mod unit_tests {
             self.intern(difference)
         }
 
-        fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+        fn evaluate_multiply_by_const_of(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
             let product = self.offset(ev) * by;
             self.intern(product)
         }

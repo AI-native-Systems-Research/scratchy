@@ -104,7 +104,8 @@ use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient, sy
 use crate::islands::sentient::print;
 
 use super::ForRef;
-use super::analyses::Liveness;
+use super::analyses::{InstructionEstimator, Liveness, RegisterCount, RegisterPressure};
+use super::utils::{InBlock, NewUse, OpAt, move_to_common_dominator};
 
 /// `localeToRegisterClass` (`dcc/src/Dialect/Sentient/Utils.cpp:203`) — the register class a locale
 /// names, which is `stringifySentientRegType(locale).upper()` with both XRF pointers folded onto one.
@@ -627,20 +628,338 @@ pub fn dump_candidates(candidates: &[CandidateEntry], scope: &[Op]) -> String {
     out
 }
 
-// crustify:todo: e358_collectCandidates
-//   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:297  (65 body lines, level 1)
-//   original  : void ScalarCopyInsertionForSymbolsPass::collectCandidates( dataflow::ProgramUnitOp unit, CandidateListTy &candidates, RegisterPressure &rp) const
-//   calls     : e252_size
+/// Replaces: e358_collectCandidates
+///
+/// The most-used symbols per symbolic locale, capped by that locale's free registers and by the
+/// unit's remaining ibuff space.
+///
+/// ⛔ TRAP: `size() < 2` SKIPS ONLY THE SORT (`:325`); the entry is already in the map, so a locale
+/// with one used symbol still yields that candidate below.
+/// ⛔ TRAP: `const unsigned num_free_insts` (`:347-348`) WRAPS an already-overrun ibuff to ~4e9, so
+/// `std::min` then ignores that budget. Ported as the reference computes it.
+#[must_use]
+pub fn collect_candidates<P: RegisterPressure, I: InstructionEstimator>(
+    unit_body: &[Op],
+    symbols: &[Val],
+    state: &PerUnitState,
+    register_pressure: &mut P,
+    instruction_estimator: &mut I,
+) -> Vec<CandidateEntry> {
+    // `getOrComputeRegisterPressure(locale == lccr ? jcr : locale, kNumFreeRegisters)` — *"our goal is
+    // to replace lccrs with jcrs"* (`:301-306`), asked once per locale in each of the two loops.
+    let free_registers = |rp: &mut P, locale: RegType| {
+        rp.num_free_registers(if locale == RegType::Lccr {
+            RegType::Jcr
+        } else {
+            locale
+        })
+    };
+    let mut per_locale: Vec<(RegType, Vec<Val>)> = Vec::new();
+    for locale in &state.symbolic_locales {
+        // `LLVM_DEBUG("skip collecting candidates for locale [..] .. no free registers")`.
+        if free_registers(register_pressure, *locale) == RegisterCount(0) {
+            continue;
+        }
+        // `collectPerLocalCandidate` — ⭐ AN EMPTY SLICE IS ITS TWO `find(..) == end()` RETURNS at
+        // once: [`SymbolUsage::record`] never leaves an entry behind with no use in it.
+        let mut ranked: Vec<Val> = symbols
+            .iter()
+            .chain(&state.ops.symbol_queries)
+            .copied()
+            .filter(|symbol| !state.symbol_to_usage.uses(*symbol, *locale).is_empty())
+            .collect();
+        // `plc_it == per_locale_candidates.end()` — the map gains no entry for a locale nothing used.
+        if ranked.is_empty() {
+            continue;
+        }
+        if ranked.len() >= 2 {
+            // `std::stable_sort` descending on the number of uses in this locale (`:327-332`).
+            ranked.sort_by_key(|symbol| {
+                std::cmp::Reverse(state.symbol_to_usage.uses(*symbol, *locale).len())
+            });
+        }
+        per_locale.push((*locale, ranked));
+    }
 
-// crustify:todo: e359_insertCopyOpsForCandidates
-//   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:365  (49 body lines, level 1)
-//   original  : void ScalarCopyInsertionForSymbolsPass::insertCopyOpsForCandidates( dataflow::ProgramUnitOp unit, const CandidateListTy &candidates)
-//   calls     : e151_insertCopyOpsForJCRCandidate, e154_propagateElementSizeToCopyOp
+    // *"Since JCR copy_ops cannot be packet initialized, they use up ibuff space"* (`:335-342`).
+    let num_free_insts = instruction_estimator
+        .remaining_ibuff_space(unit_body)
+        .0
+        .cast_unsigned();
+    let mut candidates = Vec::new();
+    for locale in &state.symbolic_locales {
+        let Some((_, ranked)) = per_locale.iter().find(|(at, _)| at == locale) else {
+            continue;
+        };
+        // `N = min(min(num_free_registers, num_free_insts), size())` — the top N of the ranking.
+        let constraint = free_registers(register_pressure, *locale).0.min(num_free_insts);
+        let take = (constraint as usize).min(ranked.len());
+        for symbol in &ranked[..take] {
+            candidates.push(CandidateEntry {
+                symbol: *symbol,
+                locale: *locale,
+            });
+        }
+    }
+    candidates
+}
 
-// crustify:todo: e360_dumpSymbolUsageInfo
-//   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:512  (32 body lines, level 1)
-//   original  : void ScalarCopyInsertionForSymbolsPass::dumpSymbolUsageInfo() const
-//   calls     : e252_size
+/// Replaces: e359_insertCopyOpsForCandidates
+///
+/// Inserts one `sentient.scalar_copy` per candidate and points that candidate's recorded uses at it,
+/// hoisting the copy until it dominates them all.
+///
+/// ⛔ TRAP: THE GATE COUNTS EACH SIDE, NOT THE CANDIDATES (`:369-382`) — two JCR-ish or two others, so
+/// one of each inserts NOTHING at all.
+/// ⭐ `ForceInsertionEvenIfOneCandidate` is a `dcc-opt` `cl::opt` at its default `false` (`:60-63`), and
+/// the `emitError`/`signalPassFailure` arm is unreachable: every use is inside this unit's own body.
+pub fn insert_copy_ops_for_candidates(
+    unit_body: &mut Vec<Op>,
+    candidates: &[CandidateEntry],
+    usage: &SymbolUsage,
+    values: &mut Values,
+) -> Vec<Val> {
+    let jcr_count = candidates
+        .iter()
+        .filter(|entry| JcrLocale::of(entry.locale).is_some())
+        .count();
+    if jcr_count < 2 && candidates.len() - jcr_count < 2 {
+        // `LLVM_DEBUG("Skip inserting copy op since there are not enough candidates ..")`.
+        return Vec::new();
+    }
+    // ⭐ THE RECORDED POSITIONS, KEPT CURRENT. The reference's `OpOperand *` survives every insertion
+    // this function makes and a [`UseSite::path`] does not, so each is shifted as the IR moves.
+    let mut live: Vec<Vec<UseSite>> = candidates
+        .iter()
+        .map(|entry| usage.uses(entry.symbol, entry.locale).to_vec())
+        .collect();
+    let mut inserted = Vec::new();
+    for (which, entry) in candidates.iter().enumerate() {
+        if let Some(jcr) = JcrLocale::of(entry.locale) {
+            let mut current = SymbolUsage::default();
+            for site in &live[which] {
+                current.record(entry.symbol, entry.locale, site.clone());
+            }
+            if let Some(copied) =
+                insert_copy_ops_for_jcr_candidate(unit_body, entry.symbol, jcr, &current, values)
+            {
+                if let Some(at) = path_of_result(unit_body, copied) {
+                    shift_paths(&mut live, &at, true);
+                }
+                inserted.push(copied);
+            }
+            continue;
+        }
+        // The two `DT_CHECK`s (`:390-393`): a candidate the collector did not record has no uses.
+        let Some(first) = live[which].first().cloned() else {
+            continue;
+        };
+        let copy_result = values.mint();
+        let mut copy = Op::Sentient(sentient::Op::ScalarCopy {
+            input: entry.symbol,
+            result: copy_result,
+            // `CopyOp::create(builder, user->getLoc(), symbol.getType(), symbol, locale)` — the
+            // candidate's own locale here, unlike the JCR arm's forced `jcr`.
+            reg: Reg {
+                locale: entry.locale,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        });
+        // `propagateElementSizeToCopyOp(*opnd, copy)` — the FIRST use only (`:404`).
+        if let Some((user, parent)) = user_and_parent(unit_body, &first.path) {
+            propagate_element_size_to_copy_op(user, first.operand, parent, &mut copy);
+        }
+        // ⛔ REWIRED BEFORE THE INSERTION, for [`insert_copy_ops_for_jcr_candidate`]'s reason: an
+        // insertion shifts every position after it in its block.
+        for site in &live[which] {
+            if let Some(user) = op_at_mut(unit_body, &site.path) {
+                dialects::set_operand(user, site.operand, copy_result);
+            }
+        }
+        // `OpBuilder builder(user)` — immediately before the first use.
+        match block_at_mut(unit_body, &first.path) {
+            Some((block, index)) => block.insert(index, copy),
+            // ⭐ UNREACHABLE: the path is one the collector recorded and nothing has moved yet.
+            None => unit_body.insert(0, copy),
+        }
+        shift_paths(&mut live, &first.path, true);
+        // `moveToCommonDominator(new_copy_op, user)` once per use after the first (`:405-410`) — a
+        // no-op where the copy already dominates, which is why stopping early is the same rewrite.
+        for _ in 1..live[which].len() {
+            let Some(before) = path_of_result(unit_body, copy_result) else {
+                break;
+            };
+            let readers = positions_of(unit_body, &[], &|op| {
+                dialects::operands(op).contains(&copy_result)
+            });
+            let Some(copy_at) = positions_of(unit_body, &[], &|op| {
+                dialects::results(op).contains(&copy_result)
+            })
+            .into_iter()
+            .next() else {
+                break;
+            };
+            let Some(stuck) = readers.into_iter().find(|at| !copy_at.dominates(at)) else {
+                break;
+            };
+            let _ = move_to_common_dominator(unit_body, &copy_at, &NewUse::SameUnit(stuck));
+            // ⭐ ONLY THE COPY MOVED, so its two positions are the whole shift: the copy's one operand
+            // is the symbol, defined at function scope or at the top of this unit, so the rehoist of
+            // operand definitions (`:101-140`) has nothing to reach.
+            shift_paths(&mut live, &before, false);
+            if let Some(after) = path_of_result(unit_body, copy_result) {
+                shift_paths(&mut live, &after, true);
+            }
+        }
+        inserted.push(copy_result);
+    }
+    inserted
+}
+
+/// `opnd->getOwner()` and its `getParentOp()` — the two ops [`propagate_element_size_to_copy_op`] asks
+/// about, reached through one [`UseSite::path`]. `None` for the parent means the unit body itself.
+fn user_and_parent<'a>(block: &'a [Op], path: &[u32]) -> Option<(&'a Op, Option<&'a Op>)> {
+    let (&ordinal, rest) = path.split_first()?;
+    let op = block.get(ordinal as usize)?;
+    let Some((&flat, tail)) = rest.split_first() else {
+        return Some((op, None));
+    };
+    let mut base = 0usize;
+    for region in dialects::regions_ref(op) {
+        if (flat as usize) < base + region.len() {
+            let (user, parent) = user_and_parent(region, &descend(flat as usize - base, tail))?;
+            return Some((user, parent.or(Some(op))));
+        }
+        base += region.len();
+    }
+    None
+}
+
+/// The block one [`UseSite::path`] ends in, with the position of the op it names — where
+/// `OpBuilder builder(user)` inserts.
+fn block_at_mut<'a>(block: &'a mut Vec<Op>, path: &[u32]) -> Option<(&'a mut Vec<Op>, usize)> {
+    let (&ordinal, rest) = path.split_first()?;
+    let Some((&flat, tail)) = rest.split_first() else {
+        return Some((block, ordinal as usize));
+    };
+    let op = block.get_mut(ordinal as usize)?;
+    let mut base = 0usize;
+    for region in dialects::regions_mut(op) {
+        let len = region.len();
+        if (flat as usize) < base + len {
+            return block_at_mut(region, &descend(flat as usize - base, tail));
+        }
+        base += len;
+    }
+    None
+}
+
+/// The tail of a [`UseSite::path`] rebased on the region it just entered.
+fn descend(within: usize, tail: &[u32]) -> Vec<u32> {
+    let mut sub: Vec<u32> = Vec::with_capacity(1 + tail.len());
+    sub.push(u32::try_from(within).unwrap_or_default());
+    sub.extend_from_slice(tail);
+    sub
+}
+
+/// The op binding `val`, as a [`UseSite::path`] — how a copy just inserted reports where it landed.
+fn path_of_result(block: &[Op], val: Val) -> Option<Vec<u32>> {
+    for (index, op) in block.iter().enumerate() {
+        if dialects::results(op).contains(&val) {
+            return Some(vec![u32::try_from(index).unwrap_or_default()]);
+        }
+        let mut base = 0usize;
+        for region in dialects::regions_ref(op) {
+            if let Some(inner) = path_of_result(region, val) {
+                let mut path = vec![u32::try_from(index).unwrap_or_default()];
+                path.extend(descend(base + inner[0] as usize, &inner[1..]));
+                return Some(path);
+            }
+            base += region.len();
+        }
+    }
+    None
+}
+
+/// A BLOCK GAINING OR LOSING THE OP AT `at` SHIFTS EVERY LATER POSITION IN IT — and, because a
+/// [`UseSite::path`] indexes an op's regions concatenated, every position in a later region of the
+/// same op too. ⭐ MECHANISM: the reference's `OpOperand *` needs none of this.
+fn shift_paths(live: &mut [Vec<UseSite>], at: &[u32], gained: bool) {
+    let Some((&last, prefix)) = at.split_last() else {
+        return;
+    };
+    for site in live.iter_mut().flatten() {
+        if site.path.len() <= prefix.len() || site.path[..prefix.len()] != *prefix {
+            continue;
+        }
+        let step = &mut site.path[prefix.len()];
+        if gained && *step >= last {
+            *step += 1;
+        } else if !gained && *step > last {
+            *step -= 1;
+        }
+    }
+}
+
+/// Every op of the subtree `pick` accepts, as an [`OpAt`], outermost first.
+///
+/// ⭐ MECHANISM FOR REACHING OPS: [`move_to_common_dominator`] asks in `(op, region)` steps, which is
+/// the same position a [`UseSite::path`] spells flat.
+fn positions_of(
+    block: &[Op],
+    enclosing: &[(InBlock, usize)],
+    pick: &dyn Fn(&Op) -> bool,
+) -> Vec<OpAt> {
+    let mut found = Vec::new();
+    for (index, op) in block.iter().enumerate() {
+        if pick(op) {
+            found.push(OpAt::at(enclosing, InBlock(index)));
+        }
+        for (which, region) in dialects::regions_ref(op).into_iter().enumerate() {
+            let mut inner = enclosing.to_vec();
+            inner.push((InBlock(index), which));
+            found.extend(positions_of(region, &inner, pick));
+        }
+    }
+    found
+}
+
+/// Replaces: e360_dumpSymbolUsageInfo
+///
+/// The `=== Usage Info: ===` block — one line per symbol and symbolic locale it is used in, naming the
+/// symbol by its `SymbolId` or, for a `symbol.query_map`, by the line it was queried on.
+///
+/// ⛔ TRAP: `DT_CHECK(sym_op ^ sym_query_op)` IS THE DEFINING OP'S IDENTITY, so any other defining op —
+/// and a symbol with none in this scope — takes the query branch, as its `dyn_cast` pair does.
+/// ⭐ `getLocation(..).getLine()` HAS NOTHING TO READ on this rung, so it prints `?`, exactly as
+/// [`dump_candidates`] already does; the outer `find(sym) == end()` return prints nothing either way.
+#[must_use]
+pub fn dump_symbol_usage_info(symbols: &[Val], state: &PerUnitState, scope: &[Op]) -> String {
+    let mut out = String::from("=== Usage Info: ===\n");
+    for symbol in symbols.iter().chain(&state.ops.symbol_queries) {
+        for locale in &state.symbolic_locales {
+            let count = state.symbol_to_usage.uses(*symbol, *locale).len();
+            if count == 0 {
+                continue;
+            }
+            let class = locale_to_register_class(*locale);
+            let _ = match dialects::defining_op(*symbol, scope) {
+                Some(Op::Symbol(symbol::Op::CreateSymbol { symbol_id, .. })) => writeln!(
+                    out,
+                    "Sym ID ({symbol_id}) for locale [{class}] has {count} use(s)."
+                ),
+                _ => writeln!(
+                    out,
+                    "Symbol Query On Line (?) for locale [{class}] has {count} use(s)."
+                ),
+            };
+        }
+    }
+    out.push_str("=== End of Usage Info ===\n");
+    out
+}
 
 // crustify:todo: e527_collectSymbolUsage
 //   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:236  (38 body lines, level 3)
@@ -661,6 +980,7 @@ pub fn dump_candidates(candidates: &[CandidateEntry], scope: &[Op]) -> String {
 mod unit_tests {
     use super::*;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::transform::sentient::analyses::InstructionCount;
     use crate::islands::sentient::dialects::dataflow;
     use crate::islands::sentient::dialects::sentient::Carried;
     use crate::units::{DfirUnit, Residency};
@@ -1061,6 +1381,280 @@ mod unit_tests {
 
         assert!(!none);
         assert_eq!(untouched, a_copy(Val(0), Val(1), RegType::Jcr));
+    }
+
+    /// `RegisterPressure&` and `InstructionEstimatorImpl&` with their answers stated — neither analysis
+    /// is in this campaign, and `collectCandidates` is nothing but a function of what they say.
+    struct StatedPressure(RegisterCount);
+    impl RegisterPressure for StatedPressure {
+        fn num_free_registers(&mut self, _locale: RegType) -> RegisterCount {
+            self.0
+        }
+
+        fn num_registers(&mut self, _locale: RegType) -> RegisterCount {
+            self.0
+        }
+    }
+    struct StatedIbuff(InstructionCount);
+    impl InstructionEstimator for StatedIbuff {
+        fn recalculate(&mut self, _unit: &[Op]) {}
+
+        fn estimated_instruction_count_of_op(&mut self, _op: &Op) -> InstructionCount {
+            InstructionCount(0)
+        }
+
+        fn estimated_instruction_count_of_region(&mut self, _region: &[Op]) -> InstructionCount {
+            InstructionCount(0)
+        }
+
+        fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
+            self.0
+        }
+    }
+
+    /// `e358` — the ranking is by use count, a locale with one used symbol still yields it, the ibuff
+    /// is the budget that binds when it is the smaller, and no free register collects nothing.
+    #[test]
+    fn the_candidates_are_the_most_used_symbols_within_both_budgets() {
+        let mut usage = SymbolUsage::default();
+        for operand in [0, 1] {
+            usage.record(
+                Val(0),
+                RegType::Lrf,
+                UseSite {
+                    path: vec![0],
+                    operand,
+                },
+            );
+        }
+        usage.record(
+            Val(1),
+            RegType::Lrf,
+            UseSite {
+                path: vec![1],
+                operand: 0,
+            },
+        );
+        usage.record(
+            Val(2),
+            RegType::Jcr,
+            UseSite {
+                path: vec![2],
+                operand: 0,
+            },
+        );
+        let state = PerUnitState {
+            ops: OpsOfInterest {
+                symbol_queries: vec![Val(2)],
+                ..OpsOfInterest::default()
+            },
+            symbol_to_usage: usage,
+            symbolic_locales: vec![RegType::Lrf, RegType::Jcr],
+        };
+        // ⭐ `%1` FIRST IN `symbols_` AND SECOND IN THE RANKING: two uses beats one.
+        let symbols = [Val(1), Val(0)];
+
+        let both = collect_candidates(
+            &[],
+            &symbols,
+            &state,
+            &mut StatedPressure(RegisterCount(4)),
+            &mut StatedIbuff(InstructionCount(4)),
+        );
+
+        assert_eq!(
+            both,
+            vec![
+                CandidateEntry {
+                    symbol: Val(0),
+                    locale: RegType::Lrf,
+                },
+                CandidateEntry {
+                    symbol: Val(1),
+                    locale: RegType::Lrf,
+                },
+                // The lone candidate its `size() < 2` left unsorted in the map.
+                CandidateEntry {
+                    symbol: Val(2),
+                    locale: RegType::Jcr,
+                },
+            ]
+        );
+
+        // `min(num_free_registers, num_free_insts)` — one instruction of ibuff takes one per locale.
+        let capped = collect_candidates(
+            &[],
+            &symbols,
+            &state,
+            &mut StatedPressure(RegisterCount(4)),
+            &mut StatedIbuff(InstructionCount(1)),
+        );
+
+        assert_eq!(
+            capped,
+            vec![
+                CandidateEntry {
+                    symbol: Val(0),
+                    locale: RegType::Lrf,
+                },
+                CandidateEntry {
+                    symbol: Val(2),
+                    locale: RegType::Jcr,
+                },
+            ]
+        );
+
+        let none = collect_candidates(
+            &[],
+            &symbols,
+            &state,
+            &mut StatedPressure(RegisterCount(0)),
+            &mut StatedIbuff(InstructionCount(4)),
+        );
+
+        assert!(none.is_empty());
+    }
+
+    /// `e359` — two non-JCR candidates: one copy each, before the first use, the add's width carried
+    /// onto both, and ⭐ THE SECOND CANDIDATE'S RECORDED PATHS STILL NAME ITS OWN USES after the first
+    /// candidate's insertion shifted them. The one-candidate gate is the negative.
+    #[test]
+    fn a_copy_per_candidate_lands_before_its_first_use_and_takes_over_all_of_them() {
+        let mut values = Values::default();
+        let map_a = values.mint();
+        let key_a = values.mint();
+        let sym_a = values.mint();
+        let map_b = values.mint();
+        let key_b = values.mint();
+        let sym_b = values.mint();
+        let sum = values.mint();
+        let difference = values.mint();
+        let a_query = |result, map, key| Op::Symbol(symbol::Op::QueryMap { result, map, key });
+        let body = vec![
+            a_query(sym_a, map_a, key_a),
+            a_query(sym_b, map_b, key_b),
+            an_add(sym_a, sym_b, sum, RegType::Lrf, Some(Bits(16))),
+            Op::Sentient(sentient::Op::ScalarSub {
+                lhs: sym_b,
+                rhs: sym_a,
+                result: difference,
+                reg: Some(Reg {
+                    locale: RegType::Lrf,
+                    index: None,
+                }),
+                element_size: None,
+                ty: ScalarTy::Index,
+            }),
+        ];
+        let mut usage = SymbolUsage::default();
+        for (symbol, path, operand) in [
+            (sym_a, 2, 0),
+            (sym_a, 3, 1),
+            (sym_b, 2, 1),
+            (sym_b, 3, 0),
+        ] {
+            usage.record(
+                symbol,
+                RegType::Lrf,
+                UseSite {
+                    path: vec![path],
+                    operand,
+                },
+            );
+        }
+        let candidates = [
+            CandidateEntry {
+                symbol: sym_a,
+                locale: RegType::Lrf,
+            },
+            CandidateEntry {
+                symbol: sym_b,
+                locale: RegType::Lrf,
+            },
+        ];
+
+        let mut rewritten = body.clone();
+        let inserted =
+            insert_copy_ops_for_candidates(&mut rewritten, &candidates, &usage, &mut values);
+
+        let a_wide_copy = |input, result| {
+            Op::Sentient(sentient::Op::ScalarCopy {
+                input,
+                result,
+                reg: Reg {
+                    locale: RegType::Lrf,
+                    index: None,
+                },
+                program_header: false,
+                element_size: Some(Bits(16)),
+            })
+        };
+        assert_eq!(inserted, vec![Val(8), Val(9)]);
+        assert_eq!(rewritten.len(), 6);
+        assert_eq!(rewritten[2], a_wide_copy(sym_a, Val(8)));
+        assert_eq!(rewritten[3], a_wide_copy(sym_b, Val(9)));
+        assert_eq!(dialects::operands(&rewritten[4]), vec![Val(8), Val(9)]);
+        assert_eq!(dialects::operands(&rewritten[5]), vec![Val(9), Val(8)]);
+
+        // `jcr_count < 2 && non_jcr_count < 2` — one non-JCR candidate is no patch-flit opportunity.
+        let mut untouched = body.clone();
+        let refused =
+            insert_copy_ops_for_candidates(&mut untouched, &candidates[..1], &usage, &mut values);
+
+        assert!(refused.is_empty());
+        assert_eq!(untouched, body);
+    }
+
+    /// `e360` — the two branches of the `xor`, each with its locale and its use count.
+    #[test]
+    fn the_usage_dump_names_a_symbol_by_its_id_and_a_query_by_its_line() {
+        let scope = vec![
+            Op::Symbol(symbol::Op::CreateSymbol {
+                result: Val(0),
+                symbol_id: 7,
+                max_value: None,
+            }),
+            Op::Symbol(symbol::Op::QueryMap {
+                result: Val(1),
+                map: Val(2),
+                key: Val(3),
+            }),
+        ];
+        let mut usage = SymbolUsage::default();
+        for operand in [0, 1] {
+            usage.record(
+                Val(0),
+                RegType::Lrf,
+                UseSite {
+                    path: vec![0],
+                    operand,
+                },
+            );
+        }
+        usage.record(
+            Val(1),
+            RegType::Jcr,
+            UseSite {
+                path: vec![1],
+                operand: 0,
+            },
+        );
+        let state = PerUnitState {
+            ops: OpsOfInterest {
+                symbol_queries: vec![Val(1)],
+                ..OpsOfInterest::default()
+            },
+            symbol_to_usage: usage,
+            symbolic_locales: vec![RegType::Lrf, RegType::Jcr],
+        };
+
+        assert_eq!(
+            dump_symbol_usage_info(&[Val(0)], &state, &scope),
+            "=== Usage Info: ===\n\
+             Sym ID (7) for locale [LRF] has 2 use(s).\n\
+             Symbol Query On Line (?) for locale [JCR] has 1 use(s).\n\
+             === End of Usage Info ===\n"
+        );
     }
 
     /// `e155` — the interleaved line, with both XRF pointers naming the one class.

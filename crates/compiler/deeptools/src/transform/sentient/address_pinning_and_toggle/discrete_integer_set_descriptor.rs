@@ -249,7 +249,7 @@ impl DiscreteIntegerSetDescriptor {
 
             // `cur_loop_delta = stride * (bound-1)`, split at zero into its positive and negative
             // halves so that the two run in opposite directions (`:3035-3046`).
-            let cur_loop_delta = evaluator.evaluate_multiply_by_const(stride, bound_value - 1);
+            let cur_loop_delta = evaluator.evaluate_multiply_by_const_of(stride, bound_value - 1);
             let zero = evaluator.constant(0);
             let cur_positive = evaluator.evaluate_min_max(&[cur_loop_delta, zero], MinMax::Max);
             let cur_negative = evaluator.evaluate_min_max(&[cur_loop_delta, zero], MinMax::Min);
@@ -432,7 +432,7 @@ mod unit_tests {
             self.intern(sum)
         }
 
-        fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+        fn evaluate_multiply_by_const_of(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
             let product = self.value(ev) * by;
             self.intern(product)
         }

@@ -330,7 +330,7 @@ impl LoopingChainMutableAddrDescriptor {
             // `increment = (increment + stride) * bound; size *= bound;` (`:3267-3270`) — ⛔ the
             // reference's `unsigned size` WRAPS here; saturation cannot make a chain look shorter.
             let sum = evaluator.evaluate_sum_handle(increment, stride);
-            increment = evaluator.evaluate_multiply_by_const(sum, *bound_value);
+            increment = evaluator.evaluate_multiply_by_const_of(sum, *bound_value);
             size = size.saturating_mul(u32::try_from(*bound_value).unwrap_or(u32::MAX));
 
             let curr_init = carried.get(curr_it_index)?.init;
@@ -568,7 +568,7 @@ mod unit_tests {
             self.intern(sum)
         }
 
-        fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+        fn evaluate_multiply_by_const_of(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
             let product = self.value(ev) * by;
             self.intern(product)
         }

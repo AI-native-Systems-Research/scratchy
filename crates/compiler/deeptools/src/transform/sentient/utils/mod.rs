@@ -983,25 +983,28 @@ pub fn constant_imm(val: Val, defs: Definitions<'_>) -> Option<ConstantImm> {
     }
 }
 
-/// `Isa::typeToImmInfo.at(isa.getOpcodeType(OpCodeT::LDSTIU))` for one unit
-/// (`Utils/DccExtContext.cpp:40-45`).
+/// `Isa::typeToImmInfo.at(isa.getOpcodeType(opcode))` for one unit (`Utils/DccExtContext.cpp:40-45`),
+/// which is also how `ScalarOpMergingAndHoisting`'s `getImmRange` reads LDSTI (`:2274-2290`).
 ///
 /// ⭐ `DT_CHECK(sizeSignMap.size() == 1)` (`:42`) FAILS THE BUILD HERE, not the run: this is a
-/// `const fn` and the four call sites below are `const` items, so a table with two immediate fields on
-/// the LDSTIU type is a compile error.
-const fn ldstiu_imm_info(comp: fields::Comp) -> (ImmWidth, Sign) {
+/// `const fn` and every call site below is a `const` item, so a table with two immediate fields on the
+/// opcode's type is a compile error.
+const fn imm_info(comp: fields::Comp, opcode: &str) -> (ImmWidth, Sign) {
     let opcodes = comp.opcodes();
     let mut i = 0;
-    let mut ldstiu = None;
+    let mut named = None;
     while i < opcodes.len() {
-        if str_eq(opcodes[i].op, "LDSTIU") {
-            ldstiu = Some(opcodes[i].ty);
+        if str_eq(opcodes[i].op, opcode) {
+            named = Some(opcodes[i].ty);
         }
         i += 1;
     }
-    let ty = match ldstiu {
+    let ty = match named {
         Some(ty) => ty.get(),
-        None => panic!("every memory unit defines LDSTIU (`isa.cpp:1132`, `:1198`, `:1267`, `:1359`)"),
+        None => panic!(
+            "every memory unit defines LDSTI and LDSTIU (`isa.cpp:1131-1132`, `:1197-1198`, \
+             `:1266-1267`, `:1358-1359`)"
+        ),
     };
 
     let all = comp.fields();
@@ -1020,13 +1023,13 @@ const fn ldstiu_imm_info(comp: fields::Comp) -> (ImmWidth, Sign) {
     match (info, found) {
         (Some(info), 1) => info,
         _ => panic!(
-            "the LDSTIU type must have exactly one immediate field — \
+            "the opcode's type must have exactly one immediate field — \
              DT_CHECK(sizeSignMap.size() == 1) (`Utils/DccExtContext.cpp:42`)"
         ),
     }
 }
 
-/// `str::eq` is not `const`, and [`ldstiu_imm_info`] — like `SetMaskRE`'s e377 — needs the opcode
+/// `str::eq` is not `const`, and [`imm_info`] — like `SetMaskRE`'s e377 — needs the opcode
 /// spelling compared at build time.
 pub(crate) const fn str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -1043,10 +1046,18 @@ pub(crate) const fn str_eq(a: &str, b: &str) -> bool {
     true
 }
 
-const LDSTIU_IMM_L0LU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::L0lu);
-const LDSTIU_IMM_L0SU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::L0su);
-const LDSTIU_IMM_LXLU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::Lxlu);
-const LDSTIU_IMM_LXSU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::Lxsu);
+const LDSTIU_IMM_L0LU: (ImmWidth, Sign) = imm_info(fields::Comp::L0lu, "LDSTIU");
+const LDSTIU_IMM_L0SU: (ImmWidth, Sign) = imm_info(fields::Comp::L0su, "LDSTIU");
+const LDSTIU_IMM_LXLU: (ImmWidth, Sign) = imm_info(fields::Comp::Lxlu, "LDSTIU");
+const LDSTIU_IMM_LXSU: (ImmWidth, Sign) = imm_info(fields::Comp::Lxsu, "LDSTIU");
+
+/// The SAME table read for the LDSTI opcode, which is the one `getImmRange` asks about
+/// (`ScalarOpMergingAndHoisting.cpp:2280`) — a scalar op's immutable address rides an LDSTI immediate,
+/// not the update-mode LDSTIU one.
+pub(crate) const LDSTI_IMM_L0LU: (ImmWidth, Sign) = imm_info(fields::Comp::L0lu, "LDSTI");
+pub(crate) const LDSTI_IMM_L0SU: (ImmWidth, Sign) = imm_info(fields::Comp::L0su, "LDSTI");
+pub(crate) const LDSTI_IMM_LXLU: (ImmWidth, Sign) = imm_info(fields::Comp::Lxlu, "LDSTI");
+pub(crate) const LDSTI_IMM_LXSU: (ImmWidth, Sign) = imm_info(fields::Comp::Lxsu, "LDSTI");
 
 /// `DccExtContext::is_imm_size_valid` (`Utils/DccExtContext.cpp:32-75`) — whether the constant
 /// immutable address still fits the unit's LDSTIU immediate field once scaled.
