@@ -80,27 +80,589 @@
 //! | `e055_simplifyTrivialLoop` | 055 | 0 | 19 | `dcc/src/Transform/Sentient/LightweightSimplification.cpp:158` |
 //! | `e623_runOnOperation` | 623 | 6 | 12 | `dcc/src/Transform/Sentient/LightweightSimplification.cpp:335` |
 
+#![allow(dead_code)]
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e623_runOnOperation` (level 6) and its callee
+// `e597_runLightWeightSimplifications` (level 5) are the units that call everything below, and
+// neither is in this batch. ⭐ REMOVE THIS WITH e623.
+
+use super::ForRef;
+use super::analyses::{ExpressionEvaluator, OffsetSites, ScalarOffset};
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::sentient as ops;
+use crate::islands::sentient::dialects::{Op, Val, defining_op, replace_all_uses_with, use_count};
+
 pub(crate) mod sentient;
 
+/// WHETHER A PATTERN FIRED — `LogicalResult`, which here reports APPLICABILITY, not an error.
+///
+/// ⛔⛔ DECLINING IS NOT FAILING, AND THE CRATE FORBIDS SPELLING IT AS AN ERROR ANYWAY.
+/// `runLightWeightSimplifications` tries the three arithmetic patterns in turn and moves to the next
+/// on `failure()` (`LightweightSimplification.cpp:283-291`), so a `Result` here would refuse a pass
+/// the reference completes. Same shape as
+/// [`YieldRewrite`](crate::bridges::dataflow_ir_to_sentient::std_affine_to_standard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum Simplified {
+    /// `LogicalResult::success()` — the IR was rewritten.
+    Rewritten,
+    /// `LogicalResult::failure()` — this pattern does not apply; try the next one.
+    DoesNotApply,
+}
 
-// crustify:todo: e052_addOrSubWithZeroSimplification
-//   authority : dcc/src/Transform/Sentient/LightweightSimplification.cpp:51  (22 body lines, level 0)
-//   original  : static LogicalResult addOrSubWithZeroSimplification( ExpressionEvaluator& evaluator, Operation& op)
+/// THE `isa<sentient::AddOp, sentient::SubOp>(op)` SHAPE all three arithmetic patterns open with —
+/// the two operands, the result, and the register placement `setAttrs` copies.
+#[derive(Debug, Clone, Copy)]
+struct ScalarArith {
+    /// `$inp1` — `getOperand(0)`.
+    inp1: Val,
+    /// `$inp2` — `getOperand(1)`.
+    inp2: Val,
+    /// `getResult(0)`.
+    result: Val,
+    /// `regLocale`/`regIndex` — what `op.getAttrs()` hands to a replacement.
+    reg: Option<ops::Reg>,
+    /// `result.getType()`.
+    ty: ScalarTy,
+    /// A `scalar_sub` rather than a `scalar_add`, which the zero pattern treats differently.
+    subtracting: bool,
+}
 
-// crustify:todo: e053_constantValueSimplification
-//   authority : dcc/src/Transform/Sentient/LightweightSimplification.cpp:75  (11 body lines, level 0)
-//   original  : static LogicalResult constantValueSimplification(OpBuilder& const_builder, OpBuilder& query_map_builder, ExpressionEvaluator& evaluator, Operation& op)
+/// `isa<sentient::AddOp, sentient::SubOp>` and its operands, or `None` for any other op.
+fn scalar_arith(op: &Op) -> Option<ScalarArith> {
+    match op {
+        Op::Sentient(ops::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg,
+            ty,
+        }) => Some(ScalarArith {
+            inp1: *lhs,
+            inp2: *rhs,
+            result: *result,
+            reg: *reg,
+            ty: *ty,
+            subtracting: false,
+        }),
+        Op::Sentient(ops::Op::ScalarSub {
+            lhs,
+            rhs,
+            result,
+            reg,
+            ty,
+        }) => Some(ScalarArith {
+            inp1: *lhs,
+            inp2: *rhs,
+            result: *result,
+            reg: *reg,
+            ty: *ty,
+            subtracting: true,
+        }),
+        _ => None,
+    }
+}
 
-// crustify:todo: e054_coalesceScalarArithSimplification
-//   authority : dcc/src/Transform/Sentient/LightweightSimplification.cpp:90  (62 body lines, level 0)
-//   original  : static LogicalResult coalesceScalarArithSimplification( OpBuilder& const_builder, OpBuilder& query_map_builder, ExpressionEvaluator& evaluator, llvm::SmallVector<Operation*, 4>& new_ops, Operation& op)
+/// `isConstantOp` (`LightweightSimplification.cpp:120-123`) — `getDefiningOp()` and
+/// `isa<sentient::ConstantOp>`.
+fn is_constant_op(value: Val, block: &[Op]) -> bool {
+    matches!(
+        defining_op(value, block),
+        Some(Op::Sentient(ops::Op::ScalarConstant { .. }))
+    )
+}
 
-// crustify:todo: e055_simplifyTrivialLoop
-//   authority : dcc/src/Transform/Sentient/LightweightSimplification.cpp:158  (19 body lines, level 0)
-//   original  : static void simplifyTrivialLoop(sentient::ForOp for_op)
+/// `dcc::utils::isTargetConstant` (`Analyses/Utils.cpp:156-183`) — ⛔ OUT OF CAMPAIGN SCOPE.
+///
+/// ⛔ A NAMED DIVERGING FUNCTION RATHER THAN AN INLINE `todo!` SO NEITHER BRANCH OF THE CALLER'S `if`
+/// IS LOST: an `if todo!() { .. } else { .. }` makes both arms `unreachable_code` and stops the
+/// reader seeing which effect each one has. It reads a `sentient.scalar_constant`, an
+/// `arith.constant` AND a `uniform.query_map`'s whole value list — the third is why it is not a
+/// two-line match here.
+fn is_target_constant(_value: Val, _target: ScalarOffset, _block: &[Op]) -> bool {
+    todo!("dcc::utils::isTargetConstant (Analyses/Utils.cpp:156) — out of campaign scope")
+}
+
+/// Replaces: e052_addOrSubWithZeroSimplification
+///
+/// `a = 0 + b`, `a = b + 0` and `a = b - 0`: rewires every reader of `a` onto `b`.
+///
+/// ⛔ TRAP: a PER-UNIT evaluation is declined even when it is known absolute — the failed
+/// `dyn_cast<AllUnitEvaluatedValue>` at `:58-59` is the second of three gates, not a formality.
+/// ⛔ TRAP: a `scalar_sub` may only lose its SECOND operand; `0 - b` is not `b`.
+pub(crate) fn add_or_sub_with_zero_simplification<E: ExpressionEvaluator>(
+    evaluator: &mut E,
+    block: &mut Vec<Op>,
+    at: usize,
+) -> Simplified {
+    let Some(arith) = block.get(at).and_then(scalar_arith) else {
+        return Simplified::DoesNotApply;
+    };
+    let operands = [arith.inp1, arith.inp2];
+    let candidates: &[usize] = if arith.subtracting { &[1] } else { &[0, 1] };
+    for &i in candidates {
+        let evaluated = evaluator.evaluate_value(operands[i]);
+        if !evaluated.known_absolute {
+            continue;
+        }
+        if evaluated.all_unit_offset != Some(ScalarOffset(0)) {
+            continue;
+        }
+        replace_all_uses_with(block, arith.result, operands[1 - i]);
+        return Simplified::Rewritten;
+    }
+    Simplified::DoesNotApply
+}
+
+/// Replaces: e053_constantValueSimplification
+///
+/// An add/sub whose RESULT is known absolute: materialises that constant and moves the readers onto it.
+///
+/// ⛔ TRAP: it evaluates the RESULT, not an operand — that is the whole difference from
+/// [`add_or_sub_with_zero_simplification`], which shares the same first two lines.
+pub(crate) fn constant_value_simplification<E: ExpressionEvaluator>(
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+    block: &mut Vec<Op>,
+    at: usize,
+) -> Simplified {
+    let Some(arith) = block.get(at).and_then(scalar_arith) else {
+        return Simplified::DoesNotApply;
+    };
+    let evaluated = evaluator.evaluate_value(arith.result);
+    if !evaluated.known_absolute {
+        return Simplified::DoesNotApply;
+    }
+    let constant = evaluator.build_offset_value(&evaluated, sites, block, arith.ty);
+    replace_all_uses_with(block, arith.result, constant);
+    Simplified::Rewritten
+}
+
+/// Replaces: e054_coalesceScalarArithSimplification
+///
+/// `b = a + 10; x = b + 20` becomes `x2 = a + 30`, built BEFORE the op it replaces; `a + 0`
+/// collapses onto `a` and `a` negated becomes a `scalar_sub` of the offset.
+///
+/// ⛔ TRAP: it only builds when an existing op will DIE to pay for the new one, and a CONSTANT
+/// operand does not count as payment (`:125-129`) — so both [`use_count`]s are load-bearing.
+/// ⛔ TRAP: `new_ops` collects the created ops' RESULTS. The block's dead-op sweep (`:308-311`)
+/// reaches an op through the value it binds, which is the only identity an op has in this island.
+pub(crate) fn coalesce_scalar_arith_simplification<E: ExpressionEvaluator>(
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+    new_ops: &mut Vec<Val>,
+    block: &mut Vec<Op>,
+    at: usize,
+) -> Simplified {
+    let Some(arith) = block.get(at).and_then(scalar_arith) else {
+        return Simplified::DoesNotApply;
+    };
+    let evaluated = evaluator.evaluate_value(arith.result);
+    let Some(base) = evaluated.base else {
+        return Simplified::DoesNotApply;
+    };
+    // Only coalesce if the add op will have a new base.
+    if base.value == arith.result || base.value == arith.inp1 || base.value == arith.inp2 {
+        return Simplified::DoesNotApply;
+    }
+    // Only transform if an op will be removed to compensate for the new one.
+    let pays = |operand: Val, block: &[Op]| {
+        use_count(operand, block) == 1 && !is_constant_op(operand, block)
+    };
+    if !pays(arith.inp1, block) && !pays(arith.inp2, block) {
+        return Simplified::DoesNotApply;
+    }
+    let offset = evaluator.build_offset_value(&evaluated, sites, block, arith.ty);
+    if !base.negated && is_target_constant(offset, ScalarOffset(0), block) {
+        // x2 = a + 0 => replace x2 with a
+        replace_all_uses_with(block, arith.result, base.value);
+        return Simplified::Rewritten;
+    }
+    let created = sites.values.mint();
+    // `SubOp::create(builder, loc, ty, offset, bv.value_)` — the OFFSET is the minuend when the base
+    // is negated; the addition takes the base first. `OpBuilder builder(&op)` inserts before the op,
+    // and `setAttrs(op.getAttrs())` copies its register placement onto the replacement.
+    let new_op = if base.negated {
+        ops::Op::ScalarSub {
+            lhs: offset,
+            rhs: base.value,
+            result: created,
+            reg: arith.reg,
+            ty: arith.ty,
+        }
+    } else {
+        ops::Op::ScalarAdd {
+            lhs: base.value,
+            rhs: offset,
+            result: created,
+            reg: arith.reg,
+            ty: arith.ty,
+        }
+    };
+    block.insert(at, Op::Sentient(new_op));
+    new_ops.push(created);
+    replace_all_uses_with(block, arith.result, created);
+    Simplified::Rewritten
+}
+
+/// `body->getTerminator()->getOperand(index)` — what a `sentient.for` hands back for one iter arg.
+///
+/// ⭐ ABSENT MEANS THE LOOP CARRIES NOTHING BACK, not a refusal: `ForOp`'s verifier requires one
+/// yield operand per iter arg, so a body with no `sentient.yield` has no iter args to rewire.
+fn yielded_value(op: &Op, index: usize) -> Option<Val> {
+    let Op::Sentient(ops::Op::For { body, .. }) = op else {
+        return None;
+    };
+    match body.last() {
+        Some(Op::Sentient(ops::Op::Yield { results })) => results.get(index).copied(),
+        _ => None,
+    }
+}
+
+/// THE BLOCK A `sentient.for` SITS IN AND ITS POSITION IN IT — the parent pointer this island's
+/// trees do not have, supplied by the caller's scope instead. [`ForRef`] names the loop by its
+/// induction variable.
+fn loop_site(scope: &mut Vec<Op>, loop_ref: ForRef) -> Option<(&mut Vec<Op>, usize)> {
+    let here = scope
+        .iter()
+        .position(|op| matches!(op, Op::Sentient(ops::Op::For { iv, .. }) if *iv == loop_ref.0));
+    if let Some(at) = here {
+        return Some((scope, at));
+    }
+    for op in scope.iter_mut() {
+        match op {
+            Op::Sentient(inner) => {
+                for region in ops::regions_mut(inner) {
+                    if let Some(site) = loop_site(region, loop_ref) {
+                        return Some(site);
+                    }
+                }
+            }
+            Op::AffineFor(loop_op) => {
+                if let Some(site) = loop_site(&mut loop_op.body, loop_ref) {
+                    return Some(site);
+                }
+            }
+            // ⭐ A LOWER-RUNG REGION CANNOT HOLD A `sentient.for`: it is typed with the rung below's
+            // `Op`, which has no `Sentient` arm.
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Replaces: e055_simplifyTrivialLoop
+///
+/// A bound-1 `sentient.for`: iter args become their inits, the loop's results become the yielded
+/// values, the induction variable becomes the bound, and the body is hoisted out ahead of the loop.
+///
+/// ⛔ TRAP: it does NOT erase the emptied loop — the caller does, right after (`:225-228`).
+/// ⛔ TRAP: the yield operand is re-read PER ITER ARG because an earlier arg's rewrite can change
+/// it; `sentient.yield %arg2, %arg1` is why the two replacements interleave rather than run as two
+/// passes. ⭐ `DoesNotApply` means the scope does not hold that loop; the reference returns `void`
+/// because its caller hands it a `ForOp` it collected moments earlier (`:188-223`).
+pub(crate) fn simplify_trivial_loop(block: &mut Vec<Op>, loop_ref: ForRef) -> Simplified {
+    let Some((scope, at)) = loop_site(block, loop_ref) else {
+        return Simplified::DoesNotApply;
+    };
+    let Op::Sentient(ops::Op::For {
+        iv, bound, carried, ..
+    }) = &scope[at]
+    else {
+        return Simplified::DoesNotApply;
+    };
+    let (induction_var, bound) = (*iv, *bound);
+    let carried = carried.clone();
+    for (index, entry) in carried.iter().enumerate() {
+        replace_all_uses_with(scope, entry.arg, entry.init);
+        if let Some(yielded) = yielded_value(&scope[at], index) {
+            replace_all_uses_with(scope, entry.result, yielded);
+        }
+    }
+    replace_all_uses_with(scope, induction_var, bound);
+
+    // Hoist the body's operations out of the loop, in order, stopping at the terminator.
+    let mut hoisted = Vec::new();
+    if let Op::Sentient(ops::Op::For { body, .. }) = &mut scope[at] {
+        while let Some(front) = body.first() {
+            if matches!(front, Op::Sentient(ops::Op::Yield { .. })) {
+                break;
+            }
+            hoisted.push(body.remove(0));
+        }
+    }
+    for (offset, op) in hoisted.into_iter().enumerate() {
+        scope.insert(at + offset, op);
+    }
+    Simplified::Rewritten
+}
 
 // crustify:todo: e623_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LightweightSimplification.cpp:335  (12 body lines, level 6)
 //   original  : void LightweightSimplificationPass::runOnOperation()
 //   calls     : e597_runLightWeightSimplifications
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegIndex, RegType};
+    use crate::transform::sentient::analyses::{BaseValue, Evaluation};
+
+    /// AN EVALUATOR THAT ANSWERS WHAT THE TEST SAYS. ⛔ The analysis behind
+    /// [`ExpressionEvaluator`] is out of campaign scope, so a test STATES its answers rather than
+    /// deriving them — the effect under test is what the pattern does with an answer, not the answer.
+    struct StatedEvaluator {
+        answers: Vec<(Val, Evaluation)>,
+        offset: Val,
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, value: Val) -> Evaluation {
+            self.answers.iter().find(|(of, _)| *of == value).map_or(
+                Evaluation {
+                    known_absolute: false,
+                    base: None,
+                    all_unit_offset: None,
+                },
+                |(_, evaluated)| evaluated.clone(),
+            )
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            self.offset
+        }
+    }
+
+    fn add(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(ops::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    fn constant(value: i64, result: Val) -> Op {
+        Op::Sentient(ops::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    fn absolute(offset: ScalarOffset) -> Evaluation {
+        Evaluation {
+            known_absolute: true,
+            base: None,
+            all_unit_offset: Some(offset),
+        }
+    }
+
+    /// A minter that has already issued `issued` values, so a fixture's hand-written [`Val`]s and a
+    /// created op's cannot collide.
+    fn values_after(issued: u32) -> Values {
+        let mut values = Values::default();
+        for _ in 0..issued {
+            values.mint();
+        }
+        values
+    }
+
+    /// `a = 0 + b` => every reader of `a` reads `b` (`LightweightSimplification.cpp:65-68`).
+    #[test]
+    fn a_zero_addend_rewires_the_readers_onto_the_other_operand() {
+        let mut block = vec![
+            constant(0, Val(0)),
+            add(Val(0), Val(1), Val(2)),
+            add(Val(2), Val(1), Val(3)),
+        ];
+        let mut evaluator = StatedEvaluator {
+            answers: vec![(Val(0), absolute(ScalarOffset(0)))],
+            offset: Val(9),
+        };
+        assert_eq!(
+            add_or_sub_with_zero_simplification(&mut evaluator, &mut block, 1),
+            Simplified::Rewritten
+        );
+        assert_eq!(block[2], add(Val(1), Val(1), Val(3)));
+    }
+
+    /// ⛔ THE NEGATIVE THE `dyn_cast` AT `:58-59` IS THERE FOR: a known-absolute PER-UNIT value is
+    /// not an `AllUnitEvaluatedValue`, so the zero pattern declines and the IR is untouched.
+    #[test]
+    fn a_per_unit_zero_is_declined_even_though_it_is_known_absolute() {
+        let mut block = vec![
+            constant(0, Val(0)),
+            add(Val(0), Val(1), Val(2)),
+            add(Val(2), Val(1), Val(3)),
+        ];
+        let before = block.clone();
+        let mut evaluator = StatedEvaluator {
+            answers: vec![(
+                Val(0),
+                Evaluation {
+                    known_absolute: true,
+                    base: None,
+                    all_unit_offset: None,
+                },
+            )],
+            offset: Val(9),
+        };
+        assert_eq!(
+            add_or_sub_with_zero_simplification(&mut evaluator, &mut block, 1),
+            Simplified::DoesNotApply
+        );
+        assert_eq!(block, before);
+    }
+
+    /// An add whose RESULT is known absolute: the readers move onto the materialised constant.
+    #[test]
+    fn a_known_absolute_result_becomes_its_constant() {
+        let mut block = vec![add(Val(0), Val(1), Val(2)), add(Val(2), Val(1), Val(3))];
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+        let mut evaluator = StatedEvaluator {
+            answers: vec![(Val(2), absolute(ScalarOffset(30)))],
+            offset: Val(9),
+        };
+        assert_eq!(
+            constant_value_simplification(&mut evaluator, &mut sites, &mut block, 0),
+            Simplified::Rewritten
+        );
+        assert_eq!(block[1], add(Val(9), Val(1), Val(3)));
+    }
+
+    /// A NEGATED BASE BUILDS A `scalar_sub` OF THE OFFSET, before the op it replaces, carrying that
+    /// op's register placement — `setAttrs(op.getAttrs())` (`:134-139`).
+    #[test]
+    fn a_negated_base_coalesces_into_a_scalar_sub_that_keeps_the_register() {
+        let placed = Reg {
+            locale: RegType::Lrf,
+            index: Some(RegIndex::at::<1>()),
+        };
+        let mut block = vec![
+            constant(10, Val(0)),
+            add(Val(5), Val(0), Val(2)),
+            Op::Sentient(ops::Op::ScalarAdd {
+                lhs: Val(2),
+                rhs: Val(4),
+                result: Val(3),
+                reg: Some(placed),
+                ty: ScalarTy::Index,
+            }),
+            add(Val(3), Val(4), Val(8)),
+        ];
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+        let mut new_ops = Vec::new();
+        let mut evaluator = StatedEvaluator {
+            answers: vec![(
+                Val(3),
+                Evaluation {
+                    known_absolute: false,
+                    base: Some(BaseValue {
+                        value: Val(5),
+                        negated: true,
+                    }),
+                    all_unit_offset: None,
+                },
+            )],
+            offset: Val(9),
+        };
+        assert_eq!(
+            coalesce_scalar_arith_simplification(
+                &mut evaluator,
+                &mut sites,
+                &mut new_ops,
+                &mut block,
+                2
+            ),
+            Simplified::Rewritten
+        );
+        assert_eq!(new_ops, vec![Val(10)]);
+        assert_eq!(
+            block[2],
+            Op::Sentient(ops::Op::ScalarSub {
+                lhs: Val(9),
+                rhs: Val(5),
+                result: Val(10),
+                reg: Some(placed),
+                ty: ScalarTy::Index,
+            })
+        );
+        // The reader of the coalesced result now reads the new op's.
+        assert_eq!(block[4], add(Val(10), Val(4), Val(8)));
+    }
+
+    /// A bound-1 loop: the body is hoisted ahead of it with the iter arg and induction variable
+    /// substituted, the loop's result becomes the yielded value, and ⛔ THE LOOP IS STILL THERE.
+    #[test]
+    fn a_trivial_loop_hoists_its_body_and_hands_back_what_it_yielded() {
+        let carried = Carried {
+            init: Val(1),
+            arg: Val(3),
+            result: Val(4),
+            reg: Reg {
+                locale: RegType::Lrf,
+                index: None,
+            },
+            program_header: false,
+        };
+        let mut block = vec![
+            constant(1, Val(0)),
+            constant(5, Val(1)),
+            Op::Sentient(ops::Op::For {
+                iv: Val(2),
+                bound: Val(0),
+                carried: vec![carried],
+                dbg_name: None,
+                body: vec![
+                    add(Val(3), Val(2), Val(5)),
+                    Op::Sentient(ops::Op::Yield {
+                        results: vec![Val(5)],
+                    }),
+                ],
+            }),
+            add(Val(4), Val(4), Val(6)),
+        ];
+        assert_eq!(
+            simplify_trivial_loop(&mut block, ForRef(Val(2))),
+            Simplified::Rewritten
+        );
+        // The body op, hoisted, reading the init and the bound instead of the arg and the iv.
+        assert_eq!(block[2], add(Val(1), Val(0), Val(5)));
+        assert_eq!(
+            block[3],
+            Op::Sentient(ops::Op::For {
+                iv: Val(2),
+                bound: Val(0),
+                carried: vec![carried],
+                dbg_name: None,
+                body: vec![Op::Sentient(ops::Op::Yield {
+                    results: vec![Val(5)],
+                })],
+            })
+        );
+        // The reader of the loop's result now reads what the yield handed back.
+        assert_eq!(block[4], add(Val(5), Val(5), Val(6)));
+    }
+}

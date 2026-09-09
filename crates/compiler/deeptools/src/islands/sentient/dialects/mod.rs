@@ -336,6 +336,67 @@ fn replace_all_uses_in_lower(
     }
 }
 
+/// HOW MANY TIMES ONE VALUE IS **READ** IN `scope` — `Value::hasOneUse()` and `Value::use_empty()`.
+///
+/// ⛔⛔ ONE PER USE, NOT PER USER, BECAUSE THAT IS WHAT MLIR COUNTS. `hasOneUse()` is false for a
+/// value one op reads twice, so `use_count(v, scope) == 1` is exactly `hasOneUse()` and `== 0` is
+/// exactly `use_empty()`. `coalesceScalarArithSimplification` (entry 054) spends this on both of an
+/// add's operands: it only rewrites when an op will be REMOVED to pay for the one it creates
+/// (`LightweightSimplification.cpp:101-104`), and an over-count there declines a rewrite the
+/// reference performs while an under-count performs one it declines.
+///
+/// ⛔ AND IT DESCENDS INTO REGIONS, like the rung below's [`crate::islands::dataflow_ir::dialects::uses`]
+/// — a scalar read by an op inside a `sentient.for` body is read.
+///
+/// ⭐ A COUNT OFF A CLONE FOR THIS RUNG'S OWN OPS. [`sentient::operands_mut`] is the ONE operand walk
+/// and it hands out PLACES so that [`replace_all_uses_with`] can be performed rather than
+/// approximated; a second by-value walk would be a twenty-nine-arm list to keep in step. Cloning to
+/// ask a question is what [`lowered`] already does, for that same reason.
+#[must_use]
+pub fn use_count(of: Val, scope: &[Op]) -> usize {
+    let mut count = 0;
+    for op in scope {
+        match op {
+            Op::Sentient(inner) => {
+                let mut probe = inner.clone();
+                count += sentient::operands_mut(&mut probe)
+                    .into_iter()
+                    .filter(|read| **read == of)
+                    .count();
+                for region in sentient::regions(inner) {
+                    count += use_count(of, region);
+                }
+            }
+            Op::AffineFor(loop_op) => {
+                for bound in [&loop_op.lo, &loop_op.hi] {
+                    if let affine::Bound::Val(v) = bound
+                        && *v == of
+                    {
+                        count += 1;
+                    }
+                }
+                count += loop_op
+                    .carried
+                    .iter()
+                    .filter(|carried| carried.init == of)
+                    .count();
+                count += use_count(of, &loop_op.body);
+            }
+            // ⭐ THE RUNG BELOW ANSWERS FOR ITS OWN OPS, REGIONS INCLUDED — see [`lowered`].
+            other => {
+                if let Some(lower) = lowered(other) {
+                    count += crate::islands::dataflow_ir::dialects::uses(
+                        of,
+                        core::slice::from_ref(&lower),
+                    )
+                    .len();
+                }
+            }
+        }
+    }
+    count
+}
+
 /// REMOVE THE OP THAT DEFINES A VALUE — `Operation::erase()`, reached through its result.
 ///
 /// ⛔⛔ THE ERASE IS HALF OF ENTRY 093 AND IT COMES **AFTER** BOTH REWIRES. `Operation::erase()` on
