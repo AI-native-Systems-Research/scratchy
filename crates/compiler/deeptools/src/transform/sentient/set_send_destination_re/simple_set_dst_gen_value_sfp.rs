@@ -78,13 +78,14 @@
 
 use crate::units::{Core, Corelet};
 
-/// `SimpleSetDstGenValueSFP` (`SetSendDestinationRE.hpp:126`) — WHICH OTHER SFP an SFP's sends go to,
+/// `SimpleSetDstGenValueSFP` (`SetSendDestinationRE.hpp:128`) — WHICH OTHER SFP an SFP's sends go to,
 /// named by the core and corelet it sits on.
 ///
-/// ⛔⛔ NEITHER ID IS OPTIONAL, AND THAT IS THE REFERENCE'S OWN `DT_CHECK`. The fields are
-/// `short core_id_ = -1, corelet_id_ = -1` with `isInitialized()` reading `>= 0` (`:129-133`), but the
-/// only constructor that puts one inside a GenValue asserts `core_id >= 0 && corelet_id >= 0`
-/// (`:186-189`) — so a REACHABLE simple SFP GenValue never holds a sentinel, and the `-1` state is
+/// ⛔⛔ NEITHER ID IS OPTIONAL, AND THAT IS THE REFERENCE'S OWN `DT_CHECK`. The fields are bare
+/// `short core_id_; short corelet_id_;` (`:145-146`) — the `-1` is the constructor's DEFAULT ARGUMENT
+/// (`:130`), which `isInitialized()` reads as `>= 0` (`:134`) — but the only constructor that puts one
+/// inside a GenValue asserts `core_id >= 0 && corelet_id >= 0` (`:188-194`), so a REACHABLE simple SFP
+/// GenValue never holds a sentinel and the `-1` state is
 /// [`super::set_dst_gen_value_sfp::GenValue`]'s `Unknown` kind instead. ⭐ [`Core`] and [`Corelet`]
 /// are arch-bounded, so an id past this machine's core count is also unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,13 +101,13 @@ impl SimpleSetDstGenValueSfp {
         SimpleSetDstGenValueSfp { core, corelet }
     }
 
-    /// `getCoreId()` (`:135`).
+    /// `getCoreId()` (`:137`).
     #[must_use]
     pub(crate) const fn core(self) -> Core {
         self.core
     }
 
-    /// `getCoreletId()` (`:137`).
+    /// `getCoreletId()` (`:139`).
     #[must_use]
     pub(crate) const fn corelet(self) -> Corelet {
         self.corelet

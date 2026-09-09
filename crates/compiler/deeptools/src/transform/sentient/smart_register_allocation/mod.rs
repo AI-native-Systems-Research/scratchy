@@ -92,7 +92,7 @@ use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 /// THE ALLOCATOR'S OWN STATE (`:54-55`) — the graphs it colours and the assignment it hands back.
 ///
 /// ⛔ `register_assignment_` IS DEAD IN THE AUTHORITY TREE: nothing reads or writes it, and the
-/// `RegAssignment()` (`:66`) that would have is declared and never defined. It is represented because
+/// `RegAssignment()` (`:70`) that would have is declared and never defined. It is represented because
 /// [`SmartRegisterAllocation::clean`] clears it, and clearing it is half of e216.
 ///
 /// ⭐ GENERIC OVER THE OUT-OF-SCOPE GRAPHS, as [`super::analyses::RegisterGraphs`] requires — the
@@ -125,9 +125,9 @@ impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
 /// and whose `mutable_addr` IS the other value. Symmetric, `op_1` tested first.
 ///
 /// ⛔ TRAP: THE REFERENCE DEREFERENCES A NULL HERE. `getIncrement().getDefiningOp<ConstantOp>()
-/// .getValue()` is unguarded (`:92-94`), so an increment that is not a `sentient.scalar_constant`
+/// .getValue()` is unguarded (`:90-92`), so an increment that is not a `sentient.scalar_constant`
 /// crashes it; this answers `false`, which is the arm the reference would have taken had it checked.
-/// ⛔ AND IT HAS NO CALLER in the authority tree — declared at `:64`, defined at `:87`, called nowhere.
+/// ⛔ AND IT HAS NO CALLER in the authority tree — declared at `:63`, defined at `:87`, called nowhere.
 #[must_use]
 pub(crate) fn is_known_to_have_same_values(op_1: Val, op_2: Val, defs: Definitions<'_>) -> bool {
     addresses(op_1, op_2, defs) || addresses(op_2, op_1, defs)

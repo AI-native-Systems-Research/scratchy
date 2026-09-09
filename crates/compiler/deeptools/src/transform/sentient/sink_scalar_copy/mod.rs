@@ -115,7 +115,7 @@ pub struct LocalRegionArg(pub Val);
 /// which is why "is it a local one" is a match and not a lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Region {
-    /// `dataflow.program_unit`'s own region — *"a global region is the program_unit region"* (`:81`).
+    /// `dataflow.program_unit`'s own region — *"a global region is the program_unit region"* (`:84`).
     Global,
     /// One region of a [`Op::UniformRegions`], owned by a `uniform.uniformize_regions` or a
     /// `uniform.equalize_pattern`.
@@ -127,8 +127,8 @@ pub enum Region {
     },
 }
 
-/// `RegionInfo` (`:88-107`) — a local or global region holding a use of the copy's result. The use
-/// itself may be nested deeper inside it (`:82-84`).
+/// `RegionInfo` (`:87-110`) — a local or global region holding a use of the copy's result. The use
+/// itself may be nested deeper inside it (`:85-86`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RegionInfo {
     region: Region,
@@ -140,14 +140,14 @@ impl RegionInfo {
     /// `RegionInfo(Region *region)`.
     ///
     /// ⭐ `DT_CHECK_MSG(region_, "expected valid region pointer")` IS DISCHARGED BY THE TYPE: there is
-    /// no null [`Region`] to hold, and `RegionInfo() = delete` (`:91`) is `#[derive]`-free —
+    /// no null [`Region`] to hold, and `RegionInfo() = delete` (`:92`) is `#[derive]`-free —
     /// no `Default`.
     #[must_use]
     pub fn new(region: Region) -> RegionInfo {
         RegionInfo { region }
     }
 
-    /// `getPointer()` (`:104`) — the identity this was built from.
+    /// `getPointer()` (`:106`) — the identity this was built from.
     #[must_use]
     pub fn region(&self) -> Region {
         self.region
@@ -201,12 +201,12 @@ impl RegionInfo {
 
 /// THE `sentient.scalar_copy` A `UsesInfo` IS ABOUT, NAMED BY ITS `$out`.
 ///
-/// ⭐ THE VALUE NAMES THE OP because `DT_CHECK(orig_op.getNumResults() == 1)` (`:223`) is the shape of
-/// a `scalar_copy` and not a runtime question — and an identity survives the erase at `:229`.
+/// ⭐ THE VALUE NAMES THE OP because `DT_CHECK(orig_op.getNumResults() == 1)` (`:224`) is the shape of
+/// a `scalar_copy` and not a runtime question — and an identity survives the erase at `:228`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CopyResult(pub Val);
 
-/// `UsesInfo` (`:111-157`) — one copy op and the unique regions its result is used in.
+/// `UsesInfo` (`:114-158`) — one copy op and the unique regions its result is used in.
 #[derive(Debug)]
 pub struct UsesInfo {
     /// `regions_` — kept sorted and unique by [`UsesInfo::add_region`].
@@ -221,7 +221,7 @@ impl UsesInfo {
     /// `UsesInfo(Operation *op)`.
     ///
     /// ⭐ `DT_CHECK_MSG(op, "expected valid operation")` IS DISCHARGED BY THE TYPE, as e209's is; the
-    /// deleted default and copy constructors (`:120-121`) are the absence of `Default` and `Clone`.
+    /// deleted default and copy constructors (`:119-120`) are the absence of `Default` and `Clone`.
     #[must_use]
     pub fn new(op: CopyResult) -> UsesInfo {
         UsesInfo {
@@ -236,7 +236,7 @@ impl UsesInfo {
         &self.regions
     }
 
-    /// `getOperation()` (`:141`) — the copy op defining the SSA value.
+    /// `getOperation()` (`:142`) — the copy op defining the SSA value.
     #[must_use]
     pub fn operation(&self) -> CopyResult {
         self.op
@@ -246,10 +246,11 @@ impl UsesInfo {
     ///
     /// Adds `region` unless it is already there — the `lower_bound`-then-`sort` is one sorted set.
     ///
-    /// ⚠️ ORDERED BY `$arg` WHERE THE REFERENCE ORDERS BY `Region *`, and the order is observable:
-    /// [`SinkScalarCopy::sink_copy_ops`] mints its clones in it. Within one owner the two agree —
-    /// MLIR stores an op's regions contiguously and this island mints their args in region order —
-    /// and across owners the reference's own order is allocation order.
+    /// ⚠️ ORDERED BY `(is-local, region number, $arg)` WHERE THE REFERENCE ORDERS BY `Region *`, and
+    /// the order is observable: [`SinkScalarCopy::sink_copy_ops`] mints its clones in it. The derived
+    /// `Ord` compares [`Region`]'s VARIANT first, so every [`Region::Global`] sorts ahead of every
+    /// [`Region::UniformLocal`] — and sink skips the global ones anyway. Within one owner the two
+    /// agree, region number BEING that order; across owners the reference's is allocation order.
     pub fn add_region(&mut self, region: RegionInfo) {
         let at = self.regions.partition_point(|each| *each < region);
         if self.regions.get(at) == Some(&region) {
@@ -259,10 +260,10 @@ impl UsesInfo {
     }
 }
 
-/// `SinkScalarCopyPass`'s own state (`:158-245`).
+/// `SinkScalarCopyPass`'s own state (`:160-246`).
 #[derive(Debug, Default)]
 pub struct SinkScalarCopy {
-    /// `std::vector<UsesInfo *> uses_info_list_` (`:243`) — owned outright, so `delete` in
+    /// `std::vector<UsesInfo *> uses_info_list_` (`:245`) — owned outright, so `delete` in
     /// [`SinkScalarCopy::clear`] is `Vec::clear`.
     uses_info_list: Vec<UsesInfo>,
 }
@@ -274,8 +275,8 @@ impl SinkScalarCopy {
     /// LOCAL region that used it, that region's uses moved onto the clone, the original erased if unread.
     ///
     /// ⭐ `OpBuilder builder(region.getPointer())` INSERTS AT THE START of the region's entry block —
-    /// why the sunk copy precedes its user in the reference's own example (`:33-42`).
-    /// ⭐ A GLOBAL REGION IS SKIPPED (`:220`); a use left there keeps the original (`getUses()`).
+    /// why the sunk copy precedes its user in the reference's own example (`:33-43`).
+    /// ⭐ A GLOBAL REGION IS SKIPPED (`:221`); a use left there keeps the original (`getUses()`).
     pub fn sink_copy_ops(&self, body: &mut Vec<Op>, values: &mut Values) {
         for uses in &self.uses_info_list {
             let of = uses.operation();
@@ -340,8 +341,8 @@ impl SinkScalarCopy {
 /// `region.getPointer()` AS A PLACE TO WRITE — the body of the local region binding `arg`.
 ///
 /// ⭐ NESTED LOCAL REGIONS ARE REACHED: a `uniform.uniformize_regions` sits inside another one's
-/// region, three deep in `flatten_local_region.mlir:86-88`, and [`dialects::regions_mut`] descends
-/// through both.
+/// region in `dcc/test/Transform/FlatteningLocalRegions/flatten_local_region.mlir:90-93`, and
+/// [`dialects::regions_mut`] descends through both.
 fn local_region_body_mut(scope: &mut [Op], arg: LocalRegionArg) -> Option<&mut Vec<Op>> {
     for op in scope.iter_mut() {
         if let Op::UniformRegions(uniform) = op {
@@ -413,7 +414,7 @@ mod unit_tests {
         })
     }
 
-    /// An op reading `lhs` inside a region — the `.. %10` of the reference's example (`:17`).
+    /// An op reading `lhs` inside a region — the `.. %10` of the reference's example (`:16`).
     fn add(lhs: Val, result: Val) -> Op {
         Op::Sentient(sentient::Op::ScalarAdd {
             lhs,
@@ -456,7 +457,7 @@ mod unit_tests {
         assert_eq!(uses.operation(), CopyResult(Val(10)));
         uses.add_region(region(5));
         uses.add_region(region(3));
-        // The second add of a region already there is ignored (`:129`).
+        // The second add of a region already there is ignored (`:130`).
         uses.add_region(region(5));
         uses.add_region(RegionInfo::new(Region::Global));
         assert_eq!(
@@ -465,7 +466,7 @@ mod unit_tests {
         );
     }
 
-    /// The reference's own example (`SinkScalarCopy.cpp:11-42`): two copies in the global region, each
+    /// The reference's own example (`SinkScalarCopy.cpp:12-43`): two copies in the global region, each
     /// used in one local region, both sunk and both originals erased.
     #[test]
     fn sink_copy_ops_sinks_each_copy_into_the_local_region_that_uses_it() {
@@ -531,7 +532,7 @@ mod unit_tests {
         }
     }
 
-    /// A copy still read from the global region is NOT erased — `getUses().empty()` (`:229`).
+    /// A copy still read from the global region is NOT erased — `getUses().empty()` (`:228`).
     #[test]
     fn a_copy_still_used_globally_survives() {
         let mut values = Values::default();

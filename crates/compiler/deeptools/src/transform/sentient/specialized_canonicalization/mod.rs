@@ -219,7 +219,7 @@ fn defining_op_in_program<'a, A: Arch, M: Model, W: Workload>(
     })
 }
 
-/// THE PASS'S PER-FUNCTION STATE (`:216-221`).
+/// THE PASS'S PER-FUNCTION STATE (`:223-228`).
 ///
 /// ⭐ `curr_func_` AND `insert_point_` ARE NOT FIELDS: both exist only to answer "is this op already
 /// at function scope, ahead of the first program unit", and that answer is [`Site`]. `opts_` is never
@@ -278,7 +278,7 @@ impl SpecializedCanonicalization {
     /// One `dataflow.get_unit`: queues it if dead, rewires its readers onto the first op with the same
     /// key and queues it if it is a duplicate, else records it and hoists it to the preamble.
     ///
-    /// ⛔ THE `IgnoreGetUnitType` GATE (`:68`) CANNOT FIRE: it compares the unit's type against
+    /// ⛔ THE `IgnoreGetUnitType` GATE (`:67`) CANNOT FIRE: it compares the unit's type against
     /// `-dcc-specialized-canonicalization-ignore-get-unit-type`, a string defaulting to `"-"`
     /// (`:47-50`), and no [`DfirUnit::spelling`] is `-`.
     /// ⛔ TRAP: dead and duplicate ops are QUEUED, not erased — the erase is e383's, after the walk.

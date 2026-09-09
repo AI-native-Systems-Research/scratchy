@@ -117,8 +117,8 @@ pub(crate) fn is_operation_a_use(op: &Op) -> bool {
 /// scope, and all four RDE passes ask a node the same questions.
 ///
 /// ⛔ TRAP: `sentient.load_compute_and_send` IS A USE (e196) AND STILL SIMPLIFIABLE HERE — the two
-/// `isa<>` lists differ by exactly that op (`:226-228` against `:311-313`). `simplify()` clears every
-/// simplifiable node (`Analyses/RedundantDefinitionEliminationTree.cpp:325-341`), so such a use leaves
+/// `isa<>` lists differ by exactly that op (`:226-228` against `:312-314`). `simplify()` clears every
+/// simplifiable node (`Analyses/RedundantDefinitionEliminationTree.cpp:325-340`), so such a use leaves
 /// the tree and `deadDefOptimization`'s `sib->isUse()` guard
 /// (`Analyses/RedundantDefinitionEliminationTreeImpl.cpp:228`) can no longer fire for it. Ported as
 /// written — dbo-opt is this pipeline's oracle, so a "corrected" list would be the divergence.

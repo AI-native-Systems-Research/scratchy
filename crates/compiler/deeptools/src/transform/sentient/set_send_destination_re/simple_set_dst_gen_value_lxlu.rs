@@ -76,16 +76,16 @@
 //! |---|---|---|---|---|
 //! | `e201_print` | 201 | 0 | 16 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:393` |
 
-/// `SimpleSetDstGenValueLXLU::Mode` (`SetSendDestinationRE.hpp:32-37`) — WHERE AN LXLU'S SENDS GO.
+/// `SimpleSetDstGenValueLXLU::Mode` (`SetSendDestinationRE.hpp:33-38`) — WHERE AN LXLU'S SENDS GO.
 ///
 /// ⛔⛔ `kUnknown` IS NOT A VARIANT HERE. `SetDstGenValueLXLU(mode, op)` opens with
-/// `DT_CHECK(mode != Mode::kUnknown)` (`:97`), so a simple GenValue never holds it — the reference's
+/// `DT_CHECK(mode != Mode::kUnknown)` (`:98`), so a simple GenValue never holds it — the reference's
 /// invalid state is this enum's ABSENCE, and deciding what to do without one belongs to
 /// `initializeDataflowInfoForLXLU` (entry 379), which is where `gen_mode` is still undecided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendDestination {
     /// `kSendToPT` — ⭐ AND THE CROSS-PT LINK TOO: entry 379 collapses any consumer type containing
-    /// `"pt"` onto this one (`SetSendDestinationRE.cpp:259-260`).
+    /// `"pt"` onto this one (`SetSendDestinationRE.cpp:264-265`).
     Pt,
     /// `kSendToSFP`.
     Sfp,
@@ -93,7 +93,7 @@ pub(crate) enum SendDestination {
     L0su,
 }
 
-/// `SimpleSetDstGenValueLXLU` (`SetSendDestinationRE.hpp:30`) — one destination for the sends of one
+/// `SimpleSetDstGenValueLXLU` (`SetSendDestinationRE.hpp:31`) — one destination for the sends of one
 /// LXLU unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SimpleSetDstGenValueLxlu {
@@ -103,14 +103,14 @@ pub(crate) struct SimpleSetDstGenValueLxlu {
 impl SimpleSetDstGenValueLxlu {
     /// `SimpleSetDstGenValueLXLU(m)`.
     ///
-    /// ⭐ `isInitialized()` NEEDS NO PORT: it is `value_ != Mode::kUnknown` (`:43`), which
+    /// ⭐ `isInitialized()` NEEDS NO PORT: it is `value_ != Mode::kUnknown` (`:44`), which
     /// [`SendDestination`] having no such state makes unconditionally true.
     #[must_use]
     pub(crate) const fn of(value: SendDestination) -> SimpleSetDstGenValueLxlu {
         SimpleSetDstGenValueLxlu { value }
     }
 
-    /// `getValue()` (`:46`).
+    /// `getValue()` (`:47`).
     #[must_use]
     pub(crate) const fn value(self) -> SendDestination {
         self.value

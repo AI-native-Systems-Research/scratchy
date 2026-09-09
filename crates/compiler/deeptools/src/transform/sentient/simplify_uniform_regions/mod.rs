@@ -85,7 +85,7 @@
 
 use crate::arch::Arch;
 use crate::islands::sentient::Program;
-use crate::islands::sentient::dialects::{self, Op, uniform};
+use crate::islands::sentient::dialects::{self, Op, UniformRegions, uniform};
 use crate::model::Model;
 use crate::workload::Workload;
 
@@ -107,7 +107,7 @@ const DISABLE_THIS_PASS: bool = false;
 ///
 /// ⛔ TRAP: EVERY `WalkResult::skip()` IN THE REFERENCE IS INERT. `Operation::walk` defaults to
 /// `WalkOrder::PostOrder` (`mlir/IR/Visitors.h:272`), which calls back only AFTER the nested regions
-/// have been walked (`:224-245`), so nothing is pruned and a nested uniform op is visited FIRST.
+/// have been walked (`:234-246`), so nothing is pruned and a nested uniform op is visited FIRST.
 ///
 /// ⭐ `dcc::getUnitType(prog_unit_op)` NEEDS NO WALK: [`crate::islands::dataflow_ir::Units`] binds the
 /// kind to the unit list, so `unit.on.kind()` is the answer.
@@ -129,7 +129,7 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
 
     // THE SECOND WALK (`:62-101`) — per `dataflow.program_unit`.
     for unit in program.units.iter() {
-        // `mergeAllLocalOps(prog_unit_op)` (`:64`) is ITSELF a walk (`Utils.cpp:1239-1259`) whose body
+        // `mergeAllLocalOps(prog_unit_op)` (`:64`) is ITSELF a walk (`Utils.cpp:1239-1261`) whose body
         // fires only on a local op, so a unit holding none is genuinely untouched and the seam is
         // where the sister-merging loop would begin.
         walk_post_order(&unit.body, &mut |op| {
@@ -137,7 +137,7 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
                 todo!(
                     "dcc::uniform::utils::{{mergeLocalOps,getNextSisterOperation}} \
                      (Dialect/Uniform/Utils.cpp:1187,1164) — out of campaign scope: \
-                     `mergeAllLocalOps`' merge of this unit's consecutive local ops (`:1239-1259`)"
+                     `mergeAllLocalOps`' merge of this unit's consecutive local ops (`:1239-1261`)"
                 )
             }
         });
@@ -162,7 +162,7 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
             });
 
             // ⭐ `PropagationAnalysis` IS NOT NEEDED HERE, and the reference is why: its lookup is
-            // COMMENTED OUT (`:81-86`) and `simplifyUniformRegions` is passed `nullptr` (`:92`).
+            // COMMENTED OUT (`:84-89`) and `simplifyUniformRegions` is passed `nullptr` (`:94`).
             let comp = unit.on.kind();
             walk_post_order(&unit.body, &mut |op| {
                 if is_local_op(op) {
@@ -170,7 +170,7 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
                         "dcc::uniform::utils::simplifyUniformRegions \
                          (Dialect/Uniform/Utils.cpp:994) — out of campaign scope: the whole \
                          UniformRegionSimplicationHelper over this {comp:?} unit's local op, with no \
-                         propagation analysis (SimplifyUniformRegions.cpp:88-93)"
+                         propagation analysis (SimplifyUniformRegions.cpp:84-89,94)"
                     )
                 }
             });
@@ -194,24 +194,38 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
 }
 
 /// `llvm::dyn_cast<uniform::UniformizeRegionsOp>(op)` (`:58`), which three of the four walks test for.
+///
+/// ⛔ BOTH ISLAND SPELLINGS OF THE ONE OP. `dyn_cast` answers on the operation, never on what its
+/// regions hold, so [`Op::UniformRegions`] — the same `uniform.uniformize_regions` with THIS rung's
+/// ops inside, which is exactly what `SinkScalarCopy` mints — matches as well. Testing only
+/// [`Op::Uniform`] made all four walks a silent no-op on that shape.
 fn is_uniformize_regions(op: &Op) -> bool {
-    matches!(op, Op::Uniform(uniform::Op::UniformizeRegions { .. }))
+    matches!(
+        op,
+        Op::Uniform(uniform::Op::UniformizeRegions { .. })
+            | Op::UniformRegions(UniformRegions::UniformizeRegions { .. })
+    )
 }
 
 /// `isa<uniform::UniformizeRegionsOp, uniform::EqualizePatternOp>(op)` — the pair the merge
-/// (`Utils.cpp:1241-1243`) and `simplifyUniformRegions` (`:90`) both accept.
+/// (`Utils.cpp:1242-1243`) and `simplifyUniformRegions` (`:92`) both accept, in both island spellings
+/// (see [`is_uniformize_regions`]).
 fn is_local_op(op: &Op) -> bool {
     matches!(
         op,
         Op::Uniform(uniform::Op::UniformizeRegions { .. } | uniform::Op::EqualizePattern { .. })
+            | Op::UniformRegions(
+                UniformRegions::UniformizeRegions { .. } | UniformRegions::EqualizePattern { .. }
+            )
     )
 }
 
 /// `Operation::walk` IN ITS DEFAULT `WalkOrder::PostOrder` — nested first, then the op itself.
 ///
-/// ⛔ A SHARED DIALECT'S REGION HOLDS RUNG-BELOW OPS AND CANNOT BE ENTERED FROM HERE — see
-/// [`dialects::regions_ref`]. A `uniform.uniformize_regions`' body is one of those, which is the same
-/// reason the two ported utils live at the DataflowIR rung.
+/// ⛔ AN [`Op::Uniform`] REGION HOLDS RUNG-BELOW OPS AND CANNOT BE ENTERED FROM HERE — see
+/// [`dialects::regions_ref`], which is the same reason the two ported utils live at the DataflowIR
+/// rung. An [`Op::UniformRegions`] region holds THIS rung's ops and IS entered, so a local region's
+/// contents are walked before the op carrying them.
 fn walk_post_order(scope: &[Op], visit: &mut impl FnMut(&Op)) {
     for op in scope {
         for region in dialects::regions_ref(op) {
@@ -227,7 +241,7 @@ mod unit_tests {
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
-    use crate::islands::sentient::dialects::{Val, sentient};
+    use crate::islands::sentient::dialects::{LocalRegion, Val, sentient};
     use crate::islands::sentient::{ProgramUnit, ProgramUnits};
     use crate::units::DfirUnit;
 
@@ -283,6 +297,24 @@ mod unit_tests {
             results: Vec::new(),
         })]);
         run_on_program(&mut held);
+    }
+
+    /// e208 — `isa<>` answers on the OP, so the sentient-rung spelling of the same
+    /// `uniform.uniformize_regions` — the shape `SinkScalarCopy` mints — reaches the flatten too.
+    #[test]
+    #[should_panic(expected = "flattenUniformRegion")]
+    fn e208_flattens_a_local_region_holding_this_rungs_ops() {
+        let mut sunk = program(vec![Op::UniformRegions(
+            UniformRegions::UniformizeRegions {
+                regions: vec![LocalRegion {
+                    arg: Val(1),
+                    units: vec![Val(0)],
+                    body: vec![Op::Sentient(sentient::Op::Nop { dbg_name: None })],
+                }],
+                results: Vec::new(),
+            },
+        )]);
+        run_on_program(&mut sunk);
     }
 
     /// e208 — a program with no uniform op anywhere runs all four walks to completion and changes
