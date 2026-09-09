@@ -56,9 +56,122 @@ impl DataType {
     }
 }
 
+/// AN ELEMENT FORMAT AS THE SCHEDULER'S OWN VOCABULARY SPELLS IT — `enum class DataFormats`
+/// (`util/sendefs/sendefs.h:30`), in the vendor's declaration order.
+///
+/// ⛔⛔ THIS IS A SUPERSET OF [`DataType`], AND THE DIFFERENCE IS LOAD-BEARING. `DataType` is a
+/// CENSUS of our own templates' `data_type=`; the scheduler compares a datastage's format against
+/// formats no template of ours declares. `GCVTF16F8PackAction::_out_format`
+/// (`ddc/transformations/automatic_shuffle/shuffle.cpp:598`) tests `IEEE_FP16` and `SEN152_FP8`,
+/// neither of which the census has, so a port that reasons in `DataType` drops those arms without
+/// saying so. [`DataFormat::from`] is the join in the other direction.
+///
+/// ⛔ `INVALID` AND `NUM_DATA_FORMATS` HAVE NO VARIANT. The vendor's own width table answers `-1`
+/// for `INVALID` (`util/sendefs/sendefs.cpp:131`), which is not a width; an absent format is
+/// `Option<DataFormat>` here. Dropping it does not disturb the order of the rest, which matters
+/// because `AbstractLayout::operator<` compares formats first (`shuffle.h:105-109`) and the derived
+/// [`Ord`] here has to agree with that enumerator order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DataFormat {
+    /// `SEN169_FP16`.
+    Sen169Fp16,
+    /// `IEEE_FP32`.
+    IeeeFp32,
+    /// `SEN143_FP8`.
+    Sen143Fp8,
+    /// `SEN152_FP8`.
+    Sen152Fp8,
+    /// `SEN153_FP9`.
+    Sen153Fp9,
+    /// `SENINT2`.
+    Senint2,
+    /// `SENINT4`.
+    Senint4,
+    /// `SENINT8`.
+    Senint8,
+    /// `SENINT16`.
+    Senint16,
+    /// `SENINT24` — sixteen bits wide, see [`DataType::bits`].
+    Senint24,
+    /// `IEEE_INT64`.
+    IeeeInt64,
+    /// `IEEE_INT32`.
+    IeeeInt32,
+    /// `SENUINT32`.
+    Senuint32,
+    /// `SENUINT2`.
+    Senuint2,
+    /// `IEEE_FP16` — torch's fp16, which is not IBM's [`Self::Sen169Fp16`].
+    IeeeFp16,
+    /// `BOOL`.
+    Bool,
+    /// `BFLOAT16`.
+    Bfloat16,
+    /// `SEN18F_FP24`.
+    Sen18fFp24,
+    /// `SEN080_FP8` — an MX scale.
+    Sen080Fp8,
+    /// `SEN053_FP8` — an MX scale.
+    Sen053Fp8,
+    /// `SEN121_FP4` — MX fp4.
+    Sen121Fp4,
+}
+
+impl DataFormat {
+    /// HOW MANY BITS ONE ELEMENT OCCUPIES — `EnumsConversion::dataFormatsToBitWidth`
+    /// (`util/sendefs/sendefs.cpp:129-141`), the same table [`DataType::bits`] transcribes for the
+    /// census subset.
+    ///
+    /// ⛔ `SENINT24` IS SIXTEEN, and `SEN153_FP9` is NINE — a width that is neither a power of two
+    /// nor a byte multiple.
+    #[must_use]
+    pub const fn bits(self) -> Bits {
+        Bits(match self {
+            Self::IeeeInt64 => 64,
+            Self::IeeeFp32 | Self::IeeeInt32 | Self::Senuint32 => 32,
+            Self::Sen18fFp24 => 24,
+            Self::Sen169Fp16
+            | Self::Senint16
+            | Self::Senint24
+            | Self::IeeeFp16
+            | Self::Bfloat16 => 16,
+            Self::Sen153Fp9 => 9,
+            Self::Sen143Fp8
+            | Self::Sen152Fp8
+            | Self::Senint8
+            | Self::Bool
+            | Self::Sen080Fp8
+            | Self::Sen053Fp8 => 8,
+            Self::Senint4 | Self::Sen121Fp4 => 4,
+            Self::Senint2 | Self::Senuint2 => 2,
+        })
+    }
+}
+
+impl From<DataType> for DataFormat {
+    /// THE CENSUS AS A VENDOR FORMAT — every `data_type=` our templates declare is one of the
+    /// vendor's, spelled the same way.
+    fn from(data_type: DataType) -> Self {
+        match data_type {
+            DataType::Sen169Fp16 => Self::Sen169Fp16,
+            DataType::Bfloat16 => Self::Bfloat16,
+            DataType::IeeeFp32 => Self::IeeeFp32,
+            DataType::Senuint32 => Self::Senuint32,
+            DataType::Sen143Fp8 => Self::Sen143Fp8,
+            DataType::Sen080Fp8 => Self::Sen080Fp8,
+            DataType::Sen053Fp8 => Self::Sen053Fp8,
+            DataType::Senint8 => Self::Senint8,
+            DataType::Bool => Self::Bool,
+            DataType::Sen121Fp4 => Self::Sen121Fp4,
+            DataType::Senint4 => Self::Senint4,
+            DataType::Senint24 => Self::Senint24,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Bits;
+    use super::{Bits, DataFormat};
     use crate::generated::DataType;
 
     /// ⭐⭐ IBM'S TABLE, ROW FOR ROW, FOR EVERY FORMAT THIS CRATE HAS.
@@ -102,5 +215,42 @@ mod tests {
         assert_eq!(DataType::IeeeFp32.per_stick(STICK_BITS), 32);
         // ⛔ AND SENINT24 PACKS AS SIXTEEN BITS, so a stick holds 64 of them, not 42.
         assert_eq!(DataType::Senint24.per_stick(STICK_BITS), 64);
+    }
+
+    /// ⭐ THE JOIN BETWEEN THE TWO FORMAT VOCABULARIES, ON THE ONE THING BOTH ANSWER.
+    ///
+    /// ⛔ CARRIED AS THE WIDTH, NOT AS "THE TWO AGREE": a `From` that mapped every census format to
+    /// `SENINT8` would satisfy any relation stated between the two tables. Twelve census formats,
+    /// twelve widths.
+    #[test]
+    fn every_census_format_is_the_same_vendor_width() {
+        for data_type in [
+            DataType::Sen169Fp16,
+            DataType::Bfloat16,
+            DataType::IeeeFp32,
+            DataType::Senuint32,
+            DataType::Sen143Fp8,
+            DataType::Sen080Fp8,
+            DataType::Sen053Fp8,
+            DataType::Senint8,
+            DataType::Bool,
+            DataType::Sen121Fp4,
+            DataType::Senint4,
+            DataType::Senint24,
+        ] {
+            assert_eq!(
+                DataFormat::from(data_type).bits(),
+                data_type.bits(),
+                "{data_type:?} changes width crossing into the vendor's DataFormats"
+            );
+        }
+    }
+
+    /// ⛔ THE TWO FORMATS THE CENSUS CANNOT SPELL, which is the whole reason [`DataFormat`] exists:
+    /// `_out_format` (`ddc/transformations/automatic_shuffle/shuffle.cpp:598`) names both.
+    #[test]
+    fn the_vendor_has_formats_the_census_does_not() {
+        assert_eq!(DataFormat::IeeeFp16.bits(), Bits(16));
+        assert_eq!(DataFormat::Sen152Fp8.bits(), Bits(8));
     }
 }
