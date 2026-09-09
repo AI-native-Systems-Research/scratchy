@@ -219,6 +219,140 @@ pub fn results(op: &Op) -> Vec<Val> {
     }
 }
 
+/// THE VALUES AN OP OF THIS RUNG **READS** — `getOpOperands()`, whichever dialect declares it.
+///
+/// # 🛑 THE USE-WALK AND THE EQUIVALENCE TEST BOTH START HERE
+///
+/// ⛔⛔ [`replace_all_uses_with`] COULD WRITE AN OPERAND BUT NOTHING COULD *ASK* WHICH ONES THERE
+/// WERE, and two of loop rolling's questions are exactly that. `Window::checkOpUsage` refuses to roll
+/// an op whose result is read outside its window (`dcc/src/Transform/Sentient/LoopRolling.cpp:144`) —
+/// a use-walk, which is this list asked of every op in the block — and
+/// `collectDeltasOfOperands` walks `op_a.getOperand(i)` against `op_b.getOperand(i)` by INDEX
+/// (`:400-402`), so the position in this list is the `i` a delta and an `OperandKind` are keyed by.
+///
+/// ⛔ THE ORDER IS [`sentient::operands_mut`]'S FOR THIS RUNG'S OWN DIALECT and the rung below's for
+/// every shared one, because it is the same `i`. ⚠️ AND FOR TWO OPS IT IS NOT THE `.td`'S: this
+/// island models `sentient.load_and_send`'s `$consumer` and `sentient.receive_and_store`'s
+/// `$producer` as a wire end rather than a [`Val`], so both lists are one entry short from position 3
+/// on. Positions 0-2 — the mutable address, the immutable address and the increment, which are the
+/// fields loop rolling keys deltas by — are the `.td`'s (`SentientOps.td:507-509`, `:550-552`).
+///
+/// ⭐ COPIES, LIKE THE RUNG BELOW'S: this answers a question. A REWRITE goes through
+/// [`replace_all_uses_with`], or through [`sentient::operands_mut`] for one slot of one op.
+#[must_use]
+pub fn operands(op: &Op) -> Vec<Val> {
+    match op {
+        // ⭐ DERIVED FROM THE MUTABLE WALK RATHER THAN RESTATED, so the twenty-nine arms cannot drift
+        // apart: a clone answered and dropped is the cost of having one description of the list.
+        Op::Sentient(inner) => {
+            let mut copy = inner.clone();
+            sentient::operands_mut(&mut copy)
+                .into_iter()
+                .map(|val| *val)
+                .collect()
+        }
+        // ⭐ THE SAME LIST `affine::Op::For` GETS FROM THE RUNG BELOW — a constant bound is no
+        // operand, and a carried value's initialiser is one. The two variants print identically, so
+        // they must answer identically.
+        Op::AffineFor(loop_op) => {
+            let mut reads: Vec<Val> = Vec::new();
+            for bound in [&loop_op.lo, &loop_op.hi] {
+                if let affine::Bound::Val(val) = bound {
+                    reads.push(*val);
+                }
+            }
+            reads.extend(loop_op.carried.iter().map(|carried| carried.init));
+            reads
+        }
+        other => lowered(other).map_or_else(Vec::new, |op| {
+            crate::islands::dataflow_ir::dialects::operands(&op)
+        }),
+    }
+}
+
+/// WRITE ONE OPERAND SLOT — `Operation::setOperand(i, v)`.
+///
+/// ⛔⛔ [`replace_all_uses_with`] IS THE WRONG TOOL FOR THIS AND LOOP ROLLING PROVES IT.
+/// `updateBody` re-points ONE field of ONE transfer at a loop's `iter_arg`
+/// (`dcc/src/Transform/Sentient/LoopRolling.cpp:712`, `:727-728`) while every other reader of the
+/// value that field held must keep reading it — a value-keyed rewrite would move all of them.
+///
+/// ⛔ THE INDEX IS [`operands`]'S, so the two must be read together; see that function's note on the
+/// two ops whose list is not the `.td`'s.
+///
+/// ⭐ AN OUT-OF-RANGE SLOT WRITES NOTHING, which is the one thing MLIR's own `setOperand` cannot do:
+/// it asserts. There is no operand to name, so there is nothing to correct.
+pub fn set_operand(op: &mut Op, at: usize, val: Val) {
+    match op {
+        Op::Sentient(inner) => {
+            if let Some(slot) = sentient::operands_mut(inner).into_iter().nth(at) {
+                *slot = val;
+            }
+        }
+        // ⭐ THE SAME ORDER [`operands`] ANSWERS IN — a constant bound occupies no slot.
+        Op::AffineFor(loop_op) => {
+            let mut slot = 0usize;
+            for bound in [&mut loop_op.lo, &mut loop_op.hi] {
+                if let affine::Bound::Val(bound) = bound {
+                    if slot == at {
+                        *bound = val;
+                        return;
+                    }
+                    slot += 1;
+                }
+            }
+            for carried in &mut loop_op.carried {
+                if slot == at {
+                    carried.init = val;
+                    return;
+                }
+                slot += 1;
+            }
+        }
+        other => {
+            if let Some(mut lower) = lowered(other) {
+                if let Some(slot) = crate::islands::dataflow_ir::dialects::operands_mut(&mut lower)
+                    .into_iter()
+                    .nth(at)
+                {
+                    *slot = val;
+                }
+                *other = raised(lower);
+            }
+        }
+    }
+}
+
+/// THE REGIONS AN OP OF THIS RUNG HOLDS, AT THIS RUNG'S TYPE — `Operation::getRegions()`.
+///
+/// ⛔⛔ ⚠️ **OWNED, UNLIKE [`sentient::regions`]**, AND THAT IS WHAT MAKES IT TOTAL. A shared
+/// dialect's region holds `Vec<`[`crate::islands::dataflow_ir::dialects::Op`]`>` — the rung below's
+/// type, because the op is the same op whichever rung holds it (see [`lowered`]) — so a borrowing
+/// signature could return the `sentient.for` and `affine.for` bodies and nothing else, and a walk
+/// built on it would silently stop at a `uniform.uniformize_regions`. [`raised`] is what puts those
+/// ops back in this rung's vocabulary, and it produces values.
+///
+/// ⭐ THE COST IS A CLONE PER SHARED REGION, paid only by callers that descend. Loop rolling's
+/// use-walk is one: a result read from inside another op's region is read OUTSIDE the window that
+/// defines it, which is what `Window::checkOpUsage` refuses to roll
+/// (`dcc/src/Transform/Sentient/LoopRolling.cpp:144-155`).
+#[must_use]
+pub fn regions(op: &Op) -> Vec<Vec<Op>> {
+    match op {
+        Op::Sentient(inner) => sentient::regions(inner)
+            .into_iter()
+            .map(<[Op]>::to_vec)
+            .collect(),
+        Op::AffineFor(loop_op) => vec![loop_op.body.clone()],
+        other => lowered(other).map_or_else(Vec::new, |op| {
+            crate::islands::dataflow_ir::dialects::regions(&op)
+                .into_iter()
+                .map(|region| region.iter().cloned().map(raised).collect())
+                .collect()
+        }),
+    }
+}
+
 /// THE OP THAT DEFINES A VALUE AS A RESULT — `Value::getDefiningOp()`.
 ///
 /// ⛔⛔ `getForOpBound` (entry 091) IS FOUR OF THESE IN A ROW. It walks a `sentient.for`'s bound

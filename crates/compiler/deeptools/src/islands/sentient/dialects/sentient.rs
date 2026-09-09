@@ -2658,6 +2658,112 @@ pub fn block_args(op: &Op) -> Vec<Val> {
     }
 }
 
+
+/// THE VALUES ONE `sentient.*` OP BINDS AS RESULTS, **ASSIGNABLE IN PLACE** — [`results`]' twin.
+///
+/// # 🛑 IT EXISTS SO AN OP OF THIS DIALECT CAN BE *BLANKED*
+///
+/// ⛔⛔ AN EQUIVALENCE TEST COMPARES TWO OPS WITH EVERY `Val` SET TO ONE SENTINEL, and without this
+/// an op of this dialect cannot be put in that form. `LoopRolling` asks
+/// `dcc::OperationEquivalence::operationsAreEquivalent` whether two address producers compute the
+/// same thing (`dcc/src/Transform/Sentient/LoopRolling.cpp:267`); the rung below answers that
+/// question through [`crate::islands::dataflow_ir::dialects::vals_mut`], and the two
+/// `sentient.scalar_constant`s that question is usually about would otherwise differ by their SSA
+/// names alone and never compare equal.
+///
+/// ⛔ THE ORDER IS [`results`]', because a caller that blanks or reads slot `n` here and asks
+/// [`results`] what slot `n` was must get one answer.
+#[must_use]
+pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
+    match op {
+        Op::For { carried, .. } => carried.iter_mut().map(|carried| &mut carried.result).collect(),
+        Op::If { yielded, .. } => yielded.iter_mut().map(|yielded| &mut yielded.result).collect(),
+        Op::VectorMac { results, .. } => results.iter_mut().collect(),
+        Op::LoadAndStore { results, .. } => vec![&mut results.0, &mut results.1],
+        Op::LoadAndExtractScalar {
+            addr_result,
+            data_result,
+            ..
+        } => vec![addr_result, data_result],
+        Op::LoadAndSend { result, .. }
+        | Op::ReceiveAndStore { result, .. }
+        | Op::LoadComputeAndSend { result, .. }
+        | Op::ReceiveAndExtractScalar { result, .. }
+        | Op::ScalarAdd { result, .. }
+        | Op::ScalarSub { result, .. }
+        | Op::ScalarMul { result, .. }
+        | Op::ScalarCopy { result, .. }
+        | Op::ScalarConstant { result, .. }
+        | Op::VectorConstant { result, .. }
+        | Op::LogicalPort { result, .. } => vec![result],
+        // ⛔ THE SAME NINE THAT BIND NOTHING IN [`results`], and for its reasons.
+        Op::Yield { .. }
+        | Op::VectorBinary { .. }
+        | Op::VectorUnary { .. }
+        | Op::VectorTernary { .. }
+        | Op::Load { .. }
+        | Op::Sync { .. }
+        | Op::Nop { .. }
+        | Op::SetSendDst { .. }
+        | Op::Splat { .. }
+        | Op::Samv { .. }
+        | Op::SetMask { .. }
+        | Op::IncrMask { .. }
+        | Op::Opaque { .. } => Vec::new(),
+    }
+}
+
+/// THE VALUES ONE `sentient.*` OP'S REGION BINDS, **ASSIGNABLE IN PLACE** — [`block_args`]' twin.
+///
+/// ⛔ FOR [`results_mut`]'S REASON, AND NOT FOR A REWRITE. MLIR keeps a region's arguments on the
+/// BLOCK, so `operationsAreEquivalent` never compares them — it compares dialect, name, arity,
+/// attributes, result types, then the operands, then the ops INSIDE each region
+/// (`dcc/src/Analysis/OperationEquivalence.cpp:88-334`). This island stores them in the variant
+/// instead, so two otherwise-identical `sentient.for`s differ here and a blanking walk that skipped
+/// them would call every pair of loops inequivalent.
+///
+/// ⛔ THE ORDER IS [`block_args`]': the induction variable is argument **0** and the carried values
+/// follow.
+#[must_use]
+pub fn block_args_mut(op: &mut Op) -> Vec<&mut Val> {
+    match op {
+        Op::For { iv, carried, .. } => {
+            let mut args = vec![iv];
+            args.extend(carried.iter_mut().map(|carried| &mut carried.arg));
+            args
+        }
+        // ⛔ A `sentient.if` REGION TAKES NO ARGUMENTS — see [`block_args`].
+        Op::If { .. }
+        | Op::Yield { .. }
+        | Op::VectorMac { .. }
+        | Op::VectorBinary { .. }
+        | Op::VectorUnary { .. }
+        | Op::VectorTernary { .. }
+        | Op::Load { .. }
+        | Op::LoadAndSend { .. }
+        | Op::ReceiveAndStore { .. }
+        | Op::LoadAndStore { .. }
+        | Op::LoadComputeAndSend { .. }
+        | Op::LoadAndExtractScalar { .. }
+        | Op::ReceiveAndExtractScalar { .. }
+        | Op::ScalarAdd { .. }
+        | Op::ScalarSub { .. }
+        | Op::ScalarMul { .. }
+        | Op::ScalarCopy { .. }
+        | Op::ScalarConstant { .. }
+        | Op::VectorConstant { .. }
+        | Op::Sync { .. }
+        | Op::Nop { .. }
+        | Op::SetSendDst { .. }
+        | Op::LogicalPort { .. }
+        | Op::Splat { .. }
+        | Op::Samv { .. }
+        | Op::SetMask { .. }
+        | Op::IncrMask { .. }
+        | Op::Opaque { .. } => Vec::new(),
+    }
+}
+
 /// THE REGIONS ONE `sentient.*` OP HOLDS, in the order `getRegions()` indexes them.
 ///
 /// ⭐ ONLY TWO OPS OF THIS DIALECT HAVE ANY, and their bodies hold [`super::Op`] — the whole mixed
