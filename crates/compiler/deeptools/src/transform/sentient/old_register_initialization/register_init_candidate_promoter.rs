@@ -82,14 +82,162 @@
 //! | `e518_replace` | 518 | 3 | 17 | `dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1184` |
 //! | `e606_run` | 606 | 5 | 224 | `dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:811` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
+// file's own tests until `e606_run` lands and something calls it.
+// ⭐ REMOVE THIS WITH `e606_run`: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e111_isWithinGlobalRegion
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1075  (10 body lines, level 0)
-//   original  : bool RegisterInitCandidatePromoter::isWithinGlobalRegion( mlir::Value val) const
+use crate::islands::dataflow_ir::dialects as lower;
+use crate::islands::sentient::dialects::{self, Op, Val, dataflow, sentient, symbol, uniform};
 
-// crustify:todo: e112_isSameOpType
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1087  (18 body lines, level 0)
-//   original  : bool RegisterInitCandidatePromoter::isSameOpType(mlir::Value val1, mlir::Value val2) const
+/// WHERE THE OP BEHIND A CANDIDATE SITS — what `getParentOfType<uniform::UniformizeRegionsOp,
+/// uniform::EqualizePatternOp>` answers about it (`:1081-1083`).
+///
+/// ⛔ `getParentOfType` IS STRICT IN THIS TREE: it starts at `op.getParentOp()`, so a
+/// `uniform.uniformize_regions` is not inside ITSELF and neither is the region argument whose owner's
+/// parent op it is — a [`uniform::LocalRegion::arg`] is GLOBAL.
+/// ⛔ `uniform.equalize_pattern` HAS NO ISLAND OP, the same recorded gap entry 020 carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ancestry {
+    /// Nothing in this subtree defines the value or binds it as a region argument.
+    Unbound,
+    /// No `uniform.uniformize_regions` strictly encloses the op behind it.
+    Global,
+    /// One does.
+    UnderUniformRegion,
+}
+
+/// Whether `op` binds `val` as a REGION ARGUMENT, the reference's `dyn_cast<BlockArgument>` case —
+/// and every one of them answers for the binding op's own scope, because that op IS
+/// `arg.getOwner()->getParentOp()`.
+fn binds_as_region_arg(op: &Op, val: Val) -> bool {
+    match op {
+        Op::Sentient(sentient::Op::For { iv, carried, .. }) => {
+            *iv == val || carried.iter().any(|position| position.arg == val)
+        }
+        Op::AffineFor(loop_op) => {
+            loop_op.iv == val || loop_op.carried.iter().any(|position| position.arg == val)
+        }
+        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
+            regions.iter().any(|region| region.arg == val)
+        }
+        _ => false,
+    }
+}
+
+/// The walk behind [`is_within_global_region`], carrying whether `scope`'s ops are already inside a
+/// `uniform.uniformize_regions`.
+fn ancestry(val: Val, scope: &[Op], under_uniform: bool) -> Ancestry {
+    let bound_here = if under_uniform {
+        Ancestry::UnderUniformRegion
+    } else {
+        Ancestry::Global
+    };
+    for op in scope {
+        if dialects::results(op).contains(&val) || binds_as_region_arg(op, val) {
+            return bound_here;
+        }
+        match op {
+            Op::Sentient(inner) => {
+                for region in sentient::regions(inner) {
+                    match ancestry(val, region, under_uniform) {
+                        Ancestry::Unbound => {}
+                        found => return found,
+                    }
+                }
+            }
+            Op::AffineFor(loop_op) => match ancestry(val, &loop_op.body, under_uniform) {
+                Ancestry::Unbound => {}
+                found => return found,
+            },
+            // ⭐ THE ONE ARM THAT CAN ANSWER `false`, AND ITS REGIONS ARE A RUNG LOWER: a local
+            // region's body holds [`lower::Op`], so the candidates reachable inside one are the
+            // SHARED ops — `dataflow.get_unit`, `symbol.create_symbol`, `uniform.query_map` — which
+            // is exactly the set entry 112 pairs. A `sentient.*` value bound inside a uniform region
+            // is not expressible here, so no answer is being guessed at.
+            Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
+                if regions
+                    .iter()
+                    .any(|region| lower::defining_op(val, &region.body).is_some())
+                {
+                    return Ancestry::UnderUniformRegion;
+                }
+            }
+            other => {
+                if let Some(op) = dialects::lowered(other)
+                    && lower::defining_op(val, core::slice::from_ref(&op)).is_some()
+                {
+                    todo!(
+                        "isWithinGlobalRegion reached a definition inside a lower-rung region: {op:?}"
+                    );
+                }
+            }
+        }
+    }
+    Ancestry::Unbound
+}
+
+/// Replaces: e111_isWithinGlobalRegion
+///
+/// Whether a candidate comes from outside every local region — the test the promoter drains its
+/// candidate stack with, one global value at a time (`:844-853`).
+#[must_use]
+pub fn is_within_global_region(val: Val, scope: &[Op]) -> bool {
+    match ancestry(val, scope, false) {
+        Ancestry::Global => true,
+        Ancestry::UnderUniformRegion => false,
+        // `DT_CHECK(op)` (`:1080`) — the reference aborts on a value with nothing behind it. The one
+        // shape this island cannot answer for is a region argument bound INSIDE a local region's
+        // lower-rung body, which no `getRegionIterArgs()` candidate of this rung is.
+        Ancestry::Unbound => todo!(
+            "isWithinGlobalRegion: DT_CHECK(op) — nothing in the module binds {val:?} (OldRegisterInitialization.cpp:1080)"
+        ),
+    }
+}
+
+/// THE OPS A SHARED REGISTER INIT MAY BE BUILT FROM — the four `isa<>` pairs of `:1091-1102`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceOpType {
+    /// `sentient::ConstantOp`, this island's `sentient.scalar_constant`.
+    ScalarConstant,
+    /// `mlir::symbol::CreateSymbolOp`.
+    CreateSymbol,
+    /// `dataflow::GetUnitOp`.
+    GetUnit,
+    /// `dataflow::CreateMulticastGroupOp`.
+    CreateMulticastGroup,
+}
+
+/// Which of them defines `val`, or nothing for any other op AND for a value with no defining op —
+/// the `isa<T>(nullptr)` the reference gets for a region argument, false for all four.
+fn source_op_type(val: Val, scope: &[Op]) -> Option<SourceOpType> {
+    match dialects::defining_op(val, scope)? {
+        Op::Sentient(sentient::Op::ScalarConstant { .. }) => Some(SourceOpType::ScalarConstant),
+        Op::Symbol(symbol::Op::CreateSymbol { .. }) => Some(SourceOpType::CreateSymbol),
+        Op::Dataflow(dataflow::Op::GetUnit { .. }) => Some(SourceOpType::GetUnit),
+        Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. }) => {
+            Some(SourceOpType::CreateMulticastGroup)
+        }
+        _ => None,
+    }
+}
+
+/// Replaces: e112_isSameOpType
+///
+/// Whether two sources are the same kind of op — and `true` for a pair where either side is null,
+/// which is the reference's own answer for one.
+#[must_use]
+pub fn is_same_op_type(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bool {
+    match (val1, val2) {
+        (Some(val1), Some(val2)) => {
+            match (source_op_type(val1, scope), source_op_type(val2, scope)) {
+                (Some(type1), Some(type2)) => type1 == type2,
+                _ => false,
+            }
+        }
+        _ => true,
+    }
+}
 
 // crustify:todo: e333_constructValues
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1107  (34 body lines, level 1)
@@ -116,3 +264,109 @@
 //   original  : void RegisterInitCandidatePromoter::run()
 //   calls     : e063_getMaxRegNum, e108_removeInitAttrFromOps, e109_eraseDeletedOps, e110_hasSameAttr, e111_isWithinGlobalRegion, e112_isSameOpType, e249_normalizeNullValues, e251_add, e252_size, e253_areAllValuesEqual, e332_moveSSAToInit, e422_insert, e452_postProcessing, e517_getSource …
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{is_same_op_type, is_within_global_region};
+    use crate::islands::dataflow_ir::dialects as lower;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::{Op, Val, dataflow, sentient, symbol, uniform};
+    use crate::units::{DfirUnit, Residency};
+
+    /// `%r = dataflow.get_unit`, at whichever rung the region holding it is.
+    fn get_unit(result: u32) -> dataflow::Op {
+        dataflow::Op::GetUnit {
+            result: Val(result),
+            residency: Residency::Global,
+            unit: DfirUnit::L3lu,
+            num_folds: None,
+        }
+    }
+
+    /// `%r = dataflow.create_multicast_group(%1 -> ())`.
+    fn multicast_group(result: u32) -> dataflow::Op {
+        dataflow::Op::CreateMulticastGroup {
+            result: Val(result),
+            producer: Val(1),
+            consumers: Vec::new(),
+            num_consumers: dataflow::ConsumerCount(1),
+            group_id: dataflow::MulticastGroupId(0),
+            count: dataflow::OutstandingRequests(0),
+        }
+    }
+
+    /// `%r = sentient.scalar_constant`.
+    fn scalar_constant(result: u32) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value: 0,
+            result: Val(result),
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// e111 — a global unit, one bound inside a local region, and the region argument the strict
+    /// `getParentOfType` leaves global.
+    #[test]
+    fn e111_answers_no_only_for_a_value_bound_inside_a_local_region() {
+        let scope = vec![
+            Op::Dataflow(get_unit(1)),
+            Op::Uniform(uniform::Op::UniformizeRegions {
+                regions: vec![uniform::LocalRegion {
+                    arg: Val(2),
+                    units: vec![Val(1)],
+                    body: vec![lower::Op::Dataflow(get_unit(3))],
+                }],
+                results: Vec::new(),
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(4),
+                bound: Val(1),
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![scalar_constant(5)],
+            }),
+        ];
+        assert!(is_within_global_region(Val(1), &scope));
+        assert!(!is_within_global_region(Val(3), &scope));
+        assert!(is_within_global_region(Val(2), &scope));
+        // A loop's own induction variable and a value inside its body are both global — the loop is
+        // not a local region.
+        assert!(is_within_global_region(Val(4), &scope));
+        assert!(is_within_global_region(Val(5), &scope));
+    }
+
+    /// e112 — a matching pair, a mismatched one, the null side, and the region argument whose
+    /// `isa<T>(nullptr)` is false for all four ops.
+    #[test]
+    fn e112_pairs_only_the_named_ops_and_says_yes_to_a_null_side() {
+        let scope = vec![
+            scalar_constant(1),
+            scalar_constant(2),
+            Op::Dataflow(get_unit(3)),
+            Op::Symbol(symbol::Op::CreateSymbol {
+                result: Val(4),
+                symbol_id: 0,
+                max_value: None,
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(5),
+                bound: Val(3),
+                carried: Vec::new(),
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+            Op::Dataflow(multicast_group(6)),
+            Op::Dataflow(multicast_group(7)),
+        ];
+        assert!(is_same_op_type(Some(Val(1)), Some(Val(2)), &scope));
+        assert!(is_same_op_type(Some(Val(6)), Some(Val(7)), &scope));
+        assert!(!is_same_op_type(Some(Val(1)), Some(Val(3)), &scope));
+        assert!(!is_same_op_type(Some(Val(6)), Some(Val(4)), &scope));
+        assert!(!is_same_op_type(Some(Val(3)), Some(Val(4)), &scope));
+        assert!(is_same_op_type(Some(Val(1)), None, &scope));
+        assert!(is_same_op_type(None, None, &scope));
+        // A value with no defining op is none of the four, on either side.
+        assert!(!is_same_op_type(Some(Val(5)), Some(Val(5)), &scope));
+    }
+}

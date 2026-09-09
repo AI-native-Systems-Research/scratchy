@@ -12781,6 +12781,7 @@ const fn sen_scalar_add(result: Val, lhs: Val, rhs: Val) -> SenOp {
         rhs,
         result,
         reg: None,
+        element_size: None,
         ty: ScalarTy::Index,
     })
 }

@@ -85,25 +85,174 @@
 //! | `e631_promoteRegisterInitCandidatesAboveUniformRegion` | 631 | 6 | 5 | `dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1036` |
 //! | `e644_runOnOperation` | 644 | 7 | 111 | `dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1203` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
+// file's own tests until `e644_runOnOperation` lands and something calls it. CI runs clippy with
+// `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH `e644_runOnOperation`: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
+
 pub(crate) mod register_init_candidate_promoter;
 pub(crate) mod register_init_info;
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
-// crustify:todo: e102_dumpWeights
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:145  (6 body lines, level 0)
-//   original  : void dumpWeights() const
+use crate::formats::Bits;
+use crate::islands::sentient::dialects::{self, Op, Val, sentient};
+use crate::islands::sentient::print;
 
-// crustify:todo: e108_removeInitAttrFromOps
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:686  (19 body lines, level 0)
-//   original  : static void removeInitAttrFromOps(mlir::Operation *parent)
+/// `ssa_weight_`'s value — *"weight is based on number of times it is accessed"* (`:122-123`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Weight(pub i32);
 
-// crustify:todo: e109_eraseDeletedOps
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:768  (4 body lines, level 0)
-//   original  : void eraseDeletedOps()
+/// Replaces: e102_dumpWeights
+///
+/// Every weighted value and its weight, one `--t> N` line each.
+///
+/// ⛔ TRAP: `llvm::errs()` IS A DUMP AND A DUMP IS A STRING HERE — the caller (`e331_dumpWeight`)
+/// wraps these lines in its own banner, so returning them is what lets it.
+/// ⭐ ORDERED, WHERE `DenseMap` IS NOT: the reference's iteration order is unspecified, so a
+/// `BTreeMap` is the only version of this whose output is the same twice.
+/// ⚠️ A VALUE WITH NO DEFINING OP IN `scope` GETS `Value::print`'S BLOCK-ARGUMENT LINE WITHOUT ITS
+/// TYPE — this island carries no per-value type. And [`print::emit`] ends its line, so `--t>` starts
+/// the next one rather than following on the same one.
+#[must_use]
+pub fn dump_weights(ssa_weight: &BTreeMap<Val, Weight>, scope: &[Op]) -> String {
+    let mut out = String::new();
+    for (val, weight) in ssa_weight {
+        match dialects::defining_op(*val, scope) {
+            Some(op) => print::emit(&mut out, op, 0),
+            None => {
+                let _ = writeln!(out, "<block argument> {val:?}");
+            }
+        }
+        let _ = writeln!(out, "--t> {}", weight.0);
+    }
+    out
+}
 
-// crustify:todo: e110_hasSameAttr
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:774  (7 body lines, level 0)
-//   original  : bool hasSameAttr(mlir::Value val1, mlir::Value val2)
+/// Replaces: e108_removeInitAttrFromOps
+///
+/// Clears `programHeader` everywhere under `parent` — every `sentient.scalar_copy` to false, and
+/// every `sentient.for`'s whole array to falses.
+///
+/// ⭐ A SLICE BECAUSE THE WALK INCLUDES THE OP IT STARTS FROM, and one caller starts it at a
+/// `scalar_copy` (`:982`) while the other starts it at the program unit (`:1216`).
+/// ⛔ TRAP: BOTH OF THE REFERENCE'S GUARDS ARE NO-OPS AT THIS ISLAND, NOT DROPPED WORK. `hasAttr`
+/// and `program_headers.empty()` distinguish an absent attribute from an all-false one, and here
+/// absent IS all-false — [`sentient::Carried::program_header`] is a `bool` per position and the
+/// printer omits the array entirely when none is set, so writing falses over either is the same IR.
+pub fn remove_init_attr_from_ops(parent: &mut [Op]) {
+    for op in parent.iter_mut() {
+        match op {
+            Op::Sentient(inner) => {
+                match inner {
+                    sentient::Op::ScalarCopy { program_header, .. } => *program_header = false,
+                    // `numIter = for_op.getNumIterOperands()` falses — one per carried value, which
+                    // is this island's array length by construction.
+                    sentient::Op::For { carried, .. } => {
+                        for position in carried.iter_mut() {
+                            position.program_header = false;
+                        }
+                    }
+                    _ => {}
+                }
+                for region in sentient::regions_mut(inner) {
+                    remove_init_attr_from_ops(region);
+                }
+            }
+            Op::AffineFor(loop_op) => remove_init_attr_from_ops(&mut loop_op.body),
+            // ⛔ PROVED ABSENT BY THE TYPE: a lower-rung region holds
+            // `crate::islands::dataflow_ir::dialects::Op`, and neither `sentient.scalar_copy` nor
+            // `sentient.for` is one.
+            _ => {}
+        }
+    }
+}
+
+/// Replaces: e109_eraseDeletedOps
+///
+/// Erases every op the promoter marked and empties the set.
+///
+/// ⛔ TRAP: `op->erase()` ABORTS MLIR WHILE A USE REMAINS, which is why every insertion into
+/// `to_be_erased_` is preceded by a `DT_CHECK(..getUses().empty())` (`:1180`) — the rewiring is the
+/// caller's, and this only carries it out.
+/// ⭐ ORDERED, WHERE `SmallSet` IS NOT: erasing is order-independent, and a set with an order is the
+/// version whose effect is the same twice.
+pub fn erase_deleted_ops(body: &mut Vec<Op>, to_be_erased: &mut BTreeSet<Val>) {
+    for val in to_be_erased.iter() {
+        dialects::erase_defining_op(body, *val);
+    }
+    to_be_erased.clear();
+}
+
+/// `dcc::utils::getAttr(val, "element_size")` (`dcc/src/Utils/Utils.cpp:392-407`) — the width the op
+/// behind a value declares, or `None` where it declares none.
+///
+/// ⛔ A LOOP ITER ARGUMENT READS THE LOOP'S `element_sizes` AT ITS OWN POSITION, and this island's
+/// array is carried-indexed while the reference's is `[bound, initArgs.., results..]` — so the
+/// argument's slot is its [`sentient::Carried`], the same collapse the loop's `regLocales` already
+/// gets. The reference's other block-argument index, the induction variable's `element_sizes[0]`, is
+/// unreachable here: only `getRegionIterArgs()` values are ever marked (`moveSSAToInit`, `:723-735`).
+fn element_size(val: Val, scope: &[Op]) -> Option<Bits> {
+    if let Some(carried) = carried_arg(val, scope) {
+        return carried.element_size;
+    }
+    match dialects::defining_op(val, scope)? {
+        Op::Sentient(
+            sentient::Op::ScalarAdd { element_size, .. }
+            | sentient::Op::ScalarSub { element_size, .. }
+            | sentient::Op::ScalarCopy { element_size, .. },
+        ) => *element_size,
+        // The `.td`-DECLARED ones, which are never absent — `$element_size` on the transfers
+        // (`SentientOps.td:715`) and on `load_and_extract_scalar` (`:606`).
+        Op::Sentient(
+            sentient::Op::Load { extent, .. }
+            | sentient::Op::LoadAndSend { extent, .. }
+            | sentient::Op::ReceiveAndStore { extent, .. }
+            | sentient::Op::LoadAndStore { extent, .. },
+        ) => Some(extent.element_size),
+        Op::Sentient(sentient::Op::LoadAndExtractScalar { element_size, .. }) => {
+            Some(*element_size)
+        }
+        _ => None,
+    }
+}
+
+/// The `sentient.for` position a block argument belongs to, at any depth of `scope`.
+fn carried_arg(val: Val, scope: &[Op]) -> Option<&sentient::Carried> {
+    for op in scope {
+        if let Op::Sentient(inner) = op {
+            if let sentient::Op::For { carried, .. } = inner
+                && let Some(found) = carried.iter().find(|position| position.arg == val)
+            {
+                return Some(found);
+            }
+            for region in sentient::regions(inner) {
+                if let Some(found) = carried_arg(val, region) {
+                    return Some(found);
+                }
+            }
+        } else if let Op::AffineFor(loop_op) = op
+            && let Some(found) = carried_arg(val, &loop_op.body)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Replaces: e110_hasSameAttr
+///
+/// Whether two values address elements of the same width — and `true` for a pair where either side
+/// is null, which is the reference's own answer for one.
+#[must_use]
+pub fn has_same_attr(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bool {
+    match (val1, val2) {
+        (Some(val1), Some(val2)) => element_size(val1, scope) == element_size(val2, scope),
+        _ => true,
+    }
+}
 
 // crustify:todo: e326_replaceVirtualAssignTarget
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:159  (8 body lines, level 1)
@@ -135,3 +284,125 @@ pub(crate) mod register_init_info;
 //   original  : void OldRegisterInitializationPass::runOnOperation()
 //   calls     : e107_hasUniformizeRegion, e108_removeInitAttrFromOps, e327_calcSSAWeight, e328_sortRegCoalescingCandidates, e329_collectAllRegCoalescingCandidates, e332_moveSSAToInit, e422_insert, e449_calcSSAWeight, e450_collectAllRegCoalescingCandidates, e451_collectRegInitAndRegCoalescingCandidateFast, e631_promoteRegisterInitCandidatesAboveUniformRegion
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{
+        Weight, dump_weights, erase_deleted_ops, has_same_attr, remove_init_attr_from_ops,
+    };
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// `%r = sentient.scalar_copy %in`, in or out of the program header and at a width.
+    fn copy(input: u32, result: u32, element_size: Option<Bits>, program_header: bool) -> Op {
+        Op::Sentient(sentient::Op::ScalarCopy {
+            input: Val(input),
+            result: Val(result),
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lbr,
+                index: None,
+            },
+            element_size,
+            program_header,
+        })
+    }
+
+    /// One carried position at a width, in or out of the program header.
+    fn carried(init: u32, arg: u32, result: u32, element_size: Option<Bits>) -> sentient::Carried {
+        sentient::Carried {
+            init: Val(init),
+            arg: Val(arg),
+            result: Val(result),
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lbr,
+                index: None,
+            },
+            element_size,
+            program_header: true,
+        }
+    }
+
+    /// e102 — the value's own op, then its weight, in key order.
+    #[test]
+    fn e102_prints_each_weighted_value_above_its_weight() {
+        let scope = vec![copy(1, 2, None, false)];
+        let mut weights = BTreeMap::new();
+        weights.insert(Val(2), Weight(7));
+        weights.insert(Val(9), Weight(-1));
+        assert_eq!(
+            dump_weights(&weights, &scope),
+            "%2 = sentient.scalar_copy %1  {reg_locale = \"lbr\"} : index\n--t> 7\n<block argument> Val(9)\n--t> -1\n"
+        );
+    }
+
+    /// e108 — a copy and a loop position both lose the flag, at any depth.
+    #[test]
+    fn e108_clears_the_program_header_flag_everywhere() {
+        let mut body = vec![Op::Sentient(sentient::Op::For {
+            iv: Val(3),
+            bound: Val(4),
+            carried: vec![carried(1, 5, 6, None)],
+            dbg_name: None,
+            body: vec![copy(5, 7, None, true)],
+        })];
+        remove_init_attr_from_ops(&mut body);
+        assert_eq!(
+            body,
+            vec![Op::Sentient(sentient::Op::For {
+                iv: Val(3),
+                bound: Val(4),
+                carried: vec![sentient::Carried {
+                    program_header: false,
+                    ..carried(1, 5, 6, None)
+                }],
+                dbg_name: None,
+                body: vec![copy(5, 7, None, false)],
+            })]
+        );
+    }
+
+    /// e109 — the marked ops go, the unmarked one stays, and the set is empty afterwards.
+    #[test]
+    fn e109_erases_every_marked_op_and_empties_the_set() {
+        let mut body = vec![copy(1, 2, None, false), copy(1, 3, None, false)];
+        let mut to_be_erased = BTreeSet::from([Val(2)]);
+        erase_deleted_ops(&mut body, &mut to_be_erased);
+        assert_eq!(body, vec![copy(1, 3, None, false)]);
+        assert!(to_be_erased.is_empty());
+    }
+
+    /// e110 — equal widths agree, a differing pair does not, two silent ops agree, and a null side
+    /// agrees with anything.
+    #[test]
+    fn e110_compares_element_sizes_and_says_yes_to_a_null_side() {
+        let scope = vec![
+            copy(1, 2, Some(Bits(8)), false),
+            copy(1, 3, Some(Bits(8)), false),
+            copy(1, 4, Some(Bits(16)), false),
+            Op::Sentient(sentient::Op::ScalarAdd {
+                lhs: Val(1),
+                rhs: Val(1),
+                result: Val(5),
+                reg: None,
+                element_size: None,
+                ty: ScalarTy::Index,
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(6),
+                bound: Val(7),
+                carried: vec![carried(2, 8, 9, Some(Bits(16)))],
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+        ];
+        assert!(has_same_attr(Some(Val(2)), Some(Val(3)), &scope));
+        assert!(!has_same_attr(Some(Val(2)), Some(Val(4)), &scope));
+        // Two ops that carry no width at all agree, as two null attributes do.
+        assert!(has_same_attr(Some(Val(5)), None, &scope));
+        assert!(has_same_attr(None, Some(Val(2)), &scope));
+        // ⭐ AND A LOOP ITER ARGUMENT READS THE LOOP'S OWN ARRAY AT ITS POSITION.
+        assert!(has_same_attr(Some(Val(8)), Some(Val(4)), &scope));
+        assert!(!has_same_attr(Some(Val(8)), Some(Val(2)), &scope));
+    }
+}

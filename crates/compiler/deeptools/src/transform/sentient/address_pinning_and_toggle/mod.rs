@@ -982,6 +982,7 @@ mod unit_tests {
                 index: None,
             },
             program_header: false,
+            element_size: None,
         };
         let updater = IntegerSequenceDataTransferUpdater {
             iter_arg: carried.arg,

@@ -193,6 +193,7 @@ fn xrf_incr_add(
                 locale,
                 index: None,
             }),
+            element_size: None,
             ty: ScalarTy::Index,
         }),
         add_result,
@@ -414,6 +415,7 @@ mod unit_tests {
                 index: None,
             },
             program_header: false,
+            element_size: None,
         })
     }
 
@@ -483,6 +485,7 @@ mod unit_tests {
                     index: None,
                 }),
                 ty: ScalarTy::Index,
+                element_size: None,
             })
         };
         assert_eq!(
@@ -519,6 +522,7 @@ mod unit_tests {
                 index: None,
             }),
             ty: ScalarTy::Index,
+            element_size: None,
         });
         let kept = Op::Sentient(sentient::Op::ScalarAdd {
             lhs: Val(32),
@@ -529,6 +533,7 @@ mod unit_tests {
                 index: None,
             }),
             ty: ScalarTy::Index,
+            element_size: None,
         });
         let mut unit = unit(vec![add, kept.clone(), reader(Val(20), Val(22))]);
         let mut values = Values::default();

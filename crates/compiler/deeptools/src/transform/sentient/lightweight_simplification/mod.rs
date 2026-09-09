@@ -87,6 +87,7 @@
 
 use super::ForRef;
 use super::analyses::{ExpressionEvaluator, OffsetSites, ScalarOffset};
+use crate::formats::Bits;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{Op, Val, defining_op, replace_all_uses_with, use_count};
@@ -123,6 +124,8 @@ struct ScalarArith {
     reg: Option<ops::Reg>,
     /// `result.getType()`.
     ty: ScalarTy,
+    /// `element_size`, carried because `setAttrs(op.getAttrs())` copies the WHOLE dictionary.
+    element_size: Option<Bits>,
     /// A `scalar_sub` rather than a `scalar_add`, which the zero pattern treats differently.
     subtracting: bool,
 }
@@ -135,12 +138,14 @@ fn scalar_arith(op: &Op) -> Option<ScalarArith> {
             rhs,
             result,
             reg,
+            element_size,
             ty,
         }) => Some(ScalarArith {
             inp1: *lhs,
             inp2: *rhs,
             result: *result,
             reg: *reg,
+            element_size: *element_size,
             ty: *ty,
             subtracting: false,
         }),
@@ -149,12 +154,14 @@ fn scalar_arith(op: &Op) -> Option<ScalarArith> {
             rhs,
             result,
             reg,
+            element_size,
             ty,
         }) => Some(ScalarArith {
             inp1: *lhs,
             inp2: *rhs,
             result: *result,
             reg: *reg,
+            element_size: *element_size,
             ty: *ty,
             subtracting: true,
         }),
@@ -287,6 +294,7 @@ pub(crate) fn coalesce_scalar_arith_simplification<E: ExpressionEvaluator>(
             rhs: base.value,
             result: created,
             reg: arith.reg,
+            element_size: arith.element_size,
             ty: arith.ty,
         }
     } else {
@@ -295,6 +303,7 @@ pub(crate) fn coalesce_scalar_arith_simplification<E: ExpressionEvaluator>(
             rhs: offset,
             result: created,
             reg: arith.reg,
+            element_size: arith.element_size,
             ty: arith.ty,
         }
     };
@@ -446,6 +455,7 @@ mod unit_tests {
             result,
             reg: None,
             ty: ScalarTy::Index,
+            element_size: None,
         })
     }
 
@@ -563,6 +573,7 @@ mod unit_tests {
                 result: Val(3),
                 reg: Some(placed),
                 ty: ScalarTy::Index,
+                element_size: None,
             }),
             add(Val(3), Val(4), Val(8)),
         ];
@@ -607,6 +618,7 @@ mod unit_tests {
                 result: Val(10),
                 reg: Some(placed),
                 ty: ScalarTy::Index,
+                element_size: None,
             })
         );
         // The reader of the coalesced result now reads the new op's.
@@ -626,6 +638,7 @@ mod unit_tests {
                 index: None,
             },
             program_header: false,
+            element_size: None,
         };
         let mut block = vec![
             constant(1, Val(0)),

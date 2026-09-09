@@ -1582,6 +1582,16 @@ pub struct Carried {
     pub reg: Reg,
     /// This position's `$programHeader` flag.
     pub program_header: bool,
+    /// This position's slot of the `element_sizes` ARRAY — see [`Op::ScalarAdd`] for what an element
+    /// size is and why it is its own field.
+    ///
+    /// ⭐ CARRIED-INDEXED, EXACTLY AS [`Carried::reg`] IS. `getAttr` reads a loop iter argument's size
+    /// at `arg.getArgNumber()` of the loop's own `element_sizes` (`dcc/src/Utils/Utils.cpp:396-402`),
+    /// an array the reference lays out `[iv, iter_args…, results…]`
+    /// (`AddressRegisterPrecisionAssignment.cpp:169-195`) — the same `[bound, initArgs…, results…]`
+    /// convention this island already collapses to one entry per carried value for the register
+    /// arrays. One collapse, applied to both, is what keeps the two from disagreeing.
+    pub element_size: Option<Bits>,
 }
 
 /// ONE VALUE A `sentient.if` REGION YIELDS.
@@ -2197,6 +2207,19 @@ pub enum Op {
         result: Val,
         /// Where the scalar lives — ⛔ `None` UNTIL AN ALLOCATOR SAYS. See [`Op::ScalarAdd`]'s note.
         reg: Option<Reg>,
+        /// `element_size` — HOW WIDE, IN BITS, THE ELEMENTS THIS SCALAR ADDRESSES ARE.
+        ///
+        /// ⛔⛔ A DISCARDABLE ATTRIBUTE THE `.td` DOES NOT DECLARE, AND THE REFERENCE PRINTS IT — the
+        /// `{element_size = 8 : i32, regIndex = 1 : i32, ..}` above is `dcc/test/LXLU/`
+        /// `rotate-composite.mlir:24`. `AddressRegisterPrecisionAssignment` writes it (`:540-547`),
+        /// `ScalarOpMergingAndHoisting` propagates it (`:1370`), and `hasSameAttr` (entry 110) and
+        /// `areElementSizeIdentical` (entry 058) read it back through
+        /// `dcc::utils::getAttr(val, "element_size")`.
+        ///
+        /// ⛔ NOT PART OF `reg`, BECAUSE THE SIZE IS DECIDED WHILE THE REGISTER IS STILL UNSAID:
+        /// precision assignment runs before register assignment, so a size with no locale is the
+        /// state the pipeline actually passes through and `Option<Reg>` could not hold it.
+        element_size: Option<Bits>,
         /// The type of both operands and of the result — `SameOperandsAndResultType`.
         ty: ScalarTy,
     },
@@ -2211,6 +2234,8 @@ pub enum Op {
         result: Val,
         /// Where the scalar lives — ⛔ `None` until an allocator says.
         reg: Option<Reg>,
+        /// `element_size` — see [`Op::ScalarAdd`].
+        element_size: Option<Bits>,
         /// The type of both operands and of the result.
         ty: ScalarTy,
     },
@@ -2241,6 +2266,9 @@ pub enum Op {
         result: Val,
         /// Where the scalar lives.
         reg: Reg,
+        /// `element_size` — see [`Op::ScalarAdd`]. ⭐ THE ONE `replace` (entry 518) COPIES ACROSS when
+        /// it swaps a value for a fresh `scalar_copy` (`OldRegisterInitialization.cpp:1188-1198`).
+        element_size: Option<Bits>,
         /// `$programHeader`.
         program_header: bool,
     },
@@ -2940,6 +2968,12 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                     &bool_array(carried.iter().map(|c| c.program_header)),
                 ));
             }
+            if carried.iter().any(|c| c.element_size.is_some()) {
+                attrs.push(attr(
+                    "element_sizes",
+                    &size_array(carried.iter().map(|c| c.element_size)),
+                ));
+            }
             if let Some(name) = dbg_name {
                 attrs.push(attr("dbgName", &quoted(name)));
             }
@@ -3546,15 +3580,35 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             rhs,
             result,
             reg,
+            element_size,
             ty,
-        } => scalar_binary(out, "scalar_add", *result, *lhs, *rhs, *reg, *ty),
+        } => scalar_binary(
+            out,
+            "scalar_add",
+            *result,
+            *lhs,
+            *rhs,
+            *reg,
+            *element_size,
+            *ty,
+        ),
         Op::ScalarSub {
             lhs,
             rhs,
             result,
             reg,
+            element_size,
             ty,
-        } => scalar_binary(out, "scalar_sub", *result, *lhs, *rhs, *reg, *ty),
+        } => scalar_binary(
+            out,
+            "scalar_sub",
+            *result,
+            *lhs,
+            *rhs,
+            *reg,
+            *element_size,
+            *ty,
+        ),
         Op::ScalarMul {
             lhs,
             rhs,
@@ -3582,11 +3636,15 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             input,
             result,
             reg,
+            element_size,
             program_header,
         } => {
             let mut attrs = vec![attr("reg_locale", &quoted(reg.locale.spelling()))];
             if let Some(index) = reg.index {
                 attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
+            }
+            if let Some(size) = element_size {
+                attrs.push(attr("element_size", &format!("{} : i32", size.0)));
             }
             if *program_header {
                 attrs.push(attr("programHeader", "true"));
@@ -3825,6 +3883,7 @@ fn scalar_binary(
     lhs: Val,
     rhs: Val,
     reg: Option<Reg>,
+    element_size: Option<Bits>,
     ty: ScalarTy,
 ) {
     // ⛔ NO DICTIONARY AT ALL WHEN NO ALLOCATOR HAS SPOKEN — see [`Op::ScalarAdd`].
@@ -3834,8 +3893,11 @@ fn scalar_binary(
         if let Some(index) = reg.index {
             attrs.push(attr("regIndex", &format!("{} : i32", index.get())));
         }
-        attrs.sort();
     }
+    if let Some(size) = element_size {
+        attrs.push(attr("element_size", &format!("{} : i32", size.0)));
+    }
+    attrs.sort();
     let _ = writeln!(
         out,
         "{} = sentient.{mnemonic} {}, {}{} : {}, {}",
@@ -3969,6 +4031,16 @@ fn index_array(regs: impl Iterator<Item = Reg>) -> String {
             r.index
                 .map_or_else(|| "-1".to_owned(), |i| i.get().to_string())
         })
+        .collect();
+    format!("[{}]", rendered.join(", "))
+}
+
+/// An `I32ArrayAttr` of element sizes — ⛔ AN UNASSIGNED SLOT PRINTS AS `-1`, the sentinel
+/// `initializePrecision` fills (`AddressRegisterPrecisionAssignment.cpp:82-92`), exactly as
+/// [`index_array`] spells an unassigned register.
+fn size_array(sizes: impl Iterator<Item = Option<Bits>>) -> String {
+    let rendered: Vec<String> = sizes
+        .map(|size| size.map_or_else(|| "-1".to_owned(), |bits| bits.0.to_string()))
         .collect();
     format!("[{}]", rendered.join(", "))
 }

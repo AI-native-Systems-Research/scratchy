@@ -210,6 +210,7 @@ mod unit_tests {
                         index: None,
                     },
                     program_header: false,
+                    element_size: None,
                 }],
                 dbg_name: None,
                 body: Vec::new(),

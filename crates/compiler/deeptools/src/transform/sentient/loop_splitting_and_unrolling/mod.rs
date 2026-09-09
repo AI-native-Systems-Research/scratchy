@@ -879,6 +879,7 @@ mod unit_tests {
             result,
             reg: None,
             ty: ScalarTy::Index,
+            element_size: None,
         })
     }
 
@@ -892,6 +893,7 @@ mod unit_tests {
                 index: None,
             },
             program_header: false,
+            element_size: None,
         }
     }
 

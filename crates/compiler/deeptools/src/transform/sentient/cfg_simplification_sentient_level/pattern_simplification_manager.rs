@@ -1043,6 +1043,7 @@ mod unit_tests {
             result,
             reg: None,
             ty: ScalarTy::Index,
+            element_size: None,
         })
     }
 
@@ -1133,6 +1134,7 @@ mod unit_tests {
                     result: Val(3),
                     reg: UNASSIGNED,
                     program_header: false,
+                    element_size: None,
                 }],
                 vec![scalar_add(Val(2), Val(11), Val(4)), yield_op(vec![Val(4)])],
             ),

@@ -843,6 +843,7 @@ mod unit_tests {
                             index: None,
                         },
                         program_header: false,
+                        element_size: None,
                     }],
                     dbg_name: Some("loop".to_owned()),
                     body: vec![
@@ -950,6 +951,8 @@ pub fn match_and_rewrite(scf_for_loop: ScfForLoop<'_>, values: &mut Values) -> V
             init: carried.init,
             arg: carried.arg,
             result: carried.result,
+            // No precision either: `AddressRegisterPrecisionAssignment` has not run at this rung.
+            element_size: None,
             // `regLocales` — one `SentientRegTypeAttr::unknown` per result. ⭐ THE `lccr` PUSH-BACK IS
             // COMMENTED OUT in the reference (`:101-103`): *"It should be set in the
             // registerTypeAssignment"*.

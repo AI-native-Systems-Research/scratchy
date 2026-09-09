@@ -1088,6 +1088,7 @@ pub fn insert_const_and_add_ops(
                 result: sum,
                 // `AddOp::create` passes neither `regLocale` nor `regIndex`.
                 reg: None,
+                element_size: None,
                 ty: xrf_reg_type,
             }),
         ],
@@ -1472,6 +1473,7 @@ mod unit_tests {
                         index: None,
                     },
                     program_header: false,
+                    element_size: None,
                 })
                 .collect(),
             dbg_name: None,
@@ -2125,6 +2127,7 @@ mod unit_tests {
                         // ⭐ NO REGISTER YET: `regTypeAssignmentPass` assigns it (`:373-374`).
                         reg: None,
                         ty: ScalarTy::Index,
+                        element_size: None,
                     }),
                 ],
                 value: sum,
@@ -2786,6 +2789,7 @@ pub fn create_for_op_with_return_value(
                 locale: sentient::RegType::Unknown,
                 index: None,
             },
+            element_size: None,
             program_header: false,
         });
         pointers.push(result);
@@ -3812,6 +3816,7 @@ mod xrf_lowering_unit_tests {
                 index: Some(sentient::RegIndex::at::<3>()),
             },
             program_header: true,
+            element_size: None,
         };
         let for_op = sen::Op::Sentient(sentient::Op::For {
             iv: Val(4),

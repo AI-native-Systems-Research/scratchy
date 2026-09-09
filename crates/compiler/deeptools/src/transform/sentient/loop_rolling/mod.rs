@@ -628,6 +628,7 @@ fn scalar_add(result: Val, lhs: Val, rhs: Val) -> Op {
         // `AddOp::create` sets no `regLocale`, so the `.td`'s absent register stands.
         reg: None,
         ty: ScalarTy::Index,
+        element_size: None,
     })
 }
 
@@ -1094,6 +1095,7 @@ mod unit_tests {
             result,
             reg,
             program_header: false,
+            element_size: None,
         };
         let mut rolled = RolledLoop {
             carried: vec![

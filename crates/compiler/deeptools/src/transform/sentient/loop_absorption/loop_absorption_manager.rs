@@ -253,6 +253,7 @@ impl<'a> LoopAbsorptionManager<'a> {
                 result: sum,
                 reg: None,
                 ty: bound_type,
+                element_size: None,
             });
             if has_definer {
                 // `builder.setInsertionPointAfter(bound.getDefiningOp());` (`:97`).

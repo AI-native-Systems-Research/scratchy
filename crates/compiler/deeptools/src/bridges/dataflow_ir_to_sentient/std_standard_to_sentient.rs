@@ -127,6 +127,7 @@ pub fn lower_addi_op_to_sentient(op: &IntBinary) -> sen::Op {
         rhs: op.rhs,
         result: op.result,
         reg: None,
+        element_size: None,
         ty: op.ty,
     }
 }
@@ -166,6 +167,7 @@ pub fn lower_subi_op_to_sentient(op: &IntBinary) -> sen::Op {
         rhs: op.rhs,
         result: op.result,
         reg: None,
+        element_size: None,
         ty: op.ty,
     }
 }
@@ -1365,6 +1367,7 @@ mod unit_tests {
                 result: Val(29),
                 reg: None,
                 ty: ScalarTy::Index,
+                element_size: None,
             },
             "the operands and the bound value carry through unchanged"
         );
@@ -1413,6 +1416,7 @@ mod unit_tests {
                     index: Some(sen::RegIndex::at::<1>()),
                 }),
                 ty: ScalarTy::Index,
+                element_size: None,
             })),
             "%20 = sentient.scalar_add %17, %1 {regIndex = 1 : i32, regLocale = #sentient<reg_type lrf>} : index, index"
         );
@@ -2049,6 +2053,7 @@ mod unit_tests {
                     result: Val(29),
                     reg: None,
                     ty: ScalarTy::Index,
+                    element_size: None,
                 }),
                 SenOp::Sentient(sen::Op::ScalarConstant {
                     is_symbol: false,

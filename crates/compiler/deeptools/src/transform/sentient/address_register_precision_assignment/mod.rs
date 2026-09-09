@@ -206,10 +206,11 @@ impl PrecisionAssignments {
             input,
             result,
             reg,
+            element_size,
             program_header,
         }) = op
         {
-            Some((*input, *result, *reg, *program_header))
+            Some((*input, *result, *reg, *element_size, *program_header))
         } else {
             None
         };
@@ -245,7 +246,7 @@ impl PrecisionAssignments {
             return PrecisionAssigned::Unchanged;
         }
 
-        if let Some((input, copy_result, reg, program_header)) = copy
+        if let Some((input, copy_result, reg, copy_element_size, program_header)) = copy
             && copies_a_constant
         {
             // ⭐ AN LBR COPY IS COMMONED WHATEVER THE FLAG SAYS: it has to be promoted to the program
@@ -268,6 +269,9 @@ impl PrecisionAssignments {
                 input,
                 result: clone_result,
                 reg,
+                // `builder.clone` COPIES THE DICTIONARY; the map entry below is what the flush
+                // (`:540-547`) later overwrites it with.
+                element_size: copy_element_size,
                 program_header,
             });
             if insert_at(body, user.path(), clone).is_some() {
@@ -420,6 +424,7 @@ mod unit_tests {
                 index: None,
             },
             program_header: false,
+            element_size: None,
         })
     }
 
@@ -433,6 +438,7 @@ mod unit_tests {
             result: Val(3),
             reg: None,
             ty: ScalarTy::Index,
+            element_size: None,
         });
         let carrier = |init, arg, result| Carried {
             init,
@@ -443,6 +449,7 @@ mod unit_tests {
                 index: None,
             },
             program_header: false,
+            element_size: None,
         };
         let loop_op = Op::Sentient(sentient::Op::For {
             iv: Val(4),
