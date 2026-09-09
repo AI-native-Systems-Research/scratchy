@@ -699,7 +699,8 @@ pub fn transform_a_compute_node_for_inter_slice_restickify<T: ComputeMasking + ?
 mod tests_e105_e109 {
     use super::*;
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{DataInfo, Dsts};
+    use crate::schedule::dsc2::{DataInfo, Dsts, ReplicationFactor};
+    use crate::units::NumFolds;
 
     /// A tree of computes, in traversal order.
     struct Computes(Vec<ComputeOp>);
@@ -754,6 +755,7 @@ mod tests_e105_e109 {
             data: DataInfo {
                 data_connect: connect,
                 my_lds_idx: lds.map(LdsIdx),
+                constant_id: None,
             },
         }
     }
@@ -765,6 +767,7 @@ mod tests_e105_e109 {
             ex_unit,
             inputs: vec![operand(ex_unit, Some(connect), Some(0))],
             outputs: vec![operand(ex_unit, Some(connect), Some(0))],
+            num_folds_engaged: NumFolds::ONE,
         }
     }
 
@@ -797,6 +800,8 @@ mod tests_e105_e109 {
                 operand(SenComponent::Lx, None, Some(0)),
                 vec![operand(ex, Some(DataConnect::PeHtOut), Some(0))],
             ),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
         };
         // Same shape, but lds 1's scales hold no -2: the destination index is still recorded.
         let mut skipped = taken.clone();

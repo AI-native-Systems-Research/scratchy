@@ -21,9 +21,13 @@ use std::collections::{BTreeMap, VecDeque};
 
 use sys_arch_spec::arch_enums::SenComponent;
 
+use crate::arch::{Elements, Sticks};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::generated::{ComputeType, DataConnect};
 use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::schedule::ddc::fold::{ConstIdx, NodeId};
+use crate::schedule::ddc::metadata::DatastageId;
+use crate::units::NumFolds;
 
 impl PrimaryDim {
     /// Every layout dim IN `PrimaryDimTypes`' OWN ORDINAL ORDER (`dsc/dims.h:34`), which is what a
@@ -263,15 +267,22 @@ impl Coordinate {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeName(pub String);
 
-/// WHAT AN OPERAND KNOWS ABOUT ITS DATA — `DataInfo` (`dsc/dsc2.h:721`) narrowed to the two fields
-/// the fold units read. `dataConnect_` is a closed set, so it is [`DataConnect`] and not a string;
+/// WHAT AN OPERAND KNOWS ABOUT ITS DATA — `DataInfo` (`dsc/dsc2.h:721`) narrowed to the three fields
+/// the ported units read. `dataConnect_` is a closed set, so it is [`DataConnect`] and not a string;
 /// a default-constructed `DataInfo` leaves it EMPTY, which is the [`None`].
+///
+/// ⚠️ [`super::ddc::fold::DataStream`] carries `myLdsIdx_` and `constantId_` as ONE
+/// [`super::ddc::fold::DataOrigin`], which is the stronger statement (`isLabeledDs`/`isConstant`
+/// `DT_CHECK` that both are not set). Converging the two spellings is a review pass's, not this
+/// batch's: `fold.rs` already carries the same note about the fold vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DataInfo {
     /// `dataConnect_`.
     pub data_connect: Option<DataConnect>,
     /// `myLdsIdx_`, once its `-1` is an [`Option`].
     pub my_lds_idx: Option<LdsIdx>,
+    /// `constantId_` (`dsc/dsc2.h:726`), once its `-1` is an [`Option`].
+    pub constant_id: Option<ConstIdx>,
 }
 
 /// A NODE OPERAND — its component and its [`DataInfo`] AS ONE VALUE.
@@ -324,15 +335,98 @@ impl Dsts {
     }
 }
 
-/// `dsc2::AllocateNode` (`dsc/dsc2.h:1008`) narrowed to what the fold units read.
+/// ONE LAYOUT DIM'S MAX SIZE — one entry of `AllocateNode::maxDimSizes_` (`dsc/dsc2.h:983`), whose
+/// `int` is THREE things in sequence.
+///
+/// ⛔⛔ A TRI-STATE, NOT A NUMBER, AND THAT IS WHAT STOPS A DOUBLE RESOLVE. Every writer but entry
+/// 128 only ever `resize(.., -1)`s it or stores a `dataStageParam_` KEY in it; entry 128 overwrites
+/// that key with an ELEMENT COUNT in place, so a second run of entry 128 would read the count back
+/// as a datastage index. Here it cannot: [`Self::Resolved`] is not a [`Self::Stage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxDimSize {
+    /// `-1` — no datastage bounds this dim.
+    Unset,
+    /// A `dataStageParam_` index, as it stands BEFORE entry 128.
+    Stage(DatastageId),
+    /// The extent entry 128 resolved it to, in stick-normalised elements.
+    Resolved(Elements),
+}
+
+/// AN ALLOCATION'S LAYOUT — `layoutDimOrder_` (`dsc/dsc2.h:982`) zipped with `maxDimSizes_` (`:983`),
+/// NON-EMPTY.
+///
+/// ⛔⛔ TWO REFERENCE ABORTS GONE BY CONSTRUCTION. Zipping the two vectors is
+/// `DT_ERROR("Mismatch in allocate layout vectors")` (`ddc/ddcv1.cpp:1717`); being non-empty is
+/// `layoutDimOrder_.at(0)` (`:1706`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocLayout {
+    first: (PrimaryDim, MaxDimSize),
+    rest: Vec<(PrimaryDim, MaxDimSize)>,
+}
+
+impl AllocLayout {
+    /// An allocation has at least one layout dim, and this is how that is stated.
+    #[must_use]
+    pub const fn new(first: (PrimaryDim, MaxDimSize), rest: Vec<(PrimaryDim, MaxDimSize)>) -> Self {
+        Self { first, rest }
+    }
+
+    /// `layoutDimOrder_.at(0)` — total.
+    #[must_use]
+    pub const fn outermost_dim(&self) -> PrimaryDim {
+        self.first.0
+    }
+
+    /// The dims with their max sizes, outermost first.
+    pub fn iter(&self) -> impl Iterator<Item = (PrimaryDim, MaxDimSize)> + '_ {
+        core::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+
+    /// The same, writable — the `maxDimSizes_[i] = ..` entry 128 performs.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut (PrimaryDim, MaxDimSize)> {
+        core::iter::once(&mut self.first).chain(self.rest.iter_mut())
+    }
+
+    /// `layoutDimOrder_` alone, as [`LayoutDims`].
+    #[must_use]
+    pub fn dims(&self) -> LayoutDims {
+        LayoutDims::new(
+            self.first.0,
+            self.rest.iter().map(|&(dim, _)| dim).collect(),
+        )
+    }
+}
+
+/// AN ALLOCATION'S PER-CORE, PER-CORELET START ADDRESS — `startAddressCoreCorelet_`, a bare
+/// `FoldManager<int64_t>` (`dsc/dsc2.h:985-986`), which is exactly the container [`FoldDim`] reduces
+/// (`CoordinateType` holds one of these per dim, `dsc/dsc2.h:76-145`).
+///
+/// ⭐ ENTRY 128 ONLY COPIES ONE ONTO ANOTHER; entry 259 (`calculateClStartAddress`) is what FILLS it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StartAddress(pub FoldDim);
+
+/// `dsc2::AllocateNode` (`dsc/dsc2.h:974`) narrowed to what the ported units read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocateNode {
     /// `name_`.
     pub name: NodeName,
-    /// `component_`.
+    /// `component_` (`:980`).
     pub component: SenComponent,
-    /// `ldsIdx_`, once its `-1` is an [`Option`].
+    /// `ldsIdx_` (`:976`), once its `-1` is an [`Option`].
     pub lds: Option<LdsIdx>,
+    /// `constIdx_` (`:977`), once its `-1` is an [`Option`].
+    pub const_idx: Option<ConstIdx>,
+    /// `tempStorageForCompute_` (`:978`) — every reader takes its `name_`, so that is what is kept.
+    pub temp_storage_for_compute: Option<NodeName>,
+    /// `layoutDimOrder_` and `maxDimSizes_` AS ONE VALUE — see [`AllocLayout`].
+    pub layout: AllocLayout,
+    /// `startAddressCoreCorelet_` (`:985`).
+    pub start_address: StartAddress,
+    /// `gapStickSpread_` (`:1006`) — per layout dim, how many sticks of gap the data is spread over.
+    pub gap_stick_spread: BTreeMap<PrimaryDim, Sticks>,
+    /// `allocUsers_` (`:1007`), less the `int` beside each entry, which is `addAllocUser`'s REFERENCE
+    /// COUNT (`:1015-1021`) and is not read by any unit ported so far.
+    pub alloc_users: Vec<NodeId>,
 }
 
 /// `dsc2::ComputeNode` (`dsc/dsc2.h:948`) narrowed to what the fold units read.
@@ -349,9 +443,48 @@ pub struct ComputeNode {
     pub inputs: Vec<Operand>,
     /// `outputs_` zipped with `outputsLdsAndLoopOffsets_`.
     pub outputs: Vec<Operand>,
+    /// `numFoldsEngaged` (`dsc/dsc2.h:940`), whose default is ONE and not zero.
+    pub num_folds_engaged: NumFolds,
 }
 
-/// `dsc2::TransferNode` (`dsc/dsc2.h:852`) narrowed to what the fold units read.
+/// A POSITION IN A STICK'S DIM ORDER — `srcSizeIdx_`/`dstSizeIdx_` (`dsc/dsc2.h:821`), an index into
+/// the `getStickSizes` list and NOT a size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StickDimIdx(pub u32);
+
+/// ONE DIM AND HOW MUCH OF IT — `dsc2::Size` (`dsc/dsc2.h:486`), whose `int size_ = -1` default means
+/// UNSET. Every size entry 126 pushes is a positive element count, so this one is not optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    /// `dim_`.
+    pub dim: PrimaryDim,
+    /// `size_`.
+    pub size: Elements,
+}
+
+/// ONE CHUNK OF A UNIT-TIME TRANSFER — `TransferNode::SizeAndIndex` (`dsc/dsc2.h:820`). Both of its
+/// `-1` indices are filled with the same stick-dim position at the one site that pushes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeAndIndex {
+    /// `sizeDim_`.
+    pub size_dim: Size,
+    /// `srcSizeIdx_`.
+    pub src_size_idx: StickDimIdx,
+    /// `dstSizeIdx_`.
+    pub dst_size_idx: StickDimIdx,
+}
+
+/// HOW MANY TIMES ONE UNIT-TIME TRANSFER REPEATS — `replicationFactor_` (`dsc/dsc2.h:834`), whose
+/// default is ONE and not zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReplicationFactor(pub u64);
+
+impl ReplicationFactor {
+    /// `replicationFactor_ = 1` — no replication.
+    pub const ONE: Self = Self(1);
+}
+
+/// `dsc2::TransferNode` (`dsc/dsc2.h:814`) narrowed to what the ported units read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferNode {
     /// `name_`.
@@ -360,6 +493,10 @@ pub struct TransferNode {
     pub src: Operand,
     /// `dstVias_` zipped with `dstLdsAndLoopOffsets_`.
     pub dsts: Dsts,
+    /// `replicationFactor_` (`:834`).
+    pub replication_factor: ReplicationFactor,
+    /// `unitTimeTransferChunkSize_` (`:836`) — the continuous elements within a stick boundary.
+    pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
 }
 
 /// A SCHEDULE NODE, AS THE FOLD UNITS SEE IT — `nodeType_`'s `ALLOCATE`, `COMPUTE` and `TRANSFER`

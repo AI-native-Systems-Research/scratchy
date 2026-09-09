@@ -29,6 +29,32 @@ pub enum IsaGen {
     Sen1p5,
 }
 
+/// WHICH UNIT'S FOLD COUNT — the three keys of `numFoldsPerUnit` (`sys-arch-spec/sysdef.h:160`).
+///
+/// ⛔ CLOSED AT THREE, so `numFoldsPerUnit.at(comp)` cannot throw: both arms of the map's one
+/// `coreArch` test fill exactly `SFP`, `PE` and `PT` (`sysdef.cpp:556-565`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldedUnit {
+    /// `SenComponents::SFP`.
+    Sfp,
+    /// `SenComponents::PE`.
+    Pe,
+    /// `SenComponents::PT`.
+    Pt,
+}
+
+impl IsaGen {
+    /// `sysDef.numFoldsPerUnit.at(unit)` (`sys-arch-spec/sysdef.cpp:556-565`) — one apiece before
+    /// SEN1P5, two for the SFP and the PE from it, and the PT is never folded.
+    #[must_use]
+    pub const fn folds_per_unit(self, unit: FoldedUnit) -> crate::units::NumFolds {
+        match (self, unit) {
+            (Self::Rcudd1a, _) | (Self::Sen1p5, FoldedUnit::Pt) => crate::units::NumFolds::ONE,
+            (Self::Sen1p5, FoldedUnit::Sfp | FoldedUnit::Pe) => crate::units::NumFolds(2),
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // The quantities. THREE UNITS OF LENGTH, AND THEY ARE NOT INTERCHANGEABLE.
 // ───────────────────────────────────────────────────────────────────────────────────────────────

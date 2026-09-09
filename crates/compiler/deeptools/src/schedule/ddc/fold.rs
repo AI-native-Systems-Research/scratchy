@@ -1956,7 +1956,11 @@ mod tests_e078_e085 {
         Extent, PaddedExtent, Sample,
     };
     use crate::generated::{ComputeType, DataConnect};
-    use crate::schedule::dsc2::{AllocateNode, DataInfo, Dsts, FoldPosition, LayoutDims, NodeName};
+    use crate::schedule::dsc2::{
+        AllocLayout, AllocateNode, DataInfo, Dsts, FoldPosition, LayoutDims, MaxDimSize, NodeName,
+        ReplicationFactor, StartAddress,
+    };
+    use crate::units::NumFolds;
 
     /// One labelled data structure whose layout order is `[out, in]`, which is all
     /// `getLayoutDims` is ever asked for here.
@@ -2006,6 +2010,7 @@ mod tests_e078_e085 {
             data: DataInfo {
                 data_connect: connect,
                 my_lds_idx: lds.map(LdsIdx),
+                constant_id: None,
             },
         }
     }
@@ -2021,6 +2026,7 @@ mod tests_e078_e085 {
                 operand(SenComponent::Lx, None, None),
             ],
             outputs: vec![operand(SenComponent::Ptsouth, None, None)],
+            num_folds_engaged: NumFolds::ONE,
         };
         assert_eq!(
             dbg_print_compute(&node),
@@ -2041,6 +2047,8 @@ mod tests_e078_e085 {
                 operand(SenComponent::Lx, None, None),
                 vec![operand(SenComponent::L0, None, None)],
             ),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
         };
         assert_eq!(
             dbg_print_transfer(&node),
@@ -2124,6 +2132,12 @@ mod tests_e078_e085 {
             name: NodeName("a0".to_owned()),
             component: SenComponent::Lx,
             lds: Some(LdsIdx(0)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new((PrimaryDim::Out, MaxDimSize::Unset), Vec::new()),
+            start_address: StartAddress::default(),
+            gap_stick_spread: Default::default(),
+            alloc_users: Vec::new(),
         };
         let compute = ComputeNode {
             name: NodeName("c0".to_owned()),
@@ -2131,11 +2145,14 @@ mod tests_e078_e085 {
             ex_unit: SenComponent::Ptrow2,
             inputs: vec![],
             outputs: vec![],
+            num_folds_engaged: NumFolds::ONE,
         };
         let transfer = TransferNode {
             name: NodeName("t0".to_owned()),
             src: operand(SenComponent::Hbm, None, None),
             dsts: Dsts::new(operand(SenComponent::L0, None, None), vec![]),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
         };
         assert_eq!(
             component(Node::Allocate(&alloc), TransferSide::Src),
@@ -2167,6 +2184,7 @@ mod tests_e078_e085 {
                 operand(SenComponent::Lx, None, None),
             ],
             outputs: vec![],
+            num_folds_engaged: NumFolds::ONE,
         };
         let node = Node::Compute(&compute);
         assert_eq!(
