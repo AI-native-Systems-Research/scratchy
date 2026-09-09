@@ -137,9 +137,10 @@ use crate::arch::Elements;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     AbsoluteMin, Constraint, ConstraintKind, DimSet, NoEpilogueDimKind, PrimaryDim,
 };
-use crate::generated::{DataConnect, MaxUnroll, OpFunc, OpaqueReg, RegName, Strategy};
+use crate::generated::{DataConnect, MaxUnroll, OpaqueReg, RegName, Strategy};
 use crate::schedule::dsc2::{LdsIdx, NodeName};
 use std::collections::{BTreeMap, BTreeSet};
+use sys_arch_spec::arch_enums::OpFunc;
 
 // ═══ `Constraints` — THE FIELDS `dump` OBSERVES, AND THE THREE UPDATERS ══════════════════════════
 
@@ -843,6 +844,10 @@ pub struct Metadata {
     /// one (`ddc/ddcv1.cpp:2341-2345`).
     pub below_lx_schedule_insert_block: Option<BlockId>,
     /// `opFuncBackup_` (:221) — `OpFuncs::NONE` is none.
+    ///
+    /// ⛔ THE FULL `OpFuncs`, NOT [`crate::generated::OpFunc`]: the only value the reference ever
+    /// stores here is `EXX2` (`ddc/ddcv1.cpp:2064-2078`), which the DDL census does not carry, so the
+    /// censused enum cannot express what entry 132 puts back.
     pub op_func_backup: Option<OpFunc>,
     /// `transformationConfig_` (:229).
     pub transformation_config: TransformationConfig,

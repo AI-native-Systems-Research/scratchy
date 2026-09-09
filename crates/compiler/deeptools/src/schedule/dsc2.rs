@@ -23,6 +23,7 @@ use sys_arch_spec::arch_enums::SenComponent;
 
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::generated::{ComputeType, DataConnect};
+use crate::islands::dataflow_ir::ty::GenericComp;
 
 impl PrimaryDim {
     /// Every layout dim IN `PrimaryDimTypes`' OWN ORDINAL ORDER (`dsc/dims.h:34`), which is what a
@@ -443,4 +444,138 @@ impl LayoutDims {
 pub trait Dsc {
     /// `DesignSpaceConfig::getLayoutDims(ldsIdx)`.
     fn layout_dims(&self, lds: LdsIdx) -> LayoutDims;
+}
+
+/// WHICH GENERIC COMPONENT A `SenComponents` IS — `EnumsConversion::senCompToGenericComp`
+/// (`sys-arch-spec/arch_enums.cpp:124-211`), the map every predicate over a node's units consults.
+///
+/// ⭐ IT IS A FREE FUNCTION AND NOT A METHOD because [`SenComponent`] is another crate's type;
+/// [`crate::generated::Unit::generic`] is the same map over the DDL-censused subset, and the two are
+/// one table read through two vocabularies.
+///
+/// ⛔ [`None`] IS "NO NAME FOR ITS IMAGE", NOT "NO IMAGE". Nine components map to register-file and
+/// buffer images ([`SenComponent::Lrfreg`] and its three per-unit spellings, `SFPLRF`, `PELRF`,
+/// `PTARF`, `PTXRF`, `LXLUSCALEREG`, `LXLUVALUE`, `L3IBR`, `QGI`) that [`GenericComp`] does not name,
+/// and the remaining components are not keys of the reference map at all — `senCompToGenericComp
+/// .at(comp)` THROWS for them. Every rule built on this asks `== <a named component>`, so "no name"
+/// and "a different component" are one answer and the throw never has to be reproduced.
+///
+/// ⛔ `L0`, `CONSTANT` AND `SFPRING` ANSWER THEMSELVES rather than [`None`]: they are not keys of the
+/// reference map either, but [`GenericComp`] already names them for exactly that reason (see its
+/// own note), so this stays consistent with the crate's other reading of the table.
+/// ⛔ AND `PTNORTH`/`PTWEST`/`PTSOUTH` ARE *NOT* KEYS. [`crate::generated::Unit::generic`] folds the
+/// north and south links into `Pt`; the reference table has no entry for any of the three, so they
+/// answer [`None`] here.
+#[must_use]
+pub const fn generic_comp(unit: SenComponent) -> Option<GenericComp> {
+    match unit {
+        // `:125-127` — the SFP and its two per-corelet copies.
+        SenComponent::Sfp | SenComponent::Sfp0 | SenComponent::Sfp1 => Some(GenericComp::Sfp),
+        // `:128-152` — EVERY PT row, in the bare spelling and in both per-fold copies.
+        SenComponent::Pt
+        | SenComponent::Ptrow0
+        | SenComponent::Ptrow1
+        | SenComponent::Ptrow2
+        | SenComponent::Ptrow3
+        | SenComponent::Ptrow4
+        | SenComponent::Ptrow5
+        | SenComponent::Ptrow6
+        | SenComponent::Ptrow7
+        | SenComponent::Ptrow0_0
+        | SenComponent::Ptrow1_0
+        | SenComponent::Ptrow2_0
+        | SenComponent::Ptrow3_0
+        | SenComponent::Ptrow4_0
+        | SenComponent::Ptrow5_0
+        | SenComponent::Ptrow6_0
+        | SenComponent::Ptrow7_0
+        | SenComponent::Ptrow0_1
+        | SenComponent::Ptrow1_1
+        | SenComponent::Ptrow2_1
+        | SenComponent::Ptrow3_1
+        | SenComponent::Ptrow4_1
+        | SenComponent::Ptrow5_1
+        | SenComponent::Ptrow6_1
+        | SenComponent::Ptrow7_1 => Some(GenericComp::Pt),
+        // `:160-162` — the state components are their own images.
+        SenComponent::Sfpstate => Some(GenericComp::SfpState),
+        SenComponent::Pestate => Some(GenericComp::PeState),
+        // `:165-167` — the PE and its two per-corelet copies.
+        SenComponent::Pe | SenComponent::Pe0 | SenComponent::Pe1 => Some(GenericComp::Pe),
+        // `:168-176` — ⛔ THE LOAD HALF AND THE STORE HALF ARE DIFFERENT IMAGES.
+        SenComponent::Lxlu | SenComponent::Lxlu0 | SenComponent::Lxlu1 => Some(GenericComp::Lxlu),
+        SenComponent::Lxsu | SenComponent::Lxsu0 | SenComponent::Lxsu1 => Some(GenericComp::Lxsu),
+        SenComponent::Lx => Some(GenericComp::Lx),
+        // `:177-204` — the L0 load unit, every row spelling of it, and the store half.
+        SenComponent::L0lu
+        | SenComponent::L0lu0
+        | SenComponent::L0lu1
+        | SenComponent::L0lurow0
+        | SenComponent::L0lurow1
+        | SenComponent::L0lurow2
+        | SenComponent::L0lurow3
+        | SenComponent::L0lurow4
+        | SenComponent::L0lurow5
+        | SenComponent::L0lurow6
+        | SenComponent::L0lurow7
+        | SenComponent::L0lurow0_0
+        | SenComponent::L0lurow1_0
+        | SenComponent::L0lurow2_0
+        | SenComponent::L0lurow3_0
+        | SenComponent::L0lurow4_0
+        | SenComponent::L0lurow5_0
+        | SenComponent::L0lurow6_0
+        | SenComponent::L0lurow7_0
+        | SenComponent::L0lurow0_1
+        | SenComponent::L0lurow1_1
+        | SenComponent::L0lurow2_1
+        | SenComponent::L0lurow3_1
+        | SenComponent::L0lurow4_1
+        | SenComponent::L0lurow5_1
+        | SenComponent::L0lurow6_1
+        | SenComponent::L0lurow7_1 => Some(GenericComp::L0lu),
+        SenComponent::L0su | SenComponent::L0su0 | SenComponent::L0su1 => Some(GenericComp::L0su),
+        // `:205-209` — the L3 halves, the HBM and the virtual IBR.
+        SenComponent::L3lu => Some(GenericComp::L3lu),
+        SenComponent::L3su => Some(GenericComp::L3su),
+        SenComponent::Hbm => Some(GenericComp::Hbm),
+        SenComponent::Lxvirtualibr => Some(GenericComp::LxVirtualIbr),
+        // `:210` — the link out of this partition.
+        SenComponent::Crossptnlink => Some(GenericComp::CrossPtnLink),
+        // ⛔ NOT KEYS, but [`GenericComp`] names them; see this function's note.
+        SenComponent::L0 => Some(GenericComp::L0),
+        SenComponent::Constant => Some(GenericComp::Constant),
+        SenComponent::Sfpring => Some(GenericComp::SfpRing),
+        // The register-file and buffer images [`GenericComp`] does not name, and every component the
+        // reference map has no key for.
+        SenComponent::Lrfreg
+        | SenComponent::PeLrfreg
+        | SenComponent::SfpLrfreg
+        | SenComponent::PtLrfreg
+        | SenComponent::Sfplrf
+        | SenComponent::Pelrf
+        | SenComponent::Ptarf
+        | SenComponent::Ptxrf
+        | SenComponent::Lxluscalereg
+        | SenComponent::Lxluvalue
+        | SenComponent::L3ibr
+        | SenComponent::Qgi
+        | SenComponent::NoComponent
+        | SenComponent::Ring
+        | SenComponent::Zero
+        | SenComponent::L3
+        | SenComponent::L3luibr
+        | SenComponent::L3suibr
+        | SenComponent::Lxlusufifo
+        | SenComponent::Ptirf
+        | SenComponent::Ptnorth
+        | SenComponent::Ptwest
+        | SenComponent::Ptsouth
+        | SenComponent::All
+        | SenComponent::One
+        | SenComponent::Latch
+        | SenComponent::Nfwd0
+        | SenComponent::Nfwd2
+        | SenComponent::L0Scale => None,
+    }
 }

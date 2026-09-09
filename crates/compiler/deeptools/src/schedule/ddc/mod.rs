@@ -137,7 +137,7 @@ pub mod metadata;
 pub mod shuffle;
 pub mod transformation;
 pub(crate) mod transformation_util;
-pub(crate) mod v1;
+pub mod v1;
 
 // crustify:todo: e230_addPropInfo
 //   authority : ddc/ddc.h:430  (4 body lines, level 1)
