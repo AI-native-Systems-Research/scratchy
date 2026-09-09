@@ -50,11 +50,12 @@ impl<const CORES: u32> CoreId<CORES> {
     ///
     /// ⛔⛔ THIS METHOD EXISTS BECAUSE THE VENDOR WROTE THE STEP AS A DIVISION. `printTrafficPerCore`
     /// walks the CCW arc with `int ccoreId = (c + coreID) / 32;` in both of its CCW arms
-    /// (`dcg/dcg_fe/pcfg_gen/stcdpOp.cpp:5889,5904`) — a typo for `%` that charges every hop landing
-    /// below core 32 to core 0. Its own second copy of the identical walk writes
-    /// `% (int)maxNumCores` (`dcg/dcg_fe/pcfg_gen/inputNeighFetchOp.cpp:2294,2308,2318`), and the CW
-    /// arm three lines below it wraps by hand. One CCW hop is core `i` to core `i + 1`
-    /// (`dsc/dataOpDsc.h:216`); with the step in the type, `/` is no longer a thing to write.
+    /// (`dcg/dcg_fe/pcfg_gen/stcdpOp.cpp:5889`, `:5904`) — a typo for `%` that charges every hop
+    /// landing below core 32 to core 0. Its own second copy of the identical walk writes
+    /// `% (int)maxNumCores` (`dcg/dcg_fe/pcfg_gen/inputNeighFetchOp.cpp:2294`, `:2308`, `:2318`), and
+    /// the CW arm of the same `if` chain wraps by hand (`stcdpOp.cpp:5897-5898`, `:5909-5910`). One
+    /// CCW hop is core `i` to core `i + 1` (`dsc/dataOpDsc.h:215`); with the step in the type, `/` is
+    /// no longer a thing to write.
     #[must_use]
     pub const fn step_ccw(self, hops: u32) -> CoreId<CORES> {
         CoreId(Bounded::wrapping(self.0.get() + hops % CORES))
