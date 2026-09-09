@@ -134,7 +134,7 @@
 
 pub mod fold;
 pub mod metadata;
-pub(crate) mod shuffle;
+pub mod shuffle;
 pub(crate) mod transformation;
 pub(crate) mod transformation_util;
 pub(crate) mod v1;

@@ -173,52 +173,578 @@
 //! | `e362_get_shuffle` | 362 | 4 | 61 | `AutoShuffler` | `ddc/transformations/automatic_shuffle/shuffle.cpp:1161` |
 //! | `e371_replace_assign` | 371 | 5 | 119 | `AutoShuffler` | `ddc/transformations/automatic_shuffle/shuffle.cpp:788` |
 
+use crate::arch::Sticks;
+use crate::generated::DataType;
+use std::collections::{BTreeMap, BTreeSet};
 
-// crustify:todo: e137_int_log2
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:95  (9 body lines, level 0)
-//   original  : int int_log2(int x)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2573-2582
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// THE LAYOUT VOCABULARY THESE UNITS ACT ON — `shuffle.h:26-110`, `shuffle.cpp:19-122`.
+//
+// Declarations, not units. This file's units are the anchors; the members that ARE units
+// (`AbstractLayout::contains` e156, `DimSymbol::getDefaultSymbols` e162) stay unfilled below.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
 
-// crustify:todo: e138_swap
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:121  (1 body lines, level 0)
-//   class     : SwapBuffer
-//   original  : void swap()
-//   extract   : crustify-ddc/cpp/ddc.cpp:2592-2593
+/// A 2-ELEMENT (SUB)DIMENSION of a slice or of a stick array (`shuffle.h:26`).
+///
+/// Symbol 0 is the dummy: a place in the layout no live dimension claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DimSymbol(i32);
 
-// crustify:todo: e139_packmerge_psuedostring
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:124  (9 body lines, level 0)
-//   original  : std::string packmerge_psuedostring(const std::vector<int> indices, const std::string& in_reg_1, const std::string& in_reg_2, const std::string& out_reg_name)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2602-2614
+impl DimSymbol {
+    /// `DimSymbol::getDummy()` (`shuffle.h:44`).
+    pub const DUMMY: Self = Self(0);
+    /// `DimSymbol::getDefaultSymbol()` (`shuffle.h:45`).
+    pub const DEFAULT: Self = Self(1);
 
-// crustify:todo: e140_repeat_over_dims
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:178  (26 body lines, level 0)
-//   class     : ComputationOp
-//   original  : void ComputationOp::repeat_over_dims( const std::vector<DimSymbol>& dims, std::vector<ComputationOp>& append_to) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:2624-2652
+    /// `is_dummy()` (`shuffle.h:35`).
+    #[must_use]
+    pub const fn is_dummy(self) -> bool {
+        self.0 == Self::DUMMY.0
+    }
 
-// crustify:todo: e141_act
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:249  (16 body lines, level 0)
-//   class     : MergeAction
-//   original  : AbstractLayout act(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2662-2678
+    /// `next()` (`shuffle.h:36`) — the next symbol in a minting run.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
 
-// crustify:todo: e142_cost
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:266  (6 body lines, level 0)
-//   class     : MergeAction
-//   original  : double cost(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2688-2694
+    /// `getID()` (`shuffle.h:43`).
+    #[must_use]
+    pub const fn id(self) -> i32 {
+        self.0
+    }
+}
 
-// crustify:todo: e143_get_shuffle_indices
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:275  (29 body lines, level 0)
-//   class     : MergeAction
-//   original  : std::vector<int> get_shuffle_indices(bool high)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2704-2733
+/// WHICH HALF of a split dimension a stick holds — the reference's `bool high` (`shuffle.h:60`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Half {
+    /// `high == false`.
+    Low,
+    /// `high == true`.
+    High,
+}
 
-// crustify:todo: e144_act
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:351  (10 body lines, level 0)
-//   class     : PackAction
-//   original  : AbstractLayout act(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2743-2753
+/// A (PARTIAL) STICK INDEX — `std::set<DimIndex, DimIndexDimComparator>` (`shuffle.h:63-69`).
+///
+/// ⛔ KEYED BY DIMENSION ALONE, so inserting a dimension already present is a NO-OP that KEEPS the
+/// half already recorded — `std::set::insert` does not overwrite, and `repeat_over_dims` inserts
+/// into indices it has already filled.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StickIndex(BTreeMap<DimSymbol, Half>);
+
+impl StickIndex {
+    /// The empty index — `emplace_back()` on an `inputs` list (`shuffle.cpp:162`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// `insert({dim, half})`, which keeps the existing half for a dimension already indexed.
+    pub fn insert(&mut self, dim: DimSymbol, half: Half) {
+        self.0.entry(dim).or_insert(half);
+    }
+
+    /// The indexed dimensions and their halves, in dimension order.
+    pub fn iter(&self) -> impl Iterator<Item = (DimSymbol, Half)> + '_ {
+        self.0.iter().map(|(dim, half)| (*dim, *half))
+    }
+
+    /// Which half this index takes of `dim`, absent when it does not index it.
+    #[must_use]
+    pub fn half_of(&self, dim: DimSymbol) -> Option<Half> {
+        self.0.get(&dim).copied()
+    }
+}
+
+impl FromIterator<(DimSymbol, Half)> for StickIndex {
+    fn from_iter<I: IntoIterator<Item = (DimSymbol, Half)>>(iter: I) -> Self {
+        let mut index = Self::new();
+        for (dim, half) in iter {
+            index.insert(dim, half);
+        }
+        index
+    }
+}
+
+/// HOW MANY SUBDIMENSIONS ONE SLICE HAS — `dims_per_slice = 6 == log2(bits_per_slice)`
+/// (`shuffle.cpp:90-91`).
+pub const DIMS_PER_SLICE: usize = 6;
+
+/// WHICH SUBDIMENSION OF A SLICE — the reference's `dim_2bit`..`dim_64bit` (`shuffle.cpp:78-83`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SliceDim {
+    /// `dim_2bit = 0`.
+    Bit2,
+    /// `dim_4bit = 1`.
+    Bit4,
+    /// `dim_8bit = 2`.
+    Bit8,
+    /// `dim_16bit = 3`.
+    Bit16,
+    /// `dim_32bit = 4`.
+    Bit32,
+    /// `dim_64bit = 5`.
+    Bit64,
+}
+
+impl SliceDim {
+    /// Its position in the slice, which is the integer the reference indexes with.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// A LAYOUT WITH ITS DIMENSIONS AS SYMBOLS — stick dimensions unordered, slice dimensions ordered
+/// by significance (`shuffle.h:81`).
+///
+/// ⛔ THE SLICE IS EXACTLY SIX SUBDIMENSIONS, AS AN ARRAY. The reference `DT_CHECK`s that length
+/// (`shuffle.cpp:692-693`, `:1165-1166`) and every `act` restores it after its erase/insert pair,
+/// so it is an invariant of the type here rather than a check someone remembers.
+///
+/// ⛔ FIELD ORDER IS LOAD-BEARING: `operator<` compares format, then stick dims, then slice dims
+/// (`shuffle.h:105-109`), and that is what the derived `Ord` reproduces.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AbstractLayout {
+    /// The element format the sticks are in.
+    pub format: DataType,
+    /// The dimensions taken across sticks. Order carries no meaning in the abstraction.
+    pub stick_dims: BTreeSet<DimSymbol>,
+    /// The dimensions within a slice, least significant first.
+    pub slice_dims: [DimSymbol; DIMS_PER_SLICE],
+}
+
+impl AbstractLayout {
+    /// `AbstractLayout(stick, slice, format)` (`shuffle.h:90`).
+    #[must_use]
+    pub fn new(
+        stick_dims: BTreeSet<DimSymbol>,
+        slice_dims: [DimSymbol; DIMS_PER_SLICE],
+        format: DataType,
+    ) -> Self {
+        Self {
+            format,
+            stick_dims,
+            slice_dims,
+        }
+    }
+
+    /// The dimension occupying one slice subdimension — `sliceDims()[i]`.
+    #[must_use]
+    pub const fn slice_dim(&self, at: SliceDim) -> DimSymbol {
+        self.slice_dims[at.index()]
+    }
+
+    /// `numSticks() = 1u << stick_dims.size()` (`shuffle.h:96`). The reference's own cap on that
+    /// size is 32 (`make_stick_number_key`, `shuffle.cpp:731`).
+    #[must_use]
+    pub fn num_sticks(&self) -> Sticks {
+        Sticks(1u64 << self.stick_dims.len())
+    }
+}
+
+/// WHAT AN ACTION COSTS — Dijkstra's edge weight, the reference's `double` (`shuffle.h:230`).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct ShuffleCost(pub f64);
+
+/// ONE LANE SELECTOR of a `packmerge` index table; `-1` selects nothing (`shuffle.cpp:19-76`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShuffleIndex(pub i32);
+
+/// The vendored tables as written, so a transcription error is visible against `shuffle.cpp`.
+const fn indices<const N: usize>(raw: [i32; N]) -> [ShuffleIndex; N] {
+    let mut out = [ShuffleIndex(0); N];
+    let mut i = 0;
+    while i < N {
+        out[i] = ShuffleIndex(raw[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `merge8h` (`shuffle.cpp:30`).
+const MERGE8H: [ShuffleIndex; 16] =
+    indices([1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31]);
+/// `merge8l` (`shuffle.cpp:32`).
+const MERGE8L: [ShuffleIndex; 16] =
+    indices([0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30]);
+/// `merge16h` (`shuffle.cpp:48`).
+const MERGE16H: [ShuffleIndex; 8] = indices([1, 9, 3, 11, 5, 13, 7, 15]);
+/// `merge16l` (`shuffle.cpp:49`).
+const MERGE16L: [ShuffleIndex; 8] = indices([0, 8, 2, 10, 4, 12, 6, 14]);
+/// `merge32h` (`shuffle.cpp:50`).
+const MERGE32H: [ShuffleIndex; 8] = indices([2, 3, 10, 11, 6, 7, 14, 15]);
+/// `merge32l` (`shuffle.cpp:51`).
+const MERGE32L: [ShuffleIndex; 8] = indices([0, 1, 8, 9, 4, 5, 12, 13]);
+/// `merge64h` (`shuffle.cpp:52`).
+const MERGE64H: [ShuffleIndex; 8] = indices([4, 5, 6, 7, 12, 13, 14, 15]);
+/// `merge64l` (`shuffle.cpp:53`).
+const MERGE64L: [ShuffleIndex; 8] = indices([0, 1, 2, 3, 8, 9, 10, 11]);
+
+/// A PSEUDOCODE REGISTER NAME — `r0`, `r1`, .. as `codegen_psuedocode` mints them
+/// (`shuffle.cpp:1229-1234`).
+///
+/// ⛔ NOT [`crate::generated::RegName`], which is a template's declared register set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PseudoReg(pub String);
+
+/// ONE STICK COMPUTATION — which (partial) stick indices it reads, and which it writes
+/// (`shuffle.h:199`).
+///
+/// The two `codegen` closures the reference carries are attached by e264/e265, which build the
+/// `packmerge` ops; `repeat_over_dims` copies whatever the op holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComputationOp {
+    /// The (partial) stick indices for the inputs.
+    pub inputs: Vec<StickIndex>,
+    /// The (partial) stick index for the output. Several ops are used for several outputs.
+    pub output: StickIndex,
+    /// Whether the op reads one stick more than once (`unary_op`, `shuffle.cpp:163`).
+    pub reuses_sticks: bool,
+}
+
+/// Replaces: e137_int_log2
+///
+/// Floor of log2, and `-1` for `x <= 0` — the reference's own documented answer
+/// (`shuffle.cpp:94`), which its callers rely on for a `stickSize_` of 0.
+#[must_use]
+pub const fn int_log2(x: i32) -> i32 {
+    if x <= 0 {
+        -1
+    } else {
+        (i32::BITS - 1 - x.leading_zeros()) as i32
+    }
+}
+
+/// A PAIR OF SLOTS WITH ONE ACTIVE — `SwapBuffer<T>` (`shuffle.cpp:109-122`), which `codegen_generic`
+/// uses to route this action's output edges into the next action's inputs.
+///
+/// ⛔ THE DEFAULT IS `flag = true`, NOT `false` (`shuffle.cpp:112`): a derived `Default` would hand
+/// back `b` where the reference hands back `a`, silently transposing the first action's edges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapBuffer<T> {
+    flag: bool,
+    a: T,
+    b: T,
+}
+
+impl<T: Default> Default for SwapBuffer<T> {
+    fn default() -> Self {
+        Self {
+            flag: true,
+            a: T::default(),
+            b: T::default(),
+        }
+    }
+}
+
+impl<T> SwapBuffer<T> {
+    /// `SwapBuffer(a, b)` (`shuffle.cpp:118`).
+    pub const fn new(a: T, b: T) -> Self {
+        Self { flag: true, a, b }
+    }
+
+    /// `first()` (`shuffle.cpp:119`).
+    pub const fn first(&self) -> &T {
+        if self.flag { &self.a } else { &self.b }
+    }
+
+    /// `first()` as the reference's mutable reference.
+    pub const fn first_mut(&mut self) -> &mut T {
+        if self.flag { &mut self.a } else { &mut self.b }
+    }
+
+    /// `second()` (`shuffle.cpp:120`).
+    pub const fn second(&self) -> &T {
+        if self.flag { &self.b } else { &self.a }
+    }
+
+    /// `second()` as the reference's mutable reference.
+    pub const fn second_mut(&mut self) -> &mut T {
+        if self.flag { &mut self.b } else { &mut self.a }
+    }
+
+    /// Replaces: e138_swap
+    ///
+    /// Exchanges the two slots, so what `second()` answered is what `first()` answers next.
+    pub const fn swap(&mut self) {
+        self.flag = !self.flag;
+    }
+}
+
+/// Replaces: e139_packmerge_psuedostring
+///
+/// One pseudocode line: `<out> = packmerge <in1> <in2> [ i i .. ]`, one space after every index.
+#[must_use]
+pub fn packmerge_psuedostring(
+    indices: &[ShuffleIndex],
+    in_reg_1: &PseudoReg,
+    in_reg_2: &PseudoReg,
+    out_reg_name: &PseudoReg,
+) -> String {
+    let mut line = format!(
+        "{} = packmerge {} {} [ ",
+        out_reg_name.0, in_reg_1.0, in_reg_2.0
+    );
+    for index in indices {
+        line.push_str(&format!("{} ", index.0));
+    }
+    line.push(']');
+    line
+}
+
+impl ComputationOp {
+    /// Replaces: e140_repeat_over_dims
+    ///
+    /// Appends this op once per assignment of the `dims` it does not already index — 2^N copies for
+    /// N absent dimensions, each copy differing in which half of one dimension it takes.
+    ///
+    /// ⛔ THE ABSENT SET IS COMPUTED FROM `inputs` ALONE (`shuffle.cpp:184-188`), so a dimension the
+    /// OUTPUT already indexes is still split; the insert that would collide is the no-op
+    /// [`StickIndex::insert`] documents.
+    pub fn repeat_over_dims(&self, dims: &[DimSymbol], append_to: &mut Vec<Self>) {
+        let original_size = append_to.len();
+        append_to.push(self.clone());
+        let mut dim_set: BTreeSet<DimSymbol> = BTreeSet::new();
+        for input in &self.inputs {
+            for (dim, _) in input.iter() {
+                dim_set.insert(dim);
+            }
+        }
+        for &dim in dims {
+            if dim_set.contains(&dim) {
+                continue;
+            }
+            let dim_stop = append_to.len();
+            for i in original_size..dim_stop {
+                let mut high_copy = append_to[i].clone();
+                for input in &mut append_to[i].inputs {
+                    input.insert(dim, Half::Low);
+                }
+                append_to[i].output.insert(dim, Half::Low);
+                for input in &mut high_copy.inputs {
+                    input.insert(dim, Half::High);
+                }
+                high_copy.output.insert(dim, Half::High);
+                append_to.push(high_copy);
+            }
+        }
+    }
+}
+
+/// WHICH SUBDIMENSION A MERGE ACTS ON — the four the ISA has a merge instruction for.
+///
+/// ⛔ THIS IS THE REFERENCE'S `DT_ERROR("Tried to use illegal merge instruction")`
+/// (`shuffle.cpp:287`, `:300`) MADE UNREPRESENTABLE. Its only construction site loops from
+/// `max(dim_8bit, bitwidth_to_idx(bw))` (`shuffle.cpp:230-232`), so a `MergeAction` never holds the
+/// 2- or 4-bit slot and `get_shuffle_indices` needs no failing arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MergeDim {
+    /// `dim_8bit`, using `merge8l`/`merge8h`.
+    Bit8,
+    /// `dim_16bit`, using `merge16l`/`merge16h`.
+    Bit16,
+    /// `dim_32bit`, using `merge32l`/`merge32h`.
+    Bit32,
+    /// `dim_64bit`, using `merge64l`/`merge64h`.
+    Bit64,
+}
+
+impl MergeDim {
+    /// The slice subdimension it names.
+    #[must_use]
+    pub const fn slice(self) -> SliceDim {
+        match self {
+            Self::Bit8 => SliceDim::Bit8,
+            Self::Bit16 => SliceDim::Bit16,
+            Self::Bit32 => SliceDim::Bit32,
+            Self::Bit64 => SliceDim::Bit64,
+        }
+    }
+}
+
+/// WHAT BECOMES OF THE DIMENSION A MERGE DISPLACES — the reference's `bool swap`.
+///
+/// ⛔ `swap` IS NEVER SET WITH A DUMMY DISPLACED DIMENSION: its one construction site computes
+/// `swap = !input.sliceDims()[i].is_dummy()` (`shuffle.cpp:233`), which is exactly the pair of
+/// `DT_CHECK`s at `:250` and `:259`. Both are structural here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMode {
+    /// The slot held a dummy: the stick dimension moves in and nothing comes out.
+    Fill,
+    /// The slot held this live dimension, which is extracted into the sticks.
+    Extract(DimSymbol),
+}
+
+/// MOVES A STICK DIMENSION INTO ONE SLICE SUBDIMENSION, optionally extracting the dimension it
+/// displaces back into the sticks — `merge8L`/`merge8H` and friends (`shuffle.cpp:207-219`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeAction {
+    stick_dim: DimSymbol,
+    slice: MergeDim,
+    mode: MergeMode,
+}
+
+impl MergeAction {
+    /// `MergeAction(stick_dim, slice_dim, slice_idx, extract_slice_to_stick)` (`shuffle.cpp:240`),
+    /// taking the displaced dimension as the construction site reads it (`shuffle.cpp:233-235`).
+    #[must_use]
+    pub const fn new(stick_dim: DimSymbol, slice: MergeDim, displaced: DimSymbol) -> Self {
+        Self {
+            stick_dim,
+            slice,
+            mode: if displaced.is_dummy() {
+                MergeMode::Fill
+            } else {
+                MergeMode::Extract(displaced)
+            },
+        }
+    }
+
+    /// The stick dimension being merged in.
+    #[must_use]
+    pub const fn stick_dim(&self) -> DimSymbol {
+        self.stick_dim
+    }
+
+    /// Which subdimension it merges on.
+    #[must_use]
+    pub const fn slice(&self) -> MergeDim {
+        self.slice
+    }
+
+    /// Whether it also extracts the displaced dimension, and which one.
+    #[must_use]
+    pub const fn mode(&self) -> MergeMode {
+        self.mode
+    }
+
+    /// Replaces: e141_act
+    ///
+    /// The stick dimension takes the slice slot; in [`MergeMode::Extract`] the dimension it
+    /// displaced joins the stick dimensions, otherwise that slot's dummy is dropped.
+    #[must_use]
+    pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
+        let mut output = input.clone();
+        if !self.stick_dim.is_dummy() {
+            output.stick_dims.remove(&self.stick_dim);
+        }
+        let evicted_dim = output.slice_dim(self.slice.slice());
+        output.slice_dims[self.slice.slice().index()] = self.stick_dim;
+        if matches!(self.mode, MergeMode::Extract(_)) {
+            output.stick_dims.insert(evicted_dim);
+        }
+        output
+    }
+
+    /// Replaces: e142_cost
+    ///
+    /// One instruction per two input sticks, or one per stick when the merge also extracts.
+    ///
+    /// ⛔ INTEGER DIVISION, AS THE REFERENCE HAS IT (`shuffle.cpp:268`): a one-stick layout costs
+    /// 0, not 0.5.
+    #[must_use]
+    pub fn cost(&self, input: &AbstractLayout) -> ShuffleCost {
+        let sticks = input.num_sticks().0;
+        match self.mode {
+            MergeMode::Fill => ShuffleCost((sticks / 2) as f64),
+            MergeMode::Extract(_) => ShuffleCost(sticks as f64),
+        }
+    }
+
+    /// Replaces: e143_get_shuffle_indices
+    ///
+    /// The vector-shuffle table for the low or the high half of this merge.
+    #[must_use]
+    pub const fn get_shuffle_indices(&self, half: Half) -> &'static [ShuffleIndex] {
+        match (self.slice, half) {
+            (MergeDim::Bit8, Half::Low) => &MERGE8L,
+            (MergeDim::Bit8, Half::High) => &MERGE8H,
+            (MergeDim::Bit16, Half::Low) => &MERGE16L,
+            (MergeDim::Bit16, Half::High) => &MERGE16H,
+            (MergeDim::Bit32, Half::Low) => &MERGE32L,
+            (MergeDim::Bit32, Half::High) => &MERGE32H,
+            (MergeDim::Bit64, Half::Low) => &MERGE64L,
+            (MergeDim::Bit64, Half::High) => &MERGE64H,
+        }
+    }
+}
+
+/// WHICH SUBDIMENSION A PACK INSERTS AT — the three `pack25`/`pack26`/`pack27` reach.
+///
+/// ⛔ THE REFERENCE'S `DT_ERROR("Tried to use illegal pack action")` (`shuffle.cpp:375`) MADE
+/// UNREPRESENTABLE: `add_valid_actions` loops `dim_16bit..=dim_64bit` (`shuffle.cpp:341`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PackDim {
+    /// `dim_16bit`, using `pack27`.
+    Bit16,
+    /// `dim_32bit`, using `pack26`.
+    Bit32,
+    /// `dim_64bit`, using `pack25`.
+    Bit64,
+}
+
+impl PackDim {
+    /// The slice subdimension it names.
+    #[must_use]
+    pub const fn slice(self) -> SliceDim {
+        match self {
+            Self::Bit16 => SliceDim::Bit16,
+            Self::Bit32 => SliceDim::Bit32,
+            Self::Bit64 => SliceDim::Bit64,
+        }
+    }
+}
+
+/// INSERTS A STICK DIMENSION INTO THE SLICE AND SLIDES THE DIMENSIONS BELOW IT RIGHT — `pack25`,
+/// `pack26`, `pack27` (`shuffle.cpp:322-326`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackAction {
+    stick_dim: DimSymbol,
+    slice: PackDim,
+}
+
+impl PackAction {
+    /// `PackAction(stick_dim, slice_idx)` (`shuffle.cpp:347`).
+    #[must_use]
+    pub const fn new(stick_dim: DimSymbol, slice: PackDim) -> Self {
+        Self { stick_dim, slice }
+    }
+
+    /// The stick dimension being packed in.
+    #[must_use]
+    pub const fn stick_dim(&self) -> DimSymbol {
+        self.stick_dim
+    }
+
+    /// Which subdimension it inserts above.
+    #[must_use]
+    pub const fn slice(&self) -> PackDim {
+        self.slice
+    }
+
+    /// Replaces: e144_act
+    ///
+    /// The stick dimension lands at `slice`, the subdimensions from the 8-bit slot up to it shift
+    /// one place down, and what the 8-bit slot held is dropped.
+    ///
+    /// ⛔ THAT IS THE REFERENCE'S `insert(begin() + slice_idx + 1)` FOLLOWED BY
+    /// `erase(begin() + dim_8bit)` (`shuffle.cpp:357-358`) — a pair whose net effect on the
+    /// six-slot slice is this shift, which is why the slice length is an invariant and not a check.
+    #[must_use]
+    pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
+        let mut output = input.clone();
+        if !self.stick_dim.is_dummy() {
+            output.stick_dims.remove(&self.stick_dim);
+        }
+        let to = self.slice.slice().index();
+        for i in SliceDim::Bit8.index()..to {
+            output.slice_dims[i] = output.slice_dims[i + 1];
+        }
+        output.slice_dims[to] = self.stick_dim;
+        output
+    }
+}
 
 // crustify:todo: e145_get_indices
 //   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:366  (12 body lines, level 0)
@@ -488,3 +1014,202 @@
 //   extract   : crustify-ddc/cpp/ddc.cpp:14744-14865
 //   calls     : e270_inferLayouts, e362_get_shuffle
 
+// ⭐ TESTS FOR ENTRIES 137-144. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e137_e144 {
+    use super::{
+        AbstractLayout, ComputationOp, DIMS_PER_SLICE, DimSymbol, Half, MergeAction, MergeDim,
+        PackAction, PackDim, PseudoReg, ShuffleCost, ShuffleIndex, StickIndex, SwapBuffer,
+        int_log2, packmerge_psuedostring,
+    };
+    use crate::generated::DataType;
+    use std::collections::BTreeSet;
+
+    /// Symbols 1, 2, 3, 4 — `getDefaultSymbol()` and its successors.
+    const A: DimSymbol = DimSymbol::DEFAULT;
+    const B: DimSymbol = A.next();
+    const C: DimSymbol = B.next();
+    const D: DimSymbol = C.next();
+    const DUMMY: DimSymbol = DimSymbol::DUMMY;
+
+    /// A layout with the given stick dimensions and slice, in `Senint8`.
+    fn layout(sticks: &[DimSymbol], slice: [DimSymbol; DIMS_PER_SLICE]) -> AbstractLayout {
+        AbstractLayout::new(
+            sticks.iter().copied().collect::<BTreeSet<_>>(),
+            slice,
+            DataType::Senint8,
+        )
+    }
+
+    /// e137: the reference's documented `-1` for `x <= 0`, and the floor for everything else — the
+    /// `stickSize_` powers of two `inferLayouts` feeds it (`shuffle.cpp:1072`) plus a non-power case.
+    #[test]
+    fn int_log2_floors_and_answers_minus_one_below_one() {
+        for (x, want) in [
+            (0, -1),
+            (-8, -1),
+            (1, 0),
+            (2, 1),
+            (5, 2),
+            (8, 3),
+            (128, 7),
+            (i32::MAX, 30),
+        ] {
+            assert_eq!(int_log2(x), want, "int_log2({x})");
+        }
+    }
+
+    /// e138: the two slots exchange, and a default-constructed buffer starts on `a` — the `flag =
+    /// true` a derived `Default` would get backwards.
+    #[test]
+    fn swap_exchanges_the_two_slots() {
+        let mut buffer: SwapBuffer<u8> = SwapBuffer::default();
+        assert_eq!((*buffer.first(), *buffer.second()), (0, 0));
+
+        let mut buffer = SwapBuffer::new("a", "b");
+        assert_eq!((*buffer.first(), *buffer.second()), ("a", "b"));
+        buffer.swap();
+        assert_eq!((*buffer.first(), *buffer.second()), ("b", "a"));
+        buffer.swap();
+        assert_eq!((*buffer.first(), *buffer.second()), ("a", "b"));
+    }
+
+    /// e139: the line as the reference's stream writes it, including the space before `]` and the
+    /// `-1` a don't-care lane prints.
+    #[test]
+    fn the_packmerge_line_is_written_as_the_reference_streams_it() {
+        let indices = [ShuffleIndex(0), ShuffleIndex(16), ShuffleIndex(-1)];
+        assert_eq!(
+            packmerge_psuedostring(
+                &indices,
+                &PseudoReg("r0".to_owned()),
+                &PseudoReg("r1".to_owned()),
+                &PseudoReg("r2".to_owned()),
+            ),
+            "r2 = packmerge r0 r1 [ 0 16 -1 ]"
+        );
+    }
+
+    /// e140: one absent dimension doubles the list, low half on the original and high on the copy;
+    /// a dimension the OUTPUT already indexes is still split, and the insert that would overwrite
+    /// its half does not.
+    #[test]
+    fn repeat_over_dims_doubles_per_absent_dimension() {
+        let op = ComputationOp {
+            inputs: vec![[(A, Half::Low)].into_iter().collect::<StickIndex>()],
+            output: StickIndex::new(),
+            reuses_sticks: false,
+        };
+        let mut appended = Vec::new();
+        op.repeat_over_dims(&[A, B], &mut appended);
+
+        assert_eq!(appended.len(), 2, "A is already indexed, B is not");
+        assert_eq!(appended[0].inputs[0].half_of(B), Some(Half::Low));
+        assert_eq!(appended[0].output.half_of(B), Some(Half::Low));
+        assert_eq!(appended[1].inputs[0].half_of(B), Some(Half::High));
+        assert_eq!(appended[1].output.half_of(B), Some(Half::High));
+        assert_eq!(appended[0].inputs[0].half_of(A), Some(Half::Low));
+
+        // The absent set comes from `inputs` alone, so B splits even though the output indexes it —
+        // and both copies keep the High the output already carried.
+        let with_output = ComputationOp {
+            inputs: vec![[(A, Half::Low)].into_iter().collect::<StickIndex>()],
+            output: [(B, Half::High)].into_iter().collect::<StickIndex>(),
+            reuses_sticks: false,
+        };
+        let mut appended = Vec::new();
+        with_output.repeat_over_dims(&[B], &mut appended);
+        assert_eq!(appended.len(), 2);
+        assert_eq!(appended[0].output.half_of(B), Some(Half::High));
+        assert_eq!(appended[1].output.half_of(B), Some(Half::High));
+        assert_eq!(appended[0].inputs[0].half_of(B), Some(Half::Low));
+    }
+
+    /// e141: the stick dimension takes the slot; `Extract` puts what it displaced into the sticks,
+    /// `Fill` drops the dummy that was there.
+    #[test]
+    fn merge_act_swaps_the_stick_dimension_for_the_slice_slot() {
+        let input = layout(&[A, B], [DUMMY, DUMMY, DUMMY, C, DUMMY, D]);
+
+        let extract = MergeAction::new(A, MergeDim::Bit64, D);
+        assert_eq!(
+            extract.act(&input),
+            layout(&[B, D], [DUMMY, DUMMY, DUMMY, C, DUMMY, A])
+        );
+
+        let fill = MergeAction::new(A, MergeDim::Bit32, DUMMY);
+        assert_eq!(
+            fill.act(&input),
+            layout(&[B], [DUMMY, DUMMY, DUMMY, C, A, D])
+        );
+    }
+
+    /// e142: half a stick per stick, doubled when it extracts — and 0 for a single stick, which is
+    /// the reference's integer division and not 0.5.
+    #[test]
+    fn merge_cost_is_integer_halves_of_the_stick_count() {
+        let four_sticks = layout(&[A, B], [DUMMY; DIMS_PER_SLICE]);
+        let one_stick = layout(&[], [DUMMY; DIMS_PER_SLICE]);
+
+        assert_eq!(
+            MergeAction::new(A, MergeDim::Bit64, DUMMY).cost(&four_sticks),
+            ShuffleCost(2.0)
+        );
+        assert_eq!(
+            MergeAction::new(A, MergeDim::Bit64, D).cost(&four_sticks),
+            ShuffleCost(4.0)
+        );
+        assert_eq!(
+            MergeAction::new(A, MergeDim::Bit64, DUMMY).cost(&one_stick),
+            ShuffleCost(0.0)
+        );
+    }
+
+    /// e143: `merge8h` and `merge64l` as `shuffle.cpp:30` and `:53` write them, so a transposed
+    /// table is a failing test rather than a wrong instruction.
+    #[test]
+    fn the_shuffle_tables_are_the_vendors_own() {
+        let merge8 = MergeAction::new(A, MergeDim::Bit8, DUMMY);
+        assert_eq!(
+            merge8
+                .get_shuffle_indices(Half::High)
+                .iter()
+                .map(|i| i.0)
+                .collect::<Vec<_>>(),
+            vec![1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31]
+        );
+        let merge64 = MergeAction::new(A, MergeDim::Bit64, DUMMY);
+        assert_eq!(
+            merge64
+                .get_shuffle_indices(Half::Low)
+                .iter()
+                .map(|i| i.0)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 8, 9, 10, 11]
+        );
+        assert_eq!(
+            merge64.get_shuffle_indices(Half::High),
+            [4, 5, 6, 7, 12, 13, 14, 15].map(ShuffleIndex).as_slice()
+        );
+    }
+
+    /// e144: the slot at 8 bits goes, everything up to the insert point slides one down, and the
+    /// stick dimension lands at the insert point.
+    #[test]
+    fn pack_act_slides_the_slice_down_into_the_eight_bit_slot() {
+        let input = layout(&[A, B], [C, D, DUMMY, A, B, C]);
+
+        assert_eq!(
+            PackAction::new(A, PackDim::Bit16).act(&input),
+            layout(&[B], [C, D, A, A, B, C])
+        );
+        assert_eq!(
+            PackAction::new(A, PackDim::Bit64).act(&input),
+            layout(&[B], [C, D, A, B, C, A])
+        );
+        assert_eq!(
+            PackAction::new(DUMMY, PackDim::Bit32).act(&input),
+            layout(&[A, B], [C, D, A, B, DUMMY, C])
+        );
+    }
+}
