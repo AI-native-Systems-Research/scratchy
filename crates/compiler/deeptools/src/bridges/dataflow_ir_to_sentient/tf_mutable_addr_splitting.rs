@@ -4429,10 +4429,10 @@ mod unit_tests {
     /// 🎯 306/384 — ⭐⭐ IBM'S `one_dim` KEY END TO END: ONE `agen.vector_load` BECOMES TWO
     /// PARTITIONS, EACH WITH ITS OWN CLONE OF THE **STORE'S** VIEW.
     ///
-    /// `mutable_addr_splitting_one_dim.mlir:236-263` in, `:29-46` out — the cut at `%arg2 < 4`, the
+    /// `mutable_addr_splitting_one_dim.mlir:240-264` in, `:12-47` out — the cut at `%arg2 < 4`, the
     /// `else` arm's `* 8 - 32`, four ops per arm in the vendor's order, and both start constants
     /// HOISTED out of the unit. ⛔ THE LAYOUT IS THE VENDOR'S TRANSPOSED AND SCALED BY 24576: it runs
-    /// `--max-mutable-size=100000`, which is [`MAX_MUTABLE_SIZE`] = [`None`] here (see
+    /// `--max-mutable-size=91200`, which is [`MAX_MUTABLE_SIZE`] = [`None`] here (see
     /// [`span_overflowing_by`]), and [`agen::access_set`] derives the lane run on the LAST axis where
     /// the key's `d2 * 256 + d1 * 64 + d0` puts it on `d0`. The start addresses scale; nothing else does.
     #[test]
@@ -8992,11 +8992,11 @@ pub enum TransferSplit<'a> {
 /// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:298` (75L): split one overflowing
 /// `agen.vector_load` into one partition per branch of a conditional tree.
 ///
-/// ⛔ THE STORE'S VIEW IS CLONED **PER PARTITION** AND NOT SHARED (`:359-364`) — *"Every memory
+/// ⛔ THE STORE'S VIEW IS CLONED **PER PARTITION** AND NOT SHARED (`:351-360`) — *"Every memory
 /// operand should have it's own unique mem view"* — and it is collected from the LOAD's use chain
-/// (`:328-332`) because a load/store pattern is merged into one transfer later, so both halves must be
+/// (`:325-330`) because a load/store pattern is merged into one transfer later, so both halves must be
 /// eligible before either is split.
-/// ⛔ AND THE ADJUSTMENT RUNS INSIDE THE LAMBDA (`:344`), once per partition, on that partition's own
+/// ⛔ AND THE ADJUSTMENT RUNS INSIDE THE LAMBDA (`:339-341`), once per partition, on that partition's own
 /// `start_addr_mod` — hoisting it would apply one leaf's parity correction to every leaf.
 #[must_use]
 pub fn transform_vector_load<'s, A: Arch>(
@@ -9306,7 +9306,7 @@ pub fn transform_vector_store<'s, A: Arch>(
             }
 
             // `op.cloneUseChainToNewOp(partition_builder, new_mem_op);` — ⭐ AND IT INHERITS THE
-            // ASSIGNMENT ABOVE, which the reference made on the original load itself (`:434`). The
+            // ASSIGNMENT ABOVE, which the reference made on the original load itself (`:433`). The
             // original is erased at the end, so re-pointing the clone is the same surviving program.
             let mut cloned_chain = clone_use_chain_to_new_store(vals, &chain, &mut new_mem_op);
             if let Some(partition_view) = partition_load_view {

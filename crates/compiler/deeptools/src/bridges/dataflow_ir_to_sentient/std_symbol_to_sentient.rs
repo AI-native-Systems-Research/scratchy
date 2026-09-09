@@ -330,7 +330,7 @@ pub struct UnitQueryMaps<'a> {
 ///
 /// ⛔ THE ERASE LOOP'S `DT_CHECK_MSG(op->use_empty())` (`:33-35`) HOLDS BY CONSTRUCTION: entry 275
 /// re-points every use it was handed, and [`LoweredQueryMap`] carries the pair rather than erasing.
-/// ⛔ A query whose `map` is not a `symbol.symbol_immutable_mapping` is the `DT_CHECK` at `:44` — it
+/// ⛔ A query whose `map` is not a `symbol.symbol_immutable_mapping` is the `DT_CHECK` at `:45` — it
 /// is skipped here, so it is neither lowered nor queued.
 #[must_use]
 pub fn run_on_operation<'a, A: Arch>(
@@ -341,6 +341,10 @@ pub fn run_on_operation<'a, A: Arch>(
     // `module_op.walk<PreOrder>([&](dataflow::ProgramUnitOp unit) { .. })` — the units are a field of
     // the program rather than ops among ops, exactly as entry 196 records.
     for unit in program.units.iter() {
+        // `dcc::getUnitType(unit.getUnits()[0].getDefiningOp<GetUnitOp>())` (`:26-27`) — ⭐ THE
+        // COMPONENT IS ALREADY GENERIC: `getUnitType` maps through `senCompToGenericComp` itself
+        // (`DccExtContext.cpp:130`), so entry 275's `is_any_of(comp, L3LU, L3SU)` (`:85`) compares
+        // generic components, not the raw `type` string.
         let comp = unit.on.kind().generic();
         let mut sites: Vec<&DfirOp> = Vec::new();
         query_maps(&unit.body, &mut sites);
@@ -401,16 +405,16 @@ fn query_maps<'a>(body: &'a [DfirOp], found: &mut Vec<&'a DfirOp>) {
 }
 
 /// EVERY USE OF THE QUERY'S RESULT, CLASSIFIED, IN MLIR USE-LIST ORDER — `for (auto& use :
-/// query_map.getResult().getUses())` (`SymbolToSentient.cpp:63-75`).
+/// query_map.getResult().getUses())` (`SymbolToSentient.cpp:64-75`).
 ///
 /// ⛔⛔ THE TEST IS ON THE **LOOP**, NOT ON THIS USE'S OPERAND NUMBER: `sentient_for.getBound()
-/// .getDefiningOp() == query_map` (`:68`) is asked once per use, so a loop that reads the query BOTH
+/// .getDefiningOp() == query_map` (`:69`) is asked once per use, so a loop that reads the query BOTH
 /// as its bound and as something else has BOTH uses counted as loop-bound uses. Classifying by
 /// operand number instead would inflate `num_non_loop_bound_uses` and, on L3, mint a result nothing
 /// reads.
 /// ⛔ THE BOUND IS THE **UPPER** ONE. `sentient.for %i = %bound` is a trip count and what lowers into
 /// it is the DataflowIR loop's `hi`; a use as `lo`, as `step` or as an `iter_args` init is an `Other`.
-/// ⛔ AND THE ORDER IS REVERSED, because MLIR's use list is reverse program order (`:90-92`) and
+/// ⛔ AND THE ORDER IS REVERSED, because MLIR's use list is reverse program order (`:91-92`) and
 /// entry 275 walks it backwards.
 fn query_map_uses(result: Val, body: &[DfirOp]) -> Vec<QueryMapUse> {
     let mut classified: Vec<QueryMapUse> = uses(result, body)

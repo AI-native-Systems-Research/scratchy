@@ -846,7 +846,7 @@ pub fn calculate_partial_shift(
 
 /// `isL3ImmutableAddrEven(evaluator, mem_view_op.getStartAddress(), num_elems_in_stick)` FOR A
 /// CONSTANT START — `evaluateDivideByConst(ev, n).isDivisibleBy(2)` over the one value that
-/// evaluation yields (`Dialect/Agen/Utils.cpp:218-288`), which is
+/// evaluation yields (`Dialect/Agen/Utils.cpp:218-287`), which is
 /// [`super::tf_mutable_addr_splitting::calculate_partition_sizes`]'s own reading of it.
 fn is_l3_immutable_addr_even(view: &ConstStartMemView<'_>, stick: ElementsPerStick) -> bool {
     (view.start / stick.elements().0.cast_signed()) % 2 == 0

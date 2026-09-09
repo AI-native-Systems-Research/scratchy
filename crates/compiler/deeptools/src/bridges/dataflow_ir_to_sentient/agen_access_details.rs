@@ -2536,7 +2536,7 @@ pub struct AccessDetailsAffineComposite<'a> {
     /// ⛔ `None` is the default-constructed NULL map, for the same reason as
     /// [`AccessDetailsAffine::subscripts_map`]. Every bound and offset is reordered THROUGH it —
     /// `time_offsets = time_order.compose(...)` (`dialect_utils/Agen/Utils.cpp:115`),
-    /// `time_bounds = time_order.compose(time_bounds)` (`:255`) — which is why the two vectors below
+    /// `time_bounds = time_order.compose(time_bounds)` (`:254`) — which is why the two vectors below
     /// are documented as already ordered (`AccessDetails.cpp:689`).
     pub time_order: Option<AffineMap>,
     /// `time_set_` — the time iteration domain (`AccessDetails.hpp:307`).
@@ -3538,23 +3538,23 @@ impl<'a, T> VacantSlot<'a, T> {
 }
 
 /// WHY `constructTimeStepsInfo` REFUSED — the three `failure()` paths of
-/// `agen::utils::calculateTimeBounds` (`dialect_utils/Agen/Utils.cpp:216-257`), each with the
+/// `agen::utils::calculateTimeBounds` (`dialect_utils/Agen/Utils.cpp:216-256`), each with the
 /// dimension that carried it.
 ///
 /// ⛔ `calculateTimeOffsets`' OWN FAILURE HAS NO VARIANT: its only one is
-/// `getFlattenedAffineExpr(..).failed()` (`:104-109`), and [`AffineExpr::flatten`] is total.
+/// `getFlattenedAffineExpr(..).failed()` (`:105-109`), and [`AffineExpr::flatten`] is total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum TimeStepsInfo {
-    /// Every dimension's bound is a compile-time constant and both vectors are stored (`:695`).
+    /// Every dimension's bound is a compile-time constant and both vectors are stored (`:669`).
     Constructed,
     /// *"Time set in the composite load/store is empty after simplification"* (`:221-227`) — also
     /// the unset [`AccessDetailsAffineComposite::time_set`], which has no dimensions to bound.
     EmptyTimeSet,
-    /// *"No support for lowering non-constant time symbol"* (`:243-247`) — the symbol bounding this
+    /// *"No support for lowering non-constant time symbol"* (`:242-245`) — the symbol bounding this
     /// dimension is not an `arith::ConstantIndexOp`.
     NonConstantTimeSymbol(TimeDim),
-    /// *"Not able to deduce the extents of time set"* (`:250-254`) — the dimension is neither pinned,
+    /// *"Not able to deduce the extents of time set"* (`:248-251`) — the dimension is neither pinned,
     /// nor a constant range, nor a symbolic one.
     ExtentsNotDeducible(TimeDim),
 }
@@ -3566,8 +3566,8 @@ impl TimeStepsInfo {
         matches!(self, TimeStepsInfo::Constructed)
     }
 
-    /// What the reference prints to `llvm::errs()` on the way out (`Utils.cpp:222-226`, `:244-246`,
-    /// `:251-253`).
+    /// What the reference prints to `llvm::errs()` on the way out (`Utils.cpp:223-226`, `:243-244`,
+    /// `:249-250`).
     #[must_use]
     pub const fn diagnostic(self) -> Option<&'static str> {
         match self {
@@ -3586,12 +3586,12 @@ impl TimeStepsInfo {
     }
 }
 
-/// `agen::utils::calculateTimeBounds` (`dialect_utils/Agen/Utils.cpp:216-257`) — one bound per time
+/// `agen::utils::calculateTimeBounds` (`dialect_utils/Agen/Utils.cpp:216-256`) — one bound per time
 /// dimension, in `time_order`'s order.
 ///
 /// ⛔ THE THREE TESTS ARE ORDERED AND THE FIRST MATCH WINS: pinned to one value → 1, a constant
 /// range → its width, a symbolic range → that symbol's constant. ⛔ `scope` is what the reference
-/// reaches through `symbol.getDefiningOp<arith::ConstantIndexOp>()` (`:239`).
+/// reaches through `symbol.getDefiningOp<arith::ConstantIndexOp>()` (`:238`).
 fn calculate_time_bounds(
     time_bounds: &mut Vec<TimeBound>,
     time_set: &IntegerSet,
@@ -3620,7 +3620,7 @@ fn calculate_time_bounds(
             return TimeStepsInfo::ExtentsNotDeducible(dim);
         }
     }
-    // `time_bounds = time_order.compose(time_bounds)` (`:255`). A negative width cannot arrive from a
+    // `time_bounds = time_order.compose(time_bounds)` (`:254`). A negative width cannot arrive from a
     // non-empty set — it would be the `kInvalid` [`TimeBound::Variable`] the consumer already guards.
     *time_bounds = time_order
         .compose_constants(&widths)
@@ -3630,11 +3630,11 @@ fn calculate_time_bounds(
     TimeStepsInfo::Constructed
 }
 
-/// `agen::utils::calculateTimeOffsets` (`dialect_utils/Agen/Utils.cpp:97-127`) — the address step of
+/// `agen::utils::calculateTimeOffsets` (`dialect_utils/Agen/Utils.cpp:97-119`) — the address step of
 /// each time dimension, in `time_order`'s order, plus the flattened constant.
 ///
 /// ⛔ THE FLATTENED ROW'S LAST COLUMN IS THE CONSTANT AND IS HELD BACK FROM THE REORDERING (`:111-116`)
-/// — see [`TimeOffsets`]. ⛔ `simplifyAffineMap` (`:103`) is dropped: flattening folds the same
+/// — see [`TimeOffsets`]. ⛔ `simplifyAffineMap` (`:104`) is dropped: flattening folds the same
 /// expression to the same row either way.
 fn calculate_time_offsets(
     mem_view_layout_map: &AffineMap,
@@ -3666,7 +3666,7 @@ fn calculate_time_offsets(
 /// composite transfer its time bounds and time offsets, then optionally coalesces the nest and claims
 /// the burst and interleave-group dimensions.
 ///
-/// ⛔ THE ORDER IS LOAD-BEARING and the reference says so at `:660-662`: coalescing sees ALL the
+/// ⛔ THE ORDER IS LOAD-BEARING and the reference says so at `:661-663`: coalescing sees ALL the
 /// operands and must precede the per-operand burst calculation. ⛔ IT STOPS AT THE FIRST REFUSAL, so
 /// neither of the two later steps runs on a half-built nest.
 pub fn construct_time_steps_info(

@@ -9648,11 +9648,11 @@ pub fn construct_time_loops_and_vector_operations(
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
 pub enum AffineDetailsAndAddrs {
-    /// The tail call to entry 212 succeeded (`Helper.cpp:2804-2805`).
+    /// The tail call to entry 212 succeeded (`Helper.cpp:2805-2806`).
     Constructed,
-    /// *"unable to construct details for src"* (`:2794-2795`).
+    /// *"unable to construct details for src"* (`:2795-2796`).
     SrcDetailsFailed(ConstructedDetails),
-    /// *"unable to construct details for dst"* (`:2800-2801`).
+    /// *"unable to construct details for dst"* (`:2801-2802`).
     DstDetailsFailed(ConstructedDetails),
     /// `emplace_insert` ABORTS on a slot that is already taken; here the slot is a capability
     /// ([`AccessContainer::vacancy`]) and a taken one refuses instead.
@@ -9667,7 +9667,7 @@ pub enum AffineDetailsAndAddrs {
 /// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2787` (16L). One record per direct operand, then
 /// entry 212 over both.
 ///
-/// ⛔ THE DESTINATION IS OPTIONAL AND THE SOURCE IS NOT (`:2791`, `:2797`) — a load has no `kDirDst`.
+/// ⛔ THE DESTINATION IS OPTIONAL AND THE SOURCE IS NOT (`:2792`, `:2798`) — a load has no `kDirDst`.
 /// ⛔ IT STOPS AT THE FIRST REFUSAL, so the gather never sees a half-built record.
 /// ⭐ `src_position` is what entry 212 MARKS (`:546`); the reference passes `src_op` itself.
 pub fn construct_affine_details_and_addrs<'a>(
@@ -9681,7 +9681,7 @@ pub fn construct_affine_details_and_addrs<'a>(
     marked: &mut Marked,
     scope: &[DfirOp],
 ) -> AffineDetailsAndAddrs {
-    // `DT_CHECK(src_op)` (`:2791`) — a `&agen::Op` cannot be null.
+    // `DT_CHECK(src_op)` (`:2792`) — a `&agen::Op` cannot be null.
     let Some(slot) = access_details.vacancy(MemoryOperandIndex::DirSrc) else {
         return AffineDetailsAndAddrs::OperandSlotTaken(MemoryOperandIndex::DirSrc);
     };
@@ -9719,12 +9719,12 @@ pub fn construct_affine_details_and_addrs<'a>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
 pub enum AffineCompositeLowering {
-    /// The nest entry 267 built, and the candidate is queued for deletion (`Helper.cpp:2967`).
+    /// The nest entry 267 built, and the candidate is queued for deletion (`Helper.cpp:2970`).
     Lowered(Box<TimeLoopsAndTransfer>),
     /// *"Unable to generate loops and sentient statements for the composite vector operations"*
-    /// (`:2962-2965`) — reported ON THE RE-FOUND op, not the one that came in.
+    /// (`:2966-2968`) — reported ON THE RE-FOUND op, not the one that came in.
     Refused(TimeLoopsAndVectorOps),
-    /// `DT_CHECK(candidate_op)` inside entry 037 (`:1483`): nothing in the unit carries the mark.
+    /// `DT_CHECK(candidate_op)` inside entry 037 (`:2893`): nothing in the unit carries the mark.
     NoCandidate,
 }
 
@@ -9735,9 +9735,9 @@ pub enum AffineCompositeLowering {
 /// replaced queued for deletion.
 ///
 /// ⛔⛔ THE CANDIDATE IS RE-FOUND AFTER THE NEST IS BUILT AND BEFORE THE FAILURE IS TESTED
-/// (`:2958-2965`): *"The op may have changed due to loop cloning"*, so the incoming op may be gone
+/// (`:2959-2965`): *"The op may have changed due to loop cloning"*, so the incoming op may be gone
 /// and both the error and the delete name the re-found one.
-/// ⛔ THE DELETE IS QUEUED ONLY ON SUCCESS (`:2967`).
+/// ⛔ THE DELETE IS QUEUED ONLY ON SUCCESS (`:2970`).
 pub fn lower_affine_composite_helper<'a>(
     kind: AgenOpKind,
     marked: &Marked,

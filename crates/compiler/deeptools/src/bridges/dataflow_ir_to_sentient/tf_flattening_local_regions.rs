@@ -2985,21 +2985,21 @@ mod unit_tests {
     /// THE VENDOR'S `@diff_groups` END TO END: TWO NESTED LOCAL REGIONS OVER FOUR UNITS BECOME ONE
     /// OP WITH FOUR SIBLING REGIONS, AND THE SECOND WALK THEN HAS NOTHING TO DO.
     ///
-    /// `dcc/test/Transform/FlatteningLocalRegions/flatten_local_region.mlir:88-153` in, `:18-67` out.
+    /// `dcc/test/Transform/FlatteningLocalRegions/flatten_local_region.mlir:88-150` in, `:18-67` out.
     /// The outer op's two regions each hold ONE nested op splitting that region's two units, so
     /// `flattenUniformRegion` reaches `sum == getUnits().size()` and emits the four unit lists in
     /// outer-then-inner order — `%0, %2, %1, %3`, which is NOT the outer op's own unit order — while
     /// [`FlatteningLocalRegionsTree::flatten`] then finds four classes against four regions (`:418`).
     ///
     /// ⚠️ TWO SUBSTITUTIONS IN THE FIXTURE'S PAYLOAD, NEITHER READ BY THE PASS, whose only test of an
-    /// operation is the `isa<UniformizeRegionsOp>` at `:137` and `:82`. The vendor's innermost
+    /// operation is the `isa<UniformizeRegionsOp>` at `:137` and `Uniform/Utils.cpp:76-77`. The vendor's innermost
     /// `affine.for` holds an `agen.vector_load` off a `memref<?x?x?x128xi8>` and a `dataflow.send`;
     /// this island's [`crate::islands::dataflow_ir::ty::MemRef`] has no dynamic extent, so that level
     /// is dropped and the two remaining loops carry the region's `dataflow.sync_recv` — which prints a
     /// `dbgName` the vendor's does not, [`SyncSignal`] being a closed set of named signals.
     ///
     /// ⭐ WHAT IS PINNED IS THE PASS, NOT THE PAYLOAD: the four regions, their unit lists and order,
-    /// a FRESH block argument each (`:671-673`), a fresh induction variable per cloned loop, and the
+    /// a FRESH block argument each (`:669-671`), a fresh induction variable per cloned loop, and the
     /// `uniform.yield` every new region gets (`:697-698`).
     #[test]
     fn the_vendor_diff_groups_case_becomes_one_op_with_a_region_per_unit() {
@@ -3061,10 +3061,10 @@ mod unit_tests {
         );
     }
 
-    /// `@diff_groups`'s `dataflow.program_unit` (`flatten_local_region.mlir:87-149`) — an outer local
+    /// `@diff_groups`'s `dataflow.program_unit` (`flatten_local_region.mlir:88-150`) — an outer local
     /// region over two units per region, each holding a nested one that splits them one apiece.
     fn a_diff_groups_program_unit() -> DfirOp {
-        // `(%arg2 -> %unit){ affine.for { affine.for { dataflow.sync_recv %unit } } }` (`:90-99`).
+        // `(%arg2 -> %unit){ affine.for { affine.for { dataflow.sync_recv %unit } } }` (`:93-104`).
         let a_nested_region =
             |arg: Val, unit: Val, outer_iv: Val, inner_iv: Val| uniform::LocalRegion {
                 arg,

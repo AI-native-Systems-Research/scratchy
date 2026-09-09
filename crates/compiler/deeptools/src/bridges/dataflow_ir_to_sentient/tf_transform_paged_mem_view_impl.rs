@@ -5223,7 +5223,7 @@ scf.if %3 {
     /// 🎯 309/384 — THE VENDOR'S FIRST PAGE, END TO END: THREE GUARDS, A PLAIN VIEW OVER THE PAGE'S
     /// OWN START, AND THE ACCESS AND ITS CHAIN REBUILT INSIDE THEM.
     ///
-    /// `paged_mem_view_loads.mlir:288-296` in, `:44-61` out, value for value.
+    /// `paged_mem_view_loads.mlir:288-296` in, `:45-61` out, value for value.
     ///
     /// ⛔ THE BOUND DOOR IS THE DEFECT THIS CATCHES: entry 294 hands over a system with ZERO dims and
     /// `[s0, s1]`, so reading column 0 as `d0` finds no bound and the page comes back
@@ -5231,9 +5231,9 @@ scf.if %3 {
     ///
     /// ⚠️ THREE PLACES THE PRINTED TEXT IS THE ISLAND'S AND NOT THE VENDOR'S, none of them this
     /// entry's: `memref<?x64x4xf16>` is written `8x64x4` ([`MemRef`] has no dynamic extent);
-    /// `right_shift = true` prints although the `.td` defaults it (`vectorchain.rs:1255`); and
+    /// `right_shift = true` prints although the `.td` defaults it (`vectorchain.rs:1254`); and
     /// `load_set` is DERIVED with the contiguous axis LAST, where the vendor CARRIES one whose
-    /// contiguous axis is `d0` (`#ATTR_7`, `:24`). The guards, the `addi`, the view and the
+    /// contiguous axis is `d0` (`#ATTR_7`, `:23`). The guards, the `addi`, the view and the
     /// subscripts — everything `constructValidPage` decides — are the vendor's value for value.
     #[test]
     fn the_vendors_first_page_is_guarded_and_rebuilt_over_its_own_start() {
@@ -5329,7 +5329,7 @@ scf.if %3 {
             }),
         ];
 
-        // `affine.for %arg1 = 0 to 2` and `%arg2 = 0 to 4` (`:285-286`) are the two iterator ranges.
+        // `affine.for %arg1 = 0 to 2` and `%arg2 = 0 to 4` (`:286-287`) are the two iterator ranges.
         let access = PagedAccess {
             mem_ops: vec![loaded],
             paged_mem_view: mem_view,
@@ -5405,7 +5405,7 @@ scf.if %11 {
     ///
     /// `paged_mem_view_loads.mlir:288-296` in, and the expectation pins the COUNT: the first load is
     /// rebuilt exactly four times, over start addends `%c0`, `%c1000`, `%c2000` and `%c3000`
-    /// (`:44-180`) — `%arg1 * 3` is 0 or 3 and never lands in page 4's or page 5's `d1` span `[4, 5]`.
+    /// (`:45-112`) — `%arg1 * 3` is 0 or 3 and never lands in page 4's or page 5's `d1` span `[4, 5]`.
     ///
     /// ⚠️ NOT THE COMPOSITE CASE (`:316-341`) THOUGH THIS IS THE COMPOSITE CLASS: its four pages are
     /// selected by a TIME iterator that entry 326 substitutes into the subscripts, and
@@ -6830,7 +6830,7 @@ pub(super) fn indices_from_map(subscripts_map: &AffineMap, indices: &[Val]) -> V
 /// THE `TPMVInfo` AND `mem_ops_` STATE ONE PAGE'S CONSTRUCTION READS AND REWRITES.
 ///
 /// ⛔ EVERY HANDLE IS THE [`Val`] IT BINDS, NOT A `&'p` BORROW: `createIterArgsForConditionals`
-/// CLONES the whole loop nest and `:503-516` then re-points `mem_ops_` and `paged_mem_view_` into the
+/// CLONES the whole loop nest and `:504-513` then re-points `mem_ops_` and `paged_mem_view_` into the
 /// clone. No borrow of the program being rewritten survives that, and re-resolving a value against
 /// the new scope is exactly what the reference's `ir_map` lookups do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6861,7 +6861,7 @@ pub struct ConstructedPage {
     /// `mem_ops_`, `paged_mem_view_`, `indices_` and `conditional_iter_args_` on the way out.
     pub access: PagedAccess,
     /// One `IRMapping` per loop the nest rebuild cloned. ⛔ THE SIBLING-`TPMVInfo` RE-SYNC AT
-    /// `:518-521` IS THE CALLER'S, over [`update_tpmv_info`]: `tpmv_info_` is not this function's to
+    /// `:518-520` IS THE CALLER'S, over [`update_tpmv_info`]: `tpmv_info_` is not this function's to
     /// hold, for the reason [`PagedAccess`] gives.
     pub ir_maps: Vec<ValueMapping>,
 }
@@ -6881,7 +6881,7 @@ pub enum ValidPage {
 /// **309/384** `TPMVBase::constructValidPage` —
 /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:190` (58L).
 ///
-/// ⛔ `insert_refs = mem_ops_` IS RE-READ EVERY PAGE (`:201`, and again at `:219`): a previous page's
+/// ⛔ `insert_refs = mem_ops_` IS RE-READ EVERY PAGE (`:201`, and again at `:217`): a previous page's
 /// conditions guard THAT page's copy, so no access ever arrives already wrapped. ⛔ AND THE TWO ARMS
 /// READ DIFFERENT SYSTEMS — hyper-rectangular bounds come from `page_sel_constraints` (one symbol per
 /// ITERATOR), non-hyper-rectangular ones from `page_set` itself (one dim per VIEW AXIS), and only the
@@ -6962,7 +6962,7 @@ pub fn construct_valid_page(
                 indices = created.indices;
                 out.indices = indices.clone();
 
-                // `:503-516` — `mem_ops_` and `paged_mem_view_` re-pointed into the clone, per loop.
+                // `:504-513` — `mem_ops_` and `paged_mem_view_` re-pointed into the clone, per loop.
                 for ir_map in &created.ir_maps {
                     for mem_op in &mut out.mem_ops {
                         if let Some(moved) = ir_map.lookup(*mem_op) {
@@ -7047,7 +7047,7 @@ pub fn construct_valid_page(
 
 /// HOW MANY PAGES AN ACCESS CAN REACH — [`TpmvComposite::analyze_valid_pages`]'s answer.
 ///
-/// ⛔ THE TWO REFUSALS ARE `emitOpError`s, WHICH FAIL THE PASS (`:915-921`) — not diagnostics the
+/// ⛔ THE TWO REFUSALS ARE `emitOpError`s, WHICH FAIL THE PASS (`:914-919`) — not diagnostics the
 /// caller may carry on past. The third is the `DT_CHECK_MSG` [`get_page_validity`] holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidPages {
@@ -7071,7 +7071,7 @@ impl TpmvComposite<'_> {
     /// **310/384** `TPMVComposite::analyzeValidPages` —
     /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:888` (33L).
     ///
-    /// ⛔ `compare_constraints` IS SEEDED BY THE FIRST VALID PAGE AND NEVER REPLACED (`:906-909`), so
+    /// ⛔ `compare_constraints` IS SEEDED BY THE FIRST VALID PAGE AND NEVER REPLACED (`:906-911`), so
     /// every later page is compared against page one and not against its predecessor — which is what
     /// makes a symbol "differs across the pages" rather than "differs from the page before it".
     /// ⚠️ AND `DT_CHECK(page_set.getNumDims() == subscripts_map_.getNumResults())` needs no test here:
@@ -7765,7 +7765,7 @@ impl<'p> TpmvBase<'p> {
     /// ⛔ `mem_ops_ = new_mem_ops` IS LOOP-CARRIED: a second paged operand builds its pages over the
     /// FIRST one's replacements, which is why `new_mem_ops` is a local per operand and `mem_ops_` is
     /// not. The write itself is the returned `mem_ops`, as entry 325's `mem_ops_[0] = new_mem_op` is
-    /// [`ExplicitTimeNest`]. ⚠️ AND THE SIBLING RE-SYNC AT `:518-521` LANDS HERE —
+    /// [`ExplicitTimeNest`]. ⚠️ AND THE SIBLING RE-SYNC AT `:518-520` LANDS HERE —
     /// [`ConstructedPage::ir_maps`] holds it for the caller, and this is that caller.
     #[must_use]
     pub fn transform(
@@ -7828,7 +7828,7 @@ impl<'p> TpmvBase<'p> {
             info.conditional_iter_args = access.conditional_iter_args.clone();
 
             // "The other TPMVInfo objects need to be synced as the values they use for paged_mem_view
-            // or indices may have changed as a result of the clones." (`:518-521`) — per cloned loop,
+            // or indices may have changed as a result of the clones." (`:518-520`) — per cloned loop,
             // in the order `createIterArgsForConditionals` cloned them.
             for page in &pages {
                 for ir_map in &page.ir_maps {

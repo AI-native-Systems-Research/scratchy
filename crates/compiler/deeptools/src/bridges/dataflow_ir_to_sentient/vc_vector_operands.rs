@@ -2346,7 +2346,7 @@ fn set_both_precisions(operand: &mut VectorOperand, elem: ElemType) {
 }
 
 /// THE PRECISION DATA OFF THE `pt` PORT ARRIVES AT — *"Input from PT is int16/fp16 in DD2 and
-/// int24/fp24 in Sen1p5"* (`VectorOperands.cpp:446-455`), which OVERRIDES the element type the
+/// int24/fp24 in Sen1p5"* (`VectorOperands.cpp:446-453`), which OVERRIDES the element type the
 /// receive itself carries.
 ///
 /// ⛔ `isIntOrIndex()` IS TRUE FOR AN `IntegerType` ONLY, so an MX-int element takes the FLOAT arm:
@@ -2387,10 +2387,10 @@ impl VectorOperand {
     /// `on_the_fly_conv_precision_`; every other arm writes BOTH, and `NegOp` writes neither (`:566`).
     /// ⛔ `traverse_upwards` PICKS WHICH END OF A FOLDED OP IS ASKED — its input's definition, same
     /// block only (`:466`), or its single USER — but the RECURSION always takes the declaration's
-    /// default `true` (`:468`, `:551`), so a chain resolves upwards from the first hop on.
-    /// ⛔ THE `pt` ARM OVERRIDES THE TYPE THE IR CARRIES (`:446-455`), which is how an `f16` receive
+    /// default `true` (`:468`, `:547`), so a chain resolves upwards from the first hop on.
+    /// ⛔ THE `pt` ARM OVERRIDES THE TYPE THE IR CARRIES (`:446-453`), which is how an `f16` receive
     /// becomes the vendor's `opAPrecision = #sentient<precision fp24>`.
-    /// ⛔ `Multiply`/`MultiplyAccumulate`/`Binary` ARE AN EXPLICIT `std::nullopt` (`:643-645`): a
+    /// ⛔ `Multiply`/`MultiplyAccumulate`/`Binary` ARE AN EXPLICIT `std::nullopt` (`:641-643`): a
     /// compute is not an operand of a compute, and falling through would be right for a wrong reason.
     pub fn with_precision<A: Arch>(
         op: &OpId,
@@ -2440,7 +2440,7 @@ impl VectorOperand {
                 })
             }
             // `mlir::arith::FPToSIOp` and `mlir::arith::SIToFPOp` — ⛔ THE FLAG IS SET BEFORE THE
-            // `hasOneUse()` TEST (`:461`, `:487`), so a multiply-used conversion reports one anyway.
+            // `hasOneUse()` TEST (`:462`, `:488`), so a multiply-used conversion reports one anyway.
             DfirOp::Arith(arith::Op::FpToSi(conv) | arith::Op::SiToFp(conv)) => {
                 converted = true;
                 folded_cast(
@@ -2462,7 +2462,7 @@ impl VectorOperand {
                 })
             }
             // `getOperandFromConstantBitstreamOp(const_bit_op)` — ⛔ WITH ITS DEFAULTED
-            // `is_constant_splatted_vector = false` (`:300`), so the value is the raw immediate and
+            // `is_constant_splatted_vector = false` (`:301`), so the value is the raw immediate and
             // NOT the pseudo-port spelling entry 278's trivial-shuffle arm asks for.
             DfirOp::VectorChain(vc::Op::ConstantBitstream { value, ty, .. }) => {
                 // `op.getValue()[0]` — an unchecked index; an empty list is `None` here.
@@ -2518,20 +2518,20 @@ impl VectorOperand {
                 if use_positions(op, scope).len() != 1 {
                     None
                 } else if traverse_upwards {
-                    // ⛔ NO `has_value()` GUARD ON THIS BRANCH (`:576-584`): the reference
+                    // ⛔ NO `has_value()` GUARD ON THIS BRANCH (`:574-583`): the reference
                     // dereferences whatever came back, so a select whose input has no operand is a
                     // null deref there and `None` here.
                     defining_position(*input, scope)
                         .and_then(|parent| get_operand(&parent, comp))
                         .map(|mut operand| {
-                            // ⭐ THE INPUT'S ELEMENT TYPE, `getData().getType()` (`:578`).
+                            // ⭐ THE INPUT'S ELEMENT TYPE, `getData().getType()` (`:576-577`).
                             set_both_precisions(&mut operand, input_ty.elem);
                             // `operand.value().splat_ = "east";`
                             operand.splat = Some(sen::Port::East);
                             operand
                         })
                 } else {
-                    // ⭐ AND THE DOWNWARD BRANCH TAKES THE SELECT'S **OWN** TYPE (`:589`), not its
+                    // ⭐ AND THE DOWNWARD BRANCH TAKES THE SELECT'S **OWN** TYPE (`:588`), not its
                     // input's, and sets no splat.
                     use_positions(op, scope)
                         .into_iter()
@@ -2543,7 +2543,7 @@ impl VectorOperand {
                         })
                 }
             }
-            // `vectorchain::ElementWiseCompareOp` — ⛔ UPWARDS ONLY (`:598-600`); asked downwards it
+            // `vectorchain::ElementWiseCompareOp` — ⛔ UPWARDS ONLY (`:599`); asked downwards it
             // falls past every arm to the trailing `nullopt`.
             DfirOp::VectorChain(vc::Op::ElementWiseCompare { ty, .. }) if traverse_upwards => {
                 // `for (auto user : ..getUsers()) if (isa<agen::VectorStoreOp>(user))`.
@@ -2588,10 +2588,10 @@ impl VectorOperand {
             }
             // `mlir::uniform::QueryMapOp` — ONE OPERAND PER MAPPED VALUE, FOLDED INTO THE FIRST.
             //
-            // ⛔ THE FOLD KEEPS ONLY `values_.front()` OF EACH LATER OPERAND (`:631-633`), so the
+            // ⛔ THE FOLD KEEPS ONLY `values_.front()` OF EACH LATER OPERAND (`:634-635`), so the
             // uniformized operand is one kind and one position with one value per core — which is
             // what [`VectorOperand::values`] is a list for.
-            // ⛔ AND THE REFERENCE DEREFERENCES EVERY ANSWER UNCHECKED (`:628-635`), the null
+            // ⛔ AND THE REFERENCE DEREFERENCES EVERY ANSWER UNCHECKED (`:627-640`), the null
             // `map_op`, each `operand.value()`, its `values_.front()` and the final
             // `folded_operand.value()` among them; each is a `None` here.
             DfirOp::Uniform(uniform::Op::QueryMap { map, .. }) => {
@@ -3950,7 +3950,7 @@ mod unit_tests {
         assert_eq!(operand.splat, None);
 
         // ⭐ AND THE COMPUTE ITSELF IS NOT AN OPERAND: `MultiplyAndAccumulateOp` is the explicit
-        // `std::nullopt` (`VectorOperands.cpp:643-645`).
+        // `std::nullopt` (`VectorOperands.cpp:641-643`).
         let compute = VectorOperand::with_precision::<Sen1p5>(
             &OpId::at(&[5]),
             ComputeComp::Pe,
