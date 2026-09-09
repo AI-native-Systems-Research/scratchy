@@ -105,7 +105,7 @@ use crate::workload::Workload;
 const LOCALES: usize = 14;
 
 /// Which slot of a [`PerLocale`] table a locale owns — the `.td`'s own numbering
-/// (`SentientTypes.td:254-267`), exhaustive so a fifteenth locale is a build error here rather than a
+/// (`SentientTypes.td:253-266`), exhaustive so a fifteenth locale is a build error here rather than a
 /// silent alias of the fourteenth.
 const fn locale_slot(locale: sentient::RegType) -> usize {
     match locale {
@@ -127,10 +127,10 @@ const fn locale_slot(locale: sentient::RegType) -> usize {
 }
 
 /// ONE ENTRY PER REGISTER LOCALE — `llvm::BitVector locale_has_free_regs_` and
-/// `std::array<unsigned, kMaxNumLocales> locale_to_num_regs_exceeded_` (`:189-196`) under one type.
+/// `std::array<unsigned, kMaxNumLocales> locale_to_num_regs_exceeded_` (`:177-185`) under one type.
 ///
 /// ⛔⛔ TRAP, AND IT IS THE REFERENCE'S OWN: `kMaxNumLocales` IS THE LAST LOCALE'S VALUE, NOT THE
-/// COUNT. `getMaxEnumValForSentientRegType()` is 13 (`SentientTypes.td:254-267` numbers
+/// COUNT. `getMaxEnumValForSentientRegType()` is 13 (`SentientTypes.td:253-266` numbers
 /// `unknown`..`unrelated` 0..13), so BOTH tables are one entry short and `localeHasFreeRegs(unrelated)`
 /// (e370) reads and writes slot 13 of 13 in each — a `BitVector::test(13)` past the end and an
 /// out-of-range `std::array` write. `findAndProcessCandidates` sizes its own bucket array
@@ -162,7 +162,7 @@ impl<T: Copy> PerLocale<T> {
 /// ONE OP'S LIVENESS INDEX — where it sits in its unit's preorder walk (`op_to_idx_`'s value).
 ///
 /// ⛔ A SNAPSHOT, NOT A LIVE POSITION. The reference computes the numbering once per unit and never
-/// updates it because *"Op reordering will render indices stale"* (`:92-96`); what stays valid is the
+/// updates it because *"Op reordering will render indices stale"* (`:158-161`); what stays valid is the
 /// liverange ENDPOINT of a scalar op, which is the only thing it may be read for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LiverangeIndex(usize);
@@ -192,7 +192,7 @@ impl LiverangeIndex {
 }
 
 /// A SCALAR OP'S ONE RESULT — `DT_CHECK_MSG(op->getNumResults() == 1, "Scalar ops expected to have one
-/// result")` (`:110-111`, `:469-470`) AS A TYPE.
+/// result")` (`:110-111`, `:468-469`) AS A TYPE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarResult(Val);
 
@@ -228,7 +228,7 @@ pub struct ScalarOpReordering {
     /// positional identity costs.
     op_to_idx: BTreeMap<OpId, LiverangeIndex>,
     /// `locale_has_free_regs_` — set once a locale has been measured to have room. ⛔ FALSE NEGATIVES
-    /// ONLY, by the reference's own note (`:432-434`).
+    /// ONLY, by the reference's own note (`:432-433`).
     locale_has_free_regs: PerLocale<bool>,
     /// `locale_to_num_regs_exceeded_` — the overestimate of how far past its register file a locale is.
     locale_to_num_regs_exceeded: PerLocale<u32>,
@@ -264,7 +264,7 @@ impl ScalarOpReordering {
     ///
     /// ⛔ NAMED FOR ITS ARGUMENT: `runOn(ModuleOp)` and `runOn(dataflow::ProgramUnitOp)` (e579) are one
     /// C++ overload set and cannot both be `run_on` here.
-    /// ⭐ `WalkResult::skip()` (`:84`) IS WHY A UNIT NESTED IN A UNIT IS NEVER VISITED; a program's
+    /// ⭐ `WalkResult::skip()` (`:85`) IS WHY A UNIT NESTED IN A UNIT IS NEVER VISITED; a program's
     /// units are a flat list here, so the skip is that list.
     /// ⭐ `new DominanceInfo(unit_op)` / `delete dom_info_` IS DROPPABLE MECHANISM — this campaign has
     /// measured what the pass asks a dominance tree and it is one block position; see
@@ -293,7 +293,7 @@ impl ScalarOpReordering {
     /// Numbers every op of one program unit in preorder, dropping the previous unit's numbering.
     ///
     /// ⭐ EVERY OP, NOT JUST THE SCALAR ONES — `sentient.yield`s included, which is the reference's own
-    /// note (`:88-91`) and why this is simpler than constructing a `Liveness`.
+    /// note (`:91-93`) and why this is simpler than constructing a `Liveness`.
     /// ⛔ THE UNIT OP ITSELF TAKES INDEX 0 IN THE REFERENCE (`Operation::walk` visits the op it is
     /// called on) and has no island `Op` to take one here, so every index below is one lower. Nothing
     /// can observe that: the map is only ever compared against itself.

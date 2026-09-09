@@ -161,7 +161,7 @@ pub(crate) fn is_profitable_for_hoisting(
         .any(|(idx, slot)| slot.arg == input_val && yielded.get(idx) == Some(&bottom_op))
 }
 
-/// HOW MUCH TRANSFORMING ONE BLOCK IS WORTH — `sortBlocks`'s `GetBlockRatio` lambda (`:911-926`).
+/// HOW MUCH TRANSFORMING ONE BLOCK IS WORTH — `sortBlocks`'s `GetBlockRatio` lambda (`:911-923`).
 ///
 /// ⛔ NEITHER THE FLOAT NOR THE `1000.0` SENTINEL SURVIVES, BECAUSE BOTH SPELL AN ORDER. The ratio is
 /// `num_scalar_ops / required_ibuff` and the sentinel is there so a block needing no IBuff "will
@@ -254,7 +254,7 @@ pub(crate) fn unroll_burst_and_il(
     evaluator: &mut dyn ExpressionEvaluator,
     sites: &mut OffsetSites<'_>,
 ) -> Vec<Val> {
-    // `zero_const` — ONE for the whole unroll, in the const builder's block (`:1030-1033`).
+    // `zero_const` — ONE for the whole unroll, in the const builder's block (`:1025-1027`).
     let zero = sites.values.mint();
     sites.consts.push(Op::Sentient(ops::Op::ScalarConstant {
         value: 0,

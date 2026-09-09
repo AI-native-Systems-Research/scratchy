@@ -209,11 +209,13 @@ fn is_scalar_add_or_sub(op: &Op) -> bool {
 /// `dcc::utils::isUpdateMode` (`Analyses/Utils.cpp:65`) at the three arms this pass reaches — the
 /// increment is a non-zero constant, or a query map with a non-zero value among its constants.
 ///
-/// ⭐ IT TAKES THE DESCRIPTOR RATHER THAN THE OP, and that is what removes the reference's
-/// `llvm_unreachable("unhandled operation")` (`:125`): all three arms it can reach read
-/// `getIncrement()`, which is exactly [`MemoryOpInfo::increment`].
+/// ⭐ IT TAKES THE DESCRIPTOR RATHER THAN THE OP, which removes ONE of the two routes to the
+/// reference's `llvm_unreachable("unhandled operation")` (`:125`): an op outside its five arms.
+/// ⛔ THE SECOND ROUTE SURVIVES AND IS WHAT `_ => false` ANSWERS — every arm falls through to `:125`
+/// when the increment is defined by neither a `ConstantOp` nor a `QueryMapOp`, and
+/// [`is_mergeable_op_or_chain`] proves only the IMMUTABLE address constant (`:1611-1612`).
 /// ⛔ THE `load_and_store` ARM IS THE ONE WITH AN OUT-OF-SCOPE ANALYSIS IN IT
-/// (`L3GatherScatterChecker::isIBRWrite`, `:83`) and the chain walk never reaches it:
+/// (`L3GatherScatterChecker::isIBRWrite`, `:86`) and the chain walk never reaches it:
 /// `sentient.load_and_store` is not in its `isa<>` list.
 fn is_update_mode(mem_info: &MemoryOpInfo, defs: Definitions<'_>) -> bool {
     match defs.of(mem_info.increment) {
@@ -223,7 +225,7 @@ fn is_update_mode(mem_info: &MemoryOpInfo, defs: Definitions<'_>) -> bool {
     }
 }
 
-/// `dcc::utils::hasNonZeroConstants` (`Analyses/Utils.cpp:49`) — a query map whose values are ALL
+/// `dcc::utils::hasNonZeroConstants` (`Analyses/Utils.cpp:50`) — a query map whose values are ALL
 /// constants (its own first gate, `:51`) and at least one of which is not zero.
 fn has_non_zero_constants(map: Val, defs: Definitions<'_>) -> bool {
     let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(map) else {
@@ -264,7 +266,7 @@ fn first_user<'a>(of: &[Val], scope: &'a [Op]) -> Option<&'a Op> {
 ///
 /// ⭐ NOT [`crate::islands::sentient::dialects::element_size`], which ports
 /// `dcc::utils::getElementSize` — its arms are the composite transfers and it answers `None` for a
-/// scalar add. ⛔ `None` here is the reference's own `hasAttr("element_size") == false` (`:1826`).
+/// scalar add. ⛔ `None` here is the reference's own `hasAttr("element_size") == false` (`:1820`).
 fn scalar_element_size(val: Val, block: &[Op]) -> Option<Bits> {
     match defining_op(val, block) {
         Some(Op::Sentient(
@@ -281,8 +283,8 @@ fn scalar_element_size(val: Val, block: &[Op]) -> Option<Bits> {
 ///
 /// ⛔ TRAP: `replaceAllUsesExcept` (`:1567-1568`) EXCEPTS THE NEW ADD, which therefore keeps reading
 /// the loop result while everything else reads the add — a plain RAUW makes it read itself.
-/// ⛔ TRAP: the size is `element_sizes[result_idx + 1]`, slot 0 being the loop iterator's (`:1563`),
-/// and this island's `Carried::element_size` already IS that slot.
+/// ⛔ TRAP: the size is `element_sizes[result_idx + 1]`, slot 0 being the loop iterator's
+/// (`:1562-1564`), and this island's `Carried::element_size` already IS that slot.
 pub(crate) fn add_for_op_result_adjustment<E: ExpressionEvaluator>(
     scope: &mut Vec<Op>,
     at: usize,
@@ -294,15 +296,26 @@ pub(crate) fn add_for_op_result_adjustment<E: ExpressionEvaluator>(
     ibuff_space: &mut IbuffSpace,
 ) -> IbuffSpent {
     // `for_op->getResult(result_idx)` beside `element_sizes[result_idx + 1]` — ⭐ ONE carried entry
-    // holds both, and its `None` is the reference's `hasAttr("element_sizes") == false` (`:1561`).
+    // holds both, and its `None` is the reference's `hasAttr("element_sizes") == false` (`:1559`).
     let Some(Op::Sentient(ops::Op::For { carried, .. })) = scope.get(at) else {
         return IbuffSpent::WithinBudget;
     };
     let Some(entry) = carried.get(result_idx.0 as usize).copied() else {
         return IbuffSpent::WithinBudget;
     };
+    // ⭐ THE CONST IS BUILT BEFORE THE INSERTION POINT IS TAKEN (`:1547-1549`, then `:1551-1552`),
+    // and building it can insert at the START of this very block (see [`OffsetSites::query_maps`]) —
+    // the reference's point is anchored to the op, ours is an index, so the loop is re-found here.
     let new_const =
         evaluator.build_offset_value(adjustment_increment.0, sites, scope, ScalarTy::Index);
+    let Some(at) = scope
+        .iter()
+        .position(|op| results(op).contains(&entry.result))
+    else {
+        // ⭐ UNREACHABLE, AND A NO-OP RATHER THAN A REFUSAL: the loop was just read at `at` above,
+        // and building an offset value only ever inserts.
+        return IbuffSpent::WithinBudget;
+    };
     let new_add = sites.values.mint();
     scope.insert(
         at + 1,
@@ -334,8 +347,8 @@ pub(crate) fn add_for_op_result_adjustment<E: ExpressionEvaluator>(
 /// add/sub with a constant operand, or in an update-mode composite transfer.
 ///
 /// ⛔ TRAP: each transfer's `mutable_addr` must be defined by the PREVIOUS op in the chain
-/// (`:1738-1742`), so the address has to keep flowing forward or the chain is not mergeable.
-/// ⛔ TRAP: an op with no uses at all passes the first gate and fails the last one (`:1747`) — only
+/// (`:1609-1613`), so the address has to keep flowing forward or the chain is not mergeable.
+/// ⛔ TRAP: an op with no uses at all passes the first gate and fails the last one (`:1620`) — only
 /// the update-mode transfer may end the chain, and it must do so before the walk asks for a user.
 /// ⛔ TRAP: a `load_compute_and_send` can never trip the burst/IL gate — [`MemoryOpInfo::of`] records
 /// why: that arm sets neither field, so they stay at 1 and 0.
@@ -421,7 +434,7 @@ pub(crate) fn add_to_or_replace_op<E: ExpressionEvaluator>(
 /// add of the offset is built BEFORE the loop, and that add becomes the iter arg's initialiser.
 ///
 /// ⛔ TRAP: the ORDER is load-bearing — the element size is read off `derived_iv` before it is erased
-/// (`:1822-1826`), and the erase comes before the loop's operand is re-pointed at the new add.
+/// (`:1820-1824`), and the erase comes before the loop's operand is re-pointed at the new add.
 /// ⭐ `main_iv.getArgNumber()` IS BOTH INDICES: as a region argument it is `1 + i`, and as a
 /// `for_op_->setOperand` slot it is `1 + i` too, operand 0 being `$bound` — so it is carried `i`.
 pub(crate) fn hoist_candidate_out_of_loop(
@@ -682,6 +695,72 @@ mod unit_tests {
         assert_eq!(scope[1], add(Val(4), Val(9), Val(10), Some(Bits(8))));
         assert_eq!(scope[2], add(Val(10), Val(5), Val(6), None));
         assert_eq!(ibuff, IbuffSpace(1));
+    }
+
+    /// e170 — a `buildOffsetValue` that inserts ahead of the loop does not carry the add off it: the
+    /// reference's insertion point is anchored to the op (`:1551-1552`) and this one is re-found.
+    #[test]
+    fn a_for_op_result_adjustment_re_finds_the_loop_after_the_const_is_built() {
+        /// An evaluator that inserts at the START of the walked block, which is what
+        /// [`OffsetSites::query_maps`] being `None` means the reference's const builder does.
+        struct PrependingEvaluator;
+
+        impl ExpressionEvaluator for PrependingEvaluator {
+            fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+                absolute(ScalarOffset(4))
+            }
+
+            fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+                absolute(ScalarOffset(20))
+            }
+
+            fn build_offset_value(
+                &mut self,
+                _evaluation: &Evaluation,
+                _sites: &mut OffsetSites<'_>,
+                walked: &mut Vec<Op>,
+                _ty: ScalarTy,
+            ) -> Val {
+                walked.insert(0, constant(0, Val(9)));
+                Val(9)
+            }
+        }
+
+        let mut scope = vec![
+            for_op(
+                vec![carried(Val(2), Val(3), Val(4), Some(Bits(8)))],
+                Vec::new(),
+            ),
+            add(Val(4), Val(5), Val(6), None),
+        ];
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+        let increment = absolute(ScalarOffset(16));
+        let mut ibuff = IbuffSpace(2);
+        assert_eq!(
+            add_for_op_result_adjustment(
+                &mut scope,
+                0,
+                IterArgIndex(0),
+                KnownAbsolute::of(&increment).expect("the fixture states it absolute"),
+                GenericComp::Lxlu,
+                &mut PrependingEvaluator,
+                &mut sites,
+                &mut ibuff,
+            ),
+            IbuffSpent::WithinBudget
+        );
+        assert_eq!(scope[0], constant(0, Val(9)));
+        // The loop moved to 1, so the add belongs at 2 — index 1 is where a position taken before the
+        // const was built would have put it, which is BEFORE the loop.
+        assert!(matches!(scope[1], Op::Sentient(ops::Op::For { .. })));
+        assert_eq!(scope[2], add(Val(4), Val(9), Val(10), Some(Bits(8))));
+        assert_eq!(scope[3], add(Val(10), Val(5), Val(6), None));
     }
 
     /// e171 — the vendor's own shape: a chain whose one composite transfer takes its mutable address

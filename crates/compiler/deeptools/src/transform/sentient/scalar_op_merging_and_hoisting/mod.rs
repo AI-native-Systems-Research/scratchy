@@ -113,7 +113,7 @@ pub(crate) mod scalar_op_merging;
 /// (`ScalarOpMergingAndHoisting.cpp:2270-2273`).
 ///
 /// ⭐ THE `DT_CHECK` IS THE CONSTRUCTOR. `doesValueExceedLRFRange`'s check (`:173`) and
-/// `computeAddressScale`'s `return -1` (`:271`) are the same fact stated twice; with the set closed
+/// `computeAddressScale`'s `return -1` (`:272`) are the same fact stated twice; with the set closed
 /// here neither is reachable, so nothing below has to refuse at run time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScalarOpComp {
@@ -128,7 +128,7 @@ pub(crate) enum ScalarOpComp {
 }
 
 impl ScalarOpComp {
-    /// `is_LX_L0` (`:2270-2273`) — `None` for every other unit, which is the flag the caller's own
+    /// `is_LX_L0` (`:2271-2273`) — `None` for every other unit, which is the flag the caller's own
     /// branch turns on and the reason Scalar Op Merging is skipped entirely elsewhere.
     #[must_use]
     pub(crate) const fn of(comp: GenericComp) -> Option<ScalarOpComp> {
@@ -278,7 +278,7 @@ pub(crate) fn does_value_exceed_lrf_range<A: Arch>(
 /// `if (genericUnit == L0LU) addrScale *= numPTRows`, which `getAddressGranularityScale` does NOT —
 /// this is the raw table lookup. Reusing it scales every L0 LOAD immediate by the row count.
 ///
-/// ⭐ THE `return -1` (`:271`) IS UNREACHABLE because [`ScalarOpComp`] closes the set at four.
+/// ⭐ THE `return -1` (`:272`) IS UNREACHABLE because [`ScalarOpComp`] closes the set at four.
 #[must_use]
 pub(crate) fn compute_address_scale<A: Arch>(comp: ScalarOpComp) -> AddressScale {
     match comp {
@@ -292,12 +292,12 @@ pub(crate) fn compute_address_scale<A: Arch>(comp: ScalarOpComp) -> AddressScale
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 
 /// `if (b > 0) burst_ = b;` — the guard both `getBurstSize()` and `getInterleavedGroup()` go through
-/// (`:293-297`), which keeps the field's DEFAULT when the op says zero.
+/// (`:294-298`), which keeps the field's DEFAULT when the op says zero.
 const fn positive_or(value: Elements, default: Elements) -> Elements {
     if value.0 > 0 { value } else { default }
 }
 
-/// THE ATTRIBUTES A MEMORY OP CARRIES — `struct MemoryOpInfo` (`:283-336`).
+/// THE ATTRIBUTES A MEMORY OP CARRIES — `struct MemoryOpInfo` (`:285-336`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MemoryOpInfo {
     /// `mutable_addr_` — the double buffer's toggling half.
@@ -323,12 +323,12 @@ pub(crate) struct MemoryOpInfo {
 impl MemoryOpInfo {
     /// Replaces: e160_MemoryOpInfo
     ///
-    /// `explicit MemoryOpInfo(Operation *op)` — the LAS / RAS / LCAS `dyn_cast` chain (`:287-317`).
+    /// `explicit MemoryOpInfo(Operation *op)` — the LAS / RAS / LCAS `dyn_cast` chain (`:288-325`).
     ///
     /// ⛔ THE THREE ARMS FILL DIFFERENT FIELDS: RAS leaves `chunk_size`/`chunk_stride` at **0** and
     /// LCAS leaves `burst` at 1, `il` and `total_elements` at 0, even though the ops carry those —
     /// and LCAS takes `getDstElementSize()`, not the source's, because that is what the address is
-    /// computed in (`:314-316`).
+    /// computed in (`:321-323`).
     ///
     /// ⭐ `None` RATHER THAN THE REFERENCE'S UNINITIALISED `element_size_`: its fourth (implicit)
     /// arm leaves that field garbage, and all five construction sites are already guarded by
@@ -395,7 +395,7 @@ impl MemoryOpInfo {
 }
 
 /// THE BURST AND INTERLEAVED-GROUP COUNTS OF ONE TRANSFER — `calculateIBuffRequired`'s two
-/// `DT_CHECK`s (`:594-597`), as a constructor.
+/// `DT_CHECK`s (`:593-596`), as a constructor.
 ///
 /// ⛔ NOT [`MemoryOpInfo`], THOUGH IT CARRIES THE SAME TWO FIELDS: that one also admits a
 /// `load_compute_and_send`, and the IBuff cost of one is exactly what this pair of checks refuses to
@@ -446,7 +446,7 @@ pub(crate) struct OperationData {
     /// `op_`.
     pub(crate) op: Val,
     /// `mod_` — the amount to modify by. ⛔ NOT OPTIONAL: both constructors take it and
-    /// `applyOperationData` dereferences it unconditionally (`:1744`, `:1762`).
+    /// `applyOperationData` dereferences it unconditionally (`:1744`, `:1751`).
     pub(crate) mod_by: EvaluatedValue,
     /// `merging_increment_` — the merging increment AT THIS operation, not the block's running one.
     pub(crate) merging_increment: EvaluatedValue,
@@ -486,7 +486,7 @@ impl FieldUnrollData {
 /// # ⛔ THE CHECKS ARE THE CONSTRUCTOR, SO THE UNROLL ITSELF CANNOT REFUSE
 ///
 /// `DT_CHECK_MSG(candidate_op, ...)` is [`FieldUnrollData::op`] being `Some`, the `isa<>` pair is the
-/// two arms below, and `created_ops.back()` at the end (`:1057`) is *"did it create at least one"* —
+/// two arms below, and `created_ops.back()` at the end (`:1059`) is *"did it create at least one"* —
 /// which an empty `speculative_immutables_` would read past. [`UnrollTarget::of`] answers all three
 /// with `None`, and [`scalar_op_merging::unroll_burst_and_il`] then has nothing left to check.
 ///
@@ -499,7 +499,7 @@ pub(crate) struct UnrollTarget {
     /// `op->getResult(0)` — the value the candidate binds, and its identity here.
     pub(crate) result: Val,
     /// `unroll_candidate.getSpeculativeImmutables()`, non-empty and in REVERSE program order:
-    /// `isFieldUnrollCandidate` counts the burst and IL groups DOWN (`:1129-1132`, `:1149`) because
+    /// `isFieldUnrollCandidate` counts the burst and IL groups DOWN (`:1130`, `:1150`) because
     /// merging runs bottom up, so the unroll walks this list backwards to emit top down.
     pub(crate) immutables: Vec<EvaluatedValue>,
 }
