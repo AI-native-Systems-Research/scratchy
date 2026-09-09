@@ -82,7 +82,13 @@
 //! | `e626_runOn` | 626 | 6 | 79 | `dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:330` |
 //! | `e641_runOnOperation` | 641 | 7 | 8 | `dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:410` |
 
-use crate::islands::sentient::dialects::{Op, sentient};
+use std::num::NonZeroU32;
+
+use crate::arch::Elements;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, replace_all_uses_with, sentient};
+use crate::transform::sentient::utils::{SenTarget, round_down_unroll_factor};
+use crate::units::DfirUnit;
 
 /// WHERE AN OP SITS IN A LOOP BODY — one entry of the reference's `std::vector<Operation *>`.
 ///
@@ -100,22 +106,45 @@ pub struct InBody(pub usize);
 pub struct SentientFor<'a> {
     /// `getBody(0)->getOperations()` — the loop's single region.
     body: &'a [Op],
+    /// `getBound()` — the trip count, which e314 and e315 both require to be a constant.
+    bound: Val,
+    /// `getRegionIterArgs()` PAIRED WITH `getInits()`, which is how e314 rewires them (`:217-223`).
+    carried: &'a [sentient::Carried],
 }
 
 impl<'a> SentientFor<'a> {
     /// The loop `op` is, or nothing when it is not a `sentient.for`.
     #[must_use]
     pub fn of(op: &'a Op) -> Option<SentientFor<'a>> {
-        let Op::Sentient(sentient::Op::For { body, .. }) = op else {
+        let Op::Sentient(sentient::Op::For {
+            bound, carried, body, ..
+        }) = op
+        else {
             return None;
         };
-        Some(SentientFor { body })
+        Some(SentientFor {
+            body,
+            bound: *bound,
+            carried,
+        })
     }
 
     /// Its body, in block order.
     #[must_use]
     pub const fn body(self) -> &'a [Op] {
         self.body
+    }
+
+    /// Its trip count.
+    #[must_use]
+    pub const fn bound(self) -> Val {
+        self.bound
+    }
+
+    /// The values it carries — `getNumRegionIterArgs()` is this many.
+    #[must_use]
+    pub const fn carried(self) -> &'a [sentient::Carried] {
+        self.carried
     }
 }
 
@@ -236,20 +265,351 @@ pub fn check_operands_of_compute_op(
         .any(|operand| operand.unroll_incr || invalid_operand.names(operand.port))
 }
 
-// crustify:todo: e313_isCandidate
-//   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:117  (52 body lines, level 1)
-//   original  : bool isCandidate(Operation *for_op, SenComponents unit_comp) const
-//   calls     : e073_getNontrivialOpsInLoop, e074_checkOperandsOfComputeOp, e252_size
+/// WHERE A LOOP SITS IN THE UNIT'S BLOCK — e314 and e315 both rewrite the loop's body and then the
+/// uses of its results, so a `&Op` is again the one handle that cannot be passed on ([`InBody`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InBlock(pub usize);
 
-// crustify:todo: e314_removeLoopsContainingLoadSendOrReceiveStore
-//   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:175  (65 body lines, level 1)
-//   original  : bool removeLoopsContainingLoadSendOrReceiveStore(sentient::ForOp sentient_for, dataflow::ProgramUnitOp unit, SenComponents unit_comp)
-//   calls     : e073_getNontrivialOpsInLoop
+/// A MEMORY OP AS THE FIELDS THIS PASS READS — `LoadAndSendOp` and `ReceiveAndStoreOp`, which declare
+/// every one of them at the same type, so the reference's two `dyn_cast` arms are one pattern here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryOp {
+    mutable_addr: Val,
+    interleaved_group: Elements,
+    burst_size: Elements,
+    result: Val,
+}
 
-// crustify:todo: e315_removeLoopsContainingComputeOp
-//   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:248  (80 body lines, level 1)
-//   original  : bool removeLoopsContainingComputeOp(sentient::ForOp sentient_for, SenComponents unit_comp)
-//   calls     : e073_getNontrivialOpsInLoop, e243_roundDownUnrollFactor
+/// `dyn_cast<LoadAndSendOp>(op)` or `dyn_cast<ReceiveAndStoreOp>(op)`.
+fn memory_op(op: &Op) -> Option<MemoryOp> {
+    let Op::Sentient(
+        sentient::Op::LoadAndSend {
+            mutable_addr,
+            interleaved_group,
+            extent,
+            result,
+            ..
+        }
+        | sentient::Op::ReceiveAndStore {
+            mutable_addr,
+            interleaved_group,
+            extent,
+            result,
+            ..
+        },
+    ) = op
+    else {
+        return None;
+    };
+    Some(MemoryOp {
+        mutable_addr: *mutable_addr,
+        interleaved_group: *interleaved_group,
+        burst_size: extent.burst_size,
+        result: *result,
+    })
+}
+
+/// Replaces: e313_isCandidate
+///
+/// Whether the loop is exactly one re-rollable op: on a compute unit one clean compute and no carried
+/// value, on a memory unit one un-interleaved memory op walking the single carried address.
+///
+/// ⛔ TRAP: THE MEMORY ARM'S CARRIED VALUE MUST BE THE OP'S OWN `mutable_addr` (`:156`, `:161`) — a
+/// loop carrying some OTHER address is refused, because folding the trip into the burst is only sound
+/// when the loop's whole per-iteration state is the address the burst itself advances.
+#[must_use]
+pub fn is_candidate(sentient_for: SentientFor<'_>, unit_comp: DfirUnit) -> bool {
+    // `is_any_of(unit_comp, SFP, PE, PT)` (`:139-140`) and `unit_comp == PT` (`:141`).
+    let is_compute_unit = matches!(
+        unit_comp,
+        DfirUnit::Sfp | DfirUnit::Pe | DfirUnit::PtRow(_)
+    );
+    let is_pt = matches!(unit_comp, DfirUnit::PtRow(_));
+
+    let nontrivial_ops_in_body = get_nontrivial_ops_in_loop(sentient_for);
+    let iter_args = sentient_for.carried().len();
+    if (!is_compute_unit && iter_args != 1)
+        || (is_compute_unit && iter_args != 0)
+        || nontrivial_ops_in_body.len() != 1
+    {
+        return false;
+    }
+    let target_op = &sentient_for.body()[nontrivial_ops_in_body[0].0];
+    if is_compute_unit {
+        let invalid_operand = if is_pt {
+            InvalidOperand::Xrf
+        } else {
+            InvalidOperand::Nfwd
+        };
+        return ComputeOp::of(target_op)
+            .is_some_and(|compute_op| check_operands_of_compute_op(&compute_op, invalid_operand));
+    }
+    let Some(memory) = memory_op(target_op) else {
+        return false;
+    };
+    memory.mutable_addr == sentient_for.carried()[0].arg && memory.interleaved_group == Elements(0)
+}
+
+/// WHETHER THE LOOP WAS REWRITTEN AWAY — the reference's `bool`, whose meaning is *"the
+/// transformation was applied and \p sentient_for is to be removed"* (`:172-173`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rerolled {
+    /// `true` — the body op now covers the whole trip; `runOn` erases the loop.
+    LoopIsToBeRemoved,
+    /// `false` — not profitable, and the loop stands.
+    Untouched,
+}
+
+/// `memory_op->setAttr("burst_size", ..)`, the residual clone's `getMutableAddrMutable().assign(..)`
+/// and `updateDbgName(prefix, op, ")")` — which writes ONLY when the op already has a name
+/// (`dcc/src/Utils/Utils.cpp:493-496, 511-515`).
+fn rewrite_memory_op(op: &mut Op, burst: Elements, mutable_addr: Option<Val>, prefix: &str) {
+    let Op::Sentient(
+        sentient::Op::LoadAndSend {
+            mutable_addr: addr,
+            extent,
+            dbg_name,
+            ..
+        }
+        | sentient::Op::ReceiveAndStore {
+            mutable_addr: addr,
+            extent,
+            dbg_name,
+            ..
+        },
+    ) = op
+    else {
+        return;
+    };
+    extent.burst_size = burst;
+    if let Some(new_addr) = mutable_addr {
+        *addr = new_addr;
+    }
+    if let Some(name) = dbg_name {
+        *name = format!("{prefix}{name})");
+    }
+}
+
+/// A CLONE BINDS FRESH RESULTS — `builder.clone(*op)` gives the copy its own values, and re-minting is
+/// how that reads at this rung.
+fn cloned_with_fresh_results(op: &Op, values: &mut Values) -> Op {
+    let mut clone = op.clone();
+    if let Op::Sentient(inner) = &mut clone {
+        for result in sentient::results_mut(inner) {
+            *result = values.mint();
+        }
+    }
+    clone
+}
+
+/// Replaces: e314_removeLoopsContainingLoadSendOrReceiveStore
+///
+/// Folds a memory loop's trip count into its memory op's burst size, cloning a second op beside it for
+/// the residual burst, and rewires the loop's carried address and its result.
+///
+/// ⛔ `max_burst` IS A PARAMETER: `getMaxBurstSize(unit)` (`:183`) reads the per-unit table on
+/// `dcc_ext_ctx_`, which is in `Analyses/` and out of campaign scope; its
+/// `DT_CHECK_MSG(max_burst != -1)` is [`Elements`] having no negative value.
+///
+/// ⛔ TRAP: `DT_CHECK_MSG(target == residual_burst)` (`:200-201`) IS DISCHARGED BY THE REFUSAL ABOVE IT
+/// — `target <= max_burst * 2` leaves at most one more burst after the first bite, so it is a subtraction.
+pub fn remove_loops_containing_load_send_or_receive_store(
+    block: &mut [Op],
+    at: InBlock,
+    max_burst: Elements,
+    values: &mut Values,
+) -> Rerolled {
+    // Everything the decision needs, read before anything is rewritten.
+    let (memory_at, carried, memory_result, new_burst, residual_burst) = {
+        let scope: &[Op] = block;
+        let Some(sentient_for) = scope.get(at.0).and_then(SentientFor::of) else {
+            return Rerolled::Untouched;
+        };
+        let nontrivial_ops_in_body = get_nontrivial_ops_in_loop(sentient_for);
+        let Some(memory_at) = nontrivial_ops_in_body.first().copied() else {
+            return Rerolled::Untouched;
+        };
+        // `isCandidate` (`:151-165`) already proved this op is one of the two.
+        let Some(memory) = memory_op(&sentient_for.body()[memory_at.0]) else {
+            return Rerolled::Untouched;
+        };
+        // `dyn_cast<sentient::ConstantOp>(getBound().getDefiningOp())` (`:189-193`), then
+        // `loop_count == 0` (`:196`). A NEGATIVE bound is not a trip count and the same refusal covers
+        // it — the burst it would become has no negative value.
+        let defs = Definitions::from_innermost(core::slice::from_ref(&scope));
+        let Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) =
+            defs.of(sentient_for.bound())
+        else {
+            return Rerolled::Untouched;
+        };
+        if *value <= 0 {
+            return Rerolled::Untouched;
+        }
+        let loop_count = value.unsigned_abs();
+        // `int target = (burst_size > 0) ? loop_count * burst_size : loop_count;` (`:195`).
+        let target = if memory.burst_size == Elements(0) {
+            loop_count
+        } else {
+            loop_count.saturating_mul(memory.burst_size.0)
+        };
+        if target > max_burst.0.saturating_mul(2) {
+            return Rerolled::Untouched;
+        }
+        let new_burst = target.min(max_burst.0);
+        (
+            memory_at,
+            sentient_for.carried().to_vec(),
+            memory.result,
+            Elements(new_burst),
+            Elements(target - new_burst),
+        )
+    };
+
+    let last_result = {
+        let Some(Op::Sentient(sentient::Op::For { body, .. })) = block.get_mut(at.0) else {
+            return Rerolled::Untouched;
+        };
+        // `iter_arg.replaceAllUsesWith(starting_val)` over every carried pair (`:217-223`).
+        for pair in &carried {
+            replace_all_uses_with(body, pair.arg, pair.init);
+        }
+        let mut last_result = memory_result;
+        if residual_burst > Elements(0) {
+            // The residual copy goes AFTER the memory op (`:214`, `:227`) and reads the address the
+            // first one left behind (`:233-236`).
+            let mut clone = cloned_with_fresh_results(&body[memory_at.0], values);
+            rewrite_memory_op(&mut clone, residual_burst, Some(memory_result), "LEVR-resid(");
+            if let Some(residual) = memory_op(&clone) {
+                last_result = residual.result;
+            }
+            body.insert(memory_at.0 + 1, clone);
+        }
+        // ⭐ AFTER the clone, so the residual's name wraps the ORIGINAL name and not `LEVR(..)`.
+        rewrite_memory_op(&mut body[memory_at.0], new_burst, None, "LEVR(");
+        last_result
+    };
+    // `sentient_for.getResults()[0].replaceAllUsesWith(last_memory_op->getResult(0))` (`:238-239`).
+    if let Some(first) = carried.first() {
+        replace_all_uses_with(block, first.result, last_result);
+    }
+    Rerolled::LoopIsToBeRemoved
+}
+
+/// `getUnrollFactor()` on any of the four compute ops.
+fn unroll_factor_of(op: &Op) -> Option<sentient::UnrollFactor> {
+    let Op::Sentient(
+        sentient::Op::VectorMac { unroll_factor, .. }
+        | sentient::Op::VectorBinary { unroll_factor, .. }
+        | sentient::Op::VectorUnary { unroll_factor, .. }
+        | sentient::Op::VectorTernary { unroll_factor, .. },
+    ) = op
+    else {
+        return None;
+    };
+    Some(*unroll_factor)
+}
+
+/// `compute_op->setAttr("unrollFactor", ..)` plus `updateDbgName(prefix, op, ")")`.
+fn rewrite_compute_op(op: &mut Op, unroll: sentient::UnrollFactor, prefix: &str) {
+    let Op::Sentient(
+        sentient::Op::VectorMac {
+            unroll_factor,
+            dbg_name,
+            ..
+        }
+        | sentient::Op::VectorBinary {
+            unroll_factor,
+            dbg_name,
+            ..
+        }
+        | sentient::Op::VectorUnary {
+            unroll_factor,
+            dbg_name,
+            ..
+        }
+        | sentient::Op::VectorTernary {
+            unroll_factor,
+            dbg_name,
+            ..
+        },
+    ) = op
+    else {
+        return;
+    };
+    *unroll_factor = unroll;
+    if let Some(name) = dbg_name {
+        *name = format!("{prefix}{name})");
+    }
+}
+
+/// Replaces: e315_removeLoopsContainingComputeOp
+///
+/// Folds a compute loop's trip count into its compute op's unroll factor, cloning a second op beside
+/// it for the residual unroll.
+///
+/// ⛔ TRAP: TWO UNROLL FIELDS OR NOTHING. `target_unroll != residual_unroll_val` (`:288`) refuses
+/// whenever one rounding-down plus one more does not cover `loop_count * unroll_factor` EXACTLY —
+/// a third copy is not profitable, so an unrollable-but-not-in-two loop stands.
+///
+/// ⛔ `sen_target` IS A PARAMETER: it is `dccExtContext().dsc_global_->backend` (`:283`), and
+/// [`round_down_unroll_factor`] answers differently for a reduction on the card.
+pub fn remove_loops_containing_compute_op(
+    block: &mut [Op],
+    at: InBlock,
+    sen_target: SenTarget,
+    values: &mut Values,
+) -> Rerolled {
+    let (compute_at, new_unroll, residual_unroll) = {
+        let scope: &[Op] = block;
+        let Some(sentient_for) = scope.get(at.0).and_then(SentientFor::of) else {
+            return Rerolled::Untouched;
+        };
+        let nontrivial_ops_in_body = get_nontrivial_ops_in_loop(sentient_for);
+        let Some(compute_at) = nontrivial_ops_in_body.first().copied() else {
+            return Rerolled::Untouched;
+        };
+        let compute_op = &sentient_for.body()[compute_at.0];
+        // `DT_ERROR("no match operation")` (`:266`) — `isCandidate` (`:143-149`) already proved this
+        // op is one of the four, so there is nothing left here to abort on.
+        let Some(unroll) = unroll_factor_of(compute_op) else {
+            return Rerolled::Untouched;
+        };
+        // `loop_count` STAYS 0 when the bound is not a constant (`:277-280`), and `loop_count == 0`
+        // refuses (`:281`) — as does anything that is not the reference's `unsigned`.
+        let defs = Definitions::from_innermost(core::slice::from_ref(&scope));
+        let Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) =
+            defs.of(sentient_for.bound())
+        else {
+            return Rerolled::Untouched;
+        };
+        let Some(target_unroll) = u32::try_from(*value)
+            .ok()
+            .and_then(|count| NonZeroU32::new(count.saturating_mul(unroll.count())))
+        else {
+            return Rerolled::Untouched;
+        };
+        let new_unroll = round_down_unroll_factor(target_unroll, compute_op, sen_target);
+        let remaining = target_unroll.get() - new_unroll.count();
+        let residual_unroll = NonZeroU32::new(remaining)
+            .map(|left| round_down_unroll_factor(left, compute_op, sen_target));
+        if remaining != residual_unroll.map_or(0, sentient::UnrollFactor::count) {
+            return Rerolled::Untouched;
+        }
+        (compute_at, new_unroll, residual_unroll)
+    };
+
+    let Some(Op::Sentient(sentient::Op::For { body, .. })) = block.get_mut(at.0) else {
+        return Rerolled::Untouched;
+    };
+    if let Some(residual_unroll) = residual_unroll {
+        let mut clone = cloned_with_fresh_results(&body[compute_at.0], values);
+        rewrite_compute_op(&mut clone, residual_unroll, "LEVR-resid(");
+        body.insert(compute_at.0 + 1, clone);
+    }
+    // ⭐ AFTER the clone, so the residual's name wraps the ORIGINAL name.
+    rewrite_compute_op(&mut body[compute_at.0], new_unroll, "LEVR(");
+    Rerolled::LoopIsToBeRemoved
+}
 
 // crustify:todo: e626_runOn
 //   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:330  (79 body lines, level 6)
@@ -264,8 +624,10 @@ pub fn check_operands_of_compute_op(
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::Val;
+    use crate::units::Row;
 
     /// `sentient.scalar_constant` — one of the two ops e073 filters out.
     fn scalar_constant(result: Val) -> Op {
@@ -391,5 +753,265 @@ mod unit_tests {
 
         // The `llvm_unreachable` this witness replaces.
         assert!(ComputeOp::of(&nop()).is_none());
+    }
+
+    /// `sentient.for` over `body`, carrying `carried` and bounded by `bound`.
+    fn sentient_for_carrying(bound: Val, carried: Vec<sentient::Carried>, body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv: Val(0),
+            bound,
+            carried,
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// One carried address, unassigned.
+    fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
+        sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lar,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// `sentient.load_and_send` walking `mutable_addr`, with the `.td`'s own extent defaults.
+    fn load_and_send(mutable_addr: Val, result: Val, burst_size: Elements, group: Elements) -> Op {
+        Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr,
+            immutable_addr: Val(6),
+            increment: Val(7),
+            consumer: SendEnd::to_self(Val(8)),
+            result,
+            extent: sentient::Extent {
+                burst_size,
+                ..sentient::Extent::of(Elements(64), Bits(32))
+            },
+            interleaved_group: group,
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: sentient::ShuffleMode::NoShuffle,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lar,
+                index: None,
+            },
+            dbg_name: Some("LS".to_owned()),
+        })
+    }
+
+    /// `sentient.yield` returning `results`.
+    fn yield_op(results: Vec<Val>) -> Op {
+        Op::Sentient(sentient::Op::Yield { results })
+    }
+
+    /// Both arms of the candidate test, and the two refusals that are unit-specific: `xrf` on PT, and
+    /// an interleaved memory op — plus the iter-arg counts, which are opposite on the two unit kinds.
+    #[test]
+    fn e313_admits_one_clean_op_per_unit_kind_and_nothing_else() {
+        let clean = sentient_for(vec![
+            mac(sentient::Port::Lrf(sentient::LrfIndex::L1), false, false),
+            yield_op(Vec::new()),
+        ]);
+        let clean = SentientFor::of(&clean).expect("a sentient.for");
+        assert!(is_candidate(clean, DfirUnit::Pe));
+        assert!(is_candidate(clean, DfirUnit::PtRow(Row::checked(0).expect("PT row 0 exists"))));
+        // ⛔ A COMPUTE LOOP ON A MEMORY UNIT NEEDS ONE ITER ARG AND HAS NONE.
+        assert!(!is_candidate(clean, DfirUnit::Lxlu));
+
+        let xrf = sentient_for(vec![mac(sentient::Port::Xrf, false, false), yield_op(Vec::new())]);
+        let xrf = SentientFor::of(&xrf).expect("a sentient.for");
+        assert!(is_candidate(xrf, DfirUnit::Pe));
+        assert!(!is_candidate(xrf, DfirUnit::PtRow(Row::checked(0).expect("PT row 0 exists"))));
+
+        let memory = sentient_for_carrying(
+            Val(1),
+            vec![carried(Val(10), Val(11), Val(12))],
+            vec![
+                load_and_send(Val(11), Val(13), Elements(4), Elements(0)),
+                yield_op(vec![Val(13)]),
+            ],
+        );
+        let memory_for = SentientFor::of(&memory).expect("a sentient.for");
+        assert!(is_candidate(memory_for, DfirUnit::Lxlu));
+        assert!(!is_candidate(memory_for, DfirUnit::Pe));
+
+        let interleaved = sentient_for_carrying(
+            Val(1),
+            vec![carried(Val(10), Val(11), Val(12))],
+            vec![
+                load_and_send(Val(11), Val(13), Elements(4), Elements(2)),
+                yield_op(vec![Val(13)]),
+            ],
+        );
+        let interleaved = SentientFor::of(&interleaved).expect("a sentient.for");
+        assert!(!is_candidate(interleaved, DfirUnit::Lxlu));
+
+        // The carried address must be the op's own.
+        let other_addr = sentient_for_carrying(
+            Val(1),
+            vec![carried(Val(10), Val(11), Val(12))],
+            vec![
+                load_and_send(Val(99), Val(13), Elements(4), Elements(0)),
+                yield_op(vec![Val(13)]),
+            ],
+        );
+        let other_addr = SentientFor::of(&other_addr).expect("a sentient.for");
+        assert!(!is_candidate(other_addr, DfirUnit::Lxlu));
+    }
+
+    /// Three iterations of a 4-element burst against a max of 8: the op takes 8, a residual clone
+    /// takes the remaining 4 from the address the first left, and the loop's result is rewired to the
+    /// clone. A trip that needs three bursts is refused instead.
+    #[test]
+    fn e314_folds_the_trip_into_one_burst_and_a_residual_clone() {
+        let memory_loop = || {
+            vec![
+                scalar_constant_of(Val(1), 3),
+                sentient_for_carrying(
+                    Val(1),
+                    vec![carried(Val(10), Val(11), Val(12))],
+                    vec![
+                        load_and_send(Val(11), Val(13), Elements(4), Elements(0)),
+                        yield_op(vec![Val(13)]),
+                    ],
+                ),
+                load_and_send(Val(12), Val(14), Elements(0), Elements(0)),
+            ]
+        };
+        let mut block = memory_loop();
+        let mut values = Values::default();
+        for _ in 0..20 {
+            let _ = values.mint();
+        }
+        assert_eq!(
+            remove_loops_containing_load_send_or_receive_store(
+                &mut block,
+                InBlock(1),
+                Elements(8),
+                &mut values,
+            ),
+            Rerolled::LoopIsToBeRemoved
+        );
+        let sentient_for = SentientFor::of(&block[1]).expect("a sentient.for");
+        let first = memory_op(&sentient_for.body()[0]).expect("the original memory op");
+        let residual = memory_op(&sentient_for.body()[1]).expect("the residual clone");
+        assert_eq!(first.burst_size, Elements(8));
+        assert_eq!(residual.burst_size, Elements(4));
+        // The iter arg became the loop's initial value, and the clone walks on from the original.
+        assert_eq!(first.mutable_addr, Val(10));
+        assert_eq!(residual.mutable_addr, Val(13));
+        assert_eq!(residual.result, Val(20));
+        // `LEVR(` wraps the original name; the residual wraps it BEFORE that rename.
+        assert_eq!(
+            sentient_for.body().iter().filter_map(dbg_name_of).collect::<Vec<_>>(),
+            ["LEVR(LS)", "LEVR-resid(LS)"]
+        );
+        // The loop's result is now the residual clone's.
+        assert_eq!(
+            memory_op(&block[2]).expect("the reader").mutable_addr,
+            Val(20)
+        );
+
+        // `target > max_burst * 2` — three bursts of 4 need three ops, which is not profitable.
+        let mut refused = memory_loop();
+        assert_eq!(
+            remove_loops_containing_load_send_or_receive_store(
+                &mut refused,
+                InBlock(1),
+                Elements(3),
+                &mut values,
+            ),
+            Rerolled::Untouched
+        );
+    }
+
+    /// A trip of 3 over an `x2` compute is a target of 6: `x4` on the op and an `x2` clone beside it.
+    /// A target of 3 is refused, because `x2` plus `x1` does not cover it in two fields.
+    #[test]
+    fn e315_folds_the_trip_into_two_unroll_fields_or_declines() {
+        let unrolled = |unroll| {
+            let mut op = mac(sentient::Port::Lrf(sentient::LrfIndex::L1), false, false);
+            rewrite_compute_op(&mut op, unroll, "");
+            op
+        };
+        let mut block = vec![
+            scalar_constant_of(Val(1), 3),
+            sentient_for_carrying(
+                Val(1),
+                Vec::new(),
+                vec![unrolled(sentient::UnrollFactor::X2), yield_op(Vec::new())],
+            ),
+        ];
+        let mut values = Values::default();
+        for _ in 0..20 {
+            let _ = values.mint();
+        }
+        assert_eq!(
+            remove_loops_containing_compute_op(
+                &mut block,
+                InBlock(1),
+                SenTarget::Sentient,
+                &mut values,
+            ),
+            Rerolled::LoopIsToBeRemoved
+        );
+        let sentient_for = SentientFor::of(&block[1]).expect("a sentient.for");
+        assert_eq!(
+            sentient_for
+                .body()
+                .iter()
+                .filter_map(unroll_factor_of)
+                .collect::<Vec<_>>(),
+            [sentient::UnrollFactor::X4, sentient::UnrollFactor::X2]
+        );
+
+        // `target_unroll != residual_unroll_val`: 3 rounds down to 2, and 1 is not the missing 1... it
+        // is — so take a target of 7 instead, which is 4 + 2 and leaves 1 uncovered.
+        let mut refused = vec![
+            scalar_constant_of(Val(1), 7),
+            sentient_for_carrying(
+                Val(1),
+                Vec::new(),
+                vec![unrolled(sentient::UnrollFactor::X1), yield_op(Vec::new())],
+            ),
+        ];
+        assert_eq!(
+            remove_loops_containing_compute_op(
+                &mut refused,
+                InBlock(1),
+                SenTarget::Sentient,
+                &mut values,
+            ),
+            Rerolled::Untouched
+        );
+    }
+
+    /// `sentient.scalar_constant` binding `result` to `value`.
+    fn scalar_constant_of(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// The `dbgName` of a memory op, for the two `updateDbgName` calls.
+    fn dbg_name_of(op: &Op) -> Option<&str> {
+        let Op::Sentient(
+            sentient::Op::LoadAndSend { dbg_name, .. }
+            | sentient::Op::ReceiveAndStore { dbg_name, .. },
+        ) = op
+        else {
+            return None;
+        };
+        dbg_name.as_deref()
     }
 }

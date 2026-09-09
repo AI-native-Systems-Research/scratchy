@@ -82,7 +82,16 @@
 //! | `e601_runOn` | 601 | 5 | 13 | `dcc/src/Transform/Sentient/LoopMerging.cpp:321` |
 //! | `e627_runOnOperation` | 627 | 6 | 5 | `dcc/src/Transform/Sentient/LoopMerging.cpp:335` |
 
-use crate::islands::sentient::dialects::{Op, dataflow, sentient, symbol, uniform};
+use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
+    DbgNamePrefix, new_dbg_name_from_list,
+};
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, dataflow, erase_defining_op, replace_all_uses_with, sentient, symbol,
+    uniform, use_count,
+};
+use crate::transform::sentient::utils::{ConstKind, is_constant};
 
 /// WHERE AN OP SITS IN ITS BLOCK — the `Operation *` identity `loopsAreMergeable` compares against
 /// the second loop (`:85`).
@@ -159,10 +168,256 @@ pub fn get_new_dbg_name(for_op1: &DbgName, for_op2: &DbgName) -> DbgName {
     DbgName(format!("LM({}, {})", for_op1.text(), for_op2.text()))
 }
 
-// crustify:todo: e316_mergeLoops
-//   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:179  (100 body lines, level 1)
-//   original  : void LoopMergingPass::mergeLoops( std::pair<dcc::LoopNode *, dcc::LoopNode *> loops)
-//   calls     : e075_getNextEligibleOp, e252_size
+/// TWO LOOPS THE PASS MAY MERGE — the pair's own two `DT_CHECK`s (`:181`, `:184-185`) as a type.
+///
+/// ⛔⛔ *"loop pointers are identical"* AND *"expected second loop to come right after the first one"*
+/// ARE BOTH UNWRITABLE HERE, because the second position is not given: it is DERIVED by
+/// [`get_next_eligible_op`], which never answers with its own argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeablePair {
+    /// `loops.first`.
+    first: InBlock,
+    /// `loops.second`.
+    second: InBlock,
+}
+
+impl MergeablePair {
+    /// The pair `first` opens, or nothing when the next eligible op is not a second `sentient.for`.
+    #[must_use]
+    pub fn of(block: &[Op], first: InBlock) -> Option<MergeablePair> {
+        let is_loop = |at: InBlock| {
+            matches!(
+                block.get(at.0),
+                Some(Op::Sentient(sentient::Op::For { .. }))
+            )
+        };
+        let second = get_next_eligible_op(block, first)?;
+        (is_loop(first) && is_loop(second)).then_some(MergeablePair { first, second })
+    }
+}
+
+/// WHERE A MERGE HAPPENS — the `dataflow.program_unit`'s block, and the nest of `sentient.for` bodies
+/// from it down to the block the two loops share.
+///
+/// ⛔⛔ `DT_CHECK_MSG(unit, "expected loop to appear in dataflow.program_unit")` (`:203`) IS THIS TYPE,
+/// and so are the reference's TWO builders: `OpBuilder const_builder(unit.getRegion())` (`:205`)
+/// inserts at the START of `unit_body` — it is passed `.getRegion()` and so starts INSIDE, unlike
+/// `LoopAbsorption.cpp:71` — while `OpBuilder builder(parent->getFirstChild()..)` (`:243`) inserts into
+/// the block `nest` names. ⭐ NO ARM USES BOTH.
+#[derive(Debug)]
+pub struct MergeSite<'u> {
+    /// The `dataflow.program_unit`'s own block.
+    pub unit_body: &'u mut Vec<Op>,
+    /// The `sentient.for` positions from `unit_body` down to the loops' shared block, outermost first.
+    /// EMPTY means the two loops are top-level, which is `getParentLoop() == getRoot()`.
+    pub nest: Vec<usize>,
+}
+
+/// WHETHER THE PAIR BECAME ONE LOOP — the `++loops_merged_count` the pass keeps (`:277`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Merged {
+    /// The two loops are now one.
+    Pair,
+    /// The site names no such pair — `DT_CHECK_MSG(parent, "did not expect root here")` (`:239`) among
+    /// them: two TOP-LEVEL loops whose bounds are neither constants nor query maps have nowhere for
+    /// the `sentient.scalar_add` to go.
+    NotMerged,
+}
+
+/// The block `nest` names — each position's `sentient.for` body in turn. `&[]` is `unit_body` itself.
+fn block_at<'a>(unit_body: &'a [Op], nest: &[usize]) -> Option<&'a [Op]> {
+    let mut block: &[Op] = unit_body;
+    for at in nest {
+        let Some(Op::Sentient(sentient::Op::For { body, .. })) = block.get(*at) else {
+            return None;
+        };
+        block = body;
+    }
+    Some(block)
+}
+
+/// [`block_at`], for the rewrite.
+fn block_at_mut<'a>(unit_body: &'a mut Vec<Op>, nest: &[usize]) -> Option<&'a mut Vec<Op>> {
+    let mut block: &mut Vec<Op> = unit_body;
+    for at in nest {
+        let Some(Op::Sentient(sentient::Op::For { body, .. })) = block.get_mut(*at) else {
+            return None;
+        };
+        block = body;
+    }
+    Some(block)
+}
+
+/// The `sentient.for` at `at`, as the four fields the merge reads.
+fn loop_at(block: &[Op], at: InBlock) -> Option<(Val, &[sentient::Carried], Option<&str>)> {
+    let Some(Op::Sentient(sentient::Op::For {
+        bound,
+        carried,
+        dbg_name,
+        ..
+    })) = block.get(at.0)
+    else {
+        return None;
+    };
+    Some((*bound, carried, dbg_name.as_deref()))
+}
+
+/// Replaces: e316_mergeLoops
+///
+/// Merges the second loop into the first by summing their trip counts, rewiring the second's results
+/// to the first's, renaming the survivor `LM(..)` and erasing the second loop and its dead bound.
+///
+/// ⛔ SIX OF THE EIGHT BOUND ARMS ARE `dcc::utils::updateBoundToValuePlusMap` /
+/// `updateBoundToMapPlusMap` (`Analyses/Utils.cpp:421`, `:462`), which are OUT OF CAMPAIGN SCOPE.
+///
+/// ⛔ TRAP: `if (first_loop.getBound().getDefiningOp()->use_empty()) ..->erase()` (`:271-272`) READS THE
+/// NEW BOUND, which the loop it was just built for reads — so that erase cannot fire. The one that
+/// does is `saved_def_op`, captured from the SECOND bound BEFORE the loop goes (`:273-275`).
+pub fn merge_loops(site: MergeSite<'_>, pair: MergeablePair, values: &mut Values) -> Merged {
+    let MergeSite { unit_body, nest } = site;
+
+    // ── everything the arm choice needs, before anything moves ──
+    let (new_bound, new_bound_op, second_bound, results, dbg_name) = {
+        let scope: &[Op] = unit_body;
+        let Some(siblings) = block_at(scope, &nest) else {
+            return Merged::NotMerged;
+        };
+        let (Some((first_bound, first_carried, first_name)), Some((second_bound, second_carried, second_name))) =
+            (loop_at(siblings, pair.first), loop_at(siblings, pair.second))
+        else {
+            return Merged::NotMerged;
+        };
+        let defs = Definitions::from_innermost(core::slice::from_ref(&scope));
+        let constant_of = |bound: Val| match defs.of(bound) {
+            Some(Op::Sentient(sentient::Op::ScalarConstant { value, ty, .. })) => Some((*value, *ty)),
+            _ => None,
+        };
+        let is_query_map = |bound: Val| {
+            matches!(defs.of(bound), Some(Op::Uniform(uniform::Op::QueryMap { .. })))
+        };
+        // `first_query_map && isConstant<sentient::ConstantOp>(first_query_map.getResult())`
+        // (`:208-213`).
+        let is_constant_query_map =
+            |bound: Val| is_query_map(bound) && is_constant(bound, ConstKind::ScalarConstant, defs);
+
+        let new_bound = values.mint();
+        let new_bound_op = match (constant_of(first_bound), constant_of(second_bound)) {
+            // `first_const_bound && second_const_bound` (`:214-218`) — the sum, at the START of the
+            // unit's own block.
+            (Some((first, ty)), Some((second, _))) => BuiltBound::AtUnitStart(Op::Sentient(
+                sentient::Op::ScalarConstant {
+                    value: first + second,
+                    result: new_bound,
+                    reg_locale: sentient::RegType::Imm,
+                    ty,
+                    is_symbol: false,
+                },
+            )),
+            (Some(_), None) if is_constant_query_map(second_bound) => {
+                todo!("dcc::utils::updateBoundToValuePlusMap — out of campaign scope (`:219-223`)")
+            }
+            (None, Some(_)) if is_constant_query_map(first_bound) => {
+                todo!("dcc::utils::updateBoundToValuePlusMap — out of campaign scope (`:224-229`)")
+            }
+            _ if is_constant_query_map(first_bound) && is_constant_query_map(second_bound) => {
+                todo!("dcc::utils::updateBoundToMapPlusMap — out of campaign scope (`:230-233`)")
+            }
+            // `!first_query_map && !second_query_map` (`:235-247`) — a `sentient.scalar_add` BEFORE the
+            // parent's first child, so no instruction lands between two otherwise mergeable loops.
+            _ if !is_query_map(first_bound) && !is_query_map(second_bound) => {
+                if nest.is_empty() {
+                    return Merged::NotMerged;
+                }
+                BuiltBound::BeforeTheParentsFirstChild(Op::Sentient(sentient::Op::ScalarAdd {
+                    lhs: first_bound,
+                    rhs: second_bound,
+                    result: new_bound,
+                    // `AddOp::create` sets no `regLocale`, so the `.td`'s absent register stands, and
+                    // `bound_type` (`:200`) is a trip count.
+                    reg: None,
+                    ty: ScalarTy::Index,
+                    element_size: None,
+                }))
+            }
+            _ if is_query_map(first_bound) != is_query_map(second_bound) => {
+                todo!("dcc::utils::updateBoundToValuePlusMap — out of campaign scope (`:248-255`)")
+            }
+            _ => todo!("dcc::utils::updateBoundToMapPlusMap — out of campaign scope (`:256-260`)"),
+        };
+        // `DT_CHECK_MSG(.., "expected equal number of results")` (`:263-265`) is discharged by
+        // `loopsAreMergeable`, which proved the two bodies equivalent; `llvm::zip` pairs what it has.
+        let results: Vec<(Val, Val)> = second_carried
+            .iter()
+            .zip(first_carried)
+            .map(|(second, first)| (second.result, first.result))
+            .collect();
+        (
+            new_bound,
+            new_bound_op,
+            second_bound,
+            results,
+            new_dbg_name_from_list(DbgNamePrefix::Lm, first_name, &[second_name]),
+        )
+    };
+
+    // ── the rewrite, innermost block first ──
+    {
+        let Some(siblings) = block_at_mut(unit_body, &nest) else {
+            return Merged::NotMerged;
+        };
+        if let Some(Op::Sentient(sentient::Op::For {
+            bound,
+            dbg_name: name,
+            ..
+        })) = siblings.get_mut(pair.first.0)
+        {
+            *bound = new_bound;
+            // ⭐ ONLY WHEN BOTH SOURCES HAD ONE (`:266-268`) — `setDbgNameAttr(op, nullptr)` REMOVES
+            // the attribute, so the reference's `if` keeps the survivor's own name instead.
+            if let Some(merged) = dbg_name {
+                *name = Some(merged);
+            }
+        }
+        // `std::get<1>(pair).replaceAllUsesWith(std::get<0>(pair))` (`:265`).
+        for (of, with) in results {
+            replace_all_uses_with(siblings, of, with);
+        }
+        // `if (first_loop.getBound().getDefiningOp()->use_empty()) ..->erase()` (`:271-272`).
+        if use_count(new_bound, siblings) == 0 {
+            erase_defining_op(siblings, new_bound);
+        }
+        // `second_loop.getOperation()->erase()` (`:274`).
+        siblings.remove(pair.second.0);
+    }
+    // `if (saved_def_op->use_empty()) saved_def_op->erase();` (`:275`) — the second bound's definer
+    // outlived the loop that read it.
+    if use_count(second_bound, unit_body) == 0 {
+        erase_defining_op(unit_body, second_bound);
+    }
+    match new_bound_op {
+        BuiltBound::AtUnitStart(op) => unit_body.insert(0, op),
+        BuiltBound::BeforeTheParentsFirstChild(op) => {
+            let Some(siblings) = block_at_mut(unit_body, &nest) else {
+                return Merged::NotMerged;
+            };
+            let at = siblings
+                .iter()
+                .position(|op| matches!(op, Op::Sentient(sentient::Op::For { .. })))
+                .unwrap_or(0);
+            siblings.insert(at, op);
+        }
+    }
+    Merged::Pair
+}
+
+/// THE MERGED BOUND AND WHICH BUILDER MAKES IT — see [`MergeSite`].
+#[derive(Debug)]
+enum BuiltBound {
+    /// `const_builder`, at the start of the unit's own block.
+    AtUnitStart(Op),
+    /// `builder`, before the first `sentient.for` of the loops' own parent.
+    BeforeTheParentsFirstChild(Op),
+}
 
 // crustify:todo: e508_loopsAreMergeable
 //   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:83  (94 body lines, level 3)
@@ -196,6 +451,28 @@ mod unit_tests {
         Op::Sentient(sentient::Op::For {
             iv: Val(0),
             bound: Val(1),
+            carried: Vec::new(),
+            dbg_name: dbg_name.map(str::to_owned),
+            body: Vec::new(),
+        })
+    }
+
+    /// A `sentient.scalar_constant` a loop bound reads.
+    fn constant_of(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// A `sentient.for` over `bound`, binding `iv`.
+    fn loop_over(bound: Val, iv: Val, dbg_name: Option<&str>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
             carried: Vec::new(),
             dbg_name: dbg_name.map(str::to_owned),
             body: Vec::new(),
@@ -266,5 +543,39 @@ mod unit_tests {
         );
         assert!(DbgName::of(&sentient_for(None)).is_none());
         assert!(DbgName::of(&Op::Sentient(sentient::Op::Nop { dbg_name: None })).is_none());
+    }
+    /// Two adjacent constant-bound loops become one over the SUM, named from both, with the second
+    /// loop and the second bound gone — and ⭐ THE FIRST LOOP'S OLD BOUND STILL STANDING, which is
+    /// the reference's own dead erase (`:271-272`).
+    #[test]
+    fn e316_merges_two_constant_bound_loops_into_one_over_the_sum() {
+        let mut values = Values::default();
+        for _ in 0..20 {
+            let _ = values.mint();
+        }
+        let mut unit_body = vec![
+            constant_of(Val(0), 4),
+            constant_of(Val(1), 6),
+            loop_over(Val(0), Val(10), Some("a")),
+            loop_over(Val(1), Val(11), Some("b")),
+        ];
+        let pair = MergeablePair::of(&unit_body, InBlock(2)).expect("two adjacent loops");
+        let merged = merge_loops(
+            MergeSite {
+                unit_body: &mut unit_body,
+                nest: Vec::new(),
+            },
+            pair,
+            &mut values,
+        );
+        assert_eq!(merged, Merged::Pair);
+        assert_eq!(
+            unit_body,
+            vec![
+                constant_of(Val(20), 10),
+                constant_of(Val(0), 4),
+                loop_over(Val(20), Val(10), Some("LM(a, b)")),
+            ]
+        );
     }
 }
