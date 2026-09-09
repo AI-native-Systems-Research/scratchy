@@ -85,6 +85,7 @@
 #![allow(dead_code)]
 
 use crate::islands::sentient::dialects::{Op, sentient};
+use crate::transform::sentient::cfg_simplification_sentient_level::pattern_simplification_manager::OpPath;
 
 /// HOW MUCH A `sentient.incrmask` INCREMENTS THE MASK — a witness, because the answer is a constant.
 ///
@@ -121,7 +122,11 @@ pub(crate) struct IncrMaskGenValue {
     /// `increment_` — `None` is the constructor's `-1`, i.e. `isUnknownValue()`.
     increment: Option<Increment>,
     /// `op_` — absent for the default-constructed unknown value.
-    op: Option<Op>,
+    ///
+    /// ⛔ A PATH, NOT AN OP: e193 and e194 push this into `to_be_deleted_` to be ERASED and rewrite
+    /// the block around it, and two `sentient.incrmask` ops are indistinguishable by value — so the
+    /// identity has to be the position, which is what [`OpPath`] is the stand-in for.
+    op: Option<OpPath>,
     /// `DataFlowDefinitionBase::is_optimized_`
     /// (`Analyses/RedundantDefinitionEliminationTree.hpp:290`) — the base class is OUT OF CAMPAIGN
     /// SCOPE, but e192 prints this flag, so the subclass holds it exactly as it holds `op_`.
@@ -139,13 +144,13 @@ impl IncrMaskGenValue {
 
     /// `IncrMaskGenValue(incrmask_op.getIncrement(), op)`, and nothing for any other operation.
     #[must_use]
-    pub(crate) fn of_incr_mask(op: &Op) -> Option<IncrMaskGenValue> {
+    pub(crate) fn of_incr_mask(op: &Op, at: OpPath) -> Option<IncrMaskGenValue> {
         if !matches!(op, Op::Sentient(sentient::Op::IncrMask { .. })) {
             return None;
         }
         Some(IncrMaskGenValue {
             increment: Some(Increment),
-            op: Some(op.clone()),
+            op: Some(at),
             is_optimized: false,
             is_dead: false,
         })
@@ -165,8 +170,25 @@ impl IncrMaskGenValue {
 
     /// The op that generated it.
     #[must_use]
-    pub(crate) const fn op(&self) -> Option<&Op> {
+    pub(crate) const fn op(&self) -> Option<&OpPath> {
         self.op.as_ref()
+    }
+
+    /// `DataFlowDefinitionBase::isOptimized()`.
+    #[must_use]
+    pub(crate) const fn is_optimized(&self) -> bool {
+        self.is_optimized
+    }
+
+    /// `DataFlowDefinitionBase::isDead()`.
+    #[must_use]
+    pub(crate) const fn is_dead(&self) -> bool {
+        self.is_dead
+    }
+
+    /// `DataFlowDefinitionBase::setIsDead()` — one way, as the base class has no clearing setter.
+    pub(crate) const fn set_is_dead(&mut self) {
+        self.is_dead = true;
     }
 }
 
@@ -221,7 +243,7 @@ impl IncrMaskGenValue {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{IncrMaskGenValue, Increment};
+    use super::{IncrMaskGenValue, Increment, OpPath};
     use crate::islands::sentient::dialects::{Op, sentient};
 
     /// `sentient.incrmask`.
@@ -244,8 +266,8 @@ mod unit_tests {
     /// compile error rather than a run-time abort.
     #[test]
     fn no_incrmask_definition_is_ever_equal_to_another() {
-        let value =
-            IncrMaskGenValue::of_incr_mask(&incr_mask()).expect("an incrmask generates one");
+        let value = IncrMaskGenValue::of_incr_mask(&incr_mask(), OpPath::at(&[(0, 0)]))
+            .expect("an incrmask generates one");
         assert!(!value.is_equal(&value), "not even to itself");
         assert!(!value.is_equal(&IncrMaskGenValue::unknown()));
         assert!(!IncrMaskGenValue::unknown().is_equal(&IncrMaskGenValue::unknown()));
@@ -260,14 +282,17 @@ mod unit_tests {
         assert_eq!(out, "(GenValue: -1) - optimized! - dead!");
 
         let mut plain = String::new();
-        IncrMaskGenValue::of_incr_mask(&incr_mask())
+        IncrMaskGenValue::of_incr_mask(&incr_mask(), OpPath::at(&[(0, 0)]))
             .expect("an incrmask generates one")
             .print(&mut plain);
         assert_eq!(plain, "(GenValue: 1)");
         assert_eq!(Increment.get(), 1);
         assert!(
-            IncrMaskGenValue::of_incr_mask(&Op::Sentient(sentient::Op::Nop { dbg_name: None }))
-                .is_none()
+            IncrMaskGenValue::of_incr_mask(
+                &Op::Sentient(sentient::Op::Nop { dbg_name: None }),
+                OpPath::at(&[(0, 0)])
+            )
+            .is_none()
         );
     }
 }

@@ -78,17 +78,118 @@
 //! | `e186_isSimplifiable` | 186 | 0 | 10 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:221` |
 //! | `e375_initializeDataflowInfo` | 375 | 1 | 17 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:203` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
+// module's own tests until `e474_runOn`/`e536_runOnOperation` (levels 2/3) land and something calls
+// it. CI runs clippy with `-D warnings`, so without this the first ported leaf fails the gate.
+// ⭐ REMOVE THIS WITH e474: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e185_isOperationAUse
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:194  (4 body lines, level 0)
-//   original  : bool SetMaskRDETree::isOperationAUse(const Operation &op) const
+use crate::islands::sentient::dialects::{Op, sentient};
+use crate::transform::sentient::analyses::RdeNode;
 
-// crustify:todo: e186_isSimplifiable
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:221  (10 body lines, level 0)
-//   original  : bool SetMaskRDETree::isSimplifiable(const RDENode &node) const
+/// Replaces: e185_isOperationAUse
+///
+/// The four compute ops read the mask, and so does `sentient.incrmask` — which the pass counts as a
+/// use AND a definition, which is what makes a use-free `incrmask` removable at all.
+#[must_use]
+pub(crate) fn is_operation_a_use(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Sentient(
+            sentient::Op::VectorMac { .. }
+                | sentient::Op::VectorUnary { .. }
+                | sentient::Op::VectorBinary { .. }
+                | sentient::Op::VectorTernary { .. }
+                | sentient::Op::IncrMask { .. }
+        )
+    )
+}
+
+/// Replaces: e186_isSimplifiable
+///
+/// A subtree may go when it is neither the root nor one of the six mask-relevant ops, and is a leaf
+/// — or a statically dead loop.
+///
+/// ⛔ TRAP: `isStaticallyDeadLoop` is `Analyses/` work and OUT OF CAMPAIGN SCOPE. The `||`
+/// short-circuits, so a leaf never reaches it.
+#[must_use]
+pub(crate) fn is_simplifiable(node: &RdeNode<'_>) -> bool {
+    let RdeNode::At { op, leaf } = node else {
+        // `getRoot() == &node` — the root is the only node without an operation.
+        return false;
+    };
+    if matches!(
+        op,
+        Op::Sentient(
+            sentient::Op::SetMask { .. }
+                | sentient::Op::IncrMask { .. }
+                | sentient::Op::VectorMac { .. }
+                | sentient::Op::VectorUnary { .. }
+                | sentient::Op::VectorBinary { .. }
+                | sentient::Op::VectorTernary { .. }
+        )
+    ) {
+        return false;
+    }
+    if *leaf {
+        return true;
+    }
+    todo!(
+        "RedundantDefinitionEliminationTree::isStaticallyDeadLoop \
+         (Analyses/RedundantDefinitionEliminationTree.hpp:247) — out of campaign scope"
+    )
+}
 
 // crustify:todo: e375_initializeDataflowInfo
 //   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:203  (17 body lines, level 1)
 //   original  : void SetMaskRDETree::initializeDataflowInfo(RDENode *node)
 //   calls     : e044_isOperationADef, e185_isOperationAUse
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::sentient::dialects::Val;
+
+    /// `sentient.set_mask %mask`.
+    fn set_mask(mask: u32) -> Op {
+        Op::Sentient(sentient::Op::SetMask {
+            mask_value: Val(mask),
+            dbg_name: None,
+        })
+    }
+
+    /// `sentient.incrmask`.
+    fn incrmask() -> Op {
+        Op::Sentient(sentient::Op::IncrMask { dbg_name: None })
+    }
+
+    /// `sentient.nop` — an op that is neither a use nor a definition.
+    fn nop() -> Op {
+        Op::Sentient(sentient::Op::Nop { dbg_name: None })
+    }
+
+    /// e185 — `incrmask` is a use, `set_mask` is not, and neither is anything else.
+    #[test]
+    fn the_compute_ops_and_incrmask_are_uses() {
+        assert!(is_operation_a_use(&incrmask()));
+        assert!(!is_operation_a_use(&set_mask(1)));
+        assert!(!is_operation_a_use(&nop()));
+    }
+
+    /// e186 — the root and the six mask-relevant ops stay; any other leaf goes.
+    #[test]
+    fn neither_the_root_nor_a_mask_relevant_op_is_simplifiable_but_another_leaf_is() {
+        assert!(!is_simplifiable(&RdeNode::Root));
+        for op in [set_mask(1), incrmask()] {
+            assert!(!is_simplifiable(&RdeNode::At {
+                op: &op,
+                leaf: true
+            }));
+        }
+        let other = nop();
+        assert!(is_simplifiable(&RdeNode::At {
+            op: &other,
+            leaf: true
+        }));
+    }
+}

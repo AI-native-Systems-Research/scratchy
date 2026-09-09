@@ -79,21 +79,241 @@
 //! | `e189_maskValuesAreEquivalent` | 189 | 0 | 13 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:258` |
 //! | `e376_isEqual` | 376 | 1 | 7 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:235` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
+// module's own tests until `e474_runOn`/`e536_runOnOperation` (levels 2/3) land and something calls
+// it. CI runs clippy with `-D warnings`, so without this the first ported leaf fails the gate.
+// ⭐ REMOVE THIS WITH e474: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e187_copyTo
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:243  (6 body lines, level 0)
-//   original  : void SetMaskGenValue::copyTo(DataFlowDefinitionBase &lhs) const
+use crate::islands::dataflow_ir::print;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+use crate::transform::sentient::cfg_simplification_sentient_level::pattern_simplification_manager::OpPath;
 
-// crustify:todo: e188_print
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:252  (5 body lines, level 0)
-//   original  : void SetMaskGenValue::print(raw_ostream &OS) const
+/// `SetMaskGenValue` (`SetMaskRE.hpp:25`) — the definition a `sentient.set_mask` node generates.
+///
+/// ⭐ DECLARED HERE, WHERE ITS OWN METHODS BELONG: e187-e189 and e376 are `copyTo`/`print`/
+/// `maskValuesAreEquivalent`/`isEqual` on this class and are scheduled into this file. e375 (in
+/// [`super::set_mask_rde_tree`]) constructs it — a batch filling that anchor should UNION with this.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SetMaskGenValue {
+    /// `mask_value_` — `None` is the constructor's `nullptr`, i.e. `isUnknownValue()`.
+    mask_value: Option<Val>,
+    /// `DataFlowDefinitionBase::op_`, which e187 copies and e194 rewrites through.
+    ///
+    /// ⛔ AN [`OpPath`] AND NOT THE NODE'S OWN OP: `node_gen.copyTo(parent_gen)`
+    /// (`Analyses/RedundantDefinitionEliminationTreeImpl.cpp:355`) hands a child's `op_` to its
+    /// PARENT, so a gen's operation may sit in a nested block and needs an identity of its own.
+    op: Option<OpPath>,
+    /// `DataFlowDefinitionBase::is_optimized_` — the base class is OUT OF CAMPAIGN SCOPE, but e188
+    /// prints this flag, so the subclass holds it exactly as it already holds `op_`.
+    is_optimized: bool,
+    /// `DataFlowDefinitionBase::is_dead_`, printed by e188 and set by e193.
+    is_dead: bool,
+}
 
-// crustify:todo: e189_maskValuesAreEquivalent
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:258  (13 body lines, level 0)
-//   original  : bool SetMaskGenValue::maskValuesAreEquivalent(const Value a, const Value b) const
+impl SetMaskGenValue {
+    /// `SetMaskGenValue()` — the unknown value.
+    #[must_use]
+    pub(crate) fn unknown() -> SetMaskGenValue {
+        SetMaskGenValue::default()
+    }
+
+    /// `SetMaskGenValue(mask_value, op)`.
+    #[must_use]
+    pub(crate) fn of(mask_value: Val, op: OpPath) -> SetMaskGenValue {
+        SetMaskGenValue {
+            mask_value: Some(mask_value),
+            op: Some(op),
+            is_optimized: false,
+            is_dead: false,
+        }
+    }
+
+    /// `getMaskValue()`, absent when the value is unknown.
+    #[must_use]
+    pub(crate) const fn mask_value(&self) -> Option<Val> {
+        self.mask_value
+    }
+
+    /// `setMaskValue(v)`.
+    pub(crate) const fn set_mask_value(&mut self, mask_value: Val) {
+        self.mask_value = Some(mask_value);
+    }
+
+    /// `getOperation()` — the `sentient.set_mask` this definition came from.
+    #[must_use]
+    pub(crate) const fn op(&self) -> Option<&OpPath> {
+        self.op.as_ref()
+    }
+
+    /// `isUnknownValue()` (`SetMaskRE.cpp:250`).
+    #[must_use]
+    pub(crate) const fn is_unknown_value(&self) -> bool {
+        self.mask_value.is_none()
+    }
+
+    /// `DataFlowDefinitionBase::isOptimized()`.
+    #[must_use]
+    pub(crate) const fn is_optimized(&self) -> bool {
+        self.is_optimized
+    }
+
+    /// `DataFlowDefinitionBase::isDead()`.
+    #[must_use]
+    pub(crate) const fn is_dead(&self) -> bool {
+        self.is_dead
+    }
+
+    /// `DataFlowDefinitionBase::setIsDead()`.
+    pub(crate) const fn set_is_dead(&mut self) {
+        self.is_dead = true;
+    }
+
+    /// Replaces: e187_copyTo
+    ///
+    /// Copies the mask value and the generating operation onto `lhs`, leaving its two flags alone.
+    ///
+    /// ⛔ THE `assert(lhs_p && "invalid subclasses of dataflow definitions")` IS THE PARAMETER TYPE:
+    /// a definition that is not a `SetMaskGenValue` is not expressible at this call.
+    ///
+    /// ⛔ AND `is_optimized_`/`is_dead_` STAY BEHIND — the reference writes two fields, so
+    /// `*lhs = self.clone()` would clobber both.
+    pub(crate) fn copy_to(&self, lhs: &mut SetMaskGenValue) {
+        lhs.mask_value = self.mask_value;
+        lhs.op = self.op.clone();
+    }
+
+    /// Replaces: e188_print
+    ///
+    /// Renders the GenValue as the pass's `-debug-only=setmask-re` dump does.
+    ///
+    /// ⛔ DEVIATION, AND IT IS OBSERVABLE: `mask_value_.getAsOpaquePointer()` streams the HOST
+    /// ADDRESS of the `Value`'s implementation, which this island has no equivalent of — so the dump
+    /// names the value, `%N`, and keeps `0x0` for the null the pointer form did say.
+    pub(crate) fn print(&self, out: &mut String) {
+        out.push_str("(GenValue: value_:");
+        match self.mask_value {
+            Some(mask_value) => out.push_str(&print::val(mask_value)),
+            None => out.push_str("0x0"),
+        }
+        out.push(')');
+        if self.is_optimized {
+            out.push_str(" - optimized!");
+        }
+        if self.is_dead {
+            out.push_str(" - dead!");
+        }
+    }
+
+    /// Replaces: e189_maskValuesAreEquivalent
+    ///
+    /// Two mask values are equivalent when they are the same value, or both are
+    /// `sentient.scalar_constant`s carrying the same number.
+    ///
+    /// ⛔ TWO ABSENT VALUES ARE EQUIVALENT AND ONE IS NOT: `a == b` runs FIRST, so null/null is
+    /// `true` before the `!a || !b` rejection ever sees it.
+    ///
+    /// ⭐ AN ASSOCIATED FUNCTION: the body reads no member, and `defs` is the scope MLIR's own
+    /// `Value::getDefiningOp()` needs no parameter for.
+    #[must_use]
+    pub(crate) fn mask_values_are_equivalent(
+        a: Option<Val>,
+        b: Option<Val>,
+        defs: Definitions<'_>,
+    ) -> bool {
+        if a == b {
+            return true;
+        }
+        let (Some(a), Some(b)) = (a, b) else {
+            return false;
+        };
+        match (defs.of(a), defs.of(b)) {
+            (
+                Some(Op::Sentient(sentient::Op::ScalarConstant { value: a_value, .. })),
+                Some(Op::Sentient(sentient::Op::ScalarConstant { value: b_value, .. })),
+            ) => a_value == b_value,
+            _ => false,
+        }
+    }
+}
 
 // crustify:todo: e376_isEqual
 //   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:235  (7 body lines, level 1)
 //   original  : bool SetMaskGenValue::isEqual(const DataFlowDefinitionBase &rhs) const
 //   calls     : e189_maskValuesAreEquivalent
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+
+    /// `%result = sentient.scalar_constant {value = <value>}`.
+    fn constant(result: u32, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result: Val(result),
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// A GenValue of `mask_value` with both base flags set.
+    fn flagged(value: SetMaskGenValue) -> SetMaskGenValue {
+        SetMaskGenValue {
+            is_optimized: true,
+            is_dead: true,
+            ..value
+        }
+    }
+
+    /// e187 — the mask value and `op_` travel; `is_optimized_` and `is_dead_` stay behind.
+    #[test]
+    fn copy_to_moves_the_mask_value_and_op_but_not_the_flags() {
+        let source = flagged(SetMaskGenValue::of(Val(7), OpPath::at(&[(0, 3)])));
+        let mut target = SetMaskGenValue::unknown();
+
+        source.copy_to(&mut target);
+
+        assert_eq!(target.mask_value(), Some(Val(7)));
+        assert_eq!(target.op(), Some(&OpPath::at(&[(0, 3)])));
+        assert!(!target.is_optimized(), "is_optimized_ is not copied");
+        assert!(!target.is_dead(), "is_dead_ is not copied");
+    }
+
+    /// e188 — the null mask value prints as `0x0`, and each flag adds its own suffix.
+    #[test]
+    fn print_names_the_value_and_both_suffixes() {
+        let mut out = String::new();
+        flagged(SetMaskGenValue::unknown()).print(&mut out);
+        assert_eq!(out, "(GenValue: value_:0x0) - optimized! - dead!");
+
+        let mut plain = String::new();
+        SetMaskGenValue::of(Val(7), OpPath::at(&[(0, 3)])).print(&mut plain);
+        assert_eq!(plain, "(GenValue: value_:%7)");
+    }
+
+    /// e189 — one value, two equal constants, and the three ways to be inequivalent.
+    #[test]
+    fn equivalent_mask_values_are_the_same_value_or_two_equal_constants() {
+        let scope = vec![
+            constant(1, 4),
+            constant(2, 4),
+            constant(3, 5),
+            Op::Sentient(sentient::Op::Nop { dbg_name: None }),
+        ];
+        let module = [scope.as_slice()];
+        let defs = Definitions::from_innermost(&module);
+
+        let equivalent = |a, b| SetMaskGenValue::mask_values_are_equivalent(a, b, defs);
+        assert!(equivalent(Some(Val(1)), Some(Val(1))), "the same value");
+        assert!(equivalent(None, None), "`a == b` runs before the null test");
+        assert!(equivalent(Some(Val(1)), Some(Val(2))), "two constants of 4");
+        assert!(!equivalent(Some(Val(1)), Some(Val(3))), "4 is not 5");
+        assert!(!equivalent(Some(Val(1)), None), "one null value");
+        assert!(
+            !equivalent(Some(Val(1)), Some(Val(9))),
+            "nothing defines %9"
+        );
+    }
+}

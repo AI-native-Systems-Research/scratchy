@@ -103,17 +103,31 @@ impl CompositeSetDstGenValueLxlu {
         self.qmap
     }
 
-    /// The body of `CompositeSetDstGenValueLXLU::print` (`SetSendDestinationRE.cpp:413`) — `OS
-    /// << qmap_`, which [`e200`](super::set_dst_gen_value_lxlu::SetDstGenValueLxlu::print) delegates
-    /// to.
+    /// Replaces: e202_print
     ///
-    /// ⛔ THE ANCHOR BELOW IS ANOTHER BATCH'S — e202 belongs to the `SetMaskRE` batch, so its TODO
-    /// stands; that batch should attach `/// Replaces: e202_print` to THIS method.
+    /// `OS << qmap_` — the `uniform.query_map` operation itself, which
+    /// [`e200`](super::set_dst_gen_value_lxlu::SetDstGenValueLxlu::print) delegates to.
+    ///
+    /// ⛔ NO TRAILING NEWLINE, and that is [`QueryMapOp::print`]'s doing: this print is streamed
+    /// mid-line into a node's debug dump, while `uniform::emit` renders a line of a module.
     pub(crate) fn print(self, out: &mut String) {
         self.qmap.print(out);
     }
 }
 
-// crustify:todo: e202_print
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:413  (1 body lines, level 0)
-//   original  : void CompositeSetDstGenValueLXLU::print(raw_ostream &OS) const
+#[cfg(test)]
+mod unit_tests {
+    use super::{CompositeSetDstGenValueLxlu, QueryMapOp};
+    use crate::islands::sentient::dialects::Val;
+
+    /// e202 — the composite prints its query map op, and nothing else.
+    #[test]
+    fn the_composite_prints_its_query_map_op_without_a_newline() {
+        let composite = CompositeSetDstGenValueLxlu::of(QueryMapOp::of(Val(2), Val(0), Val(1)));
+        let mut out = String::new();
+
+        composite.print(&mut out);
+
+        assert_eq!(out, "%2 = uniform.query_map(map:%0, key:%1) : index");
+    }
+}
