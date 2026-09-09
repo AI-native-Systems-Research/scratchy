@@ -303,19 +303,54 @@ pub struct Operand {
     pub data: DataInfo,
 }
 
+/// THE COMPONENTS ONE DESTINATION IS REACHED THROUGH — `DstVia::via_` (`dsc/dsc2.h:818`), in hop
+/// order, EMPTY where the transfer reaches its destination straight from `src_`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Hops(pub Vec<SenComponent>);
+
 /// A TRANSFER'S DESTINATIONS — `dstVias_` zipped with `dstLdsAndLoopOffsets_`, NON-EMPTY so that
 /// `getComponent`'s `dstVias_.at(0)` is total.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dsts {
     first: Operand,
     rest: Vec<Operand>,
+    /// `dstVias_.at(i).via_`, per destination.
+    ///
+    /// ⭐ SHORT OR ABSENT IS EMPTY, AND THAT IS THE TRUTH RATHER THAN A GAP: a freshly minted
+    /// `DstVia` carries an empty `via_` (`dsc/dsc2.h:818`), so a site that states no route for a
+    /// destination has stated the route it has.
+    hops: Vec<Hops>,
 }
 
 impl Dsts {
     /// A transfer has at least one destination, and this is how that is stated.
     #[must_use]
     pub const fn new(first: Operand, rest: Vec<Operand>) -> Self {
-        Self { first, rest }
+        Self {
+            first,
+            rest,
+            hops: Vec::new(),
+        }
+    }
+
+    /// The same destinations with the routes that reach them, in destination order.
+    #[must_use]
+    pub fn with_hops(mut self, hops: Vec<Hops>) -> Self {
+        self.hops = hops;
+        self
+    }
+
+    /// `dstVias_.at(index).via_`.
+    #[must_use]
+    pub fn hops(&self, index: usize) -> &[SenComponent] {
+        self.hops.get(index).map_or(&[], |hops| &hops.0)
+    }
+
+    /// Every destination WITH its route — what a hop walk over `dstVias_` reads off each entry.
+    pub fn routes(&self) -> impl Iterator<Item = (&Operand, &[SenComponent])> {
+        self.iter()
+            .enumerate()
+            .map(|(index, dst)| (dst, self.hops(index)))
     }
 
     /// `dstVias_.at(0)` — total.
