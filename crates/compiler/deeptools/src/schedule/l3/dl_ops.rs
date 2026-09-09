@@ -269,8 +269,16 @@
 
 use crate::arch::Elements;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::{DsType, Scale};
-use crate::schedule::dsc2::LdsIdx;
+use crate::schedule::ddc::transformation_util::{
+    DataStage, DataStages, LoopDims, LoopNode, PrimaryDimAndKind, StageDims, StageName,
+};
+use crate::schedule::ddc::v1::ComputeOps;
+use crate::schedule::dsc2::{
+    BlockNode, Dsts, LdsIdx, NodeName, ReplicationFactor, SyncDirection, SyncNode, SyncStrength,
+    SyncUnits, TransferNode, Via,
+};
 use crate::schedule::l3::dsc::{
     CoreletShare, DesignSpaceConfig, DscGroup, FilledDims, LabeledDs, MulticastDegree, SuperDsc,
     SymbolicDimInfo, UnneededPad,
@@ -827,53 +835,214 @@ mod tests_e001_e008 {
 //   original  : dsc2::AllocateNode *L3DlOpsScheduler::createAllocateNode( DesignSpaceConfig &dsc, const int ldsIdx, enum SenComponents component, const int numBuffers, const std::string &name, const int dscIdx)
 //   extract   : crustify-ddc/cpp/l3.cpp:417-468
 
-// crustify:todo: e017_createTransferNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:596  (22 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::TransferNode *L3DlOpsScheduler::createTransferNode( const SenComponents srcUnit, const SenComponents srcStorage, const std::vector<SenComponents> &dstUnits, const std::vector<SenComponents> &dstStorage, const int srcLdsIndex, const std::vector<int> &dstLdsIndices, const std::string &name)
-//   extract   : crustify-ddc/cpp/l3.cpp:478-504
+/// Replaces: e017_createTransferNode
+///
+/// MINTS THE TRANSFER NODE from one source end to one or more destinations, each carrying its unit,
+/// its storage and its lds index (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:596`).
+///
+/// ⛔ *"Destination unit and storage numbers do not match."* IS GONE BY THE ARGUMENT TYPE: one
+/// destination is one [`Via`], so the three vectors cannot disagree — all seven callsites (`:3202`
+/// through `:7069`) already pass them equal; every other field keeps the fresh node's default.
+#[must_use]
+pub fn create_transfer_node(src: Via, dst: Via, more_dsts: &[Via], name: NodeName) -> TransferNode {
+    TransferNode {
+        name,
+        src: src.operand(),
+        dsts: Dsts::new(
+            dst.operand(),
+            more_dsts.iter().map(|via| via.operand()).collect(),
+        ),
+        replication_factor: ReplicationFactor::ONE,
+        unit_time_transfer_chunk_size: Vec::new(),
+    }
+}
 
-// crustify:todo: e018_createLoopNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:623  (19 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::LoopNode *L3DlOpsScheduler::createLoopNode( const DesignSpaceConfig &dsc, const std::vector<PrimaryDimTypes> &dims, const int numeratorId, const int denominatorId, const std::string &name)
-//   extract   : crustify-ddc/cpp/l3.cpp:514-535
+/// WHICH WINDOW EXTENTS A DATA STAGE'S DIMS STATE — the `ki_ > 0` / `kj_ > 0` reads on a
+/// `DataStructDims` (`dsc/dims.h:158`), which is all `createLoopNode` asks of one.
+pub trait WindowExtents {
+    /// The dims the stage states a positive window extent for.
+    fn window_dims(&self) -> BTreeSet<PrimaryDim>;
+}
 
-// crustify:todo: e019_createBlockNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:645  (6 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::BlockNode *L3DlOpsScheduler::createBlockNode(const std::string &name)
-//   extract   : crustify-ddc/cpp/l3.cpp:545-551
+/// THE CORE DATA STAGE'S WINDOW DIMS, PROVED PRESENT.
+///
+/// ⛔ *"Expect valid core data stage."* IS THIS TYPE'S ABSENCE:
+/// `dataStageParam_.at(dataStageCoreIdx)` is where `createLoopNode` reads `ss_.ki_` and `ss_.kj_`,
+/// so a DSC without that stage yields no witness rather than a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreWindowDims(BTreeSet<PrimaryDim>);
 
-// crustify:todo: e020_createSyncNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:652  (10 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::SyncNode* L3DlOpsScheduler::createSyncNode( const std::unordered_set<SenComponents>& units, const std::string& name, const bool isReceive, const bool isSoft) const
-//   extract   : crustify-ddc/cpp/l3.cpp:561-573
+impl CoreWindowDims {
+    /// `dataStageCoreIdx` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:275`).
+    pub const CORE: DatastageId = DatastageId(0);
 
-// crustify:todo: e021_getOpFuncName
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:665  (4 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : OpFuncs L3DlOpsScheduler::getOpFuncName(const DesignSpaceConfig& dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:583-587
+    /// The witness, or [`None`] where the reference refuses.
+    #[must_use]
+    pub fn of<D: WindowExtents>(stages: &DataStages<D>) -> Option<Self> {
+        Some(Self(stages.0.get(&Self::CORE)?.ss.dims.window_dims()))
+    }
 
-// crustify:todo: e022_addOrUpdateDataStageParam
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:721  (12 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::addOrUpdateDataStageParam(DesignSpaceConfig &dsc, const DataStructDims &ssParam, const std::string &ssName, const DataStructDims &elParam, const std::string &elName, const int index)
-//   extract   : crustify-ddc/cpp/l3.cpp:597-614
+    /// Whether the core stage states a window extent for this dim.
+    #[must_use]
+    pub fn windows(&self, dim: PrimaryDim) -> bool {
+        self.0.contains(&dim)
+    }
+}
 
-// crustify:todo: e023_isOpFuncConv2dInt4
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:739  (6 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncConv2dInt4(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:624-630
+/// Replaces: e018_createLoopNode
+///
+/// MINTS THE LOOP NODE over `dim` and `more_dims` for one numerator/denominator data-stage pair,
+/// marking `ki` and `kj` as window dims where the core data stage windows them
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:623`).
+///
+/// ⚠️ TRAP: the window test reads the CORE stage's `ss_`, not the numerator's or denominator's, and
+/// it fires for `ki`/`kj` ONLY — every other dim takes `Unpadded` (`dsc/dims.h:76`).
+#[must_use]
+pub fn create_loop_node(
+    core: &CoreWindowDims,
+    dim: PrimaryDim,
+    more_dims: &[PrimaryDim],
+    num: DatastageId,
+    den: DatastageId,
+    name: NodeName,
+) -> LoopNode {
+    let of = |dim: PrimaryDim| PrimaryDimAndKind {
+        dim,
+        kind: if matches!(dim, PrimaryDim::Ki | PrimaryDim::Kj) && core.windows(dim) {
+            MetaDimKind::WindowDim
+        } else {
+            MetaDimKind::Unpadded
+        },
+    };
+    LoopNode {
+        name,
+        num,
+        den,
+        dims: LoopDims::new(of(dim), more_dims.iter().copied().map(of).collect()),
+    }
+}
 
-// crustify:todo: e024_isOpFuncConv2dOs1
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:746  (6 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncConv2dOs1(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:640-646
+/// Replaces: e019_createBlockNode
+///
+/// MINTS THE BLOCK NODE that names one level of the schedule tree; `new dsc2::BlockNode()` leaves
+/// its child vector empty (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:645`).
+#[must_use]
+pub fn create_block_node(name: NodeName) -> BlockNode {
+    BlockNode { name }
+}
+
+/// Replaces: e020_createSyncNode
+///
+/// MINTS THE SYNC NODE that signals all-to-all between `units`, on the given end and strength
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:652`).
+///
+/// ⭐ THE REFERENCE'S TWO `if`s ARE NOT A CHOICE: it writes `isReceive_`/`isSoft_` only when set,
+/// and the field it skips already holds the same `false`.
+#[must_use]
+pub fn create_sync_node(
+    units: SyncUnits,
+    name: NodeName,
+    direction: SyncDirection,
+    strength: SyncStrength,
+) -> SyncNode {
+    SyncNode {
+        name,
+        units,
+        direction,
+        strength,
+    }
+}
+
+/// Replaces: e021_getOpFuncName
+///
+/// THE DSC'S FIRST COMPUTE OP'S `opFuncName` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:665`).
+///
+/// ⛔ `DT_CHECK(hasComputeOp(dsc))` — `!computeOp_.empty()` (`L3DlOpsScheduler.h:285`) — IS
+/// [`OpFuncs`](crate::schedule::ddc::v1::OpFuncs)' OWN NON-EMPTINESS, and `OpFuncs::NONE` is the
+/// [`None`].
+#[must_use]
+pub fn get_op_func_name<D: ComputeOps + ?Sized>(dsc: &D) -> Option<OpFunc> {
+    dsc.op_funcs().first()
+}
+
+/// A DATA STAGE'S TWO HALVES, BOTH PROVED TO STATE EXTENTS.
+///
+/// ⛔ *"Expect non-empty data-stage parameters."* IS THIS TYPE: `DataStructDims::empty()`
+/// (`dsc/dims.cpp:112`) is equality with a default-constructed one, so a half that states nothing
+/// has no witness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatedStage<D> {
+    ss: StageDims<D>,
+    el: StageDims<D>,
+}
+
+impl<D: Default + PartialEq> StatedStage<D> {
+    /// The witness, or [`None`] where the reference refuses.
+    #[must_use]
+    pub fn of(ss: D, ss_name: StageName, el: D, el_name: StageName) -> Option<Self> {
+        (ss != D::default() && el != D::default()).then(move || Self {
+            ss: StageDims {
+                name: ss_name,
+                dims: ss,
+            },
+            el: StageDims {
+                name: el_name,
+                dims: el,
+            },
+        })
+    }
+}
+
+/// Replaces: e022_addOrUpdateDataStageParam
+///
+/// WRITES THE DSC'S DATA STAGE at `index` — both halves and both names — adding the entry where it
+/// is not there yet (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:721`).
+///
+/// ⭐ ONE INSERT IS THE WHOLE OF IT: `dsc2::DataStage` (`dsc/dsc2.h:40`) is exactly `ss_` and `el_`
+/// and the reference overwrites both, so the emplace-if-absent it does first is not observable.
+pub fn add_or_update_data_stage_param<D>(
+    stages: &mut DataStages<D>,
+    stage: StatedStage<D>,
+    index: DatastageId,
+) {
+    let StatedStage { ss, el } = stage;
+    stages.0.insert(index, DataStage { ss, el });
+}
+
+/// Replaces: e023_isOpFuncConv2dInt4
+///
+/// WHETHER THE OP FUNC IS ONE OF THE THREE INT4 CONV2Ds
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:739`).
+///
+/// ⭐ THE THREE ARE EVERY `CONV2D_INT4_*` THE ISA NAMES (`sys-arch-spec/arch_enums.h:207`, `:211`,
+/// `:215`), so this is int4-ness and not a subset of it.
+#[must_use]
+pub fn is_op_func_conv2d_int4(op_func: Option<OpFunc>) -> bool {
+    matches!(
+        op_func,
+        Some(OpFunc::Conv2DInt4Fwd | OpFunc::Conv2DInt4FwdGenkg3 | OpFunc::Conv2DInt4FwdSparsekg3)
+    )
+}
+
+/// Replaces: e024_isOpFuncConv2dOs1
+///
+/// WHETHER THE OP FUNC IS ONE OF THE FOUR OUTPUT-STATIONARY CONV2Ds
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:746`).
+///
+/// ⭐ THE FOUR ARE EVERY `*_OS1` THE ISA NAMES (`sys-arch-spec/arch_enums.h:241-244`) — there is no
+/// fp8 output-stationary form — so this is output-stationariness and not a subset of it.
+#[must_use]
+pub fn is_op_func_conv2d_os1(op_func: Option<OpFunc>) -> bool {
+    matches!(
+        op_func,
+        Some(
+            OpFunc::Conv2DFwdOs1
+                | OpFunc::Conv2DXrfInt8FwdOs1
+                | OpFunc::Conv2DFwdGenOs1
+                | OpFunc::Conv2DInt8FwdOs1
+        )
+    )
+}
 
 /// Replaces: e025_isOpFuncBmmInt4
 ///
@@ -2323,3 +2492,218 @@ mod tests_e033_e040 {
 //   extract   : crustify-ddc/cpp/l3.cpp:8946-9068
 //   calls     : e001_isSameDscGroup, e053_verifyScheduleTree, e054_prepDsc, e059_getPagedDimensions, e214_optimizeHbmLdsOutputInScheduleTree, e221_fillTransferZeroPaddingInfo, e222_allocAllMem, e289_optimizeHbmTransfers, e290_createChunkLoops, e291_fillTransferMulticastInfo, e292_fillAllocationStartAddrAndOffset, e293_setLxBufferType, e295_fillExplicitTransferSize, e332_createSynchronization …
 
+#[cfg(test)]
+mod unit_tests {
+    use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
+
+    use super::*;
+    use crate::schedule::ddc::v1::OpFuncs;
+    use crate::schedule::dsc2::LdsIdx;
+
+    /// A `DataStructDims` STAND-IN — which dims it states a window extent for, and nothing else,
+    /// which is every question these units put to one.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct Dims(BTreeSet<PrimaryDim>);
+
+    impl WindowExtents for Dims {
+        fn window_dims(&self) -> BTreeSet<PrimaryDim> {
+            self.0.clone()
+        }
+    }
+
+    /// `computeOp_` with one entry.
+    struct Ops(Option<OpFunc>);
+
+    impl ComputeOps for Ops {
+        fn op_funcs(&self) -> OpFuncs {
+            OpFuncs::new(self.0, Vec::new())
+        }
+
+        fn set_first_op_func(&mut self, op_func: OpFunc) {
+            self.0 = Some(op_func);
+        }
+    }
+
+    fn via(unit: SenComponent, storage: SenComponent, lds: u32) -> Via {
+        Via {
+            loc: DataLocation { unit, storage },
+            lds: Some(LdsIdx(lds)),
+        }
+    }
+
+    fn dims(of: &[PrimaryDim]) -> Dims {
+        Dims(of.iter().copied().collect())
+    }
+
+    #[test]
+    fn a_transfer_node_carries_every_end_with_its_storage_and_its_lds_index() {
+        let node = create_transfer_node(
+            via(SenComponent::L3lu, SenComponent::Hbm, 7),
+            via(SenComponent::L3lu, SenComponent::Lx, 7),
+            &[via(SenComponent::L3su, SenComponent::Lx, 9)],
+            NodeName("transfer_lds7_src:HBM_dst:LX".to_owned()),
+        );
+
+        assert_eq!(node.src.unit, SenComponent::L3lu);
+        assert_eq!(node.src.storage, SenComponent::Hbm);
+        assert_eq!(node.src.data.my_lds_idx, Some(LdsIdx(7)));
+        // A freshly minted end states no `dataConnect_`.
+        assert_eq!(node.src.data.data_connect, None);
+
+        let dsts: Vec<_> = node
+            .dsts
+            .iter()
+            .map(|dst| (dst.unit, dst.storage, dst.data.my_lds_idx))
+            .collect();
+        assert_eq!(
+            dsts,
+            vec![
+                (SenComponent::L3lu, SenComponent::Lx, Some(LdsIdx(7))),
+                (SenComponent::L3su, SenComponent::Lx, Some(LdsIdx(9))),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_loop_dim_is_a_window_dim_only_where_the_core_stage_windows_ki_or_kj() {
+        let stages = DataStages(
+            [(
+                CoreWindowDims::CORE,
+                DataStage {
+                    ss: StageDims {
+                        name: StageName("0".to_owned()),
+                        dims: dims(&[PrimaryDim::Ki, PrimaryDim::X]),
+                    },
+                    el: StageDims::default(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let core = CoreWindowDims::of(&stages).expect("the core data stage is stated");
+
+        let node = create_loop_node(
+            &core,
+            PrimaryDim::Ki,
+            &[PrimaryDim::Kj, PrimaryDim::X],
+            DatastageId(1),
+            DatastageId(0),
+            NodeName("loop_ds1_ds0".to_owned()),
+        );
+
+        let kinds: Vec<_> = node.dims.iter().map(|dim| (dim.dim, dim.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (PrimaryDim::Ki, MetaDimKind::WindowDim),
+                // `kj` is not windowed by the core stage, and `x` is not a dim the test even reads.
+                (PrimaryDim::Kj, MetaDimKind::Unpadded),
+                (PrimaryDim::X, MetaDimKind::Unpadded),
+            ]
+        );
+        assert_eq!(node.num, DatastageId(1));
+        assert_eq!(node.den, DatastageId(0));
+
+        // And a DSC whose core data stage is absent yields no witness at all.
+        assert!(CoreWindowDims::of(&DataStages::<Dims>::default()).is_none());
+    }
+
+    #[test]
+    fn a_block_node_carries_the_name_it_was_minted_with() {
+        let node = create_block_node(NodeName("block_lds3".to_owned()));
+        assert_eq!(node.name, NodeName("block_lds3".to_owned()));
+    }
+
+    #[test]
+    fn a_sync_node_records_its_units_which_end_it_is_and_how_it_signals() {
+        let node = create_sync_node(
+            SyncUnits::new(SenComponent::L3su, [SenComponent::L3lu]),
+            NodeName("sync_receive_L3SU_to_L3LU".to_owned()),
+            SyncDirection::Receive,
+            SyncStrength::Soft,
+        );
+
+        assert_eq!(
+            node.units.iter().collect::<Vec<_>>(),
+            vec![SenComponent::L3lu, SenComponent::L3su]
+        );
+        assert_eq!(node.direction, SyncDirection::Receive);
+        assert_eq!(node.strength, SyncStrength::Soft);
+    }
+
+    #[test]
+    fn the_op_func_name_is_the_first_compute_op_s() {
+        assert_eq!(
+            get_op_func_name(&Ops(Some(OpFunc::Conv2DInt4Fwd))),
+            Some(OpFunc::Conv2DInt4Fwd)
+        );
+        // `OpFuncs::NONE` reaches the caller as the absence it is.
+        assert_eq!(get_op_func_name(&Ops(None)), None);
+    }
+
+    #[test]
+    fn writing_a_data_stage_replaces_both_halves_and_a_stated_nothing_has_no_witness() {
+        let mut stages = DataStages::default();
+        let stage = StatedStage::of(
+            dims(&[PrimaryDim::X]),
+            StageName("3".to_owned()),
+            dims(&[PrimaryDim::Y]),
+            StageName("3el".to_owned()),
+        )
+        .expect("both halves state an extent");
+        add_or_update_data_stage_param(&mut stages, stage, DatastageId(3));
+
+        let update = StatedStage::of(
+            dims(&[PrimaryDim::In]),
+            StageName("3".to_owned()),
+            dims(&[PrimaryDim::Out]),
+            StageName("3el".to_owned()),
+        )
+        .expect("both halves state an extent");
+        add_or_update_data_stage_param(&mut stages, update, DatastageId(3));
+
+        let written = &stages.0[&DatastageId(3)];
+        assert_eq!(written.ss.dims, dims(&[PrimaryDim::In]));
+        assert_eq!(written.ss.name, StageName("3".to_owned()));
+        assert_eq!(written.el.dims, dims(&[PrimaryDim::Out]));
+        assert_eq!(written.el.name, StageName("3el".to_owned()));
+
+        // And a half that states nothing has no witness.
+        assert!(
+            StatedStage::of(
+                Dims::default(),
+                StageName("4".to_owned()),
+                dims(&[PrimaryDim::X]),
+                StageName("4el".to_owned()),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_int4_conv2ds_are_the_three_int4_forms_and_nothing_else() {
+        for op in [
+            OpFunc::Conv2DInt4Fwd,
+            OpFunc::Conv2DInt4FwdGenkg3,
+            OpFunc::Conv2DInt4FwdSparsekg3,
+        ] {
+            assert!(is_op_func_conv2d_int4(Some(op)));
+        }
+        assert!(!is_op_func_conv2d_int4(Some(OpFunc::Conv2DInt8Fwd)));
+        assert!(!is_op_func_conv2d_int4(None));
+    }
+
+    #[test]
+    fn the_output_stationary_conv2ds_are_the_four_os1_forms_and_nothing_else() {
+        for op in [
+            OpFunc::Conv2DFwdOs1,
+            OpFunc::Conv2DXrfInt8FwdOs1,
+            OpFunc::Conv2DFwdGenOs1,
+            OpFunc::Conv2DInt8FwdOs1,
+        ] {
+            assert!(is_op_func_conv2d_os1(Some(op)));
+        }
+        assert!(!is_op_func_conv2d_os1(Some(OpFunc::Conv2DFwd)));
+        assert!(!is_op_func_conv2d_os1(None));
+    }
+}

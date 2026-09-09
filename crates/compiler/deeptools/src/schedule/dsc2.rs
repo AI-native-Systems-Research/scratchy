@@ -17,9 +17,9 @@
 //!   * An operand and its [`DataInfo`] are ONE value, so the length mismatch `dbgPrint` walks into
 //!     (it bounds the loop by `inputsLdsAndLoopOffsets_.size()` and indexes `inputs_`) cannot occur.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use sys_arch_spec::arch_enums::SenComponent;
+use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 
 use crate::arch::{Elements, Sticks};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
@@ -295,6 +295,9 @@ pub struct DataInfo {
 pub struct Operand {
     /// `inputs_`/`outputs_` entry, `src_.unit_`, or `dstVias_.at(i).loc_.unit_`.
     pub unit: SenComponent,
+    /// `src_.storage_` / `dstVias_.at(i).loc_.storage_` — the memory the unit reaches, which is the
+    /// other half of the `DataLocation` the reference keeps this operand in.
+    pub storage: SenComponent,
     /// The matching `..LdsAndLoopOffsets_` entry.
     pub data: DataInfo,
 }
@@ -405,6 +408,50 @@ impl AllocLayout {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StartAddress(pub FoldDim);
 
+/// ONE END OF A TRANSFER AS ITS MINTING SITE IS HANDED IT — a [`DataLocation`] (`src_`, or a
+/// `DstVia::loc_`) TOGETHER WITH the matching `..LdsAndLoopOffsets_.myLdsIdx_`.
+///
+/// ⭐ THE PAIRING IS THE POINT, AGAIN: `createTransferNode` is given the units, the storages and the
+/// lds indices as three independently-sized vectors, and it fills `dstVias_` from the first two and
+/// `dstLdsAndLoopOffsets_` from the third. An end that cannot arrive without its lds index is what
+/// makes *"Destination unit and storage numbers do not match."* unspellable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Via {
+    /// `src_` / `dstVias_.at(i).loc_`.
+    pub loc: DataLocation,
+    /// The matching `myLdsIdx_`, once its `-1` is an [`Option`].
+    pub lds: Option<LdsIdx>,
+}
+
+impl Via {
+    /// The operand this end becomes, with `dataConnect_` and `constantId_` EMPTY — the
+    /// default-constructed `DataInfo` a freshly minted node carries (`dsc/dsc2.h:722`).
+    #[must_use]
+    pub const fn operand(self) -> Operand {
+        Operand {
+            unit: self.loc.unit,
+            storage: self.loc.storage,
+            data: DataInfo {
+                data_connect: None,
+                my_lds_idx: self.lds,
+                constant_id: None,
+            },
+        }
+    }
+
+    /// The end an operand already states, which is what duplicating a transfer node copies out.
+    #[must_use]
+    pub const fn of(operand: &Operand) -> Self {
+        Self {
+            loc: DataLocation {
+                unit: operand.unit,
+                storage: operand.storage,
+            },
+            lds: operand.data.my_lds_idx,
+        }
+    }
+}
+
 /// `dsc2::AllocateNode` (`dsc/dsc2.h:974`) narrowed to what the ported units read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocateNode {
@@ -497,6 +544,76 @@ pub struct TransferNode {
     pub replication_factor: ReplicationFactor,
     /// `unitTimeTransferChunkSize_` (`:836`) — the continuous elements within a stick boundary.
     pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
+}
+
+/// `dsc2::BlockNode` (`dsc/dsc2.h:526`) narrowed to what minting one writes.
+///
+/// ⛔ `next_` IS NOT HERE BECAUSE A FRESH BLOCK HAS NO CHILDREN: `new dsc2::BlockNode()` leaves the
+/// child vector empty, and `addChildNode`/`moveChildNode` are the units that fill it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockNode {
+    /// `name_`.
+    pub name: NodeName,
+}
+
+/// WHICH END OF A SIGNAL PAIR A SYNC NODE IS — `SyncNode::isReceive_` (`dsc/dsc2.h:967`), whose
+/// `false` default is the sending end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncDirection {
+    /// `isReceive_ == false`.
+    Send,
+    /// `isReceive_ == true`.
+    Receive,
+}
+
+/// HOW A SYNC NODE SIGNALS — `SyncNode::isSoft_` (`dsc/dsc2.h:967`), whose `false` default is the
+/// hardware signal.
+///
+/// ⛔ A SEPARATE ENUM AND NOT A SECOND `bool` ON THE SAME CALL: the reference takes `isReceive` and
+/// `isSoft` adjacently, and two `bool`s in that position transpose silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStrength {
+    /// `isSoft_ == false`.
+    Hard,
+    /// `isSoft_ == true`.
+    Soft,
+}
+
+/// THE UNITS A SYNC NODE SIGNALS BETWEEN — `SyncNode::units_` (`dsc/dsc2.h:966`), NON-EMPTY because
+/// a sync with no unit in it signals to nobody, and a set because the reference's is an
+/// `unordered_set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncUnits(BTreeSet<SenComponent>);
+
+impl SyncUnits {
+    /// A sync signals between at least one unit, and this is how that is stated.
+    #[must_use]
+    pub fn new(first: SenComponent, rest: impl IntoIterator<Item = SenComponent>) -> Self {
+        let mut units: BTreeSet<SenComponent> = rest.into_iter().collect();
+        units.insert(first);
+        Self(units)
+    }
+
+    /// `units_`, in the set's order.
+    pub fn iter(&self) -> impl Iterator<Item = SenComponent> + '_ {
+        self.0.iter().copied()
+    }
+}
+
+/// `dsc2::SyncNode` (`dsc/dsc2.h:964`) narrowed to what minting one writes.
+///
+/// ⛔ `implicitSyncRefTransfer_` AND `otherEndOfTheSignals_` ARE NOT HERE: both are `nullptr`/empty
+/// on a fresh node, and the units that pair two ends up own them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncNode {
+    /// `name_`.
+    pub name: NodeName,
+    /// `units_`.
+    pub units: SyncUnits,
+    /// `isReceive_`.
+    pub direction: SyncDirection,
+    /// `isSoft_`.
+    pub strength: SyncStrength,
 }
 
 /// A SCHEDULE NODE, AS THE FOLD UNITS SEE IT — `nodeType_`'s `ALLOCATE`, `COMPUTE` and `TRANSFER`
