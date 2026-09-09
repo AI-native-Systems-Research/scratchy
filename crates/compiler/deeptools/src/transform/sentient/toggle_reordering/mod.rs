@@ -195,7 +195,7 @@ fn outermost_const_initialization(iter_arg: Val, scope: &[Op]) -> Option<(Val, u
     todo!(
         "getOutermostConstInitialization (senpass e246, transform/sentient/utils) is not ported yet \
          — the inner-to-outer iter-arg chain walk, its constant-bound trip-count product and its \
-         one-use/ForOp-user refusals (Transform/Sentient/Utils.cpp:469-523) are what this delegates \
+         one-use/ForOp-user refusals (Transform/Sentient/Utils.cpp:469-524) are what this delegates \
          to (ToggleReordering.cpp:248)"
     )
 }

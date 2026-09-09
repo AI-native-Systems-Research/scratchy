@@ -224,7 +224,7 @@ fn uses<A: Arch, M: Model, W: Workload>(of: Val, program: &Program<A, M, W>) -> 
 /// ⛔ THE SCOPE IS THE **FUNCTION**, NOT THE UNIT: `dataflow.program_unit` is not `IsolatedFromAbove`,
 /// so a constant leaves the unit it was written in and dedupes program-wide.
 /// ⚠️ RESIDUE: the driver also folds and dead-erases every other op it walks; only the constants this
-/// call's own comment names are ported. The pass ships DISABLED (`DisableThisPass`, `:35-38`).
+/// call's own comment names are ported. The pass ships DISABLED (`DisableThisPass`, `:39-42`).
 pub(crate) fn cleanup_constants<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
     let mut found: Vec<(ConstId, Val)> = Vec::new();
     collect(&program.preamble, &mut found);
@@ -233,7 +233,7 @@ pub(crate) fn cleanup_constants<A: Arch, M: Model, W: Workload>(program: &mut Pr
     }
 
     // `if (folderConstOp) { replaceAllUsesWith(op, folderConstOp); op->erase(); }` — the FIRST
-    // occurrence of a key is the survivor and every later one is rewired onto it.
+    // occurrence of a key is the survivor and every later one is rewired onto it and erased.
     let mut survivors: Vec<(ConstId, Val)> = Vec::new();
     let mut rewires: Vec<(Val, Val)> = Vec::new();
     for (id, result) in &found {
@@ -242,31 +242,70 @@ pub(crate) fn cleanup_constants<A: Arch, M: Model, W: Workload>(program: &mut Pr
             None => survivors.push((*id, *result)),
         }
     }
-    for (of, with) in rewires {
-        dialects::replace_all_uses_with(&mut program.preamble, of, with);
+    for (of, with) in &rewires {
+        dialects::replace_all_uses_with(&mut program.preamble, *of, *with);
         for unit in program.units.iter_mut() {
-            dialects::replace_all_uses_with(&mut unit.body, of, with);
+            dialects::replace_all_uses_with(&mut unit.body, *of, *with);
         }
     }
+    let duplicates: Vec<Val> = rewires.iter().map(|(of, _)| *of).collect();
+    take_everywhere(program, &duplicates);
 
-    let wanted: Vec<Val> = found.iter().map(|(_, result)| *result).collect();
-    let mut taken: Vec<(Val, Op)> = Vec::new();
-    take_from(&mut program.preamble, &wanted, &mut taken);
-    for unit in program.units.iter_mut() {
-        take_from(&mut unit.body, &wanted, &mut taken);
-    }
-
-    // `op->moveBefore(&insertBlock->front())` in the order the walk met them, so the entry block ends
-    // in REVERSE discovery order. ⛔ A survivor nothing reads is trivially dead and stays out.
+    // `op->moveBefore(&insertBlock->front())` (`FoldUtils.cpp:160-168`) — ⛔ A SURVIVOR THE ENTRY BLOCK
+    // ALREADY HELD DOES NOT MOVE when it heads the block or follows one this walk already uniqued;
+    // MLIR takes the pre-existing constants first *"to avoid accidentally reversing the constant
+    // order"* (`mlir/../GreedyPatternRewriteDriver.cpp:846-854`). Only the ones imported from a unit
+    // or a nested region are pushed to the front, and those land in reverse discovery order.
+    let mut uniqued: Vec<Val> = Vec::new();
     for (_, result) in &survivors {
-        if uses(*result, program) == 0 {
-            continue;
+        match at_top_level_of(&program.preamble, *result) {
+            Some(0) => {}
+            Some(at)
+                if scalar_constant(&program.preamble[at - 1])
+                    .is_some_and(|(_, before)| uniqued.contains(&before)) => {}
+            Some(at) => {
+                let op = program.preamble.remove(at);
+                program.preamble.insert(0, op);
+            }
+            None => {
+                for (_, op) in take_everywhere(program, &[*result]) {
+                    program.preamble.insert(0, op);
+                }
+            }
         }
-        if let Some(position) = taken.iter().position(|(val, _)| val == result) {
-            let (_, op) = taken.remove(position);
-            program.preamble.insert(0, op);
-        }
+        uniqued.push(*result);
     }
+
+    // ⛔ A SURVIVOR NOTHING READS IS TRIVIALLY DEAD — the unique constants DO go on the driver's
+    // worklist (`GreedyPatternRewriteDriver.cpp:859`, only the replaced duplicates are skipped), and
+    // `processWorklist` erases a trivially dead op before it tries any pattern (`:484-486`).
+    let dead: Vec<Val> = survivors
+        .iter()
+        .map(|(_, result)| *result)
+        .filter(|result| uses(*result, program) == 0)
+        .collect();
+    program
+        .preamble
+        .retain(|op| !scalar_constant(op).is_some_and(|(_, result)| dead.contains(&result)));
+}
+
+/// Where `result`'s `sentient.scalar_constant` sits in the entry block itself, if it is there.
+fn at_top_level_of(ops: &[Op], result: Val) -> Option<usize> {
+    ops.iter()
+        .position(|op| scalar_constant(op).is_some_and(|(_, at)| at == result))
+}
+
+/// `op->erase()`, and the first half of `op->moveBefore(..)`, over the whole program.
+fn take_everywhere<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    wanted: &[Val],
+) -> Vec<(Val, Op)> {
+    let mut taken: Vec<(Val, Op)> = Vec::new();
+    take_from(&mut program.preamble, wanted, &mut taken);
+    for unit in program.units.iter_mut() {
+        take_from(&mut unit.body, wanted, &mut taken);
+    }
+    taken
 }
 
 // crustify:todo: e484_runOn
@@ -412,6 +451,38 @@ mod unit_tests {
                     body: vec![adds(Val(1), Val(6))],
                 }),
             ]
+        );
+    }
+
+    /// e238 — ⛔ THE ENTRY BLOCK'S OWN CONSTANTS ARE NOT REORDERED: a leading run of them is left
+    /// exactly where it stands, and only the one imported from the unit is pushed in front of it.
+    #[test]
+    fn e238_leaves_the_entry_blocks_leading_constants_in_place() {
+        let mut program = program_of(vec![
+            constant(5, Val(3), sentient::RegType::Lrf),
+            adds(Val(3), Val(12)),
+        ]);
+        program.preamble = vec![
+            constant(7, Val(1), sentient::RegType::Imm),
+            constant(9, Val(2), sentient::RegType::Imm),
+            adds(Val(1), Val(10)),
+            adds(Val(2), Val(11)),
+        ];
+        cleanup_constants(&mut program);
+
+        assert_eq!(
+            program.preamble,
+            vec![
+                constant(5, Val(3), sentient::RegType::Lrf),
+                constant(7, Val(1), sentient::RegType::Imm),
+                constant(9, Val(2), sentient::RegType::Imm),
+                adds(Val(1), Val(10)),
+                adds(Val(2), Val(11)),
+            ]
+        );
+        assert_eq!(
+            program.units.iter().next().expect("the head unit").body,
+            vec![adds(Val(3), Val(12))]
         );
     }
 }

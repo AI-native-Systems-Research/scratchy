@@ -148,7 +148,7 @@ fn output_register(result: &sentient::ResultPorts) -> Option<String> {
         .find(|dest| dest.contains("irf") || dest.contains("lrf") || dest.contains("xrf"))
 }
 
-/// `atoi(&spelling.str().back())` (`:118`, `Utils.cpp:467-469`).
+/// `atoi(&spelling.str().back())` (`:118`, `Dialect/Sentient/Utils.cpp:467-469`).
 ///
 /// ⛔⛔ IT READS **ONE CHARACTER**: `lrf12` starts at 2, not 12. That bounds every synthesized name to
 /// `lrf0`..`lrf17` (last digit 9 plus the largest unroll factor), and a spelling whose last character
@@ -161,7 +161,7 @@ fn last_digit(spelling: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// `dcc::sentient::utils::doesMacOpUseRegister` (`Dialect/Sentient/Utils.cpp:459-497`) — does `mac`
+/// `dcc::sentient::utils::doesMacOpUseRegister` (`Dialect/Sentient/Utils.cpp:460-499`) — does `mac`
 /// read `reg` in any of its unrolled copies.
 ///
 /// ⛔ TRAP: `contains` IS A SUBSTRING TEST AND IT IS PRESERVED — `lrf1` also matches `lrf10`..`lrf19`,
@@ -221,7 +221,8 @@ pub(crate) fn mac_ops_flow_dependence<A: Arch>(a: &Op, b: &Op, precision: Precis
         .any(|copy| does_mac_op_use_register::<A>(&dst, &format!("lrf{}", start + copy), precision))
 }
 
-/// `AncestorWithCounts` (`Utils.hpp:73-79`) — [`outermost_ancestor_in_common_scope`]'s answer.
+/// `AncestorWithCounts` (`src/Utils/Utils.hpp:72-78`) — what
+/// [`outermost_ancestor_in_common_scope`] answers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AncestorWithCounts {
     /// `ancestor`, as a position. ⛔ EMPTY IS THE PROGRAM UNIT and is the only reading `nullptr` has
@@ -237,15 +238,15 @@ struct AncestorWithCounts {
     if_ops_from_dst: i32,
 }
 
-/// `dcc::utils::getOutermostAncestorInCommonScope` (`Utils.cpp:80-135`) — the outermost op on `src`'s
-/// chain still strictly inside the innermost scope `src` and `dst` share, plus how many
+/// `dcc::utils::getOutermostAncestorInCommonScope` (`src/Utils/Utils.cpp:80-136`) — the outermost op
+/// on `src`'s chain still strictly inside the innermost scope `src` and `dst` share, plus how many
 /// `sentient.for`s and `sentient.if`s each chain crossed reaching it.
 ///
 /// ⭐ THE PARENT CHAIN *IS* THE PATH: `getParentOp()` drops one ordinal, so the innermost common
 /// ancestor is the longest common prefix and the `SmallPtrSet` of src's ancestors is not needed.
-/// ⛔ ONLY `sentient.for` AND `sentient.if` COUNT (`:113-119`) — an `affine.for`, an `scf.if` or a
+/// ⛔ ONLY `sentient.for` AND `sentient.if` COUNT (`:112-121`) — an `affine.for`, an `scf.if` or a
 /// uniform region on either chain is crossed silently.
-/// ⛔ `src` AT OR ABOVE `dst` IS ITS OWN ANSWER WITH NO CROSSINGS COUNTED (`:86-88`, `:102-105`).
+/// ⛔ `src` AT OR ABOVE `dst` IS ITS OWN ANSWER WITH NO CROSSINGS COUNTED (`:85-88`, `:103-106`).
 fn outermost_ancestor_in_common_scope(src: &OpId, dst: &OpId, body: &[Op]) -> AncestorWithCounts {
     let (src_path, dst_path) = (src.path(), dst.path());
     let common = src_path
@@ -388,8 +389,8 @@ impl Dependencies {
     /// that ancestor inserts MORE than its own budget — preserved.
     /// ⛔ TRAP: THE BUILDER IS REBUILT PER HAZARD, so of two hazards under one ancestor the LATER
     /// one's NOPs land FIRST.
-    /// ⛔ AN UNNAMED MAC GIVES UNNAMED NOPs (`Utils.cpp:495-496`); a `src` that is not a MAC is a null
-    /// dereference at `:308` and is skipped here.
+    /// ⛔ AN UNNAMED MAC GIVES UNNAMED NOPs (`src/Utils/Utils.cpp:495-496`); a non-MAC `src` is a
+    /// null dereference at `:308` and is skipped here.
     pub(crate) fn insert_nop_operations(&self, body: &mut Vec<Op>, cycles: Cycles) {
         // ⭐ EVERY COUNT IS TAKEN BEFORE ANYTHING MOVES, and the insertions then run deepest-and-last
         // first: inserting at a path shifts only paths lexicographically after it, where an

@@ -98,7 +98,7 @@ pub struct InBlock(pub usize);
 
 /// Replaces: e229_isIn
 ///
-/// Whether `a` is one of the peers in `b` — the `for (auto b : B) if (a == b)` of `:54`.
+/// Whether `a` is one of the peers in `b` — the `for (auto b : B) if (a == b)` of `:55-56`.
 #[must_use]
 pub fn is_in(a: SyncHalf, b: &[SyncHalf]) -> bool {
     b.contains(&a)
@@ -117,7 +117,7 @@ fn is_equal_sets(a: &[SyncHalf], b: &[SyncHalf]) -> bool {
 /// THE FIVE OPS THE ELIGIBILITY WALK STEPS OVER — `dataflow.get_unit`, `sentient.scalar_constant`,
 /// `symbol.create_symbol`, `uniform.def_immutable_mapping` and `uniform.query_map` (`:109-113`).
 ///
-/// ⛔ THE SAME FIVE AS `LoopMerging.cpp:66-69`, and deliberately a second predicate: the two lists are
+/// ⛔ THE SAME FIVE AS `LoopMerging.cpp:67-69`, and deliberately a second predicate: the two lists are
 /// independently maintained in the reference. See [`super::loop_merging::get_next_eligible_op`].
 fn skipped_between_syncs(op: &Op) -> bool {
     matches!(
@@ -144,7 +144,7 @@ pub fn get_next_eligable_node(block: &[Op], op: InBlock) -> Option<InBlock> {
 }
 
 /// WHAT ONE FUSION PRODUCED — the new `sentient.sync` and the two the driver must then erase, at
-/// their positions AFTER the new one was inserted before them (`:139-140`, `:144`).
+/// their positions AFTER the new one was inserted before them (`:138-139`, `:144`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fused {
     /// The `sentient.sync sendrecv` that now stands where the first of the pair stood.

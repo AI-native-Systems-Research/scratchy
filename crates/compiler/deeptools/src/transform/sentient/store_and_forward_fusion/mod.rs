@@ -103,7 +103,7 @@ use crate::islands::sentient::dialects::{Op, dataflow, sentient};
 /// before a pair is TWO ops back — the reference's `getPrevNode()->getPrevNode()` (`:120-121`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldAbMode {
-    /// `is_fold_AB_mode = false` — one op per step, the default argument (`:82`).
+    /// `is_fold_AB_mode = false` — one op per step, the default argument (`:84`).
     Off,
     /// `true` — the ops come in `(fold_AB_A, fold_AB_B)` pairs.
     On,
@@ -230,7 +230,7 @@ impl<'a> UnaryOp<'a> {
 
 /// Replaces: e223_appendToVector
 ///
-/// Appends one forwarding list onto a running list of value forwardings (`:92-96`).
+/// Appends one forwarding list onto a running list of value forwardings (`:94-98`).
 ///
 /// ⛔ TRAP: `if (!array_attr) return;` GUARDS THE **NULL** `ArrayAttr`, NOT AN EMPTY ONE — a
 /// `vector_binary` has no `opCForwarding` at all, so e227 leaves that out-param default-constructed
@@ -241,10 +241,10 @@ pub fn append_to_vector(vector_attr: &mut Vec<Port>, array_attr: &[Port]) {
 }
 
 /// `is_any_of(unary_op.getUnaryOp(), reduction_abs_max, reduction_abs_min, reduction_add,
-/// reduction_max, reduction_min)` (`:131-134`) — the five operators that make a `vector_unary`
+/// reduction_max, reduction_min)` (`:129-132`) — the five operators that make a `vector_unary`
 /// UNFUSIBLE.
 ///
-/// ⛔ A REDUCTION FALLS **THROUGH** in [`find_fusible_op`] rather than stopping the walk (`:130-136`
+/// ⛔ A REDUCTION FALLS **THROUGH** in [`find_fusible_op`] rather than stopping the walk (`:128-136`
 /// has no `else`), so one already queued for deletion is still stepped over.
 #[must_use]
 const fn is_reduction(unary_op: sentient::UnaryOp) -> bool {
@@ -262,15 +262,15 @@ const fn is_reduction(unary_op: sentient::UnaryOp) -> bool {
 ///
 /// The op a trivial compute at `op` may fuse into: the nearest `vector_mac`, `vector_binary` or
 /// non-reduction `vector_unary` before it in the same block, stepping over `sentient.scalar_constant`s,
-/// `dataflow.get_unit`s and ops already queued for deletion (`:110-146`).
+/// `dataflow.get_unit`s and ops already queued for deletion (`:110-147`).
 ///
 /// ⛔ [`None`] IS THE REFERENCE'S "HANDS BACK ITS OWN ARGUMENT", and that is a strict improvement:
 /// e480's second guard tests `fusible_ops.second == op` (`:470`) after calling this on
 /// `op->getNextNode()`, so its sentinel comparison can never fire. Absence cannot be misread.
 /// ⛔ AND STEPPING OFF THE FRONT OF THE BLOCK IS A NULL DEREFERENCE THERE: in `fold_AB` mode
-/// `op->getPrevNode()->getPrevNode()` (`:120-121`, `:141-142`) dereferences null for an op at index 0
+/// `op->getPrevNode()->getPrevNode()` (`:120-121`, `:140-141`) dereferences null for an op at index 0
 /// or 1. This answers [`None`] — a deliberate divergence from a crash.
-/// ⭐ `fusible_op->getBlock() == op->getBlock()` (`:124`) IS ALWAYS TRUE WHERE IT IS TESTED, because
+/// ⭐ `fusible_op->getBlock() == op->getBlock()` (`:123`) IS ALWAYS TRUE WHERE IT IS TESTED, because
 /// `getPrevNode()` is a sibling by construction; the loop guard is the non-null test alone.
 /// ⛔ `sentient::ConstantOp` IS `sentient.scalar_constant` ALONE (`SentientOps.td:848`) — a
 /// `sentient.vector_constant` is a different op class and STOPS the walk.
@@ -311,12 +311,12 @@ pub fn find_fusible_op(
 /// Replaces: e225_isOpTrivialMacOp
 ///
 /// Whether a `vector_mac` computes nothing but a forward: `0*B+C` or `A*0+C` forwarding `opC` or the
-/// result, or `lrf<n>*1+0` forwarding that operand or the result (`:148-181`).
+/// result, or `lrf<n>*1+0` forwarding that operand or the result (`:148-180`).
 ///
-/// ⛔ `opC != zero` RETURNS EITHER WAY (`:157-164`): an accumulating MAC is trivial only in the
+/// ⛔ `opC != zero` RETURNS EITHER WAY (`:159-166`): an accumulating MAC is trivial only in the
 /// zero-operand form, so the two `lrf*1` arms are unreachable for one.
-/// ⭐ `stringifySentientComputePort(port).contains("lrf")` IS `Port::Lrf(_)` — of the sixty-seven
-/// spellings only `lrf<n>` holds that substring, so the string test becomes a match.
+/// ⭐ `stringifySentientComputePort(port).contains("lrf")` IS `Port::Lrf(_)` — of the sixty-three
+/// spellings (`SentientTypes.td:165-227`) only `lrf<n>` holds it, so the test becomes a match.
 /// ⛔ AND EACH `lrf` ARM REQUIRES THE **OTHER** OPERAND'S FORWARDING TO BE EMPTY, not its own.
 #[must_use]
 pub fn is_op_trivial_mac_op(mac_op: MacOp<'_>) -> bool {
@@ -346,7 +346,7 @@ pub fn is_op_trivial_mac_op(mac_op: MacOp<'_>) -> bool {
 /// Whether a `vector_binary` computes nothing but a forward: `lrf<n> or 0` forwarding that operand or
 /// the result (`:182-204`).
 ///
-/// ⛔ `or0` AND NOTHING ELSE (`:186`) — the operator is spelled `or0` because *"and and or are
+/// ⛔ `or0` AND NOTHING ELSE (`:185`) — the operator is spelled `or0` because *"and and or are
 /// reserved keyword in c++"*, and `and0`, `add` or a compare is never trivial.
 /// ⛔ THE ZERO OPERAND IS `zero`, NOT `one` AS IN [`is_op_trivial_mac_op`], and each arm again requires
 /// the OTHER operand's forwarding to be empty.
@@ -398,9 +398,9 @@ impl Forwardings {
     /// Replaces: e227_fillOperandForFusibleOp
     ///
     /// The forwardings and result precision of the op a trivial compute is about to fuse into — a
-    /// `vector_mac`, `vector_binary` or `vector_unary` (`:340-376`).
+    /// `vector_mac`, `vector_binary` or `vector_unary` (`:341-379`).
     ///
-    /// ⛔ [`None`] IS THE `emitError` + `LogicalResult::failure()` ARM (`:371-375`): e480 abandons the
+    /// ⛔ [`None`] IS THE `emitError` + `LogicalResult::failure()` ARM (`:373-377`): e480 abandons the
     /// fusion on it, and the diagnostic is the reference's only other effect.
     /// ⛔ THE THREE `dyn_cast`s HAPPEN UP FRONT THERE AND ARE TESTED IN THIS ORDER; no op is two of
     /// them, so the ordering is not observable.
@@ -439,7 +439,7 @@ impl Forwardings {
 /// whether the fusion fits ONE instruction rather than an error.
 ///
 /// ⛔ DECLINING IS NOT FAILING, and the crate forbids spelling it as an error anyway: e480 abandons
-/// this one fusion and its caller walks on (`:530-537`, `:556-568`). Same shape as
+/// this one fusion and its caller walks on (`:531-538`, `:570-574`). Same shape as
 /// [`super::lightweight_simplification::Simplified`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
@@ -454,10 +454,10 @@ pub enum Updated {
 /// Replaces: e228_updateFusibleOp
 ///
 /// Writes the trivial op's whole forwarding list into the fusible op's `ResultForwarding`, refusing
-/// when that list names more than one LRF (`:386-427`).
+/// when that list names more than one LRF (`:387-429`).
 ///
 /// ⭐ THE EFFECT IS THE PORT: `setResultForwardingAttr` on whichever of the three op classes it is.
-/// ⛔ *"we cannot generate a single instruction using the current ISA"* (`:409-410`) is the refusal —
+/// ⛔ *"we cannot generate a single instruction using the current ISA"* (`:407-408`) is the refusal —
 /// the count is of the TRIVIAL list only; the fusible list is never counted.
 /// ⛔ `if (val == none) continue` (`:398`) IS DEAD: `stringify(none)` is `"none"`, which does not hold
 /// `"lrf"`, so the skip changes no count.
@@ -583,7 +583,7 @@ mod unit_tests {
         })
     }
 
-    /// e223: a null `ArrayAttr` contributes nothing and a present one appends in order (`:92-96`).
+    /// e223: a null `ArrayAttr` contributes nothing and a present one appends in order (`:94-98`).
     #[test]
     fn an_absent_forwarding_list_appends_nothing_and_a_present_one_appends_in_order() {
         let mut value_forwardings = vec![Port::West];
@@ -601,7 +601,7 @@ mod unit_tests {
 
     /// e224: the walk steps over a `scalar_constant` and a `get_unit` to reach the mac — and a
     /// reduction `vector_unary` stops it unless it is queued for deletion, which is the fall-through
-    /// at `:130-136`.
+    /// at `:128-136`.
     #[test]
     fn the_walk_steps_over_bookkeeping_and_a_reduction_stops_it_unless_it_is_being_deleted() {
         let block = vec![
@@ -635,8 +635,8 @@ mod unit_tests {
         );
     }
 
-    /// e225: `lrf0 * one + zero` forwarding `opA` is trivial (`:166-172`); an accumulating mac with no
-    /// zero operand is not (`:157-164`).
+    /// e225: `lrf0 * one + zero` forwarding `opA` is trivial (`:167-172`); an accumulating mac with no
+    /// zero operand is not (`:159-166`).
     #[test]
     fn a_mac_forwarding_an_lrf_through_a_multiply_by_one_is_trivial() {
         let forwarding_mac = mac(
@@ -655,7 +655,7 @@ mod unit_tests {
         assert!(!is_op_trivial_mac_op(MacOp::of(&accumulating_mac).unwrap()));
     }
 
-    /// e226: `lrf0 or0 zero` forwarding `opA` is trivial (`:186-195`); `and0` never is (`:186`).
+    /// e226: `lrf0 or0 zero` forwarding `opA` is trivial (`:192-196`); `and0` never is (`:185`).
     #[test]
     fn only_an_or_with_zero_forwarding_its_lrf_operand_is_trivial() {
         let or_zero = binary(
@@ -675,8 +675,8 @@ mod unit_tests {
     }
 
     /// e227: a `vector_unary` fills `opA`, the result and the precision, leaving `opB` and `opC` at
-    /// the null `ArrayAttr` the reference never assigns (`:364-370`); a non-compute op is the
-    /// `emitError` arm (`:371-375`).
+    /// the null `ArrayAttr` the reference never assigns (`:369-372`); a non-compute op is the
+    /// `emitError` arm (`:373-377`).
     #[test]
     fn a_unary_contributes_op_a_and_the_result_and_a_non_compute_op_contributes_nothing() {
         let fusible = unary(
@@ -698,7 +698,7 @@ mod unit_tests {
     }
 
     /// e228: two LRFs in the trivial op's forwardings cannot be one instruction and the fusible op is
-    /// left alone (`:405-411`); one LRF becomes its `ResultForwarding` (`:413-426`).
+    /// left alone (`:409-412`); one LRF becomes its `ResultForwarding` (`:414-427`).
     #[test]
     fn a_second_lrf_refuses_the_fusion_and_one_becomes_the_result_forwarding() {
         let mut fusible = mac(

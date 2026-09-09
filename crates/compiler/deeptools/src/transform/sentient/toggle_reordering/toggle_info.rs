@@ -324,7 +324,7 @@ mod unit_tests {
         }
     }
 
-    /// 🎯 e232 — the vendor's own diagram (`:66-88`): the toggle moves below its readers and just
+    /// 🎯 e232 — the vendor's own diagram (`:67-88`): the toggle moves below its readers and just
     /// above the yield, the readers move onto the iter arg, the yield keeps the toggle, and the outer
     /// loop's initializer becomes the rebuilt `minuend - init`.
     #[test]
