@@ -101,7 +101,7 @@ use crate::formats::Bits;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
 use crate::islands::sentient::print;
 
-/// `ssa_weight_`'s value — *"weight is based on number of times it is accessed"* (`:122-123`).
+/// `ssa_weight_`'s value — *"weight is based on number of times it is accessed"* (`:123-124`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Weight(pub i32);
 
@@ -174,9 +174,10 @@ pub fn remove_init_attr_from_ops(parent: &mut [Op]) {
 ///
 /// Erases every op the promoter marked and empties the set.
 ///
-/// ⛔ TRAP: `op->erase()` ABORTS MLIR WHILE A USE REMAINS, which is why every insertion into
-/// `to_be_erased_` is preceded by a `DT_CHECK(..getUses().empty())` (`:1180`) — the rewiring is the
-/// caller's, and this only carries it out.
+/// ⛔ TRAP: `op->erase()` ABORTS MLIR WHILE A USE REMAINS, and clearing the uses is the CALLER'S
+/// work, not this function's. ONE of the three insertion sites proves the state with
+/// `DT_CHECK(copy_op.getUses().empty())` (`:1030-1031`); the other two reach it by rewiring first,
+/// `replaceAllUsesWith` (`:1178-1179`, `:1194-1198`). This only carries the erasure out.
 /// ⭐ ORDERED, WHERE `SmallSet` IS NOT: erasing is order-independent, and a set with an order is the
 /// version whose effect is the same twice.
 pub fn erase_deleted_ops(body: &mut Vec<Op>, to_be_erased: &mut BTreeSet<Val>) {

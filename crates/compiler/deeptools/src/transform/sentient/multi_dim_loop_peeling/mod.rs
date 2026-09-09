@@ -85,7 +85,7 @@ pub(crate) mod loop_peeling_manager;
 use crate::transform::sentient::ForRef;
 
 /// WHICH ITERATION(S) OF A LOOP GET PEELED — `LoopPeelingManager::PeelingType`
-/// (`dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:83-88`).
+/// (`dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:86-91`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeelingType {
     /// `kFirstIterOnly`.
@@ -104,10 +104,10 @@ impl PeelingType {
     /// The spelling of one peeling mode.
     ///
     /// ⛔ TRAP: NOT DEBUG OUTPUT. `performLoopPeeling` feeds it to
-    /// `updateDbgName("MDLP(", for_op, stringifyPeelingType(p_type) + ")")` (`:583-585`), so these
+    /// `updateDbgName("MDLP(", for_op, stringifyPeelingType(p_type) + ")")` (`:577-578`), so these
     /// four strings reach the emitted IR as a loop's `dbgName`.
     ///
-    /// ⛔ TRAP: THE `default:` ARM IS `"NoPeeling"` (`:99-100`) — not an error, not the empty string.
+    /// ⛔ TRAP: THE `default:` ARM IS `"NoPeeling"` (`:101-102`) — not an error, not the empty string.
     #[must_use]
     pub const fn spelling(self) -> &'static str {
         match self {
@@ -123,9 +123,9 @@ impl PeelingType {
 ///
 /// ⛔⛔ THE TWO `DT_CHECK_MSG`s OF `insertOrUpdatePeelingType` ARE THIS TYPE. *"Map should only
 /// contain valid peeling modes"* guards the argument (`:165-166`) and *"Expect valid peeling mode in
-/// map"* guards the value already stored (`:177-178`); a list that cannot hold `kNoPeeling` makes
+/// map"* guards the value already stored (`:176-177`); a list that cannot hold `kNoPeeling` makes
 /// both unwritable — which is what the field's own comment asks for, *"No loop should have the
-/// peeling type kNoPeeling in this list"* (`:125-126`).
+/// peeling type kNoPeeling in this list"* (`:128`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Peeling {
     /// `kFirstIterOnly`.
@@ -161,12 +161,12 @@ impl Peeling {
 }
 
 /// `LoopPeelingManager::loop_to_peeling_type_` — the loops to peel and how, in the order
-/// `findCandidates` found them (`:127-129`).
+/// `findCandidates` found them (`:127-130`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeelingCandidates(Vec<(ForRef, Peeling)>);
 
 impl PeelingCandidates {
-    /// The records in insertion order — `findCandidates` answers `!empty()` (`:406`) and
+    /// The records in insertion order — `findCandidates` answers `!empty()` (`:430`) and
     /// `performLoopPeeling` walks them in REVERSE, innermost loop out (`:547`).
     #[must_use]
     pub fn records(&self) -> &[(ForRef, Peeling)] {
@@ -179,7 +179,7 @@ impl PeelingCandidates {
     ///
     /// ⛔ TRAP: THE UNION IS "DIFFERS, SO BOTH", NOT A JOIN OVER THE THREE MODES. The reference
     /// writes `kFirstAndLastIter` whenever the stored mode merely DIFFERS from the new one
-    /// (`:180-183`), so `kFirstAndLastIter` meeting `kFirstIterOnly` stays `kFirstAndLastIter` only
+    /// (`:180-181`), so `kFirstAndLastIter` meeting `kFirstIterOnly` stays `kFirstAndLastIter` only
     /// because that rule happens to give the right answer there.
     pub fn insert_or_update(&mut self, for_op: ForRef, peeling: Peeling) {
         match self.0.iter_mut().find(|(loop_ref, _)| *loop_ref == for_op) {

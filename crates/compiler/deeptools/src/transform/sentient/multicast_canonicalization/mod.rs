@@ -117,7 +117,7 @@ fn run_on_unit<A: Arch>(unit: &mut ProgramUnit<A>) -> ! {
 }
 
 /// ONE `dataflow.create_multicast_group` READ AS A STORE'S `$producer` — the group handle and the
-/// unit that produces the data (`Dataflow.td:163`).
+/// unit that produces the data (`Dataflow.td:174-181`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectMulticast {
     /// What the op binds, which is what the store currently names.
@@ -127,7 +127,7 @@ pub struct DirectMulticast {
 }
 
 impl DirectMulticast {
-    /// `dyn_cast<dataflow::CreateMulticastGroupOp>(ras.getProducer().getDefiningOp())` (`:334-335`) —
+    /// `dyn_cast<dataflow::CreateMulticastGroupOp>(ras.getProducer().getDefiningOp())` (`:333-334`) —
     /// `None` where the producer is anything else, which is the `else if` chain moving on.
     #[must_use]
     pub fn of(group: Val, scope: &[Op]) -> Option<DirectMulticast> {
@@ -153,6 +153,11 @@ impl DirectMulticast {
 /// of those; passing a store that does not read the group changes nothing.
 ///
 /// ⛔ TRAP: THE GROUP OP ITSELF IS NOT ERASED — `$multicast_info` keeps reading it.
+///
+/// ⛔ DELIBERATE DIVERGENCE: THE FILTER IS THE `$producer` POSITION, NOT ANY USE. The reference takes
+/// every `multicast->getUses()` owned by a store (`:126-130`), which also catches one already holding
+/// the group in `$multicast_info` and overwrites ITS unrelated `$producer`; its own comment says what
+/// it meant — *"List of ReceiveAndStoreOps with multicast as the producer"* (`:124`).
 pub fn process_direct_multicast(multicast: DirectMulticast, body: &mut [Op]) {
     for op in body.iter_mut() {
         if let Op::Sentient(sentient::Op::ReceiveAndStore {
@@ -189,10 +194,15 @@ pub struct ProducerQMap {
 /// whose values are those groups' `$producer`s — `None` where any value is not a group, which is the
 /// reference's `return nullptr`, *"not a type of q_map we know how to process"*.
 ///
-/// ⛔ TRAP: `getNonNullValuesFromKeys` MAY ANSWER SHORTER THAN `keys` — it builds a lookup from the
-/// mapping's own pairs and pushes only the keys present in it (`Uniform.cpp:548-556`), so a key the
-/// mapping does not carry contributes no value. Here the pairs are ONE list of necessarily equal
-/// length, which is why the keys are re-zipped as they are looked up rather than after.
+/// ⭐ `keys` IS `getListOfKeyOpsFromUniformMapping(orig_qmap)` (`:301`) — the caller resolves it,
+/// because that helper reads the key's binding region's unit list (`dcc/src/Dialect/Uniform/Utils.cpp:151`).
+///
+/// ⛔ DELIBERATE DIVERGENCE WHERE A KEY IS ABSENT FROM THE MAPPING: `getNonNullValuesFromKeys` pushes
+/// only the keys its lookup holds
+/// (`dataflow-scheduler/external/dataflow-scheduler-dialects/lib/Dialect/Uniform/Uniform.cpp:548-556`),
+/// so a short `new_values` is then paired POSITIONALLY with the full `keys` (`:318-320`) and every
+/// later key takes an earlier key's producer. Re-zipping each key as it is looked up keeps the pairs
+/// aligned; on a mapping whose keys all resolve — the only shape the callers build — both agree.
 #[must_use]
 pub fn create_new_producer_qmap(
     orig_qmap: &uniform::Op,

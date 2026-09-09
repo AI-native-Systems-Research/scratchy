@@ -96,7 +96,7 @@ use crate::islands::sentient::dialects::{
 };
 
 /// WHETHER A VALUE'S REGISTER FILE MAY, MUST OR MAY NOT BE INITIALISED IN THE PROGRAM HEADER —
-/// `RegisterInitInfo::RegInitLocalePriority` (`OldRegisterInitialization.cpp:99-104`).
+/// `RegisterInitInfo::RegInitLocalePriority` (`OldRegisterInitialization.cpp:100-105`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RegInitLocalePriority {
     /// `kUnknown` — the enum's zero. ⛔ NEVER RETURNED by [`get_register_init_priority`], which ends
@@ -111,7 +111,7 @@ pub enum RegInitLocalePriority {
     Required,
 }
 
-/// `allowed_reg_init_locales_` — `MaxAllowedLocales = 4` (`OldRegisterInitialization.cpp:108-115`).
+/// `allowed_reg_init_locales_` (`OldRegisterInitialization.cpp:110-116`) — `MaxAllowedLocales = 4` (`:108`).
 const ALLOWED_REG_INIT_LOCALES: [sentient::RegType; 4] = [
     sentient::RegType::Lrf,
     sentient::RegType::Lar,
@@ -119,7 +119,7 @@ const ALLOWED_REG_INIT_LOCALES: [sentient::RegType; 4] = [
     sentient::RegType::Gtr,
 ];
 
-/// `required_reg_init_locales_` — `MaxRequiredLocales = 3` (`OldRegisterInitialization.cpp:116-118`).
+/// `required_reg_init_locales_` (`OldRegisterInitialization.cpp:117-119`) — `MaxRequiredLocales = 3` (`:109`).
 const REQUIRED_REG_INIT_LOCALES: [sentient::RegType; 3] = [
     sentient::RegType::Ebr,
     sentient::RegType::Lbr,
@@ -141,12 +141,12 @@ pub enum GtrRegInit {
 }
 
 /// ONE VALUE'S WEIGHT — `ssa_weight_`'s value, *"based on number of times it is accessed"*
-/// (`OldRegisterInitialization.cpp:120-122`).
+/// (`OldRegisterInitialization.cpp:123-124`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SsaWeight(pub i32);
 
 /// `ssa_weight_` — the weight of every value the pass has scored, `DenseMap<mlir::Value, int>`
-/// (`OldRegisterInitialization.cpp:122`).
+/// (`OldRegisterInitialization.cpp:125`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SsaWeights(HashMap<Val, SsaWeight>);
 
@@ -237,7 +237,7 @@ pub fn get_register_init_priority(
 ) -> RegInitLocalePriority {
     let locale = value_reg_locale(val, defs);
     // Promoting GTRs requires inter-unit analysis, so the translator's flag is what says when it is
-    // safe (`:216-218`).
+    // safe (`:217-218`).
     if locale == sentient::RegType::Gtr {
         if gtr_reg_init == GtrRegInit::Enabled
             && let Some(Op::Sentient(sentient::Op::ScalarCopy { input, .. })) = defs.of(val)
@@ -336,7 +336,7 @@ pub fn collect_all_reg_coalescing_candidates_impl(
 /// Replaces: e107_hasUniformizeRegion
 ///
 /// Whether a program unit holds a `uniform.uniformize_regions` or a `uniform.equalize_pattern`
-/// anywhere inside it (`OldRegisterInitialization.cpp:536-547`).
+/// anywhere inside it (`OldRegisterInitialization.cpp:536-546`).
 ///
 /// TRAP: the reference's walk is `WalkOrder::PreOrder` with an `interrupt()`, but it only ever reports
 /// whether it found ONE — so "any op in the subtree" is the whole observable result and the order is

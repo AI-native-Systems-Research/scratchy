@@ -206,7 +206,7 @@ pub fn is_within_global_region(val: Val, scope: &[Op]) -> bool {
     }
 }
 
-/// THE OPS A SHARED REGISTER INIT MAY BE BUILT FROM — the four `isa<>` pairs of `:1091-1102`.
+/// THE OPS A SHARED REGISTER INIT MAY BE BUILT FROM — the four `isa<>` pairs of `:1092-1101`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceOpType {
     /// `sentient::ConstantOp`, this island's `sentient.scalar_constant`.
@@ -219,8 +219,13 @@ enum SourceOpType {
     CreateMulticastGroup,
 }
 
-/// Which of them defines `val`, or nothing for any other op AND for a value with no defining op —
-/// the `isa<T>(nullptr)` the reference gets for a region argument, false for all four.
+/// Which of them defines `val`, or nothing for any other op AND for a value with no defining op.
+///
+/// ⛔ DELIBERATE DIVERGENCE ON A NULL DEFINING OP: the reference's four tests are BARE `isa<>` on an
+/// `Operation *` (`:1092-1101`), which ASSERTS on null rather than answering false — `dcc` spells the
+/// null-tolerant form `dyn_cast_or_null` wherever it means it (`:220`, `:222`, `:227`). Both callers
+/// pass values `getSource` built (`:864-865`, `:879-880`), so a region argument does not reach it;
+/// answering `None` keeps this total instead of reproducing an assert.
 fn source_op_type(val: Val, scope: &[Op]) -> Option<SourceOpType> {
     match dialects::defining_op(val, scope)? {
         Op::Sentient(sentient::Op::ScalarConstant { .. }) => Some(SourceOpType::ScalarConstant),
@@ -380,7 +385,8 @@ mod unit_tests {
         assert!(!is_same_op_type(Some(Val(3)), Some(Val(4)), &scope));
         assert!(is_same_op_type(Some(Val(1)), None, &scope));
         assert!(is_same_op_type(None, None, &scope));
-        // A value with no defining op is none of the four, on either side.
+        // ⛔ THE DIVERGENCE, PINNED: a value with no defining op is none of the four rather than
+        // the reference's assert. See [`is_same_op_type`].
         assert!(!is_same_op_type(Some(Val(5)), Some(Val(5)), &scope));
     }
 }
