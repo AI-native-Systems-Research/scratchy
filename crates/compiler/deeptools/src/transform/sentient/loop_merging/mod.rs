@@ -85,7 +85,7 @@
 use crate::islands::sentient::dialects::{Op, dataflow, sentient, symbol, uniform};
 
 /// WHERE AN OP SITS IN ITS BLOCK — the `Operation *` identity `loopsAreMergeable` compares against
-/// the second loop (`:84`).
+/// the second loop (`:85`).
 ///
 /// ⛔ A POSITION AND NOT A BORROW, because `getNextEligibleOp`'s answer is used for IDENTITY
 /// (`getNextEligibleOp(loop_a) != loop_b`), and this island's ops are a tree with no addresses to

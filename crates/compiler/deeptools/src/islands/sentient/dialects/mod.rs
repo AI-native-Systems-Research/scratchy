@@ -1314,7 +1314,7 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
 }
 
 /// WHICH BRANCH OF A `sentient.if` SURVIVES CANONICALISATION — `RemoveStaticCondition`'s three
-/// outcomes (`SentientOps.cpp:1487-1502`).
+/// outcomes (`SentientOps.cpp:1489-1502`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticBranch {
     /// `replaceOpWithRegion(rewriter, op, op.getThenRegion())`.
@@ -1336,7 +1336,7 @@ struct DeadBranches {
 /// `findBranchesToDelete` — `lhs` a constant compared against `rhs`, a loop iterator running over
 /// `[1, bound]` (`SentientOps.cpp:1370-1427`).
 ///
-/// ⛔ IT RESETS BOTH FLAGS ON ENTRY (`:1375`), which is what makes the caller's second, reversed
+/// ⛔ IT RESETS BOTH FLAGS ON ENTRY (`:1374`), which is what makes the caller's second, reversed
 /// attempt safe to run over the first's leftovers.
 fn branches_to_delete(
     predicate: sentient::CmpPredicate,
@@ -1372,7 +1372,7 @@ fn branches_to_delete(
 }
 
 /// `RemoveStaticCondition::matchAndRewrite`'s DECISION, with no rewriting
-/// (`SentientOps.cpp:1429-1506`).
+/// (`SentientOps.cpp:1430-1506`).
 ///
 /// ⛔⛔ `None` IS `failure()` — *"this `sentient.if` is not static"*, never an error. The pattern is
 /// a fold: a condition it cannot decide leaves the op exactly as it was.
@@ -1381,7 +1381,7 @@ fn branches_to_delete(
 /// and the enclosing loops' bounds — while the rewrite mutates one block of it. An MLIR `Value`
 /// carries its own owner and needs no such split.
 ///
-/// ⭐ THE `else return failure()` ON AN UNRECOGNISED PREDICATE (`:1466`) IS UNWRITABLE HERE:
+/// ⭐ THE `else return failure()` ON AN UNRECOGNISED PREDICATE (`:1464`) IS UNWRITABLE HERE:
 /// [`sentient::CmpPredicate`] carries exactly the six the arms above it cover.
 #[must_use]
 pub fn static_if_branch(
@@ -1391,7 +1391,7 @@ pub fn static_if_branch(
     has_else: bool,
     has_results: bool,
 ) -> Option<StaticBranch> {
-    // `if (op->getNumResults() > 0 && op.getElseRegion().empty()) return failure();` (`:1434`).
+    // `if (op->getNumResults() > 0 && op.getElseRegion().empty()) return failure();` (`:1436`).
     if has_results && !has_else {
         return None;
     }

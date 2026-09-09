@@ -639,9 +639,9 @@ pub(crate) fn has_if_ops(loop_ref: ForRef, unit: &[Op]) -> bool {
 /// The if op's predicate evaluated at one iteration bound, comparing whichever side is a constant
 /// against the bound — `false` when neither side is.
 ///
-/// ⛔ TRAP: A CONSTANT LHS IS TRIED FIRST, and the comparison keeps the operand order, so
-/// `slt` reads `lhs < bound` on the left and `bound < rhs` on the right.
-/// ⭐ The reference's trailing `else` is `ne`: `CmpIPredicate` has exactly these six cases here.
+/// ⛔ TRAP: A CONSTANT LHS IS TRIED FIRST, and the comparison keeps the operand order, so `slt`
+/// reads `lhs < bound` on the left and `bound < rhs` on the right. ⭐ The trailing `else` is `ne`:
+/// sentient declares its own six-case `CmpIPredicate` (`SentientTypes.td:481-484`), not `arith`'s.
 #[must_use]
 pub(crate) fn evaluate_predicate(bound: IterBound, if_op: &Op, scope: &[Op]) -> bool {
     let Op::Sentient(ops::Op::If {

@@ -132,8 +132,8 @@ fn if_paths(block: &[Op], into: &[(usize, usize)], out: &mut Vec<RegionPath>) {
 }
 
 /// WHICH OPERAND OF A `sentient.if` IS THE INDUCTION VARIABLE — `if_op.getLhs() == iv` against
-/// `if_op.getRhs() == iv` (`MultiDimLoopPeeling.cpp:436-439`), which decides which operand index the
-/// decremented constant is written to (`:453-456`).
+/// `if_op.getRhs() == iv` (`MultiDimLoopPeeling.cpp:437-440`), which decides which operand index the
+/// decremented constant is written to (`:452-455`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IvSide {
     /// `$lhs` is the IV, so `$rhs` is the constant side — `setOperand(1, ..)`.
@@ -156,8 +156,8 @@ pub struct PredicateOnIv {
 /// EVERY USE OF ONE LOOP'S INDUCTION VARIABLE, ALL OF THEM COMPARISONS AGAINST A CONSTANT.
 ///
 /// ⛔⛔ THE TYPE IS `decrementPredicatesOnIV`'S THREE ABORTS. `llvm_unreachable("expect iv users to
-/// be IfOps")` (`:457`), `llvm_unreachable("expect a comparison on the IV")` (`:441`) and
-/// `DT_CHECK_MSG(const_op, "Expect a comparison between the IV and a ConstantOp")` (`:445-446`) all
+/// be IfOps")` (`:457`), `llvm_unreachable("expect a comparison on the IV")` (`:442`) and
+/// `DT_CHECK_MSG(const_op, "Expect a comparison between the IV and a ConstantOp")` (`:446-447`) all
 /// say the same thing: an IV whose uses are not exactly this. [`PredicatesOnIv::of`] answers `None`
 /// there instead, so the caller cannot reach the rewrite with a tree that would have aborted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +228,7 @@ fn walk_to<'a>(root: &'a [Op], into: &[(usize, usize)]) -> Option<&'a [Op]> {
 /// the loop's bound losing its last iteration means for the conditions inside it.
 ///
 /// ⛔ TRAP: THE OLD CONSTANT IS LEFT WHERE IT IS. The reference creates a second `ConstantOp` and
-/// re-points the operand (`:447-456`); it never edits the old one, which other ops may still read.
+/// re-points the operand (`:449-455`); it never edits the old one, which other ops may still read.
 ///
 /// ⛔ TRAP: THE REPLACEMENT TAKES `const_side.getType()`, NOT the IV's — the two differ wherever a
 /// comparison is on `i1`.
@@ -237,8 +237,8 @@ pub fn decrement_predicates_on_iv(
     values: &mut Values,
     block: &mut Vec<Op>,
 ) {
-    // ⭐ MINTED IN THE ORDER `getUsers()` YIELDS, so the constants carry the reference's numbering,
-    // and APPLIED deepest-and-last first: inserting one shifts the indices at and after it in that
+    // ⭐ MINTED IN COLLECTION ORDER, which fixes only the `Val` numbering, and APPLIED
+    // deepest-and-last first: inserting one shifts the indices at and after it in that
     // one block, and every path still to be applied there names a smaller index.
     let mut ordered: Vec<(Val, &PredicateOnIv)> = predicates
         .predicates

@@ -224,7 +224,7 @@ pub(crate) enum RollingCase {
 }
 
 /// HOW CORRESPONDING OPERANDS OF ONE MATCHED OP DIFFER ACROSS THE WINDOWS — `enum OperandKind`
-/// (`LoopRolling.cpp:162`).
+/// (`LoopRolling.cpp:163`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperandKind {
     /// `kNoDelta` — the same value in every window.
@@ -252,7 +252,7 @@ pub(crate) enum OperandDifference {
     Delta(Delta),
 }
 
-/// ONE WINDOW OF INSTRUCTIONS — the reference's `Window` (`LoopRolling.cpp:83`).
+/// ONE WINDOW OF INSTRUCTIONS — the reference's `Window` (`LoopRolling.cpp:86`).
 ///
 /// ⚠️ `dcc::CommonPassOptions &opts_` IS DROPPED, AND THAT IS A MEASUREMENT: the only two mentions of
 /// `opts_` in the class are its declaration (`:87`) and the constructor's initialiser (`:107`).
@@ -339,7 +339,7 @@ impl Window {
     }
 }
 
-/// ONE SET OF MATCHED OPS ACROSS THE WINDOWS TO BE ROLLED — the reference's `MatchedOp` (`:158`).
+/// ONE SET OF MATCHED OPS ACROSS THE WINDOWS TO BE ROLLED — the reference's `MatchedOp` (`:159`).
 #[derive(Debug)]
 pub(crate) struct MatchedOp {
     /// `start_op_` — this op's instance in the start window.
@@ -359,7 +359,7 @@ pub(crate) struct MatchedOp {
 }
 
 impl MatchedOp {
-    /// ONE MATCH, both instances starting as the same op — the reference's constructor (`:180`).
+    /// ONE MATCH, both instances starting as the same op — the reference's constructor (`:179`).
     ///
     /// ⛔ NOT AN ANCHORED UNIT (an excluded trivial constructor).
     pub(crate) fn of(start_op: InstrPos) -> MatchedOp {
@@ -434,7 +434,7 @@ fn reads_nested(val: Val, op: &Op) -> bool {
 ///
 /// ⭐ NO OPTIONS, BECAUSE LOOP ROLLING'S `oe_` HAS NONE THAT VARY: it is built with a null preference
 /// functor, `all_block_args_are_equiv = true`, `do_recursive_compare = true` and
-/// `use_equiv_classes = true` (`LoopRolling.cpp:970-972`) — so every block argument matches every
+/// `use_equiv_classes = true` (`LoopRolling.cpp:987-989`) — so every block argument matches every
 /// other, operand definitions are compared recursively, and the equivalence classes are a cache.
 ///
 /// ⭐ BLANKING THE BLOCK ARGUMENTS IS CORRECT, NOT A SHORTCUT: MLIR keeps a region's arguments on the
@@ -536,7 +536,7 @@ fn immutable_mapping_pairs(map: Val, defs: Definitions<'_>) -> Vec<(Val, Val)> {
         Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => pairs.clone(),
         other => todo!(
             "a uniform.query_map's $map is not a uniform.def_immutable_mapping \
-             (Dialect/Uniform/Utils.cpp:402): {other:?}"
+             (Dialect/Uniform/Utils.cpp:403-404): {other:?}"
         ),
     }
 }
@@ -551,7 +551,7 @@ fn constant_or_symbol_target_values(map: Val, defs: Definitions<'_>) -> Vec<i64>
     if pairs.is_empty() {
         todo!(
             "getConstantOrSymbolTargetValues: DT_CHECK(!immutable_map.getValues().empty()) \
-             (Dialect/Uniform/Utils.cpp:404)"
+             (Dialect/Uniform/Utils.cpp:405)"
         );
     }
     let mut values: Vec<i64> = Vec::new();
@@ -638,7 +638,7 @@ fn scalar_add(result: Val, lhs: Val, rhs: Val) -> Op {
 ///
 /// ⭐ THE `yield_op` HALF NEEDS NO TEST: the yield lives in [`RolledLoop::body`], which this walk
 /// never enters. The reference has to name it because it built the yield into `bb_`'s new loop
-/// before the windows were re-examined, and its own comment says so (`LoopRolling.cpp:733-735`).
+/// before the windows were re-examined, and its own comment says so (`LoopRolling.cpp:744-746`).
 fn replace_uses_outside_window(block: &mut [Op], window: &Window, of: Val, with: Val) {
     for (at, op) in block.iter_mut().enumerate() {
         if window.is_op_in_this_window(InstrPos(at)) {
@@ -655,9 +655,9 @@ fn replace_uses_outside_window(block: &mut [Op], window: &Window, of: Val, with:
 ///
 /// ⛔ `LoadAndExtractScalar` AND `LoadComputeAndSend` ARE EXCLUDED BY THE REFERENCE'S OWN NOTE
 /// (`LoopRolling.cpp:68-69`): they *"should never provide rolling opportunities"*.
-/// ⚠️ TRAP: the positions are `SentientOps.td`'s (`:507-509`, `:550-552`, `:719-723`) and this
-/// island's operand list matches them only up to slot 2 — it models `$consumer`/`$producer` as a wire
-/// end, so `load_and_send` and `receive_and_store` are one slot short from position 3 on.
+/// ⚠️ TRAP: the positions are `SentientOps.td:507-509`, `:550-552`, `:722-729`, and this island's
+/// list matches them only up to slot 2 — it models `$consumer`/`$producer` as a wire end, so
+/// `load_and_send` and `receive_and_store` are one slot short from position 3 on.
 /// ⚠️ `OpBuilder &const_builder` IS UNUSED IN THE REFERENCE'S BODY and is dropped.
 pub(crate) fn is_increment_field(op: &Op, i: OperandIdx) -> bool {
     match op {
@@ -675,7 +675,7 @@ pub(crate) fn is_increment_field(op: &Op, i: OperandIdx) -> bool {
 /// fills.
 ///
 /// ⛔⛔ NOT YET AN OP OF THE BLOCK, AND THAT IS DELIBERATE. The reference inserts the `ForOp` into
-/// `bb_` and then moves ops out of `bb_` INTO it (`:761-856`), which here would be one `&mut` into a
+/// `bb_` and then moves ops out of `bb_` INTO it (`:822-856`), which here would be one `&mut` into a
 /// vector reaching another element of the same vector. Building the loop beside the block and
 /// inserting it once, after `cur_window`'s end, is the same IR.
 #[derive(Debug)]
@@ -685,9 +685,9 @@ pub(crate) struct RolledLoop {
     pub(crate) carried: Vec<sentient::Carried>,
     /// The body.
     pub(crate) body: Vec<Op>,
-    /// Where the `sentient.yield` sits in [`Self::body`] — `matchAndRoll` creates it FIRST and moves
-    /// it to the end only after `updateBody` has run (`:846`, `:856`), which is what puts the created
-    /// adds after the moved ops.
+    /// Where the `sentient.yield` sits in [`Self::body`] — `matchAndRoll` creates it FIRST
+    /// (`:837-838`) and moves it to the end only after `updateBody` has run (`:844`), which is what
+    /// puts the created adds after the moved ops.
     pub(crate) yield_at: usize,
 }
 
@@ -700,7 +700,7 @@ pub(crate) struct RolledLoop {
 /// the constant builder's block, the definitions and the value minter are parameters instead.
 ///
 /// ⚠️ `oe_` IS GONE WITH THEM: it is constructed with a null preference functor,
-/// `all_block_args_are_equiv = true` and `do_recursive_compare = true` (`LoopRolling.cpp:970-972`),
+/// `all_block_args_are_equiv = true` and `do_recursive_compare = true` (`LoopRolling.cpp:987-989`),
 /// so once the equivalence classes — a cache — are dropped, what is left is the pure
 /// [`ops_are_equivalent`].
 #[derive(Debug)]
@@ -715,14 +715,14 @@ pub(crate) struct LoopRollingManager {
     pub(crate) window_list_end: WindowIndex,
     /// `operand_to_result_num_` — every usage of the last rollable op in the next window's first.
     pub(crate) operand_to_result_num: BTreeMap<OperandIdx, ResultNum>,
-    /// `matched_ops_` — ⛔ POPULATED IN REVERSE ORDER (`:236`), which is why
+    /// `matched_ops_` — ⛔ POPULATED IN REVERSE ORDER (`:217`), which is why
     /// [`Self::update_end_ops_of_matched_ops`] walks it forwards against a backwards block walk and
     /// [`Self::update_body`] walks it backwards.
     pub(crate) matched_ops: Vec<MatchedOp>,
 }
 
 impl LoopRollingManager {
-    /// A MANAGER FOR ONE ATTEMPT — the reference's constructor (`:219-231`).
+    /// A MANAGER FOR ONE ATTEMPT — the reference's constructor (`:221-231`).
     ///
     /// ⛔ NOT AN ANCHORED UNIT (an excluded trivial constructor).
     pub(crate) fn over(
@@ -839,7 +839,7 @@ impl LoopRollingManager {
     /// window the loop's own result instead.
     ///
     /// ⛔ THE CONSTANTS GO TO `consts`, NOT THE LOOP BODY: `const_builder_` is anchored at the start
-    /// of the block CONTAINING the program unit (`:967-968`), which is a different block from `bb_`.
+    /// of the block CONTAINING the program unit (`:990-991`), which is a different block from `bb_`.
     /// ⭐ THE MOVES ARE ONE SPLICE AT THE END, so every [`InstrPos`] stays valid while it is read.
     /// ⚠️ `start_window` IS UNUSED IN THE REFERENCE'S BODY and is dropped.
     pub(crate) fn update_body(

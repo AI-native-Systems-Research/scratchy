@@ -106,14 +106,14 @@ impl TripLimit {
 struct SmallPrime(i64);
 
 impl SmallPrime {
-    /// `std::vector<int> prime_pool = {11, 7, 5, 3, 2};` (`:386`), in the reference's order — largest
+    /// `std::vector<int> prime_pool = {11, 7, 5, 3, 2};` (`:387`), in the reference's order — largest
     /// first, so each step takes the biggest available bite.
     const POOL: [Self; 5] = [Self(11), Self(7), Self(5), Self(3), Self(2)];
 }
 
 /// What [`get_largest_divisor`] found.
 ///
-/// ⛔ `DT_ERROR("No valid prime factor but input still too large!")` (`:399`) IS THE SECOND ARM: the
+/// ⛔ `DT_ERROR("No valid prime factor but input still too large!")` (`:400`) IS THE SECOND ARM: the
 /// reference aborts, so the arm must be impossible to mistake for a usable trip count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LargestDivisor {
