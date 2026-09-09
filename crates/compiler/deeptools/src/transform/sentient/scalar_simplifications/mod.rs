@@ -81,12 +81,56 @@
 //! | `e533_simplifyLoadStoreOperation` | 533 | 3 | 93 | `dcc/src/Transform/Sentient/ScalarSimplifications.cpp:408` |
 //! | `e581_runOnOperation` | 581 | 4 | 54 | `dcc/src/Transform/Sentient/ScalarSimplifications.cpp:872` |
 
+#![allow(dead_code)]
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e581_runOnOperation` (level 4) is what reaches
+// the item below, which nothing but this file's tests calls until it lands. CI runs clippy with
+// `-D warnings`. ⭐ REMOVE THIS WITH e581.
+
 pub(crate) mod sentient;
 
+use crate::islands::sentient::dialects::sentient::CmpPredicate;
+use crate::islands::sentient::dialects::{Op, sentient as ops};
 
-// crustify:todo: e179_updateCmpIPredicate
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:63  (8 body lines, level 0)
-//   original  : void ScalarSimplificationsPass::updateCmpIPredicate( IfOp& if_op, OpBuilder& builder, CmpIPredicate new_predicate)
+/// THE `$predicate` SLOT OF ONE `sentient.if` — `IfOp& if_op` reduced to the single field
+/// `updateCmpIPredicate` writes, so "not a `sentient.if`" is not a case it has to answer.
+///
+/// ⛔ THE DIALECT IS IMPORTED AS `ops` HERE because this module already owns a `sentient` submodule.
+pub struct IfPredicate<'a>(&'a mut CmpPredicate);
+
+impl<'a> IfPredicate<'a> {
+    /// The predicate slot of `op`, or `None` when `op` is not a `sentient.if`.
+    #[must_use]
+    pub fn of(op: &'a mut Op) -> Option<IfPredicate<'a>> {
+        match op {
+            Op::Sentient(ops::Op::If { predicate, .. }) => Some(IfPredicate(predicate)),
+            _ => None,
+        }
+    }
+
+    /// `if_op.getPredicate()`.
+    #[must_use]
+    pub fn get(&self) -> CmpPredicate {
+        *self.0
+    }
+}
+
+/// Replaces: e179_updateCmpIPredicate
+///
+/// Rewrites a `sentient.if`'s comparison to `new_predicate`, but only where it is an ORDERING.
+///
+/// ⛔ TRAP: `eq` AND `ne` ARE LEFT ALONE (`:65-66` names only `sgt`, `sge`, `slt`, `sle`) — the caller
+/// e371 rewrites the operands either way, so an untouched `eq` is a reversed-operand `eq`, which is
+/// the same test. Applying the new predicate to `ne` too would invert one.
+/// ⭐ `OpBuilder& builder` IS UNREAD, and `CmpIPredicateAttr::get(getContext(), …)` is attribute
+/// uniquing — both droppable mechanism for reaching the one field.
+pub fn update_cmp_i_predicate(if_op: IfPredicate<'_>, new_predicate: CmpPredicate) {
+    if matches!(
+        if_op.get(),
+        CmpPredicate::Sgt | CmpPredicate::Sge | CmpPredicate::Slt | CmpPredicate::Sle
+    ) {
+        *if_op.0 = new_predicate;
+    }
+}
 
 // crustify:todo: e371_transformIfCondition
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:77  (109 body lines, level 1)
@@ -113,3 +157,51 @@ pub(crate) mod sentient;
 //   original  : void ScalarSimplificationsPass::runOnOperation()
 //   calls     : e471_simplifyConditionals, e532_simplifyBinaryOperation, e533_simplifyLoadStoreOperation
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{IfPredicate, update_cmp_i_predicate};
+    use crate::islands::sentient::dialects::sentient::CmpPredicate;
+    use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
+
+    /// `sentient.if %lhs `pred` %rhs { }`.
+    fn if_op(predicate: CmpPredicate) -> Op {
+        Op::Sentient(ops::Op::If {
+            predicate,
+            lhs: Val(0),
+            rhs: Val(1),
+            yielded: Vec::new(),
+            dbg_name: None,
+            then_body: Vec::new(),
+            else_body: Vec::new(),
+        })
+    }
+
+    /// e179 — an ordering is rewritten and `eq`/`ne` are left exactly as they were.
+    #[test]
+    fn only_an_ordering_predicate_is_rewritten() {
+        for original in [
+            CmpPredicate::Sgt,
+            CmpPredicate::Sge,
+            CmpPredicate::Slt,
+            CmpPredicate::Sle,
+        ] {
+            let mut op = if_op(original);
+            update_cmp_i_predicate(
+                IfPredicate::of(&mut op).expect("a sentient.if"),
+                CmpPredicate::Sle,
+            );
+            assert_eq!(
+                IfPredicate::of(&mut op).map(|p| p.get()),
+                Some(CmpPredicate::Sle)
+            );
+        }
+        for untouched in [CmpPredicate::Eq, CmpPredicate::Ne] {
+            let mut op = if_op(untouched);
+            update_cmp_i_predicate(
+                IfPredicate::of(&mut op).expect("a sentient.if"),
+                CmpPredicate::Sle,
+            );
+            assert_eq!(IfPredicate::of(&mut op).map(|p| p.get()), Some(untouched));
+        }
+    }
+}
