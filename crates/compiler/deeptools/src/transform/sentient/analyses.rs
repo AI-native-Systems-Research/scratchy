@@ -124,3 +124,54 @@ impl ExpressionEvaluator for OutOfScopeEvaluator {
         )
     }
 }
+
+/// AN INSTRUCTION COUNT FROM `InstructionEstimatorImpl` — the reference's `int`.
+///
+/// ⛔ SIGNED BECAUSE THE REFERENCE'S IS: `getRemainingIbuffSpace` goes negative once a unit overruns
+/// the buffer, and the split/unroll cost model compares against it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstructionCount(pub i32);
+
+/// THE `InstructionEstimatorImpl&` A PASS IS HANDED — a trait for the same reason
+/// [`ExpressionEvaluator`] is one: the estimator is not in this campaign, and a test must still be
+/// able to state its answers.
+///
+/// ⛔ `Analyses/InstructionEstimation.{h,cpp}` IS OUT OF CAMPAIGN SCOPE, so the crate's only
+/// implementation is [`OutOfScopeInstructionEstimator`] and every method of it is a `todo!`.
+/// ⭐ THE REFERENCE OVERLOADS ON THE ARGUMENT KIND (op, block, region, unit); the two overloads the
+/// ported units call are named apart here because Rust has no overloading.
+pub trait InstructionEstimator {
+    /// `recalculate(ctx, unit)` (`Analyses/InstructionEstimation.h:74`) — recounts the whole unit.
+    fn recalculate(&mut self, unit: &[Op]);
+
+    /// `getEstimatedInstructionCount(ctx, Operation *)` (`Analyses/InstructionEstimation.h:56`) —
+    /// the op and everything nested in it.
+    fn estimated_instruction_count_of_op(&mut self, op: &Op) -> InstructionCount;
+
+    /// `getEstimatedInstructionCount(ctx, Region *)` (`Analyses/InstructionEstimation.h:62`).
+    fn estimated_instruction_count_of_region(&mut self, region: &[Op]) -> InstructionCount;
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the estimator is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeInstructionEstimator;
+
+impl InstructionEstimator for OutOfScopeInstructionEstimator {
+    fn recalculate(&mut self, _unit: &[Op]) {
+        todo!(
+            "InstructionEstimatorImpl::recalculate (Analyses/InstructionEstimation.h:74) — out of campaign scope"
+        )
+    }
+
+    fn estimated_instruction_count_of_op(&mut self, _op: &Op) -> InstructionCount {
+        todo!(
+            "InstructionEstimatorImpl::getEstimatedInstructionCount (Analyses/InstructionEstimation.h:56) — out of campaign scope"
+        )
+    }
+
+    fn estimated_instruction_count_of_region(&mut self, _region: &[Op]) -> InstructionCount {
+        todo!(
+            "InstructionEstimatorImpl::getEstimatedInstructionCount (Analyses/InstructionEstimation.h:62) — out of campaign scope"
+        )
+    }
+}
