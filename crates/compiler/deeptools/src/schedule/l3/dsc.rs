@@ -300,7 +300,7 @@ impl DesignSpaceConfig {
     /// the dims whose `scale_` is strictly positive.
     ///
     /// ⛔ TRAP: THIS IS NOT THE COMPLEMENT OF `isLabeledDsDimensionBroadcast`. That predicate
-    /// broadcasts on `scale_ < 1` (`L3DlOpsScheduler.cpp:759`); this set keeps every `scale_ > 0`, so
+    /// broadcasts on `scale_ < 1` (`L3DlOpsScheduler.cpp:71`); this set keeps every `scale_ > 0`, so
     /// a fractional scale is broadcast to one and non-broadcast to the other.
     ///
     /// ⛔ [`None`] IS `getLayoutDims`' OWN `DT_CHECK`: an index past `labeledDs_`, or a labelled data
@@ -679,19 +679,19 @@ impl Symbolic {
         self.info.insert(dim, info);
     }
 
-    /// `DataStructDims::pruneMaxSymbolicVolumes` (`dsc/dims.cpp:728`) FUSED WITH THE ASSIGNMENT THAT
+    /// `DataStructDims::pruneMaxSymbolicVolumes` (`dsc/dims.cpp:729`) FUSED WITH THE ASSIGNMENT THAT
     /// PRECEDES ITS CALL: adopts `reference`'s volume limits, re-keyed onto the symbolic dims THIS
     /// stage still has, and divided down by the granularity of each dim it lost.
     ///
     /// ⭐ THE FUSION IS WHAT KEEPS THE TYPE HONEST — `maxSymbolicVolume_ = ref.maxSymbolicVolume_`
     /// followed by a prune passes through the one state a well-formed [`Symbolic`] cannot hold, and
-    /// this is the only call shape the reference ever uses (`L3DlOpsScheduler.cpp:170-171`).
+    /// this is the only call shape the reference ever uses (`L3DlOpsScheduler.cpp:171-172`).
     ///
     /// ⭐ Every write the reference makes is `min`-guarded and no erased key is ever a write target,
     /// so rebuilding the map with a `min`-insert is its in-place erase-and-insert walk exactly.
     ///
     /// ⛔ DIVERGENCE: where the limit does not divide by a lost dim's granularity — the reference's
-    /// `DT_CHECK` at `dsc/dims.cpp:747` — the entry is kept UNTOUCHED, which is the reference's own
+    /// `DT_CHECK` at `dsc/dims.cpp:748` — the entry is kept UNTOUCHED, which is the reference's own
     /// `!needPruning` arm rather than an invented divisibility rule.
     pub fn prune_volumes_from(&mut self, reference: &Symbolic) {
         let mut pruned: BTreeMap<BTreeSet<PrimaryDim>, VolumeLimit> = BTreeMap::new();
