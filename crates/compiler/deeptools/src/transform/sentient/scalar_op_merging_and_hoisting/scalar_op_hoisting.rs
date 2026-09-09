@@ -88,22 +88,387 @@
 //! | `e613_processForGenericHoisting` | 613 | 5 | 81 | `dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2075` |
 //! | `e635_runScalarOpHoisting` | 635 | 6 | 61 | `dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2184` |
 
+#![allow(dead_code)]
+// ⛔ NOTHING CALLS THESE FOUR LEAVES YET — every caller is a later level in a different batch
+// (`e529`, `e530`, `e578`, `e612`, `e613`) and so is the pass entry `e635_runScalarOpHoisting`. CI
+// runs clippy with `-D warnings`, so without this the batch fails its own gate.
+// ⭐ REMOVE THIS WITH `e635_runScalarOpHoisting`: an unused item here is a real defect at that point.
 
-// crustify:todo: e170_addForOpResultAdjustment
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1543  (28 body lines, level 0)
-//   original  : void ScalarOpHoisting::addForOpResultAdjustment( sentient::ForOp *for_op, Value &result, const EvaluatedValue &adjustment_increment, int result_idx)
+use super::{MemoryOpInfo, ScalarOpComp};
+use crate::arch::Elements;
+use crate::formats::Bits;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::{GenericComp, ScalarTy};
+use crate::islands::sentient::dialects::sentient as ops;
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, defining_op, erase_defining_op, operands, regions_ref,
+    replace_all_uses_with, results, uniform, use_count,
+};
+use crate::transform::sentient::IterArgIndex;
+use crate::transform::sentient::analyses::{Evaluation, ExpressionEvaluator, OffsetSites};
 
-// crustify:todo: e171_isMergeableOpOrChain
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1592  (33 body lines, level 0)
-//   original  : bool ScalarOpHoisting::isMergeableOpOrChain(Operation *input_to_chain, Operation *first_op_in_chain)
+/// `ibuff_space_` — how many instruction-buffer entries are left for the ops this pass creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct IbuffSpace(pub i32);
 
-// crustify:todo: e172_addToOrReplaceOp
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1716  (14 body lines, level 0)
-//   original  : Value ScalarOpHoisting::addToOrReplaceOp(Operation *op, const EvaluatedValue &modifier, bool replace_with_mod)
+/// WHAT SPENDING AN IBUFF ENTRY LEFT BEHIND — `DT_CHECK_MSG(ibuff_space_ >= 0, "No IBUFF space!")`
+/// (`:1571`) as data, because this crate does not spell a check as an abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum IbuffSpent {
+    /// The unit still fits its instruction buffer.
+    WithinBudget,
+    /// It no longer does — the reference's abort, reported rather than performed.
+    Overrun,
+}
 
-// crustify:todo: e173_hoistCandidateOutOfLoop
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1805  (22 body lines, level 0)
-//   original  : void ScalarOpHoisting::hoistCandidateOutOfLoop(BlockArgument &main_iv, Operation *derived_iv, Value &new_add_offset)
+impl IbuffSpace {
+    /// `--ibuff_space_` and the check that follows it (`:1570-1571`).
+    ///
+    /// ⭐ `Overrun` IS UNREACHABLE THROUGH THE REFERENCE'S OWN CALLER:
+    /// `adjustCandidateForOpResult` declines at `ibuff_space_ <= 0` before it ever gets here
+    /// (`:1524`).
+    pub(crate) fn spend_one(&mut self) -> IbuffSpent {
+        self.0 -= 1;
+        if self.0 >= 0 {
+            IbuffSpent::WithinBudget
+        } else {
+            IbuffSpent::Overrun
+        }
+    }
+}
+
+/// `OperationData::getReplaceWithMod()` — whether the modifier REPLACES the constant a chain op
+/// reads, or is added to what it already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Modification {
+    /// `replace_with_mod == true`.
+    Replace,
+    /// `replace_with_mod == false`.
+    AddTo,
+}
+
+/// AN `EvaluatedValue` PROVED ABSOLUTE — `DT_CHECK(adjustment_increment.isKnownAbsolute())` (`:1546`)
+/// as a type, so [`add_for_op_result_adjustment`] has nothing left to assert.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KnownAbsolute<'a>(&'a Evaluation);
+
+impl<'a> KnownAbsolute<'a> {
+    /// `None` for an evaluation that is not known absolute, which is the reference's abort.
+    pub(crate) fn of(evaluation: &'a Evaluation) -> Option<KnownAbsolute<'a>> {
+        evaluation
+            .known_absolute
+            .then_some(KnownAbsolute(evaluation))
+    }
+}
+
+/// A VALUE PROVED CONSTANT — `DT_CHECK_MSG(isConstant<ConstantOp>(op->getResult(0)), "Expect op to
+/// be constant")` (`:1719`) as a type, for the same reason [`KnownAbsolute`] is one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConstantValue(Val);
+
+impl ConstantValue {
+    /// `None` when the value is neither a `sentient.scalar_constant` nor an all-constant query map.
+    pub(crate) fn of(val: Val, defs: Definitions<'_>) -> Option<ConstantValue> {
+        is_sentient_constant(val, defs).then_some(ConstantValue(val))
+    }
+}
+
+/// `dcc::utils::isConstant<sentient::ConstantOp>` (`Utils/Utils.cpp:423`) — a
+/// `sentient.scalar_constant`, or a `uniform.query_map` every one of whose per-core values is one.
+fn is_sentient_constant(val: Val, defs: Definitions<'_>) -> bool {
+    let is_constant_op =
+        |op: Option<&Op>| matches!(op, Some(Op::Sentient(ops::Op::ScalarConstant { .. })));
+    match defs.of(val) {
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => match defs.of(*map) {
+            Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => pairs
+                .iter()
+                .all(|(_, value)| is_constant_op(defs.of(*value))),
+            _ => false,
+        },
+        op => is_constant_op(op),
+    }
+}
+
+/// `dcc::utils::getFirstConstOperandIndex` (`Analyses/Utils.cpp:30`) — ⭐ `None` IS ITS `-1`, and the
+/// operand order is [`operands`]'s.
+fn first_const_operand_index(op: &Op, defs: Definitions<'_>) -> Option<usize> {
+    operands(op)
+        .into_iter()
+        .position(|operand| is_sentient_constant(operand, defs))
+}
+
+/// `isa<sentient::AddOp, sentient::SubOp>(op)` — the arm of the chain walk that ends it.
+fn is_scalar_add_or_sub(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Sentient(ops::Op::ScalarAdd { .. } | ops::Op::ScalarSub { .. })
+    )
+}
+
+/// `dcc::utils::isUpdateMode` (`Analyses/Utils.cpp:65`) at the three arms this pass reaches — the
+/// increment is a non-zero constant, or a query map with a non-zero value among its constants.
+///
+/// ⭐ IT TAKES THE DESCRIPTOR RATHER THAN THE OP, and that is what removes the reference's
+/// `llvm_unreachable("unhandled operation")` (`:125`): all three arms it can reach read
+/// `getIncrement()`, which is exactly [`MemoryOpInfo::increment`].
+/// ⛔ THE `load_and_store` ARM IS THE ONE WITH AN OUT-OF-SCOPE ANALYSIS IN IT
+/// (`L3GatherScatterChecker::isIBRWrite`, `:83`) and the chain walk never reaches it:
+/// `sentient.load_and_store` is not in its `isa<>` list.
+fn is_update_mode(mem_info: &MemoryOpInfo, defs: Definitions<'_>) -> bool {
+    match defs.of(mem_info.increment) {
+        Some(Op::Sentient(ops::Op::ScalarConstant { value, .. })) => *value != 0,
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => has_non_zero_constants(*map, defs),
+        _ => false,
+    }
+}
+
+/// `dcc::utils::hasNonZeroConstants` (`Analyses/Utils.cpp:49`) — a query map whose values are ALL
+/// constants (its own first gate, `:51`) and at least one of which is not zero.
+fn has_non_zero_constants(map: Val, defs: Definitions<'_>) -> bool {
+    let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(map) else {
+        return false;
+    };
+    let mut any_non_zero = false;
+    for (_, value) in pairs {
+        match defs.of(*value) {
+            Some(Op::Sentient(ops::Op::ScalarConstant { value, .. })) => {
+                any_non_zero |= *value != 0;
+            }
+            _ => return false,
+        }
+    }
+    any_non_zero
+}
+
+/// `*op->getUsers().begin()` — the first op in `scope` that reads any of `of`, regions included.
+///
+/// ⭐ BLOCK ORDER RATHER THAN MLIR'S USE LIST, AND THE TWO CANNOT DISAGREE HERE:
+/// [`is_mergeable_op_or_chain`] only steps to a user having already proved the op has exactly one.
+fn first_user<'a>(of: &[Val], scope: &'a [Op]) -> Option<&'a Op> {
+    for op in scope {
+        if operands(op).iter().any(|read| of.contains(read)) {
+            return Some(op);
+        }
+        for region in regions_ref(op) {
+            if let Some(found) = first_user(of, region) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// `derived_iv->getAttr("element_size")` — the discardable attribute a `sentient.scalar_add` or
+/// `scalar_sub` carries, which is what a derived induction variable is.
+///
+/// ⭐ NOT [`crate::islands::sentient::dialects::element_size`], which ports
+/// `dcc::utils::getElementSize` — its arms are the composite transfers and it answers `None` for a
+/// scalar add. ⛔ `None` here is the reference's own `hasAttr("element_size") == false` (`:1826`).
+fn scalar_element_size(val: Val, block: &[Op]) -> Option<Bits> {
+    match defining_op(val, block) {
+        Some(Op::Sentient(
+            ops::Op::ScalarAdd { element_size, .. } | ops::Op::ScalarSub { element_size, .. },
+        )) => *element_size,
+        _ => None,
+    }
+}
+
+/// Replaces: e170_addForOpResultAdjustment
+///
+/// Inserts `sentient.scalar_add %result, %adjustment` immediately AFTER the loop and moves every
+/// other reader of the loop's result onto it, spending one IBUFF entry.
+///
+/// ⛔ TRAP: `replaceAllUsesExcept` (`:1567-1568`) EXCEPTS THE NEW ADD, which therefore keeps reading
+/// the loop result while everything else reads the add — a plain RAUW makes it read itself.
+/// ⛔ TRAP: the size is `element_sizes[result_idx + 1]`, slot 0 being the loop iterator's (`:1563`),
+/// and this island's `Carried::element_size` already IS that slot.
+pub(crate) fn add_for_op_result_adjustment<E: ExpressionEvaluator>(
+    scope: &mut Vec<Op>,
+    at: usize,
+    result_idx: IterArgIndex,
+    adjustment_increment: KnownAbsolute<'_>,
+    comp: GenericComp,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+    ibuff_space: &mut IbuffSpace,
+) -> IbuffSpent {
+    // `for_op->getResult(result_idx)` beside `element_sizes[result_idx + 1]` — ⭐ ONE carried entry
+    // holds both, and its `None` is the reference's `hasAttr("element_sizes") == false` (`:1561`).
+    let Some(Op::Sentient(ops::Op::For { carried, .. })) = scope.get(at) else {
+        return IbuffSpent::WithinBudget;
+    };
+    let Some(entry) = carried.get(result_idx.0 as usize).copied() else {
+        return IbuffSpent::WithinBudget;
+    };
+    let new_const =
+        evaluator.build_offset_value(adjustment_increment.0, sites, scope, ScalarTy::Index);
+    let new_add = sites.values.mint();
+    scope.insert(
+        at + 1,
+        Op::Sentient(ops::Op::ScalarAdd {
+            lhs: entry.result,
+            rhs: new_const,
+            result: new_add,
+            reg: None,
+            // Ensure element_size is set as it is essential for range checks.
+            element_size: if ScalarOpComp::of(comp).is_some() {
+                entry.element_size
+            } else {
+                None
+            },
+            ty: ScalarTy::Index,
+        }),
+    );
+    replace_all_uses_with(scope, entry.result, new_add);
+    // The exception set: the new add is the one reader that keeps reading the loop result.
+    if let Some(Op::Sentient(ops::Op::ScalarAdd { lhs, .. })) = scope.get_mut(at + 1) {
+        *lhs = entry.result;
+    }
+    ibuff_space.spend_one()
+}
+
+/// Replaces: e171_isMergeableOpOrChain
+///
+/// Whether the chain out of `first_op_in_chain` is a linear run of single-use ops ending in an
+/// add/sub with a constant operand, or in an update-mode composite transfer.
+///
+/// ⛔ TRAP: each transfer's `mutable_addr` must be defined by the PREVIOUS op in the chain
+/// (`:1738-1742`), so the address has to keep flowing forward or the chain is not mergeable.
+/// ⛔ TRAP: an op with no uses at all passes the first gate and fails the last one (`:1747`) — only
+/// the update-mode transfer may end the chain, and it must do so before the walk asks for a user.
+/// ⛔ TRAP: a `load_compute_and_send` can never trip the burst/IL gate — [`MemoryOpInfo::of`] records
+/// why: that arm sets neither field, so they stay at 1 and 0.
+pub(crate) fn is_mergeable_op_or_chain<'a>(
+    input_to_chain: &Op,
+    first_op_in_chain: &'a Op,
+    comp: GenericComp,
+    scope: &'a [Op],
+) -> bool {
+    let regions: [&[Op]; 1] = [scope];
+    let defs = Definitions::from_innermost(&regions);
+    let mut prev_results = results(input_to_chain);
+    let mut current = Some(first_op_in_chain);
+    while let Some(op) = current {
+        let uses: usize = results(op).iter().map(|val| use_count(*val, scope)).sum();
+        // `if (!op->use_empty() && !op->hasOneUse()) break;`
+        if uses > 1 {
+            break;
+        }
+        if is_scalar_add_or_sub(op) {
+            return first_const_operand_index(op, defs).is_some();
+        }
+        let Some(mem_info) = MemoryOpInfo::of(op) else {
+            return false;
+        };
+        if ScalarOpComp::of(comp).is_none() {
+            return false;
+        }
+        // TODO: Add support for burst/IL
+        if mem_info.burst > Elements(1) || mem_info.il > Elements(0) {
+            return false;
+        }
+        // Verify the immutable_addr is a constant value and the previously analyzed Operation is the
+        // mutable_addr of this memory operation.
+        if !is_sentient_constant(mem_info.immutable_addr, defs)
+            || !prev_results.contains(&mem_info.mutable_addr)
+        {
+            return false;
+        }
+        if is_update_mode(&mem_info, defs) {
+            return true;
+        }
+        if uses == 0 {
+            return false;
+        }
+        prev_results = results(op);
+        current = first_user(&prev_results, scope);
+    }
+    false
+}
+
+/// Replaces: e172_addToOrReplaceOp
+///
+/// The new value for a constant a chain op reads: `modifier` alone when it replaces, and `modifier`
+/// plus what the constant already holds when it adds to.
+///
+/// ⛔ TRAP: the `AddTo` arm needs `ExpressionEvaluator::evaluateSum`, which is OUT OF CAMPAIGN SCOPE
+/// and therefore a `todo!` at [`crate::transform::sentient::analyses::OutOfScopeEvaluator`] — the arm is present, and it
+/// is the analysis behind it that is not.
+pub(crate) fn add_to_or_replace_op<E: ExpressionEvaluator>(
+    op: ConstantValue,
+    modifier: &Evaluation,
+    replace_with_mod: Modification,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+    walked: &mut Vec<Op>,
+) -> Val {
+    match replace_with_mod {
+        Modification::Replace => {
+            evaluator.build_offset_value(modifier, sites, walked, ScalarTy::Index)
+        }
+        Modification::AddTo => {
+            let held = evaluator.evaluate_value(op.0);
+            let sum = evaluator.evaluate_sum(modifier, &held);
+            evaluator.build_offset_value(&sum, sites, walked, ScalarTy::Index)
+        }
+    }
+}
+
+/// Replaces: e173_hoistCandidateOutOfLoop
+///
+/// Hoists a derived induction variable out of the loop: its readers move onto the main iter arg, an
+/// add of the offset is built BEFORE the loop, and that add becomes the iter arg's initialiser.
+///
+/// ⛔ TRAP: the ORDER is load-bearing — the element size is read off `derived_iv` before it is erased
+/// (`:1822-1826`), and the erase comes before the loop's operand is re-pointed at the new add.
+/// ⭐ `main_iv.getArgNumber()` IS BOTH INDICES: as a region argument it is `1 + i`, and as a
+/// `for_op_->setOperand` slot it is `1 + i` too, operand 0 being `$bound` — so it is carried `i`.
+pub(crate) fn hoist_candidate_out_of_loop(
+    scope: &mut Vec<Op>,
+    at: usize,
+    main_iv: IterArgIndex,
+    derived_iv: Val,
+    new_add_offset: Val,
+    comp: GenericComp,
+    values: &mut Values,
+) {
+    let index = main_iv.0 as usize;
+    let Some(Op::Sentient(ops::Op::For { carried, body, .. })) = scope.get_mut(at) else {
+        return;
+    };
+    let Some(entry) = carried.get(index).copied() else {
+        return;
+    };
+    // `derived_iv->getResult(0).replaceAllUsesWith(main_iv)` — the body is the only region the iter
+    // argument is visible in, so it is the only region those uses can be in.
+    replace_all_uses_with(body, derived_iv, entry.arg);
+    // Copy element size as well as it is needed for range checks.
+    let element_size = scalar_element_size(derived_iv, body);
+    erase_defining_op(body, derived_iv);
+    let new_add = values.mint();
+    scope.insert(
+        at,
+        Op::Sentient(ops::Op::ScalarAdd {
+            lhs: entry.init,
+            rhs: new_add_offset,
+            result: new_add,
+            reg: None,
+            element_size: if ScalarOpComp::of(comp).is_some() {
+                element_size
+            } else {
+                None
+            },
+            ty: ScalarTy::Index,
+        }),
+    );
+    // `for_op_->setOperand(main_iv_operand_idx, new_add)`, which is carried `index`'s initialiser.
+    if let Some(Op::Sentient(ops::Op::For { carried, .. })) = scope.get_mut(at + 1)
+        && let Some(entry) = carried.get_mut(index)
+    {
+        entry.init = new_add;
+    }
+}
 
 // crustify:todo: e365_applyOperationData
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1740  (54 body lines, level 1)
@@ -150,3 +515,286 @@
 //   original  : void ScalarOpHoisting::runScalarOpHoisting()
 //   calls     : e530_processForDerivedIVElimination, e612_processForLinearChain, e613_processForGenericHoisting
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType, ShuffleMode};
+    use crate::transform::sentient::analyses::{Offsets, ScalarOffset};
+
+    /// AN EVALUATOR THAT ANSWERS WHAT THE TEST SAYS. ⛔ The analysis behind
+    /// [`ExpressionEvaluator`] is out of campaign scope, so a test STATES its answers rather than
+    /// deriving them — what is under test is the EFFECT a port has given an answer.
+    struct StatedEvaluator {
+        /// What `build_offset_value` materialises the offset as.
+        offset: Val,
+        /// Every `evaluate_sum` this evaluator was asked for, as `(lhs, rhs)`.
+        sums: Vec<(Evaluation, Evaluation)>,
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            absolute(ScalarOffset(4))
+        }
+
+        fn evaluate_sum(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation {
+            self.sums.push((lhs.clone(), rhs.clone()));
+            absolute(ScalarOffset(20))
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            self.offset
+        }
+    }
+
+    fn absolute(offset: ScalarOffset) -> Evaluation {
+        Evaluation {
+            known_absolute: true,
+            base: None,
+            offsets: Offsets::AllUnit(offset),
+        }
+    }
+
+    /// A minter that has already issued `issued` values, so a fixture's hand-written [`Val`]s and a
+    /// created op's cannot collide.
+    fn values_after(issued: u32) -> Values {
+        let mut values = Values::default();
+        for _ in 0..issued {
+            values.mint();
+        }
+        values
+    }
+
+    fn add(lhs: Val, rhs: Val, result: Val, element_size: Option<Bits>) -> Op {
+        Op::Sentient(ops::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            element_size,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    fn constant(value: i64, result: Val) -> Op {
+        Op::Sentient(ops::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    fn carried(init: Val, arg: Val, result: Val, element_size: Option<Bits>) -> Carried {
+        Carried {
+            init,
+            arg,
+            result,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            program_header: false,
+            element_size,
+        }
+    }
+
+    fn for_op(entries: Vec<Carried>, body: Vec<Op>) -> Op {
+        Op::Sentient(ops::Op::For {
+            iv: Val(0),
+            bound: Val(1),
+            carried: entries,
+            dbg_name: None,
+            body,
+        })
+    }
+
+    fn load_and_send(mutable_addr: Val, immutable_addr: Val, increment: Val) -> Op {
+        Op::Sentient(ops::Op::LoadAndSend {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            consumer: SendEnd::to_self(Val(30)),
+            result: Val(31),
+            extent: ops::Extent {
+                total_elements: Elements(64),
+                element_size: Bits(32),
+                chunk_size: Elements(1),
+                chunk_stride: Elements(1),
+                burst_size: Elements(0),
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    /// e170 — the add lands AFTER the loop, every other reader of the result moves onto it, the
+    /// carried slot's element size is copied, and the add itself keeps reading the loop result.
+    #[test]
+    fn a_for_op_result_adjustment_inserts_the_add_after_the_loop_and_keeps_its_own_operand() {
+        let mut scope = vec![
+            for_op(
+                vec![carried(Val(2), Val(3), Val(4), Some(Bits(8)))],
+                Vec::new(),
+            ),
+            add(Val(4), Val(5), Val(6), None),
+        ];
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+        let mut evaluator = StatedEvaluator {
+            offset: Val(9),
+            sums: Vec::new(),
+        };
+        let increment = absolute(ScalarOffset(16));
+        let mut ibuff = IbuffSpace(2);
+        assert_eq!(
+            add_for_op_result_adjustment(
+                &mut scope,
+                0,
+                IterArgIndex(0),
+                KnownAbsolute::of(&increment).expect("the fixture states it absolute"),
+                GenericComp::Lxlu,
+                &mut evaluator,
+                &mut sites,
+                &mut ibuff,
+            ),
+            IbuffSpent::WithinBudget
+        );
+        assert_eq!(scope[1], add(Val(4), Val(9), Val(10), Some(Bits(8))));
+        assert_eq!(scope[2], add(Val(10), Val(5), Val(6), None));
+        assert_eq!(ibuff, IbuffSpace(1));
+    }
+
+    /// e171 — the vendor's own shape: a chain whose one composite transfer takes its mutable address
+    /// from the previous op, reads a constant immutable address and updates by a non-zero constant.
+    #[test]
+    fn a_chain_ending_in_an_update_mode_transfer_is_mergeable() {
+        let scope = vec![
+            add(Val(20), Val(21), Val(1), None),
+            constant(64, Val(2)),
+            constant(64, Val(3)),
+            load_and_send(Val(1), Val(2), Val(3)),
+        ];
+        assert!(is_mergeable_op_or_chain(
+            &scope[0],
+            &scope[3],
+            GenericComp::Lxlu,
+            &scope
+        ));
+    }
+
+    /// ⛔ THE NEGATIVE THE `isConstant` GATE AT `:1738-1741` IS THERE FOR: a transfer whose immutable
+    /// address is computed rather than constant ends no mergeable chain.
+    #[test]
+    fn a_transfer_with_a_computed_immutable_address_is_not_mergeable() {
+        let scope = vec![
+            add(Val(20), Val(21), Val(1), None),
+            add(Val(22), Val(23), Val(2), None),
+            constant(64, Val(3)),
+            load_and_send(Val(1), Val(2), Val(3)),
+        ];
+        assert!(!is_mergeable_op_or_chain(
+            &scope[0],
+            &scope[3],
+            GenericComp::Lxlu,
+            &scope
+        ));
+    }
+
+    /// e172 — `AddTo` folds the modifier into what the constant already evaluates to, and `Replace`
+    /// asks for nothing but the modifier.
+    #[test]
+    fn add_to_sums_with_the_constants_own_evaluation_and_replace_does_not() {
+        let block = vec![constant(64, Val(2))];
+        let regions: [&[Op]; 1] = [&block];
+        let defs = Definitions::from_innermost(&regions);
+        let op = ConstantValue::of(Val(2), defs).expect("the fixture states it constant");
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+        let mut walked = Vec::new();
+        let mut evaluator = StatedEvaluator {
+            offset: Val(9),
+            sums: Vec::new(),
+        };
+        let modifier = absolute(ScalarOffset(16));
+        assert_eq!(
+            add_to_or_replace_op(
+                op,
+                &modifier,
+                Modification::Replace,
+                &mut evaluator,
+                &mut sites,
+                &mut walked
+            ),
+            Val(9)
+        );
+        assert!(evaluator.sums.is_empty());
+        assert_eq!(
+            add_to_or_replace_op(
+                op,
+                &modifier,
+                Modification::AddTo,
+                &mut evaluator,
+                &mut sites,
+                &mut walked
+            ),
+            Val(9)
+        );
+        assert_eq!(evaluator.sums, vec![(modifier, absolute(ScalarOffset(4)))]);
+    }
+
+    /// e173 — the derived IV's readers move onto the main iter arg, the derived add is erased, its
+    /// element size travels to a new add BEFORE the loop, and that add becomes the arg's initialiser.
+    #[test]
+    fn hoisting_a_derived_iv_re_points_the_iter_arg_at_an_add_before_the_loop() {
+        let mut scope = vec![for_op(
+            vec![carried(Val(2), Val(3), Val(4), None)],
+            vec![
+                add(Val(3), Val(5), Val(6), Some(Bits(16))),
+                add(Val(6), Val(7), Val(8), None),
+            ],
+        )];
+        let mut values = values_after(10);
+        hoist_candidate_out_of_loop(
+            &mut scope,
+            0,
+            IterArgIndex(0),
+            Val(6),
+            Val(9),
+            GenericComp::Lxlu,
+            &mut values,
+        );
+        assert_eq!(scope[0], add(Val(2), Val(9), Val(10), Some(Bits(16))));
+        assert_eq!(
+            scope[1],
+            for_op(
+                vec![carried(Val(10), Val(3), Val(4), None)],
+                vec![add(Val(3), Val(7), Val(8), None)]
+            )
+        );
+    }
+}

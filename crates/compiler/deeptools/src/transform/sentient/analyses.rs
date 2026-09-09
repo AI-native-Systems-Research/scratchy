@@ -138,6 +138,11 @@ pub trait ExpressionEvaluator {
     /// `ExpressionEvaluator::evaluateValue` (`Analyses/ExpressionEvaluatorUtils.h:219`).
     fn evaluate_value(&mut self, value: Val) -> Evaluation;
 
+    /// `ExpressionEvaluator::evaluateSum` (`Analyses/ExpressionEvaluatorUtils.h:242`) — the
+    /// evaluation of `lhs + rhs`, which is how a hoist folds an increment into a constant it already
+    /// evaluated.
+    fn evaluate_sum(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation;
+
     /// `EvaluatedValue::buildOffsetValue` (`Analyses/ExpressionEvaluatorUtils.h:126`) — materialises
     /// the offset as a value, creating ops in `sites` (`walked` when `sites.query_maps` is `None`).
     fn build_offset_value(
@@ -157,6 +162,12 @@ impl ExpressionEvaluator for OutOfScopeEvaluator {
     fn evaluate_value(&mut self, _value: Val) -> Evaluation {
         todo!(
             "ExpressionEvaluator::evaluateValue (Analyses/ExpressionEvaluatorUtils.h:219) — out of campaign scope"
+        )
+    }
+
+    fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+        todo!(
+            "ExpressionEvaluator::evaluateSum (Analyses/ExpressionEvaluatorUtils.h:242) — out of campaign scope"
         )
     }
 

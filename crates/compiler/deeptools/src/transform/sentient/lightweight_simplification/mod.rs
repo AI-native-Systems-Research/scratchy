@@ -437,6 +437,10 @@ mod unit_tests {
             )
         }
 
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("no unit of this batch evaluates a sum")
+        }
+
         fn build_offset_value(
             &mut self,
             _evaluation: &Evaluation,
