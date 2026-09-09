@@ -139,56 +139,815 @@
 //! | `e348_runDcgForDataOpsDlOps` | 348 | 3 | 179 | `DcgManager` | `dcg/dcg_manager/dcg_manager.cpp:269` |
 //! | `e349_convertToProgIRDataOp` | 349 | 3 | 46 | `DcgManager` | `dcg/dcg_manager/dcg_manager.cpp:898` |
 
+use core::marker::PhantomData;
+use std::collections::BTreeMap;
+
+use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
+
 use crate::arch::{Arch, Bytes, Elements, Sticks, Target};
-use crate::units::Core;
+use crate::islands::progir;
+use crate::model::Model;
+use crate::units::{Core, Corelet};
+use crate::workload::Workload;
 
-// crustify:todo: e188_runDcgComputeTransfer
-//   authority : dcg/dcg_manager/dcg_manager.cpp:112  (13 body lines, level 0)
-//   class     : DcgManager
-//   original  : void DcgManager::runDcgComputeTransfer(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:32-45
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE STATE STAGE 3 MUTATES, AND THE THREE SUBSYSTEMS IT HANDS WORK TO.
+//
+// ⭐ Stage 3's whole in-scope effect is `mySDsc.pcfg_`, `pcfgMap_`/`pcfgPool_` and the manager's
+// `firstAvailGlobalGrpId` (`crustify-ddc/TASK.md`). Everything it delegates to — `dcg/dcg_be/`,
+// `dcg/dcg_fe/`, `DscPcfgTranslator`, `Dpc` — is OUT of scope (`crustify-ddc/OUTSIDE-DEPS.tsv`), so
+// each is a named seam that `todo!`s. ⛔ A stand-in pcfg or program is forbidden, not merely absent.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 
-// crustify:todo: e189_runDcgForDlOps
-//   authority : dcg/dcg_manager/dcg_manager.cpp:216  (52 body lines, level 0)
-//   class     : DcgManager
-//   original  : void DcgManager::runDcgForDlOps(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:55-107
+/// `0 /*corelet_id*/` (`dcg_manager.cpp:478`, `:481`).
+const CORELET_ZERO: Corelet = match Corelet::checked(0) {
+    Some(corelet) => corelet,
+    None => panic!("stage 3 indexes corelet 0; this arch has none"),
+};
 
-// crustify:todo: e190_runDcgForDlOpsStandalone
-//   authority : dcg/dcg_manager/dcg_manager.cpp:449  (64 body lines, level 0)
-//   class     : DcgManager
-//   original  : void DcgManager::runDcgForDlOpsStandalone(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:117-181
+/// A GTR SYNC GROUP — the `int` of `firstAvailGlobalGrpId` (`dcg_manager.h:43`) and of
+/// `SenPcfg::getMaxGTRGroupId()` (`dsc/pcfg.h:1067`).
+///
+/// ⚠️ THE WRAP IS BY 63, NOT 64: `maxGroupID = 64 - 1`, *"6 bits for GTR groupId"*
+/// (`sys-arch-spec/sysdef.cpp:230`), and entry 190 takes the modulus by that value — so the highest
+/// id the wrap can produce is 62.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct GtrGroupId(u32);
 
-// crustify:todo: e191_removeextraPTrows
-//   authority : dcg/dcg_manager/dcg_manager.cpp:568  (60 body lines, level 0)
-//   class     : DcgManager
-//   original  : void DcgManager::removeextraPTrows(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:191-251
+impl GtrGroupId {
+    /// `sysDef.maxGroupID` (`sys-arch-spec/sysdef.cpp:230`) — the same on every arch.
+    pub const MAX: u32 = 64 - 1;
 
-// crustify:todo: e192_printSenProgram
-//   authority : dcg/dcg_manager/dcg_manager.cpp:959  (16 body lines, level 0)
-//   class     : DcgManager
-//   original  : void DcgManager::printSenProgram(SuperDsc* mySDsc, Dpc& myDpc, std::string fileName, bool use_smc /*= false*/)
-//   extract   : crustify-ddc/cpp/dcg.cpp:261-279
+    /// A group id, reduced the way the reference keeps `firstAvailGlobalGrpId`.
+    #[must_use]
+    pub const fn wrapped(id: u32) -> Self {
+        Self(id % Self::MAX)
+    }
 
-// crustify:todo: e193_runDcgForGenKG3
-//   authority : dcg/dcg_manager/dcg_manager.h:94  (3 body lines, level 0)
-//   class     : DcgManager
-//   original  : void runDcgForGenKG3(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:289-292
+    /// The id itself, for the one place it becomes a field.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
 
-// crustify:todo: e194_runDcgForSparseKG3CONV2D
-//   authority : dcg/dcg_manager/dcg_manager.h:98  (3 body lines, level 0)
-//   class     : DcgManager
-//   original  : void runDcgForSparseKG3CONV2D(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:302-305
+    /// `firstAvailGlobalGrpId += maxGrpIDinL3; firstAvailGlobalGrpId %= sysDef.maxGroupID`
+    /// (`dcg_manager.cpp:503-504`).
+    #[must_use]
+    pub const fn advanced_past(self, max_in_l3: Self) -> Self {
+        Self::wrapped(self.0 + max_in_l3.0)
+    }
+}
 
-// crustify:todo: e195_runDcgForSparseKG3BMM
-//   authority : dcg/dcg_manager/dcg_manager.h:102  (3 body lines, level 0)
-//   class     : DcgManager
-//   original  : void runDcgForSparseKG3BMM(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:315-318
+/// WHICH ENTRY OF `dataOpdscs_` — the `int c` entry 188 counts alongside its walk (`:119`, `:124`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DataOpIndex(usize);
+
+impl DataOpIndex {
+    /// The index, for the seam that reaches the data op through it.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// A SLOT IN `pcfgPool_` — `pcfgMap_`'s value type (`dsc/superdsc.h:97-98`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PcfgId(u64);
+
+impl PcfgId {
+    /// The slot number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// A PCFG — `SenPcfg` (`dsc/pcfg.h`), built by `dcg/dcg_fe/pcfg_gen/`.
+///
+/// ⛔ OPAQUE ON PURPOSE. No unit in this campaign reads a pcfg's nodes, and inventing them is
+/// forbidden (`crustify-ddc/TASK.md`: *"do not invent a PCFG"*), so this carries none. Its two
+/// operations are the seam below.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SenPcfg;
+
+impl SenPcfg {
+    /// `SenPcfg::mergeSenPcfg(parent, child)` (`dsc/pcfg.h:1056`).
+    ///
+    /// ⭐ STATIC, THOUGH IT LOOKS LIKE A METHOD: entry 189 calls it as
+    /// `sdscPcfg.mergeSenPcfg(sdscPcfg, *localPcfg)` (`:305`), so the receiver and the `parent`
+    /// argument are one object and the child is spliced into it.
+    pub fn merge(parent: &mut Self, child: &mut Self) {
+        let _ = (parent, child);
+        todo!("dcg_fe/pcfg_gen/: SenPcfg::mergeSenPcfg (dsc/pcfg.h:1056) is out of scope")
+    }
+
+    /// `getMaxGTRGroupId()` (`dsc/pcfg.h:1067`).
+    pub fn max_gtr_group_id(&self) -> GtrGroupId {
+        todo!("dcg_fe/pcfg_gen/: SenPcfg::getMaxGTRGroupId (dsc/pcfg.h:1067) is out of scope")
+    }
+}
+
+/// ONE CORE'S TWO L3 PCFGS — `pcfgL3lu` and `pcfgL3su`, the pair every entry of this file builds.
+///
+/// ⭐ KEYED PER CORE, NOT SIZED BY ONE: the reference declares two `std::vector<SenPcfg>` of
+/// `maxCoreId + 1` and `.at(coreID)`s them (`:288`, `:466-467`), which throws for a core the
+/// generator skipped. A pair per core cannot be misaddressed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct L3Halves {
+    /// The `SenComponents::L3LU` half.
+    pub lu: SenPcfg,
+    /// The `SenComponents::L3SU` half.
+    pub su: SenPcfg,
+}
+
+impl L3Halves {
+    /// Both halves with the component each is filed under, in the `i == 0 ? L3LU : L3SU` order
+    /// entry 189 walks them (`:286-289`).
+    fn each_mut(&mut self) -> [(SenComponent, &mut SenPcfg); 2] {
+        [
+            (SenComponent::L3lu, &mut self.lu),
+            (SenComponent::L3su, &mut self.su),
+        ]
+    }
+}
+
+/// WHETHER A DSC HAS A SCHEDULE TREE — `isDSC2()`, which is `!scheduleTree_.empty()`
+/// (`dsc/designSpaceConfig.cpp:31`). Stage 2a is what puts one there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DscVersion {
+    /// `isDSC2() == false`.
+    Dsc1,
+    /// `isDSC2() == true`.
+    Dsc2,
+}
+
+/// THE DL DSCs, KEYED BY THE CORE EACH SERVES, AND NEVER EMPTY.
+///
+/// ⭐ ONE TABLE FOR TWO FIELDS: `coreIdToDsc_` is a map of `DesignSpaceConfig*` INTO `dscs_`
+/// (`dsc/superdsc.h:67-68`), and the only thing stage 3 reads through those pointers is `isDSC2()`.
+/// ⭐ NON-EMPTY BY CONSTRUCTION — `DT_CHECK(mySDsc.dscs_.size() >= 1)` (`:221`, `:452`) needs no
+/// runtime form when the type admits no empty value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerCoreDscs(BTreeMap<Core, DscVersion>);
+
+impl PerCoreDscs {
+    /// One DL DSC, on one core.
+    #[must_use]
+    pub fn of(core: Core, version: DscVersion) -> Self {
+        Self(BTreeMap::from([(core, version)]))
+    }
+
+    /// Another core's DL DSC.
+    #[must_use]
+    pub fn and(mut self, core: Core, version: DscVersion) -> Self {
+        self.0.insert(core, version);
+        self
+    }
+
+    /// `for (auto& kv : mySDsc.coreIdToDsc_)` — ascending core, as `std::map` iterates.
+    pub fn iter(&self) -> impl Iterator<Item = (Core, DscVersion)> + '_ {
+        self.0.iter().map(|(core, version)| (*core, *version))
+    }
+}
+
+/// ONE DATA-OP DSC AS STAGE 3 READS IT — `DataOpDsc` (`dsc/dataOpDsc.h:985`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataOpDsc {
+    /// `op->name`, where `op` is a `baseOp*` (`dsc/dataOpDsc.h:1002`).
+    ///
+    /// ⛔ THE REFERENCE DEREFERENCES IT UNCHECKED (`:575-576`) though the pointer is `nullptr` until
+    /// the DCG or the graph optimizer fills it; carrying the op-func itself makes an unfilled op
+    /// unspellable rather than a null read.
+    pub op: OpFunc,
+    /// `pcfg_` — `[coreIdsUsed_ idx] -> {SenPcfg, L3LU or L3SU or LXSU0 or LXLU0}`
+    /// (`dsc/dataOpDsc.h:1005-1006`).
+    pub pcfg: Vec<Vec<(SenPcfg, SenComponent)>>,
+}
+
+/// THE SUPER-DSC AS STAGE 3 SEES IT — `SuperDsc` (`dsc/superdsc.h:48`), restricted to the pcfg state
+/// this stage mutates. The schedule tree, the allocations and the placed addresses belong to stages
+/// 2a and 2b, whose own homes own those fields.
+///
+/// ⛔ TWO `DT_CHECK`s BECOME TWO TYPE-LEVEL FACTS:
+/// `DATA_OPS` — whether `dataOpdscs_` may hold anything. `DT_CHECK(mySDsc.dataOpdscs_.size() == 0)`
+/// (`:222`) is entry 189 taking `SuperDsc<false, _>`, and entry 188 takes `SuperDsc<true, _>`.
+/// `FOLDED` — whether `sdscFoldProps_` is non-empty. `DT_CHECK_MSG(mySDsc.sdscFoldProps_.empty(),
+/// "Codegen for Folded Super-DSC is not supported")` (`:315`, `:509`) is a `const { assert!(!FOLDED) }`
+/// in the codegen tails, which is where the reference checks it — so the props themselves stay with
+/// `util/foldManager/`, out of scope, where they are read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuperDsc<const DATA_OPS: bool, const FOLDED: bool> {
+    /// `dscs_` and `coreIdToDsc_` (`dsc/superdsc.h:67-68`).
+    dscs: PerCoreDscs,
+    /// `dataOpdscs_` (`dsc/superdsc.h:75`).
+    data_op_dscs: Vec<DataOpDsc>,
+    /// `pcfg_` — `[coreID][component] -> SenPcfg` (`dsc/superdsc.h:96`).
+    pcfg: BTreeMap<Core, BTreeMap<SenComponent, SenPcfg>>,
+    /// `pcfgMap_` — `[coreID][component] -> pcfgPool_` slot (`dsc/superdsc.h:97`).
+    pcfg_map: BTreeMap<Core, BTreeMap<SenComponent, PcfgId>>,
+    /// `pcfgPool_` (`dsc/superdsc.h:98`).
+    pcfg_pool: BTreeMap<PcfgId, SenPcfg>,
+}
+
+impl<const DATA_OPS: bool, const FOLDED: bool> SuperDsc<DATA_OPS, FOLDED> {
+    /// A super-DSC carrying the DL DSCs and nothing else — every pcfg field starts empty, as the
+    /// reference's do.
+    #[must_use]
+    pub fn of(dscs: PerCoreDscs) -> Self {
+        Self {
+            dscs,
+            data_op_dscs: Vec::new(),
+            pcfg: BTreeMap::new(),
+            pcfg_map: BTreeMap::new(),
+            pcfg_pool: BTreeMap::new(),
+        }
+    }
+
+    /// `pcfg_[coreId][comp]` — a BARE SUBSCRIPT in the reference (`:470-471`), whose whole effect is
+    /// to DEFAULT-CONSTRUCT the entry before the translator fills it.
+    fn pcfg_entry(&mut self, core: Core, comp: SenComponent) -> &mut SenPcfg {
+        self.pcfg.entry(core).or_default().entry(comp).or_default()
+    }
+
+    /// THE POOL SLOT `[coreID][comp]` NAMES, allocating one when that pair has none (`:291-303`).
+    ///
+    /// ⚠️ A NEW ID IS `pcfgPool_.rbegin()->first + 1`, NOT THE LOWEST FREE ONE — entry 191 erases
+    /// slots from the pool, and a hole it leaves is never refilled unless it was the highest.
+    fn pcfg_slot(&mut self, core: Core, comp: SenComponent) -> &mut SenPcfg {
+        let next = PcfgId(
+            self.pcfg_pool
+                .keys()
+                .next_back()
+                .map_or(0, |last| last.0 + 1),
+        );
+        let id = *self
+            .pcfg_map
+            .entry(core)
+            .or_default()
+            .entry(comp)
+            .or_insert(next);
+        self.pcfg_pool.entry(id).or_default()
+    }
+}
+
+impl<const FOLDED: bool> SuperDsc<true, FOLDED> {
+    /// `dataOpdscs_.push_back(..)`, on a super-DSC whose type says it may have data ops.
+    #[must_use]
+    pub fn with_data_op(mut self, data_op: DataOpDsc) -> Self {
+        self.data_op_dscs.push(data_op);
+        self
+    }
+}
+
+/// `pcfgUnitToRemove` (`dcg_manager.cpp:571-577`) — the PT-row pcfgs a re-stickify-with-PT op leaves
+/// behind, on both corelets.
+///
+/// ⛔ ROW 0 IS NOT IN THE SET. `PTROW0_0` and `PTROW0_1` are absent from all fourteen entries, so
+/// row 0's pcfg survives on either corelet.
+const PT_ROW_PCFGS_TO_REMOVE: [SenComponent; 14] = [
+    SenComponent::Ptrow1_0,
+    SenComponent::Ptrow2_0,
+    SenComponent::Ptrow3_0,
+    SenComponent::Ptrow4_0,
+    SenComponent::Ptrow5_0,
+    SenComponent::Ptrow6_0,
+    SenComponent::Ptrow7_0,
+    SenComponent::Ptrow1_1,
+    SenComponent::Ptrow2_1,
+    SenComponent::Ptrow3_1,
+    SenComponent::Ptrow4_1,
+    SenComponent::Ptrow5_1,
+    SenComponent::Ptrow6_1,
+    SenComponent::Ptrow7_1,
+];
+
+/// WHICH FORM ENTRY 192 WRITES — the reference's `bool use_smc = false` (`:961`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenProgramForm {
+    /// `convertIr2Senprog` — `use_smc == false`, the default.
+    SenProg,
+    /// `convertIr2SMC` — `use_smc == true`.
+    Smc,
+}
+
+/// THE DEEP PROGRAM CONVERTER — `Dpc` (`sys-arch-spec/dpc/dpc.h`), out of this campaign's file list.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Dpc;
+
+impl Dpc {
+    /// `myDpc.convertIr2Senprog(mySDsc->progstateinfo_, *senCompToISAptr, fileFP, std::nullopt)`
+    /// (`:968-969`).
+    pub fn convert_ir_to_sen_prog<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        programs: &BTreeMap<Core, progir::Program<A, M, W>>,
+        out: &mut dyn core::fmt::Write,
+    ) {
+        let _ = (programs, out);
+        todo!("sys-arch-spec/dpc/: Dpc::convertIr2Senprog is out of scope")
+    }
+
+    /// `myDpc.convertIr2SMC(mySDsc->progstateinfo_, *senCompToISAptr, fileFP, std::nullopt)`
+    /// (`:971-972`).
+    pub fn convert_ir_to_smc<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        programs: &BTreeMap<Core, progir::Program<A, M, W>>,
+        out: &mut dyn core::fmt::Write,
+    ) {
+        let _ = (programs, out);
+        todo!("sys-arch-spec/dpc/: Dpc::convertIr2SMC is out of scope")
+    }
+}
+
+/// THE TRANSLATOR'S ARGUMENT — `DscPcfgTranslator::PcfgInfo` (`dsc/dsc2Pcfg.h:102-108`).
+///
+/// ⭐ THE PCFG BY KEY, NOT BY REFERENCE. The C++ field is a `SenPcfg&` aimed at
+/// `mySDsc.pcfg_[coreId][comp]` while the same super-DSC is passed alongside it (`:477-484`) — two
+/// live paths to one object. The key reaches the same place with one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcfgInfo {
+    /// `c` — the current core.
+    pub core: Core,
+    /// `cl` — the current corelet.
+    pub corelet: Corelet,
+    /// `clComp` — the corelet-specific component.
+    pub cl_comp: SenComponent,
+    /// `genComp` — the corelet-agnostic component. ⭐ Equal to `clComp` for either L3 half, which is
+    /// shared across a core's corelets.
+    pub gen_comp: SenComponent,
+}
+
+impl PcfgInfo {
+    /// `{mySDsc.pcfg_[coreId][L3LU], coreId, 0, L3LU, L3LU}` (`:477-479`).
+    #[must_use]
+    pub const fn l3_lu(core: Core) -> Self {
+        Self {
+            core,
+            corelet: CORELET_ZERO,
+            cl_comp: SenComponent::L3lu,
+            gen_comp: SenComponent::L3lu,
+        }
+    }
+
+    /// `{mySDsc.pcfg_[coreId][L3SU], coreId, 0, L3SU, L3SU}` (`:480-482`).
+    #[must_use]
+    pub const fn l3_su(core: Core) -> Self {
+        Self {
+            core,
+            corelet: CORELET_ZERO,
+            cl_comp: SenComponent::L3su,
+            gen_comp: SenComponent::L3su,
+        }
+    }
+}
+
+/// THE DSC-2 PCFG TRANSLATOR — `DscPcfgTranslator` (`dsc/dsc2Pcfg.h`), OUT of scope
+/// (`crustify-ddc/OUTSIDE-DEPS.tsv` names it for six of this campaign's units).
+pub struct DscPcfgTranslator;
+
+impl DscPcfgTranslator {
+    /// `DscPcfgTranslator::transformDscCompToPcfg(mySDsc, *dscGlobal, *dsc, info)` (`:483-486`) —
+    /// fills `pcfg_[info.core][info.cl_comp]` from the DSC's schedule tree.
+    pub fn transform_dsc_comp_to_pcfg<const D: bool, const F: bool>(
+        sdsc: &mut SuperDsc<D, F>,
+        info: PcfgInfo,
+    ) {
+        let _ = (sdsc, info);
+        todo!("dsc/dsc2Pcfg: DscPcfgTranslator::transformDscCompToPcfg is out of scope")
+    }
+}
+
+/// THE PCFG FRONT END — `DcgFE` (`dcg/dcg_fe/`), OUT of scope (`crustify-ddc/OUTSIDE-DEPS.tsv`).
+pub struct DcgFrontEnd;
+
+impl DcgFrontEnd {
+    /// `dcg_fe_.computeTranferforDataOp(mySDsc, myDataOpDsc, c)` (`:122`).
+    pub fn compute_transfer_for_data_op<const F: bool>(
+        sdsc: &mut SuperDsc<true, F>,
+        at: DataOpIndex,
+    ) {
+        let _ = (sdsc, at);
+        todo!("dcg_fe/: DcgFE::computeTranferforDataOp is out of scope")
+    }
+
+    /// `dcg_fe_.generatePcfgIRForDLOp(mySDsc, pcfgL3lu, pcfgL3su)` (`:283`) — one L3 pair per core
+    /// of the super-DSC's `coreIdToDsc_`.
+    pub fn generate_pcfg_ir_for_dl_op<const F: bool>(
+        sdsc: &mut SuperDsc<false, F>,
+    ) -> BTreeMap<Core, L3Halves> {
+        let _ = sdsc;
+        todo!("dcg_fe/pcfg_gen/: DcgFE::generatePcfgIRForDLOp is out of scope")
+    }
+
+    /// `dcg_fe_.createPcfgForUnitPerCore(mySDsc, pcfg, comp, coreId)` (`:488-491`), which returns the
+    /// unit's largest GTR group id.
+    pub fn create_pcfg_for_unit_per_core<const D: bool, const F: bool>(
+        sdsc: &mut SuperDsc<D, F>,
+        pcfg: &mut SenPcfg,
+        comp: SenComponent,
+        core: Core,
+    ) -> GtrGroupId {
+        let _ = (sdsc, pcfg, comp, core);
+        todo!("dcg_fe/: DcgFE::createPcfgForUnitPerCore is out of scope")
+    }
+}
+
+/// THE DCG BACKEND — `DcgBE` (`dcg/dcg_be/`), OUT of scope (`crustify-ddc/OUTSIDE-DEPS.tsv` names it
+/// for nine of this file's units).
+pub struct DcgBackEnd;
+
+impl DcgBackEnd {
+    /// `dcg_be_.runDcgForGenKG3(mySDsc, createSenProg)` (`dcg_manager.h:95`).
+    pub fn run_dcg_for_gen_kg3<const D: bool, const F: bool>(
+        sdsc: &mut SuperDsc<D, F>,
+        create_sen_prog: bool,
+    ) {
+        let _ = (sdsc, create_sen_prog);
+        todo!("dcg_be/: DcgBE::runDcgForGenKG3 is out of scope")
+    }
+
+    /// `dcg_be_.runDcgForSparseKG3CONV2D(mySDsc, createSenProg)` (`dcg_manager.h:99`).
+    pub fn run_dcg_for_sparse_kg3_conv2d<const D: bool, const F: bool>(
+        sdsc: &mut SuperDsc<D, F>,
+        create_sen_prog: bool,
+    ) {
+        let _ = (sdsc, create_sen_prog);
+        todo!("dcg_be/: DcgBE::runDcgForSparseKG3CONV2D is out of scope")
+    }
+
+    /// `dcg_be_.runDcgForSparseKG3BMM(mySDsc, createSenProg)` (`dcg_manager.h:103`).
+    pub fn run_dcg_for_sparse_kg3_bmm<const D: bool, const F: bool>(
+        sdsc: &mut SuperDsc<D, F>,
+        create_sen_prog: bool,
+    ) {
+        let _ = (sdsc, create_sen_prog);
+        todo!("dcg_be/: DcgBE::runDcgForSparseKG3BMM is out of scope")
+    }
+}
+
+/// WHAT `createSenProg` AND `progIRcodeGen` ARE TOGETHER, AS A TYPE.
+///
+/// ⭐ THE TWO ENTRIES DISAGREE ABOUT WHICH GENERATOR IS LEGAL: entry 189 asserts
+/// `progIRcodeGen == DCGProgIRGen::DCG` and entry 190 asserts `!= DCG` (`:317` against `:508`), both
+/// inside `if (createSenProg)`. As a type that is [`DlOpsSenProg`] against [`StandaloneSenProg`], and
+/// the wrong pairing is an E0277 rather than an abort.
+/// ⭐ `SchedulerStages.cpp:49-50` — our only call site — sets `DCC` and `createSenProg = false`, so
+/// the configuration this campaign runs is [`NoSenProg`], where both tails are no-ops.
+pub trait SenProgGen {
+    /// `createSenProg` (`dcg_manager.h:33`) — the flag entries 193-195 hand the backend.
+    const CREATE_SEN_PROG: bool;
+}
+
+/// `createSenProg == false` — no codegen tail on either entry. ⭐ Our configuration.
+pub struct NoSenProg;
+
+/// `createSenProg == true` with `progIRcodeGen == DCGProgIRGen::DCG` — entry 189's tail.
+pub struct DcgSenProg;
+
+/// `createSenProg == true` with `progIRcodeGen == DCGProgIRGen::DCC` — entry 190's tail.
+pub struct DccSenProg;
+
+impl SenProgGen for NoSenProg {
+    const CREATE_SEN_PROG: bool = false;
+}
+
+impl SenProgGen for DcgSenProg {
+    const CREATE_SEN_PROG: bool = true;
+}
+
+impl SenProgGen for DccSenProg {
+    const CREATE_SEN_PROG: bool = true;
+}
+
+/// ENTRY 189'S CODEGEN TAIL. ⛔ NOT IMPLEMENTED FOR [`DccSenProg`]: that is
+/// `DT_CHECK(progIRcodeGen == DCGProgIRGen::DCG)` (`:317`).
+pub trait DlOpsSenProg: SenProgGen {
+    /// `dcg_be_.convertToProgIRDlOp(mySDsc, pcfgL3lu, pcfgL3su)` (`:318`).
+    fn convert_to_prog_ir_dl_op<const FOLDED: bool>(
+        sdsc: &mut SuperDsc<false, FOLDED>,
+        halves: BTreeMap<Core, L3Halves>,
+    );
+}
+
+impl DlOpsSenProg for NoSenProg {
+    fn convert_to_prog_ir_dl_op<const FOLDED: bool>(
+        _sdsc: &mut SuperDsc<false, FOLDED>,
+        _halves: BTreeMap<Core, L3Halves>,
+    ) {
+    }
+}
+
+impl DlOpsSenProg for DcgSenProg {
+    fn convert_to_prog_ir_dl_op<const FOLDED: bool>(
+        sdsc: &mut SuperDsc<false, FOLDED>,
+        halves: BTreeMap<Core, L3Halves>,
+    ) {
+        const {
+            assert!(
+                !FOLDED,
+                "Codegen for Folded Super-DSC is not supported (dcg_manager.cpp:315)"
+            )
+        }
+        let _ = (sdsc, halves);
+        todo!("dcg_be/: DcgBE::convertToProgIRDlOp is out of scope")
+    }
+}
+
+/// ENTRY 190'S CODEGEN TAIL. ⛔ NOT IMPLEMENTED FOR [`DcgSenProg`]: that is
+/// `DT_CHECK(progIRcodeGen != DCGProgIRGen::DCG)` (`:508`).
+pub trait StandaloneSenProg: SenProgGen {
+    /// `dcg_be_.fillAndCreateSenProgInfoUsingSuperDSC(mySDsc)` (`:512`).
+    fn fill_and_create_sen_prog_info<const DATA_OPS: bool, const FOLDED: bool>(
+        sdsc: &mut SuperDsc<DATA_OPS, FOLDED>,
+    );
+}
+
+impl StandaloneSenProg for NoSenProg {
+    fn fill_and_create_sen_prog_info<const DATA_OPS: bool, const FOLDED: bool>(
+        _sdsc: &mut SuperDsc<DATA_OPS, FOLDED>,
+    ) {
+    }
+}
+
+impl StandaloneSenProg for DccSenProg {
+    fn fill_and_create_sen_prog_info<const DATA_OPS: bool, const FOLDED: bool>(
+        sdsc: &mut SuperDsc<DATA_OPS, FOLDED>,
+    ) {
+        const {
+            assert!(
+                !FOLDED,
+                "Codegen for Folded Super-DSC is not supported (dcg_manager.cpp:509)"
+            )
+        }
+        let _ = sdsc;
+        todo!("dcg_be/: DcgBE::fillAndCreateSenProgInfoUsingSuperDSC is out of scope")
+    }
+}
+
+/// THE DCG MANAGER — `DcgManager` (`dcg/dcg_manager/dcg_manager.h:29`), stage 3 of `runDdc`.
+///
+/// ⛔ THREE OF THE C++'s FIELDS ARE TYPES HERE, NOT VALUES. `C` is `createSenProg` and
+/// `progIRcodeGen` together; `DT2` is `dscGlobal->dtVersion > 1` (`sys-arch-spec/dscglobal/dscglobal.h:83`,
+/// and `setDtVersion` admits only 1 or 2); `L3_DL_SCHEDULER` is `enableL3DlScheduler`, whose only
+/// writer is a `DISCARD_ABOVE_LX_SCHEDULE` env read in the constructor (`:77-79`) — a build choice,
+/// so a const generic that REMOVES the arm it turns off.
+/// ⛔ `DT_CHECK(senCompToISAptr != nullptr)` (`:114`, `:220`, `:451`) HAS NO RUNTIME FORM HERE: the
+/// per-component ISA tables are `sys_arch_spec`'s consts, so the pointer it guards is a table the
+/// compiler folds.
+/// ⛔ `DT_CHECK(!isInpFetchNeigh)` (`:118`, `:223`) IS STRUCTURAL: input-fetch-neighbour mode is
+/// entry 281's own entry point, and this manager carries no such state.
+/// ⚠️ THE `verbose` `std::cout` LINES (`:114-116`, `:218-219`) ARE NOT REPRODUCED. This crate has no
+/// diagnostic stream, and one added here would print from inside a proc macro's build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DcgManager<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool> {
+    /// `firstAvailGlobalGrpId` (`dcg_manager.h:43`), whose comment is *"global variables --> shared
+    /// across dataOpDscs/DLDscs"* — so it survives every entry this manager runs.
+    first_avail_global_grp_id: GtrGroupId,
+    /// Which codegen tail, as a type rather than a pair of fields.
+    codegen: PhantomData<C>,
+}
+
+/// STAGE 3 AS `SchedulerStages.cpp:45-57` BUILDS IT — `progIRcodeGen = DCC`, `createSenProg = false`,
+/// `dtVersion = 2` and the L3 DL scheduler on (`dcg_manager.h:51`).
+pub type StageThreeDcg = DcgManager<NoSenProg, true, true>;
+
+impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool> Default
+    for DcgManager<C, DT2, L3_DL_SCHEDULER>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
+    DcgManager<C, DT2, L3_DL_SCHEDULER>
+{
+    /// A manager with `firstAvailGlobalGrpId = 0` (`dcg_manager.h:43`).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            first_avail_global_grp_id: GtrGroupId(0),
+            codegen: PhantomData,
+        }
+    }
+
+    /// `firstAvailGlobalGrpId`, which entry 190 advances and every later entry reads.
+    #[must_use]
+    pub const fn first_avail_global_grp_id(self) -> GtrGroupId
+    where
+        C: Copy,
+    {
+        self.first_avail_global_grp_id
+    }
+
+    /// Replaces: e188_runDcgComputeTransfer
+    ///
+    /// Hands every data-op DSC of the super-DSC to the front end's transfer computation, in order
+    /// (`dcg_manager.cpp:112-125`).
+    ///
+    /// ⭐ `int c` IS THE INDEX, NOT A COUNT: it is the argument the front end uses to find the same
+    /// data op again inside the super-DSC, which is why the seam here takes the index rather than
+    /// the `&mut DataOpDsc` the reference passes alongside a `&mut SuperDsc` aimed at it.
+    pub fn run_dcg_compute_transfer<const FOLDED: bool>(&self, sdsc: &mut SuperDsc<true, FOLDED>) {
+        for c in 0..sdsc.data_op_dscs.len() {
+            DcgFrontEnd::compute_transfer_for_data_op(sdsc, DataOpIndex(c));
+        }
+    }
+
+    /// Replaces: e189_runDcgForDlOps
+    ///
+    /// Generates each core's L3 load/store pcfg, then MERGES both into the super-DSC's pool slot for
+    /// that `[core][component]` pair, allocating a slot when the pair has none
+    /// (`dcg_manager.cpp:216-262`).
+    ///
+    /// ⚠️ `bool useDt1 = false` IS DEAD (`:242`) — nothing writes it, so `dtVersion > 1 && !useDt1`
+    /// is `DT2` alone. On version 1 the generated pcfgs reach the pool NOWHERE and only the codegen
+    /// tail sees them.
+    pub fn run_dcg_for_dl_ops<const FOLDED: bool>(&self, sdsc: &mut SuperDsc<false, FOLDED>)
+    where
+        C: DlOpsSenProg,
+    {
+        let mut halves = DcgFrontEnd::generate_pcfg_ir_for_dl_op(sdsc);
+
+        if DT2 {
+            for (core, core_halves) in &mut halves {
+                for (comp, local) in core_halves.each_mut() {
+                    SenPcfg::merge(sdsc.pcfg_slot(*core, comp), local);
+                }
+            }
+        }
+
+        if C::CREATE_SEN_PROG {
+            C::convert_to_prog_ir_dl_op(sdsc, halves);
+        }
+    }
+
+    /// Replaces: e190_runDcgForDlOpsStandalone
+    ///
+    /// STAGE 3 ITSELF. Per core: default-construct that core's two L3 pcfg entries, fill them —
+    /// through the DSC-2 translator when the L3 DL scheduler is on and the DSC has a schedule tree,
+    /// otherwise through the front end's per-unit generator — and keep the largest GTR group id any
+    /// of them used, which advances `firstAvailGlobalGrpId` (`dcg_manager.cpp:449-513`).
+    ///
+    /// ⛔ THE TWO ARMS DO NOT WRITE THE SAME PLACE. The translator arm fills
+    /// `mySDsc.pcfg_[coreId][L3LU|L3SU]`, which survives the call; the fallback arm fills the LOCAL
+    /// `pcfgL3lu`/`pcfgL3su`, which escape nowhere — only their group ids do (`:493-499`).
+    pub fn run_dcg_for_dl_ops_standalone<const DATA_OPS: bool, const FOLDED: bool>(
+        &mut self,
+        sdsc: &mut SuperDsc<DATA_OPS, FOLDED>,
+    ) where
+        C: StandaloneSenProg,
+    {
+        let mut local: BTreeMap<Core, L3Halves> = BTreeMap::new();
+        let mut max_grp_id_in_l3 = GtrGroupId(0);
+
+        for (core, version) in sdsc.dscs.iter().collect::<Vec<_>>() {
+            sdsc.pcfg_entry(core, SenComponent::L3lu);
+            sdsc.pcfg_entry(core, SenComponent::L3su);
+
+            let maxes = if L3_DL_SCHEDULER && version == DscVersion::Dsc2 {
+                DscPcfgTranslator::transform_dsc_comp_to_pcfg(sdsc, PcfgInfo::l3_lu(core));
+                DscPcfgTranslator::transform_dsc_comp_to_pcfg(sdsc, PcfgInfo::l3_su(core));
+                [
+                    sdsc.pcfg_entry(core, SenComponent::L3lu).max_gtr_group_id(),
+                    sdsc.pcfg_entry(core, SenComponent::L3su).max_gtr_group_id(),
+                ]
+            } else {
+                let mut halves = L3Halves::default();
+                let maxes = [
+                    DcgFrontEnd::create_pcfg_for_unit_per_core(
+                        sdsc,
+                        &mut halves.lu,
+                        SenComponent::L3lu,
+                        core,
+                    ),
+                    DcgFrontEnd::create_pcfg_for_unit_per_core(
+                        sdsc,
+                        &mut halves.su,
+                        SenComponent::L3su,
+                        core,
+                    ),
+                ];
+                local.insert(core, halves);
+                maxes
+            };
+
+            for max in maxes {
+                max_grp_id_in_l3 = max_grp_id_in_l3.max(max);
+            }
+        }
+
+        self.first_avail_global_grp_id = self
+            .first_avail_global_grp_id
+            .advanced_past(max_grp_id_in_l3);
+
+        if C::CREATE_SEN_PROG {
+            C::fill_and_create_sen_prog_info(sdsc);
+        }
+    }
+
+    /// Replaces: e191_removeextraPTrows
+    ///
+    /// Drops the PT-row pcfgs a re-stickify-with-PT data op leaves behind: from every such op's own
+    /// per-core pcfg list always, and from the super-DSC's pool-and-map (version 2) or its `pcfg_`
+    /// (version 1) once ANY such op was seen (`dcg_manager.cpp:568-627`).
+    ///
+    /// ⚠️ THE TWO VERSIONS DISAGREE ON WHEN: version 2 sweeps for any number of data ops, version 1
+    /// only when there is MORE THAN ONE (`:611`) — a single re-stickify op keeps its PT rows in
+    /// `pcfg_`. ⛔ And row 0 is never in the set; see [`PT_ROW_PCFGS_TO_REMOVE`].
+    pub fn remove_extra_pt_rows<const FOLDED: bool>(&self, sdsc: &mut SuperDsc<true, FOLDED>) {
+        let mut removed_a_pt_pcfg_node = false;
+
+        for data_op in &mut sdsc.data_op_dscs {
+            if matches!(
+                data_op.op,
+                OpFunc::ReStickifyOpWithPtLx | OpFunc::ReStickifyOpWithPthbm
+            ) {
+                removed_a_pt_pcfg_node = true;
+                for per_core in &mut data_op.pcfg {
+                    per_core.retain(|(_, comp)| !PT_ROW_PCFGS_TO_REMOVE.contains(comp));
+                }
+            }
+        }
+
+        if !removed_a_pt_pcfg_node {
+            return;
+        }
+
+        if DT2 {
+            let to_remove: Vec<(Core, SenComponent, PcfgId)> = sdsc
+                .pcfg_map
+                .iter()
+                .flat_map(|(core, by_comp)| {
+                    by_comp
+                        .iter()
+                        .filter(|(comp, _)| PT_ROW_PCFGS_TO_REMOVE.contains(comp))
+                        .map(|(comp, id)| (*core, *comp, *id))
+                })
+                .collect();
+            for (core, comp, id) in to_remove {
+                sdsc.pcfg_pool.remove(&id);
+                if let Some(by_comp) = sdsc.pcfg_map.get_mut(&core) {
+                    by_comp.remove(&comp);
+                }
+            }
+        } else if sdsc.data_op_dscs.len() > 1 {
+            for by_comp in sdsc.pcfg.values_mut() {
+                by_comp.retain(|comp, _| !PT_ROW_PCFGS_TO_REMOVE.contains(comp));
+            }
+        }
+    }
+
+    /// Replaces: e192_printSenProgram
+    ///
+    /// Writes the super-DSC's per-core programs out as SEN programs, or as SMC when asked
+    /// (`dcg_manager.cpp:959-975`).
+    ///
+    /// ⭐ THE SINK IS THE ARGUMENT, NOT A FILE NAME. The reference opens an `ofstream` and
+    /// `DT_ERROR_FMT`s when it will not open (`:963-965`) — a runtime refusal with no Rust form, and
+    /// none is needed: an already-open sink cannot fail to open.
+    pub fn print_sen_program<A: Arch, M: Model, W: Workload>(
+        &self,
+        programs: &BTreeMap<Core, progir::Program<A, M, W>>,
+        dpc: &mut Dpc,
+        out: &mut dyn core::fmt::Write,
+        form: SenProgramForm,
+    ) {
+        match form {
+            SenProgramForm::SenProg => dpc.convert_ir_to_sen_prog(programs, out),
+            SenProgramForm::Smc => dpc.convert_ir_to_smc(programs, out),
+        }
+    }
+
+    /// Replaces: e193_runDcgForGenKG3
+    ///
+    /// Hands the super-DSC to the backend's generic KG3 path (`dcg_manager.h:94-96`).
+    pub fn run_dcg_for_gen_kg3<const DATA_OPS: bool, const FOLDED: bool>(
+        &self,
+        sdsc: &mut SuperDsc<DATA_OPS, FOLDED>,
+    ) {
+        DcgBackEnd::run_dcg_for_gen_kg3(sdsc, C::CREATE_SEN_PROG);
+    }
+
+    /// Replaces: e194_runDcgForSparseKG3CONV2D
+    ///
+    /// Hands the super-DSC to the backend's sparse-KG3 2-D convolution path (`dcg_manager.h:98-100`).
+    pub fn run_dcg_for_sparse_kg3_conv2d<const DATA_OPS: bool, const FOLDED: bool>(
+        &self,
+        sdsc: &mut SuperDsc<DATA_OPS, FOLDED>,
+    ) {
+        DcgBackEnd::run_dcg_for_sparse_kg3_conv2d(sdsc, C::CREATE_SEN_PROG);
+    }
+
+    /// Replaces: e195_runDcgForSparseKG3BMM
+    ///
+    /// Hands the super-DSC to the backend's sparse-KG3 batched-matmul path (`dcg_manager.h:102-104`).
+    pub fn run_dcg_for_sparse_kg3_bmm<const DATA_OPS: bool, const FOLDED: bool>(
+        &self,
+        sdsc: &mut SuperDsc<DATA_OPS, FOLDED>,
+    ) {
+        DcgBackEnd::run_dcg_for_sparse_kg3_bmm(sdsc, C::CREATE_SEN_PROG);
+    }
+}
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // e196_printTrafficPerCore — the per-core traffic table.
@@ -600,5 +1359,153 @@ mod unit_tests {
         // Core 20 is on the CW arc alone: 4 of the split, plus the HBM's 4.
         assert_eq!(rows[20], (20, 0, 0, 0, 8));
         assert!(report.ends_with("totalProdSticks=8\n"), "{report}");
+    }
+
+    /// One DL DSC, version 2, on core 0 — what stage 3 is handed (`SchedulerStages.cpp:53-57`).
+    fn one_dsc2_core<const DATA_OPS: bool>() -> SuperDsc<DATA_OPS, false> {
+        SuperDsc::of(PerCoreDscs::of(core::<0>(), DscVersion::Dsc2))
+    }
+
+    /// e188 — a super-DSC with no data ops asks the front end for nothing, so the seam is never
+    /// reached and the walk simply ends (`dcg_manager.cpp:119-124`).
+    #[test]
+    fn e188_no_data_ops_reaches_no_transfer_seam() {
+        let mut sdsc = one_dsc2_core::<true>();
+        StageThreeDcg::new().run_dcg_compute_transfer(&mut sdsc);
+        assert!(sdsc.data_op_dscs.is_empty());
+    }
+
+    /// e189 — its FIRST act is the pcfg generator, so with that out of scope the entry names it and
+    /// stops before the merge (`dcg_manager.cpp:240`).
+    #[test]
+    #[should_panic(expected = "DcgFE::generatePcfgIRForDLOp")]
+    fn e189_stops_at_the_pcfg_generator() {
+        let mut sdsc = one_dsc2_core::<false>();
+        DcgManager::<DcgSenProg, true, true>::new().run_dcg_for_dl_ops(&mut sdsc);
+    }
+
+    /// e190 — ⚠️ THE WRAP IS BY 63. `firstAvailGlobalGrpId += maxGrpIDinL3` then `%= maxGroupID`
+    /// (`:503-504`) with `maxGroupID = 64 - 1` (`sysdef.cpp:230`), so 62 advanced past 2 is 1 and
+    /// never 0 — a wrap by 64 would say 0, and 63 is not a value this can hold.
+    #[test]
+    fn e190_the_group_id_wraps_by_sixty_three() {
+        let advanced = GtrGroupId::wrapped(62).advanced_past(GtrGroupId::wrapped(2));
+        assert_eq!(advanced.get(), 1);
+        assert_eq!(GtrGroupId::wrapped(GtrGroupId::MAX).get(), 0);
+    }
+
+    /// e191 — a re-stickify-with-PT op drops PT rows 1..=7 on both corelets, from its OWN pcfg list
+    /// and from the super-DSC's pool and map, ⛔ while ROW 0 SURVIVES on either corelet: neither
+    /// `PTROW0_0` nor `PTROW0_1` is in `pcfgUnitToRemove` (`dcg_manager.cpp:571-577`).
+    #[test]
+    fn e191_removes_pt_rows_one_through_seven_and_keeps_row_zero() {
+        let filed = [
+            SenComponent::Ptrow0_0,
+            SenComponent::Ptrow3_0,
+            SenComponent::Ptrow0_1,
+            SenComponent::Ptrow7_1,
+        ];
+        let mut sdsc = one_dsc2_core::<true>().with_data_op(DataOpDsc {
+            op: OpFunc::ReStickifyOpWithPtLx,
+            pcfg: vec![filed.iter().map(|comp| (SenPcfg, *comp)).collect()],
+        });
+        for (slot, comp) in filed.iter().enumerate() {
+            let id = PcfgId(slot as u64);
+            sdsc.pcfg_map
+                .entry(core::<0>())
+                .or_default()
+                .insert(*comp, id);
+            sdsc.pcfg_pool.insert(id, SenPcfg);
+        }
+
+        DcgManager::<DccSenProg, true, true>::new().remove_extra_pt_rows(&mut sdsc);
+
+        let kept: Vec<SenComponent> = sdsc.data_op_dscs[0].pcfg[0]
+            .iter()
+            .map(|(_, comp)| *comp)
+            .collect();
+        assert_eq!(kept, vec![SenComponent::Ptrow0_0, SenComponent::Ptrow0_1]);
+        let mapped: Vec<SenComponent> = sdsc.pcfg_map[&core::<0>()].keys().copied().collect();
+        assert_eq!(mapped, vec![SenComponent::Ptrow0_0, SenComponent::Ptrow0_1]);
+        assert_eq!(sdsc.pcfg_pool.len(), 2);
+    }
+
+    /// e191 — the version-1 arm needs MORE THAN ONE data op before it touches `pcfg_` (`:611`), so
+    /// one re-stickify op leaves that map alone even though it has already pruned its own list.
+    #[test]
+    fn e191_one_data_op_leaves_the_version_one_pcfg_map_alone() {
+        let mut sdsc = one_dsc2_core::<true>().with_data_op(DataOpDsc {
+            op: OpFunc::ReStickifyOpWithPthbm,
+            pcfg: vec![vec![(SenPcfg, SenComponent::Ptrow3_0)]],
+        });
+        sdsc.pcfg.insert(
+            core::<0>(),
+            BTreeMap::from([(SenComponent::Ptrow3_0, SenPcfg)]),
+        );
+
+        DcgManager::<DccSenProg, false, true>::new().remove_extra_pt_rows(&mut sdsc);
+
+        assert!(sdsc.data_op_dscs[0].pcfg[0].is_empty());
+        assert_eq!(sdsc.pcfg[&core::<0>()].len(), 1);
+    }
+
+    /// A model, so the programs the sink is handed carry the arch/model/rung the ISA tables were
+    /// chosen for — the same three [`progir::Program`] one rung up is bound by.
+    struct Granite;
+    impl Model for Granite {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung: one row.
+    struct Decode;
+    impl Workload for Decode {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e192 — the SEN-program form picks which converter runs, and both live in `sys-arch-spec/dpc/`,
+    /// out of scope (`dcg_manager.cpp:967-973`).
+    #[test]
+    #[should_panic(expected = "Dpc::convertIr2Senprog")]
+    fn e192_stops_at_the_deep_program_converter() {
+        let mut out = String::new();
+        let programs: BTreeMap<Core, progir::Program<Target, Granite, Decode>> = BTreeMap::new();
+        StageThreeDcg::new().print_sen_program(
+            &programs,
+            &mut Dpc,
+            &mut out,
+            SenProgramForm::SenProg,
+        );
+    }
+
+    /// e193 — the generic KG3 path is the backend's, and the flag it is handed is `createSenProg`,
+    /// which [`StageThreeDcg`] fixes to false (`dcg_manager.h:94-96`).
+    #[test]
+    #[should_panic(expected = "DcgBE::runDcgForGenKG3")]
+    fn e193_stops_at_the_backend() {
+        let mut sdsc = one_dsc2_core::<false>();
+        StageThreeDcg::new().run_dcg_for_gen_kg3(&mut sdsc);
+    }
+
+    /// e194 — likewise for the sparse-KG3 convolution path (`dcg_manager.h:98-100`).
+    #[test]
+    #[should_panic(expected = "DcgBE::runDcgForSparseKG3CONV2D")]
+    fn e194_stops_at_the_backend() {
+        let mut sdsc = one_dsc2_core::<false>();
+        StageThreeDcg::new().run_dcg_for_sparse_kg3_conv2d(&mut sdsc);
+    }
+
+    /// e195 — likewise for the sparse-KG3 batched-matmul path (`dcg_manager.h:102-104`).
+    #[test]
+    #[should_panic(expected = "DcgBE::runDcgForSparseKG3BMM")]
+    fn e195_stops_at_the_backend() {
+        let mut sdsc = one_dsc2_core::<false>();
+        StageThreeDcg::new().run_dcg_for_sparse_kg3_bmm(&mut sdsc);
     }
 }
