@@ -121,6 +121,22 @@ prune() {
 
 # ── ONE STAGE ─────────────────────────────────────────────────────────────────────────────────
 stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
+  # ⛔⛔ A PORT STAGE MUST RUN THE REMAINDER, NOT THE ORIGINAL SCHEDULE. `gen_campaign.py
+  # --remainder` writes `port-remainder.json`; the stage list names `port.json`, which still holds
+  # every unit the level ever had. On the restart after the stuck-promote recovery this driver
+  # announced `sc1-port ... 256 units` over a level that was ALREADY 256/256 FILLED — it would have
+  # re-ported the lot. So a port stage prefers the remainder whenever one exists, which also makes
+  # every restart self-correcting instead of depending on the stage list being hand-edited.
+  #
+  # ⭐ REVIEW IS DELIBERATELY NOT REMAPPED: a unit is reviewed once per port, and its remainder is
+  # not the same question as the port's.
+  if [ "$2" = "port" ]; then
+    rem="${1%/port.json}/port-remainder.json"
+    if [ -f "$CAMPDIR/$rem" ]; then
+      say "STAGE $3 using the remainder ($rem) rather than $1"
+      set -- "$rem" "$2" "$3"
+    fi
+  fi
   n=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['summary']['unit_count'])" \
         "$CAMPDIR/$1" 2>/dev/null || echo 1)
   # ⭐ SKIP AN EMPTY SCHEDULE. The remainder is rewritten after every promote, so a finished level
