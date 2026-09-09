@@ -139,37 +139,6 @@ pub(crate) mod transformation;
 pub(crate) mod transformation_util;
 pub(crate) mod v1;
 
-
-// crustify:todo: e073_addPropInfo
-//   authority : ddc/ddc.h:402  (22 body lines, level 0)
-//   class     : CoordPropTracker
-//   original  : void addPropInfo(dsc2::ScheduleNode* refNode, dsc2::ScheduleNode* nodeToFold, const std::vector<PrimaryDimTypes> dims, const std::string dataConnect = "", const bool refIsProducer = true, const bool scaleDown = false)
-//   extract   : crustify-ddc/cpp/ddc.cpp:32-59
-
-// crustify:todo: e074_retry
-//   authority : ddc/ddc.h:436  (23 body lines, level 0)
-//   class     : CoordPropTracker
-//   original  : void retry(const dsc2::CoordPropInfoType& propInfo, const std::vector<PrimaryDimTypes> dims)
-//   extract   : crustify-ddc/cpp/ddc.cpp:69-93
-
-// crustify:todo: e075_getCurrItem
-//   authority : ddc/ddc.h:463  (10 body lines, level 0)
-//   class     : CoordPropTracker
-//   original  : bool getCurrItem(dsc2::CoordPropInfoType& nextCoordPropInfo)
-//   extract   : crustify-ddc/cpp/ddc.cpp:103-113
-
-// crustify:todo: e076_print
-//   authority : ddc/ddc.h:580  (29 body lines, level 0)
-//   class     : RowGroupInfo
-//   original  : void print(std::ostream& out) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:123-152
-
-// crustify:todo: e077_printFoldParams
-//   authority : ddc/ddc.h:611  (6 body lines, level 0)
-//   class     : Ddc
-//   original  : void printFoldParams(std::vector<dsc2::FoldParamInfoType>& foldParams)
-//   extract   : crustify-ddc/cpp/ddc.cpp:162-168
-
 // crustify:todo: e230_addPropInfo
 //   authority : ddc/ddc.h:430  (4 body lines, level 1)
 //   class     : CoordPropTracker
@@ -198,3 +167,560 @@ pub(crate) mod v1;
 //   extract   : crustify-ddc/cpp/ddc.cpp:8113-8129
 //   calls     : e231_rollbackToPos
 
+// ⭐ USES FOR ENTRIES 073-077. Union these into this file's top block when its other entries land.
+use core::fmt::Write as _;
+use std::collections::BTreeMap;
+
+use self::fold::{Beta, BlockId, CoordPropInfo, FoldLabel, FoldParamInfo, NodeId};
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+use crate::units::Row;
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE COORDINATE-PROPAGATION WORKLIST AND THE ROW GROUP — as entries 073-077 read them.
+//
+// ⭐ ONE C++ STRUCT, ONE RUST TYPE. `dsc2::CoordPropInfoType` (`dsc/dsc2.h:1087`) already has a
+// reduction in this module's `fold` sibling — the three fields entry 091's match reads,
+// `fold::CoordPropInfo`. [`Propagation`] CONTAINS that reduction rather than respelling it, so no
+// field is written twice and `&queued.prop.ends` goes straight into `match_data_stream`.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `dsc2::ScheduleNode::name_` — all entries 074 and 076 ask of a node beyond its identity, and
+/// both ask only to say which node a line of text is about.
+pub trait NodeNames {
+    /// The node's name.
+    fn name(&self, node: NodeId) -> &str;
+}
+
+/// WHICH SIDE OF THE DATAFLOW THE REFERENCE NODE SITS ON — `CoordPropInfoType::refIsProducer`
+/// (`dsc/dsc2.h:1091`).
+///
+/// ⛔ AN ENUM, NOT A `bool`, BECAUSE `scaleDown` IS THE FIELD BESIDE IT: the reference initialises
+/// both positionally in one aggregate (`ddc/ddc.h:424-426`) and two `bool`s in a row transpose
+/// silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RefRole {
+    /// `true` — the reference node produces what the node to fold consumes.
+    #[default]
+    Producer,
+    /// `false`.
+    Consumer,
+}
+
+/// WHETHER THIS STEP CROSSES FROM A VALUE TENSOR TO ITS MX SCALE TENSOR — `scaleDown`
+/// (`dsc/dsc2.h:1093`), the flag that makes `buildFoldForAllocation` compress the reference
+/// coordinate through `scaleDownCoord` (`ddc/ddc_fold.cpp:2402`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum ScaleDown {
+    /// `false`.
+    #[default]
+    No,
+    /// `true` — set only where a compute's value-tensor allocation drags its scale tensor into the
+    /// queue (`ddc/ddc_fold.cpp:1746`).
+    Yes,
+}
+
+/// HOW FAR ONE QUEUED PROPAGATION GOT — `CoordPropInfoType::PropStateType` (`dsc/dsc2.h:1088`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PropState {
+    /// `NOT_PROCESSED`.
+    #[default]
+    NotProcessed,
+    /// `ROLLED_BACK`.
+    RolledBack,
+    /// `OVERRIDDEN`.
+    Overridden,
+    /// `COMPLETE`.
+    Complete,
+}
+
+/// ONE PROPAGATION STEP'S FIXED PART — `dsc2::CoordPropInfoType` (`dsc/dsc2.h:1087`) less the two
+/// fields the queue itself owns (`propState`, `dimsToPropagate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Propagation {
+    /// `refNode`, `nodeToFold` and `dataConnect` as entry 091's match reads them.
+    pub ends: CoordPropInfo,
+    /// `refNode`'s SCHEDULE-TREE identity — `refsAdded_`'s inner key (`ddc/ddc.h:534`). An allocate
+    /// end also carries an `AllocId` inside [`Propagation::ends`]; that is the allocation's
+    /// identity and this is the node's.
+    pub ref_node: NodeId,
+    /// `nodeToFold`'s tree identity — `refsAdded_`'s OUTER key.
+    pub node_to_fold: NodeId,
+    /// `refIsProducer`.
+    pub ref_role: RefRole,
+    /// `scaleDown`.
+    pub scale_down: ScaleDown,
+}
+
+/// ONE ENTRY OF `itemsToProcess_` (`ddc/ddc.h:531`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedProp {
+    /// The step.
+    pub prop: Propagation,
+    /// `propState`.
+    pub state: PropState,
+    /// `dimsToPropagate` — the dims this entry has left to propagate, which is the UNSEEN subset of
+    /// what was asked for and not the caller's whole list.
+    pub dims: Vec<PrimaryDim>,
+}
+
+/// A POSITION IN THE PROPAGATION QUEUE — an `itemsToProcess_` index, and what `rollbackToPos` takes.
+///
+/// ⛔ THE REFERENCE'S `currItemToProcess_ = -1` IS NOT A POSITION: it means *before the first
+/// entry*, so it is [`None`] here and there is no `-1` to index the queue with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QueuePos(pub usize);
+
+/// HOW MANY TIMES ONE `(nodeToFold, refNode, dim)` PROPAGATION HAS BEEN RETRIED — `refsAdded_`'s
+/// innermost value (`ddc/ddc.h:534`), bounded by the reference's own threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct RetryCount(u8);
+
+impl RetryCount {
+    /// What a first retry records — the reference stores 0 and not 1 (`ddc/ddc.h:439,455`), so a
+    /// dim's count is the number of retries BEFORE the one being charged.
+    const FIRST: RetryCount = RetryCount(0);
+
+    /// The count the reference aborts on: `retryCount == 15` (`ddc/ddc.h:445`).
+    const THRESHOLD: RetryCount = RetryCount(15);
+
+    /// The next count, or [`None`] at the threshold.
+    const fn bumped(self) -> Option<RetryCount> {
+        if self.0 >= Self::THRESHOLD.0 {
+            None
+        } else {
+            Some(RetryCount(self.0 + 1))
+        }
+    }
+}
+
+/// THE COORDINATE-PROPAGATION WORKLIST — `Ddc::CoordPropTracker` (`ddc/ddc.h:400`).
+///
+/// ⭐ A `Vec` FOR THE REFERENCE'S `std::deque`: nothing ever pops the front. Entries are appended,
+/// walked forward by [`CoordPropTracker::next_item`] and rewound by `rollbackToPos`, so the one
+/// operation that would need a deque is never performed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoordPropTracker {
+    /// `itemsToProcess_`.
+    items: Vec<QueuedProp>,
+    /// `refsAdded_` — outer key `nodeToFold`, inner key `refNode`, innermost value the dim's retry
+    /// count.
+    refs_added: BTreeMap<NodeId, BTreeMap<NodeId, BTreeMap<PrimaryDim, RetryCount>>>,
+    /// `currItemToProcess_`.
+    curr: Option<QueuePos>,
+}
+
+impl CoordPropTracker {
+    /// Replaces: e073_addPropInfo
+    ///
+    /// Queues one propagation step for every dim of `dims` NOT already recorded against this
+    /// `(nodeToFold, refNode)` pair, and records each of those as retried zero times.
+    ///
+    /// ⛔ NOTHING IS QUEUED WHEN EVERY DIM WAS ALREADY SEEN (`ddc/ddc.h:415-418`): the ledger, not
+    /// the queue, is what stops one propagation from being walked twice.
+    /// ⛔ THE QUEUED ENTRY CARRIES THE UNSEEN SUBSET, not the list it was asked for.
+    /// ⭐ A DIM REPEATED IN `dims` IS TAKEN ONCE — the ledger is written inside the loop, so the
+    /// second sighting is already seen.
+    pub fn add_prop_info(&mut self, prop: Propagation, dims: &[PrimaryDim]) {
+        let mut unseen: Vec<PrimaryDim> = Vec::new();
+        for &dim in dims {
+            let seen = self
+                .refs_added
+                .get(&prop.node_to_fold)
+                .and_then(|per_ref| per_ref.get(&prop.ref_node))
+                .is_some_and(|per_dim| per_dim.contains_key(&dim));
+            if seen {
+                // This propagation step has already been included.
+                continue;
+            }
+            unseen.push(dim);
+            self.refs_added
+                .entry(prop.node_to_fold)
+                .or_default()
+                .entry(prop.ref_node)
+                .or_default()
+                .insert(dim, RetryCount::FIRST);
+        }
+        if unseen.is_empty() {
+            // No remaining dimension for propagation.
+            return;
+        }
+        self.items.push(QueuedProp {
+            prop,
+            state: PropState::NotProcessed,
+            dims: unseen,
+        });
+    }
+
+    /// Replaces: e074_retry
+    ///
+    /// Re-queues a step for `dims` and charges each of those dims one retry.
+    ///
+    /// ⛔⛔ THE RE-QUEUED STEP LOSES `scaleDown`. The reference's aggregate initialiser stops at
+    /// `dimsToPropagate` (`ddc/ddc.h:437-441`), so the seventh member falls back to its `= false`
+    /// default and a value-to-scale-tensor step comes back as an ordinary one. Reproduced, and it is
+    /// the one field this function overwrites.
+    /// ⛔ A DIM WITH NO LEDGER ENTRY IS CHARGED ZERO (`:446-455`), so a fresh dim's first retry does
+    /// not count against the threshold.
+    /// 🛑 THE 16TH RETRY OF ONE DIM IS THE REFERENCE'S `DT_ERROR` (`:445`) and it ends the run. No
+    /// type can state "the fold builder kept failing", so this one stays a stop.
+    pub fn retry<N: NodeNames + ?Sized>(
+        &mut self,
+        names: &N,
+        prop: Propagation,
+        dims: &[PrimaryDim],
+    ) {
+        self.items.push(QueuedProp {
+            prop: Propagation {
+                scale_down: ScaleDown::No,
+                ..prop
+            },
+            state: PropState::NotProcessed,
+            dims: dims.to_vec(),
+        });
+        for &dim in dims {
+            let per_ref = self.refs_added.entry(prop.node_to_fold).or_default();
+            let charged = match per_ref
+                .get(&prop.ref_node)
+                .and_then(|per_dim| per_dim.get(&dim))
+            {
+                None => RetryCount::FIRST,
+                Some(&count) => count.bumped().unwrap_or_else(|| {
+                    // `primaryDimToString` (`dsc/dims.cpp:22`) is this enum's name lowered, for all
+                    // twelve dims, so the message is the reference's.
+                    panic!(
+                        "Retry threshold for propagation reached for {} -> {}, dim= {}.",
+                        names.name(prop.ref_node),
+                        names.name(prop.node_to_fold),
+                        format!("{dim:?}").to_lowercase(),
+                    )
+                }),
+            };
+            per_ref
+                .entry(prop.ref_node)
+                .or_default()
+                .insert(dim, charged);
+        }
+    }
+
+    /// Replaces: e075_getCurrItem
+    ///
+    /// Advances to the next queued step, stamps it COMPLETE in the queue and hands back a copy.
+    ///
+    /// ⛔⛔ IT ADVANCES BEFORE IT BOUNDS-CHECKS (`ddc/ddc.h:464-467`), so answering [`None`] still
+    /// leaves the cursor one past the last entry — the value `rollbackToPos` compares against.
+    /// ⛔ COMPLETE IS STAMPED ON FETCH, not on success: the entry is assumed processed "irrespective
+    /// of the usage on the caller side" (`:461-462`), so the copy handed back is COMPLETE too.
+    pub fn next_item(&mut self) -> Option<QueuedProp> {
+        let next = QueuePos(self.curr.map_or(0, |QueuePos(pos)| pos + 1));
+        self.curr = Some(next);
+        let item = self.items.get_mut(next.0)?;
+        item.state = PropState::Complete;
+        Some(item.clone())
+    }
+}
+
+/// WHICH ROW-BUNDLING CASE A ROW GROUP IS — `Ddc::RowGroupInfo::Category` (`ddc/ddc.h:562`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RowBundling {
+    /// `ROW_TO_SAME_ROW`.
+    RowToSameRow,
+    /// `NONROW_TO_ROW`.
+    NonRowToRow,
+    /// `ROW_TO_NONROW`.
+    RowToNonRow,
+    /// `ROW_NORTH_SOUTH`.
+    RowNorthSouth,
+    /// `NO_BUNDLING` — the field's own default (`ddc/ddc.h:567`).
+    #[default]
+    NoBundling,
+}
+
+impl RowBundling {
+    /// The reference's spelling (`ddc/ddc.h:585-601`).
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::RowToNonRow => "Row-to-NonRow",
+            Self::RowToSameRow => "Row-to-SameRow",
+            Self::NonRowToRow => "NonRow-to-Row",
+            Self::RowNorthSouth => "Row-North-South",
+            Self::NoBundling => "No-Bundling",
+        }
+    }
+}
+
+/// WHETHER A GROUP'S ROWS RUN UP OR DOWN — `RowGroupInfo::ascendingOrder` (`ddc/ddc.h:578`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RowOrder {
+    /// `true`, the field's default.
+    #[default]
+    Ascending,
+    /// `false`.
+    Descending,
+}
+
+/// ONE MEMBER OF A ROW GROUP — `RowGroupInfo::RowGroupNodeInfo` (`ddc/ddc.h:571`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowGroupNodeInfo {
+    /// `node`.
+    pub node: NodeId,
+    /// `row` — the PT row `getCompRowId` reported, absent for its `-1`.
+    pub row: Option<Row>,
+    /// `beta` — WHICH of the node's row betas this grouping uses, since a compute node has several
+    /// (`ddc/ddc.h:573-576`).
+    pub beta: Beta,
+}
+
+/// ONE ROW-SPLIT GROUP — `Ddc::RowGroupInfo` (`ddc/ddc.h:561`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RowGroupInfo {
+    /// `cat`.
+    pub cat: RowBundling,
+    /// `commonGroupAncestor` — the innermost block node containing every node of the group, absent
+    /// for the reference's `nullptr`.
+    pub common_group_ancestor: Option<BlockId>,
+    /// `nodeInfo`.
+    pub node_info: Vec<RowGroupNodeInfo>,
+    /// `activeRow` — the group's one row, carried only for `ROW_TO_SAME_ROW`, absent for the
+    /// reference's `-1`.
+    pub active_row: Option<Row>,
+    /// `ascendingOrder`.
+    pub ascending_order: RowOrder,
+}
+
+impl RowGroupInfo {
+    /// Replaces: e076_print
+    ///
+    /// Writes the group out: its category, then one `(name, row, beta)` triple per member.
+    ///
+    /// ⛔ AN UNSET ROW PRINTS `-1` — the reference prints the `int` field whose default is `-1`
+    /// (`ddc/ddc.h:573`), so absence is that number and not a blank.
+    /// ⭐ `", row= "` HAS A SPACE AFTER THE `=` AND `", beta="` HAS NONE (`:604-605`).
+    /// ⚠️ The reference's closing `out.flush()` has no `fmt::Write` counterpart: the sink is the
+    /// caller's and so is flushing it.
+    pub fn print<N: NodeNames + ?Sized>(&self, names: &N, out: &mut dyn core::fmt::Write) {
+        let _ = write!(out, "\nRowgroup: \n  Category= {}", self.cat.spelling());
+        let _ = write!(out, "\n  Group elements:");
+        for member in &self.node_info {
+            let _ = write!(
+                out,
+                " ({}, row= {}, beta={})",
+                names.name(member.node),
+                member.row.map_or(-1, |row| i64::from(row.get())),
+                member.beta.0,
+            );
+        }
+    }
+}
+
+/// Replaces: e077_printFoldParams
+///
+/// The fold list as one `(alpha, beta, cardinality, label) ` group per level, outermost first.
+///
+/// ⭐ THE SINK IS THE CALLER'S: the reference writes to `std::cout` (`ddc/ddc.h:611`) and the text is
+/// the whole of what this function decides.
+/// ⛔ AN UNLABELLED LEVEL PRINTS AN EMPTY FIELD — `foldDimLabel`'s default is `""`
+/// (`dsc/dsc2.h:1083`), so the `, )` that leaves is the reference's own.
+#[must_use]
+pub fn print_fold_params(fold_params: &[FoldParamInfo]) -> String {
+    let mut out = String::new();
+    for fp_info in fold_params {
+        let _ = write!(
+            out,
+            "({}, {}, {}, {}) ",
+            fp_info.alpha.0,
+            fp_info.beta.0,
+            fp_info.cardinality.0,
+            fp_info.label.map_or("", FoldLabel::spelling),
+        );
+    }
+    out
+}
+
+// ⭐ TESTS FOR ENTRIES 073-077. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e073_e077 {
+    use super::fold::{
+        Alpha, Beta, Cardinality, CoordPropInfo, FoldLabel, FoldParamInfo, NodeId, PropEnd,
+    };
+    use super::{
+        CoordPropTracker, NodeNames, PropState, Propagation, QueuePos, RefRole, RetryCount,
+        RowBundling, RowGroupInfo, RowGroupNodeInfo, RowOrder, ScaleDown, print_fold_params,
+    };
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+    use crate::units::Row;
+
+    /// Node names read out of a table, which is all the two text-producing entries ask for.
+    struct Names(Vec<&'static str>);
+
+    impl NodeNames for Names {
+        fn name(&self, node: NodeId) -> &str {
+            self.0[node.0 as usize]
+        }
+    }
+
+    /// A step between two nodes that are neither an allocation nor a compute, which is every end
+    /// entries 073-075 need: the tracker keys on identity alone.
+    fn step(ref_node: u32, node_to_fold: u32) -> Propagation {
+        Propagation {
+            ends: CoordPropInfo {
+                data_connect: None,
+                ref_node: PropEnd::Other,
+                node_to_fold: PropEnd::Other,
+            },
+            ref_node: NodeId(ref_node),
+            node_to_fold: NodeId(node_to_fold),
+            ref_role: RefRole::Producer,
+            scale_down: ScaleDown::Yes,
+        }
+    }
+
+    /// e073: a dim already recorded for the pair is dropped, and a step whose every dim was seen
+    /// queues nothing at all — the ledger is the guard, not the queue.
+    #[test]
+    fn an_already_propagated_dim_is_dropped_and_an_all_seen_step_queues_nothing() {
+        let mut tracker = CoordPropTracker::default();
+
+        tracker.add_prop_info(step(0, 1), &[PrimaryDim::In, PrimaryDim::Out]);
+        // Same pair, one old dim and one new: only the new one is queued.
+        tracker.add_prop_info(step(0, 1), &[PrimaryDim::Out, PrimaryDim::Mb]);
+        // Same pair, nothing new: no entry.
+        tracker.add_prop_info(step(0, 1), &[PrimaryDim::In, PrimaryDim::Mb]);
+        // The other direction is a different pair, so its dims are unseen.
+        tracker.add_prop_info(step(1, 0), &[PrimaryDim::In]);
+
+        assert_eq!(tracker.items.len(), 3);
+        assert_eq!(tracker.items[0].dims, vec![PrimaryDim::In, PrimaryDim::Out]);
+        assert_eq!(tracker.items[1].dims, vec![PrimaryDim::Mb]);
+        assert_eq!(tracker.items[2].dims, vec![PrimaryDim::In]);
+        assert_eq!(tracker.items[2].prop.node_to_fold, NodeId(0));
+        assert_eq!(
+            tracker.refs_added[&NodeId(1)][&NodeId(0)][&PrimaryDim::Mb],
+            RetryCount::FIRST
+        );
+    }
+
+    /// e074: the re-queued step comes back with `scaleDown` cleared — the reference's aggregate
+    /// initialiser never copies it — and the dim is charged 0 then 1.
+    #[test]
+    fn a_retry_requeues_without_the_scale_down_flag_and_charges_the_dim() {
+        let mut tracker = CoordPropTracker::default();
+        let names = Names(vec!["refNode", "nodeToFold"]);
+        let prop = step(0, 1);
+
+        tracker.retry(&names, prop, &[PrimaryDim::In]);
+
+        assert_eq!(prop.scale_down, ScaleDown::Yes);
+        assert_eq!(tracker.items[0].prop.scale_down, ScaleDown::No);
+        assert_eq!(tracker.items[0].state, PropState::NotProcessed);
+        // A dim with no ledger entry is charged zero, so the first retry is free.
+        assert_eq!(
+            tracker.refs_added[&NodeId(1)][&NodeId(0)][&PrimaryDim::In],
+            RetryCount(0)
+        );
+
+        tracker.retry(&names, prop, &[PrimaryDim::In]);
+
+        assert_eq!(tracker.items.len(), 2);
+        assert_eq!(
+            tracker.refs_added[&NodeId(1)][&NodeId(0)][&PrimaryDim::In],
+            RetryCount(1)
+        );
+    }
+
+    /// e074, the negative: the reference aborts once one dim of one pair has been charged 15 times
+    /// (`ddc/ddc.h:445`), and the message names both ends.
+    #[test]
+    #[should_panic(expected = "Retry threshold for propagation reached for refNode -> nodeToFold")]
+    fn retrying_one_dim_past_the_threshold_is_the_references_own_stop() {
+        let mut tracker = CoordPropTracker::default();
+        let names = Names(vec!["refNode", "nodeToFold"]);
+
+        // The first charges 0 and each of the next 15 charges one more, so the 17th is the stop.
+        for _ in 0..=RetryCount::THRESHOLD.0 {
+            tracker.retry(&names, step(0, 1), &[PrimaryDim::Y]);
+        }
+        assert_eq!(
+            tracker.refs_added[&NodeId(1)][&NodeId(0)][&PrimaryDim::Y],
+            RetryCount::THRESHOLD
+        );
+
+        tracker.retry(&names, step(0, 1), &[PrimaryDim::Y]);
+    }
+
+    /// e075: the fetch stamps COMPLETE on the queue entry as well as the copy, and the cursor
+    /// advances past the end even when there is nothing to hand back.
+    #[test]
+    fn a_fetch_stamps_complete_and_the_cursor_advances_past_the_end() {
+        let mut tracker = CoordPropTracker::default();
+        tracker.add_prop_info(step(0, 1), &[PrimaryDim::In]);
+
+        let fetched = tracker.next_item().expect("one entry was queued");
+
+        assert_eq!(fetched.state, PropState::Complete);
+        assert_eq!(tracker.items[0].state, PropState::Complete);
+        assert_eq!(tracker.curr, Some(QueuePos(0)));
+
+        assert_eq!(tracker.next_item(), None);
+        // One past the last entry, which is what a rollback position is compared against.
+        assert_eq!(tracker.curr, Some(QueuePos(1)));
+    }
+
+    /// e076: the category, then one triple per member — and a member with no row prints the
+    /// reference's `-1` rather than nothing.
+    #[test]
+    fn a_row_group_prints_its_category_and_a_minus_one_for_an_unset_row() {
+        let names = Names(vec!["transfer.0", "compute.1"]);
+        let group = RowGroupInfo {
+            cat: RowBundling::RowToSameRow,
+            node_info: vec![
+                RowGroupNodeInfo {
+                    node: NodeId(0),
+                    row: Row::checked(3),
+                    beta: Beta(128),
+                },
+                RowGroupNodeInfo {
+                    node: NodeId(1),
+                    row: None,
+                    beta: Beta(-1),
+                },
+            ],
+            ..RowGroupInfo::default()
+        };
+
+        let mut out = String::new();
+        group.print(&names, &mut out);
+
+        assert_eq!(
+            out,
+            "\nRowgroup: \n  Category= Row-to-SameRow\n  Group elements: (transfer.0, row= 3, \
+             beta=128) (compute.1, row= -1, beta=-1)"
+        );
+        assert_eq!(group.ascending_order, RowOrder::Ascending);
+    }
+
+    /// e077: one parenthesised group per level with a trailing space, and an unlabelled level leaves
+    /// the label field empty.
+    #[test]
+    fn the_fold_param_line_carries_one_group_per_level_and_an_empty_label() {
+        let params = vec![
+            FoldParamInfo {
+                alpha: Alpha(64),
+                beta: Beta(0),
+                cardinality: Cardinality(32),
+                label: Some(FoldLabel::CoreWorksliceFoldDim),
+            },
+            FoldParamInfo {
+                alpha: Alpha(-8),
+                beta: Beta(4),
+                cardinality: Cardinality(2),
+                label: None,
+            },
+        ];
+
+        assert_eq!(
+            print_fold_params(&params),
+            "(64, 0, 32, core_workslice_fold_dim) (-8, 4, 2, ) "
+        );
+    }
+}
