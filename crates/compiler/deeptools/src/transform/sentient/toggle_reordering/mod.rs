@@ -79,12 +79,194 @@
 //! | `e481_runOn` | 481 | 2 | 18 | `dcc/src/Transform/Sentient/ToggleReordering.cpp:181` |
 //! | `e542_runOnOperation` | 542 | 3 | 5 | `dcc/src/Transform/Sentient/ToggleReordering.cpp:149` |
 
+// ⛔ THE PASS DRIVERS ARE `e390_runOn`/`e481_runOn`/`e542_runOnOperation`, still open anchors below,
+// so nothing outside this module calls any of it yet and CI's `-D warnings` would fail on the first
+// ported leaf. ⭐ REMOVE THIS WITH `e390_runOn`.
+#![allow(dead_code)]
+
 pub(crate) mod toggle_info;
 
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{
+    Op, Val, defining_op, parent_for_arg, sentient, uniform, use_count,
+};
+use crate::transform::sentient::analyses::ExpressionEvaluator;
+use toggle_info::{ToggleInfo, yielded_results};
 
-// crustify:todo: e233_computeToggleInfoIfIsToggle
-//   authority : dcc/src/Transform/Sentient/ToggleReordering.cpp:222  (39 body lines, level 0)
-//   original  : ToggleInfo *ToggleReorderingPass::computeToggleInfoIfIsToggle( dataflow::ProgramUnitOp unit_op, sentient::SubOp sub_op)
+/// `sentient::SubOp` — the four things e233 reads off a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubOp {
+    /// `getInp1()` — the minuend, which must be constant for this to be a toggle.
+    pub minuend: Val,
+    /// `getInp2()` — the subtrahend, which must be a loop iter arg.
+    pub subtrahend: Val,
+    /// `getResult()`.
+    pub result: Val,
+    /// `getType()`.
+    pub ty: ScalarTy,
+}
+
+impl SubOp {
+    /// `dyn_cast<sentient::SubOp>(op)` — the walk's own parameter type, as a match.
+    #[must_use]
+    pub fn of(op: &Op) -> Option<SubOp> {
+        match op {
+            Op::Sentient(sentient::Op::ScalarSub {
+                lhs,
+                rhs,
+                result,
+                ty,
+                ..
+            }) => Some(SubOp {
+                minuend: *lhs,
+                subtrahend: *rhs,
+                result: *result,
+                ty: *ty,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Replaces: e233_computeToggleInfoIfIsToggle
+///
+/// A [`ToggleInfo`] when `sub_op` is `constant - iter_arg`, the iter arg is read by nothing else, its
+/// slot of the loop's yield holds the sub's result, and the chain's outer initializer is constant.
+///
+/// ⛔ TRAP: `dcc::utils::getOutermostConstInitialization` IS THIS CAMPAIGN'S e246
+/// (`dcc/src/Transform/Sentient/Utils.cpp:469`, homed in `transform/sentient/utils`), and the
+/// scheduler did not record the edge — the call is namespace-qualified rather than a member call. Every
+/// guard before it is ported; see [`outermost_const_initialization`] for the rest.
+/// ⭐ `unit_op` IS DROPPED: it only positioned `const_builder`, which is
+/// [`crate::transform::sentient::analyses::OffsetSites::consts`] at [`ToggleInfo::reorder_toggle`].
+pub fn compute_toggle_info_if_is_toggle<E: ExpressionEvaluator>(
+    evaluator: &mut E,
+    unit_body: &[Op],
+    sub_op: SubOp,
+) -> Option<ToggleInfo> {
+    if !is_sentient_constant(sub_op.minuend, unit_body) {
+        return None;
+    }
+    // `getIndexOfLoopRegionIterArgs(sub_inp2)` and the `DT_CHECK_MSG(iter_arg, ..)` after it are one
+    // question: only a `sentient.for` region argument has both a parent loop and an index.
+    let (loop_op, iter_arg_idx) = index_of_loop_region_iter_args(sub_op.subtrahend, unit_body)?;
+    if use_count(sub_op.subtrahend, unit_body) != 1 {
+        return None;
+    }
+    // `if (yield_op.getOperand(iter_arg_idx) != sub_result) return nullptr;`
+    let Op::Sentient(sentient::Op::For { body, .. }) = loop_op else {
+        return None;
+    };
+    if yielded_results(body)?.get(iter_arg_idx) != Some(&sub_op.result) {
+        return None;
+    }
+
+    let (outer_loop_iv, outer_loop_carried) =
+        outermost_const_initialization(sub_op.subtrahend, unit_body)?;
+    // `if (!isa<sentient::ConstantOp>(outer_loop.getIterOperands()[idx].getDefiningOp()))` — ⛔ THE
+    // BARE `isa`, NOT `isConstant`: a `uniform.query_map` initializer is accepted by the FIRST guard
+    // and refused by this one.
+    let init = carried_init(unit_body, outer_loop_iv, outer_loop_carried)?;
+    if !matches!(
+        defining_op(init, unit_body),
+        Some(Op::Sentient(sentient::Op::ScalarConstant { .. }))
+    ) {
+        return None;
+    }
+
+    Some(ToggleInfo {
+        sub_result: sub_op.result,
+        sub_ty: sub_op.ty,
+        iter_arg: sub_op.subtrahend,
+        minuend_ev: evaluator.evaluate_value(sub_op.minuend),
+        outer_loop_iv,
+        outer_loop_carried,
+    })
+}
+
+/// `dcc::utils::getOutermostConstInitialization` (`dcc/src/Transform/Sentient/Utils.cpp:469`) — the
+/// outer loop of `iter_arg`'s iter-arg chain and the carried index whose initializer is constant.
+///
+/// ⛔ IT IS e246 AND IT IS NOT PORTED YET, so the only honest body is the one below. `None` collapses
+/// the caller's `!outer_loop || outer_loop_iter_arg_idx == -1` refusal (`:251`); the tuple's third
+/// element, the chain's trip-count product, has no reader here.
+fn outermost_const_initialization(iter_arg: Val, scope: &[Op]) -> Option<(Val, usize)> {
+    let _ = (iter_arg, scope);
+    todo!(
+        "getOutermostConstInitialization (senpass e246, transform/sentient/utils) is not ported yet \
+         — the inner-to-outer iter-arg chain walk, its constant-bound trip-count product and its \
+         one-use/ForOp-user refusals (Transform/Sentient/Utils.cpp:469-523) are what this delegates \
+         to (ToggleReordering.cpp:248)"
+    )
+}
+
+/// `dcc::utils::getIndexOfLoopRegionIterArgs` (`Analyses/Utils.cpp:257`) — the owning `sentient.for`
+/// and the position of `val` in its `getRegionIterArgs()`.
+///
+/// ⛔ THE INDUCTION VARIABLE ANSWERS `-1`: `getRegionIterArgs()` is the body arguments with the
+/// induction variable dropped, so position 0 of [`parent_for_arg`] is in no iter-arg list.
+fn index_of_loop_region_iter_args(val: Val, scope: &[Op]) -> Option<(&Op, usize)> {
+    let (op, index) = parent_for_arg(val, scope)?;
+    Some((op, index.checked_sub(1)?))
+}
+
+/// One `sentient.for`'s `getIterOperands()[carried]`, the loop named by its induction variable.
+fn carried_init(scope: &[Op], iv: Val, carried: usize) -> Option<Val> {
+    fn walk(scope: &[Op], iv: Val) -> Option<&[sentient::Carried]> {
+        for op in scope {
+            if let Op::Sentient(sentient::Op::For {
+                iv: at,
+                carried,
+                body,
+                ..
+            }) = op
+            {
+                if *at == iv {
+                    return Some(carried);
+                }
+                if let Some(found) = walk(body, iv) {
+                    return Some(found);
+                }
+            } else if let Op::Sentient(inner) = op {
+                for region in sentient::regions(inner) {
+                    if let Some(found) = walk(region, iv) {
+                        return Some(found);
+                    }
+                }
+            } else if let Op::AffineFor(loop_op) = op
+                && let Some(found) = walk(&loop_op.body, iv)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(scope, iv)
+        .and_then(|list| list.get(carried))
+        .map(|carried| carried.init)
+}
+
+/// `dcc::utils::isConstant<sentient::ConstantOp>` (`dcc/src/Utils/Utils.cpp:424`) — a
+/// `sentient.scalar_constant`, or a `uniform.query_map` whose mapping answers with nothing else.
+///
+/// ⛔ A REGION ARGUMENT IS NOT CONSTANT — the `isa<BlockArgument>` refusal at `:426`, which here is
+/// simply having no defining op.
+fn is_sentient_constant(val: Val, scope: &[Op]) -> bool {
+    let is_scalar_constant =
+        |op: Option<&Op>| matches!(op, Some(Op::Sentient(sentient::Op::ScalarConstant { .. })));
+    match defining_op(val, scope) {
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => match defining_op(*map, scope) {
+            Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => {
+                !pairs.is_empty()
+                    && pairs
+                        .iter()
+                        .all(|(_, value)| is_scalar_constant(defining_op(*value, scope)))
+            }
+            _ => false,
+        },
+        other => is_scalar_constant(other),
+    }
+}
 
 // crustify:todo: e390_runOn
 //   authority : dcc/src/Transform/Sentient/ToggleReordering.cpp:200  (21 body lines, level 1)
@@ -101,3 +283,135 @@ pub(crate) mod toggle_info;
 //   original  : void runOnOperation()
 //   calls     : e390_runOn, e481_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{SubOp, compute_toggle_info_if_is_toggle};
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::transform::sentient::analyses::OutOfScopeEvaluator;
+
+    /// The candidate: `%31 = sentient.scalar_sub %30, %20`.
+    const SUB: SubOp = SubOp {
+        minuend: Val(30),
+        subtrahend: Val(20),
+        result: Val(31),
+        ty: ScalarTy::Index,
+    };
+
+    /// One carried value, at the register defaults a fixture needs none of.
+    fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
+        sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Imm,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// `%30 = sentient.scalar_constant`, then a loop carrying `%20` whose body holds the toggle and
+    /// `yields` the ops of `body` after it.
+    fn unit(minuend: Op, body: Vec<Op>) -> Vec<Op> {
+        vec![
+            minuend,
+            Op::Sentient(sentient::Op::For {
+                iv: Val(11),
+                bound: Val(12),
+                carried: vec![carried(Val(2), Val(20), Val(21))],
+                dbg_name: None,
+                body,
+            }),
+        ]
+    }
+
+    /// `%31 = sentient.scalar_sub %30, %20 : index`.
+    fn toggle() -> Op {
+        Op::Sentient(sentient::Op::ScalarSub {
+            lhs: Val(30),
+            rhs: Val(20),
+            result: Val(31),
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    /// `%30 = sentient.scalar_constant 7 : index`.
+    fn constant() -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value: 7,
+            result: Val(30),
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// 🎯 e233 — each of the three criteria the doc comment lists (`:159-165`) refuses on its own.
+    #[test]
+    fn a_sub_that_misses_any_criterion_is_not_a_toggle() {
+        let yields_the_toggle = || {
+            Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(31)],
+            })
+        };
+        // A minuend that is not constant — a `scalar_add` defines `%30` instead.
+        let not_constant = Op::Sentient(sentient::Op::ScalarAdd {
+            lhs: Val(0),
+            rhs: Val(0),
+            result: Val(30),
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        });
+        // A second reader of the iter arg — `!iter_arg.hasOneUse()`.
+        let second_reader = Op::Sentient(sentient::Op::ScalarAdd {
+            lhs: Val(20),
+            rhs: Val(20),
+            result: Val(32),
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        });
+        // A yield carrying something else at the iter arg's index.
+        let yields_other = Op::Sentient(sentient::Op::Yield {
+            results: vec![Val(2)],
+        });
+        for unit_body in [
+            unit(not_constant, vec![toggle(), yields_the_toggle()]),
+            unit(
+                constant(),
+                vec![toggle(), second_reader, yields_the_toggle()],
+            ),
+            unit(constant(), vec![toggle(), yields_other]),
+            // And a subtrahend that is no loop iter arg at all: `%12` is the bound, not an argument.
+            unit(constant(), vec![yields_the_toggle()]),
+        ] {
+            assert_eq!(
+                compute_toggle_info_if_is_toggle(&mut OutOfScopeEvaluator, &unit_body, SUB),
+                None
+            );
+        }
+    }
+
+    /// 🎯 e233 — a candidate that passes every ported criterion reaches the one guard that is not
+    /// ported, which is `e246_getOutermostConstInitialization`.
+    #[test]
+    #[should_panic(expected = "getOutermostConstInitialization (senpass e246")]
+    fn a_real_toggle_reaches_the_unported_outer_initializer_walk() {
+        let unit_body = unit(
+            constant(),
+            vec![
+                toggle(),
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(31)],
+                }),
+            ],
+        );
+        let _ = compute_toggle_info_if_is_toggle(&mut OutOfScopeEvaluator, &unit_body, SUB);
+    }
+}

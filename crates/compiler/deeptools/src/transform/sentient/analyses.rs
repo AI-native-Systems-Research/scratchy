@@ -143,6 +143,19 @@ pub trait ExpressionEvaluator {
     /// evaluated.
     fn evaluate_sum(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation;
 
+    /// `ExpressionEvaluator::evaluateSub` (`Analyses/ExpressionEvaluatorUtils.h:260`) — the
+    /// evaluation of `lhs - rhs`, which is how a reordered toggle turns `minuend - init` into the
+    /// loop's new initializer (`ToggleReordering.cpp:128-129`).
+    ///
+    /// ⭐ DEFAULTED, like [`ExpressionEvaluator::build_offset_value_of`]: the out-of-scope refusal is
+    /// stated once, and a test double for a pass that only ever sums need not repeat it.
+    fn evaluate_sub(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation {
+        let _ = (lhs, rhs);
+        todo!(
+            "ExpressionEvaluator::evaluateSub (Analyses/ExpressionEvaluatorUtils.h:260) — out of campaign scope"
+        )
+    }
+
     /// `EvaluatedValue::buildOffsetValue` (`Analyses/ExpressionEvaluatorUtils.h:126`) — materialises
     /// the offset as a value, creating ops in `sites` (`walked` when `sites.query_maps` is `None`).
     fn build_offset_value(
