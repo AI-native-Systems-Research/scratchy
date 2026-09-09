@@ -159,7 +159,6 @@
 //! | `e370_buildAndPropagateFold` | 370 | 5 | 350 | `Ddc` | `ddc/ddc_fold.cpp:1625` |
 //! | `e375_coordinateCapture` | 375 | 6 | 86 | `Ddc` | `ddc/ddc_fold.cpp:1538` |
 
-
 // crustify:todo: e078_dbgPrint
 //   authority : ddc/ddc_fold.cpp:20  (25 body lines, level 0)
 //   original  : void dbgPrint(const dsc2::ComputeNode *computeNode)
@@ -448,6 +447,8 @@ pub enum FoldLabel {
     CoreWorksliceFoldDim,
     /// `"elem_arr_layout_split"` (`:400`).
     ElemArrLayoutSplit,
+    /// `"rowsplit_fold"` (`:2158,2172`).
+    RowSplitFold,
 }
 
 impl FoldLabel {
@@ -458,6 +459,7 @@ impl FoldLabel {
             Self::CoreletFoldDim => "corelet_fold_dim",
             Self::CoreWorksliceFoldDim => "core_workslice_fold_dim",
             Self::ElemArrLayoutSplit => "elem_arr_layout_split",
+            Self::RowSplitFold => "rowsplit_fold",
         }
     }
 }
@@ -1379,16 +1381,202 @@ mod tests_e086_e093 {
     }
 }
 
-// crustify:todo: e094_getDefaultRowSplitFold
-//   authority : ddc/ddc_fold.cpp:2154  (6 body lines, level 0)
-//   original  : void getDefaultRowSplitFold(dsc2::FoldParamInfoType &resultFoldParams)
-//   extract   : crustify-ddc/cpp/ddc.cpp:810-816
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The two units that produce a fold-params list.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
 
-// crustify:todo: e095_gatherFoldParams
-//   authority : ddc/ddc_fold.cpp:2224  (12 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::gatherFoldParams(const FoldManager<CoordinateBaseType> &cfm, std::vector<dsc2::FoldParamInfoType> &foldParams)
-//   extract   : crustify-ddc/cpp/ddc.cpp:826-839
+/// WHICH SLOT OF A FOLD-PARAMS LIST — `dsc2::CoordinateFoldPosition` (`dsc/dsc2.h:73`).
+///
+/// ⛔ THE FIRST THREE POSITIONS ARE ROLES, NOT ARRIVAL ORDER. ddc reads them back as
+/// `FOLD_POS_CORE` = 0, `FOLD_POS_CORELET` = 1, `FOLD_POS_ROWSPLIT` = 2 (`ddc/ddc_fold.cpp:12-16`)
+/// and assigns that slot directly — `foldParams.at(FOLD_POS_ROWSPLIT) = ..` (`:2589,3425`). With the
+/// role in a type, a literal `2` is not what selects the rowsplit fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldPosition {
+    /// `Core = 0`.
+    Core,
+    /// `Corelet = 1`.
+    Corelet,
+    /// `RowSplit = 2`.
+    RowSplit,
+}
+
+impl FoldPosition {
+    /// The slot's index in a [`gather_fold_params`] list.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            FoldPosition::Core => 0,
+            FoldPosition::Corelet => 1,
+            FoldPosition::RowSplit => 2,
+        }
+    }
+}
+
+/// `FoldManager<CoordinateBaseType>` (`util/foldManager/foldInfrastructure.h:2262`) reduced to what
+/// entry 095 reads out of it.
+///
+/// ⛔ AFFINE IN THE NAME BECAUSE THAT RETIRES A `DT_ERROR`. `getAlphaBeta` refuses any dimension
+/// whose `BaseFuncType` is not `Affine` — *"Cannot query beta in non affine fold func"* (`:2431`) —
+/// so a `Map`, `Constant` or `WkSplit` dimension aborts the compiler there. A holder whose dims are
+/// not all affine cannot implement this trait; the classification is
+/// [`crate::bridges::superdsc_to_dataflow_ir::driver::FoldDimFunc`].
+///
+/// ⚠️ THE FOLD MANAGER ITSELF IS OUT OF SCOPE (`util/foldManager/`, a recorded outside dependency of
+/// 14 units), so the walk that reaches one belongs to the caller.
+pub trait AffineFoldDims {
+    /// `getNumDims()` (`:2270`).
+    fn num_dims(&self) -> usize;
+
+    /// `getAlphaBeta(alpha, beta, dim)` (`:2422`).
+    ///
+    /// ⛔ ONE α/β PAIR PER LEVEL, AND IT IS THE FIRST CHILD'S: the reference collects every fold
+    /// function at the level and reads `*ffs_at_pos.begin()` (`:2437-2440`), so a level whose
+    /// children disagree reports only the first — its answer, not an approximation of it.
+    fn alpha_beta(&self, dim: usize) -> (Alpha, Beta);
+
+    /// `getFoldDimSize(dim)` — `FoldDimProp::factor_` (`:126,2631`).
+    fn dim_size(&self, dim: usize) -> Cardinality;
+
+    /// `getFoldDimProp(dim)->Label()` (`:127,2624`); `None` is the empty label.
+    fn dim_label(&self, dim: usize) -> Option<FoldLabel>;
+}
+
+/// Replaces: e094_getDefaultRowSplitFold
+///
+/// THE IDENTITY ROWSPLIT FOLD — one fold index, contributing no coordinate at all
+/// (`ddc/ddc_fold.cpp:2154`).
+///
+/// ⛔ IT RETURNS A VALUE RATHER THAN TAKING `&mut`, because the reference overwrites all four fields
+/// of its out-parameter and its three callers read nothing out of the old value: one hands it a
+/// default-constructed local (`:2169`) and two hand it an existing slot (`:2593,3429`). Assigning
+/// [`FoldPosition::RowSplit`]'s slot is the whole effect.
+///
+/// ⛔ `alpha = 0` IS THE NO-OP, and `FoldParamInfoType`'s own `alpha = 1` default is not it.
+#[must_use]
+pub const fn default_row_split_fold() -> FoldParamInfo {
+    FoldParamInfo {
+        alpha: Alpha(0),
+        beta: Beta(0),
+        cardinality: Cardinality(1),
+        label: Some(FoldLabel::RowSplitFold),
+    }
+}
+
+/// Replaces: e095_gatherFoldParams
+///
+/// A FOLD MANAGER'S DIMENSIONS AS A FOLD-PARAMS LIST, in ascending dimension order
+/// (`ddc/ddc_fold.cpp:2224`).
+///
+/// ⛔ THE ORDER IS LOAD-BEARING, NOT INCIDENTAL. Callers index the result by role —
+/// `foldParams.at(FOLD_POS_ROWSPLIT)` (`:3142`) — and re-add folds walking it BACKWARDS because
+/// `addFold(.., pos = 0)` inserts at the front (`:3267-3279`). See [`FoldPosition`].
+///
+/// ⛔ IT RETURNS THE LIST INSTEAD OF APPENDING TO ONE. The reference `push_back`s into an
+/// out-parameter, and all ten call sites pass a vector that is empty at that instant — eight freshly
+/// declared (`:499,621,2531,2997,3142,3413`, `L3DlOpsScheduler.cpp:7396,7617`) and two `clear()`ed
+/// on the two lines above (`:1343-1346`). The appending mode has no caller, so it is not offered.
+///
+/// ⚠️ ITS L3 TWIN IS A SEPARATE UNIT. `L3DlOpsScheduler::gatherFoldParams`
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7248`) is this function character for character and
+/// is scheduled as `e061_gatherFoldParams`; when it lands it delegates here.
+#[must_use]
+pub fn gather_fold_params<F: AffineFoldDims + ?Sized>(fold_manager: &F) -> Vec<FoldParamInfo> {
+    (0..fold_manager.num_dims())
+        .map(|dim| {
+            let (alpha, beta) = fold_manager.alpha_beta(dim);
+            FoldParamInfo {
+                alpha,
+                beta,
+                cardinality: fold_manager.dim_size(dim),
+                label: fold_manager.dim_label(dim),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests_e094_e095 {
+    use super::{
+        AffineFoldDims, Alpha, Beta, Cardinality, FoldLabel, FoldParamInfo, FoldPosition,
+        default_row_split_fold, gather_fold_params,
+    };
+
+    /// A fold manager's dimensions, outermost first, as its four getters report them.
+    struct Dims(Vec<(Alpha, Beta, Cardinality, Option<FoldLabel>)>);
+
+    impl AffineFoldDims for Dims {
+        fn num_dims(&self) -> usize {
+            self.0.len()
+        }
+        fn alpha_beta(&self, dim: usize) -> (Alpha, Beta) {
+            (self.0[dim].0, self.0[dim].1)
+        }
+        fn dim_size(&self, dim: usize) -> Cardinality {
+            self.0[dim].2
+        }
+        fn dim_label(&self, dim: usize) -> Option<FoldLabel> {
+            self.0[dim].3
+        }
+    }
+
+    /// e094: the identity fold the reference's own comment claims (`ddc/ddc_fold.cpp:2164-2165`) —
+    /// one fold index, no coordinate, which `FoldParamInfoType`'s `alpha = 1` default is not.
+    #[test]
+    fn the_default_rowsplit_fold_is_the_identity_fold() {
+        assert_eq!(
+            default_row_split_fold(),
+            FoldParamInfo {
+                alpha: Alpha(0),
+                beta: Beta(0),
+                cardinality: Cardinality(1),
+                label: Some(FoldLabel::RowSplitFold),
+            }
+        );
+    }
+
+    /// e095: the list comes back in ascending dimension order, so the roles ddc reads it back by
+    /// (`FOLD_POS_CORE`/`CORELET`/`ROWSPLIT`, `ddc/ddc_fold.cpp:12-16`) land in those slots.
+    #[test]
+    fn gathered_params_keep_the_fold_managers_dimension_order() {
+        let fold_manager = Dims(vec![
+            (
+                Alpha(64),
+                Beta(0),
+                Cardinality(32),
+                Some(FoldLabel::CoreWorksliceFoldDim),
+            ),
+            (
+                Alpha(-8),
+                Beta(4),
+                Cardinality(2),
+                Some(FoldLabel::CoreletFoldDim),
+            ),
+            (
+                Alpha(0),
+                Beta(0),
+                Cardinality(1),
+                Some(FoldLabel::RowSplitFold),
+            ),
+        ]);
+
+        let params = gather_fold_params(&fold_manager);
+
+        assert_eq!(params.len(), 3);
+        assert_eq!(
+            params[FoldPosition::Core.index()].cardinality,
+            Cardinality(32)
+        );
+        // A negative alpha survives as a step rather than being taken for a size.
+        assert_eq!(params[FoldPosition::Corelet.index()].alpha, Alpha(-8));
+        assert_eq!(params[FoldPosition::Corelet.index()].beta, Beta(4));
+        // The outermost slot ddc assigns by role is the one e094 mints.
+        assert_eq!(
+            params[FoldPosition::RowSplit.index()],
+            default_row_split_fold()
+        );
+    }
+}
 
 // crustify:todo: e233_dbgPrint
 //   authority : ddc/ddc_fold.cpp:63  (11 body lines, level 1)
