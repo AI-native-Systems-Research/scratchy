@@ -1117,7 +1117,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`327/384 ported; 327/384 audited`
+`333/384 ported; 333/384 audited`
 
 ⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
 COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
@@ -3408,18 +3408,18 @@ list.
 - [ ] **AUDIT 349/384** `isLoopInvariant` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:681`, line by line against the C++
 - [ ] **PORT 350/384** `matchAndRewrite` — `dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, 170 lines
 - [ ] **AUDIT 350/384** `matchAndRewrite` — `dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, line by line against the C++
-- [ ] **PORT 351/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226`, 70 lines
-- [ ] **AUDIT 351/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226`, line by line against the C++
-- [ ] **PORT 352/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201`, 25 lines
-- [ ] **AUDIT 352/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201`, line by line against the C++
-- [ ] **PORT 353/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:229`, 24 lines
-- [ ] **AUDIT 353/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:229`, line by line against the C++
-- [ ] **PORT 354/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:256`, 39 lines
-- [ ] **AUDIT 354/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:256`, line by line against the C++
-- [ ] **PORT 355/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298`, 54 lines
-- [ ] **AUDIT 355/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298`, line by line against the C++
-- [ ] **PORT 356/384** `transform` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:592`, 39 lines
-- [ ] **AUDIT 356/384** `transform` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:592`, line by line against the C++
+- [x] **PORT 351/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226`, 70 lines
+- [x] **AUDIT 351/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226`, line by line against the C++
+- [x] **PORT 352/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201`, 25 lines
+- [x] **AUDIT 352/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201`, line by line against the C++
+- [x] **PORT 353/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:229`, 24 lines
+- [x] **AUDIT 353/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:229`, line by line against the C++
+- [x] **PORT 354/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:256`, 39 lines
+- [x] **AUDIT 354/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:256`, line by line against the C++
+- [x] **PORT 355/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298`, 54 lines
+- [x] **AUDIT 355/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298`, line by line against the C++
+- [x] **PORT 356/384** `transform` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:592`, 39 lines
+- [x] **AUDIT 356/384** `transform` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:592`, line by line against the C++
 
 ## Level 7
 

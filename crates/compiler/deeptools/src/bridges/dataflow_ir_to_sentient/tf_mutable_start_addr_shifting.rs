@@ -70,12 +70,23 @@
 //! | `e355_transformCompIndLoadAndStore` | 355/384 | 54 | `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298` |
 //! | `e372_runOnOperation` | 372/384 | 69 | `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130` |
 
-use super::agen_access_details::{AccessDetailsAffine, LayoutCoeff};
-use super::tf_mutable_addr_splitting::{AddrRange, ConstStartMemView, L3Half};
+use super::agen_access_details::{
+    AccessDetailsAffine, AccessDetailsAffineComposite, ConstructedDetails, LayoutCoeff,
+    MemoryOperandIndex,
+};
+use super::tf_mutable_addr_splitting::{
+    AddrRange, ConstStartMemView, L3Half, MasCandidate, SplitCandidateView,
+    clone_composite_indirect_with_new_access_info, clone_composite_with_new_access_info,
+};
+use super::tf_transform_paged_mem_view_impl::{
+    VectorLoadOp, VectorStoreOp, clone_load_with_new_access_info,
+    clone_store_with_new_access_info, indices_from_map,
+};
 use crate::arch::{Arch, Elements, IsaGen};
 use crate::islands::dataflow_ir::Values;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, arith};
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, agen, arith, dataflow, uses};
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap};
+use crate::units::DfirUnit;
 use core::cmp::Reverse;
 use core::num::{NonZeroU32, NonZeroU64};
 
@@ -956,14 +967,419 @@ pub fn shift_mutable_addr<A: Arch>(
     Some(apply_shifts(vals, &shifts, inputs, view))
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 352/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT ONE SHIFTED TRANSFER LEAVES BEHIND — the three ops the pass emits, and the one it erases.
+///
+/// ⛔ `start_address` IS HOISTED OUT OF THE UNIT: `updateMemViewStartAddress`'s const builder sits at
+/// the `dataflow.program_unit`, which is why the vendor's `%c33856` prints at function scope while
+/// the view it feeds stays inside two `affine.for`s
+/// (`Transform/MutableStartAddrShifting/mutable_start_addr_shift_full.mlir:22`, `:26`).
+/// ⛔ AND `mem_view` KEEPS THE ORIGINAL'S RESULT [`Val`]: the reference ASSIGNS the new start into the
+/// existing view op rather than cloning it, so nothing that reads that view is re-pointed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShiftedTransfer<'s> {
+    /// `arith.constant <start + total>`, at unit scope.
+    pub start_address: DfirOp,
+    /// The view rebuilt on it, under its own result — see this type's banner.
+    pub mem_view: DfirOp,
+    /// The transfer rebuilt on the shifted subscripts, where the erased one was.
+    pub mem_op: DfirOp,
+    /// `if (!op->use_empty()) op->replaceAllUsesWith(new_mem_op);` — (old result, new result). Only
+    /// entry 352 can have one: a store and both composites bind nothing.
+    pub replaced: Option<(Val, Val)>,
+    /// `op->erase();` — the transfer alone. Its use chain stays and is re-pointed.
+    pub erased: &'s DfirOp,
+    /// What the shift moved the immutable address by, in elements.
+    pub total: TotalShift,
+}
+
+/// WHAT THE FOUR TRANSFORMS ANSWER — one shifted transfer, or what the reference stopped on.
+///
+/// ⛔ NOT AN ERROR TYPE. [`Self::NoShiftRequired`] is the reference's own early return for an access
+/// with nothing to move (`:216`), [`Self::IndirectIsOnTheShiftedSide`] is entry 355's (`:305-310`),
+/// and the four class variants are its opening `DT_CHECK`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutableStartAddrShift<'s> {
+    /// The shift, applied.
+    Shifted(ShiftedTransfer<'s>),
+    /// *"If the new subscripts map is empty that means there was no shifting required."*
+    NoShiftRequired,
+    /// `DT_CHECK(dyn_cast<agen::VectorLoadOp>(candidate.op_))`.
+    NotAVectorLoad,
+    /// `DT_CHECK(dyn_cast<agen::VectorStoreOp>(candidate.op_))`.
+    NotAVectorStore,
+    /// `DT_CHECK(dyn_cast<agen::CompositeLoadAndStoreOp>(candidate.op_))`.
+    NotACompositeLoadAndStore,
+    /// `DT_CHECK(dyn_cast<agen::CompositeIndirectLoadAndStoreOp>(candidate.op_))`.
+    NotACompositeIndirectLoadAndStore,
+    /// *"The memory operands on the side of the indirect must have a 0 immutable address so no
+    /// shifting can be done."*
+    IndirectIsOnTheShiftedSide(MemoryOperandIndex),
+    /// `DT_CHECK(succeeded(ad.constructDetails(candidate.mem_index_)))`.
+    DetailsNotConstructed(ConstructedDetails),
+    /// The access details are complete but carry no subscripts map or element width — see
+    /// [`ShiftInputs::of`].
+    ShiftInputsNotReadable,
+    /// `cast<dataflow::GetLogicalMemoryViewOp>` (entries 352/353) or the
+    /// `DT_CHECK(dyn_cast_or_null<..>)` on `ad.getMemRef()` (entries 354/355).
+    MemRefIsNotAMemoryView,
+    /// The view's start address is not an `arith.constant` — a seam of [`ConstStartMemView`], not of
+    /// these four functions: the vendor's query-map, toggle and conditional start addresses all land
+    /// here, and `shiftMutableAddr`'s own `hasValidL3ImmutableAddr` admits them.
+    MemViewStartIsNotConstant,
+    /// `getMaxImmutableRange`'s `DT_CHECK(is_any_of(comp, L3LU, L3SU))`, reached through
+    /// [`calculate_shifts`]. ⚠️ ASKED EARLIER THAN THE REFERENCE ASKS IT — `calculateShifts` only
+    /// reaches that range on a NON-zero constant offset (`:433`) — and unreachable either way:
+    /// `runOnOperation`'s own component gate (`:149-150`) admits none but those two.
+    CandidateIsNotOnAnL3Half(DfirUnit),
+}
+
+/// `updateMemViewStartAddress` ARM ONE, **IN PLACE** — the view on its new start address, keeping its
+/// own result for the reason [`ShiftedTransfer`] gives.
+/// [`super::tf_mutable_addr_splitting::create_new_mem_view_with_mod`] is the same arm for a CLONE and
+/// tables the other three; ⛔ unlike there, they are reachable from here — `hasValidL3ImmutableAddr`
+/// (`Dialect/Agen/Utils.cpp:140`) admits a `subi` toggle and an `scf.if` tree, and this island's
+/// [`ConstStartMemView`] cannot spell either.
+fn mem_view_with_start(result: Val, view: &ConstStartMemView<'_>, start: Val) -> DfirOp {
+    DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+        result,
+        from: view.from,
+        start,
+        layout: view.layout.clone(),
+        ty: view.ty.clone(),
+    })
+}
+
+/// WHAT THE FOUR TRANSFORMS SHARE BETWEEN THEIR OPENING CAST AND THEIR CLONE — the view, the L3 half,
+/// the shift inputs and [`shift_mutable_addr`], in the reference's order (`:210-217`, `:238-245`,
+/// `:270-281`, `:317-328`, line for line the same).
+enum ShiftOfOneAccess<'s> {
+    /// The split side's view, and the shift applied to it.
+    Shifted(ConstStartMemView<'s>, ShiftedMemView),
+    /// The reference returned, or aborted, before the clone.
+    Stopped(MutableStartAddrShift<'s>),
+}
+
+/// The four transforms' shared middle — see [`ShiftOfOneAccess`].
+fn shift_one_access<'s, A: Arch>(
+    vals: &mut Values,
+    candidate: &MasCandidate<'s>,
+    ad: &AccessDetailsAffine<'_>,
+    mem_ref: Val,
+    scope: &'s [DfirOp],
+) -> ShiftOfOneAccess<'s> {
+    let view = match SplitCandidateView::resolve(mem_ref, scope) {
+        SplitCandidateView::ConstantStart(view) => view,
+        SplitCandidateView::NonConstantStart => {
+            return ShiftOfOneAccess::Stopped(MutableStartAddrShift::MemViewStartIsNotConstant);
+        }
+        SplitCandidateView::NotAMemoryView => {
+            return ShiftOfOneAccess::Stopped(MutableStartAddrShift::MemRefIsNotAMemoryView);
+        }
+    };
+    // `getMaxImmutableRange(ad.getComp())`'s own `DT_CHECK`, reached from `calculateShifts`.
+    let Some(half) = L3Half::of(candidate.comp) else {
+        return ShiftOfOneAccess::Stopped(MutableStartAddrShift::CandidateIsNotOnAnL3Half(
+            candidate.comp,
+        ));
+    };
+    let Some(inputs) = ShiftInputs::of::<A>(ad) else {
+        return ShiftOfOneAccess::Stopped(MutableStartAddrShift::ShiftInputsNotReadable);
+    };
+    // `shiftMutableAddr(candidate.unit_, op, mem_view_op, ad)`, then *"if the new subscripts map is
+    // empty that means there was no shifting required."*
+    match shift_mutable_addr::<A>(vals, &inputs, half, &view) {
+        Some(shifted) => ShiftOfOneAccess::Shifted(view, shifted),
+        None => ShiftOfOneAccess::Stopped(MutableStartAddrShift::NoShiftRequired),
+    }
+}
+
+/// Replaces: e352_transformVectorLoad
+///
+/// **352/384** `MutableStartAddrShiftingPass::transformVectorLoad` —
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201` (28L): move what fits of one
+/// `agen.vector_load`'s constant offset out of its subscripts and into its view's start address.
+///
+/// ⛔ THE CONSUMERS ARE RE-POINTED, NOT CLONED (`:222`): `replaceAllUsesWith` where entry 306's split
+/// needs `cloneUseChainToNewOp`, because one load still becomes exactly one load here.
+#[must_use]
+pub fn transform_vector_load<'s, A: Arch>(
+    vals: &mut Values,
+    candidate: &MasCandidate<'s>,
+    scope: &'s [DfirOp],
+) -> MutableStartAddrShift<'s> {
+    // `auto op = dyn_cast<agen::VectorLoadOp>(candidate.op_); DT_CHECK(op);`
+    let (Some(op), DfirOp::Agen(agen_op)) = (VectorLoadOp::of(candidate.op), candidate.op) else {
+        return MutableStartAddrShift::NotAVectorLoad;
+    };
+
+    // "Collect the relevant access details." — `access_details.emplace_insert(mem_index, op, comp)`
+    // then `DT_CHECK(succeeded(ad.constructDetails(mem_index)))`. ⚠️ THE CONTAINER IS MECHANISM, as
+    // entry 306 records: it memoises one record per memory operand and a vector load has one.
+    let mut ad = AccessDetailsAffine::new(agen_op, candidate.comp);
+    let details = ad.construct_details(candidate.mem_index, scope);
+    if details != ConstructedDetails::Complete {
+        return MutableStartAddrShift::DetailsNotConstructed(details);
+    }
+
+    // `cast<dataflow::GetLogicalMemoryViewOp>(op.getMemRef().getDefiningOp())`, then the shift.
+    let (view, shifted) = match shift_one_access::<A>(vals, candidate, &ad, op.view, scope) {
+        ShiftOfOneAccess::Shifted(view, shifted) => (view, shifted),
+        ShiftOfOneAccess::Stopped(stopped) => return stopped,
+    };
+
+    // `op.cloneWithNewAccessInfo(builder, mem_view_op, new_subscripts_map, ad.getIndices())` — the
+    // SAME view value, which is why `mem_view` below keeps its result.
+    let result = vals.mint();
+    let mem_op = clone_load_with_new_access_info(
+        op,
+        result,
+        op.view,
+        view.ty.clone(),
+        indices_from_map(&shifted.subscripts_map, &ad.base.indices),
+    );
+
+    MutableStartAddrShift::Shifted(ShiftedTransfer {
+        start_address: shifted.start_address,
+        mem_view: mem_view_with_start(op.view, &view, shifted.start),
+        mem_op,
+        // `if (!op->use_empty()) op->replaceAllUsesWith(new_mem_op);`
+        replaced: (!uses(op.result, scope).is_empty()).then_some((op.result, result)),
+        // `op->erase();`
+        erased: candidate.op,
+        total: shifted.total,
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 353/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e353_transformVectorStore
+///
+/// **353/384** `MutableStartAddrShiftingPass::transformVectorStore` —
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:229` (27L): entry 352 for an
+/// `agen.vector_store`, which is entry 352 minus the re-pointing — a store binds nothing.
+///
+/// ⚠️ ITS `mem_index_` IS `kDirSrc`, NOT `kDirDst`: the collection's `else` arm hands every
+/// non-composite candidate the SOURCE index (`:172`), and the access details read the store's one
+/// memref either way.
+#[must_use]
+pub fn transform_vector_store<'s, A: Arch>(
+    vals: &mut Values,
+    candidate: &MasCandidate<'s>,
+    scope: &'s [DfirOp],
+) -> MutableStartAddrShift<'s> {
+    // `auto op = dyn_cast<agen::VectorStoreOp>(candidate.op_); DT_CHECK(op);`
+    let (Some(op), DfirOp::Agen(agen_op)) = (VectorStoreOp::of(candidate.op), candidate.op) else {
+        return MutableStartAddrShift::NotAVectorStore;
+    };
+
+    // "Collect the relevant access details." — entry 352's, container and all.
+    let mut ad = AccessDetailsAffine::new(agen_op, candidate.comp);
+    let details = ad.construct_details(candidate.mem_index, scope);
+    if details != ConstructedDetails::Complete {
+        return MutableStartAddrShift::DetailsNotConstructed(details);
+    }
+
+    // `cast<dataflow::GetLogicalMemoryViewOp>(op.getMemRef().getDefiningOp())`, then the shift.
+    let (view, shifted) = match shift_one_access::<A>(vals, candidate, &ad, op.view, scope) {
+        ShiftOfOneAccess::Shifted(view, shifted) => (view, shifted),
+        ShiftOfOneAccess::Stopped(stopped) => return stopped,
+    };
+
+    MutableStartAddrShift::Shifted(ShiftedTransfer {
+        start_address: shifted.start_address,
+        mem_view: mem_view_with_start(op.view, &view, shifted.start),
+        // `(void)op.cloneWithNewAccessInfo(builder, mem_view_op, new_subscripts_map,
+        //  ad.getIndices());` — ⭐ THE `(void)` DISCARDS THE HANDLE, NOT THE OP: the builder has
+        // already inserted it where the store was.
+        mem_op: clone_store_with_new_access_info(
+            op,
+            op.view,
+            indices_from_map(&shifted.subscripts_map, &ad.base.indices),
+        ),
+        // A store has no result, so the reference has no `replaceAllUsesWith` to make.
+        replaced: None,
+        // `op->erase();`
+        erased: candidate.op,
+        total: shifted.total,
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 354/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e354_transformCompLoadAndStore
+///
+/// **354/384** `MutableStartAddrShiftingPass::transformCompLoadAndStore` —
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:256` (41L): entries 352/353 for one side
+/// of an `agen.composite_load_and_store`, the OTHER side's view, map and operands passed through.
+///
+/// ⛔ THE VIEW COMES OFF `ad.getMemRef()`, NOT OFF THE OP (`:268-270`): a composite has two memrefs
+/// and only the record built for `candidate.mem_index_` knows which one is the HBM side. Its
+/// `dyn_cast_or_null` is [`MutableStartAddrShift::MemRefIsNotAMemoryView`].
+#[must_use]
+pub fn transform_comp_load_and_store<'s, A: Arch>(
+    vals: &mut Values,
+    candidate: &MasCandidate<'s>,
+    scope: &'s [DfirOp],
+) -> MutableStartAddrShift<'s> {
+    // `auto op = dyn_cast<agen::CompositeLoadAndStoreOp>(candidate.op_); DT_CHECK(op);`
+    let DfirOp::Agen(agen_op) = candidate.op else {
+        return MutableStartAddrShift::NotACompositeLoadAndStore;
+    };
+    let agen::Op::CompositeLoadAndStore(transfer) = agen_op else {
+        return MutableStartAddrShift::NotACompositeLoadAndStore;
+    };
+
+    // "Collect the relevant access details." — the COMPOSITE record, whose `initialize` picks the
+    // operand `mem_index` names.
+    let mut ad = AccessDetailsAffineComposite::new(agen_op, candidate.comp);
+    let details = ad.construct_details(candidate.mem_index, scope);
+    if details != ConstructedDetails::Complete {
+        return MutableStartAddrShift::DetailsNotConstructed(details);
+    }
+
+    // `dyn_cast_or_null<dataflow::GetLogicalMemoryViewOp>(ad.getMemRef().getDefiningOp())`.
+    let Some(mem_ref) = ad.affine.base.mem_ref else {
+        return MutableStartAddrShift::MemRefIsNotAMemoryView;
+    };
+    let (view, shifted) = match shift_one_access::<A>(vals, candidate, &ad.affine, mem_ref, scope) {
+        ShiftOfOneAccess::Shifted(view, shifted) => (view, shifted),
+        ShiftOfOneAccess::Stopped(stopped) => return stopped,
+    };
+
+    // `op.cloneWithNewAccessInfo(builder, getSrcMemRef(), getDstMemRef(), <src map>, <dst map>,
+    //  <src indices>, <dst indices>, getTimeSet().getValue())` — the shifted side takes
+    // `new_subscripts_map` with `ad.getIndices()`, the other its own map and its own operands.
+    let shifted_side = indices_from_map(&shifted.subscripts_map, &ad.affine.base.indices);
+    let (src_indices, dst_indices) = if candidate.mem_index == MemoryOperandIndex::DirSrc {
+        (shifted_side, transfer.dst_indices.clone())
+    } else {
+        (transfer.src_indices.clone(), shifted_side)
+    };
+
+    MutableStartAddrShift::Shifted(ShiftedTransfer {
+        start_address: shifted.start_address,
+        mem_view: mem_view_with_start(mem_ref, &view, shifted.start),
+        mem_op: clone_composite_with_new_access_info(
+            vals,
+            transfer,
+            transfer.src,
+            src_indices,
+            transfer.dst,
+            dst_indices,
+            transfer.time_set.clone(),
+        ),
+        // A composite has no result.
+        replaced: None,
+        // `op->erase();`
+        erased: candidate.op,
+        total: shifted.total,
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 355/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e355_transformCompIndLoadAndStore
+///
+/// **355/384** `MutableStartAddrShiftingPass::transformCompIndLoadAndStore` —
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298` (55L): entry 354 for an
+/// `agen.composite_indirect_load_and_store`, refusing the side that carries the indirect.
+///
+/// ⛔ THE `getEmptyAffineMap()` THE SHIFTED SIDE'S INDIRECT MAP IS GIVEN (`:337`, `:349`) DESCRIBES
+/// NOTHING: the two early returns above guarantee that side has no indirect memref, so both arms hand
+/// both indirect accesses through unchanged. ⛔ AND THERE IS NO SLOT SWAP — entry 322's
+/// `clone_composite_indirect_with_new_access_info` moves a split indirect source into the destination
+/// slot; this one keeps every operand where the original had it.
+#[must_use]
+pub fn transform_comp_ind_load_and_store<'s, A: Arch>(
+    vals: &mut Values,
+    candidate: &MasCandidate<'s>,
+    scope: &'s [DfirOp],
+) -> MutableStartAddrShift<'s> {
+    // `auto op = dyn_cast<agen::CompositeIndirectLoadAndStoreOp>(candidate.op_); DT_CHECK(op);`
+    let DfirOp::Agen(agen_op) = candidate.op else {
+        return MutableStartAddrShift::NotACompositeIndirectLoadAndStore;
+    };
+    let agen::Op::CompositeIndirectLoadAndStore(transfer) = agen_op else {
+        return MutableStartAddrShift::NotACompositeIndirectLoadAndStore;
+    };
+
+    // *"The memory operands on the side of the indirect must have a 0 immutable address so no
+    // shifting can be done."* — `if (mem_index == kDirSrc && op.hasIndirectSrc()) return;` and its
+    // destination twin.
+    let indirect_on_this_side = match candidate.mem_index {
+        MemoryOperandIndex::DirSrc => transfer.indirect_src.is_some(),
+        MemoryOperandIndex::DirDst => transfer.indirect_dst.is_some(),
+        MemoryOperandIndex::IndSrc | MemoryOperandIndex::IndDst => false,
+    };
+    if indirect_on_this_side {
+        return MutableStartAddrShift::IndirectIsOnTheShiftedSide(candidate.mem_index);
+    }
+
+    // "Collect the relevant access details.", then `ad.getMemRef()` — entry 354's, unchanged.
+    let mut ad = AccessDetailsAffineComposite::new(agen_op, candidate.comp);
+    let details = ad.construct_details(candidate.mem_index, scope);
+    if details != ConstructedDetails::Complete {
+        return MutableStartAddrShift::DetailsNotConstructed(details);
+    }
+    let Some(mem_ref) = ad.affine.base.mem_ref else {
+        return MutableStartAddrShift::MemRefIsNotAMemoryView;
+    };
+    let (view, shifted) = match shift_one_access::<A>(vals, candidate, &ad.affine, mem_ref, scope) {
+        ShiftOfOneAccess::Shifted(view, shifted) => (view, shifted),
+        ShiftOfOneAccess::Stopped(stopped) => return stopped,
+    };
+
+    // The clone's twelve arguments, of which only the shifted side's map and operands are new.
+    let shifted_side = indices_from_map(&shifted.subscripts_map, &ad.affine.base.indices);
+    let (direct_src_indices, direct_dst_indices) =
+        if candidate.mem_index == MemoryOperandIndex::DirSrc {
+            (shifted_side, transfer.direct_dst_indices.clone())
+        } else {
+            (transfer.direct_src_indices.clone(), shifted_side)
+        };
+
+    MutableStartAddrShift::Shifted(ShiftedTransfer {
+        start_address: shifted.start_address,
+        mem_view: mem_view_with_start(mem_ref, &view, shifted.start),
+        mem_op: clone_composite_indirect_with_new_access_info(
+            vals,
+            transfer,
+            transfer.indirect_src.clone(),
+            transfer.direct_src,
+            direct_src_indices,
+            transfer.indirect_dst.clone(),
+            transfer.direct_dst,
+            direct_dst_indices,
+            transfer.time_set.clone(),
+        ),
+        // A composite has no result.
+        replaced: None,
+        // `op->erase();`
+        erased: candidate.op,
+        total: shifted.total,
+    })
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
     use crate::formats::Bits;
     use crate::generated::DataType;
-    use crate::islands::dataflow_ir::dialects::{Index, Val, agen};
-    use crate::islands::dataflow_ir::ty::{AffineExpr, ElemType, MemRef, Vector};
+    use crate::islands::dataflow_ir::dialects::{Index, Val, affine, agen};
+    use crate::islands::dataflow_ir::ty::{
+        AffineExpr, Constraint, ElemType, IntegerSet, MemRef, Vector,
+    };
     use crate::units::DfirUnit;
 
     /// 🎯 116/384 — THE DERIVED RANGE IS `2^bitSize * bytesPerStick * 8` ON EACH ARCH.
@@ -1944,13 +2360,680 @@ mod unit_tests {
             "every shift 0 is `AffineMap::get(ctx)` — the pass reports no shift"
         );
     }
+    /// 🎯 352/384 — ⭐⭐ IBM'S `full_shift_zero_const_start` KEY END TO END: ALL 33856 ELEMENTS OF
+    /// CONSTANT OFFSET LEAVE THE SUBSCRIPTS AND ARRIVE IN THE VIEW'S START ADDRESS.
+    ///
+    /// `mutable_start_addr_shift_full.mlir:137-158` in, `:22-27` out. ⛔ THE ACCESS IS THE VENDOR'S
+    /// TRANSPOSED, as entry 306's test is: this island derives the lane run on the LAST axis where the
+    /// key's `d2 * 256 + d1 * 64 + d0` puts it on `d0`, and its `?` extent is one vector wide here.
+    #[test]
+    fn the_full_shift_keys_whole_constant_offset_moves_into_the_start_address() {
+        let mut vals = Values::default();
+        let hbm = vals.mint();
+        let lx = vals.mint();
+        let start = vals.mint();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let src_view = vals.mint();
+        let dst_view = vals.mint();
+        let data = vals.mint();
+
+        let layout = AffineMap::linear(&[256, 64, 1]);
+        let ty = MemRef {
+            shape: vec![4, 64, 64],
+            elem: ElemType::F16,
+        };
+        let vec_ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let view = |result: Val, from: Val| {
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                layout: layout.clone(),
+                ty: ty.clone(),
+            })
+        };
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: start,
+                value: 0,
+            }),
+            // `affine.for %arg1 = 0 to 4 { affine.for %arg2 = 0 to 8 { .. } }`.
+            DfirOp::Affine(affine::Op::For {
+                iv: arg1,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: vec![DfirOp::Affine(affine::Op::For {
+                    iv: arg2,
+                    lo: affine::Bound::Const(0),
+                    hi: affine::Bound::Const(8),
+                    carried: Vec::new(),
+                    body: Vec::new(),
+                    dbg_name: None,
+                })],
+                dbg_name: None,
+            }),
+            view(src_view, hbm),
+            view(dst_view, lx),
+            // `%data = agen.vector_load %src_mem_view[%c64, %arg1 * 3 + %c16, %arg2 * 2 + %c128]`.
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: data,
+                view: src_view,
+                indices: vec![
+                    Index::Strided(vec![(arg2, 2)], 128),
+                    Index::Strided(vec![(arg1, 3)], 16),
+                    Index::Const(64),
+                ],
+                view_ty: ty.clone(),
+                ty: vec_ty,
+                multicast_info: None,
+            }),
+            // `agen.vector_store %data, %dst_mem_view[0, 0, 0]` — the one use that gets re-pointed.
+            DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                value: data,
+                view: dst_view,
+                indices: vec![Index::Const(0); 3],
+                view_ty: ty.clone(),
+                ty: vec_ty,
+            }),
+        ];
+
+        let candidate = MasCandidate {
+            op: &scope[4],
+            comp: DfirUnit::L3lu,
+            mem_index: MemoryOperandIndex::DirSrc,
+        };
+        let shift = transform_vector_load::<Dd2>(&mut vals, &candidate, &scope);
+        let MutableStartAddrShift::Shifted(shifted) = shift else {
+            panic!("64 * 1 + 16 * 64 + 128 * 256 fits the EBR whole: {shift:?}")
+        };
+        assert_eq!(shifted.total, TotalShift::WholeSticks(33856));
+        // `%[[VAL_7]] = arith.constant 33856 : index`, with the view rebuilt on it under its OWN
+        // result — `%[[VAL_11]]` still feeds the load below.
+        let DfirOp::Arith(arith::Op::Constant {
+            result: new_start,
+            value,
+        }) = shifted.start_address
+        else {
+            panic!("arm one of `updateMemViewStartAddress` is one `arith.constant`")
+        };
+        assert_eq!(value, 33856);
+        assert_eq!(
+            shifted.mem_view,
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: src_view,
+                from: hbm,
+                start: new_start,
+                layout,
+                ty: ty.clone(),
+            })
+        );
+        // `agen.vector_load %[[VAL_11]][0, %[[VAL_9]] * 3, %[[VAL_10]] * 2] {dbgName = "", ..}`.
+        let DfirOp::Agen(agen::Op::VectorLoad {
+            result,
+            view: loaded,
+            indices,
+            dbg_name,
+            ..
+        }) = &shifted.mem_op
+        else {
+            panic!("the clone is a vector load")
+        };
+        assert_eq!(*loaded, src_view);
+        assert_eq!(dbg_name.as_deref(), Some(""), "`Agen.cpp:166`");
+        assert_eq!(
+            *indices,
+            [
+                Index::Strided(vec![(arg2, 2)], 0),
+                Index::Strided(vec![(arg1, 3)], 0),
+                Index::Const(0),
+            ]
+        );
+        assert_eq!(
+            shifted.replaced,
+            Some((data, *result)),
+            "the store reads the load, so `use_empty()` is false"
+        );
+        assert_eq!(shifted.erased, &scope[4]);
+    }
+    /// 🎯 353/384 — THE SAME 33856 ELEMENTS, OUT OF A STORE'S SUBSCRIPTS, WITH NOTHING RE-POINTED.
+    ///
+    /// ⛔ THE VENDOR'S OWN STORE CASE IS NOT EXPRESSIBLE HERE: `@partial_shift_zero_query`
+    /// (`mutable_start_addr_shift_partial.mlir:157-180`) starts its HBM view at a
+    /// `uniform.query_map`, which is [`MutableStartAddrShift::MemViewStartIsNotConstant`] in this
+    /// island. So this is its access on a constant start, and the total is entry 352's.
+    #[test]
+    fn a_stores_offsets_shift_the_same_way_and_re_point_nothing() {
+        let mut vals = Values::default();
+        let hbm = vals.mint();
+        let lx = vals.mint();
+        let start = vals.mint();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let src_view = vals.mint();
+        let dst_view = vals.mint();
+        let data = vals.mint();
+
+        let layout = AffineMap::linear(&[256, 64, 1]);
+        let ty = MemRef {
+            shape: vec![4, 64, 64],
+            elem: ElemType::F16,
+        };
+        let vec_ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let view = |result: Val, from: Val| {
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                layout: layout.clone(),
+                ty: ty.clone(),
+            })
+        };
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: start,
+                value: 0,
+            }),
+            DfirOp::Affine(affine::Op::For {
+                iv: arg1,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: vec![DfirOp::Affine(affine::Op::For {
+                    iv: arg2,
+                    lo: affine::Bound::Const(0),
+                    hi: affine::Bound::Const(8),
+                    carried: Vec::new(),
+                    body: Vec::new(),
+                    dbg_name: None,
+                })],
+                dbg_name: None,
+            }),
+            view(src_view, lx),
+            view(dst_view, hbm),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: data,
+                view: src_view,
+                indices: vec![Index::Const(0); 3],
+                view_ty: ty.clone(),
+                ty: vec_ty,
+                multicast_info: None,
+            }),
+            // `agen.vector_store %data, %dst_mem_view[%c64, %arg1 * 3 + %c16, %arg2 * 2 + %c128]`.
+            DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                value: data,
+                view: dst_view,
+                indices: vec![
+                    Index::Strided(vec![(arg2, 2)], 128),
+                    Index::Strided(vec![(arg1, 3)], 16),
+                    Index::Const(64),
+                ],
+                view_ty: ty.clone(),
+                ty: vec_ty,
+            }),
+        ];
+
+        let candidate = MasCandidate {
+            op: &scope[5],
+            // The collection's `else` arm, and it is the source index — see this entry's banner.
+            comp: DfirUnit::L3su,
+            mem_index: MemoryOperandIndex::DirSrc,
+        };
+        let shift = transform_vector_store::<Dd2>(&mut vals, &candidate, &scope);
+        let MutableStartAddrShift::Shifted(shifted) = shift else {
+            panic!("the store's offsets are entry 352's: {shift:?}")
+        };
+        assert_eq!(shifted.total, TotalShift::WholeSticks(33856));
+        assert_eq!(shifted.replaced, None, "a store binds nothing to re-point");
+        assert_eq!(shifted.erased, &scope[5]);
+        let DfirOp::Arith(arith::Op::Constant { value, .. }) = shifted.start_address else {
+            panic!("arm one of `updateMemViewStartAddress` is one `arith.constant`")
+        };
+        assert_eq!(value, 33856);
+        let DfirOp::Agen(agen::Op::VectorStore {
+            value: stored,
+            view: written,
+            indices,
+            dbg_name,
+            ..
+        }) = &shifted.mem_op
+        else {
+            panic!("the clone is a vector store")
+        };
+        assert_eq!(
+            (*stored, *written),
+            (data, dst_view),
+            "`getValueToStore()` and the view, both carried over"
+        );
+        assert_eq!(dbg_name.as_deref(), Some(""), "`Agen.cpp:244`");
+        assert_eq!(
+            *indices,
+            [
+                Index::Strided(vec![(arg2, 2)], 0),
+                Index::Strided(vec![(arg1, 3)], 0),
+                Index::Const(0),
+            ]
+        );
+    }
+    /// THE VENDOR'S COMPOSITE FROM `mutable_start_addr_shift_partial.mlir:181-215`
+    /// (`@partial_shift_toggle_start`), on a CONSTANT start: its `arith.subi` toggle is
+    /// [`MutableStartAddrShift::MemViewStartIsNotConstant`] here, so the shift is entry 352's full one
+    /// rather than the vendor's partial `[64, .. * 3 + 14, .. * 2 + 78]`.
+    ///
+    /// ⚠️ THE ACCESS IS TRANSPOSED into the island's row-major convention, as entry 306's fixtures are.
+    fn toggle_start_transfer(src: Val, dst: Val, arg1: Val, arg3: Val, load_iv: Val) -> agen::Op {
+        let ty = MemRef {
+            shape: vec![4, 64, 64],
+            elem: ElemType::F16,
+        };
+        // `load_set`/`store_set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 == 0,
+        // d2 == 0)>`, transposed: the 64 lanes are the INNERMOST subscript here.
+        let transfer_set = IntegerSet {
+            dims: 3,
+            symbols: 0,
+            constraints: vec![
+                Constraint {
+                    expr: AffineExpr::dim(0),
+                    is_equality: true,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(1),
+                    is_equality: true,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(2),
+                    is_equality: false,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(2).times(-1).plus(AffineExpr::Const(63)),
+                    is_equality: false,
+                },
+            ],
+        };
+        // `time_set = affine_set<(d0, d1, d2)[s0] : (d<i> >= 0, -d<i> + s0 - 1 >= 0)>`.
+        let spanning = |dim: u32| {
+            [
+                Constraint {
+                    expr: AffineExpr::dim(dim),
+                    is_equality: false,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(dim)
+                        .times(-1)
+                        .plus(AffineExpr::sym(0))
+                        .plus(AffineExpr::Const(-1)),
+                    is_equality: false,
+                },
+            ]
+        };
+        agen::Op::CompositeLoadAndStore(Box::new(agen::CompositeTransfer {
+            // `src:%src_mem_view[0, 0, 0]`.
+            src,
+            src_indices: vec![Index::Const(0); 3],
+            src_ty: ty.clone(),
+            // `dst:%dst_mem_view[%c64, %arg1 * 3 + %c16, %arg3 * 2 + 128]`.
+            dst,
+            dst_indices: vec![
+                Index::Strided(vec![(arg3, 2)], 128),
+                Index::Strided(vec![(arg1, 3)], 16),
+                Index::Const(64),
+            ],
+            dst_ty: ty,
+            load_iv,
+            load_iv_ty: Vector {
+                len: 64,
+                elem: ElemType::F16,
+            },
+            load_set: transfer_set.clone(),
+            load_order: AffineMap::identity(3),
+            store_set: transfer_set,
+            store_order: AffineMap::identity(3),
+            time_symbols: vec![arg1],
+            time_set: IntegerSet {
+                dims: 3,
+                symbols: 1,
+                constraints: (0..3).flat_map(spanning).collect(),
+            },
+            time_order: AffineMap::identity(3),
+            load_time_addr_map: AffineMap::identity(3),
+            store_time_addr_map: AffineMap::identity(3),
+            dir: None,
+            multicast_info: None,
+            dbg_name: None,
+            body: vec![DfirOp::Agen(agen::Op::Yield)],
+        }))
+    }
+
+    /// 🎯 354/384 — ONE SIDE SHIFTS AND THE OTHER IS COPIED THROUGH, on the vendor's own composite.
+    #[test]
+    fn a_composites_shifted_side_is_the_one_the_memory_index_names() {
+        let mut vals = Values::default();
+        let hbm = vals.mint();
+        let lx = vals.mint();
+        let start = vals.mint();
+        let arg1 = vals.mint();
+        let arg3 = vals.mint();
+        let src_view = vals.mint();
+        let dst_view = vals.mint();
+        let load_iv = vals.mint();
+
+        let layout = AffineMap::linear(&[256, 64, 1]);
+        let ty = MemRef {
+            shape: vec![4, 64, 64],
+            elem: ElemType::F16,
+        };
+        let view = |result: Val, from: Val| {
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                layout: layout.clone(),
+                ty: ty.clone(),
+            })
+        };
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: start,
+                value: 0,
+            }),
+            DfirOp::Affine(affine::Op::For {
+                iv: arg1,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: vec![DfirOp::Affine(affine::Op::For {
+                    iv: arg3,
+                    lo: affine::Bound::Const(0),
+                    hi: affine::Bound::Const(8),
+                    carried: Vec::new(),
+                    body: Vec::new(),
+                    dbg_name: None,
+                })],
+                dbg_name: None,
+            }),
+            view(src_view, lx),
+            view(dst_view, hbm),
+            DfirOp::Agen(toggle_start_transfer(src_view, dst_view, arg1, arg3, load_iv)),
+        ];
+        let candidate = MasCandidate {
+            op: &scope[4],
+            comp: DfirUnit::L3su,
+            // The HBM operand is the DESTINATION — `runOnOperation:161-166`.
+            mem_index: MemoryOperandIndex::DirDst,
+        };
+        let shift = transform_comp_load_and_store::<Dd2>(&mut vals, &candidate, &scope);
+        let MutableStartAddrShift::Shifted(shifted) = shift else {
+            panic!("the destination's whole constant offset fits the immutable range: {shift:?}")
+        };
+        assert_eq!(shifted.total, TotalShift::WholeSticks(33856));
+        assert_eq!(shifted.replaced, None, "a composite binds nothing");
+        assert_eq!(shifted.erased, &scope[4]);
+        let DfirOp::Agen(agen::Op::CompositeLoadAndStore(rebuilt)) = &shifted.mem_op else {
+            panic!("the clone is a composite load and store")
+        };
+        let DfirOp::Agen(agen::Op::CompositeLoadAndStore(original)) = &scope[4] else {
+            unreachable!("the fixture is one")
+        };
+        assert_eq!(
+            (rebuilt.src, rebuilt.dst),
+            (src_view, dst_view),
+            "`getSrcMemRef()` and `getDstMemRef()`, both unchanged"
+        );
+        assert_eq!(
+            rebuilt.src_indices, original.src_indices,
+            "the load side keeps its own map and operands"
+        );
+        assert_eq!(
+            rebuilt.dst_indices,
+            [
+                Index::Strided(vec![(arg3, 2)], 0),
+                Index::Strided(vec![(arg1, 3)], 0),
+                Index::Const(0),
+            ]
+        );
+        assert_eq!(rebuilt.time_set, original.time_set, "`getTimeSet()`");
+    }
+    /// 🎯 355/384 — THE GATHER'S DIRECT SOURCE SHIFTS; ITS INDIRECT DESTINATION AND THAT SIDE'S
+    /// SUBSCRIPT DO NOT, AND ASKING FOR THE INDIRECT'S OWN SIDE IS REFUSED.
+    ///
+    /// The vendor's `@full_shift_conditional_start`
+    /// (`mutable_start_addr_shift_partial.mlir:218-259`) on a CONSTANT start of 2048 — its `scf.if`
+    /// start is [`MutableStartAddrShift::MemViewStartIsNotConstant`] here. ⛔ AND THE SHIFT IS THE
+    /// WHOLE 33856 WHERE ITS CHECK SHOWS `[64, .. * 3 + 14, .. * 2 + 78]`: that run passes
+    /// `--dcc-mutable-start-addr-shifting-max-immutable-size=240000`, i.e. 15000 `f16` elements, and
+    /// [`MAX_IMMUTABLE_SIZE`] is [`None`] in this crate, so the whole offset fits.
+    #[test]
+    fn only_the_side_without_the_indirect_can_shift() {
+        let mut vals = Values::default();
+        let hbm = vals.mint();
+        let lx = vals.mint();
+        let ibr = vals.mint();
+        let zero = vals.mint();
+        let start = vals.mint();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let src_view = vals.mint();
+        let ibr_view = vals.mint();
+        let dst_view = vals.mint();
+        let load_iv = vals.mint();
+
+        let layout = AffineMap::linear(&[256, 64, 1]);
+        let ty = MemRef {
+            shape: vec![4, 64, 64],
+            elem: ElemType::F16,
+        };
+        let view = |result: Val, from: Val, start: Val| {
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                layout: layout.clone(),
+                ty: ty.clone(),
+            })
+        };
+        let ibr_ty = MemRef {
+            shape: vec![32],
+            elem: ElemType::Int(32),
+        };
+        // `load_set`/`store_set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 == 0,
+        // d2 == 0)>`, transposed with the access.
+        let transfer_set = IntegerSet {
+            dims: 3,
+            symbols: 0,
+            constraints: vec![
+                Constraint {
+                    expr: AffineExpr::dim(0),
+                    is_equality: true,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(1),
+                    is_equality: true,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(2),
+                    is_equality: false,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(2).times(-1).plus(AffineExpr::Const(63)),
+                    is_equality: false,
+                },
+            ],
+        };
+        let spanning = |dim: u32| {
+            [
+                Constraint {
+                    expr: AffineExpr::dim(dim),
+                    is_equality: false,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(dim)
+                        .times(-1)
+                        .plus(AffineExpr::sym(0))
+                        .plus(AffineExpr::Const(-1)),
+                    is_equality: false,
+                },
+            ]
+        };
+        let transfer = agen::Op::CompositeIndirectLoadAndStore(Box::new(
+            agen::CompositeIndirectTransfer {
+                indirect_src: None,
+                // `direct_src:%src_mem_view[%c64, %arg1 * 3 + %c16, %arg2 * 2 + 128]`.
+                direct_src: src_view,
+                direct_src_indices: vec![
+                    Index::Strided(vec![(arg2, 2)], 128),
+                    Index::Strided(vec![(arg1, 3)], 16),
+                    Index::Const(64),
+                ],
+                direct_src_ty: ty.clone(),
+                // `indirect_dst:%ibr_mem_view[%arg2]`.
+                indirect_dst: Some(agen::IndirectAccess {
+                    view: ibr_view,
+                    indices: vec![Index::Val(arg2)],
+                    ty: ibr_ty.clone(),
+                }),
+                // `direct_dst:%dst_mem_view[0, 0, %arg1]`.
+                direct_dst: dst_view,
+                direct_dst_indices: vec![Index::Val(arg1), Index::Const(0), Index::Const(0)],
+                direct_dst_ty: ty.clone(),
+                load_iv,
+                load_iv_ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+                load_set: transfer_set.clone(),
+                load_order: AffineMap::identity(3),
+                store_set: transfer_set,
+                store_order: AffineMap::identity(3),
+                time_symbols: vec![arg1],
+                time_set: IntegerSet {
+                    dims: 3,
+                    symbols: 1,
+                    constraints: (0..3).flat_map(spanning).collect(),
+                },
+                time_order: AffineMap::identity(3),
+                load_indirect_time_addr_map: None,
+                load_direct_time_addr_map: AffineMap::identity(3),
+                // `store_indirect_time_addr_map = affine_map<(d0, d1, d2) -> (0)>`.
+                store_indirect_time_addr_map: Some(AffineMap {
+                    dims: 3,
+                    syms: 0,
+                    results: vec![AffineExpr::Const(0)],
+                }),
+                store_direct_time_addr_map: AffineMap::identity(3),
+                multicast_info: None,
+                dbg_name: None,
+                body: vec![DfirOp::Agen(agen::Op::Yield)],
+            },
+        ));
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: zero,
+                value: 0,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: start,
+                value: 2048,
+            }),
+            DfirOp::Affine(affine::Op::For {
+                iv: arg1,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: vec![DfirOp::Affine(affine::Op::For {
+                    iv: arg2,
+                    lo: affine::Bound::Const(0),
+                    hi: affine::Bound::Const(8),
+                    carried: Vec::new(),
+                    body: Vec::new(),
+                    dbg_name: None,
+                })],
+                dbg_name: None,
+            }),
+            view(src_view, hbm, start),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: ibr_view,
+                from: ibr,
+                start: zero,
+                layout: AffineMap::identity(1),
+                ty: ibr_ty,
+            }),
+            view(dst_view, lx, zero),
+            DfirOp::Agen(transfer),
+        ];
+        let candidate = |mem_index| MasCandidate {
+            op: &scope[6],
+            comp: DfirUnit::L3lu,
+            mem_index,
+        };
+
+        // ⛔ THE DESTINATION IS THE SCATTER'S OWN SIDE — `runOnOperation` never seats it, and the
+        // early return is what would stop it if it did.
+        assert_eq!(
+            transform_comp_ind_load_and_store::<Dd2>(
+                &mut vals,
+                &candidate(MemoryOperandIndex::DirDst),
+                &scope
+            ),
+            MutableStartAddrShift::IndirectIsOnTheShiftedSide(MemoryOperandIndex::DirDst)
+        );
+
+        let shift = transform_comp_ind_load_and_store::<Dd2>(
+            &mut vals,
+            &candidate(MemoryOperandIndex::DirSrc),
+            &scope,
+        );
+        let MutableStartAddrShift::Shifted(shifted) = shift else {
+            panic!("the direct source carries no indirect: {shift:?}")
+        };
+        assert_eq!(shifted.total, TotalShift::WholeSticks(33856));
+        assert_eq!(shifted.replaced, None);
+        assert_eq!(shifted.erased, &scope[6]);
+        let DfirOp::Arith(arith::Op::Constant { value, .. }) = shifted.start_address else {
+            panic!("the new start address is one `arith.constant`")
+        };
+        assert_eq!(value, 2048 + 33856, "the start it had plus what moved into it");
+        let DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(rebuilt)) = &shifted.mem_op else {
+            panic!("the clone is a composite indirect load and store")
+        };
+        let DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(original)) = &scope[6] else {
+            unreachable!("the fixture is one")
+        };
+        assert_eq!(
+            rebuilt.direct_src_indices,
+            [
+                Index::Strided(vec![(arg2, 2)], 0),
+                Index::Strided(vec![(arg1, 3)], 0),
+                Index::Const(0),
+            ]
+        );
+        assert_eq!(
+            (
+                rebuilt.indirect_src.clone(),
+                rebuilt.indirect_dst.clone(),
+                rebuilt.direct_dst_indices.clone()
+            ),
+            (
+                None,
+                original.indirect_dst.clone(),
+                original.direct_dst_indices.clone()
+            ),
+            "the scatter's side is copied through, subscript and all"
+        );
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e352_transformVectorLoad
-// crustify:todo: e353_transformVectorStore
-// crustify:todo: e354_transformCompLoadAndStore
-// crustify:todo: e355_transformCompIndLoadAndStore
 // crustify:todo: e372_runOnOperation

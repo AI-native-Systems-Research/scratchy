@@ -841,17 +841,7 @@ pub fn create_new_mem_op<'s>(
     scope: &'s [DfirOp],
 ) -> NewMemOp {
     let result = vals.mint();
-    let new_load_op = DfirOp::Agen(agen::Op::VectorLoad {
-        result,
-        view: mem_view,
-        indices,
-        view_ty,
-        // `getResult().getType()` — the vector the original load bound.
-        ty: mem_op.ty,
-        multicast_info: None,
-        // `getDbgNameAttr() ? getDbgNameAttr() : builder.getStringAttr("")` (`Agen.cpp:166`).
-        dbg_name: Some(mem_op.dbg_name.unwrap_or_default().to_owned()),
-    });
+    let new_load_op = clone_load_with_new_access_info(mem_op, result, mem_view, view_ty, indices);
 
     // `builder.setInsertionPointAfter(new_load_op)`, then the chain — hence the order of the list.
     let mut ops = vec![new_load_op];
@@ -861,6 +851,31 @@ pub fn create_new_mem_op<'s>(
         result,
     ));
     NewMemOp { ops, result }
+}
+
+/// `agen::VectorLoadOp::cloneWithNewAccessInfo` (`Agen.cpp:161-169`) ALONE — the load twin of
+/// [`clone_store_with_new_access_info`], without the use chain [`create_new_mem_op`] follows it with.
+///
+/// ⛔ ITS CALLERS DISAGREE ABOUT THE CHAIN AND BOTH ARE RIGHT: entry 128 clones the consumers because
+/// it builds one load PER PAGE, while entry 352 re-points them because it builds exactly one.
+pub(super) fn clone_load_with_new_access_info(
+    mem_op: VectorLoadOp<'_>,
+    result: Val,
+    mem_view: Val,
+    view_ty: MemRef,
+    indices: Vec<Index>,
+) -> DfirOp {
+    DfirOp::Agen(agen::Op::VectorLoad {
+        result,
+        view: mem_view,
+        indices,
+        view_ty,
+        // `getResult().getType()` — the vector the original load bound.
+        ty: mem_op.ty,
+        multicast_info: None,
+        // `getDbgNameAttr() ? getDbgNameAttr() : builder.getStringAttr("")` (`Agen.cpp:166`).
+        dbg_name: Some(mem_op.dbg_name.unwrap_or_default().to_owned()),
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -5957,6 +5972,160 @@ scf.if %11 {
         assert_eq!(rebuilt.time_symbols, original.time_symbols);
         assert_eq!(rebuilt.dbg_name, Some(String::new()), "`dbgName = \"\"`");
     }
+
+    // ── 356/384 ──────────────────────────────────────────────────────────────────────────────────
+
+    /// 🎯 356/384 — ⭐⭐ IBM'S PAGED LOAD, DE-PAGED END TO END: the four pages its subscripts reach
+    /// each get their own load, the original load and its whole rotate/send tail go on the erase
+    /// list, the paged view goes with them, and `mem_ops_` comes back as the FOUR replacements.
+    ///
+    /// `paged_mem_view_loads.mlir:286-299` in, `:44-180` out.
+    ///
+    /// ⛔ THE ERASE LIST IS CONSUMER-FIRST AND IT IS NOT JUST THE LOAD: `TPMVVectorLoad` overrides
+    /// `eraseMemOpAndUseChain` (entry 129), so a port that called the base's one-op answer here would
+    /// leave a `vectorchain.rotate` reading a value nothing defines.
+    #[test]
+    fn the_vendors_paged_load_is_replaced_by_one_load_per_reached_page() {
+        let mut vals = Values::default();
+        let lx = vals.mint();
+        let c0 = vals.mint();
+        let c16 = vals.mint();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let lxlu0 = vals.mint();
+        let sfp0 = vals.mint();
+        let mem_view = vals.mint();
+        let loaded = vals.mint();
+        let rotated = vals.mint();
+        let pages = vendor_six_pages(&mut vals);
+        let (to, _) = Link::<LxluUnit, SfpUnit>::between(lxlu0, sfp0).ends();
+
+        let view_ty = MemRef {
+            shape: vec![8, 64, 4],
+            elem: ElemType::F16,
+        };
+        // `affine_map<(d0, d1, d2) -> (d2 * 256 + d1 * 64 + d0)>` (`:289`).
+        let vendor_layout = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(2)
+                    .times(256)
+                    .plus(AffineExpr::dim(1).times(64))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        };
+        // `%mem_view[%c0, %arg1 * 3, %arg2 * 2 + %c2]` (`:297`) — the view and the access both sit
+        // INSIDE the nest, which is what makes `%arg1` and `%arg2` iterators entry 197 accepts.
+        let innermost = vec![
+            DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(Box::new(
+                PagedMemView {
+                    result: mem_view,
+                    unit: lx,
+                    start_addr: c0,
+                    pages,
+                    layout: vendor_layout,
+                    ty: view_ty.clone(),
+                },
+            ))),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: loaded,
+                view: mem_view,
+                indices: vec![
+                    Index::Const(0),
+                    Index::Strided(vec![(arg1, 3)], 0),
+                    Index::Strided(vec![(arg2, 2)], 2),
+                ],
+                view_ty,
+                ty: LANES,
+                multicast_info: None,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Rotate {
+                result: rotated,
+                input: loaded,
+                position: c16,
+                right_shift: true,
+                input_ty: LANES,
+                ty: LANES,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data: rotated,
+                ty: LANES,
+            }),
+        ];
+        // `affine.for %arg1 = 0 to 2 { affine.for %arg2 = 0 to 4 { .. } }` (`:286-287`).
+        let scope = vec![DfirOp::Affine(affine::Op::For {
+            iv: arg1,
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(2),
+            carried: Vec::new(),
+            body: vec![DfirOp::Affine(affine::Op::For {
+                iv: arg2,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: innermost,
+                dbg_name: None,
+            })],
+            dbg_name: None,
+        })];
+
+        let load_op = defining_op(loaded, &scope).expect("the load is in the innermost body");
+        let mut load = TpmvVectorLoad::new(load_op, DfirUnit::Lxlu);
+        load.initialize(&scope);
+
+        // `info` borrows the nest, so the emission goes into a clone — as entry 324's test does.
+        let mut emitted = scope.clone();
+        let transformed = load.vector.base.transform(&mut vals, &scope, &mut emitted);
+
+        let TransformedPagedViews::Transformed { operands, mem_ops } = transformed else {
+            panic!("every subscript is a constant-bounded iterator: {transformed:?}")
+        };
+        let [operand] = operands.as_slice() else {
+            panic!("one memory operand, and it is paged: {operands:?}")
+        };
+        assert_eq!(operand.mem_index, MemoryOperandIndex::DirSrc);
+        assert_eq!(
+            operand.pages.len(),
+            4,
+            "`%arg1 * 3` and `%arg2 * 2 + 2` reach four of the six pages"
+        );
+        // `mem_ops_ = new_mem_ops` — one replacement per page, in `getIdxSets()` order.
+        let replacements: Vec<Val> = operand
+            .pages
+            .iter()
+            .flat_map(|page| page.new_mem_ops.iter().map(|new| new.result))
+            .collect();
+        assert_eq!(mem_ops, replacements);
+        assert_eq!(mem_ops.len(), 4);
+
+        // `eraseMemOpAndUseChain` over the one original load: the send, the rotate, then the load.
+        let kinds: Vec<&str> = operand
+            .erased
+            .iter()
+            .map(|op| match op {
+                DfirOp::Dataflow(dataflow::Op::Send { .. }) => "send",
+                DfirOp::VectorChain(vectorchain::Op::Rotate { .. }) => "rotate",
+                DfirOp::Agen(agen::Op::VectorLoad { .. }) => "load",
+                other => panic!("nothing else is downstream of the load: {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, ["send", "rotate", "load"]);
+
+        // `info.paged_mem_view_->erase(); info.paged_mem_view_ = nullptr;`
+        assert_eq!(operand.erased_mem_view, mem_view);
+        let [info] = load.vector.base.tpmv_info.as_slice() else {
+            unreachable!("entry 202 filled exactly one")
+        };
+        assert_eq!(info.paged_mem_view, None);
+        // `calculateIndicesRanges` ran here and nowhere else — `0 to 2` and `0 to 4`, closed.
+        assert_eq!(
+            info.indices_ranges,
+            [IvRange { lb: 0, ub: 1 }, IvRange { lb: 0, ub: 3 }]
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -7468,8 +7637,168 @@ impl<'p> TpmvCompositeLoad<'p> {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 356/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT ONE PAGED MEMORY OPERAND'S DE-PAGING PRODUCED.
+#[derive(Debug, Clone)]
+pub struct TransformedOperand<'p> {
+    /// `info.mem_index_` — which memory operand this was.
+    pub mem_index: MemoryOperandIndex,
+    /// Every valid page, in `getIdxSets()` order, as [`analyze_and_construct_valid_pages`] built it.
+    pub pages: Vec<ConstructedPage>,
+    /// `for (auto &mem_op : mem_ops_) eraseMemOpAndUseChain(mem_op);` (`:618`), consumer-first —
+    /// a delete list and not an erase, for [`TpmvBase::erase_mem_op_and_use_chain`]'s reason.
+    pub erased: Vec<&'p DfirOp>,
+    /// `info.paged_mem_view_->erase()` (`:621`), by the value it bound: a view a cloned nest
+    /// re-pointed lives in the emission and not in the input program — see [`PagedAccess`].
+    pub erased_mem_view: Val,
+}
+
+/// WHAT `transform` DID.
+#[derive(Debug, Clone)]
+pub enum TransformedPagedViews<'p> {
+    /// `LogicalResult::success()`.
+    Transformed {
+        /// In `tpmv_info_` order, skipping every operand whose view was not paged.
+        operands: Vec<TransformedOperand<'p>>,
+        /// `mem_ops_` as the last paged operand left it — every page's replacement, in page order.
+        mem_ops: Vec<Val>,
+    },
+    /// `if (analyzeAndConstructValidPages(..).failed()) return LogicalResult::failure();` (`:614`).
+    PagesNotConstructed(ConstructedPages),
+    /// A subscript entry 197 aborts on, naming the operand — see [`SubscriptIv`].
+    SubscriptIsNotALoopIterator(usize),
+}
+
+impl<'p> TpmvBase<'p> {
+    /// Replaces: e356_transform
+    ///
+    /// **356/384** `TPMVBase::transform` —
+    /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:592` (39L).
+    ///
+    /// ⛔ `mem_ops_ = new_mem_ops` IS LOOP-CARRIED: a second paged operand builds its pages over the
+    /// FIRST one's replacements, which is why `new_mem_ops` is a local per operand and `mem_ops_` is
+    /// not. The write itself is the returned `mem_ops`, as entry 325's `mem_ops_[0] = new_mem_op` is
+    /// [`ExplicitTimeNest`]. ⚠️ AND THE SIBLING RE-SYNC AT `:518-521` LANDS HERE —
+    /// [`ConstructedPage::ir_maps`] holds it for the caller, and this is that caller.
+    #[must_use]
+    pub fn transform(
+        &mut self,
+        vals: &mut Values,
+        scope: &'p [DfirOp],
+        emitted: &mut Vec<DfirOp>,
+    ) -> TransformedPagedViews<'p> {
+        // `mem_ops_`, each by the value it binds — see [`PagedAccess`]. ⛔ A STORE BINDS NOTHING, so
+        // `TPMVVectorStore`'s op cannot be named here; that is [`PagedAccess`]'s standing seam.
+        let mut mem_ops: Vec<Val> = self.mem_ops.iter().flat_map(|&op| results(op)).collect();
+        let mut operands: Vec<TransformedOperand<'p>> = Vec::new();
+
+        // `for (auto &info : tpmv_info_)`, by position: the sibling re-sync below reaches the whole
+        // vector while this entry is being rewritten.
+        for i in 0..self.tpmv_info.len() {
+            // `if (!info.paged_mem_view_) continue;`
+            let Some(handle) = self.tpmv_info[i].paged_mem_view else {
+                continue;
+            };
+            let mem_index = self.tpmv_info[i].mem_index;
+
+            // `dcc::agen::utils::replaceConstOpsInSubscriptsMap(info.subscripts_map_, info.indices_)`.
+            let info = &mut self.tpmv_info[i];
+            replace_const_ops_in_subscripts_map(&mut info.subscripts_map, &mut info.indices, scope);
+
+            // "Create a copy of the subscripts_map that represents loop iterators as symbols. This is
+            // used to form the constraints to determine which pages are valid for mem_ops_."
+            let subscripts_map_sym = replace_dims_in_map_with_syms(&info.subscripts_map);
+
+            // "Ranges of the loop iterators are used to only choose pages within the loop iteration
+            // space." — `calculateIndicesRanges(info.indices_, info.indices_ranges_)`, entry 197,
+            // whose three aborts are [`SubscriptIv::of`]'s one door.
+            let Some(ivs) = SubscriptIv::all_of(&info.indices, scope) else {
+                return TransformedPagedViews::SubscriptIsNotALoopIterator(i);
+            };
+            calculate_indices_ranges(&ivs, &mut info.indices_ranges);
+
+            // `SmallVector<Operation *, 16> new_mem_ops;` — this operand's own, so it starts empty,
+            // and `analyzeAndConstructValidPages(new_mem_ops, info, subscripts_map_sym)`.
+            let seed = PagedAccess {
+                mem_ops: mem_ops.clone(),
+                paged_mem_view: handle.result,
+                subscripts_map: info.subscripts_map.clone(),
+                indices: info.indices.clone(),
+                indices_ranges: info.indices_ranges.clone(),
+                conditional_iter_args: info.conditional_iter_args.clone(),
+            };
+            let info = self.tpmv_info[i].clone();
+            let constructed =
+                analyze_and_construct_valid_pages(vals, emitted, &seed, &info, &subscripts_map_sym);
+            let ConstructedPages::Constructed { pages, access } = constructed else {
+                return TransformedPagedViews::PagesNotConstructed(constructed);
+            };
+
+            // `info.indices_ = indices;` (`:497`) and `info.conditional_iter_args_` (`:481`) — what
+            // the page walk wrote back into `info`, threaded out through [`PagedAccess`].
+            let info = &mut self.tpmv_info[i];
+            info.indices = access.indices.clone();
+            info.conditional_iter_args = access.conditional_iter_args.clone();
+
+            // "The other TPMVInfo objects need to be synced as the values they use for paged_mem_view
+            // or indices may have changed as a result of the clones." (`:518-521`) — per cloned loop,
+            // in the order `createIterArgsForConditionals` cloned them.
+            for page in &pages {
+                for ir_map in &page.ir_maps {
+                    for sibling in &mut self.tpmv_info {
+                        if sibling.mem_index != mem_index {
+                            update_tpmv_info(sibling, ir_map, scope);
+                        }
+                    }
+                }
+            }
+
+            // `for (auto &mem_op : mem_ops_) eraseMemOpAndUseChain(mem_op);` — over the re-pointed
+            // list, dispatched on the class the manager chose: entry 129's override for an
+            // `agen.vector_load`, the base's one-op answer (entry 135) for anything else.
+            // ⛔ A MEM OP THIS TRANSFORM CREATED IS NOT IN `scope`, and its removal is its absence
+            // from the emission — the seam [`PagedAccess`] already carries.
+            let mut erased: Vec<&'p DfirOp> = Vec::new();
+            for &mem_op in &access.mem_ops {
+                let Some(op) = defining_op(mem_op, scope) else {
+                    continue;
+                };
+                match VectorLoadOp::of(op) {
+                    Some(load) => erased.extend(erase_vector_load_and_use_chain(load, scope)),
+                    None => erased.extend(self.erase_mem_op_and_use_chain(op)),
+                }
+            }
+
+            // "There will only be one paged_mem_view per TPMVInfo object at any given time because we
+            // don't clone paged_mem_views during the lowering process." —
+            // `info.paged_mem_view_->erase(); info.paged_mem_view_ = nullptr;`
+            self.tpmv_info[i].paged_mem_view = None;
+
+            // "Re-populate mem_ops_ with the new memory ops we created. Because we could be
+            // introducing conditionals for multiple memory operands, the mem_op may get cloned into
+            // multiple conditional branches." — `mem_ops_ = new_mem_ops;`
+            mem_ops = pages
+                .iter()
+                .flat_map(|page| page.new_mem_ops.iter().map(|new| new.result))
+                .collect();
+
+            operands.push(TransformedOperand {
+                mem_index,
+                pages,
+                erased,
+                erased_mem_view: access.paged_mem_view,
+            });
+        }
+
+        // `return LogicalResult::success();`
+        TransformedPagedViews::Transformed { operands, mem_ops }
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e356_transform
 // crustify:todo: e373_run

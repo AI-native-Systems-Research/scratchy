@@ -87,10 +87,12 @@ use crate::arch::{Arch, Bounded, Elements, IsaGen, Sticks};
 use crate::formats::Bits;
 use crate::generated::DataType;
 use crate::islands::dataflow_ir::dialects::{
-    self, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, scf, symbol,
+    self, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, scf, symbol, uses,
 };
-use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, Constraint, IntegerSet, MemRef};
-use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::dataflow_ir::ty::{
+    AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, MemRef,
+};
+use crate::islands::dataflow_ir::{Program, ValueMapping, Values};
 use crate::units::DfirUnit;
 
 use super::agen_access_details::{
@@ -668,10 +670,14 @@ mod unit_tests {
     use super::super::agen_access_details::{IndicesCoeffDict, TimeOffsets};
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::dialects::{Index, agen};
     use crate::islands::dataflow_ir::print;
     use crate::islands::dataflow_ir::ty::{ElemType, ScalarTy, Vector};
-    use crate::units::Row;
+    use crate::islands::dataflow_ir::{
+        Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units,
+    };
+    use crate::units::{Core, Corelet, Residency, Row};
 
     /// 🎯 111/384 — THE MUTABLE RANGE IS THE EAR'S 21 BITS OF STICKS, IN BITS.
     ///
@@ -5455,6 +5461,158 @@ mod unit_tests {
             "the indirect SOURCE keeps its own `[%arg2]`"
         );
     }
+
+    /// 🎯 351/384 — THE TWO FILTERS ARE THE PASS: an HBM view in an L3 half is a candidate, and the
+    /// LX view beside it, the symbol-started view above it and the whole `lxlu` unit are not.
+    #[test]
+    fn only_an_hbm_view_in_an_l3_unit_reaches_a_transform() {
+        let mut vals = Values::default();
+        let get_unit = |result: Val, unit: DfirUnit, residency: Residency| {
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result,
+                residency,
+                unit,
+                num_folds: None,
+            })
+        };
+        let core0 = Core::checked(0).expect("core 0 exists");
+        let hbm = vals.mint();
+        let lx = vals.mint();
+        let l3lu = vals.mint();
+        let lxlu = vals.mint();
+        let preamble = vec![
+            get_unit(hbm, DfirUnit::Hbm, Residency::Global),
+            get_unit(lx, DfirUnit::Lx, Residency::Scratchpad { core: core0 }),
+            get_unit(l3lu, DfirUnit::L3lu, Residency::CoreWide { core: core0 }),
+            get_unit(
+                lxlu,
+                DfirUnit::Lxlu,
+                Residency::Corelet {
+                    core: core0,
+                    corelet: Corelet::checked(0).expect("corelet 0 exists"),
+                },
+            ),
+        ];
+
+        let layout = AffineMap::linear(&[2048, 1]);
+        let ty = MemRef {
+            shape: vec![1, 2048],
+            elem: ElemType::F16,
+        };
+        let vec_ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let view = |vals: &mut Values, from: Val, start: Val| {
+            let result = vals.mint();
+            (
+                DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                    result,
+                    from,
+                    start,
+                    layout: layout.clone(),
+                    ty: ty.clone(),
+                }),
+                result,
+            )
+        };
+        let (start_op, start) = index_const(&mut vals, 0);
+        let sym = vals.mint();
+        let (hbm_view_op, hbm_view) = view(&mut vals, hbm, start);
+        let (lx_view_op, lx_view) = view(&mut vals, lx, start);
+        let (sym_view_op, _) = view(&mut vals, hbm, sym);
+        let data = vals.mint();
+        let l3lu_body = vec![
+            start_op.clone(),
+            DfirOp::Symbol(symbol::Op::CreateSymbol {
+                result: sym,
+                symbol_id: -1476,
+                max_value: Some(8),
+            }),
+            hbm_view_op,
+            lx_view_op,
+            // ⛔ AN HBM VIEW STARTED BY A SYMBOL — `isa_and_nonnull<symbol::CreateSymbolOp, ..>`.
+            sym_view_op,
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: data,
+                view: hbm_view,
+                indices: vec![Index::Const(0); 2],
+                view_ty: ty.clone(),
+                ty: vec_ty.clone(),
+                multicast_info: None,
+            }),
+            DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                value: data,
+                view: lx_view,
+                indices: vec![Index::Const(0); 2],
+                view_ty: ty.clone(),
+                ty: vec_ty.clone(),
+            }),
+        ];
+
+        // The same HBM load again, on a unit the component gate never walks into.
+        let (other_view_op, other_view) = view(&mut vals, hbm, start);
+        let lxlu_body = vec![
+            start_op,
+            other_view_op,
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: vals.mint(),
+                view: other_view,
+                indices: vec![Index::Const(0); 2],
+                view_ty: ty,
+                ty: vec_ty,
+                multicast_info: None,
+            }),
+        ];
+
+        let a_unit = |on: DfirUnit, val: Val, body: Vec<DfirOp>| ProgramUnit::<Dd2> {
+            on: Units::one(on, val),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        let program = Program::<Dd2> {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            grid: Grid::single(),
+            preamble,
+            units: ProgramUnits::of(
+                a_unit(DfirUnit::L3lu, l3lu, l3lu_body),
+                vec![a_unit(DfirUnit::Lxlu, lxlu, lxlu_body)],
+            ),
+            arch: core::marker::PhantomData,
+        };
+
+        let splitting =
+            run_on_operation::<Dd2>(&program, &mut vals, EarOverflowCorrection::Allowed);
+        let MutableAddrSplitting::Split(split) = splitting else {
+            panic!("every candidate has one user and one direct memory operand: {splitting:?}")
+        };
+        assert_eq!(
+            split.len(),
+            1,
+            "one candidate: the LX view is not HBM, the symbol-started view is excluded, and the \
+             `lxlu` unit is not walked"
+        );
+        let MasSplit { candidate, dispatch } = &split[0];
+        assert_eq!(candidate.comp, DfirUnit::L3lu);
+        assert_eq!(candidate.mem_index, MemoryOperandIndex::DirSrc);
+        assert!(
+            matches!(candidate.op, DfirOp::Agen(agen::Op::VectorLoad { view, .. }) if *view == hbm_view),
+            "the load of the HBM view, reached as its one user"
+        );
+        // `[0, 0]` involves no loop, so `initialize` leaves `mas_data` empty and `max_mutable` at 0.
+        assert_eq!(
+            *dispatch,
+            MasDispatch::VectorLoad(TransferSplit::AddressFits(MutableAddrOverflow::InRange))
+        );
+    }
 }
 
 /// WHAT A LOOP ANSWERS WHEN ASKED HOW MANY TIMES IT RUNS — every value the reference's one `int64_t`
@@ -6013,16 +6171,16 @@ pub fn has_mutable_addr_overflow<A: Arch>(
 /// (`:956`).
 pub const MAX_NUM_CONDITIONALS: Option<i64> = Some(16);
 
-/// HOW MANY `scf.if`s THE PASS HAS ADDED TO THE PROGRAM UNIT IT IS WORKING ON.
+/// HOW MANY `scf.if`s THE PASS HAS ADDED TO THE PROGRAM SO FAR.
 ///
-/// # ⛔⛔ PER `dataflow.program_unit`, NOT PER PROGRAM AND NOT PER TRANSFER
+/// # ⛔⛔ PER PROGRAM, DESPITE ITS RESET SAYING PER UNIT
 ///
 /// `runOnOperation` sets it to zero at the top of every unit — *"Reset num_conditionals_ so every unit
-/// is not exceeding the max conditionals"* (`:244-246`) — and
-/// [`calculate_partition_sizes`] adds to it once per transfer it splits. So the budget of
-/// [`MAX_NUM_CONDITIONALS`] is a per-unit budget shared by every overflowing transfer in that unit,
-/// and the SECOND transfer to split is the one that can exceed it on a program where the first was
-/// fine.
+/// is not exceeding the max conditionals"* (`:244-246`) — but that reset is in the walk that only
+/// COLLECTS candidates, and the counter's one writer, [`calculate_partition_sizes`] (`:958`), is
+/// reached from the dispatch loop that runs after the whole walk. So the resets are inert and the
+/// budget of [`MAX_NUM_CONDITIONALS`] is one total for the program, shared by every overflowing
+/// transfer in it — see [`run_on_operation`].
 ///
 /// ⚠️ AN `i64` WHERE THE REFERENCE'S COUNTER IS AN `int`. `num_conditionals_` is declared `int`
 /// (`:222`) and compared against an `int64_t` flag (`:960`), so the comparison already promotes; the
@@ -9381,7 +9539,7 @@ pub(super) fn clone_composite_with_new_access_info(
 /// caller hands over four views and four maps, and `num_ind_src_indices`/`num_ind_dst_indices` are
 /// recounted off the ORIGINAL op — so an indirect side handed a view the original did not have gets
 /// that view with NO indices. `dbgName`, the fresh `load_iv` and the region are entry 321's clone's.
-fn clone_composite_indirect_with_new_access_info(
+pub(super) fn clone_composite_indirect_with_new_access_info(
     vals: &mut Values,
     transfer: &agen::CompositeIndirectTransfer,
     indirect_src: Option<agen::IndirectAccess>,
@@ -9827,4 +9985,310 @@ pub fn transform_comp_ind_load_and_store<'s, A: Arch>(
     }
 }
 
-// crustify:todo: e351_runOnOperation
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 351/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A [`DataType`] AS WIDE AS ONE ELEMENT OF THIS TYPE — the `getElementWidth()`-to-[`DataType`]
+/// bridge the four transforms' `elem` argument leaves to their caller.
+///
+/// ⛔ CHOSEN BY WIDTH, NOT BY IDENTITY. [`AddrRange::elements`] reads `elem.bits()` and nothing else,
+/// so two formats of one width are interchangeable here. [`None`] is an element type NO format is as
+/// wide as: `i1`, whose [`DataType::Bool`] is eight bits, and the PT's `i24`.
+fn transfer_format(elem: ElemType) -> Option<DataType> {
+    match elem {
+        // ⛔ `Senint24` IS THE 16-BIT ONE — the format [`ElemType::of`] maps to `Int(16)` off the PT.
+        ElemType::Int(16) => Some(DataType::Senint24),
+        ElemType::Int(8) | ElemType::MxInt(8) => Some(DataType::Senint8),
+        ElemType::Int(4) | ElemType::MxInt(4) => Some(DataType::Senint4),
+        ElemType::Int(32) => Some(DataType::Senuint32),
+        ElemType::F16 => Some(DataType::Sen169Fp16),
+        ElemType::Bf16 => Some(DataType::Bfloat16),
+        ElemType::F32 => Some(DataType::IeeeFp32),
+        ElemType::F8E4M3Fn => Some(DataType::Sen143Fp8),
+        ElemType::F8E8M0Fnu | ElemType::MxFloat(8) => Some(DataType::Sen080Fp8),
+        // ⭐ NO FORMAT NAMES E5M2, and `Sen053_FP8` is the one the reference itself stands in for a
+        // missing exponent layout with; both are eight bits, which is all this is read for.
+        ElemType::F8E5M2 => Some(DataType::Sen053Fp8),
+        ElemType::F4E2M1Fn | ElemType::MxFloat(4) => Some(DataType::Sen121Fp4),
+        ElemType::Int(_) | ElemType::MxFloat(_) | ElemType::MxInt(_) => None,
+    }
+}
+
+/// `isCandidateMemView` (`MutableAddrSplitting.cpp:229-237`) — AN HBM VIEW WHOSE START ADDRESS IS
+/// NOT A SYMBOL.
+///
+/// ⭐ THE SECOND TEST IS WHY THE PASS AND `MutableStartAddrShifting` DO NOT FIGHT: a start address
+/// bound by `symbol.create_symbol` or `symbol.query_map` is one the schedule fixes later, and there
+/// is no constant to add a partition offset to ([`is_eligible_for_splitting`]).
+fn is_candidate_mem_view(from: Val, start: Val, body: &[DfirOp], preamble: &[DfirOp]) -> bool {
+    // `dcc::getUnitType(mem_view_op.getFromUnit().getDefiningOp()) != SenComponents::HBM`.
+    // ⚠️ THE `dataflow.get_unit` OPS SIT AT FUNCTION SCOPE while the view sits in a unit's body
+    // (`tests/sentient_corpus/group_0__g0_0_mul.dfir.mlir:3-12`), so the def walk spans both — which
+    // is one search for `getDefiningOp()`, whose reach is the whole module.
+    let from_unit = defining_op(from, preamble).or_else(|| defining_op(from, body));
+    if !matches!(
+        from_unit,
+        Some(DfirOp::Dataflow(dataflow::Op::GetUnit {
+            unit: DfirUnit::Hbm,
+            ..
+        }))
+    ) {
+        return false;
+    }
+    // `!isa_and_nonnull<symbol::CreateSymbolOp, symbol::SymbolQueryMapOp>(getStartAddress()
+    //  .getDefiningOp())` — ⛔ `_and_nonnull`: a start address no op in scope binds is NOT one of the
+    // two, so a region argument stays a candidate and fails later, at the eligibility check.
+    !matches!(
+        defining_op(start, body).or_else(|| defining_op(start, preamble)),
+        Some(DfirOp::Symbol(
+            symbol::Op::CreateSymbol { .. } | symbol::Op::QueryMap { .. }
+        ))
+    )
+}
+
+/// `WalkOrder::PreOrder` over one unit's body, keeping the `dataflow.get_logical_memory_view` ops.
+///
+/// ⛔ THROUGH EVERY REGION. A view bound inside an `scf.for` is one the reference's `unit.walk`
+/// reaches, and [`dialects::regions`] is the one table that knows which ops have one.
+fn mem_views_in_pre_order<'a>(body: &'a [DfirOp], found: &mut Vec<&'a DfirOp>) {
+    for op in body {
+        if matches!(
+            op,
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView { .. })
+        ) {
+            found.push(op);
+        }
+        for region in dialects::regions(op) {
+            mem_views_in_pre_order(region, found);
+        }
+    }
+}
+
+/// WHICH OF THE FOUR TRANSFORMS RAN ON ONE CANDIDATE, AND WHAT IT ANSWERED — `:281-291`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MasDispatch<'a> {
+    /// `if (isa<agen::VectorLoadOp>(candidate.op_)) transformVectorLoad(candidate);`
+    VectorLoad(TransferSplit<'a>),
+    /// `else if (isa<agen::VectorStoreOp>(..)) transformVectorStore(candidate);`
+    VectorStore(TransferSplit<'a>),
+    /// `else if (isa<agen::CompositeLoadAndStoreOp>(..)) transformCompLoadAndStore(candidate);`
+    CompLoadAndStore(TransferSplit<'a>),
+    /// `else if (isa<agen::CompositeIndirectLoadAndStoreOp>(..))
+    /// transformCompIndLoadAndStore(candidate);`
+    CompIndLoadAndStore(TransferSplit<'a>),
+    /// `else llvm_unreachable("Unexpected candidate operation.")` — the one user of an HBM view is
+    /// none of the four transfers.
+    UnexpectedCandidateOperation,
+    /// No [`DataType`] is as wide as the transfer's elements — see [`transfer_format`].
+    ElementFormatIsUnnamed(ElemType),
+}
+
+/// ONE ENTRY OF `candidates`, AND WHAT THE DISPATCH LOOP DID WITH IT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasSplit<'a> {
+    /// `candidates.emplace_back(mem_op, unit, comp, mem_index)` (`:277`).
+    pub candidate: MasCandidate<'a>,
+    /// The transform's own answer.
+    pub dispatch: MasDispatch<'a>,
+}
+
+/// WHAT THE PASS DID TO A PROGRAM — or the `DT_CHECK` in the collecting walk that stopped it.
+///
+/// ⛔ THE THREE REFUSALS END THE WHOLE PASS, WHICH IS WHY THEY ARE NOT PER-CANDIDATE. All three are
+/// `DT_CHECK`s inside the module walk (`:253`, `:271`, `:275`), and the walk finishes before the
+/// first transform runs — so an abort there means NOTHING was transformed, in any unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum MutableAddrSplitting<'a> {
+    /// One entry per candidate, in the order the walk collected them.
+    Split(Vec<MasSplit<'a>>),
+    /// `DT_CHECK(mem_view->hasOneUse())` — this HBM view is read by zero users or by more than one.
+    MemViewIsNotSingleUsed(Val),
+    /// `DT_CHECK_MSG(mem_index != kMax, "Invalid HBM memory operand.")` — an indirect transfer whose
+    /// HBM view is neither of its two DIRECT memory operands.
+    InvalidHbmMemoryOperand(Val),
+    /// `DT_CHECK_MSG(res.second, "Data transfers should only have one HBM memory operand.")` — a
+    /// second HBM view on a transfer already collected through the first.
+    SecondHbmMemoryOperand(Val),
+}
+
+/// Replaces: e351_runOnOperation
+///
+/// **351/384** `MutableAddrSplittingPass::runOnOperation` — `MutableAddrSplitting.cpp:226` (70L):
+/// collect every HBM view in an L3 unit, then run one transform per memory operation found through
+/// one.
+///
+/// ⛔⛔ `num_conditionals_ = 0` PER UNIT (`:246`) CANNOT DO WHAT ITS COMMENT SAYS. The resets are in
+/// the COLLECTING walk and the counter's only writer is `calculatePartitionSizes`, reached from the
+/// dispatch loop AFTER that walk — so every unit's conditionals go on one total starting at zero.
+pub fn run_on_operation<'p, A: Arch>(
+    program: &'p Program<A>,
+    vals: &mut Values,
+    correction: EarOverflowCorrection,
+) -> MutableAddrSplitting<'p> {
+    // ⛔ `if (DisableThisPass) return;` (`:227`) IS DROPPED, as at entry 305:
+    // `dcc-mutable-addr-splitting-disable` (`:70-73`) is a `dcc-opt` command-line flag, and which
+    // passes run is a call in this crate.
+    //
+    // `std::vector<MASCandidate> candidates;` — ⭐ EACH PAIRED WITH ITS UNIT'S BODY, which is
+    // `candidate.unit_` (the transforms resolve their operands against it), and with the element
+    // format the transform's own `ad.getElementWidth()` will be.
+    let mut candidates: Vec<(MasCandidate<'p>, &'p [DfirOp], ElemType)> = Vec::new();
+    // `std::unordered_set<Operation *> analyzed_candidates;` — ⚠️ BY IDENTITY, so a program with two
+    // structurally equal transfers is two entries. That is what `Operation *` keys on.
+    let mut analyzed: Vec<&'p DfirOp> = Vec::new();
+
+    // `module_op.walk<WalkOrder::PreOrder>([&](dataflow::ProgramUnitOp unit) { .. })` — the units are
+    // a field of the program, so the walk is an iteration (entries 178 and 288 take the same shape).
+    for unit in program.units.iter() {
+        // `auto comp = dcc::getUnitType(unit.getUnits()[0].getDefiningOp<dataflow::GetUnitOp>());`
+        // then `if (!is_any_of(comp, L3LU, L3SU)) return WalkResult::advance();` — [`L3Half::of`] is
+        // that membership test, and [`dfir::Units`] carries the kind so there is nothing to resolve.
+        let comp = unit.on.kind();
+        if L3Half::of(comp).is_none() {
+            continue;
+        }
+        let body = unit.body.as_slice();
+        let mut views: Vec<&'p DfirOp> = Vec::new();
+        mem_views_in_pre_order(body, &mut views);
+        for view in views {
+            let DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                ty: view_ty,
+                ..
+            }) = view
+            else {
+                continue;
+            };
+            // `if (!mem_view || !isCandidateMemView(mem_view)) return WalkResult::advance();`
+            if !is_candidate_mem_view(*from, *start, body, &program.preamble) {
+                continue;
+            }
+            // `DT_CHECK(mem_view->hasOneUse());` then
+            // `auto mem_op = *mem_view->getUsers().begin();` — [`uses`] gives one entry per USE, so a
+            // view read twice by one transfer is not single-used either.
+            let users = uses(*result, body);
+            let [mem_op] = users.as_slice() else {
+                return MutableAddrSplitting::MemViewIsNotSingleUsed(*result);
+            };
+            let mem_op = *mem_op;
+
+            // `agen::MemoryOperandIndex mem_index = agen::MemoryOperandIndex::kMax;`
+            let mem_index = match mem_op {
+                // ⛔ A COMPOSITE'S SOURCE IS COMPARED, AND EVERYTHING ELSE IS THE DESTINATION:
+                // `comp_las.getSrcMemRef() == mem_view.getResult() ? kDirSrc : kDirDst`.
+                DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => Some(
+                    if transfer.src == *result {
+                        MemoryOperandIndex::DirSrc
+                    } else {
+                        MemoryOperandIndex::DirDst
+                    },
+                ),
+                // ⛔⛔ TWO `if`s AND NO `else` (`:262-267`) — an indirect transfer whose HBM view is
+                // one of its INDIRECT operands leaves `mem_index` at `kMax` and hits the check below.
+                DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
+                    if transfer.direct_src == *result {
+                        Some(MemoryOperandIndex::DirSrc)
+                    } else if transfer.direct_dst == *result {
+                        Some(MemoryOperandIndex::DirDst)
+                    } else {
+                        None
+                    }
+                }
+                // `} else { mem_index = agen::MemoryOperandIndex::kDirSrc; }` — a vector load reads
+                // its one memref as the source, and so does a vector STORE's, which is the reference's
+                // own answer for it.
+                _ => Some(MemoryOperandIndex::DirSrc),
+            };
+            // `DT_CHECK_MSG(mem_index != kMax, "Invalid HBM memory operand.");`
+            let Some(mem_index) = mem_index else {
+                return MutableAddrSplitting::InvalidHbmMemoryOperand(*result);
+            };
+            // `auto res = analyzed_candidates.insert(mem_op);`
+            // `DT_CHECK_MSG(res.second, "Data transfers should only have one HBM memory operand.");`
+            if analyzed.iter().any(|seen| core::ptr::eq(*seen, mem_op)) {
+                return MutableAddrSplitting::SecondHbmMemoryOperand(*result);
+            }
+            analyzed.push(mem_op);
+            // `ad.getElementWidth()`, which `AccessDetailsAffine::initialize` takes from the VECTOR
+            // type of a vector transfer and from the memory operand's VIEW type for a composite — and
+            // this view IS that operand, so its own `memref` is the composite's answer.
+            let elem = match mem_op {
+                DfirOp::Agen(agen::Op::VectorLoad { ty, .. } | agen::Op::VectorStore { ty, .. }) => {
+                    ty.elem
+                }
+                _ => view_ty.elem,
+            };
+            candidates.push((
+                MasCandidate {
+                    op: mem_op,
+                    comp,
+                    mem_index,
+                },
+                body,
+                elem,
+            ));
+        }
+    }
+
+    // `for (auto &candidate : candidates)` — ⭐ A SECOND LOOP, and that is what makes the per-unit
+    // reset above inert.
+    let mut num_conditionals = Conditionals::default();
+    let mut split: Vec<MasSplit<'p>> = Vec::new();
+    for (candidate, scope, elem) in candidates {
+        let dispatch = match transfer_format(elem) {
+            None => MasDispatch::ElementFormatIsUnnamed(elem),
+            Some(elem) => match candidate.op {
+                DfirOp::Agen(agen::Op::VectorLoad { .. }) => MasDispatch::VectorLoad(
+                    transform_vector_load::<A>(
+                        vals,
+                        &candidate,
+                        elem,
+                        correction,
+                        &mut num_conditionals,
+                        scope,
+                    ),
+                ),
+                DfirOp::Agen(agen::Op::VectorStore { .. }) => MasDispatch::VectorStore(
+                    transform_vector_store::<A>(
+                        vals,
+                        &candidate,
+                        elem,
+                        correction,
+                        &mut num_conditionals,
+                        scope,
+                    ),
+                ),
+                DfirOp::Agen(agen::Op::CompositeLoadAndStore(_)) => {
+                    MasDispatch::CompLoadAndStore(transform_comp_load_and_store::<A>(
+                        vals,
+                        &candidate,
+                        elem,
+                        correction,
+                        &mut num_conditionals,
+                        scope,
+                    ))
+                }
+                DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(_)) => {
+                    MasDispatch::CompIndLoadAndStore(transform_comp_ind_load_and_store::<A>(
+                        vals,
+                        &candidate,
+                        elem,
+                        correction,
+                        &mut num_conditionals,
+                        scope,
+                    ))
+                }
+                _ => MasDispatch::UnexpectedCandidateOperation,
+            },
+        };
+        split.push(MasSplit {
+            candidate,
+            dispatch,
+        });
+    }
+    MutableAddrSplitting::Split(split)
+}
