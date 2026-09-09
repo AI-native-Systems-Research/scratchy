@@ -7623,7 +7623,10 @@ pub fn lower_symbolic_vector_load_op<A: Arch>(
 pub fn lower_symbolic_vector_store_op<A: Arch>(unit: &ProgramUnit<A>, comp: DfirUnit) -> ! {
     // `:3413-3418` — `constructSymbolicDetailsAndAddrs(op, nullptr, ...)`. The single record it
     // gathers is the only route to `access_details[0]`, `mutable_addrs[0]` and `immutable_addrs[0]`,
-    // which are exactly the three arguments entry 028 needs at `:3428-3431`.
+    // which are exactly the three arguments entry 359 needs at `:3428-3431`. That 7-argument call
+    // resolves to the PRIMARY declaration (`AgenToSentient.hpp:240-245`, all trailing params
+    // defaulted), defined out-of-line as entry 359 — NOT entry 028, whose `Operation* extract_op`
+    // is required (`hpp:247-255`), so entry 028 cannot take a 7-argument call at all.
     todo!(
         "e360_constructSymbolicDetailsAndAddrs mutates the DataflowIR body it gathers over and mints \
          values, and AgenToSentient's walk hands this seam neither, so e359_constructReceiveAndStoreStmt \

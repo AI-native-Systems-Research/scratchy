@@ -991,7 +991,8 @@ pub fn pattern_agnostic_fuse_non_compute_ops_helper<A: Arch>(
 /// ⛔ `is_precision_converted_global` IS BY VALUE (`:99`), so the helper's copy is what the helper
 /// reads; nothing here observes a write back, and the local it was copied from (`:47`, set by entry
 /// 304) is never read again.
-/// ⛔ IT EMITS NOTHING ITSELF — both of its statements are calls, and the rewrite is entry 364's.
+/// ⛔ IT EMITS NOTHING ITSELF — its only calls are the operand read (`:48-50`) and the fusion helper
+/// (`:53-54`); the rewrite is entry 364's.
 pub fn match_and_rewrite<A: Arch>(
     send: &OpId,
     unit: &dfir::ProgramUnit<A>,
@@ -1054,7 +1055,7 @@ pub fn match_and_rewrite<A: Arch>(
 /// dangling non-compute ops and validate.
 ///
 /// ⛔ `redefineConstantVectors(module_op)` TAKES THE WHOLE MODULE AND SITS INSIDE THE WALK (`:1385`)
-/// — it is redone once per PE/SFP unit, not once per pass, and it is the ONE step here that is ported.
+/// — redone once per PE/SFP unit, not once per pass, and the one step that can RUN at this seam.
 /// ⛔ THE GATE IS THE FIRST UNIT HANDLE'S TYPE (`:1379-1383`), and a unit that is neither PE nor SFP
 /// is left untouched by this pass — the PT pass (entry 379) is the one that claims it.
 /// ⛔ THE REUSE ANALYSIS IS SHARED BY ALL FOUR STEPS BELOW IT, so an `OperandReuse::default()` here
@@ -1073,12 +1074,14 @@ pub fn run_on_operation<A: Arch>(program: &mut dfir::Program<A>, values: &mut Va
         // `:1385` — entry 067.
         redefine_constant_vectors(program, values);
 
-        // `:1388` — `OperandReuse reuse_info(unit_op)`, which is what `:1389`, `:1391`, `:1393` and
-        // `:1396`-`:1398` all read.
+        // `:1388` — `OperandReuse reuse_info(unit_op)`, which is what `:1391`, `:1393`, `:1396` and
+        // `:1398` read; `:1389` takes the unit alone (`VectorChainHelper.cpp:468`).
         todo!(
-            "e227_OperandReuse is unported, so e066_resetSentientFMAsIfExists, \
-             e366_fuseNonComputeOps, e076_fuseComputeOps, e344_lowerDanglingNonComputeOpsPESFP and \
-             e228_validateLoweringAndSetMissingParameters cannot run on the {:?} unit",
+            "e227_OperandReuse is the DESTRUCTOR (`OperandReuse.hpp:30`) and is ported; what this \
+             seam lacks is its constructor (`:26-28`), which is not one of the 384, and a sentient \
+             unit body for e066_resetSentientFMAsIfExists, e366_fuseNonComputeOps, \
+             e076_fuseComputeOps, e344_lowerDanglingNonComputeOpsPESFP and \
+             e228_validateLoweringAndSetMissingParameters to run over on the {:?} unit",
             comp
         );
     }

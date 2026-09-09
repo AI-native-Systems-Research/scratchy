@@ -186,8 +186,9 @@ pub const fn compute_unit_precision(precision: dataflow::Precision) -> sentient:
 /// and returns `skip()`. Treating it as a `break` would drop the mask ops of the failing unit.
 /// ⛔ THE XRF MAP AND THE MASK TREE ARE BUILT BEFORE THE REUSE ANALYSIS (`:995-1003` before `:1006`)
 /// and all three fusion steps take all three, so none of them can be defaulted away.
-/// ⭐ THE MASK TREE IS POPULATED HERE, NOT IN THE FUSIONS — *"PT masking relies on loops being
-/// stable"* (`:1000-1001`): it is read during fusion and only spent by `insertPTMaskOps`.
+/// ⭐ `:1003` BUILDS ONLY THE LOOP SKELETON, one node per `sentient.for` (`LoopMaskTree.cpp:173`)
+/// — *"PT masking relies on loops being stable"* (`:1000-1001`). Every MASK node is WRITTEN during
+/// the fusions (`LoweringPTMasks.cpp:20-39` → `LoopMaskTree.cpp:136`); `insertPTMaskOps` spends it.
 pub fn run_on_operation<A: Arch>(program: &mut dfir::Program<A>, values: &mut Values) {
     // `:983` — entry 067, once for the whole module.
     redefine_constant_vectors(program, values);
@@ -208,7 +209,8 @@ pub fn run_on_operation<A: Arch>(program: &mut dfir::Program<A>, values: &mut Va
             "e367_createXrfIndexModifOps is unported, so e368_fuseNonComputeOps, \
              e369_fuseComputeOps, e346_lowerDanglingNonComputeOps, \
              e228_validateLoweringAndSetMissingParameters and e239_insertPTMaskOps cannot run on the \
-             {:?} unit (e227_OperandReuse and the LoopMaskTree of `:1003` are unported too)",
+             {:?} unit (e238_computeLoops IS ported — the tree of `:1003` wants a sentient body to \
+             build from, and `OperandReuse`'s constructor at `:1006` is not one of the 384)",
             comp
         );
     }
