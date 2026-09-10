@@ -51,7 +51,7 @@ in. Provide `-Fserve` or `-Fbench` to bring more features into the
 binary. To run a quick test of the build:
 
 ```bash
-./target/release/scr chat mlx-community/Llama-3.2-3b-Instruct-4bit -q "why is the sky blue?"
+./target/release/scr chat mlx-community/Llama-3.2-3B-Instruct-4bit -q "why is the sky blue?"
 ```
 
 Note the convention for selecting models and quants:
