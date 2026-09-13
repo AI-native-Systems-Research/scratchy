@@ -221,6 +221,7 @@ impl FoldDim {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Coordinate {
     dims: BTreeMap<PrimaryDim, FoldDim>,
+    padding: Padding,
     fold_constructed: bool,
 }
 
@@ -282,6 +283,19 @@ impl Coordinate {
         if let Some(entry) = self.dims.get_mut(&dim) {
             *entry = FoldDim::default();
         }
+    }
+
+    /// `getPadding(dim)` (`dsc/dsc2.h:241`) — how this coordinate READS the dim, which is a
+    /// different fact from the allocation's own [`AllocPlacement::padding`] and survives
+    /// [`Self::clear_fold_for_dim`] as the reference's own note says (`:100`).
+    #[must_use]
+    pub fn padding(&self, dim: PrimaryDim) -> PadType {
+        self.padding.get(dim)
+    }
+
+    /// `setPadding(dim, pad)` (`dsc/dsc2.h:236`).
+    pub fn set_padding(&mut self, dim: PrimaryDim, pad: PadType) {
+        self.padding.set(dim, pad);
     }
 
     /// `foldConstructed()` (`dsc/dsc2.h:119`).

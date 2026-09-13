@@ -269,7 +269,10 @@
 
 use crate::arch::{Arch, Bounded, Bytes, Elements, IsaGen, Target};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
-use crate::schedule::ddc::fold::{AllocId, AllocLayout, NodeId, PadType};
+use crate::schedule::ddc::fold::{
+    AllocId, AllocLayout, Alpha, Beta, Cardinality, ElemArrDistribution, FoldParamInfo, NodeId,
+    PadType, RefComponents, TemporalLoopDistribution,
+};
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, stricter_max, stricter_min};
 use crate::schedule::ddc::transformation::{DsType, LoopId, Scale};
 use crate::schedule::ddc::transformation_util::{
@@ -278,17 +281,19 @@ use crate::schedule::ddc::transformation_util::{
 };
 use crate::schedule::ddc::v1::{self, ComputeOps};
 use crate::schedule::dsc2::{
-    AllocateNode, BlockNode, ChildPos, Dsc, Dsts, Fold, FoldDim, LdsIdx, Node, NodeName, ReplicationFactor,
-    SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, Via,
+    AllocateNode, BlockNode, ChildPos, Coordinate, CoordinateCategory, Dsc, Dsts, Fold,
+    FoldCardinality, FoldCoeff, FoldDim, FoldLabel, FoldPosition, LdsIdx, Node, NodeName,
+    ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength, SyncUnits,
+    TransferNode, Via,
 };
 use crate::schedule::l3::dsc::{
-    AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare,
+    AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare, CoreletsUsed,
     DATA_STAGE_CHUNK, DATA_STAGE_CORE, DesignSpaceConfig, DimCandidates, DimPadding, DimStage,
     DscCandidates, DscGroup, DscIdx, DscParamCandidates, FilledDims, IndexTensor, IndirectAlloc,
     InitialPlacement, InsertSide, L3Transfer, LabeledDs, MemOrg, MemOrgs, MulticastDegree,
-    NodeParents, PagedStages, Pinning, ScheduleNodes, ScheduleTrees, SchedulerMetadata, StickVolume,
-    StickVolumes, SuperChunkStage, SuperDsc, SymbolicDimInfo, TransferNodes, UnneededPad, WkSlice,
-    WkSliceCount, WkSliceId,
+    NodeParents, PagedStages, Pinning, ScheduleNodes, ScheduleTrees, SchedulerMetadata,
+    StickVolume, StickVolumes, SuperChunkStage, SuperDsc, SymbolicDimInfo, TransferNodes,
+    UnneededPad, WkSlice, WkSliceCount, WkSliceId,
 };
 use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -7041,12 +7046,556 @@ mod tests_e205_e212 {
 //   extract   : crustify-ddc/cpp/l3.cpp:4577-4761
 //   calls     : e061_gatherFoldParams, e062_getEnclosingLoopsAndRelatedDims, e063_findAndStoreLoopWithDim
 
-// crustify:todo: e229_sliceCoordinateForCorelet
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7518  (203 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::sliceCoordinateForCorelet( SuperDsc &mySDsc, DesignSpaceConfig *currDsc, dsc2::AllocateNode *allocNode) const
-//   extract   : crustify-ddc/cpp/l3.cpp:4771-4976
-//   calls     : e046_getLxBelowBlockNode, e061_gatherFoldParams, e064_constructDatastage, e065_constructLoopNode
+/// THE TWO CORELET COUNTS ONE DSC CARRIES — `numCoreletsUsed_` and `numCoreletsUsed_DSC2_`
+/// (`dsc/designSpaceConfig.h:74`), which entry 229 uses for DIFFERENT things: the first halves the
+/// data stage, the second scales the work-slice cardinality and divides the temporal alphas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreletCounts {
+    /// `numCoreletsUsed_`.
+    pub used: CoreletsUsed,
+    /// `numCoreletsUsed_DSC2_`.
+    pub dsc2: CoreletsUsed,
+}
+
+/// WHAT A CORELET SLICE READS OFF THE ALLOCATE NODE — `allocNode` narrowed to its four facts, with
+/// `allocateCoordinates_` travelling separately because entry 229 needs it EXCLUSIVELY borrowed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlicedAllocation {
+    /// The node itself — `foldOwnerNode` for the distributor.
+    pub node: NodeId,
+    /// `component_`, which is both `sizeRefComp` and `propRefComp` here.
+    pub component: SenComponent,
+    /// `ldsIdx_`.
+    pub lds: LdsIdx,
+    /// `labeledDs_.at(ldsIdx_)` through [`LabeledDs::scale`], whose [`None`] is the reference's
+    /// `dimIdx < 0` fallback to scale 1.
+    pub dim_scale: Option<Scale>,
+}
+
+/// WHAT A CORELET SLICE READS AND WRITES ON ONE DATA-STAGE HALF — `DataStructDims` narrowed to the
+/// three questions entry 229 asks of `ss_` and `el_` alike.
+pub trait CoreletSliceDims {
+    /// `coreletSplit_.begin()->first`, [`None`] where this half splits nothing.
+    fn first_corelet_split_dim(&self) -> Option<PrimaryDim>;
+
+    /// `primaryDimToValHandler_st(dim) /= n`, AND every `coreletSplit_.at(dim)` share alike — the
+    /// chunk-half-and-half slicing strategy, on this half.
+    fn divide_for_corelets(&mut self, dim: PrimaryDim, corelets: CoreletsUsed);
+
+    /// `dataStageDimToVal_compView_st(dim, comp)`, [`None`] where this half has no such extent.
+    fn comp_view_extent(&self, dim: PrimaryDim, comp: SenComponent) -> Option<Extent>;
+}
+
+/// THE dsc2 TREE A CORELET SLICE WORKS AGAINST — `dataStageParam_` plus the two `dsc/dsc2.cpp`
+/// helpers entry 229 reaches through, both OUTSIDE this campaign's file list
+/// (`crustify-ddc/OUTSIDE-DEPS.tsv`, "dsc2 tree utilities"), so they are seams here and not ports.
+pub trait CoreletSliceSeam: TemporalLoopDistribution {
+    /// The extents payload each of this DSC's data stages carries.
+    type Dims: Clone + CoreletSliceDims;
+
+    /// `currDsc->dataStageParam_`.
+    fn stages(&self) -> &DataStages<Self::Dims>;
+
+    /// The same, writable — entry 229 mints a denominator stage in it and erases it again.
+    fn stages_mut(&mut self) -> &mut DataStages<Self::Dims>;
+
+    /// `dsc2::loopRelevantForDim(currDsc, dimAndKind, loopNode, accessPadType)`
+    /// (`dsc/dsc2.cpp:6550`) — asked of ONE loop, which is why
+    /// [`TemporalLoopDistribution::related_loops`] cannot answer it: `collectRelatedLoops` pushes
+    /// one entry per matching *(loop, loop dim)* pair carrying the LOOP'S own dim, where entry 229
+    /// pushes each relevant loop ONCE carrying the corelet-split dim.
+    fn loop_relevant(&self, dim: PrimaryDimAndKind, loop_node: &LoopNode, pad: PadType) -> bool;
+
+    /// [`lx_below_block_node`] then `getMutableOwnerLoop()` walked upward, INNERMOST FIRST and
+    /// WITHOUT the outermost loop — *"Exclude the root loop"*, which breaks on a loop with NO OWNER
+    /// LOOP and so is NOT [`parent_loop_nodes`] (that one breaks on no parent BLOCK). [`None`] is
+    /// `DT_CHECK_MSG(lxBelowBlockNode, "Expect a valid lx_below block node.")`.
+    fn lx_below_chunk_loops(&self) -> Option<Vec<&LoopNode>>;
+}
+
+/// Replaces: e229_sliceCoordinateForCorelet
+///
+/// REBUILDS the corelet-split dim's folds on the allocation's coordinate: halves the chunk stage,
+/// mints a corelet-slice loop over it and redistributes the element arrangements onto that loop.
+/// ⛔ TRAP: `int scale = allocLds.scale_.at(dimIdx)` TRUNCATES a `double`, so `scale < 0` catches
+/// only [`Scale::UnitStick`]/[`Scale::StickDim`] — a fractional broadcast SURVIVES the guard.
+/// ⛔ TRAP: THE WALK EXCLUDES THE OUTERMOST LOOP, and the distributor's dim is the BARE
+/// `{coreletSplitDim, Unpadded}` while `relatedLoops` carries the possibly-`Padded` kind.
+pub fn slice_coordinate_for_corelet<T: CoreletSliceSeam + ?Sized>(
+    sdsc: &SuperDsc,
+    corelets: CoreletCounts,
+    alloc: SlicedAllocation,
+    seam: &mut T,
+    loop_params: &mut T::LoopParams,
+    coord: &mut Coordinate,
+) -> Option<()> {
+    if !corelets.used.splits() || alloc.component != SenComponent::Lx {
+        return Some(());
+    }
+    let chunk = seam.stages().0.get(&DATA_STAGE_CHUNK)?.clone();
+    let Some(dim) = chunk.ss.dims.first_corelet_split_dim() else {
+        return Some(());
+    };
+    let Some(folds) = coord.fold_dim(dim) else {
+        return Some(());
+    };
+    // Check if the coreletSplitDim is a broadcast dimension.
+    if matches!(alloc.dim_scale, Some(Scale::UnitStick | Scale::StickDim)) {
+        return Some(());
+    }
+
+    let is_lx_pinned = folds.temporal_folds() == 0;
+    let spatial_ends = i64::from(folds.spatial_folds()) - 1;
+    let temporal_ends = spatial_ends + i64::from(folds.temporal_folds());
+    let mut fold_params = Vec::new();
+    gather_fold_params(folds, &mut fold_params);
+    // `temporalFoldEnds + 1` — where the levels INSIDE the coordinate's own folds start.
+    let inside = usize::try_from(temporal_ends + 1).unwrap_or(0);
+    // The distributor reads no input label and entry 229 overwrites every output one below, so the
+    // concatenated [`FoldLabel`]s do not have to survive the crossing.
+    let elem_arr = fold_params
+        .get(inside..)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .map(|fold| FoldParamInfo {
+            alpha: Alpha(fold.alpha.0),
+            beta: Beta(fold.beta.0),
+            cardinality: Cardinality(u64::from(fold.cardinality.0)),
+            label: None,
+        })
+        .collect();
+
+    // Construct an artificial loop to simulate corelet level slicing: chunk half-and-half.
+    let den = construct_datastage(seam.stages_mut(), &chunk);
+    let den_stage = seam.stages_mut().0.get_mut(&den)?;
+    den_stage.ss.dims.divide_for_corelets(dim, corelets.used);
+    den_stage.el.dims.divide_for_corelets(dim, corelets.used);
+    let bare = PrimaryDimAndKind {
+        dim,
+        kind: MetaDimKind::Unpadded,
+    };
+    let new_loop = construct_loop_node(DATA_STAGE_CHUNK, den, LoopDims::new(bare, Vec::new()));
+
+    let alloc_padding = coord.padding(dim);
+    let split_dim = PrimaryDimAndKind {
+        dim,
+        kind: if alloc_padding == PadType::NoPad {
+            MetaDimKind::Unpadded
+        } else {
+            MetaDimKind::Padded
+        },
+    };
+    let mut related = vec![LoopAndDim {
+        loop_node: &new_loop,
+        dim: split_dim,
+        distribution: LoopDistribution::AboveChunk,
+    }];
+    if is_lx_pinned {
+        // LX-pinned allocation: every chunk loop joins the distribution and its fold becomes an
+        // outer element arrangement. Inner (position 0) to outer (end of list).
+        for loop_node in seam.lx_below_chunk_loops()? {
+            if seam.loop_relevant(split_dim, loop_node, alloc_padding) {
+                related.push(LoopAndDim {
+                    loop_node,
+                    dim: split_dim,
+                    distribution: LoopDistribution::AboveChunk,
+                });
+            }
+        }
+    }
+
+    // The reference makes the allocation a temporary child of the new loop so the distributor can
+    // compute custom data stages, and restores the tree straight after; that net-zero positioning
+    // is the seam's own precondition and not a fact about the coordinate.
+    let elem_arr_after = seam.distribute(
+        &ElemArrDistribution {
+            dim: bare,
+            fold_owner: alloc.node,
+            target_lds: alloc.lds,
+            ref_pad: alloc_padding,
+            target_pad: alloc_padding,
+            components: RefComponents {
+                size: alloc.component,
+                prop: alloc.component,
+            },
+            loops_to_distribute: related.clone(),
+            elem_arr,
+        },
+        loop_params,
+    );
+
+    // Update wkSlice fold.
+    let distributed = seam.distributed(loop_params, &new_loop, dim)?;
+    let wk_slices = sdsc.num_wk_slices_per_dim.get(&dim)?;
+    *fold_params.get_mut(FoldPosition::Core as usize)? = Fold {
+        cardinality: FoldCardinality(corelets.dsc2.get().saturating_mul(wk_slices.get())),
+        label: FoldLabel("workslice_fold".to_owned()),
+        alpha: FoldCoeff(distributed.alpha.0),
+        beta: FoldCoeff(distributed.beta.0),
+    };
+
+    // Update temporal folds: adjust alpha for the chunk-half-and-half slicing strategy.
+    for (position, fold) in fold_params.iter_mut().enumerate() {
+        let position = position as i64;
+        if position > spatial_ends && position <= temporal_ends {
+            fold.alpha = FoldCoeff(fold.alpha.0 / i64::from(corelets.dsc2.get()));
+        }
+    }
+
+    fold_params.truncate(inside);
+    if is_lx_pinned {
+        // Outer to inner; position 0 is the corelet fold rewritten above.
+        for related_loop in related.get(1..).unwrap_or_default().iter().rev() {
+            let loop_node = related_loop.loop_node;
+            let num = seam
+                .stages()
+                .0
+                .get(&loop_node.num)?
+                .ss
+                .dims
+                .comp_view_extent(dim, alloc.component)?;
+            let den = seam
+                .stages()
+                .0
+                .get(&loop_node.den)?
+                .ss
+                .dims
+                .comp_view_extent(dim, alloc.component)?;
+            let iterations = num.0.checked_div(den.0)?;
+            let params = seam.distributed(loop_params, loop_node, dim)?;
+            fold_params.push(Fold {
+                cardinality: FoldCardinality(u32::try_from(iterations).unwrap_or(u32::MAX)),
+                label: FoldLabel("elem_arr_chunk_level".to_owned()),
+                alpha: FoldCoeff(params.alpha.0),
+                beta: FoldCoeff(params.beta.0),
+            });
+        }
+    }
+
+    // The innermost element arrangement is at the beginning of the distributor's answer.
+    for (level, params) in elem_arr_after.iter().enumerate().rev() {
+        fold_params.push(Fold {
+            cardinality: FoldCardinality(u32::try_from(params.cardinality.0).unwrap_or(u32::MAX)),
+            label: FoldLabel(format!("elem_arr_{level}")),
+            alpha: FoldCoeff(params.alpha.0),
+            beta: FoldCoeff(params.beta.0),
+        });
+    }
+
+    coord.clear_fold_for_dim(dim);
+    for (position, fold) in fold_params.iter().enumerate().rev() {
+        let category = match position as i64 {
+            position if position > temporal_ends => CoordinateCategory::ElemArr,
+            position if position > spatial_ends => CoordinateCategory::Temporal,
+            _ => CoordinateCategory::Spatial,
+        };
+        coord.add_fold_front(
+            dim,
+            category,
+            fold.cardinality,
+            fold.label.clone(),
+            fold.alpha,
+            fold.beta,
+        );
+    }
+
+    // ⚠️ THE TEMPORARY STAGE'S ERASE IS DEFERRED TO HERE so the loop chain's shared borrows are
+    // dead first. Past the reference's own erase point the only stage reads are of PRE-EXISTING
+    // chunk loops' `numId_`/`denId_`, and `free_id()` cannot have handed one of those out.
+    seam.stages_mut().0.remove(&den);
+    Some(())
+}
+
+#[cfg(test)]
+mod tests_e229 {
+    use super::*;
+    use crate::schedule::ddc::fold::DistributedLoop;
+    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, DataStage as L3DataStage, DataStages as L3DataStages, DscList, LabeledDsList,
+        NamedDims, StageDims as L3StageDims,
+    };
+    use std::cell::RefCell;
+
+    /// ONE DATA-STAGE HALF: the split dim's extent and its corelet shares.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Dims {
+        extent: i64,
+        split: Vec<i64>,
+    }
+
+    impl CoreletSliceDims for Dims {
+        fn first_corelet_split_dim(&self) -> Option<PrimaryDim> {
+            (!self.split.is_empty()).then_some(PrimaryDim::X)
+        }
+
+        fn divide_for_corelets(&mut self, _dim: PrimaryDim, corelets: CoreletsUsed) {
+            let corelets = i64::from(corelets.get());
+            self.extent /= corelets;
+            for share in &mut self.split {
+                *share /= corelets;
+            }
+        }
+
+        fn comp_view_extent(&self, _dim: PrimaryDim, _comp: SenComponent) -> Option<Extent> {
+            Some(Extent(self.extent))
+        }
+    }
+
+    /// The dsc2 seams: every chunk loop is relevant, and the distributor stamps the `n`th loop it is
+    /// handed with alpha `10 + n` and hands the element arrangements straight back.
+    struct Seam {
+        stages: DataStages<Dims>,
+        chunk_loops: Vec<LoopNode>,
+        /// The minted denominator half AS THE DISTRIBUTOR SAW IT — the halving's own witness, since
+        /// the stage itself is erased before the call returns.
+        sliced: RefCell<Option<Dims>>,
+    }
+
+    impl TemporalLoopDistribution for Seam {
+        type LoopParams = Vec<(NodeName, DistributedLoop)>;
+
+        fn related_loops<'l>(
+            &self,
+            _dim: PrimaryDimAndKind,
+            chain: &[LoopAndDim<'l>],
+            _pad: PadType,
+        ) -> Vec<LoopAndDim<'l>> {
+            chain.to_vec()
+        }
+
+        fn distribute(
+            &self,
+            request: &ElemArrDistribution<'_>,
+            loop_params: &mut Self::LoopParams,
+        ) -> Vec<FoldParamInfo> {
+            *self.sliced.borrow_mut() = request
+                .loops_to_distribute
+                .first()
+                .and_then(|entry| self.stages.0.get(&entry.loop_node.den))
+                .map(|stage| stage.ss.dims.clone());
+            for (nth, entry) in request.loops_to_distribute.iter().enumerate() {
+                loop_params.push((
+                    entry.loop_node.name.clone(),
+                    DistributedLoop {
+                        alpha: Alpha(10 + nth as i64),
+                        beta: Beta(nth as i64),
+                    },
+                ));
+            }
+            request.elem_arr.clone()
+        }
+
+        fn distributed(
+            &self,
+            loop_params: &Self::LoopParams,
+            loop_node: &LoopNode,
+            _dim: PrimaryDim,
+        ) -> Option<DistributedLoop> {
+            loop_params
+                .iter()
+                .find(|(name, _)| *name == loop_node.name)
+                .map(|(_, params)| *params)
+        }
+    }
+
+    impl CoreletSliceSeam for Seam {
+        type Dims = Dims;
+
+        fn stages(&self) -> &DataStages<Dims> {
+            &self.stages
+        }
+
+        fn stages_mut(&mut self) -> &mut DataStages<Dims> {
+            &mut self.stages
+        }
+
+        fn loop_relevant(
+            &self,
+            _dim: PrimaryDimAndKind,
+            _loop_node: &LoopNode,
+            _pad: PadType,
+        ) -> bool {
+            true
+        }
+
+        fn lx_below_chunk_loops(&self) -> Option<Vec<&LoopNode>> {
+            Some(self.chunk_loops.iter().collect())
+        }
+    }
+
+    fn stage(extent: i64) -> DataStage<Dims> {
+        let half = StageDims {
+            name: StageName::default(),
+            dims: Dims {
+                extent,
+                split: vec![extent / 2],
+            },
+        };
+        DataStage {
+            ss: half.clone(),
+            el: half,
+        }
+    }
+
+    fn loop_over(num: DatastageId, den: DatastageId) -> LoopNode {
+        construct_loop_node(
+            num,
+            den,
+            LoopDims::new(
+                PrimaryDimAndKind {
+                    dim: PrimaryDim::X,
+                    kind: MetaDimKind::Unpadded,
+                },
+                Vec::new(),
+            ),
+        )
+    }
+
+    fn corelets(count: u32) -> CoreletsUsed {
+        CoreletsUsed::new(NonZeroU32::new(count).expect("a positive corelet count"))
+    }
+
+    /// A super-DSC stating TWO work slices of `X` — only `numWkSlicesPerDim_` is read.
+    fn a_super_dsc() -> SuperDsc {
+        let l3_stage = || {
+            let named = NamedDims {
+                name: StageName::default(),
+                dims: FilledDims::of(L3StageDims {
+                    extents: BTreeMap::from([(PrimaryDim::X, Extent(8))]),
+                    ..L3StageDims::default()
+                })
+                .expect("a stage stating at least one dim"),
+            };
+            L3DataStage {
+                ss: named.clone(),
+                el: named,
+            }
+        };
+        let dsc = DesignSpaceConfig {
+            corelets_used: corelets(2),
+            corelets_used_dsc2: Some(corelets(2)),
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), vec![]),
+            layout_dims: BTreeMap::from([(LdsIdx(0), LayoutDims::new(PrimaryDim::X, vec![]))]),
+            labeled_ds: LabeledDsList::new(
+                LabeledDs::new(DsType::Input, vec![], LdsIdx(0), Pinning::default()),
+                vec![],
+            ),
+            data_stages: L3DataStages::new(l3_stage(), l3_stage()),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+        };
+        SuperDsc::new(
+            DscList::new(dsc, vec![]),
+            BTreeMap::from([(
+                PrimaryDim::X,
+                WkSliceCount::new(NonZeroU32::new(2).expect("two work slices")),
+            )]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    }
+
+    /// e229 — an LX-pinned corelet split halves the chunk stage, rewrites position 0 as the
+    /// work-slice fold, keeps NOTHING inside it, and re-lays the chunk loop then the two element
+    /// arrangements after it.
+    #[test]
+    fn a_corelet_slice_rebuilds_the_split_dims_folds_and_erases_its_temporary_stage() {
+        let mut seam = Seam {
+            stages: DataStages(BTreeMap::from([
+                (DATA_STAGE_CHUNK, stage(8)),
+                (DatastageId(2), stage(8)),
+                (DatastageId(3), stage(4)),
+            ])),
+            chunk_loops: vec![loop_over(DatastageId(2), DatastageId(3))],
+            sliced: RefCell::new(None),
+        };
+        // ONE spatial fold then two element arrangements; NO temporal fold, so the alloc is pinned.
+        let mut coord = Coordinate::default();
+        for (category, cardinality, label, alpha, beta) in [
+            (CoordinateCategory::ElemArr, 7, "e2", 9, 2),
+            (CoordinateCategory::ElemArr, 3, "e1", 5, 1),
+            (CoordinateCategory::Spatial, 1, "s0", 1, 0),
+        ] {
+            coord.add_fold_front(
+                PrimaryDim::X,
+                category,
+                FoldCardinality(cardinality),
+                FoldLabel(label.to_owned()),
+                FoldCoeff(alpha),
+                FoldCoeff(beta),
+            );
+        }
+        let mut loop_params = Vec::new();
+
+        assert_eq!(
+            slice_coordinate_for_corelet(
+                &a_super_dsc(),
+                CoreletCounts {
+                    used: corelets(2),
+                    dsc2: corelets(2),
+                },
+                SlicedAllocation {
+                    node: NodeId(0),
+                    component: SenComponent::Lx,
+                    lds: LdsIdx(0),
+                    dim_scale: Some(Scale::Sized(1.0)),
+                },
+                &mut seam,
+                &mut loop_params,
+                &mut coord,
+            ),
+            Some(())
+        );
+
+        let folds = coord
+            .fold_dim(PrimaryDim::X)
+            .expect("the dim stays covered");
+        assert_eq!(
+            folds
+                .folds()
+                .map(|fold| (
+                    fold.cardinality.0,
+                    fold.label.0.clone(),
+                    fold.alpha.0,
+                    fold.beta.0
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                // `numCoreletsUsed_DSC2_ * numWkSlicesPerDim_.at(X)`, with the MINTED loop's alpha.
+                (4, "workslice_fold".to_owned(), 10, 0),
+                // The chunk loop: 8 / 4 iterations, and the alpha the distributor gave IT.
+                (2, "elem_arr_chunk_level".to_owned(), 11, 1),
+                // The element arrangements, re-labelled innermost-LAST.
+                (3, "elem_arr_1".to_owned(), 5, 1),
+                (7, "elem_arr_0".to_owned(), 9, 2),
+            ]
+        );
+        assert_eq!(
+            (
+                folds.spatial_folds(),
+                folds.temporal_folds(),
+                folds.elem_arr_folds()
+            ),
+            (1, 0, 3)
+        );
+        // The denominator half WAS halved, and its stage is gone again.
+        assert_eq!(
+            seam.sliced.into_inner(),
+            Some(Dims {
+                extent: 4,
+                split: vec![2]
+            })
+        );
+        assert_eq!(
+            seam.stages.0.keys().copied().collect::<Vec<_>>(),
+            vec![DATA_STAGE_CHUNK, DatastageId(2), DatastageId(3)]
+        );
+    }
+}
 
 // crustify:todo: e283_addOrUpdateCoreletSplitInParams
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:105  (20 body lines, level 2)
