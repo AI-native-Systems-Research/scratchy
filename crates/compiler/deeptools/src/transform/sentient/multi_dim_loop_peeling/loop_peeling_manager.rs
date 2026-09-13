@@ -107,7 +107,7 @@ use crate::transform::sentient::loop_absorption::run_loop_absorption;
 use crate::transform::sentient::loop_merging::run_loop_merging;
 use crate::transform::sentient::op_rerolling::{MergeXrfIntoMac, RerollScope, run_op_rerolling};
 use crate::transform::sentient::scalar_simplifications::sentient::Propagation;
-use crate::transform::sentient::utils::{InBlock, OpAt, reverse_predicate};
+use crate::transform::sentient::utils::{InBlock, OpAt, SenTarget, reverse_predicate};
 
 /// WHERE ONE OP SITS IN A REGION TREE — the block reached by taking region `r` of the op at index `i`
 /// for each `(i, r)` of `into`, then index `at` in that block.
@@ -384,6 +384,7 @@ mod unit_tests {
         Evaluation, ExpressionEvaluator, InstructionCount, InstructionEstimator, OffsetSites,
         Offsets, OutOfScopePropagationAnalysis, OutOfScopeUnitIndexMap,
     };
+    use crate::transform::sentient::utils::SenTarget;
     use crate::units::DfirUnit;
 
     /// e568 — on a loop of bound 8 (whose IV counts 8 down to 1) `%iv >= 8` names the FIRST
@@ -962,14 +963,17 @@ mod unit_tests {
     }
 
     /// e630's vendor shape — a loop of bound 8 whose body tests its own first iteration goes into the
-    /// throwaway loop and is peeled there.
+    /// throwaway loop, is peeled and compressed there, and REPLACES the original because it costs 0
+    /// against the original's 100.
     ///
-    /// ⛔ THE SPECULATION CANNOT BE SCORED YET: the third compression pass `run` runs over the dummy
-    /// is [`run_op_rerolling`], and `e519_processOneBlock` reaches unported `e335` at the dummy body's
-    /// first op — so what is observable is the state at that seam, with the dummy loop built beside an
-    /// original that has not been replaced. ⭐ REVISIT THIS ASSERTION WITH e335.
+    /// ⭐ THE PEELED CLONE COMPRESSES TO NOTHING, AND THAT IS THE FIXTURE AND NOT THE PASS: this loop
+    /// carries no value and nobody reads its `sentient.scalar_add`, so the simplification `run` calls
+    /// next is entitled to drop all of it. What is scored here is e630's own tail — the profitable
+    /// splice, and `erase_dummy` leaving neither the throwaway loop nor its bound of 2 behind.
+    /// ⛔ THE `x` REROLLING DOES NOT TOUCH THIS BODY: a `sentient.scalar_add` is not a candidate op,
+    /// so `e335_fill` leaves the `"NA"` sentinel and no statement is ever built.
     #[test]
-    fn e630_peels_into_the_dummy_loop_and_stops_at_the_unported_rerolling() {
+    fn e630_peels_into_the_dummy_loop_and_replaces_the_original() {
         let mut unit = sfp_unit(vec![
             constant(8, Val(1)),
             for_loop(
@@ -996,39 +1000,27 @@ mod unit_tests {
             values.mint();
         }
 
-        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run(
-                ForRef(Val(3)),
-                &mut unit,
-                &mut preamble,
-                &mut IvLoopInfo::default(),
-                &mut StatedEstimator {
-                    original: InstructionCount(100),
-                    per_op: 1,
-                    ibuff: InstructionCount(0),
-                },
-                &mut BlindEvaluator,
-                &mut OutOfScopePropagationAnalysis,
-                &OutOfScopeUnitIndexMap,
-                &mut values,
-            );
-        }));
-
-        assert!(
-            reached.is_err(),
-            "rerolling the dummy loop reaches unported e335"
+        run(
+            ForRef(Val(3)),
+            &mut unit,
+            &mut preamble,
+            &mut IvLoopInfo::default(),
+            &mut StatedEstimator {
+                original: InstructionCount(100),
+                per_op: 1,
+                ibuff: InstructionCount(0),
+            },
+            &mut BlindEvaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut values,
+            SenTarget::Sentient,
         );
-        // The dummy loop was built beside the original, and the original is still standing because
-        // the profitability comparison is downstream of the seam.
-        assert!(top_level_at(&unit.body, ForRef(Val(3))).is_some());
-        assert_eq!(
-            unit.body
-                .iter()
-                .filter(|op| matches!(op, Op::Sentient(sentient::Op::For { .. })))
-                .count(),
-            2,
-            "the throwaway loop holding the peeled clone, and the original"
-        );
+        // Neither the throwaway loop nor the constant that bounded it survives, and the original loop
+        // it was speculating against is gone with them.
+        assert_eq!(unit.body, vec![constant(8, Val(1))]);
+        assert_eq!(preamble, Vec::new());
+        assert!(top_level_at(&unit.body, ForRef(Val(3))).is_none());
     }
 
     /// e630's negative — ⛔ A LOOP WITH NOTHING TO PEEL LEAVES THE UNIT EXACTLY AS IT WAS: the dummy
@@ -1070,6 +1062,7 @@ mod unit_tests {
             &mut OutOfScopePropagationAnalysis,
             &OutOfScopeUnitIndexMap,
             &mut values,
+            SenTarget::Sentient,
         );
 
         assert_eq!(unit.body, body);
@@ -1499,6 +1492,7 @@ pub(crate) fn run<
     propagation: &mut P,
     unit_index_map: &U,
     values: &mut Values,
+    sen_target: SenTarget,
 ) {
     let avail_ibuff_space = estimator.remaining_ibuff_space(&unit.body);
     let Some(at) = top_level_at(&unit.body, outer_loop) else {
@@ -1589,6 +1583,8 @@ pub(crate) fn run<
             unit,
             &RerollScope::Op(OpAt::top(InBlock(dummy_at))),
             MergeXrfIntoMac::No,
+            sen_target,
+            values,
         );
     }
     run_loop_absorption(preamble, &mut unit.body, values);

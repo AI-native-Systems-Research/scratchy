@@ -913,6 +913,22 @@ pub(crate) trait ColoringGraph {
     /// edge recorded on BOTH nodes.
     fn add_bidirectional_edge(&mut self, node1: DataId, node2: DataId);
 
+    /// `getOrAddNode(index)->addValidValues(values)` (`Analyses/GraphColoring.hpp:34`) — the colours
+    /// this node may take.
+    ///
+    /// ⛔⛔ IT **REPLACES**, IT DOES NOT ADD. `addValidValues`' `addon` parameter defaults to `false`
+    /// and every port-assignment caller leaves it there, so the third argument's whole effect is
+    /// `setValidValues` (`Analyses/GraphColoring.cpp:44-57`) — which is why `e339`'s later
+    /// `addValidValues({2})` on a node it already constrained is a narrowing and not a union.
+    /// ⭐ THE LIST IS KEPT SORTED AND UNIQUE by the analysis itself, and [`PortId`] is `Ord`.
+    fn set_valid_values(&mut self, index: DataId, values: &[PortId]);
+
+    /// `getOrAddNode(index)->getValidValues()` (`Analyses/GraphColoring.hpp:36`).
+    ///
+    /// ⭐ `&mut self` BECAUSE `getOrAddNode` MAY CREATE THE NODE: asking an unconstrained node what it
+    /// may take adds it to the graph, which `e340` does on every `DataTransferOnly` mac.
+    fn valid_values(&mut self, index: DataId) -> Vec<PortId>;
+
     /// `int getNumNodes() const` (`Analyses/GraphColoring.hpp:118`) — `nodes_.size()`.
     ///
     /// ⛔ IT IS THE NODE MAP AND NOT `max_node_id_`, which `clear()` leaves standing: a graph cleared
@@ -950,6 +966,18 @@ impl ColoringGraph for OutOfScopeColoringGraph {
     fn add_bidirectional_edge(&mut self, _node1: DataId, _node2: DataId) {
         todo!(
             "GraphColoring::addBidirectionalEdge (Analyses/GraphColoring.hpp:80) — out of campaign scope"
+        )
+    }
+
+    fn set_valid_values(&mut self, _index: DataId, _values: &[PortId]) {
+        todo!(
+            "GraphNode::addValidValues (Analyses/GraphColoring.hpp:34) — out of campaign scope"
+        )
+    }
+
+    fn valid_values(&mut self, _index: DataId) -> Vec<PortId> {
+        todo!(
+            "GraphNode::getValidValues (Analyses/GraphColoring.hpp:36) — out of campaign scope"
         )
     }
 
