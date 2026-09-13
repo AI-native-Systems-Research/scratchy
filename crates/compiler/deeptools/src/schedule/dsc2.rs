@@ -218,6 +218,7 @@ impl FoldDim {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Coordinate {
     dims: BTreeMap<PrimaryDim, FoldDim>,
+    fold_constructed: bool,
 }
 
 impl Coordinate {
@@ -261,6 +262,29 @@ impl Coordinate {
             CoordinateCategory::Temporal => entry.temporal += 1,
             CoordinateCategory::ElemArr => entry.elem_arr += 1,
         }
+    }
+
+    /// `clearFoldForDim(dim)` (`dsc/dsc2.h:99-114`) — empties the dim's folds and zeroes its three
+    /// counts.
+    ///
+    /// ⛔⛔ THE DIM STAYS COVERED. The reference `reset()`s the fold manager in place and leaves the
+    /// `coordinates_` entry (and the padding) where it was, so [`Self::covers`] still answers true
+    /// afterwards; the fold builders rely on that to re-add a rebuilt fold list to a live dim.
+    pub fn clear_fold_for_dim(&mut self, dim: PrimaryDim) {
+        if let Some(entry) = self.dims.get_mut(&dim) {
+            *entry = FoldDim::default();
+        }
+    }
+
+    /// `foldConstructed()` (`dsc/dsc2.h:119`).
+    #[must_use]
+    pub const fn fold_constructed(&self) -> bool {
+        self.fold_constructed
+    }
+
+    /// `completeFoldConstruction()` — a one-way latch, as the reference's own setter is.
+    pub const fn complete_fold_construction(&mut self) {
+        self.fold_constructed = true;
     }
 }
 
