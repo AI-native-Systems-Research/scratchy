@@ -164,6 +164,7 @@ use super::fold::{AllocId, AllocLayout, Allocations, DataOrigin, NodeId, PadType
 use super::metadata::{DatastageId, DdcMemory, MetaDimKind, Metadata};
 use super::transformation::LoopId;
 use super::v1::CoreClSet;
+use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::generated::{DataConnect, Strategy};
 use crate::schedule::dsc2::{
@@ -510,21 +511,29 @@ pub struct LoopNode {
     pub dims: LoopDims,
 }
 
-/// ONE AND-CLAUSE TERM OF A LOOP CONDITION — `dsc2::LoopCond` (`dsc/dsc2.h:654`) reduced to the
-/// loop it compares against, which is all entry 115 reads.
+/// ONE AND-CLAUSE TERM OF A LOOP CONDITION — `dsc2::LoopCond` (`dsc/dsc2.h:654-673`): which loop,
+/// which of its dims, which comparison, and what the iterator is compared against.
 ///
 /// ⛔ `loopComp_`'s `nullptr` DEFAULT IS NOT ADMITTED: entry 115 inserts it straight into
-/// `referencedLoops`, so a null there is a defect and not a state.
+/// `referencedLoops`, so a null there is a defect and not a state. Nor is `dim_`'s
+/// `PrimaryDimTypesCount`: `loopComp_` and `dim_` are the LOOKUP `mlir_loop_from_sn_loop_node`
+/// performs (`SNControlFlowLowering.cpp:92-94`), and an unnamed dim matches no iterator.
+/// ⛔ `condValInt_` LIVES IN [`CondValType::Int`], so the `-1` it holds for a `FIRST`/`LAST` term —
+/// a value the reference reads only for `INT` (`dsc/dsc2.h:663`) — is unspellable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopCond {
     /// `loopComp_`.
     pub loop_node: NodeId,
     /// `dim_`, which is what entry 247 re-points the term by.
     pub dim: PrimaryDim,
+    /// `condOp_`.
+    pub op: CondOp,
+    /// `condValType_` with its `condValInt_`.
+    pub against: CondValType,
 }
 
-/// A CONDITION NODE'S LOOP CONDITION — `LoopCondComposite::twoLevelOrOfAnds_` (`dsc/dsc2.h:676`),
-/// an OR of ANDs of per-loop terms.
+/// A CONDITION NODE'S LOOP CONDITION — `LoopCondComposite` (`dsc/dsc2.h:675-677`), an OR of ANDs of
+/// per-loop terms with ONE negation over the lot.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LoopCondComposite {
     /// `twoLevelOrOfAnds_`, EMPTY exactly when the node carries the core/corelet condition instead
@@ -2703,22 +2712,16 @@ mod tests_e110_e117 {
 
     #[test]
     fn every_and_clause_term_of_a_condition_contributes_its_loop_and_other_kinds_contribute_none() {
+        let term = |loop_node| LoopCond {
+            loop_node,
+            dim: PrimaryDim::Mb,
+            op: CondOp::Eq,
+            against: CondValType::Last,
+        };
         let cond = LoopCondComposite {
             or_of_ands: vec![
-                vec![
-                    LoopCond {
-                        loop_node: NodeId(1),
-                        dim: PrimaryDim::In,
-                    },
-                    LoopCond {
-                        loop_node: NodeId(2),
-                        dim: PrimaryDim::Out,
-                    },
-                ],
-                vec![LoopCond {
-                    loop_node: NodeId(1),
-                    dim: PrimaryDim::In,
-                }],
+                vec![term(NodeId(1)), term(NodeId(2))],
+                vec![term(NodeId(1))],
             ],
             negated: false,
         };
@@ -3745,6 +3748,8 @@ mod tests_e247_e254 {
                     or_of_ands: vec![vec![LoopCond {
                         loop_node: base.0,
                         dim: PrimaryDim::Out,
+                        op: CondOp::Eq,
+                        against: CondValType::Last,
                     }]],
                     negated: false,
                 },
@@ -3793,6 +3798,8 @@ mod tests_e247_e254 {
             vec![vec![LoopCond {
                 loop_node: middle[0],
                 dim: PrimaryDim::Out,
+                op: CondOp::Eq,
+                against: CondValType::Last,
             }]]
         );
     }

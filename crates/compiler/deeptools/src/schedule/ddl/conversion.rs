@@ -154,21 +154,32 @@
 //! | `e364_parseDdl2Dsc` | 364 | 4 | 54 | `DdlConversion` | `ddc/ddl/ddl_conversion.cpp:2770` |
 //! | `e372_selectAndParseDdlTemplate` | 372 | 5 | 59 | `DdlConversion` | `ddc/ddl/ddl_conversion.cpp:42` |
 
-// ⭐ USES FOR ENTRIES 172-187. Union these into this file's top block when its other entries land.
-use std::collections::BTreeMap;
+// ⭐ USES FOR ENTRIES 172-187 AND 274-279. Union these into this file's top block when its other
+// entries land.
+use std::collections::{BTreeMap, BTreeSet};
 
 use sys_arch_spec::arch_enums::SenComponent;
 
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+use crate::arch::{Arch, Elements};
+use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+    Extent, PrimaryDim, SliceElems, StickPart, stick_sizes,
+};
 use crate::formats::{Bits, DataFormat};
 use crate::generated::{
-    AccessPattern, Attrs, DimProperty, NameId, Operand, PaddingType, Program, StmtKind,
+    AccessPattern, Attrs, DimProperty, LoopLabel, Memory, NameId, Operand, PaddingType, Program,
+    StmtKind,
 };
 use crate::schedule::ddc::fold::{AllocId, ConstIdx, DataOrigin, NodeId, PadType};
 use crate::schedule::ddc::metadata::{
     DataTransfer, ExternalStorage, MetaDimKind, Metadata, TransferAccessPattern,
 };
+use crate::schedule::ddc::transformation::DsType;
+use crate::schedule::ddc::transformation_util::{LoopCond, LoopCondComposite};
+use crate::schedule::ddc::v1::CoreClSet;
 use crate::schedule::dsc2::LdsIdx;
+use crate::schedule::l3::dsc::{CoreCount, DesignSpaceConfig, PadSizes};
+use crate::units::Corelet;
 
 // ⭐ TYPES FOR ENTRIES 172-179 — the `DdlInterface` sub-structures those entries read and write, and
 // the seam entry 173 mutates the DSC through.
@@ -725,10 +736,9 @@ pub const fn allocation_pad_type(padding: PaddingType) -> PadType {
 /// THE DDL↔DSC SYMBOL TABLE — `DdlInterface` (`ddc/ddl/ddl_conversion.h:288-462`), carrying the
 /// sub-maps whose element types are defined.
 ///
-/// ⛔ TWELVE MEMBERS ARE STILL ABSENT, each arriving with the unit that decides its element type:
-/// `operation_definition_`, `datastage_definition_`, `ext_constant_definition_`, `alloc_storage_`,
-/// `transfer_acc_pat_dims_`, `operand_constant_tensor_`, `loop_labels_`, `core_chunk_loop_label_`,
-/// `region2blocks_`, `resolvedConditions_`, `sync_definitions_` and `coreToCore_definitions_`.
+/// ⛔ EIGHT MEMBERS ARE STILL ABSENT, each arriving with the unit that decides its element type:
+/// `datastage_definition_`, `ext_constant_definition_`, `alloc_storage_`, `transfer_acc_pat_dims_`,
+/// `operand_constant_tensor_`, `region2blocks_`, `sync_definitions_` and `coreToCore_definitions_`.
 /// [`Self::clear`] resets whatever the struct holds, so it stays correct as they land.
 ///
 /// ⛔ THE MAPS ARE ORDERED WHERE THE REFERENCE'S ARE NOT: `unordered_map<Value, _>` iterates in an
@@ -743,6 +753,15 @@ pub struct DdlInterface {
     pub type_definition: BTreeMap<NameId, TypeDefinition>,
     /// `tensor_definition_`, which [`tensor_prop`] fills.
     pub tensor_definition: BTreeMap<NameId, TensorProp>,
+    /// `operation_definition_`, keyed by the `ddl.operation_bind` it describes.
+    pub operation_definition: BTreeMap<NameId, OperationProp>,
+    /// `resolvedConditions_`, which [`process_condition`] memoises into.
+    pub resolved_conditions: BTreeMap<NameId, CondProp>,
+    /// `loop_labels_` — the `dsc2::LoopNode` each `label=` names, which is where
+    /// `ddl_conversion.cpp:1065` registers a minted loop.
+    pub loop_labels: BTreeMap<LoopLabel, NodeId>,
+    /// `core_chunk_loop_label_`, absent for the reference's empty string.
+    pub core_chunk_loop_label: Option<LoopLabel>,
 }
 
 impl DdlInterface {
@@ -777,47 +796,745 @@ impl DdlInterface {
     }
 }
 
-// crustify:todo: e274_processDimensionOp
-//   authority : ddc/ddl/ddl_conversion.cpp:187  (22 body lines, level 1)
-//   class     : DdlConversion
-//   original  : DdlInterface::DimProp& DdlConversion::processDimensionOp( const mlir::Value& dimVal)
-//   extract   : crustify-ddc/cpp/ddl.cpp:860-883
-//   calls     : e184_setMetaDimKind
+// ⭐ TYPES FOR ENTRIES 274-279 — the two `DdlInterface` sub-structures those entries fill, the
+// allocation seam entry 277 reads through, and the constraint form entry 276 verifies.
 
-// crustify:todo: e275_processCondition
-//   authority : ddc/ddl/ddl_conversion.cpp:211  (234 body lines, level 1)
-//   class     : DdlConversion
-//   original  : const DdlInterface::CondProp& DdlConversion::processCondition( mlir::Value cond)
-//   extract   : crustify-ddc/cpp/ddl.cpp:893-1128
-//   calls     : e174_processExpression, e175_getTensorProp, e176_getTensor, e187_clear
+/// ONE BOUND DDL OPERATION'S PROPERTIES — `DdlInterface::OperationProp`
+/// (`ddc/ddl/ddl_conversion.h:342-347`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OperationProp {
+    /// `computeOpIdx_`, whose `-1` is an operation with no compute op assigned yet.
+    pub compute_op: Option<ComputeOpIdx>,
+    /// `coreClCond_`. ⭐ EMPTY MEANS UNCONDITIONALLY ACTIVE, which is what [`process_condition`]
+    /// reads it for.
+    pub core_cl_cond: CoreClSet,
+}
 
-// crustify:todo: e276_verifyDdlConstraints
-//   authority : ddc/ddl/ddl_conversion.cpp:2553  (216 body lines, level 1)
-//   class     : DdlConversion
-//   original  : void DdlConversion::verifyDdlConstraints()
-//   extract   : crustify-ddc/cpp/ddl.cpp:1138-1354
-//   calls     : e175_getTensorProp, e176_getTensor
+/// ONE RESOLVED DDL CONDITION — `DdlInterface::CondProp` (`ddc/ddl/ddl_conversion.h:349-358`).
+///
+/// ⛔ `resolvedValue_` HAS NO INITIALISER and `isResolvedToBool_` is the flag that says whether
+/// reading it is defined; the two are ONE [`Option`] here, so the undefined read is unspellable.
+/// ⭐ THE THREE CARRIERS ARE ALTERNATIVES — a bool, a loop condition, or a core/corelet set — and
+/// [`process_condition`]'s tail is what makes "none of them" mean `Some(false)`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CondProp {
+    /// `resolvedValue_` behind `isResolvedToBool_`.
+    pub resolved: Option<bool>,
+    /// `loopCond_`.
+    pub loop_cond: LoopCondComposite,
+    /// `coreClCond_`.
+    pub core_cl_cond: CoreClSet,
+}
 
-// crustify:todo: e277_getTensorAndAllocation
-//   authority : ddc/ddl/ddl_conversion.cpp:2847  (31 body lines, level 1)
-//   class     : DdlConversion
-//   original  : std::pair<Value, Value> DdlConversion::getTensorAndAllocation( llvm::DenseMap<AllocateOp, const dsc2::AllocateNode*>& allocations, SenComponents unit, const dsc2::DataInfo dtinfo) const
-//   extract   : crustify-ddc/cpp/ddl.cpp:1364-1397
-//   calls     : e176_getTensor
+/// A DDL TENSOR AND THE `ddl.allocate` THAT PLACES IT — the `std::pair<Value, Value>` entry 277
+/// answers, whose two null `Value`s are the two [`None`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TensorAndAllocation {
+    /// `allocateop.getTensor()`, or the operand-constant tensor bound to the unit.
+    pub tensor: Option<NameId>,
+    /// `allocateop.getResult()`.
+    pub allocate: Option<NameId>,
+}
 
-// crustify:todo: e278_checkMetaDimensions
-//   authority : ddc/ddl/ddl_conversion.cpp:3537  (81 body lines, level 1)
-//   class     : DdlConversion
-//   original  : void DdlConversion::checkMetaDimensions()
-//   extract   : crustify-ddc/cpp/ddl.cpp:1407-1488
-//   calls     : e185_isMetaDim
+/// WHERE A DSC PLACES ONE DATASTREAM END — `labeledDs_.at(lds).memOrg_.at(unit).allocateNode_` and
+/// `constantInfo_.at(constant).allocations_.at(unit)`, the two `.at()` chains entry 277 walks.
+///
+/// ⛔ A TRAIT BECAUSE NEITHER CHAIN IS IN [`DesignSpaceConfig`] YET: `memOrg_`'s allocate node and
+/// `constantInfo_` both arrive with later units, and [`None`] is either `.at()` throwing.
+pub trait AllocationSite {
+    /// `dsc.labeledDs_.at(lds).memOrg_.at(unit).allocateNode_`.
+    fn lds_allocation(&self, lds: LdsIdx, unit: SenComponent) -> Option<AllocId>;
 
-// crustify:todo: e279_processAccessPatterns
-//   authority : ddc/ddl/ddl_conversion.cpp:3727  (24 body lines, level 1)
-//   class     : DdlConversion
-//   original  : template <typename OpT, typename AccPatT> void DdlConversion::processAccessPatterns( OpT& op, mlir::Operation::operand_range dims, mlir::ArrayAttr inOpAccessPatternStyles, std::map<PrimaryDimTypes, AccPatT>& result)
-//   extract   : crustify-ddc/cpp/ddl.cpp:1498-1526
-//   calls     : e181_convertAccessPatternStrToDdcType, e182_convertAccessPatternStrToDdcType
+    /// `dsc.constantInfo_.at(constant).allocations_.at(unit)`.
+    fn constant_allocation(&self, constant: ConstIdx, unit: SenComponent) -> Option<AllocId>;
+}
+
+/// HOW A `ddl.constraint` COMPARES — `cmp=`, whose every other spelling is the reference's
+/// *"\"cmp\" type not yet supported"* abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintCmp {
+    /// `"equal"`.
+    Equal,
+    /// `"less"`.
+    Less,
+}
+
+/// ONE `ddl.constraint`'S FORM — the attribute combinations `verifyDdlConstraints` tests, in the
+/// order it tests them.
+///
+/// ⛔ A PARAMETER AND NOT A CENSUS READ: `build.rs` keeps `ddl.constraint` as
+/// `Attrs::Bare(StmtKind::Constraint)` and drops its attributes, so the form has to be stated by
+/// whoever walks the module.
+/// ⛔ THE TWO *"Missing \"value\" attribute"* ABORTS AND *"Unsupported constraint type/format"* ARE
+/// UNSPELLABLE: every arm that reads a value carries one, and there is no arm for no attribute at
+/// all. A `relative_op_order=false` is likewise not a variant — the reference falls through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdlConstraint {
+    /// `min_num_cores=`.
+    MinNumCores(CoreCount),
+    /// `min_num_valid=` / `max_num_valid=`, already at their `value_or` defaults.
+    NumValid {
+        /// `min_num_valid=`, defaulting to ZERO.
+        min: u32,
+        /// `max_num_valid=`, defaulting to ONE HUNDRED and not to unbounded.
+        max: u32,
+    },
+    /// `relative_op_order=true`.
+    RelativeOpOrder,
+    /// `property=` + `dim_idx=` + `cmp="equal"` + `value=`.
+    StickSizeAt {
+        /// `property=="slice"`.
+        slice: bool,
+        /// `dim_idx=`.
+        dim_idx: usize,
+        /// `value=`.
+        value: Elements,
+    },
+    /// `property=` + `cmp="equal"` with no `dim_idx=`.
+    StickSizesAgree {
+        /// `property=="slice"`.
+        slice: bool,
+    },
+    /// `cmp=` + `value=` with no `property=`.
+    DimSize {
+        /// `cmp=`.
+        cmp: ConstraintCmp,
+        /// `value=`.
+        value: Extent,
+    },
+}
+
+/// Every SSA name an operand list states, in `getOperands()` order, [`None`] for a
+/// `ddl.operation_bind` this walk did not activate.
+fn operand_names(operands: &[Operand]) -> Vec<Option<NameId>> {
+    operands
+        .iter()
+        .flat_map(|operand| match operand {
+            Operand::One(name) => vec![Some(*name)],
+            Operand::List(names) => names.iter().copied().map(Some).collect(),
+            Operand::OtherBind => vec![None],
+        })
+        .collect()
+}
+
+/// `op->getOperand(at)`, [`None`] where that position is not one plain name.
+fn operand_at(operands: &[Operand], at: usize) -> Option<NameId> {
+    match operands.get(at)? {
+        Operand::One(name) => Some(*name),
+        Operand::List(_) | Operand::OtherBind => None,
+    }
+}
+
+/// `EnumsConversion::stringToSenComponents` over the census's own `memory=` spellings.
+///
+/// ⛔ TOTAL, WHICH RETIRES THE *"Unrecognized memory"* ABORT: `dsc2::memories`
+/// (`dsc/dscdefn.cpp:142`) names all eight of them, so neither the lookup nor the membership test
+/// that guard it can fail.
+#[must_use]
+pub const fn memory_component(memory: Memory) -> SenComponent {
+    match memory {
+        Memory::L0 => SenComponent::L0,
+        Memory::L0scale => SenComponent::L0Scale,
+        Memory::Lx => SenComponent::Lx,
+        Memory::Pelrf => SenComponent::Pelrf,
+        Memory::Ptarf => SenComponent::Ptarf,
+        Memory::Ptxrf => SenComponent::Ptxrf,
+        Memory::Sfplrf => SenComponent::Sfplrf,
+        Memory::Sfpstate => SenComponent::Sfpstate,
+    }
+}
+
+/// Replaces: e274_processDimensionOp
+///
+/// THE DIM'S PROPERTIES, MINTED FROM ITS `ddl.dimension` on first sight and memoised after.
+///
+/// ⛔ [`None`] IS *"Illegal ddl file"* — a name whose definition is not a `ddl.dimension` at all.
+/// ⛔ ASKING IS A MUTATION (the reference's `operator[]`), so the entry exists afterwards with its
+/// full candidate list. ⛔ `setMetaDimKind`'s OWN `false` RETURN IS UNSPELLABLE, which is
+/// [`DimProp::set_meta_dim_kind`]'s own trap: `dim_property=` is a censused [`DimProperty`].
+pub fn process_dimension_op<'i>(
+    program: &Program,
+    interface: &'i mut DdlInterface,
+    dim: NameId,
+) -> Option<&'i mut DimProp> {
+    if interface.dim_association.contains_key(&dim) {
+        return interface.dim_association.get_mut(&dim);
+    }
+    let Attrs::Dimension { property } = program.definition(dim)?.attrs else {
+        return None;
+    };
+    let prop = interface.dim_association.entry(dim).or_default();
+    prop.set_meta_dim_kind(property);
+    Some(prop)
+}
+
+/// THE SIX COMPARISONS AGAINST ZERO a dropped dim's condition reduces to
+/// (`ddc/ddl/ddl_conversion.cpp:296-308`), and [`None`] for the *"Condition operator not
+/// supported"* abort.
+///
+/// ⛔ ONLY [`CondOp::Eq`] AND [`CondOp::Ne`] ARE REACHABLE from the census, which narrows
+/// `condition=` to `"eq"`/`"ne"` and `value_expr=` to `"first"`/`"last"`.
+const fn resolves_true(op: CondOp, value: i64) -> Option<bool> {
+    match op {
+        CondOp::Eq => Some(value == 0),
+        CondOp::Ne => Some(value != 0),
+        CondOp::Le => Some(value <= 0),
+        CondOp::Lt => Some(value < 0),
+        CondOp::Ge => Some(value >= 0),
+        CondOp::Gt => Some(value > 0),
+        CondOp::Toggle | CondOp::Always | CondOp::Never | CondOp::Const | CondOp::Default => None,
+    }
+}
+
+/// THE CORELET COMPLEMENT `ddl.condition_not` TAKES over `coreIdsUsed_`
+/// (`ddc/ddl/ddl_conversion.cpp:361-376`).
+///
+/// ⛔ TRAP: IT NEVER TOUCHES A CORE OUTSIDE `coreIdsUsed_`, so a set naming one keeps that entry
+/// UNCOMPLEMENTED — and the entry it inserts for a core the set does not name hardcodes corelets 0
+/// and 1 instead of the corelet count.
+/// ⛔ [`None`] IS `numCoreletsUsed_DSC2_` UNSET, where the reference loops `cl < -1` and complements
+/// nothing, or a count past the arch's corelets per core.
+fn complement_corelets(dsc: &DesignSpaceConfig, set: &mut CoreClSet) -> Option<()> {
+    let corelets = dsc.corelets_used_dsc2?.get();
+    for core in dsc.core_ids_used.iter() {
+        match set.0.get_mut(&core) {
+            Some(present) => {
+                for index in 0..corelets {
+                    let corelet = Corelet::checked(index)?;
+                    if !present.remove(&corelet) {
+                        present.insert(corelet);
+                    }
+                }
+                if present.is_empty() {
+                    set.0.remove(&core);
+                }
+            }
+            None => {
+                let fresh = set.0.entry(core).or_default();
+                fresh.insert(Corelet::checked(0)?);
+                if corelets > 1 {
+                    fresh.insert(Corelet::checked(1)?);
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// [`process_condition`] of one operand, plus the reference's answer for a `ddl.operation_bind` this
+/// walk did not activate: an operation absent from `operation_definition_` resolves to FALSE.
+fn operand_condition(
+    program: &Program,
+    interface: &mut DdlInterface,
+    metadata: &Metadata,
+    dsc: &DesignSpaceConfig,
+    operand: Option<NameId>,
+) -> Option<CondProp> {
+    match operand {
+        Some(name) => process_condition(program, interface, metadata, dsc, name),
+        None => Some(CondProp {
+            resolved: Some(false),
+            ..CondProp::default()
+        }),
+    }
+}
+
+/// Replaces: e275_processCondition
+///
+/// RESOLVES ONE `ddl.condition*` TREE to a bool, a two-level OR-of-ANDs loop condition or a
+/// core/corelet set, memoising the answer under the condition's own name.
+///
+/// ⛔ [`None`] IS EVERY *"Illegal ddl"*: an inadmissible op kind, an unassigned dim, an empty or
+/// unknown label, a composition that is not two-level, an and/or mixing the two carriers.
+/// ⭐ A TREE FILLING NO CARRIER IS FALSE. ⛔ TRAP: the reference ALIASES the memo across inserts.
+pub fn process_condition(
+    program: &Program,
+    interface: &mut DdlInterface,
+    metadata: &Metadata,
+    dsc: &DesignSpaceConfig,
+    cond: NameId,
+) -> Option<CondProp> {
+    if let Some(memo) = interface.resolved_conditions.get(&cond) {
+        return Some(memo.clone());
+    }
+    let stmt = *program.definition(cond)?;
+    let mut mine = CondProp::default();
+    match stmt.kind {
+        StmtKind::OperationBind => match interface.operation_definition.get(&cond) {
+            None => mine.resolved = Some(false),
+            Some(prop) if prop.core_cl_cond.0.is_empty() => mine.resolved = Some(true),
+            Some(prop) => mine.core_cl_cond = prop.core_cl_cond.clone(),
+        },
+        StmtKind::GetExternalDataTransferAllocation => {
+            let Attrs::ExternalAllocation { memory, .. } = stmt.attrs else {
+                return None;
+            };
+            let tensor = operand_at(stmt.operands, 0)?;
+            let prop = tensor_prop(program, &mut interface.tensor_definition, tensor)?;
+            let lds = dsc.labeled_ds.at(prop.lds?)?;
+            mine.resolved = Some(lds.pinning().names(memory_component(memory)));
+        }
+        StmtKind::Condition => {
+            let Attrs::Condition {
+                loop_label,
+                last,
+                negated,
+            } = stmt.attrs
+            else {
+                return None;
+            };
+            let label = loop_label?;
+            let op = if negated { CondOp::Ne } else { CondOp::Eq };
+            let (drop_dim, dim) = {
+                let prop = interface
+                    .dim_association
+                    .get(&operand_at(stmt.operands, 0)?)?;
+                (prop.drop_dim, prop.dim)
+            };
+            if drop_dim {
+                // A dropped dim is a loop of size one, so its iterator is 0 on every comparison.
+                mine.resolved = resolves_true(op, 0);
+            } else {
+                let loop_node = if Some(label) == interface.core_chunk_loop_label {
+                    *metadata.dim_to_core_chunk_loops.get(&dim?)?.first()?
+                } else {
+                    *interface.loop_labels.get(&label)?
+                };
+                mine.loop_cond.or_of_ands.push(vec![LoopCond {
+                    loop_node,
+                    dim: dim?,
+                    op,
+                    against: if last {
+                        CondValType::Last
+                    } else {
+                        CondValType::First
+                    },
+                }]);
+            }
+        }
+        StmtKind::ConditionNot => {
+            let operand = *operand_names(stmt.operands).first()?;
+            mine = operand_condition(program, interface, metadata, dsc, operand)?;
+            if let Some(value) = mine.resolved {
+                mine.resolved = Some(!value);
+            } else if !mine.loop_cond.or_of_ands.is_empty() {
+                mine.loop_cond.negated = !mine.loop_cond.negated;
+            } else {
+                complement_corelets(dsc, &mut mine.core_cl_cond)?;
+            }
+        }
+        StmtKind::ConditionAnd | StmtKind::ConditionOr => {
+            let is_and = matches!(stmt.kind, StmtKind::ConditionAnd);
+            let mut initialised = false;
+            for operand in operand_names(stmt.operands) {
+                let theirs = operand_condition(program, interface, metadata, dsc, operand)?;
+                // An AND meeting a false, or an OR meeting a true, is decided: both carriers drop.
+                if theirs.resolved == Some(!is_and) {
+                    mine = CondProp {
+                        resolved: Some(!is_and),
+                        ..CondProp::default()
+                    };
+                    break;
+                }
+                if !initialised {
+                    mine = theirs;
+                    initialised = true;
+                    continue;
+                }
+                if !theirs.loop_cond.or_of_ands.is_empty() {
+                    if !mine.core_cl_cond.0.is_empty() {
+                        return None;
+                    }
+                    if mine.resolved.is_some() {
+                        mine = theirs;
+                        continue;
+                    }
+                    if is_and {
+                        if mine.loop_cond.or_of_ands.len() != 1
+                            || mine.loop_cond.negated
+                            || theirs.loop_cond.or_of_ands.len() != 1
+                            || theirs.loop_cond.negated
+                        {
+                            return None;
+                        }
+                        let terms = theirs.loop_cond.or_of_ands.into_iter().next()?;
+                        mine.loop_cond.or_of_ands.first_mut()?.extend(terms);
+                    } else {
+                        if mine.loop_cond.negated || theirs.loop_cond.negated {
+                            return None;
+                        }
+                        mine.loop_cond
+                            .or_of_ands
+                            .extend(theirs.loop_cond.or_of_ands);
+                    }
+                } else if !theirs.core_cl_cond.0.is_empty() {
+                    if !mine.loop_cond.or_of_ands.is_empty() {
+                        return None;
+                    }
+                    if mine.resolved.is_some() {
+                        mine = theirs;
+                        continue;
+                    }
+                    if is_and {
+                        // ⛔ THE REFERENCE ERASES FROM THE MAP IT IS ITERATING; this retains.
+                        mine.core_cl_cond.0.retain(|core, corelets| {
+                            let Some(other) = theirs.core_cl_cond.0.get(core) else {
+                                return false;
+                            };
+                            corelets.retain(|corelet| other.contains(corelet));
+                            !corelets.is_empty()
+                        });
+                    } else {
+                        for (core, corelets) in &theirs.core_cl_cond.0 {
+                            mine.core_cl_cond
+                                .0
+                                .entry(*core)
+                                .or_default()
+                                .extend(corelets);
+                        }
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    if mine.resolved.is_none()
+        && mine.loop_cond.or_of_ands.is_empty()
+        && mine.core_cl_cond.0.is_empty()
+    {
+        mine.resolved = Some(false);
+    }
+    interface.resolved_conditions.insert(cond, mine.clone());
+    Some(mine)
+}
+
+/// THE STORAGE A REGISTER-FILE COMPONENT COUNTS AS (`ddc/ddl/ddl_conversion.cpp:2589-2594`) — the
+/// five folds `verifyDdlConstraints` applies before comparing against `pinnedComponent()`.
+///
+/// ⛔ THE `PESTATE` FOLD IS UNREACHABLE from the census, which states no `pestate` memory; the
+/// `SFPSTATE` one is reachable.
+const fn register_storage(component: SenComponent) -> SenComponent {
+    match component {
+        SenComponent::Pelrf | SenComponent::Pestate => SenComponent::Pe,
+        SenComponent::Sfplrf | SenComponent::Sfpstate => SenComponent::Sfp,
+        SenComponent::Ptxrf => SenComponent::Pt,
+        other => other,
+    }
+}
+
+/// `getStickSizes(dsType, isSlice, !isSlice)` — one flag or the other, never both and never neither,
+/// so [`StickPart::Whole`] is unreachable from a `ddl.constraint`.
+fn stick_extents<A: Arch>(
+    dsc: &DesignSpaceConfig,
+    ds_type: DsType,
+    slice: bool,
+) -> Option<Vec<(PrimaryDim, Elements)>> {
+    let info = dsc.primary_ds_info.get(&ds_type)?;
+    let elems = SliceElems::per_stick::<A>(&info.stick)?;
+    let part = if slice {
+        StickPart::WithinSlice(elems)
+    } else {
+        StickPart::CrossSlice(elems)
+    };
+    Some(stick_sizes(&info.stick, part))
+}
+
+/// `padFront_`/`padBack_` as the reference compares them, including the voided pair's `-1`s.
+fn pad_edges(sizes: PadSizes) -> (i64, i64) {
+    match sizes {
+        PadSizes::Unpadded => (0, 0),
+        PadSizes::Sized { front, back } => (i64::from(front.0), i64::from(back.0)),
+        PadSizes::Voided => (-1, -1),
+    }
+}
+
+/// Replaces: e276_verifyDdlConstraints
+///
+/// VERIFIES ONE `ddl.constraint` AGAINST THE DSC — core count, valid-variable count, relative
+/// compute-op order, stick sizes and dim sizes, over the operands the constraint names.
+///
+/// ⛔ [`None`] IS BOTH `llvm_unreachable`s: *"Ddl constraints not met"* and *"Illegal ddl"*.
+/// ⛔ TRAP: `max_num_valid` DEFAULTS TO ONE HUNDRED; the relative-order seed is `INT_MIN`, BELOW the
+/// `-1` an unset `computeOpIdx_` carries; `StickSizesAgree` never latches an EMPTY first list.
+pub fn verify_ddl_constraint<A: Arch>(
+    program: &Program,
+    interface: &mut DdlInterface,
+    dsc: &DesignSpaceConfig,
+    operands: &[Operand],
+    constraint: DdlConstraint,
+) -> Option<()> {
+    let inputs = operand_names(operands);
+    match constraint {
+        DdlConstraint::MinNumCores(min) => (dsc.core_ids_used.count().0 >= min.0).then_some(()),
+        DdlConstraint::NumValid { min, max } => {
+            let mut valid = 0u32;
+            for input in inputs {
+                let Some(input) = input else { continue };
+                let stmt = *program.definition(input)?;
+                match stmt.kind {
+                    StmtKind::OperationBind => {
+                        if interface.operation_definition.contains_key(&input) {
+                            valid += 1;
+                        }
+                    }
+                    StmtKind::GetExternalDataTransferAllocation => {
+                        let Attrs::ExternalAllocation { memory, .. } = stmt.attrs else {
+                            return None;
+                        };
+                        let tensor = operand_at(stmt.operands, 0)?;
+                        let prop = tensor_prop(program, &mut interface.tensor_definition, tensor)?;
+                        let lds = dsc.labeled_ds.at(prop.lds?)?;
+                        if Some(register_storage(memory_component(memory)))
+                            == lds.pinning().pinned_component()
+                        {
+                            valid += 1;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            (valid >= min && valid <= max).then_some(())
+        }
+        DdlConstraint::RelativeOpOrder => {
+            // `INT_MIN`: an absence that is BELOW the `-1` an unset `computeOpIdx_` carries.
+            let mut cur_max: Option<Option<ComputeOpIdx>> = None;
+            for input in inputs {
+                let Some(input) = input else { continue };
+                let Some(prop) = interface.operation_definition.get(&input) else {
+                    continue;
+                };
+                let index = prop.compute_op;
+                match cur_max {
+                    Some(max) if max >= index => return None,
+                    _ => cur_max = Some(index),
+                }
+            }
+            Some(())
+        }
+        DdlConstraint::StickSizeAt {
+            slice,
+            dim_idx,
+            value,
+        } => {
+            for input in inputs {
+                let Some(input) = input else { continue };
+                let Some(prop) = interface.tensor_definition.get(&input) else {
+                    continue;
+                };
+                let lds = dsc.labeled_ds.at(prop.lds?)?;
+                let sizes = stick_extents::<A>(dsc, lds.ds_type(), slice)?;
+                if sizes.get(dim_idx)?.1 != value {
+                    return None;
+                }
+            }
+            Some(())
+        }
+        DdlConstraint::StickSizesAgree { slice } => {
+            let mut previous: Vec<(PrimaryDim, Elements)> = Vec::new();
+            for input in inputs {
+                let Some(input) = input else { continue };
+                let Some(prop) = interface.tensor_definition.get(&input) else {
+                    continue;
+                };
+                let lds = dsc.labeled_ds.at(prop.lds?)?;
+                let sizes = stick_extents::<A>(dsc, lds.ds_type(), slice)?;
+                if previous.is_empty() {
+                    previous.clone_from(&sizes);
+                }
+                if previous != sizes {
+                    return None;
+                }
+            }
+            Some(())
+        }
+        DdlConstraint::DimSize { cmp, value } => {
+            let stage = dsc.core_stage().dims();
+            for input in inputs {
+                let input = input?;
+                let prop = interface.dim_association.get(&input)?;
+                if prop.drop_dim {
+                    continue;
+                }
+                let dim = prop.dim?;
+                let size = match prop.meta_dim_kind {
+                    MetaDimKind::Unpadded | MetaDimKind::WindowDim => {
+                        stage.extent(dim).unwrap_or(Extent(-1))
+                    }
+                    kind => {
+                        let Some(padding) = stage.padding.get(&dim) else {
+                            continue;
+                        };
+                        match kind {
+                            MetaDimKind::PadFront => Extent(pad_edges(padding.sizes).0),
+                            MetaDimKind::PadBack => Extent(pad_edges(padding.sizes).1),
+                            MetaDimKind::Stride => Extent(padding.stride.0),
+                            MetaDimKind::Dilation => Extent(padding.dilation.0),
+                            MetaDimKind::Padded => {
+                                stage.padded_extent(dim, PadType::PaddedFullSpanWUnneeded)?
+                            }
+                            MetaDimKind::PadValid => {
+                                stage.padded_extent(dim, PadType::PaddedNoZeroPad)?
+                            }
+                            MetaDimKind::Unpadded | MetaDimKind::WindowDim => return None,
+                        }
+                    }
+                };
+                let met = match cmp {
+                    ConstraintCmp::Equal => size == value,
+                    ConstraintCmp::Less => size.0 < value.0,
+                };
+                if !met {
+                    return None;
+                }
+            }
+            Some(())
+        }
+    }
+}
+
+/// Replaces: e277_getTensorAndAllocation
+///
+/// THE DDL TENSOR AND `ddl.allocate` A `dsc2::DataInfo` MAPS TO, by matching the DSC's own allocate
+/// node against the ones the DDL declares.
+///
+/// ⛔ TRAP: `allocations` IS A `DenseMap`, so where two allocate ops share a node the reference's
+/// `break` takes an UNSPECIFIED one; this takes the first in the caller's order.
+/// ⭐ A `NO_COMPONENT` UNIT AND AN UNMATCHED NODE BOTH ANSWER THE EMPTY PAIR.
+pub fn tensor_and_allocation<S: AllocationSite + ?Sized>(
+    site: &S,
+    allocations: &[(NameId, AllocId)],
+    program: &Program,
+    tensor_definition: &BTreeMap<NameId, TensorProp>,
+    ext_constant_definition: &BTreeMap<NameId, ConstIdx>,
+    operand_constant_tensor: &BTreeMap<NameId, SenComponent>,
+    unit: SenComponent,
+    origin: Option<DataOrigin>,
+) -> Option<TensorAndAllocation> {
+    if matches!(unit, SenComponent::NoComponent) {
+        return Some(TensorAndAllocation::default());
+    }
+    let node = match origin {
+        Some(DataOrigin::LabeledDs(lds)) => site.lds_allocation(lds, unit)?,
+        Some(DataOrigin::Constant(constant)) => site.constant_allocation(constant, unit)?,
+        None => {
+            return Some(TensorAndAllocation {
+                tensor: tensor(
+                    tensor_definition,
+                    ext_constant_definition,
+                    operand_constant_tensor,
+                    unit,
+                    None,
+                ),
+                allocate: None,
+            });
+        }
+    };
+    let Some((allocate, _)) = allocations.iter().find(|(_, held)| *held == node) else {
+        return Some(TensorAndAllocation::default());
+    };
+    Some(TensorAndAllocation {
+        tensor: operand_at(program.definition(*allocate)?.operands, 0),
+        allocate: Some(*allocate),
+    })
+}
+
+/// Replaces: e278_checkMetaDimensions
+///
+/// CHECKS EVERY PADDED DDL DIM AGAINST THE DSC'S OWN META DIMS — each kind the op states must exist
+/// in the DSC, and each kind the DSC states must be stated by the op.
+///
+/// ⛔ [`None`] IS *"Illegal ddl."* AND *"Internal error in PaddedDimensionOp verification."*, whose
+/// `emitError` is reached ON A NULL OP — a null dereference in the reference.
+/// ⛔ TRAP: `Dilation` IS SKIPPED by the second check. ⭐ ASKING MUTATES the map it iterates.
+pub fn check_meta_dimensions(
+    program: &Program,
+    interface: &mut DdlInterface,
+    dsc: &DesignSpaceConfig,
+) -> Option<()> {
+    let mut in_dsc: BTreeMap<PrimaryDim, BTreeSet<MetaDimKind>> = BTreeMap::new();
+    for (dim, padding) in &dsc.core_stage().dims().padding {
+        let kinds = in_dsc.entry(*dim).or_default();
+        kinds.extend([
+            MetaDimKind::Padded,
+            MetaDimKind::PadFront,
+            MetaDimKind::PadBack,
+            MetaDimKind::PadValid,
+        ]);
+        if padding.window_dim.is_some() {
+            kinds.extend([
+                MetaDimKind::WindowDim,
+                MetaDimKind::Stride,
+                MetaDimKind::Dilation,
+            ]);
+        }
+    }
+    let padded: Vec<(NameId, Option<NameId>)> = interface
+        .dim_association
+        .iter()
+        .filter(|(_, prop)| matches!(prop.meta_dim_kind, MetaDimKind::Padded) && !prop.drop_dim)
+        .map(|(dim, prop)| (*dim, prop.non_padded_dim))
+        .collect();
+    for (dim, non_padded) in padded {
+        let dim_type = match non_padded {
+            Some(unpadded) => interface.dim_association.entry(unpadded).or_default().dim,
+            None => None,
+        };
+        let stated = |kind: MetaDimKind| {
+            dim_type
+                .and_then(|dim_type| in_dsc.get(&dim_type))
+                .is_some_and(|kinds| kinds.contains(&kind))
+        };
+        let stmt = *program.definition(dim)?;
+        if stmt.kind != StmtKind::PaddedDimension {
+            return None;
+        }
+        let mut seen: BTreeSet<MetaDimKind> = BTreeSet::new();
+        for operand in operand_names(stmt.operands).into_iter().flatten() {
+            let prop = interface.dim_association.entry(operand).or_default();
+            if !prop.is_meta_dim() {
+                continue;
+            }
+            let kind = prop.meta_dim_kind;
+            seen.insert(kind);
+            if !stated(kind) {
+                return None;
+            }
+        }
+        for kind in [
+            MetaDimKind::PadFront,
+            MetaDimKind::PadBack,
+            MetaDimKind::PadValid,
+            MetaDimKind::WindowDim,
+            MetaDimKind::Stride,
+        ] {
+            if stated(kind) && !seen.contains(&kind) {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Replaces: e279_processAccessPatterns
+///
+/// WRITES ONE ACCESS-PATTERN STYLE PER DIM into the op's per-dim map, keyed by the primary dim each
+/// DDL dim is associated with.
+///
+/// ⛔ ASKING IS A MUTATION — `dim_association_[dims[i]]` — so an unseen dim is in the map afterwards.
+/// ⛔ DIVERGENCE: AN UNASSIGNED `dim_` is the reference's `PrimaryDimTypesCount` KEY, a sentinel
+/// nothing reads back; that is [`None`]. ⭐ [`StyledDims::stated`] settled the broadcast already.
+pub fn process_access_patterns<S: Copy, T: Copy>(
+    dim_association: &mut BTreeMap<NameId, DimProp>,
+    styled: &StyledDims<S>,
+    convert: impl Fn(S) -> T,
+    result: &mut BTreeMap<PrimaryDim, T>,
+) -> Option<()> {
+    for &(dim, style) in styled.pairs() {
+        let key = dim_association.entry(dim).or_default().dim?;
+        result.insert(key, convert(style));
+    }
+    Some(())
+}
 
 // crustify:todo: e322_processPaddedDimensionOp
 //   authority : ddc/ddl/ddl_conversion.cpp:102  (84 body lines, level 2)
@@ -884,27 +1601,40 @@ impl DdlInterface {
 
 #[cfg(test)]
 mod unit_tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroU32;
 
     use sys_arch_spec::arch_enums::SenComponent;
 
     use super::{
-        ComputeOpIdx, DdlInterface, DimProp, ExprValue, GlobalLayoutRefs, InternalTensor,
-        InternalTensorSite, LabeledDsTail, LdsSlot, StyledDims, TensorProp, TypeDefinition,
-        add_internal_tensor, allocation_pad_type, pad_type_spelling, process_expression,
-        process_types, tensor, tensor_prop, transfer_access_pattern,
+        AllocationSite, ComputeOpIdx, ConstraintCmp, DdlConstraint, DdlInterface, DimProp,
+        ExprValue, GlobalLayoutRefs, InternalTensor, InternalTensorSite, LabeledDsTail, LdsSlot,
+        StyledDims, TensorAndAllocation, TensorProp, TypeDefinition, add_internal_tensor,
+        allocation_pad_type, check_meta_dimensions, pad_type_spelling, process_access_patterns,
+        process_condition, process_dimension_op, process_expression, process_types, tensor,
+        tensor_and_allocation, tensor_prop, transfer_access_pattern, verify_ddl_constraint,
     };
-    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+    use crate::arch::Dd2;
+    use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
     use crate::formats::{Bits, DataFormat};
     use crate::generated::{
-        AccessPattern, Attrs, NameId, Operand, PROGRAMS, Program, Stmt, StmtKind,
+        AccessPattern, Attrs, DimProperty, LoopLabel, NameId, Operand, PROGRAMS, Program, Stmt,
+        StmtKind,
     };
     use crate::schedule::ddc::fold::{AllocId, ConstIdx, DataOrigin, NodeId, PadType};
     use crate::schedule::ddc::metadata::{
         Allocation, DataConnectSlot, DataTransfer, DdcMemory, ExternalStorage, MetaDimKind,
         Metadata, OpaqueOp, TransferAccessPattern, TransferEnd,
     };
+    use crate::schedule::ddc::transformation::DsType;
+    use crate::schedule::ddc::transformation_util::{LoopCond, StageName};
     use crate::schedule::dsc2::LdsIdx;
+    use crate::schedule::l3::dsc::{
+        CoreCount, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DimPadding,
+        FilledDims, LabeledDs, LabeledDsList, NamedDims, PadElems, PadSizes, Pinning, StageDims,
+    };
+    use crate::units::Core;
 
     /// A program with hand-written statements, wearing the first vendored program's template so that
     /// the census enum is not restated here.
@@ -1539,5 +2269,452 @@ mod unit_tests {
                 .dim_candidates
                 .is_empty()
         );
+    }
+
+    // ⭐ FIXTURES FOR ENTRIES 274-279.
+
+    fn core(index: u32) -> Core {
+        Core::checked(index).expect("a core in range")
+    }
+
+    /// A DSC on TWO cores with TWO corelets, labelling one INPUT tensor pinned as `pinning` says,
+    /// whose core data stage states `X = 4` and `Y = 2` with whatever `padding` puts on `X`.
+    fn config(pinning: Pinning, padding: Option<DimPadding>) -> DesignSpaceConfig {
+        let mut dims = StageDims::default();
+        dims.extents.insert(PrimaryDim::X, Extent(4));
+        dims.extents.insert(PrimaryDim::Y, Extent(2));
+        if let Some(padding) = padding {
+            dims.padding.insert(PrimaryDim::X, padding);
+        }
+        let named = NamedDims {
+            name: StageName::default(),
+            dims: FilledDims::of(dims).expect("a stage that states a dim"),
+        };
+        let stage = DataStage {
+            ss: named.clone(),
+            el: named,
+        };
+        let two = CoreletsUsed::new(NonZeroU32::new(2).expect("two corelets"));
+        DesignSpaceConfig {
+            corelets_used: two,
+            corelets_used_dsc2: Some(two),
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(core(0), vec![core(1)]),
+            layout_dims: BTreeMap::new(),
+            data_stages: DataStages::new(stage.clone(), stage),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+            labeled_ds: LabeledDsList::new(
+                LabeledDs::new(DsType::Input, vec![], LdsIdx(183), pinning),
+                vec![],
+            ),
+        }
+    }
+
+    /// ⭐ EVERY VENDORED `ddl.dimension`, MINTED FROM ITS OWN `dim_property=` and memoised after — a
+    /// second ask keeps whatever was written into the entry meanwhile. Plus the *"Illegal ddl file"*
+    /// abort: a name whose definition is not a dimension at all.
+    #[test]
+    fn mints_a_dim_prop_from_every_vendored_dimension() {
+        let mut seen = 0;
+        for program in PROGRAMS {
+            let mut interface = DdlInterface::default();
+            for stmt in program.stmts {
+                let Attrs::Dimension { property } = stmt.attrs else {
+                    continue;
+                };
+                let want = match property {
+                    None => MetaDimKind::Unpadded,
+                    Some(DimProperty::Window) => MetaDimKind::WindowDim,
+                    Some(DimProperty::Stride) => MetaDimKind::Stride,
+                    Some(DimProperty::Dilation) => MetaDimKind::Dilation,
+                    Some(DimProperty::PadFront) => MetaDimKind::PadFront,
+                    Some(DimProperty::PadBack) => MetaDimKind::PadBack,
+                    Some(DimProperty::PadValid) => MetaDimKind::PadValid,
+                };
+                for dim in stmt.results {
+                    let minted = process_dimension_op(program, &mut interface, *dim)
+                        .expect("a vendored dimension mints its own prop");
+                    assert_eq!(minted.meta_dim_kind, want);
+                    minted.drop_dim = true;
+                    let again = process_dimension_op(program, &mut interface, *dim)
+                        .expect("the memoised entry");
+                    assert!(again.drop_dim, "{} {}", program.op_func, program.bind);
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 0, "no vendored program declares a `ddl.dimension`");
+
+        const NOT_A_DIM: &[Stmt] = &[Stmt {
+            kind: StmtKind::Type,
+            depth: 0,
+            attrs: Attrs::Bare(StmtKind::Type),
+            results: &[NameId(0)],
+            operands: &[],
+            path: &[],
+        }];
+        let program = synthetic(&["%t"], NOT_A_DIM);
+        assert!(
+            process_dimension_op(&program, &mut DdlInterface::default(), NameId(0)).is_none(),
+            "a non-dimension is the abort"
+        );
+    }
+
+    /// A `ddl.condition` on a live dim becomes ONE `AND` term against the loop its label names, the
+    /// `ddl.condition_not` over it flips the COMPOSITE and not the term, and both memoise. ⛔ THE
+    /// TRAP: the same condition on a DROPPED dim resolves to a constant instead, because a
+    /// size-one loop's iterator is 0 on every comparison.
+    #[test]
+    fn resolves_a_loop_condition_and_negates_the_composite() {
+        const CONDS: &[Stmt] = &[
+            Stmt {
+                kind: StmtKind::Condition,
+                depth: 0,
+                attrs: Attrs::Condition {
+                    loop_label: Some(LoopLabel::ChunkLoop),
+                    last: false,
+                    negated: false,
+                },
+                results: &[NameId(1)],
+                operands: &[Operand::One(NameId(0))],
+                path: &[],
+            },
+            Stmt {
+                kind: StmtKind::ConditionNot,
+                depth: 0,
+                attrs: Attrs::Bare(StmtKind::ConditionNot),
+                results: &[NameId(2)],
+                operands: &[Operand::One(NameId(1))],
+                path: &[],
+            },
+        ];
+        let program = synthetic(&["%x", "%first", "%not_first"], CONDS);
+        let dsc = config(Pinning::default(), None);
+        let metadata = Metadata::default();
+
+        let live = |drop_dim| {
+            let mut interface = DdlInterface::default();
+            interface.dim_association.insert(
+                NameId(0),
+                DimProp {
+                    dim: Some(PrimaryDim::X),
+                    drop_dim,
+                    ..DimProp::default()
+                },
+            );
+            interface
+                .loop_labels
+                .insert(LoopLabel::ChunkLoop, NodeId(11));
+            interface
+        };
+
+        let mut interface = live(false);
+        let term = vec![vec![LoopCond {
+            loop_node: NodeId(11),
+            dim: PrimaryDim::X,
+            op: CondOp::Eq,
+            against: CondValType::First,
+        }]];
+        let mine = process_condition(&program, &mut interface, &metadata, &dsc, NameId(1))
+            .expect("a labelled loop resolves");
+        assert_eq!(mine.resolved, None);
+        assert_eq!(mine.loop_cond.or_of_ands, term);
+        assert!(!mine.loop_cond.negated);
+        assert_eq!(interface.resolved_conditions[&NameId(1)], mine);
+
+        let flipped = process_condition(&program, &mut interface, &metadata, &dsc, NameId(2))
+            .expect("the negation of it");
+        assert_eq!(flipped.loop_cond.or_of_ands, term);
+        assert!(flipped.loop_cond.negated);
+
+        let mut dropped = live(true);
+        assert_eq!(
+            process_condition(&program, &mut dropped, &metadata, &dsc, NameId(1))
+                .expect("a dropped dim resolves")
+                .resolved,
+            Some(true)
+        );
+    }
+
+    /// The core floor, and the dim compare in the shape that carries the trap: a `Padded` dim is
+    /// measured over its FULL SPAN WITH UNNEEDED PAD, so the plain extent is not what it answers.
+    #[test]
+    fn verifies_the_core_floor_and_a_padded_dim_size() {
+        let dsc = config(
+            Pinning::default(),
+            Some(DimPadding {
+                sizes: PadSizes::Sized {
+                    front: PadElems(1),
+                    back: PadElems(2),
+                },
+                ..DimPadding::default()
+            }),
+        );
+        let program = synthetic(&["%x_padded"], &[]);
+        let mut interface = DdlInterface::default();
+        let check = |interface: &mut DdlInterface, operands: &[Operand], constraint| {
+            verify_ddl_constraint::<Dd2>(&program, interface, &dsc, operands, constraint)
+        };
+
+        assert_eq!(
+            check(
+                &mut interface,
+                &[],
+                DdlConstraint::MinNumCores(CoreCount(2))
+            ),
+            Some(())
+        );
+        assert_eq!(
+            check(
+                &mut interface,
+                &[],
+                DdlConstraint::MinNumCores(CoreCount(3))
+            ),
+            None
+        );
+
+        interface.dim_association.insert(
+            NameId(0),
+            DimProp {
+                dim: Some(PrimaryDim::X),
+                meta_dim_kind: MetaDimKind::Padded,
+                ..DimProp::default()
+            },
+        );
+        let operands = [Operand::One(NameId(0))];
+        for (value, met) in [(Extent(7), Some(())), (Extent(4), None)] {
+            assert_eq!(
+                check(
+                    &mut interface,
+                    &operands,
+                    DdlConstraint::DimSize {
+                        cmp: ConstraintCmp::Equal,
+                        value
+                    }
+                ),
+                met
+            );
+        }
+        assert_eq!(
+            check(
+                &mut interface,
+                &operands,
+                DdlConstraint::DimSize {
+                    cmp: ConstraintCmp::Less,
+                    value: Extent(8)
+                }
+            ),
+            Some(())
+        );
+    }
+
+    /// The DSC's own allocate node matched back to the `ddl.allocate` that placed it, plus the two
+    /// EMPTY pairs — a `NO_COMPONENT` unit and a node no allocate op claims — and the `.at()` throw.
+    #[test]
+    fn matches_an_allocate_node_back_to_its_ddl_tensor() {
+        struct Site;
+        impl AllocationSite for Site {
+            fn lds_allocation(&self, lds: LdsIdx, unit: SenComponent) -> Option<AllocId> {
+                (lds == LdsIdx(2) && unit == SenComponent::L0).then_some(AllocId(9))
+            }
+            fn constant_allocation(
+                &self,
+                _constant: ConstIdx,
+                _unit: SenComponent,
+            ) -> Option<AllocId> {
+                None
+            }
+        }
+        const ALLOCATE: &[Stmt] = &[Stmt {
+            kind: StmtKind::Allocate,
+            depth: 0,
+            attrs: Attrs::Bare(StmtKind::Allocate),
+            results: &[NameId(1)],
+            operands: &[Operand::One(NameId(0))],
+            path: &[],
+        }];
+        let program = synthetic(&["%tensor", "%l0_allocation"], ALLOCATE);
+        let allocations = [(NameId(1), AllocId(9))];
+        let tensors = BTreeMap::new();
+        let constants = BTreeMap::new();
+        let operand_constants = BTreeMap::from([(NameId(0), SenComponent::L0)]);
+        let pair = |unit, origin| {
+            tensor_and_allocation(
+                &Site,
+                &allocations,
+                &program,
+                &tensors,
+                &constants,
+                &operand_constants,
+                unit,
+                origin,
+            )
+        };
+
+        assert_eq!(
+            pair(SenComponent::L0, Some(DataOrigin::LabeledDs(LdsIdx(2)))),
+            Some(TensorAndAllocation {
+                tensor: Some(NameId(0)),
+                allocate: Some(NameId(1))
+            })
+        );
+        assert_eq!(
+            pair(
+                SenComponent::NoComponent,
+                Some(DataOrigin::LabeledDs(LdsIdx(2)))
+            ),
+            Some(TensorAndAllocation::default())
+        );
+        // No origin is the operand-constant tensor, which no `ddl.allocate` places.
+        assert_eq!(
+            pair(SenComponent::L0, None),
+            Some(TensorAndAllocation {
+                tensor: Some(NameId(0)),
+                allocate: None
+            })
+        );
+        assert_eq!(
+            pair(SenComponent::L0, Some(DataOrigin::LabeledDs(LdsIdx(7)))),
+            None
+        );
+    }
+
+    /// A windowed DSC dim demands FIVE meta kinds of its `ddl.padded_dimension` — and ⛔ NOT THE
+    /// DILATION, which the reference's second check skips, so a DSC dilation the DDL omits passes.
+    #[test]
+    fn a_padded_dimension_states_every_dsc_meta_dim_but_dilation() {
+        const FULL: &[Operand] = &[
+            Operand::One(NameId(2)),
+            Operand::One(NameId(3)),
+            Operand::One(NameId(4)),
+            Operand::One(NameId(5)),
+            Operand::One(NameId(6)),
+        ];
+        let program = |operands: &'static [Operand]| {
+            let stmts: &'static [Stmt] = Box::leak(Box::new([Stmt {
+                kind: StmtKind::PaddedDimension,
+                depth: 0,
+                attrs: Attrs::Bare(StmtKind::PaddedDimension),
+                results: &[NameId(1)],
+                operands,
+                path: &[],
+            }]));
+            synthetic(
+                &[
+                    "%x",
+                    "%x_padded",
+                    "%front",
+                    "%back",
+                    "%valid",
+                    "%window",
+                    "%stride",
+                ],
+                stmts,
+            )
+        };
+        let interface = || {
+            let mut interface = DdlInterface::default();
+            for (name, kind) in [
+                (NameId(0), MetaDimKind::Unpadded),
+                (NameId(2), MetaDimKind::PadFront),
+                (NameId(3), MetaDimKind::PadBack),
+                (NameId(4), MetaDimKind::PadValid),
+                (NameId(5), MetaDimKind::WindowDim),
+                (NameId(6), MetaDimKind::Stride),
+            ] {
+                interface.dim_association.insert(
+                    name,
+                    DimProp {
+                        dim: (name == NameId(0)).then_some(PrimaryDim::X),
+                        meta_dim_kind: kind,
+                        ..DimProp::default()
+                    },
+                );
+            }
+            interface.dim_association.insert(
+                NameId(1),
+                DimProp {
+                    meta_dim_kind: MetaDimKind::Padded,
+                    non_padded_dim: Some(NameId(0)),
+                    ..DimProp::default()
+                },
+            );
+            interface
+        };
+        // A windowed dim, so the DSC states all SEVEN kinds including the dilation.
+        let dsc = config(
+            Pinning::default(),
+            Some(DimPadding {
+                window_dim: Some(PrimaryDim::Y),
+                ..DimPadding::default()
+            }),
+        );
+
+        assert_eq!(
+            check_meta_dimensions(&program(FULL), &mut interface(), &dsc),
+            Some(())
+        );
+        // The same op with the STRIDE dropped is the *"Internal error in PaddedDimensionOp
+        // verification."* refusal — the DSC states one and the op does not.
+        assert_eq!(
+            check_meta_dimensions(&program(&FULL[..4]), &mut interface(), &dsc),
+            None
+        );
+    }
+
+    /// One style per dim, keyed by the primary dim each DDL dim is ASSOCIATED with — and the
+    /// unassigned dim that keys nothing, whose entry the ask has still minted.
+    #[test]
+    fn keys_each_access_pattern_by_its_primary_dim() {
+        const STYLES: &[AccessPattern] = &[AccessPattern::PaddedWzeropadToToToLoweredPadded];
+        let styled =
+            StyledDims::stated(&[NameId(0), NameId(1)], STYLES).expect("one style broadcasts");
+        let mut dim_association = BTreeMap::from([
+            (
+                NameId(0),
+                DimProp {
+                    dim: Some(PrimaryDim::X),
+                    ..DimProp::default()
+                },
+            ),
+            (
+                NameId(1),
+                DimProp {
+                    dim: Some(PrimaryDim::Y),
+                    ..DimProp::default()
+                },
+            ),
+        ]);
+        let mut result = BTreeMap::new();
+        assert_eq!(
+            process_access_patterns(
+                &mut dim_association,
+                &styled,
+                transfer_access_pattern,
+                &mut result
+            ),
+            Some(())
+        );
+        assert_eq!(
+            result,
+            BTreeMap::from([
+                (PrimaryDim::X, transfer_access_pattern(STYLES[0])),
+                (PrimaryDim::Y, transfer_access_pattern(STYLES[0])),
+            ])
+        );
+
+        let mut unassigned = BTreeMap::new();
+        assert_eq!(
+            process_access_patterns(
+                &mut unassigned,
+                &styled,
+                transfer_access_pattern,
+                &mut BTreeMap::new()
+            ),
+            None
+        );
+        assert!(unassigned.contains_key(&NameId(0)));
     }
 }

@@ -663,6 +663,16 @@ impl Stride {
     pub const ONE: Stride = Stride(1);
 }
 
+/// A PADDED DIMENSION'S DILATION — `DimPaddingSizes::dilation_` (`dsc/dims.h:141`), whose default is
+/// likewise 1: a window with no dilation steps by one element between taps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Dilation(pub i64);
+
+impl Dilation {
+    /// The undilated step the reference initialises `dilation_` to.
+    pub const ONE: Dilation = Dilation(1);
+}
+
 /// WHICH PADDING FORM A DIM CARRIES — `PadType` (`dsc/dims.h:50`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PadType {

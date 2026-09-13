@@ -16,7 +16,7 @@ use crate::arch::{Bytes, Elements};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     self as shape_constraints, Extent, PrimaryDim, StickDims, StickPart,
 };
-use crate::schedule::ddc::fold::Stride;
+use crate::schedule::ddc::fold::{Dilation, PadType, Stride};
 use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::{DsType, Scale};
 use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
@@ -26,16 +26,59 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroU64};
 use sys_arch_spec::arch_enums::SenComponent;
 
-/// WHERE ONE LABELLED DATA STRUCTURE LIVES — `memOrg_` (`dsc/dscdefn.h:337`) reduced to the three
-/// questions this stage asks of it, each already the reference's own predicate over that map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// WHERE ONE LABELLED DATA STRUCTURE LIVES — `memOrg_` (`dsc/dscdefn.h:337`): every component the
+/// map names with that entry's `isPresent`, plus the two LX questions a component set cannot answer.
+///
+/// ⛔ THE KEY AND THE FLAG ARE DIFFERENT QUESTIONS, AND THE REFERENCE ASKS BOTH: `memOrg_.count(comp)`
+/// is [`Self::names`] while `memOrg_.at(comp).isPresent` is the value — an entry present as a key with
+/// `isPresent = false` answers the first and not the second.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Pinning {
-    /// `isHbmPinned()` (`:369`) — `memOrg_.at(HBM).isPresent`.
-    pub hbm: bool,
+    /// Each component `memOrg_` names, with its `isPresent`.
+    pub mem_org: BTreeMap<SenComponent, bool>,
     /// `isLxPinned()` (`:424`) — an LX organisation that is neither HBM- nor XRF-pinned nor a ring.
     pub lx: bool,
     /// `memOrg_.count(LX) && memOrg_.at(LX).isPadded`.
     pub lx_padded: bool,
+}
+
+impl Pinning {
+    /// `pinnedComponent()`'s own check order (`dsc/dscdefn.h:443-445`) — the pinning predicates first,
+    /// then every other memory.
+    const CHECK_ORDER: [SenComponent; 11] = [
+        SenComponent::Hbm,
+        SenComponent::Ring,
+        SenComponent::Sfpring,
+        SenComponent::Lx,
+        SenComponent::Pt,
+        SenComponent::Ptxrf,
+        SenComponent::Ptarf,
+        SenComponent::Sfplrf,
+        SenComponent::Pelrf,
+        SenComponent::L0,
+        SenComponent::Ptirf,
+    ];
+
+    /// `isHbmPinned()` (`:369-375`).
+    #[must_use]
+    pub fn hbm(&self) -> bool {
+        self.mem_org.get(&SenComponent::Hbm) == Some(&true)
+    }
+
+    /// `memOrg_.count(component)` — whether the map NAMES it, which an absent `isPresent` still does.
+    #[must_use]
+    pub fn names(&self, component: SenComponent) -> bool {
+        self.mem_org.contains_key(&component)
+    }
+
+    /// `pinnedComponent()` (`:442-454`) — the FIRST present component in that order, and [`None`] for
+    /// its `NO_COMPONENT` fallthrough.
+    #[must_use]
+    pub fn pinned_component(&self) -> Option<SenComponent> {
+        Self::CHECK_ORDER
+            .into_iter()
+            .find(|component| self.mem_org.get(component) == Some(&true))
+    }
 }
 
 /// ONE LABELLED DATA STRUCTURE — `LabeledDsInfo` (`dsc/dscdefn.h:321`) with its `scale_` ZIPPED onto
@@ -76,10 +119,10 @@ impl LabeledDs {
         self.recorded
     }
 
-    /// `memOrg_`, as the three questions asked of it.
+    /// `memOrg_`, as the questions asked of it.
     #[must_use]
-    pub fn pinning(&self) -> Pinning {
-        self.pinning
+    pub const fn pinning(&self) -> &Pinning {
+        &self.pinning
     }
 
     /// `dsType_`.
@@ -144,6 +187,14 @@ impl CoreletShare {
     }
 }
 
+/// HOW MANY CORES A DSC USES — `numCoresUsed_` (`dsc/designSpaceConfig.h:73`).
+///
+/// ⛔ NOT A FIELD, BECAUSE IT IS NOT A SECOND FACT: `DT_CHECK(coreIdsUsed_.size() == numCoresUsed_)`
+/// (`dsc/designSpaceConfig.cpp:1033`, `dsc/dsc2Pcfg.cpp:21`) says the two agree, so
+/// [`CoreIdsUsed::count`] derives it and the pair cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CoreCount(pub u32);
+
 /// THE CORES A DSC USES, NON-EMPTY — `coreIdsUsed_`, whose first entry
 /// `getLabeledDsWkSliceMulticastDegree` reaches with a bare `[0]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +214,16 @@ impl CoreIdsUsed {
     #[must_use]
     pub const fn first(&self) -> Core {
         self.first
+    }
+
+    /// `numCoresUsed_`, which is `coreIdsUsed_.size()` — ONE at minimum, by construction.
+    #[must_use]
+    pub fn count(&self) -> CoreCount {
+        CoreCount(
+            u32::try_from(self.rest.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1),
+        )
     }
 
     /// Every core, first one first.
@@ -563,6 +624,8 @@ pub struct DimPadding {
     pub unneeded: UnneededPad,
     /// `stride_`, whose declared default is `1` and not `0`.
     pub stride: Stride,
+    /// `dilation_`, whose declared default is likewise `1`.
+    pub dilation: Dilation,
 }
 
 impl Default for DimPadding {
@@ -574,6 +637,7 @@ impl Default for DimPadding {
             window_dim: None,
             unneeded: UnneededPad::NONE,
             stride: Stride::ONE,
+            dilation: Dilation::ONE,
         }
     }
 }
@@ -765,48 +829,80 @@ impl StageDims {
     }
 
     /// `hasPadding` (`L3DlOpsScheduler.cpp:1071-1075`) — the dim has a `paddingSizes_` entry AND its
-    /// `PADDED_FULLSPAN_WUNNEEDED` span (`calculate_padded`, `dsc/dims.cpp:563`) differs from its
-    /// plain extent.
+    /// `PADDED_FULLSPAN_WUNNEEDED` span differs from its plain extent.
     ///
-    /// ⛔ `None` IS `calculate_padded`'s THREE REACHABLE ABORTS: *"Cannot calculate padded version of
-    /// compound dim"* for [`PrimaryDim::Ij`]/[`PrimaryDim::Kij`], *"Padded access is not valid in
-    /// datastage"* for a [`PadSizes::Voided`] non-window dim, and *"Missing window size"* where the
-    /// window dim's own extent is absent or below one.
-    ///
-    /// ⭐ AN UNSTATED DIM IS `Some(false)`, NOT AN ABORT — `val < 0` short-circuits to `-1` on both
-    /// sides of the comparison. Spans saturate rather than wrap: a saturated span still differs from
-    /// the extent, which is the only question asked.
+    /// ⛔ [`None`] IS [`Self::padded_extent`]'s ABORT SET. ⭐ AN UNSTATED DIM IS `Some(false)`, NOT an
+    /// abort — `val < 0` short-circuits to `-1` on both sides of the comparison.
     #[must_use]
     pub fn has_padding(&self, dim: PrimaryDim) -> Option<bool> {
-        let Some(pad) = self.padding.get(&dim) else {
+        if !self.padding.contains_key(&dim) {
             return Some(false);
-        };
+        }
         let Some(plain) = self.extent(dim) else {
             return Some(false);
         };
+        Some(self.padded_extent(dim, PadType::PaddedFullSpanWUnneeded)? != plain)
+    }
+
+    /// `primaryDimToVal_st(dim, NO_COMPONENT, -1, -1, {dim, pad})`, which is `calculate_padded`
+    /// (`dsc/dims.cpp:563-615`) over the dim's own `paddingSizes_` entry.
+    ///
+    /// ⛔ [`None`] IS THE UNSTATED DIM (`val < 0` ⇒ `-1`) AND EVERY ABORT AT ONCE: *"Cannot calculate
+    /// padded version of compound dim"*, *"Padded dimension without padding sizes information"*, the
+    /// two `padFront_ < 0` refusals a [`PadSizes::Voided`] dim reaches, *"Missing window size"*, and
+    /// the two *"Unsupported padding type requested"* arms — a windowless dim admits only the two
+    /// full-span forms, a windowed one everything but [`PadType::PaddedFullSpan`].
+    /// ⛔ SPANS SATURATE rather than wrap, so an unrepresentable span stays the largest one.
+    #[must_use]
+    pub fn padded_extent(&self, dim: PrimaryDim, pad: PadType) -> Option<Extent> {
+        let plain = self.extent(dim)?;
+        if matches!(pad, PadType::NoPad) {
+            return Some(plain);
+        }
         if matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij) {
             return None;
         }
-        let unneeded = i64::from(pad.unneeded.total.0);
-        let padded = match pad.window_dim {
-            None => match pad.sizes {
-                PadSizes::Voided => return None,
-                PadSizes::Unpadded => plain.0.saturating_add(unneeded),
-                PadSizes::Sized { front, back } => plain
-                    .0
-                    .saturating_add(i64::from(front.0))
-                    .saturating_add(i64::from(back.0))
-                    .saturating_add(unneeded),
-            },
+        let info = self.padding.get(&dim)?;
+        let unneeded = i64::from(info.unneeded.total.0);
+        // `padFront_`/`padBack_`, absent for the voided pair the two `< 0` refusals reject.
+        let edges = || match info.sizes {
+            PadSizes::Voided => None,
+            PadSizes::Unpadded => Some((0, 0)),
+            PadSizes::Sized { front, back } => Some((i64::from(front.0), i64::from(back.0))),
+        };
+        match info.window_dim {
+            None => {
+                let (front, back) = edges()?;
+                let span = plain.0.saturating_add(front).saturating_add(back);
+                match pad {
+                    PadType::PaddedFullSpanWUnneeded => Some(Extent(span.saturating_add(unneeded))),
+                    PadType::PaddedFullSpan => Some(Extent(span)),
+                    _ => None,
+                }
+            }
             Some(window) => {
                 let window_size = self.extent(window).filter(|size| size.0 >= 1)?;
-                window_size
+                let span = window_size
                     .0
-                    .saturating_add(plain.0.saturating_sub(1).saturating_mul(pad.stride.0))
-                    .saturating_add(unneeded)
+                    .saturating_add(plain.0.saturating_sub(1).saturating_mul(info.stride.0));
+                match pad {
+                    PadType::PaddedFullSpanWUnneeded => Some(Extent(span.saturating_add(unneeded))),
+                    PadType::PaddedWZeroPad => Some(Extent(span)),
+                    PadType::PaddedNoZeroPad => {
+                        let (front, back) = edges()?;
+                        Some(Extent(
+                            span.saturating_add(unneeded)
+                                .saturating_sub(i64::from(info.unneeded.front.0))
+                                .saturating_sub(i64::from(info.unneeded.back.0))
+                                .saturating_sub(front)
+                                .saturating_sub(back),
+                        ))
+                    }
+                    PadType::LoweredPadded => Some(Extent(window_size.0.saturating_mul(plain.0))),
+                    PadType::NoPad | PadType::PaddedFullSpan => None,
+                }
             }
-        };
-        Some(padded != plain.0)
+        }
     }
 
     /// `DataStructDims::compound` (`dsc/dims.cpp:84`) — `IJ = I·J` and `KIJ = KI·KJ`, and a product
