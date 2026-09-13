@@ -286,10 +286,12 @@ use crate::schedule::l3::dsc::{
     DATA_STAGE_CHUNK, DATA_STAGE_CORE, DesignSpaceConfig, DimPadding, DimStage, DscGroup, DscIdx,
     DscParamCandidates, FilledDims, IndexTensor, IndirectAlloc, InitialPlacement, LabeledDs,
     MemOrg, MulticastDegree, Pinning, ScheduleNodes, ScheduleTrees, SchedulerMetadata, StickVolume,
-    StickVolumes, SuperChunkStage, SuperDsc, SymbolicDimInfo, UnneededPad, WkSlice,
+    StickVolumes, SuperChunkStage, SuperDsc, SymbolicDimInfo, UnneededPad, WkSlice, WkSliceCount,
+    WkSliceId,
 };
 use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
 /// THE WITNESS `isSameDscGroup` HANDS BACK — constructible only from a [`SuperDsc`], whose DSC list
@@ -574,6 +576,7 @@ mod tests_e001_e008 {
             DscList::new(plain_dsc(), vec![]),
             BTreeMap::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
         assert_eq!(same_dsc_group(&sdsc), SameDscGroup(()));
         assert_eq!(sdsc.dscs().iter().count(), 1);
@@ -747,6 +750,7 @@ mod tests_e001_e008 {
         let slice = |value: i32| WkSlice(BTreeMap::from([(PrimaryDim::In, WkSliceId(value))]));
         let sdsc = SuperDsc::new(
             DscList::new(dsc.clone(), vec![]),
+            BTreeMap::new(),
             BTreeMap::from([
                 (core(0), slice(0)),
                 (core(1), slice(0)),
@@ -768,6 +772,7 @@ mod tests_e001_e008 {
         // The `coreIdToWkSlice_.at(mainCoreId)` arm: no work slice for `coreIdsUsed_[0]`.
         let no_main_slice = SuperDsc::new(
             DscList::new(dsc.clone(), vec![]),
+            BTreeMap::new(),
             BTreeMap::from([(core(1), slice(0))]),
             BTreeMap::new(),
         );
@@ -778,6 +783,7 @@ mod tests_e001_e008 {
         // The `.at(dim)` arm: a group core whose slice does not state the layout dim.
         let sparse_slice = SuperDsc::new(
             DscList::new(dsc.clone(), vec![]),
+            BTreeMap::new(),
             BTreeMap::from([(core(0), slice(0)), (core(1), WkSlice::default())]),
             BTreeMap::new(),
         );
@@ -1270,6 +1276,7 @@ mod tests_e009_e016 {
             DscList::new(same.clone(), vec![same, differs]),
             BTreeMap::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
 
         assert_eq!(
@@ -1328,6 +1335,7 @@ mod tests_e009_e016 {
         let dsc = a_dsc();
         let sdsc = SuperDsc::new(
             DscList::new(dsc.clone(), vec![dsc.clone(), dsc]),
+            BTreeMap::new(),
             BTreeMap::new(),
             [(
                 core,
@@ -3069,6 +3077,7 @@ mod tests_e041_e048 {
         let core = |index: u32| Core::checked(index).expect("core in range");
         let sdsc = SuperDsc::new(
             DscList::new(dsc.clone(), vec![]),
+            BTreeMap::new(),
             BTreeMap::from([
                 (core(0), slice(0)),
                 (core(1), slice(0)),
@@ -3406,7 +3415,9 @@ mod tests_e049_e056 {
     use crate::arch::{Dd2, Sen1p5};
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
     use crate::schedule::ddc::fold::Stride;
-    use crate::schedule::dsc2::{AllocLayout, AllocPlacement, LayoutDims, MaxDimSize, StartAddress};
+    use crate::schedule::dsc2::{
+        AllocLayout, AllocPlacement, LayoutDims, MaxDimSize, StartAddress,
+    };
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DscList, LabeledDsList, NamedDims,
         PlacedAllocation, PrimaryDsInfo, StageDims,
@@ -3797,6 +3808,7 @@ mod tests_e049_e056 {
             DscList::new(plain.clone(), vec![plain]),
             BTreeMap::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
         let metadata = prep_dsc(&mut sdsc);
         assert!(
@@ -3831,6 +3843,7 @@ mod tests_e049_e056 {
     fn min_hmi_group_is_the_smallest_bucket() {
         let sdsc = SuperDsc::new(
             DscList::new(dsc(&[(PrimaryDim::In, 8)], &[(PrimaryDim::In, 8)]), vec![]),
+            BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
         );
@@ -4871,58 +4884,1053 @@ mod tests_e065_e072 {
     }
 }
 
-// crustify:todo: e197_getCoreletSplitDimensions
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:88  (15 body lines, level 1)
-//   original  : static std::vector<PrimaryDimTypes> getCoreletSplitDimensions( const DesignSpaceConfig &dsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:2006-2022
-//   calls     : e003_isDimensionCoreletSplit
+/// Replaces: e197_getCoreletSplitDimensions
+///
+/// Which dims the DSC's work is split across CORELETS along — every dim but the combined `IJ` and
+/// `KIJ` that [`is_dimension_corelet_split`] answers for.
+///
+/// ⭐ THE `numCoreletsUsed_ > 1` GUARD IS REDUNDANT (it is the predicate's own first term), and A SET
+/// FOR ITS VECTOR CHANGES NOTHING: it walks the KEYS of a `std::map` (`dsc/dims.cpp:22`), so the
+/// answer is already each dim once in ordinal order and both callers only iterate it (`:108`,
+/// `:5279`). `PrimaryDimTypesCount` is not a [`PrimaryDim`], so the third skip has no input.
+#[must_use]
+pub fn corelet_split_dimensions(dsc: &DesignSpaceConfig) -> BTreeSet<PrimaryDim> {
+    PrimaryDim::ALL
+        .into_iter()
+        .filter(|dim| !matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij))
+        .filter(|dim| is_dimension_corelet_split(dsc, *dim))
+        .collect()
+}
 
-// crustify:todo: e198_addOrUpdatePaddingSizesInChunkParams
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:150  (6 body lines, level 1)
-//   original  : static void addOrUpdatePaddingSizesInChunkParams( DataStructDims &chunkParams, const DataStructDims &coreParams)
-//   extract   : crustify-ddc/cpp/l3.cpp:2031-2038
-//   calls     : e004_voidPaddingIfChunking
+/// Replaces: e198_addOrUpdatePaddingSizesInChunkParams
+///
+/// COPIES the core stage's whole `paddingSizes_` onto the chunk stage, then VOIDS it on every dim
+/// chunking moved — [`void_padding_if_chunking`] under the same const flag, which stays ONE fact.
+///
+/// ⛔ BOTH *"Expect non-empty data-stage parameters."* `DT_CHECK`s ARE [`FilledDims`], as they are for
+/// entry 005. ⭐ TRAP: THE ASSIGNMENT REPLACES the map rather than merging into it, so a dim the chunk
+/// stage padded and the core stage does not LOSES its padding outright — the name says *addOrUpdate*
+/// and the body does neither.
+pub fn add_or_update_padding_sizes_in_chunk_params<const CARRY_UNNEEDED_PAD: bool>(
+    chunk_params: &mut FilledDims,
+    core_params: &FilledDims,
+) {
+    *chunk_params.padding_mut() = core_params.dims().padding.clone();
+    void_padding_if_chunking::<CARRY_UNNEEDED_PAD>(chunk_params, core_params);
+}
 
-// crustify:todo: e199_getLabeledDsNumOfWkSlices
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:219  (49 body lines, level 1)
-//   original  : static unsigned getLabeledDsNumOfWkSlices(const SuperDsc &mySDsc, const int ldsIdx, const std::vector<int> &dscIndices)
-//   extract   : crustify-ddc/cpp/l3.cpp:2047-2098
-//   calls     : e002_isLabeledDsDimensionBroadcast
+/// Replaces: e199_getLabeledDsNumOfWkSlices
+///
+/// HOW MANY DISTINCT WORK SLICES cover one labelled DS: the PRODUCT of its non-broadcast dims' slice
+/// counts when `dscs` names as many DSCs as the super-DSC has, else the number of distinct per-core
+/// slices over the group's cores.
+///
+/// ⛔ TRAP, AND IT IS THE REFERENCE'S: that fast path is chosen on a SIZE comparison
+/// (`dscIndices.size() == mySDsc.dscs_.size()`), so a group naming one DSC twice reaches it while
+/// covering half of them. ⭐ `emplace` KEEPS THE FIRST id a REPEATED layout dim states. ⛔ [`None`] is
+/// every abort: both dim-list checks, `numWkSlicesPerDim_.at`, `coreIdToWkSlice_.at`, `.at(dim)`, and
+/// the `unsigned` product wrapping.
+#[must_use]
+pub fn labeled_ds_num_of_wk_slices(
+    sdsc: &SuperDsc,
+    lds: LdsIdx,
+    dscs: &DscGroup<'_>,
+) -> Option<WkSliceCount> {
+    let main = dscs.main();
+    if dscs.iter().count() == sdsc.dscs().iter().count() {
+        let mut count = WkSliceCount::ONE;
+        for dim in main.non_broadcast_lds_dims(lds)? {
+            count = count.times(*sdsc.num_wk_slices_per_dim.get(&dim)?)?;
+        }
+        return Some(count);
+    }
+    let processing: BTreeSet<Core> = dscs
+        .iter()
+        .flat_map(|dsc| dsc.core_ids_used.iter())
+        .collect();
+    let entry = main.labeled_ds.at(lds)?;
+    let layout = main.layout_dims.get(&lds)?;
+    let mut slices: BTreeSet<BTreeMap<PrimaryDim, WkSliceId>> = BTreeSet::new();
+    for core in processing {
+        let mut slice: BTreeMap<PrimaryDim, WkSliceId> = BTreeMap::new();
+        for dim in layout.iter() {
+            let id = if is_labeled_ds_dimension_broadcast(entry, dim)? {
+                WkSliceId(0)
+            } else {
+                sdsc.core_id_to_wk_slice.get(&core)?.at(dim)?
+            };
+            slice.entry(dim).or_insert(id);
+        }
+        slices.insert(slice);
+    }
+    NonZeroU32::new(u32::try_from(slices.len()).ok()?).map(WkSliceCount::new)
+}
 
-// crustify:todo: e200_getLxNeighborLabeledDsIndicesSet
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:396  (7 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : std::unordered_set<int> L3DlOpsScheduler::getLxNeighborLabeledDsIndicesSet( const SuperDsc& mySDsc, const DesignSpaceConfig& dsc, const int dscIdx) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2108-2117
-//   calls     : e014_isLabeledDsLXNeighbor
+/// Replaces: e200_getLxNeighborLabeledDsIndicesSet
+///
+/// Which of a DSC's labelled DSs are fetched from a NEIGHBOUR CORE, by their own recorded index.
+///
+/// ⛔ TRAP: `config` AND `at` ARE TWO INDEPENDENT CARRIERS of one DSC and the reference relates them
+/// nowhere, so the list walked need not belong to the DSC whose schedule decides the answer.
+/// ⛔ TRAP: the index inserted is each entry's OWN [`LabeledDs::recorded`] one, not its position.
+/// ⛔ [`None`] is [`is_labeled_ds_lx_neighbor`]'s: a DSC index past `dscs_`, or a core the super-DSC
+/// states no schedule for.
+#[must_use]
+pub fn lx_neighbor_labeled_ds_indices(
+    sdsc: &SuperDsc,
+    config: &DesignSpaceConfig,
+    at: DscIdx,
+) -> Option<BTreeSet<LdsIdx>> {
+    let mut indices = BTreeSet::new();
+    for lds in config.labeled_ds.iter() {
+        if is_labeled_ds_lx_neighbor(sdsc, at, lds)? {
+            indices.insert(lds.recorded());
+        }
+    }
+    Some(indices)
+}
 
-// crustify:todo: e201_computeLdsAllocateSiblingLoopNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:435  (55 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::BlockNode *L3DlOpsScheduler::computeLdsAllocateSiblingLoopNode( const SuperDsc &mySDsc, const int dscIdx, const LabeledDsInfo &lds, const dsc2::BlockNode *startNode, const std::vector<const dsc2::LoopNode *> &parentInnerToOuterLoopNodes) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2127-2186
-//   calls     : e014_isLabeledDsLXNeighbor, e056_isIndexLds
+/// WHAT ENTRIES 201 AND 202 ADDITIONALLY ASK OF A SCHEDULE TREE — the two data stages a loop divides
+/// and the dims it walks, which is
+/// [`ScheduleSurgery`](crate::schedule::ddc::transformation_util::ScheduleSurgery)'s
+/// `loop_num`/`loop_den`/`loop_dims` asked WITHOUT any of its mutations.
+pub trait LoopStages: LoopNesting {
+    /// `loopNode->numId_` — the numerator data stage.
+    fn loop_num(&self, loop_node: LoopId) -> DatastageId;
+    /// `loopNode->denId_` — the denominator data stage.
+    fn loop_den(&self, loop_node: LoopId) -> DatastageId;
+    /// `loopNode->dims_` (`dsc/dsc2.h:601`).
+    fn loop_dims(&self, loop_node: LoopId) -> LoopDims;
+}
 
-// crustify:todo: e202_computeLdsTransferSiblingLoopNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:495  (32 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::BlockNode *L3DlOpsScheduler::computeLdsTransferSiblingLoopNode( const SuperDsc &mySDsc, const int dscIdx, const LabeledDsInfo &lds, const dsc2::BlockNode *startNode, const std::vector<const dsc2::LoopNode *> &parentInnerToOuterLoopNodes) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2196-2232
-//   calls     : e014_isLabeledDsLXNeighbor, e056_isIndexLds
+/// WHICH LX BUFFERING THE SCHEDULER CHOSE — `lxBufferType` (`L3DlOpsScheduler.h:221`) FUSED with
+/// `dataStageSuperChunkIdx` (`:227`).
+///
+/// ⭐ ONE TYPE FOR TWO FIELDS DISCHARGES `DT_CHECK_MSG(lxBufferType != SPATIAL_DOUBLE ||
+/// dsc.dataStageParam_.count(dataStageSuperChunkIdx), ..)` (`:4643`): spatial-double buffering is the
+/// ONLY writer of that index (`:4648`) and this type cannot be spelled without it. Its `-1` unset
+/// state and its `BUFFER_TYPE_COUNT` terminator both stop existing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LxBuffering {
+    /// `BufferType::DOUBLE` — one core-by-chunk loop per dim.
+    Double,
+    /// `BufferType::SPATIAL_DOUBLE` — a core-by-super-chunk over a super-chunk-by-chunk loop per dim.
+    SpatialDouble(SuperChunkStage),
+}
 
-// crustify:todo: e203_getOpFuncDataFormat
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:670  (49 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : std::string L3DlOpsScheduler::getOpFuncDataFormat( const DesignSpaceConfig &dsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:2242-2292
-//   calls     : e021_getOpFuncName
+/// THE LABELLED DS IS A VALUE TENSOR, WITNESSED — `DT_CHECK_MSG(!isIndexLds(lds), "Do not expect index
+/// tensor.")`, which entries 201 and 202 each state once.
+///
+/// ⭐ EXACT AND NOT STRONGER: their one caller collects `allValueLdsIndices` through that very
+/// predicate (`:3137`) BEFORE either call, so every labelled DS either function is ever handed has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueLds(());
 
-// crustify:todo: e204_isOpFuncConv2d
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:753  (15 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncConv2d(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2302-2317
-//   calls     : e023_isOpFuncConv2dInt4, e024_isOpFuncConv2dOs1
+impl ValueLds {
+    /// The witness, or [`None`] where [`is_index_lds`] names an index tensor OR refuses.
+    #[must_use]
+    pub fn of<M: MemOrg + ?Sized>(lds: &M) -> Option<Self> {
+        matches!(is_index_lds(lds), Some(false)).then_some(Self(()))
+    }
+}
+
+/// WHERE ENTRIES 201 AND 202 START WALKING — `startNode` proved to be the `lx_below_schedule` block,
+/// with the loops enclosing it INNERMOST FIRST.
+///
+/// ⭐ THE PAIR THE CALLER ALREADY BUILDS AS A PAIR: `getLxBelowBlockNode` and then
+/// `getParentLoopNodes(*lxBelowBlockNode, dsc)` (`:3128-3132`), which turns
+/// `DT_CHECK_MSG(startNode && startNode->name_ == lxBelowBlockNodeName, ..)` into a constructor and
+/// makes it impossible to walk one DSC's loops from another DSC's block.
+pub struct LxBelowWalk<'a, T: ?Sized> {
+    tree: &'a T,
+    start: NodeId,
+    inner_to_outer: Vec<LoopId>,
+}
+
+impl<'a, T: LoopNesting + ?Sized> LxBelowWalk<'a, T> {
+    /// The witness, or [`None`] where `name` is not [`LX_BELOW_BLOCK_NODE_NAME`].
+    #[must_use]
+    pub fn of(tree: &'a T, start: NodeId, name: &NodeName) -> Option<Self> {
+        (name.0 == LX_BELOW_BLOCK_NODE_NAME).then(|| Self {
+            tree,
+            start,
+            inner_to_outer: parent_loop_nodes(tree, start),
+        })
+    }
+}
+
+/// WHICH NODE A LABELLED DS'S ALLOCATE OR TRANSFER NODE IS INSERTED BEFORE — the `dsc2::BlockNode*`
+/// entries 201 and 202 hand back, which is `startNode` or one of the loops enclosing it, never a
+/// third thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiblingNode {
+    /// `startNode` itself — the `lx_below_schedule` block, so inside the innermost loop.
+    LxBelow(NodeId),
+    /// One of `parentInnerToOuterLoopNodes`; the caller re-reads its `denId_` (`:3185`).
+    Loop(LoopId),
+}
+
+/// `loopNode->dims_.front().dim_` under `DT_CHECK_MSG(loopNode->dims_.size() == 1, "Currently only
+/// support one dimension in a loop node.")` — [`None`] is that abort and nothing else.
+fn sole_loop_dim<T: LoopStages + ?Sized>(tree: &T, loop_node: LoopId) -> Option<PrimaryDim> {
+    let dims = tree.loop_dims(loop_node);
+    match dims
+        .iter()
+        .map(|dim| dim.dim)
+        .collect::<Vec<PrimaryDim>>()
+        .as_slice()
+    {
+        [sole] => Some(*sole),
+        _ => None,
+    }
+}
+
+/// Replaces: e201_computeLdsAllocateSiblingLoopNode
+///
+/// WHICH NODE THE LABELLED DS'S LX ALLOCATE NODE GOES BEFORE: for an HBM tensor the OUTERMOST
+/// enclosing loop that does not walk one of its non-broadcast dims, for an LX neighbour the lx-below
+/// block, for an LX-local the outermost loop of all.
+///
+/// ⛔ [`None`] IS THE `nullptr` AND EVERY ABORT ALIKE, which the caller cannot tell apart either —
+/// `DT_CHECK_MSG(allocSiblingLoopNode, "Expect a valid node.")` (`:3157`). It covers a DS pinned
+/// NOWHERE, a loop pair the spatial-double walk never matches, and the two places the reference is
+/// UNDEFINED: `parentLoop->numId_` on a loop with no enclosing loop, and `.back()` on an empty walk.
+#[must_use]
+pub fn compute_lds_allocate_sibling_loop_node<T: LoopStages + ?Sized>(
+    walk: &LxBelowWalk<'_, T>,
+    sdsc: &SuperDsc,
+    at: DscIdx,
+    lds: &LabeledDs,
+    _lds_is_value: ValueLds,
+    buffering: LxBuffering,
+) -> Option<SiblingNode> {
+    let tree = walk.tree;
+    if !lds.pinning().hbm() {
+        if is_labeled_ds_lx_neighbor(sdsc, at, lds)? {
+            return Some(SiblingNode::LxBelow(walk.start));
+        }
+        if !lds.pinning().lx {
+            return None;
+        }
+        return walk.inner_to_outer.last().copied().map(SiblingNode::Loop);
+    }
+    let non_broadcast = sdsc
+        .dscs()
+        .at(at)?
+        .non_broadcast_lds_dim_set(lds.recorded())?;
+    match buffering {
+        LxBuffering::SpatialDouble(super_chunk) => {
+            let mut sibling = None;
+            for enclosing in walk.inner_to_outer.iter().copied() {
+                if tree.loop_num(enclosing) == super_chunk.index()
+                    && tree.loop_den(enclosing) == DATA_STAGE_CHUNK
+                    && tree.owner_loop(enclosing.0).is_some_and(|parent| {
+                        tree.loop_num(parent) == DATA_STAGE_CORE
+                            && tree.loop_den(parent) == super_chunk.index()
+                    })
+                {
+                    sibling = Some(SiblingNode::Loop(enclosing));
+                } else if tree.loop_num(enclosing) == DATA_STAGE_CORE
+                    && tree.loop_den(enclosing) == super_chunk.index()
+                {
+                    if non_broadcast.contains(&sole_loop_dim(tree, enclosing)?) {
+                        break;
+                    }
+                    sibling = Some(SiblingNode::Loop(enclosing));
+                }
+            }
+            sibling
+        }
+        LxBuffering::Double => {
+            let mut sibling = SiblingNode::LxBelow(walk.start);
+            for enclosing in walk.inner_to_outer.iter().copied() {
+                if tree.loop_num(enclosing) != DATA_STAGE_CORE
+                    || tree.loop_den(enclosing) != DATA_STAGE_CHUNK
+                {
+                    return None;
+                }
+                if non_broadcast.contains(&sole_loop_dim(tree, enclosing)?) {
+                    break;
+                }
+                sibling = SiblingNode::Loop(enclosing);
+            }
+            Some(sibling)
+        }
+    }
+}
+
+/// Replaces: e202_computeLdsTransferSiblingLoopNode
+///
+/// WHICH NODE THE LABELLED DS'S HBM→LX TRANSFER GOES BEFORE — entry 201's answer, except that the
+/// walk considers only the loops whose DENOMINATOR is the chunk stage and SKIPS every other one.
+///
+/// ⛔ [`None`] IS THE `nullptr` AND EVERY ABORT ALIKE — `DT_CHECK_MSG(transSiblingLoopNode, "Expect a
+/// valid node.")` (`:3181`). ⭐ IT READS NO `lxBufferType`, which is why the caller re-checks
+/// `denId_ == dataStageChunkIdx` on the answer (`:3185`): under spatial-double buffering the
+/// core-by-super-chunk loops are skipped rather than refused, so the walk stops BELOW them.
+#[must_use]
+pub fn compute_lds_transfer_sibling_loop_node<T: LoopStages + ?Sized>(
+    walk: &LxBelowWalk<'_, T>,
+    sdsc: &SuperDsc,
+    at: DscIdx,
+    lds: &LabeledDs,
+    _lds_is_value: ValueLds,
+) -> Option<SiblingNode> {
+    let tree = walk.tree;
+    if !lds.pinning().hbm() {
+        if is_labeled_ds_lx_neighbor(sdsc, at, lds)? {
+            return Some(SiblingNode::LxBelow(walk.start));
+        }
+        if !lds.pinning().lx {
+            return None;
+        }
+        return walk.inner_to_outer.last().copied().map(SiblingNode::Loop);
+    }
+    let non_broadcast = sdsc
+        .dscs()
+        .at(at)?
+        .non_broadcast_lds_dim_set(lds.recorded())?;
+    let mut sibling = SiblingNode::LxBelow(walk.start);
+    for enclosing in walk.inner_to_outer.iter().copied() {
+        if tree.loop_den(enclosing) != DATA_STAGE_CHUNK {
+            continue;
+        }
+        if non_broadcast.contains(&sole_loop_dim(tree, enclosing)?) {
+            break;
+        }
+        sibling = SiblingNode::Loop(enclosing);
+    }
+    Some(sibling)
+}
+
+/// WHICH ARITHMETIC FORMAT AN OP FUNC IS CHARGED AT — the `std::string` `getOpFuncDataFormat` returns,
+/// whose four spellings are EXACTLY the four keys `sysFlopsPerByte` states
+/// (`sys-arch-spec/sysdef.cpp:297-306`), so the `.at(dataFormat)` beside it (`:2525`) cannot throw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OpFuncDataFormat {
+    /// `"int4"`.
+    Int4,
+    /// `"int8"`.
+    Int8,
+    /// `"fp8"`.
+    Fp8,
+    /// `"fp16"`, which is also the `default:` arm.
+    Fp16,
+}
+
+impl OpFuncDataFormat {
+    /// The `sysFlopsPerByte` key, spelled as the reference spells it.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Int4 => "int4",
+            Self::Int8 => "int8",
+            Self::Fp8 => "fp8",
+            Self::Fp16 => "fp16",
+        }
+    }
+}
+
+/// Replaces: e203_getOpFuncDataFormat
+///
+/// WHICH ARITHMETIC FORMAT the DSC's first op func is charged at.
+///
+/// ⛔ TRAP, AND IT IS THE REFERENCE'S: THIS IS A LITERAL ENUMERATION, NOT A PRECISION PREDICATE.
+/// `CSQ_INT8_V2`, `CSQ_INT8_MB_V2`, `Q_FP8_MB`, `BATCHMATMUL_FP8_FWD_MB`, `BATCHMATMUL_MXFP8_FWD` and
+/// `BATCHMATMUL_MXFP4_W_FWD` each NAME their format and each fall to the `default:` `"fp16"`, so the
+/// arithmetic intensity they are scored with is another format's (`:2521-2525`). Ported verbatim.
+/// ⭐ TOTAL: the default arm answers for `OpFuncs::NONE` too, so `DT_CHECK(hasComputeOp)` has no say.
+#[must_use]
+pub fn op_func_data_format<D: ComputeOps + ?Sized>(dsc: &D) -> OpFuncDataFormat {
+    match get_op_func_name(dsc) {
+        Some(
+            OpFunc::Conv2DInt4Fwd
+            | OpFunc::Conv2DInt4FwdGenkg3
+            | OpFunc::Conv2DInt4FwdSparsekg3
+            | OpFunc::BatchmatmulInt4Fwd
+            | OpFunc::BatchmatmulInt4FwdSparsekg3
+            | OpFunc::BatchmatmulXrfInt4Fwd
+            | OpFunc::BatchmatmulXrfchInt4Fwd
+            | OpFunc::CsqInt4
+            | OpFunc::CsqInt4Wt
+            | OpFunc::CsqInt4Chil,
+        ) => OpFuncDataFormat::Int4,
+        Some(
+            OpFunc::Conv2DInt8Fwd
+            | OpFunc::Conv2DInt8FwdGenkg3
+            | OpFunc::Conv2DInt8FwdSparsekg3
+            | OpFunc::Conv2DInt8FwdOs1
+            | OpFunc::Conv2DXrfInt8FwdOs1
+            | OpFunc::BatchmatmulInt8Fwd
+            | OpFunc::BatchmatmulInt8FwdMbkg3
+            | OpFunc::BatchmatmulInt8FwdSparsekg3
+            | OpFunc::BatchmatmulXrfInt8Fwd
+            | OpFunc::BatchmatmulXrfchInt8Fwd
+            | OpFunc::CsqInt8
+            | OpFunc::CsqInt8Ch
+            | OpFunc::CsqInt8Wt
+            | OpFunc::CsqInt8Chil
+            | OpFunc::CsqInt8Mb,
+        ) => OpFuncDataFormat::Int8,
+        Some(
+            OpFunc::Conv2DFp8Fwd
+            | OpFunc::Conv2DFp8FwdGenkg3
+            | OpFunc::Conv2DFp8FwdSparsekg3
+            | OpFunc::BatchmatmulFp8Fwd
+            | OpFunc::BatchmatmulFp8FwdSparsekg3
+            | OpFunc::BatchmatmulXrfFp8Fwd
+            | OpFunc::BatchmatmulXrfchFp8Fwd
+            | OpFunc::QFp8
+            | OpFunc::QFp8Ch
+            | OpFunc::QFp8Wt
+            | OpFunc::QFp8Chil,
+        ) => OpFuncDataFormat::Fp8,
+        _ => OpFuncDataFormat::Fp16,
+    }
+}
+
+/// Replaces: e204_isOpFuncConv2d
+///
+/// WHETHER THE OP FUNC IS A CONV2D — [`is_op_func_conv2d_int4`], [`is_op_func_conv2d_os1`] and the
+/// nine fp16, fp8 and int8 forward spellings its own `static` set names.
+///
+/// ⭐ THE UNION IS EVERY `CONV2D_*` THE ISA NAMES — sixteen variants
+/// (`sys-arch-spec/arch_enums.h:196-218`, `:241-244`) — so this is Conv2d-ness and not a subset of it,
+/// and the `static const std::unordered_set` built once per process is a `matches!` here.
+#[must_use]
+pub fn is_op_func_conv2d(op_func: Option<OpFunc>) -> bool {
+    is_op_func_conv2d_int4(op_func)
+        || is_op_func_conv2d_os1(op_func)
+        || matches!(
+            op_func,
+            Some(
+                OpFunc::Conv2DFwd
+                    | OpFunc::Conv2DFp8Fwd
+                    | OpFunc::Conv2DInt8Fwd
+                    | OpFunc::Conv2DFwdGenkg3
+                    | OpFunc::Conv2DFp8FwdGenkg3
+                    | OpFunc::Conv2DInt8FwdGenkg3
+                    | OpFunc::Conv2DFwdSparsekg3
+                    | OpFunc::Conv2DFp8FwdSparsekg3
+                    | OpFunc::Conv2DInt8FwdSparsekg3
+            )
+        )
+}
+
+#[cfg(test)]
+mod tests_e197_e204 {
+    use super::*;
+    use crate::schedule::ddc::transformation_util::StageName;
+    use crate::schedule::ddc::v1::OpFuncs;
+    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, CoreletShare, CoreletsUsed, DataStage, DataStages, DscList, DscScheduleStep,
+        LabeledDsList, NamedDims, PadElems, PadSizes, StageDims,
+    };
+
+    /// The SUPER-CHUNK data stage the spatial-double tests mint — `getNewDataStageIndex`'s answer for
+    /// a DSC that already holds the core and chunk stages.
+    const SUPER_CHUNK: DatastageId = DatastageId(2);
+
+    fn core(index: u32) -> Core {
+        Core::checked(index).expect("this arch has the core the test names")
+    }
+
+    fn count(value: u32) -> WkSliceCount {
+        WkSliceCount::new(NonZeroU32::new(value).expect("a positive slice count"))
+    }
+
+    fn a_stage(extents: &[(PrimaryDim, i64)]) -> DataStage {
+        let named = NamedDims {
+            name: StageName::default(),
+            dims: FilledDims::of(StageDims {
+                extents: extents
+                    .iter()
+                    .map(|(dim, extent)| (*dim, Extent(*extent)))
+                    .collect(),
+                ..StageDims::default()
+            })
+            .expect("a stage stating at least one dim"),
+        };
+        DataStage {
+            ss: named.clone(),
+            el: named,
+        }
+    }
+
+    /// A DSC with ONE labelled DS at position 0 recording index 0, whose layout order is `X` then
+    /// `Y`, and which uses cores 0 and 1.
+    fn a_dsc(scales: &[(PrimaryDim, Scale)], pinning: Pinning) -> DesignSpaceConfig {
+        DesignSpaceConfig {
+            corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: None,
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(core(0), vec![core(1)]),
+            layout_dims: BTreeMap::from([(
+                LdsIdx(0),
+                LayoutDims::new(PrimaryDim::X, vec![PrimaryDim::Y]),
+            )]),
+            labeled_ds: LabeledDsList::new(
+                LabeledDs::new(DsType::Input, scales.to_vec(), LdsIdx(0), pinning),
+                vec![],
+            ),
+            data_stages: DataStages::new(
+                a_stage(&[(PrimaryDim::X, 8)]),
+                a_stage(&[(PrimaryDim::X, 8)]),
+            ),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+        }
+    }
+
+    /// `X` is a one-element stick dim and so BROADCAST, `Y` carries a whole slice.
+    fn broadcast_x() -> Vec<(PrimaryDim, Scale)> {
+        vec![
+            (PrimaryDim::X, Scale::UnitStick),
+            (PrimaryDim::Y, Scale::Sized(1.0)),
+        ]
+    }
+
+    /// A `memOrg_` whose HBM allocation indirects through nothing, so entry 056 answers `false`.
+    struct ValueTensor;
+
+    impl MemOrg for ValueTensor {
+        fn hbm_pinned(&self) -> bool {
+            true
+        }
+        fn lx_buffering(&self) -> Option<Buffering> {
+            None
+        }
+        fn lx_start_address(&self, _at: &AddressCoord) -> Option<ByteAddress> {
+            None
+        }
+        fn lx_buffer_offset(&self, _core: Core, _corelet: Corelet) -> Option<BufferOffset> {
+            None
+        }
+        fn hbm_indirection(&self) -> Option<IndirectAlloc> {
+            Some(IndirectAlloc::ValueTensor)
+        }
+        fn hbm_allocation(&self) -> Option<NodeName> {
+            None
+        }
+        fn hbm_layout_dims(&self) -> Option<LayoutDims> {
+            None
+        }
+        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
+            BTreeSet::new()
+        }
+    }
+
+    /// THE NEST BOTH SIBLING WALKS SEE — the `lx_below_schedule` block at node 10, inside loop 9,
+    /// inside loop 8, inside the ROOT loop 7 that [`parent_loop_nodes`] stops at.
+    struct Nest(BTreeMap<u32, (DatastageId, DatastageId, Vec<PrimaryDim>)>);
+
+    impl LoopNesting for Nest {
+        fn owner_loop(&self, node: NodeId) -> Option<LoopId> {
+            match node.0 {
+                10 => Some(LoopId(NodeId(9))),
+                9 => Some(LoopId(NodeId(8))),
+                8 => Some(LoopId(NodeId(7))),
+                _ => None,
+            }
+        }
+        fn has_parent(&self, node: LoopId) -> bool {
+            node.0 != NodeId(7)
+        }
+    }
+
+    impl Nest {
+        fn at(&self, loop_node: LoopId) -> &(DatastageId, DatastageId, Vec<PrimaryDim>) {
+            self.0
+                .get(&loop_node.0.0)
+                .expect("the test states every loop it nests")
+        }
+    }
+
+    impl LoopStages for Nest {
+        fn loop_num(&self, loop_node: LoopId) -> DatastageId {
+            self.at(loop_node).0
+        }
+        fn loop_den(&self, loop_node: LoopId) -> DatastageId {
+            self.at(loop_node).1
+        }
+        fn loop_dims(&self, loop_node: LoopId) -> LoopDims {
+            let dims: Vec<PrimaryDimAndKind> = self
+                .at(loop_node)
+                .2
+                .iter()
+                .map(|dim| PrimaryDimAndKind {
+                    dim: *dim,
+                    kind: MetaDimKind::Unpadded,
+                })
+                .collect();
+            let (first, rest) = dims.split_first().expect("a loop walks at least one dim");
+            LoopDims::new(*first, rest.to_vec())
+        }
+    }
+
+    /// A core-by-chunk nest: loop 9 walks `X`, loop 8 walks `Y`, and the root loop 7 is never read.
+    fn double_nest() -> Nest {
+        Nest(BTreeMap::from([
+            (9, (DATA_STAGE_CORE, DATA_STAGE_CHUNK, vec![PrimaryDim::X])),
+            (8, (DATA_STAGE_CORE, DATA_STAGE_CHUNK, vec![PrimaryDim::Y])),
+        ]))
+    }
+
+    /// The spatial-double nest `addLoopNodes` builds: a core-by-super-chunk loop 8 OUTSIDE a
+    /// super-chunk-by-chunk loop 9 (`L3DlOpsScheduler.cpp:4645-4650`).
+    fn spatial_nest() -> Nest {
+        Nest(BTreeMap::from([
+            (9, (SUPER_CHUNK, DATA_STAGE_CHUNK, vec![PrimaryDim::X])),
+            (8, (DATA_STAGE_CORE, SUPER_CHUNK, vec![PrimaryDim::Y])),
+        ]))
+    }
+
+    fn lx_walk<'a>(nest: &'a Nest) -> LxBelowWalk<'a, Nest> {
+        LxBelowWalk::of(
+            nest,
+            NodeId(10),
+            &NodeName(LX_BELOW_BLOCK_NODE_NAME.to_owned()),
+        )
+        .expect("the lx-below block names itself")
+    }
+
+    /// e197 — a dim corelet 0 holds less of than the core is split, `IJ` never is however it is
+    /// stated, and a one-corelet DSC splits nothing at all.
+    #[test]
+    fn corelet_split_dimensions_skip_the_combined_dims() {
+        let split = CoreletShare {
+            corelet0: Extent(4),
+            whole: Extent(8),
+        };
+        let whole = CoreletShare {
+            corelet0: Extent(8),
+            whole: Extent(8),
+        };
+        let mut dsc = a_dsc(&broadcast_x(), Pinning::default());
+        dsc.corelets_used =
+            CoreletsUsed::new(NonZeroU32::new(2).expect("two corelets is a positive count"));
+        dsc.corelet_shares = BTreeMap::from([
+            (PrimaryDim::Y, split),
+            (PrimaryDim::X, whole),
+            (PrimaryDim::Ij, split),
+            (PrimaryDim::Kij, split),
+        ]);
+        assert_eq!(
+            corelet_split_dimensions(&dsc),
+            BTreeSet::from([PrimaryDim::Y])
+        );
+
+        // The redundant outer guard: one corelet cannot split anything, whatever the shares say.
+        dsc.corelets_used = CoreletsUsed::ONE;
+        assert_eq!(corelet_split_dimensions(&dsc), BTreeSet::new());
+    }
+
+    /// e198 — the core stage's padding lands whole on the chunk stage and is then VOIDED on the dim
+    /// chunking moved, while the dim it left alone keeps its sizes.
+    #[test]
+    fn chunk_padding_is_the_cores_voided_where_chunking_moved_the_extent() {
+        let pad = |front: u32, back: u32| DimPadding {
+            sizes: PadSizes::of(PadElems(front), PadElems(back)),
+            ..DimPadding::default()
+        };
+        let stage = |extents: &[(PrimaryDim, i64)], padding: &[(PrimaryDim, DimPadding)]| {
+            FilledDims::of(StageDims {
+                extents: extents
+                    .iter()
+                    .map(|(dim, extent)| (*dim, Extent(*extent)))
+                    .collect(),
+                padding: padding.iter().cloned().collect(),
+                ..StageDims::default()
+            })
+            .expect("a stage stating at least one dim")
+        };
+        let core_params = stage(
+            &[(PrimaryDim::X, 8), (PrimaryDim::Y, 64)],
+            &[(PrimaryDim::X, pad(1, 2)), (PrimaryDim::Y, pad(3, 4))],
+        );
+        // The chunk stage states NO padding of its own, and `Y` is the dim chunking moved.
+        let mut chunk_params = stage(&[(PrimaryDim::X, 8), (PrimaryDim::Y, 16)], &[]);
+
+        add_or_update_padding_sizes_in_chunk_params::<true>(&mut chunk_params, &core_params);
+
+        assert_eq!(
+            chunk_params.dims().padding[&PrimaryDim::X].sizes,
+            PadSizes::of(PadElems(1), PadElems(2))
+        );
+        assert_eq!(
+            chunk_params.dims().padding[&PrimaryDim::Y].sizes,
+            PadSizes::Voided
+        );
+    }
+
+    /// e199 — a whole-super-DSC group multiplies the non-broadcast dims' slice counts, a partial one
+    /// counts the distinct per-core slices, and a dim nothing states a count for has no answer.
+    #[test]
+    fn work_slice_count_is_a_product_or_a_tally_of_distinct_slices() {
+        let dsc = a_dsc(&broadcast_x(), Pinning::default());
+        let slice = |x: i32, y: i32| {
+            WkSlice(BTreeMap::from([
+                (PrimaryDim::X, WkSliceId(x)),
+                (PrimaryDim::Y, WkSliceId(y)),
+            ]))
+        };
+        let slices = BTreeMap::from([(core(0), slice(0, 0)), (core(1), slice(0, 1))]);
+        let counts = BTreeMap::from([(PrimaryDim::X, count(2)), (PrimaryDim::Y, count(3))]);
+        let group = DscGroup::new(&dsc, vec![]);
+
+        // The fast path: ONE DSC named of a ONE-DSC super-DSC. `X` broadcasts, so only `Y` counts.
+        let whole = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![]),
+            counts.clone(),
+            slices.clone(),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            labeled_ds_num_of_wk_slices(&whole, LdsIdx(0), &group),
+            Some(count(3))
+        );
+        // ... and `numWkSlicesPerDim_.at(dim)` throwing is the absence of an answer.
+        let unstated = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![]),
+            BTreeMap::from([(PrimaryDim::X, count(2))]),
+            slices.clone(),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            labeled_ds_num_of_wk_slices(&unstated, LdsIdx(0), &group),
+            None
+        );
+
+        // The tally path: ONE DSC named of a TWO-DSC super-DSC. Both cores agree on the broadcast
+        // `X`, whose id is forced to 0, and differ on `Y`, so the two cores hold two slices.
+        let partial = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![dsc.clone()]),
+            counts,
+            slices,
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            labeled_ds_num_of_wk_slices(&partial, LdsIdx(0), &group),
+            Some(count(2))
+        );
+        // ... and `coreIdToWkSlice_.at(coreId)` throwing is the absence of an answer.
+        let no_slices = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![dsc.clone()]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            labeled_ds_num_of_wk_slices(&no_slices, LdsIdx(0), &group),
+            None
+        );
+    }
+
+    /// e200 — an LX-pinned input whose own schedule step also names a data DSC is a neighbour fetch
+    /// and is reported by its RECORDED index, and a core with no schedule has no answer.
+    #[test]
+    fn lx_neighbor_indices_are_the_recorded_ones() {
+        let lx = Pinning {
+            mem_org: BTreeMap::new(),
+            lx: true,
+            lx_padded: false,
+        };
+        let mut dsc = a_dsc(&broadcast_x(), lx.clone());
+        // Position 0 RECORDS index 7; position 1 is an output and is never a neighbour fetch.
+        dsc.labeled_ds = LabeledDsList::new(
+            LabeledDs::new(DsType::Input, broadcast_x(), LdsIdx(7), lx.clone()),
+            vec![LabeledDs::new(DsType::Output, broadcast_x(), LdsIdx(1), lx)],
+        );
+        let schedule = vec![DscScheduleStep {
+            data_dsc: Some(DscIdx(3)),
+            dl_dsc: Some(DscIdx(0)),
+        }];
+        let sdsc = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::from([(core(0), schedule)]),
+        );
+        assert_eq!(
+            lx_neighbor_labeled_ds_indices(&sdsc, &dsc, DscIdx(0)),
+            Some(BTreeSet::from([LdsIdx(7)]))
+        );
+
+        // `coreIdToDscSchedule.at(coreId)` throwing is the absence of an answer.
+        let unscheduled = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            lx_neighbor_labeled_ds_indices(&unscheduled, &dsc, DscIdx(0)),
+            None
+        );
+    }
+
+    /// A one-DSC super-DSC over `dsc`, with no work slices and no schedule.
+    fn a_super_dsc(dsc: DesignSpaceConfig) -> SuperDsc {
+        SuperDsc::new(
+            DscList::new(dsc, vec![]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    }
+
+    fn hbm_pinned() -> Pinning {
+        Pinning {
+            mem_org: [(SenComponent::Hbm, true)].into(),
+            lx: false,
+            lx_padded: false,
+        }
+    }
+
+    /// e201 under DOUBLE buffering — the allocate node goes before the OUTERMOST core-by-chunk loop
+    /// that does not walk a non-broadcast dim, and a loop that is not core-by-chunk refuses.
+    #[test]
+    fn a_double_buffered_allocation_stops_below_the_loop_walking_its_own_dim() {
+        let nest = double_nest();
+        let walk = lx_walk(&nest);
+        let value = ValueLds::of(&ValueTensor).expect("a value tensor is not an index tensor");
+
+        // `X` broadcasts and `Y` does not, so loop 8's `Y` stops the walk at loop 9.
+        let lds = LabeledDs::new(DsType::Input, broadcast_x(), LdsIdx(0), hbm_pinned());
+        let sdsc = a_super_dsc(a_dsc(&broadcast_x(), hbm_pinned()));
+        assert_eq!(
+            compute_lds_allocate_sibling_loop_node(
+                &walk,
+                &sdsc,
+                DscIdx(0),
+                &lds,
+                value,
+                LxBuffering::Double
+            ),
+            Some(SiblingNode::Loop(LoopId(NodeId(9))))
+        );
+
+        // A wholly broadcast tensor stops nowhere, so it reaches the outermost loop of the walk.
+        let all_broadcast = vec![
+            (PrimaryDim::X, Scale::UnitStick),
+            (PrimaryDim::Y, Scale::UnitStick),
+        ];
+        let lds = LabeledDs::new(
+            DsType::Input,
+            all_broadcast.clone(),
+            LdsIdx(0),
+            hbm_pinned(),
+        );
+        let sdsc = a_super_dsc(a_dsc(&all_broadcast, hbm_pinned()));
+        assert_eq!(
+            compute_lds_allocate_sibling_loop_node(
+                &walk,
+                &sdsc,
+                DscIdx(0),
+                &lds,
+                value,
+                LxBuffering::Double
+            ),
+            Some(SiblingNode::Loop(LoopId(NodeId(8))))
+        );
+
+        // *"Expect a core-by-chunk loop."*: a spatial-double nest walked as a double-buffered one.
+        let spatial = spatial_nest();
+        assert_eq!(
+            compute_lds_allocate_sibling_loop_node(
+                &lx_walk(&spatial),
+                &sdsc,
+                DscIdx(0),
+                &lds,
+                value,
+                LxBuffering::Double
+            ),
+            None
+        );
+    }
+
+    /// e201 under SPATIAL-DOUBLE buffering — the allocate node goes before the super-chunk-by-chunk
+    /// loop whose parent is the core-by-super-chunk loop, and the core loop's own dim can still
+    /// stop the walk there.
+    #[test]
+    fn a_spatial_double_allocation_lands_on_the_super_chunk_loop_pair() {
+        let nest = spatial_nest();
+        let walk = lx_walk(&nest);
+        let value = ValueLds::of(&ValueTensor).expect("a value tensor is not an index tensor");
+        let mut stages = DataStages::new(
+            a_stage(&[(PrimaryDim::X, 8)]),
+            a_stage(&[(PrimaryDim::X, 8)]),
+        );
+        stages.set(SUPER_CHUNK, a_stage(&[(PrimaryDim::X, 8)]));
+        let buffering = LxBuffering::SpatialDouble(
+            stages
+                .super_chunk(SUPER_CHUNK)
+                .expect("the super-chunk stage the walk names"),
+        );
+
+        // Loop 8 walks `Y`, which is non-broadcast, so the answer stays at the pair below it.
+        let lds = LabeledDs::new(DsType::Input, broadcast_x(), LdsIdx(0), hbm_pinned());
+        let sdsc = a_super_dsc(a_dsc(&broadcast_x(), hbm_pinned()));
+        assert_eq!(
+            compute_lds_allocate_sibling_loop_node(&walk, &sdsc, DscIdx(0), &lds, value, buffering),
+            Some(SiblingNode::Loop(LoopId(NodeId(9))))
+        );
+
+        // A wholly broadcast tensor walks on out to the core-by-super-chunk loop.
+        let all_broadcast = vec![
+            (PrimaryDim::X, Scale::UnitStick),
+            (PrimaryDim::Y, Scale::UnitStick),
+        ];
+        let lds = LabeledDs::new(
+            DsType::Input,
+            all_broadcast.clone(),
+            LdsIdx(0),
+            hbm_pinned(),
+        );
+        let sdsc = a_super_dsc(a_dsc(&all_broadcast, hbm_pinned()));
+        assert_eq!(
+            compute_lds_allocate_sibling_loop_node(&walk, &sdsc, DscIdx(0), &lds, value, buffering),
+            Some(SiblingNode::Loop(LoopId(NodeId(8))))
+        );
+
+        // A tensor pinned NOWHERE is the reference's `nullptr`, whatever the nest looks like.
+        let nowhere = LabeledDs::new(DsType::Input, all_broadcast, LdsIdx(0), Pinning::default());
+        assert_eq!(
+            compute_lds_allocate_sibling_loop_node(
+                &walk,
+                &sdsc,
+                DscIdx(0),
+                &nowhere,
+                value,
+                buffering
+            ),
+            None
+        );
+    }
+
+    /// e202 — the transfer walk keeps only the chunk-denominated loops, so a spatial-double nest's
+    /// core-by-super-chunk loop is SKIPPED rather than refused, and the LX-local arm answers with
+    /// the outermost loop of the walk.
+    #[test]
+    fn a_transfer_walk_considers_only_the_chunk_denominated_loops() {
+        let nest = spatial_nest();
+        let walk = lx_walk(&nest);
+        let value = ValueLds::of(&ValueTensor).expect("a value tensor is not an index tensor");
+        let all_broadcast = vec![
+            (PrimaryDim::X, Scale::UnitStick),
+            (PrimaryDim::Y, Scale::UnitStick),
+        ];
+        let sdsc = a_super_dsc(a_dsc(&all_broadcast, hbm_pinned()));
+
+        // Loop 8 divides the core stage by the super-chunk, so the walk cannot pass it and stops at
+        // loop 9 — which is exactly what the caller's `denId_ == dataStageChunkIdx` re-check wants.
+        let lds = LabeledDs::new(
+            DsType::Input,
+            all_broadcast.clone(),
+            LdsIdx(0),
+            hbm_pinned(),
+        );
+        assert_eq!(
+            compute_lds_transfer_sibling_loop_node(&walk, &sdsc, DscIdx(0), &lds, value),
+            Some(SiblingNode::Loop(LoopId(NodeId(9))))
+        );
+
+        // An LX-local tensor goes OUTSIDE the outermost loop of the walk, whatever divides it.
+        let lx_local = LabeledDs::new(
+            DsType::Output,
+            all_broadcast,
+            LdsIdx(0),
+            Pinning {
+                mem_org: BTreeMap::new(),
+                lx: true,
+                lx_padded: false,
+            },
+        );
+        assert_eq!(
+            compute_lds_transfer_sibling_loop_node(&walk, &sdsc, DscIdx(0), &lx_local, value),
+            Some(SiblingNode::Loop(LoopId(NodeId(8))))
+        );
+    }
+
+    /// `computeOp_` with one entry, as the other test modules in this file spell one.
+    struct Ops(Option<OpFunc>);
+
+    impl ComputeOps for Ops {
+        fn op_funcs(&self) -> OpFuncs {
+            OpFuncs::new(self.0, Vec::new())
+        }
+        fn set_first_op_func(&mut self, op_func: OpFunc) {
+            self.0 = Some(op_func);
+        }
+    }
+
+    /// e203 — one representative of each of the four keys, and the six op funcs that NAME a format
+    /// the reference does not charge them at.
+    #[test]
+    fn the_data_format_is_a_literal_enumeration_and_not_a_precision_predicate() {
+        for (op, format) in [
+            (OpFunc::CsqInt4Chil, OpFuncDataFormat::Int4),
+            (OpFunc::Conv2DXrfInt8FwdOs1, OpFuncDataFormat::Int8),
+            (OpFunc::BatchmatmulXrfchFp8Fwd, OpFuncDataFormat::Fp8),
+            (OpFunc::BatchmatmulFwd, OpFuncDataFormat::Fp16),
+        ] {
+            assert_eq!(op_func_data_format(&Ops(Some(op))), format);
+        }
+        assert_eq!(
+            [
+                OpFuncDataFormat::Int4.key(),
+                OpFuncDataFormat::Int8.key(),
+                OpFuncDataFormat::Fp8.key(),
+                OpFuncDataFormat::Fp16.key(),
+            ],
+            ["int4", "int8", "fp8", "fp16"]
+        );
+
+        // ⛔ THE TRAP: each of these names its format and each is charged as `fp16`.
+        for op in [
+            OpFunc::CsqInt8V2,
+            OpFunc::CsqInt8MbV2,
+            OpFunc::QFp8Mb,
+            OpFunc::BatchmatmulFp8FwdMb,
+            OpFunc::BatchmatmulMxfp8Fwd,
+            OpFunc::BatchmatmulMxfp4WFwd,
+        ] {
+            assert_eq!(op_func_data_format(&Ops(Some(op))), OpFuncDataFormat::Fp16);
+        }
+        // No compute op at all answers `fp16` too, so the switch is total.
+        assert_eq!(op_func_data_format(&Ops(None)), OpFuncDataFormat::Fp16);
+    }
+
+    /// e204 — the union of the three predicates is every `CONV2D_*` the ISA names, and nothing else
+    /// is a Conv2d.
+    #[test]
+    fn every_conv2d_the_isa_names_is_a_conv2d_and_no_batchmatmul_is() {
+        for op in [
+            OpFunc::Conv2DFwd,
+            OpFunc::Conv2DFp8Fwd,
+            OpFunc::Conv2DInt8Fwd,
+            OpFunc::Conv2DInt4Fwd,
+            OpFunc::Conv2DFwdGenkg3,
+            OpFunc::Conv2DFp8FwdGenkg3,
+            OpFunc::Conv2DInt8FwdGenkg3,
+            OpFunc::Conv2DInt4FwdGenkg3,
+            OpFunc::Conv2DFwdSparsekg3,
+            OpFunc::Conv2DFp8FwdSparsekg3,
+            OpFunc::Conv2DInt8FwdSparsekg3,
+            OpFunc::Conv2DInt4FwdSparsekg3,
+            OpFunc::Conv2DFwdOs1,
+            OpFunc::Conv2DFwdGenOs1,
+            OpFunc::Conv2DInt8FwdOs1,
+            OpFunc::Conv2DXrfInt8FwdOs1,
+        ] {
+            assert!(is_op_func_conv2d(Some(op)), "{op:?} is a Conv2d");
+        }
+        assert!(!is_op_func_conv2d(Some(OpFunc::BatchmatmulFwd)));
+        assert!(!is_op_func_conv2d(None));
+    }
+}
 
 // crustify:todo: e205_isOpFuncBmm
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:804  (5 body lines, level 1)
