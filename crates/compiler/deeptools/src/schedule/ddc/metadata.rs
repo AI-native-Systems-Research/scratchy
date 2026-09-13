@@ -140,7 +140,7 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
 use crate::generated::{DataConnect, MaxUnroll, OpaqueReg, RegName, Strategy};
 use crate::schedule::dsc2::{LdsIdx, NodeName};
 use std::collections::{BTreeMap, BTreeSet};
-use sys_arch_spec::arch_enums::OpFunc;
+use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
 // ═══ `Constraints` — THE FIELDS `dump` OBSERVES, AND THE THREE UPDATERS ══════════════════════════
 
@@ -205,14 +205,52 @@ impl NoEpilogueDimKind {
 /// `ddc/ddc_transformation.cpp:968-1035` sets `Unpadded` on constraints that are not multiples, and
 /// `dump` prints the kind unconditionally — a fold that dropped it could not state that constraint.
 ///
-/// ⛔ THE TWO `DT_ERROR`s STAY UNREPRESENTABLE: `mustBeMultiple_` with no kind (`ddc/ddcv1.cpp:857-859`)
-/// and with a kind outside `{Unpadded, Padded, WindowDim}` (`:881-886`) have no variant here.
+/// ⛔ THE TWO `DT_ERROR`s ARE THE RELATIVE ARM'S ALONE: `mustBeMultiple_` with no kind
+/// (`ddc/ddcv1.cpp:857-859`) and with a kind outside `{Unpadded, Padded, WindowDim}` (`:881-886`) are
+/// both raised where the constraint is CHECKED against a reference stage — so on the ABSOLUTE arm,
+/// whose kind is never read, [`Self::Unkinded`] is the state entry 307 legitimately stores (`:1466`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopMultiple {
     /// `mustBeMultiple_` false, with whatever `loopDimKind_` holds — [`None`] for `Count`.
     Off(Option<MetaDimKind>),
+    /// `mustBeMultiple_` with `loopDimKind_ == Count`, which only an ABSOLUTE constraint may hold.
+    Unkinded,
     /// `mustBeMultiple_`, with the kind its no-epilogue divisibility test reads.
     NoEpilogue(NoEpilogueDimKind),
+}
+
+impl LoopMultiple {
+    /// `mustBeMultiple_ = must_be_multiple; loopDimKind_ = dim_kind` as one value, and [`None`] where
+    /// a must-be-multiple kind is one of the six the no-epilogue check has no arm for.
+    #[must_use]
+    pub fn of(must_be_multiple: bool, dim_kind: Option<MetaDimKind>) -> Option<Self> {
+        if !must_be_multiple {
+            return Some(Self::Off(dim_kind));
+        }
+        match dim_kind {
+            None => Some(Self::Unkinded),
+            Some(MetaDimKind::Unpadded) => Some(Self::NoEpilogue(NoEpilogueDimKind::Unpadded)),
+            Some(MetaDimKind::Padded) => Some(Self::NoEpilogue(NoEpilogueDimKind::Padded)),
+            Some(MetaDimKind::WindowDim) => Some(Self::NoEpilogue(NoEpilogueDimKind::WindowDim)),
+            Some(_) => None,
+        }
+    }
+
+    /// `mustBeMultiple_`.
+    #[must_use]
+    pub const fn must_be_multiple(self) -> bool {
+        !matches!(self, Self::Off(_))
+    }
+
+    /// `loopDimKind_`, [`None`] for its `Count` sentinel.
+    #[must_use]
+    pub fn dim_kind(self) -> Option<MetaDimKind> {
+        match self {
+            Self::Off(dim_kind) => dim_kind,
+            Self::Unkinded => None,
+            Self::NoEpilogue(kind) => Some(kind.dim_kind()),
+        }
+    }
 }
 
 impl<S> Constraint<'_, S> {
@@ -277,10 +315,9 @@ impl<S> Constraint<'_, S> {
                     AbsoluteMin::Bound(min) | AbsoluteMin::Multiple(min) => Some(min),
                 },
             ),
-            ConstraintKind::Relative { multiple, min, .. } => match multiple {
-                LoopMultiple::Off(dim_kind) => (false, dim_kind, min),
-                LoopMultiple::NoEpilogue(kind) => (true, Some(kind.dim_kind()), min),
-            },
+            ConstraintKind::Relative { multiple, min, .. } => {
+                (multiple.must_be_multiple(), multiple.dim_kind(), min)
+            }
         };
 
         let mut out = String::from("mustBeMultiple_= ");
@@ -766,6 +803,20 @@ pub enum ExternalStorage {
     L3LuIbr,
 }
 
+impl ExternalStorage {
+    /// `is_any_of(storage, LX, PTXRF, L3LUIBR)` as the storage it then is, and [`None`] for every
+    /// other component — which is entry 309's `DT_ERROR("External transfer node improperly set")`.
+    #[must_use]
+    pub const fn of(storage: SenComponent) -> Option<Self> {
+        match storage {
+            SenComponent::Lx => Some(Self::Lx),
+            SenComponent::Ptxrf => Some(Self::PtxRf),
+            SenComponent::L3luibr => Some(Self::L3LuIbr),
+            _ => None,
+        }
+    }
+}
+
 /// A MEMORY DDC ALLOCATES IN — `ddc::memories` (`ddc/ddc_metadata.h:20-21`).
 ///
 /// ⛔ NOT [`crate::generated::Memory`]: that is the `ddl.allocate` census and has neither `HBM` nor
@@ -862,8 +913,12 @@ pub struct Metadata {
     /// `externalTransfers_` (:137) — the one OWNING field, so the one entry 104 frees through.
     pub external_transfers: Vec<ExternalTransfer>,
     /// `prefilledExternalTransferToDataConnectToFill_` (:138), keyed by labeled DS and storage.
+    ///
+    /// ⛔ THE LDS IS OPTIONAL BECAUSE ENTRY 309'S GUARD IS ONE-SIDED: it refuses `ldsIdx >=
+    /// labeledDs_.size()` and NOT `ldsIdx < 0` (`ddc/ddcv1.cpp:2331-2336`), so a `NO_TRANSFER_FROM_TENSOR`
+    /// redirected onto a destination that names no labelled DS keys this map at `-1`.
     pub prefilled_external_transfer_data_connects:
-        BTreeMap<(LdsIdx, ExternalStorage), DataConnectSlot>,
+        BTreeMap<(Option<LdsIdx>, ExternalStorage), DataConnectSlot>,
     /// `externalNodes_` (:140).
     pub external_nodes: BTreeSet<NodeId>,
     /// `TransferNodesInterSliceTranspose_` (:141).
@@ -1201,7 +1256,7 @@ mod tests_e104 {
         });
         // The non-owning slot beside them, which the reset drops without destroying anything.
         md.prefilled_external_transfer_data_connects.insert(
-            (LdsIdx(3), ExternalStorage::Lx),
+            (Some(LdsIdx(3)), ExternalStorage::Lx),
             DataConnectSlot {
                 transfer: NodeId(7),
                 end: TransferEnd::Src,

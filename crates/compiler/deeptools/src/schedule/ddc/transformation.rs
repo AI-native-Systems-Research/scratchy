@@ -159,7 +159,7 @@ use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{AllocId, NodeId};
 use crate::schedule::ddc::metadata::{DatastageId, DestIdx, MetaDimKind, Metadata};
 use crate::schedule::dsc2::{
-    ComputeNode, LdsIdx, NodeName, Operand, TransferNode, generic_comp,
+    ComputeNode, LdsIdx, NodeName, NumChunks, Operand, TransferNode, generic_comp,
 };
 use crate::units::Corelet;
 
@@ -1526,7 +1526,9 @@ fn force_unpadded(constraint: &mut StoredConstraint, values: &[f32]) {
     constraint.update_values(values);
     constraint.multiple = match constraint.multiple {
         LoopMultiple::Off(_) => LoopMultiple::Off(Some(MetaDimKind::Unpadded)),
-        LoopMultiple::NoEpilogue(_) => LoopMultiple::NoEpilogue(NoEpilogueDimKind::Unpadded),
+        LoopMultiple::Unkinded | LoopMultiple::NoEpilogue(_) => {
+            LoopMultiple::NoEpilogue(NoEpilogueDimKind::Unpadded)
+        }
     };
 }
 
@@ -2253,6 +2255,7 @@ fn minted_transfer(name: NodeName, src: Operand, dst: Operand) -> TransferNode {
         dsts: Dsts::new(dst, Vec::new()),
         replication_factor: ReplicationFactor::ONE,
         unit_time_transfer_chunk_size: Vec::new(),
+        unit_time_transfer_num_chunks: NumChunks::ONE,
         padding: TransferPadding::default(),
         src_indirect: None,
         dst_indirect: None,
@@ -2670,7 +2673,9 @@ where
 mod tests_e105_e109 {
     use super::*;
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{DataInfo, Dsts, InstrAttribute, ReplicationFactor, TransferPadding};
+    use crate::schedule::dsc2::{
+        DataInfo, Dsts, InstrAttribute, NumChunks, ReplicationFactor, TransferPadding,
+    };
     use crate::units::NumFolds;
 
     /// A tree of computes, in traversal order.
@@ -2779,6 +2784,7 @@ mod tests_e105_e109 {
             ),
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         };
         // Same shape, but lds 1's scales hold no -2: the destination index is still recorded.
         let mut skipped = taken.clone();
@@ -2983,7 +2989,9 @@ mod tests_e105_e109 {
 mod tests_e242_e246 {
     use super::*;
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{DataInfo, Dsts, InstrAttribute, ReplicationFactor, TransferPadding};
+    use crate::schedule::dsc2::{
+        DataInfo, Dsts, InstrAttribute, NumChunks, ReplicationFactor, TransferPadding,
+    };
     use crate::units::NumFolds;
 
     fn operand(
@@ -3030,6 +3038,7 @@ mod tests_e242_e246 {
             dsts,
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         }
     }
 
@@ -3760,6 +3769,7 @@ mod tests_e300 {
             dsts: Dsts::new(dst, Vec::new()),
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,

@@ -208,6 +208,13 @@ pub trait Arch {
     /// `l0BurstSize` (`sysdef.cpp:217`), 64.
     const L0_BURST: u32;
 
+    /// `l0PtBwPerSlice` (`sysdef.cpp:246`) — the L0-to-PT bandwidth ONE SLICE gets per unit time,
+    /// `coreArch <= RCUDD1A_ISA ? 16 : 64`.
+    ///
+    /// ⛔ BYTES, NOT ELEMENTS: entry 307 divides it by the element width to get a replication factor,
+    /// so an element count here would already have folded in a format it has not read yet.
+    const L0_PT_BW_PER_SLICE: Bytes;
+
     /// `maxGroupID` (`sysdef.cpp:230`) — 63, because a GTR group id is SIX BITS.
     ///
     /// ⛔ IT IS THE LAST VALID ID, NOT THE COUNT: the L3 scheduler's default group name is
@@ -295,6 +302,7 @@ impl Arch for Dd2 {
     const L3_BURST: u32 = 32;
     const LX_BURST: u32 = 64;
     const L0_BURST: u32 = 64;
+    const L0_PT_BW_PER_SLICE: Bytes = Bytes(16);
     const MAX_GROUP_ID: u32 = 64 - 1;
     const MAX_NESTED_LOOPS: u32 = 16;
     const LCCR_REGISTERS: u32 = 16;
@@ -329,6 +337,7 @@ impl Arch for Sen1p5 {
     const L3_BURST: u32 = 32;
     const LX_BURST: u32 = 64;
     const L0_BURST: u32 = 64;
+    const L0_PT_BW_PER_SLICE: Bytes = Bytes(64);
     const MAX_GROUP_ID: u32 = 64 - 1;
     const MAX_NESTED_LOOPS: u32 = 16;
     const LCCR_REGISTERS: u32 = 16;

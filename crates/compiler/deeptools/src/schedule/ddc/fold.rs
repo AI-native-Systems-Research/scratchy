@@ -4654,7 +4654,8 @@ mod tests_e078_e085 {
     use crate::generated::{ComputeType, DataConnect};
     use crate::schedule::dsc2::{
         AllocLayout, AllocPlacement, AllocateNode, DataInfo, Dsts, FoldPosition, InstrAttribute,
-        LayoutDims, MaxDimSize, NodeName, ReplicationFactor, StartAddress, TransferPadding,
+        LayoutDims, MaxDimSize, NodeName, NumChunks, ReplicationFactor, StartAddress,
+        TransferPadding,
     };
     use crate::units::NumFolds;
 
@@ -4751,6 +4752,7 @@ mod tests_e078_e085 {
             ),
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         };
         assert_eq!(
             dbg_print_transfer(&node),
@@ -4861,6 +4863,7 @@ mod tests_e078_e085 {
             dsts: Dsts::new(operand(SenComponent::L0, None, None), vec![]),
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         };
         assert_eq!(
             component(Node::Allocate(&alloc), TransferSide::Src),
@@ -5636,8 +5639,8 @@ mod tests_e297_e299 {
     use crate::schedule::ddc::metadata::DatastageId;
     use crate::schedule::ddc::transformation_util::LoopDims;
     use crate::schedule::dsc2::{
-        DataInfo, Dsts, InstrAttribute, LayoutDims, NodeName, Operand, ReplicationFactor,
-        TransferPadding,
+        DataInfo, Dsts, InstrAttribute, LayoutDims, NodeName, NumChunks, Operand,
+        ReplicationFactor, TransferPadding,
     };
     use crate::units::NumFolds;
 
@@ -5865,6 +5868,7 @@ mod tests_e297_e299 {
 
     fn transfer_from_lds0() -> TransferNode {
         TransferNode {
+            unit_time_transfer_num_chunks: NumChunks::ONE,
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,

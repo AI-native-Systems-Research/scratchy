@@ -1032,16 +1032,29 @@ impl ReplicationFactor {
     pub const ONE: Self = Self(1);
 }
 
+/// HOW MANY UNIT-TIME CHUNKS ONE TRANSFER MOVES — `unitTimeTransferNumChunks_` (`dsc/dsc2.h:835`),
+/// whose default is ONE and not zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NumChunks(pub u32);
+
+impl NumChunks {
+    /// `unitTimeTransferNumChunks_ = 1` — one chunk per unit time.
+    pub const ONE: Self = Self(1);
+}
+
 /// HOW MUCH OF A LAYOUT DIM ONE LDS ACTUALLY HOLDS — `LabeledDsInfo::scale_`
 /// (`dsc/dscdefn.h:332`), one entry per layout dim, as the arms the ported code distinguishes.
 ///
 /// ⛔ THE REFERENCE FIELD IS A `double` AND IS NOT A COUNT: `dsc/dsc_standalone.cpp:377` pushes
 /// `1 / kij`. Nothing in this campaign reads its magnitude — entry 259 tests `== 1`
-/// (`ddc/ddcv1.cpp:1899`) and entry 260 tests `> 0` (`:2452`, `:2629`) — so these three arms are the
-/// whole surface, and a fractional scale cannot silently truncate into [`Self::Broadcast`].
+/// (`ddc/ddcv1.cpp:1899`), entry 260 tests `> 0` (`:2452`, `:2629`) and entry 307 tests `== -2`
+/// (`:1256`, `:1727`) — so a fractional scale cannot silently truncate into an arm below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LdsScale {
-    /// `scale_[i] <= 0` — this lds broadcasts the dim, so it spans nothing of it.
+    /// `scale_[i] == -2` — the dim is broadcast ALONG THE STICK, which entry 307 replicates over
+    /// rather than skips.
+    StickBroadcast,
+    /// `scale_[i] <= 0` otherwise — this lds broadcasts the dim, so it spans nothing of it.
     Broadcast,
     /// `0 < scale_[i] != 1` — the dim is present at a scale that is not one.
     Scaled,
@@ -1051,9 +1064,12 @@ pub enum LdsScale {
 
 impl LdsScale {
     /// `scale_[i] > 0` INVERTED — the reference's own test, spelled as the question it answers.
+    ///
+    /// ⛔ `-2` IS ALSO NOT `> 0`, so the stick-broadcast arm answers TRUE here: it is a spelling of
+    /// which broadcast it is, never a fourth non-broadcast state.
     #[must_use]
     pub const fn is_broadcast(self) -> bool {
-        matches!(self, Self::Broadcast)
+        matches!(self, Self::Broadcast | Self::StickBroadcast)
     }
 }
 
@@ -1070,6 +1086,8 @@ pub struct TransferNode {
     pub replication_factor: ReplicationFactor,
     /// `unitTimeTransferChunkSize_` (`:836`) — the continuous elements within a stick boundary.
     pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
+    /// `unitTimeTransferNumChunks_` (`:835`) — how many of those chunks one unit time moves.
+    pub unit_time_transfer_num_chunks: NumChunks,
     /// `paddingInfo_` (`:836`) — EMPTY on a fresh node; entry 221 is what fills it.
     pub padding: TransferPadding,
     /// `srcIndirect_` FUSED WITH `srcIndirectLdsAndLoopOffsets_.myLdsIdx_` — the index tensor this
@@ -1082,6 +1100,76 @@ pub struct TransferNode {
     /// empty and holds exactly one entry after.
     pub dst_indirect: Option<Via>,
 }
+
+/// WHAT A TRANSFER MOVES BETWEEN — `dsc2::TransferNode::getTransferType()` (`dsc/dsc2.h:882-900`),
+/// decided entirely by whether each end names a labeled ds (`myLdsIdx_ >= 0`) or a constant
+/// (`constantId_ >= 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TransferKind {
+    /// `CONSTANT_TO_CONSTANT`.
+    ConstantToConstant,
+    /// `CONSTANT_TO_TENSOR`.
+    ConstantToTensor,
+    /// `TENSOR_TO_TENSOR`.
+    TensorToTensor,
+    /// `NO_TRANSFER_TO_TENSOR` — the destination is a tensor and the source is neither.
+    NoTransferToTensor,
+    /// `NO_TRANSFER_FROM_TENSOR` — the source is a tensor and the destination is neither.
+    NoTransferFromTensor,
+    /// `INVALID_TRANSFER_TYPE` — neither end names a tensor.
+    Invalid,
+}
+
+impl DataInfo {
+    /// `isLabeledDs()` (`dsc/dsc2.h:737`) — `myLdsIdx_ >= 0`.
+    ///
+    /// ⛔ THE REFERENCE'S `DT_CHECK_MSG(!(labeledDs && constant), "Cannot be both labeledDs and
+    /// constant.")` IS UNSPELLABLE HERE and needs no runtime guard: `my_lds_idx` and `constant_id`
+    /// are separate [`Option`]s, so a node carrying both answers `true` here exactly as the
+    /// reference's field test would — the reference stops, we do not, and no caller distinguishes.
+    #[must_use]
+    pub const fn is_labeled_ds(&self) -> bool {
+        self.my_lds_idx.is_some()
+    }
+
+    /// `isConstant()` (`dsc/dsc2.h:742`) — `constantId_ >= 0`.
+    #[must_use]
+    pub const fn is_constant(&self) -> bool {
+        self.constant_id.is_some()
+    }
+}
+
+impl TransferNode {
+    /// `getTransferType()` (`dsc/dsc2.h:882`).
+    ///
+    /// ⛔ THE DESTINATION IS `dstLdsAndLoopOffsets_.front()` AND [`Dsts`] IS NON-EMPTY, so the
+    /// reference's `!dstLdsAndLoopOffsets_.empty() &&` guard is discharged by the type.
+    #[must_use]
+    pub const fn transfer_kind(&self) -> TransferKind {
+        let src = &self.src.data;
+        let dst = &self.dsts.first().data;
+        match (
+            src.is_labeled_ds(),
+            src.is_constant(),
+            dst.is_labeled_ds(),
+            dst.is_constant(),
+        ) {
+            (_, true, _, true) => TransferKind::ConstantToConstant,
+            (_, true, true, _) => TransferKind::ConstantToTensor,
+            (true, _, true, _) => TransferKind::TensorToTensor,
+            (false, false, true, _) => TransferKind::NoTransferToTensor,
+            (true, _, false, false) => TransferKind::NoTransferFromTensor,
+            _ => TransferKind::Invalid,
+        }
+    }
+}
+
+/// AN ELEMENT WIDTH IN BYTES — `labeledDs_::wordLength_` (`dsc/dsc2.h:296`).
+///
+/// ⛔ A WIDTH AND NOT A COUNT: entry 308 writes `2` for a BFLOAT16 internal kernel, and an element
+/// count of two would be a different tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WordLength(pub u32);
 
 /// `dsc2::BlockNode` (`dsc/dsc2.h:526`) narrowed to the `name_` a block is looked up by and the
 /// `next_` children a traversal descends into.

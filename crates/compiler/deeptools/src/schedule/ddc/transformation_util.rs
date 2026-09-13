@@ -2633,7 +2633,8 @@ mod tests_e110_e117 {
     use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::{ConstIdx, DataStream};
     use crate::schedule::dsc2::{
-        DataInfo, Dsts, InstrAttribute, LayoutDims, Operand, ReplicationFactor, TransferPadding,
+        DataInfo, Dsts, InstrAttribute, LayoutDims, NumChunks, Operand, ReplicationFactor,
+        TransferPadding,
     };
     use crate::units::{DfirUnit, NumFolds};
 
@@ -3069,6 +3070,7 @@ mod tests_e110_e117 {
             dsts: Dsts::new(operand(Some(DataConnect::ArfPtsum)), vec![operand(None)]),
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         };
         assert_eq!(
             get_node_description(UtilNode::Transfer(&transfer)),
@@ -3479,7 +3481,7 @@ mod tests_e247_e254 {
     use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::DataStream;
     use crate::schedule::dsc2::{
-        Dsts, InstrAttribute, LayoutDims, ReplicationFactor, TransferPadding,
+        Dsts, InstrAttribute, LayoutDims, NumChunks, ReplicationFactor, TransferPadding,
     };
     use crate::schedule::l3::dsc::{Granularity, MaxSize};
     use crate::units::{DfirUnit, NumFolds};
@@ -4018,6 +4020,7 @@ mod tests_e247_e254 {
             dsts,
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         }
     }
 

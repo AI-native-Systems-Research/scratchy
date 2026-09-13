@@ -150,28 +150,35 @@
 use core::num::{NonZeroI64, NonZeroU64};
 use std::collections::{BTreeMap, BTreeSet};
 
-use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
+use sys_arch_spec::arch_enums::{DataLocation, OpFunc, SenComponent};
 
 use crate::arch::{Arch, Bytes, Elements, FoldedUnit, IsaGen, Sticks};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
-    Extent, PrimaryDim, Sample, SliceElems, Stage, StickDims, StickPart, VectorComp,
-    cumulative_stick_sizes, stick_sizes,
+    AbsoluteMin, Constraint, ConstraintKind, DimConstraint, DimSet, Extent, PrimaryDim, Sample,
+    SliceElems, Stage, StickDims, StickPart, VectorComp, check_constraints, cumulative_stick_sizes,
+    stick_sizes,
 };
 use crate::formats::DataFormat;
-use crate::generated::{ComputeType, RegName};
+use crate::generated::{ComputeType, RegName, Strategy};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{
-    AllocId, BlockId, ConstIdx, NodeId, NodeKind, PadType, comp_row_id,
+    AllocId, BlockId, ConstIdx, NodeId, NodeKind, PadType, ScaleBlock, ScaledLds, comp_row_id,
 };
-use crate::schedule::ddc::metadata::{DatastageId, DdcMemory, DestIdx, MetaDimKind, Metadata};
+use crate::schedule::ddc::metadata::{
+    DataConnectSlot, Datastage, DatastageId, DdcMemory, DestIdx, ExternalStorage, LoopMultiple,
+    MetaDimKind, Metadata, StoredConstraint, TransferEnd,
+};
 use crate::schedule::ddc::transformation::LoopId;
+use crate::schedule::ddc::transformation_util::{NewLabeledDs, add_new_lds};
 use crate::schedule::dsc2::{
-    AddressFold, AllocateNode, BlockNode, CondOp, ComputeNode, ConditionNode, Coordinate, Dsc,
-    FoldCoeff, FoldDim, FoldPosition, LdsIdx, LdsScale, LoopBound, LoopCond, LoopCondComposite,
-    MaxDimSize, NodeName, NumBuffers, Operand, Padding, Precision, RegSlot, ReplicationFactor,
-    SchedNode, Size, SizeAndIndex, StartAddress, StickDimIdx, StickMaskNode, SyncNode,
-    TransferNode, Unroll, generic_comp,
+    AddressFold, AllocateNode, BlockNode, CondOp, ComputeNode, ConditionNode, Coordinate,
+    DataInfo, Dsc, Dsts, FoldCoeff, FoldDim, FoldPosition, LdsIdx, LdsScale, LoopBound, LoopCond,
+    LoopCondComposite, MaxDimSize, NodeName, NumBuffers, NumChunks, Operand, Padding, Precision,
+    RegSlot, ReplicationFactor, SchedNode, Size, SizeAndIndex, StartAddress, StickDimIdx,
+    StickMaskNode, SyncNode, TransferKind, TransferNode, TransferPadding, Unroll, Via, WordLength,
+    generic_comp,
 };
+use crate::schedule::l3::dsc::{DimPadding, SymbolicDimInfo, UnneededPad};
 use crate::units::{Core, Corelet, Row};
 
 /// AN ALLOCATION ARENA — the `dsc2::AllocateNode*`s the metadata's maps name.
@@ -1065,6 +1072,8 @@ pub struct GlobalData {
     /// ⛔ ITS PRESENCE IS WHY THIS TYPE IS NOT `Copy`: a set is not a scalar, and entry 260 holds a
     /// shared borrow of it while writing offsets.
     pub loops_below_chunk_boundary: BTreeSet<LoopId>,
+    /// `dataStageExplorationDone_` (`ddc/ddc.h:108`) — entry 307 sets it on entry and never clears it.
+    pub data_stage_exploration_done: bool,
 }
 
 /// `is_any_of(unit, skip_units)` with entry 133's `skip_units = {NO_COMPONENT, CONSTANT}`.
@@ -3536,34 +3545,2428 @@ pub fn identify_below_chunk_boundary_loops<T: ScheduleWalk + ?Sized>(
     global.loops_below_chunk_boundary = tree.loops_under(block).into_iter().collect();
     Some(())
 }
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE DATASTAGE-EXPLORATION VOCABULARY — as entries 307-309 read and write it.
+//
+// ⭐ AGAIN THE TRAITS ARE THE MECHANISM FOR REACHING OPERANDS: `DataStructDims`
+// (`dsc/dims.h`), `finalizeExternalDataStage`, `getStickSizes` and the schedule tree's own
+// `traverseTreeDFSMutable` all live outside this campaign's file list. What these three units OWN is
+// the datastage SIZES they choose, the constraints they record, and the nodes they mint.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 
-// crustify:todo: e307_exploreAssignDataStages
-//   authority : ddc/ddcv1.cpp:555  (1126 body lines, level 2)
-//   class     : Ddc
-//   original  : void Ddc::exploreAssignDataStages()
-//   extract   : crustify-ddc/cpp/ddc.cpp:10042-11168
-//   calls     : e096_updateMin, e097_updateMax, e098_updateValues, e104_clear, e258_allocAllMem
-//   ⛔ NOTE   : REUSE, DO NOT RE-IMPLEMENT: this body CONTAINS the `checkConstraints` lambda at
-//               ddc/ddcv1.cpp:792 and its inner `checkConstraintsImpl` at :825, both ALREADY PORTED on
-//               bridge1-campaign as `e001_checkConstraints` in
-//               crates/compiler/deeptools/src/bridges/superdsc_to_dataflow_ir/shape_constraints.rs:439
-//               (the impl at that file's :518). CALL THOSE. A second copy of the constraint check is the
-//               diverging-implementation failure this campaign's exclusion list exists to prevent.
+/// WHICH HALF OF A DATASTAGE PARAMETER — `DataStageParam::ss_` and `::el_` (`dsc/dims.h:236-238`), the
+/// steady state and its epilogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StageHalf {
+    /// `ss_`.
+    Ss,
+    /// `el_`.
+    El,
+}
 
-// crustify:todo: e308_prepDsc
-//   authority : ddc/ddcv1.cpp:2019  (252 body lines, level 2)
-//   class     : Ddc
-//   original  : void Ddc::prepDsc()
-//   extract   : crustify-ddc/cpp/ddc.cpp:11178-11430
-//   calls     : e104_clear, e130_getPeSfpSplitDim, e257_addNewLds
+/// ONE `DataStructDims` THE EXPLORATION READS OR WRITES — a datastage and which half of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StageSite {
+    /// The `dataStageParam_` key.
+    pub stage: DatastageId,
+    /// Which of its two `DataStructDims`.
+    pub half: StageHalf,
+}
 
-// crustify:todo: e309_attachToPrefilledSchedule
-//   authority : ddc/ddcv1.cpp:2280  (71 body lines, level 2)
-//   class     : Ddc
-//   original  : void Ddc::attachToPrefilledSchedule()
-//   extract   : crustify-ddc/cpp/ddc.cpp:11440-11511
-//   calls     : e259_calculateClStartAddress
+impl StageSite {
+    /// `dataStageParam_.at(stage).ss_`.
+    #[must_use]
+    pub const fn ss(stage: DatastageId) -> Self {
+        Self {
+            stage,
+            half: StageHalf::Ss,
+        }
+    }
 
+    /// `dataStageParam_.at(stage).el_`.
+    #[must_use]
+    pub const fn el(stage: DatastageId) -> Self {
+        Self {
+            stage,
+            half: StageHalf::El,
+        }
+    }
+}
+
+/// WHAT A DATASTAGE PARAMETER IS CALLED — `DataStageParam::name()`, which entry 309 compares against
+/// the two names DDC requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StageLabel {
+    /// `"core"`.
+    Core,
+    /// `"chunk"`.
+    Chunk,
+    /// Any other name, which neither of entry 309's two tests accepts.
+    Other,
+}
+
+/// A LOOP'S TWO DATASTAGE INDICES — `LoopNode::numId_` and `denId_` (`dsc/dsc2.h:571-572`).
+///
+/// ⛔ NOT [`crate::schedule::ddc::transformation::LoopStages`], WHOSE PAIR IS NON-OPTIONAL: entry 307
+/// reads `denId_ >= 0` as a question (`ddc/ddcv1.cpp:657`) and keys `constraints_` at `-1`, so the
+/// sentinel is load-bearing here in a way its three other readers never needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopStaging {
+    /// `numId_` — the datastage the loop's trip count divides INTO.
+    pub num: Option<DatastageId>,
+    /// `denId_` — the one it divides BY.
+    pub den: Option<DatastageId>,
+}
+
+/// WHERE ONE DIM'S EXTENT IS SAMPLED — `primaryDimToVal_st`'s `peOrSfp`, `ptrowId` and `clId`
+/// (`dsc/dims.h:250-255`), each of whose `-1` is the WHOLE of that axis rather than its first slot.
+///
+/// ⛔ NOT [`Sample`], WHOSE CORELET IS NON-OPTIONAL: entry 307 reads `clId = -1` at `:1613` and
+/// `:1723`, which [`Sample`] cannot spell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DimSample {
+    /// `peOrSfp` — [`None`] is `NO_COMPONENT`.
+    pub comp: Option<VectorComp>,
+    /// `ptrowId` — [`None`] is `-1`, the sum over every row.
+    pub row: Option<Row>,
+    /// `clId` — [`None`] is `-1`, the sum over every corelet.
+    pub corelet: Option<Corelet>,
+}
+
+impl DimSample {
+    /// `primaryDimToVal_st(dim)`, whose five defaults are all the whole of their axis
+    /// (`dsc/dims.cpp:647`).
+    pub const WHOLE: Self = Self {
+        comp: None,
+        row: None,
+        corelet: None,
+    };
+
+    /// The same at one corelet.
+    #[must_use]
+    pub const fn at_corelet(corelet: Corelet) -> Self {
+        Self {
+            comp: None,
+            row: None,
+            corelet: Some(corelet),
+        }
+    }
+}
+
+/// WHICH NUMBER A SYMBOLIC DIM ANSWERS WITH — `primaryDimToVal_st`'s `getSymbolicGranularity`
+/// (`dsc/dims.h:255`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolicRead {
+    /// `false` — the symbol's `maxSize_`, which is the extent the size search bounds itself by.
+    Max,
+    /// `true` — its `granularity_`, the step that search may move in.
+    Granularity,
+}
+
+/// ONE CORELET'S PE AND SFP SHARES OF A DIM — `peSfpSplit_.at(dim).at(cl)` (`dsc/dims.h:208`).
+///
+/// ⛔ NOT A MAP KEYED BY [`VectorComp`], WHICH IS NOT `Ord`: both keys are written by every one of
+/// entry 307's three writers (`ddc/ddcv1.cpp:1108`, `:1401`, `:1553`), so a pair is the shape the
+/// reference's map is always in and a missing half is not a state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeSfpShares {
+    /// `.at(PE)`.
+    pub pe: Extent,
+    /// `.at(SFP)`.
+    pub sfp: Extent,
+}
+
+impl PeSfpShares {
+    /// Both halves the same, which is what a freshly split dim gets.
+    #[must_use]
+    pub const fn both(extent: Extent) -> Self {
+        Self {
+            pe: extent,
+            sfp: extent,
+        }
+    }
+
+    /// `.at(comp)`.
+    #[must_use]
+    pub const fn get(self, comp: VectorComp) -> Extent {
+        match comp {
+            VectorComp::Pe => self.pe,
+            VectorComp::Sfp => self.sfp,
+        }
+    }
+
+    /// `.at(comp) = extent`.
+    pub const fn set(&mut self, comp: VectorComp, extent: Extent) {
+        match comp {
+            VectorComp::Pe => self.pe = extent,
+            VectorComp::Sfp => self.sfp = extent,
+        }
+    }
+}
+
+/// `usePt` (`ddc/ddcv1.cpp:2026`) — whether the DSC's first compute runs on the PT, which is what
+/// makes a row split meaningful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsePt {
+    /// Neither a PT execution unit nor `ReStickifyOpHBM`.
+    No,
+    /// One of the two.
+    Yes,
+}
+
+/// HOW MANY TIMES ONE STICK DIM REPEATS — `PrimaryDsInfo::stickRepl_` (`dsc/dscdefn.h:475`). Every
+/// entry entry 308 pushes is ONE, and that is the fact rather than a coincidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StickRepl(pub u32);
+
+impl StickRepl {
+    /// `stickRepl_.push_back(1)`.
+    pub const ONE: Self = Self(1);
+}
+
+/// ONE `computeOp_` ENTRY AS ENTRIES 307 AND 308 READ IT — the four fields beyond
+/// [`ComputeOp`]'s two that the reduction sweep and the size sweep need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DscComputeOp {
+    /// `opFuncName`, whose `INVALID` is [`None`].
+    pub op_func: Option<OpFunc>,
+    /// `exUnit`.
+    pub ex_unit: SenComponent,
+    /// `attributes_.dataFormat_`, whose `INVALID` is [`None`].
+    pub format: Option<DataFormat>,
+    /// `inputLabeledDs`, as the indices those pointers carry.
+    pub inputs: Vec<LdsIdx>,
+    /// `outputLabeledDs`.
+    pub outputs: Vec<LdsIdx>,
+}
+
+/// WHICH INTERNAL TENSOR ENTRY 308 MINTS — the two suffixes it appends, as the closed set they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalLds {
+    /// `_internalInput`, for `ReStickifyOpLx` and `ReStickifyOpHBM` (`ddc/ddcv1.cpp:2100-2158`).
+    Input,
+    /// `_internalKernel`, for `BATCHMATMUL_MXFP4W_FWD` (`:2160-2211`).
+    Kernel,
+}
+
+impl InternalLds {
+    /// The suffix itself, which names both the labelled DS and the allocation cloned beside it.
+    #[must_use]
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Input => "_internalInput",
+            Self::Kernel => "_internalKernel",
+        }
+    }
+}
+
+/// WHOSE PARENT A MINTED TRANSFER IS SPLICED UNDER — `getMutableParent()` on the node entry 308 names.
+///
+/// ⛔⛔ THE TWO MINTING BLOCKS DISAGREE AND BOTH ARE PRESERVED: `_internalInput` inserts under the
+/// SIBLING TRANSFER's parent (`ddc/ddcv1.cpp:2155-2157`) while `_internalKernel` inserts under the
+/// ALLOCATION's (`:2210-2211`), with the same sibling either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertUnder {
+    /// `transferInput0->getMutableParent()`.
+    ParentOfTransfer(NodeId),
+    /// `allocInput0->getMutableParent()`.
+    ParentOfAlloc(AllocId),
+}
+
+/// ONE NODE OF THE WHOLE-TREE WALK — [`NodeKind`] has no ALLOCATE arm because every other unit reaches
+/// allocations through [`AllocId`], and entry 309's walk is the one place both spellings meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeNode {
+    /// `nodeType_ == ALLOCATE`, as the allocation the arena holds.
+    Allocate(AllocId),
+    /// Every other node type.
+    Other(NodeKind),
+}
+
+/// `dsc2::directAddressableMemories.count(component)` (`dsc/dscdefn.cpp:147-150`) — the memories whose
+/// locations the instruction names outright (`"R1"`) rather than through an address register.
+#[must_use]
+pub const fn is_direct_addressable_memory(component: SenComponent) -> bool {
+    matches!(
+        component,
+        SenComponent::Lrfreg
+            | SenComponent::Pelrf
+            | SenComponent::Sfplrf
+            | SenComponent::Ptarf
+            | SenComponent::Ptxrf
+            | SenComponent::Pestate
+            | SenComponent::Sfpstate
+    )
+}
+
+/// THE `DataStructDims` PAIR OF EVERY DATASTAGE — `dsc/dims.h:162-238`, outside this campaign's file
+/// list, plus the three `dims.cpp` methods entry 307 calls on it.
+pub trait ExploreStages {
+    /// One half of one datastage as [`check_constraints`] measures it — an OWNED snapshot, because the
+    /// check borrows several stages at once while the search writes to others.
+    type Dims: Stage;
+
+    /// `dataStageParam_`'s keys, in `std::map` order.
+    fn stages(&self) -> Vec<DatastageId>;
+    /// `dataStageParam_.at(stage).name()`, and [`None`] where `count(stage) == 0`.
+    fn label(&self, stage: DatastageId) -> Option<StageLabel>;
+    /// `isExternalDs(stage)` — the stage whose sizes are the whole tensor's rather than a tile's.
+    fn is_external(&self, stage: DatastageId) -> bool;
+    /// The snapshot, and [`None`] for a datastage this DSC does not hold.
+    fn dims(&self, at: StageSite) -> Option<Self::Dims>;
+    /// `primaryDimToVal_st(dim, comp, row, cl, padded, density, symbolic)`.
+    fn extent(
+        &self,
+        at: StageSite,
+        dim: PrimaryDim,
+        sample: DimSample,
+        padding: PadType,
+        symbolic: SymbolicRead,
+    ) -> Extent;
+    /// `primaryDimToValHandler_st(dim)` READ — the raw per-dim slot, before any split is folded in.
+    fn dim_value(&self, at: StageSite, dim: PrimaryDim) -> Extent;
+    /// `primaryDimToValHandler_st(dim) = value`.
+    fn set_dim_value(&mut self, at: StageSite, dim: PrimaryDim, value: Extent);
+    /// `coreletSplit_.at(dim)` — each corelet's share, and [`None`] where the map has no such key.
+    fn corelet_shares(&self, at: StageSite, dim: PrimaryDim) -> Option<Vec<Extent>>;
+    /// `coreletSplit_[dim] = shares`.
+    fn set_corelet_shares(&mut self, at: StageSite, dim: PrimaryDim, shares: Vec<Extent>);
+    /// `rowSplit_.at(dim)` — per corelet, each PT row's share.
+    fn row_shares(&self, at: StageSite, dim: PrimaryDim) -> Option<BTreeMap<Corelet, Vec<Extent>>>;
+    /// `rowSplit_[dim] = shares`.
+    fn set_row_shares(
+        &mut self,
+        at: StageSite,
+        dim: PrimaryDim,
+        shares: BTreeMap<Corelet, Vec<Extent>>,
+    );
+    /// `peSfpSplit_.at(dim)` — per corelet, the PE's and the SFP's shares.
+    fn pe_sfp_shares(
+        &self,
+        at: StageSite,
+        dim: PrimaryDim,
+    ) -> Option<BTreeMap<Corelet, PeSfpShares>>;
+    /// `peSfpSplit_[dim] = shares`.
+    fn set_pe_sfp_shares(
+        &mut self,
+        at: StageSite,
+        dim: PrimaryDim,
+        shares: BTreeMap<Corelet, PeSfpShares>,
+    );
+    /// `paddingSizes_` — every padded dim with its sizes, in `std::map` order.
+    fn padding_dims(&self, at: StageSite) -> Vec<(PrimaryDim, DimPadding)>;
+    /// `paddingSizes_[dim] = padding` — ⛔ THE REFERENCE'S `emplace` IS FOLLOWED BY A MUTATION OF
+    /// WHICHEVER ENTRY IT ANSWERED WITH (`ddc/ddcv1.cpp:1173-1177`), so the emplace lives in the
+    /// caller and what reaches here is always the final value.
+    fn set_padding(&mut self, at: StageSite, dim: PrimaryDim, padding: DimPadding);
+    /// `symbolicDimInfo_` — every symbolic dim, in `std::map` order.
+    fn symbolic_dims(&self, at: StageSite) -> Vec<PrimaryDim>;
+    /// `symbolicDimInfo_.at(dim)`.
+    fn symbolic_info(&self, at: StageSite, dim: PrimaryDim) -> Option<SymbolicDimInfo>;
+    /// `symbolicDimInfo_.insert_or_assign(dim, info)`.
+    fn set_symbolic_info(&mut self, at: StageSite, dim: PrimaryDim, info: SymbolicDimInfo);
+    /// `makeDimSymbolic(refDs, dim)` (`dsc/dims.cpp:764`) — takes the symbol from `from`.
+    fn make_dim_symbolic(&mut self, at: StageSite, from: StageSite, dim: PrimaryDim);
+    /// `makeDimNotSymbolic(dim)` (`:781`).
+    fn make_dim_not_symbolic(&mut self, at: StageSite, dim: PrimaryDim);
+    /// `pruneMaxSymbolicVolumes(refDstg)` (`:728`).
+    fn prune_max_symbolic_volumes(&mut self, at: StageSite, from: StageSite);
+    /// `compound()` — recomputes the derived extents from the per-dim slots.
+    fn compound(&mut self, at: StageSite);
+    /// `denDs.el_ = denDs.ss_` (`ddc/ddcv1.cpp:1500`), the whole half copied over.
+    fn copy_ss_to_el(&mut self, stage: DatastageId);
+    /// `el_.name_ += "el"` (`:1501`).
+    fn mark_epilogue_name(&mut self, stage: DatastageId);
+    /// `ds.r_ = ds.c_ = … = -1` — entry 308's `clearDeprecatedFields`.
+    ///
+    /// ⚠️ A NO-OP IN THIS MODEL, AND STATED ANYWAY: those nine fields are all outside the closed
+    /// twelve [`PrimaryDim`], so nothing reachable from here can observe them.
+    fn clear_deprecated_dims(&mut self, at: StageSite);
+    /// `finalizeExternalDataStage(dsc, stage, clSplitDims, numPTRows, usePt, rowSplitDim,
+    /// peSfpSplitDims)` (`ddc/ddcv1.cpp:1748`) — outside this batch, so it is reached rather than
+    /// reimplemented.
+    fn finalize_external_stage(
+        &mut self,
+        stage: DatastageId,
+        cl_split: &BTreeSet<PrimaryDim>,
+        use_pt: UsePt,
+        row_split: Option<PrimaryDim>,
+        pe_sfp_split: &BTreeSet<PrimaryDim>,
+    ) -> Option<()>;
+}
+
+/// THE WHOLE SCHEDULE TREE AS ENTRIES 307-309 WALK IT — `traverseTreeDFSMutable()` with no filter,
+/// plus the loop and allocation facts the two sweeps read off each node.
+pub trait ExploreTree: ScheduleWalk {
+    /// `traverseTreeDFSMutable()` — EVERY node, in DFS order.
+    fn all_nodes(&self) -> Vec<NodeId>;
+    /// `nodeType_` as the arm it is.
+    fn tree_node(&self, node: NodeId) -> Option<TreeNode>;
+    /// `nodeType_ == BLOCK` as the block it then is.
+    fn as_block(&self, node: NodeId) -> Option<BlockId>;
+    /// `node->name_`.
+    fn node_name(&self, node: NodeId) -> Option<NodeName>;
+    /// `numId_` and `denId_`, and [`None`] for a node that is not a LOOP.
+    fn loop_staging(&self, at: LoopId) -> Option<LoopStaging>;
+    /// `isParametricLoop()` — a loop whose trip count is not a datastage ratio.
+    fn is_parametric_loop(&self, at: LoopId) -> bool;
+    /// `dims_ = dims` — entry 307's `std::stable_sort` writes the whole list back.
+    fn set_loop_dims(&mut self, at: LoopId, dims: Vec<(PrimaryDim, MetaDimKind)>);
+    /// The same the other way, because `externalNodes_` is keyed by node and not by allocation.
+    fn alloc_node(&self, alloc: AllocId) -> Option<NodeId>;
+    /// `allocNode->padding_.getPadding(dim)` (`dsc/dims.cpp:806`) — ⚠️ A DIFFERENT FIELD FROM
+    /// `paddingSizes_`, and `NOPAD` for a dim it does not name.
+    fn alloc_padding(&self, alloc: AllocId, dim: PrimaryDim) -> PadType;
+    /// `traverseTreeDFSMutable(from, {TRANSFER, COMPUTE}, ALL, -1, -1)` — ⛔ ONE DFS OVER BOTH KINDS
+    /// AND NOT TWO: `updateSizePerDim`'s multiple check is order-dependent (sizes 4, 6, 12 refuse as
+    /// `(4, 6, …)` and pass as `(4, 12, 6)`), so the interleaving is load-bearing.
+    fn transfers_and_computes_under(&self, from: NodeId) -> Vec<NodeId>;
+    /// `computeNode->isOpaqueOp_` — ⚠️ NOT `metadata.opaqueOps_.count(node)`: the reference reads the
+    /// flag and then `opaqueOps_.at(node)`, so a flagged compute with no entry is a throw and not a
+    /// second answer.
+    fn is_opaque_compute(&self, node: NodeId) -> bool;
+    /// `getBlockTransferSizePerDim(transfer, unit, 0, false, false, true)` — the WHOLE map, because
+    /// entry 307 reads it with `.at(dim)` where entry 260 reads it with `operator[]`.
+    fn block_transfer_sizes(
+        &self,
+        node: NodeId,
+        unit: SenComponent,
+    ) -> BTreeMap<PrimaryDim, Extent>;
+    /// `computeOp_`'s entry for a COMPUTE node.
+    fn compute_op(&self, node: NodeId) -> Option<DscComputeOp>;
+    /// The transfer written back after entry 307 has shrunk its unit-time chunks.
+    fn set_transfer(&mut self, node: NodeId, transfer: TransferNode) -> Option<()>;
+}
+
+/// THE LABELLED-DS FACTS ENTRY 307 READS THAT NO EXISTING TRAIT CARRIES.
+pub trait ExploreDsc {
+    /// `lds < labeledDs_.size()` — whether this DSC holds that index at all.
+    fn holds_lds(&self, lds: LdsIdx) -> bool;
+    /// `labeledDs_.at(lds).scaledLdsCategory_`.
+    fn scaled_category(&self, lds: LdsIdx) -> ScaledLds;
+    /// `labeledDs_.at(lds).mxInfo_`'s dim and block size, and [`None`] where it names none.
+    fn mx_info(&self, lds: LdsIdx) -> Option<(PrimaryDim, ScaleBlock)>;
+}
+
+/// WHAT ENTRY 308 REWRITES ON THE DSC — the compute-op list, the labelled DS records, and the two
+/// splice points its minted nodes take.
+pub trait PrepDsc: NewLabeledDs {
+    /// `numCoreletsUsed_DSC2_ = corelets`.
+    fn set_corelets_used_dsc2(&mut self, corelets: u32);
+    /// `computeOp_`, in order.
+    fn compute_ops(&self) -> Vec<DscComputeOp>;
+    /// `computeOp_.emplace(begin() + at)` filled with `op`, and [`None`] past the end.
+    fn insert_compute_op(&mut self, at: usize, op: DscComputeOp) -> Option<()>;
+    /// `computeOp_.at(at).opFuncName = op_func`.
+    fn set_op_func(&mut self, at: usize, op_func: OpFunc);
+    /// `computeOp_.at(at).inputLabeledDs.push_back(&labeledDs_.at(lds))`.
+    fn push_op_input(&mut self, at: usize, lds: LdsIdx);
+    /// SOME `constantInfo_` entry is named `useZeroMean` and its single datum is `1`
+    /// (`ddc/ddcv1.cpp:2066-2072`).
+    fn declares_zero_mean_constant(&self) -> bool;
+    /// `computeOp_.at(at).opConsts.at("useZeroMean")[0] == 1` (`:2074-2078`).
+    fn op_declares_zero_mean(&self, at: usize) -> bool;
+    /// `labeledDs_.at(lds)` — the entry [`add_new_lds`] clones.
+    fn lds_entry(&self, lds: LdsIdx) -> Option<Self::Entry>;
+    /// `dsName_ += suffix`.
+    fn append_lds_name(&mut self, lds: LdsIdx, suffix: InternalLds);
+    /// `dsType_ = DsTypes::INTERNAL`.
+    fn set_lds_internal(&mut self, lds: LdsIdx);
+    /// `wordLength = length`.
+    fn set_lds_word_length(&mut self, lds: LdsIdx, length: WordLength);
+    /// `dataFormat_ = format`.
+    fn set_lds_format(&mut self, lds: LdsIdx, format: DataFormat);
+    /// `scaledLdsCategory_ = category`.
+    fn set_lds_scaled_category(&mut self, lds: LdsIdx, category: ScaledLds);
+    /// `mxInfo_ = labeledDs_.at(from).mxInfo_`.
+    fn copy_mx_info(&mut self, to: LdsIdx, from: LdsIdx);
+    /// `primaryDsInfo_.at(lds's dsType_).stickDimOrder_`.
+    fn stick_order(&self, lds: LdsIdx) -> Vec<PrimaryDim>;
+    /// `primaryDsInfo_.at(lds's dsType_).stickSize_`.
+    fn stick_sizes_of(&self, lds: LdsIdx) -> Vec<Elements>;
+    /// `primaryDsInfo_[INTERNAL].layoutDimOrder_ = primaryDsInfo_.at(from's dsType_).layoutDimOrder_`.
+    fn set_internal_layout_from(&mut self, from: LdsIdx);
+    /// `primaryDsInfo_[INTERNAL].stickDimOrder_.push_back(dim)` with `stickRepl_.push_back(repl)`.
+    fn push_internal_stick_dim(&mut self, dim: PrimaryDim, repl: StickRepl);
+    /// `primaryDsInfo_[INTERNAL].stickSize_.push_back(size)`.
+    fn push_internal_stick_size(&mut self, size: Elements);
+    /// `labeledDs_.at(to).memOrg_[LX] = labeledDs_.at(from).memOrg_.at(LX)`, answering with the
+    /// `allocateNode_` it copied — ⛔ [`None`] is the `.at(LX)` throw.
+    fn copy_lx_mem_org(&mut self, to: LdsIdx, from: LdsIdx) -> Option<AllocId>;
+    /// `memOrg_.at(LX).allocateNode_ = alloc`.
+    fn set_lx_alloc(&mut self, lds: LdsIdx, alloc: AllocId);
+    /// `memOrg_.at(LX).isPresent = present`.
+    fn set_lx_present(&mut self, lds: LdsIdx, present: bool);
+    /// `sibling->getMutableParent()->addChildNode(node, true, sibling)` — the clone takes `sibling`'s
+    /// place among its parent's children, with `sibling` following it.
+    fn insert_alloc_before(&mut self, sibling: AllocId, node: AllocateNode) -> Option<AllocId>;
+    /// `under->getMutableParent()->addChildNode(node, false, sibling)` — the minted transfer follows
+    /// `sibling`, under whichever parent [`InsertUnder`] names.
+    fn insert_transfer_after(
+        &mut self,
+        under: InsertUnder,
+        sibling: NodeId,
+        node: TransferNode,
+    ) -> Option<NodeId>;
+}
+
+/// WHETHER EVERY STORED CONSTRAINT MENTIONING ONE DIM HOLDS — the bridge from [`StoredConstraint`],
+/// which is how the datastage KEEPS a constraint, to [`Constraint`], which is how entry 001 CHECKS one.
+///
+/// ⛔ THE CONVERSION IS WHERE THREE OF THE REFERENCE'S CHECK-TIME `DT_ERROR`s LAND: a
+/// `cannotBeSymbolic_` constraint against a reference stage (`ddc/ddcv1.cpp:801`), a must-be-multiple
+/// absolute constraint with no `min_` (`:864`), and a no-epilogue constraint over several dims (`:875`).
+fn constraints_hold<S>(
+    stages: &S,
+    at: StageSite,
+    ds_metadata: &Datastage,
+    dim_to_check: PrimaryDim,
+    allow_epilogue: bool,
+) -> Option<bool>
+where
+    S: ExploreStages + ?Sized,
+{
+    let ds = stages.dims(at)?;
+    // `&currDsc->dataStageParam_.at(refDsId).ss_` — snapshot every reference stage first, because the
+    // check borrows them all at once.
+    let mut references = BTreeMap::new();
+    for reference in ds_metadata.constraints.keys().flatten() {
+        references.insert(*reference, stages.dims(StageSite::ss(*reference))?);
+    }
+    let mut checked = Vec::new();
+    for (reference, constraints) in &ds_metadata.constraints {
+        for (dims, stored) in constraints {
+            let kind = match reference {
+                None => ConstraintKind::Absolute {
+                    cannot_be_symbolic: stored.cannot_be_symbolic,
+                    dim_kind: stored.multiple.dim_kind(),
+                    min: match (stored.multiple.must_be_multiple(), stored.min) {
+                        // "Must-be-multiple constraint but no min set".
+                        (true, None) => return None,
+                        (true, Some(min)) => AbsoluteMin::Multiple(min),
+                        (false, None) => AbsoluteMin::Unset,
+                        (false, Some(min)) => AbsoluteMin::Bound(min),
+                    },
+                },
+                Some(reference) => {
+                    // `DT_CHECK(refDs == nullptr)` under `cannotBeSymbolic_`.
+                    if stored.cannot_be_symbolic {
+                        return None;
+                    }
+                    ConstraintKind::Relative {
+                        reference: references.get(reference)?,
+                        min: stored.min,
+                        multiple: stored.multiple,
+                    }
+                }
+            };
+            checked.push(DimConstraint::of(
+                dims.clone(),
+                Constraint {
+                    kind,
+                    max: stored.max,
+                    values: stored.values.clone(),
+                },
+            )?);
+        }
+    }
+    Some(check_constraints(
+        &ds,
+        &checked,
+        dim_to_check,
+        allow_epilogue,
+    ))
+}
+
+/// `constraints_[refDs][{dim}]` AS AN L-VALUE — `std::map::operator[]`, which DEFAULT-CONSTRUCTS the
+/// entry it does not find, and that insertion is itself observable.
+fn stored_constraint<'a>(
+    ds_metadata: &'a mut Datastage,
+    reference: Option<DatastageId>,
+    dims: DimSet,
+) -> &'a mut StoredConstraint {
+    let entries = ds_metadata.constraints.entry(reference).or_default();
+    if let Some(position) = entries.iter().position(|(key, _)| *key == dims) {
+        return &mut entries[position].1;
+    }
+    entries.push((dims, StoredConstraint::default()));
+    &mut entries.last_mut().expect("just pushed").1
+}
+
+/// ONE OF THE THREE STORED BOUNDS TIGHTENED — entries 096-098 are methods on the CHECK-time
+/// [`Constraint`], so the stored one is lifted into that shape, updated and folded back.
+///
+/// ⛔ THE LIFT TAKES THE RELATIVE ARM UNCONDITIONALLY, and `min` is what makes that safe: entry 096
+/// writes [`AbsoluteMin`] through [`LoopMultiple`] on the absolute arm, and the stored form keeps those
+/// two apart, so a relative lift is the only one that round-trips every field.
+fn update_stored(stored: &mut StoredConstraint, update: impl FnOnce(&mut Constraint<'_, ()>)) {
+    let mut lifted = Constraint {
+        kind: ConstraintKind::Relative {
+            reference: &(),
+            min: stored.min,
+            multiple: stored.multiple,
+        },
+        max: stored.max,
+        values: stored.values.clone(),
+    };
+    update(&mut lifted);
+    if let ConstraintKind::Relative { min, multiple, .. } = lifted.kind {
+        stored.min = min;
+        stored.multiple = multiple;
+    }
+    stored.max = lifted.max;
+    stored.values = lifted.values;
+}
+
+/// `refConstraint.mustBeMultiple_ |= constraint.mustBeMultiple_` FOLLOWED BY THE `loopDimKind_` MERGE
+/// (`ddc/ddcv1.cpp:1051-1063`), as the one value [`LoopMultiple`] keeps them in.
+///
+/// ⛔ [`None`] IS *"Incompatible loop constraint between datastages during swapping"* — two kinds that
+/// are both set and disagree.
+fn merge_multiple(target: LoopMultiple, source: LoopMultiple) -> Option<LoopMultiple> {
+    let must_be_multiple = target.must_be_multiple() || source.must_be_multiple();
+    let dim_kind = match (target.dim_kind(), source.dim_kind()) {
+        (None, source) => source,
+        (Some(target), None) => Some(target),
+        (Some(target), Some(source)) if target == source => Some(target),
+        (Some(_), Some(_)) => return None,
+    };
+    LoopMultiple::of(must_be_multiple, dim_kind)
+}
+
+/// ENTRY 307'S WHOLE WORKING STATE — the DSC, the tree, the datastage parameters, DDC's metadata, the
+/// allocation arena and the memory trackers, which every one of its phases and both of its recursive
+/// probes need together.
+struct Explore<'a, D: ?Sized, T: ?Sized, S: ?Sized, M: ?Sized> {
+    dsc: &'a D,
+    tree: &'a mut T,
+    stages: &'a mut S,
+    metadata: &'a mut Metadata,
+    allocs: &'a mut AllocArena,
+    trackers: &'a mut M,
+    /// `relevantDims` — every dim any labelled DS lays out, in layout order.
+    relevant_dims: Vec<PrimaryDim>,
+    /// `sortedDs` — the datastages smallest first, with the externals among them.
+    sorted_ds: Vec<Option<DatastageId>>,
+}
+
+impl<D, T, S, M> Explore<'_, D, T, S, M>
+where
+    D: ExploreDsc
+        + LabeledDsIndices
+        + Masking
+        + LdsSticks
+        + Dsc
+        + Placement
+        + StorageNames
+        + StageSizes
+        + ?Sized,
+    T: ExploreTree + ?Sized,
+    S: ExploreStages + ?Sized,
+    M: MemTrackers + ?Sized,
+{
+    /// `relevantDims` and the positions the loop-dim sort reads off it (`ddc/ddcv1.cpp:559-597`).
+    fn relevant_dims(&self) -> Option<(Vec<PrimaryDim>, BTreeMap<PrimaryDim, usize>)> {
+        let layouts: Vec<Vec<PrimaryDim>> = self
+            .dsc
+            .labeled_ds_indices()
+            .into_iter()
+            .map(|lds| self.dsc.layout_dims(lds).to_vec())
+            .collect();
+        // ⚠️ `PrimaryDimTypesCount - 2` IS A POSITION BOUND, NOT A DIM: the outer walk visits layout
+        // POSITIONS, so the two it stops short of are the two innermost positions no layout reaches.
+        let mut relevant: Vec<PrimaryDim> = Vec::new();
+        for position in 0..PrimaryDim::ALL.len() - 2 {
+            for layout in &layouts {
+                let Some(dim) = layout.get(position) else {
+                    continue;
+                };
+                if !relevant.contains(dim) {
+                    relevant.push(*dim);
+                }
+            }
+        }
+        // A window dim influences the PADDED size of the dim it windows, so it is relevant even where
+        // no layout names it — and it goes in FRONT of that dim.
+        for (dim, padding) in self
+            .stages
+            .padding_dims(StageSite::ss(Metadata::CORE_DSTGID))
+        {
+            if !relevant.contains(&dim) {
+                continue;
+            }
+            if let Some(window) = padding.window_dim {
+                if !relevant.contains(&window) {
+                    let at = relevant.iter().position(|entry| *entry == dim)?;
+                    relevant.insert(at, window);
+                }
+            }
+        }
+        // ⚠️ `dimPositions[dim]` IS `unordered_map::operator[]`: a loop dim outside `relevantDims`
+        // answers ZERO and so sorts to the front, which is what the sort below actually reads.
+        let mut positions = BTreeMap::new();
+        for (position, dim) in relevant.iter().enumerate() {
+            positions.entry(*dim).or_insert(position);
+        }
+        Some((relevant, positions))
+    }
+
+    /// SORTS EVERY NON-PARAMETRIC LOOP'S DIMS INTO LAYOUT ORDER AND SEEDS THE CONSTRAINTS THAT ORDER
+    /// IMPLIES (`ddc/ddcv1.cpp:599-670`) — each loop's dims must divide its numerator's, and a window
+    /// dim's base dim must stay continuous with the loop above it.
+    fn seed_loop_constraints(
+        &mut self,
+        loops: &[LoopId],
+        positions: &BTreeMap<PrimaryDim, usize>,
+    ) -> Option<()> {
+        let core_padding = self
+            .stages
+            .padding_dims(StageSite::ss(Metadata::CORE_DSTGID));
+        for at in loops {
+            if self.tree.is_parametric_loop(*at) || self.metadata.external_nodes.contains(&at.0) {
+                continue;
+            }
+            let mut dims = self.tree.loop_dims(*at);
+            dims.sort_by_key(|(dim, _kind)| positions.get(dim).copied().unwrap_or(0));
+            self.tree.set_loop_dims(*at, dims.clone());
+            let staging = self.tree.loop_staging(*at)?;
+            // `DT_CHECK(dsMetaIt != metadata.datastages_.end())`.
+            let den = staging.den?;
+            if !self.metadata.datastages.contains_key(&den) {
+                return None;
+            }
+            let ds_metadata = self.metadata.datastages.get_mut(&den)?;
+            ds_metadata.nearest_numerator_idx = staging.num;
+            // ⛔ `constraints_[loop->numId_]` IS TAKEN ONCE, OUTSIDE THE DIM LOOP (`ddc/ddcv1.cpp:1098`),
+            // so the bucket exists even where no dim qualifies below.
+            ds_metadata.constraints.entry(staging.num).or_default();
+            for (dim, kind) in dims {
+                if !matches!(
+                    kind,
+                    MetaDimKind::Unpadded | MetaDimKind::Padded | MetaDimKind::WindowDim
+                ) {
+                    continue;
+                }
+                {
+                    let ds_metadata = self.metadata.datastages.get_mut(&den)?;
+                    // `emplace` — a dim already recorded KEEPS the numerator it was recorded with.
+                    match staging.num {
+                        Some(num) => {
+                            ds_metadata
+                                .relevant_dims_and_numerator
+                                .entry(dim)
+                                .or_insert(num);
+                        }
+                        // A `-1` numerator IS recorded by the reference and then read back as
+                        // `dataStageParam_.at(-1)`, so a dim reaching here unrecorded is that throw.
+                        None if ds_metadata.relevant_dims_and_numerator.contains_key(&dim) => {}
+                        None => return None,
+                    }
+                    let constraint =
+                        stored_constraint(ds_metadata, staging.num, DimSet::of(&[dim])?);
+                    constraint.multiple = LoopMultiple::of(true, Some(kind))?;
+                    update_stored(constraint, |lifted| lifted.update_max(1.0));
+                }
+                // Search the loops above for this dim to CHECK continuity, and for a window dim's base
+                // dims to ENFORCE it as a constraint between the two datastages.
+                let mut to_search: BTreeSet<PrimaryDim> = BTreeSet::new();
+                to_search.insert(dim);
+                if kind == MetaDimKind::WindowDim {
+                    for (pad_dim, padding) in &core_padding {
+                        if padding.window_dim == Some(dim) {
+                            to_search.insert(*pad_dim);
+                        }
+                    }
+                }
+                let mut parent = self.tree.owner_loop(at.0);
+                while let Some(above) = parent {
+                    if to_search.is_empty() {
+                        break;
+                    }
+                    let above_den = self.tree.loop_staging(above)?.den;
+                    for (parent_dim, _parent_kind) in self.tree.loop_dims(above) {
+                        if !to_search.contains(&parent_dim) {
+                            continue;
+                        }
+                        if parent_dim == dim {
+                            to_search.clear();
+                            // "Continuity of datastage not respected between loop … and …".
+                            if above_den.is_some() && above_den != staging.num {
+                                return None;
+                            }
+                        } else {
+                            // The base dim of a window dim: tie this loop's numerator to the parent's
+                            // denominator, whichever of the two this DSC actually tracks.
+                            to_search.remove(&parent_dim);
+                            let Some(above_den) = above_den else {
+                                continue;
+                            };
+                            if self.metadata.datastages.contains_key(&above_den) {
+                                let target = self.metadata.datastages.get_mut(&above_den)?;
+                                let constraint =
+                                    stored_constraint(target, staging.num, DimSet::of(&[dim])?);
+                                constraint.multiple = LoopMultiple::of(true, Some(kind))?;
+                                update_stored(constraint, |lifted| lifted.update_min(1.0));
+                            } else if let Some(num) = staging.num {
+                                if self.metadata.datastages.contains_key(&num) {
+                                    let target = self.metadata.datastages.get_mut(&num)?;
+                                    let constraint = stored_constraint(
+                                        target,
+                                        Some(above_den),
+                                        DimSet::of(&[dim])?,
+                                    );
+                                    constraint.multiple = LoopMultiple::of(true, Some(kind))?;
+                                    update_stored(constraint, |lifted| lifted.update_max(1.0));
+                                }
+                            }
+                        }
+                    }
+                    parent = self.tree.owner_loop(above.0);
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// FORBIDS A SYMBOLIC SIZE WHERE THE INSTRUCTION NAMES ITS OWN LOCATIONS (`ddc/ddcv1.cpp:672-724`):
+    /// an allocation in a directly addressable memory would need instructions removed during correction,
+    /// so every loop dim reaching it is marked as one whose datastage cannot go symbolic.
+    fn disallow_symbolic_in_direct_memories(&mut self) -> Option<()> {
+        let core_padding = self
+            .stages
+            .padding_dims(StageSite::ss(Metadata::CORE_DSTGID));
+        for alloc in self.tree.allocates() {
+            let node = self.tree.alloc_node(alloc)?;
+            if self.metadata.external_nodes.contains(&node) {
+                continue;
+            }
+            let (component, lds) = {
+                let an = self.allocs.get(&alloc)?;
+                (an.component, an.lds)
+            };
+            if !is_direct_addressable_memory(component) {
+                continue;
+            }
+            // ⚠️ `getNonBroadcastLdsDimSet(-1)` ANSWERS AN EMPTY SET (`dsc/dsc2.cpp:4053-4055`) rather
+            // than throwing, so an allocation naming no labelled DS contributes nothing here.
+            let mut target_dims = match lds {
+                Some(lds) => self.dsc.non_broadcast_dims(lds),
+                None => BTreeSet::new(),
+            };
+            for (dim, padding) in &core_padding {
+                if target_dims.contains(dim)
+                    && self.tree.alloc_padding(alloc, *dim) != PadType::NoPad
+                {
+                    if let Some(window) = padding.window_dim {
+                        target_dims.insert(window);
+                    }
+                }
+            }
+            let mut parent = self.tree.owner_loop(node);
+            while !target_dims.is_empty() {
+                // ⛔ THE REFERENCE DEREFERENCES A NULL PARENT HERE (`:707`): the root arm clears the set
+                // first, so a tree with a root above every allocation never reaches that read.
+                let above = parent?;
+                let staging = self.tree.loop_staging(above)?;
+                if self.tree.prev(above.0).is_none() {
+                    for dim in &target_dims {
+                        self.disallow_symbolic(staging.den, *dim)?;
+                    }
+                    target_dims.clear();
+                } else {
+                    for (loop_dim, _kind) in self.tree.loop_dims(above) {
+                        if target_dims.contains(&loop_dim) {
+                            if !self.tree.is_parametric_loop(above) {
+                                self.disallow_symbolic(staging.den, loop_dim)?;
+                            }
+                            target_dims.remove(&loop_dim);
+                        }
+                    }
+                }
+                parent = self.tree.owner_loop(above.0);
+            }
+        }
+        Some(())
+    }
+
+    /// `constraints_[-1][{dim}].cannotBeSymbolic_ = true`, and NOTHING for an external datastage.
+    fn disallow_symbolic(&mut self, stage: Option<DatastageId>, dim: PrimaryDim) -> Option<()> {
+        let Some(stage) = stage else {
+            return Some(());
+        };
+        if !self.metadata.datastages.contains_key(&stage) {
+            return Some(()); // external ds
+        }
+        stored_constraint(
+            self.metadata.datastages.get_mut(&stage)?,
+            None,
+            DimSet::of(&[dim])?,
+        )
+        .cannot_be_symbolic = true;
+        Some(())
+    }
+
+    /// `sortedDs` — every loop's numerator after its denominator, so the list runs smallest to largest
+    /// (`ddc/ddcv1.cpp:726-751`).
+    fn rank_datastages(&self, loops: &[LoopId]) -> Option<Vec<Option<DatastageId>>> {
+        let mut sorted: Vec<Option<DatastageId>> = Vec::new();
+        let Some(head) = loops.first() else {
+            return Some(sorted);
+        };
+        sorted.push(self.tree.loop_staging(*head)?.num);
+        for at in loops {
+            // Parametric loops are not associated with any datastage.
+            if self.tree.is_parametric_loop(*at) {
+                continue;
+            }
+            let staging = self.tree.loop_staging(*at)?;
+            let num_pos = match sorted.iter().position(|entry| *entry == staging.num) {
+                Some(position) => position,
+                None => {
+                    sorted.push(staging.num);
+                    sorted.len() - 1
+                }
+            };
+            match sorted.iter().position(|entry| *entry == staging.den) {
+                None => sorted.insert(num_pos, staging.den), // insert in front
+                // `std::distance(denDsIt, numDsIt) < 0` — the numerator sits BEFORE its denominator.
+                Some(den_pos) if den_pos > num_pos => sorted.swap(num_pos, den_pos),
+                Some(_) => {}
+            }
+        }
+        Some(sorted)
+    }
+
+    /// MOVES EVERY CONSTRAINT THAT POINTS AT A LARGER NON-EXTERNAL DATASTAGE ONTO THAT DATASTAGE
+    /// INSTEAD (`ddc/ddcv1.cpp:753-793`), reciprocating its bounds on the way so the exploration only
+    /// ever looks downward.
+    fn swap_relative_constraints(&mut self) -> Option<()> {
+        for position in 0..self.sorted_ds.len() {
+            let Some(stage) = self.sorted_ds[position] else {
+                continue;
+            };
+            if !self.metadata.datastages.contains_key(&stage) {
+                continue; // external
+            }
+            let larger: Vec<DatastageId> = self.metadata.datastages[&stage]
+                .constraints
+                .keys()
+                .flatten()
+                .copied()
+                .filter(|reference| {
+                    self.sorted_ds[position + 1..].contains(&Some(*reference))
+                        && self.metadata.datastages.contains_key(reference)
+                })
+                .collect();
+            for reference in larger {
+                let moved = self
+                    .metadata
+                    .datastages
+                    .get_mut(&stage)?
+                    .constraints
+                    .remove(&Some(reference))?;
+                let target = self.metadata.datastages.get_mut(&reference)?;
+                for (dims, constraint) in moved {
+                    let stored = stored_constraint(target, Some(stage), dims);
+                    // min becomes max and values are reciprocal
+                    if let Some(min) = constraint.min {
+                        update_stored(stored, |lifted| lifted.update_max(1.0 / min));
+                    }
+                    if let Some(max) = constraint.max {
+                        update_stored(stored, |lifted| lifted.update_min(1.0 / max));
+                    }
+                    if let Some(values) = &constraint.values {
+                        let reciprocal: Vec<f32> = values.iter().map(|value| 1.0 / value).collect();
+                        update_stored(stored, |lifted| lifted.update_values(&reciprocal));
+                    }
+                    stored.multiple = merge_multiple(stored.multiple, constraint.multiple)?;
+                }
+            }
+        }
+        Some(())
+    }
+    /// `dsTypeStickSizePerDim.at(labeledDs_.at(lds).dsType_)` (`ddc/ddcv1.cpp:1043-1049`) — every
+    /// reader keys that map by the labelled DS's own `dsType_`, so the per-lds sizes ARE the map.
+    fn stick_size_per_dim(&self, lds: LdsIdx) -> Option<BTreeMap<PrimaryDim, Extent>> {
+        let mut sizes = BTreeMap::new();
+        for (dim, size) in cumulative_stick_sizes(&self.dsc.stick_dims(lds), StickPart::Whole)? {
+            sizes.insert(dim, Extent(i64::try_from(size.0).ok()?));
+        }
+        Some(sizes)
+    }
+
+    /// `updateSizePerDim` (`ddc/ddcv1.cpp:1057-1090`) — ONE operation's per-dim granularity folded
+    /// into the running one, keeping the coarser of the two.
+    ///
+    /// ⛔ THE FOLD IS ORDER-DEPENDENT: `max % min` refuses `(4, 6)` and accepts `(4, 12)` then
+    /// `(48, 6)`, which is why the two node kinds share one DFS.
+    fn update_size_per_dim<A: Arch>(
+        &self,
+        other: &BTreeMap<PrimaryDim, Extent>,
+        dim_list: &[(PrimaryDim, MetaDimKind)],
+        units: &[SenComponent],
+        lds: LdsIdx,
+        base: &mut BTreeMap<PrimaryDim, Extent>,
+        row_unit_interaction: &mut bool,
+    ) -> Option<()> {
+        let layout = self.dsc.layout_dims(lds).to_vec();
+        for (dim, _kind) in dim_list {
+            let in_other = other.contains_key(dim);
+            if !layout.contains(dim) {
+                // `DT_CHECK(!dimInOtherMap)`.
+                if in_other {
+                    return None;
+                }
+                continue;
+            }
+            // The PT rows each hold their own share of the row-split dim, so an operation on a unit
+            // that has a row identity states one row's granularity and not the whole dim's.
+            let mut apply_row_scaling = false;
+            if Some(*dim) == self.metadata.row_split_dim {
+                for unit in units {
+                    if comp_row_id(*unit).is_some() || *unit == SenComponent::L0su {
+                        *row_unit_interaction = true;
+                        apply_row_scaling = *unit != SenComponent::L0su;
+                    }
+                }
+            }
+            if !in_other {
+                continue;
+            }
+            let mut size = other.get(dim)?.0;
+            if apply_row_scaling {
+                size *= i64::from(A::PT_ROWS);
+            }
+            let base_size = base.entry(*dim).or_insert(Extent(1)).0;
+            let max = base_size.max(size);
+            let min = base_size.min(size);
+            // "Operations with granularity that is not multiple of each other cannot coexist in the
+            // same loop" — and a zero granularity is the reference's own division by zero.
+            if min == 0 || max % min != 0 {
+                return None;
+            }
+            base.insert(*dim, Extent(max));
+        }
+        Some(())
+    }
+
+    /// `setValueInDs` (`ddc/ddcv1.cpp:1128-1153`) — one dim's value written together with the
+    /// per-corelet, per-row and per-component shares it implies, each of which multiplies the total.
+    fn set_value_in_ds<A: Arch>(
+        &mut self,
+        value: Extent,
+        at: StageSite,
+        dim: PrimaryDim,
+        row_unit_interaction: bool,
+    ) -> Option<()> {
+        let corelets: Vec<Corelet> = (0..A::CORELETS_PER_CORE)
+            .filter_map(Corelet::checked)
+            .collect();
+        self.stages.set_dim_value(at, dim, value);
+        if row_unit_interaction && Some(dim) == self.metadata.row_split_dim {
+            let per_row = vec![value; usize::try_from(A::PT_ROWS).ok()?];
+            let mut shares = self.stages.row_shares(at, dim).unwrap_or_default();
+            let first = *corelets.first()?;
+            shares.insert(first, per_row.clone());
+            if value.0 >= 0 {
+                self.stages
+                    .set_dim_value(at, dim, Extent(value.0 * i64::from(A::PT_ROWS)));
+            }
+            if !self.metadata.cl_split_dims.is_empty() {
+                for corelet in corelets.iter().skip(1) {
+                    shares.insert(*corelet, per_row.clone());
+                }
+            }
+            self.stages.set_row_shares(at, dim, shares);
+        } else if self.metadata.pe_sfp_split_dims.contains(&dim) {
+            let mut shares = self.stages.pe_sfp_shares(at, dim).unwrap_or_default();
+            let first = *corelets.first()?;
+            shares.insert(first, PeSfpShares::both(value));
+            if value.0 >= 0 {
+                self.stages.set_dim_value(at, dim, Extent(value.0 * 2));
+            }
+            if !self.metadata.cl_split_dims.is_empty() {
+                for corelet in corelets.iter().skip(1) {
+                    shares.insert(*corelet, PeSfpShares::both(value));
+                }
+            }
+            self.stages.set_pe_sfp_shares(at, dim, shares);
+        }
+        // ⛔ READ BACK, NOT `value`: the reference's `int(dsDim)` here is whatever the row or
+        // component split above already multiplied it by.
+        if self.metadata.cl_split_dims.contains(&dim) {
+            let split = self.stages.dim_value(at, dim);
+            self.stages
+                .set_corelet_shares(at, dim, vec![split; corelets.len()]);
+            if split.0 >= 0 {
+                self.stages.set_dim_value(
+                    at,
+                    dim,
+                    Extent(split.0 * i64::from(A::CORELETS_PER_CORE)),
+                );
+            }
+        }
+        Some(())
+    }
+
+    /// COPIES ONE STAGE'S CHOSEN SIZES INTO EVERY LARGER STAGE ABOVE IT (`ddc/ddcv1.cpp:1006-1040`),
+    /// growing each until its own constraints hold. `Some(false)` is the reference's `return false` —
+    /// a stage that would have to pass the enclosing external stage's extent to satisfy them.
+    fn propagate_upward<A: Arch>(
+        &mut self,
+        ref_pos: usize,
+        dim_to_propagate: Option<PrimaryDim>,
+    ) -> Option<bool> {
+        let dims_to_copy = match dim_to_propagate {
+            Some(dim) => vec![dim],
+            None => self.relevant_dims.clone(),
+        };
+        let ref_site = StageSite::ss((*self.sorted_ds.get(ref_pos)?)?);
+        // The first external datastage above this one bounds every size chosen below it.
+        let mut external = None;
+        for later in self.sorted_ds.get(ref_pos + 1..)? {
+            let later = (*later)?;
+            if self.metadata.datastages.contains_key(&later) {
+                continue;
+            }
+            external = Some(StageSite::ss(later));
+            break;
+        }
+        let mut next = self
+            .metadata
+            .datastages
+            .get(&ref_site.stage)?
+            .nearest_numerator_idx;
+        while let Some(stage) = next {
+            if !self.metadata.datastages.contains_key(&stage) {
+                break; // stop at external
+            }
+            let site = StageSite::ss(stage);
+            let ds_metadata = self.metadata.datastages.get(&stage)?.clone();
+            for dim in &dims_to_copy {
+                let ref_value = self.stages.extent(
+                    ref_site,
+                    *dim,
+                    DimSample::WHOLE,
+                    PadType::NoPad,
+                    SymbolicRead::Max,
+                );
+                // ⛔ THE REFERENCE DEREFERENCES A NULL `externalDs` HERE (`:1021`) when no external
+                // datastage follows, so a list of purely internal stages is that read.
+                let upper = self.stages.extent(
+                    external?,
+                    *dim,
+                    DimSample::WHOLE,
+                    PadType::NoPad,
+                    SymbolicRead::Max,
+                );
+                self.stages.set_dim_value(site, *dim, ref_value);
+                if self.metadata.cl_split_dims.contains(dim) {
+                    // ⛔ `operator[]` ON THE REFERENCE STAGE TOO (`:1024`): the read default-inserts,
+                    // which changes that stage's own later `coreletSplit_.count(dim)`.
+                    let shares = self
+                        .stages
+                        .corelet_shares(ref_site, *dim)
+                        .unwrap_or_default();
+                    self.stages
+                        .set_corelet_shares(ref_site, *dim, shares.clone());
+                    self.stages.set_corelet_shares(site, *dim, shares);
+                }
+                if let Some(shares) = self.stages.row_shares(ref_site, *dim) {
+                    self.stages.set_row_shares(site, *dim, shares);
+                } else if let Some(existing) = self.stages.row_shares(site, *dim) {
+                    // assuming equal split
+                    let cl_count = i64::from(self.stages.corelet_shares(site, *dim).is_some());
+                    let value = self.stages.dim_value(site, *dim);
+                    // ⛔ REAL DIVISION AND NOT INTEGER DIVISION: `dsDim` is a `double&`
+                    // (`setValueInDs` at `:1128` takes it as one), so both divides happen before
+                    // the ceil and 12 rows over 8 answers 2 rather than 1.
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        clippy::cast_possible_truncation,
+                        reason = "the reference's own double arithmetic, and every operand is a tile extent"
+                    )]
+                    let share = (value.0 as f64 / f64::from(A::PT_ROWS) / (1 + cl_count) as f64)
+                        .ceil() as i64;
+                    let rows = usize::try_from(A::PT_ROWS).ok()?;
+                    let equal = existing
+                        .into_keys()
+                        .map(|corelet| (corelet, vec![Extent(share); rows]))
+                        .collect();
+                    self.stages.set_row_shares(site, *dim, equal);
+                    self.stages.set_dim_value(
+                        site,
+                        *dim,
+                        Extent(share * i64::from(A::PT_ROWS) * (1 + cl_count)),
+                    );
+                } else if self.metadata.pe_sfp_split_dims.contains(dim) {
+                    let shares = self.stages.pe_sfp_shares(ref_site, *dim)?;
+                    self.stages.set_pe_sfp_shares(site, *dim, shares);
+                }
+                while !constraints_hold(&*self.stages, site, &ds_metadata, *dim, false)? {
+                    // try incrementing the value and see if it meets constraints
+                    let mut increment = 1;
+                    if let Some(shares) = self.stages.row_shares(site, *dim) {
+                        let bumped = shares
+                            .into_iter()
+                            .map(|(corelet, rows)| {
+                                (
+                                    corelet,
+                                    rows.into_iter()
+                                        .map(|row| Extent(row.0 + increment))
+                                        .collect(),
+                                )
+                            })
+                            .collect();
+                        self.stages.set_row_shares(site, *dim, bumped);
+                        increment *= i64::from(A::PT_ROWS);
+                    } else if self.metadata.pe_sfp_split_dims.contains(dim) {
+                        let mut shares = self.stages.pe_sfp_shares(site, *dim).unwrap_or_default();
+                        for share in shares.values_mut() {
+                            share.pe = Extent(share.pe.0 + increment);
+                            share.sfp = Extent(share.sfp.0 + increment);
+                        }
+                        self.stages.set_pe_sfp_shares(site, *dim, shares);
+                        increment *= 2;
+                    }
+                    if self.metadata.cl_split_dims.contains(dim) {
+                        let shares = self.stages.corelet_shares(site, *dim).unwrap_or_default();
+                        let bumped = shares
+                            .into_iter()
+                            .map(|share| Extent(share.0 + increment))
+                            .collect();
+                        self.stages.set_corelet_shares(site, *dim, bumped);
+                        increment *= i64::from(A::CORELETS_PER_CORE);
+                    }
+                    let grown = Extent(self.stages.dim_value(site, *dim).0 + increment);
+                    self.stages.set_dim_value(site, *dim, grown);
+                    if grown.0 > upper.0 {
+                        return Some(false);
+                    }
+                }
+            }
+            self.stages.compound(site);
+            next = self.metadata.datastages.get(&stage)?.nearest_numerator_idx;
+        }
+        Some(true)
+    }
+
+    /// GIVES EVERY DATASTAGE THE SMALLEST SIZE ITS OWN TRANSFERS AND COMPUTES CAN WORK IN
+    /// (`ddc/ddcv1.cpp:1092-1216`), then records that size as the dim's must-be-multiple minimum.
+    fn assign_minimum_sizes<A: Arch>(&mut self, loops: &[LoopId]) -> Option<()> {
+        let core = StageSite::ss(Metadata::CORE_DSTGID);
+        let chunk = StageSite::ss(Metadata::CHUNK_DSTGID);
+        for position in 0..self.sorted_ds.len() {
+            let Some(stage) = self.sorted_ds[position] else {
+                continue; // external
+            };
+            if !self.metadata.datastages.contains_key(&stage) {
+                continue; // external
+            }
+            let ds_metadata = self.metadata.datastages.get(&stage)?.clone();
+            let site = StageSite::ss(stage);
+            let mut size_per_dim = BTreeMap::new();
+            let mut row_unit_interaction = false;
+            for at in loops {
+                if self.tree.loop_staging(*at)?.den != Some(stage) {
+                    continue; // loop not relevant
+                }
+                let dims = self.tree.loop_dims(*at);
+                for child in self.tree.transfers_and_computes_under(at.0) {
+                    match self.tree.tree_node(child)? {
+                        TreeNode::Other(NodeKind::Transfer) => {
+                            let transfer = self.tree.transfer(child)?;
+                            if transfer.transfer_kind() == TransferKind::ConstantToConstant {
+                                continue;
+                            }
+                            let mut unit_time: BTreeMap<PrimaryDim, Extent> = BTreeMap::new();
+                            // A stick-broadcast dim is fetched once and replicated, so its unit-time
+                            // size is the chunk times the replication factor.
+                            let mut stick_broadcast = None;
+                            if let Some(src) = transfer.src.data.my_lds_idx {
+                                for dim in self.dsc.layout_dims(src).to_vec() {
+                                    if self.dsc.lds_scale(src, dim)
+                                        == Some(LdsScale::StickBroadcast)
+                                    {
+                                        stick_broadcast = Some(dim);
+                                        break;
+                                    }
+                                }
+                            }
+                            for entry in &transfer.unit_time_transfer_chunk_size {
+                                let dim = entry.size_dim.dim;
+                                let size = i64::try_from(entry.size_dim.size.0).ok()?;
+                                match unit_time.get(&dim).copied() {
+                                    Some(seen) => {
+                                        unit_time.insert(dim, Extent(seen.0 * size));
+                                    }
+                                    None => {
+                                        let mut value = size;
+                                        if Some(dim) == stick_broadcast {
+                                            value *= i64::try_from(transfer.replication_factor.0)
+                                                .ok()?;
+                                        }
+                                        unit_time.insert(dim, Extent(value));
+                                    }
+                                }
+                            }
+                            // In case the transfer is for mx-scale, multiply by the scale-factor.
+                            let lds = if transfer.src.data.is_labeled_ds() {
+                                transfer.src.data.my_lds_idx?
+                            } else {
+                                transfer.dsts.first().data.my_lds_idx?
+                            };
+                            if self.dsc.scaled_category(lds) == ScaledLds::Scale {
+                                // ⛔ [`None`] IS THE UNSPELLABLE ALTERNATIVE: the reference reads
+                                // `mxInfo_.dim` unguarded, and an unset one keys the map at a dim
+                                // outside the closed twelve.
+                                let (mx_dim, block) = self.dsc.mx_info(lds)?;
+                                let block = i64::try_from(block.count().0).ok()?;
+                                let scaled = match unit_time.get(&mx_dim).copied() {
+                                    Some(seen) => Extent(seen.0 * block),
+                                    None => Extent(block),
+                                };
+                                unit_time.insert(mx_dim, scaled);
+                            }
+                            self.update_size_per_dim::<A>(
+                                &unit_time,
+                                &dims,
+                                &[transfer.src.unit, transfer.dsts.first().unit],
+                                lds,
+                                &mut size_per_dim,
+                                &mut row_unit_interaction,
+                            )?;
+                        }
+                        TreeNode::Other(NodeKind::Compute) => {
+                            let unit = self.tree.compute_op(child)?.ex_unit;
+                            // ⚠️ THE INPUT SWEEP IS COMMENTED OUT AT `:1160-1166` and stays out.
+                            let outputs = if self.tree.is_opaque_compute(child) {
+                                vec![self.metadata.opaque_ops.get(&child)?.lds_idx?]
+                            } else {
+                                self.tree.compute_op(child)?.outputs
+                            };
+                            for lds in outputs {
+                                let sizes = self.stick_size_per_dim(lds)?;
+                                self.update_size_per_dim::<A>(
+                                    &sizes,
+                                    &dims,
+                                    &[unit],
+                                    lds,
+                                    &mut size_per_dim,
+                                    &mut row_unit_interaction,
+                                )?;
+                            }
+                        }
+                        TreeNode::Allocate(_) | TreeNode::Other(_) => {}
+                    }
+                }
+            }
+
+            let core_padding = self.stages.padding_dims(core);
+            for dim in self.relevant_dims.clone() {
+                let mut to_set = Extent(-1);
+                if let Some(size) = size_per_dim.get(&dim).copied() {
+                    let mut value = size.0;
+                    if row_unit_interaction && Some(dim) == self.metadata.row_split_dim {
+                        // "Size is not multiple of row".
+                        if value % i64::from(A::PT_ROWS) != 0 {
+                            return None;
+                        }
+                        value /= i64::from(A::PT_ROWS);
+                    }
+                    to_set = Extent(value);
+                } else if ds_metadata.relevant_dims_and_numerator.contains_key(&dim) {
+                    to_set = Extent(1);
+                }
+                if to_set.0 > 0 {
+                    for (pad_dim, pad_info) in &core_padding {
+                        let target = if dim == *pad_dim {
+                            dim
+                        } else if Some(dim) == pad_info.window_dim {
+                            *pad_dim
+                        } else {
+                            continue;
+                        };
+                        // `emplace(target, padInfo)` and then MUTATE whichever entry it answered
+                        // with: a tile pads nothing it does not span, so both sides are voided.
+                        let mut padding = self
+                            .stages
+                            .padding_dims(site)
+                            .into_iter()
+                            .find(|(key, _)| *key == target)
+                            .map_or(*pad_info, |(_, existing)| existing);
+                        padding.unneeded = UnneededPad::NONE;
+                        padding.sizes = padding.sizes.voided();
+                        self.stages.set_padding(site, target, padding);
+                        break;
+                    }
+                }
+                self.set_value_in_ds::<A>(to_set, site, dim, row_unit_interaction)?;
+            }
+            // give a value to kernel whenever there is a padded dim
+            for (_pad_dim, pad_info) in self.stages.padding_dims(site) {
+                let Some(window) = pad_info.window_dim else {
+                    continue;
+                };
+                if self.stages.dim_value(site, window).0 < 0 {
+                    self.set_value_in_ds::<A>(Extent(1), site, window, row_unit_interaction)?;
+                }
+            }
+            // check constraint in a separate loop to handle constraint on multiple dims
+            for dim in self.relevant_dims.clone() {
+                let original = self.stages.dim_value(site, dim);
+                let mut factor = 1;
+                let upper = self.stages.extent(
+                    chunk,
+                    dim,
+                    DimSample::WHOLE,
+                    PadType::NoPad,
+                    SymbolicRead::Granularity,
+                );
+                if !constraints_hold(&*self.stages, site, &ds_metadata, dim, false)? {
+                    // drop to 1 and explore from there
+                    self.set_value_in_ds::<A>(Extent(1), site, dim, row_unit_interaction)?;
+                }
+                while !constraints_hold(&*self.stages, site, &ds_metadata, dim, false)? {
+                    if self.stages.dim_value(site, dim) == original {
+                        factor = 1; // once above slice/stick, go in multiples
+                    }
+                    factor += 1;
+                    // ⚠️ `(v / (factor - 1)) * factor` IS EXACTLY `original * factor`: `factor` is
+                    // pre-incremented from one, so each step divides by the multiple it last applied.
+                    if let Some(shares) = self.stages.row_shares(site, dim) {
+                        let grown = shares
+                            .into_iter()
+                            .map(|(corelet, rows)| {
+                                (
+                                    corelet,
+                                    rows.into_iter()
+                                        .map(|row| Extent(row.0 / (factor - 1) * factor))
+                                        .collect(),
+                                )
+                            })
+                            .collect();
+                        self.stages.set_row_shares(site, dim, grown);
+                    } else if self.metadata.pe_sfp_split_dims.contains(&dim) {
+                        let mut shares = self.stages.pe_sfp_shares(site, dim)?;
+                        for share in shares.values_mut() {
+                            share.pe = Extent(share.pe.0 / (factor - 1) * factor);
+                            share.sfp = Extent(share.sfp.0 / (factor - 1) * factor);
+                        }
+                        self.stages.set_pe_sfp_shares(site, dim, shares);
+                    }
+                    if self.metadata.cl_split_dims.contains(&dim) {
+                        let grown = self
+                            .stages
+                            .corelet_shares(site, dim)?
+                            .into_iter()
+                            .map(|share| Extent(share.0 / (factor - 1) * factor))
+                            .collect();
+                        self.stages.set_corelet_shares(site, dim, grown);
+                    }
+                    let grown = Extent(self.stages.dim_value(site, dim).0 / (factor - 1) * factor);
+                    self.stages.set_dim_value(site, dim, grown);
+                    // "Cannot find a valid minimum value for data stage".
+                    if grown.0 > upper.0 {
+                        return None;
+                    }
+                }
+            }
+            self.stages.compound(site);
+            // Assumption: Equal split across corelet, PT-rows, and PE-SFP.
+            for dim in size_per_dim.into_keys() {
+                let share = self.stages.extent(
+                    site,
+                    dim,
+                    DimSample {
+                        comp: Some(VectorComp::Pe),
+                        row: Some(Row::at::<0>()),
+                        corelet: Some(Corelet::at::<0>()),
+                    },
+                    PadType::NoPad,
+                    SymbolicRead::Max,
+                );
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "the reference's own float constraint bound"
+                )]
+                let minimum = share.0 as f32;
+                let stored = stored_constraint(
+                    self.metadata.datastages.get_mut(&stage)?,
+                    None,
+                    DimSet::of(&[dim])?,
+                );
+                update_stored(stored, |lifted| lifted.update_min(minimum));
+                stored.multiple = LoopMultiple::of(true, stored.multiple.dim_kind())?;
+            }
+        }
+        Some(())
+    }
+
+    /// BUILDS EVERY DATASTAGE'S EPILOGUE FROM ITS STEADY STATE (`ddc/ddcv1.cpp:1218-1330`) — the last,
+    /// short trip of each loop, whose extent is the numerator's remainder. `Some(false)` is the
+    /// reference's `return false`: a remainder that would itself need an epilogue.
+    fn calculate_epilogues<A: Arch>(&mut self) -> Option<bool> {
+        let core = StageSite::ss(Metadata::CORE_DSTGID);
+        for position in (0..self.sorted_ds.len()).rev() {
+            let Some(stage) = self.sorted_ds[position] else {
+                continue; // external
+            };
+            if !self.metadata.datastages.contains_key(&stage) {
+                continue; // external
+            }
+            let ds_metadata = self.metadata.datastages.get(&stage)?.clone();
+            self.stages.copy_ss_to_el(stage);
+            self.stages.mark_epilogue_name(stage);
+            let den_ss = StageSite::ss(stage);
+            let den_el = StageSite::el(stage);
+            for (dim, numerator) in &ds_metadata.relevant_dims_and_numerator {
+                if self.stages.symbolic_dims(den_ss).contains(dim) {
+                    self.stages.make_dim_symbolic(den_el, core, *dim);
+                    continue;
+                }
+                let num_ss = StageSite::ss(*numerator);
+                let num_el = StageSite::el(*numerator);
+                let split_corelets = self.stages.corelet_shares(den_ss, *dim).is_some();
+                let split_rows = self.stages.row_shares(den_ss, *dim).is_some();
+                let num_cl = if split_corelets {
+                    A::CORELETS_PER_CORE
+                } else {
+                    1
+                };
+                let num_rows = if split_rows { A::PT_ROWS } else { 1 };
+                let mut total = 0;
+                self.stages.set_dim_value(den_el, *dim, Extent(0));
+                for corelet_index in 0..num_cl {
+                    let corelet = Corelet::checked(corelet_index)?;
+                    let slot = usize::try_from(corelet_index).ok()?;
+                    if self.stages.pe_sfp_shares(den_ss, *dim).is_none() {
+                        for row_index in 0..num_rows {
+                            // Where the denominator has no row interaction but the numerator does,
+                            // the comparison drops to the whole dim rather than one row's share.
+                            let row =
+                                if split_rows || self.stages.row_shares(num_ss, *dim).is_none() {
+                                    Some(Row::checked(row_index)?)
+                                } else {
+                                    None
+                                };
+                            let sample = DimSample {
+                                comp: None,
+                                row,
+                                corelet: Some(corelet),
+                            };
+                            let steady = self
+                                .stages
+                                .extent(num_ss, *dim, sample, PadType::NoPad, SymbolicRead::Max)
+                                .0;
+                            let epilogue = self
+                                .stages
+                                .extent(num_el, *dim, sample, PadType::NoPad, SymbolicRead::Max)
+                                .0;
+                            let mut share = self
+                                .stages
+                                .extent(den_ss, *dim, sample, PadType::NoPad, SymbolicRead::Max)
+                                .0;
+                            // ⛔ THE REFERENCE DIVIDES BY THIS UNGUARDED (`:1256`) and a dim the
+                            // denominator does not span answers zero.
+                            if share == 0 {
+                                return None;
+                            }
+                            if steady != epilogue && steady % share != 0 {
+                                return Some(false);
+                            }
+                            let remainder = epilogue % share;
+                            if remainder != 0 {
+                                share = remainder;
+                            }
+                            if num_cl > 1 {
+                                let mut shares = self.stages.corelet_shares(den_el, *dim)?;
+                                let entry = shares.get_mut(slot)?;
+                                *entry = if row_index == 0 {
+                                    Extent(share)
+                                } else {
+                                    Extent(entry.0 + share)
+                                };
+                                self.stages.set_corelet_shares(den_el, *dim, shares);
+                            }
+                            if num_rows > 1 {
+                                let mut shares = self.stages.row_shares(den_el, *dim)?;
+                                let row_slot = usize::try_from(row_index).ok()?;
+                                if num_cl > 1 {
+                                    *shares.get_mut(&corelet)?.get_mut(row_slot)? = Extent(share);
+                                } else {
+                                    for rows in shares.values_mut() {
+                                        *rows.get_mut(row_slot)? = Extent(share);
+                                    }
+                                }
+                                self.stages.set_row_shares(den_el, *dim, shares);
+                            }
+                            total += share;
+                            self.stages.set_dim_value(den_el, *dim, Extent(total));
+                        }
+                    } else {
+                        // To Verify: peSfpWorkSplit
+                        let mut shares = PeSfpShares::both(Extent(0));
+                        for comp in [VectorComp::Pe, VectorComp::Sfp] {
+                            let sample = DimSample {
+                                comp: Some(comp),
+                                row: None,
+                                corelet: Some(corelet),
+                            };
+                            let steady = self
+                                .stages
+                                .extent(num_ss, *dim, sample, PadType::NoPad, SymbolicRead::Max)
+                                .0;
+                            let epilogue = self
+                                .stages
+                                .extent(num_el, *dim, sample, PadType::NoPad, SymbolicRead::Max)
+                                .0;
+                            let mut share = self
+                                .stages
+                                .extent(den_ss, *dim, sample, PadType::NoPad, SymbolicRead::Max)
+                                .0;
+                            if share == 0 {
+                                return None;
+                            }
+                            if steady != epilogue && steady % share != 0 {
+                                return Some(false);
+                            }
+                            let remainder = epilogue % share;
+                            if remainder != 0 {
+                                share = remainder;
+                            }
+                            shares.set(comp, Extent(share));
+                        }
+                        if num_cl > 1 {
+                            let mut corelet_shares = self.stages.corelet_shares(den_el, *dim)?;
+                            *corelet_shares.get_mut(slot)? = Extent(shares.pe.0 + shares.sfp.0);
+                            self.stages.set_corelet_shares(den_el, *dim, corelet_shares);
+                        }
+                        for comp in [VectorComp::Pe, VectorComp::Sfp] {
+                            let mut split = self.stages.pe_sfp_shares(den_el, *dim)?;
+                            if num_cl > 1 {
+                                split.get_mut(&corelet)?.set(comp, shares.get(comp));
+                            } else {
+                                for entry in split.values_mut() {
+                                    entry.set(comp, shares.get(comp));
+                                }
+                            }
+                            self.stages.set_pe_sfp_shares(den_el, *dim, split);
+                            total += shares.get(comp).0;
+                            self.stages.set_dim_value(den_el, *dim, Extent(total));
+                        }
+                    }
+                }
+            }
+            self.stages.compound(den_el);
+        }
+        Some(true)
+    }
+
+    /// GROWS ONE DATASTAGE, ONE DIM AT A TIME, TO THE LARGEST SIZE THAT STILL ALLOCATES
+    /// (`ddc/ddcv1.cpp:1332-1424`): each dim jumps straight to the enclosing external stage's extent
+    /// and then walks back down until the constraints, the stages above and the memory all accept it.
+    fn explore_maximize<A: Arch>(
+        &mut self,
+        position: usize,
+        allow_epilogue: bool,
+        lx: LxTrackers,
+    ) -> Option<()> {
+        let stage = self.sorted_ds.get(position).copied()??;
+        let ds_metadata = self.metadata.datastages.get(&stage)?.clone();
+        let site = StageSite::ss(stage);
+        for dim in self.relevant_dims.clone() {
+            if !ds_metadata.relevant_dims_and_numerator.contains_key(&dim) {
+                continue; // dim not relevant for datastage
+            }
+            let original = self.stages.dim_value(site, dim);
+            let was_symbolic = self.stages.symbolic_dims(site).contains(&dim);
+            // find upper limit
+            for later in position + 1..self.sorted_ds.len() {
+                // look for the first external datastage
+                let later = self.sorted_ds[later]?;
+                if self.metadata.datastages.contains_key(&later) {
+                    continue;
+                }
+                let reference = StageSite::ss(later);
+                let extent = self.stages.extent(
+                    reference,
+                    dim,
+                    DimSample::WHOLE,
+                    PadType::NoPad,
+                    SymbolicRead::Max,
+                );
+                self.stages.set_dim_value(site, dim, extent);
+                if let Some(info) = self.stages.symbolic_info(reference, dim) {
+                    self.stages.set_symbolic_info(site, dim, info);
+                }
+                if self.metadata.cl_split_dims.contains(&dim) {
+                    // `operator[]` on both, exactly as the propagation above.
+                    let shares = self
+                        .stages
+                        .corelet_shares(reference, dim)
+                        .unwrap_or_default();
+                    self.stages
+                        .set_corelet_shares(reference, dim, shares.clone());
+                    self.stages.set_corelet_shares(site, dim, shares);
+                }
+                if self.stages.row_shares(site, dim).is_some() {
+                    let shares = self.stages.row_shares(reference, dim)?;
+                    self.stages.set_row_shares(site, dim, shares);
+                } else if self.metadata.pe_sfp_split_dims.contains(&dim) {
+                    let shares = self.stages.pe_sfp_shares(reference, dim)?;
+                    self.stages.set_pe_sfp_shares(site, dim, shares);
+                }
+                break;
+            }
+            if original == self.stages.dim_value(site, dim)
+                && was_symbolic == self.stages.symbolic_dims(site).contains(&dim)
+            {
+                continue; // dim already maximized
+            }
+            loop {
+                // `isValidAssignment` — the constraints, then every stage above, then the epilogues,
+                // then the memory, each of which can veto the size just written.
+                self.stages.compound(site);
+                let mut valid =
+                    constraints_hold(&*self.stages, site, &ds_metadata, dim, allow_epilogue)?;
+                if valid {
+                    valid = self.propagate_upward::<A>(position, Some(dim))?;
+                }
+                if valid {
+                    valid = self.calculate_epilogues::<A>()?;
+                }
+                if valid {
+                    valid = alloc_all_mem::<A, _, _, _>(
+                        self.dsc,
+                        &*self.tree,
+                        &mut *self.metadata,
+                        &mut *self.allocs,
+                        &mut *self.trackers,
+                        lx,
+                        Commit::No,
+                    )?;
+                }
+                if valid {
+                    break;
+                }
+                // A symbolic dim gives up its symbol before it gives up any size.
+                if self.stages.symbolic_dims(site).contains(&dim) {
+                    self.stages.make_dim_not_symbolic(site, dim);
+                    continue;
+                }
+                // try decrementing the value and see if it fits
+                let mut decrement = 1;
+                if let Some(shares) = self.stages.row_shares(site, dim) {
+                    let cut = shares
+                        .into_iter()
+                        .map(|(corelet, rows)| {
+                            (
+                                corelet,
+                                rows.into_iter()
+                                    .map(|row| Extent(row.0 - decrement))
+                                    .collect(),
+                            )
+                        })
+                        .collect();
+                    self.stages.set_row_shares(site, dim, cut);
+                    decrement *= i64::from(A::PT_ROWS);
+                } else if self.metadata.pe_sfp_split_dims.contains(&dim) {
+                    let mut shares = self.stages.pe_sfp_shares(site, dim)?;
+                    for share in shares.values_mut() {
+                        share.pe = Extent(share.pe.0 - decrement);
+                        share.sfp = Extent(share.sfp.0 - decrement);
+                    }
+                    self.stages.set_pe_sfp_shares(site, dim, shares);
+                    decrement *= 2;
+                }
+                if self.metadata.cl_split_dims.contains(&dim) {
+                    let cut = self
+                        .stages
+                        .corelet_shares(site, dim)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|share| Extent(share.0 - decrement))
+                        .collect();
+                    self.stages.set_corelet_shares(site, dim, cut);
+                    decrement *= i64::from(A::CORELETS_PER_CORE);
+                }
+                let cut = Extent(self.stages.dim_value(site, dim).0 - decrement);
+                self.stages.set_dim_value(site, dim, cut);
+                // "Impossible to find a suitable value for … in datastage …".
+                if cut.0 < original.0 {
+                    return None;
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// `pruneMaxSymbolicVolumes(coreDs.ss_)` OVER BOTH HALVES OF EVERY NON-EXTERNAL DATASTAGE
+    /// (`ddc/ddcv1.cpp:1426-1432`), which is what makes the sizes just chosen the symbol's real bound.
+    fn prune_symbolic_volumes(&mut self) {
+        let core = StageSite::ss(Metadata::CORE_DSTGID);
+        for stage in self.stages.stages() {
+            if !self.metadata.datastages.contains_key(&stage) {
+                continue; // external
+            }
+            self.stages
+                .prune_max_symbolic_volumes(StageSite::ss(stage), core);
+            self.stages
+                .prune_max_symbolic_volumes(StageSite::el(stage), core);
+        }
+    }
+
+    /// SHRINKS EVERY TRANSFER'S UNIT-TIME CHUNK TO THE TILE IT NOW MOVES (`ddc/ddcv1.cpp:1434-1517`),
+    /// paying the size it gave up into the replication factor where the load is a splat.
+    ///
+    /// ⚠️ THREE OF THE REFERENCE'S BRANCHES ARE DEAD AND STAY OUT: `checkAndResetUnitTimeTransfer`
+    /// (its only callsite is commented out at `:11137` of the extract), `isChunkStridedLoad` (a literal
+    /// `false`), and `disableSmallerByteStoresLXSU` (`coreArch < RCUDD1A_ISA`, which is the lowest arm
+    /// of [`IsaGen`] and so never true).
+    fn reduce_unit_time_transfers<A: Arch>(&mut self) -> Option<()> {
+        let core = StageSite::ss(Metadata::CORE_DSTGID);
+        for node in self.tree.nodes_of_kind(NodeKind::Transfer) {
+            if self.metadata.external_nodes.contains(&node) {
+                continue;
+            }
+            let mut transfer = self.tree.transfer(node)?;
+            if matches!(
+                transfer.src.unit,
+                SenComponent::NoComponent | SenComponent::Constant
+            ) {
+                continue;
+            }
+            if !is_dsc_memory(transfer.src.storage) && !is_dsc_memory(transfer.dsts.first().storage)
+            {
+                continue;
+            }
+            if transfer.src.data.my_lds_idx.is_none() && transfer.src.data.is_constant() {
+                continue;
+            }
+            // unit time transfer is only applicable to src unit.
+            let mut ds_size_per_dim = self.tree.block_transfer_sizes(node, transfer.src.unit);
+            let src = transfer.src.data.my_lds_idx?;
+            let format = self.dsc.lds_format(src)?;
+            let generic = generic_comp(transfer.src.unit)?;
+            let regular = self.dsc.scaled_category(src) == ScaledLds::Regular;
+            let do_splat = generic == GenericComp::Lxlu
+                || (generic == GenericComp::L0lu
+                    && regular
+                    && matches!(format, DataFormat::Sen169Fp16 | DataFormat::Sen143Fp8));
+            // do not perform shrinking if we have already manipulated the transfer to achieve 16b splat
+            if do_splat
+                && format == DataFormat::IeeeFp32
+                && transfer.replication_factor == ReplicationFactor(8)
+            {
+                continue;
+            }
+            let last_dst = transfer.dsts.get(transfer.dsts.len().checked_sub(1)?)?.unit;
+            let allowed = matches!(generic, GenericComp::Lxlu | GenericComp::L0lu)
+                || last_dst == SenComponent::Lxsu;
+            if !allowed {
+                continue;
+            }
+
+            let mut reduced = false;
+            let mut maximized = BTreeSet::new();
+            let mut reduce_2b = true;
+            // reduce unit transfer size if it exceeds data stage size
+            for index in 0..transfer.unit_time_transfer_chunk_size.len() {
+                let dim = transfer.unit_time_transfer_chunk_size[index].size_dim.dim;
+                let tile = ds_size_per_dim.get(&dim).copied()?.0;
+                // "Datastage size requiring unit time transfer with holes".
+                if reduced && tile != 1 {
+                    return None;
+                }
+                let scale = self.dsc.lds_scale(src, dim)?;
+                if tile > 1
+                    && (!scale.is_broadcast()
+                        || (scale == LdsScale::StickBroadcast && last_dst == SenComponent::Lxsu))
+                {
+                    reduce_2b = false;
+                }
+                let size = i64::try_from(
+                    transfer.unit_time_transfer_chunk_size[index]
+                        .size_dim
+                        .size
+                        .0,
+                )
+                .ok()?;
+                if tile < size {
+                    let padding = if self
+                        .stages
+                        .padding_dims(core)
+                        .iter()
+                        .any(|(key, _)| *key == dim)
+                    {
+                        PadType::PaddedFullSpanWUnneeded
+                    } else {
+                        PadType::NoPad
+                    };
+                    let padded = self
+                        .stages
+                        .extent(core, dim, DimSample::WHOLE, padding, SymbolicRead::Max)
+                        .0;
+                    let whole = self
+                        .stages
+                        .extent(
+                            core,
+                            dim,
+                            DimSample::WHOLE,
+                            PadType::NoPad,
+                            SymbolicRead::Max,
+                        )
+                        .0;
+                    // A chunk that already spans the whole padded core dim is not shrunk; it is the
+                    // dim the load walks, and it may only be that once.
+                    if index != transfer.unit_time_transfer_chunk_size.len() - 1
+                        && whole == tile
+                        && size == padded
+                    {
+                        // "Cannot maximize a dimension more than once".
+                        if !maximized.insert(dim) {
+                            return None;
+                        }
+                    } else {
+                        // "Datastage size not divisor of unit time trasfer".
+                        if tile == 0 || size % tile != 0 {
+                            return None;
+                        }
+                        if do_splat {
+                            transfer.replication_factor = ReplicationFactor(
+                                transfer.replication_factor.0 * u64::try_from(size / tile).ok()?,
+                            );
+                        }
+                        transfer.unit_time_transfer_chunk_size[index].size_dim.size =
+                            Elements(u64::try_from(tile).ok()?);
+                        reduced = true;
+                    }
+                }
+                let size = i64::try_from(
+                    transfer.unit_time_transfer_chunk_size[index]
+                        .size_dim
+                        .size
+                        .0,
+                )
+                .ok()?;
+                // `DT_CHECK(dsDim % size == 0)` — the L0 load may not leave a partial chunk.
+                if transfer.src.unit == SenComponent::L0lu && (size == 0 || tile % size != 0) {
+                    return None;
+                }
+                if size == 0 {
+                    return None;
+                }
+                ds_size_per_dim.insert(dim, Extent(tile / size));
+            }
+
+            // fill replicationFactor. Splat is required for sen1.5 because PT cols read different 16B
+            // from w-fifo
+            if A::GEN >= IsaGen::Sen1p5 && regular && generic == GenericComp::L0lu {
+                let mut load = u64::from(transfer.unit_time_transfer_num_chunks.0);
+                for entry in &transfer.unit_time_transfer_chunk_size {
+                    load *= entry.size_dim.size.0;
+                }
+                #[expect(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "the reference's own float division, truncated into an int factor"
+                )]
+                let factor = (A::L0_PT_BW_PER_SLICE.0 as f64
+                    / (f64::from(format.bits().0) / 8.0)
+                    / load as f64) as u64;
+                transfer.replication_factor = ReplicationFactor(factor);
+            }
+            if reduce_2b {
+                // reduce all remaining dimensions in unitTimeTransfer
+                for index in 0..transfer.unit_time_transfer_chunk_size.len() {
+                    let size = transfer.unit_time_transfer_chunk_size[index].size_dim.size;
+                    if do_splat {
+                        transfer.replication_factor =
+                            ReplicationFactor(transfer.replication_factor.0 * size.0);
+                    }
+                    transfer.unit_time_transfer_chunk_size[index].size_dim.size = Elements(1);
+                }
+            }
+            self.tree.set_transfer(node, transfer)?;
+        }
+        Some(())
+    }
+}
+
+/// Replaces: e307_exploreAssignDataStages
+///
+/// CHOOSES EVERY DATASTAGE'S TILE SIZE (`ddc/ddcv1.cpp:942`): it sorts each loop's dims into layout
+/// order and turns that order into constraints, ranks the datastages smallest-first, gives each the
+/// smallest size its own transfers and computes can work in, then grows every non-minimizing one until
+/// the next size up no longer allocates. [`None`] is any of its `DT_ERROR`s and `DT_CHECK`s.
+///
+/// ⛔ REUSES ENTRY 001 RATHER THAN RE-DECIDING CONSTRAINTS: `checkConstraints` at `:792` and its inner
+/// `checkConstraintsImpl` at `:825` are that entry, reached here through [`constraints_hold`].
+pub fn explore_assign_data_stages<A: Arch, D, T, S, M>(
+    dsc: &D,
+    tree: &mut T,
+    stages: &mut S,
+    metadata: &mut Metadata,
+    allocs: &mut AllocArena,
+    trackers: &mut M,
+    global: &mut GlobalData,
+    lx: LxTrackers,
+) -> Option<()>
+where
+    D: ExploreDsc
+        + LabeledDsIndices
+        + Masking
+        + LdsSticks
+        + Dsc
+        + Placement
+        + StorageNames
+        + StageSizes
+        + ?Sized,
+    T: ExploreTree + ?Sized,
+    S: ExploreStages + ?Sized,
+    M: MemTrackers + ?Sized,
+{
+    global.data_stage_exploration_done = true;
+    let mut explore = Explore {
+        dsc,
+        tree,
+        stages,
+        metadata,
+        allocs,
+        trackers,
+        relevant_dims: Vec::new(),
+        sorted_ds: Vec::new(),
+    };
+    let (relevant_dims, positions) = explore.relevant_dims()?;
+    explore.relevant_dims = relevant_dims;
+    // collect all loops from schedule tree
+    let mut loops = Vec::new();
+    for node in explore.tree.nodes_of_kind(NodeKind::Loop) {
+        loops.push(explore.tree.as_loop(node)?);
+    }
+    explore.seed_loop_constraints(&loops, &positions)?;
+    explore.disallow_symbolic_in_direct_memories()?;
+    explore.sorted_ds = explore.rank_datastages(&loops)?;
+    explore.swap_relative_constraints()?;
+    explore.assign_minimum_sizes::<A>(&loops)?;
+    // "Epilogue of epilogue needed in setting minimum datastage sizes".
+    if !explore.calculate_epilogues::<A>()? {
+        return None;
+    }
+    // "Cannot allocate even the smallest size".
+    if !alloc_all_mem::<A, _, _, _>(
+        explore.dsc,
+        &*explore.tree,
+        &mut *explore.metadata,
+        &mut *explore.allocs,
+        &mut *explore.trackers,
+        lx,
+        Commit::No,
+    )? {
+        return None;
+    }
+    // explore data stage parameters to maximize
+    for position in 0..explore.sorted_ds.len() {
+        let Some(stage) = explore.sorted_ds[position] else {
+            continue; // external
+        };
+        let Some(ds_metadata) = explore.metadata.datastages.get(&stage) else {
+            continue; // external
+        };
+        if ds_metadata.strategy == Strategy::Minimize {
+            continue;
+        }
+        let allow_epilogue = ds_metadata.allow_epilogue;
+        // first maximize all dims without considering epilogues
+        explore.explore_maximize::<A>(position, false, lx)?;
+        // ⚠️ TEMP IN THE REFERENCE: epilogue exploration is disallowed wherever there is an opaque op,
+        // because codegen for that pairing is not fully supported.
+        if explore.metadata.opaque_ops.is_empty() && allow_epilogue {
+            explore.explore_maximize::<A>(position, true, lx)?;
+        }
+    }
+    explore.prune_symbolic_volumes();
+    // "It should have been possible to allocate".
+    if !alloc_all_mem::<A, _, _, _>(
+        explore.dsc,
+        &*explore.tree,
+        &mut *explore.metadata,
+        &mut *explore.allocs,
+        &mut *explore.trackers,
+        lx,
+        Commit::IfValid,
+    )? {
+        return None;
+    }
+    explore.reduce_unit_time_transfers::<A>()
+}
+
+/// Replaces: e308_prepDsc
+///
+/// PREPARES A DSC THAT UPSTREAM TOOLS LEFT UNDERSPECIFIED (`ddc/ddcv1.cpp:2019`): it fixes the DSC2
+/// corelet count, picks the row split dim off the PT input's slice-less stick, calls entry 130 for the
+/// PE/SFP split, inserts a `GENERIC_PARTIAL_REDUCTION` after every op whose reduced dims are split
+/// across cores, swaps `EXX2` for `EXX2_ZEROMEAN`, finalizes each external datastage, and mints the two
+/// internal tensors restickify and MXFP4 batch-matmul need. [`None`] is one of its three `DT_CHECK`s.
+///
+/// ⛔ THE `EXX2` BACKUP IS WRITTEN TWICE WHERE BOTH DECLARATIONS FIRE, so it ends up holding
+/// `EXX2_ZEROMEAN` and not `EXX2` — a reference quirk (`:2070` then `:2076`) and not a simplification.
+pub fn prep_dsc<A: Arch, D, S>(
+    dsc: &mut D,
+    stages: &mut S,
+    metadata: &mut Metadata,
+    allocs: &AllocArena,
+    ln32: Ln32,
+) -> Option<()>
+where
+    D: PrepDsc + CoreletShapes + Masking + LdsSticks + Dsc + DataStages,
+    S: ExploreStages + ?Sized,
+{
+    dsc.set_corelets_used_dsc2(dsc.corelets_used());
+
+    let first = dsc.compute_ops().first()?.clone();
+    let use_pt =
+        if first.ex_unit == SenComponent::Pt || first.op_func == Some(OpFunc::ReStickifyOpHbm) {
+            UsePt::Yes
+        } else {
+            UsePt::No
+        };
+    if use_pt == UsePt::Yes {
+        // `getStickSizes(dsType, false, true)` — the stick WITHOUT its slices, which the PT splits
+        // across its rows. `DT_CHECK(size() == 1)`: exactly one dim survives that slicing.
+        let dims = dsc.stick_dims(*first.inputs.first()?);
+        let without_slices = stick_sizes(
+            &dims,
+            StickPart::CrossSlice(SliceElems::per_stick::<A>(&dims)?),
+        );
+        if without_slices.len() != 1 {
+            return None;
+        }
+        metadata.row_split_dim = Some(without_slices.first()?.0);
+    }
+
+    // Entry 130, on the chunk stage. `computeOp_.at(0)`'s INVALID op func or format leaves the split to
+    // the chunk stage's own request (`ddc/ddcv1.cpp:1826-1840`), which is what an absent half means.
+    let chunk = stages.dims(StageSite::ss(Metadata::CHUNK_DSTGID))?;
+    metadata.pe_sfp_split_dims = match (first.op_func, first.format) {
+        (Some(op_func), Some(format)) => get_pe_sfp_split_dim::<A, _>(
+            &ComputeOp { op_func, format },
+            &chunk,
+            *first.inputs.first()?,
+            dsc,
+            dsc,
+            ln32,
+        )?,
+        _ => PrimaryDim::ALL
+            .into_iter()
+            .filter(|&dim| chunk.is_pe_sfp_split(dim))
+            .collect(),
+    };
+
+    // A dim every input spans and no output does is REDUCED; if the work is split across cores along
+    // one of those, the partial results have to be summed back together.
+    let mut index = 0;
+    while index < dsc.compute_ops().len() {
+        let op = dsc.compute_ops().get(index)?.clone();
+        let mut reduced = BTreeSet::new();
+        for input in &op.inputs {
+            reduced.extend(dsc.non_broadcast_dims(*input));
+        }
+        for output in &op.outputs {
+            for dim in dsc.non_broadcast_dims(*output) {
+                reduced.remove(&dim);
+            }
+        }
+        if !reduced.iter().any(|dim| dsc.splits_across_cores(*dim)) {
+            index += 1;
+            continue;
+        }
+        // `DT_CHECK(compOp.outputLabeledDs.size() == 1)`.
+        if op.outputs.len() != 1 {
+            return None;
+        }
+        let lds = *op.outputs.first()?;
+        dsc.insert_compute_op(
+            index + 1,
+            DscComputeOp {
+                op_func: Some(OpFunc::GenericPartialReduction),
+                ex_unit: SenComponent::NoComponent,
+                format: op.format,
+                inputs: vec![lds],
+                outputs: vec![lds],
+            },
+        )?;
+        index += 2; // skip newly inserted op
+    }
+
+    if dsc.compute_ops().first()?.op_func == Some(OpFunc::Exx2) {
+        if dsc.declares_zero_mean_constant() {
+            metadata.op_func_backup = dsc.compute_ops().first()?.op_func;
+            dsc.set_op_func(0, OpFunc::Exx2Zeromean);
+        }
+        if dsc.op_declares_zero_mean(0) {
+            metadata.op_func_backup = dsc.compute_ops().first()?.op_func;
+            dsc.set_op_func(0, OpFunc::Exx2Zeromean);
+        }
+    }
+
+    for stage in stages.stages() {
+        stages.finalize_external_stage(
+            stage,
+            &metadata.cl_split_dims,
+            use_pt,
+            metadata.row_split_dim,
+            &metadata.pe_sfp_split_dims,
+        )?;
+        stages.clear_deprecated_dims(StageSite::ss(stage));
+        stages.clear_deprecated_dims(StageSite::el(stage));
+    }
+    // ⛔ AFTER the finalize loop, not before: what seeds this is the corelet split that loop wrote.
+    for dim in dsc.corelet_split_dims(Metadata::CORE_DSTGID) {
+        metadata.cl_split_dims.insert(dim);
+    }
+
+    for index in 0..dsc.compute_ops().len() {
+        let op_func = dsc.compute_ops().get(index)?.op_func;
+        if op_func == Some(OpFunc::ReStickifyOpLx) || op_func == Some(OpFunc::ReStickifyOpHbm) {
+            mint_internal_lds(dsc, metadata, allocs, index, InternalLds::Input)?;
+        }
+    }
+    for index in 0..dsc.compute_ops().len() {
+        if dsc.compute_ops().get(index)?.op_func == Some(OpFunc::BatchmatmulMxfp4WFwd) {
+            mint_internal_lds(dsc, metadata, allocs, index, InternalLds::Kernel)?;
+        }
+    }
+    // The `LAYERNORM_SCALE` block at :2213-2277 is `#if 0` — stick-packing is disabled, so it is dead.
+    Some(())
+}
+
+/// ONE INTERNAL TENSOR MINTED BESIDE ITS SOURCE — entry 308's two near-identical blocks
+/// (`ddc/ddcv1.cpp:2100-2211`), differing in the operand they clone, the stick layout they build and
+/// whose parent the dummy transfer lands under.
+fn mint_internal_lds<D>(
+    dsc: &mut D,
+    metadata: &mut Metadata,
+    allocs: &AllocArena,
+    op: usize,
+    kind: InternalLds,
+) -> Option<()>
+where
+    D: PrepDsc + ?Sized,
+{
+    /// `if (first) size /= 8;` — the leading stick size of EACH list is that side's slice count, and
+    /// the internal tensor holds one slice of it.
+    fn one_slice_of_first(sizes: Vec<Elements>) -> Vec<Elements> {
+        sizes
+            .into_iter()
+            .enumerate()
+            .map(|(position, size)| {
+                if position == 0 {
+                    Elements(size.0 / 8)
+                } else {
+                    size
+                }
+            })
+            .collect()
+    }
+
+    // `_internalInput` clones the DATA operand, `_internalKernel` the KERNEL one.
+    let source = match kind {
+        InternalLds::Input => *dsc.compute_ops().get(op)?.inputs.first()?,
+        InternalLds::Kernel => *dsc.compute_ops().get(op)?.inputs.get(1)?,
+    };
+    let output = *dsc.compute_ops().get(op)?.outputs.first()?;
+    let entry = dsc.lds_entry(source)?;
+    let new_lds = add_new_lds(dsc, metadata, &entry);
+    dsc.push_op_input(op, new_lds);
+    dsc.append_lds_name(new_lds, kind);
+    dsc.set_lds_internal(new_lds);
+    if kind == InternalLds::Kernel {
+        dsc.set_lds_word_length(new_lds, WordLength(2));
+        dsc.set_lds_format(new_lds, DataFormat::Bfloat16);
+        dsc.set_lds_scaled_category(new_lds, ScaledLds::Regular);
+        dsc.copy_mx_info(new_lds, *dsc.compute_ops().get(op)?.inputs.first()?);
+    }
+
+    // The internal layout is the SOURCE's; the sticks are the OUTPUT's, then — for `_internalInput`
+    // only — the source's appended behind them, each side's leading size cut to one slice.
+    dsc.set_internal_layout_from(source);
+    let mut stick_dims = dsc.stick_order(output);
+    let mut stick_sizes = match kind {
+        InternalLds::Input => one_slice_of_first(dsc.stick_sizes_of(output)),
+        InternalLds::Kernel => dsc.stick_sizes_of(output),
+    };
+    if kind == InternalLds::Input {
+        stick_dims.extend(dsc.stick_order(source));
+        stick_sizes.extend(one_slice_of_first(dsc.stick_sizes_of(source)));
+    }
+    for dim in stick_dims {
+        dsc.push_internal_stick_dim(dim, StickRepl::ONE);
+    }
+    for size in stick_sizes {
+        dsc.push_internal_stick_size(size);
+    }
+
+    // The LX allocation is CLONED beside its original, and a dummy transfer stands in as the clone's
+    // only user so the placement passes see the internal tensor arriving from nowhere.
+    let base = dsc.copy_lx_mem_org(new_lds, source)?;
+    let sibling = *allocs.get(&base)?.alloc_users.first()?;
+    let mut clone = allocs.get(&base)?.clone();
+    clone.name = NodeName(format!("{}{}", clone.name.0, kind.suffix()));
+    clone.alloc_users.clear();
+    clone.lds = Some(new_lds);
+    let transfer = TransferNode {
+        name: NodeName(format!("dummy_transfer_to_lx{}", kind.suffix())),
+        src: Operand {
+            unit: SenComponent::NoComponent,
+            storage: SenComponent::NoComponent,
+            data: DataInfo::default(),
+        },
+        dsts: Dsts::new(
+            Via {
+                loc: DataLocation {
+                    unit: SenComponent::NoComponent,
+                    storage: SenComponent::Lx,
+                },
+                lds: Some(new_lds),
+            }
+            .operand(),
+            Vec::new(),
+        ),
+        replication_factor: ReplicationFactor::ONE,
+        unit_time_transfer_chunk_size: Vec::new(),
+        unit_time_transfer_num_chunks: NumChunks::ONE,
+        padding: TransferPadding::default(),
+        src_indirect: None,
+        dst_indirect: None,
+    };
+    // ⛔ THE TWO BLOCKS DISAGREE ON WHOSE PARENT THE TRANSFER LANDS UNDER and both are kept: the
+    // sibling is `transferInput0` either way, but `_internalKernel` names the ALLOCATION's parent
+    // (`:2210-2211`) where `_internalInput` names the TRANSFER's (`:2155-2157`).
+    let under = match kind {
+        InternalLds::Input => InsertUnder::ParentOfTransfer(sibling),
+        InternalLds::Kernel => InsertUnder::ParentOfAlloc(base),
+    };
+    // The transfer goes in first only so that the clone can name it as its user; the two splice points
+    // are relative to unrelated siblings, so neither insert can move the other's.
+    let minted = dsc.insert_transfer_after(under, sibling, transfer)?;
+    clone.alloc_users.push(minted);
+    let new_alloc = dsc.insert_alloc_before(base, clone)?;
+    dsc.set_lx_alloc(new_lds, new_alloc);
+    dsc.set_lx_present(new_lds, false);
+    Some(())
+}
+
+/// Replaces: e309_attachToPrefilledSchedule
+///
+/// TAKES OVER A SCHEDULE SOMEONE ELSE ALREADY BUILT (`ddc/ddcv1.cpp:2280`): every node becomes an
+/// external node, every LX allocation gets its corelet start address when element offsets are
+/// datastage-based, every transfer's `data_connect=` slot is registered for the DDL to fill later, and
+/// each core/chunk loop is indexed by the dims it walks. [`None`] is any of its six `DT_ERROR`s.
+///
+/// ⛔ THE LDS BOUND IS ONE-SIDED AND STAYS THAT WAY: `ldsIdx >= labeledDs_.size()` is refused and
+/// `ldsIdx < 0` is NOT (`:2331`), so a redirected end naming no labelled DS keys the map at [`None`].
+pub fn attach_to_prefilled_schedule<A: Arch, D, T, S>(
+    dsc: &D,
+    tree: &T,
+    stages: &S,
+    metadata: &mut Metadata,
+    allocs: &mut AllocArena,
+    offsets: ElemOffsets,
+) -> Option<()>
+where
+    D: ExploreDsc + Placement + StageSizes + LdsSticks + OffsetSizes + ?Sized,
+    T: ExploreTree + ?Sized,
+    S: ExploreStages + ?Sized,
+{
+    // "Expected atleast core and chunk data stage parameters" — the two names DDC's own indices mean.
+    if stages.stages().len() < 2
+        || stages.label(Metadata::CORE_DSTGID) != Some(StageLabel::Core)
+        || stages.label(Metadata::CHUNK_DSTGID) != Some(StageLabel::Chunk)
+    {
+        return None;
+    }
+    metadata.below_lx_schedule_insert_block = None;
+    for node in tree.all_nodes() {
+        metadata.external_nodes.insert(node);
+        match tree.tree_node(node)? {
+            TreeNode::Allocate(alloc) => {
+                let (component, lds) = {
+                    let an = allocs.get(&alloc)?;
+                    (an.component, an.lds)
+                };
+                // "External allocate node improperly set" / "Missing memorg for external allocate
+                // node" / "External allocate node not connected to memorg".
+                let lds = lds?;
+                if !dsc.holds_lds(lds) || !is_dsc_memory(component) {
+                    return None;
+                }
+                if dsc.lds_alloc(lds, component)? != alloc {
+                    return None;
+                }
+                // `memorg.isPresent = true;` is COMMENTED OUT at :2318 and so is not done here.
+                if offsets.is_datastage() && component == SenComponent::Lx {
+                    calculate_cl_start_address::<A, _>(dsc, metadata, allocs, alloc)?;
+                }
+            }
+            TreeNode::Other(NodeKind::Transfer) => {
+                let transfer = tree.transfer(node)?;
+                // Both `dstVias_.empty()` and `dstLdsAndLoopOffsets_.empty()` are unspellable here,
+                // which is what makes the inner `DT_ERROR` at :2323 unreachable through this type.
+                let mut end = TransferEnd::Src;
+                let mut lds = transfer.src.data.my_lds_idx;
+                let mut storage = transfer.src.storage;
+                if matches!(
+                    storage,
+                    SenComponent::NoComponent | SenComponent::Hbm | SenComponent::Constant
+                ) {
+                    end = TransferEnd::FirstDst;
+                    lds = transfer.dsts.first().data.my_lds_idx;
+                    storage = transfer.dsts.first().storage;
+                }
+                // "External transfer node improperly set" — the kind, the bound and the storage.
+                if !matches!(
+                    transfer.transfer_kind(),
+                    TransferKind::ConstantToTensor
+                        | TransferKind::TensorToTensor
+                        | TransferKind::NoTransferToTensor
+                        | TransferKind::NoTransferFromTensor
+                ) {
+                    return None;
+                }
+                if lds.is_some_and(|lds| !dsc.holds_lds(lds)) {
+                    return None;
+                }
+                metadata.prefilled_external_transfer_data_connects.insert(
+                    (lds, ExternalStorage::of(storage)?),
+                    DataConnectSlot {
+                        transfer: node,
+                        end,
+                    },
+                );
+            }
+            TreeNode::Other(NodeKind::Loop) => {
+                for (dim, _kind) in tree.loop_dims(tree.as_loop(node)?) {
+                    metadata
+                        .dim_to_core_chunk_loops
+                        .entry(dim)
+                        .or_default()
+                        .push(node);
+                }
+            }
+            TreeNode::Other(NodeKind::Block) => {
+                if tree.node_name(node)?.0 == "lx_below_schedule" {
+                    metadata.below_lx_schedule_insert_block = tree.as_block(node);
+                }
+            }
+            TreeNode::Other(_) => {}
+        }
+    }
+    // "Missing below-lx schedule insert block".
+    metadata.below_lx_schedule_insert_block.map(|_| ())
+}
 // crustify:todo: e379_run_v1
 //   authority : ddc/ddcv1.cpp:3692  (109 body lines, level 7)
 //   class     : Ddc
@@ -3675,6 +6078,7 @@ mod tests_e132_e136 {
                 dsts: Dsts::new(operand(dst, Some(0)), Vec::new()),
                 replication_factor: ReplicationFactor::ONE,
                 unit_time_transfer_chunk_size: Vec::new(),
+                unit_time_transfer_num_chunks: NumChunks::ONE,
             }
         }
         fn computes(&self) -> Vec<NodeId> {
@@ -3893,6 +6297,7 @@ mod tests_e132_e136 {
 
 #[cfg(test)]
 mod tests_e124_e131 {
+    use crate::schedule::dsc2::NumChunks;
     use super::{
         AllocArena, AllocLive, ComputeArena, ComputeMasks, ComputeOp, ConstantData, CoreletShapes,
         DfsIndex,
@@ -4101,6 +6506,7 @@ mod tests_e124_e131 {
             dsts: Dsts::new(operand(SenComponent::Lxlu), Vec::new()),
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         };
         let operands = TransferOperands::ConstantToTensor(Some(TransferLds {
             stick: StickDims(vec![(PrimaryDim::Out, Elements(64))]),
@@ -4133,6 +6539,7 @@ mod tests_e124_e131 {
             dsts: Dsts::new(operand(SenComponent::Constant), Vec::new()),
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         };
         let operands = TransferOperands::ConstantToConstant(ConstantData {
             elements: NonZeroU64::new(8).expect("8 is not zero"),
@@ -4953,6 +7360,7 @@ mod tests_e258_e263 {
             ),
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         };
         let tree = Tree {
             nodes: vec![NodeId(0)],
@@ -5082,6 +7490,7 @@ mod tests_e258_e263 {
             ),
             replication_factor: ReplicationFactor::ONE,
             unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
         };
         let tree = Tree {
             nodes: vec![NodeId(0)],
@@ -5174,6 +7583,7 @@ mod tests_e258_e263 {
                     ),
                     replication_factor: ReplicationFactor::ONE,
                     unit_time_transfer_chunk_size: Vec::new(),
+                    unit_time_transfer_num_chunks: NumChunks::ONE,
                 },
             )]),
             ..Tree::default()
@@ -5271,6 +7681,942 @@ mod tests_e258_e263 {
         assert_eq!(
             global.loops_below_chunk_boundary,
             BTreeSet::from([LOOP, LoopId(NodeId(2))])
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e307_e309 {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PaddedExtent;
+    use crate::schedule::ddc::fold::ScheduleTree;
+    use crate::schedule::ddc::transformation_util::{LabeledDsEntry, TreeLdsSlot};
+    use crate::schedule::dsc2::{AllocLayout, AllocPlacement, LayoutDims};
+
+    /// The three datastages every fixture names: DDC's own core and chunk indices, and an external
+    /// stage above them for the loop's numerator.
+    const CORE: DatastageId = Metadata::CORE_DSTGID;
+    const CHUNK: DatastageId = Metadata::CHUNK_DSTGID;
+    const EXT: DatastageId = DatastageId(2);
+    const LDS0: LdsIdx = LdsIdx(0);
+    const LDS1: LdsIdx = LdsIdx(1);
+    /// The loop, the compute under it, and the three nodes entry 309's walk classifies.
+    const LOOP: LoopId = LoopId(NodeId(1));
+    const COMPUTE: NodeId = NodeId(2);
+    const ALLOC: AllocId = AllocId(3);
+    const ALLOC_NODE: NodeId = NodeId(3);
+    const TRANSFER: NodeId = NodeId(4);
+    const BLOCK: NodeId = NodeId(5);
+
+    fn cl0() -> Corelet {
+        Corelet::at::<0>()
+    }
+
+    // ─── the datastage parameters ───────────────────────────────────────────────────────────────
+
+    /// ONE `DataStructDims` SNAPSHOT — every dim at the extent the site holds it at.
+    struct Dims(BTreeMap<PrimaryDim, Extent>);
+
+    impl Stage for Dims {
+        fn is_symbolic(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_corelet_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_row_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_pe_sfp_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn splits_any_row(&self) -> bool {
+            false
+        }
+        fn extent(&self, dim: PrimaryDim, _at: Sample) -> Extent {
+            self.0.get(&dim).copied().unwrap_or(Extent(0))
+        }
+        fn padded_extent(&self, _dim: PrimaryDim, _at: Sample) -> Option<PaddedExtent> {
+            None
+        }
+    }
+
+    /// THE `dataStageParam_` TABLE — one extent per (site, dim), plus a log of the shape-changing
+    /// calls the ports make on it.
+    #[derive(Default)]
+    struct Stages {
+        order: Vec<DatastageId>,
+        labels: BTreeMap<DatastageId, StageLabel>,
+        external: BTreeSet<DatastageId>,
+        values: BTreeMap<(StageSite, PrimaryDim), Extent>,
+        finalized: Vec<DatastageId>,
+        compounded: Vec<StageSite>,
+    }
+
+    impl ExploreStages for Stages {
+        type Dims = Dims;
+        fn stages(&self) -> Vec<DatastageId> {
+            self.order.clone()
+        }
+        fn label(&self, stage: DatastageId) -> Option<StageLabel> {
+            self.labels.get(&stage).copied()
+        }
+        fn is_external(&self, stage: DatastageId) -> bool {
+            self.external.contains(&stage)
+        }
+        fn dims(&self, at: StageSite) -> Option<Self::Dims> {
+            self.order.contains(&at.stage).then(|| {
+                Dims(
+                    self.values
+                        .iter()
+                        .filter(|((site, _), _)| *site == at)
+                        .map(|((_, dim), extent)| (*dim, *extent))
+                        .collect(),
+                )
+            })
+        }
+        fn extent(
+            &self,
+            at: StageSite,
+            dim: PrimaryDim,
+            _sample: DimSample,
+            _padding: PadType,
+            _symbolic: SymbolicRead,
+        ) -> Extent {
+            self.dim_value(at, dim)
+        }
+        fn dim_value(&self, at: StageSite, dim: PrimaryDim) -> Extent {
+            self.values.get(&(at, dim)).copied().unwrap_or(Extent(0))
+        }
+        fn set_dim_value(&mut self, at: StageSite, dim: PrimaryDim, value: Extent) {
+            self.values.insert((at, dim), value);
+        }
+        fn corelet_shares(&self, _at: StageSite, _dim: PrimaryDim) -> Option<Vec<Extent>> {
+            None
+        }
+        fn set_corelet_shares(&mut self, _at: StageSite, _dim: PrimaryDim, _shares: Vec<Extent>) {}
+        fn row_shares(
+            &self,
+            _at: StageSite,
+            _dim: PrimaryDim,
+        ) -> Option<BTreeMap<Corelet, Vec<Extent>>> {
+            None
+        }
+        fn set_row_shares(
+            &mut self,
+            _at: StageSite,
+            _dim: PrimaryDim,
+            _shares: BTreeMap<Corelet, Vec<Extent>>,
+        ) {
+        }
+        fn pe_sfp_shares(
+            &self,
+            _at: StageSite,
+            _dim: PrimaryDim,
+        ) -> Option<BTreeMap<Corelet, PeSfpShares>> {
+            None
+        }
+        fn set_pe_sfp_shares(
+            &mut self,
+            _at: StageSite,
+            _dim: PrimaryDim,
+            _shares: BTreeMap<Corelet, PeSfpShares>,
+        ) {
+        }
+        fn padding_dims(&self, _at: StageSite) -> Vec<(PrimaryDim, DimPadding)> {
+            Vec::new()
+        }
+        fn set_padding(&mut self, _at: StageSite, _dim: PrimaryDim, _padding: DimPadding) {}
+        fn symbolic_dims(&self, _at: StageSite) -> Vec<PrimaryDim> {
+            Vec::new()
+        }
+        fn symbolic_info(&self, _at: StageSite, _dim: PrimaryDim) -> Option<SymbolicDimInfo> {
+            None
+        }
+        fn set_symbolic_info(&mut self, _at: StageSite, _dim: PrimaryDim, _info: SymbolicDimInfo) {}
+        fn make_dim_symbolic(&mut self, _at: StageSite, _from: StageSite, _dim: PrimaryDim) {}
+        fn make_dim_not_symbolic(&mut self, _at: StageSite, _dim: PrimaryDim) {}
+        fn prune_max_symbolic_volumes(&mut self, _at: StageSite, _from: StageSite) {}
+        fn compound(&mut self, at: StageSite) {
+            self.compounded.push(at);
+        }
+        fn copy_ss_to_el(&mut self, stage: DatastageId) {
+            let copied: Vec<(PrimaryDim, Extent)> = self
+                .values
+                .iter()
+                .filter(|((site, _), _)| *site == StageSite::ss(stage))
+                .map(|((_, dim), extent)| (*dim, *extent))
+                .collect();
+            for (dim, extent) in copied {
+                self.values.insert((StageSite::el(stage), dim), extent);
+            }
+        }
+        fn mark_epilogue_name(&mut self, _stage: DatastageId) {}
+        fn clear_deprecated_dims(&mut self, _at: StageSite) {}
+        fn finalize_external_stage(
+            &mut self,
+            stage: DatastageId,
+            _cl_split: &BTreeSet<PrimaryDim>,
+            _use_pt: UsePt,
+            _row_split: Option<PrimaryDim>,
+            _pe_sfp_split: &BTreeSet<PrimaryDim>,
+        ) -> Option<()> {
+            self.finalized.push(stage);
+            Some(())
+        }
+    }
+
+    // ─── the schedule tree ──────────────────────────────────────────────────────────────────────
+
+    /// ONE SCHEDULE TREE, stated as the tables the two walks read off it.
+    #[derive(Default)]
+    struct Tree {
+        nodes: Vec<NodeId>,
+        kinds: BTreeMap<NodeId, NodeKind>,
+        allocs: BTreeMap<AllocId, NodeId>,
+        dims: BTreeMap<LoopId, Vec<(PrimaryDim, MetaDimKind)>>,
+        staging: BTreeMap<LoopId, LoopStaging>,
+        under: BTreeMap<NodeId, Vec<NodeId>>,
+        computes: BTreeMap<NodeId, DscComputeOp>,
+        transfers: BTreeMap<NodeId, TransferNode>,
+        names: BTreeMap<NodeId, NodeName>,
+    }
+
+    impl ScheduleWalk for Tree {
+        fn loops_under(&self, _from: BlockId) -> Vec<LoopId> {
+            Vec::new()
+        }
+        fn nodes_of_kind(&self, kind: NodeKind) -> Vec<NodeId> {
+            self.nodes
+                .iter()
+                .copied()
+                .filter(|node| self.kinds.get(node) == Some(&kind))
+                .collect()
+        }
+        fn allocates(&self) -> Vec<AllocId> {
+            self.allocs.keys().copied().collect()
+        }
+        fn nodes_of_kind_under(
+            &self,
+            _from: Option<NodeId>,
+            kind: NodeKind,
+            _unit: SenComponent,
+        ) -> Vec<NodeId> {
+            self.nodes_of_kind(kind)
+        }
+        fn prev_of_alloc(&self, _alloc: AllocId) -> Option<NodeId> {
+            None
+        }
+        fn transfer(&self, node: NodeId) -> Option<TransferNode> {
+            self.transfers.get(&node).cloned()
+        }
+        fn as_loop(&self, node: NodeId) -> Option<LoopId> {
+            (self.kinds.get(&node) == Some(&NodeKind::Loop)).then_some(LoopId(node))
+        }
+        fn prev(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+        fn owner_loop(&self, _node: NodeId) -> Option<LoopId> {
+            None
+        }
+        fn loop_dims(&self, at: LoopId) -> Vec<(PrimaryDim, MetaDimKind)> {
+            self.dims.get(&at).cloned().unwrap_or_default()
+        }
+    }
+
+    impl ScheduleTree for Tree {
+        fn kind(&self, node: NodeId) -> NodeKind {
+            self.kinds.get(&node).copied().unwrap_or(NodeKind::Block)
+        }
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+        fn children(&self, _block: BlockId) -> Vec<NodeId> {
+            Vec::new()
+        }
+    }
+
+    impl ExploreTree for Tree {
+        fn all_nodes(&self) -> Vec<NodeId> {
+            self.nodes.clone()
+        }
+        fn tree_node(&self, node: NodeId) -> Option<TreeNode> {
+            for (alloc, at) in &self.allocs {
+                if *at == node {
+                    return Some(TreeNode::Allocate(*alloc));
+                }
+            }
+            self.kinds.get(&node).copied().map(TreeNode::Other)
+        }
+        fn as_block(&self, node: NodeId) -> Option<BlockId> {
+            BlockId::of(self, node)
+        }
+        fn node_name(&self, node: NodeId) -> Option<NodeName> {
+            self.names.get(&node).cloned()
+        }
+        fn loop_staging(&self, at: LoopId) -> Option<LoopStaging> {
+            self.staging.get(&at).copied()
+        }
+        fn is_parametric_loop(&self, _at: LoopId) -> bool {
+            false
+        }
+        fn set_loop_dims(&mut self, at: LoopId, dims: Vec<(PrimaryDim, MetaDimKind)>) {
+            self.dims.insert(at, dims);
+        }
+        fn alloc_node(&self, alloc: AllocId) -> Option<NodeId> {
+            self.allocs.get(&alloc).copied()
+        }
+        fn alloc_padding(&self, _alloc: AllocId, _dim: PrimaryDim) -> PadType {
+            PadType::NoPad
+        }
+        fn transfers_and_computes_under(&self, from: NodeId) -> Vec<NodeId> {
+            self.under.get(&from).cloned().unwrap_or_default()
+        }
+        fn is_opaque_compute(&self, _node: NodeId) -> bool {
+            false
+        }
+        fn block_transfer_sizes(
+            &self,
+            _node: NodeId,
+            _unit: SenComponent,
+        ) -> BTreeMap<PrimaryDim, Extent> {
+            BTreeMap::new()
+        }
+        fn compute_op(&self, node: NodeId) -> Option<DscComputeOp> {
+            self.computes.get(&node).cloned()
+        }
+        fn set_transfer(&mut self, node: NodeId, transfer: TransferNode) -> Option<()> {
+            self.transfers.insert(node, transfer).map(|_| ())
+        }
+    }
+
+    // ─── the DSC entries 307 and 309 read ───────────────────────────────────────────────────────
+
+    /// THE DESIGN SPACE AND THE LABELLED DATA STRUCTURES, as much of each as the two size sweeps
+    /// reach.
+    #[derive(Default)]
+    struct Space {
+        allocs: BTreeMap<(LdsIdx, SenComponent), AllocId>,
+    }
+
+    impl ExploreDsc for Space {
+        fn holds_lds(&self, lds: LdsIdx) -> bool {
+            lds == LDS0
+        }
+        fn scaled_category(&self, _lds: LdsIdx) -> ScaledLds {
+            ScaledLds::Regular
+        }
+        fn mx_info(&self, _lds: LdsIdx) -> Option<(PrimaryDim, ScaleBlock)> {
+            None
+        }
+    }
+
+    impl LabeledDsIndices for Space {
+        fn labeled_ds_indices(&self) -> Vec<LdsIdx> {
+            vec![LDS0]
+        }
+    }
+
+    impl Dsc for Space {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            LayoutDims::new(PrimaryDim::I, Vec::new())
+        }
+    }
+
+    impl LdsSticks for Space {
+        fn stick_dims(&self, _lds: LdsIdx) -> StickDims {
+            StickDims(vec![(PrimaryDim::I, Elements(4))])
+        }
+    }
+
+    impl StorageNames for Space {
+        fn lds_name(&self, lds: LdsIdx) -> StorageName {
+            StorageName(format!("lds{}", lds.0))
+        }
+        fn constant_name(&self, _constant: ConstIdx) -> StorageName {
+            StorageName("const".to_owned())
+        }
+    }
+
+    impl Placement for Space {
+        fn cores_used(&self) -> CoresUsed {
+            CoresUsed::new(Core::checked(0).expect("core 0"), Vec::new())
+        }
+        fn corelets_used(&self) -> Vec<Corelet> {
+            vec![cl0()]
+        }
+        fn corelets_used_total(&self) -> Vec<Corelet> {
+            vec![cl0()]
+        }
+        fn buffer_capacity(
+            &self,
+            _alloc: AllocId,
+            _lds: Option<LdsIdx>,
+            _at: Option<(Corelet, Row)>,
+        ) -> Bytes {
+            Bytes(64)
+        }
+        fn is_scale_tensor(&self, _lds: LdsIdx) -> bool {
+            false
+        }
+        fn l0_tethered(&self) -> L0Tethered {
+            L0Tethered::Whole
+        }
+        fn subcore(&self, _core: Core) -> u32 {
+            0
+        }
+        fn address_fold_depth(&self) -> usize {
+            3
+        }
+    }
+
+    impl StageSizes for Space {
+        fn dim_extent(
+            &self,
+            _stage: DatastageId,
+            _dim: PrimaryDim,
+            _unit: SenComponent,
+            _corelet: Option<Corelet>,
+            _padding: PadType,
+            _density: Density,
+        ) -> Extent {
+            Extent(4)
+        }
+        fn comp_view(
+            &self,
+            _stage: DatastageId,
+            _dim: PrimaryDim,
+            _unit: SenComponent,
+            _corelet: Option<Corelet>,
+            _padding: PadType,
+        ) -> Extent {
+            Extent(4)
+        }
+        fn lds_scale(&self, _lds: LdsIdx, _dim: PrimaryDim) -> Option<LdsScale> {
+            Some(LdsScale::Unscaled)
+        }
+        fn dim_density(&self, _lds: LdsIdx, _dim: PrimaryDim) -> Density {
+            Density::FULL
+        }
+        fn corelet_split(&self, _stage: DatastageId, _dim: PrimaryDim) -> Option<Vec<Elements>> {
+            None
+        }
+        fn alloc_padding_sizes(&self, _alloc: AllocId, _dim: PrimaryDim) -> Option<PaddingSizes> {
+            None
+        }
+        fn stage_padding_sizes(
+            &self,
+            _stage: DatastageId,
+            _dim: PrimaryDim,
+        ) -> Option<PaddingSizes> {
+            None
+        }
+        fn size_stage(&self, _alloc: AllocId) -> DatastageId {
+            CHUNK
+        }
+        fn is_sole_partial_reduction_input(&self, _lds: LdsIdx) -> bool {
+            false
+        }
+    }
+
+    impl OffsetSizes for Space {
+        fn lds_alloc(&self, lds: LdsIdx, storage: SenComponent) -> Option<AllocId> {
+            self.allocs.get(&(lds, storage)).copied()
+        }
+        fn const_alloc(&self, _constant: ConstIdx, _storage: SenComponent) -> Option<AllocId> {
+            None
+        }
+        fn address_scale(&self, _unit: GenericComp, _storage: SenComponent) -> Option<NonZeroU64> {
+            NonZeroU64::new(1)
+        }
+        fn stage_padding_dims(&self, _stage: DatastageId) -> Vec<(PrimaryDim, PaddingSizes)> {
+            Vec::new()
+        }
+        fn has_symbolic_dim(&self, _stage: DatastageId, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn pe_sfp_split_dims(&self, _stage: DatastageId) -> Vec<PrimaryDim> {
+            Vec::new()
+        }
+        fn block_transfer_size(
+            &self,
+            _node: NodeId,
+            _unit: SenComponent,
+            _corelet: Corelet,
+            _dim: PrimaryDim,
+        ) -> Elements {
+            Elements(0)
+        }
+        fn temporal_stride(
+            &self,
+            _node: NodeId,
+            _alloc: AllocId,
+            _at: LoopId,
+            _dim: PrimaryDim,
+        ) -> Option<LoopEleOffset> {
+            Some(LoopEleOffset(0))
+        }
+    }
+
+    impl Masking for Space {
+        fn coordinate_masking(&self) -> BTreeMap<PrimaryDim, Vec<MaskRun>> {
+            BTreeMap::new()
+        }
+        fn declares_samv_wsllen(&self) -> bool {
+            false
+        }
+        fn masking_constant(&self) -> Option<ConstIdx> {
+            None
+        }
+        fn splits_across_cores(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_symbolic(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn non_broadcast_dims(&self, _lds: LdsIdx) -> BTreeSet<PrimaryDim> {
+            BTreeSet::new()
+        }
+        fn lds_format(&self, _lds: LdsIdx) -> Option<DataFormat> {
+            Some(DataFormat::Sen169Fp16)
+        }
+    }
+
+    /// A tracker that places everything at address zero.
+    struct Trackers;
+
+    impl MemTrackers for Trackers {
+        fn capacity(&self, _at: TrackerSite) -> Bytes {
+            Bytes(4096)
+        }
+        fn backup(&mut self, _at: TrackerSite) {}
+        fn restore_all(&mut self) {}
+        fn remove(&mut self, _at: TrackerSite, _name: &StorageName) {}
+        fn add_at(&mut self, _at: TrackerSite, _name: &StorageName, _size: Bytes, _addr: Bytes) {}
+        fn check_and_add(
+            &mut self,
+            _at: TrackerSite,
+            _name: &StorageName,
+            _size: Bytes,
+        ) -> Option<Placed> {
+            Some(Placed::At(Bytes(0)))
+        }
+        fn check_and_add_at(
+            &mut self,
+            _at: TrackerSite,
+            _name: &StorageName,
+            _size: Bytes,
+            address: Bytes,
+        ) -> Option<Placed> {
+            Some(Placed::At(address))
+        }
+    }
+
+    // ─── entry 307 ──────────────────────────────────────────────────────────────────────────────
+
+    /// One loop dividing an external stage of 8 into a chunk stage, over the one dim its lds lays
+    /// out.
+    fn explore_fixture() -> (Space, Tree, Stages, Metadata) {
+        let mut tree = Tree {
+            nodes: vec![LOOP.0, COMPUTE],
+            ..Tree::default()
+        };
+        tree.kinds.insert(LOOP.0, NodeKind::Loop);
+        tree.kinds.insert(COMPUTE, NodeKind::Compute);
+        tree.dims
+            .insert(LOOP, vec![(PrimaryDim::I, MetaDimKind::Unpadded)]);
+        tree.staging.insert(
+            LOOP,
+            LoopStaging {
+                num: Some(EXT),
+                den: Some(CHUNK),
+            },
+        );
+        tree.under.insert(LOOP.0, vec![COMPUTE]);
+        tree.computes.insert(
+            COMPUTE,
+            DscComputeOp {
+                op_func: None,
+                ex_unit: SenComponent::Pt,
+                format: None,
+                inputs: vec![LDS0],
+                outputs: vec![LDS0],
+            },
+        );
+
+        let mut stages = Stages {
+            order: vec![CORE, CHUNK, EXT],
+            external: [EXT].into_iter().collect(),
+            ..Stages::default()
+        };
+        stages.labels.insert(CORE, StageLabel::Core);
+        stages.labels.insert(CHUNK, StageLabel::Chunk);
+        stages.labels.insert(EXT, StageLabel::Other);
+        for site in [StageSite::ss(EXT), StageSite::el(EXT)] {
+            stages.values.insert((site, PrimaryDim::I), Extent(8));
+        }
+
+        let mut metadata = Metadata::default();
+        metadata.datastages.insert(
+            CHUNK,
+            Datastage {
+                strategy: Strategy::Maximize,
+                allow_epilogue: false,
+                ..Datastage::default()
+            },
+        );
+        (Space::default(), tree, stages, metadata)
+    }
+
+    #[test]
+    fn e307_takes_the_chunk_stage_from_its_stick_minimum_up_to_the_external_extent() {
+        let (dsc, mut tree, mut stages, mut metadata) = explore_fixture();
+        let mut global = GlobalData::default();
+        explore_assign_data_stages::<Dd2, _, _, _, _>(
+            &dsc,
+            &mut tree,
+            &mut stages,
+            &mut metadata,
+            &mut AllocArena::new(),
+            &mut Trackers,
+            &mut global,
+            LxTrackers::True,
+        )
+        .expect("the fixture's one loop and one compute leave every DT_ERROR unreached");
+
+        assert!(global.data_stage_exploration_done);
+        // The stick states a minimum of 4, and the external stage above it permits 8.
+        let chunk = &metadata.datastages[&CHUNK];
+        assert_eq!(chunk.nearest_numerator_idx, Some(EXT));
+        assert_eq!(
+            chunk.relevant_dims_and_numerator,
+            [(PrimaryDim::I, EXT)].into_iter().collect()
+        );
+        assert_eq!(chunk.constraints[&None][0].1.min, Some(4.0));
+        assert!(chunk.constraints[&None][0].1.multiple.must_be_multiple());
+        assert_eq!(
+            stages.dim_value(StageSite::ss(CHUNK), PrimaryDim::I),
+            Extent(8)
+        );
+        assert_eq!(
+            stages.dim_value(StageSite::el(CHUNK), PrimaryDim::I),
+            Extent(8)
+        );
+    }
+
+    // ─── entry 308 ──────────────────────────────────────────────────────────────────────────────
+
+    /// One `labeledDs_` entry, whose only read field is its own index.
+    #[derive(Clone)]
+    struct Entry(LdsIdx);
+
+    impl LabeledDsEntry for Entry {
+        fn recorded_lds_idx(&self) -> LdsIdx {
+            self.0
+        }
+        fn set_recorded_lds_idx(&mut self, recorded: LdsIdx) {
+            self.0 = recorded;
+        }
+        fn set_reference_lds_idx(&mut self, _reference: LdsIdx) {}
+    }
+
+    /// THE DSC ENTRY 308 REWRITES — its compute ops, and the two facts it decides the row and
+    /// corelet splits from.
+    #[derive(Default)]
+    struct Prep {
+        ops: Vec<DscComputeOp>,
+        dsc2_corelets: Option<u32>,
+    }
+
+    impl NewLabeledDs for Prep {
+        type Entry = Entry;
+        fn last_lds_pos(&self) -> LdsIdx {
+            LDS1
+        }
+        fn last_recorded_lds_idx(&self) -> LdsIdx {
+            LDS1
+        }
+        fn set_last_recorded_lds_idx(&mut self, _recorded: LdsIdx) {}
+        fn insert_lds_before_last(&mut self, _entry: Self::Entry) {}
+        fn clear_mem_org(&mut self, _pos: LdsIdx) {}
+        fn mem_org_allocations(&self, _pos: LdsIdx) -> Vec<AllocId> {
+            Vec::new()
+        }
+        fn alloc_lds_idx(&self, _alloc: AllocId) -> Option<LdsIdx> {
+            None
+        }
+        fn set_alloc_lds_idx(&mut self, _alloc: AllocId, _lds: LdsIdx) {}
+        fn tree_lds_slots(&self) -> Vec<(TreeLdsSlot, Option<LdsIdx>)> {
+            Vec::new()
+        }
+        fn set_tree_lds(&mut self, _slot: TreeLdsSlot, _lds: LdsIdx) {}
+        fn opaque_computes(&self) -> Vec<NodeId> {
+            Vec::new()
+        }
+    }
+
+    impl PrepDsc for Prep {
+        fn set_corelets_used_dsc2(&mut self, corelets: u32) {
+            self.dsc2_corelets = Some(corelets);
+        }
+        fn compute_ops(&self) -> Vec<DscComputeOp> {
+            self.ops.clone()
+        }
+        fn insert_compute_op(&mut self, at: usize, op: DscComputeOp) -> Option<()> {
+            (at <= self.ops.len()).then(|| self.ops.insert(at, op))
+        }
+        fn set_op_func(&mut self, at: usize, op_func: OpFunc) {
+            if let Some(op) = self.ops.get_mut(at) {
+                op.op_func = Some(op_func);
+            }
+        }
+        fn push_op_input(&mut self, at: usize, lds: LdsIdx) {
+            if let Some(op) = self.ops.get_mut(at) {
+                op.inputs.push(lds);
+            }
+        }
+        fn declares_zero_mean_constant(&self) -> bool {
+            false
+        }
+        fn op_declares_zero_mean(&self, _at: usize) -> bool {
+            false
+        }
+        fn lds_entry(&self, lds: LdsIdx) -> Option<Self::Entry> {
+            Some(Entry(lds))
+        }
+        fn append_lds_name(&mut self, _lds: LdsIdx, _suffix: InternalLds) {}
+        fn set_lds_internal(&mut self, _lds: LdsIdx) {}
+        fn set_lds_word_length(&mut self, _lds: LdsIdx, _length: WordLength) {}
+        fn set_lds_format(&mut self, _lds: LdsIdx, _format: DataFormat) {}
+        fn set_lds_scaled_category(&mut self, _lds: LdsIdx, _category: ScaledLds) {}
+        fn copy_mx_info(&mut self, _to: LdsIdx, _from: LdsIdx) {}
+        fn stick_order(&self, _lds: LdsIdx) -> Vec<PrimaryDim> {
+            Vec::new()
+        }
+        fn stick_sizes_of(&self, _lds: LdsIdx) -> Vec<Elements> {
+            Vec::new()
+        }
+        fn set_internal_layout_from(&mut self, _from: LdsIdx) {}
+        fn push_internal_stick_dim(&mut self, _dim: PrimaryDim, _repl: StickRepl) {}
+        fn push_internal_stick_size(&mut self, _size: Elements) {}
+        fn copy_lx_mem_org(&mut self, _to: LdsIdx, _from: LdsIdx) -> Option<AllocId> {
+            None
+        }
+        fn set_lx_alloc(&mut self, _lds: LdsIdx, _alloc: AllocId) {}
+        fn set_lx_present(&mut self, _lds: LdsIdx, _present: bool) {}
+        fn insert_alloc_before(
+            &mut self,
+            _sibling: AllocId,
+            _node: AllocateNode,
+        ) -> Option<AllocId> {
+            None
+        }
+        fn insert_transfer_after(
+            &mut self,
+            _under: InsertUnder,
+            _sibling: NodeId,
+            _node: TransferNode,
+        ) -> Option<NodeId> {
+            None
+        }
+    }
+
+    impl CoreletShapes for Prep {
+        fn corelets_used(&self) -> u32 {
+            2
+        }
+        fn core_extent(&self, _dim: PrimaryDim) -> Extent {
+            Extent(8)
+        }
+        fn corelet_extent(&self, _dim: PrimaryDim) -> Extent {
+            Extent(4)
+        }
+    }
+
+    impl Masking for Prep {
+        fn coordinate_masking(&self) -> BTreeMap<PrimaryDim, Vec<MaskRun>> {
+            BTreeMap::new()
+        }
+        fn declares_samv_wsllen(&self) -> bool {
+            false
+        }
+        fn masking_constant(&self) -> Option<ConstIdx> {
+            None
+        }
+        /// The reduced dim IS split across the cores, which is what the partial reduction is for.
+        fn splits_across_cores(&self, dim: PrimaryDim) -> bool {
+            dim == PrimaryDim::Ki
+        }
+        fn is_symbolic(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn non_broadcast_dims(&self, lds: LdsIdx) -> BTreeSet<PrimaryDim> {
+            if lds == LDS0 {
+                [PrimaryDim::I, PrimaryDim::Ki].into_iter().collect()
+            } else {
+                [PrimaryDim::I].into_iter().collect()
+            }
+        }
+        fn lds_format(&self, _lds: LdsIdx) -> Option<DataFormat> {
+            None
+        }
+    }
+
+    impl LdsSticks for Prep {
+        /// A stick of 8 whose slice is 1, so exactly one dim survives the slicing.
+        fn stick_dims(&self, _lds: LdsIdx) -> StickDims {
+            StickDims(vec![(PrimaryDim::Ki, Elements(8))])
+        }
+    }
+
+    impl Dsc for Prep {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            LayoutDims::new(PrimaryDim::I, vec![PrimaryDim::Ki])
+        }
+    }
+
+    impl DataStages for Prep {
+        fn corelet_split_dims(&self, _stage: DatastageId) -> BTreeSet<PrimaryDim> {
+            [PrimaryDim::I].into_iter().collect()
+        }
+    }
+
+    #[test]
+    fn e308_names_the_row_split_dim_and_sums_the_partial_reduction_back() {
+        let mut dsc = Prep {
+            ops: vec![DscComputeOp {
+                op_func: None,
+                ex_unit: SenComponent::Pt,
+                format: None,
+                inputs: vec![LDS0],
+                outputs: vec![LDS1],
+            }],
+            dsc2_corelets: None,
+        };
+        let (_, _, mut stages, mut metadata) = explore_fixture();
+        prep_dsc::<Dd2, _, _>(
+            &mut dsc,
+            &mut stages,
+            &mut metadata,
+            &AllocArena::new(),
+            Ln32::Off,
+        )
+        .expect("one PT op over one stick leaves every DT_CHECK unreached");
+
+        assert_eq!(dsc.dsc2_corelets, Some(2));
+        // The stick without its slices names exactly one dim, and that is the row split.
+        assert_eq!(metadata.row_split_dim, Some(PrimaryDim::Ki));
+        assert!(metadata.pe_sfp_split_dims.is_empty());
+        assert_eq!(
+            metadata.cl_split_dims,
+            [PrimaryDim::I].into_iter().collect()
+        );
+        // `K` is reduced and split across cores, so the partial results are summed back.
+        assert_eq!(dsc.ops.len(), 2);
+        assert_eq!(dsc.ops[1].op_func, Some(OpFunc::GenericPartialReduction));
+        assert_eq!(dsc.ops[1].inputs, vec![LDS1]);
+        assert_eq!(dsc.ops[1].outputs, vec![LDS1]);
+        assert_eq!(stages.finalized, vec![CORE, CHUNK, EXT]);
+    }
+
+    // ─── entry 309 ──────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn e309_makes_every_node_external_and_records_the_prefilled_data_connect() {
+        let mut dsc = Space::default();
+        dsc.allocs.insert((LDS0, SenComponent::Lx), ALLOC);
+        let (_, _, stages, mut metadata) = explore_fixture();
+
+        let mut tree = Tree {
+            nodes: vec![LOOP.0, ALLOC_NODE, TRANSFER, BLOCK],
+            ..Tree::default()
+        };
+        tree.kinds.insert(LOOP.0, NodeKind::Loop);
+        tree.kinds.insert(TRANSFER, NodeKind::Transfer);
+        tree.kinds.insert(BLOCK, NodeKind::Block);
+        tree.allocs.insert(ALLOC, ALLOC_NODE);
+        tree.dims
+            .insert(LOOP, vec![(PrimaryDim::I, MetaDimKind::Unpadded)]);
+        tree.names
+            .insert(BLOCK, NodeName("lx_below_schedule".to_owned()));
+        tree.transfers.insert(
+            TRANSFER,
+            TransferNode {
+                name: NodeName("prefilled".to_owned()),
+                src: Operand {
+                    unit: SenComponent::NoComponent,
+                    storage: SenComponent::NoComponent,
+                    data: DataInfo::default(),
+                },
+                dsts: Dsts::new(
+                    Via {
+                        loc: DataLocation {
+                            unit: SenComponent::Lx,
+                            storage: SenComponent::Lx,
+                        },
+                        lds: Some(LDS0),
+                    }
+                    .operand(),
+                    Vec::new(),
+                ),
+                replication_factor: ReplicationFactor::ONE,
+                unit_time_transfer_chunk_size: Vec::new(),
+                unit_time_transfer_num_chunks: NumChunks::ONE,
+                padding: TransferPadding::default(),
+                src_indirect: None,
+                dst_indirect: None,
+            },
+        );
+
+        let mut allocs = AllocArena::new();
+        allocs.insert(
+            ALLOC,
+            AllocateNode {
+                name: NodeName("lx".to_owned()),
+                component: SenComponent::Lx,
+                lds: Some(LDS0),
+                const_idx: None,
+                temp_storage_for_compute: None,
+                layout: AllocLayout::new(
+                    (PrimaryDim::I, MaxDimSize::Resolved(Elements(8))),
+                    Vec::new(),
+                ),
+                start_address: StartAddress::new(FoldDim::default()),
+                placement: AllocPlacement::default(),
+                gap_stick_spread: BTreeMap::new(),
+                alloc_users: Vec::new(),
+            },
+        );
+
+        attach_to_prefilled_schedule::<Dd2, _, _, _>(
+            &dsc,
+            &tree,
+            &stages,
+            &mut metadata,
+            &mut allocs,
+            ElemOffsets::Distribution,
+        )
+        .expect("the fixture names the block, the allocation and the one prefilled transfer");
+
+        assert_eq!(
+            metadata.external_nodes,
+            [LOOP.0, ALLOC_NODE, TRANSFER, BLOCK].into_iter().collect()
+        );
+        assert_eq!(
+            metadata.below_lx_schedule_insert_block,
+            BlockId::of(&tree, BLOCK)
+        );
+        assert_eq!(
+            metadata.prefilled_external_transfer_data_connects[&(Some(LDS0), ExternalStorage::Lx)],
+            DataConnectSlot {
+                transfer: TRANSFER,
+                end: TransferEnd::FirstDst,
+            }
+        );
+        assert_eq!(
+            metadata.dim_to_core_chunk_loops[&PrimaryDim::I],
+            vec![LOOP.0]
         );
     }
 }
