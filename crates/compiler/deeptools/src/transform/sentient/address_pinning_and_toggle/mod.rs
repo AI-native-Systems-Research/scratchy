@@ -1066,45 +1066,139 @@ impl DataTransferDescriptor {
     }
 }
 
-// crustify:todo: e399_getMin
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:182  (4 body lines, level 2)
-//   original  : const EvaluatedValue &getMin() override
-//   calls     : e278_isValid
+impl SimpleConstantDescriptor {
+    /// Replaces: e399_getMin
+    ///
+    /// The one constant a simple-constant base address is (`:182-185`).
+    ///
+    /// ⭐ NO `DT_CHECK(isValid())` GUARD TO WRITE: "Descriptor is always valid once constructed"
+    /// (`:192-193`), so unlike its four siblings below this getter is total.
+    #[must_use]
+    pub const fn min(&self) -> EvaluatedValue {
+        self.ev
+    }
 
-// crustify:todo: e400_getMax
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:187  (4 body lines, level 2)
-//   original  : const EvaluatedValue &getMax() override
-//   calls     : e278_isValid
+    /// Replaces: e400_getMax
+    ///
+    /// The SAME one constant (`:187-190`) — a single-valued base address's range is a point.
+    ///
+    /// ⛔ NOT A SLIP TO BE TIDIED INTO ONE ACCESSOR: `findClosestPinnedAddr` (`:2057`, `:2123`) is
+    /// handed both ends of every pattern, and for this pattern both ends are `ev_`.
+    #[must_use]
+    pub const fn max(&self) -> EvaluatedValue {
+        self.ev
+    }
+}
 
-// crustify:todo: e401_getC1
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:246  (4 body lines, level 2)
-//   original  : const EvaluatedValue &getC1() const
-//   calls     : e278_isValid
+impl ToggleDescriptor {
+    /// Replaces: e401_getC1
+    ///
+    /// The constant term `c1` in `X = c1 - Y` (`:246-249`).
+    ///
+    /// ⛔ `None` IS `DT_CHECK(isValid())` AND NOT MERELY AN ABSENT `c1_`: the check reads all three
+    /// fields (`:263`), so a toggle that kept its `c1` but lost its loop answers nothing here — the
+    /// same encoding as [`DataTransferDescriptor::base_addr`].
+    #[must_use]
+    pub fn c1(&self) -> Option<EvaluatedValue> {
+        if self.is_valid() { self.c1 } else { None }
+    }
 
-// crustify:todo: e402_getIterArgIndex
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:251  (4 body lines, level 2)
-//   original  : int getIterArgIndex() const
-//   calls     : e278_isValid
+    /// Replaces: e402_getIterArgIndex
+    ///
+    /// Which iter arg of the outer loop carries the toggle (`:251-254`) — the index
+    /// `ToggleDataTransferUpdater` hands `setIterOperand` when it re-bases the toggle (`:2006`,
+    /// `:2036`).
+    ///
+    /// ⛔ `None` IS `DT_CHECK(isValid())`, which subsumes the reference's own `iter_arg_index_ >= 0`:
+    /// `invalidate()` stores `-1` there (`:271`), and an [`Option`] is that sentinel with no
+    /// arithmetic reachable on it.
+    #[must_use]
+    pub fn iter_arg_index(&self) -> Option<IterArgIndex> {
+        if self.is_valid() {
+            self.iter_arg_index
+        } else {
+            None
+        }
+    }
+}
 
-// crustify:todo: e403_getMin
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:320  (4 body lines, level 2)
-//   original  : const EvaluatedValue &getMin() override
-//   calls     : e278_isValid
+impl ConditionalConstantDescriptor {
+    /// Replaces: e403_getMin
+    ///
+    /// The per-unit minimum over every constant the conditional can yield (`:320-323`).
+    ///
+    /// ⛔ `None` IS `DT_CHECK(isValid())`, which here is the EMPTY list (`:318`): `evaluateMinMax`
+    /// would have nothing to fold. Its caller asserts the same thing before asking
+    /// (`DT_CHECK_MSG(cc.isValid(), "descriptor may be corrupt")`, `:2051`).
+    #[must_use]
+    pub fn min(&self, evaluator: &mut impl ExpressionEvaluator) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        Some(evaluator.evaluate_min_max(&self.yielded_constants, MinMax::Min))
+    }
 
-// crustify:todo: e404_getMax
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:325  (4 body lines, level 2)
-//   original  : const EvaluatedValue &getMax() override
-//   calls     : e278_isValid
+    /// Replaces: e404_getMax
+    ///
+    /// The per-unit maximum over the same list (`:325-328`), which is `compute_min = false` and
+    /// nothing else — see [`ConditionalConstantDescriptor::min`] for the `None`.
+    #[must_use]
+    pub fn max(&self, evaluator: &mut impl ExpressionEvaluator) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        Some(evaluator.evaluate_min_max(&self.yielded_constants, MinMax::Max))
+    }
+}
 
-// crustify:todo: e405_getMin
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:360  (13 body lines, level 2)
-//   original  : const EvaluatedValue &getMin() override
-//   calls     : e278_isValid
+impl IntegerSequenceDescriptor {
+    /// Replaces: e405_getMin
+    ///
+    /// The per-unit minimum of the sequence, folded over its first and last terms ONLY —
+    /// `min(init_, init_ + stride_ * size_)` (`:360-372`), the two ends a monotone sequence has.
+    ///
+    /// ⛔ THAT LAST TERM IS ONE STRIDE PAST THE SEQUENCE: `getAllConstants` enumerates
+    /// `init_ + stride_ * i` for `i` in `[0, size_)` (`:401-406`), so the sequence's own last term is
+    /// `init_ + stride_ * (size_ - 1)`. PORTED VERBATIM, because the result only ever WIDENS the range
+    /// `findClosestPinnedAddr` (`:2123`) must cover, and narrowing it would move this pass's chosen
+    /// pinned addresses off the reference's.
+    /// ⛔ THE SECOND `None` IS UNREACHABLE FROM A CONSTRUCTED DESCRIPTOR — e280 either sets BOTH
+    /// `init_` and `stride_` or invalidates everything — but `isValid()` (`:356`) does not read them.
+    #[must_use]
+    pub fn min(&self, evaluator: &mut impl ExpressionEvaluator) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let (Some(init), Some(stride), SequenceSize::Terms(size)) =
+            (self.init, self.stride, self.size)
+        else {
+            return None;
+        };
+        let total_stride = evaluator.evaluate_multiply_by_const(stride, i64::from(size));
+        let last_term = evaluator.evaluate_sum_handle(init, total_stride);
+        Some(evaluator.evaluate_min_max(&[init, last_term], MinMax::Min))
+    }
 
-// crustify:todo: e406_getMax
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:374  (13 body lines, level 2)
-//   original  : const EvaluatedValue &getMax() override
-//   calls     : e278_isValid
+    /// Replaces: e406_getMax
+    ///
+    /// The per-unit maximum of the same two terms (`:374-386`) — `compute_min = false` over the same
+    /// `init_` and the same one-stride-past-the-end last term; see
+    /// [`IntegerSequenceDescriptor::min`] for both traps.
+    #[must_use]
+    pub fn max(&self, evaluator: &mut impl ExpressionEvaluator) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let (Some(init), Some(stride), SequenceSize::Terms(size)) =
+            (self.init, self.stride, self.size)
+        else {
+            return None;
+        };
+        let total_stride = evaluator.evaluate_multiply_by_const(stride, i64::from(size));
+        let last_term = evaluator.evaluate_sum_handle(init, total_stride);
+        Some(evaluator.evaluate_min_max(&[init, last_term], MinMax::Max))
+    }
+}
 
 impl IntegerSequenceDescriptor {
     /// Replaces: e407_getInit
@@ -2310,5 +2404,91 @@ mod unit_tests {
         desc.invalidate();
         assert_eq!(desc.init, Some(init));
         assert_eq!(desc.init(), None);
+    }
+
+    /// A simple constant's range is a point: both ends read `ev_`, and neither asks the evaluator.
+    #[test]
+    fn e399_e400_a_simple_constant_is_its_own_min_and_max() {
+        let desc = SimpleConstantDescriptor {
+            ev: EvaluatedValue(5),
+        };
+        assert_eq!(desc.min(), EvaluatedValue(5));
+        assert_eq!(desc.max(), EvaluatedValue(5));
+    }
+
+    /// Both toggle reads sit behind `DT_CHECK(isValid())`, which is all THREE fields and not the one
+    /// being read.
+    #[test]
+    fn e401_e402_read_the_toggle_only_while_all_three_validity_fields_stand() {
+        let toggle = matched_toggle();
+        assert_eq!(toggle.c1(), Some(EvaluatedValue(3)));
+        assert_eq!(toggle.iter_arg_index(), Some(IterArgIndex(1)));
+        // ⛔ A `c1` THAT SURVIVED A LOST LOOP IS STILL NOTHING HERE.
+        let lost_loop = ToggleDescriptor {
+            outer_loop: None,
+            ..matched_toggle()
+        };
+        assert_eq!(lost_loop.c1(), None);
+        assert_eq!(lost_loop.iter_arg_index(), None);
+    }
+
+    /// Both ends fold the WHOLE list, and an empty one is the invalid state that asks nothing.
+    #[test]
+    fn e403_e404_fold_every_constant_the_conditional_can_yield() {
+        let mut evaluator = StatedEvaluator::default();
+        let yielded_constants = vec![
+            evaluator.constant(4096),
+            evaluator.constant(64),
+            evaluator.constant(8192),
+        ];
+        let desc = ConditionalConstantDescriptor {
+            yielded_constants,
+            can_be_simplified: false,
+        };
+        let min = desc.min(&mut evaluator);
+        let max = desc.max(&mut evaluator);
+        assert_eq!(min.map(|ev| evaluator.value(ev)), Some(64));
+        assert_eq!(max.map(|ev| evaluator.value(ev)), Some(8192));
+        let invalid = ConditionalConstantDescriptor::default();
+        assert_eq!(invalid.min(&mut evaluator), None);
+        assert_eq!(invalid.max(&mut evaluator), None);
+    }
+
+    /// The vendor's own arithmetic INCLUDING its one-stride-too-far last term: three terms of stride
+    /// 32 from 1024 fold `1024` against `1024 + 32 * 3`, never against `1024 + 32 * 2`. A negative
+    /// stride puts that same term at the MIN end, which is why both ends fold a list.
+    #[test]
+    fn e405_e406_fold_the_first_term_against_one_stride_past_the_last() {
+        let mut evaluator = StatedEvaluator::default();
+        let ascending = IntegerSequenceDescriptor {
+            outer_loop: Some(ForRef(Val(7))),
+            iter_arg_index: Some(IterArgIndex(1)),
+            init: Some(evaluator.constant(1024)),
+            stride: Some(evaluator.constant(32)),
+            size: SequenceSize::Terms(3),
+            can_be_simplified: false,
+        };
+        let min = ascending.min(&mut evaluator);
+        let max = ascending.max(&mut evaluator);
+        assert_eq!(min.map(|ev| evaluator.value(ev)), Some(1024));
+        assert_eq!(max.map(|ev| evaluator.value(ev)), Some(1024 + 32 * 3));
+
+        let descending = IntegerSequenceDescriptor {
+            stride: Some(evaluator.constant(-32)),
+            ..ascending
+        };
+        let min = descending.min(&mut evaluator);
+        let max = descending.max(&mut evaluator);
+        assert_eq!(min.map(|ev| evaluator.value(ev)), Some(1024 - 32 * 3));
+        assert_eq!(max.map(|ev| evaluator.value(ev)), Some(1024));
+
+        // ⛔ [`SequenceSize::Symbolic`] IS NOT A LENGTH: `isValid()` reads `size_ > 0`, so a symbolic
+        // loop's sequence has no range at all and asks the evaluator nothing.
+        let symbolic = IntegerSequenceDescriptor {
+            size: SequenceSize::Symbolic,
+            ..ascending
+        };
+        assert_eq!(symbolic.min(&mut evaluator), None);
+        assert_eq!(symbolic.max(&mut evaluator), None);
     }
 }
