@@ -77,9 +77,10 @@
 //! | `e474_runOn` | 474 | 2 | 26 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:151` |
 //! | `e536_runOnOperation` | 536 | 3 | 6 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:144` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e536_runOnOperation` (level 3) is what calls
-// [`run_on_unit`], and nothing but this file's own tests reaches it until that lands. CI runs clippy
-// with `-D warnings`. ⭐ REMOVE THIS WITH e536.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`run_on_operation`] (e536) is the entry, and
+// there is no ported D29–D75 pass driver to call it, so nothing but this file's own tests reaches
+// anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e536 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
 pub(crate) mod incr_mask_gen_value;
@@ -89,8 +90,9 @@ pub(crate) mod set_mask_rde_tree_optimizer;
 
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::ty::GenericComp;
-use crate::islands::sentient::ProgramUnit;
-
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::workload::Workload;
 
 /// `Statistic<"set_mask_re_count", "num-setmask-eliminated", "Number of times `set_mask` or
 /// `incrmask` operations were removed or hoisted">` (`Transform/Sentient/Passes.td:174`).
@@ -124,19 +126,79 @@ pub(crate) fn run_on_unit<A: Arch>(
     )
 }
 
-// crustify:todo: e536_runOnOperation
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:144  (6 body lines, level 3)
-//   original  : void runOnOperation()
-//   calls     : e474_runOn
+/// `-dcc-setmask-re-disable`, `cl::init(false)` (`:120-123`) — a `dcc-opt` command-line flag, not a
+/// program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e536_runOnOperation
+///
+/// The pass entry: unless the flag disables it, run `set_mask`/`incrmask` redundancy elimination over
+/// every program unit of the module, and hand back the statistic the PT units banked.
+///
+/// ⛔ THE STATISTIC BELONGS TO THE PASS INSTANCE, NOT TO A UNIT: `set_mask_re_count` is a member each
+/// PT unit **assigns** (`:175`), so it starts at zero here and the LAST PT unit's optimizer decides
+/// it — which is why [`run_on_unit`] takes it by `&mut` and a skipped unit leaves it standing.
+/// ⭐ `WalkResult::skip()` IS NOT NEEDED: a program's units are a flat list on this island, so the
+/// pre-order walk has no nested `dataflow.program_unit` to decline.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+) -> SetMaskReCount {
+    let mut set_mask_re_count = SetMaskReCount::default();
+    if DISABLE_THIS_PASS {
+        return set_mask_re_count;
+    }
+    for unit in program.units.iter_mut() {
+        run_on_unit(unit, &mut set_mask_re_count);
+    }
+    set_mask_re_count
+}
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{SetMaskReCount, run_on_unit};
+    use super::{SetMaskReCount, run_on_operation, run_on_unit};
     use crate::arch::Dd2;
-    use crate::islands::dataflow_ir::Units;
-    use crate::islands::sentient::ProgramUnit;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::Val;
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
     use crate::units::{DfirUnit, Row};
+    use crate::workload::Workload;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One program whose only unit is on `kind`.
+    fn program_on(kind: DfirUnit) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit_on(kind), Vec::new()),
+            bound: core::marker::PhantomData,
+        }
+    }
 
     /// One empty unit on `kind`.
     fn unit_on(kind: DfirUnit) -> ProgramUnit<Dd2> {
@@ -164,5 +226,14 @@ mod unit_tests {
             &mut unit_on(DfirUnit::PtRow(Row::checked(0).expect("PT row 0 exists"))),
             &mut SetMaskReCount(0),
         );
+    }
+
+    /// e536 — the disable flag is OFF, so the entry walks the module's units and the PT one arrives
+    /// at the unported tree rather than the entry returning a zero count.
+    #[test]
+    #[should_panic(expected = "senpass e378")]
+    fn e536_walks_the_units_because_the_disable_flag_is_off() {
+        let mut program = program_on(DfirUnit::PtRow(Row::checked(0).expect("PT row 0 exists")));
+        let _ = run_on_operation(&mut program);
     }
 }

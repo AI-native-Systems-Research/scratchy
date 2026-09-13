@@ -86,19 +86,25 @@
 //! | `e480_FuseStoreAndForward` | 480 | 2 | 119 | `dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:434` |
 //! | `e541_runOnOperation` | 541 | 3 | 24 | `dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:555` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e480_FuseStoreAndForward` (level 2) is what calls
-// every item below and `e541_runOnOperation` (level 3) what walks the module, so until they land this
-// file is reachable only from its own tests. CI runs clippy with `-D warnings`.
-// ⭐ REMOVE THIS WITH e541.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`run_on_operation`] (e541) is the entry, and
+// there is no ported D29-D75 pass driver to call it, so nothing but this file's own tests reaches
+// anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e541 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
+use super::analyses::{InstructionEstimator, OutOfScopeInstructionEstimator};
 use super::rematerialization_pass::InBlock;
 use super::utils::fold_mode_attribute_if_exists;
+use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
     DbgNamePrefix, new_dbg_name_from_list,
 };
+use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::sentient::{Operand, Port, Precision, ResultPorts};
-use crate::islands::sentient::dialects::{Op, dataflow, sentient};
+use crate::islands::sentient::dialects::{self as dialects, Op, dataflow, sentient};
+use crate::model::Model;
+use crate::workload::Workload;
 
 /// WHETHER THE WALK IS STEPPING OVER `fold_AB` PAIRS — `is_fold_AB_mode`.
 ///
@@ -491,12 +497,59 @@ pub fn update_fusible_op(fusible_op: &mut Op, value_forwardings_for_trivial: &[P
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::Val;
     use crate::islands::sentient::dialects::sentient::{
         Binary, FmaMode, LrfIndex, RegType, UnrollFactor,
     };
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
     use crate::units::{DfirUnit, Residency};
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One program whose only unit is on `kind` and holds `body`.
+    fn program_on(kind: DfirUnit, body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(kind, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
 
     /// An operand reading `port` and forwarded on to `forwarding`.
     fn operand(port: Port, forwarding: &[Port]) -> Operand {
@@ -769,6 +822,27 @@ mod unit_tests {
         assert!(
             reached.is_err(),
             "e387 is not ported, so the trivial fill panics"
+        );
+    }
+
+    /// e541 — a PE unit's ops reach e480 (whose unported e387 then panics), and a unit that is neither
+    /// SFP nor PE is skipped with its body untouched. ⭐ THE UNIT FILTER IS THE PORT.
+    #[test]
+    fn e541_walks_only_the_sfp_and_pe_units() {
+        let mut skipped = program_on(DfirUnit::L3lu, vec![mac_folded(None)]);
+        run_on_operation(&mut skipped);
+        assert_eq!(
+            skipped.units.iter().next().expect("the one unit").body,
+            vec![mac_folded(None)]
+        );
+
+        let mut walked = program_on(DfirUnit::Pe, vec![mac_folded(None)]);
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_on_operation(&mut walked);
+        }));
+        assert!(
+            reached.is_err(),
+            "e387 is not ported, so a PE unit's fusion panics"
         );
     }
 }
@@ -1050,7 +1124,63 @@ pub fn fuse_store_and_forward(
     Fused::Yes
 }
 
-// crustify:todo: e541_runOnOperation
-//   authority : dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:555  (24 body lines, level 3)
-//   original  : void StoreAndForwardFusionPass::runOnOperation()
-//   calls     : e480_FuseStoreAndForward
+/// `-dcc-store-and-forward-fusion-disable`, `cl::init(false)` (`:50-53`) — a `dcc-opt` command-line
+/// flag, not a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `opts_.OptLevel == 0` (`:568`) — the PIPELINE's optimisation level, which is `2` by default
+/// (`dcc/tools/Options/dcc-pass-option.h:63-65`, copied into the common options at
+/// `dcc/tools/dcc-standalone/dcc-standalone-main.cpp:701`), so the shipped pipeline never reaches the
+/// `haveIbuffSpace` half of the `&&`.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// ONE BLOCK AND EVERY BLOCK NESTED IN IT — `unit_op.walk([&](mlir::Operation *op) { … })`, whose
+/// default order is post-order, with the deletions of each block applied when its own walk ends.
+///
+/// ⛔ THE QUEUE IS PER BLOCK, NOT PER MODULE, AND THAT IS A REPRESENTATION CHANGE. The reference keeps
+/// one `std::vector<Operation *>` for the whole module and erases at the very end; an [`InBlock`] is
+/// an index into ONE `Vec<Op>`, so a shared queue would collide and e480's own `sort`+`unique` would
+/// merge unrelated positions. It is observationally identical because e480 reads only the op's own
+/// block — and the erase runs in DESCENDING position order so the queued indices stay valid.
+fn fuse_block(block: &mut Vec<Op>) {
+    for at in 0..block.len() {
+        for region in dialects::regions_mut(&mut block[at]) {
+            fuse_block(region);
+        }
+    }
+    let mut to_be_deleted = Vec::new();
+    for at in 0..block.len() {
+        // ⚠️ THE `LLVM_DEBUG` ON A SUCCESSFUL FUSION IS DROPPED (`:571-573`): it changes no IR.
+        let _ = fuse_store_and_forward(InBlock::at(at), block, &mut to_be_deleted);
+    }
+    for op in to_be_deleted.iter().rev() {
+        block.remove(op.index());
+    }
+}
+
+/// Replaces: e541_runOnOperation
+///
+/// The pass entry: unless the flag disables it, fuse the trivial computes of every SFP and PE unit of
+/// the module into the compute before them, and erase the ops that were fused away.
+///
+/// ⛔ THE MISSING ANALYSIS IS NAMED, NOT SUBSTITUTED FOR: `haveIbuffSpace` stays a `todo!` behind
+/// [`OPT_LEVEL_ZERO`], whose value the pipeline fixes rather than this pass — so flipping that const
+/// reaches the out-of-scope estimator instead of quietly skipping a unit.
+/// ⭐ `getChildAnalysis<InstructionEstimator>(unit_op)` IS PER UNIT, and it is constructed even for a
+/// unit the `&&` never asks anything of, exactly as the reference does (`:565-570`).
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for unit in program.units.iter_mut() {
+        // `is_any_of(getUnitType(unit_op.getUnits()[0]), SFP, PE)` (`:561-563`).
+        if !matches!(unit.on.kind().generic(), GenericComp::Sfp | GenericComp::Pe) {
+            continue;
+        }
+        let mut instruction_estimator = OutOfScopeInstructionEstimator;
+        if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        fuse_block(&mut unit.body);
+    }
+}

@@ -89,11 +89,13 @@ use crate::arch::Arch;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::uniform;
 use crate::islands::dataflow_ir::link::{Link, Lxlu as LxluUnit, Sfp as SfpUnit};
-use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{Op, Val, dataflow, sentient};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
 use crate::transform::sentient::ProgStitch;
 use crate::transform::sentient::set_send_destination_re::set_send_dst_rde_tree::SetSendDstRdeTreeOptimizer;
 use crate::units::{DfirUnit, Residency};
+use crate::workload::Workload;
 
 pub(crate) mod composite_set_dst_gen_value_lxlu;
 pub(crate) mod composite_set_dst_gen_value_sfp;
@@ -240,10 +242,25 @@ pub(crate) fn run_on<A: Arch>(
     }));
 }
 
-// crustify:todo: e537_runOn
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:164  (4 body lines, level 3)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e475_runOn
+/// Replaces: e537_runOn
+///
+/// Eliminates the redundant `set_send_dst`s of every program unit of the module.
+///
+/// ⛔ NAMED FOR ITS ARGUMENT: `runOn(ModuleOp)` and `runOn(dataflow::ProgramUnitOp)` (e475) are one
+/// C++ overload set and cannot both be `run_on` here.
+/// ⭐ ONE TREE HANDLE SERVES EVERY UNIT: the reference builds a fresh `SetSendDstRDETree` inside
+/// `runOn(unit)` (`:121`), and this campaign made the tree a seam whose `optimize` is called once per
+/// unit with that unit's body — so each unit's `optimize` IS its own tree.
+pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    prog_stitch: ProgStitch,
+    tree: &mut impl SetSendDstRdeTreeOptimizer,
+    values: &mut Values,
+) {
+    for unit in program.units.iter_mut() {
+        run_on(unit, prog_stitch, tree, values);
+    }
+}
 
 // crustify:todo: e583_runOnOperation
 //   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:169  (5 body lines, level 4)
@@ -255,11 +272,35 @@ mod unit_tests {
     use super::{
         DfirUnit, Link, LxluUnit, Op, ProgStitch, Residency, SetDestReOptimizationMode,
         SetSendDstReCount, SetSendDstRdeTreeOptimizer, SfpUnit, Val, Values, dataflow,
-        determine_optimization_mode, run_on, sentient,
+        determine_optimization_mode, run_on, run_on_program, sentient,
     };
     use crate::arch::Dd2;
-    use crate::islands::dataflow_ir::Units;
-    use crate::islands::sentient::ProgramUnit;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
+    use crate::workload::Workload;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     /// A program unit bound to one unit of `kind`.
     fn unit_on(kind: DfirUnit) -> ProgramUnit<Dd2> {
@@ -352,5 +393,36 @@ mod unit_tests {
         let mut standalone = lxlu_unit(&mut values);
         run_on(&mut standalone, ProgStitch::Standalone, &mut tree, &mut values);
         assert_eq!(standalone.body, Vec::new());
+    }
+
+    /// e537 — every unit of the module is offered to e475, so the LXLU one gets its reset pair and
+    /// the SFP one, which eliminated nothing, is left alone.
+    #[test]
+    fn e537_offers_every_unit_of_the_module_to_the_elimination() {
+        let mut values = Values::default();
+        let lxlu = lxlu_unit(&mut values);
+        let sfp = unit_on(DfirUnit::Sfp);
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(lxlu, vec![sfp]),
+            bound: core::marker::PhantomData,
+        };
+        let mut tree = ElidingTree {
+            count: 1,
+            asked: None,
+        };
+
+        run_on_program(&mut program, ProgStitch::Stitched, &mut tree, &mut values);
+
+        // The LAST unit asked decides `asked`, which is the SFP one — so the walk reached both.
+        assert_eq!(tree.asked, Some(SetDestReOptimizationMode::OptimizeForSfp));
+        let mut units = program.units.iter();
+        assert_eq!(units.next().expect("the LXLU unit").body.len(), 2);
+        assert_eq!(units.next().expect("the SFP unit").body, Vec::new());
     }
 }

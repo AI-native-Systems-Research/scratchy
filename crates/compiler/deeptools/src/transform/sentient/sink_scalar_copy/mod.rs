@@ -95,10 +95,14 @@
 
 use std::fmt::Write as _;
 
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient};
 use crate::islands::sentient::print;
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
 use crate::transform::sentient::local_region_splitting_for_value_commoning::local_region::Indent;
+use crate::workload::Workload;
 
 /// WHICH REGION OF ITS OWNER — `Region::getRegionNumber()` (`:102`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -431,15 +435,59 @@ impl SinkScalarCopy {
     }
 }
 
-// crustify:todo: e538_runOn
-//   authority : dcc/src/Transform/Sentient/SinkScalarCopy.cpp:176  (7 body lines, level 3)
-//   original  : void runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e214_sinkCopyOps, e215_clear, e477_runOn, e539_runOn
+/// EVERY `sentient.scalar_copy` OF `scope`, INNERMOST FIRST — `walk<WalkOrder::PostOrder>` over one
+/// program unit, which is what fixes the order [`SinkScalarCopy::sink_copy_ops`] mints clones in.
+fn walk_copies_post_order(scope: &[Op], found: &mut Vec<CopyResult>) {
+    for op in scope {
+        for nested in dialects::regions_ref(op) {
+            walk_copies_post_order(nested, found);
+        }
+        if let Op::Sentient(sentient::Op::ScalarCopy { result, .. }) = op {
+            found.push(CopyResult(*result));
+        }
+    }
+}
 
-// crustify:todo: e539_runOn
-//   authority : dcc/src/Transform/Sentient/SinkScalarCopy.cpp:184  (4 body lines, level 3)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e477_runOn, e538_runOn
+impl SinkScalarCopy {
+    /// Replaces: e538_runOn
+    ///
+    /// ONE PROGRAM UNIT: collect its global-region `sentient.scalar_copy`s, sink a clone of each into
+    /// every local region that reads it, then drop the collection again.
+    ///
+    /// ⛔ NAMED FOR ITS ARGUMENT: `runOn(ProgramUnitOp)`, `runOn(ModuleOp)` (e539) and
+    /// `runOn(sentient::CopyOp)` (e477) are one C++ overload set and cannot all be `run_on` here.
+    /// ⭐ NEITHER `clear()` IS REDUNDANT: the list lives on the pass, which outlives the unit, so the
+    /// first stops a previous unit's copies being sunk into this body and the second stops this one's
+    /// leaking into the next — and collecting before sinking is the reference's own order, `runOn`
+    /// (e477) reading the body while [`SinkScalarCopy::sink_copy_ops`] is the only writer.
+    pub fn run_on_unit<A: Arch>(&mut self, unit: &mut ProgramUnit<A>, values: &mut Values) {
+        self.clear();
+        let mut copies = Vec::new();
+        walk_copies_post_order(&unit.body, &mut copies);
+        for copy in copies {
+            self.run_on_copy(copy, &unit.body);
+        }
+        self.sink_copy_ops(&mut unit.body, values);
+        self.clear();
+    }
+
+    /// Replaces: e539_runOn
+    ///
+    /// Sinks the scalar copies of every program unit of the module.
+    ///
+    /// ⛔ NAMED FOR ITS ARGUMENT, as [`SinkScalarCopy::run_on_unit`] is.
+    /// ⭐ `WalkResult::skip()` IS NOT NEEDED: a program's units are a flat list on this island, so the
+    /// pre-order walk has no nested `dataflow.program_unit` to decline.
+    pub fn run_on_program<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+        values: &mut Values,
+    ) {
+        for unit in program.units.iter_mut() {
+            self.run_on_unit(unit, values);
+        }
+    }
+}
 
 // crustify:todo: e584_runOnOperation
 //   authority : dcc/src/Transform/Sentient/SinkScalarCopy.cpp:167  (7 body lines, level 4)
@@ -449,8 +497,34 @@ impl SinkScalarCopy {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
     use crate::islands::sentient::dialects::{LocalRegion, UniformRegions};
+    use crate::units::DfirUnit;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     /// `%out = scalar_copy %in {locale=ebr}`.
     fn copy(input: Val, result: Val) -> Op {
@@ -671,5 +745,101 @@ mod unit_tests {
         assert_eq!(pass.uses_info_list().len(), 2);
         pass.clear();
         assert!(pass.uses_info_list().is_empty());
+    }
+
+    /// One global-region copy of `input`, read only from the single local region binding `arg`.
+    fn sinkable_body(input: Val, result: Val, arg: Val) -> Vec<Op> {
+        vec![
+            copy(input, result),
+            Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![LocalRegion {
+                    arg,
+                    units: vec![Val(2)],
+                    body: vec![add(result, Val(99))],
+                }],
+                results: Vec::new(),
+                yielded: Vec::new(),
+            }),
+        ]
+    }
+
+    /// One program unit holding `body`.
+    fn unit_with(body: Vec<Op>) -> ProgramUnit<Dd2> {
+        ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::Lxlu, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// The local region's body of the unit at `at`.
+    fn sunk_region(unit: &ProgramUnit<Dd2>) -> &[Op] {
+        let [Op::UniformRegions(regions)] = unit.body.as_slice() else {
+            panic!("the copy was sunk and the uniformize op is all that is left");
+        };
+        regions.regions()[0].body.as_slice()
+    }
+
+    /// e538 — the unit's global copy is collected, sunk into the region that reads it and erased, and
+    /// the pass's list is left empty for the next unit.
+    #[test]
+    fn e538_sinks_a_units_copies_and_clears_the_list_again() {
+        let mut values = Values::default();
+        for _ in 0..30 {
+            let _ = values.mint();
+        }
+        let mut unit = unit_with(sinkable_body(Val(0), Val(10), Val(20)));
+        let mut pass = SinkScalarCopy::default();
+
+        pass.run_on_unit(&mut unit, &mut values);
+
+        let [
+            Op::Sentient(sentient::Op::ScalarCopy {
+                input: Val(0),
+                result,
+                ..
+            }),
+            Op::Sentient(sentient::Op::ScalarAdd { lhs, .. }),
+        ] = sunk_region(&unit)
+        else {
+            panic!("a sunk copy then its user");
+        };
+        assert_eq!(lhs, result);
+        assert!(pass.uses_info_list().is_empty());
+    }
+
+    /// e539 — every unit of the module is sunk, not just the first, and one unit's collection does not
+    /// reach the next unit's body.
+    #[test]
+    fn e539_sinks_the_copies_of_every_unit_of_the_module() {
+        let mut values = Values::default();
+        for _ in 0..30 {
+            let _ = values.mint();
+        }
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                unit_with(sinkable_body(Val(0), Val(10), Val(20))),
+                vec![unit_with(sinkable_body(Val(1), Val(11), Val(21)))],
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut pass = SinkScalarCopy::default();
+
+        pass.run_on_program(&mut program, &mut values);
+
+        for (unit, input) in program.units.iter().zip([Val(0), Val(1)]) {
+            let [Op::Sentient(sentient::Op::ScalarCopy { input: sunk, .. }), _] = sunk_region(unit)
+            else {
+                panic!("a sunk copy then its user");
+            };
+            assert_eq!(*sunk, input);
+        }
     }
 }

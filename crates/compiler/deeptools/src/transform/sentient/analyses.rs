@@ -537,6 +537,10 @@ pub trait InstructionEstimator {
     /// `getEstimatedInstructionCount(ctx, Region *)` (`Analyses/InstructionEstimation.h:62`).
     fn estimated_instruction_count_of_region(&mut self, region: &[Op]) -> InstructionCount;
 
+    /// `haveIbuffSpace(ctx, dataflow::ProgramUnitOp unit)` (`Analyses/InstructionEstimation.h:64`) —
+    /// whether the unit's instructions still fit its instruction buffer.
+    fn have_ibuff_space(&mut self, unit: &[Op]) -> bool;
+
     /// `getRemainingIbuffSpace(ctx, unit)` (`Analyses/InstructionEstimation.h:69`) — what is LEFT of
     /// the instruction buffer, which is why [`InstructionCount`] is signed.
     ///
@@ -570,6 +574,12 @@ impl InstructionEstimator for OutOfScopeInstructionEstimator {
     fn estimated_instruction_count_of_region(&mut self, _region: &[Op]) -> InstructionCount {
         todo!(
             "InstructionEstimatorImpl::getEstimatedInstructionCount (Analyses/InstructionEstimation.h:62) — out of campaign scope"
+        )
+    }
+
+    fn have_ibuff_space(&mut self, _unit: &[Op]) -> bool {
+        todo!(
+            "InstructionEstimatorImpl::haveIbuffSpace (Analyses/InstructionEstimation.h:64) — out of campaign scope"
         )
     }
 }
@@ -1206,6 +1216,15 @@ pub trait TimeStamps {
     /// `reduceIntervals` (`Analyses/TimeStamps.cpp:228-254`) — collapse a hazard list in place onto
     /// the fewest intervals whose intersections still cover every hazard in it.
     fn reduce_intervals(&mut self, intervals: &mut Vec<Dependency>);
+
+    /// `int computeTimeStamps(Operation *op, std::vector<TimeStampColumnVal> &parent_time_stamps)`
+    /// (`Analyses/TimeStamps.h:139`) — timestamps `op` and everything under it, appending its own
+    /// columns to `parent_time_stamps`.
+    ///
+    /// ⭐ `op` IS A BODY HERE because every call in this campaign passes the analyzer's own
+    /// `root_` — the `dataflow.program_unit` it was constructed with (`Analyses/TimeStamps.h:100`,
+    /// `:112`) — and the returned cycle count is discarded at that call.
+    fn compute_time_stamps(&mut self, op: &[Op], parent_time_stamps: &mut Vec<TimeStampColumnVal>);
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
@@ -1233,6 +1252,14 @@ impl TimeStamps for OutOfScopeTimeStamps {
 
     fn reduce_intervals(&mut self, _intervals: &mut Vec<Dependency>) {
         todo!("TimeStamp::reduceIntervals (Analyses/TimeStamps.cpp:228) — out of campaign scope")
+    }
+
+    fn compute_time_stamps(
+        &mut self,
+        _op: &[Op],
+        _parent_time_stamps: &mut Vec<TimeStampColumnVal>,
+    ) {
+        todo!("TimeStamp::computeTimeStamps (Analyses/TimeStamps.h:139) — out of campaign scope")
     }
 }
 

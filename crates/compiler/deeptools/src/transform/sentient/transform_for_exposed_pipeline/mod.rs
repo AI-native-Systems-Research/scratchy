@@ -602,10 +602,31 @@ impl Dependencies {
 //   original  : int TransformForExposedPipelinePass::getIndexOfEntry( std::vector<Dependency> &op_and_gap_list, mlir::Operation *op)
 //   calls     : e252_size
 
-// crustify:todo: e543_computeDependencies
-//   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:287  (13 body lines, level 3)
-//   original  : void TransformForExposedPipelinePass::computeDependencies( const dcc::DccExtContext &dcc_ext_ctx, TimeStamp &ts_analyzer, int cycles, std::string precision)
-//   calls     : e482_computeDependenciesSameBlock, e483_computeDependenciesAcrossBlocks
+impl Dependencies {
+    /// Replaces: e543_computeDependencies
+    ///
+    /// Timestamps the whole unit, then banks every RAW hazard within `cycles` of it — the same-block
+    /// ones first (e482), the rest after (e483).
+    ///
+    /// ⛔ THE ROOT IS THE ANALYZER'S OWN: `ts_analyzer.computeTimeStamps(ts_analyzer.root_, …)` hands
+    /// back the `dataflow.program_unit` it was constructed with (`Analyses/TimeStamps.h:100`, `:112`),
+    /// so `body` here IS that root and there is no second unit to pass.
+    /// ⛔ AND `tmp_time_stamps` IS WRITE-ONLY: nothing reads it after the call (`:290-291`), which is
+    /// why it is this function's own local and not a field.
+    /// ⚠️ `LLVM_DEBUG(ts_analyzer.printTimeStamps())` IS DROPPED (`:292`): it changes no IR.
+    pub(crate) fn compute_dependencies<A: Arch>(
+        &mut self,
+        ts: &mut impl TimeStamps,
+        body: &[Op],
+        cycles: Cycles,
+        precision: Precision,
+    ) {
+        let mut tmp_time_stamps = Vec::new();
+        ts.compute_time_stamps(body, &mut tmp_time_stamps);
+        self.compute_dependencies_same_block::<A>(ts, body, cycles, precision);
+        self.compute_dependencies_across_blocks::<A>(ts, body, cycles, precision);
+    }
+}
 
 // crustify:todo: e585_runOnOperation
 //   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:341  (35 body lines, level 4)
@@ -633,6 +654,8 @@ mod unit_tests {
         stamps: Vec<(OpId, Vec<TimeStampColumnVal>)>,
         gaps: Vec<((OpId, OpId), (Cycles, GapDirection))>,
         reductions: usize,
+        /// How many times the whole unit was timestamped — e543's own first act.
+        computed: usize,
     }
 
     impl TimeStamps for StatedTimeStamps {
@@ -664,6 +687,14 @@ mod unit_tests {
 
         fn reduce_intervals(&mut self, _intervals: &mut Vec<Dependency>) {
             self.reductions += 1;
+        }
+
+        fn compute_time_stamps(
+            &mut self,
+            _op: &[Op],
+            _parent_time_stamps: &mut Vec<TimeStampColumnVal>,
+        ) {
+            self.computed += 1;
         }
     }
 
@@ -976,6 +1007,7 @@ mod unit_tests {
                 ),
             ],
             reductions: 0,
+            computed: 0,
         };
 
         let mut dependencies = Dependencies::default();
@@ -1060,6 +1092,7 @@ mod unit_tests {
                 ),
             ],
             reductions: 0,
+            computed: 0,
         };
         let crossing = Dependency {
             src: OpId::at(&[0, 1]),
@@ -1107,6 +1140,84 @@ mod unit_tests {
                     gap: Cycles(5),
                 },
                 crossing,
+            ]
+        );
+    }
+
+    /// e543 — the unit is timestamped ONCE, then both halves run IN THAT ORDER: e482's same-block
+    /// hazard takes source `s` first, which is what stops e483 banking `s`'s self-dependence at gap 0.
+    #[test]
+    fn e543_timestamps_the_unit_then_runs_both_halves_in_order() {
+        let unrolled = sentient::UnrollFactor::X1;
+        let body = vec![
+            loop_over(vec![
+                mac(
+                    "s",
+                    sentient::Port::Lrf(sentient::LrfIndex::L2),
+                    &[sentient::Port::Lrf(sentient::LrfIndex::L2)],
+                    false,
+                    unrolled,
+                ),
+                mac(
+                    "t",
+                    sentient::Port::Lrf(sentient::LrfIndex::L2),
+                    &[sentient::Port::Lrf(sentient::LrfIndex::L5)],
+                    false,
+                    unrolled,
+                ),
+            ]),
+            mac(
+                "u",
+                sentient::Port::Lrf(sentient::LrfIndex::L5),
+                &[],
+                false,
+                unrolled,
+            ),
+        ];
+        let mut ts = StatedTimeStamps {
+            order: vec![OpId::at(&[0, 0]), OpId::at(&[0, 1]), OpId::at(&[1])],
+            stamps: vec![
+                (OpId::at(&[0, 0]), in_loop_at_zero()),
+                (OpId::at(&[0, 1]), in_loop_at_zero()),
+                (OpId::at(&[1]), vec![TimeStampColumnVal::Constant]),
+            ],
+            gaps: vec![
+                (
+                    (OpId::at(&[0, 0]), OpId::at(&[0, 0])),
+                    (Cycles(5), GapDirection::NextIter),
+                ),
+                (
+                    (OpId::at(&[0, 0]), OpId::at(&[0, 1])),
+                    (Cycles(2), GapDirection::Forward),
+                ),
+                (
+                    (OpId::at(&[0, 1]), OpId::at(&[1])),
+                    (Cycles(4), GapDirection::Forward),
+                ),
+            ],
+            reductions: 0,
+            computed: 0,
+        };
+        let mut deps = Dependencies::default();
+
+        deps.compute_dependencies::<Dd2>(&mut ts, &body, Cycles(6), Precision::Fp16);
+
+        assert_eq!(ts.computed, 1);
+        // e482's one bucket was reduced, and e483 reduces nothing here.
+        assert_eq!(ts.reductions, 1);
+        assert_eq!(
+            deps.with_min_gap,
+            vec![
+                Dependency {
+                    src: OpId::at(&[0, 0]),
+                    dst: OpId::at(&[0, 1]),
+                    gap: Cycles(2),
+                },
+                Dependency {
+                    src: OpId::at(&[0, 1]),
+                    dst: OpId::at(&[1]),
+                    gap: Cycles(4),
+                },
             ]
         );
     }

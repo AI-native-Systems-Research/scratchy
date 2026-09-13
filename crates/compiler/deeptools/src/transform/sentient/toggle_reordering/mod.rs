@@ -317,14 +317,32 @@ fn run_on_unit<A: Arch>(unit: &mut ProgramUnit<A>, evaluator: &mut impl Expressi
     )
 }
 
-// crustify:todo: e542_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ToggleReordering.cpp:149  (5 body lines, level 3)
-//   original  : void runOnOperation()
-//   calls     : e390_runOn, e481_runOn
+/// `-dcc-toggle-reordering-disable`, `cl::init(false)` (`:41-44`) — a `dcc-opt` command-line flag,
+/// not a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e542_runOnOperation
+///
+/// The pass entry: unless the flag disables it, reorder the toggles of the whole module.
+///
+/// ⛔ THE THIRD NAME OF ONE OVERLOAD SET: `runOnOperation`, `runOn(ModuleOp)` (e481) and
+/// `runOn(dataflow::ProgramUnitOp)` (e390) are three members of one class.
+/// ⭐ `getOperation()` IS THE MODULE, and this island's [`Program`] IS that module, so e481 is the one
+/// callee here and e390 is reached only through it.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    opts: &UnitFilter,
+    evaluator: &mut impl ExpressionEvaluator,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    run_on_program(program, opts, evaluator);
+}
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{SubOp, compute_toggle_info_if_is_toggle, run_on_program};
+    use super::{SubOp, compute_toggle_info_if_is_toggle, run_on_operation, run_on_program};
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -527,5 +545,15 @@ mod unit_tests {
         let mut program = program_on(DfirUnit::Pe);
         let mut evaluator = OutOfScopeEvaluator;
         run_on_program(&mut program, &UnitFilter::default(), &mut evaluator);
+    }
+
+    /// e542 — the disable flag is OFF, so the entry hands the whole module to e481 rather than
+    /// returning, and the walk arrives at the unported e390.
+    #[test]
+    #[should_panic(expected = "e390_runOn")]
+    fn e542_enters_the_module_because_the_disable_flag_is_off() {
+        let mut program = program_on(DfirUnit::Pe);
+        let mut evaluator = OutOfScopeEvaluator;
+        run_on_operation(&mut program, &UnitFilter::default(), &mut evaluator);
     }
 }

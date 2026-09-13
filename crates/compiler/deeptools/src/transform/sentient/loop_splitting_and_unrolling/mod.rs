@@ -1435,6 +1435,10 @@ mod unit_tests {
             InstructionCount(region.len() as i32)
         }
 
+        fn have_ibuff_space(&mut self, _unit: &[Op]) -> bool {
+            todo!("no unit here asks this fake whether the ibuff has space")
+        }
+
         fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
             self.ibuff_asks += 1;
             InstructionCount(self.ibuff_space)

@@ -80,17 +80,19 @@
 //! | `e478_doRegisterAllocation` | 478 | 2 | 5 | `dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:81` |
 //! | `e540_runOnOperation` | 540 | 3 | 8 | `dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:626` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
-// file's own tests until `e540_runOnOperation` lands and something calls it. CI runs clippy with
-// `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e540_runOnOperation`: at that point an unused item here is a real defect again.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`SmartRegisterAllocation::run_on_operation`]
+// (e540) is the entry, and there is no ported D29-D75 pass driver to call it, so nothing but this
+// file's own tests reaches anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e540 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
 use super::analyses::{Liveness, RegisterGraphs};
 use crate::arch::Arch;
-use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::sentient::RegType;
 use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::workload::Workload;
 
 /// THE ALLOCATOR'S OWN STATE (`:54-55`) — the graphs it colours and the assignment it hands back.
 ///
@@ -216,25 +218,69 @@ impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
     }
 }
 
-// crustify:todo: e540_runOnOperation
-//   authority : dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:626  (8 body lines, level 3)
-//   original  : void SmartRegisterAllocationPass::runOnOperation()
-//   calls     : e478_doRegisterAllocation
+impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
+    /// Replaces: e540_runOnOperation
+    ///
+    /// The pass entry: allocate registers in every program unit of the module, each against its own
+    /// live ranges.
+    ///
+    /// ⛔ NO DISABLE FLAG AND NO UNIT FILTER — unlike most passes in this campaign this one runs
+    /// unconditionally over every unit, whatever it is on (`:626-634`).
+    /// ⭐ `getChildAnalysis<Liveness>(unit)` IS A CONSTRUCTION: `Liveness(Operation *p) {
+    /// computeRegisterLiveRange(p); }` (`Analyses/Liveness.h:85`), so a fresh analysis per unit,
+    /// computed over that unit, is the port — the cache is MLIR's and holds nothing across units.
+    /// ⚠️ `DEBUG_WITH_TYPE(VerboseDebug, liveness.dump())` IS DROPPED (`:631`): it changes no IR.
+    pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload, L: Liveness + Default>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+    ) {
+        for unit in program.units.iter_mut() {
+            let mut liveness = L::default();
+            liveness.compute_register_live_range(&unit.body);
+            self.do_register_allocation(unit, &mut liveness);
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{Liveness, RegisterGraphs, SmartRegisterAllocation, is_known_to_have_same_values};
     use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
-    use crate::islands::dataflow_ir::Units;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::ProgramUnit;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
     use crate::transform::sentient::analyses::VirtualAssigns;
     use crate::transform::sentient::local_region_splitting_for_value_commoning::MaxRegNum;
     use crate::units::DfirUnit;
+    use crate::workload::Workload;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     /// A one-op-list PE program unit — e478 reads nothing of it but its body.
     fn unit_of(body: Vec<Op>) -> ProgramUnit<Dd2> {
@@ -422,5 +468,79 @@ mod unit_tests {
             }
         );
         assert_eq!(pass.register_assignment, Vec::new());
+    }
+
+    /// HOW MANY UNITS `FreshLiveness` WAS COMPUTED OVER — e540 constructs its analysis rather than
+    /// being handed one, so a static is the only place the count can be read back from.
+    static LIVE_RANGES_COMPUTED: AtomicU32 = AtomicU32::new(0);
+
+    /// A `Liveness` THAT RECORDS BEING CONSTRUCTED AND COMPUTED, which is e540's own contribution.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct FreshLiveness;
+
+    impl Liveness for FreshLiveness {
+        fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {}
+
+        fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
+            false
+        }
+
+        fn clear(&mut self, _virtual_assigns: VirtualAssigns) {
+            todo!("no unit here clears this fake")
+        }
+
+        fn compute_register_live_range(&mut self, _unit: &[Op]) {
+            LIVE_RANGES_COMPUTED.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {
+            todo!("no unit here offers a subset to this fake")
+        }
+
+        fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
+            todo!("no unit here enforces a pair on this fake")
+        }
+    }
+
+    /// e540 — the entry walks the module's units, and the first one gets a live range computed over
+    /// its OWN body before its graphs are built, then reaches the unported colouring.
+    #[test]
+    fn e540_computes_a_fresh_liveness_per_unit_before_allocating() {
+        let mut pass = SmartRegisterAllocation {
+            reg_graphs: CountingGraphs::default(),
+            register_assignment: Vec::new(),
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                unit_of(vec![scalar_const(1, 0), scalar_const(2, 1)]),
+                vec![unit_of(Vec::new())],
+            ),
+            bound: core::marker::PhantomData,
+        };
+        LIVE_RANGES_COMPUTED.store(0, Ordering::Relaxed);
+
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pass.run_on_operation::<Dd2, AnyModel, AnyRung, FreshLiveness>(&mut program);
+        }));
+
+        assert!(
+            reached.is_err(),
+            "e382 is not ported, so the first unit's colouring panics"
+        );
+        // The first unit only: it was computed over, cleaned and built over its two ops.
+        assert_eq!(LIVE_RANGES_COMPUTED.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            pass.reg_graphs,
+            CountingGraphs {
+                cleaned: 1,
+                built_over: Some((2, 1)),
+            }
+        );
     }
 }
