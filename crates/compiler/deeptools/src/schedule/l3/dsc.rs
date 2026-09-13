@@ -357,6 +357,13 @@ pub struct DesignSpaceConfig {
     /// ⭐ ABSENCE IS THE TWO `DT_CHECK`s: `memOrg_` naming no `LX`, or its entry carrying no allocate
     /// node (`L3DlOpsScheduler.cpp:1705-1709`), are one missing entry here.
     pub lx_chunk_capacity: BTreeMap<LdsIdx, Bytes>,
+    /// `N_.paddingSizes_` (`dsc/designSpaceConfig.h:103`) — the WHOLE data structure's padding, which
+    /// is where the window a padded dim belongs to is stated. EMPTY where nothing is padded.
+    ///
+    /// ⭐ THE PADDING ALONE AND NOT THE `N_` STAGE: entry 221 is the only reader and it asks this map
+    /// and nothing else of it, and a second copy of the extents is a second answer that can disagree
+    /// with [`Self::data_stages`].
+    pub full_padding: BTreeMap<PrimaryDim, DimPadding>,
 }
 
 impl DesignSpaceConfig {
@@ -584,8 +591,8 @@ pub struct DscScheduleStep {
     pub dl_dsc: Option<DscIdx>,
 }
 
-/// THE SUPER-DSC THIS STAGE SCHEDULES — `SuperDsc` (`dsc/superdsc.h:67`) reduced to the two fields
-/// this batch reads.
+/// THE SUPER-DSC THIS STAGE SCHEDULES — `SuperDsc` (`dsc/superdsc.h:67`) reduced to the fields this
+/// batch reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SuperDsc {
     dscs: DscList,
@@ -1226,6 +1233,13 @@ pub trait MemOrg {
     /// — which is *"Expect valid layoutDimOrder_."* (`:6719`).
     fn hbm_layout_dims(&self) -> Option<LayoutDims>;
 
+    /// `memOrg_.at(LX).isZeroPadded != ZpType::NOZEROPAD` FUSED WITH the `DT_CHECK_MSG(isPadded,
+    /// "Expect memOrg_ LX isPadded is true.")` beside it (`L3DlOpsScheduler.cpp:5320`).
+    ///
+    /// ⛔ [`None`] IS THAT CHECK: a zero-padded LX organisation that is not padded. `Some(false)` is
+    /// no LX entry and an LX entry that zero-pads nothing, which are one answer to every reader.
+    fn lx_zero_padded(&self) -> Option<bool>;
+
     /// `getPageSize()`'s KEY SET on that node (`dsc/dsc2.cpp:4480`), EMPTY where nothing pages.
     ///
     /// ⛔ THE SIZES ARE DELIBERATELY NOT ASKED FOR: every reader in scope asks `pageSize.count(dim)`
@@ -1623,6 +1637,44 @@ impl DataStages {
     #[must_use]
     pub fn super_chunk(&self, index: DatastageId) -> Option<SuperChunkStage> {
         self.at(index).map(|_| SuperChunkStage(index))
+    }
+
+    /// `dataStageIbrIdx` NAMING AN ENTRY THAT EXISTS — the same witness as [`Self::super_chunk`], for
+    /// the indirect-buffer-register stage entries 225 and 226 loop against.
+    #[must_use]
+    pub fn ibr(&self, index: DatastageId) -> Option<IbrStage> {
+        self.at(index).map(|_| IbrStage(index))
+    }
+
+    /// `dataStageOnePageIdx` NAMING AN ENTRY THAT EXISTS — the one-page stage entry 227 loops against.
+    #[must_use]
+    pub fn one_page(&self, index: DatastageId) -> Option<OnePageStage> {
+        self.at(index).map(|_| OnePageStage(index))
+    }
+}
+
+/// AN IBR DATA-STAGE INDEX THAT NAMES AN EXISTING ENTRY — minted by [`DataStages::ibr`] and by
+/// nothing else, as [`SuperChunkStage`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IbrStage(DatastageId);
+
+impl IbrStage {
+    /// `dataStageIbrIdx` (`L3DlOpsScheduler.h:226`).
+    #[must_use]
+    pub const fn index(self) -> DatastageId {
+        self.0
+    }
+}
+
+/// A ONE-PAGE DATA-STAGE INDEX THAT NAMES AN EXISTING ENTRY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnePageStage(DatastageId);
+
+impl OnePageStage {
+    /// `dataStageOnePageIdx` (`L3DlOpsScheduler.h:228`).
+    #[must_use]
+    pub const fn index(self) -> DatastageId {
+        self.0
     }
 }
 

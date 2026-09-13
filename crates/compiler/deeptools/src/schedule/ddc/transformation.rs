@@ -1408,7 +1408,7 @@ where
 mod tests_e105_e109 {
     use super::*;
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{DataInfo, Dsts, InstrAttribute, ReplicationFactor};
+    use crate::schedule::dsc2::{DataInfo, Dsts, InstrAttribute, ReplicationFactor, TransferPadding};
     use crate::units::NumFolds;
 
     /// A tree of computes, in traversal order.
@@ -1506,6 +1506,9 @@ mod tests_e105_e109 {
         let ex = SenComponent::Ptrow3;
         let compute = compute_on(ex, DataConnect::PeHtOut);
         let taken = TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
             name: NodeName("in".to_owned()),
             src: operand(SenComponent::Lxlu, Some(DataConnect::PeHtOut), Some(0)),
             dsts: Dsts::new(
@@ -1718,7 +1721,7 @@ mod tests_e105_e109 {
 mod tests_e242_e246 {
     use super::*;
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{DataInfo, Dsts, InstrAttribute, ReplicationFactor};
+    use crate::schedule::dsc2::{DataInfo, Dsts, InstrAttribute, ReplicationFactor, TransferPadding};
     use crate::units::NumFolds;
 
     fn operand(
@@ -1757,6 +1760,9 @@ mod tests_e242_e246 {
 
     fn transfer_node(src: Operand, dsts: Dsts) -> TransferNode {
         TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
             name: NodeName("t".to_owned()),
             src,
             dsts,

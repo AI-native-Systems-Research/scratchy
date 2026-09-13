@@ -2305,6 +2305,7 @@ mod unit_tests {
             data_stages: DataStages::new(stage.clone(), stage),
             indirect_access_index_lds: BTreeSet::new(),
             lx_chunk_capacity: BTreeMap::new(),
+            full_padding: BTreeMap::new(),
             labeled_ds: LabeledDsList::new(
                 LabeledDs::new(DsType::Input, vec![], LdsIdx(183), pinning),
                 vec![],
