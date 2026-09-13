@@ -1478,6 +1478,22 @@ pub struct ConditionNode {
 }
 
 impl ConditionNode {
+    /// `ConditionNode::addChildNode` (`dsc/dsc2.cpp:2143`) — the THEN region while none is stated and
+    /// the ELSE region after, which is how the two blocks a `ddl.if` opens land in order.
+    ///
+    /// ⛔ [`None`] IS *"ConditionNode only accepts 2 BlockNodes as children"*. The `nodeType_ != BLOCK`
+    /// half of that refusal is discharged by the argument type.
+    pub fn add_region(&mut self, block: BlockNode) -> Option<()> {
+        if self.then_region.is_empty() {
+            self.then_region.push(SchedNode::Block(block));
+        } else if self.else_region.is_empty() {
+            self.else_region.push(SchedNode::Block(block));
+        } else {
+            return None;
+        }
+        Some(())
+    }
+
     /// `hasCoreClCond()` — TRUE when no loop predicate was given, so `coreClCond_` is the guard.
     #[must_use]
     pub fn has_core_cl_cond(&self) -> bool {
@@ -1824,6 +1840,17 @@ impl ScheduleTree {
     ) -> Option<&mut BlockNode> {
         find_block_mut(&mut self.head, accepts)
     }
+
+    /// The same search over the `CONDITION` nodes, which [`Self::find_block_mut`] descends THROUGH
+    /// and never yields — `dsc2::ConditionNode` is a `BlockNode` in the reference and this type
+    /// splits its two children into [`ConditionNode::then_region`] and
+    /// [`ConditionNode::else_region`], so reaching one by name is its own search.
+    pub fn find_guarded_mut(
+        &mut self,
+        accepts: impl Fn(&ConditionNode) -> bool + Copy,
+    ) -> Option<&mut ConditionNode> {
+        find_guarded_mut(&mut self.head, accepts)
+    }
 }
 
 /// Pre-order DFS over the `BLOCK` nodes below `block`, which is itself never yielded.
@@ -1888,6 +1915,48 @@ fn find_block_mut_in(
                     return Some(found);
                 }
                 if let Some(found) = find_block_mut_in(&mut cond.else_region, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::StickMask(_) | SchedNode::Sync(_) | SchedNode::Leaf(_) => {}
+        }
+    }
+    None
+}
+
+/// The first accepted `CONDITION` node below `block`, in the same pre-order.
+fn find_guarded_mut(
+    block: &mut BlockNode,
+    accepts: impl Fn(&ConditionNode) -> bool + Copy,
+) -> Option<&mut ConditionNode> {
+    find_guarded_mut_in(&mut block.children, accepts)
+}
+
+/// The same search over a child list.
+fn find_guarded_mut_in(
+    children: &mut [SchedNode],
+    accepts: impl Fn(&ConditionNode) -> bool + Copy,
+) -> Option<&mut ConditionNode> {
+    for child in children {
+        match child {
+            SchedNode::Block(inner) | SchedNode::Condition(inner) => {
+                if let Some(found) = find_guarded_mut(inner, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::Loop(node) => {
+                if let Some(found) = find_guarded_mut(&mut node.block, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::Guarded(cond) => {
+                if accepts(cond) {
+                    return Some(cond.as_mut());
+                }
+                if let Some(found) = find_guarded_mut_in(&mut cond.then_region, accepts) {
+                    return Some(found);
+                }
+                if let Some(found) = find_guarded_mut_in(&mut cond.else_region, accepts) {
                     return Some(found);
                 }
             }

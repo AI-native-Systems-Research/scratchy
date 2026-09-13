@@ -158,7 +158,7 @@
 // entries land.
 use std::collections::{BTreeMap, BTreeSet};
 
-use sys_arch_spec::arch_enums::SenComponent;
+use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
 use crate::arch::{Arch, Elements};
 use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
@@ -189,7 +189,7 @@ use crate::schedule::dsc2::{
     LoopCond as DscLoopCond, LoopCondComposite as DscLoopCondComposite, LoopDim, LoopNode,
     MaxDimSize, NodeName, NumBuffers, NumChunks, Operand as DscOperand, PackIndex, Padding,
     Repetition, ReplicationFactor, SchedNode, ScheduleTree, StartAddress, SyncDirection, SyncNode,
-    SyncStrength, SyncUnits, TransferNode, TransferPadding, Unroll, generic_comp,
+    SyncStrength, SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
 };
 use crate::schedule::l3::dsc::{CoreCount, DesignSpaceConfig, EmptyStage, PadSizes};
 use crate::units::{Core, Corelet, NumFolds, rows_of};
@@ -1942,12 +1942,31 @@ impl DdlConversion {
         id
     }
 
+    /// The block of [`Self::tree`] that carries this name, INCLUDING THE HEAD.
+    ///
+    /// ⛔ `head_` IS NEVER VISITED BY A TRAVERSAL and it is still where the top region's ops attach:
+    /// `processRegion` is entered with `getHeadMutable()`, so a search that could not name it would
+    /// refuse every op of the dataflow.
+    fn block_mut(&mut self, name: &NodeName) -> Option<&mut BlockNode> {
+        if self.tree.head().name == *name {
+            return Some(self.tree.head_mut());
+        }
+        self.tree.find_block_mut(|block| block.name == *name)
+    }
+
     /// `currParent->addChildNode(node)`, [`None`] where no block of the tree carries that name.
     fn add_child(&mut self, parent: &NodeName, node: SchedNode) -> Option<()> {
-        self.tree
-            .find_block_mut(|block| block.name == *parent)?
-            .add_child(node);
+        self.block_mut(parent)?.add_child(node);
         Some(())
+    }
+
+    /// The same, VIRTUALLY: a `CONDITION` parent takes the block as its next region and every other
+    /// parent takes it as a child, which is the `addChildNode` override the reference dispatches on.
+    fn add_block_child(&mut self, parent: &NodeName, block: BlockNode) -> Option<()> {
+        if let Some(cond) = self.tree.find_guarded_mut(|node| node.name == *parent) {
+            return cond.add_region(block);
+        }
+        self.add_child(parent, SchedNode::Block(block))
     }
 
     /// The name of the block a [`BlockId`] addresses, which is how `belowLxScheduleInsertBlock`
@@ -4990,21 +5009,716 @@ const fn data_origin(data: &DataInfo) -> Option<DataOrigin> {
 //   extract   : crustify-ddc/cpp/ddl.cpp:3136-3763
 //   calls     : e176_getTensor, e177_dump, e179_getAccessPatternAsStr, e183_dump, e277_getTensorAndAllocation
 
-// crustify:todo: e345_exportToDdl
+/// Replaces: e345_exportToDdl
+///
+/// THE EXPORT ENTRY — `convertDsc2Ddl` verbatim, whose `std::ostream&` it forwards and which never
+/// writes it, so the emitted DDL IS the result and printing it is the caller's.
+pub fn export_to_ddl<S: DdlSizes + ?Sized>(
+    program: &Program,
+    state: &DdlConversion,
+    interface: &DdlInterface,
+    metadata: &Metadata,
+    dsc: &DesignSpaceConfig,
+    site: &S,
+) -> Option<EmittedDdl> {
+    convert_dsc2_ddl(program, state, interface, metadata, dsc, site)
+}
+
 //   authority : ddc/ddl/ddl_conversion.cpp:38  (3 body lines, level 3)
 //   class     : DdlConvertInterface
 //   original  : void DdlConvertInterface::exportToDdl(std::ostream& outputDdl)
 //   extract   : crustify-ddc/cpp/ddl.cpp:3795-3798
 //   calls     : e325_convertDsc2Ddl
 
-// crustify:todo: e346_processRegion
+/// ONE OP OF A DDL REGION AND THE REGIONS IT OPENS — `op.getRegion(i)` for each index entry 323
+/// answers, in the order the walk descends them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionOp<'d> {
+    /// The op itself.
+    pub op: DdlOp<'d>,
+    /// The regions this op owns, in `getRegions()` order.
+    pub regions: Vec<RegionId>,
+}
+
+/// EVERY REGION OF ONE DDL TEMPLATE — the ops each region holds, in `getOperations()` order.
+///
+/// ⭐ A PARAMETER AND NOT A CENSUS READ: the generated tables record a depth and a path, never the
+/// `mlir::Region` identity `region2blocks_` is keyed by, and `ddl.if` has no statement at all.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RegionTree<'d> {
+    /// The ops of each region.
+    pub ops: BTreeMap<RegionId, Vec<RegionOp<'d>>>,
+}
+
+/// Replaces: e346_processRegion
+///
+/// WALKS ONE DDL REGION INTO THE SCHEDULE TREE — every op in order, then each region it opens, under
+/// a fresh `<parent>_region<n>` block where the op opened more than one.
+///
+/// ⛔ [`None`] IS THE `DT_CHECK(numRegions == 0 || insertionPoint != nullptr)` and every refusal
+/// [`process_op`] answers with. ⛔ TRAP: an outcome region is an IDENTITY where the op's own list
+/// names it and a POSITION into that list otherwise — `ddl.loop` answers `RegionId(0)` positionally.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference's own member state"
+)]
+pub fn process_region<S: DdlSite + ?Sized>(
+    program: &Program,
+    state: &mut DdlConversion,
+    interface: &mut DdlInterface,
+    metadata: &mut Metadata,
+    dsc: &mut DesignSpaceConfig,
+    site: &mut S,
+    regions: &RegionTree<'_>,
+    region: RegionId,
+    curr_parent: &NodeName,
+) -> Option<()> {
+    interface.region2blocks.insert(region, curr_parent.clone());
+    for held in regions.ops.get(&region).map_or(&[][..], Vec::as_slice) {
+        let outcome = process_op(
+            program,
+            state,
+            interface,
+            metadata,
+            dsc,
+            site,
+            &held.op,
+            curr_parent,
+        )?;
+        let num_regions = outcome.regions.len();
+        if num_regions == 0 {
+            continue;
+        }
+        let insertion = outcome.parent?;
+        for (at, entry) in outcome.regions.iter().enumerate() {
+            let op_region = if held.regions.contains(entry) {
+                *entry
+            } else {
+                *held.regions.get(usize::try_from(entry.0).ok()?)?
+            };
+            let parent = if num_regions > 1 {
+                let name = NodeName(format!("{}_region{at}", insertion.0));
+                state.add_block_child(
+                    &insertion,
+                    BlockNode {
+                        name: name.clone(),
+                        children: Vec::new(),
+                    },
+                )?;
+                name
+            } else {
+                insertion.clone()
+            };
+            process_region(
+                program, state, interface, metadata, dsc, site, regions, op_region, &parent,
+            )?;
+        }
+    }
+    Some(())
+}
+
 //   authority : ddc/ddl/ddl_conversion.cpp:2008  (26 body lines, level 3)
 //   class     : DdlConversion
 //   original  : void DdlConversion::processRegion(::mlir::Region& myRegion, dsc2::BlockNode* currParent)
 //   extract   : crustify-ddc/cpp/ddl.cpp:3808-3835
 //   calls     : e323_processOp
 
-// crustify:todo: e347_matchDdl2Dsc
+/// ONE `ddl.operation_bind`, AS ENTRY 347 IS HANDED IT.
+///
+/// ⛔ A PARAMETER AND NOT A CENSUS READ: `build.rs`'s walk folds each bind into [`Program::op_func`]
+/// and the per-name roles and keeps NO `ddl.operation_bind` statement, so the pre-order the reference
+/// walks and every operand list it reads have to be stated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationBind {
+    /// `getResult()`.
+    pub result: NameId,
+    /// `stringToOpFuncs.at(getOpFuncName())`, whose miss is *"Unrecognized opFuncName"*.
+    pub op_func: Option<OpFunc>,
+    /// `getRequired()`.
+    pub required: bool,
+    /// `getDataFormats()`.
+    pub data_formats: Vec<NameId>,
+    /// `getInputs()`.
+    pub inputs: Vec<NameId>,
+    /// `getOutputs()`.
+    pub outputs: Vec<NameId>,
+    /// `getInterim()`.
+    pub interim: Vec<NameId>,
+}
+
+/// ONE `dsc.computeOp_` ENTRY AS THE BIND SEARCH TESTS IT — the four fields it compares plus the two
+/// exclude sets it turns into a core/corelet include set.
+///
+/// ⛔ DIVERGENCE: `DscComputeOp` carries no exclude set and no `interimLabeledDs`, and its operands
+/// are `DataInfo`s rather than indices; this states the questions the search actually asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindableOp {
+    /// `opFuncName`.
+    pub op_func: OpFunc,
+    /// `attributes_.dataFormat_`, absent for the reference's `INVALID`.
+    pub format: Option<DataFormat>,
+    /// `inputLabeledDs`, as indices.
+    pub inputs: Vec<LdsIdx>,
+    /// `outputLabeledDs`, as indices.
+    pub outputs: Vec<LdsIdx>,
+    /// `coreExclude`.
+    pub core_exclude: BTreeSet<Core>,
+    /// `coreClExclude`.
+    pub core_cl_exclude: BTreeSet<(Core, Corelet)>,
+}
+
+/// WHAT THE MATCH READS AND WRITES ON THE DSC beyond what [`DdlSite`] already answers.
+pub trait MatchSite: DdlSite {
+    /// `dsc.computeOp_`, IN ORDER — a [`ComputeOpIdx`] is a position in this vector.
+    fn bindable_ops(&self) -> Vec<BindableOp>;
+
+    /// `dsc.labeledDs_.at(lds).wordLength`.
+    fn lds_word_length(&self, lds: LdsIdx) -> Option<WordLength>;
+
+    /// `newLds.wordLength = type->bitSize_ / 8`.
+    fn set_lds_word_length(&mut self, lds: LdsIdx, length: WordLength);
+
+    /// `newLds.dataFormat_ = type->dataFormat_`.
+    fn set_lds_format(&mut self, lds: LdsIdx, format: DataFormat);
+}
+
+/// `op->getOperand(at)` as a list, which is how a `[%type, ..]` group is spelled — total over a lone
+/// name too, since the census records a one-element group either way.
+fn operand_group(operands: &[Operand], at: usize) -> Option<Vec<NameId>> {
+    match operands.get(at)? {
+        Operand::One(name) => Some(vec![*name]),
+        Operand::List(names) => Some(names.to_vec()),
+        Operand::OtherBind => None,
+    }
+}
+
+/// `layout_op.getDimensions()` with `getIsOrderFixed()`, and [`None`] for *"This op is used as a
+/// layout, but it is not"*.
+fn layout_dims_of(program: &Program, layout: NameId) -> Option<(Vec<NameId>, bool)> {
+    let stmt = program.definition(layout)?;
+    let Attrs::Layout { order_fixed } = stmt.attrs else {
+        return None;
+    };
+    Some((
+        operand_names(stmt.operands).into_iter().flatten().collect(),
+        order_fixed,
+    ))
+}
+
+/// `matchTensor` — ties one bind operand to a labeled DS, minting a stack LDS for an interim tensor
+/// and recording a regular tensor's three layouts for the dimension pass.
+///
+/// ⛔ [`None`] IS *"Multiple operation_bind ops use above tensor with different meaning"*, *"Regular
+/// tensor op cannot be used as interim tensor in operation_bind"*, *"Type incompatible with tensor
+/// role in operation"* and *"Use of non-tensor op when expected"*.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference's own capture list"
+)]
+fn match_tensor<S: MatchSite + ?Sized>(
+    program: &Program,
+    interface: &mut DdlInterface,
+    metadata: &mut Metadata,
+    site: &mut S,
+    layout_ops: &mut Vec<NameId>,
+    compute_op: ComputeOpIdx,
+    format: Option<DataFormat>,
+    tensor: NameId,
+    lds: Option<LdsIdx>,
+) -> Option<()> {
+    let stmt = program.definition(tensor)?;
+    if stmt.kind == StmtKind::AliasOneTensorOf {
+        tensor_prop(program, &mut interface.tensor_definition, tensor)?;
+    }
+    if let Some(prop) = interface.tensor_definition.get(&tensor) {
+        return (prop.lds == lds).then_some(());
+    }
+    interface
+        .tensor_definition
+        .insert(tensor, TensorProp::default());
+    match stmt.kind {
+        StmtKind::Tensor => {
+            let lds = lds?;
+            interface
+                .tensor_definition
+                .insert(tensor, TensorProp { lds: Some(lds) });
+            let types = process_types(program, &operand_group(stmt.operands, 3)?)?;
+            let held = site.lds_format(lds)?;
+            types.iter().find(|ty| ty.format == held)?;
+            for at in 0..3 {
+                layout_ops.push(operand_at(stmt.operands, at)?);
+            }
+            Some(())
+        }
+        StmtKind::InternalTensor => {
+            let reference = operand_at(stmt.operands, 0)?;
+            let reference =
+                tensor_prop(program, &mut interface.tensor_definition, reference)?.lds?;
+            let new_lds = add_internal_tensor(site, metadata, reference, compute_op)?;
+            let types = process_types(program, &operand_group(stmt.operands, 1)?)?;
+            let ty = match types.as_slice() {
+                [only] => *only,
+                many => *many.iter().find(|ty| Some(ty.format) == format)?,
+            };
+            site.set_lds_word_length(new_lds, WordLength(ty.bit_size.0 / 8));
+            site.set_lds_format(new_lds, ty.format);
+            interface
+                .tensor_definition
+                .insert(tensor, TensorProp { lds: Some(new_lds) });
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+/// `addDimConstraints` — narrows every DDL dim's candidate set from one layout: the dims this layout
+/// states get the layout's own dims, and every other unpadded dim loses them.
+///
+/// ⛔ [`None`] IS *"Not enough dimensions"* and *"Fixed layout with too many dimensions"*, both
+/// *"Impossible to match for sdsc"*. ⛔ ASKING IS A MUTATION — every read is an `operator[]`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference's own capture list"
+)]
+fn add_dim_constraints(
+    program: &Program,
+    interface: &mut DdlInterface,
+    bcasted: &BTreeSet<PrimaryDim>,
+    ddl_padded_dims: &mut BTreeSet<NameId>,
+    layout: NameId,
+    layout_dims: &[PrimaryDim],
+    is_global: bool,
+) -> Option<()> {
+    let (op_dims, order_fixed) = layout_dims_of(program, layout)?;
+    if op_dims.is_empty() {
+        return Some(());
+    }
+    let dims_set: BTreeSet<PrimaryDim> = layout_dims.iter().copied().collect();
+    let no_bcast: BTreeSet<PrimaryDim> = dims_set.difference(bcasted).copied().collect();
+    if op_dims.len() < no_bcast.len() || (order_fixed && op_dims.len() > layout_dims.len()) {
+        return None;
+    }
+    let mut no_pad: Vec<NameId> = Vec::with_capacity(op_dims.len());
+    for op_dim in &op_dims {
+        let prop = interface.dim_association.entry(*op_dim).or_default();
+        let dim = if matches!(prop.meta_dim_kind, MetaDimKind::Padded) {
+            let unpadded = prop.non_padded_dim?;
+            ddl_padded_dims.insert(*op_dim);
+            ddl_padded_dims.insert(unpadded);
+            unpadded
+        } else {
+            *op_dim
+        };
+        no_pad.push(dim);
+        if is_global {
+            interface
+                .dim_association
+                .entry(dim)
+                .or_default()
+                .global_layout_refs
+                .0 += 1;
+        }
+    }
+    for at in 0..no_pad.len() {
+        let op_dim = no_pad[at];
+        if !order_fixed {
+            if is_global || op_dims.len() <= layout_dims.len() {
+                interface
+                    .dim_association
+                    .entry(op_dim)
+                    .or_default()
+                    .dim_candidates
+                    .retain(|dim| dims_set.contains(dim));
+            }
+            continue;
+        }
+        let Some(&fixed) = layout_dims.get(at) else {
+            interface
+                .dim_association
+                .entry(op_dim)
+                .or_default()
+                .dim_candidates
+                .clear();
+            continue;
+        };
+        interface
+            .dim_association
+            .entry(op_dim)
+            .or_default()
+            .dim_candidates
+            .retain(|dim| *dim == fixed);
+        for (name, other) in &mut interface.dim_association {
+            if *name == op_dim || matches!(other.meta_dim_kind, MetaDimKind::Padded) {
+                continue;
+            }
+            other.dim_candidates.retain(|dim| *dim != fixed);
+        }
+    }
+    if !order_fixed {
+        for (name, prop) in &mut interface.dim_association {
+            if matches!(prop.meta_dim_kind, MetaDimKind::Padded) || no_pad.contains(name) {
+                continue;
+            }
+            prop.dim_candidates.retain(|dim| !no_bcast.contains(dim));
+        }
+    }
+    Some(())
+}
+
+/// `tryDimMapping` — the backtracking assignment of DSC dims to DDL dims, in the pruned order, which
+/// drops every DDL dim left over once each DSC dim is covered.
+///
+/// ⛔ ASKING IS A MUTATION: `dscDimsMapped[candidateDim]` default-inserts a dim that was never a
+/// mapping target, and the reference's own `all_of` then reads it back as UNMAPPED.
+fn try_dim_mapping(
+    interface: &mut DdlInterface,
+    dims: &[NameId],
+    mapped: &mut BTreeMap<PrimaryDim, bool>,
+    at: usize,
+) -> bool {
+    let all_done = mapped.values().all(|done| *done);
+    let Some(&dim) = dims.get(at) else {
+        return all_done;
+    };
+    if all_done {
+        interface.dim_association.entry(dim).or_default().drop_dim = true;
+        try_dim_mapping(interface, dims, mapped, at + 1);
+        return true;
+    }
+    let candidates = {
+        let prop = interface.dim_association.entry(dim).or_default();
+        prop.drop_dim = false;
+        prop.dim_candidates.clone()
+    };
+    for candidate in candidates {
+        if *mapped.entry(candidate).or_insert(false) {
+            continue;
+        }
+        interface.dim_association.entry(dim).or_default().dim = Some(candidate);
+        mapped.insert(candidate, true);
+        if try_dim_mapping(interface, dims, mapped, at + 1) {
+            return true;
+        }
+        mapped.insert(candidate, false);
+    }
+    interface.dim_association.entry(dim).or_default().drop_dim = true;
+    try_dim_mapping(interface, dims, mapped, at + 1)
+}
+
+/// Replaces: e347_matchDdl2Dsc
+///
+/// MAPS ONE DDL TEMPLATE ONTO THE DSC: binds each `ddl.operation_bind` to a compute op, mints an LDS
+/// per interim tensor, prunes each DDL dim's candidates from the layouts it appears in, then
+/// backtracks a dim assignment covering every non-broadcast DSC dim and fills the padded dims.
+///
+/// ⛔ `Some(false)` IS *"Template not suitable for DSC"* and [`None`] IS EVERY `DT_ERROR`.
+/// ⛔ TRAP: AN LDS INDEX IS POSITIONAL where a format, word length or stick is read from it and
+/// RECORDED where a layout is — the reference's `labeledDs_.at()` conflates the two.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference's own member state"
+)]
+pub fn match_ddl2_dsc<S: MatchSite + ?Sized>(
+    program: &Program,
+    interface: &mut DdlInterface,
+    metadata: &mut Metadata,
+    dsc: &mut DesignSpaceConfig,
+    site: &mut S,
+    binds: &[OperationBind],
+    padded: &BTreeMap<NameId, PaddedDimension<'_>>,
+) -> Option<bool> {
+    let mut failed = false;
+    let compute_ops = site.bindable_ops();
+    let mut mapped_ops = vec![false; compute_ops.len()];
+    let mut layout_ops: Vec<NameId> = Vec::new();
+    for bind in binds {
+        let op_func = bind.op_func?;
+        let types = process_types(program, &bind.data_formats)?;
+        let mut matched = None;
+        for (at, candidate) in compute_ops.iter().enumerate() {
+            if mapped_ops[at]
+                || candidate.op_func != op_func
+                || candidate.inputs.len() != bind.inputs.len()
+                || candidate.outputs.len() != bind.outputs.len()
+                || (!types.is_empty()
+                    && !types.iter().any(|ty| Some(ty.format) == candidate.format))
+            {
+                continue;
+            }
+            matched = Some(ComputeOpIdx(at));
+            mapped_ops[at] = true;
+            break;
+        }
+        let Some(compute_op) = matched else {
+            failed |= bind.required;
+            continue;
+        };
+        let comp = compute_ops.get(compute_op.0)?;
+        {
+            let cores: Vec<Core> = dsc.core_ids_used.iter().collect();
+            let corelets = corelets_of(dsc);
+            let prop = interface
+                .operation_definition
+                .entry(bind.result)
+                .or_default();
+            prop.compute_op = Some(compute_op);
+            if !comp.core_cl_exclude.is_empty() || !comp.core_exclude.is_empty() {
+                for core in cores {
+                    if comp.core_exclude.contains(&core) {
+                        continue;
+                    }
+                    for corelet in &corelets {
+                        if !comp.core_cl_exclude.contains(&(core, *corelet)) {
+                            prop.core_cl_cond
+                                .0
+                                .entry(core)
+                                .or_default()
+                                .insert(*corelet);
+                        }
+                    }
+                }
+            }
+        }
+        for (at, tensor) in bind.outputs.iter().enumerate() {
+            match_tensor(
+                program,
+                interface,
+                metadata,
+                site,
+                &mut layout_ops,
+                compute_op,
+                comp.format,
+                *tensor,
+                Some(*comp.outputs.get(at)?),
+            )?;
+        }
+        for (at, tensor) in bind.inputs.iter().enumerate() {
+            match_tensor(
+                program,
+                interface,
+                metadata,
+                site,
+                &mut layout_ops,
+                compute_op,
+                comp.format,
+                *tensor,
+                Some(*comp.inputs.get(at)?),
+            )?;
+        }
+        for tensor in &bind.interim {
+            match_tensor(
+                program,
+                interface,
+                metadata,
+                site,
+                &mut layout_ops,
+                compute_op,
+                comp.format,
+                *tensor,
+                None,
+            )?;
+        }
+        if bind.interim.is_empty() {
+            continue;
+        }
+        let shift = u32::try_from(bind.interim.len()).ok()?;
+        let old = LdsIdx(
+            site.labeled_ds_tail()?
+                .insert_position
+                .0
+                .checked_sub(shift)?,
+        );
+        let new = LdsIdx(old.0 + shift);
+        for slot in site.lds_slots() {
+            if !matches!(
+                slot,
+                LdsSlot::TransferSrc(_) | LdsSlot::TransferDst(_, _) | LdsSlot::Allocate(_)
+            ) {
+                continue;
+            }
+            if site.slot_lds(slot) == Some(old) {
+                site.set_slot_lds(slot, new);
+            }
+        }
+        let prefilled = &mut metadata.prefilled_external_transfer_data_connects;
+        let keys: Vec<(Option<LdsIdx>, ExternalStorage)> = prefilled
+            .keys()
+            .filter(|(lds, _)| *lds == Some(old))
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(slot) = prefilled.remove(&key) {
+                prefilled.insert((Some(new), key.1), slot);
+            }
+        }
+    }
+    if mapped_ops.contains(&false) {
+        failed = true;
+    }
+    if failed {
+        return Some(false);
+    }
+    let mut dims_to_map: Vec<NameId> = Vec::new();
+    for layout in &layout_ops {
+        let (dims, _) = layout_dims_of(program, *layout)?;
+        for ddl_dim in dims {
+            if !interface.dim_association.contains_key(&ddl_dim) {
+                match program.definition(ddl_dim)?.kind {
+                    StmtKind::PaddedDimension => {
+                        process_padded_dimension_op(
+                            program,
+                            interface,
+                            ddl_dim,
+                            *padded.get(&ddl_dim)?,
+                        )?;
+                    }
+                    StmtKind::Dimension => {
+                        process_dimension_op(program, interface, ddl_dim)?;
+                    }
+                    _ => return None,
+                }
+            }
+            let prop = interface.dim_association.get(&ddl_dim)?;
+            let entry = if matches!(
+                prop.meta_dim_kind,
+                MetaDimKind::Unpadded | MetaDimKind::WindowDim
+            ) {
+                ddl_dim
+            } else {
+                let unpadded = prop.non_padded_dim?;
+                interface.dim_association.get(&unpadded)?;
+                unpadded
+            };
+            if !dims_to_map.contains(&entry) {
+                dims_to_map.push(entry);
+            }
+        }
+    }
+    let mut dsc_dims_mapped: BTreeMap<PrimaryDim, bool> = BTreeMap::new();
+    let mut processed_lds: BTreeSet<LdsIdx> = BTreeSet::new();
+    let mut ddl_padded_dims: BTreeSet<NameId> = BTreeSet::new();
+    let tensors: Vec<(NameId, Option<LdsIdx>)> = interface
+        .tensor_definition
+        .iter()
+        .map(|(name, prop)| (*name, prop.lds))
+        .collect();
+    for (name, lds) in tensors {
+        let stmt = program.definition(name)?;
+        if stmt.kind != StmtKind::Tensor {
+            continue;
+        }
+        let lds = lds?;
+        if !processed_lds.insert(lds) {
+            continue;
+        }
+        let recorded = dsc.labeled_ds.at(lds)?.recorded();
+        let global_dims = dsc.layout_dims.get(&recorded)?.to_vec();
+        let non_bcasted = dsc.non_broadcast_lds_dim_set(recorded)?;
+        let mut bcasted: BTreeSet<PrimaryDim> = BTreeSet::new();
+        for dim in &global_dims {
+            if non_bcasted.contains(dim) {
+                dsc_dims_mapped.entry(*dim).or_insert(false);
+            } else {
+                bcasted.insert(*dim);
+            }
+        }
+        let elem_in_slice = 128u64.checked_div(u64::from(site.lds_word_length(lds)?.0))? / 8;
+        let mut slice_dims: Vec<PrimaryDim> = Vec::new();
+        let mut stick_dims: Vec<PrimaryDim> = Vec::new();
+        let mut num_elem = 1u64;
+        for (dim, size) in site.stick_dims(lds)?.0 {
+            if num_elem < elem_in_slice {
+                slice_dims.push(dim);
+            }
+            num_elem = num_elem.saturating_mul(size.0);
+            if num_elem > elem_in_slice {
+                stick_dims.push(dim);
+            }
+        }
+        for (at, dims, is_global) in [
+            (0, &slice_dims, false),
+            (1, &stick_dims, false),
+            (2, &global_dims, true),
+        ] {
+            add_dim_constraints(
+                program,
+                interface,
+                &bcasted,
+                &mut ddl_padded_dims,
+                operand_at(stmt.operands, at)?,
+                dims,
+                is_global,
+            )?;
+        }
+    }
+    let mut dsc_padded: BTreeSet<PrimaryDim> = BTreeSet::new();
+    let mut dsc_window: BTreeSet<PrimaryDim> = BTreeSet::new();
+    for (dim, padding) in &dsc.core_stage().dims().padding {
+        dsc_padded.insert(*dim);
+        if let Some(window) = padding.window_dim {
+            dsc_window.insert(window);
+        }
+    }
+    for (op_dim, prop) in &mut interface.dim_association {
+        if !ddl_padded_dims.contains(op_dim) {
+            prop.dim_candidates.retain(|dim| !dsc_padded.contains(dim));
+        }
+        if !matches!(prop.meta_dim_kind, MetaDimKind::WindowDim) {
+            prop.dim_candidates.retain(|dim| !dsc_window.contains(dim));
+        }
+    }
+    dims_to_map.sort_by_key(|dim| {
+        interface
+            .dim_association
+            .get(dim)
+            .map_or((GlobalLayoutRefs(0), 0), |prop| {
+                (prop.global_layout_refs, prop.dim_candidates.len())
+            })
+    });
+    if dims_to_map.len() < dsc_dims_mapped.len()
+        || !try_dim_mapping(interface, &dims_to_map, &mut dsc_dims_mapped, 0)
+    {
+        return None;
+    }
+    for dim in interface
+        .dim_association
+        .keys()
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        let (kind, non_padded) = {
+            let prop = interface.dim_association.entry(dim).or_default();
+            (prop.meta_dim_kind, prop.non_padded_dim)
+        };
+        if matches!(kind, MetaDimKind::Unpadded) {
+            continue;
+        }
+        let (drop_dim, base) = match non_padded {
+            Some(unpadded) => {
+                let prop = interface.dim_association.entry(unpadded).or_default();
+                (prop.drop_dim, prop.dim)
+            }
+            None => (false, None),
+        };
+        interface.dim_association.entry(dim).or_default().drop_dim = drop_dim;
+        if drop_dim {
+            continue;
+        }
+        if matches!(kind, MetaDimKind::WindowDim) {
+            let window = dsc.core_stage().dims().padding.get(&base?)?.window_dim?;
+            interface.dim_association.entry(dim).or_default().dim = Some(window);
+            continue;
+        }
+        interface.dim_association.entry(dim).or_default().dim = base;
+        if let Some(target) = base {
+            dsc.full_padding.entry(target).or_default();
+            dsc.data_stages.ensure_padding(target);
+        }
+    }
+    check_meta_dimensions(program, interface, dsc)?;
+    Some(true)
+}
+
 //   authority : ddc/ddl/ddl_conversion.cpp:2110  (442 body lines, level 3)
 //   class     : DdlConversion
 //   original  : bool DdlConversion::matchDdl2Dsc()
@@ -5030,37 +5744,41 @@ mod unit_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU32;
 
-    use sys_arch_spec::arch_enums::SenComponent;
+    use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
     use super::{
-        AllocOp, AllocationSite, ComputeOpIdx, ConstraintCmp, DdlConstraint, DdlConversion,
-        DdlInterface, DdlSizes, DimMapping, DimProp, EmittedAllocate, EmittedOp, EmittedStage,
-        EmittedTensor, ExprValue, GlobalLayoutRefs, InternalTensor, InternalTensorSite,
-        LabeledDsTail, LdsSlot, LoopCount, StyledDims, SyncLabel, TensorAndAllocation, TensorProp,
-        TypeDefinition, add_internal_tensor, allocation_pad_type, check_meta_dimensions,
-        convert_dsc2_ddl, pad_type_spelling, process_access_patterns, process_condition,
-        process_dimension_op, process_expression, process_types, tensor, tensor_and_allocation,
-        tensor_prop, transfer_access_pattern, verify_ddl_constraint,
+        AllocOp, AllocationSite, BindableOp, ComputeOpIdx, CondProp, ConstraintCmp, DdlConstraint,
+        DdlConversion, DdlInterface, DdlOp, DdlSite, DdlSizes, DimMapping, DimProp,
+        EmittedAllocate, EmittedDdl, EmittedOp, EmittedStage, EmittedTensor, ExprValue,
+        GlobalLayoutRefs, InternalTensor, InternalTensorSite, LabeledDsTail, LdsSlot, LoopCount,
+        MatchSite, OperationBind, PaddedDimension, RegionId, RegionOp, RegionTree, StyledDims,
+        SyncLabel, TensorAndAllocation, TensorProp, TypeDefinition, add_internal_tensor,
+        allocation_pad_type, check_meta_dimensions, convert_dsc2_ddl, export_to_ddl,
+        match_ddl2_dsc, pad_type_spelling, process_access_patterns, process_condition,
+        process_dimension_op, process_expression, process_region, process_types, tensor,
+        tensor_and_allocation, tensor_prop, transfer_access_pattern, verify_ddl_constraint,
     };
     use crate::arch::{Dd2, Elements};
     use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
-    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+        Extent, PrimaryDim, StickDims,
+    };
     use crate::formats::{Bits, DataFormat};
     use crate::generated::{
-        AccessPattern, Attrs, DimProperty, LoopLabel, NameId, Operand, PROGRAMS, Program, Stmt,
-        StmtKind, Strategy,
+        AccessPattern, Attrs, DataType, DimProperty, LoopLabel, NameId, Operand, PROGRAMS, Program,
+        Stmt, StmtKind, Strategy,
     };
     use crate::schedule::ddc::fold::{AllocId, ConstIdx, DataOrigin, NodeId, PadType};
     use crate::schedule::ddc::metadata::{
         Allocation, DataConnectSlot, DataTransfer, DdcMemory, ExternalStorage, MetaDimKind,
         Metadata, OpaqueOp, TransferAccessPattern, TransferEnd,
     };
-    use crate::schedule::ddc::transformation::DsType;
+    use crate::schedule::ddc::transformation::{DsType, Scale};
     use crate::schedule::ddc::transformation_util::{LoopCond, StageName};
     use crate::schedule::dsc2::{
-        AllocLayout, AllocPlacement, AllocateNode, BlockNode, LdsIdx, LoopDim, LoopNode,
-        MaxDimSize, NodeName, NumBuffers, SchedNode, StartAddress, SyncDirection, SyncNode,
-        SyncStrength, SyncUnits,
+        AllocLayout, AllocPlacement, AllocateNode, BlockNode, LayoutDims, LdsIdx, LoopDim,
+        LoopNode, MaxDimSize, NodeName, NumBuffers, SchedNode, StartAddress, SyncDirection,
+        SyncNode, SyncStrength, SyncUnits, WordLength,
     };
     use crate::schedule::l3::dsc::{
         CoreCount, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DimPadding,
@@ -6300,5 +7018,379 @@ mod unit_tests {
             None
         );
         assert!(unassigned.contains_key(&NameId(0)));
+    }
+
+    // ⭐ FIXTURES FOR ENTRIES 345-347.
+
+    /// A DSC seam that answers the four questions the match asks and nothing else: every tensor is
+    /// two bytes of fp16, one stick of `X = 4` over `Y = 2`, and no allocation is placed.
+    struct Match {
+        ops: Vec<BindableOp>,
+    }
+
+    impl AllocationSite for Match {
+        fn lds_allocation(&self, _lds: LdsIdx, _unit: SenComponent) -> Option<AllocId> {
+            None
+        }
+        fn constant_allocation(&self, _constant: ConstIdx, _unit: SenComponent) -> Option<AllocId> {
+            None
+        }
+    }
+
+    impl InternalTensorSite for Match {
+        fn labeled_ds_tail(&self) -> Option<LabeledDsTail> {
+            None
+        }
+        fn set_last_lds_idx(&mut self, _lds: LdsIdx) {}
+        fn tensors_with_lds(&self, _lds: LdsIdx) -> Vec<NameId> {
+            Vec::new()
+        }
+        fn set_tensor_lds(&mut self, _tensor: NameId, _lds: LdsIdx) {}
+        fn insert_internal_tensor(&mut self, _new: InternalTensor) {}
+        fn add_interim_lds(&mut self, _compute_op: ComputeOpIdx, _lds: LdsIdx) {}
+        fn lds_slots(&self) -> Vec<LdsSlot> {
+            Vec::new()
+        }
+        fn slot_lds(&self, _slot: LdsSlot) -> Option<LdsIdx> {
+            None
+        }
+        fn set_slot_lds(&mut self, _slot: LdsSlot, _lds: LdsIdx) {}
+        fn allocation_lds(&self, _alloc: AllocId) -> Option<LdsIdx> {
+            None
+        }
+        fn set_allocation_lds(&mut self, _alloc: AllocId, _lds: LdsIdx) {}
+    }
+
+    impl DdlSite for Match {
+        fn fused_format(&self) -> Option<DataFormat> {
+            Some(DataFormat::Sen169Fp16)
+        }
+        fn lds_format(&self, _lds: LdsIdx) -> Option<DataFormat> {
+            Some(DataFormat::Sen169Fp16)
+        }
+        fn unit_reaches(&self, _unit: SenComponent, _storage: SenComponent) -> bool {
+            false
+        }
+        fn dim_in_layout_order(&self, _lds: LdsIdx, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn wk_slices(&self, _dim: PrimaryDim) -> Option<u32> {
+            None
+        }
+        fn core_by_slice(&self, _dim: PrimaryDim, _slice: u32) -> Option<Core> {
+            None
+        }
+        fn stick_dims(&self, _lds: LdsIdx) -> Option<StickDims> {
+            Some(StickDims(vec![
+                (PrimaryDim::X, Elements(4)),
+                (PrimaryDim::Y, Elements(2)),
+            ]))
+        }
+    }
+
+    impl MatchSite for Match {
+        fn bindable_ops(&self) -> Vec<BindableOp> {
+            self.ops.clone()
+        }
+        fn lds_word_length(&self, _lds: LdsIdx) -> Option<WordLength> {
+            Some(WordLength(2))
+        }
+        fn set_lds_word_length(&mut self, _lds: LdsIdx, _length: WordLength) {}
+        fn set_lds_format(&mut self, _lds: LdsIdx, _format: DataFormat) {}
+    }
+
+    /// A DSC whose one INPUT tensor is labelled at index ZERO and lays out `X` then `Y`, which is
+    /// what the match needs [`config`]'s recorded index 183 not to be.
+    fn matchable() -> DesignSpaceConfig {
+        let mut dsc = config(Pinning::default(), None);
+        dsc.labeled_ds = LabeledDsList::new(
+            LabeledDs::new(
+                DsType::Input,
+                vec![
+                    (PrimaryDim::X, Scale::Sized(1.0)),
+                    (PrimaryDim::Y, Scale::Sized(1.0)),
+                ],
+                LdsIdx(0),
+                Pinning::default(),
+            ),
+            vec![],
+        );
+        dsc.layout_dims.insert(
+            LdsIdx(0),
+            LayoutDims::new(PrimaryDim::X, vec![PrimaryDim::Y]),
+        );
+        dsc
+    }
+
+    /// ⭐ THE EXPORT IS `convertDsc2Ddl` AND NOTHING ELSE: the two answer the same emission over the
+    /// same state, and the `std::ostream&` the reference forwards is never written.
+    #[test]
+    fn exports_exactly_what_the_conversion_emits() {
+        struct Site;
+        impl AllocationSite for Site {
+            fn lds_allocation(&self, _lds: LdsIdx, _unit: SenComponent) -> Option<AllocId> {
+                None
+            }
+            fn constant_allocation(
+                &self,
+                _constant: ConstIdx,
+                _unit: SenComponent,
+            ) -> Option<AllocId> {
+                None
+            }
+        }
+        impl DdlSizes for Site {
+            fn block_transfer_size(&self, _transfer: NodeId) -> Option<Elements> {
+                None
+            }
+            fn buffer_capacity(&self, _alloc: AllocId) -> Option<Elements> {
+                None
+            }
+        }
+        let program = synthetic(&[], &[]);
+        let interface = DdlInterface::default();
+        let metadata = Metadata::default();
+        let dsc = config(Pinning::default(), None);
+        let state = DdlConversion::new(BlockNode {
+            name: NodeName("head".to_owned()),
+            children: Vec::new(),
+        });
+        let exported = export_to_ddl(&program, &state, &interface, &metadata, &dsc, &Site);
+        assert_eq!(
+            exported,
+            convert_dsc2_ddl(&program, &state, &interface, &metadata, &dsc, &Site)
+        );
+        assert_eq!(
+            exported,
+            Some(EmittedDdl {
+                dim_mapping: BTreeMap::new(),
+                lds_mapping: BTreeMap::new(),
+                dataflow: Vec::new(),
+            })
+        );
+    }
+
+    /// ⭐⭐ A MULTI-REGION OP OPENS A BLOCK PER REGION: an unresolved `ddl.if` mints its condition
+    /// node and then `condition_region0` and `condition_region1` under it, which is where the THEN
+    /// and ELSE arms attach — and every region records the block that was current when it opened.
+    #[test]
+    fn opens_a_named_block_per_region_of_a_multi_region_op() {
+        let program = synthetic(&[], &[]);
+        let mut interface = DdlInterface::default();
+        interface
+            .resolved_conditions
+            .insert(NameId(0), CondProp::default());
+        let mut metadata = Metadata::default();
+        let mut dsc = config(Pinning::default(), None);
+        let mut site = Match { ops: Vec::new() };
+        let head = NodeName("head".to_owned());
+        let mut state = DdlConversion::new(BlockNode {
+            name: head.clone(),
+            children: Vec::new(),
+        });
+        let regions = RegionTree {
+            ops: BTreeMap::from([(
+                RegionId(0),
+                vec![RegionOp {
+                    op: DdlOp::If {
+                        condition: NameId(0),
+                        then_region: RegionId(1),
+                        else_region: RegionId(2),
+                    },
+                    regions: vec![RegionId(1), RegionId(2)],
+                }],
+            )]),
+        };
+        assert_eq!(
+            process_region(
+                &program,
+                &mut state,
+                &mut interface,
+                &mut metadata,
+                &mut dsc,
+                &mut site,
+                &regions,
+                RegionId(0),
+                &head,
+            ),
+            Some(())
+        );
+        assert_eq!(
+            interface.region2blocks,
+            BTreeMap::from([
+                (RegionId(0), head),
+                (RegionId(1), NodeName("condition_region0".to_owned())),
+                (RegionId(2), NodeName("condition_region1".to_owned())),
+            ])
+        );
+        let [SchedNode::Guarded(cond)] = state.tree.head().children.as_slice() else {
+            panic!("the condition node the unresolved `ddl.if` minted");
+        };
+        assert_eq!(
+            cond.then_region
+                .iter()
+                .chain(cond.else_region.iter())
+                .map(|child| child.name().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                NodeName("condition_region0".to_owned()),
+                NodeName("condition_region1".to_owned()),
+            ]
+        );
+    }
+
+    /// ⭐⭐ THE WHOLE MATCH, AND THEN THE REFUSAL: one `ddl.operation_bind` over an fp16 `add` binds
+    /// the DSC's only compute op, ties its tensor to LDS 0, and — because both fixed layouts state
+    /// `%d0` then `%d1` while the DSC lays out `X` then `Y` — maps `%d0` to `X` and `%d1` to `Y`.
+    /// A required bind whose arity no compute op has is *"Template not suitable for DSC"*.
+    #[test]
+    fn binds_the_template_and_maps_every_dsc_dim() {
+        const OPS: &[Stmt] = &[
+            Stmt {
+                kind: StmtKind::Dimension,
+                depth: 0,
+                attrs: Attrs::Dimension { property: None },
+                results: &[NameId(0)],
+                operands: &[],
+                path: &[],
+            },
+            Stmt {
+                kind: StmtKind::Dimension,
+                depth: 0,
+                attrs: Attrs::Dimension { property: None },
+                results: &[NameId(1)],
+                operands: &[],
+                path: &[],
+            },
+            Stmt {
+                kind: StmtKind::Layout,
+                depth: 0,
+                attrs: Attrs::Layout { order_fixed: true },
+                results: &[NameId(2)],
+                operands: &[Operand::One(NameId(0)), Operand::One(NameId(1))],
+                path: &[],
+            },
+            Stmt {
+                kind: StmtKind::Layout,
+                depth: 0,
+                attrs: Attrs::Layout { order_fixed: true },
+                results: &[NameId(3)],
+                operands: &[],
+                path: &[],
+            },
+            Stmt {
+                kind: StmtKind::Layout,
+                depth: 0,
+                attrs: Attrs::Layout { order_fixed: true },
+                results: &[NameId(4)],
+                operands: &[Operand::One(NameId(0)), Operand::One(NameId(1))],
+                path: &[],
+            },
+            Stmt {
+                kind: StmtKind::Type,
+                depth: 0,
+                attrs: Attrs::Type {
+                    data_type: DataType::Sen169Fp16,
+                    bit_width: None,
+                },
+                results: &[NameId(5)],
+                operands: &[],
+                path: &[],
+            },
+            Stmt {
+                kind: StmtKind::Tensor,
+                depth: 0,
+                attrs: Attrs::Bare(StmtKind::Tensor),
+                results: &[NameId(6)],
+                operands: &[
+                    Operand::One(NameId(2)),
+                    Operand::One(NameId(3)),
+                    Operand::One(NameId(4)),
+                    Operand::List(&[NameId(5)]),
+                ],
+                path: &[],
+            },
+        ];
+        let program = synthetic(
+            &[
+                "%d0", "%d1", "%slice", "%stick", "%global", "%type", "%tensor", "%add_op",
+            ],
+            OPS,
+        );
+        let compute = BindableOp {
+            op_func: OpFunc::Add,
+            format: Some(DataFormat::Sen169Fp16),
+            inputs: vec![LdsIdx(0)],
+            outputs: vec![LdsIdx(0)],
+            core_exclude: BTreeSet::new(),
+            core_cl_exclude: BTreeSet::new(),
+        };
+        let bind = OperationBind {
+            result: NameId(7),
+            op_func: Some(OpFunc::Add),
+            required: true,
+            data_formats: Vec::new(),
+            inputs: vec![NameId(6)],
+            outputs: vec![NameId(6)],
+            interim: Vec::new(),
+        };
+        let padded: BTreeMap<NameId, PaddedDimension<'_>> = BTreeMap::new();
+        let mut interface = DdlInterface::default();
+        let mut metadata = Metadata::default();
+        let mut dsc = matchable();
+        let mut site = Match {
+            ops: vec![compute.clone()],
+        };
+        assert_eq!(
+            match_ddl2_dsc(
+                &program,
+                &mut interface,
+                &mut metadata,
+                &mut dsc,
+                &mut site,
+                &[bind],
+                &padded,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            interface.operation_definition[&NameId(7)].compute_op,
+            Some(ComputeOpIdx(0))
+        );
+        assert_eq!(
+            interface.tensor_definition[&NameId(6)],
+            TensorProp {
+                lds: Some(LdsIdx(0))
+            }
+        );
+        assert_eq!(
+            [
+                interface.dim_association[&NameId(0)].dim,
+                interface.dim_association[&NameId(1)].dim,
+            ],
+            [Some(PrimaryDim::X), Some(PrimaryDim::Y)]
+        );
+
+        let two_inputs = OperationBind {
+            result: NameId(7),
+            op_func: Some(OpFunc::Add),
+            required: true,
+            data_formats: Vec::new(),
+            inputs: vec![NameId(6), NameId(6)],
+            outputs: vec![NameId(6)],
+            interim: Vec::new(),
+        };
+        assert_eq!(
+            match_ddl2_dsc(
+                &program,
+                &mut DdlInterface::default(),
+                &mut Metadata::default(),
+                &mut matchable(),
+                &mut Match { ops: vec![compute] },
+                &[two_inputs],
+                &padded,
+            ),
+            Some(false)
+        );
     }
 }

@@ -201,7 +201,19 @@ pub fn ddl_main(buffer: impl DdlSource, dialect: &Dialect) -> Option<Verified> {
 //   extract   : crustify-ddc/cpp/ddl.cpp:1535-1552
 //   calls     : e273_processBuffer
 
-// crustify:todo: e344_DdlMain
+/// Replaces: e344_DdlMain
+///
+/// PARSES THE NAMED FILE AS A MODULE — `openInputFile` and then `DdlMain` over what it opened.
+///
+/// ⛔ AN UNOPENABLE FILE IS [`None`], and so is `DT_CHECK(op)` — the `errorMessage` the reference
+/// prints is the OPEN's own diagnostic and the caller owns the stream.
+/// ⭐ THE FILENAME NEVER REACHES THIS PORT: opening it is the mechanism for reaching a buffer, so a
+/// source that is absent IS the failed open.
+#[must_use]
+pub fn ddl_main_of_file(file: Option<impl DdlSource>, dialect: &Dialect) -> Option<Verified> {
+    ddl_main(file?, dialect)
+}
+
 //   authority : ddc/ddl/ddl.cpp:96  (12 body lines, level 3)
 //   original  : OwningOpRef<Operation*> DdlMain(const char* input_filename, MLIRContext* context)
 //   extract   : crustify-ddc/cpp/ddl.cpp:3772-3785
@@ -217,7 +229,7 @@ pub fn ddl_main(buffer: impl DdlSource, dialect: &Dialect) -> Option<Verified> {
 #[cfg(test)]
 mod tests_e171 {
     use super::ops::{DdlOp, Dialect, StorageBits, Unverified, Value};
-    use super::{DdlSource, ParsedDdl, perform_actions, process_buffer};
+    use super::{DdlSource, ParsedDdl, ddl_main_of_file, perform_actions, process_buffer};
 
     /// A source that hands back a fixed module, standing in for `parseSourceFileForTool`.
     struct Fixed(ParsedDdl);
@@ -256,6 +268,19 @@ mod tests_e171 {
             perform_actions(&module(Some(StorageBits(4))), &dialect),
             None
         );
+    }
+
+    /// ⭐ THE OPEN AND THEN THE PARSE: a source that could not be opened is the reference's null
+    /// return, and one that could is gated by the very same verifiers.
+    #[test]
+    fn ddl_main_of_file_is_the_open_and_then_the_parse() {
+        let dialect = Dialect::initialize();
+        assert_eq!(
+            ddl_main_of_file(Some(module(Some(StorageBits(16)))), &dialect)
+                .map(|ok| ok.ops().len()),
+            Some(2)
+        );
+        assert_eq!(ddl_main_of_file(None::<Fixed>, &dialect), None);
     }
 
     /// ⭐ THE BUFFER IS CONSUMED — `process_buffer` takes its source BY VALUE, so the same storage
