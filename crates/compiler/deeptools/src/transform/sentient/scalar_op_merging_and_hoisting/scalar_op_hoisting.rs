@@ -517,10 +517,11 @@ pub(crate) fn hoist_candidate_out_of_loop(
 /// THE MERGING INCREMENT AS BOTH THINGS THE CHAIN WALK NEEDS IT AS — the [`EvaluatedValue`] handle
 /// [`OperationData`] stores, and the decoded [`Evaluation`] `doesValueExceedLRFRange` reads.
 ///
-/// ⛔ THE SEAM DELIBERATELY FORBIDS TURNING ONE INTO THE OTHER: a handle names an entry in the
-/// evaluator's arena and decoding it is `Analyses/ExpressionEvaluatorUtils`' work, out of campaign
-/// scope. The reference has one `const EvaluatedValue &` and both readings of it for free; here the
-/// caller states both, which is why they are one parameter rather than two.
+/// ⛔ THE PORT NEVER TURNS ONE INTO THE OTHER ITSELF: a handle names an entry in the evaluator's
+/// arena, so decoding it is `Analyses/ExpressionEvaluatorUtils`' work — reachable only by ASKING the
+/// seam ([`ExpressionEvaluator::evaluation_of`]), which is an out-of-scope `todo!` where stating both
+/// flavours costs nothing. The reference has one `const EvaluatedValue &` and both readings of it for
+/// free; here the caller states both, which is why they are one parameter rather than two.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MergingIncrement<'a> {
     /// What [`OperationData::mod_by`] keeps.

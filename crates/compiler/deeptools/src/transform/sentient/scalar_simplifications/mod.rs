@@ -145,10 +145,147 @@ pub fn update_cmp_i_predicate(if_op: IfPredicate<'_>, new_predicate: CmpPredicat
     }
 }
 
-// crustify:todo: e371_transformIfCondition
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:77  (109 body lines, level 1)
-//   original  : void ScalarSimplificationsPass::transformIfCondition( IfOp& if_op, OpBuilder& builder, const affine::FlatAffineValueConstraints& constraints)
-//   calls     : e179_updateCmpIPredicate, e252_size
+/// THE ONE CONSTRAINT ROW e371 READS — `constraints.getEquality(0)` when there is exactly one
+/// equality and `getInequality(0)` otherwise (`:79-81`), paired with `constraints.getValue(dim_id)`.
+///
+/// ⛔ WHICH ROW IT IS IS THE CALLER'S, NOT THIS TYPE'S: `affine::FlatAffineValueConstraints` is out of
+/// campaign scope, and e471 is the unit that solves the system and picks the row.
+/// ⛔ THE TRAILING CONSTANT IS NOT A DIM: the reference's loop stops at `getNumDimVars()` and reads
+/// `coefficients.back()` separately, so a constant term never becomes an operand.
+pub struct AffineConstraint {
+    /// One `(getValue(dim_id), coefficients[dim_id])` per dim var, in dim order.
+    pub dim_coefficients: Vec<(Val, i64)>,
+    /// `coefficients.back()` — the row's constant term, the whole row reading `… >= 0` or `… == 0`.
+    pub constant: i64,
+}
+
+/// WHICH SIDE OF THE COMPARISON THE ROW'S CONSTANT LANDS ON — `transformed_lhs_constant_arg` and
+/// `transformed_rhs_constant_arg` (`:85-86`), which the reference fills from a three-way `if / else
+/// if / else if` and so can never both hold a value.
+///
+/// ⛔ THE MUTUAL EXCLUSION IS WHY THE REFERENCE'S LAST CASCADE ARM (`:167-175`) IS DEAD, and that arm
+/// carries a defect: it builds its constant from `transformed_rhs_constant_arg[0] +
+/// transformed_rhs_constant_arg[0]`, the rhs constant added to ITSELF where the two buckets' sum was
+/// evidently meant. Stating the exclusion as a type makes the arm inexpressible instead of copying
+/// the defect into a branch nothing can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstantArg {
+    /// `transformed_lhs_constant_arg` — the row's constant, non-negative, with no variable opposite it.
+    Lhs(i64),
+    /// `transformed_rhs_constant_arg` — `-1 * const_coeff`, so a POSITIVE magnitude.
+    Rhs(i64),
+}
+
+/// Replaces: e371_transformIfCondition
+///
+/// Rewrites one `sentient.if` into the two operands of the solved constraint row — a variable or a
+/// fresh constant on each side — and re-points its predicate at `>=` or the `> 0` the row simplified.
+///
+/// ⛔ ANY COEFFICIENT BUT `1`, `-1` OR `0` ABANDONS THE OP (`:96-100`), as does a row that would need
+/// three operands or names more variables than one per side (`:118-121`, `:176-178`).
+/// ⛔ THE SIGN FOLLOWS THE SIDE THE CONSTANT MOVES TO, not the bucket it came from: crossing the
+/// comparison negates it, staying put does not.
+/// ⚠️ DELIBERATE DIVERGENCE, ONE ARM: for a rhs variable against a rhs constant the reference emits
+/// `+transformed_rhs_constant_arg[0]` on the LHS (`:161-166`), turning `-y - 5 >= 0` into `5 >= y`
+/// where the row says `-5 >= y`. That bucket holds `-const_coeff`, so the operand that does NOT cross
+/// the comparison needs it negated back — every other arm negates exactly when it crosses.
+/// ⭐ `arg_type` IS `transformed_*_args.back().getType()`, `builder.getI32Type()` where the row named
+/// no variable at all (`:126-130`), and the type its `DT_CHECK` asserts every arg shares — a `Val`
+/// carries none, so it arrives from e471 exactly as e532's `operand_type` does.
+pub fn transform_if_condition(
+    if_op: &mut Op,
+    constraint: &AffineConstraint,
+    arg_type: ScalarTy,
+    const_scope: &mut Vec<Op>,
+    values: &mut Values,
+) {
+    let Some(predicate) = IfPredicate::of(if_op).map(|slot| slot.get()) else {
+        return;
+    };
+    let mut lhs_args: Vec<Val> = Vec::new();
+    let mut rhs_args: Vec<Val> = Vec::new();
+    for &(value, coefficient) in &constraint.dim_coefficients {
+        match coefficient {
+            1 => lhs_args.push(value),
+            -1 => rhs_args.push(value),
+            0 => continue,
+            // "We don't support multiplication with non-unit value in the simplification."
+            _ => return,
+        }
+    }
+    let lhs_rhs_arg_present = !lhs_args.is_empty() && !rhs_args.is_empty();
+
+    let mut const_coeff = constraint.constant;
+    let mut new_predicate = CmpPredicate::Sge;
+    // "... - 1 >= 0 can be simplified to ... > 0".
+    if const_coeff == -1 && predicate == CmpPredicate::Sge {
+        const_coeff = 0;
+        new_predicate = CmpPredicate::Sgt;
+    }
+    let constant = if const_coeff >= 0 && !lhs_rhs_arg_present {
+        Some(ConstantArg::Lhs(const_coeff))
+    } else if const_coeff < 0 {
+        Some(ConstantArg::Rhs(-const_coeff))
+    } else {
+        // "return if constant is not zero, otherwise we need three operands to if condition."
+        if const_coeff != 0 {
+            return;
+        }
+        None
+    };
+
+    // `sentient.if` supports only two variables at max — `total_args <= 2` (`:137-141`) is what each
+    // accepting arm below spells, every one of them naming exactly two.
+    let (operand_0, operand_1) = match (lhs_args.as_slice(), rhs_args.as_slice(), constant) {
+        ([lhs], [rhs], None) => (Side::Arg(*lhs), Side::Arg(*rhs)),
+        // The constant crosses to the rhs, so it is negated.
+        ([lhs], [], Some(ConstantArg::Lhs(value))) => (Side::Arg(*lhs), Side::Constant(-value)),
+        ([lhs], [], Some(ConstantArg::Rhs(value))) => (Side::Arg(*lhs), Side::Constant(value)),
+        ([], [rhs], Some(ConstantArg::Lhs(value))) => (Side::Constant(value), Side::Arg(*rhs)),
+        // ⚠️ THE DIVERGENCE — see this function's doc.
+        ([], [rhs], Some(ConstantArg::Rhs(value))) => (Side::Constant(-value), Side::Arg(*rhs)),
+        _ => return,
+    };
+    for (at, side) in [operand_0, operand_1].into_iter().enumerate() {
+        let val = match side {
+            Side::Arg(val) => val,
+            Side::Constant(value) => sink_constant(const_scope, value, arg_type, values),
+        };
+        set_operand(if_op, at, val);
+    }
+    if let Some(slot) = IfPredicate::of(if_op) {
+        update_cmp_i_predicate(slot, new_predicate);
+    }
+}
+
+/// WHAT ONE OPERAND OF THE REWRITTEN `sentient.if` IS — a value the row already names, or a
+/// `sentient::ConstantOp::create(builder, …)` the arm builds for it.
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    /// `if_op.setOperand(idx, transformed_*_args[0])`.
+    Arg(Val),
+    /// `if_op.setOperand(idx, sentient::ConstantOp::create(builder, loc, arg_type, value))`.
+    Constant(i64),
+}
+
+/// `sentient::ConstantOp::create(builder, if_op->getLoc(), arg_type, value)` ON THE PASS'S OWN
+/// `const_builder`, which is [`simplify_conditionals`]'s block of constants and not the walked one.
+fn sink_constant(
+    const_scope: &mut Vec<Op>,
+    value: i64,
+    ty: ScalarTy,
+    values: &mut Values,
+) -> Val {
+    let result = values.mint();
+    const_scope.push(Op::Sentient(ops::Op::ScalarConstant {
+        value,
+        result,
+        reg_locale: ops::RegType::Imm,
+        ty,
+        is_symbol: false,
+    }));
+    result
+}
 
 /// Replaces: e471_simplifyConditionals
 ///
@@ -703,9 +840,9 @@ pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ConstSink, IfPredicate, Model, Program, Workload, run_on_operation,
-        simplify_binary_operation, simplify_conditionals, simplify_load_store_operation,
-        update_cmp_i_predicate,
+        AffineConstraint, ConstSink, IfPredicate, Model, Program, Workload, operands,
+        run_on_operation, simplify_binary_operation, simplify_conditionals,
+        simplify_load_store_operation, transform_if_condition, update_cmp_i_predicate,
     };
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
@@ -805,6 +942,16 @@ mod unit_tests {
         fn first_propagated_args(&mut self, map: ExprInfoMap) -> Vec<Val> {
             vec![Val(map.0)]
         }
+    }
+
+    /// A value pool that has already issued `issued` values, so what a unit mints reads apart from
+    /// the fixture's own names.
+    fn values_after(issued: u32) -> Values {
+        let mut values = Values::default();
+        for _ in 0..issued {
+            values.mint();
+        }
+        values
     }
 
     /// `sentient.if %lhs `pred` %rhs { }`.
@@ -941,6 +1088,93 @@ mod unit_tests {
             &mut Values::default(),
         );
         assert_eq!(program.units.iter().next().expect("the head unit").body, body);
+    }
+
+    /// e371 — the vendor's own simplification (`:105-107`): `x - 1 >= 0` loses its constant and
+    /// becomes `x > 0`, both operands re-pointed at what the row names.
+    #[test]
+    fn a_row_ending_in_minus_one_becomes_a_strict_comparison_against_zero() {
+        let mut op = if_op(CmpPredicate::Sge);
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        transform_if_condition(
+            &mut op,
+            &AffineConstraint {
+                dim_coefficients: vec![(Val(7), 1)],
+                constant: -1,
+            },
+            ScalarTy::Index,
+            &mut consts,
+            &mut values,
+        );
+        assert_eq!(
+            op,
+            Op::Sentient(ops::Op::If {
+                predicate: CmpPredicate::Sgt,
+                lhs: Val(7),
+                rhs: Val(10),
+                yielded: Vec::new(),
+                dbg_name: None,
+                then_body: Vec::new(),
+                else_body: Vec::new(),
+            })
+        );
+        // The `-1` became the `0` of `x > 0`, built at the pass's own const builder.
+        assert_eq!(
+            consts,
+            vec![Op::Sentient(ops::Op::ScalarConstant {
+                value: 0,
+                result: Val(10),
+                reg_locale: ops::RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            })]
+        );
+    }
+
+    /// e371 — ⚠️ THE DOCUMENTED DIVERGENCE: `-y - 5 >= 0` is `-5 >= y`, and the reference's own arm
+    /// emits `5 >= y` by reusing the rhs bucket's positive magnitude on the side that never crosses
+    /// the comparison.
+    #[test]
+    fn a_rhs_variable_against_a_rhs_constant_keeps_the_rows_sign() {
+        let mut op = if_op(CmpPredicate::Sge);
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        transform_if_condition(
+            &mut op,
+            &AffineConstraint {
+                dim_coefficients: vec![(Val(7), -1)],
+                constant: -5,
+            },
+            ScalarTy::Index,
+            &mut consts,
+            &mut values,
+        );
+        assert_eq!(operands(&op), vec![Val(10), Val(7)]);
+        assert_eq!(
+            consts,
+            vec![Op::Sentient(ops::Op::ScalarConstant {
+                value: -5,
+                result: Val(10),
+                reg_locale: ops::RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            })]
+        );
+        // ⛔ AND A COEFFICIENT THE SIMPLIFICATION DOES NOT SUPPORT ABANDONS THE OP UNTOUCHED.
+        let mut op = if_op(CmpPredicate::Sge);
+        let untouched = op.clone();
+        transform_if_condition(
+            &mut op,
+            &AffineConstraint {
+                dim_coefficients: vec![(Val(7), 2)],
+                constant: -5,
+            },
+            ScalarTy::Index,
+            &mut consts,
+            &mut values,
+        );
+        assert_eq!(op, untouched);
     }
 
     /// e581 — the first walk reaches a `sentient.if` nested in a loop, and with expressions on both

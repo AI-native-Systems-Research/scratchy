@@ -88,9 +88,10 @@
 //! | `e579_runOn` | 579 | 4 | 15 | `dcc/src/Transform/Sentient/ScalarOpReordering.cpp:191` |
 
 #![allow(dead_code)]
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e367_runOnOperation` (level 1) is what calls
-// [`ScalarOpReordering::run_on_program`], and every item below is reachable only from this file's own
-// tests until it lands. CI runs clippy with `-D warnings`. ⭐ REMOVE THIS WITH e367.
+// ⛔ THE PASS ENTRY EXISTS BUT NOTHING CALLS IT — e367 is `ScalarOpReordering::run_on_operation`, the
+// pass's own `runOnOperation`, and no sentient pipeline in this crate calls any pass's entry, so every
+// item below is reachable only from this file's own tests. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WHEN THE SENTIENT PIPELINE CALLS `ScalarOpReordering::run_on_operation`.
 
 use core::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -261,10 +262,10 @@ impl ScalarResult {
 
 /// `ScalarOpReorderingPass`'s state (`:147-186`).
 ///
-/// ⚠️ `dcc_ext_ctx_` IS NOT CARRIED YET: `dccExtContext()` is read by e370 alone (for `getMaxRegNum`),
-/// so it enters with that unit. `opts_` ARRIVED WITH e579, whose include-list gate is its only reader.
-/// The two use caches — `val_to_first_use_in_block_cache_` and `val_to_last_use_in_block_cache_` —
-/// enter with e368 and e369, which are what fill and read them.
+/// ⚠️ `dcc_ext_ctx_` IS NOT CARRIED: `dccExtContext()` is read only by the `getMaxRegNum` recompute e370
+/// leaves out of scope. `opts_` ARRIVED WITH e579, whose include-list gate is its only reader.
+/// ⛔ THE TWO USE CACHES ARE DROPPED, not missing — see [`first_use_within_block`] (memoisation, which
+/// this campaign may drop) and [`last_use_within_block`] (keyed by value alone, hence stale).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScalarOpReordering {
     /// `op_to_idx_` — ⛔ KEYED BY POSITION, WHICH IS NOT WHAT `Operation *` IS: an [`OpId`] moves when
@@ -442,25 +443,70 @@ fn walk_pre_order<'a>(
     }
 }
 
-// crustify:todo: e367_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:74  (5 body lines, level 1)
-//   original  : void runOnOperation()
-//   calls     : e175_runOn
+/// `DisableThisPass` (`:39-42`) — `cl::init(false)`, so the pass runs.
+const DISABLE_THIS_PASS: bool = false;
 
-// crustify:todo: e368_getFirstUseWithinBlock
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:383  (23 body lines, level 1)
-//   original  : Operation *ScalarOpReorderingPass::getFirstUseWithinBlock(Value v)
-//   calls     : e178_findAncestorInBlock
+impl ScalarOpReordering {
+    /// Replaces: e367_runOnOperation
+    ///
+    /// The pass entry: reorder the scalar ops of every unit of one module, unless the pass is disabled.
+    ///
+    /// ⭐ `getOperation()` IS THE `ModuleOp`, which this island spells as the [`Program`] the walk of
+    /// [`Self::run_on_program`] (e175) takes.
+    pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+    ) {
+        if DISABLE_THIS_PASS {
+            return;
+        }
+        self.run_on_program(program);
+    }
+}
 
-// crustify:todo: e369_getLastUseWithinBlock
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:407  (23 body lines, level 1)
-//   original  : Operation *ScalarOpReorderingPass::getLastUseWithinBlock(Value v, Block *bb)
-//   calls     : e178_findAncestorInBlock
+/// Replaces: e368_getFirstUseWithinBlock
+///
+/// The earliest position in `block` whose op — itself or something nested in it — reads `val`, and
+/// `None` when nothing in `block` does (which covers `v.use_empty()`).
+///
+/// ⛔ `block` IS THE DEFINING OP'S OWN BLOCK, which the reference computes and both callers here
+/// already hold; asking it of another block is what e369 takes a `bb` argument for.
+/// ⛔⛔ THE CACHE IS DROPPED, not forgotten: `val_to_first_use_in_block_cache_` is memoisation, and a
+/// key that is a [`Val`] alone cannot answer a per-block question (see e369's, which is stale by
+/// construction). A position also goes stale under the moves e531 makes, where an `Operation *` does not.
+/// ⭐ A USE NESTED IN A REGION ANSWERS THE ENCLOSING POSITION — that is all [`ancestor_in_block`] does,
+/// read downwards, and `dominates` within one block is index order.
+fn first_use_within_block(val: Val, block: &[Op]) -> Option<InBlock> {
+    block
+        .iter()
+        .position(|op| subtree_reads(op, val))
+        .map(InBlock)
+}
 
-// crustify:todo: e370_localeHasFreeRegs
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:431  (30 body lines, level 1)
-//   original  : bool ScalarOpReorderingPass::localeHasFreeRegs(SentientRegType locale)
-//   calls     : e056_set, e063_getMaxRegNum
+/// Replaces: e369_getLastUseWithinBlock
+///
+/// The latest position in `block` whose op — itself or something nested in it — reads `val`, and `None`
+/// when nothing in `block` does.
+///
+/// ⛔⛔ THE REFERENCE'S CACHE IS DEFECTIVE AND SO IS DROPPED RATHER THAN COPIED:
+/// `val_to_last_use_in_block_cache_` is keyed by `Value` ALONE while this function takes the block as an
+/// ARGUMENT, so the second block to ask about one value silently gets the first block's answer. e470
+/// asks about an operand's block, not the operand's own.
+fn last_use_within_block(val: Val, block: &[Op]) -> Option<InBlock> {
+    block
+        .iter()
+        .rposition(|op| subtree_reads(op, val))
+        .map(InBlock)
+}
+
+/// Whether `op` reads `val` at any depth — the `findAncestorInBlock` climb of every use, read downwards
+/// from the block instead, which reaches the same set of in-block ancestors.
+fn subtree_reads(op: &Op, val: Val) -> bool {
+    dialects::operands(op).contains(&val)
+        || dialects::regions_ref(op)
+            .iter()
+            .any(|region| region.iter().any(|nested| subtree_reads(nested, val)))
+}
 
 /// `dcc::utils::isConstant<sentient::ConstantOp>` (`dcc/src/Utils/Utils.cpp:424`) — a
 /// `sentient.scalar_constant`, or a `uniform.query_map` over a mapping of nothing else.
@@ -485,43 +531,31 @@ fn is_sentient_constant(val: Val, scope: &[Op]) -> bool {
 }
 
 impl ScalarOpReordering {
-    /// `getFirstUseWithinBlock(Value)` — entry 368, level 1, not yet ported.
+    /// Replaces: e370_localeHasFreeRegs
     ///
-    /// ⛔ IT IS e368 AND IT IS NOT PORTED YET. Both its parts exist: [`ancestor_in_block`] is the
-    /// per-use climb and a position in `block` is the dominance answer it compares; the two use caches
-    /// this fills are that unit's to add to [`ScalarOpReordering`].
-    fn first_use_within_block(&mut self, val: Val, block: &[Op]) -> Option<InBlock> {
-        let _ = (val, block);
-        todo!(
-            "getFirstUseWithinBlock (senpass e368, ScalarOpReordering.cpp:383) is not ported yet — \
-             the earliest in-block ancestor of a use of {val:?}, memoised in \
-             val_to_first_use_in_block_cache_"
-        )
-    }
-
-    /// `getLastUseWithinBlock(Value, Block *)` — entry 369, level 1, not yet ported.
+    /// Whether `locale` still has a register free: `imm` and `unknown` always do, so does one already
+    /// measured to have room, and one with a positive over-estimate does not — spending one of it,
+    /// because reordering one scalar op frees at most one register.
     ///
-    /// ⛔ IT IS e369 AND IT IS NOT PORTED YET; it is [`Self::first_use_within_block`] with the
-    /// dominance comparison the other way round.
-    fn last_use_within_block(&mut self, val: Val, block: &[Op]) -> Option<InBlock> {
-        let _ = (val, block);
-        todo!(
-            "getLastUseWithinBlock (senpass e369, ScalarOpReordering.cpp:407) is not ported yet — \
-             the latest in-block ancestor of a use of {val:?}, memoised in \
-             val_to_last_use_in_block_cache_"
-        )
-    }
-
-    /// `localeHasFreeRegs(SentientRegType)` — entry 370, level 1, not yet ported.
-    ///
-    /// ⛔ IT IS e370 AND IT IS NOT PORTED YET. Its two shortcuts read state this type already carries
-    /// ([`PerLocale`]), but what stands behind them is `Liveness` + `RegisterPressure`, both out of
-    /// campaign scope.
+    /// ⛔ FALSE NEGATIVES ONLY, by the reference's own note (`:432-433`): the bitvector is never cleared.
+    /// ⛔ THE RECOMPUTE BEHIND BOTH SHORTCUTS IS `Liveness` + `RegisterPressure`, OUT OF CAMPAIGN SCOPE.
     fn locale_has_free_regs(&mut self, locale: sentient::RegType) -> bool {
-        let _ = locale;
+        if matches!(
+            locale,
+            sentient::RegType::Imm | sentient::RegType::Unknown
+        ) || self.locale_has_free_regs.get(locale)
+        {
+            return true;
+        }
+        let exceeded = self.locale_to_num_regs_exceeded.get(locale);
+        if exceeded > 0 {
+            self.locale_to_num_regs_exceeded.set(locale, exceeded - 1);
+            return false;
+        }
         todo!(
-            "localeHasFreeRegs (senpass e370, ScalarOpReordering.cpp:431) is not ported yet — the \
-             RegisterPressure recompute behind the per-locale free-register bitvector"
+            "localeHasFreeRegs: RegisterPressure::getOrComputeRegisterPressure + \
+             DccExtContext::getMaxRegNum (ScalarOpReordering.cpp:449-458) — out of campaign scope, so \
+             whether {locale:?} has a register free is inconclusive and cannot be recomputed here"
         )
     }
 
@@ -573,7 +607,7 @@ impl ScalarOpReordering {
             )
         };
         // Scalar ops with no uses are dead and should not be moved.
-        let Some(first_use) = self.first_use_within_block(result.val(), block) else {
+        let Some(first_use) = first_use_within_block(result.val(), block) else {
             return false;
         };
         if let Some(next_op) = block.get(at.0 + 1)
@@ -604,7 +638,7 @@ impl ScalarOpReordering {
                 // an op and so is not one.
                 continue;
             }
-            let Some(operand_last_use) = self.last_use_within_block(val, block) else {
+            let Some(operand_last_use) = last_use_within_block(val, block) else {
                 todo!(
                     "isCandidateForReordering: DT_CHECK_MSG(operand_last_use, \"Op itself is a use \
                      of its operands\") (ScalarOpReordering.cpp:524) — {val:?} is read by the op at \
@@ -715,7 +749,8 @@ impl ScalarOpReordering {
     /// candidate's own block is still an insertion point — the walk just ends there.
     /// ⛔ AN OPERAND IS RE-QUEUED ONLY IF IT WAS ALREADY POPPED (`:360-372`), which is what keeps one op
     /// out of the queue twice, and it leaves `visited` so it can be re-queued again later.
-    /// ⭐ `val_to_first_use_in_block_cache_.clear()` IS e368'S CACHE and so is its invalidation.
+    /// ⭐ `val_to_first_use_in_block_cache_.clear()` (`:356`) GOES WITH THE CACHE e368 drops: with no
+    /// memo to invalidate, every ask after a move recomputes, which is what the clear was for.
     pub fn find_and_process_candidates(&mut self, unit_body: &mut Vec<Op>) {
         let mut locale_to_candidates: PerLocale<Vec<Candidate>> = PerLocale::per_locale(|_| Vec::new());
         // Every candidate by result, for the re-queue below: the reference pushes the pointer back and
@@ -792,7 +827,7 @@ impl ScalarOpReordering {
                         let Some(block) = cur_at.block(unit_body) else {
                             continue;
                         };
-                        let Some(first_use) = self.first_use_within_block(cur.result, block) else {
+                        let Some(first_use) = first_use_within_block(cur.result, block) else {
                             continue;
                         };
                         cur_at.sibling(first_use)
@@ -879,7 +914,7 @@ impl ScalarOpReordering {
 mod unit_tests {
     use super::{
         InBlock, LiverangeIndex, PerLocale, ScalarOpReordering, ScalarResult, UnitFilter,
-        ancestor_in_block, is_sentient_constant,
+        ancestor_in_block, first_use_within_block, is_sentient_constant, last_use_within_block,
     };
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
@@ -980,16 +1015,58 @@ mod unit_tests {
         }
     }
 
-    /// e531 — the collection walk reaches the candidate test on the unit's own scalar op, which is as
-    /// far as any path through this pass can get while e368 is unported.
+    /// e531 — a multi-use candidate moves down to just before the ancestor of its first use, and the
+    /// two constants and the op that reads it stay where they are.
     #[test]
-    #[should_panic(expected = "senpass e368")]
-    fn every_path_through_the_drain_reaches_the_unported_first_use() {
-        let unit = vec![constant(Val(1)), add(Val(1), Val(1), Val(2)), add(Val(2), Val(1), Val(3))];
+    fn a_multi_use_candidate_moves_down_to_its_first_use() {
+        let unit = vec![
+            constant(Val(1)),
+            add(Val(1), Val(1), Val(2)),
+            constant(Val(3)),
+            add(Val(2), Val(2), Val(4)),
+        ];
         let mut pass = ScalarOpReordering::default();
         pass.compute_op_indexing(&unit);
-        let mut body = unit;
+        let mut body = unit.clone();
         pass.find_and_process_candidates(&mut body);
+        assert_eq!(
+            body,
+            vec![unit[0].clone(), unit[2].clone(), unit[1].clone(), unit[3].clone()]
+        );
+    }
+
+    /// e368 and e369 — the earliest and the latest position of `block` reading a value, a use NESTED in
+    /// a loop counted at the LOOP, and a value nothing in the block reads answering `None`.
+    #[test]
+    fn first_and_last_use_bracket_the_in_block_positions_that_read_a_value() {
+        let block = vec![
+            constant(Val(1)),
+            add(Val(1), Val(1), Val(2)),
+            for_op(Val(3), Val(9), vec![add(Val(1), Val(91), Val(4))]),
+            constant(Val(5)),
+        ];
+        assert_eq!(first_use_within_block(Val(1), &block), Some(InBlock(1)));
+        assert_eq!(last_use_within_block(Val(1), &block), Some(InBlock(2)));
+        // `v.use_empty()` and "used, but from another block" are one answer here.
+        assert_eq!(first_use_within_block(Val(5), &block), None);
+        assert_eq!(last_use_within_block(Val(5), &block), None);
+    }
+
+    /// e370 — `imm` and `unknown` always answer yes, a locale the bitvector already carries answers yes,
+    /// and a locale with a positive over-estimate answers no while spending one of it.
+    #[test]
+    fn a_locale_with_an_overestimate_has_no_free_regs_and_spends_one_of_it() {
+        let mut pass = ScalarOpReordering::default();
+        assert!(pass.locale_has_free_regs(sentient::RegType::Imm));
+        assert!(pass.locale_has_free_regs(sentient::RegType::Unknown));
+        pass.locale_has_free_regs.set(sentient::RegType::Lrf, true);
+        assert!(pass.locale_has_free_regs(sentient::RegType::Lrf));
+        pass.locale_to_num_regs_exceeded.set(sentient::RegType::Lbr, 2);
+        assert!(!pass.locale_has_free_regs(sentient::RegType::Lbr));
+        assert_eq!(
+            pass.locale_to_num_regs_exceeded.get(sentient::RegType::Lbr),
+            1
+        );
     }
 
     /// e174 — nothing indexed, no locale with free registers, no locale over budget, and the
@@ -1014,20 +1091,29 @@ mod unit_tests {
         assert_eq!(table.get(sentient::RegType::Mvr), 0);
     }
 
-    /// e175 — every unit of the module is visited, and what a unit is handed to is e579, whose gate is
-    /// open on the default filter: the movable scalar op below reaches the unported e368.
+    /// e175 and e367 — the pass entry reaches [`ScalarOpReordering::run_on_program`], which hands the
+    /// unit to e579, whose gate is open on the default filter: the candidate below is reordered.
+    ///
+    /// ⭐ THE DRIVER IS THE OBSERVATION for e367 — [`DISABLE_THIS_PASS`] ships off, so its only other
+    /// statement is the delegation this asserts.
     #[test]
-    #[should_panic(expected = "senpass e368")]
-    fn run_on_program_visits_each_unit_through_the_unit_pass() {
-        let mut program = program_of(vec![constant(Val(1)), add(Val(1), Val(1), Val(2))]);
-        ScalarOpReordering::default().run_on_program(&mut program);
+    fn the_pass_entry_reorders_each_unit_of_the_module() {
+        let body = vec![
+            constant(Val(1)),
+            add(Val(1), Val(1), Val(2)),
+            constant(Val(3)),
+            add(Val(2), Val(2), Val(4)),
+        ];
+        let mut program = program_of(body.clone());
+        ScalarOpReordering::default().run_on_operation(&mut program);
+        assert_eq!(
+            program.units.iter().next().expect("the head unit").body,
+            vec![body[0].clone(), body[2].clone(), body[1].clone(), body[3].clone()]
+        );
     }
 
     /// e579 — an INCLUDE list that does not name this unit's component skips the whole unit: the
-    /// movable scalar op is left where it is, and nothing reaches the unported e368 to panic.
-    ///
-    /// ⭐ THE QUIET RETURN IS THE OBSERVATION — the e175 test above is the same body with the default
-    /// filter, and it panics.
+    /// movable scalar op is left where it is and the unit is never even indexed.
     #[test]
     fn e579_skips_a_unit_the_include_list_leaves_out() {
         let body = vec![constant(Val(1)), add(Val(1), Val(1), Val(2))];
@@ -1125,12 +1211,26 @@ mod unit_tests {
         assert!(!pass.is_candidate_for_reordering(&block, &block, InBlock(1)));
     }
 
-    /// e470 — a movable op's first question is where its first use is, which is e368 and not ported.
+    /// e470 — a movable op over iteration arguments with a later use IS a candidate; the same op is NOT
+    /// once a non-constant operand's own last use falls before that use, which is the liverange it
+    /// refuses to extend.
     #[test]
-    #[should_panic(expected = "senpass e368")]
-    fn a_movable_scalar_op_reaches_the_unported_first_use_within_block() {
-        let block = vec![add(Val(0), Val(1), Val(2))];
-        ScalarOpReordering::default().is_candidate_for_reordering(&block, &block, InBlock(0));
+    fn a_movable_scalar_op_is_a_candidate_unless_it_would_extend_an_operands_liverange() {
+        let mut pass = ScalarOpReordering::default();
+        let block = vec![
+            add(Val(0), Val(1), Val(2)),
+            add(Val(0), Val(0), Val(4)),
+            add(Val(2), Val(0), Val(3)),
+        ];
+        assert!(pass.is_candidate_for_reordering(&block, &block, InBlock(0)));
+        // `%1`'s last in-block use is position 2 and `%2`'s first use is position 3.
+        let block = vec![
+            add(Val(0), Val(0), Val(1)),
+            add(Val(1), Val(0), Val(2)),
+            add(Val(1), Val(0), Val(6)),
+            add(Val(2), Val(0), Val(3)),
+        ];
+        assert!(!pass.is_candidate_for_reordering(&block, &block, InBlock(1)));
     }
 
     /// e470 — the constant/iteration-argument classification is asked of the UNIT, and the reference's

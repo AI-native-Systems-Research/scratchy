@@ -93,14 +93,16 @@ use super::scalar_op_hoisting::{
     IbuffSpace, first_const_operand_index, is_immutable_value_in_range, is_sentient_constant,
 };
 use super::{
-    AddressScale, BurstAndIl, FieldUnrollData, MemoryOpInfo, OperationData, ScalarOpComp,
-    ScalarOpMergingBlock, UnrollTarget, does_value_exceed_lrf_range,
+    AddressScale, BurstAndIl, FieldUnrollData, ImmRange, MemoryOpInfo, OperationData, ScalarOpComp,
+    ScalarOpMergingBlock, UnrollTarget, does_immutable_imm_exceed_range, does_value_exceed_lrf_range,
 };
 use crate::arch::{Arch, Elements};
+use crate::formats::Bits;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, erase_defining_op, operands, replace_all_uses_with, results, use_count,
+    Definitions, Op, Val, erase_defining_op, operands, replace_all_uses_with, results, set_operand,
+    use_count,
 };
 use crate::transform::sentient::analyses::{
     EvaluatedValue, Evaluation, ExpressionEvaluator, InstructionCount, OffsetSites,
@@ -385,39 +387,201 @@ pub(crate) fn find_field_unroll_candidate(
         .cloned()
 }
 
-// crustify:todo: e362_isFieldUnrollCandidate
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1080  (124 body lines, level 1)
-//   original  : bool ScalarOpMerging::isFieldUnrollCandidate( FieldUnrollData &candidate, const EvaluatedValue *&merging_increment)
-//   calls     : e157_doesImmutableImmExceedRange, e161_addSpeculativeImmutable
-
-// crustify:todo: e363_markFieldUnrollingCandidates
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1206  (87 body lines, level 1)
-//   original  : void ScalarOpMerging::markFieldUnrollingCandidates()
-//   calls     : e157_doesImmutableImmExceedRange, e166_isProfitableForHoisting, e167_sortBlocks
-
-// crustify:todo: e364_doScalarOpMerging
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1334  (135 body lines, level 1)
-//   original  : void ScalarOpMerging::doScalarOpMerging(ScalarOpMergingBlock &block)
-//   calls     : e166_isProfitableForHoisting, e169_findFieldUnrollCandidate
-
-/// `ScalarOpMerging::isFieldUnrollCandidate` (`:1080`) — whether the burst/IL transfer's speculative
-/// immutables all fit, advancing the merging increment past them if they do.
+/// `dcc::sentient::utils::getLdTypeOrStTypeInElements` (`Dialect/Sentient/Utils.cpp:370-415`) — how
+/// many elements one IL group moves: the LX units read it off the shuffle mode's byte width, the L0
+/// units take the whole transfer.
 ///
-/// ⛔ IT IS e362 AND IT IS NOT PORTED YET.
-/// ⛔ IT TAKES BOTH FLAVOURS OF THE INCREMENT where the reference takes one
-/// `const EvaluatedValue *&`: updating only the handle would leave the decoded reading stale for the
-/// next arm's LRF test, and decoding a handle is out of campaign scope (see
-/// [`MergingIncrement`](super::scalar_op_hoisting::MergingIncrement)).
-fn is_field_unroll_candidate(
+/// ⛔ THE DIVISION IS DOUBLE-PRECISION AND TRUNCATED — `(float)bytes / ((float)element_size / 8.0)`,
+/// where the `8.0` promotes both sides — and its `DT_CHECK` is the one thing an element size of zero
+/// can still reach.
+fn ld_or_st_type_in_elements(op: &Op, comp: ScalarOpComp) -> i64 {
+    // "Only operations that support IL use this utility." ⭐ A `load_and_send` ALWAYS CARRIES A MODE
+    // where a `receive_and_store` may not, and the reference's `std::optional` is what covers both.
+    let (extent, shuffle_mode) = match op {
+        Op::Sentient(ops::Op::LoadAndSend {
+            extent,
+            shuffle_mode,
+            ..
+        }) => (extent, Some(*shuffle_mode)),
+        Op::Sentient(ops::Op::ReceiveAndStore {
+            extent,
+            shuffle_mode,
+            ..
+        }) => (extent, *shuffle_mode),
+        _ => todo!(
+            "getLdTypeOrStTypeInElements: llvm_unreachable(\"unsupported op type\") \
+             (Dialect/Sentient/Utils.cpp:385) — {op:?} carries no interleaved group"
+        ),
+    };
+    match comp {
+        ScalarOpComp::L0lu | ScalarOpComp::L0su => {
+            i64::try_from(extent.total_elements.0).unwrap_or(i64::MAX)
+        }
+        ScalarOpComp::Lxlu | ScalarOpComp::Lxsu => {
+            // ⛔ NO MODE AT ALL IS THE FULL 128 BYTES, exactly as `noshuffle` is: `ldsttype_in_bytes`
+            // is initialised before the `has_value()` test (`Utils.cpp:388-390`).
+            let bytes = match shuffle_mode {
+                None | Some(ops::ShuffleMode::NoShuffle) => 128,
+                Some(ops::ShuffleMode::Splat2B | ops::ShuffleMode::Masked2B) => 2,
+                Some(
+                    ops::ShuffleMode::Splat16B
+                    | ops::ShuffleMode::ZeroPad16B
+                    | ops::ShuffleMode::Masked16B,
+                ) => 16,
+                Some(
+                    mode @ (ops::ShuffleMode::Splat
+                    | ops::ShuffleMode::Rotate
+                    | ops::ShuffleMode::Splat4B),
+                ) => {
+                    todo!(
+                        "getLdTypeOrStTypeInElements: llvm_unreachable(\"unexpected shuffle_mode \
+                         for ldtype/sttype calculation\") (Dialect/Sentient/Utils.cpp:404) — \
+                         {mode:?}"
+                    )
+                }
+            };
+            let ldsttype = (f64::from(bytes) / (f64::from(extent.element_size.0) / 8.0)) as i64;
+            if ldsttype <= 0 {
+                todo!(
+                    "getLdTypeOrStTypeInElements: DT_CHECK_MSG(ldsttype > 0, \"ldsttype should be \
+                     greater than 0\") (Dialect/Sentient/Utils.cpp:410) — {} bytes over an element \
+                     size of {:?}",
+                    bytes,
+                    extent.element_size
+                )
+            }
+            ldsttype
+        }
+    }
+}
+
+/// Replaces: e362_isFieldUnrollCandidate
+///
+/// Artificially unrolls the burst/IL transfer bottom up, collecting the immutable each created op
+/// would need, and declines the candidate as soon as one of them leaves the LDSTI IMM window.
+///
+/// ⛔ THE INCREMENT IS ADVANCED BEFORE THE RANGE TEST THAT CAN REFUSE, so a `false` leaves both
+/// flavours PARTLY ADVANCED — which is why e528 hands this a copy and commits only on acceptance.
+/// ⛔ BOTH FLAVOURS OF THE INCREMENT, where the reference has one `const EvaluatedValue *&`: the
+/// handle is what [`OperationData`] stores, the [`Evaluation`] is what the range test reads, and
+/// decoding one into the other is out of campaign scope.
+/// ⭐ ONE `sentient.scalar_copy` ON THE IMMUTABLE ADDRESS IS LOOKED THROUGH (`:1091-1093`) — e528's
+/// own `isa<ConstantOp, CopyOp>` gate is what makes the two `DT_CHECK`s below reachable at all.
+#[allow(clippy::too_many_arguments)]
+fn is_field_unroll_candidate<E: ExpressionEvaluator>(
     candidate: &mut FieldUnrollData,
     merging_increment: &mut EvaluatedValue,
     merging_increment_ev: &mut Evaluation,
+    op: &Op,
+    defs: Definitions<'_>,
+    comp: ScalarOpComp,
+    imm_range: ImmRange,
+    scale: AddressScale,
+    evaluator: &mut E,
 ) -> bool {
-    let _ = (candidate, merging_increment, merging_increment_ev);
-    todo!(
-        "isFieldUnrollCandidate (senpass e362, ScalarOpMergingAndHoisting.cpp:1080) is not ported \
-         yet — whether the transfer's speculative immutables all stay in range"
-    )
+    // `DT_CHECK_MSG(is_any_of(getComp(), LXLU, LXSU, L0LU, L0SU))` is [`ScalarOpComp`] itself.
+    let Some(mem_info) = MemoryOpInfo::of(op) else {
+        // ⭐ UNREACHABLE: e528 asks only from inside its own `isa<LAS, RAS, LCAS>` arm, and no
+        // candidate is collected, so the walk stops exactly where the reference's would.
+        return false;
+    };
+    let immutable_addr = match defs.of(mem_info.immutable_addr) {
+        Some(Op::Sentient(ops::Op::ScalarCopy { input, .. })) => *input,
+        _ => mem_info.immutable_addr,
+    };
+    if !is_sentient_constant(immutable_addr, defs) {
+        todo!(
+            "isFieldUnrollCandidate: DT_CHECK_MSG(isConstant<ConstantOp>(immutable_addr_), \"Expect \
+             constant immutable address\") (ScalarOpMergingAndHoisting.cpp:1095)"
+        )
+    }
+    if !is_sentient_constant(mem_info.increment, defs) {
+        todo!(
+            "isFieldUnrollCandidate: DT_CHECK_MSG(isConstant<ConstantOp>(increment_), \"Expect \
+             constant increment\") (ScalarOpMergingAndHoisting.cpp:1098)"
+        )
+    }
+    let immutable_addr_ev = evaluator.evaluate_value(immutable_addr);
+    let increment_ev = evaluator.evaluate_value(mem_info.increment);
+    let immutable_addr_handle = evaluator.evaluate_value_handle(immutable_addr);
+    let increment_handle = evaluator.evaluate_value_handle(mem_info.increment);
+
+    let ldsttype = ld_or_st_type_in_elements(op, comp);
+    let chunk_size = i64::try_from(mem_info.chunk_size.0).unwrap_or(i64::MAX);
+    let chunk_stride = i64::try_from(mem_info.chunk_stride.0).unwrap_or(i64::MAX);
+    let is_l0 = matches!(comp, ScalarOpComp::L0lu | ScalarOpComp::L0su);
+    // The step one full IL iteration advances by (`:1119-1126`), chunked only on an L0 whose chunks
+    // are sized; the last burst's own case is computed inside the loop as the reference does.
+    let modifier = if mem_info.il.0 > 0 && chunk_size > 0 && is_l0 {
+        chunk_size
+    } else {
+        ldsttype
+    };
+    let modifier_ev = evaluator.constant_evaluation(modifier);
+    let modifier_handle = evaluator.constant(modifier);
+
+    let burst = mem_info.burst.0;
+    for b in (1..=burst).rev() {
+        if mem_info.il.0 == 0 {
+            // Without IL the op is just repeated `burst` times, each repetition unbursted:
+            // `speculative = immutable - increment - merging_increment`, and the increment it leaves
+            // is `immutable - speculative`.
+            let rebased_ev = evaluator.evaluate_sub(&immutable_addr_ev, &increment_ev);
+            let speculative_ev = evaluator.evaluate_sub(&rebased_ev, merging_increment_ev);
+            if does_immutable_imm_exceed_range(
+                &speculative_ev,
+                mem_info.element_size,
+                imm_range,
+                scale,
+            ) {
+                return false;
+            }
+            let rebased = evaluator.evaluate_sub_handle(immutable_addr_handle, increment_handle);
+            let speculative = evaluator.evaluate_sub_handle(rebased, *merging_increment);
+            *merging_increment_ev = evaluator.evaluate_sub(&immutable_addr_ev, &speculative_ev);
+            *merging_increment = evaluator.evaluate_sub_handle(immutable_addr_handle, speculative);
+            candidate.add_speculative_immutable(speculative);
+            continue;
+        }
+
+        // "After every iteration of IL, there is an add to setup the next iteration. This add won't
+        // be materialized in the IR, but it will impact the value being merged through the
+        // operations." ⛔ THE LAST BURST OF A CHUNKED L0 STEPS BY A DIFFERENT AMOUNT (`:1136-1141`).
+        let (step_ev, step) = if chunk_size != 0 && b == burst && is_l0 {
+            let chunk_mod = ((ldsttype / chunk_size - 1) * chunk_stride) + chunk_size;
+            (
+                evaluator.constant_evaluation(chunk_mod),
+                evaluator.constant(chunk_mod),
+            )
+        } else {
+            (modifier_ev.clone(), modifier_handle)
+        };
+        *merging_increment_ev = evaluator.evaluate_sum(merging_increment_ev, &step_ev);
+        *merging_increment = evaluator.evaluate_sum_handle(*merging_increment, step);
+
+        for i in (0..mem_info.il.0).rev() {
+            let by = i64::try_from(i).unwrap_or(i64::MAX);
+            // "Operations are unrolled into no update mode operations", so the unrolled immutable
+            // carries the increment the op would have applied `i` times and the speculative one
+            // subtracts what merges through it.
+            let stepped_ev = evaluator.multiply_by_const(&increment_ev, by);
+            let unrolled_ev = evaluator.evaluate_sum(&immutable_addr_ev, &stepped_ev);
+            let speculative_ev = evaluator.evaluate_sub(&unrolled_ev, merging_increment_ev);
+            if does_immutable_imm_exceed_range(
+                &speculative_ev,
+                mem_info.element_size,
+                imm_range,
+                scale,
+            ) {
+                return false;
+            }
+            let stepped = evaluator.evaluate_multiply_by_const(increment_handle, by);
+            let unrolled = evaluator.evaluate_sum_handle(immutable_addr_handle, stepped);
+            let speculative = evaluator.evaluate_sub_handle(unrolled, *merging_increment);
+            candidate.add_speculative_immutable(speculative);
+        }
+    }
+    true
 }
 
 /// `Value::getDefiningOp()` RESTRICTED TO ONE REGION — `analyze_op->getParentRegion() !=
@@ -442,11 +606,13 @@ fn defining_op_in_region(val: Val, region: &[Op]) -> Option<&Op> {
 /// increment the evaluator memoised advances even when the block ends there.
 /// ⭐ THE UNROLL ARM COMMITS ITS INCREMENT ONLY IF e362 ACCEPTS (`:769-773`), and the in-range arm's
 /// new increment is the DIFFERENCE the new immutable absorbed rather than a further sum (`:806`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_block<A: Arch, E: ExpressionEvaluator>(
     merge_candidate: Val,
     region: &[Op],
     ibuff_space: IbuffSpace,
     comp: ScalarOpComp,
+    imm_range: ImmRange,
     scale: AddressScale,
     evaluator: &mut E,
     analyzed_ops: &mut BTreeSet<Val>,
@@ -554,6 +720,12 @@ pub(crate) fn build_block<A: Arch, E: ExpressionEvaluator>(
                         &mut unroll_candidate,
                         &mut unroll_increment,
                         &mut unroll_increment_ev,
+                        op,
+                        defs,
+                        comp,
+                        imm_range,
+                        scale,
+                        evaluator,
                     ) {
                         break;
                     }
@@ -669,6 +841,7 @@ pub(crate) fn collect_blocks<A: Arch, E: ExpressionEvaluator>(
     region: &[Op],
     ibuff_space: IbuffSpace,
     comp: ScalarOpComp,
+    imm_range: ImmRange,
     scale: AddressScale,
     evaluator: &mut E,
     blocks: &mut Vec<ScalarOpMergingBlock>,
@@ -690,6 +863,7 @@ pub(crate) fn collect_blocks<A: Arch, E: ExpressionEvaluator>(
                 region,
                 ibuff_space,
                 comp,
+                imm_range,
                 scale,
                 evaluator,
                 &mut analyzed_ops,
@@ -728,6 +902,20 @@ impl MergingRegion<'_> {
         }
     }
 
+    /// `region_`, written — the block whose ops the merge rewrites.
+    ///
+    /// ⭐ `None` IS THE REFERENCE'S OWN `DT_CHECK_MSG(for_op, "Node is not a for_op as expected.")`
+    /// (`:2303`), and a region that is not a loop body's has nothing for the merge to rewrite.
+    fn region_mut(&mut self) -> Option<&mut Vec<Op>> {
+        match self {
+            Self::LoopBody(for_op) => match &mut **for_op {
+                Op::Sentient(ops::Op::For { body, .. }) => Some(body),
+                _ => None,
+            },
+            Self::UnitRegion(region) => Some(region),
+        }
+    }
+
     /// `region_.getParentOp()`, which only a loop body has.
     fn parent_op(&self) -> Option<&Op> {
         match self {
@@ -745,42 +933,468 @@ impl MergingRegion<'_> {
     }
 }
 
-/// `ScalarOpMerging::markFieldUnrollingCandidates` (`:1206`) — spends the unit's remaining IBuff on
-/// the sorted blocks' unroll candidates, whole block first and candidate by candidate otherwise.
-///
-/// ⛔ IT IS e363 AND IT IS NOT PORTED YET. [`sort_blocks`] and [`is_profitable_for_hoisting`], the two
-/// units it opens with, are ported; the LDSTI imm window its corner case measures against arrives
-/// with e361's `OptimizationContext`, as does the decoding of a stored merging increment.
-fn mark_field_unrolling_candidates(
-    blocks: &mut [ScalarOpMergingBlock],
-    parent_op: Option<&Op>,
-    ibuff_space: &mut IbuffSpace,
-    scale: AddressScale,
-    evaluator: &mut dyn ExpressionEvaluator,
-) {
-    let _ = (blocks, parent_op, ibuff_space, scale, evaluator);
+/// The `element_size` of a field unroll candidate's op — the `dyn_cast<LAS>`/`dyn_cast<RAS>` pair of
+/// e363's corner case, whose `else` is `llvm_unreachable("Unexpected operation type in unroll
+/// candidates")` and whose `DT_CHECK(element_size > 0)` follows it (`:1240-1248`).
+fn unroll_candidate_element_size(candidate_op: Val, region: &[Op]) -> Bits {
+    let held = region.iter().find(|op| results(op).contains(&candidate_op));
+    if let Some(Op::Sentient(
+        ops::Op::LoadAndSend { extent, .. } | ops::Op::ReceiveAndStore { extent, .. },
+    )) = held
+        && extent.element_size.0 > 0
+    {
+        return extent.element_size;
+    }
     todo!(
-        "markFieldUnrollingCandidates (senpass e363, ScalarOpMergingAndHoisting.cpp:1206) is not \
-         ported yet — which unroll candidates the remaining IBuff pays for"
+        "markFieldUnrollingCandidates: llvm_unreachable(\"Unexpected operation type in unroll \
+         candidates\") / DT_CHECK(element_size > 0) (ScalarOpMergingAndHoisting.cpp:1240-1248) — \
+         {held:?}"
     )
 }
 
-/// `ScalarOpMerging::doScalarOpMerging` (`:1334`) — merges one block: the chain's scalar ops collapse
-/// into the composite transfers that absorb them, and each field-unroll candidate is unrolled first.
+/// Replaces: e363_markFieldUnrollingCandidates
 ///
-/// ⛔ IT IS e364 AND IT IS NOT PORTED YET. [`is_profitable_for_hoisting`], [`unroll_burst_and_il`] and
-/// [`find_field_unroll_candidate`], the three units it delegates to, are ported and waiting for it.
+/// Spends the unit's remaining IBuff on the sorted blocks' unroll candidates: a whole block at once
+/// where it fits and pays for itself, and otherwise as far down the block as the budget reaches.
+///
+/// ⛔ NEITHER `DT_CHECK_MSG(ibuff_space_ >= 0, "No IBUFF space!")` IS REACHABLE, so neither is a
+/// check here: `required_ibuff` IS the sum of the block's candidate costs (e164), so the whole-block
+/// guard already covers every subtraction that arm makes, and the greedy arm never commits more than
+/// it has left.
+/// ⛔ THE CORNER CASE MEASURES THE INCREMENT RECORDED BY THE **TOP** OP OF THE CHAIN (`:1233-1241`),
+/// not by the candidate: `block_ops` is bottom-up, so its `back()` is the chain's first op.
+fn mark_field_unrolling_candidates(
+    blocks: &mut [ScalarOpMergingBlock],
+    region: &MergingRegion<'_>,
+    ibuff_space: &mut IbuffSpace,
+    imm_range: ImmRange,
+    scale: AddressScale,
+    evaluator: &mut dyn ExpressionEvaluator,
+) {
+    sort_blocks(blocks);
+    for block in blocks {
+        if ibuff_space.0 <= 0 {
+            break;
+        }
+        if block.unroll_candidates.is_empty() {
+            continue;
+        }
+        // "The whole block is eligible for unrolling if there is enough iBuff to support unrolling
+        // the whole block and one of the following is true: the block would be profitable for Scalar
+        // Op Hoisting; the last unroll candidate in the block enables a merging opportunity."
+        let whole_block = ibuff_space.0 >= block.required_ibuff.0
+            && (is_profitable_for_hoisting(block, region.parent_op())
+                || block
+                    .unroll_candidates
+                    .last()
+                    .is_some_and(|candidate| candidate.enables_merging));
+        if !whole_block {
+            // How many candidates the budget reaches, COMMITTED ONLY AS FAR AS THE LAST ONE THAT
+            // ENABLES A MERGE (`:1265-1289`) — the tail past it is left unmarked and unpaid for.
+            let mut remaining_ibuff = ibuff_space.0;
+            let mut pending: Vec<usize> = Vec::new();
+            let mut to_unroll: Vec<usize> = Vec::new();
+            for (at, candidate) in block.unroll_candidates.iter().enumerate() {
+                if candidate.cost.0 > remaining_ibuff {
+                    break;
+                }
+                pending.push(at);
+                remaining_ibuff -= candidate.cost.0;
+                if candidate.enables_merging {
+                    ibuff_space.0 = remaining_ibuff;
+                    to_unroll.append(&mut pending);
+                }
+            }
+            for at in to_unroll {
+                block.unroll_candidates[at].marked_for_unrolling = true;
+            }
+            continue;
+        }
+        let single_scalar_op = block.num_scalar_ops_in_block.0 == 1;
+        let top_of_chain = block.block_ops.last().copied();
+        let region_ops = region.region();
+        for candidate in &mut block.unroll_candidates {
+            // "Quick corner case check: If there is only one scalar operation in the block and the
+            // first unroll candidate in the block is also the first operation in the block, if the
+            // merging increment of the block exceeds the IMM field limit then the field unroll
+            // candidate should not be unrolled." ⭐ `DT_CHECK(merging_increment)` IS THE TYPE:
+            // [`OperationData::merging_increment`] is not optional.
+            if single_scalar_op
+                && let Some(top) = top_of_chain
+                && candidate.op == Some(top.op)
+            {
+                let merging_increment = evaluator.evaluation_of(top.merging_increment);
+                let element_size = unroll_candidate_element_size(top.op, region_ops);
+                if does_immutable_imm_exceed_range(
+                    &merging_increment,
+                    element_size,
+                    imm_range,
+                    scale,
+                ) {
+                    continue;
+                }
+            }
+            ibuff_space.0 -= candidate.cost.0;
+            candidate.marked_for_unrolling = true;
+        }
+    }
+}
+
+/// WHERE `createRemainingAdd` PUTS THE ADD — `OpBuilder builder(op)` and
+/// `builder.setInsertionPointAfter(op)` (`:1391`, `:1424`), as the op it is relative to.
+///
+/// ⛔ THE POSITION IS TAKEN AFTER `buildOffsetValue`, NOT BEFORE: building the offset can insert into
+/// this very region (see [`OffsetSites`]) and would shift an index taken first.
+#[derive(Debug, Clone, Copy)]
+enum InsertAt {
+    /// `OpBuilder builder(op)` / `setInsertionPoint(op)` — immediately before the op binding this
+    /// value.
+    Before(Val),
+    /// `builder.setInsertionPointAfter(op)`.
+    After(Val),
+}
+
+/// `anchor_op->getAttr("element_size")` — the width every add this merge creates has to carry, and
+/// `DT_CHECK(anchor_op->hasAttr("element_size"))` for an op that declares none (`:1351-1354`).
+///
+/// ⛔ NOT [`crate::islands::sentient::dialects::element_size`]: that one is `getElementSize`, which
+/// also answers for a `load_compute_and_send` out of `src_element_size` — an op that carries no
+/// `element_size` attribute at all and so is exactly what the `DT_CHECK` refuses.
+fn anchor_element_size(anchor: Val, region: &[Op]) -> Bits {
+    let held = region.iter().find(|op| results(op).contains(&anchor));
+    match held {
+        Some(Op::Sentient(
+            ops::Op::LoadAndSend { extent, .. } | ops::Op::ReceiveAndStore { extent, .. },
+        )) => extent.element_size,
+        Some(Op::Sentient(
+            ops::Op::ScalarAdd {
+                element_size: Some(element_size),
+                ..
+            }
+            | ops::Op::ScalarSub {
+                element_size: Some(element_size),
+                ..
+            },
+        )) => *element_size,
+        _ => todo!(
+            "doScalarOpMerging: DT_CHECK(anchor_op->hasAttr(\"element_size\")) \
+             (ScalarOpMergingAndHoisting.cpp:1353) — {held:?}"
+        ),
+    }
+}
+
+/// `Operation::replaceUsesOfWith(from, to)` ON ONE OP (`:1370`) — ⛔ NOT [`replace_all_uses_with`],
+/// which would move every other reader of `from` as well.
+fn replace_operand_uses(region: &mut [Op], of_op: Val, from: Val, to: Val) {
+    let Some(held) = region.iter_mut().find(|op| results(op).contains(&of_op)) else {
+        return;
+    };
+    for at in 0..operands(held).len() {
+        if operands(held)[at] == from {
+            set_operand(held, at, to);
+        }
+    }
+}
+
+/// `Value::replaceAllUsesExcept(with, {except})` (`:1428-1430`) — every reader of `of` but the one op.
+///
+/// ⭐ THE UNDO IS EXACT because `with` is a value MINTED for `except`: nothing else in the region can
+/// read it, so mapping it back on that op alone restores precisely the one use the exception names.
+fn replace_all_uses_except(region: &mut [Op], of: Val, with: Val, except: Val) {
+    replace_all_uses_with(region, of, with);
+    replace_operand_uses(region, except, with, of);
+}
+
+/// `op->setOperand(mutable_addr_idx | immutable_addr_idx | increment_idx, …)` (`:1451-1459`) — the
+/// three address slots the merge re-points, named by field rather than by the operand number the
+/// reference reads off each op class.
+fn set_transfer_addresses(
+    region: &mut [Op],
+    transfer: Val,
+    mutable_addr: Option<Val>,
+    immutable_addr: Option<Val>,
+    increment: Option<Val>,
+) {
+    let Some(held) = region.iter_mut().find(|op| results(op).contains(&transfer)) else {
+        return;
+    };
+    let Op::Sentient(
+        ops::Op::LoadAndSend {
+            mutable_addr: into_mutable,
+            immutable_addr: into_immutable,
+            increment: into_increment,
+            ..
+        }
+        | ops::Op::ReceiveAndStore {
+            mutable_addr: into_mutable,
+            immutable_addr: into_immutable,
+            increment: into_increment,
+            ..
+        }
+        | ops::Op::LoadComputeAndSend {
+            mutable_addr: into_mutable,
+            immutable_addr: into_immutable,
+            increment: into_increment,
+            ..
+        },
+    ) = held
+    else {
+        return;
+    };
+    if let Some(val) = mutable_addr {
+        *into_mutable = val;
+    }
+    if let Some(val) = immutable_addr {
+        *into_immutable = val;
+    }
+    if let Some(val) = increment {
+        *into_increment = val;
+    }
+}
+
+/// `createRemainingAdd` (`:1358-1373`) — the `sentient.scalar_add` that carries whatever of the
+/// merging increment the transfers below could not absorb, and the one reader of `inp` it displaces.
+#[allow(clippy::too_many_arguments)]
+fn create_remaining_add(
+    at: InsertAt,
+    inp: Val,
+    merging_increment: EvaluatedValue,
+    last_mem_op: Option<Val>,
+    element_size: Bits,
+    region: &mut Vec<Op>,
+    evaluator: &mut dyn ExpressionEvaluator,
+    sites: &mut OffsetSites<'_>,
+) -> Val {
+    let increment =
+        evaluator.build_offset_value_of(merging_increment, sites, region, ScalarTy::Index);
+    let result = sites.values.mint();
+    let add = Op::Sentient(ops::Op::ScalarAdd {
+        lhs: inp,
+        rhs: increment,
+        result,
+        reg: None,
+        ty: ScalarTy::Index,
+        // "Ensure element_size is copied as it is essential for range checks."
+        element_size: Some(element_size),
+    });
+    let anchor = match at {
+        InsertAt::Before(anchor) | InsertAt::After(anchor) => anchor,
+    };
+    let found = region.iter().position(|op| results(op).contains(&anchor));
+    // ⭐ AN ANCHOR THE REGION NO LONGER HOLDS APPENDS, which no caller can reach: each one names an op
+    // it has just found or created here.
+    let mut position = found.unwrap_or(region.len());
+    if matches!(at, InsertAt::After(_)) && found.is_some() {
+        position += 1;
+    }
+    region.insert(position, add);
+    if let Some(mem_op) = last_mem_op {
+        replace_operand_uses(region, mem_op, inp, result);
+    }
+    result
+}
+
+/// WHICH ARM OF THE MERGE WALK ONE BLOCK OP TAKES — the `isa<AddOp, SubOp>` / `isa<LAS, RAS, LCAS>`
+/// pair and the two counts each arm reads (`:1386`, `:1394-1419`).
+#[derive(Debug, Clone, Copy)]
+enum MergedOp {
+    /// `isa<sentient::AddOp, sentient::SubOp>` — a scalar op the merge deletes.
+    ScalarOp,
+    /// A transfer, with the counts that decide whether it needs field unrolling first.
+    Transfer {
+        /// `getBurstSize()`.
+        burst: Elements,
+        /// `getInterleavedGroup()`.
+        il: Elements,
+    },
+}
+
+impl MergedOp {
+    fn of(op: &Op) -> Option<MergedOp> {
+        match op {
+            Op::Sentient(ops::Op::ScalarAdd { .. } | ops::Op::ScalarSub { .. }) => {
+                Some(MergedOp::ScalarOp)
+            }
+            Op::Sentient(
+                ops::Op::LoadAndSend {
+                    extent,
+                    interleaved_group,
+                    ..
+                }
+                | ops::Op::ReceiveAndStore {
+                    extent,
+                    interleaved_group,
+                    ..
+                },
+            ) => Some(MergedOp::Transfer {
+                burst: extent.burst_size,
+                il: *interleaved_group,
+            }),
+            // ⛔ AN LCAS IS NEVER FIELD UNROLLED: the reference reads neither count off it and pins
+            // both to zero (`:1414-1418`), even though the op could carry them.
+            Op::Sentient(ops::Op::LoadComputeAndSend { .. }) => Some(MergedOp::Transfer {
+                burst: Elements(0),
+                il: Elements(0),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Replaces: e364_doScalarOpMerging
+///
+/// Merges one block: each scalar add/sub in the chain is erased into the transfer above it, each
+/// merged transfer takes the immutable address the analysis derived and a zero increment, and the
+/// remainder of the increment becomes one add at the top of the chain (`:1334-1465`).
+///
+/// ⛔ THE TWO EARLY RETURNS ARE THE REFERENCE'S, NOT REFUSALS: a burst/IL transfer that was NOT marked
+/// for unrolling ends merging with an add AFTER it (`:1421-1431`), and an unrolled LAST op ends it
+/// with an add before the first clone (`:1445-1450`).
+/// ⛔ `first_op` AND `unroll_candidates` ARE DEAD LOCALS (`:1342`, `:1346`) and are dropped;
+/// `zero_const` is created before the walk even when no transfer consumes it.
 fn do_scalar_op_merging(
     block: &ScalarOpMergingBlock,
-    region: MergingRegion<'_>,
+    mut region: MergingRegion<'_>,
     evaluator: &mut dyn ExpressionEvaluator,
     sites: &mut OffsetSites<'_>,
 ) {
-    let _ = (block, region, evaluator, sites);
-    todo!(
-        "doScalarOpMerging (senpass e364, ScalarOpMergingAndHoisting.cpp:1334) is not ported yet — \
-         the merge of one block's chain into the transfers that absorb it"
-    )
+    // "Blocks are profitable for Scalar Op Merging if they contain more than one scalar add/sub."
+    if block.num_scalar_ops_in_block.0 <= 1
+        && !is_profitable_for_hoisting(block, region.parent_op())
+    {
+        return;
+    }
+    // ⭐ BOTH `else`s ARE UNREACHABLE: e528 keeps a block only once it holds more than one op, and
+    // every step of one it keeps sets the input value.
+    let Some(&anchor) = block.block_ops.last() else {
+        return;
+    };
+    let Some(input_value_to_block) = block.input_value_to_block else {
+        return;
+    };
+    let Some(region) = region.region_mut() else {
+        return;
+    };
+    let element_size = anchor_element_size(anchor.op, region);
+
+    let zero_const = sites.values.mint();
+    sites.consts.push(Op::Sentient(ops::Op::ScalarConstant {
+        value: 0,
+        result: zero_const,
+        reg_locale: ops::RegType::Imm,
+        ty: ScalarTy::Index,
+        is_symbol: false,
+    }));
+
+    let mut merging_increment = evaluator.constant(0);
+    for at in 0..block.block_ops.len() {
+        let entry = block.block_ops[at];
+        let next_op = block.block_ops.get(at + 1).map(|next| next.op);
+        let Some(kind) = region
+            .iter()
+            .find(|op| results(op).contains(&entry.op))
+            .and_then(MergedOp::of)
+        else {
+            todo!(
+                "doScalarOpMerging: llvm_unreachable(\"Unsupported op found in block!\") \
+                 (ScalarOpMergingAndHoisting.cpp:1464) — {:?} is neither a scalar add/sub nor a \
+                 transfer of this region",
+                entry.op
+            )
+        };
+        match kind {
+            MergedOp::ScalarOp => {
+                merging_increment = entry.merging_increment;
+                let replacement = match next_op {
+                    Some(next) => next,
+                    None => create_remaining_add(
+                        InsertAt::Before(entry.op),
+                        input_value_to_block,
+                        merging_increment,
+                        None,
+                        element_size,
+                        region,
+                        evaluator,
+                        sites,
+                    ),
+                };
+                replace_all_uses_with(region, entry.op, replacement);
+                // ⛔ THE ERASE COMES AFTER THE REWIRE, never before — see [`erase_defining_op`].
+                erase_defining_op(region, entry.op);
+            }
+            MergedOp::Transfer { burst, il } if burst.0 > 1 || il.0 > 0 => {
+                let Some(candidate) = find_field_unroll_candidate(entry.op, block) else {
+                    // "If the op is not to be Field Unrolled, merging for this block stops."
+                    let new_add = create_remaining_add(
+                        InsertAt::After(entry.op),
+                        entry.op,
+                        merging_increment,
+                        None,
+                        element_size,
+                        region,
+                        evaluator,
+                        sites,
+                    );
+                    replace_all_uses_except(region, entry.op, new_add, new_add);
+                    return;
+                };
+                merging_increment = entry.merging_increment;
+                // `unrollBurstAndIL<LAS|RAS>` — the template argument is the `isa<>` pair
+                // [`UnrollTarget::of`] already makes, so one call serves both.
+                let unrolled = match UnrollTarget::of(&candidate, region) {
+                    Some(target) => unroll_burst_and_il(target, region, evaluator, sites),
+                    // ⭐ UNREACHABLE: e362 accepted this candidate, so it holds at least one
+                    // speculative immutable and is one of the two transfers that can be unrolled.
+                    None => Vec::new(),
+                };
+                if next_op.is_none() {
+                    let Some(&first_unrolled) = unrolled.first() else {
+                        return;
+                    };
+                    create_remaining_add(
+                        InsertAt::Before(first_unrolled),
+                        input_value_to_block,
+                        merging_increment,
+                        Some(first_unrolled),
+                        element_size,
+                        region,
+                        evaluator,
+                        sites,
+                    );
+                    return;
+                }
+            }
+            MergedOp::Transfer { .. } => {
+                merging_increment = entry.merging_increment;
+                let immutable_addr =
+                    evaluator.build_offset_value_of(entry.mod_by, sites, region, ScalarTy::Index);
+                match next_op {
+                    Some(next) => {
+                        set_transfer_addresses(region, entry.op, Some(next), None, None);
+                    }
+                    None => {
+                        create_remaining_add(
+                            InsertAt::Before(entry.op),
+                            input_value_to_block,
+                            merging_increment,
+                            Some(entry.op),
+                            element_size,
+                            region,
+                            evaluator,
+                            sites,
+                        );
+                    }
+                }
+                set_transfer_addresses(
+                    region,
+                    entry.op,
+                    None,
+                    Some(immutable_addr),
+                    Some(zero_const),
+                );
+            }
+        }
+    }
 }
 
 /// Replaces: e611_runScalarOpMerging
@@ -791,10 +1405,12 @@ fn do_scalar_op_merging(
 ///
 /// ⭐ NOTHING BUT THE REGION SURVIVES THE PASS: `getBlocks()` and `getRegion()` (`:467-468`) have no
 /// reader in the file, so `blocks_` and the spent `ibuff_space_` are the pass's own bookkeeping.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_scalar_op_merging<A: Arch, E: ExpressionEvaluator>(
     mut region: MergingRegion<'_>,
     ibuff_space: IbuffSpace,
     comp: ScalarOpComp,
+    imm_range: ImmRange,
     scale: AddressScale,
     evaluator: &mut E,
     sites: &mut OffsetSites<'_>,
@@ -805,6 +1421,7 @@ pub(crate) fn run_scalar_op_merging<A: Arch, E: ExpressionEvaluator>(
         region.region(),
         ibuff_space,
         comp,
+        imm_range,
         scale,
         evaluator,
         &mut blocks,
@@ -816,8 +1433,9 @@ pub(crate) fn run_scalar_op_merging<A: Arch, E: ExpressionEvaluator>(
     // for Field Unrolling.
     mark_field_unrolling_candidates(
         &mut blocks,
-        region.parent_op(),
+        &region,
         &mut ibuff_space,
+        imm_range,
         scale,
         evaluator,
     );
@@ -835,6 +1453,13 @@ mod unit_tests {
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::transform::sentient::analyses::{EvaluatedValue, Evaluation, Offsets, ScalarOffset};
+
+    /// `ldsti_imm_range` FOR A SIGNED 16-BIT LDSTI IMMEDIATE — `getImmRange` (`:2274-2290`) derives it
+    /// from the ISA and is e366's, not this file's; every unit here only measures against it.
+    const LDSTI: ImmRange = ImmRange {
+        min: -32768,
+        max: 32767,
+    };
 
     /// The out-of-scope evaluator, stating the ONE answer these units consume.
     struct StatedEvaluator {
@@ -871,6 +1496,12 @@ mod unit_tests {
                 .iter()
                 .find(|(of, _)| *of == immutable)
                 .map_or(Val(0), |(_, val)| *val)
+        }
+
+        /// `getConstant(n)` — the handle for a literal, which the `offsets` map above answers for like
+        /// any other.
+        fn constant(&mut self, value: i64) -> EvaluatedValue {
+            EvaluatedValue(u32::try_from(value).unwrap_or(0))
         }
     }
 
@@ -991,6 +1622,34 @@ mod unit_tests {
 
         fn evaluate_sum(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation {
             absolute(offset_of(lhs) + offset_of(rhs))
+        }
+
+        fn evaluate_sub(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation {
+            absolute(offset_of(lhs) - offset_of(rhs))
+        }
+
+        fn evaluate_sub_handle(
+            &mut self,
+            _lhs: EvaluatedValue,
+            _rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            self.intern()
+        }
+
+        /// `buildOffsetValue` FROM A STORED HANDLE — the real one materialises the offset as ops in
+        /// the const builder's block, which is all e364 asks of it.
+        fn build_offset_value_of(
+            &mut self,
+            immutable: EvaluatedValue,
+            sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            let result = sites.values.mint();
+            sites
+                .consts
+                .push(scalar_constant(i64::from(immutable.0), result));
+            result
         }
 
         fn constant_evaluation(&mut self, value: i64) -> Evaluation {
@@ -1235,6 +1894,7 @@ mod unit_tests {
             &region,
             IbuffSpace(8),
             ScalarOpComp::Lxlu,
+            LDSTI,
             AddressScale::ONE,
             &mut SummingEvaluator::default(),
             &mut analyzed,
@@ -1278,6 +1938,7 @@ mod unit_tests {
             &region,
             IbuffSpace(8),
             ScalarOpComp::Lxlu,
+            LDSTI,
             AddressScale::ONE,
             &mut SummingEvaluator::default(),
             &mut blocks,
@@ -1287,11 +1948,10 @@ mod unit_tests {
         assert_eq!(blocks[0].input_value_to_block, Some(Val(1)));
         assert_eq!(blocks[0].num_scalar_ops_in_block, ScalarOpCount(2));
     }
-    /// e611 — the pass collects the chain's one block and then reaches the candidate marking, which is
-    /// e363 and not ported.
+    /// e611 — the whole pass over a region whose one mergeable chain is two adds over the same
+    /// constant: they collapse into the single add that carries what both absorbed.
     #[test]
-    #[should_panic(expected = "senpass e363")]
-    fn a_region_with_one_merging_block_reaches_the_unported_candidate_marking() {
+    fn the_pass_collapses_a_regions_one_merging_block_into_a_single_add() {
         let mut region = vec![
             scalar_constant(8, Val(2)),
             add_sized(Val(1), Val(2), Val(4), Bits(16)),
@@ -1303,6 +1963,7 @@ mod unit_tests {
             MergingRegion::UnitRegion(&mut region),
             IbuffSpace(8),
             ScalarOpComp::Lxlu,
+            LDSTI,
             AddressScale::ONE,
             &mut SummingEvaluator::default(),
             &mut OffsetSites {
@@ -1310,6 +1971,21 @@ mod unit_tests {
                 query_maps: None,
                 values: &mut values,
             },
+        );
+
+        // The chain's two adds are gone and the increment they absorbed is one add over the value from
+        // outside the block, carrying the anchor's `element_size`.
+        assert_eq!(
+            region,
+            vec![
+                scalar_constant(8, Val(2)),
+                add_sized(Val(1), Val(11), Val(12), Bits(16)),
+            ]
+        );
+        // `%10` is the block's unused zero, `%11` the offset the remaining increment materialised as.
+        assert_eq!(
+            consts,
+            vec![scalar_constant(0, Val(10)), scalar_constant(5, Val(11))]
         );
     }
 
@@ -1328,6 +2004,7 @@ mod unit_tests {
             MergingRegion::UnitRegion(&mut region),
             IbuffSpace(8),
             ScalarOpComp::Lxlu,
+            LDSTI,
             AddressScale::ONE,
             &mut SummingEvaluator::default(),
             &mut OffsetSites {
@@ -1338,5 +2015,166 @@ mod unit_tests {
         );
         assert_eq!(region, untouched);
         assert!(consts.is_empty());
+    }
+
+    /// e362 — a burst-2 transfer with no IL speculates one immutable per repetition, each rebased on
+    /// what merges through it, and the increment it leaves is what the immutables absorbed.
+    #[test]
+    fn a_burst_two_transfer_speculates_one_immutable_per_repetition_while_they_fit() {
+        let region = vec![
+            scalar_constant(8, Val(2)),
+            scalar_constant(8, Val(3)),
+            load_and_send(Val(1), Val(2), Val(3), Val(5), 2, 0),
+        ];
+        let regions: [&[Op]; 1] = [&region];
+        let defs = Definitions::from_innermost(&regions);
+        let mut evaluator = SummingEvaluator::default();
+
+        let mut candidate = candidate_of(Val(5), 1, Vec::new());
+        let mut increment = EvaluatedValue(0);
+        let mut increment_ev = absolute(0);
+        assert!(is_field_unroll_candidate(
+            &mut candidate,
+            &mut increment,
+            &mut increment_ev,
+            &region[2],
+            defs,
+            ScalarOpComp::Lxlu,
+            LDSTI,
+            AddressScale::ONE,
+            &mut evaluator,
+        ));
+        assert_eq!(candidate.speculative_immutables.len(), 2);
+        // `immutable - (immutable - increment - merging_increment)`, twice: 8 - 0 then 8 - (-8).
+        assert_eq!(offset_of(&increment_ev), 16);
+
+        // ⛔ THE NEGATIVE THE RANGE TEST EXISTS FOR: the same transfer against a one-element window is
+        // refused at the second repetition — having already collected the first and advanced the
+        // increment past it, which is why e528 commits only a copy.
+        let mut candidate = candidate_of(Val(5), 1, Vec::new());
+        let mut increment = EvaluatedValue(0);
+        let mut increment_ev = absolute(0);
+        assert!(!is_field_unroll_candidate(
+            &mut candidate,
+            &mut increment,
+            &mut increment_ev,
+            &region[2],
+            defs,
+            ScalarOpComp::Lxlu,
+            ImmRange { min: -1, max: 1 },
+            AddressScale::ONE,
+            &mut evaluator,
+        ));
+        assert_eq!(candidate.speculative_immutables.len(), 1);
+    }
+
+    /// e363 — a block whose top candidate enables a merge is unrolled whole when the IBuff covers it,
+    /// and nothing at all is committed when it does not reach that candidate.
+    #[test]
+    fn a_block_that_fits_is_marked_whole_and_one_that_does_not_commits_nothing() {
+        let mut region: Vec<Op> = Vec::new();
+        let mut top = candidate_of(Val(6), 2, Vec::new());
+        top.enables_merging = true;
+        let block = || ScalarOpMergingBlock {
+            block_ops: vec![bottom_op(Val(4)), bottom_op(Val(6))],
+            unroll_candidates: vec![candidate_of(Val(4), 1, Vec::new()), top.clone()],
+            num_scalar_ops_in_block: ScalarOpCount(2),
+            required_ibuff: InstructionCount(3),
+            ..ScalarOpMergingBlock::default()
+        };
+        let marks = |blocks: &[ScalarOpMergingBlock]| {
+            blocks[0]
+                .unroll_candidates
+                .iter()
+                .map(|candidate| candidate.marked_for_unrolling)
+                .collect::<Vec<_>>()
+        };
+
+        let mut blocks = vec![block()];
+        let mut ibuff_space = IbuffSpace(5);
+        mark_field_unrolling_candidates(
+            &mut blocks,
+            &MergingRegion::UnitRegion(&mut region),
+            &mut ibuff_space,
+            LDSTI,
+            AddressScale::ONE,
+            &mut StatedEvaluator {
+                offsets: Vec::new(),
+            },
+        );
+        assert_eq!(marks(&blocks), vec![true, true]);
+        assert_eq!(ibuff_space, IbuffSpace(2));
+
+        // ⛔ THE GREEDY ARM COMMITS ONLY UP TO A MERGING ENABLER: two entries pay for the first
+        // candidate but the one that enables the merge costs more than what is left, so the block
+        // spends nothing rather than unrolling an op that buys no merge.
+        let mut blocks = vec![block()];
+        let mut ibuff_space = IbuffSpace(2);
+        mark_field_unrolling_candidates(
+            &mut blocks,
+            &MergingRegion::UnitRegion(&mut region),
+            &mut ibuff_space,
+            LDSTI,
+            AddressScale::ONE,
+            &mut StatedEvaluator {
+                offsets: Vec::new(),
+            },
+        );
+        assert_eq!(marks(&blocks), vec![false, false]);
+        assert_eq!(ibuff_space, IbuffSpace(2));
+    }
+
+    /// e364 — the vendor's own shape (`:1307-1331`): the chain's adds vanish, the transfer above them
+    /// takes the derived immutable and a zero increment, and one add over the value from outside the
+    /// block feeds its mutable address.
+    #[test]
+    fn merging_a_block_leaves_one_add_feeding_a_transfer_that_increments_by_zero() {
+        let mut region = vec![
+            scalar_constant(8, Val(2)),
+            load_and_send(Val(1), Val(2), Val(2), Val(3), 0, 0),
+            add_sized(Val(3), Val(2), Val(4), Bits(16)),
+            add_sized(Val(4), Val(2), Val(6), Bits(16)),
+        ];
+        let block = ScalarOpMergingBlock {
+            input_value_to_block: Some(Val(1)),
+            block_ops: vec![
+                bottom_op(Val(6)),
+                bottom_op(Val(4)),
+                OperationData {
+                    op: Val(3),
+                    mod_by: EvaluatedValue(1),
+                    merging_increment: EvaluatedValue(2),
+                    replace_with_mod: false,
+                },
+            ],
+            num_scalar_ops_in_block: ScalarOpCount(2),
+            ..ScalarOpMergingBlock::default()
+        };
+        let mut consts = Vec::new();
+        let mut values = values_after(50);
+        do_scalar_op_merging(
+            &block,
+            MergingRegion::UnitRegion(&mut region),
+            &mut StatedEvaluator {
+                offsets: vec![(EvaluatedValue(1), Val(101)), (EvaluatedValue(2), Val(102))],
+            },
+            &mut OffsetSites {
+                consts: &mut consts,
+                query_maps: None,
+                values: &mut values,
+            },
+        );
+
+        assert_eq!(
+            region,
+            vec![
+                scalar_constant(8, Val(2)),
+                // ⛔ THE ANCHOR'S `element_size` IS THE TRANSFER'S, not the erased adds' 16 bits.
+                add_sized(Val(1), Val(102), Val(51), Bits(32)),
+                load_and_send(Val(51), Val(101), Val(50), Val(3), 0, 0),
+            ]
+        );
+        // `zero_const` is created once, in the const builder's block, before the walk asks for it.
+        assert_eq!(consts, vec![scalar_constant(0, Val(50))]);
     }
 }

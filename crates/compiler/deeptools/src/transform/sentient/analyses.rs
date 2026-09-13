@@ -321,6 +321,23 @@ pub trait ExpressionEvaluator {
         )
     }
 
+    /// `EvaluatedValue`'S OWN OFFSETS, READ FROM A STORED HANDLE
+    /// (`Analyses/ExpressionEvaluatorUtils.h:63-126`) — the read twin of
+    /// [`ExpressionEvaluator::build_offset_value_of`], for the range test
+    /// `ScalarOpMerging::markFieldUnrollingCandidates` (`:1249`) applies to a merging increment the
+    /// block RECORDED rather than one it has just evaluated.
+    ///
+    /// ⛔ THE DECODE IS THE ANALYSIS'S, NOT THE PORTER'S: the arena entry the handle names belongs to
+    /// `Analyses/ExpressionEvaluatorUtils`, out of campaign scope, so this states the seam and does
+    /// not invent it — exactly as [`ExpressionEvaluator::is_any_val_less_than`] already reads a
+    /// handle's values through the trait rather than reconstructing them.
+    fn evaluation_of(&mut self, handle: EvaluatedValue) -> Evaluation {
+        let _ = handle;
+        todo!(
+            "EvaluatedValue offsets (Analyses/ExpressionEvaluatorUtils.h:63) — out of campaign scope"
+        )
+    }
+
     /// `EvaluatedValue::isAnyValLessThan` (`Analyses/ExpressionEvaluatorUtils.h:71`) — whether ANY
     /// unit's value is below `bound`, which is how a chain refuses a negative stride.
     fn is_any_val_less_than(&mut self, ev: EvaluatedValue, bound: ScalarOffset) -> bool {
