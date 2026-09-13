@@ -192,7 +192,7 @@ fn operand_text(operand: &Operand) -> String {
 ///
 /// ⛔ TRAP CLOSED: the reference bounds both loops by the `..LdsAndLoopOffsets_` length while
 /// indexing `inputs_`/`outputs_` with `.at(i)`, so a length mismatch throws. `Operand` pairs the
-/// component with its data, and `ComputeType::cpp_spelling` is total where
+/// component with its data, and `DdlComputeType::cpp_spelling` is total where
 /// `computeTypeToString.at(type_)` has no entry for `FCVT`.
 #[must_use]
 pub fn dbg_print_compute(node: &ComputeNode) -> String {
@@ -4651,7 +4651,8 @@ mod tests_e078_e085 {
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
         Extent, PaddedExtent, Sample,
     };
-    use crate::generated::{ComputeType, DataConnect};
+    use crate::generated::DataConnect;
+    use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
         AllocLayout, AllocPlacement, AllocateNode, DataInfo, Dsts, FoldPosition, InstrAttribute,
         LayoutDims, MaxDimSize, NodeName, NumChunks, ReplicationFactor, StartAddress,
@@ -4717,7 +4718,7 @@ mod tests_e078_e085 {
     fn a_compute_line_names_every_operand_with_its_own_connect() {
         let node = ComputeNode {
             name: NodeName("mac0".to_owned()),
-            op: ComputeType::Macc,
+            op: DdlComputeType::Macc,
             ex_unit: SenComponent::Ptrow3,
             inputs: vec![
                 operand(SenComponent::Ptrow3, Some(DataConnect::AconstConnect), None),
@@ -4846,7 +4847,7 @@ mod tests_e078_e085 {
         };
         let compute = ComputeNode {
             name: NodeName("c0".to_owned()),
-            op: ComputeType::Macc,
+            op: DdlComputeType::Macc,
             ex_unit: SenComponent::Ptrow2,
             inputs: vec![],
             outputs: vec![],
@@ -4888,7 +4889,7 @@ mod tests_e078_e085 {
         let dsc = out_then_in();
         let compute = ComputeNode {
             name: NodeName("c0".to_owned()),
-            op: ComputeType::Macc,
+            op: DdlComputeType::Macc,
             ex_unit: SenComponent::Ptrow0,
             inputs: vec![
                 operand(SenComponent::Lx, None, Some(0)),
@@ -4929,9 +4930,9 @@ mod tests_e233_e240 {
     use super::*;
     use crate::arch::Target;
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{PaddedExtent, Sample};
-    use crate::generated::ComputeType;
     use crate::schedule::ddc::metadata::DatastageId;
     use crate::schedule::ddc::transformation_util::LoopDims;
+    use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::InstrAttribute;
     use crate::schedule::l3::dl_ops::LoopDistribution;
     use crate::units::NumFolds;
@@ -5047,7 +5048,7 @@ mod tests_e233_e240 {
     fn compute_on(name: &str, unit: SenComponent) -> ComputeNode {
         ComputeNode {
             name: dsc2::NodeName(name.to_owned()),
-            op: ComputeType::Macc,
+            op: DdlComputeType::Macc,
             ex_unit: unit,
             inputs: Vec::new(),
             outputs: Vec::new(),
@@ -5635,9 +5636,9 @@ mod tests_e297_e299 {
     use super::*;
     use crate::arch::Target;
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{PaddedExtent, Sample};
-    use crate::generated::ComputeType;
     use crate::schedule::ddc::metadata::DatastageId;
     use crate::schedule::ddc::transformation_util::LoopDims;
+    use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
         DataInfo, Dsts, InstrAttribute, LayoutDims, NodeName, NumChunks, Operand,
         ReplicationFactor, TransferPadding,
@@ -5883,7 +5884,7 @@ mod tests_e297_e299 {
     fn compute_from_lds0() -> ComputeNode {
         ComputeNode {
             name: NodeName("c0".to_owned()),
-            op: ComputeType::Macc,
+            op: DdlComputeType::Macc,
             ex_unit: SenComponent::Ptrow0,
             inputs: vec![operand(Some(0))],
             outputs: Vec::new(),

@@ -780,6 +780,51 @@ impl DdlComputeType {
             | Self::And => ComputeArity::Binary,
         }
     }
+
+    /// `EnumsConversion::computeTypeToString` (`dsc/dscdefn.cpp:34`), which is what the dsc-side debug
+    /// prints and JSON carry.
+    ///
+    /// ⛔ NOT [`ComputeType::spelling`](crate::generated::ComputeType::spelling) — that one is the
+    /// DDL template's own spelling, UPPERCASE (`MACC`), and the two are different strings for one op.
+    /// ⛔ NO `_` ARM, and `COUNT` — the reference's only `"undefined"` — is not a member here.
+    #[must_use]
+    pub const fn cpp_spelling(self) -> &'static str {
+        match self {
+            Self::Assign => "assign",
+            Self::Equal => "equal",
+            Self::Fabsmax => "fabsmax",
+            Self::Fest => "fest",
+            Self::Floor => "floor",
+            Self::Fma16 => "fma16",
+            Self::Fma32 => "fma32",
+            Self::Fmax => "fmax",
+            Self::Fmin => "fmin",
+            Self::Fmul => "fmul",
+            Self::Fnms => "fnms",
+            Self::Greaterequal => "greaterequal",
+            Self::Greaterthan => "greaterthan",
+            Self::Icvt => "icvt",
+            Self::Lesserequal => "lesserequal",
+            Self::Lesserthan => "lesserthan",
+            Self::Macc => "macc",
+            Self::Notequal => "notequal",
+            Self::Or => "or",
+            Self::Packmerge => "packmerge",
+            Self::Reduce => "reduce",
+            Self::Select => "select",
+            Self::Shuffle => "shuffle",
+            Self::Splat => "splat",
+            Self::Fma8 => "fma8",
+            Self::Fma4 => "fma4",
+            Self::Ima8 => "ima8",
+            Self::Ima4 => "ima4",
+            Self::Fsub => "fsub",
+            Self::And => "and",
+            Self::Gcvt => "gcvt",
+            Self::Ime => "ime",
+            Self::Shr => "shr",
+        }
+    }
 }
 
 impl From<ComputeType> for DdlComputeType {

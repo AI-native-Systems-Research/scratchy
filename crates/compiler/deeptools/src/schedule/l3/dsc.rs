@@ -19,7 +19,7 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
 use crate::schedule::ddc::fold::{
     Dilation, MxScaleTensor, NodeId, PadType, ScaleBlock, Stride,
 };
-use crate::schedule::ddc::metadata::DatastageId;
+use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::{DsType, Scale};
 use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
 use crate::schedule::dsc2::{LayoutDims, LdsIdx, NodeName};
@@ -716,6 +716,30 @@ pub struct DimPadding {
     pub stride: Stride,
     /// `dilation_`, whose declared default is likewise `1`.
     pub dilation: Dilation,
+}
+
+impl DimPadding {
+    /// `getMetaDimVal(kind)` (`dsc/dims.cpp:59-73`) — the one stored number a meta dim kind names
+    /// directly.
+    ///
+    /// ⛔ [`None`] IS *"Impossible to get the direct value of MetaDimKind"*: only four of the eight
+    /// kinds name a field. A [`PadSizes::Voided`] edge answers the reference's `-1`, which is a
+    /// statement and not a size.
+    #[must_use]
+    pub const fn meta_dim_val(&self, kind: MetaDimKind) -> Option<i64> {
+        let (front, back) = match self.sizes {
+            PadSizes::Unpadded => (0, 0),
+            PadSizes::Sized { front, back } => (front.0 as i64, back.0 as i64),
+            PadSizes::Voided => (-1, -1),
+        };
+        match kind {
+            MetaDimKind::Dilation => Some(self.dilation.0),
+            MetaDimKind::Stride => Some(self.stride.0),
+            MetaDimKind::PadFront => Some(front),
+            MetaDimKind::PadBack => Some(back),
+            _ => None,
+        }
+    }
 }
 
 impl Default for DimPadding {
@@ -1590,6 +1614,25 @@ pub struct DataStages {
     core: DataStage,
     chunk: DataStage,
     minted: BTreeMap<DatastageId, DataStage>,
+    empty: BTreeMap<DatastageId, EmptyStage>,
+}
+
+/// A DATA STAGE THAT STATES NO DIM AT ALL — `dataStageParam_[id]` as `ddl.datastage` leaves it: a
+/// bare `operator[]` insert, then a NAME and the core stage's volume ceiling copied onto both halves
+/// (`ddc/ddl/ddl_conversion.cpp:2585-2591`).
+///
+/// ⭐⭐ A SECOND TYPE AND NOT A RELAXED [`FilledDims`]. Eight units of this file discharge *"Core data
+/// stage parameters are unavailable."* against a stage that states dims; admitting an extent-less
+/// [`DataStage`] would reopen every one of them. This stage HAS no extents, so [`DataStages::at`]
+/// answers [`None`] for it — which is what `primaryDimToVal_st` answers for each of its dims — and
+/// the two things the reference does write are reachable by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmptyStage {
+    /// `ss_.name_`, which is the stage's index spelled out.
+    pub name: StageName,
+    /// `ss_.maxSymbolicVolume_` and `el_.maxSymbolicVolume_`, which are one value here because the
+    /// reference assigns the core stage's to both.
+    pub volumes: BTreeMap<BTreeSet<PrimaryDim>, VolumeLimit>,
 }
 
 impl DataStages {
@@ -1600,6 +1643,7 @@ impl DataStages {
             core,
             chunk,
             minted: BTreeMap::new(),
+            empty: BTreeMap::new(),
         }
     }
 
@@ -1652,6 +1696,38 @@ impl DataStages {
     #[must_use]
     pub fn ibr(&self, index: DatastageId) -> Option<IbrStage> {
         self.at(index).map(|_| IbrStage(index))
+    }
+
+    /// `auto id = dataStageParam_.size(); while (dataStageParam_.count(id)) id++;` — the index
+    /// `ddl.datastage` mints at, which is the first free one AT OR AFTER the current size.
+    #[must_use]
+    pub fn next_index(&self) -> DatastageId {
+        let occupied = 2 + self.minted.len() + self.empty.len();
+        let mut id = DatastageId(u32::try_from(occupied).unwrap_or(u32::MAX));
+        while self.at(id).is_some() || self.empty.contains_key(&id) {
+            id = DatastageId(id.0.saturating_add(1));
+        }
+        id
+    }
+
+    /// `dataStageParam_[id] = <an extent-less stage>` — see [`EmptyStage`].
+    pub fn mint_empty(&mut self, index: DatastageId, stage: EmptyStage) {
+        self.empty.insert(index, stage);
+    }
+
+    /// That stage back, absent for an index that states dims or none at all.
+    #[must_use]
+    pub fn empty_stage(&self, index: DatastageId) -> Option<&EmptyStage> {
+        self.empty.get(&index)
+    }
+
+    /// `dataStageParam_.at(index).name()` WHICHEVER KIND OF STAGE THAT INDEX IS — the test entry 325
+    /// makes to tell an external stage from a minted one.
+    #[must_use]
+    pub fn stage_name(&self, index: DatastageId) -> Option<&StageName> {
+        self.at(index)
+            .map(DataStage::name)
+            .or_else(|| self.empty.get(&index).map(|stage| &stage.name))
     }
 
     /// `dataStageOnePageIdx` NAMING AN ENTRY THAT EXISTS — the one-page stage entry 227 loops against.

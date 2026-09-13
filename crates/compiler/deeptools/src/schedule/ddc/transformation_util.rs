@@ -2630,8 +2630,8 @@ mod tests_e110_e117 {
     use sys_arch_spec::arch_enums::SenComponent;
 
     use super::super::metadata::{Allocation, DataTransfer, TransferAccessPattern};
-    use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::{ConstIdx, DataStream};
+    use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
         DataInfo, Dsts, InstrAttribute, LayoutDims, NumChunks, Operand, ReplicationFactor,
         TransferPadding,
@@ -3079,7 +3079,7 @@ mod tests_e110_e117 {
 
         let compute = ComputeNode {
             name: NodeName("c0".to_string()),
-            op: ComputeType::Macc,
+            op: DdlComputeType::Macc,
             ex_unit: SenComponent::Pe,
             inputs: vec![operand(Some(DataConnect::ArfPt))],
             outputs: vec![operand(Some(DataConnect::ArfPtsum))],
@@ -3106,7 +3106,7 @@ mod tests_e255_e257 {
     use sys_arch_spec::arch_enums::SenComponent;
 
     use super::super::metadata::{Allocation, OpaqueOp};
-    use crate::generated::ComputeType;
+    use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{DataInfo, InstrAttribute, Operand, OperandPos};
     use crate::units::NumFolds;
 
@@ -3142,7 +3142,7 @@ mod tests_e255_e257 {
     fn compute() -> ComputeNode {
         ComputeNode {
             name: NodeName("c0".to_string()),
-            op: ComputeType::Macc,
+            op: DdlComputeType::Macc,
             ex_unit: SenComponent::Pe,
             inputs: vec![
                 operand(DataConnect::ArfPt, SenComponent::Lx),
@@ -3478,8 +3478,8 @@ mod tests_e247_e254 {
 
     use core::num::NonZeroU32;
 
-    use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::DataStream;
+    use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
         Dsts, InstrAttribute, LayoutDims, NumChunks, ReplicationFactor, TransferPadding,
     };
@@ -4301,7 +4301,7 @@ mod tests_e247_e254 {
                 consuming_compute,
                 ComputeNode {
                     name: NodeName("c0".to_string()),
-                    op: ComputeType::Macc,
+                    op: DdlComputeType::Macc,
                     ex_unit: SenComponent::Sfp,
                     inputs: vec![operand(SenComponent::Sfp, SenComponent::NoComponent, None)],
                     outputs: Vec::new(),

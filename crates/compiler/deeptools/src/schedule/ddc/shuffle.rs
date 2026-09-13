@@ -2997,9 +2997,9 @@ mod tests_e161_e164 {
         StickIndex, StickNumber, narrow_to_usize,
     };
     use crate::formats::DataFormat;
-    use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::AllocId;
     use crate::schedule::ddc::metadata::OwnedAllocateNode;
+    use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{ComputeNode, DataInfo, InstrAttribute, NodeName};
     use crate::units::NumFolds;
     use std::collections::BTreeSet;
@@ -3105,7 +3105,7 @@ mod tests_e161_e164 {
         let allocation = AllocId(4);
         let mut point = InsertPoint::new(ComputeNode {
             name: NodeName("packmerge".to_owned()),
-            op: ComputeType::Packmerge,
+            op: DdlComputeType::Packmerge,
             ex_unit: SenComponent::Ptrow0,
             inputs: Vec::new(),
             outputs: Vec::new(),
