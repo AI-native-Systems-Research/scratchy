@@ -104,18 +104,78 @@ use crate::workload::Workload;
 ///
 /// ⛔ TRAP: THE WALK IS COLLECTED BEFORE IT IS ITERATED (`:84-87`) because `runOn` rewrites the unit
 /// it is handed. A program's units are a fixed list here, so the snapshot is the droppable mechanism.
-pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+) {
     for unit in program.units.iter_mut() {
-        run_on_unit(unit);
+        run_on_unit(unit, values);
     }
 }
 
-/// `runOn(dataflow::ProgramUnitOp)` — entry 605, level 5, not yet ported.
-fn run_on_unit<A: Arch>(unit: &mut ProgramUnit<A>) -> ! {
-    let _ = unit;
-    todo!(
-        "e605_runOn(dataflow::ProgramUnitOp) — the L3LU/L3SU gate and the unique-producer store walk          (MulticastCanonicalization.cpp:371), which schedules e569_runOn per store"
-    )
+/// Every `sentient.receive_and_store` under `block`, PRE-ORDER, as `(what it binds, its producer)`.
+fn stores_pre_order(block: &[Op], out: &mut Vec<(Val, Val)>) {
+    for op in block {
+        if let Op::Sentient(sentient::Op::ReceiveAndStore {
+            result, producer, ..
+        }) = op
+        {
+            out.push((*result, producer.val()));
+        }
+        for region in dialects::regions_ref(op) {
+            stores_pre_order(region, out);
+        }
+    }
+}
+
+/// Canonicalises the store binding `store`, wherever under `block` it now sits.
+///
+/// ⛔ RE-LOCATED BY WHAT IT BINDS, NOT BY A REMEMBERED INDEX: [`run_on_store`] inserts ops ahead of the
+/// store it rewrites, so every position the collecting walk recorded is stale by the second store.
+fn run_on_store_at(block: &mut Vec<Op>, store: Val, values: &mut Values) -> bool {
+    if let Some(at) = block
+        .iter()
+        .position(|op| dialects::results(op).contains(&store))
+    {
+        run_on_store(InBlock(at), block, values);
+        return true;
+    }
+    for at in 0..block.len() {
+        for region in dialects::regions_mut(&mut block[at]) {
+            if run_on_store_at(region, store, values) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Replaces: e605_runOn
+///
+/// One program unit: on an L3 half only, canonicalise ONE store per distinct `$producer` — the first
+/// the pre-order walk reaches (`:371-393`).
+///
+/// ⛔ NAMED FOR ITS ARGUMENT — see [`run_on_program`], the same C++ overload set.
+/// ⛔ TRAP: THE DEDUPE KEEPS THE FIRST STORE OF EACH PRODUCER AND DROPS THE REST, so a producer
+/// multicast to two stores is canonicalised once and the second store keeps naming the group.
+fn run_on_unit<A: Arch>(unit: &mut ProgramUnit<A>, values: &mut Values) {
+    // `getUnitType(curr_unit)` against `L3LU, L3SU` — which is what [`ProgramUnit::moves_memory`] is.
+    if !unit.moves_memory() {
+        return;
+    }
+    let mut seen = Vec::new();
+    let mut stores = Vec::new();
+    stores_pre_order(&unit.body, &mut stores);
+    let mut unique = Vec::new();
+    for (result, producer) in stores {
+        if !seen.contains(&producer) {
+            seen.push(producer);
+            unique.push(result);
+        }
+    }
+    for store in unique {
+        run_on_store_at(&mut unit.body, store, values);
+    }
 }
 
 /// ONE `dataflow.create_multicast_group` READ AS A STORE'S `$producer` — the group handle and the
@@ -483,13 +543,63 @@ mod unit_tests {
         );
     }
 
-    /// e323 — the flag is off, so the entry walks the module's units and stops where e605 is not
-    /// ported. ⭐ REACHING THE SEAM IS WHAT IS TESTABLE: it proves the entry runs the pass at all.
+    /// e323 — the flag is off, so the entry walks the module's units and its L3 half's store comes out
+    /// canonicalised.
     #[test]
-    #[should_panic(expected = "e605_runOn")]
     fn e323_runs_the_pass_over_the_module() {
-        let mut program = program_on(DfirUnit::L3lu, Vec::new());
-        run_on_operation(&mut program);
+        let (unit, handle) = (Val(1), Val(2));
+        let mut program = program_on(
+            DfirUnit::L3lu,
+            vec![
+                group(handle, unit),
+                store(StoreSource::Multicast(handle), Val(10)),
+            ],
+        );
+        run_on_operation(&mut program, &mut Values::default());
+        let body = &program.units.iter().next().expect("the one unit").body;
+        assert!(matches!(
+            body[1],
+            Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
+                if producer == StoreSource::Wire(RecvEnd::from_multicast_group(unit))
+                    && multicast_info == Some(handle)
+        ));
+    }
+
+    /// e605 — ONE store per distinct producer, the first the pre-order walk reaches, and only on an L3
+    /// half; an LXSU unit is not touched at all.
+    #[test]
+    fn e605_canonicalises_the_first_store_of_each_producer_on_an_l3_half() {
+        let (unit, handle) = (Val(1), Val(2));
+        let body = vec![
+            group(handle, unit),
+            store(StoreSource::Multicast(handle), Val(10)),
+            store(StoreSource::Multicast(handle), Val(11)),
+        ];
+        let mut program = program_on(DfirUnit::L3lu, body.clone());
+        run_on_operation(&mut program, &mut Values::default());
+        let rewritten = &program.units.iter().next().expect("the one unit").body;
+        assert!(matches!(
+            rewritten[1],
+            Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
+                if producer == StoreSource::Wire(RecvEnd::from_multicast_group(unit))
+                    && multicast_info == Some(handle)
+        ));
+        // ⛔ AND THE SECOND STORE IS REWRITTEN TOO THOUGH THE WALK NEVER HANDED IT OVER: its
+        // producer is a duplicate, but [`process_direct_multicast`] ignores the store it is given and
+        // rewrites every store reading the group — see its own note on the unused `ras`.
+        assert!(matches!(
+            rewritten[2],
+            Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
+                if producer == StoreSource::Wire(RecvEnd::from_multicast_group(unit))
+                    && multicast_info == Some(handle)
+        ));
+
+        let mut elsewhere = program_on(DfirUnit::Lxsu, body.clone());
+        run_on_operation(&mut elsewhere, &mut Values::default());
+        assert_eq!(
+            elsewhere.units.iter().next().expect("the one unit").body,
+            body
+        );
     }
 
     /// e324 — a `query_map` of two groups gains a second `query_map` of their producers, both built at
@@ -639,11 +749,14 @@ const DISABLE_THIS_PASS: bool = false;
 ///
 /// ⭐ `getOperation()` IS THE PROGRAM HERE — the pass is declared on a `ModuleOp`, which this island
 /// spells as the [`Program`] whose units [`run_on_program`] walks.
-pub fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+) {
     if DISABLE_THIS_PASS {
         return;
     }
-    run_on_program(program);
+    run_on_program(program, values);
 }
 
 /// Replaces: e324_processQMapOfDirectMulticast
@@ -1071,8 +1184,3 @@ pub fn run_on_store(store: InBlock, body: &mut Vec<Op>, values: &mut Values) {
         }
     }
 }
-
-// crustify:todo: e605_runOn
-//   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:371  (24 body lines, level 5)
-//   original  : void MulticastCanonicalizationPass::runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e097_runOn, e569_runOn

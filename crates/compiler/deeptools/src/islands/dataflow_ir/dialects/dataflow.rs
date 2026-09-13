@@ -467,6 +467,16 @@ pub enum Op {
         /// carries `num_folds = 1 : i32` (`dcc/test/PT/fp8-bmm-1p5.mlir:104`). A mandatory field
         /// would print the attribute on ops the reference prints bare.
         num_folds: Option<crate::units::NumFolds>,
+        /// `regLocale=`, or [`None`] for an op that carries no such attribute.
+        ///
+        /// ⛔ THE ONE WRITER IS `RegisterTypeAssignmentPass::runOn` AND ONLY ON AN L3 HALF
+        /// (`RegisterTypeAssignment.cpp:1041-1048`): a `get_unit` some yield, copy or
+        /// `uniform.def_immutable_mapping` of an `l3lu`/`l3su` unit reads needs a locale so the right
+        /// assign instruction can be inserted. ⭐ AN [`Option`] AND NOT A `RegType` DEFAULTED TO
+        /// `Unknown` because `getValueRegLocale` has an explicit no-attribute branch for this op
+        /// (`Dialect/Sentient/SentientOps.cpp:1793-1800`) and a mandatory field would print the
+        /// attribute on every `get_unit` the reference prints bare.
+        reg_locale: Option<crate::islands::sentient::dialects::sentient::RegType>,
     },
 
     /// `dataflow.get_local_unit %unit {name} : index` — a register file of a unit already held.
@@ -759,6 +769,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             residency,
             unit,
             num_folds,
+            reg_locale,
         } => {
             use crate::units::Residency;
 
@@ -794,9 +805,14 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 Some(folds) => format!("num_folds = {} : i32, ", folds.0),
                 None => String::new(),
             };
+            // ⭐ AND `regLocale` SITS BETWEEN `num_folds` AND `type`, the same alphabetical order.
+            let locale = match reg_locale {
+                Some(locale) => format!("regLocale = #sentient<reg_type {}>, ", locale.spelling()),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = dataflow.get_unit {{{attrs}name = \"{name}\", {folds}type = \"{spelling}\"}} : index",
+                "{} = dataflow.get_unit {{{attrs}name = \"{name}\", {folds}{locale}type = \"{spelling}\"}} : index",
                 print::val(*result),
             );
         }
@@ -1150,6 +1166,7 @@ mod tests {
                 residency,
                 unit,
                 num_folds: None,
+                reg_locale: None,
             });
             next += 1;
             ops.push(op);

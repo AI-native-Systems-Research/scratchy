@@ -199,6 +199,7 @@ fn program<A: Arch, M: Model, W: Workload>(input: &dfir::Program<A>) -> sentient
                 residency,
                 unit,
                 num_folds,
+                reg_locale,
             }) => {
                 // ⛔⛔ THE `constant` UNIT IS DROPPED. The input binds seven units and the golden
                 // holds six: `C0-constant-CL0` is gone. It is a pseudo-unit naming where immediates
@@ -214,6 +215,7 @@ fn program<A: Arch, M: Model, W: Workload>(input: &dfir::Program<A>) -> sentient
                     residency: *residency,
                     unit: *unit,
                     num_folds: *num_folds,
+                    reg_locale: *reg_locale,
                 }));
             }
             // ⛔ VIEWS ARE RECORDED, NOT EMITTED — see [`Bound`].

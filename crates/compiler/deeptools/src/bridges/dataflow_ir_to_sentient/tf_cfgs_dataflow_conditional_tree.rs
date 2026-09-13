@@ -1103,6 +1103,7 @@ mod unit_tests {
             residency: Residency::Global,
             unit: DfirUnit::Pe,
             num_folds: None,
+            reg_locale: None,
         })
     }
 

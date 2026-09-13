@@ -896,7 +896,19 @@ fn reg_info_component(u: Val, defs: Definitions<'_>) -> Component {
         Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) => Some(*unit),
         _ => None,
     };
-    unit.and_then(|unit| match unit {
+    unit.and_then(component_of)
+        .unwrap_or_else(|| {
+            panic!(
+                "{u:?} is not a `dataflow.get_unit` on an executor, so `regInfoPerUnit` states no \
+                 register counts for it (DccExtContext.cpp:292)"
+            )
+        })
+}
+
+/// The same nine components, keyed by the unit kind rather than by the value naming it — what
+/// `dcc::getUnitType(unit_)` answers for a whole `dataflow.program_unit` (`:813`).
+pub(crate) fn component_of(unit: DfirUnit) -> Option<Component> {
+    match unit {
         DfirUnit::PtRow(_) => Some(Component::Pt),
         DfirUnit::Pe => Some(Component::Pe),
         DfirUnit::Sfp => Some(Component::Sfp),
@@ -917,13 +929,7 @@ fn reg_info_component(u: Val, defs: Definitions<'_>) -> Component {
         | DfirUnit::L3Ibr
         | DfirUnit::CrossPtnLink
         | DfirUnit::LxluScaleReg => None,
-    })
-    .unwrap_or_else(|| {
-        panic!(
-            "{u:?} is not a `dataflow.get_unit` on an executor, so `regInfoPerUnit` states no \
-             register counts for it (DccExtContext.cpp:292)"
-        )
-    })
+    }
 }
 
 impl RegisterInitInfo {
@@ -1197,6 +1203,7 @@ mod unit_tests {
             residency: crate::units::Residency::Global,
             unit: crate::units::DfirUnit::L3lu,
             num_folds: None,
+            reg_locale: None,
         })
     }
 
@@ -1368,6 +1375,7 @@ mod unit_tests {
                 residency: crate::units::Residency::Global,
                 unit: crate::units::DfirUnit::L3lu,
                 num_folds: None,
+                reg_locale: None,
             })
         };
         // `%20 = uniform.query_map (map:%10, key:%arg0)` feeding a `gtr` copy, inside a region

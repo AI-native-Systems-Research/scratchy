@@ -3056,6 +3056,7 @@ mod unit_tests {
                 residency,
                 unit,
                 num_folds: None,
+                reg_locale: None,
             })
         };
         let core0 = Core::checked(0).expect("core 0 exists");

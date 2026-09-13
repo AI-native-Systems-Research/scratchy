@@ -1905,12 +1905,14 @@ mod unit_tests {
                     residency: corelet0(),
                     unit: DfirUnit::Lxlu,
                     num_folds: None,
+                    reg_locale: None,
                 }),
                 DfirOp::Dataflow(dataflow::Op::GetUnit {
                     result: sfp_unit,
                     residency: corelet0(),
                     unit: DfirUnit::Sfp,
                     num_folds: None,
+                    reg_locale: None,
                 }),
                 DfirOp::Dataflow(dataflow::Op::Receive {
                     result: data,
@@ -2091,6 +2093,7 @@ mod unit_tests {
                     },
                     unit: DfirUnit::Lxsu,
                     num_folds: None,
+                    reg_locale: None,
                 })))
                 .collect(),
         );
@@ -2187,12 +2190,14 @@ mod unit_tests {
                         residency: Residency::Global,
                         unit: DfirUnit::Lxlu,
                         num_folds: None,
+                        reg_locale: None,
                     }),
                     DfirOp::Dataflow(dataflow::Op::GetUnit {
                         result: to.val(),
                         residency: Residency::Global,
                         unit: DfirUnit::Lxsu,
                         num_folds: None,
+                        reg_locale: None,
                     }),
                     DfirOp::Dataflow(dataflow::Op::Receive {
                         result: data,
@@ -2255,6 +2260,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::Lxlu,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::Receive {
                 result: data,

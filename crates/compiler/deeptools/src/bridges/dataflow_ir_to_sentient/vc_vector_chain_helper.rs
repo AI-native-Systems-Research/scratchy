@@ -4891,6 +4891,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::Lxsu,
                 num_folds: None,
+                reg_locale: None,
             }),
         ];
         let mut operand = VectorOperand {
@@ -4970,6 +4971,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::Lxsu,
                 num_folds: None,
+                reg_locale: None,
             }),
         ];
         let from = VectorOperand {
@@ -5042,6 +5044,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::Sfp,
                 num_folds: None,
+                reg_locale: None,
             }),
         ];
 

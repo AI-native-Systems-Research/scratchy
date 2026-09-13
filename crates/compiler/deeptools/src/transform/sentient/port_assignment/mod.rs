@@ -618,6 +618,24 @@ pub(crate) trait LiveRanges {
         let _ = (range, interval);
         todo!("LiveRange::unionWith (Analyses/LiveRange.cpp:67) — out of campaign scope")
     }
+
+    /// `lhs.overlaps(rhs, half_open_range)` (`Analyses/LiveRange.hpp:44`).
+    ///
+    /// ⛔ THE DEFAULT IS `true` AND E608 PASSES `false` EXPLICITLY (`:647-648`), so the flag is an
+    /// argument here and not a fact about the seam.
+    fn overlaps(&mut self, lhs: &LiveRange, rhs: &LiveRange, half_open_range: HalfOpenRange) -> bool {
+        let _ = (lhs, rhs, half_open_range);
+        todo!("LiveRange::overlaps (Analyses/LiveRange.cpp:57) — out of campaign scope")
+    }
+}
+
+/// WHETHER AN OVERLAP TEST TREATS THE END OF A RANGE AS OUTSIDE IT — `bool half_open_range`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HalfOpenRange {
+    /// `half_open_range = true`, the seam's own default.
+    Yes,
+    /// `half_open_range = false`, which is what e608 asks for.
+    No,
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
@@ -892,10 +910,60 @@ impl<G: ColoringGraph> PortAssignment<G> {
     }
 }
 
-// crustify:todo: e608_buildGraphEdges
-//   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:644  (37 body lines, level 5)
-//   original  : void PortAssignmentPass::buildGraphEdges(dataflow::ProgramUnitOp &unit)
-//   calls     : e572_computePortLiveRange
+impl<G: ColoringGraph> PortAssignment<G> {
+    /// Replaces: e608_buildGraphEdges
+    ///
+    /// Every ordered pair of operand values whose port live ranges overlap becomes a node pair on the
+    /// colouring graph, with an interference edge between the distinct ones (`:644-679`).
+    ///
+    /// ⛔ TRAP: THE PAIRS ARE ORDERED AND INCLUDE THE DIAGONAL. A range overlaps itself, so every
+    /// operand gets `getOrAddNode` called on it, and each unordered pair is visited TWICE — which is
+    /// what fills `reuse_nodes_per_op_` with `{a,b}` and `{b,a}` both.
+    /// ⛔ TRAP: THE REUSE PAIR IS PUSHED ONCE PER OWNER OF `node1`, not once per shared owner: the
+    /// `break` leaves the inner loop only (`:668`), so two ops both naming `node1` and `node2` record
+    /// the pair twice.
+    /// ⚠️ THE ITERATION IS `BTreeMap`'s AND THE REFERENCE'S IS `DenseMap`'s, so the pairs come out in
+    /// a different order; nothing downstream of `reuse_nodes_per_op_` or the graph reads that order.
+    pub(crate) fn build_graph_edges<R: LiveRanges>(
+        &mut self,
+        unit: &[Op],
+        live_ranges: &mut R,
+    ) -> LiveRangeComputed {
+        let computed = self.compute_port_live_range(unit, live_ranges);
+        // The overlaps are read out before the graph is written, because both are `self`.
+        let mut overlapping = Vec::new();
+        for (node1_idx, range1) in &self.operand_to_liverange {
+            for (node2_idx, range2) in &self.operand_to_liverange {
+                if live_ranges.overlaps(range1, range2, HalfOpenRange::No) {
+                    overlapping.push((*node1_idx, *node2_idx));
+                }
+            }
+        }
+        for (node1_idx, node2_idx) in overlapping {
+            if self.dummy_nodes.contains(&node1_idx) && self.dummy_nodes.contains(&node2_idx) {
+                continue;
+            }
+            if node1_idx != node2_idx
+                && self.reuse_nodes.contains(&node1_idx)
+                && self.reuse_nodes.contains(&node2_idx)
+            {
+                let owners1 = self.operand_to_owners.get(&node1_idx).cloned().unwrap_or_default();
+                let owners2 = self.operand_to_owners.get(&node2_idx).cloned().unwrap_or_default();
+                for op1 in &owners1 {
+                    if owners2.contains(op1) {
+                        self.reuse_nodes_per_op.push(vec![node1_idx, node2_idx]);
+                    }
+                }
+            }
+            self.graph.get_or_add_node(node1_idx);
+            self.graph.get_or_add_node(node2_idx);
+            if node1_idx != node2_idx {
+                self.graph.add_bidirectional_edge(node1_idx, node2_idx);
+            }
+        }
+        computed
+    }
+}
 
 // crustify:todo: e632_doPortAssignments
 //   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:776  (12 body lines, level 6)
@@ -913,19 +981,31 @@ mod unit_tests {
     use crate::arch::{Dd2, Sen1p5};
     use crate::islands::dataflow_ir::Units;
     use crate::islands::sentient::dialects::Val;
-    use crate::islands::sentient::dialects::sentient::{LrfIndex, Operand, RegType, ResultPorts};
+    use crate::islands::sentient::dialects::sentient::{
+        Binary, LrfIndex, Operand, RegType, ResultPorts,
+    };
     use crate::units::Row;
 
-    /// A colouring graph that only records being cleared — `OutOfScopeColoringGraph::clear` is a
-    /// `todo!`, and `clean`'s whole contract is that it asks the graph rather than replacing it.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    /// A colouring graph that only records what it was asked — `GraphColoring` itself is out of
+    /// scope, and `clean`'s whole contract is that it asks the graph rather than replacing it.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     struct CountingGraph {
         clears: u32,
+        nodes: Vec<DataId>,
+        edges: Vec<(DataId, DataId)>,
     }
 
     impl ColoringGraph for CountingGraph {
         fn clear(&mut self) {
             self.clears += 1;
+        }
+
+        fn get_or_add_node(&mut self, index: DataId) {
+            self.nodes.push(index);
+        }
+
+        fn add_bidirectional_edge(&mut self, node1: DataId, node2: DataId) {
+            self.edges.push((node1, node2));
         }
     }
 
@@ -1047,7 +1127,13 @@ mod unit_tests {
             operand_to_liverange: BTreeMap::from([(DataId(1), LiveRange)]),
         };
         pass.clean();
-        assert_eq!(pass.graph, CountingGraph { clears: 1 });
+        assert_eq!(
+            pass.graph,
+            CountingGraph {
+                clears: 1,
+                ..CountingGraph::default()
+            }
+        );
         assert!(pass.dummy_nodes.is_empty());
         assert!(pass.reuse_nodes.is_empty());
         assert!(pass.reuse_nodes_per_op.is_empty());
@@ -1404,6 +1490,95 @@ mod unit_tests {
                     label: RegionLabel::Global,
                 },
             ]
+        );
+    }
+
+    /// A `sentient.vector_binary` whose `$opA` and `$opB` carry `a` and `b`.
+    fn binary_on(a: i32, b: i32) -> Op {
+        Op::Sentient(sentient::Op::VectorBinary {
+            mask: Val(2),
+            op_a: Operand {
+                data_id: Some(a),
+                ..Operand::from(Port::West)
+            },
+            op_b: Operand {
+                data_id: Some(b),
+                ..Operand::from(Port::East)
+            },
+            binary_op: Binary::Plain(BinaryOp::Min),
+            result: ResultPorts::default(),
+            compute_precision: Precision::Fp16,
+            fold_mode: None,
+            unroll_factor: sentient::UnrollFactor::X1,
+            dbg_name: None,
+        })
+    }
+
+    /// A [`LiveRanges`] that answers EVERY pair overlapping and records the flag it was asked with —
+    /// the interval algebra itself is `Analyses/LiveRange.cpp` and out of scope.
+    #[derive(Debug, Default)]
+    struct AlwaysOverlapping(Vec<HalfOpenRange>);
+
+    impl LiveRanges for AlwaysOverlapping {
+        fn union_with(&mut self, _range: &mut LiveRange, _interval: LabeledRange) {}
+
+        fn overlaps(
+            &mut self,
+            _lhs: &LiveRange,
+            _rhs: &LiveRange,
+            half_open_range: HalfOpenRange,
+        ) -> bool {
+            self.0.push(half_open_range);
+            true
+        }
+    }
+
+    /// e608 — every ordered pair of the three ranges is asked, a pair of dummies is skipped whole,
+    /// the diagonal adds its node but no edge, and the reuse pair is pushed once per owner.
+    #[test]
+    fn e608_walks_every_ordered_pair_and_skips_the_pair_of_dummies() {
+        let unit = vec![binary_on(7, 8), unary_on(Some(9))];
+        let mut pass = PortAssignment::<CountingGraph>::default();
+        pass.dummy_nodes = vec![DataId(7), DataId(9)];
+        pass.reuse_nodes = vec![DataId(7), DataId(8)];
+        let mut ranges = AlwaysOverlapping::default();
+
+        assert_eq!(
+            pass.build_graph_edges(&unit, &mut ranges),
+            LiveRangeComputed::Yes
+        );
+
+        // Nine ordered pairs, every one asked with `half_open_range = false`.
+        assert_eq!(ranges.0, vec![HalfOpenRange::No; 9]);
+        assert_eq!(
+            pass.graph.edges,
+            vec![
+                (DataId(7), DataId(8)),
+                (DataId(8), DataId(7)),
+                (DataId(8), DataId(9)),
+                (DataId(9), DataId(8)),
+            ]
+        );
+        // `(8, 8)` adds its node twice and no edge; `(7, 7)`, `(7, 9)`, `(9, 7)` and `(9, 9)` are
+        // two dummies and add nothing at all.
+        assert_eq!(
+            pass.graph.nodes,
+            vec![
+                DataId(7),
+                DataId(8),
+                DataId(8),
+                DataId(7),
+                DataId(8),
+                DataId(8),
+                DataId(8),
+                DataId(9),
+                DataId(9),
+                DataId(8),
+            ]
+        );
+        assert_eq!(
+            pass.reuse_nodes_per_op,
+            vec![vec![DataId(7), DataId(8)], vec![DataId(8), DataId(7)]]
         );
     }
 }

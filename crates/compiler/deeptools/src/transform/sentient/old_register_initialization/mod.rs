@@ -401,6 +401,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::L3lu,
                 num_folds: None,
+                reg_locale: None,
             }),
             // The source `%7` is defined outside this unit, so nothing is cloned or erased.
             copy(7, 8, None, false),

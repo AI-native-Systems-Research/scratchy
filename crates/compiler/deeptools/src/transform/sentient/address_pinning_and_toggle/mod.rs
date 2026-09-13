@@ -2101,6 +2101,7 @@ mod unit_tests {
             residency: Residency::Global,
             unit,
             num_folds: None,
+            reg_locale: None,
         })
     }
 

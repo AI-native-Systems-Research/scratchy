@@ -236,6 +236,7 @@ pub(crate) fn run_on<A: Arch>(
         residency: Residency::Global,
         unit: DfirUnit::Sfp,
         num_folds: None,
+        reg_locale: None,
     }));
     unit.body.push(Op::Sentient(sentient::Op::SetSendDst {
         units: Link::<LxluUnit, SfpUnit>::between(unit.on.first(), sfp).ends().0,
@@ -401,6 +402,7 @@ mod unit_tests {
                     residency: Residency::Global,
                     unit: DfirUnit::Sfp,
                     num_folds: None,
+                    reg_locale: None,
                 }),
                 Op::Sentient(sentient::Op::SetSendDst {
                     units: Link::<LxluUnit, SfpUnit>::between(Val(0), Val(1)).ends().0,

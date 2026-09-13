@@ -472,6 +472,7 @@ mod unit_tests {
             },
             unit: DfirUnit::Lxlu,
             num_folds: None,
+            reg_locale: None,
         })
     }
 
@@ -530,6 +531,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,
                 num_folds: None,
+                reg_locale: None,
             }),
         ];
         let mut units = vec![Val(100), Val(101)];
@@ -554,6 +556,7 @@ mod unit_tests {
             residency: Residency::Scratchpad { core: core(0) },
             unit: DfirUnit::Lx,
             num_folds: None,
+            reg_locale: None,
         })];
         let mut units = vec![Val(100)];
         let filters = UnitFilters {
@@ -578,6 +581,7 @@ mod unit_tests {
             residency: Residency::CoreWide { core: core(0) },
             unit: DfirUnit::L3lu,
             num_folds: None,
+            reg_locale: None,
         })];
         let mut units = vec![Val(100)];
         let filters = UnitFilters {
@@ -605,6 +609,7 @@ mod unit_tests {
                 },
                 unit: DfirUnit::Lxlu,
                 num_folds: None,
+                reg_locale: None,
             }),
         ];
         let mut units = vec![Val(100), Val(101)];
@@ -875,6 +880,7 @@ mod unit_tests {
                     },
                     unit: DfirUnit::Lxlu,
                     num_folds: Some(NumFolds::ONE),
+                    reg_locale: None,
                 }),
                 // `%101` was read by nothing, `%103` by nothing; `%102` is read by the program unit.
                 DfirOp::Dataflow(dataflow::Op::CreateGroup {
@@ -1055,6 +1061,7 @@ mod unit_tests {
                 },
                 unit: DfirUnit::Sfp,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Uniform(uniform::Op::DefImmutableMapping {
                 result: Val(200),

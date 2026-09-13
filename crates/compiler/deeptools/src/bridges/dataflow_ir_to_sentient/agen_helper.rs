@@ -1892,6 +1892,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit,
                 num_folds: None,
+                reg_locale: None,
             })
         };
         // `dataflow.send %pt, %9` — one end of an LXLU-to-PT-row-0 link, which is the only way a send
@@ -2110,6 +2111,7 @@ mod unit_tests {
             residency: at_corelet_zero(),
             unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
             num_folds: None,
+            reg_locale: None,
         });
 
         let through = vec![
@@ -2454,6 +2456,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::LxVirtualIbr,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
                 result: Val(23),
@@ -3022,6 +3025,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
                 result: Val(21),
@@ -3035,6 +3039,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::LxVirtualIbr,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
                 result: Val(23),
@@ -3182,6 +3187,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::Receive {
                 result: Val(41),
@@ -3348,6 +3354,7 @@ mod unit_tests {
             residency: at_corelet_zero(),
             unit: DfirUnit::Lxlu,
             num_folds: None,
+            reg_locale: None,
         });
         let source = UniformizeSource {
             kind: RegionOpKind::UniformizeRegions,
@@ -3391,6 +3398,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lxlu,
                 num_folds: None,
+                reg_locale: None,
             })],
             active: true,
         };
@@ -4007,6 +4015,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::L0su,
                 num_folds: None,
+                reg_locale: None,
             })
         };
         let mut body = vec![
@@ -4054,12 +4063,14 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
                 result: Val(328),
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Agen(mc),
         ];
@@ -4232,12 +4243,14 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
                 result: Val(11),
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Agen(mc),
         ];
@@ -4662,6 +4675,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Arith(arith::Op::Constant {
                 result: Val(61),
@@ -4688,6 +4702,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::LxVirtualIbr,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
                 result: Val(65),
@@ -4733,6 +4748,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::LxVirtualIbr,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Arith(arith::Op::Constant {
                 result: Val(72),
@@ -4750,6 +4766,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lxlu,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::Receive {
                 result: Val(73),
@@ -4858,6 +4875,7 @@ mod unit_tests {
             residency: at_corelet_zero(),
             unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
             num_folds: None,
+            reg_locale: None,
         }));
         body.push(DfirOp::Dataflow(dataflow::Op::Send {
             to: to_pt,
@@ -5062,6 +5080,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::Lx,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Arith(arith::Op::Constant {
                 result: Val(81),
@@ -5079,6 +5098,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::LxluScaleReg,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
                 result: Val(84),
@@ -5147,6 +5167,7 @@ mod unit_tests {
                 residency: at_corelet_zero(),
                 unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::Send {
                 to: SendEnd::to_self(Val(93)),
@@ -8570,6 +8591,7 @@ pub fn cleanup_trivially_redundant_set_send_destination<A: Arch>(
             residency,
             unit,
             num_folds,
+            reg_locale: None,
         }),
     );
     SetSendDestinationCleanup::Replaced { get_unit, erased }

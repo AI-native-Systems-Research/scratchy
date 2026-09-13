@@ -3798,6 +3798,7 @@ mod unit_tests {
                 },
                 unit: DfirUnit::Lxsu,
                 num_folds: None,
+                reg_locale: None,
             }),
         ];
         // The parent's answer, which the reference builds and then overwrites two fields of.
@@ -3889,6 +3890,7 @@ mod unit_tests {
                 },
                 unit: DfirUnit::PtRow(Row::checked(7).expect("this arch's PT has row seven")),
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Uniform(uniform::Op::DefImmutableMapping {
                 result: Val(194),

@@ -1121,10 +1121,8 @@ pub fn element_size(val: Val, defs: Definitions<'_>) -> Option<crate::formats::B
 /// `SentientRegType::unknown` at `:1759` and returned by every arm that finds no attribute — an
 /// unassigned register, which `RegisterTypeAssignment` (D66) is what replaces.
 ///
-/// ⛔ TWO ISLAND GAPS ANSWER `Unknown`, EACH THE REFERENCE'S OWN NO-ATTRIBUTE BRANCH: `regLocale` as a
-/// discardable attribute on `dataflow.get_unit` (`:1793-1800`, whose own `else` returns `unknown`);
-/// and `regLocales` on `uniform.uniformize_regions` (`:1832-1842`, whose own `else` returns
-/// `unknown`). ⭐ ENTRY 0 WAS THE THIRD AND IS NOW [`sentient::Op::For::bound_reg`], which the
+/// ⛔ ONE ISLAND GAP ANSWERS `Unknown`, THE REFERENCE'S OWN NO-ATTRIBUTE BRANCH: `regLocales` on
+/// `uniform.uniformize_regions` (`:1832-1842`, whose own `else` returns `unknown`). ⭐ ENTRY 0 WAS THE THIRD AND IS NOW [`sentient::Op::For::bound_reg`], which the
 /// reference reads for the INDUCTION VARIABLE — argument 0, `locales[argNumber]`.
 #[must_use]
 pub fn value_reg_locale(val: Val, defs: Definitions<'_>) -> sentient::RegType {
@@ -1202,6 +1200,12 @@ pub fn value_reg_locale(val: Val, defs: Definitions<'_>) -> sentient::RegType {
                 _ => sentient::RegType::Unknown,
             }
         }
+        // ⭐ THE DISCARDABLE `regLocale` ON `dataflow.get_unit` (`:1793-1800`), which
+        // `RegisterTypeAssignmentPass::runOn` writes on an L3 half; its absence is that arm's own
+        // `else`.
+        Some(Op::Dataflow(dataflow::Op::GetUnit { reg_locale, .. })) => {
+            reg_locale.unwrap_or(sentient::RegType::Unknown)
+        }
         Some(Op::Symbol(symbol::Op::CreateSymbol { .. })) => sentient::RegType::Imm,
         Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => value_reg_locale(*map, defs),
         // ⛔ THE FIRST VALUE'S LOCALE, WITH NO CHECK THAT THE REST AGREE. The reference
@@ -1237,7 +1241,7 @@ pub fn value_reg_locale(val: Val, defs: Definitions<'_>) -> sentient::RegType {
 ///
 /// ⛔ AN OP WITH NO [`sentient::Reg`] AT THAT POSITION IS A NO-OP, not a refusal — the `_` arm is
 /// exactly the set of ops whose `regLocales` array the reference materialises and no reader of this
-/// island asks for, `sentient.mac` (positional) and `dataflow.get_unit` among them.
+/// island asks for, `sentient.mac` (positional) among them.
 pub fn set_reg_locale_on(op: &mut Op, val: Val, locale: sentient::RegType) {
     match op {
         // ⭐ ONE ENTRY FOR THE ARGUMENT AND THE RESULT, where the reference has `[i + 1]` and
@@ -1312,6 +1316,16 @@ pub fn set_reg_locale_on(op: &mut Op, val: Val, locale: sentient::RegType) {
         }) => {
             if *result == val {
                 *reg_locale = locale;
+            }
+        }
+        // ⭐ THE DISCARDABLE ATTRIBUTE `RegisterTypeAssignmentPass::runOn` SETS
+        // (`RegisterTypeAssignment.cpp:1042-1048`), reachable from e352 as well since
+        // `records_result_locales` names `dataflow.get_unit` on an L3 half.
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result, reg_locale, ..
+        }) => {
+            if *result == val {
+                *reg_locale = Some(locale);
             }
         }
         // ⭐ THE REFERENCE CREATES THE ATTRIBUTE WHERE NONE STOOD, so an absent `reg` becomes one

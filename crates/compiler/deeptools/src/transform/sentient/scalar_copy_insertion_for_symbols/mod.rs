@@ -89,19 +89,17 @@
 //! | `e576_runOn` | 576 | 4 | 67 | `dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:148` |
 //! | `e610_runOnOperation` | 610 | 5 | 17 | `dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:130` |
 
-// ⛔ NOTHING CALLS THIS MODULE YET — the pass entry is `e610_runOnOperation` (level 5), this file's
-// last unfilled anchor, and until it lands the ported leaves below are reachable only from this
-// file's own tests. ⭐ DELETE THIS LINE WHEN THAT ANCHOR IS FILLED: a warning that survives it is a
-// unit nothing calls, which the campaign's own note names as the failure mode to catch.
-#![allow(dead_code)]
-
 use std::fmt::Write as _;
 
+use crate::arch::Arch;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::sentient::dialects::sentient::{Reg, RegType};
 use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient, symbol, uniform};
 use crate::islands::sentient::print;
+use crate::islands::sentient::Program;
+use crate::model::Model;
+use crate::workload::Workload;
 
 use super::ForRef;
 use super::analyses::{Liveness, RegisterPressure};
@@ -876,15 +874,70 @@ pub fn run_on<L: Liveness, P: RegisterPressure>(
     insert_copy_ops_for_candidates(unit_body, &candidates, &state.symbol_to_usage, values);
 }
 
-// crustify:todo: e610_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:130  (17 body lines, level 5)
-//   original  : void ScalarCopyInsertionForSymbolsPass::runOnOperation()
-//   calls     : e152_clear, e576_runOn
+/// `-dcc-scalar-copy-insertion-for-symbols-disable`, `cl::init(false)` (`:62-65`) — a `dcc-opt`
+/// command-line flag, not a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `opts_.OptLevel == 0 || opts_.OptLevel == 1` (`:132`) — the pipeline's optimization level, which
+/// this crate compiles at its default and not at `-O0`/`-O1`.
+const OPT_LEVEL_BELOW_TWO: bool = false;
+
+/// EVERY `symbol.create_symbol` OF A BLOCK AND ITS REGIONS, in the pre-order the walk sees them.
+fn create_symbols_in(block: &[Op], out: &mut Vec<Val>) {
+    for op in block {
+        if let Op::Symbol(symbol::Op::CreateSymbol { result, .. }) = op {
+            out.push(*result);
+        }
+        for region in dialects::regions_ref(op) {
+            create_symbols_in(region, out);
+        }
+    }
+}
+
+/// Replaces: e610_runOnOperation
+///
+/// The pass entry: unless a flag or `-O0`/`-O1` turns it off, insert the symbol copies of every
+/// program unit, each against the symbols declared ahead of it and its own fresh state (`:130-146`).
+///
+/// ⛔ TRAP: THE REFERENCE'S ONE WALK IS SPLIT IN TWO HERE, so a unit sees EVERY declared symbol and
+/// not only those preceding it. Its own comment claims the pre-order gives it all of them anyway
+/// (`:137-138`), and on this island the declarations live in [`Program::preamble`] — outside the units
+/// the walk `skip()`s — so there is no order left to observe.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload, L: Liveness, P: RegisterPressure>(
+    program: &mut Program<A, M, W>,
+    liveness: &mut L,
+    rp: &mut P,
+    values: &mut Values,
+    trace: &mut String,
+) {
+    if DISABLE_THIS_PASS || OPT_LEVEL_BELOW_TWO {
+        return;
+    }
+    let mut symbols = Vec::new();
+    create_symbols_in(&program.preamble, &mut symbols);
+    let mut state = PerUnitState::default();
+    for unit in program.units.iter_mut() {
+        run_on(
+            &mut unit.body,
+            &symbols,
+            &mut state,
+            liveness,
+            rp,
+            values,
+            trace,
+        );
+        clear(&mut state);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
     use crate::islands::sentient::dialects::dataflow;
     use crate::islands::sentient::dialects::sentient::Carried;
     use crate::transform::sentient::analyses::{OutOfScopeRegisterPressure, VirtualAssigns};
@@ -1055,6 +1108,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::Sfp,
                 num_folds: None,
+                reg_locale: None,
             })
         };
         let body = vec![
@@ -1372,6 +1426,77 @@ mod unit_tests {
         assert_eq!(liveness.0, vec![Val(1)]);
         // ⭐ NEITHER TRACE IS TAKEN, which is what keeps the e360 seam out of the way.
         assert_eq!(trace, String::new());
+    }
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// 610/656 — the entry takes the module's symbols from the preamble and runs the unit against
+    /// them, so the promotion e150 makes is observable before the walk reaches the unported e358.
+    #[test]
+    fn e610_collects_the_preamble_symbols_and_runs_every_unit() {
+        let sym = Val(0);
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: vec![Op::Symbol(symbol::Op::CreateSymbol {
+                result: sym,
+                symbol_id: 7,
+                max_value: None,
+            })],
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::L3lu, Val(30)),
+                    precision: None,
+                    body: vec![
+                        a_copy(sym, Val(1), RegType::Jcr),
+                        an_add(sym, Val(6), Val(7), RegType::Jcr, None),
+                    ],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut liveness = Recorder::default();
+        let mut rp = OutOfScopeRegisterPressure;
+        let mut values = Values::default();
+        let mut trace = String::new();
+
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_on_operation(
+                &mut program,
+                &mut liveness,
+                &mut rp,
+                &mut values,
+                &mut trace,
+            );
+        }));
+
+        assert!(reached.is_err(), "e358 is not ported, so the choice panics");
+        // ⭐ THE PROMOTION IS THE EFFECT THAT PROVES THE PREAMBLE'S SYMBOL REACHED THE UNIT.
+        assert_eq!(liveness.0, vec![Val(1)]);
     }
 
     /// e527 — a use is recorded under the locale of the op that reads it, and the ops a copy cannot

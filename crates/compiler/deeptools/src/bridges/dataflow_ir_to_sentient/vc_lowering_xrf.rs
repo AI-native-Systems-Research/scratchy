@@ -2369,6 +2369,7 @@ mod unit_tests {
                 },
                 unit: DfirUnit::Lx,
                 num_folds: None,
+                reg_locale: None,
             }),
             xrf_view(Val(45), Val(81)),
         ];

@@ -18,6 +18,7 @@ use crate::islands::sentient::dialects::sentient::{RegIndex, RegType};
 use crate::islands::sentient::dialects::{Op, Val};
 use crate::transform::sentient::canonicalize_xrf_pointers::XrfMinExpr;
 use crate::transform::sentient::local_region_splitting_for_value_commoning::MaxRegNum;
+use crate::transform::sentient::port_assignment::DataId;
 use crate::units::DfirUnit;
 
 /// AN `EvaluatedValue` THE EXPRESSION EVALUATOR OWNS — an identity, not a value.
@@ -848,6 +849,17 @@ pub trait ColoringGraph {
     /// constructor's own `clear()` ran on an empty object. Whoever gives this an interior must never
     /// write `*self = Self::default()`.
     fn clear(&mut self);
+
+    /// `GraphNode *getOrAddNode(int index)` (`Analyses/GraphColoring.hpp:64`) — the node for `index`,
+    /// created if the graph has none yet.
+    ///
+    /// ⭐ THE RETURNED `GraphNode *` IS DROPPED: every ported caller uses this for its side effect, so
+    /// the node's own interior stays inside the out-of-scope analysis.
+    fn get_or_add_node(&mut self, index: DataId);
+
+    /// `addBidirectionalEdge(int node1, int node2)` (`Analyses/GraphColoring.hpp:80`) — an interference
+    /// edge recorded on BOTH nodes.
+    fn add_bidirectional_edge(&mut self, node1: DataId, node2: DataId);
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
@@ -857,6 +869,16 @@ pub struct OutOfScopeColoringGraph;
 impl ColoringGraph for OutOfScopeColoringGraph {
     fn clear(&mut self) {
         todo!("GraphColoring::clear (Analyses/GraphColoring.hpp:52) — out of campaign scope")
+    }
+
+    fn get_or_add_node(&mut self, _index: DataId) {
+        todo!("GraphColoring::getOrAddNode (Analyses/GraphColoring.hpp:64) — out of campaign scope")
+    }
+
+    fn add_bidirectional_edge(&mut self, _node1: DataId, _node2: DataId) {
+        todo!(
+            "GraphColoring::addBidirectionalEdge (Analyses/GraphColoring.hpp:80) — out of campaign scope"
+        )
     }
 }
 

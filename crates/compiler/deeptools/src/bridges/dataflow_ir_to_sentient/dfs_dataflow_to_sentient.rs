@@ -562,6 +562,7 @@ mod unit_tests {
             residency: crate::units::residency_of(unit, core, corelet0()),
             unit,
             num_folds: None,
+            reg_locale: None,
         })
     }
 
@@ -942,6 +943,7 @@ mod unit_tests {
             residency: crate::units::residency_of(unit, core, corelet),
             unit,
             num_folds: None,
+            reg_locale: None,
         })
     }
 
@@ -1477,6 +1479,7 @@ mod unit_tests {
                 },
                 unit,
                 num_folds: None,
+                reg_locale: None,
             })
         };
         let scope = vec![
@@ -3675,12 +3678,14 @@ mod pass_unit_tests {
                 residency: crate::units::residency_of(DfirUnit::Lxsu, core, corelet),
                 unit: DfirUnit::Lxsu,
                 num_folds: None,
+                reg_locale: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
                 result: Val(1),
                 residency: crate::units::residency_of(DfirUnit::Lxlu, core, corelet),
                 unit: DfirUnit::Lxlu,
                 num_folds: None,
+                reg_locale: None,
             }),
         ];
         let body = vec![

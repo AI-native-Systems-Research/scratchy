@@ -2774,6 +2774,7 @@ mod unit_tests {
             residency: crate::units::Residency::Global,
             unit: crate::units::DfirUnit::Hbm,
             num_folds: None,
+            reg_locale: None,
         })
     }
 

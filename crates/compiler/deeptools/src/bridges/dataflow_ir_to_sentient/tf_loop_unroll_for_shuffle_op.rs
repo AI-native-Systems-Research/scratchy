@@ -2250,6 +2250,7 @@ scf.for %1 = %2 to %3 step %4 {
             },
             unit: DfirUnit::PtRow(Row::checked(0).expect("every PT has a row 0")),
             num_folds: None,
+            reg_locale: None,
         })
     }
 

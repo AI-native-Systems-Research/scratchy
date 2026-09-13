@@ -83,21 +83,32 @@
 //! | `e606_run` | 606 | 5 | 224 | `dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:811` |
 
 // ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
-// file's own tests until `e606_run` lands and something calls it.
-// ⭐ REMOVE THIS WITH `e606_run`: at that point an unused item here is a real defect again.
+// file's own tests until `e644_runOnOperation` lands and something calls `run`.
+// ⭐ REMOVE THIS WITH `e644_runOnOperation`: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::{carried_arg, erase_deleted_ops, move_ssa_to_init};
+use super::register_init_info::{RegisterInitInfo, component_of};
+use super::{
+    carried_arg, erase_deleted_ops, get_first_source, has_same_attr, move_ssa_to_init,
+    remove_init_attr_from_ops,
+};
+use crate::arch::Arch;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects as lower;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::sentient::dialects::{
-    self, Definitions, Op, Val, dataflow, sentient, symbol, uniform,
+    self, Definitions, LocalRegion, Op, UniformRegions, Val, dataflow, sentient, symbol, uniform,
 };
-use crate::transform::sentient::analyses::{Liveness, UniformGroups, VirtualAssigns};
+use crate::transform::sentient::analyses::{
+    Liveness, RegisterGraphs, UniformGroups, VirtualAssigns,
+};
+use crate::transform::sentient::local_region_splitting_for_value_commoning::{
+    PretendRegLimits, get_max_reg_num,
+};
 use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
+use crate::units::DfirUnit;
 
 /// WHERE THE OP BEHIND A CANDIDATE SITS — what `getParentOfType<uniform::UniformizeRegionsOp,
 /// uniform::EqualizePatternOp>` answers about it (`:1081-1083`).
@@ -541,19 +552,384 @@ fn copy_element_size_mut(val: Val, scope: &mut [Op]) -> Option<&mut Option<Bits>
     None
 }
 
-// crustify:todo: e606_run
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:811  (224 body lines, level 5)
-//   original  : void RegisterInitCandidatePromoter::run()
-//   calls     : e063_getMaxRegNum, e108_removeInitAttrFromOps, e109_eraseDeletedOps, e110_hasSameAttr, e111_isWithinGlobalRegion, e112_isSameOpType, e249_normalizeNullValues, e251_add, e252_size, e253_areAllValuesEqual, e332_moveSSAToInit, e422_insert, e452_postProcessing, e517_getSource …
+/// `-dcc-old-register-initialization-avoid-extra-colorability-when-promoting-above-uniform`,
+/// `cl::init(false)` (`:67-73`) — SHIPPED OFF, so the colourability round always runs.
+const AVOID_EXTRA_COLORABILITY_WHEN_PROMOTING_ABOVE_UNIFORM: bool = false;
+
+/// `dcc::uniform::utils::getRegionIndexForUnit(uniform_op, unit)` — which region of the op runs
+/// `unit`, and `None` where none does (the reference's `DT_CHECK`ed `std::optional`, `:1006`).
+fn region_index_for_unit(regions: &[LocalRegion], unit: Val) -> Option<usize> {
+    regions.iter().position(|region| region.units.contains(&unit))
+}
+
+/// The value each region of an enclosing `uniform.uniformize_regions` should read instead of the one
+/// promoted copy, for a region standing for exactly ONE unit (`:1017-1021`).
+///
+/// ⛔ THE FIRST MAPPED UNIT THE REGION HOLDS, because the reference's `index` loop breaks at the
+/// first `uvs` entry whose unit lands in the region the use sits in.
+fn per_unit_source(regions: &[LocalRegion], region_idx: usize, uvs: &UnitsAndTheirValues) -> Option<Val> {
+    if regions.get(region_idx).map_or(0, |region| region.units.len()) != 1 {
+        return None;
+    }
+    uvs.pairs
+        .iter()
+        .find(|(unit, _value)| region_index_for_unit(regions, *unit) == Some(region_idx))
+        .and_then(|(_unit, value)| *value)
+}
+
+/// One local clone of the promoted copy per region of every enclosing `uniform.uniformize_regions`
+/// that reads it, with that region's readers rewired onto it (`:986-1029`).
+///
+/// ⛔ INNERMOST FIRST — `getUniformationOpAndRegionIterArg` walks UP from the reader, so a nested
+/// `uniformize_regions` claims its own uses before the region holding it sees them.
+/// ⛔ `uniform.equalize_pattern` IS SKIPPED: `dyn_cast<UniformizeRegionsOp>` answers null for it and
+/// `getRegionIndexForUnit(nullptr, ..)` would not be reached with a use to rewire.
+/// ⚠️ THE CLONE GOES TO THE TOP OF THE REGION rather than immediately before its first reader —
+/// positioning a builder, and it dominates every reader either way.
+fn insert_local_copies(
+    body: &mut Vec<Op>,
+    copy_op: Val,
+    copy: &Op,
+    uvs: &UnitsAndTheirValues,
+    values: &mut Values,
+    all_replacement_pairs: &mut Vec<(Val, Val)>,
+) {
+    for op in body.iter_mut() {
+        if let Op::UniformRegions(UniformRegions::UniformizeRegions { regions, .. }) = op {
+            let all: Vec<LocalRegion> = regions.clone();
+            for (region_idx, region) in regions.iter_mut().enumerate() {
+                insert_local_copies(
+                    &mut region.body,
+                    copy_op,
+                    copy,
+                    uvs,
+                    values,
+                    all_replacement_pairs,
+                );
+                let uses = dialects::use_count(copy_op, &region.body);
+                if uses == 0 {
+                    continue;
+                }
+                let clones = dialects::clone_ops(
+                    core::slice::from_ref(copy),
+                    values,
+                    &mut ValueMapping::new(),
+                );
+                let Some(mut local_copy) = clones.into_iter().next() else {
+                    continue;
+                };
+                if let Some(source) = per_unit_source(&all, region_idx, uvs)
+                    && let Op::Sentient(sentient::Op::ScalarCopy { input, .. }) = &mut local_copy
+                {
+                    *input = source;
+                }
+                let Some(local) = dialects::results(&local_copy).first().copied() else {
+                    continue;
+                };
+                region.body.insert(0, local_copy);
+                dialects::replace_all_uses_with(&mut region.body, copy_op, local);
+                // One pair per rewired USE, which is what the reference's deferred list holds.
+                for _ in 0..uses {
+                    all_replacement_pairs.push((copy_op, local));
+                }
+            }
+            continue;
+        }
+        for region in dialects::regions_mut(op) {
+            insert_local_copies(region, copy_op, copy, uvs, values, all_replacement_pairs);
+        }
+    }
+}
+
+/// Replaces: e606_run
+///
+/// Promotes register-init candidates above the unit's local regions: one round per shared
+/// `sentient.scalar_copy`, taking one candidate from every core, hoisting a single copy fed either by
+/// the one common value or by a `uniform.query_map` over a fresh mapping, and either keeping it or
+/// splitting it back into per-region clones when the promoted copy no longer colours.
+///
+/// ⛔ TRAP: `getFirstSource` IS BEHIND `&&` AND IT MUTATES THE UNIT — it clones sources to the top of
+/// the body and files erasures, so evaluating it when the locale already failed to match would edit a
+/// program the reference leaves alone.
+/// ⛔ TRAP: A CANDIDATE REJECTED WHILE SEARCHING IS PUSHED BACK IN POP ORDER (`:903-905`), which
+/// REVERSES that run of the stack — and it also clears `can_maps_be_shared_by_all_local_units`, the
+/// only thing that could have skipped the colourability round.
+/// ⛔ TRAP: THE `cl::init(false)` MEANS THE SKIP NEVER FIRES, so every round consults the
+/// out-of-scope graph colouring — that `todo!` is the reference's own path, not unported work here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference reads eleven `RegisterInitCandidatePromoter` members (`:1207-1237`); a \
+              struct of them would be one owner for state four other units already take apart"
+)]
+pub fn run<A: Arch, L: Liveness + Clone, G: RegisterGraphs + Default, U: UniformGroups>(
+    unit: &mut Vec<Op>,
+    on: DfirUnit,
+    arg: Val,
+    units: &[Val],
+    base_fold_units: &[Val],
+    rtis: &mut BTreeMap<Val, RegisterInitInfo>,
+    liveness: &mut L,
+    uga: &U,
+    values: &mut Values,
+    to_be_erased: &mut BTreeSet<Val>,
+    all_reginit_candidates: &mut Vec<Val>,
+    all_replacement_pairs: &mut Vec<(Val, Val)>,
+) {
+    let mut can_maps_be_shared_by_all_local_units = true;
+    // `SenComponents comp = dcc::getUnitType(unit_)` (`:813`), read once at the colourability check.
+    let comp = component_of(on).unwrap_or_else(|| {
+        panic!(
+            "{on:?} is not an executor, so `regInfoPerUnit` states no register counts for it \
+             (DccExtContext.cpp:292)"
+        )
+    });
+    // "Iterates until no more candidates are available in any core."
+    loop {
+        let mut locales: Vec<sentient::RegType> = Vec::new();
+        let mut tobe_replaced: Vec<Val> = Vec::new();
+        let mut uvs = UnitsAndTheirValues::default();
+        let mut all_empty = true;
+        for core in base_fold_units {
+            let core = *core;
+            let Some(rti) = rtis.get_mut(&core) else {
+                todo!(
+                    "RegisterInitCandidatePromoter::run: DT_CHECK(rtis_.count({core:?})) \
+                     (OldRegisterInitialization.cpp:826)"
+                )
+            };
+            let Some(&candidate) = rti.final_reginit_candidates.last() else {
+                // Nothing to promote here: this core and everyone it speaks for map to null.
+                for result in folds_of(core) {
+                    uvs.add(result, None);
+                }
+                if uga.is_group_leader(core) {
+                    for follower in uga.group_members_led_by(core) {
+                        if follower != core {
+                            uvs.add(follower, None);
+                        }
+                    }
+                }
+                continue;
+            };
+            all_empty = false;
+            let mut val = candidate;
+            // A global candidate is promoted as it stands, and the next one is examined.
+            let mut no_candidate_from_uniform_reg = false;
+            while is_within_global_region(val, unit) {
+                all_reginit_candidates.push(val);
+                rti.final_reginit_candidates.pop();
+                match rti.final_reginit_candidates.last() {
+                    Some(top) => val = *top,
+                    None => {
+                        no_candidate_from_uniform_reg = true;
+                        break;
+                    }
+                }
+            }
+            if no_candidate_from_uniform_reg {
+                continue;
+            }
+            let locale = locale_of(val, unit);
+            if locales.is_empty() {
+                locales.push(locale);
+                get_source(unit, core, val, &mut uvs, to_be_erased, values, uga);
+                rti.final_reginit_candidates.pop();
+                tobe_replaced.push(val);
+                continue;
+            }
+            let matched = locales.contains(&locale)
+                && {
+                    let first = get_first_source(unit, core, val, to_be_erased, values, uga);
+                    let front = uvs.pairs.first().and_then(|(_unit, value)| *value);
+                    is_same_op_type(first, front, unit)
+                }
+                && has_same_attr(Some(val), tobe_replaced.last().copied(), unit);
+            if matched {
+                get_source(unit, core, val, &mut uvs, to_be_erased, values, uga);
+                rti.final_reginit_candidates.pop();
+                tobe_replaced.push(val);
+                continue;
+            }
+            // "This candidate did not match the locale or same-type/attr requirment, look for
+            // another candidate that matches and pop it."
+            let mut found_any = false;
+            let mut temp: Vec<Val> = Vec::new();
+            while let Some(&top) = rti.final_reginit_candidates.last() {
+                let takes_it = !is_within_global_region(top, unit)
+                    && locales.contains(&locale_of(top, unit))
+                    && {
+                        let first = get_first_source(unit, core, top, to_be_erased, values, uga);
+                        let front = uvs.pairs.first().and_then(|(_unit, value)| *value);
+                        is_same_op_type(first, front, unit)
+                    }
+                    && has_same_attr(Some(top), tobe_replaced.last().copied(), unit);
+                if takes_it {
+                    get_source(unit, core, top, &mut uvs, to_be_erased, values, uga);
+                    rti.final_reginit_candidates.pop();
+                    tobe_replaced.push(top);
+                    found_any = true;
+                    break;
+                }
+                can_maps_be_shared_by_all_local_units = false;
+                // "pop this candidate so the while loop can terminate, but save it so we can put it
+                // back right after the while loop."
+                temp.push(top);
+                rti.final_reginit_candidates.pop();
+            }
+            if !found_any {
+                for result in folds_of(core) {
+                    uvs.add(result, None);
+                }
+                if uga.is_group_leader(core) {
+                    for follower in uga.group_members_led_by(core) {
+                        if follower != core {
+                            uvs.add(follower, None);
+                        }
+                    }
+                }
+            }
+            for t in &temp {
+                rti.final_reginit_candidates.push(*t);
+            }
+        }
+
+        if units.len() != uvs.size() {
+            for core in units {
+                if !uvs.pairs.iter().any(|(unit_val, _value)| unit_val == core) {
+                    uvs.add(*core, None);
+                }
+            }
+        }
+        if all_empty {
+            break;
+        }
+        uvs.normalize_null_values();
+        if locales.len() != 1 {
+            continue;
+        }
+        // `DT_CHECK(uvs.size() == unit_.getUnits().size())` (`:922`) — the fill-in loop above.
+        let src_val = match uvs.are_all_values_equal() {
+            Some(true) => uvs.pairs.last().and_then(|(_unit, value)| *value),
+            Some(false) => {
+                let map = values.mint();
+                let pairs: Vec<(Val, Val)> = uvs
+                    .pairs
+                    .iter()
+                    .filter_map(|(unit_val, value)| value.map(|value| (*unit_val, value)))
+                    .collect();
+                let queried = values.mint();
+                // `OpBuilder builder(unit_.getRegion())` inserts at the START of the entry block,
+                // and each `create` advances it — so mapping, query and copy come out in that order.
+                unit.insert(0, Op::Uniform(uniform::Op::DefImmutableMapping { result: map, pairs }));
+                unit.insert(
+                    1,
+                    Op::Uniform(uniform::Op::QueryMap {
+                        result: queried,
+                        map,
+                        key: arg,
+                    }),
+                );
+                Some(queried)
+            }
+            None => todo!(
+                "RegisterInitCandidatePromoter::run: DT_CHECK(!values_.empty()) in \
+                 areAllValuesEqual (Utils.hpp:181)"
+            ),
+        };
+        let Some(src_val) = src_val else {
+            todo!(
+                "RegisterInitCandidatePromoter::run: DT_CHECK(src_val) — every unit mapped to null \
+                 (OldRegisterInitialization.cpp:939)"
+            )
+        };
+        // The builder's third `create`, so index 2 behind the mapping and the query. ⚠️ AND AFTER
+        // `src_val` WHEREVER IT SITS: the reference's cloned sources land OUTSIDE the program unit
+        // (`const_builder(unit_)`) while this island's `getSource` puts them at the top of the body,
+        // so index 0 would put the copy above its own operand.
+        let at = unit
+            .iter()
+            .position(|op| dialects::results(op).contains(&src_val))
+            .map_or(0, |position| position + 1);
+        let copy_op = values.mint();
+        // The seven-argument `CopyOp::create` (`:942-949`): `regIndex = -1`, `programHeader = false`,
+        // and `element_size` left to the `.td`'s default.
+        let copy = Op::Sentient(sentient::Op::ScalarCopy {
+            input: src_val,
+            result: copy_op,
+            reg: sentient::Reg {
+                locale: locales[0],
+                index: None,
+            },
+            element_size: None,
+            program_header: false,
+        });
+        unit.insert(at, copy.clone());
+
+        for val in &tobe_replaced {
+            replace(unit, *val, copy_op, to_be_erased, all_replacement_pairs);
+        }
+        tobe_replaced.clear();
+        // "delete ops before recomputing live range"
+        erase_deleted_ops(unit, to_be_erased);
+
+        move_ssa_to_init(unit, copy_op);
+        if AVOID_EXTRA_COLORABILITY_WHEN_PROMOTING_ABOVE_UNIFORM
+            && can_maps_be_shared_by_all_local_units
+        {
+            all_reginit_candidates.push(copy_op);
+            continue;
+        }
+        // "recompute liveness because new scalar copy was introduced"
+        liveness.clear(VirtualAssigns::Kept);
+        liveness.compute_register_live_range(unit);
+        let mut gc = G::default();
+        let mut liveness00 = liveness.clone();
+        liveness00.update_live_ranges_for_program_header_promotion(copy_op);
+        let locale = locale_of(copy_op, unit);
+        gc.build_graphs(&mut liveness00, unit, locale, None);
+        gc.create_same_color_edge_eq_classes(&mut liveness00, locale);
+        gc.build_hyper_graph(locale);
+        let max_reg_num = get_max_reg_num::<A>(locale, comp, PretendRegLimits::default());
+        if gc.fast_check_colorability(max_reg_num, locale) {
+            all_reginit_candidates.push(copy_op);
+            continue;
+        }
+        if let Some(position) = unit
+            .iter()
+            .position(|op| dialects::results(op).contains(&copy_op))
+        {
+            remove_init_attr_from_ops(&mut unit[position..=position]);
+        }
+        insert_local_copies(unit, copy_op, &copy, &uvs, values, all_replacement_pairs);
+        // `DT_CHECK(copy_op.getUses().empty())` (`:1030`) — every reader had an enclosing region.
+        if dialects::use_count(copy_op, unit) != 0 {
+            todo!(
+                "RegisterInitCandidatePromoter::run: DT_CHECK(copy_op.getUses().empty()) — a reader \
+                 of the promoted copy sits outside every local region \
+                 (OldRegisterInitialization.cpp:1030)"
+            )
+        }
+        to_be_erased.insert(copy_op);
+    }
+    post_processing(unit, to_be_erased, all_reginit_candidates, liveness);
+}
+
+/// `sentient::getValueRegLocale(val)` against the whole unit — the one-line lookup the round makes
+/// four times.
+fn locale_of(val: Val, unit: &[Op]) -> sentient::RegType {
+    let regions: [&[Op]; 1] = [unit];
+    dialects::value_reg_locale(val, Definitions::from_innermost(&regions))
+}
 
 #[cfg(test)]
 mod unit_tests {
     use std::collections::BTreeSet;
 
     use super::{
-        construct_values, get_source, is_same_op_type, is_within_global_region, post_processing,
-        replace,
+        BTreeMap, RegisterInitInfo, construct_values, get_source, is_same_op_type,
+        is_within_global_region, post_processing, replace, run,
     };
+    use crate::arch::Dd2;
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::dialects as lower;
@@ -561,7 +937,9 @@ mod unit_tests {
     use crate::islands::sentient::dialects::{
         Definitions, Op, Val, dataflow, sentient, symbol, uniform,
     };
-    use crate::transform::sentient::analyses::{Liveness, UniformGroups, VirtualAssigns};
+    use crate::transform::sentient::analyses::{
+        Liveness, OutOfScopeRegisterGraphs, UniformGroups, VirtualAssigns,
+    };
     use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
     use crate::units::{DfirUnit, Residency};
 
@@ -596,6 +974,7 @@ mod unit_tests {
             residency: Residency::Global,
             unit: DfirUnit::L3lu,
             num_folds: None,
+            reg_locale: None,
         }
     }
 
@@ -744,7 +1123,7 @@ mod unit_tests {
         assert!(!is_same_op_type(Some(Val(5)), Some(Val(5)), &scope));
     }
     /// The out-of-scope liveness, recording only what `e452` tells it.
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct Recording {
         cleared: Vec<VirtualAssigns>,
         recomputed: Vec<usize>,
@@ -927,5 +1306,61 @@ mod unit_tests {
         assert_eq!(unit[1], sized_copy(4, 3, Some(Bits(16))));
         assert_eq!(to_be_erased, BTreeSet::from([Val(2)]));
         assert_eq!(pairs, vec![(Val(12), Val(4)), (Val(2), Val(4))]);
+    }
+
+    /// e606 — a global candidate is promoted as it stands, the round that drained the stack finds
+    /// nothing to share and builds no copy, and `post_processing` marks it for the header.
+    #[test]
+    fn e606_promotes_a_global_candidate_and_builds_no_shared_copy() {
+        let mut unit = vec![scalar_constant(5), scalar_copy(6, 5)];
+        let before = unit.clone();
+        let mut rtis = BTreeMap::from([(
+            Val(1),
+            RegisterInitInfo {
+                final_reginit_candidates: vec![Val(6)],
+                ..RegisterInitInfo::default()
+            },
+        )]);
+        let mut liveness = Recording::default();
+        let uga = Groups {
+            leader: Val(1),
+            followers: Vec::new(),
+        };
+        let mut values = Values::default();
+        let mut to_be_erased = BTreeSet::new();
+        let mut all_reginit_candidates = Vec::new();
+        let mut all_replacement_pairs = Vec::new();
+
+        run::<Dd2, _, OutOfScopeRegisterGraphs, _>(
+            &mut unit,
+            DfirUnit::L3lu,
+            Val(0),
+            &[Val(1)],
+            &[Val(1)],
+            &mut rtis,
+            &mut liveness,
+            &uga,
+            &mut values,
+            &mut to_be_erased,
+            &mut all_reginit_candidates,
+            &mut all_replacement_pairs,
+        );
+
+        assert_eq!(all_reginit_candidates, vec![Val(6)]);
+        assert!(rtis[&Val(1)].final_reginit_candidates.is_empty());
+        // ⭐ NO MAPPING, NO QUERY, NO PROMOTED COPY: `locales` stayed empty, so the round `continue`d
+        // before the builder ran, and the next one broke on `all_empty`.
+        assert_eq!(unit.len(), before.len());
+        assert!(all_replacement_pairs.is_empty());
+        assert!(to_be_erased.is_empty());
+        assert_eq!(liveness.cleared, vec![VirtualAssigns::Kept]);
+        assert_eq!(liveness.promoted, vec![Val(6)]);
+        assert!(matches!(
+            unit[1],
+            Op::Sentient(sentient::Op::ScalarCopy {
+                program_header: true,
+                ..
+            })
+        ));
     }
 }

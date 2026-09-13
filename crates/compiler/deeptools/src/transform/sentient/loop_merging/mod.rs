@@ -749,6 +749,7 @@ mod unit_tests {
                 residency: Residency::Global,
                 unit: DfirUnit::L3lu,
                 num_folds: None,
+                reg_locale: None,
             }),
             Op::Sentient(sentient::Op::ScalarConstant {
                 value: 0,

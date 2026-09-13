@@ -271,6 +271,7 @@ mod unit_tests {
                 residency: crate::units::Residency::Global,
                 unit: crate::units::DfirUnit::Sfp,
                 num_folds: None,
+                reg_locale: None,
             })
         };
         vec![

@@ -1652,10 +1652,141 @@ pub(crate) fn do_split_or_unroll(
     }
 }
 
-// crustify:todo: e603_findBestLoopNodeToOptimize
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:479  (69 body lines, level 5)
-//   original  : std::pair<dcc::LoopNode *, std::pair<int, int>> LoopSplittingAndUnrollingPass::findBestLoopNodeToOptimize( InstructionEstimatorImpl &ie, dataflow::ProgramUnitOp &unit_op, bool disable_unrolling)
-//   calls     : e088_ifOpUsesIV, e089_hasIfOps, e566_getSavedCycleAndIbuffCost
+/// WHETHER THE ROUND MAY UNROLL AT ALL — `bool disable_unrolling` (`:482`), which the driver raises
+/// once unrolling has run out of budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unrolling {
+    /// `disable_unrolling == false`: both transformations are priced.
+    Allowed,
+    /// `disable_unrolling == true`: only splitting is priced.
+    Disabled,
+}
+
+/// WHAT THE DRIVER IS TOLD TO DO NEXT — the returned `{LoopNode *, pair<int,int>}`.
+///
+/// ⭐ `None` IS THE REFERENCE'S NULL NODE and means "nothing to do this round", whatever the tag beside
+/// it says: e629 tests the node first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BestLoopNode {
+    /// `opt_node_id_for_split` or `opt_node_id_for_unroll`, or neither.
+    pub(crate) node: Option<LoopNodeId>,
+    /// The `{0,0}`/`{-1,-1}` tag that names which transformation was chosen.
+    pub(crate) optimization: Optimization,
+}
+
+/// Replaces: e603_findBestLoopNodeToOptimize
+///
+/// Prices every candidate loop for splitting and for unrolling and answers the best of the two that
+/// fits the instruction buffer, in cycles saved per instruction spent (`:479-550`).
+///
+/// ⛔ TRAP: `cyc <= 0` WINS TOO (`:508`, `:521`). A non-positive ratio — which is what
+/// [`SavedCycleAndIbuffCost::NOT_WORTH_IT`]'s `1 / INT_MAX` and the `-2` sentinel of a bound-1 loop
+/// produce — OVERWRITES the best so far, so the last such candidate is chosen over a positive one.
+/// ⛔ TRAP: A DISABLED UNROLL IS PRICED AT `INT_MAX`, NOT SKIPPED: the reference leaves the
+/// initialisers in place (`:493-494`) and the `<= avail` test is what rejects them.
+/// ⛔ TRAP: THE THREE-WAY TAIL CAN ANSWER A NULL NODE WITH THE `Split` TAG — the `!split &&
+/// hasIfOps(unroll)` path falls through to a comparison whose left side is still `0`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference reaches five of these through `this` and the pass manager, and neither \
+              is a thing this crate has"
+)]
+pub(crate) fn find_best_loop_node_to_optimize<E: InstructionEstimator, T: ConditionalTree>(
+    pass: &LoopSplittingAndUnrolling,
+    forest: &LoopForest,
+    ie: &mut E,
+    tree: &mut T,
+    unit: &[Op],
+    on: DfirUnit,
+    unrolling: Unrolling,
+) -> BestLoopNode {
+    let mut best_split = 0.0f32;
+    let mut best_unroll = 0.0f32;
+    let mut node_for_split: Option<LoopNodeId> = None;
+    let mut node_for_unroll: Option<LoopNodeId> = None;
+
+    for &node in &pass.unrolling_or_splitting_candidates {
+        // ⭐ RE-ASKED PER CANDIDATE (`:492`), because the reference's own loop does.
+        let avail = ie.remaining_ibuff_space(unit);
+        let when_split = get_saved_cycle_and_ibuff_cost(
+            pass,
+            forest,
+            node,
+            ie,
+            tree,
+            unit,
+            on,
+            Optimization::Split,
+        );
+        let when_unroll = match unrolling {
+            Unrolling::Allowed => get_saved_cycle_and_ibuff_cost(
+                pass,
+                forest,
+                node,
+                ie,
+                tree,
+                unit,
+                on,
+                Optimization::Unroll,
+            ),
+            Unrolling::Disabled => SavedCycleAndIbuffCost {
+                saved_cycles: i32::MAX,
+                ibuff_cost: InstructionCount(i32::MAX),
+            },
+        };
+        if when_split.ibuff_cost <= avail {
+            let cyc_per_ibuff = when_split.saved_cycles as f32 / when_split.ibuff_cost.0 as f32;
+            if cyc_per_ibuff > best_split || cyc_per_ibuff <= 0.0 {
+                best_split = cyc_per_ibuff;
+                node_for_split = Some(node);
+            }
+        }
+        if when_unroll.ibuff_cost <= avail {
+            let cyc_per_ibuff = when_unroll.saved_cycles as f32 / when_unroll.ibuff_cost.0 as f32;
+            if cyc_per_ibuff > best_unroll || cyc_per_ibuff <= 0.0 {
+                best_unroll = cyc_per_ibuff;
+                node_for_unroll = Some(node);
+            }
+        }
+    }
+
+    let loop_of = |chosen: Option<LoopNodeId>| {
+        chosen.and_then(|node| forest.node(node).and_then(|node| node.op))
+    };
+    if node_for_split.is_none() && node_for_unroll.is_none() {
+        return BestLoopNode {
+            node: None,
+            optimization: Optimization::Unroll,
+        };
+    }
+    if node_for_split.is_none()
+        && !loop_of(node_for_unroll).is_some_and(|loop_ref| has_if_ops(loop_ref, unit))
+    {
+        return BestLoopNode {
+            node: node_for_unroll,
+            optimization: Optimization::Unroll,
+        };
+    }
+    if node_for_unroll.is_none()
+        && loop_of(node_for_split).is_some_and(|loop_ref| if_op_uses_iv(loop_ref, unit))
+    {
+        return BestLoopNode {
+            node: node_for_split,
+            optimization: Optimization::Split,
+        };
+    }
+    if best_split > best_unroll {
+        BestLoopNode {
+            node: node_for_split,
+            optimization: Optimization::Split,
+        }
+    } else {
+        BestLoopNode {
+            node: node_for_unroll,
+            optimization: Optimization::Unroll,
+        }
+    }
+}
 
 // crustify:todo: e629_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:1019  (61 body lines, level 6)
@@ -2558,5 +2689,82 @@ mod unit_tests {
         );
         assert_eq!(pass.loops_unroll_count, 1);
         assert_eq!(pass.can_not_unroll, BTreeSet::from([ForRef(Val(1))]));
+    }
+
+    /// e603 — the candidate that fits wins on cycles per instruction, EXCEPT that a non-positive ratio
+    /// overwrites a better one: a bound-1 loop's `-2` ibuff sentinel takes the choice off the bound-4
+    /// loop. ⛔ AND WITH UNROLLING DISABLED both prices are `INT_MAX`, so nothing fits and the answer
+    /// is the null node.
+    #[test]
+    fn e603_lets_a_non_positive_ratio_overwrite_the_best_fitting_candidate() {
+        let unit = vec![
+            constant(4, Val(0)),
+            constant(1, Val(1)),
+            for_loop(
+                Val(2),
+                Val(0),
+                Vec::new(),
+                vec![nop("four"), yields(Vec::new())],
+            ),
+            for_loop(
+                Val(3),
+                Val(1),
+                Vec::new(),
+                vec![nop("one"), yields(Vec::new())],
+            ),
+        ];
+        let forest = LoopForest::of(&unit);
+        let node_of = |loop_ref| {
+            forest
+                .reverse_bfs()
+                .into_iter()
+                .find(|id| forest.node(*id).and_then(|node| node.op) == Some(loop_ref))
+                .expect("a node of the forest")
+        };
+        let (four, one) = (node_of(ForRef(Val(2))), node_of(ForRef(Val(3))));
+        let pass = LoopSplittingAndUnrolling {
+            unrolling_or_splitting_candidates: vec![four, one],
+            ..LoopSplittingAndUnrolling::default()
+        };
+        let mut ie = StatedEstimator {
+            ibuff_space: 100,
+            ..StatedEstimator::default()
+        };
+        let mut tree = StatedTree::default();
+
+        // The bound-4 loop prices at `1 / 8`; the bound-1 loop at `1 / -2`, which is not positive.
+        assert_eq!(
+            find_best_loop_node_to_optimize(
+                &pass,
+                &forest,
+                &mut ie,
+                &mut tree,
+                &unit,
+                DfirUnit::Hbm,
+                Unrolling::Allowed,
+            ),
+            BestLoopNode {
+                node: Some(one),
+                optimization: Optimization::Unroll,
+            }
+        );
+        // ⭐ ONE IBUFF ASK PER CANDIDATE, which is where the reference puts it.
+        assert_eq!(ie.ibuff_asks, 2);
+
+        assert_eq!(
+            find_best_loop_node_to_optimize(
+                &pass,
+                &forest,
+                &mut ie,
+                &mut tree,
+                &unit,
+                DfirUnit::Hbm,
+                Unrolling::Disabled,
+            ),
+            BestLoopNode {
+                node: None,
+                optimization: Optimization::Unroll,
+            }
+        );
     }
 }

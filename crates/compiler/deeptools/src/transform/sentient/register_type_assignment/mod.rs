@@ -2325,10 +2325,71 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
     }
 }
 
-// crustify:todo: e609_runOn
-//   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:996  (55 body lines, level 5)
-//   original  : void RegisterTypeAssignmentPass::runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e352_updateProgramUnit, e523_processWorkList, e574_initializeWorkList
+/// Whether some `sentient.yield`, `sentient.scalar_copy` or `uniform.def_immutable_mapping` OF THIS
+/// UNIT reads `val` — the `llvm::none_of` over the value's uses (`:1035-1042`), asked of the unit
+/// body instead of of the value.
+fn yielded_copied_or_mapped_in(val: Val, block: &[Op]) -> bool {
+    block.iter().any(|op| {
+        (matches!(
+            op,
+            Op::Sentient(sentient::Op::Yield { .. } | sentient::Op::ScalarCopy { .. })
+                | Op::Uniform(uniform::Op::DefImmutableMapping { .. })
+        ) && dialects::operands(op).contains(&val))
+            || dialects::regions_ref(op)
+                .into_iter()
+                .any(|region| yielded_copied_or_mapped_in(val, region))
+    })
+}
+
+impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
+    /// Replaces: e609_runOn
+    ///
+    /// One program unit end to end: seed what the hardware already fixes, propagate to a fixed point,
+    /// write the locales back — and on an L3 half only, give every function-level `dataflow.get_unit`
+    /// this unit yields, copies or maps a `regLocale` of its own so the right assign instruction can
+    /// be built for it (`:996-1050`).
+    ///
+    /// ⛔ TRAP: THE DIRTY QUEUE IS RECORDED AND THEN DRAINED ANYWAY — `signalPassFailure` neither
+    /// clears `worklist_` nor returns, so the propagation below starts from whatever was left.
+    /// ⭐ `getUses().empty()` IS DROPPED AS A FAST PATH: no use at all makes the `none_of` below
+    /// vacuously true, so both spellings `continue` on exactly the same ops.
+    pub(crate) fn run_on<A: Arch>(
+        &mut self,
+        preamble: &mut [Op],
+        unit: &mut crate::islands::sentient::ProgramUnit<A>,
+        values: &mut Values,
+    ) {
+        // `current_unit_type_ = dcc::getUnitType(getUnits()[0].getDefiningOp<GetUnitOp>())`, which is
+        // what [`crate::islands::dataflow_ir::Units`] carries rather than re-derives.
+        let unit_type = unit.on.kind();
+        if let Some(left) = self.worklist.front().copied() {
+            self.failures.push(Refused {
+                at: left,
+                unit_type,
+                message: "Register type assignment internal worklist is not empty before processing \
+                          a unit",
+            });
+        }
+        self.initialize_work_list::<A>(unit_type, &mut unit.body, values);
+        self.process_work_list(&mut unit.body, values);
+        self.update_program_unit(&mut unit.body, unit_type);
+        if !matches!(unit_type, DfirUnit::L3lu | DfirUnit::L3su) {
+            return;
+        }
+        for op in preamble.iter_mut() {
+            let Op::Dataflow(dataflow::Op::GetUnit { result, .. }) = op else {
+                continue;
+            };
+            let handle = *result;
+            if self.locale(handle) == Locale::Unrecorded
+                || !yielded_copied_or_mapped_in(handle, &unit.body)
+            {
+                continue;
+            }
+            dialects::set_reg_locale_on(op, handle, self.locale(handle).reg_type());
+        }
+    }
+}
 
 // crustify:todo: e633_runOnOperation
 //   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:113  (17 body lines, level 6)
@@ -2340,6 +2401,8 @@ mod unit_tests {
     use super::*;
     use crate::arch::{Dd2, Elements};
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::Units;
+    use crate::islands::sentient::ProgramUnit;
     use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
     use crate::units::Residency;
 
@@ -2740,6 +2803,7 @@ mod unit_tests {
             residency: Residency::Global,
             unit,
             num_folds: None,
+            reg_locale: None,
         })
     }
 
@@ -2905,5 +2969,47 @@ mod unit_tests {
         assert_eq!(pass.locale(Val(0)), Locale::Recorded(RegType::Imm));
         assert_eq!(pass.locale(Val(1)), Locale::Recorded(RegType::Lccr));
         assert_eq!(pass.locale(Val(5)), Locale::Recorded(RegType::Imm));
+    }
+
+    /// The `regLocale` a preamble `dataflow.get_unit` carries after one L3 unit ran, or [`None`].
+    fn get_unit_locale(op: &Op) -> Option<RegType> {
+        match op {
+            Op::Dataflow(dataflow::Op::GetUnit { reg_locale, .. }) => *reg_locale,
+            _ => None,
+        }
+    }
+
+    /// 609/656 — the L3 tail writes the yielded handle's locale onto its `get_unit`, and skips both a
+    /// handle nothing in the unit yields and one the propagation assigned nothing.
+    #[test]
+    fn e609_writes_reg_locale_only_on_a_yielded_and_assigned_unit_handle() {
+        let mut pass = TypesAndCopies::new();
+        let mut values = Values::default();
+        let mut preamble = vec![
+            get_unit(Val(0), DfirUnit::L3lu),
+            get_unit(Val(1), DfirUnit::L3su),
+            get_unit(Val(2), DfirUnit::Lx),
+        ];
+        for (handle, locale) in [(Val(0), RegType::Lar), (Val(1), RegType::Lbr)] {
+            pass.per_module
+                .global_const_assignments
+                .insert(handle, locale);
+        }
+        let mut unit = ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::L3lu, Val(0)),
+            precision: None,
+            body: vec![Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(0), Val(2)],
+            })],
+            arch: core::marker::PhantomData,
+        };
+
+        pass.run_on::<Dd2>(&mut preamble, &mut unit, &mut values);
+
+        assert_eq!(get_unit_locale(&preamble[0]), Some(RegType::Lar));
+        // ⭐ ASSIGNED BUT NOT YIELDED HERE, and unrecorded though yielded — both are `continue`s.
+        assert_eq!(get_unit_locale(&preamble[1]), None);
+        assert_eq!(get_unit_locale(&preamble[2]), None);
+        assert!(pass.failures.is_empty());
     }
 }

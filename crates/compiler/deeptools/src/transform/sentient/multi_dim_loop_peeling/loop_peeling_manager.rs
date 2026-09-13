@@ -354,7 +354,8 @@ fn next_static_if(candidates: IfOpsToSimplify, block: &[Op]) -> Option<(RegionPa
 mod unit_tests {
     use super::{
         IfOpsToSimplify, IvLoopInfo, Peeling, PeelingCandidates, PredicatesOnIv, compute_peeling_info,
-        copy_one_iter, decrement_predicates_on_iv, perform_loop_peeling, simplify_conditionals,
+        copy_one_iter, decrement_predicates_on_iv, find_candidates, perform_loop_peeling,
+        simplify_conditionals,
     };
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -469,6 +470,65 @@ mod unit_tests {
             then_body,
             else_body,
         })
+    }
+
+    /// e604 — the walk is POST-ORDER, so the inner loop's opportunity is recorded before the outer
+    /// loop's, and a comparison naming neither end is not one at all.
+    #[test]
+    fn e604_records_the_inner_loops_opportunity_first() {
+        let block = vec![
+            constant(8, Val(1)),
+            constant(1, Val(2)),
+            for_loop(
+                Val(3),
+                Val(1),
+                Vec::new(),
+                vec![
+                    for_loop(
+                        Val(4),
+                        Val(1),
+                        Vec::new(),
+                        vec![if_op(
+                            sentient::CmpPredicate::Sge,
+                            Val(4),
+                            Val(1),
+                            Vec::new(),
+                            Vec::new(),
+                        )],
+                    ),
+                    if_op(
+                        sentient::CmpPredicate::Sgt,
+                        Val(3),
+                        Val(2),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    // `%iv >= 1` is neither end of a loop counting 8 down to 1.
+                    if_op(
+                        sentient::CmpPredicate::Sge,
+                        Val(3),
+                        Val(2),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                ],
+            ),
+        ];
+        let mut ivs = IvLoopInfo::default();
+        let candidates = find_candidates(ForRef(Val(3)), &block, &mut ivs);
+        assert_eq!(
+            candidates.records(),
+            [
+                (ForRef(Val(4)), Peeling::FirstIterOnly),
+                (ForRef(Val(3)), Peeling::LastIterOnly),
+            ]
+        );
+        // A loop this unit does not hold is the reference's null `for_op`, and holds nothing to walk.
+        assert!(
+            find_candidates(ForRef(Val(99)), &block, &mut ivs)
+                .records()
+                .is_empty()
+        );
     }
 
     /// `%r = sentient.scalar_add %lhs, %rhs : index`.
@@ -1107,10 +1167,47 @@ fn constant(value: Val, defs: Definitions<'_>) -> Option<i64> {
     }
 }
 
-// crustify:todo: e604_findCandidates
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:402  (30 body lines, level 5)
-//   original  : bool LoopPeelingManager::findCandidates(sentient::ForOp for_op)
-//   calls     : e093_stringifyPeelingType, e094_insertOrUpdatePeelingType, e568_computePeelingInfo
+/// Every `sentient.if` under `block`, INNERMOST FIRST — `walk<WalkOrder::PostOrder>`.
+///
+/// ⛔ NOT [`if_paths`], WHICH IS PRE-ORDER: it pushes the op before descending, because its own reader
+/// takes the greatest path first and gets post-order out of the [`RegionPath`] ordering instead.
+fn if_ops_post_order<'a>(block: &'a [Op], out: &mut Vec<&'a Op>) {
+    for op in block {
+        for region in dialects::regions_ref(op) {
+            if_ops_post_order(region, out);
+        }
+        if matches!(op, Op::Sentient(sentient::Op::If { .. })) {
+            out.push(op);
+        }
+    }
+}
+
+/// Replaces: e604_findCandidates
+///
+/// Every peelable loop under `for_op`, found by asking each `sentient.if` inside it — innermost first
+/// — which loop and which end its comparison names (`:402-431`).
+///
+/// ⛔ TRAP: THE `DT_CHECK_MSG(loop_to_peeling_type_.empty())` (`:405`) IS THE RETURN TYPE HERE. The
+/// reference accumulates into a member the caller must have drained; this answers a fresh set, so the
+/// caller's `!empty()` is `records().is_empty()` and there is no state to have failed to clear.
+pub fn find_candidates(for_op: ForRef, unit: &[Op], ivs: &mut IvLoopInfo) -> PeelingCandidates {
+    let mut candidates = PeelingCandidates::default();
+    let Some(Op::Sentient(sentient::Op::For { body, .. })) = super::for_op_at(unit, for_op) else {
+        return candidates;
+    };
+    // `getDefiningOp()` is global, so the constants a nested comparison reads are resolved against
+    // the whole unit and not against the loop body the walk is scoped to.
+    let regions: [&[Op]; 1] = [unit];
+    let defs = Definitions::from_innermost(&regions);
+    let mut if_ops = Vec::new();
+    if_ops_post_order(body, &mut if_ops);
+    for if_op in if_ops {
+        if let Some((inner_for_op, peeling)) = compute_peeling_info(if_op, ivs, defs) {
+            candidates.insert_or_update(inner_for_op, peeling);
+        }
+    }
+    candidates
+}
 
 // crustify:todo: e630_run
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:607  (130 body lines, level 6)

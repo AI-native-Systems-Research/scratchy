@@ -182,6 +182,7 @@ pub fn enumerate_collection_unit(
             residency: member.residency,
             unit: member.unit,
             num_folds: None,
+            reg_locale: None,
         }));
 
         // `ConstantIntOp::create(builder, loc, i, intType)` — `intType` is `IntegerType::get(ctx, 32)`

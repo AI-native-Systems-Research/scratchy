@@ -83,23 +83,22 @@
 //! | `e571_runOpRerolling` | 571 | 4 | 29 | `dcc/src/Transform/Sentient/OpRerolling.cpp:1008` |
 //! | `e607_runOnOperation` | 607 | 5 | 13 | `dcc/src/Transform/Sentient/OpRerolling.cpp:994` |
 
-// ⛔ NOTHING IN THE CRATE CALLS THIS FILE UNTIL `e607_runOnOperation` (level 5) LANDS, and CI runs
-// clippy with `-D warnings`. ⭐ REMOVE THIS WITH e607.
-#![allow(dead_code)]
-
 pub(crate) mod unroll_operands;
 
 use crate::arch::{Arch, IsaGen};
 use crate::islands::dataflow_ir::dialects::dataflow;
 use crate::islands::dataflow_ir::ty::GenericComp;
-use crate::islands::sentient::ProgramUnit;
+use crate::islands::sentient::{Program, ProgramUnit};
 use crate::islands::sentient::dialects::{
     Op, Val, operands, regions_mut, regions_ref, replace_all_uses_with, results, sentient,
     use_count,
 };
+use crate::model::Model;
+use crate::transform::sentient::analyses::InstructionEstimator;
 use crate::transform::sentient::op_rerolling::unroll_operands::{UnrollOperands, XrfIncr};
 use crate::transform::sentient::utils::{InBlock, OpAt, fold_mode_attribute_if_exists};
 use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 /// HOW MANY OPS ONE REROLLED STATEMENT STANDS FOR — `UnrollOperands::unroll_size_`, whose declaration
 /// initialises it to ONE and not zero, so an unrerolled statement already stands for itself
@@ -689,17 +688,46 @@ fn reroll_blocks(ty: DfirUnit, block: &mut Vec<Op>) {
     process_one_block(ty, block);
 }
 
-// crustify:todo: e607_runOnOperation
-//   authority : dcc/src/Transform/Sentient/OpRerolling.cpp:994  (13 body lines, level 5)
-//   original  : void OpRerollingPass::runOnOperation()
-//   calls     : e571_runOpRerolling
+/// `-dcc-op-rerolling-disable`, `cl::init(false)` (`:54-56`) — a `dcc-opt` command-line flag, not a
+/// program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `opts_.OptLevel == 0` (`:1000`) — the pipeline's optimization level, which this crate compiles at
+/// its default and not at `-O0`.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// Replaces: e607_runOnOperation
+///
+/// The pass entry: rerolls every program unit of the module, innermost first, unless the flag turns
+/// the pass off or `-O0` finds the unit already fits its instruction buffer (`:994-1006`).
+///
+/// ⛔ TRAP: THE `-O0` GATE IS A CONJUNCTION AND THE `const` IS ITS LEFT HALF, so `&&` short-circuits
+/// and the out-of-scope estimator is never asked — an unconditional `have_ibuff_space` here would
+/// `todo!` on every unit of a pipeline the reference runs clean.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload, E: InstructionEstimator>(
+    program: &mut Program<A, M, W>,
+    ie: &mut E,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for unit in program.units.iter_mut() {
+        if OPT_LEVEL_ZERO && ie.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        run_op_rerolling(unit, &RerollScope::WholeUnit, MergeXrfIntoMac::Yes);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
-    use crate::islands::dataflow_ir::Units;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
     use crate::islands::sentient::dialects::sentient::{LrfIndex, Port, Precision, SplatPad};
+    use crate::transform::sentient::analyses::OutOfScopeInstructionEstimator;
     use crate::units::Row;
 
     /// AN UNREROLLED STATEMENT ALREADY STANDS FOR ONE OP, and each merge adds its own count.
@@ -795,6 +823,7 @@ mod unit_tests {
             residency: crate::units::Residency::Global,
             unit: DfirUnit::Pe,
             num_folds: None,
+            reg_locale: None,
         })
     }
 
@@ -856,5 +885,51 @@ mod unit_tests {
             arch: core::marker::PhantomData,
         };
         run_op_rerolling(&mut unit, &RerollScope::WholeUnit, MergeXrfIntoMac::Yes);
+    }
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// 607/656 — the entry walks the module's program units, so its PT unit reaches the same merge
+    /// tail e571 stops at, the unported e334. ⭐ The `-O0` gate short-circuits on the `const`, so the
+    /// out-of-scope estimator is handed over and never asked.
+    #[test]
+    #[should_panic(expected = "senpass e334")]
+    fn e607_rerolls_every_program_unit_of_the_module() {
+        let unit: ProgramUnit<Dd2> = ProgramUnit {
+            on: Units::one(DfirUnit::PtRow(Row::checked(0).expect("row 0")), Val(0)),
+            precision: None,
+            body: vec![get_unit(0), logical_port(1, Port::Lrf(LrfIndex::L0))],
+            arch: core::marker::PhantomData,
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit, Vec::new()),
+            bound: core::marker::PhantomData,
+        };
+        run_on_operation(&mut program, &mut OutOfScopeInstructionEstimator);
     }
 }

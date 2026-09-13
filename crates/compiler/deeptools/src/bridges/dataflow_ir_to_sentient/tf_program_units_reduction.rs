@@ -640,6 +640,7 @@ mod unit_tests {
             residency,
             unit,
             num_folds: None,
+            reg_locale: None,
         })
     }
 

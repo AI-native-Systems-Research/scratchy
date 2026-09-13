@@ -211,12 +211,14 @@ mod unit_tests {
                 },
                 unit: DfirUnit::Lxlu,
                 num_folds: Some(NumFolds(2)),
+                reg_locale: None,
             }),
             Op::Dataflow(dataflow::Op::GetUnit {
                 result: Val(9),
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,
                 num_folds: None,
+                reg_locale: None,
             }),
         ];
         let regions: [&[Op]; 1] = [&ops];
