@@ -174,7 +174,7 @@ use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, UniformRegions, Val, dataflow, sentient, uniform,
 };
-use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator, MinMax};
 use crate::transform::sentient::{ForRef, IterArgIndex};
 use crate::units::DfirUnit;
 
@@ -1086,45 +1086,142 @@ impl DataTransferDescriptor {
 //   original  : const EvaluatedValue &getMax() override
 //   calls     : e278_isValid
 
-// crustify:todo: e407_getInit
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:388  (4 body lines, level 2)
-//   original  : const EvaluatedValue &getInit()
-//   calls     : e278_isValid
+impl IntegerSequenceDescriptor {
+    /// Replaces: e407_getInit
+    ///
+    /// The sequence's FIRST TERM — `*init_` under `DT_CHECK(isValid())` (`:388-391`).
+    ///
+    /// ⛔ `None` IS THAT `DT_CHECK`, not "no first term": every reference caller asks only inside
+    /// `if (isq_desc->isValid())` (`:2381`), and an unmatched or [`Self::invalidate`]d sequence has
+    /// nothing to give.
+    #[must_use]
+    pub fn init(&self) -> Option<EvaluatedValue> {
+        if self.is_valid() { self.init } else { None }
+    }
 
-// crustify:todo: e408_getAllConstants
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:393  (16 body lines, level 2)
-//   original  : void getAllConstants(BaseAddrListTy &output) const
-//   calls     : e278_isValid
+    /// Replaces: e408_getAllConstants
+    ///
+    /// APPENDS every address the sequence visits — `init_` alone for a zero stride, else
+    /// `init_ + stride_ * i` for `i` in `0..size_` (`:393-408`) — keeping what `output` already holds.
+    ///
+    /// ⛔ ITS `isValid()` IS A DISCARDED STATEMENT (`:394`), NOT A `DT_CHECK`: nothing stops an
+    /// invalid descriptor, so the reference reaches a null `stride_`. Absent fields append NOTHING.
+    /// ⛔ `*stride_ == zero_ev` IS THE ANALYSIS'S CONTENT COMPARISON
+    /// (`ExpressionEvaluatorUtils.h:63`), not handle identity.
+    pub fn get_all_constants(
+        &self,
+        output: &mut BaseAddrList,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) {
+        let (Some(init), Some(stride), SequenceSize::Terms(size)) =
+            (self.init, self.stride, self.size)
+        else {
+            return;
+        };
 
-// crustify:todo: e409_getMin
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:470  (5 body lines, level 2)
-//   original  : const EvaluatedValue &getMin() override
-//   calls     : e278_isValid
+        // `if (*stride_ == zero_ev) { output.push_back(init_); return; }` (`:396-400`).
+        let zero = evaluator.constant(0);
+        if evaluator.values_equal(stride, zero) {
+            output.push(init);
+            return;
+        }
 
-// crustify:todo: e410_getMax
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:476  (5 body lines, level 2)
-//   original  : const EvaluatedValue &getMax() override
-//   calls     : e278_isValid
+        for i in 0..size {
+            let step = evaluator.evaluate_multiply_by_const(stride, i64::from(i));
+            let term = evaluator.evaluate_sum_handle(init, step);
+            output.push(term);
+        }
+    }
+}
 
-// crustify:todo: e411_getInit
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:482  (4 body lines, level 2)
-//   original  : const EvaluatedValue &getInit()
-//   calls     : e278_isValid
+impl DiscreteIntegerSetDescriptor {
+    /// Replaces: e409_getMin
+    ///
+    /// The set's lowest address — `init_ + total_negative_delta_` (`:470-474`).
+    ///
+    /// ⛔ `None` IS THE `DT_CHECK(isValid())` AND AN ABSENT FIELD BOTH: `isValid()` (`:468`) reads
+    /// NEITHER `init_` nor either delta, so a valid descriptor can still be missing them.
+    #[must_use]
+    pub fn min(&self, evaluator: &mut impl ExpressionEvaluator) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        Some(evaluator.evaluate_sum_handle(self.init?, self.total_negative_delta?))
+    }
 
-// crustify:todo: e412_getMin
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:566  (7 body lines, level 2)
-//   original  : const EvaluatedValue &getMin() override
-//   calls     : e278_isValid
+    /// Replaces: e410_getMax
+    ///
+    /// The set's highest address — `init_ + total_positive_delta_` (`:476-480`).
+    ///
+    /// ⛔ THE TWO DELTAS ARE NOT INTERCHANGEABLE: this one is the positive total, and `isValid()`
+    /// guarantees neither, so `None` covers both the `DT_CHECK` and an absent field.
+    #[must_use]
+    pub fn max(&self, evaluator: &mut impl ExpressionEvaluator) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        Some(evaluator.evaluate_sum_handle(self.init?, self.total_positive_delta?))
+    }
 
-// crustify:todo: e413_getMax
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:574  (7 body lines, level 2)
-//   original  : const EvaluatedValue &getMax() override
-//   calls     : e278_isValid
+    /// Replaces: e411_getInit
+    ///
+    /// The set's INITIAL address — `*init_` under `DT_CHECK(isValid())` (`:482-485`), which
+    /// `initializeDescriptor` pushes as the transfer's one base address (`:2398`).
+    ///
+    /// ⛔ `None` IS THAT `DT_CHECK` PLUS THE ABSENT FIELD, which `isValid()` (`:468`) does not read.
+    #[must_use]
+    pub fn init(&self) -> Option<EvaluatedValue> {
+        if self.is_valid() { self.init } else { None }
+    }
+}
 
-// crustify:todo: e414_getInit
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:582  (4 body lines, level 2)
-//   original  : const EvaluatedValue &getInit() const
-//   calls     : e278_isValid
+impl LoopingChainMutableAddrDescriptor {
+    /// Replaces: e412_getMin
+    ///
+    /// The lower of the chain's first and last address — `min(init_, init_ + increment_)`
+    /// (`:566-572`), the pair in that order.
+    ///
+    /// ⛔ IT IS NOT `init_`: the chain's total increment may be negative, which is exactly why the
+    /// reference asks `evaluateMinMax` rather than returning the first address.
+    #[must_use]
+    pub fn min(&self, evaluator: &mut impl ExpressionEvaluator) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let init = self.init?;
+        let last_val = evaluator.evaluate_sum_handle(init, self.increment?);
+        Some(evaluator.evaluate_min_max(&[init, last_val], MinMax::Min))
+    }
+
+    /// Replaces: e413_getMax
+    ///
+    /// The higher of the chain's first and last address — `max(init_, init_ + increment_)`
+    /// (`:574-580`), the pair in that order.
+    ///
+    /// ⛔ `None` IS THE `DT_CHECK(isValid())` (`:562`) TOGETHER WITH AN ABSENT `init_` or
+    /// `increment_`, neither of which `isValid()` reads.
+    #[must_use]
+    pub fn max(&self, evaluator: &mut impl ExpressionEvaluator) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let init = self.init?;
+        let last_val = evaluator.evaluate_sum_handle(init, self.increment?);
+        Some(evaluator.evaluate_min_max(&[init, last_val], MinMax::Max))
+    }
+
+    /// Replaces: e414_getInit
+    ///
+    /// The chain's INITIAL mutable address — `*init_` under `DT_CHECK(isValid())` (`:582-585`), which
+    /// `initializeDescriptor` pushes as the transfer's one base address (`:2414`).
+    ///
+    /// ⛔ `None` IS THAT `DT_CHECK`, AND [`Self::invalidate`] REACHES IT WITHOUT CLEARING `init_` —
+    /// the head flag and the outer loop are what it drops (`:589-592`).
+    #[must_use]
+    pub fn init(&self) -> Option<EvaluatedValue> {
+        if self.is_valid() { self.init } else { None }
+    }
+}
 
 // crustify:todo: e415_isSimpleConstant
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:673  (4 body lines, level 2)
@@ -1278,7 +1375,7 @@ mod unit_tests {
     use crate::formats::Bits;
     use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{LocalRegion, Val, sentient};
-    use crate::transform::sentient::analyses::RegionSite;
+    use crate::transform::sentient::analyses::{Evaluation, OffsetSites, RegionSite};
     use crate::transform::sentient::{ForRef, IterArgIndex};
     use crate::units::Residency;
 
@@ -1920,5 +2017,277 @@ mod unit_tests {
             region_op.regions()[0].body,
             vec![load_and_store(1, 3, 4, 6)]
         );
+    }
+    /// THE HANDLE FLAVOUR OF THE OUT-OF-SCOPE EVALUATOR WITH ITS ANSWERS STATED AS INTEGERS — a
+    /// returned handle names a value these tests can read back.
+    ///
+    /// ⛔ IT DOES NOT DEDUPE BY VALUE, deliberately: the reference keys its arena on the SOURCE, so
+    /// `evaluateValue(%c0)` and `getConstant(0)` are two entries holding the same 0 — and a double
+    /// that folded them together would let handle identity pass e408's zero-stride test.
+    #[derive(Default)]
+    struct StatedEvaluator {
+        held: Vec<i64>,
+    }
+
+    impl StatedEvaluator {
+        fn hold(&mut self, value: i64) -> EvaluatedValue {
+            self.held.push(value);
+            EvaluatedValue(u32::try_from(self.held.len() - 1).unwrap_or_default())
+        }
+
+        fn value(&self, ev: EvaluatedValue) -> i64 {
+            self.held
+                .get(usize::try_from(ev.0).unwrap_or_default())
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn values(&self, evs: &[EvaluatedValue]) -> Vec<i64> {
+            evs.iter().map(|ev| self.value(*ev)).collect()
+        }
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("e407-e414 ask for handles, never for a decoded evaluation")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("e407-e414 ask for handles, never for a decoded evaluation")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e407-e414 build no value")
+        }
+
+        fn constant(&mut self, value: i64) -> EvaluatedValue {
+            self.hold(value)
+        }
+
+        /// ⛔ CONTENTS, NOT HANDLES — `EvaluatedValue::operator==`, which is what e408 tests its
+        /// stride with, so a separately interned zero must compare EQUAL to a zero stride.
+        fn values_equal(&mut self, lhs: EvaluatedValue, rhs: EvaluatedValue) -> bool {
+            self.value(lhs) == self.value(rhs)
+        }
+
+        fn evaluate_sum_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            let sum = self.value(lhs) + self.value(rhs);
+            self.hold(sum)
+        }
+
+        fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+            let product = self.value(ev) * by;
+            self.hold(product)
+        }
+
+        fn evaluate_min_max(&mut self, values: &[EvaluatedValue], which: MinMax) -> EvaluatedValue {
+            let held: Vec<i64> = values.iter().map(|ev| self.value(*ev)).collect();
+            let picked = match which {
+                MinMax::Min => held.iter().min().copied(),
+                MinMax::Max => held.iter().max().copied(),
+            };
+            self.hold(picked.unwrap_or_default())
+        }
+    }
+
+    /// A MATCHED integer sequence: an outer loop, an index, and both value fields present.
+    fn integer_sequence(
+        size: SequenceSize,
+        init: EvaluatedValue,
+        stride: EvaluatedValue,
+    ) -> IntegerSequenceDescriptor {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        IntegerSequenceDescriptor {
+            outer_loop,
+            iter_arg_index,
+            init: Some(init),
+            stride: Some(stride),
+            size,
+            can_be_simplified: false,
+        }
+    }
+
+    /// A MATCHED discrete integer set, whose `isValid()` reads only the loop and the index.
+    fn discrete_set(
+        init: EvaluatedValue,
+        total_positive_delta: EvaluatedValue,
+        total_negative_delta: EvaluatedValue,
+    ) -> DiscreteIntegerSetDescriptor {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        DiscreteIntegerSetDescriptor {
+            outer_loop,
+            iter_arg_index,
+            init: Some(init),
+            total_positive_delta: Some(total_positive_delta),
+            total_negative_delta: Some(total_negative_delta),
+            can_be_simplified: false,
+        }
+    }
+
+    /// A MATCHED looping chain of two transfers.
+    fn looping_chain(
+        init: EvaluatedValue,
+        increment: EvaluatedValue,
+    ) -> LoopingChainMutableAddrDescriptor {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        LoopingChainMutableAddrDescriptor {
+            is_head_of_chain: true,
+            outer_loop,
+            iter_arg_index,
+            size: ChainSize(2),
+            init: Some(init),
+            increment: Some(increment),
+            can_be_simplified: false,
+        }
+    }
+
+    /// ⛔ [`SequenceSize::Symbolic`] IS THE REFERENCE'S `size_ == -1`, which fails `size_ > 0` and so
+    /// takes the first term away again even though `init_` is still there.
+    #[test]
+    fn e407_gives_the_first_term_only_while_the_sequence_is_valid() {
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(100);
+        let stride = evaluator.constant(3);
+        let desc = integer_sequence(SequenceSize::Terms(5), init, stride);
+        assert_eq!(desc.init(), Some(init));
+        assert_eq!(
+            IntegerSequenceDescriptor {
+                size: SequenceSize::Symbolic,
+                ..desc
+            }
+            .init(),
+            None
+        );
+    }
+
+    /// The reference's own sequence (`:345-352`), and its zero-stride special case: `100 + 3 * i` for
+    /// four terms APPENDED after what the caller already held, then one lone `init_` when the stride
+    /// evaluates to zero — ⛔ a SEPARATELY interned zero, which only a content comparison matches.
+    #[test]
+    fn e408_appends_every_term_and_collapses_a_zero_stride_to_one() {
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(100);
+        let stride = evaluator.constant(3);
+        let seed = evaluator.constant(-7);
+        let desc = integer_sequence(SequenceSize::Terms(4), init, stride);
+
+        let mut output: BaseAddrList = vec![seed];
+        desc.get_all_constants(&mut output, &mut evaluator);
+        assert_eq!(evaluator.values(&output), vec![-7, 100, 103, 106, 109]);
+
+        let flat = IntegerSequenceDescriptor {
+            stride: Some(evaluator.constant(0)),
+            ..desc
+        };
+        let mut output = BaseAddrList::new();
+        flat.get_all_constants(&mut output, &mut evaluator);
+        assert_eq!(output, vec![init]);
+    }
+
+    /// `100 + (-9)`, and ⛔ the negative total is NOT the positive one.
+    #[test]
+    fn e409_adds_the_negative_delta_to_the_initial_value() {
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(100);
+        let up = evaluator.constant(24);
+        let down = evaluator.constant(-9);
+        let desc = discrete_set(init, up, down);
+        let min = desc.min(&mut evaluator);
+        assert_eq!(min.map(|ev| evaluator.value(ev)), Some(91));
+        let cleared = DiscreteIntegerSetDescriptor {
+            init: None,
+            ..desc
+        };
+        assert_eq!(cleared.min(&mut evaluator), None);
+    }
+
+    /// `100 + 24`, the POSITIVE total — and `None` once the loop `isValid()` reads is gone.
+    #[test]
+    fn e410_adds_the_positive_delta_to_the_initial_value() {
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(100);
+        let up = evaluator.constant(24);
+        let down = evaluator.constant(-9);
+        let desc = discrete_set(init, up, down);
+        let max = desc.max(&mut evaluator);
+        assert_eq!(max.map(|ev| evaluator.value(ev)), Some(124));
+        let unmatched = DiscreteIntegerSetDescriptor {
+            outer_loop: None,
+            ..desc
+        };
+        assert_eq!(unmatched.max(&mut evaluator), None);
+    }
+
+    /// ⛔ `isValid()` DOES NOT READ `init_` HERE (`:468`), so an absent one is its own `None`.
+    #[test]
+    fn e411_gives_the_initial_value_of_a_matched_set_only() {
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(100);
+        let zero = evaluator.constant(0);
+        let desc = discrete_set(init, zero, zero);
+        assert_eq!(desc.init(), Some(init));
+        assert_eq!(
+            DiscreteIntegerSetDescriptor {
+                iter_arg_index: None,
+                ..desc
+            }
+            .init(),
+            None
+        );
+    }
+
+    /// A chain that WALKS BACKWARDS: `increment_ = -12`, so the minimum is the LAST address, not
+    /// `init_`.
+    #[test]
+    fn e412_takes_the_lower_of_the_first_and_last_address() {
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(100);
+        let increment = evaluator.constant(-12);
+        let desc = looping_chain(init, increment);
+        let min = desc.min(&mut evaluator);
+        assert_eq!(min.map(|ev| evaluator.value(ev)), Some(88));
+        let short = LoopingChainMutableAddrDescriptor {
+            size: ChainSize(0),
+            ..desc
+        };
+        assert_eq!(short.min(&mut evaluator), None);
+    }
+
+    /// A forward chain: `increment_ = 12`, so the maximum is the last address and the minimum would
+    /// have been `init_`.
+    #[test]
+    fn e413_takes_the_higher_of_the_first_and_last_address() {
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(100);
+        let increment = evaluator.constant(12);
+        let desc = looping_chain(init, increment);
+        let max = desc.max(&mut evaluator);
+        assert_eq!(max.map(|ev| evaluator.value(ev)), Some(112));
+        let min = desc.min(&mut evaluator);
+        assert_eq!(min.map(|ev| evaluator.value(ev)), Some(100));
+    }
+
+    /// ⛔ [`LoopingChainMutableAddrDescriptor::invalidate`] LEAVES `init_` ALONE, so the `None` here
+    /// comes from the head flag and the loop it DOES clear.
+    #[test]
+    fn e414_gives_the_chain_initial_address_until_it_is_invalidated() {
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(100);
+        let increment = evaluator.constant(12);
+        let mut desc = looping_chain(init, increment);
+        assert_eq!(desc.init(), Some(init));
+        desc.invalidate();
+        assert_eq!(desc.init, Some(init));
+        assert_eq!(desc.init(), None);
     }
 }
