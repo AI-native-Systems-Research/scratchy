@@ -600,10 +600,68 @@ fn holds_uniform_map(ops: &[Op]) -> bool {
     })
 }
 
-// crustify:todo: e561_run
-//   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:252  (19 body lines, level 4)
-//   original  : void LocalRegionSplittingForValueCommoningPass::run( const SentientRegType locale, const SenComponents comp)
-//   calls     : e064_dump, e065_dump, e444_analyze, e505_transform
+/// `program_unit_->walk<WalkOrder::PreOrder>([&](uniform::UniformizeRegionsOp ur) {..})`
+/// (`:254-258`), collected as clones because [`analyze`] reads the op while [`transform`] rewrites the
+/// block it sits in.
+///
+/// ⛔ A NESTED ONE IS UNREACHABLE BY [`transform`], whose `original_op_index` addresses the unit body's
+/// OWN block on the invariant e505 records — nothing nests one of these ops. The reference's walk is
+/// recursive, so the gap is named here rather than skipped in silence.
+fn collect_uniformize_regions(ops: &[Op], top_level: bool, out: &mut Vec<UniformRegions>) {
+    for op in ops {
+        if let Op::UniformRegions(regions @ UniformRegions::UniformizeRegions { .. }) = op {
+            if !top_level {
+                panic!(
+                    "a uniform.uniformize_regions nested inside another operation, which e505's \
+                     `transform` cannot address (LocalRegionSplittingForValueCommoning.cpp:254-258, \
+                     :347-360)"
+                );
+            }
+            out.push(regions.clone());
+        }
+        for region in dialects::regions_ref(op) {
+            collect_uniformize_regions(region, false, out);
+        }
+    }
+}
+
+/// Replaces: e561_run
+///
+/// Per `uniform.uniformize_regions` of the unit: work out which of its local regions must be split for
+/// `locale` on `comp`, and rebuild the op that way when any must.
+///
+/// ⛔ THE WALK IS COLLECTED FIRST (`:254-258`) BECAUSE [`transform`] REPLACES THE OP IT VISITS — the
+/// reference's own reason, and the snapshot per round is what lets a rebuilt block be re-read.
+/// ⭐ `LLVM_DEBUG(new_uniform.dump())` (`:267`) IS NOT CALLED: [`UniformRegion::dump`] returns the text
+/// its only caller gated behind `LLVM_DEBUG`, so calling it here would ungate what the reference hid.
+pub fn run<A: Arch>(
+    unit_body: &mut Vec<Op>,
+    locale: RegType,
+    comp: Component,
+    limits: PretendRegLimits,
+    values: &mut Values,
+) {
+    let mut uniform_regions_ops = Vec::new();
+    collect_uniformize_regions(unit_body, true, &mut uniform_regions_ops);
+    for orig_ur in uniform_regions_ops {
+        // `lrs::UniformRegion new_uniform(uniform);` (`:265`) — named by its first region's argument.
+        let Some(first) = orig_ur.regions().first() else {
+            continue;
+        };
+        let mut new_uniform = UniformRegion {
+            local_regions: Vec::new(),
+            original_uro: uniform_region::UniformizeRegions(first.arg),
+        };
+        let snapshot = unit_body.clone();
+        let scope: [&[Op]; 1] = [&snapshot];
+        let defs = Definitions::from_innermost(&scope);
+        if analyze::<A>(&mut new_uniform, &orig_ur, locale, comp, limits, defs)
+            == Transformation::Needed
+        {
+            transform(unit_body, &new_uniform, values);
+        }
+    }
+}
 
 // crustify:todo: e599_runOn
 //   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:240  (11 body lines, level 5)
@@ -893,5 +951,54 @@ mod unit_tests {
             panic!("the reader of the erased copy survives")
         };
         assert_eq!(read, survivor);
+    }
+
+    /// e561 — the walk finds the unit's `uniform.uniformize_regions`, its one local region holds as
+    /// many maps as the pretend limit allows registers, and the op comes back with one region per unit.
+    #[test]
+    fn run_splits_the_one_uniformize_regions_op_the_unit_holds() {
+        let mut unit_body = vec![
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(100),
+                pairs: vec![(Val(1), Val(11)), (Val(2), Val(12))],
+            }),
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(101),
+                map: Val(100),
+                key: Val(1),
+            }),
+            Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![IrLocalRegion {
+                    arg: Val(50),
+                    units: vec![Val(1), Val(2)],
+                    body: vec![scalar_copy(Val(101), Val(200), RegType::Ebr)],
+                }],
+                results: Vec::new(),
+                yielded: Vec::new(),
+            }),
+        ];
+        let mut values = Values::default();
+        for _ in 0..30 {
+            values.mint();
+        }
+
+        run::<Dd2>(
+            &mut unit_body,
+            RegType::Ebr,
+            Component::L3lu,
+            PretendRegLimits {
+                max_lbr: None,
+                max_ebr: Some(MaxRegNum(1)),
+            },
+            &mut values,
+        );
+
+        let Op::UniformRegions(new_op) = &unit_body[2] else {
+            panic!("the rebuilt uniform.uniformize_regions is still the last op")
+        };
+        let regions = new_op.regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].units, vec![Val(1)]);
+        assert_eq!(regions[1].units, vec![Val(2)]);
     }
 }

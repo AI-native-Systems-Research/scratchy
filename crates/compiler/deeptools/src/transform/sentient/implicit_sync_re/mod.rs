@@ -82,10 +82,10 @@
 //! | `e501_runOn` | 501 | 3 | 4 | `dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:77` |
 //! | `e559_runOnOperation` | 559 | 4 | 5 | `dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:82` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so `ImplicitSyncGenValue` is reachable only
-// from `implicit_sync_rde_tree` and its tests until `e559_runOnOperation` (level 4) lands. CI runs
-// clippy with `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH e559: at that point an unused item here is a real defect again.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`run_on_operation`] (e559) is the entry, and
+// there is no ported D29–D75 pass driver to call it, so nothing but this file's own tests reaches
+// anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e559 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
 use core::num::NonZeroU32;
@@ -291,10 +291,25 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
     count
 }
 
-// crustify:todo: e559_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:82  (5 body lines, level 4)
-//   original  : void runOnOperation()
-//   calls     : e438_runOn, e501_runOn
+/// `-dcc-implicit-sync-re-disable`, `cl::init(false)` (`ImplicitSyncRE.cpp:42-45`) — a `dcc-opt`
+/// command-line flag, not a program property, and this crate has no flags.
+pub(crate) const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e559_runOnOperation
+///
+/// The pass entry: unless the flag disables it, run implicit-sync redundancy elimination over every
+/// program unit of the module and hand back the statistic the last unit banked.
+///
+/// ⛔ THE FLAG IS READ BEFORE THE MODULE IS EVEN NAMED (`:83-84`), so a disabled pass walks nothing
+/// and [`run_on`]'s out-of-scope `todo!` is not reached either.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+) -> ImplicitSyncReCount {
+    if DISABLE_THIS_PASS {
+        return ImplicitSyncReCount::default();
+    }
+    run_on_program(program)
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -302,7 +317,7 @@ mod unit_tests {
 
     use super::{
         ENABLE_DEAD_DEF_REMOVAL, ENABLE_DYNAMIC_LOOP_HOISTING, ImplicitSyncGenValue, TileSize,
-        is_operation_a_use, run_on, run_on_program,
+        DISABLE_THIS_PASS, is_operation_a_use, run_on, run_on_operation, run_on_program,
     };
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
@@ -440,5 +455,16 @@ mod unit_tests {
         let mut unit_body = vec![nop()];
 
         run_on(&mut unit_body);
+    }
+
+    /// e559 — the entry runs the module walk, so it reaches the same out-of-scope optimizer; the flag
+    /// that would have skipped it is off.
+    #[test]
+    #[should_panic(expected = "RDETreeOptimizer<ImplicitSyncRDETree>::optimize")]
+    fn run_on_operation_walks_the_module_because_the_disable_flag_is_off() {
+        assert!(!DISABLE_THIS_PASS);
+        let mut program = two_unit_program(vec![nop()]);
+
+        run_on_operation(&mut program);
     }
 }

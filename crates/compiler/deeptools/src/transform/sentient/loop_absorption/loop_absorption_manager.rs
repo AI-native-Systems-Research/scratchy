@@ -101,7 +101,9 @@ use crate::islands::sentient::dialects::sentient::RegType;
 use crate::islands::sentient::dialects::{
     self as dialects, Definitions, Op, Val, sentient, uniform,
 };
+use crate::transform::sentient::loop_coalescing::TripLimit;
 use crate::transform::sentient::loop_tree::{LoopNodeId, LoopTree};
+use crate::transform::sentient::utils::{ConstKind, is_constant};
 use crate::transform::sentient::{ForRef, ops_are_equivalent};
 
 /// WHERE THE PASS MAY INSERT — the `dataflow.program_unit` the anchor loop sits in.
@@ -950,10 +952,132 @@ fn yielded_by(terminator: Option<&sentient::Op>) -> &[Val] {
     }
 }
 
-// crustify:todo: e562_absorptionAnalysis
-//   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:424  (65 body lines, level 4)
-//   original  : void LoopAbsorptionManager::absorptionAnalysis()
-//   calls     : e067_updateLoopBound, e070_removeNodesFromWorklistAndTree, e309_absorbIntoAnchorFromLeft, e310_absorbIntoAnchorFromRight, e506_canAbsorbToTheLeft, e507_canAbsorbToTheRight
+/// `cl::opt<bool> EnableDynamicLoopAbsorption("dcc-loop-absorption-dynamic-loops", .., cl::init(false))`
+/// (`LoopAbsorption.cpp:30-33`) — a `dcc-opt` command-line flag, not a program property.
+pub(crate) const ENABLE_DYNAMIC_LOOP_ABSORPTION: bool = false;
+
+/// `dcc::utils::getMaxConstValAcrossUnits(op)` (`Analyses/Utils.cpp:400-419`) — a
+/// `sentient.scalar_constant`'s own value, or the LARGEST constant a `uniform.query_map` maps.
+///
+/// ⛔ THE TWO `DT_CHECK_MSG`s AND `max_val.value()` ARE THE THREE `panic!`s: another defining op, a
+/// mapped value that is not a constant, and an empty immutable mapping.
+fn max_const_val_across_units(val: Val, defs: Definitions<'_>) -> i64 {
+    match defs.of(val) {
+        Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => *value,
+        Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })) => {
+            let mut max_val: Option<i64> = None;
+            for mapped in dialects::uniform_mapping_values(*map, *key, defs) {
+                let Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) = defs.of(mapped)
+                else {
+                    panic!(
+                        "Expect query map values to be constants. (Analyses/Utils.cpp:412-413): \
+                         {mapped:?}"
+                    )
+                };
+                max_val = Some(max_val.map_or(*value, |seen: i64| seen.max(*value)));
+            }
+            let Some(max_val) = max_val else {
+                panic!(
+                    "getMaxConstValAcrossUnits reached `max_val.value()` on an immutable mapping \
+                     with no values, which throws (Analyses/Utils.cpp:418)"
+                )
+            };
+            max_val
+        }
+        _ => panic!(
+            "Should only be called on constant operation (Analyses/Utils.cpp:405-406): {val:?}"
+        ),
+    }
+}
+
+/// `dcc::utils::updateDbgName(prefix, op, suffix)` (`dcc/src/Utils/Utils.cpp:491-515`) — ⛔ IT WRITES
+/// ONLY WHERE A NAME ALREADY EXISTS, because `getNewDbgNameFromOp` returns null without one.
+fn update_dbg_name(op: &mut Op, prefix: &str, suffix: &str) {
+    let Op::Sentient(inner) = op else {
+        return;
+    };
+    if let Some(Some(name)) = sentient::dbg_name_mut(inner) {
+        *name = format!("{prefix}{name}{suffix}");
+    }
+}
+
+impl LoopAbsorptionManager<'_> {
+    /// Replaces: e562_absorptionAnalysis
+    ///
+    /// Absorbs as many right siblings into the anchor as the LCCR still has room for, then as many
+    /// left ones, and finally raises the anchor's trip count by the total and tags its debug name.
+    ///
+    /// ⛔ THE LEFT LOOP NEVER CLEARS `to_update_` (`:461-478`) — the reference clears it once between
+    /// the two loops (`:459`) and the right loop clears it per round (`:452`), a difference kept as is.
+    /// ⭐ `max_bound_across_units += num_right_absorptions` BEFORE THE LEFT LOOP (`:463`) charges the
+    /// right absorptions against the same budget, which is why one bound serves both directions.
+    pub(crate) fn absorption_analysis(&mut self, vals: &mut Values) {
+        // `isConstant<sentient::ConstantOp>(anchor_for_op_.getBound())` (`:426-427`).
+        let bound = bound_of(self.anchor_for_op, self.site.body);
+        // ⭐ `getDefiningOp()` IS MODULE-WIDE, so the bound's definition may sit in the region holding
+        // the unit as well as in the unit itself — [`UnitSite::preamble`] is that outer region.
+        let scope: [&[Op]; 2] = [self.site.body, self.site.preamble];
+        let defs = Definitions::from_innermost(&scope);
+        let loop_bound_constant =
+            bound.is_some_and(|bound| is_constant(bound, ConstKind::ScalarConstant, defs));
+        if !loop_bound_constant && !ENABLE_DYNAMIC_LOOP_ABSORPTION {
+            return;
+        }
+        // `loop_bound_constant ? getMaxConstValAcrossUnits(..) : -1` (`:437-440`).
+        let mut max_bound_across_units = if loop_bound_constant {
+            bound.map_or(-1, |bound| max_const_val_across_units(bound, defs))
+        } else {
+            -1
+        };
+
+        // ── right absorptions (`:442-459`) ──
+        let mut num_right_absorptions: i64 = 0;
+        loop {
+            if loop_bound_constant
+                && max_bound_across_units + num_right_absorptions >= TripLimit::LCCR.0
+            {
+                break;
+            }
+            let mut nodes_to_delete = Vec::new();
+            self.to_update.clear();
+            if !self.can_absorb_to_the_right(&mut nodes_to_delete) {
+                break;
+            }
+            self.absorb_into_anchor_from_right();
+            num_right_absorptions += 1;
+            self.remove_nodes_from_worklist_and_tree(&nodes_to_delete);
+        }
+        self.to_update.clear();
+
+        // ── left absorptions (`:461-478`) ──
+        let mut num_left_absorptions: i64 = 0;
+        max_bound_across_units += num_right_absorptions;
+        loop {
+            if loop_bound_constant
+                && max_bound_across_units + num_left_absorptions >= TripLimit::LCCR.0
+            {
+                break;
+            }
+            let mut nodes_to_delete = Vec::new();
+            if !self.can_absorb_to_the_left(&mut nodes_to_delete) {
+                break;
+            }
+            self.absorb_into_anchor_from_left();
+            num_left_absorptions += 1;
+            self.remove_nodes_from_worklist_and_tree(&nodes_to_delete);
+        }
+
+        if num_left_absorptions + num_right_absorptions > 0 {
+            self.update_loop_bound(
+                vals,
+                BoundIncrement(num_left_absorptions + num_right_absorptions),
+            );
+            if let Some((block, at)) = anchor_slot_mut(self.anchor_for_op, &mut *self.site.body) {
+                update_dbg_name(&mut block[at], "LA(", ")");
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -1421,5 +1545,47 @@ mod unit_tests {
         assert_eq!(to_update.get(&right), Some(&result));
 
         assert!(!absorb(true).0);
+    }
+
+    /// e562, on e507's own right case: one right absorption happens, the second round finds nothing
+    /// to absorb, no left absorption matches a constant, and the trip count ends up one higher.
+    #[test]
+    fn absorption_analysis_absorbs_the_one_right_sibling_and_raises_the_bound() {
+        let mut vals = Values::default();
+        let bound = vals.mint();
+        let zero = vals.mint();
+        let other = vals.mint();
+        let iv = vals.mint();
+        let arg = vals.mint();
+        let result = vals.mint();
+        let inner = vals.mint();
+        let right = vals.mint();
+        let mut body = vec![
+            constant(bound, 5, ScalarTy::Index),
+            constant(zero, 0, ScalarTy::Index),
+            constant(other, 3, ScalarTy::Index),
+            for_yielding(
+                iv,
+                bound,
+                carried(zero, arg, result),
+                vec![add(arg, arg, inner)],
+                inner,
+            ),
+            add(result, result, right),
+        ];
+        let mut tree = LoopTree::<true>::of(&body);
+        let mut worklist = vec![tree.node_of(ForRef(iv)).unwrap()];
+        let mut preamble = Vec::new();
+        let mut manager = anchored(&mut body, &mut preamble, &mut tree, &mut worklist);
+
+        manager.absorption_analysis(&mut vals);
+
+        // The absorbed `add` is gone and the old bound with it.
+        assert_eq!(manager.site.body.len(), 3);
+        let new_bound = bound_of(manager.anchor_for_op, manager.site.body.as_slice()).unwrap();
+        assert!(manager.site.preamble.iter().any(|op| matches!(
+            op,
+            Op::Sentient(sentient::Op::ScalarConstant { value: 6, result, .. }) if *result == new_bound
+        )));
     }
 }

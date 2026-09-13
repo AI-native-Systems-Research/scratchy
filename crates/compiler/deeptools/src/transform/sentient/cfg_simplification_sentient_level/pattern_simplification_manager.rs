@@ -405,7 +405,14 @@ pub struct PatternSimplificationManager {
     pub monotone_seq_val_step: Option<Val>,
     /// The pass-local op markers of `:42-50`.
     pub marks: Marks,
+    /// `int &encoding_if_op_count_` (`:600`) — ⭐ A REFERENCE to the PASS's own counter (`:710`), so
+    /// it outlives one manager and names every encoding conditional the whole pass generates.
+    pub encoding_if_op_count: EncodingIfOpCount,
 }
+
+/// How many encoding conditionals the pass has named — `encoding_if_op_count_` (`:710`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncodingIfOpCount(pub u32);
 
 /// ⭐ THREE FLAGS START TRUE (`:559`, `:563`, `:570`) — a derived `Default` would start the pass
 /// having already failed to match every pattern, and nothing but a mismatch ever clears one.
@@ -424,6 +431,7 @@ impl Default for PatternSimplificationManager {
             monotone_seq_int_step: None,
             monotone_seq_val_step: None,
             marks: Marks::default(),
+            encoding_if_op_count: EncodingIfOpCount(0),
         }
     }
 }
@@ -2834,10 +2842,527 @@ impl PatternSimplificationManager {
     }
 }
 
-// crustify:todo: e555_findPatternsAndSimplify
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:1101  (340 body lines, level 4)
-//   original  : bool PatternSimplificationManager::findPatternsAndSimplify( dcc::CFGSCondNode *n, dcc::CFGSSentientLevelConditionalTree &tree)
-//   calls     : e027_print, e252_size, e286_recomputeAsDefaultVals, e289_computeTemplateSeqAndUpdateMonotoneSeq, e291_padTableSlice, e292_generateEncodingTypes, e293_generateEncodingTuple, e294_codeGenMonotoneTableSlice, e432_transformInContiguousSequenceCase, e433_transformInMonotoneSequenceCase, e434_parseSequence, e435_codeGenGenericNestedIf, e496_parseFixedDims
+// ── THE LEVEL-4 DRIVER, AND WHAT AN INSERTION COSTS A TREE NAMED BY POSITION ─────────────────────
+
+/// WHAT `findPatternsAndSimplify` ASKS OF THE CONDITIONAL TREE — `CFGSSentientLevelConditionalTree
+/// &tree` and the three questions it puts to `n` (`:1101-1102`).
+///
+/// ⛔ `Analyses/CFGSSentientLevelConditionalTree` IS OUT OF CAMPAIGN SCOPE, so each answer arrives as
+/// a parameter, exactly as [`LeafSink`] and [`LoopCloning`] do.
+///
+/// ⛔ `simplify_subtree` MUST CONFINE ITS REWRITE TO THAT OP'S OWN REGIONS. It is
+/// `subtree(*op); compute(); removeConditionWhenThenElseBranchesMatch()` followed by
+/// `getRoot()->getNumLeavesInSubtree()` (`:1312-1315`, `:1401-1404`), and a rewrite reaching the op's
+/// SIBLINGS would move ops whose position this driver has already recorded.
+pub struct TreeSeam<'a> {
+    /// `n->getNumLeavesInSubtree()`, the cost every case is compared against.
+    pub num_leaves_in_subtree: i64,
+    /// `n->setNoCandidatesForAllSubtreeNodes()`.
+    pub set_no_candidates: &'a mut dyn FnMut(),
+    /// The subtree simplification above, answering the leaves its root has left.
+    pub simplify_subtree: &'a mut dyn FnMut(&mut Vec<Op>, &OpPath) -> i64,
+}
+
+/// WHAT AN INSERTION DOES TO EVERY OTHER POSITION IN ITS BLOCK.
+///
+/// ⭐ THE REFERENCE PAYS NOTHING HERE: an `Operation *` survives a sibling insertion, so `:1177`'s
+/// `OpBuilder builder_new_if(if_op)` leaves `if_op`, `for_op` and every marked op still named. In this
+/// island each of those is a POSITION, and every position at or after the insertion point has moved.
+struct Shift {
+    /// The op whose region was inserted into, empty for the top-level body.
+    under: OpPath,
+    /// Which of its regions.
+    region: u32,
+    /// The position inserted at — every sibling from here on moves.
+    from: i64,
+    /// How far, negative for an erase.
+    by: i64,
+}
+
+impl Shift {
+    /// What inserting `by` ops in front of the op at `at` does — `OpBuilder builder(op)`.
+    fn before(at: &OpPath, by: i64) -> Option<Shift> {
+        let (&(region, index), under) = at.path().split_last()?;
+        Some(Shift {
+            under: OpPath::at(under),
+            region,
+            from: i64::from(index),
+            by,
+        })
+    }
+
+    /// The shift that undoes it — what erasing those ops again does (`:1242`, `:1438`).
+    fn undo(&self) -> Shift {
+        Shift {
+            under: self.under.clone(),
+            region: self.region,
+            from: self.from + self.by,
+            by: -self.by,
+        }
+    }
+
+    /// One recorded position, after that insertion.
+    fn apply(&self, path: &OpPath) -> OpPath {
+        if !path.path().starts_with(self.under.path()) {
+            return path.clone();
+        }
+        let depth = self.under.path().len();
+        let mut steps = path.path().to_vec();
+        let Some(step) = steps.get_mut(depth) else {
+            return path.clone();
+        };
+        if step.0 != self.region || i64::from(step.1) < self.from {
+            return path.clone();
+        }
+        step.1 = u32::try_from(i64::from(step.1) + self.by).unwrap_or(step.1);
+        OpPath::at(&steps)
+    }
+}
+
+impl Marks {
+    /// Every mark re-keyed for an insertion, the ops they name having moved.
+    fn shift(&mut self, shift: &Shift) {
+        self.on = core::mem::take(&mut self.on)
+            .into_iter()
+            .map(|(mark, at)| (mark, shift.apply(&at)))
+            .collect();
+    }
+
+    /// Every mark on `at` and on the ops inside it forgotten — what `erase()` costs the pass-local
+    /// attributes of the ops it deletes.
+    fn drop_under(&mut self, at: &OpPath) {
+        self.on
+            .retain(|(_, marked)| !marked.path().starts_with(at.path()));
+    }
+}
+
+/// THE BLOCK ONE OP SITS IN, AND WHERE IN IT — what an `OpBuilder(op)` insertion point IS here, since
+/// this island's blocks are `Vec<Op>` and not a linked list an iterator can name a place in.
+fn block_of_mut<'a>(root: &'a mut Vec<Op>, at: &OpPath) -> Option<(&'a mut Vec<Op>, usize)> {
+    let (&(region, index), under) = at.path().split_last()?;
+    if under.is_empty() {
+        return Some((root, index as usize));
+    }
+    let parent = op_at_mut(root, under)?;
+    let block = ir::regions_mut(parent).into_iter().nth(region as usize)?;
+    Some((block, index as usize))
+}
+
+/// `builder.insert(..)` for a run of ops in front of the op at `at`, answering what it moved.
+fn insert_before(root: &mut Vec<Op>, at: &OpPath, ops: Vec<Op>) -> Option<Shift> {
+    let shift = Shift::before(at, i64::try_from(ops.len()).unwrap_or(0))?;
+    let (block, index) = block_of_mut(root, at)?;
+    let index = index.min(block.len());
+    for (offset, op) in ops.into_iter().enumerate() {
+        block.insert(index + offset, op);
+    }
+    Some(shift)
+}
+
+/// `DT_CHECK_MSG(new_if.getDefiningOp()->use_empty(), "Expect new conditional to have no uses
+/// yet."); new_if.getDefiningOp()->erase()` (`:1240-1242`, `:1436-1438`) over the run
+/// [`insert_before`] put there.
+fn erase_unused(root: &mut Vec<Op>, at: &OpPath, count: usize, cite: &str) {
+    if let Some(op) = op_at(root, at.path())
+        && !use_empty(op, root)
+    {
+        panic!(
+            "DT_CHECK(new_if.getDefiningOp()->use_empty()) Expect new conditional to have no uses \
+             yet. (`CFGSimplificationSentientLevel.cpp:{cite}`): {at:?} is still read"
+        )
+    }
+    if let Some((block, index)) = block_of_mut(root, at) {
+        for _ in 0..count.min(block.len().saturating_sub(index)) {
+            block.remove(index);
+        }
+    }
+}
+
+/// `getNewDbgNameFromOp(prefix, op, suffix)` (`Utils/Utils.cpp:492-501`) — `None` when that op carries
+/// no name of its own, which is what makes every caller's `if` skip the rename.
+fn new_dbg_name_from_op(root: &[Op], prefix: &str, at: &OpPath, suffix: &str) -> Option<String> {
+    let Some(Op::Sentient(sentient::Op::If { dbg_name, .. })) = op_at(root, at.path()) else {
+        return None;
+    };
+    dbg_name
+        .as_ref()
+        .map(|name| format!("{prefix}{name}{suffix}"))
+}
+
+/// `dataflow::setDbgNameAttr(op, name)`, on an op with a place to keep one.
+fn set_dbg_name(root: &mut Vec<Op>, at: &OpPath, name: String) {
+    if let Some(Op::Sentient(inner)) = op_at_mut(root, at.path())
+        && let Some(slot) = sentient::dbg_name_mut(inner)
+    {
+        *slot = Some(name);
+    }
+}
+
+impl PatternSimplificationManager {
+    /// Every position this manager has recorded, moved by one insertion — the marks, and the loops
+    /// `lhs_to_for_op_or_null_` names.
+    fn shift_records(&mut self, shift: &Shift) {
+        self.marks.shift(shift);
+        for info in self.lhs_to_for_op_or_null.values_mut() {
+            if let Some(for_op) = info.for_op.as_ref() {
+                info.for_op = Some(shift.apply(for_op));
+            }
+        }
+    }
+
+    /// [`Self::shift_records`] for an insertion a code-gen call made: the marks that call has just set
+    /// name the ops it BUILT, which are already where they landed, so only the inherited ones move.
+    fn shift_over_generated(&mut self, before: &Marks, shift: &Shift) {
+        let added: Vec<(Mark, OpPath)> = self.marks.on.difference(&before.on).cloned().collect();
+        self.marks = before.clone();
+        self.shift_records(shift);
+        for (mark, at) in added {
+            self.marks.set(mark, at.path());
+        }
+    }
+
+    /// Replaces: e555_findPatternsAndSimplify
+    ///
+    /// Reads the table as one contiguous 1-D slice and, in the reference's order, replaces the
+    /// conditional by the single value every branch yields, by a chain over the free IV (case 1), by
+    /// an encoding conditional outside the free IV's loop plus that chain (case 2), or by the same
+    /// nest with consecutive duplicates compressed (case 3) — each kept only if it leaves fewer leaves.
+    ///
+    /// TRAP: `generateEncodingTypes()`'s RESULT IS UNUSED IN CASE 1 (`:1181`) and the call is made all
+    /// the same. Every insertion moves its siblings, hence [`Shift`]; a code-gen call that builds
+    /// nothing leaves the reference's `results[0].getDefiningOp()` on null, which stops that case.
+    pub fn find_patterns_and_simplify(
+        &mut self,
+        root: &mut Vec<Op>,
+        n: &CondNode,
+        tree: &mut TreeSeam<'_>,
+        cloning: &mut LoopCloning<'_>,
+        builders: &mut Builders<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> bool {
+        self.abort_pattern = false;
+        let Some(table) = self.table.as_ref() else {
+            return false;
+        };
+        let table_size = i64::try_from(table.size().0).unwrap_or(i64::MAX);
+        let table_entry_type = table.table_entry_type();
+        // `iv.getType()` (`:2737`) — the table's predicate type IS `n->getLhs().getType()` (`:839`),
+        // and the free IV is that LHS.
+        let predicate_type = table.predicate_type();
+        let ivs = self.ivs_dimensions_multipliers.clone();
+        // `std::prev(ivs_dimensions_multipliers_.end(), 1)` — the free IV (`:1111-1112`).
+        let Some(&free) = ivs.last() else {
+            return false;
+        };
+        let free_iv = TypedVal {
+            val: free.iv,
+            ty: predicate_type,
+        };
+        let zero = evaluator.get_constant(0);
+        let mut contiguous = TableSlice::new(
+            TableIndex(0),
+            IndexStride(1),
+            Entries(table_size),
+            zero,
+            /* is_1d_rep_of_table */ true,
+        );
+        // `DT_CHECK_MSG(free_iv_step != 0, ..)` (`:1117`): the reference reads the map with
+        // `operator[]`, which default-constructs step 0 for an IV it has no loop for.
+        let Some(free_loop) = self.lhs_to_for_op_or_null.get(&free.iv).cloned() else {
+            panic!(
+                "DT_CHECK(free_iv_step != 0) Expect non-zero stride. \
+                 (`CFGSimplificationSentientLevel.cpp:1117`): the free IV {:?} is the IV of no \
+                 recorded loop",
+                free.iv
+            )
+        };
+        for record in &ivs {
+            let Some(info) = self.lhs_to_for_op_or_null.get(&record.iv) else {
+                panic!(
+                    "DT_CHECK(iv_step != 0) Expect non-zero stride. \
+                     (`CFGSimplificationSentientLevel.cpp:1126`): the IV {:?} is the IV of no \
+                     recorded loop",
+                    record.iv
+                )
+            };
+            if free_loop.step != info.step {
+                self.table_follows_contiguous_pattern = false;
+                break;
+            }
+        }
+        let has_positive_step = free_loop.step.get() > 0;
+        let table_lb = if ivs.len() == 1 {
+            free_loop.lb
+        } else if has_positive_step {
+            0
+        } else {
+            table_size - 1
+        };
+        self.parse_sequence(
+            IntervalMarker(table_lb),
+            IntervalStride::new(free_loop.step),
+            TableIndex(0),
+            Entries(table_size),
+            &mut contiguous,
+            evaluator,
+        );
+        let mut if_op = n.op.clone();
+
+        // "If all the branches yield the same value" (`:1153-1171`).
+        if let [only] = contiguous.sequences.as_slice()
+            && only.kind == SequenceKind::DefaultValue
+        {
+            // `*getSequences().front()->getLB()` (`:1157`) is a null deref without an LB.
+            let Some(common_value) = only.lb else {
+                return false;
+            };
+            let replacement =
+                evaluator.build_offset_value(common_value, table_entry_type, builders);
+            if let Some(result) = first_result_of_if(root, &if_op) {
+                ir::replace_all_uses_with(root, result, replacement);
+            }
+            self.marks.set(Mark::ToDelete, if_op.path());
+            (tree.set_no_candidates)();
+            return false;
+        }
+
+        // There is only one table slice in case 1 (`:1150`).
+        let mut table_slices = vec![contiguous];
+        if self.table_follows_contiguous_pattern {
+            // CASE 1: contiguous pattern (`:1172-1242`).
+            self.compute_template_seq_and_update_monotone_seq(&mut table_slices, evaluator);
+            let _unused_types = self.generate_encoding_types();
+            let sequence_encoding = match table_slices.first() {
+                Some(slice) => self.generate_encoding_tuple(slice, builders, evaluator),
+                None => Vec::new(),
+            };
+            let before = self.marks.clone();
+            let new_if = match block_of_mut(root, &if_op) {
+                Some((block, _)) => {
+                    let mut site = Site {
+                        block,
+                        at: if_op.clone(),
+                    };
+                    self.code_gen_monotone_table_slice(
+                        /* mark_new_cmp */ true,
+                        free_iv,
+                        &sequence_encoding,
+                        &mut site,
+                        builders,
+                        evaluator,
+                    )
+                }
+                None => None,
+            };
+            if let Some(new_if) = new_if
+                && let Some(shift) = Shift::before(&if_op, 1)
+            {
+                // The chain landed AT `if_op`, so the conditional it replaces moved down one.
+                let new_if_op = if_op.clone();
+                self.shift_over_generated(&before, &shift);
+                if_op = shift.apply(&if_op);
+                let viable = tree.num_leaves_in_subtree
+                    > i64::try_from(self.template_sequences.len()).unwrap_or(i64::MAX);
+                // One new iterator argument for the synthetic 1-D variable unless the table already
+                // is 1-D, and one for the monotone sequence if there is one (`:1215-1222`).
+                let num_new_iter_args = usize::from(ivs.len() > 1)
+                    + usize::from(self.monotone_seq_start_val.is_some());
+                if viable && !self.abort_pattern {
+                    // Named before the clone below moves `if_op` again (`:1226-1231`).
+                    if let Some(name) = new_dbg_name_from_op(root, "CFGSimpl(", &if_op, ", case1)")
+                    {
+                        set_dbg_name(root, &new_if_op, name);
+                    }
+                    if self.transform_in_contiguous_sequence_case(
+                        root,
+                        &ContiguousCase {
+                            if_op: &if_op,
+                            new_if,
+                            num_new_iter_args,
+                            has_positive_step,
+                        },
+                        cloning,
+                        builders,
+                        evaluator,
+                    ) {
+                        (tree.set_no_candidates)();
+                        return true;
+                    }
+                }
+                erase_unused(root, &new_if_op, 1, "1240");
+                self.marks.drop_under(&new_if_op);
+                let undo = shift.undo();
+                self.shift_records(&undo);
+                if_op = undo.apply(&if_op);
+            }
+        }
+
+        // Recompute the table slices, no longer treating the table as one contiguous slice, if the
+        // table is not 1-D (`:1244-1255`).
+        self.abort_pattern = false;
+        self.template_sequences.clear();
+        if ivs.len() > 1 {
+            table_slices.clear();
+            self.parse_fixed_dims(
+                &ivs[..ivs.len() - 1],
+                free,
+                TableIndex(0),
+                &mut table_slices,
+                evaluator,
+            );
+        }
+
+        // CASE 2: monotone pattern — one slice per tuple of the fixed IVs (`:1261-1370`).
+        if ivs.len() > 1 && self.table_slices_follow_montone_pattern {
+            if !self.table_slices_are_consistent {
+                let max_num_seq = table_slices
+                    .iter()
+                    .map(|slice| slice.sequences.len())
+                    .max()
+                    .unwrap_or(0);
+                for slice in &mut table_slices {
+                    PatternSimplificationManager::pad_table_slice(slice, max_num_seq, evaluator);
+                }
+            }
+            self.compute_template_seq_and_update_monotone_seq(&mut table_slices, evaluator);
+            let Some(mut for_op) = self
+                .lhs_to_for_op_or_null
+                .get(&free.iv)
+                .and_then(|info| info.for_op.clone())
+            else {
+                panic!(
+                    "DT_CHECK(for_op) Expect valid for op. \
+                     (`CFGSimplificationSentientLevel.cpp:1291`): the free IV {:?} has no recorded \
+                     loop",
+                    free.iv
+                )
+            };
+            let generated_if_types = self.generate_encoding_types();
+            // The (n-1)-dimensional conditional yielding each slice's encoding, placed OUTSIDE the
+            // free IV's loop because its results are read inside it (`:1292-1305`).
+            let (ops, results_of_reduced_if) = {
+                let mut nest = GenericNest {
+                    generate_encoding: true,
+                    types: &generated_if_types,
+                    slices: table_slices.iter(),
+                };
+                self.code_gen_generic_nested_if(&mut nest, &ivs, &for_op, builders, evaluator)
+            };
+            // `results_of_reduced_if[0].getDefiningOp()` (`:1306`) is a null deref where the nest
+            // built no conditional at all.
+            if !ops.is_empty()
+                && !results_of_reduced_if.is_empty()
+                && let Some(shift) = insert_before(root, &for_op, ops)
+            {
+                let mut reduced_if_op = for_op.clone();
+                self.shift_records(&shift);
+                if_op = shift.apply(&if_op);
+                for_op = shift.apply(&for_op);
+                self.encoding_if_op_count =
+                    EncodingIfOpCount(self.encoding_if_op_count.0.saturating_add(1));
+                set_dbg_name(
+                    root,
+                    &reduced_if_op,
+                    format!("CFGSimpl enc #{}", self.encoding_if_op_count.0),
+                );
+                let subtree_leaves = (tree.simplify_subtree)(root, &reduced_if_op);
+                let before = self.marks.clone();
+                let new_if = match block_of_mut(root, &if_op) {
+                    Some((block, _)) => {
+                        let mut site = Site {
+                            block,
+                            at: if_op.clone(),
+                        };
+                        self.code_gen_monotone_table_slice(
+                            /* mark_new_cmp */ false,
+                            free_iv,
+                            &results_of_reduced_if,
+                            &mut site,
+                            builders,
+                            evaluator,
+                        )
+                    }
+                    None => None,
+                };
+                if let Some(new_if) = new_if
+                    && let Some(shift) = Shift::before(&if_op, 1)
+                {
+                    let new_if_op = if_op.clone();
+                    self.shift_over_generated(&before, &shift);
+                    if_op = shift.apply(&if_op);
+                    for_op = shift.apply(&for_op);
+                    reduced_if_op = shift.apply(&reduced_if_op);
+                    let new_num_leaves = subtree_leaves
+                        + i64::try_from(self.template_sequences.len()).unwrap_or(i64::MAX);
+                    if tree.num_leaves_in_subtree > new_num_leaves && !self.abort_pattern {
+                        if let Some(name) =
+                            new_dbg_name_from_op(root, "CFGSimpl(", &if_op, ", case2)")
+                        {
+                            set_dbg_name(root, &new_if_op, name);
+                        }
+                        if self.transform_in_monotone_sequence_case(
+                            root,
+                            &MonotoneCase {
+                                for_op: &for_op,
+                                if_op: &if_op,
+                                new_if,
+                            },
+                            cloning,
+                            builders,
+                            evaluator,
+                        ) {
+                            (tree.set_no_candidates)();
+                            return true;
+                        }
+                    }
+                    // Cleanup: both generated conditionals are retired (`:1366-1369`).
+                    self.marks.set(Mark::ToDelete, new_if_op.path());
+                    self.marks.set(Mark::ToDelete, reduced_if_op.path());
+                }
+            }
+        }
+
+        // CASE 3 (DEFAULT): compress consecutive duplicates in each slice (`:1372-1440`).
+        for slice in &mut table_slices {
+            slice.recompute_as_default_vals(evaluator);
+        }
+        let type_vector = [table_entry_type];
+        let (ops, results_of_reduced_if) = {
+            let mut nest = GenericNest {
+                generate_encoding: false,
+                types: &type_vector,
+                slices: table_slices.iter(),
+            };
+            self.code_gen_generic_nested_if(&mut nest, &ivs, &if_op, builders, evaluator)
+        };
+        let count = ops.len();
+        let (Some(&reduced), false) = (results_of_reduced_if.first(), ops.is_empty()) else {
+            return false;
+        };
+        let Some(shift) = insert_before(root, &if_op, ops) else {
+            return false;
+        };
+        let new_if_op = if_op.clone();
+        self.shift_records(&shift);
+        if_op = shift.apply(&if_op);
+        let subtree_leaves = (tree.simplify_subtree)(root, &new_if_op);
+        if tree.num_leaves_in_subtree > subtree_leaves {
+            if let Some(name) = new_dbg_name_from_op(root, "CFGSimpl(", &if_op, ", case3)") {
+                set_dbg_name(root, &new_if_op, name);
+            }
+            if let Some(result) = first_result_of_if(root, &if_op) {
+                ir::replace_all_uses_with(root, result, reduced);
+            }
+            self.marks.set(Mark::ToDelete, if_op.path());
+            (tree.set_no_candidates)();
+        } else {
+            erase_unused(root, &new_if_op, count, "1437");
+            self.marks.drop_under(&new_if_op);
+            self.shift_records(&shift.undo());
+        }
+        false
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -4094,5 +4619,144 @@ mod unit_tests {
             ]
         );
         assert!(!manager.table_slices_are_consistent);
+    }
+
+    /// 555/656 — the whole driver over the 1-D table `[D0 D0 D0 D1]`: case 1 builds
+    /// `if (iv <= 2) yield D0 else yield D1` in front of the conditional it replaces, names it after
+    /// that conditional, retires it and hands its reader the new result.
+    #[test]
+    fn find_patterns_and_simplify_replaces_the_conditional_with_the_contiguous_chain() {
+        let free_iv = Val(50);
+        let mut evaluator = FakeEvaluator::default();
+        let mut table = Table::new(TableSize(4), ScalarTy::Int(1), ScalarTy::Index);
+        for at in 0..3 {
+            table.create_table_entry_at_idx(
+                TableIndex(at),
+                &Leaf {
+                    results: vec![Val(70)],
+                    block: None,
+                },
+                &mut evaluator,
+            );
+        }
+        table.create_table_entry_at_idx(
+            TableIndex(3),
+            &Leaf {
+                results: vec![Val(71)],
+                block: None,
+            },
+            &mut evaluator,
+        );
+        let if_path = OpPath::at(&[(0, 0), (0, 0)]);
+        let mut manager = PatternSimplificationManager {
+            lhs_to_for_op_or_null: BTreeMap::from([(
+                free_iv,
+                loop_info(Some(OpPath::at(&[(0, 0)])), 4),
+            )]),
+            ivs_dimensions_multipliers: vec![IvDim {
+                iv: free_iv,
+                dimension: 4,
+                multiplier: 1,
+            }],
+            table: Some(table),
+            ..PatternSimplificationManager::default()
+        };
+        let original = Op::Sentient(sentient::Op::If {
+            predicate: CmpPredicate::Eq,
+            lhs: free_iv,
+            rhs: Val(60),
+            yielded: vec![Yielded {
+                result: Val(61),
+                reg: UNASSIGNED,
+                element_size: None,
+            }],
+            dbg_name: Some("orig".to_string()),
+            then_body: vec![yield_op(vec![Val(70)])],
+            else_body: vec![yield_op(vec![Val(71)])],
+        });
+        let mut root = vec![Op::Sentient(sentient::Op::For {
+            iv: free_iv,
+            bound: Val(62),
+            bound_reg: None,
+            carried: Vec::new(),
+            dbg_name: None,
+            body: vec![
+                original,
+                scalar_add(Val(61), Val(63), Val(64)),
+                yield_op(Vec::new()),
+            ],
+        })];
+        let n = CondNode {
+            lhs: free_iv,
+            rhs_val: 0,
+            op: if_path,
+            then_node: Branch::default(),
+            else_node: Branch::default(),
+        };
+        let mut no_candidates = false;
+        let mut consts = Vec::new();
+        let mut query_maps = Vec::new();
+        let mut values = Values::default();
+
+        let simplified = {
+            let mut set_no_candidates = || no_candidates = true;
+            let mut simplify_subtree = |_: &mut Vec<Op>, _: &OpPath| 0;
+            let mut tree = TreeSeam {
+                num_leaves_in_subtree: 4,
+                set_no_candidates: &mut set_no_candidates,
+                simplify_subtree: &mut simplify_subtree,
+            };
+            let mut clone = |_: &mut Vec<Op>, at: &OpPath, _: &[(Val, Val)]| at.clone();
+            let mut cloning = LoopCloning {
+                for_ops_to_avoid_new_iter_args: &[],
+                clone: &mut clone,
+            };
+            let mut builders = Builders {
+                consts: &mut consts,
+                query_maps: &mut query_maps,
+                values: &mut values,
+            };
+            manager.find_patterns_and_simplify(
+                &mut root,
+                &n,
+                &mut tree,
+                &mut cloning,
+                &mut builders,
+                &mut evaluator,
+            )
+        };
+
+        assert!(simplified);
+        assert!(no_candidates);
+        let Some(Op::Sentient(sentient::Op::For { body, .. })) = root.first() else {
+            panic!("the fixture's loop")
+        };
+        // The chain landed at the conditional's position, which pushed the conditional down one.
+        assert_eq!(
+            body.first(),
+            Some(&Op::Sentient(sentient::Op::If {
+                predicate: CmpPredicate::Sle,
+                lhs: free_iv,
+                rhs: Val(1),
+                yielded: vec![Yielded {
+                    result: Val(2),
+                    reg: UNKNOWN_LOCALE,
+                    element_size: None,
+                }],
+                dbg_name: Some("CFGSimpl(orig, case1)".to_string()),
+                then_body: vec![yield_op(vec![Val(0)])],
+                else_body: vec![yield_op(vec![Val(3)])],
+            }))
+        );
+        assert!(matches!(
+            body.get(1),
+            Some(Op::Sentient(sentient::Op::If {
+                dbg_name: Some(name),
+                ..
+            })) if name == "orig"
+        ));
+        assert!(manager.marks.has(Mark::ToDelete, &[(0, 0), (0, 1)]));
+        assert_eq!(body.get(2), Some(&scalar_add(Val(2), Val(63), Val(64))));
+        assert_eq!(consts, vec![scalar_constant(Val(1), 2, ScalarTy::Int(1))]);
     }
 }

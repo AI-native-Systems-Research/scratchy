@@ -90,10 +90,13 @@
 // ⭐ REMOVE THIS WITH e621: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
-use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::{Units, ValueMapping, Values};
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{
     self as dialects, Definitions, LocalRegion, Op, UniformRegions, Val, uniform,
 };
+use crate::units::DfirUnit;
 
 /// Replaces: e039_existsInCollection
 ///
@@ -421,10 +424,185 @@ pub fn duplicate_and_update_regions_of_local_region_ops(
     Some(new_op)
 }
 
-// crustify:todo: e556_deuniform
-//   authority : dcc/src/Transform/Sentient/Deuniform.cpp:375  (70 body lines, level 4)
-//   original  : mlir::dataflow::ProgramUnitOp DeuniformPass::deuniform( mlir::dataflow::ProgramUnitOp prog_unit, std::vector<mlir::dataflow::GetUnitOp> &set_of_units)
-//   calls     : e252_size, e298_duplicateAndUpdateEntriesOfQueryMap, e497_duplicateAndUpdateRegionsOfLocalRegionOps
+/// Replaces: e556_deuniform
+///
+/// One program unit rebuilt to run `set_of_units` alone: its body cloned under a fresh argument, then
+/// every `uniform.query_map` in it narrowed to those units and every local region op rebuilt without
+/// the regions none of them runs — returned with the argument the clone binds.
+///
+/// ⛔ TRAP: `for (auto fold : unit.getResults())` (`:381-383`) FLATTENS A LIST OF ONE.
+/// [`dialects::dataflow::Op::GetUnit`] binds a single value, so the inner loop is the identity here.
+/// ⛔ `isa<ReturnOp>` (`:399`) FILTERS NOTHING: this rung's [`ProgramUnit`] body has no terminator.
+/// ⛔ THE NEW ARGUMENT IS RETURNED because no op and no [`ProgramUnit`] carries a program unit's
+/// `iter_arg` — the same mechanism-from-the-caller e297's `prog_unit_arg` is.
+/// ⛔ `DT_CHECK(new_prog_unit.getUnits().size() > 0)` (`:401`) IS [`Units`]: naming no unit is what
+/// panics, and it panics where the reference aborts.
+#[must_use]
+pub fn deuniform<A: Arch>(
+    prog_unit: &ProgramUnit<A>,
+    prog_unit_arg: Val,
+    set_of_units: &[Val],
+    enclosing: &[&[Op]],
+    values: &mut Values,
+) -> (ProgramUnit<A>, Val) {
+    let kind = prog_unit.on.kind();
+    let bound: Vec<(DfirUnit, Val)> = set_of_units.iter().map(|unit| (kind, *unit)).collect();
+    let Some(on) = Units::of(kind, &bound) else {
+        panic!("deuniform was handed no unit for the program unit it must rebuild (:401)")
+    };
+    // `bv_map.map(prog_unit.getBody()->getArguments(), ..)` then `builder.clone(it, bv_map)`
+    // (`:396-400`).
+    let arg = values.mint();
+    let mut mapping = ValueMapping::new();
+    mapping.map(prog_unit_arg, arg);
+    let mut body = dialects::clone_ops(&prog_unit.body, values, &mut mapping);
+
+    // Every site decided over the clone BEFORE it is touched, because the mappings a query reads and
+    // the units a region names are both in it — see e297's own note on the same ordering.
+    let mut edits: Vec<(Vec<(usize, usize)>, usize, Vec<Op>)> = Vec::new();
+    let mut rewires: Vec<(Val, Val)> = Vec::new();
+    let mut to_be_deleted: Vec<Val> = Vec::new();
+    {
+        let mut scope: Vec<&[Op]> = vec![body.as_slice()];
+        scope.extend_from_slice(enclosing);
+        let defs = Definitions::within_program_unit(&scope, arg, set_of_units);
+        for (path, at) in deuniform_sites(&body) {
+            let Some(op) = block_at(&body, &path).and_then(|block| block.get(at)) else {
+                continue;
+            };
+            match op {
+                Op::Uniform(uniform::Op::QueryMap { result, map, key }) => {
+                    let (new_map, new_query) = duplicate_and_update_entries_of_query_map(
+                        *map,
+                        *key,
+                        set_of_units,
+                        defs,
+                        values,
+                    );
+                    if let Op::Uniform(uniform::Op::QueryMap {
+                        result: new_result, ..
+                    }) = new_query
+                    {
+                        rewires.push((*result, new_result));
+                    }
+                    // `for (auto user : map_op->getUsers()) num_users++; if (num_users <= 1)`
+                    // (`:404-406`) — this query is that one user, and a map two queries read survives
+                    // both of them, as it does there.
+                    if dialects::use_count(*map, &body) <= 1 {
+                        to_be_deleted.push(*map);
+                    }
+                    edits.push((path, at, vec![new_map, new_query]));
+                }
+                Op::UniformRegions(local) => {
+                    if let Some(new_op) = duplicate_and_update_regions_of_local_region_ops(
+                        local,
+                        set_of_units,
+                        &mut to_be_deleted,
+                        defs,
+                        values,
+                    ) {
+                        rewires.extend(
+                            dialects::results(op)
+                                .into_iter()
+                                .zip(dialects::results(&new_op)),
+                        );
+                        edits.push((path, at, vec![new_op]));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // ⭐ IN REVERSE DOCUMENT ORDER so an edit cannot move a site still to be applied. The reference
+    // inserts after the old op and erases it last (`:445`); replacing it is the same net shape.
+    for (path, at, replacement) in edits.into_iter().rev() {
+        if let Some(block) = block_at_mut(&mut body, &path) {
+            block.splice(at..=at, replacement);
+        }
+    }
+    for (of, with) in rewires {
+        dialects::replace_all_uses_with(&mut body, of, with);
+    }
+    // `for (auto op : to_be_deleted) op->erase();` (`:445`) — including what e497 queued inside the
+    // regions it rebuilt.
+    for val in to_be_deleted {
+        dialects::erase_defining_op(&mut body, val);
+    }
+
+    (
+        ProgramUnit {
+            on,
+            precision: prog_unit.precision,
+            body,
+            arch: core::marker::PhantomData,
+        },
+        arg,
+    )
+}
+
+/// e556's `walk<WalkOrder::PreOrder>` (`:403`), as the address of each site: the path of
+/// (op index, region index) pairs to the block that holds it, then the op's index in that block.
+///
+/// ⛔ A LOCAL REGION OP'S OWN SUBTREE IS **SKIPPED** (`:429`, `:439`) — which is why e436 exists to
+/// rewrite the queries inside the copy e497 builds.
+/// ⛔ THE RUNG BELOW'S SPELLING IS A `todo!`: [`uniform::Op::UniformizeRegions`] holds a DataflowIR
+/// body, and e497 rebuilds THIS rung's [`UniformRegions`] — the two are different types, not two
+/// names for one op.
+fn deuniform_sites(block: &[Op]) -> Vec<(Vec<(usize, usize)>, usize)> {
+    fn walk(
+        block: &[Op],
+        path: &mut Vec<(usize, usize)>,
+        found: &mut Vec<(Vec<(usize, usize)>, usize)>,
+    ) {
+        for (at, op) in block.iter().enumerate() {
+            match op {
+                Op::Uniform(uniform::Op::QueryMap { .. }) => found.push((path.clone(), at)),
+                Op::UniformRegions(_) => {
+                    found.push((path.clone(), at));
+                    continue;
+                }
+                Op::Uniform(
+                    uniform::Op::UniformizeRegions { .. } | uniform::Op::EqualizePattern { .. },
+                ) => todo!(
+                    "uniform::UniformizeRegionsOp/EqualizePatternOp carrying a DataflowIR body — \
+                     raising it to this rung's uniform.uniformize_regions is out of campaign scope"
+                ),
+                _ => {}
+            }
+            for (region_num, region) in dialects::regions_ref(op).into_iter().enumerate() {
+                path.push((at, region_num));
+                walk(region, path, found);
+                path.pop();
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(block, &mut Vec::new(), &mut found);
+    found
+}
+
+/// The block a [`deuniform_sites`] path addresses.
+fn block_at<'b>(block: &'b [Op], path: &[(usize, usize)]) -> Option<&'b [Op]> {
+    let Some((&(at, region_num), rest)) = path.split_first() else {
+        return Some(block);
+    };
+    let inner = *dialects::regions_ref(block.get(at)?).get(region_num)?;
+    block_at(inner, rest)
+}
+
+/// The same block, FOR THE EDIT.
+fn block_at_mut<'b>(
+    block: &'b mut Vec<Op>,
+    path: &[(usize, usize)],
+) -> Option<&'b mut Vec<Op>> {
+    let Some((&(at, region_num), rest)) = path.split_first() else {
+        return Some(block);
+    };
+    let inner = dialects::regions_mut(block.get_mut(at)?)
+        .into_iter()
+        .nth(region_num)?;
+    block_at_mut(inner, rest)
+}
 
 // crustify:todo: e595_deuniform
 //   authority : dcc/src/Transform/Sentient/Deuniform.cpp:448  (30 body lines, level 5)
@@ -439,6 +617,7 @@ pub fn duplicate_and_update_regions_of_local_region_ops(
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
     use crate::islands::dataflow_ir::dialects::dataflow;
     use crate::islands::sentient::dialects::sentient::{Reg, RegType};
     use crate::islands::sentient::dialects::{LocalRegion, UniformRegions, sentient};
@@ -788,5 +967,72 @@ mod unit_tests {
         );
         assert_eq!(copies(body), vec![(42, 1)]);
         assert_eq!(to_be_deleted, vec![Val(41)]);
+    }
+
+    /// e556: the unit is rebuilt for two of its three units — the query is replaced by one over a
+    /// mapping narrowed to those two, its reader follows, and the wide mapping nothing reads any more
+    /// is gone.
+    #[test]
+    fn deuniform_narrows_the_query_map_to_the_units_the_new_unit_runs() {
+        let func_body = vec![get_unit(1), get_unit(2), get_unit(3)];
+        let prog_unit: ProgramUnit<Dd2> = ProgramUnit {
+            on: Units::of(
+                DfirUnit::Lxlu,
+                &[
+                    (DfirUnit::Lxlu, Val(1)),
+                    (DfirUnit::Lxlu, Val(2)),
+                    (DfirUnit::Lxlu, Val(3)),
+                ],
+            )
+            .expect("three units of one kind"),
+            precision: None,
+            body: vec![
+                Op::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(10),
+                    pairs: vec![(Val(1), Val(20)), (Val(2), Val(21)), (Val(3), Val(22))],
+                }),
+                Op::Uniform(uniform::Op::QueryMap {
+                    result: Val(11),
+                    map: Val(10),
+                    key: Val(9),
+                }),
+                copy(12, 11),
+            ],
+            arch: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+        // Past every name the fixture writes, so a minted clone cannot collide with a unit value.
+        while values.issued() <= 22 {
+            values.mint();
+        }
+
+        let (new_unit, arg) = deuniform(
+            &prog_unit,
+            Val(9),
+            &[Val(1), Val(2)],
+            &[&func_body],
+            &mut values,
+        );
+
+        assert_eq!(new_unit.on.vals(), vec![Val(1), Val(2)]);
+        // The wide mapping was erased with the query that was its only reader.
+        assert_eq!(new_unit.body.len(), 3);
+        let Op::Uniform(uniform::Op::DefImmutableMapping { result, pairs }) = &new_unit.body[0]
+        else {
+            panic!("expected the narrowed mapping, got {:?}", new_unit.body[0]);
+        };
+        assert_eq!(*pairs, vec![(Val(1), Val(20)), (Val(2), Val(21))]);
+        let Op::Uniform(uniform::Op::QueryMap {
+            result: query,
+            map,
+            key,
+        }) = &new_unit.body[1]
+        else {
+            panic!("expected the narrowed query, got {:?}", new_unit.body[1]);
+        };
+        assert_eq!((*map, *key), (*result, arg));
+        let readers = copies(&new_unit.body);
+        assert_eq!(readers.len(), 1);
+        assert_eq!(readers[0].1, query.0);
     }
 }

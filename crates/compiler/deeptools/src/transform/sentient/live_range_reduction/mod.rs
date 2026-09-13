@@ -2054,10 +2054,92 @@ fn grow_yielded_values(
     }
 }
 
-// crustify:todo: e560_reduceLiveRange
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:885  (28 body lines, level 4)
-//   original  : void LiveRangeReductionPass::reduceLiveRange(PropagationAnalysis& expr_prop, Operation* unit_op)
-//   calls     : e252_size, e441_findDominantValue, e502_reconstructOperation
+/// `op->emitError("Failed in reconstructing the following operation!")` (`:906`) — ⛔ THE MESSAGE
+/// VERBATIM, exclamation mark included.
+const FAILED_RECONSTRUCTION: &str = "Failed in reconstructing the following operation!";
+
+/// `op->emitError(..); op->dump(); signalPassFailure();` (`:906-908`) AS DATA — one value whose
+/// defining op [`SsaMap::reconstruct_operation`] had no arm for.
+///
+/// ⭐ NOT A `Result`: the reference records the failure and CARRIES ON to the next value of the same
+/// class (`:905-909`), so the pass's verdict is the accumulated list. Same shape as
+/// [`crate::transform::sentient::register_allocation`]'s `UnknownLocale`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconstructionFailure {
+    /// The value whose op was not rewritten — an identity, not a borrow.
+    pub at: Val,
+    /// `op->dump()`, into a buffer a caller can read rather than the process's stderr.
+    pub dumped: String,
+    /// The message the reference emitted.
+    pub message: &'static str,
+}
+
+impl SsaMap {
+    /// Replaces: e560_reduceLiveRange
+    ///
+    /// Per equivalence class, from its SECOND value on: point each value's op at the closest earlier
+    /// value of the class that dominates it, recording the ops no arm of the rewriter covers.
+    ///
+    /// ⛔ TRAP: `PropagationAnalysis& expr_prop` IS UNREAD IN THE BODY (`:885-911`) and is dropped,
+    /// as is `DominanceInfo dominance_info(unit_op)` (`:889`) — [`properly_dominates`] answers from
+    /// `unit_body` itself, which is the positioning mechanism a port supplies.
+    /// ⛔ INDEX 0 IS NEVER RECONSTRUCTED (`:895`): it is the one every other value of the class moves
+    /// onto. ⭐ `isa<BlockArgument>` IS "no defining op in this unit" — an iter arg, skipped (`:899`).
+    pub fn reduce_live_range(
+        &mut self,
+        check: ElementSizeCheck,
+        unit_body: &mut Vec<Op>,
+        parent: &ParentRegionQuery,
+        index_map: &impl UnitIndexMap,
+        vals: &mut Values,
+        to_be_erased: &mut Vec<Val>,
+    ) -> Vec<ReconstructionFailure> {
+        let mut failures = Vec::new();
+        for class_index in 0..self.classes.len() {
+            let mut current_value_index = 1;
+            // `ssa_list.size()` is re-read every round, because `reconstructOperation` writes back
+            // through `ssa_value_list_[i]` (`:546`, `:630`).
+            while let Some(ssa_list) = self
+                .classes
+                .get(class_index)
+                .map(|class| class.values.clone())
+                .filter(|values| current_value_index < values.len())
+            {
+                let current = ssa_list[current_value_index];
+                let scope = unit_body.clone();
+                let regions: [&[Op]; 1] = [&scope];
+                let defs = Definitions::from_innermost(&regions);
+                if defs.of(current).is_none() {
+                    current_value_index += 1;
+                    continue;
+                }
+                let dominant = find_dominant_value(&ssa_list, current_value_index, check, &scope, defs);
+                let mut dumped = String::new();
+                print_value(current, defs, &mut dumped);
+                if let Some(dominant_value_index) = dominant
+                    && self.reconstruct_operation(
+                        class_index,
+                        current_value_index,
+                        dominant_value_index,
+                        unit_body,
+                        parent,
+                        index_map,
+                        vals,
+                        to_be_erased,
+                    ) == Reconstruction::Unsupported
+                {
+                    failures.push(ReconstructionFailure {
+                        at: current,
+                        dumped,
+                        message: FAILED_RECONSTRUCTION,
+                    });
+                }
+                current_value_index += 1;
+            }
+        }
+        failures
+    }
+}
 
 // crustify:todo: e598_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:1267  (45 body lines, level 5)
@@ -2878,6 +2960,47 @@ mod unit_tests {
             &mut Vec::new(),
         );
         assert_eq!(ops.len(), 3);
+        assert!(matches!(
+            &ops[2],
+            Op::Sentient(sentient::Op::LoadAndExtractScalar { mutable_addr, .. })
+                if *mutable_addr == Val(1)
+        ));
+    }
+
+    /// e560 — the second value of a class has its address operand repointed at the dominator, and a
+    /// value with no defining op in the unit — an iter arg, `isa<BlockArgument>` — is skipped.
+    #[test]
+    fn reduce_live_range_repoints_the_dominated_value_and_skips_a_block_argument() {
+        let parent = ParentRegionQuery {
+            key: Val(100),
+            units: vec![Val(101)],
+        };
+        let mut map = SsaMap {
+            classes: vec![EquivalenceClass {
+                expr_info: ExprInfo::default(),
+                values: vec![Val(1), Val(3), Val(99)],
+            }],
+            const_offsets: BTreeMap::from([(Val(1), vec![8]), (Val(2), vec![8])]),
+            negated: BTreeMap::from([(Val(1), false), (Val(3), false)]),
+        };
+        let mut ops = vec![
+            extract(Val(10), (Val(1), Val(11)), 16, RegType::Lar),
+            extract(Val(12), (Val(2), Val(13)), 16, RegType::Lar),
+            extract(Val(2), (Val(3), Val(4)), 16, RegType::Lar),
+        ];
+        let mut erased = Vec::new();
+        let mut vals = Values::default();
+
+        let failures = map.reduce_live_range(
+            ElementSizeCheck::Required,
+            &mut ops,
+            &parent,
+            &OutOfScopeUnitIndexMap,
+            &mut vals,
+            &mut erased,
+        );
+
+        assert!(failures.is_empty());
         assert!(matches!(
             &ops[2],
             Op::Sentient(sentient::Op::LoadAndExtractScalar { mutable_addr, .. })

@@ -924,15 +924,137 @@ impl EnhancedDeadVariableElimination {
     }
 }
 
-// crustify:todo: e557_exploreOperation
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:367  (57 body lines, level 4)
-//   original  : void EnhancedDeadVariableEliminationPass::exploreOperation(Operation *op)
-//   calls     : e041_getInfluenceType, e498_updateForOperation, e499_updateIfOperation, e500_updateUniformizeRegionsOperation, e558_exploreBlock
+/// `dcc::utils::mayHaveSideEffects` (`Analyses/Utils.cpp:666-671`) — the nine ops the reference lists,
+/// and every other op has effects.
+///
+/// ⭐ IN SCOPE AND NOT A `todo!`: it is a closed `isa<>` list over ops this island already spells.
+#[must_use]
+fn may_have_side_effects(op: &Op) -> bool {
+    !matches!(
+        op,
+        Op::Sentient(
+            sentient::Op::ScalarAdd { .. }
+                | sentient::Op::ScalarSub { .. }
+                | sentient::Op::ScalarConstant { .. }
+                | sentient::Op::ScalarCopy { .. }
+                | sentient::Op::VectorConstant { .. }
+                | sentient::Op::LogicalPort { .. }
+        ) | Op::Uniform(uniform::Op::QueryMap { .. } | uniform::Op::DefImmutableMapping { .. })
+            | Op::Symbol(symbol::Op::CreateSymbol { .. })
+    )
+}
 
-// crustify:todo: e558_exploreBlock
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:426  (23 body lines, level 4)
-//   original  : void EnhancedDeadVariableEliminationPass::exploreBlock(Block *block)
-//   calls     : e557_exploreOperation
+/// `isa<sentient::YieldOp, uniform::YieldOp>(op)` (`EnhancedDeadVariableElimination.cpp:377`) — the
+/// one op whose operands e557 erases, in either spelling.
+#[must_use]
+fn yield_operands_mut(op: &mut Op) -> Option<&mut Vec<Val>> {
+    match op {
+        Op::Sentient(sentient::Op::Yield { results }) => Some(results),
+        Op::Uniform(uniform::Op::Yield { operands }) => Some(operands),
+        _ => None,
+    }
+}
+
+impl EnhancedDeadVariableElimination {
+    /// WHICH OF A PARENT OP'S YIELDED POSITIONS MAY LOSE THEIR OPERAND — `op->getParentOp()` (`:378`)
+    /// asked before the descent, because this island keeps no parent pointers.
+    ///
+    /// ⭐ THE `sentient.for` ARM NEEDS **BOTH** ITS RESULT AND ITS BODY ARGUMENT TO BE UNINFLUENTIAL
+    /// (`:382-387`); every other parent asks about its result alone (`:388-392`).
+    #[must_use]
+    fn dead_yielded_positions(&self, parent: &Op) -> Vec<bool> {
+        if let Op::Sentient(sentient::Op::For { carried, .. }) = parent {
+            return carried
+                .iter()
+                .map(|value| {
+                    self.influence_type(value.result) == Influence::None
+                        && self.influence_type(value.arg) == Influence::None
+                })
+                .collect();
+        }
+        dialects::results(parent)
+            .into_iter()
+            .map(|result| self.influence_type(result) == Influence::None)
+            .collect()
+    }
+
+    /// Replaces: e557_exploreOperation
+    ///
+    /// Explores the op's regions, then either strips the dead operands off a terminator, erases an
+    /// unread effect-free op outright, or hands a loop, conditional or uniformized region to its own
+    /// position-dropping rewriter.
+    ///
+    /// ⛔ `parent_dead` IS `op->getParentOp()` (`:378`) PRECOMPUTED — see
+    /// [`Self::dead_yielded_positions`]; the top-level block of a program unit has no yield and an
+    /// empty slice is its verdict.
+    /// ⛔ THE SCOPE IS THE BLOCK, NOT THE MODULE, for `use_empty()` (`:411`) — the widest reach this
+    /// walk has, and dominance puts every use of a result in it or under it.
+    pub(crate) fn explore_operation(&self, scope: &mut Vec<Op>, at: usize, parent_dead: &[bool]) {
+        let Some(op) = scope.get(at) else {
+            return;
+        };
+        // `for (auto &region : op->getRegions())` (`:369-375`) — the empty region and the empty block
+        // are one `Vec` here, and [`Self::explore_block`] returns on either.
+        let dead = self.dead_yielded_positions(op);
+        for region in dialects::regions_mut(&mut scope[at]) {
+            self.explore_block(region, &dead);
+        }
+
+        if dialects::results(&scope[at]).is_empty() {
+            // `for (int i = op->getNumOperands() - 1; i >= 0; i--)` (`:379-393`) — reverse, because
+            // erasing renumbers what follows.
+            if let Some(operands) = yield_operands_mut(&mut scope[at]) {
+                for i in (0..operands.len()).rev() {
+                    if parent_dead.get(i) == Some(&true) {
+                        operands.remove(i);
+                    }
+                }
+            }
+            return;
+        }
+
+        if !may_have_side_effects(&scope[at]) {
+            let results = dialects::results(&scope[at]);
+            let may_be_deleted = results
+                .iter()
+                .all(|result| self.influence_type(*result) == Influence::None);
+            let use_empty = results
+                .iter()
+                .all(|result| dialects::use_count(*result, scope) == 0);
+            if use_empty && may_be_deleted {
+                scope.remove(at);
+            }
+            return;
+        }
+        // The three `dyn_cast` arms (`:415-422`), asked before the block is borrowed to rewrite.
+        match &scope[at] {
+            Op::Sentient(sentient::Op::For { .. }) => {
+                self.update_for_operation(scope, at, &BTreeSet::new());
+            }
+            Op::Sentient(sentient::Op::If { .. }) => self.update_if_operation(scope, at),
+            Op::UniformRegions(UniformRegions::UniformizeRegions { .. }) => {
+                self.update_uniformize_regions_operation(scope, at);
+            }
+            _ => {}
+        }
+    }
+
+    /// Replaces: e558_exploreBlock
+    ///
+    /// Explores every op of the block, last to first.
+    ///
+    /// ⭐ THE REVERSE **INDEX** IS THE SEPARATE `SmallVector` (`:433-441`): the reference copies the
+    /// ops out because deleting the one it is standing on invalidates an intrusive-list iterator, and
+    /// [`Self::explore_operation`] only ever erases the op AT the index, leaving the ones below it.
+    pub(crate) fn explore_block(&self, block: &mut Vec<Op>, parent_dead: &[bool]) {
+        if block.is_empty() {
+            return;
+        }
+        for at in (0..block.len()).rev() {
+            self.explore_operation(block, at, parent_dead);
+        }
+    }
+}
 
 // crustify:todo: e596_updateProgramUnit
 //   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:451  (3 body lines, level 5)
@@ -1405,5 +1527,54 @@ mod unit_tests {
         };
         assert_eq!(results, &vec![Val(8)]);
         assert_eq!(yielded, &vec![slot(RegType::Lrf)]);
+    }
+
+    /// `%out = sentient.scalar_add %lhs, %rhs` — effect-free, so a candidate for deletion.
+    fn scalar_add(lhs: u32, rhs: u32, result: u32) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs: Val(lhs),
+            rhs: Val(rhs),
+            result: Val(result),
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    /// e557 — the loop's only carried position has no influence, so the body's `sentient.yield` loses
+    /// its operand, the add that fed it becomes unread and effect-free and goes, and the loop itself
+    /// loses the slot.
+    #[test]
+    fn exploring_a_loop_strips_the_dead_yield_operand_then_the_op_that_fed_it() {
+        let pass = EnhancedDeadVariableElimination::default();
+        let mut scope = vec![
+            constant(Val(0), 4),
+            for_op(
+                2,
+                0,
+                vec![carried(0, 3, 5)],
+                vec![scalar_add(3, 3, 4), yield_op(vec![Val(4)])],
+            ),
+        ];
+
+        pass.explore_operation(&mut scope, 1, &[]);
+
+        let Op::Sentient(sentient::Op::For { carried, body, .. }) = &scope[1] else {
+            panic!("the loop survives");
+        };
+        assert!(carried.is_empty(), "the influenceless position leaves");
+        assert_eq!(body, &vec![yield_op(Vec::new())], "the add went with it");
+    }
+
+    /// e558 — LAST TO FIRST IS THE PORT: the reader is erased before the op it read is asked whether
+    /// anything reads it, so one pass clears the whole chain. A forward walk would keep the producer.
+    #[test]
+    fn exploring_a_block_backwards_clears_a_whole_unread_chain() {
+        let pass = EnhancedDeadVariableElimination::default();
+        let mut block = vec![constant(Val(0), 4), scalar_add(0, 0, 1), nop()];
+
+        pass.explore_block(&mut block, &[]);
+
+        assert_eq!(block, vec![nop()], "only the op with effects stands");
     }
 }
