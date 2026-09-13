@@ -133,6 +133,11 @@
 
 use crate::formats::{Bits, DataFormat};
 use crate::generated::{ComputeType, StmtKind};
+use crate::schedule::ddc::fold::PadType;
+use crate::schedule::ddl::conversion::pad_type_spelling;
+use crate::schedule::dsc2::ReplicationFactor;
+use crate::schedule::l3::dsc::Buffering;
+use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
 /// AN SSA NAME AS THE TEXT SPELLS IT — the `wrd` of `%wrd`, without the sigil.
 ///
@@ -1080,9 +1085,9 @@ fn operand_list(input: &str) -> Option<(Vec<Value>, &str)> {
 /// ONE OP AS PARSED, BEFORE ITS VERIFIER HAS RUN — the only place a `computetype=` or `data_type=`
 /// is still a STRING, which is exactly what its verifier resolves.
 ///
-/// ⛔ FOUR OF THE FIVE OPS WITH `hasVerifier = 1`. `ddl.operation_bind`'s verifier
-/// (`DdlOps.cpp:178`) is entry 271 and is NOT in this batch; until it lands, an `operation_bind`
-/// passes [`Verified::of`] unchecked.
+/// ⭐ ALL FIVE OPS WITH `hasVerifier = 1` — `ddl.type` (`DdlOps.td:131`), `ddl.operation_bind`
+/// (`:215`), `ddl.force_innermost_dimensions` (`:479`), `ddl.compute` (`:624`) and
+/// `ddl.implicit_sync` (`:690`) — so [`Verified::of`] leaves nothing unchecked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unverified {
     /// `ddl.force_innermost_dimensions`.
@@ -1113,6 +1118,11 @@ pub enum Unverified {
         /// `$allocate`.
         allocate: Value,
     },
+    /// `ddl.operation_bind`.
+    OperationBind {
+        /// `opFuncName=`, as spelled.
+        op_func_name: String,
+    },
 }
 
 impl Unverified {
@@ -1138,6 +1148,9 @@ impl Unverified {
             Self::ImplicitSync { allocate } => {
                 VerifiedOp::ImplicitSync(ImplicitSync::verify(defining, allocate)?)
             }
+            Self::OperationBind { op_func_name } => {
+                VerifiedOp::OperationBind(OperationBind::verify(&op_func_name)?)
+            }
         })
     }
 }
@@ -1153,10 +1166,12 @@ pub enum VerifiedOp {
     Datatype(Datatype),
     /// `ddl.implicit_sync`.
     ImplicitSync(ImplicitSync),
+    /// `ddl.operation_bind`.
+    OperationBind(OperationBind),
 }
 
 /// A DDL MODULE WHOSE OPS HAVE ALL BEEN VERIFIED — what `verifyAfterParse=true` leaves behind, and
-/// the only thing the four ported verifiers can be reached through.
+/// the only thing the five ported verifiers can be reached through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified(Vec<VerifiedOp>);
 
@@ -1178,19 +1193,141 @@ impl Verified {
     }
 }
 
-// crustify:todo: e271_verify
-//   authority : ddc/ddl/Dialect/DdlOps.cpp:178  (7 body lines, level 1)
-//   class     : OperationBindOp
-//   original  : LogicalResult OperationBindOp::verify()
-//   extract   : crustify-ddc/cpp/ddl.cpp:790-797
-//   calls     : e021_getOpFuncName
+/// Replaces: e271_verify
+///
+/// A `ddl.operation_bind` WHOSE `opFuncName=` NAMES A RECOGNISED OP-FUNC — the one check
+/// (`DdlOps.cpp:179`), `EnumsConversion::stringToOpFuncs.count()`, which is [`OpFunc`]'s 176
+/// spellings and nothing else.
+///
+/// ⛔ CASE-SENSITIVE, unlike [`Compute::verify`]'s `.upper()`: the lookup is on the raw attribute
+/// text and `opFuncsToString` mixes cases (`"StzLatch"`, `"ScatterOpHBM"`, `"ITOF"`), so
+/// `opFuncName="stzlatch"` is rejected while `"StzLatch"` verifies.
+///
+/// ⛔⛔ ONE VENDORED TEMPLATE FAILS THIS AND THE REFERENCE AGREES: `ddl_templates/
+/// quantization_double_pad.ddl` states `opFuncName="csqint4mb"`, which no `OpFuncs` names — the
+/// 176-name map has `csqint4`, `csqint4wt` and `csqint4chil` but no `mb` form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationBind {
+    /// `opFuncName=`, resolved.
+    pub op_func: OpFunc,
+}
 
-// crustify:todo: e272_print
-//   authority : ddc/ddl/Dialect/DdlOps.cpp:305  (19 body lines, level 1)
-//   class     : AllocateOp
-//   original  : void AllocateOp::print(::mlir::OpAsmPrinter& _odsPrinter)
-//   extract   : crustify-ddc/cpp/ddl.cpp:807-826
-//   calls     : e176_getTensor
+impl OperationBind {
+    /// The verified op, or [`None`] for the "Can not find this OpFunc" arm.
+    #[must_use]
+    pub fn verify(op_func_name: &str) -> Option<Self> {
+        Some(Self {
+            op_func: OpFunc::from_spelling(op_func_name)?,
+        })
+    }
+}
+
+/// THE ATTRIBUTES OF A `ddl.allocate` — the four `DdlOps.td:453-456` declares, each already resolved
+/// to the type its consumer reads it as, because this crate keeps no strings from the DDL.
+///
+/// ⛔ `operandSegmentSizes` IS NOT ONE OF THEM: it is
+/// [`AllocateOperands::operand_segment_sizes`], and it is the single name
+/// [`AllocateOperands::print`] elides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocateAttrs {
+    /// `memory=` — the `StrAttr` `stringToSenComponents` resolves (`ddl_conversion.cpp:769`).
+    /// MANDATORY, which is why the printed dict is never empty.
+    pub memory: SenComponent,
+    /// `num_buffers=` — what `AllocateNode::numBuffers_` receives (`ddl_conversion.cpp:804`).
+    /// [`None`] where the attribute is absent and the declared default `1` stands, since the parse
+    /// materialises no default.
+    pub num_buffers: Option<Buffering>,
+    /// `padding_type=` — one style per `padding_dim`, or a single style applied to all of them.
+    pub padding_type: Option<Vec<PadType>>,
+    /// `replication=` — the repetition `getRepetitionIfExists` reads (`ddl_conversion.cpp:866`).
+    pub replication: Option<ReplicationFactor>,
+}
+
+impl AllocateAttrs {
+    /// `printOptionalAttrDict(attrs, {"operandSegmentSizes"})` — ` {`, `name = value` joined by
+    /// `", "`, `}`, in the ALPHABETICAL order a `DictionaryAttr` keeps its names in (which for these
+    /// four is also their declaration order).
+    ///
+    /// ⛔ THE "PRINT NOTHING" BRANCH IS UNREACHABLE HERE and that is a type fact, not a judgement:
+    /// `memory` is a plain `StrAttr`, so one entry always survives the elision.
+    fn print_dict(&self) -> String {
+        let mut entries = vec![format!("memory = \"{}\"", self.memory.spelling())];
+        if let Some(buffers) = self.num_buffers {
+            entries.push(format!(
+                "num_buffers = {} : si64",
+                num_buffers_literal(buffers)
+            ));
+        }
+        if let Some(styles) = &self.padding_type {
+            let list = styles
+                .iter()
+                .map(|&pad| format!("\"{}\"", pad_type_spelling(pad)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            entries.push(format!("padding_type = [{list}]"));
+        }
+        if let Some(ReplicationFactor(replication)) = self.replication {
+            entries.push(format!("replication = {replication} : si64"));
+        }
+        format!(" {{{}}}", entries.join(", "))
+    }
+}
+
+/// THE `si64` A [`Buffering`] IS WRITTEN AS — the three values `numBuffers_`'s own comment names
+/// (`dsc/dsc2.h:984`), and the `-1` `DdlOps.td:412` calls an infinite circular buffer.
+const fn num_buffers_literal(buffers: Buffering) -> i64 {
+    match buffers {
+        Buffering::None => 1,
+        Buffering::Double => 2,
+        Buffering::Streaming => -1,
+    }
+}
+
+/// `%name`, or `%name#N` for a result the base form cannot carry — `printValueID`.
+///
+/// ⛔ RESULT ZERO PRINTS BARE, so a round trip normalises `%wrd#0` to `%wrd`. MLIR keeps the `#0`
+/// when the defining op has several results, which is a fact [`Value`] does not carry and
+/// [`AllocateOperands::parse`] already discards.
+fn print_operand(value: &Value) -> String {
+    match value.result {
+        0 => format!("%{}", value.name.0),
+        result => format!("%{}#{result}", value.name.0),
+    }
+}
+
+impl AllocateOperands {
+    /// Replaces: e272_print
+    ///
+    /// THE ROUND TRIP OF [`Self::parse`] — `(` `%tensor` (`,` `[`dims`]`)? (`,` `%ext`)? `)` and then
+    /// the attr-dict with `operandSegmentSizes` elided (`DdlOps.cpp:307-321`).
+    ///
+    /// ⛔ MLIR'S SPELLING, NOT THE TEMPLATE'S: `{memory="l0",num_buffers=-1:si64}` prints back as
+    /// ` {memory = "l0", num_buffers = -1 : si64}`, because `si64` is not the `i64` whose type an
+    /// `IntegerAttr` elides, and `printOperands` separates with `", "`.
+    ///
+    /// ⛔ NO `: index` — `DdlOps.td:441` writes one in its doc example, but the custom printer never
+    /// emits a result type and `parse` never consumes one; none of the 326 vendored
+    /// `ddl.allocate`s states one.
+    #[must_use]
+    pub fn print(&self, attrs: &AllocateAttrs) -> String {
+        let mut out = format!("({}", print_operand(&self.tensor));
+        if !self.padding_dim.is_empty() {
+            let dims = self
+                .padding_dim
+                .iter()
+                .map(print_operand)
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(", [{dims}]"));
+        }
+        if let Some(external) = &self.external_allocate {
+            out.push_str(&format!(", {}", print_operand(external)));
+        }
+        out.push(')');
+        out.push_str(&attrs.print_dict());
+        out
+    }
+}
 
 #[cfg(test)]
 mod tests_e165_e170 {
@@ -1383,5 +1520,137 @@ mod tests_e165_e170 {
         assert_eq!(AllocateOperands::parse("(%t, [%a,])"), None);
         assert_eq!(AllocateOperands::parse("(%t, [%a]"), None);
         assert_eq!(AllocateOperands::parse("%t"), None);
+    }
+}
+
+#[cfg(test)]
+mod tests_e271_e272 {
+    use super::{
+        AllocateAttrs, AllocateOperands, Buffering, DdlOp, OpFunc, OperationBind, PadType,
+        ReplicationFactor, SenComponent, Unverified, Value, Verified,
+    };
+
+    /// A `ddl.allocate` in one memory and nothing else — the form 314 of the 326 vendored
+    /// `ddl.allocate`s take.
+    fn only_memory(memory: SenComponent) -> AllocateAttrs {
+        AllocateAttrs {
+            memory,
+            num_buffers: None,
+            padding_type: None,
+            replication: None,
+        }
+    }
+
+    /// ⭐ THE VENDORED SPELLINGS — `"batchmatmulint8"` (`DdlOps.td:212`) and the mixed-case
+    /// `"StzLatch"` a real template states — AND THE TEMPLATE THE REFERENCE ITSELF REJECTS.
+    #[test]
+    fn operation_bind_takes_a_spelled_op_func() {
+        assert_eq!(
+            OperationBind::verify("batchmatmulint8").map(|op| op.op_func),
+            Some(OpFunc::BatchmatmulInt8Fwd)
+        );
+        assert_eq!(
+            OperationBind::verify("StzLatch").map(|op| op.op_func),
+            Some(OpFunc::StzLatch)
+        );
+        // ⛔ CASE-SENSITIVE: `ComputeOp::verify` uppercases first, this verifier does not.
+        assert_eq!(OperationBind::verify("stzlatch"), None);
+        // ⛔⛔ AND `quantization_double_pad.ddl`'s OWN `opFuncName` NAMES NO OP-FUNC, so the
+        // reference fails that template's parse too — `csqint4` is the spelling that exists.
+        assert_eq!(OperationBind::verify("csqint4mb"), None);
+        assert_eq!(
+            OperationBind::verify("csqint4").map(|op| op.op_func),
+            Some(OpFunc::CsqInt4)
+        );
+        // ⭐ AND THE FIFTH VERIFIER NOW RUNS FROM `Verified::of`, where it used to pass through.
+        let defining: &[(Value, DdlOp)] = &[];
+        assert_eq!(
+            Verified::of(
+                defining,
+                vec![Unverified::OperationBind {
+                    op_func_name: "csqint4mb".to_owned(),
+                }],
+            ),
+            None
+        );
+    }
+
+    /// ⭐⭐ PARSE THEN PRINT EVERY VENDORED FORM — all three operand shapes and both attribute sets
+    /// beyond the bare `memory=`, each row copied from a template and compared against WRITTEN-OUT
+    /// TEXT, because a re-parse of our own output compares the port with itself.
+    #[test]
+    fn allocate_prints_every_vendored_operand_form() {
+        for (text, attrs, printed) in [
+            (
+                // `unary_parallel.ddl:111`.
+                "(%zero_const_opaque) {memory=\"sfplrf\"}",
+                only_memory(SenComponent::Sfplrf),
+                "(%zero_const_opaque) {memory = \"sfplrf\"}",
+            ),
+            (
+                // `bmm.ddl:174`, the seven-strong `external_allocate` form.
+                "(%kertensor, %kertensor_xrf_ext_allocation)",
+                only_memory(SenComponent::Ptxrf),
+                "(%kertensor, %kertensor_xrf_ext_allocation) {memory = \"ptxrf\"}",
+            ),
+            (
+                // `convolution2d.ddl:250` — the only `padding_dim` form, one style per dimension
+                // (`DdlOps.td:448`), and the streaming buffer `num_buffers=-1` names.
+                "(%inptensor, [%krdpad0, %krdpad1])",
+                AllocateAttrs {
+                    memory: SenComponent::L0,
+                    num_buffers: Some(Buffering::Streaming),
+                    padding_type: Some(vec![PadType::PaddedWZeroPad, PadType::PaddedWZeroPad]),
+                    replication: None,
+                },
+                "(%inptensor, [%krdpad0, %krdpad1]) {memory = \"l0\", num_buffers = -1 : si64, \
+                 padding_type = [\"padded_wzeropad\", \"padded_wzeropad\"]}",
+            ),
+            (
+                // `restickify_sen1p5.ddl:73`, the one `replication=` in the whole template set.
+                "(%internal_outtensor)",
+                AllocateAttrs {
+                    replication: Some(ReplicationFactor(8)),
+                    ..only_memory(SenComponent::Ptxrf)
+                },
+                "(%internal_outtensor) {memory = \"ptxrf\", replication = 8 : si64}",
+            ),
+        ] {
+            let (parsed, _) = AllocateOperands::parse(text).expect(text);
+            assert_eq!(parsed.print(&attrs), printed, "{text}");
+        }
+    }
+
+    /// ⛔ THE THREE THINGS A ROUND TRIP DOES NOT RETURN UNCHANGED, each one the printer's own rule.
+    #[test]
+    fn allocate_printing_normalises_what_the_templates_spell_loosely() {
+        // ⛔ AN EMPTY `[]` VANISHES: `getPaddingDim().empty()` skips the brackets, so
+        // `(%t, [], %ext)` prints as `(%t, %ext)` — the SAME operandSegmentSizes, reached on
+        // re-parse through `commaNeedsFurtherParsing` instead.
+        let (parsed, _) =
+            AllocateOperands::parse("(%scale_const, [], %external_allocate)").expect("empty list");
+        assert_eq!(parsed.operand_segment_sizes(), [1, 0, 1]);
+        assert_eq!(
+            parsed.print(&only_memory(SenComponent::Sfplrf)),
+            "(%scale_const, %external_allocate) {memory = \"sfplrf\"}"
+        );
+        // ⛔ RESULT ZERO PRINTS BARE, and a non-zero index survives.
+        let bare = |text: &str| {
+            AllocateOperands::parse(text)
+                .expect(text)
+                .0
+                .print(&only_memory(SenComponent::Pelrf))
+        };
+        assert_eq!(bare("(%wrd#0)"), "(%wrd) {memory = \"pelrf\"}");
+        assert_eq!(bare("(%wrd#1)"), "(%wrd#1) {memory = \"pelrf\"}");
+        // ⛔ AND `si64` CARRIES ITS TYPE where an `i64` would not — `{num_buffers=1}` is not what a
+        // round trip gives back.
+        assert_eq!(
+            parsed.print(&AllocateAttrs {
+                num_buffers: Some(Buffering::None),
+                ..only_memory(SenComponent::Lx)
+            }),
+            "(%scale_const, %external_allocate) {memory = \"lx\", num_buffers = 1 : si64}"
+        );
     }
 }
