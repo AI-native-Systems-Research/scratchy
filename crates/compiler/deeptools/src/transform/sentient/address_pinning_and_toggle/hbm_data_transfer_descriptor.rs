@@ -76,11 +76,94 @@
 //! |---|---|---|---|---|
 //! | `e620_HBMDataTransferDescriptor` | 620 | 6 | 34 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2583` |
 
+use super::abstract_data_transfer_updater::{first_user, uses_of};
+use super::data_transfer_descriptor_container::{is_transfer, mutable_addr_end};
+use super::looping_chain_mutable_addr_descriptor::{
+    increment_val, mutable_addr_of, mutable_result,
+};
+use super::{BaseAddrList, DataTransferDescriptor, DescriptorMemoryUnit, immutable_addr_of, op_at};
+use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
+use crate::islands::sentient::dialects::{Definitions, Op};
+use crate::transform::sentient::analyses::{ExpressionEvaluator, RegionSite};
+use crate::units::DfirUnit;
 
-// crustify:todo: e620_HBMDataTransferDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2583  (34 body lines, level 6)
-//   original  : HBMDataTransferDescriptor::HBMDataTransferDescriptor( SenComponents comp, Operation &op, ExpressionEvaluator &evaluator, bool is_base_addr_mutable, int increment_via_burst, Operation *region_op, int region_num) : DataTransferDescriptor(comp, op, evaluator, region_op, region_num, is_base_addr_mutable
-//   calls     : e262_isLoopingChainMutableAddr, e278_isValid, e593_initializeDescriptor
+/// Replaces: e620_HBMDataTransferDescriptor
+///
+/// The HBM descriptor of one transfer: its base address is whichever half of the HBM pair
+/// `is_base_addr_mutable` names, and a mutable-addressed head then SUMS the increments of the
+/// non-looping chain it starts into [`ChainIncrement`].
+///
+/// ⛔ THE RESULT INDEX IS COMPUTED ONCE, FROM `op_`, AND REUSED FOR EVERY OP IN THE CHAIN (`:2639`,
+/// `:2643`), so a chain that changes which end carries the HBM address keeps reading the first op's.
+/// ⛔ THE WALK IS SKIPPED ENTIRELY unless the address is mutable, the descriptor valid and its pattern
+/// NOT already a looping chain (`:2637-2638`).
+/// ⭐ `comp` IS DROPPED, not stored: the base constructor takes it and keeps nothing (`:637-644`).
+pub fn new_hbm(
+    op: OpId,
+    body: &[Op],
+    defs: Definitions<'_>,
+    evaluator: &mut impl ExpressionEvaluator,
+    is_base_addr_mutable: bool,
+    increment_via_burst: BurstIncrement,
+    region: RegionSite,
+) -> DataTransferDescriptor {
+    let mut dtd = DataTransferDescriptor {
+        op,
+        pattern_desc: None,
+        base_addrs: BaseAddrList::new(),
+        region,
+        memory_unit: DescriptorMemoryUnit::Hbm {
+            total_chain_increment: ChainIncrement(0),
+            increment_via_burst,
+        },
+        base_addr: None,
+        is_base_addr_mutable,
+    };
+    let Some(transfer) = op_at(&dtd.op, body) else {
+        todo!("HBMDataTransferDescriptor: no op at {:?} (:2586)", dtd.op)
+    };
+    let end = mutable_addr_end(transfer, DfirUnit::Hbm, defs);
+    dtd.base_addr = Some(if is_base_addr_mutable {
+        mutable_addr_of(transfer, end)
+    } else {
+        immutable_addr_of(transfer, end)
+    });
+    dtd.initialize_descriptor(body, defs, evaluator);
+    if dtd.is_looping_chain_mutable_addr() || !dtd.is_valid() || !is_base_addr_mutable {
+        return dtd;
+    }
+
+    let mut total = 0i64;
+    let mut cur_op = transfer;
+    loop {
+        let Some(cur_result) = mutable_result(cur_op, end) else {
+            todo!(
+                "HBMDataTransferDescriptor: cur_op->getResult(mutable_addr_result_idx_) is out of \
+                 range on {cur_op:?}, which binds no {end:?} address result (:2643)"
+            )
+        };
+        let uses = uses_of(body, &[cur_result]);
+        let Some(user) = first_user(body, cur_result).filter(|user| is_transfer(user)) else {
+            break;
+        };
+        if uses != 1 {
+            panic!(
+                "DT_CHECK_MSG(cur_result.hasOneUse(), \"Expect one use in the chain\") — {uses} \
+                 uses of {cur_result:?} (:2650)"
+            )
+        }
+        total += increment_val(cur_op, end, defs);
+        cur_op = user;
+    }
+    if let DescriptorMemoryUnit::Hbm {
+        total_chain_increment,
+        ..
+    } = &mut dtd.memory_unit
+    {
+        *total_chain_increment = ChainIncrement(total);
+    }
+    dtd
+}
 
 /// `total_chain_increment_` — the total mutable-address increment of a NON-LOOPING chain this
 /// transfer heads (`:861`, `using AddrTy = int64_t` at `:98`), zero when it heads none.
@@ -95,3 +178,139 @@ pub struct ChainIncrement(pub i64);
 /// pattern's own maximum (`:863`), zero for a transfer that does not burst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub struct BurstIncrement(pub i32);
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
+    use crate::islands::sentient::dialects::{Val, dataflow, sentient};
+    use crate::transform::sentient::address_pinning_and_toggle::PatternDescriptor;
+    use crate::transform::sentient::analyses::{
+        EvaluatedValue, Evaluation, OffsetSites, RegionSite,
+    };
+    use crate::units::Residency;
+
+    /// The arena entry stated as the value's own number — `initializeDescriptor` only ever KEEPS the
+    /// handle it is given, and the chain sum is read off the increment CONSTANTS instead.
+    struct StatedEvaluator;
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("e620 keeps handles, never a decoded evaluation")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("e620 never sums evaluations")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e620 builds nothing")
+        }
+
+        fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+            EvaluatedValue(value.0)
+        }
+    }
+
+    fn get_unit(result: Val, unit: DfirUnit) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result,
+            residency: Residency::Global,
+            unit,
+            num_folds: None,
+            reg_locale: None,
+        })
+    }
+
+    fn scalar_const(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// One link of an HBM-headed chain: it reads `src_mutable_addr` and binds the next link's.
+    fn link(src_mutable_addr: Val, src_inc: Val, results: (Val, Val)) -> Op {
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src: Val(1),
+            dst: Val(2),
+            src_mutable_addr,
+            src_immutable_addr: Val(20),
+            src_inc,
+            dst_mutable_addr: Val(21),
+            dst_immutable_addr: Val(22),
+            dst_inc: Val(23),
+            multicast_info: None,
+            results,
+            extent: Extent::of(Elements(8), Bits(16)),
+            stride: 1,
+            rotate_val: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            src_reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dst_reg: Reg {
+                locale: RegType::Lbr,
+                index: None,
+            },
+            dir: None,
+            is_ibr_write: false,
+            dbg_name: None,
+        })
+    }
+
+    /// 620/656 — the mutable-addressed head sums the increments of the chain it starts, and the LAST
+    /// link's increment is NOT among them: the walk stops at the link whose address result nothing
+    /// reads, having already counted every op that handed its address on.
+    #[test]
+    fn e620_sums_the_increments_of_every_link_that_hands_its_address_on() {
+        let body = vec![
+            get_unit(Val(1), DfirUnit::Hbm),
+            get_unit(Val(2), DfirUnit::Lx),
+            scalar_const(Val(3), 4096),
+            scalar_const(Val(4), 64),
+            scalar_const(Val(5), 128),
+            scalar_const(Val(6), 256),
+            link(Val(3), Val(4), (Val(10), Val(11))),
+            link(Val(10), Val(5), (Val(12), Val(13))),
+            link(Val(12), Val(6), (Val(14), Val(15))),
+        ];
+        let regions: [&[Op]; 1] = [body.as_slice()];
+        let dtd = new_hbm(
+            OpId::at(&[6]),
+            &body,
+            Definitions::from_innermost(&regions),
+            &mut StatedEvaluator,
+            true,
+            BurstIncrement(8),
+            RegionSite::default(),
+        );
+
+        assert_eq!(dtd.base_addr, Some(Val(3)));
+        assert!(matches!(
+            dtd.pattern_desc,
+            Some(PatternDescriptor::SimpleConstant(_))
+        ));
+        // `64 + 128`, and not the trailing `256`.
+        assert_eq!(
+            dtd.memory_unit,
+            DescriptorMemoryUnit::Hbm {
+                total_chain_increment: ChainIncrement(192),
+                increment_via_burst: BurstIncrement(8),
+            }
+        );
+    }
+}

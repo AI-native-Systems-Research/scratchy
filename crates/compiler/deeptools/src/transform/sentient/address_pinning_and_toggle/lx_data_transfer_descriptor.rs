@@ -76,9 +76,236 @@
 //! |---|---|---|---|---|
 //! | `e619_LXDataTransferDescriptor` | 619 | 6 | 23 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2553` |
 
+use super::data_transfer_descriptor_container::mutable_addr_end;
+use super::{
+    BaseAddrList, DataTransferDescriptor, DescriptorMemoryUnit, immutable_addr_of, op_at,
+    unit_type_of,
+};
+use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
+use crate::islands::sentient::dialects::{Definitions, Op, sentient};
+use crate::transform::sentient::analyses::{ExpressionEvaluator, RegionSite};
+use crate::units::DfirUnit;
 
-// crustify:todo: e619_LXDataTransferDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2553  (23 body lines, level 6)
-//   original  : LXDataTransferDescriptor::LXDataTransferDescriptor( SenComponents comp, Operation &op, ExpressionEvaluator &evaluator, Operation *region_op, int region_num) : DataTransferDescriptor(comp, op, evaluator, region_op, region_num)
-//   calls     : e593_initializeDescriptor
+/// Replaces: e619_LXDataTransferDescriptor
+///
+/// The LX descriptor of one transfer: `comp` is checked against which way the transfer goes, an IBR
+/// write for gather is left invalid, and every other transfer recognises its LX IMMUTABLE address.
+///
+/// ⛔ THE EARLY RETURN IS A DESCRIPTOR WITH NO ADDRESS AND NO PATTERN, deliberately: for an IBR write
+/// for gather neither end is LX, so `getMutableAndImmutableAddr(op, LX)` would answer
+/// `{nullptr, nullptr}` and abort on the `DT_CHECK_MSG` below — [`DataTransferDescriptor::is_valid`]
+/// answers `false` on what comes back instead.
+/// ⭐ `comp` IS NOT A FIELD: the base constructor drops it (`:637-644`) and these two checks, which
+/// only ever see the `L3SU`/`L3LU` halves, are its only readers.
+pub fn new_lx(
+    comp: DfirUnit,
+    op: OpId,
+    body: &[Op],
+    defs: Definitions<'_>,
+    evaluator: &mut impl ExpressionEvaluator,
+    region: RegionSite,
+) -> DataTransferDescriptor {
+    let mut dtd = DataTransferDescriptor {
+        op,
+        pattern_desc: None,
+        base_addrs: BaseAddrList::new(),
+        region,
+        memory_unit: DescriptorMemoryUnit::Lx,
+        base_addr: None,
+        is_base_addr_mutable: false,
+    };
+    let Some(transfer) = op_at(&dtd.op, body) else {
+        todo!("LXDataTransferDescriptor: no op at {:?} (:2556)", dtd.op)
+    };
+    match transfer {
+        Op::Sentient(sentient::Op::LoadAndSend { .. }) => {
+            if comp != DfirUnit::L3su {
+                panic!(
+                    "DT_CHECK_MSG(comp == L3SU, \"load_and_send unexpected in this unit\") — \
+                     {comp:?} (:2559-2560)"
+                )
+            }
+        }
+        Op::Sentient(sentient::Op::ReceiveAndStore { .. }) => {
+            if comp != DfirUnit::L3lu {
+                panic!(
+                    "DT_CHECK_MSG(comp == L3LU, \"receive_and_store unexpected in this unit\") — \
+                     {comp:?} (:2561-2564)"
+                )
+            }
+        }
+        Op::Sentient(sentient::Op::LoadAndStore { .. }) => {
+            if is_ibr_write_for_gather(transfer, defs) {
+                // `LLVM_DEBUG(.. "Invalid descriptor created for IBR-write for gather"); return;`
+                return dtd;
+            }
+        }
+        _ => todo!(
+            "LXDataTransferDescriptor: cast<sentient::LoadAndStoreOp>({transfer:?}), which the \
+             three ops collectDataTransfers admits are the only ones to survive (:2565)"
+        ),
+    }
+    let end = mutable_addr_end(transfer, DfirUnit::Lx, defs);
+    dtd.base_addr = Some(immutable_addr_of(transfer, end));
+    dtd.initialize_descriptor(body, defs, evaluator);
+    dtd
+}
 
+/// `dcc::utils::L3GatherScatterChecker(ls_op).isIBRWriteForGather()` (`Analyses/Utils.hpp:195-197`,
+/// `Analyses/Utils.cpp:608-632`) — ⭐ `is_ibr_write_ && is_ibr_write_for_gather_` REDUCES TO THE
+/// SECOND, because `is_ibr_write_` is that flag OR the attribute (`:621-624`).
+fn is_ibr_write_for_gather(op: &Op, defs: Definitions<'_>) -> bool {
+    let Op::Sentient(sentient::Op::LoadAndStore { src, dst, .. }) = op else {
+        return false;
+    };
+    unit_type_of(*src, defs) == Some(DfirUnit::Hbm)
+        && unit_type_of(*dst, defs) == Some(DfirUnit::L3Ibr)
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
+    use crate::islands::sentient::dialects::{Val, dataflow};
+    use crate::transform::sentient::address_pinning_and_toggle::PatternDescriptor;
+    use crate::transform::sentient::analyses::{
+        EvaluatedValue, Evaluation, OffsetSites, RegionSite,
+    };
+    use crate::units::Residency;
+
+    /// The arena entry stated as the value's own number — `initializeDescriptor` only ever KEEPS the
+    /// handle it is given, so nothing here needs to decode one.
+    struct StatedEvaluator;
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("e619 keeps handles, never a decoded evaluation")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("e619 never sums")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e619 builds nothing")
+        }
+
+        fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+            EvaluatedValue(value.0)
+        }
+    }
+
+    fn get_unit(result: Val, unit: DfirUnit) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result,
+            residency: Residency::Global,
+            unit,
+            num_folds: None,
+            reg_locale: None,
+        })
+    }
+
+    fn scalar_const(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    fn load_and_store(src: Val, dst: Val, dst_immutable_addr: Val) -> Op {
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src,
+            dst,
+            src_mutable_addr: Val(30),
+            src_immutable_addr: Val(31),
+            src_inc: Val(32),
+            dst_mutable_addr: Val(33),
+            dst_immutable_addr,
+            dst_inc: Val(34),
+            multicast_info: None,
+            results: (Val(40), Val(41)),
+            extent: Extent::of(Elements(8), Bits(16)),
+            stride: 1,
+            rotate_val: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            src_reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dst_reg: Reg {
+                locale: RegType::Lbr,
+                index: None,
+            },
+            dir: None,
+            is_ibr_write: false,
+            dbg_name: None,
+        })
+    }
+
+    /// 619/656 — an HBM-to-LX store recognises the LX end's IMMUTABLE address, and the constant it
+    /// finds there becomes a simple-constant pattern over that one base address.
+    #[test]
+    fn e619_takes_the_lx_ends_immutable_address_as_the_base() {
+        let body = vec![
+            get_unit(Val(1), DfirUnit::Hbm),
+            get_unit(Val(2), DfirUnit::Lx),
+            scalar_const(Val(3), 4096),
+            load_and_store(Val(1), Val(2), Val(3)),
+        ];
+        let regions: [&[Op]; 1] = [body.as_slice()];
+        let dtd = new_lx(
+            DfirUnit::L3lu,
+            OpId::at(&[3]),
+            &body,
+            Definitions::from_innermost(&regions),
+            &mut StatedEvaluator,
+            RegionSite::default(),
+        );
+
+        assert_eq!(dtd.base_addr, Some(Val(3)));
+        assert_eq!(dtd.base_addrs, vec![EvaluatedValue(3)]);
+        assert!(matches!(
+            dtd.pattern_desc,
+            Some(PatternDescriptor::SimpleConstant(_))
+        ));
+        assert!(dtd.is_valid());
+    }
+
+    /// 619/656, the negative — an HBM-to-L3IBR store has NEITHER end on the LX, so the descriptor
+    /// comes back with no address and no pattern rather than reaching a `getMutableAndImmutableAddr`
+    /// that would abort.
+    #[test]
+    fn e619_leaves_an_ibr_write_for_gather_invalid() {
+        let body = vec![
+            get_unit(Val(1), DfirUnit::Hbm),
+            get_unit(Val(2), DfirUnit::L3Ibr),
+            scalar_const(Val(3), 4096),
+            load_and_store(Val(1), Val(2), Val(3)),
+        ];
+        let regions: [&[Op]; 1] = [body.as_slice()];
+        let dtd = new_lx(
+            DfirUnit::L3lu,
+            OpId::at(&[3]),
+            &body,
+            Definitions::from_innermost(&regions),
+            &mut StatedEvaluator,
+            RegionSite::default(),
+        );
+
+        assert_eq!(dtd.base_addr, None);
+        assert!(dtd.pattern_desc.is_none());
+        assert!(!dtd.is_valid());
+    }
+}

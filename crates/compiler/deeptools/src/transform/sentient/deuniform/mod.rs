@@ -84,19 +84,23 @@
 //! | `e595_deuniform` | 595 | 5 | 30 | `dcc/src/Transform/Sentient/Deuniform.cpp:448` |
 //! | `e621_runOnOperation` | 621 | 6 | 42 | `dcc/src/Transform/Sentient/Deuniform.cpp:482` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
-// file's own tests until `e621_runOnOperation` (level 6) lands and something calls it. CI runs clippy
-// with `-D warnings`, so without this the first ported leaf of a 9-unit module fails the gate.
-// ⭐ REMOVE THIS WITH e621: at that point an unused item here is a real defect again.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE, so every item below — `e621_runOnOperation` now
+// included — is reachable only from this file's own tests. CI runs clippy with `-D warnings`, so
+// without this a 9-unit module with no caller fails the gate.
+// ⭐ REMOVE THIS WHEN A DRIVER CALLS [`run_on_operation`]: e621 is the pass ENTRY, and what would
+// call it is `createDeuniformPass` — one of the campaign's 97 EXCLUDED pass factories, so no unit of
+// this campaign will ever be that caller.
 #![allow(dead_code)]
 
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::{Units, ValueMapping, Values};
-use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{
     self as dialects, Definitions, LocalRegion, Op, UniformRegions, Val, uniform,
 };
+use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+use crate::model::Model;
 use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 /// Replaces: e039_existsInCollection
 ///
@@ -659,16 +663,137 @@ pub fn deuniform_collections<A: Arch>(
     (deuniformed, None)
 }
 
-// crustify:todo: e621_runOnOperation
-//   authority : dcc/src/Transform/Sentient/Deuniform.cpp:482  (42 body lines, level 6)
-//   original  : void DeuniformPass::runOnOperation()
-//   calls     : e039_existsInCollection, e252_size, e297_simplifyProgramUnitOp, e556_deuniform, e595_deuniform
+/// `enum Deuniformaion { Partial, Full }` (`:35`) — how far `-dcc-deuniformation-size` splits a unit:
+/// `Full` gives every unit its own program unit, `Partial` only the units some local region singles out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deuniformaion {
+    /// `partial` — "deuniform partially".
+    Partial,
+    /// `full` — "deuniform fully".
+    Full,
+}
+
+/// `-dcc-deuniformation-size` (`:36-42`) — `cl::init(Deuniformaion::Partial)`.
+const DEUNIFORMAION_SIZE: Deuniformaion = Deuniformaion::Partial;
+
+/// Replaces: e621_runOnOperation
+///
+/// THE PASS ENTRY (`:482-522`): every program unit is REPLACED by the set of deuniformed units
+/// [`deuniform_collections`] splits it into, each simplified, and the original erased.
+///
+/// ⛔ THE ORIGINAL UNIT IS ERASED UNCONDITIONALLY (`:519-521`), so on a duplicate — where e595 answers
+/// an EMPTY list — the reference erases a unit and puts nothing back. It has called
+/// `signalPassFailure()` by then and the module is discarded, so this port reports the duplicate and
+/// leaves `program` alone rather than committing a half-erased program nothing may read.
+/// ⛔ `prog_unit_args` IS THE DROPPED MECHANISM, one per unit of `program.units` in order: no
+/// [`ProgramUnit`] carries its body's argument — see [`simplify_program_unit_op`].
+/// ⭐ EACH REBUILT UNIT IS SIMPLIFIED WITH THE ARGUMENT ITS OWN CLONE BOUND, not the original's.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    prog_unit_args: &[Val],
+    values: &mut Values,
+) -> Option<DuplicateInUnitCollections> {
+    let enclosing: [&[Op]; 1] = [program.preamble.as_slice()];
+    let mut rebuilt: Vec<ProgramUnit<A>> = Vec::new();
+    for (index, prog_unit) in program.units.iter().enumerate() {
+        let Some(prog_unit_arg) = prog_unit_args.get(index).copied() else {
+            todo!(
+                "DeuniformPass::runOnOperation: no program-unit argument for unit {index}, which \
+                 `prog_unit_op.getBody()->getArgument(0)` is (:495)"
+            )
+        };
+        let mut new_units: Vec<Vec<Val>> = Vec::new();
+        match DEUNIFORMAION_SIZE {
+            // `for (auto unit : prog_unit_op.getUnits()) new_units.push_back({unit_op});` (`:489-494`)
+            // — `DT_CHECK(unit_op)` is [`Units`], which cannot hold a value no `get_unit` binds.
+            Deuniformaion::Full => {
+                new_units.extend(prog_unit.on.vals().into_iter().map(|unit| vec![unit]));
+            }
+            Deuniformaion::Partial => {
+                let mut scope: Vec<&[Op]> = vec![prog_unit.body.as_slice()];
+                scope.extend_from_slice(&enclosing);
+                let defs = Definitions::from_innermost(&scope);
+                collect_units_of_local_regions(&prog_unit.body, defs, &mut new_units);
+            }
+        }
+        let (deuniformed, duplicate) = deuniform_collections(
+            prog_unit,
+            prog_unit_arg,
+            &mut new_units,
+            &enclosing,
+            values,
+        );
+        if let Some(duplicate) = duplicate {
+            return Some(duplicate);
+        }
+        for (mut new_prog_unit, new_arg) in deuniformed {
+            let units = new_prog_unit.on.vals();
+            simplify_program_unit_op(&mut new_prog_unit.body, &units, new_arg, &enclosing);
+            rebuilt.push(new_prog_unit);
+        }
+    }
+    let mut rebuilt = rebuilt.into_iter();
+    // UNREACHABLE: [`ProgramUnits`] holds at least one unit and e595 answers at least one rebuilt unit
+    // for each — the leftover collection, when no region collection claimed a unit.
+    if let Some(head) = rebuilt.next() {
+        program.units = ProgramUnits::of(head, rebuilt.collect());
+    }
+    None
+}
+
+/// The reference's inner `prog_unit_op.walk` (`:496-513`): every `uniform.uniformize_regions` and
+/// `uniform.equalize_pattern` under this unit contributes, per region, the units of that region NO
+/// EARLIER REGION HAS ALREADY CLAIMED.
+///
+/// ⛔ REGIONS FIRST, then the op: `Operation::walk` defaults to `WalkOrder::PostOrder`, and which
+/// region claims a shared unit first is what this whole list means.
+/// ⛔ A UNIT NAMED TWICE INSIDE ONE REGION IS PUSHED TWICE — `existsInCollection` reads `new_units`
+/// and never the list being built (`:509`) — which is exactly the duplicate e595 then reports.
+fn collect_units_of_local_regions(
+    scope: &[Op],
+    defs: Definitions<'_>,
+    new_units: &mut Vec<Vec<Val>>,
+) {
+    for op in scope {
+        for region in dialects::regions_ref(op) {
+            collect_units_of_local_regions(region, defs, new_units);
+        }
+        // ⛔ BOTH RUNGS COUNT: a `uniform.uniformize_regions` whose regions have reached this rung is
+        // [`Op::UniformRegions`], and one whose regions have not is [`Op::Uniform`] — one C++ op class.
+        let regions: Vec<&[Val]> = match op {
+            Op::UniformRegions(regions) => {
+                regions.regions().iter().map(|r| r.units.as_slice()).collect()
+            }
+            Op::Uniform(
+                uniform::Op::UniformizeRegions { regions, .. }
+                | uniform::Op::EqualizePattern { regions },
+            ) => regions.iter().map(|r| r.units.as_slice()).collect(),
+            // Nothing else is one of the reference's two op classes.
+            _ => continue,
+        };
+        for units in regions {
+            // `getUnitsOfRegion(op, region_idx)` then `expandAllGroupsToUnits(units_of_region)`, on a
+            // COPY: the op's own `$units` is not rewritten here (`:500-502`).
+            let mut units_of_region = units.to_vec();
+            dialects::expand_all_groups_to_units(&mut units_of_region, defs);
+            let unit_op_of_region: Vec<Val> = units_of_region
+                .into_iter()
+                .filter(|unit| !exists_in_collection(*unit, new_units))
+                .collect();
+            if !unit_op_of_region.is_empty() {
+                new_units.push(unit_op_of_region);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::dialects::dataflow;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName};
     use crate::islands::sentient::dialects::sentient::{Reg, RegType};
     use crate::islands::sentient::dialects::{LocalRegion, UniformRegions, sentient};
     use crate::units::{DfirUnit, Residency};
@@ -1149,5 +1274,97 @@ mod unit_tests {
         assert_eq!(duplicate, Some(DuplicateInUnitCollections { unit: Val(2) }));
         // ⛔ THE LIST IS NOT TOUCHED on the failure path — the leftover append is below the `return`.
         assert_eq!(collections, vec![vec![Val(1), Val(2)], vec![Val(2)]]);
+    }
+
+    /// A model and a rung, so a program is typed; nothing this pass reads is on either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e621 — the one three-unit program unit is REPLACED by two: the unit the local region singles
+    /// out and the two units nobody claimed. The region is spliced into the first and deleted from the
+    /// second, and each rebuilt body reads THE ARGUMENT ITS OWN CLONE BOUND — never `%9`, and never
+    /// its sibling's.
+    #[test]
+    fn e621_replaces_the_program_unit_by_the_collections_its_local_regions_name() {
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: vec![get_unit(1), get_unit(2), get_unit(3)],
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: three_units().on,
+                    precision: None,
+                    body: vec![
+                        copy(50, 9),
+                        Op::UniformRegions(UniformRegions::UniformizeRegions {
+                            regions: vec![region(
+                                10,
+                                &[2],
+                                vec![
+                                    copy(20, 10),
+                                    Op::Uniform(uniform::Op::Yield {
+                                        operands: vec![Val(20)],
+                                    }),
+                                ],
+                            )],
+                            results: vec![Val(30)],
+                            yielded: Vec::new(),
+                        }),
+                        copy(31, 30),
+                    ],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+        // Past every name the fixture writes, so a minted clone cannot collide with one.
+        while values.issued() <= 50 {
+            values.mint();
+        }
+
+        let duplicate = run_on_operation(&mut program, &[Val(9)], &mut values);
+
+        assert_eq!(duplicate, None);
+        let rebuilt: Vec<&ProgramUnit<Dd2>> = program.units.iter().collect();
+        assert_eq!(rebuilt.len(), 2);
+        assert_eq!(rebuilt[0].on.vals(), vec![Val(2)]);
+        assert_eq!(rebuilt[1].on.vals(), vec![Val(1), Val(3)]);
+
+        // The region ran exactly this unit's units, so e297 spliced its body in: `%20` reads the
+        // unit's argument and `%31` the value the region yielded.
+        let first = copies(&rebuilt[0].body);
+        assert_eq!(first.len(), 3);
+        let arg = first[0].1;
+        assert_ne!(arg, 9, "the clone's own argument, not the original's");
+        assert_eq!(first[1].1, arg);
+        assert_eq!(first[2].1, first[1].0);
+
+        // The region said nothing about units 1 and 3, so it is gone from the second unit — which
+        // was simplified with ITS argument.
+        let second = copies(&rebuilt[1].body);
+        assert_eq!(second.len(), 2);
+        assert_ne!(second[0].1, arg);
+        assert_ne!(second[0].1, 9);
     }
 }

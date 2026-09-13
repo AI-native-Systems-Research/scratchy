@@ -78,21 +78,18 @@
 //! | `e615_updateImmutableAddr` | 615 | 6 | 20 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2043` |
 //! | `e616_updateConstantMutableAddr` | 616 | 6 | 21 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2088` |
 
-
-// crustify:todo: e615_updateImmutableAddr
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2043  (20 body lines, level 6)
-//   original  : const EvaluatedValue & ConditionalConstDataTransferUpdater::updateImmutableAddr()
-//   calls     : e009_createOffsetValue, e265_getConditionalConstantDescriptor, e266_getConditionalConstantDescriptor, e278_isValid, e399_getMin, e400_getMax, e403_getMin, e404_getMax, e405_getMin, e406_getMax, e409_getMin, e410_getMax, e412_getMin, e413_getMax …
-
-// crustify:todo: e616_updateConstantMutableAddr
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2088  (21 body lines, level 6)
-//   original  : void ConditionalConstDataTransferUpdater::updateConstantMutableAddr( const EvaluatedValue &new_immut_addr_ev)
-//   calls     : e011_getOffset, e012_getOffset, e013_getOffset, e265_getConditionalConstantDescriptor, e266_getConditionalConstantDescriptor, e277_updateVariableOffsetCalculation, e400_getMax, e404_getMax, e406_getMax, e410_getMax, e413_getMax, e418_getOffset, e548_getMax, e588_getMax …
-
+use super::abstract_data_transfer_updater::{insert_before, op_at_mut, scalar_add};
+use super::looping_chain_mutable_addr_descriptor::{TransferEnd, mutable_addr_of};
+use crate::formats::Bits;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::{Definitions, Op, Val, regions_mut, sentient};
-use crate::transform::sentient::address_pinning_and_toggle::ConditionalConstDataTransferUpdater;
-use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator, OffsetSites};
+use crate::islands::sentient::dialects::{self, Definitions, Op, Val, regions_mut, sentient};
+use crate::transform::sentient::address_pinning_and_toggle::{
+    ConditionalConstDataTransferUpdater, ConditionalConstResult, DataTransferDescriptor,
+    YieldedIndex, create_offset_value, immutable_addr_mut, mutable_addr_mut, op_at,
+};
+use crate::transform::sentient::analyses::{
+    EvaluatedValue, ExpressionEvaluator, OffsetSites, PinningSchemeManager,
+};
 use crate::transform::sentient::utils::{ConstKind, is_constant};
 
 /// ONE `applyToAllYields` CALLBACK INVOCATION, RECORDED RATHER THAN APPLIED — `(terminator, index)`
@@ -114,6 +111,115 @@ struct YieldSite {
 }
 
 impl ConditionalConstDataTransferUpdater {
+    /// Replaces: e615_updateImmutableAddr
+    ///
+    /// Pins the transfer's immutable address between the LOWEST and HIGHEST constant the conditional
+    /// can yield — "pretend we have a toggle situation between those two values" (`:2044-2049`) — and
+    /// records which of the `sentient.if`'s results that operand was before replacing it.
+    ///
+    /// ⛔ THE RECORDED RESULT IS THE PRE-PINNING OPERAND: `res_index_` is set from
+    /// `immutable_addr_[0]` (`:2053`) and the assignment below then replaces it, so
+    /// [`Self::update_variable_offset_calculation`] and `getOffset` still name the conditional.
+    /// ⭐ `element_size` IS IN BITS and `ty` is `mutable_addr_[0].get().getType()`, as for e420.
+    pub fn update_immutable_addr(
+        &mut self,
+        dtd: &DataTransferDescriptor,
+        op: &mut Op,
+        end: TransferEnd,
+        ty: ScalarTy,
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+        ps_manager: &impl PinningSchemeManager,
+        element_size: Bits,
+    ) -> EvaluatedValue {
+        let cc = dtd.conditional_constant_descriptor();
+        let (Some(min), Some(max)) = (cc.min(evaluator), cc.max(evaluator)) else {
+            panic!(
+                "DT_CHECK_MSG(cc.isValid(), \"descriptor may be corrupt\") (`:2051`) — the \
+                 conditional yielded no constants"
+            )
+        };
+        let immutable_addr = *immutable_addr_mut(op, end);
+        let Some(index) = index_of_operation_results(immutable_addr, defs) else {
+            todo!(
+                "updateImmutableAddr: getIndexOfOperationResults({immutable_addr:?}) is the -1 of a \
+                 block argument, or its llvm_unreachable (dcc/src/Utils/Utils.cpp:139-153)"
+            )
+        };
+        self.if_result = ConditionalConstResult {
+            index: YieldedIndex(index),
+            val: immutable_addr,
+        };
+        let new_immut_addr_ev =
+            ps_manager.find_closest_pinned_addr(min, max, dtd.region, element_size);
+        *immutable_addr_mut(op, end) = create_offset_value(new_immut_addr_ev, ty);
+        new_immut_addr_ev
+    }
+
+    /// Replaces: e616_updateConstantMutableAddr
+    ///
+    /// Re-bases the yielded constants first, then adds the conditional's own selected result to the
+    /// transfer's constant mutable address with a fresh `sentient.scalar_add` ahead of the memory op
+    /// (`:2089-2110`).
+    ///
+    /// ⛔ THE OVERFLOW TEST USES `cc.getMax()` AND NOT THE PINNED ADDRESS'S OWN RANGE: the widest
+    /// mutable offset this transfer can reach is `max + const_mutable_addr - new_immut_addr_ev`, and
+    /// an LAR/EAR that cannot hold it is the abort (`:2103-2104`).
+    /// ⛔ THE OPERAND IS ASSIGNED BEFORE THE INSERT, for e592's reason: the insert moves `dtd.op`.
+    pub fn update_constant_mutable_addr<E: ExpressionEvaluator>(
+        self,
+        dtd: &DataTransferDescriptor,
+        end: TransferEnd,
+        ty: ScalarTy,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        element_size: Bits,
+        new_immut_addr_ev: EvaluatedValue,
+        sites: &mut OffsetSites<'_>,
+        walked: &mut Vec<Op>,
+    ) {
+        self.update_variable_offset_calculation(new_immut_addr_ev, ty, evaluator, sites, walked);
+
+        let Some(memory_op) = op_at(&dtd.op, walked) else {
+            todo!(
+                "updateConstantMutableAddr: `dtd_.getOperation()` is at {:?}, which this unit body \
+                 does not reach (:2105-2106)",
+                dtd.op
+            )
+        };
+        let mutable_addr = mutable_addr_of(memory_op, end);
+        let is_const = {
+            let regions: [&[Op]; 1] = [walked.as_slice()];
+            let defs = Definitions::from_innermost(&regions);
+            is_constant(mutable_addr, ConstKind::ScalarConstant, defs)
+        };
+        if !is_const {
+            panic!("DT_CHECK(\"Expect constant mutable addr\") (`:2092-2094`) for {mutable_addr:?}")
+        }
+        let Some(cc_max) = dtd.conditional_constant_descriptor().max(evaluator) else {
+            panic!(
+                "DT_CHECK_MSG(cc.isValid(), \"descriptor may be corrupt\") (`:2051`) — the \
+                 conditional yielded no constants"
+            )
+        };
+        let const_ma_ev = evaluator.evaluate_value_handle(mutable_addr);
+        let summed = evaluator.evaluate_sum_handle(cc_max, const_ma_ev);
+        let max_ev = evaluator.evaluate_sub_handle(summed, new_immut_addr_ev);
+        if ps_manager.overflows_register(max_ev, element_size) {
+            panic!("DT_CHECK(\"LAR/EAR overflow detected\") (`:2103-2104`)")
+        }
+        let offset = self.get_offset(new_immut_addr_ev);
+        let result = sites.values.mint();
+        if let Some(op) = op_at_mut(walked, dtd.op.path()) {
+            *mutable_addr_mut(op, end) = result;
+        }
+        insert_before(
+            walked,
+            dtd.op.path(),
+            scalar_add(mutable_addr, offset, result, ty),
+        );
+    }
+
     /// Replaces: e277_updateVariableOffsetCalculation
     ///
     /// REBASES EVERY REACHABLE YIELDED CONSTANT of the conditional on the pinned immutable address:
@@ -166,6 +272,18 @@ impl ConditionalConstDataTransferUpdater {
             *slot = new_operand;
         }
     }
+}
+
+/// `dcc::utils::getIndexOfOperationResults(val)` (`dcc/src/Utils/Utils.cpp:139-153`) — WHICH of its
+/// defining op's results a value is.
+///
+/// ⛔ `None` COVERS BOTH NON-ANSWERS: the `-1` for a block argument (`:141`), which
+/// `DT_CHECK(res_index_ >= 0)` then rejects, and the trailing `llvm_unreachable` (`:150-152`).
+fn index_of_operation_results(val: Val, defs: Definitions<'_>) -> Option<usize> {
+    let def = defs.of(val)?;
+    dialects::results(def)
+        .iter()
+        .position(|result| *result == val)
 }
 
 /// `dcc::utils::applyToAllYields<sentient::IfOp>` (`dcc/src/Utils/Utils.cpp:164-179`) with the
@@ -273,12 +391,20 @@ fn yield_operands_of<'a>(block: &'a mut Vec<Op>, site: &YieldSite) -> Option<&'a
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Elements;
+    use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::islands::dataflow_ir::Values;
-    use crate::islands::sentient::dialects::sentient::{CmpPredicate, Reg, RegType, Yielded};
-    use crate::transform::sentient::address_pinning_and_toggle::{
-        ConditionalConstResult, YieldedIndex,
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::islands::sentient::dialects::sentient::{
+        CmpPredicate, Reg, RegType, ShuffleMode, Yielded,
     };
-    use crate::transform::sentient::analyses::Evaluation;
+    use crate::transform::sentient::address_pinning_and_toggle::{
+        ConditionalConstResult, ConditionalConstantDescriptor, DescriptorMemoryUnit,
+        PatternDescriptor, YieldedIndex,
+    };
+    use crate::transform::sentient::analyses::{Evaluation, MinMax, RegionSite};
+    use std::cell::Cell;
+    use std::panic::AssertUnwindSafe;
 
     /// The handle flavour with its answers stated as INTEGERS, plus a `buildOffsetValue` that mints a
     /// `sentient.scalar_constant` into `sites.consts` — so the rebase is observable as both a value
@@ -376,6 +502,97 @@ mod unit_tests {
             let difference = self.value(lhs) - self.value(rhs);
             self.intern(difference)
         }
+
+        fn evaluate_sum_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            let sum = self.value(lhs) + self.value(rhs);
+            self.intern(sum)
+        }
+
+        fn evaluate_min_max(&mut self, values: &[EvaluatedValue], which: MinMax) -> EvaluatedValue {
+            let held: Vec<i64> = values.iter().map(|ev| self.value(*ev)).collect();
+            let folded = match which {
+                MinMax::Min => held.iter().min().copied(),
+                MinMax::Max => held.iter().max().copied(),
+            };
+            self.intern(folded.unwrap_or_default())
+        }
+    }
+
+    /// The pinning scheme with its answer stated, recording the pair it was offered — `&self` is the
+    /// reference's own `const` manager, so a [`Cell`] is what lets the test read that pair back.
+    struct StatedScheme {
+        pinned: EvaluatedValue,
+        offered: Cell<Option<(EvaluatedValue, EvaluatedValue)>>,
+        overflow_test: Cell<Option<EvaluatedValue>>,
+    }
+
+    impl PinningSchemeManager for StatedScheme {
+        fn find_closest_pinned_addr(
+            &self,
+            ev_x: EvaluatedValue,
+            ev_y: EvaluatedValue,
+            region: RegionSite,
+            element_size: Bits,
+        ) -> EvaluatedValue {
+            assert_eq!(region, RegionSite::ProgramUnitBody);
+            assert_eq!(element_size, Bits(16));
+            self.offered.set(Some((ev_x, ev_y)));
+            self.pinned
+        }
+
+        fn overflows_register(&self, addr_ev: EvaluatedValue, element_size: Bits) -> bool {
+            assert_eq!(element_size, Bits(16));
+            self.overflow_test.set(Some(addr_ev));
+            false
+        }
+    }
+
+    fn stated_scheme(pinned: EvaluatedValue) -> StatedScheme {
+        StatedScheme {
+            pinned,
+            offered: Cell::new(None),
+            overflow_test: Cell::new(None),
+        }
+    }
+
+    /// The transfer these two updaters rewrite — the `sentient.if` result is its immutable address.
+    fn load_and_send(mutable_addr: Val, immutable_addr: Val) -> Op {
+        Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr,
+            immutable_addr,
+            increment: Val(131),
+            consumer: SendEnd::to_self(Val(198)),
+            result: Val(140),
+            extent: sentient::Extent {
+                total_elements: Elements(64),
+                element_size: Bits(16),
+                chunk_size: Elements(1),
+                chunk_stride: Elements(1),
+                burst_size: Elements(1),
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    fn conditional_constant(yielded: Vec<EvaluatedValue>) -> Option<PatternDescriptor> {
+        Some(PatternDescriptor::ConditionalConstant(
+            ConditionalConstantDescriptor {
+                yielded_constants: yielded,
+                can_be_simplified: false,
+            },
+        ))
     }
 
     fn constant(value: i64, result: Val) -> Op {
@@ -492,5 +709,141 @@ mod unit_tests {
         };
         assert_eq!(inner_then.last(), Some(&yield_of(rebased[1])));
         assert_eq!(inner_else.last(), Some(&yield_of(rebased[2])));
+    }
+
+    /// 615/656 — the pair offered to the pinning scheme is the LOWEST and HIGHEST constant the
+    /// conditional can yield, and the `sentient.if` result the immutable address WAS is recorded
+    /// before the assignment replaces it. ⛔ `create_offset_value` is `EvaluatedValue::buildOffsetValue`,
+    /// out of campaign scope, so the write stops there and the record is read past the stop.
+    #[test]
+    fn e615_pins_between_the_lowest_and_highest_yielded_constant_and_records_the_conditional() {
+        let mut evaluator = StatedEvaluator::default();
+        let low = evaluator.constant(4096);
+        let high = evaluator.constant(8192);
+        let pinned = evaluator.constant(2048);
+        let scheme = stated_scheme(pinned);
+        let dtd = DataTransferDescriptor {
+            op: OpId::at(&[4]),
+            pattern_desc: conditional_constant(vec![high, low]),
+            base_addrs: vec![low, high],
+            region: RegionSite::ProgramUnitBody,
+            memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Some(Val(110)),
+            is_base_addr_mutable: false,
+        };
+        // The immutable address is the outer `sentient.if`'s one result.
+        let body = nested_conditional();
+        let regions: [&[Op]; 1] = [body.as_slice()];
+        let mut op = load_and_send(Val(130), Val(110));
+        let mut updater = ConditionalConstDataTransferUpdater {
+            if_result: ConditionalConstResult {
+                index: YieldedIndex(9),
+                val: Val(999),
+            },
+        };
+
+        let reached = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            updater.update_immutable_addr(
+                &dtd,
+                &mut op,
+                TransferEnd::Src,
+                ScalarTy::Index,
+                Definitions::from_innermost(&regions),
+                &mut evaluator,
+                &scheme,
+                Bits(16),
+            )
+        }));
+
+        assert!(
+            reached.is_err(),
+            "the assignment reaches `buildOffsetValue`"
+        );
+        assert_eq!(
+            updater.if_result,
+            ConditionalConstResult {
+                index: YieldedIndex(0),
+                val: Val(110),
+            }
+        );
+        // ⭐ THE ORDER OF `yielded_constants_` IS NOT THE ORDER OF THE PAIR: `getMin`/`getMax` fold it.
+        let (ev_x, ev_y) = scheme.offered.get().expect("the pinning scheme was asked");
+        assert_eq!((evaluator.value(ev_x), evaluator.value(ev_y)), (4096, 8192));
+    }
+
+    /// 616/656 — the yielded constants are rebased first, the overflow test sees
+    /// `cc.getMax() + const_mutable_addr - pinned`, and the transfer's mutable address becomes a fresh
+    /// `sentient.scalar_add` of that constant and the conditional's own result, inserted AHEAD of the
+    /// memory op.
+    #[test]
+    fn e616_adds_the_conditionals_result_to_the_rebased_constant_mutable_addr() {
+        let mut evaluator = StatedEvaluator {
+            held: Vec::new(),
+            constants: vec![(Val(101), 4096), (Val(102), 8192), (Val(130), 512)],
+            built: Vec::new(),
+        };
+        let low = evaluator.constant(4096);
+        let high = evaluator.constant(8192);
+        let pinned = evaluator.constant(4096);
+        let scheme = stated_scheme(pinned);
+        let dtd = DataTransferDescriptor {
+            op: OpId::at(&[4]),
+            pattern_desc: conditional_constant(vec![low, high]),
+            base_addrs: vec![low, high],
+            region: RegionSite::ProgramUnitBody,
+            memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Some(Val(110)),
+            is_base_addr_mutable: false,
+        };
+        let mut walked = vec![
+            constant(4096, Val(101)),
+            constant(8192, Val(102)),
+            if_op(Val(110), vec![yield_of(Val(101))], vec![yield_of(Val(102))]),
+            constant(512, Val(130)),
+            load_and_send(Val(130), Val(120)),
+        ];
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let updater = ConditionalConstDataTransferUpdater {
+            if_result: ConditionalConstResult {
+                index: YieldedIndex(0),
+                val: Val(110),
+            },
+        };
+        {
+            let mut sites = OffsetSites {
+                consts: &mut consts,
+                query_maps: None,
+                values: &mut values,
+            };
+            updater.update_constant_mutable_addr(
+                &dtd,
+                TransferEnd::Src,
+                ScalarTy::Index,
+                &mut evaluator,
+                &scheme,
+                Bits(16),
+                pinned,
+                &mut sites,
+                &mut walked,
+            );
+        }
+
+        // `8192 + 512 - 4096` — the widest offset this transfer can reach, and NOT the pinned range.
+        let overflow_test = scheme
+            .overflow_test
+            .get()
+            .expect("the register was measured");
+        assert_eq!(evaluator.value(overflow_test), 4608);
+        // e277 rebased both yields on the way in: `4096 - 4096` and `8192 - 4096`.
+        let built: Vec<i64> = evaluator.built.iter().map(|(_, value)| *value).collect();
+        assert_eq!(built, vec![0, 4096]);
+        // The add took the memory op's slot, and the memory op moved one later reading its result.
+        assert_eq!(walked.len(), 6);
+        assert_eq!(
+            walked[4],
+            scalar_add(Val(130), Val(110), Val(2), ScalarTy::Index)
+        );
+        assert_eq!(mutable_addr_of(&walked[5], TransferEnd::Src), Val(2));
     }
 }

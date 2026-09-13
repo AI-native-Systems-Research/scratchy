@@ -178,7 +178,11 @@ pub struct DataTransferDescriptor {
     /// ⛔ [`Self::initialize_descriptor`] REWRITES IT, through the `Value &` it takes (`:2317`): the
     /// value stored afterwards is the one at the far end of the `sentient.scalar_copy` chain, and
     /// `AbstractDataTransferUpdater::update` compares two descriptors' stored values (`:1775-1776`).
-    pub base_addr: Val,
+    ///
+    /// ⛔ `None` IS THE REFERENCE'S NULL `Value`, WHICH ONE CONSTRUCTOR REALLY LEAVES BEHIND:
+    /// [`super::lx_data_transfer_descriptor::new_lx`] returns before assigning it for an IBR write for
+    /// gather (`:2565-2572`), and that descriptor is invalid rather than addressed.
+    pub base_addr: Option<Val>,
     /// `is_base_addr_mutable_` (`:787`) — whether [`Self::base_addr`] is the transfer's MUTABLE
     /// address rather than its immutable one, the base constructor's own defaulted parameter
     /// (`:637`, `= false`) that only `HBMDataTransferDescriptor` ever passes `true` (`:1414`,
@@ -333,11 +337,17 @@ impl DataTransferDescriptor {
         defs: Definitions<'_>,
         evaluator: &mut impl ExpressionEvaluator,
     ) {
-        while let Some(Op::Sentient(sentient::Op::ScalarCopy { input, .. })) = defs.of(self.base_addr)
+        while let Some(Op::Sentient(sentient::Op::ScalarCopy { input, .. })) =
+            self.base_addr.and_then(|addr| defs.of(addr))
         {
-            self.base_addr = *input;
+            self.base_addr = Some(*input);
         }
-        let base_addr = self.base_addr;
+        let Some(base_addr) = self.base_addr else {
+            todo!(
+                "initializeDescriptor: `base_addr.getDefiningOp()` on the null `Value` an \
+                 IBR-write-for-gather descriptor carries (:2317, :2565-2572)"
+            )
+        };
 
         // `if (dcc::utils::isSymbol(base_addr))` (`:2325-2328`).
         if is_symbol(base_addr, defs) {
@@ -599,8 +609,8 @@ mod unit_tests {
             dtd
         };
 
-        let copied = initialized(Val(2));
-        assert_eq!(copied.base_addr, Val(1));
+        let copied = initialized(Some(Val(2)));
+        assert_eq!(copied.base_addr, Some(Val(1)));
         assert_eq!(copied.base_addrs, vec![EvaluatedValue(1)]);
         assert_eq!(
             copied.pattern_desc,
@@ -609,8 +619,8 @@ mod unit_tests {
             }))
         );
 
-        let summed = initialized(Val(4));
-        assert_eq!(summed.base_addr, Val(4));
+        let summed = initialized(Some(Val(4)));
+        assert_eq!(summed.base_addr, Some(Val(4)));
         assert_eq!(summed.base_addrs, vec![EvaluatedValue(4)]);
         assert_eq!(
             summed.pattern_desc,
@@ -619,7 +629,7 @@ mod unit_tests {
             }))
         );
 
-        let symbolic = initialized(Val(5));
+        let symbolic = initialized(Some(Val(5)));
         assert_eq!(symbolic.pattern_desc, None);
         assert!(symbolic.base_addrs.is_empty());
     }
@@ -641,7 +651,7 @@ mod unit_tests {
             base_addrs: (0..base_addrs).map(EvaluatedValue).collect(),
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
-            base_addr: Val(0),
+            base_addr: Some(Val(0)),
             is_base_addr_mutable: false,
         }
     }

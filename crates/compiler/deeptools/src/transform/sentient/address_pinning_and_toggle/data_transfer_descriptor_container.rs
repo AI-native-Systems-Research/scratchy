@@ -362,7 +362,7 @@ impl DataTransferDescriptorContainer {
 ///
 /// ⛔ `LoadAndExtractScalarOp` AND `LoadComputeAndSendOp` ARE DELIBERATELY ABSENT — "they are not
 /// supported outside LX" (`:2213-2214`), and they are absent from all three of those `isa` lists.
-fn is_transfer(op: &Op) -> bool {
+pub(super) fn is_transfer(op: &Op) -> bool {
     matches!(
         op,
         Op::Sentient(
@@ -535,7 +535,7 @@ mod unit_tests {
             base_addrs: Vec::new(),
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
-            base_addr: Val(0),
+            base_addr: Some(Val(0)),
             is_base_addr_mutable: false,
         }
     }

@@ -172,7 +172,8 @@ pub(crate) mod toggle_descriptor;
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::arch::{Arch, IsaGen};
+use crate::arch::{Arch, IsaGen, Sticks};
+use crate::formats::Bits;
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, UniformRegions, Val, dataflow, sentient, uniform,
 };
@@ -477,6 +478,36 @@ pub(super) fn mutable_addr_mut(op: &mut Op, end: TransferEnd) -> &mut Val {
             "updateConstantMutableAddr: `mutable_addr_` on {op:?}, which \
              `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>` rejects \
              (AddressPinningAndToggle.cpp:1400-1402)"
+        ),
+    }
+}
+
+/// `dcc::utils::getMutableAndImmutableAddr(op, mem_unit).second` (`Analyses/Utils.cpp:569-605`) — the
+/// READ of what [`immutable_addr_mut`] writes, which is how both subclass constructors take their base
+/// address (`:2573`, `:2591-2596`).
+///
+/// ⛔ NO `LoadAndExtractScalarOp` ARM, for [`looping_chain_mutable_addr_descriptor::mutable_addr_of`]'s
+/// reason: that arm dereferences a failed `dyn_cast` (`Analyses/Utils.cpp:590`) before it returns
+/// either half.
+pub(super) fn immutable_addr_of(op: &Op, end: TransferEnd) -> Val {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { immutable_addr, .. }
+            | sentient::Op::ReceiveAndStore { immutable_addr, .. }
+            | sentient::Op::LoadComputeAndSend { immutable_addr, .. },
+        ) => *immutable_addr,
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src_immutable_addr,
+            dst_immutable_addr,
+            ..
+        }) => match end {
+            TransferEnd::Src => *src_immutable_addr,
+            TransferEnd::Dst => *dst_immutable_addr,
+        },
+        _ => todo!(
+            "getMutableAndImmutableAddr: DT_CHECK(isa<LoadAndSendOp, ReceiveAndStoreOp, \
+             LoadAndStoreOp, LoadAndExtractScalarOp, LoadComputeAndSendOp>(op)) on {op:?} \
+             (Analyses/Utils.cpp:571-576)"
         ),
     }
 }
@@ -2021,10 +2052,135 @@ impl AddressPinningAndTogglePass {
     }
 }
 
-// crustify:todo: e614_computeAddressInfoList
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1675  (59 body lines, level 6)
-//   original  : void AddressPinningAndTogglePass::computeAddressInfoList(SenComponents comp)
-//   calls     : e007_isPartOfSomeChain, e258_isToggle, e273_isHeadOfChain, e278_isValid, e399_getMin, e400_getMax, e403_getMin, e404_getMax, e405_getMin, e406_getMax, e409_getMin, e410_getMax, e412_getMin, e413_getMax …
+impl AddressPinningAndTogglePass {
+    /// Replaces: e614_computeAddressInfoList
+    ///
+    /// Builds [`Self::ev_addr_info_list`] — one BYTE-ADDRESSABLE entry per base address of each paired
+    /// transfer, with the pair's mutable range taken from the mutable descriptor when it matched a
+    /// pattern and widened to the whole EAR when it did not (`:1675-1733`).
+    ///
+    /// ⛔ `ba_min_mut_addr_ev` IS EVALUATED AND THEN DROPPED (`:1717-1720`, printed at `:1727`): only
+    /// the immutable and MAX addresses reach [`EvAddressInfo`], and the arena entries the minimum's
+    /// conversion interns are still created, so removing it would renumber every later handle.
+    /// ⛔ A NON-HEAD CHAIN MEMBER IS SKIPPED ENTIRELY (`:1694-1698`) — its increment is the head's.
+    /// ⭐ THE ZIP PAIRS BY INDEX, per [`DataTransferDescriptorContainer`]: only the visit order is lost.
+    pub fn compute_address_info_list<A: Arch>(
+        &mut self,
+        comp: DfirUnit,
+        body: &[Op],
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) {
+        // `sys_def.regInfoPerUnit.at(comp).at(RegType::EAR).bitSize`, 21 on both L3 halves and every
+        // arch (`sysdef.cpp:313-314`, `:336-337`); no other component has an EAR row for `.at` to find.
+        let ear_bits = match comp {
+            DfirUnit::L3lu | DfirUnit::L3su => A::L3_EAR_BITS,
+            _ => panic!(
+                "sys_def.regInfoPerUnit.at({comp:?}).at(RegType::EAR) — no EAR on this component \
+                 (sysdef.cpp:313-337)"
+            ),
+        };
+        // `(0x1 << kBitWidthOfMutAddrRegister) * sys_def.bytesPerStick`.
+        let max_mut_addr_val = A::sticks_to_bytes(Sticks(1u64 << ear_bits.get()));
+
+        let pairs = self
+            .immut_data_transfer_descriptors
+            .descriptors
+            .len()
+            .min(self.mut_data_transfer_descriptors.descriptors.len());
+        let mut infos = Vec::new();
+        for index in 0..pairs {
+            let immut_dtd = &self.immut_data_transfer_descriptors.descriptors[index];
+            let mut_dtd = &self.mut_data_transfer_descriptors.descriptors[index];
+            let (min_mut_addr_ev, max_mut_addr_ev) = if mut_dtd.is_valid() {
+                let (Some(min), Some(max)) = (
+                    mut_dtd.min(evaluator, body, defs),
+                    mut_dtd.max(evaluator, body, defs),
+                ) else {
+                    panic!(
+                        "DT_CHECK_MSG(pattern_desc_, \"Expect valid pattern descriptor\") on the \
+                         mutable descriptor of {:?} (`:749`, `:754`)",
+                        immut_dtd.op
+                    )
+                };
+                (min, max)
+            } else if self
+                .immut_data_transfer_descriptors
+                .is_part_of_some_chain(DescriptorId(index as u32))
+                && !self
+                    .immut_data_transfer_descriptors
+                    .is_head_of_chain(DescriptorId(index as u32))
+            {
+                // "Nothing to do, as the increment of this data transfer is tracked in the chain's
+                // head."
+                continue;
+            } else {
+                // `emitWarning("The HBM transfer that does not fall into one of the recognized
+                // mutable address patterns so conservatively setting min, max values to 0, maxEAR
+                // respectively.")`, under `LLVM_DEBUG`.
+                (
+                    evaluator.constant(0),
+                    evaluator.constant(max_mut_addr_val.0 as i64),
+                )
+            };
+
+            let Some(memory_op) = op_at(&immut_dtd.op, body) else {
+                todo!(
+                    "computeAddressInfoList: `immut_dtd->getOperation()` is at {:?}, which this unit \
+                     body does not reach (:1708-1709)",
+                    immut_dtd.op
+                )
+            };
+            let elem_size = element_size_of_mem_op(memory_op);
+            for immut_addr_ev in immut_dtd.base_addrs.clone() {
+                let ba_immut_addr_ev = to_byte_addressable(evaluator, immut_addr_ev, elem_size);
+                let _ba_min_mut_addr_ev = to_byte_addressable(evaluator, min_mut_addr_ev, elem_size);
+                let ba_max_mut_addr_ev = to_byte_addressable(evaluator, max_mut_addr_ev, elem_size);
+                infos.push(EvAddressInfo {
+                    ba_immut_addr_ev,
+                    ba_max_mut_addr_ev,
+                    is_toggle: immut_dtd.is_toggle(),
+                    region: immut_dtd.region,
+                });
+            }
+        }
+        self.ev_addr_info_list.append(&mut infos);
+    }
+}
+
+/// `evaluateDivideByConst(evaluateMultiplyByConst(ev, elem_size), 8)` (`:1717-1723`) — the ELEMENT
+/// address `ev` as a BYTE address, which is the only granularity [`EvAddressInfo`] carries.
+fn to_byte_addressable(
+    evaluator: &mut impl ExpressionEvaluator,
+    ev: EvaluatedValue,
+    elem_size: Bits,
+) -> EvaluatedValue {
+    let in_bits = evaluator.evaluate_multiply_by_const(ev, i64::from(elem_size.0));
+    evaluator.evaluate_divide_by_const(in_bits, 8)
+}
+
+/// `dcc::sentient::utils::getElementSizeOfMemOp(op)` (`dcc/src/Dialect/Sentient/Utils.cpp:287-304`) —
+/// how wide, in bits, the elements whose addresses this transfer computes are.
+///
+/// ⛔ `load_compute_and_send` ANSWERS ITS **DST** WIDTH: *"the dst_element_size indicates how the
+/// address should be calculated"* (`:298-299`), so the source width is deliberately not it.
+fn element_size_of_mem_op(op: &Op) -> Bits {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { extent, .. }
+            | sentient::Op::ReceiveAndStore { extent, .. }
+            | sentient::Op::LoadAndStore { extent, .. },
+        ) => extent.element_size,
+        Op::Sentient(sentient::Op::LoadAndExtractScalar { element_size, .. }) => *element_size,
+        Op::Sentient(sentient::Op::LoadComputeAndSend {
+            dst_element_size, ..
+        }) => *dst_element_size,
+        _ => todo!(
+            "getElementSizeOfMemOp: llvm_unreachable(\"Expected a memory op.\") on {op:?} \
+             (dcc/src/Dialect/Sentient/Utils.cpp:303)"
+        ),
+    }
+}
 
 // crustify:todo: e637_collectDataTransfers
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1395  (41 body lines, level 7)
@@ -2164,7 +2320,7 @@ mod unit_tests {
             base_addrs: (0..base_addrs).map(|i| EvaluatedValue(i as u32)).collect(),
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
-            base_addr: Val(0),
+            base_addr: Some(Val(0)),
             is_base_addr_mutable: false,
         }
     }
@@ -2378,7 +2534,7 @@ mod unit_tests {
             base_addrs: vec![EvaluatedValue(64)],
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
-            base_addr: Val(0),
+            base_addr: Some(Val(0)),
             is_base_addr_mutable: false,
         }
     }
@@ -2840,6 +2996,11 @@ mod unit_tests {
         fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
             let product = self.value(ev) * by;
             self.hold(product)
+        }
+
+        fn evaluate_divide_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+            let quotient = self.value(ev) / by;
+            self.hold(quotient)
         }
 
         fn evaluate_min_max(&mut self, values: &[EvaluatedValue], which: MinMax) -> EvaluatedValue {
@@ -3589,5 +3750,48 @@ mod unit_tests {
         }));
         assert!(reached.is_err());
         assert!(!on_dd2.force_address_pinning);
+    }
+
+    /// 614/656 — a pair whose MUTABLE descriptor matched no pattern and heads no chain widens that
+    /// half to the whole EAR, and both surviving addresses are recorded in BYTES.
+    ///
+    /// ⛔ THE HANDLE NUMBERS ARE THE POINT: the dropped minimum's own conversion still interns two
+    /// arena entries, so the maximum's byte address is the NINTH entry and not the seventh — dropping
+    /// the minimum would renumber every handle the pass hands out after this one.
+    #[test]
+    fn e614_widens_an_unmatched_mutable_half_to_the_whole_ear_in_byte_addresses() {
+        let mut evaluator = StatedEvaluator::default();
+        let immut_addr_ev = evaluator.constant(4096);
+        let mut pass = AddressPinningAndTogglePass::default();
+        pass.immut_data_transfer_descriptors
+            .descriptors
+            .push(transfer(
+                Some(PatternDescriptor::SimpleConstant(SimpleConstantDescriptor {
+                    ev: immut_addr_ev,
+                })),
+                1,
+            ));
+        // No pattern and no base address: `isValid()` is false, and no chain claims it.
+        pass.mut_data_transfer_descriptors
+            .descriptors
+            .push(transfer(None, 0));
+        let body = vec![load_and_store(1, 2, 3, 10)];
+        let regions: [&[Op]; 1] = [body.as_slice()];
+
+        pass.compute_address_info_list::<Dd2>(
+            DfirUnit::L3lu,
+            &body,
+            Definitions::from_innermost(&regions),
+            &mut evaluator,
+        );
+
+        assert_eq!(pass.ev_addr_info_list.len(), 1);
+        let info = pass.ev_addr_info_list[0];
+        // `4096 * 16 / 8`, and `(0x1 << 21) * 128` sticks-worth of bytes at the same element width.
+        assert_eq!(evaluator.value(info.ba_immut_addr_ev), 8192);
+        assert_eq!(evaluator.value(info.ba_max_mut_addr_ev), 536_870_912);
+        assert!(!info.is_toggle);
+        assert_eq!(info.region, RegionSite::default());
+        assert_eq!(info.ba_max_mut_addr_ev, EvaluatedValue(8));
     }
 }

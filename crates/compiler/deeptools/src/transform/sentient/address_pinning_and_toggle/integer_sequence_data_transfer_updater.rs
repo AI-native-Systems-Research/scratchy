@@ -78,13 +78,121 @@
 //! | `e617_updateImmutableAddr` | 617 | 6 | 15 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2114` |
 //! | `e618_updateConstantMutableAddr` | 618 | 6 | 21 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2143` |
 
-
-use super::{DataTransferDescriptor, IntegerSequenceDataTransferUpdater, set_iter_operand};
+use super::abstract_data_transfer_updater::{insert_before, op_at_mut, scalar_add};
+use super::looping_chain_mutable_addr_descriptor::{TransferEnd, mutable_addr_of};
+use super::{
+    DataTransferDescriptor, IntegerSequenceDataTransferUpdater, create_offset_value,
+    immutable_addr_mut, mutable_addr_mut, op_at, set_iter_operand,
+};
+use crate::formats::Bits;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::Op;
-use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator, OffsetSites};
+use crate::islands::sentient::dialects::{Definitions, Op};
+use crate::transform::sentient::analyses::{
+    EvaluatedValue, ExpressionEvaluator, OffsetSites, PinningSchemeManager,
+};
+use crate::transform::sentient::utils::{ConstKind, is_constant};
 
 impl IntegerSequenceDataTransferUpdater {
+    /// Replaces: e617_updateImmutableAddr
+    ///
+    /// "The same strategy used for conditional constant case" (`:2115`): the transfer's immutable
+    /// address becomes one pinned address covering the whole sequence's span (`:2119-2126`).
+    ///
+    /// ⛔ NO `res_index_` HERE, unlike e615: the sequence is reached through the loop's iter operand
+    /// (e490), never through a `sentient.if` result, so nothing has to be recorded before the
+    /// assignment replaces the operand.
+    pub fn update_immutable_addr(
+        self,
+        dtd: &DataTransferDescriptor,
+        op: &mut Op,
+        end: TransferEnd,
+        ty: ScalarTy,
+        evaluator: &mut impl ExpressionEvaluator,
+        ps_manager: &impl PinningSchemeManager,
+        element_size: Bits,
+    ) -> EvaluatedValue {
+        let isq = *dtd.integer_sequence_descriptor();
+        let (Some(min), Some(max)) = (isq.min(evaluator), isq.max(evaluator)) else {
+            panic!(
+                "DT_CHECK_MSG(is.isValid(), \"descriptor may be corrupt\") (`:2117`) for {isq:?}"
+            )
+        };
+        let new_immut_addr_ev =
+            ps_manager.find_closest_pinned_addr(min, max, dtd.region, element_size);
+        *immutable_addr_mut(op, end) = create_offset_value(new_immut_addr_ev, ty);
+        new_immut_addr_ev
+    }
+
+    /// Replaces: e618_updateConstantMutableAddr
+    ///
+    /// Rebases the sequence's initializer first (e490), then adds the loop's own carried offset to the
+    /// transfer's constant mutable address with a fresh `sentient.scalar_add` ahead of the memory op
+    /// (`:2143-2163`).
+    ///
+    /// ⛔ THE OVERFLOW TEST IS `is.getMax() + const_mutable_addr - new_immut_addr_ev` — the widest
+    /// address this transfer's LAR/EAR must hold once the sequence is rebased (`:2151-2157`).
+    /// ⛔ THE OPERAND IS ASSIGNED BEFORE THE INSERT, for e592's reason: the insert moves `dtd.op`.
+    pub fn update_constant_mutable_addr<E: ExpressionEvaluator>(
+        self,
+        dtd: &DataTransferDescriptor,
+        end: TransferEnd,
+        ty: ScalarTy,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        element_size: Bits,
+        new_immut_addr_ev: EvaluatedValue,
+        sites: &mut OffsetSites<'_>,
+        walked: &mut Vec<Op>,
+    ) {
+        self.update_variable_offset_calculation(
+            dtd,
+            new_immut_addr_ev,
+            ty,
+            evaluator,
+            sites,
+            walked,
+        );
+
+        let Some(memory_op) = op_at(&dtd.op, walked) else {
+            todo!(
+                "updateConstantMutableAddr: `dtd_.getOperation()` is at {:?}, which this unit body \
+                 does not reach (:2159-2160)",
+                dtd.op
+            )
+        };
+        let mutable_addr = mutable_addr_of(memory_op, end);
+        let is_const = {
+            let regions: [&[Op]; 1] = [walked.as_slice()];
+            let defs = Definitions::from_innermost(&regions);
+            is_constant(mutable_addr, ConstKind::ScalarConstant, defs)
+        };
+        if !is_const {
+            panic!("DT_CHECK(\"Expect constant mutable addr\") (`:2147-2149`) for {mutable_addr:?}")
+        }
+        let isq = *dtd.integer_sequence_descriptor();
+        let Some(is_max) = isq.max(evaluator) else {
+            panic!(
+                "DT_CHECK_MSG(is.isValid(), \"descriptor may be corrupt\") (`:2117`) for {isq:?}"
+            )
+        };
+        let const_ma_ev = evaluator.evaluate_value_handle(mutable_addr);
+        let summed = evaluator.evaluate_sum_handle(is_max, const_ma_ev);
+        let max_ev = evaluator.evaluate_sub_handle(summed, new_immut_addr_ev);
+        if ps_manager.overflows_register(max_ev, element_size) {
+            panic!("DT_CHECK(\"LAR/EAR overflow detected\") (`:2156-2157`)")
+        }
+        let offset = self.get_offset(new_immut_addr_ev);
+        let result = sites.values.mint();
+        if let Some(op) = op_at_mut(walked, dtd.op.path()) {
+            *mutable_addr_mut(op, end) = result;
+        }
+        insert_before(
+            walked,
+            dtd.op.path(),
+            scalar_add(mutable_addr, offset, result, ty),
+        );
+    }
+
     /// Replaces: e490_updateVariableOffsetCalculation
     ///
     /// REBASES THE SEQUENCE ON THE PINNED IMMUTABLE ADDRESS: the loop's iter operand becomes a fresh
@@ -124,33 +232,28 @@ impl IntegerSequenceDataTransferUpdater {
     }
 }
 
-// crustify:todo: e617_updateImmutableAddr
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2114  (15 body lines, level 6)
-//   original  : const EvaluatedValue & IntegerSequenceDataTransferUpdater::updateImmutableAddr()
-//   calls     : e009_createOffsetValue, e267_getIntegerSequenceDescriptor, e268_getIntegerSequenceDescriptor, e278_isValid, e399_getMin, e400_getMax, e403_getMin, e404_getMax, e405_getMin, e406_getMax, e409_getMin, e410_getMax, e412_getMin, e413_getMax …
-
-// crustify:todo: e618_updateConstantMutableAddr
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2143  (21 body lines, level 6)
-//   original  : void IntegerSequenceDataTransferUpdater::updateConstantMutableAddr( const EvaluatedValue &new_immut_addr_ev)
-//   calls     : e011_getOffset, e012_getOffset, e013_getOffset, e267_getIntegerSequenceDescriptor, e268_getIntegerSequenceDescriptor, e400_getMax, e404_getMax, e406_getMax, e410_getMax, e413_getMax, e418_getOffset, e490_updateVariableOffsetCalculation, e548_getMax, e588_getMax …
-
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Elements;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::islands::dataflow_ir::Values;
-    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType};
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{Val, sentient};
     use crate::transform::sentient::address_pinning_and_toggle::{
         DescriptorMemoryUnit, IntegerSequenceDescriptor, PatternDescriptor, SequenceSize,
     };
-    use crate::transform::sentient::analyses::{Evaluation, RegionSite};
+    use crate::transform::sentient::analyses::{Evaluation, MinMax, RegionSite};
     use crate::transform::sentient::{ForRef, IterArgIndex};
+    use std::cell::Cell;
+    use std::panic::AssertUnwindSafe;
 
     /// The handle flavour with its answers stated as INTEGERS, so `==` on handles is `==` on values.
     #[derive(Default)]
     struct StatedEvaluator {
         held: Vec<i64>,
+        constants: Vec<(Val, i64)>,
         built: Vec<(Val, i64)>,
     }
 
@@ -228,6 +331,129 @@ mod unit_tests {
             let difference = self.value(lhs) - self.value(rhs);
             self.intern(difference)
         }
+
+        fn evaluate_sum_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            let sum = self.value(lhs) + self.value(rhs);
+            self.intern(sum)
+        }
+
+        fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+            let product = self.value(ev) * by;
+            self.intern(product)
+        }
+
+        fn evaluate_min_max(&mut self, values: &[EvaluatedValue], which: MinMax) -> EvaluatedValue {
+            let held: Vec<i64> = values.iter().map(|ev| self.value(*ev)).collect();
+            let folded = match which {
+                MinMax::Min => held.iter().min().copied(),
+                MinMax::Max => held.iter().max().copied(),
+            };
+            self.intern(folded.unwrap_or_default())
+        }
+
+        fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+            let held = self
+                .constants
+                .iter()
+                .find(|(val, _)| *val == value)
+                .map(|(_, held)| *held);
+            match held {
+                Some(held) => self.intern(held),
+                None => todo!("the fixture states no constant for {value:?}"),
+            }
+        }
+    }
+
+    /// The pinning scheme with its answer stated, recording what it was asked — `&self` is the
+    /// reference's own `const` manager, so a [`Cell`] is what lets the test read those back.
+    struct StatedScheme {
+        pinned: EvaluatedValue,
+        offered: Cell<Option<(EvaluatedValue, EvaluatedValue)>>,
+        overflow_test: Cell<Option<EvaluatedValue>>,
+    }
+
+    impl PinningSchemeManager for StatedScheme {
+        fn find_closest_pinned_addr(
+            &self,
+            ev_x: EvaluatedValue,
+            ev_y: EvaluatedValue,
+            region: RegionSite,
+            element_size: Bits,
+        ) -> EvaluatedValue {
+            assert_eq!(element_size, Bits(16));
+            assert_eq!(region, RegionSite::default());
+            self.offered.set(Some((ev_x, ev_y)));
+            self.pinned
+        }
+
+        fn overflows_register(&self, addr_ev: EvaluatedValue, element_size: Bits) -> bool {
+            assert_eq!(element_size, Bits(16));
+            self.overflow_test.set(Some(addr_ev));
+            false
+        }
+    }
+
+    fn stated_scheme(pinned: EvaluatedValue) -> StatedScheme {
+        StatedScheme {
+            pinned,
+            offered: Cell::new(None),
+            overflow_test: Cell::new(None),
+        }
+    }
+
+    fn scalar_const(value: i64, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// The transfer these two updaters rewrite.
+    fn load_and_send(mutable_addr: Val, immutable_addr: Val) -> Op {
+        Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr,
+            immutable_addr,
+            increment: Val(131),
+            consumer: SendEnd::to_self(Val(198)),
+            result: Val(140),
+            extent: sentient::Extent {
+                total_elements: Elements(64),
+                element_size: Bits(16),
+                chunk_size: Elements(1),
+                chunk_stride: Elements(1),
+                burst_size: Elements(1),
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    /// `init + stride * i` for `i` in `[0, 4)` from 8192 by 64, as a descriptor.
+    fn integer_sequence(init: EvaluatedValue, stride: EvaluatedValue) -> Option<PatternDescriptor> {
+        Some(PatternDescriptor::IntegerSequence(
+            IntegerSequenceDescriptor {
+                outer_loop: Some(ForRef(Val(10))),
+                iter_arg_index: Some(IterArgIndex(0)),
+                init: Some(init),
+                stride: Some(stride),
+                size: SequenceSize::Terms(4),
+                can_be_simplified: false,
+            },
+        ))
     }
 
     fn carried(init: Val) -> Carried {
@@ -276,7 +502,7 @@ mod unit_tests {
             base_addrs: vec![init],
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
-            base_addr: Val(0),
+            base_addr: Some(Val(0)),
             is_base_addr_mutable: false,
         };
         let updater = IntegerSequenceDataTransferUpdater { iter_arg: Val(11) };
@@ -305,5 +531,128 @@ mod unit_tests {
             panic!("the fixture's only op is the sentient.for")
         };
         assert_eq!(carried[0].init, rebased);
+    }
+
+    /// 617/656 — the pair offered to the pinning scheme spans the WHOLE sequence, `getMin` and
+    /// `getMax` over its two ends. ⛔ `create_offset_value` is `EvaluatedValue::buildOffsetValue`, out
+    /// of campaign scope, so the write stops there and the offered pair is read past the stop.
+    #[test]
+    fn e617_pins_one_address_over_the_sequences_whole_span() {
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(8192);
+        let stride = evaluator.constant(64);
+        let pinned = evaluator.constant(4096);
+        let scheme = stated_scheme(pinned);
+        let dtd = DataTransferDescriptor {
+            op: OpId::at(&[0]),
+            pattern_desc: integer_sequence(init, stride),
+            base_addrs: vec![init],
+            region: RegionSite::default(),
+            memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Some(Val(120)),
+            is_base_addr_mutable: false,
+        };
+        let mut op = load_and_send(Val(130), Val(120));
+        let updater = IntegerSequenceDataTransferUpdater { iter_arg: Val(11) };
+
+        let reached = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            updater.update_immutable_addr(
+                &dtd,
+                &mut op,
+                TransferEnd::Src,
+                ScalarTy::Index,
+                &mut evaluator,
+                &scheme,
+                Bits(16),
+            )
+        }));
+
+        assert!(
+            reached.is_err(),
+            "the assignment reaches `buildOffsetValue`"
+        );
+        // ⛔ 8448 IS ONE STRIDE PAST THE SEQUENCE (`8192 + 64 * 4`), which e406 ports verbatim.
+        let (ev_x, ev_y) = scheme.offered.get().expect("the pinning scheme was asked");
+        assert_eq!((evaluator.value(ev_x), evaluator.value(ev_y)), (8192, 8448));
+    }
+
+    /// 618/656 — the sequence's initializer is rebased first, the overflow test sees
+    /// `is.getMax() + const_mutable_addr - pinned`, and the transfer's mutable address becomes a fresh
+    /// `sentient.scalar_add` of that constant and the loop's carried iter arg, AHEAD of the memory op.
+    #[test]
+    fn e618_adds_the_carried_iter_arg_to_the_rebased_constant_mutable_addr() {
+        let mut evaluator = StatedEvaluator {
+            held: Vec::new(),
+            constants: vec![(Val(130), 512)],
+            built: Vec::new(),
+        };
+        let init = evaluator.constant(8192);
+        let stride = evaluator.constant(64);
+        let pinned = evaluator.constant(4096);
+        let scheme = stated_scheme(pinned);
+        let dtd = DataTransferDescriptor {
+            op: OpId::at(&[2]),
+            pattern_desc: integer_sequence(init, stride),
+            base_addrs: vec![init],
+            region: RegionSite::default(),
+            memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Some(Val(120)),
+            is_base_addr_mutable: false,
+        };
+        let mut walked = vec![
+            Op::Sentient(sentient::Op::For {
+                iv: Val(10),
+                bound: Val(1),
+                bound_reg: None,
+                carried: vec![carried(Val(102))],
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+            scalar_const(512, Val(130)),
+            load_and_send(Val(130), Val(120)),
+        ];
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let updater = IntegerSequenceDataTransferUpdater { iter_arg: Val(11) };
+        {
+            let mut sites = OffsetSites {
+                consts: &mut consts,
+                query_maps: None,
+                values: &mut values,
+            };
+            updater.update_constant_mutable_addr(
+                &dtd,
+                TransferEnd::Src,
+                ScalarTy::Index,
+                &mut evaluator,
+                &scheme,
+                Bits(16),
+                pinned,
+                &mut sites,
+                &mut walked,
+            );
+        }
+
+        // `8448 + 512 - 4096` — the widest address this LAR must hold once the sequence is rebased.
+        let overflow_test = scheme
+            .overflow_test
+            .get()
+            .expect("the register was measured");
+        assert_eq!(evaluator.value(overflow_test), 4864);
+        // e490 rebased the loop's iter operand on the way in: `8192 - 4096`.
+        assert_eq!(evaluator.built.len(), 1);
+        let (rebased, value) = evaluator.built[0];
+        assert_eq!(value, 4096);
+        let Op::Sentient(sentient::Op::For { carried, .. }) = &walked[0] else {
+            panic!("the fixture's first op is the sentient.for")
+        };
+        assert_eq!(carried[0].init, rebased);
+        // The add took the memory op's slot, and the memory op moved one later reading its result.
+        assert_eq!(walked.len(), 4);
+        assert_eq!(
+            walked[2],
+            scalar_add(Val(130), Val(11), Val(1), ScalarTy::Index)
+        );
+        assert_eq!(mutable_addr_of(&walked[3], TransferEnd::Src), Val(1));
     }
 }

@@ -272,7 +272,7 @@ pub(crate) fn update_head_of_chain_mutable_addr_initializer<E: ExpressionEvaluat
 
 /// `sentient::AddOp::create(builder, loc, type, lhs, rhs)` — the op, with the location the island does
 /// not carry and the register no allocator has assigned yet.
-fn scalar_add(lhs: Val, rhs: Val, result: Val, ty: ScalarTy) -> Op {
+pub(super) fn scalar_add(lhs: Val, rhs: Val, result: Val, ty: ScalarTy) -> Op {
     Op::Sentient(sentient::Op::ScalarAdd {
         lhs,
         rhs,
@@ -434,7 +434,7 @@ fn for_each_user(
 
 /// `Operation::hasOneUse()` — the number of USES of all of an op's results together, an op reading one
 /// twice counting twice.
-fn uses_of(scope: &[Op], vals: &[Val]) -> usize {
+pub(super) fn uses_of(scope: &[Op], vals: &[Val]) -> usize {
     scope
         .iter()
         .map(|op| {
@@ -452,7 +452,7 @@ fn uses_of(scope: &[Op], vals: &[Val]) -> usize {
 }
 
 /// `*val.user_begin()`.
-fn first_user<'a>(scope: &'a [Op], val: Val) -> Option<&'a Op> {
+pub(super) fn first_user<'a>(scope: &'a [Op], val: Val) -> Option<&'a Op> {
     scope.iter().find_map(|op| {
         if dialects::operands(op).contains(&val) {
             return Some(op);
@@ -464,7 +464,7 @@ fn first_user<'a>(scope: &'a [Op], val: Val) -> Option<&'a Op> {
 }
 
 /// THE OP AT A POSITION, MUTABLY — [`op_at`]'s writing half, for the operand the fall-back arm assigns.
-fn op_at_mut<'a>(scope: &'a mut Vec<Op>, path: &[u32]) -> Option<&'a mut Op> {
+pub(super) fn op_at_mut<'a>(scope: &'a mut Vec<Op>, path: &[u32]) -> Option<&'a mut Op> {
     let (&ordinal, rest) = path.split_first()?;
     if rest.is_empty() {
         return scope.get_mut(ordinal as usize);
@@ -485,7 +485,7 @@ fn op_at_mut<'a>(scope: &'a mut Vec<Op>, path: &[u32]) -> Option<&'a mut Op> {
 
 /// `OpBuilder builder(op)` PLUS THE `create` — the new op takes `at`'s slot and `at`'s op moves one
 /// later, together with every sibling after it.
-fn insert_before(scope: &mut Vec<Op>, path: &[u32], op: Op) {
+pub(super) fn insert_before(scope: &mut Vec<Op>, path: &[u32], op: Op) {
     let Some((&ordinal, rest)) = path.split_first() else {
         return;
     };
@@ -618,7 +618,7 @@ mod unit_tests {
             base_addrs: vec![EvaluatedValue(7)],
             region: RegionSite::ProgramUnitBody,
             memory_unit: DescriptorMemoryUnit::Lx,
-            base_addr: Val(0),
+            base_addr: Some(Val(0)),
             is_base_addr_mutable: false,
         }
     }

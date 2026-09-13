@@ -458,7 +458,7 @@ pub(super) fn mutable_addr_of(op: &Op, end: TransferEnd) -> Val {
 /// `sentient::getIncrementVal(op, target_mem_unit_is_src)` (`SentientOps.cpp:2065-2101`) for the
 /// three ops a looping chain admits. Both stops are the reference's own aborts: its `cast` to
 /// `ConstantOp` (`:2067`) and its trailing `DT_ERROR` (`:2099`).
-fn increment_val(op: &Op, end: TransferEnd, defs: Definitions<'_>) -> i64 {
+pub(super) fn increment_val(op: &Op, end: TransferEnd, defs: Definitions<'_>) -> i64 {
     let increment = match op {
         Op::Sentient(
             sentient::Op::LoadAndSend { increment, .. }
@@ -486,7 +486,7 @@ fn increment_val(op: &Op, end: TransferEnd, defs: Definitions<'_>) -> i64 {
 
 /// `op->getResult(mutable_addr_result_idx_)` (`:3293`) — ⛔ `None` for the second result of a
 /// one-result memory op, which the reference reads out of range.
-fn mutable_result(op: &Op, end: TransferEnd) -> Option<Val> {
+pub(super) fn mutable_result(op: &Op, end: TransferEnd) -> Option<Val> {
     match op {
         Op::Sentient(
             sentient::Op::LoadAndSend { result, .. } | sentient::Op::ReceiveAndStore { result, .. },

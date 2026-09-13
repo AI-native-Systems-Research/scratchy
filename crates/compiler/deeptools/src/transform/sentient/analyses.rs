@@ -290,6 +290,15 @@ pub trait ExpressionEvaluator {
         )
     }
 
+    /// `ExpressionEvaluator::evaluateDivideByConst`
+    /// (`Analyses/ExpressionEvaluatorUtils.h:294`) — `ev / by`.
+    fn evaluate_divide_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+        let _ = (ev, by);
+        todo!(
+            "ExpressionEvaluator::evaluateDivideByConst (Analyses/ExpressionEvaluatorUtils.h:294) — out of campaign scope"
+        )
+    }
+
     /// `ExpressionEvaluator::evaluateMultiplyByConst` (`Analyses/ExpressionEvaluatorUtils.h:285`) for
     /// the DECODED flavour — how e530 turns a derived `B - c` into `B + (c * -1)` before measuring it
     /// against the LRF range.
