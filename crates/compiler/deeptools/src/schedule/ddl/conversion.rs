@@ -1401,7 +1401,7 @@ pub fn verify_ddl_constraint<A: Arch>(
                         match kind {
                             MetaDimKind::PadFront => Extent(pad_edges(padding.sizes).0),
                             MetaDimKind::PadBack => Extent(pad_edges(padding.sizes).1),
-                            MetaDimKind::Stride => Extent(padding.stride.0),
+                            MetaDimKind::Stride => Extent(padding.stride.get()),
                             MetaDimKind::Dilation => Extent(padding.dilation.0),
                             MetaDimKind::Padded => {
                                 stage.padded_extent(dim, PadType::PaddedFullSpanWUnneeded)?

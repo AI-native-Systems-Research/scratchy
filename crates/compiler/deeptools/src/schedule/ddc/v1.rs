@@ -1481,7 +1481,8 @@ pub trait StageSizes {
         padding: PadType,
         density: Density,
     ) -> Extent;
-    /// `dataStageDimToVal_compView_st(dim, unit, corelet, padding)`.
+    /// `dataStageDimToVal_compView_st(dim, unit, corelet, padding)` — at FULL density, which is what
+    /// entry 260 asks for on every trip.
     fn comp_view(
         &self,
         stage: DatastageId,
@@ -1489,6 +1490,21 @@ pub trait StageSizes {
         unit: SenComponent,
         corelet: Option<Corelet>,
         padding: PadType,
+    ) -> Extent {
+        self.comp_view_scaled(stage, dim, unit, corelet, padding, Density::FULL)
+    }
+
+    /// `dataStageDimToVal_compView_st(dim, unit, corelet, padding, density)` — THE GENERAL FORM, whose
+    /// `density` an MX scale tensor's own dim divides the extent by
+    /// (`L3DlOpsScheduler.cpp:6034-6041`).
+    fn comp_view_scaled(
+        &self,
+        stage: DatastageId,
+        dim: PrimaryDim,
+        unit: SenComponent,
+        corelet: Option<Corelet>,
+        padding: PadType,
+        density: Density,
     ) -> Extent;
     /// `lds.scale_.at(getDimIndexInLayoutOrder(dsType_, dim))`, and ⛔ [`None`] IS
     /// `getDimIndexInLayoutOrder < 0` — a dim this ds type's layout order does not name. Entry 259
@@ -2533,6 +2549,7 @@ where
                             alloc_padding,
                             related_pad_dim,
                             step.get(),
+                            Density::FULL,
                             inputs.unpadded,
                         )?;
                         (LoopEleOffset(i32::try_from(offset).ok()?), iterations)
@@ -2647,7 +2664,8 @@ where
 
 /// `is_any_of(allocPadding, PADDED_WZEROPAD, PADDED_FULLSPAN, PADDED_FULLSPAN_WUNNEEDED)` — the three
 /// forms that carry a zero-pad region an index has to be offset past.
-const fn is_zero_padded(padding: PadType) -> bool {
+#[must_use]
+pub const fn is_zero_padded(padding: PadType) -> bool {
     matches!(
         padding,
         PadType::PaddedWZeroPad | PadType::PaddedFullSpan | PadType::PaddedFullSpanWUnneeded
@@ -2660,8 +2678,12 @@ const fn is_zero_padded(padding: PadType) -> bool {
 /// ⛔ `DT_CHECK_MSG(windowDim_ != PrimaryDimTypesCount, "Expect a window-based dimension.")` IS
 /// UNSPELLABLE: [`PaddingSizes::window_dim`] is a [`PrimaryDim`], so "no window dim" is not a value it
 /// can hold — the reference's sentinel is the absence of the entry, which is already the [`Option`].
-#[expect(clippy::too_many_arguments, reason = "the ladder reads eight independent facts")]
-fn padded_loop_offset<P: StageSizes + OffsetSizes + ?Sized>(
+/// ⭐ SHARED WITH THE L3 SCHEDULER'S OWN COPY OF THIS LADDER (`L3DlOpsScheduler.cpp:6042-6122`),
+/// which is this one at the caller's `density` rather than always [`Density::FULL`] — ONE ladder,
+/// because two would be two answers that can disagree about a pad form.
+#[must_use]
+#[expect(clippy::too_many_arguments, reason = "the ladder reads nine independent facts")]
+pub fn padded_loop_offset<P: StageSizes + OffsetSizes + ?Sized>(
     dsc: &P,
     stage: DatastageId,
     dim: PrimaryDim,
@@ -2672,6 +2694,7 @@ fn padded_loop_offset<P: StageSizes + OffsetSizes + ?Sized>(
     alloc_padding: PadType,
     related_pad_dim: Option<PrimaryDim>,
     step: i64,
+    density: Density,
     unpadded: UnpaddedIndexing,
 ) -> Option<i64> {
     match alloc_padding {
@@ -2695,7 +2718,9 @@ fn padded_loop_offset<P: StageSizes + OffsetSizes + ?Sized>(
             if matches!(kind, MetaDimKind::Padded | MetaDimKind::PadValid) {
                 // Indexing the padded dim directly, or its valid part — the zero-pad front is added
                 // as a constant offset by the climb above.
-                return Some(dsc.comp_view(stage, dim, unit, view, padding.get(dim)).0);
+                return Some(
+                    dsc.comp_view_scaled(stage, dim, unit, view, padding.get(dim), density).0,
+                );
             }
             if let Some(sizes) = dsc.stage_padding_sizes(stage, dim) {
                 // Indexing the unpadded dim of a window-based op's result.
@@ -7047,13 +7072,14 @@ mod tests_e258_e263 {
         ) -> Extent {
             self.span
         }
-        fn comp_view(
+        fn comp_view_scaled(
             &self,
             stage: DatastageId,
             _dim: PrimaryDim,
             _unit: SenComponent,
             _corelet: Option<Corelet>,
             _padding: PadType,
+            _density: Density,
         ) -> Extent {
             if stage == NUM { self.span } else { self.step }
         }
@@ -8105,13 +8131,14 @@ mod tests_e307_e309 {
         ) -> Extent {
             Extent(4)
         }
-        fn comp_view(
+        fn comp_view_scaled(
             &self,
             _stage: DatastageId,
             _dim: PrimaryDim,
             _unit: SenComponent,
             _corelet: Option<Corelet>,
             _padding: PadType,
+            _density: Density,
         ) -> Extent {
             Extent(4)
         }

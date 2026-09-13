@@ -644,6 +644,40 @@ impl StartAddress {
         rest.iter().all(|&addr| addr == first).then_some(first)
     }
 
+    /// `getFuncType()` RE-LAID with `foldTypes.front() = Map` and the placed addresses copied over,
+    /// which the reference spells as a `buildFoldSpace` followed by an `apply(copy)`
+    /// (`L3DlOpsScheduler.cpp:5959-5967`) — an indirect address varies from core to core.
+    ///
+    /// ⛔ [`None`] IS `DT_CHECK(foldTypes.size() >= 2)`: a fold space without a corelet axis has no
+    /// core axis to map either.
+    #[must_use]
+    pub fn with_mapped_core(&self) -> Option<Self> {
+        (self.func_types.len() >= 2).then_some(())?;
+        let mut mapped = self.clone();
+        *mapped.func_types.first_mut()? = AddressFold::Map;
+        Some(mapped)
+    }
+
+    /// `getDataAndFoldCoordinates()` FUSED WITH the `insertData` that rewrites each address it yields
+    /// (`L3DlOpsScheduler.cpp:5892-5901`) — the ONE step, since a half-rewritten fold space is not a
+    /// state the reference can be in.
+    ///
+    /// ⛔ [`None`] IS THE CLOSURE'S OWN REFUSAL. An address the caller means to leave alone is
+    /// returned unchanged.
+    pub fn map_addresses<F>(&mut self, mut rewrite: F) -> Option<()>
+    where
+        F: FnMut(Core, Corelet, Bytes) -> Option<Bytes>,
+    {
+        for (&core, per_cl) in &mut self.placed {
+            for (&cl, addrs) in per_cl.iter_mut() {
+                for addr in addrs.iter_mut() {
+                    *addr = rewrite(core, cl, *addr)?;
+                }
+            }
+        }
+        Some(())
+    }
+
     /// `apply({}, std::divides<int64_t>(), scale)` (`ddc/ddcv1.cpp:2426`) — every placed address at
     /// the unit's address granularity.
     #[must_use]

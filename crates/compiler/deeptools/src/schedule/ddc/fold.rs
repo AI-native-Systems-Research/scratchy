@@ -160,6 +160,7 @@
 //! | `e375_coordinateCapture` | 375 | 6 | 86 | `Ddc` | `ddc/ddc_fold.cpp:1538` |
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroI64;
 
 use sys_arch_spec::arch_enums::SenComponent;
 
@@ -656,12 +657,31 @@ impl Cardinality {
 
 /// A PADDED DIMENSION'S STRIDE — `DimPaddingSizes::stride_` (`dsc/dims.h:140`), whose default is 1
 /// and not 0, so an unpadded dim strides by one element rather than standing still.
+///
+/// ⛔ NON-ZERO BY TYPE BECAUSE ENTRY 328 DIVIDES BY IT: `totPadding / padInfo.stride_`
+/// (`L3DlOpsScheduler.cpp:879`) has no guard at all, so a stride of zero is a DIVIDE-BY-ZERO in the
+/// reference. A window that never advances is not a stride, and this is where that is stated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Stride(pub i64);
+pub struct Stride(NonZeroI64);
 
 impl Stride {
     /// The unpadded stride the reference initialises `stride` to (`ddc/ddc_fold.cpp:2115`).
-    pub const ONE: Stride = Stride(1);
+    pub const ONE: Stride = Stride(NonZeroI64::new(1).unwrap());
+
+    /// A stride as the reference stores it, [`None`] for the standing-still zero.
+    #[must_use]
+    pub const fn new(stride: i64) -> Option<Self> {
+        match NonZeroI64::new(stride) {
+            Some(stride) => Some(Self(stride)),
+            None => None,
+        }
+    }
+
+    /// `stride_` itself.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0.get()
+    }
 }
 
 /// A PADDED DIMENSION'S DILATION — `DimPaddingSizes::dilation_` (`dsc/dims.h:141`), whose default is
@@ -1192,7 +1212,7 @@ pub fn build_spatial_fold<S: CoreStage + ?Sized, C: Coordinate + ?Sized>(
     // Corelet spatial fold
     let corelet_alpha = stage
         .first_corelet_share(dim)
-        .map_or(Alpha(0), |share| Alpha(share.0.wrapping_mul(stride.0)));
+        .map_or(Alpha(0), |share| Alpha(share.0.wrapping_mul(stride.get())));
     coord.add_fold(
         dim,
         CoordinateCategory::Spatial,
@@ -1211,7 +1231,7 @@ pub fn build_spatial_fold<S: CoreStage + ?Sized, C: Coordinate + ?Sized>(
         Fold {
             cardinality: stage.work_slices(dim),
             label: Some(FoldLabel::CoreWorksliceFoldDim),
-            alpha: Alpha(stage.core_extent(dim).0.wrapping_mul(stride.0)),
+            alpha: Alpha(stage.core_extent(dim).0.wrapping_mul(stride.get())),
             beta: Beta(0),
         },
     );
@@ -1624,7 +1644,7 @@ mod tests_e086_e093 {
         let mut coord = Coord::default();
         build_spatial_fold(
             &Core {
-                pad_stride: Some(Stride(4)),
+                pad_stride: Stride::new(4),
                 first_corelet: Some(Extent(6)),
                 core_extent: Extent(12),
                 corelets: Cardinality(2),
@@ -1663,7 +1683,7 @@ mod tests_e086_e093 {
         let mut unsplit = Coord::default();
         build_spatial_fold(
             &Core {
-                pad_stride: Some(Stride(4)),
+                pad_stride: Stride::new(4),
                 first_corelet: None,
                 core_extent: Extent(12),
                 corelets: Cardinality(2),
@@ -4154,11 +4174,7 @@ where
         // Experimental, and the reference says so: this belongs inside entry 239.
         if effective.pad != PadType::NoPad && coord.padding(dim) == PadType::NoPad {
             // Divide by the stride.
-            let Some(stride) = core_ds
-                .pad_stride(dim)
-                .map(|stride| stride.0)
-                .filter(|&stride| stride != 0)
-            else {
+            let Some(stride) = core_ds.pad_stride(dim).map(Stride::get) else {
                 return FoldPropagation::ReferenceAborts;
             };
             row_split.alpha = Alpha(row_split.alpha.0 / stride);
