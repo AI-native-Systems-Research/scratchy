@@ -1748,6 +1748,15 @@ pub enum StoreSource {
     /// producers — in `$producer` (`:138-153`), so both the input and the output of that rewrite need
     /// this variant.
     QueryMap(Val),
+    /// THE `sentient.if` RESULT A STORE READS THROUGH WHEN THE GROUP IS CHOSEN BY A PREDICATE — the
+    /// THIRD arm of the same pass ([`StoreSource::Multicast`], [`StoreSource::QueryMap`]).
+    ///
+    /// ⛔⛔ ALSO INEXPRESSIBLE WITHOUT IT. `runOn(ReceiveAndStoreOp)` branches on
+    /// `dyn_cast<sentient::IfOp>(ras.getProducer().getDefiningOp())`
+    /// (`MulticastCanonicalization.cpp:354-355`) and `processConditional` then makes the `if` yield the
+    /// chosen group's `$producer` as a SECOND result, which lands in `$producer` as an ordinary
+    /// [`StoreSource::Wire`] while the group result moves to `$multicast_info` (`:168-296`).
+    Conditional(Val),
 }
 
 impl StoreSource {
@@ -1759,6 +1768,7 @@ impl StoreSource {
             StoreSource::Constant(val) => val,
             StoreSource::Multicast(val) => val,
             StoreSource::QueryMap(val) => val,
+            StoreSource::Conditional(val) => val,
         }
     }
 }

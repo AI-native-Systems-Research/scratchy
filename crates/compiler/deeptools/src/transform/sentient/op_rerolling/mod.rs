@@ -89,11 +89,12 @@
 
 pub(crate) mod unroll_operands;
 
+use crate::islands::dataflow_ir::dialects::dataflow;
 use crate::islands::sentient::dialects::{
-    Op, Val, replace_all_uses_with, results, sentient, use_count,
+    Op, Val, operands, regions_ref, replace_all_uses_with, results, sentient, use_count,
 };
 use crate::transform::sentient::op_rerolling::unroll_operands::{UnrollOperands, XrfIncr};
-use crate::transform::sentient::utils::InBlock;
+use crate::transform::sentient::utils::{InBlock, fold_mode_attribute_if_exists};
 use crate::units::DfirUnit;
 
 /// HOW MANY OPS ONE REROLLED STATEMENT STANDS FOR — `UnrollOperands::unroll_size_`, whose declaration
@@ -258,10 +259,339 @@ fn set_unroll_fields_in_stmt(op: &mut Op, operand_list: &mut UnrollOperands, ty:
     )
 }
 
-// crustify:todo: e519_processOneBlock
-//   authority : dcc/src/Transform/Sentient/OpRerolling.cpp:199  (239 body lines, level 3)
-//   original  : void OpRerollingPass::processOneBlock(SenComponents type, Block *bb)
-//   calls     : e115_reset, e248_getFoldModeAttributeIfExists, e335_fill, e336_match, e338_setUnrollFieldsInStmt, e453_updateRefOpUnrollInfo
+/// `dccExtContext().getArch() == MPW4_ISA` (`:249-257`) — the gate on the DD1 hardware-bug workaround
+/// that never rerolls an XRF-writing mac, and ⛔ A CONSTANT FALSE HERE: [`crate::arch::IsaGen`] names
+/// `RCUDD1A` and `SEN1P5` only, *"a generation no build can select cannot arrive here"*
+/// (`src/arch.rs:20-22`), so no program this crate compiles takes that path. Its other half,
+/// `MacOp::isXrfWtRelated()`, is ported at
+/// [`crate::bridges::dataflow_ir_to_sentient::vc_lowering_xrf::MacXrfIncrements::wt_related`].
+const FORCE_RESET_ON_MPW4_XRF_WRITE: bool = false;
+
+/// Replaces: e519_processOneBlock
+///
+/// Rerolls one block: every op is snapshotted, matched against the statement being built, and either
+/// merged into it or made the start of the next one — with a `fold_AB_A`/`fold_AB_B` pair carried as
+/// TWO statements at once.
+///
+/// ⛔ TRAP: THE FOLD PAIR IS FOUND THROUGH `getNextNode()` (`:266-273`), not through the next
+/// candidate, so a `sentient.scalar_constant` between the halves hides the pair the loop then skips.
+/// ⛔ TRAP: THE STATEMENT IS CLOSED WITH A `ref_op` THAT MAY BE NULL (`:302-311`) — see
+/// [`set_unroll_fields_in_ref_op`], which is why e519 stops at e335 and not at e338.
+/// ⭐ `prev_op_pair` IS WRITTEN SIX TIMES AND NEVER READ — the dead store e453's own note names.
+pub(crate) fn process_one_block(ty: DfirUnit, block: &mut Vec<Op>) {
+    // `auto &last_op = bb->back();` — an empty block has no back to take.
+    let Some(last_op) = block.len().checked_sub(1).map(InBlock) else {
+        return;
+    };
+    let mut curr_op_pair: (Option<InBlock>, Option<InBlock>) = (None, None);
+    let mut ref_op_pair: (Option<InBlock>, Option<InBlock>) = (None, None);
+    let mut prev_op_pair: (Option<InBlock>, Option<InBlock>) = (None, None);
+    let mut ref_list = (UnrollOperands::default(), UnrollOperands::default());
+    let mut ops_to_be_deleted: Vec<InBlock> = Vec::new();
+    let mut fold_ab_mode = false;
+    let mut skip_next = false;
+    for at in 0..block.len() {
+        if is_stepped_over(&block[at]) {
+            continue;
+        }
+        // The DD1 workaround's `force_reset_ref_op`, computed here as the reference does.
+        let force_reset_ref_op = FORCE_RESET_ON_MPW4_XRF_WRITE;
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        // `fold_AB_mode` is the value from the last iteration.
+        let was_last_fold_mode_ab = fold_ab_mode;
+        fold_ab_mode = false;
+        let curr = InBlock(at);
+        curr_op_pair.0 = Some(curr);
+        let curr_op_a_fold = fold_mode_attribute_if_exists(&block[at]);
+        let curr_op_b_fold = block.get(at + 1).and_then(fold_mode_attribute_if_exists);
+        if curr_op_a_fold == Some(sentient::FoldMode::FoldAbA)
+            && curr_op_b_fold == Some(sentient::FoldMode::FoldAbB)
+        {
+            fold_ab_mode = true;
+            skip_next = true;
+            curr_op_pair.1 = Some(InBlock(at + 1));
+        }
+        // A fold pair opening or closing ends whatever statement was being built (`:300-315`).
+        if was_last_fold_mode_ab != fold_ab_mode {
+            set_unroll_fields_in_ref_op(block, ref_op_pair.0, &mut ref_list.0, ty);
+            if was_last_fold_mode_ab {
+                set_unroll_fields_in_ref_op(block, ref_op_pair.1, &mut ref_list.1, ty);
+                ref_list.0.reset();
+                ref_list.1.reset();
+            } else {
+                ref_list.0.reset();
+            }
+        }
+
+        // No statement to match against yet: this op — or this pair — starts one (`:317-347`).
+        if fold_ab_mode {
+            if ref_op_pair.0.is_none() || ref_op_pair.1.is_none() || !was_last_fold_mode_ab {
+                ref_list.0.fill(&block[at], ty);
+                if let Some(second) = curr_op_pair.1 {
+                    ref_list.1.fill(&block[second.0], ty);
+                }
+                if ref_list.0.op_name.is_none() || ref_list.1.op_name.is_none() {
+                    ref_list.0.reset();
+                    ref_list.1.reset();
+                } else {
+                    ref_op_pair = curr_op_pair;
+                    prev_op_pair = curr_op_pair;
+                }
+                continue;
+            }
+        } else if ref_op_pair.0.is_none() || was_last_fold_mode_ab {
+            ref_list.0.fill(&block[at], ty);
+            if ref_list.0.op_name.is_none() {
+                ref_list.0.reset();
+            } else {
+                ref_op_pair.0 = curr_op_pair.0;
+                prev_op_pair.0 = curr_op_pair.0;
+            }
+            continue;
+        }
+
+        // If the op name and precisions are the same and the operands match, this op joins the
+        // statement; otherwise the statement is closed and this op starts the next one.
+        let mut curr_list = (UnrollOperands::default(), UnrollOperands::default());
+        curr_list.0.fill(&block[at], ty);
+        if fold_ab_mode {
+            if let Some(second) = curr_op_pair.1 {
+                curr_list.1.fill(&block[second.0], ty);
+            }
+        }
+
+        if was_last_fold_mode_ab {
+            let pair_rerolls = fold_ab_mode
+                && is_user(block, ref_op_pair.0, curr_op_pair.0, &ops_to_be_deleted)
+                && is_user(block, ref_op_pair.1, curr_op_pair.1, &ops_to_be_deleted)
+                && ref_list.0.matches(&curr_list.0)
+                && ref_list.1.matches(&curr_list.1)
+                && !force_reset_ref_op;
+            if pair_rerolls {
+                merge_into_ref_op(
+                    block,
+                    ty,
+                    curr_op_pair.0,
+                    ref_op_pair.0,
+                    last_op,
+                    &mut ref_list.0,
+                    &curr_list.0,
+                    &mut ops_to_be_deleted,
+                );
+                merge_into_ref_op(
+                    block,
+                    ty,
+                    curr_op_pair.1,
+                    ref_op_pair.1,
+                    last_op,
+                    &mut ref_list.1,
+                    &curr_list.1,
+                    &mut ops_to_be_deleted,
+                );
+            } else {
+                close_and_restart(
+                    block,
+                    ty,
+                    &mut ref_op_pair.0,
+                    &mut prev_op_pair.0,
+                    &mut ref_list.0,
+                    curr_op_pair.0,
+                    &curr_list.0,
+                );
+                close_and_restart(
+                    block,
+                    ty,
+                    &mut ref_op_pair.1,
+                    &mut prev_op_pair.1,
+                    &mut ref_list.1,
+                    curr_op_pair.1,
+                    &curr_list.1,
+                );
+            }
+        } else if !fold_ab_mode
+            && is_user(block, ref_op_pair.0, curr_op_pair.0, &ops_to_be_deleted)
+            && ref_list.0.matches(&curr_list.0)
+            && !force_reset_ref_op
+        {
+            merge_into_ref_op(
+                block,
+                ty,
+                curr_op_pair.0,
+                ref_op_pair.0,
+                last_op,
+                &mut ref_list.0,
+                &curr_list.0,
+                &mut ops_to_be_deleted,
+            );
+        } else {
+            close_and_restart(
+                block,
+                ty,
+                &mut ref_op_pair.0,
+                &mut prev_op_pair.0,
+                &mut ref_list.0,
+                curr_op_pair.0,
+                &curr_list.0,
+            );
+        }
+    }
+    // `dropAllUses(); erase();` (`:427-434`) — an op leaves by POSITION, so the queue leaves
+    // highest-first, and dropping the uses is what removing the definition is here.
+    // ⭐ THE REFERENCE ONLY SKIPS A **CONSECUTIVE** REPEAT; a non-consecutive one would be erased
+    // twice, and cannot arise because e453 queues a logical port only while nothing else reads it.
+    let mut doomed: Vec<usize> = ops_to_be_deleted.iter().map(|op| op.0).collect();
+    doomed.sort_unstable();
+    doomed.dedup();
+    for at in doomed.into_iter().rev() {
+        block.remove(at);
+    }
+}
+
+/// `isa<sentient::ConstantOp, dataflow::GetUnitOp, sentient::LogicalPortOp>` (`:232-234`) — the three
+/// ops the walk steps over without closing anything.
+///
+/// ⭐ `sentient::ConstantOp` IS `sentient.scalar_constant` (`SentientOps.td:848`) and NOT the vector
+/// one, which is a candidate like any other op.
+fn is_stepped_over(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Sentient(sentient::Op::ScalarConstant { .. } | sentient::Op::LogicalPort { .. })
+            | Op::Dataflow(dataflow::Op::GetUnit { .. })
+    )
+}
+
+/// `setUnrollFieldsInStmt(ref_op, ref_operand_list, type)` WHERE `ref_op` MAY BE NULL.
+///
+/// ⭐⭐ e338'S OWN FIRST TWO STATEMENTS RETURN FOR AN ABSENT SNAPSHOT OR UN-UPDATED FIELDS
+/// (`:1041-1043`) — BEFORE it reads `op` — which is how the reference survives being handed a null
+/// `ref_op` at `:302`, `:308` and `:369`. Asking that question here is what keeps the seam a rerolled
+/// program actually reaches visible: e519 stops at e335, not at e338.
+/// ⛔ DIVERGENCE: past that guard the reference would dereference the null; there is nothing to write
+/// to instead, so nothing is written.
+fn set_unroll_fields_in_ref_op(
+    block: &mut [Op],
+    ref_op: Option<InBlock>,
+    ref_operand_list: &mut UnrollOperands,
+    ty: DfirUnit,
+) {
+    if ref_operand_list.op_name.is_none() || !ref_operand_list.are_unroll_fields_updated {
+        return;
+    }
+    let Some(ref_op) = ref_op else {
+        return;
+    };
+    set_unroll_fields_in_stmt(&mut block[ref_op.0], ref_operand_list, ty);
+}
+
+/// [`update_ref_op_unroll_info`] FOR A PAIR HALF THAT MAY BE ABSENT — the reference passes raw
+/// pointers, and both are non-null on every path that reaches the call.
+fn merge_into_ref_op(
+    block: &mut [Op],
+    ty: DfirUnit,
+    curr_op: Option<InBlock>,
+    ref_op: Option<InBlock>,
+    last_op: InBlock,
+    ref_operand_list: &mut UnrollOperands,
+    curr_operand_list: &UnrollOperands,
+    ops_to_be_deleted: &mut Vec<InBlock>,
+) {
+    let (Some(curr_op), Some(ref_op)) = (curr_op, ref_op) else {
+        return;
+    };
+    update_ref_op_unroll_info(
+        block,
+        curr_op,
+        ref_op,
+        last_op,
+        ref_operand_list,
+        curr_operand_list,
+        ops_to_be_deleted,
+        ty,
+    );
+}
+
+/// THE `else` ARM `processOneBlock` WRITES OUT THREE TIMES (`:365-397`, `:406-419`) — close the
+/// statement, then start the next one from `curr_op`'s snapshot, or from nothing where that snapshot
+/// is the `"NA"` sentinel.
+///
+/// ⭐ THIS IS e454 WITH ITS DEAD STORES MADE LIVE, which is exactly what that unit's note says the
+/// reference does instead of calling it: `ref_op` and `prev_op` reach the caller here.
+fn close_and_restart(
+    block: &mut [Op],
+    ty: DfirUnit,
+    ref_op: &mut Option<InBlock>,
+    prev_op: &mut Option<InBlock>,
+    ref_operand_list: &mut UnrollOperands,
+    curr_op: Option<InBlock>,
+    curr_operand_list: &UnrollOperands,
+) {
+    set_unroll_fields_in_ref_op(block, *ref_op, ref_operand_list, ty);
+    ref_operand_list.reset();
+    // Only copy when the op is a legal type.
+    if curr_operand_list.op_name.is_none() {
+        *ref_op = None;
+        *prev_op = None;
+    } else {
+        *ref_op = curr_op;
+        *prev_op = curr_op;
+        ref_operand_list.assign_from(curr_operand_list);
+    }
+}
+
+/// `is_user(prev_op, curr_op)` (`:212-230`) — whether `curr_op` is the only reader of `prev_op` left,
+/// counting the ops already queued for deletion as gone.
+///
+/// ⛔ TRAP: ITS `prev_op` PARAMETER IS PASSED `ref_op` AT BOTH CALL SITES (`:355`, `:399`), so the
+/// question is about the statement being built and not about the previous op at all.
+/// ⛔ TRAP: THE EMPTY-QUEUE TEST IS REDUNDANT (`:224-228`) — `find` over an empty list already fails.
+/// ⭐ A READER INSIDE A REGION IS NEITHER `curr_op` NOR DELETABLE, so it refuses the merge.
+fn is_user(
+    block: &[Op],
+    prev_op: Option<InBlock>,
+    curr_op: Option<InBlock>,
+    ops_to_be_deleted: &[InBlock],
+) -> bool {
+    let (Some(prev_op), Some(curr_op)) = (prev_op, curr_op) else {
+        return false;
+    };
+    let produced = results(&block[prev_op.0]);
+    // Both without results is a merge; a `prev_op` without results and a `curr_op` with them is not.
+    if produced.is_empty() {
+        return results(&block[curr_op.0]).is_empty();
+    }
+    let mut any_user = false;
+    for (at, op) in block.iter().enumerate() {
+        if regions_ref(op)
+            .iter()
+            .any(|region| block_reads(region, &produced))
+        {
+            return false;
+        }
+        if !operands(op).iter().any(|val| produced.contains(val)) {
+            continue;
+        }
+        any_user = true;
+        let user = InBlock(at);
+        if user != curr_op && !ops_to_be_deleted.contains(&user) {
+            return false;
+        }
+    }
+    // `prev_op->use_empty()` — results nobody reads are not a statement to extend.
+    any_user
+}
+
+/// Whether anything in a region — at any depth — reads one of `produced`.
+fn block_reads(block: &[Op], produced: &[Val]) -> bool {
+    block.iter().any(|op| {
+        operands(op).iter().any(|val| produced.contains(val))
+            || regions_ref(op)
+                .iter()
+                .any(|region| block_reads(region, produced))
+    })
+}
 
 // crustify:todo: e571_runOpRerolling
 //   authority : dcc/src/Transform/Sentient/OpRerolling.cpp:1008  (29 body lines, level 4)
@@ -351,6 +681,57 @@ mod unit_tests {
             &mut to_delete,
             DfirUnit::Pe,
         );
+    }
+
+    /// `%c = sentient.scalar_constant {value = 0 : si64} : index`.
+    fn scalar_constant(result: u32) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value: 0,
+            result: Val(result),
+            reg_locale: sentient::RegType::Imm,
+            ty: crate::islands::dataflow_ir::ty::ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `%u = dataflow.get_unit {type = pe} : index`.
+    fn get_unit(result: u32) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result: Val(result),
+            residency: crate::units::Residency::Global,
+            unit: DfirUnit::Pe,
+            num_folds: None,
+        })
+    }
+
+    /// e519 — THE WALK STEPS OVER THE THREE OPS IT IS TOLD TO and snapshots the first real candidate,
+    /// which is e335. ⭐ REACHING THAT SEAM IS WHAT IS TESTABLE: every path through the block bottoms
+    /// out in it at the first candidate, so a program cannot be rerolled until e335 lands.
+    #[test]
+    #[should_panic(expected = "senpass e335")]
+    fn e519_snapshots_the_first_candidate_at_the_unported_e335() {
+        let mut block = vec![
+            get_unit(0),
+            logical_port(1, Port::Lrf(LrfIndex::L0)),
+            scalar_constant(2),
+            splat(1, 3),
+        ];
+        process_one_block(DfirUnit::Pe, &mut block);
+    }
+
+    /// e519 — a block of nothing but stepped-over ops closes no statement and deletes nothing, which
+    /// is the negative the skip list exists for: `ref_op` stays null and e338's own guard is what
+    /// keeps that harmless.
+    #[test]
+    fn e519_leaves_a_block_of_stepped_over_ops_alone() {
+        let untouched = vec![
+            get_unit(0),
+            logical_port(1, Port::Lrf(LrfIndex::L0)),
+            scalar_constant(2),
+        ];
+        let mut block = untouched.clone();
+        process_one_block(DfirUnit::Pe, &mut block);
+        assert_eq!(block, untouched);
     }
 
     /// e454 — closing the statement is e338, which is not ported, so the reset and the copy after it

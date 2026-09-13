@@ -89,8 +89,10 @@
 
 use std::collections::BTreeSet;
 
-use super::{erase_deleted_ops, move_ssa_to_init};
+use super::{carried_arg, erase_deleted_ops, move_ssa_to_init};
+use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects as lower;
+use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, Val, dataflow, sentient, symbol, uniform,
 };
@@ -357,15 +359,187 @@ pub fn post_processing<L: Liveness>(
     }
 }
 
-// crustify:todo: e517_getSource
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1144  (38 body lines, level 3)
-//   original  : void RegisterInitCandidatePromoter::getSource( mlir::Value core, mlir::Value val, OpBuilder &const_builder, dcc::utils::UnitsAndTheirValues &results)
-//   calls     : e252_size, e333_constructValues, e396_replaceValue, e422_insert
+/// The `sentient.for` position `val` arrives as, MUTABLY — [`carried_arg`]'s other half.
+fn carried_arg_mut(val: Val, scope: &mut [Op]) -> Option<&mut sentient::Carried> {
+    for op in scope.iter_mut() {
+        match op {
+            Op::Sentient(sentient::Op::For { carried, body, .. }) => {
+                if carried.iter().any(|position| position.arg == val) {
+                    return carried.iter_mut().find(|position| position.arg == val);
+                }
+                if let Some(found) = carried_arg_mut(val, body) {
+                    return Some(found);
+                }
+            }
+            Op::Sentient(inner) => {
+                for region in sentient::regions_mut(inner) {
+                    if let Some(found) = carried_arg_mut(val, region) {
+                        return Some(found);
+                    }
+                }
+            }
+            Op::AffineFor(loop_op) => {
+                if let Some(found) = carried_arg_mut(val, &mut loop_op.body) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
-// crustify:todo: e518_replace
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1184  (17 body lines, level 3)
-//   original  : void RegisterInitCandidatePromoter::replace(mlir::Value val, mlir::Value copy_op_result)
-//   calls     : e422_insert
+/// Replaces: e517_getSource
+///
+/// Pairs every unit with the value a shared register init loads there, cloning each such value to the
+/// top of the unit body so one copy can serve them all.
+///
+/// ⛔ TRAP: A SOURCE DEFINED OUTSIDE THIS UNIT IS LEFT ALONE — `isa<func::FuncOp>(parent)` (`:1159`),
+/// which at this rung is having no defining op in the body at all.
+/// ⛔ TRAP: A MULTICAST GROUP TAKES ITS PRODUCER AND EVERY CONSUMER under ONE mapper (`:1162-1175`).
+/// ⚠️ DIVERGENCE: `const_builder` inserts BEFORE the program unit, which this island cannot hold.
+pub fn get_source<U: UniformGroups>(
+    unit: &mut Vec<Op>,
+    core: Val,
+    val: Val,
+    results: &mut UnitsAndTheirValues,
+    to_be_erased: &mut BTreeSet<Val>,
+    values: &mut Values,
+    uga: &U,
+) {
+    // `isa<BlockArgument>(val)` — `for_op.getIterOperands()[arg.getArgNumber() - 1]` (`:1147-1151`).
+    if let Some(position) = carried_arg(val, unit) {
+        let src = position.init;
+        let regions: [&[Op]; 1] = [unit];
+        construct_values(src, core, results, Definitions::from_innermost(&regions), uga);
+        return;
+    }
+    // `DT_CHECK(copy_op)` — a candidate that is not a `sentient.scalar_copy` has no source to take.
+    let Some(Op::Sentient(sentient::Op::ScalarCopy { input, .. })) =
+        dialects::defining_op(val, unit)
+    else {
+        return;
+    };
+    let copy_inp = *input;
+    let old_size = results.size();
+    {
+        let regions: [&[Op]; 1] = [unit];
+        construct_values(
+            copy_inp,
+            core,
+            results,
+            Definitions::from_innermost(&regions),
+            uga,
+        );
+    }
+    let mut const_at = 0;
+    for index in old_size..results.size() {
+        // ⚠️ A NULL `src` WOULD BE `src.getDefiningOp()` ON NULL: skipped rather than aborting, and
+        // `constructValues` only leaves one where a query map has no entry for that unit.
+        let Some(src) = results.pairs[index].1 else {
+            continue;
+        };
+        let Some(src_op) = dialects::defining_op(src, unit).cloned() else {
+            continue;
+        };
+        let to_clone: Vec<Op> = match &src_op {
+            Op::Dataflow(dataflow::Op::CreateMulticastGroup {
+                producer,
+                consumers,
+                ..
+            }) => {
+                let mut reached: Vec<Op> = core::iter::once(*producer)
+                    .chain(consumers.iter().copied())
+                    .filter_map(|reached| dialects::defining_op(reached, unit).cloned())
+                    .collect();
+                reached.push(src_op.clone());
+                reached
+            }
+            _ => vec![src_op.clone()],
+        };
+        let clones = dialects::clone_ops(&to_clone, values, &mut ValueMapping::new());
+        let Some(new_src) = clones
+            .last()
+            .and_then(|op| dialects::results(op).first().copied())
+        else {
+            continue;
+        };
+        let count = clones.len();
+        for (offset, clone) in clones.into_iter().enumerate() {
+            unit.insert(const_at + offset, clone);
+        }
+        const_at += count;
+        dialects::replace_all_uses_with(unit, src, new_src);
+        to_be_erased.insert(src);
+        // `results.replaceValue(index, new_src)` (`e396`, still its own open unit) — one pair's value.
+        results.pairs[index].1 = Some(new_src);
+    }
+}
+
+/// Replaces: e518_replace
+///
+/// Points a promoted candidate's readers at the one hoisted `sentient.scalar_copy`, giving that copy
+/// the element size the candidate had.
+///
+/// ⛔ TRAP: A LOOP-CARRIED CANDIDATE REWIRES THE LOOP'S INITIAL VALUE, NOT ITS USES (`:1188`), takes
+/// its size from that position's `element_sizes` slot, and does NOT erase the old copy (`:1197`) —
+/// the loop still reads it.
+pub fn replace(
+    unit: &mut Vec<Op>,
+    val: Val,
+    copy_op_result: Val,
+    to_be_erased: &mut BTreeSet<Val>,
+    all_replacement_pairs: &mut Vec<(Val, Val)>,
+) {
+    let element_size = match carried_arg_mut(val, unit) {
+        Some(position) => {
+            position.init = copy_op_result;
+            position.element_size
+        }
+        None => {
+            dialects::replace_all_uses_with(unit, val, copy_op_result);
+            let old = match dialects::defining_op(val, unit) {
+                Some(Op::Sentient(sentient::Op::ScalarCopy { element_size, .. })) => *element_size,
+                _ => None,
+            };
+            to_be_erased.insert(val);
+            old
+        }
+    };
+    if let Some(slot) = copy_element_size_mut(copy_op_result, unit) {
+        *slot = element_size;
+    }
+    all_replacement_pairs.push((val, copy_op_result));
+}
+
+/// The `element_size` slot of the `sentient.scalar_copy` that defines `val`, at any depth.
+fn copy_element_size_mut(val: Val, scope: &mut [Op]) -> Option<&mut Option<Bits>> {
+    for op in scope {
+        if let Op::Sentient(inner) = op {
+            if let sentient::Op::ScalarCopy {
+                result,
+                element_size,
+                ..
+            } = inner
+            {
+                if *result == val {
+                    return Some(element_size);
+                }
+                continue;
+            }
+            for region in sentient::regions_mut(inner) {
+                if let Some(found) = copy_element_size_mut(val, region) {
+                    return Some(found);
+                }
+            }
+        } else if let Op::AffineFor(loop_op) = op
+            && let Some(found) = copy_element_size_mut(val, &mut loop_op.body)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
 
 // crustify:todo: e606_run
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:811  (224 body lines, level 5)
@@ -376,7 +550,12 @@ pub fn post_processing<L: Liveness>(
 mod unit_tests {
     use std::collections::BTreeSet;
 
-    use super::{construct_values, is_same_op_type, is_within_global_region, post_processing};
+    use super::{
+        construct_values, get_source, is_same_op_type, is_within_global_region, post_processing,
+        replace,
+    };
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::dialects as lower;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{
@@ -612,6 +791,15 @@ mod unit_tests {
         })
     }
 
+    /// [`scalar_copy`] carrying an `element_size` — the attribute `e518` moves.
+    fn sized_copy(result: u32, input: u32, element_size: Option<Bits>) -> Op {
+        let mut op = scalar_copy(result, input);
+        if let Op::Sentient(sentient::Op::ScalarCopy { element_size: slot, .. }) = &mut op {
+            *slot = element_size;
+        }
+        op
+    }
+
     /// e452 — the pending erasure happens FIRST, liveness is rebuilt over what is left with the virtual
     /// assignments kept, and every candidate is both told to liveness and marked in the IR.
     #[test]
@@ -635,5 +823,109 @@ mod unit_tests {
                 ..
             })
         ));
+    }
+
+    /// e517 — the source behind a candidate is cloned to the top of the unit, its readers rewired and
+    /// the original marked for erasure; a source defined OUTSIDE the unit is left where it is.
+    #[test]
+    fn e517_hoists_the_source_and_leaves_an_outside_one_alone() {
+        let mut unit = vec![
+            Op::Dataflow(get_unit(1)),
+            scalar_constant(5),
+            scalar_copy(6, 5),
+            // A second candidate whose source `%7` nothing in this unit defines.
+            scalar_copy(8, 7),
+        ];
+        let mut values = Values::default();
+        for _ in 0..9 {
+            let _ = values.mint();
+        }
+        let uga = Groups {
+            leader: Val(1),
+            followers: Vec::new(),
+        };
+        let mut results = UnitsAndTheirValues::default();
+        let mut to_be_erased = BTreeSet::new();
+        get_source(
+            &mut unit,
+            Val(1),
+            Val(6),
+            &mut results,
+            &mut to_be_erased,
+            &mut values,
+            &uga,
+        );
+        let hoisted = results.pairs[0].1.expect("the source was replaced by its clone");
+        assert_ne!(hoisted, Val(5));
+        assert_eq!(to_be_erased, BTreeSet::from([Val(5)]));
+        // The clone leads the body and the candidate now reads it.
+        assert_eq!(super::dialects::results(&unit[0]), vec![hoisted]);
+        assert_eq!(unit[3], scalar_copy(6, hoisted.0));
+
+        // `%7` has no defining op here — the reference's `isa<func::FuncOp>` skip.
+        let before = unit.clone();
+        let mut outside = UnitsAndTheirValues::default();
+        get_source(
+            &mut unit,
+            Val(1),
+            Val(8),
+            &mut outside,
+            &mut to_be_erased,
+            &mut values,
+            &uga,
+        );
+        assert_eq!(outside.pairs, vec![(Val(1), Some(Val(7)))]);
+        assert_eq!(unit, before);
+        assert_eq!(to_be_erased, BTreeSet::from([Val(5)]));
+    }
+
+    /// e518 — a loop-carried candidate rewires the loop's initial value and keeps the old copy; any
+    /// other candidate has its uses rewired, its copy erased, and both give the new copy their size.
+    #[test]
+    fn e518_rewires_the_loop_operand_or_the_uses() {
+        let mut unit = vec![
+            sized_copy(2, 1, Some(Bits(16))),
+            sized_copy(4, 3, None),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(10),
+                bound: Val(2),
+                bound_reg: None,
+                carried: vec![sentient::Carried {
+                    init: Val(11),
+                    arg: Val(12),
+                    result: Val(13),
+                    reg: sentient::Reg {
+                        locale: sentient::RegType::Lccr,
+                        index: None,
+                    },
+                    program_header: false,
+                    element_size: Some(Bits(8)),
+                }],
+                dbg_name: None,
+                body: vec![scalar_copy(14, 12)],
+            }),
+        ];
+        let mut to_be_erased = BTreeSet::new();
+        let mut pairs = Vec::new();
+
+        // The loop-carried arm: `%12` is the body argument, `%4` the fresh copy.
+        replace(&mut unit, Val(12), Val(4), &mut to_be_erased, &mut pairs);
+        let Op::Sentient(sentient::Op::For { carried, body, .. }) = &unit[2] else {
+            unreachable!("the loop is still there")
+        };
+        assert_eq!(carried[0].init, Val(4));
+        assert_eq!(body[0], scalar_copy(14, 12));
+        assert_eq!(unit[1], sized_copy(4, 3, Some(Bits(8))));
+        assert!(to_be_erased.is_empty());
+
+        // The other arm: `%2`'s uses move to `%4` and `%2`'s own copy is marked for erasure.
+        replace(&mut unit, Val(2), Val(4), &mut to_be_erased, &mut pairs);
+        let Op::Sentient(sentient::Op::For { bound, .. }) = &unit[2] else {
+            unreachable!("the loop is still there")
+        };
+        assert_eq!(*bound, Val(4));
+        assert_eq!(unit[1], sized_copy(4, 3, Some(Bits(16))));
+        assert_eq!(to_be_erased, BTreeSet::from([Val(2)]));
+        assert_eq!(pairs, vec![(Val(12), Val(4)), (Val(2), Val(4))]);
     }
 }

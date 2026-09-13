@@ -82,9 +82,12 @@
 
 pub(crate) mod loop_peeling_manager;
 
-use crate::islands::sentient::dialects::{Op, sentient};
+use std::collections::BTreeMap;
+
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 use crate::islands::sentient::print;
 use crate::transform::sentient::ForRef;
+use crate::transform::sentient::utils::{ForLoopInfo, NormalizedIv, for_loop_info_if_iv};
 
 /// WHICH ITERATION(S) OF A LOOP GET PEELED — `LoopPeelingManager::PeelingType`
 /// (`dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:86-91`).
@@ -241,8 +244,8 @@ fn for_op_at(unit: &[Op], loop_ref: ForRef) -> Option<&Op> {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Peeling, PeelingCandidates, PeelingType};
-    use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use super::{IvLoopInfo, Peeling, PeelingCandidates, PeelingType};
+    use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
     use crate::transform::sentient::ForRef;
 
     /// The four spellings `updateDbgName` writes into `MDLP(..)`.
@@ -275,6 +278,39 @@ mod unit_tests {
         );
     }
 
+    /// e515 — an induction variable resolves once and is then answered from the cache; anything
+    /// else is not cached and stays `None`.
+    #[test]
+    fn get_or_create_tuple_for_iv_caches_only_a_hit() {
+        let unit = vec![
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: 4,
+                result: Val(9),
+                reg_locale: sentient::RegType::Imm,
+                ty: crate::islands::dataflow_ir::ty::ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(1),
+                bound: Val(9),
+                bound_reg: None,
+                carried: Vec::new(),
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+        ];
+        let regions: [&[Op]; 1] = [&unit];
+        let defs = Definitions::from_innermost(&regions);
+
+        let mut cache = IvLoopInfo::default();
+        let info = cache.get_or_create(Val(1), defs).expect("Val(1) is the IV");
+        assert_eq!(info.loop_op, ForRef(Val(1)));
+        assert_eq!((info.lower_bound, info.step, info.iterations), (4, -1, 4));
+        // The second ask is the cache's, and the constant is not an induction variable at all.
+        assert_eq!(cache.get_or_create(Val(1), defs), Some(info));
+        assert_eq!(cache.get_or_create(Val(9), defs), None);
+    }
+
     /// e321 — nothing to peel is one line; one record spells its mode and then prints the loop it
     /// names, body included.
     #[test]
@@ -300,10 +336,28 @@ mod unit_tests {
     }
 }
 
-// crustify:todo: e515_getOrCreateTupleForIV
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:149  (8 body lines, level 3)
-//   original  : std::tuple<Operation *, int64_t, int64_t, int64_t, int64_t> getOrCreateTupleForIV(Value val)
-//   calls     : e242_getForLoopInfoIfIV, e422_insert
+/// `LoopPeelingManager::iv_to_loop_info_` — every value this pass has already resolved as an
+/// induction variable (`MultiDimLoopPeeling.cpp:132`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IvLoopInfo(BTreeMap<Val, ForLoopInfo>);
+
+impl IvLoopInfo {
+    /// Replaces: e515_getOrCreateTupleForIV
+    ///
+    /// The loop and bounds `val` names as a BARE induction variable, resolved once and remembered.
+    ///
+    /// ⛔ TRAP: ONLY A HIT IS CACHED (`:155`), so a `val` that is not an induction variable is
+    /// re-resolved on every ask — the reference's `{nullptr,-1,-1,-1,-1}` is the `None` here.
+    /// ⛔ TRAP: `allow_normalized_iv` IS `false` (`:153`) — a `const - iv` is NOT this loop's IV.
+    pub fn get_or_create(&mut self, val: Val, defs: Definitions<'_>) -> Option<ForLoopInfo> {
+        if let Some(cached) = self.0.get(&val) {
+            return Some(*cached);
+        }
+        let info = for_loop_info_if_iv(val, NormalizedIv::Rejected, defs)?;
+        self.0.insert(val, info);
+        Some(info)
+    }
+}
 
 // crustify:todo: e643_runOnOperation
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:738  (34 body lines, level 7)

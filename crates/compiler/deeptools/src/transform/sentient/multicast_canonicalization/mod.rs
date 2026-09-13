@@ -83,6 +83,8 @@
 //! | `e569_runOn` | 569 | 4 | 43 | `dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:327` |
 //! | `e605_runOn` | 605 | 5 | 24 | `dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:371` |
 
+use std::collections::BTreeMap;
+
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{dataflow, uniform};
@@ -249,8 +251,9 @@ pub fn create_new_producer_qmap(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        DirectMulticast, ProducerQMap, create_new_producer_qmap, process_direct_multicast,
-        process_qmap_of_direct_multicast, run_on_operation,
+        Conditional, DirectMulticast, InBlock, ProducerQMap, create_new_producer_qmap,
+        process_conditional, process_direct_multicast, process_qmap_of_direct_multicast,
+        run_on_operation,
     };
     use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
@@ -506,6 +509,88 @@ mod unit_tests {
                 if producer == StoreSource::QueryMap(Val(11)) && multicast_info == Some(qmap)
         ));
     }
+    /// e516 — THE VENDOR'S OWN CASE (`:24-43`): the group each region yields gains that group's
+    /// `$producer` beside it, the `if` gains the matching result, and the store reads the new result
+    /// with the group in `$multicast_info`. ⭐ The register the `if` result carried is gone with the
+    /// clone, which is what `cloneIfOp`'s empty attribute arrays mean.
+    #[test]
+    fn e516_yields_the_producer_beside_the_conditionally_chosen_group() {
+        let (g1, g2) = (Val(1), Val(2));
+        let (u3, u4) = (Val(3), Val(4));
+        let chosen = Val(5);
+        let mut body = vec![
+            group(g1, u3),
+            group(g2, u4),
+            Op::Sentient(sentient::Op::If {
+                predicate: sentient::CmpPredicate::Eq,
+                lhs: Val(6),
+                rhs: Val(0),
+                yielded: vec![sentient::Yielded {
+                    result: chosen,
+                    reg: sentient::Reg {
+                        locale: sentient::RegType::Lrf,
+                        index: Some(sentient::RegIndex::at::<2>()),
+                    },
+                }],
+                dbg_name: None,
+                then_body: vec![Op::Sentient(sentient::Op::Yield { results: vec![g1] })],
+                else_body: vec![Op::Sentient(sentient::Op::Yield { results: vec![g2] })],
+            }),
+            store(StoreSource::Conditional(chosen), Val(7)),
+        ];
+        let mut values = Values::default();
+        for _ in 0..8 {
+            let _ = values.mint();
+        }
+        assert_eq!(
+            process_conditional(chosen, InBlock(2), &mut body, &mut values),
+            Conditional::Split
+        );
+        let unassigned = sentient::Reg {
+            locale: sentient::RegType::Unknown,
+            index: None,
+        };
+        let Op::Sentient(sentient::Op::If {
+            yielded,
+            then_body,
+            else_body,
+            ..
+        }) = &body[2]
+        else {
+            panic!("the conditional survives")
+        };
+        assert_eq!(
+            *yielded,
+            vec![
+                sentient::Yielded {
+                    result: chosen,
+                    reg: unassigned,
+                },
+                sentient::Yielded {
+                    result: Val(8),
+                    reg: unassigned,
+                },
+            ]
+        );
+        assert_eq!(
+            *then_body,
+            vec![Op::Sentient(sentient::Op::Yield {
+                results: vec![g1, u3]
+            })]
+        );
+        assert_eq!(
+            *else_body,
+            vec![Op::Sentient(sentient::Op::Yield {
+                results: vec![g2, u4]
+            })]
+        );
+        assert!(matches!(
+            body[3],
+            Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
+                if producer == StoreSource::Wire(RecvEnd::from_multicast_group(Val(8)))
+                    && multicast_info == Some(chosen)
+        ));
+    }
 }
 
 /// `-dcc-multicast-canonicalization-disable`, `cl::init(false)` (`:72-75`) — a `dcc-opt` command-line
@@ -602,10 +687,289 @@ fn assign_producer_qmap(block: &mut [Op], query_map: Val, new_query_map: Val) {
     }
 }
 
-// crustify:todo: e516_processConditional
-//   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:168  (129 body lines, level 3)
-//   original  : void MulticastCanonicalizationPass::processConditional( sentient::ReceiveAndStoreOp ras, sentient::IfOp top_if_op)
-//   calls     : e099_createNewProducerQMap, e252_size, e422_insert
+/// WHERE THE TOP `sentient.if` SITS IN THE BLOCK THAT HOLDS IT — `top_if_op` as a POSITION, because
+/// the walk rewrites the block it was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InBlock(pub usize);
+
+/// WHETHER THE CONDITIONAL TURNED OUT TO BE A MULTICAST ONE — the reference's two exits (`:263-272`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Conditional {
+    /// The `if` gained a `$producer` result and every store on it was moved onto it.
+    Split,
+    /// No region yielded a group, so nothing was rewritten — *"did not identify as a multicast
+    /// scenario"* (`:264-266`).
+    NotAMulticast,
+}
+
+/// WHAT THE WALK REMEMBERS ABOUT EVERY `sentient.if` IT HAS PASSED — the reference's
+/// `std::map<sentient::IfOp, std::map<int, int>>` plus what an in-place growth needs beside it.
+///
+/// ⭐ AN `if` IS KEYED BY ITS FIRST RESULT. Op identity in a tree being rewritten cannot be a borrow,
+/// and [`Values`] mints a result value unique to the op that binds it, so that value IS the op.
+#[derive(Debug, Default)]
+struct IndexMaps {
+    /// Per `if`: old result index -> new result index.
+    old_to_new: BTreeMap<Val, BTreeMap<usize, usize>>,
+    /// Every result of every visited `if`, back to that `if`'s key.
+    key_of_result: BTreeMap<Val, Val>,
+    /// Per `if`: its result values AFTER it grew — `if_op.getResult(i)` for the new indices.
+    results: BTreeMap<Val, Vec<Val>>,
+    /// [`create_new_producer_qmap`]'s two ops, each with the mapping they are built in front of.
+    inserted: Vec<(Val, ProducerQMap)>,
+}
+
+/// Replaces: e516_processConditional
+///
+/// Splits a conditionally chosen multicast group in two: every region of the `sentient.if` yields the
+/// group's `$producer` beside the group itself, and every store on that `if` then reads the new result
+/// as `$producer` with the old one as `$multicast_info`.
+///
+/// ⛔ TRAP: `cloneIfOp` LEAVES `regLocales`/`regIndices` EMPTY (`Dialect/Sentient/Utils.hpp:56-57`),
+/// so EVERY result of a grown `if` comes back unassigned — not only the ones it gained.
+/// ⛔ TRAP: A NESTED `if`'S FORWARDED RESULT IS LOOKED UP BY ITS POSITION IN **THIS** YIELD (`:225`),
+/// not by its own result index among the nested `if`'s results.
+/// ⭐ THE CLONE IS AN IN-PLACE GROWTH HERE, so *"the producer still defines from `top_if_op`"* (`:263`)
+/// — the exit that changes nothing — is "the top `if` did not grow".
+pub fn process_conditional(
+    producer: Val,
+    top_if: InBlock,
+    body: &mut Vec<Op>,
+    values: &mut Values,
+) -> Conditional {
+    // The tree as it was before the rewrite — `operand.getDefiningOp()` for a yield operand reaches
+    // both outwards and inwards, and the ops it finds are the ones the walk does not touch.
+    let snapshot = body.clone();
+    let mut maps = IndexMaps::default();
+    let Some(Op::Sentient(top)) = body.get_mut(top_if.0) else {
+        return Conditional::NotAMulticast;
+    };
+    let Some(top_key) = grow_if(top, &snapshot, values, &mut maps) else {
+        return Conditional::NotAMulticast;
+    };
+    let results = maps.results.remove(&top_key).unwrap_or_default();
+    // `DT_CHECK_MSG(multicast_index >= 0, "expected a non-negative index")` (`:283`) — the caller took
+    // this `if` from the producer's own defining op, so a producer that is not one of its results is
+    // an abort, not an answer.
+    let Some(multicast_index) = results.iter().position(|&result| result == producer) else {
+        panic!("expected a non-negative index")
+    };
+    let Some(&producer_index) = maps
+        .old_to_new
+        .get(&top_key)
+        .and_then(|indices| indices.get(&multicast_index))
+    else {
+        panic!("no mapping exists for the result index")
+    };
+    let new_producer = results[producer_index];
+    for (map, built) in maps.inserted {
+        insert_before_definition(body, map, &[built.map, built.qmap]);
+    }
+    assign_conditional_producer(body, producer, new_producer);
+    Conditional::Split
+}
+
+/// ONE `sentient.if`, POST-ORDER: the `if`s nested under it, then each region's `sentient.yield`, then
+/// the `if` itself — `visitIf` (`:238-252`). `Some(key)` exactly where the reference clones it.
+fn grow_if(
+    if_op: &mut sentient::Op,
+    snapshot: &[Op],
+    values: &mut Values,
+    maps: &mut IndexMaps,
+) -> Option<Val> {
+    let sentient::Op::If {
+        yielded,
+        then_body,
+        else_body,
+        ..
+    } = if_op
+    else {
+        return None;
+    };
+    let key = yielded.first().map(|entry| entry.result);
+    if let Some(key) = key {
+        for entry in yielded.iter() {
+            maps.key_of_result.insert(entry.result, key);
+        }
+    }
+    for region in [&mut *then_body, &mut *else_body] {
+        grow_nested_ifs(region, snapshot, values, maps);
+        // A yield with operands inside a result-less `if` is not a shape the reference can index.
+        if let Some(key) = key {
+            extend_yield(region, key, snapshot, values, maps);
+        }
+    }
+    // `result_types` IS THE THEN-TERMINATOR'S OPERAND LIST (`:239-240`), and an `if` whose yield
+    // needed no replacement is not replaced either (`:243-244`).
+    let (Some(key), Some(then_count)) = (key, yield_operand_count(then_body)) else {
+        return None;
+    };
+    if then_count <= yielded.len() {
+        return None;
+    }
+    // ⛔ THE CLONE'S REGISTER ARRAYS ARE EMPTY, so every entry — old ones included — is unassigned.
+    let unassigned = sentient::Reg {
+        locale: sentient::RegType::Unknown,
+        index: None,
+    };
+    for entry in yielded.iter_mut() {
+        entry.reg = unassigned;
+    }
+    for _ in yielded.len()..then_count {
+        yielded.push(sentient::Yielded {
+            result: values.mint(),
+            reg: unassigned,
+        });
+    }
+    maps.results
+        .insert(key, yielded.iter().map(|entry| entry.result).collect());
+    Some(key)
+}
+
+/// EVERY `sentient.if` UNDER ONE REGION, AT ANY DEPTH, INNERMOST FIRST — the post-order walk
+/// (`:255-261`), which descends through whatever else carries a region on the way.
+fn grow_nested_ifs(
+    block: &mut [Op],
+    snapshot: &[Op],
+    values: &mut Values,
+    maps: &mut IndexMaps,
+) {
+    for op in block.iter_mut() {
+        if let Op::Sentient(inner) = op
+            && matches!(inner, sentient::Op::If { .. })
+        {
+            grow_if(inner, snapshot, values, maps);
+            continue;
+        }
+        for region in dialects::regions_mut(op) {
+            grow_nested_ifs(region, snapshot, values, maps);
+        }
+    }
+}
+
+/// `visitYield` (`:174-236`) — the operands one region's terminator gains, and the old-to-new result
+/// index each of them records against the `if` that owns the yield.
+///
+/// ⛔ A YIELD INSIDE A `sentient.for` IS NOT ONE OF THESE: `dyn_cast<IfOp>(old_yield->getParentOp())`
+/// returns early for it (`:176`), which is why only a region's own terminator is read.
+fn extend_yield(
+    block: &mut [Op],
+    key: Val,
+    snapshot: &[Op],
+    values: &mut Values,
+    maps: &mut IndexMaps,
+) {
+    let Some(Op::Sentient(sentient::Op::Yield { results })) = block.last_mut() else {
+        return;
+    };
+    let mut new_operands: Vec<Val> = Vec::new();
+    for (old_result_index, &operand) in results.iter().enumerate() {
+        let new_result_index = results.len() + new_operands.len();
+        // `isa<BlockArgument>(operand)` — kept as an operand, never expanded (`:182`).
+        let Some(def) = dialects::defining_op(operand, snapshot) else {
+            continue;
+        };
+        match def {
+            Op::Dataflow(dataflow::Op::CreateMulticastGroup { producer, .. }) => {
+                new_operands.push(*producer);
+                maps.old_to_new
+                    .entry(key)
+                    .or_default()
+                    .insert(old_result_index, new_result_index);
+            }
+            Op::Uniform(
+                orig @ uniform::Op::QueryMap {
+                    map,
+                    key: query_key,
+                    ..
+                },
+            ) => {
+                let scope = [snapshot];
+                let defs = dialects::Definitions::from_innermost(&scope);
+                // `llvm::none_of(getListOfValueOpsFromUniformMapping(query_map), …)` (`:200-208`) —
+                // a mapping that answers with no group at all is left as it is.
+                let mapped = dialects::uniform_mapping_values(*map, *query_key, defs);
+                if !mapped.iter().any(|&value| {
+                    matches!(
+                        dialects::defining_op(value, snapshot),
+                        Some(Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. }))
+                    )
+                }) {
+                    continue;
+                }
+                let keys = dialects::uniform_mapping_keys(*query_key, defs);
+                // ⛔ DIVERGENCE: `DT_CHECK_MSG(new_query, "unable to create a producer map…")`
+                // (`:209-211`) aborts; a mapping this cannot rebuild leaves the yield alone, which is
+                // the divergence e324 already records.
+                let Some(built) = create_new_producer_qmap(orig, &keys, snapshot, values) else {
+                    continue;
+                };
+                new_operands.push(built.result);
+                maps.inserted.push((*map, built));
+                maps.old_to_new
+                    .entry(key)
+                    .or_default()
+                    .insert(old_result_index, new_result_index);
+            }
+            // `if_op.getResult(results_index_map[if_op][old_result_index])` (`:222-226`) — a result
+            // this walk has already expanded, forwarded one level out.
+            Op::Sentient(sentient::Op::If { .. }) => {
+                let Some(&nested) = maps.key_of_result.get(&operand) else {
+                    continue;
+                };
+                let Some(&forwarded_index) = maps
+                    .old_to_new
+                    .get(&nested)
+                    .and_then(|indices| indices.get(&old_result_index))
+                else {
+                    continue;
+                };
+                let Some(&forwarded) = maps
+                    .results
+                    .get(&nested)
+                    .and_then(|results| results.get(forwarded_index))
+                else {
+                    continue;
+                };
+                new_operands.push(forwarded);
+            }
+            _ => {}
+        }
+    }
+    // `YieldOp::create(builder, …, operands)` then `old_yield->erase()` (`:229-235`) — one yield in
+    // place of the other, which in place is the operands it gained.
+    results.extend(new_operands);
+}
+
+/// `old_if_op.getThenRegion().front().getTerminator()->getOperandTypes()` (`:239-240`) — how many
+/// results the `if` must have, and `None` where the region has no terminator to ask.
+fn yield_operand_count(block: &[Op]) -> Option<usize> {
+    match block.last() {
+        Some(Op::Sentient(sentient::Op::Yield { results })) => Some(results.len()),
+        _ => None,
+    }
+}
+
+/// `getProducerMutable().assign(new_if_op.getResult(producer_index))` and
+/// `getMulticastInfoMutable().assign(tmp)` over every store reading the old `if` result as its
+/// `$producer` (`:288-296`) — the same `$producer`-position filter e098's own note argues for.
+fn assign_conditional_producer(block: &mut [Op], old_result: Val, new_producer: Val) {
+    for op in block.iter_mut() {
+        if let Op::Sentient(sentient::Op::ReceiveAndStore {
+            producer,
+            multicast_info,
+            ..
+        }) = op
+            && producer.val() == old_result
+        {
+            *producer = StoreSource::Wire(RecvEnd::from_multicast_group(new_producer));
+            *multicast_info = Some(old_result);
+        }
+        for region in dialects::regions_mut(op) {
+            assign_conditional_producer(region, old_result, new_producer);
+        }
+    }
+}
 
 // crustify:todo: e569_runOn
 //   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:327  (43 body lines, level 4)

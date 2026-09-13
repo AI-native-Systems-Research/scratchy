@@ -536,6 +536,18 @@ pub trait InstructionEstimator {
 
     /// `getEstimatedInstructionCount(ctx, Region *)` (`Analyses/InstructionEstimation.h:62`).
     fn estimated_instruction_count_of_region(&mut self, region: &[Op]) -> InstructionCount;
+
+    /// `getRemainingIbuffSpace(ctx, unit)` (`Analyses/InstructionEstimation.h:69`) — what is LEFT of
+    /// the instruction buffer, which is why [`InstructionCount`] is signed.
+    ///
+    /// ⭐ DEFAULTED SO A TEST DOUBLE NEED NOT REPEAT THE REFUSAL: one unit asks
+    /// (`e514_findOptimalNWaySplits`), and only to log the comparison.
+    fn remaining_ibuff_space(&mut self, unit: &[Op]) -> InstructionCount {
+        let _ = unit;
+        todo!(
+            "InstructionEstimatorImpl::getRemainingIbuffSpace (Analyses/InstructionEstimation.h:69) — out of campaign scope"
+        )
+    }
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the estimator is not ported, so asking it anything is a `todo!`.

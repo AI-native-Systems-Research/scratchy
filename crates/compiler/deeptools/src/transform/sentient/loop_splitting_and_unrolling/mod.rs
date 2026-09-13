@@ -966,11 +966,10 @@ fn fold_if_ops_on_iv(
 /// `dcc::utils::updateDbgName(prefix, op, suffix)` (`dcc/src/Utils/Utils.cpp:491-515`) — ⛔ IT WRITES
 /// ONLY WHERE A NAME ALREADY EXISTS, because `getNewDbgNameFromOp` returns null without one.
 fn update_dbg_name(op: &mut Op, prefix: &str, suffix: &str) {
-    if let Op::Sentient(ops::Op::For {
-        dbg_name: Some(name),
-        ..
-    }) = op
-    {
+    let Op::Sentient(inner) = op else {
+        return;
+    };
+    if let Some(Some(name)) = ops::dbg_name_mut(inner) {
         *name = format!("{prefix}{name}{suffix}");
     }
 }
@@ -1119,15 +1118,267 @@ pub(crate) fn split_loop_n_way(scope: &mut Vec<Op>, at: usize, values: &mut Valu
     LoopSplit::Split
 }
 
-// crustify:todo: e513_unrollLoop
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:207  (86 body lines, level 3)
-//   original  : LogicalResult LoopSplittingAndUnrollingPass::unrollLoop( dcc::LoopNode *n, OpBuilder &const_builder)
-//   calls     : e086_isOkToUnroll, e252_size, e318_promoteForLoopBodyAndDelete, e423_lookup
+/// WHETHER THE LOOP WAS UNROLLED — `unrollLoop`'s `LogicalResult`, whose failure has one cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopUnroll {
+    /// `success()`: the loop is gone and its iterations stand in its place — ⛔ OR IT WAS DYNAMIC and
+    /// the pass only remarked *"Dynamic loops cannot be unrolled"* (`:290-291`), which is also
+    /// `success()` and leaves the loop exactly where it was.
+    Done,
+    /// `failure()`: [`is_ok_to_unroll`] refused, because unrolling would freeze an iter arg into a
+    /// constant address and register allocation would then fail.
+    WouldFailRegisterAllocation,
+}
 
-// crustify:todo: e514_findOptimalNWaySplits
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:691  (162 body lines, level 3)
-//   original  : std::tuple<int, int, int, int> LoopSplittingAndUnrollingPass::findOptimalNWaySplits( dcc::LoopNode *n, InstructionEstimatorImpl &ie, dataflow::ProgramUnitOp &unit_op)
-//   calls     : e091_findAllSplitVals, e092_computeReducedCost, e252_size, e319_getAllTrueIndexOfIfOpsList, e422_insert
+/// Replaces: e513_unrollLoop
+///
+/// Replaces a constant-bound loop with its `loop_size` iterations laid out flat, each carrying the
+/// previous one's yielded values and its own induction-variable constant.
+///
+/// ⛔ TRAP: THE ORIGINAL BODY IS ITERATION `loop_size` AND STAYS FIRST — the clones run `loop_size-1`
+/// down to 1 after it — and its readers of the variable are finally rewired to the BOUND (`:286`),
+/// not to a constant of their own iteration.
+/// ⛔ TRAP: A CARRY-FREE EMPTY BODY ERASES THE LOOP (`:217-220`) and a bound of 0 hands every result
+/// back to its initialiser first (`:224-232`) — two erasures that unroll nothing.
+/// ⚠️ DIVERGENCE: `const_builder`'s constants land just before the loop rather than at the program
+/// unit's top, the divergence [`split_loop_n_way`] already records.
+pub(crate) fn unroll_loop(scope: &mut Vec<Op>, at: usize, values: &mut Values) -> LoopUnroll {
+    let Some(for_op) = scope.get(at).and_then(ForOp::of) else {
+        return LoopUnroll::WouldFailRegisterAllocation;
+    };
+    if !is_ok_to_unroll(for_op, scope) {
+        return LoopUnroll::WouldFailRegisterAllocation;
+    }
+    let (iv, bound) = (for_op.iv, for_op.bound);
+    let carried: Vec<ops::Carried> = for_op.carried.to_vec();
+    let body: Vec<Op> = for_op.body.to_vec();
+
+    // "Nothing in the loop body other than the terminator" — this island materialises a
+    // `sentient.yield` only for a loop that carries something, so a carry-free empty body is that.
+    if body.is_empty() && carried.is_empty() {
+        scope.remove(at);
+        return LoopUnroll::Done;
+    }
+    let Some(loop_size) = constant_value(bound, scope) else {
+        // `for_op->emitRemark("Dynamic loops cannot be unrolled")` — a diagnostic and nothing else.
+        return LoopUnroll::Done;
+    };
+    if loop_size == 0 {
+        for entry in &carried {
+            replace_all_uses_with(scope, entry.result, entry.init);
+        }
+        scope.remove(at);
+        return LoopUnroll::Done;
+    }
+
+    let has_terminator = matches!(body.last(), Some(Op::Sentient(ops::Op::Yield { .. })));
+    // `std::prev(loop_body->end(), 2)` — the body without its terminator, which is what each
+    // unrolled instance clones.
+    let template = if has_terminator {
+        &body[..body.len() - 1]
+    } else {
+        &body[..]
+    };
+    let original_yield_operands: Vec<Val> = match body.last() {
+        Some(Op::Sentient(ops::Op::Yield { results })) => results.clone(),
+        _ => Vec::new(),
+    };
+    let mut modified_yield_operands = original_yield_operands.clone();
+    let iv_is_used = use_count(iv, &body) > 0;
+
+    let mut consts: Vec<Op> = Vec::new();
+    let mut clones: Vec<Op> = Vec::new();
+    for iteration in (1..loop_size).rev() {
+        let mut mapping = ValueMapping::new();
+        // `operandMap.map(loop_iter_args, modified_yield_operands)` — this instance reads what the
+        // PREVIOUS one yielded, which for the first clone is the original body's own results.
+        for (entry, yielded) in carried.iter().zip(&modified_yield_operands) {
+            mapping.map(entry.arg, *yielded);
+        }
+        if iv_is_used {
+            let iv_value = values.mint();
+            consts.push(index_constant(iteration, iv_value));
+            mapping.map(iv, iv_value);
+        }
+        let mut cloned = clone_ops(template, values, &mut mapping);
+        for op in &mut cloned {
+            update_dbg_name(op, "LU(", &format!(", i={iteration})"));
+        }
+        clones.append(&mut cloned);
+        // ⛔ THE LOOKUP IS OF THE **ORIGINAL** OPERAND, not of the running one: the map for this
+        // instance is keyed by the body as written. A yield operand defined outside the body is
+        // mapped by nothing and stands for itself — `IRMapping::lookup` would abort there.
+        for (slot, original) in modified_yield_operands
+            .iter_mut()
+            .zip(&original_yield_operands)
+        {
+            *slot = mapping.lookup_or_default(*original);
+        }
+    }
+
+    let Some(Op::Sentient(ops::Op::For { body, .. })) = scope.get_mut(at) else {
+        return LoopUnroll::Done;
+    };
+    if has_terminator {
+        body.pop();
+    }
+    for op in body.iter_mut() {
+        update_dbg_name(op, "LU(", &format!(", i={loop_size})"));
+    }
+    body.append(&mut clones);
+    if has_terminator {
+        body.push(Op::Sentient(ops::Op::Yield {
+            results: modified_yield_operands,
+        }));
+    }
+    // `getInductionVar().replaceAllUsesWith(const_bound)` — only the original body still reads it;
+    // every clone was remapped to its own constant.
+    replace_all_uses_with(body, iv, bound);
+
+    let inserted = consts.len();
+    for (offset, op) in consts.into_iter().enumerate() {
+        scope.insert(at + offset, op);
+    }
+    promote_for_loop_body_and_delete(scope, at + inserted);
+    LoopUnroll::Done
+}
+
+/// `dcc::TransformationConditionalTree` — a trait for the same reason [`IfOpCanonicalizer`] is one:
+/// the tree is not in this campaign and a test must still be able to state its shape.
+///
+/// ⛔ `dcc/src/Analysis/ConditionalTree.hpp` IS OUTSIDE THE CAMPAIGN'S SCOPE (which is the TOP LEVEL
+/// of `Transform/Sentient/`), so the crate's only implementation is [`OutOfScopeConditionalTree`].
+/// ⭐ THE PATHS ITS NODES CARRY ARE READ RELATIVE TO THE LOOP'S BODY, the same convention
+/// [`if_op_paths`] uses for a unit — that is what makes `if_op_to_pred_val`'s keys match.
+pub(crate) trait ConditionalTree {
+    /// `TransformationConditionalTree tree(*for_op); tree.compute(); tree.getRoot()` (`:740-741`).
+    fn root<'a>(&mut self, for_op: &'a Op) -> CondNode<'a> {
+        let _ = for_op;
+        todo!(
+            "dcc::TransformationConditionalTree::{{compute,getRoot}} \
+             (dcc/src/Analysis/ConditionalTree.hpp) — out of campaign scope"
+        )
+    }
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the tree is not ported, so asking it for a root is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OutOfScopeConditionalTree;
+
+impl ConditionalTree for OutOfScopeConditionalTree {}
+
+/// `findOptimalNWaySplits`' FOUR-TUPLE (`:766-767`), whose first two entries are what
+/// `isSplittingProfitable` reads back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NWaySplits {
+    /// `index` — ⛔ ALWAYS 0: the window search that would move it is commented out (`:770-853`).
+    pub(crate) index: usize,
+    /// `nway_split` — how many split ranges [`find_all_split_vals`] found.
+    pub(crate) nway_split: usize,
+    /// `if_list.size()` — how many `sentient.if`s of the loop are on its induction variable.
+    pub(crate) if_ops_on_iv: usize,
+    /// `final_ibuff_cost` — the extra loops' cost less what the folded conditionals save.
+    pub(crate) ibuff_cost: InstructionCount,
+}
+
+/// The `sentient.if`s of `body` on `iv` as the [`OpPath`]s naming them, in the same pre-order
+/// [`if_ops_on_iv`] walks — so the two lists are positionally one list.
+fn if_op_paths_on_iv(body: &[Op], iv: Val, scopes: &[&[Op]]) -> Vec<OpPath> {
+    fn descend(body: &[Op], base: &[(u32, u32)], region: u32, iv: Val, scopes: &[&[Op]], out: &mut Vec<OpPath>) {
+        for (index, op) in body.iter().enumerate() {
+            let mut here = base.to_vec();
+            here.push((region, index as u32));
+            if is_if_op_on_iv(op, iv, scopes) {
+                out.push(OpPath::at(&here));
+            }
+            match op {
+                Op::Sentient(inner) => {
+                    for (sub, nested) in ops::regions(inner).into_iter().enumerate() {
+                        descend(nested, &here, sub as u32, iv, scopes, out);
+                    }
+                }
+                Op::AffineFor(loop_op) => descend(&loop_op.body, &here, 0, iv, scopes, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    descend(body, &[], 0, iv, scopes, &mut out);
+    out
+}
+
+/// Replaces: e514_findOptimalNWaySplits
+///
+/// Prices the FULL n-way split of one loop: one extra copy of the loop per split range beyond the
+/// first, less every conditional those ranges fold away.
+///
+/// ⛔ TRAP: THE SEARCH IS COMMENTED OUT (`:770-853`), so `index` is 0 and `nway_split` is always every
+/// range — and the ibuff comparison this ends with only picks a DEBUG MESSAGE (`:764-773`); the cost
+/// it returns is the same whether the split fits or not.
+/// ⛔ TRAP: ONE RUNNING `cost_reduced` ACROSS ALL RANGES (`:743-752`), so an if op folded by several
+/// ranges is credited once per range.
+/// ⭐ A bound of 0 leaves the map empty, where the reference reads `begin()` of nothing.
+pub(crate) fn find_optimal_n_way_splits<E: InstructionEstimator, T: ConditionalTree>(
+    scope: &[Op],
+    at: usize,
+    ie: &mut E,
+    tree: &mut T,
+    unit: &[Op],
+) -> NWaySplits {
+    let Some((for_op, loop_bound)) = scope
+        .get(at)
+        .and_then(ForOp::of)
+        .and_then(|for_op| constant_value(for_op.bound, scope).map(|bound| (for_op, bound)))
+    else {
+        // `DT_CHECK(isa<sentient::ConstantOp>(for_op.getBound().getDefiningOp()))` (`:698`) — an
+        // abort, and a loop with a dynamic bound is the one thing that reaches it.
+        panic!(
+            "findOptimalNWaySplits expects a constant-bound sentient.for \
+             (LoopSplittingAndUnrolling.cpp:698)"
+        )
+    };
+    let if_list = if_ops_on_iv(for_op.body, for_op.iv, &[scope]);
+    let if_paths = if_op_paths_on_iv(for_op.body, for_op.iv, &[scope]);
+    let mut bound_to_all_ifops_predval = BTreeMap::new();
+    for bound in 1..=loop_bound {
+        let bound = IterBound(bound);
+        bound_to_all_ifops_predval.insert(
+            bound,
+            get_all_true_index_of_if_ops_list(bound, &if_list, scope),
+        );
+    }
+    let split_vals = match BoundPredVals::from_map(&bound_to_all_ifops_predval) {
+        Some(pred_vals) => find_all_split_vals(&pred_vals),
+        // `while (loop_bound_copy)` leaves the map empty for a bound of 0 and `findAllSplitVals` then
+        // reads `begin()` of nothing; no range is the fixed point that reads nothing.
+        None => Vec::new(),
+    };
+    let nway_split = split_vals.len();
+    // "number of loops generated multiplied by ibuff of forop" (`:735-736`).
+    let per_loop = ie.estimated_instruction_count_of_op(&scope[at]).0;
+    let ibuff_cost = per_loop * (nway_split as i32 - 1);
+
+    let root = tree.root(&scope[at]);
+    let mut cost_reduced = InstructionCount(0);
+    for range in &split_vals {
+        let predvals = bound_to_all_ifops_predval
+            .get(&range.high)
+            .cloned()
+            .unwrap_or_default();
+        // `std::map::insert` of the zipped lists — `llvm::zip` stops at the shorter one.
+        let if_op_to_pred_eval: BTreeMap<OpPath, bool> =
+            if_paths.iter().cloned().zip(predvals).collect();
+        compute_reduced_cost(Some(&root), ie, &mut cost_reduced, &if_op_to_pred_eval);
+    }
+    // ⛔ ASKED FOR AND THEN ONLY LOGGED (`:762-773`) — the two arms differ by their message alone.
+    let _available_ibuff_space = ie.remaining_ibuff_space(unit);
+    NWaySplits {
+        index: 0,
+        nway_split,
+        if_ops_on_iv: if_list.len(),
+        ibuff_cost: InstructionCount(ibuff_cost - cost_reduced.0),
+    }
+}
 
 // crustify:todo: e566_getSavedCycleAndIbuffCost
 //   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:335  (117 body lines, level 4)
@@ -1166,6 +1417,9 @@ mod unit_tests {
         recalculated: usize,
         /// What every op costs.
         per_op: i32,
+        /// What is left of the ibuff, and how many times it was asked for.
+        ibuff_space: i32,
+        ibuff_asks: usize,
     }
 
     impl InstructionEstimator for StatedEstimator {
@@ -1179,6 +1433,11 @@ mod unit_tests {
 
         fn estimated_instruction_count_of_region(&mut self, region: &[Op]) -> InstructionCount {
             InstructionCount(region.len() as i32)
+        }
+
+        fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
+            self.ibuff_asks += 1;
+            InstructionCount(self.ibuff_space)
         }
     }
 
@@ -1374,8 +1633,8 @@ mod unit_tests {
         let mut pass = LoopSplittingAndUnrolling::default();
         let mut tree = LoopForest::default();
         let mut ie = StatedEstimator {
-            recalculated: 0,
             per_op: 7,
+            ..StatedEstimator::default()
         };
         let mut canonicalizer = RecordingCanonicalizer::default();
         cleanup_and_recalculate(&mut pass, &mut tree, &mut ie, &mut canonicalizer, &mut unit);
@@ -1734,5 +1993,133 @@ mod unit_tests {
             scope.last(),
             Some(Op::Sentient(ops::Op::ScalarAdd { lhs, .. })) if *lhs == tail.carried[0].result
         ));
+    }
+    /// A `sentient.nop` carrying a debug name — the one op a body can hold that `updateDbgName`
+    /// writes to without also being a loop.
+    fn nop(dbg_name: &str) -> Op {
+        Op::Sentient(ops::Op::Nop {
+            dbg_name: Some(dbg_name.to_string()),
+        })
+    }
+
+    /// e513 — a two-iteration loop comes out as its ORIGINAL body, named `i=2`, followed by the clone
+    /// for `i=1` reading the original's yielded value and its own induction-variable constant.
+    #[test]
+    fn e513_lays_the_iterations_out_flat_with_the_original_body_first() {
+        let mut values = Values::default();
+        let bound_c = values.mint();
+        let init_c = values.mint();
+        let iv = values.mint();
+        let arg = values.mint();
+        let result = values.mint();
+        let sum = values.mint();
+        let reader = values.mint();
+
+        let mut scope = vec![
+            constant(2, bound_c),
+            constant(7, init_c),
+            for_loop(
+                iv,
+                bound_c,
+                vec![carried(init_c, arg, result)],
+                vec![nop("n"), add(arg, iv, sum), yields(vec![sum])],
+            ),
+            add(result, bound_c, reader),
+        ];
+
+        assert_eq!(unroll_loop(&mut scope, 2, &mut values), LoopUnroll::Done);
+
+        let mut adds = Vec::new();
+        let mut names = Vec::new();
+        let mut for_ops = 0;
+        for_each_op(&scope, &mut |op| match op {
+            Op::Sentient(ops::Op::ScalarAdd {
+                lhs, rhs, result, ..
+            }) => adds.push((*lhs, *rhs, *result)),
+            Op::Sentient(ops::Op::Nop { dbg_name: Some(name) }) => names.push(name.clone()),
+            Op::Sentient(ops::Op::For { .. }) => for_ops += 1,
+            _ => {}
+        });
+
+        assert_eq!(for_ops, 0);
+        assert_eq!(names, vec!["LU(n, i=2)".to_string(), "LU(n, i=1)".to_string()]);
+        assert_eq!(adds.len(), 3);
+        // The original body reads the loop's INIT and — the trap — the loop's BOUND for its variable.
+        assert_eq!(adds[0], (init_c, bound_c, sum));
+        // The clone reads what the original yielded, and a constant of its own iteration.
+        assert_eq!(adds[1].0, sum);
+        assert_eq!(constant_value(adds[1].1, &scope), Some(1));
+        // The loop's reader moved onto the LAST iteration's result.
+        assert_eq!(adds[2], (adds[1].2, bound_c, reader));
+    }
+    /// A conditional tree the test STATES: one if-node over the loop's own `sentient.if`.
+    /// ⛔ `dcc::TransformationConditionalTree` is outside the campaign, so what e514 owns is what it
+    /// does with a tree, not the tree.
+    #[derive(Debug, Default)]
+    struct StatedTree {
+        at: OpPath,
+    }
+
+    impl ConditionalTree for StatedTree {
+        fn root<'a>(&mut self, for_op: &'a Op) -> CondNode<'a> {
+            let Op::Sentient(ops::Op::For { body, .. }) = for_op else {
+                return CondNode::Branches(Vec::new());
+            };
+            let Some(if_op) = body.first().and_then(IfNode::of) else {
+                return CondNode::Branches(Vec::new());
+            };
+            CondNode::Branches(vec![CondNode::If {
+                at: self.at.clone(),
+                if_op,
+                then_node: Box::new(CondNode::Branches(Vec::new())),
+                else_node: None,
+            }])
+        }
+    }
+
+    /// e514 — a bound-3 loop whose one conditional is true for iterations 3 and 2 splits two ways, and
+    /// the price is ONE extra copy of the loop less what each range's dead branch saves.
+    #[test]
+    fn e514_prices_the_full_split_against_what_the_folded_conditionals_save() {
+        let scope = vec![
+            constant(3, Val(0)),
+            constant(2, Val(1)),
+            for_loop(
+                Val(2),
+                Val(0),
+                Vec::new(),
+                vec![if_op(
+                    Val(2),
+                    Val(1),
+                    vec![yields(vec![Val(3)])],
+                    vec![constant(5, Val(4)), yields(vec![Val(4)])],
+                )],
+            ),
+        ];
+        let mut ie = StatedEstimator {
+            per_op: 10,
+            ibuff_space: 4,
+            ..StatedEstimator::default()
+        };
+        let mut tree = StatedTree {
+            at: OpPath::at(&[(0, 0)]),
+        };
+
+        let answer = find_optimal_n_way_splits(&scope, 2, &mut ie, &mut tree, &scope);
+
+        assert_eq!(
+            answer,
+            NWaySplits {
+                index: 0,
+                nway_split: 2,
+                if_ops_on_iv: 1,
+                // `10 * (2 - 1)` for the extra loop, less `(1 + 1 + 2)` for the range that folds the
+                // else away and `(1 + 1 + 1)` for the one that folds the then away.
+                ibuff_cost: InstructionCount(3),
+            }
+        );
+        // ⛔ THE IBUFF IS ASKED FOR AND THE ANSWER ONLY LOGGED: 3 fits in 4, and a cost that did not
+        // fit would come back the same.
+        assert_eq!(ie.ibuff_asks, 1);
     }
 }

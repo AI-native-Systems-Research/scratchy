@@ -94,7 +94,7 @@
 use super::UnrollSize;
 use crate::arch::Elements;
 use crate::formats::Bits;
-use crate::islands::sentient::dialects::Val;
+use crate::islands::sentient::dialects::{Op, Val};
 use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::DfirUnit;
 
@@ -709,6 +709,35 @@ impl UnrollOperands {
         self.mutable_address = other.mutable_address;
         self.result_address = other.result_address;
         self.fold_mode = other.fold_mode;
+    }
+
+    /// `UnrollOperands::fill(Operation *op, SenComponents type)` — SENPASS UNIT e335, whose anchor is
+    /// still open below.
+    ///
+    /// ⛔ e335 IS A LEVEL-1 DEPENDENCY THAT NO REMAINING SCHEDULE OWNS, for the reason
+    /// [`Self::update_unroll_info`] gives; its TODO is left untouched. ⭐ EVERY PATH THROUGH
+    /// `e519_processOneBlock` REACHES THIS at the block's first candidate, so it is the seam a rerolled
+    /// program stops at.
+    pub(super) fn fill(&mut self, op: &Op, ty: DfirUnit) {
+        let _ = op;
+        todo!(
+            "UnrollOperands::fill — senpass e335 (OpRerolling.cpp:502) is not ported yet, and \
+             snapshotting this {ty:?} op needs it"
+        )
+    }
+
+    /// `bool UnrollOperands::match(UnrollOperands &new_operand_list)` — SENPASS UNIT e336, whose anchor
+    /// is still open below. ⭐ `match` IS A KEYWORD; the question it asks is the name.
+    ///
+    /// ⛔ e336 IS A LEVEL-1 DEPENDENCY THAT NO REMAINING SCHEDULE OWNS, for the reason
+    /// [`Self::update_unroll_info`] gives; its TODO is left untouched.
+    pub(super) fn matches(&self, new_operand_list: &UnrollOperands) -> bool {
+        todo!(
+            "UnrollOperands::match — senpass e336 (OpRerolling.cpp:731) is not ported yet, and \
+             deciding whether {:?} rerolls into {:?} needs it",
+            new_operand_list.op_name,
+            self.op_name
+        )
     }
 
     /// `UnrollOperands::updateUnrollInfo(UnrollOperands &new_operand_list)` — SENPASS UNIT e337, whose

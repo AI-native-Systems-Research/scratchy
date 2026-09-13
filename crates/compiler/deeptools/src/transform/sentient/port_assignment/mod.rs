@@ -581,10 +581,223 @@ impl<G: ColoringGraph> PortAssignment<G> {
     }
 }
 
-// crustify:todo: e520_processDataID
-//   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:93  (67 body lines, level 3)
-//   original  : void PortAssignmentPass::processDataID(int data_id, StringRef operand_value, Operation *current_op)
-//   calls     : e422_insert
+/// WHICH LOCAL REGION AN INTERVAL BELONGS TO — `LabeledRange::label`.
+///
+/// ⛔ `INT_MAX` IS "GLOBAL" AND `LabeledRange::print` SPELLS IT SO (`Analyses/LiveRange.cpp:118`);
+/// this is not a region index of zero, and `label_for_region` starts here (`:106`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RegionLabel {
+    /// `INT_MAX`.
+    Global,
+    /// `op_to_index_[region_op]` for a `uniform.uniformize_regions`/`uniform.equalize_pattern`.
+    Region(InstrIndex),
+}
+
+/// ONE INTERVAL OF A [`LiveRange`] — `LiveRange::LabeledRange` (`Analyses/LiveRange.hpp:19-33`).
+///
+/// ⭐ THIS IS THE PART OF THE ANALYSIS `e520_processDataID` ITSELF DECIDES, and it is why the union
+/// below is a seam rather than a bare `todo!`: which instruction pair and which region label a data
+/// ID's range is built from is in this campaign's reach; the interval arithmetic is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LabeledRange {
+    /// `first` — the producer's instruction index.
+    pub(crate) first: InstrIndex,
+    /// `last` — the consumer's, or the terminator that stands for it.
+    pub(crate) last: InstrIndex,
+    /// `label`.
+    pub(crate) label: RegionLabel,
+}
+
+/// THE `LiveRange` INTERVAL ALGEBRA — a trait for the same reason [`ColoringGraph`] is one: the
+/// analysis is not in this campaign and a test must still be able to observe what a pass builds.
+///
+/// ⛔ `Analyses/LiveRange.{hpp,cpp}` IS OUT OF CAMPAIGN SCOPE — see [`LiveRange`].
+pub(crate) trait LiveRanges {
+    /// `range.unionWith(LiveRange(interval))` (`Analyses/LiveRange.cpp:67`).
+    fn union_with(&mut self, range: &mut LiveRange, interval: LabeledRange) {
+        let _ = (range, interval);
+        todo!("LiveRange::unionWith (Analyses/LiveRange.cpp:67) — out of campaign scope")
+    }
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OutOfScopeLiveRanges;
+
+impl LiveRanges for OutOfScopeLiveRanges {}
+
+/// WHETHER A DATA ID'S LIVE RANGE COULD BE COMPUTED AT ALL.
+///
+/// ⛔ `No` IS `emitError("Unable to compute live range\n")` FOLLOWED BY `signalPassFailure()`
+/// (`:154-156`), which ends the compilation — the same reason [`ValidPorts::Rejected`] is its own
+/// answer rather than an empty one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveRangeComputed {
+    /// The interval was unioned in — or there was no data ID, which is nothing to compute.
+    Yes,
+    /// The ancestor sharing the producer's block is neither a loop, an `if` nor a local region.
+    No,
+}
+
+/// WHERE ONE OP SITS IN THE UNIT'S PRE-ORDER WALK — its own [`OpAt`] and the BLOCK holding it, as the
+/// `(enclosing op, which region of it)` steps that reach it.
+///
+/// ⭐ `Operation::getBlock()` AND `getParentOp()` FOR A TREE WITH NO PARENT POINTERS, which is exactly
+/// the *mechanism* the campaign brief lets a port supply for itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Position {
+    at: OpAt,
+    block: Vec<(OpAt, u32)>,
+}
+
+/// `unit.walk<WalkOrder::PreOrder>`, keeping each op's block — indexed by [`OpAt`].
+fn walk_of(unit: &[Op]) -> Vec<Position> {
+    fn walk(scope: &[Op], block: &mut Vec<(OpAt, u32)>, next: &mut u32, out: &mut Vec<Position>) {
+        for op in scope {
+            let at = OpAt(*next);
+            *next += 1;
+            out.push(Position {
+                at,
+                block: block.clone(),
+            });
+            for (index, region) in regions_ref(op).into_iter().enumerate() {
+                block.push((at, index as u32));
+                walk(region, block, next, out);
+                block.pop();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(unit, &mut Vec::new(), &mut 0, &mut out);
+    out
+}
+
+/// The op at one pre-order position.
+fn op_at(unit: &[Op], target: OpAt) -> Option<&Op> {
+    fn walk<'a>(scope: &'a [Op], next: &mut u32, target: OpAt) -> Option<&'a Op> {
+        for op in scope {
+            let here = OpAt(*next);
+            *next += 1;
+            if here == target {
+                return Some(op);
+            }
+            for region in regions_ref(op) {
+                if let Some(found) = walk(region, next, target) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    walk(unit, &mut 0, target)
+}
+
+/// `Block::getTerminator()` for region `region` of the op at `parent` — the LAST op of that block,
+/// which in pre-order is the greatest position whose block is that one.
+fn terminator_of(walk: &[Position], parent: &Position, region: u32) -> Option<OpAt> {
+    let mut block = parent.block.clone();
+    block.push((parent.at, region));
+    walk.iter()
+        .filter(|position| position.block == block)
+        .map(|position| position.at)
+        .next_back()
+}
+
+impl<G: ColoringGraph> PortAssignment<G> {
+    /// `op_to_index_[op]` — ⛔ `std::map::operator[]` DEFAULT-CONSTRUCTS, so an op the index walk never
+    /// numbered reads as instruction 0 rather than throwing.
+    fn index_of(&self, op: OpAt) -> InstrIndex {
+        self.op_to_index.get(&op).copied().unwrap_or(InstrIndex(0))
+    }
+
+    /// Replaces: e520_processDataID
+    ///
+    /// Records `current_op` as an owner of this operand value and widens that value's live range to
+    /// reach it from its FIRST owner — the producer.
+    ///
+    /// ⛔ TRAP: A CONSUMER IN A DEEPER BLOCK EXTENDS THE RANGE TO THAT BLOCK'S TERMINATOR, not to the
+    /// consumer: a loop body, an `else`-less `then`, or a local region (`:135-153`).
+    /// ⛔ TRAP: THE LABEL IS THE **PRODUCER'S** LOCAL REGION, not the consumer's (`:107-112`).
+    /// ⭐ ITS `StringRef operand_value` (`:93`) IS DECLARED AND NEVER USED, as `e126`'s is.
+    pub(crate) fn process_data_id<R: LiveRanges>(
+        &mut self,
+        data_id: Option<DataId>,
+        current_op: OpAt,
+        unit: &[Op],
+        live_ranges: &mut R,
+    ) -> LiveRangeComputed {
+        // "Sometimes, we can data_id being -1; in that case, don't process them." (`:95-96`)
+        let Some(data_id) = data_id else {
+            return LiveRangeComputed::Yes;
+        };
+        self.operand_to_owners
+            .entry(data_id)
+            .or_default()
+            .push(current_op);
+        // `insert` KEEPS AN EXISTING RANGE — it is not an overwrite (`:102`).
+        self.operand_to_liverange.entry(data_id).or_default();
+        let src_op = self.operand_to_owners[&data_id][0];
+
+        let walk = walk_of(unit);
+        let (Some(src), Some(current)) = (
+            walk.get(src_op.0 as usize),
+            walk.get(current_op.0 as usize),
+        ) else {
+            // Neither op can be absent in the reference: both came from the same pre-order walk.
+            return LiveRangeComputed::Yes;
+        };
+
+        // `getRegionOp(src_op)`, kept only where it is a local region (`:107-112`).
+        let mut label = RegionLabel::Global;
+        for (ancestor, _region) in src.block.iter().rev() {
+            if matches!(op_at(unit, *ancestor), Some(Op::UniformRegions(_))) {
+                label = RegionLabel::Region(self.index_of(*ancestor));
+                break;
+            }
+        }
+
+        let first = self.index_of(src_op);
+        let last = if src.block == current.block {
+            // "If the current op is from the same block --> peace!" (`:116`)
+            self.index_of(current_op)
+        } else {
+            // The ancestor of `current_op` whose own block is the producer's (`:124-133`).
+            let Some((parent_op, _)) = current.block.get(src.block.len()).copied() else {
+                return LiveRangeComputed::Yes;
+            };
+            let Some(parent) = walk.get(parent_op.0 as usize) else {
+                return LiveRangeComputed::Yes;
+            };
+            let terminator = match op_at(unit, parent_op) {
+                // "If ancestor is for-loop, liverange is throughout." (`:136-141`)
+                Some(Op::Sentient(sentient::Op::For { .. })) => terminator_of(&walk, parent, 0),
+                Some(Op::Sentient(sentient::Op::If { else_body, .. })) => {
+                    if else_body.is_empty() {
+                        terminator_of(&walk, parent, 0)
+                    } else {
+                        // `DT_ERROR("yet to handle the live range case")` (`:149`) — an abort, and the
+                        // reference's own comment above it is *"TODO: Check for this case."*
+                        todo!(
+                            "processDataID: yet to handle the live range case — a \
+                             `sentient.if` WITH an else region (PortAssignment.cpp:145-150)"
+                        )
+                    }
+                }
+                Some(Op::UniformRegions(_)) => terminator_of(&walk, parent, 0),
+                _ => return LiveRangeComputed::No,
+            };
+            match terminator {
+                Some(at) => self.index_of(at),
+                // An empty block has no terminator; MLIR's own `getTerminator()` requires one.
+                None => return LiveRangeComputed::Yes,
+            }
+        };
+        if let Some(range) = self.operand_to_liverange.get_mut(&data_id) {
+            live_ranges.union_with(range, LabeledRange { first, last, label });
+        }
+        LiveRangeComputed::Yes
+    }
+}
 
 // crustify:todo: e572_computePortLiveRange
 //   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:165  (40 body lines, level 4)
@@ -980,5 +1193,61 @@ mod unit_tests {
     fn e455_hands_each_op_of_the_unit_to_the_unported_e339() {
         let unit = pe_unit(vec![mac(Port::West, Precision::Fp16, Precision::Fp16)]);
         PortAssignment::<CountingGraph>::default().build_graph_nodes::<Dd2>(&unit, DfirUnit::Pe);
+    }
+
+    /// A [`LiveRanges`] that records what a pass asks it to union — the interval algebra itself is
+    /// `Analyses/LiveRange.cpp` and out of scope.
+    #[derive(Debug, Default)]
+    struct RecordingLiveRanges(Vec<LabeledRange>);
+
+    impl LiveRanges for RecordingLiveRanges {
+        fn union_with(&mut self, _range: &mut LiveRange, interval: LabeledRange) {
+            self.0.push(interval);
+        }
+    }
+
+    /// e520 — the producer's own use is one instruction wide, and a use inside a `sentient.for` runs to
+    /// that body's LAST op rather than to the use itself.
+    #[test]
+    fn e520_extends_a_deeper_use_to_the_enclosing_blocks_terminator() {
+        let unit = vec![
+            scalar_copy(),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(3),
+                bound: Val(4),
+                bound_reg: None,
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![scalar_copy(), scalar_copy()],
+            }),
+        ];
+        let mut pass = PortAssignment::<CountingGraph>::default();
+        pass.op_to_index = (0..4).map(|index| (OpAt(index), InstrIndex(index))).collect();
+        let mut ranges = RecordingLiveRanges::default();
+
+        // ⛔ `data_id == -1` IS NOTHING TO COMPUTE, not a failure (`:95-96`).
+        assert_eq!(
+            pass.process_data_id(None, OpAt(0), &unit, &mut ranges),
+            LiveRangeComputed::Yes
+        );
+        pass.process_data_id(Some(DataId(7)), OpAt(0), &unit, &mut ranges);
+        pass.process_data_id(Some(DataId(7)), OpAt(2), &unit, &mut ranges);
+
+        assert_eq!(
+            ranges.0,
+            vec![
+                LabeledRange {
+                    first: InstrIndex(0),
+                    last: InstrIndex(0),
+                    label: RegionLabel::Global,
+                },
+                LabeledRange {
+                    first: InstrIndex(0),
+                    last: InstrIndex(3),
+                    label: RegionLabel::Global,
+                },
+            ]
+        );
+        assert_eq!(pass.operand_to_owners[&DataId(7)], vec![OpAt(0), OpAt(2)]);
     }
 }
