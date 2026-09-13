@@ -3136,6 +3136,8 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
         padding: TransferPadding::default(),
         src_indirect: None,
         dst_indirect: None,
+        core_id_to_gtr_info: BTreeMap::new(),
+        transfer_size: BTreeMap::new(),
     };
     // The styles, and the dims they apply to, which entry 325 writes back in this same order.
     let mut per_dim = BTreeMap::new();
@@ -5726,6 +5728,7 @@ mod unit_tests {
         };
         let two = CoreletsUsed::new(NonZeroU32::new(2).expect("two corelets"));
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: two,
             corelets_used_dsc2: Some(two),
             corelet_shares: BTreeMap::new(),

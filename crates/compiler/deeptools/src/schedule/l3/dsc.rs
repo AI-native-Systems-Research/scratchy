@@ -23,6 +23,7 @@ use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::{DsType, Scale};
 use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
 use crate::schedule::dsc2::{LayoutDims, LdsIdx, NodeName};
+use crate::schedule::l3::dl_ops::GtrGroupId;
 use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroU64};
@@ -364,6 +365,10 @@ pub struct DesignSpaceConfig {
     /// and nothing else of it, and a second copy of the extents is a second answer that can disagree
     /// with [`Self::data_stages`].
     pub full_padding: BTreeMap<PrimaryDim, DimPadding>,
+    /// `gtrIdsUsed_` (`dsc/designSpaceConfig.h:116`) — which group tag registers this DSC's
+    /// multicast transfers claim. EMPTY on a DSC the L3 scheduler has not reached; entries 218 and
+    /// 291 are what fill it, and only for a group with more than one sharer.
+    pub gtr_ids_used: BTreeSet<GtrGroupId>,
 }
 
 impl DesignSpaceConfig {
@@ -605,6 +610,14 @@ pub struct SuperDsc {
     /// `coreIdToDscSchedule` (`dsc/superdsc.h:77`), absent for a core the super-DSC states no
     /// schedule for — that `.at()`'s throw.
     pub core_id_to_dsc_schedule: BTreeMap<Core, Vec<DscScheduleStep>>,
+    /// `coreIdToDsc_` (`dsc/superdsc.h:68`) — EVERY core the whole super-DSC schedules, which is
+    /// wider than any one DSC's [`DesignSpaceConfig::core_ids_used`].
+    ///
+    /// ⛔ AN INPUT AND NOT A DERIVED UNION: dbo fills it (`ProgramCorrection.cpp:1064`,
+    /// `SdscRelayoutInsertion.cpp:538`), and [`Self::new`] leaves it EMPTY exactly as the
+    /// reference's default construction does. Entry 291 reads it to widen a conditional-GTR group
+    /// beyond one DSC's cores, and an empty map makes that arm REFUSE rather than answer wrongly.
+    pub core_id_to_dsc: BTreeMap<Core, DscIdx>,
 }
 
 impl SuperDsc {
@@ -621,6 +634,7 @@ impl SuperDsc {
             num_wk_slices_per_dim,
             core_id_to_wk_slice,
             core_id_to_dsc_schedule,
+            core_id_to_dsc: BTreeMap::new(),
         }
     }
 

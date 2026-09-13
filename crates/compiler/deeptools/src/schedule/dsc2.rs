@@ -31,6 +31,7 @@ use crate::schedule::ddc::fold::{ConstIdx, NodeId, PadType};
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddl::ops::DdlComputeType;
+use crate::schedule::l3::dl_ops::{GtrGroupId, Shares};
 use crate::units::{Core, Corelet, NumFolds};
 
 impl PrimaryDim {
@@ -1105,6 +1106,20 @@ impl LdsScale {
     }
 }
 
+/// WHICH GROUP TAG REGISTER ONE CORE'S END OF A MULTICAST TRANSFER USES — `dsc2::GroupTagRegInfo`
+/// (`dsc/dsc2.h:34`), whose two `-1` defaults are "unshared" and "unfilled" and NOT counts.
+///
+/// ⭐ `groupId_ = -1` IS NOT A GROUP: entries 218 and 291 both write the id ONLY when
+/// `numSharers_ > 1`, so the sentinel is [`None`] here and an unshared end cannot name a register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupTagRegInfo {
+    /// `numSharers_` — how many cores share this end. Never the `-1` default: a filled entry
+    /// carries a real count, and an unfilled one is an absent map entry.
+    pub num_sharers: Shares,
+    /// `groupId_`, with the reference's `-1` as [`None`].
+    pub group: Option<GtrGroupId>,
+}
+
 /// `dsc2::TransferNode` (`dsc/dsc2.h:814`) narrowed to what the ported units read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferNode {
@@ -1131,6 +1146,12 @@ pub struct TransferNode {
     /// `dstVias_.size() == 1` before it writes, and then that `dstIndirectLdsAndLoopOffsets_` was
     /// empty and holds exactly one entry after.
     pub dst_indirect: Option<Via>,
+    /// `coreIdToGTRInfo_` (`:840`) — the multicast group each transferring core belongs to, EMPTY
+    /// on a fresh node. Entry 291 is what fills it and entry 218 is what fills a condition arm's.
+    pub core_id_to_gtr_info: BTreeMap<Core, GroupTagRegInfo>,
+    /// `transferSize_` (`:843`) — an EXPLICIT per-dim size that overrides the one derived from the
+    /// data stage (`dsc/dsc2.cpp:3474` reads it), EMPTY on a fresh node. Entry 295 fills it.
+    pub transfer_size: BTreeMap<PrimaryDim, Elements>,
 }
 
 /// WHAT A TRANSFER MOVES BETWEEN — `dsc2::TransferNode::getTransferType()` (`dsc/dsc2.h:882-900`),

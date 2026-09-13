@@ -5847,6 +5847,8 @@ where
         padding: TransferPadding::default(),
         src_indirect: None,
         dst_indirect: None,
+        core_id_to_gtr_info: BTreeMap::new(),
+        transfer_size: BTreeMap::new(),
     };
     // ⛔ THE TWO BLOCKS DISAGREE ON WHOSE PARENT THE TRANSFER LANDS UNDER and both are kept: the
     // sibling is `transferInput0` either way, but `_internalKernel` names the ALLOCATION's parent
@@ -6079,6 +6081,8 @@ mod tests_e132_e136 {
                 padding: TransferPadding::default(),
                 src_indirect: None,
                 dst_indirect: None,
+                core_id_to_gtr_info: BTreeMap::new(),
+                transfer_size: BTreeMap::new(),
                 name: NodeName("t".to_owned()),
                 src: operand(src, Some(0)),
                 dsts: Dsts::new(operand(dst, Some(0)), Vec::new()),
@@ -6507,6 +6511,8 @@ mod tests_e124_e131 {
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
             name: NodeName("t".to_owned()),
             src: operand(SenComponent::Constant),
             dsts: Dsts::new(operand(SenComponent::Lxlu), Vec::new()),
@@ -6540,6 +6546,8 @@ mod tests_e124_e131 {
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
             name: NodeName("t".to_owned()),
             src: operand(SenComponent::Constant),
             dsts: Dsts::new(operand(SenComponent::Constant), Vec::new()),
@@ -7358,6 +7366,8 @@ mod tests_e258_e263 {
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
             name: NodeName("t".to_owned()),
             src: operand(SenComponent::Lxlu, SenComponent::Lx, Some(0)),
             dsts: Dsts::new(
@@ -7488,6 +7498,8 @@ mod tests_e258_e263 {
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
             name: NodeName("t".to_owned()),
             src: operand(SenComponent::Lxlu, SenComponent::Lx, Some(0)),
             dsts: Dsts::new(
@@ -7581,6 +7593,8 @@ mod tests_e258_e263 {
                     padding: TransferPadding::default(),
                     src_indirect: None,
                     dst_indirect: None,
+                    core_id_to_gtr_info: BTreeMap::new(),
+                    transfer_size: BTreeMap::new(),
                     name: NodeName("t".to_owned()),
                     src: operand(SenComponent::Lxlu, SenComponent::Lx, Some(0)),
                     dsts: Dsts::new(
@@ -8572,6 +8586,8 @@ mod tests_e307_e309 {
                 padding: TransferPadding::default(),
                 src_indirect: None,
                 dst_indirect: None,
+                core_id_to_gtr_info: BTreeMap::new(),
+                transfer_size: BTreeMap::new(),
             },
         );
 

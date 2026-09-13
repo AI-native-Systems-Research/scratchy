@@ -281,10 +281,11 @@ use crate::schedule::ddc::transformation_util::{
 };
 use crate::schedule::ddc::v1::{self, ComputeOps};
 use crate::schedule::dsc2::{
-    AddressFold, AllocateNode, BlockNode, ChildPos, Coordinate, CoordinateCategory, Dsc, Dsts, Fold,
-    FoldCardinality, FoldCoeff, FoldDim, FoldLabel, FoldPosition, LdsIdx, Node, NodeName, NumChunks,
-    PadFold, ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength,
-    SyncUnits, TransferNode, TransferPadding, Via, ZeroPadFolds,
+    AddressFold, AllocateNode, BlockNode, ChildPos, CondOp, Coordinate, CoordinateCategory, Dsc,
+    Dsts, Fold, FoldCardinality, FoldCoeff, FoldDim, FoldLabel, FoldPosition, GroupTagRegInfo,
+    LdsIdx, LoopBound, LoopCond, LoopCondComposite, Node, NodeName, NumBuffers, NumChunks, PadFold,
+    ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength, SyncUnits,
+    TransferNode, TransferPadding, Via, ZeroPadFolds,
 };
 use crate::schedule::l3::dsc::{
     AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare, CoreletsUsed,
@@ -532,6 +533,7 @@ mod tests_e001_e008 {
 
     fn plain_dsc() -> DesignSpaceConfig {
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
@@ -1216,6 +1218,7 @@ mod tests_e009_e016 {
 
     fn a_dsc() -> DesignSpaceConfig {
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
@@ -1535,6 +1538,8 @@ pub fn create_transfer_node(src: Via, dst: Via, more_dsts: &[Via], name: NodeNam
         padding: TransferPadding::default(),
         src_indirect: None,
         dst_indirect: None,
+        core_id_to_gtr_info: BTreeMap::new(),
+        transfer_size: BTreeMap::new(),
         name,
         src: src.operand(),
         dsts: Dsts::new(
@@ -2280,6 +2285,7 @@ mod tests_e033_e040 {
             el: named,
         };
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
@@ -2911,6 +2917,7 @@ mod tests_e041_e048 {
 
     fn dsc(core: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),
@@ -3466,6 +3473,7 @@ mod tests_e049_e056 {
         let mut stage = StageDims::default();
         stage.extents.insert(first, Extent(1));
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: corelets(2),
             corelets_used_dsc2: Some(corelets(2)),
             corelet_shares: BTreeMap::new(),
@@ -5108,6 +5116,45 @@ pub enum LxBuffering {
     SpatialDouble(SuperChunkStage),
 }
 
+impl LxBuffering {
+    /// Which `BufferType` this is, with the super-chunk stage struck out — what entry 293 DECIDES,
+    /// before `dataStageSuperChunkIdx` exists to fuse into it.
+    #[must_use]
+    pub const fn choice(self) -> LxBufferChoice {
+        match self {
+            Self::Double => LxBufferChoice::Double,
+            Self::SpatialDouble(_) => LxBufferChoice::SpatialDouble,
+        }
+    }
+}
+
+/// WHICH LX BUFFER TYPE THE SCHEDULER PICKS — `lxBufferType` (`L3DlOpsScheduler.h:221`) AS ENTRY 293
+/// WRITES IT, which is [`LxBuffering`] WITHOUT its super-chunk stage.
+///
+/// ⛔⛔ A SEPARATE TYPE BECAUSE THE STAGE DOES NOT EXIST YET: `dataStageSuperChunkIdx` is written at
+/// `L3DlOpsScheduler.cpp:4648`, AFTER `setLxBufferType` runs, so a decision that carried one would be
+/// stating a fact the scheduler has not yet computed. [`LxBuffering::choice`] is the fusion's own view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LxBufferChoice {
+    /// `BufferType::DOUBLE`.
+    Double,
+    /// `BufferType::SPATIAL_DOUBLE`.
+    SpatialDouble,
+}
+
+/// HOW THE LX BUFFER TYPE WAS ASKED FOR — `lxBufferTypeMode` (`L3DlOpsScheduler.h:222`), whose
+/// `BUFFER_TYPE_MODE_COUNT` terminator is not a mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LxBufferTypeMode {
+    /// `AUTO` — the heuristic decides.
+    #[default]
+    Auto,
+    /// `FORCE_DOUBLE`.
+    ForceDouble,
+    /// `FORCE_SPATIAL_DOUBLE`.
+    ForceSpatialDouble,
+}
+
 /// THE LABELLED DS IS A VALUE TENSOR, WITNESSED — `DT_CHECK_MSG(!isIndexLds(lds), "Do not expect index
 /// tensor.")`, which entries 201 and 202 each state once.
 ///
@@ -5454,6 +5501,7 @@ mod tests_e197_e204 {
     /// `Y`, and which uses cores 0 and 1.
     fn a_dsc(scales: &[(PrimaryDim, Scale)], pinning: Pinning) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
@@ -6735,6 +6783,7 @@ mod tests_e205_e212 {
 
     fn dsc(core: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),
@@ -7067,26 +7116,408 @@ mod tests_e205_e212 {
 //   extract   : crustify-ddc/cpp/l3.cpp:3450-3510
 //   calls     : e018_createLoopNode, e019_createBlockNode, e058_getNewDataStageIndex
 
-// crustify:todo: e218_setCondGtr
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4721  (114 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::setCondGtr( SuperDsc &mySDsc, const int dscIdx, const int ldsIdx, const int currCoreId, dsc2::TransferNode &ldsL3LUTransNode, const std::vector<std::tuple<const dsc2::LoopNode *, PrimaryDimTypes, int, int>> &loopDimTripCounts)
-//   extract   : crustify-ddc/cpp/l3.cpp:3520-3638
-//   calls     : e010_getCoreSplitDimensions, e017_createTransferNode, e048_getSharesAndGroupName
+/// ONE PARENT LOOP WHOSE TRIP COUNT DIFFERS BETWEEN DSCs — the `{loopNode, dim, currTripCount,
+/// otherTripCount}` tuple entry 291 builds and entry 218 conditions on.
+///
+/// ⭐ `curr` IS CARRIED AND NEVER READ, exactly as in the reference: the guard is `dim < other`, and
+/// keeping the count that made this loop UNRELATED beside it is what names the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopTripDiff {
+    /// The parent loop node.
+    pub loop_node: LoopId,
+    /// The dim of that loop this DSC walks further than another does.
+    pub dim: PrimaryDim,
+    /// `currTripCount` — this DSC's count on that dim.
+    pub curr: TripCount,
+    /// `otherTripCount` — the smaller count another DSC states, which becomes the condition's bound.
+    pub other: TripCount,
+}
 
-// crustify:todo: e219_fillFinalStartAddressAndOffset
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4959  (137 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::fillFinalStartAddressAndOffset( DesignSpaceConfig &dsc, const int ldsIdx, const std::vector<PrimaryDimTypes> &coreletSplitDims) const
-//   extract   : crustify-ddc/cpp/l3.cpp:3648-3787
-//   calls     : e050_getInitialStartAddressAndOffset
+/// WHAT ENTRIES 218 AND 291 DO TO ONE DSC'S SCHEDULE TREE — the transfer duplication, the condition
+/// node that guards it, and the `gtrIdsUsed_` the DSC records beside it.
+///
+/// ⭐ ONE CARRIER WITH [`DscTreeSurgery`] because `mySDsc` IS ONE OBJECT, and `gtrIdsUsed_` travels
+/// with it for the same reason [`Self::set_transfer`] does: entry 218's effect is not complete until
+/// the group id it minted is in the DSC, and it holds the tree while it mints one.
+pub trait DscGtrSurgery: DscTreeSurgery + DscTransferWrites {
+    /// `node->name_` BY IDENTITY — the loop name a duplicated transfer is named after.
+    fn node_name(&self, dsc: DscIdx, node: NodeId) -> Option<NodeName>;
+    /// `new dsc2::TransferNode(..)`, unlinked.
+    fn new_transfer(&mut self, dsc: DscIdx, transfer: TransferNode) -> NodeId;
+    /// `new dsc2::BlockNode()` with that name, unlinked.
+    fn new_block(&mut self, dsc: DscIdx, name: NodeName) -> NodeId;
+    /// `new dsc2::ConditionNode()` with that name and that predicate, unlinked.
+    fn new_condition(&mut self, dsc: DscIdx, name: NodeName, cond: LoopCondComposite) -> NodeId;
+    /// `condition->addThenRegion(block)`.
+    fn add_then_region(&mut self, dsc: DscIdx, condition: NodeId, block: NodeId);
+    /// `condition->addElseRegion(block)`.
+    fn add_else_region(&mut self, dsc: DscIdx, condition: NodeId, block: NodeId);
+    /// `parent->addChildNode(node, addBefore, sibling)`.
+    fn add_child_node(&mut self, dsc: DscIdx, node: NodeId, at: InsertionPoint);
+    /// `allocNode->addAllocUser(user)`, the allocation reached by [`DscTrees::allocation`].
+    fn add_alloc_user(&mut self, dsc: DscIdx, alloc: NodeId, user: NodeId);
+    /// `dsc.gtrIdsUsed_.insert(groupId)`.
+    fn insert_gtr_id(&mut self, dsc: DscIdx, group: GtrGroupId);
+}
 
-// crustify:todo: e220_fillIBRStartAddressAndOffset
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5100  (43 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::fillIBRStartAddressAndOffset(const SuperDsc &sdsc, DesignSpaceConfig &dsc, const int ldsIdx) const
-//   extract   : crustify-ddc/cpp/l3.cpp:3797-3842
-//   calls     : e056_isIndexLds
+/// Replaces: e218_setCondGtr
+///
+/// SPLITS ONE HBM-TO-LX LOAD IN TWO SO THE DEEPER DSC'S SURPLUS ITERATIONS MULTICAST NARROWLY: per
+/// differing parent loop, duplicates the transfer, guards the ORIGINAL by `loop.dim < otherTripCount`
+/// in a then-region and the DUPLICATE in the else-region, and writes the duplicate's multicast group.
+///
+/// ⛔ [`None`] IS *"Unsupported number of core split dimensions in condGtr_."*, both `memOrg_`/allocate
+/// refusals for the front destination and HBM, *"Expect L3LU transfer node."*, entry 048's own three,
+/// and a bound past `u32`. ⚠️ TRAP: `getNonBroadcastLdsDimSet` IS COMPUTED AND NEVER READ — only its
+/// `.at()` refusal survives, and the DUPLICATE alone carries the GTR entry.
+pub fn set_cond_gtr<E: DscGtrSurgery + ?Sized>(
+    sdsc: &SuperDsc,
+    dsc_idx: DscIdx,
+    lds: LdsIdx,
+    core: Core,
+    transfer: NodeId,
+    loop_dim_trip_counts: &[LoopTripDiff],
+    names: &mut GtrGroupNames,
+    env: &mut E,
+) -> Option<()> {
+    // "Currently the hardware only supports one condGtr_ entry."
+    (core_split_dimensions(sdsc).len() < 2).then_some(())?;
+    let dsc = sdsc.dscs().at(dsc_idx)?;
+    let entry = dsc.labeled_ds.at(lds)?;
+    dsc.non_broadcast_lds_dim_set(lds)?;
+    let original = env.transfer(dsc_idx, transfer)?;
+    let dst_storage = original.dsts.first().storage;
+    let alloc_dst = env.allocation(dsc_idx, lds, dst_storage)?;
+    let alloc_hbm = env.allocation(dsc_idx, lds, SenComponent::Hbm)?;
+    let processing: BTreeSet<Core> = dsc.core_ids_used.iter().collect();
+
+    for diff in loop_dim_trip_counts {
+        let slices = sdsc.core_id_to_wk_slice.get(&core)?;
+        let (shares, group) =
+            shares_and_group_name(sdsc, dsc, entry, slices, &processing, names)?;
+        // "Expect L3LU transfer node."
+        (original.src.storage == SenComponent::Hbm).then_some(())?;
+        (dst_storage == SenComponent::Lx).then_some(())?;
+
+        let suffix = format!(
+            "{}_{}",
+            env.node_name(dsc_idx, diff.loop_node.0)?.0,
+            diff.dim.spelling()
+        );
+        let rest: Vec<Via> = original.dsts.iter().skip(1).map(Via::of).collect();
+        let mut duplicate = create_transfer_node(
+            Via::of(&original.src),
+            Via::of(original.dsts.first()),
+            &rest,
+            NodeName(format!("{}_condition_{suffix}", original.name.0)),
+        );
+        // The four `locIndirect_`/`..IndirectLdsAndLoopOffsets_` copies, in the projection that holds
+        // one indirection per END rather than one per destination.
+        duplicate.src_indirect = original.src_indirect;
+        duplicate.dst_indirect = original.dst_indirect;
+        let group = match group {
+            GroupName::Shared(id) => Some(id),
+            GroupName::Unshared => None,
+        };
+        duplicate.core_id_to_gtr_info.insert(
+            core,
+            GroupTagRegInfo {
+                num_sharers: shares,
+                group,
+            },
+        );
+        let duplicated = env.new_transfer(dsc_idx, duplicate);
+        env.add_alloc_user(dsc_idx, alloc_dst, duplicated);
+        env.add_alloc_user(dsc_idx, alloc_hbm, duplicated);
+
+        //   condition_separate_..
+        //     then: the original transfer
+        //     else: the duplicate
+        let condition_name = NodeName(format!("condition_separate_{}_{suffix}", original.name.0));
+        let condition = env.new_condition(
+            dsc_idx,
+            condition_name.clone(),
+            LoopCondComposite {
+                two_level_or_of_ands: vec![vec![LoopCond {
+                    loop_comp: diff.loop_node,
+                    dim: diff.dim,
+                    op: CondOp::Lt,
+                    bound: LoopBound::Index(u32::try_from(diff.other.get()).ok()?),
+                }]],
+                negated: false,
+            },
+        );
+        env.add_child_node(dsc_idx, condition, InsertionPoint::Before(transfer));
+
+        let then_block = env.new_block(dsc_idx, NodeName(format!("{}_then_region", condition_name.0)));
+        env.add_then_region(dsc_idx, condition, then_block);
+        env.move_node(dsc_idx, transfer, InsertionPoint::LastIn(then_block));
+
+        let else_block = env.new_block(dsc_idx, NodeName(format!("{}_else_region", condition_name.0)));
+        env.add_else_region(dsc_idx, condition, else_block);
+        env.add_child_node(dsc_idx, duplicated, InsertionPoint::LastIn(else_block));
+
+        if let Some(id) = group {
+            env.insert_gtr_id(dsc_idx, id);
+        }
+    }
+    Some(())
+}
+
+// ⭐ TYPES FOR ENTRIES 218-220. The address fold space's own coordinates, and the seam through which
+// the placement writes the allocate nodes it reaches through `memOrg_`.
+
+/// THE FOLD COORDINATES ONE `(core, corelet)` SPREADS ITS ADDRESSES OVER —
+/// `startAddressCoreCorelet_.getFlattenedCoordinates({{0, 0}, {1, 0}})` with the core and corelet axes
+/// struck out, so what is left is each coordinate's TAIL over the super-DSC's own folds.
+///
+/// ⛔⛔ `DT_CHECK(coordinates.begin()->size() >= 2)` IS THIS TYPE: an empty coordinate list, or one
+/// whose entries disagree on width, has no value here, and the two struck axes are counted by
+/// [`Self::depth`] rather than carried, so they cannot go missing.
+/// ⭐ THE TAILS ARE RAW `i64` BECAUSE [`AddressCoord::sdsc_folds`] IS — a second spelling of a
+/// super-DSC fold step would need a conversion at every read, and there is nothing to convert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressFoldCoords(Vec<Vec<i64>>);
+
+impl AddressFoldCoords {
+    /// The tails in the fold manager's own order; [`None`] for an empty list or ragged widths.
+    #[must_use]
+    pub fn of(tails: Vec<Vec<i64>>) -> Option<Self> {
+        let width = tails.first()?.len();
+        tails
+            .iter()
+            .all(|tail| tail.len() == width)
+            .then_some(Self(tails))
+    }
+
+    /// The ONE coordinate a super-DSC declaring no folds of its own has.
+    #[must_use]
+    pub fn flat() -> Self {
+        Self(vec![Vec::new()])
+    }
+
+    /// `{coreFoldProp_, coreletFoldProp_} ++ sdscFoldProps_`'s size — the two struck axes plus each
+    /// tail axis, which is [`L3Placement::address_fold_depth`] reached from the coordinates.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        2 + self.0.first().map_or(0, Vec::len)
+    }
+
+    /// Each coordinate's tail.
+    pub fn tails(&self) -> impl Iterator<Item = &Vec<i64>> {
+        self.0.iter()
+    }
+}
+
+/// WHERE ENTRIES 219, 220 AND 292 WRITE — `labeledDs_.at(lds).memOrg_.at(storage).allocateNode_`,
+/// handed out BY VALUE and written back, exactly as [`DscTransfers::transfer`] hands out a transfer.
+///
+/// ⭐ BY VALUE BECAUSE THE PLACEMENT READS ITS OWN NODE BACK WHILE IT FILLS IT: entry 219 asks
+/// [`MemOrg`] for the LX start address it is about to overwrite, and the two reads cannot be one
+/// borrow. ⛔ [`None`] FROM [`Self::allocation`] IS *"Expect .. in memOrg_."* AND *"Expect a valid
+/// allocate node."* — a storage `memOrg_` does not name and an entry carrying no node are one answer.
+pub trait AllocationSites: MemOrgs {
+    /// That allocate node, absent for either refusal above.
+    fn allocation(&self, dsc: DscIdx, lds: LdsIdx, storage: SenComponent) -> Option<AllocateNode>;
+    /// The same node written back.
+    fn set_allocation(
+        &mut self,
+        dsc: DscIdx,
+        lds: LdsIdx,
+        storage: SenComponent,
+        node: AllocateNode,
+    );
+}
+
+/// Replaces: e219_fillFinalStartAddressAndOffset
+///
+/// PLACES ONE LX ALLOCATION'S START ADDRESS AND BUFFER OFFSET ON EVERY CORE AND CORELET: corelet 0's
+/// answer from entry 050 at each fold coordinate, then that same address and offset on every corelet.
+///
+/// ⛔⛔ TRAP — THE CORELET OFFSET IS DEAD CODE, AND THAT IS WHY ALL CORELETS SHARE AN ADDRESS.
+/// `int64_t addr = startAddr` is accumulated with `coreletOffset` and never read again; every
+/// `insertData` writes `startAddr` itself. Only that arithmetic's REFUSALS are ported, not its sum.
+/// ⛔ [`None`] IS the `numBuffers_ == 1 || == 2` check, more than one corelet-split dim, a split dim
+/// the stage does not split, a `getFuncType(1)` that is not `Map`, and every `primaryDimToVal_st`,
+/// `coreletSplit_.at` and padding `.at` the dead sum walks through.
+pub fn fill_final_start_address_and_offset<M: MemOrg + ?Sized, S: DimStage + ?Sized>(
+    dsc: &DesignSpaceConfig,
+    lds: LdsIdx,
+    mem: &M,
+    core_stage: &S,
+    chunk_stage: &S,
+    corelet_split_dims: &BTreeSet<PrimaryDim>,
+    coords: &AddressFoldCoords,
+    node: &mut AllocateNode,
+) -> Option<()> {
+    matches!(
+        node.placement.num_buffers,
+        NumBuffers::Single | NumBuffers::Double
+    )
+    .then_some(())?;
+    let corelets = dsc.corelets_used_dsc2?.get();
+    let padding = mem.lx_padding()?;
+
+    // READ EVERY COORDINATE BEFORE WRITING ANY: corelet 0's own read is the address it is handed
+    // back, so a write at one coordinate must not have moved what the next one reads.
+    let mut reads: Vec<(Core, Vec<Bytes>, BufferOffset)> = Vec::new();
+    for core in dsc.core_ids_used.iter() {
+        let mut spread = Vec::new();
+        let mut buffer_offset = BufferOffset(0);
+        for tail in coords.tails() {
+            let at = AddressCoord {
+                core,
+                corelet: Corelet::at::<0>(),
+                sdsc_folds: tail.clone(),
+            };
+            let initial = initial_start_address_and_offset(mem, &at)?;
+            spread.push(Bytes(initial.start.0));
+            buffer_offset = initial.buffer_offset;
+        }
+        reads.push((core, spread, buffer_offset));
+    }
+
+    let all_corelets = (0..corelets)
+        .map(Corelet::checked)
+        .collect::<Option<Vec<_>>>()?;
+    let targets = if corelets == 1 {
+        vec![Corelet::at::<0>()]
+    } else {
+        let split: Vec<PrimaryDim> = dsc
+            .non_broadcast_lds_dims(lds)?
+            .into_iter()
+            .filter(|dim| corelet_split_dims.contains(dim))
+            .collect();
+        match split.as_slice() {
+            // "Corelet split is on an unrelated dimension" — one address for every corelet.
+            [] => all_corelets,
+            [split_dim] => {
+                corelet_offset_refusals(
+                    dsc, lds, mem, core_stage, chunk_stage, &padding, node, *split_dim,
+                    &all_corelets,
+                )?;
+                all_corelets
+            }
+            // `DT_CHECK_MSG(size() <= 1, "Support maximal one corelet split dimension for a tensor")`.
+            _ => return None,
+        }
+    };
+
+    for (core, spread, buffer_offset) in reads {
+        for &corelet in &targets {
+            node.start_address
+                .insert_spread(core, corelet, spread.clone());
+            node.placement
+                .buffer_offset
+                .entry(core)
+                .or_default()
+                .insert(corelet, Bytes(buffer_offset.0));
+        }
+    }
+    Some(())
+}
+
+/// EVERY REFUSAL ENTRY 219'S DEAD CORELET-OFFSET SUM MAKES, and none of its arithmetic — the stage
+/// checks, the `Map` fold check and each dim's `.at()` walk up to and including the split dim.
+///
+/// ⭐ SEPARATE BECAUSE THE SUM IS DEAD, NOT BECAUSE IT IS LONG: keeping the walk shows exactly which
+/// inputs a placement still demands, and computing the offset would state a second answer that
+/// nothing reads. [`calculate_corelet_offset_in_byte`] is the LIVE spelling of the same arithmetic.
+fn corelet_offset_refusals<M: MemOrg + ?Sized, S: DimStage + ?Sized>(
+    dsc: &DesignSpaceConfig,
+    lds: LdsIdx,
+    mem: &M,
+    core_stage: &S,
+    chunk_stage: &S,
+    padding: &PaddingForm,
+    node: &AllocateNode,
+    split_dim: PrimaryDim,
+    corelets: &[Corelet],
+) -> Option<()> {
+    // "If the tensor is HBM double buffering, we use the chunk data stage .. Otherwise .. the core
+    // data stage for all non-corelet-split dimensions and the chunk data stage for the split one."
+    let stage: &S = if mem.hbm_pinned() {
+        chunk_stage
+    } else {
+        core_stage
+    };
+    stage.is_corelet_split(split_dim).then_some(())?;
+    dsc.cumulative_stick_sizes(dsc.labeled_ds.at(lds)?.ds_type())?;
+    (node.start_address.func_type(FoldPosition::Corelet)? == AddressFold::Map).then_some(())?;
+    let dims = dsc.non_broadcast_lds_dims(lds)?;
+    for &corelet in corelets {
+        for dim in &dims {
+            let dim = *dim;
+            if dim != split_dim {
+                stage.corelet_dim_val(dim, SenComponent::NoComponent, corelet, padding)?;
+                continue;
+            }
+            if padding.padding(dim) == PadType::NoPad {
+                chunk_stage.corelet_dim_val(dim, SenComponent::NoComponent, corelet, padding)?;
+            } else {
+                // `offset_in_element = size_of_i * stride`, and only for `I`.
+                (padding.padding(dim) == PadType::PaddedFullSpanWUnneeded).then_some(())?;
+                (dim == PrimaryDim::I).then_some(())?;
+                chunk_stage.pad_stride(dim)?;
+                chunk_stage.corelet_split(dim, corelet)?;
+            }
+            break;
+        }
+    }
+    Some(())
+}
+
+/// Replaces: e220_fillIBRStartAddressAndOffset
+///
+/// ZEROES AN INDEX TENSOR'S IBR ALLOCATIONS: a wholly CONSTANT fold space over every super-DSC axis
+/// with address zero placed in it, and a zero buffer offset on every core and corelet.
+///
+/// ⭐ A NON-INDEX TENSOR IS `Some(())` AND NOT A REFUSAL — "Nothing to fill if it is not an index
+/// tensor". ⭐ THE ADDRESS IS PLACED AT THE ALL-ZERO COORDINATE ALONE because every axis is
+/// [`AddressFold::Constant`], which is the reference's `insertData(0, coord)` verbatim.
+/// ⛔ [`None`] IS *"Expect IBR in memOrg_."*, *"Expect a valid allocate node."* and
+/// `DT_CHECK(addrFM.hasZeroFoldDim())` — an IBR address already laid out is not laid out again.
+pub fn fill_ibr_start_address_and_offset<M, A>(
+    dsc: &DesignSpaceConfig,
+    dsc_idx: DscIdx,
+    lds: LdsIdx,
+    mem: &M,
+    coords: &AddressFoldCoords,
+    sites: &mut A,
+) -> Option<()>
+where
+    M: MemOrg + ?Sized,
+    A: AllocationSites + ?Sized,
+{
+    if !is_index_lds(mem)? {
+        return Some(());
+    }
+    let corelets = dsc.corelets_used_dsc2?.get();
+    let mut any = false;
+    for ibr in [SenComponent::L3luibr, SenComponent::L3suibr] {
+        let Some(mut node) = sites.allocation(dsc_idx, lds, ibr) else {
+            continue;
+        };
+        any = true;
+        node.start_address.has_zero_fold_dim().then_some(())?;
+        node.start_address
+            .build_fold_space(coords.depth(), AddressFold::Constant, AddressFold::Constant);
+        node.start_address
+            .insert(Core::checked(0)?, Corelet::at::<0>(), Bytes(0));
+        for core in dsc.core_ids_used.iter() {
+            for id in 0..corelets {
+                node.placement
+                    .buffer_offset
+                    .entry(core)
+                    .or_default()
+                    .insert(Corelet::checked(id)?, Bytes(0));
+            }
+        }
+        sites.set_allocation(dsc_idx, lds, ibr, node);
+    }
+    any.then_some(())
+}
+
 
 // ⭐ TYPES FOR ENTRIES 221-228. The indirect-access stage's own vocabulary — which LX buffering the
 // paged chunk loops sit under, which way an IBR transfer runs, and the four seams through which the
@@ -7230,14 +7661,29 @@ pub trait L3TreeSurgery: LoopBands {
     fn add_alloc_user(&mut self, alloc: AllocId, user: NodeId);
     /// `labeledDs_.at(lds).memOrg_[storage].allocateNode_ = alloc`.
     fn set_mem_org_allocation(&mut self, lds: LdsIdx, storage: SenComponent, alloc: AllocId);
+    /// `allocNode->numBuffers_ = n` — entry 294's fallback, which double-buffers an allocation the
+    /// remaining LX could not hold whole.
+    fn set_buffering(&mut self, alloc: AllocId, buffering: Buffering);
     /// The transfer node written back — [`ScheduleSurgery::transfer`] hands one out BY VALUE.
     fn set_transfer(&mut self, node: NodeId, transfer: TransferNode);
+}
+
+/// ONE TRANSFER NODE OF ONE DSC, READ AND WRITTEN BACK — the seam entries 221, 291 and 295 all fill a
+/// transfer through, hoisted out so the three do not each spell it.
+///
+/// ⭐ BY VALUE, exactly as [`ScheduleSurgery::transfer`] hands one out: every filler reads fields of
+/// the node it is about to write, and the two cannot be one borrow.
+pub trait DscTransferWrites {
+    /// That transfer node, absent where the DSC's tree holds no such node.
+    fn transfer(&self, dsc: DscIdx, node: NodeId) -> Option<TransferNode>;
+    /// The same node written back.
+    fn set_transfer(&mut self, dsc: DscIdx, node: NodeId, transfer: TransferNode);
 }
 
 /// WHAT ENTRY 221 ASKS OF THE SUPER-DSC'S SCHEDULE TREES — the per-DSC `memOrg_` walk and the LX
 /// allocation's transfer users, which are the MECHANISM for reaching those transfers rather than a
 /// fact about their padding.
-pub trait DscTransfers {
+pub trait DscTransfers: DscTransferWrites {
     /// What one labelled DS's `memOrg_` answers.
     type Org: MemOrg;
     /// That DSC's `labeledDs_` organisations, POSITIONALLY beside
@@ -7246,10 +7692,6 @@ pub trait DscTransfers {
     /// `memOrg_.at(LX).allocateNode_->allocUsers_` restricted to its TRANSFER users, for the labelled
     /// DS at that POSITION.
     fn lx_alloc_transfer_users(&self, dsc: DscIdx, lds: LdsIdx) -> Vec<NodeId>;
-    /// That transfer node, absent where the DSC's tree holds no such node.
-    fn transfer(&self, dsc: DscIdx, node: NodeId) -> Option<TransferNode>;
-    /// The same node written back.
-    fn set_transfer(&mut self, dsc: DscIdx, node: NodeId, transfer: TransferNode);
 }
 
 /// WHAT ENTRY 222 ASKS OF THE MEMORY TRACKERS — `DsTrackInMem` (`ddc/memTracker.h`), reached PER
@@ -8213,6 +8655,7 @@ mod tests_e221_e228 {
             .map(|&(dim, extent)| (dim, extent / 2))
             .collect();
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: corelets(2),
             corelets_used_dsc2: Some(corelets(2)),
             corelet_shares: BTreeMap::new(),
@@ -8657,6 +9100,15 @@ mod tests_e221_e228 {
         fn set_transfer(&mut self, node: NodeId, transfer: TransferNode) {
             self.nodes.get_mut(&node).expect("node exists").kind = Kind::Transfer(transfer);
         }
+
+        fn set_buffering(&mut self, alloc: AllocId, buffering: Buffering) {
+            let node = self.alloc_nodes[&alloc];
+            if let Kind::Allocate(allocate) =
+                &mut self.nodes.get_mut(&node).expect("node exists").kind
+            {
+                allocate.buffering = buffering;
+            }
+        }
     }
 
     /// e221 — a padded HBM-to-LX transfer gains one work-slice and one chunk fold at each end, and the
@@ -8688,6 +9140,16 @@ mod tests_e221_e228 {
             transfers: BTreeMap<NodeId, TransferNode>,
         }
 
+        impl DscTransferWrites for Env {
+            fn transfer(&self, _dsc: DscIdx, node: NodeId) -> Option<TransferNode> {
+                self.transfers.get(&node).cloned()
+            }
+
+            fn set_transfer(&mut self, _dsc: DscIdx, node: NodeId, transfer: TransferNode) {
+                self.transfers.insert(node, transfer);
+            }
+        }
+
         impl DscTransfers for Env {
             type Org = Org;
 
@@ -8698,14 +9160,6 @@ mod tests_e221_e228 {
             fn lx_alloc_transfer_users(&self, _dsc: DscIdx, lds: LdsIdx) -> Vec<NodeId> {
                 assert_eq!(lds, LdsIdx(0), "the POSITION the entry sits at");
                 self.transfers.keys().copied().collect()
-            }
-
-            fn transfer(&self, _dsc: DscIdx, node: NodeId) -> Option<TransferNode> {
-                self.transfers.get(&node).cloned()
-            }
-
-            fn set_transfer(&mut self, _dsc: DscIdx, node: NodeId, transfer: TransferNode) {
-                self.transfers.insert(node, transfer);
             }
         }
 
@@ -9099,6 +9553,145 @@ mod tests_e221_e228 {
         assert_eq!(
             tree.sync_node(children[3]).other_ends,
             vec![tree.node_name(children[2])]
+        );
+    }
+
+    /// e294 — the paged index gains an UNBUFFERED LX allocation after its HBM one, carrying that
+    /// allocation's indirection and the paged tensor's own LX allocation, then the load and its
+    /// L3LU-to-L3SU sync pair. ⭐ TESTED HERE, out of span: it is entry 226's LX twin and shares its
+    /// tree stub.
+    #[test]
+    fn staging_a_paged_index_into_lx_adds_an_allocate_a_transfer_and_a_sync_pair() {
+        struct Trackers;
+
+        impl ExPhaseTrackers for Trackers {
+            fn ex_phases(&self) -> Vec<ExPhase> {
+                vec![ExPhase(0)]
+            }
+
+            fn capacity(&self, _at: L3TrackerSite) -> Bytes {
+                Bytes(4096)
+            }
+
+            fn backup(&mut self, _at: L3TrackerSite) {}
+
+            fn restore_all(&mut self) {}
+
+            fn remove(&mut self, _at: L3TrackerSite, _name: &v1::StorageName) {}
+
+            fn check_and_add(
+                &mut self,
+                _at: L3TrackerSite,
+                _phase: ExPhase,
+                _name: &v1::StorageName,
+                _size: Bytes,
+            ) -> Option<v1::Placed> {
+                Some(v1::Placed::At(Bytes(0)))
+            }
+        }
+
+        struct Placement;
+
+        impl L3Placement for Placement {
+            fn buffer_capacity_even_sticks(
+                &self,
+                _alloc: AllocId,
+                _lds: LdsIdx,
+                _corelet: Corelet,
+                _row: Row,
+            ) -> Bytes {
+                Bytes(64)
+            }
+
+            fn address_fold_depth(&self) -> usize {
+                2
+            }
+
+            fn address_fold_coords(&self) -> usize {
+                1
+            }
+        }
+
+        impl v1::StorageNames for Placement {
+            fn lds_name(&self, lds: LdsIdx) -> v1::StorageName {
+                v1::StorageName(format!("lds{}", lds.0))
+            }
+
+            fn constant_name(&self, constant: ConstIdx) -> v1::StorageName {
+                v1::StorageName(format!("const{}", constant.0))
+            }
+        }
+
+        let mut tree = Tree::default();
+        let root = tree.add("root", Kind::Block, None);
+        let hbm = tree.add("allocate_lds7_hbm", Kind::Block, Some(root));
+        let chunk = tree.loop_over(DatastageId(2), DATA_STAGE_CHUNK, PrimaryDim::X, root);
+        let config = dsc(LdsIdx(7), &[(PrimaryDim::X, 8)], Pinning::default());
+        let mut metadata = BTreeMap::from([(
+            DscIdx(0),
+            DscMetadata {
+                new_allocations: BTreeMap::new(),
+            },
+        )]);
+        let mut allocs: v1::AllocArena = BTreeMap::new();
+
+        create_store_index_tensor_to_lx(
+            &mut tree,
+            &config,
+            &mut metadata,
+            DscIdx(0),
+            LdsIdx(0),
+            IndexHbmAllocation {
+                alloc: AllocId(9),
+                indirect: Some(IndirectAlloc::IndexTensor(IndexTensor::Index)),
+                related_indirect: Some(AllocId(4)),
+            },
+            hbm,
+            AllocId(3),
+            chunk,
+            &mut allocs,
+            &mut Trackers,
+            &Placement,
+        )
+        .expect("a staged index tensor");
+
+        // The allocate and transfer names spell the RECORDED index, the syncs the POSITION.
+        let children = tree.children(root);
+        assert_eq!(
+            tree.names(&children),
+            vec![
+                "allocate_lds7_hbm".to_owned(),
+                "allocate_lds7_lx".to_owned(),
+                "transfer_lds7_src:hbm_dst:lx".to_owned(),
+                "sync_send_l3lu_to_l3su_paged_index_0".to_owned(),
+                "sync_receive_l3su_from_l3lu_paged_index_0".to_owned(),
+                tree.node_name(chunk.0).0,
+            ]
+        );
+        let lx = tree.allocate_node(AllocId(0));
+        // The remaining LX held it whole, so it is NOT double-buffered and it did not move.
+        assert_eq!(lx.buffering, Buffering::None);
+        assert_eq!(
+            lx.indirect,
+            Some(IndirectAlloc::IndexTensor(IndexTensor::Index))
+        );
+        // ⭐ THE PAGED TENSOR'S LX ALLOCATION, not the HBM allocation's own related indirection.
+        assert_eq!(lx.related_indirect, Some(AllocId(3)));
+        assert_eq!(
+            tree.mem_orgs,
+            vec![(LdsIdx(0), SenComponent::Lx, AllocId(0))]
+        );
+        assert_eq!(
+            tree.alloc_users,
+            vec![(AllocId(9), children[2]), (AllocId(0), children[2])]
+        );
+        assert_eq!(
+            tree.sync_node(children[3]).other_ends,
+            vec![tree.node_name(children[4])]
+        );
+        assert_eq!(
+            tree.sync_node(children[4]).other_ends,
+            vec![tree.node_name(children[3])]
         );
     }
 
@@ -9937,6 +10530,7 @@ mod tests_e229 {
             }
         };
         let dsc = DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: corelets(2),
             corelets_used_dsc2: Some(corelets(2)),
             corelet_shares: BTreeMap::new(),
@@ -10995,16 +11589,21 @@ pub fn create_chunk_loops(sdsc: &SuperDsc) -> Option<()> {
 }
 
 #[cfg(test)]
-mod tests_e283_e290 {
-    // ⭐ TESTS FOR ENTRIES 283-290. One node-id tree, one organisation map and one transfer list
+mod tests_e283_e295 {
+    // ⭐ TESTS FOR ENTRIES 283-295. One node-id tree, one organisation map and one transfer list
     // serve all of them. ⛔ ENTRY 290 HAS NO TEST: its body is a `todo!` naming entries 215, 216 and
     // 217, which this batch does not schedule.
+    // ⭐ ENTRIES 218, 219 AND 220 ARE TESTED HERE TOO, out of span: they are entries 291's and 292's
+    // own callees, and the tree, organisation and allocation-site stubs they need are these.
     use super::*;
 
+    use crate::arch::{Dd2, Sen1p5};
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
-    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::ddc::fold::Stride;
+    use crate::schedule::dsc2::{AllocLayout, AllocPlacement, LayoutDims, MaxDimSize, StartAddress};
     use crate::schedule::l3::dsc::{
-        CoreIdsUsed, DataStage, DscList, LabeledDsList, NamedDims, PrimaryDsInfo, StageDims,
+        CoreIdsUsed, DataStage, DscList, LabeledDsList, NamedDims, PlacedAllocation, PrimaryDsInfo,
+        StageDims,
     };
 
     fn core(index: u32) -> Core {
@@ -11079,6 +11678,7 @@ mod tests_e283_e290 {
 
     fn a_dsc(core_extents: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),
@@ -11115,27 +11715,34 @@ mod tests_e283_e290 {
         padding: Option<PaddingForm>,
         hbm_users: Option<Vec<NodeId>>,
         lx_users: Option<Vec<NodeId>>,
+        hbm: bool,
+        buffering: Option<Buffering>,
+        /// The address this tensor already holds at each `(core, fold tail)` — what entry 219 reads
+        /// back out and spreads over the fold coordinates.
+        start: BTreeMap<(Core, Vec<i64>), ByteAddress>,
+        offset: Option<BufferOffset>,
+        indirection: Option<IndirectAlloc>,
     }
 
     impl MemOrg for Org {
         fn hbm_pinned(&self) -> bool {
-            false
+            self.hbm
         }
 
         fn lx_buffering(&self) -> Option<Buffering> {
-            None
+            self.buffering
         }
 
-        fn lx_start_address(&self, _at: &AddressCoord) -> Option<ByteAddress> {
-            None
+        fn lx_start_address(&self, at: &AddressCoord) -> Option<ByteAddress> {
+            self.start.get(&(at.core, at.sdsc_folds.clone())).copied()
         }
 
         fn lx_buffer_offset(&self, _core: Core, _corelet: Corelet) -> Option<BufferOffset> {
-            None
+            self.offset
         }
 
         fn hbm_indirection(&self) -> Option<IndirectAlloc> {
-            None
+            self.indirection
         }
 
         fn hbm_allocation(&self) -> Option<NodeName> {
@@ -11199,6 +11806,15 @@ mod tests_e283_e290 {
         Transfer,
         Allocate,
         Sync,
+        Condition,
+    }
+
+    /// One minted condition node's predicate and its two regions.
+    #[derive(Debug, Clone)]
+    struct Cond {
+        cond: LoopCondComposite,
+        then_region: Vec<NodeId>,
+        else_region: Vec<NodeId>,
     }
 
     #[derive(Debug, Clone)]
@@ -11220,6 +11836,11 @@ mod tests_e283_e290 {
         allocations: BTreeMap<(LdsIdx, SenComponent), NodeId>,
         src_lds: BTreeMap<NodeId, LdsIdx>,
         dst_is_lds: BTreeSet<NodeId>,
+        transfer_nodes: BTreeMap<NodeId, TransferNode>,
+        conditions: BTreeMap<NodeId, Cond>,
+        alloc_users: Vec<(NodeId, NodeId)>,
+        gtr_ids: Vec<GtrGroupId>,
+        sizes: BTreeMap<NodeId, BTreeMap<PrimaryDim, Elements>>,
     }
 
     impl Tree {
@@ -11275,10 +11896,20 @@ mod tests_e283_e290 {
         }
 
         /// A tensor-to-tensor transfer out of `src` — the shape entry 289 hoists.
-        fn transfer(&mut self, name: &str, parent: NodeId, src: LdsIdx) -> NodeId {
+        /// ⭐ NOT `transfer`: [`DscTransferWrites::transfer`] takes `&self` and so wins the
+        /// method probe even on a `&mut Tree` receiver.
+        fn tensor_transfer(&mut self, name: &str, parent: NodeId, src: LdsIdx) -> NodeId {
             let id = self.add(name, Kind::Transfer, Some(parent));
             self.src_lds.insert(id, src);
             self.dst_is_lds.insert(id);
+            id
+        }
+
+        /// The same transfer CARRYING the node entries 218, 291 and 295 read and write back.
+        fn filled_transfer(&mut self, parent: NodeId, src: LdsIdx, node: TransferNode) -> NodeId {
+            let name = node.name.0.clone();
+            let id = self.tensor_transfer(&name, parent, src);
+            self.transfer_nodes.insert(id, node);
             id
         }
 
@@ -11439,6 +12070,186 @@ mod tests_e283_e290 {
         }
     }
 
+    impl DscTransferWrites for Tree {
+        fn transfer(&self, _dsc: DscIdx, node: NodeId) -> Option<TransferNode> {
+            self.transfer_nodes.get(&node).cloned()
+        }
+
+        fn set_transfer(&mut self, _dsc: DscIdx, node: NodeId, transfer: TransferNode) {
+            self.transfer_nodes.insert(node, transfer);
+        }
+    }
+
+    impl DscGtrSurgery for Tree {
+        fn node_name(&self, _dsc: DscIdx, node: NodeId) -> Option<NodeName> {
+            self.nodes.get(&node).map(|entry| entry.name.clone())
+        }
+
+        fn new_transfer(&mut self, _dsc: DscIdx, transfer: TransferNode) -> NodeId {
+            let name = transfer.name.0.clone();
+            let id = self.add(&name, Kind::Transfer, None);
+            self.transfer_nodes.insert(id, transfer);
+            id
+        }
+
+        fn new_block(&mut self, _dsc: DscIdx, name: NodeName) -> NodeId {
+            self.add(&name.0, Kind::Block, None)
+        }
+
+        fn new_condition(
+            &mut self,
+            _dsc: DscIdx,
+            name: NodeName,
+            cond: LoopCondComposite,
+        ) -> NodeId {
+            let id = self.add(&name.0, Kind::Condition, None);
+            self.conditions.insert(
+                id,
+                Cond {
+                    cond,
+                    then_region: Vec::new(),
+                    else_region: Vec::new(),
+                },
+            );
+            id
+        }
+
+        fn add_then_region(&mut self, _dsc: DscIdx, condition: NodeId, block: NodeId) {
+            self.conditions
+                .get_mut(&condition)
+                .expect("a minted condition")
+                .then_region
+                .push(block);
+            self.link(block, InsertionPoint::LastIn(condition));
+        }
+
+        fn add_else_region(&mut self, _dsc: DscIdx, condition: NodeId, block: NodeId) {
+            self.conditions
+                .get_mut(&condition)
+                .expect("a minted condition")
+                .else_region
+                .push(block);
+            self.link(block, InsertionPoint::LastIn(condition));
+        }
+
+        fn add_child_node(&mut self, _dsc: DscIdx, node: NodeId, at: InsertionPoint) {
+            self.link(node, at);
+        }
+
+        fn add_alloc_user(&mut self, _dsc: DscIdx, alloc: NodeId, user: NodeId) {
+            self.alloc_users.push((alloc, user));
+        }
+
+        fn insert_gtr_id(&mut self, _dsc: DscIdx, group: GtrGroupId) {
+            self.gtr_ids.push(group);
+        }
+    }
+
+    impl DscTransferSizes for Tree {
+        fn block_transfer_size_per_dim(
+            &self,
+            _dsc: DscIdx,
+            node: NodeId,
+            _storage: SenComponent,
+            _corelet: Corelet,
+        ) -> Option<BTreeMap<PrimaryDim, Elements>> {
+            self.sizes.get(&node).cloned()
+        }
+    }
+
+    /// One `DataStructDims`, stated by lookup — what entry 292 hands entry 219 per data stage.
+    #[derive(Default)]
+    struct Stage;
+
+    impl DimStage for Stage {
+        fn corelet_dim_val(
+            &self,
+            _dim: PrimaryDim,
+            _comp: SenComponent,
+            _corelet: Corelet,
+            _padded: &PaddingForm,
+        ) -> Option<Extent> {
+            None
+        }
+
+        fn is_corelet_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+
+        fn corelet_split(&self, _dim: PrimaryDim, _corelet: Corelet) -> Option<Extent> {
+            None
+        }
+
+        fn pad_stride(&self, _dim: PrimaryDim) -> Option<Stride> {
+            None
+        }
+    }
+
+    /// The two data stages entry 292 reaches by id.
+    struct Stages;
+
+    impl DscStages for Stages {
+        type Stage = Stage;
+
+        fn dim_stage(&self, _dsc: DscIdx, stage: DatastageId) -> Option<&Stage> {
+            (stage == DATA_STAGE_CORE || stage == DATA_STAGE_CHUNK).then_some(&Stage)
+        }
+    }
+
+    /// The allocate nodes entries 219, 220 and 292 write, by the `memOrg_` entry they hang from.
+    #[derive(Debug, Default)]
+    struct Sites(BTreeMap<(LdsIdx, SenComponent), AllocateNode>);
+
+    impl MemOrgs for Sites {
+        type Org = Org;
+
+        /// ⭐ NOTHING HERE ON PURPOSE: entries 219 and 220 take the organisation they read as their
+        /// own argument, and the supertrait is only what a driver reaches both through.
+        fn mem_org(&self, _dsc: DscIdx, _lds: LdsIdx) -> Option<&Org> {
+            None
+        }
+    }
+
+    impl AllocationSites for Sites {
+        fn allocation(
+            &self,
+            _dsc: DscIdx,
+            lds: LdsIdx,
+            storage: SenComponent,
+        ) -> Option<AllocateNode> {
+            self.0.get(&(lds, storage)).cloned()
+        }
+
+        fn set_allocation(
+            &mut self,
+            _dsc: DscIdx,
+            lds: LdsIdx,
+            storage: SenComponent,
+            node: AllocateNode,
+        ) {
+            self.0.insert((lds, storage), node);
+        }
+    }
+
+    /// One placed LX allocation, of the buffering the placement admits.
+    fn an_lx_node(buffers: NumBuffers) -> AllocateNode {
+        AllocateNode {
+            name: NodeName("allocate_lds0_lx".to_owned()),
+            component: SenComponent::Lx,
+            lds: Some(LdsIdx(0)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new((PrimaryDim::I, MaxDimSize::Unset), Vec::new()),
+            start_address: StartAddress::default(),
+            placement: AllocPlacement {
+                num_buffers: buffers,
+                ..AllocPlacement::default()
+            },
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        }
+    }
+
     /// e283 — a corelet-split dim is REPLACED by one equal share per corelet, and a share the corelet
     /// count does not divide is *"Invalid corelet split."*
     #[test]
@@ -11510,7 +12321,7 @@ mod tests_e283_e290 {
 
         let mut tree = Tree::default();
         let root = tree.root_block("root");
-        let load = tree.transfer("hbm_to_lx", root, LdsIdx(0));
+        let load = tree.tensor_transfer("hbm_to_lx", root, LdsIdx(0));
         let orgs = Orgs(BTreeMap::from([(
             LdsIdx(0),
             Org {
@@ -11631,7 +12442,7 @@ mod tests_e283_e290 {
         let mut tree = Tree::default();
         let root = tree.root_block("root");
         let chunk_loop = tree.loop_over(DATA_STAGE_CORE, DATA_STAGE_CHUNK, PrimaryDim::I, root);
-        let load = tree.transfer("hbm_to_lx", chunk_loop.0, LdsIdx(0));
+        let load = tree.tensor_transfer("hbm_to_lx", chunk_loop.0, LdsIdx(0));
         let orgs = Orgs(BTreeMap::from([(
             LdsIdx(0),
             Org {
@@ -11709,7 +12520,7 @@ mod tests_e283_e290 {
         tree.allocate("alloc_lx", LdsIdx(0), SenComponent::Lx, root);
         let outer = tree.loop_over(DATA_STAGE_CORE, DATA_STAGE_CHUNK, PrimaryDim::I, root);
         let inner = tree.loop_over(DATA_STAGE_CORE, DATA_STAGE_CHUNK, PrimaryDim::J, outer.0);
-        let load = tree.transfer("hbm_to_lx", inner.0, LdsIdx(0));
+        let load = tree.tensor_transfer("hbm_to_lx", inner.0, LdsIdx(0));
         let trees = Transfers(vec![L3Transfer {
             node: load,
             name: NodeName("hbm_to_lx".to_owned()),
@@ -11725,46 +12536,865 @@ mod tests_e283_e290 {
         );
         assert!(NodeParents::children(&tree, inner.0).is_empty());
     }
+
+    /// ONE HBM-PINNED INPUT LOADED INTO LX ON TWO CORES OF THE SAME WORK SLICE — what entries 218 and
+    /// 291 both start from: the load, the allocations at both of its ends, and the cores that share it.
+    fn a_multicast_load() -> (SuperDsc, Orgs, Transfers, Tree, NodeId) {
+        let mut config = a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 4)]);
+        config.labeled_ds = LabeledDsList::new(
+            labeled(
+                DsType::Input,
+                LdsIdx(0),
+                &[(PrimaryDim::I, Scale::Sized(1.0))],
+                hbm(),
+            ),
+            vec![],
+        );
+        config.layout_dims =
+            BTreeMap::from([(LdsIdx(0), LayoutDims::new(PrimaryDim::I, Vec::new()))]);
+        config.core_ids_used = CoreIdsUsed::new(core(0), vec![core(1)]);
+        let mut sdsc = a_sdsc(
+            config,
+            &[(PrimaryDim::I, 1)],
+            &[
+                (core(0), slice(&[(PrimaryDim::I, 0)])),
+                (core(1), slice(&[(PrimaryDim::I, 0)])),
+            ],
+        );
+        sdsc.core_id_to_dsc = BTreeMap::from([(core(0), DscIdx(0)), (core(1), DscIdx(0))]);
+
+        let mut tree = Tree::default();
+        let root = tree.root_block("root");
+        tree.allocate("allocate_lds0_lx", LdsIdx(0), SenComponent::Lx, root);
+        tree.allocate("allocate_lds0_hbm", LdsIdx(0), SenComponent::Hbm, root);
+        let load = tree.filled_transfer(root, LdsIdx(0), an_hbm_to_lx_load());
+        let orgs = Orgs(BTreeMap::from([(
+            LdsIdx(0),
+            Org {
+                hbm: true,
+                hbm_users: Some(vec![load]),
+                ..Org::default()
+            },
+        )]));
+        let trees = Transfers(vec![L3Transfer {
+            node: load,
+            name: NodeName("load".to_owned()),
+            src: SenComponent::Hbm,
+            dst: SenComponent::Lx,
+        }]);
+        (sdsc, orgs, trees, tree, load)
+    }
+
+    /// `load` — one HBM read into LX through the load unit, which is the only shape entry 218 admits.
+    fn an_hbm_to_lx_load() -> TransferNode {
+        create_transfer_node(
+            via(SenComponent::L3lu, SenComponent::Hbm, LdsIdx(0)),
+            via(SenComponent::L3lu, SenComponent::Lx, LdsIdx(0)),
+            &[],
+            NodeName("load".to_owned()),
+        )
+    }
+
+    fn via(unit: SenComponent, storage: SenComponent, lds: LdsIdx) -> Via {
+        Via {
+            loc: DataLocation { unit, storage },
+            lds: Some(lds),
+        }
+    }
+
+    /// e218 — the parent loop whose trip count another DSC undercuts splits the load in two: the
+    /// original is guarded by `dim < otherTripCount`, the duplicate takes the else-region, and only
+    /// the duplicate carries the multicast group.
+    #[test]
+    fn a_differing_parent_loop_splits_the_load_under_one_condition() {
+        let (sdsc, _orgs, _trees, mut tree, load) = a_multicast_load();
+        let root = tree.head.expect("a root block");
+        let outer = tree.loop_over(DATA_STAGE_CORE, DATA_STAGE_CHUNK, PrimaryDim::I, root);
+        tree.move_node(DscIdx(0), load, InsertionPoint::LastIn(outer.0));
+        let stages = &sdsc.dscs().first().data_stages;
+        let diff = LoopTripDiff {
+            loop_node: outer,
+            dim: PrimaryDim::I,
+            curr: trip_count(stages, PrimaryDim::I, DATA_STAGE_CORE, DATA_STAGE_CHUNK)
+                .expect("this DSC walks the core stage in two chunks"),
+            other: trip_count(stages, PrimaryDim::I, DATA_STAGE_CORE, DATA_STAGE_CORE)
+                .expect("another DSC walks it in one"),
+        };
+        let loop_name = tree.names(&[outer.0])[0].clone();
+        let mut names = GtrGroupNames::new();
+        assert_eq!(
+            set_cond_gtr(
+                &sdsc,
+                DscIdx(0),
+                LdsIdx(0),
+                core(0),
+                load,
+                &[diff],
+                &mut names,
+                &mut tree,
+            ),
+            Some(())
+        );
+
+        // The condition took the load's place, and the load its then-region.
+        let condition = *NodeParents::children(&tree, outer.0)
+            .first()
+            .expect("the condition sits where the load was");
+        assert_eq!(
+            tree.names(&[condition]),
+            vec![format!("condition_separate_load_{loop_name}_i")]
+        );
+        let regions = NodeParents::children(&tree, condition);
+        let cond = tree.conditions[&condition].clone();
+        assert_eq!(cond.then_region, vec![regions[0]]);
+        assert_eq!(cond.else_region, vec![regions[1]]);
+        assert_eq!(NodeParents::children(&tree, regions[0]), vec![load]);
+        let duplicate = *NodeParents::children(&tree, regions[1])
+            .first()
+            .expect("the duplicate takes the else-region");
+        assert_eq!(
+            tree.names(&[duplicate]),
+            vec![format!("load_condition_{loop_name}_i")]
+        );
+
+        // `loop.i < 1` — the SMALLER count another DSC states is the bound.
+        assert_eq!(
+            cond.cond,
+            LoopCondComposite {
+                two_level_or_of_ands: vec![vec![LoopCond {
+                    loop_comp: outer,
+                    dim: PrimaryDim::I,
+                    op: CondOp::Lt,
+                    bound: LoopBound::Index(1),
+                }]],
+                negated: false,
+            }
+        );
+
+        // The DUPLICATE alone names the group, and both ends of it gain a user.
+        let group = GtrGroupId::checked(0).expect("the first group name");
+        assert_eq!(
+            DscTransferWrites::transfer(&tree, DscIdx(0), duplicate)
+                .expect("the duplicate")
+                .core_id_to_gtr_info,
+            BTreeMap::from([(
+                core(0),
+                GroupTagRegInfo {
+                    num_sharers: Shares(2),
+                    group: Some(group),
+                }
+            )])
+        );
+        assert!(
+            DscTransferWrites::transfer(&tree, DscIdx(0), load)
+                .expect("the original")
+                .core_id_to_gtr_info
+                .is_empty()
+        );
+        assert_eq!(tree.gtr_ids, vec![group]);
+        assert_eq!(
+            tree.alloc_users,
+            vec![
+                (
+                    DscTrees::allocation(&tree, DscIdx(0), LdsIdx(0), SenComponent::Lx)
+                        .expect("the LX allocation"),
+                    duplicate
+                ),
+                (
+                    DscTrees::allocation(&tree, DscIdx(0), LdsIdx(0), SenComponent::Hbm)
+                        .expect("the HBM allocation"),
+                    duplicate
+                ),
+            ]
+        );
+    }
+
+    /// e219 — corelet 0's own address at each fold coordinate is the spread the whole allocation
+    /// carries, and its buffer offset copies out beside it.
+    #[test]
+    fn the_final_start_address_is_corelet_zeros_own_spread() {
+        let config = a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 4)]);
+        let org = Org {
+            hbm: true,
+            buffering: Some(Buffering::Double),
+            padding: Some(PaddingForm::default()),
+            start: BTreeMap::from([
+                ((core(0), vec![0]), ByteAddress(1024)),
+                ((core(0), vec![1]), ByteAddress(3072)),
+            ]),
+            offset: Some(BufferOffset(64)),
+            ..Org::default()
+        };
+        let coords = AddressFoldCoords::of(vec![vec![0], vec![1]]).expect("two fold coordinates");
+        let mut node = an_lx_node(NumBuffers::Double);
+        assert_eq!(
+            fill_final_start_address_and_offset(
+                &config,
+                LdsIdx(0),
+                &org,
+                &Stage,
+                &Stage,
+                &BTreeSet::new(),
+                &coords,
+                &mut node,
+            ),
+            Some(())
+        );
+        assert_eq!(
+            node.start_address.spread(core(0), Corelet::at::<0>()),
+            [Bytes(1024), Bytes(3072)]
+        );
+        assert_eq!(
+            node.placement.buffer_offset,
+            BTreeMap::from([(core(0), BTreeMap::from([(Corelet::at::<0>(), Bytes(64))]))])
+        );
+    }
+
+    /// e220 — an index tensor's IBR is zeroed over a wholly constant fold space, and a tensor that is
+    /// not an index tensor is left alone rather than refused.
+    #[test]
+    fn an_index_tensors_ibr_is_zeroed_and_anything_else_is_untouched() {
+        let config = a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 4)]);
+        let index = Org {
+            indirection: Some(IndirectAlloc::IndexTensor(IndexTensor::Address)),
+            ..Org::default()
+        };
+        let mut sites = Sites(BTreeMap::from([(
+            (LdsIdx(0), SenComponent::L3luibr),
+            an_lx_node(NumBuffers::Single),
+        )]));
+        assert_eq!(
+            fill_ibr_start_address_and_offset(
+                &config,
+                DscIdx(0),
+                LdsIdx(0),
+                &index,
+                &AddressFoldCoords::flat(),
+                &mut sites,
+            ),
+            Some(())
+        );
+        let ibr = &sites.0[&(LdsIdx(0), SenComponent::L3luibr)];
+        assert_eq!(ibr.start_address.at(core(0), Corelet::at::<0>()), Some(Bytes(0)));
+        assert_eq!(
+            ibr.start_address.func_type(FoldPosition::Core),
+            Some(AddressFold::Constant)
+        );
+        assert_eq!(
+            ibr.placement.buffer_offset,
+            BTreeMap::from([(core(0), BTreeMap::from([(Corelet::at::<0>(), Bytes(0))]))])
+        );
+
+        // "Nothing to fill if it is not an index tensor."
+        let mut none = Sites::default();
+        assert_eq!(
+            fill_ibr_start_address_and_offset(
+                &config,
+                DscIdx(0),
+                LdsIdx(0),
+                &Org::default(),
+                &AddressFoldCoords::flat(),
+                &mut none,
+            ),
+            Some(())
+        );
+        assert!(none.0.is_empty());
+    }
+
+    /// e291 — both cores of the one work slice take the same group on the one load, the DSC records it,
+    /// and no parent loop differs so no conditional GTR is minted.
+    #[test]
+    fn every_transferring_core_names_the_group_its_slice_mates_share() {
+        let (sdsc, orgs, trees, mut tree, load) = a_multicast_load();
+        let mut names = GtrGroupNames::new();
+        assert_eq!(
+            fill_transfer_multicast_info(&sdsc, &orgs, &trees, &mut names, &mut tree),
+            Some(())
+        );
+        let group = GtrGroupId::checked(0).expect("the first group name");
+        let shared = GroupTagRegInfo {
+            num_sharers: Shares(2),
+            group: Some(group),
+        };
+        assert_eq!(
+            DscTransferWrites::transfer(&tree, DscIdx(0), load)
+                .expect("the load")
+                .core_id_to_gtr_info,
+            BTreeMap::from([(core(0), shared), (core(1), shared)])
+        );
+        assert_eq!(tree.gtr_ids, vec![group, group]);
+        assert!(tree.conditions.is_empty());
+    }
+
+    /// e292 — the HBM-pinned tensor's LX allocation is placed through entry 219, which is the whole
+    /// cure for `start_address = 0`.
+    #[test]
+    fn every_pinned_tensors_lx_allocation_leaves_this_pass_placed() {
+        let mut config = a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 4)]);
+        config.labeled_ds = LabeledDsList::new(
+            labeled(
+                DsType::Input,
+                LdsIdx(0),
+                &[(PrimaryDim::I, Scale::Sized(1.0))],
+                hbm(),
+            ),
+            vec![],
+        );
+        let sdsc = a_sdsc(config, &[(PrimaryDim::I, 1)], &[]);
+        let orgs = Orgs(BTreeMap::from([(
+            LdsIdx(0),
+            Org {
+                hbm: true,
+                buffering: Some(Buffering::Double),
+                padding: Some(PaddingForm::default()),
+                start: BTreeMap::from([((core(0), Vec::new()), ByteAddress(2048))]),
+                offset: Some(BufferOffset(128)),
+                ..Org::default()
+            },
+        )]));
+        let mut sites = Sites(BTreeMap::from([(
+            (LdsIdx(0), SenComponent::Lx),
+            an_lx_node(NumBuffers::Double),
+        )]));
+        assert_eq!(
+            fill_allocation_start_addr_and_offset(
+                &sdsc,
+                &orgs,
+                &Stages,
+                &AddressFoldCoords::flat(),
+                &mut sites,
+            ),
+            Some(())
+        );
+        let node = &sites.0[&(LdsIdx(0), SenComponent::Lx)];
+        assert_eq!(
+            node.start_address.at(core(0), Corelet::at::<0>()),
+            Some(Bytes(2048))
+        );
+        assert_eq!(
+            node.placement.buffer_offset,
+            BTreeMap::from([(core(0), BTreeMap::from([(Corelet::at::<0>(), Bytes(128))]))])
+        );
+        // Not an index tensor, so no IBR was asked for.
+        assert_eq!(sites.0.len(), 1);
+    }
+
+    /// e293 — a forced mode wins outright, RCUDD1A is double whatever the estimate says, and an
+    /// unbounded estimate on SEN1P5 falls through to double.
+    #[test]
+    fn the_lx_buffer_type_is_forced_then_arch_then_the_hmi_estimate() {
+        struct Placed;
+
+        impl ScheduleTrees for Placed {
+            fn allocations(&self, _dsc: DscIdx) -> Vec<PlacedAllocation> {
+                Vec::new()
+            }
+        }
+
+        let sdsc = a_sdsc(a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 4)]), &[], &[]);
+        assert_eq!(
+            set_lx_buffer_type::<Sen1p5, _>(&sdsc, LxBufferTypeMode::ForceSpatialDouble, &Placed),
+            Some(LxBufferChoice::SpatialDouble)
+        );
+        assert_eq!(
+            set_lx_buffer_type::<Sen1p5, _>(&sdsc, LxBufferTypeMode::ForceDouble, &Placed),
+            Some(LxBufferChoice::Double)
+        );
+        // The reference's own FIXME, and it outranks the heuristic.
+        assert_eq!(
+            set_lx_buffer_type::<Dd2, _>(&sdsc, LxBufferTypeMode::Auto, &Placed),
+            Some(LxBufferChoice::Double)
+        );
+        assert_eq!(
+            set_lx_buffer_type::<Sen1p5, _>(&sdsc, LxBufferTypeMode::Auto, &Placed),
+            Some(LxBufferChoice::Double)
+        );
+    }
+
+    /// e295 — the cross-core reduction's one LX-to-HBM output store states the size ONE corelet moves.
+    #[test]
+    fn a_cross_core_reduction_states_its_store_size_explicitly() {
+        let mut config = a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 4)]);
+        config.corelets_used_dsc2 = Some(CoreletsUsed::new(
+            NonZeroU32::new(2).expect("two corelets"),
+        ));
+        config.layout_dims = BTreeMap::from([
+            (LdsIdx(0), LayoutDims::new(PrimaryDim::I, Vec::new())),
+            (LdsIdx(1), LayoutDims::new(PrimaryDim::J, Vec::new())),
+        ]);
+        config.labeled_ds = LabeledDsList::new(
+            labeled(
+                DsType::Input,
+                LdsIdx(0),
+                &[(PrimaryDim::I, Scale::Sized(1.0))],
+                hbm(),
+            ),
+            vec![labeled(
+                DsType::Output,
+                LdsIdx(1),
+                &[(PrimaryDim::J, Scale::Sized(1.0))],
+                hbm(),
+            )],
+        );
+        let sdsc = a_sdsc(
+            config,
+            &[(PrimaryDim::I, 2), (PrimaryDim::J, 1)],
+            &[(core(0), slice(&[(PrimaryDim::I, 0)]))],
+        );
+
+        let mut tree = Tree::default();
+        let root = tree.root_block("root");
+        let store = tree.filled_transfer(
+            root,
+            LdsIdx(1),
+            create_transfer_node(
+                via(SenComponent::L3su, SenComponent::Lx, LdsIdx(1)),
+                via(SenComponent::L3su, SenComponent::Hbm, LdsIdx(1)),
+                &[],
+                NodeName("store".to_owned()),
+            ),
+        );
+        let size = BTreeMap::from([(PrimaryDim::J, Elements(4))]);
+        tree.sizes.insert(store, size.clone());
+        let trees = Transfers(vec![L3Transfer {
+            node: store,
+            name: NodeName("store".to_owned()),
+            src: SenComponent::Lx,
+            dst: SenComponent::Hbm,
+        }]);
+        assert_eq!(fill_explicit_transfer_size(&sdsc, &trees, &mut tree), Some(()));
+        assert_eq!(
+            DscTransferWrites::transfer(&tree, DscIdx(0), store)
+                .expect("the store")
+                .transfer_size,
+            size
+        );
+    }
 }
 
-// crustify:todo: e291_fillTransferMulticastInfo
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5146  (127 body lines, level 2)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::fillTransferMulticastInfo(SuperDsc &mySDsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:6156-6283
-//   calls     : e015_getParentLoopNodes, e048_getSharesAndGroupName, e072_getTripCount, e218_setCondGtr
+// ⭐ TYPES FOR ENTRIES 291-295. The per-DSC data-stage seam the placement reads its corelet extents
+// through, and the explicit transfer size the store side asks a DSC for.
 
-// crustify:todo: e292_fillAllocationStartAddrAndOffset
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5274  (20 body lines, level 2)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::fillAllocationStartAddrAndOffset( SuperDsc &mySDsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:6297-6318
-//   calls     : e056_isIndexLds, e197_getCoreletSplitDimensions, e219_fillFinalStartAddressAndOffset, e220_fillIBRStartAddressAndOffset
-//   ⛔ NOTE   : THIS IS THE `start_address = 0` DEFECT. L3DlOpsScheduler::run calls this as "Set start
-//               address, offset in allocations" (L3DlOpsScheduler.cpp:8000). Our emitted views print
-//               start_address = 0 where the reference states a placed base. The effect of this function
-//               IS the port.
+/// ONE DSC'S DATA STAGES AS A [`DimStage`] EACH — `dsc.dataStageParam_.at(stage)`, which is the
+/// MECHANISM for reaching a stage rather than a fact about one.
+///
+/// ⛔ [`None`] IS THAT `.at()`'s THROW, which is every *"Expect valid .. data stage."* the placement
+/// states.
+pub trait DscStages {
+    /// One data stage's corelet-split view, however the caller holds it.
+    type Stage: DimStage + ?Sized;
 
-// crustify:todo: e293_setLxBufferType
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6425  (26 body lines, level 2)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::setLxBufferType(const SuperDsc &mySDsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:6328-6354
-//   calls     : e223_getHbmLdsTransferHMIRequestEstimate
+    /// `dscs_.at(dsc).dataStageParam_.at(stage)`.
+    fn dim_stage(&self, dsc: DscIdx, stage: DatastageId) -> Option<&Self::Stage>;
+}
 
-// crustify:todo: e294_createStoreIndexTensorToLx
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6948  (85 body lines, level 2)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::createStoreIndexTensorToLx( SuperDsc &mySDsc, const int dscIdx, const int pagedLdsIdx, const int indexLdsIdx, dsc2::AllocateNode &indexLdsHbmAllocNode, dsc2::LoopNode &newChunkLoopNode)
-//   extract   : crustify-ddc/cpp/l3.cpp:6364-6452
-//   calls     : e016_createAllocateNode, e017_createTransferNode, e020_createSyncNode, e222_allocAllMem
+/// WHAT ENTRY 295 ASKS OF ONE DSC — `getBlockTransferSizePerDim` (`dsc/dsc2.cpp:3474`), which lives
+/// OUTSIDE this campaign's file list, over the transfer nodes it reaches by identity.
+pub trait DscTransferSizes: DscTrees + DscTransferWrites {
+    /// `dsc.getBlockTransferSizePerDim(*transNode, storage, clId)`, [`None`] for every refusal that
+    /// walk makes.
+    fn block_transfer_size_per_dim(
+        &self,
+        dsc: DscIdx,
+        node: NodeId,
+        storage: SenComponent,
+        corelet: Corelet,
+    ) -> Option<BTreeMap<PrimaryDim, Elements>>;
+}
 
-// crustify:todo: e295_fillExplicitTransferSize
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7875  (35 body lines, level 2)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::fillExplicitTransferSize(SuperDsc &mySDsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:6462-6497
-//   calls     : e210_isOpCrossCoreReduction
+/// EVERY PARENT LOOP OF ONE TRANSFER WHOSE DIM THE TENSOR DOES NOT DEPEND ON AND WHOSE TRIP COUNT
+/// ANOTHER DSC UNDERCUTS — the `loopDimTripCounts` entry 291 builds before it decides on condGtr.
+///
+/// ⭐ THE FIRST STRICTLY SMALLER DSC WINS AND THE SCAN STOPS, INCLUDING THIS DSC ITSELF in the scan:
+/// its own count can never undercut itself, so the reference's `for (otherDsc : dscs_)` needs no skip.
+fn unrelated_loop_trip_diffs<E: DscTrees + ?Sized>(
+    sdsc: &SuperDsc,
+    dsc_idx: DscIdx,
+    transfer: NodeId,
+    related: &BTreeSet<PrimaryDim>,
+    env: &E,
+) -> Option<Vec<LoopTripDiff>> {
+    let dsc = sdsc.dscs().at(dsc_idx)?;
+    let tree = env.tree(dsc_idx)?;
+    let mut diffs = Vec::new();
+    for enclosing in parent_loop_nodes(tree, transfer) {
+        let num = tree.loop_num(enclosing);
+        let den = tree.loop_den(enclosing);
+        for kind in tree.loop_dims(enclosing).iter() {
+            if related.contains(&kind.dim) {
+                continue;
+            }
+            let curr = trip_count(&dsc.data_stages, kind.dim, num, den)?;
+            for other in sdsc.dscs().iter() {
+                let theirs = trip_count(&other.data_stages, kind.dim, num, den)?;
+                if curr > theirs {
+                    diffs.push(LoopTripDiff {
+                        loop_node: enclosing,
+                        dim: kind.dim,
+                        curr,
+                        other: theirs,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    Some(diffs)
+}
+
+/// Replaces: e291_fillTransferMulticastInfo
+///
+/// NAMES THE MULTICAST GROUP EVERY HBM-TO-LX AND HBM-TO-IBR LOAD USES, PER TRANSFERRING CORE: the
+/// cores taking the same work slices, widened to the WHOLE super-DSC's cores where a conditional GTR
+/// is legal and narrowed to this DSC's where it is not, and then entry 218 for the surplus iterations.
+///
+/// ⛔ CONDGTR IS LEGAL ONLY WITH AT MOST ONE DIFFERING PARENT LOOP, and it is that same legality that
+/// picks WHICH cores are asked for a group — so an illegal split broadcasts inside one DSC only.
+/// ⛔ [`None`] IS entry 208's refusals, *"Do not expect an entry created."*, entry 048's three and
+/// entry 218's. ⭐ A TENSOR WITH NO L3 LOAD IS SKIPPED, and that is not a refusal.
+pub fn fill_transfer_multicast_info<O, T, E>(
+    sdsc: &SuperDsc,
+    orgs: &O,
+    trees: &T,
+    names: &mut GtrGroupNames,
+    env: &mut E,
+) -> Option<()>
+where
+    O: MemOrgs + ?Sized,
+    T: TransferNodes + ?Sized,
+    E: DscGtrSurgery + ?Sized,
+{
+    for dsc_idx in dsc_indices(sdsc) {
+        let dsc = sdsc.dscs().at(dsc_idx)?;
+        for lds in hbm_pinned_labeled_ds_indices(dsc) {
+            let loads = lds_l3_transfer_nodes(
+                sdsc,
+                dsc_idx,
+                lds,
+                orgs.mem_org(dsc_idx, lds)?,
+                trees,
+                &[SenComponent::Hbm],
+                &[SenComponent::Lx, SenComponent::L3luibr],
+            )?;
+            if loads.is_empty() {
+                continue;
+            }
+            let related = dsc.non_broadcast_lds_dim_set(lds)?;
+            for load in loads {
+                let diffs = unrelated_loop_trip_diffs(sdsc, dsc_idx, load.node, &related, env)?;
+                let cond_gtr_legal = diffs.len() < 2;
+                let asked: BTreeSet<Core> = if cond_gtr_legal {
+                    sdsc.core_id_to_dsc.keys().copied().collect()
+                } else {
+                    dsc.core_ids_used.iter().collect()
+                };
+                for core in dsc.core_ids_used.iter() {
+                    let slices = sdsc.core_id_to_wk_slice.get(&core)?;
+                    let (shares, group) = shares_and_group_name(
+                        sdsc,
+                        dsc,
+                        dsc.labeled_ds.at(lds)?,
+                        slices,
+                        &asked,
+                        names,
+                    )?;
+                    let mut node = env.transfer(dsc_idx, load.node)?;
+                    // "Do not expect an entry created."
+                    (!node.core_id_to_gtr_info.contains_key(&core)).then_some(())?;
+                    let group = match group {
+                        GroupName::Shared(id) => Some(id),
+                        GroupName::Unshared => None,
+                    };
+                    node.core_id_to_gtr_info.insert(
+                        core,
+                        GroupTagRegInfo {
+                            num_sharers: shares,
+                            group,
+                        },
+                    );
+                    env.set_transfer(dsc_idx, load.node, node);
+                    if let Some(id) = group {
+                        env.insert_gtr_id(dsc_idx, id);
+                    }
+                    if cond_gtr_legal && !diffs.is_empty() {
+                        set_cond_gtr(sdsc, dsc_idx, lds, core, load.node, &diffs, names, env)?;
+                    }
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// Replaces: e292_fillAllocationStartAddrAndOffset
+///
+/// PLACES EVERY ALLOCATION'S START ADDRESS AND BUFFER OFFSET — this is the *"Set start address, offset
+/// in allocations"* step (`L3DlOpsScheduler.cpp:8000`) and the whole cure for `start_address = 0`. Per
+/// DSC: entry 219 on each tensor's LX allocation, and entry 220 on each index tensor's two IBRs.
+///
+/// ⛔ AN INDEX TENSOR THAT `memOrg_` STATES NO LX FOR IS THE ONE EXCLUSION from the LX pass, and it is
+/// the SAME tensors entry 220 then places — so an index tensor loaded to LX gets BOTH.
+/// ⛔ [`None`] IS entries 219's and 220's own refusals, an lds whose LX allocation the environment does
+/// not hold, and each `dataStageParam_.at()` [`DscStages`] discharges.
+pub fn fill_allocation_start_addr_and_offset<O, S, A>(
+    sdsc: &SuperDsc,
+    orgs: &O,
+    stages: &S,
+    coords: &AddressFoldCoords,
+    sites: &mut A,
+) -> Option<()>
+where
+    O: MemOrgs + ?Sized,
+    S: DscStages + ?Sized,
+    A: AllocationSites + ?Sized,
+{
+    for dsc_idx in dsc_indices(sdsc) {
+        let dsc = sdsc.dscs().at(dsc_idx)?;
+        let corelet_split_dims = corelet_split_dimensions(dsc);
+        let core_stage = stages.dim_stage(dsc_idx, DATA_STAGE_CORE)?;
+        let chunk_stage = stages.dim_stage(dsc_idx, DATA_STAGE_CHUNK)?;
+        for entry in dsc.labeled_ds.iter() {
+            let lds = entry.recorded();
+            let mem = orgs.mem_org(dsc_idx, lds)?;
+            let index = is_index_lds(mem)?;
+            let hbm = entry.pinning().hbm();
+            let states_lx = entry.pinning().mem_org.contains_key(&SenComponent::Lx);
+            if (hbm && !(index && !states_lx)) || entry.pinning().lx {
+                let mut node = sites.allocation(dsc_idx, lds, SenComponent::Lx)?;
+                fill_final_start_address_and_offset(
+                    dsc,
+                    lds,
+                    mem,
+                    core_stage,
+                    chunk_stage,
+                    &corelet_split_dims,
+                    coords,
+                    &mut node,
+                )?;
+                sites.set_allocation(dsc_idx, lds, SenComponent::Lx, node);
+            }
+            if hbm && index {
+                fill_ibr_start_address_and_offset(dsc, dsc_idx, lds, mem, coords, sites)?;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Replaces: e293_setLxBufferType
+///
+/// PICKS THE LX BUFFER TYPE: a forced mode wins outright, RCUDD1A is always double, and AUTO takes
+/// spatial-double when at most two HMI requests come out of a core group.
+///
+/// ⛔ THE FORCED MODES ARE CHECKED BEFORE THE ARCH, so `FORCE_SPATIAL_DOUBLE` overrides the FIXME.
+/// ⚠️ FIXME, THE REFERENCE'S OWN: *"Temporarily force double buffering for target rcudd1a and below.
+/// Remove when fixed."* ⛔ [`None`] IS entry 223's refusals, which only AUTO on SEN1P5 can reach.
+#[must_use]
+pub fn set_lx_buffer_type<A: Arch, T: ScheduleTrees + ?Sized>(
+    sdsc: &SuperDsc,
+    mode: LxBufferTypeMode,
+    trees: &T,
+) -> Option<LxBufferChoice> {
+    /// `heuristicThreshold`.
+    const HEURISTIC_THRESHOLD: u32 = 2;
+
+    match mode {
+        LxBufferTypeMode::ForceSpatialDouble => return Some(LxBufferChoice::SpatialDouble),
+        LxBufferTypeMode::ForceDouble => return Some(LxBufferChoice::Double),
+        LxBufferTypeMode::Auto => {}
+    }
+    if A::GEN == IsaGen::Rcudd1a {
+        return Some(LxBufferChoice::Double);
+    }
+    let requests = get_hbm_lds_transfer_hmi_request_estimate::<A, T>(sdsc, trees)?;
+    Some(if requests.0 <= HEURISTIC_THRESHOLD {
+        LxBufferChoice::SpatialDouble
+    } else {
+        LxBufferChoice::Double
+    })
+}
+
+/// Replaces: e294_createStoreIndexTensorToLx
+///
+/// PRELOADS A PAGED TENSOR'S INDEX INTO LX: mints an unbuffered LX allocation after the index's HBM
+/// one, and — when the remaining LX cannot hold it whole — DOUBLE-BUFFERS it and moves it to the front
+/// of the loop above the new chunk loop, then chains the HBM-to-LX load and an L3LU/L3SU sync pair.
+///
+/// ⛔ THE FALLBACK RE-TARGETS WHERE EVERY LATER NODE LANDS, because the reference reassigns
+/// `parentInsertNode`; stating each insertion relative to the allocation itself carries that over.
+/// ⛔ [`None`] IS *"Memory allocation must be valid to commit."*, *"Expect a valid parent node."* and
+/// entries 016's and 222's own refusals. ⚠️ TRAP, AS IN ENTRY 226: the allocate and transfer names
+/// spell the RECORDED `ldsIdx_` while the sync names spell the POSITION handed in.
+pub fn create_store_index_tensor_to_lx<T, M, P>(
+    tree: &mut T,
+    dsc: &DesignSpaceConfig,
+    metadata: &mut BTreeMap<DscIdx, DscMetadata>,
+    dsc_idx: DscIdx,
+    index_lds: LdsIdx,
+    index_hbm: IndexHbmAllocation,
+    index_hbm_node: NodeId,
+    paged_lx: AllocId,
+    new_chunk_loop: LoopId,
+    allocs: &mut v1::AllocArena,
+    trackers: &mut M,
+    placement: &P,
+) -> Option<()>
+where
+    T: L3TreeSurgery + ?Sized,
+    M: ExPhaseTrackers + ?Sized,
+    P: L3Placement + v1::StorageNames,
+{
+    let recorded = dsc.labeled_ds.at(index_lds)?.recorded();
+    let fresh = FreshL3Allocation::of(dsc, index_lds, SenComponent::Lx)?;
+    let alloc = tree.fresh_alloc();
+    let mut lx_alloc = create_allocate_node(
+        dsc,
+        metadata,
+        fresh,
+        Buffering::None,
+        NodeName(format!(
+            "allocate_lds{}_{}",
+            recorded.0,
+            SenComponent::Lx.spelling()
+        )),
+        dsc_idx,
+        alloc,
+    )?;
+    lx_alloc.indirect = index_hbm.indirect;
+    // "Expect LX in memOrg_." and "Expect valid paged tensor LX allocate node." are this argument.
+    lx_alloc.related_indirect = Some(paged_lx);
+    let allocate = tree.new_allocate(alloc, lx_alloc);
+    tree.set_mem_org_allocation(index_lds, SenComponent::Lx, alloc);
+    tree.parent(index_hbm_node)?;
+    tree.add_child_node(allocate, InsertionPoint::After(index_hbm_node));
+
+    let sufficient = alloc_all_mem(
+        dsc,
+        metadata,
+        dsc_idx,
+        allocs,
+        trackers,
+        placement,
+        v1::Commit::No,
+    )?;
+    if !sufficient {
+        tree.set_buffering(alloc, Buffering::Double);
+        let above = tree.parent(new_chunk_loop.0)?;
+        tree.move_node(allocate, InsertionPoint::FirstIn(above));
+        // "Memory allocation must be valid to commit."
+        alloc_all_mem(
+            dsc,
+            metadata,
+            dsc_idx,
+            allocs,
+            trackers,
+            placement,
+            v1::Commit::No,
+        )?
+        .then_some(())?;
+    }
+
+    let transfer = tree.new_transfer(create_transfer_node(
+        Via {
+            loc: DataLocation {
+                unit: SenComponent::L3lu,
+                storage: SenComponent::Hbm,
+            },
+            lds: Some(index_lds),
+        },
+        Via {
+            loc: DataLocation {
+                unit: SenComponent::L3lu,
+                storage: SenComponent::Lx,
+            },
+            lds: Some(index_lds),
+        },
+        &[],
+        NodeName(format!(
+            "transfer_lds{}_src:{}_dst:{}",
+            recorded.0,
+            SenComponent::Hbm.spelling(),
+            SenComponent::Lx.spelling()
+        )),
+    ));
+    tree.add_alloc_user(index_hbm.alloc, transfer);
+    tree.add_alloc_user(alloc, transfer);
+
+    let from = SenComponent::L3lu.spelling();
+    let to = SenComponent::L3su.spelling();
+    let position = index_lds.0;
+    let send = tree.new_sync(create_sync_node(
+        SyncUnits::new(SenComponent::L3lu, []),
+        NodeName(format!("sync_send_{from}_to_{to}_paged_index_{position}")),
+        SyncDirection::Send,
+        SyncStrength::Hard,
+    ));
+    let receive = tree.new_sync(create_sync_node(
+        SyncUnits::new(SenComponent::L3su, []),
+        NodeName(format!("sync_receive_{to}_from_{from}_paged_index_{position}")),
+        SyncDirection::Receive,
+        SyncStrength::Hard,
+    ));
+    tree.add_sync_other_end(send, receive);
+    tree.add_sync_other_end(receive, send);
+
+    tree.add_child_node(transfer, InsertionPoint::After(allocate));
+    tree.add_child_node(send, InsertionPoint::After(transfer));
+    tree.add_child_node(receive, InsertionPoint::After(send));
+    Some(())
+}
+
+/// Replaces: e295_fillExplicitTransferSize
+///
+/// STATES THE OUTPUT STORE'S TRANSFER SIZE EXPLICITLY WHERE THE CORELETS REDUCE ACROSS CORES: ONE
+/// CORELET'S size per dim, written onto the DSC's single LX-to-HBM output-tensor transfer.
+///
+/// ⛔ ONE CORELET AND NOT ALL OF THEM IS THE WHOLE POINT — a cross-core reduction has every corelet
+/// carrying the same reduced block, so the derived size (which sums them) would overstate the store.
+/// ⛔ [`None`] IS *"Currently support at most one L3SU transfer."*, *"Expect empty transferSize_
+/// field."*, an unprepared `numCoreletsUsed_DSC2_`, entry 210's refusals and the size walk's own.
+pub fn fill_explicit_transfer_size<T, E>(sdsc: &SuperDsc, trees: &T, env: &mut E) -> Option<()>
+where
+    T: TransferNodes + ?Sized,
+    E: DscTransferSizes + ?Sized,
+{
+    for dsc_idx in dsc_indices(sdsc) {
+        let dsc = sdsc.dscs().at(dsc_idx)?;
+        if dsc.corelets_used_dsc2?.get() <= 1 || !is_op_cross_core_reduction(sdsc, dsc)? {
+            continue;
+        }
+        let mut stores = Vec::new();
+        for transfer in trees.transfers(dsc_idx) {
+            // `TENSOR_TO_TENSOR` is both ends naming a labelled DS.
+            let Some(src) = env.transfer_src_lds(dsc_idx, transfer.node) else {
+                continue;
+            };
+            if env.transfer_dst_is_lds(dsc_idx, transfer.node)
+                && dsc.labeled_ds.is_output(src)
+                && transfer.src == SenComponent::Lx
+                && transfer.dst == SenComponent::Hbm
+            {
+                stores.push(transfer.node);
+            }
+        }
+        // "Currently support at most one L3SU transfer."
+        (stores.len() <= 1).then_some(())?;
+        for node in stores {
+            let sizes = env.block_transfer_size_per_dim(
+                dsc_idx,
+                node,
+                SenComponent::Lx,
+                Corelet::at::<0>(),
+            )?;
+            let mut store = env.transfer(dsc_idx, node)?;
+            // "Expect empty transferSize_ field."
+            store.transfer_size.is_empty().then_some(())?;
+            store.transfer_size = sizes;
+            env.set_transfer(dsc_idx, node, store);
+        }
+    }
+    Some(())
+}
 
 // crustify:todo: e328_computeMinParamForPaddedDim
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:870  (24 body lines, level 3)
