@@ -87,10 +87,10 @@
 //! | `e539_runOn` | 539 | 3 | 4 | `dcc/src/Transform/Sentient/SinkScalarCopy.cpp:184` |
 //! | `e584_runOnOperation` | 584 | 4 | 7 | `dcc/src/Transform/Sentient/SinkScalarCopy.cpp:167` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
-// file's own tests until `e584_runOnOperation` (level 4) lands and something calls it. CI runs clippy
-// with `-D warnings`, so without this the first ported leaf of a 12-unit module fails the gate.
-// ⭐ REMOVE THIS WITH e584: at that point an unused item here is a real defect again.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`SinkScalarCopy::run_on_operation`] (e584) is the
+// entry, and there is no ported D29–D75 pass driver to call it, so nothing but this file's own tests
+// reaches anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e584 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
 use std::fmt::Write as _;
@@ -101,6 +101,7 @@ use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient};
 use crate::islands::sentient::print;
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
+use crate::transform::sentient::ProgPatch;
 use crate::transform::sentient::local_region_splitting_for_value_commoning::local_region::Indent;
 use crate::workload::Workload;
 
@@ -489,10 +490,34 @@ impl SinkScalarCopy {
     }
 }
 
-// crustify:todo: e584_runOnOperation
-//   authority : dcc/src/Transform/Sentient/SinkScalarCopy.cpp:167  (7 body lines, level 4)
-//   original  : void runOnOperation()
-//   calls     : e477_runOn, e538_runOn, e539_runOn
+/// `-dcc-sink-scalar-copy-disable`, `cl::init(false)` (`:78-80`) — a `dcc-opt` command-line flag, not
+/// a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `opts_.OptLevel == 0` (`:169`) — the pipeline's optimization level, which this crate compiles at
+/// its default and not at `-O0`.
+const OPT_LEVEL_ZERO: bool = false;
+
+impl SinkScalarCopy {
+    /// Replaces: e584_runOnOperation
+    ///
+    /// The pass entry: unless one of THREE gates turns it off, sink the scalar copies of the whole
+    /// module.
+    ///
+    /// ⛔ THE THIRD GATE IS A PROGRAM PROPERTY, NOT A FLAG (`:170`): an unpatched compilation runs no
+    /// sinking at all, which is why [`ProgPatch`] arrives as an argument rather than as a `const`.
+    pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+        prog_patch: ProgPatch,
+        values: &mut Values,
+    ) {
+        if DISABLE_THIS_PASS || OPT_LEVEL_ZERO || prog_patch == ProgPatch::Unpatched {
+            return;
+        }
+        self.run_on_program(program, values);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -840,6 +865,53 @@ mod unit_tests {
                 panic!("a sunk copy then its user");
             };
             assert_eq!(*sunk, input);
+        }
+    }
+
+    /// e584 — a patched compilation sinks, and an unpatched one leaves the body exactly as it was:
+    /// `getProgPatch()` is the gate the other two are constants for.
+    #[test]
+    fn e584_sinks_only_when_the_program_will_be_patched() {
+        let mut values = Values::default();
+        for _ in 0..30 {
+            let _ = values.mint();
+        }
+        let body = sinkable_body(Val(0), Val(10), Val(20));
+        let mut patched: Program<Dd2, AnyModel, AnyRung> = program_with(body.clone());
+        let mut unpatched: Program<Dd2, AnyModel, AnyRung> = program_with(body.clone());
+
+        SinkScalarCopy::default().run_on_operation(&mut patched, ProgPatch::Patched, &mut values);
+        SinkScalarCopy::default().run_on_operation(
+            &mut unpatched,
+            ProgPatch::Unpatched,
+            &mut values,
+        );
+
+        assert!(
+            matches!(
+                sunk_region(patched.units.iter().next().expect("the head unit")),
+                [Op::Sentient(sentient::Op::ScalarCopy { .. }), _]
+            ),
+            "the patched compilation sank a clone into the local region"
+        );
+        assert_eq!(
+            unpatched.units.iter().next().expect("the head unit").body,
+            body,
+            "the unpatched compilation left the body alone"
+        );
+    }
+
+    /// One program whose only unit holds `body`.
+    fn program_with(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit_with(body), Vec::new()),
+            bound: core::marker::PhantomData,
         }
     }
 }

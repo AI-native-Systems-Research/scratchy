@@ -196,6 +196,17 @@ impl UnitFilter {
         let (UnitFilter::Include(list) | UnitFilter::Exclude(list)) = self;
         list.contains(&unit)
     }
+
+    /// `getInclExclList().count(dcc::getUnitType(get_unit_op)) != 0` — the same test as
+    /// [`UnitFilter::names`] BUT AGAINST THE GENERIC COMPONENT, which is what a unit read off a
+    /// `dataflow.get_unit` is: `getUnitType` maps the op's type through `senCompToGenericComp`
+    /// (`Utils/DccExtContext.cpp:126-130`), so every PT row answers `PT` and a list naming one row
+    /// names them all.
+    #[must_use]
+    pub fn names_component(&self, unit: DfirUnit) -> bool {
+        let (UnitFilter::Include(list) | UnitFilter::Exclude(list)) = self;
+        list.iter().any(|named| named.generic() == unit.generic())
+    }
 }
 
 /// WHETHER THE PROGRAMS ARE BEING STITCHED TOGETHER — `dccExtContext().getProgStitch()`, which is
@@ -213,6 +224,24 @@ pub enum ProgStitch {
     Stitched,
     /// `getProgStitch() == false` — the standalone compilation, and the crate's own path today.
     Standalone,
+}
+
+/// WHETHER THE PROGRAM WILL BE PATCHED AFTER COMPILATION — `dccExtContext().getProgPatch()`, which is
+/// `dsc_global_->doPatchProg` (`Utils/DccExtContext.cpp:327`).
+///
+/// ⛔ A PASS INPUT, NOT A CONSTANT HERE, for the reason [`ProgStitch`] is one: it is a property of the
+/// whole compilation, set from a DSC option (`sys-arch-spec/dscglobal/dscglobal.cpp:259`), and
+/// `SinkScalarCopy.cpp:170` turns its whole pass off when it is false.
+/// ⭐ `doPatchProg = true` IS THE DEFAULT (`dscglobal.h:66`), so [`ProgPatch::Patched`] is the path a
+/// compilation takes unless the option says otherwise. ⛔ NOT to be confused with
+/// [`register_type_assignment`]'s two `getProgPatch()` arms, which a `cl::init(false)` flag removes
+/// before the context is ever asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgPatch {
+    /// `getProgPatch() == true` — the program will be patched, and the default.
+    Patched,
+    /// `getProgPatch() == false` — it will not, and the passes that only matter for patching are off.
+    Unpatched,
 }
 
 /// ARE TWO OPS THE SAME COMPUTATION? — `dcc::OperationEquivalence::operationsAreEquivalent`

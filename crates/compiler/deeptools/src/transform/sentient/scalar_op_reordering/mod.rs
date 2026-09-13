@@ -103,12 +103,17 @@ use crate::islands::sentient::dialects::{
 };
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
+use crate::transform::sentient::UnitFilter;
 use crate::transform::sentient::utils::{InBlock, OpAt, move_before, path_of};
 use crate::workload::Workload;
 
 /// `ForceAllowMovementWithinLoops` (`:50-53`) — `cl::init(false)`, so register pressure is what
 /// decides whether a candidate may be moved into a loop.
 const FORCE_ALLOW_MOVEMENT_WITHIN_LOOPS: bool = false;
+
+/// `ReorderInIncludedUnitsOnly` (`:44-48`) — ⛔ `cl::init(TRUE)`, so e579's include-list gate is LIVE
+/// and not a flag this crate can drop.
+const REORDER_IN_INCLUDED_UNITS_ONLY: bool = true;
 
 /// THE NUMBER OF REGISTER LOCALES — fourteen, which is `getMaxEnumValForSentientRegType() + 1`.
 const LOCALES: usize = 14;
@@ -256,10 +261,10 @@ impl ScalarResult {
 
 /// `ScalarOpReorderingPass`'s state (`:147-186`).
 ///
-/// ⚠️ `dcc_ext_ctx_` AND `opts_` ARE NOT CARRIED YET: `dccExtContext()` is read by e370 alone (for
-/// `getMaxRegNum`) and `opts_` by e579 (the include-list gate), so both enter with those units. The two
-/// use caches — `val_to_first_use_in_block_cache_` and `val_to_last_use_in_block_cache_` — enter with
-/// e368 and e369, which are what fill and read them.
+/// ⚠️ `dcc_ext_ctx_` IS NOT CARRIED YET: `dccExtContext()` is read by e370 alone (for `getMaxRegNum`),
+/// so it enters with that unit. `opts_` ARRIVED WITH e579, whose include-list gate is its only reader.
+/// The two use caches — `val_to_first_use_in_block_cache_` and `val_to_last_use_in_block_cache_` —
+/// enter with e368 and e369, which are what fill and read them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScalarOpReordering {
     /// `op_to_idx_` — ⛔ KEYED BY POSITION, WHICH IS NOT WHAT `Operation *` IS: an [`OpId`] moves when
@@ -273,6 +278,8 @@ pub struct ScalarOpReordering {
     locale_has_free_regs: PerLocale<bool>,
     /// `locale_to_num_regs_exceeded_` — the overestimate of how far past its register file a locale is.
     locale_to_num_regs_exceeded: PerLocale<u32>,
+    /// `opts_` — the pipeline's unit filter, read by e579's include-list gate and nothing else.
+    opts: UnitFilter,
 }
 
 impl ScalarOpReordering {
@@ -283,18 +290,21 @@ impl ScalarOpReordering {
     /// ⛔ TRAP: THE REFERENCE'S TWO LOCALE TABLES ARE ONE ENTRY SHORT — this constructor is where the
     /// size is stated, so see [`PerLocale`]. Its `for (i < kMaxNumLocales) … = 0` loop is one `filled`.
     #[must_use]
-    pub fn new() -> ScalarOpReordering {
+    pub fn new(opts: UnitFilter) -> ScalarOpReordering {
         ScalarOpReordering {
             op_to_idx: BTreeMap::new(),
             locale_has_free_regs: PerLocale::filled(false),
             locale_to_num_regs_exceeded: PerLocale::filled(0),
+            opts,
         }
     }
 }
 
 impl Default for ScalarOpReordering {
+    /// `ScalarOpReorderingPass(dcc_ext_ctx, opts)` WITH THE OPTIONS AS CONSTRUCTED — an exclude list of
+    /// nothing, which is what [`UnitFilter`]'s own default documents.
     fn default() -> ScalarOpReordering {
-        ScalarOpReordering::new()
+        ScalarOpReordering::new(UnitFilter::default())
     }
 }
 
@@ -319,14 +329,29 @@ impl ScalarOpReordering {
         }
     }
 
-    /// `runOn(dataflow::ProgramUnitOp)` — entry 579, level 4, not yet ported.
-    fn run_on_unit<A: Arch>(&mut self, unit: &mut ProgramUnit<A>) -> ! {
-        let _ = unit;
-        todo!(
-            "e579_runOn(dataflow::ProgramUnitOp) — the GetUnitOp read and the include-list gate \
-             (ScalarOpReordering.cpp:191), which runs e176_computeOpIndexing and then \
-             e531_findAndProcessCandidates over the unit"
-        )
+    /// Replaces: e579_runOn
+    ///
+    /// One program unit: unless the pass's include list leaves this unit's component out, number every
+    /// op of it and then reorder its scalar ops.
+    ///
+    /// ⛔ NAMED FOR ITS ARGUMENT, as [`ScalarOpReordering::run_on_program`] (e175) is.
+    /// ⛔ THE GATE IS THREE CONJUNCTS AND ONLY THE MIDDLE ONE IS A PASS INPUT (`:199-201`):
+    /// [`REORDER_IN_INCLUDED_UNITS_ONLY`] ships ON, and an EXCLUDE list — the default — never gates
+    /// anything, so a unit is skipped only when an include list was set and does not name its
+    /// component. ⭐ AN EXCLUDE LIST THAT NAMES THIS UNIT DOES NOT SKIP IT; that is the reference's
+    /// own reading of its two-flavour list here.
+    /// ⭐ `DT_CHECK_MSG(get_unit_op, "Cannot determine GetUnitOp!")` (`:194`) AND `unit_op_ = unit_op`
+    /// (`:196`) ARE BOTH TYPES HERE: [`Units`](crate::islands::dataflow_ir::Units) cannot be empty and
+    /// carries its own kind, and the unit arrives by reference rather than being banked on the pass.
+    fn run_on_unit<A: Arch>(&mut self, unit: &mut ProgramUnit<A>) {
+        if REORDER_IN_INCLUDED_UNITS_ONLY
+            && self.opts.is_include_list()
+            && !self.opts.names_component(unit.on.kind())
+        {
+            return;
+        }
+        self.compute_op_indexing(&unit.body);
+        self.find_and_process_candidates(&mut unit.body);
     }
 
     /// Replaces: e176_computeOpIndexing
@@ -848,16 +873,13 @@ impl ScalarOpReordering {
     }
 }
 
-// crustify:todo: e579_runOn
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:191  (15 body lines, level 4)
-//   original  : void ScalarOpReorderingPass::runOn(dataflow::ProgramUnitOp unit_op)
-//   calls     : e176_computeOpIndexing, e531_findAndProcessCandidates
+// ⭐ e579_runOn IS [`ScalarOpReordering::run_on_unit`], beside the e175 overload it belongs to.
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        InBlock, LiverangeIndex, PerLocale, ScalarOpReordering, ScalarResult, ancestor_in_block,
-        is_sentient_constant,
+        InBlock, LiverangeIndex, PerLocale, ScalarOpReordering, ScalarResult, UnitFilter,
+        ancestor_in_block, is_sentient_constant,
     };
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
@@ -964,7 +986,7 @@ mod unit_tests {
     #[should_panic(expected = "senpass e368")]
     fn every_path_through_the_drain_reaches_the_unported_first_use() {
         let unit = vec![constant(Val(1)), add(Val(1), Val(1), Val(2)), add(Val(2), Val(1), Val(3))];
-        let mut pass = ScalarOpReordering::new();
+        let mut pass = ScalarOpReordering::default();
         pass.compute_op_indexing(&unit);
         let mut body = unit;
         pass.find_and_process_candidates(&mut body);
@@ -974,7 +996,7 @@ mod unit_tests {
     /// FOURTEENTH locale is addressable, which is the entry the reference's two tables lack.
     #[test]
     fn the_new_pass_has_fourteen_zeroed_locale_slots() {
-        let pass = ScalarOpReordering::new();
+        let pass = ScalarOpReordering::default();
         assert_eq!(pass, ScalarOpReordering::default());
         assert!(pass.op_to_idx.is_empty());
         for locale in [
@@ -992,12 +1014,33 @@ mod unit_tests {
         assert_eq!(table.get(sentient::RegType::Mvr), 0);
     }
 
-    /// e175 — every unit of the module is visited, and what a unit is handed to is e579.
+    /// e175 — every unit of the module is visited, and what a unit is handed to is e579, whose gate is
+    /// open on the default filter: the movable scalar op below reaches the unported e368.
     #[test]
-    #[should_panic(expected = "e579_runOn")]
-    fn run_on_program_visits_each_unit_through_the_unported_unit_pass() {
-        let mut program = program_of(vec![constant(Val(0))]);
-        ScalarOpReordering::new().run_on_program(&mut program);
+    #[should_panic(expected = "senpass e368")]
+    fn run_on_program_visits_each_unit_through_the_unit_pass() {
+        let mut program = program_of(vec![constant(Val(1)), add(Val(1), Val(1), Val(2))]);
+        ScalarOpReordering::default().run_on_program(&mut program);
+    }
+
+    /// e579 — an INCLUDE list that does not name this unit's component skips the whole unit: the
+    /// movable scalar op is left where it is, and nothing reaches the unported e368 to panic.
+    ///
+    /// ⭐ THE QUIET RETURN IS THE OBSERVATION — the e175 test above is the same body with the default
+    /// filter, and it panics.
+    #[test]
+    fn e579_skips_a_unit_the_include_list_leaves_out() {
+        let body = vec![constant(Val(1)), add(Val(1), Val(1), Val(2))];
+        let mut program = program_of(body.clone());
+        let mut pass = ScalarOpReordering::new(UnitFilter::Include(vec![DfirUnit::Lxlu]));
+
+        pass.run_on_program(&mut program);
+
+        assert_eq!(
+            program.units.iter().next().expect("the head unit").body,
+            body
+        );
+        assert!(pass.op_to_idx.is_empty(), "the unit was not even indexed");
     }
 
     /// e176 — preorder, every op including the `sentient.yield`-less loop's body, regions inline.
@@ -1008,7 +1051,7 @@ mod unit_tests {
             for_op(Val(1), Val(0), vec![add(Val(0), Val(91), Val(2))]),
             add(Val(0), Val(0), Val(3)),
         ];
-        let mut pass = ScalarOpReordering::new();
+        let mut pass = ScalarOpReordering::default();
         pass.compute_op_indexing(&unit);
         let mut got: Vec<(Vec<u32>, usize)> = pass
             .op_to_idx
@@ -1034,7 +1077,7 @@ mod unit_tests {
             add(Val(0), Val(0), Val(3)),
             for_op(Val(1), Val(0), vec![add(Val(0), Val(91), Val(2))]),
         ];
-        let mut pass = ScalarOpReordering::new();
+        let mut pass = ScalarOpReordering::default();
         pass.compute_op_indexing(&unit);
         let c = ScalarResult::of(&unit[0]).expect("a constant binds one value");
         // The nested `scalar_add` at index 3 reads `%0` and is later than the loop that encloses it.
@@ -1075,7 +1118,7 @@ mod unit_tests {
     #[test]
     fn an_op_that_is_not_a_movable_scalar_op_is_no_candidate() {
         let block = vec![for_op(Val(0), Val(1), Vec::new()), constant(Val(2))];
-        let mut pass = ScalarOpReordering::new();
+        let mut pass = ScalarOpReordering::default();
         assert!(!pass.is_candidate_for_reordering(&block, &block, InBlock(0)));
         // `sentient.scalar_constant` is not in the isa list either — only copy, add, sub and the
         // multicast group are.
@@ -1087,7 +1130,7 @@ mod unit_tests {
     #[should_panic(expected = "senpass e368")]
     fn a_movable_scalar_op_reaches_the_unported_first_use_within_block() {
         let block = vec![add(Val(0), Val(1), Val(2))];
-        ScalarOpReordering::new().is_candidate_for_reordering(&block, &block, InBlock(0));
+        ScalarOpReordering::default().is_candidate_for_reordering(&block, &block, InBlock(0));
     }
 
     /// e470 — the constant/iteration-argument classification is asked of the UNIT, and the reference's

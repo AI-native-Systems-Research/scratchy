@@ -84,20 +84,24 @@
 //! | `e543_computeDependencies` | 543 | 3 | 13 | `dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:287` |
 //! | `e585_runOnOperation` | 585 | 4 | 35 | `dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:341` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
-// file's own tests until `e585_runOnOperation` lands and something calls it. CI runs clippy with
-// `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e585_runOnOperation`: at that point an unused item here is a real defect again.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`run_on_operation`] (e585) is the entry, and
+// there is no ported D29–D75 pass driver to call it, so nothing but this file's own tests reaches
+// anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e585 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
 use crate::arch::{Arch, IsaGen};
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::dialects::dataflow::Precision;
-use crate::islands::sentient::dialects::{Op, sentient};
+use crate::islands::sentient::dialects::{self as dialects, Op, sentient};
 use crate::islands::sentient::print;
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
 use crate::transform::sentient::analyses::{
     Cycles, Dependency, GapDirection, TimeStampColumnVal, TimeStamps,
 };
+use crate::units::DfirUnit;
+use crate::workload::Workload;
 use std::collections::BTreeMap;
 
 /// WHAT THIS PASS READS OFF A `sentient.vector_mac` — `dyn_cast<sentient::MacOp>`'s result, and the
@@ -628,21 +632,143 @@ impl Dependencies {
     }
 }
 
-// crustify:todo: e585_runOnOperation
-//   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:341  (35 body lines, level 4)
-//   original  : void TransformForExposedPipelinePass::runOnOperation()
-//   calls     : e235_cleanUp, e237_insertNOPOperations, e543_computeDependencies
+/// `-dcc-transform-for-exposed-pipeline-disable`, `cl::init(false)` (`:35-38`) — a `dcc-opt`
+/// command-line flag, not a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `sentient::getCyclesForExposedPipeline(precision, arch)` — the RAW gap the exposed pipeline needs
+/// (`Dialect/Sentient/SentientOps.cpp:40-59`).
+///
+/// ⛔ NOT AN ANCHORED UNIT: it lives in `Dialect/`, outside this campaign's `Transform/Sentient/`
+/// scope, and its `DT_ERROR("Unknown precision for exposed pipeline")` tail (`:57`) is an ABORT — a
+/// precision this generation has no answer for returns no cycle count in the reference either.
+/// ⭐ `arch <= RCUDD1A_ISA` IS THE SPLIT and [`IsaGen`] starts at `Rcudd1a`, so the two arms are the
+/// two generations. ⛔ `"int2"` HAS NO ISLAND SPELLING — [`Precision`] is closed and does not carry
+/// it — so its two arms are unreachable here rather than dropped.
+fn cycles_for_exposed_pipeline<A: Arch>(precision: Precision) -> Cycles {
+    match (A::GEN, precision) {
+        (IsaGen::Rcudd1a, Precision::Fp16 | Precision::Fp8 | Precision::Fp80) => Cycles(3),
+        (IsaGen::Rcudd1a, Precision::Int4 | Precision::Int8) => Cycles(2),
+        (
+            IsaGen::Sen1p5,
+            Precision::Fp16
+            | Precision::Bf16
+            | Precision::Fp8
+            | Precision::Fp80
+            | Precision::Int4
+            | Precision::Mxfp4
+            | Precision::Mxfp8,
+        ) => Cycles(4),
+        (IsaGen::Sen1p5, Precision::Int8) => Cycles(2),
+        (isa_gen, unknown) => panic!(
+            "DT_ERROR(\"Unknown precision for exposed pipeline\") \
+             (Dialect/Sentient/SentientOps.cpp:57) — {} on {isa_gen:?}",
+            unknown.spelling()
+        ),
+    }
+}
+
+/// `unit.walk<WalkOrder::PreOrder>([&](sentient::NOPOp nop_op) { … }); nop_op->erase();` (`:353-359`)
+/// — every `sentient.nop` of this unit, at every depth, gone.
+fn erase_nops(scope: &mut Vec<Op>) {
+    scope.retain(|op| !matches!(op, Op::Sentient(sentient::Op::Nop { .. })));
+    for op in scope.iter_mut() {
+        for region in dialects::regions_mut(op) {
+            erase_nops(region);
+        }
+    }
+}
+
+/// Replaces: e585_runOnOperation
+///
+/// The pass entry: on each PT unit, throw away the NOPs a previous run left, then re-open every RAW
+/// hazard the exposed pipeline needs by inserting the NOPs its precision's cycle budget asks for.
+///
+/// ⛔ THE NOP SWEEP IS UNCONDITIONAL AND COMES FIRST (`:353-359`), so a unit whose hazards have all
+/// been closed since loses its NOPs and gains none back — this pass is idempotent by rebuilding.
+/// ⛔ `precision->str()` ON A PT UNIT CARRYING NONE IS A `bad_optional_access` (`:362`), the same
+/// unchecked deref [`super::canonicalize_xrf_pointers::run_on_operation`] preserves.
+/// ⛔ `cycles -= 1` "covering the exiting FMA operation" (`:365-367`) happens BEFORE the analysis, so
+/// both the hazard filter and the NOP count spend the reduced budget.
+/// ⚠️ ONE `TimeStamps` HANDLE SERVES EVERY UNIT where the reference constructs `TimeStamp
+/// ts_analyzer(unit)` per unit (`:368`): the analysis is out of campaign scope, and e543 re-timestamps
+/// the body it is given as its own first act.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    ts: &mut impl TimeStamps,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    // `dependencies_with_min_gap_` IS THE PASS'S, and `cleanUp()` at the foot of each iteration is
+    // what keeps one unit's hazards out of the next one's insertions.
+    let mut dependencies = Dependencies::default();
+    for unit in program.units.iter_mut() {
+        // `dcc::getUnitType(unit_op.getUnits()[0].getDefiningOp<GetUnitOp>()) == PT` — every PT row is
+        // the one generic component.
+        if !matches!(unit.on.kind(), DfirUnit::PtRow(_)) {
+            continue;
+        }
+        erase_nops(&mut unit.body);
+        let precision = precision_of(unit);
+        let budget = Cycles(cycles_for_exposed_pipeline::<A>(precision).0 - 1);
+        dependencies.compute_dependencies::<A>(ts, &unit.body, budget, precision);
+        if !dependencies.with_min_gap.is_empty() {
+            dependencies.insert_nop_operations(&mut unit.body, budget);
+        }
+        dependencies.clean_up();
+    }
+}
+
+/// `unit.getPrecision()` DEREFERENCED — `precision->str()` (`:362`, `:369`).
+fn precision_of<A: Arch>(unit: &ProgramUnit<A>) -> Precision {
+    match unit.precision {
+        Some(precision) => precision,
+        None => panic!(
+            "std::bad_optional_access: `precision->str()` on {:?}, a PT unit with no precision \
+             (`TransformForExposedPipeline.cpp:362`)",
+            unit.on.kind()
+        ),
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Dependencies, mac_ops_flow_dependence};
+    use super::{Dependencies, mac_ops_flow_dependence, run_on_operation};
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::dialects::dataflow::Precision;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
     use crate::transform::sentient::analyses::{
         Cycles, Dependency, GapDirection, TimeStampColumnVal, TimeStamps,
     };
+    use crate::units::{DfirUnit, Row};
+    use crate::workload::Workload;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     /// A `TimeStamp` STATING ITS ANSWERS — the analysis is out of campaign scope
     /// ([`OutOfScopeTimeStamps`](crate::transform::sentient::analyses::OutOfScopeTimeStamps) is a
@@ -1220,5 +1346,99 @@ mod unit_tests {
                 },
             ]
         );
+    }
+
+    /// One program unit on `kind` holding `body`, at `fp16`.
+    fn unit_on(kind: DfirUnit, body: Vec<Op>) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(kind, Val(0)),
+            precision: Some(Precision::Fp16),
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e585 — a PT unit loses the NOPs of a previous run at every depth and gains the two its `fp16`
+    /// budget of `3 - 1` cycles asks for, while the unit that is not a PT row keeps its own NOP: the
+    /// component gate is the whole pass.
+    #[test]
+    fn e585_rebuilds_the_nops_of_every_pt_unit_and_leaves_the_rest_alone() {
+        let unrolled = sentient::UnrollFactor::X1;
+        let s = mac(
+            "s",
+            sentient::Port::Lrf(sentient::LrfIndex::L2),
+            &[sentient::Port::Lrf(sentient::LrfIndex::L2)],
+            false,
+            unrolled,
+        );
+        let t = mac(
+            "t",
+            sentient::Port::Lrf(sentient::LrfIndex::L2),
+            &[sentient::Port::Lrf(sentient::LrfIndex::L5)],
+            false,
+            unrolled,
+        );
+        let u = mac(
+            "u",
+            sentient::Port::Lrf(sentient::LrfIndex::L5),
+            &[],
+            false,
+            unrolled,
+        );
+        let pt = unit_on(
+            DfirUnit::PtRow(Row::checked(0).expect("PT row 0 exists")),
+            vec![
+                loop_over(vec![s.clone(), t.clone(), nop("stale", 0)]),
+                u.clone(),
+                nop("stale", 1),
+            ],
+        );
+        let sfp = unit_on(DfirUnit::Sfp, vec![nop("kept", 0)]);
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(pt, vec![sfp]),
+            bound: core::marker::PhantomData,
+        };
+        // The e543 fixture's answers, over the body the NOP sweep leaves behind.
+        let mut ts = StatedTimeStamps {
+            order: vec![OpId::at(&[0, 0]), OpId::at(&[0, 1]), OpId::at(&[1])],
+            stamps: vec![
+                (OpId::at(&[0, 0]), in_loop_at_zero()),
+                (OpId::at(&[0, 1]), in_loop_at_zero()),
+                (OpId::at(&[1]), vec![TimeStampColumnVal::Constant]),
+            ],
+            gaps: vec![
+                (
+                    (OpId::at(&[0, 0]), OpId::at(&[0, 1])),
+                    (Cycles(2), GapDirection::Forward),
+                ),
+                (
+                    (OpId::at(&[0, 1]), OpId::at(&[1])),
+                    (Cycles(4), GapDirection::Forward),
+                ),
+            ],
+            reductions: 0,
+            computed: 0,
+        };
+
+        run_on_operation(&mut program, &mut ts);
+
+        // ⭐ ONLY THE PT UNIT WAS TIMESTAMPED, so the SFP one was never analysed at all.
+        assert_eq!(ts.computed, 1);
+        let mut units = program.units.iter();
+        assert_eq!(
+            units.next().expect("the PT unit").body,
+            vec![
+                loop_over(vec![s, nop("s", 0), nop("s", 1), t]),
+                u,
+            ]
+        );
+        // `t`→`u`'s gap of 4 is outside the reduced budget of 2, so `u` is left standing.
+        assert_eq!(units.next().expect("the SFP unit").body, vec![nop("kept", 0)]);
     }
 }

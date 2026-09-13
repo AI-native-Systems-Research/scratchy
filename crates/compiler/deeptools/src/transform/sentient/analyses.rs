@@ -1209,6 +1209,15 @@ pub trait PropagationAnalysis {
         )
     }
 
+    /// `isPropagationSuccessful()` (`Analyses/PropagationAnalysis.h:313`) — whether the analysis ran
+    /// to the end over this op. ⭐ `false` IS ITS `LogicalResult::failure()`, and e580 returns without
+    /// walking anything on it.
+    fn is_propagation_successful(&mut self) -> bool {
+        todo!(
+            "PropagationAnalysis::isPropagationSuccessful (Analyses/PropagationAnalysis.h:313) — out of campaign scope"
+        )
+    }
+
     /// `setExprInfoMapForValue(val, expr_map)` (`Analyses/PropagationAnalysis.h:323`) — the operand a
     /// simplification just created inherits the expression map of the op it stands for.
     fn set_expr_info_map_for_value(&mut self, val: Val, map: ExprInfoMap) {

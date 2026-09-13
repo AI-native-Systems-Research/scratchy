@@ -81,16 +81,17 @@
 //! | `e580_runOldLightWeightSimplifications` | 580 | 4 | 25 | `dcc/src/Transform/Sentient/ScalarSimplifications.cpp:690` |
 
 #![allow(dead_code)]
-// ⛔ NOTHING IN THIS FILE IS WIRED INTO THE PIPELINE YET — `e580_runOldLightWeightSimplifications`
-// (level 4) is what reaches the item below, through e534. CI runs clippy with `-D warnings`, so
-// without this the first ported leaf here fails the gate. ⭐ REMOVE THIS WITH e580.
+// ⛔ NOTHING IN THIS FILE IS WIRED INTO THE PIPELINE YET — the pass entry that reaches
+// `e580_runOldLightWeightSimplifications` is e597 (level 5), behind an `OldLightweightSimplification`
+// flag that ships `cl::init(false)`. CI runs clippy with `-D warnings`, so without this the leaves
+// here fail the gate. ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor.
 
 use super::{ConstSink, QueryKeyAndUnits};
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, operands, replace_all_uses_with, sentient as ops, set_operand, uniform,
-    use_count,
+    Definitions, Op, Val, erase_defining_op, operands, regions_mut, replace_all_uses_with,
+    sentient as ops, set_operand, uniform, use_count,
 };
 use crate::transform::sentient::analyses::{ExprInfoMap, PropagationAnalysis, UnitIndexMap};
 use crate::transform::sentient::register_packing::constant_target_values;
@@ -559,15 +560,87 @@ pub(crate) fn light_weight_simplify_binary_arithmetic(
 }
 
 
-// crustify:todo: e580_runOldLightWeightSimplifications
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:690  (25 body lines, level 4)
-//   original  : LogicalResult sentient::runOldLightWeightSimplifications(Operation* op)
-//   calls     : e534_lightWeightSimplifyBinaryArithmetic
+/// WHETHER THE PROPAGATION ANALYSIS ANSWERED — `LogicalResult`, which here reports THE ANALYSIS'S
+/// state and not a failure of this pass, so the crate's refusal ban is not in play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum Propagation {
+    /// `LogicalResult::success()` — the analysis ran, so the walk ran too.
+    Succeeded,
+    /// `LogicalResult::failure()` — `isPropagationSuccessful()` failed and nothing was simplified.
+    Failed,
+}
+
+/// Replaces: e580_runOldLightWeightSimplifications
+///
+/// Hands every op of the block, and of the blocks nested in it, to
+/// [`light_weight_simplify_binary_arithmetic`], then erases what the walk queued.
+///
+/// ⛔ A FAILED PROPAGATION ANALYSIS SIMPLIFIES NOTHING (`:691-693`), and the entry WIDENS TO THE
+/// PARENT for `uniform.uniformize_regions`/`uniform.equalize_pattern` (`:696-698`) — the block this
+/// takes is the widened one, which for every caller in the tree is a unit body (`:700`).
+pub(crate) fn run_old_light_weight_simplifications(
+    scope: &mut Vec<Op>,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    values: &mut Values,
+) -> Propagation {
+    if !expr_prop_analysis.is_propagation_successful() {
+        return Propagation::Failed;
+    }
+    let mut to_be_deleted = Vec::new();
+    simplify_pre_order(
+        scope,
+        expr_prop_analysis,
+        unit_index_map,
+        &mut to_be_deleted,
+        values,
+    );
+    for doomed in &to_be_deleted {
+        erase_defining_op(scope, *doomed);
+    }
+    Propagation::Succeeded
+}
+
+/// `op->walk<WalkOrder::PreOrder>` — an op, then the blocks nested in it.
+///
+/// ⚠️ ONE [`ConstSink`] PER BLOCK where the reference has one builder for the whole nest, and e534
+/// resolves an operand's definition inside the block it is given — so a nested op's constant lands at
+/// the head of ITS block, and an operand defined further out is one e534 does not see.
+fn simplify_pre_order(
+    scope: &mut Vec<Op>,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    to_be_deleted: &mut Vec<Val>,
+    values: &mut Values,
+) {
+    let mut const_sink = ConstSink::default();
+    let mut at = 0;
+    while at < scope.len() {
+        let before = scope.len();
+        light_weight_simplify_binary_arithmetic(
+            scope,
+            at,
+            expr_prop_analysis,
+            unit_index_map,
+            to_be_deleted,
+            &mut const_sink,
+            values,
+        );
+        // Everything e534 builds lands ahead of the op it simplified, so the op's index moves with it.
+        at += scope.len() - before;
+        for region in regions_mut(&mut scope[at]) {
+            simplify_pre_order(region, expr_prop_analysis, unit_index_map, to_be_deleted, values);
+        }
+        at += 1;
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ConstSink, FlatExpr, create_new_op_or_map, light_weight_simplify_binary_arithmetic,
+        ConstSink, FlatExpr, Propagation, create_new_op_or_map,
+        light_weight_simplify_binary_arithmetic, run_old_light_weight_simplifications,
     };
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -590,6 +663,19 @@ mod unit_tests {
 
         fn first_propagated_args(&mut self, _map: ExprInfoMap) -> Vec<Val> {
             vec![Val(50), Val(60)]
+        }
+    }
+
+    /// AN ANALYSIS THAT RAN — e580's gate answers, and its zero-operand arm consults nothing else.
+    struct PropagatingAnalysis;
+
+    impl PropagationAnalysis for PropagatingAnalysis {
+        fn are_expressions_same(&mut self, _val1: Val, _val2: Val) -> bool {
+            todo!("e580 never asks whether two expressions are the same")
+        }
+
+        fn is_propagation_successful(&mut self) -> bool {
+            true
         }
     }
 
@@ -752,5 +838,96 @@ mod unit_tests {
         );
         assert_eq!(operands(&scope[2]), vec![Val(1), Val(1)]);
         assert_eq!(to_be_deleted, vec![Val(3)]);
+    }
+
+    /// e580 — the pre-order walk reaches an add of zero inside a `sentient.for` body, and the erase
+    /// runs after the walk rather than under it.
+    #[test]
+    fn e580_simplifies_a_nested_add_of_zero_and_erases_it_afterwards() {
+        let mut scope = vec![
+            Op::Sentient(ops::Op::Nop { dbg_name: None }),
+            Op::Sentient(ops::Op::For {
+                iv: Val(3),
+                bound: Val(0),
+                bound_reg: None,
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![
+                    Op::Sentient(ops::Op::ScalarConstant {
+                        value: 0,
+                        result: Val(2),
+                        reg_locale: ops::RegType::Imm,
+                        ty: ScalarTy::Index,
+                        is_symbol: false,
+                    }),
+                    Op::Sentient(ops::Op::ScalarAdd {
+                        lhs: Val(1),
+                        rhs: Val(2),
+                        result: Val(4),
+                        reg: None,
+                        element_size: None,
+                        ty: ScalarTy::Index,
+                    }),
+                    Op::Sentient(ops::Op::ScalarMul {
+                        lhs: Val(4),
+                        rhs: Val(1),
+                        result: Val(5),
+                        reg_locale: None,
+                        ty: ScalarTy::Index,
+                    }),
+                ],
+            }),
+        ];
+        assert_eq!(
+            run_old_light_weight_simplifications(
+                &mut scope,
+                &mut PropagatingAnalysis,
+                &OutOfScopeUnitIndexMap,
+                &mut Values::default(),
+            ),
+            Propagation::Succeeded
+        );
+        let Op::Sentient(ops::Op::For { body, .. }) = &scope[1] else {
+            panic!("the loop is still there")
+        };
+        assert_eq!(body.len(), 2);
+        assert_eq!(operands(&body[1]), vec![Val(1), Val(1)]);
+    }
+
+    /// e580 — ⛔ A FAILED PROPAGATION ANALYSIS SIMPLIFIES NOTHING (`:691-693`): the same add of zero
+    /// survives, which is why the walk cannot be reached through the out-of-scope analysis at all.
+    #[test]
+    fn e580_walks_nothing_when_the_propagation_analysis_failed() {
+        struct NoPropagation;
+
+        impl PropagationAnalysis for NoPropagation {
+            fn are_expressions_same(&mut self, _val1: Val, _val2: Val) -> bool {
+                todo!("e580 never asks whether two expressions are the same")
+            }
+
+            fn is_propagation_successful(&mut self) -> bool {
+                false
+            }
+        }
+
+        let mut scope = vec![Op::Sentient(ops::Op::ScalarAdd {
+            lhs: Val(1),
+            rhs: Val(2),
+            result: Val(3),
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        })];
+        let before = scope.clone();
+        assert_eq!(
+            run_old_light_weight_simplifications(
+                &mut scope,
+                &mut NoPropagation,
+                &OutOfScopeUnitIndexMap,
+                &mut Values::default(),
+            ),
+            Propagation::Failed
+        );
+        assert_eq!(scope, before);
     }
 }

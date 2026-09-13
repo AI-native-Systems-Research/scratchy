@@ -82,10 +82,10 @@
 //! | `e535_runOn` | 535 | 3 | 4 | `dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:73` |
 //! | `e582_runOnOperation` | 582 | 4 | 5 | `dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:78` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so `SetActiveMaskValueGenValue` is reachable only
-// from `set_active_mask_value_rde_tree` and its tests until `e582_runOnOperation` (level 4) lands. CI
-// runs clippy with `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH e582: at that point an unused item here is a real defect again.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`run_on_operation`] (e582) is the entry, and
+// there is no ported D29–D75 pass driver to call it, so nothing but this file's own tests reaches
+// anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e582 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
 use crate::arch::Arch;
@@ -380,15 +380,34 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
     }
 }
 
-// crustify:todo: e582_runOnOperation
-//   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:78  (5 body lines, level 4)
-//   original  : void runOnOperation()
-//   calls     : e473_runOn, e535_runOn
+/// `-dcc-samv-re-disable`, `cl::init(false)` (`:41-44`) — a `dcc-opt` command-line flag, not a
+/// program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e582_runOnOperation
+///
+/// The pass entry: unless the flag disables it, run SAMV redundant-definition elimination over the
+/// whole module, and hand back the statistic its units banked.
+///
+/// ⛔ THE STATISTIC BELONGS TO THE PASS INSTANCE, NOT TO A UNIT (`Passes.td:57`): it starts at zero
+/// here and each unit **assigns** it (`:70`), so a disabled pass answers zero rather than leaving a
+/// previous module's count standing.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+) -> SamvReCount {
+    let mut samv_re_count = SamvReCount::default();
+    if DISABLE_THIS_PASS {
+        return samv_re_count;
+    }
+    run_on_program(program, &mut samv_re_count);
+    samv_re_count
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        SamvAttrs, SamvReCount, SetActiveMaskValueGenValue, run_on_program, run_on_unit,
+        SamvAttrs, SamvReCount, SetActiveMaskValueGenValue, run_on_operation, run_on_program,
+        run_on_unit,
     };
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
@@ -551,5 +570,13 @@ mod unit_tests {
     #[should_panic(expected = "senpass e378")]
     fn every_unit_of_the_module_is_run_on() {
         run_on_program(&mut program_on(DfirUnit::Pe), &mut SamvReCount(0));
+    }
+
+    /// e582 — the disable flag ships OFF, so the entry walks the module rather than answering a zero
+    /// count, and its first unit arrives at the unported e378.
+    #[test]
+    #[should_panic(expected = "senpass e378")]
+    fn the_entry_runs_because_the_disable_flag_is_off() {
+        run_on_operation(&mut program_on(DfirUnit::Pe));
     }
 }

@@ -82,21 +82,27 @@
 //! | `e581_runOnOperation` | 581 | 4 | 54 | `dcc/src/Transform/Sentient/ScalarSimplifications.cpp:872` |
 
 #![allow(dead_code)]
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e581_runOnOperation` (level 4) is what reaches
-// the item below, which nothing but this file's tests calls until it lands. CI runs clippy with
-// `-D warnings`. ⭐ REMOVE THIS WITH e581.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e581_runOnOperation` is the entry, and nothing
+// runs it until a pass driver schedules it. CI runs clippy with `-D warnings`, so without this the
+// items below fail the gate. ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor.
 
 pub(crate) mod sentient;
 
+use super::analyses::{InstructionEstimator, OutOfScopeInstructionEstimator};
 use super::register_type_assignment::is_symbol;
 use super::utils::select_indices_for_units;
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::sentient::CmpPredicate;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, operands, replace_all_uses_with, results, sentient as ops, set_operand,
+    Definitions, Op, Val, erase_defining_op, operands, regions_mut, replace_all_uses_with, results,
+    sentient as ops, set_operand,
 };
+use crate::model::Model;
 use crate::transform::sentient::analyses::{PropagationAnalysis, UnitIndexMap};
+use crate::workload::Workload;
 
 /// THE `$predicate` SLOT OF ONE `sentient.if` — `IfOp& if_op` reduced to the single field
 /// `updateCmpIPredicate` writes, so "not a `sentient.if`" is not a case it has to answer.
@@ -548,24 +554,213 @@ fn simplified_value(
     ))
 }
 
-// crustify:todo: e581_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:872  (54 body lines, level 4)
-//   original  : void ScalarSimplificationsPass::runOnOperation()
-//   calls     : e471_simplifyConditionals, e532_simplifyBinaryOperation, e533_simplifyLoadStoreOperation
+/// `-dcc-scalar-simplification-disable`, `cl::init(false)` (`:58-61`) — a `dcc-opt` command-line flag,
+/// not a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `opts_.OptLevel == 0` (`:884`) — the pipeline's optimisation level, which is `2` by default
+/// (`dcc/tools/Options/dcc-pass-option.h:63-65`), so the shipped pipeline never reaches the
+/// `haveIbuffSpace` half of the `&&`.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// THE FIRST WALK — `unit->walk<PreOrder>` for `sentient::IfOp` (`:891-894`).
+///
+/// ⚠️ THE CONSTANTS GO TO A BLOCK OF THEIR OWN and are spliced in at the sink afterwards, because a
+/// `sentient.if` nested in the body cannot be handed to [`simplify_conditionals`] while the body it
+/// sits in is the const block. Creation order and the head-of-body position are the sink's own.
+fn simplify_conditionals_pre_order(
+    scope: &mut Vec<Op>,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    consts: &mut Vec<Op>,
+) {
+    for op in scope.iter_mut() {
+        if matches!(op, Op::Sentient(ops::Op::If { .. })) {
+            simplify_conditionals(expr_prop_analysis, op, consts);
+        }
+        for region in regions_mut(op) {
+            simplify_conditionals_pre_order(region, expr_prop_analysis, consts);
+        }
+    }
+}
+
+/// THE SECOND WALK — `unit->walk<PreOrder>` over the arithmetic and the transfers (`:897-914`).
+///
+/// ⚠️ ONE [`ConstSink`] PER BLOCK where the reference has one for the whole unit: a nested op's
+/// constant lands at the head of ITS block, which still dominates the use.
+fn simplify_arithmetic_pre_order(
+    scope: &mut Vec<Op>,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    to_be_deleted: &mut Vec<Val>,
+    values: &mut Values,
+) {
+    let mut const_sink = ConstSink::default();
+    let mut at = 0;
+    while at < scope.len() {
+        let before = scope.len();
+        match &scope[at] {
+            Op::Sentient(ops::Op::ScalarAdd { ty, .. } | ops::Op::ScalarSub { ty, .. }) => {
+                // `add_op.getInp1().getType()` (`:901`, `:906`) — the op's own type, which
+                // `SameOperandsAndResultType` makes the first operand's.
+                let operand_type = *ty;
+                simplify_binary_operation(
+                    scope,
+                    at,
+                    operand_type,
+                    expr_prop_analysis,
+                    unit_index_map,
+                    to_be_deleted,
+                    &mut const_sink,
+                    values,
+                );
+            }
+            Op::Sentient(
+                ops::Op::LoadAndSend { .. }
+                | ops::Op::ReceiveAndStore { .. }
+                | ops::Op::LoadAndStore { .. }
+                | ops::Op::LoadAndExtractScalar { .. }
+                | ops::Op::LoadComputeAndSend { .. },
+            ) => simplify_load_store_operation(
+                scope,
+                at,
+                expr_prop_analysis,
+                unit_index_map,
+                &mut const_sink,
+                values,
+            ),
+            _ => {}
+        }
+        // Everything the simplifications build lands ahead of the op, so its index moves with it.
+        at += scope.len() - before;
+        for region in regions_mut(&mut scope[at]) {
+            simplify_arithmetic_pre_order(
+                region,
+                expr_prop_analysis,
+                unit_index_map,
+                to_be_deleted,
+                values,
+            );
+        }
+        at += 1;
+    }
+}
+
+/// Replaces: e581_runOnOperation
+///
+/// The pass entry: simplify every conditional of every unit, then every scalar add, sub and transfer
+/// address in it, and erase what the second walk queued.
+///
+/// ⛔ A FAILED PROPAGATION ANALYSIS DOES NOT STOP THE PASS (`:876-879`): there is no `return` after
+/// `signalPassFailure()`, so both walks still run.
+/// ⛔ THE MISSING ANALYSIS IS NAMED, NOT SUBSTITUTED FOR — `haveIbuffSpace` stays a `todo!` behind
+/// [`OPT_LEVEL_ZERO`], which the pipeline fixes rather than this pass.
+/// ⚠️ `markAnalysesPreserved<PropagationAnalysis>()` (`:917`) IS PASS-MANAGER BOOKKEEPING: no IR.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    // `module_op->emitError("Unable to perform expression propagation"); signalPassFailure();`
+    let _propagation_succeeded = expr_prop_analysis.is_propagation_successful();
+    for unit in program.units.iter_mut() {
+        let mut instruction_estimator = OutOfScopeInstructionEstimator;
+        if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        let mut consts = Vec::new();
+        simplify_conditionals_pre_order(&mut unit.body, expr_prop_analysis, &mut consts);
+        unit.body.splice(0..0, consts);
+        let mut to_be_deleted = Vec::new();
+        simplify_arithmetic_pre_order(
+            &mut unit.body,
+            expr_prop_analysis,
+            unit_index_map,
+            &mut to_be_deleted,
+            values,
+        );
+        for doomed in &to_be_deleted {
+            erase_defining_op(&mut unit.body, *doomed);
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ConstSink, IfPredicate, simplify_binary_operation, simplify_conditionals,
-        simplify_load_store_operation, update_cmp_i_predicate,
+        ConstSink, IfPredicate, Model, Program, Workload, run_on_operation,
+        simplify_binary_operation, simplify_conditionals, simplify_load_store_operation,
+        update_cmp_i_predicate,
     };
-    use crate::islands::dataflow_ir::Values;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units, Values};
     use crate::islands::sentient::dialects::sentient::CmpPredicate;
     use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
     use crate::transform::sentient::analyses::{
         ExprInfoMap, OutOfScopeUnitIndexMap, PropagationAnalysis,
     };
+    use crate::units::DfirUnit;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One program whose only unit holds `body`.
+    fn program_with(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit::<Dd2> {
+                    on: Units::one(DfirUnit::Lxlu, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// A `sentient.for` around `body`, so a walk has somewhere to descend to.
+    fn loop_over(body: Vec<Op>) -> Op {
+        Op::Sentient(ops::Op::For {
+            iv: Val(8),
+            bound: Val(9),
+            bound_reg: None,
+            carried: Vec::new(),
+            dbg_name: None,
+            body,
+        })
+    }
 
     /// AN ANALYSIS THAT ANSWERS WHAT THE TEST SAYS — `PropagationAnalysis` is out of campaign scope,
     /// so what is under test is the EFFECT this unit has given an answer.
@@ -577,6 +772,10 @@ mod unit_tests {
     impl PropagationAnalysis for StatedAnalysis {
         fn are_expressions_same(&mut self, _val1: Val, _val2: Val) -> bool {
             todo!("e471 never asks whether two expressions are the same")
+        }
+
+        fn is_propagation_successful(&mut self) -> bool {
+            true
         }
 
         fn affine_expression(&mut self, val: Val) -> ExprInfoMap {
@@ -700,6 +899,48 @@ mod unit_tests {
             &mut StatedAnalysis { empty: false },
             &OutOfScopeUnitIndexMap,
             &mut ConstSink::default(),
+            &mut Values::default(),
+        );
+    }
+
+    /// e581 — the entry runs both walks over the whole nest of every unit, and a stale analysis is
+    /// what leaves the conditional and the arithmetic in it alone.
+    #[test]
+    fn e581_walks_every_units_nest_and_a_stale_analysis_rewrites_nothing() {
+        let body = vec![
+            loop_over(vec![
+                if_op(CmpPredicate::Sge),
+                Op::Sentient(ops::Op::ScalarAdd {
+                    lhs: Val(1),
+                    rhs: Val(2),
+                    result: Val(3),
+                    reg: None,
+                    element_size: None,
+                    ty: ScalarTy::Index,
+                }),
+            ]),
+            Op::Sentient(ops::Op::Nop { dbg_name: None }),
+        ];
+        let mut program = program_with(body.clone());
+        run_on_operation(
+            &mut program,
+            &mut StatedAnalysis { empty: true },
+            &OutOfScopeUnitIndexMap,
+            &mut Values::default(),
+        );
+        assert_eq!(program.units.iter().next().expect("the head unit").body, body);
+    }
+
+    /// e581 — the first walk reaches a `sentient.if` nested in a loop, and with expressions on both
+    /// sides that conditional reaches the affine solver, which is out of campaign scope.
+    #[test]
+    #[should_panic(expected = "out of campaign scope")]
+    fn e581_reaches_a_nested_conditional_through_the_first_walk() {
+        let mut program = program_with(vec![loop_over(vec![if_op(CmpPredicate::Sge)])]);
+        run_on_operation(
+            &mut program,
+            &mut StatedAnalysis { empty: false },
+            &OutOfScopeUnitIndexMap,
             &mut Values::default(),
         );
     }

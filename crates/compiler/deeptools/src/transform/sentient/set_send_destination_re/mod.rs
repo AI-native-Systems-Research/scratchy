@@ -79,10 +79,10 @@
 //! | `e537_runOn` | 537 | 3 | 4 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:164` |
 //! | `e583_runOnOperation` | 583 | 4 | 5 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:169` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so the two GenValue families below are reachable
-// only from each other and their tests until `e583_runOnOperation` (level 4) lands. CI runs clippy
-// with `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH e583: at that point an unused item here is a real defect again.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`run_on_operation`] (e583) is the entry, and
+// there is no ported D29–D75 pass driver to call it, so nothing but this file's own tests reaches
+// anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e583 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
 use crate::arch::Arch;
@@ -262,17 +262,36 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
     }
 }
 
-// crustify:todo: e583_runOnOperation
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:169  (5 body lines, level 4)
-//   original  : void runOnOperation()
-//   calls     : e475_runOn, e537_runOn
+/// `-dcc-set-send-dst-re-disable`, `cl::init(false)` (`:88-91`) — a `dcc-opt` command-line flag, not
+/// a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e583_runOnOperation
+///
+/// The pass entry: unless the flag disables it, eliminate the redundant `set_send_dst`s of the whole
+/// module.
+///
+/// ⭐ THE STATISTIC IS BANKED INSIDE THE TREE SEAM: the reference assigns `set_send_dst_re_count` from
+/// `optimizer.optimize()` per unit (`:135`), which is [`run_on`]'s `tree.optimize` call, so the entry
+/// has nothing of its own to answer with.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    prog_stitch: ProgStitch,
+    tree: &mut impl SetSendDstRdeTreeOptimizer,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    run_on_program(program, prog_stitch, tree, values);
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
         DfirUnit, Link, LxluUnit, Op, ProgStitch, Residency, SetDestReOptimizationMode,
         SetSendDstReCount, SetSendDstRdeTreeOptimizer, SfpUnit, Val, Values, dataflow,
-        determine_optimization_mode, run_on, run_on_program, sentient,
+        determine_optimization_mode, run_on, run_on_operation, run_on_program, sentient,
     };
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
@@ -424,5 +443,32 @@ mod unit_tests {
         let mut units = program.units.iter();
         assert_eq!(units.next().expect("the LXLU unit").body.len(), 2);
         assert_eq!(units.next().expect("the SFP unit").body, Vec::new());
+    }
+
+    /// e583 — the disable flag ships OFF, so the entry reaches the module walk and the LXLU unit is
+    /// still given its reset pair.
+    #[test]
+    fn e583_runs_the_module_because_the_disable_flag_is_off() {
+        let mut values = Values::default();
+        let lxlu = lxlu_unit(&mut values);
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(lxlu, Vec::new()),
+            bound: core::marker::PhantomData,
+        };
+        let mut tree = ElidingTree {
+            count: 1,
+            asked: None,
+        };
+
+        run_on_operation(&mut program, ProgStitch::Stitched, &mut tree, &mut values);
+
+        assert_eq!(tree.asked, Some(SetDestReOptimizationMode::OptimizeForLxlu));
+        assert_eq!(program.units.iter().next().expect("the LXLU unit").body.len(), 2);
     }
 }

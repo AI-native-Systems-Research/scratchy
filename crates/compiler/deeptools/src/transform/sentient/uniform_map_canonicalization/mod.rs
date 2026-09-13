@@ -80,10 +80,10 @@
 //! | `e545_runOn` | 545 | 3 | 8 | `dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:96` |
 //! | `e586_runOnOperation` | 586 | 4 | 5 | `dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:58` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
-// file's own tests until `e545_runOn` and `e586_runOnOperation` land. CI runs clippy with
-// `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e586_runOnOperation`: an unused item here is a real defect again at that point.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`run_on_operation`] (e586) is the entry, and
+// there is no ported D29–D75 pass driver to call it, so nothing but this file's own tests reaches
+// anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e586 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
 use crate::arch::Arch;
@@ -394,14 +394,29 @@ pub(crate) fn run_on_module<A: Arch, M: Model, W: Workload>(run: &mut Run<A, M, 
     }
 }
 
-// crustify:todo: e586_runOnOperation
-//   authority : dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:58  (5 body lines, level 4)
-//   original  : void runOnOperation()
-//   calls     : e484_runOn, e544_runOn, e545_runOn
+/// `-dcc-uniform-map-canonicalization-disable` (`:39-45`).
+///
+/// ⛔⛔ `cl::init(TRUE)` — THIS PASS SHIPS DISABLED, *"for now keep it disabled, since it turns out we
+/// still need to update progIROpt even if there are no `L3_ADDEARIMM imm=0`"* (`:42-45`). That is the
+/// reference's behaviour and not a defect to fix: [`run_on_module`] is unreachable from the pass entry
+/// until the flag is passed.
+const DISABLE_THIS_PASS: bool = true;
+
+/// Replaces: e586_runOnOperation
+///
+/// The pass entry: unless the flag disables it, canonicalize the whole module's uniform maps.
+///
+/// ⛔ [`DISABLE_THIS_PASS`] IS `true`, so this returns without touching the run — see its doc.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(run: &mut Run<A, M, W>) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    run_on_module(run);
+}
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{cleanup_constants, run_on, run_on_module, run_on_unit};
+    use super::{cleanup_constants, run_on, run_on_module, run_on_operation, run_on_unit};
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -673,6 +688,34 @@ mod unit_tests {
                 .expect("the head unit")
                 .body,
             vec![adds(Val(4), Val(5))]
+        );
+    }
+
+    /// e586 — the flag ships ON, so the entry leaves the run exactly as it found it: the duplicate
+    /// constant e545 would have unified is still there.
+    #[test]
+    fn e586_ships_disabled_and_changes_nothing() {
+        let before = vec![
+            constant(7, Val(1), sentient::RegType::Imm),
+            constant(7, Val(2), sentient::RegType::Lrf),
+            adds(Val(2), Val(3)),
+        ];
+        let mut run = Run {
+            kernel: KernelName(GroupId(0)),
+            programs: vec![program_of(before.clone())],
+        };
+
+        run_on_operation(&mut run);
+
+        assert!(run.programs[0].preamble.is_empty());
+        assert_eq!(
+            run.programs[0]
+                .units
+                .iter()
+                .next()
+                .expect("the head unit")
+                .body,
+            before
         );
     }
 }
