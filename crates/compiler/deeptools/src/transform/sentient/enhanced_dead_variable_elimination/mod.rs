@@ -929,7 +929,7 @@ impl EnhancedDeadVariableElimination {
 ///
 /// ⭐ IN SCOPE AND NOT A `todo!`: it is a closed `isa<>` list over ops this island already spells.
 #[must_use]
-fn may_have_side_effects(op: &Op) -> bool {
+pub(crate) fn may_have_side_effects(op: &Op) -> bool {
     !matches!(
         op,
         Op::Sentient(
@@ -1056,10 +1056,18 @@ impl EnhancedDeadVariableElimination {
     }
 }
 
-// crustify:todo: e596_updateProgramUnit
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:451  (3 body lines, level 5)
-//   original  : void EnhancedDeadVariableEliminationPass::updateProgramUnit()
-//   calls     : e558_exploreBlock
+impl EnhancedDeadVariableElimination {
+    /// Replaces: e596_updateProgramUnit
+    ///
+    /// Deletes the dead variables the analysis found: explores the unit's own block, last op first
+    /// (`:451-453`).
+    ///
+    /// ⭐ `parent_dead` IS EMPTY BECAUSE A `dataflow.program_unit` BODY HAS NO TERMINATOR TO STRIP —
+    /// the reference's `getParentOp()` climb (`:378`) has nothing above this block to read.
+    pub(crate) fn update_program_unit(&self, unit_body: &mut Vec<Op>) {
+        self.explore_block(unit_body, &[]);
+    }
+}
 
 // crustify:todo: e622_runOn
 //   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:710  (36 body lines, level 6)
@@ -1576,5 +1584,16 @@ mod unit_tests {
         pass.explore_block(&mut block, &[]);
 
         assert_eq!(block, vec![nop()], "only the op with effects stands");
+    }
+
+    /// e596 — the unit's own block is what gets explored, so the whole unread chain in it goes.
+    #[test]
+    fn update_program_unit_explores_the_units_own_block() {
+        let pass = EnhancedDeadVariableElimination::default();
+        let mut unit_body = vec![constant(Val(0), 4), scalar_add(0, 0, 1), nop()];
+
+        pass.update_program_unit(&mut unit_body);
+
+        assert_eq!(unit_body, vec![nop()]);
     }
 }

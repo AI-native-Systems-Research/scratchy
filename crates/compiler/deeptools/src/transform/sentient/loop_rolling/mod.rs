@@ -97,11 +97,6 @@
 // ── STILL SCHEDULED IN THIS FILE (levels 1..8) — anchors, not dead comments. ⛔ Do not delete one
 // you did not port; on bridge 2 that silently lost 149 of 384 functions.
 
-// crustify:todo: e602_compareToNextWindow
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:321  (67 body lines, level 5)
-//   original  : bool compareToNextWindow(bool is_start_window, Window *cur_window, Window *next_window)
-//   calls     : e078_setEffectiveStart, e079_checkOpUsage, e252_size, e317_checkDeltasOfOperands, e565_collectDeltasOfOperands
-
 // crustify:todo: e628_matchAndRoll
 //   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:758  (104 body lines, level 6)
 //   original  : void matchAndRoll(std::vector<Window *>::iterator &next)
@@ -221,6 +216,15 @@ pub(crate) enum OperandDifference {
     Same,
     /// `return true`, delta written.
     Delta(Delta),
+}
+
+/// WHICH SIDE OF THE COMPARISON A WINDOW IS ON — the reference's `bool is_start_window`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowRole {
+    /// `is_start_window == true` — the matches are CREATED here and the deltas collected.
+    Start,
+    /// `is_start_window == false` — the deltas are CHECKED against the ones the start window filed.
+    Follower,
 }
 
 /// ONE WINDOW OF INSTRUCTIONS — the reference's `Window` (`LoopRolling.cpp:86`).
@@ -485,6 +489,29 @@ fn ops_are_equivalent(a: &Op, b: &Op, defs: Definitions<'_>) -> bool {
             (None, None) => {}
             (Some(_), None) | (None, Some(_)) => return false,
         }
+    }
+    for (region_a, region_b) in dialects::regions(a).into_iter().zip(dialects::regions(b)) {
+        if region_a.len() != region_b.len() {
+            return false;
+        }
+        for (inner_a, inner_b) in region_a.iter().zip(region_b.iter()) {
+            if !ops_are_equivalent(inner_a, inner_b, defs) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `oe_.operationsAreEquivalent(.., /*allow_different_operands*/ true)` — the same walk with the
+/// operand comparison switched off (`OperationEquivalence.cpp:232-315`).
+///
+/// ⛔ NOT AN ANCHORED UNIT, for the reason [`ops_are_equivalent`] is not.
+/// ⛔ THE FLAG IS TOP-LEVEL ONLY: `regionsAreEquivalent` is re-entered with `allow_different_operands`
+/// HARDCODED to `false` (`:317-325`), so a nested pair still has to read the same values.
+fn ops_are_equivalent_ignoring_operands(a: &Op, b: &Op, defs: Definitions<'_>) -> bool {
+    if skeleton(a) != skeleton(b) {
+        return false;
     }
     for (region_a, region_b) in dialects::regions(a).into_iter().zip(dialects::regions(b)) {
         if region_a.len() != region_b.len() {
@@ -1037,6 +1064,82 @@ impl LoopRollingManager {
                 }
                 OperandDifference::Incomputable => return false,
             }
+        }
+        true
+    }
+
+    /// Replaces: e602_compareToNextWindow
+    ///
+    /// Whether `next_window` repeats `cur_window`: the two are walked BACKWARDS in step from their
+    /// ends, and a start window files a match per pair while a follower re-checks the filed deltas
+    /// (`:321-386`).
+    ///
+    /// ⛔ THE OPERANDS ARE ALLOWED TO DIFFER AT THE TOP LEVEL AND ONLY THERE — see
+    /// [`ops_are_equivalent_ignoring_operands`]; comparing them is this function's own job.
+    /// ⛔ THE EFFECTIVE START IS THE LAST PAIR MATCHED (`:381-384`), which `++it_cur` recovers after
+    /// the third clause has already stepped past it — an empty walk therefore leaves it PAST the end.
+    /// ⭐ THE PAIRED RANGES ARE THE TYPE GUARD for `std::prev` off the front of the block, the same
+    /// way [`Self::update_end_ops_of_matched_ops`] bounds its own backwards step.
+    pub(crate) fn compare_to_next_window(
+        &mut self,
+        role: WindowRole,
+        cur_window: &mut Window,
+        next_window: &Window,
+        block: &[Op],
+        key_vals: &[Val],
+        defs: Definitions<'_>,
+    ) -> bool {
+        // `it_next != cur_window->getEnd()` (`:354-355`) — one pair per instruction between the ends.
+        let pairs = next_window.end.0.saturating_sub(cur_window.end.0);
+        // `++it_cur` on an untouched iterator (`:384`).
+        let mut effective_start = InstrPos(cur_window.end.0 + 1);
+        for (at, (cur, next)) in (0..=cur_window.end.0)
+            .rev()
+            .zip((0..=next_window.end.0).rev())
+            .take(pairs)
+            .enumerate()
+        {
+            let (cur_op, next_op) = (InstrPos(cur), InstrPos(next));
+            if !ops_are_equivalent_ignoring_operands(&block[cur], &block[next], defs) {
+                return false;
+            }
+            if !cur_window.check_op_usage(cur_op, block, next_window) {
+                return false;
+            }
+            effective_start = cur_op;
+            match role {
+                WindowRole::Start => {
+                    let mut matched_op = MatchedOp::of(cur_op);
+                    // `delete matched_op` on the refusal (`:388-391`) IS THE DROP: it is never filed.
+                    if !self.collect_deltas_of_operands(
+                        cur_window,
+                        cur_op,
+                        next_op,
+                        &mut matched_op,
+                        block,
+                        key_vals,
+                        defs,
+                    ) {
+                        return false;
+                    }
+                    self.matched_ops.push(matched_op);
+                }
+                // `*it_matched_op` — the reference walks the list alongside and does not check its
+                // end, for the reason [`Self::check_deltas_of_operands`] gives about `op_b`.
+                WindowRole::Follower => {
+                    let Some(matched_op) = self.matched_ops.get(at) else {
+                        return false;
+                    };
+                    if !self.check_deltas_of_operands(
+                        cur_window, cur_op, next_op, matched_op, block, key_vals, defs,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if role == WindowRole::Start {
+            cur_window.set_effective_start(effective_start, WindowSize(self.matched_ops.len()));
         }
         true
     }
@@ -1673,5 +1776,71 @@ mod unit_tests {
         assert_eq!(rolled.yield_at, 1);
         // The reader outside the window now reads the loop's result.
         assert_eq!(block, vec![add(Val(32), Val(32), Val(13))]);
+    }
+
+    /// A window of one op at `at`, indexed as the reference's walk would leave it.
+    fn window_at(at: InstrPos, block: &[Op]) -> Window {
+        let mut window = Window::opening(RollingCase::SingleInstrWindows, at);
+        window.insert_next_instr(at, block);
+        window
+    }
+
+    /// e602 — three windows of one `sentient.scalar_add` each: the start window files the stride it
+    /// found and moves its effective start onto the matched op, and the follower confirms the same
+    /// stride. ⛔ A THIRD CONSTANT AT A DIFFERENT STRIDE REFUSES THE FOLLOWER.
+    #[test]
+    fn e602_files_the_start_windows_deltas_then_rechecks_them() {
+        // `%3 = add %0, %9` / `%4 = add %1, %9` / `%5 = add %2, %9`, one per window.
+        let compare = |third: i64| {
+            let block = vec![
+                scalar_constant(Val(0), 4),
+                scalar_constant(Val(1), 10),
+                scalar_constant(Val(2), third),
+                add(Val(0), Val(9), Val(3)),
+                add(Val(1), Val(9), Val(4)),
+                add(Val(2), Val(9), Val(5)),
+            ];
+            let regions: [&[Op]; 1] = [&block];
+            let defs = Definitions::from_innermost(&regions);
+            let mut manager = LoopRollingManager::over(
+                RollingCase::SingleInstrWindows,
+                NewLoopCount(0),
+                WindowIndex(0),
+                WindowIndex(3),
+            );
+            let mut start = window_at(InstrPos(3), &block);
+            let mut second = window_at(InstrPos(4), &block);
+            let third_window = window_at(InstrPos(5), &block);
+
+            let matched = manager.compare_to_next_window(
+                WindowRole::Start,
+                &mut start,
+                &second,
+                &block,
+                &[],
+                defs,
+            );
+            let followed = manager.compare_to_next_window(
+                WindowRole::Follower,
+                &mut second,
+                &third_window,
+                &block,
+                &[],
+                defs,
+            );
+            let deltas = manager.matched_ops[0].operand_deltas.clone();
+            (matched, followed, deltas, start.effective_start, start.size)
+        };
+
+        let (matched, followed, deltas, effective_start, size) = compare(16);
+        assert!(matched && followed);
+        assert_eq!(deltas.get(&OperandIdx(0)), Some(&Delta(6)));
+        // ⭐ THE FOLLOWER LEAVES THE START WINDOW'S OWN EFFECTIVE START ALONE.
+        assert_eq!(effective_start, InstrPos(3));
+        assert_eq!(size, WindowSize(1));
+
+        let (matched, followed, ..) = compare(20);
+        assert!(matched);
+        assert!(!followed);
     }
 }

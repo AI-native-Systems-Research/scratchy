@@ -85,8 +85,9 @@
 //! | `e507_canAbsorbToTheRight` | 507 | 3 | 103 | `dcc/src/Transform/Sentient/LoopAbsorption.cpp:282` |
 //! | `e562_absorptionAnalysis` | 562 | 4 | 65 | `dcc/src/Transform/Sentient/LoopAbsorption.cpp:424` |
 
-// ⛔ NOTHING IN THIS MODULE HAS A CALLER UNTIL `e600_runLoopAbsorption` (level 5) LANDS, and CI runs
-// clippy with `-D warnings`. ⭐ REMOVE THIS WITH e600.
+// ⛔ NOTHING IN THIS MODULE IS REACHED FROM THE PIPELINE UNTIL `e640_runOnOperation` (level 7) LANDS,
+// and CI runs clippy with `-D warnings`. ⭐ REMOVE THIS WITH e640: e600 gives the manager its caller,
+// but that caller has none of its own until the pass is wired in.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;

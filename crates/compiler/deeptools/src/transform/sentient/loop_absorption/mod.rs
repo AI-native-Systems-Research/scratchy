@@ -78,13 +78,109 @@
 //! | `e625_runOn` | 625 | 6 | 13 | `dcc/src/Transform/Sentient/LoopAbsorption.cpp:544` |
 //! | `e640_runOnOperation` | 640 | 7 | 5 | `dcc/src/Transform/Sentient/LoopAbsorption.cpp:558` |
 
+// ⛔ `e600_runLoopAbsorption` BELOW HAS NO CALLER UNTIL `e625_runOn` (level 6) LANDS, and CI runs
+// clippy with `-D warnings`. ⭐ REMOVE THIS WITH e640, when the pipeline calls the pass.
+#![allow(dead_code)]
+
 pub(crate) mod loop_absorption_manager;
 
+use crate::islands::dataflow_ir::Values;
+use crate::islands::sentient::dialects::{self as dialects, Op, sentient};
+use crate::transform::sentient::ForRef;
+use crate::transform::sentient::loop_absorption::loop_absorption_manager::{
+    LoopAbsorptionManager, UnitSite,
+};
+use crate::transform::sentient::loop_tree::{LoopNodeId, LoopTree};
 
-// crustify:todo: e600_runLoopAbsorption
-//   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:495  (48 body lines, level 5)
-//   original  : void LoopAbsorptionPass::runLoopAbsorption(Operation *op)
-//   calls     : e562_absorptionAnalysis
+/// `for_op.getBody()->without_terminator().empty()` (`:517-518`) — `None` where this unit holds no such
+/// loop, which `getOpAs<sentient::ForOp>()` cannot ask because a node of the tree always does.
+fn loop_body_is_empty(for_op: ForRef, scope: &[Op]) -> Option<bool> {
+    for op in scope {
+        if let Op::Sentient(sentient::Op::For { iv, body, .. }) = op
+            && *iv == for_op.0
+        {
+            // `without_terminator()` DROPS THE CLOSING `sentient.yield` and nothing else.
+            return Some(
+                body.iter()
+                    .all(|op| matches!(op, Op::Sentient(sentient::Op::Yield { .. }))),
+            );
+        }
+        for region in dialects::regions_ref(op) {
+            if let Some(found) = loop_body_is_empty(for_op, region) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// `checkAndAbsorb(n)` (`:502-534`) and the pre-order recursion that drives it (`:541`), in one live
+/// walk: the action runs on `n`, and only then are `n`'s children re-read.
+fn check_and_absorb(
+    n: LoopNodeId,
+    tree: &mut LoopTree<true>,
+    preamble: &mut Vec<Op>,
+    unit_body: &mut Vec<Op>,
+    vals: &mut Values,
+) {
+    let mut sorted_worklist: Vec<LoopNodeId> = Vec::new();
+    let mut child = tree.first_child(n);
+    while let Some(c) = child {
+        if tree
+            .loop_of(c)
+            .and_then(|for_op| loop_body_is_empty(for_op, unit_body))
+            == Some(false)
+        {
+            sorted_worklist.push(c);
+        }
+        child = tree.next_sibling(c);
+    }
+    // `std::sort` by `getSubtreeHeightOf`, *"ties are broken by left-to-right order"* (`:503-505`,
+    // `:527-531`) — ⭐ WHICH IS WHAT A STABLE SORT OF A WALK-ORDER LIST IS.
+    sorted_worklist.sort_by_key(|c| tree.subtree_height_of(*c));
+    while !sorted_worklist.is_empty() {
+        if let Some(mut instance) = LoopAbsorptionManager::new(
+            &mut sorted_worklist,
+            tree,
+            UnitSite {
+                preamble,
+                body: unit_body,
+            },
+        ) {
+            instance.absorption_analysis(vals);
+        }
+        sorted_worklist.pop();
+    }
+    let mut child = tree.first_child(n);
+    while let Some(c) = child {
+        check_and_absorb(c, tree, preamble, unit_body, vals);
+        child = tree.next_sibling(c);
+    }
+}
+
+/// Replaces: e600_runLoopAbsorption
+///
+/// One program unit: every loop's non-empty children become absorption anchors, shortest subtree first,
+/// each absorbing its equivalent neighbours until it cannot (`:495-542`).
+///
+/// ⛔ THE WALK IS LIVE, NOT A PRECOMPUTED LIST: `OperationNode::preOrderWalk` re-reads
+/// `getFirstChild()`/`getNextSibling()` AFTER the action (`Analysis/OperationTree.cpp:135-142`), so an
+/// absorption that removes a sibling node removes it from the walk too — contrast
+/// [`LoopTree::walk_reverse_bfs`], whose list is fixed before the first action runs.
+/// ⛔ THE ANCHOR IS THE WORKLIST'S BACK AND IS POPPED AFTER, NOT BEFORE (`:523-528`): the manager
+/// reads its own siblings out of the list it is handed.
+pub(crate) fn run_loop_absorption(
+    preamble: &mut Vec<Op>,
+    unit_body: &mut Vec<Op>,
+    vals: &mut Values,
+) {
+    let mut tree: LoopTree<true> = LoopTree::of(unit_body);
+    if tree.empty() {
+        return;
+    }
+    let root = tree.root();
+    check_and_absorb(root, &mut tree, preamble, unit_body, vals);
+}
 
 // crustify:todo: e625_runOn
 //   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:544  (13 body lines, level 6)
@@ -96,3 +192,86 @@ pub(crate) mod loop_absorption_manager;
 //   original  : void LoopAbsorptionPass::runOnOperation()
 //   calls     : e625_runOn
 
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::Val;
+    use crate::islands::sentient::dialects::sentient::RegType;
+
+    /// `%r = sentient.scalar_constant {value} : index`.
+    fn constant(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `%r = sentient.scalar_add %lhs, %rhs : index`.
+    fn add(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            ty: ScalarTy::Index,
+            element_size: None,
+        })
+    }
+
+    /// e600 — e562's own case reached through the tree walk: the one top-level loop becomes the anchor,
+    /// absorbs the `sentient.scalar_add` on its right, and comes out with a trip count one higher.
+    #[test]
+    fn e600_makes_every_non_empty_loop_an_anchor_and_absorbs_into_it() {
+        let mut vals = Values::default();
+        let bound = vals.mint();
+        let (zero, other, iv, arg) = (vals.mint(), vals.mint(), vals.mint(), vals.mint());
+        let (result, inner, right) = (vals.mint(), vals.mint(), vals.mint());
+        let mut unit_body = vec![
+            constant(bound, 5),
+            constant(zero, 0),
+            constant(other, 3),
+            Op::Sentient(sentient::Op::For {
+                iv,
+                bound,
+                bound_reg: None,
+                carried: vec![sentient::Carried {
+                    init: zero,
+                    arg,
+                    result,
+                    reg: sentient::Reg {
+                        locale: RegType::Unknown,
+                        index: None,
+                    },
+                    program_header: false,
+                    element_size: None,
+                }],
+                dbg_name: None,
+                body: vec![
+                    add(arg, arg, inner),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![inner],
+                    }),
+                ],
+            }),
+            add(result, result, right),
+        ];
+        let mut preamble = Vec::new();
+
+        run_loop_absorption(&mut preamble, &mut unit_body, &mut vals);
+
+        // The absorbed `add` is gone, and so is the bound constant nothing reads any more.
+        assert_eq!(unit_body.len(), 3);
+        let Op::Sentient(sentient::Op::For { bound: new, .. }) = unit_body[2] else {
+            panic!("the anchor loop is the last op left: {unit_body:?}")
+        };
+        assert!(preamble.iter().any(|op| matches!(
+            op,
+            Op::Sentient(sentient::Op::ScalarConstant { value: 6, result, .. }) if *result == new
+        )));
+    }
+}

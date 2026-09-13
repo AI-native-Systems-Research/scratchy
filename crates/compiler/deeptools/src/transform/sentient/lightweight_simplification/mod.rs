@@ -81,9 +81,9 @@
 //! | `e623_runOnOperation` | 623 | 6 | 12 | `dcc/src/Transform/Sentient/LightweightSimplification.cpp:335` |
 
 #![allow(dead_code)]
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e623_runOnOperation` (level 6) and its callee
-// `e597_runLightWeightSimplifications` (level 5) are the units that call everything below, and
-// neither is in this batch. ⭐ REMOVE THIS WITH e623.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e597_runLightWeightSimplifications` (level 5, in
+// `sentient.rs`) is what calls everything below, and its own caller `e623_runOnOperation` (level 6)
+// is not in this batch. ⭐ REMOVE THIS WITH e623.
 
 use super::ForRef;
 use super::analyses::{ExpressionEvaluator, OffsetSites, ScalarOffset};

@@ -87,13 +87,15 @@
 pub(crate) mod local_region;
 pub(crate) mod uniform_region;
 
-use crate::arch::Arch;
+use crate::arch::{Arch, IsaGen};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{
     self as dialects, Definitions, Op, UniformRegions, Val, sentient, uniform,
 };
 use crate::transform::sentient::utils::{Hoisted, NewUse, move_to_common_dominator, path_of};
+use crate::units::DfirUnit;
 use local_region::{LocalRegion, OriginalRegion};
 use sentient::RegType;
 use sys_arch_spec::regfile::{Component, Presence, RegType as RegFile, depth_of};
@@ -663,10 +665,26 @@ pub fn run<A: Arch>(
     }
 }
 
-// crustify:todo: e599_runOn
-//   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:240  (11 body lines, level 5)
-//   original  : void LocalRegionSplittingForValueCommoningPass::runOn( dataflow::ProgramUnitOp unit)
-//   calls     : e561_run
+/// Replaces: e599_runOn
+///
+/// One program unit: an L3 load or store half splits its uniformized regions for the EBR file, and on
+/// a pre-SEN1P5 arch for the LBR file first (`:240-251`).
+///
+/// ⛔ THE TWO LOCALES ARE NOT SYMMETRIC (`:249-251`): `lbr` runs FIRST and ONLY below SEN1P5, which is
+/// what [`IsaGen`]'s `Ord` makes of `dcc_ext_ctx_.getArch() < IsaCoreGen::SEN1P5_ISA`.
+/// ⭐ `dyn_cast_or_null` + `DT_CHECK` + `getUnitType` + `is_any_of` ARE ONE MATCH HERE: the unit's
+/// kind IS its type in this island, and any other kind is the reference's own `return`.
+pub fn run_on<A: Arch>(unit: &mut ProgramUnit<A>, limits: PretendRegLimits, values: &mut Values) {
+    let comp = match unit.on.kind() {
+        DfirUnit::L3lu => Component::L3lu,
+        DfirUnit::L3su => Component::L3su,
+        _ => return,
+    };
+    if A::GEN < IsaGen::Sen1p5 {
+        run::<A>(&mut unit.body, RegType::Lbr, comp, limits, values);
+    }
+    run::<A>(&mut unit.body, RegType::Ebr, comp, limits, values);
+}
 
 // crustify:todo: e624_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:233  (6 body lines, level 6)
@@ -677,6 +695,7 @@ pub fn run<A: Arch>(
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::sentient::dialects::LocalRegion as IrLocalRegion;
     use crate::islands::sentient::dialects::sentient::Reg;
 
@@ -1000,5 +1019,56 @@ mod unit_tests {
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].units, vec![Val(1)]);
         assert_eq!(regions[1].units, vec![Val(2)]);
+    }
+
+    /// e599 — an L3 half is split; ⛔ ANY OTHER UNIT IS LEFT EXACTLY AS IT WAS, which is the
+    /// `is_any_of(comp, L3LU, L3SU)` gate and not an optimisation.
+    #[test]
+    fn e599_splits_an_l3_half_and_leaves_every_other_unit_alone() {
+        let limits = PretendRegLimits {
+            max_lbr: None,
+            max_ebr: Some(MaxRegNum(1)),
+        };
+        let unit_of = |kind: DfirUnit| ProgramUnit::<Dd2> {
+            on: Units::one(kind, Val(1)),
+            precision: None,
+            body: vec![
+                Op::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(100),
+                    pairs: vec![(Val(1), Val(11)), (Val(2), Val(12))],
+                }),
+                Op::Uniform(uniform::Op::QueryMap {
+                    result: Val(101),
+                    map: Val(100),
+                    key: Val(1),
+                }),
+                Op::UniformRegions(UniformRegions::UniformizeRegions {
+                    regions: vec![IrLocalRegion {
+                        arg: Val(50),
+                        units: vec![Val(1), Val(2)],
+                        body: vec![scalar_copy(Val(101), Val(200), RegType::Ebr)],
+                    }],
+                    results: Vec::new(),
+                    yielded: Vec::new(),
+                }),
+            ],
+            arch: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+        for _ in 0..30 {
+            values.mint();
+        }
+
+        let mut l3 = unit_of(DfirUnit::L3lu);
+        run_on(&mut l3, limits, &mut values);
+        let Op::UniformRegions(new_op) = &l3.body[2] else {
+            panic!("the rebuilt uniform.uniformize_regions is still the last op")
+        };
+        assert_eq!(new_op.regions().len(), 2);
+
+        let mut lxlu = unit_of(DfirUnit::Lxlu);
+        let before = lxlu.body.clone();
+        run_on(&mut lxlu, limits, &mut values);
+        assert_eq!(lxlu.body, before);
     }
 }

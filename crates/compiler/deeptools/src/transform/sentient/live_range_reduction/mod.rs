@@ -103,17 +103,23 @@
 use core::fmt::Write as _;
 use std::collections::BTreeMap;
 
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects as lower;
+use crate::islands::dataflow_ir::ty::{GenericComp, ScalarTy};
 use crate::islands::dataflow_ir::{ValueMapping, Values};
-use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects;
 use crate::islands::sentient::dialects::{
-    Definitions, LocalRegion, Op, UniformRegions, Val, YieldedReg, element_size, sentient, symbol,
-    uniform, value_reg_locale,
+    Definitions, LocalRegion, Op, UniformRegions, Val, YieldedReg, element_size,
+    erase_defining_op, sentient, symbol, uniform, value_reg_locale,
 };
-use crate::islands::sentient::print;
-use crate::transform::sentient::analyses::{OutOfScopeUnitIndexMap, UnitIndex, UnitIndexMap};
+use crate::islands::sentient::{Program, print};
+use crate::model::Model;
+use crate::transform::sentient::analyses::{
+    InstructionEstimator, OutOfScopeInstructionEstimator, OutOfScopeUnitIndexMap, UnitIndex,
+    UnitIndexMap,
+};
 use crate::transform::sentient::utils::{self, OpAt};
+use crate::workload::Workload;
 
 /// `affine::FlatAffineValueConstraints` — THE LOCAL-VARIABLE CONSTRAINT SYSTEM OF ONE FLATTENED
 /// AFFINE EXPRESSION, opaque here.
@@ -527,6 +533,18 @@ pub trait PropagationAnalysis {
 
     /// `expr_prop.getUnitIndexMap()` (`:830`).
     fn unit_index_map(&self) -> Self::Units;
+
+    /// `isPropagationSuccessful()` (`Analyses/PropagationAnalysis.h`), read once by e598.
+    ///
+    /// ⛔ DEFAULTED TO A `todo!` AND NOT TO `true`: the analysis that decides it is out of campaign
+    /// scope, and answering "yes" for it would reduce live ranges against expressions nothing
+    /// propagated — a fabricated analysis result.
+    fn is_propagation_successful(&self) -> bool {
+        todo!(
+            "PropagationAnalysis::isPropagationSuccessful \
+             (dcc/src/Transform/Sentient/Analyses/PropagationAnalysis.h) — out of campaign scope"
+        )
+    }
 }
 
 /// THE ANALYSIS THIS CAMPAIGN DOES NOT PORT — every method `todo!`s, naming it.
@@ -2141,19 +2159,109 @@ impl SsaMap {
     }
 }
 
-// crustify:todo: e598_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:1267  (45 body lines, level 5)
-//   original  : void LiveRangeReductionPass::runOnOperation()
-//   calls     : e304_printSsaMap, e503_mapAllValues, e504_optimizeUniformRegionYieldedValues, e560_reduceLiveRange
+/// `-dcc-live-range-reduction-disable`, `cl::init(false)` (`:103-105`) — a `dcc-opt` flag, not a
+/// program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `opts_.OptLevel == 0` (`:1292`) — the PIPELINE's optimisation level, `2` by default
+/// (`dcc/tools/Options/dcc-pass-option.h:63-65`), so the shipped pipeline never asks the estimator.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// `module_op->emitError("Unable to perform expression propagation"); signalPassFailure();`
+/// (`:1279-1281`) AS DATA.
+///
+/// ⛔⛔ AND THE PASS CARRIES ON: there is no `return` under those two statements, so the walk below
+/// runs on expressions the analysis itself disowned. A `Result` here would invent an early exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropagationFailure;
+
+/// Replaces: e598_runOnOperation
+///
+/// The pass entry: every one-region `uniform.uniformize_regions` grows the register values its region
+/// drops, then each program unit's values are mapped and their live ranges reduced, and the ops the
+/// reductions orphaned are erased once at the end (`:1267-1310`).
+///
+/// ⛔ THE FOUR `clear()`s (`:1296-1299`) ARE A FRESH [`SsaMap`] PER UNIT — the map is per-unit state
+/// the reference keeps in the pass, and carrying one unit's classes into the next would merge
+/// registers across units. ⛔ THE ERASE QUEUE IS DRAINED ONCE FOR THE WHOLE MODULE (`:1306-1308`).
+/// ⛔ `unit_keys` IS A PARAMETER: [`ProgramUnit`] does not carry its region argument, the same seam
+/// [`ParentRegionQuery`] already is.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload, P: PropagationAnalysis>(
+    program: &mut Program<A, M, W>,
+    analysis: &mut P,
+    unit_keys: &[Val],
+    vals: &mut Values,
+) -> (Option<PropagationFailure>, Vec<ReconstructionFailure>) {
+    if DISABLE_THIS_PASS {
+        return (None, Vec::new());
+    }
+    // ⛔ DIVERGENCE: `optimizeUniformRegionYieldedValues(module_op)` walks the WHOLE module, and this
+    // walks each program unit's body — which is where e504's `getQueryKeyAndUnitsFromParentRegion`
+    // has a program unit to read a key and a unit list out of (`Sentient/Utils.cpp:44-54`).
+    for (unit, key) in program.units.iter_mut().zip(unit_keys.iter()) {
+        let parent = ParentRegionQuery {
+            key: *key,
+            units: unit.on.vals(),
+        };
+        optimize_uniform_region_yielded_values(&mut unit.body, &parent, &[], vals);
+    }
+    let propagation = if analysis.is_propagation_successful() {
+        None
+    } else {
+        Some(PropagationFailure)
+    };
+
+    let mut failures = Vec::new();
+    let mut to_be_erased: Vec<Val> = Vec::new();
+    for (unit, key) in program.units.iter_mut().zip(unit_keys.iter()) {
+        // `std::set<SenComponents> list = {PT, PE, SFP}; skip_elem_size_ = list.count(type) > 0`
+        // (`:1286-1290`) — ⭐ `getUnitType` IS THE GENERIC COMPONENT, so one PT row names them all.
+        let check = match unit.on.kind().generic() {
+            GenericComp::Pt | GenericComp::Pe | GenericComp::Sfp => ElementSizeCheck::Skipped,
+            _ => ElementSizeCheck::Required,
+        };
+        // `getChildAnalysis<InstructionEstimator>(unit_op)` IS CONSTRUCTED PER UNIT (`:1291-1292`).
+        let mut instruction_estimator = OutOfScopeInstructionEstimator;
+        if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        let parent = ParentRegionQuery {
+            key: *key,
+            units: unit.on.vals(),
+        };
+        let mut map = SsaMap::default();
+        let index_map = map.map_all_values(analysis, &unit.body);
+        failures.extend(map.reduce_live_range(
+            check,
+            &mut unit.body,
+            &parent,
+            &index_map,
+            vals,
+            &mut to_be_erased,
+        ));
+    }
+    // `for (auto op : op_to_be_erased_) op->erase();` — ⭐ EVERY [`Val`] IS UNIQUE ACROSS THE MODULE,
+    // so the unit a queued value came from is the only one an erase can find it in.
+    for val in to_be_erased {
+        for unit in program.units.iter_mut() {
+            erase_defining_op(&mut unit.body, val);
+        }
+    }
+    (propagation, failures)
+}
 
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::arch::Elements;
+    use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
+    use crate::units::DfirUnit;
     use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType};
 
     /// A `sentient.load_and_extract_scalar` reading `addr`, `size` bits at a time, into `locale`.
@@ -3165,5 +3273,151 @@ mod unit_tests {
             regions[0].body.last(),
             Some(Op::Uniform(uniform::Op::Yield { operands })) if *operands == vec![handed_out]
         ));
+    }
+
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// A `PropagationAnalysis` THAT FAILED, and whose every expression is irresolvable — so nothing is
+    /// classified and e598's reduction has nothing to move.
+    struct Failed;
+
+    impl PropagationAnalysis for Failed {
+        type Units = OutOfScopeUnitIndexMap;
+
+        fn affine_expression(&mut self, _val: Val) -> ExprInfoMap {
+            ExprInfoMap {
+                exprs: vec![Some(PropagatedExpr {
+                    propagated_map: PropagatedMap { id: 0, num_dims: 1 },
+                    propagated_args: Vec::new(),
+                    cannot_be_resolved: true,
+                })],
+                buckets: vec![0],
+            }
+        }
+
+        fn flattened_affine_expr(&self, _map: PropagatedMap) -> FlattenedExpr {
+            todo!("unreachable: every expression this double answers is irresolvable")
+        }
+
+        fn unit_index_map(&self) -> Self::Units {
+            OutOfScopeUnitIndexMap
+        }
+
+        fn is_propagation_successful(&self) -> bool {
+            false
+        }
+    }
+
+    /// e598 — the pass entry over a two-unit program: BOTH units' one-region
+    /// `uniform.uniformize_regions` hands its unread `lrf` value out, and ⛔ THE FAILED PROPAGATION IS
+    /// REPORTED WITHOUT STOPPING THE WALK, which is what the reference's missing `return` means.
+    #[test]
+    fn e598_walks_every_unit_and_reports_the_failed_propagation_as_data() {
+        let mut vals = Values::default();
+        let unit_a = vals.mint();
+        let unit_b = vals.mint();
+        let key = vals.mint();
+        let unit_body = |vals: &mut Values| {
+            let (const_a, const_b, offset) = (vals.mint(), vals.mint(), vals.mint());
+            let (mapping, query, sum, r0_arg) =
+                (vals.mint(), vals.mint(), vals.mint(), vals.mint());
+            vec![
+                get_unit(unit_a),
+                get_unit(unit_b),
+                Op::UniformRegions(UniformRegions::UniformizeRegions {
+                    regions: vec![LocalRegion {
+                        arg: r0_arg,
+                        units: vec![unit_a],
+                        body: vec![
+                            constant(const_a),
+                            constant(const_b),
+                            constant(offset),
+                            Op::Uniform(uniform::Op::DefImmutableMapping {
+                                result: mapping,
+                                pairs: vec![(unit_a, const_a), (unit_b, const_b)],
+                            }),
+                            Op::Uniform(uniform::Op::QueryMap {
+                                result: query,
+                                map: mapping,
+                                key: r0_arg,
+                            }),
+                            Op::Sentient(sentient::Op::ScalarAdd {
+                                lhs: query,
+                                rhs: offset,
+                                result: sum,
+                                reg: Some(Reg {
+                                    locale: RegType::Lrf,
+                                    index: None,
+                                }),
+                                ty: ScalarTy::Index,
+                                element_size: Some(Bits(16)),
+                            }),
+                            Op::Uniform(uniform::Op::Yield {
+                                operands: Vec::new(),
+                            }),
+                        ],
+                    }],
+                    results: Vec::new(),
+                    yielded: Vec::new(),
+                }),
+            ]
+        };
+        let unit_of = |body: Vec<Op>| ProgramUnit {
+            on: Units::of(
+                DfirUnit::Lxlu,
+                &[(DfirUnit::Lxlu, unit_a), (DfirUnit::Lxlu, unit_b)],
+            )
+            .expect("two units of one kind"),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        let first = unit_of(unit_body(&mut vals));
+        let second = unit_of(unit_body(&mut vals));
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(first, vec![second]),
+            bound: core::marker::PhantomData,
+        };
+
+        let (propagation, failures) =
+            run_on_operation(&mut program, &mut Failed, &[key, key], &mut vals);
+
+        assert_eq!(propagation, Some(PropagationFailure));
+        assert!(failures.is_empty());
+        for unit in program.units.iter() {
+            let Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions, results, ..
+            }) = &unit.body[2]
+            else {
+                panic!("the op keeps its slot in every unit")
+            };
+            assert_eq!(results.len(), 1);
+            assert_eq!(regions.len(), 2);
+            assert_eq!(regions[1].units, vec![unit_b]);
+        }
     }
 }

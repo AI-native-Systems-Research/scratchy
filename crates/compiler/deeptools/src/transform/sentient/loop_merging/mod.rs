@@ -84,21 +84,26 @@
 
 use std::collections::BTreeMap;
 
+use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
     BlockArgEquivalence, DbgNamePrefix, EquivalenceTag, OperationEquivalence, SubregionCompare,
     new_dbg_name_from_list,
 };
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::{
     Definitions, Op, Val, dataflow, erase_defining_op, regions_mut, regions_ref,
     replace_all_uses_with, sentient, symbol, uniform, use_count,
 };
+use crate::model::Model;
 use crate::transform::sentient::ForRef;
+use crate::transform::sentient::analyses::{InstructionEstimator, OutOfScopeInstructionEstimator};
 use crate::transform::sentient::loop_coalescing::TripLimit;
 use crate::transform::sentient::loop_tree::LoopTree;
 use crate::transform::sentient::regions_are_equivalent;
 use crate::transform::sentient::utils::{ConstKind, ConstantImm, constant_imm, is_constant};
+use crate::workload::Workload;
 
 /// `oe_` (`LoopMerging.cpp:58-61`) — this pass's one comparison configuration.
 ///
@@ -638,10 +643,32 @@ pub fn run_loop_merging(unit_body: &mut Vec<Op>, values: &mut Values) -> LoopsMe
     merged
 }
 
-// crustify:todo: e601_runOn
-//   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:321  (13 body lines, level 5)
-//   original  : void LoopMergingPass::runOn(ModuleOp module_op)
-//   calls     : e564_runLoopMerging
+/// `opts_.OptLevel == 0` (`:326`) — the PIPELINE's optimisation level, which is `2` by default
+/// (`dcc/tools/Options/dcc-pass-option.h:63-65`), so the shipped pipeline never reaches the
+/// `haveIbuffSpace` half of the `&&`.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// Replaces: e601_runOn
+///
+/// The module walk: merges the adjacent equivalent loops of every program unit whose instruction
+/// buffer is not already roomy (`:321-333`).
+///
+/// ⛔ `haveIbuffSpace` STAYS A `todo!` BEHIND [`OPT_LEVEL_ZERO`]: the pipeline fixes that const's
+/// value, not this pass, so flipping it reaches the estimator rather than quietly skipping a unit.
+/// ⭐ `unit_list` COLLAPSES — [`crate::islands::sentient::ProgramUnits::iter_mut`] hands out one unit
+/// at a time in walk order and merging one reaches no other, so collect-then-merge is one pass.
+pub fn run_on<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>, values: &mut Values) {
+    for unit in program.units.iter_mut() {
+        // `getChildAnalysis<InstructionEstimator>(unit)` IS CONSTRUCTED PER UNIT (`:324-325`), even
+        // for one the `&&` never asks anything of.
+        let mut instruction_estimator = OutOfScopeInstructionEstimator;
+        if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        // `runLoopMerging` answers with a count nothing above it reads (`:332`).
+        let _ = run_loop_merging(&mut unit.body, values);
+    }
+}
 
 // crustify:todo: e627_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:335  (5 body lines, level 6)
@@ -651,9 +678,33 @@ pub fn run_loop_merging(unit_body: &mut Vec<Op>, values: &mut Values) -> LoopsMe
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::Val;
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
     use crate::units::{DfirUnit, Residency};
+
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     /// `sentient.for` carrying `dbg_name`.
     fn sentient_for(dbg_name: Option<&str>) -> Op {
@@ -871,4 +922,49 @@ mod unit_tests {
         // the other's trip count, and no cross-block pair merged.
         assert_eq!((value_of(top), value_of(nested)), (3, 12));
     }
+
+    /// e601 — the pass entry reaches every unit of the module: both units' adjacent pairs merge.
+    #[test]
+    fn e601_merges_the_loops_of_every_program_unit() {
+        let mut values = Values::default();
+        for _ in 0..40 {
+            let _ = values.mint();
+        }
+        let body = || {
+            vec![
+                constant_of(Val(0), 4),
+                constant_of(Val(1), 6),
+                loop_over(Val(0), Val(10), None),
+                loop_over(Val(1), Val(11), None),
+            ]
+        };
+        let unit = |body: Vec<Op>| ProgramUnit {
+            on: Units::one(DfirUnit::Lxlu, Val(99)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(body()), vec![unit(body())]),
+            bound: core::marker::PhantomData,
+        };
+
+        run_on(&mut program, &mut values);
+
+        for unit in program.units.iter() {
+            let loops = unit
+                .body
+                .iter()
+                .filter(|op| matches!(op, Op::Sentient(sentient::Op::For { .. })))
+                .count();
+            assert_eq!(loops, 1, "each unit's pair merged: {:?}", unit.body);
+        }
+    }
 }
+

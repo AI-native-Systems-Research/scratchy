@@ -604,10 +604,60 @@ fn block_at_mut<'b>(
     block_at_mut(inner, rest)
 }
 
-// crustify:todo: e595_deuniform
-//   authority : dcc/src/Transform/Sentient/Deuniform.cpp:448  (30 body lines, level 5)
-//   original  : std::vector<mlir::dataflow::ProgramUnitOp> DeuniformPass::deuniform( mlir::dataflow::ProgramUnitOp prog_unit, std::vector<std::vector<mlir::dataflow::GetUnitOp>> &set_of_unit_collection)
-//   calls     : e252_size, e556_deuniform
+/// `prog_unit.emitError("duplication in list of unit collections")` + `signalPassFailure()`
+/// (`:459-461`) AS DATA: the pass fails there, so its empty answer is not an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateInUnitCollections {
+    /// The unit two of the collections both claim.
+    pub unit: Val,
+}
+
+/// Replaces: e595_deuniform
+///
+/// The program unit split up: one rebuilt unit per collection of units, plus a last one for the units
+/// no collection claimed (`:448-478`).
+///
+/// ⛔ THE COLLECTION LIST IS AN IN-OUT PARAMETER (`:473-474`): the leftover set is APPENDED to it, and
+/// e621 goes on to read the list back.
+/// ⛔ THE DUPLICATE IS REPORTED, NOT REFUSED: the reference returns an EMPTY list after signalling
+/// failure, which a caller cannot tell from "nothing to split" unless the reason comes with it.
+#[must_use]
+pub fn deuniform_collections<A: Arch>(
+    prog_unit: &ProgramUnit<A>,
+    prog_unit_arg: Val,
+    set_of_unit_collection: &mut Vec<Vec<Val>>,
+    enclosing: &[&[Op]],
+    values: &mut Values,
+) -> (Vec<(ProgramUnit<A>, Val)>, Option<DuplicateInUnitCollections>) {
+    let mut units_in_collection: Vec<Val> = Vec::new();
+    for unit_ops in set_of_unit_collection.iter() {
+        for unit_op in unit_ops {
+            if units_in_collection.contains(unit_op) {
+                return (
+                    Vec::new(),
+                    Some(DuplicateInUnitCollections { unit: *unit_op }),
+                );
+            }
+            units_in_collection.push(*unit_op);
+        }
+    }
+    // `prog_unit.getUnits()` less what the collections already claim (`:465-472`) — `DT_CHECK(unit_op)`
+    // is [`Units`] itself, which cannot hold a unit no `dataflow.get_unit` binds.
+    let rest_of_units: Vec<Val> = prog_unit
+        .on
+        .vals()
+        .into_iter()
+        .filter(|unit| !units_in_collection.contains(unit))
+        .collect();
+    if !rest_of_units.is_empty() {
+        set_of_unit_collection.push(rest_of_units);
+    }
+    let deuniformed = set_of_unit_collection
+        .iter()
+        .map(|units| deuniform(prog_unit, prog_unit_arg, units, enclosing, values))
+        .collect();
+    (deuniformed, None)
+}
 
 // crustify:todo: e621_runOnOperation
 //   authority : dcc/src/Transform/Sentient/Deuniform.cpp:482  (42 body lines, level 6)
@@ -1034,5 +1084,69 @@ mod unit_tests {
         let readers = copies(&new_unit.body);
         assert_eq!(readers.len(), 1);
         assert_eq!(readers[0].1, query.0);
+    }
+
+    /// A three-unit program unit and one collection naming one of them.
+    fn three_units() -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::of(
+                DfirUnit::Lxlu,
+                &[
+                    (DfirUnit::Lxlu, Val(1)),
+                    (DfirUnit::Lxlu, Val(2)),
+                    (DfirUnit::Lxlu, Val(3)),
+                ],
+            )
+            .expect("three units of one kind"),
+            precision: None,
+            body: vec![copy(12, 9)],
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e595 — the collection gets its own unit and the two units nobody claimed get one more, and the
+    /// leftover set is left behind in the caller's list.
+    #[test]
+    fn e595_splits_the_unit_once_per_collection_plus_the_rest() {
+        let func_body = vec![get_unit(1), get_unit(2), get_unit(3)];
+        let mut collections = vec![vec![Val(2)]];
+        let mut values = Values::default();
+        while values.issued() <= 22 {
+            values.mint();
+        }
+
+        let (new_units, duplicate) = deuniform_collections(
+            &three_units(),
+            Val(9),
+            &mut collections,
+            &[&func_body],
+            &mut values,
+        );
+
+        assert_eq!(duplicate, None);
+        assert_eq!(collections, vec![vec![Val(2)], vec![Val(1), Val(3)]]);
+        let ran: Vec<Vec<Val>> = new_units.iter().map(|(unit, _)| unit.on.vals()).collect();
+        assert_eq!(ran, vec![vec![Val(2)], vec![Val(1), Val(3)]]);
+    }
+
+    /// e595 — a unit two collections both claim is reported and nothing is built, because the
+    /// reference signals pass failure and returns an empty list there.
+    #[test]
+    fn e595_reports_a_unit_two_collections_both_claim() {
+        let mut collections = vec![vec![Val(1), Val(2)], vec![Val(2)]];
+        let mut values = Values::default();
+
+        let (new_units, duplicate) = deuniform_collections(
+            &three_units(),
+            Val(9),
+            &mut collections,
+            &[&[]],
+            &mut values,
+        );
+
+        assert!(new_units.is_empty());
+        assert_eq!(duplicate, Some(DuplicateInUnitCollections { unit: Val(2) }));
+        // ⛔ THE LIST IS NOT TOUCHED on the failure path — the leftover append is below the `return`.
+        assert_eq!(collections, vec![vec![Val(1), Val(2)], vec![Val(2)]]);
     }
 }
