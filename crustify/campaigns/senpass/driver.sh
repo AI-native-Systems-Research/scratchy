@@ -126,9 +126,23 @@ stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
   # so a restart re-reviewed all 256 of sc1 — already reviewed and gated green hours earlier — and
   # the driver's own comment records the same thing happening to 142 units before. So each stage
   # writes a marker on success and skips if one is present. Delete a marker to force a re-run.
+  # ⛔⛔ A MARKER SAYS THE STAGE RAN, NOT THAT THE LEVEL IS COMPLETE — AND THE REMAINDER OVERRULES IT.
+  # senpass's sc2-port exited 0 on 2026-09-09 while 43 of its units sat unpromoted on AGENT branches
+  # that had run ahead of their session branch. The stage was therefore marked done, its remainder
+  # still listed 49 units, and every later run SKIPPED it — so the campaign would have reported DONE
+  # with 49 units never ported. Completeness is the remainder's answer, never a marker's.
   if [ -f "$CAMPDIR/.done-$3" ]; then
-    say "STAGE $3 SKIPPED (already completed: .done-$3 present)"
-    return 0
+    left=0
+    if [ "$2" = "port" ]; then
+      rj="$CAMPDIR/${1%/port.json}/port-remainder.json"
+      [ -f "$rj" ] && left=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['summary']['unit_count'])" "$rj" 2>/dev/null || echo 0)
+    fi
+    if [ "${left:-0}" = "0" ]; then
+      say "STAGE $3 SKIPPED (already completed: .done-$3 present, remainder empty)"
+      return 0
+    fi
+    say "⛔ STAGE $3 IS MARKED DONE BUT ITS REMAINDER STILL HOLDS $left UNIT(S) — the marker recorded that the stage RAN, not that the level is complete. RE-RUNNING it."
+    rm -f "$CAMPDIR/.done-$3"
   fi
   # ⛔⛔ A PORT STAGE MUST RUN THE REMAINDER, NOT THE ORIGINAL SCHEDULE. `gen_campaign.py
   # --remainder` writes `port-remainder.json`; the stage list names `port.json`, which still holds
@@ -162,6 +176,16 @@ stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
     rc=$?
     say "STAGE $3 attempt $attempt exit=$rc"
     [ $rc -eq 0 ] && break
+    # ⛔⛔ AN AUTH FAILURE IS NOT A TRANSIENT — CHECK IT BEFORE THE RETRY PREDICATE. A revoked or
+    # expired key returns `401 Authentication Error` and the agent still exits 1 for TranslateAgent,
+    # so it matched the transient predicate below and burned all three attempts at ~200s per batch.
+    # That is exactly how BOTH campaigns died on 2026-09-09: 22 of 22 batches on one and 14 on the
+    # other, every one a 401, then the dead-stage guard stopped the run. Retrying cannot fix a key.
+    if grep -q "401 Authentication Error\|Invalid proxy server token\|Failed to authenticate" \
+         "$LOGDIR/driver-$3.log"; then
+      say "⛔ STAGE $3 FAILED TO AUTHENTICATE (401) — the API key is dead, not the network. Fix the key and re-run; NOT retrying."
+      break
+    fi
     # ⭐ RETRY ONLY API FAILURES. Every batch lost so far died with `API Error: Can't reach the API
     # server (ENOTFOUND)` after 120-180 turns. Anything else fails fast: a config or gate failure
     # will fail identically three times and only burn an hour.
