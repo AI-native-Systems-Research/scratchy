@@ -162,11 +162,15 @@ use sys_arch_spec::arch_enums::SenComponent;
 
 use super::fold::{AllocId, AllocLayout, Allocations, DataOrigin, NodeId, PadType, StoredStream};
 use super::metadata::{DatastageId, DdcMemory, MetaDimKind, Metadata};
+use super::transformation::LoopId;
+use super::v1::CoreClSet;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
-use crate::generated::DataConnect;
+use crate::generated::{DataConnect, Strategy};
 use crate::schedule::dsc2::{
-    ComputeNode, DataInfo, Dsc, LdsIdx, NodeName, OperandPos, TransferNode, TransferSide,
+    ComputeNode, DataInfo, Dsc, LdsIdx, NodeName, Operand, OperandPos, TransferNode, TransferSide,
 };
+use crate::schedule::l3::dsc::SymbolicDimInfo;
+use crate::units::{Core, Corelet};
 
 // ⭐ TYPES FOR ENTRIES 110-117. Union this section with this file's other vocabulary when its other
 // entries land; each declaration is one C++ one narrowed to what the ported entries read and write.
@@ -515,6 +519,8 @@ pub struct LoopNode {
 pub struct LoopCond {
     /// `loopComp_`.
     pub loop_node: NodeId,
+    /// `dim_`, which is what entry 247 re-points the term by.
+    pub dim: PrimaryDim,
 }
 
 /// A CONDITION NODE'S LOOP CONDITION — `LoopCondComposite::twoLevelOrOfAnds_` (`dsc/dsc2.h:676`),
@@ -524,6 +530,8 @@ pub struct LoopCondComposite {
     /// `twoLevelOrOfAnds_`, EMPTY exactly when the node carries the core/corelet condition instead
     /// — that is the whole of `hasCoreClCond()` (`dsc/dsc2.h:693-695`).
     pub or_of_ands: Vec<Vec<LoopCond>>,
+    /// `negated_` (`dsc/dsc2.h:677`), which entry 249 flips when it reproduces an `else` branch.
+    pub negated: bool,
 }
 
 /// A SCHEDULE NODE AS ENTRIES 115 AND 117 SEE ONE — the kinds either looks inside, and
@@ -859,62 +867,6 @@ pub fn get_node_description(node: UtilNode<'_>) -> String {
 //   original  : void Ddc::updateNodesWithNewLds(int newLdsIdx, int oldLdsIdx, dsc2::ScheduleNode *startNode)
 //   extract   : crustify-ddc/cpp/ddc.cpp:1877-1935
 
-// crustify:todo: e247_splitLoopBandOnDim
-//   authority : ddc/ddc_transformation_util.cpp:159  (123 body lines, level 1)
-//   class     : Ddc
-//   original  : dsc2::LoopNode *Ddc::splitLoopBandOnDim( dsc2::LoopNode *baseLoop, const std::vector<std::vector<PrimaryDimAndKind>> &inputSplitDimSetsOuterToInner, bool unspecifiedDimsInnermost)
-//   extract   : crustify-ddc/cpp/ddc.cpp:5086-5213
-//   calls     : e114_constructLoopNode
-
-// crustify:todo: e248_splitLoopBandOnDatastage
-//   authority : ddc/ddc_transformation_util.cpp:287  (30 body lines, level 1)
-//   class     : Ddc
-//   original  : dsc2::LoopNode *Ddc::splitLoopBandOnDatastage(dsc2::LoopNode *baseLoop)
-//   extract   : crustify-ddc/cpp/ddc.cpp:5223-5253
-//   calls     : e112_constructDatastage, e113_constructDatastage, e114_constructLoopNode
-
-// crustify:todo: e249_moveTransferNode
-//   authority : ddc/ddc_transformation_util.cpp:335  (372 body lines, level 1)
-//   class     : Ddc
-//   original  : void Ddc::moveTransferNode(dsc2::TransferNode *transferNode, dsc2::LoopNode *newParentLoop)
-//   extract   : crustify-ddc/cpp/ddc.cpp:5263-5636
-//   calls     : e104_clear
-
-// crustify:todo: e250_convertResultFromFIFOtoReg
-//   authority : ddc/ddc_transformation_util.cpp:760  (148 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::convertResultFromFIFOtoReg(dsc2::TransferNode *transferNode)
-//   extract   : crustify-ddc/cpp/ddc.cpp:5646-5794
-//   calls     : e110_constructAllocation, e116_getPaddingPerDim
-
-// crustify:todo: e251_unrollTransfer
-//   authority : ddc/ddc_transformation_util.cpp:1120  (72 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::unrollTransfer(dsc2::TransferNode *transferNode)
-//   extract   : crustify-ddc/cpp/ddc.cpp:5804-5876
-//   calls     : e104_clear, e112_constructDatastage, e113_constructDatastage, e114_constructLoopNode
-
-// crustify:todo: e252_unrollTransferForSymbolicDims
-//   authority : ddc/ddc_transformation_util.cpp:1193  (110 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::unrollTransferForSymbolicDims( dsc2::TransferNode *transferNode, const std::map<PrimaryDimTypes, SymbolicDimInfo> &symbolicDims)
-//   extract   : crustify-ddc/cpp/ddc.cpp:5886-5998
-//   calls     : e112_constructDatastage, e113_constructDatastage, e114_constructLoopNode
-
-// crustify:todo: e253_srcRelatedToExternalNodes
-//   authority : ddc/ddc_transformation_util.cpp:1687  (4 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::srcRelatedToExternalNodes( const dsc2::TransferNode *transferNode) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:6008-6013
-//   calls     : e120_storageOrDatastreamIsExternal
-
-// crustify:todo: e254_destRelatedToExternalNodes
-//   authority : ddc/ddc_transformation_util.cpp:1693  (5 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::destRelatedToExternalNodes(const dsc2::TransferNode *transferNode, int dstIndex) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:6023-6029
-//   calls     : e120_storageOrDatastreamIsExternal
-
 // crustify:todo: e304_cloneForPeSfpWorkSplit
 //   authority : ddc/ddc_transformation_util.cpp:1538  (113 body lines, level 2)
 //   class     : Ddc
@@ -1206,6 +1158,1183 @@ pub fn add_new_lds<D: NewLabeledDs + ?Sized>(
     }
 
     new_recorded
+}
+
+// ⭐ USES FOR ENTRIES 247-254: `Strategy`, `Operand`, `Core`/`Corelet`, `LoopId`, `CoreClSet` and
+// `SymbolicDimInfo`, added to this file's top block. TYPES FOR ENTRIES 247-254 follow; union them
+// with this file's other vocabulary as its remaining entries land.
+
+/// `dsc2::memories` — the SIXTEEN storages a result may live in (`dsc/dscdefn.cpp:142-144`).
+///
+/// ⭐ ONE TABLE, TWO READERS: `hasNonMemoryResult()` (`dsc/dsc2.cpp:4368`) and entry 250's FIFO scan
+/// both ask it, and a destination storage OUTSIDE it is exactly what "a FIFO destination" means.
+/// ⛔ NOT [`DdcMemory`]'s eight (`ddc::memories`, `ddc/ddc_metadata.h:20-21`), a different and
+/// smaller set — [`DdcAllocateNode::component`] carries that one and says so.
+#[must_use]
+pub const fn is_memory(storage: SenComponent) -> bool {
+    matches!(
+        storage,
+        SenComponent::Lx
+            | SenComponent::L0
+            | SenComponent::L0Scale
+            | SenComponent::Lrfreg
+            | SenComponent::Pelrf
+            | SenComponent::Sfplrf
+            | SenComponent::Ptarf
+            | SenComponent::Ptxrf
+            | SenComponent::Ptirf
+            | SenComponent::Hbm
+            | SenComponent::L3luibr
+            | SenComponent::L3suibr
+            | SenComponent::Pestate
+            | SenComponent::Sfpstate
+            | SenComponent::Lxluscalereg
+            | SenComponent::Qgi
+    )
+}
+
+/// The `SenComponents` one [`DdcMemory`] IS — `ddc::memories`' own spelling read the other way, which
+/// is what lets entry 250 write an allocation's `component_` back into a `DataLocation`.
+const fn memory_component(memory: DdcMemory) -> SenComponent {
+    match memory {
+        DdcMemory::Lx => SenComponent::Lx,
+        DdcMemory::L0 => SenComponent::L0,
+        DdcMemory::PeLrf => SenComponent::Pelrf,
+        DdcMemory::SfpLrf => SenComponent::Sfplrf,
+        DdcMemory::PtaRf => SenComponent::Ptarf,
+        DdcMemory::PtxRf => SenComponent::Ptxrf,
+        DdcMemory::PtiRf => SenComponent::Ptirf,
+        DdcMemory::Hbm => SenComponent::Hbm,
+    }
+}
+
+/// A NODE PROVED NOT TO BE IN `externalNodes_` — `isExternalNode(node)` (`ddc/ddc.h:298`).
+///
+/// ⛔⛔ ONE TYPE FOR SIX ABORTS: every one of entries 247-252 opens with
+/// `if (isExternalNode(x)) DT_ERROR("Can not <verb> external <x>")`, and each of those is this
+/// witness missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InternalNode(NodeId);
+
+impl InternalNode {
+    /// The witness, or [`None`] where the node is external.
+    #[must_use]
+    pub fn of(metadata: &Metadata, node: NodeId) -> Option<Self> {
+        (!metadata.external_nodes.contains(&node)).then_some(Self(node))
+    }
+
+    /// The node.
+    #[must_use]
+    pub const fn node(self) -> NodeId {
+        self.0
+    }
+}
+
+/// WHETHER DATASTAGE EXPLORATION HAS FINISHED — `dataStageExplorationDone_` (`ddc/ddc.h:352`), after
+/// which no unit may mint a datastage or an allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatastageExploration {
+    /// `false` — datastages may still be minted.
+    Open,
+    /// `true`.
+    Done,
+}
+
+/// WHERE A NODE IS PLACED AMONG A PARENT'S CHILDREN — `addChildNode`'s `(addBefore,
+/// siblingRefNode)` pair (`dsc/dsc2.cpp:2010`).
+///
+/// ⛔ *"Sibling reference node not found in parent node"* IS UNSPELLABLE: naming a sibling names its
+/// parent too, so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertionPoint {
+    /// `(true, sibling)` — immediately before `sibling`, among its own parent's children.
+    Before(NodeId),
+    /// `(false, sibling)` — immediately after it.
+    After(NodeId),
+    /// `(true, nullptr)` — the FRONT of that parent's children.
+    FirstIn(NodeId),
+    /// `(false, nullptr)` — the BACK, which is `addChildNode`'s and `moveNode`'s own default.
+    LastIn(NodeId),
+}
+
+/// WHAT ENTRIES 247-252 DO TO THE SCHEDULE TREE — the mint, the placement and the move.
+///
+/// ⭐ EVERY MUTATION THE REFERENCE PERFORMS IS ONE METHOD HERE; the DECISION of which to call, in
+/// what order and with what value stays in the port.
+pub trait ScheduleSurgery {
+    /// `node->name_`.
+    fn node_name(&self, node: NodeId) -> NodeName;
+
+    /// `node->name_ = name`.
+    fn set_node_name(&mut self, node: NodeId, name: NodeName);
+
+    /// `node->getPrev()` (`dsc/dsc2.h:463`) — the node's PARENT, absent for the schedule head.
+    fn parent(&self, node: NodeId) -> Option<NodeId>;
+
+    /// `node->getOwnerLoop()` (`dsc/dsc2.cpp:1892`) — the nearest `LOOP` ancestor, walking `prev_`.
+    fn owner_loop(&self, node: NodeId) -> Option<LoopId>;
+
+    /// `transferNode->..` — the transfer at that node, as [`super::transformation::TransferWalk`]
+    /// also reads one.
+    fn transfer(&self, node: NodeId) -> TransferNode;
+
+    /// `loopNode->numId_`.
+    fn loop_num(&self, loop_node: LoopId) -> DatastageId;
+
+    /// `loopNode->denId_`.
+    fn loop_den(&self, loop_node: LoopId) -> DatastageId;
+
+    /// `loopNode->dims_` (`dsc/dsc2.h:601`), ordered inner to outer.
+    fn loop_dims(&self, loop_node: LoopId) -> LoopDims;
+
+    /// `loopNode->isParametricLoop()` (`dsc/dsc2.h:599`).
+    fn is_parametric(&self, loop_node: LoopId) -> bool;
+
+    /// `new dsc2::LoopNode(..)` — an UNPARENTED loop, which is all [`construct_loop_node`] mints.
+    fn new_loop(&mut self, loop_node: LoopNode) -> LoopId;
+
+    /// `new dsc2::BlockNode()` with its `name_` — a fresh block has NO children.
+    fn new_block(&mut self, name: NodeName) -> NodeId;
+
+    /// `addChildNode(node, ..)` (`dsc/dsc2.cpp:2010`).
+    fn add_child_node(&mut self, node: NodeId, at: InsertionPoint);
+
+    /// `node->moveNode(currDsc, ..)` (`dsc/dsc2.cpp:1977`) — unlinked from its old parent first.
+    fn move_node(&mut self, node: NodeId, at: InsertionPoint);
+
+    /// `scheduleTree_.traverseTreeDFSMutable(root, {CONDITION})`.
+    fn conditions_under(&self, root: NodeId) -> Vec<NodeId>;
+
+    /// `condNode->loopCond_`.
+    fn loop_cond(&self, condition: NodeId) -> LoopCondComposite;
+
+    /// `condNode->loopCond_ = cond`.
+    fn set_loop_cond(&mut self, condition: NodeId, cond: LoopCondComposite);
+}
+
+/// WHAT ENTRIES 247 AND 248 ADDITIONALLY DO — rewriting one loop band in place.
+pub trait LoopBands: ScheduleSurgery {
+    /// `loopNode->denId_ = den`.
+    fn set_loop_den(&mut self, loop_node: LoopId, den: DatastageId);
+
+    /// `loopNode->dims_ = dims`.
+    fn set_loop_dims(&mut self, loop_node: LoopId, dims: LoopDims);
+
+    /// `from->moveChildren(to)` (`dsc/dsc2.cpp:2043`) — every child re-parented, in order.
+    fn move_children(&mut self, from: NodeId, to: NodeId);
+
+    /// `base->insertPerfectlyNestedBlockNode(nested)` — [`Self::move_children`] and then the one
+    /// child. ⛔ *"Nested node must not have any children."* cannot hold for a freshly minted loop.
+    fn insert_perfectly_nested(&mut self, base: LoopId, nested: LoopId);
+
+    /// `condNode->loopCond_.adjustConditionForSplitLoop(orig, new_loops)` (`dsc/dsc2.cpp:2061`).
+    ///
+    /// ⛔ ASKED FOR AND NOT PORTED HERE: it is a `dsc/` function, outside this campaign's file list,
+    /// and it is where the `EQ`/`NE`/`(GT,FIRST)`/`(LT,LAST)` rewrite and its four aborts live.
+    fn adjust_condition_for_split_loop(
+        &mut self,
+        condition: NodeId,
+        orig: LoopId,
+        new_loops: &[LoopId],
+    );
+}
+
+/// WHERE THE BASE LOOP'S DIMS THAT NO SPLIT SET NAMED GO — `unspecifiedDimsInnermost`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnspecifiedDims {
+    /// `true` — they become the innermost loop of the new nest.
+    Innermost,
+    /// `false` — the outermost.
+    Outermost,
+}
+
+/// A LOOP BAND SPLIT PROVED WELL FORMED — the dim sets outermost to innermost, each drawn from the
+/// base loop's own dims, no dim in two of them, plus whatever dims no set named.
+///
+/// ⛔⛔ THREE ABORTS AND TWO OUT-OF-BOUNDS READS GONE. The three are the external-loop refusal,
+/// *"Base loop is not associated with (d, k)"* and *"Overlapping dimension sets specified for
+/// loop-splitting."*; requiring at least one set closes `newLoops[1]` and
+/// `baseLoop->moveChildren(baseLoop)` on the empty input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopBandSplit {
+    base: LoopId,
+    sets: Vec<LoopDims>,
+}
+
+impl LoopBandSplit {
+    /// The split, or [`None`] for any of the three refusals; `sets` is outermost to innermost, and
+    /// the base loop's dims no set names become one more set placed per `unspecified`.
+    ///
+    /// ⚠️ TRAP: the reference reads those remaining dims out of an `unordered_map`, so their order is
+    /// unspecified there; here it is the base loop's own dims order.
+    #[must_use]
+    pub fn of<S: ScheduleSurgery + ?Sized>(
+        tree: &S,
+        metadata: &Metadata,
+        base: LoopId,
+        sets: &[LoopDims],
+        unspecified: UnspecifiedDims,
+    ) -> Option<Self> {
+        InternalNode::of(metadata, base.0)?;
+        let Some((first_set, other_sets)) = sets.split_first() else {
+            return None;
+        };
+        let base_dims = tree.loop_dims(base);
+        let mut named: BTreeSet<PrimaryDimAndKind> = BTreeSet::new();
+        for set in core::iter::once(first_set).chain(other_sets) {
+            for dim in set.iter() {
+                if !base_dims.iter().any(|base| base == dim) {
+                    return None;
+                }
+                if !named.insert(dim) {
+                    return None;
+                }
+            }
+        }
+
+        let mut sets = sets.to_vec();
+        let remaining: Vec<PrimaryDimAndKind> = base_dims
+            .iter()
+            .filter(|dim| !named.contains(dim))
+            .collect();
+        if let Some((first, rest)) = remaining.split_first() {
+            let dims = LoopDims::new(*first, rest.to_vec());
+            match unspecified {
+                UnspecifiedDims::Innermost => sets.push(dims),
+                UnspecifiedDims::Outermost => sets.insert(0, dims),
+            }
+        }
+
+        Some(Self { base, sets })
+    }
+}
+
+/// Replaces: e247_splitLoopBandOnDim
+///
+/// SPLITS ONE LOOP INTO A PERFECT NEST, one loop per dim set: the base loop keeps the outermost set
+/// and gains `__split` in its name, each further set becomes a fresh loop over the SAME
+/// numerator/denominator pair nested inside the last, the base loop's children move into the
+/// innermost one, and every CONDITION now under it that compared against the base loop is
+/// re-pointed at whichever new loop carries its dim (`:159`). Yields the INNERMOST new loop.
+///
+/// ⚠️ TRAP: the reference's inner `break` leaves only the DIMS scan, so where several new loops
+/// carry the condition's dim the LAST one wins; that is reproduced.
+pub fn split_loop_band_on_dim<S: LoopBands + ?Sized>(tree: &mut S, split: LoopBandSplit) -> LoopId {
+    let LoopBandSplit { base, sets } = split;
+    let Some((outermost, inner_sets)) = sets.split_first() else {
+        return base;
+    };
+    if inner_sets.is_empty() {
+        // One dim set is left and it is the base loop's own: no transformation is needed.
+        return base;
+    }
+
+    let num = tree.loop_num(base);
+    let den = tree.loop_den(base);
+    let mut new_loops = vec![base];
+    let mut first_new = None;
+    let mut previous = None;
+    for dims in inner_sets {
+        let minted = tree.new_loop(construct_loop_node(num, den, dims.clone()));
+        if let Some(previous) = previous {
+            tree.add_child_node(minted.0, InsertionPoint::LastIn(previous));
+        } else {
+            first_new = Some(minted.0);
+        }
+        previous = Some(minted.0);
+        new_loops.push(minted);
+    }
+
+    let innermost = new_loops.last().copied().unwrap_or(base);
+    tree.move_children(base.0, innermost.0);
+    if let Some(first_new) = first_new {
+        tree.add_child_node(first_new, InsertionPoint::LastIn(base.0));
+    }
+
+    // The base loop keeps the outermost set, and its name is entry 114's naming plus `__split`.
+    tree.set_loop_dims(base, outermost.clone());
+    let renamed = construct_loop_node(num, den, outermost.clone()).name;
+    tree.set_node_name(base.0, NodeName(format!("{}__split", renamed.0)));
+
+    for condition in tree.conditions_under(innermost.0) {
+        let mut cond = tree.loop_cond(condition);
+        for clause in &mut cond.or_of_ands {
+            for term in clause.iter_mut() {
+                if term.loop_node != base.0 {
+                    continue;
+                }
+                for candidate in &new_loops {
+                    if tree.loop_dims(*candidate).iter().any(|d| d.dim == term.dim) {
+                        term.loop_node = candidate.0;
+                    }
+                }
+            }
+        }
+        tree.set_loop_cond(condition, cond);
+    }
+
+    innermost
+}
+
+/// A DATASTAGE SPLIT PROVED PERFORMABLE, CARRYING THE NUMERATOR STAGE IT WILL COPY.
+///
+/// ⛔⛔ THREE REFUSALS GONE: the external-loop abort, *"Loop splitting after datastage exploration is
+/// not supported."* and `dataStageParam_.at(baseLoop->numId_)` throwing. ⚠️ THE REFERENCE MINTS THE
+/// COPY *BEFORE* IT CHECKS THE EXPLORATION FLAG, so an aborting run has already grown the map; here
+/// nothing is minted until the witness holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatastageSplitSite<D> {
+    base: LoopId,
+    reference: DataStage<D>,
+}
+
+impl<D: Clone> DatastageSplitSite<D> {
+    /// The site, or [`None`] for any of the three refusals.
+    #[must_use]
+    pub fn of<S: ScheduleSurgery + ?Sized>(
+        tree: &S,
+        metadata: &Metadata,
+        stages: &DataStages<D>,
+        base: LoopId,
+        exploration: DatastageExploration,
+    ) -> Option<Self> {
+        InternalNode::of(metadata, base.0)?;
+        if exploration == DatastageExploration::Done {
+            return None;
+        }
+        let reference = stages.0.get(&tree.loop_num(base))?.clone();
+        Some(Self { base, reference })
+    }
+}
+
+/// Replaces: e248_splitLoopBandOnDatastage
+///
+/// SPLITS ONE LOOP ON ITS DATASTAGE: a copy of the loop's numerator stage becomes a new stage, a
+/// fresh loop over the SAME dims is nested perfectly inside the base loop with that new stage as its
+/// numerator, the base loop's DENOMINATOR becomes it too, and every CONDITION now under the new loop
+/// has its loop references adjusted for the split (`:287`). Yields the new inner loop.
+///
+/// ⚠️ TRAP: the base loop keeps its own numerator, so the pair `num/new` and `new/oldDen` compose to
+/// the one band the single loop walked.
+pub fn split_loop_band_on_datastage<S, D>(
+    tree: &mut S,
+    stages: &mut DataStages<D>,
+    site: DatastageSplitSite<D>,
+) -> LoopId
+where
+    S: LoopBands + ?Sized,
+    D: Clone,
+{
+    let DatastageSplitSite { base, reference } = site;
+    let stage = construct_datastage_from(stages, &reference);
+    let dims = tree.loop_dims(base);
+    let den = tree.loop_den(base);
+    let minted = tree.new_loop(construct_loop_node(stage, den, dims));
+    tree.insert_perfectly_nested(base, minted);
+    tree.set_loop_den(base, stage);
+
+    for condition in tree.conditions_under(minted.0) {
+        tree.adjust_condition_for_split_loop(condition, base, &[base, minted]);
+    }
+
+    minted
+}
+
+/// WHICH BRANCH OF AN ENCLOSING CONDITION THE MOVED NODE SAT IN — `condNode->getThenBranchNode() ==
+/// lastSeenNode` (`ddc/ddc_transformation_util.cpp:493`), which decides whether the reproduced
+/// condition is combined or negated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionBranch {
+    /// The `then` region — a core/corelet condition INTERSECTS, and a loop condition is copied.
+    Then,
+    /// The `else` region — a core/corelet condition is SUBTRACTED, and a loop condition's
+    /// `negated_` flips.
+    Else,
+}
+
+/// `coreClCond_` after one more `then`-branch condition intersects into it — `set_intersect` per
+/// core, with a core that empties or is unnamed dropped.
+fn intersect_core_cl(accumulated: &CoreClSet, condition: &CoreClSet) -> CoreClSet {
+    CoreClSet(
+        accumulated
+            .0
+            .iter()
+            .filter_map(|(core, corelets)| {
+                let other = condition.0.get(core)?;
+                let both: BTreeSet<Corelet> = corelets.intersection(other).copied().collect();
+                (!both.is_empty()).then_some((*core, both))
+            })
+            .collect(),
+    )
+}
+
+/// `coreClCond_` after one more `else`-branch condition is subtracted from it — `set_diff` per core
+/// the condition names, with a core that empties dropped.
+///
+/// ⛔ DELIBERATE DIVERGENCE, AND THE DEFECT IS THE REFERENCE'S: both of its accumulate steps
+/// `erase` from the very map their range-`for` is walking (`:503`, `:544`), which invalidates the
+/// iterator. Rebuilding states the intended result without the undefined behaviour.
+fn subtract_core_cl(accumulated: &CoreClSet, condition: &CoreClSet) -> CoreClSet {
+    let mut result = accumulated.clone();
+    for (core, corelets) in &condition.0 {
+        let Some(left) = result.0.get(core) else {
+            continue;
+        };
+        let rest: BTreeSet<Corelet> = left.difference(corelets).copied().collect();
+        if rest.is_empty() {
+            result.0.remove(core);
+        } else {
+            result.0.insert(*core, rest);
+        }
+    }
+    result
+}
+
+/// THE UNIVERSE MINUS ONE `else`-branch condition — every `coreIdsUsed_` core mapped to all
+/// `numCoreletsUsed_DSC2_` corelets the condition did not name.
+///
+/// ⚠️ TRAP: a core the condition maps to EXACTLY the universe contributes NO entry at all rather
+/// than an empty one, which is the reference's `if (clsIt->second != allCorelets)`.
+fn negated_core_cl(condition: &CoreClSet, cores: &[Core], all: &BTreeSet<Corelet>) -> CoreClSet {
+    let mut result = BTreeMap::new();
+    for core in cores {
+        match condition.0.get(core) {
+            None => {
+                result.insert(*core, all.clone());
+            }
+            Some(corelets) if corelets != all => {
+                result.insert(*core, all.difference(corelets).copied().collect());
+            }
+            Some(_) => {}
+        }
+    }
+    CoreClSet(result)
+}
+
+/// A TRANSFER MOVE PROVED LEGAL, CARRYING EVERYTHING THE REFERENCE VALIDATED BEFORE IT MUTATED.
+///
+/// ⛔⛔ SEVEN ABORTS COLLAPSE HERE: the external transfer, the FIFO destination, hoisting above the
+/// source's producer loop, hoisting above a parametric loop, a loop conditional naming a chain loop,
+/// an external allocate node, and moving allocations after datastage exploration.
+/// ⛔⛔ AND THE SINKING PATH IS DEAD CODE, SO THIS ONLY EVER HOISTS. The reference rebuilds its chain
+/// under `while (loop != transferOwnerLoop && loop != nullptr)`, whose guard already excludes the
+/// terminator the following `if (loopChain.back() != transferOwnerLoop) DT_ERROR(..)` demands — so
+/// that abort fires for EVERY destination that is not an ancestor, and the consumer-loop check, the
+/// `start`/`end` swap and both `if (!insertBefore)` blocks below are unreachable. A destination that
+/// is not an ancestor is [`None`] here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferMove {
+    transfer: NodeId,
+    new_parent: LoopId,
+    /// `loopChain` — the transfer's owner loop first, `new_parent` last, always two or more.
+    chain: Vec<LoopId>,
+    /// `allocateNodesToMove`.
+    allocations: Vec<NodeId>,
+    /// `coreConditionToMove->coreClCond_`.
+    core_condition: Option<CoreClSet>,
+    /// `loopConditions`, in the walk's own innermost-to-outermost order.
+    loop_conditions: Vec<(NodeId, ConditionBranch)>,
+}
+
+impl TransferMove {
+    /// The move, or [`None`] for any of the seven refusals — and also where there is nothing to do,
+    /// which is the reference's early `return` for a transfer already owned by `new_parent`.
+    ///
+    /// ⚠️ TRAP: the producer-loop AND parametric-loop checks are BOTH gated on the source's
+    /// `dataConnect_` having a metadata entry, so an unset connect skips the parametric check too.
+    #[must_use]
+    pub fn of<S: TransferMoves + ?Sized>(
+        tree: &S,
+        metadata: &Metadata,
+        transfer: NodeId,
+        new_parent: LoopId,
+        exploration: DatastageExploration,
+    ) -> Option<Self> {
+        InternalNode::of(metadata, transfer)?;
+        // A transfer with no owner loop leaves `loopChain` empty and `loopChain.back()` undefined.
+        let owner = tree.owner_loop(transfer)?;
+        if owner == new_parent {
+            return None;
+        }
+
+        let mut chain = Vec::new();
+        let mut current = Some(owner);
+        while let Some(loop_node) = current {
+            chain.push(loop_node);
+            if loop_node == new_parent {
+                break;
+            }
+            current = tree.owner_loop(loop_node.0);
+        }
+        if chain.last() != Some(&new_parent) {
+            return None;
+        }
+
+        let moved = tree.transfer(transfer);
+        // `hasNonMemoryResult()` (`dsc/dsc2.cpp:4368`).
+        if moved.dsts.iter().any(|dst| !is_memory(dst.storage)) {
+            return None;
+        }
+        if let Some(producers) = moved
+            .src
+            .data
+            .data_connect
+            .and_then(|connect| tree.producer_loops(connect))
+        {
+            for loop_node in chain.iter().take(chain.len().saturating_sub(1)) {
+                if producers.contains(loop_node) || tree.is_parametric(*loop_node) {
+                    return None;
+                }
+            }
+        }
+
+        let mut core_condition: Option<CoreClSet> = None;
+        let mut loop_conditions = Vec::new();
+        let mut last_seen = transfer;
+        let mut curr = transfer;
+        while curr != new_parent.0 {
+            if tree.is_condition(curr) {
+                let branch = if tree.then_branch(curr) == Some(last_seen) {
+                    ConditionBranch::Then
+                } else {
+                    ConditionBranch::Else
+                };
+                let cond = tree.loop_cond(curr);
+                // `hasCoreClCond()` IS `twoLevelOrOfAnds_.empty()` (`dsc/dsc2.h:693-695`).
+                if cond.or_of_ands.is_empty() {
+                    let core_cl = tree.core_cl_cond(curr);
+                    let combined = match (&core_condition, branch) {
+                        (None, ConditionBranch::Then) => core_cl,
+                        (None, ConditionBranch::Else) => {
+                            negated_core_cl(&core_cl, &tree.core_ids_used(), &tree.corelets_used())
+                        }
+                        (Some(accumulated), ConditionBranch::Then) => {
+                            intersect_core_cl(accumulated, &core_cl)
+                        }
+                        (Some(accumulated), ConditionBranch::Else) => {
+                            subtract_core_cl(accumulated, &core_cl)
+                        }
+                    };
+                    core_condition = Some(combined);
+                } else {
+                    for clause in &cond.or_of_ands {
+                        for term in clause {
+                            if chain
+                                .iter()
+                                .any(|l| *l != new_parent && l.0 == term.loop_node)
+                            {
+                                return None;
+                            }
+                        }
+                    }
+                    loop_conditions.push((curr, branch));
+                }
+            }
+            last_seen = curr;
+            curr = tree.parent(curr)?;
+        }
+
+        let mut allocations = Vec::new();
+        for dst in moved.dsts.iter() {
+            let Some(alloc) = tree.destination_allocation(dst) else {
+                continue;
+            };
+            let alloc_owner = tree.owner_loop(alloc);
+            if alloc_owner == Some(new_parent) {
+                continue;
+            }
+            if chain
+                .iter()
+                .any(|loop_node| alloc_owner == Some(*loop_node))
+            {
+                InternalNode::of(metadata, alloc)?;
+                allocations.push(alloc);
+            }
+        }
+        if !allocations.is_empty() && exploration == DatastageExploration::Done {
+            return None;
+        }
+
+        Some(Self {
+            transfer,
+            new_parent,
+            chain,
+            allocations,
+            core_condition,
+            loop_conditions,
+        })
+    }
+
+    /// The loop the transfer is hoisted to.
+    #[must_use]
+    pub const fn new_parent(&self) -> LoopId {
+        self.new_parent
+    }
+}
+
+/// WHAT ENTRY 249 ADDITIONALLY ASKS OF THE TREE — the conditions it reproduces and the allocations
+/// that travel with the transfer.
+pub trait TransferMoves: ScheduleSurgery {
+    /// `node->nodeType_ == CONDITION`.
+    fn is_condition(&self, node: NodeId) -> bool;
+
+    /// `condNode->getThenBranchNode()` (`dsc/dsc2.h:685`).
+    fn then_branch(&self, condition: NodeId) -> Option<NodeId>;
+
+    /// `condNode->coreClCond_` (`dsc/dsc2.h:683`).
+    fn core_cl_cond(&self, condition: NodeId) -> CoreClSet;
+
+    /// `0 .. currDsc->numCoreletsUsed_DSC2_` — the `allCorelets` universe.
+    fn corelets_used(&self) -> BTreeSet<Corelet>;
+
+    /// `currDsc->coreIdsUsed_`.
+    fn core_ids_used(&self) -> Vec<Core>;
+
+    /// `metadata.dataConnects_.at(connect).getProducerLoops()` (`ddc/ddc_metadata.h:159`), absent
+    /// where that connect has NO metadata entry — which is the reference's `count()` gate.
+    ///
+    /// ⛔ ASKED THROUGH THE SEAM BECAUSE THE TWO NODE SPELLINGS ARE STILL TWO: [`Ends`] keys its
+    /// producers by [`super::metadata::NodeIndex`] while a loop chain is [`LoopId`] over [`NodeId`],
+    /// and unifying them is the refactor `metadata.rs` reserves for a batch that owns a
+    /// schedule-tree type outright (`ddc/metadata.rs:532-534`).
+    fn producer_loops(&self, connect: DataConnect) -> Option<Vec<LoopId>>;
+
+    /// `currDsc->getMutableAllocation(dstLdsAndLoopOffsets_.at(i), dstVias_.at(i).loc_.storage_)` as
+    /// a schedule node, absent where it is null.
+    fn destination_allocation(&self, dst: &Operand) -> Option<NodeId>;
+
+    /// `condNode->clone()` — a detached copy, with its regions still to be added.
+    fn clone_condition(&mut self, condition: NodeId) -> NodeId;
+
+    /// `new dsc2::ConditionNode()` with its `name_` and `coreClCond_`, and no loop condition.
+    fn new_condition(&mut self, name: NodeName, core_cl: CoreClSet) -> NodeId;
+
+    /// `condNode->addThenRegion(block)` (`dsc/dsc2.h:686`).
+    fn add_then_region(&mut self, condition: NodeId, block: NodeId);
+
+    /// `condNode->addElseRegion(block)` (`dsc/dsc2.h:687`).
+    fn add_else_region(&mut self, condition: NodeId, block: NodeId);
+}
+
+/// Replaces: e249_moveTransferNode
+///
+/// HOISTS ONE TRANSFER TO AN ENCLOSING LOOP, immediately BEFORE the chain loop it leaves: the
+/// destination allocations that lived in the loops it leaves move with it, a
+/// `core_corelet_reuse_<transfer>` condition reproduces the core/corelet conditions it was under,
+/// each enclosing loop condition is cloned as `<cond>_reuse_<transfer>` with fresh
+/// `_then_region`/`_else_region` blocks and chained inside the previous one's `then`, and the
+/// transfer lands at the FRONT of the innermost of those (`:335`).
+///
+/// ⚠️ TRAP: `insertBefore` is `true` on every reachable path, so the reference's `lastLoopCond` is
+/// assigned and never read and both of its `if (!insertBefore)` blocks are dead.
+pub fn move_transfer_node<S: TransferMoves + ?Sized>(tree: &mut S, move_: TransferMove) {
+    let TransferMove {
+        transfer,
+        new_parent: _,
+        chain,
+        allocations,
+        core_condition,
+        loop_conditions,
+    } = move_;
+    let moved_name = tree.node_name(transfer).0;
+
+    // `reverse(loopConditions)` — the chain is built outermost first.
+    let mut first_loop_cond = None;
+    let mut last_then: Option<NodeId> = None;
+    for (condition, branch) in loop_conditions.iter().rev() {
+        let name = format!("{}_reuse_{}", tree.node_name(*condition).0, moved_name);
+        let cloned = tree.clone_condition(*condition);
+        tree.set_node_name(cloned, NodeName(name.clone()));
+        let then_branch = tree.new_block(NodeName(format!("{name}_then_region")));
+        let else_branch = tree.new_block(NodeName(format!("{name}_else_region")));
+        tree.add_then_region(cloned, then_branch);
+        tree.add_else_region(cloned, else_branch);
+        if *branch == ConditionBranch::Else {
+            let mut cond = tree.loop_cond(cloned);
+            cond.negated ^= true;
+            tree.set_loop_cond(cloned, cond);
+        }
+        if first_loop_cond.is_none() {
+            first_loop_cond = Some(cloned);
+        }
+        if let Some(last_then) = last_then {
+            tree.add_child_node(cloned, InsertionPoint::LastIn(last_then));
+        }
+        last_then = Some(then_branch);
+    }
+
+    // `refNodeForInsertion = loopChain[loopChain.size() - 2]`, whose own parent is the effective new
+    // parent — which is what naming the SIBLING already says.
+    let Some(reference) = chain.iter().rev().nth(1).copied() else {
+        return;
+    };
+    let mut at = InsertionPoint::Before(reference.0);
+
+    for allocation in &allocations {
+        tree.move_node(*allocation, at);
+    }
+
+    if let Some(core_cl) = core_condition {
+        let name = format!("core_corelet_reuse_{moved_name}");
+        let condition = tree.new_condition(NodeName(name.clone()), core_cl);
+        tree.add_child_node(condition, at);
+        let then_branch = tree.new_block(NodeName(format!("{name}_then_region")));
+        let else_branch = tree.new_block(NodeName(format!("{name}_else_region")));
+        tree.add_then_region(condition, then_branch);
+        tree.add_else_region(condition, else_branch);
+        at = InsertionPoint::FirstIn(then_branch);
+    }
+
+    if let Some(first_loop_cond) = first_loop_cond {
+        tree.add_child_node(first_loop_cond, at);
+        if let Some(last_then) = last_then {
+            at = InsertionPoint::FirstIn(last_then);
+        }
+    }
+
+    tree.move_node(transfer, at);
+}
+
+/// ONE CONSUMER OF A FIFO RESULT — the `dataConnects_[dc].consumers_` entries entry 250 rewrites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FifoConsumer {
+    /// `TRANSFER` — its `src_.storage_` is repointed.
+    Transfer(NodeId),
+    /// `COMPUTE` — every `inputs_` entry whose `dataConnect_` matches is repointed.
+    Compute(NodeId, ComputeNode),
+    /// Every other `nodeType_`, which is *"Unsupported consumer type"*.
+    Other(NodeId),
+}
+
+impl FifoConsumer {
+    /// The consumer's node.
+    #[must_use]
+    pub const fn node(&self) -> NodeId {
+        match self {
+            Self::Transfer(node) | Self::Compute(node, _) | Self::Other(node) => *node,
+        }
+    }
+}
+
+/// WHAT ENTRY 250 ADDITIONALLY ASKS — the FIFO result's consumers and the writes that repoint them.
+pub trait FifoResults: ScheduleSurgery {
+    /// `metadata.dataConnects_[connect].consumers_`. ⛔ An UNSET `dataConnect_` is the reference's
+    /// `dataConnects_[""]`, which DEFAULT-CONSTRUCTS an empty entry — so it has no consumers.
+    fn connect_consumers(&self, connect: Option<DataConnect>) -> Vec<FifoConsumer>;
+
+    /// `computeNode->isOpaqueOp_` (`dsc/dsc2.h:531`).
+    fn is_opaque(&self, compute: NodeId) -> bool;
+
+    /// The transfer's ends as allocation lookups, for [`get_padding_per_dim`].
+    fn transfer_ends(&self, transfer: NodeId) -> TransferEnds;
+
+    /// The minted allocate node, placed and registered under `alloc`.
+    fn insert_allocate(&mut self, alloc: AllocId, node: DdcAllocateNode, at: InsertionPoint);
+
+    /// `transferNode->dstVias_[i].loc_.storage_ = storage`.
+    fn set_dst_storage(&mut self, transfer: NodeId, dst: usize, storage: SenComponent);
+
+    /// `transferConsumer->src_.storage_ = storage`.
+    fn set_src_storage(&mut self, transfer: NodeId, storage: SenComponent);
+
+    /// `computeConsumer->inputs_[i] = unit` — the UNIT vector (`dsc/dsc2.h:906`), not a storage.
+    fn set_compute_input_unit(&mut self, compute: NodeId, input: usize, unit: SenComponent);
+
+    /// `allocNode->addAllocUser(user)` (`dsc/dsc2.h:1012`) — the count-bumping one,
+    /// [`DdcAllocateNode::add_alloc_user`].
+    fn add_alloc_user(&mut self, alloc: AllocId, user: NodeId);
+}
+
+/// A TRANSFER WHOSE FIFO RESULT MAY BE CONVERTED AT ALL — entry 250's two aborts.
+///
+/// ⛔⛔ BOTH ARE THIS WITNESS MISSING: *"Conversion of FIFO result to register after datastage
+/// exploration is not supported."* and the external-transfer refusal. Its `return false` paths are
+/// NOT here — those are the function's own answer and stay in the port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FifoConversionSite {
+    transfer: NodeId,
+}
+
+impl FifoConversionSite {
+    /// The site, or [`None`] for either abort.
+    #[must_use]
+    pub fn of(
+        metadata: &Metadata,
+        transfer: NodeId,
+        exploration: DatastageExploration,
+    ) -> Option<Self> {
+        if exploration == DatastageExploration::Done {
+            return None;
+        }
+        InternalNode::of(metadata, transfer).map(|internal| Self {
+            transfer: internal.node(),
+        })
+    }
+}
+
+/// Replaces: e250_convertResultFromFIFOtoReg
+///
+/// MOVES A TRANSFER'S ONE FIFO RESULT INTO A REGISTER FILE: mints an
+/// `allocate_lds<i>_<mem>_<dc>_fifo_to_reg` allocation in the destination unit's own LRF right
+/// before the transfer, repoints that destination's storage at it, and repoints every consumer of
+/// the connect — a transfer's source storage, a compute's matching input UNITS — adding each as an
+/// alloc user (`:760`). `true` also where there was NO FIFO result at all.
+///
+/// ⛔ THE `false` ANSWERS ARE THE REFERENCE'S: more than one FIFO result, a consumer that is opaque
+/// or external, a destination unit that is neither `SFP` nor `PE`, and an allocation that already
+/// exists. ⛔ DELIBERATE DIVERGENCE: an unset destination lds index and repeated layout dims are
+/// aborts inside the reference's `constructAllocation`; here they answer `false` instead.
+/// ⚠️ *"Unsupported consumer type"* becomes a skipped consumer, since a refusal is not available.
+pub fn convert_result_from_fifo_to_reg<D>(
+    dsc: &mut D,
+    metadata: &mut Metadata,
+    site: FifoConversionSite,
+    alloc: AllocId,
+) -> bool
+where
+    D: FifoResults + DscAllocations + AllocationPaddings + ?Sized,
+{
+    let transfer = site.transfer;
+    let node = dsc.transfer(transfer);
+
+    let mut fifo = None;
+    for (index, dst) in node.dsts.iter().enumerate() {
+        if is_memory(dst.storage) {
+            continue;
+        }
+        if fifo.is_some() {
+            return false;
+        }
+        fifo = Some((index, *dst));
+    }
+    let Some((index, dst)) = fifo else {
+        return true;
+    };
+    let connect = dst.data.data_connect;
+
+    for consumer in dsc.connect_consumers(connect) {
+        if matches!(consumer, FifoConsumer::Compute(compute, _) if dsc.is_opaque(compute)) {
+            return false;
+        }
+        if metadata.external_nodes.contains(&consumer.node()) {
+            return false;
+        }
+    }
+
+    let register_file = match dst.unit {
+        SenComponent::Sfp => DdcMemory::SfpLrf,
+        SenComponent::Pe => DdcMemory::PeLrf,
+        _ => return false,
+    };
+    let Some(lds) = dst.data.my_lds_idx else {
+        return false;
+    };
+    let Some(fresh) = FreshAllocation::of(dsc, metadata, lds, register_file) else {
+        return false;
+    };
+
+    let ends = dsc.transfer_ends(transfer);
+    let padding = get_padding_per_dim(dsc, metadata, transfer, &ends, TransferSide::Dst);
+    let mut alloc_node = construct_allocation(dsc, metadata, fresh, padding, transfer, alloc);
+    alloc_node.name = NodeName(format!(
+        "{}_{}_fifo_to_reg",
+        alloc_node.name.0,
+        connect_spelling(connect)
+    ));
+    let component = memory_component(alloc_node.component);
+    dsc.insert_allocate(alloc, alloc_node, InsertionPoint::Before(transfer));
+
+    dsc.set_dst_storage(transfer, index, component);
+    for consumer in dsc.connect_consumers(connect) {
+        match consumer {
+            FifoConsumer::Transfer(node) => {
+                dsc.set_src_storage(node, component);
+                dsc.add_alloc_user(alloc, node);
+            }
+            FifoConsumer::Compute(node, compute) => {
+                for (input, operand) in compute.inputs.iter().enumerate() {
+                    if operand.data.data_connect != connect {
+                        continue;
+                    }
+                    dsc.set_compute_input_unit(node, input, component);
+                    dsc.add_alloc_user(alloc, node);
+                }
+            }
+            FifoConsumer::Other(_) => {}
+        }
+    }
+
+    true
+}
+
+/// WHAT ENTRIES 251 AND 252 ADDITIONALLY ASK — the layout order the transfer walks.
+pub trait TransferUnrolling: ScheduleSurgery + Dsc {
+    /// `currDsc->getNonBroadcastLdsDims(lds)` (`dsc/dsc2.cpp:4039`) — the layout dims whose
+    /// `scale_` is positive, as `l3::dsc::DesignSpaceConfig::non_broadcast_lds_dims` answers it,
+    /// [`None`] for its own `getLayoutDims` abort.
+    fn non_broadcast_lds_dims(&self, lds: LdsIdx) -> Option<Vec<PrimaryDim>>;
+}
+
+/// The transfer's `myLdsIdx_`: its source's, else the FIRST destination that has one.
+fn transfer_lds_idx(node: &TransferNode) -> Option<LdsIdx> {
+    node.src
+        .data
+        .my_lds_idx
+        .or_else(|| node.dsts.iter().find_map(|dst| dst.data.my_lds_idx))
+}
+
+/// Mints one single-dim loop against `num`/`den`, inserts it immediately before the transfer and
+/// moves the transfer inside it — the three lines both unrolling entries end each iteration with.
+fn nest_transfer_in_new_loop<S: ScheduleSurgery + ?Sized>(
+    tree: &mut S,
+    transfer: NodeId,
+    num: DatastageId,
+    den: DatastageId,
+    dim: PrimaryDimAndKind,
+) {
+    let minted = tree.new_loop(construct_loop_node(
+        num,
+        den,
+        LoopDims::new(dim, Vec::new()),
+    ));
+    tree.add_child_node(minted.0, InsertionPoint::Before(transfer));
+    tree.move_node(transfer, InsertionPoint::LastIn(minted.0));
+}
+
+/// Replaces: e251_unrollTransfer
+///
+/// FULLY UNROLLS ONE TRANSFER OVER ITS LAYOUT DIMS: one fresh single-dim loop per layout dim,
+/// innermost dim outermost, each against a NEW minimizing denominator datastage and against the
+/// denominator of the innermost enclosing loop that already carried that dim as its numerator, with
+/// the transfer moved inside each in turn (`:1120`). `true` also where the transfer names no
+/// labelled data structure at all, which needs no unrolling.
+///
+/// ⚠️ TRAP: the enclosing-loop walk does NOT stop once every dim has a numerator, so a parametric
+/// loop ANYWHERE above the transfer still answers `false`.
+/// ⛔ DELIBERATE DIVERGENCE: `loopNumPerDim.at(currDim)` throws for a layout dim no enclosing loop
+/// carried; here that one dim is skipped and the rest still unroll.
+pub fn unroll_transfer<S, D>(
+    tree: &mut S,
+    stages: &mut DataStages<D>,
+    metadata: &mut Metadata,
+    site: InternalNode,
+) -> bool
+where
+    S: TransferUnrolling + ?Sized,
+    D: Default,
+{
+    let transfer = site.node();
+    let node = tree.transfer(transfer);
+    let Some(lds) = transfer_lds_idx(&node) else {
+        return true;
+    };
+
+    // `unordered_set<PrimaryDimAndKind>` over the layout dims — every one at kind `Unpadded`, which
+    // is what `PrimaryDimAndKind`'s implicit conversion from a `PrimaryDimTypes` gives (`dims.h:79`).
+    let transfer_dims: Vec<PrimaryDimAndKind> = tree
+        .layout_dims(lds)
+        .iter()
+        .map(|dim| PrimaryDimAndKind {
+            dim,
+            kind: MetaDimKind::Unpadded,
+        })
+        .collect();
+    let mut remaining: BTreeSet<PrimaryDimAndKind> = transfer_dims.iter().copied().collect();
+
+    let mut num_per_dim: BTreeMap<PrimaryDim, DatastageId> = BTreeMap::new();
+    let mut current = tree.owner_loop(transfer);
+    while let Some(loop_node) = current {
+        if tree.is_parametric(loop_node) {
+            return false;
+        }
+        let num = tree.loop_den(loop_node);
+        for dim in tree.loop_dims(loop_node).iter() {
+            if remaining.remove(&dim) {
+                num_per_dim.insert(dim.dim, num);
+            }
+        }
+        current = tree.owner_loop(loop_node.0);
+    }
+
+    let den = construct_datastage(stages);
+    metadata.datastages.entry(den).or_default().strategy = Strategy::Minimize;
+
+    for dim in transfer_dims.iter().rev() {
+        let Some(num) = num_per_dim.get(&dim.dim).copied() else {
+            continue;
+        };
+        nest_transfer_in_new_loop(tree, transfer, num, den, *dim);
+    }
+
+    true
+}
+
+/// WHICH PER-DIM MAP OF A `DataStructDims` — the four entry 252 copies (`dsc/dims.h:170-200`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DimSplit {
+    /// `coreletSplit_`.
+    Corelet,
+    /// `rowSplit_`.
+    Row,
+    /// `peSfpSplit_`.
+    PeSfp,
+    /// `paddingSizes_`.
+    Padding,
+}
+
+/// WHAT ENTRY 252 ASKS OF ONE HALF OF A DATA STAGE — [`DataStage`] is generic in its extents
+/// payload, and this is the part of that payload entry 252 writes.
+pub trait StageExtents {
+    /// `primaryDimToValHandler_st(dim) = other.primaryDimToVal_st(dim)`.
+    fn copy_dim_value_from(&mut self, other: &Self, dim: PrimaryDim);
+
+    /// `<split>_.count(dim)`.
+    fn states(&self, split: DimSplit, dim: PrimaryDim) -> bool;
+
+    /// `<split>_[dim] = other.<split>_.at(dim)`.
+    fn copy_split_from(&mut self, other: &Self, split: DimSplit, dim: PrimaryDim);
+
+    /// `makeDimNotSymbolic(dim)` (`dsc/dims.cpp:717`).
+    fn make_dim_not_symbolic(&mut self, dim: PrimaryDim);
+}
+
+/// Replaces: e252_unrollTransferForSymbolicDims
+///
+/// UNROLLS ONE TRANSFER OVER ITS SYMBOLIC LAYOUT DIMS ONLY, exactly as entry 251 does over all of
+/// them, and first fills the new denominator datastage per dim from the numerator stage that dim
+/// came from: its steady-state and epilogue extent, then its corelet/row/PE-SFP splits, then
+/// `makeDimNotSymbolic`, and only THEN its padding sizes (`:1193`). `true` where there are no
+/// symbolic dims or the transfer names no labelled data structure.
+///
+/// ⚠️ TRAP: each split is copied into BOTH halves gated on the STEADY-STATE half naming the dim, and
+/// the padding copy deliberately runs AFTER the dim stopped being symbolic.
+/// ⛔ Unlike entry 251 this walk STOPS once every dim has a numerator, which is observable: a
+/// parametric loop above that point answers `true` here and `false` there.
+pub fn unroll_transfer_for_symbolic_dims<S, D>(
+    tree: &mut S,
+    stages: &mut DataStages<D>,
+    site: InternalNode,
+    symbolic_dims: &BTreeMap<PrimaryDim, SymbolicDimInfo>,
+) -> bool
+where
+    S: TransferUnrolling + ?Sized,
+    D: Default + Clone + StageExtents,
+{
+    if symbolic_dims.is_empty() {
+        return true;
+    }
+    let transfer = site.node();
+    let node = tree.transfer(transfer);
+    let Some(lds) = transfer_lds_idx(&node) else {
+        return true;
+    };
+
+    // ⚠️ A SET OF DIMS AND NOT OF DIM-AND-KINDS, unlike entry 251's.
+    // ⛔ DELIBERATE DIVERGENCE: `getLayoutDims`' own abort answers `false` here.
+    let Some(non_broadcast) = tree.non_broadcast_lds_dims(lds) else {
+        return false;
+    };
+    let transfer_dims: Vec<PrimaryDim> = non_broadcast
+        .into_iter()
+        .filter(|dim| symbolic_dims.contains_key(dim))
+        .collect();
+    let mut remaining: BTreeSet<PrimaryDim> = transfer_dims.iter().copied().collect();
+
+    let mut num_per_dim: BTreeMap<PrimaryDim, DatastageId> = BTreeMap::new();
+    let mut current = tree.owner_loop(transfer);
+    while let Some(loop_node) = current {
+        if remaining.is_empty() {
+            break;
+        }
+        if tree.is_parametric(loop_node) {
+            return false;
+        }
+        let num = tree.loop_den(loop_node);
+        for dim in tree.loop_dims(loop_node).iter() {
+            if remaining.remove(&dim.dim) {
+                num_per_dim.insert(dim.dim, num);
+            }
+        }
+        current = tree.owner_loop(loop_node.0);
+    }
+
+    let den = construct_datastage(stages);
+    for (dim, reference) in &num_per_dim {
+        // The reference stage is read out first: `dataStageParam_.at(dsIdx)` and `.at(denId)` are one
+        // map, and a missing either is that `.at()` throwing — here the dim is skipped instead.
+        let Some(from) = stages.0.get(reference).cloned() else {
+            continue;
+        };
+        let Some(to) = stages.0.get_mut(&den) else {
+            continue;
+        };
+        to.ss.dims.copy_dim_value_from(&from.ss.dims, *dim);
+        to.el.dims.copy_dim_value_from(&from.el.dims, *dim);
+        for split in [DimSplit::Corelet, DimSplit::Row, DimSplit::PeSfp] {
+            if !from.ss.dims.states(split, *dim) {
+                continue;
+            }
+            to.ss.dims.copy_split_from(&from.ss.dims, split, *dim);
+            to.el.dims.copy_split_from(&from.el.dims, split, *dim);
+        }
+        to.ss.dims.make_dim_not_symbolic(*dim);
+        to.el.dims.make_dim_not_symbolic(*dim);
+        if from.ss.dims.states(DimSplit::Padding, *dim) {
+            to.ss
+                .dims
+                .copy_split_from(&from.ss.dims, DimSplit::Padding, *dim);
+            to.el
+                .dims
+                .copy_split_from(&from.el.dims, DimSplit::Padding, *dim);
+        }
+    }
+
+    for dim in transfer_dims.iter().rev() {
+        let Some(num) = num_per_dim.get(dim).copied() else {
+            continue;
+        };
+        let entry = PrimaryDimAndKind {
+            dim: *dim,
+            kind: MetaDimKind::Unpadded,
+        };
+        nest_transfer_in_new_loop(tree, transfer, num, den, entry);
+    }
+
+    true
+}
+
+/// Replaces: e253_srcRelatedToExternalNodes
+///
+/// Whether the transfer's SOURCE datastream is external, asked of the connect's `producers_`
+/// (`:1687`).
+///
+/// ⛔ TRAP, AND IT IS THE REFERENCE'S: the operand's `storage_` is what reaches entry 120's
+/// `storage` here — the OPPOSITE of entries 255/256, which pass the operand's `unit_`.
+#[must_use]
+pub fn src_related_to_external_nodes<E: ExternalStreams + ?Sized>(
+    streams: &E,
+    transfer: &TransferNode,
+) -> bool {
+    streams.storage_or_datastream_is_external(
+        transfer.src.data,
+        transfer.src.storage,
+        StreamDirection::Incoming,
+    )
+}
+
+/// Replaces: e254_destRelatedToExternalNodes
+///
+/// Whether ONE destination datastream of a transfer is external, asked of the connect's `consumers_`
+/// (`:1693`).
+///
+/// ⛔ Taking the destination ITSELF closes both `.at(dstIndex)` throws, and it is what keeps entries
+/// 305/339/340/341 constructible. ⛔ Same storage trap as entry 253.
+#[must_use]
+pub fn dest_related_to_external_nodes<E: ExternalStreams + ?Sized>(
+    streams: &E,
+    dst: &Operand,
+) -> bool {
+    streams.storage_or_datastream_is_external(dst.data, dst.storage, StreamDirection::Outgoing)
 }
 
 #[cfg(test)]
@@ -1579,15 +2708,19 @@ mod tests_e110_e117 {
                 vec![
                     LoopCond {
                         loop_node: NodeId(1),
+                        dim: PrimaryDim::In,
                     },
                     LoopCond {
                         loop_node: NodeId(2),
+                        dim: PrimaryDim::Out,
                     },
                 ],
                 vec![LoopCond {
                     loop_node: NodeId(1),
+                    dim: PrimaryDim::In,
                 }],
             ],
+            negated: false,
         };
         let name = NodeName("cond0".to_string());
         let mut referenced = BTreeSet::new();
@@ -2045,5 +3178,1051 @@ mod tests_e255_e257 {
             metadata.lds_idx_after_ddc,
             BTreeMap::from([(LdsIdx(2), LdsIdx(3)), (LdsIdx(0), LdsIdx(2))])
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_e247_e254 {
+    // ⭐ TESTS FOR ENTRIES 247-254. Union this module with this file's other test modules when they
+    // land.
+    use super::*;
+
+    use core::num::NonZeroU32;
+
+    use crate::generated::ComputeType;
+    use crate::schedule::ddc::fold::DataStream;
+    use crate::schedule::dsc2::{Dsts, LayoutDims, ReplicationFactor};
+    use crate::schedule::l3::dsc::{Granularity, MaxSize};
+    use crate::units::{DfirUnit, NumFolds};
+
+    /// The kinds of node the ported entries build a nest out of.
+    #[derive(Debug, Clone)]
+    enum Kind {
+        Loop { node: LoopNode, parametric: bool },
+        Transfer(TransferNode),
+        Condition(LoopCondComposite, CoreClSet),
+        Block,
+        Allocate,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Entry {
+        name: NodeName,
+        parent: Option<NodeId>,
+        children: Vec<NodeId>,
+        kind: Kind,
+        then_region: Option<NodeId>,
+        else_region: Option<NodeId>,
+    }
+
+    /// A SCHEDULE TREE THESE ENTRIES REWRITE, plus the DSC facts entries 250-252 read of one.
+    #[derive(Debug, Default)]
+    struct Tree {
+        nodes: BTreeMap<NodeId, Entry>,
+        next: u32,
+        layout: BTreeMap<LdsIdx, LayoutDims>,
+        non_broadcast: BTreeMap<LdsIdx, Vec<PrimaryDim>>,
+        producers: BTreeMap<DataConnect, Vec<LoopId>>,
+        consumers: Vec<FifoConsumer>,
+        opaque: BTreeSet<NodeId>,
+        dst_allocation: BTreeMap<LdsIdx, NodeId>,
+        ends: Option<TransferEnds>,
+        core_ids: Vec<Core>,
+        corelets: BTreeSet<Corelet>,
+        allocated: Vec<(AllocId, DdcAllocateNode, InsertionPoint)>,
+        dst_storage: Vec<(NodeId, usize, SenComponent)>,
+        src_storage: Vec<(NodeId, SenComponent)>,
+        compute_inputs: Vec<(NodeId, usize, SenComponent)>,
+        alloc_users: Vec<(AllocId, NodeId)>,
+        adjusted: Vec<(NodeId, LoopId, Vec<LoopId>)>,
+        nested: Vec<(LoopId, LoopId)>,
+    }
+
+    impl Tree {
+        fn add(&mut self, name: &str, kind: Kind, parent: Option<NodeId>) -> NodeId {
+            let id = NodeId(self.next);
+            self.next += 1;
+            self.nodes.insert(
+                id,
+                Entry {
+                    name: NodeName(name.to_string()),
+                    parent,
+                    children: Vec::new(),
+                    kind,
+                    then_region: None,
+                    else_region: None,
+                },
+            );
+            if let Some(parent) = parent {
+                self.nodes
+                    .get_mut(&parent)
+                    .expect("parent exists")
+                    .children
+                    .push(id);
+            }
+            id
+        }
+
+        fn loop_node(
+            &mut self,
+            num: u32,
+            den: u32,
+            dims: LoopDims,
+            parent: Option<NodeId>,
+        ) -> LoopId {
+            let node = construct_loop_node(DatastageId(num), DatastageId(den), dims);
+            let name = node.name.0.clone();
+            LoopId(self.add(
+                &name,
+                Kind::Loop {
+                    node,
+                    parametric: false,
+                },
+                parent,
+            ))
+        }
+
+        fn unlink(&mut self, node: NodeId) {
+            let parent = self
+                .nodes
+                .get_mut(&node)
+                .expect("node exists")
+                .parent
+                .take();
+            if let Some(parent) = parent {
+                self.nodes
+                    .get_mut(&parent)
+                    .expect("parent exists")
+                    .children
+                    .retain(|child| *child != node);
+            }
+        }
+
+        fn link(&mut self, node: NodeId, at: InsertionPoint) {
+            let (parent, index) = match at {
+                InsertionPoint::Before(sibling) | InsertionPoint::After(sibling) => {
+                    let parent = self.nodes[&sibling].parent.expect("sibling has a parent");
+                    let position = self.nodes[&parent]
+                        .children
+                        .iter()
+                        .position(|child| *child == sibling)
+                        .expect("sibling among its parent's children");
+                    let after = matches!(at, InsertionPoint::After(_));
+                    (parent, position + usize::from(after))
+                }
+                InsertionPoint::FirstIn(parent) => (parent, 0),
+                InsertionPoint::LastIn(parent) => (parent, self.nodes[&parent].children.len()),
+            };
+            self.nodes
+                .get_mut(&parent)
+                .expect("parent exists")
+                .children
+                .insert(index, node);
+            self.nodes.get_mut(&node).expect("node exists").parent = Some(parent);
+        }
+
+        fn children(&self, node: NodeId) -> Vec<NodeId> {
+            self.nodes[&node].children.clone()
+        }
+
+        fn minted_loop(&self, loop_node: LoopId) -> &LoopNode {
+            match &self.nodes[&loop_node.0].kind {
+                Kind::Loop { node, .. } => node,
+                other => panic!("not a loop: {other:?}"),
+            }
+        }
+    }
+
+    impl ScheduleSurgery for Tree {
+        fn node_name(&self, node: NodeId) -> NodeName {
+            self.nodes[&node].name.clone()
+        }
+
+        fn set_node_name(&mut self, node: NodeId, name: NodeName) {
+            self.nodes.get_mut(&node).expect("node exists").name = name;
+        }
+
+        fn parent(&self, node: NodeId) -> Option<NodeId> {
+            self.nodes[&node].parent
+        }
+
+        fn owner_loop(&self, node: NodeId) -> Option<LoopId> {
+            let mut current = self.nodes[&node].parent;
+            while let Some(candidate) = current {
+                if matches!(self.nodes[&candidate].kind, Kind::Loop { .. }) {
+                    return Some(LoopId(candidate));
+                }
+                current = self.nodes[&candidate].parent;
+            }
+            None
+        }
+
+        fn transfer(&self, node: NodeId) -> TransferNode {
+            match &self.nodes[&node].kind {
+                Kind::Transfer(transfer) => transfer.clone(),
+                other => panic!("not a transfer: {other:?}"),
+            }
+        }
+
+        fn loop_num(&self, loop_node: LoopId) -> DatastageId {
+            self.minted_loop(loop_node).num
+        }
+
+        fn loop_den(&self, loop_node: LoopId) -> DatastageId {
+            self.minted_loop(loop_node).den
+        }
+
+        fn loop_dims(&self, loop_node: LoopId) -> LoopDims {
+            self.minted_loop(loop_node).dims.clone()
+        }
+
+        fn is_parametric(&self, loop_node: LoopId) -> bool {
+            matches!(
+                self.nodes[&loop_node.0].kind,
+                Kind::Loop {
+                    parametric: true,
+                    ..
+                }
+            )
+        }
+
+        fn new_loop(&mut self, node: LoopNode) -> LoopId {
+            let name = node.name.0.clone();
+            LoopId(self.add(
+                &name,
+                Kind::Loop {
+                    node,
+                    parametric: false,
+                },
+                None,
+            ))
+        }
+
+        fn new_block(&mut self, name: NodeName) -> NodeId {
+            self.add(&name.0, Kind::Block, None)
+        }
+
+        fn add_child_node(&mut self, node: NodeId, at: InsertionPoint) {
+            self.link(node, at);
+        }
+
+        fn move_node(&mut self, node: NodeId, at: InsertionPoint) {
+            self.unlink(node);
+            self.link(node, at);
+        }
+
+        fn conditions_under(&self, root: NodeId) -> Vec<NodeId> {
+            let mut found = Vec::new();
+            let mut stack = vec![root];
+            while let Some(node) = stack.pop() {
+                if matches!(self.nodes[&node].kind, Kind::Condition(..)) {
+                    found.push(node);
+                }
+                stack.extend(self.children(node));
+            }
+            found
+        }
+
+        fn loop_cond(&self, condition: NodeId) -> LoopCondComposite {
+            match &self.nodes[&condition].kind {
+                Kind::Condition(cond, _) => cond.clone(),
+                _ => LoopCondComposite::default(),
+            }
+        }
+
+        fn set_loop_cond(&mut self, condition: NodeId, new: LoopCondComposite) {
+            if let Kind::Condition(cond, _) =
+                &mut self.nodes.get_mut(&condition).expect("node exists").kind
+            {
+                *cond = new;
+            }
+        }
+    }
+
+    impl LoopBands for Tree {
+        fn set_loop_den(&mut self, loop_node: LoopId, den: DatastageId) {
+            if let Kind::Loop { node, .. } =
+                &mut self.nodes.get_mut(&loop_node.0).expect("loop exists").kind
+            {
+                node.den = den;
+            }
+        }
+
+        fn set_loop_dims(&mut self, loop_node: LoopId, dims: LoopDims) {
+            if let Kind::Loop { node, .. } =
+                &mut self.nodes.get_mut(&loop_node.0).expect("loop exists").kind
+            {
+                node.dims = dims;
+            }
+        }
+
+        fn move_children(&mut self, from: NodeId, to: NodeId) {
+            let children =
+                core::mem::take(&mut self.nodes.get_mut(&from).expect("node exists").children);
+            for child in children {
+                self.nodes.get_mut(&child).expect("child exists").parent = Some(to);
+                self.nodes
+                    .get_mut(&to)
+                    .expect("node exists")
+                    .children
+                    .push(child);
+            }
+        }
+
+        fn insert_perfectly_nested(&mut self, base: LoopId, nested: LoopId) {
+            self.move_children(base.0, nested.0);
+            self.link(nested.0, InsertionPoint::LastIn(base.0));
+            self.nested.push((base, nested));
+        }
+
+        fn adjust_condition_for_split_loop(
+            &mut self,
+            condition: NodeId,
+            orig: LoopId,
+            new_loops: &[LoopId],
+        ) {
+            self.adjusted.push((condition, orig, new_loops.to_vec()));
+        }
+    }
+
+    impl TransferMoves for Tree {
+        fn is_condition(&self, node: NodeId) -> bool {
+            matches!(self.nodes[&node].kind, Kind::Condition(..))
+        }
+
+        fn then_branch(&self, condition: NodeId) -> Option<NodeId> {
+            self.nodes[&condition].then_region
+        }
+
+        fn core_cl_cond(&self, condition: NodeId) -> CoreClSet {
+            match &self.nodes[&condition].kind {
+                Kind::Condition(_, core_cl) => core_cl.clone(),
+                _ => CoreClSet(BTreeMap::new()),
+            }
+        }
+
+        fn corelets_used(&self) -> BTreeSet<Corelet> {
+            self.corelets.clone()
+        }
+
+        fn core_ids_used(&self) -> Vec<Core> {
+            self.core_ids.clone()
+        }
+
+        fn producer_loops(&self, connect: DataConnect) -> Option<Vec<LoopId>> {
+            self.producers.get(&connect).cloned()
+        }
+
+        fn destination_allocation(&self, dst: &Operand) -> Option<NodeId> {
+            dst.data
+                .my_lds_idx
+                .and_then(|lds| self.dst_allocation.get(&lds).copied())
+        }
+
+        fn clone_condition(&mut self, condition: NodeId) -> NodeId {
+            let entry = self.nodes[&condition].clone();
+            let name = entry.name.0.clone();
+            self.add(&name, entry.kind, None)
+        }
+
+        fn new_condition(&mut self, name: NodeName, core_cl: CoreClSet) -> NodeId {
+            self.add(
+                &name.0,
+                Kind::Condition(LoopCondComposite::default(), core_cl),
+                None,
+            )
+        }
+
+        fn add_then_region(&mut self, condition: NodeId, block: NodeId) {
+            self.nodes
+                .get_mut(&condition)
+                .expect("node exists")
+                .then_region = Some(block);
+            self.link(block, InsertionPoint::LastIn(condition));
+        }
+
+        fn add_else_region(&mut self, condition: NodeId, block: NodeId) {
+            self.nodes
+                .get_mut(&condition)
+                .expect("node exists")
+                .else_region = Some(block);
+            self.link(block, InsertionPoint::LastIn(condition));
+        }
+    }
+
+    impl Dsc for Tree {
+        fn layout_dims(&self, lds: LdsIdx) -> LayoutDims {
+            self.layout
+                .get(&lds)
+                .cloned()
+                .unwrap_or_else(|| LayoutDims::new(PrimaryDim::X1, Vec::new()))
+        }
+    }
+
+    impl TransferUnrolling for Tree {
+        fn non_broadcast_lds_dims(&self, lds: LdsIdx) -> Option<Vec<PrimaryDim>> {
+            self.non_broadcast.get(&lds).cloned()
+        }
+    }
+
+    impl Allocations for Tree {
+        fn allocation(&self, _stored: StoredStream) -> Option<AllocId> {
+            None
+        }
+
+        fn value_allocation(&self, _scale: AllocId) -> Option<AllocId> {
+            None
+        }
+    }
+
+    impl AllocationPaddings for Tree {
+        fn padding(&self, _alloc: AllocId) -> PaddingForm {
+            PaddingForm::default()
+        }
+    }
+
+    impl DscAllocations for Tree {
+        fn own_lds_idx(&self, lds: LdsIdx) -> LdsIdx {
+            lds
+        }
+
+        fn allocation_in(&self, _origin: DataOrigin, _storage: DdcMemory) -> Option<AllocId> {
+            None
+        }
+
+        fn set_allocation_in(&mut self, _lds: LdsIdx, _storage: DdcMemory, _alloc: AllocId) {}
+
+        fn alloc_users(&self, _alloc: AllocId) -> Vec<NodeId> {
+            Vec::new()
+        }
+
+        fn alloc_component(&self, _alloc: AllocId) -> DdcMemory {
+            DdcMemory::SfpLrf
+        }
+
+        fn alloc_origin(&self, _alloc: AllocId) -> DataOrigin {
+            DataOrigin::LabeledDs(LdsIdx(0))
+        }
+
+        fn alloc_node(&self, alloc: AllocId) -> NodeId {
+            NodeId(alloc.0)
+        }
+
+        fn reduce_users_or_delete(
+            &mut self,
+            _alloc_use: AllocationUse,
+            _can_delete: CanDelete,
+        ) -> bool {
+            false
+        }
+    }
+
+    impl FifoResults for Tree {
+        fn connect_consumers(&self, _connect: Option<DataConnect>) -> Vec<FifoConsumer> {
+            self.consumers.clone()
+        }
+
+        fn is_opaque(&self, compute: NodeId) -> bool {
+            self.opaque.contains(&compute)
+        }
+
+        fn transfer_ends(&self, _transfer: NodeId) -> TransferEnds {
+            self.ends.clone().expect("the transfer's ends are stated")
+        }
+
+        fn insert_allocate(&mut self, alloc: AllocId, node: DdcAllocateNode, at: InsertionPoint) {
+            self.allocated.push((alloc, node, at));
+        }
+
+        fn set_dst_storage(&mut self, transfer: NodeId, dst: usize, storage: SenComponent) {
+            self.dst_storage.push((transfer, dst, storage));
+        }
+
+        fn set_src_storage(&mut self, transfer: NodeId, storage: SenComponent) {
+            self.src_storage.push((transfer, storage));
+        }
+
+        fn set_compute_input_unit(&mut self, compute: NodeId, input: usize, unit: SenComponent) {
+            self.compute_inputs.push((compute, input, unit));
+        }
+
+        fn add_alloc_user(&mut self, alloc: AllocId, user: NodeId) {
+            self.alloc_users.push((alloc, user));
+        }
+    }
+
+    /// A STAGE'S EXTENTS AS ENTRY 252 WRITES THEM, recording the ORDER of every write so the
+    /// deliberate `makeDimNotSymbolic`-before-padding sequence is observable.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct Extents {
+        values: BTreeMap<PrimaryDim, u32>,
+        splits: BTreeSet<(DimSplit, PrimaryDim)>,
+        symbolic: BTreeSet<PrimaryDim>,
+        writes: Vec<String>,
+    }
+
+    impl StageExtents for Extents {
+        fn copy_dim_value_from(&mut self, other: &Self, dim: PrimaryDim) {
+            if let Some(value) = other.values.get(&dim) {
+                self.values.insert(dim, *value);
+            }
+            self.writes.push(format!("value {dim:?}"));
+        }
+
+        fn states(&self, split: DimSplit, dim: PrimaryDim) -> bool {
+            self.splits.contains(&(split, dim))
+        }
+
+        fn copy_split_from(&mut self, other: &Self, split: DimSplit, dim: PrimaryDim) {
+            if other.splits.contains(&(split, dim)) {
+                self.splits.insert((split, dim));
+            }
+            self.writes.push(format!("{split:?} {dim:?}"));
+        }
+
+        fn make_dim_not_symbolic(&mut self, dim: PrimaryDim) {
+            self.symbolic.remove(&dim);
+            self.writes.push(format!("not symbolic {dim:?}"));
+        }
+    }
+
+    fn dims(first: PrimaryDim, rest: &[PrimaryDim]) -> LoopDims {
+        let kinded = |dim: PrimaryDim| PrimaryDimAndKind {
+            dim,
+            kind: MetaDimKind::Unpadded,
+        };
+        LoopDims::new(kinded(first), rest.iter().copied().map(kinded).collect())
+    }
+
+    fn operand(unit: SenComponent, storage: SenComponent, lds: Option<LdsIdx>) -> Operand {
+        Operand {
+            unit,
+            storage,
+            data: DataInfo {
+                data_connect: Some(DataConnect::ArfPt),
+                my_lds_idx: lds,
+                constant_id: None,
+            },
+        }
+    }
+
+    fn transfer_node(name: &str, src: Operand, dsts: Dsts) -> TransferNode {
+        TransferNode {
+            name: NodeName(name.to_string()),
+            src,
+            dsts,
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn splitting_a_band_keeps_the_outermost_set_and_repoints_every_condition_at_its_own_new_loop() {
+        let mut tree = Tree::default();
+        let root = tree.add("root", Kind::Block, None);
+        let base = tree.loop_node(
+            1,
+            2,
+            dims(PrimaryDim::In, &[PrimaryDim::Out, PrimaryDim::Mb]),
+            Some(root),
+        );
+        let moved = tree.add(
+            "transfer",
+            Kind::Transfer(transfer_node(
+                "transfer",
+                operand(SenComponent::Pe, SenComponent::Lx, None),
+                Dsts::new(
+                    operand(SenComponent::Sfp, SenComponent::L0, None),
+                    Vec::new(),
+                ),
+            )),
+            Some(base.0),
+        );
+        let condition = tree.add(
+            "cond0",
+            Kind::Condition(
+                LoopCondComposite {
+                    or_of_ands: vec![vec![LoopCond {
+                        loop_node: base.0,
+                        dim: PrimaryDim::Out,
+                    }]],
+                    negated: false,
+                },
+                CoreClSet(BTreeMap::new()),
+            ),
+            Some(base.0),
+        );
+        let metadata = Metadata::default();
+
+        let split = LoopBandSplit::of(
+            &tree,
+            &metadata,
+            base,
+            &[dims(PrimaryDim::Mb, &[]), dims(PrimaryDim::Out, &[])],
+            UnspecifiedDims::Innermost,
+        )
+        .expect("the sets are drawn from the base loop's own dims and do not overlap");
+        let innermost = split_loop_band_on_dim(&mut tree, split);
+
+        // The base loop keeps the outermost set, and the dims no set named became the innermost loop.
+        assert_eq!(
+            tree.loop_dims(base).iter().collect::<Vec<_>>(),
+            dims(PrimaryDim::Mb, &[]).iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tree.loop_dims(innermost).iter().collect::<Vec<_>>(),
+            dims(PrimaryDim::In, &[]).iter().collect::<Vec<_>>()
+        );
+        let expected = format!(
+            "{}__split",
+            construct_loop_node(DatastageId(1), DatastageId(2), dims(PrimaryDim::Mb, &[]))
+                .name
+                .0
+        );
+        assert_eq!(tree.node_name(base.0), NodeName(expected));
+
+        // A perfect nest, with the base loop's own children in the innermost loop.
+        let middle = tree.children(base.0);
+        assert_eq!(middle.len(), 1);
+        assert_eq!(tree.children(middle[0]), vec![innermost.0]);
+        assert_eq!(tree.children(innermost.0), vec![moved, condition]);
+
+        // The condition compared against the base loop on `Out`, which is the MIDDLE loop's dim now.
+        assert_eq!(
+            tree.loop_cond(condition).or_of_ands,
+            vec![vec![LoopCond {
+                loop_node: middle[0],
+                dim: PrimaryDim::Out,
+            }]]
+        );
+    }
+
+    #[test]
+    fn a_dim_named_by_two_split_sets_is_no_split_at_all() {
+        let mut tree = Tree::default();
+        let root = tree.add("root", Kind::Block, None);
+        let base = tree.loop_node(1, 2, dims(PrimaryDim::In, &[PrimaryDim::Out]), Some(root));
+
+        assert!(
+            LoopBandSplit::of(
+                &tree,
+                &Metadata::default(),
+                base,
+                &[dims(PrimaryDim::In, &[]), dims(PrimaryDim::In, &[])],
+                UnspecifiedDims::Innermost,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn splitting_a_band_on_its_datastage_nests_a_copy_of_the_numerator_and_takes_it_as_the_den() {
+        let mut tree = Tree::default();
+        let root = tree.add("root", Kind::Block, None);
+        let base = tree.loop_node(0, 3, dims(PrimaryDim::In, &[]), Some(root));
+        let condition = tree.add(
+            "cond0",
+            Kind::Condition(LoopCondComposite::default(), CoreClSet(BTreeMap::new())),
+            Some(base.0),
+        );
+        let mut stages: DataStages<()> =
+            DataStages(BTreeMap::from([(DatastageId(0), DataStage::default())]));
+
+        let site = DatastageSplitSite::of(
+            &tree,
+            &Metadata::default(),
+            &stages,
+            base,
+            DatastageExploration::Open,
+        )
+        .expect("an internal loop whose numerator stage exists, before exploration finished");
+        let minted = split_loop_band_on_datastage(&mut tree, &mut stages, site);
+
+        assert_eq!(tree.loop_num(minted), DatastageId(1));
+        assert_eq!(tree.loop_den(minted), DatastageId(3));
+        assert_eq!(tree.loop_den(base), DatastageId(1));
+        assert_eq!(tree.children(base.0), vec![minted.0]);
+        assert_eq!(tree.children(minted.0), vec![condition]);
+        assert_eq!(tree.adjusted, vec![(condition, base, vec![base, minted])]);
+    }
+
+    #[test]
+    fn hoisting_a_transfer_takes_its_allocation_and_reproduces_the_core_condition_it_sat_under() {
+        let mut tree = Tree::default();
+        tree.core_ids = vec![Core::checked(0).expect("core 0")];
+        tree.corelets = BTreeSet::from([Corelet::checked(0).expect("corelet 0")]);
+        let core_cl = CoreClSet(BTreeMap::from([(
+            Core::checked(0).expect("core 0"),
+            BTreeSet::from([Corelet::checked(0).expect("corelet 0")]),
+        )]));
+
+        let root = tree.add("root", Kind::Block, None);
+        let outer = tree.loop_node(1, 2, dims(PrimaryDim::In, &[]), Some(root));
+        let condition = tree.add(
+            "cond0",
+            Kind::Condition(LoopCondComposite::default(), core_cl.clone()),
+            Some(outer.0),
+        );
+        let then_region = tree.add("cond0_then", Kind::Block, Some(condition));
+        tree.nodes
+            .get_mut(&condition)
+            .expect("condition exists")
+            .then_region = Some(then_region);
+        let inner = tree.loop_node(2, 3, dims(PrimaryDim::Out, &[]), Some(then_region));
+        let moved = tree.add(
+            "t0",
+            Kind::Transfer(transfer_node(
+                "t0",
+                operand(SenComponent::Pe, SenComponent::Lx, None),
+                Dsts::new(
+                    operand(SenComponent::Sfp, SenComponent::L0, Some(LdsIdx(5))),
+                    Vec::new(),
+                ),
+            )),
+            Some(inner.0),
+        );
+        let allocation = tree.add("allocate_lds5_l0", Kind::Allocate, Some(inner.0));
+        tree.dst_allocation.insert(LdsIdx(5), allocation);
+
+        let hoist = TransferMove::of(
+            &tree,
+            &Metadata::default(),
+            moved,
+            outer,
+            DatastageExploration::Open,
+        )
+        .expect("an internal transfer whose destination loop is an ancestor");
+        assert_eq!(hoist.new_parent(), outer);
+        move_transfer_node(&mut tree, hoist);
+
+        // The allocation and a reproduced core condition land before the loop the transfer left.
+        let siblings = tree.children(then_region);
+        assert_eq!(siblings.len(), 3);
+        assert_eq!(siblings[0], allocation);
+        assert_eq!(siblings[2], inner.0);
+        let reproduced = siblings[1];
+        assert_eq!(
+            tree.node_name(reproduced),
+            NodeName("core_corelet_reuse_t0".to_string())
+        );
+        assert_eq!(tree.core_cl_cond(reproduced), core_cl);
+
+        // And the transfer is the first thing in that condition's own then region.
+        let region = tree
+            .then_branch(reproduced)
+            .expect("a then region was added");
+        assert_eq!(tree.children(region), vec![moved]);
+    }
+
+    #[test]
+    fn a_destination_loop_that_does_not_enclose_the_transfer_is_no_move() {
+        let mut tree = Tree::default();
+        let root = tree.add("root", Kind::Block, None);
+        let elsewhere = tree.loop_node(1, 2, dims(PrimaryDim::In, &[]), Some(root));
+        let owner = tree.loop_node(2, 3, dims(PrimaryDim::Out, &[]), Some(root));
+        let moved = tree.add(
+            "t0",
+            Kind::Transfer(transfer_node(
+                "t0",
+                operand(SenComponent::Pe, SenComponent::Lx, None),
+                Dsts::new(
+                    operand(SenComponent::Sfp, SenComponent::L0, None),
+                    Vec::new(),
+                ),
+            )),
+            Some(owner.0),
+        );
+
+        assert!(
+            TransferMove::of(
+                &tree,
+                &Metadata::default(),
+                moved,
+                elsewhere,
+                DatastageExploration::Open,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_fifo_destination_gains_an_lrf_allocation_and_every_consumer_is_repointed_at_it() {
+        let mut tree = Tree::default();
+        tree.layout.insert(
+            LdsIdx(2),
+            LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out]),
+        );
+        tree.ends = Some(TransferEnds {
+            src: StoredStream {
+                stream: DataStream {
+                    origin: DataOrigin::LabeledDs(LdsIdx(2)),
+                    data_connect: Some(DataConnect::ArfPt),
+                },
+                storage: DfirUnit::Pe,
+            },
+            dsts: Vec::new(),
+        });
+
+        let root = tree.add("root", Kind::Block, None);
+        let moved = tree.add(
+            "t0",
+            Kind::Transfer(transfer_node(
+                "t0",
+                operand(SenComponent::Pe, SenComponent::Lx, Some(LdsIdx(2))),
+                // NOT one of `dsc2::memories`, which is exactly what a FIFO result is.
+                Dsts::new(
+                    operand(
+                        SenComponent::Sfp,
+                        SenComponent::NoComponent,
+                        Some(LdsIdx(2)),
+                    ),
+                    Vec::new(),
+                ),
+            )),
+            Some(root),
+        );
+        let consuming_transfer = NodeId(50);
+        let consuming_compute = NodeId(51);
+        tree.consumers = vec![
+            FifoConsumer::Transfer(consuming_transfer),
+            FifoConsumer::Compute(
+                consuming_compute,
+                ComputeNode {
+                    name: NodeName("c0".to_string()),
+                    op: ComputeType::Macc,
+                    ex_unit: SenComponent::Sfp,
+                    inputs: vec![operand(SenComponent::Sfp, SenComponent::NoComponent, None)],
+                    outputs: Vec::new(),
+                    num_folds_engaged: NumFolds::ONE,
+                },
+            ),
+        ];
+        let mut metadata = Metadata::default();
+
+        let site = FifoConversionSite::of(&metadata, moved, DatastageExploration::Open)
+            .expect("an internal transfer before exploration finished");
+        assert!(convert_result_from_fifo_to_reg(
+            &mut tree,
+            &mut metadata,
+            site,
+            AllocId(9)
+        ));
+
+        // The SFP's own register file, allocated right before the transfer.
+        let (alloc, node, at) = tree
+            .allocated
+            .first()
+            .cloned()
+            .expect("an allocation minted");
+        assert_eq!(alloc, AllocId(9));
+        assert_eq!(node.component, DdcMemory::SfpLrf);
+        assert_eq!(
+            node.name,
+            NodeName(format!(
+                "allocate_lds2_sfplrf_{}_fifo_to_reg",
+                connect_spelling(Some(DataConnect::ArfPt))
+            ))
+        );
+        assert_eq!(at, InsertionPoint::Before(moved));
+
+        // The destination and every consumer now name that register file.
+        assert_eq!(tree.dst_storage, vec![(moved, 0, SenComponent::Sfplrf)]);
+        assert_eq!(
+            tree.src_storage,
+            vec![(consuming_transfer, SenComponent::Sfplrf)]
+        );
+        assert_eq!(
+            tree.compute_inputs,
+            vec![(consuming_compute, 0, SenComponent::Sfplrf)]
+        );
+        assert_eq!(
+            tree.alloc_users,
+            vec![
+                (AllocId(9), consuming_transfer),
+                (AllocId(9), consuming_compute)
+            ]
+        );
+    }
+
+    #[test]
+    fn unrolling_a_transfer_mints_one_loop_per_layout_dim_against_a_minimizing_denominator() {
+        let mut tree = Tree::default();
+        tree.layout.insert(
+            LdsIdx(1),
+            LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out]),
+        );
+        let root = tree.add("root", Kind::Block, None);
+        let outer = tree.loop_node(1, 10, dims(PrimaryDim::In, &[]), Some(root));
+        let inner = tree.loop_node(2, 20, dims(PrimaryDim::Out, &[]), Some(outer.0));
+        let moved = tree.add(
+            "t0",
+            Kind::Transfer(transfer_node(
+                "t0",
+                operand(SenComponent::Pe, SenComponent::Lx, Some(LdsIdx(1))),
+                Dsts::new(
+                    operand(SenComponent::Sfp, SenComponent::L0, None),
+                    Vec::new(),
+                ),
+            )),
+            Some(inner.0),
+        );
+        let mut stages: DataStages<()> = DataStages::default();
+        let mut metadata = Metadata::default();
+        let site = InternalNode::of(&metadata, moved).expect("an internal transfer");
+
+        assert!(unroll_transfer(&mut tree, &mut stages, &mut metadata, site));
+
+        // One loop per layout dim, the innermost layout dim outermost, each against the enclosing
+        // loop's own denominator and the one new minimizing stage.
+        let den = DatastageId(0);
+        assert_eq!(metadata.datastages[&den].strategy, Strategy::Minimize);
+        let over_out = LoopId(tree.children(inner.0)[0]);
+        let over_in = LoopId(tree.children(over_out.0)[0]);
+        assert_eq!(tree.loop_num(over_out), DatastageId(20));
+        assert_eq!(tree.loop_num(over_in), DatastageId(10));
+        assert_eq!(tree.loop_den(over_out), den);
+        assert_eq!(tree.loop_den(over_in), den);
+        assert_eq!(tree.children(over_in.0), vec![moved]);
+    }
+
+    #[test]
+    fn unrolling_for_symbolic_dims_fills_the_new_stage_and_stops_being_symbolic_before_padding() {
+        let mut tree = Tree::default();
+        tree.non_broadcast
+            .insert(LdsIdx(1), vec![PrimaryDim::In, PrimaryDim::Out]);
+        let root = tree.add("root", Kind::Block, None);
+        let outer = tree.loop_node(1, 10, dims(PrimaryDim::In, &[]), Some(root));
+        let moved = tree.add(
+            "t0",
+            Kind::Transfer(transfer_node(
+                "t0",
+                operand(SenComponent::Pe, SenComponent::Lx, Some(LdsIdx(1))),
+                Dsts::new(
+                    operand(SenComponent::Sfp, SenComponent::L0, None),
+                    Vec::new(),
+                ),
+            )),
+            Some(outer.0),
+        );
+
+        // The reference stage states `In`, and its EPILOGUE half deliberately states no padding.
+        let reference = DataStage {
+            ss: StageDims {
+                name: StageName("10".to_string()),
+                dims: Extents {
+                    values: BTreeMap::from([(PrimaryDim::In, 4)]),
+                    splits: BTreeSet::from([
+                        (DimSplit::Corelet, PrimaryDim::In),
+                        (DimSplit::Padding, PrimaryDim::In),
+                    ]),
+                    symbolic: BTreeSet::from([PrimaryDim::In]),
+                    writes: Vec::new(),
+                },
+            },
+            el: StageDims {
+                name: StageName("10el".to_string()),
+                dims: Extents {
+                    values: BTreeMap::from([(PrimaryDim::In, 2)]),
+                    splits: BTreeSet::from([(DimSplit::Corelet, PrimaryDim::In)]),
+                    symbolic: BTreeSet::from([PrimaryDim::In]),
+                    writes: Vec::new(),
+                },
+            },
+        };
+        let mut stages = DataStages(BTreeMap::from([(DatastageId(10), reference)]));
+        let symbolic = BTreeMap::from([(
+            PrimaryDim::In,
+            SymbolicDimInfo {
+                max_size: MaxSize(8),
+                granularity: Granularity::new(NonZeroU32::new(1).expect("a step of one")),
+            },
+        )]);
+        let site = InternalNode::of(&Metadata::default(), moved).expect("an internal transfer");
+
+        assert!(unroll_transfer_for_symbolic_dims(
+            &mut tree,
+            &mut stages,
+            site,
+            &symbolic
+        ));
+
+        let minted = &stages.0[&DatastageId(1)];
+        assert_eq!(minted.ss.dims.values, BTreeMap::from([(PrimaryDim::In, 4)]));
+        assert_eq!(minted.el.dims.values, BTreeMap::from([(PrimaryDim::In, 2)]));
+        assert!(minted.ss.dims.symbolic.is_empty());
+        // The padding copy runs LAST, and the epilogue half is asked for it because the STEADY-STATE
+        // half states it.
+        assert_eq!(
+            minted.el.dims.writes,
+            vec![
+                "value In".to_string(),
+                "Corelet In".to_string(),
+                "not symbolic In".to_string(),
+                "Padding In".to_string(),
+            ]
+        );
+        assert!(
+            !minted
+                .el
+                .dims
+                .splits
+                .contains(&(DimSplit::Padding, PrimaryDim::In))
+        );
+
+        // Only the symbolic dim is unrolled, and against the enclosing loop's denominator.
+        let over_in = LoopId(tree.children(outer.0)[0]);
+        assert_eq!(tree.loop_num(over_in), DatastageId(10));
+        assert_eq!(tree.loop_den(over_in), DatastageId(1));
+        assert_eq!(tree.children(over_in.0), vec![moved]);
+    }
+
+    /// THE ONE DATASTREAM THIS STAND-IN CALLS EXTERNAL, keyed on the triple entries 253/254 hand
+    /// over — so a port that passed `Operand::unit` instead of `Operand::storage` cannot match it.
+    struct External(Option<(Option<DataConnect>, SenComponent, StreamDirection)>);
+
+    impl ExternalStreams for External {
+        fn storage_or_datastream_is_external(
+            &self,
+            data: DataInfo,
+            storage: SenComponent,
+            direction: StreamDirection,
+        ) -> bool {
+            self.0 == Some((data.data_connect, storage, direction))
+        }
+    }
+
+    #[test]
+    fn a_transfers_source_is_asked_about_by_its_storage_and_its_destination_by_the_destinations() {
+        let src = operand(SenComponent::Pe, SenComponent::Lx, None);
+        let dst = operand(SenComponent::Sfp, SenComponent::L0, None);
+        let node = transfer_node("t0", src, Dsts::new(dst, Vec::new()));
+
+        let by_src_storage = External(Some((
+            Some(DataConnect::ArfPt),
+            SenComponent::Lx,
+            StreamDirection::Incoming,
+        )));
+        assert!(src_related_to_external_nodes(&by_src_storage, &node));
+        // The SOURCE's `unit_` is not what is asked about, and neither is the destination's storage.
+        let by_src_unit = External(Some((
+            Some(DataConnect::ArfPt),
+            SenComponent::Pe,
+            StreamDirection::Incoming,
+        )));
+        assert!(!src_related_to_external_nodes(&by_src_unit, &node));
+
+        let by_dst_storage = External(Some((
+            Some(DataConnect::ArfPt),
+            SenComponent::L0,
+            StreamDirection::Outgoing,
+        )));
+        assert!(dest_related_to_external_nodes(
+            &by_dst_storage,
+            node.dsts.first()
+        ));
+        assert!(!dest_related_to_external_nodes(
+            &by_src_storage,
+            node.dsts.first()
+        ));
     }
 }
