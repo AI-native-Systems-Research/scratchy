@@ -7919,8 +7919,9 @@ pub fn convert_transfer_direct_to_indirect<T: L3TreeSurgery + ?Sized>(
 ///
 /// ⛔ [`None`] IS the distribution's refusals, a zero-extent denominator and the `int` arithmetic
 /// beside them. ⚠️ TRAP: `foldParams.insert(iter, ..)` RETURNS THE INSERTED ELEMENT, so successive
-/// inserts all land at the SAME index — the distributed loops end up REVERSED against the order they
-/// were handed to the distribution, and the final walk from the back rebuilds it.
+/// inserts land at the SAME index and the distributed loops end up REVERSED, which the walk from the
+/// back rebuilds. ⛔ TRAP: `int scale = allocLds.scale_.at(dimIdx)` TRUNCATES a `double`, so the
+/// non-broadcast test is `scale_ >= 1` and a fractional scale gathers NO loops.
 pub fn build_coordinate_from_allocation<'a, D, E>(
     node: Node<'a>,
     node_id: NodeId,
@@ -7951,7 +7952,7 @@ where
         let mut related_loops: Vec<LoopAndDim<'_>> = Vec::new();
         let non_broadcast = match reference.labeled_ds.scale(dim) {
             None => true,
-            Some(scale) => matches!(scale, Scale::Sized(value) if value > 0.0),
+            Some(scale) => matches!(scale, Scale::Sized(value) if value >= 1.0),
         };
         if non_broadcast {
             for owner in &chain {
@@ -9293,6 +9294,158 @@ mod tests_e221_e228 {
             (1, 1, 1)
         );
         assert!(coordinate.fold_constructed());
+    }
+
+    #[test]
+    fn a_fractional_scale_is_broadcast_and_gathers_no_loops_to_distribute() {
+        struct OneDim;
+
+        impl Dsc for OneDim {
+            fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+                LayoutDims::new(PrimaryDim::X, Vec::new())
+            }
+        }
+
+        /// A distributor the broadcast dim must never reach.
+        struct NoDistribution;
+
+        impl TemporalLoopDistribution for NoDistribution {
+            type LoopParams = ();
+
+            fn related_loops<'l>(
+                &self,
+                _dim: PrimaryDimAndKind,
+                _chain: &[LoopAndDim<'l>],
+                _pad: PadType,
+            ) -> Vec<LoopAndDim<'l>> {
+                unreachable!("a broadcast dim relates no loops")
+            }
+
+            fn distribute(
+                &self,
+                _request: &ElemArrDistribution<'_>,
+                _loop_params: &mut Self::LoopParams,
+            ) -> Vec<FoldParamInfo> {
+                unreachable!("a broadcast dim distributes nothing")
+            }
+
+            fn distributed(
+                &self,
+                _loop_params: &Self::LoopParams,
+                _loop_node: &LoopNode,
+                _dim: PrimaryDim,
+            ) -> Option<DistributedLoop> {
+                None
+            }
+        }
+
+        impl AllocCoordinateSeam for NoDistribution {
+            fn parametric_iter_count(&self, _loop_node: &LoopNode) -> Option<FoldCardinality> {
+                None
+            }
+
+            fn comp_view(&self, _stage: DatastageId, _dim: PrimaryDim) -> Option<Extent> {
+                None
+            }
+
+            fn stage_padding(
+                &self,
+                _stage: DatastageId,
+            ) -> Option<&BTreeMap<PrimaryDim, DimPadding>> {
+                None
+            }
+        }
+
+        let mut reference = Coordinate::default();
+        reference.add_fold_front(
+            PrimaryDim::X,
+            CoordinateCategory::ElemArr,
+            FoldCardinality(4),
+            FoldLabel("kept".to_owned()),
+            FoldCoeff(1),
+            FoldCoeff(0),
+        );
+        reference.add_fold_front(
+            PrimaryDim::X,
+            CoordinateCategory::Spatial,
+            FoldCardinality(2),
+            FoldLabel("core".to_owned()),
+            FoldCoeff(8),
+            FoldCoeff(0),
+        );
+        // `int scale = 0.5` is 0, so the reference takes the broadcast arm.
+        let labeled_ds = LabeledDs::new(
+            DsType::Input,
+            vec![(PrimaryDim::X, Scale::Sized(0.5))],
+            LdsIdx(3),
+            Pinning::default(),
+        );
+        let alloc = AllocateNode {
+            name: NodeName("allocate_lds3".to_owned()),
+            component: SenComponent::Lx,
+            lds: Some(LdsIdx(3)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AddressLayout::new((PrimaryDim::X, MaxDimSize::Unset), Vec::new()),
+            start_address: StartAddress::default(),
+            placement: AllocPlacement::default(),
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        };
+        let inner = construct_loop_node(
+            DatastageId(1),
+            DatastageId(2),
+            LoopDims::new(
+                PrimaryDimAndKind {
+                    dim: PrimaryDim::X,
+                    kind: MetaDimKind::Unpadded,
+                },
+                Vec::new(),
+            ),
+        );
+        let root = construct_loop_node(
+            DatastageId(0),
+            DatastageId(1),
+            LoopDims::new(
+                PrimaryDimAndKind {
+                    dim: PrimaryDim::Y,
+                    kind: MetaDimKind::Unpadded,
+                },
+                Vec::new(),
+            ),
+        );
+        let loops = OwnerLoops::of(vec![&inner, &root]).expect("a loop chain with a root");
+        let mut coordinate = Coordinate::default();
+
+        build_coordinate_from_allocation(
+            Node::Allocate(&alloc),
+            NodeId(0),
+            &OneDim,
+            &loops,
+            ReferenceAllocation {
+                coordinate: &reference,
+                lds: LdsIdx(3),
+                labeled_ds: &labeled_ds,
+            },
+            &mut NoDistribution,
+            &mut (),
+            &mut coordinate,
+        )
+        .expect("a coordinate built from its reference");
+
+        let folds = coordinate
+            .fold_dim(PrimaryDim::X)
+            .expect("the dim the reference shares");
+        assert_eq!(
+            folds
+                .folds()
+                .map(|fold| (fold.label.0.clone(), fold.cardinality, fold.alpha))
+                .collect::<Vec<_>>(),
+            vec![
+                ("core".to_owned(), FoldCardinality(2), FoldCoeff(8)),
+                ("elem_arr_0".to_owned(), FoldCardinality(4), FoldCoeff(1)),
+            ]
+        );
     }
 }
 
