@@ -36,136 +36,6 @@
         "types": [],
         "symbols": [
          {
-          "name": "e104_clear",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e125_minimizeAllocations",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e126_populateUnitTimeTransfers",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e127_spreadDataInAllocate",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e128_finalizeAllocateLayouts",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e132_restoreDsc",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e133_adjustLoopOffsetsAndAddresses",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e134_simplifyScheduleTree",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e135_updateLdsIdxMetadata",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e136_initGlobalData",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e244_cloneForOffsetAdjustment",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e245_setSizeForFixedSizeTransfers",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e246_transformForInterSliceRestickify",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e260_fillLoopOffsetsAndAddresses",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e261_finalizeOps",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e262_coordinateMasking",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e263_identifyBelowChunkBoundaryLoops",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e300_packStickDim",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e301_hoistTransfersUpForReuse",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e302_unrollSymbolicTransfers",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e303_unrollSpreadTransfers",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e307_exploreAssignDataStages",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e308_prepDsc",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e309_attachToPrefilledSchedule",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e338_performPeSfpWorkSplit",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e345_exportToDdl",
-          "defined_in": "crustify-ddc/cpp/ddl.cpp",
-          "scope": "port"
-         },
-         {
           "name": "e359_transformRegToFifoOrLatch",
           "defined_in": "crustify-ddc/cpp/ddc.cpp",
           "scope": "port"
@@ -213,16 +83,6 @@
        "deps": {
         "types": [],
         "symbols": [
-         {
-          "name": "e104_clear",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e187_clear",
-          "defined_in": "crustify-ddc/cpp/ddl.cpp",
-          "scope": "port"
-         },
          {
           "name": "e373_getMinParamForDim",
           "defined_in": "crustify-ddc/cpp/l3.cpp",
@@ -307,36 +167,6 @@
         "types": [],
         "symbols": [
          {
-          "name": "e008_hasDimensionReuse",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e010_getCoreSplitDimensions",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e014_isLabeledDsLXNeighbor",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e022_addOrUpdateDataStageParam",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e207_generateDscParamCandidates",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e222_allocAllMem",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
           "name": "e352_updateChunkDataStagesFromCandidates",
           "defined_in": "crustify-ddc/cpp/l3.cpp",
           "scope": "port"
@@ -385,87 +215,7 @@
         "types": [],
         "symbols": [
          {
-          "name": "e001_isSameDscGroup",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e053_verifyScheduleTree",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e054_prepDsc",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e059_getPagedDimensions",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
           "name": "e214_optimizeHbmLdsOutputInScheduleTree",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e221_fillTransferZeroPaddingInfo",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e222_allocAllMem",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e289_optimizeHbmTransfers",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e290_createChunkLoops",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e291_fillTransferMulticastInfo",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e292_fillAllocationStartAddrAndOffset",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e293_setLxBufferType",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e295_fillExplicitTransferSize",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e332_createSynchronization",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e333_fillLoopOffsetsAndAddresses",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e334_addIbrDataStage",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e335_addOnePageDataStage",
           "defined_in": "crustify-ddc/cpp/l3.cpp",
           "scope": "port"
          },
