@@ -98,8 +98,9 @@ use std::collections::BTreeMap;
 
 use super::analyses::{ColoringGraph, LiveRange};
 use crate::arch::{Arch, IsaGen};
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::sentient::{BinaryOp, Port, Precision, TernaryOp, UnaryOp};
-use crate::islands::sentient::dialects::{Op, sentient};
+use crate::islands::sentient::dialects::{Op, regions_ref, sentient};
 use crate::units::DfirUnit;
 
 /// WHICH OF THE THREE COMPUTE PORTS — the count is fixed at `performGraphColoring(3)` (`:784`).
@@ -542,10 +543,43 @@ pub(crate) fn is_swappable_per_algebraic_reassociation(op: &Op) -> Option<MacOpe
 //   original  : void PortAssignmentPass::addReuseToDummyOperands()
 //   calls     : e124_getPortAttr, e252_size
 
-// crustify:todo: e455_buildGraphNodes
-//   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:636  (6 body lines, level 2)
-//   original  : void PortAssignmentPass::buildGraphNodes(dataflow::ProgramUnitOp &unit, const SenComponents comp)
-//   calls     : e339_addNodesToGraph
+impl<G: ColoringGraph> PortAssignment<G> {
+    /// Replaces: e455_buildGraphNodes
+    ///
+    /// Builds the colouring graph's nodes from the ISA restrictions: every op of the unit, in
+    /// pre-order, is handed to [`Self::add_nodes_to_graph`].
+    ///
+    /// ⛔ IT DOES NOT INITIALISE THE GRAPH ITS COMMENT (`:637-638`) CLAIMS TO: the clearing is the
+    /// caller's, `doPortAssignments`' `clean()` one line earlier (`:780-781`), so calling this twice
+    /// ADDS to the nodes already there.
+    pub(crate) fn build_graph_nodes<A: Arch>(&mut self, unit: &ProgramUnit<A>, comp: DfirUnit) {
+        self.add_nodes_in::<A>(&unit.body, comp);
+    }
+
+    /// `unit.walk<WalkOrder::PreOrder>` — the op, then its regions.
+    fn add_nodes_in<A: Arch>(&mut self, scope: &[Op], comp: DfirUnit) {
+        for op in scope {
+            self.add_nodes_to_graph::<A>(op, comp);
+            for region in regions_ref(op) {
+                self.add_nodes_in::<A>(region, comp);
+            }
+        }
+    }
+
+    /// `PortAssignmentPass::addNodesToGraph(Operation *, SenComponents)` — e455's ONE callee and
+    /// SENPASS UNIT e339, whose anchor is still open below.
+    ///
+    /// ⛔ e339 IS A LEVEL-1 DEPENDENCY THAT NO REMAINING SCHEDULE OWNS: sc2's port driver died on an
+    /// authentication error with 12 batches unrun, `sentient.cpp: e334_mergeScalarOpIntoMac +7` among
+    /// them. Isolating the call in a private seam is the `2a8195231` precedent, and e339's TODO is left
+    /// untouched — filling it is not this batch's work.
+    fn add_nodes_to_graph<A: Arch>(&mut self, op: &Op, comp: DfirUnit) {
+        todo!(
+            "PortAssignmentPass::addNodesToGraph — senpass e339 (PortAssignment.cpp:473) is not \
+             ported yet, and this {comp:?} unit's {op:?} needs it"
+        )
+    }
+}
 
 // crustify:todo: e520_processDataID
 //   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:93  (67 body lines, level 3)
@@ -576,6 +610,7 @@ pub(crate) fn is_swappable_per_algebraic_reassociation(op: &Op) -> Option<MacOpe
 mod unit_tests {
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::sentient::dialects::Val;
     use crate::islands::sentient::dialects::sentient::{LrfIndex, Operand, RegType, ResultPorts};
     use crate::units::Row;
@@ -917,5 +952,33 @@ mod unit_tests {
         );
         // A non-mac op is the reference's `-1` too.
         assert_eq!(is_swappable_per_algebraic_reassociation(&scalar_copy()), None);
+    }
+
+    /// A `dataflow.program_unit` on a PE holding `body`.
+    fn pe_unit(body: Vec<Op>) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(DfirUnit::Pe, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e455 — an EMPTY unit asks nothing and adds nothing, which is why `doPortAssignments` tests the
+    /// node count before building any edge.
+    #[test]
+    fn e455_adds_nothing_of_its_own_for_a_unit_with_no_ops() {
+        let mut pass = PortAssignment::<CountingGraph>::default();
+        pass.build_graph_nodes::<Dd2>(&pe_unit(Vec::new()), DfirUnit::Pe);
+        assert_eq!(pass.graph, CountingGraph::default());
+        assert!(pass.dummy_nodes.is_empty() && pass.reuse_nodes.is_empty());
+    }
+
+    /// e455's positive — an op of the unit IS handed on, and the hand-off is e339, which is not ported.
+    #[test]
+    #[should_panic(expected = "senpass e339")]
+    fn e455_hands_each_op_of_the_unit_to_the_unported_e339() {
+        let unit = pe_unit(vec![mac(Port::West, Precision::Fp16, Precision::Fp16)]);
+        PortAssignment::<CountingGraph>::default().build_graph_nodes::<Dd2>(&unit, DfirUnit::Pe);
     }
 }

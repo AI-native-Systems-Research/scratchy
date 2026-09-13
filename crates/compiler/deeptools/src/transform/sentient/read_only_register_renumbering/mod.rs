@@ -92,12 +92,15 @@
 use crate::arch::Arch;
 use crate::formats::Bits;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, sentient, set_value_reg_index, uniform,
+    Definitions, Op, Val, regions_ref, sentient, set_value_reg_index, uniform,
 };
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
 use crate::transform::sentient::ProgStitch;
-use crate::transform::sentient::analyses::{ExpressionEvaluator, PinningSchemeManager};
+use crate::transform::sentient::analyses::{
+    ExpressionEvaluator, OutOfScopeEvaluator, OutOfScopePinningSchemeManager, PinningSchemeManager,
+};
+use crate::units::DfirUnit;
 use crate::workload::Workload;
 
 /// `-dcc-read-only-register-renumbering-disable`, `cl::init(false)` (`:58-61`).
@@ -154,8 +157,10 @@ pub(crate) struct Candidate {
 /// (`:173`, `:177`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReadOnlyRegisterRenumbering {
-    /// `unsafe_to_renumber_` — ⛔ ONCE SET IT IS NEVER CLEARED, and `cleanup()` does not touch it, so
-    /// the first unit that gives up disables the pass for every unit after it.
+    /// `unsafe_to_renumber_` — ⛔ ONCE SET IT IS NEVER CLEARED **WITHIN A PROGRAM UNIT**: `cleanup()`
+    /// does not touch it, so the first op that gives up disables the pass for the whole unit. Its one
+    /// clearer is the `initialize(unit)` inlined at the top of [`Self::run_on_unit`] (e456), which runs
+    /// BEFORE that unit's gate — so a later unit starts safe again even when it is skipped.
     pub(crate) unsafe_to_renumber: bool,
     /// `candidates_`.
     pub(crate) candidates: Vec<Candidate>,
@@ -204,18 +209,48 @@ impl ReadOnlyRegisterRenumbering {
         }
     }
 
-    /// `ReadOnlyRegisterRenumberingPass::runOn(dataflow::ProgramUnitOp)` — e127's ONE callee, and
-    /// SENPASS UNIT e456, whose anchor is still open below.
+    /// Replaces: e456_runOn
     ///
-    /// ⛔ THE SCHEDULER RECORDED THE EDGE INVERTED: `UNITS.tsv` gives e456 `calls e127_runOn` and e127
-    /// no callees, because the two `runOn`s share a name. e127 is the caller. Isolating the delegation
-    /// in a private seam is the `2a8195231` precedent, and e456's anchor is left untouched.
+    /// One program unit, and only an L3 half: evaluate its pinning scheme, collect every LBR copy of a
+    /// constant, renumber the ones that survived, then drop the list.
+    ///
+    /// ⛔ THE SCHEDULER RECORDED e127'S EDGE INVERTED — `UNITS.tsv` gives e456 `calls e127_runOn`
+    /// because the two `runOn`s share a name; e127 is the CALLER and this is its ONE callee, so the
+    /// port is e127's private seam rather than a fourth public entry.
+    /// ⛔ `calls e221_initialize` IS A NAME COLLISION: e221 is `SpecializedCanonicalization`'s
+    /// `initialize`, while this pass's is the one-liner `unsafe_to_renumber_ = false` (`:161`) — too
+    /// small to be a campaign unit of its own, so it is inlined below. It does NOT clear the
+    /// candidates; [`Self::cleanup`] does, at the END.
+    /// ⭐ `LLVM_DEBUG(sps_manager.dump(..))` IS DROPPED — it changes no IR — and the pinning scheme is
+    /// asked for `LX` regardless of which L3 half this unit is.
     fn run_on_unit<A: Arch>(&mut self, unit: &mut ProgramUnit<A>) {
-        todo!(
-            "ReadOnlyRegisterRenumberingPass::runOn(dataflow::ProgramUnitOp) — senpass e456 \
-             (ReadOnlyRegisterRenumbering.cpp:183) is not ported yet, and this {} op unit needs it",
-            unit.body.len()
-        )
+        self.unsafe_to_renumber = false;
+        if !matches!(unit.on.kind(), DfirUnit::L3lu | DfirUnit::L3su) {
+            return;
+        }
+        // `getChildAnalysis<StaticPinningSchemeManager>(unit)` and a fresh `ExpressionEvaluator`: both
+        // are out of campaign scope, and `eval` is the seam this unit stops at.
+        let mut sps_manager = OutOfScopePinningSchemeManager;
+        let mut evaluator = OutOfScopeEvaluator;
+        sps_manager.eval(&mut evaluator, DfirUnit::Lx);
+        self.collect_from(&unit.body, &[]);
+        self.compute_new_register_indices(&sps_manager, &mut evaluator);
+        self.do_renumbering(&mut unit.body);
+        self.cleanup();
+    }
+
+    /// `unit->walk<WalkOrder::PreOrder>([&](Operation *op) { runOn(op); })` — the op, then its regions,
+    /// each seeing the scopes that enclose it, which is the [`Definitions`] a `getDefiningOp()` needs.
+    fn collect_from<'a>(&mut self, scope: &'a [Op], outer: &[&'a [Op]]) {
+        let mut regions: Vec<&'a [Op]> = Vec::with_capacity(outer.len() + 1);
+        regions.push(scope);
+        regions.extend_from_slice(outer);
+        for op in scope {
+            self.run_on_op(op, Definitions::from_innermost(&regions));
+            for region in regions_ref(op) {
+                self.collect_from(region, &regions);
+            }
+        }
     }
 
     /// Replaces: e343_computeNewRegisterIndices
@@ -415,11 +450,6 @@ fn constant_target_values(map: Val, defs: Definitions<'_>) -> Vec<i64> {
     values
 }
 
-// crustify:todo: e456_runOn
-//   authority : dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:183  (15 body lines, level 2)
-//   original  : void ReadOnlyRegisterRenumberingPass::runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e127_runOn, e128_doRenumbering, e129_cleanup, e130_runOn, e221_initialize, e343_computeNewRegisterIndices
-
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -429,10 +459,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::ProgramUnits;
     use crate::islands::sentient::dialects::sentient::{Reg, RegIndex, RegType};
-    use crate::transform::sentient::analyses::{
-        Evaluation, EvaluatedValue, OffsetSites, OutOfScopeEvaluator, OutOfScopePinningSchemeManager,
-    };
-    use crate::units::DfirUnit;
+    use crate::transform::sentient::analyses::{EvaluatedValue, Evaluation, OffsetSites};
 
     /// A model, so a program is typed; nothing here reads it.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -583,6 +610,11 @@ mod unit_tests {
 
     /// A module holding one `dataflow.program_unit`, which is all any walk here needs.
     fn one_unit_program() -> Program<Dd2, AnyModel, AnyRung> {
+        one_unit_program_on(DfirUnit::L3lu)
+    }
+
+    /// The same module on `kind`, which is the one thing e456 gates on.
+    fn one_unit_program_on(kind: DfirUnit) -> Program<Dd2, AnyModel, AnyRung> {
         Program {
             name: ProgramName {
                 group: GroupId(0),
@@ -592,7 +624,7 @@ mod unit_tests {
             preamble: Vec::new(),
             units: ProgramUnits::of(
                 ProgramUnit {
-                    on: Units::one(DfirUnit::L3lu, Val(0)),
+                    on: Units::one(kind, Val(0)),
                     precision: None,
                     body: vec![scalar_const(1, 384)],
                     arch: core::marker::PhantomData,
@@ -603,10 +635,32 @@ mod unit_tests {
         }
     }
 
-    /// e127 — every program unit is visited, and the visit is e456's, which is not ported.
+    /// e456 — a unit that is neither L3 half returns before the pinning scheme is even asked for, so
+    /// nothing is collected and the IR is untouched.
     #[test]
-    #[should_panic(expected = "senpass e456")]
-    fn run_on_program_delegates_each_unit_to_the_unported_e456() {
+    fn e456_skips_a_unit_that_is_not_an_l3_half() {
+        let mut program = one_unit_program_on(DfirUnit::Lxlu);
+        let untouched = program.clone();
+        let mut pass = ReadOnlyRegisterRenumbering::default();
+        pass.run_on_program(&mut program);
+        assert_eq!(pass, ReadOnlyRegisterRenumbering::default());
+        assert_eq!(program, untouched);
+    }
+
+    /// e456's positive — an L3 half is admitted, and the FIRST thing it does is ask the out-of-scope
+    /// `StaticPinningSchemeManager` to evaluate the unit's pinned addresses.
+    #[test]
+    #[should_panic(expected = "StaticPinningSchemeManager::eval")]
+    fn e456_evaluates_the_pinning_scheme_of_an_l3_half() {
+        let mut program = one_unit_program_on(DfirUnit::L3su);
+        ReadOnlyRegisterRenumbering::default().run_on_program(&mut program);
+    }
+
+    /// e127 — every program unit is visited, and the visit is e456's, which stops at the out-of-scope
+    /// pinning scheme.
+    #[test]
+    #[should_panic(expected = "StaticPinningSchemeManager::eval")]
+    fn run_on_program_delegates_each_unit_to_e456() {
         let mut program = one_unit_program();
         ReadOnlyRegisterRenumbering::default().run_on_program(&mut program);
     }
@@ -624,7 +678,7 @@ mod unit_tests {
 
     /// e342's positive — stitching passes both gates and the pass walks the module, which is e127.
     #[test]
-    #[should_panic(expected = "senpass e456")]
+    #[should_panic(expected = "StaticPinningSchemeManager::eval")]
     fn e342_run_on_operation_walks_the_module_when_the_program_is_stitched() {
         let mut program = one_unit_program();
         ReadOnlyRegisterRenumbering::default().run_on_operation(&mut program, ProgStitch::Stitched);

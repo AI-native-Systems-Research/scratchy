@@ -17,6 +17,7 @@ use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient::RegIndex;
 use crate::islands::sentient::dialects::{Op, Val};
 use crate::transform::sentient::canonicalize_xrf_pointers::XrfMinExpr;
+use crate::units::DfirUnit;
 
 /// AN `EvaluatedValue` THE EXPRESSION EVALUATOR OWNS — an identity, not a value.
 ///
@@ -427,6 +428,23 @@ pub trait PinningSchemeManager {
             "PinningSchemeManager::findMatchingPinnedAddr (Analyses/AddressPinningScheme.h:245) — out of campaign scope"
         )
     }
+
+    /// `StaticPinningSchemeManager::eval(dcc_ext_context, evaluator, memory_unit)`
+    /// (`Analyses/AddressPinningScheme.h:267-268`) — computes the per-unit static pinned address
+    /// schemes, which is what makes the two `find*PinnedAddr` seams answerable.
+    ///
+    /// ⛔ `&mut self` AND ON THIS TRAIT THOUGH IT IS THE **DERIVED** CLASS'S: it is non-const, it is
+    /// the only mutator any ported pass calls on a manager, and its callers hold the static manager —
+    /// so one seam serves both here for the reason [`Self::find_matching_pinned_addr`] gives.
+    /// ⭐ `dccExtContext()` IS DROPPED, NOT FORGOTTEN: it is the arch/hardware description, which this
+    /// crate carries as the `A: Arch` parameter its caller is generic over — and a generic method here
+    /// would make the trait no longer `dyn`-compatible.
+    fn eval(&mut self, evaluator: &mut dyn ExpressionEvaluator, memory_unit: DfirUnit) {
+        let _ = (evaluator, memory_unit);
+        todo!(
+            "StaticPinningSchemeManager::eval (Analyses/AddressPinningScheme.h:267) — out of campaign scope"
+        )
+    }
 }
 
 /// THE ONE CRATE IMPLEMENTATION, for the reason [`OutOfScopeEvaluator`] is the evaluator's.
@@ -613,6 +631,18 @@ pub trait UniformGroups {
     /// `getGroupMembersLedBy(leader)` (`Analyses/UniformGroupAnalysis.h:72`) — the non-leader units
     /// `leader` speaks for, `leader` itself excluded.
     fn group_members_led_by(&self, leader: Val) -> Vec<Val>;
+
+    /// `collectExclusiveGroupLeaders()` (`Analyses/UniformGroupAnalysis.h:66`) — RUNS the analysis,
+    /// which is what makes the three getters above answerable at all.
+    ///
+    /// ⛔ `&mut self` AND DEFAULTED, unlike its three read-only siblings: it is the analysis's one
+    /// mutator, every caller constructs the analyzer itself, and a defaulted seam keeps the fakes that
+    /// only need the getters implementable.
+    fn collect_exclusive_group_leaders(&mut self) {
+        todo!(
+            "UniformGroupAnalyzer::collectExclusiveGroupLeaders (Analyses/UniformGroupAnalysis.h:66) — out of campaign scope"
+        )
+    }
 }
 
 /// THE ONE CRATE IMPLEMENTATION of [`CandidateCollector`]: asking it anything is a `todo!`.

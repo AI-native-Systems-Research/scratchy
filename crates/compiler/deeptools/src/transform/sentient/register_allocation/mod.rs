@@ -78,9 +78,10 @@
 //! | `e457_runOnOperation` | 457 | 2 | 1 | `dcc/src/Transform/Sentient/RegisterAllocation.cpp:321` |
 
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e457_runOnOperation` is its one-line driver and its
-// anchor is still open below, so everything here is reachable only from this file's own tests. CI runs
-// clippy with `-D warnings`. ⭐ REMOVE THIS WITH e457.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e457_runOnOperation` is its one-line driver and is
+// now filled, but it is the pass ENTRY, so filling it added no caller: everything here is still
+// reachable only from this file's own tests. CI runs clippy with `-D warnings`. ⭐ REMOVE THIS WHEN THE
+// SENTIENT PIPELINE CALLS `RegisterAllocation::run_on_operation`.
 #![allow(dead_code)]
 
 use crate::arch::Arch;
@@ -492,10 +493,22 @@ enum Parent {
     Other,
 }
 
-// crustify:todo: e457_runOnOperation
-//   authority : dcc/src/Transform/Sentient/RegisterAllocation.cpp:321  (1 body lines, level 2)
-//   original  : void RegisterAllocationPass::runOnOperation()
-//   calls     : e344_naivelyAllocate
+impl RegisterAllocation {
+    /// Replaces: e457_runOnOperation
+    ///
+    /// The pass entry: hand every register-carrying op in the module its index
+    /// ([`Self::naively_allocate`]).
+    ///
+    /// ⛔ NO GATE AND NO OPTION — unlike its siblings this pass has neither a `DisableThisPass` flag
+    /// nor a component test, so `runOnOperation` is the whole delegation.
+    /// ⭐ `getOperation()` IS THE `ModuleOp`, which this island spells as the [`Program`] the walk takes.
+    pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+    ) {
+        self.naively_allocate(program);
+    }
+}
 
 
 #[cfg(test)]
@@ -734,5 +747,25 @@ mod unit_tests {
         );
         // ⛔ AND THE JCR IT ALREADY TOOK STAYS TAKEN, which is what the reference's local vector does.
         assert_eq!(pass.counters.jcr, NextIndex(1));
+    }
+
+    /// e457 — the pass entry allocates, ungated: what `run_on_operation` leaves is what
+    /// `naively_allocate` leaves.
+    #[test]
+    fn e457_run_on_operation() {
+        let body = vec![
+            scalar_add(20, Some(unassigned(RegType::Lrf))),
+            scalar_add(21, Some(unassigned(RegType::Lrf))),
+        ];
+        let mut module = program(vec![body]);
+
+        let mut pass = RegisterAllocation::default();
+        pass.run_on_operation(&mut module);
+
+        assert_eq!(
+            indices(&module.units.iter().next().expect("the head unit").body),
+            vec![Some(RegIndex::at::<0>()), Some(RegIndex::at::<1>())]
+        );
+        assert_eq!(pass.failures(), &[]);
     }
 }

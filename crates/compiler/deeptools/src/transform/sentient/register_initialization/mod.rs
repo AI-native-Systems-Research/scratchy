@@ -86,10 +86,59 @@
 // this file's driver, and every unit below is reachable only from the tests until it lands. CI runs
 // clippy with `-D warnings`. ⭐ REMOVE THIS WITH e521.
 
+use crate::arch::Arch;
+use crate::islands::sentient::ProgramUnit;
 use crate::transform::sentient::analyses::{
-    Candidate, CandidateCollector, CandidateEvaluator, CandidateSelector, Transformer,
+    Candidate, CandidateCollector, CandidateEvaluator, CandidateSelector, Liveness,
+    OutOfScopeCandidateCollector, OutOfScopeCandidateEvaluator, OutOfScopeCandidateSelector,
+    OutOfScopeTransformer, OutOfScopeUniformGrouper, OutOfScopeUniformGroups, Transformer,
     UniformGrouper, UniformGroups,
 };
+
+/// THE `-dcc-register-initialization-collector` VALUES — `dcc::reginit::CollectorKind`
+/// (`RegisterInitialization/Collector.h:28`) less the `kUnknown` the option never offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollectorKind {
+    /// `simple` — the only value declared, and the `cl::init` (`RegisterInitialization.cpp:36-41`).
+    #[default]
+    Simple,
+}
+
+/// THE `-dcc-register-initialization-evaluator` VALUES — `dcc::reginit::EvaluatorKind`
+/// (`RegisterInitialization/Evaluator.h:23`) less `kUnknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvaluatorKind {
+    /// `simple` — the only value declared, and the `cl::init` (`RegisterInitialization.cpp:43-48`).
+    #[default]
+    Simple,
+}
+
+/// THE `-dcc-register-initialization-selector` VALUES — `dcc::reginit::SelectorKind`
+/// (`RegisterInitialization/Selector.h:32-40`) less `kUnknown`.
+///
+/// ⛔ THE DEFAULT IS `kBisect`, NOT the greedy algorithm the option's own help text calls "old"
+/// (`RegisterInitialization.cpp:50-67`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectorKind {
+    /// `greedy` — colourability checked one candidate at a time.
+    Greedy,
+    /// `const-decay`, constructed with `/* backtrack */ true`.
+    ConstantDecay,
+    /// `linear-decay`, constructed with `/* backtrack */ true`.
+    LinearDecay,
+    /// `polynomial-decay`, constructed with `/* backtrack */ true`.
+    PolynomialDecay,
+    /// `bisect` — the `cl::init`.
+    #[default]
+    Bisect,
+}
+
+/// `collectorKind`, `evaluatorKind`, `selectorKind` — the three `cl::opt`s' inits
+/// (`RegisterInitialization.cpp:36-67`). ⛔ NOT PASS OPTIONS: nothing in `dcc/src` assigns them, so
+/// these are the kinds every build runs.
+const COLLECTOR_KIND: CollectorKind = CollectorKind::Simple;
+const EVALUATOR_KIND: EvaluatorKind = EvaluatorKind::Simple;
+const SELECTOR_KIND: SelectorKind = SelectorKind::Bisect;
 
 /// Replaces: e131_runLocalAnalysis
 ///
@@ -172,10 +221,57 @@ pub fn run_transformation(candidates: &[Candidate], transformer: &mut dyn Transf
     transformer.run(candidates);
 }
 
-// crustify:todo: e458_runOn
-//   authority : dcc/src/Transform/Sentient/RegisterInitialization.cpp:182  (68 body lines, level 2)
-//   original  : void runOn(dataflow::ProgramUnitOp prog_unit, Liveness &liveness)
-//   calls     : e345_run
+/// Replaces: e458_runOn
+///
+/// One program unit's whole register initialisation: run the uniform-group analysis, build the
+/// collaborators the three options choose between, and hand the chosen three to the [`run`] driver.
+///
+/// ⛔ THE THREE `DT_ERROR` DEFAULTS ARE INEXPRESSIBLE — each option is a closed `enum` WITHOUT the
+/// `kUnknown` the `cl::opt` never offers, so "unexpected kind" is not a state this can be in.
+/// ⭐ EVERY COLLABORATOR IS CONSTRUCTED HERE AND EVERY ONE IS OUT OF CAMPAIGN SCOPE
+/// (`RegisterInitialization/`, `Analyses/UniformGroupAnalysis`): the crate has one implementation of
+/// each interface, so the ctor arguments — `prog_unit`, `liveness`, `dccExtContext()` and
+/// `/* backtrack */ true` — reach seams that keep nothing, and the unit stops at the first of them.
+pub fn run_on<A: Arch>(unit: &mut ProgramUnit<A>, liveness: &mut dyn Liveness) {
+    let mut uga = OutOfScopeUniformGroups;
+    uga.collect_exclusive_group_leaders();
+
+    // `SimpleCollector(prog_unit, liveness, uga)` and the eight collaborators after it: one crate
+    // implementation per interface, and not one of them keeps what the reference hands its ctor.
+    let _ = (unit, liveness);
+    let mut simple_collector = OutOfScopeCandidateCollector;
+    let mut simple_evaluator = OutOfScopeCandidateEvaluator;
+    let mut greedy_selector = OutOfScopeCandidateSelector;
+    let mut cd_selector = OutOfScopeCandidateSelector;
+    let mut ld_selector = OutOfScopeCandidateSelector;
+    let mut pd_selector = OutOfScopeCandidateSelector;
+    let mut bisect_selector = OutOfScopeCandidateSelector;
+    let mut uniform_grouper = OutOfScopeUniformGrouper;
+    let mut transformer = OutOfScopeTransformer;
+
+    let chosen_collector: &mut dyn CandidateCollector = match COLLECTOR_KIND {
+        CollectorKind::Simple => &mut simple_collector,
+    };
+    let chosen_evaluator: &mut dyn CandidateEvaluator = match EVALUATOR_KIND {
+        EvaluatorKind::Simple => &mut simple_evaluator,
+    };
+    let chosen_selector: &mut dyn CandidateSelector = match SELECTOR_KIND {
+        SelectorKind::Greedy => &mut greedy_selector,
+        SelectorKind::ConstantDecay => &mut cd_selector,
+        SelectorKind::LinearDecay => &mut ld_selector,
+        SelectorKind::PolynomialDecay => &mut pd_selector,
+        SelectorKind::Bisect => &mut bisect_selector,
+    };
+
+    run(
+        chosen_collector,
+        chosen_evaluator,
+        chosen_selector,
+        &mut uniform_grouper,
+        &mut transformer,
+        &uga,
+    );
+}
 
 // crustify:todo: e521_runOnOperation
 //   authority : dcc/src/Transform/Sentient/RegisterInitialization.cpp:261  (16 body lines, level 3)
@@ -185,7 +281,11 @@ pub fn run_transformation(candidates: &[Candidate], transformer: &mut dyn Transf
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::sentient::dialects::Val;
+    use crate::transform::sentient::analyses::OutOfScopeLiveness;
+    use crate::units::DfirUnit;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -391,6 +491,21 @@ mod unit_tests {
             ]
         );
         assert_eq!(candidates, vec![Candidate(5), Candidate(900)]);
+    }
+
+    /// e458_runOn — the analysis it runs FIRST is out of campaign scope, so a unit gets no further:
+    /// the leaders it collects are what every phase after it iterates.
+    #[test]
+    #[should_panic(expected = "UniformGroupAnalyzer::collectExclusiveGroupLeaders")]
+    fn e458_run_on_starts_at_the_uniform_group_analysis() {
+        let mut unit: ProgramUnit<Dd2> = ProgramUnit {
+            on: Units::one(DfirUnit::Pe, Val(0)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        };
+        let mut liveness = OutOfScopeLiveness;
+        run_on(&mut unit, &mut liveness);
     }
 
     /// e347_runTransformation — the whole list reaches the transformer, and only the transformer.

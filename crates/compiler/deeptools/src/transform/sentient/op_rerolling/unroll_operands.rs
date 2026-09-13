@@ -91,6 +91,7 @@
 // clippy with `-D warnings`. ⭐ REMOVE THIS WITH e607.
 #![allow(dead_code)]
 
+use super::UnrollSize;
 use crate::arch::Elements;
 use crate::formats::Bits;
 use crate::islands::sentient::dialects::Val;
@@ -177,16 +178,6 @@ impl ComputePortId {
             _ => Self::Port2,
         }
     }
-}
-
-/// HOW MANY OP INSTANCES ONE SNAPSHOT NOW STANDS FOR — `unsigned unroll_size_ = 1`
-/// (`OpRerolling.hpp:45`); for a memory op it is the burst size instead (`:643`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct UnrollSize(pub(crate) u32);
-
-impl UnrollSize {
-    /// A single instance — the reference's initial value, and what [`UnrollOperands::reset`] restores.
-    pub(crate) const ONE: Self = Self(1);
 }
 
 /// AN XRF POINTER INCREMENT — `int xrf_read_incr_` / `int xrf_write_incr_` (`OpRerolling.hpp:54-55`),
@@ -718,6 +709,22 @@ impl UnrollOperands {
         self.mutable_address = other.mutable_address;
         self.result_address = other.result_address;
         self.fold_mode = other.fold_mode;
+    }
+
+    /// `UnrollOperands::updateUnrollInfo(UnrollOperands &new_operand_list)` — SENPASS UNIT e337, whose
+    /// anchor is still open below.
+    ///
+    /// ⛔ e337 IS A LEVEL-1 DEPENDENCY THAT NO REMAINING SCHEDULE OWNS: sc2's port driver died on an
+    /// authentication error with 12 batches unrun, `sentient.cpp: e334_mergeScalarOpIntoMac +7` among
+    /// them. Isolating the call in a seam is the `2a8195231` precedent, and e337's TODO is left
+    /// untouched — filling it is not this batch's work.
+    pub(super) fn update_unroll_info(&mut self, new_operand_list: &UnrollOperands) {
+        todo!(
+            "UnrollOperands::updateUnrollInfo — senpass e337 (OpRerolling.cpp:881) is not ported \
+             yet, and merging {:?} into {:?} needs it",
+            new_operand_list.op_name,
+            self.op_name
+        )
     }
 }
 
