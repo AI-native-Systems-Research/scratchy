@@ -425,7 +425,7 @@ pub fn analyze<A: Arch>(
 /// THE COMMONING KEY — `std::make_tuple(const value, locale, element size)` (`:404-406`, `:418-420`).
 ///
 /// ⛔ NOT A MAP KEY: [`RegType`] orders nothing and the reference's `DenseMap` is unordered too —
-/// *first insertion wins* (`:407`) is the whole of that map's contract, and a `Vec` states it.
+/// *first insertion wins* (`:409`) is the whole of that map's contract, and a `Vec` states it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CopyKey {
     /// `const_op.getValue()`.
@@ -443,7 +443,7 @@ struct CopyKey {
 /// Rebuilds the `uniform.uniformize_regions` with one region per local region [`analyze`] decided on,
 /// then commons the constant-fed `sentient.scalar_copy`s of one (value, locale, element size).
 ///
-/// ⛔ `replaceAllUsesWith` (`:376`) IS A NO-OP: the new op reuses the original's `$results` verbatim.
+/// ⛔ `replaceAllUsesWith` (`:377`) IS A NO-OP: the new op reuses the original's `$results` verbatim.
 /// ⛔ THE PRUNE (`:379-386`) IS THE UNPORTED `e395_pruneOutOfScopeEntries`, GATED on a map being in the
 /// new op — an unconditional `todo!` would put the commoning below out of reach.
 pub fn transform(unit_body: &mut Vec<Op>, ur: &UniformRegion, values: &mut Values) {
@@ -531,7 +531,7 @@ pub fn transform(unit_body: &mut Vec<Op>, ur: &UniformRegion, values: &mut Value
             ));
         });
     }
-    // `copy_op_aliases.insert(..)` — `DenseMap::insert` leaves an existing entry alone (`:407`).
+    // `copy_op_aliases.insert(..)` — `DenseMap::insert` leaves an existing entry alone (`:409`).
     let mut aliases: Vec<(CopyKey, Val)> = Vec::new();
     for (key, result) in &copies {
         if !aliases.iter().any(|(seen, _)| seen == key) {

@@ -474,7 +474,7 @@ fn loop_body_at(block: &[Op], at: InBlock) -> Option<&[Op]> {
 /// iter args up where the first left them, and their bodies are the same computation modulo that.
 ///
 /// ⛔ `mergeable_block_args` IS A LOCAL, not a field: written and read only here (`:130`, `:154-156`).
-/// ⭐ A LOOP CARRYING NOTHING SKIPS THE PICK-UP TEST (`:110`) — effect-only loops merge on bodies alone.
+/// ⭐ A LOOP CARRYING NOTHING SKIPS THE PICK-UP TEST (`:109`) — effect-only loops merge on bodies alone.
 #[must_use]
 pub fn loops_are_mergeable(
     unit_body: &[Op],
@@ -496,7 +496,7 @@ pub fn loops_are_mergeable(
     };
     let defs = Definitions::from_innermost(core::slice::from_ref(&unit_body));
 
-    // `isConstant<sentient::ConstantOp>` on both bounds, then their sum against the LCCR (`:92-107`).
+    // `isConstant<sentient::ConstantOp>` on both bounds, then their sum against the LCCR (`:91-107`).
     match (constant_imm(bound_a, defs), constant_imm(bound_b, defs)) {
         (Some(a), Some(b)) => {
             if !is_sum_less_than_lccr_max_value(&a, &b) {

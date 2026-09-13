@@ -372,7 +372,7 @@ pub fn duplicate_and_update_regions_of_local_region_ops(
 ) -> Option<Op> {
     let mut new_regions: Vec<LocalRegion> = Vec::new();
     for region in local_op.regions() {
-        // `expandAllGroupsToUnitsAndUpdateSizes(units_v, list_sizes, builder)` (`:302`) on the
+        // `expandAllGroupsToUnitsAndUpdateSizes(units_v, list_sizes, builder)` (`:303`) on the
         // reference's own local copies — per region here, for the reason
         // [`expand_all_groups_to_units_and_update_sizes`] records: this island zips the two arrays.
         let mut units = region.units.clone();

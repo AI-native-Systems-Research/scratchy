@@ -563,7 +563,7 @@ impl PrecisionAssignments {
     ///
     /// TRAP: A LOOP'S YIELD OPERAND TAKES THE **YIELD** AS ITS USER (`:377`), so a clone lands INSIDE
     /// the body and every path into it is re-derived from the loop's CURRENT one.
-    /// TRAP: `assignments_[op].front()` IS SLOT 0 whichever result reached the worklist (`:228`).
+    /// TRAP: `assignments_[op].front()` IS SLOT 0 whichever result reached the worklist (`:226`).
     pub fn process_address_ssa_value(
         &mut self,
         body: &mut Vec<Op>,
@@ -572,7 +572,7 @@ impl PrecisionAssignments {
         val: Val,
     ) -> AddressWalk {
         // `isa<BlockArgument>(val)` and `val.getDefiningOp()` as ONE search — and its `None` is the
-        // reference's `else { return failure(); }` (`:436-437`): the only values this body binds
+        // reference's `else { return failure(); }` (`:438-439`): the only values this body binds
         // nowhere are region arguments of a program unit or a `uniform` region.
         let Some((at, slot)) = bound_slot(val, body, &[], 0) else {
             return AddressWalk::NotALoopArgument;
@@ -670,7 +670,7 @@ impl PrecisionAssignments {
             }
             other => panic!(
                 "llvm_unreachable(\"unsupported op\") \
-                 (`AddressRegisterPrecisionAssignment.cpp:410-411`): {other:?}"
+                 (`AddressRegisterPrecisionAssignment.cpp:411-412`): {other:?}"
             ),
         };
 
@@ -719,7 +719,7 @@ impl PrecisionAssignments {
                     element_size,
                     Carry::Init,
                 );
-                // "Adding region operand (No need for setting operand here)." (`:387-389`).
+                // "Adding region operand (No need for setting operand here)." (`:386-388`).
                 self.propagate_for_carried(
                     body,
                     values,

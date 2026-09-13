@@ -819,13 +819,13 @@ impl EnhancedDeadVariableElimination {
     /// Replaces: e498_updateForOperation
     ///
     /// Drops every `iter_args` position whose result AND body argument both have no influence — or the
-    /// positions `deleted_pos` names, an EMPTY set being the reference's own "not provided" (`:130`).
+    /// positions `deleted_pos` names, an EMPTY set being the reference's own "not provided" (`:129`).
     ///
     /// ⛔ TRAP: THE REFERENCE MISALIGNS ITS OWN REGISTER ARRAYS BY ONE unless they are in the
-    /// `1 + 2 * num_results` layout (`:139`) — the else arm reads surviving position `i` at
+    /// `1 + 2 * num_results` layout (`:140-141`) — the else arm reads surviving position `i` at
     /// `regLocales[i]`, which is the BOUND's slot, and writes an array with no bound slot at all
     /// (`:187-192`). [`sentient::Carried::reg`] beside `bound_reg` makes both unwritable.
-    /// ⛔ THE SURVIVORS KEEP THEIR OWN VALUES: `create` + `replaceAllUsesWith` + `erase` (`:225-266`)
+    /// ⛔ THE SURVIVORS KEEP THEIR OWN VALUES: `create` + `replaceAllUsesWith` + `erase` (`:225-267`)
     /// only renumbers what a collapsed [`sentient::Carried`] drops in place.
     pub(crate) fn update_for_operation(
         &self,
@@ -893,14 +893,16 @@ impl EnhancedDeadVariableElimination {
 
     /// Replaces: e500_updateUniformizeRegionsOperation
     ///
-    /// Drops every `uniform.uniformize_regions` result with no influence, and its `element_sizes` and
-    /// `regLocales` slot with it.
+    /// Drops every `uniform.uniformize_regions` result with no influence, and its `regLocales` slot
+    /// with it.
     ///
     /// ⛔ THE RAISED SPELLING ONLY — see e300's note; the lower-rung [`Op::Uniform`] op's terminator
     /// hands back values of the rung below, which this pass has no influence for.
-    /// ⛔ THE TWO ARRAYS ARE FILTERED INDEPENDENTLY, EACH OVER ITS OWN LENGTH
-    /// (`Dialect/Sentient/Utils.cpp:252-266`): an unwritten `regLocales` stays unwritten rather than
-    /// being padded to the result count, which is what EMPTY [`dialects::YieldedReg`] means here.
+    /// ⛔ `cloneUniformOp` NEVER CARRIES `element_sizes` ONTO THE OP IT BUILDS
+    /// (`Dialect/Sentient/Utils.cpp:266-271`): it filters `regIndices` and `regLocales` independently,
+    /// each over its own length (`:254-265`), and DISCARDS the whole `element_sizes` array where this
+    /// keeps the surviving slots of the fused [`dialects::YieldedReg`] — the same `create`-shaped loss
+    /// e497 records and calls discardable.
     pub(crate) fn update_uniformize_regions_operation(&self, scope: &mut [Op], at: usize) {
         let Some(Op::UniformRegions(UniformRegions::UniformizeRegions {
             results, yielded, ..

@@ -151,7 +151,7 @@ pub(crate) struct BoundIncrement(pub i64);
 
 /// `LoopAbsorptionManager` (`LoopAbsorption.hpp:22`) — one anchor loop and the absorptions into it.
 ///
-/// ⭐ `iter_arg_num_to_new_start_val_` AND `to_update_` (`:43-51`) ARE FIELDS: `e506_canAbsorbToTheLeft`
+/// ⭐ `iter_arg_num_to_new_start_val_` AND `to_update_` (`LoopAbsorption.hpp:43-51`) ARE FIELDS: `e506_canAbsorbToTheLeft`
 /// and `e507_canAbsorbToTheRight` fill them while checking equivalence, and the two absorptions here
 /// apply and clear them.
 #[derive(Debug)]
@@ -171,7 +171,7 @@ pub(crate) struct LoopAbsorptionManager<'a> {
     /// `iter_arg_num_to_new_start_val_` (`LoopAbsorption.hpp:43`) — drained by
     /// [`Self::absorb_into_anchor_from_left`]. See [`AnchorArgNumber`] for what the key really is.
     iter_arg_num_to_new_start_val: BTreeMap<AnchorArgNumber, Val>,
-    /// `to_update_` (`:51`) — the old→new result rewrites, drained by
+    /// `to_update_` (`LoopAbsorption.hpp:51`) — the old→new result rewrites, drained by
     /// [`Self::absorb_into_anchor_from_right`].
     to_update: BTreeMap<Val, Val>,
 }
@@ -366,7 +366,7 @@ impl<'a> LoopAbsorptionManager<'a> {
     ///
     /// ⛔ THE KEY IS A BLOCK-ARGUMENT NUMBER USED AS AN OPERAND INDEX — see [`AnchorArgNumber`].
     /// ⭐ SATURATING WHERE `std::prev` WALKS OFF `begin()` (`:245-247`): it is `canAbsorbToTheLeft`'s
-    /// `rend()` test that keeps that walk in range (`:152`), so a short block absorbs what is there.
+    /// `rend()` test that keeps that walk in range (`:154`), so a short block absorbs what is there.
     pub(crate) fn absorb_into_anchor_from_left(&mut self) {
         // `for (pair : ..) setOperand(..)` then `clear()` (`:237-240`) — cleared even if the anchor
         // has since moved, as the reference's `clear()` is unconditional too.
@@ -454,11 +454,11 @@ impl<'a> LoopAbsorptionManager<'a> {
             .collect();
         let yielded = yielded_by(terminator);
 
-        // `dcc::LoopNode *prev_sibling = anchor_->getPrevSibling();` (`:147`).
+        // `dcc::LoopNode *prev_sibling = anchor_->getPrevSibling();` (`:148`).
         let mut prev_sibling = tree.prev_sibling(*anchor);
         let mut left = anchor_at;
         for body_at in (0..body.len().saturating_sub(1)).rev() {
-            // `if (block_it == anchor_bb_->getOperations().rend()) return false;` (`:152`).
+            // `if (block_it == anchor_bb_->getOperations().rend()) return false;` (`:154`).
             let Some(next_left) = left.checked_sub(1) else {
                 return false;
             };
@@ -485,7 +485,7 @@ impl<'a> LoopAbsorptionManager<'a> {
                     return true;
                 };
                 // `return a_operand_op ? oe_.operationsAreEquivalent(*it_op, *a_operand_op)
-                //                      : (it->second == a_operand);` (`:176-181`).
+                //                      : (it->second == a_operand);` (`:178-182`).
                 match (defs.of(a_operand), defs.of(assigned)) {
                     (None, _) => assigned == a_operand,
                     (Some(a_operand_op), Some(it_op)) => {
@@ -529,7 +529,7 @@ impl<'a> LoopAbsorptionManager<'a> {
             }
 
             // `if (isa<sentient::ForOp>(op_in_loop)) { nodes_to_delete.push_back(prev_sibling); .. }`
-            // (`:223-226`). ⭐ e068 PROVED THE SIBLING IS THERE for every child, so `None` is a
+            // (`:228-231`). ⭐ e068 PROVED THE SIBLING IS THERE for every child, so `None` is a
             // refusal rather than the reference's null push.
             if matches!(op_in_loop, Op::Sentient(sentient::Op::For { .. })) {
                 let Some(sibling) = prev_sibling else {
@@ -606,7 +606,7 @@ impl<'a> LoopAbsorptionManager<'a> {
         let mut right = anchor_at;
         for op_in_loop in body.iter().take(body.len().saturating_sub(1)) {
             right += 1;
-            // `if (block_it == anchor_bb_->getOperations().end()) return false;` (`:318`).
+            // `if (block_it == anchor_bb_->getOperations().end()) return false;` (`:317`).
             let Some(op_to_right_of_loop) = block.get(right) else {
                 return false;
             };

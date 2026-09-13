@@ -284,7 +284,7 @@ impl DataTransferDescriptorContainer {
                 ) == 1
             {
                 // The loop-carried case: the address arrives as an iter arg and the result it produces
-                // is read once (`:2242-2252`).
+                // is read once (`:2238-2246`).
                 self.set_chaining_info(curr, ChainFlag::PartOfChain, true);
                 self.set_chaining_info(curr, ChainFlag::HeadOfChain, true);
             }
@@ -299,7 +299,7 @@ impl DataTransferDescriptorContainer {
             let unit = desc.memory_unit.dfir_unit();
             let op_id = desc.op.clone();
             let Some(op) = op_at(&op_id, unit_body) else {
-                todo!("computeChainingInfo: no op at {op_id:?} in the looping-chain pass (:2258)")
+                todo!("computeChainingInfo: no op at {op_id:?} in the looping-chain pass (:2253)")
             };
             let mut curr_val = mutable_addr_result_of(op, mutable_addr_end(op, unit, defs));
             let parent = parent_for_of(&op_id, unit_body);
@@ -341,7 +341,7 @@ impl DataTransferDescriptorContainer {
                     todo!(
                         "computeChainingInfo: DT_CHECK(res_idx >= 0 && res_idx < \
                          inner_for_op.getNumResults()) — {curr_val:?} is yielded at a position the \
-                         loop carries nothing for (:2290-2292)"
+                         loop carries nothing for (:2286)"
                     )
                 };
                 if use_count(for_result, unit_body) == 1
@@ -358,7 +358,7 @@ impl DataTransferDescriptorContainer {
 }
 
 /// THE THREE OPS THE CHAINING WALK FOLLOWS — `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>`
-/// (`:2216-2218`, `:2263-2264`, `:2296-2297`).
+/// (`:2216-2218`, `:2263-2264`, `:2290-2291`).
 ///
 /// ⛔ `LoadAndExtractScalarOp` AND `LoadComputeAndSendOp` ARE DELIBERATELY ABSENT — "they are not
 /// supported outside LX" (`:2213-2214`), and they are absent from all three of those `isa` lists.
@@ -377,9 +377,9 @@ fn is_transfer(op: &Op) -> bool {
 /// of the transfer carries `unit`'s address.
 ///
 /// ⛔ THE `-1` IS NOT EXPRESSIBLE AS AN END, AND EVERY CALLER HERE DEREFERENCES IT: e491 feeds this
-/// index straight into `getResult(..)` (`:2245-2248`, `:2260-2261`) and into
+/// index straight into `getResult(..)` (`:2239-2242`, `:2256-2257`) and into
 /// `getMutableAndImmutableAddr`, whose `{nullptr, nullptr}` then meets an `isa<BlockArgument>`
-/// (`:2216`). Both are the reference's own stop, so the two non-answers stay named stops here.
+/// (`:2215`). Both are the reference's own stop, so the two non-answers stay named stops here.
 fn mutable_addr_end(op: &Op, unit: DfirUnit, defs: Definitions<'_>) -> TransferEnd {
     match op {
         // `return 0` for the three single-address ops, and `getAddrResultIdx()` for
@@ -410,7 +410,7 @@ fn mutable_addr_end(op: &Op, unit: DfirUnit, defs: Definitions<'_>) -> TransferE
                 todo!(
                     "computeChainingInfo: getMutableAddrResultIndex answered -1 for the {unit:?} \
                      address of a sentient.load_and_store, which the reference then hands to \
-                     getResult/isa<BlockArgument> (:2216, Analyses/Utils.cpp:550-551)"
+                     getResult/isa<BlockArgument> (:2215, Analyses/Utils.cpp:550-551)"
                 )
             }
         }

@@ -1467,7 +1467,7 @@ fn classify(op: &Op, current_value: Val) -> Arm {
             | sentient::Op::LoadAndSend { .. }
             | sentient::Op::LoadComputeAndSend { .. },
         ) => Arm::Transfer(Some(MutableAddr::Only)),
-        // `result_idx > 0 ? dst : src` (`:678-684`) — result 0 is the `src_res` address.
+        // `result_idx > 0 ? dst : src` (`:684-688`) — result 0 is the `src_res` address.
         Op::Sentient(sentient::Op::LoadAndStore { results, .. }) => Arm::Transfer(Some(
             if current_value == results.0 {
                 MutableAddr::Src
@@ -1489,13 +1489,13 @@ fn classify(op: &Op, current_value: Val) -> Arm {
 }
 
 impl SsaMap {
-    /// `ssa_negated_map_.at(value)` AS A SIGN — `s0` and `s2` (`:585-586`, `:716-717`, `:763-764`).
+    /// `ssa_negated_map_.at(value)` AS A SIGN — `s0` and `s2` (`:586-587`, `:717-718`, `:763-764`).
     /// `std::map::at` THROWS on a value `mapAllValues` never mapped, which is this `panic!`.
     fn sign_of(&self, value: Val) -> i64 {
         let Some(negated) = self.negated.get(&value) else {
             panic!(
                 "ssa_negated_map_.at({value:?}) has no entry, where `std::map::at` throws \
-                 (LiveRangeReduction.cpp:585-586)"
+                 (LiveRangeReduction.cpp:586-587)"
             )
         };
         if *negated { -1 } else { 1 }
@@ -1510,13 +1510,13 @@ impl SsaMap {
         ) else {
             panic!(
                 "ssa_expr_const_map_.at() has no entry for {dominant:?} or {other:?}, where \
-                 `std::map::at` throws (LiveRangeReduction.cpp:591-593)"
+                 `std::map::at` throws (LiveRangeReduction.cpp:592-595)"
             )
         };
         if dominant_consts.len() != other_consts.len() {
             panic!(
                 "DT_CHECK_MSG(Neither dominant_value, current_value are expected to be global.) \
-                 (`LiveRangeReduction.cpp:594-596`): {} against {}",
+                 (`LiveRangeReduction.cpp:596-598`): {} against {}",
                 dominant_consts.len(),
                 other_consts.len()
             )
@@ -1676,7 +1676,7 @@ impl SsaMap {
                     map_and_query.result
                 };
                 let new_result = vals.mint();
-                // `new_op->setAttrs(op->getAttrs())` (`:652`) — the register and the width travel.
+                // `new_op->setAttrs(op->getAttrs())` (`:653`) — the register and the width travel.
                 built.push(Op::Sentient(if sign > 0 {
                     sentient::Op::ScalarAdd {
                         lhs: dominant_value,
@@ -1703,7 +1703,7 @@ impl SsaMap {
                     utils::insert_at(unit_body, &at, op);
                 }
                 dialects::replace_all_uses_with(unit_body, current_value, new_result);
-                // ⭐ `DenseMap::operator[]` ON BOTH SIDES (`:654-657`), so a current value that was
+                // ⭐ `DenseMap::operator[]` ON BOTH SIDES (`:656-658`), so a current value that was
                 // never mapped copies an EMPTY offset list and `false` rather than nothing.
                 let offsets = self
                     .const_offsets
@@ -1892,7 +1892,7 @@ fn is_yieldable_locale(locale: sentient::RegType) -> bool {
     matches!(locale, sentient::RegType::Lrf | sentient::RegType::Jcr)
 }
 
-/// `curr_op.hasAttr("regLocale")` AND ITS VALUE (`:1183-1188`) — the nine ops that declare the
+/// `curr_op.hasAttr("regLocale")` AND ITS VALUE (`:1182-1186`) — the nine ops that declare the
 /// SINGULAR attribute (`SentientOps.td:473, 521, 567, 681, 705, 806, 821, 834, 852`), `None` for the
 /// rest, all of which bind exactly one result so the reference's default `result_idx = 0` is theirs.
 ///
@@ -1945,9 +1945,9 @@ fn result_reg_locale(op: &Op, result_idx: usize) -> Option<sentient::RegType> {
 /// `sentient.if` contributing one per such result rather than one per op.
 ///
 /// ⛔ THE OP IS RE-READ FROM ITS SLOT EVERY TIME because [`add_result_to_yield`] answers with a WHOLE
-/// NEW OP whose region-0 values are re-minted, and ⭐ `ops_to_be_delected` (`:1208`) IS that slot
+/// NEW OP whose region-0 values are re-minted, and ⭐ `ops_to_be_delected` (`:1208-1209`) IS that slot
 /// assignment. ⛔ `parent` is REPLACED on the way into a local region, where
-/// `getQueryKeyAndUnitsFromParentRegion` reads exactly its two fields (`Sentient/Utils.cpp:48-53`).
+/// `getQueryKeyAndUnitsFromParentRegion` reads exactly its two fields (`Sentient/Utils.cpp:53-54`).
 pub fn optimize_uniform_region_yielded_values(
     body: &mut Vec<Op>,
     parent: &ParentRegionQuery,

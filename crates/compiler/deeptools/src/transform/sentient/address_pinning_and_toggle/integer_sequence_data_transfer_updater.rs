@@ -117,7 +117,7 @@ impl IntegerSequenceDataTransferUpdater {
                  unchecked (:2131-2141)"
             )
         };
-        // `evaluator_.evaluateSub(isq.getInit(), new_immut_addr_ev)` (`:2136-2137`).
+        // `evaluator_.evaluateSub(isq.getInit(), new_immut_addr_ev)` (`:2137-2138`).
         let new_init = evaluator.evaluate_sub_handle(init, new_immut_addr_ev);
         let new_operand = evaluator.build_offset_value_of(new_init, sites, walked, ty);
         set_iter_operand(walked, outer_loop, iter_arg_index, new_operand);

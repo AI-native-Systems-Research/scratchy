@@ -2765,10 +2765,10 @@ impl PatternSimplificationManager {
     /// Replaces: e496_parseFixedDims
     ///
     /// Enumerates every tuple of the FIXED IVs and parses one [`TableSlice`] per leaf, recording
-    /// whether the slices agree in sequence count and kind (`:2020-2083`).
+    /// whether the slices agree in sequence count and kind (`:2021-2084`).
     ///
     /// TRAP: THE COUNT MISMATCH DOES NOT `break` AND THE KIND MISMATCH DOES (`:2053`, `:2069`).
-    /// TRAP: A MISSING `lhs_to_for_op_or_null_` ENTRY IS `DT_CHECK_MSG(step != 0, ..)` (`:2038`) —
+    /// TRAP: A MISSING `lhs_to_for_op_or_null_` ENTRY IS `DT_CHECK_MSG(step != 0, ..)` (`:2038-2039`) —
     /// the reference reads the map with `operator[]`, which default-constructs step 0.
     pub fn parse_fixed_dims(
         &mut self,

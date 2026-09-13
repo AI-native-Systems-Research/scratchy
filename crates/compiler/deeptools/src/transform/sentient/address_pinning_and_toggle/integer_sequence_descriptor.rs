@@ -253,7 +253,7 @@ impl IntegerSequenceDescriptor {
         }
         out.push_str("\tinit:");
         write_evaluated_value(self.init, &mut out);
-        // ⭐ THE STRAY SPACE IS THE REFERENCE'S OWN: `"; \n " << indent` (`:2887`).
+        // ⭐ THE STRAY SPACE IS THE REFERENCE'S OWN: `"; \n " << indent` (`:2886`).
         out.push_str(";\n \tstride:");
         write_evaluated_value(self.stride, &mut out);
         out.push_str(";\n\tsize:");
