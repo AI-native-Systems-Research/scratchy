@@ -6011,6 +6011,7 @@ mod tests_e132_e136 {
                 data_connect: None,
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
@@ -6811,6 +6812,7 @@ mod tests_e258_e263 {
                 data_connect: None,
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }

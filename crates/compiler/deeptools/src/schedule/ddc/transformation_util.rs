@@ -169,8 +169,8 @@ use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType}
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::generated::{DataConnect, Strategy};
 use crate::schedule::dsc2::{
-    ComputeNode, DataInfo, Dsc, Dsts, Hops, LdsIdx, NodeName, Operand, OperandPos, TransferNode,
-    TransferSide,
+    ComputeNode, DataInfo, Dsc, Dsts, Hops, LatchDataId, LdsIdx, NodeName, Operand, OperandPos,
+    TransferNode, TransferSide,
 };
 use crate::schedule::l3::dsc::SymbolicDimInfo;
 use crate::units::{Core, Corelet};
@@ -1160,26 +1160,321 @@ pub fn compute_related_to_external_nodes<E: ExternalStreams + ?Sized>(
         || output_related_to_external_nodes(streams, compute)
 }
 
-// crustify:todo: e339_convertResultToSkipReg
-//   authority : ddc/ddc_transformation_util.cpp:909  (110 body lines, level 3)
-//   class     : Ddc
-//   original  : bool Ddc::convertResultToSkipReg(dsc2::TransferNode *transferNode, int destIndex, bool useLatch)
-//   extract   : crustify-ddc/cpp/ddc.cpp:12139-12250
-//   calls     : e111_reduceUsersOrDeleteAllocationAndMetadata, e254_destRelatedToExternalNodes, e305_destRelatedToExternalNodes
+// ⭐ TYPES FOR ENTRIES 339 AND 340 — the destination witness, the latch-link counter and the writes
+// they add to [`FifoResults`]. Union them with this file's other vocabulary.
 
-// crustify:todo: e340_insertComputeBetweenTransferAndReg
-//   authority : ddc/ddc_transformation_util.cpp:1021  (69 body lines, level 3)
-//   class     : Ddc
-//   original  : bool Ddc::insertComputeBetweenTransferAndReg(dsc2::TransferNode *transferNode, int transferDestIndex, dsc2::ComputeNode *computeNode, int computeInputIndex)
-//   extract   : crustify-ddc/cpp/ddc.cpp:12260-12332
-//   calls     : e254_destRelatedToExternalNodes, e305_destRelatedToExternalNodes
+/// WHERE A TRANSFER'S RESULT IS SKIPPED TO — `convertResultToSkipReg`'s `useLatch` (`:909`).
+///
+/// ⭐ AN ENUM AND NOT A `bool`: the two arms test the SAME storage for OPPOSITE things when deciding
+/// the result is already converted, so transposing a callsite must be a type error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipRegTarget {
+    /// `useLatch == true` — the result becomes a `LATCH`, linked by a [`LatchDataId`].
+    Latch,
+    /// `useLatch == false` — the result becomes a FIFO on the component it is reached from.
+    Fifo,
+}
 
-// crustify:todo: e341_relatedToExternalNodes
-//   authority : ddc/ddc_transformation_util.cpp:1712  (4 body lines, level 3)
-//   class     : Ddc
-//   original  : bool Ddc::relatedToExternalNodes(const dsc2::TransferNode *transferNode) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:12342-12346
-//   calls     : e253_srcRelatedToExternalNodes, e254_destRelatedToExternalNodes, e305_destRelatedToExternalNodes
+/// THE SOURCE OF EVERY LATCH LINK — `Ddc::latchDataIdCounter_` (`ddc/ddc.h:39`), bumped once per
+/// latched result so that the producer and all of its consumers carry ONE id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LatchDataIds(u32);
+
+impl LatchDataIds {
+    /// `latchDataIdCounter_++` — this latch's id, and the counter advanced past it.
+    pub const fn next(&mut self) -> LatchDataId {
+        let id = LatchDataId(self.0);
+        self.0 += 1;
+        id
+    }
+}
+
+/// ONE DESTINATION OF A TRANSFER ENTRIES 339 AND 340 MAY REPOINT AT ALL.
+///
+/// ⛔⛔ FOUR ABORTS COLLAPSE INTO THIS WITNESS — both entries open with *"Can not convert result of
+/// external transferNode"* ([`InternalNode`]) and then
+/// `DT_CHECK(destIndex < dstLdsAndLoopOffsets_.size())`. Their `return false` paths are NOT here:
+/// those are each function's own answer and stay in the port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferDest {
+    transfer: NodeId,
+    dest: DestIdx,
+    operand: Operand,
+    reached_from: SenComponent,
+}
+
+impl TransferDest {
+    /// The witness, or [`None`] for either abort.
+    #[must_use]
+    pub fn of(
+        metadata: &Metadata,
+        node: NodeId,
+        transfer: &TransferNode,
+        dest: DestIdx,
+    ) -> Option<Self> {
+        let internal = InternalNode::of(metadata, node)?;
+        let index = dest.0 as usize;
+        let operand = *transfer.dsts.get(index)?;
+        Some(Self {
+            transfer: internal.node(),
+            dest,
+            operand,
+            reached_from: transfer
+                .dsts
+                .hops(index)
+                .last()
+                .copied()
+                .unwrap_or(transfer.src.unit),
+        })
+    }
+
+    /// The transfer.
+    #[must_use]
+    pub const fn transfer(self) -> NodeId {
+        self.transfer
+    }
+
+    /// Which destination, as the reference's `dstVias_`/`dstLdsAndLoopOffsets_` index.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.dest.0 as usize
+    }
+
+    /// `dstVias_.at(i).loc_` zipped with `dstLdsAndLoopOffsets_.at(i)`.
+    #[must_use]
+    pub const fn operand(self) -> Operand {
+        self.operand
+    }
+
+    /// `dstVias_.at(i).via_.back()`, else `src_.unit_` — the component this destination is REACHED
+    /// FROM, which is what both entries repoint a skipped result at.
+    #[must_use]
+    pub const fn reached_from(self) -> SenComponent {
+        self.reached_from
+    }
+}
+
+/// A NODE PROVED NOT TO BE IN THE SCHEDULE TREE YET — `DT_CHECK(computeNode->getPrev() == nullptr)`
+/// (`:1032`), which is entry 340's one remaining abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnplacedNode(NodeId);
+
+impl UnplacedNode {
+    /// The witness, or [`None`] where the node already has a parent.
+    #[must_use]
+    pub fn of<S: ScheduleSurgery + ?Sized>(surgery: &S, node: NodeId) -> Option<Self> {
+        surgery.parent(node).is_none().then_some(Self(node))
+    }
+
+    /// The node.
+    #[must_use]
+    pub const fn node(self) -> NodeId {
+        self.0
+    }
+}
+
+/// WHAT ENTRIES 339 AND 340 ADDITIONALLY WRITE — the latch links and the compute's operand vectors.
+pub trait SkipRegResults: FifoResults {
+    /// `transferNode->dstLdsAndLoopOffsets_.at(i).latchDataId_ = id`.
+    fn set_dst_latch_data_id(&mut self, transfer: NodeId, dst: usize, id: LatchDataId);
+
+    /// `transferConsumer->srcLdsAndLoopOffsets_.latchDataId_ = id`.
+    fn set_src_latch_data_id(&mut self, transfer: NodeId, id: LatchDataId);
+
+    /// `computeConsumer->inputsLdsAndLoopOffsets_.at(i).latchDataId_ = id`.
+    fn set_compute_input_latch_data_id(&mut self, compute: NodeId, input: usize, id: LatchDataId);
+
+    /// `allocNode->removeAllocUser(user)` (`dsc/dsc2.h:1024`) — its *"Schedule node <n> is not in
+    /// the user list of allocate node <a>"* abort is [`AllocationUse`] missing. ⛔ NOT
+    /// [`DscAllocations::reduce_users_or_delete`], which drops a reference AND may unlink the node.
+    fn remove_alloc_use(&mut self, alloc_use: AllocationUse);
+
+    /// `computeNode->outputs_.resize(1)` with `outputsLdsAndLoopOffsets_`, then `at(0) = (unit,
+    /// data)`. ⚠️ EVERY OTHER OUTPUT IS DROPPED. `unit` is an `outputs_` entry and so a component,
+    /// which is why the reference writes a transfer's `storage_` into it.
+    fn set_sole_compute_output(&mut self, compute: NodeId, unit: SenComponent, data: DataInfo);
+
+    /// `computeNode->inputs_.resize(i + 1)` with `inputsLdsAndLoopOffsets_`, then `at(i) = (unit,
+    /// data)`. ⚠️ THE RESIZE GOES BOTH WAYS: inputs past `i` are DROPPED, and a gap below it is
+    /// `NO_COMPONENT` against a default-constructed `DataInfo`.
+    fn resize_compute_inputs_to(
+        &mut self,
+        compute: NodeId,
+        input: InputIdx,
+        unit: SenComponent,
+        data: DataInfo,
+    );
+}
+
+/// One `reduceUsersOrDeleteAllocationAndMetadata(di, storage, user)` — a no-op where the operand
+/// keys no allocation, which is the abort inside its own `getMutableAllocation`.
+fn reduce_users_of<D: SkipRegResults + DscAllocations + ?Sized>(
+    dsc: &mut D,
+    metadata: &mut Metadata,
+    data: DataInfo,
+    storage: SenComponent,
+    user: NodeId,
+) {
+    if let Some(alloc_use) = data_origin(data)
+        .zip(component_memory(storage))
+        .and_then(|(origin, memory)| AllocationUse::of(dsc, origin, memory, user))
+    {
+        reduce_users_or_delete_allocation_and_metadata(dsc, metadata, alloc_use);
+    }
+}
+
+/// Replaces: e339_convertResultToSkipReg
+///
+/// MOVES ONE TRANSFER DESTINATION OUT OF ITS REGISTER FILE into a latch or a FIFO (`:909`): drops
+/// the register allocation, repoints the destination at `LATCH` or at the component it is reached
+/// from, and repoints every consumer of its connect under one shared fresh [`LatchDataId`].
+///
+/// ⛔ `true` AND NOTHING DONE where the destination ALREADY skips the register file; any other
+/// non-register, non-`LXLUVALUE` storage is `false`. ⚠️ TRAP: an `LXLUVALUE` destination keeps every
+/// allocation — its own and its consumers' — and is repointed anyway; *"Unsupported consumer type"*
+/// becomes a skipped consumer.
+pub fn convert_result_to_skip_reg<D>(
+    dsc: &mut D,
+    metadata: &mut Metadata,
+    latch_ids: &mut LatchDataIds,
+    dest: TransferDest,
+    target: SkipRegTarget,
+) -> bool
+where
+    D: SkipRegResults + DscAllocations + ExternalStreams + ?Sized,
+{
+    let dst = dest.operand();
+    let is_lxlu_value = dst.unit == SenComponent::Lxluvalue;
+
+    if !is_register(dst.storage) && !is_lxlu_value {
+        return match target {
+            SkipRegTarget::Latch => dst.storage == SenComponent::Latch,
+            SkipRegTarget::Fifo => {
+                dst.storage != SenComponent::Latch && !is_memory(dst.storage)
+            }
+        };
+    }
+    let connect = dst.data.data_connect;
+
+    if !is_lxlu_value {
+        let keyed = data_origin(dst.data).zip(component_memory(dst.storage));
+        let Some((origin, memory)) = keyed else {
+            return false;
+        };
+        if dsc.allocation_in(origin, memory).is_none() {
+            return false;
+        }
+        if dest_related_to_external_nodes(dsc, &dst) {
+            return false;
+        }
+        reduce_users_of(dsc, metadata, dst.data, dst.storage, dest.transfer());
+    }
+
+    let (new_component, latch_id) = match target {
+        SkipRegTarget::Latch => {
+            let id = latch_ids.next();
+            dsc.set_dst_latch_data_id(dest.transfer(), dest.index(), id);
+            (SenComponent::Latch, Some(id))
+        }
+        SkipRegTarget::Fifo => (dest.reached_from(), None),
+    };
+    dsc.set_dst_storage(dest.transfer(), dest.index(), new_component);
+
+    for consumer in dsc.connect_consumers(connect) {
+        match consumer {
+            FifoConsumer::Transfer(node) => {
+                let src = dsc.transfer(node).src;
+                reduce_users_of(dsc, metadata, src.data, src.storage, node);
+                dsc.set_src_storage(node, new_component);
+                if let Some(id) = latch_id {
+                    dsc.set_src_latch_data_id(node, id);
+                }
+            }
+            FifoConsumer::Compute(node, compute) => {
+                for (input, operand) in compute.inputs.iter().enumerate() {
+                    if operand.data.data_connect != connect {
+                        continue;
+                    }
+                    if !is_lxlu_value {
+                        reduce_users_of(dsc, metadata, operand.data, operand.unit, node);
+                    }
+                    dsc.set_compute_input_unit(node, input, new_component);
+                    if let Some(id) = latch_id {
+                        dsc.set_compute_input_latch_data_id(node, input, id);
+                    }
+                }
+            }
+            FifoConsumer::Other(_) => {}
+        }
+    }
+
+    true
+}
+
+/// Replaces: e340_insertComputeBetweenTransferAndReg
+///
+/// PUTS A COMPUTE BETWEEN A TRANSFER AND ITS REGISTER DESTINATION (`:1021`): places it right after
+/// the transfer, hands it the register allocation as its SOLE output, and gives it the component the
+/// destination is reached from as `input`, which is what the transfer now writes instead.
+///
+/// ⚠️ TRAP: THE PLACEMENT HAPPENS FIRST, so every `false` — a non-register destination, a missing
+/// allocation, an external destination — leaves the compute already in the tree beside the transfer.
+/// ⚠️ TRAP: the reference resizes, so outputs past the first and inputs past `input` are DROPPED.
+pub fn insert_compute_between_transfer_and_reg<D>(
+    dsc: &mut D,
+    dest: TransferDest,
+    compute: UnplacedNode,
+    input: InputIdx,
+) -> bool
+where
+    D: SkipRegResults + DscAllocations + ExternalStreams + ?Sized,
+{
+    let compute = compute.node();
+    dsc.add_child_node(compute, InsertionPoint::After(dest.transfer()));
+
+    let dst = dest.operand();
+    if !is_register(dst.storage) {
+        return false;
+    }
+    let keyed = data_origin(dst.data).zip(component_memory(dst.storage));
+    let Some((origin, memory)) = keyed else {
+        return false;
+    };
+    let Some(alloc) = dsc.allocation_in(origin, memory) else {
+        return false;
+    };
+    if dest_related_to_external_nodes(dsc, &dst) {
+        return false;
+    }
+
+    dsc.add_alloc_user(alloc, compute);
+    if let Some(alloc_use) = AllocationUse::of(dsc, origin, memory, dest.transfer()) {
+        dsc.remove_alloc_use(alloc_use);
+    }
+
+    dsc.set_sole_compute_output(compute, dst.storage, dst.data);
+    let new_component = dest.reached_from();
+    dsc.set_dst_storage(dest.transfer(), dest.index(), new_component);
+    dsc.resize_compute_inputs_to(compute, input, new_component, dst.data);
+
+    true
+}
+
+/// Replaces: e341_relatedToExternalNodes
+///
+/// Whether EITHER END of the transfer touches an external datastream (`:1712`) — entry 253 on the
+/// source, entry 305 across every destination.
+///
+/// ⛔ A DISTINCT NAME: five C++ `relatedToExternalNodes` overloads differ only in their argument
+/// type — entries 121, 306, 341 and 361 — and Rust must name each of them.
+#[must_use]
+pub fn transfer_related_to_external_nodes<E: ExternalStreams + ?Sized>(
+    streams: &E,
+    transfer: &TransferNode,
+) -> bool {
+    src_related_to_external_nodes(streams, transfer)
+        || any_dest_related_to_external_nodes(streams, transfer)
+}
 
 // crustify:todo: e361_relatedToExternalNodes
 //   authority : ddc/ddc_transformation_util.cpp:1757  (20 body lines, level 4)
@@ -1478,6 +1773,61 @@ pub const fn memory_component(memory: DdcMemory) -> SenComponent {
         DdcMemory::PtxRf => SenComponent::Ptxrf,
         DdcMemory::PtiRf => SenComponent::Ptirf,
         DdcMemory::Hbm => SenComponent::Hbm,
+    }
+}
+
+/// `Ddc::registerComponents` — the SEVEN storages a result is held in AS A REGISTER
+/// (`ddc/ddcv1.cpp:17-18`).
+///
+/// ⭐ NEITHER A SUBSET NOR A SUPERSET OF [`is_memory`]: PELRF, SFPLRF, PTARF, PTXRF, PESTATE,
+/// SFPSTATE and LXLUSCALEREG are all `dsc2::memories` too, and PTIRF is a memory that is not a
+/// register — so entries 339 and 340 ask this one and not that one.
+#[must_use]
+pub const fn is_register(storage: SenComponent) -> bool {
+    matches!(
+        storage,
+        SenComponent::Pelrf
+            | SenComponent::Sfplrf
+            | SenComponent::Ptarf
+            | SenComponent::Ptxrf
+            | SenComponent::Pestate
+            | SenComponent::Sfpstate
+            | SenComponent::Lxluscalereg
+    )
+}
+
+/// The [`DdcMemory`] one storage IS — [`memory_component`] read the other way, which is how a
+/// `DataLocation`'s storage becomes an allocation key.
+///
+/// ⛔ NARROWER THAN `getAllocation`'S OWN MEMORY TEST, which admits all sixteen of `dsc2::memories`
+/// ([`is_memory`]) — the seven with no [`DdcMemory`] spelling cannot key
+/// [`DscAllocations::allocation_in`], so each answers exactly as an absent `memOrg_` entry does:
+/// *"missing allocation"*, which is `getAllocation(.., allowMissingAlloc=true)`'s own `nullptr`.
+#[must_use]
+pub const fn component_memory(storage: SenComponent) -> Option<DdcMemory> {
+    match storage {
+        SenComponent::Lx => Some(DdcMemory::Lx),
+        SenComponent::L0 => Some(DdcMemory::L0),
+        SenComponent::L0Scale => Some(DdcMemory::L0Scale),
+        SenComponent::Pelrf => Some(DdcMemory::PeLrf),
+        SenComponent::Sfplrf => Some(DdcMemory::SfpLrf),
+        SenComponent::Ptarf => Some(DdcMemory::PtaRf),
+        SenComponent::Ptxrf => Some(DdcMemory::PtxRf),
+        SenComponent::Ptirf => Some(DdcMemory::PtiRf),
+        SenComponent::Hbm => Some(DdcMemory::Hbm),
+        _ => None,
+    }
+}
+
+/// THE KEY `getAllocation(di, ..)` READS OFF ONE OPERAND — `myLdsIdx_`, else `constantId_`
+/// (`dsc/dsc2.cpp:2589`), [`None`] where the reference has neither and answers *"One of myLdsIdx or
+/// constantId must be set"*.
+#[must_use]
+pub const fn data_origin(data: DataInfo) -> Option<DataOrigin> {
+    match (data.my_lds_idx, data.constant_id) {
+        (Some(lds), _) => Some(DataOrigin::LabeledDs(lds)),
+        (None, Some(cons)) => Some(DataOrigin::Constant(cons)),
+        (None, None) => None,
     }
 }
 
@@ -2770,6 +3120,7 @@ mod tests_e110_e117 {
                 data_connect: connect,
                 my_lds_idx: None,
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
@@ -3137,6 +3488,7 @@ mod tests_e255_e257 {
                 data_connect: Some(connect),
                 my_lds_idx: Some(LdsIdx(1)),
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
@@ -3474,8 +3826,9 @@ mod tests_e255_e257 {
 
 #[cfg(test)]
 mod tests_e247_e254 {
-    // ⭐ TESTS FOR ENTRIES 247-254. Union this module with this file's other test modules when they
-    // land.
+    // ⭐ TESTS FOR ENTRIES 247-254, AND FOR ENTRIES 339-341, whose destination-repointing entries
+    // read the same tree, the same allocations and the same external stand-in. Union this module
+    // with this file's other test modules when they land.
     use super::*;
 
     use core::num::NonZeroU32;
@@ -3496,6 +3849,9 @@ mod tests_e247_e254 {
         Condition(LoopCondComposite, CoreClSet),
         Block,
         Allocate,
+        /// Entry 340 places one of these; nothing reads its `ComputeNode`, which the consumer list
+        /// carries instead.
+        Compute,
     }
 
     #[derive(Debug, Clone)]
@@ -3529,6 +3885,16 @@ mod tests_e247_e254 {
         alloc_users: Vec<(AllocId, NodeId)>,
         adjusted: Vec<(NodeId, LoopId, Vec<LoopId>)>,
         nested: Vec<(LoopId, LoopId)>,
+        allocations: BTreeMap<(DataOrigin, DdcMemory), AllocId>,
+        users: BTreeMap<AllocId, Vec<NodeId>>,
+        external: Option<(Option<DataConnect>, SenComponent, StreamDirection)>,
+        reduced: Vec<(AllocId, NodeId)>,
+        removed: Vec<(AllocId, NodeId)>,
+        dst_latch: Vec<(NodeId, usize, LatchDataId)>,
+        src_latch: Vec<(NodeId, LatchDataId)>,
+        input_latch: Vec<(NodeId, usize, LatchDataId)>,
+        compute_outputs: Vec<(NodeId, SenComponent, DataInfo)>,
+        compute_input_writes: Vec<(NodeId, InputIdx, SenComponent, DataInfo)>,
     }
 
     impl Tree {
@@ -3879,14 +4245,14 @@ mod tests_e247_e254 {
             lds
         }
 
-        fn allocation_in(&self, _origin: DataOrigin, _storage: DdcMemory) -> Option<AllocId> {
-            None
+        fn allocation_in(&self, origin: DataOrigin, storage: DdcMemory) -> Option<AllocId> {
+            self.allocations.get(&(origin, storage)).copied()
         }
 
         fn set_allocation_in(&mut self, _lds: LdsIdx, _storage: DdcMemory, _alloc: AllocId) {}
 
-        fn alloc_users(&self, _alloc: AllocId) -> Vec<NodeId> {
-            Vec::new()
+        fn alloc_users(&self, alloc: AllocId) -> Vec<NodeId> {
+            self.users.get(&alloc).cloned().unwrap_or_default()
         }
 
         fn alloc_component(&self, _alloc: AllocId) -> DdcMemory {
@@ -3903,10 +4269,64 @@ mod tests_e247_e254 {
 
         fn reduce_users_or_delete(
             &mut self,
-            _alloc_use: AllocationUse,
+            alloc_use: AllocationUse,
             _can_delete: CanDelete,
         ) -> bool {
+            self.reduced.push((alloc_use.alloc(), alloc_use.user()));
             false
+        }
+    }
+
+    impl ExternalStreams for Tree {
+        fn storage_or_datastream_is_external(
+            &self,
+            data: DataInfo,
+            storage: SenComponent,
+            direction: StreamDirection,
+        ) -> bool {
+            self.external == Some((data.data_connect, storage, direction))
+        }
+    }
+
+    impl SkipRegResults for Tree {
+        fn set_dst_latch_data_id(&mut self, transfer: NodeId, dst: usize, id: LatchDataId) {
+            self.dst_latch.push((transfer, dst, id));
+        }
+
+        fn set_src_latch_data_id(&mut self, transfer: NodeId, id: LatchDataId) {
+            self.src_latch.push((transfer, id));
+        }
+
+        fn set_compute_input_latch_data_id(
+            &mut self,
+            compute: NodeId,
+            input: usize,
+            id: LatchDataId,
+        ) {
+            self.input_latch.push((compute, input, id));
+        }
+
+        fn remove_alloc_use(&mut self, alloc_use: AllocationUse) {
+            self.removed.push((alloc_use.alloc(), alloc_use.user()));
+        }
+
+        fn set_sole_compute_output(
+            &mut self,
+            compute: NodeId,
+            unit: SenComponent,
+            data: DataInfo,
+        ) {
+            self.compute_outputs.push((compute, unit, data));
+        }
+
+        fn resize_compute_inputs_to(
+            &mut self,
+            compute: NodeId,
+            input: InputIdx,
+            unit: SenComponent,
+            data: DataInfo,
+        ) {
+            self.compute_input_writes.push((compute, input, unit, data));
         }
     }
 
@@ -4008,6 +4428,7 @@ mod tests_e247_e254 {
                 data_connect: Some(DataConnect::ArfPt),
                 my_lds_idx: lds,
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
@@ -4542,5 +4963,225 @@ mod tests_e247_e254 {
             &by_src_storage,
             node.dsts.first()
         ));
+    }
+
+    /// e341: EITHER end relates a transfer to an external node, and each end is asked about by its
+    /// own storage and its own direction.
+    #[test]
+    fn a_transfer_is_related_to_external_nodes_through_either_of_its_ends() {
+        let src = operand(SenComponent::Pe, SenComponent::Lx, None);
+        let dst = operand(SenComponent::Sfp, SenComponent::L0, None);
+        let node = transfer_node("t0", src, Dsts::new(dst, Vec::new()));
+
+        let by_src = External(Some((
+            Some(DataConnect::ArfPt),
+            SenComponent::Lx,
+            StreamDirection::Incoming,
+        )));
+        let by_dst = External(Some((
+            Some(DataConnect::ArfPt),
+            SenComponent::L0,
+            StreamDirection::Outgoing,
+        )));
+        assert!(transfer_related_to_external_nodes(&by_src, &node));
+        assert!(transfer_related_to_external_nodes(&by_dst, &node));
+
+        // Neither end: the destination's storage asked in the SOURCE's direction.
+        let neither = External(Some((
+            Some(DataConnect::ArfPt),
+            SenComponent::L0,
+            StreamDirection::Incoming,
+        )));
+        assert!(!transfer_related_to_external_nodes(&neither, &node));
+    }
+
+    /// e339: the register allocation is dropped for the transfer AND for every consumer, and the one
+    /// minted id links them.
+    #[test]
+    fn latching_a_register_result_drops_every_allocation_use_and_links_them_by_one_id() {
+        let mut tree = Tree::default();
+        let root = tree.add("root", Kind::Block, None);
+        let dst = operand(SenComponent::Sfp, SenComponent::Sfplrf, Some(LdsIdx(1)));
+        let t0 = tree.add(
+            "t0",
+            Kind::Transfer(transfer_node(
+                "t0",
+                operand(SenComponent::Pe, SenComponent::Lx, Some(LdsIdx(1))),
+                Dsts::new(dst, Vec::new()),
+            )),
+            Some(root),
+        );
+        // A consuming transfer reads that register file as its SOURCE, and a consuming compute reads
+        // it on the one input whose connect matches.
+        let consuming = tree.add(
+            "t1",
+            Kind::Transfer(transfer_node(
+                "t1",
+                operand(SenComponent::Sfp, SenComponent::Sfplrf, Some(LdsIdx(1))),
+                Dsts::new(
+                    operand(SenComponent::Pe, SenComponent::Lx, None),
+                    Vec::new(),
+                ),
+            )),
+            Some(root),
+        );
+        let computing = tree.add("c0", Kind::Compute, Some(root));
+        tree.consumers = vec![
+            FifoConsumer::Transfer(consuming),
+            FifoConsumer::Compute(
+                computing,
+                ComputeNode {
+                    name: NodeName("c0".to_string()),
+                    op: DdlComputeType::Macc,
+                    ex_unit: SenComponent::Sfp,
+                    inputs: vec![operand(
+                        SenComponent::Sfplrf,
+                        SenComponent::NoComponent,
+                        Some(LdsIdx(1)),
+                    )],
+                    outputs: Vec::new(),
+                    num_folds_engaged: NumFolds::ONE,
+                    data_format: None,
+                    instr_attribute: InstrAttribute::default(),
+                },
+            ),
+        ];
+        tree.allocations.insert(
+            (DataOrigin::LabeledDs(LdsIdx(1)), DdcMemory::SfpLrf),
+            AllocId(9),
+        );
+        tree.users.insert(AllocId(9), vec![t0, consuming, computing]);
+
+        let mut metadata = Metadata::default();
+        let mut latch_ids = LatchDataIds::default();
+        let node = tree.transfer(t0);
+        let dest =
+            TransferDest::of(&metadata, t0, &node, DestIdx(0)).expect("an internal destination");
+
+        assert!(convert_result_to_skip_reg(
+            &mut tree,
+            &mut metadata,
+            &mut latch_ids,
+            dest,
+            SkipRegTarget::Latch
+        ));
+
+        assert_eq!(
+            tree.reduced,
+            vec![
+                (AllocId(9), t0),
+                (AllocId(9), consuming),
+                (AllocId(9), computing)
+            ]
+        );
+        assert_eq!(tree.dst_storage, vec![(t0, 0, SenComponent::Latch)]);
+        assert_eq!(tree.src_storage, vec![(consuming, SenComponent::Latch)]);
+        assert_eq!(tree.compute_inputs, vec![(computing, 0, SenComponent::Latch)]);
+
+        // ONE id across the producer and both consumers, and the counter has moved past it.
+        let id = LatchDataId(0);
+        assert_eq!(tree.dst_latch, vec![(t0, 0, id)]);
+        assert_eq!(tree.src_latch, vec![(consuming, id)]);
+        assert_eq!(tree.input_latch, vec![(computing, 0, id)]);
+        assert_eq!(latch_ids.next(), LatchDataId(1));
+    }
+
+    /// e339: a destination that is not a register at all is the reference's OWN answer — accepted
+    /// where it already skips the register file, refused otherwise, and untouched either way.
+    #[test]
+    fn a_result_that_already_skips_the_register_file_is_accepted_untouched() {
+        fn answered(storage: SenComponent, target: SkipRegTarget) -> bool {
+            let mut tree = Tree::default();
+            let root = tree.add("root", Kind::Block, None);
+            let t0 = tree.add(
+                "t0",
+                Kind::Transfer(transfer_node(
+                    "t0",
+                    operand(SenComponent::Pe, SenComponent::Lx, Some(LdsIdx(1))),
+                    Dsts::new(
+                        operand(SenComponent::Sfp, storage, Some(LdsIdx(1))),
+                        Vec::new(),
+                    ),
+                )),
+                Some(root),
+            );
+            let mut metadata = Metadata::default();
+            let node = tree.transfer(t0);
+            let dest =
+                TransferDest::of(&metadata, t0, &node, DestIdx(0)).expect("an internal destination");
+            let answer = convert_result_to_skip_reg(
+                &mut tree,
+                &mut metadata,
+                &mut LatchDataIds::default(),
+                dest,
+                target,
+            );
+            assert!(tree.dst_storage.is_empty(), "the destination is not rewritten");
+            assert!(tree.reduced.is_empty(), "no allocation use is dropped");
+            answer
+        }
+
+        // A latch is already a latch, and a FIFO is any non-latch that is not a memory.
+        assert!(answered(SenComponent::Latch, SkipRegTarget::Latch));
+        assert!(answered(SenComponent::NoComponent, SkipRegTarget::Fifo));
+        // The same two storages read against the OTHER target, and a memory against either.
+        assert!(!answered(SenComponent::Latch, SkipRegTarget::Fifo));
+        assert!(!answered(SenComponent::NoComponent, SkipRegTarget::Latch));
+        assert!(!answered(SenComponent::Qgi, SkipRegTarget::Fifo));
+    }
+
+    /// e340: the compute lands beside the transfer, inherits the allocation, and the two ends swap —
+    /// the compute writes the register file, the transfer writes the LAST HOP.
+    #[test]
+    fn a_compute_inserted_before_a_register_takes_its_allocation_and_reads_the_last_hop() {
+        let mut tree = Tree::default();
+        let root = tree.add("root", Kind::Block, None);
+        let dst = operand(SenComponent::Sfp, SenComponent::Sfplrf, Some(LdsIdx(1)));
+        let t0 = tree.add(
+            "t0",
+            Kind::Transfer(transfer_node(
+                "t0",
+                operand(SenComponent::Pe, SenComponent::Lx, Some(LdsIdx(1))),
+                Dsts::new(dst, Vec::new())
+                    .with_hops(vec![Hops(vec![SenComponent::L0, SenComponent::Sfp])]),
+            )),
+            Some(root),
+        );
+        let computing = tree.add("c0", Kind::Compute, None);
+        tree.allocations.insert(
+            (DataOrigin::LabeledDs(LdsIdx(1)), DdcMemory::SfpLrf),
+            AllocId(9),
+        );
+        tree.users.insert(AllocId(9), vec![t0]);
+
+        let metadata = Metadata::default();
+        let node = tree.transfer(t0);
+        let dest =
+            TransferDest::of(&metadata, t0, &node, DestIdx(0)).expect("an internal destination");
+        let unplaced = UnplacedNode::of(&tree, computing).expect("a compute not yet in the tree");
+
+        assert!(insert_compute_between_transfer_and_reg(
+            &mut tree,
+            dest,
+            unplaced,
+            InputIdx(2)
+        ));
+
+        // Placed immediately after the transfer, and the allocation's user in its place.
+        assert_eq!(tree.children(root), vec![t0, computing]);
+        assert_eq!(tree.alloc_users, vec![(AllocId(9), computing)]);
+        assert_eq!(tree.removed, vec![(AllocId(9), t0)]);
+
+        // The compute writes the register file as its sole output and reads the transfer's last hop
+        // on input 2, which is what the transfer now writes.
+        assert_eq!(
+            tree.compute_outputs,
+            vec![(computing, SenComponent::Sfplrf, dst.data)]
+        );
+        assert_eq!(
+            tree.compute_input_writes,
+            vec![(computing, InputIdx(2), SenComponent::Sfp, dst.data)]
+        );
+        assert_eq!(tree.dst_storage, vec![(t0, 0, SenComponent::Sfp)]);
     }
 }

@@ -501,6 +501,28 @@ const PACK12: [ShuffleIndex; 16] =
 /// `pack13` (`shuffle.cpp:36`) — its HIGH output stick, the same lanes offset by eight.
 const PACK13: [ShuffleIndex; 16] =
     indices([8, -1, 9, -1, 10, -1, 11, -1, 12, -1, 13, -1, 14, -1, 15, -1]);
+/// `pack8` (`shuffle.cpp:23`) — sixteen lanes, then sixteen selecting nothing.
+const PACK8: [ShuffleIndex; 32] = indices([
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1,
+]);
+/// `pack9` (`shuffle.cpp:26`) — two lanes then two selecting nothing, eight times over.
+const PACK9: [ShuffleIndex; 32] = indices([
+    0, 32, -1, -1, 4, 36, -1, -1, 8, 40, -1, -1, 12, 44, -1, -1, 16, 48, -1, -1, 20, 52, -1, -1,
+    24, 56, -1, -1, 28, 60, -1, -1,
+]);
+/// `pack24` (`shuffle.cpp:18`) — sixteen lanes, then forty-eight selecting nothing.
+const PACK24: [ShuffleIndex; 64] = indices([
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+]);
+/// `gcvt_f16_f8_pack` (`shuffle.cpp:72`) — the identity selection, taking the first stick whole.
+const GCVT_F16_F8_PACK: [ShuffleIndex; 16] =
+    indices([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+/// `gcvt_f16_f8_merge` (`shuffle.cpp:74`) — the two sticks interleaved lane by lane.
+const GCVT_F16_F8_MERGE: [ShuffleIndex; 16] =
+    indices([0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15]);
 
 /// A PSEUDOCODE REGISTER NAME — `r0`, `r1`, .. as `codegen_psuedocode` mints them
 /// (`shuffle.cpp:1229-1234`).
@@ -1640,6 +1662,65 @@ pub enum ShuffleAction {
 /// (`shuffle.cpp:1149-1157`), so an offer that replaced the list would silently drop the others.
 pub type ActionList = Vec<ShuffleAction>;
 
+impl ShuffleAction {
+    /// `action->enumerate_stick_computations()` (`shuffle.h:229`) — the virtual e342 drives, over all
+    /// eight subclasses.
+    ///
+    /// ⭐ FIVE ARMS ARE INLINE BECAUSE THEY HAVE NO ENTRY OF THEIR OWN: EXCLUSIONS.tsv carries
+    /// `Pack8Action`, `Pack9Action`, `Pack24Action`, `GCVTF16F8PackAction` and
+    /// `GCVTF16F8MergeAction`'s overrides as 3-line `field_accessor`s (`shuffle.cpp:490`, `:537`,
+    /// `:588`, `:630`, `:675`); the three that do are delegated to (e311, e313, e315).
+    /// ⛔ THE TWO GCVT TABLES GO IN AS WRITTEN — `bin_op(dim, table, false)` (`:630`, `:675`) — where
+    /// the three packs take the defaulted [`IndexExpansion::ByElementWidth`].
+    #[must_use]
+    pub fn enumerate_stick_computations(&self) -> Vec<ComputationOp> {
+        match self {
+            Self::Merge(action) => action.enumerate_stick_computations(),
+            Self::Pack(action) => action.enumerate_stick_computations(),
+            Self::ShiftLeft(action) => action.enumerate_stick_computations(),
+            Self::Pack8(action) => vec![ComputationOp::bin_op(
+                action.dim(),
+                PACK8.to_vec(),
+                IndexExpansion::ByElementWidth,
+            )],
+            Self::Pack9(action) => vec![ComputationOp::bin_op(
+                action.dim(),
+                PACK9.to_vec(),
+                IndexExpansion::ByElementWidth,
+            )],
+            Self::Pack24(action) => vec![ComputationOp::bin_op(
+                action.dim(),
+                PACK24.to_vec(),
+                IndexExpansion::ByElementWidth,
+            )],
+            Self::GcvtF16F8Pack(action) => vec![ComputationOp::bin_op(
+                action.dim(),
+                GCVT_F16_F8_PACK.to_vec(),
+                IndexExpansion::AsWritten,
+            )],
+            Self::GcvtF16F8Merge(action) => vec![ComputationOp::bin_op(
+                action.dim(),
+                GCVT_F16_F8_MERGE.to_vec(),
+                IndexExpansion::AsWritten,
+            )],
+        }
+    }
+}
+
+/// ONE STEP OF A SHUFFLE — a graph node TOGETHER WITH the action that reached it, which is what
+/// `codegen_generic` reads out of `shuffle[i]` (`shuffle.cpp:940-942`).
+///
+/// ⛔ THIS PAIR IS `DT_CHECK(action != nullptr)` (`shuffle.cpp:942`) MADE UNSPELLABLE. `get_shuffle`
+/// (e362) only ever appends nodes it reached over an edge (`shuffle.cpp:1205-1211`), so a step
+/// without its action is not a state the walk has to test for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShuffleStep {
+    /// `shuffle[i]`.
+    pub node: GraphNodeId,
+    /// `node->prev_action`, dereferenced.
+    pub action: ShuffleAction,
+}
+
 /// WHICH NODE OF THE SHUFFLE GRAPH — an index into [`AutoShuffler`]'s arena, standing in for the
 /// reference's `std::shared_ptr<GraphNode>` (`shuffle.h:264`).
 ///
@@ -2152,18 +2233,78 @@ pub struct StickIds {
     pub output: StickNumber,
 }
 
+/// THE EDGES ONE NODE'S OUTPUT STICKS ARE WRITTEN TO — `get_edges_for_node`'s `std::vector`, WHICH
+/// THE WALK CALLS `back()` ON BEFORE ANY SIZE TEST (`shuffle.cpp:1002`).
+///
+/// ⛔ THAT UNGUARDED `back()` IS WHY THIS IS NOT A `Vec`: both instantiations fill the vector with
+/// `numSticks() = 1 << stick_dims.size()` edges (`shuffle.cpp:829-838`, `:1244-1246`), never zero, so
+/// non-emptiness is a fact of the type rather than a check the reference omits.
+/// ⛔ AND THE LAST EDGE IS NEVER POPPED — `if (outputs.size() != 1) outputs.pop_back()`
+/// (`shuffle.cpp:1003`) — so once the list runs down, every remaining computation writes that edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEdges<E> {
+    /// The edges below the back one, the one popped next LAST.
+    below: Vec<E>,
+    /// `back()`.
+    last: E,
+}
+
+impl<E> NodeEdges<E> {
+    /// `numSticks()` edges, `f` called once per stick, and the FIRST one minted is `back()` — which
+    /// is what `codegen_psuedocode`'s `std::reverse` arranges (`shuffle.cpp:1244-1249`).
+    ///
+    /// ⛔ ONE DIVERGENCE, ON AN INPUT THE REFERENCE CANNOT HAVE: a zero stick count still mints one
+    /// edge here, where the reference mints none and then reads `back()` of an empty vector.
+    pub fn per_stick(sticks: Sticks, mut f: impl FnMut() -> E) -> Self {
+        let last = f();
+        let mut below: Vec<E> = (1..sticks.0).map(|_| f()).collect();
+        below.reverse();
+        Self { below, last }
+    }
+
+    /// `outputs.back()`, then `pop_back()` unless it is the only edge left
+    /// (`shuffle.cpp:1002-1003`).
+    pub fn pop_back_unless_last(&mut self) -> E
+    where
+        E: Clone,
+    {
+        match self.below.pop() {
+            Some(next) => std::mem::replace(&mut self.last, next),
+            None => self.last.clone(),
+        }
+    }
+
+    /// `outputs.size() == 1`, which is what `out_added` reads AFTER the pop.
+    #[must_use]
+    pub const fn is_last(&self) -> bool {
+        self.below.is_empty()
+    }
+}
+
+impl<E: Clone> NodeEdges<E> {
+    /// `outputs.insert(outputs.begin(), numSticks(), edge)` — one stick's worth of the same edge,
+    /// which is how e371's hook fills the list (`shuffle.cpp:838`, `:846`).
+    #[must_use]
+    pub fn repeated(sticks: Sticks, edge: E) -> Self {
+        Self {
+            below: vec![edge.clone(); narrow_to_usize(sticks.0.saturating_sub(1))],
+            last: edge,
+        }
+    }
+}
+
 /// THE TWO `std::function`s THE WALK IS DRIVEN BY, WITH ITS `EdgeType` — `codegen_generic`'s last
 /// two parameters as one implementable thing (`shuffle.cpp:915-919`). [`Pseudocode`] is the
 /// `std::string` instantiation; e371 `replace_assign` is the [`DataEdge`] one.
 pub trait ShuffleCodegen {
     /// `EdgeType`.
-    type Edge;
+    type Edge: Clone;
 
     /// `get_edges_for_node(node)` — the edges this node's output sticks are written to.
     ///
     /// ⭐ THE LAYOUT, NOT THE NODE: both instantiations read `node->layout` and nothing else of it
     /// (`shuffle.cpp:829`, `:1244`), so the hook does not need the node handle.
-    fn edges_for_node(&mut self, layout: &AbstractLayout) -> Vec<Self::Edge>;
+    fn edges_for_node(&mut self, layout: &AbstractLayout) -> NodeEdges<Self::Edge>;
 
     /// `do_op_codegen(op, inputs, output, input_output_stick_id, output_added)`.
     fn op_codegen(
@@ -2179,16 +2320,16 @@ pub trait ShuffleCodegen {
 /// THE CODEGEN WALK — `AutoShuffler::codegen_generic<EdgeType>` (`shuffle.cpp:910`), which is
 /// `e342_codegen_generic`, LEVEL 3 and not this batch, so it is NAMED here rather than called.
 ///
-/// ⭐ A TRAIT BECAUSE THE REFERENCE'S IS A MEMBER TEMPLATE: e342 lands as `impl CodegenGeneric for
-/// AutoShuffler` with `Node = GraphNodeId`, and [`Self::codegen_psuedocode`] — e161, one of the
-/// template's two instantiations — becomes a method on the shuffler with no signature change.
+/// ⭐ A TRAIT BECAUSE THE REFERENCE'S IS A MEMBER TEMPLATE: e342 is `impl CodegenGeneric for
+/// AutoShuffler` with `Node = ShuffleStep`, and [`Self::codegen_psuedocode`] — e161, one of the
+/// template's two instantiations — is a method on the shuffler with no signature change.
 pub trait CodegenGeneric {
-    /// An element of `shuffle` — the reference's `std::shared_ptr<GraphNode>`, which is
-    /// [`GraphNodeId`] now that the nodes live in [`AutoShuffler`]'s arena.
+    /// An element of `shuffle` — the reference's `std::shared_ptr<GraphNode>`, which for the shuffler
+    /// is a [`ShuffleStep`]: the node handle into its arena PLUS the action that reached it.
     type Node;
 
     /// `codegen_generic(input_layout, output_layout, shuffle, input_edges, get_edges_for_node,
-    /// do_op_codegen)`.
+    /// do_op_codegen)`. [`None`] is the `edges.first().at(key)` throw described on e342.
     fn codegen_generic<C: ShuffleCodegen>(
         &mut self,
         input_layout: &ConcreteLayout,
@@ -2196,7 +2337,7 @@ pub trait CodegenGeneric {
         shuffle: &[Self::Node],
         input_edges: &[C::Edge],
         codegen: &mut C,
-    );
+    ) -> Option<()>;
 
     /// Replaces: e161_codegen_psuedocode
     ///
@@ -2212,13 +2353,13 @@ pub trait CodegenGeneric {
         input: &ConcreteLayout,
         output: &ConcreteLayout,
         shuffle: &[Self::Node],
-    ) -> Vec<String> {
+    ) -> Option<Vec<String>> {
         let mut codegen = Pseudocode::default();
         let input_regs: Vec<PseudoReg> = (0..input.num_sticks().0)
             .map(|_| codegen.regs.new_reg_name())
             .collect();
-        self.codegen_generic(input, output, shuffle, &input_regs, &mut codegen);
-        codegen.code_lines
+        self.codegen_generic(input, output, shuffle, &input_regs, &mut codegen)?;
+        Some(codegen.code_lines)
     }
 }
 
@@ -2250,14 +2391,10 @@ struct Pseudocode {
 impl ShuffleCodegen for Pseudocode {
     type Edge = PseudoReg;
 
-    fn edges_for_node(&mut self, layout: &AbstractLayout) -> Vec<PseudoReg> {
-        let mut regs: Vec<PseudoReg> = (0..layout.num_sticks().0)
-            .map(|_| self.regs.new_reg_name())
-            .collect();
+    fn edges_for_node(&mut self, layout: &AbstractLayout) -> NodeEdges<PseudoReg> {
         // "Codegen pulls in order from the back. Register names are interchangeable for psuedocode,
-        // but this order is easier to read." (`shuffle.cpp:1247-1248`)
-        regs.reverse();
-        regs
+        // but this order is easier to read." (`shuffle.cpp:1247-1248`) — which [`NodeEdges`] holds.
+        NodeEdges::per_stick(layout.num_sticks(), || self.regs.new_reg_name())
     }
 
     fn op_codegen(
@@ -2369,19 +2506,146 @@ impl DataEdge {
     }
 }
 
-// crustify:todo: e342_codegen_generic
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:910  (123 body lines, level 3)
-//   class     : AutoShuffler
-//   original  : template <typename EdgeType> void AutoShuffler::codegen_generic( const ConcreteLayout& input_layout, const ConcreteLayout& output_layout, const std::vector<std::shared_ptr<GraphNode>>& shuffle, const std::vector<EdgeType>& input_edges, const std::function<std::vector<EdgeType>(std::shared_ptr<GraphN
-//   extract   : crustify-ddc/cpp/ddc.cpp:12356-12488
-//   calls     : e104_clear, e138_swap, e140_repeat_over_dims, e158_make_stick_number_key, e311_enumerate_stick_computations, e313_enumerate_stick_computations, e315_enumerate_stick_computations
+impl CodegenGeneric for AutoShuffler {
+    type Node = ShuffleStep;
 
-// crustify:todo: e343_get_legal_transforms
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:1147  (12 body lines, level 3)
-//   class     : AutoShuffler
-//   original  : std::vector<std::shared_ptr<ShuffleAction>> AutoShuffler::get_legal_transforms( const AbstractLayout& layout, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:12498-12511
-//   calls     : e310_add_valid_actions, e312_add_valid_actions, e314_add_valid_actions, e316_add_valid_actions, e317_add_valid_actions, e318_add_valid_actions, e319_add_valid_actions, e320_add_valid_actions
+    /// Replaces: e342_codegen_generic
+    ///
+    /// EMITS THE WHOLE SHUFFLE: per step it expands the action's stick computations over the stick
+    /// dimensions they do not index, orders them so the tensor reads and writes come out in order,
+    /// drives one op at a time into that step's edges, then routes those edges into the next step's
+    /// inputs.
+    ///
+    /// ⛔ [`None`] IS `edges.first().at(key)` (`shuffle.cpp:998`) — a computation reading a stick the
+    /// previous step never wrote — and the write-order `DT_ERROR` (`:989`) is the `todo!` it names.
+    /// ⚠️ THE `write_in_order` ARM RE-SEEDING THE OUTPUT EDGE MAP FROM `input_edges` (`:956`) IS
+    /// INERT — that map is read only after a swap, and the arm runs only on the last step. Kept.
+    fn codegen_generic<C: ShuffleCodegen>(
+        &mut self,
+        input_layout: &ConcreteLayout,
+        output_layout: &ConcreteLayout,
+        shuffle: &[ShuffleStep],
+        input_edges: &[C::Edge],
+        codegen: &mut C,
+    ) -> Option<()> {
+        // "Reading from the input tensor and writing to the output tensor must be in order, but
+        // anything we put in registers can be done in any order."
+        let mut stick_to_int = SwapBuffer::new(
+            make_stick_number_key(&input_layout.stick_dims),
+            make_stick_number_key(&[]),
+        );
+        let mut stick_ordering = SwapBuffer::new(input_layout.stick_dims.clone(), Vec::new());
+        // ⛔ THE `zip` IS `DT_CHECK(num_input_sticks == input_edges.size())` (`shuffle.cpp:930`): a
+        // short edge list seeds fewer sticks instead of reading past its end.
+        let seed: BTreeMap<StickNumber, C::Edge> = (0..input_layout.num_sticks().0)
+            .zip(input_edges)
+            .map(|(stick, edge)| (StickNumber(stick as u32), edge.clone()))
+            .collect();
+        let mut edges = SwapBuffer::new(seed.clone(), BTreeMap::new());
+
+        for (i, step) in shuffle.iter().enumerate() {
+            let mut read_in_order = i == 0;
+            let write_in_order = i + 1 == shuffle.len();
+
+            // Housekeeping: set up output stick order, data edges, and int key.
+            stick_ordering.second_mut().clear();
+            edges.second_mut().clear();
+            if write_in_order {
+                *stick_ordering.second_mut() = output_layout.stick_dims.clone();
+                *edges.second_mut() = seed.clone();
+            } else {
+                let mut dim_set = self.node(step.node).layout.stick_dims.clone();
+                // "Any order works here, but heuristically try to keep active sticks in low dims."
+                let mut active = Vec::new();
+                for &dim in stick_ordering.first() {
+                    if dim_set.remove(&dim) {
+                        active.push(dim);
+                    }
+                }
+                let mut ordering: Vec<DimSymbol> = dim_set.into_iter().collect();
+                ordering.extend(active);
+                *stick_ordering.second_mut() = ordering;
+            }
+            *stick_to_int.second_mut() = make_stick_number_key(stick_ordering.second());
+
+            // "Get computation list for this action. These computations are implicitly repeated
+            // across absent stick dims."
+            let mut computations = Vec::new();
+            for partial in step.action.enumerate_stick_computations() {
+                partial.repeat_over_dims(stick_ordering.first(), &mut computations);
+            }
+
+            // "We can check if in-order reading/writing is possible by sorting the computations
+            // accordingly."
+            sort_ops_by_input_stick(stick_to_int.first(), &mut computations);
+            if read_in_order && !inputs_read_single_inorder(stick_to_int.first(), &computations) {
+                // The reference's `DT_ERROR("TODO: read into registers")` is commented out here.
+                read_in_order = false;
+            }
+            if write_in_order {
+                if !read_in_order {
+                    // "we can only perturb the order if it isn't needed for reading."
+                    sort_ops_by_output_stick(stick_to_int.second(), &mut computations);
+                }
+                if !outputs_written_single_inorder(stick_to_int.second(), &computations) {
+                    todo!("insert identity op at end to write in correct order");
+                }
+            }
+
+            let mut outputs = codegen.edges_for_node(&self.node(step.node).layout);
+            let mut output_added = false;
+            // "We have our computation ordering, execute it."
+            for computation in &computations {
+                let mut inputs = Vec::with_capacity(computation.inputs.len());
+                let mut sticks = StickIds {
+                    inputs: Vec::with_capacity(computation.inputs.len()),
+                    output: StickNumber(0),
+                };
+                for index in &computation.inputs {
+                    let key = stick_to_int.first().key(index);
+                    inputs.push(edges.first().get(&key)?.clone());
+                    sticks.inputs.push(key);
+                }
+                sticks.output = stick_to_int.second().key(&computation.output);
+                // "either writing to output or need to allocate a register."
+                let mut output = outputs.pop_back_unless_last();
+                edges.second_mut().insert(sticks.output, output.clone());
+                let out_added = outputs.is_last() && output_added;
+                codegen.op_codegen(computation, &inputs, &mut output, &sticks, out_added);
+                output_added = true;
+            }
+
+            // Housekeeping: route the out edges back to the in edges.
+            edges.swap();
+            stick_to_int.swap();
+            stick_ordering.swap();
+        }
+        Some(())
+    }
+}
+
+impl AutoShuffler {
+    /// Replaces: e343_get_legal_transforms
+    ///
+    /// EVERY OFFER THE EIGHT ACTIONS MAKE FROM `layout` TOWARDS `goal`, concatenated in the
+    /// reference's own order (`shuffle.cpp:1147-1159`).
+    ///
+    /// ⛔ THE ORDER IS PART OF THE ANSWER: the search breaks equal-cost ties by push order, so
+    /// reordering these eight calls changes which shuffle e362 returns.
+    #[must_use]
+    pub fn get_legal_transforms(layout: &AbstractLayout, goal: &AbstractLayout) -> ActionList {
+        let mut actions = ActionList::new();
+        MergeAction::add_valid_actions(&mut actions, layout, goal);
+        PackAction::add_valid_actions(&mut actions, layout, goal);
+        ShiftLeftAction::add_valid_actions(&mut actions, layout, goal);
+        Pack8Action::add_valid_actions(&mut actions, layout, goal);
+        Pack9Action::add_valid_actions(&mut actions, layout, goal);
+        Pack24Action::add_valid_actions(&mut actions, layout, goal);
+        GCVTF16F8PackAction::add_valid_actions(&mut actions, layout, goal);
+        GCVTF16F8MergeAction::add_valid_actions(&mut actions, layout, goal);
+        actions
+    }
+}
 
 // crustify:todo: e362_get_shuffle
 //   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:1161  (61 body lines, level 4)
@@ -3011,8 +3275,8 @@ mod tests_e161_e164 {
     const C: DimSymbol = B.next();
     const DUMMY: DimSymbol = DimSymbol::DUMMY;
 
-    /// A stand-in for `e342_codegen_generic` (`shuffle.cpp:910`, level 3, NOT this batch): visits
-    /// each node once and drives one `packmerge` op into the node's first edge.
+    /// A MINIMAL IMPLEMENTOR, so this exercises e161's own frame rather than e342's ordering: visits
+    /// each node once and drives one `packmerge` op into the edge the node's list hands back first.
     struct StubWalk;
 
     impl CodegenGeneric for StubWalk {
@@ -3025,7 +3289,7 @@ mod tests_e161_e164 {
             shuffle: &[AbstractLayout],
             input_edges: &[C::Edge],
             codegen: &mut C,
-        ) {
+        ) -> Option<()> {
             let op = ComputationOp {
                 inputs: Vec::new(),
                 output: StickIndex::new(),
@@ -3036,11 +3300,11 @@ mod tests_e161_e164 {
                 }),
             };
             for node in shuffle {
-                let mut edges = codegen.edges_for_node(node);
+                let mut edge = codegen.edges_for_node(node).pop_back_unless_last();
                 codegen.op_codegen(
                     &op,
                     input_edges,
-                    &mut edges[0],
+                    &mut edge,
                     &StickIds {
                         inputs: Vec::new(),
                         output: StickNumber(0),
@@ -3048,6 +3312,7 @@ mod tests_e161_e164 {
                     false,
                 );
             }
+            Some(())
         }
     }
 
@@ -3074,11 +3339,11 @@ mod tests_e161_e164 {
         assert_ne!(narrow_to_usize(0xffff_ffff_0000_0000), 0);
     }
 
-    /// e161: one register counter across both lambdas, and a node's registers handed out from the
-    /// back — one input stick dimension mints `r0`/`r1`, then a 2-dimension node mints `r2..r5` and
-    /// yields `r5` first.
+    /// e161: one register counter across both lambdas, and a node's registers pulled from the BACK
+    /// of the reversed list — one input stick dimension mints `r0`/`r1`, then a 2-dimension node
+    /// mints `r2..r5` and hands back `r2`, the first it minted.
     #[test]
-    fn pseudocode_shares_one_register_counter_and_reverses_node_registers() {
+    fn pseudocode_shares_one_register_counter_and_pulls_node_registers_from_the_back() {
         let input = ConcreteLayout {
             stick_dims: vec![A],
             slice_dims: vec![B],
@@ -3095,7 +3360,10 @@ mod tests_e161_e164 {
 
         let lines = StubWalk.codegen_psuedocode(&input, &output, &[node]);
 
-        assert_eq!(lines, vec!["r5 = packmerge r0 r1 [ 0 16 ]".to_owned()]);
+        assert_eq!(
+            lines,
+            Some(vec!["r2 = packmerge r0 r1 [ 0 16 ]".to_owned()])
+        );
     }
 
     /// e164: the allocation lands before the insert point exactly once, and an edge with none — or
@@ -3928,6 +4196,96 @@ mod tests_e310_e317 {
             )
             .is_empty(),
             "a dummy goal slot is rejected by the sticks-contain test, since sticks are never dummy"
+        );
+    }
+}
+
+// ⭐ TESTS FOR ENTRIES 342-343. Union this module with this file's other test modules when the rest
+// of the walk's callers land.
+#[cfg(test)]
+mod tests_e342_e343 {
+    use super::{
+        AbstractLayout, AutoShuffler, CodegenGeneric, ConcreteLayout, DIMS_PER_SLICE, DimSymbol,
+        MergeAction, MergeDim, ShuffleAction, ShuffleStep,
+    };
+    use crate::formats::DataFormat;
+    use std::collections::BTreeSet;
+
+    /// Symbols 1 and 4 — `getDefaultSymbol()` and its successors.
+    const A: DimSymbol = DimSymbol::DEFAULT;
+    const D: DimSymbol = A.next().next().next();
+    const DUMMY: DimSymbol = DimSymbol::DUMMY;
+
+    /// e343: the eight offers append to ONE list in the reference's own family order, so an 8-bit
+    /// layout with a vacant slice yields four merges, then three packs, then the shift-left, then
+    /// the `pack24` — and nine offers rather than any single family's count.
+    #[test]
+    fn every_family_appends_to_one_list_in_the_references_order() {
+        let layout = AbstractLayout::new(
+            [A].into_iter().collect::<BTreeSet<_>>(),
+            [DUMMY; DIMS_PER_SLICE],
+            DataFormat::Senint8,
+        );
+        let goal = AbstractLayout::new(
+            BTreeSet::new(),
+            [DUMMY; DIMS_PER_SLICE],
+            DataFormat::Senint8,
+        );
+
+        let actions = AutoShuffler::get_legal_transforms(&layout, &goal);
+
+        assert_eq!(actions.len(), 9);
+        assert!(
+            actions[..4]
+                .iter()
+                .all(|action| matches!(action, ShuffleAction::Merge(_)))
+        );
+        assert!(
+            actions[4..7]
+                .iter()
+                .all(|action| matches!(action, ShuffleAction::Pack(_)))
+        );
+        assert!(matches!(actions[7], ShuffleAction::ShiftLeft(_)));
+        assert!(matches!(actions[8], ShuffleAction::Pack24(_)));
+    }
+
+    /// e342: one step of a merge that pulls `D` out of the 8-bit slot and pushes `A` in. The two
+    /// halves read both input sticks, the step's own registers are pulled lowest-first from the back
+    /// of its list, and the output sticks come out 0 then 1 — which is what lets the write stay in
+    /// order without the reference's identity op.
+    #[test]
+    fn the_walk_orders_one_steps_computations_and_writes_its_own_registers() {
+        let before = AbstractLayout::new(
+            [A].into_iter().collect::<BTreeSet<_>>(),
+            [DUMMY, DUMMY, D, DUMMY, DUMMY, DUMMY],
+            DataFormat::Senint8,
+        );
+        let action = MergeAction::new(A, MergeDim::Bit8, D);
+        let after = action.act(&before);
+        assert_eq!(after.stick_dims, [D].into_iter().collect::<BTreeSet<_>>());
+
+        let mut shuffler = AutoShuffler::new();
+        let step = ShuffleStep {
+            node: shuffler.get_node(&after),
+            action: ShuffleAction::Merge(action),
+        };
+        let input = ConcreteLayout {
+            stick_dims: vec![A],
+            slice_dims: vec![D],
+        };
+        let output = ConcreteLayout {
+            stick_dims: vec![D],
+            slice_dims: vec![A],
+        };
+
+        let lines = shuffler.codegen_psuedocode(&input, &output, &[step]);
+
+        assert_eq!(
+            lines,
+            Some(vec![
+                "r2 = packmerge r0 r1 [ 0 16 2 18 4 20 6 22 8 24 10 26 12 28 14 30 ]".to_owned(),
+                "r3 = packmerge r0 r1 [ 1 17 3 19 5 21 7 23 9 25 11 27 13 29 15 31 ]".to_owned(),
+            ])
         );
     }
 }

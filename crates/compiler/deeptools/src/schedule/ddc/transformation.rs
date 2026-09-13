@@ -208,6 +208,14 @@ use crate::schedule::l3::dsc::PrimaryDsInfo;
 use crate::units::{Core, NumFolds};
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐ USES FOR ENTRY 338.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+use crate::schedule::ddc::transformation_util::{
+    NodeCloning, PeSfpTransferSplit, clone_transfer_for_pe_sfp_work_split,
+};
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 // THE STICK-PACKING AND OFFSET-ADJUSTMENT VOCABULARY — as entries 105-109 read it.
 //
 // ⭐ THE TRAITS ARE THE MECHANISM FOR REACHING OPERANDS, the one part the campaign statement names
@@ -2647,12 +2655,90 @@ where
     true
 }
 
-// crustify:todo: e338_performPeSfpWorkSplit
-//   authority : ddc/ddc_transformation.cpp:1395  (36 body lines, level 3)
-//   class     : Ddc
-//   original  : bool Ddc::performPeSfpWorkSplit()
-//   extract   : crustify-ddc/cpp/ddc.cpp:12093-12129
-//   calls     : e118_cloneForPeSfpWorkSplit, e119_cloneForPeSfpWorkSplit, e304_cloneForPeSfpWorkSplit
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐ TYPES FOR ENTRY 338. Union this section with this file's other vocabulary when its remaining
+// entries land.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHETHER THE ALLOCATE CLONE SKIPS ITS METADATA UPDATE — entry 118's `skipMetadataUpdate`.
+///
+/// ⚠️ TRAP, AND IT IS THE REFERENCE'S: `:1418` passes the POINTER
+/// `allocNode->tempStorageForCompute_` (`dsc/dsc2.h:978`) into a parameter DECLARED `bool`, so the
+/// flag says only *"this allocation is some compute's temp storage"*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipMetadataUpdate {
+    /// `tempStorageForCompute_ != nullptr`.
+    Yes,
+    /// `tempStorageForCompute_ == nullptr`.
+    No,
+}
+
+/// ONE NODE ENTRY 338 HANDS TO A CLONE — the three `nodeType_` arms of its ONE `{ALLOCATE, TRANSFER,
+/// COMPUTE}` traversal.
+///
+/// ⛔ ONE WALK, INTERLEAVED IN TREE ORDER and NOT three walks grouped by kind: a transfer's clone is
+/// minted before a later allocate's is, which is what the reference's own *"TO VERIFY: Can unrolling
+/// invalidate the traversal result"* (`:1431`) is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeSfpSplitNode {
+    /// `ALLOCATE`, with its `tempStorageForCompute_` read as entry 118's flag.
+    Allocate(NodeId, SkipMetadataUpdate),
+    /// `TRANSFER`.
+    Transfer(NodeId),
+    /// `COMPUTE`.
+    Compute(NodeId),
+}
+
+/// WHAT ENTRY 338 ASKS OF THE DSC AND ITS TREE.
+pub trait PeSfpWorkSplit: NodeCloning {
+    /// `currDsc->dataStageParam_.at(metadata.core_dstgid).ss_.peSfpSplit_.empty()` negated — the
+    /// WHOLE of the input SDSC's worksplit information as far as this pass reads it.
+    fn has_pe_sfp_split(&self) -> bool;
+
+    /// `scheduleTree_.traverseTreeDFSMutable(nullptr, {ALLOCATE, TRANSFER, COMPUTE}, ALL, -1, -1)`.
+    fn split_candidates(&self) -> Vec<PeSfpSplitNode>;
+}
+
+/// Replaces: e338_performPeSfpWorkSplit
+///
+/// CLONES THE SCHEDULE ONTO THE OTHER HALF OF THE PE/SFP PAIR (`:1395`): one DFS handing every
+/// allocate, transfer and compute to its own `cloneForPeSfpWorkSplit`.
+///
+/// ⛔ `true` AND NOTHING DONE where the input SDSC states no worksplit; the report beside that answer
+/// is a `std::cerr` line and this pass has no other answer.
+/// ⚠️ EVERY CLONE'S ANSWER IS DISCARDED, the transfer arm's `nullptr` included, so a transfer that
+/// cannot be unrolled or was already cloned is silently left alone.
+/// ⛔ ENTRIES 118 AND 119 ARE NOT PORTED — their anchors are still open in
+/// [`super::transformation_util`], so those two arms `todo!` NAMING them rather than silently
+/// narrowing this pass to transfers.
+pub fn perform_pe_sfp_work_split<S, D>(
+    tree: &mut S,
+    stages: &mut DataStages<D>,
+    metadata: &mut Metadata,
+) -> bool
+where
+    S: PeSfpWorkSplit + FifoResults + Allocations + TransferUnrolling + MintedConnects + ?Sized,
+    D: Default,
+{
+    if !tree.has_pe_sfp_split() {
+        return true;
+    }
+    for candidate in tree.split_candidates() {
+        match candidate {
+            PeSfpSplitNode::Allocate(node, skip) => {
+                todo!("e118_cloneForPeSfpWorkSplit({node:?}, {skip:?})")
+            }
+            PeSfpSplitNode::Transfer(node) => {
+                let body = ScheduleSurgery::transfer(tree, node);
+                if let Some(split) = PeSfpTransferSplit::of(metadata, node, &body) {
+                    let _ = clone_transfer_for_pe_sfp_work_split(tree, stages, metadata, split);
+                }
+            }
+            PeSfpSplitNode::Compute(node) => todo!("e119_cloneForPeSfpWorkSplit({node:?})"),
+        }
+    }
+    true
+}
 
 // crustify:todo: e359_transformRegToFifoOrLatch
 //   authority : ddc/ddc_transformation.cpp:610  (82 body lines, level 4)
@@ -2740,6 +2826,7 @@ mod tests_e105_e109 {
                 data_connect: connect,
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
@@ -3017,6 +3104,7 @@ mod tests_e242_e246 {
                 data_connect: connect,
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
@@ -3770,6 +3858,7 @@ mod tests_e300 {
                 data_connect: None,
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
@@ -3829,5 +3918,187 @@ mod tests_e300 {
             mb_capacity: Elements(1),
         };
         assert!(PackStickDimSite::of(&tree, &stages(), DatastageExploration::Open).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests_e338 {
+    use super::*;
+    use crate::schedule::ddc::fold::StoredStream;
+    use crate::schedule::ddc::transformation_util::{
+        DdcAllocateNode, FifoConsumer, LoopNode, TransferEnds,
+    };
+    use crate::schedule::dsc2::Dsc as Dsc2;
+    use std::cell::Cell;
+
+    /// A tree holding ONE transfer that involves neither PE nor SFP, so the transfer arm's own
+    /// witness refuses it and no clone machinery is reached.
+    struct Split {
+        has_split: bool,
+        asked: Cell<bool>,
+    }
+
+    impl PeSfpWorkSplit for Split {
+        fn has_pe_sfp_split(&self) -> bool {
+            self.has_split
+        }
+        fn split_candidates(&self) -> Vec<PeSfpSplitNode> {
+            self.asked.set(true);
+            vec![PeSfpSplitNode::Transfer(NodeId(1))]
+        }
+    }
+
+    impl NodeCloning for Split {
+        fn clone_transfer_after(&mut self, _node: NodeId, _body: TransferNode) -> NodeId {
+            unimplemented!("no transfer of this tree is cloneable")
+        }
+    }
+
+    impl ScheduleSurgery for Split {
+        fn node_name(&self, _node: NodeId) -> NodeName {
+            NodeName::default()
+        }
+        fn set_node_name(&mut self, _node: NodeId, _name: NodeName) {}
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+        fn owner_loop(&self, _node: NodeId) -> Option<LoopId> {
+            None
+        }
+        fn transfer(&self, _node: NodeId) -> TransferNode {
+            TransferNode {
+                name: NodeName("lxlu_to_lxsu".to_owned()),
+                src: operand(SenComponent::Lxlu),
+                dsts: Dsts::new(operand(SenComponent::Lxsu), Vec::new()),
+                replication_factor: ReplicationFactor::ONE,
+                unit_time_transfer_chunk_size: Vec::new(),
+                unit_time_transfer_num_chunks: NumChunks::ONE,
+                padding: TransferPadding::default(),
+                src_indirect: None,
+                dst_indirect: None,
+                core_id_to_gtr_info: BTreeMap::new(),
+                transfer_size: BTreeMap::new(),
+            }
+        }
+        fn loop_num(&self, _loop_node: LoopId) -> DatastageId {
+            DatastageId(0)
+        }
+        fn loop_den(&self, _loop_node: LoopId) -> DatastageId {
+            DatastageId(1)
+        }
+        fn loop_dims(&self, _loop_node: LoopId) -> LoopDims {
+            unimplemented!("no loop is read")
+        }
+        fn is_parametric(&self, _loop_node: LoopId) -> bool {
+            false
+        }
+        fn new_loop(&mut self, _loop_node: LoopNode) -> LoopId {
+            unimplemented!("no loop is minted")
+        }
+        fn new_block(&mut self, _name: NodeName) -> NodeId {
+            unimplemented!("no block is minted")
+        }
+        fn add_child_node(&mut self, _node: NodeId, _at: InsertionPoint) {}
+        fn move_node(&mut self, _node: NodeId, _at: InsertionPoint) {}
+        fn conditions_under(&self, _root: NodeId) -> Vec<NodeId> {
+            Vec::new()
+        }
+        fn loop_cond(&self, _condition: NodeId) -> LoopCondComposite {
+            LoopCondComposite::default()
+        }
+        fn set_loop_cond(&mut self, _condition: NodeId, _cond: LoopCondComposite) {}
+    }
+
+    impl FifoResults for Split {
+        fn connect_consumers(&self, _connect: Option<DataConnect>) -> Vec<FifoConsumer> {
+            Vec::new()
+        }
+        fn is_opaque(&self, _compute: NodeId) -> bool {
+            false
+        }
+        fn transfer_ends(&self, _transfer: NodeId) -> TransferEnds {
+            unimplemented!("no allocation is read")
+        }
+        fn insert_allocate(&mut self, _alloc: AllocId, _node: DdcAllocateNode, _at: InsertionPoint) {
+        }
+        fn set_dst_storage(&mut self, _transfer: NodeId, _dst: usize, _storage: SenComponent) {}
+        fn set_src_storage(&mut self, _transfer: NodeId, _storage: SenComponent) {}
+        fn set_compute_input_unit(&mut self, _compute: NodeId, _input: usize, _unit: SenComponent) {}
+        fn add_alloc_user(&mut self, _alloc: AllocId, _user: NodeId) {}
+    }
+
+    impl Allocations for Split {
+        fn allocation(&self, _stored: StoredStream) -> Option<AllocId> {
+            None
+        }
+        fn value_allocation(&self, _scale: AllocId) -> Option<AllocId> {
+            None
+        }
+    }
+
+    impl Dsc2 for Split {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            unimplemented!("no layout is read")
+        }
+    }
+
+    impl TransferUnrolling for Split {
+        fn non_broadcast_lds_dims(&self, _lds: LdsIdx) -> Option<Vec<PrimaryDim>> {
+            None
+        }
+    }
+
+    impl MintedConnects for Split {
+        fn intern_connect(&mut self, _connect: MintedConnect) -> DataConnect {
+            unimplemented!("no connect is minted")
+        }
+    }
+
+    fn operand(unit: SenComponent) -> Operand {
+        Operand {
+            unit,
+            storage: unit,
+            data: DataInfo {
+                data_connect: None,
+                my_lds_idx: None,
+                constant_id: None,
+                latch_data_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_dsc_stating_no_worksplit_is_never_even_walked_and_a_transfer_off_the_pair_is_left_alone() {
+        let mut stages = DataStages::<()>::default();
+        let mut metadata = Metadata::default();
+
+        let mut quiet = Split {
+            has_split: false,
+            asked: Cell::new(false),
+        };
+        assert!(perform_pe_sfp_work_split(
+            &mut quiet,
+            &mut stages,
+            &mut metadata
+        ));
+        assert!(
+            !quiet.asked.get(),
+            "the tree is not traversed at all without worksplit information"
+        );
+
+        let mut splitting = Split {
+            has_split: true,
+            asked: Cell::new(false),
+        };
+        assert!(perform_pe_sfp_work_split(
+            &mut splitting,
+            &mut stages,
+            &mut metadata
+        ));
+        assert!(splitting.asked.get(), "the tree IS traversed with it");
+        assert!(
+            metadata.node_cloning_map.is_empty(),
+            "an LXLU-to-LXSU transfer involves neither PE nor SFP, so nothing is cloned"
+        );
     }
 }
