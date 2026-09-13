@@ -906,7 +906,7 @@ impl FreshL3Allocation {
     #[must_use]
     pub fn of(dsc: &DesignSpaceConfig, lds: LdsIdx, component: SenComponent) -> Option<Self> {
         let dims = dsc.layout_dims.get(&lds)?.to_vec();
-        let pinning = dsc.labeled_ds.at(lds)?.pinning();
+        let pinning = dsc.labeled_ds.at(lds)?.pinning().clone();
         let distinct: BTreeSet<PrimaryDim> = dims.iter().copied().collect();
         (distinct.len() == dims.len()).then(|| Self {
             lds,
@@ -1016,7 +1016,7 @@ pub fn all_labeled_ds_indices(dsc: &DesignSpaceConfig) -> BTreeSet<LdsIdx> {
 pub fn hbm_pinned_labeled_ds_indices(dsc: &DesignSpaceConfig) -> BTreeSet<LdsIdx> {
     dsc.labeled_ds
         .iter()
-        .filter(|lds| lds.pinning().hbm)
+        .filter(|lds| lds.pinning().hbm())
         .map(LabeledDs::recorded)
         .collect()
 }
@@ -1102,7 +1102,7 @@ pub fn create_allocate_node(
         }
     }
 
-    if pinning.hbm && component == SenComponent::Lx {
+    if pinning.hbm() && component == SenComponent::Lx {
         let allocated = metadata
             .get_mut(&dsc_idx)?
             .new_allocations
@@ -1216,7 +1216,7 @@ mod tests_e009_e016 {
                     vec![],
                     LdsIdx(183),
                     Pinning {
-                        hbm: true,
+                        mem_org: [(SenComponent::Hbm, true)].into(),
                         lx: false,
                         lx_padded: true,
                     },
@@ -1320,7 +1320,7 @@ mod tests_e009_e016 {
             vec![],
             LdsIdx(0),
             Pinning {
-                hbm: false,
+                mem_org: BTreeMap::new(),
                 lx: true,
                 lx_padded: false,
             },
@@ -1372,7 +1372,7 @@ mod tests_e009_e016 {
                     vec![],
                     LdsIdx(0),
                     Pinning {
-                        hbm: false,
+                        mem_org: BTreeMap::new(),
                         lx: true,
                         lx_padded: false,
                     }

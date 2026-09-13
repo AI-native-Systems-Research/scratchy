@@ -168,11 +168,19 @@ pub fn perform_actions(source: &(impl DdlSource + ?Sized), dialect: &Dialect) ->
     Verified::of(parsed.defining.as_slice(), parsed.verifiable)
 }
 
-// crustify:todo: e273_processBuffer
-//   authority : ddc/ddl/ddl.cpp:62  (13 body lines, level 1)
-//   original  : OwningOpRef<Operation*> processBuffer(std::unique_ptr<MemoryBuffer> ownedBuffer, ThreadPoolInterface* threadPool, MLIRContext* context)
-//   extract   : crustify-ddc/cpp/ddl.cpp:835-850
-//   calls     : e171_performActions
+/// Replaces: e273_processBuffer
+///
+/// PARSES ONE OWNED BUFFER — the buffer is CONSUMED (`std::move(ownedBuffer)` into the `SourceMgr`),
+/// so a source reaching here cannot be parsed a second time from the same storage.
+///
+/// ⛔ `allowUnregisteredDialects(false)` IS DISCHARGED BY THE ARGUMENT: `dialect` is the registry, so
+/// an op outside it is [`DdlSource::parse`]'s [`None`] rather than a permissive parse.
+/// ⭐ THE THREAD POOL, `loadAllAvailableDialects` and `SourceMgrDiagnosticHandler` ARE AMBIENT — a
+/// pool to share, every dialect the build linked, and where diagnostics are printed.
+#[must_use]
+pub fn process_buffer(owned_buffer: impl DdlSource, dialect: &Dialect) -> Option<Verified> {
+    perform_actions(&owned_buffer, dialect)
+}
 
 // crustify:todo: e321_DdlMain
 //   authority : ddc/ddl/ddl.cpp:78  (16 body lines, level 2)
@@ -196,7 +204,7 @@ pub fn perform_actions(source: &(impl DdlSource + ?Sized), dialect: &Dialect) ->
 #[cfg(test)]
 mod tests_e171 {
     use super::ops::{DdlOp, Dialect, StorageBits, Unverified, Value};
-    use super::{DdlSource, ParsedDdl, perform_actions};
+    use super::{DdlSource, ParsedDdl, perform_actions, process_buffer};
 
     /// A source that hands back a fixed module, standing in for `parseSourceFileForTool`.
     struct Fixed(ParsedDdl);
@@ -235,5 +243,17 @@ mod tests_e171 {
             perform_actions(&module(Some(StorageBits(4))), &dialect),
             None
         );
+    }
+
+    /// ⭐ THE BUFFER IS CONSUMED — `process_buffer` takes its source BY VALUE, so the same storage
+    /// cannot be parsed twice — and the module it states is gated by the very same verifiers.
+    #[test]
+    fn process_buffer_consumes_its_source_and_gates_it() {
+        let dialect = Dialect::initialize();
+        assert_eq!(
+            process_buffer(module(Some(StorageBits(16))), &dialect).map(|ok| ok.ops().len()),
+            Some(2)
+        );
+        assert_eq!(process_buffer(module(Some(StorageBits(4))), &dialect), None);
     }
 }
