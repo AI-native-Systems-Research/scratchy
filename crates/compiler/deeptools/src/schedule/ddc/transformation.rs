@@ -2263,6 +2263,8 @@ fn minted_transfer(name: NodeName, src: Operand, dst: Operand) -> TransferNode {
         padding: TransferPadding::default(),
         src_indirect: None,
         dst_indirect: None,
+        core_id_to_gtr_info: BTreeMap::new(),
+        transfer_size: BTreeMap::new(),
     }
 }
 
@@ -2681,6 +2683,7 @@ mod tests_e105_e109 {
         DataInfo, Dsts, InstrAttribute, NumChunks, ReplicationFactor, TransferPadding,
     };
     use crate::units::NumFolds;
+    use std::collections::BTreeMap;
 
     /// A tree of computes, in traversal order.
     struct Computes(Vec<ComputeOp>);
@@ -2780,6 +2783,8 @@ mod tests_e105_e109 {
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
             name: NodeName("in".to_owned()),
             src: operand(SenComponent::Lxlu, Some(DataConnect::PeHtOut), Some(0)),
             dsts: Dsts::new(
@@ -2997,6 +3002,7 @@ mod tests_e242_e246 {
         DataInfo, Dsts, InstrAttribute, NumChunks, ReplicationFactor, TransferPadding,
     };
     use crate::units::NumFolds;
+    use std::collections::BTreeMap;
 
     fn operand(
         unit: SenComponent,
@@ -3037,6 +3043,8 @@ mod tests_e242_e246 {
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
             name: NodeName("t".to_owned()),
             src,
             dsts,
@@ -3777,6 +3785,8 @@ mod tests_e300 {
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
         }
     }
 
