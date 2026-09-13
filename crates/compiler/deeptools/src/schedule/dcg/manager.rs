@@ -728,9 +728,11 @@ pub struct DataOpDsc {
 /// `DATA_OPS` — whether `dataOpdscs_` may hold anything. `DT_CHECK(mySDsc.dataOpdscs_.size() == 0)`
 /// (`:222`) is entry 189 taking `SuperDsc<false, _>`, and entry 188 takes `SuperDsc<true, _>`.
 /// `FOLDED` — whether `sdscFoldProps_` is non-empty. `DT_CHECK_MSG(mySDsc.sdscFoldProps_.empty(),
-/// "Codegen for Folded Super-DSC is not supported")` (`:262`, `:506`) is a `const { assert!(!FOLDED) }`
-/// in the codegen tails, which is where the reference checks it — so the props themselves stay with
+/// "Codegen for Folded Super-DSC is not supported")` (`:262`, `:506`) is a `const { assert! }` in the
+/// codegen tails, which is where the reference checks it — so the props themselves stay with
 /// `util/foldManager/`, out of scope, where they are read.
+/// ⛔ AND IT ASSERTS `!(createSenProg && FOLDED)`, NEVER `!FOLDED`: every one of those checks sits
+/// INSIDE `if (createSenProg)`, while a `const` block is evaluated whether or not its branch can run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuperDsc<const DATA_OPS: bool, const FOLDED: bool> {
     /// `dscs_` and `coreIdToDsc_` (`dsc/superdsc.h:67-68`).
@@ -1806,13 +1808,17 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
     where
         C: DcgProgIRGen,
     {
+        // ⛔ THE FOLD CHECK IS `createSenProg`'S AND THE CONJUNCTION IS LOAD-BEARING (`:155-157`).
+        // An inline `const` block is evaluated at MONOMORPHIZATION however dead the branch around
+        // it, so `!FOLDED` alone refused a folded super-DSC with codegen off — which the reference
+        // accepts, and which is THIS campaign's configuration (`SchedulerStages.cpp:49-50`).
+        const {
+            assert!(
+                !(C::CREATE_SEN_PROG && FOLDED),
+                "Codegen for Folded Super-DSC is not supported (dcg_manager.cpp:156)"
+            )
+        }
         if C::CREATE_SEN_PROG {
-            const {
-                assert!(
-                    !FOLDED,
-                    "Codegen for Folded Super-DSC is not supported (dcg_manager.cpp:156)"
-                )
-            }
             if sdsc.data_op_dscs.len() <= 1 {
                 let mut at = DataOpTarget::InMain(DataOpIndex(0));
                 let op = sdsc.data_op_dscs.first()?.op;
@@ -1848,9 +1854,13 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
     }
 }
 
-/// THE MANAGER ONCE IT IS IN INPUT-FETCH-NEIGHBOUR MODE — `isInpFetchNeigh == true` (`:523`), which
-/// NOTHING in the reference ever clears.
+/// THE MANAGER ONCE IT IS IN INPUT-FETCH-NEIGHBOUR MODE — `isInpFetchNeigh == true` (`:523`).
 ///
+/// ⛔ THE FLAG *IS* CLEARED, AND IT STILL STICKS — BY ORDER, NOT BY ABSENCE. The front end holds it
+/// as a `bool&` (`dcg_manager.h:59`, `dcg_frontend.h:125`) and `generatePcfgIRForDataOpInpFetch` sets
+/// it on entry and CLEARS IT ON EXIT (`pcfg_gen.cpp:164`, `:184`); entry 281 writes `:523` AFTER that
+/// call, and the clearing function's only other caller — entry 348's `:401` — is unreachable once the
+/// flag is set, because `:347` checks it first.
 /// ⛔ THIS TYPE *IS* THE `DT_CHECK(!isInpFetchNeigh)` OF ENTRIES 188, 189 AND 280 (`:118`, `:221`,
 /// `:151`): those are [`DcgManager`] methods and entry 281 consumes the manager, so calling one after
 /// the mode has flipped does not compile.
@@ -1899,13 +1909,14 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
         let data_dsc_idx = DataOpIndex(0);
         let at = DcgFrontEnd::generate_pcfg_ir_for_data_op_inp_fetch(main, pre, data_dsc_idx);
 
+        // ⛔ `createSenProg && FOLDED`, for the reason entry 280 states (`:526-528`).
+        const {
+            assert!(
+                !(C::CREATE_SEN_PROG && FOLDED),
+                "Codegen for Folded Super-DSC is not supported (dcg_manager.cpp:527)"
+            )
+        }
         if C::CREATE_SEN_PROG {
-            const {
-                assert!(
-                    !FOLDED,
-                    "Codegen for Folded Super-DSC is not supported (dcg_manager.cpp:527)"
-                )
-            }
             let mut statuses = DcgBackEnd::create_sen_program_stcdp_op(main, &at);
             let op = at.op(main);
 
@@ -2475,6 +2486,47 @@ mod unit_tests {
             .map(|(_, comp)| *comp)
             .collect();
         assert_eq!(kept, vec![SenComponent::Ptrow0_0]);
+    }
+
+    /// e280 — ⛔⛔ THE FOLD GUARD, PINNED AT MONOMORPHIZATION. A folded super-DSC with `createSenProg`
+    /// off never reaches the reference's `DT_CHECK_MSG` (`:155-157`) and still runs the PT-row sweep,
+    /// so this call has to COMPILE: a `const { assert!(!FOLDED) }` would refuse it — the block is
+    /// evaluated whether or not the branch around it can run — and that is our own configuration
+    /// (`SchedulerStages.cpp:49-50`). Instantiating `FOLDED = true` here is the whole test.
+    #[test]
+    fn e280_a_folded_super_dsc_without_codegen_still_sweeps_pt_rows() {
+        let mut sdsc: SuperDsc<true, true> =
+            SuperDsc::of(PerCoreDscs::of(core::<0>(), DscVersion::Dsc2)).with_data_op(DataOpDsc {
+                op: OpFunc::ReStickifyOpWithPtLx,
+                pcfg: BTreeMap::from([(
+                    core::<0>(),
+                    vec![
+                        (SenPcfg::default(), SenComponent::Ptrow0_0),
+                        (SenPcfg::default(), SenComponent::Ptrow3_0),
+                    ],
+                )]),
+            });
+
+        let ran = DcgManager::<NoSenProgDcg, true, true>::new().run_dcg_generate_prog_ir(&mut sdsc);
+
+        assert_eq!(ran, Some(()));
+        let kept: Vec<SenComponent> = sdsc.data_op_dscs[0].pcfg[&core::<0>()]
+            .iter()
+            .map(|(_, comp)| *comp)
+            .collect();
+        assert_eq!(kept, vec![SenComponent::Ptrow0_0]);
+    }
+
+    /// e281 — the same fold guard on the other entry (`:526-528`): folded and codegen-off, this must
+    /// reach the pcfg generator rather than be refused before it, so the `should_panic` naming that
+    /// seam is what proves the guard is the conjunction and not `!FOLDED`.
+    #[test]
+    #[should_panic(expected = "DcgFE::generatePcfgIRForDataOpInpFetch")]
+    fn e281_a_folded_super_dsc_without_codegen_reaches_the_generator() {
+        let mut main: SuperDsc<true, true> =
+            SuperDsc::of(PerCoreDscs::of(core::<0>(), DscVersion::Dsc2));
+        let _ = DcgManager::<NoSenProgDcg, true, true>::new()
+            .run_dcg_for_input_fetch_neighbor(&mut main, None);
     }
 
     /// e281 — its FIRST act is the input-fetch pcfg generator, so the entry names that translator and
