@@ -82,11 +82,13 @@
 //! | `e604_findCandidates` | 604 | 5 | 30 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:402` |
 //! | `e630_run` | 630 | 6 | 130 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:607` |
 
+use super::{Peeling, PeelingCandidates};
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::sentient::dialects::{
     self, Op, StaticBranch, Val, replace_if_with_region, sentient, static_if_branch, static_operand,
 };
+use crate::transform::sentient::ForRef;
 
 /// WHERE ONE OP SITS IN A REGION TREE — the block reached by taking region `r` of the op at index `i`
 /// for each `(i, r)` of `into`, then index `at` in that block.
@@ -349,12 +351,13 @@ fn next_static_if(candidates: IfOpsToSimplify, block: &[Op]) -> Option<(RegionPa
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        IfOpsToSimplify, PredicatesOnIv, copy_one_iter, decrement_predicates_on_iv,
-        simplify_conditionals,
+        IfOpsToSimplify, Peeling, PeelingCandidates, PredicatesOnIv, copy_one_iter,
+        decrement_predicates_on_iv, perform_loop_peeling, simplify_conditionals,
     };
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::transform::sentient::ForRef;
 
     /// `%c = scalar_constant N : index`.
     fn constant(value: i64, result: Val) -> Op {
@@ -599,6 +602,124 @@ mod unit_tests {
         assert_eq!(block[6], add(Val(16), Val(2), Val(12)));
         assert_eq!(block.len(), 7);
     }
+
+    /// e448 — a loop running `[1, 8]` peeled at both ends: the first iteration's copy is pinned to 8
+    /// and lands BEFORE the loop, the last iteration's is pinned to 1 and lands after, the bound
+    /// loses both, the three run in the loop's carried value, and the condition inside the loop is
+    /// rebuilt one lower because the bound lost an iteration.
+    #[test]
+    fn e448_peels_both_ends_and_chains_them_through_the_carried_value() {
+        let mut values = Values::default();
+        let (init, bound, four) = (values.mint(), values.mint(), values.mint());
+        let (iv, arg, result) = (values.mint(), values.mint(), values.mint());
+        let (body_val, reader) = (values.mint(), values.mint());
+        let nop = Op::Sentient(sentient::Op::Nop { dbg_name: None });
+        let mut loop_op = for_loop(
+            iv,
+            bound,
+            vec![carried(init, arg, result)],
+            vec![
+                if_op(
+                    sentient::CmpPredicate::Slt,
+                    iv,
+                    four,
+                    vec![nop.clone()],
+                    Vec::new(),
+                ),
+                add(arg, four, body_val),
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![body_val],
+                }),
+            ],
+        );
+        if let Op::Sentient(sentient::Op::For { dbg_name, .. }) = &mut loop_op {
+            *dbg_name = Some("L".to_string());
+        }
+        let mut unit = vec![
+            constant(0, init),
+            constant(8, bound),
+            constant(4, four),
+            loop_op,
+            add(result, four, reader),
+        ];
+
+        let mut candidates = PeelingCandidates::default();
+        candidates.insert_or_update(ForRef(iv), Peeling::FirstAndLastIter);
+        perform_loop_peeling(&candidates, &mut unit, &mut values);
+
+        assert_eq!(unit.len(), 11);
+        // THE FIRST ITERATION IS THE HIGHEST BOUND — this island counts iterations DOWN — and its
+        // copy reads the loop's own init, with `%iv < 4` decided false at 8 and its `then` gone.
+        assert!(matches!(
+            unit[3],
+            Op::Sentient(sentient::Op::ScalarConstant { value: 8, .. })
+        ));
+        let Op::Sentient(sentient::Op::ScalarAdd {
+            lhs: first_lhs,
+            result: first_yielded,
+            ..
+        }) = unit[4]
+        else {
+            panic!("the first iteration's body is hoisted before the loop")
+        };
+        assert_eq!(first_lhs, init);
+        // `orig_bound_val - 1 - 1`, and the loop reads what the first iteration yielded.
+        let Op::Sentient(sentient::Op::ScalarConstant {
+            value: 6,
+            result: new_bound_val,
+            ..
+        }) = unit[5]
+        else {
+            panic!("the loop's new bound is built immediately before it")
+        };
+        let Op::Sentient(sentient::Op::For {
+            bound: new_bound,
+            carried: peeled_carried,
+            dbg_name,
+            body,
+            ..
+        }) = &unit[6]
+        else {
+            panic!("the loop follows its new bound")
+        };
+        assert_eq!(*new_bound, new_bound_val);
+        assert_eq!(peeled_carried[0].init, first_yielded);
+        assert_eq!(dbg_name.as_deref(), Some("MDLP(LFirstAndLastIter)"));
+        // `%iv < 4` became `%iv < 3` on a fresh constant, and the original 4 is untouched.
+        assert!(matches!(
+            body[0],
+            Op::Sentient(sentient::Op::ScalarConstant { value: 3, .. })
+        ));
+        assert!(matches!(
+            body[1],
+            Op::Sentient(sentient::Op::If { lhs, rhs, .. })
+                if lhs == iv && rhs != four
+        ));
+        assert!(matches!(
+            unit[2],
+            Op::Sentient(sentient::Op::ScalarConstant { value: 4, .. })
+        ));
+        // The last iteration is bound 1, so `%iv < 4` held and its `then` branch survives; its body
+        // reads the loop's result and the loop's original reader ends on what it yielded.
+        assert!(matches!(
+            unit[7],
+            Op::Sentient(sentient::Op::ScalarConstant { value: 1, .. })
+        ));
+        assert_eq!(unit[8], nop);
+        let Op::Sentient(sentient::Op::ScalarAdd {
+            lhs: last_lhs,
+            result: last_yielded,
+            ..
+        }) = unit[9]
+        else {
+            panic!("the last iteration's body is hoisted after the loop")
+        };
+        assert_eq!(last_lhs, result);
+        assert!(matches!(
+            unit[10],
+            Op::Sentient(sentient::Op::ScalarAdd { lhs, .. }) if lhs == last_yielded
+        ));
+    }
 }
 
 /// Replaces: e322_copyOneIter
@@ -697,10 +818,150 @@ pub fn copy_one_iter(
     }
 }
 
-// crustify:todo: e448_performLoopPeeling
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:543  (63 body lines, level 2)
-//   original  : void LoopPeelingManager::performLoopPeeling()
-//   calls     : e093_stringifyPeelingType, e095_decrementPredicatesOnIV, e096_simplifyConditionals, e322_copyOneIter
+/// The `sentient.for` whose induction variable is `loop_ref`, wherever under `block` it sits.
+///
+/// ⭐ RE-DERIVED AFTER EVERY MUTATION. `copyOneIter` inserts a constant and a hoisted body around the
+/// loop, so a [`RegionPath`] taken before it names a different op after it — an MLIR `ForOp` handle
+/// survives that and a path does not.
+fn for_path(block: &[Op], into: &[(usize, usize)], loop_ref: ForRef) -> Option<RegionPath> {
+    for (at, op) in block.iter().enumerate() {
+        if let Op::Sentient(sentient::Op::For { iv, .. }) = op
+            && *iv == loop_ref.0
+        {
+            return Some(RegionPath {
+                into: into.to_vec(),
+                at,
+            });
+        }
+        for (region_index, region) in dialects::regions_ref(op).into_iter().enumerate() {
+            let mut deeper = into.to_vec();
+            deeper.push((at, region_index));
+            if let Some(found) = for_path(region, &deeper, loop_ref) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// `%c = sentient.scalar_constant {value} : ty`, as `const_builder_` creates one.
+fn scalar_constant(value: i64, result: Val, ty: ScalarTy) -> Op {
+    Op::Sentient(sentient::Op::ScalarConstant {
+        value,
+        result,
+        reg_locale: sentient::RegType::Imm,
+        ty,
+        is_symbol: false,
+    })
+}
+
+/// Replaces: e448_performLoopPeeling
+///
+/// Peels each candidate loop, INNERMOST FIRST: a copy of the body before the loop for the first
+/// iteration, a copy after it for the last, the loop's bound reduced by however many were taken, and
+/// the iterations chained through the loop's carried values.
+///
+/// ⛔ TRAP: THE ORDER IS THE REVERSE OF THE CANDIDATE LIST *because* peeling clones a body — a
+/// candidate inside another must already be peeled when its enclosing loop is copied.
+/// ⛔ TRAP: THE FIRST-ITERATION COPY IS PINNED TO `orig_bound_val`, NOT TO 1: this island counts a
+/// loop's iterations DOWN, so the first iteration is the highest bound and the last is 1.
+/// ⚠️ DIVERGENCE: the closing simplification runs over the whole unit rather than the loop's parent
+/// op, because a nested block cannot resolve the constants above it — folding a statically decidable
+/// `sentient.if` is the dialect's own canonicalisation and is valid wherever it applies.
+pub fn perform_loop_peeling(
+    candidates: &PeelingCandidates,
+    unit: &mut Vec<Op>,
+    values: &mut Values,
+) {
+    for &(loop_ref, peeling) in candidates.records().iter().rev() {
+        // `DT_CHECK(p_type != kNoPeeling)` is [`Peeling`] itself, so there is no case here.
+        let peel_first_iter = matches!(peeling, Peeling::FirstIterOnly | Peeling::FirstAndLastIter);
+        let peel_last_iter = matches!(peeling, Peeling::LastIterOnly | Peeling::FirstAndLastIter);
+        let Some(path) = for_path(unit, &[], loop_ref) else {
+            continue;
+        };
+        let Some(scope) = walk_to(unit, &path.into) else {
+            continue;
+        };
+        let Some(Op::Sentient(sentient::Op::For { bound, carried, .. })) = scope.get(path.at)
+        else {
+            continue;
+        };
+        // `DT_CHECK_MSG(const_bound_op, "Expect ForOp with constant bound")` read as a precondition.
+        let Some(Op::Sentient(sentient::Op::ScalarConstant {
+            value: orig_bound_val,
+            ty: bound_ty,
+            ..
+        })) = dialects::defining_op(*bound, unit)
+        else {
+            continue;
+        };
+        let (orig_bound_val, bound_ty) = (*orig_bound_val, *bound_ty);
+        let mut new_iter_args: Vec<Val> = carried.iter().map(|entry| entry.init).collect();
+
+        if peel_first_iter {
+            let Some(block) = block_at(unit, &path.into) else {
+                continue;
+            };
+            copy_one_iter(
+                block,
+                path.at,
+                &mut new_iter_args,
+                orig_bound_val,
+                false,
+                values,
+            );
+        }
+
+        // `orig_bound_val - (peel_first_iter ? 1 : 0) - (peel_last_iter ? 1 : 0)`.
+        let new_bound_val = orig_bound_val - i64::from(peel_first_iter) - i64::from(peel_last_iter);
+        let new_bound = values.mint();
+        let Some(path) = for_path(unit, &[], loop_ref) else {
+            continue;
+        };
+        let Some(block) = block_at(unit, &path.into) else {
+            continue;
+        };
+        block.insert(path.at, scalar_constant(new_bound_val, new_bound, bound_ty));
+        let at = path.at + 1;
+        let Some(Op::Sentient(sentient::Op::For {
+            bound,
+            carried,
+            dbg_name,
+            ..
+        })) = block.get_mut(at)
+        else {
+            continue;
+        };
+        *bound = new_bound;
+        // `updateDbgName("MDLP(", for_op, stringifyPeelingType(p_type) + ")")` — ⛔ WRITES ONLY WHERE
+        // A NAME ALREADY EXISTS (`dcc/src/Utils/Utils.cpp:491-496`).
+        if let Some(name) = dbg_name {
+            *name = format!("MDLP({name}{})", peeling.ty().spelling());
+        }
+        // `getInitArgsMutable().assign(new_iter_args)`, then `new_iter_args = for_op.getResults()`.
+        for (entry, init) in carried.iter_mut().zip(&new_iter_args) {
+            entry.init = *init;
+        }
+        new_iter_args = carried.iter().map(|entry| entry.result).collect();
+
+        if peel_last_iter {
+            copy_one_iter(block, at, &mut new_iter_args, 1, true, values);
+            // The loop's bound has just been decremented, so every constant the induction variable
+            // is compared against must be too.
+            //
+            // ⛔ THE SCOPE IS THE WHOLE UNIT, NOT THE LOOP'S BODY: `iv.getUsers()` and
+            // `getDefiningOp()` are both global, and `const_builder_` puts the compared constant at
+            // the program unit's top — a body-only scope finds no definition for it and answers "not
+            // a comparison against a constant", which decrements nothing at all.
+            if let Some(predicates) = PredicatesOnIv::of(loop_ref.0, unit) {
+                decrement_predicates_on_iv(&predicates, values, unit);
+            }
+        }
+
+        simplify_conditionals(IfOpsToSimplify::Every, unit);
+    }
+}
 
 // crustify:todo: e568_computePeelingInfo
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:351  (49 body lines, level 4)

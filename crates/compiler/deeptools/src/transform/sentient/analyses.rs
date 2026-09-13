@@ -14,9 +14,10 @@ use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::sentient::RegIndex;
+use crate::islands::sentient::dialects::sentient::{RegIndex, RegType};
 use crate::islands::sentient::dialects::{Op, Val};
 use crate::transform::sentient::canonicalize_xrf_pointers::XrfMinExpr;
+use crate::transform::sentient::local_region_splitting_for_value_commoning::MaxRegNum;
 use crate::units::DfirUnit;
 
 /// AN `EvaluatedValue` THE EXPRESSION EVALUATOR OWNS — an identity, not a value.
@@ -728,9 +729,7 @@ pub struct OutOfScopeTransformer;
 
 impl Transformer for OutOfScopeTransformer {
     fn run(&mut self, _candidates: &[Candidate]) {
-        todo!(
-            "Transformer::run (RegisterInitialization/Transformer.h:34) — out of campaign scope"
-        )
+        todo!("Transformer::run (RegisterInitialization/Transformer.h:34) — out of campaign scope")
     }
 }
 
@@ -804,6 +803,34 @@ pub trait RegisterGraphs {
     /// the same shape of trap as [`ColoringGraph::clear`], and for the same reason nobody giving this
     /// an interior may write `*self = Self::default()`.
     fn clean(&mut self);
+
+    /// `buildGraphs(dcc_ext_ctx, liverange, unit, target_locale, coreunit, dumpLiveRange)`
+    /// (`Analyses/GraphColoring.hpp:154-157`) — one interference graph per locale over `unit`'s live
+    /// ranges, or over `target_locale` alone.
+    ///
+    /// ⭐ `Liveness &` IS NON-CONST THERE, hence `&mut`. `coreunit` is the reference's nullable
+    /// `mlir::Value`; the `dumpLiveRange` debug flag is dropped, being output and not behaviour.
+    fn build_graphs<L: Liveness>(
+        &mut self,
+        liveness: &mut L,
+        unit: &[Op],
+        locale: RegType,
+        coreunit: Option<Val>,
+    );
+
+    /// `createSameColorEdgeEqClasses(liveness, target_locale)`
+    /// (`Analyses/GraphColoring.hpp:168-170`) — folds the virtual assignments `liveness` holds into
+    /// `ec_map_`'s equivalence classes.
+    fn create_same_color_edge_eq_classes<L: Liveness>(&mut self, liveness: &mut L, locale: RegType);
+
+    /// `buildHyperGraph(targetLocale, buildHyperGraph)` (`Analyses/GraphColoring.hpp:158-159`) —
+    /// collapses each equivalence class to one hyper-node. The second parameter is the reference's own
+    /// `bool buildHyperGraph` default, dropped: no ported call site passes it.
+    fn build_hyper_graph(&mut self, locale: RegType);
+
+    /// `fastCheckColorability(num_colors, locale)` (`Analyses/GraphColoring.hpp:167`) — whether
+    /// `locale`'s graph still colours in `num_colors` registers. ⭐ NON-CONST there, hence `&mut`.
+    fn fast_check_colorability(&mut self, num_colors: MaxRegNum, locale: RegType) -> bool;
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
@@ -813,6 +840,40 @@ pub struct OutOfScopeRegisterGraphs;
 impl RegisterGraphs for OutOfScopeRegisterGraphs {
     fn clean(&mut self) {
         todo!("RegisterGraphs::clean (Analyses/GraphColoring.hpp:179) — out of campaign scope")
+    }
+
+    fn build_graphs<L: Liveness>(
+        &mut self,
+        _liveness: &mut L,
+        _unit: &[Op],
+        _locale: RegType,
+        _coreunit: Option<Val>,
+    ) {
+        todo!(
+            "RegisterGraphs::buildGraphs (Analyses/GraphColoring.hpp:154) — out of campaign scope"
+        )
+    }
+
+    fn create_same_color_edge_eq_classes<L: Liveness>(
+        &mut self,
+        _liveness: &mut L,
+        _locale: RegType,
+    ) {
+        todo!(
+            "RegisterGraphs::createSameColorEdgeEqClasses (Analyses/GraphColoring.hpp:168) — out of campaign scope"
+        )
+    }
+
+    fn build_hyper_graph(&mut self, _locale: RegType) {
+        todo!(
+            "RegisterGraphs::buildHyperGraph (Analyses/GraphColoring.hpp:158) — out of campaign scope"
+        )
+    }
+
+    fn fast_check_colorability(&mut self, _num_colors: MaxRegNum, _locale: RegType) -> bool {
+        todo!(
+            "RegisterGraphs::fastCheckColorability (Analyses/GraphColoring.hpp:167) — out of campaign scope"
+        )
     }
 }
 
@@ -892,11 +953,43 @@ pub struct ExprInfoMap(pub u32);
 pub trait Liveness {
     /// `updateLiveRangesForProgramHeaderPromotion(candidate)` (`Analyses/Liveness.h:130`) — widens
     /// `candidate`'s live range to the whole program because it is about to live in the header.
+    ///
+    /// ⭐ THE PLURAL OVERLOAD (`:131-135`) IS AN INLINE `for` OVER THIS ONE, so it is a loop at the
+    /// call site and not a second method.
     fn update_live_ranges_for_program_header_promotion(&mut self, candidate: Val);
 
     /// `isLiveRangeOverlaps(val1, val2)` (`Analyses/Liveness.h:111`) — do the two values' live
     /// ranges intersect anywhere, i.e. may they NOT share one register.
     fn is_live_range_overlaps(&self, val1: Val, val2: Val) -> bool;
+
+    /// `clear(clear_virtual_assigns)` (`Analyses/Liveness.h:136`, `Analyses/Liveness.cpp:991-1002`) —
+    /// empties the seven index and live-range maps, and `va_` only when asked.
+    fn clear(&mut self, virtual_assigns: VirtualAssigns);
+
+    /// `computeRegisterLiveRange(unit)` (`Analyses/Liveness.h:88`) — indexes every op in the program
+    /// unit and rebuilds the live ranges over those indices.
+    fn compute_register_live_range(&mut self, unit: &[Op]);
+
+    /// `addVirtualAssignOptional(set_of_subsets)` (`Analyses/Liveness.h:118-119`) — links every pair
+    /// within each subset as MAY share a register.
+    fn add_virtual_assign_optional(&mut self, set_of_subsets: &[Vec<Val>]);
+
+    /// `addVirtualAssignEnforced(set_of_subsets)` (`Analyses/Liveness.h:124-125`) — links each pair as
+    /// MUST share a register. ⭐ THE OVERLOAD THIS IS, of the three, takes PAIRS and not subsets.
+    fn add_virtual_assign_enforced(&mut self, set_of_pairs: &[(Val, Val)]);
+}
+
+/// WHETHER A `Liveness::clear` ALSO DROPS THE VIRTUAL ASSIGNMENTS — `clear`'s defaulted `bool`
+/// (`Analyses/Liveness.h:136`), which is two different erasures and not a flag.
+///
+/// ⭐ BOTH CASES OCCUR: `Transformer.cpp:110` passes `true`, and `OldRegisterInitialization.cpp:968`
+/// and `:1050` take the default — so `e452`'s clear KEEPS the assignments `e451` established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualAssigns {
+    /// `clear_virtual_assigns == false`: `va_` survives.
+    Kept,
+    /// `clear_virtual_assigns == true`: `va_.clear()` too.
+    Cleared,
 }
 
 /// THE ONE CRATE IMPLEMENTATION: liveness is not ported, so telling it anything is a `todo!`.
@@ -912,6 +1005,26 @@ impl Liveness for OutOfScopeLiveness {
 
     fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
         todo!("Liveness::isLiveRangeOverlaps (Analyses/Liveness.h:111) — out of campaign scope")
+    }
+
+    fn clear(&mut self, _virtual_assigns: VirtualAssigns) {
+        todo!("Liveness::clear (Analyses/Liveness.h:136) — out of campaign scope")
+    }
+
+    fn compute_register_live_range(&mut self, _unit: &[Op]) {
+        todo!("Liveness::computeRegisterLiveRange (Analyses/Liveness.h:88) — out of campaign scope")
+    }
+
+    fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {
+        todo!(
+            "Liveness::addVirtualAssignOptional (Analyses/Liveness.h:118) — out of campaign scope"
+        )
+    }
+
+    fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
+        todo!(
+            "Liveness::addVirtualAssignEnforced (Analyses/Liveness.h:124) — out of campaign scope"
+        )
     }
 }
 

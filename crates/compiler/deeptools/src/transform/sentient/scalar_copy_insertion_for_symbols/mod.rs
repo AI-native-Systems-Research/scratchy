@@ -663,6 +663,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::dataflow;
     use crate::islands::sentient::dialects::sentient::Carried;
+    use crate::transform::sentient::analyses::VirtualAssigns;
     use crate::units::{DfirUnit, Residency};
 
     /// A `sentient.scalar_copy` with no width, as `CopyOp::create`'s five-argument builder makes one.
@@ -720,6 +721,22 @@ mod unit_tests {
 
         fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
             todo!("this fake records promotions only; no unit here asks it about an overlap")
+        }
+
+        fn clear(&mut self, _virtual_assigns: VirtualAssigns) {
+            todo!("no unit here clears this fake")
+        }
+
+        fn compute_register_live_range(&mut self, _unit: &[Op]) {
+            todo!("no unit here recomputes this fake")
+        }
+
+        fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {
+            todo!("no unit here links optional assignments through this fake")
+        }
+
+        fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
+            todo!("no unit here links enforced assignments through this fake")
         }
     }
 

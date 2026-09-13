@@ -187,6 +187,8 @@ mod unit_tests {
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+    use crate::transform::sentient::analyses::Liveness;
+    use crate::transform::sentient::local_region_splitting_for_value_commoning::MaxRegNum;
 
     /// A `RegisterGraphs` THAT ONLY RECORDS BEING CLEANED — the analysis is out of campaign scope, so
     /// `clean()` is the whole of its observable surface.
@@ -198,6 +200,32 @@ mod unit_tests {
     impl RegisterGraphs for CountingGraphs {
         fn clean(&mut self) {
             self.cleaned += 1;
+        }
+
+        fn build_graphs<L: Liveness>(
+            &mut self,
+            _liveness: &mut L,
+            _unit: &[Op],
+            _locale: RegType,
+            _coreunit: Option<Val>,
+        ) {
+            todo!("no unit here builds graphs through this fake")
+        }
+
+        fn create_same_color_edge_eq_classes<L: Liveness>(
+            &mut self,
+            _liveness: &mut L,
+            _locale: RegType,
+        ) {
+            todo!("no unit here folds equivalence classes through this fake")
+        }
+
+        fn build_hyper_graph(&mut self, _locale: RegType) {
+            todo!("no unit here builds a hyper-graph through this fake")
+        }
+
+        fn fast_check_colorability(&mut self, _num_colors: MaxRegNum, _locale: RegType) -> bool {
+            todo!("no unit here checks colorability through this fake")
         }
     }
 

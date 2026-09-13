@@ -104,8 +104,12 @@ use std::collections::{BTreeMap, VecDeque};
 use super::ForRef;
 use super::analyses::{InstructionCount, InstructionEstimator};
 use super::cfg_simplification_sentient_level::pattern_simplification_manager::OpPath;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::sentient::dialects::sentient as ops;
-use crate::islands::sentient::dialects::{Op, Val, defining_op, replace_all_uses_with};
+use crate::islands::sentient::dialects::{
+    Op, Val, clone_ops, defining_op, replace_all_uses_with, use_count,
+};
 
 /// THE PASS'S OWN STATE (`LoopSplittingAndUnrolling.cpp:125-129`) — the candidate list and its ibuff
 /// costs, which is everything [`cleanup_and_recalculate`] touches.
@@ -827,15 +831,293 @@ fn subsets_impl(
     }
 }
 
-// crustify:todo: e446_subsets
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:635  (12 body lines, level 2)
-//   original  : static std::vector<std::vector<std::pair<int, int>>> subsets( std::vector<std::pair<int, int>> &split_vals)
-//   calls     : e252_size, e320_subsetsImpl
+/// Replaces: e446_subsets
+///
+/// Every subset of the split ranges ([`subsets_impl`]), ordered by DECREASING SIZE, which is the order
+/// `findOptimalNWaySplits` tries them in.
+///
+/// ⭐ STABLE, WHERE `std::sort` IS NOT: equal-sized subsets keep the recursion's own enumeration order
+/// here and have no defined order there, so this is the version whose candidate list is the same
+/// twice. ⭐ The empty subset is enumerated first and therefore sorts LAST.
+#[must_use]
+pub(crate) fn subsets(split_vals: &[SplitRange]) -> Vec<Vec<SplitRange>> {
+    let mut res = Vec::new();
+    let mut subset = Vec::new();
+    subsets_impl(split_vals, &mut res, &mut subset, 0);
+    res.sort_by(|first, second| second.len().cmp(&first.len()));
+    res
+}
 
-// crustify:todo: e447_splitLoopNWay
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:858  (129 body lines, level 2)
-//   original  : LogicalResult LoopSplittingAndUnrollingPass::splitLoopNWay( dcc::LoopNode *n, OpBuilder &const_builder)
-//   calls     : e091_findAllSplitVals, e252_size, e319_getAllTrueIndexOfIfOpsList
+/// WHETHER THE LOOP WAS SPLIT — `splitLoopNWay`'s `LogicalResult`, whose failure has one cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopSplit {
+    /// `success()`: the loop is gone and one loop per split range stands in its place.
+    Split,
+    /// `failure()`: *"Unable to Perform Loop Splitting, due to dynamic bound"*.
+    ///
+    /// ⭐ A NON-POSITIVE CONSTANT BOUND IS ALSO HERE: the reference fills its map with
+    /// `while (loop_bound_copy)` from the bound down to 1, so a bound of 0 leaves it empty and
+    /// `findAllSplitVals` then dereferences `begin()` — undefined behaviour there, refused here.
+    BoundIsNotAPositiveConstant,
+}
+
+/// ⛔ `getDefiningOp()` IS GLOBAL, so a value resolves in whichever enclosing scope defines it: the
+/// clone's own body for a constant it carries, the block above for one hoisted out of the loop.
+fn constant_value_in(value: Val, scopes: &[&[Op]]) -> Option<i64> {
+    scopes.iter().find_map(|scope| constant_value(value, scope))
+}
+
+/// `(getLhs() or getRhs() is a sentient.constant) && (iv == getLhs() || iv == getRhs())` — the filter
+/// both of `splitLoopNWay`'s walks apply (`:880-889`, `:924-933`).
+fn is_if_op_on_iv(op: &Op, iv: Val, scopes: &[&[Op]]) -> bool {
+    let Op::Sentient(ops::Op::If { lhs, rhs, .. }) = op else {
+        return false;
+    };
+    let pred_can_be_evaluated =
+        constant_value_in(*lhs, scopes).is_some() || constant_value_in(*rhs, scopes).is_some();
+    pred_can_be_evaluated && (iv == *lhs || iv == *rhs)
+}
+
+/// The `sentient.if`s of `body` on `iv`, in the pre-order `for_op->walk` visits them.
+fn if_ops_on_iv<'a>(body: &'a [Op], iv: Val, scopes: &[&[Op]]) -> Vec<&'a Op> {
+    let mut if_list = Vec::new();
+    for_each_op(body, &mut |op| {
+        if is_if_op_on_iv(op, iv, scopes) {
+            if_list.push(op);
+        }
+    });
+    if_list
+}
+
+/// Splices each `sentient.if` on `iv` down to the branch `predvals` names positionally, walking
+/// `if_list1`'s pre-order, and collects the rewires the reference performs immediately per if op.
+///
+/// ⛔⛔ BOTH REGIONS ARE DESCENDED INTO EVEN THOUGH ONE IS DISCARDED, because that is what fixes
+/// `predvals`' positions: `if_list1` holds the DISCARDED branch's if ops too, at their own pre-order
+/// slots. The reference processes them inside the dying region and then double-frees them in its
+/// second erase loop (`:958-960`); here the folding is real and the region is simply dropped after.
+///
+/// ⭐ AN EMPTY ELSE REGION SPLICES NOTHING AND REWIRES NOTHING (`:942`), so the if op's results lose
+/// their definition and keep their readers — the reference's own outcome.
+fn fold_if_ops_on_iv(
+    block: Vec<Op>,
+    iv: Val,
+    scopes: &[&[Op]],
+    predvals: &[bool],
+    index: &mut usize,
+    rewires: &mut Vec<Vec<(Val, Val)>>,
+) -> Vec<Op> {
+    let mut out = Vec::new();
+    for op in block {
+        if !is_if_op_on_iv(&op, iv, scopes) {
+            let mut op = op;
+            if let Op::Sentient(inner) = &mut op {
+                for region in ops::regions_mut(inner) {
+                    *region = fold_if_ops_on_iv(
+                        core::mem::take(region),
+                        iv,
+                        scopes,
+                        predvals,
+                        index,
+                        rewires,
+                    );
+                }
+            }
+            out.push(op);
+            continue;
+        }
+        // `bound_to_all_ifops_predval[kv.first][index]` — a vector shorter than the list cannot
+        // happen (both walks apply the same filter to the same structure), and reads as the else.
+        let take_then = predvals.get(*index).copied().unwrap_or(false);
+        *index += 1;
+        // The outer if op's rewire is performed BEFORE its regions' are, so its slot is reserved
+        // here: a result rewired onto an inner if's result must be redirected again by that inner
+        // rewire, which only holds when the two are applied in this order.
+        let slot = rewires.len();
+        rewires.push(Vec::new());
+        let Op::Sentient(ops::Op::If {
+            yielded,
+            then_body,
+            else_body,
+            ..
+        }) = op
+        else {
+            continue;
+        };
+        let produced: Vec<Val> = yielded.iter().map(|entry| entry.result).collect();
+        let else_was_empty = else_body.is_empty();
+        let then_out = fold_if_ops_on_iv(then_body, iv, scopes, predvals, index, rewires);
+        let else_out = fold_if_ops_on_iv(else_body, iv, scopes, predvals, index, rewires);
+        if !take_then && else_was_empty {
+            continue;
+        }
+        let mut region = if take_then { then_out } else { else_out };
+        // `cloned_if_op.getResult(i).replaceAllUsesWith(cloned_if_yield_op->getOperand(i))`, then
+        // `cloned_if_yield_op->erase()`.
+        if let Some(Op::Sentient(ops::Op::Yield { results })) = region.last() {
+            rewires[slot] = produced.into_iter().zip(results.iter().copied()).collect();
+            region.pop();
+        }
+        out.extend(region);
+    }
+    out
+}
+
+/// `dcc::utils::updateDbgName(prefix, op, suffix)` (`dcc/src/Utils/Utils.cpp:491-515`) — ⛔ IT WRITES
+/// ONLY WHERE A NAME ALREADY EXISTS, because `getNewDbgNameFromOp` returns null without one.
+fn update_dbg_name(op: &mut Op, prefix: &str, suffix: &str) {
+    if let Op::Sentient(ops::Op::For {
+        dbg_name: Some(name),
+        ..
+    }) = op
+    {
+        *name = format!("{prefix}{name}{suffix}");
+    }
+}
+
+/// `%c = sentient.scalar_constant {value} : index`, as `const_builder_` creates one.
+fn index_constant(value: i64, result: Val) -> Op {
+    Op::Sentient(ops::Op::ScalarConstant {
+        value,
+        result,
+        reg_locale: ops::RegType::Imm,
+        ty: ScalarTy::Index,
+        is_symbol: false,
+    })
+}
+
+/// Replaces: e447_splitLoopNWay
+///
+/// Replaces the loop at `at` with ONE LOOP PER SPLIT RANGE, each with the range's own trip count, its
+/// induction variable shifted to the range's base, and every `sentient.if` on that variable already
+/// folded to the branch the range decided.
+///
+/// ⛔ TRAP: `builder.clone` RUNS BEFORE `updateDbgName`, so clone *k* carries the name the original
+/// had after *k-1* renamings and the fully accumulated name is discarded with the original.
+/// ⛔ TRAP: THE TAIL REWIRE USES THE LAST CLONE ALONE — the loops are chained by
+/// `newiter_args`, so only the final one's results stand for the original's.
+/// ⚠️ DIVERGENCE: each range's constants land immediately before their clone rather than at
+/// `const_builder_`'s program-unit top, the divergence `e322_copyOneIter` already records.
+pub(crate) fn split_loop_n_way(scope: &mut Vec<Op>, at: usize, values: &mut Values) -> LoopSplit {
+    let Some(for_op) = scope.get(at).and_then(ForOp::of) else {
+        return LoopSplit::BoundIsNotAPositiveConstant;
+    };
+    let Some(loop_bound) = constant_value(for_op.bound, scope) else {
+        return LoopSplit::BoundIsNotAPositiveConstant;
+    };
+    if loop_bound <= 0 {
+        return LoopSplit::BoundIsNotAPositiveConstant;
+    }
+    let inits: Vec<Val> = for_op.carried.iter().map(|entry| entry.init).collect();
+    let original_results: Vec<Val> = for_op.carried.iter().map(|entry| entry.result).collect();
+    // `getAllTrueIndexOfIfOpsList(loop_bound_copy, if_list)` for every bound from `loop_bound` down
+    // to 1; the map is `std::greater<>`-ordered and [`BoundPredVals`] reads it back that way.
+    let if_list = if_ops_on_iv(for_op.body, for_op.iv, &[scope]);
+    let mut bound_to_all_ifops_predval = BTreeMap::new();
+    for bound in 1..=loop_bound {
+        let bound = IterBound(bound);
+        bound_to_all_ifops_predval.insert(
+            bound,
+            get_all_true_index_of_if_ops_list(bound, &if_list, scope),
+        );
+    }
+    drop(if_list);
+    let Some(pred_vals) = BoundPredVals::from_map(&bound_to_all_ifops_predval) else {
+        return LoopSplit::BoundIsNotAPositiveConstant;
+    };
+    let split_vals = find_all_split_vals(&pred_vals);
+
+    let mut newiter_args: Vec<Val> = Vec::new();
+    // `OpBuilder builder(for_op->getNextNode())` — every clone is inserted just before the loop's
+    // next sibling, so the clones end up after the loop in `split_vals` order.
+    let mut cursor = at + 1;
+    for range in &split_vals {
+        let mut minted = Vec::new();
+        let bound_val = values.mint();
+        minted.push(index_constant(range.high.0 - range.low.0 + 1, bound_val));
+        let template = scope[at].clone();
+        let mut mapping = ValueMapping::new();
+        let mut cloned = clone_ops(&[template], values, &mut mapping);
+        update_dbg_name(&mut scope[at], "LS(", &format!(", sv {})", range.high.0));
+        let Some(Op::Sentient(ops::Op::For {
+            iv: cloned_iv,
+            bound,
+            carried,
+            body,
+            ..
+        })) = cloned.first_mut()
+        else {
+            return LoopSplit::BoundIsNotAPositiveConstant;
+        };
+        let cloned_iv = *cloned_iv;
+        *bound = bound_val;
+        // `getInitArgsMutable().assign(newiter_args.size() > 0 ? newiter_args : getIterOperands())`.
+        let assigned = if newiter_args.is_empty() {
+            &inits
+        } else {
+            &newiter_args
+        };
+        for (entry, init) in carried.iter_mut().zip(assigned) {
+            entry.init = *init;
+        }
+        // ⛔ THE FILTER NEEDS BOTH SCOPES: the clone's body for the constants it carries — remapped,
+        // so only this snapshot defines them — and the block the loop sits in for the ones hoisted
+        // above it, which the clone reads unchanged. A body-only scope answers "not on the induction
+        // variable" for every hoisted comparison and folds nothing.
+        let snapshot = body.clone();
+        let scopes: [&[Op]; 2] = [&snapshot, scope];
+        let predvals = bound_to_all_ifops_predval
+            .get(&range.high)
+            .cloned()
+            .unwrap_or_default();
+        let mut index = 0;
+        let mut rewires = Vec::new();
+        *body = fold_if_ops_on_iv(
+            core::mem::take(body),
+            cloned_iv,
+            &scopes,
+            &predvals,
+            &mut index,
+            &mut rewires,
+        );
+        for (of, with) in rewires.into_iter().flatten() {
+            replace_all_uses_with(body, of, with);
+        }
+        // `if (!getInductionVar().use_empty())` — the range's iterations start at `kv.second - 1`,
+        // so every surviving reader of the clone's variable reads `iv + (low - 1)` instead.
+        if use_count(cloned_iv, body) > 0 {
+            let shift_val = values.mint();
+            minted.push(index_constant(range.low.0 - 1, shift_val));
+            let sum = values.mint();
+            body.insert(
+                0,
+                Op::Sentient(ops::Op::ScalarAdd {
+                    lhs: cloned_iv,
+                    rhs: shift_val,
+                    result: sum,
+                    reg: None,
+                    ty: ScalarTy::Index,
+                    element_size: None,
+                }),
+            );
+            // `replaceAllUsesExcept(add_op.getResult(), {add_op})` — the addition itself keeps
+            // reading the variable, which is why the rewrite starts past it.
+            replace_all_uses_with(&mut body[1..], cloned_iv, sum);
+        }
+        newiter_args = carried.iter().map(|entry| entry.result).collect();
+        let inserted = minted.len() + cloned.len();
+        minted.append(&mut cloned);
+        for (offset, op) in minted.into_iter().enumerate() {
+            scope.insert(cursor + offset, op);
+        }
+        cursor += inserted;
+    }
+    for (original, last) in original_results.iter().zip(&newiter_args) {
+        replace_all_uses_with(scope, *original, *last);
+    }
+    scope.remove(at);
+    LoopSplit::Split
+}
 
 // crustify:todo: e513_unrollLoop
 //   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:207  (86 body lines, level 3)
@@ -873,7 +1155,7 @@ mod unit_tests {
     use crate::arch::Elements;
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType};
+    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType, Yielded};
 
     /// AN ESTIMATOR THAT ANSWERS WHAT THE TEST SAYS. ⛔ `InstructionEstimatorImpl` is out of campaign
     /// scope, so a test STATES its counts rather than deriving them — the effect under test is what
@@ -1316,5 +1598,141 @@ mod unit_tests {
             res,
             vec![Vec::new(), vec![high], vec![high, low], vec![low]]
         );
+    }
+
+    /// The loop `op` is, which every one of these collected by matching on.
+    fn for_op_of(op: &Op) -> ForOp<'_> {
+        ForOp::of(op).expect("collected by matching `sentient.for`")
+    }
+
+    /// e446 — the sort is by DECREASING SIZE and it is stable, so ties keep [`subsets_impl`]'s own
+    /// enumeration order and the empty subset lands last.
+    #[test]
+    fn e446_orders_every_subset_longest_first_and_keeps_the_ties_stable() {
+        let range = |high: i64, low: i64| SplitRange {
+            high: IterBound(high),
+            low: IterBound(low),
+        };
+        let (first, second, third) = (range(9, 8), range(7, 5), range(4, 1));
+        assert_eq!(
+            subsets(&[first, second, third]),
+            vec![
+                vec![first, second, third],
+                vec![first, second],
+                vec![first, third],
+                vec![second, third],
+                vec![first],
+                vec![second],
+                vec![third],
+                Vec::new(),
+            ]
+        );
+    }
+
+    /// e447 — a loop over `%iv >= 2` splits into the bounds that behave alike: bounds 3 and 2 take
+    /// the `then` branch, bound 1 the `else`, so two loops stand in its place with no conditional
+    /// left, chained through the iter args, and only the shifted one carries the `iv + (low - 1)`.
+    #[test]
+    fn e447_replaces_the_loop_with_one_folded_loop_per_split_range() {
+        let mut values = Values::default();
+        let bound_c = values.mint();
+        let two = values.mint();
+        let init_c = values.mint();
+        let iv = values.mint();
+        let arg = values.mint();
+        let result = values.mint();
+        let if_result = values.mint();
+        let then_val = values.mint();
+        let else_val = values.mint();
+        let reader = values.mint();
+
+        let mut scope = vec![
+            constant(3, bound_c),
+            constant(2, two),
+            constant(7, init_c),
+            for_loop(
+                iv,
+                bound_c,
+                vec![carried(init_c, arg, result)],
+                vec![
+                    Op::Sentient(ops::Op::If {
+                        predicate: ops::CmpPredicate::Sge,
+                        lhs: iv,
+                        rhs: two,
+                        yielded: vec![Yielded {
+                            result: if_result,
+                            reg: Reg {
+                                locale: RegType::Lrf,
+                                index: None,
+                            },
+                        }],
+                        dbg_name: None,
+                        // The `then` branch reads the induction variable and the `else` branch does
+                        // not, which is what decides whether each clone needs the shift.
+                        then_body: vec![add(iv, two, then_val), yields(vec![then_val])],
+                        else_body: vec![add(arg, bound_c, else_val), yields(vec![else_val])],
+                    }),
+                    yields(vec![if_result]),
+                ],
+            ),
+            add(result, bound_c, reader),
+        ];
+
+        assert_eq!(
+            split_loop_n_way(&mut scope, 3, &mut values),
+            LoopSplit::Split
+        );
+
+        // The original loop is gone and no `sentient.if` survives: each clone's predicate was
+        // decided by its own range.
+        let mut for_ops = Vec::new();
+        let mut if_ops = 0;
+        for_each_op(&scope, &mut |op| match op {
+            Op::Sentient(ops::Op::If { .. }) => if_ops += 1,
+            Op::Sentient(ops::Op::For { .. }) => for_ops.push(op),
+            _ => {}
+        });
+        assert_eq!(if_ops, 0);
+        assert_eq!(for_ops.len(), 2);
+
+        let bounds: Vec<Option<i64>> = for_ops
+            .iter()
+            .map(|op| constant_value(for_op_of(op).bound, &scope))
+            .collect();
+        // `kv.first - kv.second + 1` for the ranges `(3, 2)` and `(1, 1)`.
+        assert_eq!(bounds, vec![Some(2), Some(1)]);
+
+        let split = for_op_of(for_ops[0]);
+        let tail = for_op_of(for_ops[1]);
+        // The first clone keeps the original inits; the second reads the first's results.
+        assert_eq!(split.carried[0].init, init_c);
+        assert_eq!(tail.carried[0].init, split.carried[0].result);
+        // `%sum = %iv + 1` heads the shifted clone, and the folded `then` branch reads `%sum`.
+        let Op::Sentient(ops::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result: sum,
+            ..
+        }) = &split.body[0]
+        else {
+            panic!("the shifted clone must open with the induction variable's offset");
+        };
+        assert_eq!(*lhs, split.iv);
+        assert_eq!(constant_value(*rhs, &scope), Some(1));
+        assert!(
+            matches!(&split.body[1], Op::Sentient(ops::Op::ScalarAdd { lhs, .. }) if lhs == sum)
+        );
+        assert_eq!(split.body.len(), 3);
+        // The `else` branch never read the variable, so that clone gets no offset at all.
+        assert_eq!(tail.body.len(), 2);
+        assert!(matches!(
+            &tail.body[0],
+            Op::Sentient(ops::Op::ScalarAdd { lhs, .. }) if *lhs == tail.carried[0].arg
+        ));
+        // The original loop's readers moved onto the LAST clone alone.
+        assert!(matches!(
+            scope.last(),
+            Some(Op::Sentient(ops::Op::ScalarAdd { lhs, .. })) if *lhs == tail.carried[0].result
+        ));
     }
 }

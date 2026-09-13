@@ -89,11 +89,17 @@
 
 use std::collections::BTreeMap;
 
+use crate::arch::Arch;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, arith, dataflow, lowered, sentient, symbol, uniform,
+    Definitions, Op, Val, arith, dataflow, lowered, regions_ref, sentient, symbol, uniform,
     uniform_mapping_values, use_count, value_reg_locale,
 };
-use crate::transform::sentient::analyses::Liveness;
+use crate::transform::sentient::analyses::{Liveness, RegisterGraphs};
+use crate::transform::sentient::local_region_splitting_for_value_commoning::{
+    PretendRegLimits, get_max_reg_num,
+};
+use crate::units::DfirUnit;
+use sys_arch_spec::regfile::Component;
 
 /// WHETHER A VALUE'S REGISTER FILE MAY, MUST OR MAY NOT BE INITIALISED IN THE PROGRAM HEADER —
 /// `RegisterInitInfo::RegInitLocalePriority` (`OldRegisterInitialization.cpp:100-105`).
@@ -832,29 +838,280 @@ pub struct NextMaxWeight {
     pub pick: Option<Pick>,
 }
 
-// crustify:todo: e449_calcSSAWeight
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:252  (9 body lines, level 2)
-//   original  : int RegisterInitInfo::calcSSAWeight(Region &reg)
-//   calls     : e327_calcSSAWeight
+/// `op.walk<WalkOrder::PreOrder>` OVER EVERY OP OF A REGION — the shape both region overloads below
+/// are (`:252-260`, `:361-369`), carrying the two chains this island has no parent pointer for.
+fn walk_region_pre_order<'a>(
+    region: &'a [Op],
+    outer_ops: &[&'a Op],
+    outer_scopes: &[&'a [Op]],
+    visit: &mut impl FnMut(&'a Op, Enclosing<'_>, Definitions<'_>),
+) {
+    let mut scopes: Vec<&'a [Op]> = Vec::with_capacity(outer_scopes.len() + 1);
+    scopes.push(region);
+    scopes.extend_from_slice(outer_scopes);
+    for op in region {
+        visit(
+            op,
+            Enclosing::from_innermost(outer_ops),
+            Definitions::from_innermost(&scopes),
+        );
+        let mut inner_ops: Vec<&'a Op> = Vec::with_capacity(outer_ops.len() + 1);
+        inner_ops.push(op);
+        inner_ops.extend_from_slice(outer_ops);
+        for inner in regions_ref(op) {
+            walk_region_pre_order(inner, &inner_ops, &scopes, visit);
+        }
+    }
+}
 
-// crustify:todo: e450_collectAllRegCoalescingCandidates
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:361  (9 body lines, level 2)
-//   original  : void RegisterInitInfo::collectAllRegCoalescingCandidates(Region &region)
-//   calls     : e329_collectAllRegCoalescingCandidates
+/// PER CENT OF ONE CANDIDATE LIST TO ACCEPT BEFORE ABANDONING THE REST OF IT — the value of
+/// `-dcc-old-register-initialization-top-candidates` and its coalescing twin (`:81-88`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TopPercent(pub u32);
 
-// crustify:todo: e451_collectRegInitAndRegCoalescingCandidateFast
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:548  (114 body lines, level 2)
-//   original  : void RegisterInitInfo::collectRegInitAndRegCoalescingCandidateFast( dataflow::ProgramUnitOp &unit, mlir::Value u)
-//   calls     : e063_getMaxRegNum, e107_hasUniformizeRegion, e252_size, e330_getNextMaxWeight
+impl Default for TopPercent {
+    /// ⛔ 100 IS `cl::init(100)` AND MEANS NO EARLY STOP AT ALL — both clauses are guarded by `< 100`.
+    fn default() -> TopPercent {
+        TopPercent(100)
+    }
+}
+
+/// THE PASS'S TWO EARLY-STOP FLAGS, which are one decision and are read once per greedy iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EarlyStop {
+    /// `NPercentTopRegInitCandidates` (`:81-84`).
+    pub reg_init: TopPercent,
+    /// `NPercentTopRegCoalescingCandidates` (`:85-88`).
+    pub coalescing: TopPercent,
+}
+
+/// `dcc::getUnitType(get_unit)` (`dcc/src/Utils/DccExtContext.cpp:126-130`) narrowed to the nine
+/// components `regInfoPerUnit` is keyed by (`:292`).
+///
+/// ⛔ PANICS WHERE THE REFERENCE'S `.at()` THROWS — a value that is not a `dataflow.get_unit`, and a
+/// unit that is a memory, an IBR, a state block or the whole LX rather than an executor. The same
+/// reasoning `machine_max_reg_num` records for the file lookup one level down.
+fn reg_info_component(u: Val, defs: Definitions<'_>) -> Component {
+    let unit = match defs.of(u) {
+        Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) => Some(*unit),
+        _ => None,
+    };
+    unit.and_then(|unit| match unit {
+        DfirUnit::PtRow(_) => Some(Component::Pt),
+        DfirUnit::Pe => Some(Component::Pe),
+        DfirUnit::Sfp => Some(Component::Sfp),
+        DfirUnit::Lxlu => Some(Component::Lxlu),
+        DfirUnit::Lxsu => Some(Component::Lxsu),
+        DfirUnit::L0lu => Some(Component::L0lu),
+        DfirUnit::L0su => Some(Component::L0su),
+        DfirUnit::L3lu => Some(Component::L3lu),
+        DfirUnit::L3su => Some(Component::L3su),
+        DfirUnit::Lx
+        | DfirUnit::L0
+        | DfirUnit::Hbm
+        | DfirUnit::Constant
+        | DfirUnit::SfpState
+        | DfirUnit::PeState
+        | DfirUnit::SfpRing
+        | DfirUnit::LxVirtualIbr
+        | DfirUnit::L3Ibr
+        | DfirUnit::CrossPtnLink
+        | DfirUnit::LxluScaleReg => None,
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "{u:?} is not a `dataflow.get_unit` on an executor, so `regInfoPerUnit` states no \
+             register counts for it (DccExtContext.cpp:292)"
+        )
+    })
+}
+
+impl RegisterInitInfo {
+    /// Replaces: e449_calcSSAWeight
+    ///
+    /// [`RegisterInitInfo::calc_ssa_weight`] over a whole region, pre-order — the overload the caller
+    /// uses for one unit's slice of a `uniform.uniformize_regions` (`:252-260`, `:1240-1254`).
+    ///
+    /// ⭐ THE `int` RETURN IS A CONSTANT `0` NOTHING READS (`:259`), so there is none here.
+    pub fn calc_ssa_weight_in_region<'a>(
+        &mut self,
+        region: &'a [Op],
+        enclosing: Enclosing<'a>,
+        outer_scopes: &[&'a [Op]],
+        gtr_reg_init: GtrRegInit,
+    ) {
+        walk_region_pre_order(
+            region,
+            enclosing.ops(),
+            outer_scopes,
+            &mut |op, enclosing, defs| {
+                self.calc_ssa_weight(op, enclosing, defs, gtr_reg_init);
+            },
+        );
+    }
+
+    /// Replaces: e450_collectAllRegCoalescingCandidates
+    ///
+    /// [`RegisterInitInfo::collect_all_reg_coalescing_candidates`] over a whole region, pre-order
+    /// (`:361-369`).
+    ///
+    /// ⭐ `hasOneUse()` IS GLOBAL IN THE REFERENCE, so the scope counted is the OUTERMOST region given
+    /// and never the nested one being walked — a value read once inside an inner loop is read once here.
+    pub fn collect_all_reg_coalescing_candidates_in_region<'a, L: Liveness>(
+        &mut self,
+        region: &'a [Op],
+        outer_scopes: &[&'a [Op]],
+        liveness: &L,
+    ) {
+        let scope: &[Op] = outer_scopes.last().copied().unwrap_or(region);
+        let none: [&Op; 0] = [];
+        walk_region_pre_order(region, &none, outer_scopes, &mut |op, _enclosing, defs| {
+            self.collect_all_reg_coalescing_candidates(op, scope, defs, liveness);
+        });
+    }
+
+    /// Replaces: e451_collectRegInitAndRegCoalescingCandidateFast
+    ///
+    /// Takes the heaviest candidate left, provisionally accepts it, and keeps it only while `locale`'s
+    /// interference graph still colours — the greedy vetting that fills `final_reginit_candidates_` and
+    /// `final_reg_coalescing_candidates_` (`:548-661`).
+    ///
+    /// ⛔ TRAP: THE REQUIRED CANDIDATES GO IN UNVETTED AND FIRST, raising their locale's counter, so
+    /// they spend the very budget the vetted ones are then measured against.
+    /// ⛔ TRAP: A FULL LOCALE `continue`s, which also skips that iteration's colouring AND both early
+    /// stops — the counter is still raised, so one refusal per further candidate in that locale.
+    /// ⚠️ THE `DT_CHECK_MSG` ON AN OVER-SUBSCRIBED LOCALE (`:563-566`) IS NOT EMITTED: it names no
+    /// alternative behaviour, and this crate does not runtime-refuse.
+    /// ⚠️ AN EMPTY LIST SKIPS ITS OWN EARLY STOP, where the reference divides by zero — with nothing
+    /// collected the index it would set is already past the end, so the outcome is the same one.
+    pub fn collect_reg_init_and_reg_coalescing_candidate_fast<
+        A: Arch,
+        L: Liveness + Clone,
+        G: RegisterGraphs + Default,
+    >(
+        &mut self,
+        unit: &[Op],
+        u: Val,
+        defs: Definitions<'_>,
+        liveness: &L,
+        early_stop: EarlyStop,
+    ) {
+        let comp = reg_info_component(u, defs);
+        // `dccExtContext().getMaxRegNum(locale, comp)` — this pass owns no pretend-limit flags, so the
+        // limits are unset and `e063` falls straight through to the machine's own bound.
+        let max_reg_num = |locale| get_max_reg_num::<A>(locale, comp, PretendRegLimits::default());
+        let mut final_reginit_candidates: Vec<Val> = Vec::new();
+        // `std::array<unsigned, getMaxEnumValForSentientRegType() + 1>{0}` — a locale never counted
+        // reads zero, which is what `or_default` answers.
+        let mut locale_to_num_reginit_candidates: BTreeMap<sentient::RegType, u32> =
+            BTreeMap::new();
+        for req in &self.required_reginit_candidates {
+            let locale = value_reg_locale(*req, defs);
+            *locale_to_num_reginit_candidates.entry(locale).or_default() += 1;
+            final_reginit_candidates.push(*req);
+        }
+        // `std::stable_sort(.., ssa_weight_[l] > ssa_weight_[r])` — heaviest first, ties keeping their
+        // collection order, through the disjoint field borrow `e328` already uses.
+        let ssa_weight = &self.ssa_weight;
+        self.valid_reginit_candidates
+            .sort_by(|l, r| ssa_weight.weight_of(*r).cmp(&ssa_weight.weight_of(*l)));
+        let mut reg_init_index = 0;
+        let mut coalescing_index = 0;
+        let mut final_regcoalescing_candidates: Vec<Vec<Val>> = Vec::new();
+        loop {
+            let next = self.get_next_max_weight(reg_init_index, coalescing_index);
+            reg_init_index = next.reg_init_index;
+            coalescing_index = next.coalescing_index;
+            // `if (val_with_max_weight.empty()) break;` — both lists spent, which is also the only
+            // shape an empty subset could ever reach this test as.
+            let Some(pick) = next.pick else { break };
+            let val_with_max_weight: &[Val] = match &pick {
+                Pick::RegInit(val) => std::slice::from_ref(val),
+                Pick::RegCoalescing(subset) => subset,
+            };
+            let Some(&max_weight_val) = val_with_max_weight.first() else {
+                break;
+            };
+            let is_reginit = matches!(pick, Pick::RegInit(_));
+            let locale = value_reg_locale(max_weight_val, defs);
+            if is_reginit {
+                let count = locale_to_num_reginit_candidates.entry(locale).or_default();
+                let locale_count = *count;
+                *count += 1;
+                // `continue;  // not colorable anymore.`
+                if locale_count >= max_reg_num(locale).0 {
+                    continue;
+                }
+                final_reginit_candidates.push(max_weight_val);
+            } else {
+                final_regcoalescing_candidates.push(val_with_max_weight.to_vec());
+            }
+            let mut liveness_copy0 = liveness.clone();
+            // The plural promotion overload is an inline `for` over the singular one (`Liveness.h:131`).
+            for candidate in &final_reginit_candidates {
+                liveness_copy0.update_live_ranges_for_program_header_promotion(*candidate);
+            }
+            liveness_copy0.add_virtual_assign_optional(&final_regcoalescing_candidates);
+            liveness_copy0.add_virtual_assign_enforced(&self.enforced_virtual_assign);
+            // `RegisterGraphs gc;` — a FRESH graph set every iteration, which is why nothing here
+            // ever cleans one.
+            let mut gc = G::default();
+            gc.build_graphs(
+                &mut liveness_copy0,
+                unit,
+                locale,
+                has_uniformize_region(unit).then_some(u),
+            );
+            gc.create_same_color_edge_eq_classes(&mut liveness_copy0, locale);
+            gc.build_hyper_graph(locale);
+            if !gc.fast_check_colorability(max_reg_num(locale), locale) {
+                if is_reginit {
+                    final_reginit_candidates.pop();
+                } else {
+                    final_regcoalescing_candidates.pop();
+                }
+            }
+            // `reg_coal_index = valid_reg_coalescing_candidates_.size()` is what stops `e330` offering
+            // any more of that list.
+            if early_stop.coalescing < TopPercent(100) {
+                let total_initial = self.valid_reg_coalescing_candidates.len();
+                let total_accepted = final_regcoalescing_candidates.len();
+                if total_initial > 0
+                    && (total_accepted * 100) / total_initial >= early_stop.coalescing.0 as usize
+                {
+                    coalescing_index = self.valid_reg_coalescing_candidates.len();
+                }
+            }
+            if early_stop.reg_init < TopPercent(100) {
+                let total_initial = self.valid_reginit_candidates.len();
+                // `.size() - required_reginit_candidates_.size()`: the required ones were never vetted,
+                // so they do not count towards the share accepted.
+                let total_accepted = final_reginit_candidates
+                    .len()
+                    .saturating_sub(self.required_reginit_candidates.len());
+                if total_initial > 0
+                    && (total_accepted * 100) / total_initial >= early_stop.reg_init.0 as usize
+                {
+                    reg_init_index = self.valid_reginit_candidates.len();
+                }
+            }
+        }
+        // `final_reginit_candidates_` IS A `std::stack`, so `push` APPENDS — the last one in is `top()`.
+        self.final_reginit_candidates
+            .extend(final_reginit_candidates);
+        self.final_reg_coalescing_candidates = final_regcoalescing_candidates;
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        Enclosing, GtrRegInit, NextMaxWeight, Pick, RegInitLocalePriority, RegisterInitInfo,
-        SsaWeight, SsaWeights, TripCount, collect_all_reg_coalescing_candidates_impl,
-        get_register_init_priority, has_uniformize_region, total_trip_count, weight_of_subset,
+        EarlyStop, Enclosing, GtrRegInit, NextMaxWeight, Pick, RegInitLocalePriority,
+        RegisterInitInfo, SsaWeight, SsaWeights, TripCount,
+        collect_all_reg_coalescing_candidates_impl, get_register_init_priority,
+        has_uniformize_region, total_trip_count, weight_of_subset,
     };
-    use crate::arch::Elements;
+    use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::dialects::dataflow::{
         ConsumerCount, MulticastGroupId, OutstandingRequests,
@@ -864,19 +1121,72 @@ mod unit_tests {
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{Definitions, Op, Val, dataflow, sentient, uniform};
-    use crate::transform::sentient::analyses::Liveness;
+    use crate::transform::sentient::analyses::{Liveness, RegisterGraphs, VirtualAssigns};
+    use crate::transform::sentient::local_region_splitting_for_value_commoning::MaxRegNum;
 
     /// The out-of-scope liveness, answering from the pairs that DO overlap — the only way to observe
     /// which subsets `e329` offers.
+    ///
+    /// ⭐ `Clone` BECAUSE `e451` COPIES ITS LIVENESS PER ITERATION and tells the copy what it is
+    /// considering; the copy is dropped at the end of the iteration, so the three telling methods are
+    /// no-ops here rather than recorders — nothing outside the iteration could read them.
+    #[derive(Clone)]
     struct Overlapping(Vec<(Val, Val)>);
 
     impl Liveness for Overlapping {
-        fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {
-            todo!("this fake answers overlaps only; no unit here promotes through it")
-        }
+        fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {}
 
         fn is_live_range_overlaps(&self, val1: Val, val2: Val) -> bool {
             self.0.contains(&(val1, val2))
+        }
+
+        fn clear(&mut self, _virtual_assigns: VirtualAssigns) {
+            todo!("no unit here clears this fake")
+        }
+
+        fn compute_register_live_range(&mut self, _unit: &[Op]) {
+            todo!("no unit here recomputes this fake")
+        }
+
+        fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {}
+
+        fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {}
+    }
+
+    /// The out-of-scope register graphs, colourable or not by construction — the only way to observe
+    /// which of `e451`'s pushes stick.
+    ///
+    /// ⭐ THE ANSWER IS A TYPE PARAMETER AND NOT A FIELD because `e451` constructs a FRESH
+    /// `RegisterGraphs` on every iteration (`OldRegisterInitialization.cpp:613`), so nothing an
+    /// instance records could survive to the next one.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct Colorable<const OK: bool>;
+
+    impl<const OK: bool> RegisterGraphs for Colorable<OK> {
+        fn clean(&mut self) {
+            todo!("e451 constructs a fresh RegisterGraphs per iteration and never cleans one")
+        }
+
+        fn build_graphs<L: Liveness>(
+            &mut self,
+            _liveness: &mut L,
+            _unit: &[Op],
+            _locale: RegType,
+            _coreunit: Option<Val>,
+        ) {
+        }
+
+        fn create_same_color_edge_eq_classes<L: Liveness>(
+            &mut self,
+            _liveness: &mut L,
+            _locale: RegType,
+        ) {
+        }
+
+        fn build_hyper_graph(&mut self, _locale: RegType) {}
+
+        fn fast_check_colorability(&mut self, _num_colors: MaxRegNum, _locale: RegType) -> bool {
+            OK
         }
     }
 
@@ -1408,5 +1718,143 @@ mod unit_tests {
                 pick: None,
             }
         );
+    }
+    /// e449 — ONE call over the region reproduces `e327`'s hand-walk exactly, which is what the
+    /// pre-order descent and the supplied enclosing chain are for.
+    #[test]
+    fn e449_weighs_a_whole_region_in_pre_order() {
+        let inner = for_op(44, 11, vec![carried(12, 46, 47, RegType::Lrf)], Vec::new());
+        let promoted = copy(23, 13, RegType::Lbr);
+        let weighed = load_and_send(60, 61, 12);
+        let outer = for_op(
+            40,
+            10,
+            vec![carried(12, 42, 43, RegType::Lrf)],
+            vec![inner, promoted, weighed],
+        );
+        let scope = vec![
+            constant(10, 4),
+            constant(11, 3),
+            constant(12, 0),
+            get_unit(13),
+            outer,
+        ];
+        let mut info = RegisterInitInfo::default();
+        let none: [&Op; 0] = [];
+
+        info.calc_ssa_weight_in_region(
+            &scope,
+            Enclosing::from_innermost(&none),
+            &[],
+            GtrRegInit::Enabled,
+        );
+
+        // The outer loop runs once; everything inside it runs 4 times.
+        assert_eq!(info.ssa_weight.weight_of(Val(42)), SsaWeight(1));
+        assert_eq!(info.ssa_weight.weight_of(Val(46)), SsaWeight(4));
+        assert_eq!(info.ssa_weight.weight_of(Val(23)), SsaWeight(4));
+        assert_eq!(info.ssa_weight.weight_of(Val(60)), SsaWeight(4));
+        // ⛔ `%46` IS WEIGHED AND NEVER OFFERED: the walk reached it, and its loop is not the outermost.
+        assert_eq!(info.valid_reginit_candidates, vec![Val(42)]);
+        assert_eq!(info.required_reginit_candidates, vec![Val(23)]);
+    }
+
+    /// e450 — ONE call over the region collects what `e329`'s hand-walk does, nested loop included.
+    #[test]
+    fn e450_collects_a_whole_regions_subsets_in_pre_order() {
+        let inner = for_op(
+            44,
+            45,
+            vec![carried(42, 46, 47, RegType::Lrf)],
+            vec![copy(48, 46, RegType::Lrf)],
+        );
+        let outer = for_op(40, 41, vec![carried(50, 42, 43, RegType::Lrf)], vec![inner]);
+        let scope = vec![
+            constant(41, 2),
+            constant(45, 3),
+            constant(50, 0),
+            constant(72, 5),
+            copy(81, 90, RegType::Lrf),
+            outer,
+            load_and_send(60, 61, 50),
+            load_and_send(70, 71, 72),
+            scalar_add(80, 50, 81),
+        ];
+        let liveness = Overlapping(vec![(Val(70), Val(71))]);
+        let mut info = RegisterInitInfo::default();
+
+        info.collect_all_reg_coalescing_candidates_in_region(&scope, &[], &liveness);
+
+        assert_eq!(
+            info.valid_reg_coalescing_candidates,
+            vec![
+                // The INNER loop's subset, which only a descent reaches; the outer loop's arrives from
+                // a constant and is dropped.
+                vec![Val(46), Val(42)],
+                vec![Val(60), Val(61)],
+                vec![Val(80), Val(81)],
+            ]
+        );
+        assert_eq!(info.enforced_virtual_assign, vec![(Val(60), Val(61))]);
+    }
+
+    /// e451 — the required candidate goes in unvetted, and whether the two vetted picks survive is the
+    /// colourability answer and nothing else.
+    #[test]
+    fn e451_keeps_only_the_picks_whose_locale_still_colours() {
+        // ⭐ `lccr` IS THE ONE LOCALE WHOSE BUDGET IS ARCH-CONSTANT — `numLCCRRegisters` is 16 on both
+        // arches, so the 3 candidates below are never the thing that refuses a pick.
+        let scope = vec![
+            get_unit(1),
+            constant(9, 0),
+            copy(10, 9, RegType::Lccr),
+            copy(11, 9, RegType::Lccr),
+            copy(12, 9, RegType::Lccr),
+            copy(13, 9, RegType::Lccr),
+        ];
+        let module = [scope.as_slice()];
+        let defs = Definitions::from_innermost(&module);
+        let mut ssa_weight = SsaWeights::default();
+        for (val, weight) in [(11, 10), (12, 4), (13, 4)] {
+            ssa_weight.set(Val(val), SsaWeight(weight));
+        }
+        let base = RegisterInitInfo {
+            ssa_weight,
+            required_reginit_candidates: vec![Val(10)],
+            valid_reginit_candidates: vec![Val(11)],
+            valid_reg_coalescing_candidates: vec![vec![Val(12), Val(13)]],
+            ..RegisterInitInfo::default()
+        };
+        let liveness = Overlapping(Vec::new());
+
+        let mut accepted = base.clone();
+        accepted.collect_reg_init_and_reg_coalescing_candidate_fast::<Dd2, _, Colorable<true>>(
+            &scope,
+            Val(1),
+            defs,
+            &liveness,
+            EarlyStop::default(),
+        );
+        assert_eq!(
+            accepted.final_reginit_candidates,
+            vec![Val(10), Val(11)],
+            "the required candidate first, then the heavier vetted one"
+        );
+        assert_eq!(
+            accepted.final_reg_coalescing_candidates,
+            vec![vec![Val(12), Val(13)]]
+        );
+
+        let mut refused = base;
+        refused.collect_reg_init_and_reg_coalescing_candidate_fast::<Dd2, _, Colorable<false>>(
+            &scope,
+            Val(1),
+            defs,
+            &liveness,
+            EarlyStop::default(),
+        );
+        // ⛔ ONLY THE REQUIRED ONE SURVIVES: both vetted picks were pushed and popped again.
+        assert_eq!(refused.final_reginit_candidates, vec![Val(10)]);
+        assert!(refused.final_reg_coalescing_candidates.is_empty());
     }
 }

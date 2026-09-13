@@ -87,11 +87,14 @@
 // ⭐ REMOVE THIS WITH `e606_run`: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
+
+use super::{erase_deleted_ops, move_ssa_to_init};
 use crate::islands::dataflow_ir::dialects as lower;
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, Val, dataflow, sentient, symbol, uniform,
 };
-use crate::transform::sentient::analyses::UniformGroups;
+use crate::transform::sentient::analyses::{Liveness, UniformGroups, VirtualAssigns};
 use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
 
 /// WHERE THE OP BEHIND A CANDIDATE SITS — what `getParentOfType<uniform::UniformizeRegionsOp,
@@ -328,10 +331,31 @@ pub fn construct_values<U: UniformGroups>(
     }
 }
 
-// crustify:todo: e452_postProcessing
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1047  (27 body lines, level 2)
-//   original  : void RegisterInitCandidatePromoter::postProcessing()
-//   calls     : e109_eraseDeletedOps, e326_replaceVirtualAssignTarget, e332_moveSSAToInit
+/// Replaces: e452_postProcessing
+///
+/// Carries out the promoter's pending erasures, recomputes liveness over the changed unit, and marks
+/// every promoted candidate for the program header (`OldRegisterInitialization.cpp:1047-1072`).
+///
+/// ⛔ THE CLEAR KEEPS THE VIRTUAL ASSIGNMENTS: `liveness_.clear()` takes the default, so everything
+/// `e451` established survives into the recomputed ranges — see [`VirtualAssigns`].
+/// ⛔ `e326_replaceVirtualAssignTarget` IS NAMED BY THE ANALYSIS AND NOT CALLED: its only mention here
+/// is inside the `#if 0` at `:1064-1071`, which the reference's own comment says regressed
+/// `yolo_tinyenh` and raised register pressure (issue 3841). Deliberately not ported as live code.
+pub fn post_processing<L: Liveness>(
+    unit: &mut Vec<Op>,
+    to_be_erased: &mut BTreeSet<Val>,
+    all_reginit_candidates: &[Val],
+    liveness: &mut L,
+) {
+    erase_deleted_ops(unit, to_be_erased);
+    // "recompute liveness because new scalar copy was introduced".
+    liveness.clear(VirtualAssigns::Kept);
+    liveness.compute_register_live_range(unit);
+    for val in all_reginit_candidates {
+        liveness.update_live_ranges_for_program_header_promotion(*val);
+        move_ssa_to_init(unit, *val);
+    }
+}
 
 // crustify:todo: e517_getSource
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1144  (38 body lines, level 3)
@@ -350,13 +374,15 @@ pub fn construct_values<U: UniformGroups>(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{construct_values, is_same_op_type, is_within_global_region};
+    use std::collections::BTreeSet;
+
+    use super::{construct_values, is_same_op_type, is_within_global_region, post_processing};
     use crate::islands::dataflow_ir::dialects as lower;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{
         Definitions, Op, Val, dataflow, sentient, symbol, uniform,
     };
-    use crate::transform::sentient::analyses::UniformGroups;
+    use crate::transform::sentient::analyses::{Liveness, UniformGroups, VirtualAssigns};
     use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
     use crate::units::{DfirUnit, Residency};
 
@@ -537,5 +563,77 @@ mod unit_tests {
         // ⛔ THE DIVERGENCE, PINNED: a value with no defining op is none of the four rather than
         // the reference's assert. See [`is_same_op_type`].
         assert!(!is_same_op_type(Some(Val(5)), Some(Val(5)), &scope));
+    }
+    /// The out-of-scope liveness, recording only what `e452` tells it.
+    #[derive(Default)]
+    struct Recording {
+        cleared: Vec<VirtualAssigns>,
+        recomputed: Vec<usize>,
+        promoted: Vec<Val>,
+    }
+
+    impl Liveness for Recording {
+        fn update_live_ranges_for_program_header_promotion(&mut self, candidate: Val) {
+            self.promoted.push(candidate);
+        }
+
+        fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
+            todo!("no unit here asks this fake about an overlap")
+        }
+
+        fn clear(&mut self, virtual_assigns: VirtualAssigns) {
+            self.cleared.push(virtual_assigns);
+        }
+
+        fn compute_register_live_range(&mut self, unit: &[Op]) {
+            self.recomputed.push(unit.len());
+        }
+
+        fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {
+            todo!("no unit here adds an optional assignment through this fake")
+        }
+
+        fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
+            todo!("no unit here adds an enforced assignment through this fake")
+        }
+    }
+
+    /// `%r = sentient.scalar_copy %inp`.
+    fn scalar_copy(result: u32, input: u32) -> Op {
+        Op::Sentient(sentient::Op::ScalarCopy {
+            input: Val(input),
+            result: Val(result),
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lrf,
+                index: None,
+            },
+            element_size: None,
+            program_header: false,
+        })
+    }
+
+    /// e452 — the pending erasure happens FIRST, liveness is rebuilt over what is left with the virtual
+    /// assignments kept, and every candidate is both told to liveness and marked in the IR.
+    #[test]
+    fn e452_erases_then_rebuilds_liveness_and_marks_every_candidate() {
+        let mut unit = vec![scalar_constant(1), scalar_copy(2, 1), scalar_copy(3, 1)];
+        let mut to_be_erased = BTreeSet::from([Val(3)]);
+        let mut liveness = Recording::default();
+
+        post_processing(&mut unit, &mut to_be_erased, &[Val(2)], &mut liveness);
+
+        assert_eq!(unit.len(), 2);
+        assert!(to_be_erased.is_empty());
+        // ⭐ THE CLEAR KEEPS `va_`, and the rebuild saw the unit WITHOUT the erased op.
+        assert_eq!(liveness.cleared, vec![VirtualAssigns::Kept]);
+        assert_eq!(liveness.recomputed, vec![2]);
+        assert_eq!(liveness.promoted, vec![Val(2)]);
+        assert!(matches!(
+            unit[1],
+            Op::Sentient(sentient::Op::ScalarCopy {
+                program_header: true,
+                ..
+            })
+        ));
     }
 }

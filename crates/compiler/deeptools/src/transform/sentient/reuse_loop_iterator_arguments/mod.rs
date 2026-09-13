@@ -96,9 +96,7 @@ use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
-use crate::transform::sentient::analyses::{
-    CorrelatedEquivClasses, Liveness, PropagationAnalysis,
-};
+use crate::transform::sentient::analyses::{CorrelatedEquivClasses, Liveness, PropagationAnalysis};
 use crate::workload::Workload;
 
 /// `-dcc-reuse-loop-iterator-arguments-disable`, `cl::init(false)` (`:57-60`).
@@ -508,7 +506,7 @@ mod unit_tests {
     use crate::islands::sentient::dialects::sentient::StoreSource;
     use crate::islands::sentient::dialects::{Op, Val, sentient};
     use crate::transform::sentient::analyses::{
-        CorrelatedEquivClass, CorrelatedEquivClasses, Liveness, PropagationAnalysis,
+        CorrelatedEquivClass, CorrelatedEquivClasses, Liveness, PropagationAnalysis, VirtualAssigns,
     };
 
     /// `%out = sentient.scalar_add %lhs, %rhs : index`.
@@ -599,6 +597,22 @@ mod unit_tests {
         fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {}
         fn is_live_range_overlaps(&self, _v1: Val, _v2: Val) -> bool {
             false
+        }
+
+        fn clear(&mut self, _virtual_assigns: VirtualAssigns) {
+            todo!("no unit here clears this fake")
+        }
+
+        fn compute_register_live_range(&mut self, _unit: &[Op]) {
+            todo!("no unit here recomputes this fake")
+        }
+
+        fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {
+            todo!("no unit here links optional assignments through this fake")
+        }
+
+        fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
+            todo!("no unit here links enforced assignments through this fake")
         }
     }
 
