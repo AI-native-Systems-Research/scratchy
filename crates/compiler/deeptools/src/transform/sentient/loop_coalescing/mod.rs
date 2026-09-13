@@ -81,23 +81,33 @@
 //! | `e445_coalesceLoops` | 445 | 2 | 165 | `dcc/src/Transform/Sentient/LoopCoalescing.cpp:135` |
 //! | `e563_runOnOperation` | 563 | 4 | 74 | `dcc/src/Transform/Sentient/LoopCoalescing.cpp:302` |
 
-// ⛔ NOTHING IN THIS FILE HAS A CALLER YET and CI runs clippy with `-D warnings`. e445 consumes
-// `split_bounds` and `is_all_less_than_max`, but `get_candidate_loops`, [`MaxLoops`] and
-// [`ProcessedLoops::mark`]/[`ProcessedLoops::holds`] belong to `e563_runOnOperation`, which is what
-// walks the unit and calls the two of them. ⭐ REMOVE THIS WITH e563: that is the unit that wires the
-// pass up, and only then is an unused item here a real defect again.
+// ⛔ THE PASS ENTRY ITSELF STILL HAS NO CALLER and CI runs clippy with `-D warnings`. e563 wired the
+// rest of this file up — `get_candidate_loops`, [`MaxLoops`], [`ProcessedLoops`] and [`coalesce_loops`]
+// are all reached now — but nothing yet RUNS the sentient pass pipeline, so [`run_on_operation`] and
+// everything only it reaches are still unused. ⭐ REMOVE THIS WITH THE PASS DRIVER.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
+
+use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
     DbgNamePrefix, new_dbg_name_from_list,
 };
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, Val, sentient, uniform, use_count,
 };
-use crate::transform::sentient::ForRef;
-use crate::transform::sentient::utils::{ConstKind, InBlock, is_constant};
+use crate::model::Model;
+use crate::transform::sentient::analyses::InstructionEstimator;
+use crate::transform::sentient::enhanced_dead_variable_elimination::EnhancedDeadVariableElimination;
+use crate::transform::sentient::utils::{
+    ConstKind, InBlock, RedundantIterArgs, find_and_replace_redundant_iter_args_used_in_conditions,
+    is_constant,
+};
+use crate::transform::sentient::{ForRef, IterArgIndex};
+use crate::workload::Workload;
 
 /// A loop's trip count — `sentient.for`'s `$bound`, and what coalescing multiplies together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -173,6 +183,32 @@ pub(crate) fn is_all_less_than_max(new_bounds: &[TripCount], max: TripLimit) -> 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
+    use crate::transform::sentient::analyses::OutOfScopeInstructionEstimator;
+    use crate::units::DfirUnit;
+
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     /// `splitBounds`' own use (`:421-422`): a bound over one LCCR reduces to a divisor that fits, and
     /// the cofactor is exact.
@@ -413,6 +449,76 @@ mod unit_tests {
                 carried(Val(11), Val(21), Val(22)),
                 vec![Op::Sentient(sentient::Op::Yield {
                     results: vec![Val(21)],
+                })]
+            )
+        );
+    }
+
+
+    /// e563 — the pass entry walks a unit's own body: the two-deep perfect nest coalesces into its
+    /// outermost loop, the product lands in the program preamble, and ⚠️ THE ESTIMATOR IS NEVER ASKED,
+    /// so its `todo!` does not fire.
+    #[test]
+    fn e563_coalesces_the_nest_of_a_program_unit_without_asking_the_estimator() {
+        let inner = sentient_for(
+            Val(20),
+            Val(2),
+            carried(Val(11), Val(21), Val(22)),
+            vec![Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(21)],
+            })],
+        );
+        let outer = sentient_for(
+            Val(10),
+            Val(1),
+            carried(Val(0), Val(11), Val(12)),
+            vec![
+                inner,
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(22)],
+                }),
+            ],
+        );
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Pe, Val(0)),
+                    precision: None,
+                    body: vec![constant(Val(1), 8), constant(Val(2), 4), outer],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+        for _ in 0..30 {
+            let _ = values.mint();
+        }
+
+        run_on_operation(
+            &mut program,
+            &mut values,
+            &mut OutOfScopeInstructionEstimator,
+        );
+
+        // `8 * 4`, minted by the `const_builder` the reference points at the unit's own block.
+        assert_eq!(program.preamble, vec![constant(Val(30), 32)]);
+        let body = &program.units.iter().next().expect("one unit").body;
+        assert_eq!(
+            body[2],
+            sentient_for(
+                Val(10),
+                Val(30),
+                carried(Val(0), Val(11), Val(12)),
+                vec![Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(11)],
                 })]
             )
         );
@@ -979,7 +1085,192 @@ fn carried_of(op: &Op) -> &[sentient::Carried] {
     carried
 }
 
-// crustify:todo: e563_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:302  (74 body lines, level 4)
-//   original  : void runOnOperation()
-//   calls     : e252_size, e311_getCandidateLoops, e445_coalesceLoops, e498_updateForOperation, e546_findAndReplaceRedundantIterArgsUsedInConditions
+/// `-dcc-loop-coalescing-disable`, `cl::init(false)` (`:41-43`) — a `dcc-opt` command-line flag, not a
+/// program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `-dcc-redundant-iter-arg-elim-disable`, `cl::init(false)` (`:45-48`).
+const DISABLE_REDUDANT_ITER_ARG_ELIM: bool = false;
+
+/// `opts_.OptLevel == 0` (`:309`) — ⛔ NOT A `dcc-opt` FLAG BUT A BUILD OPTION:
+/// `CommonPassOptions::OptLevel` defaults to `-1` (`dcc/tools/Options/dcc-pass-option.h:117`), so an
+/// ordinary build never asks the estimator and coalesces every unit.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// ONE STEP FROM A BLOCK INTO A REGION NESTED IN IT — `(the op's position, which of its regions)`.
+type NestStep = (usize, usize);
+
+/// WHICH END OF A NEST `unit.walk` REACHES FIRST — `mlir::WalkOrder`, and this pass needs BOTH: the
+/// band collection is pre-order (`:321`) and the iter-arg elimination post-order (`:361`) because
+/// *"cloning clobbers any inner loops"* (`:359-360`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkOrder {
+    /// Outermost loop first.
+    PreOrder,
+    /// Innermost loop first.
+    PostOrder,
+}
+
+/// The block `nest` names — one region per step. `&[]` is the unit's own body.
+fn block_at<'a>(unit_body: &'a [Op], nest: &[NestStep]) -> Option<&'a [Op]> {
+    let mut block: &[Op] = unit_body;
+    for (at, region) in nest {
+        block = *dialects::regions_ref(block.get(*at)?).get(*region)?;
+    }
+    Some(block)
+}
+
+/// [`block_at`], for the rewrite.
+fn block_at_mut<'a>(unit_body: &'a mut Vec<Op>, nest: &[NestStep]) -> Option<&'a mut Vec<Op>> {
+    let mut block: &mut Vec<Op> = unit_body;
+    for (at, region) in nest {
+        block = dialects::regions_mut(block.get_mut(*at)?)
+            .into_iter()
+            .nth(*region)?;
+    }
+    Some(block)
+}
+
+/// Every `sentient.for` under the unit in `order`, each with the region path down to its block and its
+/// position there — `unit.walk<WalkOrder::..>([&](sentient::ForOp op) { .. })`.
+///
+/// ⭐ THE MECHANISM AN `Operation *` REPLACES: the reference's handle knows its own block, so it walks
+/// once and keeps pointers. [`ForRef`] is an identity, so the position is re-derived per use — which is
+/// what makes it safe for [`coalesce_loops`] to move ops between the two walks.
+fn for_sites(unit_body: &[Op], order: WalkOrder) -> Vec<(Vec<NestStep>, InBlock, ForRef)> {
+    fn walk(
+        block: &[Op],
+        order: WalkOrder,
+        path: &mut Vec<NestStep>,
+        out: &mut Vec<(Vec<NestStep>, InBlock, ForRef)>,
+    ) {
+        for (at, op) in block.iter().enumerate() {
+            let this = match op {
+                Op::Sentient(sentient::Op::For { iv, .. }) => Some((path.clone(), InBlock(at), ForRef(*iv))),
+                _ => None,
+            };
+            if order == WalkOrder::PreOrder {
+                out.extend(this.clone());
+            }
+            for (region, body) in dialects::regions_ref(op).into_iter().enumerate() {
+                path.push((at, region));
+                walk(body, order, path, out);
+                path.pop();
+            }
+            if order == WalkOrder::PostOrder {
+                out.extend(this);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(unit_body, order, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Replaces: e563_runOnOperation
+///
+/// Coalesces every perfect loop nest of every program unit, then replaces the redundant `const ± IV`
+/// iter args of every loop and drops the positions that leaves dead.
+///
+/// ⛔ TRAP: `if (DisableRedudantIterArgElim) return;` (`:357`) SITS INSIDE THE PER-UNIT LOOP, so that
+/// flag would also skip the COALESCING of every later unit. It defaults off, so the reference never
+/// takes it — but it is a `return` and not a `continue`, and this port keeps that.
+/// ⚠️ THE ESTIMATOR IS ONLY ASKED AT `-O0`, and it is out of campaign scope: the `&&` short circuit is
+/// what keeps [`InstructionEstimator::have_ibuff_space`]'s `todo!` out of a default build.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+    instruction_estimator: &mut impl InstructionEstimator,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    let Program {
+        preamble, units, ..
+    } = program;
+    for unit in units.iter_mut() {
+        if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        let mut processed = ProcessedLoops::default();
+        // *"First collect groups of loops to be coalesced. Each group will contain at least two loops
+        // and there will be no overlaps"* (`:318-320`) — the `PROCESSED` mark is what makes that true.
+        let mut bands: Vec<Vec<ForRef>> = Vec::new();
+        for (nest, at, for_op) in for_sites(&unit.body, WalkOrder::PreOrder) {
+            if processed.holds(for_op) {
+                continue;
+            }
+            let (Some(scope), Some(root)) = (
+                block_at(&unit.body, &nest),
+                block_at(&unit.body, &nest).and_then(|scope| scope.get(at.0)),
+            ) else {
+                continue;
+            };
+            let band = get_candidate_loops(root, scope, MaxLoops::UNLIMITED);
+            // `if (loops.size() < 2) return;` (`:325`).
+            if band.len() < 2 {
+                continue;
+            }
+            for loop_op in &band {
+                processed.mark(*loop_op);
+            }
+            bands.push(band);
+        }
+
+        // ⭐ ONE `const_builder` FOR THE WHOLE UNIT (`:316-317`): its cursor carries across bands, so
+        // the constants come out in the order the bands were coalesced.
+        let mut const_at = InBlock(0);
+        for band in bands {
+            let Some((nest, at)) = site_of(&unit.body, band[0]) else {
+                continue;
+            };
+            let Some(block) = block_at_mut(&mut unit.body, &nest) else {
+                continue;
+            };
+            let mut builders = Builders {
+                preamble: &mut *preamble,
+                const_at,
+                block,
+                at,
+                vals: &mut *values,
+            };
+            coalesce_loops(&band, &mut builders, &mut processed);
+            const_at = builders.const_at;
+        }
+
+        if DISABLE_REDUDANT_ITER_ARG_ELIM {
+            return;
+        }
+        for (_, _, for_op) in for_sites(&unit.body, WalkOrder::PostOrder) {
+            let mut to_delete: Vec<IterArgIndex> = Vec::new();
+            if find_and_replace_redundant_iter_args_used_in_conditions(
+                &mut unit.body,
+                for_op,
+                values,
+                &mut to_delete,
+            ) != RedundantIterArgs::ToDelete
+            {
+                continue;
+            }
+            // `EnhancedDeadVariableEliminationPass eve(opts_)` (`:370`) is FRESH each turn, so its
+            // influence analysis is empty and only the named positions decide.
+            let deleted: BTreeSet<usize> =
+                to_delete.iter().map(|index| index.0 as usize).collect();
+            let Some((nest, at)) = site_of(&unit.body, for_op) else {
+                continue;
+            };
+            let Some(block) = block_at_mut(&mut unit.body, &nest) else {
+                continue;
+            };
+            EnhancedDeadVariableElimination::default().update_for_operation(block, at.0, &deleted);
+        }
+    }
+}
+
+/// WHERE A LOOP SITS IN THE UNIT — the region path down to its block, and its position in that block.
+fn site_of(unit_body: &[Op], loop_op: ForRef) -> Option<(Vec<NestStep>, InBlock)> {
+    for_sites(unit_body, WalkOrder::PreOrder)
+        .into_iter()
+        .find(|(_, _, found)| *found == loop_op)
+        .map(|(nest, at, _)| (nest, at))
+}

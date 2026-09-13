@@ -98,8 +98,11 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::formats::Bits;
+use crate::islands::dataflow_ir::Values;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
 use crate::islands::sentient::print;
+use crate::transform::sentient::analyses::UniformGroups;
+use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
 
 use self::register_init_info::{RegisterInitInfo, SsaWeights};
 
@@ -316,10 +319,35 @@ pub fn move_ssa_to_init(scope: &mut [Op], val: Val) {
     }
 }
 
-// crustify:todo: e570_getFirstSource
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:788  (5 body lines, level 4)
-//   original  : mlir::Value getFirstSource(mlir::Value core, mlir::Value val, OpBuilder &const_builder)
-//   calls     : e517_getSource
+/// Replaces: e570_getFirstSource
+///
+/// The value [`register_init_candidate_promoter::get_source`] pairs with the FIRST unit — the one
+/// source that stands for all of them once the clones are in place.
+///
+/// ⛔ TRAP: THE CLONING IS NOT DISCARDED WITH THE LIST. `tmp_uvs` is local, but `getSource` clones
+/// each source to the top of the unit body and records erasures as it goes, and those survive.
+/// ⛔ `values().front()` ON AN EMPTY LIST IS A DANGLING READ; `None` is that and the reference's own
+/// null first value, which `normalizeNullValues` leaves in place for an all-null list.
+pub fn get_first_source<U: UniformGroups>(
+    unit: &mut Vec<Op>,
+    core: Val,
+    val: Val,
+    to_be_erased: &mut BTreeSet<Val>,
+    values: &mut Values,
+    uga: &U,
+) -> Option<Val> {
+    let mut tmp_uvs = UnitsAndTheirValues::default();
+    register_init_candidate_promoter::get_source(
+        unit,
+        core,
+        val,
+        &mut tmp_uvs,
+        to_be_erased,
+        values,
+        uga,
+    );
+    tmp_uvs.pairs.first().and_then(|(_unit, value)| *value)
+}
 
 // crustify:todo: e631_promoteRegisterInitCandidatesAboveUniformRegion
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1036  (5 body lines, level 6)
@@ -335,13 +363,64 @@ pub fn move_ssa_to_init(scope: &mut [Op], val: Val) {
 mod unit_tests {
     use super::register_init_info::{RegisterInitInfo, SsaWeight, SsaWeights};
     use super::{
-        dump_weight, dump_weights, erase_deleted_ops, has_same_attr, move_ssa_to_init,
-        remove_init_attr_from_ops,
+        dump_weight, dump_weights, erase_deleted_ops, get_first_source, has_same_attr,
+        move_ssa_to_init, remove_init_attr_from_ops,
     };
     use crate::formats::Bits;
+    use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::islands::sentient::dialects::{Op, Val, dataflow, sentient};
+    use crate::transform::sentient::analyses::UniformGroups;
+    use crate::units::{DfirUnit, Residency};
     use std::collections::BTreeSet;
+
+    /// The out-of-scope group analysis, answering for ONE leader with no followers.
+    struct OneUnit(Val);
+
+    impl UniformGroups for OneUnit {
+        fn group_leaders(&self) -> Vec<Val> {
+            vec![self.0]
+        }
+
+        fn is_group_leader(&self, unit: Val) -> bool {
+            unit == self.0
+        }
+
+        fn group_members_led_by(&self, _leader: Val) -> Vec<Val> {
+            Vec::new()
+        }
+    }
+
+    /// e570 — the first (and here only) pair's value is the candidate's source; a candidate that is
+    /// not a `sentient.scalar_copy` pairs nothing, which is `values().front()` of an empty list.
+    #[test]
+    fn e570_takes_the_first_paired_source_and_nothing_from_a_non_copy() {
+        let mut unit = vec![
+            Op::Dataflow(dataflow::Op::GetUnit {
+                result: Val(1),
+                residency: Residency::Global,
+                unit: DfirUnit::L3lu,
+                num_folds: None,
+            }),
+            // The source `%7` is defined outside this unit, so nothing is cloned or erased.
+            copy(7, 8, None, false),
+        ];
+        let uga = OneUnit(Val(1));
+        let mut to_be_erased = BTreeSet::new();
+        let mut values = Values::default();
+        for _ in 0..9 {
+            let _ = values.mint();
+        }
+        assert_eq!(
+            get_first_source(&mut unit, Val(1), Val(8), &mut to_be_erased, &mut values, &uga),
+            Some(Val(7))
+        );
+        assert!(to_be_erased.is_empty());
+        assert_eq!(
+            get_first_source(&mut unit, Val(1), Val(1), &mut to_be_erased, &mut values, &uga),
+            None
+        );
+    }
 
     /// `%r = sentient.scalar_copy %in`, in or out of the program header and at a width.
     fn copy(input: u32, result: u32, element_size: Option<Bits>, program_header: bool) -> Op {

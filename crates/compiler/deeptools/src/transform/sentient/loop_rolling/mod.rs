@@ -97,11 +97,6 @@
 // ── STILL SCHEDULED IN THIS FILE (levels 1..8) — anchors, not dead comments. ⛔ Do not delete one
 // you did not port; on bridge 2 that silently lost 149 of 384 functions.
 
-// crustify:todo: e565_collectDeltasOfOperands
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:392  (109 body lines, level 4)
-//   original  : bool collectDeltasOfOperands(Window *start_window, Operation &op_a, Operation &op_b, MatchedOp *matched_op)
-//   calls     : e077_isIncrementField, e083_computeValsIfDifferent, e510_insertOperandKind, e511_insertOperandDelta
-
 // crustify:todo: e602_compareToNextWindow
 //   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:321  (67 body lines, level 5)
 //   original  : bool compareToNextWindow(bool is_start_window, Window *cur_window, Window *next_window)
@@ -134,8 +129,11 @@ use std::collections::BTreeMap;
 
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::{self, Definitions, Op, Val, sentient, symbol, uniform};
+use crate::islands::sentient::dialects::{
+    self, Definitions, Op, Val, dataflow, sentient, symbol, uniform,
+};
 use crate::transform::sentient::skeleton;
+use crate::units::DfirUnit;
 
 /// WHERE AN INSTRUCTION SITS IN THE BLOCK BEING ROLLED — `Block::iterator`.
 ///
@@ -663,6 +661,54 @@ pub(crate) fn is_increment_field(op: &Op, i: OperandIdx) -> bool {
     }
 }
 
+/// `isImmutableAddressLXAddress(op, i, const_builder)` — `Analyses/Utils.cpp:307-326`: is operand `i`
+/// an `$immutable_addr` whose base address is on the LX?
+///
+/// ⛔ NOT AN ANCHORED UNIT. It lives in `Transform/Sentient/Analyses/`, outside the campaign's 656
+/// definitions, but it is small and pure — the precedent is `loop_merging`'s
+/// `is_sum_less_than_lccr_max_value`. ⭐ A `load_and_store` HAS TWO, and each asks about ITS OWN END.
+fn is_immutable_address_lx_address(op: &Op, i: OperandIdx, defs: Definitions<'_>) -> bool {
+    match op {
+        // Operand 1 of all four, whose base address is the unit the op itself runs on.
+        Op::Sentient(
+            sentient::Op::ReceiveAndStore { .. }
+            | sentient::Op::LoadAndSend { .. }
+            | sentient::Op::LoadAndExtractScalar { .. }
+            | sentient::Op::LoadComputeAndSend { .. },
+        ) => i == OperandIdx(1),
+        Op::Sentient(sentient::Op::LoadAndStore { src, dst, .. }) => match i {
+            OperandIdx(3) => is_lx_unit(*src, defs),
+            OperandIdx(6) => is_lx_unit(*dst, defs),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `isLXUnit(src)` — `Analyses/Utils.cpp:328-343`, through
+/// `getUnitTypeFromUniformMappingAsString` (`Dialect/Uniform/Utils.cpp:258-283`).
+///
+/// ⛔ THE MAPPING ARM READS `getValues()[0]` AND ASKS NO AGREEMENT: it is the mapping's FIRST target,
+/// not the targets the key selects, which is why this is not `address_pinning_and_toggle`'s
+/// `unit_type_of`. The reference's `GetLocalUnitOp` arm has no island variant to match
+/// (`islands/dataflow_ir/dialects/dataflow.rs:78` — the lowering emits `get_unit`).
+fn is_lx_unit(val: Val, defs: Definitions<'_>) -> bool {
+    match defs.of(val) {
+        Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) => *unit == DfirUnit::Lx,
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => {
+            let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(*map)
+            else {
+                return false;
+            };
+            matches!(
+                pairs.first().and_then(|(_, value)| defs.of(*value)),
+                Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) if *unit == DfirUnit::Lx
+            )
+        }
+        _ => false,
+    }
+}
+
 /// WHICH RESULT OF WHICH OP DEFINES A VALUE — `getDefiningOp()` paired with
 /// `cast<OpResult>(..).getResultNumber()`.
 ///
@@ -837,6 +883,86 @@ impl LoopRollingManager {
             }
             _ => OperandDifference::Incomputable,
         }
+    }
+
+    /// Replaces: e565_collectDeltasOfOperands
+    ///
+    /// Classifies every operand of `op_b` against `op_a`'s, recording the kind — and for a constant
+    /// stride the delta — on `matched_op`, and refusing the match when one cannot be classified.
+    ///
+    /// ⛔ FOUR OPERANDS REFUSE THE WHOLE MATCH WHEN THEY DIFFER (`:414-459`): a transfer's
+    /// `$increment`, a `sentient.set_mask`'s mask, a loop's `$bound`, and — in the L3 case only — an
+    /// `$immutable_addr` on an LX base. ⭐ THE PAIRED READER IS [`Self::check_deltas_of_operands`],
+    /// which re-asks for exactly the kinds this one wrote.
+    pub(crate) fn collect_deltas_of_operands(
+        &mut self,
+        start_window: &Window,
+        op_a: InstrPos,
+        op_b: InstrPos,
+        matched_op: &mut MatchedOp,
+        block: &[Op],
+        key_vals: &[Val],
+        defs: Definitions<'_>,
+    ) -> bool {
+        let a_operands = dialects::operands(&block[op_a.0]);
+        let b_operands = dialects::operands(&block[op_b.0]);
+        for i in (0..a_operands.len()).rev() {
+            let i = OperandIdx(i);
+            let a_operand = a_operands[i.0];
+            // See [`Self::check_deltas_of_operands`] on the reference's unchecked `op_b` index.
+            let Some(b_operand) = b_operands.get(i.0).copied() else {
+                return false;
+            };
+
+            if a_operand == b_operand {
+                matched_op.insert_operand_kind(i, OperandKind::NoDelta);
+                continue;
+            }
+
+            if is_increment_field(&block[op_a.0], i)
+                || matches!(&block[op_a.0], Op::Sentient(sentient::Op::SetMask { .. }))
+            {
+                return false;
+            }
+            // `dyn_cast<sentient::ForOp>(op_a)` and `a_operand == for_op_a.getBound()`: a loop whose
+            // bound is a block argument is not one this pass rolls.
+            if let Op::Sentient(sentient::Op::For { bound, .. }) = &block[op_a.0] {
+                if a_operand == *bound {
+                    return false;
+                }
+            }
+            if self.case == RollingCase::L3SoftSyncWindows
+                && is_immutable_address_lx_address(&block[op_a.0], i, defs)
+            {
+                return false;
+            }
+
+            // `op_b` (the next window's first rollable op) reading one of the start window's last
+            // rollable op's results.
+            if start_window.first_rollable_op == Some(op_a) {
+                if let Some((at, res_num)) = defining_result(b_operand, block) {
+                    if start_window.last_rollable_op == Some(at) {
+                        self.operand_to_result_num.insert(i, res_num);
+                        matched_op.insert_operand_kind(i, OperandKind::FirstLastOpUsage);
+                        continue;
+                    }
+                }
+            }
+
+            match LoopRollingManager::compute_vals_if_different(a_operand, b_operand, key_vals, defs)
+            {
+                OperandDifference::Delta(delta) if delta != Delta(0) => {
+                    matched_op.insert_operand_delta(i, delta);
+                    matched_op.insert_operand_kind(i, OperandKind::ConstValueDelta);
+                }
+                // `delta == 0`, and `Same` is the reference's untouched pre-set 0.
+                OperandDifference::Delta(_) | OperandDifference::Same => {
+                    matched_op.insert_operand_kind(i, OperandKind::NoDelta);
+                }
+                OperandDifference::Incomputable => return false,
+            }
+        }
+        true
     }
 
     /// Replaces: e317_checkDeltasOfOperands
@@ -1343,6 +1469,62 @@ mod unit_tests {
             InstrPos(3),
             &matched_op,
             &block,
+            &[],
+            defs
+        ));
+    }
+
+    /// `e565_collectDeltasOfOperands` — the differing constant operand is recorded as a stride and the
+    /// shared one as no delta; ⛔ a differing `$increment` refuses the whole pair.
+    #[test]
+    fn collect_deltas_of_operands_records_the_stride_and_refuses_an_increment() {
+        let block = vec![
+            scalar_constant(Val(0), 4),
+            scalar_constant(Val(1), 10),
+            add(Val(0), Val(9), Val(2)),
+            add(Val(1), Val(9), Val(3)),
+        ];
+        let regions: [&[Op]; 1] = [&block];
+        let defs = Definitions::from_innermost(&regions);
+        let mut manager = LoopRollingManager::over(
+            RollingCase::SingleInstrWindows,
+            NewLoopCount(0),
+            WindowIndex(0),
+            WindowIndex(2),
+        );
+        let window = Window::opening(RollingCase::SingleInstrWindows, InstrPos(2));
+        let mut matched_op = MatchedOp::of(InstrPos(2));
+        assert!(manager.collect_deltas_of_operands(
+            &window,
+            InstrPos(2),
+            InstrPos(3),
+            &mut matched_op,
+            &block,
+            &[],
+            defs
+        ));
+        assert_eq!(
+            matched_op.operand_kind(OperandIdx(0)),
+            OperandKind::ConstValueDelta
+        );
+        assert_eq!(
+            matched_op.operand_deltas.get(&OperandIdx(0)),
+            Some(&Delta(6))
+        );
+        assert_eq!(matched_op.operand_kind(OperandIdx(1)), OperandKind::NoDelta);
+
+        // A pair of transfers whose `$increment` differs, which is operand 2 of both.
+        let mut second = receive_and_store();
+        dialects::set_operand(&mut second, 2, Val(30));
+        let transfers = vec![receive_and_store(), second];
+        let regions: [&[Op]; 1] = [&transfers];
+        let defs = Definitions::from_innermost(&regions);
+        assert!(!manager.collect_deltas_of_operands(
+            &Window::opening(RollingCase::SingleInstrWindows, InstrPos(0)),
+            InstrPos(0),
+            InstrPos(1),
+            &mut MatchedOp::of(InstrPos(0)),
+            &transfers,
             &[],
             defs
         ));

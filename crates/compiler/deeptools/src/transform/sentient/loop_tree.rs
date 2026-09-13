@@ -16,7 +16,7 @@
 // `-D warnings`. ⭐ REMOVE THIS WITH e600.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::bridges::dataflow_ir_to_sentient::vc_loop_mask_tree::{
     OperationNodeId, OperationTreeBase,
@@ -160,6 +160,29 @@ impl<const HEIGHTS: bool> LoopTree<HEIGHTS> {
     /// for what "does not free the storage" buys.
     pub fn remove(&mut self, n: LoopNodeId) {
         self.tree.remove(n.0);
+    }
+
+    /// `OperationNode::reverseBreadthFirstWalk(n, action)` — `Analysis/OperationTree.cpp:200-236`, the
+    /// order `WalkOrder::kReverseBFS` walks in (`:100-102`, so `keep_order` is `false`).
+    ///
+    /// ⛔⛔ THE VISIT LIST IS PRECOMPUTED AND THE ACTION'S RETURN IS DISCARDED — `stack.push_back` runs
+    /// the whole BFS first and then `(void)action(stack.back())` unwinds it. So an action of this walk
+    /// may rewrite the IR and [`Self::remove`] nodes as it goes, and a `LoopNode *` it returns to steer
+    /// the walk is DEAD CODE, which is exactly what `LoopMerging`'s `checkAndMerge` returns.
+    #[must_use]
+    pub fn walk_reverse_bfs(&self) -> Vec<LoopNodeId> {
+        let mut queue = VecDeque::from([self.root()]);
+        let mut out = Vec::new();
+        while let Some(n) = queue.pop_front() {
+            out.push(n);
+            let mut child = self.first_child(n);
+            while let Some(c) = child {
+                queue.push_back(c);
+                child = self.next_sibling(c);
+            }
+        }
+        out.reverse();
+        out
     }
 
     /// Every node, root first — the pre-order walk the two total helpers here need.

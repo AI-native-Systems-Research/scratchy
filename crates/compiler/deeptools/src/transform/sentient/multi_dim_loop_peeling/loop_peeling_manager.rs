@@ -82,13 +82,15 @@
 //! | `e604_findCandidates` | 604 | 5 | 30 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:402` |
 //! | `e630_run` | 630 | 6 | 130 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:607` |
 
-use super::{Peeling, PeelingCandidates};
+use super::{IvLoopInfo, Peeling, PeelingCandidates};
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::sentient::dialects::{
-    self, Op, StaticBranch, Val, replace_if_with_region, sentient, static_if_branch, static_operand,
+    self, Definitions, Op, StaticBranch, Val, replace_if_with_region, sentient, static_if_branch,
+    static_operand,
 };
 use crate::transform::sentient::ForRef;
+use crate::transform::sentient::utils::reverse_predicate;
 
 /// WHERE ONE OP SITS IN A REGION TREE — the block reached by taking region `r` of the op at index `i`
 /// for each `(i, r)` of `into`, then index `at` in that block.
@@ -351,13 +353,93 @@ fn next_static_if(candidates: IfOpsToSimplify, block: &[Op]) -> Option<(RegionPa
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        IfOpsToSimplify, Peeling, PeelingCandidates, PredicatesOnIv, copy_one_iter,
-        decrement_predicates_on_iv, perform_loop_peeling, simplify_conditionals,
+        IfOpsToSimplify, IvLoopInfo, Peeling, PeelingCandidates, PredicatesOnIv, compute_peeling_info,
+        copy_one_iter, decrement_predicates_on_iv, perform_loop_peeling, simplify_conditionals,
     };
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
     use crate::transform::sentient::ForRef;
+
+    /// e568 — on a loop of bound 8 (whose IV counts 8 down to 1) `%iv >= 8` names the FIRST
+    /// iteration and reads the same way with the operands swapped, `%iv > 1` names the LAST, and a
+    /// loop of bound 1 is refused before any of that.
+    #[test]
+    fn e568_reads_the_comparison_with_the_iv_on_the_left() {
+        let block = vec![
+            constant(8, Val(1)),
+            constant(1, Val(2)),
+            for_loop(
+                Val(3),
+                Val(1),
+                Vec::new(),
+                vec![
+                    if_op(
+                        sentient::CmpPredicate::Sge,
+                        Val(3),
+                        Val(1),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    if_op(
+                        sentient::CmpPredicate::Sle,
+                        Val(1),
+                        Val(3),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    if_op(
+                        sentient::CmpPredicate::Sgt,
+                        Val(3),
+                        Val(2),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                ],
+            ),
+        ];
+        let regions = [block.as_slice()];
+        let defs = Definitions::from_innermost(&regions);
+        let Op::Sentient(sentient::Op::For { body, .. }) = &block[2] else {
+            panic!("the loop is a sentient.for")
+        };
+        let mut ivs = IvLoopInfo::default();
+        assert_eq!(
+            compute_peeling_info(&body[0], &mut ivs, defs),
+            Some((ForRef(Val(3)), Peeling::FirstIterOnly))
+        );
+        // `8 <= %iv` is `%iv >= 8` reversed, and answers the same end.
+        assert_eq!(
+            compute_peeling_info(&body[1], &mut ivs, defs),
+            Some((ForRef(Val(3)), Peeling::FirstIterOnly))
+        );
+        assert_eq!(
+            compute_peeling_info(&body[2], &mut ivs, defs),
+            Some((ForRef(Val(3)), Peeling::LastIterOnly))
+        );
+
+        let small = vec![
+            constant(1, Val(11)),
+            for_loop(
+                Val(12),
+                Val(11),
+                Vec::new(),
+                vec![if_op(
+                    sentient::CmpPredicate::Sge,
+                    Val(12),
+                    Val(11),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+            ),
+        ];
+        let regions = [small.as_slice()];
+        let defs = Definitions::from_innermost(&regions);
+        let Op::Sentient(sentient::Op::For { body, .. }) = &small[1] else {
+            panic!("the loop is a sentient.for")
+        };
+        assert_eq!(compute_peeling_info(&body[0], &mut ivs, defs), None);
+    }
 
     /// `%c = scalar_constant N : index`.
     fn constant(value: i64, result: Val) -> Op {
@@ -963,10 +1045,67 @@ pub fn perform_loop_peeling(
     }
 }
 
-// crustify:todo: e568_computePeelingInfo
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:351  (49 body lines, level 4)
-//   original  : std::pair<sentient::ForOp, LoopPeelingManager::PeelingType> LoopPeelingManager::computePeelingInfo(sentient::IfOp if_op)
-//   calls     : e245_reversePredicate, e515_getOrCreateTupleForIV
+/// Replaces: e568_computePeelingInfo
+///
+/// Which loop one `sentient.if` lets us peel, and at which end: the comparison is read with the
+/// induction variable on the left, and a constant one off either end names that end's iteration.
+///
+/// ⛔ TRAP: A BARE `sentient.for` IV COUNTS DOWN, so `first_val` is the loop's BOUND and `last_val`
+/// is 1 — see [`crate::transform::sentient::utils::for_loop_info_if_iv`]. The `DT_CHECK_MSG(last_val
+/// == 1, ..)` (`:381`) is unwritable here because `NormalizedIv::Rejected` guarantees it.
+/// ⛔ TRAP: A BOUND OF 0 OR 1 IS REFUSED (`:371-373`) — `LightweightSimplifications` removes it.
+pub fn compute_peeling_info(
+    if_op: &Op,
+    ivs: &mut IvLoopInfo,
+    defs: Definitions<'_>,
+) -> Option<(ForRef, Peeling)> {
+    let Op::Sentient(sentient::Op::If {
+        predicate,
+        lhs,
+        rhs,
+        ..
+    }) = if_op
+    else {
+        return None;
+    };
+    // The two attempts of `:355-369`. ⭐ `isa<BlockArgument>` GUARDS A NULL `getDefiningOp()` ONLY,
+    // and a value with no definition in scope answers `None` here without the guard.
+    let (info, const_value, rhs_is_const) = match (ivs.get_or_create(*lhs, defs), constant(*rhs, defs))
+    {
+        (Some(info), Some(value)) => (info, value, true),
+        _ => match (ivs.get_or_create(*rhs, defs), constant(*lhs, defs)) {
+            (Some(info), Some(value)) => (info, value, false),
+            _ => return None,
+        },
+    };
+    if info.lower_bound <= 1 {
+        return None;
+    }
+
+    let (first_val, last_val) = (info.lower_bound, info.upper_bound);
+    let predicate = if rhs_is_const {
+        *predicate
+    } else {
+        reverse_predicate(*predicate)
+    };
+    use sentient::CmpPredicate::{Eq, Ne, Sge, Sgt, Sle, Slt};
+    let peeling = match (const_value, predicate) {
+        (v, Sge | Eq | Ne | Slt) if v == first_val => Peeling::FirstIterOnly,
+        (v, Sgt | Sle) if v == first_val - 1 => Peeling::FirstIterOnly,
+        (v, Sgt | Eq | Ne | Sle) if v == last_val => Peeling::LastIterOnly,
+        (v, Sge | Slt) if v == last_val + 1 => Peeling::LastIterOnly,
+        _ => return None,
+    };
+    Some((info.loop_op, peeling))
+}
+
+/// `dyn_cast<sentient::ConstantOp>(value.getDefiningOp()).getValue()`.
+fn constant(value: Val, defs: Definitions<'_>) -> Option<i64> {
+    match defs.of(value) {
+        Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => Some(*value),
+        _ => None,
+    }
+}
 
 // crustify:todo: e604_findCandidates
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:402  (30 body lines, level 5)

@@ -91,10 +91,12 @@ use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, dataflow, erase_defining_op, replace_all_uses_with, sentient, symbol,
-    uniform, use_count,
+    Definitions, Op, Val, dataflow, erase_defining_op, regions_mut, regions_ref,
+    replace_all_uses_with, sentient, symbol, uniform, use_count,
 };
+use crate::transform::sentient::ForRef;
 use crate::transform::sentient::loop_coalescing::TripLimit;
+use crate::transform::sentient::loop_tree::LoopTree;
 use crate::transform::sentient::regions_are_equivalent;
 use crate::transform::sentient::utils::{ConstKind, ConstantImm, constant_imm, is_constant};
 
@@ -228,44 +230,71 @@ impl MergeablePair {
 pub struct MergeSite<'u> {
     /// The `dataflow.program_unit`'s own block.
     pub unit_body: &'u mut Vec<Op>,
-    /// The `sentient.for` positions from `unit_body` down to the loops' shared block, outermost first.
-    /// EMPTY means the two loops are top-level, which is `getParentLoop() == getRoot()`.
-    pub nest: Vec<usize>,
+    /// The region path from `unit_body` down to the loops' shared block, outermost first. EMPTY means
+    /// the two loops are top-level, which is `getParentLoop() == getRoot()`.
+    pub nest: Vec<NestStep>,
 }
+
+/// ONE STEP FROM A BLOCK INTO A REGION NESTED IN IT — `(the op's position, which of its regions)`.
+///
+/// ⛔ NOT A CHAIN OF `sentient.for` BODIES. `LoopTree` makes two loops inside one `sentient.if` region
+/// SIBLINGS — *"a loop inside a `sentient.if` is a child of the loop AROUND the `if`"* — and the pairs
+/// this pass considers are pairs of tree siblings, so their shared block is any region on the way down.
+pub type NestStep = (usize, usize);
 
 /// WHETHER THE PAIR BECAME ONE LOOP — the `++loops_merged_count` the pass keeps (`:277`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Merged {
     /// The two loops are now one.
     Pair,
-    /// The site names no such pair — `DT_CHECK_MSG(parent, "did not expect root here")` (`:239`) among
-    /// them: two TOP-LEVEL loops whose bounds are neither constants nor query maps have nowhere for
-    /// the `sentient.scalar_add` to go.
+    /// The site names no such pair.
+    ///
+    /// ⛔ NOT `DT_CHECK_MSG(parent, "did not expect root here")` (`:239`), which CANNOT FIRE: the root
+    /// is synthetic and non-null (`new LoopNode(nullptr)`, `LoopTree.hpp:150`), so a top-level pair
+    /// reaches that arm and builds its `sentient.scalar_add` before the first top-level loop.
     NotMerged,
 }
 
-/// The block `nest` names — each position's `sentient.for` body in turn. `&[]` is `unit_body` itself.
-fn block_at<'a>(unit_body: &'a [Op], nest: &[usize]) -> Option<&'a [Op]> {
+/// The block `nest` names — one region per step. `&[]` is `unit_body` itself.
+fn block_at<'a>(unit_body: &'a [Op], nest: &[NestStep]) -> Option<&'a [Op]> {
     let mut block: &[Op] = unit_body;
-    for at in nest {
-        let Some(Op::Sentient(sentient::Op::For { body, .. })) = block.get(*at) else {
-            return None;
-        };
-        block = body;
+    for (at, region) in nest {
+        block = *regions_ref(block.get(*at)?).get(*region)?;
     }
     Some(block)
 }
 
 /// [`block_at`], for the rewrite.
-fn block_at_mut<'a>(unit_body: &'a mut Vec<Op>, nest: &[usize]) -> Option<&'a mut Vec<Op>> {
+fn block_at_mut<'a>(unit_body: &'a mut Vec<Op>, nest: &[NestStep]) -> Option<&'a mut Vec<Op>> {
     let mut block: &mut Vec<Op> = unit_body;
-    for at in nest {
-        let Some(Op::Sentient(sentient::Op::For { body, .. })) = block.get_mut(*at) else {
-            return None;
-        };
-        block = body;
+    for (at, region) in nest {
+        block = regions_mut(block.get_mut(*at)?).into_iter().nth(*region)?;
     }
     Some(block)
+}
+
+/// WHERE A LOOP SITS IN THE UNIT — the region path down to its block, and its position in that block.
+///
+/// ⭐ THE MECHANISM `LoopNode *` REPLACES: the C++ node holds an `Operation *` that knows its own
+/// block, so nothing has to be searched for. [`ForRef`] is an identity, so this finds it.
+fn site_of(unit_body: &[Op], loop_op: ForRef) -> Option<(Vec<NestStep>, InBlock)> {
+    fn search(block: &[Op], iv: Val, path: &mut Vec<NestStep>) -> Option<(Vec<NestStep>, InBlock)> {
+        for (at, op) in block.iter().enumerate() {
+            if matches!(op, Op::Sentient(sentient::Op::For { iv: this, .. }) if *this == iv) {
+                return Some((path.clone(), InBlock(at)));
+            }
+            for (region, body) in regions_ref(op).into_iter().enumerate() {
+                path.push((at, region));
+                let found = search(body, iv, path);
+                path.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    }
+    search(unit_body, loop_op.0, &mut Vec::new())
 }
 
 /// The `sentient.for` at `at`, as the four fields the merge reads.
@@ -345,9 +374,6 @@ pub fn merge_loops(site: MergeSite<'_>, pair: MergeablePair, values: &mut Values
             // `!first_query_map && !second_query_map` (`:235-247`) — a `sentient.scalar_add` BEFORE the
             // parent's first child, so no instruction lands between two otherwise mergeable loops.
             _ if !is_query_map(first_bound) && !is_query_map(second_bound) => {
-                if nest.is_empty() {
-                    return Merged::NotMerged;
-                }
                 BuiltBound::BeforeTheParentsFirstChild(Op::Sentient(sentient::Op::ScalarAdd {
                     lhs: first_bound,
                     rhs: second_bound,
@@ -478,7 +504,7 @@ fn loop_body_at(block: &[Op], at: InBlock) -> Option<&[Op]> {
 #[must_use]
 pub fn loops_are_mergeable(
     unit_body: &[Op],
-    nest: &[usize],
+    nest: &[NestStep],
     loop_a: InBlock,
     loop_b: InBlock,
 ) -> bool {
@@ -558,10 +584,59 @@ pub fn loops_are_mergeable(
     )
 }
 
-// crustify:todo: e564_runLoopMerging
-//   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:281  (39 body lines, level 4)
-//   original  : void LoopMergingPass::runLoopMerging(Operation *op)
-//   calls     : e316_mergeLoops, e508_loopsAreMergeable
+/// `++loops_merged_count` (`:277`) — how many pairs this pass turned into one loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct LoopsMerged(pub usize);
+
+/// Replaces: e564_runLoopMerging
+///
+/// Walks the unit's loop forest in reverse BFS, merging each node with its next sibling when
+/// [`loops_are_mergeable`] accepts the pair, and removing the absorbed node from the tree.
+///
+/// ⛔⛔ `checkAndMerge`'s `resume` STEERING IS DEAD under the default `-dcc-loop-merging-walk-order=rbfs`:
+/// [`LoopTree::walk_reverse_bfs`] precomputes the visit list and `(void)action(..)` discards the node
+/// returned, so the condition is exactly "has a next sibling, is not the root, and is mergeable".
+pub fn run_loop_merging(unit_body: &mut Vec<Op>, values: &mut Values) -> LoopsMerged {
+    let mut tree = LoopTree::<false>::of(unit_body);
+    // `if (!tree.empty()) tree.walk(..)` (`:315`).
+    if tree.empty() {
+        return LoopsMerged::default();
+    }
+    let mut merged = LoopsMerged::default();
+    for n in tree.walk_reverse_bfs() {
+        // `if (n == tree.getRoot() || !next_node) return resume;` (`:290`) — the root names no loop, so
+        // `loop_of` answering `None` IS that test.
+        let (Some(curr), Some(next)) = (tree.loop_of(n), tree.next_sibling(n)) else {
+            continue;
+        };
+        // ⭐ A NODE ALREADY REMOVED IS NEVER ACTED ON: `tree.remove` only ever takes a LATER sibling,
+        // and reverse BFS visited those FIRST — and its `sentient.for` is gone from the IR by then, so
+        // `site_of` no longer finds it either.
+        let (Some((nest, first)), Some((next_nest, second))) = (
+            site_of(unit_body, curr),
+            tree.loop_of(next).and_then(|l| site_of(unit_body, l)),
+        ) else {
+            continue;
+        };
+        // Two tree siblings in DIFFERENT blocks are never adjacent, which is `getNextEligibleOp`'s own
+        // answer inside `loopsAreMergeable` (`:85`).
+        if nest != next_nest {
+            continue;
+        }
+        let Some(pair) = block_at(unit_body, &nest).and_then(|b| MergeablePair::of(b, first)) else {
+            continue;
+        };
+        if pair.second != second || !loops_are_mergeable(unit_body, &nest, first, second) {
+            continue;
+        }
+        // *"We are merging iff we are returning curr_node to the guided walk"* (`:305-309`).
+        if merge_loops(MergeSite { unit_body, nest }, pair, values) == Merged::Pair {
+            merged.0 += 1;
+            tree.remove(next);
+        }
+    }
+    merged
+}
 
 // crustify:todo: e601_runOn
 //   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:321  (13 body lines, level 5)
@@ -731,5 +806,69 @@ mod unit_tests {
                 loop_over(Val(20), Val(10), Some("LM(a, b)")),
             ]
         );
+    }
+
+    /// The reverse-BFS walk merges a pair inside a `sentient.if` region as readily as a top-level one —
+    /// they are all root siblings — and ⛔ REFUSES THE CROSS-BLOCK PAIR the flattening puts beside it,
+    /// which is `getNextEligibleOp` seeing the `sentient.if` and not the loop inside it.
+    #[test]
+    fn e564_merges_both_sibling_pairs_and_not_the_pair_that_spans_two_blocks() {
+        let mut values = Values::default();
+        for _ in 0..30 {
+            let _ = values.mint();
+        }
+        let mut unit_body = vec![
+            constant_of(Val(0), 1),
+            constant_of(Val(1), 2),
+            constant_of(Val(2), 4),
+            constant_of(Val(3), 8),
+            loop_over(Val(0), Val(10), None),
+            loop_over(Val(1), Val(11), None),
+            Op::Sentient(sentient::Op::If {
+                predicate: sentient::CmpPredicate::Eq,
+                lhs: Val(0),
+                rhs: Val(1),
+                yielded: Vec::new(),
+                dbg_name: None,
+                then_body: vec![
+                    loop_over(Val(2), Val(12), None),
+                    loop_over(Val(3), Val(13), None),
+                ],
+                else_body: Vec::new(),
+            }),
+        ];
+
+        assert_eq!(
+            run_loop_merging(&mut unit_body, &mut values),
+            LoopsMerged(2)
+        );
+        let only_loop = |block: &[Op]| -> Val {
+            let bounds: Vec<Val> = block
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Sentient(sentient::Op::For { bound, .. }) => Some(*bound),
+                    _ => None,
+                })
+                .collect();
+            let [only] = bounds[..] else {
+                panic!("expected exactly one surviving loop, got {bounds:?}");
+            };
+            only
+        };
+        let Some(Op::Sentient(sentient::Op::If { then_body, .. })) = unit_body.last().cloned() else {
+            panic!("the `sentient.if` survives");
+        };
+        let (top, nested) = (only_loop(&unit_body), only_loop(&then_body));
+        // ⭐ BOTH MERGED BOUNDS LAND IN THE UNIT'S OWN BLOCK — `const_builder` is built from the
+        // `dataflow.program_unit`'s region, not from the block the loops share.
+        let scope: &[Op] = &unit_body;
+        let defs = Definitions::from_innermost(core::slice::from_ref(&scope));
+        let value_of = |bound: Val| match defs.of(bound) {
+            Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => *value,
+            other => panic!("expected a constant bound, got {other:?}"),
+        };
+        // The top-level pair summed to 1 + 2 and the `then` region's to 4 + 8: neither pair borrowed
+        // the other's trip count, and no cross-block pair merged.
+        assert_eq!((value_of(top), value_of(nested)), (3, 12));
     }
 }

@@ -90,7 +90,7 @@ use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{dataflow, uniform};
 use crate::islands::dataflow_ir::link::RecvEnd;
 use crate::islands::sentient::dialects::sentient::StoreSource;
-use crate::islands::sentient::dialects::{self, Op, Val, sentient};
+use crate::islands::sentient::dialects::{self, Definitions, Op, Val, sentient};
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
 use crate::workload::Workload;
@@ -253,7 +253,7 @@ mod unit_tests {
     use super::{
         Conditional, DirectMulticast, InBlock, ProducerQMap, create_new_producer_qmap,
         process_conditional, process_direct_multicast, process_qmap_of_direct_multicast,
-        run_on_operation,
+        run_on_operation, run_on_store,
     };
     use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
@@ -391,6 +391,39 @@ mod unit_tests {
             inner[0],
             Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
                 if producer == rewritten && multicast_info == Some(handle)
+        ));
+    }
+
+    /// e569 — the direct-multicast arm: the store's `$producer` names the group, so it comes out
+    /// reading the group's own producer with the group in `$multicast_info`. ⛔ AND A STORE WHOSE
+    /// `$multicast_info` IS ALREADY SET IS SKIPPED, whatever its `$producer` still names.
+    #[test]
+    fn e569_splits_the_direct_multicast_and_skips_a_store_already_done() {
+        let (unit, handle) = (Val(0), Val(1));
+        let mut body = vec![
+            group(handle, unit),
+            store(StoreSource::Multicast(handle), Val(10)),
+        ];
+        run_on_store(InBlock(1), &mut body, &mut Values::default());
+        let rewritten = StoreSource::Wire(RecvEnd::from_multicast_group(unit));
+        assert!(matches!(
+            body[1],
+            Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
+                if producer == rewritten && multicast_info == Some(handle)
+        ));
+
+        let mut already = vec![
+            group(handle, unit),
+            store(StoreSource::Multicast(handle), Val(10)),
+        ];
+        if let Op::Sentient(sentient::Op::ReceiveAndStore { multicast_info, .. }) = &mut already[1] {
+            *multicast_info = Some(Val(77));
+        }
+        run_on_store(InBlock(1), &mut already, &mut Values::default());
+        assert!(matches!(
+            already[1],
+            Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
+                if producer == StoreSource::Multicast(handle) && multicast_info == Some(Val(77))
         ));
     }
 
@@ -975,10 +1008,69 @@ fn assign_conditional_producer(block: &mut [Op], old_result: Val, new_producer: 
     }
 }
 
-// crustify:todo: e569_runOn
-//   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:327  (43 body lines, level 4)
-//   original  : void MulticastCanonicalizationPass::runOn(sentient::ReceiveAndStoreOp ras)
-//   calls     : e098_processDirectMulticast, e324_processQMapOfDirectMulticast, e516_processConditional
+/// Replaces: e569_runOn
+///
+/// Canonicalises one store's `$producer`: whichever of the three multicast shapes it names gets
+/// split into a `$producer` the store can read directly and a `$multicast_info` beside it.
+///
+/// ⛔ NAMED FOR ITS ARGUMENT — see [`run_on_program`], the same C++ overload set.
+/// ⭐ THE THREE `dyn_cast`s ARE [`StoreSource`]'S OWN ARMS: the island records how a store names its
+/// producer, so the chain is a match and `isa<BlockArgument>(ras.getProducer())` (`:328`) — a
+/// `$producer` with no defining op — is the two arms this leaves alone.
+pub fn run_on_store(store: InBlock, body: &mut Vec<Op>, values: &mut Values) {
+    let Some(Op::Sentient(sentient::Op::ReceiveAndStore {
+        producer,
+        multicast_info,
+        ..
+    })) = body.get(store.0)
+    else {
+        return;
+    };
+    // "skip if multicast info is already set."
+    if multicast_info.is_some() {
+        return;
+    }
+    match *producer {
+        StoreSource::Wire(_) | StoreSource::Constant(_) => {}
+        StoreSource::Multicast(group) => {
+            if let Some(multicast) = DirectMulticast::of(group, body) {
+                process_direct_multicast(multicast, body);
+            }
+        }
+        StoreSource::QueryMap(query_map) => {
+            let (keys, all_groups) = {
+                let scope = [body.as_slice()];
+                let defs = Definitions::from_innermost(&scope);
+                let Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })) = defs.of(query_map)
+                else {
+                    return;
+                };
+                // ⭐ `llvm::all_of` OF NOTHING IS TRUE (`:347-352`), and a block-argument value has no
+                // defining op to be a group, so it fails the test.
+                let mapped = dialects::uniform_mapping_values(*map, *key, defs);
+                let all_groups = mapped.iter().all(|value| {
+                    matches!(
+                        defs.of(*value),
+                        Some(Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. }))
+                    )
+                });
+                (dialects::uniform_mapping_keys(*key, defs), all_groups)
+            };
+            if all_groups {
+                process_qmap_of_direct_multicast(query_map, &keys, body, values);
+            }
+        }
+        StoreSource::Conditional(result) => {
+            let Some(top_if) = body
+                .iter()
+                .position(|op| dialects::results(op).contains(&result))
+            else {
+                return;
+            };
+            process_conditional(result, InBlock(top_if), body, values);
+        }
+    }
+}
 
 // crustify:todo: e605_runOn
 //   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:371  (24 body lines, level 5)

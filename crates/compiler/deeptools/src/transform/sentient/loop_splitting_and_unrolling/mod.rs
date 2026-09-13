@@ -99,7 +99,7 @@
 // file's driver, and every unit below is reachable only from the tests until it lands. CI runs clippy
 // with `-D warnings`. ⭐ REMOVE THIS WITH e629.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::ForRef;
 use super::analyses::{InstructionCount, InstructionEstimator};
@@ -110,17 +110,27 @@ use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
     Op, Val, clone_ops, defining_op, replace_all_uses_with, use_count,
 };
+use crate::units::DfirUnit;
 
 /// THE PASS'S OWN STATE (`LoopSplittingAndUnrolling.cpp:125-129`) — the candidate list and its ibuff
 /// costs, which is everything [`cleanup_and_recalculate`] touches.
 ///
-/// ⭐ `can_not_split_`/`can_not_unroll_` land with the units that read them (e566, e603).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LoopSplittingAndUnrolling {
     /// `unrolling_or_splitting_candidates`, in the order the reverse-BFS walk pushed them.
     pub(crate) unrolling_or_splitting_candidates: Vec<LoopNodeId>,
     /// `loopnode_to_ibuff`.
     pub(crate) loopnode_to_ibuff: BTreeMap<LoopNodeId, InstructionCount>,
+    /// `can_not_split_` — *"map of loop node, which turned out not beneficial for unrolling/splitting;
+    /// it gets cleared for every programunitop"* (`:123-125`). ⭐ A SET: the map's value is only ever
+    /// `true` and only `find != end()` reads it.
+    pub(crate) can_not_split: BTreeSet<ForRef>,
+    /// `can_not_unroll_`.
+    pub(crate) can_not_unroll: BTreeSet<ForRef>,
+    /// `Statistic<"loops_split_count", "num-loop-splitted", ..>` (`Passes.td:321`).
+    pub(crate) loops_split_count: usize,
+    /// `Statistic<"loops_unroll_count", "num-loop-unrolled", ..>` (`Passes.td:322`).
+    pub(crate) loops_unroll_count: usize,
 }
 
 /// `dyn_cast<sentient::ForOp>(op)` AS A TYPE — the four things this pass reads off a loop.
@@ -287,6 +297,18 @@ impl LoopForest {
         }
         visited.reverse();
         visited
+    }
+
+    /// `LoopNode::getParentLoop()` — the node that holds this one as a child, absent for the root.
+    ///
+    /// ⛔ NOT AN ANCHORED UNIT — the *mechanism* an intrusive parent pointer is; a search over the
+    /// children lists is the same answer.
+    #[must_use]
+    pub(crate) fn parent_of(&self, id: LoopNodeId) -> Option<LoopNodeId> {
+        self.nodes
+            .iter()
+            .position(|node| node.children.contains(&id))
+            .map(|at| LoopNodeId(at as u32))
     }
 
     /// A new node under `parent`.
@@ -463,6 +485,30 @@ fn for_op_at(unit: &[Op], loop_ref: ForRef) -> Option<&Op> {
         }
     });
     found
+}
+
+/// THE BLOCK A LOOP SITS IN AND ITS POSITION THERE, INNERMOST BLOCK FIRST — the `Block *` an
+/// `Operation *` knows and a [`ForRef`] does not, which is what [`find_optimal_n_way_splits`] and
+/// [`split_loop_n_way`] ask for; the blocks around it are what makes `getDefiningOp()` global, so a
+/// nested loop's bound resolves in the block that hoisted the constant.
+fn loop_site<'a>(unit: &'a [Op], loop_ref: ForRef) -> Option<(Vec<&'a [Op]>, usize)> {
+    for (at, op) in unit.iter().enumerate() {
+        if matches!(op, Op::Sentient(ops::Op::For { iv, .. }) if *iv == loop_ref.0) {
+            return Some((vec![unit], at));
+        }
+        let nested: Vec<&[Op]> = match op {
+            Op::Sentient(inner) => ops::regions(inner),
+            Op::AffineFor(loop_op) => vec![&loop_op.body],
+            _ => Vec::new(),
+        };
+        for body in nested {
+            if let Some((mut scopes, found)) = loop_site(body, loop_ref) {
+                scopes.push(unit);
+                return Some((scopes, found));
+            }
+        }
+    }
+    None
 }
 
 /// `value.getDefiningOp<sentient::ConstantOp>().getValue()`.
@@ -1396,15 +1442,215 @@ pub(crate) fn find_optimal_n_way_splits<E: InstructionEstimator, T: ConditionalT
     }
 }
 
-// crustify:todo: e566_getSavedCycleAndIbuffCost
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:335  (117 body lines, level 4)
-//   original  : std::pair<int, int> LoopSplittingAndUnrollingPass::getSavedCycleAndIbuffCost( dcc::LoopNode *loop, InstructionEstimatorImpl &ie, dataflow::ProgramUnitOp &unit, std::pair<int, int> &is_splitting)
-//   calls     : e088_ifOpUsesIV, e514_findOptimalNWaySplits
+/// WHICH TRANSFORMATION IS BEING PRICED — the reference's `std::pair<int, int> &is_splitting`.
+///
+/// ⛔ THE PAIR IS A TAG, NOT A VALUE. `findBestLoopNodeToOptimize` declares `split{0, 0}` and
+/// `unroll{-1, -1}` (`:483-484`) and every reader asks only `first == 0 && second == 0`, so the two
+/// entries carry one bit between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Optimization {
+    /// `split{0, 0}`.
+    Split,
+    /// `unroll{-1, -1}`.
+    Unroll,
+}
 
-// crustify:todo: e567_doSplitOrUnroll
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:993  (23 body lines, level 4)
-//   original  : void LoopSplittingAndUnrollingPass::doSplitOrUnroll( OpBuilder &builder, dcc::LoopNode *n, std::pair<int, int> index_and_nwaysplit)
-//   calls     : e447_splitLoopNWay, e513_unrollLoop
+/// `getSavedCycleAndIbuffCost`' `std::pair<int, int>` — what the loop buys and what it costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SavedCycleAndIbuffCost {
+    /// `saved_cycles_`.
+    pub(crate) saved_cycles: i32,
+    /// `iBuff_cost_`.
+    pub(crate) ibuff_cost: InstructionCount,
+}
+
+impl SavedCycleAndIbuffCost {
+    /// `{1, INT_MAX}` — *"set high ibuff cost so it does not consider splitting"*, the answer all
+    /// five of the function's early returns give.
+    pub(crate) const NOT_WORTH_IT: SavedCycleAndIbuffCost = SavedCycleAndIbuffCost {
+        saved_cycles: 1,
+        ibuff_cost: InstructionCount(i32::MAX),
+    };
+}
+
+/// `int saved_cycles_` FED AN `int64_t` PRODUCT — the reference's implicit narrowing, clamped rather
+/// than wrapped so a huge nest stays expensive instead of becoming cheap.
+fn narrow(value: i64) -> i32 {
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Replaces: e566_getSavedCycleAndIbuffCost
+///
+/// Prices one loop for the transformation named: cycles saved (an if op is 2, an unroll is 1, both
+/// multiplied by every constant-bound ancestor) against the instruction-buffer cost.
+///
+/// ⛔ TRAP: A LOOP OF BOUND 1 RETURNS `ibuff_cost = -2` (`:404`), a sentinel cheaper than free that
+/// makes `promoteForLoopBodyAndDelete` always win — *"Removing loops with size 1"*.
+/// ⛔ TRAP: THE UNIT TWEAK APPLIES TO UNROLLING ONLY, and the reference `break`s at the first arm, so
+/// a unit divides `ibuff_cost` by 2 (SFP/PE) or 4 (PT, LXLU/LXSU, L3LU/L3SU, L0LU/L0SU) exactly once.
+pub(crate) fn get_saved_cycle_and_ibuff_cost<E: InstructionEstimator, T: ConditionalTree>(
+    pass: &LoopSplittingAndUnrolling,
+    forest: &LoopForest,
+    node: LoopNodeId,
+    ie: &mut E,
+    tree: &mut T,
+    unit: &[Op],
+    on: DfirUnit,
+    optimization: Optimization,
+) -> SavedCycleAndIbuffCost {
+    let Some(loop_ref) = forest.node(node).and_then(|node| node.op) else {
+        // `dyn_cast<sentient::ForOp>(loop->getOperation())` then `.getBound()` on the result
+        // (`:350-352`) — the synthetic root null-dereferences there. Same abort as e514's.
+        panic!(
+            "getSavedCycleAndIbuffCost expects a loop node, not the synthetic root \
+             (LoopSplittingAndUnrolling.cpp:350)"
+        )
+    };
+    let marked = match optimization {
+        Optimization::Split => &pass.can_not_split,
+        Optimization::Unroll => &pass.can_not_unroll,
+    };
+    if marked.contains(&loop_ref) {
+        return SavedCycleAndIbuffCost::NOT_WORTH_IT;
+    }
+
+    let Some((scopes, at)) = loop_site(unit, loop_ref) else {
+        panic!("getSavedCycleAndIbuffCost expects the loop to be in this unit")
+    };
+    let scope = scopes[0];
+    let Some((for_op, bound)) = ForOp::of(&scope[at])
+        .and_then(|for_op| constant_value_in(for_op.bound, &scopes).map(|bound| (for_op, bound)))
+    else {
+        panic!(
+            "getSavedCycleAndIbuffCost expects a constant-bound sentient.for \
+             (LoopSplittingAndUnrolling.cpp:351-352)"
+        )
+    };
+
+    let (mut saved_cycles, ibuff_cost) = match optimization {
+        Optimization::Split => {
+            if !if_op_uses_iv(loop_ref, unit) {
+                return SavedCycleAndIbuffCost::NOT_WORTH_IT;
+            }
+            let splits = find_optimal_n_way_splits(scope, at, ie, tree, unit);
+            if splits.index == 0 && splits.nway_split == 0 {
+                return SavedCycleAndIbuffCost::NOT_WORTH_IT;
+            }
+            // "Considering each IfOp takes 2 cycle".
+            (
+                narrow(2 * bound * splits.if_ops_on_iv as i64),
+                splits.ibuff_cost,
+            )
+        }
+        Optimization::Unroll => (
+            1,
+            InstructionCount(narrow(
+                i64::from(ie.estimated_instruction_count_of_region(for_op.body).0) * bound,
+            )),
+        ),
+    };
+
+    // `while (parent->getOperation())`: every enclosing loop runs this one that many times over.
+    // ⭐ A NON-CONSTANT ANCESTOR BOUND MULTIPLIES BY NOTHING — the reference's own empty `else`.
+    let mut parent = forest.parent_of(node);
+    while let Some(id) = parent
+        && let Some(ancestor) = forest.node(id).and_then(|node| node.op)
+    {
+        if let Some((ancestor_scopes, ancestor_at)) = loop_site(unit, ancestor)
+            && let Some(ancestor_bound) = ForOp::of(&ancestor_scopes[0][ancestor_at])
+                .and_then(|for_op| constant_value_in(for_op.bound, &ancestor_scopes))
+        {
+            saved_cycles = narrow(i64::from(saved_cycles) * ancestor_bound);
+        }
+        parent = forest.parent_of(id);
+    }
+
+    if optimization == Optimization::Split {
+        return SavedCycleAndIbuffCost {
+            saved_cycles,
+            ibuff_cost,
+        };
+    }
+
+    // "Removing loops with size 1."
+    if bound == 1 {
+        return SavedCycleAndIbuffCost {
+            saved_cycles,
+            ibuff_cost: InstructionCount(-2),
+        };
+    }
+
+    // ⭐ EXHAUSTIVE, NO WILDCARD: a new unit kind must say whether unrolling on it is discounted.
+    let discount = match on {
+        // "SFP and PE are important because to reduce space and enable program stitching".
+        DfirUnit::Sfp | DfirUnit::Pe => Some(2.0),
+        // "PT is priority because flits for PT are added separately", then the load/store units.
+        DfirUnit::PtRow(_)
+        | DfirUnit::Lxlu
+        | DfirUnit::Lxsu
+        | DfirUnit::L3lu
+        | DfirUnit::L3su
+        | DfirUnit::L0lu
+        | DfirUnit::L0su => Some(4.0),
+        DfirUnit::Lx
+        | DfirUnit::Hbm
+        | DfirUnit::L0
+        | DfirUnit::Constant
+        | DfirUnit::SfpState
+        | DfirUnit::PeState
+        | DfirUnit::SfpRing
+        | DfirUnit::LxVirtualIbr
+        | DfirUnit::L3Ibr
+        | DfirUnit::CrossPtnLink
+        | DfirUnit::LxluScaleReg => None,
+    };
+    if let Some(divisor) = discount {
+        saved_cycles =
+            saved_cycles.saturating_sub((f64::from(ibuff_cost.0) / divisor).ceil() as i32);
+        // "min threshold", PT's being the lower one.
+        let min_cycles = if matches!(on, DfirUnit::PtRow(_)) { 10 } else { 25 };
+        if saved_cycles < min_cycles {
+            return SavedCycleAndIbuffCost::NOT_WORTH_IT;
+        }
+    }
+
+    SavedCycleAndIbuffCost {
+        saved_cycles,
+        ibuff_cost,
+    }
+}
+
+/// Replaces: e567_doSplitOrUnroll
+///
+/// Performs the chosen transformation on the loop, counting the statistic on success and marking the
+/// loop as not worth re-pricing on failure.
+///
+/// ⭐ THE FAILURE MARK IS WHAT MAKES THE DRIVER TERMINATE: `findBestLoopNodeToOptimize` re-prices
+/// every candidate on the next round and [`get_saved_cycle_and_ibuff_cost`] answers
+/// [`SavedCycleAndIbuffCost::NOT_WORTH_IT`] for a marked loop, so a loop is attempted once.
+pub(crate) fn do_split_or_unroll(
+    pass: &mut LoopSplittingAndUnrolling,
+    loop_ref: ForRef,
+    optimization: Optimization,
+    scope: &mut Vec<Op>,
+    at: usize,
+    values: &mut Values,
+) {
+    match optimization {
+        Optimization::Split => match split_loop_n_way(scope, at, values) {
+            LoopSplit::Split => pass.loops_split_count += 1,
+            LoopSplit::BoundIsNotAPositiveConstant => {
+                pass.can_not_split.insert(loop_ref);
+            }
+        },
+        Optimization::Unroll => match unroll_loop(scope, at, values) {
+            LoopUnroll::Done => pass.loops_unroll_count += 1,
+            LoopUnroll::WouldFailRegisterAllocation => {
+                pass.can_not_unroll.insert(loop_ref);
+            }
+        },
+    }
+}
 
 // crustify:todo: e603_findBestLoopNodeToOptimize
 //   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:479  (69 body lines, level 5)
@@ -2186,5 +2432,131 @@ mod unit_tests {
         // ⛔ THE IBUFF IS ASKED FOR AND THE ANSWER ONLY LOGGED: 3 fits in 4, and a cost that did not
         // fit would come back the same.
         assert_eq!(ie.ibuff_asks, 1);
+    }
+
+    /// e566 — an inner loop of bound 4 with a two-op body costs `2 * 4` of ibuff and saves the
+    /// ENCLOSING loop's bound; a loop already marked not-unrollable costs the most there is.
+    #[test]
+    fn e566_prices_an_unroll_by_the_body_and_multiplies_by_the_enclosing_bound() {
+        let unit = vec![
+            constant(3, Val(0)),
+            constant(4, Val(1)),
+            for_loop(
+                Val(2),
+                Val(0),
+                Vec::new(),
+                vec![
+                    for_loop(
+                        Val(3),
+                        Val(1),
+                        Vec::new(),
+                        vec![nop("inner"), yields(Vec::new())],
+                    ),
+                    yields(Vec::new()),
+                ],
+            ),
+        ];
+        let forest = LoopForest::of(&unit);
+        let Some(inner) = forest
+            .reverse_bfs()
+            .into_iter()
+            .find(|id| forest.node(*id).and_then(|node| node.op) == Some(ForRef(Val(3))))
+        else {
+            panic!("the inner loop is a node of the forest")
+        };
+        let mut ie = StatedEstimator::default();
+        let mut tree = StatedTree::default();
+
+        let pass = LoopSplittingAndUnrolling::default();
+        assert_eq!(
+            get_saved_cycle_and_ibuff_cost(
+                &pass,
+                &forest,
+                inner,
+                &mut ie,
+                &mut tree,
+                &unit,
+                DfirUnit::Hbm,
+                Optimization::Unroll,
+            ),
+            SavedCycleAndIbuffCost {
+                saved_cycles: 3,
+                ibuff_cost: InstructionCount(8),
+            }
+        );
+
+        let marked = LoopSplittingAndUnrolling {
+            can_not_unroll: BTreeSet::from([ForRef(Val(3))]),
+            ..LoopSplittingAndUnrolling::default()
+        };
+        assert_eq!(
+            get_saved_cycle_and_ibuff_cost(
+                &marked,
+                &forest,
+                inner,
+                &mut ie,
+                &mut tree,
+                &unit,
+                DfirUnit::Hbm,
+                Optimization::Unroll,
+            ),
+            SavedCycleAndIbuffCost::NOT_WORTH_IT
+        );
+    }
+
+    /// e567 — a successful unroll counts the statistic; the loop that refuses is marked instead, so
+    /// e566 answers [`SavedCycleAndIbuffCost::NOT_WORTH_IT`] for it from then on.
+    #[test]
+    fn e567_counts_the_unroll_and_marks_the_loop_that_refuses() {
+        let mut pass = LoopSplittingAndUnrolling::default();
+
+        let mut values = Values::default();
+        let bound_c = values.mint();
+        let init_c = values.mint();
+        let iv = values.mint();
+        let arg = values.mint();
+        let result = values.mint();
+        let sum = values.mint();
+        let mut scope = vec![
+            constant(2, bound_c),
+            constant(7, init_c),
+            for_loop(
+                iv,
+                bound_c,
+                vec![carried(init_c, arg, result)],
+                vec![add(arg, iv, sum), yields(vec![sum])],
+            ),
+        ];
+        do_split_or_unroll(
+            &mut pass,
+            ForRef(iv),
+            Optimization::Unroll,
+            &mut scope,
+            2,
+            &mut values,
+        );
+        assert_eq!(pass.loops_unroll_count, 1);
+        assert!(pass.can_not_unroll.is_empty());
+
+        // The fixture `is_ok_to_unroll` refuses: a constant iter arg on a MUTABLE address.
+        let mut blocked = vec![
+            constant(4096, Val(0)),
+            for_loop(
+                Val(1),
+                Val(9),
+                vec![carried(Val(0), Val(2), Val(3))],
+                vec![load_and_store(Val(2), Val(7)), yields(vec![Val(2)])],
+            ),
+        ];
+        do_split_or_unroll(
+            &mut pass,
+            ForRef(Val(1)),
+            Optimization::Unroll,
+            &mut blocked,
+            1,
+            &mut Values::default(),
+        );
+        assert_eq!(pass.loops_unroll_count, 1);
+        assert_eq!(pass.can_not_unroll, BTreeSet::from([ForRef(Val(1))]));
     }
 }
