@@ -1203,9 +1203,9 @@ impl Verified {
 /// text and `opFuncsToString` mixes cases (`"StzLatch"`, `"ScatterOpHBM"`, `"ITOF"`), so
 /// `opFuncName="stzlatch"` is rejected while `"StzLatch"` verifies.
 ///
-/// ⛔⛔ ONE VENDORED TEMPLATE FAILS THIS AND THE REFERENCE AGREES: `ddl_templates/
-/// quantization_double_pad.ddl` states `opFuncName="csqint4mb"`, which no `OpFuncs` names — the
-/// 176-name map has `csqint4`, `csqint4wt` and `csqint4chil` but no `mb` form.
+/// ⭐ NO VENDORED TEMPLATE FAILS THIS: all 124 distinct LIVE `opFuncName=` spellings resolve within
+/// the 176. The one unnamed spelling, `csqint4mb` (`ddl_templates/quantization_double_pad.ddl:57`),
+/// sits on a COMMENTED-OUT `ddl.operation_bind`, so the reference never looks it up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperationBind {
     /// `opFuncName=`, resolved.
@@ -1299,15 +1299,15 @@ impl AllocateOperands {
     /// Replaces: e272_print
     ///
     /// THE ROUND TRIP OF [`Self::parse`] — `(` `%tensor` (`,` `[`dims`]`)? (`,` `%ext`)? `)` and then
-    /// the attr-dict with `operandSegmentSizes` elided (`DdlOps.cpp:307-321`).
+    /// the attr-dict with `operandSegmentSizes` elided (`DdlOps.cpp:306-322`).
     ///
     /// ⛔ MLIR'S SPELLING, NOT THE TEMPLATE'S: `{memory="l0",num_buffers=-1:si64}` prints back as
     /// ` {memory = "l0", num_buffers = -1 : si64}`, because `si64` is not the `i64` whose type an
     /// `IntegerAttr` elides, and `printOperands` separates with `", "`.
     ///
     /// ⛔ NO `: index` — `DdlOps.td:441` writes one in its doc example, but the custom printer never
-    /// emits a result type and `parse` never consumes one; none of the 326 vendored
-    /// `ddl.allocate`s states one.
+    /// emits a result type and `parse` never consumes one; none of the 318 LIVE vendored
+    /// `ddl.allocate`s states one (326 counts 8 commented out).
     #[must_use]
     pub fn print(&self, attrs: &AllocateAttrs) -> String {
         let mut out = format!("({}", print_operand(&self.tensor));
@@ -1530,8 +1530,9 @@ mod tests_e271_e272 {
         ReplicationFactor, SenComponent, Unverified, Value, Verified,
     };
 
-    /// A `ddl.allocate` in one memory and nothing else — the form 314 of the 326 vendored
-    /// `ddl.allocate`s take.
+    /// A `ddl.allocate` in one memory and nothing else — the form 306 of the 318 LIVE vendored
+    /// `ddl.allocate`s take (the other 12: 8 `+num_buffers`, 3 `+num_buffers,padding_type`, 1
+    /// `+replication`).
     fn only_memory(memory: SenComponent) -> AllocateAttrs {
         AllocateAttrs {
             memory,
@@ -1542,7 +1543,7 @@ mod tests_e271_e272 {
     }
 
     /// ⭐ THE VENDORED SPELLINGS — `"batchmatmulint8"` (`DdlOps.td:212`) and the mixed-case
-    /// `"StzLatch"` a real template states — AND THE TEMPLATE THE REFERENCE ITSELF REJECTS.
+    /// `"StzLatch"` a real template states — AND A NAME NO `OpFuncs` CARRIES.
     #[test]
     fn operation_bind_takes_a_spelled_op_func() {
         assert_eq!(
@@ -1555,8 +1556,8 @@ mod tests_e271_e272 {
         );
         // ⛔ CASE-SENSITIVE: `ComputeOp::verify` uppercases first, this verifier does not.
         assert_eq!(OperationBind::verify("stzlatch"), None);
-        // ⛔⛔ AND `quantization_double_pad.ddl`'s OWN `opFuncName` NAMES NO OP-FUNC, so the
-        // reference fails that template's parse too — `csqint4` is the spelling that exists.
+        // ⛔ AND `csqint4mb` names no op-func — but `quantization_double_pad.ddl:57` states it only
+        // on a COMMENTED-OUT `operation_bind`, so no LIVE template reaches this arm.
         assert_eq!(OperationBind::verify("csqint4mb"), None);
         assert_eq!(
             OperationBind::verify("csqint4").map(|op| op.op_func),
@@ -1594,7 +1595,8 @@ mod tests_e271_e272 {
                 "(%kertensor, %kertensor_xrf_ext_allocation) {memory = \"ptxrf\"}",
             ),
             (
-                // `convolution2d.ddl:250` — the only `padding_dim` form, one style per dimension
+                // `convolution2d.ddl:250` — one of the THREE `padding_dim` forms (also
+                // `convolution2d_dd1.ddl:223`, `convolution2d_os1.ddl:228`), one style per dimension
                 // (`DdlOps.td:448`), and the streaming buffer `num_buffers=-1` names.
                 "(%inptensor, [%krdpad0, %krdpad1])",
                 AllocateAttrs {

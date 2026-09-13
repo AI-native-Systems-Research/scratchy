@@ -969,7 +969,7 @@ pub fn process_dimension_op<'i>(
 }
 
 /// THE SIX COMPARISONS AGAINST ZERO a dropped dim's condition reduces to
-/// (`ddc/ddl/ddl_conversion.cpp:296-308`), and [`None`] for the *"Condition operator not
+/// (`ddc/ddl/ddl_conversion.cpp:282-294`), and [`None`] for the *"Condition operator not
 /// supported"* abort.
 ///
 /// ⛔ ONLY [`CondOp::Eq`] AND [`CondOp::Ne`] ARE REACHABLE from the census, which narrows
@@ -987,7 +987,7 @@ const fn resolves_true(op: CondOp, value: i64) -> Option<bool> {
 }
 
 /// THE CORELET COMPLEMENT `ddl.condition_not` TAKES over `coreIdsUsed_`
-/// (`ddc/ddl/ddl_conversion.cpp:361-376`).
+/// (`ddc/ddl/ddl_conversion.cpp:328-343`).
 ///
 /// ⛔ TRAP: IT NEVER TOUCHES A CORE OUTSIDE `coreIdsUsed_`, so a set naming one keeps that entry
 /// UNCOMPLEMENTED — and the entry it inserts for a core the set does not name hardcodes corelets 0
@@ -1208,7 +1208,7 @@ pub fn process_condition(
     Some(mine)
 }
 
-/// THE STORAGE A REGISTER-FILE COMPONENT COUNTS AS (`ddc/ddl/ddl_conversion.cpp:2589-2594`) — the
+/// THE STORAGE A REGISTER-FILE COMPONENT COUNTS AS (`ddc/ddl/ddl_conversion.cpp:2591-2596`) — the
 /// five folds `verifyDdlConstraints` applies before comparing against `pinnedComponent()`.
 ///
 /// ⛔ THE `PESTATE` FOLD IS UNREACHABLE from the census, which states no `pestate` memory; the
