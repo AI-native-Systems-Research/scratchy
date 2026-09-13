@@ -161,14 +161,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::arch_enums::SenComponent;
 
 use super::fold::{AllocId, AllocLayout, Allocations, DataOrigin, NodeId, PadType, StoredStream};
-use super::metadata::{DatastageId, DdcMemory, MetaDimKind, Metadata};
+use super::metadata::{DatastageId, DdcMemory, DestIdx, MetaDimKind, Metadata};
 use super::transformation::LoopId;
 use super::v1::CoreClSet;
+use crate::arch::Elements;
 use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::generated::{DataConnect, Strategy};
 use crate::schedule::dsc2::{
-    ComputeNode, DataInfo, Dsc, LdsIdx, NodeName, Operand, OperandPos, TransferNode, TransferSide,
+    ComputeNode, DataInfo, Dsc, Dsts, Hops, LdsIdx, NodeName, Operand, OperandPos, TransferNode,
+    TransferSide,
 };
 use crate::schedule::l3::dsc::SymbolicDimInfo;
 use crate::units::{Core, Corelet};
@@ -877,26 +879,286 @@ pub fn get_node_description(node: UtilNode<'_>) -> String {
 //   original  : void Ddc::updateNodesWithNewLds(int newLdsIdx, int oldLdsIdx, dsc2::ScheduleNode *startNode)
 //   extract   : crustify-ddc/cpp/ddc.cpp:1877-1935
 
-// crustify:todo: e304_cloneForPeSfpWorkSplit
-//   authority : ddc/ddc_transformation_util.cpp:1538  (113 body lines, level 2)
-//   class     : Ddc
-//   original  : dsc2::TransferNode *Ddc::cloneForPeSfpWorkSplit(dsc2::TransferNode *node)
-//   extract   : crustify-ddc/cpp/ddc.cpp:9878-9991
-//   calls     : e251_unrollTransfer
+// ⭐ TYPES FOR ENTRIES 304-306. Union this section with this file's other vocabulary when its
+// remaining entries land.
 
-// crustify:todo: e305_destRelatedToExternalNodes
-//   authority : ddc/ddc_transformation_util.cpp:1700  (10 body lines, level 2)
-//   class     : Ddc
-//   original  : bool Ddc::destRelatedToExternalNodes( const dsc2::TransferNode *transferNode) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:10001-10012
-//   calls     : e254_destRelatedToExternalNodes
+/// WHICH INPUT OF A COMPUTE — the `i` entries 300 and 304 spell into a minted name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InputIdx(pub usize);
 
-// crustify:todo: e306_relatedToExternalNodes
-//   authority : ddc/ddc_transformation_util.cpp:1743  (4 body lines, level 2)
-//   class     : Ddc
-//   original  : bool Ddc::relatedToExternalNodes(const dsc2::ComputeNode *computeNode) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:10022-10026
-//   calls     : e255_inputRelatedToExternalNodes, e256_outputRelatedToExternalNodes
+/// WHICH HALF OF THE PE/SFP PAIR A CLONE RUNS ON — entry 304's suffix, `"_sfp_parallel"` where the
+/// original ran on PE and `"_pe_parallel"` otherwise (`ddc/ddc_transformation_util.cpp:1583`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ParallelSuffix {
+    /// `"_pe_parallel"`.
+    Pe,
+    /// `"_sfp_parallel"`.
+    Sfp,
+}
+
+impl ParallelSuffix {
+    /// The suffix as the reference concatenates it.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Pe => "_pe_parallel",
+            Self::Sfp => "_sfp_parallel",
+        }
+    }
+}
+
+/// A `dataConnect_` THE DDC MINTS RATHER THAN THE DDL CENSUS NAMING — every fresh connect entries
+/// 300 and 304 write into a `DataInfo` (`ddc/ddc_transformation.cpp:1152-1310`, `:1583-1608`).
+///
+/// ⛔⛔ [`DataConnect`] IS A BUILD-TIME CENSUS OF THE VENDORED DDL TEMPLATES, so it has no member for
+/// any of these and never will; a `String` would break the crate's closed-set rule. THIS ENUM IS THE
+/// CLOSED SET, and [`MintedConnects`] is what turns one into the carrier's own [`DataConnect`], the
+/// way `ddlInterface.loop_labels_` interns a minted loop's label (`ddc/ddl/ddl_conversion.cpp:1065`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MintedConnect {
+    /// `"sfp_compress_input<i>_comp"` — entry 300's LX-to-SFP compression transfer destination.
+    SfpCompressInputComp(InputIdx),
+    /// `"sfp_compress_output<i>_comp"` — that input's dummy FMA output, and the SFP-to-LX source.
+    SfpCompressOutputComp(InputIdx),
+    /// `"lx_compress_input<i>_comp"` — the write back into LX, taken over by the original transfer.
+    LxCompressInputComp(InputIdx),
+    /// `"lx_compress_output_exp"` — entry 300's expansion read out of the internal output.
+    LxCompressOutputExp,
+    /// `"sfp_compress_output_exp"` — the expansion FMA's output, read again by its write-back.
+    SfpCompressOutputExp,
+    /// `<base> + <suffix>` — entry 304's suffix on a connect that is already named.
+    Parallel(DataConnect, ParallelSuffix),
+}
+
+impl MintedConnect {
+    /// The name as the reference concatenates it.
+    #[must_use]
+    pub fn spelling(self) -> String {
+        match self {
+            Self::SfpCompressInputComp(i) => format!("sfp_compress_input{}_comp", i.0),
+            Self::SfpCompressOutputComp(i) => format!("sfp_compress_output{}_comp", i.0),
+            Self::LxCompressInputComp(i) => format!("lx_compress_input{}_comp", i.0),
+            Self::LxCompressOutputExp => "lx_compress_output_exp".to_string(),
+            Self::SfpCompressOutputExp => "sfp_compress_output_exp".to_string(),
+            Self::Parallel(base, suffix) => format!("{}{}", base.spelling(), suffix.spelling()),
+        }
+    }
+}
+
+/// HOW A MINTED `data_connect=` REACHES THE CRATE'S CENSUS.
+pub trait MintedConnects {
+    /// The [`DataConnect`] naming `connect`, interned if the carrier has not seen it before.
+    fn intern_connect(&mut self, connect: MintedConnect) -> DataConnect;
+}
+
+/// WHAT ENTRY 300 CANNOT REACH YET — `updateNodesWithNewLds(newLdsIdx, oldLdsIdx, startNode)`
+/// (`ddc/ddc_transformation_util.cpp:1919`), which repoints every datastream under `start` from one
+/// labeled DS index to another.
+///
+/// ⛔ ENTRY 123 IS NOT PORTED — its anchor is still open above and the scheduler put it in no batch
+/// of this wave, so this trait is the SEAM entry 300 reaches it through and NOT a stand-in: it walks
+/// the whole subtree rewriting transfer, compute and allocate operands at once, which is a carrier's
+/// job however it is spelled. Its port is the one implementation of this method.
+pub trait NewLdsRewrite {
+    /// `updateNodesWithNewLds(new_lds, old_lds, start)`.
+    fn update_nodes_with_new_lds(&mut self, new_lds: LdsIdx, old_lds: LdsIdx, start: NodeId);
+}
+
+/// `toggleMap` (`ddc/ddc_transformation_util.cpp:12-18`) — the PE/SFP swap over the THREE pairs it
+/// holds, [`None`] for a component it has no entry for, which is what leaves that field alone.
+#[must_use]
+pub const fn toggle_pe_sfp(comp: SenComponent) -> Option<SenComponent> {
+    match comp {
+        SenComponent::Pe => Some(SenComponent::Sfp),
+        SenComponent::Sfp => Some(SenComponent::Pe),
+        SenComponent::Pelrf => Some(SenComponent::Sfplrf),
+        SenComponent::Sfplrf => Some(SenComponent::Pelrf),
+        SenComponent::Sfpstate => Some(SenComponent::Pestate),
+        SenComponent::Pestate => Some(SenComponent::Sfpstate),
+        _ => None,
+    }
+}
+
+/// A TRANSFER PROVED CLONEABLE FOR THE PE/SFP WORK SPLIT, CARRYING THE SUFFIX ITS CLONE TAKES.
+///
+/// ⛔⛔ TWO ABORTS AND THE `nullptr` ANSWER COLLAPSE INTO THIS TYPE: *"as the transfer writes to
+/// multiple destinations"*, *"has already been cloned"*, and the transfer that involves neither PE
+/// nor SFP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeSfpTransferSplit {
+    transfer: NodeId,
+    suffix: ParallelSuffix,
+}
+
+impl PeSfpTransferSplit {
+    /// The witness, or [`None`] for either abort and for the `nullptr`.
+    ///
+    /// ⛔ TRAP, AND IT IS THE REFERENCE'S: the *"dstVias.via() is not empty"* abort is gated on
+    /// `transformationReportLevel_ > 0` (`:1548-1552`), so at the DEFAULT report level a transfer
+    /// routed to PE through other components IS still cloned; that default is what holds here.
+    /// ⚠️ And the multi-destination abort is only reached through the DESTINATION scan — a transfer
+    /// whose `src_.unit_` is PE or SFP clones however many destinations it has.
+    #[must_use]
+    pub fn of(metadata: &Metadata, transfer: NodeId, node: &TransferNode) -> Option<Self> {
+        let mut existing = pe_or_sfp(node.src.unit);
+        if existing.is_none() {
+            existing = node.dsts.iter().filter_map(|dst| pe_or_sfp(dst.unit)).last();
+            if existing.is_some() && node.dsts.len() > 1 {
+                return None;
+            }
+        }
+        let existing = existing?;
+        if metadata.node_cloning_map.contains_key(&transfer) {
+            return None;
+        }
+        Some(Self {
+            transfer,
+            suffix: if existing == SenComponent::Pe {
+                ParallelSuffix::Sfp
+            } else {
+                ParallelSuffix::Pe
+            },
+        })
+    }
+}
+
+/// `is_any_of(comp, {PE, SFP})` — `comps` (`ddc/ddc_transformation_util.cpp:1543`).
+const fn pe_or_sfp(comp: SenComponent) -> Option<SenComponent> {
+    match comp {
+        SenComponent::Pe => Some(SenComponent::Pe),
+        SenComponent::Sfp => Some(SenComponent::Sfp),
+        _ => None,
+    }
+}
+
+/// WHAT ENTRY 304 DOES TO THE TREE — the clone and its placement.
+pub trait NodeCloning: ScheduleSurgery {
+    /// `node->clone()` with `body` for its transfer state, placed IMMEDIATELY AFTER `node` among its
+    /// parent's children (`parent->addChildNode(newNode, false, node)`). Yields the clone.
+    fn clone_transfer_after(&mut self, node: NodeId, body: TransferNode) -> NodeId;
+}
+
+/// Replaces: e304_cloneForPeSfpWorkSplit
+///
+/// CLONES ONE TRANSFER ONTO THE OTHER HALF OF THE PE/SFP PAIR: fully unrolls the original, mints a
+/// copy right after it whose source and destination units, storages and `data_connect=` are swapped
+/// by [`toggle_pe_sfp`], registers the copy as a user of both ends' allocations, records which ends
+/// then need the split's constant offset, and records the clone (`:1538`).
+///
+/// ⛔ DELIBERATE DIVERGENCE: *"could not be unrolled"* is an abort in the reference; here it is the
+/// [`None`] answer, which is the ONLY thing this [`Option`] means once [`PeSfpTransferSplit`] holds.
+/// ⚠️ A CONNECT TAKES THE SUFFIX ONLY WHERE THE UNIT TOGGLED *AND* THE CONNECT IS ALREADY NAMED;
+/// the STORAGE toggle is independent of both.
+pub fn clone_transfer_for_pe_sfp_work_split<S, D>(
+    tree: &mut S,
+    stages: &mut DataStages<D>,
+    metadata: &mut Metadata,
+    split: PeSfpTransferSplit,
+) -> Option<NodeId>
+where
+    S: NodeCloning + FifoResults + Allocations + TransferUnrolling + MintedConnects + ?Sized,
+    D: Default,
+{
+    let PeSfpTransferSplit { transfer, suffix } = split;
+    let site = InternalNode::of(metadata, transfer)?;
+    if !unroll_transfer(tree, stages, metadata, site) {
+        return None;
+    }
+
+    let mut body = tree.transfer(transfer);
+    body.name = NodeName(format!("{}{}", body.name.0, suffix.spelling()));
+    toggle_for_split(tree, suffix, &mut body.src);
+    let hops: Vec<Hops> = body
+        .dsts
+        .routes()
+        .map(|(_, hops)| Hops(hops.to_vec()))
+        .collect();
+    let mut dsts: Vec<Operand> = body.dsts.iter().copied().collect();
+    for dst in &mut dsts {
+        toggle_for_split(tree, suffix, dst);
+    }
+    let (first, rest) = dsts.split_first()?;
+    body.dsts = Dsts::new(*first, rest.to_vec()).with_hops(hops);
+
+    let clone = tree.clone_transfer_after(transfer, body.clone());
+
+    let ends = tree.transfer_ends(clone);
+    for end in std::iter::once(ends.src).chain(ends.dsts) {
+        if let Some(alloc) = tree.allocation(end) {
+            tree.add_alloc_user(alloc, clone);
+        }
+    }
+
+    let cloned = metadata.datatransfers.entry(clone).or_default();
+    if pe_or_sfp(body.src.unit).is_none() && is_memory(body.src.storage) {
+        cloned.apply_pe_sfp_split_offset_src = true;
+    }
+    for (index, dst) in body.dsts.iter().enumerate() {
+        if pe_or_sfp(dst.unit).is_none() && is_memory(dst.storage) {
+            cloned
+                .apply_pe_sfp_split_offset_dest
+                .push(DestIdx(index as u32));
+        }
+    }
+    metadata
+        .node_cloning_map
+        .entry(transfer)
+        .or_default()
+        .push(clone);
+
+    Some(clone)
+}
+
+/// One operand through `toggleMap`, with the suffix on a connect whose unit moved.
+fn toggle_for_split<S: MintedConnects + ?Sized>(
+    tree: &mut S,
+    suffix: ParallelSuffix,
+    operand: &mut Operand,
+) {
+    if let Some(unit) = toggle_pe_sfp(operand.unit) {
+        operand.unit = unit;
+        if let Some(base) = operand.data.data_connect {
+            operand.data.data_connect =
+                Some(tree.intern_connect(MintedConnect::Parallel(base, suffix)));
+        }
+    }
+    if let Some(storage) = toggle_pe_sfp(operand.storage) {
+        operand.storage = storage;
+    }
+}
+
+/// Replaces: e305_destRelatedToExternalNodes
+///
+/// Whether ANY destination datastream of the transfer is external (`:1700`) — entry 254 over every
+/// destination.
+///
+/// ⚠️ TRAP: the reference declares `const dsc2::AllocateNode *allocNode;` and never reads it.
+/// ⛔ A DISTINCT NAME because entry 254 is the same C++ name at a different arity.
+#[must_use]
+pub fn any_dest_related_to_external_nodes<E: ExternalStreams + ?Sized>(
+    streams: &E,
+    transfer: &TransferNode,
+) -> bool {
+    transfer
+        .dsts
+        .iter()
+        .any(|dst| dest_related_to_external_nodes(streams, dst))
+}
+
+/// Replaces: e306_relatedToExternalNodes
+///
+/// Whether ANY input OR output datastream of the compute is external (`:1743`).
+///
+/// ⛔ A DISTINCT NAME: five C++ `relatedToExternalNodes` overloads differ only in their argument
+/// type — entries 121, 306, 341 and 361 — and Rust must name each of them.
+#[must_use]
+pub fn compute_related_to_external_nodes<E: ExternalStreams + ?Sized>(
+    streams: &E,
+    compute: &ComputeNode,
+) -> bool {
+    input_related_to_external_nodes(streams, compute)
+        || output_related_to_external_nodes(streams, compute)
+}
 
 // crustify:todo: e339_convertResultToSkipReg
 //   authority : ddc/ddc_transformation_util.cpp:909  (110 body lines, level 3)
@@ -1205,7 +1467,7 @@ pub const fn is_memory(storage: SenComponent) -> bool {
 
 /// The `SenComponents` one [`DdcMemory`] IS — `ddc::memories`' own spelling read the other way, which
 /// is what lets entry 250 write an allocation's `component_` back into a `DataLocation`.
-const fn memory_component(memory: DdcMemory) -> SenComponent {
+pub const fn memory_component(memory: DdcMemory) -> SenComponent {
     match memory {
         DdcMemory::Lx => SenComponent::Lx,
         DdcMemory::L0 => SenComponent::L0,
@@ -2207,6 +2469,17 @@ pub trait StageExtents {
 
     /// `makeDimNotSymbolic(dim)` (`dsc/dims.cpp:717`).
     fn make_dim_not_symbolic(&mut self, dim: PrimaryDim);
+
+    /// `<split>_.clear()` — the WHOLE map, not one dim, as entry 300 empties `peSfpSplit_` on the
+    /// stage it copied (`ddc/ddc_transformation.cpp:1101-1102`).
+    fn clear_split(&mut self, split: DimSplit);
+
+    /// `<split>_.at(dim)` — that dim's per-side sizes, EMPTY where [`Self::states`] is false.
+    ///
+    /// ⛔ Entry 300 reads `.at(dim).at(0)` AND `.at(1)` of the corelet split
+    /// (`ddc/ddc_transformation.cpp:920-922`), so a split with fewer than two sides is that second
+    /// `.at()`'s throw and what to do about it is the caller's decision, not this reader's.
+    fn split_sizes(&self, split: DimSplit, dim: PrimaryDim) -> Vec<Elements>;
 }
 
 /// Replaces: e252_unrollTransferForSymbolicDims
@@ -3699,6 +3972,19 @@ mod tests_e247_e254 {
         fn make_dim_not_symbolic(&mut self, dim: PrimaryDim) {
             self.symbolic.remove(&dim);
             self.writes.push(format!("not symbolic {dim:?}"));
+        }
+
+        fn clear_split(&mut self, split: DimSplit) {
+            self.splits.retain(|(kind, _)| *kind != split);
+            self.writes.push(format!("clear {split:?}"));
+        }
+
+        fn split_sizes(&self, split: DimSplit, dim: PrimaryDim) -> Vec<Elements> {
+            if self.splits.contains(&(split, dim)) {
+                vec![Elements(1), Elements(1)]
+            } else {
+                Vec::new()
+            }
         }
     }
 

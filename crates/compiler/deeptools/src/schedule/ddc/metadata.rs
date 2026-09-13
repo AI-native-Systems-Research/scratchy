@@ -255,17 +255,7 @@ impl<S> Constraint<'_, S> {
     /// an intersection may leave it ENGAGED AND EMPTY, which no size satisfies. Two different states,
     /// and only the second is a contradiction.
     pub fn update_values(&mut self, new_vals: &[f32]) {
-        let mut incoming = new_vals.to_vec();
-        incoming.sort_by(f32::total_cmp);
-        incoming.dedup();
-        self.values = Some(match &self.values {
-            Some(values) => values
-                .iter()
-                .copied()
-                .filter(|value| incoming.contains(value))
-                .collect(),
-            None => incoming,
-        });
+        intersect_values(&mut self.values, new_vals);
     }
 
     /// Replaces: e099_dump
@@ -330,6 +320,22 @@ pub(crate) fn stricter_min(held: f32, new_val: f32) -> f32 {
 /// `std::min` ON TWO UPPER BOUNDS — likewise `(b < a) ? b : a`.
 pub(crate) fn stricter_max(held: f32, new_val: f32) -> f32 {
     if new_val < held { new_val } else { held }
+}
+
+/// `values_ = values_ ? set_intersect(*values_, newVals) : newVals` — the SHARED body of entry 098,
+/// because [`StoredConstraint`] holds the same `std::set<float>` and takes the same update.
+pub(crate) fn intersect_values(values: &mut Option<Vec<f32>>, new_vals: &[f32]) {
+    let mut incoming = new_vals.to_vec();
+    incoming.sort_by(f32::total_cmp);
+    incoming.dedup();
+    *values = Some(match values {
+        Some(values) => values
+            .iter()
+            .copied()
+            .filter(|value| incoming.contains(value))
+            .collect(),
+        None => incoming,
+    });
 }
 
 /// `operator<<(std::ostream&, float)` AT THE DEFAULT PRECISION 6 — `%g`: six significant digits,
@@ -573,6 +579,15 @@ impl Default for StoredConstraint {
     }
 }
 
+impl StoredConstraint {
+    /// `updateValues` ON THE STORED SIDE (`ddc/ddc_metadata.h:46`) — the same intersect entry 098
+    /// performs, reached through [`Datastage::constraint_mut`] by the transformations that WRITE
+    /// `constraints_` rather than check it.
+    pub fn update_values(&mut self, new_vals: &[f32]) {
+        intersect_values(&mut self.values, new_vals);
+    }
+}
+
 /// ONE DATASTAGE'S EXPLORATION STATE — `Metadata::Datastage` (`ddc/ddc_metadata.h:32`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Datastage {
@@ -600,6 +615,30 @@ impl Default for Datastage {
             relevant_dims_and_numerator: BTreeMap::new(),
             nearest_numerator_idx: None,
         }
+    }
+}
+
+impl Datastage {
+    /// `constraints_[reference][dims]` — `std::map::operator[]`, which DEFAULT-CONSTRUCTS the
+    /// constraint when that dim set is not yet keyed (`ddc/ddc_transformation.cpp:968`).
+    ///
+    /// ⛔ THE INNER KEY IS MATCHED WHOLE, AND AS A SET: `{x, y}` and `{y, x}` are ONE entry while
+    /// `{x}` is another. [`DimSet::of`] sorts and deduplicates, so equality of the key IS equality of
+    /// the set the reference's `std::set<DimId>` compares.
+    pub fn constraint_mut(
+        &mut self,
+        reference: Option<DatastageId>,
+        dims: DimSet,
+    ) -> &mut StoredConstraint {
+        let entries = self.constraints.entry(reference).or_default();
+        let at = match entries.iter().position(|(keyed, _)| *keyed == dims) {
+            Some(at) => at,
+            None => {
+                entries.push((dims, StoredConstraint::default()));
+                entries.len() - 1
+            }
+        };
+        &mut entries[at].1
     }
 }
 
