@@ -85,13 +85,15 @@
 //! | `e251_add` | 251 | 0 | 4 | `dcc/src/Transform/Sentient/Utils.hpp:165` |
 //! | `e252_size` | 252 | 0 | 4 | `dcc/src/Transform/Sentient/Utils.hpp:171` |
 //! | `e253_areAllValuesEqual` | 253 | 0 | 6 | `dcc/src/Transform/Sentient/Utils.hpp:180` |
+//! | `e396_replaceValue` | 396 | 1 | 4 | `dcc/src/Transform/Sentient/Utils.hpp:175` |
 
 
-// ⛔ NOTHING CALLS THIS TYPE YET. `replaceValue` (e396) is still anchored in the PARENT module, and
-// the type's one consumer is `RegisterInitCandidatePromoter` (e606, e517, e570) — all still open.
+// ⛔ NOTHING CALLS THIS TYPE YET. The type's one consumer is `RegisterInitCandidatePromoter`
+// (e606, e517, e570) — all still open.
 // ⭐ REMOVE THIS WITH THE FIRST OF THEM: an unused item here is a real defect from then on.
 #![allow(dead_code)]
 
+use crate::islands::dataflow_ir::print;
 use crate::islands::sentient::dialects::Val;
 
 /// EVERY UNIT OF A UNIFORMIZED PROGRAM PAIRED WITH ITS VALUE — `dcc::utils::UnitsAndTheirValues`
@@ -162,12 +164,40 @@ impl UnitsAndTheirValues {
         let (_, last) = *self.pairs.last()?;
         Some(self.pairs.iter().all(|(_, value)| *value == last))
     }
-}
 
-// crustify:todo: e394_dump
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:615  (6 body lines, level 1)
-//   original  : void UnitsAndTheirValues::dump()
-//   calls     : e252_size
+    /// Replaces: e396_replaceValue
+    ///
+    /// `replaceValue(index, new_val)` (`Utils.hpp:175`) — one mapping's value, overwritten in place.
+    ///
+    /// ⭐ PROMOTED FROM `utils/mod.rs`, whose scheduler TODO this was, for the reason e251-e253 were.
+    /// ⛔ `DT_CHECK(index < size())` (`:176`) IS THE SLICE INDEX AND NOT A CHECK ADDED HERE: an
+    /// out-of-range write is the reference's own crash, and Rust's is the same stop.
+    pub(crate) fn replace_value(&mut self, index: usize, new_val: Val) {
+        self.pairs[index].1 = Some(new_val);
+    }
+
+    /// Replaces: e394_dump
+    ///
+    /// The debug dump — `size: <n>` and then one `<unit>\t --> <value>` line per pair (`:615-620`).
+    ///
+    /// ⛔ A DUMP IS A STRING HERE, not an `llvm::dbgs()` — the `e102_dumpWeights` precedent
+    /// (`old_register_initialization/mod.rs`), so a test can read what the reference only prints.
+    /// ⚠️ A NULL VALUE ENDS THE LINE AFTER THE ARROW. MLIR prints nothing for a null `Value` and no
+    /// spelling is invented for one here.
+    #[must_use]
+    pub(crate) fn dump(&self) -> String {
+        let mut out = format!("size: {}\n", self.size());
+        for (unit, value) in &self.pairs {
+            out.push_str(&print::val(*unit));
+            out.push_str("\t --> ");
+            if let Some(value) = value {
+                out.push_str(&print::val(*value));
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
 
 
 #[cfg(test)]
@@ -227,5 +257,28 @@ mod unit_tests {
 
         uvs.add(Val(3), None);
         assert_eq!(uvs.are_all_values_equal(), Some(false));
+    }
+
+    /// e396 — the value at one index is overwritten and the unit beside it is untouched.
+    #[test]
+    fn e396_replace_value() {
+        let mut uvs = UnitsAndTheirValues {
+            pairs: vec![(Val(10), Some(Val(20))), (Val(11), None)],
+        };
+        uvs.replace_value(1, Val(21));
+        uvs.replace_value(0, Val(22));
+        assert_eq!(
+            uvs.pairs,
+            vec![(Val(10), Some(Val(22))), (Val(11), Some(Val(21)))]
+        );
+    }
+
+    /// e394 — the size line, one line per pair, and a null value ending its line after the arrow.
+    #[test]
+    fn e394_dump() {
+        let uvs = UnitsAndTheirValues {
+            pairs: vec![(Val(10), Some(Val(20))), (Val(11), None)],
+        };
+        assert_eq!(uvs.dump(), "size: 2\n%10\t --> %20\n%11\t --> \n");
     }
 }

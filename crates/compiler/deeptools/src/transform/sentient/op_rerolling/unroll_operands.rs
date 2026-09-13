@@ -763,7 +763,7 @@ impl UnrollOperands {
 /// ⛔ `None` IS THE REFERENCE'S OWN DEATH, NOT A CHECK ADDED HERE — the shape
 /// `bridges::dataflow_ir_to_sentient::vc_vector_operands::register_slice` already documents: every
 /// reader calls `.value()` on the result, which is `std::nullopt` from `lrf32` up.
-const fn lrf_at(index: u32) -> Option<sen::LrfIndex> {
+pub(crate) const fn lrf_at(index: u32) -> Option<sen::LrfIndex> {
     match index {
         0 => Some(sen::LrfIndex::L0),
         1 => Some(sen::LrfIndex::L1),

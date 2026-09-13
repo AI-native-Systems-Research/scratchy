@@ -730,7 +730,7 @@ fn carried_init_of(val: Val, root: &[Op]) -> Option<Val> {
 ///
 /// ⭐ An op that binds no scalar type answers `None`, which SKIPS an iter-arg candidate rather than
 /// accepting it on an unknown type.
-fn scalar_ty_of(val: Val, root: &[Op]) -> Option<ScalarTy> {
+pub(crate) fn scalar_ty_of(val: Val, root: &[Op]) -> Option<ScalarTy> {
     if let Some(init) = carried_init_of(val, root) {
         return scalar_ty_of(init, root);
     }
