@@ -957,15 +957,365 @@ pub(crate) fn adjust_candidate_for_op_result<A: Arch, E: ExpressionEvaluator>(
     true
 }
 
-// crustify:todo: e612_processForLinearChain
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1893  (129 body lines, level 5)
-//   original  : bool ScalarOpHoisting::processForLinearChain(BlockArgument &main_iv, Operation *derived_iv)
-//   calls     : e361_isImmutableValueInRange, e469_hoistForLinearChain, e578_adjustCandidateForOpResult
+/// `*op->getUsers().begin()` AND THE REFUSAL AT `:1945` AS ONE STEP — the reference takes the first
+/// user wherever it is and then declines any chain whose next op is not a direct child of the
+/// candidate loop's body.
+///
+/// ⭐ `None` IS THAT REFUSAL: a step with no user at all is its other reading, and `hasOneUse` has
+/// already ruled that out before every step the walk makes.
+fn first_user_in_body<'a>(of: &[Val], body: &'a [Op]) -> Option<&'a Op> {
+    let found = first_user(of, body)?;
+    body.iter().find(|op| core::ptr::eq(*op, found))
+}
 
-// crustify:todo: e613_processForGenericHoisting
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2075  (81 body lines, level 5)
-//   original  : bool ScalarOpHoisting::processForGenericHoisting(BlockArgument &main_iv, Operation *derived_iv)
-//   calls     : e171_isMergeableOpOrChain, e173_hoistCandidateOutOfLoop, e365_applyOperationData, e578_adjustCandidateForOpResult
+/// Replaces: e612_processForLinearChain
+///
+/// Hoists a derived induction variable whose users are a linear run of composite transfers from it to
+/// the loop's own yield, each absorbing the offset the one before it passed on (`:1893-2021`).
+///
+/// ⛔ THE FIRST TRANSFER IS THE ONE THAT ABSORBS THE ADD: it alone refuses a burst or interleaved
+/// group and it alone is recorded with `replace_with_mod`, and from there the running offset is the
+/// NEGATED immutable address it just approved, not the derived variable's constant.
+/// ⛔ THE INTERLEAVED-GROUP GATE IS `> 1` HERE AND `> 0` IN e171 (`:1969` against `:1607`) —
+/// transcribed, not harmonised.
+/// ⛔ THE CONSTANT IS EVALUATED BEFORE THE SUB GATE (`:1913-1919`) and the analysis memoises.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
+    scope: &mut Vec<Op>,
+    at: usize,
+    main_iv: IterArgIndex,
+    derived_iv: Val,
+    innermost: Innermost,
+    comp: GenericComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+    ibuff_space: &mut IbuffSpace,
+    hoists: &mut HoistCount,
+) -> bool {
+    // `is_any_of(getComp(), LXLU, LXSU, L0LU, L0SU)` — linear-chain hoisting is LX/L0 only (`:1894`).
+    if ScalarOpComp::of(comp).is_none() {
+        return false;
+    }
+    let Some(Op::Sentient(ops::Op::For { carried, body, .. })) = scope.get(at) else {
+        return false;
+    };
+    let Some(main_iv_arg) = carried.get(main_iv.0 as usize).map(|entry| entry.arg) else {
+        return false;
+    };
+    // `!derived_iv->hasOneUse() || !main_iv.hasOneUse()` (`:1903`).
+    if use_count(derived_iv, body) != 1 || use_count(main_iv_arg, body) != 1 {
+        return false;
+    }
+    let regions: [&[Op]; 1] = [body.as_slice()];
+    let defs = Definitions::from_innermost(&regions);
+    let Some(derived_iv_op) = defining_op(derived_iv, body) else {
+        return false;
+    };
+    let Some(const_operand_idx) = first_const_operand_index(derived_iv_op, defs) else {
+        // `getFirstConstOperandIndex`'s `-1`, which the reference then uses as an operand index.
+        return false;
+    };
+    let Some(constant) = operands(derived_iv_op).get(const_operand_idx).copied() else {
+        return false;
+    };
+    let mut offset = evaluator.evaluate_value(constant);
+    let mut offset_handle = evaluator.evaluate_value_handle(constant);
+    if matches!(derived_iv_op, Op::Sentient(ops::Op::ScalarSub { .. })) {
+        // `derived_iv = B - c` only, and then as `B + (c * -1)` (`:1916-1919`).
+        if const_operand_idx == 0 {
+            return false;
+        }
+        offset = evaluator.multiply_by_const(&offset, -1);
+        offset_handle = evaluator.evaluate_multiply_by_const(offset_handle, -1);
+    }
+    let mut first_comp_op_found = false;
+    let mut comp_ops: Vec<OperationData> = Vec::new();
+    let mut prev_results = results(derived_iv_op);
+    let mut current = first_user_in_body(&prev_results, body);
+    loop {
+        let Some(op) = current else {
+            return false;
+        };
+        if let Op::Sentient(ops::Op::Yield { results: yielded }) = op {
+            // `op == main_yield` — the chain ends here only if the yield hands the op before it back
+            // at the main IV's own position (`:1934-1937`).
+            if yielded.get(main_iv.0 as usize) == prev_results.first() {
+                break;
+            }
+            return false;
+        }
+        // `!op->hasOneUse()` (`:1938`).
+        if results(op)
+            .iter()
+            .map(|val| use_count(*val, body))
+            .sum::<usize>()
+            != 1
+        {
+            return false;
+        }
+        let Some(mem_info) = MemoryOpInfo::of(op) else {
+            // The `else` arm: anything but the three composites ends the chain unhoisted (`:2004`).
+            return false;
+        };
+        let Op::Sentient(
+            ops::Op::LoadAndSend { result, .. }
+            | ops::Op::ReceiveAndStore { result, .. }
+            | ops::Op::LoadComputeAndSend { result, .. },
+        ) = op
+        else {
+            // [`MemoryOpInfo::of`] names exactly these three.
+            return false;
+        };
+        if !is_sentient_constant(mem_info.immutable_addr, defs) {
+            return false;
+        }
+        let immutable_addr_ev = evaluator.evaluate_value(mem_info.immutable_addr);
+        // `mem_info.mutable_addr_.getDefiningOp() != prev_op` — the address has to keep flowing.
+        if !prev_results.contains(&mem_info.mutable_addr) {
+            return false;
+        }
+        // "Memory operations with non-zero increment attributes would have been handled in
+        // processForDerivedIVElimination()."
+        if is_update_mode(&mem_info, defs) {
+            return false;
+        }
+        if first_comp_op_found {
+            let new_immutable_ev = evaluator.evaluate_sum(&immutable_addr_ev, &offset);
+            if !is_immutable_value_in_range(
+                &new_immutable_ev,
+                &immutable_addr_ev,
+                mem_info.element_size,
+                op,
+            ) {
+                return false;
+            }
+            comp_ops.push(OperationData {
+                op: *result,
+                mod_by: offset_handle,
+                merging_increment: evaluator.constant(0),
+                replace_with_mod: false,
+            });
+        } else {
+            // TODO: Add support for burst/IL — this transfer's increment is what the hoisted add
+            // swaps into, which an unrolled transfer's own increments would contradict (`:1969`).
+            if mem_info.burst > Elements(1) || mem_info.il > Elements(1) {
+                return false;
+            }
+            if !is_immutable_value_in_range(&offset, &immutable_addr_ev, mem_info.element_size, op)
+            {
+                return false;
+            }
+            comp_ops.push(OperationData {
+                op: *result,
+                mod_by: offset_handle,
+                merging_increment: evaluator.constant(0),
+                replace_with_mod: true,
+            });
+            // This transfer's immutable address, negated, is what the rest of the chain absorbs.
+            let immutable_handle = evaluator.evaluate_value_handle(mem_info.immutable_addr);
+            offset_handle = evaluator.evaluate_multiply_by_const(immutable_handle, -1);
+            offset = evaluator.multiply_by_const(&immutable_addr_ev, -1);
+            first_comp_op_found = true;
+        }
+        prev_results = results(op);
+        current = first_user_in_body(&prev_results, body);
+    }
+    if comp_ops.is_empty() {
+        return false;
+    }
+    if !adjust_candidate_for_op_result::<A, E>(
+        scope,
+        at,
+        main_iv,
+        MergingIncrement {
+            handle: offset_handle,
+            evaluation: &offset,
+        },
+        innermost,
+        comp,
+        scale,
+        evaluator,
+        sites,
+        ibuff_space,
+    ) {
+        return false;
+    }
+    hoist_for_linear_chain(
+        scope,
+        at,
+        main_iv,
+        derived_iv,
+        &comp_ops,
+        comp,
+        sites.values,
+    );
+    hoists.0 += 1;
+    true
+}
+
+/// Replaces: e613_processForGenericHoisting
+///
+/// Hoists a derived induction variable whose loop yield is fed by an add or sub that can absorb the
+/// adjustment, adjusting every other reader of that op and of the main iter arg by its opposite
+/// (`:2075-2155`).
+///
+/// ⛔ THE SIGNS ARE NOT SYMMETRIC: the op feeding the yield takes `+adjustment` — or `-adjustment`
+/// when it is a sub reading the constant FIRST — and every other reader takes `-adjustment`.
+/// ⛔ A SUB FEEDING THE YIELD WITH THE CONSTANT SECOND FALLS THROUGH TO THE `isa<AddOp>` TEST AND IS
+/// DECLINED (`:2109-2117`): the two arms are not exhaustive over add/sub, and that is the reference.
+/// ⛔ THE CONSTANT IS EVALUATED BEFORE THE SUB GATE (`:2085-2092`) and the analysis memoises.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
+    scope: &mut Vec<Op>,
+    at: usize,
+    main_iv: IterArgIndex,
+    derived_iv: Val,
+    innermost: Innermost,
+    comp: GenericComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+    ibuff_space: &mut IbuffSpace,
+    hoists: &mut HoistCount,
+) -> bool {
+    let Some(Op::Sentient(ops::Op::For { carried, body, .. })) = scope.get(at) else {
+        return false;
+    };
+    let Some(main_iv_arg) = carried.get(main_iv.0 as usize).map(|entry| entry.arg) else {
+        return false;
+    };
+    let regions: [&[Op]; 1] = [body.as_slice()];
+    let defs = Definitions::from_innermost(&regions);
+    let Some(derived_iv_op) = defining_op(derived_iv, body) else {
+        return false;
+    };
+    let Some(const_operand_idx) = first_const_operand_index(derived_iv_op, defs) else {
+        // `getFirstConstOperandIndex`'s `-1`, which the reference then uses as an operand index.
+        return false;
+    };
+    let Some(derived_iv_operand) = operands(derived_iv_op).get(const_operand_idx).copied() else {
+        return false;
+    };
+    let mut adjustment = evaluator.evaluate_value(derived_iv_operand);
+    let mut adjustment_handle = evaluator.evaluate_value_handle(derived_iv_operand);
+    if matches!(derived_iv_op, Op::Sentient(ops::Op::ScalarSub { .. })) {
+        // `derived_iv = B - c` only, and then as `B + (c * -1)` (`:2088-2092`).
+        if const_operand_idx == 0 {
+            return false;
+        }
+        adjustment = evaluator.multiply_by_const(&adjustment, -1);
+        adjustment_handle = evaluator.evaluate_multiply_by_const(adjustment_handle, -1);
+    }
+    // `main_yield->getOperand(main_iv_idx).getDefiningOp()` — the op the loop hands back at the main
+    // IV's position is the one that has to absorb the adjustment (`:2096-2102`).
+    let Some((main_yield, yielded)) = body.iter().find_map(|op| match op {
+        Op::Sentient(ops::Op::Yield { results }) => Some((op, results)),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let Some(yielded_val) = yielded.get(main_iv.0 as usize).copied() else {
+        return false;
+    };
+    let Some(op_feeding_yield) = defining_op(yielded_val, body) else {
+        return false;
+    };
+    let Some(const_idx) = first_const_operand_index(op_feeding_yield, defs) else {
+        return false;
+    };
+    let mut ops_to_update: Vec<OperationData> = Vec::new();
+    if matches!(op_feeding_yield, Op::Sentient(ops::Op::ScalarSub { .. })) && const_idx == 0 {
+        let mod_by = evaluator.evaluate_multiply_by_const(adjustment_handle, -1);
+        ops_to_update.push(OperationData {
+            op: yielded_val,
+            mod_by,
+            merging_increment: evaluator.constant(0),
+            replace_with_mod: false,
+        });
+    } else if matches!(op_feeding_yield, Op::Sentient(ops::Op::ScalarAdd { .. })) {
+        ops_to_update.push(OperationData {
+            op: yielded_val,
+            mod_by: adjustment_handle,
+            merging_increment: evaluator.constant(0),
+            replace_with_mod: false,
+        });
+    } else {
+        return false;
+    }
+    // Every OTHER reader of the op feeding the yield has to be mergeable, and takes the opposite
+    // adjustment (`:2118-2128`).
+    for user in users(&[yielded_val], body) {
+        if core::ptr::eq(user, main_yield) {
+            continue;
+        }
+        if !is_mergeable_op_or_chain(op_feeding_yield, user, comp, body) {
+            return false;
+        }
+        let Some(user_val) = results(user).first().copied() else {
+            // Unreachable: every arm e171 accepts binds one result.
+            continue;
+        };
+        let mod_by = evaluator.evaluate_multiply_by_const(adjustment_handle, -1);
+        ops_to_update.push(OperationData {
+            op: user_val,
+            mod_by,
+            merging_increment: evaluator.constant(0),
+            replace_with_mod: false,
+        });
+    }
+    // And every other use of the main IV, once the derived one is gone (`:2130-2140`).
+    for user in users(&[main_iv_arg], body) {
+        if core::ptr::eq(user, derived_iv_op) {
+            continue;
+        }
+        let Some(user_val) = results(user).first().copied() else {
+            todo!(
+                "processForGenericHoisting: applyOperationData's \
+                 llvm_unreachable (ScalarOpMergingAndHoisting.cpp:1793) — {user:?} reads the main IV \
+                 and binds no result to modify"
+            )
+        };
+        let mod_by = evaluator.evaluate_multiply_by_const(adjustment_handle, -1);
+        ops_to_update.push(OperationData {
+            op: user_val,
+            mod_by,
+            merging_increment: evaluator.constant(0),
+            replace_with_mod: false,
+        });
+    }
+    let negated = evaluator.multiply_by_const(&adjustment, -1);
+    let negated_handle = evaluator.evaluate_multiply_by_const(adjustment_handle, -1);
+    if !adjust_candidate_for_op_result::<A, E>(
+        scope,
+        at,
+        main_iv,
+        MergingIncrement {
+            handle: negated_handle,
+            evaluation: &negated,
+        },
+        innermost,
+        comp,
+        scale,
+        evaluator,
+        sites,
+        ibuff_space,
+    ) {
+        return false;
+    }
+    apply_operation_data(&ops_to_update);
+    hoist_candidate_out_of_loop(
+        scope,
+        at,
+        main_iv,
+        derived_iv,
+        derived_iv_operand,
+        comp,
+        sites.values,
+    );
+    hoists.0 += 1;
+    true
+}
 
 // crustify:todo: e635_runScalarOpHoisting
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2184  (61 body lines, level 6)
@@ -1018,6 +1368,17 @@ mod unit_tests {
         fn evaluate_value_handle(&mut self, _value: Val) -> EvaluatedValue {
             // The handle flavour of the same stated answer — what e530 hands the chain walk.
             EvaluatedValue(7)
+        }
+
+        fn multiply_by_const(&mut self, ev: &Evaluation, by: i64) -> Evaluation {
+            absolute(ScalarOffset(
+                ev.all_unit_offset().map_or(0, |offset| offset.0) * by,
+            ))
+        }
+
+        fn evaluate_multiply_by_const(&mut self, _ev: EvaluatedValue, _by: i64) -> EvaluatedValue {
+            // A stated arena entry, distinct from the one `evaluate_value_handle` names.
+            EvaluatedValue(70)
         }
     }
 
@@ -1588,5 +1949,163 @@ mod unit_tests {
             &mut none_left,
         ));
         assert_eq!(declined, candidate());
+    }
+    fn sub(lhs: Val, rhs: Val, result: Val, element_size: Option<Bits>) -> Op {
+        Op::Sentient(ops::Op::ScalarSub {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            element_size,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    /// The one loop both level-5 drivers are asked about: `%5` is the derived IV, `%6` is what the
+    /// yield hands back, and `chain` is what sits between them.
+    fn loop_with(chain: Vec<Op>, yielded: Vec<Val>) -> Vec<Op> {
+        let mut body = vec![
+            constant(4, Val(10)),
+            add(Val(3), Val(10), Val(5), Some(Bits(8))),
+            constant(6, Val(11)),
+            constant(0, Val(12)),
+        ];
+        body.extend(chain);
+        body.push(Op::Sentient(ops::Op::Yield { results: yielded }));
+        vec![for_op(
+            vec![carried(Val(2), Val(3), Val(4), Some(Bits(8)))],
+            body,
+        )]
+    }
+
+    fn sites_of<'a>(consts: &'a mut Vec<Op>, values: &'a mut Values) -> OffsetSites<'a> {
+        OffsetSites {
+            consts,
+            query_maps: None,
+            values,
+        }
+    }
+
+    /// e612 — a one-transfer chain clears every gate: the derived IV feeds the transfer's mutable
+    /// address, the transfer feeds the yield at the main IV's own slot, and the first transfer in a
+    /// chain is measured against e361, which is not ported.
+    #[test]
+    #[should_panic(expected = "senpass e361")]
+    fn a_linear_chain_of_one_transfer_reaches_the_unported_range_check() {
+        let mut scope = loop_with(vec![load_and_send(Val(5), Val(11), Val(12))], vec![Val(31)]);
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
+        process_for_linear_chain::<Dd2, _>(
+            &mut scope,
+            0,
+            IterArgIndex(0),
+            Val(5),
+            Innermost::Yes,
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut StatedEvaluator {
+                offset: Val(9),
+                sums: Vec::new(),
+            },
+            &mut sites_of(&mut consts, &mut values),
+            &mut IbuffSpace(4),
+            &mut HoistCount(0),
+        );
+    }
+
+    /// ⛔ `:1945`'S REFUSAL: the derived IV's one user is inside a NESTED loop, so the walk declines
+    /// the candidate rather than following the chain out of the body it may rewrite.
+    #[test]
+    fn a_derived_iv_used_inside_a_nested_loop_is_declined() {
+        let mut scope = loop_with(
+            vec![for_op(
+                Vec::new(),
+                vec![load_and_send(Val(5), Val(11), Val(12))],
+            )],
+            vec![Val(11)],
+        );
+        let untouched = scope.clone();
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
+        let mut hoists = HoistCount(0);
+        assert!(!process_for_linear_chain::<Dd2, _>(
+            &mut scope,
+            0,
+            IterArgIndex(0),
+            Val(5),
+            Innermost::Yes,
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut StatedEvaluator {
+                offset: Val(9),
+                sums: Vec::new(),
+            },
+            &mut sites_of(&mut consts, &mut values),
+            &mut IbuffSpace(4),
+            &mut hoists,
+        ));
+        assert_eq!(scope, untouched);
+        assert_eq!(hoists, HoistCount(0));
+    }
+
+    /// e613 — the add feeding the yield absorbs the adjustment, the loop result needs none, and the
+    /// hoist then reaches `applyOperationData`, which is e365 and not ported.
+    #[test]
+    #[should_panic(expected = "senpass e365")]
+    fn generic_hoisting_reaches_the_unported_apply_operation_data() {
+        let mut scope = loop_with(
+            vec![add(Val(5), Val(11), Val(6), Some(Bits(8)))],
+            vec![Val(6)],
+        );
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
+        process_for_generic_hoisting::<Dd2, _>(
+            &mut scope,
+            0,
+            IterArgIndex(0),
+            Val(5),
+            Innermost::Yes,
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut StatedEvaluator {
+                offset: Val(9),
+                sums: Vec::new(),
+            },
+            &mut sites_of(&mut consts, &mut values),
+            &mut IbuffSpace(4),
+            &mut HoistCount(0),
+        );
+    }
+
+    /// ⛔ THE ASYMMETRY e613's TWO ARMS LEAVE: a sub feeding the yield is absorbable only with the
+    /// constant FIRST, and with it second the reference falls through to `isa<AddOp>` and declines.
+    #[test]
+    fn a_sub_feeding_the_yield_with_the_constant_second_is_declined() {
+        let mut scope = loop_with(
+            vec![sub(Val(5), Val(11), Val(6), Some(Bits(8)))],
+            vec![Val(6)],
+        );
+        let untouched = scope.clone();
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
+        let mut hoists = HoistCount(0);
+        assert!(!process_for_generic_hoisting::<Dd2, _>(
+            &mut scope,
+            0,
+            IterArgIndex(0),
+            Val(5),
+            Innermost::Yes,
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut StatedEvaluator {
+                offset: Val(9),
+                sums: Vec::new(),
+            },
+            &mut sites_of(&mut consts, &mut values),
+            &mut IbuffSpace(4),
+            &mut hoists,
+        ));
+        assert_eq!(scope, untouched);
+        assert_eq!(hoists, HoistCount(0));
     }
 }

@@ -699,10 +699,132 @@ pub(crate) fn collect_blocks<A: Arch, E: ExpressionEvaluator>(
     }
 }
 
-// crustify:todo: e611_runScalarOpMerging
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:569  (10 body lines, level 5)
-//   original  : void ScalarOpMerging::runScalarOpMerging()
-//   calls     : e363_markFieldUnrollingCandidates, e364_doScalarOpMerging, e577_collectBlocks
+/// WHERE THE PASS IS RUN — `ScalarOpMerging(opt_context, region, ibuff_space)` is constructed on a
+/// loop body (`:2320`) and on the program unit's own region (`:2376`), and `region_.getParentOp()` is
+/// the difference [`is_profitable_for_hoisting`] asks about.
+///
+/// ⛔ IT IS ONE PARAMETER BECAUSE THE TWO READINGS OVERLAP: the parent op OWNS the region it hands
+/// out, so a caller cannot pass `&mut Vec<Op>` and `Option<&Op>` for the same loop separately.
+pub(crate) enum MergingRegion<'a> {
+    /// `for_op.getLoopBody()` — the `sentient.for` whose body is the region.
+    LoopBody(&'a mut Op),
+    /// `unit.getRegion()`, which is no loop body, so hoisting is never profitable for its blocks.
+    UnitRegion(&'a mut Vec<Op>),
+}
+
+impl MergingRegion<'_> {
+    /// `region_`, read.
+    ///
+    /// ⭐ AN EMPTY REGION FOR A [`MergingRegion::LoopBody`] THAT IS NOT A LOOP: the reference's own
+    /// `DT_CHECK_MSG(for_op, "Node is not a for_op as expected.")` (`:2303`) makes it unreachable, and
+    /// a region with no op in it collects no block and transforms nothing.
+    fn region(&self) -> &[Op] {
+        match self {
+            Self::LoopBody(for_op) => match &**for_op {
+                Op::Sentient(ops::Op::For { body, .. }) => body,
+                _ => &[],
+            },
+            Self::UnitRegion(region) => region,
+        }
+    }
+
+    /// `region_.getParentOp()`, which only a loop body has.
+    fn parent_op(&self) -> Option<&Op> {
+        match self {
+            Self::LoopBody(for_op) => Some(for_op),
+            Self::UnitRegion(_) => None,
+        }
+    }
+
+    /// The same region, borrowed for shorter — one pass member handed to two calls in turn.
+    fn reborrow(&mut self) -> MergingRegion<'_> {
+        match self {
+            Self::LoopBody(for_op) => MergingRegion::LoopBody(for_op),
+            Self::UnitRegion(region) => MergingRegion::UnitRegion(region),
+        }
+    }
+}
+
+/// `ScalarOpMerging::markFieldUnrollingCandidates` (`:1206`) — spends the unit's remaining IBuff on
+/// the sorted blocks' unroll candidates, whole block first and candidate by candidate otherwise.
+///
+/// ⛔ IT IS e363 AND IT IS NOT PORTED YET. [`sort_blocks`] and [`is_profitable_for_hoisting`], the two
+/// units it opens with, are ported; the LDSTI imm window its corner case measures against arrives
+/// with e361's `OptimizationContext`, as does the decoding of a stored merging increment.
+fn mark_field_unrolling_candidates(
+    blocks: &mut [ScalarOpMergingBlock],
+    parent_op: Option<&Op>,
+    ibuff_space: &mut IbuffSpace,
+    scale: AddressScale,
+    evaluator: &mut dyn ExpressionEvaluator,
+) {
+    let _ = (blocks, parent_op, ibuff_space, scale, evaluator);
+    todo!(
+        "markFieldUnrollingCandidates (senpass e363, ScalarOpMergingAndHoisting.cpp:1206) is not \
+         ported yet — which unroll candidates the remaining IBuff pays for"
+    )
+}
+
+/// `ScalarOpMerging::doScalarOpMerging` (`:1334`) — merges one block: the chain's scalar ops collapse
+/// into the composite transfers that absorb them, and each field-unroll candidate is unrolled first.
+///
+/// ⛔ IT IS e364 AND IT IS NOT PORTED YET. [`is_profitable_for_hoisting`], [`unroll_burst_and_il`] and
+/// [`find_field_unroll_candidate`], the three units it delegates to, are ported and waiting for it.
+fn do_scalar_op_merging(
+    block: &ScalarOpMergingBlock,
+    region: MergingRegion<'_>,
+    evaluator: &mut dyn ExpressionEvaluator,
+    sites: &mut OffsetSites<'_>,
+) {
+    let _ = (block, region, evaluator, sites);
+    todo!(
+        "doScalarOpMerging (senpass e364, ScalarOpMergingAndHoisting.cpp:1334) is not ported yet — \
+         the merge of one block's chain into the transfers that absorb it"
+    )
+}
+
+/// Replaces: e611_runScalarOpMerging
+///
+/// The whole `ScalarOpMerging` pass, which the reference's constructor runs (`:462-464`): collect the
+/// region's merging blocks, spend the unit's IBuff marking field-unroll candidates, then merge each
+/// block in the order that spending left them in (`:569-577`).
+///
+/// ⭐ NOTHING BUT THE REGION SURVIVES THE PASS: `getBlocks()` and `getRegion()` (`:467-468`) have no
+/// reader in the file, so `blocks_` and the spent `ibuff_space_` are the pass's own bookkeeping.
+pub(crate) fn run_scalar_op_merging<A: Arch, E: ExpressionEvaluator>(
+    mut region: MergingRegion<'_>,
+    ibuff_space: IbuffSpace,
+    comp: ScalarOpComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+) {
+    let mut ibuff_space = ibuff_space;
+    let mut blocks: Vec<ScalarOpMergingBlock> = Vec::new();
+    collect_blocks::<A, E>(
+        region.region(),
+        ibuff_space,
+        comp,
+        scale,
+        evaluator,
+        &mut blocks,
+    );
+    if blocks.is_empty() {
+        return;
+    }
+    // Order blocks with respect to their benefit vs IBuff impact and mark operations in the blocks
+    // for Field Unrolling.
+    mark_field_unrolling_candidates(
+        &mut blocks,
+        region.parent_op(),
+        &mut ibuff_space,
+        scale,
+        evaluator,
+    );
+    for block in &blocks {
+        do_scalar_op_merging(block, region.reborrow(), evaluator, sites);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -1164,5 +1286,57 @@ mod unit_tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].input_value_to_block, Some(Val(1)));
         assert_eq!(blocks[0].num_scalar_ops_in_block, ScalarOpCount(2));
+    }
+    /// e611 — the pass collects the chain's one block and then reaches the candidate marking, which is
+    /// e363 and not ported.
+    #[test]
+    #[should_panic(expected = "senpass e363")]
+    fn a_region_with_one_merging_block_reaches_the_unported_candidate_marking() {
+        let mut region = vec![
+            scalar_constant(8, Val(2)),
+            add_sized(Val(1), Val(2), Val(4), Bits(16)),
+            add_sized(Val(4), Val(2), Val(6), Bits(16)),
+        ];
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        run_scalar_op_merging::<Dd2, _>(
+            MergingRegion::UnitRegion(&mut region),
+            IbuffSpace(8),
+            ScalarOpComp::Lxlu,
+            AddressScale::ONE,
+            &mut SummingEvaluator::default(),
+            &mut OffsetSites {
+                consts: &mut consts,
+                query_maps: None,
+                values: &mut values,
+            },
+        );
+    }
+
+    /// ⭐ `if (blocks_.empty()) return;` — a region with no mergeable chain in it is left exactly as it
+    /// was, and neither unported unit is reached.
+    #[test]
+    fn a_region_with_no_merging_candidate_is_left_alone() {
+        let mut region = vec![
+            scalar_constant(8, Val(2)),
+            load_and_send(Val(1), Val(2), Val(3), Val(5), 0, 0),
+        ];
+        let untouched = region.clone();
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        run_scalar_op_merging::<Dd2, _>(
+            MergingRegion::UnitRegion(&mut region),
+            IbuffSpace(8),
+            ScalarOpComp::Lxlu,
+            AddressScale::ONE,
+            &mut SummingEvaluator::default(),
+            &mut OffsetSites {
+                consts: &mut consts,
+                query_maps: None,
+                values: &mut values,
+            },
+        );
+        assert_eq!(region, untouched);
+        assert!(consts.is_empty());
     }
 }
