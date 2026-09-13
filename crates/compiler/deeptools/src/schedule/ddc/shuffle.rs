@@ -495,6 +495,12 @@ const PACK26: [ShuffleIndex; 16] =
 /// `pack27` (`shuffle.cpp:46`).
 const PACK27: [ShuffleIndex; 16] =
     indices([0, 2, 16, 18, 4, 6, 20, 22, 8, 10, 24, 26, 12, 14, 28, 30]);
+/// `pack12` (`shuffle.cpp:34`) — a shift-left's LOW output stick.
+const PACK12: [ShuffleIndex; 16] =
+    indices([0, -1, 1, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1]);
+/// `pack13` (`shuffle.cpp:36`) — its HIGH output stick, the same lanes offset by eight.
+const PACK13: [ShuffleIndex; 16] =
+    indices([8, -1, 9, -1, 10, -1, 11, -1, 12, -1, 13, -1, 14, -1, 15, -1]);
 
 /// A PSEUDOCODE REGISTER NAME — `r0`, `r1`, .. as `codegen_psuedocode` mints them
 /// (`shuffle.cpp:1229-1234`).
@@ -770,6 +776,9 @@ pub enum MergeDim {
 }
 
 impl MergeDim {
+    /// The four in slot order, which is the order `add_valid_actions` (e310) offers them in.
+    const ALL: [Self; 4] = [Self::Bit8, Self::Bit16, Self::Bit32, Self::Bit64];
+
     /// The slice subdimension it names.
     #[must_use]
     pub const fn slice(self) -> SliceDim {
@@ -779,6 +788,21 @@ impl MergeDim {
             Self::Bit32 => SliceDim::Bit32,
             Self::Bit64 => SliceDim::Bit64,
         }
+    }
+
+    /// EVERY SUBDIMENSION A FORMAT THIS WIDE MAY MERGE ON — the loop bound
+    /// `max(dim_8bit, bitwidth_to_idx(bw)) ..= dim_64bit` (`shuffle.cpp:230-232`).
+    ///
+    /// ⛔ `bitwidth_to_idx` IS `int_log2(bw) - 1` (`shuffle.cpp:107`) ON A TRUNCATED LOG, so a 9-bit
+    /// `SEN153_FP9` floors at the 8-BIT slot and a 24-bit `SEN18F_FP24` at the 16-bit one.
+    /// ⛔ THE `max(dim_8bit, ..)` IS THIS TYPE: [`Self`] cannot name the 2- or 4-bit slots, so a
+    /// narrow format's floor is clamped by the representation rather than by a comparison.
+    #[must_use]
+    pub fn mergeable_for(bits: Bits) -> impl Iterator<Item = Self> {
+        let floor = int_log2(bits.0 as i32) - 1;
+        Self::ALL
+            .into_iter()
+            .filter(move |slice| slice.slice().index() as i32 >= floor)
     }
 }
 
@@ -887,6 +911,59 @@ impl MergeAction {
             (MergeDim::Bit64, Half::High) => &MERGE64H,
         }
     }
+
+    /// Replaces: e310_add_valid_actions
+    ///
+    /// ONE MERGE PER (STICK DIMENSION, MERGEABLE SLOT), each carrying the dimension that slot holds,
+    /// so a live slot yields an extracting merge and a dummy one a filling merge
+    /// (`shuffle.cpp:226-237`).
+    ///
+    /// ⛔ THE SLOT FLOOR IS THE FORMAT'S — [`MergeDim::mergeable_for`] holds it. ⛔ `goal` IS UNREAD.
+    /// ⛔ STICK DIMENSION OUTER, SLOT INNER: that is the order the search first explores.
+    pub fn add_valid_actions(
+        actions: &mut ActionList,
+        input: &AbstractLayout,
+        _goal: &AbstractLayout,
+    ) {
+        for &stick_dim in &input.stick_dims {
+            for slice in MergeDim::mergeable_for(input.format.bits()) {
+                actions.push(ShuffleAction::Merge(Self::new(
+                    stick_dim,
+                    slice,
+                    input.slice_dim(slice.slice()),
+                )));
+            }
+        }
+    }
+
+    /// Replaces: e311_enumerate_stick_computations
+    ///
+    /// TWO OPS FOR AN EXTRACTING MERGE AND ONE FOR A FILLING ONE — the low half's table, then the
+    /// high half's, each a two-stick packmerge on the merged dimension (`shuffle.cpp:305-319`).
+    ///
+    /// ⛔ THE OUTPUT INDEX IS WRITTEN ONLY WHEN EXTRACTING (`shuffle.cpp:314-317`): a filling merge
+    /// leaves it empty for `repeat_over_dims` (e140) to fill, and records no displaced dummy.
+    #[must_use]
+    pub fn enumerate_stick_computations(&self) -> Vec<ComputationOp> {
+        // Don't need to condition on keep_input/output_order since we do it anyway.
+        let halves: &[Half] = match self.mode {
+            MergeMode::Fill => &[Half::Low],
+            MergeMode::Extract(_) => &[Half::Low, Half::High],
+        };
+        let mut out_sticks = Vec::new();
+        for &half in halves {
+            let mut op = ComputationOp::bin_op(
+                self.stick_dim,
+                self.get_shuffle_indices(half).to_vec(),
+                IndexExpansion::ByElementWidth,
+            );
+            if let MergeMode::Extract(displaced) = self.mode {
+                op.output.insert(displaced, half);
+            }
+            out_sticks.push(op);
+        }
+        out_sticks
+    }
 }
 
 /// WHICH SUBDIMENSION A PACK INSERTS AT — the three `pack25`/`pack26`/`pack27` reach.
@@ -904,6 +981,10 @@ pub enum PackDim {
 }
 
 impl PackDim {
+    /// The three in slot order, which is the `dim_16bit ..= dim_64bit` loop `add_valid_actions`
+    /// (e312) offers them in (`shuffle.cpp:341`).
+    const ALL: [Self; 3] = [Self::Bit16, Self::Bit32, Self::Bit64];
+
     /// The slice subdimension it names.
     #[must_use]
     pub const fn slice(self) -> SliceDim {
@@ -979,6 +1060,43 @@ impl PackAction {
             PackDim::Bit16 => &PACK27,
         }
     }
+
+    /// Replaces: e312_add_valid_actions
+    ///
+    /// ONE PACK PER (STICK DIMENSION, SLOT ABOVE THE 8-BIT ONE), and only for a format of eight bits
+    /// or fewer whose 8-bit slot is vacant (`shuffle.cpp:331-343`).
+    ///
+    /// ⛔ THE TEST IS `bw > 8` ON THE ELEMENT WIDTH AND NOT ON A SLOT INDEX: it also refuses the
+    /// 9-bit `SEN153_FP9`, which the truncated-log floor of [`MergeDim::mergeable_for`] admits.
+    /// ⛔ `goal` IS UNREAD — the reference's own comment gives quantization as the reason.
+    pub fn add_valid_actions(
+        actions: &mut ActionList,
+        input: &AbstractLayout,
+        _goal: &AbstractLayout,
+    ) {
+        // "can't chop up 16, 32 bits in half - even if its reassembled later somehow it can mess
+        // with quantization happening in between"
+        if input.format.bits() > Bits(8) || !input.slice_dim(SliceDim::Bit8).is_dummy() {
+            return;
+        }
+        for &stick_dim in &input.stick_dims {
+            for slice in PackDim::ALL {
+                actions.push(ShuffleAction::Pack(Self::new(stick_dim, slice)));
+            }
+        }
+    }
+
+    /// Replaces: e313_enumerate_stick_computations
+    ///
+    /// ONE TWO-STICK PACKMERGE on this pack's own table (`shuffle.cpp:379-382`).
+    #[must_use]
+    pub fn enumerate_stick_computations(&self) -> Vec<ComputationOp> {
+        vec![ComputationOp::bin_op(
+            self.stick_dim,
+            self.get_indices().to_vec(),
+            IndexExpansion::ByElementWidth,
+        )]
+    }
 }
 
 /// SHIFTS THE SLICE DIMENSIONS ONE PLACE UP, dropping the 64-bit subdimension or extracting it back
@@ -1046,6 +1164,50 @@ impl ShiftLeftAction {
             ShuffleCost((sticks * 2) as f64)
         }
     }
+
+    /// Replaces: e314_add_valid_actions
+    ///
+    /// ONE SHIFT-LEFT for a format of eight bits or fewer, carrying whatever the input's 64-bit slot
+    /// holds (`shuffle.cpp:398-405`).
+    ///
+    /// ⛔ NO STICK LOOP AND NO DUMMY TEST, alone among the eight offers: one action per layout, and
+    /// offered even when that slot is vacant — the shift then DISCARDS it instead of extracting.
+    /// ⛔ `goal` IS UNREAD.
+    pub fn add_valid_actions(
+        actions: &mut ActionList,
+        input: &AbstractLayout,
+        _goal: &AbstractLayout,
+    ) {
+        if input.format.bits() > Bits(8) {
+            return;
+        }
+        actions.push(ShuffleAction::ShiftLeft(Self::new(
+            input.slice_dim(SliceDim::Bit64),
+        )));
+    }
+
+    /// Replaces: e315_enumerate_stick_computations
+    ///
+    /// TWO ONE-STICK PACKMERGES when the shift extracts — `pack12` then `pack13` — and only
+    /// `pack12` when it discards (`shuffle.cpp:428-441`).
+    ///
+    /// ⛔ THE OUTPUT INSERT IS UNCONDITIONAL (`shuffle.cpp:436`), unlike the merge's: a DISCARDING
+    /// shift still records its dummy at [`Half::Low`] in that one op's output index.
+    #[must_use]
+    pub fn enumerate_stick_computations(&self) -> Vec<ComputationOp> {
+        // Don't need to condition on keep_input/output_order since we do it anyway.
+        let outs = if self.extract_dim.is_dummy() { 1 } else { 2 };
+        let mut out_sticks = Vec::new();
+        for (indices, half) in [(&PACK12, Half::Low), (&PACK13, Half::High)]
+            .into_iter()
+            .take(outs)
+        {
+            let mut op = ComputationOp::unary_op(indices.to_vec());
+            op.output.insert(self.extract_dim, half);
+            out_sticks.push(op);
+        }
+        out_sticks
+    }
 }
 
 /// THE `pack8` INSTRUCTION — takes a stick dimension into the slice, drops the 4- and 8-bit
@@ -1087,6 +1249,37 @@ impl Pack8Action {
         output.slice_dims[SliceDim::Bit32.index()] = self.dim;
         output.slice_dims[SliceDim::Bit64.index()] = DimSymbol::DUMMY;
         output
+    }
+
+    /// Replaces: e316_add_valid_actions
+    ///
+    /// OFFERS A `pack8` PER STICK DIMENSION when the format is four bits or fewer, the 4- and 8-bit
+    /// slots are dummies, and the 16-bit slot is a dummy or already final (`shuffle.cpp:451-471`).
+    ///
+    /// ⛔ THAT LAST TEST IS CROSS-SLOT — the INPUT'S 16-BIT slot against the GOAL'S 4-BIT slot —
+    /// because [`Self::act`] slides that dimension two places down into the 4-bit slot.
+    /// ⛔ `input.sliceDims().size() <= dim_4bit` (`:454`) CANNOT HOLD: the slice is always six slots.
+    pub fn add_valid_actions(
+        actions: &mut ActionList,
+        input: &AbstractLayout,
+        goal: &AbstractLayout,
+    ) {
+        // "this logic asserts that the only dimension we can ever move into the 4 bit place is its
+        // goal dimension or dummy, on the basis that our current instruction set cannot recover
+        // 4-bit dimensions. If that changes, revisit."
+        let displaced = input.slice_dim(SliceDim::Bit16);
+        let can_pack = input.format.bits() <= Bits(4)
+            && input.slice_dim(SliceDim::Bit4).is_dummy()
+            && input.slice_dim(SliceDim::Bit8).is_dummy()
+            && (displaced == goal.slice_dim(SliceDim::Bit4) || displaced.is_dummy());
+        if can_pack {
+            actions.extend(
+                input
+                    .stick_dims
+                    .iter()
+                    .map(|stick| ShuffleAction::Pack8(Self::new(*stick))),
+            );
+        }
     }
 }
 
@@ -1136,6 +1329,32 @@ impl Pack9Action {
     #[must_use]
     pub fn cost(&self, input: &AbstractLayout) -> ShuffleCost {
         ShuffleCost((input.num_sticks().0 / 2) as f64)
+    }
+
+    /// Replaces: e317_add_valid_actions
+    ///
+    /// OFFERS ONE `pack9` OF THE GOAL'S 4-BIT DIMENSION when the format is four bits or fewer, the
+    /// sticks hold that dimension, and the 4- and 8-bit slots are dummies (`shuffle.cpp:501-519`).
+    ///
+    /// ⛔ NO STICK LOOP: the dimension packed is the GOAL'S (`shuffle.cpp:518`), so there is at most
+    /// one offer however many stick dimensions there are. ⛔ A DUMMY GOAL SLOT IS NOT SPECIAL-CASED
+    /// — the sticks-contain test is what rejects it, since `stick_dims` never holds the dummy.
+    pub fn add_valid_actions(
+        actions: &mut ActionList,
+        input: &AbstractLayout,
+        goal: &AbstractLayout,
+    ) {
+        // "this logic asserts that the only dimension we can ever move into the 4 bit place is its
+        // goal dimension or dummy, on the basis that our current instruction set cannot recover
+        // 4-bit dimensions. If that changes, revisit."
+        let goal_dim = goal.slice_dim(SliceDim::Bit4);
+        let can_pack = input.format.bits() <= Bits(4)
+            && input.stick_dims.contains(&goal_dim)
+            && input.slice_dim(SliceDim::Bit4).is_dummy()
+            && input.slice_dim(SliceDim::Bit8).is_dummy();
+        if can_pack {
+            actions.push(ShuffleAction::Pack9(Self::new(goal_dim)));
+        }
     }
 }
 
@@ -2149,62 +2368,6 @@ impl DataEdge {
         }
     }
 }
-
-// crustify:todo: e310_add_valid_actions
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:226  (11 body lines, level 2)
-//   class     : MergeAction
-//   original  : static void add_valid_actions(ActionList& actions, const AbstractLayout& input, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:11521-11534
-//   calls     : e232_reset
-
-// crustify:todo: e311_enumerate_stick_computations
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:305  (15 body lines, level 2)
-//   class     : MergeAction
-//   original  : std::vector<ComputationOp> enumerate_stick_computations() override
-//   extract   : crustify-ddc/cpp/ddc.cpp:11544-11559
-//   calls     : e143_get_shuffle_indices, e264_bin_op
-
-// crustify:todo: e312_add_valid_actions
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:332  (12 body lines, level 2)
-//   class     : PackAction
-//   original  : static void add_valid_actions(ActionList& actions, const AbstractLayout& input, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:11569-11583
-//   calls     : e232_reset
-
-// crustify:todo: e313_enumerate_stick_computations
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:379  (4 body lines, level 2)
-//   class     : PackAction
-//   original  : std::vector<ComputationOp> enumerate_stick_computations() override
-//   extract   : crustify-ddc/cpp/ddc.cpp:11593-11597
-//   calls     : e145_get_indices, e264_bin_op
-
-// crustify:todo: e314_add_valid_actions
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:398  (6 body lines, level 2)
-//   class     : ShiftLeftAction
-//   original  : static void add_valid_actions(ActionList& actions, const AbstractLayout& input, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:11607-11615
-//   calls     : e232_reset
-
-// crustify:todo: e315_enumerate_stick_computations
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:428  (15 body lines, level 2)
-//   class     : ShiftLeftAction
-//   original  : std::vector<ComputationOp> enumerate_stick_computations() override
-//   extract   : crustify-ddc/cpp/ddc.cpp:11625-11640
-//   calls     : e265_unary_op
-
-// crustify:todo: e316_add_valid_actions
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:451  (20 body lines, level 2)
-//   class     : Pack8Action
-//   original  : static void add_valid_actions(ActionList& actions, const AbstractLayout& input, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:11650-11672
-//   calls     : e232_reset
-
-// crustify:todo: e317_add_valid_actions
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:501  (17 body lines, level 2)
-//   class     : Pack9Action
-//   original  : static void add_valid_actions(ActionList& actions, const AbstractLayout& input, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:11682-11701
-//   calls     : e232_reset
 
 // crustify:todo: e342_codegen_generic
 //   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:910  (123 body lines, level 3)
@@ -3406,5 +3569,365 @@ mod tests_e318_e320 {
             GCVTF16F8MergeAction::add_valid_actions(&mut actions, &input, &goal);
             assert!(actions.is_empty(), "{case}");
         }
+    }
+}
+
+/// ⭐ TESTS FOR ENTRIES 310-317. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e310_e317 {
+    use super::{
+        AbstractLayout, ActionList, DIMS_PER_SLICE, DimSymbol, Half, IndexExpansion, MERGE16H,
+        MERGE16L, MergeAction, MergeDim, MergeMode, PACK12, PACK13, PACK26, Pack8Action,
+        Pack9Action, PackAction, PackDim, ShiftLeftAction, ShuffleAction, ShuffleIndex, StickIndex,
+    };
+    use crate::formats::DataFormat;
+
+    /// The symbol with this id; `0` is the dummy, as the reference numbers them.
+    fn sym(id: i32) -> DimSymbol {
+        let mut symbol = DimSymbol::DUMMY;
+        for _ in 0..id {
+            symbol = symbol.next();
+        }
+        symbol
+    }
+
+    /// A layout from slice symbol ids (2-bit slot first), stick symbol ids, and a format.
+    fn layout(slice: [i32; DIMS_PER_SLICE], sticks: &[i32], format: DataFormat) -> AbstractLayout {
+        AbstractLayout::new(
+            sticks.iter().copied().map(sym).collect(),
+            slice.map(sym),
+            format,
+        )
+    }
+
+    /// The all-dummy layout, which no offer reads as a goal except `pack8`'s and `pack9`'s.
+    fn empty_goal() -> AbstractLayout {
+        layout([0; DIMS_PER_SLICE], &[], DataFormat::Senint8)
+    }
+
+    /// Each offered merge as (stick symbol id, slot, mode).
+    fn merges(actions: &ActionList) -> Vec<(i32, MergeDim, MergeMode)> {
+        actions
+            .iter()
+            .map(|action| match action {
+                ShuffleAction::Merge(merge) => {
+                    (merge.stick_dim().id(), merge.slice(), merge.mode())
+                }
+                other => panic!("not a merge: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// One op's index table and its expansion, which is what `insert_packmerge` reads.
+    fn table(op: &super::ComputationOp) -> (Vec<ShuffleIndex>, IndexExpansion) {
+        let packmerge = op.packmerge.as_ref().expect("an op carries its table");
+        (packmerge.indices.clone(), packmerge.expansion)
+    }
+
+    /// e310 — one merge per stick dimension and mergeable slot, its mode taken from that slot, with
+    /// the slot floor read off the format's TRUNCATED log.
+    #[test]
+    fn merge_is_offered_per_stick_and_mergeable_slot_with_the_slots_own_mode() {
+        // 8-bit and 32-bit slots vacant; the 16-bit holds symbol 4 and the 64-bit symbol 6.
+        let input = layout([1, 2, 0, 4, 0, 6], &[7, 8], DataFormat::Senint8);
+
+        let mut actions = ActionList::new();
+        MergeAction::add_valid_actions(&mut actions, &input, &empty_goal());
+        assert_eq!(
+            merges(&actions),
+            [
+                (7, MergeDim::Bit8, MergeMode::Fill),
+                (7, MergeDim::Bit16, MergeMode::Extract(sym(4))),
+                (7, MergeDim::Bit32, MergeMode::Fill),
+                (7, MergeDim::Bit64, MergeMode::Extract(sym(6))),
+                (8, MergeDim::Bit8, MergeMode::Fill),
+                (8, MergeDim::Bit16, MergeMode::Extract(sym(4))),
+                (8, MergeDim::Bit32, MergeMode::Fill),
+                (8, MergeDim::Bit64, MergeMode::Extract(sym(6))),
+            ],
+            "stick dimension outer, slot inner, and the mode is the slot's own occupant"
+        );
+
+        // The list is APPENDED to, never replaced.
+        MergeAction::add_valid_actions(&mut actions, &input, &empty_goal());
+        assert_eq!(actions.len(), 16, "the second call appends");
+
+        use MergeDim::{Bit8, Bit16, Bit32, Bit64};
+        for (format, want) in [
+            (DataFormat::Senint2, vec![Bit8, Bit16, Bit32, Bit64]),
+            (DataFormat::Senint4, vec![Bit8, Bit16, Bit32, Bit64]),
+            (DataFormat::Senint8, vec![Bit8, Bit16, Bit32, Bit64]),
+            // ⛔ NINE BITS FLOORS AT THE 8-BIT SLOT: `int_log2(9) - 1 == 2`.
+            (DataFormat::Sen153Fp9, vec![Bit8, Bit16, Bit32, Bit64]),
+            (DataFormat::Senint16, vec![Bit16, Bit32, Bit64]),
+            // ⛔ AND TWENTY-FOUR AT THE 16-BIT ONE: `int_log2(24) - 1 == 3`.
+            (DataFormat::Sen18fFp24, vec![Bit16, Bit32, Bit64]),
+            (DataFormat::IeeeFp32, vec![Bit32, Bit64]),
+            (DataFormat::IeeeInt64, vec![Bit64]),
+        ] {
+            let input = layout([0; DIMS_PER_SLICE], &[7], format);
+            let mut actions = ActionList::new();
+            MergeAction::add_valid_actions(&mut actions, &input, &empty_goal());
+            let slots: Vec<MergeDim> = merges(&actions).into_iter().map(|(_, s, _)| s).collect();
+            assert_eq!(slots, want, "{format:?}");
+        }
+    }
+
+    /// e311 — two ops when the merge extracts and one when it fills, and only the extracting merge
+    /// writes an output index.
+    #[test]
+    fn merge_computations_index_the_output_only_when_extracting() {
+        let extracting = MergeAction::new(sym(7), MergeDim::Bit16, sym(4));
+        let ops = extracting.enumerate_stick_computations();
+        assert_eq!(ops.len(), 2, "one op per output stick");
+        for (op, (half, want_table)) in ops
+            .iter()
+            .zip([(Half::Low, MERGE16L), (Half::High, MERGE16H)])
+        {
+            assert_eq!(
+                op.inputs,
+                vec![
+                    [(sym(7), Half::Low)].into_iter().collect::<StickIndex>(),
+                    [(sym(7), Half::High)].into_iter().collect::<StickIndex>(),
+                ],
+                "the low-half stick first, then the high"
+            );
+            assert_eq!(
+                op.output.half_of(sym(4)),
+                Some(half),
+                "the displaced dimension at this op's half"
+            );
+            assert_eq!(
+                table(op),
+                (want_table.to_vec(), IndexExpansion::ByElementWidth)
+            );
+            assert!(!op.reuses_sticks, "a merge reads two distinct sticks");
+        }
+
+        let filling = MergeAction::new(sym(7), MergeDim::Bit16, DimSymbol::DUMMY);
+        let ops = filling.enumerate_stick_computations();
+        assert_eq!(ops.len(), 1, "a filling merge writes one stick");
+        assert_eq!(
+            ops[0].output.iter().count(),
+            0,
+            "and indexes nothing on the output — not even the displaced dummy"
+        );
+        assert_eq!(table(&ops[0]), (MERGE16L.to_vec(), IndexExpansion::ByElementWidth));
+    }
+
+    /// e312 — one pack per stick dimension and slot above the 8-bit one, refused by an element width
+    /// over eight bits or a live 8-bit slot.
+    #[test]
+    fn pack_needs_eight_bits_or_fewer_and_a_vacant_eight_bit_slot() {
+        let input = layout([1, 2, 0, 4, 5, 6], &[7, 8], DataFormat::Senint8);
+
+        let mut actions = ActionList::new();
+        PackAction::add_valid_actions(&mut actions, &input, &empty_goal());
+        let offers: Vec<(i32, PackDim)> = actions
+            .iter()
+            .map(|action| match action {
+                ShuffleAction::Pack(pack) => (pack.stick_dim().id(), pack.slice()),
+                other => panic!("not a pack: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            offers,
+            [
+                (7, PackDim::Bit16),
+                (7, PackDim::Bit32),
+                (7, PackDim::Bit64),
+                (8, PackDim::Bit16),
+                (8, PackDim::Bit32),
+                (8, PackDim::Bit64),
+            ],
+            "stick dimension outer, slot inner"
+        );
+
+        for (case, input) in [
+            (
+                // ⛔ A SLOT INDEX WOULD HAVE ADMITTED THIS ONE.
+                "a nine-bit format is wider than eight bits",
+                layout([1, 2, 0, 4, 5, 6], &[7], DataFormat::Sen153Fp9),
+            ),
+            (
+                "a sixteen-bit format cannot be chopped in half",
+                layout([1, 2, 0, 4, 5, 6], &[7], DataFormat::Sen169Fp16),
+            ),
+            (
+                "the 8-bit slot holds a live dimension",
+                layout([1, 2, 3, 4, 5, 6], &[7], DataFormat::Senint8),
+            ),
+        ] {
+            let mut actions = ActionList::new();
+            PackAction::add_valid_actions(&mut actions, &input, &empty_goal());
+            assert!(actions.is_empty(), "{case}");
+        }
+    }
+
+    /// e313 — one two-stick packmerge on the pack's own table.
+    #[test]
+    fn pack_computations_are_one_op_on_its_own_table() {
+        let ops = PackAction::new(sym(7), PackDim::Bit32).enumerate_stick_computations();
+        assert_eq!(ops.len(), 1, "a pack writes one stick");
+        assert_eq!(
+            ops[0].inputs,
+            vec![
+                [(sym(7), Half::Low)].into_iter().collect::<StickIndex>(),
+                [(sym(7), Half::High)].into_iter().collect::<StickIndex>(),
+            ]
+        );
+        assert_eq!(ops[0].output.iter().count(), 0, "the output index is empty");
+        assert_eq!(table(&ops[0]), (PACK26.to_vec(), IndexExpansion::ByElementWidth));
+    }
+
+    /// e314 — exactly one shift-left per layout, carrying the 64-bit slot whether it is live or not,
+    /// and none at all above eight bits.
+    #[test]
+    fn shift_left_is_one_offer_carrying_the_sixty_four_bit_slot() {
+        let extract_dim = |input: &AbstractLayout| {
+            let mut actions = ActionList::new();
+            ShiftLeftAction::add_valid_actions(&mut actions, input, &empty_goal());
+            match actions.as_slice() {
+                [ShuffleAction::ShiftLeft(shift)] => Some(shift.extract_dim()),
+                [] => None,
+                other => panic!("not one shift-left: {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            extract_dim(&layout([1, 2, 3, 4, 5, 6], &[7, 8, 9], DataFormat::Senint8)),
+            Some(sym(6)),
+            "one offer for three stick dimensions, carrying the 64-bit slot"
+        );
+        assert_eq!(
+            extract_dim(&layout([1, 2, 3, 4, 5, 0], &[7], DataFormat::Senint4)),
+            Some(DimSymbol::DUMMY),
+            "still offered with a vacant 64-bit slot, which the shift then discards"
+        );
+        assert_eq!(
+            extract_dim(&layout([1, 2, 3, 4, 5, 6], &[7], DataFormat::Sen153Fp9)),
+            None,
+            "a nine-bit format is wider than eight bits"
+        );
+    }
+
+    /// e315 — `pack12` and `pack13` when the shift extracts, `pack12` alone when it discards, and the
+    /// output index is written either way.
+    #[test]
+    fn shift_left_computations_index_the_output_even_on_the_dummy() {
+        let ops = ShiftLeftAction::new(sym(6)).enumerate_stick_computations();
+        assert_eq!(ops.len(), 2, "an extracting shift writes two sticks per input");
+        for (op, (half, want_table)) in ops
+            .iter()
+            .zip([(Half::Low, PACK12), (Half::High, PACK13)])
+        {
+            assert_eq!(op.inputs, vec![StickIndex::new()], "needs A stick, no particular index");
+            assert!(op.reuses_sticks, "a unary op feeds the same stick to both operands");
+            assert_eq!(op.output.half_of(sym(6)), Some(half));
+            assert_eq!(
+                table(op),
+                (want_table.to_vec(), IndexExpansion::ByElementWidth)
+            );
+        }
+
+        let ops = ShiftLeftAction::new(DimSymbol::DUMMY).enumerate_stick_computations();
+        assert_eq!(ops.len(), 1, "a discarding shift writes one stick");
+        assert_eq!(
+            ops[0].output.half_of(DimSymbol::DUMMY),
+            Some(Half::Low),
+            "and STILL indexes its output, on the dummy"
+        );
+    }
+
+    /// e316 — one `pack8` per stick dimension, gated on the 4- and 8-bit slots being vacant and on
+    /// the INPUT'S 16-bit slot holding what the GOAL wants at its 4-bit slot.
+    #[test]
+    fn pack8_compares_the_inputs_sixteen_bit_slot_with_the_goals_four_bit_slot() {
+        let goal = layout([1, 4, 0, 0, 0, 0], &[], DataFormat::Senint4);
+        let offered = |input: &AbstractLayout| {
+            let mut actions = ActionList::new();
+            Pack8Action::add_valid_actions(&mut actions, input, &goal);
+            actions
+                .iter()
+                .map(|action| match action {
+                    ShuffleAction::Pack8(pack) => pack.dim().id(),
+                    other => panic!("not a pack8: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            offered(&layout([1, 0, 0, 4, 5, 6], &[7, 9, 8], DataFormat::Senint4)),
+            [7, 8, 9],
+            "one per stick dimension when the 16-bit slot already holds the goal's 4-bit dimension"
+        );
+        assert_eq!(
+            offered(&layout([1, 0, 0, 0, 5, 6], &[7], DataFormat::Sen121Fp4)),
+            [7],
+            "a dummy 16-bit slot also passes"
+        );
+        assert!(
+            offered(&layout([1, 0, 0, 3, 5, 6], &[7], DataFormat::Senint4)).is_empty(),
+            "the 16-bit dimension is not the one the goal wants at its 4-bit slot"
+        );
+        assert!(
+            offered(&layout([1, 3, 0, 4, 5, 6], &[7], DataFormat::Senint4)).is_empty(),
+            "a live 4-bit slot, which pack8 drops"
+        );
+        assert!(
+            offered(&layout([1, 0, 3, 4, 5, 6], &[7], DataFormat::Senint4)).is_empty(),
+            "a live 8-bit slot, which pack8 drops"
+        );
+        assert!(
+            offered(&layout([1, 0, 0, 4, 5, 6], &[7], DataFormat::Senint8)).is_empty(),
+            "an eight-bit format is wider than four bits"
+        );
+    }
+
+    /// e317 — at most one `pack9`, of the GOAL'S 4-bit dimension, and only when the sticks hold it.
+    #[test]
+    fn pack9_offers_one_action_for_the_goals_four_bit_dimension() {
+        let goal = layout([1, 5, 0, 0, 0, 0], &[], DataFormat::Senint4);
+        let offered = |input: &AbstractLayout, goal: &AbstractLayout| {
+            let mut actions = ActionList::new();
+            Pack9Action::add_valid_actions(&mut actions, input, goal);
+            actions
+                .iter()
+                .map(|action| match action {
+                    ShuffleAction::Pack9(pack) => pack.dim().id(),
+                    other => panic!("not a pack9: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            offered(&layout([1, 0, 0, 4, 6, 3], &[5, 7, 8], DataFormat::Senint4), &goal),
+            [5],
+            "ONE offer for three stick dimensions, and it packs the goal's dimension"
+        );
+        assert!(
+            offered(&layout([1, 0, 0, 4, 6, 3], &[7, 8], DataFormat::Senint4), &goal).is_empty(),
+            "the sticks do not hold the goal's 4-bit dimension"
+        );
+        assert!(
+            offered(&layout([1, 2, 0, 4, 6, 3], &[5], DataFormat::Senint4), &goal).is_empty(),
+            "a live 4-bit slot, which pack9 overwrites"
+        );
+        assert!(
+            offered(&layout([1, 0, 2, 4, 6, 3], &[5], DataFormat::Senint4), &goal).is_empty(),
+            "a live 8-bit slot, which pack9 dummies out"
+        );
+        assert!(
+            offered(&layout([1, 0, 0, 4, 6, 3], &[5], DataFormat::Senint8), &goal).is_empty(),
+            "an eight-bit format is wider than four bits"
+        );
+        assert!(
+            offered(
+                &layout([1, 0, 0, 4, 6, 3], &[5], DataFormat::Senint4),
+                &layout([0; DIMS_PER_SLICE], &[], DataFormat::Senint4)
+            )
+            .is_empty(),
+            "a dummy goal slot is rejected by the sticks-contain test, since sticks are never dummy"
+        );
     }
 }
