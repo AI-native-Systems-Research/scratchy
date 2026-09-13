@@ -274,9 +274,11 @@ const fn is_reduction(unary_op: sentient::UnaryOp) -> bool {
 /// non-reduction `vector_unary` before it in the same block, stepping over `sentient.scalar_constant`s,
 /// `dataflow.get_unit`s and ops already queued for deletion (`:110-147`).
 ///
-/// ⛔ [`None`] IS THE REFERENCE'S "HANDS BACK ITS OWN ARGUMENT", and that is a strict improvement:
-/// e480's second guard tests `fusible_ops.second == op` (`:470`) after calling this on
-/// `op->getNextNode()`, so its sentinel comparison can never fire. Absence cannot be misread.
+/// ⛔ [`None`] IS THE REFERENCE'S "HANDS BACK ITS OWN ARGUMENT" (`:146`), AND ONLY THE FIRST OF
+/// e480'S TWO GUARDS CATCHES IT. `fusible_ops.first == op` (`:466`) fires; the second compares
+/// `fusible_ops.second` against `op` (`:470`) after calling this on `op->getNextNode()`, so it
+/// CANNOT fire — see [`fuse_store_and_forward`] for what the reference does with the failure it
+/// misses, and why declining diverges deliberately.
 /// ⛔ AND STEPPING OFF THE FRONT OF THE BLOCK IS A NULL DEREFERENCE THERE: in `fold_AB` mode
 /// `op->getPrevNode()->getPrevNode()` (`:120-121`, `:140-141`) dereferences null for an op at index 0
 /// or 1. This answers [`None`] — a deliberate divergence from a crash.
@@ -1005,9 +1007,11 @@ pub fn fuse_store_and_forward(
         return Fused::No;
     };
     let fusible_second = match fold_ab_mode {
-        // ⛔ `fusible_ops.second == op` (`:470`) TESTS THE WRONG OP THERE, so a reference run that
-        // finds none carries on with the `fold_AB_B` half as its own fusible op — the divergence
-        // [`find_fusible_op`]'s own note records.
+        // ⛔ DELIBERATE DIVERGENCE, NOT A LOST FUSION: `fusible_ops.second == op` (`:470`) tests the
+        // wrong op, so a reference run that finds none carries on with the `fold_AB_B` half ITSELF
+        // as its own fusible op — it writes the fold round's forwardings into that op (`:536`) and
+        // then queues that very op for deletion (`:546`), so those forwardings leave the program.
+        // Declining keeps both ops, and with them everything they forward.
         FoldAbMode::On => match find_fusible_op(next, block, to_be_deleted, FoldAbMode::On) {
             None => return Fused::No,
             second => second,
