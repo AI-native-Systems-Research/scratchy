@@ -77,11 +77,7 @@
 //! | `e016_ConditionalConstantDescriptor` | 016 | 0 | 32 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2744` |
 //! | `e425_dump` | 425 | 2 | 15 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2780` |
 
-// crustify:todo: e425_dump
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2780  (15 body lines, level 2)
-//   original  : void ConditionalConstantDescriptor::dump() const
-//   calls     : e252_size, e278_isValid, e279_canBeSimplified
-
+use super::write_evaluated_value;
 use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator};
 use crate::transform::sentient::utils::{ConstKind, is_constant};
@@ -155,6 +151,43 @@ impl ConditionalConstantDescriptor {
             yielded_constants,
             can_be_simplified,
         }
+    }
+}
+
+impl ConditionalConstantDescriptor {
+    /// Replaces: e425_dump
+    ///
+    /// This conditional's constants as debug text (`:2780-2794`) — one `\t`-indented constant per
+    /// line, `;\n` BETWEEN them, wrapped in a counted `[` … `]`.
+    ///
+    /// ⛔ TRAP: THE VALID BRANCH ENDS IN [`write_evaluated_value`], and `isValid()` here IS
+    /// `!yielded_constants.is_empty()` (`:318`) — so the first `interleave` element always reaches the
+    /// out-of-scope `operator<<` and only the invalid branch is complete.
+    /// ⛔ `llvm::interleave`'s SEPARATOR GOES BETWEEN ONLY: the last constant is followed by no `;\n`,
+    /// so `"\t]\n"` lands directly against it.
+    #[must_use]
+    pub fn dump(&self) -> String {
+        let mut out = String::from("N-Way Conditional Constant Descriptor:\n");
+        // `const char indent = '\t'` (`:2783`), streamed before each line the reference indents.
+        if !self.is_valid() {
+            out.push_str("\tInvalid\n");
+            return out;
+        }
+        if self.can_be_simplified {
+            out.push_str("\t(Simplified)\n");
+        }
+        out.push_str("\tYielded Constants (");
+        out.push_str(&self.yielded_constants.len().to_string());
+        out.push_str(") [\n");
+        for (index, ev) in self.yielded_constants.iter().enumerate() {
+            if index > 0 {
+                out.push_str(";\n");
+            }
+            out.push('\t');
+            write_evaluated_value(Some(*ev), &mut out);
+        }
+        out.push_str("\t]\n");
+        out
     }
 }
 
@@ -292,5 +325,29 @@ mod unit_tests {
         let desc =
             ConditionalConstantDescriptor::new(Val(1), defs, &mut OutOfScopeEvaluator::default());
         assert_eq!(desc, ConditionalConstantDescriptor::default());
+    }
+
+    /// 425/656 — the complete branch: an unmatched conditional is the empty list, which `isValid()`
+    /// reads, and its whole trace is the header and the word.
+    #[test]
+    fn e425_an_invalid_descriptor_dumps_the_header_and_invalid() {
+        let desc = ConditionalConstantDescriptor::default();
+        assert_eq!(
+            desc.dump(),
+            "N-Way Conditional Constant Descriptor:\n\tInvalid\n"
+        );
+    }
+
+    /// The vendor's own case: a matched conditional reaches the constants, so the seam it stops at is
+    /// the analysis's own `operator<<` and not some earlier gap. ⛔ Nothing written before the stop is
+    /// observable — the `String` dies with the panic.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::operator<<")]
+    fn e425_a_matched_descriptor_stops_at_the_out_of_scope_rendering() {
+        let desc = ConditionalConstantDescriptor {
+            yielded_constants: vec![EvaluatedValue(4), EvaluatedValue(4)],
+            can_be_simplified: true,
+        };
+        let _ = desc.dump();
     }
 }

@@ -498,6 +498,26 @@ impl IntegerSequenceDataTransferUpdater {
     }
 }
 
+/// `raw_ostream &operator<<(raw_ostream &, const EvaluatedValue &)`
+/// (`Analyses/ExpressionEvaluatorUtils.h:405`, defined `.cpp:205-232`) — `kind(..), baseValue(..),
+/// offsetValue(..)`, every field of it read off the arena entry an [`EvaluatedValue`] only NAMES.
+///
+/// ⛔ OUT OF CAMPAIGN SCOPE, AND EVERY `dump()` IN THIS PASS ENDS HERE. Each of them writes its own
+/// literal text and stops at its first evaluated value, exactly as
+/// [`Sequence::print`](crate::transform::sentient::cfg_simplification_sentient_level) does for the
+/// same `operator<<`. ⛔ Do not render a handle from its number: that number is which arena entry,
+/// not what the entry says.
+///
+/// ⛔ `None` IS THE REFERENCE DEREFERENCING A NULL `const EvaluatedValue *` — `DiscreteIntegerSet`'s
+/// `isValid()` (`:468`) does not cover its own value fields, so `dump` can reach one. It is a stop
+/// either way, and the message says which it was.
+pub(crate) fn write_evaluated_value(ev: Option<EvaluatedValue>, _out: &mut String) {
+    todo!(
+        "EvaluatedValue::operator<< (Analyses/ExpressionEvaluatorUtils.h:405) — out of campaign \
+         scope, asked for {ev:?}"
+    )
+}
+
 /// WHAT e014 NEEDS OF A DESCRIPTOR — `DataTransferDescriptor::dump` is **e492** (`:2521`, level 3,
 /// `data_transfer_descriptor.rs`), a later unit.
 ///
@@ -1372,6 +1392,7 @@ impl LoopingChainMutableAddrDescriptor {
 mod unit_tests {
     use super::*;
     use crate::arch::Elements;
+    use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::formats::Bits;
     use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{LocalRegion, Val, sentient};
@@ -1443,6 +1464,7 @@ mod unit_tests {
         base_addrs: usize,
     ) -> DataTransferDescriptor {
         DataTransferDescriptor {
+            op: OpId::at(&[0]),
             pattern_desc,
             base_addrs: (0..base_addrs).map(|i| EvaluatedValue(i as u32)).collect(),
             region: RegionSite::default(),
@@ -1546,9 +1568,7 @@ mod unit_tests {
     #[test]
     fn part_of_some_chain_is_false_without_an_entry_and_true_once_set() {
         let mut container = DataTransferDescriptorContainer::default();
-        container
-            .descriptors
-            .push(DataTransferDescriptor::default());
+        container.descriptors.push(transfer(None, 0));
         let desc = DescriptorId(0);
         assert!(!container.is_part_of_some_chain(desc));
         container.set_chaining_info(desc, ChainFlag::PartOfChain, true);
@@ -1655,6 +1675,7 @@ mod unit_tests {
     /// the reference's `base_addrs_` is what the absent `isValid()` conjunct would read.
     fn with_pattern(kind: PatternDescriptor) -> DataTransferDescriptor {
         DataTransferDescriptor {
+            op: OpId::at(&[0]),
             pattern_desc: Some(kind),
             base_addrs: vec![EvaluatedValue(64)],
             region: RegionSite::default(),
@@ -1754,7 +1775,7 @@ mod unit_tests {
     #[test]
     #[should_panic(expected = "DT_CHECK(isConditionalConstant())")]
     fn asking_an_unmatched_transfer_for_a_pattern_descriptor_is_the_dt_check() {
-        let _ = DataTransferDescriptor::default().conditional_constant_descriptor();
+        let _ = transfer(None, 0).conditional_constant_descriptor();
     }
 
     /// 257/656 — the `DT_CHECK(size() == 1)`: one stored address is the answer, a toggle's pair and an

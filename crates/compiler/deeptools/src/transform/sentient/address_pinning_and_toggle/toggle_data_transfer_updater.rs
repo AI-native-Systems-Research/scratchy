@@ -154,6 +154,7 @@ fn immutable_addr_mut(op: &mut Op, end: TransferEnd) -> &mut Val {
 mod unit_tests {
     use super::*;
     use crate::arch::Elements;
+    use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
     use crate::transform::sentient::analyses::RegionSite;
@@ -183,6 +184,7 @@ mod unit_tests {
         }
 
         let dtd = DataTransferDescriptor {
+            op: OpId::at(&[0]),
             pattern_desc: None,
             base_addrs: vec![EvaluatedValue(7), EvaluatedValue(9)],
             region: RegionSite::ProgramUnitBody,

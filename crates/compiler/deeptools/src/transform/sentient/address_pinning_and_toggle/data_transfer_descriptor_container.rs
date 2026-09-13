@@ -78,16 +78,6 @@
 //! | `e423_lookup` | 423 | 2 | 11 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2179` |
 //! | `e491_computeChainingInfo` | 491 | 3 | 120 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2192` |
 
-// crustify:todo: e422_insert
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2169  (9 body lines, level 2)
-//   original  : void DataTransferDescriptorContainer::insert(DataTransferDescriptor *desc)
-//   calls     : e274_validate
-
-// crustify:todo: e423_lookup
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2179  (11 body lines, level 2)
-//   original  : DataTransferDescriptor *DataTransferDescriptorContainer::lookup( const Operation *op) const
-//   calls     : e274_validate
-
 // crustify:todo: e491_computeChainingInfo
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2192  (120 body lines, level 3)
 //   original  : void DataTransferDescriptorContainer::computeChainingInfo()
@@ -96,6 +86,7 @@
 use std::collections::BTreeMap;
 
 use super::DataTransferDescriptor;
+use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 
 /// WHICH DESCRIPTOR — a position in [`DataTransferDescriptorContainer::descriptors`].
 ///
@@ -171,4 +162,100 @@ pub struct DataTransferDescriptorContainer {
     pub descriptors: Vec<DataTransferDescriptor>,
     /// `chaining_info_` — only the descriptors some chain has touched. See [`ChainFlags`].
     pub chaining_info: BTreeMap<DescriptorId, ChainFlags>,
+}
+
+impl DataTransferDescriptorContainer {
+    /// Replaces: e422_insert
+    ///
+    /// Takes ownership of one descriptor, appended in the syntactic order the walk found it, and
+    /// answers WHICH one it now is (`:2169-2177`).
+    ///
+    /// ⛔ THE `std::sort` GOES WITH `sorted_list_`, AND ORDERS NOTHING OBSERVABLE: its comparator is
+    /// `&a->getOperation() < &b->getOperation()` (`:2173-2176`), the raw ADDRESS of the op, and the
+    /// only reader of that order is [`Self::lookup`]'s `lower_bound`. Reproducing it would need
+    /// allocation addresses Rust does not hand out, and it would still answer the same question.
+    /// ⭐ IT RETURNS THE [`DescriptorId`] THE REFERENCE'S CALLER ALREADY HELD: the reference is handed
+    /// a pointer it keeps using (`:1444`, `:2226`), so a `()` return would make the descriptor it just
+    /// moved in unreachable.
+    pub fn insert(&mut self, desc: DataTransferDescriptor) -> DescriptorId {
+        self.validate();
+        let id = DescriptorId(self.descriptors.len() as u32);
+        self.descriptors.push(desc);
+        id
+    }
+
+    /// Replaces: e423_lookup
+    ///
+    /// WHICH descriptor describes the op at `op`, and `None` for an op no descriptor in this container
+    /// describes (`:2179-2189`).
+    ///
+    /// ⛔ THE `lower_bound` IS THE MEMOISATION, NOT THE ANSWER: the reference binary-searches
+    /// `sorted_list_` by op address and then re-tests `&(*iter)->getOperation() == op` (`:2188`),
+    /// because address order only narrows the candidate — that final equality is the whole predicate,
+    /// and a scan of `descriptors` decides it identically.
+    /// ⛔ `DT_CHECK(op)` (`:2183`) HAS NO ARM HERE: an [`OpId`] is not nullable, so the reference's
+    /// null `Operation *` is not expressible.
+    #[must_use]
+    pub fn lookup(&self, op: &OpId) -> Option<DescriptorId> {
+        self.validate();
+        self.descriptors
+            .iter()
+            .position(|desc| desc.op == *op)
+            .map(|index| DescriptorId(index as u32))
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::transform::sentient::analyses::RegionSite;
+
+    /// One transfer describing the op at `path` — `op_` is the only field either unit reads.
+    fn transfer(path: &[u32]) -> DataTransferDescriptor {
+        DataTransferDescriptor {
+            op: OpId::at(path),
+            pattern_desc: None,
+            base_addrs: Vec::new(),
+            region: RegionSite::default(),
+        }
+    }
+
+    /// 422/656 — insertion order is the identity, so the ids come back 0, 1, 2 and the container holds
+    /// the descriptors in the order the walk saw them.
+    #[test]
+    fn e422_insert_appends_and_names_the_position_it_appended_at() {
+        let mut container = DataTransferDescriptorContainer::default();
+        let first = container.insert(transfer(&[0]));
+        let second = container.insert(transfer(&[3, 1]));
+        let third = container.insert(transfer(&[3, 2]));
+        assert_eq!(
+            [first, second, third],
+            [DescriptorId(0), DescriptorId(1), DescriptorId(2)]
+        );
+        assert_eq!(
+            container
+                .descriptors
+                .iter()
+                .map(|desc| desc.op.path().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![0], vec![3, 1], vec![3, 2]]
+        );
+    }
+
+    /// 423/656 — the final `&(*iter)->getOperation() == op` both ways: a nested op that IS described
+    /// is found at its own position, and one at a path no descriptor holds is the `nullptr`.
+    ///
+    /// ⛔ `[3, 1]` AND `[3]` ARE DIFFERENT OPS, not the same one at two depths — a prefix must miss,
+    /// which is what a `lower_bound` over addresses would have no way to get wrong and a sloppy scan
+    /// would.
+    #[test]
+    fn e423_lookup_finds_the_descriptor_whose_op_is_exactly_this_one() {
+        let mut container = DataTransferDescriptorContainer::default();
+        container.insert(transfer(&[0]));
+        container.insert(transfer(&[3, 1]));
+        assert_eq!(container.lookup(&OpId::at(&[3, 1])), Some(DescriptorId(1)));
+        assert_eq!(container.lookup(&OpId::at(&[0])), Some(DescriptorId(0)));
+        assert_eq!(container.lookup(&OpId::at(&[3])), None);
+        assert_eq!(container.lookup(&OpId::at(&[1])), None);
+    }
 }

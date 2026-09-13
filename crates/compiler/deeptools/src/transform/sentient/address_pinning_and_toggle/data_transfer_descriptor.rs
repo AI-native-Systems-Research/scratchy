@@ -90,6 +90,7 @@
 //   calls     : e002_getAllConstants, e015_getInit, e016_ConditionalConstantDescriptor, e252_size, e278_isValid, e279_canBeSimplified, e280_IntegerSequenceDescriptor, e281_DiscreteIntegerSetDescriptor, e282_LoopingChainMutableAddrDescriptor, e407_getInit, e408_getAllConstants, e411_getInit, e414_getInit, e485_getX …
 
 use super::{BaseAddrList, PatternDescriptor};
+use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::transform::sentient::analyses::RegionSite;
 
 /// ONE DATA TRANSFER'S BASE-ADDRESS STORY — `class DataTransferDescriptor`
@@ -99,8 +100,19 @@ use crate::transform::sentient::analyses::RegionSite;
 /// ⛔ NOT `evaluator_`: the reference stores `ExpressionEvaluator &`, one global the pass threads
 /// through. A shared borrow in a field would make the descriptor unstorable while the pass rewrites
 /// the IR, so the ported methods take the evaluator as an argument instead.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// ⛔ NO `Default`, BECAUSE `DataTransferDescriptor() = delete` (`:634`): there is no transfer without
+/// the op it describes, and `op` below has no meaningful default — the empty [`OpId`] path names a
+/// BLOCK, not an op.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataTransferDescriptor {
+    /// `op_` — WHICH transfer this describes, the reference's `Operation &op_` (`:783`) behind the
+    /// `getOperation()` pair (`:666-667`, both `EXCLUSIONS.tsv` field accessors).
+    ///
+    /// ⭐ A POSITION, NOT A POINTER: [`OpId`] is this crate's stand-in for `Operation *`, and it is
+    /// the key [`super::DataTransferDescriptorContainer::lookup`] answers about — the reference's
+    /// `sorted_list_` orders the very same identity by raw address.
+    pub op: OpId,
     /// Replaces: e006_dtor_DataTransferDescriptor
     ///
     /// `pattern_desc_` — which recognised pattern this transfer follows, `None` for the reference's
@@ -206,6 +218,7 @@ mod unit_tests {
 
     fn descriptor(pattern: Option<PatternDescriptor>, base_addrs: u32) -> DataTransferDescriptor {
         DataTransferDescriptor {
+            op: OpId::at(&[0]),
             pattern_desc: pattern,
             base_addrs: (0..base_addrs).map(EvaluatedValue).collect(),
             region: RegionSite::default(),
@@ -238,7 +251,7 @@ mod unit_tests {
         assert!(descriptor(Some(simple_constant()), 1).is_valid());
         assert!(!descriptor(Some(simple_constant()), 2).is_valid());
         assert!(descriptor(None, 1).is_valid());
-        assert!(!DataTransferDescriptor::default().is_valid());
+        assert!(!descriptor(None, 0).is_valid());
     }
 
     /// The pattern's own flag, gated on validity — and the simple constant whose `true` is unread.

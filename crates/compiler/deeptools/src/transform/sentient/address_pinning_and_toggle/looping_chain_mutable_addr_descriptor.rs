@@ -78,11 +78,7 @@
 //! | `e282_LoopingChainMutableAddrDescriptor` | 282 | 1 | 27 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3081` |
 //! | `e427_dump` | 427 | 2 | 12 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3121` |
 
-// crustify:todo: e427_dump
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3121  (12 body lines, level 2)
-//   original  : void LoopingChainMutableAddrDescriptor::dump() const
-//   calls     : e278_isValid, e279_canBeSimplified
-
+use super::write_evaluated_value;
 use crate::islands::sentient::dialects::{
     Definitions, Op, Val, operands, regions_ref, sentient, use_count,
 };
@@ -114,6 +110,38 @@ pub struct LoopingChainMutableAddrDescriptor {
     /// `can_be_simplified_`, the base class's own field (`AddressPinningAndToggle.cpp:159`) — true
     /// when the chain is one transfer long or never moves, so it is really one address.
     pub can_be_simplified: bool,
+}
+
+impl LoopingChainMutableAddrDescriptor {
+    /// Replaces: e427_dump
+    ///
+    /// The chain's unrolled size, initial value and total increment as debug text (`:3121-3132`), over
+    /// two `\t`-indented lines.
+    ///
+    /// ⛔ TRAP: THE VALID BRANCH ENDS AT `, init:` IN [`write_evaluated_value`] — the size prints, and
+    /// then rendering an `EvaluatedValue` is the out-of-scope analysis's `operator<<`, so only the
+    /// invalid branch is complete.
+    /// ⭐ THE TWO SPELLINGS DIFFER AND BOTH ARE THE REFERENCE'S: `"…size:"` and `", init:"` carry no
+    /// space after the colon, `"total increment: "` does.
+    #[must_use]
+    pub fn dump(&self) -> String {
+        let mut out = String::from("Loop Chain Mutable Address Descriptor: \n");
+        if !self.is_valid() {
+            out.push_str("\tInvalid\n");
+            return out;
+        }
+        if self.can_be_simplified {
+            out.push_str("\t(Simplified)\n");
+        }
+        out.push_str("\tUnrolled chain size:");
+        out.push_str(&self.size.0.to_string());
+        out.push_str(", init:");
+        write_evaluated_value(self.init, &mut out);
+        out.push_str("\n\ttotal increment: ");
+        write_evaluated_value(self.increment, &mut out);
+        out.push('\n');
+        out
+    }
 }
 
 /// WHICH END OF A TRANSFER A DESCRIPTOR IS ABOUT — `int mutable_addr_result_idx_` (`:613`), which
@@ -766,5 +794,34 @@ mod unit_tests {
         assert_eq!(desc.init.map(|init| evaluator.value(init)), Some(0));
         assert_eq!(desc.increment.map(|ev| evaluator.value(ev)), Some(46));
         assert!(!desc.can_be_simplified);
+    }
+
+    /// 427/656 — the complete branch: a chain whose head never resolved, and the whole trace is the
+    /// header and the word.
+    #[test]
+    fn e427_an_invalid_descriptor_dumps_the_header_and_invalid() {
+        let desc = LoopingChainMutableAddrDescriptor::default();
+        assert_eq!(
+            desc.dump(),
+            "Loop Chain Mutable Address Descriptor: \n\tInvalid\n"
+        );
+    }
+
+    /// The vendor's own case: a resolved chain prints its size and then stops in the analysis's own
+    /// `operator<<` at `init`. ⛔ Nothing written before the stop is observable — the `String` dies
+    /// with it, which is why the size is not asserted here.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::operator<<")]
+    fn e427_a_matched_descriptor_stops_at_the_out_of_scope_rendering() {
+        let desc = LoopingChainMutableAddrDescriptor {
+            is_head_of_chain: true,
+            outer_loop: Some(ForRef(Val(10))),
+            iter_arg_index: Some(IterArgIndex(0)),
+            size: ChainSize(12),
+            init: Some(EvaluatedValue(1)),
+            increment: Some(EvaluatedValue(2)),
+            can_be_simplified: false,
+        };
+        let _ = desc.dump();
     }
 }

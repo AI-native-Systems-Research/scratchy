@@ -78,11 +78,7 @@
 //! | `e281_DiscreteIntegerSetDescriptor` | 281 | 1 | 45 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2901` |
 //! | `e426_dump` | 426 | 2 | 13 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2954` |
 
-// crustify:todo: e426_dump
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2954  (13 body lines, level 2)
-//   original  : void DiscreteIntegerSetDescriptor::dump() const
-//   calls     : e278_isValid, e279_canBeSimplified
-
+use super::write_evaluated_value;
 use crate::islands::sentient::dialects::{
     Definitions, Op, Val, operands, regions_ref, results, sentient,
 };
@@ -110,6 +106,41 @@ pub struct DiscreteIntegerSetDescriptor {
     /// `can_be_simplified_`, the base class's own field (`AddressPinningAndToggle.cpp:159`) — true
     /// when BOTH delta totals are zero, so the set is really one address.
     pub can_be_simplified: bool,
+}
+
+impl DiscreteIntegerSetDescriptor {
+    /// Replaces: e426_dump
+    ///
+    /// The set's initial value and both delta totals as debug text (`:2954-2966`), one `\t`-indented
+    /// line each.
+    ///
+    /// ⛔ TRAP: THE VALID BRANCH ENDS AT `init:` IN [`write_evaluated_value`] — rendering an
+    /// `EvaluatedValue` is the out-of-scope analysis's `operator<<`, so only the invalid branch is
+    /// complete.
+    /// ⛔ AND A VALID DESCRIPTOR CAN CARRY `None` THERE: `isValid()` (`:468`) reads only
+    /// `iter_arg_index_` and `outer_loop_`, so the reference's `*init_` here is an unguarded
+    /// dereference of a pointer its own validity test never covered.
+    /// ⭐ NOTE THE SPACE BEFORE THE FIRST NEWLINE (`"…Descriptor: \n"`), which its two sibling dumps
+    /// have and `ConditionalConstantDescriptor`'s does not.
+    #[must_use]
+    pub fn dump(&self) -> String {
+        let mut out = String::from("Constant Discrete Integer Set Descriptor: \n");
+        if !self.is_valid() {
+            out.push_str("\tInvalid\n");
+            return out;
+        }
+        if self.can_be_simplified {
+            out.push_str("\t(Simplified)\n");
+        }
+        out.push_str("\tinit:");
+        write_evaluated_value(self.init, &mut out);
+        out.push_str("\n\ttotal positive delta:");
+        write_evaluated_value(self.total_positive_delta, &mut out);
+        out.push_str("\n\ttotal negative delta:");
+        write_evaluated_value(self.total_negative_delta, &mut out);
+        out.push('\n');
+        out
+    }
 }
 
 /// WHAT THE WALK ANSWERS — the reference's
@@ -624,5 +655,32 @@ mod unit_tests {
             Some(-8)
         );
         assert!(!desc.can_be_simplified);
+    }
+
+    /// 426/656 — the complete branch: no recognised pattern, and the whole trace is the header (note
+    /// its trailing space) and the word.
+    #[test]
+    fn e426_an_invalid_descriptor_dumps_the_header_and_invalid() {
+        let desc = DiscreteIntegerSetDescriptor::default();
+        assert_eq!(
+            desc.dump(),
+            "Constant Discrete Integer Set Descriptor: \n\tInvalid\n"
+        );
+    }
+
+    /// The vendor's own case: a matched set reaches `init:` and stops in the analysis's own
+    /// `operator<<`. ⛔ Nothing written before the stop is observable — the `String` dies with it.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::operator<<")]
+    fn e426_a_matched_descriptor_stops_at_the_out_of_scope_rendering() {
+        let desc = DiscreteIntegerSetDescriptor {
+            outer_loop: Some(ForRef(Val(10))),
+            iter_arg_index: Some(IterArgIndex(0)),
+            init: Some(EvaluatedValue(1)),
+            total_positive_delta: Some(EvaluatedValue(2)),
+            total_negative_delta: Some(EvaluatedValue(3)),
+            can_be_simplified: false,
+        };
+        let _ = desc.dump();
     }
 }
