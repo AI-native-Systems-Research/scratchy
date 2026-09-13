@@ -1696,6 +1696,24 @@ impl DataStages {
         }
     }
 
+    /// `for (auto& [dsIdx, ds] : dsc.dataStageParam_) { ds.ss_.paddingSizes_[dim]; ds.el_.paddingSizes_[dim]; }`
+    /// — every stage gains a ZERO padding entry for `dim` where it had none.
+    ///
+    /// ⭐ ASKING IS A MUTATION: the reference's statement is a bare `operator[]` and its whole effect
+    /// is that default insert, which is what a dimension mapping needs the stages to carry.
+    ///
+    /// ⚠️ [`EmptyStage`] states no `paddingSizes_` to write, so the stages minted by `ddl.datastage`
+    /// are not reached — a divergence from a reference map that holds one value type.
+    pub fn ensure_padding(&mut self, dim: PrimaryDim) {
+        for stage in [&mut self.core, &mut self.chunk]
+            .into_iter()
+            .chain(self.minted.values_mut())
+        {
+            stage.ss.dims.padding_mut().entry(dim).or_default();
+            stage.el.dims.padding_mut().entry(dim).or_default();
+        }
+    }
+
     /// `dataStageParam_[index] = stage`.
     pub fn set(&mut self, index: DatastageId, stage: DataStage) {
         match index {
