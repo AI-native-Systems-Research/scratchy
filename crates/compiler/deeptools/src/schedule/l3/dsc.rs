@@ -16,7 +16,9 @@ use crate::arch::{Bytes, Elements};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     self as shape_constraints, Extent, PrimaryDim, StickDims, StickPart,
 };
-use crate::schedule::ddc::fold::{Dilation, PadType, Stride};
+use crate::schedule::ddc::fold::{
+    Dilation, MxScaleTensor, NodeId, PadType, ScaleBlock, Stride,
+};
 use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::{DsType, Scale};
 use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
@@ -93,6 +95,7 @@ pub struct LabeledDs {
     scales: Vec<(PrimaryDim, Scale)>,
     recorded: LdsIdx,
     pinning: Pinning,
+    scale_tensor: Option<MxScaleTensor>,
 }
 
 impl LabeledDs {
@@ -109,7 +112,23 @@ impl LabeledDs {
             scales,
             recorded,
             pinning,
+            scale_tensor: None,
         }
+    }
+
+    /// `scaledLdsCategory_ == SCALE_TENSOR` WITH ITS `mxInfo_` — a BUILDER and not a `new` argument
+    /// because `SCALE_TENSOR` is the rare category and every other site states `REGULAR`.
+    #[must_use]
+    pub fn with_scale_tensor(mut self, scale_tensor: MxScaleTensor) -> Self {
+        self.scale_tensor = Some(scale_tensor);
+        self
+    }
+
+    /// `mxInfo_` where `scaledLdsCategory_ == SCALE_TENSOR`, which is the ONE pair of conditions
+    /// every reader of it tests — [`None`] for any other category.
+    #[must_use]
+    pub const fn scale_tensor(&self) -> Option<MxScaleTensor> {
+        self.scale_tensor
     }
 
     /// `ldsIdx_` — the entry's OWN self-index, which need NOT equal the position it sits at in
@@ -571,7 +590,8 @@ pub struct DscScheduleStep {
 pub struct SuperDsc {
     dscs: DscList,
     /// `numWkSlicesPerDim_` (`dsc/superdsc.h:69`), absent for a dim nothing sliced — that `.at()`'s
-    /// throw, which entry 199 multiplies straight into its product.
+    /// throw, which entry 199 multiplies straight into its product and entry 210 reaches with no
+    /// guard at all.
     pub num_wk_slices_per_dim: BTreeMap<PrimaryDim, WkSliceCount>,
     /// `coreIdToWkSlice_`.
     pub core_id_to_wk_slice: BTreeMap<Core, WkSlice>,
@@ -891,6 +911,110 @@ impl StageDims {
         self.extents.get(&dim).copied()
     }
 
+    /// `primaryDimToVal_st(dim, NO_COMPONENT, /*ptrowId=*/-1, /*clId=*/-1, padded, density,
+    /// granularity)` (`dsc/dims.h:267`) — the GENERAL form, which with no component and a negative
+    /// row id falls through to `primaryDimToVal_base_st` (`dsc/dims.cpp:516`) and then
+    /// `calculate_padded` (`:562`).
+    ///
+    /// `granularity` selects a symbolic dim's `granularity_` over its `maxSize_`; `density` is
+    /// `dimDensity`, stated as the MX scale block the callers divide by rather than as the reciprocal
+    /// they pass.
+    ///
+    /// ⛔ [`None`] IS THE `-1` AND EVERY ABORT AT ONCE: an unstated extent, a negative one (which
+    /// `calculate_padded` short-circuits on BEFORE any abort), *"Cannot calculate padded version of
+    /// compound dim"*, *"Padded access is not valid in datastage"* for a [`PadSizes::Voided`]
+    /// non-window dim, a missing `paddingSizes_` entry, *"Missing window size"*, and each
+    /// *"Unsupported padding type"*. Spans SATURATE rather than wrap.
+    ///
+    /// ⛔ DIVERGENCE: the density is INTEGER DIVISION where the reference multiplies by the `double`
+    /// `1.0/blkSize` and truncates. The two agree for every power-of-two block size; for a block of
+    /// three the reference's product falls just short and loses one.
+    #[must_use]
+    pub fn scaled_extent(
+        &self,
+        dim: PrimaryDim,
+        padded: &PaddingForm,
+        density: Option<ScaleBlock>,
+        granularity: bool,
+    ) -> Option<Extent> {
+        let stated = match self.symbolic.info().get(&dim) {
+            Some(info) if granularity => i64::from(info.granularity.get()),
+            Some(info) => i64::from(info.max_size.0),
+            None => self.extent(dim)?.0,
+        };
+        let val = match density {
+            Some(block) => stated / i64::try_from(block.count().0).unwrap_or(i64::MAX),
+            None => stated,
+        };
+        if val < 0 {
+            return None;
+        }
+        let pad_type = padded.padding(dim);
+        if pad_type == PadType::NoPad {
+            return Some(Extent(val));
+        }
+        if matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij) {
+            return None;
+        }
+        let pad = self.padding.get(&dim)?;
+        let unneeded = i64::from(pad.unneeded.total.0);
+        let span = match pad.window_dim {
+            None => {
+                let (front, back) = match pad.sizes {
+                    PadSizes::Voided => return None,
+                    PadSizes::Unpadded => (0, 0),
+                    PadSizes::Sized { front, back } => (i64::from(front.0), i64::from(back.0)),
+                };
+                let edges = val.saturating_add(front).saturating_add(back);
+                match pad_type {
+                    PadType::PaddedFullSpanWUnneeded => edges.saturating_add(unneeded),
+                    PadType::PaddedFullSpan => edges,
+                    _ => return None,
+                }
+            }
+            Some(window) => {
+                let window_size = self
+                    .scaled_extent(window, &PaddingForm::default(), None, granularity)
+                    .filter(|size| size.0 >= 1)?;
+                let strided = window_size
+                    .0
+                    .saturating_add(val.saturating_sub(1).saturating_mul(pad.stride.0));
+                match pad_type {
+                    PadType::PaddedFullSpanWUnneeded => strided.saturating_add(unneeded),
+                    PadType::PaddedWZeroPad => strided,
+                    PadType::PaddedNoZeroPad => {
+                        let (front, back) = match pad.sizes {
+                            PadSizes::Voided => return None,
+                            PadSizes::Unpadded => (0, 0),
+                            PadSizes::Sized { front, back } => {
+                                (i64::from(front.0), i64::from(back.0))
+                            }
+                        };
+                        strided
+                            .saturating_add(unneeded)
+                            .saturating_sub(i64::from(pad.unneeded.front.0))
+                            .saturating_sub(i64::from(pad.unneeded.back.0))
+                            .saturating_sub(front)
+                            .saturating_sub(back)
+                    }
+                    PadType::LoweredPadded => window_size.0.saturating_mul(val),
+                    _ => return None,
+                }
+            }
+        };
+        Some(Extent(span))
+    }
+
+    /// `primaryDimToVal_st(dim, NO_COMPONENT, -1, -1, {dim, pad})` — [`Self::scaled_extent`] with the
+    /// default density and the max symbolic size, which is what every caller that names one padding
+    /// type asks for.
+    #[must_use]
+    pub fn padded_extent(&self, dim: PrimaryDim, pad: PadType) -> Option<Extent> {
+        let mut form = PaddingForm::default();
+        form.set_padding(dim, pad);
+        self.scaled_extent(dim, &form, None, false)
+    }
+
     /// `hasPadding` (`L3DlOpsScheduler.cpp:1071-1075`) — the dim has a `paddingSizes_` entry AND its
     /// `PADDED_FULLSPAN_WUNNEEDED` span differs from its plain extent.
     ///
@@ -905,67 +1029,6 @@ impl StageDims {
             return Some(false);
         };
         Some(self.padded_extent(dim, PadType::PaddedFullSpanWUnneeded)? != plain)
-    }
-
-    /// `primaryDimToVal_st(dim, NO_COMPONENT, -1, -1, {dim, pad})`, which is `calculate_padded`
-    /// (`dsc/dims.cpp:563-615`) over the dim's own `paddingSizes_` entry.
-    ///
-    /// ⛔ [`None`] IS THE UNSTATED DIM (`val < 0` ⇒ `-1`) AND EVERY ABORT AT ONCE: *"Cannot calculate
-    /// padded version of compound dim"*, *"Padded dimension without padding sizes information"*, the
-    /// two `padFront_ < 0` refusals a [`PadSizes::Voided`] dim reaches, *"Missing window size"*, and
-    /// the two *"Unsupported padding type requested"* arms — a windowless dim admits only the two
-    /// full-span forms, a windowed one everything but [`PadType::PaddedFullSpan`].
-    /// ⛔ SPANS SATURATE rather than wrap, so an unrepresentable span stays the largest one.
-    #[must_use]
-    pub fn padded_extent(&self, dim: PrimaryDim, pad: PadType) -> Option<Extent> {
-        let plain = self.extent(dim)?;
-        if matches!(pad, PadType::NoPad) {
-            return Some(plain);
-        }
-        if matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij) {
-            return None;
-        }
-        let info = self.padding.get(&dim)?;
-        let unneeded = i64::from(info.unneeded.total.0);
-        // `padFront_`/`padBack_`, absent for the voided pair the two `< 0` refusals reject.
-        let edges = || match info.sizes {
-            PadSizes::Voided => None,
-            PadSizes::Unpadded => Some((0, 0)),
-            PadSizes::Sized { front, back } => Some((i64::from(front.0), i64::from(back.0))),
-        };
-        match info.window_dim {
-            None => {
-                let (front, back) = edges()?;
-                let span = plain.0.saturating_add(front).saturating_add(back);
-                match pad {
-                    PadType::PaddedFullSpanWUnneeded => Some(Extent(span.saturating_add(unneeded))),
-                    PadType::PaddedFullSpan => Some(Extent(span)),
-                    _ => None,
-                }
-            }
-            Some(window) => {
-                let window_size = self.extent(window).filter(|size| size.0 >= 1)?;
-                let span = window_size
-                    .0
-                    .saturating_add(plain.0.saturating_sub(1).saturating_mul(info.stride.0));
-                match pad {
-                    PadType::PaddedFullSpanWUnneeded => Some(Extent(span.saturating_add(unneeded))),
-                    PadType::PaddedWZeroPad => Some(Extent(span)),
-                    PadType::PaddedNoZeroPad => {
-                        let (front, back) = edges()?;
-                        Some(Extent(
-                            span.saturating_add(unneeded)
-                                .saturating_sub(i64::from(info.unneeded.front.0))
-                                .saturating_sub(i64::from(info.unneeded.back.0))
-                                .saturating_sub(front)
-                                .saturating_sub(back),
-                        ))
-                    }
-                    PadType::LoweredPadded => Some(Extent(window_size.0.saturating_mul(plain.0))),
-                    PadType::NoPad | PadType::PaddedFullSpan => None,
-                }
-            }
-        }
     }
 
     /// `DataStructDims::compound` (`dsc/dims.cpp:84`) — `IJ = I·J` and `KIJ = KI·KJ`, and a product
@@ -1171,6 +1234,178 @@ pub trait MemOrg {
     /// on meeting a negative `maxSize` and skips every later entry naming it, so the key set is
     /// "bounded by the layout and never left unbounded", whatever order the layout states them in.
     fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim>;
+
+    /// `memOrg_.at(SenComponents::LX).allocateNode_->padding_` (`dsc/dsc2.h:983`), [`None`] where
+    /// `memOrg_` names no `LX` or its entry holds no node — *"Expect LX in memOrg_."* and *"Expect a
+    /// valid allocate node."* both.
+    fn lx_padding(&self) -> Option<PaddingForm>;
+
+    /// `getPageSize()` ON THAT LX NODE (`dsc/dsc2.cpp:4480`) WITH ITS SIZES, empty where nothing
+    /// pages.
+    ///
+    /// ⛔ A DIFFERENT NODE FROM [`Self::hbm_page_dims`], AND THE SIZES ARE WHY BOTH EXIST: entry 209
+    /// CAPS a chunk parameter at `pageSizes.at(dim)`, so the value it reads is load-bearing, where
+    /// every reader of the HBM node's page set asks only `count(dim)`.
+    fn lx_page_sizes(&self) -> BTreeMap<PrimaryDim, Extent>;
+
+    /// `memOrg_.at(HBM).allocateNode_->allocUsers_` (`dsc/dsc2.h:1000`) by node id — the nodes
+    /// `hasAllocUser(node)` answers for. [`None`] is no HBM entry or no node; the EMPTY vector is
+    /// `!hasAllocUsers()`, which is a REFUSAL of its own and not this seam's.
+    fn hbm_alloc_users(&self) -> Option<Vec<NodeId>>;
+
+    /// The same list on the LX node, which is the branch an input neighbour fetch takes.
+    fn lx_alloc_users(&self) -> Option<Vec<NodeId>>;
+}
+
+/// EVERY LABELLED DS'S MEMORY ORGANISATION IN ONE SUPER-DSC — `mySDsc.dscs_.at(i).labeledDs_.at(j)
+/// .memOrg_`, so a unit that walks two nested lists can reach each entry's allocate nodes.
+pub trait MemOrgs {
+    /// One labelled DS's organisation, however the caller stores it.
+    type Org: MemOrg + ?Sized;
+
+    /// `dscs_.at(dsc).labeledDs_.at(lds).memOrg_`, [`None`] for either `.at()`'s throw.
+    fn mem_org(&self, dsc: DscIdx, lds: LdsIdx) -> Option<&Self::Org>;
+}
+
+/// ONE TRANSFER NODE AS ENTRY 208 FILTERS IT — a `dsc2::TransferNode` reduced to its identity and
+/// the two storages the filter reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L3Transfer {
+    /// The node itself, which is what an alloc-user list names and what a later insertion point is
+    /// computed from.
+    pub node: NodeId,
+    /// `name_`.
+    pub name: NodeName,
+    /// `src_.storage_`.
+    pub src: SenComponent,
+    /// `dstVias_.front().loc_.storage_` — the FRONT destination, which is the only one the filter
+    /// reads however many the transfer has.
+    pub dst: SenComponent,
+}
+
+/// ONE DSC'S TRANSFER NODES — `dsc.scheduleTree_.traverseTreeDFS(nullptr, {TRANSFER})`.
+///
+/// ⭐ `DT_CHECK_MSG(node->nodeType_ == TRANSFER, "Expect a transfer node.")` IS THE FILTER THAT
+/// PRODUCED THE LIST, exactly as [`ScheduleTrees`]' allocate walk re-checks its own cast.
+pub trait TransferNodes {
+    /// That DSC's transfers in DFS order; EMPTY for an index the super-DSC does not have.
+    fn transfers(&self, dsc: DscIdx) -> Vec<L3Transfer>;
+}
+
+/// A SCHEDULE TREE AS ENTRY 211 WALKS IT — `getMutableParent()` and a parent's children, both by
+/// node id.
+///
+/// ⭐ EVERY NODE'S PARENT IS A BLOCK AND SO ALWAYS HAS CHILDREN: `prev_` is declared
+/// `BlockNode *prev_` (`dsc/dsc2.h:515`) and `getPrev()` and `getMutableParent()` (`:463-464`) are
+/// the SAME link, which is what makes *"Parent node must be a block node."* unreachable.
+///
+/// ⛔ NOT [`fold::ScheduleTree`](crate::schedule::ddc::fold::ScheduleTree), whose `children` takes a
+/// BLOCK-only id and so cannot be asked for an arbitrary node's siblings, and NOT
+/// [`ScopeTree`](crate::schedule::ddc::transformation::ScopeTree), which carries an ancestry and a
+/// scope classification this walk never asks for.
+pub trait NodeParents {
+    /// `getMutableParent()`, [`None`] at the root.
+    fn parent(&self, node: NodeId) -> Option<NodeId>;
+
+    /// `next_` of `parent`, in order; EMPTY for a node that is not a block.
+    fn children(&self, parent: NodeId) -> Vec<NodeId>;
+}
+
+/// WHICH SIDE OF A REFERENCE NODE SET AN INSERTION LANDS ON — `insertBefore`
+/// (`L3DlOpsScheduler.cpp:3376`), an enum because the flag sits beside the node set it selects into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertSide {
+    /// `insertBefore == true` — the FIRST child of the common parent in the set.
+    Before,
+    /// `insertBefore == false` — the LAST.
+    After,
+}
+
+/// ONE DIM'S CANDIDATE CHUNK EXTENTS, NON-EMPTY — `DscParamCandidatesType`'s inner vector
+/// (`L3DlOpsScheduler.h:100`).
+///
+/// ⭐ THE NON-EMPTINESS IS `DT_CHECK_MSG(!dscCandidates[dscIdx][dim].empty(), "There must be at least
+/// one valid candidate.")` — entry 207's closing check, discharged by the type it builds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidates(Vec<Extent>);
+
+impl Candidates {
+    /// The candidates, or [`None`] for an empty list.
+    #[must_use]
+    pub fn of(extents: Vec<Extent>) -> Option<Self> {
+        (!extents.is_empty()).then_some(Self(extents))
+    }
+
+    /// The candidates, in ascending order as the search generates them.
+    #[must_use]
+    pub fn extents(&self) -> &[Extent] {
+        &self.0
+    }
+}
+
+/// ONE DSC'S CANDIDATES, PER DIM — `DscParamCandidatesType`'s inner map.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DimCandidates(BTreeMap<PrimaryDim, Candidates>);
+
+impl DimCandidates {
+    /// Every dim's candidates, or [`None`] where any dim reached the end with none.
+    #[must_use]
+    pub fn of(per_dim: BTreeMap<PrimaryDim, Vec<Extent>>) -> Option<Self> {
+        per_dim
+            .into_iter()
+            .map(|(dim, extents)| Candidates::of(extents).map(|found| (dim, found)))
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(Self)
+    }
+
+    /// `.at(dim)`, [`None`] for a dim no candidate was generated for.
+    #[must_use]
+    pub fn get(&self, dim: PrimaryDim) -> Option<&Candidates> {
+        self.0.get(&dim)
+    }
+
+    /// Every dim and its candidates, in `PrimaryDimTypes` order.
+    pub fn iter(&self) -> impl Iterator<Item = (PrimaryDim, &Candidates)> + '_ {
+        self.0.iter().map(|(dim, found)| (*dim, found))
+    }
+}
+
+/// EVERY DSC'S CANDIDATES — `DscParamCandidatesType` (`L3DlOpsScheduler.h:100`), sized by
+/// `mySDsc.dscs_.size()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DscCandidates(Vec<DimCandidates>);
+
+impl DscCandidates {
+    /// One entry per DSC, in `dscs_` order.
+    #[must_use]
+    pub const fn new(per_dsc: Vec<DimCandidates>) -> Self {
+        Self(per_dsc)
+    }
+
+    /// `dscCandidates[dscIdx]`, [`None`] past the end.
+    #[must_use]
+    pub fn at(&self, dsc: DscIdx) -> Option<&DimCandidates> {
+        self.0.get(usize::try_from(dsc.0).ok()?)
+    }
+
+    /// Every DSC's candidates, in `dscs_` order.
+    pub fn iter(&self) -> impl Iterator<Item = &DimCandidates> + '_ {
+        self.0.iter()
+    }
+}
+
+/// THE TWO DATA STAGES A PAGED DIM IS CHECKED AGAINST — `dataStageOnePageIdx` and
+/// `dataStageIbrIdx` (`L3DlOpsScheduler.h:222-223`), whose `-1` default is this type's absence.
+///
+/// ⭐ NAMED FIELDS AND NOT A PAIR: the two indices are both `DatastageId` and transposing them would
+/// check a page size against an index-tensor stick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedStages {
+    /// `dataStageOnePageIdx`, assigned at `L3DlOpsScheduler.cpp:6680-6681`.
+    pub one_page: DatastageId,
+    /// `dataStageIbrIdx`, assigned at `:6630-6631` — the index-tensor stick's stage, read on BOTH its
+    /// `ss_` (steady state) and its `el_` (epilogue).
+    pub ibr: DatastageId,
 }
 
 /// WHAT ENTRY 049 READS OFF ONE DATA STAGE — `DataStructDims` (`dsc/dims.h:158-303`) reduced to the
