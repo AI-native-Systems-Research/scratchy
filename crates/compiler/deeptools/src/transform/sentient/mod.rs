@@ -133,6 +133,7 @@ pub(crate) mod utils;
 pub(crate) mod vector_register_initialization;
 
 use crate::islands::sentient::dialects::Val;
+use crate::units::DfirUnit;
 
 /// THE `sentient.for` A DESCRIPTOR OR AN ANALYSIS POINTS AT — `sentient::ForOp`, named by its
 /// induction variable.
@@ -153,6 +154,45 @@ pub struct ForRef(pub Val);
 /// negative index. `iter_arg_index_ >= 0` is half of four descriptors' `isValid()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IterArgIndex(pub u32);
+
+/// `CommonPassOptions`'s UNIT FILTER — `is_include_list_` and `incl_excl_list_` as one value
+/// (`dcc/tools/Options/dcc-pass-option.h:127-141`).
+///
+/// ⛔ A PASS INPUT, NOT A CONSTANT, for the reason [`ProgStitch`] is one: the pipeline that builds a
+/// pass decides which units it may touch, and the pass reads the answer.
+/// ⭐ THE DEFAULT EXCLUDES NOTHING — *"by default, we exclude an empty list of units"* (`:163-167`),
+/// so `isIncludeList()` is false and every unit is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitFilter {
+    /// `includeUnits(list)` — the ONLY units the next pass may touch.
+    Include(Vec<DfirUnit>),
+    /// `excludeUnits(list)` — the units it must not.
+    Exclude(Vec<DfirUnit>),
+}
+
+impl Default for UnitFilter {
+    /// `is_include_list_ = false` over an empty `incl_excl_list_`, which is what `resetInclExclList`
+    /// also writes (`:135-138`).
+    fn default() -> UnitFilter {
+        UnitFilter::Exclude(Vec::new())
+    }
+}
+
+impl UnitFilter {
+    /// `isIncludeList()` (`:142`).
+    #[must_use]
+    pub fn is_include_list(&self) -> bool {
+        matches!(self, UnitFilter::Include(_))
+    }
+
+    /// `getInclExclList().count(unit) != 0` — whether the list NAMES this unit kind, whichever kind
+    /// of list it is.
+    #[must_use]
+    pub fn names(&self, unit: DfirUnit) -> bool {
+        let (UnitFilter::Include(list) | UnitFilter::Exclude(list)) = self;
+        list.contains(&unit)
+    }
+}
 
 /// WHETHER THE PROGRAMS ARE BEING STITCHED TOGETHER — `dccExtContext().getProgStitch()`, which is
 /// `dsc_global_->doProgStitch` (`Utils/DccExtContext.cpp:329`).

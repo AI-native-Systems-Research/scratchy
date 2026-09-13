@@ -86,10 +86,14 @@
 #![allow(dead_code)]
 
 use crate::arch::Arch;
+use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::uniform;
+use crate::islands::dataflow_ir::link::{Link, Lxlu as LxluUnit, Sfp as SfpUnit};
 use crate::islands::sentient::ProgramUnit;
-use crate::islands::sentient::dialects::Val;
-use crate::units::DfirUnit;
+use crate::islands::sentient::dialects::{Op, Val, dataflow, sentient};
+use crate::transform::sentient::ProgStitch;
+use crate::transform::sentient::set_send_destination_re::set_send_dst_rde_tree::SetSendDstRdeTreeOptimizer;
+use crate::units::{DfirUnit, Residency};
 
 pub(crate) mod composite_set_dst_gen_value_lxlu;
 pub(crate) mod composite_set_dst_gen_value_sfp;
@@ -187,10 +191,54 @@ pub(crate) fn determine_optimization_mode<A: Arch>(
     }
 }
 
-// crustify:todo: e475_runOn
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:109  (54 body lines, level 2)
-//   original  : void runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e195_determineOptimizationMode, e200_print, e201_print, e202_print, e205_print, e206_print, e207_print, e378_optimize
+/// `-dcc-set-send-destination-reset-force`, `cl::init(false)` (`:97-101`) — a `dcc-opt` command-line
+/// flag, not a program property, and this crate has no flags.
+const FORCE_SET_SEND_DESTINATION_RESET: bool = false;
+
+/// `Statistic set_send_dst_re_count`, *"num-set-dst-redundancy-eliminated"* (`Passes.td:178-181`) —
+/// how many `set_send_dst`s the optimizer removed or hoisted out of this program unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SetSendDstReCount(pub(crate) u32);
+
+/// Replaces: e475_runOn
+///
+/// One program unit: eliminate its redundant `set_send_dst`s, then — for a stitched program that
+/// eliminated any — reset the send destination to the SFP default at the end of an LXLU unit.
+///
+/// ⛔ `comp != LXLU` IS THE MODE AGAIN: past the first gate the mode is LXLU or SFP, and it is LXLU
+/// exactly when `getUnits()[0]`'s kind is, so an SFP unit is never reset.
+/// ⭐ THE PAIR GOES BEFORE `unit.getRegion().back().back()`, the implicit `dataflow.return`
+/// (`Dataflow.td:86`) — the island holds no terminator, so inserting before it is a push.
+/// ⚠️ ALL FOUR `LLVM_DEBUG` DUMPS ARE DROPPED (`:112-119`, `:124-136`): they change no IR.
+pub(crate) fn run_on<A: Arch>(
+    unit: &mut ProgramUnit<A>,
+    prog_stitch: ProgStitch,
+    tree: &mut impl SetSendDstRdeTreeOptimizer,
+    values: &mut Values,
+) {
+    let mode = determine_optimization_mode(unit);
+    // `if (!optimizeForLXLU() && !optimizeForSFP()) return;`
+    if mode == SetDestReOptimizationMode::Unknown {
+        return;
+    }
+    let count = tree.optimize(&mut unit.body, mode);
+    if prog_stitch == ProgStitch::Standalone && !FORCE_SET_SEND_DESTINATION_RESET {
+        return;
+    }
+    if count == SetSendDstReCount(0) || unit.on.kind() != DfirUnit::Lxlu {
+        return;
+    }
+    let sfp = values.mint();
+    unit.body.push(Op::Dataflow(dataflow::Op::GetUnit {
+        result: sfp,
+        residency: Residency::Global,
+        unit: DfirUnit::Sfp,
+        num_folds: None,
+    }));
+    unit.body.push(Op::Sentient(sentient::Op::SetSendDst {
+        units: Link::<LxluUnit, SfpUnit>::between(unit.on.first(), sfp).ends().0,
+    }));
+}
 
 // crustify:todo: e537_runOn
 //   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:164  (4 body lines, level 3)
@@ -204,12 +252,14 @@ pub(crate) fn determine_optimization_mode<A: Arch>(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{SetDestReOptimizationMode, determine_optimization_mode};
+    use super::{
+        DfirUnit, Link, LxluUnit, Op, ProgStitch, Residency, SetDestReOptimizationMode,
+        SetSendDstReCount, SetSendDstRdeTreeOptimizer, SfpUnit, Val, Values, dataflow,
+        determine_optimization_mode, run_on, sentient,
+    };
     use crate::arch::Dd2;
     use crate::islands::dataflow_ir::Units;
     use crate::islands::sentient::ProgramUnit;
-    use crate::islands::sentient::dialects::Val;
-    use crate::units::DfirUnit;
 
     /// A program unit bound to one unit of `kind`.
     fn unit_on(kind: DfirUnit) -> ProgramUnit<Dd2> {
@@ -237,5 +287,70 @@ mod unit_tests {
             determine_optimization_mode(&unit_on(DfirUnit::L3lu)),
             SetDestReOptimizationMode::Unknown
         );
+    }
+
+    /// A tree THAT ELIMINATED `count` REDUNDANCIES and remembers which mode it was asked for — the
+    /// optimizer is `Analyses/` work, so the count is its whole observable surface.
+    #[derive(Debug, Default)]
+    struct ElidingTree {
+        count: u32,
+        asked: Option<SetDestReOptimizationMode>,
+    }
+
+    impl SetSendDstRdeTreeOptimizer for ElidingTree {
+        fn optimize(
+            &mut self,
+            _unit: &mut Vec<Op>,
+            mode: SetDestReOptimizationMode,
+        ) -> SetSendDstReCount {
+            self.asked = Some(mode);
+            SetSendDstReCount(self.count)
+        }
+    }
+
+    /// An LXLU program unit whose own handle is minted from `values`, so the `get_unit` e475 appends
+    /// is a distinct value.
+    fn lxlu_unit(values: &mut Values) -> ProgramUnit<Dd2> {
+        ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::Lxlu, values.mint()),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e475 — a stitched LXLU unit that eliminated something ends with the SFP reset pair, and the
+    /// standalone compilation appends nothing. ⭐ THE TAIL IS THE PORT, and the count gates it.
+    #[test]
+    fn e475_resets_the_destination_at_the_end_of_a_stitched_lxlu_unit() {
+        let mut values = Values::default();
+        let mut unit = lxlu_unit(&mut values);
+        let mut tree = ElidingTree {
+            count: 2,
+            asked: None,
+        };
+
+        run_on(&mut unit, ProgStitch::Stitched, &mut tree, &mut values);
+
+        assert_eq!(tree.asked, Some(SetDestReOptimizationMode::OptimizeForLxlu));
+        assert_eq!(
+            unit.body,
+            vec![
+                Op::Dataflow(dataflow::Op::GetUnit {
+                    result: Val(1),
+                    residency: Residency::Global,
+                    unit: DfirUnit::Sfp,
+                    num_folds: None,
+                }),
+                Op::Sentient(sentient::Op::SetSendDst {
+                    units: Link::<LxluUnit, SfpUnit>::between(Val(0), Val(1)).ends().0,
+                }),
+            ]
+        );
+
+        // `dccExtContext().getProgStitch()` false and the flag off — the elimination still runs.
+        let mut standalone = lxlu_unit(&mut values);
+        run_on(&mut standalone, ProgStitch::Standalone, &mut tree, &mut values);
+        assert_eq!(standalone.body, Vec::new());
     }
 }

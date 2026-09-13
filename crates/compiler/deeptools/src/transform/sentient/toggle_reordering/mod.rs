@@ -86,11 +86,16 @@
 
 pub(crate) mod toggle_info;
 
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{
     Op, Val, defining_op, parent_for_arg, sentient, uniform, use_count,
 };
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::transform::sentient::UnitFilter;
 use crate::transform::sentient::analyses::ExpressionEvaluator;
+use crate::workload::Workload;
 use toggle_info::{ToggleInfo, yielded_results};
 
 /// `sentient::SubOp` — the four things e233 reads off a candidate.
@@ -273,10 +278,44 @@ fn is_sentient_constant(val: Val, scope: &[Op]) -> bool {
 //   original  : void ToggleReorderingPass::runOn(dataflow::ProgramUnitOp unit_op)
 //   calls     : e232_reorderToggle, e233_computeToggleInfoIfIsToggle
 
-// crustify:todo: e481_runOn
-//   authority : dcc/src/Transform/Sentient/ToggleReordering.cpp:181  (18 body lines, level 2)
-//   original  : void ToggleReorderingPass::runOn(ModuleOp module_op)
-//   calls     : e390_runOn
+/// `-toggle-reordering-in-l3-units-only`, `cl::init(true)` (`:45-47`) — a `dcc-opt` command-line flag,
+/// not a program property, and this crate has no flags. ⛔ DEFAULTS **ON**, unlike every
+/// `DisableThisPass`, so the include-list gate below is live.
+const TOGGLE_REORDERING_IN_L3_ONLY: bool = true;
+
+/// Replaces: e481_runOn
+///
+/// Reorders toggles in every program unit of the module, skipping one an include list leaves out.
+///
+/// ⭐ `DT_CHECK_MSG(get_unit_op, "Cannot determine GetUnitOp!")` IS DISCHARGED BY THE TYPE: a
+/// [`Units`](crate::islands::dataflow_ir::Units) carries its [`DfirUnit`](crate::units::DfirUnit) as
+/// a closed enum, so the `dyn_cast_or_null` on `getUnits().front()` cannot come back null.
+/// ⭐ BOTH `WalkResult::skip()` RETURNS LEAVE ONE PASS OVER TOP-LEVEL UNITS, which a program's unit
+/// list already is — the skip only stops the walk re-entering the body e390 has just rewritten.
+/// ⛔ THE GATE IS A CONJUNCTION AND THE DEFAULT FILTER IS AN **EXCLUDE** LIST, so with stock options
+/// nothing is skipped even though the L3-only flag is on.
+pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    opts: &UnitFilter,
+    evaluator: &mut impl ExpressionEvaluator,
+) {
+    for unit in program.units.iter_mut() {
+        if TOGGLE_REORDERING_IN_L3_ONLY && opts.is_include_list() && !opts.names(unit.on.kind()) {
+            continue;
+        }
+        run_on_unit(unit, evaluator);
+    }
+}
+
+/// `runOn(dataflow::ProgramUnitOp)` — entry 390, level 1, not yet ported.
+fn run_on_unit<A: Arch>(unit: &mut ProgramUnit<A>, evaluator: &mut impl ExpressionEvaluator) -> ! {
+    let _ = (unit, evaluator);
+    todo!(
+        "e390_runOn(dataflow::ProgramUnitOp) — the pre-order walk gathering every \
+         e233_computeToggleInfoIfIsToggle candidate and then e232_reorderToggle over them \
+         (ToggleReordering.cpp:200)"
+    )
+}
 
 // crustify:todo: e542_runOnOperation
 //   authority : dcc/src/Transform/Sentient/ToggleReordering.cpp:149  (5 body lines, level 3)
@@ -285,10 +324,61 @@ fn is_sentient_constant(val: Val, scope: &[Op]) -> bool {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{SubOp, compute_toggle_info_if_is_toggle};
+    use super::{SubOp, compute_toggle_info_if_is_toggle, run_on_program};
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
+    use crate::transform::sentient::UnitFilter;
     use crate::transform::sentient::analyses::OutOfScopeEvaluator;
+    use crate::units::DfirUnit;
+    use crate::workload::Workload;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One program with one unit on `kind`, holding nothing — e481 reads only the unit's kind.
+    fn program_on(kind: DfirUnit) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(kind, Val(0)),
+                    precision: None,
+                    body: Vec::new(),
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
 
     /// The candidate: `%31 = sentient.scalar_sub %30, %20`.
     const SUB: SubOp = SubOp {
@@ -414,5 +504,28 @@ mod unit_tests {
             ],
         );
         let _ = compute_toggle_info_if_is_toggle(&mut OutOfScopeEvaluator, &unit_body, SUB);
+    }
+
+    /// e481 — an include list that does not name the unit's kind skips it, so nothing runs and the
+    /// unported e390 is never reached. ⭐ THE L3-ONLY FLAG DEFAULTS ON, which is what arms this gate.
+    #[test]
+    fn e481_skips_a_unit_an_include_list_leaves_out() {
+        let mut program = program_on(DfirUnit::Pe);
+        let mut evaluator = OutOfScopeEvaluator;
+        run_on_program(
+            &mut program,
+            &UnitFilter::Include(vec![DfirUnit::L3lu, DfirUnit::L3su]),
+            &mut evaluator,
+        );
+        assert!(program.units.iter().all(|unit| unit.body.is_empty()));
+    }
+
+    /// e481 — the stock filter is an EXCLUDE list, so the conjunction fails and every unit runs.
+    #[test]
+    #[should_panic(expected = "e390_runOn")]
+    fn e481_runs_every_unit_under_the_default_filter() {
+        let mut program = program_on(DfirUnit::Pe);
+        let mut evaluator = OutOfScopeEvaluator;
+        run_on_program(&mut program, &UnitFilter::default(), &mut evaluator);
     }
 }

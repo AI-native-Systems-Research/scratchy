@@ -374,10 +374,62 @@ fn local_region_body_mut(scope: &mut [Op], arg: LocalRegionArg) -> Option<&mut V
 //   original  : void dump(raw_ostream &os, int indent = 0) const
 //   calls     : e211_dump
 
-// crustify:todo: e477_runOn
-//   authority : dcc/src/Transform/Sentient/SinkScalarCopy.cpp:189  (25 body lines, level 2)
-//   original  : void runOn(sentient::CopyOp copy_op)
-//   calls     : e211_dump, e213_addRegion, e381_dump
+/// EVERY OP IN `scope` WITH THE REGION `getRegionOpAndIndex` NAMES FOR IT (`Uniform/Utils.cpp:343`):
+/// the owner is the innermost `uniform.uniformize_regions`/`uniform.equalize_pattern`, or the unit.
+///
+/// ⭐ AN INTERMEDIATE OP DOES NOT OWN A REGION HERE: the reference's walk keeps overwriting `region`
+/// as it climbs and stops only at one of the three owners, so a use nested in an `affine.for` inside
+/// a local region reports that LOCAL region, not the loop body.
+fn walk_owning_regions(scope: &[Op], region: Region, visit: &mut impl FnMut(&Op, Region)) {
+    for op in scope {
+        visit(op, region);
+        if let Op::UniformRegions(uniform) = op {
+            for (at, local) in uniform.regions().iter().enumerate() {
+                let owned = Region::UniformLocal {
+                    number: RegionNumber(at as u32),
+                    arg: LocalRegionArg(local.arg),
+                };
+                walk_owning_regions(&local.body, owned, visit);
+            }
+            continue;
+        }
+        for nested in dialects::regions_ref(op) {
+            walk_owning_regions(nested, region, visit);
+        }
+    }
+}
+
+impl SinkScalarCopy {
+    /// Replaces: e477_runOn
+    ///
+    /// Collects one global-region `sentient.scalar_copy` together with the unique regions its result
+    /// is read in — the list [`SinkScalarCopy::sink_copy_ops`] then sinks a clone into.
+    ///
+    /// ⭐ A COPY ALREADY INSIDE A LOCAL REGION IS SKIPPED: `isa<ProgramUnitOp>(getRegionOp(copy_op))`
+    /// asks whether any uniformization construct encloses it, which is this walk's own answer.
+    /// ⚠️ BOTH `LLVM_DEBUG` DUMPS ARE DROPPED (`:192`, `:208`) — they change no IR, and the second is
+    /// the only call `e381_dump` has in the pass.
+    pub fn run_on_copy(&mut self, copy: CopyResult, body: &[Op]) {
+        let mut defined_in = None;
+        let mut used_in = Vec::new();
+        walk_owning_regions(body, Region::Global, &mut |op, region| {
+            if dialects::results(op).contains(&copy.0) {
+                defined_in = Some(region);
+            }
+            if dialects::operands(op).contains(&copy.0) {
+                used_in.push(RegionInfo::new(region));
+            }
+        });
+        if defined_in != Some(Region::Global) {
+            return;
+        }
+        let mut uses = UsesInfo::new(copy);
+        for region in used_in {
+            uses.add_region(region);
+        }
+        self.uses_info_list.push(uses);
+    }
+}
 
 // crustify:todo: e538_runOn
 //   authority : dcc/src/Transform/Sentient/SinkScalarCopy.cpp:176  (7 body lines, level 3)
@@ -566,6 +618,49 @@ mod unit_tests {
                 ..
             })
         ));
+    }
+
+    /// A global-region copy read once globally and once from a local region collects BOTH; a copy
+    /// that already sits inside a local region is not collected at all.
+    #[test]
+    fn run_on_copy_collects_the_owning_region_of_every_use() {
+        let body = vec![
+            copy(Val(0), Val(10)),
+            add(Val(10), Val(11)),
+            Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![LocalRegion {
+                    arg: Val(20),
+                    units: vec![Val(2)],
+                    // The nested copy's own use is in this same region, and the loop does not own it.
+                    body: vec![
+                        copy(Val(1), Val(30)),
+                        add(Val(10), Val(12)),
+                        add(Val(30), Val(13)),
+                    ],
+                }],
+                results: Vec::new(),
+                yielded: Vec::new(),
+            }),
+        ];
+
+        let mut pass = SinkScalarCopy::default();
+        pass.run_on_copy(CopyResult(Val(10)), &body);
+        pass.run_on_copy(CopyResult(Val(30)), &body);
+
+        let [collected] = pass.uses_info_list() else {
+            panic!("only the global-region copy is collected");
+        };
+        assert_eq!(collected.operation(), CopyResult(Val(10)));
+        assert_eq!(
+            collected.regions(),
+            [
+                RegionInfo::new(Region::Global),
+                RegionInfo::new(Region::UniformLocal {
+                    number: RegionNumber(0),
+                    arg: LocalRegionArg(Val(20)),
+                }),
+            ]
+        );
     }
 
     #[test]

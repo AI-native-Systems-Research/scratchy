@@ -93,6 +93,10 @@
 #![allow(dead_code)]
 
 use super::rematerialization_pass::InBlock;
+use super::utils::fold_mode_attribute_if_exists;
+use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
+    DbgNamePrefix, new_dbg_name_from_list,
+};
 use crate::islands::sentient::dialects::sentient::{Operand, Port, Precision, ResultPorts};
 use crate::islands::sentient::dialects::{Op, dataflow, sentient};
 
@@ -730,6 +734,43 @@ mod unit_tests {
             )
         );
     }
+
+    /// A `vector_mac` carrying `fold_mode` — the attribute e480's first two gates read.
+    fn mac_folded(fold_mode: Option<sentient::FoldMode>) -> Op {
+        let mut op = mac(
+            operand(Port::West, &[]),
+            operand(Port::West, &[]),
+            operand(Port::Zero, &[]),
+            result(&[], Precision::Fp16),
+        );
+        if let Op::Sentient(sentient::Op::VectorMac { fold_mode: on, .. }) = &mut op {
+            *on = fold_mode;
+        }
+        op
+    }
+
+    /// e480: a `fold_AB_B` head is refused before anything is asked of the op (`:449-450`), and an
+    /// ordinary candidate walks the gates as far as the unported e387. ⭐ THE GATE ORDER IS THE PORT.
+    #[test]
+    fn e480_a_fold_ab_b_head_is_refused_and_anything_else_reaches_the_trivial_fill() {
+        let mut to_be_deleted = Vec::new();
+        let mut block = vec![mac_folded(Some(sentient::FoldMode::FoldAbB))];
+
+        assert_eq!(
+            fuse_store_and_forward(InBlock::at(0), &mut block, &mut to_be_deleted),
+            Fused::No
+        );
+        assert_eq!(to_be_deleted, Vec::new());
+
+        let mut plain = vec![mac_folded(None)];
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fuse_store_and_forward(InBlock::at(0), &mut plain, &mut to_be_deleted)
+        }));
+        assert!(
+            reached.is_err(),
+            "e387 is not ported, so the trivial fill panics"
+        );
+    }
 }
 
 // crustify:todo: e385_appendValueForwarding
@@ -747,10 +788,267 @@ mod unit_tests {
 //   original  : bool StoreAndForwardFusionPass::fillOperandForTrivialOp( mlir::Operation *op, mlir::ArrayAttr &opA_forwarding, mlir::ArrayAttr &opB_forwarding, mlir::ArrayAttr &opC_forwarding, mlir::ArrayAttr &result_forwarding, SentientPrecision &result_precision)
 //   calls     : e225_isOpTrivialMacOp, e226_isOpTrivialBinaryOp
 
-// crustify:todo: e480_FuseStoreAndForward
-//   authority : dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:434  (119 body lines, level 2)
-//   original  : LogicalResult StoreAndForwardFusionPass::FuseStoreAndForward( mlir::Operation *op, std::vector<mlir::Operation *> &to_be_deleted)
-//   calls     : e223_appendToVector, e224_findFusibleOp, e227_fillOperandForFusibleOp, e228_updateFusibleOp, e248_getFoldModeAttributeIfExists, e385_appendValueForwarding, e386_isEligibleToFuse, e387_fillOperandForTrivialOp
+/// `appendValueForwarding(value_forwardings, opA, opB, opC, result)` — entry 385, level 1, not yet
+/// ported.
+fn append_value_forwarding(value_forwardings: &mut Vec<Port>, forwardings: &Forwardings) {
+    let _ = (value_forwardings, forwardings);
+    todo!(
+        "e385_appendValueForwarding(value_forwardings, opA, opB, opC, result) — the four \
+         e223_appendToVector calls that flatten one op's forwardings in operand order \
+         (StoreAndForwardFusion.cpp:100)"
+    )
+}
+
+/// `isEligibleToFuse(trivial_forwardings, fusible_forwardings, trivial_op, fusible_op)` — entry 386,
+/// level 1, not yet ported.
+fn is_eligible_to_fuse(
+    value_forwardings_for_trivial: &[Port],
+    value_forwardings_for_fusible: &[Port],
+    trivial_op: &Op,
+    fusible_op: &Op,
+) -> bool {
+    let _ = (
+        value_forwardings_for_trivial,
+        value_forwardings_for_fusible,
+        trivial_op,
+        fusible_op,
+    );
+    todo!(
+        "e386_isEligibleToFuse(trivial_forwardings, fusible_forwardings, trivial_op, fusible_op) — \
+         the fold-mode agreement, the ports the fusible list may name, the one-LRF rule and the \
+         unroll-factor match (StoreAndForwardFusion.cpp:219), 87 lines"
+    )
+}
+
+/// `fillOperandForTrivialOp(op, opA, opB, opC, result, result_precision)` — entry 387, level 1, not
+/// yet ported. ⭐ [`None`] IS ITS `false`: e480 abandons the fusion, so the out-params it filled on
+/// the way are never read.
+fn fill_operand_for_trivial_op(op: &Op) -> Option<Forwardings> {
+    let _ = op;
+    todo!(
+        "e387_fillOperandForTrivialOp(op) — the forwardings and result precision of a \
+         vector_mac or vector_binary, together with e225_isOpTrivialMacOp / \
+         e226_isOpTrivialBinaryOp over it (StoreAndForwardFusion.cpp:318)"
+    )
+}
+
+/// `getDbgNameAttr(op)` for the three compute classes — the two names `"SAFF("` is built from.
+fn dbg_name_of(op: &Op) -> Option<&str> {
+    let Op::Sentient(
+        sentient::Op::VectorMac { dbg_name, .. }
+        | sentient::Op::VectorBinary { dbg_name, .. }
+        | sentient::Op::VectorUnary { dbg_name, .. },
+    ) = op
+    else {
+        return None;
+    };
+    dbg_name.as_deref()
+}
+
+/// `setDbgNameAttr(op, name)`.
+///
+/// ⛔ ONLY EVER WITH A NAME: `setDbgNameAttr(op, nullptr)` REMOVES the attribute
+/// (`DataflowOpInterfaces.cpp:49`), which is why e480 guards on the `StringAttr` (`:539-542`).
+fn set_dbg_name(op: &mut Op, name: String) {
+    if let Op::Sentient(
+        sentient::Op::VectorMac { dbg_name, .. }
+        | sentient::Op::VectorBinary { dbg_name, .. }
+        | sentient::Op::VectorUnary { dbg_name, .. },
+    ) = op
+    {
+        *dbg_name = Some(name);
+    }
+}
+
+/// WHETHER ONE CANDIDATE FUSED — `LogicalResult`, which here reports whether this store and the
+/// forward before it became one instruction rather than an error.
+///
+/// ⛔ DECLINING IS NOT FAILING, the same shape as [`Updated`]: e541 walks on either way (`:570-574`).
+/// ⛔ AND [`Self::No`] IS NOT ALWAYS "NOTHING HAPPENED" — in `fold_AB` mode the FIRST fusible op keeps
+/// the forwardings [`update_fusible_op`] wrote into it when the second round then declines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Fused {
+    /// `LogicalResult::success()` — the fusible op took the forwardings and `op` is queued for
+    /// deletion.
+    Yes,
+    /// `LogicalResult::failure()` — one of the gates below declined.
+    No,
+}
+
+/// Replaces: e480_FuseStoreAndForward
+///
+/// Fuses the trivial compute at `op` into the compute before it: that op takes over `op`'s
+/// forwardings and gains a `SAFF(…)` name, and `op` — with its `fold_AB_B` partner — is queued for
+/// deletion.
+///
+/// ⛔ THE SECOND `fillOperandForTrivialOp` IS HANDED THE **SAME** `op` (`:456-461`), not
+/// `op->getNextNode()`, so the `fold_AB_B` half's own forwardings are never read — ported as written.
+/// ⛔ BOTH RESULT PRECISIONS ARE ONE VARIABLE EACH that the fold round overwrites (`:459`, `:487`), so
+/// the equality at `:493` is the SECOND fusible op's against the trivial op's.
+/// ⛔ AND A DECLINING FOLD ROUND LEAVES THE FIRST FUSIBLE OP REWRITTEN — see [`Fused`].
+pub fn fuse_store_and_forward(
+    op: InBlock,
+    block: &mut Vec<Op>,
+    to_be_deleted: &mut Vec<InBlock>,
+) -> Fused {
+    let next = InBlock::at(op.index() + 1);
+    // COPIED OUT, not held: the reference keeps `op` as a pointer across `setResultForwardingAttr`
+    // on the fusible op, which is a second path into the same block. e541 hands positions from the
+    // block it walks, so an absent one cannot arise.
+    let Some(trivial_op) = block.get(op.index()).cloned() else {
+        return Fused::No;
+    };
+    let op_a_fold = fold_mode_attribute_if_exists(&trivial_op);
+    // `getFoldModeAttributeIfExists(op->getNextNode())` — e248's own null check answers the last op.
+    let op_b_fold = block
+        .get(next.index())
+        .and_then(fold_mode_attribute_if_exists);
+    let fold_ab_mode = if op_a_fold == Some(sentient::FoldMode::FoldAbA)
+        && op_b_fold == Some(sentient::FoldMode::FoldAbB)
+    {
+        FoldAbMode::On
+    } else {
+        FoldAbMode::Off
+    };
+    if op_a_fold == Some(sentient::FoldMode::FoldAbB) {
+        return Fused::No;
+    }
+
+    let Some(trivial_first) = fill_operand_for_trivial_op(&trivial_op) else {
+        return Fused::No;
+    };
+    let trivial_second = match fold_ab_mode {
+        // `trivialOps.second` READS THE SAME OP, so it is that same answer in the second slot.
+        FoldAbMode::On => match fill_operand_for_trivial_op(&trivial_op) {
+            None => return Fused::No,
+            second => second,
+        },
+        FoldAbMode::Off => None,
+    };
+
+    let Some(fusible_first) = find_fusible_op(op, block, to_be_deleted, fold_ab_mode) else {
+        return Fused::No;
+    };
+    let fusible_second = match fold_ab_mode {
+        // ⛔ `fusible_ops.second == op` (`:470`) TESTS THE WRONG OP THERE, so a reference run that
+        // finds none carries on with the `fold_AB_B` half as its own fusible op — the divergence
+        // [`find_fusible_op`]'s own note records.
+        FoldAbMode::On => match find_fusible_op(next, block, to_be_deleted, FoldAbMode::On) {
+            None => return Fused::No,
+            second => second,
+        },
+        FoldAbMode::Off => None,
+    };
+
+    let Some(fusible_first_forwardings) = block
+        .get(fusible_first.index())
+        .and_then(Forwardings::of_fusible_op)
+    else {
+        return Fused::No;
+    };
+    let mut fusible_second_forwardings = None;
+    if let Some(second) = fusible_second {
+        let Some(filled) = block
+            .get(second.index())
+            .and_then(Forwardings::of_fusible_op)
+        else {
+            return Fused::No;
+        };
+        fusible_second_forwardings = Some(filled);
+    }
+    let fusible_precision = match &fusible_second_forwardings {
+        Some(second) => second.result_precision,
+        None => fusible_first_forwardings.result_precision,
+    };
+    let trivial_precision = match &trivial_second {
+        Some(second) => second.result_precision,
+        None => trivial_first.result_precision,
+    };
+    if fusible_precision != trivial_precision {
+        return Fused::No;
+    }
+
+    let mut fusible_values_first = Vec::new();
+    append_value_forwarding(&mut fusible_values_first, &fusible_first_forwardings);
+    let mut trivial_values_first = Vec::new();
+    append_value_forwarding(&mut trivial_values_first, &trivial_first);
+    let mut fusible_values_second = Vec::new();
+    let mut trivial_values_second = Vec::new();
+    if let (Some(fusible), Some(trivial)) = (&fusible_second_forwardings, &trivial_second) {
+        append_value_forwarding(&mut fusible_values_second, fusible);
+        append_value_forwarding(&mut trivial_values_second, trivial);
+    }
+
+    let Some(fusible_op) = block.get(fusible_first.index()) else {
+        return Fused::No;
+    };
+    if !is_eligible_to_fuse(
+        &trivial_values_first,
+        &fusible_values_first,
+        &trivial_op,
+        fusible_op,
+    ) {
+        return Fused::No;
+    }
+    if let Some(second) = fusible_second {
+        // ⭐ HERE THE TRIVIAL OP IS `op->getNextNode()` (`:520`), unlike `:456`'s second fill.
+        let (Some(next_op), Some(second_op)) = (block.get(next.index()), block.get(second.index()))
+        else {
+            return Fused::No;
+        };
+        if !is_eligible_to_fuse(
+            &trivial_values_second,
+            &fusible_values_second,
+            next_op,
+            second_op,
+        ) {
+            return Fused::No;
+        }
+    }
+
+    append_to_vector(&mut trivial_values_first, &fusible_first_forwardings.result);
+    if let Some(second) = &fusible_second_forwardings {
+        append_to_vector(&mut trivial_values_second, &second.result);
+    }
+
+    let Some(fusible_op) = block.get_mut(fusible_first.index()) else {
+        return Fused::No;
+    };
+    if update_fusible_op(fusible_op, &trivial_values_first) == Updated::NotFused {
+        return Fused::No;
+    }
+    if let Some(second) = fusible_second {
+        let Some(second_op) = block.get_mut(second.index()) else {
+            return Fused::No;
+        };
+        if update_fusible_op(second_op, &trivial_values_second) == Updated::NotFused {
+            return Fused::No;
+        }
+    }
+
+    // `getNewDbgNameFromList("SAFF(", {fusible_ops.first, op})`, which is [`None`] unless BOTH are
+    // named, and then leaves the fusible op's own name alone.
+    let new_dbg_name = new_dbg_name_from_list(
+        DbgNamePrefix::Saff,
+        block.get(fusible_first.index()).and_then(dbg_name_of),
+        &[dbg_name_of(&trivial_op)],
+    );
+    if let Some(name) = new_dbg_name
+        && let Some(fusible_op) = block.get_mut(fusible_first.index())
+    {
+        set_dbg_name(fusible_op, name);
+    }
+
+    to_be_deleted.push(op);
+    if fold_ab_mode == FoldAbMode::On {
+        to_be_deleted.push(next);
+    }
+    // `std::sort` + `std::unique` + `erase` — the queue is an ordered set of positions.
+    to_be_deleted.sort_unstable();
+    to_be_deleted.dedup();
+    Fused::Yes
+}
 
 // crustify:todo: e541_runOnOperation
 //   authority : dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:555  (24 body lines, level 3)

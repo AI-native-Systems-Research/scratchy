@@ -86,7 +86,10 @@
 // ⭐ REMOVE THIS WITH `e540_runOnOperation`: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
-use super::analyses::RegisterGraphs;
+use super::analyses::{Liveness, RegisterGraphs};
+use crate::arch::Arch;
+use crate::islands::sentient::ProgramUnit;
+use crate::islands::sentient::dialects::sentient::RegType;
 use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 
 /// THE ALLOCATOR'S OWN STATE (`:54-55`) — the graphs it colours and the assignment it hands back.
@@ -168,10 +171,50 @@ fn addresses(value: Val, addr: Val, defs: Definitions<'_>) -> bool {
 //   original  : void SmartRegisterAllocationPass::performGraphColoring( dataflow::ProgramUnitOp &unit, Liveness &liveness, bool use_greedy_allocator)
 //   calls     : e252_size
 
-// crustify:todo: e478_doRegisterAllocation
-//   authority : dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:81  (5 body lines, level 2)
-//   original  : void SmartRegisterAllocationPass::doRegisterAllocation( dataflow::ProgramUnitOp &unit, Liveness &liveness)
-//   calls     : e216_clean, e382_performGraphColoring
+/// `useGreedyAllocator = (opts_.OptLevel == 0)`, set once in the pass constructor (`:48`).
+///
+/// ⛔ NOT A `dcc-opt` FLAG BUT A BUILD OPTION: `CommonPassOptions::OptLevel` defaults to `-1`
+/// (`dcc/tools/Options/dcc-pass-option.h:117`), so an ordinary build colours normally and only `-O0`
+/// is greedy. The `Passes.td` option of the same name (`Passes.td:365`) is overwritten by that
+/// constructor line and never read.
+const USE_GREEDY_ALLOCATOR: bool = false;
+
+impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
+    /// Replaces: e478_doRegisterAllocation
+    ///
+    /// One program unit's allocation: drop the previous unit's state, build this unit's interference
+    /// graphs from its live ranges, then colour them.
+    ///
+    /// ⛔ ORDER IS THE PORT: `clean()` FIRST, so the graphs are built into an emptied allocator — and
+    /// `RegisterGraphs::clean` leaving `ec_map_` standing is what makes that order observable.
+    pub(crate) fn do_register_allocation<A: Arch, L: Liveness>(
+        &mut self,
+        unit: &mut ProgramUnit<A>,
+        liveness: &mut L,
+    ) {
+        self.clean();
+        // `buildGraphs(dccExtContext(), liveness, unit)` — all three trailing defaults left alone.
+        self.reg_graphs
+            .build_graphs(liveness, &unit.body, RegType::Unknown, None);
+        self.perform_graph_coloring(unit, liveness, USE_GREEDY_ALLOCATOR);
+    }
+
+    /// `performGraphColoring(unit, liveness, use_greedy_allocator)` — entry 382, level 1, not yet
+    /// ported.
+    fn perform_graph_coloring<A: Arch, L: Liveness>(
+        &mut self,
+        unit: &mut ProgramUnit<A>,
+        liveness: &mut L,
+        use_greedy_allocator: bool,
+    ) -> ! {
+        let _ = (unit, liveness, use_greedy_allocator);
+        todo!(
+            "e382_performGraphColoring(unit, liveness, use_greedy_allocator) — the per-locale \
+             hyper-graph colouring and the register each value is assigned \
+             (SmartRegisterAllocation.cpp:136), 484 lines"
+        )
+    }
+}
 
 // crustify:todo: e540_runOnOperation
 //   authority : dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:626  (8 body lines, level 3)
@@ -180,21 +223,36 @@ fn addresses(value: Val, addr: Val, defs: Definitions<'_>) -> bool {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{RegisterGraphs, SmartRegisterAllocation, is_known_to_have_same_values};
-    use crate::arch::Elements;
+    use super::{Liveness, RegisterGraphs, SmartRegisterAllocation, is_known_to_have_same_values};
+    use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::ProgramUnit;
     use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
-    use crate::transform::sentient::analyses::Liveness;
+    use crate::transform::sentient::analyses::VirtualAssigns;
     use crate::transform::sentient::local_region_splitting_for_value_commoning::MaxRegNum;
+    use crate::units::DfirUnit;
+
+    /// A one-op-list PE program unit — e478 reads nothing of it but its body.
+    fn unit_of(body: Vec<Op>) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(DfirUnit::Pe, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
 
     /// A `RegisterGraphs` THAT ONLY RECORDS BEING CLEANED — the analysis is out of campaign scope, so
     /// `clean()` is the whole of its observable surface.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct CountingGraphs {
         cleaned: u32,
+        /// How many ops the graphs were last built over, and whether they had been cleaned first.
+        built_over: Option<(usize, u32)>,
     }
 
     impl RegisterGraphs for CountingGraphs {
@@ -205,11 +263,11 @@ mod unit_tests {
         fn build_graphs<L: Liveness>(
             &mut self,
             _liveness: &mut L,
-            _unit: &[Op],
+            unit: &[Op],
             _locale: RegType,
             _coreunit: Option<Val>,
         ) {
-            todo!("no unit here builds graphs through this fake")
+            self.built_over = Some((unit.len(), self.cleaned));
         }
 
         fn create_same_color_edge_eq_classes<L: Liveness>(
@@ -226,6 +284,35 @@ mod unit_tests {
 
         fn fast_check_colorability(&mut self, _num_colors: MaxRegNum, _locale: RegType) -> bool {
             todo!("no unit here checks colorability through this fake")
+        }
+    }
+
+    /// A `Liveness` e478 ONLY PASSES ALONG — it asks it nothing itself, and the two graph calls that
+    /// would are the out-of-scope analysis's.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct SilentLiveness;
+
+    impl Liveness for SilentLiveness {
+        fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {}
+
+        fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
+            false
+        }
+
+        fn clear(&mut self, _virtual_assigns: VirtualAssigns) {
+            todo!("no unit here clears this fake")
+        }
+
+        fn compute_register_live_range(&mut self, _unit: &[Op]) {
+            todo!("no unit here recomputes this fake")
+        }
+
+        fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {
+            todo!("no unit here offers a subset to this fake")
+        }
+
+        fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
+            todo!("no unit here enforces a pair on this fake")
         }
     }
 
@@ -277,7 +364,14 @@ mod unit_tests {
 
         pass.clean();
 
-        assert_eq!(pass.reg_graphs, CountingGraphs { cleaned: 1 });
+        assert_eq!(
+            pass.reg_graphs,
+            CountingGraphs {
+                cleaned: 1,
+                // e216 never builds, which is what makes e478's ordering assertion legible.
+                built_over: None,
+            }
+        );
         assert_eq!(pass.register_assignment, Vec::new());
     }
 
@@ -299,5 +393,34 @@ mod unit_tests {
         assert!(is_known_to_have_same_values(Val(10), Val(20), defs));
         assert!(!is_known_to_have_same_values(Val(21), Val(11), defs));
         assert!(!is_known_to_have_same_values(Val(20), Val(11), defs));
+    }
+
+    /// e478 — the allocator is cleaned BEFORE its graphs are built over the unit, and the colouring
+    /// seam is then reached. ⭐ THE ORDER IS WHAT IS OBSERVABLE, and it is the whole of the port.
+    #[test]
+    fn e478_cleans_then_builds_the_graphs_then_colours() {
+        let mut pass = SmartRegisterAllocation {
+            reg_graphs: CountingGraphs::default(),
+            register_assignment: vec![(Val(7), sentient::RegIndex::at::<3>())],
+        };
+        let mut unit = unit_of(vec![scalar_const(1, 0), scalar_const(2, 1)]);
+        let mut liveness = SilentLiveness;
+
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pass.do_register_allocation(&mut unit, &mut liveness);
+        }));
+
+        assert!(
+            reached.is_err(),
+            "e382 is not ported, so the colouring panics"
+        );
+        assert_eq!(
+            pass.reg_graphs,
+            CountingGraphs {
+                cleaned: 1,
+                built_over: Some((2, 1)),
+            }
+        );
+        assert_eq!(pass.register_assignment, Vec::new());
     }
 }

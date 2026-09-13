@@ -80,7 +80,6 @@
 //! | `e380_initializeDataflowInfoForSFP` | 380 | 1 | 30 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:277` |
 //! | `e476_initializeDataflowInfo` | 476 | 2 | 8 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:235` |
 
-
 // ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so both items below are reachable only from this
 // file's own tests until `e583_runOnOperation` (level 4) lands and something calls it. CI runs clippy
 // with `-D warnings`, so without this the first ported leaf of the module fails the gate.
@@ -89,6 +88,47 @@
 
 use crate::islands::sentient::dialects::{Op, sentient};
 use crate::transform::sentient::analyses::RdeNode;
+use crate::transform::sentient::set_send_destination_re::{
+    SetDestReOptimizationMode, SetSendDstReCount,
+};
+
+/// `RDETreeOptimizer<SetSendDstRDETree>` AS e475 REACHES IT
+/// (`Analyses/RedundantDefinitionEliminationTree.hpp:345`) — this tree built over one program unit,
+/// computed, simplified, then walked bottom-up to remove, common up and hoist its redundant
+/// `set_send_dst`s.
+///
+/// ⛔ TREE AND OPTIMIZER ARE BOTH `Analyses/` WORK AND OUT OF CAMPAIGN SCOPE, so this is a trait for
+/// the reason [`Liveness`](crate::transform::sentient::analyses::Liveness) is one: e475's whole tail
+/// is gated on the count, and a test must be able to observe both sides of that gate.
+pub(crate) trait SetSendDstRdeTreeOptimizer {
+    /// `tree.compute(unit)`, `tree.simplify()` and `optimizer.optimize()` AS ONE CALL (`:121-136`) —
+    /// rewrites `unit` and answers how many nodes were removed, commoned up or hoisted.
+    ///
+    /// ⭐ THE CONSTRUCTION ARGUMENTS COME WITH IT: `mode` is e195's (`:121`), and
+    /// `EnableDynamicLoopHoisting` (`:92-96`) is a `dcc-opt` flag this crate has not got.
+    fn optimize(
+        &mut self,
+        unit: &mut Vec<Op>,
+        mode: SetDestReOptimizationMode,
+    ) -> SetSendDstReCount;
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the tree is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OutOfScopeSetSendDstRdeTree;
+
+impl SetSendDstRdeTreeOptimizer for OutOfScopeSetSendDstRdeTree {
+    fn optimize(
+        &mut self,
+        _unit: &mut Vec<Op>,
+        _mode: SetDestReOptimizationMode,
+    ) -> SetSendDstReCount {
+        todo!(
+            "RDETreeOptimizer<SetSendDstRDETree>::optimize \
+             (Analyses/RedundantDefinitionEliminationTree.hpp:361) — out of campaign scope"
+        )
+    }
+}
 
 /// Replaces: e196_isOperationAUse
 ///
@@ -163,10 +203,43 @@ pub(crate) fn is_simplifiable(node: &RdeNode<'_>) -> bool {
 //   original  : void SetSendDstRDETree::initializeDataflowInfoForSFP(RDENode *node)
 //   calls     : e196_isOperationAUse
 
-// crustify:todo: e476_initializeDataflowInfo
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:235  (8 body lines, level 2)
-//   original  : void SetSendDstRDETree::initializeDataflowInfo(RDENode *node)
-//   calls     : e379_initializeDataflowInfoForLXLU, e380_initializeDataflowInfoForSFP
+/// Replaces: e476_initializeDataflowInfo
+///
+/// Gives one node its initial gen value, from whichever setting the unit is being optimised for.
+///
+/// ⭐ `opt_mode_` IS A PARAMETER, not a field: the tree is `Analyses/` work and out of campaign scope,
+/// so what a ported hook can hold is the mode e195 handed the constructor (`.hpp:222-226`).
+/// ⛔ THE `kUnknown` ARM IS REACHABLE ONLY BY MISUSE: e475 skips a unit that is neither all-LXLU nor
+/// all-SFP before building a tree (`:110-120`), which is what makes the reference's third arm an
+/// `llvm_unreachable` rather than a case.
+pub(crate) fn initialize_dataflow_info(mode: SetDestReOptimizationMode, node: &RdeNode<'_>) {
+    match mode {
+        SetDestReOptimizationMode::OptimizeForLxlu => initialize_dataflow_info_for_lxlu(node),
+        SetDestReOptimizationMode::OptimizeForSfp => initialize_dataflow_info_for_sfp(node),
+        SetDestReOptimizationMode::Unknown => panic!(
+            "llvm_unreachable(\"invalid optimization mode\") (`SetSendDestinationRE.cpp:241`)"
+        ),
+    }
+}
+
+/// `initializeDataflowInfoForLXLU(node)` — entry 379, level 1, not yet ported.
+fn initialize_dataflow_info_for_lxlu(node: &RdeNode<'_>) -> ! {
+    let _ = node;
+    todo!(
+        "e379_initializeDataflowInfoForLXLU(node) — the LXLU gen value a node starts with: a \
+         query-map composite, or the send's consumer unit as a mode \
+         (SetSendDestinationRE.cpp:244)"
+    )
+}
+
+/// `initializeDataflowInfoForSFP(node)` — entry 380, level 1, not yet ported.
+fn initialize_dataflow_info_for_sfp(node: &RdeNode<'_>) -> ! {
+    let _ = node;
+    todo!(
+        "e380_initializeDataflowInfoForSFP(node) — the SFP gen value a node starts with \
+         (SetSendDestinationRE.cpp:277)"
+    )
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -241,5 +314,36 @@ mod unit_tests {
             op: &use_op,
             leaf: true
         }));
+    }
+
+    /// WHAT `initialize_dataflow_info` PANICS WITH — every arm of the dispatch ends in one, two at
+    /// unported units and one at the reference's own `llvm_unreachable`.
+    fn dispatch_reaches(mode: SetDestReOptimizationMode) -> String {
+        let caught = std::panic::catch_unwind(|| initialize_dataflow_info(mode, &RdeNode::Root));
+        let payload = caught.unwrap_err();
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|msg| (*msg).to_string()))
+            .unwrap_or_default()
+    }
+
+    /// e476 — each mode reaches its own initialiser, and the mode e475 never builds a tree with
+    /// reaches the reference's `llvm_unreachable`.
+    #[test]
+    fn e476_dispatches_on_the_optimization_mode() {
+        assert!(
+            dispatch_reaches(SetDestReOptimizationMode::OptimizeForLxlu).contains("e379"),
+            "the LXLU initialiser"
+        );
+        assert!(
+            dispatch_reaches(SetDestReOptimizationMode::OptimizeForSfp).contains("e380"),
+            "the SFP initialiser"
+        );
+        assert!(
+            dispatch_reaches(SetDestReOptimizationMode::Unknown)
+                .contains("invalid optimization mode"),
+            "the unreachable third arm"
+        );
     }
 }

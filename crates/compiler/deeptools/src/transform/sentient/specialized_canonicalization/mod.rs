@@ -403,14 +403,35 @@ impl SpecializedCanonicalization {
 //   original  : void runOn(ModuleOp module_op)
 //   calls     : e218_runOn, e219_runOn, e220_runOn, e383_runOn
 
-// crustify:todo: e479_runOnOperation
-//   authority : dcc/src/Transform/Sentient/SpecializedCanonicalization.cpp:58  (5 body lines, level 2)
-//   original  : void runOnOperation()
-//   calls     : e218_runOn, e219_runOn, e220_runOn, e383_runOn, e384_runOn
+/// `-dcc-specialized-canonicalization-disable`, `cl::init(false)` (`:42-45`) — a `dcc-opt`
+/// command-line flag, not a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e479_runOnOperation
+///
+/// The pass entry: unless the flag disables it, canonicalizes the whole module.
+///
+/// ⭐ `getOperation()` IS THE PROGRAM: a [`Program`] is the func/module this pass walks, so the
+/// `ModuleOp` fetch is the parameter and e384 is the only callee.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    run_on_module(program);
+}
+
+/// `runOn(mlir::ModuleOp)` — entry 384, level 1, not yet ported.
+fn run_on_module<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) -> ! {
+    let _ = program;
+    todo!(
+        "e384_runOn(mlir::ModuleOp) — the pre-order walk over the module's func::FuncOps \
+         (SpecializedCanonicalization.cpp:188), which runs e383_runOn on each"
+    )
+}
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Site, SpecializedCanonicalization};
+    use super::{Site, SpecializedCanonicalization, run_on_operation};
     use crate::arch::Dd2;
     use crate::formats::Bits;
     use crate::generated::OpFunc;
@@ -664,5 +685,14 @@ mod unit_tests {
         pass.clear();
 
         assert_eq!(pass, SpecializedCanonicalization::default());
+    }
+
+    /// e479 — the flag is off, so the entry runs the pass and stops where e384 is not ported.
+    /// ⭐ REACHING THE SEAM IS WHAT IS TESTABLE: it proves the entry does not swallow the pass.
+    #[test]
+    #[should_panic(expected = "e384_runOn")]
+    fn e479_runs_the_pass_over_the_module() {
+        let mut module = program(Vec::new(), Vec::new());
+        run_on_operation(&mut module);
     }
 }
