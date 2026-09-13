@@ -389,6 +389,29 @@ impl DesignSpaceConfig {
         )
     }
 
+    /// `getNonBroadcastLdsDimSet(ldsIdx)` (`dsc/dsc2.cpp:4050`) — the dims of the labelled DS's OWN
+    /// layout order whose `scale_` is strictly positive, NOT filtered through `getLayoutDims`.
+    ///
+    /// ⛔ TRAP: THIS IS NOT [`Self::non_broadcast_lds_dims`], which intersects this set with the
+    /// ALLOCATE node's order (`dsc/dsc2.cpp:4044`). Entries 201 and 202 ask THIS one, so a dim the
+    /// allocate node does not name is non-broadcast here and absent there.
+    ///
+    /// ⛔ [`None`] IS `labeledDs_.at(ldsIdx)` THROWING; `if (ldsIdx < 0) return {}` beside it is
+    /// unspellable because [`LdsIdx`] is unsigned, and `layout.at(i)`'s own throw is unreachable
+    /// because [`LabeledDs`] carries the layout order and the scales ZIPPED.
+    #[must_use]
+    pub fn non_broadcast_lds_dim_set(&self, lds: LdsIdx) -> Option<BTreeSet<PrimaryDim>> {
+        let entry = self.labeled_ds.at(lds)?;
+        Some(
+            entry
+                .scales
+                .iter()
+                .filter(|(_, scale)| matches!(scale, Scale::Sized(scale) if *scale > 0.0))
+                .map(|(dim, _)| *dim)
+                .collect(),
+        )
+    }
+
     /// `getCumulativeStickSizes(dsType)` (`dsc/dsc2.cpp:4108`) with all four flags at their defaults,
     /// which is [`StickPart::Whole`], delegating to the ported fold.
     ///
@@ -492,6 +515,41 @@ impl WkSlice {
     }
 }
 
+/// HOW MANY WORK SLICES ONE DIM IS CUT INTO — `numWkSlicesPerDim_`'s value (`dsc/superdsc.h:69`).
+///
+/// ⭐ NON-ZERO, WHICH IS WHAT MAKES THE PRODUCT A COUNT: every writer states `1` or `numCoresUsed`
+/// (`dbo/src/Transforms/sdsc_bundle/ProgramCorrection.cpp:1094`, `:1396`, `:1399`;
+/// `GatherIndexConversion.cpp:100`; `dsc/dsm.cpp:22041`), so the zero that would silently zero the
+/// reference's `numWkSlices` is unspellable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WkSliceCount(NonZeroU32);
+
+impl WkSliceCount {
+    /// ONE SLICE — `unsigned numWkSlices = 1`, which is the product's identity.
+    pub const ONE: Self = Self(NonZeroU32::MIN);
+
+    /// A stated count.
+    #[must_use]
+    pub const fn new(count: NonZeroU32) -> Self {
+        Self(count)
+    }
+
+    /// The count.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// `numWkSlices *= count`, [`None`] where the reference's `unsigned` product would WRAP.
+    #[must_use]
+    pub const fn times(self, count: Self) -> Option<Self> {
+        match self.0.checked_mul(count.0) {
+            Some(product) => Some(Self(product)),
+            None => None,
+        }
+    }
+}
+
 /// HOW MANY CORES SHARE ONE TRANSFER'S DATA — `getLabeledDsWkSliceMulticastDegree`'s `unsigned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MulticastDegree(pub u32);
@@ -512,6 +570,9 @@ pub struct DscScheduleStep {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SuperDsc {
     dscs: DscList,
+    /// `numWkSlicesPerDim_` (`dsc/superdsc.h:69`), absent for a dim nothing sliced — that `.at()`'s
+    /// throw, which entry 199 multiplies straight into its product.
+    pub num_wk_slices_per_dim: BTreeMap<PrimaryDim, WkSliceCount>,
     /// `coreIdToWkSlice_`.
     pub core_id_to_wk_slice: BTreeMap<Core, WkSlice>,
     /// `coreIdToDscSchedule` (`dsc/superdsc.h:77`), absent for a core the super-DSC states no
@@ -524,11 +585,13 @@ impl SuperDsc {
     #[must_use]
     pub const fn new(
         dscs: DscList,
+        num_wk_slices_per_dim: BTreeMap<PrimaryDim, WkSliceCount>,
         core_id_to_wk_slice: BTreeMap<Core, WkSlice>,
         core_id_to_dsc_schedule: BTreeMap<Core, Vec<DscScheduleStep>>,
     ) -> Self {
         Self {
             dscs,
+            num_wk_slices_per_dim,
             core_id_to_wk_slice,
             core_id_to_dsc_schedule,
         }
