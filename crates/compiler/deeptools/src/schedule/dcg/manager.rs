@@ -2171,19 +2171,61 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
     }
 }
 
-// crustify:todo: e326_mergePcfgInSuperDSC
-//   authority : dcg/dcg_manager/dcg_manager.cpp:629  (5 body lines, level 2)
-//   class     : DcgManager
-//   original  : void DcgManager::mergePcfgInSuperDSC(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:756-761
-//   calls     : e282_mergePcfgInSuperDSC
+/// ONE CORE'S PROGRAM AS TEXT — `psCore.second.print(fileFP)` (`dcg_manager.cpp:952`), which is
+/// `ProgramAndStateInfo::print` (`sys-arch-spec/progir/progir.cpp:1449`), out of this campaign's file
+/// list: spelling one unit's opcodes needs `Isa::getOpCodePrefix` (`progir.cpp:1462`), the ISA tables
+/// `crustify-ddc/OUTSIDE-DEPS.tsv` records as owed.
+fn print_prog_state_info<A: Arch, M: Model, W: Workload>(
+    program: &progir::Program<A, M, W>,
+    out: &mut dyn core::fmt::Write,
+) {
+    let _ = (program, out);
+    todo!("sys-arch-spec/progir/: ProgramAndStateInfo::print (progir.cpp:1449) is out of scope")
+}
 
-// crustify:todo: e327_printSenProgram
-//   authority : dcg/dcg_manager/dcg_manager.cpp:945  (13 body lines, level 2)
-//   class     : DcgManager
-//   original  : void DcgManager::printSenProgram(SuperDsc* mySDsc, std::string fileName)
-//   extract   : crustify-ddc/cpp/dcg.cpp:771-784
-//   calls     : e076_print, e102_print, e272_print
+impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
+    DcgManager<C, DT2, L3_DL_SCHEDULER>
+{
+    /// Replaces: e326_mergePcfgInSuperDSC
+    ///
+    /// THE MERGE WITH NO L3 PCFG SUPPLIED — [`Self::merge_pcfg_in_super_dsc`] over two empty vectors, so
+    /// every step's DL arm merges nothing and `pcfg_` is rebuilt from the data ops alone
+    /// (`dcg_manager.cpp:629-633`). This is the overload the data-DSC stitch calls (`:913`).
+    ///
+    /// ⚠️ THE REFERENCE PASSES `pcfgL3lu` TWICE (`:632`) — a typo for `pcfgL3su`, and inert: both are
+    /// default-constructed and the arm reading them needs `size() > 0` on EACH (`:780`). One empty
+    /// table states that once; see [`DlPcfgSource`].
+    pub fn merge_pcfg_in_super_dsc_without_l3_pcfg<const DATA_OPS: bool, const FOLDED: bool>(
+        &self,
+        sdsc: &mut SuperDsc<DATA_OPS, FOLDED>,
+    ) -> Option<()> {
+        // `std::vector<SenPcfg> pcfgL3lu; std::vector<SenPcfg> pcfgL3su;` (`:630-631`), both empty.
+        let no_l3_pcfg = BTreeMap::new();
+        self.merge_pcfg_in_super_dsc(sdsc, DlPcfgSource::L3Halves(&no_l3_pcfg))
+    }
+
+    /// Replaces: e327_printSenProgram
+    ///
+    /// Dumps every core's program to one sink, each under its own `Program for coreID : <id>` header and
+    /// followed by a blank line, in ascending core order as `std::map` iterates (`:945-957`).
+    ///
+    /// ⚠️ THE NAME SAYS SENPROG AND THE BODY WRITES PROG IR: this overload hands each program to
+    /// `ProgramAndStateInfo::print` and reaches no SEN-program converter — that is entry 192's
+    /// (`:967-973`).
+    /// ⭐ THE SINK IS THE ARGUMENT, so the reference's `DT_ERROR_FMT` on a file that will not open has
+    /// no Rust form — see [`Self::print_sen_program`].
+    pub fn print_sen_program_as_prog_ir<A: Arch, M: Model, W: Workload>(
+        &self,
+        programs: &BTreeMap<Core, progir::Program<A, M, W>>,
+        out: &mut dyn core::fmt::Write,
+    ) {
+        for (core, program) in programs {
+            let _ = writeln!(out, "Program for coreID : {}", core.get());
+            print_prog_state_info(program, out);
+            let _ = out.write_str("\n");
+        }
+    }
+}
 
 // crustify:todo: e348_runDcgForDataOpsDlOps
 //   authority : dcg/dcg_manager/dcg_manager.cpp:269  (179 body lines, level 3)
@@ -2611,5 +2653,82 @@ mod unit_tests {
         assert_eq!(sdsc.pcfg_map[&core::<0>()][&SenComponent::Lxlu0], PcfgId(5));
         let pooled: Vec<PcfgId> = sdsc.pcfg_pool.keys().copied().collect();
         assert_eq!(pooled, vec![PcfgId(5)]);
+    }
+
+    /// One dl step on core 0, whose DL DSC carries a pcfg the generator rooted — a step with something
+    /// to merge on the DL side and nothing on the data side.
+    fn one_dl_step_with_a_rooted_dsc_pcfg() -> SuperDsc<true, false> {
+        SuperDsc::of(PerCoreDscs::of(core::<0>(), DscVersion::Dsc2).with_dl_pcfg(
+            DscIdx(0),
+            core::<0>(),
+            SenPcfg::rooted_at(PcfgNodeId::new(1)),
+        ))
+        .with_core_schedule(
+            core::<0>(),
+            CoreSchedule::with_dl(
+                Vec::new(),
+                DlStep {
+                    data_dsc: None,
+                    dl_dsc: DscIdx(0),
+                    before_sync: false,
+                    after_sync: false,
+                },
+                Vec::new(),
+            ),
+        )
+    }
+
+    /// e326 — the overload supplies NO L3 pcfg, so the dl arm reads an empty table (`:780`) and merges
+    /// nothing: `pcfg_` is left as empty as the data-op side it was rebuilt from (`:629-633`).
+    #[test]
+    fn e326_supplies_no_l3_pcfg_so_the_dl_arm_merges_nothing() {
+        let mut sdsc = one_dl_step_with_a_rooted_dsc_pcfg();
+
+        let merged = StageThreeDcg::new().merge_pcfg_in_super_dsc_without_l3_pcfg(&mut sdsc);
+
+        assert_eq!(merged, Some(()));
+        assert!(sdsc.pcfg.is_empty(), "{:?}", sdsc.pcfg);
+    }
+
+    /// e326's control — THE SAME FIXTURE with an L3 pcfg supplied does reach the merge, so what the test
+    /// above pins is the empty table and not a super-DSC with nothing to merge (`:780-790`).
+    #[test]
+    #[should_panic(expected = "SenPcfg::mergeSenPcfg")]
+    fn e326_a_supplied_l3_pcfg_reaches_the_merge() {
+        let mut sdsc = one_dl_step_with_a_rooted_dsc_pcfg();
+        let halves = BTreeMap::from([(
+            core::<0>(),
+            L3Halves {
+                lu: SenPcfg::rooted_at(PcfgNodeId::new(1)),
+                su: SenPcfg::default(),
+            },
+        )]);
+
+        let _ = StageThreeDcg::new()
+            .merge_pcfg_in_super_dsc(&mut sdsc, DlPcfgSource::L3Halves(&halves));
+    }
+
+    /// e327 — the header is this entry's own emission (`:951`) and the body is
+    /// `ProgramAndStateInfo::print`'s, out of scope (`:952`), so the walk writes core 3's header and then
+    /// stops there. ⭐ Caught off the unwind because the seam IS what stops it.
+    #[test]
+    fn e327_writes_each_core_header_then_stops_at_the_prog_state_printer() {
+        let programs = BTreeMap::from([(
+            core::<3>(),
+            progir::Program::<Target, Granite, Decode> {
+                per_unit: Vec::new(),
+                reg_state: Vec::new(),
+                variable_definitions: Vec::new(),
+                bound: PhantomData,
+            },
+        )]);
+        let mut out = String::new();
+
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            StageThreeDcg::new().print_sen_program_as_prog_ir(&programs, &mut out);
+        }));
+
+        assert!(stopped.is_err(), "the body printer is out of scope");
+        assert_eq!(out, "Program for coreID : 3\n");
     }
 }
