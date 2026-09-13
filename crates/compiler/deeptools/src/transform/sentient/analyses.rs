@@ -978,15 +978,116 @@ impl PropagationAnalysis for OutOfScopePropagationAnalysis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Cycles(pub i32);
 
-/// ONE COLUMN OF A `TimeStamp` — `TimeStampColumnVal` (`Analyses/TimeStamps.h:40`) AS A PORTED PASS
-/// HOLDS IT: an identity, like [`LiveRange`], because the loop or condition it names, and the
-/// iteration count beside it, belong to the analysis.
+/// ONE COLUMN OF A `TimeStamp` — `TimeStampColumnVal` (`Analyses/TimeStamps.h:39-91`) AS A PORTED
+/// PASS READS IT: which of the class's own three `TimeStampColumnType`s this column is, and the op it
+/// names.
 ///
-/// ⛔ `Analyses/TimeStamps.{h,cpp}` IS OUT OF CAMPAIGN SCOPE. `isLoop`, `isCond`, `getLoop` and
-/// `getCond` are `todo!`s at the units that need them — `e482_computeDependenciesSameBlock` walks a
-/// timestamp to find a parent op, and `e234_printDependencies` only carries the vector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TimeStampColumnVal;
+/// ⛔ `Analyses/TimeStamps.{h,cpp}` IS OUT OF CAMPAIGN SCOPE and the analysis that BUILDS these
+/// columns stays there. What is spelled here is exactly the four accessors a ported pass calls —
+/// `isConstant()`, `isLoop()`/`getLoop()`, `isCond()`/`getCond()` (`:64-79`) — which read fields the
+/// constructors set and compute nothing. `getConstantValue()`, `getLoopBound()` and
+/// `getLoopBodyCycleCount()` are the analysis's own and no ported unit asks for them.
+///
+/// ⭐ AN ENUM BECAUSE `TimeStampColumnType` IS ONE, CLOSED AT THREE (`:40`): a column is a constant,
+/// a loop iterator or a conditional, and `type_` is set in each constructor and never again.
+/// ⛔ THE OP IS A POSITION, NOT `ForOp`/`IfOp`: `getLoop().getOperation()` is all
+/// `e482_computeDependenciesSameBlock` does with one, and [`OpId`] is this crate's stand-in for the
+/// pointer — so it goes stale exactly as [`Dependency`]'s ends do.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TimeStampColumnVal {
+    /// `kConstant` — `explicit TimeStampColumnVal(int val)`.
+    #[default]
+    Constant,
+    /// `kLoopIterator` — `explicit TimeStampColumnVal(sentient::ForOp op)`, at that op's position.
+    Loop(OpId),
+    /// `kConditional` — `explicit TimeStampColumnVal(sentient::IfOp op)`, at that op's position.
+    Cond(OpId),
+}
+
+impl TimeStampColumnVal {
+    /// `getLoop().getOperation()` when `isLoop()`, `getCond().getOperation()` when `isCond()` — the
+    /// one question `e482_computeDependenciesSameBlock`'s parent-op scan asks of a column.
+    #[must_use]
+    pub fn region_op(&self) -> Option<&OpId> {
+        match self {
+            TimeStampColumnVal::Loop(op) | TimeStampColumnVal::Cond(op) => Some(op),
+            TimeStampColumnVal::Constant => None,
+        }
+    }
+}
+
+/// WHICH WAY A CYCLE GAP RUNS — `enum directionType { forward, nextIter }` (`Analyses/TimeStamps.h:26`).
+///
+/// ⛔ BOTH ARMS ARE READ, AND THEY DECIDE DIFFERENT THINGS: `e482_computeDependenciesSameBlock`
+/// records a hazard only for `forward` (`:169`), and `e483_computeDependenciesAcrossBlocks` uses
+/// `forward` twice — once to SKIP the pairs e482 already banked and once to group by destination
+/// (`:245`, `:259`). A `nextIter` gap survives into neither list unless `src == dst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GapDirection {
+    /// `forward` — `dst` reads in the same iteration `src` wrote in.
+    Forward,
+    /// `nextIter` — the read is a loop-carried one, `operationDistance` having come out non-positive.
+    NextIter,
+}
+
+/// THE `TimeStamp &ts_analyzer` A PASS IS HANDED — a trait, for the reason
+/// [`ExpressionEvaluator`] is one: the analysis behind it is not in this campaign and a test must
+/// still be able to state its answers.
+///
+/// ⛔ `Analyses/TimeStamps.{h,cpp}` IS OUT OF CAMPAIGN SCOPE, so the crate's only implementation is
+/// [`OutOfScopeTimeStamps`] and every method of it is a `todo!` naming the analysis.
+/// ⭐ THE FIVE METHODS ARE EXACTLY WHAT THE PORTED UNITS TOUCH: `time_stamps_op_order_`,
+/// `time_stamps_[op]`, `isInSameBlock`, `getCyclesGap` and `reduceIntervals`. `intervalIntersection`,
+/// `isIntervalEmpty`, `commonDimIndex`, `operationDistance`, `getNextIterCycleGap` and
+/// `computeTimeStamps` are reached only from inside those and are not restated here.
+pub trait TimeStamps {
+    /// `time_stamps_op_order_` — the MACs the analysis timestamped, in the order it met them.
+    fn op_order(&self) -> &[OpId];
+
+    /// `time_stamps_[op]`. ⛔ A `std::map` SUBSCRIPT DEFAULT-CONSTRUCTS, so an op the analysis never
+    /// timestamped answers the EMPTY column list rather than refusing.
+    fn time_stamp(&self, op: &OpId) -> &[TimeStampColumnVal];
+
+    /// `isInSameBlock` (`Analyses/TimeStamps.cpp:287-296`) — do two timestamps differ only in their
+    /// last column.
+    fn is_in_same_block(&self, src: &[TimeStampColumnVal], dst: &[TimeStampColumnVal]) -> bool;
+
+    /// `getCyclesGap` (`Analyses/TimeStamps.cpp:137-163`) — the smaller of the direct and
+    /// next-iteration distances, and which one it was.
+    fn cycles_gap(&mut self, src: &OpId, dst: &OpId) -> (Cycles, GapDirection);
+
+    /// `reduceIntervals` (`Analyses/TimeStamps.cpp:228-254`) — collapse a hazard list in place onto
+    /// the fewest intervals whose intersections still cover every hazard in it.
+    fn reduce_intervals(&mut self, intervals: &mut Vec<Dependency>);
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeTimeStamps;
+
+impl TimeStamps for OutOfScopeTimeStamps {
+    fn op_order(&self) -> &[OpId] {
+        todo!(
+            "TimeStamp::time_stamps_op_order_ (Analyses/TimeStamps.h:104) — out of campaign scope"
+        )
+    }
+
+    fn time_stamp(&self, _op: &OpId) -> &[TimeStampColumnVal] {
+        todo!("TimeStamp::time_stamps_ (Analyses/TimeStamps.h:103) — out of campaign scope")
+    }
+
+    fn is_in_same_block(&self, _src: &[TimeStampColumnVal], _dst: &[TimeStampColumnVal]) -> bool {
+        todo!("TimeStamp::isInSameBlock (Analyses/TimeStamps.cpp:287) — out of campaign scope")
+    }
+
+    fn cycles_gap(&mut self, _src: &OpId, _dst: &OpId) -> (Cycles, GapDirection) {
+        todo!("TimeStamp::getCyclesGap (Analyses/TimeStamps.cpp:137) — out of campaign scope")
+    }
+
+    fn reduce_intervals(&mut self, _intervals: &mut Vec<Dependency>) {
+        todo!("TimeStamp::reduceIntervals (Analyses/TimeStamps.cpp:228) — out of campaign scope")
+    }
+}
 
 /// `Dependency` (`Analyses/TimeStamps.h:30-34`) — one RAW hazard between two MACs, and how many
 /// cycles apart they are.

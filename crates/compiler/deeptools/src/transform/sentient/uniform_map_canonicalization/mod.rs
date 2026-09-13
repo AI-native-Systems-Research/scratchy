@@ -87,9 +87,10 @@
 #![allow(dead_code)]
 
 use crate::arch::Arch;
+use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::Program;
-use crate::islands::sentient::dialects::{self, Op, Val, sentient};
+use crate::islands::sentient::dialects::{self, Op, Val, sentient, uniform};
 use crate::model::Model;
 use crate::workload::Workload;
 
@@ -308,10 +309,28 @@ fn take_everywhere<A: Arch, M: Model, W: Workload>(
     taken
 }
 
-// crustify:todo: e484_runOn
-//   authority : dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:83  (12 body lines, level 2)
-//   original  : void UniformMapCanonicalizationPass::runOn(Operation *op)
-//   calls     : e395_pruneOutOfScopeEntries
+/// Replaces: e484_runOn
+///
+/// The pre-order walk's per-op body: a `uniform.def_immutable_mapping` has its out-of-scope entries
+/// pruned and every other op is left exactly as it is.
+///
+/// ⛔ THE GUARD IS THE WHOLE OF THIS UNIT'S OWN BODY; the effect belongs to
+/// `e395_pruneOutOfScopeEntries` (`dcc/src/Transform/Sentient/Utils.cpp:635`), whose home is
+/// [`utils`](super::utils) and whose anchor is STILL UNFILLED — it sits in this campaign's
+/// `sc2-level1-helpers` port remainder. `todo!` NAMES it rather than standing in for it.
+/// ⛔ THE REFERENCE'S OWN `// todo:` (`:86-87`) IS UNIMPLEMENTED THERE TOO: nothing here pulls a
+/// map or query op with only local-region uses into that region, and nothing should.
+/// ⭐ `to_be_deleted` IS DEFERRED DELETION, NOT AN OUTPUT: `e545_runOn` erases the list after the
+/// walk, because `pruneOutOfScopeEntries` is called from inside one.
+pub(crate) fn run_on(op: &Op, _to_be_deleted: &mut Vec<OpId>) {
+    let Op::Uniform(uniform::Op::DefImmutableMapping { .. }) = op else {
+        return;
+    };
+    todo!(
+        "e395_pruneOutOfScopeEntries (dcc/src/Transform/Sentient/Utils.cpp:635) — \
+         homed in transform::sentient::utils, anchor not yet filled"
+    )
+}
 
 // crustify:todo: e544_runOn
 //   authority : dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:75  (7 body lines, level 3)
@@ -330,7 +349,7 @@ fn take_everywhere<A: Arch, M: Model, W: Workload>(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::cleanup_constants;
+    use super::{cleanup_constants, run_on};
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -486,5 +505,20 @@ mod unit_tests {
             program.units.iter().next().expect("the head unit").body,
             vec![adds(Val(3), Val(12))]
         );
+    }
+
+    /// e484 — every op that is not a `uniform.def_immutable_mapping` returns without touching the
+    /// deferred-deletion list.
+    ///
+    /// ⛔ THE MAPPING ARM IS NOT REACHABLE FROM A TEST YET: it is `e395_pruneOutOfScopeEntries`, whose
+    /// anchor in [`utils`](super::super::utils) is still unfilled, so the arm is a `todo!`.
+    #[test]
+    fn e484_leaves_every_op_that_is_not_a_mapping_alone() {
+        let mut to_be_deleted = Vec::new();
+        run_on(
+            &Op::Sentient(sentient::Op::Nop { dbg_name: None }),
+            &mut to_be_deleted,
+        );
+        assert!(to_be_deleted.is_empty());
     }
 }

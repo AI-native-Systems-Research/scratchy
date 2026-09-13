@@ -95,7 +95,9 @@ use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::dialects::dataflow::Precision;
 use crate::islands::sentient::dialects::{Op, sentient};
 use crate::islands::sentient::print;
-use crate::transform::sentient::analyses::{Cycles, Dependency, TimeStampColumnVal};
+use crate::transform::sentient::analyses::{
+    Cycles, Dependency, GapDirection, TimeStampColumnVal, TimeStamps,
+};
 use std::collections::BTreeMap;
 
 /// WHAT THIS PASS READS OFF A `sentient.vector_mac` — `dyn_cast<sentient::MacOp>`'s result, and the
@@ -436,22 +438,169 @@ impl Dependencies {
             }
         }
     }
+
+    /// Replaces: e482_computeDependenciesSameBlock
+    ///
+    /// Banks one RAW hazard per source MAC for every forward pair within `cycles` whose two ends sit
+    /// in the same block, after collapsing the hazards under each enclosing loop or conditional onto
+    /// their intersections.
+    ///
+    /// ⛔ THE INTERSECTION IS PER ENCLOSING REGION OP, NOT PER BLOCK: the key is the INNERMOST
+    /// `sentient.for`/`sentient.if` on `src`'s own timestamp (`:170-183`), and `None` — the
+    /// reference's `nullptr` — is the one bucket for every hazard under no loop and no conditional.
+    /// ⛔ THE COLUMN SCAN STARTS AT `size() - 2`, so a source's OWN innermost region column is
+    /// skipped and a timestamp of one column or none contributes nothing.
+    /// ⛔ TRAP: `dst_operations_debug_` (`:149`, `:185`) IS BUILT AND DROPPED — the assignment into
+    /// [`Dependencies::debug`] is missing in this revision, so it is not written here either.
+    /// ⭐ DETERMINISTIC WHERE THE REFERENCE IS NOT: `std::map<Operation *, …>` reduces the buckets in
+    /// POINTER order, which decides which source wins the one-entry-per-`src` filter below.
+    /// ⚠️ THE `LLVM_DEBUG` INTERVAL DUMPS CHANGE NO IR AND ARE DROPPED.
+    pub(crate) fn compute_dependencies_same_block<A: Arch>(
+        &mut self,
+        ts: &mut impl TimeStamps,
+        body: &[Op],
+        cycles: Cycles,
+        precision: Precision,
+    ) {
+        // ⭐ THE ORDER IS COPIED, NOT BORROWED: `getCyclesGap` subscripts `time_stamps_` and so takes
+        // the analyzer mutably, which a live borrow of its own op order would forbid.
+        let order: Vec<OpId> = ts.op_order().to_vec();
+        let mut dependencies_in_bb: BTreeMap<Option<OpId>, Vec<Dependency>> = BTreeMap::new();
+        for src in &order {
+            for dst in &order {
+                if src == dst {
+                    continue;
+                }
+                if !ts.is_in_same_block(ts.time_stamp(src), ts.time_stamp(dst)) {
+                    continue;
+                }
+                // ⭐ AN UNRESOLVABLE POSITION CANNOT ARISE: the analyzer timestamped these very ops
+                // of this very body, so both lookups answer `Some`.
+                let (Some(src_op), Some(dst_op)) = (op_at(src, body), op_at(dst, body)) else {
+                    continue;
+                };
+                if !mac_ops_flow_dependence::<A>(src_op, dst_op, precision) {
+                    continue;
+                }
+                let (gap, direction) = ts.cycles_gap(src, dst);
+                if gap.0 < 0 || gap.0 > cycles.0 {
+                    continue;
+                }
+                if direction == GapDirection::Forward {
+                    let columns = ts.time_stamp(src);
+                    let parent = columns[..columns.len().saturating_sub(1)]
+                        .iter()
+                        .rev()
+                        .find_map(TimeStampColumnVal::region_op)
+                        .cloned();
+                    dependencies_in_bb
+                        .entry(parent)
+                        .or_default()
+                        .push(Dependency {
+                            src: src.clone(),
+                            dst: dst.clone(),
+                            gap,
+                        });
+                }
+            }
+        }
+        for (_parent, mut intervals) in dependencies_in_bb {
+            ts.reduce_intervals(&mut intervals);
+            for interval in intervals {
+                // `getIndexOfEntry(dependencies_with_min_gap_, op_interval.src) == -1` — the FIRST
+                // interval reduction to reach a source keeps it and every later one is dropped.
+                if !self
+                    .with_min_gap
+                    .iter()
+                    .any(|held| held.src == interval.src)
+                {
+                    self.with_min_gap.push(interval);
+                }
+            }
+        }
+    }
+
+    /// Replaces: e483_computeDependenciesAcrossBlocks
+    ///
+    /// Banks the hazards e482 could not: the loop-carried ones, the self-dependent MACs, and the
+    /// forward pairs whose two ends sit in DIFFERENT blocks, reduced per destination.
+    ///
+    /// ⛔ THE GROUPING KEY IS THE DESTINATION HERE, NOT AN ANCESTOR — and `reduceIntervals` runs only
+    /// on a destination with more than one source (`:253`), so a lone hazard keeps its own gap.
+    /// ⛔ TRAP: A SELF-DEPENDENT MAC IS BANKED WITH GAP **0**, NOT ITS OWN GAP (`:249`), and the
+    /// update arm only ever LOWERS an existing entry — so once this pass has created one, no later
+    /// pair can raise it, and the only entry the `gap > gap` test can usefully lower is one e482
+    /// already made for that source.
+    /// ⛔ A `nextIter` PAIR WITH `src != dst` REACHES NEITHER ARM and is dropped after being paid for.
+    /// ⭐ DETERMINISTIC WHERE THE REFERENCE IS NOT, as e482 is; ⚠️ its `LLVM_DEBUG` dumps are dropped.
+    pub(crate) fn compute_dependencies_across_blocks<A: Arch>(
+        &mut self,
+        ts: &mut impl TimeStamps,
+        body: &[Op],
+        cycles: Cycles,
+        precision: Precision,
+    ) {
+        let order: Vec<OpId> = ts.op_order().to_vec();
+        let mut deps_by_dst: BTreeMap<OpId, Vec<Dependency>> = BTreeMap::new();
+        for src in &order {
+            for dst in &order {
+                let (Some(src_op), Some(dst_op)) = (op_at(src, body), op_at(dst, body)) else {
+                    continue;
+                };
+                if !mac_ops_flow_dependence::<A>(src_op, dst_op, precision) {
+                    continue;
+                }
+                let (gap, direction) = ts.cycles_gap(src, dst);
+                if gap.0 < 0 || gap.0 > cycles.0 {
+                    continue;
+                }
+                if direction == GapDirection::Forward
+                    && src != dst
+                    && ts.is_in_same_block(ts.time_stamp(src), ts.time_stamp(dst))
+                {
+                    continue;
+                }
+                if src == dst {
+                    match self.with_min_gap.iter().position(|held| held.src == *src) {
+                        None => self.with_min_gap.push(Dependency {
+                            src: src.clone(),
+                            dst: dst.clone(),
+                            gap: Cycles(0),
+                        }),
+                        Some(idx) if self.with_min_gap[idx].gap > gap => {
+                            self.with_min_gap[idx].gap = gap;
+                        }
+                        Some(_) => {}
+                    }
+                } else if direction == GapDirection::Forward {
+                    deps_by_dst
+                        .entry(dst.clone())
+                        .or_default()
+                        .push(Dependency {
+                            src: src.clone(),
+                            dst: dst.clone(),
+                            gap,
+                        });
+                }
+            }
+        }
+        for (_dst, mut deps) in deps_by_dst {
+            if deps.len() > 1 {
+                ts.reduce_intervals(&mut deps);
+            }
+            for dep in deps {
+                if !self.with_min_gap.iter().any(|held| held.src == dep.src) {
+                    self.with_min_gap.push(dep);
+                }
+            }
+        }
+    }
 }
 
 // crustify:todo: e391_getIndexOfEntry
 //   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:131  (6 body lines, level 1)
 //   original  : int TransformForExposedPipelinePass::getIndexOfEntry( std::vector<Dependency> &op_and_gap_list, mlir::Operation *op)
 //   calls     : e252_size
-
-// crustify:todo: e482_computeDependenciesSameBlock
-//   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:139  (82 body lines, level 2)
-//   original  : void TransformForExposedPipelinePass::computeDependenciesSameBlock( const dcc::DccExtContext &dcc_ext_ctx, TimeStamp &ts_analyzer, int cycles, std::string precision)
-//   calls     : e236_macOpsFlowDependence, e252_size, e391_getIndexOfEntry
-
-// crustify:todo: e483_computeDependenciesAcrossBlocks
-//   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:224  (59 body lines, level 2)
-//   original  : void TransformForExposedPipelinePass::computeDependenciesAcrossBlocks( const dcc::DccExtContext &dcc_ext_ctx, TimeStamp &ts_analyzer, int cycles, std::string precision)
-//   calls     : e236_macOpsFlowDependence, e252_size, e391_getIndexOfEntry
 
 // crustify:todo: e543_computeDependencies
 //   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:287  (13 body lines, level 3)
@@ -470,7 +619,61 @@ mod unit_tests {
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::islands::dataflow_ir::dialects::dataflow::Precision;
     use crate::islands::sentient::dialects::{Op, Val, sentient};
-    use crate::transform::sentient::analyses::{Cycles, Dependency};
+    use crate::transform::sentient::analyses::{
+        Cycles, Dependency, GapDirection, TimeStampColumnVal, TimeStamps,
+    };
+
+    /// A `TimeStamp` STATING ITS ANSWERS — the analysis is out of campaign scope
+    /// ([`OutOfScopeTimeStamps`](crate::transform::sentient::analyses::OutOfScopeTimeStamps) is a
+    /// `todo!`), so a test supplies the op order, each op's columns and each pair's gap, and counts
+    /// the interval reductions it was asked for.
+    #[derive(Default)]
+    struct StatedTimeStamps {
+        order: Vec<OpId>,
+        stamps: Vec<(OpId, Vec<TimeStampColumnVal>)>,
+        gaps: Vec<((OpId, OpId), (Cycles, GapDirection))>,
+        reductions: usize,
+    }
+
+    impl TimeStamps for StatedTimeStamps {
+        fn op_order(&self) -> &[OpId] {
+            &self.order
+        }
+
+        fn time_stamp(&self, op: &OpId) -> &[TimeStampColumnVal] {
+            self.stamps
+                .iter()
+                .find(|(at, _)| at == op)
+                .map_or(&[], |(_, columns)| columns)
+        }
+
+        fn is_in_same_block(&self, src: &[TimeStampColumnVal], dst: &[TimeStampColumnVal]) -> bool {
+            // `isInSameBlock` (`Analyses/TimeStamps.cpp:287-296`): equal lengths, and every column
+            // but the last `compareTypes`-equal.
+            src.len() == dst.len()
+                && src[..src.len().saturating_sub(1)] == dst[..dst.len().saturating_sub(1)]
+        }
+
+        fn cycles_gap(&mut self, src: &OpId, dst: &OpId) -> (Cycles, GapDirection) {
+            // ⭐ A PAIR WITH NO STATED GAP IS NOT A HAZARD: `-1` is what the `gap < 0` filter drops.
+            self.gaps
+                .iter()
+                .find(|((from, to), _)| from == src && to == dst)
+                .map_or((Cycles(-1), GapDirection::NextIter), |(_, answer)| *answer)
+        }
+
+        fn reduce_intervals(&mut self, _intervals: &mut Vec<Dependency>) {
+            self.reductions += 1;
+        }
+    }
+
+    /// A column naming the `sentient.for` at `[0]`.
+    fn in_loop_at_zero() -> Vec<TimeStampColumnVal> {
+        vec![
+            TimeStampColumnVal::Loop(OpId::at(&[0])),
+            TimeStampColumnVal::Constant,
+        ]
+    }
 
     /// A `sentient.vector_mac` reading `reads` on operand A and forwarding its result to `writes`,
     /// unrolled `factor` times, with `incr` on both that operand and the result.
@@ -693,6 +896,217 @@ mod unit_tests {
                 nop("a", 0),
                 before[1].clone(),
                 before[2].clone(),
+            ]
+        );
+    }
+
+    /// e482 — the two same-block forward hazards land in two different buckets, `d`→`e`'s under no
+    /// enclosing region and `a`→`b`'s under the `sentient.for` on `a`'s timestamp, so `reduceIntervals`
+    /// runs twice; `b`→`c` is a `nextIter` gap and is dropped, and the loop's MACs are never paired
+    /// with the top-level ones because their timestamps are not the same length.
+    #[test]
+    fn e482_buckets_same_block_forward_hazards_under_their_innermost_region() {
+        let unrolled = sentient::UnrollFactor::X1;
+        let body = vec![
+            loop_over(vec![
+                mac(
+                    "a",
+                    sentient::Port::Zero,
+                    &[sentient::Port::Lrf(sentient::LrfIndex::L2)],
+                    false,
+                    unrolled,
+                ),
+                mac(
+                    "b",
+                    sentient::Port::Lrf(sentient::LrfIndex::L2),
+                    &[sentient::Port::Lrf(sentient::LrfIndex::L4)],
+                    false,
+                    unrolled,
+                ),
+                mac(
+                    "c",
+                    sentient::Port::Lrf(sentient::LrfIndex::L4),
+                    &[],
+                    false,
+                    unrolled,
+                ),
+            ]),
+            mac(
+                "d",
+                sentient::Port::Zero,
+                &[sentient::Port::Lrf(sentient::LrfIndex::L6)],
+                false,
+                unrolled,
+            ),
+            mac(
+                "e",
+                sentient::Port::Lrf(sentient::LrfIndex::L6),
+                &[],
+                false,
+                unrolled,
+            ),
+        ];
+        let mut ts = StatedTimeStamps {
+            order: vec![
+                OpId::at(&[0, 0]),
+                OpId::at(&[0, 1]),
+                OpId::at(&[0, 2]),
+                OpId::at(&[1]),
+                OpId::at(&[2]),
+            ],
+            stamps: vec![
+                (OpId::at(&[0, 0]), in_loop_at_zero()),
+                (OpId::at(&[0, 1]), in_loop_at_zero()),
+                (OpId::at(&[0, 2]), in_loop_at_zero()),
+                (OpId::at(&[1]), vec![TimeStampColumnVal::Constant]),
+                (OpId::at(&[2]), vec![TimeStampColumnVal::Constant]),
+            ],
+            gaps: vec![
+                (
+                    (OpId::at(&[0, 0]), OpId::at(&[0, 1])),
+                    (Cycles(2), GapDirection::Forward),
+                ),
+                (
+                    (OpId::at(&[0, 1]), OpId::at(&[0, 2])),
+                    (Cycles(1), GapDirection::NextIter),
+                ),
+                (
+                    (OpId::at(&[1]), OpId::at(&[2])),
+                    (Cycles(3), GapDirection::Forward),
+                ),
+            ],
+            reductions: 0,
+        };
+
+        let mut dependencies = Dependencies::default();
+        dependencies.compute_dependencies_same_block::<Dd2>(
+            &mut ts,
+            &body,
+            Cycles(4),
+            Precision::Fp16,
+        );
+        assert_eq!(
+            dependencies.with_min_gap,
+            vec![
+                Dependency {
+                    src: OpId::at(&[1]),
+                    dst: OpId::at(&[2]),
+                    gap: Cycles(3),
+                },
+                Dependency {
+                    src: OpId::at(&[0, 0]),
+                    dst: OpId::at(&[0, 1]),
+                    gap: Cycles(2),
+                },
+            ]
+        );
+        assert_eq!(ts.reductions, 2);
+        // The bucketed `debug` map stays empty: the reference builds `dst_operations_debug_` and
+        // never assigns it anywhere.
+        assert!(dependencies.debug.is_empty());
+    }
+
+    /// e483 — `s` reads what it writes, so it is banked as a self-dependence with gap **0** rather
+    /// than its stated 5; `s`→`t` is a same-block forward pair e482 already owns and is skipped;
+    /// `t`→`u` crosses out of the loop and is grouped under `u` alone, so no reduction runs. Re-run
+    /// over the list e482 would have left, the self-dependence LOWERS that entry to 5 instead.
+    #[test]
+    fn e483_banks_a_self_dependence_at_zero_and_only_ever_lowers_it() {
+        let unrolled = sentient::UnrollFactor::X1;
+        let body = vec![
+            loop_over(vec![
+                mac(
+                    "s",
+                    sentient::Port::Lrf(sentient::LrfIndex::L2),
+                    &[sentient::Port::Lrf(sentient::LrfIndex::L2)],
+                    false,
+                    unrolled,
+                ),
+                mac(
+                    "t",
+                    sentient::Port::Lrf(sentient::LrfIndex::L2),
+                    &[sentient::Port::Lrf(sentient::LrfIndex::L5)],
+                    false,
+                    unrolled,
+                ),
+            ]),
+            mac(
+                "u",
+                sentient::Port::Lrf(sentient::LrfIndex::L5),
+                &[],
+                false,
+                unrolled,
+            ),
+        ];
+        let stated = || StatedTimeStamps {
+            order: vec![OpId::at(&[0, 0]), OpId::at(&[0, 1]), OpId::at(&[1])],
+            stamps: vec![
+                (OpId::at(&[0, 0]), in_loop_at_zero()),
+                (OpId::at(&[0, 1]), in_loop_at_zero()),
+                (OpId::at(&[1]), vec![TimeStampColumnVal::Constant]),
+            ],
+            gaps: vec![
+                (
+                    (OpId::at(&[0, 0]), OpId::at(&[0, 0])),
+                    (Cycles(5), GapDirection::NextIter),
+                ),
+                (
+                    (OpId::at(&[0, 0]), OpId::at(&[0, 1])),
+                    (Cycles(2), GapDirection::Forward),
+                ),
+                (
+                    (OpId::at(&[0, 1]), OpId::at(&[1])),
+                    (Cycles(4), GapDirection::Forward),
+                ),
+            ],
+            reductions: 0,
+        };
+        let crossing = Dependency {
+            src: OpId::at(&[0, 1]),
+            dst: OpId::at(&[1]),
+            gap: Cycles(4),
+        };
+
+        let mut ts = stated();
+        let mut fresh = Dependencies::default();
+        fresh.compute_dependencies_across_blocks::<Dd2>(&mut ts, &body, Cycles(6), Precision::Fp16);
+        assert_eq!(
+            fresh.with_min_gap,
+            vec![
+                Dependency {
+                    src: OpId::at(&[0, 0]),
+                    dst: OpId::at(&[0, 0]),
+                    gap: Cycles(0),
+                },
+                crossing.clone(),
+            ]
+        );
+        assert_eq!(ts.reductions, 0);
+
+        let mut ts = stated();
+        let mut banked = Dependencies {
+            debug: Default::default(),
+            with_min_gap: vec![Dependency {
+                src: OpId::at(&[0, 0]),
+                dst: OpId::at(&[0, 0]),
+                gap: Cycles(9),
+            }],
+        };
+        banked.compute_dependencies_across_blocks::<Dd2>(
+            &mut ts,
+            &body,
+            Cycles(6),
+            Precision::Fp16,
+        );
+        assert_eq!(
+            banked.with_min_gap,
+            vec![
+                Dependency {
+                    src: OpId::at(&[0, 0]),
+                    dst: OpId::at(&[0, 0]),
+                    gap: Cycles(5),
+                },
+                crossing,
             ]
         );
     }
