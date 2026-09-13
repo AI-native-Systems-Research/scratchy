@@ -1157,7 +1157,13 @@ mod unit_tests {
         fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {}
 
         fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {}
+        fn operand_to_index(
+            &mut self,
+            _value: Val,
+        ) -> crate::transform::sentient::analyses::RegNode {
+        todo!("no unit here reads a colouring node through this fake")
     }
+}
 
     /// The out-of-scope register graphs, colourable or not by construction — the only way to observe
     /// which of `e451`'s pushes stick.
@@ -1194,7 +1200,18 @@ mod unit_tests {
         fn fast_check_colorability(&mut self, _num_colors: MaxRegNum, _locale: RegType) -> bool {
             OK
         }
+        fn do_graph_color_on_locale(
+        &mut self,
+        _locale: RegType,
+        _unit: &[Op],
+        _greedy: crate::transform::sentient::analyses::GreedyAllocator,
+    ) -> std::collections::BTreeMap<
+        crate::transform::sentient::analyses::RegNode,
+        crate::islands::sentient::dialects::sentient::RegIndex,
+    > {
+        todo!("no unit here colours a locale through this fake")
     }
+}
 
     /// `%r = dataflow.get_unit`.
     fn get_unit(result: u32) -> Op {

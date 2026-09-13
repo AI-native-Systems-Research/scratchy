@@ -86,11 +86,15 @@
 // ⭐ REMOVE THIS WITH e583: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
-use crate::islands::sentient::dialects::{Op, sentient};
+use crate::islands::sentient::dialects::{Definitions, Op, dataflow, sentient, uniform};
 use crate::transform::sentient::analyses::RdeNode;
+use crate::transform::sentient::set_send_destination_re::set_dst_gen_value_lxlu::SetDstGenValueLxlu;
+use crate::transform::sentient::set_send_destination_re::set_dst_gen_value_sfp::SetDstGenValueSfp;
+use crate::transform::sentient::set_send_destination_re::simple_set_dst_gen_value_lxlu::SendDestination;
 use crate::transform::sentient::set_send_destination_re::{
-    SetDestReOptimizationMode, SetSendDstReCount,
+    QueryMapOp, SetDestReOptimizationMode, SetSendDstReCount,
 };
+use crate::units::{Core, Corelet, DfirUnit, Residency};
 
 /// `RDETreeOptimizer<SetSendDstRDETree>` AS e475 REACHES IT
 /// (`Analyses/RedundantDefinitionEliminationTree.hpp:345`) — this tree built over one program unit,
@@ -193,15 +197,152 @@ pub(crate) fn is_simplifiable(node: &RdeNode<'_>) -> bool {
     )
 }
 
-// crustify:todo: e379_initializeDataflowInfoForLXLU
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:244  (32 body lines, level 1)
-//   original  : void SetSendDstRDETree::initializeDataflowInfoForLXLU(RDENode *node)
-//   calls     : e196_isOperationAUse
+/// `SetDstGenValueLXLU` AND `SetDstGenValueSFP` AS ONE `setDataflowGen` ARGUMENT — WHICH of the two a
+/// node generates is not the node's business but the program unit's, decided once by e195.
+///
+/// ⭐ THE C++ NEEDS NO SUCH TYPE because both derive from `DataFlowDefinitionBase` and `RDENode` holds
+/// the base pointer; that class is `Analyses/` work and out of campaign scope, so the union of what
+/// THIS tree's hooks generate is spelled here instead.
+#[derive(Debug, Clone)]
+pub(crate) enum SetDstGenValue {
+    /// `kOptimizeForLXLU`'s definition.
+    Lxlu(SetDstGenValueLxlu),
+    /// `kOptimizeForSFP`'s definition.
+    Sfp(SetDstGenValueSfp),
+}
 
-// crustify:todo: e380_initializeDataflowInfoForSFP
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:277  (30 body lines, level 1)
-//   original  : void SetSendDstRDETree::initializeDataflowInfoForSFP(RDENode *node)
-//   calls     : e196_isOperationAUse
+/// `consumer_unit.getType().lower()` NARROWED BY THE THREE COMPARISONS (`:262-271`) — `None` is the
+/// `gen_mode` that stays `kUnknown`.
+///
+/// ⭐ THE `find("pt") != npos` COLLAPSE, EVALUATED OVER EVERY [`DfirUnit::spelling`]: `ptrow0`…`ptrow7`
+/// and `crossptnlink` are the spellings that contain `"pt"` — *"it covers crossptlink as well"* — and
+/// no other one does (`sfpstate` and `constant` are the near misses).
+fn send_destination(unit: DfirUnit) -> Option<SendDestination> {
+    match unit {
+        DfirUnit::PtRow(_) | DfirUnit::CrossPtnLink => Some(SendDestination::Pt),
+        DfirUnit::Sfp => Some(SendDestination::Sfp),
+        DfirUnit::L0su => Some(SendDestination::L0su),
+        _ => None,
+    }
+}
+
+/// `dcc::getCoreId(unit)` AND `dcc::getCoreletId(unit)` AS ONE PAIR (`Utils/DccExtContext.cpp:78,116`)
+/// — `None` is the `-1` either one returns for an absent attribute.
+///
+/// ⛔ `CoreWide` IS `corelet = 0`, NOT ABSENT (`UnitMaterializer.cpp:62-80`), which is the same reading
+/// [`crate::transform::sentient::specialized_canonicalization`]'s `corelet_of` takes.
+fn core_and_corelet(residency: Residency) -> Option<(Core, Corelet)> {
+    let corelet = match residency {
+        Residency::Global | Residency::Scratchpad { .. } => None,
+        Residency::CoreWide { .. } => Corelet::checked(0),
+        Residency::Corelet { corelet, .. } => Some(corelet),
+    };
+    residency.core().zip(corelet)
+}
+
+/// `set_dst_op.getUnits().getDefiningOp()` (`:252`, `:285`) — the op that binds the destination this
+/// node's `sentient.set_send_dst` names, or `None` for a node that is not one.
+fn set_send_dst_destination<'a>(op: &Op, defs: Definitions<'a>) -> Option<&'a Op> {
+    let Op::Sentient(sentient::Op::SetSendDst { units }) = op else {
+        return None;
+    };
+    defs.of(units.val())
+}
+
+/// Replaces: e379_initializeDataflowInfoForLXLU
+///
+/// The LXLU gen value a node starts with: none for a use, a query-map composite when the destination is
+/// uniformized, else the kind of unit being sent to.
+///
+/// ⛔ TRAP: `None` IS NOT `unknown()` — the early return leaves `df_gen_` NULL, which generates nothing
+/// at all (`Analyses/RedundantDefinitionEliminationTree.cpp:198`), while an unknown value IS a
+/// definition. ⛔ TRAP: A DESTINATION THAT IS NEITHER `sfp`, `pt` NOR `l0su` — an operand that is no
+/// `dataflow.get_unit` included — leaves `gen_mode` at `kUnknown` and aborts at `.hpp:98`.
+#[must_use]
+pub(crate) fn initialize_dataflow_info_for_lxlu(
+    node: &RdeNode<'_>,
+    defs: Definitions<'_>,
+) -> Option<SetDstGenValueLxlu> {
+    let RdeNode::At { op, .. } = node else {
+        // `isOperationAUse(*nullptr)` — the root never reaches a `setDataflowGen` hook
+        // (`Analyses/RedundantDefinitionEliminationTree.cpp:217,244-294`); e045 answers it the same way.
+        return Some(SetDstGenValueLxlu::unknown());
+    };
+    // "Uses cannot generate definitions" (`:245`).
+    if is_operation_a_use(op) {
+        return None;
+    }
+    // "Only set_send_dst operations generate definitions, initially" (`:247`).
+    let Some(destination) = set_send_dst_destination(op, defs) else {
+        return Some(SetDstGenValueLxlu::unknown());
+    };
+    if let Op::Uniform(uniform::Op::QueryMap { result, map, key }) = destination {
+        let qmap = QueryMapOp::of(*result, *map, *key);
+        return Some(SetDstGenValueLxlu::composite(qmap, (*op).clone()));
+    }
+    let mode = match destination {
+        Op::Dataflow(dataflow::Op::GetUnit { unit, .. }) => send_destination(*unit),
+        _ => None,
+    };
+    match mode {
+        Some(mode) => Some(SetDstGenValueLxlu::simple(mode, (*op).clone())),
+        None => panic!(
+            "DT_CHECK(mode != SimpleSetDstGenValueLXLU::Mode::kUnknown) \
+             (`SetSendDestinationRE.hpp:98`)"
+        ),
+    }
+}
+
+/// Replaces: e380_initializeDataflowInfoForSFP
+///
+/// The SFP gen value a node starts with: none for a use, a query-map composite when the destination is
+/// uniformized, else the core and corelet of the SFP being sent to.
+///
+/// ⛔ TRAP: THE DESTINATION MUST BE ANOTHER SFP AND MUST SIT ON A CORE. A non-`sfp` consumer aborts at
+/// `:302-304`, and one whose `dataflow.get_unit` is global carries no `core` — so `core_id` stays `-1`
+/// and it aborts at `.hpp:194` instead. ⭐ `None` IS NOT `unknown()`, for the reason
+/// [`initialize_dataflow_info_for_lxlu`] records.
+#[must_use]
+pub(crate) fn initialize_dataflow_info_for_sfp(
+    node: &RdeNode<'_>,
+    defs: Definitions<'_>,
+) -> Option<SetDstGenValueSfp> {
+    let RdeNode::At { op, .. } = node else {
+        return Some(SetDstGenValueSfp::unknown());
+    };
+    if is_operation_a_use(op) {
+        return None;
+    }
+    let Some(destination) = set_send_dst_destination(op, defs) else {
+        return Some(SetDstGenValueSfp::unknown());
+    };
+    if let Op::Uniform(uniform::Op::QueryMap { result, map, key }) = destination {
+        let qmap = QueryMapOp::of(*result, *map, *key);
+        return Some(SetDstGenValueSfp::composite(qmap, (*op).clone()));
+    }
+    let ids = match destination {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            unit, residency, ..
+        }) => {
+            // `DT_CHECK_MSG((consumer_str.empty() || consumer_str == "sfp"), ...)` — a spelling is
+            // never empty here, so the `||`'s first arm is unreachable.
+            if *unit != DfirUnit::Sfp {
+                panic!(
+                    "DT_CHECK_MSG: expected the set_send_dst destination to be another SFP unit \
+                     (`SetSendDestinationRE.cpp:302`)"
+                );
+            }
+            core_and_corelet(*residency)
+        }
+        _ => None,
+    };
+    match ids {
+        Some((core, corelet)) => Some(SetDstGenValueSfp::simple(core, corelet, (*op).clone())),
+        None => {
+            panic!("DT_CHECK(core_id >= 0 && corelet_id >= 0) (`SetSendDestinationRE.hpp:194`)")
+        }
+    }
+}
 
 /// Replaces: e476_initializeDataflowInfo
 ///
@@ -212,33 +353,23 @@ pub(crate) fn is_simplifiable(node: &RdeNode<'_>) -> bool {
 /// ⛔ THE `kUnknown` ARM IS REACHABLE ONLY BY MISUSE: e475 skips a unit that is neither all-LXLU nor
 /// all-SFP before building a tree (`:110-120`), which is what makes the reference's third arm an
 /// `llvm_unreachable` rather than a case.
-pub(crate) fn initialize_dataflow_info(mode: SetDestReOptimizationMode, node: &RdeNode<'_>) {
+#[must_use]
+pub(crate) fn initialize_dataflow_info(
+    mode: SetDestReOptimizationMode,
+    node: &RdeNode<'_>,
+    defs: Definitions<'_>,
+) -> Option<SetDstGenValue> {
     match mode {
-        SetDestReOptimizationMode::OptimizeForLxlu => initialize_dataflow_info_for_lxlu(node),
-        SetDestReOptimizationMode::OptimizeForSfp => initialize_dataflow_info_for_sfp(node),
+        SetDestReOptimizationMode::OptimizeForLxlu => {
+            initialize_dataflow_info_for_lxlu(node, defs).map(SetDstGenValue::Lxlu)
+        }
+        SetDestReOptimizationMode::OptimizeForSfp => {
+            initialize_dataflow_info_for_sfp(node, defs).map(SetDstGenValue::Sfp)
+        }
         SetDestReOptimizationMode::Unknown => panic!(
             "llvm_unreachable(\"invalid optimization mode\") (`SetSendDestinationRE.cpp:241`)"
         ),
     }
-}
-
-/// `initializeDataflowInfoForLXLU(node)` — entry 379, level 1, not yet ported.
-fn initialize_dataflow_info_for_lxlu(node: &RdeNode<'_>) -> ! {
-    let _ = node;
-    todo!(
-        "e379_initializeDataflowInfoForLXLU(node) — the LXLU gen value a node starts with: a \
-         query-map composite, or the send's consumer unit as a mode \
-         (SetSendDestinationRE.cpp:244)"
-    )
-}
-
-/// `initializeDataflowInfoForSFP(node)` — entry 380, level 1, not yet ported.
-fn initialize_dataflow_info_for_sfp(node: &RdeNode<'_>) -> ! {
-    let _ = node;
-    todo!(
-        "e380_initializeDataflowInfoForSFP(node) — the SFP gen value a node starts with \
-         (SetSendDestinationRE.cpp:277)"
-    )
 }
 
 #[cfg(test)]
@@ -248,6 +379,12 @@ mod unit_tests {
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::link::{L0su as L0suUnit, Link, Lxlu as LxluUnit};
     use crate::islands::sentient::dialects::Val;
+    use crate::transform::sentient::set_send_destination_re::composite_set_dst_gen_value_lxlu::CompositeSetDstGenValueLxlu;
+    use crate::transform::sentient::set_send_destination_re::composite_set_dst_gen_value_sfp::CompositeSetDstGenValueSfp;
+    use crate::transform::sentient::set_send_destination_re::set_dst_gen_value_lxlu::GenValue as LxluGenValue;
+    use crate::transform::sentient::set_send_destination_re::set_dst_gen_value_sfp::GenValue as SfpGenValue;
+    use crate::transform::sentient::set_send_destination_re::simple_set_dst_gen_value_lxlu::SimpleSetDstGenValueLxlu;
+    use crate::transform::sentient::set_send_destination_re::simple_set_dst_gen_value_sfp::SimpleSetDstGenValueSfp;
 
     /// `sentient.load_compute_and_send` — the op the two `isa<>` lists disagree about.
     fn load_compute_and_send() -> Op {
@@ -316,33 +453,180 @@ mod unit_tests {
         }));
     }
 
-    /// WHAT `initialize_dataflow_info` PANICS WITH — every arm of the dispatch ends in one, two at
-    /// unported units and one at the reference's own `llvm_unreachable`.
-    fn dispatch_reaches(mode: SetDestReOptimizationMode) -> String {
-        let caught = std::panic::catch_unwind(|| initialize_dataflow_info(mode, &RdeNode::Root));
-        let payload = caught.unwrap_err();
-        payload
+    /// `dataflow.get_unit` binding `result` as one unit of `unit`'s kind.
+    fn get_unit(result: Val, unit: DfirUnit, residency: Residency) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result,
+            residency,
+            unit,
+            num_folds: None,
+            reg_locale: None,
+        })
+    }
+
+    /// `uniform.query_map` binding `result` — a uniformized destination.
+    fn query_map(result: Val) -> Op {
+        Op::Uniform(uniform::Op::QueryMap {
+            result,
+            map: Val(90),
+            key: Val(91),
+        })
+    }
+
+    /// `sentient.set_send_dst` whose `$units` is `dst`.
+    fn set_send_dst_to(dst: Val) -> Op {
+        Op::Sentient(sentient::Op::SetSendDst {
+            units: Link::<LxluUnit, L0suUnit>::between(Val(0), dst).ends().0,
+        })
+    }
+
+    /// A node over `op`, as the tree hands one to a `setDataflowGen` hook.
+    fn node(op: &Op) -> RdeNode<'_> {
+        RdeNode::At { op, leaf: true }
+    }
+
+    /// e379 — a use generates NOTHING, an op that is no `set_send_dst` the unknown value, a
+    /// uniformized destination the composite, and each consumer kind its own send destination.
+    #[test]
+    fn e379_gives_each_consumer_kind_its_destination_and_a_use_no_definition() {
+        let region = vec![
+            get_unit(Val(21), DfirUnit::L0su, Residency::Global),
+            get_unit(Val(22), DfirUnit::Sfp, Residency::Global),
+            get_unit(Val(23), DfirUnit::CrossPtnLink, Residency::Global),
+            query_map(Val(24)),
+        ];
+        let regions: [&[Op]; 1] = [region.as_slice()];
+        let defs = Definitions::from_innermost(&regions);
+
+        let use_op = load_compute_and_send();
+        assert!(
+            initialize_dataflow_info_for_lxlu(&node(&use_op), defs).is_none(),
+            "a use leaves `df_gen_` null, which is not the unknown value"
+        );
+
+        let other = nop();
+        let unknown = initialize_dataflow_info_for_lxlu(&node(&other), defs)
+            .expect("a non-use generates a definition");
+        assert!(unknown.is_unknown_value());
+
+        for (dst, destination) in [
+            (Val(21), SendDestination::L0su),
+            (Val(22), SendDestination::Sfp),
+            // "It covers crossptlink as well" — `find("pt")`, evaluated.
+            (Val(23), SendDestination::Pt),
+        ] {
+            let op = set_send_dst_to(dst);
+            let value = initialize_dataflow_info_for_lxlu(&node(&op), defs)
+                .expect("a `set_send_dst` generates a definition");
+            assert_eq!(
+                value.gen_value(),
+                LxluGenValue::Simple(SimpleSetDstGenValueLxlu::of(destination))
+            );
+            assert!(
+                value.op().is_some(),
+                "the generating operation travels with it"
+            );
+        }
+
+        let uniformized = set_send_dst_to(Val(24));
+        let value = initialize_dataflow_info_for_lxlu(&node(&uniformized), defs)
+            .expect("a `set_send_dst` generates a definition");
+        assert_eq!(
+            value.gen_value(),
+            LxluGenValue::Composite(CompositeSetDstGenValueLxlu::of(QueryMapOp::of(
+                Val(24),
+                Val(90),
+                Val(91)
+            )))
+        );
+    }
+
+    /// e380 — the same four cases for the SFP, whose simple value is the destination SFP's core and
+    /// corelet rather than a unit kind.
+    #[test]
+    fn e380_gives_the_destination_sfps_core_and_corelet_and_a_use_no_definition() {
+        let core = Core::checked(1).expect("every arch this crate builds for has core 1");
+        let corelet = Corelet::checked(0).expect("every core has corelet 0");
+        let region = vec![
+            get_unit(Val(31), DfirUnit::Sfp, Residency::Corelet { core, corelet }),
+            get_unit(Val(32), DfirUnit::Sfp, Residency::CoreWide { core }),
+            query_map(Val(33)),
+        ];
+        let regions: [&[Op]; 1] = [region.as_slice()];
+        let defs = Definitions::from_innermost(&regions);
+
+        let use_op = load_compute_and_send();
+        assert!(initialize_dataflow_info_for_sfp(&node(&use_op), defs).is_none());
+
+        let other = nop();
+        let unknown = initialize_dataflow_info_for_sfp(&node(&other), defs)
+            .expect("a non-use generates a definition");
+        assert!(unknown.is_unknown_value());
+
+        // ⭐ AND `CoreWide` READS BACK AS CORELET 0, not as an absent corelet.
+        for dst in [Val(31), Val(32)] {
+            let op = set_send_dst_to(dst);
+            let value = initialize_dataflow_info_for_sfp(&node(&op), defs)
+                .expect("a `set_send_dst` generates a definition");
+            assert_eq!(
+                value.gen_value(),
+                SfpGenValue::Simple(SimpleSetDstGenValueSfp::of(core, corelet))
+            );
+        }
+
+        let uniformized = set_send_dst_to(Val(33));
+        let value = initialize_dataflow_info_for_sfp(&node(&uniformized), defs)
+            .expect("a `set_send_dst` generates a definition");
+        assert_eq!(
+            value.gen_value(),
+            SfpGenValue::Composite(CompositeSetDstGenValueSfp::of(QueryMapOp::of(
+                Val(33),
+                Val(90),
+                Val(91)
+            )))
+        );
+    }
+
+    /// e476 — each mode reaches its own initialiser and answers with THAT mode's definition, and the
+    /// mode e475 never builds a tree with reaches the reference's `llvm_unreachable`.
+    #[test]
+    fn e476_dispatches_on_the_optimization_mode() {
+        let region = vec![get_unit(Val(41), DfirUnit::L0su, Residency::Global)];
+        let regions: [&[Op]; 1] = [region.as_slice()];
+        let defs = Definitions::from_innermost(&regions);
+        let op = set_send_dst_to(Val(41));
+
+        let lxlu =
+            initialize_dataflow_info(SetDestReOptimizationMode::OptimizeForLxlu, &node(&op), defs);
+        assert!(
+            matches!(lxlu, Some(SetDstGenValue::Lxlu(_))),
+            "the LXLU initialiser"
+        );
+
+        // ⭐ NOT THE SAME NODE: the SFP hook aborts on an `l0su` destination, so this arm is asked
+        // with an op that is no `set_send_dst` at all — still that mode's own definition.
+        let nothing = nop();
+        let sfp = initialize_dataflow_info(
+            SetDestReOptimizationMode::OptimizeForSfp,
+            &node(&nothing),
+            defs,
+        );
+        assert!(
+            matches!(sfp, Some(SetDstGenValue::Sfp(_))),
+            "the SFP initialiser"
+        );
+
+        let caught = std::panic::catch_unwind(|| {
+            initialize_dataflow_info(SetDestReOptimizationMode::Unknown, &RdeNode::Root, defs)
+        });
+        let payload = caught.expect_err("the third arm is the reference's llvm_unreachable");
+        let message = payload
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| payload.downcast_ref::<&str>().map(|msg| (*msg).to_string()))
-            .unwrap_or_default()
-    }
-
-    /// e476 — each mode reaches its own initialiser, and the mode e475 never builds a tree with
-    /// reaches the reference's `llvm_unreachable`.
-    #[test]
-    fn e476_dispatches_on_the_optimization_mode() {
+            .unwrap_or_default();
         assert!(
-            dispatch_reaches(SetDestReOptimizationMode::OptimizeForLxlu).contains("e379"),
-            "the LXLU initialiser"
-        );
-        assert!(
-            dispatch_reaches(SetDestReOptimizationMode::OptimizeForSfp).contains("e380"),
-            "the SFP initialiser"
-        );
-        assert!(
-            dispatch_reaches(SetDestReOptimizationMode::Unknown)
-                .contains("invalid optimization mode"),
+            message.contains("invalid optimization mode"),
             "the unreachable third arm"
         );
     }

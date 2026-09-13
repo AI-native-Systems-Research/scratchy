@@ -97,7 +97,7 @@ use std::fmt::Write as _;
 
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::Values;
-use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient};
+use crate::islands::sentient::dialects::{self as dialects, Definitions, Op, Val, sentient};
 use crate::islands::sentient::print;
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
@@ -263,6 +263,35 @@ impl UsesInfo {
         }
         self.regions.insert(at, region);
     }
+
+    /// Replaces: e381_dump
+    ///
+    /// The copy operation itself, then `Regions:`, then one [`RegionInfo::dump`] line per region its
+    /// result is used in — each indented one column further than this.
+    ///
+    /// ⛔ NO SPACE AFTER `"SSA Defining Operation:"` AND NONE BEFORE THE OP: `os << *op_` streams the
+    /// WHOLE operation, so the first line carries the `sentient.scalar_copy` and not just its result.
+    /// ⛔ TRAP: A COPY ALREADY SUNK AND ERASED HAS NO OP LEFT TO STREAM — where the reference's `*op_`
+    /// would be a use-after-free, the value names itself; nothing is invented and nothing aborts.
+    #[must_use]
+    pub fn dump(&self, defs: Definitions<'_>, indent: Indent) -> String {
+        let mut out = " ".repeat(indent.0);
+        out.push_str("SSA Defining Operation:");
+        match defs.of(self.op.0) {
+            Some(op) => {
+                let mut streamed = String::new();
+                print::emit(&mut streamed, op, 0);
+                out.push_str(streamed.trim_end_matches('\n'));
+            }
+            None => out.push_str(&print::val(self.op.0)),
+        }
+        out.push('\n');
+        let _ = writeln!(out, "{}Regions:", " ".repeat(indent.0));
+        for region in &self.regions {
+            out.push_str(&region.dump(Indent(indent.0 + 1)));
+        }
+        out
+    }
 }
 
 /// `SinkScalarCopyPass`'s own state (`:160-246`).
@@ -373,11 +402,6 @@ fn local_region_body_mut(scope: &mut [Op], arg: LocalRegionArg) -> Option<&mut V
     }
     None
 }
-
-// crustify:todo: e381_dump
-//   authority : dcc/src/Transform/Sentient/SinkScalarCopy.cpp:144  (7 body lines, level 1)
-//   original  : void dump(raw_ostream &os, int indent = 0) const
-//   calls     : e211_dump
 
 /// EVERY OP IN `scope` WITH THE REGION `getRegionOpAndIndex` NAMES FOR IT (`Uniform/Utils.cpp:343`):
 /// the owner is the innermost `uniform.uniformize_regions`/`uniform.equalize_pattern`, or the unit.
@@ -614,6 +638,39 @@ mod unit_tests {
         assert_eq!(
             uses.regions(),
             [RegionInfo::new(Region::Global), region(3), region(5)]
+        );
+    }
+
+    /// e381 — the copy streamed WHOLE right up against the colon, then `Regions:` at the same indent
+    /// and one [`RegionInfo::dump`] line per region, each one column deeper.
+    #[test]
+    fn e381_dumps_the_copy_operation_then_a_line_per_region() {
+        let body = vec![copy(Val(9), Val(10))];
+        let regions: [&[Op]; 1] = [body.as_slice()];
+        let defs = Definitions::from_innermost(&regions);
+
+        let mut uses = UsesInfo::new(CopyResult(Val(10)));
+        uses.add_region(RegionInfo::new(Region::Global));
+        uses.add_region(RegionInfo::new(Region::UniformLocal {
+            number: RegionNumber(1),
+            arg: LocalRegionArg(Val(7)),
+        }));
+        let dumped = uses.dump(defs, Indent(2));
+
+        // ⛔ NO SPACE AFTER THE COLON, and the op's own result opens it — not the value alone.
+        assert!(
+            dumped.starts_with("  SSA Defining Operation:%10 = sentient.scalar_copy"),
+            "{dumped}"
+        );
+        let mut streamed = String::new();
+        print::emit(&mut streamed, &body[0], 0);
+        assert_eq!(
+            dumped,
+            format!(
+                "  SSA Defining Operation:{}\n  Regions:\n   region 0 of parent \
+                 dataflow.program_unit\n   region 1 of parent binding %7\n",
+                streamed.trim_end_matches('\n')
+            )
         );
     }
 

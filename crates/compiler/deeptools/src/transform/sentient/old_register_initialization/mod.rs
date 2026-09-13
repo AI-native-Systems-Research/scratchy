@@ -693,7 +693,13 @@ mod unit_tests {
         fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
             todo!("this fake is never given an enforced assignment")
         }
+        fn operand_to_index(
+            &mut self,
+            _value: Val,
+        ) -> crate::transform::sentient::analyses::RegNode {
+        todo!("no unit here reads a colouring node through this fake")
     }
+}
 
     /// e631 — the promoter runs over the unit's own body and units, and its post-processing lands on
     /// the caller's liveness even when there is no core to take a candidate from.

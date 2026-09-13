@@ -1154,7 +1154,13 @@ mod unit_tests {
         fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
             todo!("no unit here adds an enforced assignment through this fake")
         }
+        fn operand_to_index(
+            &mut self,
+            _value: Val,
+        ) -> crate::transform::sentient::analyses::RegNode {
+        todo!("no unit here reads a colouring node through this fake")
     }
+}
 
     /// `%r = sentient.scalar_copy %inp`.
     fn scalar_copy(result: u32, input: u32) -> Op {

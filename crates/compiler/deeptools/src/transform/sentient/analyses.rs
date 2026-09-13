@@ -951,6 +951,15 @@ impl ColoringGraph for OutOfScopeColoringGraph {
     }
 }
 
+/// A NODE OF ONE LOCALE'S REGISTER INTERFERENCE GRAPH — the `int` a `RegisterGraphs` colouring is
+/// keyed by, which is [`Liveness::operand_to_index`]'s index for the value.
+///
+/// ⭐ NOT [`DataId`]: that is port assignment's node index over the same out-of-scope graph class, and
+/// a register graph node beside a compute-port graph node is exactly the confusion a newtype makes an
+/// E0308.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegNode(pub i32);
+
 /// `RegisterGraphs` (`Analyses/GraphColoring.hpp:152`) — one [`ColoringGraph`] per register locale,
 /// plus their hyper-graphs and the value-to-locale cache, as the allocator holds it.
 pub trait RegisterGraphs {
@@ -989,6 +998,19 @@ pub trait RegisterGraphs {
     /// `fastCheckColorability(num_colors, locale)` (`Analyses/GraphColoring.hpp:167`) — whether
     /// `locale`'s graph still colours in `num_colors` registers. ⭐ NON-CONST there, hence `&mut`.
     fn fast_check_colorability(&mut self, num_colors: MaxRegNum, locale: RegType) -> bool;
+
+    /// `doGraphColorOnLocale(dcc_ext_ctx, locale, unit, use_greedy_allocator)`
+    /// (`Analyses/GraphColoring.hpp:163`) — which register index each node of `locale`'s hyper-graph
+    /// was given, over the register count `locale` has on this machine.
+    ///
+    /// ⛔ TRAP: THE RESULT IS A `std::map` ITS CALLER SUBSCRIPTS, so a node the colouring never placed
+    /// reads back as register 0 rather than absent — see `e382`'s `Colorings::index`.
+    fn do_graph_color_on_locale(
+        &mut self,
+        locale: RegType,
+        unit: &[Op],
+        greedy: GreedyAllocator,
+    ) -> BTreeMap<RegNode, RegIndex>;
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
@@ -1031,6 +1053,17 @@ impl RegisterGraphs for OutOfScopeRegisterGraphs {
     fn fast_check_colorability(&mut self, _num_colors: MaxRegNum, _locale: RegType) -> bool {
         todo!(
             "RegisterGraphs::fastCheckColorability (Analyses/GraphColoring.hpp:167) — out of campaign scope"
+        )
+    }
+
+    fn do_graph_color_on_locale(
+        &mut self,
+        _locale: RegType,
+        _unit: &[Op],
+        _greedy: GreedyAllocator,
+    ) -> BTreeMap<RegNode, RegIndex> {
+        todo!(
+            "RegisterGraphs::doGraphColorOnLocale (Analyses/GraphColoring.hpp:163) — out of campaign scope"
         )
     }
 }
@@ -1211,6 +1244,13 @@ pub trait Liveness {
     /// `addVirtualAssignEnforced(set_of_subsets)` (`Analyses/Liveness.h:124-125`) — links each pair as
     /// MUST share a register. ⭐ THE OVERLOAD THIS IS, of the three, takes PAIRS and not subsets.
     fn add_virtual_assign_enforced(&mut self, set_of_pairs: &[(Val, Val)]);
+
+    /// `getOperandToIndex()[value]` (`Analyses/Liveness.h:143`) — which interference-graph node
+    /// `value` is, i.e. the key a [`RegisterGraphs`] colouring answers for it.
+    ///
+    /// ⛔ TRAP: THE REFERENCE SUBSCRIBES A `DenseMap`, so a value liveness never indexed is INSERTED
+    /// with node 0 rather than refused — the seam keeps that totality and returns a [`RegNode`] always.
+    fn operand_to_index(&mut self, value: Val) -> RegNode;
 }
 
 /// WHETHER A `Liveness::clear` ALSO DROPS THE VIRTUAL ASSIGNMENTS — `clear`'s defaulted `bool`
@@ -1259,6 +1299,10 @@ impl Liveness for OutOfScopeLiveness {
         todo!(
             "Liveness::addVirtualAssignEnforced (Analyses/Liveness.h:124) — out of campaign scope"
         )
+    }
+
+    fn operand_to_index(&mut self, _value: Val) -> RegNode {
+        todo!("Liveness::getOperandToIndex (Analyses/Liveness.h:143) — out of campaign scope")
     }
 }
 

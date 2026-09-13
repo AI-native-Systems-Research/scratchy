@@ -394,15 +394,93 @@ impl SpecializedCanonicalization {
     }
 }
 
-// crustify:todo: e383_runOn
-//   authority : dcc/src/Transform/Sentient/SpecializedCanonicalization.cpp:170  (17 body lines, level 1)
-//   original  : void runOn(func::FuncOp func)
-//   calls     : e218_runOn, e219_runOn, e220_runOn, e221_initialize, e222_clear, e384_runOn
+/// EVERY OP THE PRE-ORDER WALK OFFERS THE THREE HOOKS, WITH WHERE IT SAT WHEN IT WAS REACHED
+/// (`:173-182`).
+///
+/// ⭐ A SNAPSHOT OF RESULT VALUES, NOT OF OPS: the hooks hoist and rewire while the walk runs, and
+/// `moveBefore(insert_point_)` lands an op BEFORE the walk's own position, so each is offered exactly
+/// once — while re-fetching by result is what lets a later `create_group` read the operands an earlier
+/// step rewired.
+fn canonicalizable<A: Arch, M: Model, W: Workload>(program: &Program<A, M, W>) -> Vec<(Val, Site)> {
+    let mut found = Vec::new();
+    collect_canonicalizable(&program.preamble, Site::Preamble, &mut found);
+    for unit in program.units.iter() {
+        collect_canonicalizable(&unit.body, Site::Nested, &mut found);
+    }
+    found
+}
 
-// crustify:todo: e384_runOn
-//   authority : dcc/src/Transform/Sentient/SpecializedCanonicalization.cpp:188  (4 body lines, level 1)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e218_runOn, e219_runOn, e220_runOn, e383_runOn
+/// One scope of [`canonicalizable`]'s walk — ⛔ A NESTED REGION IS NEVER FUNCTION SCOPE, whatever the
+/// site of the op that owns it.
+fn collect_canonicalizable(scope: &[Op], site: Site, found: &mut Vec<(Val, Site)>) {
+    for op in scope {
+        match op {
+            Op::Dataflow(
+                dataflow::Op::GetUnit { result, .. } | dataflow::Op::CreateGroup { result, .. },
+            )
+            | Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => found.push((*result, site)),
+            _ => {}
+        }
+        for region in dialects::regions_ref(op) {
+            collect_canonicalizable(region, Site::Nested, found);
+        }
+    }
+}
+
+impl SpecializedCanonicalization {
+    /// Replaces: e383_runOn
+    ///
+    /// One function: open it, offer every `dataflow.get_unit`, `dataflow.create_group` and
+    /// `symbol.create_symbol` to its hook in pre-order, then erase what they queued and close.
+    ///
+    /// ⛔ TRAP: THE ERASE AND THE `clear()` SIT OUTSIDE THE `if` (`:186-187`) — a function whose
+    /// insert point was missing would still be cleared, and e221's `false` arm is unreachable here.
+    /// ⭐ EACH OP IS RE-FETCHED BY RESULT rather than carried as a clone, so the `dyn_cast` chain runs
+    /// against the op AS THE EARLIER STEPS LEFT IT — see [`canonicalizable`].
+    pub(crate) fn run_on_func<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+    ) {
+        *self = SpecializedCanonicalization::initialize(program);
+        for (val, site) in canonicalizable(program) {
+            match defining_op_in_program(program, val).cloned() {
+                Some(Op::Dataflow(curr_op @ dataflow::Op::GetUnit { .. })) => {
+                    self.run_on_get_unit(curr_op, site, program);
+                }
+                Some(Op::Dataflow(curr_op @ dataflow::Op::CreateGroup { .. })) => {
+                    self.run_on_create_group(curr_op, site, program);
+                }
+                Some(Op::Symbol(curr_op @ symbol::Op::CreateSymbol { .. })) => {
+                    self.run_on_create_symbol(curr_op, site, program);
+                }
+                // The op was erased or is no longer one of the three — the reference's own
+                // `dyn_cast` chain falling through.
+                _ => {}
+            }
+        }
+        for val in std::mem::take(&mut self.to_be_deleted) {
+            dialects::erase_defining_op(&mut program.preamble, val);
+            for unit in program.units.iter_mut() {
+                dialects::erase_defining_op(&mut unit.body, val);
+            }
+        }
+        self.clear();
+    }
+
+    /// Replaces: e384_runOn
+    ///
+    /// The module: canonicalize each of its functions.
+    ///
+    /// ⭐ ONE FUNCTION PER MODULE ON THIS ISLAND: a [`Program`] IS the `func::FuncOp` this pass walks —
+    /// its preamble and program units are that function's entry block — so the `ModuleOp` pre-order
+    /// walk over `func::FuncOp`s has exactly one step.
+    pub(crate) fn run_on_module<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+    ) {
+        self.run_on_func(program);
+    }
+}
 
 /// `-dcc-specialized-canonicalization-disable`, `cl::init(false)` (`:42-45`) — a `dcc-opt`
 /// command-line flag, not a program property, and this crate has no flags.
@@ -418,16 +496,7 @@ pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Pro
     if DISABLE_THIS_PASS {
         return;
     }
-    run_on_module(program);
-}
-
-/// `runOn(mlir::ModuleOp)` — entry 384, level 1, not yet ported.
-fn run_on_module<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) -> ! {
-    let _ = program;
-    todo!(
-        "e384_runOn(mlir::ModuleOp) — the pre-order walk over the module's func::FuncOps \
-         (SpecializedCanonicalization.cpp:188), which runs e383_runOn on each"
-    )
+    SpecializedCanonicalization::default().run_on_module(program);
 }
 
 #[cfg(test)]
@@ -689,12 +758,77 @@ mod unit_tests {
         assert_eq!(pass, SpecializedCanonicalization::default());
     }
 
-    /// e479 — the flag is off, so the entry runs the pass and stops where e384 is not ported.
-    /// ⭐ REACHING THE SEAM IS WHAT IS TESTABLE: it proves the entry does not swallow the pass.
+    /// A unit body holding a dead `get_unit`, a `Corelet { corelet: 0 }` one with a reader, and the
+    /// `CoreWide` duplicate of it with a reader — the whole of e383's walk in five ops.
+    fn walkable() -> Program<Dd2, AnyModel, AnyRung> {
+        let core = core0().expect("Dd2 has a core 0");
+        program(
+            Vec::new(),
+            vec![
+                Op::Dataflow(get_unit(1, Residency::Global, DfirUnit::Hbm)),
+                Op::Dataflow(get_unit(
+                    2,
+                    Residency::Corelet {
+                        core,
+                        corelet: Corelet::checked(0).expect("Dd2 has a corelet 0"),
+                    },
+                    DfirUnit::L3lu,
+                )),
+                reader(2, 10),
+                Op::Dataflow(get_unit(3, Residency::CoreWide { core }, DfirUnit::L3lu)),
+                reader(3, 11),
+            ],
+        )
+    }
+
+    /// The one `get_unit` a walked [`walkable`] leaves standing, in the preamble.
+    fn survivor() -> Op {
+        Op::Dataflow(get_unit(
+            2,
+            Residency::Corelet {
+                core: core0().expect("a core 0"),
+                corelet: Corelet::checked(0).expect("a corelet 0"),
+            },
+            DfirUnit::L3lu,
+        ))
+    }
+
+    /// e383 — the walk offers all three forms in pre-order: the dead one is queued and ERASED, the
+    /// duplicate is rewired onto the survivor and erased, the survivor is hoisted, and the pass is
+    /// left clear.
     #[test]
-    #[should_panic(expected = "e384_runOn")]
+    fn e383_walks_the_function_then_erases_what_the_hooks_queued() {
+        let mut prog = walkable();
+        let mut pass = SpecializedCanonicalization::default();
+
+        pass.run_on_func(&mut prog);
+
+        assert_eq!(prog.preamble, vec![survivor()]);
+        assert_eq!(
+            prog.units.iter().next().expect("one unit").body,
+            vec![reader(2, 10), reader(2, 11)]
+        );
+        assert_eq!(pass, SpecializedCanonicalization::default());
+    }
+
+    /// e384 — a [`Program`] is the module's one function, so the module walk canonicalizes it.
+    #[test]
+    fn e384_canonicalizes_the_modules_one_function() {
+        let mut prog = walkable();
+
+        SpecializedCanonicalization::default().run_on_module(&mut prog);
+
+        assert_eq!(prog.preamble, vec![survivor()]);
+    }
+
+    /// e479 — the flag is off, so the entry runs the pass over the module.
+    /// ⭐ THE EFFECT IS WHAT IS TESTABLE: it proves the entry does not swallow the pass.
+    #[test]
     fn e479_runs_the_pass_over_the_module() {
-        let mut module = program(Vec::new(), Vec::new());
+        let mut module = walkable();
+
         run_on_operation(&mut module);
+
+        assert_eq!(module.preamble, vec![survivor()]);
     }
 }

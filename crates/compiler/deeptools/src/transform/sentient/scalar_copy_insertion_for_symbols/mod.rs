@@ -1015,7 +1015,13 @@ mod unit_tests {
         fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
             todo!("no unit here links enforced assignments through this fake")
         }
+        fn operand_to_index(
+            &mut self,
+            _value: Val,
+        ) -> crate::transform::sentient::analyses::RegNode {
+        todo!("no unit here reads a colouring node through this fake")
     }
+}
 
     /// `e149` — the four arms, with the inner loop rejected by `isOuterMostLoop` and the misplaced
     /// `create_symbol` recorded rather than collected.

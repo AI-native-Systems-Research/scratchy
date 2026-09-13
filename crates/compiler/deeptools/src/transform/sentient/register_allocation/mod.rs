@@ -97,24 +97,29 @@ use crate::workload::Workload;
 /// reference's counter BELOW zero, and a negative index is this island's `None` — the exact `-1` the
 /// backend refuses with `Register initialization out of boundary`. Saturating keeps the counter a
 /// register index; the TRAP is stated at [`RegisterAllocation::naively_allocate`].
+//
+// ⭐ `pub(crate)` FOR THE ONE COUNTER THE SMART ALLOCATOR SHARES: `SmartRegisterAllocation.cpp:184`
+// carries the same `lccr_counter` with the same `++`/`--` pair, so
+// `smart_register_allocation::SmartRegisterAllocation::perform_graph_coloring` (e382) takes this type
+// rather than minting a second one with the same trap.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct NextIndex(u32);
+pub(crate) struct NextIndex(u32);
 
 impl NextIndex {
     /// The next index WITHOUT advancing — the two xrf pointers, whose `++` is commented out.
-    fn peek(self) -> RegIndex {
+    pub(crate) fn peek(self) -> RegIndex {
         RegIndex::allocated(self.0)
     }
 
     /// `reg_indices.push_back(counter); counter++;`
-    fn take(&mut self) -> RegIndex {
+    pub(crate) fn take(&mut self) -> RegIndex {
         let index = self.peek();
         self.0 += 1;
         index
     }
 
     /// `lccr_counter--` (`:97`) — see the type's note for why it stops at zero.
-    fn release(&mut self) {
+    pub(crate) fn release(&mut self) {
         self.0 = self.0.saturating_sub(1);
     }
 }

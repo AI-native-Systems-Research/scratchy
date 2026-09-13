@@ -86,10 +86,15 @@
 // ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e540 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
-use super::analyses::{Liveness, RegisterGraphs};
+use std::collections::BTreeMap;
+
+use super::analyses::{GreedyAllocator, Liveness, RegNode, RegisterGraphs};
+use super::register_allocation::{NextIndex, UnknownLocale};
 use crate::arch::Arch;
-use crate::islands::sentient::dialects::sentient::RegType;
-use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+use crate::islands::sentient::dialects::sentient::{Reg, RegIndex, RegType};
+use crate::islands::sentient::dialects::{
+    self, Definitions, Op, UniformRegions, Val, sentient, uniform,
+};
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
 use crate::workload::Workload;
@@ -108,6 +113,9 @@ pub(crate) struct SmartRegisterAllocation<G: RegisterGraphs> {
     pub(crate) reg_graphs: G,
     /// `register_assignment_` — `DenseMap<Value, int>`, the register each value was given.
     pub(crate) register_assignment: Vec<(Val, sentient::RegIndex)>,
+    /// `signalPassFailure()` AS DATA — ⭐ NOT CLEARED BY [`Self::clean`], because MLIR's failure flag
+    /// lives on the pass and e216 touches only the two members the reference names.
+    pub(crate) failures: Vec<UnknownLocale>,
 }
 
 impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
@@ -168,18 +176,403 @@ fn addresses(value: Val, addr: Val, defs: Definitions<'_>) -> bool {
     ) && mutable_addr == addr
 }
 
-// crustify:todo: e382_performGraphColoring
-//   authority : dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:136  (484 body lines, level 1)
-//   original  : void SmartRegisterAllocationPass::performGraphColoring( dataflow::ProgramUnitOp &unit, Liveness &liveness, bool use_greedy_allocator)
-//   calls     : e252_size
-
 /// `useGreedyAllocator = (opts_.OptLevel == 0)`, set once in the pass constructor (`:48`).
 ///
 /// ⛔ NOT A `dcc-opt` FLAG BUT A BUILD OPTION: `CommonPassOptions::OptLevel` defaults to `-1`
 /// (`dcc/tools/Options/dcc-pass-option.h:117`), so an ordinary build colours normally and only `-O0`
 /// is greedy. The `Passes.td` option of the same name (`Passes.td:365`) is overwritten by that
 /// constructor line and never read.
-const USE_GREEDY_ALLOCATOR: bool = false;
+const USE_GREEDY_ALLOCATOR: GreedyAllocator = GreedyAllocator::No;
+
+/// `<locale>0` — what a `std::map` subscript reads for a node no colouring placed, and the index the
+/// two xrf pointers always get.
+const ZERO: RegIndex = RegIndex::at::<0>();
+
+/// THE EIGHT LOCALES e382 COLOURS, IN THE ORDER IT COLOURS THEM (`:139-179`).
+///
+/// ⛔ THE ORDER IS OBSERVABLE: each triple folds `liveness`'s virtual assignments into the SHARED
+/// `ec_map_` that [`RegisterGraphs::clean`] does not clear, so a later locale sees the earlier ones'
+/// equivalence classes.
+const COLOURED_LOCALES: [RegType; 8] = [
+    RegType::Lrf,
+    RegType::Jcr,
+    RegType::Lar,
+    RegType::Lbr,
+    RegType::Ear,
+    RegType::Ebr,
+    RegType::Gtr,
+    RegType::Mvr,
+];
+
+/// THE EIGHT COLOURINGS, keyed by locale rather than named one `std::map<int, int>` local each
+/// (`:142-179`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Colorings(BTreeMap<RegType, BTreeMap<RegNode, RegIndex>>);
+
+impl Colorings {
+    /// `<locale>_coloring[graph_index]`, and `None` where no arm of the colouring loop covers
+    /// `locale`.
+    ///
+    /// ⛔ TRAP: `std::map::operator[]` INSERTS A ZERO. A node the colouring never placed reads back as
+    /// register 0 instead of being refused, so a value liveness never indexed silently lands in
+    /// `<locale>0` — and [`Liveness::operand_to_index`] carries the same trap one level down.
+    fn index(&self, locale: RegType, node: RegNode) -> Option<RegIndex> {
+        Some(self.0.get(&locale)?.get(&node).copied().unwrap_or(ZERO))
+    }
+}
+
+/// WHICH REGISTER FILES ONE OP FORM ACCEPTS — the `if / else if` chain each arm of the walk spells out.
+///
+/// ⛔ NOT [`super::register_allocation`]'s SETS OF THE SAME NAME: the naive allocator's chains differ
+/// op for op (no GTR loop, no LRF branch, no MVR copy, LBR instead of EAR on a transfer), so the two
+/// enums are two different facts about two different passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Accepts {
+    /// `sentient.for` (`:191-256`) — the only arm that takes LCCR.
+    Loop,
+    /// `sentient.if` (`:268-307`) and `uniform.uniformize_regions` (`:319-356`).
+    Branch,
+    /// `sentient.scalar_add` (`:368-397`) and `scalar_sub` (`:401-430`).
+    Scalar,
+    /// `sentient.scalar_copy` (`:434-483`) — the widest chain, and the only one taking EBR or MVR.
+    Copy,
+    /// `sentient.load_and_send` (`:487-508`) and `receive_and_store` (`:552-573`).
+    Transfer,
+    /// `sentient.load_and_extract_scalar` (`:513-533`), and the required locale of the two
+    /// `DT_CHECK`ed ops (`:580`, `:613`).
+    LrfOnly,
+    /// `sentient.load_and_store` (`:588-599`).
+    Address,
+}
+
+impl Accepts {
+    /// Whether this op form's chain has an arm for `locale`.
+    fn takes(self, locale: RegType) -> bool {
+        match self {
+            Accepts::Loop => matches!(
+                locale,
+                RegType::Lrf
+                    | RegType::Jcr
+                    | RegType::Lar
+                    | RegType::Ear
+                    | RegType::Gtr
+                    | RegType::Lccr
+                    | RegType::XrfRdPtr
+                    | RegType::XrfWrPtr
+            ),
+            Accepts::Branch => matches!(
+                locale,
+                RegType::Jcr
+                    | RegType::Lar
+                    | RegType::Ear
+                    | RegType::Gtr
+                    | RegType::XrfRdPtr
+                    | RegType::XrfWrPtr
+                    | RegType::Lrf
+            ),
+            Accepts::Scalar => matches!(
+                locale,
+                RegType::Lrf
+                    | RegType::Jcr
+                    | RegType::Lar
+                    | RegType::Ear
+                    | RegType::XrfRdPtr
+                    | RegType::XrfWrPtr
+            ),
+            Accepts::Copy => matches!(
+                locale,
+                RegType::Lrf
+                    | RegType::Jcr
+                    | RegType::Lar
+                    | RegType::Ear
+                    | RegType::Lbr
+                    | RegType::Ebr
+                    | RegType::Gtr
+                    | RegType::XrfRdPtr
+                    | RegType::XrfWrPtr
+                    | RegType::Mvr
+            ),
+            Accepts::Transfer => matches!(locale, RegType::Lrf | RegType::Lar | RegType::Ear),
+            Accepts::LrfOnly => matches!(locale, RegType::Lrf),
+            Accepts::Address => matches!(locale, RegType::Ear | RegType::Lar),
+        }
+    }
+}
+
+/// `"Unknown locale at the for operation"` (`:256`).
+const UNKNOWN_AT_FOR: &str = "Unknown locale at the for operation";
+/// `:307-309`, the two string literals concatenated as the compiler joins them.
+const ONLY_FOR_IF: &str =
+    "Only JCR/LRF/LAR/EAR/GTR/XRFRDPTR/XRFWRPTR locales are accepted for if-ops";
+
+/// WHOSE REGION THE WALK IS IN — the one question this pass asks about a parent (`:265`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parent {
+    /// A `sentient.for` body, where a `sentient.yield` gives the LCCR index back.
+    For,
+    /// Anything else, including the program unit body itself.
+    Other,
+}
+
+/// THE LOCALS ONE `performGraphColoring` CARRIES THROUGH ITS WALK (`:182-188`).
+struct Assign<'a, L: Liveness> {
+    /// The eight colourings, already computed.
+    colorings: Colorings,
+    /// `liveness`, asked only for `getOperandToIndex()`.
+    liveness: &'a mut L,
+    /// `lccr_counter` — ⭐ THE LOOP NESTING DEPTH, by the `for`/`yield` pair, and the ONLY counter here
+    /// that is read before it is written.
+    lccr: NextIndex,
+    /// Every `emitError` + `signalPassFailure` the walk made.
+    failures: Vec<UnknownLocale>,
+}
+
+impl<L: Liveness> Assign<'_, L> {
+    /// `unit.walk<WalkOrder::PreOrder>` (`:190`) — the op, then its regions.
+    fn walk(&mut self, scope: &mut [Op], parent: Parent) {
+        for op in scope.iter_mut() {
+            self.assign_to(op, parent);
+            // ⛔ WHOSE REGION THE NESTED SCOPE IS, because the `sentient.yield` arm asks exactly that.
+            let inner = match op {
+                Op::Sentient(sentient::Op::For { .. }) => Parent::For,
+                _ => Parent::Other,
+            };
+            for region in dialects::regions_mut(op) {
+                self.walk(region, inner);
+            }
+        }
+    }
+
+    /// One op of the walk — the `if / else if` chain over op kinds (`:191-620`).
+    fn assign_to(&mut self, op: &mut Op, parent: Parent) {
+        match op {
+            Op::Sentient(sentient::Op::For {
+                iv,
+                bound_reg,
+                carried,
+                ..
+            }) => {
+                // ⭐ ENTRY 0 IS THE INDUCTION VARIABLE: `curr_iter_args[i - 1]` at `i == 0` reads
+                // `getRegionIterArgs()`, which is `arguments().drop_front(1)`, one before its start —
+                // body argument 0, the iv.
+                let asked: Vec<(Val, RegType)> = bound_reg
+                    .as_ref()
+                    .map(|reg| (*iv, reg.locale))
+                    .into_iter()
+                    .chain(carried.iter().map(|slot| (slot.arg, slot.reg.locale)))
+                    .collect();
+                let Some(indices) = self.indices_for(&asked, Accepts::Loop, UNKNOWN_AT_FOR) else {
+                    return;
+                };
+                let mut assigned = indices.into_iter();
+                if let Some(reg) = bound_reg {
+                    reg.index = assigned.next();
+                }
+                for slot in carried.iter_mut() {
+                    slot.reg.index = assigned.next();
+                }
+            }
+            Op::Sentient(sentient::Op::Yield { .. }) => {
+                // `isa<sentient::ForOp>(yield_op->getParentRegion()->getParentOp())` (`:265`).
+                if matches!(parent, Parent::For) {
+                    self.lccr.release();
+                }
+            }
+            Op::Sentient(sentient::Op::If { yielded, .. }) => {
+                let asked: Vec<(Val, RegType)> = yielded
+                    .iter()
+                    .map(|slot| (slot.result, slot.reg.locale))
+                    .collect();
+                let Some(indices) = self.indices_for(&asked, Accepts::Branch, ONLY_FOR_IF) else {
+                    return;
+                };
+                for (slot, index) in yielded.iter_mut().zip(indices) {
+                    slot.reg.index = Some(index);
+                }
+            }
+            // `dyn_cast<uniform::UniformizeRegionsOp>(op)` (`:318-367`), whose whole body is inside
+            // `if (const auto locales = unif_regions.getRegLocalesAttr(); locales)`.
+            //
+            // ⛔ NEITHER ISLAND SPELLING CARRIES THAT ATTRIBUTE, for the reason
+            // [`super::register_allocation`]'s own uniformize arm records: `uniform` at this rung IS the
+            // DataflowIR dialect, and the sentient-rung [`UniformRegions`] spelling has no printer for
+            // the register arrays either. Every `uniform.uniformize_regions` here is therefore the
+            // reference's own no-attribute case, which assigns nothing and refuses nothing.
+            Op::Uniform(uniform::Op::UniformizeRegions { .. })
+            | Op::UniformRegions(UniformRegions::UniformizeRegions { .. }) => {}
+            Op::Sentient(sentient::Op::ScalarAdd { result, reg, .. }) => {
+                let message = "Unknown locale at the add operation";
+                self.assign_singular(*result, reg.as_mut(), Accepts::Scalar, message);
+            }
+            Op::Sentient(sentient::Op::ScalarSub { result, reg, .. }) => {
+                let message = "Unknown locale at the sub operation";
+                self.assign_singular(*result, reg.as_mut(), Accepts::Scalar, message);
+            }
+            Op::Sentient(sentient::Op::ScalarCopy { result, reg, .. }) => {
+                let message = "Unknown locale at the copy operation";
+                self.assign_singular(*result, Some(reg), Accepts::Copy, message);
+            }
+            Op::Sentient(sentient::Op::LoadAndSend { result, reg, .. }) => {
+                let message = "Unknown locale at the load_and_send operation";
+                self.assign_singular(*result, Some(reg), Accepts::Transfer, message);
+            }
+            Op::Sentient(sentient::Op::ReceiveAndStore { result, reg, .. }) => {
+                let message = "Unknown locale at the receive_and_store operation";
+                self.assign_singular(*result, Some(reg), Accepts::Transfer, message);
+            }
+            Op::Sentient(sentient::Op::LoadAndExtractScalar {
+                addr_result,
+                data_result,
+                addr_reg,
+                data_reg,
+                ..
+            }) => {
+                // ⭐ BOTH LOCALES ARE CHECKED BEFORE EITHER INDEX IS READ (`:517-537`), and the DATA
+                // half is checked first even though it is written to entry 1 of the array.
+                if !Accepts::LrfOnly.takes(data_reg.locale) {
+                    self.failures.push(UnknownLocale {
+                        at: *data_result,
+                        locale: Some(data_reg.locale),
+                        message: "Unknown locale at the load_and_extract operation for data result",
+                    });
+                    return;
+                }
+                if !Accepts::LrfOnly.takes(addr_reg.locale) {
+                    self.failures.push(UnknownLocale {
+                        at: *addr_result,
+                        locale: Some(addr_reg.locale),
+                        message: "Unknown locale at the load_and_extract operation for addr result",
+                    });
+                    return;
+                }
+                let data_index = self.lrf_index(*data_result);
+                if data_index != ZERO {
+                    panic!(
+                        "DT_CHECK_MSG(lrf_coloring[graph_index] == 0, \"only LRF0 supported for \
+                         load_and_extract_scalar op data results\") \
+                         (`SmartRegisterAllocation.cpp:541`)"
+                    );
+                }
+                data_reg.index = Some(data_index);
+                addr_reg.index = Some(self.lrf_index(*addr_result));
+            }
+            Op::Sentient(sentient::Op::ReceiveAndExtractScalar { result, reg, .. }) => {
+                if !Accepts::LrfOnly.takes(reg.locale) {
+                    panic!(
+                        "DT_CHECK_MSG(receive_and_extract_op.getRegLocale() == \
+                         SentientRegType::lrf, \"ReceiveAndExtractScalarOp must be LRF locale\") \
+                         (`SmartRegisterAllocation.cpp:580`)"
+                    );
+                }
+                reg.index = Some(self.lrf_index(*result));
+            }
+            Op::Sentient(sentient::Op::LoadAndStore {
+                results,
+                src_reg,
+                dst_reg,
+                ..
+            }) => {
+                let asked = [(results.0, src_reg.locale), (results.1, dst_reg.locale)];
+                let message = "Unknown locale at the load_and_store operation";
+                if let Some(indices) = self.indices_for(&asked, Accepts::Address, message) {
+                    src_reg.index = Some(indices[0]);
+                    dst_reg.index = Some(indices[1]);
+                }
+            }
+            Op::Sentient(sentient::Op::LoadComputeAndSend { result, reg, .. }) => {
+                if !Accepts::LrfOnly.takes(reg.locale) {
+                    panic!(
+                        "DT_CHECK(load_compute_op.getRegLocale() == SentientRegType::lrf) \
+                         (`SmartRegisterAllocation.cpp:613`)"
+                    );
+                }
+                reg.index = Some(self.lrf_index(*result));
+            }
+            // ⭐ THE REFERENCE'S CHAIN HAS NO `else`: an op it names no arm for keeps whatever register
+            // an earlier pass gave it.
+            _ => {}
+        }
+    }
+
+    /// `lrf_coloring[liveness.getOperandToIndex()[value]]` — the three `DT_CHECK`ed reads, which
+    /// consult no chain because their locale is already known.
+    fn lrf_index(&mut self, value: Val) -> RegIndex {
+        let node = self.liveness.operand_to_index(value);
+        self.colorings.index(RegType::Lrf, node).unwrap_or(ZERO)
+    }
+
+    /// The whole array, or nothing — see [`SmartRegisterAllocation::perform_graph_coloring`]'s TRAP.
+    fn indices_for(
+        &mut self,
+        asked: &[(Val, RegType)],
+        accepts: Accepts,
+        message: &'static str,
+    ) -> Option<Vec<RegIndex>> {
+        let mut indices = Vec::with_capacity(asked.len());
+        for (at, locale) in asked {
+            indices.push(self.index_for(*at, *locale, accepts, message)?);
+        }
+        Some(indices)
+    }
+
+    /// `op.setRegIndexAttr(builder.getI32IntegerAttr(counter))` — the ops carrying ONE `regLocale`.
+    ///
+    /// ⛔ `None` IS THE ABSENT ATTRIBUTE, which `getRegLocale()` cannot answer any arm of the chain
+    /// with, so it lands on the same `emitError`.
+    fn assign_singular(
+        &mut self,
+        at: Val,
+        reg: Option<&mut Reg>,
+        accepts: Accepts,
+        message: &'static str,
+    ) {
+        match reg {
+            Some(reg) => {
+                if let Some(index) = self.index_for(at, reg.locale, accepts, message) {
+                    reg.index = Some(index);
+                }
+            }
+            None => self.failures.push(UnknownLocale {
+                at,
+                locale: None,
+                message,
+            }),
+        }
+    }
+
+    /// The index `locale` asks for at `at`, and the recorded `emitError` + `signalPassFailure` where
+    /// this op form's chain has no arm for it.
+    fn index_for(
+        &mut self,
+        at: Val,
+        locale: RegType,
+        accepts: Accepts,
+        message: &'static str,
+    ) -> Option<RegIndex> {
+        if accepts.takes(locale) {
+            // ⛔ THREE LOCALES CONSULT NO COLOURING: LCCR counts loop depth, and the two xrf pointers
+            // push a counter whose `+= 1` is commented out ("Already handled in the above passes"), so
+            // every xrf pointer in the unit is index 0.
+            let index = match locale {
+                RegType::Lccr => Some(self.lccr.take()),
+                RegType::XrfRdPtr | RegType::XrfWrPtr => Some(ZERO),
+                _ => {
+                    let node = self.liveness.operand_to_index(at);
+                    self.colorings.index(locale, node)
+                }
+            };
+            if let Some(index) = index {
+                return Some(index);
+            }
+        }
+        self.failures.push(UnknownLocale {
+            at,
+            locale: Some(locale),
+            message,
+        });
+        None
+    }
+}
 
 impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
     /// Replaces: e478_doRegisterAllocation
@@ -201,20 +594,46 @@ impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
         self.perform_graph_coloring(unit, liveness, USE_GREEDY_ALLOCATOR);
     }
 
-    /// `performGraphColoring(unit, liveness, use_greedy_allocator)` — entry 382, level 1, not yet
-    /// ported.
-    fn perform_graph_coloring<A: Arch, L: Liveness>(
+    /// Replaces: e382_performGraphColoring
+    ///
+    /// Colours all eight register files over this unit's hyper-graphs, then walks it in pre-order
+    /// giving every register-carrying op the colour its own result got.
+    ///
+    /// ⛔ TRAP: A REFUSED ENTRY ABANDONS THE WHOLE OP, and an LCCR index already taken stays taken.
+    /// ⭐ ONLY `lccr_counter` IS STATE (`:182-188`): the other nine are write-before-read at every
+    /// use, and the two xrf pointers never advance, so every xrf pointer here is index 0. The
+    /// colouring's own subscript trap is at [`Colorings::index`].
+    pub(crate) fn perform_graph_coloring<A: Arch, L: Liveness>(
         &mut self,
         unit: &mut ProgramUnit<A>,
         liveness: &mut L,
-        use_greedy_allocator: bool,
-    ) -> ! {
-        let _ = (unit, liveness, use_greedy_allocator);
-        todo!(
-            "e382_performGraphColoring(unit, liveness, use_greedy_allocator) — the per-locale \
-             hyper-graph colouring and the register each value is assigned \
-             (SmartRegisterAllocation.cpp:136), 484 lines"
-        )
+        greedy: GreedyAllocator,
+    ) {
+        let mut colorings = Colorings::default();
+        for locale in COLOURED_LOCALES {
+            self.reg_graphs
+                .create_same_color_edge_eq_classes(liveness, locale);
+            self.reg_graphs.build_hyper_graph(locale);
+            let coloring = self
+                .reg_graphs
+                .do_graph_color_on_locale(locale, &unit.body, greedy);
+            colorings.0.insert(locale, coloring);
+        }
+
+        let mut assign = Assign {
+            colorings,
+            liveness,
+            lccr: NextIndex::default(),
+            failures: Vec::new(),
+        };
+        assign.walk(&mut unit.body, Parent::Other);
+        self.failures.append(&mut assign.failures);
+    }
+
+    /// Every `emitError` + `signalPassFailure` this pass made.
+    #[must_use]
+    pub(crate) fn failures(&self) -> &[UnknownLocale] {
+        &self.failures
     }
 }
 
@@ -244,14 +663,18 @@ impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Liveness, RegisterGraphs, SmartRegisterAllocation, is_known_to_have_same_values};
+    use super::{
+        COLOURED_LOCALES, GreedyAllocator, Liveness, RegNode, RegisterGraphs,
+        SmartRegisterAllocation, is_known_to_have_same_values,
+    };
+    use std::collections::BTreeMap;
     use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
-    use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
+    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegIndex, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
     use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
     use crate::model::Model;
@@ -321,7 +744,7 @@ mod unit_tests {
             _liveness: &mut L,
             _locale: RegType,
         ) {
-            todo!("no unit here folds equivalence classes through this fake")
+            todo!("e478 stops at the first of e382's eight colouring triples")
         }
 
         fn build_hyper_graph(&mut self, _locale: RegType) {
@@ -330,6 +753,15 @@ mod unit_tests {
 
         fn fast_check_colorability(&mut self, _num_colors: MaxRegNum, _locale: RegType) -> bool {
             todo!("no unit here checks colorability through this fake")
+        }
+
+        fn do_graph_color_on_locale(
+            &mut self,
+            _locale: RegType,
+            _unit: &[Op],
+            _greedy: GreedyAllocator,
+        ) -> BTreeMap<RegNode, RegIndex> {
+            todo!("no unit here colours through this fake")
         }
     }
 
@@ -359,6 +791,10 @@ mod unit_tests {
 
         fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
             todo!("no unit here enforces a pair on this fake")
+        }
+
+        fn operand_to_index(&mut self, _value: Val) -> RegNode {
+            todo!("e478 never reaches a colouring lookup through this fake")
         }
     }
 
@@ -406,6 +842,7 @@ mod unit_tests {
         let mut pass = SmartRegisterAllocation {
             reg_graphs: CountingGraphs::default(),
             register_assignment: vec![(Val(7), sentient::RegIndex::at::<3>())],
+            failures: Vec::new(),
         };
 
         pass.clean();
@@ -448,6 +885,7 @@ mod unit_tests {
         let mut pass = SmartRegisterAllocation {
             reg_graphs: CountingGraphs::default(),
             register_assignment: vec![(Val(7), sentient::RegIndex::at::<3>())],
+            failures: Vec::new(),
         };
         let mut unit = unit_of(vec![scalar_const(1, 0), scalar_const(2, 1)]);
         let mut liveness = SilentLiveness;
@@ -458,7 +896,7 @@ mod unit_tests {
 
         assert!(
             reached.is_err(),
-            "e382 is not ported, so the colouring panics"
+            "the fake has no equivalence classes, so e382's first colouring triple panics"
         );
         assert_eq!(
             pass.reg_graphs,
@@ -468,6 +906,209 @@ mod unit_tests {
             }
         );
         assert_eq!(pass.register_assignment, Vec::new());
+    }
+
+    /// A `RegisterGraphs` THAT ANSWERS WITH A COLOURING — e382 is the one unit that reads one back, so
+    /// this fake also records WHICH locales it was asked, in order.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct ColouringGraphs {
+        asked: Vec<RegType>,
+        greedy: Vec<GreedyAllocator>,
+    }
+
+    impl RegisterGraphs for ColouringGraphs {
+        fn clean(&mut self) {}
+
+        fn build_graphs<L: Liveness>(
+            &mut self,
+            _liveness: &mut L,
+            _unit: &[Op],
+            _locale: RegType,
+            _coreunit: Option<Val>,
+        ) {
+        }
+
+        fn create_same_color_edge_eq_classes<L: Liveness>(
+            &mut self,
+            _liveness: &mut L,
+            _locale: RegType,
+        ) {
+        }
+
+        fn build_hyper_graph(&mut self, _locale: RegType) {}
+
+        fn fast_check_colorability(&mut self, _num_colors: MaxRegNum, _locale: RegType) -> bool {
+            todo!("e382 never checks colorability")
+        }
+
+        fn do_graph_color_on_locale(
+            &mut self,
+            locale: RegType,
+            _unit: &[Op],
+            greedy: GreedyAllocator,
+        ) -> BTreeMap<RegNode, RegIndex> {
+            self.asked.push(locale);
+            self.greedy.push(greedy);
+            match locale {
+                // The carried value `%11` got LRF2.
+                RegType::Lrf => BTreeMap::from([(RegNode(11), RegIndex::at::<2>())]),
+                // The copy's result `%30` got MVR5.
+                RegType::Mvr => BTreeMap::from([(RegNode(30), RegIndex::at::<5>())]),
+                _ => BTreeMap::new(),
+            }
+        }
+    }
+
+    /// A `Liveness` WHOSE GRAPH NODE IS THE VALUE'S OWN NUMBER — e382 asks it nothing else.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct NumberedLiveness;
+
+    impl Liveness for NumberedLiveness {
+        fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {}
+
+        fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
+            false
+        }
+
+        fn clear(&mut self, _virtual_assigns: VirtualAssigns) {
+            todo!("e382 never clears liveness")
+        }
+
+        fn compute_register_live_range(&mut self, _unit: &[Op]) {
+            todo!("e382 is handed a computed liveness")
+        }
+
+        fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {
+            todo!("e382 adds no virtual assignment")
+        }
+
+        fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
+            todo!("e382 adds no virtual assignment")
+        }
+
+        fn operand_to_index(&mut self, value: Val) -> RegNode {
+            RegNode(i32::try_from(value.0).unwrap_or_default())
+        }
+    }
+
+    /// `sentient.for %iv = 0 to %bound iter_args(%arg = %init)`, the bound in `bound_locale` and the
+    /// carried value in `carried_locale`.
+    fn for_op(iv: u32, arg: u32, bound_locale: RegType, carried_locale: RegType, body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv: Val(iv),
+            bound: Val(90),
+            bound_reg: Some(Reg {
+                locale: bound_locale,
+                index: None,
+            }),
+            carried: vec![Carried {
+                init: Val(91),
+                arg: Val(arg),
+                result: Val(arg + 100),
+                reg: Reg {
+                    locale: carried_locale,
+                    index: None,
+                },
+                program_header: false,
+                element_size: None,
+            }],
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// `sentient.scalar_copy %in` into `locale`.
+    fn scalar_copy(result: u32, locale: RegType) -> Op {
+        Op::Sentient(sentient::Op::ScalarCopy {
+            input: Val(92),
+            result: Val(result),
+            reg: Reg {
+                locale,
+                index: None,
+            },
+            element_size: None,
+            program_header: false,
+        })
+    }
+
+    /// `sentient.scalar_add %a, %b` into `locale`.
+    fn scalar_add(result: u32, locale: RegType) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs: Val(93),
+            rhs: Val(94),
+            result: Val(result),
+            reg: Some(Reg {
+                locale,
+                index: None,
+            }),
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    /// The register `op` carries, by the field each form keeps it in.
+    fn assigned(op: &Op) -> Option<RegIndex> {
+        match op {
+            Op::Sentient(sentient::Op::ScalarCopy { reg, .. }) => reg.index,
+            Op::Sentient(sentient::Op::ScalarAdd { reg, .. }) => reg.as_ref().and_then(|r| r.index),
+            _ => None,
+        }
+    }
+
+    /// e382 — the eight locales are coloured in order, a value's register IS its colour, LCCR is the
+    /// loop nesting depth the `yield` gives back, and a locale no arm accepts is refused as data with
+    /// the op left unassigned.
+    #[test]
+    fn e382_assigns_each_value_its_colour_and_counts_lccr_by_loop_depth() {
+        let mut pass: SmartRegisterAllocation<ColouringGraphs> = SmartRegisterAllocation::default();
+        let mut unit = unit_of(vec![
+            for_op(
+                10,
+                11,
+                RegType::Lccr,
+                RegType::Lrf,
+                vec![
+                    scalar_copy(30, RegType::Mvr),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![Val(30)],
+                    }),
+                ],
+            ),
+            scalar_add(40, RegType::Ebr),
+            for_op(20, 21, RegType::Lccr, RegType::Lrf, Vec::new()),
+        ]);
+        let mut liveness = NumberedLiveness;
+
+        pass.perform_graph_coloring(&mut unit, &mut liveness, GreedyAllocator::No);
+
+        assert_eq!(pass.reg_graphs.asked, COLOURED_LOCALES.to_vec());
+        assert_eq!(pass.reg_graphs.greedy, vec![GreedyAllocator::No; 8]);
+        let Op::Sentient(sentient::Op::For {
+            bound_reg,
+            carried,
+            body,
+            ..
+        }) = &unit.body[0]
+        else {
+            panic!("the first op is the loop")
+        };
+        // LCCR0 for the outer loop, and the carried value's own LRF colour.
+        assert_eq!(bound_reg.as_ref().and_then(|r| r.index), Some(RegIndex::at::<0>()));
+        assert_eq!(carried[0].reg.index, Some(RegIndex::at::<2>()));
+        assert_eq!(assigned(&body[0]), Some(RegIndex::at::<5>()));
+        // EBR is not in the add's chain: refused as data, and the op keeps no register.
+        assert_eq!(assigned(&unit.body[1]), None);
+        assert_eq!(pass.failures().len(), 1);
+        assert_eq!(pass.failures()[0].locale, Some(RegType::Ebr));
+        assert_eq!(
+            pass.failures()[0].message,
+            "Unknown locale at the add operation"
+        );
+        // ⭐ THE `yield` GAVE LCCR0 BACK, so the second loop gets it again rather than LCCR1.
+        let Op::Sentient(sentient::Op::For { bound_reg, .. }) = &unit.body[2] else {
+            panic!("the third op is the second loop")
+        };
+        assert_eq!(bound_reg.as_ref().and_then(|r| r.index), Some(RegIndex::at::<0>()));
     }
 
     /// HOW MANY UNITS `FreshLiveness` WAS COMPUTED OVER — e540 constructs its analysis rather than
@@ -500,6 +1141,10 @@ mod unit_tests {
         fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
             todo!("no unit here enforces a pair on this fake")
         }
+
+        fn operand_to_index(&mut self, _value: Val) -> RegNode {
+            todo!("e540 never reaches a colouring lookup through this fake")
+        }
     }
 
     /// e540 — the entry walks the module's units, and the first one gets a live range computed over
@@ -509,6 +1154,7 @@ mod unit_tests {
         let mut pass = SmartRegisterAllocation {
             reg_graphs: CountingGraphs::default(),
             register_assignment: Vec::new(),
+            failures: Vec::new(),
         };
         let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
             name: ProgramName {
@@ -531,7 +1177,7 @@ mod unit_tests {
 
         assert!(
             reached.is_err(),
-            "e382 is not ported, so the first unit's colouring panics"
+            "the fake has no equivalence classes, so the first unit's colouring panics"
         );
         // The first unit only: it was computed over, cleaned and built over its two ops.
         assert_eq!(LIVE_RANGES_COMPUTED.load(Ordering::Relaxed), 1);

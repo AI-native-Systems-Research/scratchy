@@ -819,7 +819,13 @@ mod unit_tests {
         fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
             todo!("no unit here links enforced assignments through this fake")
         }
+        fn operand_to_index(
+            &mut self,
+            _value: Val,
+        ) -> crate::transform::sentient::analyses::RegNode {
+        todo!("no unit here reads a colouring node through this fake")
     }
+}
 
     /// `e356` — the second argument's uses move to the first, and the third is left alone because its
     /// register locale differs however the analysis answers.
