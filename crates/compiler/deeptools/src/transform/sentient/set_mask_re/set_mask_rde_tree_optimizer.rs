@@ -92,6 +92,7 @@ use super::set_mask_gen_value::SetMaskGenValue;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::sentient::dialects::{self as ir, Op, Val, sentient};
 use crate::transform::sentient::cfg_simplification_sentient_level::pattern_simplification_manager::OpPath;
+use sys_arch_spec::fields::{self, ImmSpec};
 
 /// `RDENode::getDataflowGen()` AS e193/e194 READ IT — the two `dynamic_cast`s, as cases.
 ///
@@ -278,16 +279,18 @@ pub(crate) struct SetMaskRdeTreeOptimizer {
 
 impl SetMaskRdeTreeOptimizer {
     /// `SetMaskRDETreeOptimizer(tree, isa, .., enable_dead_incrmask_removal, ..)`.
+    ///
+    /// ⭐ THE WRAP IS NOT A PARAMETER: the constructor derives it from the ISA (e377), so no caller
+    /// can hand this optimizer a wrap the instruction's immediate field does not have.
     #[must_use]
     pub(crate) fn of(
-        setmask_wrap: SetMaskWrap,
         enable_dead_incrmask_removal: bool,
         enable_incrmask_absorption: bool,
     ) -> SetMaskRdeTreeOptimizer {
         SetMaskRdeTreeOptimizer {
             enable_dead_incrmask_removal,
             enable_incrmask_absorption,
-            setmask_wrap,
+            setmask_wrap: SETMASK_WRAP,
             count: 0,
             to_be_deleted: Vec::new(),
         }
@@ -464,24 +467,187 @@ fn hard_sets_the_mask(siblings: &[Option<DataflowGen>]) -> bool {
     false
 }
 
-// crustify:todo: e377_setSetMaskWrap
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:299  (9 body lines, level 1)
-//   original  : void SetMaskRDETreeOptimizer::setSetMaskWrap()
-//   calls     : e252_size
+/// Replaces: e377_setSetMaskWrap
+///
+/// `setmask_wrap_ = 1 << imm_info.first` — the mask value wraps at the span of SETMASK's one immediate
+/// field, which the PT declares 3 bits wide, so it wraps at 8.
+///
+/// ⛔ BOTH `DT_CHECK`s FAIL THE BUILD AND NOT THE RUN: this is a `const fn` read by [`SETMASK_WRAP`],
+/// so an ISA with no SETMASK opcode, or with more than one immediate on its instruction type, is a
+/// compile error — and so is a wrap of zero, which is [`SetMaskWrap`]'s own `DT_CHECK`.
+/// ⛔ THE COMPONENT IS THE PT: `isa_` is the pass's own PT ISA, `set_mask` being a PT instruction.
+const fn setmask_wrap() -> SetMaskWrap {
+    let opcodes = fields::Comp::Pt.opcodes();
+    let mut i = 0;
+    let mut setmask = None;
+    while i < opcodes.len() {
+        if str_eq(opcodes[i].op, "SETMASK") {
+            setmask = Some(opcodes[i].ty);
+        }
+        i += 1;
+    }
+    let ty = match setmask {
+        Some(ty) => ty.get(),
+        None => panic!("the PT defines SETMASK — `isa_.getOpcodeType(OpCodeT::SETMASK)`"),
+    };
 
-// crustify:todo: e378_optimize
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:311  (34 body lines, level 1)
-//   original  : unsigned SetMaskRDETreeOptimizer::optimize()
-//   calls     : e188_print, e192_print, e193_deadIncrMaskOptimization, e194_absorbIncrMask
+    let all = fields::Comp::Pt.fields();
+    let mut j = 0;
+    let mut bits = 0;
+    let mut found = 0;
+    while j < all.len() {
+        if all[j].ty.get() == ty
+            && let ImmSpec::Imm { bits: width, .. } = all[j].imm
+        {
+            bits = width.get();
+            found += 1;
+        }
+        j += 1;
+    }
+    if found != 1 {
+        panic!(
+            "the SETMASK type must have exactly one immediate field — \
+             DT_CHECK(imm_info_map.size() == 1) (`SetMaskRE.cpp:305`)"
+        )
+    }
+    match NonZeroU32::new(1 << bits) {
+        Some(wrap) => SetMaskWrap::of(wrap),
+        None => panic!("`1 << bits` of a non-zero width is not zero"),
+    }
+}
+
+/// `str::eq` is not `const`, and [`setmask_wrap`] compares the opcode spelling at build time.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `setmask_wrap_` AS THE CONSTRUCTOR LEAVES IT — e377's effect, evaluated at build time.
+pub(crate) const SETMASK_WRAP: SetMaskWrap = setmask_wrap();
+
+/// `tree_.walk` AS e378 READS IT (`Analyses/RedundantDefinitionEliminationTree.hpp:352`) — one entry
+/// per parent node, holding that parent's children in tree order.
+///
+/// ⭐ THE TREE IS `Analyses/` WORK AND OUT OF CAMPAIGN SCOPE, so this is the minimum shape the body
+/// distinguishes: index 0 of a group is `getParentNode()->getFirstChild()`, and `&mut group[curr..]`
+/// is the `node` followed by its `getNextSibling()` chain that e193 and e194 both take.
+pub(crate) type SiblingGroups = [Vec<Option<DataflowGen>>];
+
+/// `RDETreeOptimizer`'S OTHER TWO OPTIMIZATIONS, which e378 calls per node
+/// (`Analyses/RedundantDefinitionEliminationTree.hpp:364-365`).
+///
+/// ⛔ BOTH ARE OUT OF CAMPAIGN SCOPE, so this is a trait for the reason
+/// [`SetSendDstRdeTreeOptimizer`](crate::transform::sentient::set_send_destination_re::set_send_dst_rde_tree::SetSendDstRdeTreeOptimizer)
+/// is one: e378's order, its first-child gate and its erasure are the port, and a test has to be able
+/// to observe them without inventing the base class.
+pub(crate) trait RdeTreeOptimizations {
+    /// `deadDefOptimization(n)` — every dead definition in the node's block.
+    fn dead_def_optimization(&mut self, siblings: &mut [Option<DataflowGen>]);
+
+    /// `redundancyOptimizations(n)` — the horizontal and vertical redundancy elimination.
+    fn redundancy_optimizations(&mut self, siblings: &mut [Option<DataflowGen>]);
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the base class is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OutOfScopeRdeTreeOptimizations;
+
+impl RdeTreeOptimizations for OutOfScopeRdeTreeOptimizations {
+    fn dead_def_optimization(&mut self, _siblings: &mut [Option<DataflowGen>]) {
+        todo!(
+            "RDETreeOptimizer::deadDefOptimization \
+             (Analyses/RedundantDefinitionEliminationTree.hpp:364) — out of campaign scope"
+        )
+    }
+
+    fn redundancy_optimizations(&mut self, _siblings: &mut [Option<DataflowGen>]) {
+        todo!(
+            "RDETreeOptimizer::redundancyOptimizations \
+             (Analyses/RedundantDefinitionEliminationTree.hpp:365) — out of campaign scope"
+        )
+    }
+}
+
+impl SetMaskRdeTreeOptimizer {
+    /// Replaces: e378_optimize
+    ///
+    /// Absorbs every `incrmask` into its `set_mask`, then — once per parent, on its first child —
+    /// removes the dead `incrmask`es and the dead definitions, then runs the redundancy optimizations;
+    /// finally erases every op recorded along the way and answers how many optimizations fired.
+    ///
+    /// ⛔ THE ORDER IS THE REFERENCE'S OWN ARGUMENT (`:315-326`): absorption creates dead-removal
+    /// opportunities and dead removal creates redundancy ones, so reversing it loses optimizations.
+    /// ⛔ THE DEAD-DEF HALF IS PER PARENT, NOT PER NODE — it clears the node's whole block, so it runs
+    /// on `getFirstChild()` alone; the absorption and the redundancy half run on every node.
+    /// ⛔ THE ROOT IS SKIPPED (`if (node == tree_.getRoot())`), which is why a [`SiblingGroups`] entry
+    /// holds children only. The `DEBUG_WITH_TYPE` dump is `-debug-only` output.
+    /// ⭐ THE ERASURE TAKES THE LIST AND GOES IN DESCENDING PATH ORDER, so removing one op cannot
+    /// shift an [`OpPath`] not yet erased — the reference erases through a pointer and needs neither.
+    pub(crate) fn optimize(
+        &mut self,
+        groups: &mut SiblingGroups,
+        scope: &mut UnitScope<'_>,
+        rest: &mut impl RdeTreeOptimizations,
+        values: &mut Values,
+    ) -> u32 {
+        for group in groups.iter_mut() {
+            for curr in 0..group.len() {
+                self.absorb_incr_mask(&mut group[curr..], scope, values);
+                if curr == 0 {
+                    self.dead_incr_mask_optimization(&mut group[curr..]);
+                    rest.dead_def_optimization(&mut group[curr..]);
+                }
+                rest.redundancy_optimizations(&mut group[curr..]);
+            }
+        }
+        let mut dead = core::mem::take(&mut self.to_be_deleted);
+        dead.sort_unstable_by(|a, b| b.path().cmp(a.path()));
+        dead.dedup();
+        for at in &dead {
+            erase_at(scope.body, at.path());
+        }
+        self.count
+    }
+}
+
+/// `dead->erase()` — removes the op an [`OpPath`] names, and answers `false` where it no longer names
+/// one at all.
+fn erase_at(root: &mut Vec<Op>, path: &[(u32, u32)]) -> bool {
+    let Some((&(_, index), rest)) = path.split_first() else {
+        return false;
+    };
+    let index = index as usize;
+    if rest.is_empty() {
+        if index >= root.len() {
+            return false;
+        }
+        root.remove(index);
+        return true;
+    }
+    let Some(op) = root.get_mut(index) else {
+        return false;
+    };
+    let (region, _) = rest[0];
+    match ir::regions_mut(op).into_iter().nth(region as usize) {
+        Some(region) => erase_at(region, rest),
+        None => false,
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-
-    fn wrap8() -> SetMaskWrap {
-        SetMaskWrap::of(NonZeroU32::new(8).expect("8 is not zero"))
-    }
 
     fn constant(result: Val, value: i64) -> Op {
         Op::Sentient(sentient::Op::ScalarConstant {
@@ -515,7 +681,7 @@ mod unit_tests {
     /// The header's own example: `incrmask; set_mask 4; vector_mac` loses the `incrmask`.
     #[test]
     fn an_incrmask_before_a_hard_set_is_dead() {
-        let mut optimizer = SetMaskRdeTreeOptimizer::of(wrap8(), true, true);
+        let mut optimizer = SetMaskRdeTreeOptimizer::of(true, true);
         let mut siblings = vec![
             Some(DataflowGen::IncrMask(incr_mask_gen(0))),
             Some(DataflowGen::SetMask(SetMaskGenValue::of(Val(0), at(2)))),
@@ -538,7 +704,7 @@ mod unit_tests {
         let mask = values.mint();
         let mut preamble = vec![constant(mask, 4)];
         let mut body = vec![set_mask(mask), incr_mask()];
-        let mut optimizer = SetMaskRdeTreeOptimizer::of(wrap8(), true, true);
+        let mut optimizer = SetMaskRdeTreeOptimizer::of(true, true);
         let mut siblings = vec![
             Some(DataflowGen::SetMask(SetMaskGenValue::of(mask, at(0)))),
             Some(DataflowGen::IncrMask(incr_mask_gen(1))),
@@ -568,7 +734,7 @@ mod unit_tests {
         let mask = values.mint();
         let mut preamble = vec![constant(mask, 6)];
         let mut body = vec![set_mask(mask), incr_mask(), incr_mask(), incr_mask()];
-        let mut optimizer = SetMaskRdeTreeOptimizer::of(wrap8(), true, true);
+        let mut optimizer = SetMaskRdeTreeOptimizer::of(true, true);
         let mut siblings = vec![
             Some(DataflowGen::SetMask(SetMaskGenValue::of(mask, at(0)))),
             Some(DataflowGen::IncrMask(incr_mask_gen(1))),
@@ -597,5 +763,74 @@ mod unit_tests {
             ]
         );
         assert_eq!(body[0], set_mask(Val(3)));
+    }
+
+    /// e377 — SETMASK's immediate field is 3 bits wide on the PT, so the mask value wraps at 8.
+    ///
+    /// ⭐ CORROBORATED INDEPENDENTLY OF THE TABLE WALK: the wrap the three tests above rely on is a
+    /// property of the instruction, and this states it as a number.
+    #[test]
+    fn the_set_mask_wrap_is_the_span_of_the_instruction_s_immediate_field() {
+        assert_eq!(SETMASK_WRAP.get(), 8);
+        assert_eq!(SetMaskRdeTreeOptimizer::of(true, true).setmask_wrap, SETMASK_WRAP);
+    }
+
+    /// A base class THAT DID NOTHING but remembers WHICH nodes reached each half — both are
+    /// `Analyses/` work, so that is their whole observable surface. The length of the chain a call
+    /// receives names the node's position in its group.
+    #[derive(Debug, Default)]
+    struct StatedOptimizations {
+        dead_def_on: Vec<usize>,
+        redundancy_on: Vec<usize>,
+    }
+
+    impl RdeTreeOptimizations for StatedOptimizations {
+        fn dead_def_optimization(&mut self, siblings: &mut [Option<DataflowGen>]) {
+            self.dead_def_on.push(siblings.len());
+        }
+
+        fn redundancy_optimizations(&mut self, siblings: &mut [Option<DataflowGen>]) {
+            self.redundancy_on.push(siblings.len());
+        }
+    }
+
+    /// e378 — two parents: the first absorbs its `incrmask` into its `set_mask`, the second's leading
+    /// `incrmask` dies before a hard set. Both recorded ops are then erased, deepest index first, and
+    /// the two out-of-scope halves see every node and every first child respectively.
+    #[test]
+    fn the_walk_absorbs_then_kills_then_erases_and_answers_the_count() {
+        let mut values = Values::default();
+        let mask = values.mint();
+        let mut preamble = vec![constant(mask, 4)];
+        let mut body = vec![set_mask(mask), incr_mask(), incr_mask(), set_mask(mask)];
+        let mut optimizer = SetMaskRdeTreeOptimizer::of(true, true);
+        let mut groups = vec![
+            vec![
+                Some(DataflowGen::SetMask(SetMaskGenValue::of(mask, at(0)))),
+                Some(DataflowGen::IncrMask(incr_mask_gen(1))),
+            ],
+            vec![
+                Some(DataflowGen::IncrMask(incr_mask_gen(2))),
+                Some(DataflowGen::SetMask(SetMaskGenValue::of(mask, at(3)))),
+            ],
+        ];
+        let mut rest = StatedOptimizations::default();
+
+        let count = optimizer.optimize(
+            &mut groups,
+            &mut UnitScope {
+                preamble: &mut preamble,
+                body: &mut body,
+            },
+            &mut rest,
+            &mut values,
+        );
+
+        assert_eq!(count, 2);
+        assert_eq!(preamble, [constant(mask, 4), constant(Val(1), 5)]);
+        assert_eq!(body, [set_mask(Val(1)), set_mask(mask)]);
+        assert_eq!(rest.dead_def_on, [2, 2], "once per parent, on its first child");
+        assert_eq!(rest.redundancy_on, [2, 1, 2, 1], "on every node");
+        assert!(optimizer.to_be_deleted().is_empty(), "the list is erased and taken");
     }
 }

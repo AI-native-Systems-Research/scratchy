@@ -86,6 +86,7 @@
 #![allow(dead_code)]
 
 use crate::islands::dataflow_ir::print;
+use super::set_mask_rde_tree_optimizer::DataflowGen;
 use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 use crate::transform::sentient::cfg_simplification_sentient_level::pattern_simplification_manager::OpPath;
 
@@ -237,10 +238,26 @@ impl SetMaskGenValue {
     }
 }
 
-// crustify:todo: e376_isEqual
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:235  (7 body lines, level 1)
-//   original  : bool SetMaskGenValue::isEqual(const DataFlowDefinitionBase &rhs) const
-//   calls     : e189_maskValuesAreEquivalent
+impl SetMaskGenValue {
+    /// Replaces: e376_isEqual
+    ///
+    /// Equal when the other definition is a `set_mask` one whose mask value is equivalent — the
+    /// `is_optimized_` bit is deliberately left out, and so is `op_`.
+    ///
+    /// ⛔ THE `dynamic_cast` FAILURE IS A REACHABLE ANSWER, NOT AN ABORT: `SetMaskRE` has TWO
+    /// subclasses, so an [`IncrMaskGenValue`](super::incr_mask_gen_value::IncrMaskGenValue) reaching
+    /// here is the reference's `return false`. That is why the parameter is the [`DataflowGen`] enum
+    /// and not a `&SetMaskGenValue` — unlike e187's `copyTo`, whose `assert` IS its parameter type.
+    /// ⛔ AN UNKNOWN VALUE IS EQUAL TO ANOTHER UNKNOWN ONE: e189 runs `a == b` first, so two `None`
+    /// mask values agree.
+    #[must_use]
+    pub(crate) fn is_equal(&self, rhs: &DataflowGen, defs: Definitions<'_>) -> bool {
+        let DataflowGen::SetMask(rhs) = rhs else {
+            return false;
+        };
+        SetMaskGenValue::mask_values_are_equivalent(self.mask_value, rhs.mask_value(), defs)
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -291,6 +308,43 @@ mod unit_tests {
         let mut plain = String::new();
         SetMaskGenValue::of(Val(7), OpPath::at(&[(0, 3)])).print(&mut plain);
         assert_eq!(plain, "(GenValue: value_:%7)");
+    }
+
+    /// e376 — a `set_mask` definition of an equivalent mask is equal; an `incrmask` definition never
+    /// is, however its own `isEqual` would have answered.
+    #[test]
+    fn only_an_equivalent_set_mask_definition_is_equal() {
+        let scope = vec![constant(1, 4), constant(2, 4), constant(3, 5)];
+        let module = [scope.as_slice()];
+        let defs = Definitions::from_innermost(&module);
+        let at = OpPath::at(&[(0, 3)]);
+        let value = SetMaskGenValue::of(Val(1), at.clone());
+
+        assert!(
+            value.is_equal(
+                &DataflowGen::SetMask(flagged(SetMaskGenValue::of(Val(2), OpPath::default()))),
+                defs
+            ),
+            "two constants of 4, and neither the flags nor `op_` take part"
+        );
+        assert!(
+            !value.is_equal(&DataflowGen::SetMask(SetMaskGenValue::of(Val(3), at)), defs),
+            "4 is not 5"
+        );
+        assert!(
+            !value.is_equal(
+                &DataflowGen::IncrMask(
+                    crate::transform::sentient::set_mask_re::incr_mask_gen_value::IncrMaskGenValue::unknown()
+                ),
+                defs
+            ),
+            "the failed `dynamic_cast` answers false"
+        );
+        assert!(
+            SetMaskGenValue::unknown()
+                .is_equal(&DataflowGen::SetMask(SetMaskGenValue::unknown()), defs),
+            "two unknown values are equivalent"
+        );
     }
 
     /// e189 — one value, two equal constants, and the three ways to be inequivalent.

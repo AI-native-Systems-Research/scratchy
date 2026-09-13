@@ -329,10 +329,26 @@ impl SetActiveMaskValueGenValue {
     }
 }
 
-// crustify:todo: e374_isEqual
-//   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:30  (8 body lines, level 1)
-//   original  : bool isEqual(const DataFlowDefinitionBase &rhs) const final override
-//   calls     : e184_maskValuesAreEquivalent
+impl SetActiveMaskValueGenValue {
+    /// Replaces: e374_isEqual
+    ///
+    /// Two SAMV definitions are equal when their mask values are equivalent AND their attribute
+    /// dictionaries agree, with the `is_optimized_` bit deliberately left out.
+    ///
+    /// ⛔ THE `DT_CHECK_MSG(rhs_p, ..)` IS THE PARAMETER TYPE and it can never have fired:
+    /// `SetActiveMaskValueGenValue` is this pass's ONLY `DataFlowDefinitionBase` subclass
+    /// (`SetActiveMaskValueRE.hpp:22-72`), so there is no sibling to mis-compare against.
+    /// ⛔ NOT `SetMaskGenValue::isEqual`'S SHAPE: that sibling ANSWERS `false` on a failed cast
+    /// (e376), because its pass has two subclasses. This one aborts, which is why the two ports take
+    /// different argument types.
+    /// ⛔ `is_dead_` IS ALSO LEFT OUT, though only `is_optimized_` is named in the comment — the
+    /// reference reads exactly two fields.
+    #[must_use]
+    pub(crate) fn is_equal(&self, rhs: &SetActiveMaskValueGenValue) -> bool {
+        SetActiveMaskValueGenValue::mask_values_are_equivalent(self.mask_value, rhs.mask_value())
+            && self.attrs.as_ref() == rhs.attrs()
+    }
+}
 
 /// `Statistic<"samv_re_count", "num-samv-eliminated", "Number of times SAMV operations removed or
 /// hoisted">` (`Transform/Sentient/Passes.td:57`).
@@ -554,6 +570,41 @@ mod unit_tests {
         assert!(SetActiveMaskValueGenValue::mask_values_are_equivalent(
             None, None
         ));
+    }
+
+    /// e374 — the mask value and the whole dictionary both have to agree, and neither base flag
+    /// takes part.
+    #[test]
+    fn equal_definitions_agree_on_the_mask_value_and_the_dictionary_only() {
+        let value = SetActiveMaskValueGenValue::of(Val(7), attrs(), samv(Val(7)));
+        assert!(value.is_equal(&flagged(value.clone())), "the flags stay out");
+        assert!(
+            !value.is_equal(&SetActiveMaskValueGenValue::of(
+                Val(8),
+                attrs(),
+                samv(Val(8))
+            )),
+            "a different mask value"
+        );
+        let mut renamed = attrs();
+        renamed.dbg_name = Some("other".to_owned());
+        assert!(
+            !value.is_equal(&SetActiveMaskValueGenValue::of(
+                Val(7),
+                renamed,
+                samv(Val(7))
+            )),
+            "dbgName is in the dictionary, hence in the equality"
+        );
+        assert!(
+            !value.is_equal(&SetActiveMaskValueGenValue::unknown()),
+            "a null dictionary is not this one"
+        );
+        assert!(
+            SetActiveMaskValueGenValue::unknown()
+                .is_equal(&SetActiveMaskValueGenValue::unknown()),
+            "two unknowns agree on both halves"
+        );
     }
 
     /// e473 — every unit is visited, and the tree it builds is out of campaign scope down to the

@@ -114,11 +114,6 @@ impl FlatExpr {
 }
 
 
-// crustify:todo: e372_areAllExprsValidToTransform
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:716  (50 body lines, level 1)
-//   original  : bool sentient::areAllExprsValidToTransform( std::vector<FlatExprType>& flat_exprs, SmallVector<unsigned>& indices, PropagationAnalysis::ExprInfoMap* result_info, bool is_load_store)
-//   calls     : e252_size
-
 /// WHICH CALLER `areAllExprsValidToTransform` ANSWERS FOR — its defaulted `bool is_load_store`
 /// (`:42`), whose effect is one further length limit (`:729`) and one further coefficient test
 /// (`:748`).
@@ -130,44 +125,133 @@ pub(super) enum ExprUse {
     LoadStore,
 }
 
-/// `sentient::areAllExprsValidToTransform` — e372, level 1, not yet ported.
+/// Replaces: e372_areAllExprsValidToTransform
 ///
-/// ⛔ IT IS e372 AND IT IS NOT PORTED YET: whether every unit's flattened expression is single,
-/// between 1 and 3 terms long, the same length as unit 0's, coefficients all 1, no constant on the
-/// 3-term case — and written over no induction variable.
+/// Every unit's flattened expression must be single, 1 to 3 terms long, exactly as long as unit 0's,
+/// have unit coefficients, no constant on the 3-term case, and be written over no induction variable.
+///
+/// ⛔ UNIT 0'S LENGTH IS THE DIMENSION SIZE and it is read BEFORE the `size() > 1` gate (`:721`), so
+/// the discriminator comes from unit 0 even when unit 0 is the one that fails.
+/// ⛔ THE 2-TERM CASE DOES NOT CHECK THE CONSTANT unless this is a load or store (`:756`); the 3-term
+/// case checks it always.
+/// ⛔ A LENGTH OF 0 IS A REFUSAL (`:743`), which is where an empty [`FlatExpr::first`] lands.
+#[must_use]
 pub(super) fn are_all_exprs_valid_to_transform(
     flat_exprs: &[FlatExpr],
     indices: &[usize],
     result_info: ExprInfoMap,
     use_of: ExprUse,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    defs: Definitions<'_>,
 ) -> bool {
-    let _ = (flat_exprs, indices, result_info, use_of);
-    todo!(
-        "areAllExprsValidToTransform (senpass e372, ScalarSimplifications.cpp:716) is not ported \
-         yet — the per-unit agreement of dimension size, coefficients and induction-variable freedom"
-    )
+    let dim_size = flat_exprs.first().map_or(0, |flat_expr| flat_expr.first().len());
+    for (unit_idx, flat_expr_at_idx) in flat_exprs.iter().enumerate() {
+        // We want only one expression.
+        if flat_expr_at_idx.0.len() > 1 {
+            return false;
+        }
+        let expression = flat_expr_at_idx.first();
+        // No symbols, so a 1-dim affine expression is always 2 long.
+        if use_of == ExprUse::LoadStore && expression.len() > 2 {
+            return false;
+        }
+        if dim_size != expression.len() {
+            return false;
+        }
+        let at = indices.get(unit_idx).copied().unwrap_or(0);
+        let mut over_an_iv = |arg_idx| {
+            propagated_arg_is_induction_variable(expr_prop_analysis, result_info, at, arg_idx, defs)
+        };
+        match expression.len() {
+            1 => {}
+            // `1 * variable + constant` — and an identity map for a load or store.
+            2 => {
+                if over_an_iv(0) || expression[0] != 1 {
+                    return false;
+                }
+                if use_of == ExprUse::LoadStore && expression[1] != 0 {
+                    return false;
+                }
+            }
+            // `1 * variable + 1 * variable + constant`, the constant being zero.
+            3 => {
+                if over_an_iv(0)
+                    || over_an_iv(1)
+                    || expression[2] != 0
+                    || expression[0] != 1
+                    || expression[1] != 1
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
-// crustify:todo: e373_areFlatExprsAndArgsIdentical
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:840  (29 body lines, level 1)
-//   original  : bool sentient::areFlatExprsAndArgsIdentical( std::vector<FlatExprType>& flat_exprs, SmallVector<unsigned>& indices, PropagationAnalysis::ExprInfoMap* result_info, unsigned dim_idx)
-//   calls     : e252_size
-
-/// `sentient::areFlatExprsAndArgsIdentical` — e373, level 1, not yet ported.
+/// `dcc::utils::isInductionVariable(result_info->getExprInfoAt(at)->propagated_args_[arg_idx])`
+/// (`Analyses/Utils.cpp:128-139`) — region argument 0 of a `sentient.for`.
 ///
-/// ⛔ IT IS e373 AND IT IS NOT PORTED YET: whether every unit's flattened expression AND every
-/// unit's propagated arguments agree, which is what lets one value stand for all of them.
+/// ⭐ AN ABSENT ARGUMENT IS NOT ONE: the reference's default-constructed `Value` fails
+/// `isa<BlockArgument>`, which is that function's first test.
+fn propagated_arg_is_induction_variable(
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    result_info: ExprInfoMap,
+    at: usize,
+    arg_idx: usize,
+    defs: Definitions<'_>,
+) -> bool {
+    propagated_arg(expr_prop_analysis, result_info, at, arg_idx)
+        .is_some_and(|arg| matches!(defs.for_arg_of(arg), Some((_, 0))))
+}
+
+/// Replaces: e373_areFlatExprsAndArgsIdentical
+///
+/// Whether every unit agrees with unit 0 on the expression's length, on the coefficient at `dim_idx`
+/// and on the propagated arguments — which is what lets one value stand for all of them.
+///
+/// ⛔ ONLY THE `dim_idx` COEFFICIENT IS COMPARED (`:855`), not the whole expression: two units may
+/// differ in their constant term and still be identical here.
+/// ⛔ THE ARGUMENT COUNT COMPARED COMES FROM THE UNIT'S OWN LENGTH (`:862`, `:866`) — 2 terms compare
+/// one argument, 3 compare two, and 1 compares none.
+#[must_use]
 fn are_flat_exprs_and_args_identical(
     flat_exprs: &[FlatExpr],
     indices: &[usize],
     result_info: ExprInfoMap,
     dim_idx: usize,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
 ) -> bool {
-    let _ = (flat_exprs, indices, result_info, dim_idx);
-    todo!(
-        "areFlatExprsAndArgsIdentical (senpass e373, ScalarSimplifications.cpp:840) is not ported \
-         yet — the per-unit comparison of both the flattened expression and the propagated args"
-    )
+    let Some(first_flat_expr) = flat_exprs.first().map(FlatExpr::first) else {
+        todo!(
+            "areFlatExprsAndArgsIdentical: DT_CHECK(num_flat_exprs > 1) \
+             (ScalarSimplifications.cpp:845) — no flattened expression at all"
+        )
+    };
+    let first_at = indices.first().copied().unwrap_or(0);
+    for (unit_idx, flat_expr_at_idx) in flat_exprs.iter().enumerate().skip(1) {
+        let flat_expr_at_idx = flat_expr_at_idx.first();
+        // Expression dimensions, then the dimension's coefficient.
+        if flat_expr_at_idx.len() != first_flat_expr.len() {
+            return false;
+        }
+        if flat_expr_at_idx.get(dim_idx) != first_flat_expr.get(dim_idx) {
+            return false;
+        }
+        let at = indices.get(unit_idx).copied().unwrap_or(0);
+        let mut same_arg = |arg_idx| {
+            propagated_arg(expr_prop_analysis, result_info, at, arg_idx)
+                == propagated_arg(expr_prop_analysis, result_info, first_at, arg_idx)
+        };
+        if flat_expr_at_idx.len() >= 2 && !same_arg(0) {
+            return false;
+        }
+        if flat_expr_at_idx.len() == 3 && !same_arg(1) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Replaces: e472_createNewOpOrMap
@@ -202,7 +286,13 @@ pub(crate) fn create_new_op_or_map(
     let first_flat_expr = flat_exprs.first().map(FlatExpr::first).unwrap_or(&[]);
     let first_flat_expr_size = first_flat_expr.len();
     if flat_exprs.len() == 1
-        || are_flat_exprs_and_args_identical(flat_exprs, indices, result_info, operand_idx)
+        || are_flat_exprs_and_args_identical(
+            flat_exprs,
+            indices,
+            result_info,
+            operand_idx,
+            expr_prop_analysis,
+        )
     {
         match first_flat_expr_size {
             1 => return sink_constant(scope, const_sink, first_flat_expr[0], ty, values),
@@ -639,12 +729,15 @@ fn simplify_pre_order(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ConstSink, FlatExpr, Propagation, create_new_op_or_map,
+        ConstSink, ExprUse, FlatExpr, Propagation, are_all_exprs_valid_to_transform,
+        are_flat_exprs_and_args_identical, create_new_op_or_map,
         light_weight_simplify_binary_arithmetic, run_old_light_weight_simplifications,
     };
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::{Op, Val, operands, sentient as ops};
+    use crate::islands::sentient::dialects::{
+        Definitions, Op, Val, operands, sentient as ops, uniform,
+    };
     use crate::transform::sentient::analyses::{
         ExprInfoMap, OutOfScopePropagationAnalysis, OutOfScopeUnitIndexMap, PropagationAnalysis,
     };
@@ -742,24 +835,185 @@ mod unit_tests {
         assert_eq!(scope.len(), 2);
     }
 
-    /// e472 — more than one unit asks whether every unit agrees, which is e373 and not ported.
+    /// e472 — units whose expressions disagree (e373) take the mapping path: one constant per unit,
+    /// a `uniform.def_immutable_mapping` pairing them with the units, and a `uniform.query_map`.
     #[test]
-    #[should_panic(expected = "senpass e373")]
-    fn several_units_reach_the_unported_identical_expression_test() {
+    fn several_disagreeing_units_become_a_mapping_read_back_by_a_query() {
         let mut scope = vec![Op::Sentient(ops::Op::Nop { dbg_name: None })];
-        create_new_op_or_map(
-            &mut scope,
-            0,
-            &[FlatExpr(vec![vec![7]]), FlatExpr(vec![vec![9]])],
-            &[0, 1],
-            &[Val(80), Val(82)],
-            ExprInfoMap(0),
-            0,
-            ScalarTy::Index,
-            Val(81),
-            &mut StatedAnalysis,
-            &mut ConstSink::default(),
-            &mut values_after(10),
+        assert_eq!(
+            create_new_op_or_map(
+                &mut scope,
+                0,
+                &[FlatExpr(vec![vec![7]]), FlatExpr(vec![vec![9]])],
+                &[0, 1],
+                &[Val(80), Val(82)],
+                ExprInfoMap(0),
+                0,
+                ScalarTy::Index,
+                Val(81),
+                &mut StatedAnalysis,
+                &mut ConstSink::default(),
+                &mut values_after(10),
+            ),
+            Val(13)
+        );
+        assert!(matches!(
+            scope[0],
+            Op::Sentient(ops::Op::ScalarConstant { value: 7, .. })
+        ));
+        assert!(matches!(
+            scope[1],
+            Op::Sentient(ops::Op::ScalarConstant { value: 9, .. })
+        ));
+        assert_eq!(
+            scope[2],
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(12),
+                pairs: vec![(Val(80), Val(10)), (Val(82), Val(11))],
+            })
+        );
+        assert_eq!(
+            scope[3],
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(13),
+                map: Val(12),
+                key: Val(81),
+            })
+        );
+    }
+
+    /// A `sentient.for %<iv> = %9` over an empty body, so `%<iv>` is region argument 0 of a loop.
+    fn for_over(iv: u32) -> Op {
+        Op::Sentient(ops::Op::For {
+            iv: Val(iv),
+            bound: Val(9),
+            bound_reg: None,
+            carried: Vec::new(),
+            dbg_name: None,
+            body: Vec::new(),
+        })
+    }
+
+    /// e372 — the three accepted lengths, and each refusal: a second expression, a length unit 0 does
+    /// not have, a coefficient that is not 1, a non-zero 3-term constant, a load/store's two extra
+    /// limits, and a propagated argument that is a loop's induction variable.
+    ///
+    /// [`StatedAnalysis`] answers `[Val(50 + at), Val(60 + at)]`, so unit-index 2 reads neither loop's
+    /// induction variable, index 0 reads `%50` as argument 0 and index 1 reads `%61` as argument 1.
+    #[test]
+    fn every_unit_agrees_on_the_length_carries_unit_coefficients_and_avoids_an_induction_variable() {
+        let scope = vec![for_over(50), for_over(61)];
+        let regions: [&[Op]; 1] = [&scope];
+        let defs = Definitions::from_innermost(&regions);
+        let valid = |flat_exprs: &[FlatExpr], indices: &[usize], use_of| {
+            are_all_exprs_valid_to_transform(
+                flat_exprs,
+                indices,
+                ExprInfoMap(0),
+                use_of,
+                &mut StatedAnalysis,
+                defs,
+            )
+        };
+
+        assert!(valid(&[FlatExpr(vec![vec![7]])], &[2], ExprUse::LoadStore), "a constant");
+        assert!(
+            valid(&[FlatExpr(vec![vec![1, 0]])], &[2], ExprUse::LoadStore),
+            "an identity map"
+        );
+        assert!(
+            valid(
+                &[FlatExpr(vec![vec![1, 1, 0]]), FlatExpr(vec![vec![1, 1, 0]])],
+                &[2, 2],
+                ExprUse::BinaryOperation
+            ),
+            "two variables and no constant"
+        );
+
+        assert!(
+            !valid(&[FlatExpr(vec![vec![1, 0], vec![1, 0]])], &[2], ExprUse::BinaryOperation),
+            "only one expression"
+        );
+        assert!(
+            !valid(&[FlatExpr(Vec::new())], &[2], ExprUse::BinaryOperation),
+            "an empty expression"
+        );
+        assert!(
+            !valid(
+                &[FlatExpr(vec![vec![1, 0]]), FlatExpr(vec![vec![1, 1, 0]])],
+                &[2, 2],
+                ExprUse::BinaryOperation
+            ),
+            "unit 0's length is every unit's length"
+        );
+        assert!(
+            !valid(&[FlatExpr(vec![vec![2, 0]])], &[2], ExprUse::BinaryOperation),
+            "the variable's coefficient has to be 1"
+        );
+        assert!(
+            !valid(&[FlatExpr(vec![vec![1, 1, 3]])], &[2], ExprUse::BinaryOperation),
+            "the 3-term constant has to be zero"
+        );
+        assert!(
+            valid(&[FlatExpr(vec![vec![1, 5]])], &[2], ExprUse::BinaryOperation),
+            "a binary operation keeps its constant"
+        );
+        assert!(
+            !valid(&[FlatExpr(vec![vec![1, 5]])], &[2], ExprUse::LoadStore),
+            "an address operand may not"
+        );
+        assert!(
+            !valid(&[FlatExpr(vec![vec![1, 1, 0]])], &[2], ExprUse::LoadStore),
+            "nor may it have 3 terms"
+        );
+
+        assert!(
+            !valid(&[FlatExpr(vec![vec![1, 0]])], &[0], ExprUse::BinaryOperation),
+            "%50 is a loop's induction variable"
+        );
+        assert!(
+            valid(&[FlatExpr(vec![vec![1, 0]])], &[1], ExprUse::BinaryOperation),
+            "and the 2-term case looks at argument 0 only"
+        );
+        assert!(
+            !valid(&[FlatExpr(vec![vec![1, 1, 0]])], &[1], ExprUse::BinaryOperation),
+            "which the 3-term case does not — %61 is one too"
+        );
+    }
+
+    /// e373 — units are identical when the expression length, the `dim_idx` coefficient AND the
+    /// propagated arguments all agree; the constant term of a 2-term expression takes no part.
+    #[test]
+    fn identical_means_the_length_the_dim_coefficient_and_the_arguments_all_agree() {
+        let identical = |flat_exprs: &[FlatExpr], indices: &[usize], dim_idx| {
+            are_flat_exprs_and_args_identical(
+                flat_exprs,
+                indices,
+                ExprInfoMap(0),
+                dim_idx,
+                &mut StatedAnalysis,
+            )
+        };
+
+        assert!(
+            identical(&[FlatExpr(vec![vec![7]]), FlatExpr(vec![vec![7]])], &[0, 1], 0),
+            "a 1-term expression compares no argument at all"
+        );
+        assert!(
+            !identical(&[FlatExpr(vec![vec![7]]), FlatExpr(vec![vec![9]])], &[0, 1], 0),
+            "7 is not 9"
+        );
+        assert!(
+            identical(&[FlatExpr(vec![vec![1, 4]]), FlatExpr(vec![vec![1, 8]])], &[0, 0], 0),
+            "the constant term is not the dim_idx coefficient"
+        );
+        assert!(
+            !identical(&[FlatExpr(vec![vec![1, 4]]), FlatExpr(vec![vec![1, 4]])], &[0, 1], 0),
+            "unit 1 propagates its own argument"
+        );
+        assert!(
+            !identical(&[FlatExpr(vec![vec![1, 4]]), FlatExpr(vec![vec![1, 1, 0]])], &[0, 0], 0),
+            "the lengths differ"
         );
     }
 

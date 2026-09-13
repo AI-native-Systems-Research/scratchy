@@ -320,12 +320,18 @@ pub fn simplify_binary_operation(
         }
         flat_exprs.push(sentient::FlatExpr(flattened.rows));
     }
-    if !sentient::are_all_exprs_valid_to_transform(
-        &flat_exprs,
-        &unit_indices,
-        expr_info_map,
-        sentient::ExprUse::BinaryOperation,
-    ) {
+    let valid = {
+        let regions: [&[Op]; 1] = [scope];
+        sentient::are_all_exprs_valid_to_transform(
+            &flat_exprs,
+            &unit_indices,
+            expr_info_map,
+            sentient::ExprUse::BinaryOperation,
+            expr_prop_analysis,
+            Definitions::from_innermost(&regions),
+        )
+    };
+    if !valid {
         return;
     }
     let first_coeffs: Vec<i64> = flat_exprs
@@ -524,12 +530,18 @@ fn simplified_value(
         }
         flat_exprs.push(sentient::FlatExpr(flattened.rows));
     }
-    if !sentient::are_all_exprs_valid_to_transform(
-        &flat_exprs,
-        unit_indices,
-        expr_info_map,
-        sentient::ExprUse::LoadStore,
-    ) {
+    let valid = {
+        let regions: [&[Op]; 1] = [scope];
+        sentient::are_all_exprs_valid_to_transform(
+            &flat_exprs,
+            unit_indices,
+            expr_info_map,
+            sentient::ExprUse::LoadStore,
+            expr_prop_analysis,
+            Definitions::from_innermost(&regions),
+        )
+    };
+    if !valid {
         return None;
     }
     // `getFirstExprInfo()` (`:456-457`) — either a direct variable or a constant. ⛔ THE FIRST
