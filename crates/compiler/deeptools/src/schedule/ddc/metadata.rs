@@ -737,6 +737,9 @@ pub enum DdcMemory {
     Lx,
     /// `L0`.
     L0,
+    /// `L0_SCALE` — the scale half of a scaled L0 allocation, which entry 258 places alongside `L0`
+    /// but under a different tracker (`ddc/ddcv1.cpp:184-190`).
+    L0Scale,
     /// `PELRF`.
     PeLrf,
     /// `SFPLRF`.

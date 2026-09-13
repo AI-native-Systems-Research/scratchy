@@ -2738,7 +2738,7 @@ mod tests_e161_e164 {
     use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::AllocId;
     use crate::schedule::ddc::metadata::OwnedAllocateNode;
-    use crate::schedule::dsc2::{ComputeNode, DataInfo, NodeName};
+    use crate::schedule::dsc2::{ComputeNode, DataInfo, InstrAttribute, NodeName};
     use crate::units::NumFolds;
     use std::collections::BTreeSet;
     use sys_arch_spec::arch_enums::SenComponent;
@@ -2848,6 +2848,8 @@ mod tests_e161_e164 {
             inputs: Vec::new(),
             outputs: Vec::new(),
             num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
         });
         let mut edge = DataEdge {
             dinfo: DataInfo::default(),
