@@ -604,6 +604,26 @@ pub struct StoredConstraint {
     pub cannot_be_symbolic: bool,
 }
 
+impl StoredConstraint {
+    /// [`Constraint::update_min`] over the stored spelling, where `min_`'s double role as the
+    /// multiple is already one field and so needs no [`AbsoluteMin`] fold.
+    pub fn update_min(&mut self, new_val: f32) {
+        self.min = Some(self.min.map_or(new_val, |min| stricter_min(min, new_val)));
+    }
+
+    /// [`Constraint::update_max`] over the stored spelling.
+    pub fn update_max(&mut self, new_val: f32) {
+        self.max = Some(self.max.map_or(new_val, |max| stricter_max(max, new_val)));
+    }
+
+    /// `updateValues` ON THE STORED SIDE (`ddc/ddc_metadata.h:46`) — the same intersect entry 098
+    /// performs, reached through [`Datastage::constraint_mut`] by the transformations that WRITE
+    /// `constraints_` rather than check it.
+    pub fn update_values(&mut self, new_vals: &[f32]) {
+        intersect_values(&mut self.values, new_vals);
+    }
+}
+
 impl Default for StoredConstraint {
     fn default() -> Self {
         Self {
@@ -616,22 +636,17 @@ impl Default for StoredConstraint {
     }
 }
 
-impl StoredConstraint {
-    /// `updateValues` ON THE STORED SIDE (`ddc/ddc_metadata.h:46`) — the same intersect entry 098
-    /// performs, reached through [`Datastage::constraint_mut`] by the transformations that WRITE
-    /// `constraints_` rather than check it.
-    pub fn update_values(&mut self, new_vals: &[f32]) {
-        intersect_values(&mut self.values, new_vals);
-    }
-}
-
 /// ONE DATASTAGE'S EXPLORATION STATE — `Metadata::Datastage` (`ddc/ddc_metadata.h:32`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Datastage {
     /// `constraints_` (:73-76) — outer key is the REFERENCE datastage, [`None`] for the `-1`
     /// absolute constraints; the inner `std::map` key is a [`DimSet`], which has no ordering of its
     /// own here.
-    pub constraints: BTreeMap<Option<DatastageId>, Vec<(DimSet, StoredConstraint)>>,
+    ///
+    /// ⛔ [`None`] IS THE EMPTY DIM KEY, which `constraints_[refDsId][{}]` states whenever every dim
+    /// the op named was dropped or was a direct meta value: [`check_constraints`] can never read one
+    /// (it wants `dims.count(dim)`), and only `dump` observes it.
+    pub constraints: BTreeMap<Option<DatastageId>, Vec<(Option<DimSet>, StoredConstraint)>>,
     /// `strategyMinimize_` (:77), whose `// false == maximize` comment is this enum.
     pub strategy: Strategy,
     /// `allowEpilogue_` (:78).
@@ -661,11 +676,11 @@ impl Datastage {
     ///
     /// ⛔ THE INNER KEY IS MATCHED WHOLE, AND AS A SET: `{x, y}` and `{y, x}` are ONE entry while
     /// `{x}` is another. [`DimSet::of`] sorts and deduplicates, so equality of the key IS equality of
-    /// the set the reference's `std::set<DimId>` compares.
+    /// the set the reference's `std::set<DimId>` compares, and [`None`] is the empty key.
     pub fn constraint_mut(
         &mut self,
         reference: Option<DatastageId>,
-        dims: DimSet,
+        dims: Option<DimSet>,
     ) -> &mut StoredConstraint {
         let entries = self.constraints.entry(reference).or_default();
         let at = match entries.iter().position(|(keyed, _)| *keyed == dims) {

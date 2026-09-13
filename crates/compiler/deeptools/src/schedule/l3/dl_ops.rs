@@ -2871,7 +2871,7 @@ mod tests_e041_e048 {
     use crate::arch::Bytes;
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent;
     use crate::schedule::ddc::metadata::DatastageId;
-    use crate::schedule::dsc2::{LayoutDims, NodeName, SchedNode};
+    use crate::schedule::dsc2::{LayoutDims, LoopNode, NodeName, SchedNode};
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DscList, LabeledDsList, NamedDims,
         SelectedCandidate, StageDims, WkSliceId,
@@ -3057,10 +3057,10 @@ mod tests_e041_e048 {
         };
         let mut tree = ScheduleTree::new(BlockNode {
             name: NodeName("head".to_owned()),
-            children: vec![SchedNode::Loop(BlockNode {
+            children: vec![SchedNode::Loop(Box::new(LoopNode::bare(BlockNode {
                 name: NodeName("loop_ds0_ds1".to_owned()),
                 children: vec![SchedNode::Block(named)],
-            })],
+            })))],
         });
         let found = lx_below_block_node(&mut tree).expect("the lx-below block");
         found

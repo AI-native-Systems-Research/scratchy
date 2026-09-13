@@ -189,7 +189,7 @@ use crate::schedule::l3::dsc::SymbolicDimInfo;
 use crate::arch::{Arch, Bytes};
 use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{DimSet, NoEpilogueDimKind};
-use crate::generated::{ComputeType, Strategy};
+use crate::generated::Strategy;
 use crate::schedule::ddc::fold::DataOrigin;
 use crate::schedule::ddc::metadata::{DdcMemory, LoopMultiple, StoredConstraint};
 use crate::schedule::ddc::shuffle::StickRepl;
@@ -199,6 +199,7 @@ use crate::schedule::ddc::transformation_util::{
     construct_datastage_from, construct_loop_node, memory_component, split_loop_band_on_datastage,
 };
 use crate::schedule::ddc::v1::{CoreClSet, StorageName};
+use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::dsc2::{
     DataInfo, Dsts, InstrAttribute, LayoutDims, ReplicationFactor, SyncDirection, SyncNode,
     SyncStrength, TransferPadding,
@@ -1825,14 +1826,17 @@ where
         bot_ds.strategy = Strategy::Maximize;
         let old_sizes: Vec<f32> = stick_dims.iter().map(|&(_, size)| size.0 as f32).collect();
         force_unpadded(
-            bot_ds.constraint_mut(None, stick_dim_key.clone()),
+            bot_ds.constraint_mut(None, Some(stick_dim_key.clone())),
             &old_sizes,
         );
         for entry in parent_dims.iter() {
             if stick_dim_key.contains(entry.dim) {
                 continue;
             }
-            force_unpadded(bot_ds.constraint_mut(None, DimSet::single(entry.dim)), &[1.0]);
+            force_unpadded(
+                bot_ds.constraint_mut(None, Some(DimSet::single(entry.dim))),
+                &[1.0],
+            );
         }
     }
 
@@ -1865,11 +1869,11 @@ where
             }
             match new_stick_dims.iter().find(|&&(held, _)| held == entry.dim) {
                 Some(&(dim, size)) => force_unpadded(
-                    split_ds.constraint_mut(None, DimSet::single(dim)),
+                    split_ds.constraint_mut(None, Some(DimSet::single(dim))),
                     &sized(size),
                 ),
                 None => force_unpadded(
-                    split_ds.constraint_mut(None, DimSet::single(entry.dim)),
+                    split_ds.constraint_mut(None, Some(DimSet::single(entry.dim))),
                     &[1.0],
                 ),
             }
@@ -1894,7 +1898,7 @@ where
                     .datastages
                     .entry(chunk)
                     .or_default()
-                    .constraint_mut(None, DimSet::single(dim)),
+                    .constraint_mut(None, Some(DimSet::single(dim))),
                 &sized(size),
             );
         }
@@ -1903,7 +1907,7 @@ where
                 .datastages
                 .entry(parent_den)
                 .or_default()
-                .constraint_mut(None, DimSet::single(dim)),
+                .constraint_mut(None, Some(DimSet::single(dim))),
             &sized(size),
         );
     }
@@ -2272,7 +2276,7 @@ fn dummy_fma(name: NodeName, input: DataInfo, constant: DataInfo, output: DataIn
     };
     ComputeNode {
         name,
-        op: ComputeType::Fma16,
+        op: DdlComputeType::Fma16,
         ex_unit: SenComponent::Sfp,
         inputs: vec![
             operand(SenComponent::Lxlu, input),
@@ -2672,7 +2676,7 @@ where
 #[cfg(test)]
 mod tests_e105_e109 {
     use super::*;
-    use crate::generated::ComputeType;
+    use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
         DataInfo, Dsts, InstrAttribute, NumChunks, ReplicationFactor, TransferPadding,
     };
@@ -2740,7 +2744,7 @@ mod tests_e105_e109 {
     fn compute_on(ex_unit: SenComponent, connect: DataConnect) -> ComputeNode {
         ComputeNode {
             name: NodeName("recip".to_owned()),
-            op: ComputeType::Macc,
+            op: DdlComputeType::Macc,
             ex_unit,
             inputs: vec![operand(ex_unit, Some(connect), Some(0))],
             outputs: vec![operand(ex_unit, Some(connect), Some(0))],
@@ -2988,7 +2992,7 @@ mod tests_e105_e109 {
 #[cfg(test)]
 mod tests_e242_e246 {
     use super::*;
-    use crate::generated::ComputeType;
+    use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
         DataInfo, Dsts, InstrAttribute, NumChunks, ReplicationFactor, TransferPadding,
     };
@@ -3018,7 +3022,7 @@ mod tests_e242_e246 {
     ) -> ComputeNode {
         ComputeNode {
             name: NodeName("c".to_owned()),
-            op: ComputeType::Macc,
+            op: DdlComputeType::Macc,
             ex_unit,
             inputs,
             outputs,
@@ -3575,7 +3579,7 @@ mod tests_e300 {
         fn compute(&self, _compute: NodeId) -> ComputeNode {
             ComputeNode {
                 name: NodeName("recip".to_owned()),
-                op: ComputeType::Macc,
+                op: DdlComputeType::Macc,
                 ex_unit: SenComponent::Sfp,
                 inputs: vec![operand(SenComponent::Sfp, Some(0))],
                 outputs: vec![operand(SenComponent::Sfp, Some(1))],

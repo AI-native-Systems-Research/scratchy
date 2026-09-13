@@ -25,11 +25,12 @@ use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 use crate::arch::{Bytes, Elements, Sticks};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::formats::DataFormat;
-use crate::generated::{ComputeType, DataConnect, RegName};
+use crate::generated::{DataConnect, Mode, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{ConstIdx, NodeId, PadType};
-use crate::schedule::ddc::metadata::DatastageId;
+use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::LoopId;
+use crate::schedule::ddl::ops::DdlComputeType;
 use crate::units::{Core, Corelet, NumFolds};
 
 impl PrimaryDim {
@@ -68,46 +69,6 @@ impl PrimaryDim {
             Self::Ki => "ki",
             Self::Kj => "kj",
             Self::X1 => "x1",
-        }
-    }
-}
-
-impl ComputeType {
-    /// `EnumsConversion::computeTypeToString` (`dsc/dscdefn.cpp:34`), which is what the dsc-side debug
-    /// prints and JSON carry.
-    ///
-    /// ⛔ NOT the generated [`ComputeType::spelling`] — that one is the DDL template's own spelling,
-    /// which is UPPERCASE (`MACC`), and the two are different strings for one op.
-    /// ⛔ NO `_` ARM: a compute type entering the census has to be given its C++ spelling here. That
-    /// is also why the reference's `computeTypeToString.at(type_)` throw is unreachable rather than
-    /// mapped — the one op with no entry, `FCVT`, is not in the census.
-    #[must_use]
-    pub const fn cpp_spelling(self) -> &'static str {
-        match self {
-            Self::Assign => "assign",
-            Self::Equal => "equal",
-            Self::Fabsmax => "fabsmax",
-            Self::Fest => "fest",
-            Self::Floor => "floor",
-            Self::Fma16 => "fma16",
-            Self::Fma32 => "fma32",
-            Self::Fmax => "fmax",
-            Self::Fmin => "fmin",
-            Self::Fmul => "fmul",
-            Self::Fnms => "fnms",
-            Self::Greaterequal => "greaterequal",
-            Self::Greaterthan => "greaterthan",
-            Self::Icvt => "icvt",
-            Self::Lesserequal => "lesserequal",
-            Self::Lesserthan => "lesserthan",
-            Self::Macc => "macc",
-            Self::Notequal => "notequal",
-            Self::Or => "or",
-            Self::Packmerge => "packmerge",
-            Self::Reduce => "reduce",
-            Self::Select => "select",
-            Self::Shuffle => "shuffle",
-            Self::Splat => "splat",
         }
     }
 }
@@ -608,7 +569,10 @@ impl StartAddress {
     /// The same write with ONE ADDRESS PER REMAINING FOLD COORDINATE, innermost coordinate first —
     /// entry 222's `addrIt++` walk over `getFlattenedCoordinates({{0, 0}, {1, 0}})`.
     pub fn insert_spread(&mut self, core: Core, corelet: Corelet, addresses: Vec<Bytes>) {
-        self.placed.entry(core).or_default().insert(corelet, addresses);
+        self.placed
+            .entry(core)
+            .or_default()
+            .insert(corelet, addresses);
     }
 
     /// `getSingleData({{0, core}, {1, corelet}})`, absent where nothing was placed there.
@@ -885,8 +849,56 @@ impl RegSlot {
     }
 }
 
+/// HOW MANY SLICES A COMPUTE INSTRUCTION REPEATS OVER — `InstrAttribute::repetition_`
+/// (`dsc/dsc2.h:923`), whose default EIGHT is *"default 8 slices works the same"* and not zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Repetition(pub u32);
+
+impl Repetition {
+    /// `repetition_ = 8`.
+    pub const ALL_SLICES: Self = Self(8);
+}
+
+impl Default for Repetition {
+    /// A fresh `InstrAttribute` carries eight, and every reader of it wants that rather than none.
+    fn default() -> Self {
+        Self::ALL_SLICES
+    }
+}
+
+/// ONE ENTRY OF A PACK/MERGE MAPPING — one `InstrAttribute::indices_` element (`dsc/dsc2.h:922`),
+/// whose `-1` is the reference's own *"zero/sign extend"* marker and NOT a slice position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PackIndex {
+    /// `-1` — zero- or sign-extend rather than take a slice.
+    Extend,
+    /// A slice of the source stick.
+    Slice(u32),
+}
+
+/// WHICH LANES OF A COMPUTE INSTRUCTION ARE LIVE — `InstrAttribute::compute_mask_`
+/// (`dsc/dsc2.h:916`), whose initialiser 255 is *all eight* and not *none*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ComputeMask(pub u32);
+
+impl ComputeMask {
+    /// `compute_mask_ = 255`.
+    pub const ALL: Self = Self(255);
+}
+
+impl Default for ComputeMask {
+    /// A fresh `InstrAttribute` states every lane, and every reader of it wants that rather than none.
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 /// AN OPAQUE OP'S BOUND INSTRUCTION STATE — `ComputeNode::instrAttribute_` (`dsc/dsc2.h:905-939`)
-/// narrowed to the four things entry 261 writes.
+/// narrowed to the four things entry 261 writes, plus the three `ddl.compute` states entry 323 sets.
+///
+/// ⛔ NO CENSUSED `ddl.compute` STATES A `mask=`, so [`Self::compute_mask`] is invariably the
+/// reference's own 255 initialiser — but entry 323 writes the slot and entry 325 reads it back out,
+/// so the slot itself is not droppable.
 ///
 /// ⭐ THE PARAM MAP IS TWO TYPED FIELDS AND NOT A `map<string, string>`: the reference stores an
 /// unroll factor and a precision under fixed keys, and both are closed values.
@@ -900,6 +912,25 @@ pub struct InstrAttribute {
     pub read_write_regs: BTreeMap<RegName, RegSlot>,
     /// `read_only_reg_map_` — the input/output registers.
     pub read_only_regs: BTreeMap<RegName, RegSlot>,
+    /// `mode_` (`dsc/dsc2.h:930`) — the general SRC1/IMM field, once its `-1` default is an [`Option`].
+    pub mode: Option<Mode>,
+    /// `compute_mask_` (`dsc/dsc2.h:916`) — `mask=` where a template states one.
+    pub compute_mask: ComputeMask,
+    /// `repetition_` (`dsc/dsc2.h:923`).
+    pub repetition: Repetition,
+    /// `indices_` (`dsc/dsc2.h:922`) — the PACK/MERGE mapping, empty where the op states none.
+    pub indices: Vec<PackIndex>,
+    /// `param_map_` MINUS its two fixed keys — a `ddl.opaque`'s `params=`, copied through
+    /// (`ddc/ddl/ddl_conversion.cpp:2674-2690`).
+    ///
+    /// ⭐ NO OVERLAP WITH [`Self::unroll`] OR [`Self::precision`]: those two are `"unroll"` and
+    /// `"prec"`, which entry 261 writes from the compute's own state, and no vendored template
+    /// spells either as a `params=` key.
+    pub params: BTreeMap<ParamKey, ParamValue>,
+    /// `input_data_connects_` (`dsc/dsc2.h:936`) — which ports a spliced opaque body reads.
+    pub input_data_connects: Vec<DataConnect>,
+    /// `output_data_connects_` (`dsc/dsc2.h:938`).
+    pub output_data_connects: Vec<DataConnect>,
 }
 
 impl Default for Unroll {
@@ -914,9 +945,10 @@ impl Default for Unroll {
 pub struct ComputeNode {
     /// `name_`.
     pub name: NodeName,
-    /// `type_` — the crate's censused compute set, whose `spelling()` is
-    /// `EnumsConversion::computeTypeToString` for every member of it.
-    pub op: ComputeType,
+    /// `type_` — the dialect's whole recognised compute set, because the MACC resolution entry 323
+    /// performs names `IMA4`/`IMA8`/`FMA8`/`FMA4`, which no `computetype=` spells and the census
+    /// therefore cannot express.
+    pub op: DdlComputeType,
     /// `exUnit_`.
     pub ex_unit: SenComponent,
     /// `inputs_` zipped with `inputsLdsAndLoopOffsets_`.
@@ -1201,6 +1233,71 @@ impl BlockNode {
         let pos = (at.0 + 1).min(self.children.len());
         self.children.insert(pos, node);
         ChildPos(pos)
+    }
+
+    /// `addChildNode(node, /*addFront=*/false)` — append, which is where a walk in program order puts
+    /// every node it mints.
+    pub fn add_child(&mut self, node: SchedNode) -> ChildPos {
+        self.children.push(node);
+        ChildPos(self.children.len() - 1)
+    }
+
+    /// `addChildNode(node, /*addFront=*/true)` — the allocation case, whose node has to precede the
+    /// transfers already in the block it lands in (`ddl_conversion.cpp:713-716`).
+    pub fn add_child_front(&mut self, node: SchedNode) -> ChildPos {
+        self.children.insert(0, node);
+        ChildPos(0)
+    }
+}
+
+/// ONE DIM A LOOP ITERATES — `LoopNode::dims_`, paired with the META KIND the DDL dim it came from
+/// carried, because that pair is what `convertDsc2Ddl` matches a loop back to its DDL dims by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopDim {
+    /// The primary dim.
+    pub dim: PrimaryDim,
+    /// `metaDimKind_` of the DDL dim that named it.
+    pub kind: MetaDimKind,
+}
+
+/// A LOOP NODE — `dsc2::LoopNode`: a block, the dims it divides, and the two datastages whose
+/// extents give its trip count.
+///
+/// ⭐ THE PARAMETRIC FLAG AND ITS INDEX ARE ONE FIELD. `markAsParametricLoop()` and
+/// `setParametricLdsIdx(lds)` are called together and only together (`ddl_conversion.cpp:1093-1101`),
+/// so a parametric loop with no index — and an index on a non-parametric loop — are both unspellable.
+/// ⛔ `numId_`/`denId_` ABSENT IS THE REFERENCE'S `-1`, which a parametric loop sets for both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopNode {
+    /// The loop's own block: its name and its children.
+    pub block: BlockNode,
+    /// `dims_`, in the order the loop states them.
+    pub dims: Vec<LoopDim>,
+    /// `numId_` — the datastage the trip count divides.
+    pub num: Option<DatastageId>,
+    /// `denId_` — the datastage it divides by.
+    pub den: Option<DatastageId>,
+    /// `isParametricLoop_` together with `parametricLdsIdx_`.
+    pub parametric_lds: Option<LdsIdx>,
+}
+
+impl LoopNode {
+    /// A freshly minted loop over `block`, before an arm fills its tiling.
+    #[must_use]
+    pub const fn bare(block: BlockNode) -> Self {
+        Self {
+            block,
+            dims: Vec::new(),
+            num: None,
+            den: None,
+            parametric_lds: None,
+        }
+    }
+
+    /// The dims it iterates, without their meta kinds.
+    #[must_use]
+    pub fn primary_dims(&self) -> Vec<PrimaryDim> {
+        self.dims.iter().map(|entry| entry.dim).collect()
     }
 }
 
@@ -1607,8 +1704,9 @@ pub const fn generic_comp(unit: SenComponent) -> Option<GenericComp> {
 pub enum SchedNode {
     /// `nodeType_ == BLOCK` — the only kind a `{BLOCK}` filter yields.
     Block(BlockNode),
-    /// `nodeType_ == LOOP`: descended into, never yielded by a `{BLOCK}` filter.
-    Loop(BlockNode),
+    /// `nodeType_ == LOOP`: descended into, never yielded by a `{BLOCK}` filter. Boxed with its own
+    /// tiling, because a loop is the one block kind that carries state of its own.
+    Loop(Box<LoopNode>),
     /// `nodeType_ == CONDITION`: likewise a block kind that a `{BLOCK}` filter passes over.
     Condition(BlockNode),
     /// `nodeType_ == CONDITION` for a condition MINTED with both its regions — the shape entry 262
@@ -1630,7 +1728,8 @@ impl SchedNode {
     #[must_use]
     pub const fn name(&self) -> &NodeName {
         match self {
-            Self::Block(block) | Self::Loop(block) | Self::Condition(block) => &block.name,
+            Self::Block(block) | Self::Condition(block) => &block.name,
+            Self::Loop(node) => &node.block.name,
             Self::Guarded(cond) => &cond.name,
             Self::StickMask(mask) => &mask.name,
             Self::Sync(sync) => &sync.name,
@@ -1710,7 +1809,8 @@ fn collect_blocks_in<'a>(children: &'a [SchedNode], found: &mut Vec<&'a BlockNod
                 found.push(inner);
                 collect_blocks(inner, found);
             }
-            SchedNode::Loop(inner) | SchedNode::Condition(inner) => collect_blocks(inner, found),
+            SchedNode::Loop(node) => collect_blocks(&node.block, found),
+            SchedNode::Condition(inner) => collect_blocks(inner, found),
             SchedNode::Guarded(cond) => {
                 collect_blocks_in(&cond.then_region, found);
                 collect_blocks_in(&cond.else_region, found);
@@ -1743,7 +1843,12 @@ fn find_block_mut_in(
                     return Some(found);
                 }
             }
-            SchedNode::Loop(inner) | SchedNode::Condition(inner) => {
+            SchedNode::Loop(node) => {
+                if let Some(found) = find_block_mut(&mut node.block, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::Condition(inner) => {
                 if let Some(found) = find_block_mut(inner, accepts) {
                     return Some(found);
                 }

@@ -159,7 +159,7 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     stick_sizes,
 };
 use crate::formats::DataFormat;
-use crate::generated::{ComputeType, RegName, Strategy};
+use crate::generated::{RegName, Strategy};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{
     AllocId, BlockId, ConstIdx, NodeId, NodeKind, PadType, ScaleBlock, ScaledLds, comp_row_id,
@@ -170,6 +170,7 @@ use crate::schedule::ddc::metadata::{
 };
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::transformation_util::{NewLabeledDs, add_new_lds};
+use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::dsc2::{
     AddressFold, AllocateNode, BlockNode, CondOp, ComputeNode, ConditionNode, Coordinate,
     DataInfo, Dsc, Dsts, FoldCoeff, FoldDim, FoldPosition, LdsIdx, LdsScale, LoopBound, LoopCond,
@@ -1195,7 +1196,7 @@ where
         .into_iter()
         .filter_map(|node| {
             let compute = dsc.compute(node);
-            (compute.op == ComputeType::Fmul && compute.ex_unit == SenComponent::Lxlu)
+            (compute.op == DdlComputeType::Fmul && compute.ex_unit == SenComponent::Lxlu)
                 .then(|| LxluScaleSite::of(node, &compute))
                 .flatten()
         })
@@ -4036,6 +4037,11 @@ where
     let mut checked = Vec::new();
     for (reference, constraints) in &ds_metadata.constraints {
         for (dims, stored) in constraints {
+            // ⛔ THE EMPTY DIM KEY IS UNREACHABLE HERE: the check asks `dims.count(dim)` of every
+            // constraint it walks, which no empty `std::set<DimId>` answers.
+            let Some(dims) = dims else {
+                continue;
+            };
             let kind = match reference {
                 None => ConstraintKind::Absolute {
                     cannot_be_symbolic: stored.cannot_be_symbolic,
@@ -4083,7 +4089,7 @@ where
 fn stored_constraint<'a>(
     ds_metadata: &'a mut Datastage,
     reference: Option<DatastageId>,
-    dims: DimSet,
+    dims: Option<DimSet>,
 ) -> &'a mut StoredConstraint {
     let entries = ds_metadata.constraints.entry(reference).or_default();
     if let Some(position) = entries.iter().position(|(key, _)| *key == dims) {
@@ -4263,7 +4269,7 @@ where
                         None => return None,
                     }
                     let constraint =
-                        stored_constraint(ds_metadata, staging.num, DimSet::of(&[dim])?);
+                        stored_constraint(ds_metadata, staging.num, DimSet::of(&[dim]));
                     constraint.multiple = LoopMultiple::of(true, Some(kind))?;
                     update_stored(constraint, |lifted| lifted.update_max(1.0));
                 }
@@ -4304,7 +4310,7 @@ where
                             if self.metadata.datastages.contains_key(&above_den) {
                                 let target = self.metadata.datastages.get_mut(&above_den)?;
                                 let constraint =
-                                    stored_constraint(target, staging.num, DimSet::of(&[dim])?);
+                                    stored_constraint(target, staging.num, DimSet::of(&[dim]));
                                 constraint.multiple = LoopMultiple::of(true, Some(kind))?;
                                 update_stored(constraint, |lifted| lifted.update_min(1.0));
                             } else if let Some(num) = staging.num {
@@ -4313,7 +4319,7 @@ where
                                     let constraint = stored_constraint(
                                         target,
                                         Some(above_den),
-                                        DimSet::of(&[dim])?,
+                                        DimSet::of(&[dim]),
                                     );
                                     constraint.multiple = LoopMultiple::of(true, Some(kind))?;
                                     update_stored(constraint, |lifted| lifted.update_max(1.0));
@@ -4400,7 +4406,7 @@ where
         stored_constraint(
             self.metadata.datastages.get_mut(&stage)?,
             None,
-            DimSet::of(&[dim])?,
+            DimSet::of(&[dim]),
         )
         .cannot_be_symbolic = true;
         Some(())
@@ -4994,7 +5000,7 @@ where
                 let stored = stored_constraint(
                     self.metadata.datastages.get_mut(&stage)?,
                     None,
-                    DimSet::of(&[dim])?,
+                    DimSet::of(&[dim]),
                 );
                 update_stored(stored, |lifted| lifted.update_min(minimum));
                 stored.multiple = LoopMultiple::of(true, stored.multiple.dim_kind())?;
@@ -6087,7 +6093,7 @@ mod tests_e132_e136 {
         fn compute(&self, _node: NodeId) -> ComputeNode {
             ComputeNode {
                 name: NodeName("mul".to_owned()),
-                op: ComputeType::Fmul,
+                op: DdlComputeType::Fmul,
                 ex_unit: SenComponent::Lxlu,
                 inputs: vec![
                     operand(SenComponent::Lxluscalereg, None),
@@ -6732,7 +6738,7 @@ mod tests_e124_e131 {
     fn e131_folds_the_pe_only_when_a_pt_compute_is_present() {
         let compute = |unit: SenComponent| ComputeNode {
             name: NodeName("c".to_owned()),
-            op: crate::generated::ComputeType::Fmul,
+            op: crate::schedule::ddl::ops::DdlComputeType::Fmul,
             ex_unit: unit,
             inputs: Vec::new(),
             outputs: Vec::new(),

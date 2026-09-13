@@ -182,7 +182,20 @@ pub fn process_buffer(owned_buffer: impl DdlSource, dialect: &Dialect) -> Option
     perform_actions(&owned_buffer, dialect)
 }
 
-// crustify:todo: e321_DdlMain
+/// Replaces: e321_DdlMain
+///
+/// PARSES ONE OWNED BUFFER AS A MODULE — the whole body past the pool is `return
+/// processBuffer(std::move(buffer), threadPool, context)`.
+///
+/// ⭐ THE EXPLICIT THREAD POOL IS PERFORMANCE-ONLY, AND ITS OWN COMMENT SAYS SO: a temporary
+/// `MLIRContext` is built solely to read whether `--mlir-disable-threading` was passed, so that the
+/// split-input-file mode reuses one pool instead of spawning per slice. Nothing it decides is
+/// observable in the module.
+#[must_use]
+pub fn ddl_main(buffer: impl DdlSource, dialect: &Dialect) -> Option<Verified> {
+    process_buffer(buffer, dialect)
+}
+
 //   authority : ddc/ddl/ddl.cpp:78  (16 body lines, level 2)
 //   original  : OwningOpRef<Operation*> DdlMain(std::unique_ptr<llvm::MemoryBuffer> buffer, MLIRContext* context)
 //   extract   : crustify-ddc/cpp/ddl.cpp:1535-1552
