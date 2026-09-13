@@ -761,7 +761,7 @@ impl DimPadding {
         };
         match kind {
             MetaDimKind::Dilation => Some(self.dilation.0),
-            MetaDimKind::Stride => Some(self.stride.0),
+            MetaDimKind::Stride => Some(self.stride.get()),
             MetaDimKind::PadFront => Some(front),
             MetaDimKind::PadBack => Some(back),
             _ => None,
@@ -1038,7 +1038,7 @@ impl StageDims {
                     .filter(|size| size.0 >= 1)?;
                 let strided = window_size
                     .0
-                    .saturating_add(val.saturating_sub(1).saturating_mul(pad.stride.0));
+                    .saturating_add(val.saturating_sub(1).saturating_mul(pad.stride.get()));
                 match pad_type {
                     PadType::PaddedFullSpanWUnneeded => strided.saturating_add(unneeded),
                     PadType::PaddedWZeroPad => strided,
@@ -1306,7 +1306,17 @@ pub trait MemOrg {
     /// ⭐ ONE UNBOUNDED ENTRY WINS WHEREVER IT SITS — the reference ERASES an already-multiplied dim
     /// on meeting a negative `maxSize` and skips every later entry naming it, so the key set is
     /// "bounded by the layout and never left unbounded", whatever order the layout states them in.
-    fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim>;
+    fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
+        self.hbm_page_sizes().unwrap_or_default().into_keys().collect()
+    }
+
+    /// `memOrg_.at(HBM).allocateNode_->getPageSize()` ITSELF (`dsc/dsc2.cpp:4480`), [`None`] where
+    /// `memOrg_` names no `HBM` or its entry holds no node — *"Exepect HBM in memOrg_."* and
+    /// *"Expect a valid HBM allocate node."* both (`L3DlOpsScheduler.cpp:6686-6691`).
+    ///
+    /// ⭐ THE ONE FACT [`MemOrg::hbm_page_dims`] IS A VIEW OF, so a paged dim and its page size can
+    /// never disagree about whether the dim pages at all.
+    fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>>;
 
     /// `memOrg_.at(SenComponents::LX).allocateNode_->padding_` (`dsc/dsc2.h:983`), [`None`] where
     /// `memOrg_` names no `LX` or its entry holds no node — *"Expect LX in memOrg_."* and *"Expect a
@@ -1586,6 +1596,18 @@ impl StageName {
     #[must_use]
     pub fn chunk() -> Self {
         Self("chunk".to_owned())
+    }
+
+    /// `"ibr"` (`L3DlOpsScheduler.cpp:6664`).
+    #[must_use]
+    pub fn ibr() -> Self {
+        Self("ibr".to_owned())
+    }
+
+    /// `"1page"` (`L3DlOpsScheduler.cpp:6701`).
+    #[must_use]
+    pub fn one_page() -> Self {
+        Self("1page".to_owned())
     }
 }
 

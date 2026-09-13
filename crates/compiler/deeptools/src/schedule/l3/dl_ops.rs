@@ -268,12 +268,17 @@
 //! | `e382_run` | 382 | 9 | 122 | `L3DlOpsScheduler` | `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7912` |
 
 use crate::arch::{Arch, Bounded, Bytes, Elements, IsaGen, Target};
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+    Extent, PrimaryDim, StickPart, stick_sizes,
+};
+use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{
     AllocId, AllocLayout, Alpha, Beta, Cardinality, ElemArrDistribution, FoldParamInfo, NodeId,
-    PadType, RefComponents, TemporalLoopDistribution,
+    NodeKind, PadType, RefComponents, TemporalLoopDistribution,
 };
-use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, stricter_max, stricter_min};
+use crate::schedule::ddc::metadata::{
+    DatastageId, DestIdx, MetaDimKind, stricter_max, stricter_min,
+};
 use crate::schedule::ddc::transformation::{DsType, LoopId, Scale};
 use crate::schedule::ddc::transformation_util::{
     DataStage, DataStages, InsertionPoint, LoopBands, LoopDims, LoopNode, PaddingForm,
@@ -283,23 +288,24 @@ use crate::schedule::ddc::v1::{self, ComputeOps};
 use crate::schedule::dsc2::{
     AddressFold, AllocateNode, BlockNode, ChildPos, CondOp, Coordinate, CoordinateCategory, Dsc,
     Dsts, Fold, FoldCardinality, FoldCoeff, FoldDim, FoldLabel, FoldPosition, GroupTagRegInfo,
-    LdsIdx, LoopBound, LoopCond, LoopCondComposite, Node, NodeName, NumBuffers, NumChunks, PadFold,
-    ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength, SyncUnits,
-    TransferNode, TransferPadding, Via, ZeroPadFolds,
+    LdsIdx, LoopBound, LoopCond, LoopCondComposite, Node, NodeName, NumBuffers, NumChunks, Operand,
+    PadFold, Padding, ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode,
+    SyncStrength, SyncUnits, TransferNode, TransferPadding, Via, WordLength, ZeroPadFolds,
+    generic_comp,
 };
 use crate::schedule::l3::dsc::{
     AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare, CoreletsUsed,
-    DATA_STAGE_CHUNK, DATA_STAGE_CORE, DataStages as L3DataStages, DesignSpaceConfig,
-    DimCandidates, DimPadding, DimStage, DscCandidates, DscGroup, DscIdx, DscParamCandidates,
-    FilledDims, IbrStage, IndexTensor, IndirectAlloc, InitialPlacement, InsertSide, L3Transfer,
-    LabeledDs, MemOrg, MemOrgs, MulticastDegree, NodeParents, OnePageStage, PadElems, PadSizes,
-    PagedStages, Pinning, ScheduleNodes, ScheduleTrees, SchedulerMetadata, StickVolume,
-    StickVolumes, SuperChunkStage, SuperDsc, SymbolicDimInfo, TransferNodes, UnneededPad, WkSlice,
-    WkSliceCount, WkSliceId,
+    DATA_STAGE_CHUNK, DATA_STAGE_CORE, DataStage as L3DataStage, DataStages as L3DataStages,
+    DesignSpaceConfig, DimCandidates, DimPadding, DimStage, DscCandidates, DscGroup, DscIdx,
+    DscParamCandidates, FilledDims, IbrStage, IndexTensor, IndirectAlloc, InitialPlacement,
+    InsertSide, L3Transfer, LabeledDs, MemOrg, MemOrgs, MulticastDegree, NamedDims, NodeParents,
+    OnePageStage, PadElems, PadSizes, PagedStages, Pinning, ScheduleNodes, ScheduleTrees,
+    SchedulerMetadata, StageDims as L3StageDims, StickVolume, StickVolumes, SuperChunkStage,
+    SuperDsc, SymbolicDimInfo, TransferNodes, UnneededPad, WkSlice, WkSliceCount, WkSliceId,
 };
 use crate::units::{Core, Corelet, Row};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use sys_arch_spec::arch_enums::{DataLocation, OpFunc, SenComponent};
 
 /// THE WITNESS `isSameDscGroup` HANDS BACK — constructible only from a [`SuperDsc`], whose DSC list
@@ -909,6 +915,12 @@ pub struct L3Allocation {
 pub struct DscMetadata {
     /// `newAllocations_`, each component to what was newly allocated in it.
     pub new_allocations: BTreeMap<SenComponent, L3Allocation>,
+    /// `externalNodes_` (`:170`) — the nodes entry 333 skips, having been filled by another stage.
+    ///
+    /// ⛔ THE `datatransfers_` BESIDE IT IS NOT MODELLED, so entry 333's *"Expect empty
+    /// datatransfers_ in metadata for now."* is discharged by construction and its `apply_row_offset_`
+    /// fixup — which only that map can reach — is unspellable.
+    pub external_nodes: BTreeSet<NodeId>,
 }
 
 /// A LABELLED DS PROVED READY FOR AN L3 ALLOCATION, WITH THE LAYOUT ORDER IT GETS.
@@ -3204,7 +3216,7 @@ pub fn calculate_corelet_offset_in_byte<A: Arch, N: DimStage + ?Sized, C: DimSta
                 (dim == PrimaryDim::I).then_some(())?;
                 node_stage.pad_stride(dim)?;
                 let share = chunk_stage.corelet_split(dim, from)?;
-                Extent(share.0.checked_mul(chunk_stage.pad_stride(dim)?.0)?)
+                Extent(share.0.checked_mul(chunk_stage.pad_stride(dim)?.get())?)
             };
             let per_stick = v1::stick_divisor(&sticks, dim)?;
             offset = offset.checked_mul(u64::try_from(extent.0).ok()? / per_stick.get())?;
@@ -3686,8 +3698,8 @@ mod tests_e049_e056 {
             None
         }
 
-        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
-            BTreeSet::new()
+        fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>> {
+            None
         }
 
         fn lx_padding(&self) -> Option<PaddingForm> {
@@ -4232,7 +4244,7 @@ mod tests_e057_e064 {
         allocation: Option<NodeName>,
         indirection: Option<IndirectAlloc>,
         layout: Option<LayoutDims>,
-        pages: BTreeSet<PrimaryDim>,
+        pages: BTreeMap<PrimaryDim, Extent>,
     }
 
     impl MemOrg for HbmStub {
@@ -4268,8 +4280,8 @@ mod tests_e057_e064 {
             self.layout.clone()
         }
 
-        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
-            self.pages.clone()
+        fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>> {
+            Some(self.pages.clone())
         }
 
         fn lx_padding(&self) -> Option<PaddingForm> {
@@ -4361,13 +4373,13 @@ mod tests_e057_e064 {
                 PrimaryDim::Out,
                 vec![PrimaryDim::In, PrimaryDim::Ki],
             )),
-            pages: BTreeSet::from([PrimaryDim::In, PrimaryDim::Ki]),
+            pages: BTreeMap::from([(PrimaryDim::In, Extent(4)), (PrimaryDim::Ki, Extent(4))]),
             ..HbmStub::default()
         };
         let value = HbmStub {
             indirection: Some(IndirectAlloc::ValueTensor),
             layout: Some(LayoutDims::new(PrimaryDim::Kj, Vec::new())),
-            pages: BTreeSet::from([PrimaryDim::Kj]),
+            pages: BTreeMap::from([(PrimaryDim::Kj, Extent(4))]),
             ..HbmStub::default()
         };
         assert_eq!(
@@ -5558,8 +5570,8 @@ mod tests_e197_e204 {
         fn hbm_layout_dims(&self) -> Option<LayoutDims> {
             None
         }
-        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
-            BTreeSet::new()
+        fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>> {
+            None
         }
         fn lx_padding(&self) -> Option<PaddingForm> {
             None
@@ -6679,8 +6691,8 @@ mod tests_e205_e212 {
             None
         }
 
-        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
-            BTreeSet::new()
+        fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>> {
+            None
         }
 
         fn lx_padding(&self) -> Option<PaddingForm> {
@@ -7840,8 +7852,8 @@ pub fn fill_transfer_zero_padding_info<E: DscTransfers + ?Sized>(
                     return None;
                 }
                 let chunks = core_extent / lx_extent;
-                let core_offset = core_extent.checked_mul(core_stage.padding.get(&dim)?.stride.0)?;
-                let chunk_offset = lx_extent.checked_mul(chunk_stage.padding.get(&dim)?.stride.0)?;
+                let core_offset = core_extent.checked_mul(core_stage.padding.get(&dim)?.stride.get())?;
+                let chunk_offset = lx_extent.checked_mul(chunk_stage.padding.get(&dim)?.stride.get())?;
                 if core_offset <= 0 || chunk_offset <= 0 {
                     return None;
                 }
@@ -8770,8 +8782,8 @@ mod tests_e221_e228 {
             Some(self.padding.clone())
         }
 
-        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
-            BTreeSet::new()
+        fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>> {
+            None
         }
 
         fn lx_page_sizes(&self) -> BTreeMap<PrimaryDim, Extent> {
@@ -9246,6 +9258,7 @@ mod tests_e221_e228 {
                         lds_idx_and_alloc_node: BTreeMap::from([(LdsIdx(0), AllocId(0))]),
                     },
                 )]),
+                external_nodes: BTreeSet::new(),
             },
         )]);
         let mut allocs: v1::AllocArena = BTreeMap::from([(
@@ -9631,6 +9644,7 @@ mod tests_e221_e228 {
             DscIdx(0),
             DscMetadata {
                 new_allocations: BTreeMap::new(),
+                external_nodes: BTreeSet::new(),
             },
         )]);
         let mut allocs: v1::AllocArena = BTreeMap::new();
@@ -9902,6 +9916,7 @@ mod tests_e221_e228 {
             DscIdx(0),
             DscMetadata {
                 new_allocations: BTreeMap::new(),
+                external_nodes: BTreeSet::new(),
             },
         )]);
         let mut allocs: v1::AllocArena = BTreeMap::new();
@@ -11877,7 +11892,7 @@ mod tests_e283_e295 {
 
     use crate::arch::{Dd2, Sen1p5};
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
-    use crate::schedule::ddc::fold::Stride;
+    use crate::schedule::ddc::fold::{ConstIdx, Stride};
     use crate::schedule::dsc2::{AllocLayout, AllocPlacement, LayoutDims, MaxDimSize, StartAddress};
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, DataStage, DscList, LabeledDsList, NamedDims, PlacedAllocation, PrimaryDsInfo,
@@ -12031,8 +12046,8 @@ mod tests_e283_e295 {
             None
         }
 
-        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
-            BTreeSet::new()
+        fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>> {
+            None
         }
 
         fn lx_padding(&self) -> Option<PaddingForm> {
@@ -12640,10 +12655,8 @@ mod tests_e283_e295 {
         );
     }
 
-    /// e287 — two slices on the reduced dim and two on the kept one make two groups of two cores,
-    /// each core placed at the slice its reduced dim names.
-    #[test]
-    fn the_reduction_groups_are_the_kept_slices_holding_the_reduced_ones() {
+    /// Two slices on a reduced dim and two on a kept one — four cores in two reduction groups.
+    fn a_cross_core_reduction() -> (SuperDsc, DesignSpaceConfig) {
         let mut dsc = a_dsc(
             &[(PrimaryDim::I, 8), (PrimaryDim::Ki, 8)],
             &[(PrimaryDim::I, 4)],
@@ -12683,6 +12696,14 @@ mod tests_e283_e295 {
             ],
         );
 
+        (sdsc, dsc)
+    }
+
+    /// e287 — two slices on the reduced dim and two on the kept one make two groups of two cores,
+    /// each core placed at the slice its reduced dim names.
+    #[test]
+    fn the_reduction_groups_are_the_kept_slices_holding_the_reduced_ones() {
+        let (sdsc, dsc) = a_cross_core_reduction();
         let groups = cross_core_reduction_group_info(&sdsc, &dsc).expect("a cross-core reduction");
         let ends = |group: &CrossCoreReductionGroup| {
             let cores = group.cores().expect("a group with a slice in it");
@@ -12694,6 +12715,22 @@ mod tests_e283_e295 {
         assert_eq!(groups.len(), 2);
         assert_eq!(ends(&groups[0]), (Some(core(0)), Some(core(1))));
         assert_eq!(ends(&groups[1]), (Some(core(2)), Some(core(3))));
+    }
+
+    /// e330 — OUT OF SPAN, over entry 287's own fixture: the cross-core reduction's OUTPUT is stored
+    /// only by the core each group ends at, so two groups of two name one core each, not four.
+    #[test]
+    fn only_the_core_a_reduction_group_ends_at_transfers_the_output() {
+        let (sdsc, dsc) = a_cross_core_reduction();
+        assert_eq!(
+            lds_transfer_core_ids(&sdsc, &dsc, LdsIdx(1)),
+            Some(vec![core(1), core(3)])
+        );
+        // Its INPUT is transferred by every core with work.
+        assert_eq!(
+            lds_transfer_core_ids(&sdsc, &dsc, LdsIdx(0)),
+            Some(vec![core(0), core(1), core(2), core(3)])
+        );
     }
 
     /// e288 — the one HBM->LX load is the innermost, so the four-node hard handshake chains straight
@@ -12756,6 +12793,182 @@ mod tests_e283_e295 {
                 "sync_send_lxlu_to_l3lu",
                 "sync_receive_l3lu_from_lxlu",
             ]
+        );
+    }
+
+    /// e331 — OUT OF SPAN: not exploring, the walk starts at the loop owning the lx_below block and
+    /// stops at the first CORE-numbered loop, so a super-chunk loop directly above the core one gives
+    /// the stage nothing to double; a super-chunk loop that chunks the CORE stage instead is the
+    /// `DT_CHECK` on the two loops above that block.
+    #[test]
+    fn the_non_exploring_walk_stops_at_the_core_loop_and_checks_the_one_above_it() {
+        #[derive(Default)]
+        struct Trackers;
+        impl ExPhaseTrackers for Trackers {
+            fn ex_phases(&self) -> Vec<ExPhase> {
+                vec![ExPhase(0)]
+            }
+            fn capacity(&self, _at: L3TrackerSite) -> Bytes {
+                Bytes(4096)
+            }
+            fn backup(&mut self, _at: L3TrackerSite) {}
+            fn restore_all(&mut self) {}
+            fn remove(&mut self, _at: L3TrackerSite, _name: &v1::StorageName) {}
+            fn check_and_add(
+                &mut self,
+                _at: L3TrackerSite,
+                _phase: ExPhase,
+                _name: &v1::StorageName,
+                _size: Bytes,
+            ) -> Option<v1::Placed> {
+                Some(v1::Placed::At(Bytes(0)))
+            }
+        }
+        struct Placement;
+        impl L3Placement for Placement {
+            fn buffer_capacity_even_sticks(
+                &self,
+                _alloc: AllocId,
+                _lds: LdsIdx,
+                _corelet: Corelet,
+                _row: Row,
+            ) -> Bytes {
+                Bytes(64)
+            }
+            fn address_fold_depth(&self) -> usize {
+                2
+            }
+            fn address_fold_coords(&self) -> usize {
+                2
+            }
+        }
+        impl v1::StorageNames for Placement {
+            fn lds_name(&self, lds: LdsIdx) -> v1::StorageName {
+                v1::StorageName(format!("lds{}", lds.0))
+            }
+            fn constant_name(&self, constant: ConstIdx) -> v1::StorageName {
+                v1::StorageName(format!("const{}", constant.0))
+            }
+        }
+
+        /// The super-chunk index entry 058 minted, holding the chunk's own extent.
+        fn a_super_chunk_dsc() -> (DesignSpaceConfig, SuperChunkStage) {
+            let mut dsc = a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 4)]);
+            dsc.data_stages
+                .set(DatastageId(2), stage("super_chunk", &[(PrimaryDim::I, 4)]));
+            let super_chunk = dsc
+                .data_stages
+                .super_chunk(DatastageId(2))
+                .expect("the super-chunk stage exists");
+            (dsc, super_chunk)
+        }
+
+        /// root -> `above` -> a CORE-by-CHUNK loop -> the lx_below block.
+        fn a_tree(above_num: DatastageId, above_den: DatastageId) -> Tree {
+            let mut tree = Tree::default();
+            let root = tree.root_block("root");
+            let above = tree.loop_over(above_num, above_den, PrimaryDim::I, root);
+            let innermost =
+                tree.loop_over(DATA_STAGE_CORE, DATA_STAGE_CHUNK, PrimaryDim::I, above.0);
+            tree.lx_below = Some(tree.add("lx_below", Kind::Block, Some(innermost.0)));
+            tree
+        }
+
+        let mut allocs = v1::AllocArena::new();
+        let (mut dsc, super_chunk) = a_super_chunk_dsc();
+        assert_eq!(
+            explore_super_chunk_data_stage_params::<false, false, _, _, _, _>(
+                &mut dsc,
+                DscIdx(0),
+                super_chunk,
+                None,
+                &a_tree(DatastageId(2), DATA_STAGE_CHUNK),
+                &Orgs(BTreeMap::new()),
+                &BTreeMap::new(),
+                &mut allocs,
+                &mut Trackers,
+                &Placement,
+            ),
+            Some(())
+        );
+        // The core loop stops the walk before it ever doubles, so the stage stands as it was.
+        let held = dsc.data_stages.at(DatastageId(2)).expect("the super-chunk stage");
+        assert_eq!(held.ss.dims.dims().extent(PrimaryDim::I), Some(Extent(4)));
+
+        let (mut dsc, super_chunk) = a_super_chunk_dsc();
+        assert_eq!(
+            explore_super_chunk_data_stage_params::<false, false, _, _, _, _>(
+                &mut dsc,
+                DscIdx(0),
+                super_chunk,
+                None,
+                &a_tree(DatastageId(2), DATA_STAGE_CORE),
+                &Orgs(BTreeMap::new()),
+                &BTreeMap::new(),
+                &mut allocs,
+                &mut Trackers,
+                &Placement,
+            ),
+            None
+        );
+    }
+
+    /// e332 — OUT OF SPAN: the walk synchronises EVERY DSC, so entry 288's handshake lands once per
+    /// DSC of a two-DSC super-DSC and the one load ends up carrying both.
+    #[test]
+    fn every_dsc_of_the_super_dsc_gains_its_own_handshake() {
+        let mut dsc = a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 4)]);
+        dsc.labeled_ds = LabeledDsList::new(
+            labeled(
+                DsType::Input,
+                LdsIdx(0),
+                &[(PrimaryDim::I, Scale::Sized(1.0))],
+                hbm(),
+            ),
+            vec![labeled(
+                DsType::Output,
+                LdsIdx(1),
+                &[(PrimaryDim::I, Scale::Sized(1.0))],
+                lx(),
+            )],
+        );
+        let sdsc = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![dsc]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+
+        let mut tree = Tree::default();
+        let root = tree.root_block("root");
+        let chunk_loop = tree.loop_over(DATA_STAGE_CORE, DATA_STAGE_CHUNK, PrimaryDim::I, root);
+        let load = tree.tensor_transfer("hbm_to_lx", chunk_loop.0, LdsIdx(0));
+        let orgs = Orgs(BTreeMap::from([(
+            LdsIdx(0),
+            Org {
+                hbm_users: Some(vec![load]),
+                ..Org::default()
+            },
+        )]));
+        let trees = Transfers(vec![L3Transfer {
+            node: load,
+            name: NodeName("hbm_to_lx".to_owned()),
+            src: SenComponent::Hbm,
+            dst: SenComponent::Lx,
+        }]);
+
+        assert_eq!(
+            create_synchronization(&sdsc, LxBuffering::Double, &orgs, &trees, &mut tree),
+            Some(())
+        );
+        let names = tree.names(&NodeParents::children(&tree, chunk_loop.0));
+        assert_eq!(names.len(), 9);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("sync_send_l3lu_to_lxlu"))
+                .count(),
+            2
         );
     }
 
@@ -13674,61 +13887,1909 @@ where
     Some(())
 }
 
-// crustify:todo: e328_computeMinParamForPaddedDim
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:870  (24 body lines, level 3)
-//   class     : L3DlOpsScheduler
-//   original  : long L3DlOpsScheduler::computeMinParamForPaddedDim( const DesignSpaceConfig& dsc, const PrimaryDimTypes dim) const
-//   extract   : crustify-ddc/cpp/l3.cpp:6507-6532
-//   calls     : e021_getOpFuncName, e284_isOpFuncStridedWindow
+/// Replaces: e328_computeMinParamForPaddedDim
+///
+/// The smallest chunk a strided-window op may take of a PADDED dim: the first divisor of the core
+/// extent that keeps the padding's own cost down to a sixth of the chunks it spans — a fifth past ten
+/// — and one where the padding is already that cheap, the dim carries none, or nothing divides.
+///
+/// ⛔ [`None`] IS *"Expect a strided-window op."* ALONE. An unstated core extent is the reference's
+/// `-1`, which leaves `cand <= coreParam` false at once and falls through to the default.
+#[must_use]
+pub fn compute_min_param_for_padded_dim<D: ComputeOps + ?Sized>(
+    dsc: &DesignSpaceConfig,
+    ops: &D,
+    dim: PrimaryDim,
+) -> Option<Extent> {
+    is_op_func_strided_window(get_op_func_name(ops)).then_some(())?;
+    let core_ss = dsc.core_stage().dims();
+    let core_param = core_ss.extent(dim).map_or(-1, |extent| extent.0);
+    if let Some(pad) = core_ss.padding.get(&dim) {
+        let (front, back) = match pad.sizes {
+            PadSizes::Unpadded => (0, 0),
+            PadSizes::Sized { front, back } => (i64::from(front.0), i64::from(back.0)),
+            PadSizes::Voided => (-1, -1),
+        };
+        // ⭐ THE DIVIDE IS UNGUARDED IN THE REFERENCE — [`DimPadding::stride`] carries the non-zero.
+        let chunks = (front + back) / pad.stride.get();
+        let threshold = if chunks > 10 { 5 } else { 6 };
+        if chunks > threshold {
+            // `std::ceil` of two ints this branch has just made positive, so it is exact.
+            let smallest = (chunks / threshold) + i64::from(chunks % threshold != 0);
+            for cand in smallest..=core_param {
+                if core_param % cand == 0 {
+                    return Some(Extent(cand));
+                }
+            }
+        }
+    }
+    Some(DEFAULT_MIN_PARAM)
+}
 
-// crustify:todo: e329_addChunkDataStageFromCandidates
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1405  (13 body lines, level 3)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::addChunkDataStageFromCandidates( DataStructDims &chunkParams, DesignSpaceConfig &dsc, const int dscIdx, const DscParamCandidateIndicesType &selectedIndices, const DscParamCandidatesType &dscCandidates, const std::vector<PrimaryDimTypes> &primaryDims)
-//   extract   : crustify-ddc/cpp/l3.cpp:6542-6559
-//   calls     : e005_addOrUpdateSymbolicInfoInParams, e022_addOrUpdateDataStageParam, e041_getChunkParamsFromCandidates, e198_addOrUpdatePaddingSizesInChunkParams, e283_addOrUpdateCoreletSplitInParams
+/// Replaces: e329_addChunkDataStageFromCandidates
+///
+/// STATES THE CHUNK DATA STAGE the candidate search selected: the chosen extent per dim, the corelet
+/// split over them, the core stage's padding voided where chunking moved it, and its symbolic dims —
+/// then writes that one `DataStructDims` into the chunk stage AS BOTH HALVES.
+///
+/// ⛔ BOTH HALVES ARE THE SAME VALUE (`:1418-1419`), so a chunk stage has no epilogue of its own.
+/// ⛔ [`None`] IS entry 283's refusals; *"Core data stage parameters are unavailable."* is discharged
+/// by [`L3DataStages`] holding the core stage as a field. `chunkParams` stays the caller's, filled.
+pub fn add_chunk_data_stage_from_candidates<const CARRY_UNNEEDED_PAD: bool>(
+    chunk_params: &mut FilledDims,
+    dsc: &mut DesignSpaceConfig,
+    candidates: &DscParamCandidates,
+) -> Option<()> {
+    let core_ss = dsc.data_stages.core().ss.dims.clone();
+    chunk_params_from_candidates(chunk_params, candidates);
+    add_or_update_corelet_split_in_params(chunk_params, dsc)?;
+    add_or_update_padding_sizes_in_chunk_params::<CARRY_UNNEEDED_PAD>(chunk_params, &core_ss);
+    add_or_update_symbolic_info_in_params(chunk_params, &core_ss);
+    // Entry 022's insert in the l3 projection: the chunk index always names an existing entry.
+    let named = NamedDims { name: StageName::chunk(), dims: chunk_params.clone() };
+    dsc.data_stages.set(DATA_STAGE_CHUNK, L3DataStage { ss: named.clone(), el: named });
+    Some(())
+}
 
-// crustify:todo: e330_getLdsTransferCoreIds
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:2773  (17 body lines, level 3)
-//   class     : L3DlOpsScheduler
-//   original  : std::vector<int> L3DlOpsScheduler::getLdsTransferCoreIds( const SuperDsc &mySDsc, const DesignSpaceConfig &dsc, const LabeledDsInfo &lds) const
-//   extract   : crustify-ddc/cpp/l3.cpp:6569-6588
-//   calls     : e068_getEndCoreAtCorelet, e210_isOpCrossCoreReduction, e287_getCrossCoreReductionGroupInfo
+/// Replaces: e330_getLdsTransferCoreIds
+///
+/// WHICH CORES TRANSFER this labelled data structure: every core with work, EXCEPT for the output of
+/// a cross-core reduction, where only the core each reduction group ENDS at per corelet stores.
+///
+/// ⛔ [`None`] IS THE `-1` HOLE MADE THE REFUSAL IT WOULD HAVE CAUSED: every caller feeds these ids
+/// straight to `coreIdToWkSlice_.at()`, which throws on a group with no core at that corelet.
+#[must_use]
+pub fn lds_transfer_core_ids(
+    sdsc: &SuperDsc,
+    dsc: &DesignSpaceConfig,
+    lds: LdsIdx,
+) -> Option<Vec<Core>> {
+    if dsc.labeled_ds.is_output(lds) && is_op_cross_core_reduction(sdsc, dsc)? {
+        let corelets = dsc.corelets_used_dsc2?.get();
+        let mut selected = Vec::new();
+        for group in cross_core_reduction_group_info(sdsc, dsc)? {
+            for id in 0..corelets {
+                let corelet = GroupCorelet::of(Corelet::checked(id)?);
+                selected.push(group.cores()?.end_core_at_corelet(corelet)?);
+            }
+        }
+        return Some(selected);
+    }
+    Some(sdsc.core_id_to_wk_slice.keys().copied().collect())
+}
 
-// crustify:todo: e331_exploreSuperChunkDataStageParams
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:2829  (140 body lines, level 3)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::exploreSuperChunkDataStageParams(SuperDsc& mySDsc, const int dscIdx)
-//   extract   : crustify-ddc/cpp/l3.cpp:6598-6739
-//   calls     : e046_getLxBelowBlockNode, e059_getPagedDimensions, e222_allocAllMem, e283_addOrUpdateCoreletSplitInParams
+/// `auto& dsSuperChunk = dataStageParam_.at(dataStageSuperChunkIdx)` DONE OUT OF PLACE: entry 283
+/// reads the whole DSC, so the stage cannot stay borrowed while its corelet split is stated.
+fn write_super_chunk_extents(
+    dsc: &mut DesignSpaceConfig,
+    super_chunk: SuperChunkStage,
+    written: &[(PrimaryDim, Extent, Extent)],
+    state_split: bool,
+) -> Option<()> {
+    let mut stage = dsc.data_stages.at(super_chunk.index())?.clone();
+    for &(dim, ss, el) in written {
+        stage.ss.dims.set_extent(dim, ss);
+        stage.el.dims.set_extent(dim, el);
+    }
+    if state_split {
+        add_or_update_corelet_split_in_params(&mut stage.ss.dims, dsc)?;
+        add_or_update_corelet_split_in_params(&mut stage.el.dims, dsc)?;
+    }
+    dsc.data_stages.set(super_chunk.index(), stage);
+    Some(())
+}
 
-// crustify:todo: e332_createSynchronization
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3481  (5 body lines, level 3)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::createSynchronization(SuperDsc &mySDsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:6749-6754
-//   calls     : e288_createSynchronizationDSC
+/// Replaces: e331_exploreSuperChunkDataStageParams
+///
+/// STATES THE SUPER-CHUNK DATA STAGE over the core-by-chunk loop dims. Exploring, each starts at its
+/// maximum — one IBR fill for a paged dim, the whole core extent otherwise — and while that does not
+/// fit LX the OUTERMOST dim steps down a chunk at a time to the first extent whose two halves agree
+/// with the reference stage's and whose trial allocation fits. Not exploring, each dim from the
+/// innermost up DOUBLES once while the core is a multiple of it and the doubling still fits.
+///
+/// ⛔ THE TRIAL IS THE PORT: entry 222 without a commit restores its trackers, so only the extents
+/// standing when one trial SUCCEEDS are kept, and a failed step is left written for the next dim.
+/// ⛔ [`None`] IS *"Expect IBR data stage."*, *"The SuperChunk value must be multiple of the chunk
+/// value."*, *"Expect the same ss_ and el_ values."*, *"A valid set of SuperChunk parameters must be
+/// found."*, the non-exploring path's `DT_CHECK` on the two loops above the lx_below block, entries
+/// 222's and 283's — and a non-positive chunk extent, whose `-=` HANGS the reference.
+pub fn explore_super_chunk_data_stage_params<const EXPLORE: bool, const EPILOGUE: bool, R, O, M, P>(
+    dsc: &mut DesignSpaceConfig,
+    dsc_idx: DscIdx,
+    super_chunk: SuperChunkStage,
+    ibr: Option<IbrStage>,
+    nesting: &R,
+    orgs: &O,
+    metadata: &BTreeMap<DscIdx, DscMetadata>,
+    allocs: &mut v1::AllocArena,
+    trackers: &mut M,
+    placement: &P,
+) -> Option<()>
+where
+    R: DscTrees + ?Sized,
+    O: MemOrgs + ?Sized,
+    M: ExPhaseTrackers + ?Sized,
+    P: L3Placement + v1::StorageNames,
+{
+    let tree = nesting.tree(dsc_idx)?;
+    let innermost = tree.owner_loop(nesting.lx_below_block(dsc_idx)?);
+    if !EXPLORE {
+        let innermost = innermost?;
+        let above = tree.owner_loop(innermost.0)?;
+        (tree.loop_num(above) == super_chunk.index() && tree.loop_den(above) == DATA_STAGE_CHUNK)
+            .then_some(())?;
+        let mut at = Some(innermost);
+        while let Some(walked) = at.filter(|&it| tree.loop_num(it) != DATA_STAGE_CORE) {
+            let dim = tree.loop_dims(walked).iter().last()?.dim;
+            let core = dsc.data_stages.core().ss.dims.dims().extent(dim)?;
+            let held = dsc.data_stages.at(super_chunk.index())?.ss.dims.dims().extent(dim)?;
+            if core.0 > held.0 && is_multiple_of(core.0, held.0)? {
+                let doubled = Extent(held.0 * 2);
+                write_super_chunk_extents(dsc, super_chunk, &[(dim, doubled, doubled)], false)?;
+                if alloc_all_mem(dsc, metadata, dsc_idx, allocs, trackers, placement, v1::Commit::No)?
+                {
+                    break;
+                }
+                write_super_chunk_extents(dsc, super_chunk, &[(dim, held, held)], false)?;
+            }
+            at = tree.owner_loop(walked.0);
+        }
+        return Some(());
+    }
 
-// crustify:todo: e333_fillLoopOffsetsAndAddresses
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5750  (613 body lines, level 3)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::fillLoopOffsetsAndAddresses( SuperDsc &mySDsc, const int dscIdx, const bool allowUnpaddedIndexingAtPaddedNoZeroPad)
-//   extract   : crustify-ddc/cpp/l3.cpp:6764-7379
-//   calls     : e049_calculateCoreletOffsetInByte, e056_isIndexLds, e057_isPagedLds, e068_getEndCoreAtCorelet, e076_print, e102_print, e104_clear, e187_clear, e210_isOpCrossCoreReduction, e272_print, e287_getCrossCoreReductionGroupInfo
+    let mut inner_to_outer: Vec<PrimaryDim> = Vec::new();
+    let mut at = innermost;
+    while let Some(walked) = at.filter(|&it| tree.loop_den(it) == DATA_STAGE_CHUNK) {
+        inner_to_outer.push(tree.loop_dims(walked).iter().last()?.dim);
+        at = tree.owner_loop(walked.0);
+    }
+    let mut lds: Vec<&O::Org> = Vec::new();
+    for (recorded, _) in dsc.labeled_ds.indexed() {
+        lds.push(orgs.mem_org(dsc_idx, recorded)?);
+    }
+    let paged_dims = get_paged_dimensions(&lds);
+    drop(lds);
 
-// crustify:todo: e334_addIbrDataStage
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6626  (47 body lines, level 3)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::addIbrDataStage( SuperDsc& mySDsc, DesignSpaceConfig& dsc, const std::vector<PrimaryDimTypes>& pagedDims)
-//   extract   : crustify-ddc/cpp/l3.cpp:7389-7438
-//   calls     : e005_addOrUpdateSymbolicInfoInParams, e056_isIndexLds, e058_getNewDataStageIndex, e283_addOrUpdateCoreletSplitInParams
+    // Initialize the SuperChunk parameters to the maximum, outer loop dim first.
+    let mut maxima: Vec<(PrimaryDim, Extent, Extent)> = Vec::new();
+    for &dim in inner_to_outer.iter().rev() {
+        let chunk = dsc.data_stages.chunk().ss.dims.dims().extent(dim)?.0;
+        let (ss, el) = if paged_dims.contains(&dim) {
+            let stage = dsc.data_stages.at(ibr?.index())?;
+            let ibr_ss = stage.ss.dims.dims().extent(dim)?.0;
+            let ss = ibr_ss.min(stage.el.dims.dims().extent(dim)?.0);
+            let el = if is_multiple_of(ibr_ss, ss)? { ss } else { ibr_ss % ss };
+            (ss, el)
+        } else {
+            let core = dsc.data_stages.core();
+            let ss = core.ss.dims.dims().extent(dim)?.0;
+            (ss == core.el.dims.dims().extent(dim)?.0).then_some(())?;
+            (ss, ss)
+        };
+        (is_multiple_of(ss, chunk)? && is_multiple_of(el, chunk)?).then_some(())?;
+        maxima.push((dim, Extent(ss), Extent(el)));
+    }
+    write_super_chunk_extents(dsc, super_chunk, &maxima, true)?;
+    if alloc_all_mem(dsc, metadata, dsc_idx, allocs, trackers, placement, v1::Commit::No)? {
+        return Some(());
+    }
 
-// crustify:todo: e335_addOnePageDataStage
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6676  (30 body lines, level 3)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::addOnePageDataStage( SuperDsc& mySDsc, DesignSpaceConfig& dsc, const std::vector<PrimaryDimTypes>& pagedDims)
-//   extract   : crustify-ddc/cpp/l3.cpp:7448-7480
-//   calls     : e058_getNewDataStageIndex, e224_getAllPagedLdsIndices, e283_addOrUpdateCoreletSplitInParams
+    // Decrease from the outer loop dim inwards until the LX allocation fits.
+    for &dim in inner_to_outer.iter().rev() {
+        let reference = if paged_dims.contains(&dim) {
+            dsc.data_stages.at(ibr?.index())?
+        } else {
+            dsc.data_stages.core()
+        };
+        let ref_ss = reference.ss.dims.dims().extent(dim)?.0;
+        let ref_el = reference.el.dims.dims().extent(dim)?.0;
+        let chunk = dsc.data_stages.chunk().ss.dims.dims().extent(dim)?.0;
+        (chunk > 0).then_some(())?;
+        let mut ss = dsc.data_stages.at(super_chunk.index())?.ss.dims.dims().extent(dim)?.0;
+        while ss > chunk {
+            // The subtraction leaves `ss` positive, so neither remainder below divides by zero.
+            ss -= chunk;
+            if ref_ss % ss != ref_el % ss {
+                continue;
+            }
+            let el = if ref_ss % ss == 0 { ss } else { ref_ss % ss };
+            if !EPILOGUE && ss != el {
+                continue;
+            }
+            write_super_chunk_extents(dsc, super_chunk, &[(dim, Extent(ss), Extent(el))], true)?;
+            if alloc_all_mem(dsc, metadata, dsc_idx, allocs, trackers, placement, v1::Commit::No)? {
+                return Some(());
+            }
+        }
+    }
+    // "A valid set of SuperChunk parameters must be found."
+    None
+}
+
+/// Replaces: e332_createSynchronization
+///
+/// SYNCHRONISES EVERY DSC of the SuperDSC, in `dscs_` order.
+///
+/// ⛔ ONE `buffering` FOR ALL OF THEM IS FAITHFUL: `lxBufferType` is a scheduler member, not a
+/// per-DSC field, so entry 288 reads the same value on every trip.
+/// ⛔ [`None`] IS entry 288's, and the walk STOPS at it — the reference has no way to skip a DSC.
+pub fn create_synchronization<O, T, E>(
+    sdsc: &SuperDsc,
+    buffering: LxBuffering,
+    orgs: &O,
+    trees: &T,
+    env: &mut E,
+) -> Option<()>
+where
+    O: MemOrgs + ?Sized,
+    T: TransferNodes + ?Sized,
+    E: DscTreeSurgery + ?Sized,
+{
+    for dsc_idx in dsc_indices(sdsc) {
+        create_synchronization_dsc(sdsc, dsc_idx, buffering, orgs, trees, env)?;
+    }
+    Some(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//    ENTRY 333 — THE L3 LOOP OFFSETS AND ADDRESSES
+//
+// ⭐ THIS IS ENTRY 260'S BODY SPECIALISED, NOT A WRAPPER OVER IT, and it reuses entry 260's
+// VOCABULARY throughout: the fills are [`v1::DataInfoFill`]s at [`v1::OperandSite`]s, the pad ladder
+// IS [`v1::padded_loop_offset`], the memory set is [`v1::is_dsc_memory`], and the symbolic division
+// is [`v1::Symbols`].
+//
+// WHAT THE L3 COPY DROPS (`L3DlOpsScheduler.cpp:5750-6364` against `ddc/ddcv1.cpp:2359-2673`):
+//   · `loopsBelowChunkBoundary` IS FILLED BY DEAD CODE — `:5765-5781` is commented out with *"there
+//     are no loops below chunk boundary in ALxS"* — so `belowChunkLimit` is ALWAYS false and the
+//     corelet view is ALWAYS `-1`. No `both_corelets` tracking, and `is_non_corelet_memory` is
+//     never asked.
+//   · the offsets are ALWAYS datastage-based: no `loopDistributionParamInfo`, no [`v1::IterCount`]
+//     cross-check and so no MISMATCH `DT_ERROR`, and no coordinate-based constant offsets.
+//   · `metadata.datatransfers_` is `DT_CHECK`ed EMPTY (`:5757`), which makes the `apply_row_offset_`
+//     fixup DEAD. [`DscMetadata`] does not model that map, so the check is discharged by
+//     construction and the fixup is unspellable.
+//   · no replication, pe/sfp-split or cloned-compute-repetition fixups.
+//   · `findLastFusableLoop` has NEITHER the CONDITION break NOR the symbolic-loop break
+//     (`:6329-6338` against `ddc/ddcv1.cpp:2818-2857`), so an L3 transfer fuses through both.
+//
+// WHAT IT ADDS:
+//   · the cross-core-reduction HBM adjustment, which shifts the address at corelet 1's END CORE by
+//     that corelet's own byte offset (`:5820-5848`).
+//   · the INDIRECT (IBR) operand — a SECOND `DataInfo` whose start address is the index tensor's
+//     re-laid with a MAPPED core axis, shifted by each core's work slice within its stick, in bytes
+//     or as a symbol tree where a sliced dim's per-core size is itself a symbol (`:5865-5981`).
+//   · the MX `scaleDownFactor`, which is [`v1::Density`] (`:6034-6041`).
+//   · the paged-dim ladder, which divides an offset by the page size and ROUTES it to the indirect
+//     `DataInfo` (`:6390-6409`).
+//
+// ⛔ AND ONE DIVERGENCE THAT IS THE REFERENCE'S, NOT OURS: `numPTRows` does NOT divide the START
+// ADDRESS here (`:5850-5863`), only `bufferAddrOffset_` (`:6521`). Entry 260 folds [`Arch::PT_ROWS`]
+// into its scale for BOTH (`ddc/ddcv1.cpp:2417-2420`), so an L0LU operand's start address differs
+// between the two schedulers by exactly that factor. Both are ported as written.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE SYMBOL OF `mySDsc.symbolDefinitions_` — a `VariableSymbol` (`dsc/symbolDefinitions.h`).
+///
+/// ⭐ A SYMBOLIC ADDRESS *IS* ITS SYMBOL ID. Under `isStartAddrSymbolic_` the reference stores the
+/// id in the very `int64_t` slot a byte count would occupy (`L3DlOpsScheduler.cpp:5978-5990`), so
+/// the two conversions below are the reinterpretation it performs and not a lossy cast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VariableSymbol(pub u64);
+
+impl VariableSymbol {
+    /// The id as a `startAddr_` slot holds it.
+    #[must_use]
+    pub const fn as_address(self) -> Bytes {
+        Bytes(self.0)
+    }
+}
+
+/// ONE `VariableDefinition::OperandsType` ENTRY — the `{isSymbol, value}` PAIR as the ONE choice it
+/// is, so a literal byte count cannot be read as a symbol id or the reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolOperand {
+    /// `{true, sym}`.
+    Symbol(VariableSymbol),
+    /// `{false, value}`.
+    Literal(i64),
+}
+
+/// `VariableOperator` NARROWED TO ENTRY 333'S SIX (`:5857`, `:5905`, `:5983-5996`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolOp {
+    /// `CONST`.
+    Const,
+    /// `ADD`.
+    Add,
+    /// `DIV`.
+    Div,
+    /// `DIV_CEIL`.
+    DivCeil,
+    /// `MOD`.
+    Mod,
+    /// `MACC`.
+    Macc,
+}
+
+/// `mySDsc.symbolDefinitions_` AS ENTRY 333 WRITES IT — [`v1::Symbols`] widened by the one
+/// definition entry 260 never mints.
+///
+/// ⭐ THE ARM IS THE TRAIT'S, NOT THE REPRESENTATION'S, exactly as it is for [`v1::Symbols`]: a
+/// symbol is DEFINED, not computed, and the table that defines it is the only thing that can name
+/// the result.
+pub trait SymbolTable: v1::Symbols {
+    /// `addVar(op, operands)` — the symbol the definition is filed under.
+    fn add_var(&mut self, op: SymbolOp, operands: &[SymbolOperand]) -> VariableSymbol;
+}
+
+/// ONE OPERAND'S TWO `DataInfo`s — the direct fill and, where the operand gathers through an index
+/// tensor, the INDIRECT one beside it.
+///
+/// ⭐ ONE VALUE BECAUSE THE PAGED LADDER ROUTES BETWEEN THEM (`:6402-6409`): a paged offset that
+/// overflows one page is written to the indirect `DataInfo` and to no other, so a caller holding
+/// only the direct fill would silently drop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L3Fill {
+    /// `srcLdsAndLoopOffsets_`, `dstLdsAndLoopOffsets_[i]`, or an input's or output's.
+    pub direct: v1::DataInfoFill,
+    /// `srcIndirectLdsAndLoopOffsets_` / `dstIndirectLdsAndLoopOffsets_[i]`, [`None`] for an operand
+    /// the transfer does not gather through.
+    pub indirect: Option<v1::DataInfoFill>,
+}
+
+/// WHERE ENTRY 333'S FILLS GO — [`v1::DataInfoSink`] LESS its two constant-offset fixups, which the
+/// L3 body cannot reach: the only writer of them is the `apply_row_offset_` block, and
+/// `metadata.datatransfers_` is `DT_CHECK`ed EMPTY before it (`:5757`).
+pub trait L3DataInfoSink {
+    /// Both `DataInfo`s at one operand, installed in ONE move.
+    fn fill(&mut self, at: v1::OperandSite, filled: L3Fill) -> Option<()>;
+    /// `lastFusableParentLoopSrc_`.
+    fn set_last_fusable_src(&mut self, node: NodeId, at: Option<LoopId>) -> Option<()>;
+    /// `lastFusableParentLoopDst_`, CLEARED AND REFILLED, one entry per destination.
+    fn set_last_fusable_dsts(&mut self, node: NodeId, at: Vec<Option<LoopId>>) -> Option<()>;
+}
+
+/// WHAT ENTRY 333 READS OFF THE DESIGN SPACE THAT [`v1::OffsetSizes`] DOES NOT — the four `dsc2`
+/// and `DesignSpaceConfig` accessors outside this campaign's file list, plus the two datastages
+/// [`calculate_corelet_offset_in_byte`] needs.
+pub trait L3OffsetFacts: MemOrgs {
+    /// However the caller carries a `DataStructDims`.
+    type Stage: DimStage + ?Sized;
+
+    /// `allocNode->getPageSize()` (`dsc/dsc2.cpp:4479`), EMPTY where nothing pages.
+    ///
+    /// ⛔ A SEAM AND NOT A DERIVATION: `getPageSize` dispatches on `indirectAllocType_` and reads
+    /// `relatedIndirectAccessAlloc_` for an `INDEX_TENSOR` (`:4483-4491`), and
+    /// [`dsc2::AllocateNode`](AllocateNode) carries NEITHER — only [`L3AllocateNode`] does.
+    /// ⛔ NON-ZERO BY TYPE, WHICH IS THE DIVISOR GUARD: the page size divides an element offset
+    /// (`:6396`) and bounds it (`:6400`), and a page of no elements is not a page.
+    fn page_sizes(&self, alloc: AllocId) -> BTreeMap<PrimaryDim, NonZeroU64>;
+
+    /// `getBufferCapacityForNodePerDim(alloc, lds, storage, -1, -1, /*noRounding=*/true)` (`:5875`)
+    /// — the index tensor's IBR extent per dim WITHOUT rounding up to a whole stick.
+    fn ibr_sizes_no_rounding(
+        &self,
+        alloc: AllocId,
+        lds: LdsIdx,
+        storage: SenComponent,
+    ) -> Option<BTreeMap<PrimaryDim, Elements>>;
+
+    /// `labeledDs_.at(lds).wordLength` (`dsc/dsc2.h:296`).
+    fn word_length(&self, lds: LdsIdx) -> Option<WordLength>;
+
+    /// `dimToSymbolMapping_.at(dim)`, and the EMPTY vector is `count(dim) == 0`.
+    ///
+    /// ⛔ A LIST AND NOT AN [`Option`]: "no entry" makes the reference SKIP the dim (`:5155`) while
+    /// "not exactly one symbol" makes it ABORT on `DT_CHECK(symbols.size() == 1)`, and one
+    /// [`Option`] would conflate a skip with a refusal.
+    fn dim_symbols(&self, dim: PrimaryDim) -> Vec<VariableSymbol>;
+
+    /// `getSizeDataStageForNode(alloc, alloc).ss_` (`:4848`).
+    fn size_stage(&self, alloc: AllocId) -> Option<&Self::Stage>;
+
+    /// `dataStageParam_.at(dataStageChunkIdx).ss_` (`:4851`) — mandatory, which is *"Expect chunk
+    /// data stage."* discharged.
+    fn chunk_stage(&self) -> &Self::Stage;
+}
+
+/// EVERYTHING ENTRY 333 READS — one value, so the six things the reference reaches for through
+/// `mySDsc`, `currDsc`, `metadata` and `dscGlobal` arrive together and in one lifetime.
+pub struct L3OffsetInputs<'a, P: ?Sized, T: ?Sized, G: ?Sized> {
+    /// `mySDsc`.
+    pub sdsc: &'a SuperDsc,
+    /// `dscIdx` — ⭐ THE DSC IS DERIVED FROM IT AND NOT A SECOND FIELD, so the two cannot disagree.
+    pub dsc_idx: DscIdx,
+    /// The datastage extents and the address granularity table.
+    pub sizes: &'a P,
+    /// `currDsc->scheduleTree_`.
+    pub tree: &'a T,
+    /// The four accessors outside this file list.
+    pub facts: &'a G,
+    /// The allocate nodes the tree's ALLOCATEs name.
+    pub allocs: &'a v1::AllocArena,
+    /// `dscMetadata.at(dscIdx)`.
+    pub metadata: &'a DscMetadata,
+    /// `allowUnpaddedIndexingAtPaddedNoZeroPad`.
+    pub unpadded: v1::UnpaddedIndexing,
+}
+
+impl<P: ?Sized, T: ?Sized, G: ?Sized> L3OffsetInputs<'_, P, T, G> {
+    /// `&mySDsc.dscs_.at(dscIdx)` — [`None`] is that `.at()`'s throw.
+    fn dsc(&self) -> Option<&DesignSpaceConfig> {
+        self.sdsc.dscs().at(self.dsc_idx)
+    }
+}
+
+/// WHERE ONE TRIP'S ELEMENT OFFSET LANDS — `storeLoopEleOffs` AND `isIndirectLoopEleOffs`
+/// (`:6376-6377`) AS ONE VALUE.
+///
+/// ⛔ TWO `bool`s CANNOT SPELL THIS: `!store && indirect` is not a state the reference can be in,
+/// and reading the pair in the wrong order writes a paged offset into the direct `DataInfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetPlace {
+    /// `di.loopEleOffsets_[cl][loop][dim] = loopEleOffs`.
+    Direct(v1::LoopEleOffset),
+    /// `indirectDi->loopEleOffsets_[cl][loop][dim] = loopEleOffs`.
+    Indirect(v1::LoopEleOffset),
+    /// `storeLoopEleOffs = false` — the offset belongs to a page the indirect allocation's own owner
+    /// loop already accounts for.
+    Dropped,
+}
+
+/// Replaces: e333_fillLoopOffsetsAndAddresses
+///
+/// Fills every transfer and compute operand of one DSC with its allocation's start address at that
+/// unit's address granularity, one element offset per enclosing loop and dim, the padding's constant
+/// offsets, its buffer switch position, and — where the operand gathers through an index tensor —
+/// the whole indirect `DataInfo` beside it.
+///
+/// ⛔ [`None`] IS EVERY `DT_ERROR`/`DT_CHECK`: a storage the lds has no `memOrg_` for, an allocation
+/// no parent loop holds, an indirection that is not an IBR, a repeated stick dim, and an index
+/// tensor whose word length is not four.
+pub fn fill_loop_offsets_and_addresses<A, P, T, G, K, S>(
+    inputs: &L3OffsetInputs<'_, P, T, G>,
+    sink: &mut K,
+    symbols: &mut S,
+) -> Option<()>
+where
+    A: Arch,
+    P: v1::StageSizes + v1::OffsetSizes + ?Sized,
+    T: v1::ScheduleNodes + ?Sized,
+    G: L3OffsetFacts + ?Sized,
+    K: L3DataInfoSink + ?Sized,
+    S: SymbolTable + ?Sized,
+{
+    let tree = inputs.tree;
+    for node in tree.nodes() {
+        if inputs.metadata.external_nodes.contains(&node) {
+            continue;
+        }
+        let owner_loop = tree.owner_loop(node);
+        match tree.kind(node) {
+            Some(NodeKind::Transfer) => {
+                let transfer = tree.transfer(node)?;
+                if transfer.src.unit == SenComponent::NoComponent
+                    && !tree.transfer_has_padding(node)
+                {
+                    continue;
+                }
+                let src_site = v1::OperandSite::TransferSrc(node);
+                let indirect = transfer.src_indirect.map(Via::operand);
+                if let Some(filled) = l3_fill_data_info::<A, _, _, _, _>(
+                    inputs,
+                    symbols,
+                    &transfer.src,
+                    indirect.as_ref(),
+                    owner_loop,
+                )? {
+                    sink.fill(src_site, filled)?;
+                }
+                sink.set_last_fusable_src(
+                    node,
+                    l3_last_fusable_loop(tree, node, transfer.src.unit),
+                )?;
+
+                // ⛔ THE `dstLdsAndLoopOffsets_.size() != dstVias_.size()` `DT_ERROR` IS UNSPELLABLE:
+                // [`Dsts`] holds each destination's location and its offsets as ONE entry.
+                // ⛔ AND SO IS `isDstIndirectAtIndex(i)` FOR `i > 0`: entry 227 demands
+                // `dstVias_.size() == 1` before it writes, which is why [`TransferNode::dst_indirect`]
+                // is ONE end.
+                let mut fusable_dsts = Vec::new();
+                for (index, dst) in transfer.dsts.iter().enumerate() {
+                    let site = v1::OperandSite::TransferDst(
+                        node,
+                        DestIdx(u32::try_from(index).ok()?),
+                    );
+                    let indirect =
+                        transfer.dst_indirect.filter(|_| index == 0).map(Via::operand);
+                    if let Some(filled) = l3_fill_data_info::<A, _, _, _, _>(
+                        inputs,
+                        symbols,
+                        dst,
+                        indirect.as_ref(),
+                        owner_loop,
+                    )? {
+                        sink.fill(site, filled)?;
+                    }
+                    fusable_dsts.push(l3_last_fusable_loop(tree, node, dst.unit));
+                }
+                sink.set_last_fusable_dsts(node, fusable_dsts)?;
+            }
+            Some(NodeKind::Compute) => {
+                let compute = tree.compute(node)?;
+                // ⛔ THE `"Compute node input/output missing information"` `DT_ERROR` IS UNSPELLABLE:
+                // [`ComputeNode`] zips `inputs_`/`outputs_` with their offsets, one [`Operand`] each.
+                for (index, input) in compute.inputs.iter().enumerate() {
+                    let site = v1::OperandSite::ComputeInput(node, v1::InputIdx(index));
+                    if let Some(filled) =
+                        l3_fill_data_info::<A, _, _, _, _>(inputs, symbols, input, None, owner_loop)?
+                    {
+                        sink.fill(site, filled)?;
+                    }
+                }
+                for (index, output) in compute.outputs.iter().enumerate() {
+                    let site = v1::OperandSite::ComputeOutput(node, v1::OutputIdx(index));
+                    if let Some(filled) = l3_fill_data_info::<A, _, _, _, _>(
+                        inputs, symbols, output, None, owner_loop,
+                    )? {
+                        sink.fill(site, filled)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(())
+}
+
+/// `fillDataInfo(di, indirectDi, loc, indirectLoc, loopLocation, isProducer)` (`:5783-6528`) as the
+/// value it computes rather than the two references it mutates.
+///
+/// [`None`] is every abort; `Some(None)` is the lambda's two early returns, which leave the operand
+/// exactly as it was.
+/// ⚠️ `isProducer` IS DROPPED: its only reader is the `dataConnectLoops` block, commented out at
+/// `:6337-6340`.
+fn l3_fill_data_info<A, P, T, G, S>(
+    inputs: &L3OffsetInputs<'_, P, T, G>,
+    symbols: &mut S,
+    loc: &Operand,
+    indirect: Option<&Operand>,
+    loop_location: Option<LoopId>,
+) -> Option<Option<L3Fill>>
+where
+    A: Arch,
+    P: v1::StageSizes + v1::OffsetSizes + ?Sized,
+    T: v1::ScheduleNodes + ?Sized,
+    G: L3OffsetFacts + ?Sized,
+    S: SymbolTable + ?Sized,
+{
+    if loc.data.my_lds_idx.is_none() && loc.data.constant_id.is_none() {
+        return Some(None);
+    }
+    if !v1::is_dsc_memory(loc.storage) {
+        return Some(None);
+    }
+    let dsc = inputs.dsc()?;
+    let tree = inputs.tree;
+
+    // ⛔ THE `memOrg_` LOOKUP AND ITS `DT_ERROR` ARE THE SAME QUESTION: an lds with no entry for this
+    // storage has no allocation to take an address from, which is what the reference stops on.
+    let alloc = match (loc.data.my_lds_idx, loc.data.constant_id) {
+        (Some(lds), _) => inputs.sizes.lds_alloc(lds, loc.storage)?,
+        (None, Some(constant)) => inputs.sizes.const_alloc(constant, loc.storage)?,
+        (None, None) => return Some(None),
+    };
+    let allocation = inputs.allocs.get(&alloc)?;
+    let is_symbolic = allocation.placement.is_start_addr_symbolic;
+    let mut start_address = allocation.start_address.clone();
+
+    // ── the cross-core reduction's corelet-1 HBM shift ──────────────────────────────────────────
+    if dsc.corelets_used_dsc2.is_some_and(CoreletsUsed::splits)
+        && loc.storage == SenComponent::Hbm
+        && loc.data.my_lds_idx.is_some_and(|lds| dsc.labeled_ds.is_output(lds))
+        && is_op_cross_core_reduction(inputs.sdsc, dsc)?
+    {
+        // ⛔ `DT_ERROR("Currently no support; work in progress")`.
+        (!is_symbolic).then_some(())?;
+        let mut ends = BTreeSet::new();
+        for group in cross_core_reduction_group_info(inputs.sdsc, dsc)? {
+            // ⛔ [`None`] IS `DT_CHECK_MSG(!coreGroup.isEmpty(), "Expect valid core group.")`; a
+            // group whose corelet-1 end is a `-1` HOLE contributes the `-1` the reference inserts,
+            // which matches no core id — dropping it is the same set.
+            if let Some(end) = group.cores()?.end_core_at_corelet(GroupCorelet::One) {
+                ends.insert(end);
+            }
+        }
+        let offsets = calculate_corelet_offset_in_byte::<A, _, _>(
+            dsc,
+            inputs.facts.size_stage(alloc)?,
+            inputs.facts.chunk_stage(),
+            loc.data.my_lds_idx?,
+            allocation.component,
+            &padding_form(&allocation.placement.padding),
+        )?;
+        let shift = offsets.get(&Corelet::checked(1)?)?.0;
+        start_address.map_addresses(|core, corelet, addr| {
+            if corelet != Corelet::at::<0>() || !ends.contains(&core) {
+                return Some(addr);
+            }
+            Some(Bytes(addr.0.checked_add(shift.0)?))
+        })?;
+    }
+
+    // ── the unit's address granularity ─────────────────────────────────────────────────────────
+    // ⛔ NO [`Arch::PT_ROWS`] HERE, unlike entry 260 — see this section's banner.
+    let generic = generic_comp(loc.unit)?;
+    let scale = inputs.sizes.address_scale(generic, loc.storage)?;
+    if scale.get() != 1 {
+        start_address = if is_symbolic {
+            symbols.divide_symbols(&start_address, scale)
+        } else {
+            start_address.divided_by(scale)
+        };
+    }
+
+    let mut fill = v1::DataInfoFill {
+        start_address,
+        is_start_addr_symbolic: is_symbolic,
+        loop_ele_offsets: BTreeMap::new(),
+        const_ele_offsets: BTreeMap::new(),
+        buffer_switch_position: None,
+        buffer_addr_offset: BTreeMap::new(),
+    };
+
+    // ── the indirect (IBR) operand ─────────────────────────────────────────────────────────────
+    let mut indirect_alloc = None;
+    let mut indirect_fill = None;
+    if let Some(via) = indirect {
+        let (ind, filled) = ibr_start_address::<A, _, _, _, _>(inputs, symbols, dsc, via)?;
+        indirect_alloc = Some(ind);
+        indirect_fill = Some(filled);
+    }
+
+    // Constants get an address and nothing else.
+    let Some(lds) = loc.data.my_lds_idx else {
+        return Some(Some(L3Fill {
+            direct: fill,
+            indirect: indirect_fill,
+        }));
+    };
+    let entry = dsc.labeled_ds.at(lds)?;
+    let mem = inputs.facts.mem_org(inputs.dsc_idx, lds)?;
+    let pages = inputs.facts.page_sizes(alloc);
+    let alloc_owner = tree.alloc_owner_loop(alloc);
+    let indirect_owner = indirect_alloc.and_then(|ind| tree.alloc_owner_loop(ind));
+    let layout: Vec<PrimaryDim> = allocation.layout.dims().iter().collect();
+    let padding = allocation.placement.padding.clone();
+    let corelets = dsc2_corelets(dsc)?;
+    // `int scale = dimIdx < 0 ? 1 : scale_.at(dimIdx); if (scale > 0)` — the reference TRUNCATES a
+    // `double` to `int`, so anything below one is zero, which is exactly entry 002's `scale_ < 1`.
+    let scaled = |dim: PrimaryDim| !is_labeled_ds_dimension_broadcast(entry, dim).unwrap_or(false);
+
+    // ── the element offsets, one climb from the node's loop up to the allocation's ─────────────
+    let mut reached_indirect_owner = false;
+    let mut walked = loop_location;
+    while walked != alloc_owner {
+        // ⛔ A CLIMB THAT RAN OUT OF TREE IS THE `DT_ERROR`: the reference tests `prev_ == nullptr`
+        // and, at the root, dereferences a null `loopPtr` on the next trip.
+        let here = walked?;
+        tree.prev(here.0)?;
+        if indirect_owner == Some(here) {
+            reached_indirect_owner = true;
+        }
+        let stages = tree.loop_stages(here);
+        for (dim, kind) in tree.loop_dims(here) {
+            let mut alloc_padding = padding.get(dim);
+            let mut relevant = layout.contains(&dim);
+            let mut related_pad_dim = None;
+            if !relevant && !tree.is_parametric(here) {
+                // Accessing a padded dim through the window dim that walks it — iterating within
+                // one window.
+                for (pad_dim, pad_info) in inputs.sizes.stage_padding_dims(stages.den) {
+                    if pad_info.window_dim == dim && padding.get(pad_dim) != PadType::NoPad {
+                        relevant = true;
+                        alloc_padding = padding.get(pad_dim);
+                        related_pad_dim = Some(pad_dim);
+                        break;
+                    }
+                }
+            }
+            if !relevant || !scaled(dim) {
+                continue;
+            }
+            // `scaleDownFactor = 1.0 / mxInfo_.blkSize` on a scale tensor's own mx dim.
+            let density = match entry.scale_tensor() {
+                Some(mx) if mx.dim == dim => {
+                    v1::Density::per_block(NonZeroU64::new(mx.blk_size.count().0)?)
+                }
+                _ => v1::Density::FULL,
+            };
+            for &corelet in &corelets {
+                let place = if tree.is_parametric(here) {
+                    OffsetPlace::Direct(tree.parametric_stride(here))
+                } else {
+                    // ⛔ THE CORELET VIEW IS ALWAYS `-1`: `belowChunkLimit` cannot be true.
+                    let step = inputs
+                        .sizes
+                        .comp_view_scaled(
+                            stages.den,
+                            dim,
+                            loc.unit,
+                            None,
+                            PadType::NoPad,
+                            density,
+                        )
+                        .0;
+                    let offset = v1::padded_loop_offset(
+                        inputs.sizes,
+                        stages.den,
+                        dim,
+                        kind,
+                        loc.unit,
+                        None,
+                        &padding,
+                        alloc_padding,
+                        related_pad_dim,
+                        step,
+                        density,
+                        inputs.unpadded,
+                    )?;
+                    // ⛔ THE PAGED BLOCK'S OWN `DT_CHECK_MSG(allocPadding == NOPAD, "Do not expect a
+                    // dimension is both paged and padded.")` IS A TAUTOLOGY AND SO UNSPELLABLE:
+                    // [`PadType`] has exactly six variants and the block sits in the `else` the
+                    // other five have already been taken out of.
+                    if alloc_padding == PadType::NoPad {
+                        paged_place(mem, &pages, dim, offset, reached_indirect_owner)?
+                    } else {
+                        OffsetPlace::Direct(v1::LoopEleOffset(i32::try_from(offset).ok()?))
+                    }
+                };
+                let target = match place {
+                    OffsetPlace::Direct(offset) => (&mut fill, offset),
+                    // ⛔ `DT_CHECK_MSG(indirectDi, "Expect a valid indirect DataInfo")`.
+                    OffsetPlace::Indirect(offset) => (indirect_fill.as_mut()?, offset),
+                    OffsetPlace::Dropped => continue,
+                };
+                target
+                    .0
+                    .loop_ele_offsets
+                    .entry(corelet)
+                    .or_default()
+                    .entry(here)
+                    .or_default()
+                    .insert(dim, target.1);
+            }
+        }
+        walked = tree.owner_loop(here.0);
+    }
+
+    // ── the constant offsets the padding itself contributes, over the same climb ───────────────
+    let mut walked = loop_location;
+    while walked != alloc_owner {
+        let here = walked?;
+        tree.prev(here.0)?;
+        let stages = tree.loop_stages(here);
+        for (dim, kind) in tree.loop_dims(here) {
+            if !layout.contains(&dim) || !scaled(dim) {
+                continue;
+            }
+            if !v1::is_zero_padded(padding.get(dim)) {
+                continue;
+            }
+            // `metadata.core_dstgid`, which the L3 scheduler sets to `dataStageCoreIdx` (`:6420`).
+            let stage = if tree.is_parametric(here) {
+                DATA_STAGE_CORE
+            } else {
+                stages.den
+            };
+            // ⛔ THE TWO `padFront_ < 0` / `padBack_ < 0` `DT_ERROR`S ARE UNSPELLABLE: [`Elements`] is
+            // unsigned, so a negative pad is not a value [`v1::PaddingSizes`] can hold.
+            let offset = match kind {
+                MetaDimKind::PadValid => {
+                    // The zero-pad front, which a later stage adds on top of the element offset.
+                    let sizes = inputs.sizes.stage_padding_sizes(stage, dim)?;
+                    v1::ConstEleOffset(i64::try_from(sizes.pad_front.0).ok()?)
+                }
+                MetaDimKind::PadBack => {
+                    // The zero-pad front PLUS the valid span, which is the padded extent less the
+                    // back.
+                    let sizes = inputs.sizes.stage_padding_sizes(stage, dim)?;
+                    let span = inputs
+                        .sizes
+                        .dim_extent(
+                            stage,
+                            dim,
+                            SenComponent::NoComponent,
+                            None,
+                            padding.get(dim),
+                            v1::Density::FULL,
+                        )
+                        .0;
+                    v1::ConstEleOffset(span - i64::try_from(sizes.pad_back.0).ok()?)
+                }
+                _ => continue,
+            };
+            for core in dsc.core_ids_used.iter() {
+                for &corelet in &corelets {
+                    fill.const_ele_offsets
+                        .entry(core)
+                        .or_default()
+                        .entry(corelet)
+                        .or_default()
+                        .insert(dim, offset);
+                }
+            }
+        }
+        walked = tree.owner_loop(here.0);
+    }
+
+    // ── the buffer switch ──────────────────────────────────────────────────────────────────────
+    if allocation.placement.num_buffers.switches() {
+        // ⛔ `DT_CHECK_MSG(loopPtr->getOwnerLoop() != nullptr, "Do not expect the root node.")`,
+        // where `loopPtr` has walked all the way up to the allocation's own owner loop.
+        let switch_at = alloc_owner?;
+        tree.owner_loop(switch_at.0)?;
+        fill.buffer_switch_position = Some(switch_at);
+        // ⭐ HERE `numPTRows` DOES divide, and only for an L0LU (`:6521`).
+        let divisor = if generic == GenericComp::L0lu {
+            scale.get().checked_mul(u64::from(A::PT_ROWS))?
+        } else {
+            scale.get()
+        };
+        fill.buffer_addr_offset = allocation
+            .placement
+            .buffer_offset
+            .iter()
+            .map(|(&core, per_cl)| {
+                (
+                    core,
+                    per_cl
+                        .iter()
+                        .map(|(&cl, &offset)| (cl, Bytes(offset.0 / divisor)))
+                        .collect(),
+                )
+            })
+            .collect();
+    }
+    Some(Some(L3Fill {
+        direct: fill,
+        indirect: indirect_fill,
+    }))
+}
+
+/// The indirect operand's whole `DataInfo` (`:5865-5981`) — the index tensor's start address re-laid
+/// with a MAPPED core axis and then, at every fold coordinate whose core takes work, shifted by that
+/// core's work slice within its own stick.
+///
+/// ⛔ [`None`] IS EVERY CHECK OF THAT BLOCK: an index tensor with no lds, an indirection storage that
+/// is not an IBR, a symbolic index allocation, a fold space with no corelet axis, an IBR extent wider
+/// than the stick, a stick dim named twice, more than one symbol for a dim, and a word length that
+/// is not four.
+fn ibr_start_address<A, P, T, G, S>(
+    inputs: &L3OffsetInputs<'_, P, T, G>,
+    symbols: &mut S,
+    dsc: &DesignSpaceConfig,
+    indirect: &Operand,
+) -> Option<(AllocId, v1::DataInfoFill)>
+where
+    A: Arch,
+    P: v1::StageSizes + v1::OffsetSizes + ?Sized,
+    T: v1::ScheduleNodes + ?Sized,
+    G: L3OffsetFacts + ?Sized,
+    S: SymbolTable + ?Sized,
+{
+    // ⛔ `DT_CHECK_MSG(indexLdsIdx >= 0, "Expect a valid index tensor.")`.
+    let index_lds = indirect.data.my_lds_idx?;
+    // ⛔ `DT_CHECK_MSG(indirectLoc->storage_ == L3LUIBR || L3SUIBR, ..)`.
+    matches!(
+        indirect.storage,
+        SenComponent::L3luibr | SenComponent::L3suibr
+    )
+    .then_some(())?;
+    // ⛔ `DT_CHECK_MSG(indAllocation, "Expect a valid indirect allocate node.")`.
+    let alloc = inputs.sizes.lds_alloc(index_lds, indirect.storage)?;
+    let allocation = inputs.allocs.get(&alloc)?;
+    // ⛔ `DT_CHECK(!indAllocation->isStartAddrSymbolic_)`.
+    (!allocation.placement.is_start_addr_symbolic).then_some(())?;
+    // `buildFoldSpace(foldProps, foldTypes.front() = Map)` FOLLOWED BY the `apply(copy)`.
+    let mut address = allocation.start_address.with_mapped_core()?;
+
+    let ibr_sizes = inputs
+        .facts
+        .ibr_sizes_no_rounding(alloc, index_lds, indirect.storage)?;
+    let ds_type = dsc.labeled_ds.at(index_lds)?.ds_type();
+    let sticks = stick_sizes(&dsc.primary_ds_info.get(&ds_type)?.stick, StickPart::Whole);
+    let cumulative = dsc.cumulative_stick_sizes(ds_type)?;
+    // ⛔ `DT_CHECK_MSG(cumulative.size() == stickSizes.size(), "Same stick dimension in multiple
+    // coordinates in the stick layout is currently not supported.")` — [`cumulative_stick_sizes`]
+    // folds a repeated dim by MULTIPLYING, so a shorter list IS the repeat.
+    (cumulative.len() == sticks.len()).then_some(())?;
+
+    let pages = inputs.facts.page_sizes(alloc);
+    let mut stick_ibr_sizes: BTreeMap<PrimaryDim, Elements> = BTreeMap::new();
+    let mut core_size_symbol: BTreeMap<PrimaryDim, VariableSymbol> = BTreeMap::new();
+    for (&dim, &size) in &ibr_sizes {
+        let Some(&(_, stick)) = cumulative.iter().find(|&&(walked, _)| walked == dim) else {
+            continue;
+        };
+        // ⛔ THE `!indexLdsStickDimIbrSizesNoRounding.count(dim)` `DT_CHECK` IS UNSPELLABLE:
+        // [`L3OffsetFacts::ibr_sizes_no_rounding`] is keyed BY dim, one entry each by construction.
+        // ⛔ `DT_CHECK_MSG(size <= cumulative.at(dim), "IBR stick dimension size without rounding
+        // should always be not greater than the stick size.")`.
+        (size <= stick).then_some(())?;
+        stick_ibr_sizes.insert(dim, size);
+        let dim_symbols = inputs.facts.dim_symbols(dim);
+        if dim_symbols.is_empty() || inputs.sdsc.num_wk_slices_per_dim.get(&dim)?.get() <= 1 {
+            continue;
+        }
+        // ⛔ `DT_CHECK(symbols.size() == 1)`.
+        let [only] = dim_symbols.as_slice() else {
+            return None;
+        };
+        let page = i64::try_from(pages.get(&dim)?.get()).ok()?;
+        core_size_symbol.insert(
+            dim,
+            symbols.add_var(
+                SymbolOp::DivCeil,
+                &[SymbolOperand::Symbol(*only), SymbolOperand::Literal(page)],
+            ),
+        );
+    }
+    let needs_symbol = !core_size_symbol.is_empty();
+
+    // ⛔ `DT_CHECK(indexLds.wordLength == 4)`.
+    let word = inputs.facts.word_length(index_lds)?;
+    (word == WordLength(4)).then_some(())?;
+    let width = i64::from(word.0);
+    let scale = i64::try_from(
+        inputs
+            .sizes
+            .address_scale(generic_comp(indirect.unit)?, indirect.storage)?
+            .get(),
+    )
+    .ok()?;
+    let per_stick = i64::try_from(A::BYTES_PER_STICK.get()).ok()?;
+
+    address.map_addresses(|core, _corelet, addr| {
+        // `if (!coreIdToWkSlice_.count(coreId)) continue;` — that address is left as it was.
+        let Some(slices) = inputs.sdsc.core_id_to_wk_slice.get(&core) else {
+            return Some(addr);
+        };
+        let mut offset: i64 = 0;
+        let mut operands: Vec<SymbolOperand> = Vec::new();
+        for &(dim, _) in &sticks {
+            let slice = slices.at(dim)?;
+            // ⛔ `DT_CHECK_MSG(count(stickDim), "Expect the stick dimension size available.")`.
+            let extent = i64::try_from(stick_ibr_sizes.get(&dim)?.0).ok()?;
+            if slice.0 == 0 {
+                continue;
+            }
+            let ordinal = i64::from(slice.0);
+            if needs_symbol {
+                operands.push(SymbolOperand::Literal(ordinal.checked_mul(width)?));
+                operands.push(match core_size_symbol.get(&dim) {
+                    Some(&sym) => SymbolOperand::Symbol(sym),
+                    None => SymbolOperand::Literal(extent),
+                });
+            } else {
+                offset =
+                    offset.checked_add(ordinal.checked_mul(extent)?.checked_mul(width)?)?;
+            }
+        }
+        let placed = i64::try_from(addr.0).ok()?;
+        if !needs_symbol {
+            // Every term is non-negative, so the remainder is too.
+            let within = offset % per_stick;
+            return Some(Bytes(addr.0.checked_add(u64::try_from(within / scale).ok()?)?));
+        }
+        if operands.is_empty() {
+            return Some(
+                symbols
+                    .add_var(SymbolOp::Const, &[SymbolOperand::Literal(placed)])
+                    .as_address(),
+            );
+        }
+        let mut sym = symbols.add_var(SymbolOp::Macc, &operands);
+        sym = symbols.add_var(
+            SymbolOp::Mod,
+            &[
+                SymbolOperand::Symbol(sym),
+                SymbolOperand::Literal(per_stick),
+            ],
+        );
+        if scale != 1 {
+            sym = symbols.add_var(
+                SymbolOp::Div,
+                &[SymbolOperand::Symbol(sym), SymbolOperand::Literal(scale)],
+            );
+        }
+        if placed != 0 {
+            sym = symbols.add_var(
+                SymbolOp::Add,
+                &[SymbolOperand::Symbol(sym), SymbolOperand::Literal(placed)],
+            );
+        }
+        Some(sym.as_address())
+    })?;
+
+    Some((
+        alloc,
+        v1::DataInfoFill {
+            start_address: address,
+            is_start_addr_symbolic: needs_symbol,
+            loop_ele_offsets: BTreeMap::new(),
+            const_ele_offsets: BTreeMap::new(),
+            buffer_switch_position: None,
+            buffer_addr_offset: BTreeMap::new(),
+        },
+    ))
+}
+
+/// The NOPAD arm's paged block (`:6390-6409`) — where a paged dim's element offset goes.
+///
+/// ⛔ THE FLOOR IS AN INTEGER DIVISION: `std::floor(float(loopEleOffs) / pageSize)` on a datastage
+/// extent, which is non-negative, so truncation IS the floor. A negative offset is not a value the
+/// ladder above can produce.
+/// ⛔ [`None`] IS `DT_ERROR("Unhandled indirect alloc type")` — an allocation that pages a dim while
+/// being neither an index tensor nor a paged one.
+fn paged_place<M: MemOrg + ?Sized>(
+    mem: &M,
+    pages: &BTreeMap<PrimaryDim, NonZeroU64>,
+    dim: PrimaryDim,
+    offset: i64,
+    reached_indirect_owner: bool,
+) -> Option<OffsetPlace> {
+    let here = v1::LoopEleOffset(i32::try_from(offset).ok()?);
+    let Some(page) = pages.get(&dim).copied() else {
+        return Some(OffsetPlace::Direct(here));
+    };
+    let elems = i64::try_from(page.get()).ok()?;
+    let scaled = v1::LoopEleOffset(i32::try_from(offset / elems).ok()?);
+    if is_index_lds(mem)? {
+        return Some(OffsetPlace::Direct(scaled));
+    }
+    is_paged_lds(mem).then_some(())?;
+    if offset < elems {
+        return Some(OffsetPlace::Direct(here));
+    }
+    if reached_indirect_owner {
+        return Some(OffsetPlace::Dropped);
+    }
+    Some(OffsetPlace::Indirect(scaled))
+}
+
+/// `findLastFusableLoop(unit)` (`:6329-6338`) — the outermost enclosing loop this unit can still see
+/// a single child through.
+///
+/// ⛔ NOT [`v1`]'S: the L3 copy has NEITHER the `CONDITION` break NOR the symbolic-loop break, so an
+/// L3 transfer fuses through both. [`None`] is `nullptr` and not an abort.
+fn l3_last_fusable_loop<T: v1::ScheduleNodes + ?Sized>(
+    tree: &T,
+    node: NodeId,
+    unit: SenComponent,
+) -> Option<LoopId> {
+    if !tree.is_relevant(node, unit) {
+        return None;
+    }
+    let mut last = None;
+    let mut parent = tree.prev(node);
+    while let Some(here) = parent {
+        if tree.prev(here).is_none() || tree.next_view_len(here, unit) != 1 {
+            break;
+        }
+        if let Some(at) = tree.as_loop(here) {
+            last = Some(at);
+        }
+        parent = tree.prev(here);
+    }
+    last
+}
+
+/// `for (int clId = 0; clId < numCoreletsUsed_DSC2_; clId++)` as the corelets it names — [`None`] is
+/// the `-1` an unprepared DSC carries, which would size the reference's loop to nothing.
+fn dsc2_corelets(dsc: &DesignSpaceConfig) -> Option<Vec<Corelet>> {
+    (0..dsc.corelets_used_dsc2?.get())
+        .map(Corelet::checked)
+        .collect()
+}
+
+/// `allocNode->padding_` AS [`calculate_corelet_offset_in_byte`] TAKES IT — [`Padding`] and
+/// [`PaddingForm`] are the same `PaddingFormType` reached through two carriers, and this is the one
+/// place the two meet.
+fn padding_form(padding: &Padding) -> PaddingForm {
+    let mut form = PaddingForm::default();
+    for dim in padding.dims() {
+        form.set_padding(dim, padding.get(dim));
+    }
+    form
+}
+
+/// Replaces: e334_addIbrDataStage
+///
+/// STATES THE IBR DATA STAGE — how much of each paged dim one fill of the index-broadcast register
+/// covers: as many whole pages as the index tensor's stick holds, capped by the core's own page count,
+/// with the epilogue half taking the remainder where the core is not a whole number of those fills.
+///
+/// ⛔ THE `-1` RESOLUTION IS THE CALLER'S: [`IbrStage`] and [`OnePageStage`] witness that entry 058
+/// already minted both indices, so *"Expect the .. datastage available."* is discharged before entry.
+/// ⛔ [`None`] IS *"Support only one index tensor."*, `DT_CHECK(coreSs % pageSize == 0)`, entries 005
+/// and 283, AND the unguarded `numPagesInCore % ssNumPages` divide that a zero page count would make.
+pub fn add_ibr_data_stage<O: MemOrgs + ?Sized>(
+    dsc: &mut DesignSpaceConfig,
+    dsc_idx: DscIdx,
+    ibr: IbrStage,
+    one_page: OnePageStage,
+    paged_dims: &[PrimaryDim],
+    orgs: &O,
+) -> Option<()> {
+    let mut index_lds: Vec<LdsIdx> = Vec::new();
+    for entry in dsc.labeled_ds.iter() {
+        if is_index_lds(orgs.mem_org(dsc_idx, entry.recorded())?)? {
+            index_lds.push(entry.recorded());
+        }
+    }
+    (index_lds.len() == 1).then_some(())?;
+    // ⛔ TRAP: THE REFERENCE INDEXES `labeledDs_` WITH THE RECORDED INDEX AS A POSITION.
+    let index_type = dsc.labeled_ds.at(*index_lds.first()?)?.ds_type();
+    let index_sticks = dsc.cumulative_stick_sizes(index_type)?;
+
+    let core = dsc.data_stages.core().clone();
+    let page_sizes = dsc.data_stages.at(one_page.index())?.ss.dims.clone();
+    let mut ss = L3StageDims::default();
+    let mut el = L3StageDims::default();
+    for &dim in paged_dims {
+        let max_pages = match index_sticks.iter().find(|(named, _)| *named == dim) {
+            Some((_, size)) => i64::try_from(size.0).ok()?,
+            None => 1,
+        };
+        let page = page_sizes.dims().extent(dim)?.0;
+        let core_extent = core.ss.dims.dims().extent(dim)?.0;
+        (page != 0 && core_extent % page == 0).then_some(())?;
+        let core_pages = core_extent / page;
+        let ss_pages = core_pages.min(max_pages);
+        (ss_pages != 0).then_some(())?;
+        ss.extents.insert(dim, Extent(ss_pages * page));
+        let el_pages = if core_pages % ss_pages > 0 { core_pages % ss_pages } else { ss_pages };
+        el.extents.insert(dim, Extent(el_pages * page));
+    }
+
+    let mut ss = FilledDims::of(ss)?;
+    let mut el = FilledDims::of(el)?;
+    add_or_update_corelet_split_in_params(&mut ss, dsc)?;
+    add_or_update_corelet_split_in_params(&mut el, dsc)?;
+    // ⭐ EACH HALF TAKES ITS OWN HALF OF THE CORE STAGE'S SYMBOLIC DIMS (`:6668-6669`).
+    add_or_update_symbolic_info_in_params(&mut ss, &core.ss.dims);
+    add_or_update_symbolic_info_in_params(&mut el, &core.el.dims);
+    dsc.data_stages.set(
+        ibr.index(),
+        L3DataStage {
+            ss: NamedDims { name: StageName::ibr(), dims: ss },
+            el: NamedDims { name: StageName::ibr(), dims: el },
+        },
+    );
+    Some(())
+}
+
+/// Replaces: e335_addOnePageDataStage
+///
+/// STATES THE ONE-PAGE DATA STAGE — each paged dim's extent is ONE HBM page of it, agreed by every
+/// paged tensor of the DSC, written into both halves.
+///
+/// ⛔ [`None`] IS *"Exepect HBM in memOrg_."* with *"Expect a valid HBM allocate node."* (both
+/// [`MemOrg::hbm_page_sizes`]), *"Expect paged dim in paged tensor."*, *"Page size does not match for
+/// this dimension."* and entry 283's. ⛔ DIVERGENCE: no paged dim writes an EMPTY stage in the
+/// reference and refuses here — [`FilledDims`] is the type that says a stage states something.
+pub fn add_one_page_data_stage<O: MemOrgs + ?Sized>(
+    dsc: &mut DesignSpaceConfig,
+    dsc_idx: DscIdx,
+    one_page: OnePageStage,
+    paged_dims: &[PrimaryDim],
+    orgs: &O,
+) -> Option<()> {
+    let mut orgs_by_lds: Vec<(LdsIdx, &O::Org)> = Vec::new();
+    for entry in dsc.labeled_ds.iter() {
+        orgs_by_lds.push((entry.recorded(), orgs.mem_org(dsc_idx, entry.recorded())?));
+    }
+    let all_paged = get_all_paged_lds_indices(&orgs_by_lds);
+
+    let mut params = L3StageDims::default();
+    for &dim in paged_dims {
+        let mut agreed: Option<Extent> = None;
+        for &lds in &all_paged {
+            let page = *orgs.mem_org(dsc_idx, lds)?.hbm_page_sizes()?.get(&dim)?;
+            (agreed.is_none_or(|seen| seen == page)).then_some(())?;
+            params.extents.insert(dim, page);
+            agreed = Some(page);
+        }
+    }
+
+    let mut params = FilledDims::of(params)?;
+    add_or_update_corelet_split_in_params(&mut params, dsc)?;
+    let named = NamedDims { name: StageName::one_page(), dims: params };
+    dsc.data_stages.set(one_page.index(), L3DataStage { ss: named.clone(), el: named });
+    Some(())
+}
+
+#[cfg(test)]
+mod tests_e328_e335 {
+    // ⭐ TESTS FOR ENTRIES 328, 329 AND 333-335. ⛔ ENTRIES 330, 331 AND 332 ARE TESTED IN
+    // `tests_e283_e295`, out of span: the cross-core reduction groups entry 330 selects from, the
+    // node-id tree entry 331 climbs and the sync surgery entry 332 walks are all that module's
+    // fixtures, and a second copy of them would be a second answer.
+    use super::*;
+    use crate::arch::Sen1p5;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
+    use crate::schedule::ddc::fold::{BlockId, ConstIdx, Dilation, Stride};
+    use crate::schedule::ddl::ops::DdlComputeType;
+    use crate::schedule::dsc2::{
+        AddressFold, AllocLayout, AllocPlacement, ComputeNode, DataInfo, InstrAttribute, LayoutDims,
+        LdsScale, MaxDimSize, StartAddress,
+    };
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, DataStage, DscList, LabeledDsList, NamedDims, PrimaryDsInfo, SelectedCandidate,
+        StageDims, UnneededPad,
+    };
+
+    fn core0() -> Core {
+        Core::checked(0).expect("core 0")
+    }
+
+    fn dims(extents: &[(PrimaryDim, i64)]) -> FilledDims {
+        let mut stage = StageDims::default();
+        for &(dim, extent) in extents {
+            stage.extents.insert(dim, Extent(extent));
+        }
+        FilledDims::of(stage).expect("a stage that states a dim")
+    }
+
+    fn stage(name: &str, extents: &[(PrimaryDim, i64)]) -> DataStage {
+        let name = StageName(name.to_owned());
+        DataStage {
+            ss: NamedDims { name: name.clone(), dims: dims(extents) },
+            el: NamedDims { name, dims: dims(extents) },
+        }
+    }
+
+    fn labeled(ds_type: DsType, recorded: LdsIdx, scales: &[(PrimaryDim, Scale)]) -> LabeledDs {
+        LabeledDs::new(ds_type, scales.to_vec(), recorded, Pinning::default())
+    }
+
+    fn a_dsc(core_extents: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
+        DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
+            corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: Some(CoreletsUsed::ONE),
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(core0(), vec![]),
+            layout_dims: BTreeMap::new(),
+            labeled_ds: LabeledDsList::new(labeled(DsType::Input, LdsIdx(0), &[]), vec![]),
+            data_stages: L3DataStages::new(stage("core", core_extents), stage("chunk", chunk)),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+            full_padding: BTreeMap::new(),
+        }
+    }
+
+    /// `computeOp_.at(0).opFuncName`, which is all entry 328 asks of the ops.
+    struct Ops(OpFunc);
+
+    impl ComputeOps for Ops {
+        fn op_funcs(&self) -> v1::OpFuncs {
+            v1::OpFuncs::new(Some(self.0), Vec::new())
+        }
+        fn set_first_op_func(&mut self, op_func: OpFunc) {
+            self.0 = op_func;
+        }
+    }
+
+    /// One labelled DS's `memOrg_` as entries 333-335 read it, stated by field.
+    #[derive(Default)]
+    struct Org {
+        indirection: Option<IndirectAlloc>,
+        hbm_pages: Option<BTreeMap<PrimaryDim, Extent>>,
+    }
+
+    impl MemOrg for Org {
+        fn hbm_pinned(&self) -> bool {
+            false
+        }
+        fn lx_buffering(&self) -> Option<Buffering> {
+            None
+        }
+        fn lx_start_address(&self, _at: &AddressCoord) -> Option<ByteAddress> {
+            None
+        }
+        fn lx_buffer_offset(&self, _core: Core, _corelet: Corelet) -> Option<BufferOffset> {
+            None
+        }
+        fn hbm_indirection(&self) -> Option<IndirectAlloc> {
+            self.indirection
+        }
+        fn hbm_allocation(&self) -> Option<NodeName> {
+            None
+        }
+        fn hbm_layout_dims(&self) -> Option<LayoutDims> {
+            None
+        }
+        fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>> {
+            self.hbm_pages.clone()
+        }
+        fn lx_padding(&self) -> Option<PaddingForm> {
+            None
+        }
+        fn lx_page_sizes(&self) -> BTreeMap<PrimaryDim, Extent> {
+            BTreeMap::new()
+        }
+        fn hbm_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
+        }
+        fn lx_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
+        }
+        fn lx_zero_padded(&self) -> Option<bool> {
+            Some(false)
+        }
+    }
+
+    /// The organisations of one DSC, by the labelled DS index the entries hand them.
+    #[derive(Default)]
+    struct Orgs(BTreeMap<LdsIdx, Org>);
+
+    impl MemOrgs for Orgs {
+        type Org = Org;
+
+        fn mem_org(&self, _dsc: DscIdx, lds: LdsIdx) -> Option<&Org> {
+            self.0.get(&lds)
+        }
+    }
+
+    /// e328 — a dim whose 70 elements of padding span 70 chunks of one carries its cost down to a
+    /// fifth, so the smallest chunk is 14, which already divides the 28-element core. A dim of an op
+    /// with no window carries no minimum at all.
+    #[test]
+    fn the_padded_min_param_is_the_first_divisor_past_a_fifth_of_the_pad_span() {
+        let mut dsc = a_dsc(&[(PrimaryDim::I, 28)], &[(PrimaryDim::I, 4)]);
+        let mut core = stage("core", &[(PrimaryDim::I, 28)]);
+        core.ss.dims.padding_mut().insert(
+            PrimaryDim::I,
+            DimPadding {
+                sizes: PadSizes::of(PadElems(35), PadElems(35)),
+                window_dim: None,
+                unneeded: UnneededPad::default(),
+                stride: Stride::ONE,
+                dilation: Dilation(1),
+            },
+        );
+        dsc.data_stages.set(DATA_STAGE_CORE, core);
+        assert_eq!(
+            compute_min_param_for_padded_dim(&dsc, &Ops(OpFunc::Conv2DInt4Fwd), PrimaryDim::I),
+            Some(Extent(14))
+        );
+        // ⛔ "Expect a strided-window op." — a batch matmul has no window to pad.
+        assert_eq!(
+            compute_min_param_for_padded_dim(
+                &dsc,
+                &Ops(OpFunc::BatchmatmulInt8Fwd),
+                PrimaryDim::I
+            ),
+            None
+        );
+    }
+
+    /// e329 — the selected candidate becomes the chunk stage's extent, written into BOTH halves.
+    #[test]
+    fn the_chunk_stage_takes_the_selected_candidate_in_both_halves() {
+        let mut dsc = a_dsc(&[(PrimaryDim::I, 16)], &[(PrimaryDim::I, 2)]);
+        let candidates = DscParamCandidates(BTreeMap::from([(
+            PrimaryDim::I,
+            SelectedCandidate::new(vec![Extent(2), Extent(4), Extent(8)], 1)
+                .expect("an index into the candidates"),
+        )]));
+        let mut chunk_params = dims(&[(PrimaryDim::I, 2)]);
+        assert_eq!(
+            add_chunk_data_stage_from_candidates::<true>(&mut chunk_params, &mut dsc, &candidates),
+            Some(())
+        );
+        let chunk = dsc.data_stages.chunk();
+        assert_eq!(chunk.ss.dims.dims().extent(PrimaryDim::I), Some(Extent(4)));
+        assert_eq!(chunk.el.dims.dims().extent(PrimaryDim::I), Some(Extent(4)));
+    }
+
+    // ── entry 333's seams ──────────────────────────────────────────────────────────────────────
+
+    /// The denominator and the numerator datastage every fixture loop names.
+    const DEN: DatastageId = DATA_STAGE_CHUNK;
+    const NUM: DatastageId = DATA_STAGE_CORE;
+
+    fn operand(unit: SenComponent, storage: SenComponent, lds: Option<u32>) -> Operand {
+        Operand {
+            unit,
+            storage,
+            data: DataInfo {
+                data_connect: None,
+                latch_data_id: None,
+                my_lds_idx: lds.map(LdsIdx),
+                constant_id: None,
+            },
+        }
+    }
+
+    /// One LX allocation of `I` whose address is placed at core 0, corelet 0.
+    fn alloc_node(placed: Bytes) -> AllocateNode {
+        let mut start_address = StartAddress::new(FoldDim::default());
+        start_address.build_fold_space(2, AddressFold::Map, AddressFold::Constant);
+        start_address.insert(core0(), Corelet::at::<0>(), placed);
+        AllocateNode {
+            name: NodeName("alloc".to_owned()),
+            component: SenComponent::Lx,
+            lds: Some(LdsIdx(0)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new(
+                (PrimaryDim::I, MaxDimSize::Resolved(Elements(64))),
+                Vec::new(),
+            ),
+            start_address,
+            placement: AllocPlacement::default(),
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        }
+    }
+
+    /// ONE SCHEDULE TREE as entry 333's driver walks it — a single COMPUTE at the root.
+    struct Tree(ComputeNode);
+
+    impl v1::ScheduleWalk for Tree {
+        fn loops_under(&self, _from: BlockId) -> Vec<LoopId> {
+            Vec::new()
+        }
+        fn nodes_of_kind(&self, _kind: NodeKind) -> Vec<NodeId> {
+            Vec::new()
+        }
+        fn allocates(&self) -> Vec<AllocId> {
+            Vec::new()
+        }
+        fn nodes_of_kind_under(
+            &self,
+            _from: Option<NodeId>,
+            _kind: NodeKind,
+            _unit: SenComponent,
+        ) -> Vec<NodeId> {
+            Vec::new()
+        }
+        fn prev_of_alloc(&self, _alloc: AllocId) -> Option<NodeId> {
+            None
+        }
+        fn transfer(&self, _node: NodeId) -> Option<TransferNode> {
+            None
+        }
+        fn as_loop(&self, _node: NodeId) -> Option<LoopId> {
+            None
+        }
+        fn prev(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+        fn owner_loop(&self, _node: NodeId) -> Option<LoopId> {
+            None
+        }
+        fn loop_dims(&self, _at: LoopId) -> Vec<(PrimaryDim, MetaDimKind)> {
+            Vec::new()
+        }
+    }
+
+    impl v1::ScheduleNodes for Tree {
+        fn nodes(&self) -> Vec<NodeId> {
+            vec![NodeId(0)]
+        }
+        fn kind(&self, _node: NodeId) -> Option<NodeKind> {
+            Some(NodeKind::Compute)
+        }
+        fn is_parametric(&self, _at: LoopId) -> bool {
+            false
+        }
+        fn loop_stages(&self, _at: LoopId) -> v1::LoopStages {
+            v1::LoopStages { num: NUM, den: DEN }
+        }
+        fn parametric_stride(&self, _at: LoopId) -> v1::LoopEleOffset {
+            v1::LoopEleOffset(0)
+        }
+        fn parametric_iter_count(
+            &self,
+            _at: LoopId,
+            _corelet: Corelet,
+            _unit: SenComponent,
+        ) -> v1::IterCount {
+            v1::IterCount(1)
+        }
+        fn is_relevant(&self, _node: NodeId, _unit: SenComponent) -> bool {
+            true
+        }
+        fn next_view_len(&self, _node: NodeId, _unit: SenComponent) -> usize {
+            1
+        }
+        fn alloc_owner_loop(&self, _alloc: AllocId) -> Option<LoopId> {
+            None
+        }
+        fn transfer_has_padding(&self, _node: NodeId) -> bool {
+            false
+        }
+        fn compute(&self, _node: NodeId) -> Option<ComputeNode> {
+            Some(self.0.clone())
+        }
+        fn repetition_with_offset_outputs(&self, _node: NodeId) -> usize {
+            0
+        }
+    }
+
+    /// The datastage extents and the address granularity entry 333 divides by.
+    struct Space {
+        alloc: AllocId,
+        scale: NonZeroU64,
+    }
+
+    impl v1::StageSizes for Space {
+        fn dim_extent(
+            &self,
+            _stage: DatastageId,
+            _dim: PrimaryDim,
+            _unit: SenComponent,
+            _corelet: Option<Corelet>,
+            _padding: PadType,
+            _density: v1::Density,
+        ) -> Extent {
+            Extent(16)
+        }
+        fn comp_view_scaled(
+            &self,
+            _stage: DatastageId,
+            _dim: PrimaryDim,
+            _unit: SenComponent,
+            _corelet: Option<Corelet>,
+            _padding: PadType,
+            _density: v1::Density,
+        ) -> Extent {
+            Extent(4)
+        }
+        fn lds_scale(&self, _lds: LdsIdx, _dim: PrimaryDim) -> Option<LdsScale> {
+            Some(LdsScale::Unscaled)
+        }
+        fn dim_density(&self, _lds: LdsIdx, _dim: PrimaryDim) -> v1::Density {
+            v1::Density::FULL
+        }
+        fn corelet_split(&self, _stage: DatastageId, _dim: PrimaryDim) -> Option<Vec<Elements>> {
+            None
+        }
+        fn alloc_padding_sizes(
+            &self,
+            _alloc: AllocId,
+            _dim: PrimaryDim,
+        ) -> Option<v1::PaddingSizes> {
+            None
+        }
+        fn stage_padding_sizes(
+            &self,
+            _stage: DatastageId,
+            _dim: PrimaryDim,
+        ) -> Option<v1::PaddingSizes> {
+            None
+        }
+        fn size_stage(&self, _alloc: AllocId) -> DatastageId {
+            DEN
+        }
+        fn is_sole_partial_reduction_input(&self, _lds: LdsIdx) -> bool {
+            false
+        }
+    }
+
+    impl v1::OffsetSizes for Space {
+        fn lds_alloc(&self, lds: LdsIdx, storage: SenComponent) -> Option<AllocId> {
+            (lds == LdsIdx(0) && storage == SenComponent::Lx).then_some(self.alloc)
+        }
+        fn const_alloc(&self, _constant: ConstIdx, _storage: SenComponent) -> Option<AllocId> {
+            None
+        }
+        fn address_scale(
+            &self,
+            _unit: GenericComp,
+            _storage: SenComponent,
+        ) -> Option<NonZeroU64> {
+            Some(self.scale)
+        }
+        fn stage_padding_dims(&self, _stage: DatastageId) -> Vec<(PrimaryDim, v1::PaddingSizes)> {
+            Vec::new()
+        }
+        fn has_symbolic_dim(&self, _stage: DatastageId, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn pe_sfp_split_dims(&self, _stage: DatastageId) -> Vec<PrimaryDim> {
+            Vec::new()
+        }
+        fn block_transfer_size(
+            &self,
+            _node: NodeId,
+            _unit: SenComponent,
+            _corelet: Corelet,
+            _dim: PrimaryDim,
+        ) -> Elements {
+            Elements(0)
+        }
+        fn temporal_stride(
+            &self,
+            _node: NodeId,
+            _alloc: AllocId,
+            _at: LoopId,
+            _dim: PrimaryDim,
+        ) -> Option<v1::LoopEleOffset> {
+            Some(v1::LoopEleOffset(0))
+        }
+    }
+
+    /// A datastage that states nothing, since this fill never reaches a corelet offset.
+    struct Stage;
+
+    impl DimStage for Stage {
+        fn corelet_dim_val(
+            &self,
+            _dim: PrimaryDim,
+            _comp: SenComponent,
+            _corelet: Corelet,
+            _padded: &PaddingForm,
+        ) -> Option<Extent> {
+            None
+        }
+        fn is_corelet_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn corelet_split(&self, _dim: PrimaryDim, _corelet: Corelet) -> Option<Extent> {
+            None
+        }
+        fn pad_stride(&self, _dim: PrimaryDim) -> Option<Stride> {
+            None
+        }
+    }
+
+    /// The four accessors outside this campaign's file list, over one organisation.
+    struct Facts {
+        orgs: Orgs,
+        stage: Stage,
+    }
+
+    impl MemOrgs for Facts {
+        type Org = Org;
+
+        fn mem_org(&self, dsc: DscIdx, lds: LdsIdx) -> Option<&Org> {
+            self.orgs.mem_org(dsc, lds)
+        }
+    }
+
+    impl L3OffsetFacts for Facts {
+        type Stage = Stage;
+
+        fn page_sizes(&self, _alloc: AllocId) -> BTreeMap<PrimaryDim, NonZeroU64> {
+            BTreeMap::new()
+        }
+        fn ibr_sizes_no_rounding(
+            &self,
+            _alloc: AllocId,
+            _lds: LdsIdx,
+            _storage: SenComponent,
+        ) -> Option<BTreeMap<PrimaryDim, Elements>> {
+            None
+        }
+        fn word_length(&self, _lds: LdsIdx) -> Option<WordLength> {
+            Some(WordLength(4))
+        }
+        fn dim_symbols(&self, _dim: PrimaryDim) -> Vec<VariableSymbol> {
+            Vec::new()
+        }
+        fn size_stage(&self, _alloc: AllocId) -> Option<&Stage> {
+            Some(&self.stage)
+        }
+        fn chunk_stage(&self) -> &Stage {
+            &self.stage
+        }
+    }
+
+    /// Every fill entry 333 wrote, kept by the operand it landed on.
+    #[derive(Default)]
+    struct Sink {
+        fills: BTreeMap<v1::OperandSite, L3Fill>,
+    }
+
+    impl L3DataInfoSink for Sink {
+        fn fill(&mut self, at: v1::OperandSite, filled: L3Fill) -> Option<()> {
+            self.fills.insert(at, filled);
+            Some(())
+        }
+        fn set_last_fusable_src(&mut self, _node: NodeId, _at: Option<LoopId>) -> Option<()> {
+            Some(())
+        }
+        fn set_last_fusable_dsts(&mut self, _node: NodeId, _at: Vec<Option<LoopId>>) -> Option<()> {
+            Some(())
+        }
+    }
+
+    /// The symbol table, never reached while every address is a byte count.
+    struct NoSymbols;
+
+    impl v1::Symbols for NoSymbols {
+        fn divide_symbols(
+            &mut self,
+            address: &StartAddress,
+            by: NonZeroU64,
+        ) -> StartAddress {
+            address.divided_by(by)
+        }
+    }
+
+    impl SymbolTable for NoSymbols {
+        fn add_var(&mut self, _op: SymbolOp, _operands: &[SymbolOperand]) -> VariableSymbol {
+            VariableSymbol(0)
+        }
+    }
+
+    /// e333 — a compute input in LX takes its allocation's own address at the unit's granularity, and
+    /// nothing else: with the allocation owned by the node's own scope there is no loop to offset
+    /// through, and with one buffer there is no switch position.
+    #[test]
+    fn a_compute_input_takes_its_allocations_address_at_the_units_granularity() {
+        let mut dsc = a_dsc(&[(PrimaryDim::I, 16)], &[(PrimaryDim::I, 4)]);
+        dsc.labeled_ds = LabeledDsList::new(
+            labeled(DsType::Input, LdsIdx(0), &[(PrimaryDim::I, Scale::Sized(1.0))]),
+            Vec::new(),
+        );
+        let sdsc = SuperDsc::new(
+            DscList::new(dsc, Vec::new()),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let input = operand(SenComponent::L3lu, SenComponent::Lx, Some(0));
+        let tree = Tree(ComputeNode {
+            name: NodeName("compute".to_owned()),
+            op: DdlComputeType::Macc,
+            ex_unit: SenComponent::L3lu,
+            inputs: vec![input],
+            outputs: Vec::new(),
+            num_folds_engaged: crate::units::NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
+        });
+        let allocs = v1::AllocArena::from([(AllocId(0), alloc_node(Bytes(512)))]);
+        let facts = Facts {
+            orgs: Orgs(BTreeMap::from([(LdsIdx(0), Org::default())])),
+            stage: Stage,
+        };
+        let inputs = L3OffsetInputs {
+            sdsc: &sdsc,
+            dsc_idx: DscIdx(0),
+            sizes: &Space {
+                alloc: AllocId(0),
+                scale: NonZeroU64::new(2).expect("two is not zero"),
+            },
+            tree: &tree,
+            facts: &facts,
+            allocs: &allocs,
+            metadata: &DscMetadata::default(),
+            unpadded: v1::UnpaddedIndexing::Forbidden,
+        };
+        let mut sink = Sink::default();
+        assert_eq!(
+            fill_loop_offsets_and_addresses::<Sen1p5, _, _, _, _, _>(
+                &inputs,
+                &mut sink,
+                &mut NoSymbols,
+            ),
+            Some(())
+        );
+        let filled = sink
+            .fills
+            .get(&v1::OperandSite::ComputeInput(NodeId(0), v1::InputIdx(0)))
+            .expect("the input was filled");
+        assert_eq!(
+            filled.direct.start_address.at(core0(), Corelet::at::<0>()),
+            Some(Bytes(256))
+        );
+        assert_eq!(filled.direct.buffer_switch_position, None);
+        assert!(filled.direct.loop_ele_offsets.is_empty());
+        assert_eq!(filled.indirect, None);
+    }
+
+    /// e334 — the IBR fill covers as many whole pages as the index tensor's stick holds, and the
+    /// epilogue takes the one page the three-page core has left over.
+    #[test]
+    fn the_ibr_stage_is_the_sticks_pages_with_the_cores_remainder_as_its_epilogue() {
+        let mut dsc = a_dsc(&[(PrimaryDim::X, 6)], &[(PrimaryDim::X, 2)]);
+        dsc.primary_ds_info.insert(
+            DsType::Input,
+            PrimaryDsInfo {
+                layout: LayoutDims::new(PrimaryDim::X, Vec::new()),
+                stick: StickDims(vec![(PrimaryDim::X, Elements(2))]),
+            },
+        );
+        dsc.data_stages
+            .set(DatastageId(2), stage("one_page", &[(PrimaryDim::X, 2)]));
+        dsc.data_stages
+            .set(DatastageId(3), stage("ibr", &[(PrimaryDim::X, 2)]));
+        let one_page = dsc
+            .data_stages
+            .one_page(DatastageId(2))
+            .expect("the one-page stage exists");
+        let ibr = dsc.data_stages.ibr(DatastageId(3)).expect("the IBR stage exists");
+        let orgs = Orgs(BTreeMap::from([(
+            LdsIdx(0),
+            Org {
+                indirection: Some(IndirectAlloc::IndexTensor(IndexTensor::Address)),
+                ..Org::default()
+            },
+        )]));
+        assert_eq!(
+            add_ibr_data_stage(
+                &mut dsc,
+                DscIdx(0),
+                ibr,
+                one_page,
+                &[PrimaryDim::X],
+                &orgs,
+            ),
+            Some(())
+        );
+        let filled = dsc.data_stages.at(DatastageId(3)).expect("the IBR stage");
+        // Two pages of two, which the stick holds; the core's third page is the epilogue's.
+        assert_eq!(filled.ss.dims.dims().extent(PrimaryDim::X), Some(Extent(4)));
+        assert_eq!(filled.el.dims.dims().extent(PrimaryDim::X), Some(Extent(2)));
+    }
+
+    /// e335 — the one-page stage is the HBM page every paged tensor of the DSC agrees on.
+    #[test]
+    fn the_one_page_stage_is_the_agreed_hbm_page() {
+        let mut dsc = a_dsc(&[(PrimaryDim::X, 8)], &[(PrimaryDim::X, 2)]);
+        dsc.labeled_ds = LabeledDsList::new(
+            labeled(DsType::Input, LdsIdx(0), &[]),
+            vec![labeled(DsType::Output, LdsIdx(1), &[])],
+        );
+        dsc.data_stages
+            .set(DatastageId(2), stage("one_page", &[(PrimaryDim::X, 1)]));
+        let one_page = dsc
+            .data_stages
+            .one_page(DatastageId(2))
+            .expect("the one-page stage exists");
+        let paged = || Org {
+            indirection: Some(IndirectAlloc::ValueTensor),
+            hbm_pages: Some(BTreeMap::from([(PrimaryDim::X, Extent(2))])),
+        };
+        let orgs = Orgs(BTreeMap::from([(LdsIdx(0), paged()), (LdsIdx(1), paged())]));
+        assert_eq!(
+            add_one_page_data_stage(&mut dsc, DscIdx(0), one_page, &[PrimaryDim::X], &orgs),
+            Some(())
+        );
+        let filled = dsc.data_stages.at(DatastageId(2)).expect("the one-page stage");
+        assert_eq!(filled.ss.dims.dims().extent(PrimaryDim::X), Some(Extent(2)));
+        assert_eq!(filled.el.dims.dims().extent(PrimaryDim::X), Some(Extent(2)));
+    }
+}
 
 /// THE INDEX TENSOR'S HBM ALLOCATION AS ENTRY 336 REACHES IT — the paged tensor's
 /// `relatedIndirectAccessAlloc_`, reduced to the node, the `ldsIdx_` and the allocation entries 226
