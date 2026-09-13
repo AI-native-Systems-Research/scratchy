@@ -298,6 +298,19 @@ impl Coordinate {
         self.padding.set(dim, pad);
     }
 
+    /// `setPadding(const PaddingFormType)` (`dsc/dsc2.h:240`) — REPLACES the whole form, which is a
+    /// DIFFERENT operation from the per-dim [`Self::set_padding`]: a dim the form has no entry for
+    /// goes back to reading `NOPAD`.
+    ///
+    /// ⛔ TAKES THE ENTRIES AND NOT A [`Padding`] so that the fold builders can hand over an
+    /// allocation's `padding_` without this module depending on theirs.
+    pub fn set_padding_form(&mut self, form: impl IntoIterator<Item = (PrimaryDim, PadType)>) {
+        self.padding = Padding::default();
+        for (dim, pad) in form {
+            self.padding.set(dim, pad);
+        }
+    }
+
     /// `foldConstructed()` (`dsc/dsc2.h:119`).
     #[must_use]
     pub const fn fold_constructed(&self) -> bool {
