@@ -88,9 +88,15 @@
 
 pub(crate) mod sentient;
 
+use super::register_type_assignment::is_symbol;
+use super::utils::select_indices_for_units;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient::CmpPredicate;
-use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
-use crate::transform::sentient::analyses::PropagationAnalysis;
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, operands, replace_all_uses_with, results, sentient as ops, set_operand,
+};
+use crate::transform::sentient::analyses::{PropagationAnalysis, UnitIndexMap};
 
 /// THE `$predicate` SLOT OF ONE `sentient.if` — `IfOp& if_op` reduced to the single field
 /// `updateCmpIPredicate` writes, so "not a `sentient.if`" is not a case it has to answer.
@@ -194,15 +200,331 @@ pub fn simplify_conditionals(
     )
 }
 
-// crustify:todo: e532_simplifyBinaryOperation
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:315  (89 body lines, level 3)
-//   original  : void ScalarSimplificationsPass::simplifyBinaryOperation( OpBuilder& builder, Operation* op, Type operand_type, PropagationAnalysis& expr_prop_analysis, std::vector<mlir::Operation*>& tobe_deleted)
-//   calls     : e240_selectIndicesForUnits, e252_size, e372_areAllExprsValidToTransform, e392_getQueryKeyAndUnitsFromParentRegion, e472_createNewOpOrMap
+/// WHAT `getQueryKeyAndUnitsFromParentRegion` FILLS IN — the uniformization key one op's enclosing
+/// region is keyed by, and that region's unit list.
+///
+/// ⛔ THE REFERENCE LEAVES `key` NULL where a `dataflow.program_unit`'s region binds no argument
+/// (`Utils.cpp:46-47`) and hands that null on to a `uniform.query_map`; representing that case is
+/// e392's to settle, and this type's `None` is only its `LogicalResult::failure()`.
+pub(super) struct QueryKeyAndUnits {
+    /// `key` — the region argument every `uniform.query_map` this file builds is read through.
+    pub(super) key: Val,
+    /// `units` — the enclosing region's `$units`, before groups are expanded.
+    pub(super) units: Vec<Val>,
+}
 
-// crustify:todo: e533_simplifyLoadStoreOperation
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:408  (93 body lines, level 3)
-//   original  : void ScalarSimplificationsPass::simplifyLoadStoreOperation( PropagationAnalysis& expr_prop_analysis, OpBuilder& builder, Operation* op)
-//   calls     : e240_selectIndicesForUnits, e252_size, e372_areAllExprsValidToTransform, e392_getQueryKeyAndUnitsFromParentRegion, e472_createNewOpOrMap
+/// `getQueryKeyAndUnitsFromParentRegion(op, key, units)` — e392, level 1, not yet ported.
+///
+/// ⛔ IT IS e392 AND IT IS NOT PORTED YET, and porting it will WIDEN THIS SIGNATURE: it climbs
+/// `getParentRegion()` to the `dataflow.program_unit`, `uniform.uniformize_regions` or
+/// `uniform.equalize_pattern` that binds the key, which one block does not carry — the enclosing path
+/// ([`crate::transform::sentient::utils::OpAt`]) is what it needs.
+pub(super) fn query_key_and_units_from_parent_region(
+    block: &[Op],
+    at: usize,
+) -> Option<QueryKeyAndUnits> {
+    let _ = (block, at);
+    todo!(
+        "getQueryKeyAndUnitsFromParentRegion (senpass e392, Utils.cpp:40) is not ported yet — the \
+         climb to the enclosing region's uniformization key and unit list"
+    )
+}
+
+/// Replaces: e532_simplifyBinaryOperation
+///
+/// Rewrites one scalar add or sub whose propagated expression flattened to something simpler: a
+/// constant replaces it outright, and a one- or two-variable expression re-points its operands.
+///
+/// ⛔ MORE THAN TWO PROPAGATED ARGUMENTS, MORE THAN ONE MAP RESULT, A FLATTENING FAILURE OR ANY LOCAL
+/// VARIABLE ABANDONS THE WHOLE OP (`:344-359`) — including the units already flattened.
+/// ⛔ LENGTH 3 IS AN ADD AND THE REFERENCE `DT_CHECK`s IT (`:382`), so a sub whose expression flattens
+/// to two variables is a crash there and a named `todo!` here.
+/// ⛔ LENGTH 2 SPLITS ON THE CONSTANT TERM: non-zero re-points both operands, ZERO replaces the op
+/// with its variable (`:385-402`).
+/// ⛔ A LENGTH THAT IS NEITHER 1 NOR 3 READS `[1]`, so an empty expression is the reference's own
+/// out-of-bounds read — [`sentient::FlatExpr::first`] answers the empty slice and 0 takes the
+/// replace arm.
+/// ⭐ EVERY VALUE THIS BUILDS LANDS BEFORE THE OP, so the op's own index walks forward as they arrive.
+pub fn simplify_binary_operation(
+    scope: &mut Vec<Op>,
+    at: usize,
+    operand_type: ScalarTy,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    to_be_deleted: &mut Vec<Val>,
+    values: &mut Values,
+) {
+    let Some(result) = scope.get(at).and_then(|op| results(op).first().copied()) else {
+        return;
+    };
+    let expr_info_map = expr_prop_analysis.affine_expression(result);
+    if expr_prop_analysis.is_expr_info_map_empty(expr_info_map) {
+        // A simplification that already ran can stale the analysis, or leave it without an entry for
+        // an operand that simplification created.
+        return;
+    }
+    // `op->emitOpError("can't find parentOp"); signalPassFailure();`
+    let Some(QueryKeyAndUnits { key, mut units }) =
+        query_key_and_units_from_parent_region(scope, at)
+    else {
+        return;
+    };
+    let mut indices = Vec::new();
+    {
+        let regions: [&[Op]; 1] = [scope];
+        select_indices_for_units(
+            &mut units,
+            &mut indices,
+            unit_index_map,
+            Definitions::from_innermost(&regions),
+        );
+    }
+    let unit_indices: Vec<usize> = indices.iter().map(|index| index.0 as usize).collect();
+    let mut flat_exprs: Vec<sentient::FlatExpr> = Vec::new();
+    for idx in &unit_indices {
+        let Some(expr_info) = expr_prop_analysis.expr_info_at(expr_info_map, *idx) else {
+            todo!(
+                "simplifyBinaryOperation: DT_CHECK_MSG(expr_info, \"Expecting valid ExprInfo for \
+                 unit\") (ScalarSimplifications.cpp:344) — no entry for unit {idx}"
+            )
+        };
+        if expr_info.num_propagated_args > 2 || expr_info.num_map_results > 1 {
+            return;
+        }
+        let Some(flattened) = expr_prop_analysis.flattened_affine_exprs(expr_info_map, *idx) else {
+            return;
+        };
+        // MLIR cannot construct a local variable without an explicit representation.
+        if flattened.num_local_vars > 0 {
+            return;
+        }
+        flat_exprs.push(sentient::FlatExpr(flattened.rows));
+    }
+    if !sentient::are_all_exprs_valid_to_transform(
+        &flat_exprs,
+        &unit_indices,
+        expr_info_map,
+        sentient::ExprUse::BinaryOperation,
+    ) {
+        return;
+    }
+    let first_coeffs: Vec<i64> = flat_exprs
+        .first()
+        .map_or_else(Vec::new, |flat_expr| flat_expr.first().to_vec());
+    let new_operand = |scope: &mut Vec<Op>,
+                           at: usize,
+                           operand_idx: usize,
+                           expr_prop_analysis: &mut _,
+                           values: &mut Values| {
+        let before = scope.len();
+        let operand = sentient::create_new_op_or_map(
+            scope,
+            at,
+            &flat_exprs,
+            &unit_indices,
+            &units,
+            expr_info_map,
+            operand_idx,
+            operand_type,
+            key,
+            expr_prop_analysis,
+            values,
+        );
+        (operand, scope.len() - before)
+    };
+    match first_coeffs.len() {
+        // A constant: the op goes.
+        1 => {
+            let (operand, _) = new_operand(scope, at, 0, expr_prop_analysis, values);
+            expr_prop_analysis.set_expr_info_map_for_value(operand, expr_info_map);
+            replace_all_uses_with(scope, result, operand);
+            to_be_deleted.push(result);
+        }
+        // `1 * variable + 1 * variable + constant` — the constant has to be zero, so both operands
+        // are rewritten and the add stays.
+        3 => {
+            let (operand0, grew0) = new_operand(scope, at, 0, expr_prop_analysis, values);
+            let (operand1, grew1) = new_operand(scope, at + grew0, 1, expr_prop_analysis, values);
+            let at = at + grew0 + grew1;
+            if !matches!(scope.get(at), Some(Op::Sentient(ops::Op::ScalarAdd { .. }))) {
+                todo!(
+                    "simplifyBinaryOperation: DT_CHECK(isa<sentient::AddOp>(op)) \
+                     (ScalarSimplifications.cpp:382) — a two-variable expression on {:?}",
+                    scope.get(at)
+                )
+            }
+            set_operand(&mut scope[at], 0, operand0);
+            set_operand(&mut scope[at], 1, operand1);
+        }
+        // `1 * variable + constant` — the variable's coefficient has to be 1.
+        _ => {
+            if first_coeffs.get(1).copied().unwrap_or(0) != 0 {
+                let (operand0, grew0) = new_operand(scope, at, 0, expr_prop_analysis, values);
+                let (operand1, grew1) =
+                    new_operand(scope, at + grew0, 1, expr_prop_analysis, values);
+                let at = at + grew0 + grew1;
+                set_operand(&mut scope[at], 0, operand0);
+                set_operand(&mut scope[at], 1, operand1);
+            } else {
+                let (operand0, _) = new_operand(scope, at, 0, expr_prop_analysis, values);
+                replace_all_uses_with(scope, result, operand0);
+                to_be_deleted.push(result);
+            }
+        }
+    }
+}
+
+/// THE OPERAND SLOTS `simplifyLoadStoreOperation` REWRITES (`:469-497`) — ⭐ THE ADDRESS PAIRS AND
+/// NOTHING ELSE: an increment, a `dst`, a multicast operand or an element index is never simplified.
+///
+/// ⛔ `sentient.load_and_store` HAS ITS TWO PAIRS APART: `src`, `dst` and both increments sit between
+/// and around them in the operand order [`operands`] answers.
+fn address_slots(op: &Op) -> &'static [usize] {
+    match op {
+        Op::Sentient(
+            ops::Op::LoadAndSend { .. }
+            | ops::Op::ReceiveAndStore { .. }
+            | ops::Op::LoadAndExtractScalar { .. }
+            | ops::Op::LoadComputeAndSend { .. },
+        ) => &[0, 1],
+        Op::Sentient(ops::Op::LoadAndStore { .. }) => &[2, 3, 5, 6],
+        _ => &[],
+    }
+}
+
+/// Replaces: e533_simplifyLoadStoreOperation
+///
+/// Replaces every address operand of one transfer with the simplest value its propagated expression
+/// allows — the variable it is written over, or a fresh constant.
+///
+/// ⛔ A SYMBOL IS NEVER SIMPLIFIED (`:423`) and neither is an operand whose expression is stale, has
+/// more than one propagated argument, more than one dimension, fails to flatten or needs a local
+/// variable — each of those leaves the operand exactly as it was.
+/// ⛔ ONE DIMENSION ANSWERS WITH THE PROPAGATED ARGUMENT ITSELF (`:456-458`), which is the whole point
+/// of the load/store flavour of e372: no op is created for it.
+/// ⛔ THE UNIT LIST AND KEY ARE READ BEFORE THE OP KIND IS (`:412-420`), so a transfer this cannot
+/// name still reports `can't find parentOp` from an unrooted op.
+/// ⭐ EVERY ADDRESS OPERAND IS `Index` BY THE OP'S OWN DECLARATION (`SentientOps.td:460`, `:507`,
+/// `:550`, `:609`), which is what `val.getType()` hands `createNewOpOrMap`.
+pub fn simplify_load_store_operation(
+    scope: &mut Vec<Op>,
+    at: usize,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    values: &mut Values,
+) {
+    // `op->emitOpError("can't find parentOp"); signalPassFailure();`
+    let Some(QueryKeyAndUnits { key, mut units }) =
+        query_key_and_units_from_parent_region(scope, at)
+    else {
+        return;
+    };
+    let mut indices = Vec::new();
+    {
+        let regions: [&[Op]; 1] = [scope];
+        select_indices_for_units(
+            &mut units,
+            &mut indices,
+            unit_index_map,
+            Definitions::from_innermost(&regions),
+        );
+    }
+    let unit_indices: Vec<usize> = indices.iter().map(|index| index.0 as usize).collect();
+    let Some(slots) = scope.get(at).map(address_slots) else {
+        return;
+    };
+    let mut at = at;
+    for slot in slots {
+        let Some(val) = operands(&scope[at]).get(*slot).copied() else {
+            continue;
+        };
+        let before = scope.len();
+        let simplified = simplified_value(
+            scope,
+            at,
+            val,
+            &unit_indices,
+            &units,
+            key,
+            expr_prop_analysis,
+            values,
+        );
+        at += scope.len() - before;
+        if let Some(simplified) = simplified {
+            set_operand(&mut scope[at], *slot, simplified);
+        }
+    }
+}
+
+/// `getSimplifiedValue(Value)` (`:422-468`) — the value one address operand can be replaced by, or
+/// `None` for the reference's empty `Value()`, which leaves the operand alone.
+fn simplified_value(
+    scope: &mut Vec<Op>,
+    at: usize,
+    val: Val,
+    unit_indices: &[usize],
+    units: &[Val],
+    key: Val,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    values: &mut Values,
+) -> Option<Val> {
+    {
+        let regions: [&[Op]; 1] = [scope];
+        if is_symbol(val, Definitions::from_innermost(&regions)) {
+            return None;
+        }
+    }
+    let expr_info_map = expr_prop_analysis.affine_expression(val);
+    if expr_prop_analysis.is_expr_info_map_empty(expr_info_map) {
+        return None;
+    }
+    let mut flat_exprs: Vec<sentient::FlatExpr> = Vec::new();
+    for idx in unit_indices {
+        let Some(expr_info) = expr_prop_analysis.expr_info_at(expr_info_map, *idx) else {
+            todo!(
+                "simplifyLoadStoreOperation: DT_CHECK_MSG(expr_info, \"Expecting valid ExprInfo for \
+                 unit\") (ScalarSimplifications.cpp:437) — no entry for unit {idx}"
+            )
+        };
+        if expr_info.num_propagated_args > 1 || expr_info.num_map_dims > 1 {
+            return None;
+        }
+        let flattened = expr_prop_analysis.flattened_affine_exprs(expr_info_map, *idx)?;
+        if flattened.num_local_vars > 0 {
+            return None;
+        }
+        flat_exprs.push(sentient::FlatExpr(flattened.rows));
+    }
+    if !sentient::are_all_exprs_valid_to_transform(
+        &flat_exprs,
+        unit_indices,
+        expr_info_map,
+        sentient::ExprUse::LoadStore,
+    ) {
+        return None;
+    }
+    // `getFirstExprInfo()` — either a direct variable or a constant.
+    let first = expr_prop_analysis.expr_info_at(expr_info_map, 0)?;
+    if first.num_map_dims == 1 {
+        return expr_prop_analysis
+            .propagated_args(expr_info_map, 0)
+            .first()
+            .copied();
+    }
+    Some(sentient::create_new_op_or_map(
+        scope,
+        at,
+        &flat_exprs,
+        unit_indices,
+        units,
+        expr_info_map,
+        0,
+        ScalarTy::Index,
+        key,
+        expr_prop_analysis,
+        values,
+    ))
+}
 
 // crustify:todo: e581_runOnOperation
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:872  (54 body lines, level 4)
@@ -211,10 +533,17 @@ pub fn simplify_conditionals(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{IfPredicate, simplify_conditionals, update_cmp_i_predicate};
+    use super::{
+        IfPredicate, simplify_binary_operation, simplify_conditionals, simplify_load_store_operation,
+        update_cmp_i_predicate,
+    };
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::sentient::CmpPredicate;
     use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
-    use crate::transform::sentient::analyses::{ExprInfoMap, PropagationAnalysis};
+    use crate::transform::sentient::analyses::{
+        ExprInfoMap, OutOfScopeUnitIndexMap, PropagationAnalysis,
+    };
 
     /// AN ANALYSIS THAT ANSWERS WHAT THE TEST SAYS — `PropagationAnalysis` is out of campaign scope,
     /// so what is under test is the EFFECT this unit has given an answer.
@@ -303,5 +632,47 @@ mod unit_tests {
         let mut op = if_op(CmpPredicate::Sge);
         let mut consts = Vec::new();
         simplify_conditionals(&mut StatedAnalysis { empty: false }, &mut op, &mut consts);
+    }
+
+    /// e532 — a stale analysis with no expression for the result leaves the add exactly as it was and
+    /// deletes nothing, which is the reference's own reason for the `empty()` test.
+    #[test]
+    fn a_binary_operation_whose_result_has_no_propagated_expression_is_left_alone() {
+        let mut scope = vec![Op::Sentient(ops::Op::ScalarAdd {
+            lhs: Val(1),
+            rhs: Val(2),
+            result: Val(3),
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        })];
+        let untouched = scope.clone();
+        let mut to_be_deleted = Vec::new();
+        simplify_binary_operation(
+            &mut scope,
+            0,
+            ScalarTy::Index,
+            &mut StatedAnalysis { empty: true },
+            &OutOfScopeUnitIndexMap,
+            &mut to_be_deleted,
+            &mut Values::default(),
+        );
+        assert_eq!(scope, untouched);
+        assert!(to_be_deleted.is_empty());
+    }
+
+    /// e533 — the unit list is read before the op kind is, so even an op with no address operands at
+    /// all reaches the unported parent-region query rather than returning early.
+    #[test]
+    #[should_panic(expected = "senpass e392")]
+    fn a_load_store_asks_for_its_units_before_it_looks_at_the_op() {
+        let mut scope = vec![Op::Sentient(ops::Op::Nop { dbg_name: None })];
+        simplify_load_store_operation(
+            &mut scope,
+            0,
+            &mut StatedAnalysis { empty: false },
+            &OutOfScopeUnitIndexMap,
+            &mut Values::default(),
+        );
     }
 }

@@ -238,6 +238,16 @@ pub trait ExpressionEvaluator {
         )
     }
 
+    /// `ExpressionEvaluator::getConstant` (`Analyses/ExpressionEvaluatorUtils.h:335`) for the DECODED
+    /// flavour — the `getConstant(0)` a merging block starts its running increment from, which e528
+    /// must also be able to measure against the LRF range.
+    fn constant_evaluation(&mut self, value: i64) -> Evaluation {
+        let _ = value;
+        todo!(
+            "ExpressionEvaluator::getConstant (Analyses/ExpressionEvaluatorUtils.h:335) — out of campaign scope"
+        )
+    }
+
     /// `ExpressionEvaluator::evaluateSum` (`Analyses/ExpressionEvaluatorUtils.h:242`) on two handles.
     fn evaluate_sum_handle(&mut self, lhs: EvaluatedValue, rhs: EvaluatedValue) -> EvaluatedValue {
         let _ = (lhs, rhs);
@@ -270,6 +280,19 @@ pub trait ExpressionEvaluator {
     /// `ExpressionEvaluator::evaluateMultiplyByConst`
     /// (`Analyses/ExpressionEvaluatorUtils.h:285`) — `ev * by`.
     fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+        let _ = (ev, by);
+        todo!(
+            "ExpressionEvaluator::evaluateMultiplyByConst (Analyses/ExpressionEvaluatorUtils.h:285) — out of campaign scope"
+        )
+    }
+
+    /// `ExpressionEvaluator::evaluateMultiplyByConst` (`Analyses/ExpressionEvaluatorUtils.h:285`) for
+    /// the DECODED flavour — how e530 turns a derived `B - c` into `B + (c * -1)` before measuring it
+    /// against the LRF range.
+    ///
+    /// ⛔ NOT `_handle`-SUFFIXED THE OTHER WAY ROUND: the handle flavour took the reference's own name
+    /// first, so this one is spelled short rather than renaming its sixteen call sites.
+    fn multiply_by_const(&mut self, ev: &Evaluation, by: i64) -> Evaluation {
         let _ = (ev, by);
         todo!(
             "ExpressionEvaluator::evaluateMultiplyByConst (Analyses/ExpressionEvaluatorUtils.h:285) — out of campaign scope"
@@ -1072,6 +1095,32 @@ impl Liveness for OutOfScopeLiveness {
     }
 }
 
+/// ONE UNIT'S `PropagationAnalysis::ExprInfo` AS THE SIMPLIFICATIONS READ IT — the four fields their
+/// refusals test (`Analyses/PropagationAnalysis.h:99-102`), never the `AffineMap` itself, which is
+/// MLIR affine machinery this crate does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExprInfoShape {
+    /// `propagated_args_.size()`.
+    pub num_propagated_args: usize,
+    /// `propagated_map_.getNumResults()`.
+    pub num_map_results: usize,
+    /// `propagated_map_.getNumDims()`.
+    pub num_map_dims: usize,
+    /// `cannot_be_resolved_`.
+    pub cannot_be_resolved: bool,
+}
+
+/// `getFlattenedAffineExprs(propagated_map_, &flat_expr, &constraints)` ON SUCCESS — the coefficient
+/// rows, and the one thing its callers ask the constraint system it also fills.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FlattenedAffineExprs {
+    /// `flat_expr` — one row per result of the map, the dimension coefficients then the constant.
+    pub rows: Vec<Vec<i64>>,
+    /// `constraints.getNumLocalVars()` — ⛔ ANYTHING ABOVE ZERO IS DECLINED by every caller: MLIR
+    /// cannot construct a local variable without an explicit representation.
+    pub num_local_vars: usize,
+}
+
 /// THE `PropagationAnalysis&` A PASS IS HANDED — a trait for the same reason [`Liveness`] is one: the
 /// analysis is not in this campaign, and a test must still be able to observe which values a ported
 /// pass treats as carrying the same expression.
@@ -1110,6 +1159,39 @@ pub trait PropagationAnalysis {
         let _ = (map, at);
         todo!(
             "PropagationAnalysis::ExprInfo::propagated_args_ (Analyses/PropagationAnalysis.h:100) — out of campaign scope"
+        )
+    }
+
+    /// `getExprInfoAt(at)` (`Analyses/PropagationAnalysis.h:254`) REDUCED TO THE FIELDS A
+    /// SIMPLIFICATION TESTS — see [`ExprInfoShape`]. ⭐ `None` IS THE `DT_CHECK_MSG(expr_info,
+    /// "Expecting valid ExprInfo for unit")` its three callers open with.
+    fn expr_info_at(&mut self, map: ExprInfoMap, at: usize) -> Option<ExprInfoShape> {
+        let _ = (map, at);
+        todo!(
+            "PropagationAnalysis::ExprInfoMap::getExprInfoAt (Analyses/PropagationAnalysis.h:254) — out of campaign scope"
+        )
+    }
+
+    /// `getFlattenedAffineExprs(getExprInfoAt(at)->propagated_map_, &flat_expr, &constraints)` —
+    /// ⭐ `None` IS ITS `LogicalResult::failure()`, which every caller but e534 declines on.
+    fn flattened_affine_exprs(
+        &mut self,
+        map: ExprInfoMap,
+        at: usize,
+    ) -> Option<FlattenedAffineExprs> {
+        let _ = (map, at);
+        todo!(
+            "mlir::affine::getFlattenedAffineExpr + affine::FlatAffineValueConstraints \
+             (mlir/Dialect/Affine/Analysis/AffineStructures.h) — MLIR upstream, out of campaign scope"
+        )
+    }
+
+    /// `setExprInfoMapForValue(val, expr_map)` (`Analyses/PropagationAnalysis.h:323`) — the operand a
+    /// simplification just created inherits the expression map of the op it stands for.
+    fn set_expr_info_map_for_value(&mut self, val: Val, map: ExprInfoMap) {
+        let _ = (val, map);
+        todo!(
+            "PropagationAnalysis::setExprInfoMapForValue (Analyses/PropagationAnalysis.h:323) — out of campaign scope"
         )
     }
 }

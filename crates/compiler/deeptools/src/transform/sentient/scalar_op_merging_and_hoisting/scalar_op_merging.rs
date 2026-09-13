@@ -87,15 +87,27 @@
 //! | `e611_runScalarOpMerging` | 611 | 5 | 10 | `dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:569` |
 
 use core::cmp::Ordering;
+use std::collections::BTreeSet;
 
-use super::{BurstAndIl, FieldUnrollData, OperationData, ScalarOpMergingBlock, UnrollTarget};
-use crate::arch::Elements;
+use super::scalar_op_hoisting::{
+    IbuffSpace, first_const_operand_index, is_immutable_value_in_range, is_sentient_constant,
+};
+use super::{
+    AddressScale, BurstAndIl, FieldUnrollData, MemoryOpInfo, OperationData, ScalarOpComp,
+    ScalarOpMergingBlock, UnrollTarget, does_value_exceed_lrf_range,
+};
+use crate::arch::{Arch, Elements};
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
-    Op, Val, erase_defining_op, replace_all_uses_with, results, use_count,
+    Definitions, Op, Val, erase_defining_op, operands, replace_all_uses_with, results, use_count,
 };
-use crate::transform::sentient::analyses::{ExpressionEvaluator, InstructionCount, OffsetSites};
+use crate::transform::sentient::analyses::{
+    EvaluatedValue, Evaluation, ExpressionEvaluator, InstructionCount, OffsetSites,
+};
+
+/// `DisableFieldUnrolling` (`:110-113`) — `cl::init(false)`, so the field-unroll arm is live.
+const DISABLE_FIELD_UNROLLING: bool = false;
 
 /// Replaces: e165_calculateIBuffRequired
 ///
@@ -388,10 +400,262 @@ pub(crate) fn find_field_unroll_candidate(
 //   original  : void ScalarOpMerging::doScalarOpMerging(ScalarOpMergingBlock &block)
 //   calls     : e166_isProfitableForHoisting, e169_findFieldUnrollCandidate
 
-// crustify:todo: e528_buildBlock
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:644  (179 body lines, level 3)
-//   original  : void ScalarOpMerging::buildBlock( Operation *merge_candidate, std::unordered_set<Operation *> &analyzed_ops)
-//   calls     : e158_doesValueExceedLRFRange, e162_addOpToBlock, e163_setEnablesMerging, e164_addUnrollCandidate, e252_size, e361_isImmutableValueInRange, e362_isFieldUnrollCandidate, e422_insert
+/// `ScalarOpMerging::isFieldUnrollCandidate` (`:1080`) — whether the burst/IL transfer's speculative
+/// immutables all fit, advancing the merging increment past them if they do.
+///
+/// ⛔ IT IS e362 AND IT IS NOT PORTED YET.
+/// ⛔ IT TAKES BOTH FLAVOURS OF THE INCREMENT where the reference takes one
+/// `const EvaluatedValue *&`: updating only the handle would leave the decoded reading stale for the
+/// next arm's LRF test, and decoding a handle is out of campaign scope (see
+/// [`MergingIncrement`](super::scalar_op_hoisting::MergingIncrement)).
+fn is_field_unroll_candidate(
+    candidate: &mut FieldUnrollData,
+    merging_increment: &mut EvaluatedValue,
+    merging_increment_ev: &mut Evaluation,
+) -> bool {
+    let _ = (candidate, merging_increment, merging_increment_ev);
+    todo!(
+        "isFieldUnrollCandidate (senpass e362, ScalarOpMergingAndHoisting.cpp:1080) is not ported \
+         yet — whether the transfer's speculative immutables all stay in range"
+    )
+}
+
+/// `Value::getDefiningOp()` RESTRICTED TO ONE REGION — `analyze_op->getParentRegion() !=
+/// parent_region` (`:659`) expressed as a lookup, because [`defining_op`] recurses into nested ones.
+///
+/// [`defining_op`]: crate::islands::sentient::dialects::defining_op
+fn defining_op_in_region(val: Val, region: &[Op]) -> Option<&Op> {
+    region.iter().find(|op| results(op).contains(&val))
+}
+
+/// Replaces: e528_buildBlock
+///
+/// Walks the operand chain up from one merge candidate collecting every op that can absorb the
+/// running merging increment, and keeps the block only where it reached more than one op.
+///
+/// ⛔ THE SKIP SET GAINS THE OP THE WALK IS ABOUT TO DECLINE (`:653`), breaks included, so e577
+/// never re-analyses one — and here it also gains the chain's final input value, which defines no op
+/// at all and so can never collide with a candidate.
+/// ⛔ TWO USES END THE CHAIN AND NO USES DOES NOT (`:654`): a dead op is still merged through.
+/// ⛔ `setInputValueToBlock` IS OVERWRITTEN EVERY STEP — what survives is the last step's input.
+/// ⛔ THE ADD/SUB ARMS DECLINE ON A MISSING `element_size` AFTER SUMMING (`:673-679`), so the
+/// increment the evaluator memoised advances even when the block ends there.
+/// ⭐ THE UNROLL ARM COMMITS ITS INCREMENT ONLY IF e362 ACCEPTS (`:769-773`), and the in-range arm's
+/// new increment is the DIFFERENCE the new immutable absorbed rather than a further sum (`:806`).
+pub(crate) fn build_block<A: Arch, E: ExpressionEvaluator>(
+    merge_candidate: Val,
+    region: &[Op],
+    ibuff_space: IbuffSpace,
+    comp: ScalarOpComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    analyzed_ops: &mut BTreeSet<Val>,
+    blocks: &mut Vec<ScalarOpMergingBlock>,
+) {
+    let mut remaining_ibuff = InstructionCount(ibuff_space.0);
+    let mut increment = evaluator.constant(0);
+    let mut increment_ev = evaluator.constant_evaluation(0);
+    let mut block = ScalarOpMergingBlock::default();
+    let regions: [&[Op]; 1] = [region];
+    let defs = Definitions::from_innermost(&regions);
+    let mut analyze = Some(merge_candidate);
+    while let Some(op_val) = analyze {
+        analyzed_ops.insert(op_val);
+        if use_count(op_val, region) > 1 {
+            break;
+        }
+        let Some(op) = defining_op_in_region(op_val, region) else {
+            break;
+        };
+        let input_value = match op {
+            Op::Sentient(ops::Op::ScalarAdd {
+                lhs,
+                rhs,
+                element_size,
+                ..
+            }) => {
+                let Some(const_operand_idx) = first_const_operand_index(op, defs) else {
+                    break;
+                };
+                let operand = operands(op)[const_operand_idx];
+                let operand_ev = evaluator.evaluate_value(operand);
+                increment_ev = evaluator.evaluate_sum(&increment_ev, &operand_ev);
+                let operand_handle = evaluator.evaluate_value_handle(operand);
+                increment = evaluator.evaluate_sum_handle(increment, operand_handle);
+                let Some(element_size) = *element_size else {
+                    break;
+                };
+                if does_value_exceed_lrf_range::<A>(&increment_ev, element_size, comp, scale) {
+                    break;
+                }
+                record(&mut block, op_val, merge_candidate, evaluator, increment);
+                if const_operand_idx == 0 { *rhs } else { *lhs }
+            }
+            Op::Sentient(ops::Op::ScalarSub {
+                lhs,
+                rhs,
+                element_size,
+                ..
+            }) => {
+                // "Subs are treated as adds so the increment value will be equal to the opposite
+                // constant" — which is only expressible when the SUBTRAHEND is the constant.
+                if !is_sentient_constant(*rhs, defs) {
+                    break;
+                }
+                let rhs_ev = evaluator.evaluate_value(*rhs);
+                increment_ev = evaluator.evaluate_sub(&increment_ev, &rhs_ev);
+                let rhs_handle = evaluator.evaluate_value_handle(*rhs);
+                increment = evaluator.evaluate_sub_handle(increment, rhs_handle);
+                let Some(element_size) = *element_size else {
+                    break;
+                };
+                if does_value_exceed_lrf_range::<A>(&increment_ev, element_size, comp, scale) {
+                    break;
+                }
+                record(&mut block, op_val, merge_candidate, evaluator, increment);
+                *lhs
+            }
+            Op::Sentient(
+                ops::Op::LoadAndSend { .. }
+                | ops::Op::ReceiveAndStore { .. }
+                | ops::Op::LoadComputeAndSend { .. },
+            ) => {
+                let Some(mem_info) = MemoryOpInfo::of(op) else {
+                    break;
+                };
+                // `calculateIBuffRequired<LAS|RAS>`, and 0 for LCAS — which is what
+                // [`BurstAndIl::of`]'s own `isa<>` pair already says.
+                let required_ibuff =
+                    BurstAndIl::of(op).map_or(InstructionCount(0), calculate_ibuff_required);
+                let Some(immutable_addr_op) = defs.of(mem_info.immutable_addr) else {
+                    break;
+                };
+                if mem_info.burst.0 > 1 || mem_info.il.0 > 0 {
+                    if DISABLE_FIELD_UNROLLING {
+                        break;
+                    }
+                    if !matches!(
+                        immutable_addr_op,
+                        Op::Sentient(ops::Op::ScalarConstant { .. } | ops::Op::ScalarCopy { .. })
+                    ) {
+                        break;
+                    }
+                    if required_ibuff > remaining_ibuff {
+                        break;
+                    }
+                    let mut unroll_candidate = FieldUnrollData {
+                        op: Some(op_val),
+                        cost: required_ibuff,
+                        ..FieldUnrollData::default()
+                    };
+                    let mut unroll_increment = increment;
+                    let mut unroll_increment_ev = increment_ev.clone();
+                    if !is_field_unroll_candidate(
+                        &mut unroll_candidate,
+                        &mut unroll_increment,
+                        &mut unroll_increment_ev,
+                    ) {
+                        break;
+                    }
+                    increment = unroll_increment;
+                    increment_ev = unroll_increment_ev;
+                    remaining_ibuff.0 -= required_ibuff.0;
+                    let zero = evaluator.constant(0);
+                    block.add_op_to_block(
+                        OperationData {
+                            op: op_val,
+                            mod_by: zero,
+                            merging_increment: increment,
+                            replace_with_mod: false,
+                        },
+                        false,
+                    );
+                    block.add_unroll_candidate(unroll_candidate);
+                } else {
+                    if !is_sentient_constant(mem_info.immutable_addr, defs) {
+                        todo!(
+                            "buildBlock: DT_CHECK_MSG(isConstant<ConstantOp>(immutable_addr_), \
+                             \"Expect constant immutable address\") \
+                             (ScalarOpMergingAndHoisting.cpp:788)"
+                        )
+                    }
+                    if !is_sentient_constant(mem_info.increment, defs) {
+                        todo!(
+                            "buildBlock: DT_CHECK_MSG(isConstant<ConstantOp>(increment_), \"Expect \
+                             constant increment\") (ScalarOpMergingAndHoisting.cpp:791)"
+                        )
+                    }
+                    let immutable_addr_ev = evaluator.evaluate_value(mem_info.immutable_addr);
+                    let op_increment_ev = evaluator.evaluate_value(mem_info.increment);
+                    // `immutable - increment - merging_increment`.
+                    let new_immutable_addr_ev = {
+                        let rebased = evaluator.evaluate_sub(&immutable_addr_ev, &op_increment_ev);
+                        evaluator.evaluate_sub(&rebased, &increment_ev)
+                    };
+                    let immutable_addr = evaluator.evaluate_value_handle(mem_info.immutable_addr);
+                    let op_increment = evaluator.evaluate_value_handle(mem_info.increment);
+                    let new_immutable_addr = {
+                        let rebased = evaluator.evaluate_sub_handle(immutable_addr, op_increment);
+                        evaluator.evaluate_sub_handle(rebased, increment)
+                    };
+                    if !is_immutable_value_in_range(
+                        &new_immutable_addr_ev,
+                        &immutable_addr_ev,
+                        mem_info.element_size,
+                        op,
+                    ) {
+                        break;
+                    }
+                    // `immutable - (immutable - increment - merging_increment)`.
+                    increment_ev =
+                        evaluator.evaluate_sub(&immutable_addr_ev, &new_immutable_addr_ev);
+                    increment = evaluator.evaluate_sub_handle(immutable_addr, new_immutable_addr);
+                    block.add_op_to_block(
+                        OperationData {
+                            op: op_val,
+                            mod_by: new_immutable_addr,
+                            merging_increment: increment,
+                            replace_with_mod: false,
+                        },
+                        false,
+                    );
+                }
+                mem_info.mutable_addr
+            }
+            _ => break,
+        };
+        block.input_value_to_block = Some(input_value);
+        analyze = Some(input_value);
+    }
+
+    if block.block_ops.len() > 1 {
+        blocks.push(block);
+    }
+}
+
+/// The add/sub arms' shared tail (`:692-699`, `:729-736`) — the op is recorded with a modification of
+/// ZERO because merging deletes it, and anything above the candidate is what enables merging.
+fn record<E: ExpressionEvaluator>(
+    block: &mut ScalarOpMergingBlock,
+    op: Val,
+    merge_candidate: Val,
+    evaluator: &mut E,
+    merging_increment: EvaluatedValue,
+) {
+    let zero = evaluator.constant(0);
+    block.add_op_to_block(
+        OperationData {
+            op,
+            mod_by: zero,
+            merging_increment,
+            replace_with_mod: false,
+        },
+        true,
+    );
+    if op != merge_candidate {
+        block.set_enables_merging();
+    }
+}
 
 // crustify:todo: e577_collectBlocks
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:869  (26 body lines, level 4)
@@ -409,8 +673,11 @@ mod unit_tests {
     use super::*;
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::Values;
+    use crate::arch::Dd2;
     use crate::islands::dataflow_ir::link::SendEnd;
-    use crate::transform::sentient::analyses::{EvaluatedValue, Evaluation};
+    use crate::transform::sentient::analyses::{
+        EvaluatedValue, Evaluation, Offsets, ScalarOffset,
+    };
 
     /// The out-of-scope evaluator, stating the ONE answer these units consume.
     struct StatedEvaluator {
@@ -542,6 +809,97 @@ mod unit_tests {
             required_ibuff: InstructionCount(slots),
             ..ScalarOpMergingBlock::default()
         }
+    }
+
+    /// AN EVALUATOR THAT ACTUALLY SUMS — `ExpressionEvaluator` is out of campaign scope, and the
+    /// running increment is the one answer e528 consumes. Every handle is a fresh arena entry, so the
+    /// numbering below IS the order the walk asked its questions in.
+    #[derive(Default)]
+    struct SummingEvaluator {
+        interned: u32,
+    }
+
+    impl SummingEvaluator {
+        fn intern(&mut self) -> EvaluatedValue {
+            self.interned += 1;
+            EvaluatedValue(self.interned - 1)
+        }
+    }
+
+    impl ExpressionEvaluator for SummingEvaluator {
+        /// The fixture's one constant.
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            absolute(8)
+        }
+
+        fn evaluate_sum(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation {
+            absolute(offset_of(lhs) + offset_of(rhs))
+        }
+
+        fn constant_evaluation(&mut self, value: i64) -> Evaluation {
+            absolute(value)
+        }
+
+        fn constant(&mut self, _value: i64) -> EvaluatedValue {
+            self.intern()
+        }
+
+        fn evaluate_value_handle(&mut self, _value: Val) -> EvaluatedValue {
+            self.intern()
+        }
+
+        fn evaluate_sum_handle(
+            &mut self,
+            _lhs: EvaluatedValue,
+            _rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            self.intern()
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e528 builds no offset value")
+        }
+    }
+
+    fn absolute(offset: i64) -> Evaluation {
+        Evaluation {
+            known_absolute: true,
+            base: None,
+            offsets: Offsets::AllUnit(ScalarOffset(offset)),
+        }
+    }
+
+    fn offset_of(evaluation: &Evaluation) -> i64 {
+        evaluation
+            .all_unit_offset()
+            .map_or(0, |offset: ScalarOffset| offset.0)
+    }
+
+    fn add_sized(lhs: Val, rhs: Val, result: Val, element_size: Bits) -> Op {
+        Op::Sentient(ops::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            ty: ScalarTy::Index,
+            element_size: Some(element_size),
+        })
+    }
+
+    fn scalar_constant(value: i64, result: Val) -> Op {
+        Op::Sentient(ops::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: ops::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
     }
 
     fn candidate_of(op: Val, cost: i32, immutables: Vec<EvaluatedValue>) -> FieldUnrollData {
@@ -702,5 +1060,50 @@ mod unit_tests {
         // ⛔ THE UNMARKED ONE IS NOT AN ANSWER: `markFieldUnrollingCandidates` has not chosen it, so
         // there is no IBuff reserved for it.
         assert_eq!(find_field_unroll_candidate(Val(4), &block), None);
+    }
+
+    /// e528 — a chain of two adds over the same constant becomes ONE block whose second op carries the
+    /// summed increment, ending at the value from outside it.
+    #[test]
+    fn a_chain_of_two_adds_is_one_block_ending_at_the_value_from_outside_it() {
+        let region = vec![
+            scalar_constant(8, Val(2)),
+            add_sized(Val(1), Val(2), Val(4), Bits(16)),
+            add_sized(Val(4), Val(2), Val(6), Bits(16)),
+        ];
+        let mut analyzed = BTreeSet::new();
+        let mut blocks = Vec::new();
+        build_block::<Dd2, _>(
+            Val(6),
+            &region,
+            IbuffSpace(8),
+            ScalarOpComp::Lxlu,
+            AddressScale::ONE,
+            &mut SummingEvaluator::default(),
+            &mut analyzed,
+            &mut blocks,
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].input_value_to_block, Some(Val(1)));
+        assert_eq!(blocks[0].num_scalar_ops_in_block, ScalarOpCount(2));
+        assert_eq!(
+            blocks[0].block_ops,
+            vec![
+                OperationData {
+                    op: Val(6),
+                    mod_by: EvaluatedValue(3),
+                    merging_increment: EvaluatedValue(2),
+                    replace_with_mod: false,
+                },
+                OperationData {
+                    op: Val(4),
+                    mod_by: EvaluatedValue(6),
+                    merging_increment: EvaluatedValue(5),
+                    replace_with_mod: false,
+                },
+            ]
+        );
+        // ⛔ `%1` IS IN THE SKIP SET although it defines no op — see [`build_block`]'s first trap.
+        assert_eq!(analyzed, BTreeSet::from([Val(1), Val(4), Val(6)]));
     }
 }

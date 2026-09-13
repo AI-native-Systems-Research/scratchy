@@ -476,7 +476,7 @@ impl DefKind {
 /// on the first symbol found (`:152`) and on the first non-match (`:230`, `:249`).
 /// ⛔ TRAP: THE KEY IS LOAD-BEARING, so [`dialects::uniform_mapping_values`] and not every pair of the
 /// `uniform.def_immutable_mapping`.
-fn is_symbol(val: Val, defs: dialects::Definitions<'_>) -> bool {
+pub(super) fn is_symbol(val: Val, defs: dialects::Definitions<'_>) -> bool {
     match defs.of(val) {
         Some(Op::Symbol(symbol::Op::CreateSymbol { .. })) => true,
         Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })) => {

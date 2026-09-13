@@ -92,17 +92,23 @@
 // [`ScalarOpReordering::run_on_program`], and every item below is reachable only from this file's own
 // tests until it lands. CI runs clippy with `-D warnings`. ⭐ REMOVE THIS WITH e367.
 
-use std::collections::BTreeMap;
+use core::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::sentient::dialects::{
-    self as dialects, Op, Val, dataflow, defining_op, sentient, uniform,
+    self as dialects, Definitions, Op, Val, dataflow, defining_op, sentient, uniform,
+    value_reg_locale,
 };
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
-use crate::transform::sentient::utils::InBlock;
+use crate::transform::sentient::utils::{InBlock, OpAt, move_before, path_of};
 use crate::workload::Workload;
+
+/// `ForceAllowMovementWithinLoops` (`:50-53`) — `cl::init(false)`, so register pressure is what
+/// decides whether a candidate may be moved into a loop.
+const FORCE_ALLOW_MOVEMENT_WITHIN_LOOPS: bool = false;
 
 /// THE NUMBER OF REGISTER LOCALES — fourteen, which is `getMaxEnumValForSentientRegType() + 1`.
 const LOCALES: usize = 14;
@@ -141,6 +147,38 @@ const fn locale_slot(locale: sentient::RegType) -> usize {
 /// indexed by [`locale_slot`], so neither the short size nor the out-of-range index is expressible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerLocale<T>([T; LOCALES]);
+
+/// THE FOURTEEN LOCALES IN [`locale_slot`] ORDER — `for (i = 0; i <= getMaxEnumValForSentientRegType();
+/// ++i)` (`:238-239`), which is the order e531 drains its buckets in.
+const LOCALES_IN_ORDER: [sentient::RegType; LOCALES] = [
+    sentient::RegType::Unknown,
+    sentient::RegType::Imm,
+    sentient::RegType::Jcr,
+    sentient::RegType::Lccr,
+    sentient::RegType::Lrf,
+    sentient::RegType::XrfRdPtr,
+    sentient::RegType::XrfWrPtr,
+    sentient::RegType::Lar,
+    sentient::RegType::Lbr,
+    sentient::RegType::Ear,
+    sentient::RegType::Ebr,
+    sentient::RegType::Gtr,
+    sentient::RegType::Mvr,
+    sentient::RegType::Unrelated,
+];
+
+impl<T> PerLocale<T> {
+    /// One fresh element per locale — [`Self::filled`] for an element type that is not [`Copy`], which
+    /// is what `std::array<std::optional<std::priority_queue<..>>>` (`:225-228`) needs.
+    fn per_locale(element: impl FnMut(usize) -> T) -> PerLocale<T> {
+        PerLocale(core::array::from_fn(element))
+    }
+
+    /// What `locale` holds, mutably.
+    fn get_mut(&mut self, locale: sentient::RegType) -> &mut T {
+        &mut self.0[locale_slot(locale)]
+    }
+}
 
 impl<T: Copy> PerLocale<T> {
     /// Every locale holding `value` — `BitVector(n)`'s all-clear and the ctor's `= 0` loop, which are
@@ -449,6 +487,19 @@ impl ScalarOpReordering {
         )
     }
 
+    /// `localeHasFreeRegs(SentientRegType)` — entry 370, level 1, not yet ported.
+    ///
+    /// ⛔ IT IS e370 AND IT IS NOT PORTED YET. Its two shortcuts read state this type already carries
+    /// ([`PerLocale`]), but what stands behind them is `Liveness` + `RegisterPressure`, both out of
+    /// campaign scope.
+    fn locale_has_free_regs(&mut self, locale: sentient::RegType) -> bool {
+        let _ = locale;
+        todo!(
+            "localeHasFreeRegs (senpass e370, ScalarOpReordering.cpp:431) is not ported yet — the \
+             RegisterPressure recompute behind the per-locale free-register bitvector"
+        )
+    }
+
     /// Replaces: e470_isCandidateForReordering
     ///
     /// Whether the scalar op at `at` may be moved down to just before its first use: it must be one of
@@ -530,10 +581,255 @@ impl ScalarOpReordering {
     }
 }
 
-// crustify:todo: e531_findAndProcessCandidates
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:207  (165 body lines, level 3)
-//   original  : void ScalarOpReorderingPass::findAndProcessCandidates( dataflow::ProgramUnitOp unit_op)
-//   calls     : e177_getLiverangeEndPt, e368_getFirstUseWithinBlock, e370_localeHasFreeRegs, e422_insert, e470_isCandidateForReordering
+/// ONE CANDIDATE IN A LOCALE'S QUEUE — an `Operation *` plus the two indices `cmp` (`:214-222`) sorts
+/// it by.
+///
+/// ⛔⛔ BOTH INDICES ARE SNAPSHOTS TAKEN BEFORE ANY MOVE, and that is what the reference does too: it
+/// never updates `op_to_idx_` because *"Op reordering will render indices stale"* (`:158-161`), and it
+/// argues the liverange ENDPOINT survives because this pass never moves an op past a use of its
+/// operands. ⭐ THE OP'S OWN RESULT IS ITS IDENTITY here where a pointer is there — a [`Val`] is bound
+/// once and a position is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Candidate {
+    /// `op->getResult(0)`.
+    result: Val,
+    /// `getLiverangeEndPt(op)` (e177).
+    liverange_end: LiverangeIndex,
+    /// `op_to_idx_[op]` — the original operation order, and `cmp`'s tie-break.
+    order: LiverangeIndex,
+}
+
+/// `candidates.top()` — the furthest liverange endpoint, and among ties the EARLIEST op, which is
+/// `cmp`'s `left_idx > right_idx` read as a maximum.
+fn top(candidates: &[Candidate]) -> Option<&Candidate> {
+    candidates
+        .iter()
+        .max_by_key(|candidate| (candidate.liverange_end, Reverse(candidate.order)))
+}
+
+/// `candidates.top(); candidates.pop();`.
+fn pop_top(candidates: &mut Vec<Candidate>) -> Option<Candidate> {
+    let popped = *top(candidates)?;
+    candidates.retain(|candidate| candidate.result != popped.result);
+    Some(popped)
+}
+
+/// `unit_op->walk<WalkOrder::PreOrder>` YIELDING BOTH IDENTITIES ONE OP HAS HERE: the [`OpId`] the
+/// liveness numbering is keyed by ([`ScalarOpReordering::compute_op_indexing`]) and the [`OpAt`] the
+/// moves index by.
+fn walk_positions(unit_body: &[Op]) -> Vec<(OpId, OpAt)> {
+    fn walk<'a>(
+        scope: &'a [Op],
+        base: u32,
+        prefix: &mut Vec<u32>,
+        enclosing: &mut Vec<(InBlock, usize)>,
+        out: &mut Vec<(OpId, OpAt)>,
+    ) {
+        for (ordinal, op) in scope.iter().enumerate() {
+            prefix.push(base + ordinal as u32);
+            out.push((OpId::at(prefix), OpAt::at(enclosing, InBlock(ordinal))));
+            let mut offset = 0u32;
+            for (region_idx, region) in dialects::regions_ref(op).into_iter().enumerate() {
+                enclosing.push((InBlock(ordinal), region_idx));
+                walk(region, offset, prefix, enclosing, out);
+                enclosing.pop();
+                offset += region.len() as u32;
+            }
+            prefix.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(unit_body, 0, &mut Vec::new(), &mut Vec::new(), &mut out);
+    out
+}
+
+/// `*val.user_begin()` — where the FIRST op reading `val` sits, at whatever depth, with how many uses
+/// of it there are in the whole unit (`hasOneUse` is ONE USE, not one user).
+fn uses_of(unit_body: &[Op], val: Val) -> (usize, Option<OpAt>) {
+    let mut count = 0;
+    let mut first = None;
+    for (_, at) in walk_positions(unit_body) {
+        let Some(op) = at.op(unit_body) else {
+            continue;
+        };
+        let reads = dialects::operands(op)
+            .into_iter()
+            .filter(|operand| *operand == val)
+            .count();
+        if reads > 0 && first.is_none() {
+            first = Some(at);
+        }
+        count += reads;
+    }
+    (count, first)
+}
+
+impl ScalarOpReordering {
+    /// Replaces: e531_findAndProcessCandidates
+    ///
+    /// Moves every reorderable scalar op of one unit down towards its first use, the furthest-living
+    /// candidate of each locale first, re-queueing the operands of each op it moved.
+    ///
+    /// ⛔ A SINGLE-USE CANDIDATE WHOSE USER IS IN ANOTHER BLOCK CLIMBS THE LOOP NEST: with free
+    /// registers it stops in front of the OUTERMOST enclosing loop, and without, in front of the
+    /// outermost one the next candidate stops living before (`:315-337`).
+    /// ⛔ THE LOOP TEST COMES BEFORE THE SAME-BLOCK BREAK (`:316-344`), so the loop that opens the
+    /// candidate's own block is still an insertion point — the walk just ends there.
+    /// ⛔ AN OPERAND IS RE-QUEUED ONLY IF IT WAS ALREADY POPPED (`:360-372`), which is what keeps one op
+    /// out of the queue twice, and it leaves `visited` so it can be re-queued again later.
+    /// ⭐ `val_to_first_use_in_block_cache_.clear()` IS e368'S CACHE and so is its invalidation.
+    pub fn find_and_process_candidates(&mut self, unit_body: &mut Vec<Op>) {
+        let mut locale_to_candidates: PerLocale<Vec<Candidate>> = PerLocale::per_locale(|_| Vec::new());
+        // Every candidate by result, for the re-queue below: the reference pushes the pointer back and
+        // `cmp` re-reads the same two snapshot indices off it. See [`Candidate`].
+        let mut collected: BTreeMap<Val, Candidate> = BTreeMap::new();
+        // `op_to_idx_[parent_op]` FOR A LOOP, keyed by its induction variable rather than its position:
+        // an [`OpAt`] shifts when a candidate ahead of it moves and an `Operation *` does not.
+        let mut loop_order: BTreeMap<Val, LiverangeIndex> = BTreeMap::new();
+        for (op_id, at) in walk_positions(unit_body) {
+            let order = self
+                .op_to_idx
+                .get(&op_id)
+                .copied()
+                .unwrap_or(LiverangeIndex::FIRST);
+            if let Some(Op::Sentient(sentient::Op::For { iv, .. })) = at.op(unit_body) {
+                loop_order.insert(*iv, order);
+            }
+            let Some(block) = at.block(unit_body) else {
+                continue;
+            };
+            if !self.is_candidate_for_reordering(block, at.index()) {
+                continue;
+            }
+            let Some(result) = at.op(unit_body).and_then(ScalarResult::of) else {
+                continue;
+            };
+            let locale = value_reg_locale(result.val(), Definitions::from_innermost(&[block]));
+            let candidate = Candidate {
+                result: result.val(),
+                liverange_end: self.liverange_end_pt(result, unit_body),
+                order,
+            };
+            collected.insert(result.val(), candidate);
+            locale_to_candidates.get_mut(locale).push(candidate);
+        }
+
+        for locale in LOCALES_IN_ORDER {
+            let mut candidates = core::mem::take(locale_to_candidates.get_mut(locale));
+            // `if (!optional_candidates.has_value()) continue;` — a locale nothing was bucketed into.
+            if candidates.is_empty() {
+                continue;
+            }
+            // Candidates no longer in the list, so they may be re-inserted if needed.
+            let mut visited: BTreeSet<Val> = BTreeSet::new();
+            while let Some(cur) = pop_top(&mut candidates) {
+                visited.insert(cur.result);
+                // The furthest liverange endpoint among those REMAINING, and `0` once none are.
+                let next_candidate_liverange_end = top(&candidates)
+                    .map_or(LiverangeIndex::FIRST, |candidate| candidate.liverange_end);
+                let Some(cur_at) = path_of(unit_body, cur.result) else {
+                    continue;
+                };
+                let (num_uses, first_user) = uses_of(unit_body, cur.result);
+                let insert_before = match first_user {
+                    // `cur_val.hasOneUse()` and the `DT_CHECK(result_user)` beneath it.
+                    Some(result_user) if num_uses == 1 => {
+                        if result_user.in_same_block_as(&cur_at) {
+                            // Movement is horizontal.
+                            result_user
+                        } else {
+                            self.insertion_point_up_the_nest(
+                                unit_body,
+                                &cur_at,
+                                &result_user,
+                                locale,
+                                next_candidate_liverange_end,
+                                &loop_order,
+                            )
+                        }
+                    }
+                    // Multiple uses: horizontally to right before the ancestor of the first use
+                    // within the block. ⭐ NO USES AT ALL CANNOT REACH HERE — e470 declines a dead op.
+                    _ => {
+                        let Some(block) = cur_at.block(unit_body) else {
+                            continue;
+                        };
+                        let Some(first_use) = self.first_use_within_block(cur.result, block) else {
+                            continue;
+                        };
+                        cur_at.sibling(first_use)
+                    }
+                };
+                move_before(unit_body, &cur_at, &insert_before);
+                // Re-insert the moved candidate's operands, and only those already processed.
+                let Some(moved_at) = path_of(unit_body, cur.result) else {
+                    continue;
+                };
+                let operands = moved_at
+                    .op(unit_body)
+                    .map(dialects::operands)
+                    .unwrap_or_default();
+                for operand in operands {
+                    let Some(operand_at) = path_of(unit_body, operand) else {
+                        continue;
+                    };
+                    let Some(operand_block) = operand_at.block(unit_body) else {
+                        continue;
+                    };
+                    if !self.is_candidate_for_reordering(operand_block, operand_at.index()) {
+                        continue;
+                    }
+                    if visited.remove(&operand)
+                        && let Some(candidate) = collected.get(&operand)
+                    {
+                        candidates.push(*candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The ancestor-chain walk between a single use in another block and the candidate (`:314-344`) —
+    /// how far up the loop nest the candidate may be placed.
+    fn insertion_point_up_the_nest(
+        &mut self,
+        unit_body: &[Op],
+        cur_at: &OpAt,
+        result_user: &OpAt,
+        locale: sentient::RegType,
+        next_candidate_liverange_end: LiverangeIndex,
+        loop_order: &BTreeMap<Val, LiverangeIndex>,
+    ) -> OpAt {
+        let has_free_regs =
+            !FORCE_ALLOW_MOVEMENT_WITHIN_LOOPS && self.locale_has_free_regs(locale);
+        let mut insert_before = result_user.clone();
+        let mut parent = result_user.parent();
+        while let Some(parent_op) = parent {
+            if let Some(Op::Sentient(sentient::Op::For { iv, .. })) = parent_op.op(unit_body) {
+                if has_free_regs {
+                    insert_before = parent_op.clone();
+                } else {
+                    let loop_idx = loop_order
+                        .get(iv)
+                        .copied()
+                        .unwrap_or(LiverangeIndex::FIRST);
+                    // The next candidate's liverange ends strictly before this loop, so the candidate
+                    // does not need to be moved inside it.
+                    if next_candidate_liverange_end < loop_idx {
+                        insert_before = parent_op.clone();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if parent_op.in_same_block_as(cur_at) {
+                break;
+            }
+            parent = parent_op.parent();
+        }
+        insert_before
+    }
+}
 
 // crustify:todo: e579_runOn
 //   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:191  (15 body lines, level 4)
@@ -642,6 +938,18 @@ mod unit_tests {
             ),
             bound: core::marker::PhantomData,
         }
+    }
+
+    /// e531 — the collection walk reaches the candidate test on the unit's own scalar op, which is as
+    /// far as any path through this pass can get while e368 is unported.
+    #[test]
+    #[should_panic(expected = "senpass e368")]
+    fn every_path_through_the_drain_reaches_the_unported_first_use() {
+        let unit = vec![constant(Val(1)), add(Val(1), Val(1), Val(2)), add(Val(2), Val(1), Val(3))];
+        let mut pass = ScalarOpReordering::new();
+        pass.compute_op_indexing(&unit);
+        let mut body = unit;
+        pass.find_and_process_candidates(&mut body);
     }
 
     /// e174 — nothing indexed, no locale with free registers, no locale over budget, and the

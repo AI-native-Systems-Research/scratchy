@@ -85,10 +85,16 @@
 // (level 4) is what reaches the item below, through e534. CI runs clippy with `-D warnings`, so
 // without this the first ported leaf here fails the gate. ⭐ REMOVE THIS WITH e580.
 
+use super::QueryKeyAndUnits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::{Op, Val, sentient as ops, uniform};
-use crate::transform::sentient::analyses::{ExprInfoMap, PropagationAnalysis};
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, operands, replace_all_uses_with, sentient as ops, set_operand, uniform,
+    use_count,
+};
+use crate::transform::sentient::analyses::{ExprInfoMap, PropagationAnalysis, UnitIndexMap};
+use crate::transform::sentient::register_packing::constant_target_values;
+use crate::transform::sentient::utils::{ConstKind, is_constant, select_indices_for_units};
 
 /// `FlatExprType` (`:35`) — ONE UNIT'S FLATTENED AFFINE EXPRESSIONS, coefficients then constant.
 ///
@@ -101,7 +107,7 @@ impl FlatExpr {
     /// `flat_expr[0]` — ⭐ EMPTY WHERE THE REFERENCE DEREFERENCES `std::vector::operator[]` past the
     /// end, which every caller's `size()` chain then declines.
     #[must_use]
-    fn first(&self) -> &[i64] {
+    pub(super) fn first(&self) -> &[i64] {
         self.0.first().map_or(&[], Vec::as_slice)
     }
 }
@@ -111,6 +117,35 @@ impl FlatExpr {
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:716  (50 body lines, level 1)
 //   original  : bool sentient::areAllExprsValidToTransform( std::vector<FlatExprType>& flat_exprs, SmallVector<unsigned>& indices, PropagationAnalysis::ExprInfoMap* result_info, bool is_load_store)
 //   calls     : e252_size
+
+/// WHICH CALLER `areAllExprsValidToTransform` ANSWERS FOR — its defaulted `bool is_load_store`
+/// (`:42`), whose effect is one further length limit (`:729`) and one further coefficient test
+/// (`:748`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExprUse {
+    /// `is_load_store == false` — e532 and e534.
+    BinaryOperation,
+    /// `is_load_store == true` — e533's operand lambda.
+    LoadStore,
+}
+
+/// `sentient::areAllExprsValidToTransform` — e372, level 1, not yet ported.
+///
+/// ⛔ IT IS e372 AND IT IS NOT PORTED YET: whether every unit's flattened expression is single,
+/// between 1 and 3 terms long, the same length as unit 0's, coefficients all 1, no constant on the
+/// 3-term case — and written over no induction variable.
+pub(super) fn are_all_exprs_valid_to_transform(
+    flat_exprs: &[FlatExpr],
+    indices: &[usize],
+    result_info: ExprInfoMap,
+    use_of: ExprUse,
+) -> bool {
+    let _ = (flat_exprs, indices, result_info, use_of);
+    todo!(
+        "areAllExprsValidToTransform (senpass e372, ScalarSimplifications.cpp:716) is not ported \
+         yet — the per-unit agreement of dimension size, coefficients and induction-variable freedom"
+    )
+}
 
 // crustify:todo: e373_areFlatExprsAndArgsIdentical
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:840  (29 body lines, level 1)
@@ -271,10 +306,219 @@ fn scalar_constant(
     result
 }
 
-// crustify:todo: e534_lightWeightSimplifyBinaryArithmetic
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:504  (183 body lines, level 3)
-//   original  : void sentient::lightWeightSimplifyBinaryArithmetic( OpBuilder& builder, PropagationAnalysis& expr_prop_analysis, Operation* op, std::vector<mlir::Operation*>& tobe_deleted)
-//   calls     : e240_selectIndicesForUnits, e252_size, e392_getQueryKeyAndUnitsFromParentRegion, e472_createNewOpOrMap
+/// `sentient::ConstantOp` OR A CONSTANT `uniform::QueryMapOp`'S PER-UNIT TARGETS (`:604-616`,
+/// `:622-634`) — the two spellings of an add's constant operand, EMPTY where it is neither, which is
+/// the reference's `rhs_consts.empty()` refusal.
+fn add_operand_constants(val: Val, defs: Definitions<'_>) -> Vec<i64> {
+    match defs.of(val) {
+        Some(Op::Sentient(ops::Op::ScalarConstant { value, .. })) => vec![*value],
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => {
+            if !is_constant(val, ConstKind::ScalarConstant, defs) {
+                todo!(
+                    "lightWeightSimplifyBinaryArithmetic: \
+                     DT_CHECK_MSG(isConstant<sentient::ConstantOp>(query_map), \"Expecting \
+                     non-symbolic RHS of IfOp condition\") (ScalarSimplifications.cpp:608, :627)"
+                )
+            }
+            constant_target_values(*map, defs)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Replaces: e534_lightWeightSimplifyBinaryArithmetic
+///
+/// Deletes an add of zero, folds a scalar add whose expression resolved to a constant into that
+/// constant, and otherwise merges a chain of two adds into one over the sum of their constants.
+///
+/// ⛔ ONLY AN ADD LOSES ITS ZERO OPERAND (`:528-534`): `checkOperand` is written for both ops and
+/// called for neither `sentient.scalar_sub`, so `x - 0` survives.
+/// ⛔ THE CONSTANT ARM DELETES THE OP EVEN WITH NO USES (`:578-588`) — the replacement value is what
+/// is conditional, not the deletion.
+/// ⛔ e534'S FLATTENING DISCARDS ITS OWN FAILURE (`void(...)`, `:567`) where e532 and e533 decline on
+/// it, so a failed unit still pushes an expression.
+/// ⛔ THE MERGE ARM READS THE INNER ADD'S SECOND OPERAND ONLY (`:618`), keeps the outer op and
+/// deletes the INNER one, and needs it to have exactly one use.
+/// ⭐ THE PER-UNIT CONSTANT LISTS BROADCAST: a list of length 1 pairs with every element of the other
+/// (`:646-650`), which is why the sum is indexed by `min(idx, len - 1)`.
+pub(crate) fn light_weight_simplify_binary_arithmetic(
+    scope: &mut Vec<Op>,
+    at: usize,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    to_be_deleted: &mut Vec<Val>,
+    values: &mut Values,
+) {
+    let (is_add, result, ty) = match scope.get(at) {
+        Some(Op::Sentient(ops::Op::ScalarAdd { result, ty, .. })) => (true, *result, *ty),
+        Some(Op::Sentient(ops::Op::ScalarSub { result, ty, .. })) => (false, *result, *ty),
+        _ => return,
+    };
+    let inputs = operands(&scope[at]);
+    if is_add {
+        for i in 0..inputs.len() {
+            let zero = {
+                let regions: [&[Op]; 1] = [scope];
+                let defs = Definitions::from_innermost(&regions);
+                matches!(
+                    defs.of(inputs[i]),
+                    Some(Op::Sentient(ops::Op::ScalarConstant { value: 0, .. }))
+                )
+            };
+            if zero {
+                replace_all_uses_with(scope, result, inputs[1 - i]);
+                to_be_deleted.push(result);
+                return;
+            }
+        }
+    }
+    let expr_info_map = expr_prop_analysis.affine_expression(result);
+    if expr_prop_analysis.is_expr_info_map_empty(expr_info_map) {
+        // A simplification that already ran can stale the analysis, or leave it without an entry for
+        // an operand that simplification created.
+        return;
+    }
+    // `op->emitOpError("can't find parentOp")` — ⭐ AND NO `signalPassFailure()`, unlike e532 and e533.
+    let Some(QueryKeyAndUnits { key, mut units }) =
+        super::query_key_and_units_from_parent_region(scope, at)
+    else {
+        return;
+    };
+    let mut indices = Vec::new();
+    {
+        let regions: [&[Op]; 1] = [scope];
+        let defs = Definitions::from_innermost(&regions);
+        select_indices_for_units(&mut units, &mut indices, unit_index_map, defs);
+    }
+    let unit_indices: Vec<usize> = indices.iter().map(|index| index.0 as usize).collect();
+    let mut flat_exprs: Vec<FlatExpr> = Vec::new();
+    let mut is_the_result_constant = true;
+    for idx in &unit_indices {
+        let Some(expr_info) = expr_prop_analysis.expr_info_at(expr_info_map, *idx) else {
+            todo!(
+                "lightWeightSimplifyBinaryArithmetic: DT_CHECK_MSG(expr_info, \"Expecting valid \
+                 ExprInfo for unit\") (ScalarSimplifications.cpp:562) — no entry for unit {idx}"
+            )
+        };
+        if !expr_info.cannot_be_resolved
+            && expr_info.num_propagated_args == 0
+            && expr_info.num_map_results == 1
+        {
+            let rows = expr_prop_analysis
+                .flattened_affine_exprs(expr_info_map, *idx)
+                .map(|flattened| flattened.rows)
+                .unwrap_or_default();
+            flat_exprs.push(FlatExpr(rows));
+        } else {
+            is_the_result_constant = false;
+            break;
+        }
+    }
+    if is_the_result_constant {
+        if use_count(result, scope) > 0 {
+            let new_op = create_new_op_or_map(
+                scope,
+                at,
+                &flat_exprs,
+                &unit_indices,
+                &units,
+                expr_info_map,
+                0,
+                ty,
+                key,
+                expr_prop_analysis,
+                values,
+            );
+            expr_prop_analysis.set_expr_info_map_for_value(new_op, expr_info_map);
+            replace_all_uses_with(scope, result, new_op);
+        }
+        to_be_deleted.push(result);
+        return;
+    }
+    // `x = ADD a, c0; y = ADD x, c1` --> `y = ADD a, c0 + c1`, which reads no propagated expression
+    // at all: using one could disrupt what live range reduction did (`:597-602`).
+    let Some(Op::Sentient(ops::Op::ScalarAdd { lhs, rhs, .. })) = scope.get(at) else {
+        return;
+    };
+    let (lhs, rhs) = (*lhs, *rhs);
+    let merge = {
+        let regions: [&[Op]; 1] = [scope];
+        let defs = Definitions::from_innermost(&regions);
+        // `isa<BlockArgument>(lhs) || isa<BlockArgument>(rhs)`, and the inner op must be an add.
+        let Some(Op::Sentient(ops::Op::ScalarAdd {
+            lhs: inner_lhs,
+            rhs: inner_rhs,
+            result: inner_result,
+            ..
+        })) = defs.of(lhs)
+        else {
+            return;
+        };
+        if defs.of(rhs).is_none() {
+            return;
+        }
+        let rhs_consts = add_operand_constants(rhs, defs);
+        let inner_consts = add_operand_constants(*inner_rhs, defs);
+        if rhs_consts.is_empty() || inner_consts.is_empty() {
+            return;
+        }
+        (*inner_lhs, *inner_result, inner_consts, rhs_consts)
+    };
+    let (inner_lhs, inner_result, inner_consts, rhs_consts) = merge;
+    if use_count(inner_result, scope) != 1 {
+        return;
+    }
+    let element_num = inner_consts.len().max(rhs_consts.len());
+    if (inner_consts.len() != 1 && inner_consts.len() != element_num)
+        || (rhs_consts.len() != 1 && rhs_consts.len() != element_num)
+    {
+        todo!(
+            "lightWeightSimplifyBinaryArithmetic: DT_CHECK(lhs_add_op_consts.size() == 1 || \
+             lhs_add_op_consts.size() == element_num) (ScalarSimplifications.cpp:643-645) — {} \
+             against {} per-unit constants",
+            inner_consts.len(),
+            rhs_consts.len()
+        )
+    }
+    let final_consts: Vec<i64> = (0..element_num)
+        .map(|idx| {
+            inner_consts[idx.min(inner_consts.len() - 1)] + rhs_consts[idx.min(rhs_consts.len() - 1)]
+        })
+        .collect();
+    let before = scope.len();
+    let new_operand = if element_num == 1 {
+        scalar_constant(scope, at, final_consts[0], ty, values)
+    } else {
+        let mapped: Vec<Val> = final_consts
+            .iter()
+            .enumerate()
+            .map(|(offset, value)| scalar_constant(scope, at + offset, *value, ty, values))
+            .collect();
+        let map = values.mint();
+        let query = values.mint();
+        scope.insert(
+            at + element_num,
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: map,
+                pairs: units.iter().copied().zip(mapped).collect(),
+            }),
+        );
+        scope.insert(
+            at + element_num + 1,
+            Op::Uniform(uniform::Op::QueryMap {
+                result: query,
+                map,
+                key,
+            }),
+        );
+        query
+    };
+    let at = at + (scope.len() - before);
+    set_operand(&mut scope[at], 0, inner_lhs);
+    set_operand(&mut scope[at], 1, new_operand);
+    to_be_deleted.push(inner_result);
+}
+
 
 // crustify:todo: e580_runOldLightWeightSimplifications
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:690  (25 body lines, level 4)
@@ -283,11 +527,13 @@ fn scalar_constant(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{FlatExpr, create_new_op_or_map};
+    use super::{FlatExpr, create_new_op_or_map, light_weight_simplify_binary_arithmetic};
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
-    use crate::transform::sentient::analyses::{ExprInfoMap, PropagationAnalysis};
+    use crate::islands::sentient::dialects::{Op, Val, operands, sentient as ops};
+    use crate::transform::sentient::analyses::{
+        ExprInfoMap, OutOfScopePropagationAnalysis, OutOfScopeUnitIndexMap, PropagationAnalysis,
+    };
 
     /// AN ANALYSIS THAT ANSWERS WHAT THE TEST SAYS — `PropagationAnalysis` is out of campaign scope.
     struct StatedAnalysis;
@@ -381,5 +627,46 @@ mod unit_tests {
             &mut StatedAnalysis,
             &mut values_after(10),
         );
+    }
+
+    /// e534 — the vendor's own case: an add of a zero constant is replaced by its other operand and
+    /// queued for deletion, with the out-of-scope analyses proving that arm consults neither.
+    #[test]
+    fn an_add_of_a_zero_constant_is_replaced_by_its_other_operand() {
+        let mut scope = vec![
+            Op::Sentient(ops::Op::ScalarConstant {
+                value: 0,
+                result: Val(2),
+                reg_locale: ops::RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Sentient(ops::Op::ScalarAdd {
+                lhs: Val(1),
+                rhs: Val(2),
+                result: Val(3),
+                reg: None,
+                element_size: None,
+                ty: ScalarTy::Index,
+            }),
+            Op::Sentient(ops::Op::ScalarMul {
+                lhs: Val(3),
+                rhs: Val(1),
+                result: Val(4),
+                reg_locale: None,
+                ty: ScalarTy::Index,
+            }),
+        ];
+        let mut to_be_deleted = Vec::new();
+        light_weight_simplify_binary_arithmetic(
+            &mut scope,
+            1,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut to_be_deleted,
+            &mut Values::default(),
+        );
+        assert_eq!(operands(&scope[2]), vec![Val(1), Val(1)]);
+        assert_eq!(to_be_deleted, vec![Val(3)]);
     }
 }

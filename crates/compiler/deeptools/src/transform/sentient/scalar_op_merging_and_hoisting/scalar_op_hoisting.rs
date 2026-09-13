@@ -113,6 +113,11 @@ use crate::transform::sentient::analyses::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct IbuffSpace(pub i32);
 
+/// `num_hoists_executed_per_unit` (`:95`) — the hoists this unit has already executed, which
+/// `MaxHoists` caps and e635 resets between units.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct HoistCount(pub(crate) u32);
+
 /// WHAT SPENDING AN IBUFF ENTRY LEFT BEHIND — `DT_CHECK_MSG(ibuff_space_ >= 0, "No IBUFF space!")`
 /// (`:1571`) as data, because this crate does not spell a check as an abort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +183,7 @@ impl ConstantValue {
 
 /// `dcc::utils::isConstant<sentient::ConstantOp>` (`Utils/Utils.cpp:423`) — a
 /// `sentient.scalar_constant`, or a `uniform.query_map` every one of whose per-core values is one.
-fn is_sentient_constant(val: Val, defs: Definitions<'_>) -> bool {
+pub(super) fn is_sentient_constant(val: Val, defs: Definitions<'_>) -> bool {
     let is_constant_op =
         |op: Option<&Op>| matches!(op, Some(Op::Sentient(ops::Op::ScalarConstant { .. })));
     match defs.of(val) {
@@ -194,7 +199,7 @@ fn is_sentient_constant(val: Val, defs: Definitions<'_>) -> bool {
 
 /// `dcc::utils::getFirstConstOperandIndex` (`Analyses/Utils.cpp:30`) — ⭐ `None` IS ITS `-1`, and the
 /// operand order is [`operands`]'s.
-fn first_const_operand_index(op: &Op, defs: Definitions<'_>) -> Option<usize> {
+pub(super) fn first_const_operand_index(op: &Op, defs: Definitions<'_>) -> Option<usize> {
     operands(op)
         .into_iter()
         .position(|operand| is_sentient_constant(operand, defs))
@@ -261,6 +266,25 @@ fn first_user<'a>(of: &[Val], scope: &'a [Op]) -> Option<&'a Op> {
         }
     }
     None
+}
+
+/// `op->getUsers()` — every op in `scope` reading any of `of`, regions included, in block order.
+///
+/// ⭐ [`first_user`]'S SIBLING: the chain walk needs the one, the two units that adjust every reader
+/// of a value need them all.
+/// ⛔ AN OP READING THE VALUE TWICE APPEARS ONCE HERE and twice in `getUsers()`, which yields one
+/// entry per USE — the reference would walk such a user's chain twice and record it twice.
+fn users<'a>(of: &[Val], scope: &'a [Op]) -> Vec<&'a Op> {
+    let mut found: Vec<&Op> = Vec::new();
+    for op in scope {
+        if operands(op).iter().any(|read| of.contains(read)) {
+            found.push(op);
+        }
+        for region in regions_ref(op) {
+            found.extend(users(of, region));
+        }
+    }
+    found
 }
 
 /// `derived_iv->getAttr("element_size")` — the discardable attribute a `sentient.scalar_add` or
@@ -513,7 +537,7 @@ pub(crate) struct MergingIncrement<'a> {
 /// pair and the `OptimizationContext` that carries it are that unit's to introduce.
 ///
 /// [`does_immutable_imm_exceed_range`]: super::does_immutable_imm_exceed_range
-fn is_immutable_value_in_range(
+pub(super) fn is_immutable_value_in_range(
     new_immutable_ev: &Evaluation,
     original_immutable_ev: &Evaluation,
     element_size: Bits,
@@ -731,15 +755,133 @@ fn defining_op_mut(scope: &mut [Op], val: Val) -> Option<&mut Op> {
     scope.get_mut(at)
 }
 
-// crustify:todo: e529_processForOpResult
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1484  (13 body lines, level 3)
-//   original  : bool ScalarOpHoisting::processForOpResult( sentient::ForOp *for_op, int result_idx, const EvaluatedValue &adjustment_increment, SmallVector<OperationData> &ops_to_update)
-//   calls     : e171_isMergeableOpOrChain, e468_processMergeableChain
+/// Replaces: e529_processForOpResult
+///
+/// Whether every reader of one loop result can absorb the hoist's adjustment, recording each reader's
+/// update in `ops_to_update` as it goes.
+///
+/// ⛔ TRAP: `processMergeableChain`'S ANSWER IS DISCARDED HERE (`:1497`) and checked by e530 (`:1871`)
+/// — a chain e171 accepted but e468 then declined still leaves its partial records in the list and
+/// this still answers true. Not a transcription slip: the two call sites differ in the reference.
+/// ⭐ `result.use_empty()` (`:1489`) IS THE EMPTY WALK: no reader, nothing to absorb, true.
+pub(crate) fn process_for_op_result<A: Arch, E: ExpressionEvaluator>(
+    scope: &[Op],
+    at: usize,
+    result_idx: IterArgIndex,
+    adjustment_increment: MergingIncrement<'_>,
+    comp: GenericComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    ops_to_update: &mut Vec<OperationData>,
+) -> bool {
+    let Some(for_op @ Op::Sentient(ops::Op::For { carried, .. })) = scope.get(at) else {
+        return true;
+    };
+    let Some(result) = carried.get(result_idx.0 as usize).map(|entry| entry.result) else {
+        return true;
+    };
+    for user in users(&[result], scope) {
+        if !is_mergeable_op_or_chain(for_op, user, comp, scope) {
+            return false;
+        }
+        process_mergeable_chain::<A, E>(
+            user,
+            adjustment_increment,
+            comp,
+            scale,
+            scope,
+            evaluator,
+            ops_to_update,
+        );
+    }
+    true
+}
 
-// crustify:todo: e530_processForDerivedIVElimination
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1843  (38 body lines, level 3)
-//   original  : bool ScalarOpHoisting::processForDerivedIVElimination(BlockArgument &main_iv, Operation *derived_iv)
-//   calls     : e171_isMergeableOpOrChain, e365_applyOperationData, e468_processMergeableChain
+/// Replaces: e530_processForDerivedIVElimination
+///
+/// Eliminates a derived induction variable outright: every reader absorbs its constant operand as a
+/// merging increment, and the derived variable's readers move onto the main iter arg before it is
+/// erased.
+///
+/// ⛔ THE SUB FORM IS `B - c` AND ONLY WITH `c` SECOND (`:1861`): as operand 0 the constant is the
+/// MINUEND, so `derived_iv = c - B` is no offset of `B` and is declined. Otherwise the modifier is
+/// negated, which is what makes the two forms one add.
+/// ⛔ THE EVALUATION HAPPENS BEFORE THAT GATE (`:1858-1862`) and the analysis memoises, so asking is
+/// not free of effect. ⛔ AND BEFORE ANY REWRITE: one declining reader leaves the loop untouched.
+pub(crate) fn process_for_derived_iv_elimination<A: Arch, E: ExpressionEvaluator>(
+    scope: &mut Vec<Op>,
+    at: usize,
+    main_iv: IterArgIndex,
+    derived_iv: Val,
+    comp: GenericComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    hoists: &mut HoistCount,
+) -> bool {
+    // `is_any_of(getComp(), LXLU, LXSU, L0LU, L0SU)` — DerivedIV elimination is LX/L0 only (`:1845`).
+    if ScalarOpComp::of(comp).is_none() {
+        return false;
+    }
+    let Some(Op::Sentient(ops::Op::For { carried, body, .. })) = scope.get_mut(at) else {
+        return false;
+    };
+    let Some(main_iv_arg) = carried.get(main_iv.0 as usize).map(|entry| entry.arg) else {
+        return false;
+    };
+    let regions: [&[Op]; 1] = [body.as_slice()];
+    let Some(derived_iv_op) = defining_op(derived_iv, body) else {
+        return false;
+    };
+    let Some(const_operand_idx) =
+        first_const_operand_index(derived_iv_op, Definitions::from_innermost(&regions))
+    else {
+        // `getFirstConstOperandIndex`'s `-1`, which the reference then uses as an operand index.
+        return false;
+    };
+    let Some(constant) = operands(derived_iv_op).get(const_operand_idx).copied() else {
+        return false;
+    };
+    let is_sub = matches!(derived_iv_op, Op::Sentient(ops::Op::ScalarSub { .. }));
+    let modifier = evaluator.evaluate_value(constant);
+    let modifier_handle = evaluator.evaluate_value_handle(constant);
+    let (modifier, modifier_handle) = if is_sub {
+        if const_operand_idx == 0 {
+            return false;
+        }
+        (
+            evaluator.multiply_by_const(&modifier, -1),
+            evaluator.evaluate_multiply_by_const(modifier_handle, -1),
+        )
+    } else {
+        (modifier, modifier_handle)
+    };
+    let increment = MergingIncrement {
+        handle: modifier_handle,
+        evaluation: &modifier,
+    };
+    let mut ops_to_update: Vec<OperationData> = Vec::new();
+    for user in users(&[derived_iv], body) {
+        if !is_mergeable_op_or_chain(derived_iv_op, user, comp, body) {
+            return false;
+        }
+        if !process_mergeable_chain::<A, E>(
+            user,
+            increment,
+            comp,
+            scale,
+            body,
+            evaluator,
+            &mut ops_to_update,
+        ) {
+            return false;
+        }
+    }
+    apply_operation_data(&ops_to_update);
+    replace_all_uses_with(body, derived_iv, main_iv_arg);
+    erase_defining_op(body, derived_iv);
+    hoists.0 += 1;
+    true
+}
 
 // crustify:todo: e578_adjustCandidateForOpResult
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1514  (19 body lines, level 4)
@@ -802,6 +944,11 @@ mod unit_tests {
         fn constant(&mut self, value: i64) -> EvaluatedValue {
             // A stated arena entry: `getConstant(0)` is the only literal e468 asks for.
             EvaluatedValue(value.unsigned_abs() as u32)
+        }
+
+        fn evaluate_value_handle(&mut self, _value: Val) -> EvaluatedValue {
+            // The handle flavour of the same stated answer — what e530 hands the chain walk.
+            EvaluatedValue(7)
         }
     }
 
@@ -1193,6 +1340,119 @@ mod unit_tests {
                 vec![carried(Val(10), Val(3), Val(4), None)],
                 vec![add(Val(3), Val(7), Val(8), None)]
             )
+        );
+    }
+    /// e529 — the TRAP, both halves: a reader whose chain absorbs the adjustment is recorded, and a
+    /// reader whose chain e468 DECLINES still leaves this answering true with nothing recorded.
+    #[test]
+    fn every_reader_of_a_loop_result_is_recorded_and_a_declined_chain_is_still_accepted() {
+        let scope = vec![
+            constant(4, Val(5)),
+            for_op(vec![carried(Val(2), Val(3), Val(4), None)], Vec::new()),
+            add(Val(4), Val(5), Val(6), Some(Bits(32))),
+        ];
+        let within = absolute(ScalarOffset(16));
+        let mut evaluator = StatedEvaluator {
+            offset: Val(9),
+            sums: Vec::new(),
+        };
+        let mut ops_to_update = Vec::new();
+        assert!(process_for_op_result::<Dd2, _>(
+            &scope,
+            1,
+            IterArgIndex(0),
+            MergingIncrement {
+                handle: EvaluatedValue(7),
+                evaluation: &within,
+            },
+            GenericComp::Pt,
+            AddressScale::ONE,
+            &mut evaluator,
+            &mut ops_to_update,
+        ));
+        assert_eq!(
+            ops_to_update,
+            vec![OperationData {
+                op: Val(6),
+                mod_by: EvaluatedValue(7),
+                merging_increment: EvaluatedValue(0),
+                replace_with_mod: false,
+            }]
+        );
+
+        // The same reader on an LX unit, with an increment no LRF can hold: e468 refuses it.
+        let beyond = absolute(ScalarOffset(i64::from(i32::MAX)));
+        let mut discarded = Vec::new();
+        assert!(process_for_op_result::<Dd2, _>(
+            &scope,
+            1,
+            IterArgIndex(0),
+            MergingIncrement {
+                handle: EvaluatedValue(7),
+                evaluation: &beyond,
+            },
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut evaluator,
+            &mut discarded,
+        ));
+        assert!(discarded.is_empty(), "the refusal is what went unrecorded");
+    }
+
+    /// One loop whose body derives `%6 = %main_iv + 4` and one reader of it that can absorb a
+    /// constant — the shape e530 eliminates.
+    fn loop_with_a_derived_iv() -> Vec<Op> {
+        vec![for_op(
+            vec![carried(Val(2), Val(3), Val(4), None)],
+            vec![
+                constant(4, Val(5)),
+                add(Val(3), Val(5), Val(6), Some(Bits(16))),
+                add(Val(6), Val(5), Val(8), Some(Bits(32))),
+            ],
+        )]
+    }
+
+    /// e530 — DerivedIV elimination is LX/L0 only, so on any other unit the loop is left exactly as
+    /// it was and no hoist is banked.
+    #[test]
+    fn a_non_lx_unit_eliminates_no_derived_iv() {
+        let mut scope = loop_with_a_derived_iv();
+        let untouched = scope.clone();
+        let mut hoists = HoistCount(0);
+        assert!(!process_for_derived_iv_elimination::<Dd2, _>(
+            &mut scope,
+            0,
+            IterArgIndex(0),
+            Val(6),
+            GenericComp::Pt,
+            AddressScale::ONE,
+            &mut StatedEvaluator {
+                offset: Val(9),
+                sums: Vec::new(),
+            },
+            &mut hoists,
+        ));
+        assert_eq!(scope, untouched);
+        assert_eq!(hoists, HoistCount(0));
+    }
+
+    /// e530 — with every reader absorbing the modifier the elimination reaches `applyOperationData`,
+    /// which is e365 and not ported, BEFORE it may touch the loop.
+    #[test]
+    #[should_panic(expected = "senpass e365")]
+    fn eliminating_a_derived_iv_reaches_the_unported_apply_operation_data() {
+        process_for_derived_iv_elimination::<Dd2, _>(
+            &mut loop_with_a_derived_iv(),
+            0,
+            IterArgIndex(0),
+            Val(6),
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut StatedEvaluator {
+                offset: Val(9),
+                sums: Vec::new(),
+            },
+            &mut HoistCount(0),
         );
     }
 }

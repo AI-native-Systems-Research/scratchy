@@ -219,6 +219,38 @@ impl OpAt {
         block_of(unit_body, &self.enclosing)?.get(self.index.0)
     }
 
+    /// This path's own position — `Operation`'s index in the block [`Self::block`] answers.
+    #[must_use]
+    pub const fn index(&self) -> InBlock {
+        self.index
+    }
+
+    /// `a->getBlock() == b->getBlock()` — whether two paths name ops of the SAME block, which is the
+    /// test that tells a horizontal move from one across a region boundary.
+    #[must_use]
+    pub fn in_same_block_as(&self, other: &OpAt) -> bool {
+        self.enclosing == other.enclosing
+    }
+
+    /// This path once the op at `removed` has been taken out of its block — the one component of this
+    /// path that lies in that block steps back when it was behind the removal.
+    #[must_use]
+    fn shifted_by_removal_at(&self, removed: &OpAt) -> OpAt {
+        let depth = removed.enclosing.len();
+        if self.enclosing.len() < depth || self.enclosing[..depth] != removed.enclosing[..] {
+            return self.clone();
+        }
+        let mut shifted = self.clone();
+        if shifted.enclosing.len() == depth {
+            if shifted.index > removed.index {
+                shifted.index.0 -= 1;
+            }
+        } else if shifted.enclosing[depth].0 > removed.index {
+            shifted.enclosing[depth].0.0 -= 1;
+        }
+        shifted
+    }
+
     /// The op at `index` of THIS path's own block — how a position found by scanning that block
     /// becomes a path, for the ops that bind nothing to look one up by.
     #[must_use]
@@ -506,6 +538,18 @@ pub(crate) fn insert_at(unit_body: &mut Vec<Op>, at: &OpAt, op: Op) {
         let index = at.index.0.min(block.len());
         block.insert(index, op);
     }
+}
+
+/// `Operation::moveBefore(before)` — [`remove_at`] then [`insert_at`], `before` naming the op to land
+/// in front of wherever in the unit it sits.
+///
+/// ⛔ THE REMOVAL SHIFTS `before` when it lies behind the moved op in the SAME block, which is the one
+/// adjustment a pointer-based `moveBefore` never has to make.
+pub(crate) fn move_before(unit_body: &mut Vec<Op>, at: &OpAt, before: &OpAt) {
+    let Some(moved) = remove_at(unit_body, at) else {
+        return;
+    };
+    insert_at(unit_body, &before.shifted_by_removal_at(at), moved);
 }
 
 /// WHICH OP `isConstant<ConstTy>` IS INSTANTIATED FOR (`dcc/src/Utils/Utils.cpp:445-447`); the

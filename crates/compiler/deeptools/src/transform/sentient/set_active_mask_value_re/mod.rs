@@ -89,10 +89,12 @@
 #![allow(dead_code)]
 
 use crate::arch::Arch;
-use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::sentient::{RawPrecision, SliceId, ValidEntries, WslLen};
 use crate::islands::sentient::dialects::{Op, Val, sentient};
 use crate::islands::sentient::print;
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::workload::Workload;
 
 pub(crate) mod set_active_mask_value_rde_tree;
 
@@ -360,10 +362,23 @@ pub(crate) fn run_on_unit<A: Arch>(
     )
 }
 
-// crustify:todo: e535_runOn
-//   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:73  (4 body lines, level 3)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e473_runOn
+/// Replaces: e535_runOn
+///
+/// Runs SAMV redundant-definition elimination over every program unit of one module.
+///
+/// ⛔ NAMED FOR ITS ARGUMENT: `runOn(ModuleOp)` and `runOn(dataflow::ProgramUnitOp)` (e473) are one
+/// C++ overload set and cannot both be `run_on` here.
+/// ⛔ THE STATISTIC IS ASSIGNED PER UNIT, NOT ACCUMULATED (`:70`) — after the walk it holds the LAST
+/// unit's count, not the module's total. That is the reference's behaviour.
+/// ⭐ THE PREORDER WALK IS DROPPABLE MECHANISM: a program's units are a flat list here.
+pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    samv_re_count: &mut SamvReCount,
+) {
+    for unit in program.units.iter_mut() {
+        run_on_unit(unit, samv_re_count);
+    }
+}
 
 // crustify:todo: e582_runOnOperation
 //   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:78  (5 body lines, level 4)
@@ -372,15 +387,65 @@ pub(crate) fn run_on_unit<A: Arch>(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{SamvAttrs, SamvReCount, SetActiveMaskValueGenValue, run_on_unit};
+    use super::{
+        SamvAttrs, SamvReCount, SetActiveMaskValueGenValue, run_on_program, run_on_unit,
+    };
     use crate::arch::Dd2;
-    use crate::islands::dataflow_ir::Units;
-    use crate::islands::sentient::ProgramUnit;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::sentient::{
         RawPrecision, SliceId, ValidEntries, WslLen,
     };
     use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
     use crate::units::DfirUnit;
+    use crate::workload::Workload;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One empty program unit on `kind`.
+    fn unit_on(kind: DfirUnit) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(kind, Val(0)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// One program with one unit, holding nothing — the walk reads only the unit list.
+    fn program_on(kind: DfirUnit) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit_on(kind), Vec::new()),
+            bound: core::marker::PhantomData,
+        }
+    }
 
     /// `sentient.samv mask_value(%7) {...}` — the op a GenValue is built from.
     fn samv(mask_value: Val) -> Op {
@@ -477,14 +542,14 @@ mod unit_tests {
     #[test]
     #[should_panic(expected = "senpass e378")]
     fn any_unit_reaches_the_unported_rde_tree_optimizer() {
-        run_on_unit(
-            &mut ProgramUnit::<Dd2> {
-                on: Units::one(DfirUnit::Lxlu, Val(0)),
-                precision: None,
-                body: Vec::new(),
-                arch: core::marker::PhantomData,
-            },
-            &mut SamvReCount(0),
-        );
+        run_on_unit(&mut unit_on(DfirUnit::Lxlu), &mut SamvReCount(0));
+    }
+
+    /// e535 — there is no unit-kind gate: the first unit of the module reaches the per-unit body,
+    /// which is e473 and blocked on the out-of-scope tree down to the unported e378.
+    #[test]
+    #[should_panic(expected = "senpass e378")]
+    fn every_unit_of_the_module_is_run_on() {
+        run_on_program(&mut program_on(DfirUnit::Pe), &mut SamvReCount(0));
     }
 }
