@@ -147,7 +147,7 @@ use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 use crate::arch::{Arch, Bytes, Elements, Sticks, Target};
 use crate::islands::progir;
 use crate::model::Model;
-use crate::schedule::l3::dsc::DscIdx;
+use crate::schedule::l3::dsc::{DscIdx, Pinning};
 use crate::units::{Core, Corelet};
 use crate::workload::Workload;
 
@@ -214,6 +214,35 @@ impl DataOpIndex {
     }
 
     /// The index, for the seam that reaches the data op through it.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// WHICH DATA OP IN THE ORDER THE DCG PROCESSES THEM — the `int c` the front end names its nodes
+/// after (`pcfg_gen.cpp:31`) and hands `computerGTRInfo` (`transfer_compute.cpp:114`).
+///
+/// ⛔ NOT A [`DataOpIndex`]: entry 348 counts this one up only over the ops it PROCESSES, skipping the
+/// input-fetch op while still reaching `dataOpdscs_.at(idx)` by its own index (`dcg_manager.cpp:349-356`),
+/// so from that op on the two disagree. Entry 188 is where they coincide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DataOpSeq(usize);
+
+impl DataOpSeq {
+    /// `int c = 0` (`dcg_manager.cpp:348`), which is also the seam's own default (`dcg_frontend.h:89`).
+    #[must_use]
+    pub const fn first() -> Self {
+        Self(0)
+    }
+
+    /// `c++` (`:355`).
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// The number, for the seam that names a pcfg node after it.
     #[must_use]
     pub const fn get(self) -> usize {
         self.0
@@ -636,6 +665,12 @@ pub struct DlDsc {
     /// not reach that core's index, which is `dsc.pcfg_.size() > coreIDX` answering false
     /// (`dcg_manager.cpp:760`) and what sends entry 282 to the pcfg-pool arm instead.
     pcfgs: BTreeMap<Core, Option<SenPcfg>>,
+    /// `computeOp_.at(0).opFuncName` (`dsc/designSpaceConfig.h:118`) — [`None`] is
+    /// `DT_CHECK(dsc.computeOp_.size() > 0)` (`dcg_manager.cpp:310`) throwing.
+    first_compute_op: Option<OpFunc>,
+    /// `labeledDs_` (`:106`), EACH REDUCED TO ITS `pinnedComponent()`: that is the one thing entry
+    /// 348's sfp-ring arm asks of one (`:319-324`), and [`Pinning`] already answers it.
+    labeled_ds: Vec<Pinning>,
 }
 
 /// THE DL DSCs, AND WHICH ONE SERVES EACH CORE, NEVER EMPTY.
@@ -671,6 +706,8 @@ impl PerCoreDscs {
         self.dscs.push(DlDsc {
             version,
             pcfgs: BTreeMap::from([(core, None)]),
+            first_compute_op: None,
+            labeled_ds: Vec::new(),
         });
         self.core_to_dsc.insert(core, idx);
         self
@@ -681,6 +718,17 @@ impl PerCoreDscs {
     pub fn with_dl_pcfg(mut self, idx: DscIdx, core: Core, pcfg: SenPcfg) -> Self {
         if let Some(dsc) = self.dscs.get_mut(idx.0 as usize) {
             dsc.pcfgs.insert(core, Some(pcfg));
+        }
+        self
+    }
+
+    /// `dscs_.at(idx).computeOp_.at(0)` and its `labeledDs_` — what entry 348's sfp-ring arm reads of
+    /// the FIRST DL DSC (`dcg_manager.cpp:309-324`).
+    #[must_use]
+    pub fn with_compute(mut self, idx: DscIdx, op: OpFunc, labeled_ds: Vec<Pinning>) -> Self {
+        if let Some(dsc) = self.dscs.get_mut(idx.0 as usize) {
+            dsc.first_compute_op = Some(op);
+            dsc.labeled_ds = labeled_ds;
         }
         self
     }
@@ -939,8 +987,11 @@ impl DscPcfgTranslator {
 pub struct DcgFrontEnd;
 
 impl DcgFrontEnd {
-    /// `dcg_fe_.computeTranferforDataOp(mySDsc, myDataOpDsc, c)` (`:122`).
+    /// `dcg_fe_.computeTranferforDataOp(mySDsc, myDataOpDsc, c)` (`:122`, `:353`).
     ///
+    /// ⛔ TWO ARGUMENTS FOR THE REFERENCE'S ONE `int c` PLUS ITS `DataOpDsc&`: `at` is which op, `seq`
+    /// is the `int c` the body uses for naming and for `computerGTRInfo` — and entry 348 passes a `c`
+    /// that does NOT index `dataOpdscs_` (`:349-356`). See [`DataOpSeq`].
     /// ⛔ `first_avail` IS `firstAvailGlobalGrpId_`, THE MANAGER'S OWN FIELD BY REFERENCE
     /// (`dcg_frontend.h:129`, bound at `:68`/`:76` from `dcg_manager.h:60`): this path ADVANCES it,
     /// through `computerGTRInfo` (`transfer_compute.cpp:74`, `:114` → `stcdpOp.cpp:2586-2587`,
@@ -948,19 +999,37 @@ impl DcgFrontEnd {
     pub fn compute_transfer_for_data_op<const F: bool>(
         sdsc: &mut SuperDsc<true, F>,
         at: DataOpIndex,
+        seq: DataOpSeq,
         first_avail: &mut GtrGroupId,
     ) {
-        let _ = (sdsc, at, first_avail);
+        let _ = (sdsc, at, seq, first_avail);
         todo!("dcg_fe/: DcgFE::computeTranferforDataOp is out of scope")
     }
 
-    /// `dcg_fe_.generatePcfgIRForDLOp(mySDsc, pcfgL3lu, pcfgL3su)` (`:229`) — one L3 pair per core
-    /// of the super-DSC's `coreIdToDsc_`.
+    /// `dcg_fe_.generatePcfgIRForDataOp(mySDsc, myDataOpDsc, c)` (`:354`) — the data op's own per-core
+    /// pcfg list, whose NOP nodes are named after `seq` (`pcfg_gen.cpp:31`).
     ///
+    /// ⭐ NO `first_avail`, UNLIKE THE TRANSFER SEAM: the only writer of `firstAvailGlobalGrpId_` this
+    /// body could reach is `collectArrayBCPieceInfo` (`gatherOp.cpp:911-912`), which has no callers —
+    /// `computerGTRInfo` is reached from `transfer_compute.cpp:74`, `:114` alone.
+    pub fn generate_pcfg_ir_for_data_op<const F: bool>(
+        sdsc: &mut SuperDsc<true, F>,
+        at: DataOpIndex,
+        seq: DataOpSeq,
+    ) {
+        let _ = (sdsc, at, seq);
+        todo!("dcg_fe/pcfg_gen/: DcgFE::generatePcfgIRForDataOp is out of scope")
+    }
+
+    /// `dcg_fe_.generatePcfgIRForDLOp(mySDsc, pcfgL3lu, pcfgL3su)` (`:229`, `:367`) — one L3 pair per
+    /// core of the super-DSC's `coreIdToDsc_`.
+    ///
+    /// ⛔ NOT RESTRICTED TO `SuperDsc<false, _>`: `DT_CHECK(mySDsc.dataOpdscs_.size() == 0)` (`:222`)
+    /// is ENTRY 189's, not this seam's, and entry 348 calls it on a super-DSC that HAS data ops.
     /// ⛔ IT ADVANCES `first_avail` ITSELF, past the largest group id any core used
     /// (`pcfg_gen.cpp:157-158`), through the same `int&` (`dcg_frontend.h:129`).
-    pub fn generate_pcfg_ir_for_dl_op<const F: bool>(
-        sdsc: &mut SuperDsc<false, F>,
+    pub fn generate_pcfg_ir_for_dl_op<const D: bool, const F: bool>(
+        sdsc: &mut SuperDsc<D, F>,
         first_avail: &mut GtrGroupId,
     ) -> BTreeMap<Core, L3Halves> {
         let _ = (sdsc, first_avail);
@@ -1143,6 +1212,15 @@ impl DcgProgIRGen for NoSenProgDcg {}
 
 impl DcgProgIRGen for DcgSenProg {}
 
+/// `createSenProg` AS A BOUND — entry 349 checks it UNCONDITIONALLY and before anything else (`:905`),
+/// where every other entry's fold-and-codegen check sits inside an `if (createSenProg)`. A manager with
+/// codegen off cannot call that entry at all.
+pub trait CreateSenProg: SenProgGen {}
+
+impl CreateSenProg for DcgSenProg {}
+
+impl CreateSenProg for DccSenProg {}
+
 /// ENTRY 189'S CODEGEN TAIL. ⛔ NOT IMPLEMENTED FOR [`DccSenProg`]: that is
 /// `DT_CHECK(progIRcodeGen == DCGProgIRGen::DCG)` (`:264`).
 pub trait DlOpsSenProg: SenProgGen {
@@ -1246,6 +1324,12 @@ pub struct DcgManager<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: boo
     /// ⭐ A FIELD AND NOT A CONST GENERIC: `DcgBE` binds it by `const bool&` (`:64`), so it is read
     /// late and a build cannot state it.
     enable_prog_verification: bool,
+    /// `myIFNInfo.dataDsc_Idx` (`dcg_manager.h:132`), whose `-1` (`dcg_common.h:106`) is this [`None`].
+    ///
+    /// ⛔ THE WRITE AT `:400` OUTLIVES THE MODE FLIP AT `:415` — with `reqDLOp` also set the DL arm is
+    /// taken, `:400` never runs and the flag still flips, so the index the flipped manager carries
+    /// cannot be assumed present.
+    data_dsc_idx: Option<DataOpIndex>,
     /// Which codegen tail, as a type rather than a pair of fields.
     codegen: PhantomData<C>,
 }
@@ -1271,6 +1355,7 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
         Self {
             first_avail_global_grp_id: GtrGroupId(0),
             enable_prog_verification: false,
+            data_dsc_idx: None,
             codegen: PhantomData,
         }
     }
@@ -1306,9 +1391,9 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
     /// Hands every data-op DSC of the super-DSC to the front end's transfer computation, in order
     /// (`dcg_manager.cpp:112-124`).
     ///
-    /// ⭐ `int c` IS THE INDEX, NOT A COUNT: it is the argument the front end uses to find the same
-    /// data op again inside the super-DSC, which is why the seam here takes the index rather than
-    /// the `&mut DataOpDsc` the reference passes alongside a `&mut SuperDsc` aimed at it.
+    /// ⭐ HERE `int c` AND THE INDEX COINCIDE, AND THEY ARE NOT THE SAME THING: this walk skips
+    /// nothing, so the sequence number the front end names its nodes after equals the `dataOpdscs_`
+    /// index — entry 348 is where the two part company. See [`DataOpSeq`].
     /// ⛔ `&mut self` BECAUSE THE WALK ADVANCES `firstAvailGlobalGrpId`: the front end holds it by
     /// `int&` (`dcg_frontend.h:129`) and writes it per multicast transfer
     /// (`transfer_compute.cpp:74`, `:114` → `stcdpOp.cpp:2586-2587`, `:2662-2663`).
@@ -1320,6 +1405,7 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
             DcgFrontEnd::compute_transfer_for_data_op(
                 sdsc,
                 DataOpIndex(c),
+                DataOpSeq(c),
                 &mut self.first_avail_global_grp_id,
             );
         }
@@ -1868,8 +1954,9 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
 pub struct InpFetchNeighDcg<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool> {
     first_avail_global_grp_id: GtrGroupId,
     enable_prog_verification: bool,
-    /// `myIFNInfo.dataDsc_Idx` (`:520`).
-    data_dsc_idx: DataOpIndex,
+    /// `myIFNInfo.dataDsc_Idx` — `0` where entry 281 flipped the mode (`:520`), and ⛔ STILL `-1`
+    /// (`dcg_common.h:106`) where entry 348 did: its `:400` write is on the arm `reqDLOp` preempts.
+    data_dsc_idx: Option<DataOpIndex>,
     codegen: PhantomData<C>,
 }
 
@@ -1882,9 +1969,9 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
         self.first_avail_global_grp_id
     }
 
-    /// `myIFNInfo.dataDsc_Idx` (`:520`).
+    /// `myIFNInfo.dataDsc_Idx`, or [`None`] for the `-1` it may still hold.
     #[must_use]
-    pub const fn data_dsc_idx(&self) -> DataOpIndex {
+    pub const fn data_dsc_idx(&self) -> Option<DataOpIndex> {
         self.data_dsc_idx
     }
 }
@@ -1944,7 +2031,7 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
         InpFetchNeighDcg {
             first_avail_global_grp_id: self.first_avail_global_grp_id,
             enable_prog_verification: self.enable_prog_verification,
-            data_dsc_idx,
+            data_dsc_idx: Some(data_dsc_idx),
             codegen: PhantomData,
         }
     }
@@ -2227,19 +2314,269 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
     }
 }
 
-// crustify:todo: e348_runDcgForDataOpsDlOps
-//   authority : dcg/dcg_manager/dcg_manager.cpp:269  (179 body lines, level 3)
-//   class     : DcgManager
-//   original  : void DcgManager::runDcgForDataOpsDlOps(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:794-973
-//   calls     : e104_clear, e187_clear, e191_removeextraPTrows, e282_mergePcfgInSuperDSC, e326_mergePcfgInSuperDSC
+/// THE SIX COMPUTE OPS THE SFP-RING ARM RECOGNISES (`dcg_manager.cpp:312-317`), in the order the
+/// reference's `||` chain tries them.
+const SFP_RING_COMPUTE_OPS: [OpFunc; 6] = [
+    OpFunc::Conv2DInt8Fwd,
+    OpFunc::Conv2DFwd,
+    OpFunc::Conv2DInt8FwdSparsekg3,
+    OpFunc::BatchmatmulInt8FwdSparsekg3,
+    OpFunc::BatchmatmulFwd,
+    OpFunc::BatchmatmulInt8Fwd,
+];
 
-// crustify:todo: e349_convertToProgIRDataOp
-//   authority : dcg/dcg_manager/dcg_manager.cpp:898  (46 body lines, level 3)
-//   class     : DcgManager
-//   original  : void DcgManager::convertToProgIRDataOp(SuperDsc& mySDsc)
-//   extract   : crustify-ddc/cpp/dcg.cpp:983-1029
-//   calls     : e282_mergePcfgInSuperDSC, e326_mergePcfgInSuperDSC
+/// WHICH MODE ENTRY 348 LEFT THE MANAGER IN — `isInpFetchNeigh` after `:415`.
+///
+/// ⛔ THE FLIP IS A ONE-WAY DOOR (see [`InpFetchNeighDcg`]), so the entry CONSUMES the manager and
+/// hands back whichever of the two it now is: continuing to call entries 188, 189 or 280 on an
+/// input-fetch-neighbour manager is the `DT_CHECK(!isInpFetchNeigh)` those three open with, and here it
+/// does not compile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DcgMode<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool> {
+    /// `isInpFetchNeigh == false` — no input-fetch schedule, or codegen off, which is where `:415` sits.
+    Normal(DcgManager<C, DT2, L3_DL_SCHEDULER>),
+    /// `isInpFetchNeigh == true` (`:415`).
+    InpFetchNeigh(InpFetchNeighDcg<C, DT2, L3_DL_SCHEDULER>),
+}
+
+impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
+    DcgManager<C, DT2, L3_DL_SCHEDULER>
+{
+    /// Replaces: e348_runDcgForDataOpsDlOps
+    ///
+    /// Classifies every schedule step as input-fetch, data-op or DL-op work, runs the front end for
+    /// each kind it found, and rebuilds `pcfg_` from the result (`dcg_manager.cpp:269-447`).
+    ///
+    /// ⛔ THE ACT1 ARM IS THE NAMED EXCLUSION `runDcg` (`crustify-ddc/EXCLUSIONS.tsv`).
+    /// ⛔ `SFP_RING` CAN CANCEL `reqDLOp` (`:325`), emptying the classification into the early return.
+    /// ⛔ IT MAY LEAVE THE MANAGER IN INPUT-FETCH-NEIGHBOUR MODE (`:415`) — see [`DcgMode`].
+    /// ⚠️ `int c` SKIPS THE INPUT-FETCH OP while `idx` indexes `dataOpdscs_` — see [`DataOpSeq`].
+    pub fn run_dcg_for_data_ops_dl_ops<const SFP_RING: bool, const FOLDED: bool>(
+        mut self,
+        sdsc: &mut SuperDsc<true, FOLDED>,
+    ) -> Option<DcgMode<C, DT2, L3_DL_SCHEDULER>> {
+        sdsc.pcfg.clear();
+
+        // `data_dldscIdx_inf` (`:279`), whose two `-1`s are one absent pair.
+        let mut inp_fetch: Option<(DataOpIndex, DscIdx)> = None;
+        let mut req_inp_fetch = false;
+        let mut req_data_op = false;
+        let mut req_dl_op = false;
+        let mut has_syncs = false;
+
+        for schedule in sdsc.core_schedules.values() {
+            // `DT_CHECK(dscSchedule.size() > 0)` (`:286`).
+            if schedule.steps().next().is_none() {
+                return None;
+            }
+            for (step, _) in schedule.steps() {
+                has_syncs = has_syncs || step.after_sync || step.before_sync;
+                match (step.data_dsc, step.dl_dsc) {
+                    (Some(data), Some(dl)) => {
+                        if sdsc.target == SenTarget::SenPcfg {
+                            req_dl_op = true;
+                            req_data_op = true;
+                        } else {
+                            // `DT_CHECK(data_dldscIdx_inf.first == scheduleStep.datadsc_idx)` (`:296`)
+                            // — *"we only allow 1 InpFetch op"*.
+                            if req_inp_fetch && inp_fetch.map(|(at, _)| at) != Some(data) {
+                                return None;
+                            }
+                            req_inp_fetch = true;
+                            inp_fetch = Some((data, dl));
+                        }
+                    }
+                    // ⛔ A STEP NAMING NEITHER INDEX IS STILL A DL STEP: the reference's third arm is a
+                    // bare `else` on `datadsc_idx == -1` alone (`:303`).
+                    (Some(_), None) => req_data_op = true,
+                    (None, _) => {
+                        req_dl_op = true;
+                        if !C::DCC && SFP_RING && sdsc.target != SenTarget::SenPcfg {
+                            let dsc = sdsc.dscs.at(DscIdx(0))?;
+                            let op = dsc.first_compute_op?;
+                            if SFP_RING_COMPUTE_OPS.contains(&op) {
+                                let all_lx_pinned = dsc.labeled_ds.iter().all(|lds| {
+                                    !matches!(
+                                        lds.pinned_component(),
+                                        None | Some(SenComponent::Hbm)
+                                    )
+                                });
+                                req_dl_op = !all_lx_pinned;
+                                if !req_dl_op && (step.after_sync || step.before_sync) {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !(req_dl_op || req_inp_fetch || req_data_op) {
+            return Some(DcgMode::Normal(self));
+        }
+        // `if (!reqDataOp) DT_CHECK(reqInpFetch ^ reqDLOp)` (`:340`).
+        if !req_data_op && req_inp_fetch == req_dl_op {
+            return None;
+        }
+
+        if !req_dl_op && !req_inp_fetch && !has_syncs {
+            // ACT1 (`:342-344`).
+            todo!(
+                "dcg/dcg_manager: runDcg (dcg_manager.cpp:17) is a named exclusion \
+                 (crustify-ddc/EXCLUSIONS.tsv) — SchedulerStages.cpp:53-57 never takes it"
+            );
+        }
+
+        let mut seq = DataOpSeq::first();
+        for idx in 0..sdsc.data_op_dscs.len() {
+            let at = DataOpIndex(idx);
+            if req_inp_fetch && inp_fetch.map(|(data, _)| data) == Some(at) {
+                continue;
+            }
+            DcgFrontEnd::compute_transfer_for_data_op(
+                sdsc,
+                at,
+                seq,
+                &mut self.first_avail_global_grp_id,
+            );
+            DcgFrontEnd::generate_pcfg_ir_for_data_op(sdsc, at, seq);
+            seq = seq.next();
+        }
+
+        // `std::vector<SenPcfg> pcfgL3lu; pcfgL3su;` (`:358-359`), which stay empty unless ACT2 fills
+        // them — and the two merge tails read them either way.
+        let mut halves: BTreeMap<Core, L3Halves> = BTreeMap::new();
+        if req_dl_op {
+            // ACT2. `DT_CHECK(mySDsc.dscs_.size() >= 1)` (`:362`) is [`PerCoreDscs`]'s own shape.
+            if C::CREATE_SEN_PROG || C::DCC {
+                halves = DcgFrontEnd::generate_pcfg_ir_for_dl_op(
+                    sdsc,
+                    &mut self.first_avail_global_grp_id,
+                );
+            }
+            if C::DCC {
+                // ⛔ THE WALK IS OVER `coreIdToDsc_` AND THE HALVES ARE `.at(coreID)`-ED (`:372-378`),
+                // so a DL core the generator skipped throws rather than being skipped here.
+                for core in sdsc.dscs.core_to_dsc.keys().copied().collect::<Vec<_>>() {
+                    for (comp, local) in halves.get_mut(&core)?.each_mut() {
+                        SenPcfg::merge(sdsc.pcfg_slot(core, comp), local);
+                    }
+                }
+            }
+        } else if req_inp_fetch {
+            let (data, dl) = inp_fetch?;
+            // `DT_CHECK(mySDsc.dscs_.size() > data_dldscIdx_inf.second)` (`:399`).
+            sdsc.dscs.at(dl)?;
+            self.data_dsc_idx = Some(data);
+            // ⚠️ THE RETURNED `DataOpDsc&` IS BOUND AND NEVER READ (`:401-402`).
+            let _ = DcgFrontEnd::generate_pcfg_ir_for_data_op_inp_fetch(sdsc, None, data);
+        } else if !has_syncs {
+            // `DT_CHECK(hasSyncs)` (`:404`).
+            return None;
+        }
+
+        let mut inp_fetch_neigh = false;
+        if C::CREATE_SEN_PROG {
+            // ⛔ BOTH CHECKS ARE CONJOINED WITH `createSenProg` for the reason entry 280 states: an
+            // inline `const` block is evaluated however dead the branch around it (`:409-411`).
+            const {
+                assert!(
+                    !(C::CREATE_SEN_PROG && FOLDED),
+                    "Codegen for Folded Super-DSC is not supported (dcg_manager.cpp:409)"
+                )
+            }
+            const {
+                assert!(
+                    !(C::CREATE_SEN_PROG && C::DCC),
+                    "progIRcodeGen must be DCG here (dcg_manager.cpp:411)"
+                )
+            }
+            self.merge_pcfg_in_super_dsc(sdsc, DlPcfgSource::L3Halves(&halves))?;
+            // ACT3 (`:415-416`).
+            inp_fetch_neigh = req_inp_fetch;
+            DcgBackEnd::fill_and_create_sen_prog_info(sdsc);
+        }
+
+        if !C::DCC {
+            self.remove_extra_pt_rows(sdsc);
+            // `DT_CHECK(!mySDsc.dscs_.empty())` (`:423`) is [`PerCoreDscs`]'s own shape.
+            let dsc_pcfg = sdsc
+                .dscs
+                .at(DscIdx(0))
+                .is_some_and(|dsc0| dsc0.pcfgs.values().any(Option::is_some));
+            let has_dl_pcfg = dsc_pcfg || !sdsc.pcfg_pool.is_empty();
+            let dl_pcfg = if req_dl_op && has_dl_pcfg {
+                DlPcfgSource::Dsc
+            } else {
+                DlPcfgSource::L3Halves(&halves)
+            };
+            self.merge_pcfg_in_super_dsc(sdsc, dl_pcfg)?;
+        }
+
+        // "Keep only pool" (`:440-446`).
+        if DT2 && !C::DCC {
+            sdsc.pcfg.clear();
+            for ddsc in &mut sdsc.data_op_dscs {
+                ddsc.pcfg.clear();
+            }
+        }
+
+        Some(if inp_fetch_neigh {
+            DcgMode::InpFetchNeigh(InpFetchNeighDcg {
+                first_avail_global_grp_id: self.first_avail_global_grp_id,
+                enable_prog_verification: self.enable_prog_verification,
+                data_dsc_idx: self.data_dsc_idx,
+                codegen: PhantomData,
+            })
+        } else {
+            DcgMode::Normal(self)
+        })
+    }
+
+    /// Replaces: e349_convertToProgIRDataOp
+    ///
+    /// Generates the SEN programs for a data-op super-DSC: from its ONE data op, or — after stitching
+    /// more than one op's pcfgs into `pcfg_` — from `pcfg_` itself (`dcg_manager.cpp:898-943`).
+    ///
+    /// ⚠️ THE SECOND `pcfg_.empty()` (`:913`) IS INERT: the stitch that could change it runs only for
+    /// MORE THAN ONE data op, and that same count already sends this to the `pcfg_` arm.
+    /// ⚠️ NO FOLD CHECK HERE, unlike every other codegen tail, and the reference's diagnostic also
+    /// names `mySDsc.name_` (`:936`), which this super-DSC does not carry.
+    pub fn convert_to_prog_ir_data_op<const FOLDED: bool>(
+        &self,
+        sdsc: &mut SuperDsc<true, FOLDED>,
+    ) -> Option<()>
+    where
+        C: CreateSenProg,
+    {
+        // `if (mySDsc.pcfg_.empty()) DT_CHECK(!mySDsc.dataOpdscs_.empty())` (`:907-909`).
+        if sdsc.pcfg.is_empty() && sdsc.data_op_dscs.is_empty() {
+            return None;
+        }
+
+        if sdsc.data_op_dscs.len() > 1 && sdsc.pcfg.is_empty() {
+            self.merge_pcfg_in_super_dsc_without_l3_pcfg(sdsc)?;
+        }
+
+        if sdsc.data_op_dscs.len() <= 1 && sdsc.pcfg.is_empty() {
+            // `DT_CHECK(mySDsc.dataOpdscs_.size())` (`:920`); the `GatherOpHBM` arm's two ISA checks
+            // (`:924-927`) are compile-time truths — see [`Self::run_dcg_generate_prog_ir`].
+            sdsc.data_op_dscs.first()?;
+            let at = DataOpTarget::InMain(DataOpIndex(0));
+            let statuses = DcgBackEnd::create_sen_program_stcdp_op(sdsc, &at);
+            // ⛔ EVERY FILED CORE IS A FAILURE, WHATEVER ITS STATUS (`:932-939`): this entry has no
+            // I-buff recovery arm, unlike entries 280 and 281.
+            for (core, (_, message)) in &statuses {
+                self.verification_failure(*core, message);
+            }
+        } else {
+            DcgBackEnd::fill_and_create_sen_prog_info(sdsc);
+        }
+
+        Some(())
+    }
+}
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -2730,5 +3067,94 @@ mod unit_tests {
 
         assert!(stopped.is_err(), "the body printer is out of scope");
         assert_eq!(out, "Program for coreID : 3\n");
+    }
+
+    /// One DL-only schedule step on core 0, whose DL DSC's first compute op is one the sfp-ring arm
+    /// recognises and whose labelled DSs carry the given pinnings (`dcg_manager.cpp:309-324`).
+    fn one_dl_step_with_pinnings(pinnings: Vec<Pinning>) -> SuperDsc<true, false> {
+        SuperDsc::of(PerCoreDscs::of(core::<0>(), DscVersion::Dsc2).with_compute(
+            DscIdx(0),
+            OpFunc::BatchmatmulFwd,
+            pinnings,
+        ))
+        .with_core_schedule(
+            core::<0>(),
+            CoreSchedule::data_only(vec![DataStep {
+                data_dsc: None,
+                before_sync: false,
+                after_sync: false,
+            }]),
+        )
+    }
+
+    /// `memOrg_[comp] = isPresent` — one labelled DS pinned to one component.
+    fn pinned_to(comp: SenComponent) -> Pinning {
+        Pinning {
+            mem_org: BTreeMap::from([(comp, true)]),
+            ..Pinning::default()
+        }
+    }
+
+    /// e348 — ⛔ THE SFP-RING ARM CANCELS THE DL OP IT JUST DECLARED. With `psumRing == "sfpring"`, a
+    /// recognised compute op and EVERY labelled DS pinned somewhere that is neither HBM nor
+    /// `NO_COMPONENT`, `reqDLOp` goes back to false (`:325`) — and with no data op and no sync left,
+    /// the whole classification is empty and the entry returns having only cleared `pcfg_` (`:337-339`),
+    /// reaching no seam at all.
+    #[test]
+    fn e348_the_sfp_ring_arm_cancels_the_dl_op_into_the_early_return() {
+        let mut sdsc = one_dl_step_with_pinnings(vec![pinned_to(SenComponent::Lx)]);
+        sdsc.pcfg.insert(
+            core::<0>(),
+            BTreeMap::from([(SenComponent::L3lu, SenPcfg::default())]),
+        );
+
+        let mode = DcgManager::<DcgSenProg, true, true>::new()
+            .run_dcg_for_data_ops_dl_ops::<true, false>(&mut sdsc);
+
+        assert!(matches!(mode, Some(DcgMode::Normal(_))));
+        assert!(sdsc.pcfg.is_empty(), "{:?}", sdsc.pcfg);
+        assert!(sdsc.pcfg_pool.is_empty());
+    }
+
+    /// e348's control — THE SAME FIXTURE with ONE labelled DS pinned to HBM leaves `allLxPinned` false,
+    /// so `reqDLOp` stands (`:320-325`) and ACT2 reaches the L3 pcfg generator (`:367`). That is what
+    /// pins the cancellation above to the pinning walk rather than to an empty schedule.
+    #[test]
+    #[should_panic(expected = "DcgFE::generatePcfgIRForDLOp")]
+    fn e348_one_hbm_pinned_labelled_ds_keeps_the_dl_op() {
+        let mut sdsc = one_dl_step_with_pinnings(vec![
+            pinned_to(SenComponent::Lx),
+            pinned_to(SenComponent::Hbm),
+        ]);
+
+        let _ = DcgManager::<DcgSenProg, true, true>::new()
+            .run_dcg_for_data_ops_dl_ops::<true, false>(&mut sdsc);
+    }
+
+    /// e349 — `DT_CHECK(!mySDsc.dataOpdscs_.empty())` under an empty `pcfg_` (`:907-909`) is the only
+    /// answer this entry can give without a backend: with neither, it refuses BEFORE the stitch and
+    /// before either codegen route, so no seam is named.
+    #[test]
+    fn e349_an_empty_super_dsc_is_refused_before_any_codegen() {
+        let mut sdsc = one_dsc2_core::<true>();
+
+        let converted =
+            DcgManager::<DccSenProg, true, true>::new().convert_to_prog_ir_data_op(&mut sdsc);
+
+        assert_eq!(converted, None);
+    }
+
+    /// e349's control — ONE data op with `pcfg_` still empty takes the single-op route and reaches
+    /// `createSenProgramSTCDPOp` (`:929-930`), so the refusal above is the missing data op and not a
+    /// blanket stop.
+    #[test]
+    #[should_panic(expected = "DcgBE::createSenProgramSTCDPOp")]
+    fn e349_one_data_op_reaches_the_single_op_codegen() {
+        let mut sdsc = one_dsc2_core::<true>().with_data_op(DataOpDsc {
+            op: OpFunc::GatherOpHbm,
+            pcfg: BTreeMap::new(),
+        });
+
+        let _ = DcgManager::<DccSenProg, true, true>::new().convert_to_prog_ir_data_op(&mut sdsc);
     }
 }
