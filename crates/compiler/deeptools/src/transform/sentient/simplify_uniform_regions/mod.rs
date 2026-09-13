@@ -312,6 +312,7 @@ mod unit_tests {
                     body: vec![Op::Sentient(sentient::Op::Nop { dbg_name: None })],
                 }],
                 results: Vec::new(),
+                yielded: Vec::new(),
             },
         )]);
         run_on_program(&mut sunk);

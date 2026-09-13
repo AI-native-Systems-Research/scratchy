@@ -103,13 +103,17 @@
 use core::fmt::Write as _;
 use std::collections::BTreeMap;
 
-use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects as lower;
+use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects;
 use crate::islands::sentient::dialects::{
-    Definitions, LocalRegion, Op, UniformRegions, Val, element_size, sentient, symbol, uniform,
-    value_reg_locale,
+    Definitions, LocalRegion, Op, UniformRegions, Val, YieldedReg, element_size, sentient, symbol,
+    uniform, value_reg_locale,
 };
 use crate::islands::sentient::print;
+use crate::transform::sentient::analyses::{UnitIndex, UnitIndexMap};
+use crate::transform::sentient::utils::{self, OpAt};
 
 /// `affine::FlatAffineValueConstraints` — THE LOCAL-VARIABLE CONSTRAINT SYSTEM OF ONE FLATTENED
 /// AFFINE EXPRESSION, opaque here.
@@ -796,7 +800,9 @@ fn is_uniformize_regions(op: &Op) -> bool {
 /// second holding nothing but its terminator (`:470-476`).
 fn uniformize_result_source(op: &Op, val: Val) -> Option<Val> {
     let (results, yielded, region_count, second_len) = match op {
-        Op::UniformRegions(UniformRegions::UniformizeRegions { regions, results }) => (
+        Op::UniformRegions(UniformRegions::UniformizeRegions {
+            regions, results, ..
+        }) => (
             results.as_slice(),
             regions.first().and_then(|region| match region.body.last() {
                 Some(Op::Uniform(uniform::Op::Yield { operands })) => Some(operands.as_slice()),
@@ -941,25 +947,398 @@ pub fn clone_value_to_region(val: Val, target: SecondRegion<'_>, vals: &mut Valu
     Some(result)
 }
 
-// crustify:todo: e440_addToMap
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:241  (25 body lines, level 2)
-//   original  : void LiveRangeReductionPass::addToMap(PropagationAnalysis& expr_prop_analysis, Value& value)
-//   calls     : e252_size, e305_getBaseExpr
+impl SsaMap {
+    /// Replaces: e440_addToMap
+    ///
+    /// Files one value under the equivalence class of its base expression, recording the per-unit
+    /// constant offsets and the negation it differs from that class by.
+    ///
+    /// ⛔ A CONSTANT IS RECORDED BUT NEVER CLASSED (`:252-253`, `:258-261`): its live range needs no
+    /// reducing, so it neither joins a class nor opens one — yet its offsets and its negation ARE
+    /// mapped, because that constant term is what `reconstructOperation` substitutes with.
+    /// ⛔ A VALUE WHOSE BASE EXPRESSION FAILS IS NOT MAPPED AT ALL, not mapped as empty.
+    pub fn add_to_map(
+        &mut self,
+        analysis: &mut impl PropagationAnalysis,
+        value: Val,
+        defs: Definitions<'_>,
+    ) {
+        let is_constant = is_sentient_constant(value, defs);
+        let Some(base) = get_base_expr(analysis, value, defs) else {
+            return;
+        };
+        let existing = self
+            .classes
+            .iter()
+            .position(|class| expr_info_eq(&class.expr_info, &base.expr_info));
+        if !is_constant {
+            match existing {
+                Some(index) => self.classes[index].values.push(value),
+                None => self.classes.push(EquivalenceClass {
+                    expr_info: base.expr_info,
+                    values: vec![value],
+                }),
+            }
+        }
+        self.const_offsets.insert(value, base.const_val);
+        self.negated.insert(value, base.negated);
+    }
+}
 
-// crustify:todo: e441_findDominantValue
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:480  (38 body lines, level 2)
-//   original  : LogicalResult LiveRangeReductionPass::findDominantValue( SmallVector<Value> ssa_list, const int current_value_index, int& dominant_value_index, const DominanceInfo& dominance_info)
-//   calls     : e058_areElementSizeIdentical, e060_areReglocalesMatching, e306_getRootIterArg
+/// `skip_elem_size_` (`LiveRangeReduction.cpp:1287-1290`) — whether the unit's own type waives
+/// [`are_element_size_identical`], which it does for a PT, PE or SFP unit and no other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementSizeCheck {
+    /// `skip_elem_size_ == false` — the widths must match.
+    Required,
+    /// `skip_elem_size_ == true`.
+    Skipped,
+}
 
-// crustify:todo: e442_addResultToYield
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:961  (140 body lines, level 2)
-//   original  : uniform::UniformizeRegionsOp LiveRangeReductionPass::addResultToYield( uniform::UniformizeRegionsOp uniformize_op, SmallVector<Operation*>& ops_to_be_delected, int region_num, int op_num, int result_idx)
-//   calls     : e059_getFirstGlobalOrConstantAncestor, e239_getOperationOfBlock, e252_size, e307_cloneValueToRegion, e392_getQueryKeyAndUnitsFromParentRegion
+/// Replaces: e441_findDominantValue
+///
+/// Scans this class's earlier values backwards for the CLOSEST one that properly dominates the
+/// current value, steps by the same element width and shares its register file; `None` is
+/// `LogicalResult::failure()`.
+///
+/// ⛔ A `scalar_add`/`scalar_sub` MUST ALSO SHARE THE DEF-USE ROOT (`:506-514`) — two adds rooted in
+/// different iter args cannot have their registers merged — and such a candidate is SKIPPED, the scan
+/// continuing to the next rather than failing.
+#[must_use]
+pub fn find_dominant_value(
+    ssa_list: &[Val],
+    current_value_index: usize,
+    check: ElementSizeCheck,
+    unit_body: &[Op],
+    defs: Definitions<'_>,
+) -> Option<usize> {
+    let current = ssa_list[current_value_index];
+    // `ssa_list[current_value_index].getDefiningOp()`, which `:487` and `:506` then dereference
+    // unchecked — so a block argument here is the reference's own null dereference.
+    let Some(current_at) = utils::path_of(unit_body, current) else {
+        panic!(
+            "findDominantValue was asked about a value with no defining op in this program unit, \
+             where the reference dereferences a null Operation* \
+             (LiveRangeReduction.cpp:484,487,506)"
+        )
+    };
+    let current_op = current_at.op(unit_body);
+    for scanner in (0..current_value_index).rev() {
+        let candidate = ssa_list[scanner];
+        if !properly_dominates(candidate, &current_at, unit_body, defs) {
+            continue;
+        }
+        if check == ElementSizeCheck::Required
+            && !are_element_size_identical(candidate, current, defs)
+        {
+            continue;
+        }
+        if !are_reglocales_matching(candidate, current, defs) {
+            continue;
+        }
+        if matches!(
+            current_op,
+            Some(Op::Sentient(
+                sentient::Op::ScalarAdd { .. } | sentient::Op::ScalarSub { .. }
+            ))
+        ) && get_root_iter_arg(current, defs) != get_root_iter_arg(candidate, defs)
+        {
+            continue;
+        }
+        return Some(scanner);
+    }
+    None
+}
 
-// crustify:todo: e443_createMapAndQuery
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:1216  (43 body lines, level 2)
-//   original  : Operation* LiveRangeReductionPass::createMapAndQuery( OpBuilder& builder, std::vector<int64_t>& new_const_val, Operation* op)
-//   calls     : e252_size, e392_getQueryKeyAndUnitsFromParentRegion
+/// `DominanceInfo::properlyDominates(Value, Operation*)` — the value's DEFINING OP against `use_at`
+/// when it has one, and its BLOCK otherwise.
+///
+/// ⭐ THREE CASES, ALL THE ONE MLIR RULE. A result defined in this unit compares paths (and never
+/// properly dominates its own op); a result defined outside it was bound in the enclosing program
+/// scope and so dominates the whole unit; a block argument is a `sentient.for`'s `iv` or iter arg and
+/// dominates exactly what that loop's body holds.
+fn properly_dominates(
+    val: Val,
+    use_at: &OpAt,
+    unit_body: &[Op],
+    defs: Definitions<'_>,
+) -> bool {
+    if defs.of(val).is_some() {
+        return match utils::path_of(unit_body, val) {
+            Some(def_at) => def_at != *use_at && def_at.dominates(use_at),
+            None => true,
+        };
+    }
+    let mut at = use_at.clone();
+    while let Some(parent) = at.parent() {
+        if let Some(Op::Sentient(sentient::Op::For { iv, carried, .. })) = parent.op(unit_body)
+            && (*iv == val || carried.iter().any(|value| value.arg == val))
+        {
+            return true;
+        }
+        at = parent;
+    }
+    false
+}
+
+/// WHAT `getQueryKeyAndUnitsFromParentRegion` (`e392`, `Transform/Sentient/Utils.cpp:40`) ANSWERS —
+/// the enclosing region's own key and every unit it covers.
+///
+/// ⛔ A PARAMETER BECAUSE `e392` IS NOT PORTED YET, and it is the same seam [`SecondRegion`] is: the
+/// climb out of the op to its parent `dataflow.program_unit` or sibling `uniform` region is mechanism
+/// its owner writes once, while [`add_result_to_yield`] and [`create_map_and_query`] need only its
+/// answer. ⭐ e442 READS `units` ALONE — the reference's own `key` is `(void)`-discarded there
+/// (`LiveRangeReduction.cpp:986`) and only `e443` uses it.
+#[derive(Debug, Clone)]
+pub struct ParentRegionQuery {
+    /// `key` — the parent region's argument, which a new `uniform.query_map` is keyed by.
+    pub key: Val,
+    /// `all_units` — every unit of the parent region's list.
+    pub units: Vec<Val>,
+}
+
+/// Replaces: e442_addResultToYield
+///
+/// Rebuilds the `uniform.uniformize_regions` with ONE MORE RESULT: the op at `op_num` of region
+/// `region_num` now yields its result `result_idx`, region 1 yields that value's global ancestor
+/// re-minted for its own units, and the new result's element width and register file are appended.
+///
+/// ⛔ A ONE-REGION OP GAINS ITS SECOND REGION HERE, running on whatever of the parent's unit list
+/// region 0 does not cover (`:981-997`) — the reference's second `listSizes` entry, which this
+/// island spells as [`LocalRegion::units`].
+/// ⛔ `None` FROM [`clone_value_to_region`] ABANDONS THE WHOLE REWRITE and the ORIGINAL op is
+/// answered with (`:1085-1088`); `newly_added`/`ops_to_be_delected` (`:1093-1096`) are the rewriter's
+/// memory management and become the caller storing this answer into the slot.
+#[must_use]
+pub fn add_result_to_yield(
+    uniformize_op: &UniformRegions,
+    parent: &ParentRegionQuery,
+    region_num: usize,
+    op_num: utils::InBlock,
+    result_idx: usize,
+    enclosing: &[&[Op]],
+    vals: &mut Values,
+) -> UniformRegions {
+    let defs = Definitions::from_innermost(enclosing);
+    // `uniform::UniformizeRegionsOp` IS THE PARAMETER'S TYPE (`:961-965`), and `$results` is what
+    // only that variant carries.
+    let UniformRegions::UniformizeRegions {
+        regions,
+        results,
+        yielded,
+    } = uniformize_op
+    else {
+        panic!(
+            "addResultToYield takes a uniform.uniformize_regions, not a uniform.equalize_pattern \
+             (LiveRangeReduction.cpp:961-965)"
+        )
+    };
+
+    // `register_op.getResult(result_idx)` READ FROM THE ORIGINAL (`:1039`, `:1058-1067`): the clone
+    // is a copy, so the width and the locale are the same on either side.
+    let Some(source_result) = utils::operation_of_block(&regions[region_num].body, op_num)
+        .and_then(|op| dialects::results(op).get(result_idx).copied())
+    else {
+        panic!(
+            "addResultToYield was asked for result {result_idx} of op {} of a local region that has \
+             neither, where the reference walks past the end of the block \
+             (LiveRangeReduction.cpp:1039)",
+            op_num.0
+        )
+    };
+
+    // ⭐ THE SECOND REGION'S UNITS — `collectUnitVals(units)` against the parent's whole list
+    // (`:981-997`). A two-region op keeps both lists as they are (`:1000-1006`).
+    let unit_lists: Vec<Vec<Val>> = if regions.len() == 1 {
+        let organized = dialects::collect_unit_ops(&regions[0].units, defs);
+        vec![
+            regions[0].units.clone(),
+            parent
+                .units
+                .iter()
+                .copied()
+                .filter(|unit| !organized.contains(unit))
+                .collect(),
+        ]
+    } else {
+        regions.iter().map(|region| region.units.clone()).collect()
+    };
+
+    // THE TWO REGIONS OF THE NEW OP (`:1008-1026`), each binding a fresh argument.
+    let mut new_regions: Vec<LocalRegion> = Vec::new();
+    let mut cloned_result = source_result;
+    for r in 0..2 {
+        let arg = vals.mint();
+        let body = match regions.get(r) {
+            Some(source) if r == region_num || regions.len() == 2 => {
+                let mut mapping = ValueMapping::new();
+                mapping.map(source.arg, arg);
+                let body = dialects::clone_ops(&source.body, vals, &mut mapping);
+                if r == region_num {
+                    cloned_result = mapping.lookup_or_default(source_result);
+                }
+                body
+            }
+            // A one-region op's new region 1 starts as a bare `uniform.yield` (`:1024-1026`).
+            _ => vec![Op::Uniform(uniform::Op::Yield {
+                operands: Vec::new(),
+            })],
+        };
+        new_regions.push(LocalRegion {
+            arg,
+            units: unit_lists[r].clone(),
+            body,
+        });
+    }
+
+    let mut new_op = UniformRegions::UniformizeRegions {
+        results: results
+            .iter()
+            .copied()
+            .chain(core::iter::once(vals.mint()))
+            .collect(),
+        // ⭐ ONE ENTRY APPENDED TO WHATEVER WAS THERE (`:1043-1067`) — so an op that carried NEITHER
+        // attribute over two results comes out with one entry for three, exactly as the reference's
+        // `hasAttr`-guarded reads leave it.
+        yielded: yielded
+            .iter()
+            .copied()
+            .chain(core::iter::once(YieldedReg {
+                element_size: element_size(source_result, defs),
+                locale: value_reg_locale(source_result, defs),
+            }))
+            .collect(),
+        regions: new_regions,
+    };
+
+    // `yield_args.push_back(register_op.getResult(result_idx))` (`:1039`).
+    push_yield_operand(&mut new_op.regions_mut()[region_num], cloned_result);
+
+    // THE OTHER REGION YIELDS THE ANCESTOR, RE-MINTED (`:1072-1090`). ⭐ `DT_CHECK(r == 1)` (`:1073`)
+    // holds because the one caller only ever passes `region_num == 0` (`:1173`).
+    let scopes: Vec<&[Op]> = core::iter::once(new_op.regions()[0].body.as_slice())
+        .chain(enclosing.iter().copied())
+        .collect();
+    let ancestor = get_first_global_or_constant_ancestor(
+        cloned_result,
+        &new_op.regions()[0].body,
+        Definitions::from_innermost(&scopes),
+    );
+    let Some(ancestor) = ancestor else {
+        panic!(
+            "addResultToYield could not attribute the new result to a global ancestor, which is \
+             `emitOpError(\"can't find global ancestor\")` and fails the pass \
+             (LiveRangeReduction.cpp:1153-1154)"
+        )
+    };
+    drop(scopes);
+    let Some(target) = SecondRegion::of(&mut new_op) else {
+        panic!("the op addResultToYield just built has two regions (LiveRangeReduction.cpp:1008)")
+    };
+    let Some(yield_operand) = clone_value_to_region(ancestor, target, vals) else {
+        // if ancestor_val is a queryOp which doesn't cover region1's units, quit adding
+        return uniformize_op.clone();
+    };
+    push_yield_operand(&mut new_op.regions_mut()[1], yield_operand);
+    new_op
+}
+
+/// `yield_op->setOperands(yield_args)` WITH ONE MORE (`:1069`, `:1090`) — the terminator is the last
+/// op of the region, and a region built by [`add_result_to_yield`] always has one.
+fn push_yield_operand(region: &mut LocalRegion, operand: Val) {
+    if let Some(Op::Uniform(uniform::Op::Yield { operands })) = region.body.last_mut() {
+        operands.push(operand);
+    }
+}
+
+/// WHAT [`create_map_and_query`] BUILT — the ops in the order the builder wrote them, and the value
+/// the caller substitutes with.
+#[derive(Debug, Clone)]
+pub struct MapAndQuery {
+    /// The `sentient.scalar_constant`s, then the `uniform.def_immutable_mapping`, then the
+    /// `uniform.query_map` — what the reference leaves at the insertion point.
+    pub ops: Vec<Op>,
+    /// `query_op->getResult(0)`.
+    pub result: Val,
+}
+
+/// Replaces: e443_createMapAndQuery
+///
+/// Turns one per-unit constant offset per unit into a `uniform.query_map` over a mapping from each of
+/// the parent region's units to its own `sentient.scalar_constant`.
+///
+/// ⛔ ONLY THE UNITS THE PARENT REGION COVERS GET A KEY, AND IN THE REFERENCE'S REVERSED, GROUP-FLAT
+/// ORDER — [`utils::select_indices_for_units`], whose own note explains the LIFO.
+/// ⛔ A UNIT WHOSE OFFSET WAS THE `i64::MAX` SENTINEL HAS NO CONSTANT and the reference dereferences
+/// the null it pushed for it (`:1222`, `:1250-1252`); that is the one `panic!` here.
+#[must_use]
+pub fn create_map_and_query(
+    new_const_val: &[i64],
+    ty: ScalarTy,
+    parent: &ParentRegionQuery,
+    index_map: &impl UnitIndexMap,
+    defs: Definitions<'_>,
+    vals: &mut Values,
+) -> MapAndQuery {
+    // create const_ops for all new constants — `INT64_MAX` pushes a NULL (`:1220-1229`).
+    let constants: Vec<Option<(Val, Op)>> = new_const_val
+        .iter()
+        .map(|value| {
+            (*value != i64::MAX).then(|| {
+                let result = vals.mint();
+                (
+                    result,
+                    Op::Sentient(sentient::Op::ScalarConstant {
+                        value: *value,
+                        result,
+                        reg_locale: sentient::RegType::Imm,
+                        ty,
+                        is_symbol: false,
+                    }),
+                )
+            })
+        })
+        .collect();
+
+    // second, create an immutable map mapping getUnitOp to constOp — the reference's own LIFO walk.
+    let mut units = parent.units.clone();
+    let mut indices: Vec<UnitIndex> = Vec::new();
+    utils::select_indices_for_units(&mut units, &mut indices, index_map, defs);
+    let pairs: Vec<(Val, Val)> = units
+        .iter()
+        .zip(&indices)
+        .map(|(unit, index)| {
+            let Some(Some((result, _))) = constants.get(index.0 as usize) else {
+                panic!(
+                    "unit index {} has no constant of its own among {} — `const_ops.at(idx)` either \
+                     throws or dereferences the null pushed for an INT64_MAX offset \
+                     (LiveRangeReduction.cpp:1222, 1250-1252)",
+                    index.0,
+                    new_const_val.len()
+                )
+            };
+            (*unit, *result)
+        })
+        .collect();
+
+    let mapping = vals.mint();
+    let result = vals.mint();
+    let mut ops: Vec<Op> = constants
+        .into_iter()
+        .flatten()
+        .map(|(_, op)| op)
+        .collect();
+    ops.push(Op::Uniform(uniform::Op::DefImmutableMapping {
+        result: mapping,
+        pairs,
+    }));
+    ops.push(Op::Uniform(uniform::Op::QueryMap {
+        result,
+        map: mapping,
+        key: parent.key,
+    }));
+    MapAndQuery { ops, result }
+}
 
 // crustify:todo: e502_reconstructOperation
 //   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:546  (259 body lines, level 3)
@@ -1383,6 +1762,7 @@ mod unit_tests {
                     },
                 ],
                 results: Vec::new(),
+                yielded: Vec::new(),
             }
         };
 
@@ -1410,5 +1790,273 @@ mod unit_tests {
             None
         );
         assert_eq!(short.regions()[1].body.len(), 1);
+    }
+
+    /// e440 — the second value of one expression joins the first's class, and a constant is mapped
+    /// without ever entering one.
+    #[test]
+    fn add_to_map_classes_the_non_constants_and_only_maps_the_constant() {
+        let ops = vec![
+            constant(Val(1)),
+            extract(Val(20), (Val(2), Val(3)), 16, RegType::Lar),
+            extract(Val(21), (Val(5), Val(6)), 16, RegType::Lar),
+        ];
+        let regions: [&[Op]; 1] = [&ops];
+        let defs = Definitions::from_innermost(&regions);
+        let mut canned = Canned {
+            map: ExprInfoMap {
+                exprs: vec![bucket(0, 1, vec![Val(7)])],
+                buckets: vec![0],
+            },
+            flats: BTreeMap::from([(
+                0,
+                FlattenedExpr {
+                    coeffs: vec![2, 5],
+                    constraints: FlatAffineValueConstraints(3),
+                    num_local_vars: 0,
+                },
+            )]),
+        };
+
+        let mut map = SsaMap::default();
+        map.add_to_map(&mut canned, Val(2), defs);
+        map.add_to_map(&mut canned, Val(5), defs);
+        // ⛔ THE CONSTANT OPENS NO CLASS AND JOINS NONE.
+        map.add_to_map(&mut canned, Val(1), defs);
+
+        assert_eq!(map.classes.len(), 1);
+        assert_eq!(map.classes[0].values, vec![Val(2), Val(5)]);
+        assert_eq!(map.classes[0].expr_info.expr_coeffs, vec![2]);
+        // ⭐ ALL THREE ARE MAPPED, the constant included.
+        assert_eq!(map.const_offsets.get(&Val(1)), Some(&vec![5]));
+        assert_eq!(map.const_offsets.get(&Val(5)), Some(&vec![5]));
+        assert_eq!(map.negated.get(&Val(1)), Some(&false));
+    }
+
+    /// e441 — the closest dominator wins; a differing width refuses unless the unit waives the check;
+    /// and two adds with different def-use roots are skipped rather than chained.
+    #[test]
+    fn find_dominant_value_takes_the_closest_matching_dominator() {
+        let ops = vec![
+            extract(Val(1), (Val(2), Val(3)), 16, RegType::Lar),
+            extract(Val(2), (Val(4), Val(5)), 16, RegType::Lar),
+            // Same locale, HALF the element width.
+            extract(Val(4), (Val(6), Val(7)), 8, RegType::Lar),
+            // `%10 = %2 + %11`, rooted through the first extract in the block argument `%1`.
+            add(Val(2), Val(11), Val(10)),
+            // `%13 = %12 + %11`, rooted in the block argument `%12`.
+            add(Val(12), Val(11), Val(13)),
+        ];
+        let regions: [&[Op]; 1] = [&ops];
+        let defs = Definitions::from_innermost(&regions);
+
+        let chain = [Val(2), Val(4), Val(6)];
+        assert_eq!(
+            find_dominant_value(&chain, 1, ElementSizeCheck::Required, &ops, defs),
+            Some(0)
+        );
+        // ⛔ 8 BITS AGAINST 16 IS NO MATCH, and nothing earlier matches either.
+        assert_eq!(
+            find_dominant_value(&chain, 2, ElementSizeCheck::Required, &ops, defs),
+            None
+        );
+        // ⭐ A PT/PE/SFP UNIT WAIVES THAT CHECK, so the immediate dominator answers.
+        assert_eq!(
+            find_dominant_value(&chain, 2, ElementSizeCheck::Skipped, &ops, defs),
+            Some(1)
+        );
+        // ⛔ TWO ADDS WITH DIFFERENT ROOTS ARE SKIPPED — the `continue` at `:513`.
+        assert_eq!(
+            find_dominant_value(&[Val(10), Val(13)], 1, ElementSizeCheck::Skipped, &ops, defs),
+            None
+        );
+    }
+
+    /// A `dataflow.get_unit` standing for one unit handle, so that `collectUnitVals` recognises it.
+    fn get_unit(result: Val) -> Op {
+        Op::Dataflow(lower::dataflow::Op::GetUnit {
+            result,
+            residency: crate::units::Residency::Global,
+            unit: crate::units::DfirUnit::Hbm,
+            num_folds: None,
+        })
+    }
+
+    /// e442 — a one-region op gains its second region on exactly the units region 0 does not cover,
+    /// and the new result is yielded from BOTH sides: region 0 yields the op's own result, region 1 the
+    /// ancestor query re-minted over its own unit.
+    #[test]
+    fn add_result_to_yield_opens_a_second_region_on_the_units_region_zero_leaves() {
+        let mut vals = Values::default();
+        let unit_a = vals.mint();
+        let unit_b = vals.mint();
+        let const_a = vals.mint();
+        let const_b = vals.mint();
+        let mapping = vals.mint();
+        let query = vals.mint();
+        let addr_result = vals.mint();
+        let data_result = vals.mint();
+        let r0_arg = vals.mint();
+
+        let op = UniformRegions::UniformizeRegions {
+            regions: vec![LocalRegion {
+                arg: r0_arg,
+                units: vec![unit_a],
+                body: vec![
+                    constant(const_a),
+                    constant(const_b),
+                    Op::Uniform(uniform::Op::DefImmutableMapping {
+                        result: mapping,
+                        pairs: vec![(unit_a, const_a), (unit_b, const_b)],
+                    }),
+                    Op::Uniform(uniform::Op::QueryMap {
+                        result: query,
+                        map: mapping,
+                        key: r0_arg,
+                    }),
+                    extract(query, (addr_result, data_result), 16, RegType::Lar),
+                    Op::Uniform(uniform::Op::Yield {
+                        operands: Vec::new(),
+                    }),
+                ],
+            }],
+            results: Vec::new(),
+            yielded: Vec::new(),
+        };
+        // ⭐ THE OP IS IN THE BLOCK IT IS REWRITTEN IN, which is how the widths and locales of values
+        // inside its regions are readable from the enclosing scope at all.
+        let enclosing = vec![
+            get_unit(unit_a),
+            get_unit(unit_b),
+            Op::UniformRegions(op.clone()),
+        ];
+        let scopes: [&[Op]; 1] = [&enclosing];
+        let parent = ParentRegionQuery {
+            key: r0_arg,
+            units: vec![unit_a, unit_b],
+        };
+
+        let grown = add_result_to_yield(
+            &op,
+            &parent,
+            0,
+            utils::InBlock(4),
+            0,
+            &scopes,
+            &mut vals,
+        );
+        let UniformRegions::UniformizeRegions {
+            regions,
+            results,
+            yielded,
+        } = &grown
+        else {
+            panic!("addResultToYield answers with a uniform.uniformize_regions")
+        };
+
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].units, vec![unit_a]);
+        // ⛔ THE SECOND REGION'S UNIT LIST IS THE PARENT'S MINUS REGION 0'S.
+        assert_eq!(regions[1].units, vec![unit_b]);
+        assert_eq!(results.len(), 1);
+        // The width and register file are read from the ORIGINAL result, not the clone.
+        assert_eq!(
+            yielded,
+            &vec![YieldedReg {
+                element_size: Some(Bits(16)),
+                locale: RegType::Lar,
+            }]
+        );
+
+        // Region 0 yields its own clone of the op's result.
+        let cloned_addr = dialects::results(&regions[0].body[4])[0];
+        assert!(matches!(
+            regions[0].body.last(),
+            Some(Op::Uniform(uniform::Op::Yield { operands })) if *operands == vec![cloned_addr]
+        ));
+        // ⭐ REGION 1 YIELDS A QUERY IT MINTED ITSELF, over a mapping of its own single unit.
+        assert!(matches!(
+            &regions[1].body[0],
+            Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. }) if pairs.len() == 1
+        ));
+        let Op::Uniform(uniform::Op::QueryMap {
+            result: re_minted,
+            key,
+            ..
+        }) = &regions[1].body[1]
+        else {
+            panic!("region 1 opens with the mapping and the query cloneValueToRegion inserted")
+        };
+        assert_eq!(*key, regions[1].arg);
+        assert!(matches!(
+            regions[1].body.last(),
+            Some(Op::Uniform(uniform::Op::Yield { operands })) if *operands == vec![*re_minted]
+        ));
+    }
+
+    /// e443 — one constant per unit index, keyed in `selectIndicesForUnits`' reversed order, and the
+    /// `INT64_MAX` sentinel's slot produces no constant at all.
+    #[test]
+    fn create_map_and_query_keys_the_parents_units_in_reversed_order() {
+        /// The unit's own value number as its index — the out-of-scope name lookup stood in for.
+        struct ByValue;
+        impl UnitIndexMap for ByValue {
+            fn index_of(&self, unit: Val) -> UnitIndex {
+                UnitIndex(unit.0)
+            }
+        }
+
+        let scope = vec![get_unit(Val(0)), get_unit(Val(2))];
+        let scopes: [&[Op]; 1] = [&scope];
+        let defs = Definitions::from_innermost(&scopes);
+        let mut vals = Values::default();
+        let key = vals.mint();
+        let parent = ParentRegionQuery {
+            key,
+            units: vec![Val(0), Val(2)],
+        };
+
+        // Index 1's offset is the sentinel, and no unit of the parent region claims it.
+        let built = create_map_and_query(
+            &[7, i64::MAX, 9],
+            ScalarTy::Index,
+            &parent,
+            &ByValue,
+            defs,
+            &mut vals,
+        );
+
+        // ⛔ TWO CONSTANTS FOR THREE OFFSETS — the sentinel's slot is a null the reference pushes.
+        assert_eq!(built.ops.len(), 4);
+        let values: Vec<i64> = built.ops[..2]
+            .iter()
+            .map(|op| match op {
+                Op::Sentient(sentient::Op::ScalarConstant {
+                    value,
+                    reg_locale: RegType::Imm,
+                    ty: ScalarTy::Index,
+                    ..
+                }) => *value,
+                other => panic!("the constants come first, not {other:?}"),
+            })
+            .collect();
+        assert_eq!(values, vec![7, 9]);
+        let seven = dialects::results(&built.ops[0])[0];
+        let nine = dialects::results(&built.ops[1])[0];
+
+        // ⭐ REVERSED: the LIFO pops `%2` before `%0`, so unit 2's constant is the first pair.
+        let Op::Uniform(uniform::Op::DefImmutableMapping {
+            result: mapping,
+            pairs,
+        }) = &built.ops[2]
+        else {
+            panic!("the mapping follows the constants")
+        };
+        assert_eq!(*pairs, vec![(Val(2), nine), (Val(0), seven)]);
+        assert!(matches!(
+            &built.ops[3],
+            Op::Uniform(uniform::Op::QueryMap { result, map, key: queried })
+                if *result == built.result && map == mapping && *queried == key
+        ));
     }
 }

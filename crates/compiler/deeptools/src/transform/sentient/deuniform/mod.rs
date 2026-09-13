@@ -423,6 +423,7 @@ mod unit_tests {
                 ],
             )],
             results: vec![Val(30)],
+            yielded: Vec::new(),
         });
         let mut unit_body = vec![
             foreign,
@@ -495,6 +496,7 @@ mod unit_tests {
         let mut op = Op::UniformRegions(UniformRegions::UniformizeRegions {
             regions: vec![region(10, &[4], Vec::new()), region(11, &[3], Vec::new())],
             results: Vec::new(),
+            yielded: Vec::new(),
         });
 
         expand_all_groups_to_units_and_update_sizes(&mut op, Definitions::from_innermost(&regions));

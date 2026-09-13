@@ -142,7 +142,13 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 local_region(out, region, depth + 1);
             }
             indent(out, depth);
-            out.push_str("}\n");
+            out.push('}');
+            // ⭐ THE ONLY ATTRIBUTES THIS OP CARRIES, and only once `addResultToYield` has written
+            // them — see [`sentient::uniformize_result_attrs`].
+            if let UniformRegions::UniformizeRegions { yielded, .. } = regions {
+                out.push_str(&sentient::uniformize_result_attrs(yielded));
+            }
+            out.push('\n');
         }
     }
 }
@@ -185,6 +191,7 @@ mod unit_tests {
                 })],
             }],
             results: Vec::new(),
+            yielded: Vec::new(),
         });
         let below = lower::Op::Uniform(lower_uniform::Op::UniformizeRegions {
             regions: vec![lower_uniform::LocalRegion {

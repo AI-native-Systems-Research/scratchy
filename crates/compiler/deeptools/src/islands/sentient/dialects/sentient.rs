@@ -4106,6 +4106,32 @@ fn extent_attrs(extent: &Extent) -> Vec<String> {
     attrs
 }
 
+/// THE TRAILING DICTIONARY OF A `uniform.uniformize_regions` WHOSE RESULTS CARRY REGISTER INFO —
+/// `} {element_sizes = [16 : i32, 16 : i32], regLocales = [#sentient<reg_type lrf>, ..]}`
+/// (`dcc/test/Transform/LiveRangeReduction/uniformizeRegions.mlir:187`), one entry per result and
+/// nothing at all before `addResultToYield` has written them.
+///
+/// ⭐ `: i32` AND `#sentient<reg_type ..>` AS THE REFERENCE WRITES THEM — [`locale_attr`]'s spelling
+/// rather than [`locale_array`]'s quoted one, which that function's own note says is wrong and left
+/// to the units owning the older arrays. This array is new, so it is written right.
+pub(crate) fn uniformize_result_attrs(yielded: &[super::YieldedReg]) -> String {
+    if yielded.is_empty() {
+        return String::new();
+    }
+    let sizes: Vec<String> = yielded
+        .iter()
+        .map(|reg| {
+            reg.element_size
+                .map_or_else(|| "-1 : i32".to_owned(), |bits| format!("{} : i32", bits.0))
+        })
+        .collect();
+    let locales: Vec<String> = yielded.iter().map(|reg| locale_attr(reg.locale)).collect();
+    dict(&[
+        attr("element_sizes", &format!("[{}]", sizes.join(", "))),
+        attr("regLocales", &format!("[{}]", locales.join(", "))),
+    ])
+}
+
 /// A `SentientRegTypeArrayAttr` — one locale per carried value.
 fn locale_array(regs: impl Iterator<Item = Reg>) -> String {
     let spelled: Vec<String> = regs.map(|r| quoted(r.locale.spelling())).collect();

@@ -101,6 +101,29 @@ pub struct LocalRegion {
     pub body: Vec<Op>,
 }
 
+/// ONE RESULT'S REGISTER INFO ON A [`UniformRegions::UniformizeRegions`] — `element_sizes[i]` beside
+/// `regLocales[i]`, the two discardable attributes `LiveRangeReduction::addResultToYield` writes
+/// (`Transform/Sentient/LiveRangeReduction.cpp:1041-1070`).
+///
+/// ⭐ ONE RECORD WHERE THE REFERENCE KEEPS TWO PARALLEL ARRAYS, because its only writer appends to
+/// both together (`:1058-1067`) and both readers index them BY RESULT NUMBER — `element_sizes[i]` for
+/// `getResult(i)` (`Dialect/Sentient/Utils.cpp:353-366`) and `regLocales[getResultNum(op, val)]`
+/// (`Dialect/Sentient/SentientOps.cpp:1831-1842`). A length disagreement between them is unwritable
+/// here.
+///
+/// ⛔ THIS IS **NOT** A `sentient.for`'S `1 + 2n` LAYOUT. On `uniform.uniformize_regions` the arrays
+/// are exactly `getNumResults()` long — `element_sizes = [16 : i32, 16 : i32]` beside a `regLocales`
+/// of two entries for two results
+/// (`dcc/test/Transform/LiveRangeReduction/uniformizeRegions.mlir:187`) — and no `bound` or region
+/// argument occupies a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YieldedReg {
+    /// `element_sizes[i]` — `None` is the reference's own `-1`, the absent attribute.
+    pub element_size: Option<crate::formats::Bits>,
+    /// `regLocales[i]`.
+    pub locale: sentient::RegType,
+}
+
 /// A `uniform.uniformize_regions` OR `uniform.equalize_pattern` WHOSE REGIONS HOLD OPS OF **THIS**
 /// RUNG — the op [`Op::Uniform`] cannot hold.
 ///
@@ -134,6 +157,9 @@ pub enum UniformRegions {
         /// `Variadic<AnyType>:$results` (`Uniform.td:90`) — one per operand of every region's
         /// `uniform.yield`.
         results: Vec<Val>,
+        /// `element_sizes` AND `regLocales`, ONE ENTRY PER [`Self::UniformizeRegions::results`] — see
+        /// [`YieldedReg`]. EMPTY is neither attribute written.
+        yielded: Vec<YieldedReg>,
     },
     /// `uniform.equalize_pattern { (%arg -> %0, %2){ .. } .. }` — see
     /// [`uniform::Op::EqualizePattern`].
@@ -1064,6 +1090,16 @@ pub fn element_size(val: Val, defs: Definitions<'_>) -> Option<crate::formats::B
             sentient::Op::ScalarAdd { element_size, .. }
             | sentient::Op::ScalarSub { element_size, .. },
         ) => *element_size,
+        // ⭐ `element_sizes[i]` FOR `getResult(i)` (`:353-366`) — see [`YieldedReg`]. An empty array
+        // is the reference's own `hasAttr == false`, and an index past a SHORT one answers the same
+        // `-1` where the reference would read off the end.
+        Op::UniformRegions(UniformRegions::UniformizeRegions {
+            results, yielded, ..
+        }) => results
+            .iter()
+            .position(|result| *result == val)
+            .and_then(|at| yielded.get(at))
+            .and_then(|reg| reg.element_size),
         // ⭐ THE `_` ARM IS THE REFERENCE'S OWN `return -1;` (`:367`), not a fall-through: every op
         // it does not name answers "no element size", and so do the `element_sizes` arms above.
         _ => None,
@@ -1169,6 +1205,15 @@ pub fn value_reg_locale(val: Val, defs: Definitions<'_>) -> sentient::RegType {
             .map_or(sentient::RegType::Unknown, |(_, value)| {
                 value_reg_locale(*value, defs)
             }),
+        // ⭐ `regLocales[getResultNum(op, val)]` (`:1831-1842`) — see [`YieldedReg`]. An empty array
+        // is that arm's own `else`, which returns `unknown`.
+        Some(Op::UniformRegions(UniformRegions::UniformizeRegions {
+            results, yielded, ..
+        })) => results
+            .iter()
+            .position(|result| *result == val)
+            .and_then(|at| yielded.get(at))
+            .map_or(sentient::RegType::Unknown, |reg| reg.locale),
         // ⭐ THE FALL-THROUGH IS THE REFERENCE'S OWN `return locale;` (`:1861`) — including for
         // `scalar_mul`, which the reference names no arm for either and which declares `regLocale`
         // singular rather than the `regLocales` array its generic tail reads.

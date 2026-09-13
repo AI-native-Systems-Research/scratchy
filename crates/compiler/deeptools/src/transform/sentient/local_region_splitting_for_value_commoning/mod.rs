@@ -88,7 +88,7 @@ pub(crate) mod local_region;
 pub(crate) mod uniform_region;
 
 use crate::arch::Arch;
-use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient, uniform};
+use crate::islands::sentient::dialects::{Definitions, Op, UniformRegions, Val, sentient, uniform};
 use local_region::{LocalRegion, OriginalRegion};
 use sentient::RegType;
 use sys_arch_spec::regfile::{Component, Presence, RegType as RegFile, depth_of};
@@ -356,10 +356,67 @@ pub fn cluster(
     }
 }
 
-// crustify:todo: e444_analyze
-//   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:273  (32 body lines, level 2)
-//   original  : bool LocalRegionSplittingForValueCommoningPass::analyze( lrs::UniformRegion &ur, const SentientRegType locale, const SenComponents comp)
-//   calls     : e061_addLocalRegion, e062_collectUniformMaps, e063_getMaxRegNum, e252_size, e308_cluster
+/// WHETHER A SPLIT WAS FOUND — the `bool` `analyze` returns (`:271`), and the only thing deciding
+/// whether `run` (e561) goes on to call `transform` (`:266-269`).
+///
+/// ⛔ NOT A BARE `bool`: `false` is neither failure nor "nothing found" — `ur` is filled EITHER WAY
+/// (`:298-302`), so both answers are kinds of success and each has to name itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transformation {
+    /// Some region held at least as many uniform maps as the file has registers and was clustered.
+    Needed,
+    /// Every region fit, and `ur` holds each of them unsplit.
+    NotNeeded,
+}
+
+/// Replaces: e444_analyze
+///
+/// Per region of the original op: collect the uniform maps its `locale` copies read, append the region
+/// unsplit when they fit `comp`'s register file, else append one local region per cluster.
+///
+/// ⛔ `<` AND NOT `<=` IS THE REFERENCE'S OWN HEURISTIC (`:295-297`) — being purely local it leaves one
+/// register free for a globally shared map.
+/// ⛔ EVERY REGION IS APPENDED EITHER WAY (`:298-302`), so a [`Transformation::NotNeeded`] `ur` is a
+/// faithful copy of the original op and the answer says only whether ANY region was split.
+/// ⭐ THE OP ARRIVES BESIDE `ur`: `ur.original_uro` is an identity ([`uniform_region::UniformizeRegions`])
+/// and a region's ops are not reachable from a [`Val`], so e561 holds both.
+#[must_use]
+pub fn analyze<A: Arch>(
+    ur: &mut UniformRegion,
+    orig_ur: &UniformRegions,
+    locale: RegType,
+    comp: Component,
+    limits: PretendRegLimits,
+    defs: Definitions<'_>,
+) -> Transformation {
+    let max_reg_num = get_max_reg_num::<A>(locale, comp, limits);
+    let UniformRegions::UniformizeRegions { regions, .. } = orig_ur else {
+        panic!(
+            "analyze takes a uniform.uniformize_regions and nothing else — that is its typed \
+             parameter (LocalRegionSplittingForValueCommoning.cpp:271-273)"
+        )
+    };
+    let mut answer = Transformation::NotNeeded;
+    for local_region in regions {
+        let mut uniform_maps = Vec::new();
+        collect_uniform_maps(&mut uniform_maps, &local_region.body, locale, defs);
+        // ⭐ `getUnitsOfRegion(orig_ur, region_index)` (`Dialect/Uniform/Utils.cpp:526-546`) IS THIS
+        // FIELD: it slices the flat `$units` operand list by `list_sizes`, and the island stores the
+        // slice per region, so the slicing is mechanism this port drops.
+        if uniform_maps.len() < max_reg_num.0 as usize {
+            ur.add_local_region(local_region.units.clone(), OriginalRegion(local_region.arg));
+            continue;
+        }
+        answer = Transformation::Needed;
+        let mut clustered_units = Vec::new();
+        cluster(&mut clustered_units, &local_region.units, &uniform_maps, defs);
+        for unit_group in clustered_units {
+            ur.add_local_region(unit_group, OriginalRegion(local_region.arg));
+        }
+    }
+    answer
+}
+
 
 // crustify:todo: e505_transform
 //   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:347  (91 body lines, level 3)
@@ -385,6 +442,7 @@ pub fn cluster(
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
+    use crate::islands::sentient::dialects::LocalRegion as IrLocalRegion;
     use crate::islands::sentient::dialects::sentient::Reg;
 
     /// `%out = sentient.scalar_copy %input {regLocale = locale}`.
@@ -521,5 +579,65 @@ mod unit_tests {
             output,
             vec![vec![Val(9)], vec![Val(1)], vec![Val(2)], vec![Val(3)]]
         );
+    }
+
+    /// e444 — one region under the pretend limit is kept whole, the next one at it is split per unit,
+    /// and both answer with the SAME original region.
+    #[test]
+    fn analyze_keeps_a_fitting_region_whole_and_clusters_the_one_that_does_not_fit() {
+        let outer = vec![
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(100),
+                pairs: vec![(Val(1), Val(11)), (Val(2), Val(12))],
+            }),
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(101),
+                map: Val(100),
+                key: Val(1),
+            }),
+        ];
+        let orig_ur = UniformRegions::UniformizeRegions {
+            regions: vec![
+                IrLocalRegion {
+                    arg: Val(50),
+                    units: vec![Val(3)],
+                    body: vec![Op::Sentient(sentient::Op::Nop { dbg_name: None })],
+                },
+                IrLocalRegion {
+                    arg: Val(51),
+                    units: vec![Val(1), Val(2)],
+                    body: vec![scalar_copy(Val(101), Val(200), RegType::Ebr)],
+                },
+            ],
+            results: Vec::new(),
+            yielded: Vec::new(),
+        };
+        let mut ur = UniformRegion {
+            local_regions: Vec::new(),
+            original_uro: uniform_region::UniformizeRegions(Val(50)),
+        };
+        let scopes: [&[Op]; 1] = [&outer];
+        assert_eq!(
+            analyze::<Dd2>(
+                &mut ur,
+                &orig_ur,
+                RegType::Ebr,
+                Component::L3lu,
+                PretendRegLimits {
+                    max_lbr: None,
+                    max_ebr: Some(MaxRegNum(1)),
+                },
+                Definitions::from_innermost(&scopes),
+            ),
+            Transformation::Needed
+        );
+        // Region 0 found no map, so `0 < 1` kept it whole; region 1 found one, so `1 < 1` split it.
+        assert_eq!(ur.local_regions.len(), 3);
+        assert_eq!(ur.local_regions[0].units, vec![Val(3)]);
+        assert_eq!(ur.local_regions[0].original_region, OriginalRegion(Val(50)));
+        assert_eq!(ur.local_regions[1].units, vec![Val(1)]);
+        assert_eq!(ur.local_regions[2].units, vec![Val(2)]);
+        assert_eq!(ur.local_regions[1].original_region, OriginalRegion(Val(51)));
+        assert_eq!(ur.local_regions[2].original_region, OriginalRegion(Val(51)));
     }
 }

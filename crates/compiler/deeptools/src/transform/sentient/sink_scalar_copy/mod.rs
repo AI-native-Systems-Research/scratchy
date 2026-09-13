@@ -494,6 +494,7 @@ mod unit_tests {
                     },
                 ],
                 results: Vec::new(),
+                yielded: Vec::new(),
             }),
         ];
 
@@ -546,6 +547,7 @@ mod unit_tests {
                     body: vec![add(Val(10), Val(12))],
                 }],
                 results: Vec::new(),
+                yielded: Vec::new(),
             }),
         ];
         let mut pass = SinkScalarCopy::default();

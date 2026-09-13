@@ -81,13 +81,23 @@
 //! | `e445_coalesceLoops` | 445 | 2 | 165 | `dcc/src/Transform/Sentient/LoopCoalescing.cpp:135` |
 //! | `e563_runOnOperation` | 563 | 4 | 74 | `dcc/src/Transform/Sentient/LoopCoalescing.cpp:302` |
 
-// ⛔ NOTHING CALLS THESE TWO UNTIL `e312_splitBounds` / `e445_coalesceLoops` LAND, and CI runs clippy
-// with `-D warnings`. ⭐ REMOVE THIS WITH e445.
+// ⛔ NOTHING IN THIS FILE HAS A CALLER YET and CI runs clippy with `-D warnings`. e445 consumes
+// `split_bounds` and `is_all_less_than_max`, but `get_candidate_loops`, [`MaxLoops`] and
+// [`ProcessedLoops::mark`]/[`ProcessedLoops::holds`] belong to `e563_runOnOperation`, which is what
+// walks the unit and calls the two of them. ⭐ REMOVE THIS WITH e563: that is the unit that wires the
+// pass up, and only then is an unused item here a real defect again.
 #![allow(dead_code)]
 
-use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient, use_count};
+use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
+    DbgNamePrefix, new_dbg_name_from_list,
+};
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{
+    self, Definitions, Op, Val, sentient, uniform, use_count,
+};
 use crate::transform::sentient::ForRef;
-use crate::transform::sentient::utils::{ConstKind, is_constant};
+use crate::transform::sentient::utils::{ConstKind, InBlock, is_constant};
 
 /// A loop's trip count — `sentient.for`'s `$bound`, and what coalescing multiplies together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -280,6 +290,133 @@ mod unit_tests {
         assert!(split[0].fitting.0 <= TripLimit::LCCR.0);
         assert_eq!(split[0].fitting.0 * split[0].cofactor.0, 65536 * 3);
     }
+
+    /// e445 — the reference's own two-loop case: the coalesced bound is the product of the band's,
+    /// minted at the head of the preamble, and the innermost body moves up in place of the loop below.
+    #[test]
+    fn e445_fuses_a_band_of_two_into_its_outermost_loop() {
+        let inner = sentient_for(
+            Val(20),
+            Val(2),
+            carried(Val(11), Val(21), Val(22)),
+            vec![Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(21)],
+            })],
+        );
+        let outer = sentient_for(
+            Val(10),
+            Val(1),
+            carried(Val(0), Val(11), Val(12)),
+            vec![
+                inner,
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(22)],
+                }),
+            ],
+        );
+        let mut block = vec![constant(Val(1), 8), constant(Val(2), 4), outer];
+        let mut preamble = Vec::new();
+        let mut vals = Values::default();
+        for _ in 0..30 {
+            let _ = vals.mint();
+        }
+        let mut processed = ProcessedLoops::default();
+        processed.mark(ForRef(Val(10)));
+        processed.mark(ForRef(Val(20)));
+
+        coalesce_loops(
+            &[ForRef(Val(10)), ForRef(Val(20))],
+            &mut Builders {
+                preamble: &mut preamble,
+                const_at: InBlock(0),
+                block: &mut block,
+                at: InBlock(2),
+                vals: &mut vals,
+            },
+            &mut processed,
+        );
+
+        // The mark comes off every loop of the band (`:154`).
+        assert!(!processed.holds(ForRef(Val(10))));
+        assert!(!processed.holds(ForRef(Val(20))));
+        // `8 * 4`, and the const builder writes to the preamble, not beside the band.
+        assert_eq!(preamble, vec![constant(Val(30), 32)]);
+        // The inner loop is gone, its yield operand answers the outer one, and the iter arg it read
+        // is now the outermost's.
+        assert_eq!(
+            block[2],
+            sentient_for(
+                Val(10),
+                Val(30),
+                carried(Val(0), Val(11), Val(12)),
+                vec![Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(11)],
+                })]
+            )
+        );
+    }
+
+    /// e445 — a product one LCCR cannot hold splits across the outer TWO loops and returns there, so a
+    /// band of exactly two keeps both, and the outermost takes the COFACTOR.
+    #[test]
+    fn e445_splits_a_product_too_wide_for_one_lccr_and_leaves_the_band_standing() {
+        let body = vec![Op::Sentient(sentient::Op::Yield {
+            results: vec![Val(21)],
+        })];
+        let inner = sentient_for(Val(20), Val(2), carried(Val(11), Val(21), Val(22)), body);
+        let outer = sentient_for(
+            Val(10),
+            Val(1),
+            carried(Val(0), Val(11), Val(12)),
+            vec![
+                inner.clone(),
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(22)],
+                }),
+            ],
+        );
+        let mut block = vec![constant(Val(1), 65536), constant(Val(2), 3), outer];
+        let mut preamble = Vec::new();
+        let mut vals = Values::default();
+        for _ in 0..30 {
+            let _ = vals.mint();
+        }
+
+        coalesce_loops(
+            &[ForRef(Val(10)), ForRef(Val(20))],
+            &mut Builders {
+                preamble: &mut preamble,
+                const_at: InBlock(0),
+                block: &mut block,
+                at: InBlock(2),
+                vals: &mut vals,
+            },
+            &mut ProcessedLoops::default(),
+        );
+
+        // `65536 * 3` is `6 * 32768`: the remainder is minted FIRST and goes to the outermost loop.
+        assert_eq!(
+            preamble,
+            vec![constant(Val(30), 6), constant(Val(31), 32768)]
+        );
+        let Op::Sentient(sentient::Op::For { bound, body, .. }) = &block[2] else {
+            panic!("the band's outermost loop is still a sentient.for")
+        };
+        assert_eq!(*bound, Val(30));
+        // ⭐ AND THE NEST IS STILL TWO DEEP — the split consumed the second loop, so there was none
+        // left to fuse into.
+        assert_eq!(
+            body[0],
+            sentient_for(
+                Val(20),
+                Val(31),
+                carried(Val(11), Val(21), Val(22)),
+                vec![Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(21)],
+                })]
+            )
+        );
+    }
 }
 
 /// HOW MANY LOOPS OF A BAND TO COLLECT — the `max_loops` parameter (`:78`).
@@ -299,6 +436,9 @@ struct ForView<'a> {
     bound: Val,
     carried: &'a [sentient::Carried],
     body: &'a [Op],
+    /// `dataflow::getDbgNameAttr(op)` — what `coalesceLoops` builds the band's merged name from
+    /// (`:275-281`), and `None` for a loop carrying no `dbgName`.
+    dbg_name: &'a Option<String>,
 }
 
 /// `dyn_cast<sentient::ForOp>(op)`.
@@ -308,6 +448,7 @@ fn for_view(op: &Op) -> Option<ForView<'_>> {
         bound,
         carried,
         body,
+        dbg_name,
         ..
     }) = op
     else {
@@ -318,6 +459,7 @@ fn for_view(op: &Op) -> Option<ForView<'_>> {
         bound: *bound,
         carried,
         body,
+        dbg_name,
     })
 }
 
@@ -414,10 +556,428 @@ pub(crate) fn split_bounds(new_bounds: &[TripCount]) -> Vec<SplitBound> {
         .collect()
 }
 
-// crustify:todo: e445_coalesceLoops
-//   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:135  (165 body lines, level 2)
-//   original  : void coalesceLoops(SmallVector<sentient::ForOp, 4> loops, OpBuilder &const_builder)
-//   calls     : e071_getLargestDivisor, e072_isAllLessThanMax, e252_size, e312_splitBounds
+/// THE `"processed"` MARK — `#define PROCESSED "processed"` (`:29`), which `runOnOperation` stamps on
+/// every loop of a candidate band (`:326-327`) and `coalesceLoops` takes off again (`:154`).
+///
+/// ⛔ NOT AN ISLAND FIELD: the attribute is written and erased inside this one pass, no other pass and
+/// no printer reads it, so it is this pass's own bookkeeping and stays in the pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProcessedLoops(Vec<ForRef>);
+
+impl ProcessedLoops {
+    /// `for_op->setAttr(PROCESSED, ..)` (`:327`).
+    pub(crate) fn mark(&mut self, for_op: ForRef) {
+        if !self.holds(for_op) {
+            self.0.push(for_op);
+        }
+    }
+
+    /// `op->hasAttr(PROCESSED)` (`:323`).
+    #[must_use]
+    pub(crate) fn holds(&self, for_op: ForRef) -> bool {
+        self.0.contains(&for_op)
+    }
+
+    /// `loop->removeAttr(PROCESSED)` (`:154`).
+    pub(crate) fn remove(&mut self, for_op: ForRef) {
+        self.0.retain(|held| *held != for_op);
+    }
+}
+
+/// THE TWO INSERTION POINTS `coalesceLoops` BUILDS WITH — `const_builder`, at the head of the block
+/// that holds the `dataflow.program_unit` (`:316-317`), and `builder(outermost)`, immediately before
+/// the band's outermost loop (`:145`).
+///
+/// ⛔ BOTH ARE CURSORS AND NOT FIXED INDICES. MLIR's insertion point sits after the op it just made,
+/// so consecutive `create`s land in call order and `const_builder` keeps its place ACROSS bands — one
+/// builder serves the whole unit (`:316`). And an insert before the outermost loop MOVES that loop,
+/// which is why [`Builders::at`] is maintained rather than passed again.
+pub(crate) struct Builders<'a> {
+    /// The block holding the `dataflow.program_unit` — the program preamble.
+    pub(crate) preamble: &'a mut Vec<Op>,
+    /// `const_builder`'s point in it.
+    pub(crate) const_at: InBlock,
+    /// The block holding the band.
+    pub(crate) block: &'a mut Vec<Op>,
+    /// `builder`'s point in it — which is the outermost loop's own index.
+    pub(crate) at: InBlock,
+    /// Fresh value names for everything minted here.
+    pub(crate) vals: &'a mut Values,
+}
+
+impl Builders<'_> {
+    /// `sentient::ConstantOp::create(const_builder, loc, ty, value)`.
+    fn constant(&mut self, value: TripCount, ty: ScalarTy) -> Val {
+        let result = self.vals.mint();
+        self.preamble.insert(
+            self.const_at.0,
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: value.0,
+                result,
+                reg_locale: sentient::RegType::Imm,
+                ty,
+                is_symbol: false,
+            }),
+        );
+        self.const_at.0 += 1;
+        result
+    }
+
+    /// `dcc::uniform::utils::createQueryMapFromConstants` (`Dialect/Uniform/Utils.cpp:367-380`) — one
+    /// constant per bound at the const cursor, then the mapping and the query of it before the band.
+    ///
+    /// ⛔ INDEX-TYPED, NOT THE BAND'S `const_type`: both the constants and the map are
+    /// `builder.getIndexType()` (`:373`, `Utils.cpp:355-362`), so a query-map bound comes out an index
+    /// however the constant bounds were typed.
+    fn query_map_from_constants(
+        &mut self,
+        query_map_key: Val,
+        keys: &[Val],
+        const_vals: &[TripCount],
+    ) -> Val {
+        if keys.len() != const_vals.len() {
+            panic!(
+                "DT_CHECK(keys.size() == const_vals.size()) \
+                 (dcc/src/Dialect/Uniform/Utils.cpp:371)"
+            )
+        }
+        let pairs = keys
+            .iter()
+            .zip(const_vals)
+            .map(|(key, value)| (*key, self.constant(*value, ScalarTy::Index)))
+            .collect();
+        let map = self.vals.mint();
+        let result = self.vals.mint();
+        self.block.insert(
+            self.at.0,
+            Op::Uniform(uniform::Op::DefImmutableMapping { result: map, pairs }),
+        );
+        self.block.insert(
+            self.at.0 + 1,
+            Op::Uniform(uniform::Op::QueryMap {
+                result,
+                map,
+                key: query_map_key,
+            }),
+        );
+        // ⭐ THE OUTERMOST LOOP HAS MOVED DOWN BY THE TWO OPS JUST PUT IN FRONT OF IT.
+        self.at.0 += 2;
+        result
+    }
+
+    /// The band's loop `depth` levels in, mutably — the perfect nest e311 proved, descended.
+    fn loop_at_mut(&mut self, depth: usize) -> &mut Op {
+        let Some(outermost) = self.block.get_mut(self.at.0) else {
+            panic!("`builder(outermost)`'s insertion point is the outermost loop's own index (`:145`)")
+        };
+        nested_loop_mut(outermost, depth)
+    }
+
+    /// The same loop, read-only.
+    fn loop_at(&self, depth: usize) -> &Op {
+        let Some(outermost) = self.block.get(self.at.0) else {
+            panic!("`builder(outermost)`'s insertion point is the outermost loop's own index (`:145`)")
+        };
+        let mut op = outermost;
+        for _ in 0..depth {
+            let Some(view) = for_view(op) else {
+                panic!("the band is a perfect nest of `sentient.for` ops (`:99-131`)")
+            };
+            let Some(inner) = view.body.first() else {
+                panic!("a band loop's body opens with the loop below it (`:104-108`)")
+            };
+            op = inner;
+        }
+        op
+    }
+}
+
+/// [`Builders::loop_at_mut`]'s descent, recursive so the reborrow chain is one per level.
+fn nested_loop_mut(op: &mut Op, depth: usize) -> &mut Op {
+    if depth == 0 {
+        return op;
+    }
+    let Op::Sentient(sentient::Op::For { body, .. }) = op else {
+        panic!("the band is a perfect nest of `sentient.for` ops (`:99-131`)")
+    };
+    let Some(inner) = body.first_mut() else {
+        panic!("a band loop's body opens with the loop below it (`:104-108`)")
+    };
+    nested_loop_mut(inner, depth - 1)
+}
+
+/// `outermost.setBound(new_bound_op)`.
+fn set_bound(op: &mut Op, bound: Val) {
+    let Op::Sentient(sentient::Op::For { bound: at, .. }) = op else {
+        panic!("only a `sentient.for` has a `$bound` to set (`:200`)")
+    };
+    *at = bound;
+}
+
+/// `outermost.setDbgName(new_dbg_name_attr)` (`:281`).
+fn set_dbg_name(op: &mut Op, name: String) {
+    let Op::Sentient(sentient::Op::For { dbg_name, .. }) = op else {
+        panic!("only a `sentient.for` has a `dbgName` to set (`:281`)")
+    };
+    *dbg_name = Some(name);
+}
+
+/// WHAT THE BAND'S BOUNDS MULTIPLY OUT TO — the locals `coalesceLoops`' first loop fills (`:147-194`).
+///
+/// ⭐ ONE READ PASS BEFORE ANY MUTATION, because [`Definitions`] borrows the very blocks the rest of
+/// the unit rewrites.
+struct BandBounds {
+    /// `new_bound` — the product of every `sentient.scalar_constant` bound.
+    new_bound: TripCount,
+    /// `const_type` — the type of the LAST constant bound seen (`:163`). `None` is the reference's
+    /// default-constructed, null `mlir::Type` (`:148`), which only a band with no constant bound
+    /// leaves behind.
+    const_type: Option<ScalarTy>,
+    /// `new_bounds` — one product per unit, EMPTY when no bound was a `uniform.query_map`.
+    new_bounds: Vec<TripCount>,
+    /// `bound_keys` — the unit list of the LAST query-map bound seen.
+    bound_keys: Vec<Val>,
+    /// `query_map_key` — that query map's `$key`.
+    query_map_key: Option<Val>,
+}
+
+/// The band's loops, outermost first — `loops` descended through the nest e311 proved.
+fn band_views<'a>(loops: &[ForRef], outermost: &'a Op) -> Vec<ForView<'a>> {
+    let mut views = Vec::with_capacity(loops.len());
+    let mut next = Some(outermost);
+    for for_op in loops {
+        let Some(view) = next.and_then(for_view) else {
+            panic!("the band is a perfect nest of `sentient.for` ops (`:99-131`)")
+        };
+        if view.iv != for_op.0 {
+            panic!("this band is not the nest rooted at the loop `builder` points before (`:145`)")
+        }
+        next = view.body.first();
+        views.push(view);
+    }
+    views
+}
+
+/// `coalesceLoops`' first loop (`:153-194`) — everything it reads, before anything is written.
+fn band_bounds(loops: &[ForRef], outermost: &Op, defs: Definitions<'_>) -> BandBounds {
+    let mut found = BandBounds {
+        new_bound: TripCount(1),
+        const_type: None,
+        new_bounds: Vec::new(),
+        bound_keys: Vec::new(),
+        query_map_key: None,
+    };
+    // `int num_of_const_bound = 1;` (`:150`) — 1 until a query map says how many units there are.
+    let mut num_of_const_bound = 1;
+    for view in band_views(loops, outermost) {
+        if !is_constant(view.bound, ConstKind::ScalarConstant, defs) {
+            panic!(
+                "We do not yet support coalescing of loops with non-constant bound \
+                 (`:158-162`, signalPassFailure)"
+            )
+        }
+        match defs.of(view.bound) {
+            Some(Op::Sentient(sentient::Op::ScalarConstant { value, ty, .. })) => {
+                found.new_bound.0 *= value;
+                found.const_type = Some(*ty);
+            }
+            Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })) => {
+                found.query_map_key = Some(*key);
+                found.bound_keys = dialects::uniform_mapping_keys(*key, defs);
+                let bound_values = dialects::uniform_mapping_values(*map, *key, defs);
+                // The three `DT_CHECK`s (`:173-177`): the map answers for every key it was asked
+                // about, it answers at all, and every query-map bound of the band has the same width.
+                if found.bound_keys.len() != bound_values.len() || bound_values.is_empty() {
+                    panic!("a bound query map answers for every one of its keys (`:173-175`)")
+                }
+                if num_of_const_bound != 1 && num_of_const_bound != bound_values.len() {
+                    panic!("every query-map bound of a band covers the same units (`:176-177`)")
+                }
+                num_of_const_bound = bound_values.len();
+                if found.new_bounds.is_empty() {
+                    found.new_bounds = vec![TripCount(1); num_of_const_bound];
+                }
+                for (product, value) in found.new_bounds.iter_mut().zip(&bound_values) {
+                    let Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) =
+                        defs.of(*value)
+                    else {
+                        panic!("All values of query map has to be constants (`:184-187`)")
+                    };
+                    product.0 *= value;
+                }
+            }
+            // ⛔ NO `else` IN THE REFERENCE'S CHAIN (`:163-190`), and the refusal just above is why it
+            // needs none: a bound `isConstant` answered for is one of these two ops.
+            _ => {}
+        }
+    }
+    // `if (new_bounds.size() != 0) for (auto &bound : new_bounds) bound *= new_bound;` (`:192-194`).
+    for bound in &mut found.new_bounds {
+        bound.0 *= found.new_bound.0;
+    }
+    found
+}
+
+/// Replaces: e445_coalesceLoops
+///
+/// Fuses a perfectly nested band into its outermost loop: that loop's bound becomes the product of the
+/// band's, split across the outer TWO loops when one loop-control register cannot hold it, and the
+/// innermost body moves up in place of the loop below.
+///
+/// ⛔ THE SPLIT PAIR IS ORDERED THE OTHER WAY IN THE TWO BRANCHES — a constant bound gives the outermost
+/// the COFACTOR and the second the fitting divisor (`:211-217`), a query-map bound gives the outermost
+/// the FITTING one (`:257-259`). ⭐ AND A SPLIT MAKES `loops[1]` THE NEW OUTERMOST (`:219-225`), so a
+/// band of exactly two is already coalesced and returns there.
+/// ⛔ AN UNNAMED LOOP ANYWHERE IN THE BAND LEAVES THE OUTERMOST'S OWN `dbgName` ALONE (`:279-281`).
+pub(crate) fn coalesce_loops(
+    loops: &[ForRef],
+    builders: &mut Builders<'_>,
+    processed: &mut ProcessedLoops,
+) {
+    // `DT_CHECK(loops.size() > 1)` (`:139`) — the caller returns on `loops.size() < 2` (`:325`).
+    if loops.len() < 2 {
+        panic!("coalesceLoops is given a band of at least two loops (`:139`, `:325`)")
+    }
+    for for_op in loops {
+        processed.remove(*for_op);
+    }
+
+    let bounds = {
+        let scopes: [&[Op]; 2] = [&*builders.block, &*builders.preamble];
+        let defs = Definitions::from_innermost(&scopes);
+        band_bounds(loops, builders.loop_at(0), defs)
+    };
+
+    let innermost = loops.len() - 1;
+    let mut outermost = 0;
+    let mut second = 1;
+
+    if bounds.new_bounds.is_empty() {
+        let Some(const_type) = bounds.const_type else {
+            panic!("a band with no query-map bound has a constant one, so `const_type` is set (`:163`)")
+        };
+        // 2. Assign the newly calculated bound to the outermost loop (`:196-202`).
+        if bounds.new_bound.0 <= TripLimit::LCCR.0 {
+            let new_bound = builders.constant(bounds.new_bound, const_type);
+            set_bound(builders.loop_at_mut(outermost), new_bound);
+        } else {
+            if bounds.new_bound.0 >= TripLimit::LCCR_SQUARED.0 {
+                panic!("Currently we only support splitting into 2 loops (`:203-208`)")
+            }
+            let LargestDivisor::Fits(outer_bound) =
+                get_largest_divisor(bounds.new_bound, TripLimit::LCCR)
+            else {
+                todo!("DT_ERROR(\"No valid prime factor but input still too large!\") (`:400`)")
+            };
+            let remainder = TripCount(bounds.new_bound.0 / outer_bound.0);
+            let new_bound_outer = builders.constant(remainder, const_type);
+            let new_bound_second = builders.constant(outer_bound, const_type);
+            set_bound(builders.loop_at_mut(outermost), new_bound_outer);
+            set_bound(builders.loop_at_mut(second), new_bound_second);
+            outermost = second;
+            if loops.len() > 2 {
+                second = 2;
+            } else {
+                return;
+            }
+        }
+    } else {
+        let Some(query_map_key) = bounds.query_map_key else {
+            panic!("a non-empty `new_bounds` was filled by a query-map bound, which has a key (`:167`)")
+        };
+        if is_all_less_than_max(&bounds.new_bounds, TripLimit::LCCR) {
+            let new_bound = builders.query_map_from_constants(
+                query_map_key,
+                &bounds.bound_keys,
+                &bounds.new_bounds,
+            );
+            set_bound(builders.loop_at_mut(outermost), new_bound);
+        } else {
+            if !is_all_less_than_max(&bounds.new_bounds, TripLimit::LCCR_SQUARED) {
+                panic!("Currently we only support splitting into 2 loops (`:239-244`)")
+            }
+            let split = split_bounds(&bounds.new_bounds);
+            let fitting: Vec<TripCount> = split.iter().map(|bound| bound.fitting).collect();
+            let cofactors: Vec<TripCount> = split.iter().map(|bound| bound.cofactor).collect();
+            let new_bound0 =
+                builders.query_map_from_constants(query_map_key, &bounds.bound_keys, &fitting);
+            let new_bound1 =
+                builders.query_map_from_constants(query_map_key, &bounds.bound_keys, &cofactors);
+            set_bound(builders.loop_at_mut(outermost), new_bound0);
+            set_bound(builders.loop_at_mut(second), new_bound1);
+            outermost = second;
+            if loops.len() > 2 {
+                second = 2;
+            } else {
+                return;
+            }
+        }
+    }
+
+    if outermost == innermost {
+        return;
+    }
+
+    // `getNewDbgNameFromList("LC(", loop_op_list)` over the WHOLE original band (`:275-281`).
+    let dbg_names: Vec<Option<String>> = band_views(loops, builders.loop_at(0))
+        .iter()
+        .map(|view| view.dbg_name.clone())
+        .collect();
+    let borrowed: Vec<Option<&str>> = dbg_names.iter().map(Option::as_deref).collect();
+    if let Some((first, rest)) = borrowed.split_first()
+        && let Some(name) = new_dbg_name_from_list(DbgNamePrefix::Lc, *first, rest)
+    {
+        set_dbg_name(builders.loop_at_mut(outermost), name);
+    }
+
+    // 3. Move the innermost's operations up, drop its terminator and the second-outermost loop
+    // (`:283-299`).
+    let outer_args: Vec<Val> = carried_of(builders.loop_at(outermost))
+        .iter()
+        .map(|carried| carried.arg)
+        .collect();
+    let inner_args: Vec<Val> = carried_of(builders.loop_at(innermost))
+        .iter()
+        .map(|carried| carried.arg)
+        .collect();
+    let second_results: Vec<Val> = carried_of(builders.loop_at(second))
+        .iter()
+        .map(|carried| carried.result)
+        .collect();
+
+    let (moved, ret_values) = {
+        let Op::Sentient(sentient::Op::For { body, .. }) = builders.loop_at_mut(innermost) else {
+            panic!("the band is a perfect nest of `sentient.for` ops (`:99-131`)")
+        };
+        for (of, with) in inner_args.iter().zip(&outer_args) {
+            dialects::replace_all_uses_with(body, *of, *with);
+        }
+        let Some(Op::Sentient(sentient::Op::Yield { results })) = body.last() else {
+            panic!("a `sentient.for` body ends in the `sentient.yield` this reads (`:290`)")
+        };
+        let ret_values = results.clone();
+        body.pop();
+        (core::mem::take(body), ret_values)
+    };
+
+    let Op::Sentient(sentient::Op::For { body, .. }) = builders.loop_at_mut(outermost) else {
+        panic!("the band is a perfect nest of `sentient.for` ops (`:99-131`)")
+    };
+    for (of, with) in second_results.iter().zip(&ret_values) {
+        dialects::replace_all_uses_with(body, *of, *with);
+    }
+    // ⭐ THE SPLICE AND THE `second.erase()` IN ONE (`:294-299`): `second` is the head of this body —
+    // that is what makes the nest perfect — so the innermost's ops go exactly where it was.
+    body.splice(0..1, moved);
+}
+
+/// `for_op.getRegionIterArgs()` / `.getResults()`, whichever the caller reads.
+fn carried_of(op: &Op) -> &[sentient::Carried] {
+    let Op::Sentient(sentient::Op::For { carried, .. }) = op else {
+        panic!("only a `sentient.for` carries iteration arguments (`:285-287`)")
+    };
+    carried
+}
 
 // crustify:todo: e563_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:302  (74 body lines, level 4)

@@ -79,12 +79,6 @@
 //! | `e303_runOn` | 303 | 1 | 8 | `dcc/src/Transform/Sentient/LexicalOrdering.cpp:203` |
 //! | `e439_runOnOperation` | 439 | 2 | 12 | `dcc/src/Transform/Sentient/LexicalOrdering.cpp:99` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from
-// this file's own tests until `e439_runOnOperation` lands and something calls it. CI runs clippy with
-// `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e439_runOnOperation`: at that point an unused item here is a real defect again.
-#![allow(dead_code)]
-
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects as lower;
 use crate::islands::dataflow_ir::dialects::{dataflow, uniform};
@@ -585,15 +579,84 @@ pub(crate) fn run_on_module<A: Arch, M: Model, W: Workload>(run: &mut Run<A, M, 
     }
 }
 
-// crustify:todo: e439_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LexicalOrdering.cpp:99  (12 body lines, level 2)
-//   original  : void runOnOperation()
-//   calls     : e051_runOn, e303_runOn
+/// `-dcc-lexical-ordering-disable`, `cl::init(false)` (`LexicalOrdering.cpp:40-42`).
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e439_runOnOperation
+///
+/// The pass: sort every `uniform.def_immutable_mapping`'s pairs, then hoist the constants.
+///
+/// ⭐ ONE SWEEP IS THE GREEDY FIXPOINT — [`order_mapping_keys_lexically`] leaves the op sorted, so a
+/// second application answers [`Reordered::AlreadySorted`]; and a pattern that never signals failure
+/// cannot fail the driver, so `signalPassFailure()` (`:107`) is unreachable.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(run: &mut Run<A, M, W>) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for program in &mut run.programs {
+        order_every_mapping(program);
+    }
+    run_on_module(run);
+}
+
+/// `applyPatternsGreedily` OVER ONE PROGRAM, READ THEN WRITE: a mapping's keys are `dataflow.get_unit`
+/// results in the preamble, which is one of the scopes the sort then writes into.
+fn order_every_mapping<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    let mut sorted: Vec<(Val, Vec<(Val, Val)>)> = Vec::new();
+    {
+        let preamble: &[Op] = &program.preamble;
+        sortings_of(preamble, &[preamble], &mut sorted);
+        for unit in program.units.iter() {
+            let enclosing: [&[Op]; 2] = [&unit.body, preamble];
+            sortings_of(&unit.body, &enclosing, &mut sorted);
+        }
+    }
+    if sorted.is_empty() {
+        return;
+    }
+    reorder_mappings(&mut program.preamble, &sorted);
+    for unit in program.units.iter_mut() {
+        reorder_mappings(&mut unit.body, &sorted);
+    }
+}
+
+/// The read half: the pairs each mapping in `scope` wants, by the [`Val`] it binds.
+fn sortings_of(scope: &[Op], enclosing: &[&[Op]], sorted: &mut Vec<(Val, Vec<(Val, Val)>)>) {
+    let defs = Definitions::from_innermost(enclosing);
+    for op in scope {
+        if let Op::Uniform(uniform::Op::DefImmutableMapping { result, .. }) = op {
+            let mut candidate = op.clone();
+            if order_mapping_keys_lexically(&mut candidate, defs) == Reordered::Sorted
+                && let Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. }) = candidate
+            {
+                sorted.push((*result, pairs));
+            }
+        }
+        for region in dialects::regions_ref(op) {
+            sortings_of(region, enclosing, sorted);
+        }
+    }
+}
+
+/// The write half of [`order_every_mapping`].
+fn reorder_mappings(scope: &mut [Op], sorted: &[(Val, Vec<(Val, Val)>)]) {
+    for op in scope {
+        if let Op::Uniform(uniform::Op::DefImmutableMapping { result, pairs }) = op
+            && let Some((_, ordered)) = sorted.iter().find(|(val, _)| val == result)
+        {
+            *pairs = ordered.clone();
+        }
+        for region in dialects::regions_mut(op) {
+            reorder_mappings(region, sorted);
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        Definitions, Reordered, order_mapping_keys_lexically, run_on_module, run_on_program,
+        Definitions, Reordered, order_mapping_keys_lexically, run_on_module, run_on_operation,
+        run_on_program,
     };
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
@@ -787,5 +850,42 @@ mod unit_tests {
 
         assert_eq!(run.programs[0].preamble, vec![index_const(1, 5)]);
         assert_eq!(run.programs[1].preamble, vec![scalar_const(3, 7)]);
+    }
+
+    /// e439 — both halves run: the unit body's mapping comes out sorted against the
+    /// `dataflow.get_unit`s of the preamble, and then the body's constant is hoisted out of it.
+    #[test]
+    fn the_pass_orders_every_mapping_and_then_hoists() {
+        let mut run = Run {
+            kernel: KernelName(GroupId(0)),
+            programs: vec![program_of(
+                vec![
+                    get_unit(1, DfirUnit::Sfp, corelet(0, 1)),
+                    get_unit(2, DfirUnit::Lxlu, corelet(0, 0)),
+                ],
+                vec![
+                    Op::Uniform(uniform::Op::DefImmutableMapping {
+                        result: Val(10),
+                        pairs: vec![(Val(1), Val(20)), (Val(2), Val(21))],
+                    }),
+                    index_const(3, 5),
+                ],
+            )],
+        };
+
+        run_on_operation(&mut run);
+
+        assert_eq!(
+            run.programs[0]
+                .units
+                .iter()
+                .next()
+                .map(|unit| unit.body.clone()),
+            Some(vec![Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(10),
+                pairs: vec![(Val(2), Val(21)), (Val(1), Val(20))],
+            })])
+        );
+        assert_eq!(run.programs[0].preamble[0], index_const(3, 5));
     }
 }

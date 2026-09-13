@@ -2783,6 +2783,7 @@ mod unit_tests {
                     body: vec![load_and_store(1, 3, 4, 6)],
                 }],
                 results: Vec::new(),
+                yielded: Vec::new(),
             })],
         })];
         let mut values = Values::default();
