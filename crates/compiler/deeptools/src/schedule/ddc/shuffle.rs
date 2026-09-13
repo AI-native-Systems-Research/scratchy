@@ -175,7 +175,7 @@
 
 use crate::arch::{Arch, Sticks};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{PrimaryDim, StickDims};
-use crate::formats::DataFormat;
+use crate::formats::{Bits, DataFormat};
 use crate::schedule::ddc::fold::AllocId;
 use crate::schedule::ddc::metadata::OwnedAllocateNode;
 use crate::schedule::dsc2::{ComputeNode, DataInfo};
@@ -1180,6 +1180,39 @@ impl Pack24Action {
         output.slice_dims[SliceDim::Bit64.index()] = DimSymbol::DUMMY;
         output
     }
+
+    /// Replaces: e318_add_valid_actions
+    ///
+    /// OFFERS A `pack24` PER STICK DIMENSION when the format is wider than two bits, the 2-, 4- and
+    /// 8-bit slots are all dummies, and the 16-bit slot is a dummy or already holds the dimension the
+    /// goal wants in its 2-bit slot (`shuffle.cpp:548-570`).
+    ///
+    /// ⛔ THAT LAST TEST IS CROSS-SLOT — the INPUT'S 16-BIT slot against the GOAL'S 2-BIT slot —
+    /// because [`Self::act`] slides that dimension three places down into the 2-bit slot, and the
+    /// reference's own TODO says why: the instruction set cannot recover a 2- or 4-bit dimension, so
+    /// this may only place one that is already final. ⛔ THE 32-BIT SLOT, WHICH LANDS AT THE 4-BIT
+    /// SLOT, IS NOT CHECKED THE SAME WAY — carried as the reference has it.
+    pub fn add_valid_actions(
+        actions: &mut ActionList,
+        input: &AbstractLayout,
+        goal: &AbstractLayout,
+    ) {
+        let bottom_slots_free = [SliceDim::Bit2, SliceDim::Bit4, SliceDim::Bit8]
+            .into_iter()
+            .all(|slot| input.slice_dim(slot).is_dummy());
+        let displaced = input.slice_dim(SliceDim::Bit16);
+        let can_pack = input.format.bits() > Bits(2)
+            && bottom_slots_free
+            && (displaced == goal.slice_dim(SliceDim::Bit2) || displaced.is_dummy());
+        if can_pack {
+            actions.extend(
+                input
+                    .stick_dims
+                    .iter()
+                    .map(|stick| ShuffleAction::Pack24(Self::new(*stick))),
+            );
+        }
+    }
 }
 
 /// THE `gcvt` PACK — the one action family that CHANGES THE FORMAT, converting fp16 sticks to the
@@ -1241,6 +1274,32 @@ impl GCVTF16F8PackAction {
         output.slice_dims[SliceDim::Bit64.index()] = self.dim;
         output
     }
+
+    /// Replaces: e319_add_valid_actions
+    ///
+    /// OFFERS A `gcvt` PACK PER STICK DIMENSION when [`Self::out_format`] accepts the input/goal
+    /// format pair and the 8-bit slot is a dummy (`shuffle.cpp:607-616`).
+    ///
+    /// ⛔ THE DUMMY TEST IS ON THE SLOT [`Self::act`] ERASES, not on the 64-bit slot it fills: the
+    /// slide would otherwise drop a live 8-bit dimension the instruction set cannot recover.
+    /// ⛔ IT ASKS ONLY WHETHER A FORMAT EXISTS, never applying it — `get_shuffle` (e362) asks
+    /// `out_format` again and writes the answer onto the neighbour layout (`shuffle.cpp:1196-1199`).
+    pub fn add_valid_actions(
+        actions: &mut ActionList,
+        input: &AbstractLayout,
+        goal: &AbstractLayout,
+    ) {
+        if Self::out_format(input.format, goal).is_some()
+            && input.slice_dim(SliceDim::Bit8).is_dummy()
+        {
+            actions.extend(
+                input
+                    .stick_dims
+                    .iter()
+                    .map(|stick| ShuffleAction::GcvtF16F8Pack(Self::new(*stick))),
+            );
+        }
+    }
 }
 
 // ═══ e153..e160 — THE GCVT MERGE, THE MEMOISED GRAPH AND ITS WORKLIST ════════════════════════════
@@ -1299,7 +1358,68 @@ impl GCVTF16F8MergeAction {
         output.slice_dims[SliceDim::Bit8.index()] = self.dim;
         output
     }
+
+    /// Replaces: e320_add_valid_actions
+    ///
+    /// OFFERS A `gcvt` MERGE PER STICK DIMENSION when [`Self::out_format`] accepts the input/goal
+    /// format pair and the 8-bit slot is a dummy (`shuffle.cpp:653-662`).
+    ///
+    /// ⛔ CHARACTER-FOR-CHARACTER THE PACK'S GUARD (`GCVTF16F8PackAction::add_valid_actions`, e319),
+    /// so for any layout the two offers arrive TOGETHER, one pair per stick dimension — and they are
+    /// different actions: [`Self::act`] OVERWRITES the 8-bit slot where the pack's erases it and
+    /// slides. The dummy test is what makes that overwrite lose nothing.
+    pub fn add_valid_actions(
+        actions: &mut ActionList,
+        input: &AbstractLayout,
+        goal: &AbstractLayout,
+    ) {
+        if Self::out_format(input.format, goal).is_some()
+            && input.slice_dim(SliceDim::Bit8).is_dummy()
+        {
+            actions.extend(
+                input
+                    .stick_dims
+                    .iter()
+                    .map(|stick| ShuffleAction::GcvtF16F8Merge(Self::new(*stick))),
+            );
+        }
+    }
 }
+
+/// THE ACTION FAMILY AS ONE TYPE — `std::shared_ptr<ShuffleAction>` (`shuffle.h:225`), whose eight
+/// subclasses are exactly the eight offers `get_legal_transforms` (e343) concatenates into one list
+/// (`shuffle.cpp:1147-1159`).
+///
+/// ⛔ AN ENUM, NOT A `dyn` TRAIT, BECAUSE THE SET IS CLOSED: the reference dispatches its virtuals
+/// over these eight and nothing else, and `get_legal_transforms` needs them as ONE element type.
+/// ⛔ ALL EIGHT VARIANTS ARE DECLARED, THREE OF THE OFFERS ARE PORTED. e310, e312, e314, e316 and
+/// e317 still carry their anchors below, so a variant nothing constructs yet is UNFILLED WORK, not
+/// a dead arm — and the per-variant `act`/`cost`/`out_format` dispatch is e362's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShuffleAction {
+    /// `MergeAction` (`shuffle.cpp:207`).
+    Merge(MergeAction),
+    /// `PackAction` (`shuffle.cpp:322`).
+    Pack(PackAction),
+    /// `ShiftLeftAction` (`shuffle.cpp:385`).
+    ShiftLeft(ShiftLeftAction),
+    /// `Pack8Action` (`shuffle.cpp:446`).
+    Pack8(Pack8Action),
+    /// `Pack9Action` (`shuffle.cpp:496`).
+    Pack9(Pack9Action),
+    /// `Pack24Action` (`shuffle.cpp:543`).
+    Pack24(Pack24Action),
+    /// `GCVTF16F8PackAction` (`shuffle.cpp:593`).
+    GcvtF16F8Pack(GCVTF16F8PackAction),
+    /// `GCVTF16F8MergeAction` (`shuffle.cpp:639`).
+    GcvtF16F8Merge(GCVTF16F8MergeAction),
+}
+
+/// THE OFFERS COLLECTED FOR ONE LAYOUT — `using ActionList = std::vector<...>` (`shuffle.cpp:14`).
+///
+/// ⛔ EVERY `add_valid_actions` APPENDS AND NONE CLEARS: the eight run in sequence on the same list
+/// (`shuffle.cpp:1149-1157`), so an offer that replaced the list would silently drop the others.
+pub type ActionList = Vec<ShuffleAction>;
 
 /// WHICH NODE OF THE SHUFFLE GRAPH — an index into [`AutoShuffler`]'s arena, standing in for the
 /// reference's `std::shared_ptr<GraphNode>` (`shuffle.h:264`).
@@ -2085,27 +2205,6 @@ impl DataEdge {
 //   original  : static void add_valid_actions(ActionList& actions, const AbstractLayout& input, const AbstractLayout& goal)
 //   extract   : crustify-ddc/cpp/ddc.cpp:11682-11701
 //   calls     : e232_reset
-
-// crustify:todo: e318_add_valid_actions
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:548  (20 body lines, level 2)
-//   class     : Pack24Action
-//   original  : static void add_valid_actions(ActionList& actions, const AbstractLayout& input, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:11711-11733
-//   calls     : e232_reset
-
-// crustify:todo: e319_add_valid_actions
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:607  (8 body lines, level 2)
-//   class     : GCVTF16F8PackAction
-//   original  : static void add_valid_actions(ActionList& actions, const AbstractLayout& input, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:11743-11753
-//   calls     : e152__out_format, e154__out_format, e232_reset
-
-// crustify:todo: e320_add_valid_actions
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:653  (8 body lines, level 2)
-//   class     : GCVTF16F8MergeAction
-//   original  : static void add_valid_actions(ActionList& actions, const AbstractLayout& input, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:11763-11773
-//   calls     : e152__out_format, e154__out_format, e232_reset
 
 // crustify:todo: e342_codegen_generic
 //   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:910  (123 body lines, level 3)
@@ -3178,5 +3277,134 @@ mod tests_e264_e270 {
                 .is_none(),
             "not a power of two"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_e318_e320 {
+    use super::{
+        AbstractLayout, DIMS_PER_SLICE, DimSymbol, GCVTF16F8MergeAction, GCVTF16F8PackAction,
+        Pack24Action, ShuffleAction,
+    };
+    use crate::formats::DataFormat;
+
+    /// The symbol with this id; `0` is the dummy, as the reference numbers them.
+    fn sym(id: i32) -> DimSymbol {
+        let mut symbol = DimSymbol::DUMMY;
+        for _ in 0..id {
+            symbol = symbol.next();
+        }
+        symbol
+    }
+
+    /// A layout from slice symbol ids (2-bit slot first), stick symbol ids, and a format.
+    fn layout(slice: [i32; DIMS_PER_SLICE], sticks: &[i32], format: DataFormat) -> AbstractLayout {
+        AbstractLayout::new(
+            sticks.iter().copied().map(sym).collect(),
+            slice.map(sym),
+            format,
+        )
+    }
+
+    /// The stick dimension each offered `pack24` carries, in offer order.
+    fn pack24_dims(actions: &[ShuffleAction]) -> Vec<i32> {
+        actions
+            .iter()
+            .map(|action| match action {
+                ShuffleAction::Pack24(pack) => pack.dim().id(),
+                other => panic!("not a pack24: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// e318 — one offer per stick dimension when the bottom three slots are free and the 16-bit slot
+    /// is final, and each of the four guards refuses on its own.
+    #[test]
+    fn pack24_is_offered_per_stick_only_when_the_bottom_of_the_slice_is_free() {
+        // 2-, 4- and 8-bit dummies; the 16-bit slot holds symbol 4, which is the goal's 2-bit dim.
+        let input = layout([0, 0, 0, 4, 5, 6], &[7, 9, 8], DataFormat::Senint8);
+        let goal = layout([4, 0, 0, 0, 0, 0], &[], DataFormat::Senint8);
+
+        let mut actions = Vec::new();
+        Pack24Action::add_valid_actions(&mut actions, &input, &goal);
+        assert_eq!(
+            pack24_dims(&actions),
+            [7, 8, 9],
+            "one per stick dimension, in stick-symbol order"
+        );
+
+        // The list is APPENDED to, never replaced.
+        Pack24Action::add_valid_actions(&mut actions, &input, &goal);
+        assert_eq!(actions.len(), 6, "the second call appends");
+
+        let refused = |input: &AbstractLayout, goal: &AbstractLayout, why: &str| {
+            let mut actions = Vec::new();
+            Pack24Action::add_valid_actions(&mut actions, input, goal);
+            assert!(actions.is_empty(), "{why}");
+        };
+        refused(
+            &layout([0, 0, 0, 4, 5, 6], &[7], DataFormat::Senint2),
+            &goal,
+            "a two-bit format is not wider than two bits",
+        );
+        for occupied in 0..3 {
+            let mut slice = [0, 0, 0, 4, 5, 6];
+            slice[occupied] = 3;
+            refused(
+                &layout(slice, &[7], DataFormat::Senint8),
+                &goal,
+                "a live dimension in one of the three slots pack24 drops",
+            );
+        }
+        refused(
+            &layout([0, 0, 0, 4, 5, 6], &[7], DataFormat::Senint8),
+            &layout([5, 0, 0, 0, 0, 0], &[], DataFormat::Senint8),
+            "the 16-bit dimension is not the one the goal wants at its 2-bit slot",
+        );
+    }
+
+    /// e319/e320 — the two `gcvt` guards are the same predicate, so both offers arrive together, one
+    /// pair per stick dimension; and each refuses on the format pair and on a live 8-bit slot.
+    #[test]
+    fn the_two_gcvt_offers_arrive_together_per_stick() {
+        let input = layout([1, 2, 0, 4, 5, 6], &[7, 8], DataFormat::Sen169Fp16);
+        let goal = layout([0; DIMS_PER_SLICE], &[], DataFormat::Sen143Fp8);
+
+        let mut actions = Vec::new();
+        GCVTF16F8PackAction::add_valid_actions(&mut actions, &input, &goal);
+        GCVTF16F8MergeAction::add_valid_actions(&mut actions, &input, &goal);
+        assert_eq!(
+            actions,
+            [
+                ShuffleAction::GcvtF16F8Pack(GCVTF16F8PackAction::new(sym(7))),
+                ShuffleAction::GcvtF16F8Pack(GCVTF16F8PackAction::new(sym(8))),
+                ShuffleAction::GcvtF16F8Merge(GCVTF16F8MergeAction::new(sym(7))),
+                ShuffleAction::GcvtF16F8Merge(GCVTF16F8MergeAction::new(sym(8))),
+            ],
+            "a pack and a merge for each stick dimension, packs first"
+        );
+
+        for (case, input, goal) in [
+            (
+                "the input is not an fp16",
+                layout([1, 2, 0, 4, 5, 6], &[7], DataFormat::IeeeFp32),
+                goal.clone(),
+            ),
+            (
+                "the goal is not an fp8",
+                layout([1, 2, 0, 4, 5, 6], &[7], DataFormat::Sen169Fp16),
+                layout([0; DIMS_PER_SLICE], &[], DataFormat::Sen169Fp16),
+            ),
+            (
+                "the 8-bit slot holds a live dimension",
+                layout([1, 2, 3, 4, 5, 6], &[7], DataFormat::Sen169Fp16),
+                goal.clone(),
+            ),
+        ] {
+            let mut actions = Vec::new();
+            GCVTF16F8PackAction::add_valid_actions(&mut actions, &input, &goal);
+            GCVTF16F8MergeAction::add_valid_actions(&mut actions, &input, &goal);
+            assert!(actions.is_empty(), "{case}");
+        }
     }
 }
