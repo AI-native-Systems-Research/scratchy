@@ -3753,7 +3753,7 @@ mod tests_e078_e085 {
     use crate::generated::{ComputeType, DataConnect};
     use crate::schedule::dsc2::{
         AllocLayout, AllocPlacement, AllocateNode, DataInfo, Dsts, FoldPosition, InstrAttribute,
-        LayoutDims, MaxDimSize, NodeName, ReplicationFactor, StartAddress,
+        LayoutDims, MaxDimSize, NodeName, ReplicationFactor, StartAddress, TransferPadding,
     };
     use crate::units::NumFolds;
 
@@ -3839,6 +3839,9 @@ mod tests_e078_e085 {
     #[test]
     fn a_transfer_line_carries_one_source_and_every_destination() {
         let node = TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
             name: NodeName("t0".to_owned()),
             src: operand(SenComponent::Hbm, None, None),
             dsts: Dsts::new(
@@ -3949,6 +3952,9 @@ mod tests_e078_e085 {
             instr_attribute: InstrAttribute::default(),
         };
         let transfer = TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
             name: NodeName("t0".to_owned()),
             src: operand(SenComponent::Hbm, None, None),
             dsts: Dsts::new(operand(SenComponent::L0, None, None), vec![]),

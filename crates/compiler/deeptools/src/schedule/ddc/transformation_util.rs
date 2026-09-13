@@ -2360,7 +2360,7 @@ mod tests_e110_e117 {
     use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::{ConstIdx, DataStream};
     use crate::schedule::dsc2::{
-        DataInfo, Dsts, InstrAttribute, LayoutDims, Operand, ReplicationFactor,
+        DataInfo, Dsts, InstrAttribute, LayoutDims, Operand, ReplicationFactor, TransferPadding,
     };
     use crate::units::{DfirUnit, NumFolds};
 
@@ -2788,6 +2788,9 @@ mod tests_e110_e117 {
     #[test]
     fn a_transfer_and_a_compute_carry_their_data_connects_and_any_other_kind_is_just_its_name() {
         let transfer = TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
             name: NodeName("t0".to_string()),
             src: operand(Some(DataConnect::ArfPt)),
             dsts: Dsts::new(operand(Some(DataConnect::ArfPtsum)), vec![operand(None)]),
@@ -3202,7 +3205,9 @@ mod tests_e247_e254 {
 
     use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::DataStream;
-    use crate::schedule::dsc2::{Dsts, InstrAttribute, LayoutDims, ReplicationFactor};
+    use crate::schedule::dsc2::{
+        Dsts, InstrAttribute, LayoutDims, ReplicationFactor, TransferPadding,
+    };
     use crate::schedule::l3::dsc::{Granularity, MaxSize};
     use crate::units::{DfirUnit, NumFolds};
 
@@ -3719,6 +3724,9 @@ mod tests_e247_e254 {
 
     fn transfer_node(name: &str, src: Operand, dsts: Dsts) -> TransferNode {
         TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
             name: NodeName(name.to_string()),
             src,
             dsts,

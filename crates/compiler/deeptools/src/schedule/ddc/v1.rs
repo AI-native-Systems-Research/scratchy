@@ -3567,7 +3567,7 @@ mod tests_e132_e136 {
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
     use crate::schedule::dsc2::{
-        DataInfo, Dsts, InstrAttribute, NodeName, Operand, ReplicationFactor,
+        DataInfo, Dsts, InstrAttribute, NodeName, Operand, ReplicationFactor, TransferPadding,
     };
     use crate::units::NumFolds;
 
@@ -3651,6 +3651,9 @@ mod tests_e132_e136 {
                 (SenComponent::L0lu, SenComponent::Ptrow3)
             };
             TransferNode {
+                padding: TransferPadding::default(),
+                src_indirect: None,
+                dst_indirect: None,
                 name: NodeName("t".to_owned()),
                 src: operand(src, Some(0)),
                 dsts: Dsts::new(operand(dst, Some(0)), Vec::new()),
@@ -3898,6 +3901,7 @@ mod tests_e124_e131 {
         AllocLayout, AllocPlacement, AllocateNode, ComputeNode, Coordinate, CoordinateCategory,
         DataInfo, Dsc, Dsts, FoldCardinality, FoldCoeff, FoldLabel, InstrAttribute, LayoutDims,
         LdsIdx, MaxDimSize, NodeName, Operand, ReplicationFactor, StartAddress, TransferNode,
+        TransferPadding,
     };
     use crate::units::NumFolds;
 
@@ -4073,6 +4077,9 @@ mod tests_e124_e131 {
     #[test]
     fn e126_splats_a_constant_source_one_element_at_a_time() {
         let mut transfer = TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
             name: NodeName("t".to_owned()),
             src: operand(SenComponent::Constant),
             dsts: Dsts::new(operand(SenComponent::Lxlu), Vec::new()),
@@ -4102,6 +4109,9 @@ mod tests_e124_e131 {
     #[test]
     fn e126_replicates_a_constant_to_constant_transfer_across_the_stick() {
         let mut transfer = TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
             name: NodeName("t".to_owned()),
             src: operand(SenComponent::Constant),
             dsts: Dsts::new(operand(SenComponent::Constant), Vec::new()),
@@ -4335,6 +4345,7 @@ mod tests_e258_e263 {
     use crate::schedule::ddc::metadata::Allocation;
     use crate::schedule::dsc2::{
         AllocLayout, AllocPlacement, DataInfo, Dsts, SyncDirection, SyncStrength, SyncUnits,
+        TransferPadding,
     };
 
     /// The one core and the two corelets a `Dd2` core has.
@@ -4907,6 +4918,9 @@ mod tests_e258_e263 {
         node.start_address.insert(core0(), cl0(), Bytes(0x200));
         let allocs = AllocArena::from([(AllocId(0), node)]);
         let transfer = TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
             name: NodeName("t".to_owned()),
             src: operand(SenComponent::Lxlu, SenComponent::Lx, Some(0)),
             dsts: Dsts::new(
@@ -4974,6 +4988,9 @@ mod tests_e258_e263 {
             transfers: BTreeMap::from([(
                 NodeId(0),
                 TransferNode {
+                    padding: TransferPadding::default(),
+                    src_indirect: None,
+                    dst_indirect: None,
                     name: NodeName("t".to_owned()),
                     src: operand(SenComponent::Lxlu, SenComponent::Lx, Some(0)),
                     dsts: Dsts::new(

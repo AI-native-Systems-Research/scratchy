@@ -405,6 +405,17 @@ impl Dsts {
         &self.first
     }
 
+    /// `dstVias_.front()` AS AN L-VALUE — the end entries 221 and 227 rewrite in place.
+    pub const fn first_mut(&mut self) -> &mut Operand {
+        &mut self.first
+    }
+
+    /// `dstVias_.size()`.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.rest.len() + 1
+    }
+
     /// Every destination in order.
     pub fn iter(&self) -> impl Iterator<Item = &Operand> {
         core::iter::once(&self.first).chain(self.rest.iter())
@@ -502,11 +513,15 @@ pub enum AddressFold {
 /// in the authority tree sets `coord[0] = core`, `coord[1] = cl` and leaves the rest at zero
 /// (`ddc/ddcv1.cpp:344-350`, `:2005-2011`), so those two axes ARE the key and the deque is the
 /// mechanism for reaching it.
+///
+/// ⭐ ONE `(core, corelet)` MAY HOLD SEVERAL ADDRESSES, and that is entry 222: the L3 scheduler places
+/// each execution phase separately and spreads the resulting list over the REMAINING fold coordinates
+/// of that `(core, corelet)` (`L3DlOpsScheduler.cpp:4249-4262`), one address per coordinate.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StartAddress {
     folds: FoldDim,
     func_types: Vec<AddressFold>,
-    placed: BTreeMap<Core, BTreeMap<Corelet, Bytes>>,
+    placed: BTreeMap<Core, BTreeMap<Corelet, Vec<Bytes>>>,
 }
 
 impl StartAddress {
@@ -533,9 +548,25 @@ impl StartAddress {
     }
 
     /// `buildFoldSpace(foldProps, foldTypes)` (`ddc/ddcv1.cpp:339`) — `depth` axes, of which only the
-    /// core and the corelet are ever anything but [`AddressFold::Constant`].
+    /// core and the corelet are anything but [`AddressFold::Constant`].
     pub fn build_fold_space(&mut self, depth: usize, core: AddressFold, corelet: AddressFold) {
-        self.func_types = vec![AddressFold::Constant; depth];
+        self.build_fold_space_spread(depth, AddressFold::Constant, core, corelet);
+    }
+
+    /// `buildFoldSpace(foldProps, foldTypes(size, defaultFold))` (`l3/l3.cpp:4249`) — the same axes,
+    /// laid out over a `default` the L3 sets to [`AddressFold::Map`] when one allocation's addresses
+    /// differ from coordinate to coordinate.
+    ///
+    /// ⭐ THE DEFAULT IS NOT ALWAYS `Constant`, WHICH IS WHY THIS IS THE GENERAL SPELLING. A spread
+    /// address has a distinct value at every fold coordinate, so every axis maps.
+    pub fn build_fold_space_spread(
+        &mut self,
+        depth: usize,
+        default: AddressFold,
+        core: AddressFold,
+        corelet: AddressFold,
+    ) {
+        self.func_types = vec![default; depth];
         if let Some(slot) = self.func_types.get_mut(FoldPosition::Core as usize) {
             *slot = core;
         }
@@ -550,15 +581,37 @@ impl StartAddress {
         self.func_types.get(pos as usize).copied()
     }
 
-    /// `insertData(addr, {{0, core}, {1, corelet}})`.
+    /// `insertData(addr, {{0, core}, {1, corelet}})` — ONE address over every remaining coordinate.
     pub fn insert(&mut self, core: Core, corelet: Corelet, address: Bytes) {
-        self.placed.entry(core).or_default().insert(corelet, address);
+        self.insert_spread(core, corelet, vec![address]);
+    }
+
+    /// The same write with ONE ADDRESS PER REMAINING FOLD COORDINATE, innermost coordinate first —
+    /// entry 222's `addrIt++` walk over `getFlattenedCoordinates({{0, 0}, {1, 0}})`.
+    pub fn insert_spread(&mut self, core: Core, corelet: Corelet, addresses: Vec<Bytes>) {
+        self.placed.entry(core).or_default().insert(corelet, addresses);
     }
 
     /// `getSingleData({{0, core}, {1, corelet}})`, absent where nothing was placed there.
+    ///
+    /// ⛔ ALSO ABSENT FOR A SPREAD, which is `getSingleData`'s own *"more than one data"* refusal:
+    /// [`Self::spread`] is what reads that shape.
     #[must_use]
     pub fn at(&self, core: Core, corelet: Corelet) -> Option<Bytes> {
-        self.placed.get(&core)?.get(&corelet).copied()
+        match self.placed.get(&core)?.get(&corelet)?.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
+    /// Every address placed at that `(core, corelet)`, in fold-coordinate order — EMPTY where nothing
+    /// was placed there at all.
+    #[must_use]
+    pub fn spread(&self, core: Core, corelet: Corelet) -> &[Bytes] {
+        self.placed
+            .get(&core)
+            .and_then(|per_cl| per_cl.get(&corelet))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// `getDataAndFoldCoordinates({{1, corelet}})` — every core's address at ONE corelet, which is
@@ -567,7 +620,13 @@ impl StartAddress {
     pub fn at_corelet(&self, corelet: Corelet) -> Vec<(Core, Bytes)> {
         self.placed
             .iter()
-            .filter_map(|(&core, per_cl)| per_cl.get(&corelet).map(|&addr| (core, addr)))
+            .flat_map(|(&core, per_cl)| {
+                per_cl
+                    .get(&corelet)
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .map(move |&addr| (core, addr))
+            })
             .collect()
     }
 
@@ -576,7 +635,7 @@ impl StartAddress {
     pub fn all(&self) -> Vec<Bytes> {
         self.placed
             .values()
-            .flat_map(|per_cl| per_cl.values().copied())
+            .flat_map(|per_cl| per_cl.values().flatten().copied())
             .collect()
     }
 
@@ -608,7 +667,15 @@ impl StartAddress {
                         core,
                         per_cl
                             .iter()
-                            .map(|(&cl, &addr)| (cl, Bytes(addr.0 / scale.get())))
+                            .map(|(&cl, addrs)| {
+                                (
+                                    cl,
+                                    addrs
+                                        .iter()
+                                        .map(|addr| Bytes(addr.0 / scale.get()))
+                                        .collect(),
+                                )
+                            })
                             .collect(),
                     )
                 })
@@ -872,6 +939,70 @@ pub struct SizeAndIndex {
     pub dst_size_idx: StickDimIdx,
 }
 
+/// ONE POSITION OF A TRANSFER'S ZERO-PAD FOLD — the `(size, alpha, beta)` triple that ONE
+/// `TransferPadInfo::FoldDimPosition` slot of `buildPadFrontSizes`' and `buildPadBackSizes`' three
+/// parallel `std::vector<int>`s holds (`dsc/dsc2.h:849`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PadFold {
+    /// `sizes[pos]` — how many steps that fold axis walks.
+    pub cardinality: FoldCardinality,
+    /// `alphas[pos]`.
+    pub alpha: FoldCoeff,
+    /// `betas[pos]`.
+    pub beta: FoldCoeff,
+}
+
+/// ONE DIM'S ZERO-PAD FOLD SPACE — the two `TransferPadInfo::FoldDimPosition` slots that are ever
+/// written, `WORK_SLICE_FOLDDIM` and `CHUNK_FOLDDIM`.
+///
+/// ⛔ THE REMAINING `TOTAL_FOLDDIM_NUM` SLOTS ARE UNSPELLABLE, AND THAT IS THE TRUTH: entry 221 is the
+/// only writer of `paddingInfo_`, it sets exactly these two, and every other slot keeps the zero its
+/// `std::vector<int>` was sized with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZeroPadFolds {
+    /// `WORK_SLICE_FOLDDIM`.
+    pub work_slice: PadFold,
+    /// `CHUNK_FOLDDIM`.
+    pub chunk: PadFold,
+}
+
+/// A TRANSFER'S ZERO-PAD INFO — `TransferNode::paddingInfo_`, a `TransferPadInfo` (`dsc/dsc2.h:836`),
+/// reduced to the two per-dim fold spaces its builders fill.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransferPadding {
+    front: BTreeMap<PrimaryDim, ZeroPadFolds>,
+    back: BTreeMap<PrimaryDim, ZeroPadFolds>,
+}
+
+impl TransferPadding {
+    /// `buildPadFrontSizes(dim, sizes, alphas, betas)`.
+    pub fn build_pad_front(&mut self, dim: PrimaryDim, folds: ZeroPadFolds) {
+        self.front.insert(dim, folds);
+    }
+
+    /// `buildPadBackSizes(dim, sizes, alphas, betas)`.
+    pub fn build_pad_back(&mut self, dim: PrimaryDim, folds: ZeroPadFolds) {
+        self.back.insert(dim, folds);
+    }
+
+    /// The front fold space of one dim, absent where nothing built it.
+    #[must_use]
+    pub fn pad_front(&self, dim: PrimaryDim) -> Option<ZeroPadFolds> {
+        self.front.get(&dim).copied()
+    }
+
+    /// The back fold space of one dim, absent where nothing built it.
+    #[must_use]
+    pub fn pad_back(&self, dim: PrimaryDim) -> Option<ZeroPadFolds> {
+        self.back.get(&dim).copied()
+    }
+
+    /// Every dim either builder has been handed, in dim order.
+    pub fn dims(&self) -> impl Iterator<Item = PrimaryDim> + '_ {
+        self.front.keys().chain(self.back.keys()).copied()
+    }
+}
+
 /// HOW MANY TIMES ONE UNIT-TIME TRANSFER REPEATS — `replicationFactor_` (`dsc/dsc2.h:834`), whose
 /// default is ONE and not zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -895,6 +1026,17 @@ pub struct TransferNode {
     pub replication_factor: ReplicationFactor,
     /// `unitTimeTransferChunkSize_` (`:836`) — the continuous elements within a stick boundary.
     pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
+    /// `paddingInfo_` (`:836`) — EMPTY on a fresh node; entry 221 is what fills it.
+    pub padding: TransferPadding,
+    /// `srcIndirect_` FUSED WITH `srcIndirectLdsAndLoopOffsets_.myLdsIdx_` — the index tensor this
+    /// transfer gathers its SOURCE addresses through, [`None`] for a direct transfer.
+    pub src_indirect: Option<Via>,
+    /// `dstVias_.front().locIndirect_` FUSED WITH `dstIndirectLdsAndLoopOffsets_.front().myLdsIdx_`.
+    ///
+    /// ⛔ ONE END AND NOT A VECTOR, WHICH IS THE REFERENCE'S OWN TWO `DT_CHECK`s: entry 227 demands
+    /// `dstVias_.size() == 1` before it writes, and then that `dstIndirectLdsAndLoopOffsets_` was
+    /// empty and holds exactly one entry after.
+    pub dst_indirect: Option<Via>,
 }
 
 /// `dsc2::BlockNode` (`dsc/dsc2.h:526`) narrowed to the `name_` a block is looked up by and the
@@ -976,7 +1118,6 @@ impl SyncUnits {
 
 /// `dsc2::SyncNode` (`dsc/dsc2.h:964`) narrowed to what minting one writes and what entry 261 then
 /// binds onto it.
-///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncNode {
     /// `name_`.
