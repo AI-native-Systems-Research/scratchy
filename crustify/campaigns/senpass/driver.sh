@@ -44,6 +44,14 @@ say() { echo "[$(date +%H:%M:%S)] $*" >> "$TRACE"; }
 # driver AND its `crustify` child — killing the bash script alone reparents the child to init,
 # which keeps spawning agents. This was defeated five times.
 #     pkill -TERM -P "$(cat .driver.lock)" ; kill -TERM "$(cat .driver.lock)"
+# ⛔⛔ STAGE MARKERS LIVE OUTSIDE $CAMPDIR. crustify link_shares the campaign directory into every
+# agent worktree, and that turned each .done-<tag> into a symlink POINTING AT ITSELF: `[ -f ]`
+# follows the link, finds nothing and reports absent, so the driver re-ran a completed 256-unit
+# review; while crustify's own `open(path,'x')` sees the link and dies `FileExistsError`, which
+# failed all 7 batches of sc2-port in seven seconds. One cause, both failures. $STATE is not under
+# crustify/ and not under target/ (which gets cargo clean'd), so nothing links or sweeps it.
+STATE=$ROOT/.campaign-done
+mkdir -p "$STATE"
 LOCK=$CAMPDIR/.driver.lock
 if [ -e "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
   echo "driver already running as pid $(cat "$LOCK") — refusing to start a second" >&2
@@ -131,7 +139,7 @@ stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
   # that had run ahead of their session branch. The stage was therefore marked done, its remainder
   # still listed 49 units, and every later run SKIPPED it — so the campaign would have reported DONE
   # with 49 units never ported. Completeness is the remainder's answer, never a marker's.
-  if [ -f "$CAMPDIR/.done-$3" ]; then
+  if [ -f "$STATE/.done-$3" ]; then
     left=0
     if [ "$2" = "port" ]; then
       rj="$CAMPDIR/${1%/port.json}/port-remainder.json"
@@ -142,7 +150,7 @@ stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
       return 0
     fi
     say "⛔ STAGE $3 IS MARKED DONE BUT ITS REMAINDER STILL HOLDS $left UNIT(S) — the marker recorded that the stage RAN, not that the level is complete. RE-RUNNING it."
-    rm -f "$CAMPDIR/.done-$3"
+    rm -f "$STATE/.done-$3"
   fi
   # ⛔⛔ A PORT STAGE MUST RUN THE REMAINDER, NOT THE ORIGINAL SCHEDULE. `gen_campaign.py
   # --remainder` writes `port-remainder.json`; the stage list names `port.json`, which still holds
@@ -207,7 +215,7 @@ stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
   python3 "$ROOT/crustify-senpass/tools/gen_campaign.py" --remainder "$ROOT" >> "$TRACE" 2>&1
   prune
   # The stage got here having landed work and promoted it, so a restart must not redo it.
-  touch "$CAMPDIR/.done-$3"
+  touch "$STATE/.done-$3"
 }
 
 gate() { # $1 tag
