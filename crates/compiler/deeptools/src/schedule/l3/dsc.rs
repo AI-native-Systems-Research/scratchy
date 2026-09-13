@@ -908,6 +908,8 @@ pub struct StageDims {
     pub padding: BTreeMap<PrimaryDim, DimPadding>,
     /// `symbolicDimInfo_` with `maxSymbolicVolume_`.
     pub symbolic: Symbolic,
+    /// `coreletSplit_` — per corelet-split dim, one extent per corelet of the core.
+    pub corelet_split: BTreeMap<PrimaryDim, Vec<Extent>>,
 }
 
 impl StageDims {
@@ -1089,6 +1091,12 @@ impl FilledDims {
     /// `symbolicDimInfo_`/`maxSymbolicVolume_`, for the scheduler to carry forward.
     pub const fn symbolic_mut(&mut self) -> &mut Symbolic {
         &mut self.0.symbolic
+    }
+
+    /// `coreletSplit_`, for the scheduler to state a corelet split with — writing it cannot empty
+    /// the extents, so the non-emptiness survives it.
+    pub const fn corelet_split_mut(&mut self) -> &mut BTreeMap<PrimaryDim, Vec<Extent>> {
+        &mut self.0.corelet_split
     }
 
     /// `primaryDimToValHandler_st(dim) = extent` — the scheduler's one way to write a dim. Adding an
