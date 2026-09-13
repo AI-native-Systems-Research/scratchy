@@ -102,7 +102,8 @@ use crate::model::Model;
 use crate::workload::Workload;
 
 use super::ForRef;
-use super::analyses::{Liveness, RegisterPressure};
+use super::analyses::{InstructionEstimator, Liveness, Metric, Pressure, RegisterPressure};
+use super::utils::{Hoisted, InBlock, NewUse, OpAt, insert_at, move_to_common_dominator, path_of};
 
 /// `localeToRegisterClass` (`dcc/src/Dialect/Sentient/Utils.cpp:203`) — the register class a locale
 /// names, which is `stringifySentientRegType(locale).upper()` with both XRF pointers folded onto one.
@@ -625,20 +626,272 @@ pub fn dump_candidates(candidates: &[CandidateEntry], scope: &[Op]) -> String {
     out
 }
 
-// crustify:todo: e358_collectCandidates
-//   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:297  (65 body lines, level 1)
-//   original  : void ScalarCopyInsertionForSymbolsPass::collectCandidates( dataflow::ProgramUnitOp unit, CandidateListTy &candidates, RegisterPressure &rp) const
-//   calls     : e252_size
+/// `getOrComputeRegisterPressure(locale == lccr ? jcr : locale, kNumFreeRegisters)` — *"our goal is
+/// to replace lccrs with jcrs"* (`:302-305`, `:352-355`), asked once per locale in each of e358's loops.
+fn free_registers<P: RegisterPressure>(rp: &mut P, locale: RegType) -> Pressure {
+    let asked = match locale {
+        RegType::Lccr => RegType::Jcr,
+        other => other,
+    };
+    rp.get_or_compute_register_pressure(asked, Metric::NumFreeRegisters)
+}
 
-// crustify:todo: e359_insertCopyOpsForCandidates
-//   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:365  (49 body lines, level 1)
-//   original  : void ScalarCopyInsertionForSymbolsPass::insertCopyOpsForCandidates( dataflow::ProgramUnitOp unit, const CandidateListTy &candidates)
-//   calls     : e151_insertCopyOpsForJCRCandidate, e154_propagateElementSizeToCopyOp
+/// Replaces: e358_collectCandidates
+///
+/// Picks, per symbolic register file that still has a free register, the symbols used in it —
+/// most-used first — and takes as many as both the free registers and the free ibuff space allow.
+///
+/// ⛔ TRAP: A LOCALE WITH ONE CANDIDATE IS NOT DROPPED. `size() < 2` (`:331`) skips only the SORT and
+/// the second loop still takes that candidate; the count that decides insertion is e359's.
+/// ⛔ TRAP: A NEGATIVE `getRemainingIbuffSpace` WRAPS — it is read into an `unsigned` (`:346`), so an
+/// overrun unit stops constraining `N` rather than driving it to zero.
+/// ⭐ `DT_CHECK(candidates.empty())` IS THE RETURN TYPE, as e149's two are.
+#[must_use]
+pub fn collect_candidates<P: RegisterPressure, I: InstructionEstimator>(
+    unit_body: &[Op],
+    symbols: &[Val],
+    state: &PerUnitState,
+    rp: &mut P,
+    estimator: &mut I,
+    trace: &mut String,
+) -> Vec<CandidateEntry> {
+    let mut per_locale: Vec<(RegType, Vec<Val>)> = Vec::new();
+    for &locale in &state.symbolic_locales {
+        if free_registers(rp, locale).0 == 0 {
+            if DEBUG {
+                let _ = writeln!(
+                    trace,
+                    "skip collecting candidates for locale [{}] because there are no free registers.",
+                    locale_to_register_class(locale)
+                );
+            }
+            continue;
+        }
+        // The `collectPerLocalCandidate` lambda over `symbols_` then `symbol_queries_` — a pair the
+        // collector never recorded has no uses, which is the two `find` misses it returns on.
+        for &sym in symbols.iter().chain(&state.ops.symbol_queries) {
+            if state.symbol_to_usage.uses(sym, locale).is_empty() {
+                continue;
+            }
+            match per_locale.iter_mut().find(|(at, _)| *at == locale) {
+                Some((_, syms)) => syms.push(sym),
+                None => per_locale.push((locale, vec![sym])),
+            }
+        }
+        let Some((_, syms)) = per_locale.iter_mut().find(|(at, _)| *at == locale) else {
+            continue;
+        };
+        if syms.len() < 2 {
+            continue;
+        }
+        // `std::stable_sort` descending by number of uses, and `sort_by` is stable too — which the
+        // reference's own *"todo: for candidates that have the same num uses"* relies on.
+        syms.sort_by(|a, b| {
+            state
+                .symbol_to_usage
+                .uses(*b, locale)
+                .len()
+                .cmp(&state.symbol_to_usage.uses(*a, locale).len())
+        });
+    }
+    // *"Since JCR copy_ops cannot be packet initialized, they use up ibuff space"* — asked once, after
+    // every pressure query of the first loop.
+    let num_free_insts = estimator.remaining_ibuff_space(unit_body).0 as u32;
+    let mut candidates = Vec::new();
+    for &locale in &state.symbolic_locales {
+        let Some((_, syms)) = per_locale.iter().find(|(at, _)| *at == locale) else {
+            continue;
+        };
+        let taken = free_registers(rp, locale)
+            .0
+            .min(num_free_insts)
+            .min(syms.len() as u32);
+        for &symbol in &syms[..taken as usize] {
+            candidates.push(CandidateEntry { symbol, locale });
+        }
+    }
+    candidates
+}
 
-// crustify:todo: e360_dumpSymbolUsageInfo
-//   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:512  (32 body lines, level 1)
-//   original  : void ScalarCopyInsertionForSymbolsPass::dumpSymbolUsageInfo() const
-//   calls     : e252_size
+/// `-dcc-scalar-copy-insertion-for-symbols-force-one-candidate`, `cl::init(false)` (`:67-72`) —
+/// *"only meant to be enabled for testing"*, and this crate has no flags.
+const FORCE_INSERTION_EVEN_IF_ONE_CANDIDATE: bool = false;
+
+/// Replaces: e359_insertCopyOpsForCandidates
+///
+/// Inserts one `sentient.scalar_copy` per candidate and points every recorded use of that symbol in
+/// that register file at it, unless too few candidates share a file to reduce a patch flit.
+///
+/// ⛔ TRAP: THE TWO COUNTS ARE SEPARATE — `jcr_count < 2 && non_jcr_count < 2`, so one candidate in
+/// each file returns, and `lccr` counts as `jcr` here as it does in e358.
+/// ⛔ TRAP: THE THREE PHASES ARE ONE LOOP THERE. A use is a POSITION on this island, so every use is
+/// repointed first, e151 then inserts while those positions are still pristine, and each remaining
+/// copy is placed last against the ops its own freshly minted result identifies.
+pub fn insert_copy_ops_for_candidates(
+    unit_body: &mut Vec<Op>,
+    candidates: &[CandidateEntry],
+    usage: &SymbolUsage,
+    values: &mut Values,
+    trace: &mut String,
+) {
+    if !FORCE_INSERTION_EVEN_IF_ONE_CANDIDATE {
+        let jcr_count = candidates
+            .iter()
+            .filter(|entry| JcrLocale::of(entry.locale).is_some())
+            .count();
+        if jcr_count < 2 && candidates.len() - jcr_count < 2 {
+            if DEBUG {
+                trace.push_str(
+                    "Skip inserting copy op since there are not enough candidates to create patch \
+                     flit reduction opportunity\n",
+                );
+            }
+            return;
+        }
+    }
+    let mut planned: Vec<(CandidateEntry, Val)> = Vec::new();
+    for entry in candidates {
+        if JcrLocale::of(entry.locale).is_some() {
+            continue;
+        }
+        // `DT_CHECK(symbol_to_usage_.find(symbol) != end)` and the same for the locale: a candidate
+        // came from a recorded pair, so an empty list is the check and not a case.
+        if usage.uses(entry.symbol, entry.locale).is_empty() {
+            continue;
+        }
+        let copy_result = values.mint();
+        for at in usage.uses(entry.symbol, entry.locale) {
+            if let Some(user) = op_at_mut(unit_body, &at.path) {
+                dialects::set_operand(user, at.operand, copy_result);
+            }
+        }
+        planned.push((*entry, copy_result));
+    }
+    for entry in candidates {
+        if let Some(locale) = JcrLocale::of(entry.locale) {
+            // e151 mints its own copy result and repoints the uses itself; nothing here reads it.
+            let _ =
+                insert_copy_ops_for_jcr_candidate(unit_body, entry.symbol, locale, usage, values);
+        }
+    }
+    for (entry, copy_result) in planned {
+        insert_one_copy(unit_body, entry, copy_result, usage);
+    }
+}
+
+/// The `for (OpOperand *opnd : ..)` body of e359 once its uses read `copy_result`: the copy is built
+/// at the first of them with e154's width, then hoisted to a common dominator over each of the rest.
+fn insert_one_copy(
+    unit_body: &mut Vec<Op>,
+    entry: CandidateEntry,
+    copy_result: Val,
+    usage: &SymbolUsage,
+) {
+    let users = use_positions(unit_body, copy_result);
+    let Some(first) = users.first() else {
+        return;
+    };
+    let mut copy = Op::Sentient(sentient::Op::ScalarCopy {
+        input: entry.symbol,
+        result: copy_result,
+        reg: Reg {
+            locale: entry.locale,
+            index: None,
+        },
+        program_header: false,
+        element_size: None,
+    });
+    if let Some(user) = first.op(unit_body) {
+        let parent = first.parent().and_then(|at| at.op(unit_body));
+        let operand = usage.uses(entry.symbol, entry.locale)[0].operand;
+        propagate_element_size_to_copy_op(user, operand, parent, &mut copy);
+    }
+    // `OpBuilder builder(user)` — the copy lands immediately ahead of the first use, in its block.
+    insert_at(unit_body, first, copy);
+    for rank in 1..users.len() {
+        let Some(copy_at) = path_of(unit_body, copy_result) else {
+            continue;
+        };
+        // Recomputed, because e241 rehoists the operand definitions it has to move with the copy.
+        let refreshed = use_positions(unit_body, copy_result);
+        let Some(user_at) = refreshed.get(rank) else {
+            continue;
+        };
+        if move_to_common_dominator(unit_body, &copy_at, &NewUse::SameUnit(user_at.clone()))
+            == Hoisted::OutsideProgramUnit
+        {
+            // `user->emitError("failed to move copy op to common dominator"); signalPassFailure();`
+            // (`:407-409`) — unreachable, since every recorded use is in THIS unit and that is
+            // [`Hoisted::OutsideProgramUnit`]'s one precondition.
+            panic!("failed to move copy op to common dominator (`:407`) for {copy_result:?}");
+        }
+    }
+}
+
+/// `val.getUses()` AS POSITIONS — every op of the unit reading `val` in its OWN operands, in the
+/// pre-order [`collect_usage`] records them in, and never an enclosing op whose region holds one.
+fn use_positions(unit_body: &[Op], val: Val) -> Vec<OpAt> {
+    fn walk(block: &[Op], val: Val, enclosing: &mut Vec<(InBlock, usize)>, found: &mut Vec<OpAt>) {
+        for (index, op) in block.iter().enumerate() {
+            if dialects::operands(op).contains(&val) {
+                found.push(OpAt::at(enclosing, InBlock(index)));
+            }
+            for (region, inner) in dialects::regions_ref(op).into_iter().enumerate() {
+                enclosing.push((InBlock(index), region));
+                walk(inner, val, enclosing, found);
+                enclosing.pop();
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(unit_body, val, &mut Vec::new(), &mut found);
+    found
+}
+
+/// Replaces: e360_dumpSymbolUsageInfo
+///
+/// The `=== Usage Info: ===` block — one line per symbol and register file, naming the symbol's ID or
+/// the line its `symbol.query_map` sits on together with how many uses were recorded there.
+///
+/// ⛔ TRAP: `getLocation(..).getLine()` HAS NOTHING TO READ, as in e156 — a line number is provenance
+/// of the input rather than a result of the pass, so a query's parenthesised number prints `?`.
+/// ⭐ THE LOCALES ITERATED ARE `symbolic_locales_`, not the symbol's own, which is what makes the
+/// `find` miss inside the loop a `continue` rather than the outer `return`.
+#[must_use]
+pub fn dump_symbol_usage_info(state: &PerUnitState, symbols: &[Val], scope: &[Op]) -> String {
+    let enclosing = [scope];
+    let defs = dialects::Definitions::from_innermost(&enclosing);
+    let mut out = String::from("=== Usage Info: ===\n");
+    for &sym in symbols.iter().chain(&state.ops.symbol_queries) {
+        for &locale in &state.symbolic_locales {
+            let count = state.symbol_to_usage.uses(sym, locale).len();
+            if count == 0 {
+                continue;
+            }
+            let class = locale_to_register_class(locale);
+            match defs.of(sym) {
+                Some(Op::Symbol(symbol::Op::CreateSymbol { symbol_id, .. })) => {
+                    let _ = writeln!(
+                        out,
+                        "Sym ID ({symbol_id}) for locale [{class}] has {count} use(s)."
+                    );
+                }
+                Some(Op::Symbol(symbol::Op::QueryMap { .. })) => {
+                    let _ = writeln!(
+                        out,
+                        "Symbol Query On Line (?) for locale [{class}] has {count} use(s)."
+                    );
+                }
+                _ => panic!(
+                    "DT_CHECK(static_cast<bool>(sym_op) ^ static_cast<bool>(sym_query_op)) (`:526`) \
+                     for {sym:?}"
+                ),
+            }
+        }
+    }
+    out.push_str("=== End of Usage Info ===\n");
+    out
+}
 
 /// Replaces: e527_collectSymbolUsage
 ///
@@ -758,53 +1011,6 @@ const DEBUG: bool = false;
 /// `DEBUG_WITH_TYPE(VerboseDebug, ..)` — `DEBUG_TYPE "-verbose"` (`:41`), a second and narrower flag.
 const VERBOSE_DEBUG: bool = false;
 
-/// `ScalarCopyInsertionForSymbolsPass::dumpSymbolUsageInfo()` — SENPASS UNIT e360, whose anchor is
-/// still open above; isolating the call in a private seam is the `2a8195231` precedent.
-fn dump_symbol_usage_info(usage: &SymbolUsage) -> String {
-    todo!(
-        "ScalarCopyInsertionForSymbolsPass::dumpSymbolUsageInfo — senpass e360 \
-         (ScalarCopyInsertionForSymbols.cpp:512) is not ported yet, and this {usage:?} needs it"
-    )
-}
-
-/// `ScalarCopyInsertionForSymbolsPass::collectCandidates(unit, candidates, rp)` — SENPASS UNIT e358,
-/// whose anchor is still open above. ⛔ THE ONE READER OF THE REGISTER-PRESSURE ESTIMATE IS HERE, which
-/// is why e576 only ever hands `rp` on.
-fn collect_candidates<P: RegisterPressure>(
-    unit_body: &[Op],
-    state: &PerUnitState,
-    candidates: &mut Vec<CandidateEntry>,
-    rp: &mut P,
-) {
-    // ⛔ NOT `rp.dump()` IN THE MESSAGE: that method is a `todo!` of its own, and a panic from it
-    // would name the analysis where this seam is what a caller actually reached.
-    let _ = rp;
-    todo!(
-        "ScalarCopyInsertionForSymbolsPass::collectCandidates — senpass e358 \
-         (ScalarCopyInsertionForSymbols.cpp:297) is not ported yet, and this unit of {} ops with \
-         {} symbolic locales and {candidates:?} needs it",
-        unit_body.len(),
-        state.symbolic_locales.len()
-    )
-}
-
-/// `ScalarCopyInsertionForSymbolsPass::insertCopyOpsForCandidates(unit, candidates)` — SENPASS UNIT
-/// e359, whose anchor is still open above. Its own callee `e151` IS ported ([`insert_copy_ops_for_jcr_candidate`]).
-fn insert_copy_ops_for_candidates(
-    unit_body: &mut Vec<Op>,
-    candidates: &[CandidateEntry],
-    usage: &SymbolUsage,
-    values: &mut Values,
-) {
-    todo!(
-        "ScalarCopyInsertionForSymbolsPass::insertCopyOpsForCandidates — senpass e359 \
-         (ScalarCopyInsertionForSymbols.cpp:365) is not ported yet, and these {} candidates over \
-         {} ops, {usage:?} and {values:?} need it",
-        candidates.len(),
-        unit_body.len()
-    )
-}
-
 /// Replaces: e576_runOn
 ///
 /// One program unit's six steps: collect its copies and outermost loops, map every symbol's uses to
@@ -822,12 +1028,13 @@ fn insert_copy_ops_for_candidates(
     reason = "the reference reaches five of these through `this` and two more through the pass \
               manager, and neither is a thing this crate has"
 )]
-pub fn run_on<L: Liveness, P: RegisterPressure>(
+pub fn run_on<L: Liveness, P: RegisterPressure, I: InstructionEstimator>(
     unit_body: &mut Vec<Op>,
     symbols: &[Val],
     state: &mut PerUnitState,
     liveness: &mut L,
     rp: &mut P,
+    estimator: &mut I,
     values: &mut Values,
     trace: &mut String,
 ) {
@@ -855,7 +1062,7 @@ pub fn run_on<L: Liveness, P: RegisterPressure>(
     state.symbolic_locales = symbolic_locales;
     if DEBUG {
         trace.push_str(&dump_symbolic_locales(&state.symbolic_locales));
-        trace.push_str(&dump_symbol_usage_info(&state.symbol_to_usage));
+        trace.push_str(&dump_symbol_usage_info(state, symbols, unit_body));
     }
     // ⭐ A COPY OF THE CHILD ANALYSIS, *"since this pass does not preserve liveness, the changes made
     // in the liveness object will not affect downstream transformations"* — the copy is the mechanism.
@@ -865,13 +1072,18 @@ pub fn run_on<L: Liveness, P: RegisterPressure>(
         rp.compute_register_pressure_for_all_locales();
         trace.push_str(&rp.dump());
     }
-    let mut candidates: Vec<CandidateEntry> = Vec::new();
-    collect_candidates(unit_body, state, &mut candidates, rp);
+    let candidates = collect_candidates(unit_body, symbols, state, rp, estimator, trace);
     if DEBUG {
         trace.push_str("Selected the following candidates for copy-op insertion:\n");
         trace.push_str(&dump_candidates(&candidates, unit_body));
     }
-    insert_copy_ops_for_candidates(unit_body, &candidates, &state.symbol_to_usage, values);
+    insert_copy_ops_for_candidates(
+        unit_body,
+        &candidates,
+        &state.symbol_to_usage,
+        values,
+        trace,
+    );
 }
 
 /// `-dcc-scalar-copy-insertion-for-symbols-disable`, `cl::init(false)` (`:62-65`) — a `dcc-opt`
@@ -903,10 +1115,23 @@ fn create_symbols_in(block: &[Op], out: &mut Vec<Val>) {
 /// not only those preceding it. Its own comment claims the pre-order gives it all of them anyway
 /// (`:137-138`), and on this island the declarations live in [`Program::preamble`] — outside the units
 /// the walk `skip()`s — so there is no order left to observe.
-pub fn run_on_operation<A: Arch, M: Model, W: Workload, L: Liveness, P: RegisterPressure>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the three analyses are the pass manager's `getChildAnalysis`, and neither it nor a \
+              pass object is a thing this crate has"
+)]
+pub fn run_on_operation<
+    A: Arch,
+    M: Model,
+    W: Workload,
+    L: Liveness,
+    P: RegisterPressure,
+    I: InstructionEstimator,
+>(
     program: &mut Program<A, M, W>,
     liveness: &mut L,
     rp: &mut P,
+    estimator: &mut I,
     values: &mut Values,
     trace: &mut String,
 ) {
@@ -923,6 +1148,7 @@ pub fn run_on_operation<A: Arch, M: Model, W: Workload, L: Liveness, P: Register
             &mut state,
             liveness,
             rp,
+            estimator,
             values,
             trace,
         );
@@ -940,7 +1166,7 @@ mod unit_tests {
     use crate::islands::sentient::{ProgramUnit, ProgramUnits};
     use crate::islands::sentient::dialects::dataflow;
     use crate::islands::sentient::dialects::sentient::Carried;
-    use crate::transform::sentient::analyses::{OutOfScopeRegisterPressure, VirtualAssigns};
+    use crate::transform::sentient::analyses::{InstructionCount, VirtualAssigns};
     use crate::units::{DfirUnit, Residency};
 
     /// A `sentient.scalar_copy` with no width, as `CopyOp::create`'s five-argument builder makes one.
@@ -1022,6 +1248,72 @@ mod unit_tests {
         todo!("no unit here reads a colouring node through this fake")
     }
 }
+
+    /// A `RegisterPressure&` that states its answers and records what it was asked — the estimate is
+    /// out of campaign scope, so what e358 owns is WHICH locale it asks about and what it then takes.
+    #[derive(Default)]
+    struct StatedPressure {
+        /// Free registers per locale, `0` for any locale not listed.
+        free: Vec<(RegType, u32)>,
+        /// Every ask, in order.
+        asked: Vec<(RegType, Metric)>,
+    }
+
+    impl RegisterPressure for StatedPressure {
+        fn get_or_compute_register_pressure(
+            &mut self,
+            locale: RegType,
+            metric: Metric,
+        ) -> Pressure {
+            self.asked.push((locale, metric));
+            Pressure(
+                self.free
+                    .iter()
+                    .find(|(at, _)| *at == locale)
+                    .map_or(0, |(_, free)| *free),
+            )
+        }
+
+        fn compute_register_pressure_for_all_locales(&mut self) {
+            todo!("no unit here asks this fake for every locale at once")
+        }
+
+        fn dump(&self) -> String {
+            todo!("no unit here dumps this fake")
+        }
+    }
+
+    /// An `InstructionEstimator&` that states the one count e358 reads, for the same reason.
+    #[derive(Default)]
+    struct StatedEstimator {
+        /// What is left of the ibuff.
+        ibuff_space: i32,
+        /// How many times it was asked for.
+        ibuff_asks: usize,
+    }
+
+    impl InstructionEstimator for StatedEstimator {
+        fn recalculate(&mut self, _unit: &[Op]) {
+            todo!("no unit here recounts this fake")
+        }
+
+        fn estimated_instruction_count_of_op(&mut self, _op: &Op) -> InstructionCount {
+            todo!("no unit here costs an op through this fake")
+        }
+
+        fn estimated_instruction_count_of_region(&mut self, _region: &[Op]) -> InstructionCount {
+            todo!("no unit here costs a region through this fake")
+        }
+
+        fn have_ibuff_space(&mut self, _unit: &[Op]) -> bool {
+            todo!("no unit here asks this fake whether the ibuff has space")
+        }
+
+        fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
+            self.ibuff_asks += 1;
+            InstructionCount(self.ibuff_space)
+        }
+    }
 
     /// `e149` — the four arms, with the inner loop rejected by `isOuterMostLoop` and the misplaced
     /// `create_symbol` recorded rather than collected.
@@ -1391,9 +1683,10 @@ mod unit_tests {
              \tlocale [JCR]\n"
         );
     }
-    /// e576 — the five steps that ARE ported run in the order the sixth needs, and the sixth is e358.
+    /// e576 — the six steps in the order the data needs, ending on the ONE candidate e359 refuses to
+    /// insert for.
     #[test]
-    fn e576_collects_maps_and_pessimizes_before_it_reaches_the_unported_e358() {
+    fn e576_collects_maps_and_pessimizes_then_finds_one_candidate_too_few() {
         let sym = Val(0);
         let mut body = vec![
             a_copy(sym, Val(1), RegType::Jcr),
@@ -1401,23 +1694,30 @@ mod unit_tests {
         ];
         let mut state = PerUnitState::default();
         let mut liveness = Recorder::default();
-        let mut rp = OutOfScopeRegisterPressure;
+        let mut rp = StatedPressure {
+            free: vec![(RegType::Jcr, 4)],
+            asked: Vec::new(),
+        };
+        let mut estimator = StatedEstimator {
+            ibuff_space: 9,
+            ibuff_asks: 0,
+        };
         let mut values = Values::default();
         let mut trace = String::new();
 
-        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_on(
-                &mut body,
-                &[sym],
-                &mut state,
-                &mut liveness,
-                &mut rp,
-                &mut values,
-                &mut trace,
-            );
-        }));
+        run_on(
+            &mut body,
+            &[sym],
+            &mut state,
+            &mut liveness,
+            &mut rp,
+            &mut estimator,
+            &mut values,
+            &mut trace,
+        );
 
-        assert!(reached.is_err(), "e358 is not ported, so the choice panics");
+        // ⭐ ONE `jcr` CANDIDATE AND NO OTHER FILE, so e359 returns before inserting anything.
+        assert_eq!(body.len(), 2);
         assert_eq!(state.ops.scalar_copy_ops, vec![Val(1)]);
         // ⛔ THE COPY'S OWN USE OF THE SYMBOL IS NOT ONE, so `jcr` comes from the `scalar_add`.
         assert_eq!(state.symbolic_locales, vec![RegType::Jcr]);
@@ -1486,23 +1786,249 @@ mod unit_tests {
             bound: core::marker::PhantomData,
         };
         let mut liveness = Recorder::default();
-        let mut rp = OutOfScopeRegisterPressure;
+        let mut rp = StatedPressure {
+            free: vec![(RegType::Jcr, 4)],
+            asked: Vec::new(),
+        };
+        let mut estimator = StatedEstimator {
+            ibuff_space: 9,
+            ibuff_asks: 0,
+        };
         let mut values = Values::default();
         let mut trace = String::new();
 
-        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_on_operation(
-                &mut program,
-                &mut liveness,
-                &mut rp,
-                &mut values,
-                &mut trace,
-            );
-        }));
+        run_on_operation(
+            &mut program,
+            &mut liveness,
+            &mut rp,
+            &mut estimator,
+            &mut values,
+            &mut trace,
+        );
 
-        assert!(reached.is_err(), "e358 is not ported, so the choice panics");
         // ⭐ THE PROMOTION IS THE EFFECT THAT PROVES THE PREAMBLE'S SYMBOL REACHED THE UNIT.
         assert_eq!(liveness.0, vec![Val(1)]);
+        assert_eq!(program.units.iter().next().expect("one unit").body.len(), 2);
+    }
+
+    /// e358 — the sort puts the most-used symbol first, `N` caps the take at the free registers, the
+    /// one-candidate locale still contributes, and `lccr` is asked about as `jcr`.
+    #[test]
+    fn e358_takes_the_most_used_symbol_and_asks_about_lccr_as_jcr() {
+        let (a, b, c) = (Val(0), Val(1), Val(2));
+        let body = vec![
+            an_add(b, Val(10), Val(11), RegType::Lrf, None),
+            an_add(a, Val(10), Val(12), RegType::Lrf, None),
+            an_add(a, Val(10), Val(13), RegType::Lrf, None),
+            an_add(c, Val(10), Val(14), RegType::Lccr, None),
+        ];
+        // ⛔ `b` IS DECLARED FIRST, so only the descending sort can put `a` ahead of it.
+        let (usage, symbolic_locales) = collect_symbol_usage(&body, &[b, a, c], &[]);
+        let state = PerUnitState {
+            ops: collect_ops_of_interest(&body),
+            symbol_to_usage: usage,
+            symbolic_locales,
+        };
+        let mut rp = StatedPressure {
+            free: vec![(RegType::Lrf, 1), (RegType::Jcr, 3)],
+            asked: Vec::new(),
+        };
+        let mut estimator = StatedEstimator {
+            ibuff_space: 5,
+            ibuff_asks: 0,
+        };
+        let mut trace = String::new();
+
+        let candidates = collect_candidates(
+            &body,
+            &[b, a, c],
+            &state,
+            &mut rp,
+            &mut estimator,
+            &mut trace,
+        );
+
+        assert_eq!(state.symbolic_locales, vec![RegType::Lrf, RegType::Lccr]);
+        assert_eq!(
+            candidates,
+            vec![
+                CandidateEntry {
+                    symbol: a,
+                    locale: RegType::Lrf,
+                },
+                CandidateEntry {
+                    symbol: c,
+                    locale: RegType::Lccr,
+                },
+            ]
+        );
+        // Twice per locale, and `lccr` never under its own name.
+        assert_eq!(
+            rp.asked,
+            vec![
+                (RegType::Lrf, Metric::NumFreeRegisters),
+                (RegType::Jcr, Metric::NumFreeRegisters),
+                (RegType::Lrf, Metric::NumFreeRegisters),
+                (RegType::Jcr, Metric::NumFreeRegisters),
+            ]
+        );
+        assert_eq!(estimator.ibuff_asks, 1);
+    }
+
+    /// e359 — two `lrf` candidates: the first copy is built inside the loop that holds the first use,
+    /// carries that use's width, then hoists to the block dominating the second use.
+    #[test]
+    fn e359_builds_one_copy_per_candidate_and_hoists_it_over_the_second_use() {
+        let (a, b) = (Val(0), Val(1));
+        let mut body = vec![
+            Op::Sentient(sentient::Op::For {
+                iv: Val(20),
+                bound: Val(21),
+                bound_reg: None,
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![an_add(a, Val(10), Val(11), RegType::Lrf, Some(Bits(16)))],
+            }),
+            an_add(a, Val(10), Val(12), RegType::Lrf, None),
+            an_add(b, Val(10), Val(13), RegType::Lrf, None),
+        ];
+        let (usage, _) = collect_symbol_usage(&body, &[a, b], &[]);
+        let candidates = vec![
+            CandidateEntry {
+                symbol: a,
+                locale: RegType::Lrf,
+            },
+            CandidateEntry {
+                symbol: b,
+                locale: RegType::Lrf,
+            },
+        ];
+        // ⛔ MINT PAST THE SYMBOLS THEMSELVES: a copy result that collides with the symbol it copies
+        // repoints nothing, and this entry's whole effect is the repointing.
+        let mut values = Values::default();
+        for _ in 0..40 {
+            values.mint();
+        }
+        let mut trace = String::new();
+
+        insert_copy_ops_for_candidates(&mut body, &candidates, &usage, &mut values, &mut trace);
+
+        // `[copy_a, for { add(copy_a) }, add(copy_a), copy_b, add(copy_b)]`.
+        assert_eq!(body.len(), 5);
+        let Op::Sentient(sentient::Op::ScalarCopy {
+            input,
+            result: copy_a,
+            reg,
+            element_size,
+            ..
+        }) = body[0]
+        else {
+            panic!(
+                "the hoisted copy of `a` is the first op of the unit: {:?}",
+                body[0]
+            );
+        };
+        assert_eq!(input, a);
+        assert_eq!(reg.locale, RegType::Lrf);
+        // e154 read the width off the FIRST use, the one inside the loop.
+        assert_eq!(element_size, Some(Bits(16)));
+        assert_eq!(dialects::operands(&body[2])[0], copy_a);
+        let Op::Sentient(sentient::Op::For {
+            body: ref inner, ..
+        }) = body[1]
+        else {
+            panic!("the loop survives its own hoist: {:?}", body[1]);
+        };
+        assert_eq!(dialects::operands(&inner[0])[0], copy_a);
+        let Op::Sentient(sentient::Op::ScalarCopy {
+            input: input_b,
+            result: copy_b,
+            element_size: width_b,
+            ..
+        }) = body[3]
+        else {
+            panic!("the copy of `b` sits ahead of its one use: {:?}", body[3]);
+        };
+        assert_eq!(input_b, b);
+        assert_eq!(width_b, None);
+        assert_eq!(dialects::operands(&body[4])[0], copy_b);
+    }
+
+    /// e359 NEGATIVE — ⛔ THE TWO COUNTS ARE SEPARATE: one `jcr` candidate and one `lrf` candidate is
+    /// no patch-flit opportunity in either file, so nothing is inserted at all.
+    #[test]
+    fn e359_refuses_one_candidate_in_each_register_file() {
+        let (a, b) = (Val(0), Val(1));
+        let mut body = vec![
+            an_add(a, Val(10), Val(11), RegType::Jcr, None),
+            an_add(b, Val(10), Val(12), RegType::Lrf, None),
+        ];
+        let (usage, _) = collect_symbol_usage(&body, &[a, b], &[]);
+        let candidates = vec![
+            CandidateEntry {
+                symbol: a,
+                locale: RegType::Jcr,
+            },
+            CandidateEntry {
+                symbol: b,
+                locale: RegType::Lrf,
+            },
+        ];
+        let mut values = Values::default();
+        let mut trace = String::new();
+
+        insert_copy_ops_for_candidates(&mut body, &candidates, &usage, &mut values, &mut trace);
+
+        assert_eq!(body.len(), 2);
+        assert_eq!(dialects::operands(&body[0])[0], a);
+        assert_eq!(dialects::operands(&body[1])[0], b);
+    }
+
+    /// e360 — a symbol prints its ID, a query prints its line, and a locale with nothing recorded
+    /// prints no line at all.
+    #[test]
+    fn e360_dumps_one_line_per_symbol_and_locale_that_has_a_use() {
+        let (sym, query) = (Val(0), Val(1));
+        let scope = vec![
+            Op::Symbol(symbol::Op::CreateSymbol {
+                result: sym,
+                symbol_id: 7,
+                max_value: None,
+            }),
+            Op::Symbol(symbol::Op::QueryMap {
+                result: query,
+                map: Val(20),
+                key: Val(21),
+            }),
+        ];
+        let mut usage = SymbolUsage::default();
+        usage.record(
+            sym,
+            RegType::Jcr,
+            UseSite {
+                path: vec![2],
+                operand: 0,
+            },
+        );
+        for path in [vec![3], vec![4]] {
+            usage.record(query, RegType::Lrf, UseSite { path, operand: 0 });
+        }
+        let state = PerUnitState {
+            ops: OpsOfInterest {
+                symbol_queries: vec![query],
+                ..OpsOfInterest::default()
+            },
+            symbol_to_usage: usage,
+            symbolic_locales: vec![RegType::Jcr, RegType::Lrf],
+        };
+
+        assert_eq!(
+            dump_symbol_usage_info(&state, &[sym], &scope),
+            "=== Usage Info: ===\n\
+             Sym ID (7) for locale [JCR] has 1 use(s).\n\
+             Symbol Query On Line (?) for locale [LRF] has 2 use(s).\n\
+             === End of Usage Info ===\n"
+        );
     }
 
     /// e527 — a use is recorded under the locale of the op that reads it, and the ops a copy cannot

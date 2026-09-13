@@ -95,19 +95,27 @@
 
 use std::num::NonZeroU32;
 
-use self::scalar_op_hoisting::HoistCount;
+use sys_arch_spec::fields::{self, ImmWidth, Sign};
+
+use self::scalar_op_hoisting::{
+    HoistCount, IbuffSpace, Innermost, MAX_HOISTS, run_scalar_op_hoisting,
+};
+use self::scalar_op_merging::{MergingRegion, run_scalar_op_merging};
+use super::ForRef;
 use super::analyses::{
-    EvaluatedValue, Evaluation, ExpressionEvaluator, InstructionCount, PropagationAnalysis,
-    ScalarOffset, UnitIndexMap,
+    EvaluatedValue, Evaluation, ExpressionEvaluator, InstructionCount, InstructionEstimator,
+    OffsetSites, PropagationAnalysis, ScalarOffset, UnitIndexMap,
 };
 use super::lightweight_simplification::sentient::run_light_weight_simplifications;
+use super::loop_tree::LoopTree;
 use super::scalar_simplifications::sentient::Propagation;
+use super::utils::opcode_imm_info;
 use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::dialects::sentient as ops;
-use crate::islands::sentient::dialects::{Op, Val, results};
+use crate::islands::sentient::dialects::{Op, Val, regions_mut, results};
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
 use crate::units::DfirUnit;
@@ -598,35 +606,228 @@ impl ScalarOpMergingBlock {
     }
 }
 
-// crustify:todo: e361_isImmutableValueInRange
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:232  (28 body lines, level 1)
-//   original  : bool isImmutableValueInRange(const EvaluatedValue &new_immutable_ev, const EvaluatedValue &original_immutable_ev, int element_size, mlir::Operation *op) const
-//   calls     : e157_doesImmutableImmExceedRange, e158_doesValueExceedLRFRange
+/// Replaces: e361_isImmutableValueInRange
+///
+/// Whether a merge or hoist may push an immutable address to `new_immutable_ev`: inside the LDSTI imm
+/// window always, and outside it only when the ORIGINAL was already outside it too AND the new value
+/// still fits the unit's LRF (`:232-260`).
+///
+/// ⛔ IT IS NOT "IS IN THE IMM RANGE": an address that already exceeded the window may be pushed
+/// further, because the op pays for an LRF either way — only one pushed OUT of a window it FITTED is
+/// refused. ⚠️ The two `LLVM_DEBUG` dumps and the `Operation *op` they print change no IR and are
+/// dropped.
+#[must_use]
+pub(crate) fn is_immutable_value_in_range<A: Arch>(
+    new_immutable_ev: &Evaluation,
+    original_immutable_ev: &Evaluation,
+    element_size: Bits,
+    ldsti_imm_range: ImmRange,
+    comp: ScalarOpComp,
+    scale: AddressScale,
+) -> bool {
+    if does_immutable_imm_exceed_range(new_immutable_ev, element_size, ldsti_imm_range, scale) {
+        if !does_immutable_imm_exceed_range(
+            original_immutable_ev,
+            element_size,
+            ldsti_imm_range,
+            scale,
+        ) {
+            return false;
+        }
+        if does_value_exceed_lrf_range::<A>(new_immutable_ev, element_size, comp, scale) {
+            return false;
+        }
+    }
+    true
+}
 
-// crustify:todo: e366_runOn
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2258  (130 body lines, level 1)
-//   original  : void runOn(dataflow::ProgramUnitOp unit, ModuleOp module_op)
-//   calls     : e252_size
+/// `DisableScalarOpMerging`, `cl::init(false)` (`:97-99`) — a `dcc-opt` flag, and this crate has none.
+const DISABLE_SCALAR_OP_MERGING: bool = false;
+
+/// `DisableScalarOpHoisting`, `cl::init(false)` (`:101-103`).
+const DISABLE_SCALAR_OP_HOISTING: bool = false;
 
 /// `DisableSOMAHSimplification`, `cl::init(false)` (`:127-131`) — a `dcc-opt` flag, and this crate
 /// has no flags.
 const DISABLE_SOMAH_SIMPLIFICATION: bool = false;
 
-/// `ScalarOpMergingAndHoistingPass::runOn(dataflow::ProgramUnitOp, ModuleOp)` (`:2258`) — ⛔⛔
-/// **e366_runOn**, the anchor above, WHICH IS NOT IN THIS BATCH. This function is that one call and
-/// nothing else, and it goes away when e366 lands. ⛔ Not written here: filling another batch's
-/// anchor would double-fill it and take the unit out of the campaign's accounting.
-fn merge_and_hoist_one_unit<A: Arch>(
+/// `isa.typeToImmInfo.at(isa.getOpcodeType(OpCodeT::LDSTI))` per LX/L0 unit (`:2278-2281`) — a table
+/// lookup, so it resolves at BUILD time and its `DT_CHECK(size == 1)` (`:2282`) is a compile error.
+///
+/// ⛔ **LDSTI**, NOT LDSTIU: the two share an instruction type on each of these four components, but
+/// [`super::utils::imm_size_valid`] means the other opcode and each names the one it measures.
+const LDSTI_IMM_L0LU: (ImmWidth, Sign) = opcode_imm_info(fields::Comp::L0lu, "LDSTI");
+const LDSTI_IMM_L0SU: (ImmWidth, Sign) = opcode_imm_info(fields::Comp::L0su, "LDSTI");
+const LDSTI_IMM_LXLU: (ImmWidth, Sign) = opcode_imm_info(fields::Comp::Lxlu, "LDSTI");
+const LDSTI_IMM_LXSU: (ImmWidth, Sign) = opcode_imm_info(fields::Comp::Lxsu, "LDSTI");
+
+/// `getImmRange` (`:2274-2290`) — the window an LDSTI immediate may occupy on the unit being run on.
+///
+/// ⛔ `{0, 0}` OFF LX/L0 (`:2277`) IS NOT AN EMPTY WINDOW, it admits the immediate 0 — and no such
+/// unit reaches a range test anyway, because every reader sits behind [`ScalarOpComp::of`].
+/// ⚠️ THE UNSIGNED ARM IS UNREACHABLE AND KEPT VERBATIM: all four fields above are signed, so its
+/// `(0, 1 << bits)` — one PAST the widest unsigned value — never decides anything.
+fn ldsti_imm_range(comp: Option<ScalarOpComp>) -> ImmRange {
+    let Some(comp) = comp else {
+        return ImmRange { min: 0, max: 0 };
+    };
+    let (bits, sign) = match comp {
+        ScalarOpComp::L0lu => LDSTI_IMM_L0LU,
+        ScalarOpComp::L0su => LDSTI_IMM_L0SU,
+        ScalarOpComp::Lxlu => LDSTI_IMM_LXLU,
+        ScalarOpComp::Lxsu => LDSTI_IMM_LXSU,
+    };
+    let width = i32::from(bits.get());
+    match sign {
+        Sign::Signed => {
+            let max_val = 1 << (width - 1);
+            ImmRange {
+                min: -max_val,
+                max: max_val - 1,
+            }
+        }
+        Sign::Unsigned | Sign::ModuloUnsigned => ImmRange {
+            min: 0,
+            max: 1 << width,
+        },
+    }
+}
+
+/// THE BLOCK A `sentient.for` SITS IN AND ITS POSITION IN IT — the `LoopNode`'s `Operation *`, which
+/// knows its own block, replaced by a search from the unit body. [`ForRef`] is the loop's identity.
+///
+/// ⭐ RE-ASKED BEFORE EVERY PHASE: merging rewrites the body and hoisting inserts AHEAD of the loop,
+/// so a position taken once is stale by the next phase — the same reason e635 re-finds its own `at`.
+fn loop_site(scope: &mut Vec<Op>, loop_ref: ForRef) -> Option<(&mut Vec<Op>, usize)> {
+    let here = scope
+        .iter()
+        .position(|op| matches!(op, Op::Sentient(ops::Op::For { iv, .. }) if *iv == loop_ref.0));
+    if let Some(at) = here {
+        return Some((scope, at));
+    }
+    for op in scope.iter_mut() {
+        for region in regions_mut(op) {
+            if let Some(site) = loop_site(region, loop_ref) {
+                return Some(site);
+            }
+        }
+    }
+    None
+}
+
+/// Replaces: e366_runOn
+///
+/// One program unit, its loop forest in reverse BFS: merge the scalar ops of each loop body (LX/L0
+/// only), hoist out of that same loop, and when the walk is done merge the unit's own outermost
+/// region (`:2258-2387`).
+///
+/// ⛔ THE IBUFF IS RE-MEASURED ON THE WHOLE UNIT BEFORE EVERY PHASE (`:2315`, `:2339`, `:2368`): each
+/// phase spends what the one before it left, never a budget taken once.
+/// ⚠️ `getLocalOrGlobalRegion(for_op)` is not ported, so `query_maps: None` makes the walked block its
+/// own query-map home — the established divergence. ⚠️ All six `LLVM_DEBUG` dumps change no IR.
+pub(crate) fn run_on_unit<A: Arch, E: ExpressionEvaluator, I: InstructionEstimator>(
     preamble: &mut Vec<Op>,
     unit: &mut ProgramUnit<A>,
+    evaluator: &mut E,
+    estimator: &mut I,
+    values: &mut Values,
     hoists: &mut HoistCount,
 ) {
-    let _ = (preamble, unit, hoists);
-    todo!(
-        "ScalarOpMergingAndHoisting::runOn(unit, module_op) — senpass e366 \
-         (ScalarOpMergingAndHoisting.cpp:2258) is not ported yet, so nothing in this unit merges or \
-         hoists and the simplification below has nothing to clean up"
-    )
+    // `EnumsConversion::senCompToGenericComp.at(unit_comp)` over the unit's own `GetUnitOp` (`:2263-2269`),
+    // whose `DT_CHECK_MSG(get_unit_op, ..)` is discharged by [`crate::islands::dataflow_ir::Units`].
+    let gen_comp = unit.on.kind().generic();
+    // `is_LX_L0` (`:2271-2273`) AS THE VALUE THE MERGING PASS ALSO NEEDS.
+    let scalar_comp = ScalarOpComp::of(gen_comp);
+    let ldsti_imm_range = ldsti_imm_range(scalar_comp);
+    // ⚠️ DIVERGENCE, AND IT DECIDES NOTHING: `ScalarOptimizationContext`'s `scale_` is
+    // `computeAddressScale(gen_comp, ..)` (`:206`), which stands at **-1** off LX/L0 (`:272`) —
+    // inexpressible in a [`AddressScale`]. Every reader of it sits behind [`ScalarOpComp::of`], so no
+    // scaled immediate is ever computed from the value this stands in for.
+    let scale = scalar_comp.map_or(AddressScale::ONE, compute_address_scale::<A>);
+
+    let tree = LoopTree::<false>::of(&unit.body);
+    // `if (!loopTree.empty()) loopTree.walk(optimizeNode, kReverseBFS)` (`:2361-2362`).
+    if !tree.empty() {
+        for n in tree.walk_reverse_bfs() {
+            // `if (n == loopTree.getRoot() || !n) return nullptr;` (`:2302`) — the root names no loop.
+            let Some(loop_op) = tree.loop_of(n) else {
+                continue;
+            };
+            if !DISABLE_SCALAR_OP_MERGING && let Some(comp) = scalar_comp {
+                estimator.recalculate(&unit.body);
+                let ibuff_space = IbuffSpace(estimator.remaining_ibuff_space(&unit.body).0);
+                if let Some((block, at)) = loop_site(&mut unit.body, loop_op) {
+                    run_scalar_op_merging::<A, E>(
+                        MergingRegion::LoopBody(&mut block[at]),
+                        ibuff_space,
+                        comp,
+                        ldsti_imm_range,
+                        scale,
+                        evaluator,
+                        &mut OffsetSites {
+                            consts: &mut *preamble,
+                            query_maps: None,
+                            values: &mut *values,
+                        },
+                    );
+                }
+            }
+            if DISABLE_SCALAR_OP_HOISTING {
+                continue;
+            }
+            // `if (MaxHoists != -1 && num_hoists_executed_per_unit >= MaxHoists) return n;` (`:2336`),
+            // which skips this node's hoisting and not the walk — the returned node is dead code.
+            if MAX_HOISTS.is_some_and(|max| *hoists >= max) {
+                continue;
+            }
+            estimator.recalculate(&unit.body);
+            let mut ibuff_space = IbuffSpace(estimator.remaining_ibuff_space(&unit.body).0);
+            // `n->isInnermostLoop()`, which is `isLeaf()` (`LoopTree.hpp:56`).
+            let innermost = if tree.first_child(n).is_none() {
+                Innermost::Yes
+            } else {
+                Innermost::No
+            };
+            let Some((block, at)) = loop_site(&mut unit.body, loop_op) else {
+                continue;
+            };
+            run_scalar_op_hoisting::<A, E>(
+                block,
+                at,
+                innermost,
+                ldsti_imm_range,
+                gen_comp,
+                scale,
+                evaluator,
+                &mut OffsetSites {
+                    consts: &mut *preamble,
+                    query_maps: None,
+                    values: &mut *values,
+                },
+                &mut ibuff_space,
+                hoists,
+            );
+        }
+    }
+
+    // "Run Scalar Op Merging on the main region of the unit (outermost region)." (`:2364-2385`).
+    if !DISABLE_SCALAR_OP_MERGING && let Some(comp) = scalar_comp {
+        estimator.recalculate(&unit.body);
+        let ibuff_space = IbuffSpace(estimator.remaining_ibuff_space(&unit.body).0);
+        run_scalar_op_merging::<A, E>(
+            MergingRegion::UnitRegion(&mut unit.body),
+            ibuff_space,
+            comp,
+            ldsti_imm_range,
+            scale,
+            evaluator,
+            &mut OffsetSites {
+                consts: preamble,
+                query_maps: None,
+                values,
+            },
+        );
+    }
 }
 
 /// Replaces: e636_runOn
@@ -640,16 +841,19 @@ fn merge_and_hoist_one_unit<A: Arch>(
 /// `unit->getBlock()` is the block that HOLDS the unit, so e597's constants land in the preamble.
 /// ⭐ THE RETURNED UNITS ARE `emitError("failed in simplifying code") + signalPassFailure()` AS DATA
 /// (`:2398-2399`): the reference does not `return`, so the units behind a failure still run.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_on_module<
     A: Arch,
     M: Model,
     W: Workload,
     E: ExpressionEvaluator,
+    I: InstructionEstimator,
     P: PropagationAnalysis,
     U: UnitIndexMap,
 >(
     program: &mut Program<A, M, W>,
     evaluator: &mut E,
+    estimator: &mut I,
     propagation: &mut P,
     unit_index_map: &U,
     values: &mut Values,
@@ -660,7 +864,7 @@ pub(crate) fn run_on_module<
     let mut failed_to_simplify = Vec::new();
     for unit in units.iter_mut() {
         let mut hoists = HoistCount(0);
-        merge_and_hoist_one_unit(preamble, unit, &mut hoists);
+        run_on_unit(preamble, unit, evaluator, estimator, values, &mut hoists);
         if DISABLE_SOMAH_SIMPLIFICATION {
             continue;
         }
@@ -808,6 +1012,32 @@ mod unit_tests {
             ScalarOpComp::Lxlu,
             scale
         ));
+    }
+
+    /// e361 — ⛔ IT IS NOT "IS IN THE IMM RANGE". With `element_size = 8` and `scale = 1` the offset
+    /// IS the immediate: 100 is simply inside the window; 128 is outside one the original FITTED and
+    /// is refused; 1023 is outside a window the original had already left, and Dd2's 10-bit L0 LRF
+    /// holds it; 1024 leaves that LRF too and is refused after all.
+    #[test]
+    fn a_value_already_outside_the_imm_window_may_be_pushed_further_but_not_past_the_lrf() {
+        let window = ImmRange {
+            min: -128,
+            max: 127,
+        };
+        let in_range = |new: i64, original: i64| {
+            is_immutable_value_in_range::<Dd2>(
+                &all_unit(new),
+                &all_unit(original),
+                Bits(8),
+                window,
+                ScalarOpComp::L0lu,
+                AddressScale::ONE,
+            )
+        };
+        assert!(in_range(100, 0));
+        assert!(!in_range(128, 0));
+        assert!(in_range(1023, 200));
+        assert!(!in_range(1024, 200));
     }
 
     /// ⛔ THE L0 STORE'S SCALE IS THE ROW COUNT AND THE L0 LOAD'S IS 1 — the same memory, two units,
@@ -996,10 +1226,85 @@ mod unit_tests {
         const ACTIVE_CAP: u32 = 64;
     }
 
-    /// e636 — the walk reaches its first unit's merge-and-hoist. ⛔ THE ONLY ASSERTION THERE IS UNTIL
-    /// e366 LANDS: [`ProgramUnits`] cannot be empty, so no run of this entry skips the seam.
+    /// The estimator these two units are handed, recording the SIZE OF THE UNIT it was asked to
+    /// recount each time — which is how a phase that re-measures shows itself.
+    #[derive(Debug, Default)]
+    struct CountingEstimator {
+        recalculated: Vec<usize>,
+    }
+
+    impl InstructionEstimator for CountingEstimator {
+        fn recalculate(&mut self, unit: &[Op]) {
+            self.recalculated.push(unit.len());
+        }
+
+        fn estimated_instruction_count_of_op(&mut self, _op: &Op) -> InstructionCount {
+            todo!("no phase of this entry counts one op")
+        }
+
+        fn estimated_instruction_count_of_region(&mut self, _region: &[Op]) -> InstructionCount {
+            todo!("no phase of this entry counts a region")
+        }
+
+        fn have_ibuff_space(&mut self, _unit: &[Op]) -> bool {
+            todo!("no phase of this entry asks whether the unit fits")
+        }
+
+        fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
+            InstructionCount(8)
+        }
+    }
+
+    /// One unit whose body is a single loop with nothing in it — enough to put a node in the loop
+    /// forest, and empty enough that no phase rewrites anything.
+    fn unit_with_one_loop<A: Arch>(on: DfirUnit, at: Val) -> ProgramUnit<A> {
+        ProgramUnit {
+            on: Units::one(on, at),
+            precision: None,
+            body: vec![Op::Sentient(ops::Op::For {
+                iv: Val(10),
+                bound: Val(11),
+                bound_reg: None,
+                carried: Vec::new(),
+                dbg_name: None,
+                body: Vec::new(),
+            })],
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e366 — ⛔ THE IBUFF IS RE-MEASURED BEFORE EVERY PHASE, and WHICH phases there are is the unit's
+    /// own: an LX unit merges the loop body, hoists out of it, then merges the unit region — three
+    /// measurements. An L3 unit is neither LX nor L0, so both merges are skipped and only the hoist
+    /// measures. Each measurement sees the WHOLE unit, which is why the recorded size is 1 every time.
     #[test]
-    #[should_panic(expected = "senpass e366")]
+    fn e366_measures_the_ibuff_before_every_phase_and_merges_only_on_lx_l0() {
+        for (on, phases) in [(DfirUnit::Lxlu, vec![1, 1, 1]), (DfirUnit::L3lu, vec![1])] {
+            let mut unit = unit_with_one_loop::<Dd2>(on, Val(1));
+            let untouched = unit.body.clone();
+            let mut preamble = Vec::new();
+            let mut values = Values::default();
+            let mut estimator = CountingEstimator::default();
+            let mut hoists = HoistCount(0);
+            run_on_unit(
+                &mut preamble,
+                &mut unit,
+                &mut OutOfScopeEvaluator,
+                &mut estimator,
+                &mut values,
+                &mut hoists,
+            );
+            assert_eq!(estimator.recalculated, phases);
+            assert_eq!(unit.body, untouched);
+            assert!(preamble.is_empty());
+            assert_eq!(hoists, HoistCount(0));
+        }
+    }
+
+    /// e636 — every unit of the module goes through merge-and-hoist AND the simplification behind it:
+    /// two LX units measure three phases each, and each unit's empty loop is GONE afterwards, which
+    /// only the per-unit lightweight simplification does.
+    #[test]
     fn e636_walks_every_unit_through_merging_and_hoisting() {
         let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
             name: ProgramName {
@@ -1009,24 +1314,26 @@ mod unit_tests {
             },
             preamble: Vec::new(),
             units: ProgramUnits::of(
-                ProgramUnit {
-                    on: Units::one(DfirUnit::Lxlu, Val(1)),
-                    precision: None,
-                    body: Vec::new(),
-                    arch: core::marker::PhantomData,
-                },
-                Vec::new(),
+                unit_with_one_loop(DfirUnit::Lxlu, Val(1)),
+                vec![unit_with_one_loop(DfirUnit::Lxsu, Val(2))],
             ),
             bound: core::marker::PhantomData,
         };
         let mut values = Values::default();
+        let mut estimator = CountingEstimator::default();
 
-        let _ = run_on_module(
+        let failed = run_on_module(
             &mut program,
             &mut OutOfScopeEvaluator,
+            &mut estimator,
             &mut OutOfScopePropagationAnalysis,
             &OutOfScopeUnitIndexMap,
             &mut values,
         );
+        assert!(failed.is_empty());
+        assert_eq!(estimator.recalculated, vec![1, 1, 1, 1, 1, 1]);
+        for unit in program.units.iter() {
+            assert!(unit.body.is_empty(), "the empty loop was simplified away");
+        }
     }
 }

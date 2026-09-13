@@ -1080,25 +1080,31 @@ pub fn constant_imm(val: Val, defs: Definitions<'_>) -> Option<ConstantImm> {
     }
 }
 
-/// `Isa::typeToImmInfo.at(isa.getOpcodeType(OpCodeT::LDSTIU))` for one unit
+/// `Isa::typeToImmInfo.at(isa.getOpcodeType(opcode))` for one unit
 /// (`Utils/DccExtContext.cpp:40-45`).
 ///
 /// ⭐ `DT_CHECK(sizeSignMap.size() == 1)` (`:42`) FAILS THE BUILD HERE, not the run: this is a
-/// `const fn` and the four call sites below are `const` items, so a table with two immediate fields on
-/// the LDSTIU type is a compile error.
-const fn ldstiu_imm_info(comp: fields::Comp) -> (ImmWidth, Sign) {
+/// `const fn` and every call site is a `const` item, so a table with two immediate fields on
+/// `opcode`'s type is a compile error.
+///
+/// ⛔ `opcode` IS READ, NEVER ASSUMED: LDSTI and LDSTIU happen to share an instruction type on each
+/// of the four LX/L0 components, but that is a fact of the table and not a rule, so each caller names
+/// the opcode whose immediate window it actually means.
+pub(crate) const fn opcode_imm_info(comp: fields::Comp, opcode: &str) -> (ImmWidth, Sign) {
     let opcodes = comp.opcodes();
     let mut i = 0;
-    let mut ldstiu = None;
+    let mut found_ty = None;
     while i < opcodes.len() {
-        if str_eq(opcodes[i].op, "LDSTIU") {
-            ldstiu = Some(opcodes[i].ty);
+        if str_eq(opcodes[i].op, opcode) {
+            found_ty = Some(opcodes[i].ty);
         }
         i += 1;
     }
-    let ty = match ldstiu {
+    let ty = match found_ty {
         Some(ty) => ty.get(),
-        None => panic!("every memory unit defines LDSTIU (`isa.cpp:1132`, `:1198`, `:1267`, `:1359`)"),
+        None => panic!(
+            "this unit does not define the named opcode (`isa.cpp:1132`, `:1198`, `:1267`, `:1359`)"
+        ),
     };
 
     let all = comp.fields();
@@ -1117,13 +1123,13 @@ const fn ldstiu_imm_info(comp: fields::Comp) -> (ImmWidth, Sign) {
     match (info, found) {
         (Some(info), 1) => info,
         _ => panic!(
-            "the LDSTIU type must have exactly one immediate field — \
+            "the named opcode's type must have exactly one immediate field — \
              DT_CHECK(sizeSignMap.size() == 1) (`Utils/DccExtContext.cpp:42`)"
         ),
     }
 }
 
-/// `str::eq` is not `const`, and [`ldstiu_imm_info`] needs the opcode spelling compared at build time.
+/// `str::eq` is not `const`, and [`opcode_imm_info`] needs the opcode spelling compared at build time.
 const fn str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -1139,10 +1145,10 @@ const fn str_eq(a: &str, b: &str) -> bool {
     true
 }
 
-const LDSTIU_IMM_L0LU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::L0lu);
-const LDSTIU_IMM_L0SU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::L0su);
-const LDSTIU_IMM_LXLU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::Lxlu);
-const LDSTIU_IMM_LXSU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::Lxsu);
+const LDSTIU_IMM_L0LU: (ImmWidth, Sign) = opcode_imm_info(fields::Comp::L0lu, "LDSTIU");
+const LDSTIU_IMM_L0SU: (ImmWidth, Sign) = opcode_imm_info(fields::Comp::L0su, "LDSTIU");
+const LDSTIU_IMM_LXLU: (ImmWidth, Sign) = opcode_imm_info(fields::Comp::Lxlu, "LDSTIU");
+const LDSTIU_IMM_LXSU: (ImmWidth, Sign) = opcode_imm_info(fields::Comp::Lxsu, "LDSTIU");
 
 /// `DccExtContext::is_imm_size_valid` (`Utils/DccExtContext.cpp:32-75`) — whether the constant
 /// immutable address still fits the unit's LDSTIU immediate field once scaled.

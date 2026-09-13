@@ -89,12 +89,11 @@
 use core::cmp::Ordering;
 use std::collections::BTreeSet;
 
-use super::scalar_op_hoisting::{
-    IbuffSpace, first_const_operand_index, is_immutable_value_in_range, is_sentient_constant,
-};
+use super::scalar_op_hoisting::{IbuffSpace, first_const_operand_index, is_sentient_constant};
 use super::{
     AddressScale, BurstAndIl, FieldUnrollData, ImmRange, MemoryOpInfo, OperationData, ScalarOpComp,
-    ScalarOpMergingBlock, UnrollTarget, does_immutable_imm_exceed_range, does_value_exceed_lrf_range,
+    ScalarOpMergingBlock, UnrollTarget, does_immutable_imm_exceed_range,
+    does_value_exceed_lrf_range, is_immutable_value_in_range,
 };
 use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
@@ -770,11 +769,16 @@ pub(crate) fn build_block<A: Arch, E: ExpressionEvaluator>(
                         let rebased = evaluator.evaluate_sub_handle(immutable_addr, op_increment);
                         evaluator.evaluate_sub_handle(rebased, increment)
                     };
-                    if !is_immutable_value_in_range(
+                    // ⚠️ THE `Operation *op` THE STUB TOOK IS GONE: e361 reads it only for its two
+                    // `LLVM_DEBUG` dumps, and the window and scale it measures against come from
+                    // the unit being run on.
+                    if !is_immutable_value_in_range::<A>(
                         &new_immutable_addr_ev,
                         &immutable_addr_ev,
                         mem_info.element_size,
-                        op,
+                        imm_range,
+                        comp,
+                        scale,
                     ) {
                         break;
                     }

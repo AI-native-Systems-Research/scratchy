@@ -89,25 +89,30 @@
 //! | `e635_runScalarOpHoisting` | 635 | 6 | 61 | `dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2184` |
 
 #![allow(dead_code)]
-// ⛔ NOTHING CALLS THIS FILE'S PASS ENTRY YET — `e635_runScalarOpHoisting` below is ported, but its
-// own caller is `e366_runOn` (`ScalarOpMergingAndHoisting.cpp:2258`), which is a different batch's
-// unit. CI runs clippy with `-D warnings`, so without this the batch fails its own gate.
-// ⭐ REMOVE THIS WITH `e366_runOn`: an unused item here is a real defect at that point.
+// ⛔ THE WHOLE CHAIN IS STILL UNREACHABLE — `e635_runScalarOpHoisting` has its caller now
+// (`e366_runOn`), but the pass is not wired into the pipeline until `e646_runOnOperation`
+// (`ScalarOpMergingAndHoisting.cpp:2404`, level 7), which is a different batch's unit. CI runs clippy
+// with `-D warnings`, so without this the batch fails its own gate.
+// ⭐ REMOVE THIS WITH e646: an unused item here is a real defect at that point.
 
-use super::{AddressScale, MemoryOpInfo, OperationData, ScalarOpComp, does_value_exceed_lrf_range};
+use super::{
+    AddressScale, ImmRange, MemoryOpInfo, OperationData, ScalarOpComp, does_value_exceed_lrf_range,
+    is_immutable_value_in_range,
+};
 use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::{GenericComp, ScalarTy};
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, defining_op, erase_defining_op, operands, regions_ref,
-    replace_all_uses_with, results, uniform, use_count,
+    Definitions, Op, Val, defining_op, erase_defining_op, operands, regions_mut, regions_ref,
+    replace_all_uses_with, results, set_operand, uniform, use_count,
 };
 use crate::transform::sentient::IterArgIndex;
 use crate::transform::sentient::analyses::{
     EvaluatedValue, Evaluation, ExpressionEvaluator, OffsetSites,
 };
+use crate::transform::sentient::old_register_initialization::register_init_info::is_target_constant;
 
 /// `ibuff_space_` — how many instruction-buffer entries are left for the ops this pass creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -431,12 +436,15 @@ pub(crate) fn is_mergeable_op_or_chain<'a>(
 /// The new value for a constant a chain op reads: `modifier` alone when it replaces, and `modifier`
 /// plus what the constant already holds when it adds to.
 ///
-/// ⛔ TRAP: the `AddTo` arm needs `ExpressionEvaluator::evaluateSum`, which is OUT OF CAMPAIGN SCOPE
-/// and therefore a `todo!` at [`crate::transform::sentient::analyses::OutOfScopeEvaluator`] — the arm is present, and it
-/// is the analysis behind it that is not.
+/// ⛔ THE MODIFIER IS THE ARENA HANDLE, NOT A DECODED [`Evaluation`]: the reference's
+/// `const EvaluatedValue &modifier` is the entry [`OperationData::mod_by`] stored, and e365 hands it
+/// straight back — decoding it here would be inventing the out-of-scope analysis.
+/// ⛔ TRAP: both arms need methods that are OUT OF CAMPAIGN SCOPE and therefore `todo!`s at
+/// [`crate::transform::sentient::analyses::OutOfScopeEvaluator`] — the arms are present, and it is
+/// the analysis behind them that is not.
 pub(crate) fn add_to_or_replace_op<E: ExpressionEvaluator>(
     op: ConstantValue,
-    modifier: &Evaluation,
+    modifier: EvaluatedValue,
     replace_with_mod: Modification,
     evaluator: &mut E,
     sites: &mut OffsetSites<'_>,
@@ -444,12 +452,12 @@ pub(crate) fn add_to_or_replace_op<E: ExpressionEvaluator>(
 ) -> Val {
     match replace_with_mod {
         Modification::Replace => {
-            evaluator.build_offset_value(modifier, sites, walked, ScalarTy::Index)
+            evaluator.build_offset_value_of(modifier, sites, walked, ScalarTy::Index)
         }
         Modification::AddTo => {
-            let held = evaluator.evaluate_value(op.0);
-            let sum = evaluator.evaluate_sum(modifier, &held);
-            evaluator.build_offset_value(&sum, sites, walked, ScalarTy::Index)
+            let held = evaluator.evaluate_value_handle(op.0);
+            let sum = evaluator.evaluate_sum_handle(modifier, held);
+            evaluator.build_offset_value_of(sum, sites, walked, ScalarTy::Index)
         }
     }
 }
@@ -509,11 +517,6 @@ pub(crate) fn hoist_candidate_out_of_loop(
     }
 }
 
-// crustify:todo: e365_applyOperationData
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1740  (54 body lines, level 1)
-//   original  : void ScalarOpHoisting::applyOperationData( SmallVector<OperationData> &ops_to_update)
-//   calls     : e172_addToOrReplaceOp
-
 /// THE MERGING INCREMENT AS BOTH THINGS THE CHAIN WALK NEEDS IT AS — the [`EvaluatedValue`] handle
 /// [`OperationData`] stores, and the decoded [`Evaluation`] `doesValueExceedLRFRange` reads.
 ///
@@ -530,27 +533,6 @@ pub(crate) struct MergingIncrement<'a> {
     pub(crate) evaluation: &'a Evaluation,
 }
 
-/// `OptimizationContext::isImmutableValueInRange` (`:232`) — whether a new immutable address still
-/// fits, in IMM range or, if the original was already out of it, in LRF range.
-///
-/// ⛔ IT IS e361 AND IT IS NOT PORTED YET. Both range tests it composes are ported already
-/// ([`does_immutable_imm_exceed_range`], [`does_value_exceed_lrf_range`]), but the `ldsti_imm_range_`
-/// pair and the `OptimizationContext` that carries it are that unit's to introduce.
-///
-/// [`does_immutable_imm_exceed_range`]: super::does_immutable_imm_exceed_range
-pub(super) fn is_immutable_value_in_range(
-    new_immutable_ev: &Evaluation,
-    original_immutable_ev: &Evaluation,
-    element_size: Bits,
-    op: &Op,
-) -> bool {
-    let _ = (new_immutable_ev, original_immutable_ev, element_size, op);
-    todo!(
-        "isImmutableValueInRange (senpass e361, ScalarOpMergingAndHoisting.cpp:232) is not ported \
-         yet — the IMM and LRF range tests over the new immutable address"
-    )
-}
-
 /// Replaces: e468_processMergeableChain
 ///
 /// Walks the chain out of `first_op_in_chain` recording how each op absorbs `merging_increment`, and
@@ -562,9 +544,11 @@ pub(super) fn is_immutable_value_in_range(
 /// ⛔ THE LRF TEST IS SKIPPED FOR EVERY NON-LX/L0 UNIT, and the add/sub is still recorded — only the
 /// memory-op arm refuses outright on `!is_any_of(getComp(), ..)` (`:1691`).
 /// ⭐ `Operation *input_to_chain` IS UNREAD IN THE BODY, droppable like e179's `OpBuilder&`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_mergeable_chain<A: Arch, E: ExpressionEvaluator>(
     first_op_in_chain: &Op,
     merging_increment: MergingIncrement<'_>,
+    ldsti_imm_range: ImmRange,
     comp: GenericComp,
     scale: AddressScale,
     scope: &[Op],
@@ -619,19 +603,21 @@ pub(crate) fn process_mergeable_chain<A: Arch, E: ExpressionEvaluator>(
             // `sentient.load_and_store` is deliberately among them (`:1689`).
             return true;
         };
-        if ScalarOpComp::of(comp).is_none() {
+        let Some(scalar_comp) = ScalarOpComp::of(comp) else {
             return false;
-        }
+        };
         // `checkImmutableRange` — the lambda whose recorded [`OperationData`] is the one effect it has
         // besides its answer (`:1650-1665`).
         let immutable_addr_ev = evaluator.evaluate_value(mem_info.immutable_addr);
         let new_immutable_ev =
             evaluator.evaluate_sum(&immutable_addr_ev, merging_increment.evaluation);
-        if !is_immutable_value_in_range(
+        if !is_immutable_value_in_range::<A>(
             &new_immutable_ev,
             &immutable_addr_ev,
             mem_info.element_size,
-            op,
+            ldsti_imm_range,
+            scalar_comp,
+            scale,
         ) {
             return false;
         }
@@ -658,17 +644,156 @@ pub(crate) fn process_mergeable_chain<A: Arch, E: ExpressionEvaluator>(
     true
 }
 
-/// `ScalarOpHoisting::applyOperationData` (`:1740`) — the per-op rewrite each [`OperationData`]
-/// describes.
+/// WHERE ONE RECORDED MODIFICATION LANDS — the operand slot of an add or sub, or a transfer's
+/// address pair, decided while the block is still borrowed for reading.
+#[derive(Debug, Clone, Copy)]
+enum Applied {
+    /// `op->setOperand(const_idx, new_const)`.
+    Operand(usize),
+    /// `getImmutableAddrMutable().assign(new_const)`, and the increment as well when it is not zero.
+    Address {
+        /// `!isTargetConstant(getIncrement(), 0)`.
+        also_increment: bool,
+    },
+}
+
+/// Replaces: e365_applyOperationData
 ///
-/// ⛔ IT IS e365 AND IT IS NOT PORTED YET; [`add_to_or_replace_op`], the unit it delegates each
-/// modification to, is ported and waiting for it.
-fn apply_operation_data(ops_to_update: &[OperationData]) {
-    let _ = ops_to_update;
-    todo!(
-        "applyOperationData (senpass e365, ScalarOpMergingAndHoisting.cpp:1740) is not ported yet — \
-         the per-op constant rewrite each OperationData describes"
-    )
+/// Applies every recorded modification: an add or sub gets a new constant operand, and a composite
+/// transfer a new immutable address — and the same value as its increment, unless that increment is
+/// already the constant zero (`:1740-1793`).
+///
+/// ⛔ THE SUB NEGATES THE MODIFIER FIRST, AND ONLY WHEN IT IS ADDING TO (`:1757-1760`): its constant
+/// is subtracted, so absorbing `+m` means storing `-m` — and a REPLACING sub keeps the modifier as is.
+/// ⛔ `llvm_unreachable("Unexpected operation encountered!")` (`:1791`) AND BOTH `DT_CHECK`s ARE NAMED
+/// `todo!`s: an op no arm claims is a caller defect, not an input this may answer for.
+fn apply_operation_data<E: ExpressionEvaluator>(
+    ops_to_update: &[OperationData],
+    scope: &mut Vec<Op>,
+    comp: GenericComp,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+) {
+    for op_data in ops_to_update {
+        let (constant, negate_modifier, applied) = {
+            let regions: [&[Op]; 1] = [scope.as_slice()];
+            let defs = Definitions::from_innermost(&regions);
+            let Some(op) = defining_op(op_data.op, scope) else {
+                // `op_data.getOp()` is a live pointer in the reference; an op a later entry of the
+                // same list already erased has nothing left to rewrite.
+                continue;
+            };
+            let modification = match op {
+                Op::Sentient(ops::Op::ScalarAdd { .. } | ops::Op::ScalarSub { .. }) => {
+                    let Some(const_idx) = first_const_operand_index(op, defs) else {
+                        // `getFirstConstOperandIndex`'s `-1`, which the reference then uses as an
+                        // operand index.
+                        continue;
+                    };
+                    let Some(constant) = operands(op).get(const_idx).copied() else {
+                        continue;
+                    };
+                    let negate = matches!(op, Op::Sentient(ops::Op::ScalarSub { .. }))
+                        && !op_data.replace_with_mod;
+                    (constant, negate, Applied::Operand(const_idx))
+                }
+                Op::Sentient(
+                    ops::Op::LoadAndSend {
+                        immutable_addr,
+                        increment,
+                        ..
+                    }
+                    | ops::Op::ReceiveAndStore {
+                        immutable_addr,
+                        increment,
+                        ..
+                    }
+                    | ops::Op::LoadComputeAndSend {
+                        immutable_addr,
+                        increment,
+                        ..
+                    },
+                ) => {
+                    if ScalarOpComp::of(comp).is_none() {
+                        todo!(
+                            "applyOperationData: DT_CHECK(is_any_of(getComp(), LXLU, LXSU, L0LU, \
+                             L0SU)) (ScalarOpMergingAndHoisting.cpp:1766) — {comp:?} recorded a \
+                             composite transfer"
+                        )
+                    }
+                    (
+                        *immutable_addr,
+                        false,
+                        Applied::Address {
+                            also_increment: !is_target_constant(*increment, 0, defs),
+                        },
+                    )
+                }
+                other => todo!(
+                    "applyOperationData: llvm_unreachable(\"Unexpected operation encountered!\") \
+                     (ScalarOpMergingAndHoisting.cpp:1791) — {other:?} was recorded for update"
+                ),
+            };
+            let (constant, negate, applied) = modification;
+            let Some(constant) = ConstantValue::of(constant, defs) else {
+                todo!(
+                    "addToOrReplaceOp: DT_CHECK_MSG(isConstant<sentient::ConstantOp>(..), \"Expect \
+                     op to be constant\") (ScalarOpMergingAndHoisting.cpp:1719) — {constant:?} is \
+                     not a constant"
+                )
+            };
+            (constant, negate, applied)
+        };
+        let modifier = if negate_modifier {
+            evaluator.evaluate_multiply_by_const(op_data.mod_by, -1)
+        } else {
+            op_data.mod_by
+        };
+        let replace_with_mod = if op_data.replace_with_mod {
+            Modification::Replace
+        } else {
+            Modification::AddTo
+        };
+        let new_const = add_to_or_replace_op(
+            constant,
+            modifier,
+            replace_with_mod,
+            evaluator,
+            sites,
+            scope,
+        );
+        let Some(op) = defining_op_mut(scope, op_data.op) else {
+            continue;
+        };
+        match applied {
+            Applied::Operand(const_idx) => set_operand(op, const_idx, new_const),
+            Applied::Address { also_increment } => {
+                if let Op::Sentient(
+                    ops::Op::LoadAndSend {
+                        immutable_addr,
+                        increment,
+                        ..
+                    }
+                    | ops::Op::ReceiveAndStore {
+                        immutable_addr,
+                        increment,
+                        ..
+                    }
+                    | ops::Op::LoadComputeAndSend {
+                        immutable_addr,
+                        increment,
+                        ..
+                    },
+                ) = op
+                {
+                    *immutable_addr = new_const;
+                    if also_increment {
+                        *increment = new_const;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Replaces: e469_hoistForLinearChain
@@ -682,14 +807,16 @@ fn apply_operation_data(ops_to_update: &[OperationData]) {
 /// rewrite the immutable address the swap just read (`:2046-2060`).
 /// ⛔ `llvm_unreachable("Unexpected operation found!")` (`:2059`) IS A NAMED `todo!`: a first chain op
 /// that is not one of the three composites is a caller defect, not an input this may answer for.
-pub(crate) fn hoist_for_linear_chain(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hoist_for_linear_chain<E: ExpressionEvaluator>(
     scope: &mut Vec<Op>,
     at: usize,
     main_iv: IterArgIndex,
     derived_iv: Val,
     comp_ops: &[OperationData],
     comp: GenericComp,
-    values: &mut Values,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
 ) {
     let Some(Op::Sentient(ops::Op::For { body, .. })) = scope.get_mut(at) else {
         return;
@@ -739,7 +866,7 @@ pub(crate) fn hoist_for_linear_chain(
              (ScalarOpMergingAndHoisting.cpp:2059) — {first:?} heads the chain"
         ),
     };
-    apply_operation_data(comp_ops);
+    apply_operation_data(comp_ops, body, comp, evaluator, sites);
     hoist_candidate_out_of_loop(
         scope,
         at,
@@ -747,14 +874,26 @@ pub(crate) fn hoist_for_linear_chain(
         derived_iv,
         first_op_immutable_addr,
         comp,
-        values,
+        sites.values,
     );
 }
 
 /// `Value::getDefiningOp()` in a block being rewritten — [`defining_op`], mutably.
+///
+/// ⭐ REGIONS INCLUDED, as [`defining_op`] and [`users`] both are: an op a `sentient.if` holds is one
+/// `getUsers()` reports and one e365 then has to rewrite.
 fn defining_op_mut(scope: &mut [Op], val: Val) -> Option<&mut Op> {
-    let at = scope.iter().position(|op| results(op).contains(&val))?;
-    scope.get_mut(at)
+    for op in scope.iter_mut() {
+        if results(op).contains(&val) {
+            return Some(op);
+        }
+        for region in regions_mut(op) {
+            if let Some(found) = defining_op_mut(region, val) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// Replaces: e529_processForOpResult
@@ -766,11 +905,13 @@ fn defining_op_mut(scope: &mut [Op], val: Val) -> Option<&mut Op> {
 /// — a chain e171 accepted but e468 then declined still leaves its partial records in the list and
 /// this still answers true. Not a transcription slip: the two call sites differ in the reference.
 /// ⭐ `result.use_empty()` (`:1489`) IS THE EMPTY WALK: no reader, nothing to absorb, true.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_for_op_result<A: Arch, E: ExpressionEvaluator>(
     scope: &[Op],
     at: usize,
     result_idx: IterArgIndex,
     adjustment_increment: MergingIncrement<'_>,
+    ldsti_imm_range: ImmRange,
     comp: GenericComp,
     scale: AddressScale,
     evaluator: &mut E,
@@ -789,6 +930,7 @@ pub(crate) fn process_for_op_result<A: Arch, E: ExpressionEvaluator>(
         process_mergeable_chain::<A, E>(
             user,
             adjustment_increment,
+            ldsti_imm_range,
             comp,
             scale,
             scope,
@@ -810,14 +952,17 @@ pub(crate) fn process_for_op_result<A: Arch, E: ExpressionEvaluator>(
 /// negated, which is what makes the two forms one add.
 /// ⛔ THE EVALUATION HAPPENS BEFORE THAT GATE (`:1858-1862`) and the analysis memoises, so asking is
 /// not free of effect. ⛔ AND BEFORE ANY REWRITE: one declining reader leaves the loop untouched.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_for_derived_iv_elimination<A: Arch, E: ExpressionEvaluator>(
     scope: &mut Vec<Op>,
     at: usize,
     main_iv: IterArgIndex,
     derived_iv: Val,
+    ldsti_imm_range: ImmRange,
     comp: GenericComp,
     scale: AddressScale,
     evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
     hoists: &mut HoistCount,
 ) -> bool {
     // `is_any_of(getComp(), LXLU, LXSU, L0LU, L0SU)` — DerivedIV elimination is LX/L0 only (`:1845`).
@@ -869,6 +1014,7 @@ pub(crate) fn process_for_derived_iv_elimination<A: Arch, E: ExpressionEvaluator
         if !process_mergeable_chain::<A, E>(
             user,
             increment,
+            ldsti_imm_range,
             comp,
             scale,
             body,
@@ -878,7 +1024,7 @@ pub(crate) fn process_for_derived_iv_elimination<A: Arch, E: ExpressionEvaluator
             return false;
         }
     }
-    apply_operation_data(&ops_to_update);
+    apply_operation_data(&ops_to_update, body, comp, evaluator, sites);
     replace_all_uses_with(body, derived_iv, main_iv_arg);
     erase_defining_op(body, derived_iv);
     hoists.0 += 1;
@@ -917,6 +1063,7 @@ pub(crate) fn adjust_candidate_for_op_result<A: Arch, E: ExpressionEvaluator>(
     main_iv: IterArgIndex,
     adjustment_increment: MergingIncrement<'_>,
     innermost: Innermost,
+    ldsti_imm_range: ImmRange,
     comp: GenericComp,
     scale: AddressScale,
     evaluator: &mut E,
@@ -929,13 +1076,14 @@ pub(crate) fn adjust_candidate_for_op_result<A: Arch, E: ExpressionEvaluator>(
         at,
         main_iv,
         adjustment_increment,
+        ldsti_imm_range,
         comp,
         scale,
         evaluator,
         &mut ops_to_update,
     ) {
         if !ops_to_update.is_empty() {
-            apply_operation_data(&ops_to_update);
+            apply_operation_data(&ops_to_update, scope, comp, evaluator, sites);
         }
         return true;
     }
@@ -987,6 +1135,7 @@ pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
     main_iv: IterArgIndex,
     derived_iv: Val,
     innermost: Innermost,
+    ldsti_imm_range: ImmRange,
     comp: GenericComp,
     scale: AddressScale,
     evaluator: &mut E,
@@ -995,9 +1144,9 @@ pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
     hoists: &mut HoistCount,
 ) -> bool {
     // `is_any_of(getComp(), LXLU, LXSU, L0LU, L0SU)` — linear-chain hoisting is LX/L0 only (`:1894`).
-    if ScalarOpComp::of(comp).is_none() {
+    let Some(scalar_comp) = ScalarOpComp::of(comp) else {
         return false;
-    }
+    };
     let Some(Op::Sentient(ops::Op::For { carried, body, .. })) = scope.get(at) else {
         return false;
     };
@@ -1083,11 +1232,13 @@ pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
         }
         if first_comp_op_found {
             let new_immutable_ev = evaluator.evaluate_sum(&immutable_addr_ev, &offset);
-            if !is_immutable_value_in_range(
+            if !is_immutable_value_in_range::<A>(
                 &new_immutable_ev,
                 &immutable_addr_ev,
                 mem_info.element_size,
-                op,
+                ldsti_imm_range,
+                scalar_comp,
+                scale,
             ) {
                 return false;
             }
@@ -1103,8 +1254,14 @@ pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
             if mem_info.burst > Elements(1) || mem_info.il > Elements(1) {
                 return false;
             }
-            if !is_immutable_value_in_range(&offset, &immutable_addr_ev, mem_info.element_size, op)
-            {
+            if !is_immutable_value_in_range::<A>(
+                &offset,
+                &immutable_addr_ev,
+                mem_info.element_size,
+                ldsti_imm_range,
+                scalar_comp,
+                scale,
+            ) {
                 return false;
             }
             comp_ops.push(OperationData {
@@ -1134,6 +1291,7 @@ pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
             evaluation: &offset,
         },
         innermost,
+        ldsti_imm_range,
         comp,
         scale,
         evaluator,
@@ -1143,13 +1301,7 @@ pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
         return false;
     }
     hoist_for_linear_chain(
-        scope,
-        at,
-        main_iv,
-        derived_iv,
-        &comp_ops,
-        comp,
-        sites.values,
+        scope, at, main_iv, derived_iv, &comp_ops, comp, evaluator, sites,
     );
     hoists.0 += 1;
     true
@@ -1173,6 +1325,7 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
     main_iv: IterArgIndex,
     derived_iv: Val,
     innermost: Innermost,
+    ldsti_imm_range: ImmRange,
     comp: GenericComp,
     scale: AddressScale,
     evaluator: &mut E,
@@ -1180,9 +1333,13 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
     ibuff_space: &mut IbuffSpace,
     hoists: &mut HoistCount,
 ) -> bool {
-    let Some(Op::Sentient(ops::Op::For { carried, body, .. })) = scope.get(at) else {
+    let Some(Op::Sentient(ops::Op::For {
+        iv, carried, body, ..
+    })) = scope.get(at)
+    else {
         return false;
     };
+    let for_iv = *iv;
     let Some(main_iv_arg) = carried.get(main_iv.0 as usize).map(|entry| entry.arg) else {
         return false;
     };
@@ -1296,6 +1453,7 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
             evaluation: &negated,
         },
         innermost,
+        ldsti_imm_range,
         comp,
         scale,
         evaluator,
@@ -1304,7 +1462,18 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
     ) {
         return false;
     }
-    apply_operation_data(&ops_to_update);
+    // ⭐ THE LOOP IS RE-FOUND BY ITS INDUCTION VARIABLE, for the reason e170 states: the adjustment
+    // above builds a constant, and building one can insert at the START of this block.
+    let Some(at) = scope
+        .iter()
+        .position(|op| matches!(op, Op::Sentient(ops::Op::For { iv, .. }) if *iv == for_iv))
+    else {
+        return false;
+    };
+    let Some(Op::Sentient(ops::Op::For { body, .. })) = scope.get_mut(at) else {
+        return false;
+    };
+    apply_operation_data(&ops_to_update, body, comp, evaluator, sites);
     hoist_candidate_out_of_loop(
         scope,
         at,
@@ -1322,7 +1491,7 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
 ///
 /// ⭐ THE CAP IS INERT AS SHIPPED, AND `None` IS WHY RATHER THAN A BIG NUMBER: the option is
 /// `cl::opt<unsigned>`, so its `-1` is `UINT_MAX` and the guard `MaxHoists != -1` is FALSE (`:2189`).
-const MAX_HOISTS: Option<HoistCount> = None;
+pub(super) const MAX_HOISTS: Option<HoistCount> = None;
 
 /// ONE `iter_arg.getUsers()` ENTRY, READ BEFORE ANY REWRITE — [`users`] cannot report a user's PARENT,
 /// and the candidate gate declines a user a `sentient.if` holds (`:2213`).
@@ -1376,6 +1545,7 @@ pub(crate) fn run_scalar_op_hoisting<A: Arch, E: ExpressionEvaluator>(
     scope: &mut Vec<Op>,
     at: usize,
     innermost: Innermost,
+    ldsti_imm_range: ImmRange,
     comp: GenericComp,
     scale: AddressScale,
     evaluator: &mut E,
@@ -1428,13 +1598,23 @@ pub(crate) fn run_scalar_op_hoisting<A: Arch, E: ExpressionEvaluator>(
         let mut reanalyze_candidates = false;
         for candidate in candidates {
             if process_for_derived_iv_elimination::<A, E>(
-                scope, at, main_iv, candidate, comp, scale, evaluator, hoists,
+                scope,
+                at,
+                main_iv,
+                candidate,
+                ldsti_imm_range,
+                comp,
+                scale,
+                evaluator,
+                sites,
+                hoists,
             ) || process_for_linear_chain::<A, E>(
                 scope,
                 at,
                 main_iv,
                 candidate,
                 innermost,
+                ldsti_imm_range,
                 comp,
                 scale,
                 evaluator,
@@ -1447,6 +1627,7 @@ pub(crate) fn run_scalar_op_hoisting<A: Arch, E: ExpressionEvaluator>(
                 main_iv,
                 candidate,
                 innermost,
+                ldsti_imm_range,
                 comp,
                 scale,
                 evaluator,
@@ -1488,6 +1669,10 @@ mod unit_tests {
         offset: Val,
         /// Every `evaluate_sum` this evaluator was asked for, as `(lhs, rhs)`.
         sums: Vec<(Evaluation, Evaluation)>,
+        /// Every `evaluate_sum_handle`, as `(lhs, rhs)` — where a NEGATED modifier shows.
+        handle_sums: Vec<(EvaluatedValue, EvaluatedValue)>,
+        /// Every handle `build_offset_value_of` was asked to materialise, in order.
+        built: Vec<EvaluatedValue>,
     }
 
     impl ExpressionEvaluator for StatedEvaluator {
@@ -1520,6 +1705,27 @@ mod unit_tests {
             EvaluatedValue(7)
         }
 
+        fn build_offset_value_of(
+            &mut self,
+            immutable: EvaluatedValue,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            self.built.push(immutable);
+            self.offset
+        }
+
+        fn evaluate_sum_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            self.handle_sums.push((lhs, rhs));
+            // A stated arena entry, distinct from every other this double hands out.
+            EvaluatedValue(200)
+        }
+
         fn multiply_by_const(&mut self, ev: &Evaluation, by: i64) -> Evaluation {
             absolute(ScalarOffset(
                 ev.all_unit_offset().map_or(0, |offset| offset.0) * by,
@@ -1529,6 +1735,25 @@ mod unit_tests {
         fn evaluate_multiply_by_const(&mut self, _ev: EvaluatedValue, _by: i64) -> EvaluatedValue {
             // A stated arena entry, distinct from the one `evaluate_value_handle` names.
             EvaluatedValue(70)
+        }
+    }
+
+    /// The stated evaluator, with nothing recorded yet.
+    fn stated_evaluator() -> StatedEvaluator {
+        StatedEvaluator {
+            offset: Val(9),
+            sums: Vec::new(),
+            handle_sums: Vec::new(),
+            built: Vec::new(),
+        }
+    }
+
+    /// THE LDSTI IMM WINDOW A TEST STATES in place of e366's own table lookup: every stated offset
+    /// below scales to 16 or less, so no fixture is refused for exceeding it.
+    fn imm_window() -> ImmRange {
+        ImmRange {
+            min: -128,
+            max: 127,
         }
     }
 
@@ -1640,10 +1865,7 @@ mod unit_tests {
             query_maps: None,
             values: &mut values,
         };
-        let mut evaluator = StatedEvaluator {
-            offset: Val(9),
-            sums: Vec::new(),
-        };
+        let mut evaluator = stated_evaluator();
         let increment = absolute(ScalarOffset(16));
         let mut ibuff = IbuffSpace(2);
         assert_eq!(
@@ -1766,8 +1988,8 @@ mod unit_tests {
         ));
     }
 
-    /// e172 — `AddTo` folds the modifier into what the constant already evaluates to, and `Replace`
-    /// asks for nothing but the modifier.
+    /// e172 — `AddTo` folds the modifier into the handle the constant ITSELF evaluates to, and
+    /// `Replace` materialises the modifier alone.
     #[test]
     fn add_to_sums_with_the_constants_own_evaluation_and_replace_does_not() {
         let block = vec![constant(64, Val(2))];
@@ -1782,15 +2004,12 @@ mod unit_tests {
             values: &mut values,
         };
         let mut walked = Vec::new();
-        let mut evaluator = StatedEvaluator {
-            offset: Val(9),
-            sums: Vec::new(),
-        };
-        let modifier = absolute(ScalarOffset(16));
+        let mut evaluator = stated_evaluator();
+        let modifier = EvaluatedValue(16);
         assert_eq!(
             add_to_or_replace_op(
                 op,
-                &modifier,
+                modifier,
                 Modification::Replace,
                 &mut evaluator,
                 &mut sites,
@@ -1798,11 +2017,12 @@ mod unit_tests {
             ),
             Val(9)
         );
-        assert!(evaluator.sums.is_empty());
+        assert!(evaluator.handle_sums.is_empty());
+        assert_eq!(evaluator.built, vec![modifier]);
         assert_eq!(
             add_to_or_replace_op(
                 op,
-                &modifier,
+                modifier,
                 Modification::AddTo,
                 &mut evaluator,
                 &mut sites,
@@ -1810,7 +2030,46 @@ mod unit_tests {
             ),
             Val(9)
         );
-        assert_eq!(evaluator.sums, vec![(modifier, absolute(ScalarOffset(4)))]);
+        // `EvaluatedValue(7)` is the constant's own handle, and the sum is what gets materialised.
+        assert_eq!(evaluator.handle_sums, vec![(modifier, EvaluatedValue(7))]);
+        assert_eq!(evaluator.built, vec![modifier, EvaluatedValue(200)]);
+    }
+
+    /// e365 — THE NEGATION TRAP: an add absorbs the modifier as it stands, and a sub absorbing one
+    /// stores its OPPOSITE, because a sub's constant is subtracted rather than added.
+    #[test]
+    fn a_sub_absorbing_a_modifier_stores_its_opposite_and_an_add_does_not() {
+        let mut scope = vec![
+            constant(4, Val(1)),
+            add(Val(20), Val(1), Val(2), Some(Bits(8))),
+            sub(Val(21), Val(1), Val(3), Some(Bits(8))),
+        ];
+        let recorded = |op: Val| OperationData {
+            op,
+            mod_by: EvaluatedValue(5),
+            merging_increment: EvaluatedValue(0),
+            replace_with_mod: false,
+        };
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        let mut evaluator = stated_evaluator();
+        apply_operation_data(
+            &[recorded(Val(2)), recorded(Val(3))],
+            &mut scope,
+            GenericComp::Lxlu,
+            &mut evaluator,
+            &mut sites_of(&mut consts, &mut values),
+        );
+        assert_eq!(scope[1], add(Val(20), Val(9), Val(2), Some(Bits(8))));
+        assert_eq!(scope[2], sub(Val(21), Val(9), Val(3), Some(Bits(8))));
+        // `5` as it stands for the add, and the stated `5 * -1` for the sub.
+        assert_eq!(
+            evaluator.handle_sums,
+            vec![
+                (EvaluatedValue(5), EvaluatedValue(7)),
+                (EvaluatedValue(70), EvaluatedValue(7)),
+            ]
+        );
     }
 
     /// e468 — the TRAP: on a unit that is neither LX nor L0 the add still records the increment and
@@ -1826,14 +2085,12 @@ mod unit_tests {
             handle: EvaluatedValue(7),
             evaluation: &increment,
         };
-        let mut evaluator = StatedEvaluator {
-            offset: Val(9),
-            sums: Vec::new(),
-        };
+        let mut evaluator = stated_evaluator();
         let mut ops_to_update = Vec::new();
         assert!(process_mergeable_chain::<Dd2, _>(
             &scope[0],
             stated,
+            imm_window(),
             GenericComp::Pt,
             AddressScale::ONE,
             &scope,
@@ -1853,6 +2110,7 @@ mod unit_tests {
         assert!(!process_mergeable_chain::<Dd2, _>(
             &scope[1],
             stated,
+            imm_window(),
             GenericComp::Pt,
             AddressScale::ONE,
             &scope,
@@ -1862,17 +2120,19 @@ mod unit_tests {
         assert!(refused.is_empty());
     }
 
-    /// e469 — the swap of the first transfer's increment for the derived IV's constant operand is the
-    /// step before `applyOperationData`, which is e365 and not ported.
+    /// e469 — ⛔ THE ORDER IS THE PORT: the first transfer's increment takes the derived IV's constant
+    /// operand, and only THEN does e365 rewrite the immutable address that swap just read — so the
+    /// increment is non-zero by the time e365 decides to write it too.
     #[test]
-    #[should_panic(expected = "senpass e365")]
-    fn hoisting_a_linear_chain_reaches_the_unported_apply_operation_data() {
+    fn hoisting_a_linear_chain_swaps_the_increment_before_the_address_is_rewritten() {
         let mut scope = vec![for_op(
             vec![carried(Val(2), Val(3), Val(4), None)],
             vec![
                 constant(4, Val(5)),
                 add(Val(3), Val(5), Val(6), Some(Bits(16))),
-                load_and_send(Val(6), Val(2), Val(7)),
+                constant(64, Val(7)),
+                constant(0, Val(8)),
+                load_and_send(Val(6), Val(7), Val(8)),
             ],
         )];
         let comp_ops = vec![OperationData {
@@ -1881,6 +2141,8 @@ mod unit_tests {
             merging_increment: EvaluatedValue(0),
             replace_with_mod: false,
         }];
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
         hoist_for_linear_chain(
             &mut scope,
             0,
@@ -1888,7 +2150,22 @@ mod unit_tests {
             Val(6),
             &comp_ops,
             GenericComp::Lxlu,
-            &mut values_after(40),
+            &mut stated_evaluator(),
+            &mut sites_of(&mut consts, &mut values),
+        );
+        // The new add reads the transfer's OLD immutable address and initialises the iter arg.
+        assert_eq!(scope[0], add(Val(2), Val(7), Val(40), Some(Bits(16))));
+        assert_eq!(
+            scope[1],
+            for_op(
+                vec![carried(Val(40), Val(3), Val(4), None)],
+                vec![
+                    constant(4, Val(5)),
+                    constant(64, Val(7)),
+                    constant(0, Val(8)),
+                    load_and_send(Val(3), Val(9), Val(9)),
+                ]
+            )
         );
     }
 
@@ -1932,10 +2209,7 @@ mod unit_tests {
             add(Val(4), Val(5), Val(6), Some(Bits(32))),
         ];
         let within = absolute(ScalarOffset(16));
-        let mut evaluator = StatedEvaluator {
-            offset: Val(9),
-            sums: Vec::new(),
-        };
+        let mut evaluator = stated_evaluator();
         let mut ops_to_update = Vec::new();
         assert!(process_for_op_result::<Dd2, _>(
             &scope,
@@ -1945,6 +2219,7 @@ mod unit_tests {
                 handle: EvaluatedValue(7),
                 evaluation: &within,
             },
+            imm_window(),
             GenericComp::Pt,
             AddressScale::ONE,
             &mut evaluator,
@@ -1971,6 +2246,7 @@ mod unit_tests {
                 handle: EvaluatedValue(7),
                 evaluation: &beyond,
             },
+            imm_window(),
             GenericComp::Lxlu,
             AddressScale::ONE,
             &mut evaluator,
@@ -1998,42 +2274,57 @@ mod unit_tests {
     fn a_non_lx_unit_eliminates_no_derived_iv() {
         let mut scope = loop_with_a_derived_iv();
         let untouched = scope.clone();
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
         let mut hoists = HoistCount(0);
         assert!(!process_for_derived_iv_elimination::<Dd2, _>(
             &mut scope,
             0,
             IterArgIndex(0),
             Val(6),
+            imm_window(),
             GenericComp::Pt,
             AddressScale::ONE,
-            &mut StatedEvaluator {
-                offset: Val(9),
-                sums: Vec::new(),
-            },
+            &mut stated_evaluator(),
+            &mut sites_of(&mut consts, &mut values),
             &mut hoists,
         ));
         assert_eq!(scope, untouched);
         assert_eq!(hoists, HoistCount(0));
     }
 
-    /// e530 — with every reader absorbing the modifier the elimination reaches `applyOperationData`,
-    /// which is e365 and not ported, BEFORE it may touch the loop.
+    /// e530 — with its one reader absorbing the modifier the derived IV goes outright: the reader's
+    /// constant operand becomes the sum e365 built, the reader moves onto the main iter arg, and the
+    /// derived add is erased.
     #[test]
-    #[should_panic(expected = "senpass e365")]
-    fn eliminating_a_derived_iv_reaches_the_unported_apply_operation_data() {
-        process_for_derived_iv_elimination::<Dd2, _>(
-            &mut loop_with_a_derived_iv(),
+    fn eliminating_a_derived_iv_absorbs_the_modifier_into_its_reader_and_erases_the_add() {
+        let mut scope = loop_with_a_derived_iv();
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
+        let mut hoists = HoistCount(0);
+        assert!(process_for_derived_iv_elimination::<Dd2, _>(
+            &mut scope,
             0,
             IterArgIndex(0),
             Val(6),
+            imm_window(),
             GenericComp::Lxlu,
             AddressScale::ONE,
-            &mut StatedEvaluator {
-                offset: Val(9),
-                sums: Vec::new(),
-            },
-            &mut HoistCount(0),
+            &mut stated_evaluator(),
+            &mut sites_of(&mut consts, &mut values),
+            &mut hoists,
+        ));
+        assert_eq!(
+            scope,
+            vec![for_op(
+                vec![carried(Val(2), Val(3), Val(4), None)],
+                vec![
+                    constant(4, Val(5)),
+                    add(Val(3), Val(9), Val(8), Some(Bits(32))),
+                ]
+            )]
         );
+        assert_eq!(hoists, HoistCount(1));
     }
     /// 578/656 — the one reader adds a value that is not a constant, so nothing can absorb the
     /// adjustment: with an IBuff entry free the add goes in behind the loop, and with none the
@@ -2061,10 +2352,7 @@ mod unit_tests {
             query_maps: None,
             values: &mut values,
         };
-        let mut evaluator = StatedEvaluator {
-            offset: Val(9),
-            sums: Vec::new(),
-        };
+        let mut evaluator = stated_evaluator();
 
         let mut scope = candidate();
         let mut ibuff = IbuffSpace(2);
@@ -2074,6 +2362,7 @@ mod unit_tests {
             IterArgIndex(0),
             adjustment(),
             Innermost::Yes,
+            imm_window(),
             GenericComp::Lxlu,
             AddressScale::ONE,
             &mut evaluator,
@@ -2092,6 +2381,7 @@ mod unit_tests {
             IterArgIndex(0),
             adjustment(),
             Innermost::Yes,
+            imm_window(),
             GenericComp::Lxlu,
             AddressScale::ONE,
             &mut evaluator,
@@ -2137,30 +2427,45 @@ mod unit_tests {
     }
 
     /// e612 — a one-transfer chain clears every gate: the derived IV feeds the transfer's mutable
-    /// address, the transfer feeds the yield at the main IV's own slot, and the first transfer in a
-    /// chain is measured against e361, which is not ported.
+    /// address and the transfer feeds the yield at the main IV's own slot, so the FIRST transfer has
+    /// its address REPLACED by the offset and the IV leaves the loop as an add of the old address.
     #[test]
-    #[should_panic(expected = "senpass e361")]
-    fn a_linear_chain_of_one_transfer_reaches_the_unported_range_check() {
+    fn a_linear_chain_of_one_transfer_replaces_its_address_and_leaves_the_loop() {
         let mut scope = loop_with(vec![load_and_send(Val(5), Val(11), Val(12))], vec![Val(31)]);
         let mut consts = Vec::new();
         let mut values = values_after(40);
-        process_for_linear_chain::<Dd2, _>(
+        let mut hoists = HoistCount(0);
+        assert!(process_for_linear_chain::<Dd2, _>(
             &mut scope,
             0,
             IterArgIndex(0),
             Val(5),
             Innermost::Yes,
+            imm_window(),
             GenericComp::Lxlu,
             AddressScale::ONE,
-            &mut StatedEvaluator {
-                offset: Val(9),
-                sums: Vec::new(),
-            },
+            &mut stated_evaluator(),
             &mut sites_of(&mut consts, &mut values),
             &mut IbuffSpace(4),
-            &mut HoistCount(0),
+            &mut hoists,
+        ));
+        assert_eq!(scope[0], add(Val(2), Val(11), Val(40), Some(Bits(8))));
+        assert_eq!(
+            scope[1],
+            for_op(
+                vec![carried(Val(40), Val(3), Val(4), Some(Bits(8)))],
+                vec![
+                    constant(4, Val(10)),
+                    constant(6, Val(11)),
+                    constant(0, Val(12)),
+                    load_and_send(Val(3), Val(9), Val(9)),
+                    Op::Sentient(ops::Op::Yield {
+                        results: vec![Val(31)]
+                    }),
+                ]
+            )
         );
+        assert_eq!(hoists, HoistCount(1));
     }
 
     /// ⛔ `:1945`'S REFUSAL: the derived IV's one user is inside a NESTED loop, so the walk declines
@@ -2184,12 +2489,10 @@ mod unit_tests {
             IterArgIndex(0),
             Val(5),
             Innermost::Yes,
+            imm_window(),
             GenericComp::Lxlu,
             AddressScale::ONE,
-            &mut StatedEvaluator {
-                offset: Val(9),
-                sums: Vec::new(),
-            },
+            &mut stated_evaluator(),
             &mut sites_of(&mut consts, &mut values),
             &mut IbuffSpace(4),
             &mut hoists,
@@ -2199,32 +2502,47 @@ mod unit_tests {
     }
 
     /// e613 — the add feeding the yield absorbs the adjustment, the loop result needs none, and the
-    /// hoist then reaches `applyOperationData`, which is e365 and not ported.
+    /// derived IV then leaves the loop as an add of its OWN constant operand rather than an address.
     #[test]
-    #[should_panic(expected = "senpass e365")]
-    fn generic_hoisting_reaches_the_unported_apply_operation_data() {
+    fn generic_hoisting_absorbs_the_adjustment_into_the_op_feeding_the_yield() {
         let mut scope = loop_with(
             vec![add(Val(5), Val(11), Val(6), Some(Bits(8)))],
             vec![Val(6)],
         );
         let mut consts = Vec::new();
         let mut values = values_after(40);
-        process_for_generic_hoisting::<Dd2, _>(
+        let mut hoists = HoistCount(0);
+        assert!(process_for_generic_hoisting::<Dd2, _>(
             &mut scope,
             0,
             IterArgIndex(0),
             Val(5),
             Innermost::Yes,
+            imm_window(),
             GenericComp::Lxlu,
             AddressScale::ONE,
-            &mut StatedEvaluator {
-                offset: Val(9),
-                sums: Vec::new(),
-            },
+            &mut stated_evaluator(),
             &mut sites_of(&mut consts, &mut values),
             &mut IbuffSpace(4),
-            &mut HoistCount(0),
+            &mut hoists,
+        ));
+        assert_eq!(scope[0], add(Val(2), Val(10), Val(40), Some(Bits(8))));
+        assert_eq!(
+            scope[1],
+            for_op(
+                vec![carried(Val(40), Val(3), Val(4), Some(Bits(8)))],
+                vec![
+                    constant(4, Val(10)),
+                    constant(6, Val(11)),
+                    constant(0, Val(12)),
+                    add(Val(3), Val(9), Val(6), Some(Bits(8))),
+                    Op::Sentient(ops::Op::Yield {
+                        results: vec![Val(6)]
+                    }),
+                ]
+            )
         );
+        assert_eq!(hoists, HoistCount(1));
     }
 
     /// ⛔ THE ASYMMETRY e613's TWO ARMS LEAVE: a sub feeding the yield is absorbable only with the
@@ -2245,12 +2563,10 @@ mod unit_tests {
             IterArgIndex(0),
             Val(5),
             Innermost::Yes,
+            imm_window(),
             GenericComp::Lxlu,
             AddressScale::ONE,
-            &mut StatedEvaluator {
-                offset: Val(9),
-                sums: Vec::new(),
-            },
+            &mut stated_evaluator(),
             &mut sites_of(&mut consts, &mut values),
             &mut IbuffSpace(4),
             &mut hoists,
@@ -2258,30 +2574,40 @@ mod unit_tests {
         assert_eq!(scope, untouched);
         assert_eq!(hoists, HoistCount(0));
     }
-    /// e635 — the driver takes the loop's one iter arg, finds the add of a constant that reads it, and
-    /// offers that add to derived-IV elimination first: which is [`loop_with_a_derived_iv`]'s own case,
-    /// so it reaches `applyOperationData` — e365, and not ported.
+    /// e635 — the driver takes the loop's one iter arg, finds the add of a constant that reads it and
+    /// offers that add to derived-IV elimination FIRST, which takes it: the add is gone and its reader
+    /// reads the iter arg. The second pass over the same iter arg then finds no candidate and stops.
     ///
-    /// ⭐ THE PANIC IS THE DISPATCH: nothing else in this driver can reach e365, so arriving there
-    /// proves the candidate found was `Val(6)` on iter arg 0 and that the first of the three ran.
+    /// ⭐ THE SHAPE IS THE DISPATCH: only elimination erases the candidate outright, so this result
+    /// proves the candidate found was `%6` on iter arg 0 and that the first of the three ran.
     #[test]
-    #[should_panic(expected = "senpass e365")]
     fn e635_offers_each_iter_arg_candidate_to_derived_iv_elimination_first() {
+        let mut scope = loop_with_a_derived_iv();
         let mut consts = Vec::new();
         let mut values = values_after(40);
+        let mut hoists = HoistCount(0);
         run_scalar_op_hoisting::<Dd2, _>(
-            &mut loop_with_a_derived_iv(),
+            &mut scope,
             0,
             Innermost::Yes,
+            imm_window(),
             GenericComp::Lxlu,
             AddressScale::ONE,
-            &mut StatedEvaluator {
-                offset: Val(9),
-                sums: Vec::new(),
-            },
+            &mut stated_evaluator(),
             &mut sites_of(&mut consts, &mut values),
             &mut IbuffSpace(4),
-            &mut HoistCount(0),
+            &mut hoists,
         );
+        assert_eq!(
+            scope,
+            vec![for_op(
+                vec![carried(Val(2), Val(3), Val(4), None)],
+                vec![
+                    constant(4, Val(5)),
+                    add(Val(3), Val(9), Val(8), Some(Bits(32))),
+                ]
+            )]
+        );
+        assert_eq!(hoists, HoistCount(1));
     }
 }
