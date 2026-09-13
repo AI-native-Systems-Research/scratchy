@@ -108,7 +108,7 @@ use crate::islands::sentient::dialects::{
     self as dialects, Op, UniformRegions, Val, dataflow, sentient, symbol, uniform,
 };
 use crate::islands::sentient::print;
-use crate::transform::sentient::utils::{self, Hoisted, NewUse, OpAt};
+use crate::transform::sentient::utils::{self, Hoisted, InBlock, NewUse, OpAt};
 use crate::units::{Core, DfirUnit};
 
 /// `RegisterLocales` (`:87-102`) IS THE ISLAND'S [`sentient::RegType`], not a second enum.
@@ -1678,8 +1678,7 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
             )
             | Op::Symbol(symbol::Op::CreateSymbol { .. }) => {
                 if let Op::Dataflow(dataflow::Op::CreateMulticastGroup {
-                    init_packet_opt_en,
-                    ..
+                    init_packet_opt_en, ..
                 }) = &op
                     && *init_packet_opt_en
                     && inside_a_for(unit_body, at)
@@ -1725,10 +1724,7 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
                 on_unit(
                     scope,
                     |unit_type| {
-                        matches!(
-                            unit_type,
-                            DfirUnit::PtRow(_) | DfirUnit::Sfp | DfirUnit::Pe
-                        )
+                        matches!(unit_type, DfirUnit::PtRow(_) | DfirUnit::Sfp | DfirUnit::Pe)
                     },
                     "is_any_of(current_unit_type_, PT, SFP, PE) (`:621`)",
                 );
@@ -1781,7 +1777,8 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
                 // attribute, which is the reference's own `hasAttr == false` / `-1` (`:650-656`), and
                 // the width only keys the alias cache.
                 if !bound_is_fixed
-                    && let Some(slot) = OperandSlot::of(at.clone(), slot_at::MUTABLE_ADDR, unit_body)
+                    && let Some(slot) =
+                        OperandSlot::of(at.clone(), slot_at::MUTABLE_ADDR, unit_body)
                 {
                     self.add_to_work_list_create_copy_and_update_assignment(
                         unit_body,
@@ -1810,9 +1807,7 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
                 };
                 let mut user = at.clone();
                 for (index, wanted) in [(slot_at::LHS, copy_lhs), (slot_at::RHS, copy_rhs)] {
-                    if wanted
-                        && let Some(slot) = OperandSlot::of(user.clone(), index, unit_body)
-                    {
+                    if wanted && let Some(slot) = OperandSlot::of(user.clone(), index, unit_body) {
                         self.add_to_work_list_create_copy_and_update_assignment(
                             unit_body,
                             &slot,
@@ -2182,11 +2177,7 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
                     ));
                 }
                 if multicast_info.is_some() {
-                    demands.push((
-                        slot_at::TRANSFER_MULTICAST_INFO,
-                        RegisterLocale::Gtr,
-                        false,
-                    ));
+                    demands.push((slot_at::TRANSFER_MULTICAST_INFO, RegisterLocale::Gtr, false));
                 }
                 // ⛔ THE PATH IS RE-DERIVED PER SLOT, as e523's own operand loop does: each copy can
                 // land in front of the transfer.
@@ -2269,10 +2260,70 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
     }
 }
 
-// crustify:todo: e574_initializeWorkList
-//   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:987  (8 body lines, level 4)
-//   original  : void RegisterTypeAssignmentPass::initializeWorkList()
-//   calls     : e138_clear, e422_insert, e524_initializeAssignmentForAnOperation
+impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
+    /// Replaces: e574_initializeWorkList
+    ///
+    /// Starts one unit from nothing but the module's constant locales, then records what every op in
+    /// it already fixes (`:987-995`).
+    ///
+    /// ⛔ TRAP: `std::map::insert` DOES NOT OVERWRITE — a value this unit already assigned keeps the
+    /// locale it has, which is why the seeding loop is an `or_insert`.
+    pub(crate) fn initialize_work_list<A: Arch>(
+        &mut self,
+        unit_type: DfirUnit,
+        unit_body: &mut Vec<Op>,
+        values: &mut Values,
+    ) {
+        self.clear();
+        for (value, locale) in self.per_module.global_const_assignments.clone() {
+            self.per_unit.assignments.entry(value).or_insert(locale);
+        }
+        self.initialize_assignments_in::<A>(unit_type, unit_body, &[], values);
+    }
+
+    /// The `walk<WalkOrder::PreOrder>` of `:993-994`, one block at a time.
+    ///
+    /// ⛔ TRAP: e524 CREATES COPIES IN FRONT OF THE OP IT IS GIVEN, and MLIR's walk holds an iterator
+    /// that an insertion before the current op does not move. The cursor therefore steps over
+    /// whatever appeared ahead of the walked op, which is not itself walked.
+    fn initialize_assignments_in<A: Arch>(
+        &mut self,
+        unit_type: DfirUnit,
+        unit_body: &mut Vec<Op>,
+        enclosing: &[(InBlock, usize)],
+        values: &mut Values,
+    ) {
+        let mut index = 0;
+        loop {
+            let at = OpAt::at(enclosing, InBlock(index));
+            let Some(before) = at.block(unit_body).map(<[Op]>::len) else {
+                return;
+            };
+            if index >= before {
+                return;
+            }
+            self.initialize_assignment_for_an_operation::<A>(
+                unit_body,
+                &at,
+                OpScope::ProgramUnit(unit_type),
+                values,
+            );
+            index += at
+                .block(unit_body)
+                .map_or(0, |block| block.len().saturating_sub(before));
+            let at = OpAt::at(enclosing, InBlock(index));
+            let regions = at
+                .op(unit_body)
+                .map_or(0, |op| dialects::regions_ref(op).len());
+            for region in 0..regions {
+                let mut inner = enclosing.to_vec();
+                inner.push((InBlock(index), region));
+                self.initialize_assignments_in::<A>(unit_type, unit_body, &inner, values);
+            }
+            index += 1;
+        }
+    }
+}
 
 // crustify:todo: e609_runOn
 //   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:996  (55 body lines, level 5)
@@ -2828,5 +2879,31 @@ mod unit_tests {
         // refused.
         assert_eq!(body.len(), 3);
         assert!(pass.failures.is_empty());
+    }
+    /// 574/656 — the module's constant locale is seeded first, then the whole unit is walked: the
+    /// top-level constant, the loop's induction variable, and the constant inside the loop's region.
+    #[test]
+    fn e574_seeds_from_the_module_then_walks_the_whole_unit() {
+        let mut pass = TypesAndCopies::new();
+        let mut values = Values::default();
+        pass.per_module
+            .global_const_assignments
+            .insert(Val(20), RegType::Imm);
+        let mut body = vec![
+            constant(Val(0), 8),
+            for_op(
+                Val(1),
+                Val(0),
+                carried(Val(2), Val(3), Val(4)),
+                vec![constant(Val(5), 9)],
+            ),
+        ];
+
+        pass.initialize_work_list::<Dd2>(DfirUnit::Lxlu, &mut body, &mut values);
+
+        assert_eq!(pass.locale(Val(20)), Locale::Recorded(RegType::Imm));
+        assert_eq!(pass.locale(Val(0)), Locale::Recorded(RegType::Imm));
+        assert_eq!(pass.locale(Val(1)), Locale::Recorded(RegType::Lccr));
+        assert_eq!(pass.locale(Val(5)), Locale::Recorded(RegType::Imm));
     }
 }

@@ -89,12 +89,16 @@
 
 pub(crate) mod unroll_operands;
 
+use crate::arch::{Arch, IsaGen};
 use crate::islands::dataflow_ir::dialects::dataflow;
+use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{
-    Op, Val, operands, regions_ref, replace_all_uses_with, results, sentient, use_count,
+    Op, Val, operands, regions_mut, regions_ref, replace_all_uses_with, results, sentient,
+    use_count,
 };
 use crate::transform::sentient::op_rerolling::unroll_operands::{UnrollOperands, XrfIncr};
-use crate::transform::sentient::utils::{InBlock, fold_mode_attribute_if_exists};
+use crate::transform::sentient::utils::{InBlock, OpAt, fold_mode_attribute_if_exists};
 use crate::units::DfirUnit;
 
 /// HOW MANY OPS ONE REROLLED STATEMENT STANDS FOR — `UnrollOperands::unroll_size_`, whose declaration
@@ -593,10 +597,97 @@ fn block_reads(block: &[Op], produced: &[Val]) -> bool {
     })
 }
 
-// crustify:todo: e571_runOpRerolling
-//   authority : dcc/src/Transform/Sentient/OpRerolling.cpp:1008  (29 body lines, level 4)
-//   original  : void OpRerollingPass::runOpRerolling(Operation *op, bool merge_xrf_into_mac)
-//   calls     : e252_size, e334_mergeScalarOpIntoMac, e519_processOneBlock
+/// `mergeScalarOpIntoMac(unit_op.getBody())` — e334, not ported yet.
+fn merge_scalar_op_into_mac(unit_body: &mut Vec<Op>) {
+    todo!(
+        "OpRerollingPass::mergeScalarOpIntoMac — senpass e334 (OpRerolling.cpp:81) is not ported \
+         yet, and this PT unit's {} rerolled ops need it",
+        unit_body.len()
+    )
+}
+
+/// `bool merge_xrf_into_mac` — ⛔ A BOOL PARAMETER IS NOT A CRATE TYPE, and its two call sites state
+/// opposite answers (`:1004` true, `MultiDimLoopPeeling.cpp:676` false).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeXrfIntoMac {
+    /// The pass's own entry, which merges.
+    Yes,
+    /// Loop peeling's call on one peeled loop, which does not.
+    No,
+}
+
+/// WHAT `op->walk` COVERS — the whole unit or one op inside it.
+///
+/// ⛔ THE WALKED SCOPE AND THE OWNING UNIT ARE SEPARATE, because a path cannot be reborrowed out of
+/// the unit it indexes: `op->getParentOfType<ProgramUnitOp>()` (`:1009-1012`) is the caller's fact.
+#[derive(Debug, Clone)]
+pub(crate) enum RerollScope {
+    /// `isa<dataflow::ProgramUnitOp>(op)` — the unit body itself (`:1004`).
+    WholeUnit,
+    /// An op inside it, whose own regions are what gets walked (`MultiDimLoopPeeling.cpp:676`).
+    Op(OpAt),
+}
+
+/// Replaces: e571_runOpRerolling
+///
+/// Rerolls every block of the scope, innermost first, on the nine components that reroll at all, then
+/// merges a PT unit's scalar ops into the MAC ahead of them (`:1008-1036`).
+///
+/// ⛔ TRAP: THE DD2 LDST BUG IS A `return`, NOT A SKIP (`:1024-1028`) — on `RCUDD1A` an L0, L0LU or
+/// L0SU unit leaves this having done nothing at all, the PT tail included.
+/// ⭐ `getUnitType` IS THE GENERIC COMPONENT, so a PT row and a PT row span are both `PT` here.
+/// ⛔ `DT_CHECK(unit_op.getUnits().size() >= 1)` IS DISCHARGED BY [`crate::islands::dataflow_ir::Units`].
+pub(crate) fn run_op_rerolling<A: Arch>(
+    unit: &mut ProgramUnit<A>,
+    scope: &RerollScope,
+    merge_xrf_into_mac: MergeXrfIntoMac,
+) {
+    let unit_type = unit.on.kind();
+    let generic = unit_type.generic();
+    let handled = matches!(
+        generic,
+        GenericComp::Sfp
+            | GenericComp::Pe
+            | GenericComp::Pt
+            | GenericComp::Lx
+            | GenericComp::L0
+            | GenericComp::Lxlu
+            | GenericComp::Lxsu
+            | GenericComp::L0lu
+            | GenericComp::L0su
+    );
+    let dd2_ldst_bug = matches!(A::GEN, IsaGen::Rcudd1a)
+        && matches!(
+            generic,
+            GenericComp::L0 | GenericComp::L0lu | GenericComp::L0su
+        );
+    if handled && !dd2_ldst_bug {
+        match scope {
+            RerollScope::WholeUnit => reroll_blocks(unit_type, &mut unit.body),
+            RerollScope::Op(at) => {
+                if let Some(op) = at.op_mut(&mut unit.body) {
+                    for region in regions_mut(op) {
+                        reroll_blocks(unit_type, region);
+                    }
+                }
+            }
+        }
+    }
+    // after rerolling ops, merge scalar_add/sub to its preceding mac
+    if matches!(generic, GenericComp::Pt) && matches!(merge_xrf_into_mac, MergeXrfIntoMac::Yes) {
+        merge_scalar_op_into_mac(&mut unit.body);
+    }
+}
+
+/// The `walk<WalkOrder::PostOrder>` over blocks (`:1029-1030`): the nested ones first.
+fn reroll_blocks(ty: DfirUnit, block: &mut Vec<Op>) {
+    for at in 0..block.len() {
+        for region in regions_mut(&mut block[at]) {
+            reroll_blocks(ty, region);
+        }
+    }
+    process_one_block(ty, block);
+}
 
 // crustify:todo: e607_runOnOperation
 //   authority : dcc/src/Transform/Sentient/OpRerolling.cpp:994  (13 body lines, level 5)
@@ -606,7 +697,10 @@ fn block_reads(block: &[Op], produced: &[Val]) -> bool {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::sentient::dialects::sentient::{LrfIndex, Port, Precision, SplatPad};
+    use crate::units::Row;
 
     /// AN UNREROLLED STATEMENT ALREADY STANDS FOR ONE OP, and each merge adds its own count.
     #[test]
@@ -749,5 +843,18 @@ mod unit_tests {
             &candidate,
             DfirUnit::Pe,
         );
+    }
+    /// 571/656 — a PT unit is one of the nine that reroll, so the walk runs over its blocks (this one
+    /// closes no statement) and the PT tail is then reached, which is the unported e334.
+    #[test]
+    #[should_panic(expected = "senpass e334")]
+    fn e571_walks_then_reaches_the_pt_merge_tail() {
+        let mut unit: ProgramUnit<Dd2> = ProgramUnit {
+            on: Units::one(DfirUnit::PtRow(Row::checked(0).expect("row 0")), Val(0)),
+            precision: None,
+            body: vec![get_unit(0), logical_port(1, Port::Lrf(LrfIndex::L0))],
+            arch: core::marker::PhantomData,
+        };
+        run_op_rerolling(&mut unit, &RerollScope::WholeUnit, MergeXrfIntoMac::Yes);
     }
 }

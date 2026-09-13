@@ -79,11 +79,9 @@
 //! | `e466_updateIfOpFeedingDynLoopBound` | 466 | 2 | 77 | `dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:217` |
 //! | `e526_processIfOp` | 526 | 3 | 22 | `dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:98` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
-// file's own tests until `e575_runOnOperation` lands and something calls it. CI runs clippy with
-// `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e575_runOnOperation`: at that point an unused item here is a real defect again.
-#![allow(dead_code)]
+// ⭐ `e575_runOnOperation` HAS LANDED and calls [`process_if_op`], so this file's own note is
+// discharged; the `allow` it asked for now sits on the parent module, where the ONE remaining
+// unreached root — the pass entry itself — is.
 
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
     DbgNamePrefix, new_dbg_name_from_list,

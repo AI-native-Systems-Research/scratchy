@@ -106,7 +106,7 @@ use crate::islands::sentient::dialects::{
 };
 use crate::transform::sentient::IterArgIndex;
 use crate::transform::sentient::analyses::{
-    Evaluation, EvaluatedValue, ExpressionEvaluator, OffsetSites,
+    EvaluatedValue, Evaluation, ExpressionEvaluator, OffsetSites,
 };
 
 /// `ibuff_space_` — how many instruction-buffer entries are left for the ops this pass creates.
@@ -696,9 +696,10 @@ pub(crate) fn hoist_for_linear_chain(
     let Some(derived_iv_op) = defining_op(derived_iv, body) else {
         return;
     };
-    let Some(const_operand_idx) =
-        first_const_operand_index(derived_iv_op, Definitions::from_innermost(&[body.as_slice()]))
-    else {
+    let Some(const_operand_idx) = first_const_operand_index(
+        derived_iv_op,
+        Definitions::from_innermost(&[body.as_slice()]),
+    ) else {
         // `getFirstConstOperandIndex`'s `-1`, which the reference then uses as an operand index.
         return;
     };
@@ -883,10 +884,78 @@ pub(crate) fn process_for_derived_iv_elimination<A: Arch, E: ExpressionEvaluator
     true
 }
 
-// crustify:todo: e578_adjustCandidateForOpResult
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1514  (19 body lines, level 4)
-//   original  : bool ScalarOpHoisting::adjustCandidateForOpResult( BlockArgument &main_iv, const EvaluatedValue &adjustment_increment)
-//   calls     : e170_addForOpResultAdjustment, e365_applyOperationData, e529_processForOpResult
+/// `-dcc-hoist-without-absorbing-ops` (`:114-119`) — *"Enable scalar op hoisting even if there are no
+/// absorbing ops for the adjustment add op (innermost loop will always attempt to hoist)"*, whose
+/// `llvm::cl::init(true)` is this value.
+const HOIST_WITHOUT_ABSORBING_OPS: bool = true;
+
+/// `is_inner_most_` (`:516`, `:564`) AT THE ONE ARM THAT READS IT (`:1524`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Innermost {
+    /// The candidate loop encloses no other loop.
+    Yes,
+    /// It does.
+    No,
+}
+
+/// Replaces: e578_adjustCandidateForOpResult
+///
+/// Absorbs the post-hoist adjustment into the users of the candidate loop's result, or — where they
+/// cannot take it and an IBuff entry is free — adds the adjustment behind the loop (`:1514-1532`).
+///
+/// ⭐ `main_iv.getArgNumber() - 1` IS DISCHARGED BY THE TYPE: [`IterArgIndex`] already numbers the
+/// carried entries, whose region argument is one past the induction variable.
+/// ⚠️ TRAP: A NON-ABSOLUTE INCREMENT IS REPORTED, NOT ASSERTED — the reference's `DT_CHECK` at
+/// `:1546` becomes `false`, the same answer its two callers give a candidate they cannot adjust.
+/// ⭐ e170's `Overrun` IS UNREACHABLE FROM HERE: the `ibuff_space_ <= 0` guard above it is this
+/// function's own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn adjust_candidate_for_op_result<A: Arch, E: ExpressionEvaluator>(
+    scope: &mut Vec<Op>,
+    at: usize,
+    main_iv: IterArgIndex,
+    adjustment_increment: MergingIncrement<'_>,
+    innermost: Innermost,
+    comp: GenericComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+    ibuff_space: &mut IbuffSpace,
+) -> bool {
+    let mut ops_to_update: Vec<OperationData> = Vec::new();
+    if process_for_op_result::<A, E>(
+        scope,
+        at,
+        main_iv,
+        adjustment_increment,
+        comp,
+        scale,
+        evaluator,
+        &mut ops_to_update,
+    ) {
+        if !ops_to_update.is_empty() {
+            apply_operation_data(&ops_to_update);
+        }
+        return true;
+    }
+    if (matches!(innermost, Innermost::No) && !HOIST_WITHOUT_ABSORBING_OPS) || ibuff_space.0 <= 0 {
+        return false;
+    }
+    let Some(known) = KnownAbsolute::of(adjustment_increment.evaluation) else {
+        return false;
+    };
+    let _ = add_for_op_result_adjustment(
+        scope,
+        at,
+        main_iv,
+        known,
+        comp,
+        evaluator,
+        sites,
+        ibuff_space,
+    );
+    true
+}
 
 // crustify:todo: e612_processForLinearChain
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1893  (129 body lines, level 5)
@@ -1454,5 +1523,70 @@ mod unit_tests {
             },
             &mut HoistCount(0),
         );
+    }
+    /// 578/656 — the one reader adds a value that is not a constant, so nothing can absorb the
+    /// adjustment: with an IBuff entry free the add goes in behind the loop, and with none the
+    /// candidate is declined and the scope is left alone.
+    #[test]
+    fn e578_adds_the_adjustment_after_the_loop_or_declines_when_there_is_no_ibuff() {
+        let candidate = || {
+            vec![
+                for_op(
+                    vec![carried(Val(2), Val(3), Val(4), Some(Bits(8)))],
+                    Vec::new(),
+                ),
+                add(Val(4), Val(5), Val(6), Some(Bits(32))),
+            ]
+        };
+        let increment = absolute(ScalarOffset(16));
+        let adjustment = || MergingIncrement {
+            handle: EvaluatedValue(7),
+            evaluation: &increment,
+        };
+        let mut consts = Vec::new();
+        let mut values = values_after(10);
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+        let mut evaluator = StatedEvaluator {
+            offset: Val(9),
+            sums: Vec::new(),
+        };
+
+        let mut scope = candidate();
+        let mut ibuff = IbuffSpace(2);
+        assert!(adjust_candidate_for_op_result::<Dd2, _>(
+            &mut scope,
+            0,
+            IterArgIndex(0),
+            adjustment(),
+            Innermost::Yes,
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut evaluator,
+            &mut sites,
+            &mut ibuff,
+        ));
+        assert_eq!(scope[1], add(Val(4), Val(9), Val(10), Some(Bits(8))));
+        assert_eq!(scope[2], add(Val(10), Val(5), Val(6), Some(Bits(32))));
+        assert_eq!(ibuff, IbuffSpace(1));
+
+        let mut declined = candidate();
+        let mut none_left = IbuffSpace(0);
+        assert!(!adjust_candidate_for_op_result::<Dd2, _>(
+            &mut declined,
+            0,
+            IterArgIndex(0),
+            adjustment(),
+            Innermost::Yes,
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut evaluator,
+            &mut sites,
+            &mut none_left,
+        ));
+        assert_eq!(declined, candidate());
     }
 }

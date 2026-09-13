@@ -95,11 +95,16 @@
 
 use std::collections::BTreeMap;
 
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
     Definitions, Op, Val, regions_ref, results, set_value_reg_index, symbol, uniform,
 };
+use crate::model::Model;
 use crate::transform::sentient::ProgStitch;
+use crate::workload::Workload;
 
 /// `std::map<SentientRegType, std::vector<int>> avoid_renumbering_regs` (`RegisterPacking.cpp:183`)
 /// — per register file, the indices that must survive this pass wearing the number they came in
@@ -667,15 +672,75 @@ impl RegisterPacking {
     }
 }
 
-// crustify:todo: e573_runOnOperation
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:410  (11 body lines, level 4)
-//   original  : void RegisterPackingPass::runOnOperation()
-//   calls     : e133_cleanup, e522_runOnProgramUnitOp
+/// `-dcc-register-packing-disable` (`RegisterPacking.cpp:52-54`) — *"Disable the register packing
+/// pass"*, whose `llvm::cl::init(false)` is this value.
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e573_runOnOperation
+///
+/// Packs each unit that is NOT a PT, PE or SFP one, clearing the tracked-register table before every
+/// unit whether or not it is packed (`:410-421`).
+///
+/// ⭐ `getOperation()` IS THE ARGUMENT, as in every pass entry here.
+/// ⭐ `WalkResult::skip()` IS A NO-OP: a program's units are a flat list, so no unit encloses another.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    stitching: ProgStitch,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    let mut pass = RegisterPacking::default();
+    for unit in program.units.iter_mut() {
+        pass.cleanup();
+        if !matches!(
+            unit.on.kind().generic(),
+            GenericComp::Pt | GenericComp::Pe | GenericComp::Sfp
+        ) {
+            pass.run_on_program_unit_op(&mut unit.body, stitching);
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
+    use crate::units::{DfirUnit, Row};
+
+    /// A model and rung, for the same reason [`ProgramUnit`] needs an arch: the pass reads neither.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One unit on `kind`, holding `body`.
+    fn unit_on(kind: DfirUnit, body: Vec<Op>) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(kind, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
 
     /// `sentient.scalar_constant` — an `init_value` the promoted branch recognises.
     fn scalar_constant(result: Val, value: i64) -> Op {
@@ -1080,5 +1145,45 @@ mod unit_tests {
             panic!("the loop is still the second op");
         };
         assert_eq!(copy_reg(body).index, Some(ops::RegIndex::at::<1>()));
+    }
+    /// 573/656 — the PT unit's `regIndex` is the one it came in with, and the L3LU unit behind it is
+    /// packed from 7 down to 0.
+    #[test]
+    fn e573_packs_a_unit_that_is_not_pt_pe_or_sfp_and_leaves_the_others() {
+        let copy = |index: u32| {
+            scalar_copy(
+                Val(9),
+                ops::RegType::Lrf,
+                Some(ops::RegIndex::allocated(index)),
+            )
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                unit_on(
+                    DfirUnit::PtRow(Row::checked(0).expect("row 0")),
+                    vec![copy(7)],
+                ),
+                vec![unit_on(DfirUnit::L3lu, vec![copy(7)])],
+            ),
+            bound: core::marker::PhantomData,
+        };
+
+        run_on_operation(&mut program, ProgStitch::Standalone);
+
+        let units: Vec<&ProgramUnit<Dd2>> = program.units.iter().collect();
+        assert_eq!(
+            copy_reg(&units[0].body).index,
+            Some(ops::RegIndex::at::<7>())
+        );
+        assert_eq!(
+            copy_reg(&units[1].body).index,
+            Some(ops::RegIndex::at::<0>())
+        );
     }
 }

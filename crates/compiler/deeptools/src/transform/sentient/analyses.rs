@@ -1425,3 +1425,72 @@ impl UnitIndexMap for OutOfScopeUnitIndexMap {
         )
     }
 }
+
+/// WHICH UNIT A REGISTER-PRESSURE ANSWER IS IN — `RegisterPressure::Metric`
+/// (`Analyses/RegisterPressureAnalysis.h:37-43`), and the reason [`Pressure`] carries no unit of its
+/// own: the same number means registers, free registers or a percentage depending on this.
+///
+/// ⭐ `kDefault` IS `kNumRegisters`, an alias and not a fifth case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Metric {
+    /// `kNumRegisters`, which `kDefault` names.
+    #[default]
+    NumRegisters,
+    /// `kNumFreeRegisters`.
+    NumFreeRegisters,
+    /// `kPercentUtilization`.
+    PercentUtilization,
+    /// `kPercentFree`.
+    PercentFree,
+}
+
+/// ONE REGISTER-PRESSURE ANSWER — the `unsigned` of `getOrComputeRegisterPressure`, read in whichever
+/// unit the [`Metric`] asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Pressure(pub u32);
+
+/// THE `RegisterPressure&` A PASS IS HANDED — a trait for the same reason [`Liveness`] is one: the
+/// estimate is not in this campaign, and a test must still be able to observe what a pass asks of it.
+///
+/// ⛔ `Analyses/RegisterPressureAnalysis.{h,cpp}` IS OUT OF CAMPAIGN SCOPE, so the crate's only
+/// implementation is [`OutOfScopeRegisterPressure`] and every method of it is a `todo!`.
+/// ⭐ ONE TRAIT FOR BOTH `RegisterPressure` AND `RegisterPressureAnalysis`: the latter is a pass-manager
+/// wrapper that forwards all three methods to a `RegisterPressure` member (`:156-187`).
+pub trait RegisterPressure {
+    /// `getOrComputeRegisterPressure(locale, metric)` (`:71`) — the estimate for one register file.
+    fn get_or_compute_register_pressure(&mut self, locale: RegType, metric: Metric) -> Pressure;
+
+    /// `computeRegisterPressureForAllLocales()` (`:78`) — *"meant to be used for debugging and
+    /// information collection purposes only"*, which is why every caller of it is a debug block.
+    fn compute_register_pressure_for_all_locales(&mut self);
+
+    /// `dump()` (`:80`) — a `String` rather than a write to `llvm::dbgs()`, as the ported dumps of
+    /// [`super::scalar_copy_insertion_for_symbols`] are.
+    fn dump(&self) -> String;
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the estimate is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeRegisterPressure;
+
+impl RegisterPressure for OutOfScopeRegisterPressure {
+    fn get_or_compute_register_pressure(&mut self, _locale: RegType, _metric: Metric) -> Pressure {
+        todo!(
+            "RegisterPressure::getOrComputeRegisterPressure \
+             (Analyses/RegisterPressureAnalysis.h:71) — out of campaign scope"
+        )
+    }
+
+    fn compute_register_pressure_for_all_locales(&mut self) {
+        todo!(
+            "RegisterPressure::computeRegisterPressureForAllLocales \
+             (Analyses/RegisterPressureAnalysis.h:78) — out of campaign scope"
+        )
+    }
+
+    fn dump(&self) -> String {
+        todo!(
+            "RegisterPressure::dump (Analyses/RegisterPressureAnalysis.h:80) — out of campaign scope"
+        )
+    }
+}

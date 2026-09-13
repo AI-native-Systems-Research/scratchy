@@ -739,10 +739,9 @@ impl<G: ColoringGraph> PortAssignment<G> {
         let src_op = self.operand_to_owners[&data_id][0];
 
         let walk = walk_of(unit);
-        let (Some(src), Some(current)) = (
-            walk.get(src_op.0 as usize),
-            walk.get(current_op.0 as usize),
-        ) else {
+        let (Some(src), Some(current)) =
+            (walk.get(src_op.0 as usize), walk.get(current_op.0 as usize))
+        else {
             // Neither op can be absent in the reference: both came from the same pre-order walk.
             return LiveRangeComputed::Yes;
         };
@@ -799,10 +798,99 @@ impl<G: ColoringGraph> PortAssignment<G> {
     }
 }
 
-// crustify:todo: e572_computePortLiveRange
-//   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:165  (40 body lines, level 4)
-//   original  : void PortAssignmentPass::computePortLiveRange(dataflow::ProgramUnitOp &unit)
-//   calls     : e252_size, e422_insert, e520_processDataID
+/// `op<X>DataID` NARROWED — ⛔ `None` IS THE `.td`'S `-1`, which e520 declines rather than looks up.
+fn data_id_of(operand: &sentient::Operand) -> Option<DataId> {
+    operand
+        .data_id
+        .and_then(|id| u32::try_from(id).ok())
+        .map(DataId)
+}
+
+/// `isa<MacOp, BinaryOp, UnaryOp, TernaryOp, YieldOp>` — which ops the index walk numbers (`:168`).
+fn takes_an_instruction_index(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Sentient(
+            sentient::Op::VectorMac { .. }
+                | sentient::Op::VectorBinary { .. }
+                | sentient::Op::VectorUnary { .. }
+                | sentient::Op::VectorTernary { .. }
+                | sentient::Op::Yield { .. }
+        )
+    )
+}
+
+impl<G: ColoringGraph> PortAssignment<G> {
+    /// Replaces: e572_computePortLiveRange
+    ///
+    /// Numbers the unit's compute ops and yields in pre-order, then widens each compute operand's live
+    /// range to every op that reads it (`:165-204`).
+    ///
+    /// ⛔ TWO WALKS AND NOT ONE — *"Don't merge this step with before"* (`:175`): e520 reads the index
+    /// of ops it has not reached yet, and an unnumbered one would read as instruction 0.
+    /// ⛔ A `select` LEAVES `$opA` UNPROCESSED (`:194-197`), and it is the only ternary operator there
+    /// is, so the arm is written as a match that a second one would break.
+    /// ⭐ ONE `No` LOSES: it is the reference's `signalPassFailure()`, which does not unwind.
+    pub(crate) fn compute_port_live_range<R: LiveRanges>(
+        &mut self,
+        unit: &[Op],
+        live_ranges: &mut R,
+    ) -> LiveRangeComputed {
+        // First fill the operations
+        for position in walk_of(unit) {
+            let Some(op) = op_at(unit, position.at) else {
+                continue;
+            };
+            if takes_an_instruction_index(op) {
+                let next = InstrIndex(self.op_to_index.len() as u32);
+                self.op_to_index.entry(position.at).or_insert(next);
+            }
+        }
+        // Don't merge this step with before
+        let mut computed = LiveRangeComputed::Yes;
+        for position in walk_of(unit) {
+            let Some(op) = op_at(unit, position.at) else {
+                continue;
+            };
+            let operands: Vec<Option<DataId>> = match op {
+                Op::Sentient(sentient::Op::VectorMac {
+                    op_a, op_b, op_c, ..
+                }) => vec![data_id_of(op_a), data_id_of(op_b), data_id_of(op_c)],
+                Op::Sentient(sentient::Op::VectorBinary { op_a, op_b, .. }) => {
+                    vec![data_id_of(op_a), data_id_of(op_b)]
+                }
+                Op::Sentient(sentient::Op::VectorUnary { op_a, .. }) => vec![data_id_of(op_a)],
+                Op::Sentient(sentient::Op::VectorTernary {
+                    op_a,
+                    op_b,
+                    op_c,
+                    ternary_op,
+                    ..
+                }) => {
+                    let mut ids = Vec::new();
+                    match ternary_op {
+                        // A `select` leaves `$opA` unprocessed (`:194-197`).
+                        TernaryOp::Select => {
+                            let _ = op_a;
+                        }
+                    }
+                    ids.push(data_id_of(op_b));
+                    ids.push(data_id_of(op_c));
+                    ids
+                }
+                _ => Vec::new(),
+            };
+            for data_id in operands {
+                if self.process_data_id(data_id, position.at, unit, live_ranges)
+                    == LiveRangeComputed::No
+                {
+                    computed = LiveRangeComputed::No;
+                }
+            }
+        }
+        computed
+    }
+}
 
 // crustify:todo: e608_buildGraphEdges
 //   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:644  (37 body lines, level 5)
@@ -1164,7 +1252,10 @@ mod unit_tests {
             None
         );
         // A non-mac op is the reference's `-1` too.
-        assert_eq!(is_swappable_per_algebraic_reassociation(&scalar_copy()), None);
+        assert_eq!(
+            is_swappable_per_algebraic_reassociation(&scalar_copy()),
+            None
+        );
     }
 
     /// A `dataflow.program_unit` on a PE holding `body`.
@@ -1222,7 +1313,9 @@ mod unit_tests {
             }),
         ];
         let mut pass = PortAssignment::<CountingGraph>::default();
-        pass.op_to_index = (0..4).map(|index| (OpAt(index), InstrIndex(index))).collect();
+        pass.op_to_index = (0..4)
+            .map(|index| (OpAt(index), InstrIndex(index)))
+            .collect();
         let mut ranges = RecordingLiveRanges::default();
 
         // ⛔ `data_id == -1` IS NOTHING TO COMPUTE, not a failure (`:95-96`).
@@ -1249,5 +1342,68 @@ mod unit_tests {
             ]
         );
         assert_eq!(pass.operand_to_owners[&DataId(7)], vec![OpAt(0), OpAt(2)]);
+    }
+
+    /// A `sentient.vector_unary` whose `$opA` carries `data_id` — `None` being the `.td`'s `-1`.
+    fn unary_on(data_id: Option<i32>) -> Op {
+        Op::Sentient(sentient::Op::VectorUnary {
+            mask: Val(2),
+            op_a: Operand {
+                data_id,
+                ..Operand::from(Port::West)
+            },
+            unary_op: UnaryOp::Rec,
+            result: ResultPorts::default(),
+            compute_precision: Precision::Fp16,
+            fold_mode: None,
+            unroll_factor: sentient::UnrollFactor::X1,
+            dbg_name: None,
+        })
+    }
+
+    /// e572 — only the compute ops are numbered, and the two ops sharing a data ID both widen its
+    /// range while the unassigned one is nothing to compute.
+    #[test]
+    fn e572_numbers_the_compute_ops_then_widens_each_operands_range() {
+        let unit = vec![
+            scalar_copy(),
+            unary_on(Some(7)),
+            unary_on(None),
+            unary_on(Some(7)),
+        ];
+        let mut pass = PortAssignment::<CountingGraph>::default();
+        let mut ranges = RecordingLiveRanges::default();
+
+        assert_eq!(
+            pass.compute_port_live_range(&unit, &mut ranges),
+            LiveRangeComputed::Yes
+        );
+
+        // The `sentient.scalar_copy` at position 0 takes no instruction index.
+        assert_eq!(
+            pass.op_to_index,
+            BTreeMap::from([
+                (OpAt(1), InstrIndex(0)),
+                (OpAt(2), InstrIndex(1)),
+                (OpAt(3), InstrIndex(2)),
+            ])
+        );
+        assert_eq!(pass.operand_to_owners[&DataId(7)], vec![OpAt(1), OpAt(3)]);
+        assert_eq!(pass.operand_to_owners.len(), 1);
+        assert_eq!(
+            ranges.0,
+            vec![
+                LabeledRange {
+                    first: InstrIndex(0),
+                    last: InstrIndex(0),
+                    label: RegionLabel::Global,
+                },
+                LabeledRange {
+                    first: InstrIndex(0),
+                    last: InstrIndex(2),
+                    label: RegionLabel::Global,
+                },
+            ]
+        );
     }
 }

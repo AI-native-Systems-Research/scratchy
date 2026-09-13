@@ -76,11 +76,224 @@
 //! |---|---|---|---|---|
 //! | `e575_runOnOperation` | 575 | 4 | 28 | `dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:295` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET: `e575_runOnOperation` below is this module's only
+// root and nothing calls it, so every item under it — this file's and the manager's — reads as dead.
+// CI runs clippy with `-D warnings`, so without this the pass entry itself fails the gate.
+// ⭐ REMOVE THIS WHEN THE PIPELINE CALLS THE PASS: at that point an unused item here is a real defect.
+#![allow(dead_code)]
+
 pub(crate) mod redundant_conditional_manager;
 
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::sentient::Program;
+use crate::islands::sentient::dialects::{
+    Op, Val, erase_defining_op, regions_mut, regions_ref, sentient,
+};
+use crate::model::Model;
+use crate::transform::sentient::ForRef;
+use crate::transform::sentient::remove_redundant_conditionals::redundant_conditional_manager::{
+    Doomed, process_if_op,
+};
+use crate::transform::sentient::utils::{InBlock, OpAt};
+use crate::workload::Workload;
 
-// crustify:todo: e575_runOnOperation
-//   authority : dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:295  (28 body lines, level 4)
-//   original  : void RemoveRedundantConditionalsPass::runOnOperation()
-//   calls     : e526_processIfOp
+/// `-dcc-remove-redundant-conditionals-disable`, `cl::init(false)` (`:45-48`) — a `dcc-opt` flag, not
+/// a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
 
+/// `dcc::ConditionalTree`'s nodes that carry a `sentient.if` — the tree itself is the droppable
+/// mechanism for reaching them, so what is left is where each one SITS.
+fn if_paths(scope: &[Op], enclosing: &mut Vec<(InBlock, usize)>, out: &mut Vec<OpAt>) {
+    for (index, op) in scope.iter().enumerate() {
+        if matches!(op, Op::Sentient(sentient::Op::If { .. })) {
+            out.push(OpAt::at(enclosing, InBlock(index)));
+        }
+        for (region, block) in regions_ref(op).into_iter().enumerate() {
+            enclosing.push((InBlock(index), region));
+            if_paths(block, enclosing, out);
+            enclosing.pop();
+        }
+    }
+}
+
+/// `Operation::erase()` FOR AN OP THAT BINDS NOTHING: a `sentient.for`'s results are its carried
+/// values, never its induction variable, so [`erase_defining_op`] cannot reach one queued by e466.
+fn erase_for_op(scope: &mut Vec<Op>, iv: Val) {
+    let is_it = |op: &Op| matches!(op, Op::Sentient(sentient::Op::For { iv: at, .. }) if *at == iv);
+    if let Some(at) = scope.iter().position(is_it) {
+        scope.remove(at);
+        return;
+    }
+    for op in scope.iter_mut() {
+        for region in regions_mut(op) {
+            erase_for_op(region, iv);
+        }
+    }
+}
+
+/// Replaces: e575_runOnOperation
+///
+/// The pass entry: simplifies every conditional of every program unit, then erases the ops the
+/// simplifications emptied — all of them, and only once the whole unit has been walked (`:295-322`).
+///
+/// ⚠️ TRAP: THE QUEUE IS DRAINED PER UNIT AND NOT PER CONDITIONAL, because e466 leaves an emptied
+/// `sentient.for` standing while a later conditional may still be read against it.
+/// ⚠️ DIVERGENCE: `CondNode::walk<kPostOrder>` visits SIBLINGS FORWARD; we visit them backward, so
+/// that e466's insertions — always after the conditional it rewrote — cannot invalidate a path not yet
+/// processed. The outcome set is unchanged: the only cross-sibling coupling is e465's
+/// order-insensitive *"the parent has no more uses"* test.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for unit in program.units.iter_mut() {
+        let mut paths = Vec::new();
+        if_paths(&unit.body, &mut Vec::new(), &mut paths);
+        let mut to_be_deleted: Vec<Doomed> = Vec::new();
+        for if_at in paths.iter().rev() {
+            process_if_op(&mut unit.body, if_at, &mut to_be_deleted, values);
+        }
+        for doomed in to_be_deleted {
+            match doomed {
+                Doomed::If(result) => erase_defining_op(&mut unit.body, result),
+                Doomed::For(ForRef(iv)) => erase_for_op(&mut unit.body, iv),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::run_on_operation;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units, Values};
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
+    use crate::units::DfirUnit;
+    use crate::workload::Workload;
+
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// `%r = sentient.scalar_constant {value = <value>} : index`.
+    fn constant(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `sentient.yield %results`.
+    fn yield_op(results: Vec<Val>) -> Op {
+        Op::Sentient(sentient::Op::Yield { results })
+    }
+
+    /// A one-unit program running `body`.
+    fn one_unit(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// e575 — e466's own case through the pass entry: the loop guarded by a conditional becomes a
+    /// conditional around the loop's body, and BOTH emptied ops are erased by the post-walk drain.
+    #[test]
+    fn e575_simplifies_every_conditional_then_drains_the_queue() {
+        let (a, b, zero, one) = (Val(0), Val(1), Val(2), Val(3));
+        let (if_result, iv, inner) = (Val(4), Val(5), Val(6));
+        let mut program = one_unit(vec![
+            constant(a, 3),
+            constant(b, 4),
+            constant(zero, 0),
+            constant(one, 1),
+            Op::Sentient(sentient::Op::If {
+                predicate: sentient::CmpPredicate::Slt,
+                lhs: a,
+                rhs: b,
+                yielded: vec![sentient::Yielded {
+                    result: if_result,
+                    reg: sentient::Reg {
+                        locale: sentient::RegType::Unknown,
+                        index: None,
+                    },
+                    element_size: None,
+                }],
+                dbg_name: None,
+                then_body: vec![yield_op(vec![one])],
+                else_body: vec![yield_op(vec![zero])],
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv,
+                bound: if_result,
+                bound_reg: None,
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![constant(inner, 7), yield_op(Vec::new())],
+            }),
+        ]);
+        let mut values = Values::default();
+        // Val(0)..=Val(6) are taken above.
+        for _ in 0..7 {
+            let _ = values.mint();
+        }
+
+        run_on_operation(&mut program, &mut values);
+
+        let unit = program.units.iter().next().expect("the one unit");
+        let body = &unit.body;
+        // The four constants, e466's new bound, and the new conditional — the old `if` and the
+        // emptied `for` are both gone.
+        assert_eq!(body.len(), 6);
+        let Op::Sentient(sentient::Op::If { then_body, .. }) = &body[5] else {
+            panic!("the new conditional follows the new bound");
+        };
+        assert_eq!(then_body, &vec![constant(inner, 7), yield_op(Vec::new())]);
+        assert!(
+            !body
+                .iter()
+                .any(|op| matches!(op, Op::Sentient(sentient::Op::For { .. })))
+        );
+    }
+}

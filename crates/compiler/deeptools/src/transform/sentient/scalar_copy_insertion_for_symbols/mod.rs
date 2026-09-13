@@ -104,7 +104,7 @@ use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient, sy
 use crate::islands::sentient::print;
 
 use super::ForRef;
-use super::analyses::Liveness;
+use super::analyses::{Liveness, RegisterPressure};
 
 /// `localeToRegisterClass` (`dcc/src/Dialect/Sentient/Utils.cpp:203`) — the register class a locale
 /// names, which is `stringifySentientRegType(locale).upper()` with both XRF pointers folded onto one.
@@ -753,10 +753,128 @@ fn collect_usage(
     }
 }
 
-// crustify:todo: e576_runOn
-//   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:148  (67 body lines, level 4)
-//   original  : void ScalarCopyInsertionForSymbolsPass::runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e149_collectOpsOfInterest, e150_pessimizeLiveness, e155_dumpSymbolicLocales, e156_dumpCandidates, e252_size, e358_collectCandidates, e359_insertCopyOpsForCandidates, e360_dumpSymbolUsageInfo, e527_collectSymbolUsage
+/// `LLVM_DEBUG` — `-debug-only=scalar-copy-insertion-for-symbols`, off unless `dcc-opt` is asked for
+/// it, and the reason the trace calls below are present but not taken.
+const DEBUG: bool = false;
+
+/// `DEBUG_WITH_TYPE(VerboseDebug, ..)` — `DEBUG_TYPE "-verbose"` (`:41`), a second and narrower flag.
+const VERBOSE_DEBUG: bool = false;
+
+/// `ScalarCopyInsertionForSymbolsPass::dumpSymbolUsageInfo()` — SENPASS UNIT e360, whose anchor is
+/// still open above; isolating the call in a private seam is the `2a8195231` precedent.
+fn dump_symbol_usage_info(usage: &SymbolUsage) -> String {
+    todo!(
+        "ScalarCopyInsertionForSymbolsPass::dumpSymbolUsageInfo — senpass e360 \
+         (ScalarCopyInsertionForSymbols.cpp:512) is not ported yet, and this {usage:?} needs it"
+    )
+}
+
+/// `ScalarCopyInsertionForSymbolsPass::collectCandidates(unit, candidates, rp)` — SENPASS UNIT e358,
+/// whose anchor is still open above. ⛔ THE ONE READER OF THE REGISTER-PRESSURE ESTIMATE IS HERE, which
+/// is why e576 only ever hands `rp` on.
+fn collect_candidates<P: RegisterPressure>(
+    unit_body: &[Op],
+    state: &PerUnitState,
+    candidates: &mut Vec<CandidateEntry>,
+    rp: &mut P,
+) {
+    // ⛔ NOT `rp.dump()` IN THE MESSAGE: that method is a `todo!` of its own, and a panic from it
+    // would name the analysis where this seam is what a caller actually reached.
+    let _ = rp;
+    todo!(
+        "ScalarCopyInsertionForSymbolsPass::collectCandidates — senpass e358 \
+         (ScalarCopyInsertionForSymbols.cpp:297) is not ported yet, and this unit of {} ops with \
+         {} symbolic locales and {candidates:?} needs it",
+        unit_body.len(),
+        state.symbolic_locales.len()
+    )
+}
+
+/// `ScalarCopyInsertionForSymbolsPass::insertCopyOpsForCandidates(unit, candidates)` — SENPASS UNIT
+/// e359, whose anchor is still open above. Its own callee `e151` IS ported ([`insert_copy_ops_for_jcr_candidate`]).
+fn insert_copy_ops_for_candidates(
+    unit_body: &mut Vec<Op>,
+    candidates: &[CandidateEntry],
+    usage: &SymbolUsage,
+    values: &mut Values,
+) {
+    todo!(
+        "ScalarCopyInsertionForSymbolsPass::insertCopyOpsForCandidates — senpass e359 \
+         (ScalarCopyInsertionForSymbols.cpp:365) is not ported yet, and these {} candidates over \
+         {} ops, {usage:?} and {values:?} need it",
+        candidates.len(),
+        unit_body.len()
+    )
+}
+
+/// Replaces: e576_runOn
+///
+/// One program unit's six steps: collect its copies and outermost loops, map every symbol's uses to
+/// the register files reading them, pessimize liveness over those files, then choose candidates
+/// against the resulting register pressure and insert a copy for each (`:148-214`).
+///
+/// ⛔ TRAP: THE STEPS ARE ORDERED BY DATA AND NOT BY THE COMMENT. `collectSymbolUsage` reads
+/// `symbol_queries_` that `collectOpsOfInterest` filled, and `pessimizeLiveness` reads the
+/// `symbolic_locales_` that `collectSymbolUsage` filled — swapping any pair silently empties the next.
+/// ⭐ THE `Liveness` AND `RegisterPressure` ARE PARAMETERS, not built here: both are out of campaign
+/// scope, and the reference's own note is that an `rp` built before `pessimizeLiveness` is invalid
+/// afterwards — which is why its first dump, under [`VERBOSE_DEBUG`], reads a DIFFERENT instance.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference reaches five of these through `this` and two more through the pass \
+              manager, and neither is a thing this crate has"
+)]
+pub fn run_on<L: Liveness, P: RegisterPressure>(
+    unit_body: &mut Vec<Op>,
+    symbols: &[Val],
+    state: &mut PerUnitState,
+    liveness: &mut L,
+    rp: &mut P,
+    values: &mut Values,
+    trace: &mut String,
+) {
+    if VERBOSE_DEBUG {
+        trace.push_str("Register Pressure before pessimizing liveness:\n");
+        rp.compute_register_pressure_for_all_locales();
+        trace.push_str(&rp.dump());
+    }
+    if DEBUG {
+        let _ = writeln!(trace, "num global symbols (seen so far):{}", symbols.len());
+    }
+    state.ops = collect_ops_of_interest(unit_body);
+    if DEBUG {
+        let _ = writeln!(
+            trace,
+            "num query_symbol ops:{}\nnum scalar_copy ops:{}\nnum outermost loops:{}",
+            state.ops.symbol_queries.len(),
+            state.ops.scalar_copy_ops.len(),
+            state.ops.outermost_loops.len()
+        );
+    }
+    let (usage, symbolic_locales) =
+        collect_symbol_usage(unit_body, symbols, &state.ops.symbol_queries);
+    state.symbol_to_usage = usage;
+    state.symbolic_locales = symbolic_locales;
+    if DEBUG {
+        trace.push_str(&dump_symbolic_locales(&state.symbolic_locales));
+        trace.push_str(&dump_symbol_usage_info(&state.symbol_to_usage));
+    }
+    // ⭐ A COPY OF THE CHILD ANALYSIS, *"since this pass does not preserve liveness, the changes made
+    // in the liveness object will not affect downstream transformations"* — the copy is the mechanism.
+    pessimize_liveness(state, unit_body, liveness);
+    if VERBOSE_DEBUG {
+        trace.push_str("Register Pressure after pessimizing liveness:\n");
+        rp.compute_register_pressure_for_all_locales();
+        trace.push_str(&rp.dump());
+    }
+    let mut candidates: Vec<CandidateEntry> = Vec::new();
+    collect_candidates(unit_body, state, &mut candidates, rp);
+    if DEBUG {
+        trace.push_str("Selected the following candidates for copy-op insertion:\n");
+        trace.push_str(&dump_candidates(&candidates, unit_body));
+    }
+    insert_copy_ops_for_candidates(unit_body, &candidates, &state.symbol_to_usage, values);
+}
 
 // crustify:todo: e610_runOnOperation
 //   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:130  (17 body lines, level 5)
@@ -769,7 +887,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::dataflow;
     use crate::islands::sentient::dialects::sentient::Carried;
-    use crate::transform::sentient::analyses::VirtualAssigns;
+    use crate::transform::sentient::analyses::{OutOfScopeRegisterPressure, VirtualAssigns};
     use crate::units::{DfirUnit, Residency};
 
     /// A `sentient.scalar_copy` with no width, as `CopyOp::create`'s five-argument builder makes one.
@@ -1213,6 +1331,49 @@ mod unit_tests {
              \tlocale [JCR]\n"
         );
     }
+    /// e576 — the five steps that ARE ported run in the order the sixth needs, and the sixth is e358.
+    #[test]
+    fn e576_collects_maps_and_pessimizes_before_it_reaches_the_unported_e358() {
+        let sym = Val(0);
+        let mut body = vec![
+            a_copy(sym, Val(1), RegType::Jcr),
+            an_add(sym, Val(6), Val(7), RegType::Jcr, None),
+        ];
+        let mut state = PerUnitState::default();
+        let mut liveness = Recorder::default();
+        let mut rp = OutOfScopeRegisterPressure;
+        let mut values = Values::default();
+        let mut trace = String::new();
+
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_on(
+                &mut body,
+                &[sym],
+                &mut state,
+                &mut liveness,
+                &mut rp,
+                &mut values,
+                &mut trace,
+            );
+        }));
+
+        assert!(reached.is_err(), "e358 is not ported, so the choice panics");
+        assert_eq!(state.ops.scalar_copy_ops, vec![Val(1)]);
+        // ⛔ THE COPY'S OWN USE OF THE SYMBOL IS NOT ONE, so `jcr` comes from the `scalar_add`.
+        assert_eq!(state.symbolic_locales, vec![RegType::Jcr]);
+        assert_eq!(
+            state.symbol_to_usage.uses(sym, RegType::Jcr),
+            &[UseSite {
+                path: vec![1],
+                operand: 0,
+            }]
+        );
+        // The copy's result is promoted BECAUSE `jcr` became symbolic one step earlier.
+        assert_eq!(liveness.0, vec![Val(1)]);
+        // ⭐ NEITHER TRACE IS TAKEN, which is what keeps the e360 seam out of the way.
+        assert_eq!(trace, String::new());
+    }
+
     /// e527 — a use is recorded under the locale of the op that reads it, and the ops a copy cannot
     /// stand in front of are skipped.
     #[test]

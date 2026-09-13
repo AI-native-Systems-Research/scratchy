@@ -657,10 +657,47 @@ fn record<E: ExpressionEvaluator>(
     }
 }
 
-// crustify:todo: e577_collectBlocks
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:869  (26 body lines, level 4)
-//   original  : void ScalarOpMerging::collectBlocks()
-//   calls     : e422_insert, e528_buildBlock
+/// Replaces: e577_collectBlocks
+///
+/// Searches the region bottom-up for a scalar add/sub merging candidate and builds a block from each
+/// one the operand chains walked so far have not already absorbed (`:869-895`).
+///
+/// ⭐ ONE LOOP FOR THE REFERENCE'S TWO: a region at this rung is a single flat block.
+/// ⛔ THE SKIP SET IS KEYED BY THE RESULT AN OP BINDS, which is all [`build_block`] ever writes into
+/// it; an op that binds nothing takes the same `continue` the reference's `else` does.
+pub(crate) fn collect_blocks<A: Arch, E: ExpressionEvaluator>(
+    region: &[Op],
+    ibuff_space: IbuffSpace,
+    comp: ScalarOpComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    blocks: &mut Vec<ScalarOpMergingBlock>,
+) {
+    let mut analyzed_ops: BTreeSet<Val> = BTreeSet::new();
+    for op in region.iter().rev() {
+        let Some(op_val) = results(op).first().copied() else {
+            continue;
+        };
+        if !analyzed_ops.insert(op_val) {
+            continue;
+        }
+        if matches!(
+            op,
+            Op::Sentient(ops::Op::ScalarAdd { .. } | ops::Op::ScalarSub { .. })
+        ) {
+            build_block::<A, E>(
+                op_val,
+                region,
+                ibuff_space,
+                comp,
+                scale,
+                evaluator,
+                &mut analyzed_ops,
+                blocks,
+            );
+        }
+    }
+}
 
 // crustify:todo: e611_runScalarOpMerging
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:569  (10 body lines, level 5)
@@ -671,13 +708,11 @@ fn record<E: ExpressionEvaluator>(
 mod unit_tests {
     use super::super::ScalarOpCount;
     use super::*;
+    use crate::arch::Dd2;
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::Values;
-    use crate::arch::Dd2;
     use crate::islands::dataflow_ir::link::SendEnd;
-    use crate::transform::sentient::analyses::{
-        EvaluatedValue, Evaluation, Offsets, ScalarOffset,
-    };
+    use crate::transform::sentient::analyses::{EvaluatedValue, Evaluation, Offsets, ScalarOffset};
 
     /// The out-of-scope evaluator, stating the ONE answer these units consume.
     struct StatedEvaluator {
@@ -1105,5 +1140,29 @@ mod unit_tests {
         );
         // ⛔ `%1` IS IN THE SKIP SET although it defines no op — see [`build_block`]'s first trap.
         assert_eq!(analyzed, BTreeSet::from([Val(1), Val(4), Val(6)]));
+    }
+    /// 577/656 — the bottom add of the chain is the only candidate the walk builds from: the add above
+    /// it is already in the skip set, and the constant they share is not an add at all.
+    #[test]
+    fn e577_collects_one_block_from_the_bottom_add_of_a_chain() {
+        let region = vec![
+            scalar_constant(8, Val(2)),
+            add_sized(Val(1), Val(2), Val(4), Bits(16)),
+            add_sized(Val(4), Val(2), Val(6), Bits(16)),
+        ];
+        let mut blocks = Vec::new();
+
+        collect_blocks::<Dd2, _>(
+            &region,
+            IbuffSpace(8),
+            ScalarOpComp::Lxlu,
+            AddressScale::ONE,
+            &mut SummingEvaluator::default(),
+            &mut blocks,
+        );
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].input_value_to_block, Some(Val(1)));
+        assert_eq!(blocks[0].num_scalar_ops_in_block, ScalarOpCount(2));
     }
 }
