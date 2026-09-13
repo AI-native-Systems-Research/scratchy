@@ -139,13 +139,6 @@ pub mod transformation;
 pub(crate) mod transformation_util;
 pub mod v1;
 
-// crustify:todo: e296_rollBackNodesInBlock
-//   authority : ddc/ddc.h:511  (15 body lines, level 2)
-//   class     : CoordPropTracker
-//   original  : void rollBackNodesInBlock(DesignSpaceConfig* currDsc, dsc2::BlockNode* blockRoot)
-//   extract   : crustify-ddc/cpp/ddc.cpp:8113-8129
-//   calls     : e231_rollbackToPos
-
 // ⭐ USES FOR ENTRIES 073-077 AND 230-232. Union these into this file's top block when its other
 // entries land.
 use core::fmt::Write as _;
@@ -477,6 +470,40 @@ impl CoordPropTracker {
         self.items.clear();
         self.refs_added.clear();
         self.curr = None;
+    }
+
+    /// Replaces: e296_rollBackNodesInBlock
+    ///
+    /// Rewinds to the first queued step before the cursor whose reference or fold node sits in
+    /// `block`'s subtree, and does nothing when none does.
+    ///
+    /// ⛔ THE CURSOR'S OWN ENTRY IS NOT SCANNED (`ddc/ddc.h:519`): `i < currItemToProcess_`.
+    /// ⭐ MEMBERSHIP IS A PARENT WALK over the three kinds the reference's DFS filter admits —
+    /// ALLOCATE, COMPUTE and TRANSFER — since a subtree holds loops and conditions too.
+    pub fn roll_back_nodes_in_block<T: ScheduleTree + NodeCoordinates + ?Sized>(
+        &mut self,
+        nodes: &mut T,
+        block: BlockId,
+    ) {
+        let Some(QueuePos(curr)) = self.curr else {
+            return;
+        };
+        let in_block = |node: NodeId| {
+            matches!(
+                nodes.kind(node),
+                NodeKind::Allocate | NodeKind::Compute | NodeKind::Transfer
+            ) && core::iter::successors(nodes.parent(node), |&walked| nodes.parent(walked))
+                .any(|walked| walked == block.node())
+        };
+        // `take`, not a slice: `next_item` can leave the cursor one past the last entry.
+        let hit = self
+            .items
+            .iter()
+            .take(curr)
+            .position(|item| in_block(item.prop.ref_node) || in_block(item.prop.node_to_fold));
+        if let Some(pos) = hit {
+            self.rollback_to_pos(nodes, QueuePos(pos));
+        }
     }
 }
 
@@ -950,5 +977,131 @@ mod tests_e230_e232 {
 
         tracker.add_prop_info(step(0, 1), &[PrimaryDim::In]);
         assert_eq!(tracker.items.len(), 1);
+    }
+}
+
+// ⭐ TESTS FOR ENTRY 296. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e296 {
+    use super::fold::{BlockId, CoordPropInfo, NodeId, NodeKind, PropEnd, ScheduleTree};
+    use super::{
+        CoordPropTracker, NodeCoordinates, PropState, Propagation, QueuePos, RefRole, ScaleDown,
+    };
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+
+    fn step(ref_node: u32, node_to_fold: u32) -> Propagation {
+        Propagation {
+            ends: CoordPropInfo {
+                data_connect: None,
+                ref_node: PropEnd::Other,
+                node_to_fold: PropEnd::Other,
+            },
+            ref_node: NodeId(ref_node),
+            node_to_fold: NodeId(node_to_fold),
+            ref_role: RefRole::Producer,
+            scale_down: ScaleDown::Yes,
+        }
+    }
+
+    /// A KIND AND A PARENT PER NODE, recording which store was emptied for which node.
+    struct Nodes {
+        kinds: Vec<NodeKind>,
+        parents: Vec<Option<NodeId>>,
+        cleared: Vec<(NodeId, NodeKind)>,
+    }
+
+    impl ScheduleTree for Nodes {
+        fn kind(&self, node: NodeId) -> NodeKind {
+            self.kinds[node.0 as usize]
+        }
+        fn parent(&self, node: NodeId) -> Option<NodeId> {
+            self.parents[node.0 as usize]
+        }
+        fn children(&self, _block: BlockId) -> Vec<NodeId> {
+            Vec::new()
+        }
+    }
+
+    impl NodeCoordinates for Nodes {
+        fn clear_allocate_coordinates(&mut self, node: NodeId) {
+            self.cleared.push((node, NodeKind::Allocate));
+        }
+        fn clear_transfer_coordinates(&mut self, node: NodeId) {
+            self.cleared.push((node, NodeKind::Transfer));
+        }
+        fn clear_compute_coordinates(&mut self, node: NodeId) {
+            self.cleared.push((node, NodeKind::Compute));
+        }
+    }
+
+    /// NODE 0 is the block, 1 a loop under it, 2 a compute under that loop, 3 a transfer OUTSIDE the
+    /// block, and 4 the block's own child transfer.
+    fn tree() -> Nodes {
+        Nodes {
+            kinds: vec![
+                NodeKind::Block,
+                NodeKind::Loop,
+                NodeKind::Compute,
+                NodeKind::Transfer,
+                NodeKind::Transfer,
+            ],
+            parents: vec![
+                None,
+                Some(NodeId(0)),
+                Some(NodeId(1)),
+                None,
+                Some(NodeId(0)),
+            ],
+            cleared: Vec::new(),
+        }
+    }
+
+    /// e296: the FIRST step before the cursor touching the block's subtree is where the queue rewinds
+    /// to, and the match may come through either end at any depth.
+    #[test]
+    fn the_first_step_reaching_into_the_block_is_what_the_queue_rewinds_to() {
+        let mut nodes = tree();
+        let mut tracker = CoordPropTracker::default();
+        // 0: neither end in the block. 1: `nodeToFold` two levels down. 2: `refNode` a direct child.
+        tracker.add_prop_info(step(3, 3), &[PrimaryDim::In]);
+        tracker.add_prop_info(step(3, 2), &[PrimaryDim::In]);
+        tracker.add_prop_info(step(4, 3), &[PrimaryDim::In]);
+        for _ in 0..3 {
+            let _ = tracker.next_item();
+        }
+
+        let block = BlockId::of(&nodes, NodeId(0)).unwrap();
+        tracker.roll_back_nodes_in_block(&mut nodes, block);
+
+        assert_eq!(tracker.items[0].state, PropState::Complete);
+        assert_eq!(tracker.items[1].state, PropState::RolledBack);
+        assert_eq!(tracker.items[2].state, PropState::RolledBack);
+        assert_eq!(tracker.curr, Some(QueuePos(0)));
+        assert_eq!(
+            nodes.cleared,
+            vec![
+                (NodeId(2), NodeKind::Compute),
+                (NodeId(3), NodeKind::Transfer),
+            ]
+        );
+    }
+
+    /// e296, the negative: the cursor's own entry is outside the scan, so the step just fetched is
+    /// never the one rolled back.
+    #[test]
+    fn the_entry_the_cursor_sits_on_is_not_scanned() {
+        let mut nodes = tree();
+        let mut tracker = CoordPropTracker::default();
+        tracker.add_prop_info(step(3, 3), &[PrimaryDim::In]);
+        tracker.add_prop_info(step(4, 3), &[PrimaryDim::In]);
+        for _ in 0..2 {
+            let _ = tracker.next_item();
+        }
+
+        let block = BlockId::of(&nodes, NodeId(0)).unwrap();
+        tracker.roll_back_nodes_in_block(&mut nodes, block);
+
+        assert!(nodes.cleared.is_empty());
+        assert_eq!(tracker.curr, Some(QueuePos(1)));
     }
 }
