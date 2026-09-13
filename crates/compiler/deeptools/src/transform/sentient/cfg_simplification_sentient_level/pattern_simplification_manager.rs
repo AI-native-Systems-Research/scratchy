@@ -97,8 +97,8 @@
 
 use super::{
     Builders, ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS, Entries, EvaluatedValueId,
-    ExpressionEvaluator, IntervalMarker, IntervalStride, Leaf, Sequence, SequenceKind, Table,
-    TableIndex, TableSlice,
+    ExpressionEvaluator, IndexStride, IntervalMarker, IntervalStride, Leaf, Sequence, SequenceKind,
+    Table, TableIndex, TableSlice,
 };
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{self as ir, Op, Val, affine, arith, sentient};
@@ -371,9 +371,9 @@ pub struct Branch {
 
 /// `PatternSimplificationManager` (`:537-695`) — the members the units in this file read.
 ///
-/// ⛔ `table_slices_are_consistent_` (`:570`) AND `cur_root_` (`:594`) ARE NOT DECLARED YET: no unit
-/// ported so far reads either, and every use of `cur_root_` is the `getLoc()` of a builder call —
-/// SentientIR carries no `Loc`, so there is nothing for the island to hold.
+/// ⛔ `cur_root_` (`:594`) IS NOT DECLARED: no unit ported so far reads it, and every use of it is
+/// the `getLoc()` of a builder call — SentientIR carries no `Loc`, so there is nothing for the island
+/// to hold.
 #[derive(Debug, Clone)]
 pub struct PatternSimplificationManager {
     /// `lhs_to_for_op_or_null_`.
@@ -391,6 +391,9 @@ pub struct PatternSimplificationManager {
     /// `table_slices_follow_montone_pattern_` (`:563`) — ⭐ STARTS TRUE, and the reference's own
     /// spelling of "montone" is kept so that a grep for the member lands here.
     pub table_slices_follow_montone_pattern: bool,
+    /// `table_slices_are_consistent_` (`:570`) — ⭐ STARTS TRUE, and only
+    /// [`PatternSimplificationManager::parse_fixed_dims`] ever clears it.
+    pub table_slices_are_consistent: bool,
     /// `abort_pattern_` (`:591`).
     pub abort_pattern: bool,
     /// `monotone_seq_start_val_` (`:583`).
@@ -404,8 +407,8 @@ pub struct PatternSimplificationManager {
     pub marks: Marks,
 }
 
-/// ⭐ TWO FLAGS START TRUE (`:559`, `:563`) — a derived `Default` would start the pass having already
-/// failed to match both patterns, and `insertSequence` only ever clears them.
+/// ⭐ THREE FLAGS START TRUE (`:559`, `:563`, `:570`) — a derived `Default` would start the pass
+/// having already failed to match every pattern, and nothing but a mismatch ever clears one.
 impl Default for PatternSimplificationManager {
     fn default() -> PatternSimplificationManager {
         PatternSimplificationManager {
@@ -415,6 +418,7 @@ impl Default for PatternSimplificationManager {
             template_sequences: Vec::new(),
             table_follows_contiguous_pattern: true,
             table_slices_follow_montone_pattern: true,
+            table_slices_are_consistent: true,
             abort_pattern: false,
             monotone_seq_start_val: None,
             monotone_seq_int_step: None,
@@ -2757,10 +2761,76 @@ fn carried_and_body_len(root: &[Op], for_op: &OpPath) -> Option<(Vec<sentient::C
     Some((carried.clone(), body.len()))
 }
 
-// crustify:todo: e496_parseFixedDims
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2021  (59 body lines, level 3)
-//   original  : void PatternSimplificationManager::parseFixedDims( std::vector<std::tuple<Value, dcc::WidestIntType, dcc::WidestIntType>>::iterator it_cur, std::vector<std::tuple<Value, dcc::WidestIntType, dcc::WidestIntType>>::iterator it_free_dimension, dcc::WidestIntType index, std::vector<TableSlice *> &table_s
-//   calls     : e027_print, e252_size, e434_parseSequence
+impl PatternSimplificationManager {
+    /// Replaces: e496_parseFixedDims
+    ///
+    /// Enumerates every tuple of the FIXED IVs and parses one [`TableSlice`] per leaf, recording
+    /// whether the slices agree in sequence count and kind (`:2020-2083`).
+    ///
+    /// TRAP: THE COUNT MISMATCH DOES NOT `break` AND THE KIND MISMATCH DOES (`:2053`, `:2069`).
+    /// TRAP: A MISSING `lhs_to_for_op_or_null_` ENTRY IS `DT_CHECK_MSG(step != 0, ..)` (`:2038`) —
+    /// the reference reads the map with `operator[]`, which default-constructs step 0.
+    pub fn parse_fixed_dims(
+        &mut self,
+        fixed: &[IvDim],
+        free_dimension: IvDim,
+        index: TableIndex,
+        table_slices: &mut Vec<TableSlice>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) {
+        let Some((cur, rest)) = fixed.split_first() else {
+            // `it_cur == it_free_dimension` — reached a leaf.
+            let Some((lb, step)) = self
+                .lhs_to_for_op_or_null
+                .get(&free_dimension.iv)
+                .map(|info| (info.lb, info.step))
+            else {
+                panic!(
+                    "DT_CHECK(step != 0) Expect non-zero stride. \
+                     (`CFGSimplificationSentientLevel.cpp:2038`): the free dimension \
+                     {free_dimension:?} is the IV of no recorded loop"
+                )
+            };
+            let zero = evaluator.get_constant(0);
+            let length = Entries(free_dimension.dimension);
+            let mut table_slice = TableSlice::new(
+                index,
+                IndexStride(free_dimension.multiplier),
+                length,
+                zero,
+                /* is_1d_rep_of_table */ false,
+            );
+            self.parse_sequence(
+                IntervalMarker(lb),
+                IntervalStride::new(step),
+                index,
+                length,
+                &mut table_slice,
+                evaluator,
+            );
+            if self.table_slices_are_consistent
+                && let Some(first) = table_slices.first()
+            {
+                if table_slice.sequences.len() != first.sequences.len() {
+                    self.table_slices_are_consistent = false;
+                }
+                for (cur_seq, first_seq) in table_slice.sequences.iter().zip(&first.sequences) {
+                    if cur_seq.kind != first_seq.kind {
+                        self.table_slices_are_consistent = false;
+                        break;
+                    }
+                }
+            }
+            table_slices.push(table_slice);
+            return;
+        };
+        let mut index = index;
+        for _ in 0..cur.dimension {
+            self.parse_fixed_dims(rest, free_dimension, index, table_slices, evaluator);
+            index = TableIndex(index.0 + cur.multiplier);
+        }
+    }
+}
 
 // crustify:todo: e555_findPatternsAndSimplify
 //   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:1101  (340 body lines, level 4)
@@ -3954,5 +4024,65 @@ mod unit_tests {
         // Both slices are consumed, the `then` one first.
         assert_eq!(evaluator.built, vec![first, second]);
         assert!(nest.slices.next().is_none());
+    }
+
+    /// 496/656 — one fixed IV of dimension two parses one slice per iteration, stepping the table
+    /// index by that dimension's multiplier, and the two slices disagreeing in sequence count clears
+    /// the consistency flag.
+    #[test]
+    fn parse_fixed_dims_parses_one_slice_per_fixed_iteration_and_notices_they_disagree() {
+        let (fixed, free) = (Val(1), Val(2));
+        let mut evaluator = FakeEvaluator::default();
+        let mut table = Table::new(TableSize(4), ScalarTy::Int(1), ScalarTy::Index);
+        // `[7, 7]` is one sequence and `[7, 8]` is two, so the slices cannot agree.
+        for (at, result) in [(0, 7), (1, 7), (2, 7), (3, 8)] {
+            table.create_table_entry_at_idx(
+                TableIndex(at),
+                &Leaf {
+                    results: vec![Val(result)],
+                    block: None,
+                },
+                &mut evaluator,
+            );
+        }
+        let mut manager = PatternSimplificationManager {
+            lhs_to_for_op_or_null: BTreeMap::from([(free, loop_info(None, 2))]),
+            table: Some(table),
+            ..PatternSimplificationManager::default()
+        };
+        let mut slices = Vec::new();
+
+        manager.parse_fixed_dims(
+            &[IvDim {
+                iv: fixed,
+                dimension: 2,
+                multiplier: 2,
+            }],
+            IvDim {
+                iv: free,
+                dimension: 2,
+                multiplier: 1,
+            },
+            TableIndex(0),
+            &mut slices,
+            &mut evaluator,
+        );
+
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| (
+                    slice.start_idx,
+                    slice.idx_stride,
+                    slice.length,
+                    slice.sequences.len()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (TableIndex(0), IndexStride(1), Entries(2), 1),
+                (TableIndex(2), IndexStride(1), Entries(2), 2),
+            ]
+        );
+        assert!(!manager.table_slices_are_consistent);
     }
 }

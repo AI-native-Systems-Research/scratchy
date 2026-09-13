@@ -255,10 +255,23 @@ pub fn max_burst_size<A: Arch>(comp: DfirUnit) -> Option<Elements> {
     }
 }
 
-// crustify:todo: e495_runOnOperation
-//   authority : dcc/src/Transform/Sentient/BurstSplitting.cpp:213  (5 body lines, level 3)
-//   original  : void runOnOperation()
-//   calls     : e285_runOn, e430_runOn
+/// `-dcc-burst-splitting-disable` (`BurstSplitting.cpp:63-67`) — *"Disable burst splitting pass
+/// (CAUTION: May lead to invalid program)"*, whose `llvm::cl::init(false)` is this value.
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e495_runOnOperation
+///
+/// The pass entry point (`:213-217`): unless `-dcc-burst-splitting-disable` is set, splits every
+/// oversized burst in the module.
+///
+/// ⭐ `getOperation()` IS THE ARGUMENT — an MLIR pass asks the pass manager for its module, and this
+/// crate's caller already holds the [`Program`].
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    run_on_program(program);
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -411,5 +424,48 @@ mod unit_tests {
             bound: core::marker::PhantomData,
         };
         run_on_program(&mut program);
+    }
+
+    /// 495/656 — the pass entry point is not gated off by default, so a module holding one oversized
+    /// L3LU transfer is split at DD2's own burst size.
+    #[test]
+    #[should_panic(expected = "bursts of Elements(32)")]
+    fn e495_the_entry_point_splits_the_modules_oversized_burst() {
+        let unit = ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::L3lu, Val(0)),
+            precision: None,
+            body: vec![Op::Sentient(sentient::Op::LoadAndSend {
+                mutable_addr: Val(1),
+                immutable_addr: Val(2),
+                increment: Val(3),
+                consumer: crate::islands::dataflow_ir::link::SendEnd::to_self(Val(98)),
+                result: Val(4),
+                extent: sentient::Extent {
+                    burst_size: Elements(264),
+                    ..sentient::Extent::of(Elements(264), Bits(16))
+                },
+                interleaved_group: Elements(0),
+                rotate_val: None,
+                dir: None,
+                shuffle_mode: sentient::ShuffleMode::NoShuffle,
+                reg: sentient::Reg {
+                    locale: sentient::RegType::Lar,
+                    index: None,
+                },
+                dbg_name: None,
+            })],
+            arch: core::marker::PhantomData,
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit, Vec::new()),
+            bound: core::marker::PhantomData,
+        };
+        run_on_operation(&mut program);
     }
 }

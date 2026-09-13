@@ -86,7 +86,9 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
-use crate::islands::sentient::dialects::{self, Op, Val, sentient, symbol, uniform};
+use crate::islands::sentient::dialects::{
+    self, Op, UniformRegions, Val, sentient, symbol, uniform,
+};
 
 /// `-dcc-address-register-precision-assignment-const-commoning`, `cl::init(false)`.
 ///
@@ -135,6 +137,33 @@ pub enum PrecisionAssigned {
     },
 }
 
+/// ONE `signalPassFailure()` THE UPWARD WALK PASSED OVER — `assignPrecisionHelper`'s two `emitError`
+/// arms (`:154-157`, `:170-172`) signal the failure and RETURN, so the walk carries on and the pass's
+/// verdict is the accumulated list.
+///
+/// ⭐ DATA, BECAUSE THE REFERENCE'S OWN CONTROL FLOW MAKES IT DATA — unlike
+/// [`AddressWalk::NotALoopArgument`], which stops the drain loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrecisionFailure {
+    /// The operand the assignment was asked for.
+    pub val: Val,
+    /// Which of the two `emitError`s it was.
+    pub outcome: PrecisionAssigned,
+}
+
+/// WHAT `processAddressSSAValue` ANSWERED — its `LogicalResult` (`:221`).
+///
+/// ⛔ ITS FAILURE STOPS THE PASS, unlike a [`PrecisionFailure`]: `if (failed(..)) { signalPassFailure();
+/// break; }` (`:527-530`) abandons the rest of the worklist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressWalk {
+    /// `LogicalResult::success()` — `val` was walked, to whatever effect its defining op has.
+    Walked,
+    /// `LogicalResult::failure()` (`:437`) — `val` is a region argument of something that is not a
+    /// `sentient.for`, which is the only way the reference's `else` is reached.
+    NotALoopArgument,
+}
+
 /// THE PASS'S TWO MAPS — `assignments_` and `cached_copies_`.
 ///
 /// ⛔⛔ THE KEY IS A POSITION, WHICH IS NOT WHAT `Operation *` IS. [`OpId`] is this crate's stand-in
@@ -150,6 +179,8 @@ pub struct PrecisionAssignments {
     /// element_size"* (`AddressRegisterPrecisionAssignment.cpp:65-66`), keyed by the ORIGINAL copy's
     /// result.
     cached_copies: BTreeMap<Val, BTreeMap<Bits, Val>>,
+    /// Every `signalPassFailure()` the upward walk passed over — see [`PrecisionFailure`].
+    failures: Vec<PrecisionFailure>,
 }
 
 impl PrecisionAssignments {
@@ -309,6 +340,12 @@ impl PrecisionAssignments {
     #[must_use]
     pub fn slots(&self, at: &OpId) -> Option<&[Option<Bits>]> {
         self.assignments.get(at).map(Vec::as_slice)
+    }
+
+    /// The `signalPassFailure()`s so far — see [`PrecisionFailure`].
+    #[must_use]
+    pub fn failures(&self) -> &[PrecisionFailure] {
+        &self.failures
     }
 
     /// Replaces: e283_assignPrecision
@@ -498,10 +535,593 @@ fn insert_at(block: &mut Vec<Op>, path: &[u32], op: Op) -> Option<Op> {
     Some(op)
 }
 
-// crustify:todo: e494_processAddressSSAValue
-//   authority : dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:221  (223 body lines, level 3)
-//   original  : LogicalResult AddressRegisterPrecisionAssignmentPass::processAddressSSAValue( Value val)
-//   calls     : e428_addToWorkListAndAssignPrecision
+/// WHICH OPERANDS ONE ADDRESS PROPAGATES INTO — the reference's eleven `dyn_cast` arms (`:225-411`)
+/// as the shape each writes, so that the op can be read once and then mutated.
+enum Propagation {
+    /// The address operands of a transfer, or the inputs of an `add`/`sub`/`copy` in an addressing
+    /// register, in the reference's own order and all at `assignments_[op].front()`.
+    Operands(Vec<Val>),
+    /// `if_op` — operand `i` of the then-region terminator, and of the else region when it has one.
+    IfYields(usize),
+    /// `for_op`'s result `i` — its yield operand, its iter operand and its region iter arg.
+    ForResult(usize),
+    /// `for_op`'s region iter arg `i` — its iter operand, its yield operand and its result.
+    ForIterArg(usize),
+    /// `uniformize_regions` result `i` — operand `i` of EVERY region's terminator.
+    UniformYields(usize),
+    /// Nothing to propagate: a non-addressing `add`/`sub`/`copy`, or the induction variable, which
+    /// `getRegionIterArgs()` excludes so the reference's loop matches it nowhere.
+    Nothing,
+}
+
+impl PrecisionAssignments {
+    /// Replaces: e494_processAddressSSAValue
+    ///
+    /// Propagates `val`'s element size into the operands its defining op reaches it from: a
+    /// transfer's addresses, an addressing `add`/`sub`/`copy`'s inputs, or the terminator, iter
+    /// operand and iter arg of an `if`/`for`/`uniformize_regions` (`:221-443`).
+    ///
+    /// TRAP: A LOOP'S YIELD OPERAND TAKES THE **YIELD** AS ITS USER (`:377`), so a clone lands INSIDE
+    /// the body and every path into it is re-derived from the loop's CURRENT one.
+    /// TRAP: `assignments_[op].front()` IS SLOT 0 whichever result reached the worklist (`:228`).
+    pub fn process_address_ssa_value(
+        &mut self,
+        body: &mut Vec<Op>,
+        values: &mut Values,
+        worklist: &mut AddressWorklist,
+        val: Val,
+    ) -> AddressWalk {
+        // `isa<BlockArgument>(val)` and `val.getDefiningOp()` as ONE search — and its `None` is the
+        // reference's `else { return failure(); }` (`:436-437`): the only values this body binds
+        // nowhere are region arguments of a program unit or a `uniform` region.
+        let Some((at, slot)) = bound_slot(val, body, &[], 0) else {
+            return AddressWalk::NotALoopArgument;
+        };
+        // `auto element_sizes = assignments_[op];` — a COPY, taken before anything is inserted.
+        let Some(element_sizes) = self.slots(&at).map(<[Option<Bits>]>::to_vec) else {
+            todo!(
+                "processAddressSSAValue: `assignments_[op]` on an op initializePrecision never saw \
+                 ({at:?}) (AddressRegisterPrecisionAssignment.cpp:226)"
+            )
+        };
+        let Some(op) = op_at(&at, body) else {
+            todo!(
+                "processAddressSSAValue: {val:?} is bound at {at:?}, a position only a region this \
+                 rung's `op_at` does not descend can hold \
+                 (AddressRegisterPrecisionAssignment.cpp:224)"
+            )
+        };
+        let plan = match op {
+            Op::Sentient(
+                sentient::Op::LoadAndSend {
+                    mutable_addr,
+                    immutable_addr,
+                    increment,
+                    ..
+                }
+                | sentient::Op::ReceiveAndStore {
+                    mutable_addr,
+                    immutable_addr,
+                    increment,
+                    ..
+                }
+                | sentient::Op::LoadAndExtractScalar {
+                    mutable_addr,
+                    immutable_addr,
+                    increment,
+                    ..
+                }
+                | sentient::Op::LoadComputeAndSend {
+                    mutable_addr,
+                    immutable_addr,
+                    increment,
+                    ..
+                },
+            ) => Propagation::Operands(vec![*mutable_addr, *immutable_addr, *increment]),
+            Op::Sentient(sentient::Op::LoadAndStore {
+                src_mutable_addr,
+                src_immutable_addr,
+                src_inc,
+                dst_mutable_addr,
+                dst_immutable_addr,
+                dst_inc,
+                ..
+            }) => Propagation::Operands(vec![
+                *src_mutable_addr,
+                *src_immutable_addr,
+                *src_inc,
+                *dst_mutable_addr,
+                *dst_immutable_addr,
+                *dst_inc,
+            ]),
+            Op::Sentient(
+                sentient::Op::ScalarAdd { lhs, rhs, reg, .. }
+                | sentient::Op::ScalarSub { lhs, rhs, reg, .. },
+            ) if addresses_a_register(*reg, false) => Propagation::Operands(vec![*lhs, *rhs]),
+            Op::Sentient(sentient::Op::ScalarCopy { input, reg, .. })
+                if addresses_a_register(Some(*reg), true) =>
+            {
+                Propagation::Operands(vec![*input])
+            }
+            // The three arms above with a locale the reference's `is_any_of` refuses (`:311`, `:327`,
+            // `:339`): the whole body is inside that `if`, so the op is left alone.
+            Op::Sentient(
+                sentient::Op::ScalarAdd { .. }
+                | sentient::Op::ScalarSub { .. }
+                | sentient::Op::ScalarCopy { .. },
+            ) => Propagation::Nothing,
+            // `if_op->getResults()[i] == val` — the slot IS that `i`, since an `if` binds no block
+            // argument and [`initialize_precision`](PrecisionAssignments::initialize_precision)
+            // gives it one slot per result.
+            Op::Sentient(sentient::Op::If { .. }) => Propagation::IfYields(slot),
+            Op::Sentient(sentient::Op::For { carried, .. }) => {
+                // `int offset = 1 + for_op.getNumRegionIterArgs();`
+                let offset = 1 + carried.len();
+                if slot >= offset {
+                    Propagation::ForResult(slot - offset)
+                } else if slot >= 1 {
+                    Propagation::ForIterArg(slot - 1)
+                } else {
+                    Propagation::Nothing
+                }
+            }
+            Op::UniformRegions(UniformRegions::UniformizeRegions { .. }) => {
+                Propagation::UniformYields(slot)
+            }
+            other => panic!(
+                "llvm_unreachable(\"unsupported op\") \
+                 (`AddressRegisterPrecisionAssignment.cpp:410-411`): {other:?}"
+            ),
+        };
+
+        let mut user = at.clone();
+        match plan {
+            Propagation::Nothing => {}
+            Propagation::Operands(operands) => {
+                let element_size = size_at(&element_sizes, 0, &at);
+                for (which, operand) in operands.into_iter().enumerate() {
+                    self.propagate(
+                        body,
+                        values,
+                        worklist,
+                        operand,
+                        element_size,
+                        &mut user,
+                        move |op, copy_val| set_address_operand(op, which, copy_val),
+                    );
+                }
+            }
+            Propagation::IfYields(i) => {
+                let element_size = size_at(&element_sizes, slot, &at);
+                // The then region, then the else region — `!getElseRegion().empty()` (`:358`) is the
+                // emptiness [`region_body`] already answers.
+                for region in [0, 1] {
+                    self.propagate_region_yield(
+                        body,
+                        values,
+                        worklist,
+                        &mut user,
+                        region,
+                        i,
+                        element_size,
+                    );
+                }
+            }
+            Propagation::ForResult(i) => {
+                let element_size = size_at(&element_sizes, slot, &at);
+                self.propagate_for_yield(body, values, worklist, &user, i, element_size);
+                self.propagate_for_carried(
+                    body,
+                    values,
+                    worklist,
+                    &mut user,
+                    i,
+                    element_size,
+                    Carry::Init,
+                );
+                // "Adding region operand (No need for setting operand here)." (`:387-389`).
+                self.propagate_for_carried(
+                    body,
+                    values,
+                    worklist,
+                    &mut user,
+                    i,
+                    element_size,
+                    Carry::Arg,
+                );
+            }
+            Propagation::ForIterArg(i) => {
+                let element_size = size_at(&element_sizes, slot, &at);
+                self.propagate_for_carried(
+                    body,
+                    values,
+                    worklist,
+                    &mut user,
+                    i,
+                    element_size,
+                    Carry::Init,
+                );
+                self.propagate_for_yield(body, values, worklist, &user, i, element_size);
+                // "Adding result operand (No need for copy)" (`:431-433`).
+                self.propagate_for_carried(
+                    body,
+                    values,
+                    worklist,
+                    &mut user,
+                    i,
+                    element_size,
+                    Carry::Result,
+                );
+            }
+            Propagation::UniformYields(i) => {
+                let element_size = size_at(&element_sizes, slot, &at);
+                let regions = op_at(&user, body).map_or(0, region_count);
+                for region in 0..regions {
+                    self.propagate_region_yield(
+                        body,
+                        values,
+                        worklist,
+                        &mut user,
+                        region,
+                        i,
+                        element_size,
+                    );
+                }
+            }
+        }
+        AddressWalk::Walked
+    }
+
+    /// `if (auto copy_val = addToWorkListAndAssignPrecision(operand, element_size, user)) <write>` —
+    /// one operand, with the reference's own two-line shape.
+    ///
+    /// ⛔ THE CLONE TAKES THE USER'S OWN SLOT (`:117`), so `user` moves down one before `write` can
+    /// find it again; the two `emitError` arms are recorded rather than returned, because the
+    /// reference's walk does not stop at one.
+    fn propagate(
+        &mut self,
+        body: &mut Vec<Op>,
+        values: &mut Values,
+        worklist: &mut AddressWorklist,
+        operand: Val,
+        element_size: Bits,
+        user: &mut OpId,
+        write: impl FnOnce(&mut Op, Val),
+    ) {
+        let outcome = self.add_to_worklist_and_assign_precision(
+            body,
+            values,
+            worklist,
+            operand,
+            element_size,
+            user,
+        );
+        match outcome {
+            PrecisionAssigned::Substituted(copy_val) => {
+                *user = shifted(user);
+                if let Some(op) = op_at_mut(user, body) {
+                    write(op, copy_val);
+                }
+            }
+            PrecisionAssigned::UnknownParentOp | PrecisionAssigned::DifferentPrecisions { .. } => {
+                self.failures.push(PrecisionFailure {
+                    val: operand,
+                    outcome,
+                })
+            }
+            PrecisionAssigned::Assigned | PrecisionAssigned::Unchanged => {}
+        }
+    }
+
+    /// One `getTerminator()->getOperand(i)` of a region of the op at `user` (`:352-365`, `:399-406`).
+    fn propagate_region_yield(
+        &mut self,
+        body: &mut Vec<Op>,
+        values: &mut Values,
+        worklist: &mut AddressWorklist,
+        user: &mut OpId,
+        region: usize,
+        i: usize,
+        element_size: Bits,
+    ) {
+        let Some(operand) = op_at(user, body)
+            .and_then(|op| region_body(op, region))
+            .and_then(|region_body| region_body.last().and_then(|last| yield_operand(last, i)))
+        else {
+            return;
+        };
+        self.propagate(
+            body,
+            values,
+            worklist,
+            operand,
+            element_size,
+            user,
+            move |op, copy_val| set_region_yield_operand(op, region, i, copy_val),
+        );
+    }
+
+    /// `yield_op->getOperand(i)` with the YIELD as the user (`:375-379`, `:425-429`).
+    ///
+    /// ⛔ THE YIELD'S PATH IS RE-DERIVED FROM THE LOOP'S CURRENT ONE, never remembered: an earlier
+    /// operand of this same walk may have put a clone in front of the loop.
+    fn propagate_for_yield(
+        &mut self,
+        body: &mut Vec<Op>,
+        values: &mut Values,
+        worklist: &mut AddressWorklist,
+        for_op: &OpId,
+        i: usize,
+        element_size: Bits,
+    ) {
+        let Some(terminator) = op_at(for_op, body)
+            .and_then(for_terminator_path)
+            .map(|last| {
+                let mut path = for_op.path().to_vec();
+                path.push(last);
+                OpId::at(&path)
+            })
+        else {
+            return;
+        };
+        let mut user = terminator;
+        let Some(operand) = op_at(&user, body).and_then(|op| yield_operand(op, i)) else {
+            return;
+        };
+        self.propagate(
+            body,
+            values,
+            worklist,
+            operand,
+            element_size,
+            &mut user,
+            move |op, copy_val| set_yield_operand(op, i, copy_val),
+        );
+    }
+
+    /// `for_op.getIterOperands()[i]` / `getRegionIterArgs()[i]` / `getResult(i)` (`:381-390`,
+    /// `:420-434`), with the loop as the user.
+    fn propagate_for_carried(
+        &mut self,
+        body: &mut Vec<Op>,
+        values: &mut Values,
+        worklist: &mut AddressWorklist,
+        user: &mut OpId,
+        i: usize,
+        element_size: Bits,
+        which: Carry,
+    ) {
+        let Some(operand) = op_at(user, body).and_then(|op| carried_of(op, i, which)) else {
+            return;
+        };
+        self.propagate(
+            body,
+            values,
+            worklist,
+            operand,
+            element_size,
+            user,
+            move |op, copy_val| {
+                // `setIterOperand(i, copy_val)` — the OTHER two are read-only (`:387`, `:431`).
+                if which == Carry::Init
+                    && let Op::Sentient(sentient::Op::For { carried, .. }) = op
+                    && let Some(entry) = carried.get_mut(i)
+                {
+                    entry.init = copy_val;
+                }
+            },
+        );
+    }
+}
+
+/// WHICH OF A CARRIED ENTRY'S THREE VALUES — `getIterOperands()`, `getRegionIterArgs()` and
+/// `getResults()` are one record at this rung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carry {
+    /// `getIterOperands()[i]` — the only one the pass ever assigns over.
+    Init,
+    /// `getRegionIterArgs()[i]`.
+    Arg,
+    /// `for_op.getResult(i)`.
+    Result,
+}
+
+/// `is_any_of(getRegLocale(), lar, lbr, ear, ebr, lrf, jcr)` (`:311-314`), and `mvr` as well for a
+/// `scalar_copy` (`:339-342`).
+///
+/// ⭐ AN UNSAID REGISTER IS NONE OF THEM, which is `RegType::Unknown` read through the [`Option`].
+fn addresses_a_register(reg: Option<sentient::Reg>, copy: bool) -> bool {
+    reg.is_some_and(|reg| {
+        matches!(
+            reg.locale,
+            sentient::RegType::Lar
+                | sentient::RegType::Lbr
+                | sentient::RegType::Ear
+                | sentient::RegType::Ebr
+                | sentient::RegType::Lrf
+                | sentient::RegType::Jcr
+        ) || (copy && reg.locale == sentient::RegType::Mvr)
+    })
+}
+
+/// `element_sizes[k]`, whose `-1` the seeding walk (`:466-497`) makes unreachable: it assigns every
+/// transfer's results before any value of one can reach the worklist.
+fn size_at(element_sizes: &[Option<Bits>], k: usize, at: &OpId) -> Bits {
+    match element_sizes.get(k) {
+        Some(Some(size)) => *size,
+        _ => todo!(
+            "processAddressSSAValue: slot {k} of the {} that {at:?} holds is still -1, which the \
+             seeding walk (AddressRegisterPrecisionAssignment.cpp:466-497) assigns first",
+            element_sizes.len()
+        ),
+    }
+}
+
+/// `get<X>Mutable().assign(copy_val)` — the `which`th of the operands the arm listed, written back on
+/// the op that listed them.
+fn set_address_operand(op: &mut Op, which: usize, val: Val) {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                ..
+            }
+            | sentient::Op::ReceiveAndStore {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                ..
+            }
+            | sentient::Op::LoadAndExtractScalar {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                ..
+            }
+            | sentient::Op::LoadComputeAndSend {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                ..
+            },
+        ) => match which {
+            0 => *mutable_addr = val,
+            1 => *immutable_addr = val,
+            _ => *increment = val,
+        },
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src_mutable_addr,
+            src_immutable_addr,
+            src_inc,
+            dst_mutable_addr,
+            dst_immutable_addr,
+            dst_inc,
+            ..
+        }) => match which {
+            0 => *src_mutable_addr = val,
+            1 => *src_immutable_addr = val,
+            2 => *src_inc = val,
+            3 => *dst_mutable_addr = val,
+            4 => *dst_immutable_addr = val,
+            _ => *dst_inc = val,
+        },
+        Op::Sentient(
+            sentient::Op::ScalarAdd { lhs, rhs, .. } | sentient::Op::ScalarSub { lhs, rhs, .. },
+        ) => match which {
+            0 => *lhs = val,
+            _ => *rhs = val,
+        },
+        Op::Sentient(sentient::Op::ScalarCopy { input, .. }) => *input = val,
+        _ => {}
+    }
+}
+
+/// `if_op.getThenRegion()`/`getElseRegion()` (`:352`, `:358`) and `unif_region.getRegion(j)`
+/// (`:399`) as a body — `None` where the reference asks `empty()`, which is the very distinction
+/// [`dialects::regions_ref`] keeps for an `if` without an else.
+fn region_body(op: &Op, region: usize) -> Option<Vec<Op>> {
+    let body = *dialects::regions_ref(op).get(region)?;
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_vec())
+    }
+}
+
+/// `getTerminator()->setOperand(i, copy_val)` on region `region` of `op`.
+fn set_region_yield_operand(op: &mut Op, region: usize, i: usize, val: Val) {
+    if let Some(body) = dialects::regions_mut(op).get_mut(region)
+        && let Some(terminator) = body.last_mut()
+    {
+        set_yield_operand(terminator, i, val);
+    }
+}
+
+/// `unif_region.getNumRegions()` (`:398`).
+fn region_count(op: &Op) -> usize {
+    dialects::regions_ref(op).len()
+}
+
+/// `yield_op->getOperand(i)` — either dialect's terminator.
+fn yield_operand(op: &Op, i: usize) -> Option<Val> {
+    match op {
+        Op::Sentient(sentient::Op::Yield { results }) => results.get(i).copied(),
+        Op::Uniform(uniform::Op::Yield { operands }) => operands.get(i).copied(),
+        _ => None,
+    }
+}
+
+/// [`yield_operand`] FOR THE ASSIGNMENT.
+fn set_yield_operand(op: &mut Op, i: usize, val: Val) {
+    match op {
+        Op::Sentient(sentient::Op::Yield { results }) => {
+            if let Some(slot) = results.get_mut(i) {
+                *slot = val;
+            }
+        }
+        Op::Uniform(uniform::Op::Yield { operands }) => {
+            if let Some(slot) = operands.get_mut(i) {
+                *slot = val;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Where `for_op.getLoopBody().front().getTerminator()` sits WITHIN the loop — its last position.
+fn for_terminator_path(op: &Op) -> Option<u32> {
+    let Op::Sentient(sentient::Op::For { body, .. }) = op else {
+        return None;
+    };
+    u32::try_from(body.len().checked_sub(1)?).ok()
+}
+
+/// One of a loop's carried values — see [`Carry`].
+fn carried_of(op: &Op, i: usize, which: Carry) -> Option<Val> {
+    let Op::Sentient(sentient::Op::For { carried, .. }) = op else {
+        return None;
+    };
+    let entry = carried.get(i)?;
+    Some(match which {
+        Carry::Init => entry.init,
+        Carry::Arg => entry.arg,
+        Carry::Result => entry.result,
+    })
+}
+
+/// THE USER, ONE SLOT FURTHER DOWN ITS BLOCK — `OpBuilder builder(user)` inserted the clone AT the
+/// user's own position (`:117`), which is [`PrecisionAssigned::Substituted`]'s note made concrete.
+fn shifted(user: &OpId) -> OpId {
+    let mut path = user.path().to_vec();
+    if let Some(last) = path.last_mut() {
+        *last += 1;
+    }
+    OpId::at(&path)
+}
+
+/// [`op_at`]'s twin FOR THE ASSIGNMENT — what the reference gets for free from an `Operation *`.
+fn op_at_mut<'a>(id: &OpId, scope: &'a mut [Op]) -> Option<&'a mut Op> {
+    let (&ordinal, rest) = id.path().split_first()?;
+    let op = scope.get_mut(ordinal as usize)?;
+    let Some(&next) = rest.first() else {
+        return Some(op);
+    };
+    let Op::Sentient(inner) = op else {
+        return None;
+    };
+    let mut base = 0usize;
+    for region in sentient::regions_mut(inner) {
+        if (next as usize) < base + region.len() {
+            let mut sub: Vec<u32> = rest.to_vec();
+            sub[0] = (next as usize - base) as u32;
+            return op_at_mut(&OpId::at(&sub), region);
+        }
+        base += region.len();
+    }
+    None
+}
 
 // crustify:todo: e554_runOnOperation
 //   authority : dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:449  (100 body lines, level 4)
@@ -716,5 +1336,86 @@ mod unit_tests {
             PrecisionAssigned::Unchanged
         );
         assert_eq!(worklist, AddressWorklist::default());
+    }
+
+    /// 494/656 — a loop RESULT propagates its size to the yield operand (with the YIELD as the user),
+    /// to the iter operand and to the region iter arg, all off the ONE slot the result owns; a value
+    /// no op of this body binds is the walk's own failure.
+    #[test]
+    fn e494_walks_a_loop_result_up_to_its_yield_its_init_and_its_iter_arg() {
+        let add = Op::Sentient(sentient::Op::ScalarAdd {
+            lhs: Val(4),
+            rhs: Val(1),
+            result: Val(6),
+            reg: Some(Reg {
+                locale: RegType::Lar,
+                index: None,
+            }),
+            ty: ScalarTy::Index,
+            element_size: None,
+        });
+        let mut body = vec![
+            constant(0, Val(1)),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(3),
+                bound: Val(2),
+                bound_reg: None,
+                carried: vec![Carried {
+                    init: Val(1),
+                    arg: Val(4),
+                    result: Val(5),
+                    reg: Reg {
+                        locale: RegType::Lar,
+                        index: None,
+                    },
+                    program_header: false,
+                    element_size: None,
+                }],
+                dbg_name: None,
+                body: vec![
+                    add.clone(),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![Val(6)],
+                    }),
+                ],
+            }),
+        ];
+        let mut values = Values::default();
+        let mut worklist = AddressWorklist::default();
+
+        let mut assignments = PrecisionAssignments::default();
+        assignments.initialize_precision(OpId::at(&[0]), &body[0]);
+        assignments.initialize_precision(OpId::at(&[1]), &body[1]);
+        assignments.initialize_precision(OpId::at(&[1, 0]), &add);
+        // The seeding walk assigns the loop's result before its value can reach the worklist.
+        assert_eq!(
+            assignments.assign_precision(&mut body, &mut values, Val(5), Bits(32), &OpId::at(&[1])),
+            PrecisionAssigned::Assigned
+        );
+
+        assert_eq!(
+            assignments.process_address_ssa_value(&mut body, &mut values, &mut worklist, Val(5)),
+            AddressWalk::Walked
+        );
+
+        // The yield's operand first, then the iter arg — the constant init is on the skip list.
+        assert_eq!(worklist.pop(), Some(Val(6)));
+        assert_eq!(worklist.pop(), Some(Val(4)));
+        assert_eq!(worklist.pop(), None);
+        assert_eq!(
+            assignments.slots(&OpId::at(&[1, 0])),
+            Some(&[Some(Bits(32))][..])
+        );
+        // `[iv, arg, result]`, the iv's slot still untouched.
+        assert_eq!(
+            assignments.slots(&OpId::at(&[1])),
+            Some(&[None, Some(Bits(32)), Some(Bits(32))][..])
+        );
+        assert!(assignments.failures().is_empty());
+
+        assert_eq!(
+            assignments.process_address_ssa_value(&mut body, &mut values, &mut worklist, Val(99)),
+            AddressWalk::NotALoopArgument
+        );
     }
 }

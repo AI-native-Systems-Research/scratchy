@@ -176,11 +176,12 @@ use crate::islands::sentient::dialects::{
     self, Definitions, Op, UniformRegions, Val, dataflow, sentient, uniform,
 };
 use crate::transform::sentient::analyses::{
-    EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites,
+    EvAddressInfo, EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites,
 };
 use crate::transform::sentient::{ForRef, IterArgIndex};
 use crate::units::DfirUnit;
 use looping_chain_mutable_addr_descriptor::TransferEnd;
+use std::collections::BTreeSet;
 
 pub use conditional_constant_descriptor::ConditionalConstantDescriptor;
 pub use data_transfer_descriptor::{DataTransferDescriptor, DescriptorMemoryUnit};
@@ -1315,6 +1316,32 @@ impl DataTransferDescriptor {
             ),
         }
     }
+
+    /// Replaces: e486_getSimpleConstantDescriptor
+    ///
+    /// The pattern as a mutable [`SimpleConstantDescriptor`] (`:698-701`).
+    #[must_use]
+    pub fn simple_constant_descriptor_mut(&mut self) -> &mut SimpleConstantDescriptor {
+        match &mut self.pattern_desc {
+            Some(PatternDescriptor::SimpleConstant(sc)) => sc,
+            other => {
+                panic!("DT_CHECK(isSimpleConstant()) (`AddressPinningAndToggle.cpp:699`): {other:?}")
+            }
+        }
+    }
+
+    /// Replaces: e487_getSimpleConstantDescriptor
+    ///
+    /// The pattern as a shared [`SimpleConstantDescriptor`] (`:702-705`).
+    #[must_use]
+    pub fn simple_constant_descriptor(&self) -> &SimpleConstantDescriptor {
+        match &self.pattern_desc {
+            Some(PatternDescriptor::SimpleConstant(sc)) => sc,
+            other => {
+                panic!("DT_CHECK(isSimpleConstant()) (`AddressPinningAndToggle.cpp:703`): {other:?}")
+            }
+        }
+    }
 }
 
 impl SimpleConstantDescriptor {
@@ -1370,6 +1397,27 @@ impl ToggleDescriptor {
         } else {
             None
         }
+    }
+
+    /// Replaces: e485_getX
+    ///
+    /// The toggle's OTHER constant — `evaluateSub(*c1_, getInit())`, the `X` of `X = c1 - Y`
+    /// (`:227-231`), `Y` being [`Self::init`].
+    ///
+    /// ⛔ `None` IS `DT_CHECK(isValid())` (`:228`), exactly as in [`Self::c1`]; the `?` on `c1` after
+    /// it is unreachable and is there only because the field is an [`Option`].
+    #[must_use]
+    pub fn x(
+        &self,
+        evaluator: &mut impl ExpressionEvaluator,
+        body: &[Op],
+        defs: Definitions<'_>,
+    ) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let c1 = self.c1?;
+        Some(evaluator.evaluate_sub_handle(c1, self.init(body, defs)))
     }
 }
 
@@ -1588,30 +1636,68 @@ impl LoopingChainMutableAddrDescriptor {
     }
 }
 
-// crustify:todo: e485_getX
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:227  (5 body lines, level 3)
-//   original  : const EvaluatedValue &getX() const
-//   calls     : e015_getInit, e278_isValid, e407_getInit, e411_getInit, e414_getInit
+/// HOW MANY DISTINCT BASE ADDRESSES A UNIT'S IMMUTABLE TRANSFERS STREAM FROM — the reference's
+/// `int num_streams_` (`AddressPinningAndToggle.cpp:1268`), a COUNT and never an index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StreamCount(pub usize);
 
-// crustify:todo: e486_getSimpleConstantDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:698  (4 body lines, level 3)
-//   original  : SimpleConstantDescriptor &getSimpleConstantDescriptor()
-//   calls     : e415_isSimpleConstant
+/// THE PASS'S PER-UNIT STATE — the four fields of `class AddressPinningAndTogglePass`
+/// (`AddressPinningAndToggle.cpp:1266-1287`) that [`AddressPinningAndTogglePass::cleanup`] resets.
+///
+/// ⛔ THE REFERENCE'S OTHER FOUR FIELDS ARE AMBIENT SERVICES, NOT STATE: `dcc_ext_ctx_`, `opts_`,
+/// `dom_info_` and `evaluator_` (`:1288-1291`) — and this crate hands the evaluator in as
+/// `&mut impl ExpressionEvaluator` at each seam that needs one rather than storing it.
+#[derive(Debug, Default)]
+pub struct AddressPinningAndTogglePass {
+    /// `num_streams_` — the memoised stream count; the reference's `-1` "not computed" is `None`.
+    pub num_streams: Option<StreamCount>,
+    /// `immut_data_transfer_descriptors_` — the descriptors that DO update the IR.
+    pub immut_data_transfer_descriptors: DataTransferDescriptorContainer,
+    /// `mut_data_transfer_descriptors_` — collected for analysis only, never written back
+    /// (`:1274-1277`).
+    pub mut_data_transfer_descriptors: DataTransferDescriptorContainer,
+    /// `ev_addr_info_list_` — one entry per base address of each sorted transfer pair.
+    pub ev_addr_info_list: Vec<EvAddressInfo>,
+}
 
-// crustify:todo: e487_getSimpleConstantDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:702  (4 body lines, level 3)
-//   original  : const SimpleConstantDescriptor &getSimpleConstantDescriptor() const
-//   calls     : e415_isSimpleConstant
+impl AddressPinningAndTogglePass {
+    /// Replaces: e488_computeOrGetNumberOfStreams
+    ///
+    /// How many DISTINCT evaluated base addresses the immutable descriptors name, memoised on first
+    /// ask (`:1439-1448`).
+    ///
+    /// ⛔ THE SET KEYS ON THE HANDLE, NOT THE VALUE: `SmallSet<const EvaluatedValue *, 4>` (`:1442`)
+    /// dedups ARENA POINTERS, so two separately evaluated but equal addresses count twice — this is
+    /// [`EvaluatedValue`] identity and never [`ExpressionEvaluator::values_equal`].
+    pub fn compute_or_get_number_of_streams(&mut self) -> StreamCount {
+        if let Some(computed) = self.num_streams {
+            return computed;
+        }
+        let set_of_streams: BTreeSet<EvaluatedValue> = self
+            .immut_data_transfer_descriptors
+            .descriptors
+            .iter()
+            .flat_map(|dtd| dtd.base_addrs.iter().copied())
+            .collect();
+        let num_streams = StreamCount(set_of_streams.len());
+        self.num_streams = Some(num_streams);
+        num_streams
+    }
 
-// crustify:todo: e488_computeOrGetNumberOfStreams
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1439  (10 body lines, level 3)
-//   original  : int AddressPinningAndTogglePass::computeOrGetNumberOfStreams()
-//   calls     : e252_size, e422_insert
-
-// crustify:todo: e489_cleanup
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1656  (9 body lines, level 3)
-//   original  : void AddressPinningAndTogglePass::cleanup()
-//   calls     : e416_clear_all
+    /// Replaces: e489_cleanup
+    ///
+    /// Drops everything the pass accumulated over one program unit (`:1656-1664`), so the next unit
+    /// recomputes its stream count instead of reading this one's.
+    ///
+    /// ⭐ THE TWO `delete dtd` LOOPS (`:1658`, `:1661`) ARE THE OWNING [`Vec`]'S CLEAR, for the reason
+    /// already argued at [`DataTransferDescriptorContainer::clear_all`].
+    pub fn cleanup(&mut self) {
+        self.num_streams = None;
+        self.immut_data_transfer_descriptors.clear_all();
+        self.mut_data_transfer_descriptors.clear_all();
+        self.ev_addr_info_list.clear();
+    }
+}
 
 // crustify:todo: e547_getMin
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:235  (4 body lines, level 4)
@@ -1716,7 +1802,9 @@ mod unit_tests {
     use crate::formats::Bits;
     use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{LocalRegion, Val, sentient};
-    use crate::transform::sentient::analyses::{Evaluation, OffsetSites, RegionSite};
+    use crate::transform::sentient::analyses::{
+        Evaluation, OffsetSites, OutOfScopeEvaluator, RegionSite,
+    };
     use crate::transform::sentient::{ForRef, IterArgIndex};
     use crate::units::Residency;
 
@@ -2874,5 +2962,117 @@ mod unit_tests {
         };
         // The mapping, its query and the transfer now reading the queried address.
         assert_eq!(region_op.regions()[0].body[2], load_and_store(1, 3, 16, 6));
+    }
+
+    /// 485/656 — an invalid toggle answers nothing and never reaches the evaluator, which
+    /// [`OutOfScopeEvaluator`] proves by panicking if it is asked.
+    #[test]
+    fn e485_an_invalid_toggle_has_no_x() {
+        let empty: [&[Op]; 1] = [&[]];
+        assert_eq!(
+            ToggleDescriptor::default().x(
+                &mut OutOfScopeEvaluator,
+                &[],
+                Definitions::from_innermost(&empty)
+            ),
+            None
+        );
+    }
+
+    /// 485/656 — a valid toggle subtracts its `init` from `c1`, so the seam it stops at is the
+    /// evaluation of the iter arg's constant init.
+    #[test]
+    #[should_panic(expected = "evaluateValue")]
+    fn e485_a_valid_toggle_reaches_the_evaluation_of_its_init() {
+        let body = vec![
+            scalar_const(1, 4096),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(2),
+                bound: Val(0),
+                bound_reg: None,
+                carried: vec![sentient::Carried {
+                    init: Val(1),
+                    arg: Val(3),
+                    result: Val(4),
+                    reg: Reg {
+                        locale: RegType::Lbr,
+                        index: None,
+                    },
+                    program_header: false,
+                    element_size: None,
+                }],
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+        ];
+        let toggle = ToggleDescriptor {
+            outer_loop: Some(ForRef(Val(2))),
+            iter_arg_index: Some(IterArgIndex(0)),
+            c1: Some(EvaluatedValue(5)),
+            can_be_simplified: false,
+        };
+        let regions: [&[Op]; 1] = [&body];
+        let _x = toggle.x(
+            &mut OutOfScopeEvaluator,
+            &body,
+            Definitions::from_innermost(&regions),
+        );
+    }
+
+    /// 486+487/656 — both getters answer the pattern a simple-constant transfer holds, and neither
+    /// tolerates another pattern.
+    #[test]
+    fn e486_e487_the_simple_constant_getters_answer_the_pattern_and_refuse_any_other() {
+        let mut desc = transfer(
+            Some(PatternDescriptor::SimpleConstant(SimpleConstantDescriptor {
+                ev: EvaluatedValue(9),
+            })),
+            1,
+        );
+        assert_eq!(desc.simple_constant_descriptor().ev, EvaluatedValue(9));
+        desc.simple_constant_descriptor_mut().ev = EvaluatedValue(10);
+        assert_eq!(desc.simple_constant_descriptor().ev, EvaluatedValue(10));
+
+        let toggled = transfer(Some(PatternDescriptor::Toggle(matched_toggle())), 1);
+        let refused = std::panic::catch_unwind(move || toggled.simple_constant_descriptor().ev);
+        assert!(refused.is_err());
+    }
+
+    /// 488/656 — the count is the number of DISTINCT base-address handles the immutable descriptors
+    /// name, and it is memoised: a descriptor added afterwards does not change it.
+    #[test]
+    fn e488_counts_distinct_base_addresses_once_and_remembers_the_answer() {
+        let mut pass = AddressPinningAndTogglePass::default();
+        // Two transfers whose base addresses are the SAME two handles: two streams, not four.
+        pass.immut_data_transfer_descriptors.insert(transfer(None, 2));
+        pass.immut_data_transfer_descriptors.insert(transfer(None, 2));
+        assert_eq!(pass.compute_or_get_number_of_streams(), StreamCount(2));
+
+        pass.immut_data_transfer_descriptors
+            .insert(transfer(None, 5));
+        assert_eq!(pass.compute_or_get_number_of_streams(), StreamCount(2));
+    }
+
+    /// 489/656 — every accumulated field is dropped, so the next program unit recomputes its stream
+    /// count instead of reading this one's.
+    #[test]
+    fn e489_cleanup_drops_the_count_both_containers_and_the_address_info() {
+        let mut pass = AddressPinningAndTogglePass::default();
+        pass.immut_data_transfer_descriptors.insert(transfer(None, 1));
+        pass.mut_data_transfer_descriptors.insert(transfer(None, 1));
+        pass.ev_addr_info_list.push(EvAddressInfo {
+            ba_immut_addr_ev: EvaluatedValue(1),
+            ba_max_mut_addr_ev: EvaluatedValue(2),
+            is_toggle: true,
+            region: RegionSite::default(),
+        });
+        let _ = pass.compute_or_get_number_of_streams();
+
+        pass.cleanup();
+
+        assert_eq!(pass.num_streams, None);
+        assert!(pass.immut_data_transfer_descriptors.descriptors.is_empty());
+        assert!(pass.mut_data_transfer_descriptors.descriptors.is_empty());
+        assert!(pass.ev_addr_info_list.is_empty());
     }
 }

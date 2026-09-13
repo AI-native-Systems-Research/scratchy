@@ -371,6 +371,28 @@ pub struct BodyIndex(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionNum(pub usize);
 
+/// ONE DATA TRANSFER'S BYTE-ADDRESSABLE ADDRESSES, AS THE DYNAMIC PINNING SCHEME IS HANDED THEM —
+/// `DynamicPinningSchemeManager::EVAddressInfo` (`Analyses/AddressPinningScheme.h:279-295`), built
+/// per base address by `computeAddressInfoList` (`AddressPinningAndToggle.cpp:1729-1731`).
+///
+/// ⛔ DATA, NOT AN ANALYSIS, exactly as [`CorrelatedEquivClass`] is: `Analyses/AddressPinningScheme`
+/// is out of campaign scope, so nothing here COMPUTES a scheme — this is the record a pass
+/// accumulates and [`PinningSchemeManager`] consumes.
+///
+/// ⭐ THE MINIMUM MUTABLE ADDRESS IS NOT A FIELD: `computeAddressInfoList` evaluates
+/// `ba_min_mut_addr_ev` and prints it, then passes only the immutable and MAX addresses (`:1730`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvAddressInfo {
+    /// `ba_immut_addr_ev_` — the transfer's immutable address, in bytes.
+    pub ba_immut_addr_ev: EvaluatedValue,
+    /// `ba_max_mut_addr_ev_` — the HIGHEST mutable address it reaches, in bytes.
+    pub ba_max_mut_addr_ev: EvaluatedValue,
+    /// `is_toggle_` — `immut_dtd->isToggle()`, which is what makes the pair a toggling one.
+    pub is_toggle: bool,
+    /// `region_op_` and `region_num_` together — see [`RegionSite`].
+    pub region: RegionSite,
+}
+
 /// THE `const PinningSchemeManager&` A PASS IS HANDED — a trait, for the reason
 /// [`ExpressionEvaluator`] is one: `Analyses/AddressPinningScheme.{h,cpp}` is not in this campaign and
 /// a test must still be able to state which pinned address it chose.
