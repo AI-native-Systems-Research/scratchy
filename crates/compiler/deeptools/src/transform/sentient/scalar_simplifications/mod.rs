@@ -180,16 +180,17 @@ pub fn simplify_conditionals(
         // an operand that simplification created.
         return;
     }
-    // `getFirstExprInfo()` on each side — unit index 0, because uniformization supports one DSC and so
-    // every unit's conditional is the same (`:207-209`).
+    // `getFirstExprInfo()` on each side (`:221-222`), which is the FIRST NON-NULL list entry and not
+    // unit index 0 — uniformization supports one DSC, so every unit's conditional is the same
+    // (`:207-209`).
     let (minuend, subtrahend, strict) = match predicate {
         CmpPredicate::Sge | CmpPredicate::Eq | CmpPredicate::Ne => (lhs_info, rhs_info, false),
         CmpPredicate::Sle => (rhs_info, lhs_info, false),
         CmpPredicate::Sgt => (lhs_info, rhs_info, true),
         CmpPredicate::Slt => (rhs_info, lhs_info, true),
     };
-    let mut all_args: Vec<Val> = expr_prop_analysis.propagated_args(minuend, 0);
-    all_args.extend(expr_prop_analysis.propagated_args(subtrahend, 0));
+    let mut all_args: Vec<Val> = expr_prop_analysis.first_propagated_args(minuend);
+    all_args.extend(expr_prop_analysis.first_propagated_args(subtrahend));
     let equality = matches!(predicate, CmpPredicate::Eq | CmpPredicate::Ne);
     let _ = (strict, equality, all_args, const_scope);
     todo!(
@@ -230,6 +231,17 @@ pub(super) fn query_key_and_units_from_parent_region(
     )
 }
 
+/// WHERE THE PASS'S OWN `OpBuilder&` POINTS — `OpBuilder const_builder(unit);
+/// const_builder.setInsertionPointToStart(unit.getBody(0))` (`:889-890`, `:902`; `:700` in e580), as
+/// an insertion index into the block being walked that each op created through it advances past.
+///
+/// ⛔ IT IS NOT THE SIMPLIFIED OP'S OWN POSITION: only the mapping path of
+/// [`sentient::create_new_op_or_map`] moves the builder to the op (`:801-802`) and puts it back
+/// (`:836`) — an identical case's constant lands HERE, ahead of every op the walk has still to reach,
+/// which is a longer live range and not just a different print order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConstSink(pub usize);
+
 /// Replaces: e532_simplifyBinaryOperation
 ///
 /// Rewrites one scalar add or sub whose propagated expression flattened to something simpler: a
@@ -244,7 +256,8 @@ pub(super) fn query_key_and_units_from_parent_region(
 /// ⛔ A LENGTH THAT IS NEITHER 1 NOR 3 READS `[1]`, so an empty expression is the reference's own
 /// out-of-bounds read — [`sentient::FlatExpr::first`] answers the empty slice and 0 takes the
 /// replace arm.
-/// ⭐ EVERY VALUE THIS BUILDS LANDS BEFORE THE OP, so the op's own index walks forward as they arrive.
+/// ⭐ EVERY VALUE THIS BUILDS LANDS AHEAD OF THE OP — at [`ConstSink`] or immediately before it — so
+/// the op's own index walks forward as they arrive.
 pub fn simplify_binary_operation(
     scope: &mut Vec<Op>,
     at: usize,
@@ -252,6 +265,7 @@ pub fn simplify_binary_operation(
     expr_prop_analysis: &mut impl PropagationAnalysis,
     unit_index_map: &impl UnitIndexMap,
     to_be_deleted: &mut Vec<Val>,
+    const_sink: &mut ConstSink,
     values: &mut Values,
 ) {
     let Some(result) = scope.get(at).and_then(|op| results(op).first().copied()) else {
@@ -315,6 +329,7 @@ pub fn simplify_binary_operation(
                            at: usize,
                            operand_idx: usize,
                            expr_prop_analysis: &mut _,
+                           const_sink: &mut ConstSink,
                            values: &mut Values| {
         let before = scope.len();
         let operand = sentient::create_new_op_or_map(
@@ -328,6 +343,7 @@ pub fn simplify_binary_operation(
             operand_type,
             key,
             expr_prop_analysis,
+            const_sink,
             values,
         );
         (operand, scope.len() - before)
@@ -335,7 +351,7 @@ pub fn simplify_binary_operation(
     match first_coeffs.len() {
         // A constant: the op goes.
         1 => {
-            let (operand, _) = new_operand(scope, at, 0, expr_prop_analysis, values);
+            let (operand, _) = new_operand(scope, at, 0, expr_prop_analysis, const_sink, values);
             expr_prop_analysis.set_expr_info_map_for_value(operand, expr_info_map);
             replace_all_uses_with(scope, result, operand);
             to_be_deleted.push(result);
@@ -343,8 +359,10 @@ pub fn simplify_binary_operation(
         // `1 * variable + 1 * variable + constant` — the constant has to be zero, so both operands
         // are rewritten and the add stays.
         3 => {
-            let (operand0, grew0) = new_operand(scope, at, 0, expr_prop_analysis, values);
-            let (operand1, grew1) = new_operand(scope, at + grew0, 1, expr_prop_analysis, values);
+            let (operand0, grew0) =
+                new_operand(scope, at, 0, expr_prop_analysis, const_sink, values);
+            let (operand1, grew1) =
+                new_operand(scope, at + grew0, 1, expr_prop_analysis, const_sink, values);
             let at = at + grew0 + grew1;
             if !matches!(scope.get(at), Some(Op::Sentient(ops::Op::ScalarAdd { .. }))) {
                 todo!(
@@ -359,14 +377,16 @@ pub fn simplify_binary_operation(
         // `1 * variable + constant` — the variable's coefficient has to be 1.
         _ => {
             if first_coeffs.get(1).copied().unwrap_or(0) != 0 {
-                let (operand0, grew0) = new_operand(scope, at, 0, expr_prop_analysis, values);
+                let (operand0, grew0) =
+                    new_operand(scope, at, 0, expr_prop_analysis, const_sink, values);
                 let (operand1, grew1) =
-                    new_operand(scope, at + grew0, 1, expr_prop_analysis, values);
+                    new_operand(scope, at + grew0, 1, expr_prop_analysis, const_sink, values);
                 let at = at + grew0 + grew1;
                 set_operand(&mut scope[at], 0, operand0);
                 set_operand(&mut scope[at], 1, operand1);
             } else {
-                let (operand0, _) = new_operand(scope, at, 0, expr_prop_analysis, values);
+                let (operand0, _) =
+                    new_operand(scope, at, 0, expr_prop_analysis, const_sink, values);
                 replace_all_uses_with(scope, result, operand0);
                 to_be_deleted.push(result);
             }
@@ -374,7 +394,7 @@ pub fn simplify_binary_operation(
     }
 }
 
-/// THE OPERAND SLOTS `simplifyLoadStoreOperation` REWRITES (`:469-497`) — ⭐ THE ADDRESS PAIRS AND
+/// THE OPERAND SLOTS `simplifyLoadStoreOperation` REWRITES (`:470-501`) — ⭐ THE ADDRESS PAIRS AND
 /// NOTHING ELSE: an increment, a `dst`, a multicast operand or an element index is never simplified.
 ///
 /// ⛔ `sentient.load_and_store` HAS ITS TWO PAIRS APART: `src`, `dst` and both increments sit between
@@ -397,10 +417,10 @@ fn address_slots(op: &Op) -> &'static [usize] {
 /// Replaces every address operand of one transfer with the simplest value its propagated expression
 /// allows — the variable it is written over, or a fresh constant.
 ///
-/// ⛔ A SYMBOL IS NEVER SIMPLIFIED (`:423`) and neither is an operand whose expression is stale, has
+/// ⛔ A SYMBOL IS NEVER SIMPLIFIED (`:425`) and neither is an operand whose expression is stale, has
 /// more than one propagated argument, more than one dimension, fails to flatten or needs a local
 /// variable — each of those leaves the operand exactly as it was.
-/// ⛔ ONE DIMENSION ANSWERS WITH THE PROPAGATED ARGUMENT ITSELF (`:456-458`), which is the whole point
+/// ⛔ ONE DIMENSION ANSWERS WITH THE PROPAGATED ARGUMENT ITSELF (`:456-459`), which is the whole point
 /// of the load/store flavour of e372: no op is created for it.
 /// ⛔ THE UNIT LIST AND KEY ARE READ BEFORE THE OP KIND IS (`:412-420`), so a transfer this cannot
 /// name still reports `can't find parentOp` from an unrooted op.
@@ -411,6 +431,7 @@ pub fn simplify_load_store_operation(
     at: usize,
     expr_prop_analysis: &mut impl PropagationAnalysis,
     unit_index_map: &impl UnitIndexMap,
+    const_sink: &mut ConstSink,
     values: &mut Values,
 ) {
     // `op->emitOpError("can't find parentOp"); signalPassFailure();`
@@ -447,6 +468,7 @@ pub fn simplify_load_store_operation(
             &units,
             key,
             expr_prop_analysis,
+            const_sink,
             values,
         );
         at += scope.len() - before;
@@ -466,6 +488,7 @@ fn simplified_value(
     units: &[Val],
     key: Val,
     expr_prop_analysis: &mut impl PropagationAnalysis,
+    const_sink: &mut ConstSink,
     values: &mut Values,
 ) -> Option<Val> {
     {
@@ -483,7 +506,7 @@ fn simplified_value(
         let Some(expr_info) = expr_prop_analysis.expr_info_at(expr_info_map, *idx) else {
             todo!(
                 "simplifyLoadStoreOperation: DT_CHECK_MSG(expr_info, \"Expecting valid ExprInfo for \
-                 unit\") (ScalarSimplifications.cpp:437) — no entry for unit {idx}"
+                 unit\") (ScalarSimplifications.cpp:436) — no entry for unit {idx}"
             )
         };
         if expr_info.num_propagated_args > 1 || expr_info.num_map_dims > 1 {
@@ -503,13 +526,11 @@ fn simplified_value(
     ) {
         return None;
     }
-    // `getFirstExprInfo()` — either a direct variable or a constant.
-    let first = expr_prop_analysis.expr_info_at(expr_info_map, 0)?;
+    // `getFirstExprInfo()` (`:456-457`) — either a direct variable or a constant. ⛔ THE FIRST
+    // NON-NULL LIST ENTRY, NOT UNIT INDEX 0, and this read is not inside an identical-only branch.
+    let first = expr_prop_analysis.first_expr_info(expr_info_map)?;
     if first.num_map_dims == 1 {
-        return expr_prop_analysis
-            .propagated_args(expr_info_map, 0)
-            .first()
-            .copied();
+        return expr_prop_analysis.first_propagated_args(expr_info_map).first().copied();
     }
     Some(sentient::create_new_op_or_map(
         scope,
@@ -522,6 +543,7 @@ fn simplified_value(
         ScalarTy::Index,
         key,
         expr_prop_analysis,
+        const_sink,
         values,
     ))
 }
@@ -534,8 +556,8 @@ fn simplified_value(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        IfPredicate, simplify_binary_operation, simplify_conditionals, simplify_load_store_operation,
-        update_cmp_i_predicate,
+        ConstSink, IfPredicate, simplify_binary_operation, simplify_conditionals,
+        simplify_load_store_operation, update_cmp_i_predicate,
     };
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -566,6 +588,10 @@ mod unit_tests {
         }
 
         fn propagated_args(&mut self, map: ExprInfoMap, _at: usize) -> Vec<Val> {
+            vec![Val(map.0)]
+        }
+
+        fn first_propagated_args(&mut self, map: ExprInfoMap) -> Vec<Val> {
             vec![Val(map.0)]
         }
     }
@@ -655,6 +681,7 @@ mod unit_tests {
             &mut StatedAnalysis { empty: true },
             &OutOfScopeUnitIndexMap,
             &mut to_be_deleted,
+            &mut ConstSink::default(),
             &mut Values::default(),
         );
         assert_eq!(scope, untouched);
@@ -672,6 +699,7 @@ mod unit_tests {
             0,
             &mut StatedAnalysis { empty: false },
             &OutOfScopeUnitIndexMap,
+            &mut ConstSink::default(),
             &mut Values::default(),
         );
     }

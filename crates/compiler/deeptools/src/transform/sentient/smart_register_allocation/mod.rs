@@ -229,7 +229,7 @@ impl<G: RegisterGraphs> SmartRegisterAllocation<G> {
     /// ⭐ `getChildAnalysis<Liveness>(unit)` IS A CONSTRUCTION: `Liveness(Operation *p) {
     /// computeRegisterLiveRange(p); }` (`Analyses/Liveness.h:85`), so a fresh analysis per unit,
     /// computed over that unit, is the port — the cache is MLIR's and holds nothing across units.
-    /// ⚠️ `DEBUG_WITH_TYPE(VerboseDebug, liveness.dump())` IS DROPPED (`:631`): it changes no IR.
+    /// ⚠️ `DEBUG_WITH_TYPE(VerboseDebug, liveness.dump())` IS DROPPED (`:630`): it changes no IR.
     pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload, L: Liveness + Default>(
         &mut self,
         program: &mut Program<A, M, W>,

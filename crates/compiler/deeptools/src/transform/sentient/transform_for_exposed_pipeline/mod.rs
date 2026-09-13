@@ -613,7 +613,7 @@ impl Dependencies {
     /// so `body` here IS that root and there is no second unit to pass.
     /// ⛔ AND `tmp_time_stamps` IS WRITE-ONLY: nothing reads it after the call (`:290-291`), which is
     /// why it is this function's own local and not a field.
-    /// ⚠️ `LLVM_DEBUG(ts_analyzer.printTimeStamps())` IS DROPPED (`:292`): it changes no IR.
+    /// ⚠️ `LLVM_DEBUG(ts_analyzer.printTimeStamps())` IS DROPPED (`:293`): it changes no IR.
     pub(crate) fn compute_dependencies<A: Arch>(
         &mut self,
         ts: &mut impl TimeStamps,

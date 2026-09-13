@@ -1390,13 +1390,13 @@ struct IterArgPlan {
 /// the yielded increment and folding the loop's result to a constant.
 ///
 /// ⛔ THE ITER ARG AND ITS RESULT STAY ON THE LOOP — this unit only names their indices, so the yield
-/// is deliberately left ONE OPERAND SHORT of the loop's results (`:378`) and
+/// is deliberately left ONE OPERAND SHORT of the loop's results (`:380`) and
 /// `EnhancedDeadVariableElimination` finishes the job; see [`RedundantIterArgs`].
 /// ⛔ TRAP: DESCENDING `i` IS LOAD-BEARING — `eraseOperand(i)` renumbers every later yield operand.
 /// ⭐ THE IV COUNTS DOWN FROM `$bound` TO ZERO (`SentientOps.td:55`), which is why `stride = 1` SWAPS
 /// the compared operands and `stride = -1` moves only the constant: `iter_arg = adjustment - IV`
 /// reverses a comparison and `iter_arg = IV - adjustment` preserves it.
-/// ⚠️ THE `DT_CHECK_MSG` AT `:344` IS UNREACHABLE — the non-iter-arg side was already proved a
+/// ⚠️ THE `DT_CHECK_MSG` AT `:345` IS UNREACHABLE — the non-iter-arg side was already proved a
 /// `sentient.scalar_constant` when the use was accepted (`:314-321`), and the plan carries its value
 /// rather than re-deriving it from a position the inserted constants have since shifted.
 pub fn find_and_replace_redundant_iter_args_used_in_conditions(
@@ -1441,7 +1441,7 @@ pub fn find_and_replace_redundant_iter_args_used_in_conditions(
     redundant_iter_args(iter_arg_indices_to_delete)
 }
 
-/// `iter_arg_indices_to_delete.empty()` (`:392`).
+/// `iter_arg_indices_to_delete.empty()` (`:393`).
 fn redundant_iter_args(indices: &[IterArgIndex]) -> RedundantIterArgs {
     if indices.is_empty() {
         RedundantIterArgs::None
@@ -1479,7 +1479,7 @@ fn for_path(unit_body: &[Op], loop_op: ForRef) -> Option<OpAt> {
     walk(unit_body, loop_op.0, &mut Vec::new())
 }
 
-/// `loop.getNumRegionIterArgs()` (`:262`).
+/// `loop.getNumRegionIterArgs()` (`:261`).
 fn carried_count(unit_body: &[Op], at: &OpAt) -> Option<usize> {
     match at.op(unit_body)? {
         Op::Sentient(ops::Op::For { carried, .. }) => Some(carried.len()),
@@ -1495,7 +1495,7 @@ fn loop_result(unit_body: &[Op], at: &OpAt, i: usize) -> Option<Val> {
     }
 }
 
-/// EVERY `continue` OF THE REFERENCE'S LOOP BODY AS ONE READ (`:263-341`) — `None` is a rejected iter
+/// EVERY `continue` OF THE REFERENCE'S LOOP BODY AS ONE READ (`:262-328`) — `None` is a rejected iter
 /// arg.
 ///
 /// ⭐ THE LOOP BODY IS THE INNERMOST SCOPE AND THE ENCLOSING ONES STILL COUNT: the vendor's own
@@ -1555,9 +1555,9 @@ fn plan_for(unit_body: &[Op], at: &OpAt, i: usize) -> Option<IterArgPlan> {
         return None;
     };
 
-    // `for (auto &use : iter_arg.getUses())` (`:322-338`).
+    // `for (auto &use : iter_arg.getUses())` (`:310-327`).
     let mut predicates: Vec<(usize, i64, ScalarTy)> = Vec::new();
-    if !accepts_every_iter_arg_use(body, entry.arg, add_result, defs, &mut predicates) {
+    if !accepts_every_iter_arg_use(&scopes, entry.arg, add_result, &mut predicates) {
         return None;
     }
     Some(IterArgPlan {
@@ -1573,14 +1573,21 @@ fn plan_for(unit_body: &[Op], at: &OpAt, i: usize) -> Option<IterArgPlan> {
 /// `skip_iter_arg_replacement` INVERTED — every reader of the iter arg must be the yielded add or a
 /// `sentient.if` whose other side is a `sentient.scalar_constant`, and `list_of_if_ops` is collected
 /// in the same walk order the writer re-finds them in.
+///
+/// ⭐ A NESTED REGION IS ITS OWN INNERMOST SCOPE: `non_iter_arg_side.getDefiningOp()` (`:316-318`) is
+/// scope-free, so a predicate compared against a constant defined inside the region the `sentient.if`
+/// sits in is accepted there and has to be here.
 fn accepts_every_iter_arg_use(
-    block: &[Op],
+    scopes: &[&[Op]],
     iter_arg: Val,
     add_result: Val,
-    defs: Definitions<'_>,
     predicates: &mut Vec<(usize, i64, ScalarTy)>,
 ) -> bool {
-    for op in block {
+    let defs = Definitions::from_innermost(scopes);
+    let Some(block) = scopes.first() else {
+        return true;
+    };
+    for op in *block {
         if operands(op).contains(&iter_arg) {
             match op {
                 Op::Sentient(ops::Op::If { lhs, rhs, .. }) => {
@@ -1603,7 +1610,9 @@ fn accepts_every_iter_arg_use(
             }
         }
         for region in regions_ref(op) {
-            if !accepts_every_iter_arg_use(region, iter_arg, add_result, defs, predicates) {
+            let mut inner: Vec<&[Op]> = vec![region];
+            inner.extend_from_slice(scopes);
+            if !accepts_every_iter_arg_use(&inner, iter_arg, add_result, predicates) {
                 return false;
             }
         }
@@ -1611,7 +1620,7 @@ fn accepts_every_iter_arg_use(
     true
 }
 
-/// `:341-384` — the writes, in the reference's own order so the minted constants land in its order.
+/// `:330-382` — the writes, in the reference's own order so the minted constants land in its order.
 fn apply_iter_arg_plan(
     unit_body: &mut Vec<Op>,
     at: &OpAt,
@@ -1643,7 +1652,7 @@ fn apply_iter_arg_plan(
     }
 }
 
-/// The `for (auto sentient_if : list_of_if_ops)` body (`:341-375`), re-finding each `sentient.if` by
+/// The `for (auto sentient_if : list_of_if_ops)` body (`:337-377`), re-finding each `sentient.if` by
 /// the operand that accepted it and consuming the plan in the same walk order.
 fn adjust_iter_arg_predicates<'a>(
     block: &mut Vec<Op>,
@@ -1668,7 +1677,7 @@ fn adjust_iter_arg_predicates<'a>(
                 }
                 // `iter_arg = adjustment_val - IV`: the comparison reverses, so the NON-iter-arg slot
                 // takes the induction variable and the iter arg's slot takes the new constant
-                // (`:370-372`).
+                // (`:374-375`).
                 IterArgStride::Up => {
                     let updated = mint_constant(minted, values, plan.adjustment - constant, ty);
                     set_operand(&mut block[index], slot, iv);

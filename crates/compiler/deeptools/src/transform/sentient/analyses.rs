@@ -1153,12 +1153,35 @@ pub trait PropagationAnalysis {
     }
 
     /// `ExprInfoMap::getExprInfoAt(at)->propagated_args_` — the SSA values the affine map at unit
-    /// index `at` is written over. ⭐ `at == 0` IS `getFirstExprInfo()`
-    /// (`Analyses/PropagationAnalysis.h:264`), which is what the identical case reads.
+    /// index `at` is written over. ⛔ `at == 0` IS NOT `getFirstExprInfo()`; that is
+    /// [`PropagationAnalysis::first_propagated_args`].
     fn propagated_args(&mut self, map: ExprInfoMap, at: usize) -> Vec<Val> {
         let _ = (map, at);
         todo!(
             "PropagationAnalysis::ExprInfo::propagated_args_ (Analyses/PropagationAnalysis.h:100) — out of campaign scope"
+        )
+    }
+
+    /// `ExprInfoMap::getFirstExprInfo()` (`Analyses/PropagationAnalysis.h:264-269`) REDUCED TO THE
+    /// SAME FIELDS as [`PropagationAnalysis::expr_info_at`] — see [`ExprInfoShape`].
+    ///
+    /// ⛔ IT IS THE FIRST NON-NULL ENTRY OF `expr_info_list_`, NOT UNIT INDEX 0: a unit index goes
+    /// through `getListIdxFromUnitIdx` (`Analyses/PropagationAnalysis.cpp:1722-1749`), and only
+    /// `kIdentical` collapses it to 0 — which is why the reference has a second accessor at all, "for
+    /// cases where we do not have the index list" (`Analyses/PropagationAnalysis.h:258-263`).
+    fn first_expr_info(&mut self, map: ExprInfoMap) -> Option<ExprInfoShape> {
+        let _ = map;
+        todo!(
+            "PropagationAnalysis::ExprInfoMap::getFirstExprInfo (Analyses/PropagationAnalysis.h:264) — out of campaign scope"
+        )
+    }
+
+    /// `getFirstExprInfo()->propagated_args_` — the same list [`PropagationAnalysis::propagated_args`]
+    /// answers, for the entry [`PropagationAnalysis::first_expr_info`] names.
+    fn first_propagated_args(&mut self, map: ExprInfoMap) -> Vec<Val> {
+        let _ = map;
+        todo!(
+            "PropagationAnalysis::ExprInfoMap::getFirstExprInfo (Analyses/PropagationAnalysis.h:264) — out of campaign scope"
         )
     }
 

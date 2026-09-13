@@ -317,7 +317,7 @@ fn take_everywhere<A: Arch, M: Model, W: Workload>(
 /// `e395_pruneOutOfScopeEntries` (`dcc/src/Transform/Sentient/Utils.cpp:635`), whose home is
 /// [`utils`](super::utils) and whose anchor is STILL UNFILLED — it sits in this campaign's
 /// `sc2-level1-helpers` port remainder. `todo!` NAMES it rather than standing in for it.
-/// ⛔ THE REFERENCE'S OWN `// todo:` (`:86-87`) IS UNIMPLEMENTED THERE TOO: nothing here pulls a
+/// ⛔ THE REFERENCE'S OWN `// todo:` (`:87-88`) IS UNIMPLEMENTED THERE TOO: nothing here pulls a
 /// map or query op with only local-region uses into that region, and nothing should.
 /// ⭐ `to_be_deleted` IS DEFERRED DELETION, NOT AN OUTPUT: `e545_runOn` erases the list after the
 /// walk, because `pruneOutOfScopeEntries` is called from inside one.

@@ -85,7 +85,7 @@
 // (level 4) is what reaches the item below, through e534. CI runs clippy with `-D warnings`, so
 // without this the first ported leaf here fails the gate. ⭐ REMOVE THIS WITH e580.
 
-use super::QueryKeyAndUnits;
+use super::{ConstSink, QueryKeyAndUnits};
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{
@@ -178,11 +178,12 @@ fn are_flat_exprs_and_args_identical(
 /// ⛔ `first_flat_expr_size` DECIDES THE SHAPE FOR EVERY UNIT, including in the per-unit loop
 /// (`:809-826`): unit 0's expression length is the whole discriminator.
 /// ⛔ SIZE 2 IS THE ONE ASYMMETRIC CASE — only `operand_idx == 1` becomes a constant, the other index
-/// answers with the propagated argument (`:788-793`).
+/// answers with the propagated argument (`:791-798`).
 /// ⛔ A SIZE THAT IS NOT 1, 2 OR 3 FALLS THROUGH TO THE MAPPING PATH, whose own chain then pushes
 /// NOTHING and builds a mapping of no values. The reference has no `else` on either chain.
-/// ⭐ THE SAVE/RESTORE OF THE INSERTION POINT IS DROPPABLE MECHANISM; what is not is that every op
-/// created here lands immediately BEFORE `at`, in creation order.
+/// ⛔ THE TWO PATHS BUILD IN DIFFERENT PLACES: the identical case creates its constant wherever the
+/// PASS's builder points — [`ConstSink`] — and only the mapping path moves to the op (`:801-802`) and
+/// puts the sink back afterwards (`:836`).
 pub(crate) fn create_new_op_or_map(
     scope: &mut Vec<Op>,
     at: usize,
@@ -194,6 +195,7 @@ pub(crate) fn create_new_op_or_map(
     ty: ScalarTy,
     query_key: Val,
     expr_prop_analysis: &mut impl PropagationAnalysis,
+    const_sink: &mut ConstSink,
     values: &mut Values,
 ) -> Val {
     let first_flat_expr = flat_exprs.first().map(FlatExpr::first).unwrap_or(&[]);
@@ -202,13 +204,15 @@ pub(crate) fn create_new_op_or_map(
         || are_flat_exprs_and_args_identical(flat_exprs, indices, result_info, operand_idx)
     {
         match first_flat_expr_size {
-            1 => return scalar_constant(scope, at, first_flat_expr[0], ty, values),
+            1 => return sink_constant(scope, const_sink, first_flat_expr[0], ty, values),
             2 if operand_idx == 1 => {
-                return scalar_constant(scope, at, first_flat_expr[operand_idx], ty, values);
+                return sink_constant(scope, const_sink, first_flat_expr[operand_idx], ty, values);
             }
-            // `getFirstExprInfo()->propagated_args_[operand_idx]` — unit index 0.
+            // `getFirstExprInfo()->propagated_args_[operand_idx]` (`:790`, `:797`) — the first
+            // NON-NULL list entry, which this branch has just proved every unit agrees with.
             2 | 3 => {
-                if let Some(arg) = propagated_arg(expr_prop_analysis, result_info, 0, operand_idx) {
+                if let Some(arg) = first_propagated_arg(expr_prop_analysis, result_info, operand_idx)
+                {
                     return arg;
                 }
             }
@@ -218,7 +222,7 @@ pub(crate) fn create_new_op_or_map(
     if units.len() != flat_exprs.len() {
         todo!(
             "createNewOpOrMap: DT_CHECK_MSG(units.size() == num_flat_exprs, \"Expecting a flattened \
-             expression for each unit\") (ScalarSimplifications.cpp:803) — {} units against {} \
+             expression for each unit\") (ScalarSimplifications.cpp:805) — {} units against {} \
              flattened expressions",
             units.len(),
             flat_exprs.len()
@@ -270,8 +274,21 @@ pub(crate) fn create_new_op_or_map(
     query
 }
 
-/// `result_info->getExprInfoAt(at)->propagated_args_[operand_idx]` — the one read of the analysis this
-/// unit makes, and `None` where the reference indexes a `SmallVector` past its end.
+/// `result_info->getFirstExprInfo()->propagated_args_[operand_idx]` (`:790`, `:797`) — the identical
+/// case's read, and `None` where the reference indexes a `SmallVector` past its end.
+fn first_propagated_arg(
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    result_info: ExprInfoMap,
+    operand_idx: usize,
+) -> Option<Val> {
+    expr_prop_analysis
+        .first_propagated_args(result_info)
+        .get(operand_idx)
+        .copied()
+}
+
+/// `result_info->getExprInfoAt(at)->propagated_args_[operand_idx]` (`:816-817`, `:824-825`) — the
+/// per-unit read, and `None` where the reference indexes a `SmallVector` past its end.
 fn propagated_arg(
     expr_prop_analysis: &mut impl PropagationAnalysis,
     result_info: ExprInfoMap,
@@ -282,6 +299,21 @@ fn propagated_arg(
         .propagated_args(result_info, at)
         .get(operand_idx)
         .copied()
+}
+
+/// `sentient::ConstantOp::create(builder, loc, operand_type, value)` ON THE PASS'S OWN BUILDER
+/// (`:786-788`, `:793-795`) — at the sink, which then advances past what it just created.
+fn sink_constant(
+    scope: &mut Vec<Op>,
+    const_sink: &mut ConstSink,
+    value: i64,
+    ty: ScalarTy,
+    values: &mut Values,
+) -> Val {
+    let at = const_sink.0.min(scope.len());
+    let result = scalar_constant(scope, at, value, ty, values);
+    const_sink.0 = at + 1;
+    result
 }
 
 /// `sentient::ConstantOp::create(builder, loc, operand_type, value)` inserted before `at`.
@@ -306,9 +338,9 @@ fn scalar_constant(
     result
 }
 
-/// `sentient::ConstantOp` OR A CONSTANT `uniform::QueryMapOp`'S PER-UNIT TARGETS (`:604-616`,
-/// `:622-634`) — the two spellings of an add's constant operand, EMPTY where it is neither, which is
-/// the reference's `rhs_consts.empty()` refusal.
+/// `sentient::ConstantOp` OR A CONSTANT `uniform::QueryMapOp`'S PER-UNIT TARGETS (`:618-626`,
+/// `:634-643`) — the two spellings of an add's constant operand, EMPTY where it is neither, which is
+/// the reference's `rhs_consts.empty()` refusal (`:627`, `:644`).
 fn add_operand_constants(val: Val, defs: Definitions<'_>) -> Vec<i64> {
     match defs.of(val) {
         Some(Op::Sentient(ops::Op::ScalarConstant { value, .. })) => vec![*value],
@@ -317,7 +349,7 @@ fn add_operand_constants(val: Val, defs: Definitions<'_>) -> Vec<i64> {
                 todo!(
                     "lightWeightSimplifyBinaryArithmetic: \
                      DT_CHECK_MSG(isConstant<sentient::ConstantOp>(query_map), \"Expecting \
-                     non-symbolic RHS of IfOp condition\") (ScalarSimplifications.cpp:608, :627)"
+                     non-symbolic RHS of IfOp condition\") (ScalarSimplifications.cpp:623, :639)"
                 )
             }
             constant_target_values(*map, defs)
@@ -331,22 +363,23 @@ fn add_operand_constants(val: Val, defs: Definitions<'_>) -> Vec<i64> {
 /// Deletes an add of zero, folds a scalar add whose expression resolved to a constant into that
 /// constant, and otherwise merges a chain of two adds into one over the sum of their constants.
 ///
-/// ⛔ ONLY AN ADD LOSES ITS ZERO OPERAND (`:528-534`): `checkOperand` is written for both ops and
+/// ⛔ ONLY AN ADD LOSES ITS ZERO OPERAND (`:512-536`): `checkOperand` is written for both ops and
 /// called for neither `sentient.scalar_sub`, so `x - 0` survives.
 /// ⛔ THE CONSTANT ARM DELETES THE OP EVEN WITH NO USES (`:578-588`) — the replacement value is what
 /// is conditional, not the deletion.
-/// ⛔ e534'S FLATTENING DISCARDS ITS OWN FAILURE (`void(...)`, `:567`) where e532 and e533 decline on
+/// ⛔ e534'S FLATTENING DISCARDS ITS OWN FAILURE (`void(...)`, `:568`) where e532 and e533 decline on
 /// it, so a failed unit still pushes an expression.
-/// ⛔ THE MERGE ARM READS THE INNER ADD'S SECOND OPERAND ONLY (`:618`), keeps the outer op and
+/// ⛔ THE MERGE ARM READS THE INNER ADD'S SECOND OPERAND ONLY (`:629`), keeps the outer op and
 /// deletes the INNER one, and needs it to have exactly one use.
 /// ⭐ THE PER-UNIT CONSTANT LISTS BROADCAST: a list of length 1 pairs with every element of the other
-/// (`:646-650`), which is why the sum is indexed by `min(idx, len - 1)`.
+/// (`:650-659`), which is why the sum is indexed by `min(idx, len - 1)`.
 pub(crate) fn light_weight_simplify_binary_arithmetic(
     scope: &mut Vec<Op>,
     at: usize,
     expr_prop_analysis: &mut impl PropagationAnalysis,
     unit_index_map: &impl UnitIndexMap,
     to_be_deleted: &mut Vec<Val>,
+    const_sink: &mut ConstSink,
     values: &mut Values,
 ) {
     let (is_add, result, ty) = match scope.get(at) {
@@ -427,6 +460,7 @@ pub(crate) fn light_weight_simplify_binary_arithmetic(
                 ty,
                 key,
                 expr_prop_analysis,
+                const_sink,
                 values,
             );
             expr_prop_analysis.set_expr_info_map_for_value(new_op, expr_info_map);
@@ -436,7 +470,7 @@ pub(crate) fn light_weight_simplify_binary_arithmetic(
         return;
     }
     // `x = ADD a, c0; y = ADD x, c1` --> `y = ADD a, c0 + c1`, which reads no propagated expression
-    // at all: using one could disrupt what live range reduction did (`:597-602`).
+    // at all: using one could disrupt what live range reduction did (`:594-600`).
     let Some(Op::Sentient(ops::Op::ScalarAdd { lhs, rhs, .. })) = scope.get(at) else {
         return;
     };
@@ -457,9 +491,14 @@ pub(crate) fn light_weight_simplify_binary_arithmetic(
         if defs.of(rhs).is_none() {
             return;
         }
+        // `if (rhs_consts.empty()) return;` (`:627`) IS BEFORE THE LHS IS EVEN LOOKED AT, so a
+        // non-constant RHS never reaches the LHS `DT_CHECK_MSG` (`:639`).
         let rhs_consts = add_operand_constants(rhs, defs);
+        if rhs_consts.is_empty() {
+            return;
+        }
         let inner_consts = add_operand_constants(*inner_rhs, defs);
-        if rhs_consts.is_empty() || inner_consts.is_empty() {
+        if inner_consts.is_empty() {
             return;
         }
         (*inner_lhs, *inner_result, inner_consts, rhs_consts)
@@ -474,7 +513,7 @@ pub(crate) fn light_weight_simplify_binary_arithmetic(
     {
         todo!(
             "lightWeightSimplifyBinaryArithmetic: DT_CHECK(lhs_add_op_consts.size() == 1 || \
-             lhs_add_op_consts.size() == element_num) (ScalarSimplifications.cpp:643-645) — {} \
+             lhs_add_op_consts.size() == element_num) (ScalarSimplifications.cpp:652-654) — {} \
              against {} per-unit constants",
             inner_consts.len(),
             rhs_consts.len()
@@ -527,7 +566,9 @@ pub(crate) fn light_weight_simplify_binary_arithmetic(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{FlatExpr, create_new_op_or_map, light_weight_simplify_binary_arithmetic};
+    use super::{
+        ConstSink, FlatExpr, create_new_op_or_map, light_weight_simplify_binary_arithmetic,
+    };
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{Op, Val, operands, sentient as ops};
@@ -546,6 +587,10 @@ mod unit_tests {
         fn propagated_args(&mut self, _map: ExprInfoMap, at: usize) -> Vec<Val> {
             vec![Val(50 + at as u32), Val(60 + at as u32)]
         }
+
+        fn first_propagated_args(&mut self, _map: ExprInfoMap) -> Vec<Val> {
+            vec![Val(50), Val(60)]
+        }
     }
 
     /// A minter that has already issued `issued` values, so a fixture's own [`Val`]s cannot collide.
@@ -558,7 +603,7 @@ mod unit_tests {
     }
 
     /// e472 — the non-uniformization case: one unit's flattened expression of length 1 becomes a
-    /// `sentient.scalar_constant` before the op, and one of length 3 answers with the propagated
+    /// `sentient.scalar_constant` at the pass's sink, and one of length 3 answers with the propagated
     /// argument itself, creating nothing.
     #[test]
     fn a_single_unit_expression_becomes_a_constant_or_the_propagated_argument() {
@@ -576,6 +621,7 @@ mod unit_tests {
                 ScalarTy::Index,
                 Val(81),
                 &mut StatedAnalysis,
+                &mut ConstSink::default(),
                 &mut values,
             ),
             Val(10)
@@ -602,6 +648,7 @@ mod unit_tests {
                 ScalarTy::Index,
                 Val(81),
                 &mut StatedAnalysis,
+                &mut ConstSink(1),
                 &mut values,
             ),
             Val(60)
@@ -625,8 +672,44 @@ mod unit_tests {
             ScalarTy::Index,
             Val(81),
             &mut StatedAnalysis,
+            &mut ConstSink::default(),
             &mut values_after(10),
         );
+    }
+
+    /// e472 — ⛔ THE IDENTICAL CASE BUILDS AT THE PASS'S OWN BUILDER (`:786-788`) AND NOT IN FRONT OF
+    /// THE OP: the sink starts at the head of the block, so the constant lands at index 0 while the op
+    /// it feeds sits at index 2, and the sink then advances past what it created.
+    #[test]
+    fn an_identical_case_constant_lands_at_the_pass_sink_not_before_the_op() {
+        let mut scope = vec![
+            Op::Sentient(ops::Op::Nop { dbg_name: None }),
+            Op::Sentient(ops::Op::Nop { dbg_name: None }),
+            Op::Sentient(ops::Op::Nop { dbg_name: None }),
+        ];
+        let mut const_sink = ConstSink::default();
+        assert_eq!(
+            create_new_op_or_map(
+                &mut scope,
+                2,
+                &[FlatExpr(vec![vec![7]])],
+                &[0],
+                &[Val(80)],
+                ExprInfoMap(0),
+                0,
+                ScalarTy::Index,
+                Val(81),
+                &mut StatedAnalysis,
+                &mut const_sink,
+                &mut values_after(10),
+            ),
+            Val(10)
+        );
+        assert!(matches!(
+            scope[0],
+            Op::Sentient(ops::Op::ScalarConstant { value: 7, .. })
+        ));
+        assert_eq!(const_sink, ConstSink(1));
     }
 
     /// e534 — the vendor's own case: an add of a zero constant is replaced by its other operand and
@@ -664,6 +747,7 @@ mod unit_tests {
             &mut OutOfScopePropagationAnalysis,
             &OutOfScopeUnitIndexMap,
             &mut to_be_deleted,
+            &mut ConstSink::default(),
             &mut Values::default(),
         );
         assert_eq!(operands(&scope[2]), vec![Val(1), Val(1)]);
