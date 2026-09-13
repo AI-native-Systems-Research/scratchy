@@ -174,7 +174,9 @@ use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, UniformRegions, Val, dataflow, sentient, uniform,
 };
-use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator, MinMax};
+use crate::transform::sentient::analyses::{
+    EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites,
+};
 use crate::transform::sentient::{ForRef, IterArgIndex};
 use crate::units::DfirUnit;
 
@@ -384,6 +386,37 @@ impl SimpleConstantDataTransferUpdater {
     /// `sentient.if` whose yielded constants would need re-basing against the pinned address, so this
     /// override of the three that do is empty.
     pub const fn update_variable_offset_calculation(self, _new_immut_addr_ev: EvaluatedValue) {}
+
+    /// Replaces: e418_getOffset
+    ///
+    /// `dtd_.getBaseAddr() - new_immut_addr_ev` BUILT AS A VALUE (`:1073-1079`), which is the
+    /// `old_immutable - pinned_addr` term of `new_mutable = old_mutable + (old_immutable - pinned)`.
+    ///
+    /// ⛔ THE ONLY ONE OF THE FOUR `getOffset`s THAT MATERIALISES ANYTHING — e011/e012/e013 hand back
+    /// a value the IR already computes, so this one alone needs the evaluator and the build sites.
+    /// ⛔ `None` FROM [`DataTransferDescriptor::base_addr`] IS `DT_CHECK(base_addrs_.size() == 1)`.
+    /// ⭐ `createOffsetValue` (e009) IS `buildOffsetValue` PLUS TWO BUILDER POSITIONS, which the
+    /// campaign names droppable and which `sites`/`walked` carry instead — the same seam as e277.
+    #[must_use]
+    pub fn get_offset<E: ExpressionEvaluator>(
+        self,
+        dtd: &DataTransferDescriptor,
+        new_immut_addr_ev: EvaluatedValue,
+        ty: ScalarTy,
+        evaluator: &mut E,
+        sites: &mut OffsetSites<'_>,
+        walked: &mut Vec<Op>,
+    ) -> Val {
+        let Some(base_addr) = dtd.base_addr() else {
+            todo!(
+                "SimpleConstantDataTransferUpdater::getOffset: DT_CHECK(base_addrs_.size() == 1) \
+                 (`:657-660`) — {} base addrs",
+                dtd.base_addrs.len()
+            )
+        };
+        let offset = evaluator.evaluate_sub_handle(base_addr, new_immut_addr_ev);
+        evaluator.build_offset_value_of(offset, sites, walked, ty)
+    }
 }
 
 /// `SubOp toggle_sub_` — the `sentient.scalar_sub` computing a toggling transfer's immutable address,
@@ -580,6 +613,42 @@ impl DataTransferDescriptorContainer {
     pub const fn validate(&self) {}
 }
 
+impl DataTransferDescriptorContainer {
+    /// Replaces: e416_clear_all
+    ///
+    /// Empties the container — every descriptor and every chaining bit (`:886-891`).
+    ///
+    /// ⛔ `sorted_list_.clear()` HAS NOTHING TO CLEAR: there is no such field here, see the type.
+    /// ⭐ AND IT FREES THE DESCRIPTORS, WHICH THE REFERENCE'S `clear_all` DOES NOT — its only two
+    /// callers are `~DataTransferDescriptorContainer()` (`:881`) and `cleanup()` (e489, `:1656-1664`),
+    /// and the latter deletes every element first and then clears. An owning `Vec`'s clear is that
+    /// pair, minus the delete loop; the destructor's own leak is not a behaviour to port.
+    pub fn clear_all(&mut self) {
+        self.validate();
+        self.descriptors.clear();
+        self.chaining_info.clear();
+    }
+}
+
+impl DataTransferDescriptorContainer {
+    /// Replaces: e417_isHeadOfLoopingChain
+    ///
+    /// Whether `desc` heads a chain whose last link reaches back to it (`:920-927`).
+    ///
+    /// ⭐ THE `isHeadOfChain` GUARD DOES FIRE, UNLIKE e273'S: `computeChainingInfo`'s second loop runs
+    /// over EVERY valid descriptor and sets `kHeadOfLoopingChain` on each one whose mutable-address
+    /// result is yielded by its own enclosing `sentient.for` (`:2251-2278`) — which the tail link of a
+    /// two-link chain is, holding `kPartOfChain` with `kHeadOfChain` explicitly cleared (`:2219-2220`).
+    #[must_use]
+    pub fn is_head_of_looping_chain(&self, desc: DescriptorId) -> bool {
+        self.is_head_of_chain(desc)
+            && self
+                .chaining_info
+                .get(&desc)
+                .is_some_and(|flags| flags.get(ChainFlag::HeadOfLoopingChain))
+    }
+}
+
 /// WHICH END OF A `sentient.load_and_store` SITS ON THE HBM — the reference's `if
 /// (getUnitType(src_unit) == HBM) .. else if (getUnitType(dst_unit) == HBM)`, whose `else if` gives
 /// the source the win when both ends are.
@@ -774,6 +843,56 @@ pub fn turn_hbm_constant_op_addrs_to_query_maps_helper(
     constants
 }
 
+/// `unit->walk<WalkOrder::PreOrder>` — each op before its own regions, `scopes` grown one level per
+/// descent so `getDefiningOp()` still searches outwards, and `WalkResult::skip()` on a region op e275
+/// has just rewritten. ⭐ THE BLOCK IS SNAPSHOT BEFORE THE DESCENT because the walk holds it
+/// exclusively while the lookups inside want it shared.
+fn query_map_uniform_regions(
+    body: &mut [Op],
+    enclosing: &[&[Op]],
+    values: &mut Values,
+    constants: &mut Vec<Op>,
+) {
+    let here = body.to_vec();
+    let mut scopes: Vec<&[Op]> = Vec::with_capacity(enclosing.len() + 1);
+    scopes.push(&here);
+    scopes.extend_from_slice(enclosing);
+    for op in body.iter_mut() {
+        if let Op::UniformRegions(region_op) = op {
+            constants.extend(turn_hbm_constant_op_addrs_to_query_maps_helper(
+                region_op, &scopes, values,
+            ));
+            continue;
+        }
+        for region in dialects::regions_mut(op) {
+            query_map_uniform_regions(region, &scopes, values, constants);
+        }
+    }
+}
+
+/// Replaces: e419_turnHBMConstantOpAddrsToQueryMapsInUniformRegions
+///
+/// Hands every `uniform.uniformize_regions`/`uniform.equalize_pattern` in one program unit to e275,
+/// skipping its subtree, and puts the constants it built at the front of the enclosing function's
+/// entry block — `OpBuilder const_builder(parent_func.getBody())`, ONE builder for the whole walk, so
+/// they land in creation order ahead of every reader (`:1579-1591`).
+///
+/// ⭐ `DT_CHECK(parent_func)` IS THE ISLAND'S SHAPE: a program unit is a member of a
+/// [`crate::islands::sentient::Program`], whose `preamble` is that entry block.
+/// ⛔ [`Op::Uniform`] NEEDS NO ARM OF ITS OWN: it carries no regions at this rung, so it can hold no
+/// `sentient.load_and_store` and descending into it rather than skipping is unobservable.
+pub fn turn_hbm_constant_op_addrs_to_query_maps_in_uniform_regions(
+    unit_body: &mut [Op],
+    preamble: &mut Vec<Op>,
+    values: &mut Values,
+) {
+    let scope = preamble.clone();
+    let mut constants = Vec::new();
+    let enclosing: [&[Op]; 1] = [&scope];
+    query_map_uniform_regions(unit_body, &enclosing, values, &mut constants);
+    preamble.splice(0..0, constants);
+}
+
 // THE FIVE DESCRIPTORS' OWN `isValid()` — `:263`, `:318`, `:356`, `:468`, `:562`, each one to three
 // lines reading its own fields, and each on `EXCLUSIONS.tsv` as "a struct field in Rust, not a
 // function". ⛔ NONE OF THEM IS `DataTransferDescriptor::isValid()`, which is e278
@@ -842,6 +961,22 @@ impl DataTransferDescriptor {
             [only] => Some(*only),
             _ => None,
         }
+    }
+
+    /// Replaces: e415_isSimpleConstant
+    ///
+    /// Whether this transfer's base address is ONE constant (`:673-676`).
+    ///
+    /// ⛔ THE `isValid()` CONJUNCT IS SPECIALISED, NOT DROPPED, exactly as in [`Self::is_toggle`]:
+    /// with the arm destructured, `isValid() && isa<SimpleConstantDescriptor>` is e278's TAIL arm
+    /// (`:2497-2499`) — the reference's `dyn_cast` chain has no `SimpleConstant` case and this
+    /// descriptor is never invalid (`:191`) — so exactly one stored base address is required.
+    #[must_use]
+    pub fn is_simple_constant(&self) -> bool {
+        matches!(
+            self.pattern_desc,
+            Some(PatternDescriptor::SimpleConstant(_))
+        ) && self.base_addrs.len() == 1
     }
 
     /// Replaces: e258_isToggle
@@ -1336,31 +1471,6 @@ impl LoopingChainMutableAddrDescriptor {
         if self.is_valid() { self.init } else { None }
     }
 }
-
-// crustify:todo: e415_isSimpleConstant
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:673  (4 body lines, level 2)
-//   original  : bool isSimpleConstant() const
-//   calls     : e278_isValid
-
-// crustify:todo: e416_clear_all
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:886  (6 body lines, level 2)
-//   original  : void clear_all()
-//   calls     : e274_validate
-
-// crustify:todo: e417_isHeadOfLoopingChain
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:920  (7 body lines, level 2)
-//   original  : bool isHeadOfLoopingChain(const DataTransferDescriptor &desc) const
-//   calls     : e273_isHeadOfChain
-
-// crustify:todo: e418_getOffset
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1073  (7 body lines, level 2)
-//   original  : Value getOffset(const EvaluatedValue &new_immut_addr_ev) override
-//   calls     : e009_createOffsetValue, e257_getBaseAddr
-
-// crustify:todo: e419_turnHBMConstantOpAddrsToQueryMapsInUniformRegions
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1579  (13 body lines, level 2)
-//   original  : void AddressPinningAndTogglePass:: turnHBMConstantOpAddrsToQueryMapsInUniformRegions( dataflow::ProgramUnitOp unit)
-//   calls     : e275_turnHBMConstantOpAddrsToQueryMapsHelper
 
 // crustify:todo: e485_getX
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:227  (5 body lines, level 3)
@@ -2181,6 +2291,27 @@ mod unit_tests {
             todo!("e407-e414 build no value")
         }
 
+        fn build_offset_value_of(
+            &mut self,
+            immutable: EvaluatedValue,
+            sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            ty: ScalarTy,
+        ) -> Val {
+            let value = self.value(immutable);
+            let result = sites.values.mint();
+            sites
+                .consts
+                .push(Op::Sentient(sentient::Op::ScalarConstant {
+                    value,
+                    result,
+                    reg_locale: RegType::Imm,
+                    ty,
+                    is_symbol: false,
+                }));
+            result
+        }
+
         fn constant(&mut self, value: i64) -> EvaluatedValue {
             self.hold(value)
         }
@@ -2189,6 +2320,15 @@ mod unit_tests {
         /// stride with, so a separately interned zero must compare EQUAL to a zero stride.
         fn values_equal(&mut self, lhs: EvaluatedValue, rhs: EvaluatedValue) -> bool {
             self.value(lhs) == self.value(rhs)
+        }
+
+        fn evaluate_sub_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            let difference = self.value(lhs) - self.value(rhs);
+            self.hold(difference)
         }
 
         fn evaluate_sum_handle(
@@ -2490,5 +2630,130 @@ mod unit_tests {
         };
         assert_eq!(symbolic.min(&mut evaluator), None);
         assert_eq!(symbolic.max(&mut evaluator), None);
+    }
+    /// 415/656 — the specialised `isValid()`: ⛔ a simple constant holding anything other than exactly
+    /// one base address is refused, and so is every other arm.
+    #[test]
+    fn e415_a_simple_constant_needs_exactly_one_stored_base_address() {
+        let simple = PatternDescriptor::SimpleConstant(SimpleConstantDescriptor {
+            ev: EvaluatedValue(7),
+        });
+        assert!(transfer(Some(simple.clone()), 1).is_simple_constant());
+        assert!(!transfer(Some(simple.clone()), 2).is_simple_constant());
+        assert!(!transfer(Some(simple), 0).is_simple_constant());
+        assert!(!transfer(None, 1).is_simple_constant());
+        assert!(
+            !transfer(Some(PatternDescriptor::Toggle(matched_toggle())), 2).is_simple_constant()
+        );
+    }
+
+    /// 416/656 — ⭐ the descriptors go with the bits: the owning `Vec`'s clear IS e489's delete loop.
+    #[test]
+    fn clear_all_empties_the_descriptors_and_their_chaining_bits() {
+        let mut container = DataTransferDescriptorContainer::default();
+        container.descriptors.push(transfer(None, 1));
+        container.set_chaining_info(DescriptorId(0), ChainFlag::PartOfChain, true);
+        container.clear_all();
+        assert_eq!(container, DataTransferDescriptorContainer::default());
+    }
+
+    /// 417/656 — ⭐ THE GUARD THAT DOES FIRE: the tail link of a chain carries `kHeadOfLoopingChain`
+    /// (its result is what the loop yields) with `kHeadOfChain` cleared, and it is not a looping head.
+    #[test]
+    fn head_of_looping_chain_refuses_a_looping_tail_link() {
+        let mut container = DataTransferDescriptorContainer::default();
+        let tail = DescriptorId(0);
+        container.set_chaining_info(tail, ChainFlag::PartOfChain, true);
+        container.set_chaining_info(tail, ChainFlag::HeadOfLoopingChain, true);
+        assert!(!container.is_head_of_looping_chain(tail));
+        // The same bits on the chain's head, which is what `computeChainingInfo` gives a one-link one.
+        container.set_chaining_info(tail, ChainFlag::HeadOfChain, true);
+        assert!(container.is_head_of_looping_chain(tail));
+    }
+
+    /// 418/656 — `old_immutable - pinned_addr`, built into the `const_builder`'s block.
+    #[test]
+    fn e418_the_offset_is_the_stored_base_addr_minus_the_pinned_one() {
+        let mut evaluator = StatedEvaluator::default();
+        let base_addr = evaluator.constant(4096);
+        let pinned = evaluator.constant(1024);
+        let mut dtd = transfer(
+            Some(PatternDescriptor::SimpleConstant(
+                SimpleConstantDescriptor { ev: base_addr },
+            )),
+            1,
+        );
+        dtd.base_addrs = vec![base_addr];
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut walked = Vec::new();
+        let offset = {
+            let mut sites = OffsetSites {
+                consts: &mut consts,
+                query_maps: None,
+                values: &mut values,
+            };
+            SimpleConstantDataTransferUpdater.get_offset(
+                &dtd,
+                pinned,
+                ScalarTy::Index,
+                &mut evaluator,
+                &mut sites,
+                &mut walked,
+            )
+        };
+        assert_eq!(offset, Val(0));
+        assert_eq!(consts, vec![scalar_const(0, 4096 - 1024)]);
+        assert!(walked.is_empty());
+    }
+
+    /// 419/656 — the pre-order walk reaches a region op nested in a loop, and ⭐ the constants e275
+    /// built land at the FRONT of the preamble in creation order: one `const_builder`, positioned at
+    /// the enclosing function's entry block before the walk starts.
+    #[test]
+    fn a_constant_hbm_addr_inside_a_loop_is_query_mapped_and_its_constants_head_the_preamble() {
+        let mut preamble = vec![
+            get_unit(1, DfirUnit::Hbm),
+            get_unit(2, DfirUnit::Hbm),
+            get_unit(3, DfirUnit::Pe),
+            scalar_const(4, 64),
+        ];
+        let mut unit_body = vec![Op::Sentient(sentient::Op::For {
+            iv: Val(11),
+            bound: Val(12),
+            bound_reg: None,
+            carried: Vec::new(),
+            dbg_name: None,
+            body: vec![Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![LocalRegion {
+                    arg: Val(5),
+                    units: vec![Val(1), Val(2)],
+                    body: vec![load_and_store(1, 3, 4, 6)],
+                }],
+                results: Vec::new(),
+            })],
+        })];
+        let mut values = Values::default();
+        for _ in 0..13 {
+            let _ = values.mint();
+        }
+
+        turn_hbm_constant_op_addrs_to_query_maps_in_uniform_regions(
+            &mut unit_body,
+            &mut preamble,
+            &mut values,
+        );
+
+        assert_eq!(preamble[0], scalar_const(13, 64));
+        assert_eq!(preamble[1], scalar_const(14, 64));
+        assert_eq!(preamble[2], get_unit(1, DfirUnit::Hbm));
+        let Op::Sentient(sentient::Op::For { body, .. }) = &unit_body[0] else {
+            panic!("the loop the walk descended into")
+        };
+        let Op::UniformRegions(region_op) = &body[0] else {
+            panic!("the region op the walk handed to e275")
+        };
+        // The mapping, its query and the transfer now reading the queried address.
+        assert_eq!(region_op.regions()[0].body[2], load_and_store(1, 3, 16, 6));
     }
 }
