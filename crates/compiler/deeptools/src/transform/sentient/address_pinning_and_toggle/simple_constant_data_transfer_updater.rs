@@ -175,6 +175,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{Val, sentient};
+    use crate::transform::sentient::address_pinning_and_toggle::DescriptorMemoryUnit;
     use crate::transform::sentient::analyses::{Evaluation, OffsetSites, RegionSite};
 
     /// The transfer whose two addresses these updaters rewrite — `load_and_send` with the mutable
@@ -233,6 +234,7 @@ mod unit_tests {
             pattern_desc: None,
             base_addrs: vec![EvaluatedValue(7)],
             region: RegionSite::ProgramUnitBody,
+            memory_unit: DescriptorMemoryUnit::Lx,
         };
         let mut op = load_and_send();
         SimpleConstantDataTransferUpdater.update_immutable_addr(
@@ -320,6 +322,7 @@ mod unit_tests {
             pattern_desc: None,
             base_addrs: vec![EvaluatedValue(7)],
             region: RegionSite::ProgramUnitBody,
+            memory_unit: DescriptorMemoryUnit::Lx,
         };
         // `mutable_addr_[0]` is the `sentient.scalar_constant` the DT_CHECK insists on.
         let body = [Op::Sentient(sentient::Op::ScalarConstant {

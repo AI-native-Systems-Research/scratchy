@@ -78,12 +78,7 @@
 //! | `e493_dump` | 493 | 3 | 20 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2877` |
 
 
-// crustify:todo: e493_dump
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2877  (20 body lines, level 3)
-//   original  : void IntegerSequenceDescriptor::dump() const
-//   calls     : e002_getAllConstants, e252_size, e278_isValid, e279_canBeSimplified, e408_getAllConstants
-
-
+use super::{BaseAddrList, write_evaluated_value};
 use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator};
 use crate::transform::sentient::utils::{ChainSize, ConstKind, is_constant};
@@ -236,6 +231,54 @@ impl IntegerSequenceDescriptor {
         let zero = evaluator.constant(0);
         desc.can_be_simplified = desc.size == SequenceSize::Terms(1) || stride == zero;
         desc
+    }
+
+    /// Replaces: e493_dump
+    ///
+    /// The sequence's own record: init, stride and term count, then every address it visits
+    /// (`:2877-2896`).
+    ///
+    /// ⛔ IT TAKES THE EVALUATOR BECAUSE `getAllConstants` DOES — the reference reads the one
+    /// `evaluator_` reference its descriptor holds, which this port passes instead (see
+    /// [`super::DataTransferDescriptor`]).
+    #[must_use]
+    pub fn dump(&self, evaluator: &mut impl ExpressionEvaluator) -> String {
+        let mut out = String::from("Constant Integer Sequence Descriptor:\n");
+        if !self.is_valid() {
+            out.push_str("\tInvalid\n");
+            return out;
+        }
+        if self.can_be_simplified {
+            out.push_str("\t(Simplified)\n");
+        }
+        out.push_str("\tinit:");
+        write_evaluated_value(self.init, &mut out);
+        // ⭐ THE STRAY SPACE IS THE REFERENCE'S OWN: `"; \n " << indent` (`:2887`).
+        out.push_str(";\n \tstride:");
+        write_evaluated_value(self.stride, &mut out);
+        out.push_str(";\n\tsize:");
+        // `os << size_` — the tri-state `int` back as the number it was.
+        let size = match self.size {
+            SequenceSize::Cleared => 0,
+            SequenceSize::Symbolic => -1,
+            SequenceSize::Terms(terms) => i64::from(terms),
+        };
+        out.push_str(&size.to_string());
+        out.push('\n');
+        let mut constants = BaseAddrList::new();
+        self.get_all_constants(&mut constants, evaluator);
+        out.push_str("\tConstants (");
+        out.push_str(&constants.len().to_string());
+        out.push_str(") [\n");
+        for (index, ev) in constants.iter().enumerate() {
+            if index > 0 {
+                out.push_str(";\n");
+            }
+            out.push('\t');
+            write_evaluated_value(Some(*ev), &mut out);
+        }
+        out.push_str("\t]\n");
+        out
     }
 }
 
@@ -438,5 +481,16 @@ mod unit_tests {
         assert_eq!(desc.size, SequenceSize::Symbolic);
         assert_eq!(desc.init, None);
         assert_eq!(desc.stride, None);
+    }
+
+    /// `e493` — an invalid sequence dumps the header and `Invalid`, asking the evaluator nothing.
+    /// ⛔ A MATCHED ONE CANNOT BE ASSERTED ON: `init:` stops in the out-of-scope `operator<<`.
+    #[test]
+    fn e493_an_invalid_descriptor_dumps_the_header_and_invalid() {
+        let desc = IntegerSequenceDescriptor::default();
+        assert_eq!(
+            desc.dump(&mut OutOfScopeEvaluator::default()),
+            "Constant Integer Sequence Descriptor:\n\tInvalid\n"
+        );
     }
 }

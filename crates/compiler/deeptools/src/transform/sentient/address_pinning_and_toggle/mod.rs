@@ -169,6 +169,7 @@ pub(crate) mod simple_constant_descriptor;
 pub(crate) mod toggle_data_transfer_updater;
 pub(crate) mod toggle_descriptor;
 
+use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{
@@ -182,7 +183,7 @@ use crate::units::DfirUnit;
 use looping_chain_mutable_addr_descriptor::TransferEnd;
 
 pub use conditional_constant_descriptor::ConditionalConstantDescriptor;
-pub use data_transfer_descriptor::DataTransferDescriptor;
+pub use data_transfer_descriptor::{DataTransferDescriptor, DescriptorMemoryUnit};
 pub use data_transfer_descriptor_container::{
     ChainFlag, ChainFlags, DataTransferDescriptorContainer, DescriptorId,
 };
@@ -357,6 +358,54 @@ fn iter_operand_of(
     carried
         .get(iter_arg_index.0 as usize)
         .map(|entry| entry.init)
+}
+
+/// `outer_loop_.setIterOperand(iter_arg_index_, v)` — the WRITE half of [`iter_operand_of`], which
+/// e490 and the toggle updaters (`:2006`, `:2036`) perform once the pinned base address is chosen.
+///
+/// ⭐ THE LOOP IS FOUND BY ITS INDUCTION VARIABLE at whatever depth, because that is what a
+/// [`ForRef`] names; an index the walk produced is in range, and out of range writes nothing.
+pub(super) fn set_iter_operand(
+    body: &mut [Op],
+    outer_loop: ForRef,
+    iter_arg_index: IterArgIndex,
+    val: Val,
+) {
+    for op in body {
+        if let Op::Sentient(sentient::Op::For { iv, carried, .. }) = op
+            && *iv == outer_loop.0
+        {
+            if let Some(entry) = carried.get_mut(iter_arg_index.0 as usize) {
+                entry.init = val;
+            }
+            return;
+        }
+        for region in dialects::regions_mut(op) {
+            set_iter_operand(region, outer_loop, iter_arg_index, val);
+        }
+    }
+}
+
+/// THE OP AT A POSITION — this module's copy of
+/// [`address_register_precision_assignment`](crate::transform::sentient::address_register_precision_assignment)'s
+/// walk, regions concatenated, which is the numbering [`OpId`] documents. `DataTransferDescriptor`
+/// names its transfer by position, so every unit that has to READ that op comes through here.
+pub(super) fn op_at<'a>(id: &OpId, scope: &'a [Op]) -> Option<&'a Op> {
+    let (&ordinal, rest) = id.path().split_first()?;
+    let op = scope.get(ordinal as usize)?;
+    let Some(&next) = rest.first() else {
+        return Some(op);
+    };
+    let mut base = 0usize;
+    for region in dialects::regions_ref(op) {
+        if (next as usize) < base + region.len() {
+            let mut sub: Vec<u32> = rest.to_vec();
+            sub[0] = (next as usize - base) as u32;
+            return op_at(&OpId::at(&sub), region);
+        }
+        base += region.len();
+    }
+    None
 }
 
 /// Replaces: e009_createOffsetValue
@@ -607,7 +656,12 @@ pub(crate) fn write_evaluated_value(ev: Option<EvaluatedValue>, _out: &mut Strin
 /// `data_transfer_descriptor.rs`), a later unit.
 ///
 /// ⚠️ `UNITS.tsv` RECORDS e014's CALLS AS `-`: the call resolves through a virtual `dump()` the
-/// extractor's detector did not follow. This trait is the seam e492 lands into later.
+/// extractor's detector did not follow.
+///
+/// ⛔ `e492_dump` DOES NOT IMPLEMENT THIS AND CANNOT: `os << op_` needs the body its [`OpId`] names
+/// and its integer-sequence arm needs the evaluator `getAllConstants` asks, neither of which a bare
+/// `&self` carries — see [`DataTransferDescriptor::dump`]. Whichever unit ports e014's callers
+/// (`:1350-1354`, `:1371-1375`) has both in hand and binds them here.
 pub trait DumpDescriptor {
     /// `dtd->dump()` (`:1669`) — one descriptor's block, `----------` delimited.
     fn dump(&self) -> String;
@@ -734,24 +788,34 @@ struct ConstantHbmAddr {
 /// this answers `false`. And the reference's fourth arm — an op that is none of the three — answers
 /// with the ENCLOSING `dataflow.program_unit`'s own type, which is never the HBM.
 fn is_hbm(val: Val, defs: Definitions<'_>) -> bool {
+    unit_type_of(val, defs) == Some(DfirUnit::Hbm)
+}
+
+/// `dcc::getUnitType(val.getDefiningOp())` ITSELF (`dcc/src/Utils/DccExtContext.cpp:191-206`) — which
+/// unit the value lives on, `None` where the reference aborts or answers with the enclosing
+/// `dataflow.program_unit`. [`is_hbm`] is the `== HBM` of it, and
+/// `getMutableAddrResultIndex`'s `src_unit == mem_unit` (`Analyses/Utils.cpp:544-549`) is the general
+/// question.
+pub(super) fn unit_type_of(val: Val, defs: Definitions<'_>) -> Option<DfirUnit> {
     match defs.of(val) {
-        Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) => *unit == DfirUnit::Hbm,
+        Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) => Some(*unit),
         // `getUnitType(QueryMapOp)`: every QUERIED VALUE must be a `get_unit`, and
-        // `DT_CHECK_MSG(type == unit_type, ..)` says they all agree — so "all HBM" is "is HBM", and
-        // the empty mapping its `DT_CHECK_MSG(!units.empty(), ..)` rejects answers `false`.
-        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => match defs.of(*map) {
-            Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => {
-                !pairs.is_empty()
-                    && pairs.iter().all(|(_, value)| {
-                        matches!(
-                            defs.of(*value),
-                            Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) if *unit == DfirUnit::Hbm
-                        )
-                    })
-            }
-            _ => false,
-        },
-        _ => false,
+        // `DT_CHECK_MSG(type == unit_type, ..)` says they all agree — so the mapping's one agreed
+        // unit is the answer, and the empty mapping its `DT_CHECK_MSG(!units.empty(), ..)` rejects
+        // has none.
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => {
+            let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(*map)
+            else {
+                return None;
+            };
+            let mut units = pairs.iter().map(|(_, value)| match defs.of(*value) {
+                Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) => Some(*unit),
+                _ => None,
+            });
+            let first = units.next().flatten()?;
+            units.all(|unit| unit == Some(first)).then_some(first)
+        }
+        _ => None,
     }
 }
 
@@ -1724,6 +1788,7 @@ mod unit_tests {
             pattern_desc,
             base_addrs: (0..base_addrs).map(|i| EvaluatedValue(i as u32)).collect(),
             region: RegionSite::default(),
+            memory_unit: DescriptorMemoryUnit::Lx,
         }
     }
 
@@ -1935,6 +2000,7 @@ mod unit_tests {
             pattern_desc: Some(kind),
             base_addrs: vec![EvaluatedValue(64)],
             region: RegionSite::default(),
+            memory_unit: DescriptorMemoryUnit::Lx,
         }
     }
 

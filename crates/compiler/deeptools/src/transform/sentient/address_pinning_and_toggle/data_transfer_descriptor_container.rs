@@ -78,15 +78,15 @@
 //! | `e423_lookup` | 423 | 2 | 11 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2179` |
 //! | `e491_computeChainingInfo` | 491 | 3 | 120 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2192` |
 
-// crustify:todo: e491_computeChainingInfo
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2192  (120 body lines, level 3)
-//   original  : void DataTransferDescriptorContainer::computeChainingInfo()
-//   calls     : e007_isPartOfSomeChain, e008_setChainingInfo, e252_size, e273_isHeadOfChain, e278_isValid, e417_isHeadOfLoopingChain, e423_lookup
-
 use std::collections::BTreeMap;
 
-use super::DataTransferDescriptor;
+use super::looping_chain_mutable_addr_descriptor::mutable_addr_of;
+use super::{DataTransferDescriptor, TransferEnd, op_at, unit_type_of};
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
+use crate::islands::sentient::dialects::{
+    self, Definitions, Op, Val, results, sentient, use_count,
+};
+use crate::units::DfirUnit;
 
 /// WHICH DESCRIPTOR — a position in [`DataTransferDescriptorContainer::descriptors`].
 ///
@@ -205,10 +205,322 @@ impl DataTransferDescriptorContainer {
     }
 }
 
+impl DataTransferDescriptorContainer {
+    /// Replaces: e491_computeChainingInfo
+    ///
+    /// WRITES EVERY CHAINING BIT THIS CONTAINER HOLDS (`:2192-2311`): pass one decides part-of/head-of
+    /// chain from what feeds each transfer's mutable address, pass two walks each chain forward to see
+    /// whether it closes through its own loop's yield and re-heads whatever consumes the loop result.
+    ///
+    /// ⛔ ALL THREE `LLVM_DEBUG`/`DEBUG_WITH_TYPE` BLOCKS ARE TRACING, and the trailing one only reads
+    /// e007/e273/e417 back.
+    /// ⛔ THE `while (!found)` LOOP ADVANCES ONLY THROUGH TRANSFERS: every other user breaks it, so a
+    /// chain that reaches anything else is not looping.
+    pub fn compute_chaining_info(&mut self, unit_body: &[Op]) {
+        let regions: [&[Op]; 1] = [unit_body];
+        let defs = Definitions::from_innermost(&regions);
+
+        for index in 0..self.descriptors.len() {
+            let curr = DescriptorId(index as u32);
+            let desc = &self.descriptors[index];
+            if !desc.is_valid() {
+                continue;
+            }
+            let unit = desc.memory_unit.dfir_unit();
+            let op_id = desc.op.clone();
+            let Some(op) = op_at(&op_id, unit_body) else {
+                todo!("computeChainingInfo: DT_CHECK(at(i)) — no op at {op_id:?} (:2196)")
+            };
+            let mutable_addr = mutable_addr_for_unit(op, unit, defs);
+            // `!isa<BlockArgument>(mutable_addr)` IS "it has a defining op", and its position is the
+            // key `lookup` answers about.
+            let defining = defining_op_id(unit_body, mutable_addr);
+            let fed_by_transfer = defining
+                .as_ref()
+                .and_then(|id| op_at(id, unit_body))
+                .is_some_and(is_transfer);
+
+            if fed_by_transfer {
+                self.set_chaining_info(curr, ChainFlag::PartOfChain, true);
+                self.set_chaining_info(curr, ChainFlag::HeadOfChain, false);
+                // The transfer feeding this address is the chain's head when ITS own mutable address
+                // comes from outside the chain (`:2220-2234`).
+                let head = defining.as_ref().and_then(|id| self.lookup(id));
+                if let Some(head) = head {
+                    let head_desc = &self.descriptors[head.0 as usize];
+                    let head_unit = head_desc.memory_unit.dfir_unit();
+                    let head_op_id = head_desc.op.clone();
+                    let Some(head_op) = op_at(&head_op_id, unit_body) else {
+                        todo!(
+                            "computeChainingInfo: no op at {head_op_id:?} for the potential head \
+                             (:2226-2229)"
+                        )
+                    };
+                    let head_addr = mutable_addr_for_unit(head_op, head_unit, defs);
+                    let head_fed_by_transfer = defining_op_id(unit_body, head_addr)
+                        .and_then(|id| op_at(&id, unit_body).cloned())
+                        .is_some_and(|op| is_transfer(&op));
+                    if !head_fed_by_transfer {
+                        self.set_chaining_info(head, ChainFlag::PartOfChain, true);
+                        self.set_chaining_info(head, ChainFlag::HeadOfChain, true);
+                    }
+                }
+            } else if results(op)
+                .iter()
+                .all(|val| use_count(*val, unit_body) == 0)
+            {
+                // `curr_desc.getOperation().use_empty()` — nothing reads this transfer at all.
+                self.set_chaining_info(curr, ChainFlag::PartOfChain, false);
+                self.set_chaining_info(curr, ChainFlag::HeadOfChain, false);
+            } else if defining.is_none()
+                && use_count(
+                    mutable_addr_result_of(op, mutable_addr_end(op, unit, defs)),
+                    unit_body,
+                ) == 1
+            {
+                // The loop-carried case: the address arrives as an iter arg and the result it produces
+                // is read once (`:2242-2252`).
+                self.set_chaining_info(curr, ChainFlag::PartOfChain, true);
+                self.set_chaining_info(curr, ChainFlag::HeadOfChain, true);
+            }
+        }
+
+        for index in 0..self.descriptors.len() {
+            let curr = DescriptorId(index as u32);
+            let desc = &self.descriptors[index];
+            if !desc.is_valid() {
+                continue;
+            }
+            let unit = desc.memory_unit.dfir_unit();
+            let op_id = desc.op.clone();
+            let Some(op) = op_at(&op_id, unit_body) else {
+                todo!("computeChainingInfo: no op at {op_id:?} in the looping-chain pass (:2258)")
+            };
+            let mut curr_val = mutable_addr_result_of(op, mutable_addr_end(op, unit, defs));
+            let parent = parent_for_of(&op_id, unit_body);
+            let mut reached_a_yield = false;
+            loop {
+                if use_count(curr_val, unit_body) != 1 {
+                    break;
+                }
+                let Some(user) =
+                    using_op_id(unit_body, curr_val).and_then(|id| op_at(&id, unit_body))
+                else {
+                    break;
+                };
+                if is_transfer(user) {
+                    // ⭐ THE UNIT STAYS `curr_desc`'s, not the user's — the reference passes
+                    // `curr_desc.getMemoryUnit()` all the way down (`:2266-2267`).
+                    curr_val = mutable_addr_result_of(user, mutable_addr_end(user, unit, defs));
+                    continue;
+                }
+                reached_a_yield = matches!(user, Op::Sentient(sentient::Op::Yield { .. }));
+                break;
+            }
+            // `yield_op->getParentOp()` being `curr_desc.getOperation().getParentOp()` and yielding
+            // `curr_val` is one question here: `curr_val` has a single use, so a parent loop that
+            // yields it IS that use (`:2268-2275`).
+            let found =
+                reached_a_yield && parent.is_some_and(|(yielded, _)| yielded.contains(&curr_val));
+            self.set_chaining_info(curr, ChainFlag::HeadOfLoopingChain, found);
+
+            // The chain can continue AFTER the loop, through the loop result carrying `curr_val`
+            // (`:2280-2303`).
+            if found && let Some((yielded, carried)) = parent {
+                let for_result = yielded
+                    .iter()
+                    .position(|val| *val == curr_val)
+                    .and_then(|res_idx| carried.get(res_idx))
+                    .map(|entry| entry.result);
+                let Some(for_result) = for_result else {
+                    todo!(
+                        "computeChainingInfo: DT_CHECK(res_idx >= 0 && res_idx < \
+                         inner_for_op.getNumResults()) — {curr_val:?} is yielded at a position the \
+                         loop carries nothing for (:2290-2292)"
+                    )
+                };
+                if use_count(for_result, unit_body) == 1
+                    && let Some(user_id) = using_op_id(unit_body, for_result)
+                    && op_at(&user_id, unit_body).is_some_and(is_transfer)
+                    && let Some(consumer) = self.lookup(&user_id)
+                {
+                    self.set_chaining_info(consumer, ChainFlag::HeadOfChain, false);
+                    self.set_chaining_info(consumer, ChainFlag::PartOfChain, true);
+                }
+            }
+        }
+    }
+}
+
+/// THE THREE OPS THE CHAINING WALK FOLLOWS — `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>`
+/// (`:2216-2218`, `:2263-2264`, `:2296-2297`).
+///
+/// ⛔ `LoadAndExtractScalarOp` AND `LoadComputeAndSendOp` ARE DELIBERATELY ABSENT — "they are not
+/// supported outside LX" (`:2213-2214`), and they are absent from all three of those `isa` lists.
+fn is_transfer(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Sentient(
+            sentient::Op::LoadAndSend { .. }
+                | sentient::Op::ReceiveAndStore { .. }
+                | sentient::Op::LoadAndStore { .. }
+        )
+    )
+}
+
+/// `dcc::utils::getMutableAddrResultIndex(op, mem_unit)` (`Analyses/Utils.cpp:536-555`) as WHICH END
+/// of the transfer carries `unit`'s address.
+///
+/// ⛔ THE `-1` IS NOT EXPRESSIBLE AS AN END, AND EVERY CALLER HERE DEREFERENCES IT: e491 feeds this
+/// index straight into `getResult(..)` (`:2245-2248`, `:2260-2261`) and into
+/// `getMutableAndImmutableAddr`, whose `{nullptr, nullptr}` then meets an `isa<BlockArgument>`
+/// (`:2216`). Both are the reference's own stop, so the two non-answers stay named stops here.
+fn mutable_addr_end(op: &Op, unit: DfirUnit, defs: Definitions<'_>) -> TransferEnd {
+    match op {
+        // `return 0` for the three single-address ops, and `getAddrResultIdx()` for
+        // `LoadAndExtractScalarOp`, whose ONE address is its [`TransferEnd::Src`] here.
+        Op::Sentient(
+            sentient::Op::LoadAndSend { .. }
+            | sentient::Op::ReceiveAndStore { .. }
+            | sentient::Op::LoadComputeAndSend { .. }
+            | sentient::Op::LoadAndExtractScalar { .. },
+        ) => TransferEnd::Src,
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src,
+            dst,
+            is_ibr_write,
+            ..
+        }) => {
+            if unit_type_of(*src, defs) == Some(unit) {
+                TransferEnd::Src
+            } else if unit_type_of(*dst, defs) == Some(unit) {
+                TransferEnd::Dst
+            } else if *is_ibr_write {
+                todo!(
+                    "getMutableAddrResultIndex: llvm_unreachable(\"cannot obtain mem_unit addr \
+                     from this operation\") — an IBR-write sentient.load_and_store with neither end \
+                     on {unit:?} (Analyses/Utils.cpp:550-554)"
+                )
+            } else {
+                todo!(
+                    "computeChainingInfo: getMutableAddrResultIndex answered -1 for the {unit:?} \
+                     address of a sentient.load_and_store, which the reference then hands to \
+                     getResult/isa<BlockArgument> (:2216, Analyses/Utils.cpp:550-551)"
+                )
+            }
+        }
+        _ => todo!(
+            "getMutableAddrResultIndex: llvm_unreachable(\"cannot obtain mem_unit addr from this \
+             operation\") on {op:?} (Analyses/Utils.cpp:554)"
+        ),
+    }
+}
+
+/// `op.getResult(getMutableAddrResultIndex(op, mem_unit))` — the SSA value the next link of a chain
+/// reads as its own mutable address.
+fn mutable_addr_result_of(op: &Op, end: TransferEnd) -> Val {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { result, .. }
+            | sentient::Op::ReceiveAndStore { result, .. }
+            | sentient::Op::LoadComputeAndSend { result, .. },
+        ) => *result,
+        // `getAddrResultIdx()` names the ADDRESS result, never the extracted datum.
+        Op::Sentient(sentient::Op::LoadAndExtractScalar { addr_result, .. }) => *addr_result,
+        Op::Sentient(sentient::Op::LoadAndStore { results, .. }) => match end {
+            TransferEnd::Src => results.0,
+            TransferEnd::Dst => results.1,
+        },
+        _ => todo!(
+            "computeChainingInfo: getResult(getMutableAddrResultIndex(..)) on {op:?}, which binds no \
+             address result (Analyses/Utils.cpp:554)"
+        ),
+    }
+}
+
+/// `dcc::utils::getMutableAndImmutableAddr(op, mem_unit).first` (`Analyses/Utils.cpp:556-567`).
+fn mutable_addr_for_unit(op: &Op, unit: DfirUnit, defs: Definitions<'_>) -> Val {
+    mutable_addr_of(op, mutable_addr_end(op, unit, defs))
+}
+
+/// `val.getDefiningOp()` AS A POSITION — `None` for the reference's `isa<BlockArgument>(val)`, which
+/// is exactly the value no op in this scope defines.
+fn defining_op_id(unit_body: &[Op], val: Val) -> Option<OpId> {
+    find_op_id(
+        unit_body,
+        0,
+        &|op| results(op).contains(&val),
+        &mut Vec::new(),
+    )
+}
+
+/// `*val.user_begin()` AS A POSITION — only meaningful where `val` has exactly one use, which both
+/// callers check first.
+fn using_op_id(unit_body: &[Op], val: Val) -> Option<OpId> {
+    find_op_id(
+        unit_body,
+        0,
+        &|op| dialects::operands(op).contains(&val),
+        &mut Vec::new(),
+    )
+}
+
+/// THE POSITION OF THE FIRST OP SATISFYING `pred`, in the regions-concatenated numbering [`op_at`]
+/// reads back — `base` is where the region being walked starts in its owner's flattened child list.
+fn find_op_id(
+    scope: &[Op],
+    base: u32,
+    pred: &dyn Fn(&Op) -> bool,
+    prefix: &mut Vec<u32>,
+) -> Option<OpId> {
+    for (index, op) in scope.iter().enumerate() {
+        prefix.push(base + index as u32);
+        if pred(op) {
+            let id = OpId::at(prefix);
+            prefix.pop();
+            return Some(id);
+        }
+        let mut offset = 0u32;
+        for region in dialects::regions_ref(op) {
+            if let Some(found) = find_op_id(region, offset, pred, prefix) {
+                prefix.pop();
+                return Some(found);
+            }
+            offset += region.len() as u32;
+        }
+        prefix.pop();
+    }
+    None
+}
+
+/// THE `sentient.for` HOLDING THE OP AT `id`, as its terminator's yielded operands and its carried
+/// entries — `getParentOp()` off a position is its block prefix (see [`OpId::block`]).
+fn parent_for_of<'a>(
+    id: &OpId,
+    unit_body: &'a [Op],
+) -> Option<(&'a [Val], &'a [sentient::Carried])> {
+    let Op::Sentient(sentient::Op::For { carried, body, .. }) =
+        op_at(&OpId::at(id.block()), unit_body)?
+    else {
+        return None;
+    };
+    let Some(Op::Sentient(sentient::Op::Yield { results })) = body.last() else {
+        return None;
+    };
+    Some((results, carried))
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::transform::sentient::analyses::RegionSite;
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::islands::sentient::dialects::sentient::{
+        Carried, Extent, Reg, RegType, ShuffleMode,
+    };
+    use crate::transform::sentient::address_pinning_and_toggle::DescriptorMemoryUnit;
+    use crate::transform::sentient::analyses::{EvaluatedValue, RegionSite};
 
     /// One transfer describing the op at `path` — `op_` is the only field either unit reads.
     fn transfer(path: &[u32]) -> DataTransferDescriptor {
@@ -217,6 +529,7 @@ mod unit_tests {
             pattern_desc: None,
             base_addrs: Vec::new(),
             region: RegionSite::default(),
+            memory_unit: DescriptorMemoryUnit::Lx,
         }
     }
 
@@ -257,5 +570,121 @@ mod unit_tests {
         assert_eq!(container.lookup(&OpId::at(&[0])), Some(DescriptorId(0)));
         assert_eq!(container.lookup(&OpId::at(&[3])), None);
         assert_eq!(container.lookup(&OpId::at(&[1])), None);
+    }
+
+    /// One `sentient.load_and_send` reading `mutable_addr` and binding `result` — the two fields the
+    /// chaining walk follows.
+    fn load_and_send(mutable_addr: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr,
+            immutable_addr: Val(90),
+            increment: Val(91),
+            consumer: SendEnd::to_self(Val(92)),
+            result,
+            extent: Extent {
+                total_elements: Elements(64),
+                element_size: Bits(16),
+                chunk_size: Elements(1),
+                chunk_stride: Elements(1),
+                burst_size: Elements(1),
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    /// A VALID transfer at `path` — one base address is what [`DataTransferDescriptor::is_valid`]
+    /// needs with no pattern, and `computeChainingInfo` skips anything invalid.
+    fn chained(path: &[u32]) -> DataTransferDescriptor {
+        DataTransferDescriptor {
+            base_addrs: vec![EvaluatedValue(0)],
+            ..transfer(path)
+        }
+    }
+
+    /// The vendor's own two cases in one nest (`:2203-2212`): a loop-carried address chained into a
+    /// second transfer whose yielded result feeds a third after the loop.
+    ///
+    /// ⭐ THE THIRD DESCRIPTOR PROVES e008's ASYMMETRY: pass one clears both its bits, inserting NO
+    /// entry, and pass two's post-loop arm is what puts it in the chain.
+    #[test]
+    fn e491_heads_the_carried_transfer_chains_the_second_and_re_heads_the_loops_consumer() {
+        let unit_body = vec![
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: 0,
+                result: Val(0),
+                reg_locale: RegType::Imm,
+                ty: crate::islands::dataflow_ir::ty::ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(1),
+                bound: Val(0),
+                bound_reg: None,
+                carried: vec![Carried {
+                    init: Val(0),
+                    arg: Val(2),
+                    result: Val(3),
+                    reg: Reg {
+                        locale: RegType::Unknown,
+                        index: None,
+                    },
+                    program_header: false,
+                    element_size: None,
+                }],
+                dbg_name: None,
+                body: vec![
+                    load_and_send(Val(2), Val(4)),
+                    load_and_send(Val(4), Val(5)),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![Val(5)],
+                    }),
+                ],
+            }),
+            load_and_send(Val(3), Val(6)),
+        ];
+        let mut container = DataTransferDescriptorContainer::default();
+        let carried = container.insert(chained(&[1, 0]));
+        let inner = container.insert(chained(&[1, 1]));
+        let consumer = container.insert(chained(&[2]));
+
+        container.compute_chaining_info(&unit_body);
+
+        // The carried transfer is the head of a chain that closes through its own loop's yield.
+        assert_eq!(
+            container.chaining_info.get(&carried),
+            Some(&ChainFlags {
+                part_of_chain: true,
+                head_of_chain: true,
+                head_of_looping_chain: true,
+            })
+        );
+        // The second link is in the chain and is not its head — and its own walk reaches the same
+        // yield, so it is a looping head too.
+        assert_eq!(
+            container.chaining_info.get(&inner),
+            Some(&ChainFlags {
+                part_of_chain: true,
+                head_of_chain: false,
+                head_of_looping_chain: true,
+            })
+        );
+        // ⭐ REACHED ONLY BY PASS TWO: pass one saw an unused transfer fed by the loop, not by a
+        // transfer, and cleared two bits into no entry at all.
+        assert_eq!(
+            container.chaining_info.get(&consumer),
+            Some(&ChainFlags {
+                part_of_chain: true,
+                head_of_chain: false,
+                head_of_looping_chain: false,
+            })
+        );
     }
 }

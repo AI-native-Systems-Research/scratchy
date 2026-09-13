@@ -133,6 +133,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
     use crate::islands::sentient::dialects::{Val, sentient};
+    use crate::transform::sentient::address_pinning_and_toggle::DescriptorMemoryUnit;
     use crate::transform::sentient::analyses::RegionSite;
 
     /// 276/656 — the pinned address chosen for the PAIR is handed back, and the transfer's immutable
@@ -164,6 +165,7 @@ mod unit_tests {
             pattern_desc: None,
             base_addrs: vec![EvaluatedValue(7), EvaluatedValue(9)],
             region: RegionSite::ProgramUnitBody,
+            memory_unit: DescriptorMemoryUnit::Lx,
         };
         let mut op = Op::Sentient(sentient::Op::LoadAndSend {
             mutable_addr: Val(1),

@@ -428,13 +428,15 @@ fn carried_result(loop_op: &Op, index: usize) -> Option<Val> {
 /// (`Analyses/Utils.cpp:569-605`); e018 `std::ignore`s the immutable half (`:3219-3221`).
 ///
 /// ⛔ THE REFERENCE'S `LoadAndExtractScalarOp` ARM DEREFERENCES THE FAILED `dyn_cast`
-/// (`Analyses/Utils.cpp:590`, `receive_and_store.getMutableAddr()`); e018's own `isa` filter
-/// (`:3207-3208`, `:3232-3234`) never reaches it, so only the three ops it admits are written here.
-fn mutable_addr_of(op: &Op, end: TransferEnd) -> Val {
+/// (`Analyses/Utils.cpp:590`, `receive_and_store.getMutableAddr()`), so that op alone has no arm; the
+/// other four the `DT_CHECK` admits are all written out, `LoadComputeAndSendOp` because
+/// `computeChainingInfo` (e491) reaches ops e018's `isa` filter (`:3207-3208`, `:3232-3234`) did not.
+pub(super) fn mutable_addr_of(op: &Op, end: TransferEnd) -> Val {
     match op {
         Op::Sentient(
             sentient::Op::LoadAndSend { mutable_addr, .. }
-            | sentient::Op::ReceiveAndStore { mutable_addr, .. },
+            | sentient::Op::ReceiveAndStore { mutable_addr, .. }
+            | sentient::Op::LoadComputeAndSend { mutable_addr, .. },
         ) => *mutable_addr,
         Op::Sentient(sentient::Op::LoadAndStore {
             src_mutable_addr,

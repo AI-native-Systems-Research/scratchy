@@ -79,19 +79,44 @@
 //! | `e492_dump` | 492 | 3 | 28 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2521` |
 //! | `e593_initializeDescriptor` | 593 | 5 | 161 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2316` |
 
-// crustify:todo: e492_dump
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2521  (28 body lines, level 3)
-//   original  : void DataTransferDescriptor::dump() const
-//   calls     : e258_isToggle, e259_isConditionalConstant, e260_isIntegerSequence, e261_isDiscreteIntegerSet, e262_isLoopingChainMutableAddr, e415_isSimpleConstant
-
 // crustify:todo: e593_initializeDescriptor
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2316  (161 body lines, level 5)
 //   original  : void DataTransferDescriptor::initializeDescriptor()
 //   calls     : e002_getAllConstants, e015_getInit, e016_ConditionalConstantDescriptor, e252_size, e278_isValid, e279_canBeSimplified, e280_IntegerSequenceDescriptor, e281_DiscreteIntegerSetDescriptor, e282_LoopingChainMutableAddrDescriptor, e407_getInit, e408_getAllConstants, e411_getInit, e414_getInit, e485_getX …
 
-use super::{BaseAddrList, PatternDescriptor};
+use super::{BaseAddrList, PatternDescriptor, op_at, write_evaluated_value};
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
-use crate::transform::sentient::analyses::RegionSite;
+use crate::islands::sentient::dialects::Op;
+use crate::islands::sentient::print;
+use crate::transform::sentient::analyses::{ExpressionEvaluator, RegionSite};
+use crate::units::DfirUnit;
+
+/// WHICH MEMORY THIS DESCRIPTOR'S ADDRESS LIVES IN — the pure virtual `getMemoryUnit()` (`:671`),
+/// answered `LX` by `LXDataTransferDescriptor` (`:806`) and `HBM` by `HBMDataTransferDescriptor`
+/// (`:827`).
+///
+/// ⭐ A FIELD, NOT TWO TYPES: `collectDataTransfers` (`:1400-1435`) pushes BOTH subclasses into the
+/// one `immut_data_transfer_descriptors_`, so descriptors in a single container disagree about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DescriptorMemoryUnit {
+    /// `LXDataTransferDescriptor` (`:806`).
+    #[default]
+    Lx,
+    /// `HBMDataTransferDescriptor` (`:827`).
+    Hbm,
+}
+
+impl DescriptorMemoryUnit {
+    /// The island's spelling of the same unit, which `getMutableAddrResultIndex` compares against
+    /// `dcc::getUnitType(..)` of each address operand (`Analyses/Utils.cpp:544-549`).
+    #[must_use]
+    pub const fn dfir_unit(self) -> DfirUnit {
+        match self {
+            Self::Lx => DfirUnit::Lx,
+            Self::Hbm => DfirUnit::Hbm,
+        }
+    }
+}
 
 /// ONE DATA TRANSFER'S BASE-ADDRESS STORY — `class DataTransferDescriptor`
 /// (`AddressPinningAndToggle.cpp:632-790`), one per `load_and_send`/`receive_and_store`/
@@ -131,6 +156,9 @@ pub struct DataTransferDescriptor {
     /// both excluded field accessors, and never read apart: every caller pairs them for
     /// `findClosestPinnedAddr` (`:1897`, `:1937`, `:2054`, `:2120`). See [`RegionSite`].
     pub region: RegionSite,
+    /// `getMemoryUnit()` — which of the two subclasses this descriptor is (`:806`, `:827`), read by
+    /// every `getMutableAndImmutableAddr(op, getMemoryUnit())` call. See [`DescriptorMemoryUnit`].
+    pub memory_unit: DescriptorMemoryUnit,
 }
 
 impl DataTransferDescriptor {
@@ -194,16 +222,79 @@ impl DataTransferDescriptor {
         }
         res
     }
+
+    /// Replaces: e492_dump
+    ///
+    /// One transfer's record between two `----------` rules: the op, its base addresses, then its
+    /// matched pattern's own dump (`:2521-2548`).
+    ///
+    /// ⛔ NOT [`super::DumpDescriptor`], WHOSE BARE `&self` CANNOT REACH EITHER ARGUMENT: `os << op_`
+    /// needs the body [`Self::op`] indexes, and the integer-sequence arm's `getAllConstants` needs
+    /// the evaluator. e014's caller has both.
+    /// ⛔ TRAP: `getLocation(..).getLine()` HAS NOTHING TO READ — no op on any rung of this crate's
+    /// islands carries a source location, so the line prints `?`, which is also what the reference's
+    /// own `FileLineColLoc::get(ctx, "unknown", -1, -1)` fallback means (`Utils/Utils.cpp:43-55`).
+    #[must_use]
+    pub fn dump(&self, unit_body: &[Op], evaluator: &mut impl ExpressionEvaluator) -> String {
+        const LINE: &str = "----------";
+        let mut out = String::from(LINE);
+        out.push_str("\n* operation:line:?:");
+        match op_at(&self.op, unit_body) {
+            // `print::emit` ends that line, which is the reference's `<< op_ << "\n"`.
+            Some(op) => print::emit(&mut out, op, 0),
+            None => out.push('\n'),
+        }
+        out.push_str("* base addrs:[\n");
+        for (index, ev) in self.base_addrs.iter().enumerate() {
+            if index > 0 {
+                out.push_str(";\n");
+            }
+            out.push_str("  ");
+            write_evaluated_value(Some(*ev), &mut out);
+        }
+        out.push_str("\n]\n");
+        // The `is*()` chain (`:2536-2547`): each already tests its own variant, so the guards are
+        // that chain and the fallthrough is its `else`.
+        match &self.pattern_desc {
+            Some(PatternDescriptor::SimpleConstant(sc)) if self.is_simple_constant() => {
+                out.push_str(&sc.dump());
+            }
+            Some(PatternDescriptor::Toggle(_)) if self.is_toggle() => {
+                todo!(
+                    "ToggleDescriptor::dump (e553, AddressPinningAndToggle.cpp:2724) — a later \
+                     unit of this campaign"
+                )
+            }
+            Some(PatternDescriptor::ConditionalConstant(cc)) if self.is_conditional_constant() => {
+                out.push_str(&cc.dump());
+            }
+            Some(PatternDescriptor::IntegerSequence(isq)) if self.is_integer_sequence() => {
+                out.push_str(&isq.dump(evaluator));
+            }
+            Some(PatternDescriptor::DiscreteIntegerSet(dis)) if self.is_discrete_integer_set() => {
+                out.push_str(&dis.dump());
+            }
+            Some(PatternDescriptor::LoopingChainMutableAddr(lcma))
+                if self.is_looping_chain_mutable_addr() =>
+            {
+                out.push_str(&lcma.dump());
+            }
+            _ => out.push_str("* invalid pattern descriptor\n"),
+        }
+        out.push_str(LINE);
+        out.push('\n');
+        out
+    }
 }
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::islands::sentient::dialects::Val;
+    use crate::islands::sentient::dialects::{Val, symbol};
     use crate::transform::sentient::address_pinning_and_toggle::{
         SimpleConstantDescriptor, ToggleDescriptor,
     };
-    use crate::transform::sentient::analyses::EvaluatedValue;
+    use crate::transform::sentient::analyses::{EvaluatedValue, OutOfScopeEvaluator};
     use crate::transform::sentient::{ForRef, IterArgIndex};
 
     /// A toggle that matched, so only the base-address count decides.
@@ -222,6 +313,7 @@ mod unit_tests {
             pattern_desc: pattern,
             base_addrs: (0..base_addrs).map(EvaluatedValue).collect(),
             region: RegionSite::default(),
+            memory_unit: DescriptorMemoryUnit::Lx,
         }
     }
 
@@ -270,6 +362,27 @@ mod unit_tests {
             .can_be_simplified()
         );
         assert!(!descriptor(Some(simple_constant()), 1).can_be_simplified());
+    }
+
+    /// `e492` — THE ONLY PATH THAT COMPLETES: with no base addresses nothing reaches the
+    /// out-of-scope `EvaluatedValue::operator<<`, and an unmatched pattern takes the `else`.
+    #[test]
+    fn e492_fences_the_operation_and_reports_an_invalid_pattern_descriptor() {
+        let body = vec![Op::Symbol(symbol::Op::CreateSymbol {
+            result: Val(0),
+            symbol_id: 7,
+            max_value: None,
+        })];
+
+        assert_eq!(
+            descriptor(None, 0).dump(&body, &mut OutOfScopeEvaluator),
+            "----------\n\
+             * operation:line:?:%0 = symbol.create_symbol {SymbolId = 7 : i32} : index\n\
+             * base addrs:[\n\
+             \n]\n\
+             * invalid pattern descriptor\n\
+             ----------\n"
+        );
     }
 
     /// `DT_CHECK_MSG((!res || getBaseAddrList().size() == 1), ..)` is an abort, and a simplified

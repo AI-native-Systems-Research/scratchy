@@ -79,10 +79,50 @@
 //! | `e618_updateConstantMutableAddr` | 618 | 6 | 21 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2143` |
 
 
-// crustify:todo: e490_updateVariableOffsetCalculation
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2131  (10 body lines, level 3)
-//   original  : void IntegerSequenceDataTransferUpdater::updateVariableOffsetCalculation( const EvaluatedValue &new_immut_addr_ev)
-//   calls     : e009_createOffsetValue, e015_getInit, e267_getIntegerSequenceDescriptor, e268_getIntegerSequenceDescriptor, e402_getIterArgIndex, e407_getInit, e411_getInit, e414_getInit
+use super::{DataTransferDescriptor, IntegerSequenceDataTransferUpdater, set_iter_operand};
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::Op;
+use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator, OffsetSites};
+
+impl IntegerSequenceDataTransferUpdater {
+    /// Replaces: e490_updateVariableOffsetCalculation
+    ///
+    /// REBASES THE SEQUENCE ON THE PINNED IMMUTABLE ADDRESS: the loop's iter operand becomes a fresh
+    /// offset value holding `init - new_immut_addr_ev`, so the induction still lands where the
+    /// unpinned sequence did (`:2131-2141`).
+    ///
+    /// ⭐ THROUGH `buildOffsetValue` AND `sites`/`walked`, AS e277 DOES: `createOffsetValue` (e009)
+    /// is that call plus two builder positions, which the campaign names droppable — and going via
+    /// e009's stop would make this unit's one IR write unreachable.
+    /// ⛔ THE WRITE IS THE PORT: `ty` is `mutable_addr_[0].get().getType()` (`:1029`), and
+    /// [`set_iter_operand`] is `getOuterLoop().setIterOperand(getIterArgIndex(), ..)`.
+    pub fn update_variable_offset_calculation<E: ExpressionEvaluator>(
+        self,
+        dtd: &DataTransferDescriptor,
+        new_immut_addr_ev: EvaluatedValue,
+        ty: ScalarTy,
+        evaluator: &mut E,
+        sites: &mut OffsetSites<'_>,
+        walked: &mut Vec<Op>,
+    ) {
+        // `dtd_.getIntegerSequenceDescriptor()` — `DT_CHECK(isIntegerSequence())` (`:728`) panics in
+        // [`DataTransferDescriptor::integer_sequence_descriptor`] itself.
+        let isq = *dtd.integer_sequence_descriptor();
+        let (Some(init), Some(outer_loop), Some(iter_arg_index)) =
+            (isq.init, isq.outer_loop, isq.iter_arg_index)
+        else {
+            todo!(
+                "IntegerSequenceDataTransferUpdater::updateVariableOffsetCalculation: \
+                 *isq.getInit() / isq.getOuterLoop() on {isq:?}, which the reference dereferences \
+                 unchecked (:2131-2141)"
+            )
+        };
+        // `evaluator_.evaluateSub(isq.getInit(), new_immut_addr_ev)` (`:2136-2137`).
+        let new_init = evaluator.evaluate_sub_handle(init, new_immut_addr_ev);
+        let new_operand = evaluator.build_offset_value_of(new_init, sites, walked, ty);
+        set_iter_operand(walked, outer_loop, iter_arg_index, new_operand);
+    }
+}
 
 // crustify:todo: e617_updateImmutableAddr
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2114  (15 body lines, level 6)
@@ -94,3 +134,174 @@
 //   original  : void IntegerSequenceDataTransferUpdater::updateConstantMutableAddr( const EvaluatedValue &new_immut_addr_ev)
 //   calls     : e011_getOffset, e012_getOffset, e013_getOffset, e267_getIntegerSequenceDescriptor, e268_getIntegerSequenceDescriptor, e400_getMax, e404_getMax, e406_getMax, e410_getMax, e413_getMax, e418_getOffset, e490_updateVariableOffsetCalculation, e548_getMax, e588_getMax …
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType};
+    use crate::islands::sentient::dialects::{Val, sentient};
+    use crate::transform::sentient::address_pinning_and_toggle::{
+        DescriptorMemoryUnit, IntegerSequenceDescriptor, PatternDescriptor, SequenceSize,
+    };
+    use crate::transform::sentient::analyses::{Evaluation, RegionSite};
+    use crate::transform::sentient::{ForRef, IterArgIndex};
+
+    /// The handle flavour with its answers stated as INTEGERS, so `==` on handles is `==` on values.
+    #[derive(Default)]
+    struct StatedEvaluator {
+        held: Vec<i64>,
+        built: Vec<(Val, i64)>,
+    }
+
+    impl StatedEvaluator {
+        fn intern(&mut self, value: i64) -> EvaluatedValue {
+            let index = self
+                .held
+                .iter()
+                .position(|held| *held == value)
+                .unwrap_or_else(|| {
+                    self.held.push(value);
+                    self.held.len() - 1
+                });
+            EvaluatedValue(u32::try_from(index).unwrap_or_default())
+        }
+
+        fn value(&self, ev: EvaluatedValue) -> i64 {
+            self.held
+                .get(usize::try_from(ev.0).unwrap_or_default())
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("e490 asks for handles, never for a decoded evaluation")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("e490 never sums")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e490 builds from a stored handle, not from an evaluation")
+        }
+
+        fn build_offset_value_of(
+            &mut self,
+            immutable: EvaluatedValue,
+            sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            ty: ScalarTy,
+        ) -> Val {
+            let value = self.value(immutable);
+            let result = sites.values.mint();
+            self.built.push((result, value));
+            sites
+                .consts
+                .push(Op::Sentient(sentient::Op::ScalarConstant {
+                    value,
+                    result,
+                    reg_locale: RegType::Imm,
+                    ty,
+                    is_symbol: false,
+                }));
+            result
+        }
+
+        fn constant(&mut self, value: i64) -> EvaluatedValue {
+            self.intern(value)
+        }
+
+        fn evaluate_sub_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            let difference = self.value(lhs) - self.value(rhs);
+            self.intern(difference)
+        }
+    }
+
+    fn carried(init: Val) -> Carried {
+        Carried {
+            init,
+            arg: Val(11),
+            result: Val(12),
+            reg: Reg {
+                locale: RegType::Unknown,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// The loop's iter operand becomes a fresh constant holding `init - pinned`, and the walk finds
+    /// that loop by the induction variable [`ForRef`] names.
+    #[test]
+    fn e490_rebases_the_loops_iter_operand_on_the_pinned_address() {
+        let mut walked = vec![Op::Sentient(sentient::Op::For {
+            iv: Val(10),
+            bound: Val(1),
+            bound_reg: None,
+            carried: vec![carried(Val(2))],
+            dbg_name: None,
+            body: Vec::new(),
+        })];
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut evaluator = StatedEvaluator::default();
+        let init = evaluator.constant(8192);
+        let pinned = evaluator.constant(4096);
+        let dtd = DataTransferDescriptor {
+            op: OpId::at(&[0]),
+            pattern_desc: Some(PatternDescriptor::IntegerSequence(
+                IntegerSequenceDescriptor {
+                    outer_loop: Some(ForRef(Val(10))),
+                    iter_arg_index: Some(IterArgIndex(0)),
+                    init: Some(init),
+                    stride: Some(evaluator.constant(64)),
+                    size: SequenceSize::Terms(4),
+                    can_be_simplified: false,
+                },
+            )),
+            base_addrs: vec![init],
+            region: RegionSite::default(),
+            memory_unit: DescriptorMemoryUnit::Lx,
+        };
+        let updater = IntegerSequenceDataTransferUpdater { iter_arg: Val(11) };
+        {
+            let mut sites = OffsetSites {
+                consts: &mut consts,
+                query_maps: None,
+                values: &mut values,
+            };
+            updater.update_variable_offset_calculation(
+                &dtd,
+                pinned,
+                ScalarTy::Index,
+                &mut evaluator,
+                &mut sites,
+                &mut walked,
+            );
+        }
+
+        // `8192 - 4096`, built once, and written over the loop's `init`.
+        assert_eq!(evaluator.built.len(), 1);
+        let (rebased, value) = evaluator.built[0];
+        assert_eq!(value, 4096);
+        assert_eq!(consts.len(), 1);
+        let Op::Sentient(sentient::Op::For { carried, .. }) = &walked[0] else {
+            panic!("the fixture's only op is the sentient.for")
+        };
+        assert_eq!(carried[0].init, rebased);
+    }
+}
