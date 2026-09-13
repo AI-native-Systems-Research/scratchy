@@ -868,7 +868,7 @@ fn constant_value_in(value: Val, scopes: &[&[Op]]) -> Option<i64> {
 }
 
 /// `(getLhs() or getRhs() is a sentient.constant) && (iv == getLhs() || iv == getRhs())` — the filter
-/// both of `splitLoopNWay`'s walks apply (`:880-889`, `:924-933`).
+/// both of `splitLoopNWay`'s walks apply (`:875-881`, `:923-929`).
 fn is_if_op_on_iv(op: &Op, iv: Val, scopes: &[&[Op]]) -> bool {
     let Op::Sentient(ops::Op::If { lhs, rhs, .. }) = op else {
         return false;
@@ -895,9 +895,9 @@ fn if_ops_on_iv<'a>(body: &'a [Op], iv: Val, scopes: &[&[Op]]) -> Vec<&'a Op> {
 /// ⛔⛔ BOTH REGIONS ARE DESCENDED INTO EVEN THOUGH ONE IS DISCARDED, because that is what fixes
 /// `predvals`' positions: `if_list1` holds the DISCARDED branch's if ops too, at their own pre-order
 /// slots. The reference processes them inside the dying region and then double-frees them in its
-/// second erase loop (`:958-960`); here the folding is real and the region is simply dropped after.
+/// second erase loop (`:961-963`); here the folding is real and the region is simply dropped after.
 ///
-/// ⭐ AN EMPTY ELSE REGION SPLICES NOTHING AND REWIRES NOTHING (`:942`), so the if op's results lose
+/// ⭐ AN EMPTY ELSE REGION SPLICES NOTHING AND REWIRES NOTHING (`:943`), so the if op's results lose
 /// their definition and keep their readers — the reference's own outcome.
 fn fold_if_ops_on_iv(
     block: Vec<Op>,
@@ -911,10 +911,25 @@ fn fold_if_ops_on_iv(
     for op in block {
         if !is_if_op_on_iv(&op, iv, scopes) {
             let mut op = op;
-            if let Op::Sentient(inner) = &mut op {
-                for region in ops::regions_mut(inner) {
-                    *region = fold_if_ops_on_iv(
-                        core::mem::take(region),
+            // ⛔ THE REGION TREE IS `walk`'S, NOT ONE DIALECT'S: an if op on the iv inside an
+            // `affine.for` is in `if_list1` at its own slot, so stopping here would both leave it
+            // standing and shift every later if op's `predvals` position by one.
+            match &mut op {
+                Op::Sentient(inner) => {
+                    for region in ops::regions_mut(inner) {
+                        *region = fold_if_ops_on_iv(
+                            core::mem::take(region),
+                            iv,
+                            scopes,
+                            predvals,
+                            index,
+                            rewires,
+                        );
+                    }
+                }
+                Op::AffineFor(loop_op) => {
+                    loop_op.body = fold_if_ops_on_iv(
+                        core::mem::take(&mut loop_op.body),
                         iv,
                         scopes,
                         predvals,
@@ -922,6 +937,7 @@ fn fold_if_ops_on_iv(
                         rewires,
                     );
                 }
+                _ => {}
             }
             out.push(op);
             continue;
@@ -1998,6 +2014,50 @@ mod unit_tests {
             Some(Op::Sentient(ops::Op::ScalarAdd { lhs, .. })) if *lhs == tail.carried[0].result
         ));
     }
+    /// e447 — an if op on the induction variable nested in an `affine.for` is folded like any other
+    /// and takes its OWN `predvals` slot: `if_list1` is a `walk`, so skipping it would leave it
+    /// standing AND read the next if op's branch off the wrong bound.
+    #[test]
+    fn e447_folds_the_if_ops_inside_an_affine_for_at_their_own_predval_slots() {
+        use crate::islands::sentient::dialects::{AffineFor, affine};
+
+        let (iv, two) = (Val(1), Val(2));
+        let scope = vec![constant(2, two)];
+        let block = vec![
+            Op::AffineFor(AffineFor {
+                iv: Val(3),
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: vec![if_op(iv, two, vec![nop("nested-then")], vec![nop("nested-else")])],
+                dbg_name: None,
+            }),
+            if_op(iv, two, vec![nop("after-then")], vec![nop("after-else")]),
+        ];
+
+        let mut index = 0;
+        let mut rewires = Vec::new();
+        let out = fold_if_ops_on_iv(
+            block,
+            iv,
+            &[scope.as_slice()],
+            &[true, false],
+            &mut index,
+            &mut rewires,
+        );
+
+        // Two if ops, two slots: the nested one is FIRST in pre-order.
+        assert_eq!(index, 2);
+        let Op::AffineFor(time_loop) = &out[0] else {
+            panic!("the time loop stays, holding only what its if op resolved to")
+        };
+        assert_eq!(time_loop.body, vec![nop("nested-then")]);
+        // Slot 1 is `false`, so the following if op keeps its `else` — reading slot 0 would take the
+        // `then` instead.
+        assert_eq!(out[1], nop("after-else"));
+        assert_eq!(out.len(), 2);
+    }
+
     /// A `sentient.nop` carrying a debug name — the one op a body can hold that `updateDbgName`
     /// writes to without also being a loop.
     fn nop(dbg_name: &str) -> Op {

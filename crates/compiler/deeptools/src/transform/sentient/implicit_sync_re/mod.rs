@@ -244,7 +244,7 @@ pub(crate) fn is_operation_a_use(_op: &Op) -> bool {
 }
 
 /// `cl::opt<bool> EnableDynamicLoopHoisting("dcc-implicit-sync-re-dynamic-loops", .., cl::init(false))`
-/// (`ImplicitSyncRE.cpp:45-49`) — what e438 hands the optimizer.
+/// (`ImplicitSyncRE.cpp:46-50`) — what e438 hands the optimizer.
 pub(crate) const ENABLE_DYNAMIC_LOOP_HOISTING: bool = false;
 
 /// `Statistic implicit_sync_re_count` — the pass's own count, set from `optimizer.optimize()`.

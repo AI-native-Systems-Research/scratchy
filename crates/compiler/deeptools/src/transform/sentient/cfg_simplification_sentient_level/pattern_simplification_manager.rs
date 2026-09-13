@@ -1780,7 +1780,7 @@ impl LeafSink<'_> {
 }
 
 /// THE LOOP CLONE BOTH TRANSFORMS NEED — `createSentientForOpWithAdditionalIterArgs(for_op,
-/// start_vals_and_steps)` (`Analyses/Utils.cpp:195`), plus the loops the tree refuses to grow.
+/// start_vals_and_steps)` (`Transform/Sentient/Utils.cpp:195`), plus the loops the tree refuses to grow.
 ///
 /// ⛔ e393 IS NOT PORTED, so the clone arrives as a closure exactly as the leaf handler does for
 /// [`PatternSimplificationManager::populate_table`]: given the tree, the loop and one
@@ -1893,7 +1893,7 @@ impl PatternSimplificationManager {
     /// nest — reusing an existing one or cloning each loop to add it — then retires the original
     /// conditional in favour of `new_if` and points its placeholders at those arguments.
     ///
-    /// TRAP: EVERY REFUSAL IS GATED ON `num_new_iter_args > 0` (`:1682`, `:1690`), including the
+    /// TRAP: EVERY REFUSAL IS GATED ON `num_new_iter_args > 0` (`:1683`, `:1692`), including the
     /// capacity check, so a nest that needs nothing is never rejected. The outermost loop's veto is
     /// `isa<BlockArgument>(init)`, i.e. an initial value with no defining op.
     pub fn transform_in_contiguous_sequence_case(
@@ -1961,7 +1961,7 @@ impl PatternSimplificationManager {
             }
         }
         if create_mono_seq_iter_arg {
-            // `DT_CHECK(monotone_seq_int_step_ && monotone_seq_start_val_.has_value())` (`:1646-1647`).
+            // `DT_CHECK(monotone_seq_int_step_ && monotone_seq_start_val_.has_value())` (`:1648-1649`).
             let (Some(start_val), Some(step_val)) =
                 (self.monotone_seq_start_val, self.monotone_seq_int_step)
             else {
@@ -1998,7 +1998,7 @@ impl PatternSimplificationManager {
             if num_new_iter_args > 0 && cloning.for_ops_to_avoid_new_iter_args.contains(&for_op) {
                 return false;
             }
-            // `DT_CHECK_MSG(sentient_for, "Expect sentient.for op.")` (`:1687`) — NOT gated.
+            // `DT_CHECK_MSG(sentient_for, "Expect sentient.for op.")` (`:1690`) — NOT gated.
             let Some(Op::Sentient(sentient::Op::For { carried, .. })) = op_at(root, for_op.path())
             else {
                 return false;
@@ -2036,7 +2036,7 @@ impl PatternSimplificationManager {
         }
 
         if !create_synthetic_iv && !create_mono_seq_iter_arg {
-            // Nothing to add: the iterator arguments already found do the job (`:1878-1915`).
+            // Nothing to add: the iterator arguments already found do the job (`:1883-1917`).
             let Some(for_op) = self
                 .lhs_to_for_op_or_null
                 .get(&cur.iv)
@@ -2129,7 +2129,7 @@ impl PatternSimplificationManager {
     }
 
     /// The innermost loop's IV, and any `sentient.sub` over it, may only be read where turning it into
-    /// an iterator argument still leaves loop coalescing possible (`:1708-1744`).
+    /// an iterator argument still leaves loop coalescing possible (`:1710-1750`).
     fn check_free_iv_uses(&self, root: &[Op], cur: &IvDim, rest: &[IvDim]) -> bool {
         let mut sub_result = None;
         for use_path in uses_of(cur.iv, root) {
@@ -2156,7 +2156,7 @@ impl PatternSimplificationManager {
         })
     }
 
-    /// The cleanup both transforms share (`:1830-1846`, `:1893-1915`): the marked conditional, yield
+    /// The cleanup both transforms share (`:1832-1847`, `:1904-1916`): the marked conditional, yield
     /// and predicate inside `new_if` take the iterator arguments that were just secured.
     fn finish_placeholders(
         &mut self,
@@ -2184,7 +2184,7 @@ impl PatternSimplificationManager {
         }
     }
 
-    /// `new_for_op->walk(..)` (`:1852-1876`) — the clone built one level in starts its new iterator
+    /// `new_for_op->walk(..)` (`:1854-1877`) — the clone built one level in starts its new iterator
     /// arguments from this clone's, and when the two loops are directly nested this clone's terminator
     /// yields the inner loop's matching results.
     ///
@@ -2236,7 +2236,7 @@ impl PatternSimplificationManager {
     /// existing one or cloning the loop — retires the conditional in favour of `new_if`, and points
     /// the marked placeholder at that argument.
     ///
-    /// TRAP: THE CAPACITY CHECK IS `+ 1`, NOT `+ num_new_iter_args` (`:1953`), and it is reached only
+    /// TRAP: THE CAPACITY CHECK IS `+ 1`, NOT `+ num_new_iter_args` (`:1954`), and it is reached only
     /// when no existing iterator argument matched.
     pub fn transform_in_monotone_sequence_case(
         &mut self,
@@ -2321,7 +2321,7 @@ impl PatternSimplificationManager {
     }
 
     /// `table_->getTableEntryAtIdx(index)->getEV()`, absent where the reference's `DT_CHECK_MSG`
-    /// (`:2189`) or its null `getEV` would fire.
+    /// (`:2187`) or `getEV`'s own on a leaf that yields nothing (`:474`, `:469-471`) would fire.
     fn table_ev(&self, at: TableIndex) -> Option<EvaluatedValueId> {
         self.table.as_ref()?.table_entry_at_idx(at)?.ev()
     }
@@ -2661,7 +2661,7 @@ impl PatternSimplificationManager {
         let Some((cur, rest)) = ivs.split_first() else {
             return (Vec::new(), Vec::new());
         };
-        // `DT_CHECK_MSG(step != 0, "Expect non-zero stride.")` (`:2585`) is the loop's own type.
+        // `DT_CHECK_MSG(step != 0, "Expect non-zero stride.")` (`:2586`) is the loop's own type.
         let Some(info) = self.lhs_to_for_op_or_null.get(&cur.iv) else {
             return (Vec::new(), Vec::new());
         };
@@ -2724,7 +2724,7 @@ impl PatternSimplificationManager {
                 else_body: built,
             });
             if depth == 0 {
-                // The caller creates the yield over the outermost conditional (`:2612-2617`).
+                // The caller creates the yield over the outermost conditional (`:2611-2613`).
                 built = vec![if_op];
                 outer_results = level.results;
             } else {

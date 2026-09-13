@@ -892,7 +892,7 @@ impl<'a> SecondRegion<'a> {
 /// `uniform.query_map` behind it over a mapping of region 1's own units.
 ///
 /// ⛔ `None` MEANS THE MAPPING DOES NOT COVER REGION 1'S UNITS, and the caller (`e442`) then erases the
-/// op it was building and keeps the original (`LiveRangeReduction.cpp:1085-1088`).
+/// op it was building and keeps the original (`LiveRangeReduction.cpp:1083-1087`).
 /// ⛔ THE `!query_op->isProperAncestor(region.getParentOp())` GUARD IS DEAD CODE (`:929`): a
 /// `uniform.query_map` carries no regions, so it can never be an ancestor of anything and the mapping
 /// is ALWAYS re-minted. Ported as the reference behaves, not as it reads.
@@ -967,7 +967,7 @@ impl SsaMap {
     /// Files one value under the equivalence class of its base expression, recording the per-unit
     /// constant offsets and the negation it differs from that class by.
     ///
-    /// ⛔ A CONSTANT IS RECORDED BUT NEVER CLASSED (`:252-253`, `:258-261`): its live range needs no
+    /// ⛔ A CONSTANT IS RECORDED BUT NEVER CLASSED (`:252-253`, `:259-261`): its live range needs no
     /// reducing, so it neither joins a class nor opens one — yet its offsets and its negation ARE
     /// mapped, because that constant term is what `reconstructOperation` substitutes with.
     /// ⛔ A VALUE WHOSE BASE EXPRESSION FAILS IS NOT MAPPED AT ALL, not mapped as empty.
@@ -1015,7 +1015,7 @@ pub enum ElementSizeCheck {
 /// current value, steps by the same element width and shares its register file; `None` is
 /// `LogicalResult::failure()`.
 ///
-/// ⛔ A `scalar_add`/`scalar_sub` MUST ALSO SHARE THE DEF-USE ROOT (`:506-514`) — two adds rooted in
+/// ⛔ A `scalar_add`/`scalar_sub` MUST ALSO SHARE THE DEF-USE ROOT (`:505-512`) — two adds rooted in
 /// different iter args cannot have their registers merged — and such a candidate is SKIPPED, the scan
 /// continuing to the next rather than failing.
 #[must_use]
@@ -1027,13 +1027,13 @@ pub fn find_dominant_value(
     defs: Definitions<'_>,
 ) -> Option<usize> {
     let current = ssa_list[current_value_index];
-    // `ssa_list[current_value_index].getDefiningOp()`, which `:487` and `:506` then dereference
+    // `ssa_list[current_value_index].getDefiningOp()`, which `:499` and `:505` then dereference
     // unchecked — so a block argument here is the reference's own null dereference.
     let Some(current_at) = utils::path_of(unit_body, current) else {
         panic!(
             "findDominantValue was asked about a value with no defining op in this program unit, \
              where the reference dereferences a null Operation* \
-             (LiveRangeReduction.cpp:484,487,506)"
+             (LiveRangeReduction.cpp:484,499,505)"
         )
     };
     let current_op = current_at.op(unit_body);
@@ -1121,7 +1121,7 @@ pub struct ParentRegionQuery {
 /// region 0 does not cover (`:981-997`) — the reference's second `listSizes` entry, which this
 /// island spells as [`LocalRegion::units`].
 /// ⛔ `None` FROM [`clone_value_to_region`] ABANDONS THE WHOLE REWRITE and the ORIGINAL op is
-/// answered with (`:1085-1088`); `newly_added`/`ops_to_be_delected` (`:1093-1096`) are the rewriter's
+/// answered with (`:1083-1087`); `newly_added`/`ops_to_be_delected` (`:1093-1096`) are the rewriter's
 /// memory management and become the caller storing this answer into the slot.
 #[must_use]
 pub fn add_result_to_yield(
@@ -1193,7 +1193,7 @@ pub fn add_result_to_yield(
                 }
                 body
             }
-            // A one-region op's new region 1 starts as a bare `uniform.yield` (`:1024-1026`).
+            // A one-region op's new region 1 starts as a bare `uniform.yield` (`:1027-1030`).
             _ => vec![Op::Uniform(uniform::Op::Yield {
                 operands: Vec::new(),
             })],
@@ -1229,7 +1229,7 @@ pub fn add_result_to_yield(
     push_yield_operand(&mut new_op.regions_mut()[region_num], cloned_result);
 
     // THE OTHER REGION YIELDS THE ANCESTOR, RE-MINTED (`:1072-1090`). ⭐ `DT_CHECK(r == 1)` (`:1073`)
-    // holds because the one caller only ever passes `region_num == 0` (`:1173`).
+    // holds because the one caller only ever passes `region_num == 0` (`:1173-1174`).
     let scopes: Vec<&[Op]> = core::iter::once(new_op.regions()[0].body.as_slice())
         .chain(enclosing.iter().copied())
         .collect();
@@ -1247,7 +1247,10 @@ pub fn add_result_to_yield(
     };
     drop(scopes);
     let Some(target) = SecondRegion::of(&mut new_op) else {
-        panic!("the op addResultToYield just built has two regions (LiveRangeReduction.cpp:1008)")
+        panic!(
+            "the op addResultToYield just built has two regions \
+             (LiveRangeReduction.cpp:1010-1011)"
+        )
     };
     let Some(yield_operand) = clone_value_to_region(ancestor, target, vals) else {
         // if ancestor_val is a queryOp which doesn't cover region1's units, quit adding
@@ -1257,8 +1260,8 @@ pub fn add_result_to_yield(
     new_op
 }
 
-/// `yield_op->setOperands(yield_args)` WITH ONE MORE (`:1069`, `:1090`) — the terminator is the last
-/// op of the region, and a region built by [`add_result_to_yield`] always has one.
+/// `yield_op->setOperands(yield_args)` WITH ONE MORE (`:1040`, `:1089`, `:1091`) — the terminator is
+/// the last op of the region, and a region built by [`add_result_to_yield`] always has one.
 fn push_yield_operand(region: &mut LocalRegion, operand: Val) {
     if let Some(Op::Uniform(uniform::Op::Yield { operands })) = region.body.last_mut() {
         operands.push(operand);
@@ -1284,7 +1287,7 @@ pub struct MapAndQuery {
 /// ⛔ ONLY THE UNITS THE PARENT REGION COVERS GET A KEY, AND IN THE REFERENCE'S REVERSED, GROUP-FLAT
 /// ORDER — [`utils::select_indices_for_units`], whose own note explains the LIFO.
 /// ⛔ A UNIT WHOSE OFFSET WAS THE `i64::MAX` SENTINEL HAS NO CONSTANT and the reference dereferences
-/// the null it pushed for it (`:1222`, `:1250-1252`); that is the one `panic!` here.
+/// the null it pushed for it (`:1222`, `:1249-1250`); that is the one `panic!` here.
 #[must_use]
 pub fn create_map_and_query(
     new_const_val: &[i64],

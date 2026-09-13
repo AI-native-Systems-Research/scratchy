@@ -729,7 +729,7 @@ fn set_dbg_name(op: &mut Op, name: String) {
 struct BandBounds {
     /// `new_bound` — the product of every `sentient.scalar_constant` bound.
     new_bound: TripCount,
-    /// `const_type` — the type of the LAST constant bound seen (`:163`). `None` is the reference's
+    /// `const_type` — the type of the LAST constant bound seen (`:164`). `None` is the reference's
     /// default-constructed, null `mlir::Type` (`:148`), which only a band with no constant bound
     /// leaves behind.
     const_type: Option<ScalarTy>,
@@ -826,9 +826,9 @@ fn band_bounds(loops: &[ForRef], outermost: &Op, defs: Definitions<'_>) -> BandB
 ///
 /// ⛔ THE SPLIT PAIR IS ORDERED THE OTHER WAY IN THE TWO BRANCHES — a constant bound gives the outermost
 /// the COFACTOR and the second the fitting divisor (`:211-217`), a query-map bound gives the outermost
-/// the FITTING one (`:257-259`). ⭐ AND A SPLIT MAKES `loops[1]` THE NEW OUTERMOST (`:219-225`), so a
-/// band of exactly two is already coalesced and returns there.
-/// ⛔ AN UNNAMED LOOP ANYWHERE IN THE BAND LEAVES THE OUTERMOST'S OWN `dbgName` ALONE (`:279-281`).
+/// the FITTING one (`:262`, `splitBounds` `:422-423`). ⭐ AND A SPLIT MAKES `loops[1]` THE NEW
+/// OUTERMOST (`:222-227`), so a band of exactly two is already coalesced and returns there.
+/// ⛔ AN UNNAMED LOOP ANYWHERE IN THE BAND LEAVES THE OUTERMOST'S OWN `dbgName` ALONE (`:280-282`).
 pub(crate) fn coalesce_loops(
     loops: &[ForRef],
     builders: &mut Builders<'_>,
@@ -854,7 +854,7 @@ pub(crate) fn coalesce_loops(
 
     if bounds.new_bounds.is_empty() {
         let Some(const_type) = bounds.const_type else {
-            panic!("a band with no query-map bound has a constant one, so `const_type` is set (`:163`)")
+            panic!("a band with no query-map bound has a constant one, so `const_type` is set (`:164`)")
         };
         // 2. Assign the newly calculated bound to the outermost loop (`:196-202`).
         if bounds.new_bound.0 <= TripLimit::LCCR.0 {
@@ -953,7 +953,7 @@ pub(crate) fn coalesce_loops(
             dialects::replace_all_uses_with(body, *of, *with);
         }
         let Some(Op::Sentient(sentient::Op::Yield { results })) = body.last() else {
-            panic!("a `sentient.for` body ends in the `sentient.yield` this reads (`:290`)")
+            panic!("a `sentient.for` body ends in the `sentient.yield` this reads (`:291`)")
         };
         let ret_values = results.clone();
         body.pop();

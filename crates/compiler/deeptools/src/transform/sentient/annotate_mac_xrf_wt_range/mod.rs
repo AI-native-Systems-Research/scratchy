@@ -89,7 +89,7 @@ use crate::workload::Workload;
 /// `-dcc-annotate-mac-xrf-wt-range-disable`, `cl::init(false)` (`:42-45`).
 const DISABLE_THIS_PASS: bool = false;
 
-/// `dtGetEnv<bool>("SET_IFIFO_CONVERT").value_or(true)` (`:123`) — whether the IFIFO conversion this
+/// `dtGetEnv<bool>("SET_IFIFO_CONVERT").value_or(true)` (`:124`) — whether the IFIFO conversion this
 /// annotation feeds is on, defaulting to on.
 ///
 /// ⛔ STATED BY THE BUILD, NOT READ FROM THE ENVIRONMENT, exactly as `SENCORES` becomes
@@ -101,7 +101,7 @@ const SET_IFIFO_CONVERT: bool = true;
 /// Sets `isDataWeight` on an mx-precision PT MAC that reads N-link into `opC` and zero into A or B:
 /// its XRF WRITE pointer's constant range decides data weights (`< 64`) from scale weights (`:104`).
 ///
-/// ⛔ NO POINTERS IS A `return`, NOT `false` (`:88-95`): the pass runs before
+/// ⛔ NO POINTERS IS A `return`, NOT `false` (`:89-95`): the pass runs before
 /// `LoopSplittingAndUnrolling`, so an un-annotated MAC is the range being left to ProgIR lowering —
 /// writing `Some(false)` there would state the scale range for a MAC nobody measured.
 pub(crate) fn annotate_mac_op(fma_op: &mut Op, xrf_reg_analyzer: &mut impl XrfRegisterAnalyzer) {
@@ -130,11 +130,11 @@ pub(crate) fn annotate_mac_op(fma_op: &mut Op, xrf_reg_analyzer: &mut impl XrfRe
         sentient::Precision::Fp4 | sentient::Precision::Fp8
     ) {
         panic!(
-            "DT_CHECK(N-link has to be in fp4/fp8 precision) (`AnnotateMacXRFWtRange.cpp:79-81`): {:?}",
+            "DT_CHECK(N-link has to be in fp4/fp8 precision) (`AnnotateMacXRFWtRange.cpp:78-80`): {:?}",
             op_c.precision
         );
     }
-    // `fma_op.getPointers()[0]` — the WRITE pointer, which is `$pointers` front (`:89`).
+    // `fma_op.getPointers()[0]` — the WRITE pointer, which is `$pointers` front (`:88`).
     let Some(wt_ptr_result) = *xrf_write_ptr else {
         return;
     };
@@ -330,7 +330,7 @@ mod unit_tests {
 
 /// Replaces: e429_runOnOperation
 ///
-/// Annotates every MAC of every PT unit, on SEN1P5 and later only (`:130-132`).
+/// Annotates every MAC of every PT unit, on SEN1P5 and later only (`:129-131`).
 ///
 /// ⛔ THE ARCH GATE IS `<`, ON AN ORDER THAT IS LOAD-BEARING: [`IsaGen`] is ordered so this reads as
 /// the reference's `getArch() < SEN1P5_ISA`, and an RCUDD1A build must annotate NOTHING.

@@ -175,7 +175,7 @@ pub fn split_burst<A: Arch>(
 /// Splits every burst in the unit that exceeds `max_burst`, in walk order.
 ///
 /// ⛔ `LoadAndExtractScalar` IS DELIBERATELY ABSENT (`:166`) — it carries no burst — and that filter
-/// is [`BurstCandidate::of`]. The `emitError` + `signalPassFailure` arm (`:180-183`) is unreachable
+/// is [`BurstCandidate::of`]. The `emitError` + `signalPassFailure` arm (`:178-182`) is unreachable
 /// from here: [`split_burst`] hands the rewrite to the out-of-scope `burst_utils`, which is where the
 /// reference's failure comes from, so the pass stops there rather than at a `LogicalResult`.
 pub(crate) fn run_on<A: Arch>(unit: &mut ProgramUnit<A>, comp: DfirUnit, max_burst: Elements) {

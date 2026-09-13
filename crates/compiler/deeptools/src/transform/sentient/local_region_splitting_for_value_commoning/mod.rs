@@ -361,11 +361,11 @@ pub fn cluster(
     }
 }
 
-/// WHETHER A SPLIT WAS FOUND — the `bool` `analyze` returns (`:271`), and the only thing deciding
+/// WHETHER A SPLIT WAS FOUND — the `bool` `analyze` returns (`:273`), and the only thing deciding
 /// whether `run` (e561) goes on to call `transform` (`:266-269`).
 ///
 /// ⛔ NOT A BARE `bool`: `false` is neither failure nor "nothing found" — `ur` is filled EITHER WAY
-/// (`:298-302`), so both answers are kinds of success and each has to name itself.
+/// (`:291-303`), so both answers are kinds of success and each has to name itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transformation {
     /// Some region held at least as many uniform maps as the file has registers and was clustered.
@@ -379,9 +379,9 @@ pub enum Transformation {
 /// Per region of the original op: collect the uniform maps its `locale` copies read, append the region
 /// unsplit when they fit `comp`'s register file, else append one local region per cluster.
 ///
-/// ⛔ `<` AND NOT `<=` IS THE REFERENCE'S OWN HEURISTIC (`:295-297`) — being purely local it leaves one
+/// ⛔ `<` AND NOT `<=` IS THE REFERENCE'S OWN HEURISTIC (`:288-290`) — being purely local it leaves one
 /// register free for a globally shared map.
-/// ⛔ EVERY REGION IS APPENDED EITHER WAY (`:298-302`), so a [`Transformation::NotNeeded`] `ur` is a
+/// ⛔ EVERY REGION IS APPENDED EITHER WAY (`:291-303`), so a [`Transformation::NotNeeded`] `ur` is a
 /// faithful copy of the original op and the answer says only whether ANY region was split.
 /// ⭐ THE OP ARRIVES BESIDE `ur`: `ur.original_uro` is an identity ([`uniform_region::UniformizeRegions`])
 /// and a region's ops are not reachable from a [`Val`], so e561 holds both.
@@ -398,7 +398,7 @@ pub fn analyze<A: Arch>(
     let UniformRegions::UniformizeRegions { regions, .. } = orig_ur else {
         panic!(
             "analyze takes a uniform.uniformize_regions and nothing else — that is its typed \
-             parameter (LocalRegionSplittingForValueCommoning.cpp:271-273)"
+             parameter (LocalRegionSplittingForValueCommoning.cpp:273-275)"
         )
     };
     let mut answer = Transformation::NotNeeded;

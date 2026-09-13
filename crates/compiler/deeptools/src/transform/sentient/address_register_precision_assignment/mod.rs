@@ -383,7 +383,7 @@ impl PrecisionAssignments {
     /// ⭐ RETURNS THE WHOLE OUTCOME, WHICH IS MORE THAN THE REFERENCE'S `new_val`: the two failure
     /// arms of [`PrecisionAssigned`] are how this pass stops (`signalPassFailure`), and with no
     /// `Result` in this crate the caller has to receive them as a value. `Substituted(v)` is the
-    /// `new_val` its callers assign over the operand (`:236`).
+    /// `new_val` its callers assign over the operand (`:229`).
     pub fn add_to_worklist_and_assign_precision(
         &mut self,
         body: &mut Vec<Op>,
