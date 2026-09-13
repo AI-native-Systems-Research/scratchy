@@ -77,8 +77,9 @@
 //! | `e597_runLightWeightSimplifications` | 597 | 5 | 144 | `dcc/src/Transform/Sentient/LightweightSimplification.cpp:180` |
 
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e623_runOnOperation` (level 6) is what calls
-// `run_light_weight_simplifications` below, and it is not in this batch. ⭐ REMOVE THIS WITH e623.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e623_runOnOperation` (level 6, in `mod.rs`) is
+// what calls `run_light_weight_simplifications` below, and nothing runs it until a pass driver
+// schedules it. ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;

@@ -84,9 +84,18 @@
 
 use std::num::NonZeroU32;
 
-use crate::arch::Elements;
+use crate::arch::{Arch, Elements, IsaGen};
 use crate::islands::dataflow_ir::Values;
-use crate::islands::sentient::dialects::{Definitions, Op, Val, replace_all_uses_with, sentient};
+use crate::islands::sentient::ProgramUnit;
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, regions_mut, replace_all_uses_with, sentient,
+};
+use crate::transform::sentient::ForRef;
+use crate::transform::sentient::analyses::{
+    ExpressionEvaluator, PropagationAnalysis, UnitIndexMap,
+};
+use crate::transform::sentient::burst_splitting::max_burst_size;
+use crate::transform::sentient::lightweight_simplification::sentient::run_light_weight_simplifications;
 use crate::transform::sentient::utils::{SenTarget, round_down_unroll_factor};
 use crate::units::DfirUnit;
 
@@ -611,10 +620,181 @@ pub fn remove_loops_containing_compute_op(
     Rerolled::LoopIsToBeRemoved
 }
 
-// crustify:todo: e626_runOn
-//   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:330  (79 body lines, level 6)
-//   original  : void runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e313_isCandidate, e314_removeLoopsContainingLoadSendOrReceiveStore, e315_removeLoopsContainingComputeOp, e597_runLightWeightSimplifications
+/// `cl::opt<unsigned> MaxIterArgsOfAncestorLoops("dcc-levr-max-iter-args-of-ancestor-loops", ..,
+/// cl::init(12))` (`:42-46`) — the iter-arg count above which a loop's whole subtree is left alone.
+const MAX_ITER_ARGS_OF_ANCESTOR_LOOPS: usize = 12;
+
+/// `is_any_of(unit_comp, LX, LXLU, LXSU, L0, L0LU, L0SU)` (`:336-338`) — a memory unit, which is the
+/// one place the burst arm applies.
+const fn is_lx_or_l0(unit_comp: DfirUnit) -> bool {
+    matches!(
+        unit_comp,
+        DfirUnit::Lx
+            | DfirUnit::Lxlu
+            | DfirUnit::Lxsu
+            | DfirUnit::L0
+            | DfirUnit::L0lu
+            | DfirUnit::L0su
+    )
+}
+
+/// `while (!body->empty()) { .. oper.moveBefore(sentient_for); }` (`:383-388`) — the loop's body ops
+/// hoisted out ahead of it, up to but not including the first `sentient.scalar_add` or `sentient.yield`.
+/// Answers HOW MANY MOVED, which is how far the loop itself slid down the block.
+fn hoist_body_front(block: &mut Vec<Op>, at: usize) -> usize {
+    let mut hoisted = Vec::new();
+    if let Some(Op::Sentient(sentient::Op::For { body, .. })) = block.get_mut(at) {
+        while let Some(front) = body.first() {
+            if matches!(
+                front,
+                Op::Sentient(sentient::Op::ScalarAdd { .. } | sentient::Op::Yield { .. })
+            ) {
+                break;
+            }
+            hoisted.push(body.remove(0));
+        }
+    }
+    let moved = hoisted.len();
+    for (offset, op) in hoisted.into_iter().enumerate() {
+        block.insert(at + offset, op);
+    }
+    moved
+}
+
+/// `op->erase()` FOR A LOOP NAMED BY ITS INDUCTION VARIABLE ([`ForRef`]) — the parent pointer this
+/// island's trees do not have, searched for from the unit body down.
+fn erase_loop(scope: &mut Vec<Op>, loop_ref: ForRef) -> bool {
+    let here = scope
+        .iter()
+        .position(|op| matches!(op, Op::Sentient(sentient::Op::For { iv, .. }) if *iv == loop_ref.0));
+    if let Some(at) = here {
+        scope.remove(at);
+        return true;
+    }
+    for op in scope.iter_mut() {
+        for region in regions_mut(op) {
+            if erase_loop(region, loop_ref) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `unit.walk<WalkOrder::PreOrder>([&](sentient::ForOp sentient_for) { .. })` (`:351-392`) — the action
+/// runs on the loop, and only then are its own regions walked.
+///
+/// ⛔ `WalkResult::skip()` (`:360`) IS THE WHOLE POINT OF THE PRE-ORDER: an ancestor loop over the
+/// iter-arg threshold takes its DESCENDANTS out of the walk, which a post-order walk cannot express.
+fn reroll_pre_order<A: Arch>(
+    block: &mut Vec<Op>,
+    unit_comp: DfirUnit,
+    sen_target: SenTarget,
+    for_op_to_be_deleted: &mut Vec<ForRef>,
+    values: &mut Values,
+) {
+    let lx_or_l0 = is_lx_or_l0(unit_comp);
+    let mut at = 0;
+    while at < block.len() {
+        // Where this op sits once the action below has moved anything ahead of it.
+        let mut here = at;
+        if let Op::Sentient(sentient::Op::For { iv, carried, .. }) = &block[at] {
+            let (iv, iter_args) = (*iv, carried.len());
+            if lx_or_l0 && iter_args > MAX_ITER_ARGS_OF_ANCESTOR_LOOPS {
+                at += 1;
+                continue;
+            }
+            let candidate =
+                SentientFor::of(&block[at]).is_some_and(|for_op| is_candidate(for_op, unit_comp));
+            if candidate {
+                let rerolled = if lx_or_l0 {
+                    // `int max_burst = getMaxBurstSize(unit)` (`:184`).
+                    let Some(max_burst) = max_burst_size::<A>(unit_comp) else {
+                        panic!(
+                            "Cannot determine max burst size! ({unit_comp:?} states none, which is \
+                             the reference's DT_CHECK_MSG at \
+                             LoopEliminationViaRerolling.cpp:185)"
+                        )
+                    };
+                    remove_loops_containing_load_send_or_receive_store(
+                        block,
+                        InBlock(at),
+                        max_burst,
+                        values,
+                    )
+                } else if matches!(
+                    unit_comp,
+                    DfirUnit::Sfp | DfirUnit::Pe | DfirUnit::PtRow(_)
+                ) {
+                    remove_loops_containing_compute_op(block, InBlock(at), sen_target, values)
+                } else {
+                    // Neither arm applies on an L3 half: *"do not modify the burst in L3 units to
+                    // avoid load/store mismatches across cores"* (`:368-371`).
+                    Rerolled::Untouched
+                };
+                if rerolled == Rerolled::LoopIsToBeRemoved {
+                    here = at + hoist_body_front(block, at);
+                    for_op_to_be_deleted.push(ForRef(iv));
+                }
+            }
+        }
+        for region in regions_mut(&mut block[here]) {
+            reroll_pre_order::<A>(region, unit_comp, sen_target, for_op_to_be_deleted, values);
+        }
+        at = here + 1;
+    }
+}
+
+/// Replaces: e626_runOn
+///
+/// One program unit: every single-op loop it holds is rerolled into that op's burst size or unroll
+/// factor, its body hoisted out, and the emptied loops erased — then the code is simplified once
+/// (`:330-408`).
+///
+/// ⛔ THE DD2 EARLY RETURN IS A HARDWARE BUG, NOT A HEURISTIC (`:341-349`): rerolling an LDST inside
+/// an L0 half can make the implicit tile granularity smaller than the burst size.
+/// ⛔ A DECLINED SIMPLIFICATION DOES NOT STOP THE PASS (`:403-406`): `emitError` +
+/// `signalPassFailure()` sets a flag on the pass object, and `for_op_to_be_deleted_` is cleared anyway.
+pub fn run_on<A: Arch>(
+    preamble: &mut Vec<Op>,
+    unit: &mut ProgramUnit<A>,
+    sen_target: SenTarget,
+    evaluator: &mut impl ExpressionEvaluator,
+    propagation: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    values: &mut Values,
+) {
+    let unit_comp = unit.on.kind();
+    if A::GEN == IsaGen::Rcudd1a
+        && matches!(
+            unit_comp,
+            DfirUnit::L0 | DfirUnit::L0lu | DfirUnit::L0su
+        )
+    {
+        return;
+    }
+    let mut for_op_to_be_deleted = Vec::new();
+    reroll_pre_order::<A>(
+        &mut unit.body,
+        unit_comp,
+        sen_target,
+        &mut for_op_to_be_deleted,
+        values,
+    );
+    for doomed in &for_op_to_be_deleted {
+        erase_loop(&mut unit.body, *doomed);
+    }
+    if !for_op_to_be_deleted.is_empty() {
+        let _simplified = run_light_weight_simplifications(
+            preamble,
+            &mut unit.body,
+            evaluator,
+            propagation,
+            unit_index_map,
+            values,
+        );
+    }
+}
 
 // crustify:todo: e641_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:410  (8 body lines, level 7)
@@ -624,10 +804,43 @@ pub fn remove_loops_containing_compute_op(
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
     use crate::formats::Bits;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::transform::sentient::analyses::{
+        Evaluation, OffsetSites, Offsets, OutOfScopePropagationAnalysis, OutOfScopeUnitIndexMap,
+    };
     use crate::units::Row;
+
+    /// AN EVALUATOR THAT KNOWS NOTHING — every value is non-absolute with no base, which is what makes
+    /// the simplification e626 runs afterwards decline every arithmetic pattern.
+    struct BlindEvaluator;
+
+    impl ExpressionEvaluator for BlindEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            Evaluation {
+                known_absolute: false,
+                base: None,
+                offsets: Offsets::PerUnit(Vec::new()),
+            }
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("no op of this fixture evaluates a sum")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("no op of this fixture is known absolute")
+        }
+    }
 
     /// `sentient.scalar_constant` — one of the two ops e073 filters out.
     fn scalar_constant(result: Val) -> Op {
@@ -1015,5 +1228,64 @@ mod unit_tests {
             return None;
         };
         dbg_name.as_deref()
+    }
+    /// e626 — the whole unit, memory arm: the one candidate loop folds its trip into the burst, its
+    /// body is hoisted out ahead of it, the emptied loop is erased, and the reader is rewired.
+    #[test]
+    fn e626_rerolls_the_candidate_loop_and_erases_it() {
+        let mut unit = ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::Lxlu, Val(30)),
+            precision: None,
+            body: vec![
+                scalar_constant_of(Val(1), 3),
+                sentient_for_carrying(
+                    Val(1),
+                    vec![carried(Val(10), Val(11), Val(12))],
+                    vec![
+                        load_and_send(Val(11), Val(13), Elements(4), Elements(0)),
+                        yield_op(vec![Val(13)]),
+                    ],
+                ),
+                load_and_send(Val(12), Val(14), Elements(0), Elements(0)),
+            ],
+            arch: core::marker::PhantomData,
+        };
+        let mut preamble = Vec::new();
+        let mut values = Values::default();
+        for _ in 0..40 {
+            let _ = values.mint();
+        }
+
+        run_on(
+            &mut preamble,
+            &mut unit,
+            SenTarget::Sentient,
+            &mut BlindEvaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut values,
+        );
+
+        assert!(
+            !unit
+                .body
+                .iter()
+                .any(|op| matches!(op, Op::Sentient(sentient::Op::For { .. }))),
+            "the rerolled loop is gone: {:?}",
+            unit.body
+        );
+        // `LX_BURST` is 64, so a trip of 3 over a burst of 4 fits one burst of 12 and no residual.
+        let hoisted = unit
+            .body
+            .iter()
+            .filter_map(memory_op)
+            .map(|op| op.burst_size)
+            .collect::<Vec<_>>();
+        assert_eq!(hoisted, [Elements(12), Elements(0)]);
+        // ⭐ ONLY THE REROLLED OP IS RENAMED — the reader was never a candidate and keeps its name.
+        assert_eq!(
+            unit.body.iter().filter_map(dbg_name_of).collect::<Vec<_>>(),
+            ["LEVR(LS)", "LS"]
+        );
     }
 }

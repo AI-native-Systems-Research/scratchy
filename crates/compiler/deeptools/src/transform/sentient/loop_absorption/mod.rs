@@ -78,19 +78,24 @@
 //! | `e625_runOn` | 625 | 6 | 13 | `dcc/src/Transform/Sentient/LoopAbsorption.cpp:544` |
 //! | `e640_runOnOperation` | 640 | 7 | 5 | `dcc/src/Transform/Sentient/LoopAbsorption.cpp:558` |
 
-// ⛔ `e600_runLoopAbsorption` BELOW HAS NO CALLER UNTIL `e625_runOn` (level 6) LANDS, and CI runs
+// ⛔ `e625_runOn` BELOW HAS NO CALLER UNTIL `e640_runOnOperation` (level 7) LANDS, and CI runs
 // clippy with `-D warnings`. ⭐ REMOVE THIS WITH e640, when the pipeline calls the pass.
 #![allow(dead_code)]
 
 pub(crate) mod loop_absorption_manager;
 
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::Values;
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::{self as dialects, Op, sentient};
+use crate::model::Model;
 use crate::transform::sentient::ForRef;
+use crate::transform::sentient::analyses::{InstructionEstimator, OutOfScopeInstructionEstimator};
 use crate::transform::sentient::loop_absorption::loop_absorption_manager::{
     LoopAbsorptionManager, UnitSite,
 };
 use crate::transform::sentient::loop_tree::{LoopNodeId, LoopTree};
+use crate::workload::Workload;
 
 /// `for_op.getBody()->without_terminator().empty()` (`:517-518`) — `None` where this unit holds no such
 /// loop, which `getOpAs<sentient::ForOp>()` cannot ask because a node of the tree always does.
@@ -182,10 +187,34 @@ pub(crate) fn run_loop_absorption(
     check_and_absorb(root, &mut tree, preamble, unit_body, vals);
 }
 
-// crustify:todo: e625_runOn
-//   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:544  (13 body lines, level 6)
-//   original  : void LoopAbsorptionPass::runOn(ModuleOp module_op)
-//   calls     : e600_runLoopAbsorption
+/// `opts_.OptLevel == 0` (`:549`) — the PIPELINE's optimisation level, which is `2` by default
+/// (`dcc/tools/Options/dcc-pass-option.h:63-65`), so the shipped pipeline never reaches the
+/// `haveIbuffSpace` half of the `&&`.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// Replaces: e625_runOn
+///
+/// The module walk: absorbs the neighbours of every loop of every program unit whose instruction
+/// buffer is not already roomy (`:544-556`).
+///
+/// ⛔ `haveIbuffSpace` STAYS A `todo!` BEHIND [`OPT_LEVEL_ZERO`]: the pipeline fixes that const's
+/// value, not this pass, so flipping it reaches the estimator rather than quietly skipping a unit.
+/// ⭐ `unit_list` COLLAPSES — [`crate::islands::sentient::ProgramUnits::iter_mut`] hands out one unit
+/// at a time in walk order and absorbing in one reaches no other, so collect-then-run is one pass.
+pub fn run_on<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>, vals: &mut Values) {
+    let Program {
+        preamble, units, ..
+    } = program;
+    for unit in units.iter_mut() {
+        // `getChildAnalysis<InstructionEstimator>(unit)` IS CONSTRUCTED PER UNIT (`:547-548`), even
+        // for one the `&&` never asks anything of.
+        let mut instruction_estimator = OutOfScopeInstructionEstimator;
+        if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        run_loop_absorption(preamble, &mut unit.body, vals);
+    }
+}
 
 // crustify:todo: e640_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:558  (5 body lines, level 7)
@@ -196,9 +225,34 @@ pub(crate) fn run_loop_absorption(
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::Val;
     use crate::islands::sentient::dialects::sentient::RegType;
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
+    use crate::units::DfirUnit;
+
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     /// `%r = sentient.scalar_constant {value} : index`.
     fn constant(result: Val, value: i64) -> Op {
@@ -273,5 +327,79 @@ mod unit_tests {
             op,
             Op::Sentient(sentient::Op::ScalarConstant { value: 6, result, .. }) if *result == new
         )));
+    }
+    /// e625 — the module walk reaches EVERY unit: both units absorb their neighbour, and both new
+    /// bounds land in the ONE module block the `dataflow.program_unit`s sit in.
+    #[test]
+    fn e625_absorbs_in_every_program_unit() {
+        let mut vals = Values::default();
+        let mut absorbable = || {
+            let bound = vals.mint();
+            let (zero, other, iv, arg) = (vals.mint(), vals.mint(), vals.mint(), vals.mint());
+            let (result, inner, right) = (vals.mint(), vals.mint(), vals.mint());
+            vec![
+                constant(bound, 5),
+                constant(zero, 0),
+                constant(other, 3),
+                Op::Sentient(sentient::Op::For {
+                    iv,
+                    bound,
+                    bound_reg: None,
+                    carried: vec![sentient::Carried {
+                        init: zero,
+                        arg,
+                        result,
+                        reg: sentient::Reg {
+                            locale: RegType::Unknown,
+                            index: None,
+                        },
+                        program_header: false,
+                        element_size: None,
+                    }],
+                    dbg_name: None,
+                    body: vec![
+                        add(arg, arg, inner),
+                        Op::Sentient(sentient::Op::Yield {
+                            results: vec![inner],
+                        }),
+                    ],
+                }),
+                add(result, result, right),
+            ]
+        };
+        let (first, second) = (absorbable(), absorbable());
+        let unit = |body: Vec<Op>| ProgramUnit {
+            on: Units::one(DfirUnit::Lxlu, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(first), vec![unit(second)]),
+            bound: core::marker::PhantomData,
+        };
+
+        run_on(&mut program, &mut vals);
+
+        for unit in program.units.iter() {
+            assert_eq!(unit.body.len(), 3, "the neighbour was absorbed: {:?}", unit.body);
+        }
+        let new_bounds = program
+            .preamble
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::Sentient(sentient::Op::ScalarConstant { value: 6, .. })
+                )
+            })
+            .count();
+        assert_eq!(new_bounds, 2);
     }
 }

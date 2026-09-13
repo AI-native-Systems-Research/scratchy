@@ -670,10 +670,23 @@ pub fn run_on<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>, va
     }
 }
 
-// crustify:todo: e627_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:335  (5 body lines, level 6)
-//   original  : void LoopMergingPass::runOnOperation()
-//   calls     : e601_runOn
+/// `cl::opt<bool> DisableThisPass("dcc-loop-merging-disable", .., cl::init(false))`
+/// (`LoopMerging.cpp:33-35`) — off, so the shipped pipeline runs the pass.
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e627_runOnOperation
+///
+/// The pass entry: unless the flag turns the whole pass off, merge every unit's adjacent loops
+/// (`:335-339`).
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    run_on(program, values);
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -967,5 +980,45 @@ mod unit_tests {
             assert_eq!(loops, 1, "each unit's pair merged: {:?}", unit.body);
         }
     }
-}
+    /// e627 — the pass entry with the flag off does what e601 does: the unit's pair merges.
+    #[test]
+    fn e627_runs_the_pass_when_the_flag_is_off() {
+        let mut values = Values::default();
+        for _ in 0..40 {
+            let _ = values.mint();
+        }
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(99)),
+                    precision: None,
+                    body: vec![
+                        constant_of(Val(0), 4),
+                        constant_of(Val(1), 6),
+                        loop_over(Val(0), Val(10), None),
+                        loop_over(Val(1), Val(11), None),
+                    ],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
 
+        run_on_operation(&mut program, &mut values);
+
+        let loops = program
+            .units
+            .iter()
+            .flat_map(|unit| unit.body.iter())
+            .filter(|op| matches!(op, Op::Sentient(sentient::Op::For { .. })))
+            .count();
+        assert_eq!(loops, 1);
+    }
+}

@@ -81,14 +81,21 @@
 //! | `e623_runOnOperation` | 623 | 6 | 12 | `dcc/src/Transform/Sentient/LightweightSimplification.cpp:335` |
 
 #![allow(dead_code)]
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e597_runLightWeightSimplifications` (level 5, in
-// `sentient.rs`) is what calls everything below, and its own caller `e623_runOnOperation` (level 6)
-// is not in this batch. ⭐ REMOVE THIS WITH e623.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e623_runOnOperation` is the entry, and nothing
+// runs it until a pass driver schedules it. CI runs clippy with `-D warnings`, so without this the
+// items below fail the gate. ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor.
 
 use super::ForRef;
-use super::analyses::{ExpressionEvaluator, OffsetSites, ScalarOffset};
+use super::analyses::{
+    ExpressionEvaluator, OffsetSites, PropagationAnalysis, ScalarOffset, UnitIndexMap,
+};
+use crate::arch::Arch;
 use crate::formats::Bits;
+use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::Program;
+use crate::model::Model;
+use crate::workload::Workload;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{Op, Val, defining_op, replace_all_uses_with, use_count};
 
@@ -405,17 +412,70 @@ pub(crate) fn simplify_trivial_loop(block: &mut Vec<Op>, loop_ref: ForRef) -> Si
     Simplified::Rewritten
 }
 
-// crustify:todo: e623_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LightweightSimplification.cpp:335  (12 body lines, level 6)
-//   original  : void LightweightSimplificationPass::runOnOperation()
-//   calls     : e597_runLightWeightSimplifications
+/// Replaces: e623_runOnOperation
+///
+/// The pass entry: run the lightweight simplifications over every program unit of the module
+/// (`:335-346`).
+///
+/// ⛔ A DECLINED SIMPLIFICATION DOES NOT STOP THE WALK (`:340-343`): `emitError` +
+/// `signalPassFailure()` sets a flag on the pass object, and the next unit still runs.
+/// ⭐ `const_builder` AT THE START OF `unit->getBlock()` IS `program.preamble` — the module block the
+/// `dataflow.program_unit` itself sits in — and `WalkResult::skip()` is what
+/// [`crate::islands::sentient::ProgramUnits::iter_mut`] already is.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    evaluator: &mut impl ExpressionEvaluator,
+    propagation: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    values: &mut Values,
+) {
+    let Program {
+        preamble, units, ..
+    } = program;
+    for unit in units.iter_mut() {
+        let _simplified = sentient::run_light_weight_simplifications(
+            preamble,
+            &mut unit.body,
+            evaluator,
+            propagation,
+            unit_index_map,
+            values,
+        );
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::islands::dataflow_ir::Values;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units, Values};
     use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegIndex, RegType};
-    use crate::transform::sentient::analyses::{BaseValue, Evaluation, Offsets};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
+    use crate::transform::sentient::analyses::{
+        BaseValue, Evaluation, Offsets, OutOfScopePropagationAnalysis, OutOfScopeUnitIndexMap,
+    };
+    use crate::units::DfirUnit;
+
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     /// AN EVALUATOR THAT ANSWERS WHAT THE TEST SAYS. ⛔ The analysis behind
     /// [`ExpressionEvaluator`] is out of campaign scope, so a test STATES its answers rather than
@@ -683,5 +743,65 @@ mod unit_tests {
         );
         // The reader of the loop's result now reads what the yield handed back.
         assert_eq!(block[4], add(Val(5), Val(5), Val(6)));
+    }
+    /// e623 — the entry reaches EVERY unit of the module: each one's empty `sentient.for` is folded
+    /// away, and the declined simplification of one unit does not stop the walk.
+    #[test]
+    fn e623_simplifies_every_program_unit() {
+        let body = || {
+            vec![
+                constant(4, Val(0)),
+                Op::Sentient(ops::Op::For {
+                    iv: Val(1),
+                    bound: Val(0),
+                    bound_reg: None,
+                    carried: Vec::new(),
+                    dbg_name: None,
+                    body: vec![Op::Sentient(ops::Op::Yield {
+                        results: Vec::new(),
+                    })],
+                }),
+            ]
+        };
+        let unit = |body: Vec<Op>| ProgramUnit {
+            on: Units::one(DfirUnit::Lxlu, Val(99)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(body()), vec![unit(body())]),
+            bound: core::marker::PhantomData,
+        };
+        let mut evaluator = StatedEvaluator {
+            answers: Vec::new(),
+            offset: Val(50),
+        };
+        let mut values = values_after(100);
+
+        run_on_operation(
+            &mut program,
+            &mut evaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut values,
+        );
+
+        for unit in program.units.iter() {
+            assert!(
+                !unit
+                    .body
+                    .iter()
+                    .any(|op| matches!(op, Op::Sentient(ops::Op::For { .. }))),
+                "the empty loop of every unit went: {:?}",
+                unit.body
+            );
+        }
     }
 }

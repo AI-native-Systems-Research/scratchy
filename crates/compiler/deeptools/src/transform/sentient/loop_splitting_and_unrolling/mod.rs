@@ -95,22 +95,29 @@
 //! | `e629_runOnOperation` | 629 | 6 | 61 | `dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:1019` |
 
 #![allow(dead_code)]
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e629_runOnOperation` (level 6) is what calls this
-// file's driver, and every unit below is reachable only from the tests until it lands. CI runs clippy
-// with `-D warnings`. ⭐ REMOVE THIS WITH e629.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e629_runOnOperation` (level 6) is the entry, and
+// nothing runs it until a pass driver schedules it. CI runs clippy with `-D warnings`, so without this
+// the items below fail the gate. ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::ForRef;
-use super::analyses::{InstructionCount, InstructionEstimator};
+use super::analyses::{
+    ExpressionEvaluator, InstructionCount, InstructionEstimator, PropagationAnalysis, UnitIndexMap,
+};
 use super::cfg_simplification_sentient_level::pattern_simplification_manager::OpPath;
+use super::lightweight_simplification::sentient::run_light_weight_simplifications;
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
     Op, Val, clone_ops, defining_op, replace_all_uses_with, use_count,
 };
+use crate::model::Model;
 use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 /// THE PASS'S OWN STATE (`LoopSplittingAndUnrolling.cpp:125-129`) — the candidate list and its ibuff
 /// costs, which is everything [`cleanup_and_recalculate`] touches.
@@ -1788,18 +1795,201 @@ pub(crate) fn find_best_loop_node_to_optimize<E: InstructionEstimator, T: Condit
     }
 }
 
-// crustify:todo: e629_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:1019  (61 body lines, level 6)
-//   original  : void LoopSplittingAndUnrollingPass::runOnOperation()
-//   calls     : e087_cleanupAndRecalculate, e567_doSplitOrUnroll, e597_runLightWeightSimplifications, e603_findBestLoopNodeToOptimize
+/// `cl::opt<bool> DisableThisPass("dcc-loop-unroll-and-split-disable", .., cl::init(false))`
+/// (`:41-44`) — off, so the shipped pipeline runs the pass.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `cl::opt<bool> UseUnderEstimatedIE("dcc-loop-unroll-split-under-estimated-ie", .., cl::init(false))`
+/// (`:50-54`) — off; the mode the pipeline really uses arrives as [`IeMode`] instead.
+const USE_UNDER_ESTIMATED_IE: bool = false;
+
+/// WHICH INSTRUCTION ESTIMATOR THE ROUND WAS BUILT WITH — `CommonPassOptions::IEMode`
+/// (`dcc/tools/Options/dcc-pass-option.h:117-120`).
+///
+/// ⭐ THE PIPELINE REALLY SETS IT: this pass is instantiated
+/// `LoopMergeCoalesceBucketIterations` times and the FIRST instantiation is handed
+/// `kUnderEstimate` *"to perform more aggressive loop splitting"*
+/// (`dcc/tools/dcc-standalone/dcc-standalone-main.cpp:527-534`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IeMode {
+    /// `kConservative` — *"fast but conservative (default)"*.
+    Conservative,
+    /// `kUnderEstimate` — *"ignoring implicit copy from add/sub/for-op"*.
+    UnderEstimate,
+}
+
+/// THE BLOCK A LOOP SITS IN AND ITS POSITION THERE, MUTABLY — `getParentOp()`'s region, which is both
+/// the scope [`do_split_or_unroll`] rewrites and the one e629 then simplifies. [`loop_site`] answers
+/// the same question for a reader that also needs the enclosing scopes.
+fn loop_site_mut(scope: &mut Vec<Op>, loop_ref: ForRef) -> Option<(&mut Vec<Op>, usize)> {
+    let here = scope
+        .iter()
+        .position(|op| matches!(op, Op::Sentient(ops::Op::For { iv, .. }) if *iv == loop_ref.0));
+    if let Some(at) = here {
+        return Some((scope, at));
+    }
+    for op in scope.iter_mut() {
+        match op {
+            Op::Sentient(inner) => {
+                for region in ops::regions_mut(inner) {
+                    if let Some(site) = loop_site_mut(region, loop_ref) {
+                        return Some(site);
+                    }
+                }
+            }
+            Op::AffineFor(loop_op) => {
+                if let Some(site) = loop_site_mut(&mut loop_op.body, loop_ref) {
+                    return Some(site);
+                }
+            }
+            // ⭐ A LOWER-RUNG REGION CANNOT HOLD A `sentient.for`: it is typed with the rung below's
+            // `Op`, which has no `Sentient` arm.
+            _ => {}
+        }
+    }
+    None
+}
+
+/// e629's `while (true)` over ONE program unit (`:1039-1074`).
+///
+/// ⭐ GENERIC OVER THE ESTIMATOR so the `UnderEstimateInstructionEstimator` swap is a different TYPE
+/// rather than a different value — the reference's `ie` reassignment is one analysis replacing another.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference reaches the pass state, four analyses and the module through `this` and \
+              the pass manager, and neither is a thing this crate has"
+)]
+fn optimize_one_unit<E: InstructionEstimator, C: IfOpCanonicalizer, T: ConditionalTree>(
+    pass: &mut LoopSplittingAndUnrolling,
+    preamble: &mut Vec<Op>,
+    unit_body: &mut Vec<Op>,
+    on: DfirUnit,
+    unrolling: Unrolling,
+    ie: &mut E,
+    canonicalizer: &mut C,
+    tree: &mut T,
+    evaluator: &mut impl ExpressionEvaluator,
+    propagation: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    values: &mut Values,
+) {
+    let mut forest = LoopForest::of(unit_body);
+    loop {
+        cleanup_and_recalculate(pass, &mut forest, ie, canonicalizer, unit_body);
+        let best =
+            find_best_loop_node_to_optimize(pass, &forest, ie, tree, unit_body, on, unrolling);
+        let Some(chosen) = best.node.and_then(|node| forest.node(node)).and_then(|node| node.op)
+        else {
+            break;
+        };
+        // `auto parentOp = ...getParentOp()` IS TAKEN BEFORE THE REWRITE (`:1055`) — the block stays
+        // put while `doSplitOrUnroll` replaces the loop inside it.
+        let Some((parent_block, at)) = loop_site_mut(unit_body, chosen) else {
+            break;
+        };
+        do_split_or_unroll(pass, chosen, best.optimization, parent_block, at, values);
+        // "Unrolling or Splitting can present some opportunities for simplification" (`:1063-1069`);
+        // a refusal is `emitError` + `signalPassFailure()`, which stops neither the walk nor the loop.
+        let _simplified = run_light_weight_simplifications(
+            preamble,
+            parent_block,
+            evaluator,
+            propagation,
+            unit_index_map,
+            values,
+        );
+    }
+    cleanup_and_recalculate(pass, &mut forest, ie, canonicalizer, unit_body);
+    // "Clear gathered information for this unit_op before going to other" (`:1072-1074`).
+    pass.can_not_split.clear();
+    pass.can_not_unroll.clear();
+}
+
+/// Replaces: e629_runOnOperation
+///
+/// The pass entry: unless the flag turns the whole pass off, splits or unrolls the best-priced loop of
+/// every program unit, over and over, until no loop is worth optimising (`:1019-1078`).
+///
+/// ⛔ THE UNDER-ESTIMATING ESTIMATOR ALSO DISABLES UNROLLING (`:1031-1037`): ONE branch sets both, and
+/// only on an L3 load half — an under-estimated ibuff would let unrolling overfill it.
+/// ⭐ `markAnalysesPreserved<InstructionEstimator>()` at `OptLevel == 0` (`:1077`) is pass-manager
+/// cache bookkeeping: it touches no IR, and this crate hands its analyses in as parameters.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "five analyses, the pass state and the estimator mode all reach the reference through \
+              `this` and the pass manager"
+)]
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    pass: &mut LoopSplittingAndUnrolling,
+    program: &mut Program<A, M, W>,
+    ie_mode: IeMode,
+    ie: &mut impl InstructionEstimator,
+    under_estimating_ie: &mut impl InstructionEstimator,
+    canonicalizer: &mut impl IfOpCanonicalizer,
+    tree: &mut impl ConditionalTree,
+    evaluator: &mut impl ExpressionEvaluator,
+    propagation: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    let Program {
+        preamble, units, ..
+    } = program;
+    for unit in units.iter_mut() {
+        let on = unit.on.kind();
+        if (matches!(ie_mode, IeMode::UnderEstimate) || USE_UNDER_ESTIMATED_IE)
+            && matches!(on, DfirUnit::L3lu)
+        {
+            optimize_one_unit(
+                pass,
+                preamble,
+                &mut unit.body,
+                on,
+                Unrolling::Disabled,
+                under_estimating_ie,
+                canonicalizer,
+                tree,
+                evaluator,
+                propagation,
+                unit_index_map,
+                values,
+            );
+        } else {
+            optimize_one_unit(
+                pass,
+                preamble,
+                &mut unit.body,
+                on,
+                Unrolling::Allowed,
+                ie,
+                canonicalizer,
+                tree,
+                evaluator,
+                propagation,
+                unit_index_map,
+                values,
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::arch::Elements;
+    use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType, Yielded};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
+    use crate::transform::sentient::analyses::{
+        OutOfScopeEvaluator, OutOfScopeInstructionEstimator, OutOfScopePropagationAnalysis,
+        OutOfScopeUnitIndexMap,
+    };
 
     /// AN ESTIMATOR THAT ANSWERS WHAT THE TEST SAYS. ⛔ `InstructionEstimatorImpl` is out of campaign
     /// scope, so a test STATES its counts rather than deriving them — the effect under test is what
@@ -2766,5 +2956,92 @@ mod unit_tests {
                 optimization: Optimization::Unroll,
             }
         );
+    }
+
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e629 — the driver reaches EVERY unit and keeps going until nothing is left to optimise: each
+    /// unit's bound-1 loop is unrolled away, and the trailing `cleanupAndRecalculate` runs once more
+    /// after the round that found nothing.
+    #[test]
+    fn e629_optimizes_every_unit_until_no_loop_is_left_worth_it() {
+        let mut values = Values::default();
+        let mut unrollable = || {
+            let (bound, iv) = (values.mint(), values.mint());
+            vec![
+                constant(1, bound),
+                for_loop(iv, bound, Vec::new(), vec![nop("body"), yields(Vec::new())]),
+            ]
+        };
+        let (first, second) = (unrollable(), unrollable());
+        let unit = |body: Vec<Op>| ProgramUnit {
+            on: Units::one(DfirUnit::Lxlu, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(first), vec![unit(second)]),
+            bound: core::marker::PhantomData,
+        };
+        let mut pass = LoopSplittingAndUnrolling::default();
+        let mut ie = StatedEstimator {
+            ibuff_space: 100,
+            per_op: 1,
+            ..StatedEstimator::default()
+        };
+
+        run_on_operation(
+            &mut pass,
+            &mut program,
+            IeMode::Conservative,
+            &mut ie,
+            &mut OutOfScopeInstructionEstimator,
+            &mut RecordingCanonicalizer::default(),
+            &mut StatedTree::default(),
+            &mut OutOfScopeEvaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut values,
+        );
+
+        for unit in program.units.iter() {
+            assert!(
+                !unit
+                    .body
+                    .iter()
+                    .any(|op| matches!(op, Op::Sentient(ops::Op::For { .. }))),
+                "the loop was unrolled away: {:?}",
+                unit.body
+            );
+        }
+        assert_eq!(pass.loops_unroll_count, 2);
+        // Per unit: the round that unrolled, the round that found nothing, and the trailing one.
+        assert_eq!(ie.recalculated, 6);
+        assert!(pass.can_not_split.is_empty() && pass.can_not_unroll.is_empty());
     }
 }

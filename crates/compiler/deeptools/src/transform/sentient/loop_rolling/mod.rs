@@ -97,11 +97,6 @@
 // ── STILL SCHEDULED IN THIS FILE (levels 1..8) — anchors, not dead comments. ⛔ Do not delete one
 // you did not port; on bridge 2 that silently lost 149 of 384 functions.
 
-// crustify:todo: e628_matchAndRoll
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:758  (104 body lines, level 6)
-//   original  : void matchAndRoll(std::vector<Window *>::iterator &next)
-//   calls     : e081_deleteMatchedOps, e082_updateEndOpsOfMatchedOps, e084_updateBody, e252_size, e512_collectStartingValIterArgs, e602_compareToNextWindow
-
 // crustify:todo: e642_rollInstrsInBlock
 //   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:886  (77 body lines, level 7)
 //   original  : void rollInstrsInBlock(dcc::OperationEquivalence &oe, dcc::CommonPassOptions &opts, OpBuilder &const_builder, Block &bb, bool is_L3_case)
@@ -1310,6 +1305,197 @@ impl LoopRollingManager {
         }
         rolled.yield_at += inserted;
     }
+
+    /// Replaces: e628_matchAndRoll
+    ///
+    /// Matches windows forward from `start` for as long as each repeats the last, and — once enough of
+    /// them have — rolls them into one `sentient.for` that replaces the originals (`:758-861`).
+    ///
+    /// ⛔ `next` IS AN IN/OUT PARAMETER, exactly as the reference's `iterator &`: on a mismatch it is
+    /// left ON the window that failed, which is the next attempt's start.
+    /// ⛔ THE ERASED RANGE IS `[start.effective_start, second_last.end]` — the LAST window's ops are
+    /// not erased, they were MOVED into the body by [`Self::update_body`], and the loop takes their
+    /// place. ⭐ `oe_.clearCache()` (`:857`) is dropped with the cache it clears.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the reference reaches the block, the constant block, the window list and the value \
+                  minter through `this` and two `OpBuilder &`s, and neither is a thing this crate has"
+    )]
+    pub(crate) fn match_and_roll(
+        &mut self,
+        next: &mut WindowIndex,
+        windows: &mut [Window],
+        block: &mut Vec<Op>,
+        consts: &mut Vec<Op>,
+        key_vals: &[Val],
+        values: &mut Values,
+    ) {
+        let (Some(start_size), Some(start_end)) = (
+            windows.get(self.start.0).map(|window| window.size),
+            windows.get(self.start.0).map(|window| window.end),
+        ) else {
+            return;
+        };
+        // "Cannot match if next window is larger."
+        let Some(next_size) = windows.get(next.0).map(|window| window.size) else {
+            return;
+        };
+        if next_size.0 > start_size.0 {
+            return;
+        }
+        // "Cannot match certain instructions in the single instruction case."
+        if self.case == RollingCase::SingleInstrWindows
+            && matches!(
+                block.get(start_end.0),
+                Some(
+                    Op::Sentient(sentient::Op::ScalarConstant { .. })
+                        | Op::Dataflow(dataflow::Op::GetUnit { .. })
+                )
+            )
+        {
+            return;
+        }
+
+        // `auto cur = start_;` and its predecessor, carried rather than recomputed by `std::prev`:
+        // the profitability test below is what makes `second_last` a window at all.
+        let mut cur = self.start;
+        let mut second_last = self.start;
+        let mut count: u32 = 1;
+        while *next != self.window_list_end {
+            // "No hope to match windows if their sizes are different."
+            let (Some(cur_size), Some(next_size)) = (
+                windows.get(cur.0).map(|window| window.size),
+                windows.get(next.0).map(|window| window.size),
+            ) else {
+                break;
+            };
+            if count > 1 && next_size != cur_size {
+                break;
+            }
+            let role = if cur == self.start {
+                WindowRole::Start
+            } else {
+                WindowRole::Follower
+            };
+            let (before, from_next) = windows.split_at_mut(next.0);
+            let (Some(cur_window), Some(next_window)) = (before.get_mut(cur.0), from_next.first())
+            else {
+                break;
+            };
+            // The definitions are read-only and only this phase needs them, so they are built here
+            // rather than held: `consts` is the enclosing block a hoisted constant is defined in.
+            let regions: [&[Op]; 2] = [block, consts];
+            let matched = self.compare_to_next_window(
+                role,
+                cur_window,
+                next_window,
+                block,
+                key_vals,
+                Definitions::from_innermost(&regions),
+            );
+            if !matched {
+                break;
+            }
+            count += 1;
+            second_last = cur;
+            cur = *next;
+            *next = WindowIndex(next.0 + 1);
+        }
+
+        // "In the single instruction case, it's profitable to roll only if at least 4 matching
+        // windows are found."
+        if count > 3 || (self.case == RollingCase::L3SoftSyncWindows && count > 1) {
+            let (Some(cur_end), Some(effective_start), Some(second_last_end)) = (
+                windows.get(cur.0).map(|window| window.end),
+                windows.get(self.start.0).map(|window| window.effective_start),
+                windows.get(second_last.0).map(|window| window.end),
+            ) else {
+                self.delete_matched_ops();
+                return;
+            };
+            // Everything after the last rolled window is touched by neither the moves nor the
+            // erasure, so its length is where the new loop goes.
+            let after_cur_window = block.len().saturating_sub(cur_end.0 + 1);
+            if let Some(end_window) = windows.get(cur.0) {
+                self.update_end_ops_of_matched_ops(end_window);
+            }
+
+            // "Determine the starting values of the new iterator arguments. If the number of iterator
+            // arguments exceeds the allowance, do not roll." `zero` is minted first because e512 is
+            // the one that erases it again on every path that does not place it.
+            let zero = values.mint();
+            consts.push(scalar_constant(zero, 0));
+            let mut starting_vals: Vec<Val> = Vec::new();
+            let collected = match (windows.get(self.start.0), windows.get(cur.0)) {
+                (Some(start_window), Some(cur_window)) => self.collect_starting_val_iter_args(
+                    start_window,
+                    cur_window,
+                    &mut starting_vals,
+                    zero,
+                    block,
+                    consts,
+                ),
+                _ => false,
+            };
+            if collected {
+                let bound = values.mint();
+                consts.push(scalar_constant(bound, i64::from(count)));
+                self.new_loop_count = NewLoopCount(self.new_loop_count.0 + 1);
+                // `body_block.addArgument` once for the induction variable, then one per starting
+                // value; `regLocales` is created from an EMPTY vector (`:816-819`).
+                let iv = values.mint();
+                let carried: Vec<sentient::Carried> = starting_vals
+                    .iter()
+                    .map(|init| sentient::Carried {
+                        init: *init,
+                        arg: values.mint(),
+                        result: values.mint(),
+                        reg: sentient::Reg {
+                            locale: sentient::RegType::Unknown,
+                            index: None,
+                        },
+                        program_header: false,
+                        element_size: None,
+                    })
+                    .collect();
+                let mut rolled = RolledLoop {
+                    carried,
+                    body: vec![Op::Sentient(sentient::Op::Yield {
+                        results: starting_vals.clone(),
+                    })],
+                    yield_at: 0,
+                };
+                if let Some(cur_window) = windows.get(cur.0) {
+                    self.update_body(cur_window, &mut rolled, block, consts, values);
+                }
+                // `yield_op->moveBefore(&body_block, body_block.end())` (`:844`) — the adds e084 built
+                // after it now precede it.
+                let yielded = rolled.body.remove(rolled.yield_at);
+                rolled.body.push(yielded);
+                rolled.yield_at = rolled.body.len() - 1;
+
+                // "Remove the original instructions, proceeding backwards from the second last
+                // window's end", the trailing `start_of_first_window->erase()` included — one closed
+                // range, since a backwards walk that erases as it goes is exactly a drain.
+                if effective_start.0 <= second_last_end.0 && second_last_end.0 < block.len() {
+                    block.drain(effective_start.0..=second_last_end.0);
+                }
+                let at = block.len().saturating_sub(after_cur_window);
+                block.insert(
+                    at,
+                    Op::Sentient(sentient::Op::For {
+                        iv,
+                        bound,
+                        bound_reg: None,
+                        carried: rolled.carried,
+                        dbg_name: Some(format!("LR loop #{}", self.new_loop_count.0)),
+                        body: rolled.body,
+                    }),
+                );
+            }
+        }
+        self.delete_matched_ops();
+    }
 }
 
 /// The `uniform.query_map`'s `$map`, when that is what defines a value.
@@ -1842,5 +2028,81 @@ mod unit_tests {
         let (matched, followed, ..) = compare(20);
         assert!(matched);
         assert!(!followed);
+    }
+
+    /// e628 — four single-instruction windows at a constant stride roll into ONE `sentient.for`: the
+    /// originals are gone, the loop sits where the last window ended, the reader past it takes the
+    /// loop's result, and `next` is left at the end of the window list.
+    #[test]
+    fn e628_rolls_four_matching_windows_into_one_loop() {
+        let mut values = Values::default();
+        let shared = values.mint();
+        // `%c = constant 4 + 6n` / `%r = add %c, %shared`, four times, then a reader of the last.
+        let steps: Vec<(Val, Val)> = (0..4).map(|_| (values.mint(), values.mint())).collect();
+        let mut block: Vec<Op> = steps
+            .iter()
+            .enumerate()
+            .map(|(n, (constant, _))| scalar_constant(*constant, 4 + 6 * n as i64))
+            .collect();
+        block.extend(steps.iter().map(|(constant, result)| add(*constant, shared, *result)));
+        let last_result = steps[3].1;
+        let tail = values.mint();
+        block.push(add(last_result, last_result, tail));
+        let mut windows: Vec<Window> = (4..8).map(|at| window_at(InstrPos(at), &block)).collect();
+        let mut manager = LoopRollingManager::over(
+            RollingCase::SingleInstrWindows,
+            NewLoopCount(0),
+            WindowIndex(0),
+            WindowIndex(4),
+        );
+        let mut consts: Vec<Op> = Vec::new();
+        let mut next = WindowIndex(1);
+
+        manager.match_and_roll(
+            &mut next,
+            &mut windows,
+            &mut block,
+            &mut consts,
+            &[],
+            &mut values,
+        );
+
+        // Every window was consumed, and the attempt's matches were dropped after it.
+        assert_eq!(next, WindowIndex(4));
+        assert!(manager.matched_ops.is_empty());
+        assert_eq!(manager.new_loop_count, NewLoopCount(1));
+        // The four constants stay, the four adds are replaced by the loop, the reader follows it.
+        assert_eq!(block.len(), 6);
+        let Op::Sentient(sentient::Op::For {
+            bound,
+            carried,
+            dbg_name,
+            body,
+            ..
+        }) = &block[4]
+        else {
+            panic!("the rolled loop sits where the last window ended: {:?}", block)
+        };
+        assert_eq!(dbg_name.as_deref(), Some("LR loop #1"));
+        // One iteration argument for the stride, one for the result read past the last window.
+        assert_eq!(carried.len(), 2);
+        assert_eq!(carried[0].init, steps[0].0);
+        // The bound is `count`, and the stride constant is the one e084 built.
+        assert!(consts.contains(&scalar_constant(*bound, 4)));
+        assert!(consts.iter().any(|op| matches!(
+            op,
+            Op::Sentient(sentient::Op::ScalarConstant { value: 6, .. })
+        )));
+        // The moved op, the `iter_arg + delta` it yields, then the yield.
+        assert_eq!(body.len(), 3);
+        assert!(matches!(
+            body[2],
+            Op::Sentient(sentient::Op::Yield { .. })
+        ));
+        // The reader past the last window now reads the loop's own result.
+        assert_eq!(
+            block[5],
+            add(carried[1].result, carried[1].result, tail)
+        );
     }
 }

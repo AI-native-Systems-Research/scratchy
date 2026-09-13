@@ -99,7 +99,9 @@
 use core::fmt::Write as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{
     self as dialects, Definitions, Op, UniformRegions, Val, sentient, symbol, uniform,
 };
@@ -271,6 +273,8 @@ pub(crate) struct EnhancedDeadVariableElimination {
     conflicts: Vec<InfluenceConflict>,
     /// The other `signalPassFailure()` this pass makes — e301's misplaced transfers.
     misplaced: Vec<MisplacedTransfer>,
+    /// The third one: whatever e622 found still queued when it was handed a unit.
+    stale_worklist: Vec<Val>,
 }
 
 impl EnhancedDeadVariableElimination {
@@ -349,6 +353,13 @@ impl EnhancedDeadVariableElimination {
     #[must_use]
     pub(crate) fn misplaced(&self) -> &[MisplacedTransfer] {
         &self.misplaced
+    }
+
+    /// Every value e622 found still queued when it was handed a unit — the entry check's
+    /// `signalPassFailure()`.
+    #[must_use]
+    pub(crate) fn stale_worklist(&self) -> &[Val] {
+        &self.stale_worklist
     }
 
     /// [`Self::add_to_work_list_and_update_assignment`] with the value's own [`Origin`], which is
@@ -1069,10 +1080,30 @@ impl EnhancedDeadVariableElimination {
     }
 }
 
-// crustify:todo: e622_runOn
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:710  (36 body lines, level 6)
-//   original  : void EnhancedDeadVariableEliminationPass::runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e043_removeConstantIterArgs, e300_processWorkList, e437_initializeWorkList, e596_updateProgramUnit
+impl EnhancedDeadVariableElimination {
+    /// Replaces: e622_runOn
+    ///
+    /// One program unit end to end: fold the constant iter args away, seed the influences, propagate
+    /// them to a fixed point, then delete every value left with none (`:710-745`).
+    ///
+    /// ⛔ THE ENTRY `signalPassFailure()` (`:711-715`) IS DATA: a worklist left over from the previous
+    /// unit is a defect in this pass, not a reason to stop, and the reference runs the unit anyway —
+    /// so it is recorded and deliberately NOT drained.
+    /// ⭐ `clear()` (`:56`) CLEARS THE ASSIGNMENTS ALONE, which is why `conflicts` and `misplaced`
+    /// accumulate across the units of one module.
+    /// ⭐ `current_unit_type_` IS `senCompToGenericComp.at(getUnits()[0]...)` — [`GenericComp`] here,
+    /// and `current_unit_` is the body plus the module block around it.
+    pub fn run_on<A: Arch>(&mut self, preamble: &[Op], unit: &mut ProgramUnit<A>) {
+        let stale: Vec<Val> = self.worklist.iter().copied().collect();
+        self.stale_worklist.extend(stale);
+        let on = unit.on.kind().generic();
+        self.assignments.clear();
+        remove_constant_iter_args(&mut unit.body);
+        self.initialize_work_list(&unit.body, on, &[preamble]);
+        self.process_work_list(Definitions::from_innermost(&[&unit.body, preamble]));
+        self.update_program_unit(&mut unit.body);
+    }
+}
 
 // crustify:todo: e639_runOnOperation
 //   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:58  (6 body lines, level 7)
@@ -1082,10 +1113,12 @@ impl EnhancedDeadVariableElimination {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::arch::Elements;
+    use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::units::DfirUnit;
     use crate::islands::sentient::dialects::sentient::{
         Carried, CmpPredicate, Extent, Reg, RegType, ShuffleMode, Yielded,
     };
@@ -1595,5 +1628,60 @@ mod unit_tests {
         pass.update_program_unit(&mut unit_body);
 
         assert_eq!(unit_body, vec![nop()]);
+    }
+
+    /// e622 — one unit, all four steps: the constant iter arg is folded into its init, the influence
+    /// of the surviving `set_mask` keeps that init alive, the unread constant beside it goes, and the
+    /// loop loses the position whose result and argument both ended up influenceless.
+    #[test]
+    fn e622_runs_the_whole_elimination_over_one_unit() {
+        let mut unit = ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::Lxlu, Val(0)),
+            precision: None,
+            body: vec![
+                constant(Val(0), 3),
+                constant(Val(1), 7),
+                for_op(
+                    10,
+                    0,
+                    vec![carried(0, 11, 12)],
+                    vec![
+                        Op::Sentient(sentient::Op::SetMask {
+                            mask_value: Val(11),
+                            dbg_name: None,
+                        }),
+                        yield_op(vec![Val(11)]),
+                    ],
+                ),
+            ],
+            arch: core::marker::PhantomData,
+        };
+        let mut pass = EnhancedDeadVariableElimination::default();
+
+        pass.run_on(&[], &mut unit);
+
+        // `%1` was read by nobody and influenced nothing; `%0` is the bound AND the folded init.
+        assert_eq!(unit.body.len(), 2);
+        assert!(matches!(
+            unit.body[0],
+            Op::Sentient(sentient::Op::ScalarConstant { value: 3, .. })
+        ));
+        let Op::Sentient(sentient::Op::For { carried, body, .. }) = &unit.body[1] else {
+            panic!("the loop survives: {:?}", unit.body);
+        };
+        // e043 replaced the iter arg with its init, so e596 found the position dead and dropped it.
+        assert!(carried.is_empty());
+        assert_eq!(
+            body[0],
+            Op::Sentient(sentient::Op::SetMask {
+                mask_value: Val(0),
+                dbg_name: None,
+            })
+        );
+        assert_eq!(body[1], yield_op(Vec::new()));
+        assert_eq!(pass.influence_type(Val(0)), Influence::Memory);
+        assert!(pass.conflicts().is_empty());
+        assert!(pass.misplaced().is_empty());
+        assert!(pass.stale_worklist().is_empty());
     }
 }

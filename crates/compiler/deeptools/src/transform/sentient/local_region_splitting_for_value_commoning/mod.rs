@@ -90,11 +90,13 @@ pub(crate) mod uniform_region;
 use crate::arch::{Arch, IsaGen};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
-use crate::islands::sentient::ProgramUnit;
+use crate::islands::sentient::{Program, ProgramUnit};
 use crate::islands::sentient::dialects::{
     self as dialects, Definitions, Op, UniformRegions, Val, sentient, uniform,
 };
+use crate::model::Model;
 use crate::transform::sentient::utils::{Hoisted, NewUse, move_to_common_dominator, path_of};
+use crate::workload::Workload;
 use crate::units::DfirUnit;
 use local_region::{LocalRegion, OriginalRegion};
 use sentient::RegType;
@@ -686,18 +688,62 @@ pub fn run_on<A: Arch>(unit: &mut ProgramUnit<A>, limits: PretendRegLimits, valu
     run::<A>(&mut unit.body, RegType::Ebr, comp, limits, values);
 }
 
-// crustify:todo: e624_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:233  (6 body lines, level 6)
-//   original  : void LocalRegionSplittingForValueCommoningPass::runOnOperation()
-//   calls     : e599_runOn
+/// `cl::opt<bool> DisableThisPass("dcc-local-region-splitting-for-value-commoning-disable", ..,
+/// cl::init(false))` (`:117-120`) — off, so the shipped pipeline runs the pass.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `-..-max-lbr` and `-..-max-ebr`, both `cl::init(0)` (`:122-130`), and 0 is the "no pretend limit"
+/// the `if (MaxLBR)` guard reads as absent — [`PretendRegLimits`]'s `None`.
+const PRETEND_REG_LIMITS: PretendRegLimits = PretendRegLimits {
+    max_lbr: None,
+    max_ebr: None,
+};
+
+/// Replaces: e624_runOnOperation
+///
+/// The pass entry: unless the flag turns the whole pass off, split every unit's local regions
+/// (`:233-238`).
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for unit in program.units.iter_mut() {
+        run_on(unit, PRETEND_REG_LIMITS, values);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
-    use crate::islands::dataflow_ir::Units;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
     use crate::islands::sentient::dialects::LocalRegion as IrLocalRegion;
     use crate::islands::sentient::dialects::sentient::Reg;
+
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     /// `%out = sentient.scalar_copy %input {regLocale = locale}`.
     fn scalar_copy(input: Val, result: Val, locale: RegType) -> Op {
@@ -1070,5 +1116,66 @@ mod unit_tests {
         let before = lxlu.body.clone();
         run_on(&mut lxlu, limits, &mut values);
         assert_eq!(lxlu.body, before);
+    }
+    /// e624 — the entry reaches EVERY unit of the module, and under the machine's own EBR bound
+    /// (8 registers on an L3 half) a region reading 8 maps splits in both of them.
+    #[test]
+    fn e624_splits_the_regions_of_every_program_unit() {
+        let max = get_max_reg_num::<Dd2>(RegType::Ebr, Component::L3lu, PRETEND_REG_LIMITS);
+        let maps = max.0;
+        let unit_of = || {
+            let mut body = Vec::new();
+            let mut copies = Vec::new();
+            for i in 0..maps {
+                body.push(Op::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(100 + i),
+                    pairs: vec![(Val(1), Val(200 + 2 * i)), (Val(2), Val(201 + 2 * i))],
+                }));
+                body.push(Op::Uniform(uniform::Op::QueryMap {
+                    result: Val(300 + i),
+                    map: Val(100 + i),
+                    key: Val(1),
+                }));
+                copies.push(scalar_copy(Val(300 + i), Val(400 + i), RegType::Ebr));
+            }
+            body.push(Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![IrLocalRegion {
+                    arg: Val(50),
+                    units: vec![Val(1), Val(2)],
+                    body: copies,
+                }],
+                results: Vec::new(),
+                yielded: Vec::new(),
+            }));
+            ProgramUnit::<Dd2> {
+                on: Units::one(DfirUnit::L3lu, Val(1)),
+                precision: None,
+                body,
+                arch: core::marker::PhantomData,
+            }
+        };
+        let mut values = Values::default();
+        for _ in 0..600 {
+            values.mint();
+        }
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit_of(), vec![unit_of()]),
+            bound: core::marker::PhantomData,
+        };
+
+        run_on_operation(&mut program, &mut values);
+
+        for unit in program.units.iter() {
+            let Some(Op::UniformRegions(new_op)) = unit.body.last() else {
+                panic!("the rebuilt uniform.uniformize_regions is still the last op")
+            };
+            assert_eq!(new_op.regions().len(), 2, "one region per unit, per unit");
+        }
     }
 }
