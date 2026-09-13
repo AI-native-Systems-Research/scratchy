@@ -515,7 +515,18 @@ impl ScalarOpReordering {
     /// ⭐ THE `next_op` TEST READS THE OPERANDS OF ONE OP, not the uses of the result: an op followed by
     /// something that does not read it is movable even if that something is its own first user's
     /// ancestor.
-    pub fn is_candidate_for_reordering(&mut self, block: &[Op], at: InBlock) -> bool {
+    /// ⛔⛔ TWO SCOPES, AND CONFLATING THEM MISREADS THE REFERENCE'S OWN EXAMPLE. `block` answers
+    /// POSITIONS; `unit_body` answers WHO DEFINES A VALUE, because `getDefiningOp()` and
+    /// `isa<BlockArgument>` are asked of the whole unit and not of one block. The worked example at
+    /// `:512-520` hoists `%c1 = sentient.scalar_constant` OUT of the loop and reads it from inside,
+    /// so a `defining_op` scoped to the loop body would call that constant non-constant AND then call
+    /// it an iteration argument.
+    pub fn is_candidate_for_reordering(
+        &mut self,
+        block: &[Op],
+        unit_body: &[Op],
+        at: InBlock,
+    ) -> bool {
         let Some(op) = block.get(at.0) else {
             return false;
         };
@@ -555,15 +566,17 @@ impl ScalarOpReordering {
             _ => Vec::new(),
         }
         .into_iter()
-        .filter(|val| !is_sentient_constant(*val, block))
+        .filter(|val| !is_sentient_constant(*val, unit_body))
         .collect();
         // If op only has constant operands then it is a candidate.
         if non_const_operands.is_empty() {
             return true;
         }
         for val in non_const_operands {
-            if defining_op(val, block).is_none() {
+            if defining_op(val, unit_body).is_none() {
                 // `isa<BlockArgument>` — an iteration argument, whose liverange may be extended.
+                // Asked of the unit, not of `block`: a value the ENCLOSING block defines is bound by
+                // an op and so is not one.
                 continue;
             }
             let Some(operand_last_use) = self.last_use_within_block(val, block) else {
@@ -698,7 +711,7 @@ impl ScalarOpReordering {
             let Some(block) = at.block(unit_body) else {
                 continue;
             };
-            if !self.is_candidate_for_reordering(block, at.index()) {
+            if !self.is_candidate_for_reordering(block, unit_body, at.index()) {
                 continue;
             }
             let Some(result) = at.op(unit_body).and_then(ScalarResult::of) else {
@@ -776,7 +789,11 @@ impl ScalarOpReordering {
                     let Some(operand_block) = operand_at.block(unit_body) else {
                         continue;
                     };
-                    if !self.is_candidate_for_reordering(operand_block, operand_at.index()) {
+                    if !self.is_candidate_for_reordering(
+                        operand_block,
+                        unit_body,
+                        operand_at.index(),
+                    ) {
                         continue;
                     }
                     if visited.remove(&operand)
@@ -840,6 +857,7 @@ impl ScalarOpReordering {
 mod unit_tests {
     use super::{
         InBlock, LiverangeIndex, PerLocale, ScalarOpReordering, ScalarResult, ancestor_in_block,
+        is_sentient_constant,
     };
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
@@ -1058,10 +1076,10 @@ mod unit_tests {
     fn an_op_that_is_not_a_movable_scalar_op_is_no_candidate() {
         let block = vec![for_op(Val(0), Val(1), Vec::new()), constant(Val(2))];
         let mut pass = ScalarOpReordering::new();
-        assert!(!pass.is_candidate_for_reordering(&block, InBlock(0)));
+        assert!(!pass.is_candidate_for_reordering(&block, &block, InBlock(0)));
         // `sentient.scalar_constant` is not in the isa list either — only copy, add, sub and the
         // multicast group are.
-        assert!(!pass.is_candidate_for_reordering(&block, InBlock(1)));
+        assert!(!pass.is_candidate_for_reordering(&block, &block, InBlock(1)));
     }
 
     /// e470 — a movable op's first question is where its first use is, which is e368 and not ported.
@@ -1069,6 +1087,24 @@ mod unit_tests {
     #[should_panic(expected = "senpass e368")]
     fn a_movable_scalar_op_reaches_the_unported_first_use_within_block() {
         let block = vec![add(Val(0), Val(1), Val(2))];
-        ScalarOpReordering::new().is_candidate_for_reordering(&block, InBlock(0));
+        ScalarOpReordering::new().is_candidate_for_reordering(&block, &block, InBlock(0));
+    }
+
+    /// e470 — the constant/iteration-argument classification is asked of the UNIT, and the reference's
+    /// own worked example is a constant hoisted out of the loop that reads it: scoped to the loop body
+    /// that constant is invisible, so it would be filed as non-constant and then as an iteration
+    /// argument.
+    #[test]
+    fn a_constant_defined_outside_the_loop_is_still_constant() {
+        let unit_body = vec![
+            constant(Val(1)),
+            for_op(Val(0), Val(1), vec![add(Val(91), Val(1), Val(2))]),
+        ];
+        let Op::Sentient(sentient::Op::For { body, .. }) = &unit_body[1] else {
+            unreachable!()
+        };
+        assert!(is_sentient_constant(Val(1), &unit_body));
+        // The scope this used to be asked of, and the answer that made the fix necessary.
+        assert!(!is_sentient_constant(Val(1), body));
     }
 }
