@@ -101,10 +101,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 
+use crate::arch::{Arch, IsaGen};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::sentient::dialects::{
-    self as dialects, Op, Val, dataflow, sentient, symbol, uniform,
+    self as dialects, Op, UniformRegions, Val, dataflow, sentient, symbol, uniform,
 };
 use crate::islands::sentient::print;
 use crate::transform::sentient::utils::{self, Hoisted, NewUse, OpAt};
@@ -231,9 +232,11 @@ impl<'a> CopyOp<'a> {
 /// reach `createCopyOperationAndUpdateAssignment` at all: [`Self::is_copy_needed`] is statically
 /// [`CopyNeeded::No`], which is the crate's rule that a flag must REMOVE ops rather than be consulted.
 ///
-/// ⚠️ `dcc_ext_ctx_` IS NOT CARRIED YET. `dccExtContext()` is read by e524 alone (`:692-954`, for
-/// `getArch()`, `getProgPatch()` and the `memoryOpRequiresImmutAddrScalarCopy` it forwards to), and
-/// `opts_` by nothing in the file; both enter with e524.
+/// ⛔ `dcc_ext_ctx_` IS NOT A FIELD. `dccExtContext()` is read by e524 alone (`:692-954`): its
+/// `getArch()` is the `A: Arch` parameter of
+/// [`Self::initialize_assignment_for_an_operation`], its `getProgPatch()` is reached only under
+/// [`DO_EAR_OPTIMIZATION`], and the rest goes to [`utils::memory_op_requires_immut_addr_scalar_copy`],
+/// which takes `A` too. `opts_` is read by nothing in the file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RegisterTypeAssignment<const ADD_SCALAR_COPIES: bool> {
     /// The maps `clear()` resets at each unit.
@@ -243,6 +246,25 @@ pub(crate) struct RegisterTypeAssignment<const ADD_SCALAR_COPIES: bool> {
     /// `worklist_` — ⛔ NOT IN [`PerUnit`]: `clear()` does not name it (`:222-227`), and e523 drains
     /// it to empty instead.
     pub(crate) worklist: VecDeque<Val>,
+    /// Every `op->emitError(..); signalPassFailure();` e524 raised — see [`Refused`].
+    pub(crate) failures: Vec<Refused>,
+}
+
+/// `op->emitError(..); signalPassFailure();` AS DATA — one transfer e524 found on a unit that cannot
+/// run it (`:760-761`, `:855-856`).
+///
+/// ⭐ NOT A `Result` AND NOT A PANIC, for the reason
+/// [`register_allocation::UnknownLocale`](super::register_allocation) gives: `signalPassFailure` is a
+/// flag on the pass object, and the walk CONTINUES past the op it refused — so the assignments the
+/// rest of the unit produced are still there to be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Refused {
+    /// The value the offending op binds — an identity, for the reason [`super::ForRef`] gives.
+    pub(crate) at: Val,
+    /// `current_unit_type_` — the unit it was found on.
+    pub(crate) unit_type: DfirUnit,
+    /// The message the reference emitted.
+    pub(crate) message: &'static str,
 }
 
 /// `createRegisterTypeAssignmentPass(dcc_ext_ctx, common_opts, /*skip_copies=*/true)` — the early run
@@ -264,6 +286,7 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
             per_unit: PerUnit::default(),
             per_module: PerModule::default(),
             worklist: VecDeque::new(),
+            failures: Vec::new(),
         }
     }
 
@@ -836,10 +859,24 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
 pub(crate) struct OperandSlot {
     /// `user` — where that op sits in the unit body.
     user: OpAt,
-    /// Which of its operands, in [`dialects::operands`] order.
-    at: usize,
+    /// Which slot of it.
+    at: Slot,
     /// `operand[0].get()` — read once, at construction.
     val: Val,
+}
+
+/// WHICH SLOT OF THE USER ONE `MutableOperandRange` NAMES.
+///
+/// ⛔ A WIRE END IS NO [`dialects::operands`] POSITION AND IS STILL A `MutableOperandRange`: e524
+/// hands e463 `load_and_send.getConsumerMutable()` (`:906-908`), which this island models as a
+/// [`sentient::SendEnd`] rather than a [`Val`] — see [`dialects::operands`] and
+/// [`sentient::wire_end`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Slot {
+    /// `op->getOpOperand(at)`, in [`dialects::operands`] order.
+    Operand(usize),
+    /// `getConsumerMutable()`, `getProducerMutable()` or the receive's `$unit`.
+    WireEnd,
 }
 
 impl OperandSlot {
@@ -847,13 +884,46 @@ impl OperandSlot {
     #[must_use]
     pub(crate) fn of(user: OpAt, at: usize, unit_body: &[Op]) -> Option<OperandSlot> {
         let val = *dialects::operands(user.op(unit_body)?).get(at)?;
-        Some(OperandSlot { user, at, val })
+        Some(OperandSlot {
+            user,
+            at: Slot::Operand(at),
+            val,
+        })
+    }
+
+    /// The wire-end slot, or `None` when `user` names no op or an op with no wire end.
+    #[must_use]
+    pub(crate) fn wire_end_of(user: OpAt, unit_body: &[Op]) -> Option<OperandSlot> {
+        let Op::Sentient(inner) = user.op(unit_body)? else {
+            return None;
+        };
+        let val = sentient::wire_end(inner)?;
+        Some(OperandSlot {
+            user,
+            at: Slot::WireEnd,
+            val,
+        })
     }
 
     /// The value in the slot.
     #[must_use]
     pub(crate) const fn val(&self) -> Val {
         self.val
+    }
+
+    /// `operand.assign(val)` — ⭐ AN OUT-OF-RANGE OR ABSENT SLOT WRITES NOTHING, as
+    /// [`dialects::set_operand`] does.
+    fn assign(&self, op: &mut Op, val: Val) {
+        match self.at {
+            Slot::Operand(at) => dialects::set_operand(op, at, val),
+            Slot::WireEnd => {
+                if let Op::Sentient(inner) = op
+                    && let Some(end) = sentient::wire_end_mut(inner)
+                {
+                    *end = val;
+                }
+            }
+        }
     }
 }
 
@@ -954,7 +1024,7 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
                 } else {
                     let now = user_after_copy(unit_body, &slot.user, &snapshot);
                     if let Some(op) = now.op_mut(unit_body) {
-                        dialects::set_operand(op, slot.at, new_copy);
+                        slot.assign(op, new_copy);
                     }
                     CopyInstalled::Assigned(new_copy)
                 }
@@ -963,15 +1033,1241 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
     }
 }
 
-// crustify:todo: e523_processWorkList
-//   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:492  (93 body lines, level 3)
-//   original  : void RegisterTypeAssignmentPass::processWorkList()
-//   calls     : e139_getLocale, e143_updateAssignment, e351_addToWorkListAndUpdateAssignment, e463_addToWorkListCreateCopyAndUpdateAssignment
+/// `-dcc-sentient-create-copy-ops-for-iter-args`, `cl::init(true)` (`:68-72`) — a `dcc-opt`
+/// command-line flag, not a program property, and this crate has no flags.
+const CREATE_COPY_OPS_FOR_ITER_ARGS: bool = true;
 
-// crustify:todo: e524_initializeAssignmentForAnOperation
-//   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:594  (383 body lines, level 3)
-//   original  : void RegisterTypeAssignmentPass::initializeAssignmentForAnOperation( Operation* op)
-//   calls     : e139_getLocale, e143_updateAssignment, e247_memoryOpRequiresImmutAddrScalarCopy, e252_size, e278_isValid, e351_addToWorkListAndUpdateAssignment, e463_addToWorkListCreateCopyAndUpdateAssignment
+/// `dcc::utils::isInductionVariable` (`Analyses/Utils.cpp:128-139`) — region argument 0 of a
+/// `sentient.for`, and `false` for an op result or any other op's region argument.
+fn is_induction_variable(val: Val, defs: dialects::Definitions<'_>) -> bool {
+    matches!(defs.for_arg_of(val), Some((_, 0)))
+}
+
+/// `region.front().getTerminator()->getOperand(index)`, at either dialect's spelling of a yield.
+///
+/// ⭐ `None` FOR A REGION WITH NO TERMINATOR — a `sentient.if`'s `else` region is routinely empty,
+/// where `front().getTerminator()` hands the reference a null `Operation *`.
+fn terminator_operand(region: &[Op], index: usize) -> Option<Val> {
+    let operands = region.iter().rev().find_map(|op| match op {
+        Op::Sentient(sentient::Op::Yield { results }) => Some(results.as_slice()),
+        Op::Uniform(uniform::Op::Yield { operands }) => Some(operands.as_slice()),
+        _ => None,
+    })?;
+    operands.get(index).copied()
+}
+
+/// `op->getParentOfType<sentient::ForOp>()` — whether any op enclosing `at` is a `sentient.for`.
+fn inside_a_for(unit_body: &[Op], at: &OpAt) -> bool {
+    let mut cursor = at.parent();
+    while let Some(enclosing) = cursor {
+        if matches!(
+            enclosing.op(unit_body),
+            Some(Op::Sentient(sentient::Op::For { .. }))
+        ) {
+            return true;
+        }
+        cursor = enclosing.parent();
+    }
+    false
+}
+
+/// WHAT ONE DRAINED VALUE'S DEFINITION ASKS FOR — decided while the unit body is only borrowed, acted
+/// on once it is not.
+enum Propagate {
+    /// The add/sub/copy arms: these operand positions of the definition need a register of the
+    /// demanded locale.
+    CopyOperands(Vec<usize>),
+    /// The `for`/`if`/`uniformize_regions` arm: what every region hands back at the result's own
+    /// position, and — for a loop — the matching iterator argument.
+    RegionInterface {
+        /// One per region that has a terminator.
+        yields: Vec<Val>,
+        /// `for_op.getRegionIterArgs()[val_index]`.
+        iter_arg: Option<Val>,
+    },
+}
+
+impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
+    /// Replaces: e523_processWorkList
+    ///
+    /// Drains the worklist, pushing each value's locale back onto what produced it — a loop's
+    /// initialiser, result and yield; an add/sub/copy's non-constant inputs; the yields and iterator
+    /// argument behind a region-carrying op's result — copying an input into that locale where due.
+    ///
+    /// ⛔ TRAP: `getIndexOfLoopRegionIterArgs` ANSWERS `-1` FOR THE INDUCTION VARIABLE TOO, so
+    /// position 0 of [`dialects::Definitions::for_arg_of`] takes the `else` branch, where its null
+    /// `getDefiningOp()` makes every `isa<>` false and nothing happens.
+    /// ⭐ AND THAT NULL `def` IS UNREACHABLE FOR ANYTHING ELSE — e141 queues only a value with NO
+    /// assignment, and e524 assigns `lccr` to every induction variable before the drain begins, which
+    /// is what keeps `isa<AddOp, SubOp>(nullptr)` from asserting.
+    pub(crate) fn process_work_list(&mut self, unit_body: &mut Vec<Op>, values: &mut Values) {
+        while let Some(val) = self.worklist.pop_front() {
+            let (key, position) = {
+                let scope: [&[Op]; 1] = [unit_body.as_slice()];
+                let defs = dialects::Definitions::from_innermost(&scope);
+                let key = AliasKey {
+                    locale: self.locale(val).reg_type(),
+                    element_size: dialects::element_size(val, defs),
+                };
+                (key, defs.for_arg_of(val).map(|(_, position)| position))
+            };
+            match position {
+                Some(position) if position >= 1 => {
+                    self.process_iter_arg(unit_body, val, position - 1, key, values);
+                }
+                _ => self.process_definition(unit_body, val, key, values),
+            }
+        }
+    }
+
+    /// e523's `index != -1` half — `val` is a `sentient.for`'s iterator argument `index`.
+    ///
+    /// ⛔ TRAP: THE COPY IS ONLY WORTH IT FOR A NESTED LOOP'S QUERY-MAP INITIALISER — an outermost
+    /// loop's iter arg gets promoted to the header anyway, and a copy there ADDS `REGCOPY`s
+    /// (`:506-513`).
+    fn process_iter_arg(
+        &mut self,
+        unit_body: &mut Vec<Op>,
+        val: Val,
+        index: usize,
+        key: AliasKey,
+        values: &mut Values,
+    ) {
+        let (for_at, init, result, yielded, copy_the_init) = {
+            let scope: [&[Op]; 1] = [unit_body.as_slice()];
+            let defs = dialects::Definitions::from_innermost(&scope);
+            let Some((Op::Sentient(sentient::Op::For { carried, body, .. }), _)) =
+                defs.for_arg_of(val)
+            else {
+                return;
+            };
+            let Some(entry) = carried.get(index) else {
+                return;
+            };
+            let Some(for_at) = utils::path_of(unit_body, entry.result) else {
+                return;
+            };
+            let copy_the_init = CREATE_COPY_OPS_FOR_ITER_ARGS
+                && matches!(
+                    defs.of(entry.init),
+                    Some(Op::Uniform(uniform::Op::QueryMap { .. }))
+                )
+                && inside_a_for(unit_body, &for_at);
+            (
+                for_at,
+                entry.init,
+                entry.result,
+                terminator_operand(body, index),
+                copy_the_init,
+            )
+        };
+        // Operand 0 of a `sentient.for` is `$bound`, so initialiser `index` is operand `index + 1`.
+        match copy_the_init
+            .then(|| OperandSlot::of(for_at, index + 1, unit_body))
+            .flatten()
+        {
+            Some(slot) => {
+                self.add_to_work_list_create_copy_and_update_assignment(
+                    unit_body, &slot, key, false, values,
+                );
+            }
+            None => self.add_to_work_list_and_update_assignment(init, key.locale),
+        }
+        self.update_assignment(result, key.locale);
+        if let Some(yielded) = yielded {
+            self.add_to_work_list_and_update_assignment(yielded, key.locale);
+        }
+    }
+
+    /// e523's `else` half — `val` is an op result.
+    fn process_definition(
+        &mut self,
+        unit_body: &mut Vec<Op>,
+        val: Val,
+        key: AliasKey,
+        values: &mut Values,
+    ) {
+        let plan = {
+            let scope: [&[Op]; 1] = [unit_body.as_slice()];
+            let defs = dialects::Definitions::from_innermost(&scope);
+            let Some(def) = defs.of(val) else {
+                return;
+            };
+            match def {
+                Op::Sentient(
+                    sentient::Op::ScalarAdd { lhs, rhs, .. }
+                    | sentient::Op::ScalarSub { lhs, rhs, .. },
+                ) => {
+                    // A constant, a symbol and an induction variable each already own their register.
+                    let owns_its_register = |operand: Val| {
+                        utils::is_constant(operand, utils::ConstKind::ScalarConstant, defs)
+                            || is_symbol(operand, defs)
+                            || is_induction_variable(operand, defs)
+                    };
+                    Propagate::CopyOperands(
+                        [*lhs, *rhs]
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(_, operand)| !owns_its_register(*operand))
+                            .map(|(at, _)| at)
+                            .collect(),
+                    )
+                }
+                Op::Sentient(sentient::Op::ScalarCopy { input, .. }) => Propagate::CopyOperands(
+                    if utils::is_constant(*input, utils::ConstKind::ScalarConstant, defs) {
+                        Vec::new()
+                    } else {
+                        vec![0]
+                    },
+                ),
+                Op::Sentient(sentient::Op::For { .. } | sentient::Op::If { .. })
+                | Op::Uniform(uniform::Op::UniformizeRegions { .. })
+                | Op::UniformRegions(UniformRegions::UniformizeRegions { .. }) => {
+                    let Some(val_index) = dialects::results(def).iter().position(|r| *r == val)
+                    else {
+                        panic!("DT_CHECK(val_index != -1) (`:567`)");
+                    };
+                    Propagate::RegionInterface {
+                        yields: dialects::regions_ref(def)
+                            .into_iter()
+                            .filter_map(|region| terminator_operand(region, val_index))
+                            .collect(),
+                        iter_arg: match def {
+                            Op::Sentient(sentient::Op::For { carried, .. }) => {
+                                carried.get(val_index).map(|entry| entry.arg)
+                            }
+                            _ => None,
+                        },
+                    }
+                }
+                _ => return,
+            }
+        };
+        match plan {
+            // ⛔ THE PATH IS RE-DERIVED PER OPERAND: e463 can insert a copy in front of the user, and
+            // the reference holds a stable `Operation *` where this holds a position.
+            Propagate::CopyOperands(slots) => {
+                for at in slots {
+                    let Some(slot) = utils::path_of(unit_body, val)
+                        .and_then(|def_at| OperandSlot::of(def_at, at, unit_body))
+                    else {
+                        continue;
+                    };
+                    self.add_to_work_list_create_copy_and_update_assignment(
+                        unit_body, &slot, key, false, values,
+                    );
+                }
+            }
+            Propagate::RegionInterface { yields, iter_arg } => {
+                for yielded in yields {
+                    self.add_to_work_list_and_update_assignment(yielded, key.locale);
+                }
+                if let Some(arg) = iter_arg {
+                    self.add_to_work_list_and_update_assignment(arg, key.locale);
+                }
+            }
+        }
+    }
+}
+
+/// `-dcc-sentient-do-ear-optimization`, `cl::init(false)` (`:62-66`) — a `dcc-opt` command-line flag.
+///
+/// ⛔ AND SO ITS TWO ARMS ARE NOT BELOW (`:748-758`, `:844-854`). Both read `DoEAROptimization &&
+/// dccExtContext().getProgPatch() && isa<dataflow::GetUnitOp>(..)`, and this crate's rule is that a
+/// flag REMOVES the ops it guards rather than being consulted at run time — which is also why the
+/// pass carries no `getProgPatch()`.
+const DO_EAR_OPTIMIZATION: bool = false;
+
+/// `dcc::utils::isUpdateMode` (`Analyses/Utils.cpp:65-125`) at the three arms e524 reaches — the
+/// increment is a non-zero constant, or a query map with a non-zero value among its constants.
+///
+/// ⛔ NOT AN ANCHORED UNIT, and taking the increment VALUE rather than the op removes BOTH routes to
+/// `llvm_unreachable("unhandled operation")` (`:125`) and the out-of-scope `L3GatherScatterChecker`
+/// its `load_and_store` arm consults (`:86`) — the same reading
+/// [`scalar_op_hoisting`](super::scalar_op_merging_and_hoisting) makes of it, kept local because that
+/// one is keyed by its own descriptor.
+fn is_update_mode(increment: Val, defs: dialects::Definitions<'_>) -> bool {
+    match defs.of(increment) {
+        Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => *value != 0,
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => has_non_zero_constants(*map, defs),
+        _ => false,
+    }
+}
+
+/// `dcc::utils::hasNonZeroConstants` (`Analyses/Utils.cpp:50-63`) — a query map whose values are ALL
+/// constants (its own first gate, `:51`) and at least one of which is not zero.
+fn has_non_zero_constants(map: Val, defs: dialects::Definitions<'_>) -> bool {
+    let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(map) else {
+        return false;
+    };
+    let mut any_non_zero = false;
+    for (_, value) in pairs {
+        match defs.of(*value) {
+            Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => {
+                any_non_zero |= *value != 0;
+            }
+            _ => return false,
+        }
+    }
+    any_non_zero
+}
+
+/// `dcc::getUnitType(val.getDefiningOp())` (`Utils/DccExtContext.cpp:126-130`, `:191-206`) at the two
+/// ends of a transfer — the `dataflow.get_unit`'s own type, or the one type every value a query map
+/// answers with shares.
+///
+/// ⚠️ DIVERGENCE ON A BLOCK ARGUMENT AND ON AN EMPTY MAPPING: `None` where the reference's
+/// `DT_CHECK_MSG(op, "expected valid op")` aborts — the reading
+/// [`address_pinning_and_toggle`](super::address_pinning_and_toggle) already makes of this function.
+fn unit_type_of(val: Val, defs: dialects::Definitions<'_>) -> Option<DfirUnit> {
+    let unit_of = |value: Val| match defs.of(value) {
+        Some(Op::Dataflow(dataflow::Op::GetUnit { unit, .. })) => Some(*unit),
+        _ => None,
+    };
+    match defs.of(val)? {
+        Op::Dataflow(dataflow::Op::GetUnit { unit, .. }) => Some(*unit),
+        Op::Uniform(uniform::Op::QueryMap { map, key, .. }) => {
+            let values = dialects::uniform_mapping_values(*map, *key, defs);
+            let mut units = values.iter().map(|value| unit_of(*value));
+            let first = units.next()??;
+            units.all(|unit| unit == Some(first)).then_some(first)
+        }
+        _ => None,
+    }
+}
+
+/// e247's `unit_type` parameter — [`utils::MemoryUnit`] is exactly the six units the memory arms'
+/// `DT_CHECK`s admit (`:677`, `:780`), so `None` is a unit no arm that calls e247 can be on.
+fn memory_unit(unit_type: DfirUnit) -> Option<utils::MemoryUnit> {
+    match unit_type {
+        DfirUnit::L0lu => Some(utils::MemoryUnit::L0lu),
+        DfirUnit::L0su => Some(utils::MemoryUnit::L0su),
+        DfirUnit::Lxlu => Some(utils::MemoryUnit::Lxlu),
+        DfirUnit::Lxsu => Some(utils::MemoryUnit::Lxsu),
+        DfirUnit::L3lu => Some(utils::MemoryUnit::L3lu),
+        DfirUnit::L3su => Some(utils::MemoryUnit::L3su),
+        _ => None,
+    }
+}
+
+/// `is_any_of(current_unit_type_, L0LU, L0SU, LXLU, LXSU, L3LU, L3SU)` — the `DT_CHECK` the send and
+/// the store share (`:677`, `:780`), stated as [`memory_unit`] so the two cannot drift apart.
+fn is_a_memory_unit(unit_type: DfirUnit) -> bool {
+    memory_unit(unit_type).is_some()
+}
+
+/// `(dccExtContext().getArch() >= IsaCoreGen::SEN1P5_ISA) ? Unrelated : LBR` (`:718-720`, `:821-823`,
+/// `:899-900`) — where an L3 transfer's immutable address lives.
+fn immutable_locale<A: Arch>() -> RegisterLocale {
+    if A::GEN >= IsaGen::Sen1p5 {
+        RegisterLocale::Unrelated
+    } else {
+        RegisterLocale::Lbr
+    }
+}
+
+/// `isa<dataflow::CreateMulticastGroupOp>(def)` — [`find_yields_resolving_to`]'s first target.
+fn is_a_multicast_group(op: &Op) -> bool {
+    matches!(op, Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. }))
+}
+
+/// `isa<dataflow::GetUnitOp>(def)` — its second.
+fn is_a_get_unit(op: &Op) -> bool {
+    matches!(op, Op::Dataflow(dataflow::Op::GetUnit { .. }))
+}
+
+/// `dcc::utils::findYieldsResolvingTo<TargetTy, sentient::IfOp>` (`Utils/Utils.cpp:182-208`) — whether
+/// ANY region of `if_op` hands back, at `result_index`, a value the target op defines, a query map all
+/// of whose answers it defines, or a nested `sentient.if` that does either.
+///
+/// ⛔ NOT AN ANCHORED UNIT, and its query-map arm IS [`query_map_values_all`] — the reference's
+/// `isa<TargetTy>(def)` and its `all_of` over the mapping are that function's two arms.
+fn find_yields_resolving_to(
+    if_op: &Op,
+    result_index: usize,
+    defs: dialects::Definitions<'_>,
+    is_target: impl Fn(&Op) -> bool + Copy,
+) -> bool {
+    dialects::regions_ref(if_op).into_iter().any(|region| {
+        // `None` is the empty `else` region, whose `front().getTerminator()` is null.
+        let Some(yielded) = terminator_operand(region, result_index) else {
+            return false;
+        };
+        // `if (isa<BlockArgument>(yield_operand)) continue;`
+        if defs.for_arg_of(yielded).is_some() {
+            return false;
+        }
+        if query_map_values_all(yielded, defs, is_target) {
+            return true;
+        }
+        match defs.of(yielded) {
+            Some(nested @ Op::Sentient(sentient::Op::If { .. })) => dialects::results(nested)
+                .iter()
+                .position(|result| *result == yielded)
+                .is_some_and(|index| find_yields_resolving_to(nested, index, defs, is_target)),
+            _ => false,
+        }
+    })
+}
+
+/// `dcc::utils::L3GatherScatterChecker` (`Analyses/Utils.cpp:608-633`) — WHICH OF FOUR SHAPES one
+/// `sentient.load_and_store` has.
+///
+/// ⛔ ONE ANSWER AND NOT FOUR FLAGS: the constructor's own `DT_CHECK`s say the states exclude each
+/// other (`:619-620`, `:626-627`, `:630-632`), and e524 asks the four `is*()` questions of them.
+/// ⛔ NOT AN OUT-OF-SCOPE ANALYSIS: three unit-type comparisons and one attribute, ported inline as
+/// [`is_symbol`] and its siblings are — the ANALYSIS CLASSES are the out-of-scope thing.
+/// ⚠️ e524's FIRST `DT_CHECK` OVER IT IS UNPORTED: `(src == LX && dst == QGI)` (`:868-871`) names a
+/// unit [`DfirUnit`] does not model, so the check without that disjunct would panic on a valid
+/// `LX -> QGI` transfer. The second group (`:872-880`) is expressible, and IS ported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum L3GatherScatter {
+    /// `is_gather_` — `L3IBR -> LX`, the read half of a gather.
+    Gather,
+    /// `is_scatter_` — `LX -> L3IBR` without the `is_ibr_write` attribute.
+    Scatter,
+    /// `is_ibr_write_` — the attribute, or `HBM -> L3IBR`, which is also
+    /// `is_ibr_write_for_gather_`.
+    IbrWrite {
+        /// `isIBRWriteForGather()`.
+        for_gather: bool,
+    },
+    /// `!isValid()` — an ordinary transfer between the LX and the HBM.
+    Plain,
+}
+
+impl L3GatherScatter {
+    /// The constructor, whose last `DT_CHECK` is the only one a state machine cannot discharge: the
+    /// attribute on a `L3IBR -> LX` transfer claims both at once.
+    fn of(
+        src: Option<DfirUnit>,
+        dst: Option<DfirUnit>,
+        has_ibr_write_attr: bool,
+    ) -> L3GatherScatter {
+        let gather = src == Some(DfirUnit::L3Ibr) && dst == Some(DfirUnit::Lx);
+        let scatter =
+            src == Some(DfirUnit::Lx) && dst == Some(DfirUnit::L3Ibr) && !has_ibr_write_attr;
+        let for_gather = src == Some(DfirUnit::Hbm) && dst == Some(DfirUnit::L3Ibr);
+        let ibr_write = for_gather || has_ibr_write_attr;
+        if ibr_write && (gather || scatter) {
+            panic!(
+                "DT_CHECK((!is_gather_ && !is_scatter_) && \"an IBR write must be distinct from \
+                 actual gather/scatter operation\") (`Analyses/Utils.cpp:630-632`)"
+            );
+        }
+        if gather {
+            L3GatherScatter::Gather
+        } else if scatter {
+            L3GatherScatter::Scatter
+        } else if ibr_write {
+            L3GatherScatter::IbrWrite { for_gather }
+        } else {
+            L3GatherScatter::Plain
+        }
+    }
+
+    /// `isGather()`.
+    const fn is_gather(self) -> bool {
+        matches!(self, L3GatherScatter::Gather)
+    }
+
+    /// `isScatter()`.
+    const fn is_scatter(self) -> bool {
+        matches!(self, L3GatherScatter::Scatter)
+    }
+
+    /// `isIBRWrite()`.
+    const fn is_ibr_write(self) -> bool {
+        matches!(self, L3GatherScatter::IbrWrite { .. })
+    }
+}
+
+/// WHICH WALK REACHED THE OP — e633's over a `func`'s own three op kinds (`:117-124`) or e574's over
+/// one program unit's every op (`:993-994`).
+///
+/// ⛔ THE UNIT TYPE IS INSIDE IT RATHER THAN BESIDE IT. `isa<mlir::func::FuncOp>(op->getParentOp())`
+/// (`:606`) and `current_unit_type_` are one fact asked twice: a module-level op has no unit, and the
+/// reference's own `current_unit_type_` is then whatever the last unit walked left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpScope {
+    /// The op sits directly in the `mlir::func::FuncOp`.
+    Module,
+    /// The op sits in `current_unit_`, whose type is `getUnitType(unit.getUnits()[0])` (`:1006-1007`).
+    ProgramUnit(DfirUnit),
+}
+
+/// `current_unit_type_` AT AN ARM THAT READS IT, with that arm's own `DT_CHECK` discharged.
+///
+/// ⛔ PANICS AT MODULE SCOPE, because no arm that reads the unit type can be reached there: e633 hands
+/// e524 a `sentient.constant`, a `symbol.create_symbol` or a `dataflow.get_unit` and nothing else.
+fn on_unit(scope: OpScope, is_expected: impl Fn(DfirUnit) -> bool, dt_check: &str) -> DfirUnit {
+    match scope {
+        OpScope::ProgramUnit(unit_type) if is_expected(unit_type) => unit_type,
+        _ => panic!("DT_CHECK({dt_check})"),
+    }
+}
+
+/// WHERE AN OP SITS AFTER e463 HAS COPIED ONE OF ITS OPERANDS — its own path, or ONE LATER when the
+/// copy landed in front of it.
+///
+/// ⛔ [`user_after_copy`] CANNOT ANSWER THIS ONE: it recognises the user by comparing against a
+/// snapshot, and e463 has just rewritten the very operand that would make them differ. The op at the
+/// user's own index is a `sentient.scalar_copy` exactly when e350 inserted one there, and none of the
+/// arms that make TWO demands of one op is itself a copy.
+/// ⛔ THE SHIFT IS AT MOST ONE for the reason [`user_after_copy`] gives.
+fn user_after_operand_copy(unit_body: &[Op], user: &OpAt) -> OpAt {
+    match user.op(unit_body) {
+        Some(op) if CopyOp::of(op).is_some() => user.next(),
+        Some(_) | None => user.clone(),
+    }
+}
+
+/// THE OPERAND POSITIONS e524 NAMES BY `get<Name>Mutable()`, in [`dialects::operands`] order.
+///
+/// ⛔ A `receive_and_store`'s `$multicast_info` HAS NO FIXED POSITION: `$dst` and `$drop_first` are
+/// optional and precede it, so it is `3 + present(dst) + present(drop_first)` — see
+/// [`sentient::operands`]. The transfer's own is last of nine.
+mod slot_at {
+    /// `getMutableAddrMutable()` on all four address-carrying memory ops, and `getBoundMutable()` on
+    /// a `sentient.for`.
+    pub(super) const MUTABLE_ADDR: usize = 0;
+    /// `getImmutableAddrMutable()`.
+    pub(super) const IMMUTABLE_ADDR: usize = 1;
+    /// `getLhsMutable()`, and `getMaskValueMutable()` on a `sentient.samv`.
+    pub(super) const LHS: usize = 0;
+    /// `getRhsMutable()`.
+    pub(super) const RHS: usize = 1;
+    /// `getSrcMutableAddrMutable()` — a `sentient.load_and_store` reads `$src` and `$dst` first.
+    pub(super) const SRC_MUTABLE_ADDR: usize = 2;
+    /// `getSrcImmutableAddrMutable()`.
+    pub(super) const SRC_IMMUTABLE_ADDR: usize = 3;
+    /// `getDstMutableAddrMutable()` — `$src_inc` sits between the two halves.
+    pub(super) const DST_MUTABLE_ADDR: usize = 5;
+    /// `getDstImmutableAddrMutable()`.
+    pub(super) const DST_IMMUTABLE_ADDR: usize = 6;
+    /// `getMulticastInfoMutable()` on a `sentient.load_and_store`.
+    pub(super) const TRANSFER_MULTICAST_INFO: usize = 8;
+    /// `getMulticastInfoMutable()` on a `sentient.receive_and_store`, BEFORE its two optional
+    /// operands are counted.
+    pub(super) const RECEIVE_MULTICAST_INFO: usize = 3;
+}
+
+/// ONE MEMORY OP'S ADDRESS PAIR AND WHERE EACH HALF HAS TO LIVE — the five arms that assign both
+/// (`:684-706`, `:713-731`, `:790-812`, `:815-830`, `:955-976`) differ only in these four values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransferAddrs {
+    /// Where `$mutable_addr` goes — `lrf` on an L0/LX half, `lar` on an L3 one.
+    mutable: RegisterLocale,
+    /// Where `$immutable_addr` goes — `lrf`, or [`immutable_locale`] on an L3 half.
+    immutable: RegisterLocale,
+    /// `getElementSize()`, or `getSrcElementSize()` for a `load_compute_and_send` — ⭐ THE CACHE KEY
+    /// ONLY. e247 reads the op's own width, which for that op is the DST one.
+    element_size: Bits,
+    /// `$increment` — ⛔ `None` WHERE THE ARM DOES NOT COMPUTE `treat_immutable_as_mutable`: the two
+    /// L3 halves pass the flag's default `false` (`:723-725`, `:826-828`), and only the L0/LX halves
+    /// ask `isUpdateMode`.
+    increment: Option<Val>,
+}
+
+impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
+    /// The `$mutable_addr` / `$immutable_addr` pair of one memory op, `anchor` being the value the op
+    /// binds — its identity, and how the path is re-derived after the first copy shifted it.
+    ///
+    /// ⛔ TRAP: `mutable_addr_copy` IS READ BEFORE THE FIRST COPY (`:695`, `:801`, `:960`), so the
+    /// comparison that follows is against the ORIGINAL value and not against the copy that replaced
+    /// it — which is the whole point of `treat_immutable_as_mutable`: two uses of one SSA variable
+    /// must not be commoned into one register when the op updates it.
+    fn assign_transfer_addresses<A: Arch>(
+        &mut self,
+        unit_body: &mut Vec<Op>,
+        anchor: Val,
+        unit_type: utils::MemoryUnit,
+        addrs: &TransferAddrs,
+        values: &mut Values,
+    ) {
+        let Some(mutable) = utils::path_of(unit_body, anchor)
+            .and_then(|at| OperandSlot::of(at, slot_at::MUTABLE_ADDR, unit_body))
+        else {
+            return;
+        };
+        let mutable_addr = mutable.val();
+        self.add_to_work_list_create_copy_and_update_assignment(
+            unit_body,
+            &mutable,
+            AliasKey {
+                locale: addrs.mutable,
+                element_size: Some(addrs.element_size),
+            },
+            true,
+            values,
+        );
+        let Some(at) = utils::path_of(unit_body, anchor) else {
+            return;
+        };
+        let Some((needs_a_copy, immutable_addr, treat_immutable_as_mutable, is_constant)) = ({
+            let outer: [&[Op]; 1] = [unit_body.as_slice()];
+            let defs = dialects::Definitions::from_innermost(&outer);
+            at.op(unit_body)
+                .and_then(utils::ImmutAddrMemoryOpInfo::of)
+                .map(|info| {
+                    (
+                        utils::memory_op_requires_immut_addr_scalar_copy::<A>(
+                            unit_type,
+                            &info,
+                            utils::RangeCheck::Check,
+                            defs,
+                        ),
+                        info.immutable_addr,
+                        info.immutable_addr == mutable_addr
+                            && addrs
+                                .increment
+                                .is_some_and(|increment| is_update_mode(increment, defs)),
+                        utils::is_constant(
+                            info.immutable_addr,
+                            utils::ConstKind::ScalarConstant,
+                            defs,
+                        ),
+                    )
+                })
+        }) else {
+            return;
+        };
+        if needs_a_copy {
+            if let Some(slot) = OperandSlot::of(at, slot_at::IMMUTABLE_ADDR, unit_body) {
+                self.add_to_work_list_create_copy_and_update_assignment(
+                    unit_body,
+                    &slot,
+                    AliasKey {
+                        locale: addrs.immutable,
+                        element_size: Some(addrs.element_size),
+                    },
+                    treat_immutable_as_mutable,
+                    values,
+                );
+            }
+        } else if !is_constant {
+            self.add_to_work_list_and_update_assignment(immutable_addr, addrs.immutable);
+        }
+    }
+
+    /// Replaces: e524_initializeAssignmentForAnOperation
+    ///
+    /// Records the locale one op already fixes — a constant's `imm`, an induction variable's `lccr`, a
+    /// condition's `jcr`, a MAC's XRF pointers, a memory op's address registers, a transfer's
+    /// `ear`/`lar` pair — copying the operand into that locale where the value itself cannot hold it.
+    ///
+    /// ⛔ TRAP: THE `rhs` GUARD ASKS `isSymbol(lhs)` (`:668`) AND NOT `isSymbol(rhs)` — a copy-paste
+    /// bug in the reference, kept verbatim, so a symbolic `rhs` beside a non-symbolic `lhs` is copied.
+    /// ⚠️ ONE `DT_CHECK` IS DELIBERATELY ABSENT — see [`L3GatherScatter`].
+    pub(crate) fn initialize_assignment_for_an_operation<A: Arch>(
+        &mut self,
+        unit_body: &mut Vec<Op>,
+        at: &OpAt,
+        scope: OpScope,
+        values: &mut Values,
+    ) {
+        // A SNAPSHOT: every arm reads the op's operands while rewriting them, and the two arms that
+        // must see the rewrite re-derive the op ([`user_after_operand_copy`], [`utils::path_of`]).
+        let Some(op) = at.op(unit_body).cloned() else {
+            return;
+        };
+        match &op {
+            Op::Sentient(sentient::Op::ScalarConstant { .. })
+            | Op::Dataflow(
+                dataflow::Op::CreateMulticastGroup { .. } | dataflow::Op::GetUnit { .. },
+            )
+            | Op::Symbol(symbol::Op::CreateSymbol { .. }) => {
+                if let Op::Dataflow(dataflow::Op::CreateMulticastGroup {
+                    init_packet_opt_en,
+                    ..
+                }) = &op
+                    && *init_packet_opt_en
+                    && inside_a_for(unit_body, at)
+                {
+                    panic!(
+                        "DT_CHECK_MSG(!parent_loop || !isOptimizable(mc_op), \"an optimizable \
+                         create_multicast_group op should not appear inside a loop (per \
+                         pcfg-translator agreement)\") (`:600-604`)"
+                    );
+                }
+                let Some(value) = dialects::results(&op).first().copied() else {
+                    return;
+                };
+                match scope {
+                    OpScope::Module => {
+                        self.per_module
+                            .global_const_assignments
+                            .insert(value, RegisterLocale::Imm);
+                    }
+                    // No worklist entry: a constant has no operand to propagate to (`:608-610`).
+                    OpScope::ProgramUnit(_) => self.update_assignment(value, RegisterLocale::Imm),
+                }
+            }
+            // `getLocale(map_op.getValues().front())` — one locale for a whole map (`:611-615`).
+            Op::Uniform(uniform::Op::DefImmutableMapping { result, pairs }) => {
+                let Some((_, first)) = pairs.first() else {
+                    return;
+                };
+                let locale = self.locale(*first).reg_type();
+                self.update_assignment(*result, locale);
+            }
+            Op::Uniform(uniform::Op::QueryMap { result, map, .. }) => {
+                let locale = self.locale(*map).reg_type();
+                self.update_assignment(*result, locale);
+            }
+            Op::Sentient(sentient::Op::VectorMac {
+                mask,
+                xrf_write_ptr,
+                xrf_read_ptr,
+                results,
+                ..
+            }) => {
+                on_unit(
+                    scope,
+                    |unit_type| {
+                        matches!(
+                            unit_type,
+                            DfirUnit::PtRow(_) | DfirUnit::Sfp | DfirUnit::Pe
+                        )
+                    },
+                    "is_any_of(current_unit_type_, PT, SFP, PE) (`:621`)",
+                );
+                if xrf_write_ptr.is_none() && xrf_read_ptr.is_none() {
+                    return;
+                }
+                if xrf_write_ptr.is_none() || xrf_read_ptr.is_none() {
+                    panic!(
+                        "DT_CHECK_MSG(mac_op.getPointers().size() == 2, \"unhandled number of \
+                         pointer operands\") (`:623-624`)"
+                    );
+                }
+                // `all_opnds.slice(0, 1)` and `.slice(1, 1)` of `getPointersMutable()`, which follows
+                // the optional mask in [`sentient::operands`].
+                let write_ptr = usize::from(mask.is_some());
+                let mut user = at.clone();
+                for (index, locale) in [
+                    (write_ptr, RegisterLocale::XrfWrPtr),
+                    (write_ptr + 1, RegisterLocale::XrfRdPtr),
+                ] {
+                    if let Some(slot) = OperandSlot::of(user.clone(), index, unit_body) {
+                        self.add_to_work_list_create_copy_and_update_assignment(
+                            unit_body,
+                            &slot,
+                            AliasKey {
+                                locale,
+                                element_size: None,
+                            },
+                            true,
+                            values,
+                        );
+                    }
+                    user = user_after_operand_copy(unit_body, &user);
+                }
+                // `if (mac_op->getNumResults() == 2)` — the advanced pointers (`:635-641`).
+                if let [xrf_wr_out, xrf_rd_out] = results.as_slice() {
+                    self.update_assignment(*xrf_wr_out, RegisterLocale::XrfWrPtr);
+                    self.update_assignment(*xrf_rd_out, RegisterLocale::XrfRdPtr);
+                }
+            }
+            Op::Sentient(sentient::Op::For { iv, bound, .. }) => {
+                self.update_assignment(*iv, RegisterLocale::Lccr);
+                let bound_is_fixed = {
+                    let outer: [&[Op]; 1] = [unit_body.as_slice()];
+                    let defs = dialects::Definitions::from_innermost(&outer);
+                    utils::is_constant(*bound, utils::ConstKind::ScalarConstant, defs)
+                        || is_symbol(*bound, defs)
+                };
+                // ⭐ `element_sizes[0]` IS `None`: no `sentient.for` of this island carries that
+                // attribute, which is the reference's own `hasAttr == false` / `-1` (`:650-656`), and
+                // the width only keys the alias cache.
+                if !bound_is_fixed
+                    && let Some(slot) = OperandSlot::of(at.clone(), slot_at::MUTABLE_ADDR, unit_body)
+                {
+                    self.add_to_work_list_create_copy_and_update_assignment(
+                        unit_body,
+                        &slot,
+                        AliasKey {
+                            locale: RegisterLocale::Jcr,
+                            element_size: None,
+                        },
+                        false,
+                        values,
+                    );
+                }
+            }
+            Op::Sentient(sentient::Op::If { lhs, rhs, .. }) => {
+                let (copy_lhs, copy_rhs) = {
+                    let outer: [&[Op]; 1] = [unit_body.as_slice()];
+                    let defs = dialects::Definitions::from_innermost(&outer);
+                    let owns_its_register = |val: Val| {
+                        utils::is_constant(val, utils::ConstKind::ScalarConstant, defs)
+                            || is_induction_variable(val, defs)
+                    };
+                    (
+                        !owns_its_register(*lhs) && !is_symbol(*lhs, defs),
+                        !owns_its_register(*rhs) && !is_symbol(*lhs, defs),
+                    )
+                };
+                let mut user = at.clone();
+                for (index, wanted) in [(slot_at::LHS, copy_lhs), (slot_at::RHS, copy_rhs)] {
+                    if wanted
+                        && let Some(slot) = OperandSlot::of(user.clone(), index, unit_body)
+                    {
+                        self.add_to_work_list_create_copy_and_update_assignment(
+                            unit_body,
+                            &slot,
+                            AliasKey {
+                                locale: RegisterLocale::Jcr,
+                                element_size: None,
+                            },
+                            false,
+                            values,
+                        );
+                    }
+                    user = user_after_operand_copy(unit_body, &user);
+                }
+            }
+            Op::Sentient(sentient::Op::LoadAndSend {
+                result,
+                extent,
+                increment,
+                consumer,
+                ..
+            }) => {
+                let unit_type = on_unit(
+                    scope,
+                    is_a_memory_unit,
+                    "is_any_of(current_unit_type_, L0LU, L0SU, LXLU, LXSU, L3LU, L3SU) (`:677`)",
+                );
+                let Some(unit) = memory_unit(unit_type) else {
+                    return;
+                };
+                match unit_type {
+                    DfirUnit::L0lu | DfirUnit::Lxlu => {
+                        self.add_to_work_list_and_update_assignment(*result, RegisterLocale::Lrf);
+                        self.assign_transfer_addresses::<A>(
+                            unit_body,
+                            *result,
+                            unit,
+                            &TransferAddrs {
+                                mutable: RegisterLocale::Lrf,
+                                immutable: RegisterLocale::Lrf,
+                                element_size: extent.element_size,
+                                increment: Some(*increment),
+                            },
+                            values,
+                        );
+                    }
+                    DfirUnit::L3lu | DfirUnit::L3su => {
+                        self.add_to_work_list_and_update_assignment(*result, RegisterLocale::Lar);
+                        self.assign_transfer_addresses::<A>(
+                            unit_body,
+                            *result,
+                            unit,
+                            &TransferAddrs {
+                                mutable: RegisterLocale::Lar,
+                                immutable: immutable_locale::<A>(),
+                                element_size: extent.element_size,
+                                increment: None,
+                            },
+                            values,
+                        );
+                        // THE `$consumer` WIRE END (`:732-747`) — a `gtr` when it names a multicast
+                        // group, and otherwise whatever a `sentient.if` in front of it resolves to.
+                        let consumer = consumer.val();
+                        let (is_a_group, yields_a_group, yields_a_unit) = {
+                            let outer: [&[Op]; 1] = [unit_body.as_slice()];
+                            let defs = dialects::Definitions::from_innermost(&outer);
+                            let via_if = match defs.of(consumer) {
+                                Some(if_op @ Op::Sentient(sentient::Op::If { .. })) => {
+                                    dialects::results(if_op)
+                                        .iter()
+                                        .position(|result| *result == consumer)
+                                        .map(|index| {
+                                            (
+                                                find_yields_resolving_to(
+                                                    if_op,
+                                                    index,
+                                                    defs,
+                                                    is_a_multicast_group,
+                                                ),
+                                                find_yields_resolving_to(
+                                                    if_op,
+                                                    index,
+                                                    defs,
+                                                    is_a_get_unit,
+                                                ),
+                                            )
+                                        })
+                                }
+                                Some(_) | None => None,
+                            };
+                            let (yields_a_group, yields_a_unit) = via_if.unwrap_or((false, false));
+                            (is_multicast(consumer, defs), yields_a_group, yields_a_unit)
+                        };
+                        if is_a_group {
+                            if let Some(slot) = utils::path_of(unit_body, *result)
+                                .and_then(|at| OperandSlot::wire_end_of(at, unit_body))
+                            {
+                                self.add_to_work_list_create_copy_and_update_assignment(
+                                    unit_body,
+                                    &slot,
+                                    AliasKey {
+                                        locale: RegisterLocale::Gtr,
+                                        element_size: Some(extent.element_size),
+                                    },
+                                    false,
+                                    values,
+                                );
+                            }
+                        } else if yields_a_group {
+                            self.add_to_work_list_and_update_assignment(
+                                consumer,
+                                RegisterLocale::Gtr,
+                            );
+                        } else if yields_a_unit {
+                            self.add_to_work_list_and_update_assignment(
+                                consumer,
+                                RegisterLocale::Ear,
+                            );
+                        }
+                    }
+                    // `op->emitError(..); signalPassFailure();` on an L0SU or an LXSU (`:759-762`).
+                    _ => self.failures.push(Refused {
+                        at: *result,
+                        unit_type,
+                        message: "Not expecting load_and_send in other units",
+                    }),
+                }
+            }
+            Op::Sentient(sentient::Op::LoadAndExtractScalar {
+                addr_result,
+                data_result,
+                element_size,
+                ..
+            }) => {
+                on_unit(
+                    scope,
+                    |unit_type| unit_type == DfirUnit::Lxlu,
+                    "current_unit_type_ == LXLU (`:765`)",
+                );
+                self.add_to_work_list_and_update_assignment(*addr_result, RegisterLocale::Lrf);
+                self.add_to_work_list_and_update_assignment(*data_result, RegisterLocale::Lrf);
+                // ⭐ THE IMMUTABLE ADDRESS IS NOT TOUCHED HERE, which is why this arm does not reach
+                // [`Self::assign_transfer_addresses`] (`:776-778`).
+                if let Some(slot) = OperandSlot::of(at.clone(), slot_at::MUTABLE_ADDR, unit_body) {
+                    self.add_to_work_list_create_copy_and_update_assignment(
+                        unit_body,
+                        &slot,
+                        AliasKey {
+                            locale: RegisterLocale::Lrf,
+                            element_size: Some(*element_size),
+                        },
+                        true,
+                        values,
+                    );
+                }
+            }
+            Op::Sentient(sentient::Op::ReceiveAndStore {
+                result,
+                extent,
+                increment,
+                producer,
+                dst,
+                drop_first,
+                multicast_info,
+                ..
+            }) => {
+                let unit_type = on_unit(
+                    scope,
+                    is_a_memory_unit,
+                    "is_any_of(current_unit_type_, L0LU, L0SU, LXLU, LXSU, L3LU, L3SU) (`:780`)",
+                );
+                let Some(unit) = memory_unit(unit_type) else {
+                    return;
+                };
+                match unit_type {
+                    DfirUnit::L0su | DfirUnit::Lxsu => {
+                        self.add_to_work_list_and_update_assignment(*result, RegisterLocale::Lrf);
+                        self.assign_transfer_addresses::<A>(
+                            unit_body,
+                            *result,
+                            unit,
+                            &TransferAddrs {
+                                mutable: RegisterLocale::Lrf,
+                                immutable: RegisterLocale::Lrf,
+                                element_size: extent.element_size,
+                                increment: Some(*increment),
+                            },
+                            values,
+                        );
+                    }
+                    DfirUnit::L3lu | DfirUnit::L3su => {
+                        self.add_to_work_list_and_update_assignment(*result, RegisterLocale::Lar);
+                        self.assign_transfer_addresses::<A>(
+                            unit_body,
+                            *result,
+                            unit,
+                            &TransferAddrs {
+                                mutable: RegisterLocale::Lar,
+                                immutable: immutable_locale::<A>(),
+                                element_size: extent.element_size,
+                                increment: None,
+                            },
+                            values,
+                        );
+                        if multicast_info.is_some() {
+                            let index = slot_at::RECEIVE_MULTICAST_INFO
+                                + usize::from(dst.is_some())
+                                + usize::from(drop_first.is_some());
+                            if let Some(slot) = utils::path_of(unit_body, *result)
+                                .and_then(|at| OperandSlot::of(at, index, unit_body))
+                            {
+                                self.add_to_work_list_create_copy_and_update_assignment(
+                                    unit_body,
+                                    &slot,
+                                    AliasKey {
+                                        locale: RegisterLocale::Gtr,
+                                        element_size: Some(extent.element_size),
+                                    },
+                                    false,
+                                    values,
+                                );
+                            }
+                        }
+                        // THE `$producer` WIRE END (`:840-854`) — an `ear` when a `sentient.if` in
+                        // front of it resolves to a unit handle. ⛔ AND NO MULTICAST ARM HERE, unlike
+                        // the send's consumer.
+                        let producer = producer.val();
+                        let yields_a_unit = {
+                            let outer: [&[Op]; 1] = [unit_body.as_slice()];
+                            let defs = dialects::Definitions::from_innermost(&outer);
+                            match defs.of(producer) {
+                                Some(if_op @ Op::Sentient(sentient::Op::If { .. })) => {
+                                    dialects::results(if_op)
+                                        .iter()
+                                        .position(|result| *result == producer)
+                                        .is_some_and(|index| {
+                                            find_yields_resolving_to(
+                                                if_op,
+                                                index,
+                                                defs,
+                                                is_a_get_unit,
+                                            )
+                                        })
+                                }
+                                Some(_) | None => false,
+                            }
+                        };
+                        if yields_a_unit {
+                            self.add_to_work_list_and_update_assignment(
+                                producer,
+                                RegisterLocale::Ear,
+                            );
+                        }
+                    }
+                    // `op->emitError(..); signalPassFailure();` on an L0LU or an LXLU (`:855-857`).
+                    _ => self.failures.push(Refused {
+                        at: *result,
+                        unit_type,
+                        message: "Not expecting receive_and_store in other units",
+                    }),
+                }
+            }
+            Op::Sentient(sentient::Op::LoadAndStore {
+                src,
+                dst,
+                results,
+                extent,
+                multicast_info,
+                is_ibr_write,
+                ..
+            }) => {
+                let unit_type = on_unit(
+                    scope,
+                    |unit_type| matches!(unit_type, DfirUnit::L3lu | DfirUnit::L3su),
+                    "is_any_of(current_unit_type_, L3LU, L3SU) (`:861`)",
+                );
+                let (transfer, src_unit_type, dst_unit_type) = {
+                    let outer: [&[Op]; 1] = [unit_body.as_slice()];
+                    let defs = dialects::Definitions::from_innermost(&outer);
+                    let src_unit_type = unit_type_of(*src, defs);
+                    let dst_unit_type = unit_type_of(*dst, defs);
+                    (
+                        L3GatherScatter::of(src_unit_type, dst_unit_type, *is_ibr_write),
+                        src_unit_type,
+                        dst_unit_type,
+                    )
+                };
+                match transfer {
+                    L3GatherScatter::Gather if unit_type != DfirUnit::L3lu => {
+                        panic!("DT_CHECK(current_unit_type_ == L3LU) (`:874`)")
+                    }
+                    L3GatherScatter::Scatter if unit_type != DfirUnit::L3su => {
+                        panic!("DT_CHECK(current_unit_type_ == L3SU) (`:876`)")
+                    }
+                    L3GatherScatter::IbrWrite { .. } | L3GatherScatter::Plain
+                        if !((src_unit_type == Some(DfirUnit::Lx)
+                            && unit_type == DfirUnit::L3su)
+                            || (src_unit_type == Some(DfirUnit::Hbm)
+                                && unit_type == DfirUnit::L3lu)) =>
+                    {
+                        panic!(
+                            "DT_CHECK(((src_unit_type == LX && current_unit_type_ == L3SU) || \
+                             (src_unit_type == HBM && current_unit_type_ == L3LU)) && \"unexpected \
+                             producer/consumer unit\") (`:878-880`)"
+                        )
+                    }
+                    L3GatherScatter::Gather
+                    | L3GatherScatter::Scatter
+                    | L3GatherScatter::IbrWrite { .. }
+                    | L3GatherScatter::Plain => {}
+                }
+                let (src_locale, dst_locale) = match transfer {
+                    L3GatherScatter::Gather => (RegisterLocale::Ear, RegisterLocale::Lar),
+                    L3GatherScatter::Scatter => (RegisterLocale::Lar, RegisterLocale::Ear),
+                    // ⭐ AN IBR WRITE'S DESTINATION STILL TAKES A `lar`: every use of an IBR register
+                    // is implicit, but the senulator increments the LAR of an ibr-write LDIMU, so the
+                    // register has to count as used (`:888-895`).
+                    L3GatherScatter::IbrWrite { .. } => {
+                        if unit_type == DfirUnit::L3lu {
+                            (RegisterLocale::Ear, RegisterLocale::Lar)
+                        } else {
+                            (RegisterLocale::Lar, RegisterLocale::Ear)
+                        }
+                    }
+                    L3GatherScatter::Plain => (
+                        if src_unit_type == Some(DfirUnit::Lx) {
+                            RegisterLocale::Lar
+                        } else {
+                            RegisterLocale::Ear
+                        },
+                        if dst_unit_type == Some(DfirUnit::Lx) {
+                            RegisterLocale::Lar
+                        } else {
+                            RegisterLocale::Ear
+                        },
+                    ),
+                };
+                let immutable = immutable_locale::<A>();
+                let imm_locale = |locale: RegisterLocale, jcr: bool| {
+                    if locale == RegisterLocale::Ear {
+                        if jcr {
+                            RegisterLocale::Jcr
+                        } else {
+                            RegisterLocale::Ebr
+                        }
+                    } else {
+                        immutable
+                    }
+                };
+                self.add_to_work_list_and_update_assignment(results.0, src_locale);
+                self.add_to_work_list_and_update_assignment(results.1, dst_locale);
+                let mut demands = vec![
+                    (slot_at::SRC_MUTABLE_ADDR, src_locale, true),
+                    (
+                        slot_at::SRC_IMMUTABLE_ADDR,
+                        imm_locale(src_locale, transfer.is_gather()),
+                        false,
+                    ),
+                ];
+                if !(transfer.is_ibr_write() && unit_type == DfirUnit::L3su) {
+                    demands.push((slot_at::DST_MUTABLE_ADDR, dst_locale, true));
+                }
+                if !transfer.is_ibr_write() {
+                    demands.push((
+                        slot_at::DST_IMMUTABLE_ADDR,
+                        imm_locale(dst_locale, transfer.is_scatter()),
+                        false,
+                    ));
+                }
+                if multicast_info.is_some() {
+                    demands.push((
+                        slot_at::TRANSFER_MULTICAST_INFO,
+                        RegisterLocale::Gtr,
+                        false,
+                    ));
+                }
+                // ⛔ THE PATH IS RE-DERIVED PER SLOT, as e523's own operand loop does: each copy can
+                // land in front of the transfer.
+                for (index, locale, is_mutable_addr) in demands {
+                    let Some(slot) = utils::path_of(unit_body, results.0)
+                        .and_then(|at| OperandSlot::of(at, index, unit_body))
+                    else {
+                        continue;
+                    };
+                    self.add_to_work_list_create_copy_and_update_assignment(
+                        unit_body,
+                        &slot,
+                        AliasKey {
+                            locale,
+                            element_size: Some(extent.element_size),
+                        },
+                        is_mutable_addr,
+                        values,
+                    );
+                }
+            }
+            Op::Sentient(sentient::Op::ReceiveAndExtractScalar { result, .. }) => {
+                on_unit(
+                    scope,
+                    |unit_type| unit_type == DfirUnit::Lxsu,
+                    "current_unit_type_ == LXSU (`:936`)",
+                );
+                self.add_to_work_list_and_update_assignment(*result, RegisterLocale::Lrf);
+            }
+            Op::Sentient(sentient::Op::LoadComputeAndSend {
+                result,
+                src_element_size,
+                increment,
+                ..
+            }) => {
+                let unit_type = on_unit(
+                    scope,
+                    |unit_type| unit_type == DfirUnit::Lxlu,
+                    "current_unit_type_ == LXLU (`:940`)",
+                );
+                let Some(unit) = memory_unit(unit_type) else {
+                    return;
+                };
+                self.add_to_work_list_and_update_assignment(*result, RegisterLocale::Lrf);
+                self.assign_transfer_addresses::<A>(
+                    unit_body,
+                    *result,
+                    unit,
+                    &TransferAddrs {
+                        mutable: RegisterLocale::Lrf,
+                        immutable: RegisterLocale::Lrf,
+                        element_size: *src_element_size,
+                        increment: Some(*increment),
+                    },
+                    values,
+                );
+            }
+            Op::Sentient(sentient::Op::Samv { .. }) => {
+                on_unit(
+                    scope,
+                    |unit_type| unit_type == DfirUnit::Lxlu,
+                    "current_unit_type_ == LXLU (`:973`)",
+                );
+                if let Some(slot) = OperandSlot::of(at.clone(), slot_at::LHS, unit_body) {
+                    self.add_to_work_list_create_copy_and_update_assignment(
+                        unit_body,
+                        &slot,
+                        AliasKey {
+                            locale: RegisterLocale::Mvr,
+                            element_size: None,
+                        },
+                        false,
+                        values,
+                    );
+                }
+            }
+            // The `else if` chain ends here: every other op's locale is decided by propagation.
+            _ => {}
+        }
+    }
+}
 
 // crustify:todo: e574_initializeWorkList
 //   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:987  (8 body lines, level 4)
@@ -991,8 +2287,10 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::{Dd2, Elements};
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::sentient::{Reg, RegType};
+    use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
+    use crate::units::Residency;
 
     /// `%r = sentient.scalar_constant {value = <value>}`.
     fn constant(result: Val, value: i64) -> Op {
@@ -1351,5 +2649,184 @@ mod unit_tests {
         assert_eq!(dialects::operands(&body[1]), vec![Val(0)]);
         assert_eq!(dialects::operands(&body[2]), vec![copy, Val(1)]);
         assert_eq!(dialects::operands(&body[3]), vec![copy, Val(1)]);
+    }
+    /// e523 — one drain, running to empty, carries a loop result's locale all the way round its
+    /// interface: the yield, the iterator argument, and from there the initialiser.
+    #[test]
+    fn the_drain_carries_a_loop_results_locale_round_its_whole_interface() {
+        let mut pass = TypesAndCopies::new();
+        let mut values = Values::default();
+        let mut body = vec![
+            constant(Val(0), 8),
+            for_op(
+                Val(1),
+                Val(0),
+                carried(Val(2), Val(3), Val(4)),
+                vec![Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(5)],
+                })],
+            ),
+        ];
+        // e524's own two records, which are what makes the null `def` of the trap unreachable.
+        pass.update_assignment(Val(1), RegType::Lccr);
+        pass.add_to_work_list_and_update_assignment(Val(4), RegType::Lrf);
+
+        pass.process_work_list(&mut body, &mut values);
+
+        assert!(pass.worklist.is_empty());
+        assert_eq!(pass.locale(Val(5)), Locale::Recorded(RegType::Lrf));
+        assert_eq!(pass.locale(Val(3)), Locale::Recorded(RegType::Lrf));
+        // ⭐ THE ARG'S OWN TURN IN THE DRAIN IS WHAT REACHED THE INITIALISER (position >= 1).
+        assert_eq!(pass.locale(Val(2)), Locale::Recorded(RegType::Lrf));
+        // ⛔ AND THE INDUCTION VARIABLE'S `lccr` SURVIVED: first writer wins.
+        assert_eq!(pass.locale(Val(1)), Locale::Recorded(RegType::Lccr));
+    }
+
+    /// `%u = dataflow.get_unit {type = <unit>}`.
+    fn get_unit(result: Val, unit: DfirUnit) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result,
+            residency: Residency::Global,
+            unit,
+            num_folds: None,
+        })
+    }
+
+    /// e524 — the module/unit split for a constant, the loop's `lccr`, and the `isSymbol(lhs)` slip.
+    #[test]
+    fn e524_records_what_the_hardware_fixes_and_copies_nothing_it_need_not() {
+        let mut pass = TypesAndCopies::new();
+        let mut values = Values::default();
+        let mut body = vec![
+            constant(Val(0), 8),
+            for_op(Val(1), Val(0), carried(Val(2), Val(3), Val(4)), Vec::new()),
+        ];
+
+        pass.initialize_assignment_for_an_operation::<Dd2>(
+            &mut body,
+            &OpAt::top(utils::InBlock(0)),
+            OpScope::Module,
+            &mut values,
+        );
+        // ⭐ A MODULE-LEVEL CONSTANT GOES TO THE MAP `clear()` KEEPS, AND IS NOT QUEUED.
+        assert_eq!(
+            pass.per_module.global_const_assignments[&Val(0)],
+            RegType::Imm
+        );
+        assert_eq!(pass.locale(Val(0)), Locale::Unrecorded);
+        assert!(pass.worklist.is_empty());
+
+        pass.initialize_assignment_for_an_operation::<Dd2>(
+            &mut body,
+            &OpAt::top(utils::InBlock(1)),
+            OpScope::ProgramUnit(DfirUnit::Lxlu),
+            &mut values,
+        );
+        assert_eq!(pass.locale(Val(1)), Locale::Recorded(RegType::Lccr));
+        // A constant bound already owns its register: no `jcr` copy went in.
+        assert_eq!(body.len(), 2);
+
+        // ⛔ THE TRAP: with a SYMBOLIC `lhs` the `rhs` guard reads `isSymbol(lhs)` and so leaves the
+        // non-symbolic `rhs` alone as well.
+        let mut with_if = vec![
+            Op::Symbol(symbol::Op::CreateSymbol {
+                result: Val(10),
+                symbol_id: 0,
+                max_value: None,
+            }),
+            Op::Sentient(sentient::Op::If {
+                predicate: sentient::CmpPredicate::Slt,
+                lhs: Val(10),
+                rhs: Val(11),
+                yielded: Vec::new(),
+                dbg_name: None,
+                then_body: Vec::new(),
+                else_body: Vec::new(),
+            }),
+        ];
+        pass.initialize_assignment_for_an_operation::<Dd2>(
+            &mut with_if,
+            &OpAt::top(utils::InBlock(1)),
+            OpScope::ProgramUnit(DfirUnit::Lxlu),
+            &mut values,
+        );
+        assert_eq!(pass.locale(Val(11)), Locale::Unrecorded);
+        // ⭐ AND A NON-SYMBOLIC `lhs` IS WHAT LETS THE SAME `rhs` BE ASKED FOR A `jcr`.
+        let mut without = vec![Op::Sentient(sentient::Op::If {
+            predicate: sentient::CmpPredicate::Slt,
+            lhs: Val(12),
+            rhs: Val(11),
+            yielded: Vec::new(),
+            dbg_name: None,
+            then_body: Vec::new(),
+            else_body: Vec::new(),
+        })];
+        pass.initialize_assignment_for_an_operation::<Dd2>(
+            &mut without,
+            &OpAt::top(utils::InBlock(0)),
+            OpScope::ProgramUnit(DfirUnit::Lxlu),
+            &mut values,
+        );
+        assert_eq!(pass.locale(Val(11)), Locale::Recorded(RegType::Jcr));
+        assert_eq!(pass.locale(Val(12)), Locale::Recorded(RegType::Jcr));
+    }
+
+    /// e524 — an ordinary `LX -> HBM` store on the L3SU: both ends and all four addresses land on the
+    /// register file the transfer's direction fixes.
+    #[test]
+    fn e524_an_l3_transfer_pins_both_ends_and_all_four_addresses() {
+        let mut pass = TypesAndCopies::new();
+        let mut values = Values::default();
+        let mut body = vec![
+            get_unit(Val(0), DfirUnit::Lx),
+            get_unit(Val(1), DfirUnit::Hbm),
+            Op::Sentient(sentient::Op::LoadAndStore {
+                src: Val(0),
+                dst: Val(1),
+                src_mutable_addr: Val(2),
+                src_immutable_addr: Val(3),
+                src_inc: Val(4),
+                dst_mutable_addr: Val(5),
+                dst_immutable_addr: Val(6),
+                dst_inc: Val(7),
+                multicast_info: None,
+                results: (Val(8), Val(9)),
+                extent: Extent::of(Elements(8), Bits(16)),
+                stride: 1,
+                rotate_val: None,
+                shuffle_mode: ShuffleMode::NoShuffle,
+                src_reg: Reg {
+                    locale: RegType::Unknown,
+                    index: None,
+                },
+                dst_reg: Reg {
+                    locale: RegType::Unknown,
+                    index: None,
+                },
+                dir: None,
+                is_ibr_write: false,
+                dbg_name: None,
+            }),
+        ];
+
+        pass.initialize_assignment_for_an_operation::<Dd2>(
+            &mut body,
+            &OpAt::top(utils::InBlock(2)),
+            OpScope::ProgramUnit(DfirUnit::L3su),
+            &mut values,
+        );
+
+        // The LX end is local, the HBM end is external.
+        assert_eq!(pass.locale(Val(8)), Locale::Recorded(RegType::Lar));
+        assert_eq!(pass.locale(Val(9)), Locale::Recorded(RegType::Ear));
+        assert_eq!(pass.locale(Val(2)), Locale::Recorded(RegType::Lar));
+        assert_eq!(pass.locale(Val(5)), Locale::Recorded(RegType::Ear));
+        // ⭐ THE IMMUTABLE HALVES DIFFER: `lbr` beside a `lar` before SEN1P5, `ebr` beside an `ear`.
+        assert_eq!(pass.locale(Val(3)), Locale::Recorded(RegType::Lbr));
+        assert_eq!(pass.locale(Val(6)), Locale::Recorded(RegType::Ebr));
+        // Nothing was copied — an unassigned address needs no register of its own — and nothing was
+        // refused.
+        assert_eq!(body.len(), 3);
+        assert!(pass.failures.is_empty());
     }
 }

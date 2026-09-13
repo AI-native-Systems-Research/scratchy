@@ -514,16 +514,51 @@ pub fn update_if_op_feeding_dyn_loop_bound(
     to_be_deleted.push(Doomed::If(plan.if_result));
 }
 
-// crustify:todo: e526_processIfOp
-//   authority : dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:98  (22 body lines, level 3)
-//   original  : void RedundantConditionalManager::processIfOp()
-//   calls     : e465_updateIfOpBasedOnParentIfOp, e466_updateIfOpFeedingDynLoopBound
+/// Which side of the predicate a `sentient.scalar_constant` defines — `const_val_` with the OTHER side
+/// as `non_const_side_`.
+fn predicate_constant(unit_body: &[Op], if_at: &OpAt) -> Option<(WidestInt, Val)> {
+    let scope: [&[Op]; 1] = [unit_body];
+    let defs = Definitions::from_innermost(&scope);
+    let Op::Sentient(sentient::Op::If { lhs, rhs, .. }) = if_at.op(unit_body)? else {
+        return None;
+    };
+    let constant = |val: Val| match defs.of(val) {
+        Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => Some(*value),
+        _ => None,
+    };
+    match (constant(*lhs), constant(*rhs)) {
+        (Some(value), _) => Some((value, *rhs)),
+        (None, Some(value)) => Some((value, *lhs)),
+        (None, None) => None,
+    }
+}
+
+/// Replaces: e526_processIfOp
+///
+/// Reads the constant side of one conditional's predicate and runs both rewrites off it; a predicate
+/// comparing two non-constants is left alone.
+///
+/// ⛔ TRAP: `isa<BlockArgument>` IS A NULL GUARD, NOT A CASE — a bare `dyn_cast` on a region argument's
+/// null `getDefiningOp()` asserts, and [`Definitions::of`] answering [`None`] covers both.
+/// ⚠️ TRAP: THE LHS WINS WHEN BOTH SIDES ARE CONSTANT, so `non_const_side_` is then the constant RHS.
+pub fn process_if_op(
+    unit_body: &mut Vec<Op>,
+    if_at: &OpAt,
+    to_be_deleted: &mut Vec<Doomed>,
+    values: &mut Values,
+) {
+    let Some((const_val, non_const_side)) = predicate_constant(unit_body, if_at) else {
+        return;
+    };
+    update_if_op_based_on_parent_if_op(unit_body, if_at, non_const_side, const_val, to_be_deleted);
+    update_if_op_feeding_dyn_loop_bound(unit_body, if_at, to_be_deleted, values);
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        Doomed, IfOp, get_return_vals_if_simple_conditional, update_if_op_based_on_parent_if_op,
-        update_if_op_feeding_dyn_loop_bound,
+        Doomed, IfOp, get_return_vals_if_simple_conditional, process_if_op,
+        update_if_op_based_on_parent_if_op, update_if_op_feeding_dyn_loop_bound,
     };
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -813,5 +848,73 @@ mod unit_tests {
             to_be_deleted,
             vec![Doomed::For(ForRef(iv)), Doomed::If(if_result)]
         );
+    }
+    /// e526 — both rewrites run off the ONE constant the predicate names, and a predicate with no
+    /// constant side is left alone.
+    #[test]
+    fn process_if_op_needs_a_constant_side_before_either_rewrite_runs() {
+        let (a, b, zero, four) = (Val(0), Val(1), Val(2), Val(3));
+        let (if_result, iv) = (Val(4), Val(5));
+        let mut body = vec![
+            constant(a, 3),
+            constant(b, 4),
+            constant(zero, 0),
+            constant(four, 4),
+            cond(
+                if_result,
+                sentient::CmpPredicate::Slt,
+                (a, b),
+                Some("dyn"),
+                vec![yield_op(vec![zero])],
+                vec![yield_op(vec![four])],
+            ),
+            for_op(iv, if_result, vec![constant(Val(6), 1), yield_op(vec![])]),
+        ];
+        let mut values = Values::default();
+        for _ in 0..7 {
+            let _ = values.mint();
+        }
+        let mut to_be_deleted = Vec::new();
+
+        process_if_op(
+            &mut body,
+            &OpAt::top(InBlock(4)),
+            &mut to_be_deleted,
+            &mut values,
+        );
+
+        // ⚠️ THE LHS WON, so `non_const_side_` was the constant `b` — and with no parent conditional
+        // the first rewrite found nothing, leaving the dynamic-bound one to move the loop.
+        assert_eq!(body.len(), 7);
+        assert!(matches!(
+            &body[6],
+            Op::Sentient(sentient::Op::If { then_body, .. }) if then_body.len() == 2
+        ));
+        assert_eq!(to_be_deleted, vec![Doomed::If(if_result)]);
+
+        // ⛔ AND WITH NEITHER SIDE CONSTANT, NOTHING AT ALL.
+        let mut untouched = vec![
+            constant(zero, 0),
+            constant(four, 4),
+            cond(
+                if_result,
+                sentient::CmpPredicate::Slt,
+                (Val(7), Val(8)),
+                Some("dyn"),
+                vec![yield_op(vec![zero])],
+                vec![yield_op(vec![four])],
+            ),
+            for_op(iv, if_result, vec![yield_op(vec![])]),
+        ];
+        let before = untouched.clone();
+        let mut none_deleted = Vec::new();
+        process_if_op(
+            &mut untouched,
+            &OpAt::top(InBlock(2)),
+            &mut none_deleted,
+            &mut values,
+        );
+        assert_eq!(untouched, before);
+        assert!(none_deleted.is_empty());
     }
 }

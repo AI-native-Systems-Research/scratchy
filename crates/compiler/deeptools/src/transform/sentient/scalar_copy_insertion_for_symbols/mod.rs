@@ -642,10 +642,116 @@ pub fn dump_candidates(candidates: &[CandidateEntry], scope: &[Op]) -> String {
 //   original  : void ScalarCopyInsertionForSymbolsPass::dumpSymbolUsageInfo() const
 //   calls     : e252_size
 
-// crustify:todo: e527_collectSymbolUsage
-//   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:236  (38 body lines, level 3)
-//   original  : void ScalarCopyInsertionForSymbolsPass::collectSymbolUsage( dataflow::ProgramUnitOp unit)
-//   calls     : e153_getLocale, e422_insert
+/// Replaces: e527_collectSymbolUsage
+///
+/// Records, per symbol and per register file, every use in this unit a `jcr` copy could stand in front
+/// of, skipping the copies and the mapping ops.
+///
+/// ⛔ TRAP: THE TWO `DT_CHECK(..empty())` ARE THE RETURN TYPE, and `DT_CHECK(use_unit)` with
+/// `use_unit != unit` IS THE WALK — only `unit_body` is visited, so neither is constructible.
+/// ⚠️ TRAP: e153 ANSWERS `Unknown` FOR A SYMBOL USED AS A `sentient.for` `$bound`, so that one input
+/// reaches the `DT_CHECK` here where the reference reads the induction variable's locale instead.
+#[must_use]
+pub fn collect_symbol_usage(
+    unit_body: &[Op],
+    symbols: &[Val],
+    symbol_queries: &[Val],
+) -> (SymbolUsage, Vec<RegType>) {
+    let mut usage = SymbolUsage::default();
+    let mut symbolic_locales = Vec::new();
+    for &sym in symbols.iter().chain(symbol_queries) {
+        collect_usage(
+            unit_body,
+            sym,
+            &[],
+            0,
+            None,
+            false,
+            &mut usage,
+            &mut symbolic_locales,
+        );
+    }
+    (usage, symbolic_locales)
+}
+
+/// The `collectUsage` lambda's `sym.getUses()` loop, as a walk: an op of this island has no use list,
+/// so a use is found by visiting the unit and testing every operand slot. `inside_uniform` is
+/// `getParentOfType<UniformizeRegionsOp, EqualizePatternOp>` carried down, as in
+/// [`walk_ops_of_interest`]; `offset` is where this region starts in its holder's concatenated regions,
+/// which is what a [`UseSite::path`] ordinal counts.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the walk carries the reference's `this`, its lambda capture and the parent chain an op               of this island cannot be asked for"
+)]
+fn collect_usage(
+    scope: &[Op],
+    sym: Val,
+    prefix: &[u32],
+    offset: u32,
+    parent: Option<&Op>,
+    inside_uniform: bool,
+    usage: &mut SymbolUsage,
+    symbolic_locales: &mut Vec<RegType>,
+) {
+    for (index, op) in scope.iter().enumerate() {
+        let mut path: Vec<u32> = Vec::with_capacity(prefix.len() + 1);
+        path.extend_from_slice(prefix);
+        path.push(offset + index as u32);
+        if !matches!(
+            op,
+            Op::Sentient(sentient::Op::ScalarCopy { .. })
+                | Op::Symbol(symbol::Op::ImmutableMapping { .. })
+                | Op::Uniform(uniform::Op::DefImmutableMapping { .. })
+        ) {
+            for (operand, val) in dialects::operands(op).into_iter().enumerate() {
+                if val != sym {
+                    continue;
+                }
+                let locale = locale_of_use(op, operand, parent);
+                if locale == RegType::Unknown {
+                    panic!(
+                        "DT_CHECK(locale != SentientRegType::unknown) (`:256`) for operand {operand}                          of {op:?}"
+                    );
+                }
+                if inside_uniform && matches!(locale, RegType::Jcr | RegType::Lccr) {
+                    continue;
+                }
+                if !symbolic_locales.contains(&locale) {
+                    symbolic_locales.push(locale);
+                }
+                usage.record(
+                    sym,
+                    locale,
+                    UseSite {
+                        path: path.clone(),
+                        operand,
+                    },
+                );
+            }
+        }
+        let nested_uniform = inside_uniform
+            || matches!(
+                op,
+                Op::Uniform(
+                    uniform::Op::UniformizeRegions { .. } | uniform::Op::EqualizePattern { .. }
+                )
+            );
+        let mut base = 0u32;
+        for region in dialects::regions_ref(op) {
+            collect_usage(
+                region,
+                sym,
+                &path,
+                base,
+                Some(op),
+                nested_uniform,
+                usage,
+                symbolic_locales,
+            );
+            base += region.len() as u32;
+        }
+    }
+}
 
 // crustify:todo: e576_runOn
 //   authority : dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:148  (67 body lines, level 4)
@@ -1105,6 +1211,29 @@ mod unit_tests {
             dump_candidates(&candidates, &scope),
             "symbol on line (?): %0 = symbol.create_symbol {SymbolId = 7 : i32} : index\n\
              \tlocale [JCR]\n"
+        );
+    }
+    /// e527 — a use is recorded under the locale of the op that reads it, and the ops a copy cannot
+    /// stand in front of are skipped.
+    #[test]
+    fn collect_symbol_usage_records_the_users_locale_and_skips_the_copies() {
+        let sym = Val(1);
+        let body = vec![
+            a_copy(sym, Val(5), RegType::Lrf),
+            an_add(sym, Val(6), Val(7), RegType::Lbr, None),
+        ];
+
+        let (usage, locales) = collect_symbol_usage(&body, &[sym], &[]);
+
+        // ⛔ THE COPY'S OWN USE IS NOT ONE: `lrf` never appears.
+        assert_eq!(locales, vec![RegType::Lbr]);
+        assert!(usage.uses(sym, RegType::Lrf).is_empty());
+        assert_eq!(
+            usage.uses(sym, RegType::Lbr),
+            &[UseSite {
+                path: vec![1],
+                operand: 0,
+            }]
         );
     }
 }

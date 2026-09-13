@@ -81,19 +81,23 @@
 //! | `e458_runOn` | 458 | 2 | 68 | `dcc/src/Transform/Sentient/RegisterInitialization.cpp:182` |
 //! | `e521_runOnOperation` | 521 | 3 | 16 | `dcc/src/Transform/Sentient/RegisterInitialization.cpp:261` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET. `e521_runOnOperation` — the pass entry — has landed
+// as [`run_on_operation`], and nothing in this crate calls it, so every item below is still reachable
+// only from the tests. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WHEN A PIPELINE CALLS `run_on_operation`: from then on an unused item here is a real
+// defect.
 #![allow(dead_code)]
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e521_runOnOperation` (level 3) is what reaches
-// this file's driver, and every unit below is reachable only from the tests until it lands. CI runs
-// clippy with `-D warnings`. ⭐ REMOVE THIS WITH e521.
 
 use crate::arch::Arch;
-use crate::islands::sentient::ProgramUnit;
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
 use crate::transform::sentient::analyses::{
-    Candidate, CandidateCollector, CandidateEvaluator, CandidateSelector, Liveness,
-    OutOfScopeCandidateCollector, OutOfScopeCandidateEvaluator, OutOfScopeCandidateSelector,
-    OutOfScopeTransformer, OutOfScopeUniformGrouper, OutOfScopeUniformGroups, Transformer,
-    UniformGrouper, UniformGroups,
+    Candidate, CandidateCollector, CandidateEvaluator, CandidateSelector, InstructionEstimator,
+    Liveness, OutOfScopeCandidateCollector, OutOfScopeCandidateEvaluator,
+    OutOfScopeCandidateSelector, OutOfScopeTransformer, OutOfScopeUniformGrouper,
+    OutOfScopeUniformGroups, Transformer, UniformGrouper, UniformGroups,
 };
+use crate::workload::Workload;
 
 /// THE `-dcc-register-initialization-collector` VALUES — `dcc::reginit::CollectorKind`
 /// (`RegisterInitialization/Collector.h:28`) less the `kUnknown` the option never offers.
@@ -273,17 +277,49 @@ pub fn run_on<A: Arch>(unit: &mut ProgramUnit<A>, liveness: &mut dyn Liveness) {
     );
 }
 
-// crustify:todo: e521_runOnOperation
-//   authority : dcc/src/Transform/Sentient/RegisterInitialization.cpp:261  (16 body lines, level 3)
-//   original  : void RegisterInitializationPass::runOnOperation()
-//   calls     : e458_runOn
+/// `-dcc-register-initialization-disable`, `cl::init(false)` (`:77-80`) — a `dcc-opt` command-line
+/// flag, not a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `opts_.OptLevel == 0` (`:266`) — ⛔ NOT A `dcc-opt` FLAG BUT A BUILD OPTION:
+/// `CommonPassOptions::OptLevel` defaults to `-1` (`dcc/tools/Options/dcc-pass-option.h:117`), so an
+/// ordinary build never asks the estimator and initialises every unit.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// Replaces: e521_runOnOperation
+///
+/// The pass entry: register-initialises every program unit, unless the flag turned the pass off or
+/// `-O0` found the unit already fits its instruction buffer.
+///
+/// ⭐ `markAnalysesPreserved<Liveness>()` HAS NO EXPRESSION HERE — a `Liveness` this crate hands in as
+/// a seam is owned by the caller, so there is no pass-manager cache to keep or invalidate.
+/// ⚠️ TRAP: THE ESTIMATOR IS ONLY ASKED AT `-O0`, and it is out of campaign scope — the `&&` short
+/// circuit is what keeps [`InstructionEstimator::have_ibuff_space`]'s `todo!` out of a default build.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    liveness: &mut dyn Liveness,
+    instruction_estimator: &mut impl InstructionEstimator,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for unit in program.units.iter_mut() {
+        if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        run_on(unit, liveness);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
-    use crate::islands::dataflow_ir::Units;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
     use crate::islands::sentient::dialects::Val;
+    use crate::transform::sentient::analyses::OutOfScopeInstructionEstimator;
     use crate::transform::sentient::analyses::OutOfScopeLiveness;
     use crate::units::DfirUnit;
     use std::cell::RefCell;
@@ -518,5 +554,53 @@ mod unit_tests {
             *log.borrow(),
             vec![Call::Transform(vec![Candidate(7), Candidate(8)])]
         );
+    }
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e521_runOnOperation — the entry reaches [`run_on`] for the unit, and ⚠️ THE ESTIMATOR IS NOT
+    /// ASKED: at any optimisation level but `-O0` the `&&` short circuits before its `todo!`, so the
+    /// panic that arrives names the uniform-group analysis and not `haveIbuffSpace`.
+    #[test]
+    #[should_panic(expected = "UniformGroupAnalyzer::collectExclusiveGroupLeaders")]
+    fn e521_run_on_operation_reaches_the_driver_without_asking_the_estimator() {
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Pe, Val(0)),
+                    precision: None,
+                    body: Vec::new(),
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut liveness = OutOfScopeLiveness;
+        let mut estimator = OutOfScopeInstructionEstimator;
+        run_on_operation(&mut program, &mut liveness, &mut estimator);
     }
 }

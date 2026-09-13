@@ -1771,6 +1771,18 @@ impl StoreSource {
             StoreSource::Conditional(val) => val,
         }
     }
+
+    /// THE VALUE THE `$producer` OPERAND NAMES, AS A PLACE — for SUBSTITUTION ONLY, exactly as
+    /// [`RecvEnd::val_mut`] is, and reachable only through [`wire_end_mut`].
+    pub(crate) const fn val_mut(&mut self) -> &mut Val {
+        match self {
+            StoreSource::Wire(end) => end.val_mut(),
+            StoreSource::Constant(val)
+            | StoreSource::Multicast(val)
+            | StoreSource::QueryMap(val)
+            | StoreSource::Conditional(val) => val,
+        }
+    }
 }
 
 /// HOW MANY ELEMENTS A TRANSFER MOVES AND HOW WIDE THEY ARE — the attributes every transfer shares.
@@ -2698,6 +2710,92 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
         | Op::Opaque { .. } => {}
     }
     reads
+}
+
+/// THE WIRE END ONE `sentient.*` OP NAMES — its `$consumer`, `$producer` or `$unit`, the one operand
+/// [`operands_mut`] deliberately leaves out.
+///
+/// ⛔⛔ IT IS AN OPERAND IN THE `.td` AND IT IS A USE OF A VALUE, so a rewrite MUST reach it.
+/// [`operands_mut`] cannot carry it — loop rolling keys deltas by POSITION in that list and adding a
+/// fourth entry would shift every field past the increment (see [`super::operands`]) — which left
+/// [`super::replace_all_uses_with`] able to leave a store reading a value nothing defines any more.
+/// This is the other half of that list, addressed by name because there is at most one per op.
+#[must_use]
+pub fn wire_end(op: &Op) -> Option<Val> {
+    match op {
+        Op::LoadAndSend { consumer, .. }
+        | Op::LoadAndExtractScalar { consumer, .. }
+        | Op::LoadComputeAndSend { consumer, .. } => Some(consumer.val()),
+        Op::ReceiveAndStore { producer, .. } => Some(producer.val()),
+        Op::ReceiveAndExtractScalar { unit, .. } => Some(unit.val()),
+        // ⛔ NO `_` ARM: a thirtieth operation carrying a wire end must be a build error here, not one
+        // every rewrite quietly skips — see [`regions`].
+        Op::For { .. }
+        | Op::If { .. }
+        | Op::Yield { .. }
+        | Op::VectorMac { .. }
+        | Op::VectorBinary { .. }
+        | Op::VectorUnary { .. }
+        | Op::VectorTernary { .. }
+        | Op::Load { .. }
+        | Op::LoadAndStore { .. }
+        | Op::ScalarAdd { .. }
+        | Op::ScalarSub { .. }
+        | Op::ScalarMul { .. }
+        | Op::ScalarCopy { .. }
+        | Op::ScalarConstant { .. }
+        | Op::VectorConstant { .. }
+        | Op::Sync { .. }
+        | Op::Nop { .. }
+        | Op::SetSendDst { .. }
+        | Op::LogicalPort { .. }
+        | Op::Splat { .. }
+        | Op::Samv { .. }
+        | Op::SetMask { .. }
+        | Op::IncrMask { .. }
+        | Op::Opaque { .. } => None,
+    }
+}
+
+/// THE WIRE END ONE `sentient.*` OP NAMES, AS A PLACE — [`wire_end`]'s counterpart, and the only
+/// route to [`SendEnd::val_mut`], [`RecvEnd::val_mut`] and [`StoreSource::val_mut`].
+///
+/// ⛔ SUBSTITUTION, NOT RE-PAIRING: writing here renames the value an end already names; the
+/// [`Link`] the end came from still says which two units it joins.
+#[must_use]
+pub fn wire_end_mut(op: &mut Op) -> Option<&mut Val> {
+    match op {
+        Op::LoadAndSend { consumer, .. }
+        | Op::LoadAndExtractScalar { consumer, .. }
+        | Op::LoadComputeAndSend { consumer, .. } => Some(consumer.val_mut()),
+        Op::ReceiveAndStore { producer, .. } => Some(producer.val_mut()),
+        Op::ReceiveAndExtractScalar { unit, .. } => Some(unit.val_mut()),
+        // ⛔ NO `_` ARM — see [`wire_end`].
+        Op::For { .. }
+        | Op::If { .. }
+        | Op::Yield { .. }
+        | Op::VectorMac { .. }
+        | Op::VectorBinary { .. }
+        | Op::VectorUnary { .. }
+        | Op::VectorTernary { .. }
+        | Op::Load { .. }
+        | Op::LoadAndStore { .. }
+        | Op::ScalarAdd { .. }
+        | Op::ScalarSub { .. }
+        | Op::ScalarMul { .. }
+        | Op::ScalarCopy { .. }
+        | Op::ScalarConstant { .. }
+        | Op::VectorConstant { .. }
+        | Op::Sync { .. }
+        | Op::Nop { .. }
+        | Op::SetSendDst { .. }
+        | Op::LogicalPort { .. }
+        | Op::Splat { .. }
+        | Op::Samv { .. }
+        | Op::SetMask { .. }
+        | Op::IncrMask { .. }
+        | Op::Opaque { .. } => None,
+    }
 }
 
 /// THE VALUES ONE `sentient.*` OP **BINDS AS RESULTS** — what `getResult(n)` answers.

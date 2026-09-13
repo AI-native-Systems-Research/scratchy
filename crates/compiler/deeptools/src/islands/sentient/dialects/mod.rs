@@ -624,6 +624,14 @@ pub fn replace_all_uses_with(scope: &mut [Op], of: Val, with: Val) {
                         *operand = with;
                     }
                 }
+                // ⛔ AND THE WIRE END, which is an operand in the `.td` and not in the list above —
+                // see [`sentient::wire_end_mut`]. Without it a `receive_and_store` kept reading the
+                // value a `gtr` copy had just displaced (`RegisterTypeAssignment.cpp:417`).
+                if let Some(end) = sentient::wire_end_mut(inner)
+                    && *end == of
+                {
+                    *end = with;
+                }
                 for region in sentient::regions_mut(inner) {
                     replace_all_uses_with(region, of, with);
                 }

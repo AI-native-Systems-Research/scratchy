@@ -80,17 +80,22 @@
 //! | `e464_runOn` | 464 | 2 | 42 | `dcc/src/Transform/Sentient/RematerializationPass.cpp:175` |
 //! | `e525_runOnOperation` | 525 | 3 | 11 | `dcc/src/Transform/Sentient/RematerializationPass.cpp:163` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
-// file's own tests until `e525_runOnOperation` lands and something calls it. CI runs clippy with
-// `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e525_runOnOperation`: at that point an unused item here is a real defect again.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET. `e525_runOnOperation` — the pass entry — has landed
+// as [`run_on_operation`], and nothing in this crate calls it, so every item below is still reachable
+// only from this file's own tests. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WHEN A PIPELINE CALLS `run_on_operation`: from then on an unused item here is a real
+// defect.
 #![allow(dead_code)]
 
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::{
     self as dialects, Definitions, Op, Val, sentient, use_count,
 };
+use crate::model::Model;
 use crate::transform::sentient::utils::{self, ConstKind, OpAt};
+use crate::workload::Workload;
 
 /// A VALUE SOME ENCLOSING REGION BINDS AS A RESULT — `DT_CHECK_MSG(!isa<BlockArgument>(v), "Function
 /// should not be called on an iter arg")` (`:83-84`) AS THE PARAMETER TYPE.
@@ -372,22 +377,51 @@ pub fn run_on<const ALLOW_OPERAND_LIVE_RANGE_INCREASE: bool>(
     }
 }
 
-// crustify:todo: e525_runOnOperation
-//   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:163  (11 body lines, level 3)
-//   original  : void RematerializationPass::runOnOperation()
-//   calls     : e464_runOn
+/// `-dcc-rematerialization-disable`, `cl::init(false)` (`:38-40`) — a `dcc-opt` command-line flag,
+/// not a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `AllowOperandLiveRangeIncrease`, `cl::init(true)` (`:42-46`) — the pass entry is the one place that
+/// instantiates [`run_on`]'s const generic.
+const ALLOW_OPERAND_LIVE_RANGE_INCREASE: bool = true;
+
+/// Replaces: e525_runOnOperation
+///
+/// The pass entry: rematerializes in every program unit of the module, unless the flag turned the pass
+/// off.
+///
+/// ⭐ `dom_info_` IS THE DROPPABLE MECHANISM — a `DominanceInfo` built and deleted per unit is how the
+/// reference reaches the answer [`InBlock`] derives from the body's own order, and `WalkResult::skip()`
+/// needs no expression: a program's units are a flat list on this island.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for unit in program.units.iter_mut() {
+        run_on::<ALLOW_OPERAND_LIVE_RANGE_INCREASE>(&mut unit.body, values);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
         Defined, InBlock, increases_operand_liverange, is_candidate_for_rematerialization,
-        last_use_within_block, run_on,
+        last_use_within_block, run_on, run_on_operation,
     };
-    use crate::islands::dataflow_ir::Values;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units, Values};
     use crate::islands::sentient::dialects::{
         self as dialects, Definitions, Op, Val, sentient, use_count,
     };
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
+    use crate::units::DfirUnit;
+    use crate::workload::Workload;
 
     /// `%r = sentient.scalar_constant {value = 1 : si64} : index`.
     fn constant(result: Val) -> Op {
@@ -625,5 +659,70 @@ mod unit_tests {
         assert_ne!(cloned, Val(1));
         assert_eq!(dialects::operands(&body[3]), vec![cloned, Val(4)]);
         assert_eq!(use_count(Val(1), &body), 0);
+    }
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// A two-unit program, both units running `body`.
+    fn two_units(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        let unit = |body| ProgramUnit {
+            on: Units::one(DfirUnit::Lxlu, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(body.clone()), vec![unit(body)]),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// e525 — the pass entry rematerializes in EVERY program unit, which is all it adds over e464.
+    #[test]
+    fn e525_rematerializes_in_every_unit_of_the_program() {
+        let mut values = Values::default();
+        for _ in 0..6 {
+            let _ = values.mint();
+        }
+        let mut program = two_units(vec![
+            constant(Val(0)),
+            copy(Val(0), Val(1)),
+            constant(Val(4)),
+            mul(Val(1), Val(4), Val(2)),
+        ]);
+
+        run_on_operation(&mut program, &mut values);
+
+        for unit in program.units.iter() {
+            // The candidate was cloned in front of its one use and the original erased.
+            assert_eq!(use_count(Val(1), &unit.body), 0);
+            assert!(matches!(
+                &unit.body[2],
+                Op::Sentient(sentient::Op::ScalarCopy { .. })
+            ));
+        }
     }
 }

@@ -97,7 +97,7 @@ use std::collections::BTreeMap;
 
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, results, set_value_reg_index, symbol, uniform,
+    Definitions, Op, Val, regions_ref, results, set_value_reg_index, symbol, uniform,
 };
 use crate::transform::sentient::ProgStitch;
 
@@ -619,10 +619,53 @@ impl RegisterPacking {
     }
 }
 
-// crustify:todo: e522_runOnProgramUnitOp
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:388  (21 body lines, level 3)
-//   original  : void RegisterPackingPass::runOnProgramUnitOp(dataflow::ProgramUnitOp unit)
-//   calls     : e134_doRenumbering, e459_computeNewRegisterIndices, e460_runOnAllOps, e461_runOnForOp, e462_runOnCopyOp
+impl RegisterPacking {
+    /// Replaces: e522_runOnProgramUnitOp
+    ///
+    /// Tracks every register one program unit holds, packs the indices and writes them back.
+    ///
+    /// ⛔ TRAP: `lrf0` IS AVOIDED ONCE PER `sentient.load_and_extract_scalar`, BEFORE THE ATTRIBUTE
+    /// GUARD (`:393-395`), so a unit with two of them avoids index 0 twice — harmless, because
+    /// `getNextValidIdx` restarts its scan and never counts entries.
+    /// ⭐ `hasAttr("regIndex") || hasAttr("regIndices")` IS DISCHARGED BY e135 ANSWERING [`None`]: an
+    /// island [`ops::Op::ScalarCopy`] always carries a `reg`, and an op that holds no register at
+    /// `position` is skipped by e460/e461 exactly where the reference never calls them.
+    pub fn run_on_program_unit_op(&mut self, unit_body: &mut [Op], stitching: ProgStitch) {
+        let mut avoid_renumbering_regs = AvoidRenumbering::new();
+        self.collect_from(unit_body, &[], &mut avoid_renumbering_regs);
+        self.compute_new_register_indices(stitching, &avoid_renumbering_regs);
+        self.do_renumbering(unit_body);
+    }
+
+    /// The pre-order `unit->walk` of e522, carrying the scopes an op's operands may be defined in.
+    fn collect_from<'a>(
+        &mut self,
+        scope: &'a [Op],
+        outer: &[&'a [Op]],
+        avoid_renumbering_regs: &mut AvoidRenumbering,
+    ) {
+        let mut regions: Vec<&'a [Op]> = Vec::with_capacity(outer.len() + 1);
+        regions.push(scope);
+        regions.extend_from_slice(outer);
+        for op in scope {
+            if matches!(op, Op::Sentient(ops::Op::LoadAndExtractScalar { .. })) {
+                avoid_renumbering_regs
+                    .entry(ops::RegType::Lrf)
+                    .or_default()
+                    .push(ops::RegIndex::at::<0>());
+            }
+            let defs = Definitions::from_innermost(&regions);
+            match op {
+                Op::Sentient(ops::Op::ScalarCopy { .. }) => self.run_on_copy_op(op, defs),
+                Op::Sentient(ops::Op::For { .. }) => self.run_on_for_op(op, defs),
+                _ => self.run_on_all_ops(op),
+            }
+            for region in regions_ref(op) {
+                self.collect_from(region, &regions, avoid_renumbering_regs);
+            }
+        }
+    }
+}
 
 // crustify:todo: e573_runOnOperation
 //   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:410  (11 body lines, level 4)
@@ -1006,5 +1049,36 @@ mod unit_tests {
 
         packing.run_on_copy_op(&scalar_copy(Val(10), ops::RegType::Unknown, None), defs);
         assert_eq!(packing.reg_table.len(), 1);
+    }
+    /// e522 — the walk reaches into a nested region, and the whole unit's `lrf` registers come back
+    /// packed from zero in the order the pre-order walk saw them.
+    #[test]
+    fn e522_packs_every_lrf_the_unit_holds_including_one_inside_a_loop() {
+        let mut unit = vec![
+            scalar_copy(Val(9), ops::RegType::Lrf, Some(ops::RegIndex::at::<7>())),
+            Op::Sentient(ops::Op::For {
+                iv: Val(1),
+                bound: Val(2),
+                bound_reg: None,
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![scalar_copy(
+                    Val(10),
+                    ops::RegType::Lrf,
+                    Some(ops::RegIndex::at::<4>()),
+                )],
+            }),
+        ];
+        let mut packing = RegisterPacking {
+            reg_table: Vec::new(),
+        };
+
+        packing.run_on_program_unit_op(&mut unit, ProgStitch::Standalone);
+
+        assert_eq!(copy_reg(&unit).index, Some(ops::RegIndex::at::<0>()));
+        let Op::Sentient(ops::Op::For { body, .. }) = &unit[1] else {
+            panic!("the loop is still the second op");
+        };
+        assert_eq!(copy_reg(body).index, Some(ops::RegIndex::at::<1>()));
     }
 }
