@@ -3745,8 +3745,8 @@ mod tests_e078_e085 {
     };
     use crate::generated::{ComputeType, DataConnect};
     use crate::schedule::dsc2::{
-        AllocLayout, AllocateNode, DataInfo, Dsts, FoldPosition, LayoutDims, MaxDimSize, NodeName,
-        ReplicationFactor, StartAddress,
+        AllocLayout, AllocPlacement, AllocateNode, DataInfo, Dsts, FoldPosition, InstrAttribute,
+        LayoutDims, MaxDimSize, NodeName, ReplicationFactor, StartAddress,
     };
     use crate::units::NumFolds;
 
@@ -3816,6 +3816,8 @@ mod tests_e078_e085 {
             ],
             outputs: vec![operand(SenComponent::Ptsouth, None, None)],
             num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
         };
         assert_eq!(
             dbg_print_compute(&node),
@@ -3925,6 +3927,7 @@ mod tests_e078_e085 {
             temp_storage_for_compute: None,
             layout: AllocLayout::new((PrimaryDim::Out, MaxDimSize::Unset), Vec::new()),
             start_address: StartAddress::default(),
+            placement: AllocPlacement::default(),
             gap_stick_spread: Default::default(),
             alloc_users: Vec::new(),
         };
@@ -3935,6 +3938,8 @@ mod tests_e078_e085 {
             inputs: vec![],
             outputs: vec![],
             num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
         };
         let transfer = TransferNode {
             name: NodeName("t0".to_owned()),
@@ -3974,6 +3979,8 @@ mod tests_e078_e085 {
             ],
             outputs: vec![],
             num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
         };
         let node = Node::Compute(&compute);
         assert_eq!(
@@ -4008,6 +4015,7 @@ mod tests_e233_e240 {
     use crate::generated::ComputeType;
     use crate::schedule::ddc::metadata::DatastageId;
     use crate::schedule::ddc::transformation_util::LoopDims;
+    use crate::schedule::dsc2::InstrAttribute;
     use crate::schedule::l3::dl_ops::LoopDistribution;
     use crate::units::NumFolds;
 
@@ -4127,6 +4135,8 @@ mod tests_e233_e240 {
             inputs: Vec::new(),
             outputs: Vec::new(),
             num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
         }
     }
 
@@ -4254,6 +4264,7 @@ mod tests_e233_e240 {
             temp_storage_for_compute: None,
             layout: dsc2::AllocLayout::new((PrimaryDim::Out, dsc2::MaxDimSize::Unset), Vec::new()),
             start_address: dsc2::StartAddress::default(),
+            placement: dsc2::AllocPlacement::default(),
             gap_stick_spread: Default::default(),
             alloc_users: Vec::new(),
         };

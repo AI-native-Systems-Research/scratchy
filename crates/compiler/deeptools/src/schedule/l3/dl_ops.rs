@@ -1611,6 +1611,7 @@ pub fn create_sync_node(
         units,
         direction,
         strength,
+        implicit_sync_ref_transfer: None,
     }
 }
 
@@ -3405,7 +3406,7 @@ mod tests_e049_e056 {
     use crate::arch::{Dd2, Sen1p5};
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
     use crate::schedule::ddc::fold::Stride;
-    use crate::schedule::dsc2::{AllocLayout, LayoutDims, MaxDimSize, StartAddress};
+    use crate::schedule::dsc2::{AllocLayout, AllocPlacement, LayoutDims, MaxDimSize, StartAddress};
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DscList, LabeledDsList, NamedDims,
         PlacedAllocation, PrimaryDsInfo, StageDims,
@@ -3716,6 +3717,7 @@ mod tests_e049_e056 {
             temp_storage_for_compute: None,
             layout: AllocLayout::new((PrimaryDim::Out, MaxDimSize::Unset), Vec::new()),
             start_address: StartAddress::default(),
+            placement: AllocPlacement::default(),
             gap_stick_spread: BTreeMap::new(),
             alloc_users: Vec::new(),
         };
@@ -4150,8 +4152,8 @@ pub fn construct_datastage<D: Clone>(
 mod tests_e057_e064 {
     use super::*;
     use crate::schedule::dsc2::{
-        AllocLayout as Dsc2AllocLayout, Coordinate, CoordinateCategory, FoldCardinality, FoldCoeff,
-        FoldLabel, LayoutDims, MaxDimSize, StartAddress,
+        AllocLayout as Dsc2AllocLayout, AllocPlacement, Coordinate, CoordinateCategory,
+        FoldCardinality, FoldCoeff, FoldLabel, LayoutDims, MaxDimSize, StartAddress,
     };
 
     /// One labelled DS's `memOrg_` as this batch reads it, stated by field.
@@ -4207,6 +4209,7 @@ mod tests_e057_e064 {
             temp_storage_for_compute: None,
             layout: Dsc2AllocLayout::new((dim, MaxDimSize::Unset), Vec::new()),
             start_address: StartAddress::default(),
+            placement: AllocPlacement::default(),
             gap_stick_spread: BTreeMap::new(),
             alloc_users: Vec::new(),
         }

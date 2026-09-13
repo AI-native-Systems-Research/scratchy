@@ -200,12 +200,13 @@ impl PaddingForm {
     }
 }
 
-/// `EnumsConversion::senComponentsToString.at(comp)` for the eight `ddc::memories`
+/// `EnumsConversion::senComponentsToString.at(comp)` for the `ddc::memories`
 /// (`sys-arch-spec/arch_enums.cpp:10-118`, `ddc/ddc_metadata.h:20-21`).
 const fn memory_spelling(memory: DdcMemory) -> &'static str {
     match memory {
         DdcMemory::Lx => "lx",
         DdcMemory::L0 => "l0",
+        DdcMemory::L0Scale => "l0_scale",
         DdcMemory::PeLrf => "pelrf",
         DdcMemory::SfpLrf => "sfplrf",
         DdcMemory::PtaRf => "ptarf",
@@ -1208,6 +1209,7 @@ const fn memory_component(memory: DdcMemory) -> SenComponent {
     match memory {
         DdcMemory::Lx => SenComponent::Lx,
         DdcMemory::L0 => SenComponent::L0,
+        DdcMemory::L0Scale => SenComponent::L0Scale,
         DdcMemory::PeLrf => SenComponent::Pelrf,
         DdcMemory::SfpLrf => SenComponent::Sfplrf,
         DdcMemory::PtaRf => SenComponent::Ptarf,
@@ -2357,7 +2359,9 @@ mod tests_e110_e117 {
     use super::super::metadata::{Allocation, DataTransfer, TransferAccessPattern};
     use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::{ConstIdx, DataStream};
-    use crate::schedule::dsc2::{DataInfo, Dsts, LayoutDims, Operand, ReplicationFactor};
+    use crate::schedule::dsc2::{
+        DataInfo, Dsts, InstrAttribute, LayoutDims, Operand, ReplicationFactor,
+    };
     use crate::units::{DfirUnit, NumFolds};
 
     /// A DSC WITH ONE LABELED DS. Its own `ldsIdx_` is deliberately NOT the index it is looked up
@@ -2802,6 +2806,8 @@ mod tests_e110_e117 {
             inputs: vec![operand(Some(DataConnect::ArfPt))],
             outputs: vec![operand(Some(DataConnect::ArfPtsum))],
             num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
         };
         assert_eq!(
             get_node_description(UtilNode::Compute(&compute)),
@@ -2823,7 +2829,7 @@ mod tests_e255_e257 {
 
     use super::super::metadata::{Allocation, OpaqueOp};
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{DataInfo, Operand, OperandPos};
+    use crate::schedule::dsc2::{DataInfo, InstrAttribute, Operand, OperandPos};
     use crate::units::NumFolds;
 
     /// THE ONE DATASTREAM THIS STAND-IN CALLS EXTERNAL — entry 120's answer, as the seam the port
@@ -2866,6 +2872,8 @@ mod tests_e255_e257 {
             ],
             outputs: vec![operand(DataConnect::OuttensorToSfp, SenComponent::Ptxrf)],
             num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
         }
     }
 
@@ -3194,7 +3202,7 @@ mod tests_e247_e254 {
 
     use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::DataStream;
-    use crate::schedule::dsc2::{Dsts, LayoutDims, ReplicationFactor};
+    use crate::schedule::dsc2::{Dsts, InstrAttribute, LayoutDims, ReplicationFactor};
     use crate::schedule::l3::dsc::{Granularity, MaxSize};
     use crate::units::{DfirUnit, NumFolds};
 
@@ -4001,6 +4009,8 @@ mod tests_e247_e254 {
                     inputs: vec![operand(SenComponent::Sfp, SenComponent::NoComponent, None)],
                     outputs: Vec::new(),
                     num_folds_engaged: NumFolds::ONE,
+                    data_format: None,
+                    instr_attribute: InstrAttribute::default(),
                 },
             ),
         ];

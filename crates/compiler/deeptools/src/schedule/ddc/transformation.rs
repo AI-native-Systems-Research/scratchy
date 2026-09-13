@@ -1408,7 +1408,7 @@ where
 mod tests_e105_e109 {
     use super::*;
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{DataInfo, Dsts, ReplicationFactor};
+    use crate::schedule::dsc2::{DataInfo, Dsts, InstrAttribute, ReplicationFactor};
     use crate::units::NumFolds;
 
     /// A tree of computes, in traversal order.
@@ -1478,6 +1478,8 @@ mod tests_e105_e109 {
             inputs: vec![operand(ex_unit, Some(connect), Some(0))],
             outputs: vec![operand(ex_unit, Some(connect), Some(0))],
             num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
         }
     }
 
@@ -1716,7 +1718,7 @@ mod tests_e105_e109 {
 mod tests_e242_e246 {
     use super::*;
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{DataInfo, Dsts, ReplicationFactor};
+    use crate::schedule::dsc2::{DataInfo, Dsts, InstrAttribute, ReplicationFactor};
     use crate::units::NumFolds;
 
     fn operand(
@@ -1748,6 +1750,8 @@ mod tests_e242_e246 {
             inputs,
             outputs,
             num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
         }
     }
 

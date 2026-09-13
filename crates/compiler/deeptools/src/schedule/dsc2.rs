@@ -17,17 +17,20 @@
 //!   * An operand and its [`DataInfo`] are ONE value, so the length mismatch `dbgPrint` walks into
 //!     (it bounds the loop by `inputsLdsAndLoopOffsets_.size()` and indexes `inputs_`) cannot occur.
 
+use core::num::NonZeroU64;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 
-use crate::arch::{Elements, Sticks};
+use crate::arch::{Bytes, Elements, Sticks};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
-use crate::generated::{ComputeType, DataConnect};
+use crate::formats::DataFormat;
+use crate::generated::{ComputeType, DataConnect, RegName};
 use crate::islands::dataflow_ir::ty::GenericComp;
-use crate::schedule::ddc::fold::{ConstIdx, NodeId};
+use crate::schedule::ddc::fold::{ConstIdx, NodeId, PadType};
 use crate::schedule::ddc::metadata::DatastageId;
-use crate::units::NumFolds;
+use crate::schedule::ddc::transformation::LoopId;
+use crate::units::{Core, Corelet, NumFolds};
 
 impl PrimaryDim {
     /// Every layout dim IN `PrimaryDimTypes`' OWN ORDINAL ORDER (`dsc/dims.h:34`), which is what a
@@ -232,6 +235,11 @@ impl Coordinate {
     #[must_use]
     pub fn fold_dim(&self, dim: PrimaryDim) -> Option<&FoldDim> {
         self.dims.get(&dim)
+    }
+
+    /// `coordinates_`, in dim order — what a walk over every dim this coordinate covers reads.
+    pub fn iter(&self) -> impl Iterator<Item = (PrimaryDim, &FoldDim)> {
+        self.dims.iter().map(|(&dim, folds)| (dim, folds))
     }
 
     /// `CoordinateType::addFold(dim, cat, card, label, alpha, beta, 0)` (`dsc/dsc2.h:120`) — the
@@ -460,13 +468,218 @@ impl AllocLayout {
     }
 }
 
-/// AN ALLOCATION'S PER-CORE, PER-CORELET START ADDRESS — `startAddressCoreCorelet_`, a bare
-/// `FoldManager<int64_t>` (`dsc/dsc2.h:985-986`), which is exactly the container [`FoldDim`] reduces
-/// (`CoordinateType` holds one of these per dim, `dsc/dsc2.h:76-145`).
+/// WHETHER AN ADDRESS FOLD VARIES ACROSS ITS AXIS — `BaseFuncType`
+/// (`util/foldManager/foldInfrastructure.h:39`) narrowed to the two arms `buildFoldSpace` is ever
+/// handed and `getFuncType` ever compared against (`ddc/ddcv1.cpp:279`, `:2001`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum AddressFold {
+    /// `BaseFuncType::Constant` — the same address on every step of that axis.
+    #[default]
+    Constant,
+    /// `BaseFuncType::Map` — a per-step address, which is what `insertData` then fills.
+    Map,
+}
+
+/// AN ALLOCATION'S PER-CORE, PER-CORELET START ADDRESS — `startAddressCoreCorelet_`, a
+/// `FoldManager<int64_t>` (`dsc/dsc2.h:985-986`): the fold space `buildFoldSpace` lays out, the
+/// per-axis [`AddressFold`] it is laid out with, and the addresses `insertData` places into it.
 ///
-/// ⭐ ENTRY 128 ONLY COPIES ONE ONTO ANOTHER; entry 259 (`calculateClStartAddress`) is what FILLS it.
+/// ⭐ THE PLACED ADDRESSES ARE KEYED BY `(core, corelet)` AND NOT BY A COORDINATE DEQUE. Every write
+/// in the authority tree sets `coord[0] = core`, `coord[1] = cl` and leaves the rest at zero
+/// (`ddc/ddcv1.cpp:344-350`, `:2005-2011`), so those two axes ARE the key and the deque is the
+/// mechanism for reaching it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StartAddress(pub FoldDim);
+pub struct StartAddress {
+    folds: FoldDim,
+    func_types: Vec<AddressFold>,
+    placed: BTreeMap<Core, BTreeMap<Corelet, Bytes>>,
+}
+
+impl StartAddress {
+    /// An address whose fold space is one dim's folds and nothing placed in it yet.
+    #[must_use]
+    pub const fn new(folds: FoldDim) -> Self {
+        Self {
+            folds,
+            func_types: Vec::new(),
+            placed: BTreeMap::new(),
+        }
+    }
+
+    /// The fold space's own dim folds.
+    #[must_use]
+    pub const fn folds(&self) -> &FoldDim {
+        &self.folds
+    }
+
+    /// `hasZeroFoldDim()` — TRUE before `buildFoldSpace` has laid any axis out.
+    #[must_use]
+    pub fn has_zero_fold_dim(&self) -> bool {
+        self.func_types.is_empty()
+    }
+
+    /// `buildFoldSpace(foldProps, foldTypes)` (`ddc/ddcv1.cpp:339`) — `depth` axes, of which only the
+    /// core and the corelet are ever anything but [`AddressFold::Constant`].
+    pub fn build_fold_space(&mut self, depth: usize, core: AddressFold, corelet: AddressFold) {
+        self.func_types = vec![AddressFold::Constant; depth];
+        if let Some(slot) = self.func_types.get_mut(FoldPosition::Core as usize) {
+            *slot = core;
+        }
+        if let Some(slot) = self.func_types.get_mut(FoldPosition::Corelet as usize) {
+            *slot = corelet;
+        }
+    }
+
+    /// `getFuncType(pos)`, absent where the fold space does not reach that far.
+    #[must_use]
+    pub fn func_type(&self, pos: FoldPosition) -> Option<AddressFold> {
+        self.func_types.get(pos as usize).copied()
+    }
+
+    /// `insertData(addr, {{0, core}, {1, corelet}})`.
+    pub fn insert(&mut self, core: Core, corelet: Corelet, address: Bytes) {
+        self.placed.entry(core).or_default().insert(corelet, address);
+    }
+
+    /// `getSingleData({{0, core}, {1, corelet}})`, absent where nothing was placed there.
+    #[must_use]
+    pub fn at(&self, core: Core, corelet: Corelet) -> Option<Bytes> {
+        self.placed.get(&core)?.get(&corelet).copied()
+    }
+
+    /// `getDataAndFoldCoordinates({{1, corelet}})` — every core's address at ONE corelet, which is
+    /// the frontier entry 259 copies onto the others.
+    #[must_use]
+    pub fn at_corelet(&self, corelet: Corelet) -> Vec<(Core, Bytes)> {
+        self.placed
+            .iter()
+            .filter_map(|(&core, per_cl)| per_cl.get(&corelet).map(|&addr| (core, addr)))
+            .collect()
+    }
+
+    /// `getAllData()`, in core-then-corelet order.
+    #[must_use]
+    pub fn all(&self) -> Vec<Bytes> {
+        self.placed
+            .values()
+            .flat_map(|per_cl| per_cl.values().copied())
+            .collect()
+    }
+
+    /// THE ONE ADDRESS EVERY CORE AND CORELET SHARES — `getAllData()` FUSED WITH the `std::equal`
+    /// beside it and the `allAddr.at(0)` after it (`ddc/ddcv1.cpp:3369-3377`).
+    ///
+    /// ⛔ [`None`] IS BOTH OF THAT SITE'S FAILURES: addresses that differ, and an address nothing has
+    /// been placed into at all — the reference throws on the first and indexes past the end on the
+    /// second, and neither is an answer.
+    #[must_use]
+    pub fn uniform(&self) -> Option<Bytes> {
+        let all = self.all();
+        let (&first, rest) = all.split_first()?;
+        rest.iter().all(|&addr| addr == first).then_some(first)
+    }
+
+    /// `apply({}, std::divides<int64_t>(), scale)` (`ddc/ddcv1.cpp:2426`) — every placed address at
+    /// the unit's address granularity.
+    #[must_use]
+    pub fn divided_by(&self, scale: NonZeroU64) -> Self {
+        Self {
+            folds: self.folds.clone(),
+            func_types: self.func_types.clone(),
+            placed: self
+                .placed
+                .iter()
+                .map(|(&core, per_cl)| {
+                    (
+                        core,
+                        per_cl
+                            .iter()
+                            .map(|(&cl, &addr)| (cl, Bytes(addr.0 / scale.get())))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// HOW MANY BUFFERS ONE ALLOCATION HOLDS — `numBuffers_` (`dsc/dsc2.h:984`), whose own comment names
+/// the closed set: *"1:no buffering, 2:double-buffer, -1:streaming buffer"*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum NumBuffers {
+    /// `1` — the default, and the value every `numBuffers_ != 1` test is asking about.
+    #[default]
+    Single,
+    /// `2` — double buffered.
+    Double,
+    /// `-1` — a streaming buffer, which reserves the WHOLE memory rather than a size.
+    Streaming,
+}
+
+impl NumBuffers {
+    /// The divisor the reference computes a buffer offset with, INCLUDING its `if (numBuffers == -1)
+    /// numBuffers = 2;  // reserve at least 2 buffers` (`ddc/ddcv1.cpp:239`).
+    #[must_use]
+    pub const fn reserved(self) -> NonZeroU64 {
+        match self {
+            Self::Single => NonZeroU64::new(1).expect("one is not zero"),
+            Self::Double | Self::Streaming => NonZeroU64::new(2).expect("two is not zero"),
+        }
+    }
+
+    /// `numBuffers_ != 1` — whether the allocation switches buffers at all.
+    #[must_use]
+    pub const fn switches(self) -> bool {
+        !matches!(self, Self::Single)
+    }
+
+    /// `numBuffers_ == -1` — whether the whole memory is reserved for it.
+    #[must_use]
+    pub const fn is_streaming(self) -> bool {
+        matches!(self, Self::Streaming)
+    }
+}
+
+/// AN ALLOCATION'S PER-DIM PADDING STYLE — `padding_`, a `PaddingFormType` (`dsc/dsc2.h:981`) whose
+/// `getPadding(dim)` answers `NOPAD` for every dim it has no entry for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Padding(BTreeMap<PrimaryDim, PadType>);
+
+impl Padding {
+    /// `getPadding(dim)` — total, because the absent case IS `NOPAD`.
+    #[must_use]
+    pub fn get(&self, dim: PrimaryDim) -> PadType {
+        self.0.get(&dim).copied().unwrap_or(PadType::NoPad)
+    }
+
+    /// `setPadding(dim, pad)`.
+    pub fn set(&mut self, dim: PrimaryDim, pad: PadType) {
+        self.0.insert(dim, pad);
+    }
+
+    /// The dims that carry a style at all, in `std::map`'s order.
+    pub fn dims(&self) -> impl Iterator<Item = PrimaryDim> + '_ {
+        self.0.keys().copied()
+    }
+}
+
+/// WHERE AN ALLOCATION LANDED AND HOW IT IS BUFFERED — the four `dsc2::AllocateNode` fields the
+/// placement units read and write (`dsc/dsc2.h:981-988`), as ONE value.
+///
+/// ⭐ ONE FIELD RATHER THAN FOUR because they are filled TOGETHER: entry 258 writes the buffer offset
+/// beside the start address, entry 259 reads the padding beside both, and every construction site of
+/// a fresh allocate node wants all four at their defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AllocPlacement {
+    /// `numBuffers_` (`:984`).
+    pub num_buffers: NumBuffers,
+    /// `padding_` (`:981`).
+    pub padding: Padding,
+    /// `bufferOffsetCoreCorelet_` (`:988`) — how far apart this allocation's buffers are.
+    pub buffer_offset: BTreeMap<Core, BTreeMap<Corelet, Bytes>>,
+    /// `isStartAddrSymbolic_` (`:987`).
+    pub is_start_addr_symbolic: bool,
+}
 
 /// ONE END OF A TRANSFER AS ITS MINTING SITE IS HANDED IT — a [`DataLocation`] (`src_`, or a
 /// `DstVia::loc_`) TOGETHER WITH the matching `..LdsAndLoopOffsets_.myLdsIdx_`.
@@ -529,11 +742,71 @@ pub struct AllocateNode {
     pub layout: AllocLayout,
     /// `startAddressCoreCorelet_` (`:985`).
     pub start_address: StartAddress,
+    /// `numBuffers_`, `padding_`, `bufferOffsetCoreCorelet_` and `isStartAddrSymbolic_` AS ONE
+    /// VALUE — see [`AllocPlacement`].
+    pub placement: AllocPlacement,
     /// `gapStickSpread_` (`:1006`) — per layout dim, how many sticks of gap the data is spread over.
     pub gap_stick_spread: BTreeMap<PrimaryDim, Sticks>,
     /// `allocUsers_` (`:1007`), less the `int` beside each entry, which is `addAllocUser`'s REFERENCE
     /// COUNT (`:1015-1021`) and is not read by any unit ported so far.
     pub alloc_users: Vec<NodeId>,
+}
+
+/// HOW MANY TIMES AN OPAQUE OP'S BODY IS UNROLLED — `param_map_["unroll"]`, which the reference
+/// keeps as the DECIMAL SPELLING of a power of two (`ddc/ddcv1.cpp:3352`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Unroll(pub u32);
+
+impl Unroll {
+    /// The `1` an opaque op with no internal register allocation gets.
+    pub const ONE: Self = Self(1);
+}
+
+/// AN OPAQUE OP'S ARITHMETIC PRECISION — `param_map_["prec"]`, whose two spellings are the whole of
+/// the closed set (`ddc/ddcv1.cpp:3400-3403`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Precision {
+    /// `"fp32"` — `dataFormat_ == IEEE_FP32`.
+    Fp32,
+    /// `"fp16"` — every other format, including the unset one.
+    Fp16,
+}
+
+/// WHICH PHYSICAL REGISTER — the `n` of the reference's `"R" + std::to_string(n)`
+/// (`ddc/ddcv1.cpp:3358`), which is a stick index into the allocation's own memory and not a byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegSlot(pub u64);
+
+impl RegSlot {
+    /// `"R" + std::to_string(startAddress)` — the spelling the islands read back.
+    #[must_use]
+    pub fn spelling(self) -> String {
+        format!("R{}", self.0)
+    }
+}
+
+/// AN OPAQUE OP'S BOUND INSTRUCTION STATE — `ComputeNode::instrAttribute_` (`dsc/dsc2.h:905-939`)
+/// narrowed to the four things entry 261 writes.
+///
+/// ⭐ THE PARAM MAP IS TWO TYPED FIELDS AND NOT A `map<string, string>`: the reference stores an
+/// unroll factor and a precision under fixed keys, and both are closed values.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InstrAttribute {
+    /// `param_map_["unroll"]`.
+    pub unroll: Unroll,
+    /// `param_map_["prec"]`, absent until entry 261 decides it.
+    pub precision: Option<Precision>,
+    /// `read_write_reg_map_` — the internal registers.
+    pub read_write_regs: BTreeMap<RegName, RegSlot>,
+    /// `read_only_reg_map_` — the input/output registers.
+    pub read_only_regs: BTreeMap<RegName, RegSlot>,
+}
+
+impl Default for Unroll {
+    /// `param_map_` carries no `"unroll"` key on a fresh node, and every reader of it wants one.
+    fn default() -> Self {
+        Self::ONE
+    }
 }
 
 /// `dsc2::ComputeNode` (`dsc/dsc2.h:948`) narrowed to what the fold units read.
@@ -552,6 +825,10 @@ pub struct ComputeNode {
     pub outputs: Vec<Operand>,
     /// `numFoldsEngaged` (`dsc/dsc2.h:940`), whose default is ONE and not zero.
     pub num_folds_engaged: NumFolds,
+    /// `dataFormat_` (`dsc/dsc2.h:945`), once its `DataFormats::INVALID` default is an [`Option`].
+    pub data_format: Option<DataFormat>,
+    /// `instrAttribute_` (`dsc/dsc2.h:939`).
+    pub instr_attribute: InstrAttribute,
 }
 
 /// A POSITION IN A STICK'S DIM ORDER — `srcSizeIdx_`/`dstSizeIdx_` (`dsc/dsc2.h:821`), an index into
@@ -663,10 +940,11 @@ impl SyncUnits {
     }
 }
 
-/// `dsc2::SyncNode` (`dsc/dsc2.h:964`) narrowed to what minting one writes.
+/// `dsc2::SyncNode` (`dsc/dsc2.h:964`) narrowed to what minting one writes and what entry 261 then
+/// binds onto it.
 ///
-/// ⛔ `implicitSyncRefTransfer_` AND `otherEndOfTheSignals_` ARE NOT HERE: both are `nullptr`/empty
-/// on a fresh node, and the units that pair two ends up own them.
+/// ⛔ `otherEndOfTheSignals_` IS STILL NOT HERE: it is empty on a fresh node, and the unit that pairs
+/// two ends up owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncNode {
     /// `name_`.
@@ -677,6 +955,118 @@ pub struct SyncNode {
     pub direction: SyncDirection,
     /// `isSoft_`.
     pub strength: SyncStrength,
+    /// `implicitSyncRefTransfer_` (`dsc/dsc2.h:969`) — `nullptr` until entry 261 picks the transfer
+    /// this sync stands in for.
+    pub implicit_sync_ref_transfer: Option<NodeId>,
+}
+
+/// HOW A LOOP CONDITION COMPARES — `dsc2::CondOp` (`dsc/dscdefn.h:95`), verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CondOp {
+    /// `EQ`.
+    Eq,
+    /// `NE`.
+    Ne,
+    /// `LT`.
+    Lt,
+    /// `LE`.
+    Le,
+    /// `GT`.
+    Gt,
+    /// `GE`.
+    Ge,
+    /// `TOGGLE`.
+    Toggle,
+    /// `ALWAYS`.
+    Always,
+    /// `NEVER`.
+    Never,
+    /// `CONST`.
+    Const,
+    /// `DEFAULT`.
+    Default,
+}
+
+/// WHICH ITERATION A LOOP CONDITION NAMES — `LoopCond::CondValType` FUSED WITH the `condValInt_`
+/// only its `INT` arm reads (`dsc/dsc2.h:654-672`), so the `-1` sentinel is unspellable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoopBound {
+    /// `INT` with `condValInt_ = n`.
+    Index(u32),
+    /// `FIRST`.
+    First,
+    /// `LAST`.
+    Last,
+}
+
+/// ONE CLAUSE OF A CONDITION — `dsc2::LoopCond` (`dsc/dsc2.h:654`): this loop's index on this dim,
+/// compared against this bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopCond {
+    /// `loopComp_`.
+    pub loop_comp: LoopId,
+    /// `dim_`.
+    pub dim: PrimaryDim,
+    /// `condOp_`.
+    pub op: CondOp,
+    /// `condValType_` with `condValInt_`.
+    pub bound: LoopBound,
+}
+
+/// A CONDITION'S PREDICATE — `dsc2::LoopCondComposite` (`dsc/dsc2.h:675`), an OR of ANDs with an
+/// optional negation over the whole thing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LoopCondComposite {
+    /// `twoLevelOrOfAnds_` — the outer vector is the OR, each inner vector an AND.
+    pub two_level_or_of_ands: Vec<Vec<LoopCond>>,
+    /// `negated_`.
+    pub negated: bool,
+}
+
+/// `dsc2::ConditionNode` (`dsc/dsc2.h:685`) — a block whose children are split into a then-region and
+/// an else-region, guarded by a loop predicate or a core/corelet set.
+///
+/// ⛔ `hasCoreClCond()` IS `loopCond_.twoLevelOrOfAnds_.empty()` IN THE REFERENCE, i.e. it answers
+/// "the core/corelet set is what guards this", not "the set is non-empty".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConditionNode {
+    /// `name_`.
+    pub name: NodeName,
+    /// `loopCond_`.
+    pub loop_cond: LoopCondComposite,
+    /// `coreClCond_`.
+    pub core_cl_cond: BTreeMap<Core, BTreeSet<Corelet>>,
+    /// `addThenRegion(block)` — the children taken when the predicate holds.
+    pub then_region: Vec<SchedNode>,
+    /// `addElseRegion(block)` — the children taken otherwise.
+    pub else_region: Vec<SchedNode>,
+}
+
+impl ConditionNode {
+    /// `hasCoreClCond()` — TRUE when no loop predicate was given, so `coreClCond_` is the guard.
+    #[must_use]
+    pub fn has_core_cl_cond(&self) -> bool {
+        self.loop_cond.two_level_or_of_ands.is_empty()
+    }
+}
+
+/// `dsc2::StickMaskNode` (`dsc/dsc2.h:1058`) — a mask applied to the trailing elements of a stick,
+/// naming the constant that holds the mask value and the transfers it applies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickMaskNode {
+    /// `name_`.
+    pub name: NodeName,
+    /// `maskValConstId_` (`:1063`), whose `-1` default is [`None`].
+    pub mask_val_const_id: Option<ConstIdx>,
+    /// `dataFormat_` (`:1064`), whose `INVALID` default is [`None`].
+    pub data_format: Option<DataFormat>,
+    /// `stickLayout_` (`:1065`) — the stick's dim sizes, which every affected transfer must agree on.
+    pub stick_layout: Vec<Size>,
+    /// `firstStickCoordToMaskPerDim_` (`:1066`) — the first masked coordinate per dim. EMPTY is the
+    /// reset node, which masks nothing.
+    pub first_stick_coord_to_mask_per_dim: BTreeMap<PrimaryDim, Elements>,
+    /// `affectedTransfers_` (`:1067`).
+    pub affected_transfers: Vec<NodeId>,
 }
 
 /// A SCHEDULE NODE, AS THE FOLD UNITS SEE IT — `nodeType_`'s `ALLOCATE`, `COMPUTE` and `TRANSFER`
@@ -912,8 +1302,14 @@ pub enum SchedNode {
     Loop(BlockNode),
     /// `nodeType_ == CONDITION`: likewise a block kind that a `{BLOCK}` filter passes over.
     Condition(BlockNode),
-    /// An allocate, compute, transfer, sync or stick-mask node — `isBlockNode()` is false and it has
-    /// no children, so the walk neither yields nor descends.
+    /// `nodeType_ == CONDITION` for a condition MINTED with both its regions — the shape entry 262
+    /// splices in, kept apart from [`SchedNode::Condition`] because a two-region condition's children
+    /// are not one child vector.
+    Guarded(Box<ConditionNode>),
+    /// `nodeType_ == STICK_MASK` — a leaf that carries its mask.
+    StickMask(Box<StickMaskNode>),
+    /// An allocate, compute, transfer or sync node — `isBlockNode()` is false and it has no children,
+    /// so the walk neither yields nor descends.
     Leaf(NodeName),
 }
 
@@ -971,14 +1367,23 @@ impl ScheduleTree {
 
 /// Pre-order DFS over the `BLOCK` nodes below `block`, which is itself never yielded.
 fn collect_blocks<'a>(block: &'a BlockNode, found: &mut Vec<&'a BlockNode>) {
-    for child in &block.children {
+    collect_blocks_in(&block.children, found);
+}
+
+/// The same walk over a child list, which is what a two-region condition has instead of a block.
+fn collect_blocks_in<'a>(children: &'a [SchedNode], found: &mut Vec<&'a BlockNode>) {
+    for child in children {
         match child {
             SchedNode::Block(inner) => {
                 found.push(inner);
                 collect_blocks(inner, found);
             }
             SchedNode::Loop(inner) | SchedNode::Condition(inner) => collect_blocks(inner, found),
-            SchedNode::Leaf(_) => {}
+            SchedNode::Guarded(cond) => {
+                collect_blocks_in(&cond.then_region, found);
+                collect_blocks_in(&cond.else_region, found);
+            }
+            SchedNode::StickMask(_) | SchedNode::Leaf(_) => {}
         }
     }
 }
@@ -988,7 +1393,15 @@ fn find_block_mut(
     block: &mut BlockNode,
     accepts: impl Fn(&BlockNode) -> bool + Copy,
 ) -> Option<&mut BlockNode> {
-    for child in &mut block.children {
+    find_block_mut_in(&mut block.children, accepts)
+}
+
+/// The same search over a child list.
+fn find_block_mut_in(
+    children: &mut [SchedNode],
+    accepts: impl Fn(&BlockNode) -> bool + Copy,
+) -> Option<&mut BlockNode> {
+    for child in children {
         match child {
             SchedNode::Block(inner) => {
                 if accepts(inner) {
@@ -1003,7 +1416,15 @@ fn find_block_mut(
                     return Some(found);
                 }
             }
-            SchedNode::Leaf(_) => {}
+            SchedNode::Guarded(cond) => {
+                if let Some(found) = find_block_mut_in(&mut cond.then_region, accepts) {
+                    return Some(found);
+                }
+                if let Some(found) = find_block_mut_in(&mut cond.else_region, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::StickMask(_) | SchedNode::Leaf(_) => {}
         }
     }
     None
