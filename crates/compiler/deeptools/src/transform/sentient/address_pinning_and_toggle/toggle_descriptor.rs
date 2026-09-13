@@ -120,9 +120,15 @@ impl ToggleDescriptor {
     /// `invalidate()` fields the walk had filled (`:2680`, `:2691`).
     /// ⛔ `setCanBeSimplified(getX() == getY())` COMPARES VALUES, NOT HANDLES (`:2710`) —
     /// `EvaluatedValue::operator==`, which is [`ExpressionEvaluator::values_equal`].
+    /// ⛔ `scope` IS THE ENCLOSING BODY, NOT THE MATCHED LOOP'S: `getY()` is `getInit()`, which reads
+    /// `outer_loop_.getIterOperands()[..]` off the loop OP (`:2713-2721`), and
+    /// [`outermost_const_initialization`] walks inner-to-outer so `outer_loop_` is an ancestor-or-self
+    /// of the loop matched here — a loop is never inside its own body, so resolving it against that
+    /// body can only ever fail.
     #[must_use]
     pub fn new(
         base_addr: Val,
+        scope: &[Op],
         defs: Definitions<'_>,
         evaluator: &mut impl ExpressionEvaluator,
     ) -> ToggleDescriptor {
@@ -173,16 +179,19 @@ impl ToggleDescriptor {
             desc.invalidate();
             return desc;
         };
-        let Op::Sentient(sentient::Op::For { body, .. }) = for_op else {
+        let Op::Sentient(sentient::Op::For {
+            body: loop_body, ..
+        }) = for_op
+        else {
             desc.invalidate();
             return desc;
         };
         // `DT_CHECK_MSG(yield, "expected terminator of loop body to be a yield")` (`:2684-2685`).
-        let Some(Op::Sentient(sentient::Op::Yield { results })) = body.last() else {
+        let Some(Op::Sentient(sentient::Op::Yield { results })) = loop_body.last() else {
             todo!(
                 "ToggleDescriptor: DT_CHECK_MSG(yield, \"expected terminator of loop body to be a \
                  yield\") (:2684-2685) — the loop binding {iter_arg:?} ends in {:?}",
-                body.last()
+                loop_body.last()
             )
         };
         // `if (yield.getOperand(iter_arg_index) != base_addr) { invalidate(); return; }` (`:2686-2693`).
@@ -195,7 +204,7 @@ impl ToggleDescriptor {
         // `DT_CHECK_MSG(num_non_yield_feeding_uses == 1, ..)` (`:2696-2700`) — an ABORT there, so a
         // named stop here. ⚠️ DIVERGENCE: the reference filters the ONE terminator by identity and this
         // filters every `sentient.yield`, as its e017 sibling already does.
-        let uses = num_users_except(base_addr, body, &|op| {
+        let uses = num_users_except(base_addr, loop_body, &|op| {
             matches!(op, Op::Sentient(sentient::Op::Yield { .. }))
         });
         if uses != 1 {
@@ -207,8 +216,8 @@ impl ToggleDescriptor {
         }
 
         // `setCanBeSimplified(getX() == getY())` (`:2710`).
-        let x = desc.x(evaluator, body, defs);
-        let y = desc.init(body, defs);
+        let x = desc.x(evaluator, scope, defs);
+        let y = desc.init(scope, defs);
         desc.can_be_simplified = match x {
             Some(x) => evaluator.values_equal(x, y),
             None => false,
@@ -377,9 +386,40 @@ fn iter_operand(outer_loop: ForRef, iter_arg_index: IterArgIndex, scope: &[Op]) 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType};
-    use crate::transform::sentient::analyses::OutOfScopeEvaluator;
+    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType, ShuffleMode};
+    use crate::transform::sentient::analyses::{Evaluation, OffsetSites, OutOfScopeEvaluator};
+
+    /// An evaluator that answers for `c1`'s handle and nothing else, so the ladder runs PAST the one
+    /// seam that used to hide its tail and stops at `getY()`'s.
+    struct HandlesOnly;
+
+    impl ExpressionEvaluator for HandlesOnly {
+        fn evaluate_value(&mut self, value: Val) -> Evaluation {
+            OutOfScopeEvaluator.evaluate_value(value)
+        }
+
+        fn evaluate_sum(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation {
+            OutOfScopeEvaluator.evaluate_sum(lhs, rhs)
+        }
+
+        fn build_offset_value(
+            &mut self,
+            evaluation: &Evaluation,
+            sites: &mut OffsetSites<'_>,
+            walked: &mut Vec<Op>,
+            ty: ScalarTy,
+        ) -> Val {
+            OutOfScopeEvaluator.build_offset_value(evaluation, sites, walked, ty)
+        }
+
+        fn evaluate_value_handle(&mut self, _value: Val) -> EvaluatedValue {
+            EvaluatedValue(4096)
+        }
+    }
 
     /// `%base = sentient.scalar_sub %c, %arg` inside a loop that carries `%base` back — the shape
     /// e552 matches, with the pieces the ladder reads at the positions it reads them.
@@ -416,6 +456,31 @@ mod unit_tests {
                         reg: None,
                         element_size: None,
                         ty: ScalarTy::Index,
+                    }),
+                    // The ONE non-yield use `:2696-2700` demands, and a memory op because that is the
+                    // only user its message allows.
+                    Op::Sentient(sentient::Op::LoadAndSend {
+                        mutable_addr: Val(5),
+                        immutable_addr: Val(6),
+                        increment: Val(7),
+                        consumer: SendEnd::to_self(Val(98)),
+                        result: Val(8),
+                        extent: sentient::Extent {
+                            total_elements: Elements(64),
+                            element_size: Bits(16),
+                            chunk_size: Elements(1),
+                            chunk_stride: Elements(1),
+                            burst_size: Elements(1),
+                        },
+                        interleaved_group: Elements(0),
+                        rotate_val: None,
+                        dir: None,
+                        shuffle_mode: ShuffleMode::NoShuffle,
+                        reg: Reg {
+                            locale: RegType::Lar,
+                            index: None,
+                        },
+                        dbg_name: None,
                     }),
                     Op::Sentient(sentient::Op::Yield {
                         results: vec![yielded],
@@ -466,16 +531,20 @@ mod unit_tests {
         let _evaluated = toggle.init(&body, Definitions::from_innermost(&regions));
     }
 
-    /// 552/656 — the whole ladder passes on the vendor's shape and stops at the evaluator: the sub of
-    /// a constant and a loop-carried arg, the loop's outermost constant initialization, the yield
+    /// 552/656 — the whole ladder passes on the vendor's shape and stops in `getY()`: the sub of a
+    /// constant and a loop-carried arg, the loop's outermost constant initialization, the yield
     /// operand being the sub itself and its one other use.
+    ///
+    /// ⛔ THE EXPECTATION IS `getInit`'S OWN SEAM, NOT ANY `evaluateValue`: that message is reachable
+    /// only once the iter operand RESOLVED, so it fails if `new` is handed the matched loop's own body
+    /// instead of the scope enclosing it.
     #[test]
-    #[should_panic(expected = "evaluateValue")]
+    #[should_panic(expected = "on the constant iter arg init Val(1)")]
     fn e552_matches_a_sub_of_a_constant_and_the_iter_arg_the_loop_yields_back() {
         let body = toggle_body(Val(5));
         let regions: [&[Op]; 2] = [&body[1..], &body];
         let defs = Definitions::from_innermost(&regions);
-        let _desc = ToggleDescriptor::new(Val(5), defs, &mut OutOfScopeEvaluator);
+        let _desc = ToggleDescriptor::new(Val(5), &body, defs, &mut HandlesOnly);
     }
 
     /// A loop that yields something ELSE back is `invalidate()`, not a toggle — and the fields the
@@ -486,7 +555,7 @@ mod unit_tests {
         let regions: [&[Op]; 2] = [&body[1..], &body];
         let defs = Definitions::from_innermost(&regions);
         assert_eq!(
-            ToggleDescriptor::new(Val(5), defs, &mut OutOfScopeEvaluator),
+            ToggleDescriptor::new(Val(5), &body, defs, &mut OutOfScopeEvaluator),
             ToggleDescriptor::default()
         );
     }

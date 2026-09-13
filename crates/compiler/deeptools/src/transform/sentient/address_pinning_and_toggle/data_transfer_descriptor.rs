@@ -288,11 +288,15 @@ impl DataTransferDescriptor {
             Some(PatternDescriptor::SimpleConstant(sc)) if self.is_simple_constant() => {
                 out.push_str(&sc.dump());
             }
-            Some(PatternDescriptor::Toggle(_)) if self.is_toggle() => {
-                todo!(
-                    "ToggleDescriptor::dump (e553, AddressPinningAndToggle.cpp:2724) — a later \
-                     unit of this campaign"
-                )
+            Some(PatternDescriptor::Toggle(toggle)) if self.is_toggle() => {
+                // ⭐ THE ONLY SCOPE THIS SIGNATURE HAS IS THE UNIT BODY, which is the outermost one:
+                // `getInit` resolves the outer loop off it and `getLoopNestLevel` counts down from it.
+                let regions: [&[Op]; 1] = [unit_body];
+                out.push_str(&toggle.dump(
+                    unit_body,
+                    Definitions::from_innermost(&regions),
+                    evaluator,
+                ));
             }
             Some(PatternDescriptor::ConditionalConstant(cc)) if self.is_conditional_constant() => {
                 out.push_str(&cc.dump());
@@ -456,7 +460,7 @@ impl DataTransferDescriptor {
 
         // The fall-back: a toggle, whose two constants are `X` and — unless it simplified away — `Y`
         // (`:2452-2467`).
-        let toggle_desc = ToggleDescriptor::new(base_addr, defs, evaluator);
+        let toggle_desc = ToggleDescriptor::new(base_addr, body, defs, evaluator);
         if ASSERT_ON_UNEXPECTED_PATTERNS && !toggle_desc.is_valid() {
             todo!(
                 "initializeDescriptor: DT_CHECK(toggle_desc->isValid()) under \
