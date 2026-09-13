@@ -96,9 +96,12 @@ use std::collections::BTreeMap;
 
 use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
-use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient};
+use crate::islands::sentient::dialects::{
+    self as dialects, Op, Val, dataflow, defining_op, sentient, uniform,
+};
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
+use crate::transform::sentient::utils::InBlock;
 use crate::workload::Workload;
 
 /// THE NUMBER OF REGISTER LOCALES — fourteen, which is `getMaxEnumValForSentientRegType() + 1`.
@@ -396,10 +399,136 @@ fn walk_pre_order<'a>(
 //   original  : bool ScalarOpReorderingPass::localeHasFreeRegs(SentientRegType locale)
 //   calls     : e056_set, e063_getMaxRegNum
 
-// crustify:todo: e470_isCandidateForReordering
-//   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:462  (67 body lines, level 2)
-//   original  : bool ScalarOpReorderingPass::isCandidateForReordering(Operation &op)
-//   calls     : e368_getFirstUseWithinBlock, e369_getLastUseWithinBlock
+/// `dcc::utils::isConstant<sentient::ConstantOp>` (`dcc/src/Utils/Utils.cpp:424`) — a
+/// `sentient.scalar_constant`, or a `uniform.query_map` over a mapping of nothing else.
+///
+/// ⛔ A REGION ARGUMENT IS NOT CONSTANT — the `isa<BlockArgument>` refusal at `:426`, which here is
+/// having no defining op in `scope`.
+fn is_sentient_constant(val: Val, scope: &[Op]) -> bool {
+    let is_scalar_constant =
+        |op: Option<&Op>| matches!(op, Some(Op::Sentient(sentient::Op::ScalarConstant { .. })));
+    match defining_op(val, scope) {
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => match defining_op(*map, scope) {
+            Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => {
+                !pairs.is_empty()
+                    && pairs
+                        .iter()
+                        .all(|(_, value)| is_scalar_constant(defining_op(*value, scope)))
+            }
+            _ => false,
+        },
+        other => is_scalar_constant(other),
+    }
+}
+
+impl ScalarOpReordering {
+    /// `getFirstUseWithinBlock(Value)` — entry 368, level 1, not yet ported.
+    ///
+    /// ⛔ IT IS e368 AND IT IS NOT PORTED YET. Both its parts exist: [`ancestor_in_block`] is the
+    /// per-use climb and a position in `block` is the dominance answer it compares; the two use caches
+    /// this fills are that unit's to add to [`ScalarOpReordering`].
+    fn first_use_within_block(&mut self, val: Val, block: &[Op]) -> Option<InBlock> {
+        let _ = (val, block);
+        todo!(
+            "getFirstUseWithinBlock (senpass e368, ScalarOpReordering.cpp:383) is not ported yet — \
+             the earliest in-block ancestor of a use of {val:?}, memoised in \
+             val_to_first_use_in_block_cache_"
+        )
+    }
+
+    /// `getLastUseWithinBlock(Value, Block *)` — entry 369, level 1, not yet ported.
+    ///
+    /// ⛔ IT IS e369 AND IT IS NOT PORTED YET; it is [`Self::first_use_within_block`] with the
+    /// dominance comparison the other way round.
+    fn last_use_within_block(&mut self, val: Val, block: &[Op]) -> Option<InBlock> {
+        let _ = (val, block);
+        todo!(
+            "getLastUseWithinBlock (senpass e369, ScalarOpReordering.cpp:407) is not ported yet — \
+             the latest in-block ancestor of a use of {val:?}, memoised in \
+             val_to_last_use_in_block_cache_"
+        )
+    }
+
+    /// Replaces: e470_isCandidateForReordering
+    ///
+    /// Whether the scalar op at `at` may be moved down to just before its first use: it must be one of
+    /// the four movable ops, be used at all, not already sit there, and not extend the liverange of any
+    /// non-constant operand that is not an iteration argument.
+    ///
+    /// ⛔ ONLY AN ITERATION ARGUMENT'S LIVERANGE MAY BE EXTENDED, which is why the `isa<BlockArgument>`
+    /// operands skip the dominance test rather than fail it (`:521-527`, and the reference's own
+    /// worked example above it).
+    /// ⛔ `dominates` HERE IS `<=` ON A BLOCK POSITION and is REFLEXIVE: an operand whose last use is
+    /// the first use itself is still a candidate. See [`ancestor_in_block`] for why one position is the
+    /// whole answer.
+    /// ⭐ THE `next_op` TEST READS THE OPERANDS OF ONE OP, not the uses of the result: an op followed by
+    /// something that does not read it is movable even if that something is its own first user's
+    /// ancestor.
+    pub fn is_candidate_for_reordering(&mut self, block: &[Op], at: InBlock) -> bool {
+        let Some(op) = block.get(at.0) else {
+            return false;
+        };
+        if !matches!(
+            op,
+            Op::Sentient(
+                sentient::Op::ScalarCopy { .. }
+                    | sentient::Op::ScalarAdd { .. }
+                    | sentient::Op::ScalarSub { .. }
+            ) | Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. })
+        ) {
+            return false;
+        }
+        let Some(result) = ScalarResult::of(op) else {
+            todo!(
+                "isCandidateForReordering: DT_CHECK_MSG(op.getNumResults() == 1, \"Scalar ops \
+                 expected to have one result\") (ScalarOpReordering.cpp:468) — {op:?} binds no one \
+                 result, which none of the four ops above can"
+            )
+        };
+        // Scalar ops with no uses are dead and should not be moved.
+        let Some(first_use) = self.first_use_within_block(result.val(), block) else {
+            return false;
+        };
+        if let Some(next_op) = block.get(at.0 + 1)
+            && dialects::operands(next_op).contains(&result.val())
+        {
+            return false;
+        }
+        let non_const_operands: Vec<Val> = match op {
+            Op::Sentient(sentient::Op::ScalarCopy { input, .. }) => vec![*input],
+            Op::Sentient(
+                sentient::Op::ScalarAdd { lhs, rhs, .. } | sentient::Op::ScalarSub { lhs, rhs, .. },
+            ) => vec![*lhs, *rhs],
+            // ⭐ `dataflow.create_multicast_group` HAS NO ARM: it passes the isa gate and then queues
+            // nothing, so a multicast group with no constant operands is a candidate outright (`:483`).
+            _ => Vec::new(),
+        }
+        .into_iter()
+        .filter(|val| !is_sentient_constant(*val, block))
+        .collect();
+        // If op only has constant operands then it is a candidate.
+        if non_const_operands.is_empty() {
+            return true;
+        }
+        for val in non_const_operands {
+            if defining_op(val, block).is_none() {
+                // `isa<BlockArgument>` — an iteration argument, whose liverange may be extended.
+                continue;
+            }
+            let Some(operand_last_use) = self.last_use_within_block(val, block) else {
+                todo!(
+                    "isCandidateForReordering: DT_CHECK_MSG(operand_last_use, \"Op itself is a use \
+                     of its operands\") (ScalarOpReordering.cpp:524) — {val:?} is read by the op at \
+                     {at:?} and so has an in-block use"
+                )
+            };
+            if first_use > operand_last_use {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 // crustify:todo: e531_findAndProcessCandidates
 //   authority : dcc/src/Transform/Sentient/ScalarOpReordering.cpp:207  (165 body lines, level 3)
@@ -413,7 +542,9 @@ fn walk_pre_order<'a>(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{LiverangeIndex, PerLocale, ScalarOpReordering, ScalarResult, ancestor_in_block};
+    use super::{
+        InBlock, LiverangeIndex, PerLocale, ScalarOpReordering, ScalarResult, ancestor_in_block,
+    };
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::generated::OpFunc;
@@ -611,5 +742,25 @@ mod unit_tests {
             ancestor_in_block(&OpId::at(&[7]), &[]),
             Some(OpId::at(&[7]))
         );
+    }
+
+    /// e470 — an op that is not one of the four movable ones is no candidate, and the `sentient.for`
+    /// here is the reference's own "not a scalar op" case.
+    #[test]
+    fn an_op_that_is_not_a_movable_scalar_op_is_no_candidate() {
+        let block = vec![for_op(Val(0), Val(1), Vec::new()), constant(Val(2))];
+        let mut pass = ScalarOpReordering::new();
+        assert!(!pass.is_candidate_for_reordering(&block, InBlock(0)));
+        // `sentient.scalar_constant` is not in the isa list either — only copy, add, sub and the
+        // multicast group are.
+        assert!(!pass.is_candidate_for_reordering(&block, InBlock(1)));
+    }
+
+    /// e470 — a movable op's first question is where its first use is, which is e368 and not ported.
+    #[test]
+    #[should_panic(expected = "senpass e368")]
+    fn a_movable_scalar_op_reaches_the_unported_first_use_within_block() {
+        let block = vec![add(Val(0), Val(1), Val(2))];
+        ScalarOpReordering::new().is_candidate_for_reordering(&block, InBlock(0));
     }
 }

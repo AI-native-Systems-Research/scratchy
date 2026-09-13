@@ -79,9 +79,10 @@
 //! | `e375_initializeDataflowInfo` | 375 | 1 | 17 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:203` |
 
 // ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
-// module's own tests until `e474_runOn`/`e536_runOnOperation` (levels 2/3) land and something calls
-// it. CI runs clippy with `-D warnings`, so without this the first ported leaf fails the gate.
-// ⭐ REMOVE THIS WITH e474: at that point an unused item here is a real defect again.
+// module's own tests until something calls it. CI runs clippy with `-D warnings`, so without this the
+// first ported leaf fails the gate.
+// ⭐ REMOVE THIS WITH e536: `e474_runOn` has landed, but its body is blocked on the out-of-scope
+// `SetMaskRDETree` and on e378, so it reaches nothing here — e536 is the one that wires the pass up.
 #![allow(dead_code)]
 
 use crate::islands::sentient::dialects::{Op, sentient};

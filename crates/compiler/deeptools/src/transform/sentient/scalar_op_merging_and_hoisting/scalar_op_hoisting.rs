@@ -94,8 +94,8 @@
 // runs clippy with `-D warnings`, so without this the batch fails its own gate.
 // ⭐ REMOVE THIS WITH `e635_runScalarOpHoisting`: an unused item here is a real defect at that point.
 
-use super::{MemoryOpInfo, ScalarOpComp};
-use crate::arch::Elements;
+use super::{AddressScale, MemoryOpInfo, OperationData, ScalarOpComp, does_value_exceed_lrf_range};
+use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::{GenericComp, ScalarTy};
@@ -105,7 +105,9 @@ use crate::islands::sentient::dialects::{
     replace_all_uses_with, results, uniform, use_count,
 };
 use crate::transform::sentient::IterArgIndex;
-use crate::transform::sentient::analyses::{Evaluation, ExpressionEvaluator, OffsetSites};
+use crate::transform::sentient::analyses::{
+    Evaluation, EvaluatedValue, ExpressionEvaluator, OffsetSites,
+};
 
 /// `ibuff_space_` — how many instruction-buffer entries are left for the ops this pass creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -488,15 +490,246 @@ pub(crate) fn hoist_candidate_out_of_loop(
 //   original  : void ScalarOpHoisting::applyOperationData( SmallVector<OperationData> &ops_to_update)
 //   calls     : e172_addToOrReplaceOp
 
-// crustify:todo: e468_processMergeableChain
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1645  (58 body lines, level 2)
-//   original  : bool ScalarOpHoisting::processMergeableChain( Operation *input_to_chain, Operation *first_op_in_chain, const EvaluatedValue &merging_increment, SmallVector<OperationData> &ops_to_update)
-//   calls     : e158_doesValueExceedLRFRange, e361_isImmutableValueInRange
+/// THE MERGING INCREMENT AS BOTH THINGS THE CHAIN WALK NEEDS IT AS — the [`EvaluatedValue`] handle
+/// [`OperationData`] stores, and the decoded [`Evaluation`] `doesValueExceedLRFRange` reads.
+///
+/// ⛔ THE SEAM DELIBERATELY FORBIDS TURNING ONE INTO THE OTHER: a handle names an entry in the
+/// evaluator's arena and decoding it is `Analyses/ExpressionEvaluatorUtils`' work, out of campaign
+/// scope. The reference has one `const EvaluatedValue &` and both readings of it for free; here the
+/// caller states both, which is why they are one parameter rather than two.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MergingIncrement<'a> {
+    /// What [`OperationData::mod_by`] keeps.
+    pub(crate) handle: EvaluatedValue,
+    /// What the LRF range test measures.
+    pub(crate) evaluation: &'a Evaluation,
+}
 
-// crustify:todo: e469_hoistForLinearChain
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2034  (29 body lines, level 2)
-//   original  : void ScalarOpHoisting::hoistForLinearChain( BlockArgument &main_iv, Operation *derived_iv, SmallVector<OperationData> &comp_ops)
-//   calls     : e173_hoistCandidateOutOfLoop, e365_applyOperationData
+/// `OptimizationContext::isImmutableValueInRange` (`:232`) — whether a new immutable address still
+/// fits, in IMM range or, if the original was already out of it, in LRF range.
+///
+/// ⛔ IT IS e361 AND IT IS NOT PORTED YET. Both range tests it composes are ported already
+/// ([`does_immutable_imm_exceed_range`], [`does_value_exceed_lrf_range`]), but the `ldsti_imm_range_`
+/// pair and the `OptimizationContext` that carries it are that unit's to introduce.
+///
+/// [`does_immutable_imm_exceed_range`]: super::does_immutable_imm_exceed_range
+fn is_immutable_value_in_range(
+    new_immutable_ev: &Evaluation,
+    original_immutable_ev: &Evaluation,
+    element_size: Bits,
+    op: &Op,
+) -> bool {
+    let _ = (new_immutable_ev, original_immutable_ev, element_size, op);
+    todo!(
+        "isImmutableValueInRange (senpass e361, ScalarOpMergingAndHoisting.cpp:232) is not ported \
+         yet — the IMM and LRF range tests over the new immutable address"
+    )
+}
+
+/// Replaces: e468_processMergeableChain
+///
+/// Walks the chain out of `first_op_in_chain` recording how each op absorbs `merging_increment`, and
+/// declines the whole chain the moment one of them cannot hold the result.
+///
+/// ⛔ THE CONSTRUCTOR ARGUMENT ORDER IS THE REFERENCE'S AND IT READS BACKWARDS:
+/// `{op, &merging_increment, &getConstant(0)}` fills `mod_` with the INCREMENT and
+/// `merging_increment_` with ZERO (`:342-344`, `:1663`, `:1687`).
+/// ⛔ THE LRF TEST IS SKIPPED FOR EVERY NON-LX/L0 UNIT, and the add/sub is still recorded — only the
+/// memory-op arm refuses outright on `!is_any_of(getComp(), ..)` (`:1691`).
+/// ⭐ `Operation *input_to_chain` IS UNREAD IN THE BODY, droppable like e179's `OpBuilder&`.
+pub(crate) fn process_mergeable_chain<A: Arch, E: ExpressionEvaluator>(
+    first_op_in_chain: &Op,
+    merging_increment: MergingIncrement<'_>,
+    comp: GenericComp,
+    scale: AddressScale,
+    scope: &[Op],
+    evaluator: &mut E,
+    ops_to_update: &mut Vec<OperationData>,
+) -> bool {
+    let mut walked = Some(first_op_in_chain);
+    while let Some(op) = walked {
+        if is_scalar_add_or_sub(op) {
+            let Op::Sentient(
+                ops::Op::ScalarAdd {
+                    result,
+                    element_size,
+                    ..
+                }
+                | ops::Op::ScalarSub {
+                    result,
+                    element_size,
+                    ..
+                },
+            ) = op
+            else {
+                // [`is_scalar_add_or_sub`] names exactly these two.
+                return true;
+            };
+            if let Some(scalar_comp) = ScalarOpComp::of(comp) {
+                let Some(element_size) = *element_size else {
+                    todo!(
+                        "processMergeableChain: DT_CHECK(op->hasAttr(\"element_size\")) \
+                         (ScalarOpMergingAndHoisting.cpp:1655) — {op:?} carries no element size"
+                    )
+                };
+                if does_value_exceed_lrf_range::<A>(
+                    merging_increment.evaluation,
+                    element_size,
+                    scalar_comp,
+                    scale,
+                ) {
+                    return false;
+                }
+            }
+            ops_to_update.push(OperationData {
+                op: *result,
+                mod_by: merging_increment.handle,
+                merging_increment: evaluator.constant(0),
+                replace_with_mod: false,
+            });
+            return true;
+        }
+        let Some(mem_info) = MemoryOpInfo::of(op) else {
+            // The `else` arm — anything that is not one of the three composites ends the walk, and
+            // `sentient.load_and_store` is deliberately among them (`:1689`).
+            return true;
+        };
+        if ScalarOpComp::of(comp).is_none() {
+            return false;
+        }
+        // `checkImmutableRange` — the lambda whose recorded [`OperationData`] is the one effect it has
+        // besides its answer (`:1650-1665`).
+        let immutable_addr_ev = evaluator.evaluate_value(mem_info.immutable_addr);
+        let new_immutable_ev =
+            evaluator.evaluate_sum(&immutable_addr_ev, merging_increment.evaluation);
+        if !is_immutable_value_in_range(
+            &new_immutable_ev,
+            &immutable_addr_ev,
+            mem_info.element_size,
+            op,
+        ) {
+            return false;
+        }
+        let Op::Sentient(
+            ops::Op::LoadAndSend { result, .. }
+            | ops::Op::ReceiveAndStore { result, .. }
+            | ops::Op::LoadComputeAndSend { result, .. },
+        ) = op
+        else {
+            // [`MemoryOpInfo::of`] names exactly these three.
+            return true;
+        };
+        ops_to_update.push(OperationData {
+            op: *result,
+            mod_by: merging_increment.handle,
+            merging_increment: evaluator.constant(0),
+            replace_with_mod: false,
+        });
+        if is_update_mode(&mem_info, Definitions::from_innermost(&[scope])) {
+            return true;
+        }
+        walked = first_user(&[*result], scope);
+    }
+    true
+}
+
+/// `ScalarOpHoisting::applyOperationData` (`:1740`) — the per-op rewrite each [`OperationData`]
+/// describes.
+///
+/// ⛔ IT IS e365 AND IT IS NOT PORTED YET; [`add_to_or_replace_op`], the unit it delegates each
+/// modification to, is ported and waiting for it.
+fn apply_operation_data(ops_to_update: &[OperationData]) {
+    let _ = ops_to_update;
+    todo!(
+        "applyOperationData (senpass e365, ScalarOpMergingAndHoisting.cpp:1740) is not ported yet — \
+         the per-op constant rewrite each OperationData describes"
+    )
+}
+
+/// Replaces: e469_hoistForLinearChain
+///
+/// Hoists a derived induction variable whose chain is a linear run of composite transfers: the FIRST
+/// transfer swaps its increment for the derived variable's constant operand, the chain's recorded
+/// modifications are applied, and the derived variable then leaves the loop with its old immutable
+/// address as the new add's offset.
+///
+/// ⛔ THE ORDER IS THE PORT: the swap happens BEFORE `applyOperationData`, which is what lets that pass
+/// rewrite the immutable address the swap just read (`:2046-2060`).
+/// ⛔ `llvm_unreachable("Unexpected operation found!")` (`:2059`) IS A NAMED `todo!`: a first chain op
+/// that is not one of the three composites is a caller defect, not an input this may answer for.
+pub(crate) fn hoist_for_linear_chain(
+    scope: &mut Vec<Op>,
+    at: usize,
+    main_iv: IterArgIndex,
+    derived_iv: Val,
+    comp_ops: &[OperationData],
+    comp: GenericComp,
+    values: &mut Values,
+) {
+    let Some(Op::Sentient(ops::Op::For { body, .. })) = scope.get_mut(at) else {
+        return;
+    };
+    let Some(derived_iv_op) = defining_op(derived_iv, body) else {
+        return;
+    };
+    let Some(const_operand_idx) =
+        first_const_operand_index(derived_iv_op, Definitions::from_innermost(&[body.as_slice()]))
+    else {
+        // `getFirstConstOperandIndex`'s `-1`, which the reference then uses as an operand index.
+        return;
+    };
+    let Some(derived_iv_operand) = operands(derived_iv_op).get(const_operand_idx).copied() else {
+        return;
+    };
+    let Some(first_op) = comp_ops.first() else {
+        // `comp_ops.front()` on an empty list — the caller (e612) only ever hands over a chain it
+        // built, so there is nothing here for an empty one to mean.
+        return;
+    };
+    let first_op_immutable_addr = match defining_op_mut(body, first_op.op) {
+        Some(Op::Sentient(
+            ops::Op::LoadAndSend {
+                immutable_addr,
+                increment,
+                ..
+            }
+            | ops::Op::ReceiveAndStore {
+                immutable_addr,
+                increment,
+                ..
+            }
+            | ops::Op::LoadComputeAndSend {
+                immutable_addr,
+                increment,
+                ..
+            },
+        )) => {
+            let immutable_addr = *immutable_addr;
+            *increment = derived_iv_operand;
+            immutable_addr
+        }
+        first => todo!(
+            "hoistForLinearChain: llvm_unreachable(\"Unexpected operation found!\") \
+             (ScalarOpMergingAndHoisting.cpp:2059) — {first:?} heads the chain"
+        ),
+    };
+    apply_operation_data(comp_ops);
+    hoist_candidate_out_of_loop(
+        scope,
+        at,
+        main_iv,
+        derived_iv,
+        first_op_immutable_addr,
+        comp,
+        values,
+    );
+}
+
+/// `Value::getDefiningOp()` in a block being rewritten — [`defining_op`], mutably.
+fn defining_op_mut(scope: &mut [Op], val: Val) -> Option<&mut Op> {
+    let at = scope.iter().position(|op| results(op).contains(&val))?;
+    scope.get_mut(at)
+}
 
 // crustify:todo: e529_processForOpResult
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1484  (13 body lines, level 3)
@@ -531,6 +764,7 @@ pub(crate) fn hoist_candidate_out_of_loop(
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType, ShuffleMode};
     use crate::transform::sentient::analyses::{Offsets, ScalarOffset};
@@ -563,6 +797,11 @@ mod unit_tests {
             _ty: ScalarTy,
         ) -> Val {
             self.offset
+        }
+
+        fn constant(&mut self, value: i64) -> EvaluatedValue {
+            // A stated arena entry: `getConstant(0)` is the only literal e468 asks for.
+            EvaluatedValue(value.unsigned_abs() as u32)
         }
     }
 
@@ -845,6 +1084,85 @@ mod unit_tests {
             Val(9)
         );
         assert_eq!(evaluator.sums, vec![(modifier, absolute(ScalarOffset(4)))]);
+    }
+
+    /// e468 — the TRAP: on a unit that is neither LX nor L0 the add still records the increment and
+    /// the chain stops there, while the very same non-LX/L0 comp makes a composite transfer refuse.
+    #[test]
+    fn a_non_lx_unit_records_the_add_and_still_refuses_the_transfer() {
+        let scope = vec![
+            add(Val(20), Val(21), Val(1), Some(Bits(32))),
+            load_and_send(Val(1), Val(2), Val(3)),
+        ];
+        let increment = absolute(ScalarOffset(16));
+        let stated = MergingIncrement {
+            handle: EvaluatedValue(7),
+            evaluation: &increment,
+        };
+        let mut evaluator = StatedEvaluator {
+            offset: Val(9),
+            sums: Vec::new(),
+        };
+        let mut ops_to_update = Vec::new();
+        assert!(process_mergeable_chain::<Dd2, _>(
+            &scope[0],
+            stated,
+            GenericComp::Pt,
+            AddressScale::ONE,
+            &scope,
+            &mut evaluator,
+            &mut ops_to_update,
+        ));
+        assert_eq!(
+            ops_to_update,
+            vec![OperationData {
+                op: Val(1),
+                mod_by: EvaluatedValue(7),
+                merging_increment: EvaluatedValue(0),
+                replace_with_mod: false,
+            }]
+        );
+        let mut refused = Vec::new();
+        assert!(!process_mergeable_chain::<Dd2, _>(
+            &scope[1],
+            stated,
+            GenericComp::Pt,
+            AddressScale::ONE,
+            &scope,
+            &mut evaluator,
+            &mut refused,
+        ));
+        assert!(refused.is_empty());
+    }
+
+    /// e469 — the swap of the first transfer's increment for the derived IV's constant operand is the
+    /// step before `applyOperationData`, which is e365 and not ported.
+    #[test]
+    #[should_panic(expected = "senpass e365")]
+    fn hoisting_a_linear_chain_reaches_the_unported_apply_operation_data() {
+        let mut scope = vec![for_op(
+            vec![carried(Val(2), Val(3), Val(4), None)],
+            vec![
+                constant(4, Val(5)),
+                add(Val(3), Val(5), Val(6), Some(Bits(16))),
+                load_and_send(Val(6), Val(2), Val(7)),
+            ],
+        )];
+        let comp_ops = vec![OperationData {
+            op: Val(31),
+            mod_by: EvaluatedValue(1),
+            merging_increment: EvaluatedValue(0),
+            replace_with_mod: false,
+        }];
+        hoist_for_linear_chain(
+            &mut scope,
+            0,
+            IterArgIndex(0),
+            Val(6),
+            &comp_ops,
+            GenericComp::Lxlu,
+            &mut values_after(40),
+        );
     }
 
     /// e173 — the derived IV's readers move onto the main iter arg, the derived add is erased, its

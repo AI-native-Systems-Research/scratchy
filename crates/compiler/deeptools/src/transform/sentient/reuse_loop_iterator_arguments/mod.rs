@@ -91,10 +91,14 @@
 #![allow(dead_code)]
 
 use crate::arch::Arch;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
-use crate::transform::sentient::analyses::{Liveness, PropagationAnalysis};
+use crate::transform::sentient::analyses::{
+    CorrelatedEquivClasses, Liveness, PropagationAnalysis,
+};
 use crate::workload::Workload;
 
 /// `-dcc-reuse-loop-iterator-arguments-disable`, `cl::init(false)` (`:57-60`).
@@ -389,10 +393,102 @@ pub fn are_users_liveranges_overlapping(
     false
 }
 
-// crustify:todo: e467_replaceCorrelatedIterArgsInEquivClass
-//   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:259  (81 body lines, level 2)
-//   original  : void ReuseLoopIteratorArgumentsPass::replaceCorrelatedIterArgsInEquivClass( OpBuilder &const_builder, sentient::ForOp for_op, CorrelationAnalysisBase::CorrelatedEquivClassContainer *correlated_equiv_classes, const Liveness &liveness, bool check_users_liverange_conflicts)
-//   calls     : e357_areUsersLiverangesOverlapping
+/// Replaces: e467_replaceCorrelatedIterArgsInEquivClass
+///
+/// Points every correlated iterator argument at its class's head plus an offset: one
+/// `sentient.scalar_constant` at the start of `preamble` and one `sentient.scalar_add` at the start of
+/// the loop body per replacement, then a RAUW of the argument onto that add.
+///
+/// ⛔ EVERY OVERLAP CHECK RUNS BEFORE THE FIRST REWRITE (`:280-283`, the reference's own NOTE): each
+/// `scalar_add` this creates is a new user of an iterator argument, so a replacement made mid-scan
+/// would be checked against ops the reference had not created yet.
+/// ⛔⛔ DELIBERATE DIVERGENCE, AND IT IS AN OFF-BY-ONE IN THE REFERENCE. `locales[correlated_idx + 1]`
+/// with `correlated_idx = getArgNumber()` (`:333-338`) reads slot `i + 2` of `[bound, initArgs…,
+/// results…]` for carried `i`, because `getArgNumber()` already counts the `$iv`
+/// (`SentientOps.td:96-102`) — the NEIGHBOURING slot's locale and size. `carried[i]` is the intended
+/// one, and e356 indexes the same arrays `locales[i + 1]` (`:378-380`).
+/// ⭐ `if (locales && element_sizes)` IS DROPPED for e356's reason, and `iter_arg.getType()` is
+/// [`ScalarTy::Index`] for [`hoist_candidate_out_of_loop`]'s.
+///
+/// [`hoist_candidate_out_of_loop`]: super::scalar_op_merging_and_hoisting::scalar_op_hoisting::hoist_candidate_out_of_loop
+pub fn replace_correlated_iter_args_in_equiv_class(
+    preamble: &mut Vec<Op>,
+    for_op: &mut Op,
+    correlated_equiv_classes: Option<&CorrelatedEquivClasses>,
+    liveness: &impl Liveness,
+    check_users_liverange_conflicts: bool,
+    values: &mut Values,
+) {
+    let Op::Sentient(sentient::Op::For { carried, body, .. }) = for_op else {
+        return;
+    };
+    if carried.is_empty() {
+        return;
+    }
+    let Some(equiv_classes) = correlated_equiv_classes.filter(|classes| !classes.is_empty()) else {
+        return;
+    };
+    // `(iter_arg_to_replace, head_iter_arg, correlation)` — the carried slot rather than the argument,
+    // because the slot is what carries the locale and the element size the replacement copies.
+    let mut replacements: Vec<(usize, Val, i64)> = Vec::new();
+    for equiv_class in &equiv_classes.classes {
+        let head_iter_arg = equiv_class.head_iter_arg;
+        // ⭐ A HEAD THIS LOOP DOES NOT CARRY IS SKIPPED, which the reference cannot be handed: the
+        // container is keyed by the `sentient.for` whose arguments the class holds.
+        let Some(head_at) = carried.iter().position(|slot| slot.arg == head_iter_arg) else {
+            continue;
+        };
+        for &(correlated_iter_arg, correlation) in &equiv_class.correlations {
+            let Some(correlated_at) = carried.iter().position(|s| s.arg == correlated_iter_arg)
+            else {
+                continue;
+            };
+            if check_users_liverange_conflicts
+                && let Some(head) = IterArg::at(carried, body, head_at)
+                && let Some(correlated) = IterArg::at(carried, body, correlated_at)
+                && are_users_liveranges_overlapping(head, correlated, body, liveness)
+            {
+                continue;
+            }
+            replacements.push((correlated_at, head_iter_arg, correlation));
+        }
+    }
+    // ⭐ `inserted` IS BOTH BUILDERS' INSERTION POINT ADVANCING: `create` leaves the point after the
+    // op it inserted, so successive constants and adds land in creation order at the start of the
+    // block rather than in reverse.
+    for (inserted, (correlated_at, head_iter_arg, correlation_value)) in
+        replacements.into_iter().enumerate()
+    {
+        let correlation = values.mint();
+        preamble.insert(
+            inserted,
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: correlation_value,
+                result: correlation,
+                reg_locale: sentient::RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+        );
+        let replacement = values.mint();
+        body.insert(
+            inserted,
+            Op::Sentient(sentient::Op::ScalarAdd {
+                lhs: head_iter_arg,
+                rhs: correlation,
+                result: replacement,
+                // `setAttr("regLocale", ..)` — the index is NOT set, and unsaid is not `Unknown`.
+                reg: Some(sentient::Reg {
+                    locale: carried[correlated_at].reg.locale,
+                    index: None,
+                }),
+                element_size: carried[correlated_at].element_size,
+                ty: ScalarTy::Index,
+            }),
+        );
+        dialects::replace_all_uses_with(body, carried[correlated_at].arg, replacement);
+    }
+}
 
 // crustify:todo: e634_runOn
 //   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:140  (118 body lines, level 6)
@@ -403,14 +499,17 @@ pub fn are_users_liveranges_overlapping(
 mod unit_tests {
     use super::{
         IterArg, are_users_liveranges_overlapping, collect_results_of_non_yield_feeding_users,
-        reuse_identical_iter_args,
+        replace_correlated_iter_args_in_equiv_class, reuse_identical_iter_args,
     };
     use crate::arch::Elements;
     use crate::formats::Bits;
+    use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::sentient::StoreSource;
     use crate::islands::sentient::dialects::{Op, Val, sentient};
-    use crate::transform::sentient::analyses::{Liveness, PropagationAnalysis};
+    use crate::transform::sentient::analyses::{
+        CorrelatedEquivClass, CorrelatedEquivClasses, Liveness, PropagationAnalysis,
+    };
 
     /// `%out = sentient.scalar_add %lhs, %rhs : index`.
     fn add(lhs: Val, rhs: Val, result: Val) -> Op {
@@ -604,5 +703,94 @@ mod unit_tests {
             collect_results_of_non_yield_feeding_users(iter_arg, &body),
             vec![aside, aside]
         );
+    }
+
+    /// `e467` — the vendor's own shape: the second argument's one use moves onto `head + 4`, the
+    /// constant lands in the enclosing block and the add copies the SLOT's locale and element size, not
+    /// its neighbour's.
+    #[test]
+    fn a_correlated_iter_arg_is_replaced_by_the_head_plus_its_offset() {
+        let (a0, a1) = (Val(10), Val(11));
+        let mut slots = vec![carried(Val(1), a0, Val(20)), carried(Val(2), a1, Val(21))];
+        slots[0].reg.locale = sentient::RegType::Lbr;
+        slots[1].reg.locale = sentient::RegType::Lar;
+        slots[1].element_size = Some(Bits(16));
+        let mut for_op = Op::Sentient(sentient::Op::For {
+            iv: Val(9),
+            bound: Val(8),
+            bound_reg: None,
+            carried: slots,
+            dbg_name: None,
+            body: vec![
+                store(a1, Val(31)),
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(50), Val(51)],
+                }),
+            ],
+        });
+        let mut preamble: Vec<Op> = Vec::new();
+        let classes = CorrelatedEquivClasses {
+            classes: vec![CorrelatedEquivClass {
+                head_iter_arg: a0,
+                correlations: vec![(a1, 4)],
+            }],
+        };
+        let mut values = Values::default();
+        for _ in 0..100 {
+            values.mint();
+        }
+
+        replace_correlated_iter_args_in_equiv_class(
+            &mut preamble,
+            &mut for_op,
+            Some(&classes),
+            &NeverOverlaps,
+            true,
+            &mut values,
+        );
+
+        let Op::Sentient(sentient::Op::For { carried, body, .. }) = &for_op else {
+            unreachable!("the loop is still a loop")
+        };
+        let Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result: correlation,
+            ..
+        }) = preamble[0]
+        else {
+            unreachable!("the offset constant is built in the enclosing block")
+        };
+        assert_eq!(value, 4);
+        assert_eq!(
+            body[0],
+            Op::Sentient(sentient::Op::ScalarAdd {
+                lhs: a0,
+                rhs: correlation,
+                result: Val(101),
+                // ⛔ THE SLOT'S OWN LOCALE AND SIZE — `Lar`/16, not slot 0's `Lbr`/`None`, which is
+                // what the reference's `locales[getArgNumber() + 1]` would have copied.
+                reg: Some(sentient::Reg {
+                    locale: sentient::RegType::Lar,
+                    index: None,
+                }),
+                element_size: Some(Bits(16)),
+                ty: ScalarTy::Index,
+            })
+        );
+        // The one reader of the replaced argument now reads the add.
+        assert_eq!(
+            collect_results_of_non_yield_feeding_users(
+                IterArg::at(carried, body, 1).expect("slot 1"),
+                body
+            ),
+            Vec::<Val>::new()
+        );
+        assert_eq!(
+            body[1],
+            store(Val(101), Val(31)),
+            "the transfer reads the add"
+        );
+        // ⛔ THE `carried` LIST IS UNTOUCHED — only uses moved.
+        assert_eq!(carried.len(), 2);
     }
 }

@@ -89,7 +89,8 @@
 pub(crate) mod sentient;
 
 use crate::islands::sentient::dialects::sentient::CmpPredicate;
-use crate::islands::sentient::dialects::{Op, sentient as ops};
+use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
+use crate::transform::sentient::analyses::PropagationAnalysis;
 
 /// THE `$predicate` SLOT OF ONE `sentient.if` — `IfOp& if_op` reduced to the single field
 /// `updateCmpIPredicate` writes, so "not a `sentient.if`" is not a case it has to answer.
@@ -137,10 +138,61 @@ pub fn update_cmp_i_predicate(if_op: IfPredicate<'_>, new_predicate: CmpPredicat
 //   original  : void ScalarSimplificationsPass::transformIfCondition( IfOp& if_op, OpBuilder& builder, const affine::FlatAffineValueConstraints& constraints)
 //   calls     : e179_updateCmpIPredicate, e252_size
 
-// crustify:todo: e471_simplifyConditionals
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:194  (118 body lines, level 2)
-//   original  : void ScalarSimplificationsPass::simplifyConditionals( PropagationAnalysis& expr_prop_analysis, sentient::IfOp& if_op, OpBuilder& const_builder)
-//   calls     : e252_size, e371_transformIfCondition
+/// Replaces: e471_simplifyConditionals
+///
+/// Turns one `sentient.if` into the single affine constraint `lhs - rhs {>=,>,==} 0` over both sides'
+/// propagated arguments, and hands it to the solver that decides whether the branch can go.
+///
+/// ⛔ THE ARM ORDER IS THE PORT: `sle`/`slt` SWAP the two sides — of the subtraction AND of `all_args`
+/// — and `sgt`/`slt` subtract a further 1, which is the strict comparison. `eq`/`ne` become an
+/// EQUALITY where the four orderings become an inequality (`:268-270`).
+/// ⛔ `else { return; }` (`:249`) IS UNREACHABLE HERE AND THAT IS A TYPE FACT: it covers MLIR's
+/// unsigned `CmpIPredicate`s, and [`CmpPredicate`] is the six signed ones the dialect carries.
+/// ⛔ BOTH `getAffineExpression` CALLS HAPPEN BEFORE EITHER `empty()` TEST (`:198-205`) — the analysis
+/// memoises, so asking is not free of effect.
+pub fn simplify_conditionals(
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    if_op: &mut Op,
+    const_scope: &mut Vec<Op>,
+) {
+    let Op::Sentient(ops::Op::If {
+        predicate,
+        lhs,
+        rhs,
+        ..
+    }) = &*if_op
+    else {
+        return;
+    };
+    let (predicate, lhs, rhs) = (*predicate, *lhs, *rhs);
+    let lhs_info = expr_prop_analysis.affine_expression(lhs);
+    let rhs_info = expr_prop_analysis.affine_expression(rhs);
+    if expr_prop_analysis.is_expr_info_map_empty(lhs_info)
+        || expr_prop_analysis.is_expr_info_map_empty(rhs_info)
+    {
+        // A simplification that already ran can stale the analysis, or leave it without an entry for
+        // an operand that simplification created.
+        return;
+    }
+    // `getFirstExprInfo()` on each side — unit index 0, because uniformization supports one DSC and so
+    // every unit's conditional is the same (`:207-209`).
+    let (minuend, subtrahend, strict) = match predicate {
+        CmpPredicate::Sge | CmpPredicate::Eq | CmpPredicate::Ne => (lhs_info, rhs_info, false),
+        CmpPredicate::Sle => (rhs_info, lhs_info, false),
+        CmpPredicate::Sgt => (lhs_info, rhs_info, true),
+        CmpPredicate::Slt => (rhs_info, lhs_info, true),
+    };
+    let mut all_args: Vec<Val> = expr_prop_analysis.propagated_args(minuend, 0);
+    all_args.extend(expr_prop_analysis.propagated_args(subtrahend, 0));
+    let equality = matches!(predicate, CmpPredicate::Eq | CmpPredicate::Ne);
+    let _ = (strict, equality, all_args, const_scope);
+    todo!(
+        "affine::getFlattenedAffineExpr and affine::FlatAffineValueConstraints \
+         (ScalarSimplifications.cpp:253-306) — out of campaign scope, and with them the local-variable \
+         refusal, the redundant-constraint simplification and the one-constraint case that reaches \
+         e371_transformIfCondition"
+    )
+}
 
 // crustify:todo: e532_simplifyBinaryOperation
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:315  (89 body lines, level 3)
@@ -159,9 +211,35 @@ pub fn update_cmp_i_predicate(if_op: IfPredicate<'_>, new_predicate: CmpPredicat
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{IfPredicate, update_cmp_i_predicate};
+    use super::{IfPredicate, simplify_conditionals, update_cmp_i_predicate};
     use crate::islands::sentient::dialects::sentient::CmpPredicate;
     use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
+    use crate::transform::sentient::analyses::{ExprInfoMap, PropagationAnalysis};
+
+    /// AN ANALYSIS THAT ANSWERS WHAT THE TEST SAYS — `PropagationAnalysis` is out of campaign scope,
+    /// so what is under test is the EFFECT this unit has given an answer.
+    struct StatedAnalysis {
+        /// Whether every value's `ExprInfoMap` is empty.
+        empty: bool,
+    }
+
+    impl PropagationAnalysis for StatedAnalysis {
+        fn are_expressions_same(&mut self, _val1: Val, _val2: Val) -> bool {
+            todo!("e471 never asks whether two expressions are the same")
+        }
+
+        fn affine_expression(&mut self, val: Val) -> ExprInfoMap {
+            ExprInfoMap(val.0)
+        }
+
+        fn is_expr_info_map_empty(&mut self, _map: ExprInfoMap) -> bool {
+            self.empty
+        }
+
+        fn propagated_args(&mut self, map: ExprInfoMap, _at: usize) -> Vec<Val> {
+            vec![Val(map.0)]
+        }
+    }
 
     /// `sentient.if %lhs `pred` %rhs { }`.
     fn if_op(predicate: CmpPredicate) -> Op {
@@ -203,5 +281,27 @@ mod unit_tests {
             );
             assert_eq!(IfPredicate::of(&mut op).map(|p| p.get()), Some(untouched));
         }
+    }
+
+    /// e471 — a stale analysis with no expression for an operand leaves the `sentient.if` exactly as
+    /// it was, which is the reference's own reason for the `empty()` test.
+    #[test]
+    fn a_conditional_whose_operands_have_no_propagated_expression_is_left_alone() {
+        let mut op = if_op(CmpPredicate::Sge);
+        let untouched = op.clone();
+        let mut consts = Vec::new();
+        simplify_conditionals(&mut StatedAnalysis { empty: true }, &mut op, &mut consts);
+        assert_eq!(op, untouched);
+        assert!(consts.is_empty());
+    }
+
+    /// e471 — with expressions on both sides the unit reaches the affine solver, which is out of
+    /// campaign scope.
+    #[test]
+    #[should_panic(expected = "out of campaign scope")]
+    fn a_conditional_with_propagated_expressions_reaches_the_affine_solver() {
+        let mut op = if_op(CmpPredicate::Sge);
+        let mut consts = Vec::new();
+        simplify_conditionals(&mut StatedAnalysis { empty: false }, &mut op, &mut consts);
     }
 }

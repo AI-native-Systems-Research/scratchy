@@ -77,19 +77,92 @@
 //! | `e474_runOn` | 474 | 2 | 26 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:151` |
 //! | `e536_runOnOperation` | 536 | 3 | 6 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:144` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e536_runOnOperation` (level 3) is what calls
+// [`run_on_unit`], and nothing but this file's own tests reaches it until that lands. CI runs clippy
+// with `-D warnings`. ⭐ REMOVE THIS WITH e536.
+#![allow(dead_code)]
+
 pub(crate) mod incr_mask_gen_value;
 pub(crate) mod set_mask_gen_value;
 pub(crate) mod set_mask_rde_tree;
 pub(crate) mod set_mask_rde_tree_optimizer;
 
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::sentient::ProgramUnit;
 
-// crustify:todo: e474_runOn
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:151  (26 body lines, level 2)
-//   original  : void runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e188_print, e192_print, e378_optimize
+
+/// `Statistic<"set_mask_re_count", "num-setmask-eliminated", "Number of times `set_mask` or
+/// `incrmask` operations were removed or hoisted">` (`Transform/Sentient/Passes.td:174`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SetMaskReCount(pub(crate) u32);
+
+/// Replaces: e474_runOn
+///
+/// Runs `set_mask`/`incrmask` redundancy elimination over ONE PT unit, and banks how many ops it
+/// removed or hoisted.
+///
+/// ⛔ ANYTHING BUT THE PT IS SKIPPED AND ITS COUNT LEFT ALONE (`:153-155`) — the pass is *"removes
+/// redundant set_mask operations in the PT unit"* (`Passes.td:169`), and `set_mask_re_count` is a
+/// per-module statistic, so a skipped unit must not zero what a PT unit before it banked.
+/// ⛔ THE REST OF THE BODY IS BLOCKED BY TWO DIFFERENT THINGS: `SetMaskRDETree`'s construction,
+/// `compute` and `simplify` are `RedundantDefinitionEliminationTree`'s and OUT OF CAMPAIGN SCOPE,
+/// while `SetMaskRDETreeOptimizer::optimize()` is this campaign's own e378.
+pub(crate) fn run_on_unit<A: Arch>(
+    unit: &mut ProgramUnit<A>,
+    set_mask_re_count: &mut SetMaskReCount,
+) {
+    if unit.on.kind().generic() != GenericComp::Pt {
+        return;
+    }
+    let _ = set_mask_re_count;
+    todo!(
+        "e474_runOn: SetMaskRDETree's construction, compute() and simplify() \
+         (Analyses/RedundantDefinitionEliminationTree.hpp) are out of campaign scope, as is the \
+         DT_CHECK over dcc_ext_ctx_.isa_per_unit_, and SetMaskRDETreeOptimizer::optimize() is not \
+         ported yet (senpass e378, SetMaskRE.cpp:311) — together they are SetMaskRE.cpp:157-175"
+    )
+}
 
 // crustify:todo: e536_runOnOperation
 //   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:144  (6 body lines, level 3)
 //   original  : void runOnOperation()
 //   calls     : e474_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{SetMaskReCount, run_on_unit};
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
+    use crate::islands::sentient::ProgramUnit;
+    use crate::islands::sentient::dialects::Val;
+    use crate::units::{DfirUnit, Row};
+
+    /// One empty unit on `kind`.
+    fn unit_on(kind: DfirUnit) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(kind, Val(0)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e474 — anything but the PT is skipped, and the module-wide count it did not touch stays put.
+    #[test]
+    fn a_unit_that_is_not_the_pt_is_skipped_and_the_count_kept() {
+        let mut count = SetMaskReCount(3);
+        run_on_unit(&mut unit_on(DfirUnit::Lxlu), &mut count);
+        assert_eq!(count, SetMaskReCount(3));
+    }
+
+    /// e474 — a PT unit runs the tree, whose optimizer is e378 and not ported.
+    #[test]
+    #[should_panic(expected = "senpass e378")]
+    fn the_pt_reaches_the_unported_rde_tree_optimizer() {
+        run_on_unit(
+            &mut unit_on(DfirUnit::PtRow(Row::checked(0).expect("PT row 0 exists"))),
+            &mut SetMaskReCount(0),
+        );
+    }
+}

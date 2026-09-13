@@ -80,6 +80,32 @@
 //! | `e534_lightWeightSimplifyBinaryArithmetic` | 534 | 3 | 183 | `dcc/src/Transform/Sentient/ScalarSimplifications.cpp:504` |
 //! | `e580_runOldLightWeightSimplifications` | 580 | 4 | 25 | `dcc/src/Transform/Sentient/ScalarSimplifications.cpp:690` |
 
+#![allow(dead_code)]
+// ⛔ NOTHING IN THIS FILE IS WIRED INTO THE PIPELINE YET — `e580_runOldLightWeightSimplifications`
+// (level 4) is what reaches the item below, through e534. CI runs clippy with `-D warnings`, so
+// without this the first ported leaf here fails the gate. ⭐ REMOVE THIS WITH e580.
+
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{Op, Val, sentient as ops, uniform};
+use crate::transform::sentient::analyses::{ExprInfoMap, PropagationAnalysis};
+
+/// `FlatExprType` (`:35`) — ONE UNIT'S FLATTENED AFFINE EXPRESSIONS, coefficients then constant.
+///
+/// ⛔ EVERY READER OF ONE IN THIS FILE READS `[0]`: the outer list is per result of the propagated
+/// affine map and the simplifications only ever transform a single-result one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct FlatExpr(pub(crate) Vec<Vec<i64>>);
+
+impl FlatExpr {
+    /// `flat_expr[0]` — ⭐ EMPTY WHERE THE REFERENCE DEREFERENCES `std::vector::operator[]` past the
+    /// end, which every caller's `size()` chain then declines.
+    #[must_use]
+    fn first(&self) -> &[i64] {
+        self.0.first().map_or(&[], Vec::as_slice)
+    }
+}
+
 
 // crustify:todo: e372_areAllExprsValidToTransform
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:716  (50 body lines, level 1)
@@ -91,10 +117,159 @@
 //   original  : bool sentient::areFlatExprsAndArgsIdentical( std::vector<FlatExprType>& flat_exprs, SmallVector<unsigned>& indices, PropagationAnalysis::ExprInfoMap* result_info, unsigned dim_idx)
 //   calls     : e252_size
 
-// crustify:todo: e472_createNewOpOrMap
-//   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:769  (63 body lines, level 2)
-//   original  : Value sentient::createNewOpOrMap(OpBuilder& builder, std::vector<FlatExprType>& flat_exprs, SmallVector<unsigned>& indices, PropagationAnalysis& expr_prop_analysis, SmallVector<Value>& units, Operation* op, Type operand_type, Value query_key, PropagationAnalysis::ExprInfoMap* result_info, unsigned o
-//   calls     : e252_size, e373_areFlatExprsAndArgsIdentical
+/// `sentient::areFlatExprsAndArgsIdentical` — e373, level 1, not yet ported.
+///
+/// ⛔ IT IS e373 AND IT IS NOT PORTED YET: whether every unit's flattened expression AND every
+/// unit's propagated arguments agree, which is what lets one value stand for all of them.
+fn are_flat_exprs_and_args_identical(
+    flat_exprs: &[FlatExpr],
+    indices: &[usize],
+    result_info: ExprInfoMap,
+    dim_idx: usize,
+) -> bool {
+    let _ = (flat_exprs, indices, result_info, dim_idx);
+    todo!(
+        "areFlatExprsAndArgsIdentical (senpass e373, ScalarSimplifications.cpp:840) is not ported \
+         yet — the per-unit comparison of both the flattened expression and the propagated args"
+    )
+}
+
+/// Replaces: e472_createNewOpOrMap
+///
+/// The one value that stands for a simplified operand: a `sentient.scalar_constant`, a propagated
+/// argument as it is, or — when the units disagree — a `uniform.def_immutable_mapping` of one value
+/// per unit read back through a `uniform.query_map`.
+///
+/// ⛔ `first_flat_expr_size` DECIDES THE SHAPE FOR EVERY UNIT, including in the per-unit loop
+/// (`:809-826`): unit 0's expression length is the whole discriminator.
+/// ⛔ SIZE 2 IS THE ONE ASYMMETRIC CASE — only `operand_idx == 1` becomes a constant, the other index
+/// answers with the propagated argument (`:788-793`).
+/// ⛔ A SIZE THAT IS NOT 1, 2 OR 3 FALLS THROUGH TO THE MAPPING PATH, whose own chain then pushes
+/// NOTHING and builds a mapping of no values. The reference has no `else` on either chain.
+/// ⭐ THE SAVE/RESTORE OF THE INSERTION POINT IS DROPPABLE MECHANISM; what is not is that every op
+/// created here lands immediately BEFORE `at`, in creation order.
+pub(crate) fn create_new_op_or_map(
+    scope: &mut Vec<Op>,
+    at: usize,
+    flat_exprs: &[FlatExpr],
+    indices: &[usize],
+    units: &[Val],
+    result_info: ExprInfoMap,
+    operand_idx: usize,
+    ty: ScalarTy,
+    query_key: Val,
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    values: &mut Values,
+) -> Val {
+    let first_flat_expr = flat_exprs.first().map(FlatExpr::first).unwrap_or(&[]);
+    let first_flat_expr_size = first_flat_expr.len();
+    if flat_exprs.len() == 1
+        || are_flat_exprs_and_args_identical(flat_exprs, indices, result_info, operand_idx)
+    {
+        match first_flat_expr_size {
+            1 => return scalar_constant(scope, at, first_flat_expr[0], ty, values),
+            2 if operand_idx == 1 => {
+                return scalar_constant(scope, at, first_flat_expr[operand_idx], ty, values);
+            }
+            // `getFirstExprInfo()->propagated_args_[operand_idx]` — unit index 0.
+            2 | 3 => {
+                if let Some(arg) = propagated_arg(expr_prop_analysis, result_info, 0, operand_idx) {
+                    return arg;
+                }
+            }
+            _ => {}
+        }
+    }
+    if units.len() != flat_exprs.len() {
+        todo!(
+            "createNewOpOrMap: DT_CHECK_MSG(units.size() == num_flat_exprs, \"Expecting a flattened \
+             expression for each unit\") (ScalarSimplifications.cpp:803) — {} units against {} \
+             flattened expressions",
+            units.len(),
+            flat_exprs.len()
+        )
+    }
+    let mut mapped: Vec<Val> = Vec::new();
+    let mut inserted = 0usize;
+    for (unit_idx, cur_flat_expr) in flat_exprs.iter().enumerate() {
+        let expr_info_idx = indices.get(unit_idx).copied().unwrap_or(0);
+        let cur = cur_flat_expr.first();
+        let constant_at = |index: usize| cur.get(index).copied().unwrap_or(0);
+        match first_flat_expr_size {
+            1 => {
+                mapped.push(scalar_constant(scope, at + inserted, constant_at(0), ty, values));
+                inserted += 1;
+            }
+            2 if operand_idx == 1 => {
+                let value = constant_at(operand_idx);
+                mapped.push(scalar_constant(scope, at + inserted, value, ty, values));
+                inserted += 1;
+            }
+            2 | 3 => {
+                if let Some(arg) =
+                    propagated_arg(expr_prop_analysis, result_info, expr_info_idx, operand_idx)
+                {
+                    mapped.push(arg);
+                }
+            }
+            _ => {}
+        }
+    }
+    let map = values.mint();
+    let query = values.mint();
+    scope.insert(
+        at + inserted,
+        Op::Uniform(uniform::Op::DefImmutableMapping {
+            result: map,
+            pairs: units.iter().copied().zip(mapped).collect(),
+        }),
+    );
+    scope.insert(
+        at + inserted + 1,
+        Op::Uniform(uniform::Op::QueryMap {
+            result: query,
+            map,
+            key: query_key,
+        }),
+    );
+    query
+}
+
+/// `result_info->getExprInfoAt(at)->propagated_args_[operand_idx]` — the one read of the analysis this
+/// unit makes, and `None` where the reference indexes a `SmallVector` past its end.
+fn propagated_arg(
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+    result_info: ExprInfoMap,
+    at: usize,
+    operand_idx: usize,
+) -> Option<Val> {
+    expr_prop_analysis
+        .propagated_args(result_info, at)
+        .get(operand_idx)
+        .copied()
+}
+
+/// `sentient::ConstantOp::create(builder, loc, operand_type, value)` inserted before `at`.
+fn scalar_constant(
+    scope: &mut Vec<Op>,
+    at: usize,
+    value: i64,
+    ty: ScalarTy,
+    values: &mut Values,
+) -> Val {
+    let result = values.mint();
+    scope.insert(
+        at,
+        Op::Sentient(ops::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: ops::RegType::Imm,
+            ty,
+            is_symbol: false,
+        }),
+    );
+    result
+}
 
 // crustify:todo: e534_lightWeightSimplifyBinaryArithmetic
 //   authority : dcc/src/Transform/Sentient/ScalarSimplifications.cpp:504  (183 body lines, level 3)
@@ -106,3 +281,105 @@
 //   original  : LogicalResult sentient::runOldLightWeightSimplifications(Operation* op)
 //   calls     : e534_lightWeightSimplifyBinaryArithmetic
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{FlatExpr, create_new_op_or_map};
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::{Op, Val, sentient as ops};
+    use crate::transform::sentient::analyses::{ExprInfoMap, PropagationAnalysis};
+
+    /// AN ANALYSIS THAT ANSWERS WHAT THE TEST SAYS — `PropagationAnalysis` is out of campaign scope.
+    struct StatedAnalysis;
+
+    impl PropagationAnalysis for StatedAnalysis {
+        fn are_expressions_same(&mut self, _val1: Val, _val2: Val) -> bool {
+            todo!("e472 never asks whether two expressions are the same")
+        }
+
+        fn propagated_args(&mut self, _map: ExprInfoMap, at: usize) -> Vec<Val> {
+            vec![Val(50 + at as u32), Val(60 + at as u32)]
+        }
+    }
+
+    /// A minter that has already issued `issued` values, so a fixture's own [`Val`]s cannot collide.
+    fn values_after(issued: u32) -> Values {
+        let mut values = Values::default();
+        for _ in 0..issued {
+            values.mint();
+        }
+        values
+    }
+
+    /// e472 — the non-uniformization case: one unit's flattened expression of length 1 becomes a
+    /// `sentient.scalar_constant` before the op, and one of length 3 answers with the propagated
+    /// argument itself, creating nothing.
+    #[test]
+    fn a_single_unit_expression_becomes_a_constant_or_the_propagated_argument() {
+        let mut scope = vec![Op::Sentient(ops::Op::Nop { dbg_name: None })];
+        let mut values = values_after(10);
+        assert_eq!(
+            create_new_op_or_map(
+                &mut scope,
+                0,
+                &[FlatExpr(vec![vec![7]])],
+                &[0],
+                &[Val(80)],
+                ExprInfoMap(0),
+                0,
+                ScalarTy::Index,
+                Val(81),
+                &mut StatedAnalysis,
+                &mut values,
+            ),
+            Val(10)
+        );
+        assert_eq!(
+            scope[0],
+            Op::Sentient(ops::Op::ScalarConstant {
+                value: 7,
+                result: Val(10),
+                reg_locale: ops::RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            })
+        );
+        assert_eq!(
+            create_new_op_or_map(
+                &mut scope,
+                1,
+                &[FlatExpr(vec![vec![1, 1, 0]])],
+                &[0],
+                &[Val(80)],
+                ExprInfoMap(0),
+                1,
+                ScalarTy::Index,
+                Val(81),
+                &mut StatedAnalysis,
+                &mut values,
+            ),
+            Val(60)
+        );
+        assert_eq!(scope.len(), 2);
+    }
+
+    /// e472 — more than one unit asks whether every unit agrees, which is e373 and not ported.
+    #[test]
+    #[should_panic(expected = "senpass e373")]
+    fn several_units_reach_the_unported_identical_expression_test() {
+        let mut scope = vec![Op::Sentient(ops::Op::Nop { dbg_name: None })];
+        create_new_op_or_map(
+            &mut scope,
+            0,
+            &[FlatExpr(vec![vec![7]]), FlatExpr(vec![vec![9]])],
+            &[0, 1],
+            &[Val(80), Val(82)],
+            ExprInfoMap(0),
+            0,
+            ScalarTy::Index,
+            Val(81),
+            &mut StatedAnalysis,
+            &mut values_after(10),
+        );
+    }
+}

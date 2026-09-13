@@ -840,6 +840,49 @@ pub enum RdeNode<'a> {
     },
 }
 
+/// ONE CORRELATED EQUIVALENCE CLASS OF LOOP ITERATOR ARGUMENTS — `CorrelatedEquivClass`
+/// (`Analyses/CorrelationAnalysis.h:140`) reduced to the two things a ported pass reads of it.
+///
+/// ⛔ DATA, NOT AN ANALYSIS: `Analyses/CorrelationAnalysis.{h,cpp}` is out of campaign scope, so
+/// nothing here COMPUTES a class — this is the identity of an answer the pass is handed, which is what
+/// lets e467's replacement be observed without inventing the correlation walk that finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrelatedEquivClass {
+    /// `getHeadInfo()->getIterArg()` — the iterator argument every member is an offset FROM.
+    pub head_iter_arg: Val,
+    /// `getIterArgToCorrelation()` — each other member paired with its constant offset from the head.
+    ///
+    /// ⛔ THE HEAD IS NOT IN HERE, which is why e467 never replaces an argument by itself.
+    pub correlations: Vec<(Val, i64)>,
+}
+
+/// `CorrelatedEquivClassContainer` (`Analyses/CorrelationAnalysis.h:290`) — the classes one loop's
+/// iterator arguments fall into.
+///
+/// ⭐ `isEmpty()` IS `classes.is_empty()`, and the container POINTER the reference also guards
+/// against (`ReuseLoopIteratorArguments.cpp:267`) is the caller's `Option`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CorrelatedEquivClasses {
+    /// `getCorrelatedEquivClasses()`, in the order the container hands them out.
+    pub classes: Vec<CorrelatedEquivClass>,
+}
+
+impl CorrelatedEquivClasses {
+    /// `correlated_equiv_classes->isEmpty()`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.classes.is_empty()
+    }
+}
+
+/// AN `ExprInfoMap` THE PROPAGATION ANALYSIS OWNS — an identity, not the map, for exactly the reason
+/// [`EvaluatedValue`] is one: `getAffineExpression` returns a borrowed
+/// `PropagationAnalysisImpl::ExprInfoMap *` into the analysis's own memoisation
+/// (`Analyses/PropagationAnalysis.h:308`), and the `AffineMap` inside each `ExprInfo` is MLIR affine
+/// machinery this crate does not carry at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExprInfoMap(pub u32);
+
 /// THE `Liveness&` A PASS IS HANDED — a trait for the same reason [`ExpressionEvaluator`] is one:
 /// the analysis is not in this campaign, and a test must still be able to observe WHICH values a
 /// ported pass promotes.
@@ -883,6 +926,35 @@ pub trait PropagationAnalysis {
     /// `areExpressionsSame(val1, val2)` (`Analyses/PropagationAnalysis.h:335`) — whether the two
     /// values' affine expressions agree unit by unit. ⭐ NOT `const` THERE (it memoises), so `&mut`.
     fn are_expressions_same(&mut self, val1: Val, val2: Val) -> bool;
+
+    /// `getAffineExpression(val)` (`Analyses/PropagationAnalysis.h:308`) — the propagated affine
+    /// expression of `val`, one `ExprInfo` per unit. ⭐ DEFAULTED TO A `todo!` like
+    /// [`ExpressionEvaluator`]'s handle flavour, so a test double implements only what its unit asks.
+    fn affine_expression(&mut self, val: Val) -> ExprInfoMap {
+        let _ = val;
+        todo!(
+            "PropagationAnalysis::getAffineExpression (Analyses/PropagationAnalysis.h:308) — out of campaign scope"
+        )
+    }
+
+    /// `ExprInfoMap::empty()` — no unit has an expression for this value, which is the staleness a
+    /// simplification declines on rather than trusting.
+    fn is_expr_info_map_empty(&mut self, map: ExprInfoMap) -> bool {
+        let _ = map;
+        todo!(
+            "PropagationAnalysis::ExprInfoMap::empty (Analyses/PropagationAnalysis.h:106) — out of campaign scope"
+        )
+    }
+
+    /// `ExprInfoMap::getExprInfoAt(at)->propagated_args_` — the SSA values the affine map at unit
+    /// index `at` is written over. ⭐ `at == 0` IS `getFirstExprInfo()`
+    /// (`Analyses/PropagationAnalysis.h:264`), which is what the identical case reads.
+    fn propagated_args(&mut self, map: ExprInfoMap, at: usize) -> Vec<Val> {
+        let _ = (map, at);
+        todo!(
+            "PropagationAnalysis::ExprInfo::propagated_args_ (Analyses/PropagationAnalysis.h:100) — out of campaign scope"
+        )
+    }
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the affine expressions behind the answer are not ported.

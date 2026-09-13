@@ -88,6 +88,8 @@
 // ⭐ REMOVE THIS WITH e582: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
+use crate::arch::Arch;
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::sentient::{RawPrecision, SliceId, ValidEntries, WslLen};
 use crate::islands::sentient::dialects::{Op, Val, sentient};
 use crate::islands::sentient::print;
@@ -330,10 +332,33 @@ impl SetActiveMaskValueGenValue {
 //   original  : bool isEqual(const DataFlowDefinitionBase &rhs) const final override
 //   calls     : e184_maskValuesAreEquivalent
 
-// crustify:todo: e473_runOn
-//   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:54  (18 body lines, level 2)
-//   original  : void runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e378_optimize
+/// `Statistic<"samv_re_count", "num-samv-eliminated", "Number of times SAMV operations removed or
+/// hoisted">` (`Transform/Sentient/Passes.td:57`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SamvReCount(pub(crate) u32);
+
+/// Replaces: e473_runOn
+///
+/// Builds this unit's SAMV redundant-definition tree, simplifies it, and banks how many SAMVs the
+/// optimizer removed or hoisted.
+///
+/// ⛔ EVERY LINE OF THE BODY IS BLOCKED, AND BY TWO DIFFERENT THINGS: the tree's construction,
+/// `compute` and `simplify` are `RedundantDefinitionEliminationTree`'s and OUT OF CAMPAIGN SCOPE,
+/// while `optimize()` is this campaign's own e378. The two `print`s in between are debug output.
+/// ⛔ THERE IS NO UNIT-KIND GATE HERE, unlike [`super::set_mask_re::run_on_unit`]'s `!= PT`: SAMV
+/// redundancy elimination runs on every program unit (`:54-70`).
+pub(crate) fn run_on_unit<A: Arch>(
+    unit: &mut ProgramUnit<A>,
+    samv_re_count: &mut SamvReCount,
+) -> ! {
+    let _ = (unit, samv_re_count);
+    todo!(
+        "e473_runOn: SetActiveMaskValueRDETree's construction, compute() and simplify() \
+         (Analyses/RedundantDefinitionEliminationTree.hpp) are out of campaign scope, and \
+         RDETreeOptimizer::optimize() is not ported yet (senpass e378, SetMaskRE.cpp:311) — together \
+         they are the whole of SetActiveMaskValueRE.cpp:54-70"
+    )
+}
 
 // crustify:todo: e535_runOn
 //   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:73  (4 body lines, level 3)
@@ -347,11 +372,15 @@ impl SetActiveMaskValueGenValue {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{SamvAttrs, SetActiveMaskValueGenValue};
+    use super::{SamvAttrs, SamvReCount, SetActiveMaskValueGenValue, run_on_unit};
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
+    use crate::islands::sentient::ProgramUnit;
     use crate::islands::sentient::dialects::sentient::{
         RawPrecision, SliceId, ValidEntries, WslLen,
     };
     use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::units::DfirUnit;
 
     /// `sentient.samv mask_value(%7) {...}` — the op a GenValue is built from.
     fn samv(mask_value: Val) -> Op {
@@ -441,5 +470,21 @@ mod unit_tests {
         assert!(SetActiveMaskValueGenValue::mask_values_are_equivalent(
             None, None
         ));
+    }
+
+    /// e473 — every unit is visited, and the tree it builds is out of campaign scope down to the
+    /// optimizer, which is e378 and not ported.
+    #[test]
+    #[should_panic(expected = "senpass e378")]
+    fn any_unit_reaches_the_unported_rde_tree_optimizer() {
+        run_on_unit(
+            &mut ProgramUnit::<Dd2> {
+                on: Units::one(DfirUnit::Lxlu, Val(0)),
+                precision: None,
+                body: Vec::new(),
+                arch: core::marker::PhantomData,
+            },
+            &mut SamvReCount(0),
+        );
     }
 }
