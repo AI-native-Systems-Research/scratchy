@@ -81,7 +81,7 @@
 //! | `e494_processAddressSSAValue` | 494 | 3 | 223 | `dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:221` |
 //! | `e554_runOnOperation` | 554 | 4 | 100 | `dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:449` |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::formats::Bits;
@@ -338,6 +338,31 @@ impl PrecisionAssignments {
         }
     }
 
+    /// Replaces: e428_addToWorkListAndAssignPrecision
+    ///
+    /// Assigns `element_size` to `val`'s own slot and queues `val` for the upward walk — but ONLY on a
+    /// fresh assignment, *"otherwise, it leads to infinite loop"* (`:206-207`).
+    ///
+    /// ⭐ RETURNS THE WHOLE OUTCOME, WHICH IS MORE THAN THE REFERENCE'S `new_val`: the two failure
+    /// arms of [`PrecisionAssigned`] are how this pass stops (`signalPassFailure`), and with no
+    /// `Result` in this crate the caller has to receive them as a value. `Substituted(v)` is the
+    /// `new_val` its callers assign over the operand (`:236`).
+    pub fn add_to_worklist_and_assign_precision(
+        &mut self,
+        body: &mut Vec<Op>,
+        values: &mut Values,
+        worklist: &mut AddressWorklist,
+        val: Val,
+        element_size: Bits,
+        user: &OpId,
+    ) -> PrecisionAssigned {
+        let outcome = self.assign_precision(body, values, val, element_size, user);
+        if outcome == PrecisionAssigned::Assigned {
+            worklist.push(val);
+        }
+        outcome
+    }
+
     /// EVERY KEY AT OR AFTER `at` IN ITS OWN BLOCK MOVES DOWN ONE — the price of a positional
     /// identity, paid where the insertion happens rather than left for a reader to discover.
     fn shift_keys_at_or_after(&mut self, at: &[u32]) {
@@ -355,6 +380,28 @@ impl PrecisionAssignments {
                 (OpId::at(&path), slots)
             })
             .collect();
+    }
+}
+
+/// `std::queue<Value> worklist_` (`:63`) — the addresses still to walk upward, FIFO, drained by
+/// `processAddressSSAValue` (`:525-527`).
+///
+/// ⛔ ITS OWN TYPE, NOT A FIELD OF [`PrecisionAssignments`]: the reference pushes onto it from
+/// `addToWorkListAndAssignPrecision` while `assignments_` is being written through the same `this`,
+/// and keeping the queue apart is what lets a Rust caller hold both at once.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AddressWorklist(VecDeque<Val>);
+
+impl AddressWorklist {
+    /// `worklist_.push(val)`.
+    pub fn push(&mut self, val: Val) {
+        self.0.push_back(val);
+    }
+
+    /// `worklist_.front()` then `worklist_.pop()` — `None` is `worklist_.empty()`, which is the
+    /// reference's own loop condition (`:525`) and not a refusal.
+    pub fn pop(&mut self) -> Option<Val> {
+        self.0.pop_front()
     }
 }
 
@@ -450,11 +497,6 @@ fn insert_at(block: &mut Vec<Op>, path: &[u32], op: Op) -> Option<Op> {
     }
     Some(op)
 }
-
-// crustify:todo: e428_addToWorkListAndAssignPrecision
-//   authority : dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:204  (10 body lines, level 2)
-//   original  : Value AddressRegisterPrecisionAssignmentPass::addToWorkListAndAssignPrecision( Value val, int element_size, Operation *user)
-//   calls     : e283_assignPrecision
 
 // crustify:todo: e494_processAddressSSAValue
 //   authority : dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:221  (223 body lines, level 3)
@@ -630,5 +672,49 @@ mod unit_tests {
             assignments.assign_precision(&mut body, &mut values, Val(99), Bits(32), &user),
             PrecisionAssigned::UnknownParentOp
         );
+    }
+
+    /// 428/656 — a fresh assignment queues the value; the same size again assigns nothing and must
+    /// NOT queue it, which is the reference's stated infinite-loop guard.
+    #[test]
+    fn e428_queues_the_value_only_on_a_fresh_assignment() {
+        let mut body = vec![
+            constant(0, Val(1)),
+            copy(Val(1), Val(2), RegType::Lbr),
+            copy(Val(2), Val(3), RegType::Lccr),
+        ];
+        let mut values = Values::default();
+        let user = OpId::at(&[2]);
+        let mut worklist = AddressWorklist::default();
+
+        let mut assignments = PrecisionAssignments::default();
+        assignments.initialize_precision(OpId::at(&[1]), &body[1]);
+
+        assert_eq!(
+            assignments.add_to_worklist_and_assign_precision(
+                &mut body,
+                &mut values,
+                &mut worklist,
+                Val(2),
+                Bits(8),
+                &user,
+            ),
+            PrecisionAssigned::Assigned
+        );
+        assert_eq!(worklist.pop(), Some(Val(2)));
+        assert_eq!(worklist.pop(), None);
+
+        assert_eq!(
+            assignments.add_to_worklist_and_assign_precision(
+                &mut body,
+                &mut values,
+                &mut worklist,
+                Val(2),
+                Bits(8),
+                &user,
+            ),
+            PrecisionAssigned::Unchanged
+        );
+        assert_eq!(worklist, AddressWorklist::default());
     }
 }

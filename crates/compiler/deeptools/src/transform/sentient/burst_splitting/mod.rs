@@ -81,9 +81,11 @@
 
 use crate::arch::{Arch, Elements};
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
-use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{self as dialects, Op, sentient};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
 use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 /// A MEMORY OP THIS PASS MAY SPLIT, WITH THE BURST IT CARRIES.
 ///
@@ -213,10 +215,45 @@ fn collect_candidates(
     }
 }
 
-// crustify:todo: e430_runOn
-//   authority : dcc/src/Transform/Sentient/BurstSplitting.cpp:191  (21 body lines, level 2)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e285_runOn
+/// Replaces: e430_runOn
+///
+/// Runs the split on every program unit that moves memory, in program order.
+///
+/// ⭐ THE `any_of` OVER `getUnits()` IS ONE QUESTION HERE, NOT A LOOP: a
+/// [`Units`](crate::islands::dataflow_ir::Units) carries ONE [`DfirUnit`] for all its values, so the
+/// reference's per-value `getUnitType` cannot disagree with itself and `unit_comp` — whatever
+/// `any_of` left in it — is that kind. That also settles a real trap in the reference: its
+/// `getMaxBurstSize` reads `getUnits().front()` (`Analyses/Utils.cpp:290`) while `runOn` receives the
+/// component of the unit that MATCHED, and here the two cannot differ.
+/// ⭐ `DT_CHECK_MSG(get_unit_op, "Cannot determine GetUnitOp!")` is that same type.
+pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    for unit in program.units.iter_mut() {
+        let comp = unit.on.kind();
+        // `is_any_of(unit_comp, LXLU, LXSU, L0LU, L0SU, L3LU, L3SU)` — which is exactly the set
+        // [`max_burst_size`] can answer for.
+        let Some(max_burst) = max_burst_size::<A>(comp) else {
+            continue;
+        };
+        run_on(unit, comp, max_burst);
+    }
+}
+
+/// `getMaxBurstSize` (`Analyses/Utils.cpp:287-304`) — the unit's burst limit, `None` for its `-1`.
+///
+/// ⭐ PORTED THOUGH IT LIVES UNDER `Analyses/`, BECAUSE IT COMPUTES NO ANALYSIS: it is a
+/// `SenSystemDef` table read, keyed by unit component, and `SenSystemDef`'s three burst sizes are
+/// [`Arch::LX_BURST`], [`Arch::L0_BURST`] and [`Arch::L3_BURST`] — the same fact, stated by the type.
+/// ⛔ AND ITS `None` SET IS `runOn`'s FILTER, which is why the two are one function: that is what
+/// keeps `DT_CHECK_MSG(max_burst != -1)` (`:163`) unreachable rather than merely unlikely.
+#[must_use]
+pub fn max_burst_size<A: Arch>(comp: DfirUnit) -> Option<Elements> {
+    match comp {
+        DfirUnit::Lxlu | DfirUnit::Lxsu => Some(Elements(u64::from(A::LX_BURST))),
+        DfirUnit::L0lu | DfirUnit::L0su => Some(Elements(u64::from(A::L0_BURST))),
+        DfirUnit::L3lu | DfirUnit::L3su => Some(Elements(u64::from(A::L3_BURST))),
+        _ => None,
+    }
+}
 
 // crustify:todo: e495_runOnOperation
 //   authority : dcc/src/Transform/Sentient/BurstSplitting.cpp:213  (5 body lines, level 3)
@@ -228,8 +265,10 @@ mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
     use crate::formats::Bits;
-    use crate::islands::dataflow_ir::Units;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
     use crate::islands::sentient::dialects::Val;
 
     /// The file header's own example: a burst of 264 where 64 is the maximum needs a loop of four
@@ -308,5 +347,69 @@ mod unit_tests {
             arch: core::marker::PhantomData,
         };
         run_on(&mut unit, DfirUnit::L3lu, Elements(64));
+    }
+
+    /// A model and rung, for the same reason [`ProgramUnit`] needs an arch: the pass reads neither.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// 430/656 — the PE unit's transfer is skipped because a PE has no burst limit, and the L3LU one
+    /// after it is split at DD2's `l3BurstSize` of 32, not at the LX or L0 64.
+    #[test]
+    #[should_panic(expected = "bursts of Elements(32)")]
+    fn e430_skips_the_non_memory_unit_and_splits_the_l3_one_at_its_own_burst_size() {
+        let transfer = Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr: Val(1),
+            immutable_addr: Val(2),
+            increment: Val(3),
+            consumer: crate::islands::dataflow_ir::link::SendEnd::to_self(Val(98)),
+            result: Val(4),
+            extent: sentient::Extent {
+                burst_size: Elements(264),
+                ..sentient::Extent::of(Elements(264), Bits(16))
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: sentient::ShuffleMode::NoShuffle,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        });
+        let unit = |kind| ProgramUnit::<Dd2> {
+            on: Units::one(kind, Val(0)),
+            precision: None,
+            body: vec![transfer.clone()],
+            arch: core::marker::PhantomData,
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(DfirUnit::Pe), vec![unit(DfirUnit::L3lu)]),
+            bound: core::marker::PhantomData,
+        };
+        run_on_program(&mut program);
     }
 }

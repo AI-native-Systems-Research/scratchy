@@ -78,8 +78,23 @@
 //! | `e429_runOnOperation` | 429 | 2 | 40 | `dcc/src/Transform/Sentient/AnnotateMacXRFWtRange.cpp:116` |
 
 
-use crate::islands::sentient::dialects::{Op, sentient};
+use crate::arch::{Arch, IsaGen};
+use crate::islands::sentient::Program;
+use crate::islands::sentient::dialects::{self, Op, sentient};
+use crate::model::Model;
 use crate::transform::sentient::analyses::{MinMax, XrfRegisterAnalyzer};
+use crate::units::DfirUnit;
+use crate::workload::Workload;
+
+/// `-dcc-annotate-mac-xrf-wt-range-disable`, `cl::init(false)` (`:42-45`).
+const DISABLE_THIS_PASS: bool = false;
+
+/// `dtGetEnv<bool>("SET_IFIFO_CONVERT").value_or(true)` (`:123`) — whether the IFIFO conversion this
+/// annotation feeds is on, defaulting to on.
+///
+/// ⛔ STATED BY THE BUILD, NOT READ FROM THE ENVIRONMENT, exactly as `SENCORES` becomes
+/// [`Arch::CORES`]: an emission that changes under an env var is an emission nothing can reproduce.
+const SET_IFIFO_CONVERT: bool = true;
 
 /// Replaces: e284_annotateMacOp
 ///
@@ -143,11 +158,17 @@ pub(crate) fn annotate_mac_op(fma_op: &mut Op, xrf_reg_analyzer: &mut impl XrfRe
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::{Dd2, Sen1p5};
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::dialects::dataflow;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::Val;
     use crate::islands::sentient::dialects::sentient::{
         FmaMode, Operand, Port, Precision, ResultPorts, UnrollFactor,
     };
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
     use crate::transform::sentient::analyses::MinMax;
+    use crate::units::Row;
 
     /// A `mxfp8` MAC reading zero into B and N-link `fp8` into C, writing XRF through `%7`.
     fn mac(xrf_write_ptr: Option<Val>, op_c_port: Port) -> Op {
@@ -210,11 +231,137 @@ mod unit_tests {
         annotate_mac_op(&mut not_north, &mut StatedAnalyzer);
         assert_eq!(annotation(&not_north), None);
     }
+
+    /// A model and rung, for the same reason [`ProgramUnit`] needs an arch: the pass reads neither.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// A `[8, 40]` write pointer — the data range, for any MAC that reaches the analyzer.
+    struct DataRange;
+
+    impl XrfRegisterAnalyzer for DataRange {
+        fn min_max_val_if_constant(&mut self, _value: Val, end: MinMax) -> Option<i64> {
+            Some(match end {
+                MinMax::Min => 8,
+                MinMax::Max => 40,
+            })
+        }
+    }
+
+    /// A PT-row unit whose MAC sits inside a `sentient.for`, beside an LXLU unit holding one at top
+    /// level — so the walk's depth and the PT filter are both visible.
+    fn program<A: Arch>() -> Program<A, AnyModel, AnyRung> {
+        let loop_op = Op::Sentient(sentient::Op::For {
+            iv: Val(50),
+            bound: Val(51),
+            bound_reg: None,
+            carried: Vec::new(),
+            dbg_name: None,
+            body: vec![mac(Some(Val(7)), Port::North)],
+        });
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(0)),
+                    precision: None,
+                    body: vec![mac(Some(Val(7)), Port::North)],
+                    arch: core::marker::PhantomData,
+                },
+                vec![ProgramUnit {
+                    on: Units::one(DfirUnit::PtRow(Row::checked(0).expect("row 0")), Val(1)),
+                    precision: Some(dataflow::Precision::Int8),
+                    body: vec![loop_op],
+                    arch: core::marker::PhantomData,
+                }],
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// The MAC nested in the PT unit's loop, and the one the LXLU unit holds.
+    fn annotations<A: Arch>(
+        program: &Program<A, AnyModel, AnyRung>,
+    ) -> (Option<bool>, Option<bool>) {
+        let mut units = program.units.iter();
+        let lxlu = annotation(&units.next().expect("the lxlu").body[0]);
+        let Op::Sentient(sentient::Op::For { body, .. }) =
+            &units.next().expect("the pt row").body[0]
+        else {
+            panic!("the loop survives")
+        };
+        (annotation(&body[0]), lxlu)
+    }
+
+    /// 429/656 — on SEN1P5 the PT unit's nested MAC is annotated and the LXLU's is not touched; on
+    /// DD2 the arch gate stops the pass before either.
+    #[test]
+    fn e429_annotates_nested_pt_macs_on_sen1p5_only() {
+        let mut sen1p5 = program::<Sen1p5>();
+        run_on_program(&mut sen1p5, &mut DataRange);
+        assert_eq!(annotations(&sen1p5), (Some(true), None));
+
+        let mut dd2 = program::<Dd2>();
+        run_on_program(&mut dd2, &mut DataRange);
+        assert_eq!(annotations(&dd2), (None, None));
+    }
 }
 
+/// Replaces: e429_runOnOperation
+///
+/// Annotates every MAC of every PT unit, on SEN1P5 and later only (`:130-132`).
+///
+/// ⛔ THE ARCH GATE IS `<`, ON AN ORDER THAT IS LOAD-BEARING: [`IsaGen`] is ordered so this reads as
+/// the reference's `getArch() < SEN1P5_ISA`, and an RCUDD1A build must annotate NOTHING.
+/// ⭐ THE PER-UNIT `make_unique<XRFRegisterAnalyzer>(unit)` (`:148`) IS THE SEAM'S OWN BUSINESS: the
+/// analyzer is out of campaign scope, and every unit's MACs still reach it in unit order.
+/// ⭐ `if (!get_unit_op) return;` needs no expression — a [`Units`](crate::islands::dataflow_ir::Units)
+/// carries its [`DfirUnit`] as a closed enum rather than a nullable defining op.
+pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    xrf_reg_analyzer: &mut impl XrfRegisterAnalyzer,
+) {
+    if DISABLE_THIS_PASS || !SET_IFIFO_CONVERT || A::GEN < IsaGen::Sen1p5 {
+        return;
+    }
+    for unit in program.units.iter_mut() {
+        // `senCompToGenericComp.at(...) != PT -> return` — every PT row is the one generic component.
+        if !matches!(unit.on.kind(), DfirUnit::PtRow(_)) {
+            continue;
+        }
+        annotate_macs(&mut unit.body, xrf_reg_analyzer);
+    }
+}
 
-// crustify:todo: e429_runOnOperation
-//   authority : dcc/src/Transform/Sentient/AnnotateMacXRFWtRange.cpp:116  (40 body lines, level 2)
-//   original  : void AnnotateMacXRFWtPtrRangePass::runOnOperation()
-//   calls     : e284_annotateMacOp
-
+/// `unit.walk([&](sentient::MacOp fma_op) { annotateMacOp(..); })` — the nested walk, which is the
+/// mechanism the campaign names droppable. The `MacOp` filter is
+/// [`annotate_mac_op`]'s own first match, so every op is offered to it.
+fn annotate_macs(body: &mut [Op], xrf_reg_analyzer: &mut impl XrfRegisterAnalyzer) {
+    for op in body.iter_mut() {
+        annotate_mac_op(op, xrf_reg_analyzer);
+        for region in dialects::regions_mut(op) {
+            annotate_macs(region, xrf_reg_analyzer);
+        }
+    }
+}

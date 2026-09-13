@@ -77,12 +77,6 @@
 //! | `e424_dump` | 424 | 2 | 10 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2628` |
 
 
-// crustify:todo: e424_dump
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2628  (10 body lines, level 2)
-//   original  : void SimpleConstantDescriptor::dump() const
-//   calls     : e278_isValid
-
-
 use crate::transform::sentient::analyses::EvaluatedValue;
 
 /// A BASE ADDRESS THAT IS ONE CONSTANT — `class SimpleConstantDescriptor`
@@ -94,4 +88,39 @@ use crate::transform::sentient::analyses::EvaluatedValue;
 pub struct SimpleConstantDescriptor {
     /// `ev_` — the constant this address is.
     pub ev: EvaluatedValue,
+}
+
+impl SimpleConstantDescriptor {
+    /// Replaces: e424_dump
+    ///
+    /// The descriptor's debug block: its header and then its one constant, tab-indented.
+    ///
+    /// ⭐ THE `Invalid` BRANCH (`:2632-2635`) IS UNREACHABLE, not dropped: this class's `isValid()` is
+    /// `return true` (`:191`), so no `SimpleConstantDescriptor` can take it and there is no state here
+    /// to test — see the type's own note.
+    /// ⛔ THE CONSTANT'S DIGITS ARE THE ANALYSIS'S — [`EvaluatedValue::rendered`], not `self.ev.0`,
+    /// which is an arena slot.
+    #[must_use]
+    pub fn dump(&self) -> String {
+        format!(
+            "Simple Constant Descriptor:\n\tConstant value = {}\n",
+            self.ev.rendered()
+        )
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// 424/656 — the header and the indented constant. ⛔ `EvaluatedValue`'s `operator<<` is out of
+    /// campaign scope, so the line stops at the digits; the block's shape is what this checks.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::operator<<")]
+    fn e424_writes_the_header_then_the_indented_constant() {
+        let _ = SimpleConstantDescriptor {
+            ev: EvaluatedValue(7),
+        }
+        .dump();
+    }
 }

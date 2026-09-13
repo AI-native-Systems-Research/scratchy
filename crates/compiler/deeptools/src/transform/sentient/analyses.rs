@@ -31,6 +31,22 @@ use crate::transform::sentient::canonicalize_xrf_pointers::XrfMinExpr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EvaluatedValue(pub u32);
 
+impl EvaluatedValue {
+    /// `raw_ostream &operator<<(raw_ostream &, const EvaluatedValue &)`
+    /// (`Analyses/ExpressionEvaluatorUtils.h:405`) — the analysis's own rendering of the arena entry
+    /// this handle names, which is what every `dump()` in `AddressPinningAndToggle.cpp` prints.
+    ///
+    /// ⛔ NOT DERIVABLE FROM THE HANDLE, which is why it is not a `Display`: the digits live in the
+    /// evaluator's memoisation arena, and printing `self.0` would put a slot number where the
+    /// reference prints an address.
+    #[must_use]
+    pub fn rendered(self) -> String {
+        todo!(
+            "EvaluatedValue::operator<< (Analyses/ExpressionEvaluatorUtils.h:405) — out of campaign scope"
+        )
+    }
+}
+
 /// A SIGNED SCALAR OFFSET — `ScalarValue`, what an evaluated expression carries beside its base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScalarOffset(pub i64);
@@ -374,6 +390,20 @@ pub trait PinningSchemeManager {
         let _ = (ev_x, ev_y, region, element_size);
         todo!(
             "PinningSchemeManager::findClosestPinnedAddr (Analyses/AddressPinningScheme.h:229) — out of campaign scope"
+        )
+    }
+
+    /// `PinningSchemeManager::overflowsRegister(addr_ev, element_size_in_bits)`
+    /// (`Analyses/AddressPinningScheme.h:236-238`) — whether LAR/EAR is too narrow for the signed
+    /// element addresses in `addr_ev`: *"Returns false if they all fit and true otherwise."*
+    ///
+    /// ⛔ `true` IS THE ABORT, NOT THE SUCCESS. All four call sites are
+    /// `DT_CHECK(!ps_manager_.overflowsRegister(..))` (`AddressPinningAndToggle.cpp:1927`, `:2030`,
+    /// `:2101`, `:2156`), so a port that reads the name as "fits" inverts every one of them.
+    fn overflows_register(&self, addr_ev: EvaluatedValue, element_size: Bits) -> bool {
+        let _ = (addr_ev, element_size);
+        todo!(
+            "PinningSchemeManager::overflowsRegister (Analyses/AddressPinningScheme.h:236) — out of campaign scope"
         )
     }
 

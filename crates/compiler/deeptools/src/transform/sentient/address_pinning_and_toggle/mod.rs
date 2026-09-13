@@ -179,6 +179,7 @@ use crate::transform::sentient::analyses::{
 };
 use crate::transform::sentient::{ForRef, IterArgIndex};
 use crate::units::DfirUnit;
+use looping_chain_mutable_addr_descriptor::TransferEnd;
 
 pub use conditional_constant_descriptor::ConditionalConstantDescriptor;
 pub use data_transfer_descriptor::DataTransferDescriptor;
@@ -372,6 +373,57 @@ pub fn create_offset_value(_ev: EvaluatedValue, _ty: ScalarTy) -> Val {
         "EvaluatedValue::buildOffsetValue — out of campaign scope \
          (dcc/src/Transform/Sentient/Analyses/ExpressionEvaluatorUtils.cpp:148)"
     )
+}
+
+/// THE IMMUTABLE-ADDR OPERAND AS A PLACE — what `immutable_addr_.assign(v)` (`:1903`, `:1943`) writes
+/// through, `mlir::MutableOperandRange` being a reference into the op the descriptor describes.
+///
+/// ⛔ THE THREE OPS `collectDataTransfers` ADMITS (`:1400-1402`) AND NO OTHER, which is why the stop
+/// names that filter rather than `getMutableAndImmutableAddr`'s wider `DT_CHECK`.
+pub(super) fn immutable_addr_mut(op: &mut Op, end: TransferEnd) -> &mut Val {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { immutable_addr, .. }
+            | sentient::Op::ReceiveAndStore { immutable_addr, .. },
+        ) => immutable_addr,
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src_immutable_addr,
+            dst_immutable_addr,
+            ..
+        }) => match end {
+            TransferEnd::Src => src_immutable_addr,
+            TransferEnd::Dst => dst_immutable_addr,
+        },
+        _ => todo!(
+            "updateImmutableAddr: `immutable_addr_` on {op:?}, which \
+             `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>` rejects \
+             (AddressPinningAndToggle.cpp:1400-1402)"
+        ),
+    }
+}
+
+/// THE MUTABLE-ADDR OPERAND AS A PLACE — the sibling of [`immutable_addr_mut`], which
+/// `mutable_addr_.assign(v)` (`:1931`, `:2044`) writes through.
+pub(super) fn mutable_addr_mut(op: &mut Op, end: TransferEnd) -> &mut Val {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { mutable_addr, .. }
+            | sentient::Op::ReceiveAndStore { mutable_addr, .. },
+        ) => mutable_addr,
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src_mutable_addr,
+            dst_mutable_addr,
+            ..
+        }) => match end {
+            TransferEnd::Src => src_mutable_addr,
+            TransferEnd::Dst => dst_mutable_addr,
+        },
+        _ => todo!(
+            "updateConstantMutableAddr: `mutable_addr_` on {op:?}, which \
+             `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>` rejects \
+             (AddressPinningAndToggle.cpp:1400-1402)"
+        ),
+    }
 }
 
 /// `SimpleConstantDataTransferUpdater` (`:1050`) — the updater for a transfer whose base address is

@@ -80,10 +80,12 @@
 
 
 use super::looping_chain_mutable_addr_descriptor::TransferEnd;
-use super::{DataTransferDescriptor, ToggleDataTransferUpdater, create_offset_value};
+use super::{
+    DataTransferDescriptor, ToggleDataTransferUpdater, create_offset_value, immutable_addr_mut,
+};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::{Op, Val, sentient};
+use crate::islands::sentient::dialects::Op;
 use crate::transform::sentient::analyses::{EvaluatedValue, PinningSchemeManager};
 
 impl ToggleDataTransferUpdater {
@@ -123,33 +125,6 @@ impl ToggleDataTransferUpdater {
     }
 }
 
-/// THE IMMUTABLE-ADDR OPERAND AS A PLACE — what `immutable_addr_.assign(v)` (`:1943`) writes through,
-/// `mlir::MutableOperandRange` being a reference into the op the descriptor describes.
-///
-/// ⛔ THE THREE OPS `collectDataTransfers` ADMITS (`:1400-1402`) AND NO OTHER, which is why the stop
-/// names that filter rather than `getMutableAndImmutableAddr`'s wider `DT_CHECK`.
-fn immutable_addr_mut(op: &mut Op, end: TransferEnd) -> &mut Val {
-    match op {
-        Op::Sentient(
-            sentient::Op::LoadAndSend { immutable_addr, .. }
-            | sentient::Op::ReceiveAndStore { immutable_addr, .. },
-        ) => immutable_addr,
-        Op::Sentient(sentient::Op::LoadAndStore {
-            src_immutable_addr,
-            dst_immutable_addr,
-            ..
-        }) => match end {
-            TransferEnd::Src => src_immutable_addr,
-            TransferEnd::Dst => dst_immutable_addr,
-        },
-        _ => todo!(
-            "updateImmutableAddr: `immutable_addr_` on {op:?}, which \
-             `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>` rejects \
-             (AddressPinningAndToggle.cpp:1400-1402)"
-        ),
-    }
-}
-
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -157,6 +132,7 @@ mod unit_tests {
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
+    use crate::islands::sentient::dialects::{Val, sentient};
     use crate::transform::sentient::analyses::RegionSite;
 
     /// 276/656 — the pinned address chosen for the PAIR is handed back, and the transfer's immutable

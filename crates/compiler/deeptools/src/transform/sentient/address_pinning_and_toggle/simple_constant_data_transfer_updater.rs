@@ -78,13 +78,268 @@
 //! | `e421_updateConstantMutableAddr` | 421 | 2 | 23 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1908` |
 
 
-// crustify:todo: e420_updateImmutableAddr
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1896  (11 body lines, level 2)
-//   original  : const EvaluatedValue &SimpleConstantDataTransferUpdater::updateImmutableAddr()
-//   calls     : e009_createOffsetValue, e257_getBaseAddr
+use super::looping_chain_mutable_addr_descriptor::TransferEnd;
+use super::{
+    DataTransferDescriptor, SimpleConstantDataTransferUpdater, create_offset_value,
+    immutable_addr_mut, mutable_addr_mut,
+};
+use crate::formats::Bits;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{Definitions, Op};
+use crate::transform::sentient::analyses::{
+    EvaluatedValue, ExpressionEvaluator, PinningSchemeManager,
+};
+use crate::transform::sentient::utils::{ConstKind, is_constant};
 
-// crustify:todo: e421_updateConstantMutableAddr
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1908  (23 body lines, level 2)
-//   original  : void SimpleConstantDataTransferUpdater::updateConstantMutableAddr( const EvaluatedValue &new_immut_addr_ev)
-//   calls     : e009_createOffsetValue, e257_getBaseAddr
+impl SimpleConstantDataTransferUpdater {
+    /// Replaces: e420_updateImmutableAddr
+    ///
+    /// Pins the transfer's immutable address: the closest pinned address to its ONE constant base
+    /// address (`:1897-1899`) becomes `op`'s immutable-addr operand, and that answer is handed back
+    /// for the mutable half to re-base against.
+    ///
+    /// ⭐ THE ONE-ADDRESS `findClosestPinnedAddr` IS THE PAIR CALL WITH `X == Y` by its own body
+    /// (`Analyses/AddressPinningScheme.h:208-219`), so the base address goes in twice — this is the
+    /// degenerate case the toggle's [`super::ToggleDataTransferUpdater::update_immutable_addr`] warns
+    /// against, and here it is the correct one. `element_size` is in BITS, `ty` is
+    /// `mutable_addr_[0].get().getType()` (`:1029`).
+    pub fn update_immutable_addr(
+        self,
+        dtd: &DataTransferDescriptor,
+        op: &mut Op,
+        end: TransferEnd,
+        ty: ScalarTy,
+        ps_manager: &impl PinningSchemeManager,
+        element_size: Bits,
+    ) -> EvaluatedValue {
+        let Some(base_addr) = dtd.base_addr() else {
+            panic!(
+                "DT_CHECK(base_addrs_.size() == 1) (`:658`) for a simple constant holding {} base \
+                 address(es)",
+                dtd.base_addrs.len()
+            )
+        };
+        let new_immut_addr_ev =
+            ps_manager.find_closest_pinned_addr(base_addr, base_addr, dtd.region, element_size);
+        *immutable_addr_mut(op, end) = create_offset_value(new_immut_addr_ev, ty);
+        new_immut_addr_ev
+    }
 
+    /// Replaces: e421_updateConstantMutableAddr
+    ///
+    /// Re-bases the transfer's constant mutable address onto the address just pinned:
+    /// `(const_mutable_addr + base_addr) - new_immut_addr_ev` (`:1918-1920`) becomes the new
+    /// mutable-addr operand.
+    ///
+    /// ⭐ THE SUM RESTORES THE ABSOLUTE ADDRESS AND THE SUB RE-RELATIVISES IT: `mutable_addr_[0]` is
+    /// an offset from the OLD base, so it is only meaningful once `dtd_.getBaseAddr()` is added back.
+    /// ⛔ `overflowsRegister` TRUE IS THE ABORT (`:1924-1925`) — LAR/EAR cannot hold the new offset.
+    pub fn update_constant_mutable_addr(
+        self,
+        dtd: &DataTransferDescriptor,
+        op: &mut Op,
+        end: TransferEnd,
+        ty: ScalarTy,
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+        ps_manager: &impl PinningSchemeManager,
+        element_size: Bits,
+        new_immut_addr_ev: EvaluatedValue,
+    ) {
+        let mutable_addr = *mutable_addr_mut(op, end);
+        if !is_constant(mutable_addr, ConstKind::ScalarConstant, defs) {
+            panic!("DT_CHECK(\"Expect constant mutable addr\") (`:1911-1912`) for {mutable_addr:?}")
+        }
+        let Some(base_addr) = dtd.base_addr() else {
+            panic!(
+                "DT_CHECK(base_addrs_.size() == 1) (`:658`) for a simple constant holding {} base \
+                 address(es)",
+                dtd.base_addrs.len()
+            )
+        };
+        let const_ma_ev = evaluator.evaluate_value_handle(mutable_addr);
+        let absolute = evaluator.evaluate_sum_handle(const_ma_ev, base_addr);
+        let new_mut_addr_ev = evaluator.evaluate_sub_handle(absolute, new_immut_addr_ev);
+        if ps_manager.overflows_register(new_mut_addr_ev, element_size) {
+            panic!("DT_CHECK_MSG(\"LAR/EAR overflow detected\") (`:1924-1925`)")
+        }
+        *mutable_addr_mut(op, end) = create_offset_value(new_mut_addr_ev, ty);
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Elements;
+    use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
+    use crate::islands::sentient::dialects::{Val, sentient};
+    use crate::transform::sentient::analyses::{Evaluation, OffsetSites, RegionSite};
+
+    /// The transfer whose two addresses these updaters rewrite — `load_and_send` with the mutable
+    /// address `Val(1)` and the immutable address `Val(2)`.
+    fn load_and_send() -> Op {
+        Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr: Val(1),
+            immutable_addr: Val(2),
+            increment: Val(3),
+            consumer: SendEnd::to_self(Val(98)),
+            result: Val(4),
+            extent: sentient::Extent {
+                total_elements: Elements(64),
+                element_size: Bits(16),
+                chunk_size: Elements(1),
+                chunk_stride: Elements(1),
+                burst_size: Elements(1),
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    /// 420/656 — the ONE base address is offered to the pinning scheme as BOTH ends of the pair, and
+    /// its answer is handed back. ⛔ `create_offset_value` is `EvaluatedValue::buildOffsetValue`, out
+    /// of campaign scope, so the assignment stops there — the choice of address is what this checks.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e420_pins_the_single_constant_base_address_as_a_degenerate_pair() {
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn find_closest_pinned_addr(
+                &self,
+                ev_x: EvaluatedValue,
+                ev_y: EvaluatedValue,
+                region: RegionSite,
+                element_size: Bits,
+            ) -> EvaluatedValue {
+                assert_eq!((ev_x, ev_y), (EvaluatedValue(7), EvaluatedValue(7)));
+                assert_eq!(region, RegionSite::ProgramUnitBody);
+                assert_eq!(element_size, Bits(16));
+                EvaluatedValue(21)
+            }
+        }
+
+        let dtd = DataTransferDescriptor {
+            op: OpId::at(&[0]),
+            pattern_desc: None,
+            base_addrs: vec![EvaluatedValue(7)],
+            region: RegionSite::ProgramUnitBody,
+        };
+        let mut op = load_and_send();
+        SimpleConstantDataTransferUpdater.update_immutable_addr(
+            &dtd,
+            &mut op,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            &StatedScheme,
+            Bits(16),
+        );
+    }
+
+    /// 421/656 — the constant mutable address is summed with the old base and then reduced by the
+    /// newly pinned immutable address, and the overflow check sees THAT handle. ⛔ stops at
+    /// `buildOffsetValue`, as e420 does.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e421_rebases_the_constant_mutable_addr_onto_the_newly_pinned_immutable_addr() {
+        struct StatedEvaluator;
+
+        impl ExpressionEvaluator for StatedEvaluator {
+            fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+                unreachable!("the handle flavour is what a descriptor keeps")
+            }
+
+            fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+                unreachable!("the handle flavour is what a descriptor keeps")
+            }
+
+            fn build_offset_value(
+                &mut self,
+                _evaluation: &Evaluation,
+                _sites: &mut OffsetSites<'_>,
+                _walked: &mut Vec<Op>,
+                _ty: ScalarTy,
+            ) -> Val {
+                unreachable!("`create_offset_value` is the out-of-scope builder e421 reaches")
+            }
+
+            fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+                assert_eq!(value, Val(1));
+                EvaluatedValue(30)
+            }
+
+            fn evaluate_sum_handle(
+                &mut self,
+                lhs: EvaluatedValue,
+                rhs: EvaluatedValue,
+            ) -> EvaluatedValue {
+                assert_eq!((lhs, rhs), (EvaluatedValue(30), EvaluatedValue(7)));
+                EvaluatedValue(37)
+            }
+
+            fn evaluate_sub_handle(
+                &mut self,
+                lhs: EvaluatedValue,
+                rhs: EvaluatedValue,
+            ) -> EvaluatedValue {
+                assert_eq!((lhs, rhs), (EvaluatedValue(37), EvaluatedValue(21)));
+                EvaluatedValue(16)
+            }
+        }
+
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn find_closest_pinned_addr(
+                &self,
+                _ev_x: EvaluatedValue,
+                _ev_y: EvaluatedValue,
+                _region: RegionSite,
+                _element_size: Bits,
+            ) -> EvaluatedValue {
+                unreachable!("e421 does not pin")
+            }
+
+            fn overflows_register(&self, addr_ev: EvaluatedValue, element_size: Bits) -> bool {
+                assert_eq!((addr_ev, element_size), (EvaluatedValue(16), Bits(16)));
+                false
+            }
+        }
+
+        let dtd = DataTransferDescriptor {
+            op: OpId::at(&[0]),
+            pattern_desc: None,
+            base_addrs: vec![EvaluatedValue(7)],
+            region: RegionSite::ProgramUnitBody,
+        };
+        // `mutable_addr_[0]` is the `sentient.scalar_constant` the DT_CHECK insists on.
+        let body = [Op::Sentient(sentient::Op::ScalarConstant {
+            value: 512,
+            result: Val(1),
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })];
+        let mut op = load_and_send();
+        SimpleConstantDataTransferUpdater.update_constant_mutable_addr(
+            &dtd,
+            &mut op,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            Definitions::from_innermost(&[&body]),
+            &mut StatedEvaluator,
+            &StatedScheme,
+            Bits(16),
+            EvaluatedValue(21),
+        );
+    }
+}
