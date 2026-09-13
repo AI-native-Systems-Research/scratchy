@@ -216,6 +216,44 @@ impl OpAt {
         block_of(unit_body, &self.enclosing)?.get(self.index.0)
     }
 
+    /// The op at `index` of THIS path's own block — how a position found by scanning that block
+    /// becomes a path, for the ops that bind nothing to look one up by.
+    #[must_use]
+    pub fn sibling(&self, index: InBlock) -> OpAt {
+        OpAt {
+            enclosing: self.enclosing.clone(),
+            index,
+        }
+    }
+
+    /// The block this path's op sits in — the `Block *` every position in [`Self::index`]'s company
+    /// indexes, and what a use-walk over ONE block is asked of.
+    #[must_use]
+    pub fn block<'a>(&self, unit_body: &'a [Op]) -> Option<&'a [Op]> {
+        block_of(unit_body, &self.enclosing)
+    }
+
+    /// `Block::findAncestorOpInBlock(*other)` — where `other`'s own enclosing chain enters THIS path's
+    /// block, and `None` when `other` lies in no region of it.
+    #[must_use]
+    pub fn ancestor_in_block_of(&self, other: &OpAt) -> Option<InBlock> {
+        let depth = self.enclosing.len();
+        if other.enclosing.len() < depth || other.enclosing[..depth] != self.enclosing[..] {
+            return None;
+        }
+        Some(if other.enclosing.len() == depth {
+            other.index
+        } else {
+            other.enclosing[depth].0
+        })
+    }
+
+    /// The op this path names, mutably — the writing half of [`Self::op`], for the passes that set an
+    /// operand on a user they located by position (`Operation::setOperand`).
+    pub fn op_mut<'a>(&self, unit_body: &'a mut Vec<Op>) -> Option<&'a mut Op> {
+        block_of_mut(unit_body, &self.enclosing)?.get_mut(self.index.0)
+    }
+
     /// `OpBuilder::setInsertionPointAfter(op)` — the position immediately after this one, in the same
     /// block.
     #[must_use]
@@ -452,8 +490,9 @@ fn immediate_user<'a>(val: Val, scope: &'a [Op]) -> Option<&'a Op> {
     })
 }
 
-/// `Operation::remove()` — the first half of a `moveBefore`.
-fn remove_at(unit_body: &mut Vec<Op>, at: &OpAt) -> Option<Op> {
+/// `Operation::remove()` — the first half of a `moveBefore`, and on its own the `Operation::erase()`
+/// of an op named by a position rather than by a result.
+pub(crate) fn remove_at(unit_body: &mut Vec<Op>, at: &OpAt) -> Option<Op> {
     let block = block_of_mut(unit_body, &at.enclosing)?;
     (at.index.0 < block.len()).then(|| block.remove(at.index.0))
 }

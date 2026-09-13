@@ -93,10 +93,18 @@
 // file's driver, and every unit below is reachable only from the tests until it lands. CI runs clippy
 // with `-D warnings`. ⭐ REMOVE THIS WITH e573.
 
+use std::collections::BTreeMap;
+
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, set_value_reg_index, symbol, uniform,
+    Definitions, Op, Val, results, set_value_reg_index, symbol, uniform,
 };
+use crate::transform::sentient::ProgStitch;
+
+/// `std::map<SentientRegType, std::vector<int>> avoid_renumbering_regs` (`RegisterPacking.cpp:183`)
+/// — per register file, the indices that must survive this pass wearing the number they came in
+/// with, which e522 collects from the unit before it packs anything.
+pub type AvoidRenumbering = BTreeMap<ops::RegType, Vec<ops::RegIndex>>;
 
 /// ONE REGISTER-RELATED SSA VALUE THE PACKER TRACKS — the pass-local `RegIndex`
 /// (`RegisterPacking.cpp:60-92`), renamed because [`ops::RegIndex`] is the island's index type.
@@ -403,25 +411,213 @@ pub fn reg_with_type(reg_table: &mut Vec<TypedRegCollection>, reg_type: ops::Reg
     }
 }
 
-// crustify:todo: e459_computeNewRegisterIndices
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:182  (53 body lines, level 2)
-//   original  : void RegisterPackingPass::computeNewRegisterIndices( std::map<SentientRegType, std::vector<int>> &avoid_renumbering_regs)
-//   calls     : e132_setNewRegisterIndex, e252_size, e348_updateRegIndex
+/// WHICH OF e459'S THREE ORDERED PASSES OVER ONE REGISTER FILE IS RUNNING
+/// (`RegisterPacking.cpp:215-233`) — the order is the packing policy: the promoted registers whose
+/// value differs per unit get the low indices, then the promoted ones that agree, then the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackingRound {
+    /// `isHeaderPromoted() && !hasSameValueInAllUnits()`.
+    PromotedAndDiffering,
+    /// `isHeaderPromoted() && hasSameValueInAllUnits()`.
+    PromotedAndUniform,
+    /// `!isHeaderPromoted()`.
+    NotPromoted,
+}
 
-// crustify:todo: e460_runOnAllOps
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:275  (21 body lines, level 2)
-//   original  : void RegisterPackingPass::runOnAllOps(mlir::Operation *op)
-//   calls     : e135_getRegTypeAndIndex, e349_getRegWithType
+impl PackingRound {
+    /// Whether this round is the one that renumbers `reg`.
+    const fn selects(self, reg: &TrackedReg) -> bool {
+        match self {
+            PackingRound::PromotedAndDiffering => {
+                reg.header_promoted && !reg.same_value_in_all_units
+            }
+            PackingRound::PromotedAndUniform => reg.header_promoted && reg.same_value_in_all_units,
+            PackingRound::NotPromoted => !reg.header_promoted,
+        }
+    }
+}
 
-// crustify:todo: e461_runOnForOp
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:333  (38 body lines, level 2)
-//   original  : void RegisterPackingPass::runOnForOp(sentient::ForOp for_op)
-//   calls     : e135_getRegTypeAndIndex, e136_fillTypedRegCollection, e252_size, e349_getRegWithType
+/// The `getNextValidIdx` lambda (`RegisterPacking.cpp:203-214`) — the lowest index at or above `idx`
+/// that no avoided register already holds. It restarts the scan on every step, so the avoid list
+/// need not be sorted.
+fn next_valid_idx(avoid_list: &[ops::RegIndex], idx: u32) -> u32 {
+    let mut curr = idx;
+    let mut i = 0;
+    while i < avoid_list.len() {
+        if curr == avoid_list[i].get() {
+            curr += 1;
+            i = 0;
+        } else {
+            i += 1;
+        }
+    }
+    curr
+}
 
-// crustify:todo: e462_runOnCopyOp
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:373  (12 body lines, level 2)
-//   original  : void RegisterPackingPass::runOnCopyOp(sentient::CopyOp copy_op)
-//   calls     : e136_fillTypedRegCollection, e349_getRegWithType
+impl RegisterPacking {
+    /// Replaces: e459_computeNewRegisterIndices
+    ///
+    /// Chooses every tracked register's packed index, one register file at a time, in three ordered
+    /// rounds ([`PackingRound`]) that share one rising counter.
+    ///
+    /// ⚠️ TRAP: THE NEXT-VALID SCAN RUNS FOR EVERY REGISTER, EVEN ONE THIS ROUND SKIPS
+    /// (`RegisterPacking.cpp:216-218`), so an avoided index is stepped over as many times as the
+    /// file has registers — and the counter only rises when e348 says `suggested` was consumed.
+    /// ⚠️ TRAP: UNDER [`ProgStitch::Stitched`] `lbr` AND `ebr` ARE NOT PACKED AT ALL — every one of
+    /// their registers is handed its own old index back, which is what keeps the read-only files
+    /// agreeing across the stitched programs.
+    pub fn compute_new_register_indices(
+        &mut self,
+        stitching: ProgStitch,
+        avoid_renumbering_regs: &AvoidRenumbering,
+    ) {
+        for collection in &mut self.reg_table {
+            let reg_type = collection.reg_type;
+            if matches!(stitching, ProgStitch::Stitched)
+                && matches!(reg_type, ops::RegType::Lbr | ops::RegType::Ebr)
+            {
+                for reg in &mut collection.regs {
+                    reg.set_new_register_index(reg.old_index);
+                }
+                continue;
+            }
+            let avoid: &[ops::RegIndex] = avoid_renumbering_regs
+                .get(&reg_type)
+                .map_or(&[], Vec::as_slice);
+            for &no_renumbering_reg in avoid {
+                for reg in &mut collection.regs {
+                    if reg.old_index == Some(no_renumbering_reg) {
+                        reg.set_new_register_index(reg.old_index);
+                    }
+                }
+            }
+            let mut idx: u32 = 0;
+            for round in [
+                PackingRound::PromotedAndDiffering,
+                PackingRound::PromotedAndUniform,
+                PackingRound::NotPromoted,
+            ] {
+                for at in 0..collection.regs.len() {
+                    idx = next_valid_idx(avoid, idx);
+                    if round.selects(&collection.regs[at])
+                        && collection.update_reg_index(at, ops::RegIndex::allocated(idx))
+                    {
+                        idx += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl RegisterPacking {
+    /// Replaces: e460_runOnAllOps
+    ///
+    /// Tracks one register per result of an ordinary op, skipping the results whose locale is still
+    /// unassigned.
+    ///
+    /// ⭐ ONE LOOP FOR BOTH OF THE REFERENCE'S BRANCHES. Every op carrying the singular
+    /// `regIndex` binds exactly one result and e135 ignores `position` for those, so the singular
+    /// branch's `return` on an unknown locale and the plural branch's `continue` are the same skip.
+    /// ⭐ NOTHING PROMOTED REACHES HERE — a promoted register belongs to a `sentient.for` or a
+    /// `sentient.copy`, which e522 sends to e461/e462 instead.
+    pub fn run_on_all_ops(&mut self, op: &Op) {
+        for (position, result) in results(op).into_iter().enumerate() {
+            let Some(reg) = reg_type_and_index(op, position) else {
+                continue;
+            };
+            if reg.locale == ops::RegType::Unknown {
+                continue;
+            }
+            let at = reg_with_type(&mut self.reg_table, reg.locale);
+            self.reg_table[at]
+                .regs
+                .push(TrackedReg::new(result, reg.index));
+        }
+    }
+}
+
+impl RegisterPacking {
+    /// Replaces: e461_runOnForOp
+    ///
+    /// Tracks the two registers each carried value of a loop holds — its body argument, then its
+    /// result — deciding promotion from the value that ENTERS the loop.
+    ///
+    /// ⭐ `getNumInductionVars()` IS 1 (`SentientOps.td:91`), so the reference's `1 + idx` and
+    /// `1 + n + idx` positions are the two [`ops::Carried`] entries e135 already maps them to.
+    /// ⚠️ TRAP: ALL THE ARGUMENTS ARE TRACKED BEFORE ANY RESULT, and e459 packs a file in the order
+    /// its registers were pushed, so the two loops may not be fused.
+    pub fn run_on_for_op(&mut self, for_op: &Op, defs: Definitions<'_>) {
+        /// `for_op.getNumInductionVars()`.
+        const NUM_LCCR: usize = 1;
+        let Op::Sentient(ops::Op::For { carried, .. }) = for_op else {
+            return;
+        };
+        let sites = carried
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| (NUM_LCCR + idx, value.init, value.arg, value.program_header))
+            .chain(carried.iter().enumerate().map(|(idx, value)| {
+                (
+                    NUM_LCCR + carried.len() + idx,
+                    value.init,
+                    value.result,
+                    value.program_header,
+                )
+            }))
+            .collect::<Vec<_>>();
+        for (position, init_value, res_value, header_promoted) in sites {
+            let Some(reg) = reg_type_and_index(for_op, position) else {
+                continue;
+            };
+            if reg.locale == ops::RegType::Unknown {
+                continue;
+            }
+            let at = reg_with_type(&mut self.reg_table, reg.locale);
+            fill_typed_reg_collection(
+                &mut self.reg_table[at],
+                init_value,
+                res_value,
+                reg.index,
+                header_promoted,
+                defs,
+            );
+        }
+    }
+}
+
+impl RegisterPacking {
+    /// Replaces: e462_runOnCopyOp
+    ///
+    /// Tracks the one register a `sentient.copy` holds, promoted or not.
+    ///
+    /// ⭐ BOTH `hasAttr` GUARDS ARE DISCHARGED BY THE TYPE: an [`ops::Op::ScalarCopy`] always has a
+    /// `reg`, and an absent index is that field's own `None` rather than a missing attribute.
+    pub fn run_on_copy_op(&mut self, copy_op: &Op, defs: Definitions<'_>) {
+        let Op::Sentient(ops::Op::ScalarCopy {
+            input,
+            result,
+            reg,
+            program_header,
+            ..
+        }) = copy_op
+        else {
+            return;
+        };
+        if reg.locale == ops::RegType::Unknown {
+            return;
+        }
+        let at = reg_with_type(&mut self.reg_table, reg.locale);
+        fill_typed_reg_collection(
+            &mut self.reg_table[at],
+            *input,
+            *result,
+            reg.index,
+            *program_header,
+            defs,
+        );
+    }
+}
 
 // crustify:todo: e522_runOnProgramUnitOp
 //   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:388  (21 body lines, level 3)
@@ -676,5 +872,139 @@ mod unit_tests {
         assert_eq!(reg_table.len(), 2);
         assert_eq!(reg_with_type(&mut reg_table, ops::RegType::Ebr), 2);
         assert_eq!(reg_table[2], TypedRegCollection::new(ops::RegType::Ebr));
+    }
+    /// e459_computeNewRegisterIndices — the three rounds hand out 0, 2 and 3: the promoted register
+    /// whose value differs goes first, index 1 is avoided, and the plain register comes last.
+    #[test]
+    fn e459_compute_new_register_indices() {
+        let mut packing = RegisterPacking {
+            reg_table: vec![TypedRegCollection {
+                reg_type: ops::RegType::Lrf,
+                regs: vec![
+                    TrackedReg::new(Val(1), Some(ops::RegIndex::at::<4>())),
+                    TrackedReg::promoted(Val(2), Some(ops::RegIndex::at::<5>()), false),
+                    TrackedReg::promoted(Val(3), Some(ops::RegIndex::at::<6>()), true),
+                ],
+            }],
+        };
+        let avoid = AvoidRenumbering::from([(ops::RegType::Lrf, vec![ops::RegIndex::at::<1>()])]);
+        packing.compute_new_register_indices(ProgStitch::Standalone, &avoid);
+        let packed: Vec<_> = packing.reg_table[0]
+            .regs
+            .iter()
+            .map(|reg| reg.new_index)
+            .collect();
+        assert_eq!(
+            packed,
+            vec![
+                Some(ops::RegIndex::at::<3>()),
+                Some(ops::RegIndex::at::<0>()),
+                Some(ops::RegIndex::at::<2>()),
+            ]
+        );
+    }
+
+    /// e459_computeNewRegisterIndices — under stitching `ebr` keeps every index it came in with,
+    /// while a file that is not read-only is packed as usual.
+    #[test]
+    fn e459_stitched_read_only_files_are_not_packed() {
+        let mut packing = RegisterPacking {
+            reg_table: vec![
+                TypedRegCollection {
+                    reg_type: ops::RegType::Ebr,
+                    regs: vec![TrackedReg::new(Val(1), Some(ops::RegIndex::at::<9>()))],
+                },
+                TypedRegCollection {
+                    reg_type: ops::RegType::Lrf,
+                    regs: vec![TrackedReg::new(Val(2), Some(ops::RegIndex::at::<9>()))],
+                },
+            ],
+        };
+        packing.compute_new_register_indices(ProgStitch::Stitched, &AvoidRenumbering::new());
+        assert_eq!(
+            packing.reg_table[0].regs[0].new_index,
+            Some(ops::RegIndex::at::<9>())
+        );
+        assert_eq!(
+            packing.reg_table[1].regs[0].new_index,
+            Some(ops::RegIndex::at::<0>())
+        );
+    }
+
+    /// e460_runOnAllOps — the register an op holds is tracked against the result that holds it, and
+    /// an unassigned locale is tracked nowhere.
+    #[test]
+    fn e460_run_on_all_ops() {
+        let mut packing = RegisterPacking::default();
+        packing.run_on_all_ops(&scalar_copy(
+            Val(9),
+            ops::RegType::Lrf,
+            Some(ops::RegIndex::at::<4>()),
+        ));
+        assert_eq!(
+            packing.reg_table,
+            vec![TypedRegCollection {
+                reg_type: ops::RegType::Lrf,
+                regs: vec![TrackedReg::new(Val(9), Some(ops::RegIndex::at::<4>()))],
+            }]
+        );
+
+        packing.run_on_all_ops(&scalar_copy(Val(10), ops::RegType::Unknown, None));
+        assert_eq!(packing.reg_table.len(), 1);
+        assert_eq!(packing.reg_table[0].regs.len(), 1);
+    }
+
+    /// e461_runOnForOp — the loop's carried value is tracked twice, its body argument before its
+    /// result, and the carried value whose locale is unassigned is skipped in both loops.
+    #[test]
+    fn e461_run_on_for_op() {
+        let regions: [&[Op]; 0] = [];
+        let mut packing = RegisterPacking::default();
+        packing.run_on_for_op(
+            &for_op(ops::RegType::Lrf, ops::RegType::Unknown),
+            Definitions::from_innermost(&regions),
+        );
+        assert_eq!(
+            packing.reg_table,
+            vec![TypedRegCollection {
+                reg_type: ops::RegType::Lrf,
+                regs: vec![TrackedReg::new(Val(4), None), TrackedReg::new(Val(5), None)],
+            }]
+        );
+    }
+
+    /// e462_runOnCopyOp — a promoted copy initialised by a `sentient.scalar_constant` is tracked as
+    /// holding the same value in every unit, and an unassigned locale is not tracked at all.
+    #[test]
+    fn e462_run_on_copy_op() {
+        let unit = vec![scalar_constant(Val(0), 7)];
+        let regions: [&[Op]; 1] = [&unit];
+        let defs = Definitions::from_innermost(&regions);
+        let promoted = Op::Sentient(ops::Op::ScalarCopy {
+            input: Val(0),
+            result: Val(9),
+            reg: ops::Reg {
+                locale: ops::RegType::Lrf,
+                index: Some(ops::RegIndex::at::<4>()),
+            },
+            element_size: None,
+            program_header: true,
+        });
+        let mut packing = RegisterPacking::default();
+        packing.run_on_copy_op(&promoted, defs);
+        assert_eq!(
+            packing.reg_table,
+            vec![TypedRegCollection {
+                reg_type: ops::RegType::Lrf,
+                regs: vec![TrackedReg::promoted(
+                    Val(9),
+                    Some(ops::RegIndex::at::<4>()),
+                    true
+                )],
+            }]
+        );
+
+        packing.run_on_copy_op(&scalar_copy(Val(10), ops::RegType::Unknown, None), defs);
+        assert_eq!(packing.reg_table.len(), 1);
     }
 }

@@ -86,8 +86,11 @@
 // ⭐ REMOVE THIS WITH `e525_runOnOperation`: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
-use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient, use_count};
-use crate::transform::sentient::utils::{self, ConstKind};
+use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, Op, Val, sentient, use_count,
+};
+use crate::transform::sentient::utils::{self, ConstKind, OpAt};
 
 /// A VALUE SOME ENCLOSING REGION BINDS AS A RESULT — `DT_CHECK_MSG(!isa<BlockArgument>(v), "Function
 /// should not be called on an iter arg")` (`:83-84`) AS THE PARAMETER TYPE.
@@ -242,10 +245,132 @@ pub fn increases_operand_liverange(
     })
 }
 
-// crustify:todo: e464_runOn
-//   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:175  (42 body lines, level 2)
-//   original  : void RematerializationPass::runOn(dataflow::ProgramUnitOp unit_op)
-//   calls     : e145_isCandidateForRematerialization, e353_increasesOperandLiverange
+/// THE CANDIDATES OF ONE PROGRAM UNIT, PRE-ORDER — `unit_op.walk<WalkOrder::PreOrder>` (`:177-179`),
+/// naming each by the one result it binds so that the answer survives the rewrites that follow.
+fn candidates(block: &[Op], defs: Definitions<'_>, into: &mut Vec<Val>) {
+    for op in block {
+        if is_candidate_for_rematerialization(op, defs) {
+            // `op->getResults()[0]` — all three candidate ops bind exactly one result.
+            if let Some(&result) = dialects::results(op).first() {
+                into.push(result);
+            }
+        }
+        for region in dialects::regions_ref(op) {
+            candidates(region, defs, into);
+        }
+    }
+}
+
+/// `result.getUses()` — every `(owner, use.getOperandNumber())` that reads `val`, in pre-order.
+fn uses_of(
+    block: &[Op],
+    val: Val,
+    enclosing: &mut Vec<(utils::InBlock, usize)>,
+    into: &mut Vec<(OpAt, usize)>,
+) {
+    for (index, op) in block.iter().enumerate() {
+        for (operand_number, operand) in dialects::operands(op).into_iter().enumerate() {
+            if operand == val {
+                into.push((OpAt::at(enclosing, utils::InBlock(index)), operand_number));
+            }
+        }
+        for (region, inner) in dialects::regions_ref(op).into_iter().enumerate() {
+            enclosing.push((utils::InBlock(index), region));
+            uses_of(inner, val, enclosing, into);
+            enclosing.pop();
+        }
+    }
+}
+
+/// Replaces: e464_runOn
+///
+/// Clones every rematerialization candidate in front of each of its uses, then erases the original
+/// once nothing reads it.
+///
+/// ⛔⛔ `AllowOperandLiveRangeIncrease` IS A CONST GENERIC BECAUSE IT DECIDES WHICH OPS EXIST: with it
+/// `false` a clone is only made where the operands are already dead, so it REMOVES clones rather than
+/// being consulted, and it is what makes [`increases_operand_liverange`] reachable at all. It is a
+/// `cl::opt<bool>` with `cl::init(true)` read at `:192` alone.
+/// ⛔ TRAP: THE CLONES GO IN IN REVERSE PRE-ORDER, and that is what keeps the paths of the remaining
+/// uses valid — inserting at a position only shifts what sits at or after it, and every earlier use is
+/// either at a smaller index in that block or diverges from it at a smaller index.
+/// ⚠️ TRAP: A USE THAT IMMEDIATELY FOLLOWS THE CANDIDATE IS LEFT ALONE (`:186`), so a chain of uses
+/// keeps the original for its first reader and clones for the rest.
+pub fn run_on<const ALLOW_OPERAND_LIVE_RANGE_INCREASE: bool>(
+    unit_body: &mut Vec<Op>,
+    values: &mut Values,
+) {
+    let candidate_results = {
+        let scope: [&[Op]; 1] = [unit_body.as_slice()];
+        let mut found = Vec::new();
+        candidates(unit_body, Definitions::from_innermost(&scope), &mut found);
+        found
+    };
+
+    for result in candidate_results {
+        let to_replace = {
+            let Some(cand_at) = utils::path_of(unit_body, result) else {
+                continue;
+            };
+            let scope: [&[Op]; 1] = [unit_body.as_slice()];
+            let defs = Definitions::from_innermost(&scope);
+            let Some(cand_op) = cand_at.op(unit_body) else {
+                continue;
+            };
+            let Some(cand_block) = cand_at.block(unit_body) else {
+                continue;
+            };
+            let next = cand_at.next();
+            let mut uses = Vec::new();
+            uses_of(unit_body, result, &mut Vec::new(), &mut uses);
+            uses.retain(|(owner_at, _)| {
+                if *owner_at == next {
+                    return false;
+                }
+                if ALLOW_OPERAND_LIVE_RANGE_INCREASE {
+                    return true;
+                }
+                match cand_at.ancestor_in_block_of(owner_at) {
+                    Some(utils::InBlock(index)) => {
+                        !increases_operand_liverange(cand_op, InBlock::at(index), cand_block, defs)
+                    }
+                    // No ancestor in the candidate's block: the use is unreachable from it, which
+                    // dominance makes impossible for a value the block defines.
+                    None => false,
+                }
+            });
+            uses
+        };
+
+        for (owner_at, operand_number) in to_replace.into_iter().rev() {
+            // Re-derived per clone: the original never moves (every use follows it), and this is what
+            // says so.
+            let Some(original) = utils::path_of(unit_body, result)
+                .and_then(|at| at.op(unit_body))
+                .cloned()
+            else {
+                break;
+            };
+            let mut mapping = ValueMapping::new();
+            let Some(cloned) =
+                dialects::clone_ops(core::slice::from_ref(&original), values, &mut mapping).pop()
+            else {
+                break;
+            };
+            let cloned_result = dialects::results(&cloned).first().copied();
+            utils::insert_at(unit_body, &owner_at, cloned);
+            // `OpBuilder builder(owner)` inserted IN FRONT OF the owner, which shifted it by one.
+            let owner_now = owner_at.next();
+            if let (Some(new_result), Some(op)) = (cloned_result, owner_now.op_mut(unit_body)) {
+                dialects::set_operand(op, operand_number, new_result);
+            }
+        }
+
+        if use_count(result, unit_body) == 0 {
+            dialects::erase_defining_op(unit_body, result);
+        }
+    }
+}
 
 // crustify:todo: e525_runOnOperation
 //   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:163  (11 body lines, level 3)
@@ -256,10 +381,13 @@ pub fn increases_operand_liverange(
 mod unit_tests {
     use super::{
         Defined, InBlock, increases_operand_liverange, is_candidate_for_rematerialization,
-        last_use_within_block,
+        last_use_within_block, run_on,
     };
+    use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+    use crate::islands::sentient::dialects::{
+        self as dialects, Definitions, Op, Val, sentient, use_count,
+    };
 
     /// `%r = sentient.scalar_constant {value = 1 : si64} : index`.
     fn constant(result: Val) -> Op {
@@ -436,5 +564,66 @@ mod unit_tests {
         // The `DT_CHECK_MSG` this type replaces: an iter arg has no defining op anywhere in scope.
         assert_eq!(Defined::of(Val(21), defs), None);
         assert_eq!(Defined::of(elsewhere, defs), None);
+    }
+    /// e464 — the second use gets a clone of its own and the first keeps the original, which therefore
+    /// survives; the reader's operand is the clone's result.
+    #[test]
+    fn e464_run_on_clones_the_candidate_before_every_later_use() {
+        let mut values = Values::default();
+        for _ in 0..6 {
+            let _ = values.mint();
+        }
+        // %0 = constant, %1 = copy %0 (the candidate), %2 = mul %1 %0, %3 = mul %1 %0. The readers
+        // are `mul`s because a candidate with no reader of its own is erased below.
+        let mut body = vec![
+            constant(Val(0)),
+            copy(Val(0), Val(1)),
+            mul(Val(1), Val(0), Val(2)),
+            mul(Val(1), Val(0), Val(3)),
+        ];
+        run_on::<true>(&mut body, &mut values);
+
+        assert_eq!(body.len(), 5);
+        // The immediately following use kept the original copy.
+        assert_eq!(dialects::operands(&body[2]), vec![Val(1), Val(0)]);
+        // The later use reads the clone that now sits in front of it.
+        let cloned = dialects::results(&body[3])[0];
+        assert!(matches!(
+            &body[3],
+            Op::Sentient(sentient::Op::ScalarCopy { .. })
+        ));
+        assert_eq!(dialects::operands(&body[4]), vec![cloned, Val(0)]);
+    }
+
+    /// e464 — the original is erased once every use has taken a clone.
+    #[test]
+    fn e464_run_on_erases_a_candidate_nothing_reads_any_more() {
+        let mut values = Values::default();
+        for _ in 0..6 {
+            let _ = values.mint();
+        }
+        // The one use does not immediately follow the candidate, so it is rematerialized and the
+        // original is left with no reader.
+        let mut body = vec![
+            constant(Val(0)),
+            copy(Val(0), Val(1)),
+            constant(Val(4)),
+            mul(Val(1), Val(4), Val(2)),
+        ];
+        run_on::<true>(&mut body, &mut values);
+
+        assert_eq!(body.len(), 4);
+        assert!(matches!(
+            &body[0],
+            Op::Sentient(sentient::Op::ScalarConstant { .. })
+        ));
+        assert!(matches!(
+            &body[1],
+            Op::Sentient(sentient::Op::ScalarConstant { .. })
+        ));
+        let cloned = dialects::results(&body[2])[0];
+        assert_ne!(cloned, Val(1));
+        assert_eq!(dialects::operands(&body[3]), vec![cloned, Val(4)]);
+        assert_eq!(use_count(Val(1), &body), 0);
     }
 }

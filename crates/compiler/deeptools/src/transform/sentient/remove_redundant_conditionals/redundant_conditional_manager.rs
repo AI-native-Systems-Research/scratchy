@@ -85,7 +85,16 @@
 // ⭐ REMOVE THIS WITH `e575_runOnOperation`: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
-use crate::islands::sentient::dialects::{Definitions, Op, sentient};
+use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
+    DbgNamePrefix, new_dbg_name_from_list,
+};
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, Op, Val, sentient, use_count,
+};
+use crate::transform::sentient::ForRef;
+use crate::transform::sentient::utils::{self, InBlock, OpAt};
 
 /// `typedef int64_t WidestIntType` (`:52`) — the width the pass compares yielded constants at.
 ///
@@ -157,15 +166,353 @@ fn yielded_constant(body: &[Op], idx: usize, defs: Definitions<'_>) -> Option<Wi
     }
 }
 
-// crustify:todo: e465_updateIfOpBasedOnParentIfOp
-//   authority : dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:151  (65 body lines, level 2)
-//   original  : void RedundantConditionalManager::updateIfOpBasedOnParentIfOp()
-//   calls     : e244_negatePredicate, e354_getReturnValsIfSimpleConditional
+/// ONE OP THE MANAGER QUEUED FOR `erase()` — `llvm::SmallVector<Operation *, 4>& to_be_deleted_`.
+///
+/// ⛔⛔ AN IDENTITY AND NEVER A PATH: the queue is drained only after the WHOLE conditional-tree walk
+/// (`:319`), by which time every position in it has moved. A [`Val`] is minted once, so it still names
+/// the op that binds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Doomed {
+    /// A `sentient.if`, named by the first result it binds.
+    If(Val),
+    /// A `sentient.for`, which binds nothing here — named by its induction variable ([`ForRef`]).
+    For(ForRef),
+}
 
-// crustify:todo: e466_updateIfOpFeedingDynLoopBound
-//   authority : dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:217  (77 body lines, level 2)
-//   original  : void RedundantConditionalManager::updateIfOpFeedingDynLoopBound()
-//   calls     : e244_negatePredicate, e354_getReturnValsIfSimpleConditional
+/// WHAT THE PARENT CONDITIONAL LETS THIS ONE DO — the two arms of `:172` and `:194` as one answer, so
+/// that every read of the IR happens before the first write to it.
+#[derive(Debug, Clone)]
+enum ParentFold {
+    /// The parent yields the same value in both branches: its result is that value.
+    SameBothBranches {
+        /// `parent_if_op.getResult(result_idx)`.
+        parent_result: Val,
+        /// The operand the then-region yields there — a constant defined OUTSIDE both regions.
+        value: Val,
+    },
+    /// The child's condition becomes the parent's, or its negation.
+    TakeParentPredicate {
+        /// `parent_if_op.getPredicate()`, negated when the child matched the ELSE constant.
+        predicate: sentient::CmpPredicate,
+        /// `parent_if_op.getOperand(0)`.
+        lhs: Val,
+        /// `parent_if_op.getOperand(1)`.
+        rhs: Val,
+        /// The `RRC(parent, child)` name, or `None` when either op has none.
+        dbg_name: Option<String>,
+    },
+}
+
+/// The fold plus the parent results `parent_if_op.use_empty()` is asked of.
+#[derive(Debug, Clone)]
+struct Fold {
+    action: ParentFold,
+    parent_results: Vec<Val>,
+}
+
+/// Everything e465 reads before it writes anything — `None` at each of the reference's five refusals.
+fn parent_fold(
+    unit_body: &[Op],
+    if_at: &OpAt,
+    non_const_side: Val,
+    const_val: WidestInt,
+) -> Option<Fold> {
+    let scope: [&[Op]; 1] = [unit_body];
+    let defs = Definitions::from_innermost(&scope);
+    let Op::Sentient(sentient::Op::If {
+        predicate,
+        lhs,
+        rhs,
+        dbg_name: child_dbg_name,
+        ..
+    }) = if_at.op(unit_body)?
+    else {
+        return None;
+    };
+    // `isa<BlockArgument>` on either side of the child's predicate — a region argument is bound by no
+    // op — and the `eq`-only guard.
+    if defs.of(*lhs).is_none()
+        || defs.of(*rhs).is_none()
+        || *predicate != sentient::CmpPredicate::Eq
+    {
+        return None;
+    }
+    let parent = defs.of(non_const_side)?;
+    let Op::Sentient(sentient::Op::If {
+        predicate: parent_predicate,
+        lhs: parent_lhs,
+        rhs: parent_rhs,
+        yielded,
+        dbg_name: parent_dbg_name,
+        then_body,
+        ..
+    }) = parent
+    else {
+        return None;
+    };
+    let result_idx = yielded
+        .iter()
+        .position(|value| value.result == non_const_side)?;
+    let parent_results: Vec<Val> = yielded.iter().map(|value| value.result).collect();
+    let (then_val, else_val) =
+        get_return_vals_if_simple_conditional(IfOp::of(parent)?, result_idx, defs)?;
+    if then_val == else_val {
+        let Some(Op::Sentient(sentient::Op::Yield { results })) = then_body.first() else {
+            return None;
+        };
+        return Some(Fold {
+            action: ParentFold::SameBothBranches {
+                parent_result: non_const_side,
+                value: *results.get(result_idx)?,
+            },
+            parent_results,
+        });
+    }
+    if const_val != then_val && const_val != else_val {
+        return None;
+    }
+    let negate_parent_predicate = const_val == else_val;
+    Some(Fold {
+        action: ParentFold::TakeParentPredicate {
+            predicate: if negate_parent_predicate {
+                utils::negate_predicate(*parent_predicate)
+            } else {
+                *parent_predicate
+            },
+            lhs: *parent_lhs,
+            rhs: *parent_rhs,
+            dbg_name: new_dbg_name_from_list(
+                DbgNamePrefix::Rrc,
+                parent_dbg_name.as_deref(),
+                &[child_dbg_name.as_deref()],
+            ),
+        },
+        parent_results,
+    })
+}
+
+/// Replaces: e465_updateIfOpBasedOnParentIfOp
+///
+/// Gives this conditional its parent's condition (negated when it tested the parent's ELSE constant),
+/// or folds a parent that yields one value in both branches away, and queues the parent once dead.
+///
+/// ⛔ TRAP: A `None` DEBUG NAME LEAVES THE CHILD'S OWN NAME ALONE — `setDbgNameAttr(op, nullptr)`
+/// would REMOVE the attribute, which is why the reference guards the call with `if (StringAttr ..)`.
+/// ⭐ `OpBuilder builder(if_op_)` (`:155`) IS DEAD IN THE REFERENCE: nothing is created here.
+pub fn update_if_op_based_on_parent_if_op(
+    unit_body: &mut Vec<Op>,
+    if_at: &OpAt,
+    non_const_side: Val,
+    const_val: WidestInt,
+    to_be_deleted: &mut Vec<Doomed>,
+) {
+    let Some(fold) = parent_fold(unit_body, if_at, non_const_side, const_val) else {
+        return;
+    };
+    match fold.action {
+        ParentFold::SameBothBranches {
+            parent_result,
+            value,
+        } => dialects::replace_all_uses_with(unit_body, parent_result, value),
+        ParentFold::TakeParentPredicate {
+            predicate: new_predicate,
+            lhs: new_lhs,
+            rhs: new_rhs,
+            dbg_name: new_dbg_name,
+        } => {
+            if let Some(Op::Sentient(sentient::Op::If {
+                predicate,
+                lhs,
+                rhs,
+                dbg_name,
+                ..
+            })) = if_at.op_mut(unit_body)
+            {
+                *predicate = new_predicate;
+                *lhs = new_lhs;
+                *rhs = new_rhs;
+                if let Some(name) = new_dbg_name {
+                    *dbg_name = Some(name);
+                }
+            }
+        }
+    }
+    if fold
+        .parent_results
+        .iter()
+        .all(|val| use_count(*val, unit_body) == 0)
+    {
+        if let Some(&first) = fold.parent_results.first() {
+            to_be_deleted.push(Doomed::If(first));
+        }
+    }
+}
+
+/// Everything e466 reads before it writes anything — the conditional, its one loop and the bound.
+#[derive(Debug, Clone)]
+struct FuseLoop {
+    /// `if_op_.getResult(0)`.
+    if_result: Val,
+    /// Where the loop sits in the conditional's own block.
+    for_index: InBlock,
+    /// The loop's induction variable — its identity once it is queued.
+    iv: Val,
+    /// The new conditional's predicate, negated when the then-branch was the zero one.
+    predicate: sentient::CmpPredicate,
+    /// `if_op_.getLhs()`.
+    lhs: Val,
+    /// `if_op_.getRhs()`.
+    rhs: Val,
+    /// `getDbgNameAttr(if_op_)`, copied onto the new conditional.
+    dbg_name: Option<String>,
+    /// `nonzero_ret_val`.
+    bound: WidestInt,
+}
+
+/// The four refusals of `:219-232` as one `None`.
+fn fuse_plan(unit_body: &[Op], if_at: &OpAt) -> Option<FuseLoop> {
+    let scope: [&[Op]; 1] = [unit_body];
+    let defs = Definitions::from_innermost(&scope);
+    let if_op = if_at.op(unit_body)?;
+    let Op::Sentient(sentient::Op::If {
+        predicate,
+        lhs,
+        rhs,
+        yielded,
+        dbg_name,
+        ..
+    }) = if_op
+    else {
+        return None;
+    };
+    let [only] = yielded.as_slice() else {
+        return None;
+    };
+    if use_count(only.result, unit_body) != 1 {
+        return None;
+    }
+    // The one user, a result-less `sentient.for` bound by it, IN THE CONDITIONAL'S OWN BLOCK — a use
+    // anywhere else is a user whose `getBlock()` differs, which the reference declines.
+    let (for_index, iv) = if_at
+        .block(unit_body)?
+        .iter()
+        .enumerate()
+        .find_map(|(index, op)| match op {
+            Op::Sentient(sentient::Op::For {
+                iv, bound, carried, ..
+            }) if *bound == only.result && carried.is_empty() => Some((InBlock(index), *iv)),
+            _ => None,
+        })?;
+    let (then_val, else_val) = get_return_vals_if_simple_conditional(IfOp::of(if_op)?, 0, defs)?;
+    if then_val != 0 && else_val != 0 {
+        return None;
+    }
+    // `DT_CHECK_MSG(first != second, "Expect conditionals yielding the same value in both branches to
+    // have been cleaned up")` — with one side zero, equal means both are, and e465's own fold is what
+    // removes that conditional. Nothing to fuse rather than an abort.
+    if then_val == else_val {
+        return None;
+    }
+    let to_negate_predicate = then_val == 0;
+    Some(FuseLoop {
+        if_result: only.result,
+        for_index,
+        iv,
+        predicate: if to_negate_predicate {
+            utils::negate_predicate(*predicate)
+        } else {
+            *predicate
+        },
+        lhs: *lhs,
+        rhs: *rhs,
+        dbg_name: dbg_name.clone(),
+        bound: if to_negate_predicate {
+            else_val
+        } else {
+            then_val
+        },
+    })
+}
+
+/// Replaces: e466_updateIfOpFeedingDynLoopBound
+///
+/// Fuses a loop whose dynamic bound is this conditional into the branch that gives it a NON-ZERO
+/// bound: a fresh result-less conditional after it takes the loop (or, at a bound of one, the loop's
+/// body), the loop's bound becomes that constant, and both old ops are queued.
+///
+/// ⭐ AN EMPTY `else_body` IS THE REFERENCE'S ELSE REGION WITH NO BLOCK IN IT — see
+/// [`sentient::Op::If`], where empty means there is no `else` at all.
+/// ⚠️ TRAP: THE LOOP SITS TWO POSITIONS LOWER once the constant and the new conditional are in, which
+/// is where the reference's `Operation *` needs no adjustment and a path does.
+/// ⚠️ TRAP: AT A BOUND OF ONE THE LOOP'S OWN BODY IS MOVED OUT of it, up to but not including its
+/// yield, and the emptied loop is queued — its induction variable goes with it.
+pub fn update_if_op_feeding_dyn_loop_bound(
+    unit_body: &mut Vec<Op>,
+    if_at: &OpAt,
+    to_be_deleted: &mut Vec<Doomed>,
+    values: &mut Values,
+) {
+    let Some(plan) = fuse_plan(unit_body, if_at) else {
+        return;
+    };
+    let new_loop_bound = values.mint();
+    let for_at = if_at.sibling(plan.for_index);
+    if let Some(Op::Sentient(sentient::Op::For { bound, .. })) = for_at.op_mut(unit_body) {
+        *bound = new_loop_bound;
+    }
+    // `setInsertionPointAfter(if_op_)`, then the constant and the conditional in creation order.
+    let constant_at = if_at.next();
+    utils::insert_at(
+        unit_body,
+        &constant_at,
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value: plan.bound,
+            result: new_loop_bound,
+            // `ConstantOp`'s own default, which this creation does not override, and a loop bound is
+            // an `index`.
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        }),
+    );
+    let new_if_at = constant_at.next();
+    utils::insert_at(
+        unit_body,
+        &new_if_at,
+        Op::Sentient(sentient::Op::If {
+            predicate: plan.predicate,
+            lhs: plan.lhs,
+            rhs: plan.rhs,
+            // No results, so no `regLocales` either.
+            yielded: Vec::new(),
+            dbg_name: plan.dbg_name,
+            then_body: vec![Op::Sentient(sentient::Op::Yield {
+                results: Vec::new(),
+            })],
+            else_body: Vec::new(),
+        }),
+    );
+    let for_now = if_at.sibling(InBlock(plan.for_index.0 + 2));
+    let moved = if plan.bound == 1 {
+        to_be_deleted.push(Doomed::For(ForRef(plan.iv)));
+        match for_now.op_mut(unit_body) {
+            Some(Op::Sentient(sentient::Op::For { body, .. })) => {
+                let upto = body
+                    .iter()
+                    .position(|op| matches!(op, Op::Sentient(sentient::Op::Yield { .. })))
+                    .unwrap_or(body.len());
+                body.drain(..upto).collect()
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        utils::remove_at(unit_body, &for_now).map_or_else(Vec::new, |op| vec![op])
+    };
+    if let Some(Op::Sentient(sentient::Op::If { then_body, .. })) = new_if_at.op_mut(unit_body) {
+        then_body.splice(0..0, moved);
+    }
+    to_be_deleted.push(Doomed::If(plan.if_result));
+}
 
 // crustify:todo: e526_processIfOp
 //   authority : dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:98  (22 body lines, level 3)
@@ -174,9 +521,15 @@ fn yielded_constant(body: &[Op], idx: usize, defs: Definitions<'_>) -> Option<Wi
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{IfOp, get_return_vals_if_simple_conditional};
+    use super::{
+        Doomed, IfOp, get_return_vals_if_simple_conditional, update_if_op_based_on_parent_if_op,
+        update_if_op_feeding_dyn_loop_bound,
+    };
+    use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+    use crate::transform::sentient::ForRef;
+    use crate::transform::sentient::utils::{InBlock, OpAt};
 
     /// `%r = sentient.scalar_constant {value = <value>} : index`.
     fn constant(result: Val, value: i64) -> Op {
@@ -253,5 +606,212 @@ mod unit_tests {
         );
         // ⛔ AND ONLY A `sentient.if` IS A WITNESS.
         assert!(IfOp::of(&body[0]).is_none());
+    }
+
+    /// `%r = sentient.if <predicate>(%lhs, %rhs) { <then> } else { <else> }`, named.
+    fn cond(
+        result: Val,
+        predicate: sentient::CmpPredicate,
+        (lhs, rhs): (Val, Val),
+        dbg_name: Option<&str>,
+        then_body: Vec<Op>,
+        else_body: Vec<Op>,
+    ) -> Op {
+        Op::Sentient(sentient::Op::If {
+            predicate,
+            lhs,
+            rhs,
+            yielded: vec![sentient::Yielded {
+                result,
+                reg: sentient::Reg {
+                    locale: sentient::RegType::Unknown,
+                    index: None,
+                },
+            }],
+            dbg_name: dbg_name.map(String::from),
+            then_body,
+            else_body,
+        })
+    }
+
+    /// `sentient.for %iv = %bound { <body> }`, carrying nothing.
+    fn for_op(iv: Val, bound: Val, body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
+            bound_reg: None,
+            carried: Vec::new(),
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// `e465` — the child takes the NEGATION of its parent's predicate because it tested the ELSE
+    /// constant, gains the parent's operands and the `RRC(..)` name, and the dead parent is queued.
+    #[test]
+    fn a_child_conditional_takes_over_the_predicate_that_decided_its_operand() {
+        let (a, b, c5, c9) = (Val(0), Val(1), Val(2), Val(3));
+        let (parent_result, child_result) = (Val(4), Val(5));
+        let mut body = vec![
+            constant(a, 3),
+            constant(b, 4),
+            constant(c5, 5),
+            constant(c9, 9),
+            cond(
+                parent_result,
+                sentient::CmpPredicate::Slt,
+                (a, b),
+                Some("p"),
+                vec![yield_op(vec![c5])],
+                vec![yield_op(vec![c9])],
+            ),
+            cond(
+                child_result,
+                sentient::CmpPredicate::Eq,
+                (parent_result, c9),
+                Some("c"),
+                vec![yield_op(vec![c5])],
+                vec![yield_op(vec![c9])],
+            ),
+        ];
+        let child_at = OpAt::top(InBlock(5));
+        let mut to_be_deleted = Vec::new();
+        update_if_op_based_on_parent_if_op(
+            &mut body,
+            &child_at,
+            parent_result,
+            9,
+            &mut to_be_deleted,
+        );
+        let Op::Sentient(sentient::Op::If {
+            predicate,
+            lhs,
+            rhs,
+            dbg_name,
+            ..
+        }) = &body[5]
+        else {
+            panic!("the child is still a sentient.if");
+        };
+        assert_eq!(*predicate, sentient::CmpPredicate::Sge);
+        assert_eq!((*lhs, *rhs), (a, b));
+        assert_eq!(dbg_name.as_deref(), Some("RRC(p, c)"));
+        assert_eq!(to_be_deleted, vec![Doomed::If(parent_result)]);
+    }
+
+    /// `e466` — the loop moves into the then-branch of a fresh result-less conditional whose
+    /// predicate is negated (the then-branch yielded the zero bound), reading the new constant.
+    #[test]
+    fn a_loop_bound_by_a_conditional_moves_into_its_nonzero_branch() {
+        let (a, b, zero, four) = (Val(0), Val(1), Val(2), Val(3));
+        let (if_result, iv) = (Val(4), Val(5));
+        let mut body = vec![
+            constant(a, 3),
+            constant(b, 4),
+            constant(zero, 0),
+            constant(four, 4),
+            cond(
+                if_result,
+                sentient::CmpPredicate::Slt,
+                (a, b),
+                Some("dyn"),
+                vec![yield_op(vec![zero])],
+                vec![yield_op(vec![four])],
+            ),
+            for_op(iv, if_result, vec![constant(Val(6), 1), yield_op(vec![])]),
+        ];
+        let mut values = Values::default();
+        // Val(0)..=Val(6) are taken above.
+        for _ in 0..7 {
+            let _ = values.mint();
+        }
+        let mut to_be_deleted = Vec::new();
+        update_if_op_feeding_dyn_loop_bound(
+            &mut body,
+            &OpAt::top(InBlock(4)),
+            &mut to_be_deleted,
+            &mut values,
+        );
+        assert_eq!(body.len(), 7);
+        let Op::Sentient(sentient::Op::ScalarConstant { value, result, .. }) = &body[5] else {
+            panic!("the non-zero bound is a fresh constant right after the old conditional");
+        };
+        let (bound_value, new_bound) = (*value, *result);
+        assert_eq!(bound_value, 4);
+        let Op::Sentient(sentient::Op::If {
+            predicate,
+            lhs,
+            rhs,
+            yielded,
+            dbg_name,
+            then_body,
+            else_body,
+        }) = &body[6]
+        else {
+            panic!("the new conditional follows the constant");
+        };
+        assert_eq!(*predicate, sentient::CmpPredicate::Sge);
+        assert_eq!((*lhs, *rhs), (a, b));
+        assert!(yielded.is_empty() && else_body.is_empty());
+        assert_eq!(dbg_name.as_deref(), Some("dyn"));
+        assert_eq!(
+            then_body,
+            &vec![
+                for_op(iv, new_bound, vec![constant(Val(6), 1), yield_op(vec![])]),
+                yield_op(vec![]),
+            ]
+        );
+        assert_eq!(to_be_deleted, vec![Doomed::If(if_result)]);
+    }
+
+    /// `e466` — at a bound of ONE the loop's own body is what moves, and the emptied loop is queued.
+    #[test]
+    fn a_trip_count_of_one_moves_the_loop_body_and_queues_the_loop() {
+        let (a, b, zero, one) = (Val(0), Val(1), Val(2), Val(3));
+        let (if_result, iv, inner) = (Val(4), Val(5), Val(6));
+        let mut body = vec![
+            constant(a, 3),
+            constant(b, 4),
+            constant(zero, 0),
+            constant(one, 1),
+            cond(
+                if_result,
+                sentient::CmpPredicate::Slt,
+                (a, b),
+                None,
+                vec![yield_op(vec![one])],
+                vec![yield_op(vec![zero])],
+            ),
+            for_op(iv, if_result, vec![constant(inner, 7), yield_op(vec![])]),
+        ];
+        let mut values = Values::default();
+        // Val(0)..=Val(6) are taken above.
+        for _ in 0..7 {
+            let _ = values.mint();
+        }
+        let mut to_be_deleted = Vec::new();
+        update_if_op_feeding_dyn_loop_bound(
+            &mut body,
+            &OpAt::top(InBlock(4)),
+            &mut to_be_deleted,
+            &mut values,
+        );
+        // ⭐ THE THEN-BRANCH KEPT ITS PREDICATE: the then-branch already yielded the non-zero bound.
+        let Op::Sentient(sentient::Op::If {
+            predicate,
+            then_body,
+            ..
+        }) = &body[6]
+        else {
+            panic!("the new conditional follows the constant");
+        };
+        assert_eq!(*predicate, sentient::CmpPredicate::Slt);
+        assert_eq!(then_body, &vec![constant(inner, 7), yield_op(vec![])]);
+        // The loop stays where it is, emptied, until the queue is drained.
+        assert_eq!(body[7], for_op(iv, Val(7), vec![yield_op(vec![])]));
+        assert_eq!(
+            to_be_deleted,
+            vec![Doomed::For(ForRef(iv)), Doomed::If(if_result)]
+        );
     }
 }

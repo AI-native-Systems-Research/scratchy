@@ -827,10 +827,141 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
     }
 }
 
-// crustify:todo: e463_addToWorkListCreateCopyAndUpdateAssignment
-//   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:405  (17 body lines, level 2)
-//   original  : void RegisterTypeAssignmentPass::addToWorkListCreateCopyAndUpdateAssignment( MutableOperandRange operand, const RegisterLocales locale, Operation* user, int element_size, const bool is_mutable_addr_or_xrf_ptr)
-//   calls     : e141_addToWorkList, e142_isCopyNeeded, e143_updateAssignment, e252_size, e350_createCopyOperationAndUpdateAssignment
+/// THE ONE OPERAND OF ONE OP THAT ASKED FOR A LOCALE — `MutableOperandRange operand` with
+/// `DT_CHECK_MSG(operand.size() == 1, "expected a single operand")` (`:409`) discharged by the type.
+///
+/// ⭐ THE RANGE'S OWNER IS THE `user` EVERY CALL SITE PASSES BESIDE IT, so one path names both — the
+/// op the copy is positioned against and the op whose operand is rewritten.
+#[derive(Debug, Clone)]
+pub(crate) struct OperandSlot {
+    /// `user` — where that op sits in the unit body.
+    user: OpAt,
+    /// Which of its operands, in [`dialects::operands`] order.
+    at: usize,
+    /// `operand[0].get()` — read once, at construction.
+    val: Val,
+}
+
+impl OperandSlot {
+    /// The slot, or `None` when `user` names no op or that op has no operand `at`.
+    #[must_use]
+    pub(crate) fn of(user: OpAt, at: usize, unit_body: &[Op]) -> Option<OperandSlot> {
+        let val = *dialects::operands(user.op(unit_body)?).get(at)?;
+        Some(OperandSlot { user, at, val })
+    }
+
+    /// The value in the slot.
+    #[must_use]
+    pub(crate) const fn val(&self) -> Val {
+        self.val
+    }
+}
+
+/// WHAT e463 DID TO THE SLOT — the reference writes its effect into the IR and returns `void`, and this
+/// names the outcomes so a caller (and a test) can tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyInstalled {
+    /// The `else`: no copy was needed, and the demanded locale was recorded for the value itself.
+    Recorded,
+    /// `operand.assign(new_copy)` — the new copy went into THIS slot alone.
+    Assigned(Val),
+    /// `val.replaceAllUsesExcept(new_copy, new_copy.getDefiningOp())` — the `gtr` path, where every
+    /// other reader of the value was redirected instead.
+    AllUsesRedirected(Val),
+    /// e350 answered `None` (its own two `DT_CHECK`s as data), so no copy exists and no slot changed.
+    NoCopyProduced,
+    /// [`CopyNeeded::MultipleAssignments`] — the reference's
+    /// `DT_CHECK_MSG(record->second == IMM, "multiple assignments to the same variable")`, carried out
+    /// to the caller that knows which operand asked.
+    MultipleAssignments {
+        /// What `assignments_` already held for the value in the slot.
+        recorded: RegisterLocale,
+    },
+}
+
+/// WHERE THE USER SITS AFTER e350 HAS RUN — its own path, or ONE LATER when the op there is no longer
+/// it.
+///
+/// ⛔ THE SHIFT IS AT MOST ONE, WHICH IS WHY TWO CANDIDATES ARE ENOUGH: e350 either inserts a single
+/// `sentient.scalar_copy` or hoists ONE op out of a strictly deeper block
+/// ([`utils::move_to_common_dominator`]), so nothing is ever removed from ahead of the user in its own
+/// block. A `scalar_copy` binding a freshly minted result equals no existing op, so the comparison
+/// cannot pick the newcomer.
+fn user_after_copy(unit_body: &[Op], user: &OpAt, snapshot: &Op) -> OpAt {
+    let shifted = user.next();
+    if user.op(unit_body) != Some(snapshot) && shifted.op(unit_body) == Some(snapshot) {
+        return shifted;
+    }
+    user.clone()
+}
+
+impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
+    /// Replaces: e463_addToWorkListCreateCopyAndUpdateAssignment
+    ///
+    /// Queues the value in `slot`, and either records the demanded locale on it or copies it into a
+    /// register of that locale and rewires the reader — every other use for `gtr`, this operand for
+    /// everything else.
+    ///
+    /// ⛔ TRAP: `gtr` IS PARTLY HARDWARE MANAGED, so exactly ONE copy may hang off a
+    /// `create_multicast_group`: every OTHER use moves to the copy and the copy keeps reading the
+    /// original, which is what `replaceAllUsesExcept(.., new_copy.getDefiningOp())` says on a
+    /// one-operand op.
+    /// ⛔ TRAP: e350 CAN SHIFT THE READER BY ONE (it inserts in front of it), so the operand is written
+    /// through a re-derived path — see [`user_after_copy`].
+    pub(crate) fn add_to_work_list_create_copy_and_update_assignment(
+        &mut self,
+        unit_body: &mut Vec<Op>,
+        slot: &OperandSlot,
+        key: AliasKey,
+        is_mutable_addr_or_xrf_ptr: bool,
+        values: &mut Values,
+    ) -> CopyInstalled {
+        let val = slot.val;
+        self.add_to_work_list(val);
+        match self.is_copy_needed(val, key.locale) {
+            CopyNeeded::No => {
+                self.update_assignment(val, key.locale);
+                CopyInstalled::Recorded
+            }
+            CopyNeeded::MultipleAssignments { recorded } => {
+                CopyInstalled::MultipleAssignments { recorded }
+            }
+            CopyNeeded::Yes => {
+                let snapshot = match slot.user.op(unit_body) {
+                    Some(op) => op.clone(),
+                    None => return CopyInstalled::NoCopyProduced,
+                };
+                let demand = CopyDemand {
+                    val,
+                    key,
+                    user: slot.user.clone(),
+                    is_mutable_addr_or_xrf_ptr,
+                };
+                let Some(new_copy) =
+                    self.create_copy_operation_and_update_assignment(unit_body, &demand, values)
+                else {
+                    return CopyInstalled::NoCopyProduced;
+                };
+                if key.locale == RegisterLocale::Gtr {
+                    dialects::replace_all_uses_with(unit_body, val, new_copy);
+                    // The copy itself is the one reader that keeps the original — its only operand.
+                    if let Some(at) = utils::path_of(unit_body, new_copy) {
+                        if let Some(op) = at.op_mut(unit_body) {
+                            dialects::set_operand(op, 0, val);
+                        }
+                    }
+                    CopyInstalled::AllUsesRedirected(new_copy)
+                } else {
+                    let now = user_after_copy(unit_body, &slot.user, &snapshot);
+                    if let Some(op) = now.op_mut(unit_body) {
+                        dialects::set_operand(op, slot.at, new_copy);
+                    }
+                    CopyInstalled::Assigned(new_copy)
+                }
+            }
+        }
+    }
+}
 
 // crustify:todo: e523_processWorkList
 //   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:492  (93 body lines, level 3)
@@ -1146,5 +1277,79 @@ mod unit_tests {
         assert!(out.contains("- locale: imm"), "{out}");
         // An ownerless value still reports its locale, in key order after `%7`.
         assert!(out.ends_with("- locale: lbr"), "{out}");
+    }
+    /// e463 — the copy goes in front of the reader, and the reader's own operand is the only one
+    /// rewritten, the insertion having shifted the reader by one.
+    #[test]
+    fn e463_the_copy_replaces_the_operand_that_asked_for_it() {
+        let mut pass = TypesAndCopies::new();
+        let mut values = Values::default();
+        for _ in 0..4 {
+            let _ = values.mint();
+        }
+        let mut body = vec![
+            constant(Val(0), 8),
+            add(Val(0), Val(1), Val(2)),
+            add(Val(0), Val(1), Val(3)),
+        ];
+        pass.update_assignment(Val(0), RegType::Imm);
+        let slot = OperandSlot::of(OpAt::top(utils::InBlock(1)), 0, &body)
+            .expect("the add reads the constant as its first operand");
+        assert_eq!(slot.val(), Val(0));
+
+        let installed = pass.add_to_work_list_create_copy_and_update_assignment(
+            &mut body,
+            &slot,
+            AliasKey {
+                locale: RegType::Lrf,
+                element_size: None,
+            },
+            false,
+            &mut values,
+        );
+        let copy = match installed {
+            CopyInstalled::Assigned(copy) => copy,
+            other => panic!("expected the operand to be assigned: {other:?}"),
+        };
+        assert_eq!(body.len(), 4);
+        assert!(CopyOp::of(&body[1]).is_some());
+        // ⭐ THE SHIFTED READER, AND ONLY IT: the second user still reads the constant.
+        assert_eq!(dialects::operands(&body[2]), vec![copy, Val(1)]);
+        assert_eq!(dialects::operands(&body[3]), vec![Val(0), Val(1)]);
+    }
+
+    /// e463 — for `gtr` the copy takes over every OTHER reader and keeps reading the original itself.
+    #[test]
+    fn e463_a_gtr_copy_takes_over_every_other_use() {
+        let mut pass = TypesAndCopies::new();
+        let mut values = Values::default();
+        for _ in 0..4 {
+            let _ = values.mint();
+        }
+        let mut body = vec![
+            constant(Val(0), 8),
+            add(Val(0), Val(1), Val(2)),
+            add(Val(0), Val(1), Val(3)),
+        ];
+        pass.update_assignment(Val(0), RegType::Imm);
+        let slot = OperandSlot::of(OpAt::top(utils::InBlock(1)), 0, &body)
+            .expect("the add reads the constant as its first operand");
+        let installed = pass.add_to_work_list_create_copy_and_update_assignment(
+            &mut body,
+            &slot,
+            AliasKey {
+                locale: RegType::Gtr,
+                element_size: None,
+            },
+            false,
+            &mut values,
+        );
+        let copy = match installed {
+            CopyInstalled::AllUsesRedirected(copy) => copy,
+            other => panic!("expected every use to be redirected: {other:?}"),
+        };
+        assert_eq!(dialects::operands(&body[1]), vec![Val(0)]);
+        assert_eq!(dialects::operands(&body[2]), vec![copy, Val(1)]);
+        assert_eq!(dialects::operands(&body[3]), vec![copy, Val(1)]);
     }
 }
