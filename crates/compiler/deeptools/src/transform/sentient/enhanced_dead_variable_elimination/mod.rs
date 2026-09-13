@@ -97,7 +97,7 @@
 #![allow(dead_code)]
 
 use core::fmt::Write as _;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::dialects::{
@@ -804,20 +804,123 @@ impl EnhancedDeadVariableElimination {
     }
 }
 
-// crustify:todo: e498_updateForOperation
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:127  (141 body lines, level 3)
-//   original  : void EnhancedDeadVariableEliminationPass::updateForOperation( ForOp &for_op, std::set<int> deleted_pos)
-//   calls     : e041_getInfluenceType, e252_size, e422_insert
+/// `deleted_pos.find(i) == deleted_pos.end()` APPLIED TO ONE PARALLEL LIST — the filter e498, e499 and
+/// e500 rebuild every one of their arrays through.
+fn retain_positions<T>(items: &mut Vec<T>, deleted: &BTreeSet<usize>) {
+    let mut at = 0;
+    items.retain(|_| {
+        let keep = !deleted.contains(&at);
+        at += 1;
+        keep
+    });
+}
 
-// crustify:todo: e499_updateIfOperation
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:272  (49 body lines, level 3)
-//   original  : void EnhancedDeadVariableEliminationPass::updateIfOperation( mlir::sentient::IfOp &if_op)
-//   calls     : e041_getInfluenceType, e422_insert
+impl EnhancedDeadVariableElimination {
+    /// Replaces: e498_updateForOperation
+    ///
+    /// Drops every `iter_args` position whose result AND body argument both have no influence — or the
+    /// positions `deleted_pos` names, an EMPTY set being the reference's own "not provided" (`:130`).
+    ///
+    /// ⛔ TRAP: THE REFERENCE MISALIGNS ITS OWN REGISTER ARRAYS BY ONE unless they are in the
+    /// `1 + 2 * num_results` layout (`:139`) — the else arm reads surviving position `i` at
+    /// `regLocales[i]`, which is the BOUND's slot, and writes an array with no bound slot at all
+    /// (`:187-192`). [`sentient::Carried::reg`] beside `bound_reg` makes both unwritable.
+    /// ⛔ THE SURVIVORS KEEP THEIR OWN VALUES: `create` + `replaceAllUsesWith` + `erase` (`:225-266`)
+    /// only renumbers what a collapsed [`sentient::Carried`] drops in place.
+    pub(crate) fn update_for_operation(
+        &self,
+        scope: &mut [Op],
+        at: usize,
+        deleted_pos: &BTreeSet<usize>,
+    ) {
+        let Some(Op::Sentient(sentient::Op::For { carried, .. })) = scope.get(at) else {
+            return;
+        };
+        let mut deleted = deleted_pos.clone();
+        if deleted_pos.is_empty() {
+            for (i, value) in carried.iter().enumerate() {
+                if self.influence_type(value.result) == Influence::None
+                    && self.influence_type(value.arg) == Influence::None
+                {
+                    deleted.insert(i);
+                }
+            }
+        }
+        if deleted.is_empty() {
+            return;
+        }
+        let dead: Vec<Val> = deleted
+            .iter()
+            .filter_map(|i| carried.get(*i).map(|value| value.result))
+            .collect();
+        for result in dead {
+            if dialects::use_count(result, scope) != 0 {
+                panic!(
+                    "DT_CHECK_MSG(The loop's results at the indices to be deleted should have no \
+                     uses.) (`EnhancedDeadVariableElimination.cpp:250-253`): {result:?}"
+                );
+            }
+        }
+        let Some(Op::Sentient(sentient::Op::For { carried, .. })) = scope.get_mut(at) else {
+            return;
+        };
+        retain_positions(carried, &deleted);
+    }
 
-// crustify:todo: e500_updateUniformizeRegionsOperation
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:325  (38 body lines, level 3)
-//   original  : void EnhancedDeadVariableEliminationPass::updateUniformizeRegionsOperation( mlir::uniform::UniformizeRegionsOp &uniform_op)
-//   calls     : e041_getInfluenceType, e422_insert
+    /// Replaces: e499_updateIfOperation
+    ///
+    /// Drops every `sentient.if` result with no influence, and its `regLocales`/`regIndices` slot with
+    /// it.
+    ///
+    /// ⛔ THE REGION BODIES ARE UNTOUCHED, `sentient.yield`s INCLUDED: e557 erases the dead yield
+    /// operands BEFORE it reaches the parent (`:377-396`), so each region already hands back exactly
+    /// the surviving results by the time this runs.
+    /// ⛔ ONE SHARED `IRMapping` SPANS BOTH REGIONS of `cloneIfOp`
+    /// (`Dialect/Sentient/Utils.cpp:218-228`) — dropped with the clone, which a collapsed
+    /// [`sentient::Yielded`] has no need of.
+    pub(crate) fn update_if_operation(&self, scope: &mut [Op], at: usize) {
+        let Some(Op::Sentient(sentient::Op::If { yielded, .. })) = scope.get_mut(at) else {
+            return;
+        };
+        let deleted: BTreeSet<usize> = yielded
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| self.influence_type(value.result) == Influence::None)
+            .map(|(i, _)| i)
+            .collect();
+        retain_positions(yielded, &deleted);
+    }
+
+    /// Replaces: e500_updateUniformizeRegionsOperation
+    ///
+    /// Drops every `uniform.uniformize_regions` result with no influence, and its `element_sizes` and
+    /// `regLocales` slot with it.
+    ///
+    /// ⛔ THE RAISED SPELLING ONLY — see e300's note; the lower-rung [`Op::Uniform`] op's terminator
+    /// hands back values of the rung below, which this pass has no influence for.
+    /// ⛔ THE TWO ARRAYS ARE FILTERED INDEPENDENTLY, EACH OVER ITS OWN LENGTH
+    /// (`Dialect/Sentient/Utils.cpp:252-266`): an unwritten `regLocales` stays unwritten rather than
+    /// being padded to the result count, which is what EMPTY [`dialects::YieldedReg`] means here.
+    pub(crate) fn update_uniformize_regions_operation(&self, scope: &mut [Op], at: usize) {
+        let Some(Op::UniformRegions(UniformRegions::UniformizeRegions {
+            results, yielded, ..
+        })) = scope.get_mut(at)
+        else {
+            return;
+        };
+        let deleted: BTreeSet<usize> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| self.influence_type(**result) == Influence::None)
+            .map(|(i, _)| i)
+            .collect();
+        if deleted.is_empty() {
+            return;
+        }
+        retain_positions(results, &deleted);
+        retain_positions(yielded, &deleted);
+    }
+}
 
 // crustify:todo: e557_exploreOperation
 //   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:367  (57 body lines, level 4)
@@ -852,7 +955,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::sentient::{
-        Carried, Extent, Reg, RegType, ShuffleMode,
+        Carried, CmpPredicate, Extent, Reg, RegType, ShuffleMode, Yielded,
     };
 
     /// `%r = sentient.scalar_constant {value = <value>}`.
@@ -1182,5 +1285,122 @@ mod unit_tests {
         assert_eq!(pass.influence_type(Val(30)), Influence::ControlFlow);
         assert_eq!(pass.influence_type(Val(31)), Influence::ControlFlow);
         assert!(pass.conflicts().is_empty());
+    }
+
+    /// e498 — the position whose result and body argument both lack influence leaves the loop, once
+    /// because the influence test says so and once because a caller named it.
+    #[test]
+    fn updating_a_loop_drops_the_iter_arg_positions_with_no_influence() {
+        let mut pass = EnhancedDeadVariableElimination::default();
+        // ⭐ THE BODY ARGUMENT, NOT THE RESULT: either one carrying influence keeps the position.
+        pass.add_to_work_list_and_update_assignment(
+            Val(4),
+            &Origin::RegionArg(nop()),
+            Influence::Memory,
+            WorklistAdd::Push,
+        );
+        let loop_op = |body| for_op(2, 0, vec![carried(0, 3, 5), carried(1, 4, 6)], body);
+        // ⭐ THE YIELD ALREADY HANDS BACK ONE VALUE — e557 erased the dead operand before it reached
+        // the parent.
+        let mut scope = vec![
+            constant(Val(0), 4),
+            constant(Val(1), 7),
+            loop_op(vec![yield_op(vec![Val(4)])]),
+        ];
+
+        pass.update_for_operation(&mut scope, 2, &BTreeSet::new());
+
+        let Op::Sentient(sentient::Op::For { carried: left, .. }) = &scope[2] else {
+            panic!("the loop survives");
+        };
+        assert_eq!(left, &vec![carried(1, 4, 6)]);
+
+        // A provided set deletes exactly what it names, influence or not.
+        let mut named = vec![
+            constant(Val(0), 4),
+            constant(Val(1), 7),
+            loop_op(vec![yield_op(vec![Val(3)])]),
+        ];
+
+        pass.update_for_operation(&mut named, 2, &BTreeSet::from([1]));
+
+        let Op::Sentient(sentient::Op::For { carried: left, .. }) = &named[2] else {
+            panic!("the loop survives");
+        };
+        assert_eq!(left, &vec![carried(0, 3, 5)]);
+    }
+
+    /// e499 — the influenceless result leaves the `sentient.if` and takes its register slot with it.
+    #[test]
+    fn updating_a_conditional_drops_the_result_with_no_influence() {
+        let mut pass = EnhancedDeadVariableElimination::default();
+        pass.add_to_work_list_and_update_assignment(
+            Val(6),
+            &Origin::RegionArg(nop()),
+            Influence::ControlFlow,
+            WorklistAdd::Push,
+        );
+        let slot = |result: u32, locale| Yielded {
+            result: Val(result),
+            reg: Reg {
+                locale,
+                index: None,
+            },
+        };
+        let mut scope = vec![Op::Sentient(sentient::Op::If {
+            predicate: CmpPredicate::Eq,
+            lhs: Val(0),
+            rhs: Val(1),
+            yielded: vec![slot(5, RegType::Jcr), slot(6, RegType::Lrf)],
+            dbg_name: None,
+            then_body: vec![yield_op(vec![Val(6)])],
+            else_body: Vec::new(),
+        })];
+
+        pass.update_if_operation(&mut scope, 0);
+
+        let Op::Sentient(sentient::Op::If { yielded, .. }) = &scope[0] else {
+            panic!("the conditional survives");
+        };
+        assert_eq!(yielded, &vec![slot(6, RegType::Lrf)]);
+    }
+
+    /// e500 — the influenceless result leaves the `uniform.uniformize_regions` and both discardable
+    /// arrays lose that slot with it.
+    #[test]
+    fn updating_a_uniformize_regions_op_drops_the_result_with_no_influence() {
+        let mut pass = EnhancedDeadVariableElimination::default();
+        pass.add_to_work_list_and_update_assignment(
+            Val(8),
+            &Origin::RegionArg(nop()),
+            Influence::Memory,
+            WorklistAdd::Push,
+        );
+        let slot = |locale| dialects::YieldedReg {
+            element_size: Some(Bits(16)),
+            locale,
+        };
+        let mut scope = vec![Op::UniformRegions(UniformRegions::UniformizeRegions {
+            regions: vec![dialects::LocalRegion {
+                arg: Val(1),
+                units: vec![Val(0)],
+                body: vec![Op::Uniform(uniform::Op::Yield {
+                    operands: vec![Val(8)],
+                })],
+            }],
+            results: vec![Val(7), Val(8)],
+            yielded: vec![slot(RegType::Jcr), slot(RegType::Lrf)],
+        })];
+
+        pass.update_uniformize_regions_operation(&mut scope, 0);
+
+        let Op::UniformRegions(UniformRegions::UniformizeRegions {
+            results, yielded, ..
+        }) = &scope[0]
+        else {
+            panic!("the uniformize_regions op survives");
+        };
+        assert_eq!(results, &vec![Val(8)]);
+        assert_eq!(yielded, &vec![slot(RegType::Lrf)]);
     }
 }

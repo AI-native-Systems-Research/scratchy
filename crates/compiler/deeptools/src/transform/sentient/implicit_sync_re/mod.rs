@@ -90,7 +90,11 @@
 
 use core::num::NonZeroU32;
 
+use crate::arch::Arch;
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::Op;
+use crate::model::Model;
+use crate::workload::Workload;
 
 pub(crate) mod implicit_sync_rde_tree;
 
@@ -267,10 +271,25 @@ pub(crate) fn run_on(unit_body: &mut Vec<Op>) -> ImplicitSyncReCount {
     )
 }
 
-// crustify:todo: e501_runOn
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:77  (4 body lines, level 3)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e438_runOn
+/// Replaces: e501_runOn
+///
+/// Runs the implicit-sync RDE optimizer over every program unit of one module.
+///
+/// ⛔ NAMED FOR ITS ARGUMENT: `runOn(ModuleOp)` and `runOn(ProgramUnitOp)` (e438) are one C++ overload
+/// set and cannot both be `run_on` here — the same split
+/// [`crate::transform::sentient::multicast_canonicalization::run_on_program`] carries.
+///
+/// ⛔ THE COUNT IS **ASSIGNED**, NOT ACCUMULATED (`ImplicitSyncRE.cpp:74`): `implicit_sync_re_count`
+/// is a pass member each unit overwrites, so a two-unit module reports the LAST unit's removals.
+pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+) -> ImplicitSyncReCount {
+    let mut count = ImplicitSyncReCount::default();
+    for unit in program.units.iter_mut() {
+        count = run_on(&mut unit.body);
+    }
+    count
+}
 
 // crustify:todo: e559_runOnOperation
 //   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:82  (5 body lines, level 4)
@@ -283,9 +302,57 @@ mod unit_tests {
 
     use super::{
         ENABLE_DEAD_DEF_REMOVAL, ENABLE_DYNAMIC_LOOP_HOISTING, ImplicitSyncGenValue, TileSize,
-        is_operation_a_use, run_on,
+        is_operation_a_use, run_on, run_on_program,
     };
-    use crate::islands::sentient::dialects::{Op, sentient};
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
+    use crate::units::DfirUnit;
+    use crate::workload::Workload;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One module with two program units, each holding `body`.
+    fn two_unit_program(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        let unit = |on| ProgramUnit {
+            on: Units::one(on, Val(0)),
+            precision: None,
+            body: body.clone(),
+            arch: core::marker::PhantomData,
+        };
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(DfirUnit::Pe), vec![unit(DfirUnit::L3lu)]),
+            bound: core::marker::PhantomData,
+        }
+    }
 
     /// `sentient.nop` — the `op_` a GenValue points at, whatever it is.
     fn nop() -> Op {
@@ -352,6 +419,16 @@ mod unit_tests {
     fn no_operation_is_a_use_in_an_implicit_sync_tree() {
         assert!(!is_operation_a_use(&nop()));
         assert!(!ENABLE_DEAD_DEF_REMOVAL);
+    }
+
+    /// e501 — the module walk reaches the optimizer on its FIRST program unit, which is `Analyses/`
+    /// work; the count it would assign is the last unit's.
+    #[test]
+    #[should_panic(expected = "RDETreeOptimizer<ImplicitSyncRDETree>::optimize")]
+    fn run_on_program_hands_every_program_unit_to_the_optimizer() {
+        let mut program = two_unit_program(vec![nop()]);
+
+        run_on_program(&mut program);
     }
 
     /// e438 — the pass hands one program unit to the RDE tree optimizer, which is `Analyses/` work.

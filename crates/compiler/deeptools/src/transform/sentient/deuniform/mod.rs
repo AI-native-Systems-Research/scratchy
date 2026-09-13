@@ -90,8 +90,10 @@
 // ⭐ REMOVE THIS WITH e621: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
-use crate::islands::dataflow_ir::Values;
-use crate::islands::sentient::dialects::{self as dialects, Definitions, Op, Val, uniform};
+use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, LocalRegion, Op, UniformRegions, Val, uniform,
+};
 
 /// Replaces: e039_existsInCollection
 ///
@@ -345,10 +347,79 @@ pub fn duplicate_and_update_entries_of_query_map_in_local_regions(
     }
 }
 
-// crustify:todo: e497_duplicateAndUpdateRegionsOfLocalRegionOps
-//   authority : dcc/src/Transform/Sentient/Deuniform.cpp:284  (88 body lines, level 3)
-//   original  : mlir::Operation *DeuniformPass::duplicateAndUpdateRegionsOfLocalRegionOps( mlir::Operation *local_op, std::vector<mlir::Value> &new_units, mlir::OpBuilder builder, std::vector<mlir::Operation *> &to_be_deleted)
-//   calls     : e252_size, e299_expandAllGroupsToUnitsAndUpdateSizes, e436_duplicateAndUpdateEntriesOfQueryMapInLocalRegions
+/// Replaces: e497_duplicateAndUpdateRegionsOfLocalRegionOps
+///
+/// A copy of a local region op holding only the regions that still run one of `new_units` — each
+/// region cloned under a freshly minted argument, its unit list cut to the survivors, and its queries
+/// narrowed by [`duplicate_and_update_entries_of_query_map_in_local_regions`].
+///
+/// ⛔ `nullptr` (`:327`) IS [`None`]: no unit of any region survived, so the caller has nothing to
+/// replace the original with.
+/// ⛔ `new_to_old_region_num_map` IS THE ORDER ITSELF — the surviving regions are pushed in old-region
+/// order, which is what makes the reference's index map an identity on what it keeps.
+/// ⛔ TRAP: `getRegIndicesIfExist`/`getRegLocalesIfExist` ARE COPIED WHOLE (`:333`) while the REGION
+/// list shrinks. They are per RESULT and the result list is unchanged, so a two-region op cut to one
+/// keeps every [`dialects::YieldedReg`] entry — including the discardable `element_sizes` this island
+/// fuses into it, which `UniformizeRegionsOp::create` would have dropped.
+/// ⛔ THE `DT_CHECK(uniform_op || eq_pattern_op)` (`:291`) IS THE PARAMETER TYPE.
+#[must_use]
+pub fn duplicate_and_update_regions_of_local_region_ops(
+    local_op: &UniformRegions,
+    new_units: &[Val],
+    to_be_deleted: &mut Vec<Val>,
+    defs: Definitions<'_>,
+    values: &mut Values,
+) -> Option<Op> {
+    let mut new_regions: Vec<LocalRegion> = Vec::new();
+    for region in local_op.regions() {
+        // `expandAllGroupsToUnitsAndUpdateSizes(units_v, list_sizes, builder)` (`:302`) on the
+        // reference's own local copies — per region here, for the reason
+        // [`expand_all_groups_to_units_and_update_sizes`] records: this island zips the two arrays.
+        let mut units = region.units.clone();
+        dialects::expand_all_groups_to_units(&mut units, defs);
+        let kept: Vec<Val> = units
+            .into_iter()
+            .filter(|unit| new_units.contains(unit))
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        // `block.addArgument(builder.getIndexType(), ..)` then `bv_map.map(old args, new args)`
+        // (`:336-347`) — the region's own argument is the only value the clone must remap.
+        let arg = values.mint();
+        let mut mapping = ValueMapping::new();
+        mapping.map(region.arg, arg);
+        new_regions.push(LocalRegion {
+            arg,
+            units: kept,
+            body: dialects::clone_ops(&region.body, values, &mut mapping),
+        });
+    }
+    if new_regions.is_empty() {
+        return None;
+    }
+    let mut new_op = Op::UniformRegions(match local_op {
+        UniformRegions::UniformizeRegions {
+            results, yielded, ..
+        } => UniformRegions::UniformizeRegions {
+            regions: new_regions,
+            // `uniform_op.getResultTypes()` — as many results as before, each a new value.
+            results: results.iter().map(|_| values.mint()).collect(),
+            yielded: yielded.clone(),
+        },
+        UniformRegions::EqualizePattern { .. } => UniformRegions::EqualizePattern {
+            regions: new_regions,
+        },
+    });
+    duplicate_and_update_entries_of_query_map_in_local_regions(
+        &mut new_op,
+        new_units,
+        to_be_deleted,
+        defs,
+        values,
+    );
+    Some(new_op)
+}
 
 // crustify:todo: e556_deuniform
 //   authority : dcc/src/Transform/Sentient/Deuniform.cpp:375  (70 body lines, level 4)
@@ -548,6 +619,110 @@ mod unit_tests {
         };
         assert_eq!(rewritten.regions()[0].units, vec![Val(1), Val(2)]);
         assert_eq!(rewritten.regions()[1].units, vec![Val(3)]);
+    }
+
+    /// e497 — the region whose units the new unit set no longer covers is dropped, the surviving one
+    /// is cloned under a fresh argument over just those units with its query narrowed, and a set that
+    /// covers nothing answers the reference's `nullptr`.
+    #[test]
+    fn duplicating_a_local_region_op_keeps_only_the_regions_the_new_units_still_run() {
+        let func_body = vec![
+            get_unit(101),
+            get_unit(102),
+            get_unit(103),
+            group(104, &[101, 102]),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(105),
+                pairs: vec![
+                    (Val(101), Val(120)),
+                    (Val(102), Val(121)),
+                    (Val(103), Val(122)),
+                ],
+            }),
+        ];
+        let scopes: Vec<&[Op]> = vec![&func_body];
+        let defs = Definitions::within_program_unit(
+            &scopes,
+            Val(109),
+            &[Val(101), Val(102), Val(103)],
+        );
+        let local_op = UniformRegions::UniformizeRegions {
+            regions: vec![
+                region(
+                    110,
+                    &[104],
+                    vec![
+                        Op::Uniform(uniform::Op::QueryMap {
+                            result: Val(141),
+                            map: Val(105),
+                            key: Val(109),
+                        }),
+                        Op::Uniform(uniform::Op::Yield {
+                            operands: vec![Val(141)],
+                        }),
+                    ],
+                ),
+                region(111, &[103], Vec::new()),
+            ],
+            results: vec![Val(130)],
+            yielded: Vec::new(),
+        };
+        let mut values = Values::default();
+        let mut to_be_deleted = Vec::new();
+
+        let duplicated = duplicate_and_update_regions_of_local_region_ops(
+            &local_op,
+            &[Val(102)],
+            &mut to_be_deleted,
+            defs,
+            &mut values,
+        );
+
+        let Some(Op::UniformRegions(new_op)) = &duplicated else {
+            panic!("expected a duplicated uniformize_regions, got {duplicated:?}");
+        };
+        assert_eq!(new_op.regions().len(), 1, "region 1 ran only unit 103");
+        // The group expanded, and only the unit the caller kept survived it.
+        assert_eq!(new_op.regions()[0].units, vec![Val(102)]);
+        assert_eq!(new_op.regions()[0].arg, Val(0), "a freshly minted argument");
+        assert_eq!(dialects::results(&duplicated.clone().expect("built")), vec![Val(2)]);
+        // e436's narrowed duplicate sits in front of the clone, and the yield reads it.
+        assert_eq!(
+            new_op.regions()[0].body,
+            vec![
+                Op::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(3),
+                    pairs: vec![(Val(102), Val(121))],
+                }),
+                Op::Uniform(uniform::Op::QueryMap {
+                    result: Val(4),
+                    map: Val(3),
+                    key: Val(109),
+                }),
+                Op::Uniform(uniform::Op::QueryMap {
+                    result: Val(1),
+                    map: Val(105),
+                    key: Val(109),
+                }),
+                Op::Uniform(uniform::Op::Yield {
+                    operands: vec![Val(4)],
+                }),
+            ]
+        );
+        assert_eq!(to_be_deleted, vec![Val(1)]);
+
+        // `if (new_local_units.size() == 0) return nullptr;`
+        let mut fresh = Values::default();
+        assert!(
+            duplicate_and_update_regions_of_local_region_ops(
+                &local_op,
+                &[Val(199)],
+                &mut Vec::new(),
+                defs,
+                &mut fresh,
+            )
+            .is_none()
+        );
     }
 
     /// e436 — the query inside the local region gains a narrowed duplicate IN FRONT of itself, its

@@ -112,7 +112,7 @@ use crate::islands::sentient::dialects::{
     uniform, value_reg_locale,
 };
 use crate::islands::sentient::print;
-use crate::transform::sentient::analyses::{UnitIndex, UnitIndexMap};
+use crate::transform::sentient::analyses::{OutOfScopeUnitIndexMap, UnitIndex, UnitIndexMap};
 use crate::transform::sentient::utils::{self, OpAt};
 
 /// `affine::FlatAffineValueConstraints` — THE LOCAL-VARIABLE CONSTRAINT SYSTEM OF ONE FLATTENED
@@ -514,11 +514,19 @@ impl ExprInfoMap {
 /// ⛔ SCOPED TO THIS FILE UNTIL A SECOND CONSUMER APPEARS. Hoist it beside those seams when one does;
 /// `crustify-senpass/OUTSIDE-DEPS.tsv` names this analysis for several more passes.
 pub trait PropagationAnalysis {
+    /// WHAT `getUnitIndexMap()` (`Analyses/PropagationAnalysis.h:325`) ANSWERS — an associated type
+    /// rather than a `dyn`, because `mapAllValues` copies the map into a pass member (`:830`) and
+    /// `createMapAndQuery` reads it back a whole arm later.
+    type Units: UnitIndexMap;
+
     /// `getAffineExpression(Value)` (`Analyses/PropagationAnalysis.h:308`).
     fn affine_expression(&mut self, val: Val) -> ExprInfoMap;
 
     /// `mlir::getFlattenedAffineExpr(map.getResult(0), map.getNumDims(), 0, ..)` (`:308-310`).
     fn flattened_affine_expr(&self, map: PropagatedMap) -> FlattenedExpr;
+
+    /// `expr_prop.getUnitIndexMap()` (`:830`).
+    fn unit_index_map(&self) -> Self::Units;
 }
 
 /// THE ANALYSIS THIS CAMPAIGN DOES NOT PORT — every method `todo!`s, naming it.
@@ -526,6 +534,8 @@ pub trait PropagationAnalysis {
 pub struct OutOfScopePropagationAnalysis;
 
 impl PropagationAnalysis for OutOfScopePropagationAnalysis {
+    type Units = OutOfScopeUnitIndexMap;
+
     fn affine_expression(&mut self, _val: Val) -> ExprInfoMap {
         todo!(
             "PropagationAnalysis::getAffineExpression \
@@ -538,6 +548,10 @@ impl PropagationAnalysis for OutOfScopePropagationAnalysis {
             "mlir::getFlattenedAffineExpr (mlir/Dialect/Affine/Analysis/AffineStructures.h) \
              — MLIR upstream, out of campaign scope"
         )
+    }
+
+    fn unit_index_map(&self) -> Self::Units {
+        OutOfScopeUnitIndexMap
     }
 }
 
@@ -1340,20 +1354,702 @@ pub fn create_map_and_query(
     MapAndQuery { ops, result }
 }
 
-// crustify:todo: e502_reconstructOperation
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:546  (259 body lines, level 3)
-//   original  : LogicalResult LiveRangeReductionPass::reconstructOperation( SmallVector<Value>& ssa_list, int current_value_index, int dominant_value_index)
-//   calls     : e057_print, e252_size, e443_createMapAndQuery
+/// WHAT `reconstructOperation` ANSWERS — a `LogicalResult` whose only `failure()` is the closing
+/// `else`'s `op->emitError("unsupported op for live range reduction!")` (`:801-803`).
+///
+/// ⭐ NOT A `Result`: every profitability test in the body answers `success()` too, so "rewritten" and
+/// "deliberately left alone" are ONE answer there and must stay one here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reconstruction {
+    /// `LogicalResult::success()` — rewritten, or left exactly as it was.
+    Done,
+    /// `LogicalResult::failure()`, which `e560_reduceLiveRange` turns into `signalPassFailure()`.
+    Unsupported,
+}
 
-// crustify:todo: e503_mapAllValues
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:827  (48 body lines, level 3)
-//   original  : void LiveRangeReductionPass::mapAllValues(PropagationAnalysis& expr_prop, Operation* unit_op)
-//   calls     : e440_addToMap
+/// WHICH `$mutable_addr` OPERAND A TRANSFER OP'S RESULT IS A FUNCTION OF — `operand_idx` (`:670-704`),
+/// named by the field rather than by the position the reference asks the op for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutableAddr {
+    /// `getMutableAddrMutable()` — the four one-address ops.
+    Only,
+    /// `getSrcMutableAddrMutable()`, which a `sentient.load_and_store`'s result 0 travels through.
+    Src,
+    /// `getDstMutableAddrMutable()`, which its result 1 does.
+    Dst,
+}
 
-// crustify:todo: e504_optimizeUniformRegionYieldedValues
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:1167  (47 body lines, level 3)
-//   original  : void LiveRangeReductionPass::optimizeUniformRegionYieldedValues( ModuleOp module_op)
-//   calls     : e239_getOperationOfBlock, e252_size, e442_addResultToYield
+impl MutableAddr {
+    /// `op->getOperand(operand_idx)`.
+    fn read(self, op: &Op) -> Option<Val> {
+        match (self, op) {
+            (
+                MutableAddr::Only,
+                Op::Sentient(
+                    sentient::Op::ReceiveAndStore { mutable_addr, .. }
+                    | sentient::Op::LoadAndSend { mutable_addr, .. }
+                    | sentient::Op::LoadAndExtractScalar { mutable_addr, .. }
+                    | sentient::Op::LoadComputeAndSend { mutable_addr, .. },
+                ),
+            ) => Some(*mutable_addr),
+            (
+                MutableAddr::Src,
+                Op::Sentient(sentient::Op::LoadAndStore {
+                    src_mutable_addr, ..
+                }),
+            ) => Some(*src_mutable_addr),
+            (
+                MutableAddr::Dst,
+                Op::Sentient(sentient::Op::LoadAndStore {
+                    dst_mutable_addr, ..
+                }),
+            ) => Some(*dst_mutable_addr),
+            _ => None,
+        }
+    }
+
+    /// `op->setOperand(operand_idx, dominant_value)` (`:744`).
+    fn write(self, op: &mut Op, val: Val) {
+        match (self, op) {
+            (
+                MutableAddr::Only,
+                Op::Sentient(
+                    sentient::Op::ReceiveAndStore { mutable_addr, .. }
+                    | sentient::Op::LoadAndSend { mutable_addr, .. }
+                    | sentient::Op::LoadAndExtractScalar { mutable_addr, .. }
+                    | sentient::Op::LoadComputeAndSend { mutable_addr, .. },
+                ),
+            ) => *mutable_addr = val,
+            (
+                MutableAddr::Src,
+                Op::Sentient(sentient::Op::LoadAndStore {
+                    src_mutable_addr, ..
+                }),
+            ) => *src_mutable_addr = val,
+            (
+                MutableAddr::Dst,
+                Op::Sentient(sentient::Op::LoadAndStore {
+                    dst_mutable_addr, ..
+                }),
+            ) => *dst_mutable_addr = val,
+            _ => {}
+        }
+    }
+}
+
+/// WHICH OF `reconstructOperation`'S FIVE ARMS ONE VALUE'S DEFINING OP TAKES (`:561-805`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    /// `isa<AddOp, SubOp>` — THE ONLY ARM THAT BUILDS.
+    AddOrSub,
+    /// The five transfer ops. `None` is a `load_and_extract_scalar`'s DATA result, which is what is
+    /// stored AT the address rather than a function of it, and answers `success()` (`:687-700`).
+    Transfer(Option<MutableAddr>),
+    /// `sentient.for`, and the `iter_args` position `resultNumber + getNumControlOperands()` names.
+    Loop(usize),
+    /// `isa<uniform::UniformizeRegionsOp>` — nothing to reconstruct (`:797-798`).
+    Uniformize,
+    /// The closing `else` (`:800-804`).
+    Unsupported,
+}
+
+/// The `isa<>` chain at `:561`, `:667`, `:749` and `:797`, read once.
+fn classify(op: &Op, current_value: Val) -> Arm {
+    match op {
+        Op::Sentient(sentient::Op::ScalarAdd { .. } | sentient::Op::ScalarSub { .. }) => {
+            Arm::AddOrSub
+        }
+        Op::Sentient(
+            sentient::Op::ReceiveAndStore { .. }
+            | sentient::Op::LoadAndSend { .. }
+            | sentient::Op::LoadComputeAndSend { .. },
+        ) => Arm::Transfer(Some(MutableAddr::Only)),
+        // `result_idx > 0 ? dst : src` (`:678-684`) — result 0 is the `src_res` address.
+        Op::Sentient(sentient::Op::LoadAndStore { results, .. }) => Arm::Transfer(Some(
+            if current_value == results.0 {
+                MutableAddr::Src
+            } else {
+                MutableAddr::Dst
+            },
+        )),
+        Op::Sentient(sentient::Op::LoadAndExtractScalar { addr_result, .. }) => {
+            Arm::Transfer((current_value == *addr_result).then_some(MutableAddr::Only))
+        }
+        Op::Sentient(sentient::Op::For { carried, .. }) => carried
+            .iter()
+            .position(|value| value.result == current_value)
+            .map_or(Arm::Unsupported, Arm::Loop),
+        Op::UniformRegions(UniformRegions::UniformizeRegions { .. })
+        | Op::Uniform(uniform::Op::UniformizeRegions { .. }) => Arm::Uniformize,
+        _ => Arm::Unsupported,
+    }
+}
+
+impl SsaMap {
+    /// `ssa_negated_map_.at(value)` AS A SIGN — `s0` and `s2` (`:585-586`, `:716-717`, `:763-764`).
+    /// `std::map::at` THROWS on a value `mapAllValues` never mapped, which is this `panic!`.
+    fn sign_of(&self, value: Val) -> i64 {
+        let Some(negated) = self.negated.get(&value) else {
+            panic!(
+                "ssa_negated_map_.at({value:?}) has no entry, where `std::map::at` throws \
+                 (LiveRangeReduction.cpp:585-586)"
+            )
+        };
+        if *negated { -1 } else { 1 }
+    }
+
+    /// THE TWO `ssa_expr_const_map_.at()` LOOKUPS EVERY ARM MAKES, plus the `DT_CHECK_MSG` that they
+    /// are one length — *"Neither dominant_value, current_value are expected to be global."*
+    fn const_offset_pair(&self, dominant: Val, other: Val) -> (Vec<i64>, Vec<i64>) {
+        let (Some(dominant_consts), Some(other_consts)) = (
+            self.const_offsets.get(&dominant),
+            self.const_offsets.get(&other),
+        ) else {
+            panic!(
+                "ssa_expr_const_map_.at() has no entry for {dominant:?} or {other:?}, where \
+                 `std::map::at` throws (LiveRangeReduction.cpp:591-593)"
+            )
+        };
+        if dominant_consts.len() != other_consts.len() {
+            panic!(
+                "DT_CHECK_MSG(Neither dominant_value, current_value are expected to be global.) \
+                 (`LiveRangeReduction.cpp:594-596`): {} against {}",
+                dominant_consts.len(),
+                other_consts.len()
+            )
+        }
+        (dominant_consts.clone(), other_consts.clone())
+    }
+
+    /// THE ALL-DIFFS-ZERO TEST the transfer and loop arms share (`:727-743`, `:775-791`) — a unit
+    /// irresolvable for BOTH is skipped, for ONE it refuses, and any non-zero difference would need an
+    /// extra instruction and so is refused on profitability.
+    fn all_offsets_agree(&self, dominant: Val, other: Val, sign: i64) -> bool {
+        let (dominant_consts, other_consts) = self.const_offset_pair(dominant, other);
+        for (dominant_const, current_const) in dominant_consts.iter().zip(&other_consts) {
+            if *dominant_const == i64::MAX && *current_const == i64::MAX {
+                continue;
+            }
+            if *dominant_const == i64::MAX || *current_const == i64::MAX {
+                return false;
+            }
+            if current_const.wrapping_sub(sign.wrapping_mul(*dominant_const)) != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Replaces: e502_reconstructOperation
+    ///
+    /// Rewrites the op binding `classes[class_index].values[current_value_index]` to read the
+    /// DOMINATING value of its class instead. ⛔ ONLY THE SCALAR ARM MAY BUILD — it rebuilds around a
+    /// fresh per-unit constant, while the five transfers and the loop replace one address operand and
+    /// refuse any non-zero difference (`:733-737`, `:781-785`), an extra instruction there costing
+    /// more than the register saved.
+    ///
+    /// ⛔ THE CLASS IS NAMED BY INDEX because the reference writes back through `ssa_value_list_[i]`
+    /// (`:546`, `:630`), and `op_to_be_erased_` is a pass member (`:178`) e598 drains (`:1308`).
+    pub fn reconstruct_operation(
+        &mut self,
+        class_index: usize,
+        current_value_index: usize,
+        dominant_value_index: usize,
+        unit_body: &mut Vec<Op>,
+        parent: &ParentRegionQuery,
+        index_map: &impl UnitIndexMap,
+        vals: &mut Values,
+        to_be_erased: &mut Vec<Val>,
+    ) -> Reconstruction {
+        let Some(class) = self.classes.get(class_index) else {
+            return Reconstruction::Done;
+        };
+        let (Some(current_value), Some(dominant_value)) = (
+            class.values.get(current_value_index).copied(),
+            class.values.get(dominant_value_index).copied(),
+        ) else {
+            return Reconstruction::Done;
+        };
+        let scope = unit_body.clone();
+        let regions: [&[Op]; 1] = [&scope];
+        let defs = Definitions::from_innermost(&regions);
+        let Some(op) = defs.of(current_value) else {
+            panic!(
+                "reconstructOperation was asked about {current_value:?}, which has no defining op, \
+                 where the reference dereferences a null Operation* \
+                 (LiveRangeReduction.cpp:549-556)"
+            )
+        };
+        // check if dominant_value is already used in the curren op — the check that prevents
+        // switching iter_args' def-chain when iter_args.size > 1 (`:555-563`).
+        if dialects::operands(op).contains(&dominant_value) {
+            return Reconstruction::Done;
+        }
+        match classify(op, current_value) {
+            Arm::AddOrSub => {
+                let Op::Sentient(
+                    sentient::Op::ScalarAdd {
+                        ty,
+                        reg,
+                        element_size,
+                        ..
+                    }
+                    | sentient::Op::ScalarSub {
+                        ty,
+                        reg,
+                        element_size,
+                        ..
+                    },
+                ) = op
+                else {
+                    return Reconstruction::Done;
+                };
+                let (ty, reg, element_size) = (*ty, *reg, *element_size);
+                // The first operand that is a non-block-argument constant; `>= 2` is "none is", and
+                // both constant makes live range reduction inapplicable anyway (`:566-580`).
+                let reads = dialects::operands(op);
+                let const_operand_idx = reads
+                    .iter()
+                    .position(|operand| is_sentient_constant(*operand, defs))
+                    .unwrap_or(reads.len());
+                if const_operand_idx >= 2 {
+                    return Reconstruction::Done;
+                }
+                if !self.const_offsets.contains_key(&reads[1 - const_operand_idx]) {
+                    return Reconstruction::Done;
+                }
+                let sign = self.sign_of(current_value) / self.sign_of(dominant_value);
+                let (dominant_consts, current_consts) =
+                    self.const_offset_pair(dominant_value, current_value);
+                let mut new_const_val: Vec<i64> = Vec::with_capacity(dominant_consts.len());
+                let mut common_val = i64::MAX;
+                let mut are_all_val_equal = true;
+                for (dominant_const, current_const) in dominant_consts.iter().zip(&current_consts) {
+                    if *dominant_const == i64::MAX && *current_const == i64::MAX {
+                        // if both SSAs are irresolvable for a unit, record it and continue.
+                        new_const_val.push(i64::MAX);
+                    } else if *dominant_const != i64::MAX && *current_const != i64::MAX {
+                        let value = current_const.wrapping_sub(sign.wrapping_mul(*dominant_const));
+                        new_const_val.push(value);
+                        // only initialize common_val once
+                        if common_val == i64::MAX {
+                            common_val = value;
+                        }
+                    } else {
+                        return Reconstruction::Done;
+                    }
+                    let last = new_const_val[new_const_val.len() - 1];
+                    if common_val != i64::MAX && last != i64::MAX && last != common_val {
+                        are_all_val_equal = false;
+                    }
+                }
+
+                // remove the old operation
+                to_be_erased.push(current_value);
+
+                // optimization to remove addOp with zero-constant operand (`:625-632`).
+                if are_all_val_equal && common_val == 0 && sign == 1 {
+                    dialects::replace_all_uses_with(unit_body, current_value, dominant_value);
+                    self.classes[class_index].values[current_value_index] = dominant_value;
+                    return Reconstruction::Done;
+                }
+
+                // create new constOp + addOp/SubOp — `OpBuilder builder(op)` inserts IN FRONT of it.
+                let mut built: Vec<Op> = Vec::new();
+                let const_result = if are_all_val_equal {
+                    let result = vals.mint();
+                    built.push(Op::Sentient(sentient::Op::ScalarConstant {
+                        value: common_val,
+                        result,
+                        reg_locale: sentient::RegType::Imm,
+                        ty,
+                        is_symbol: false,
+                    }));
+                    result
+                } else {
+                    let map_and_query =
+                        create_map_and_query(&new_const_val, ty, parent, index_map, defs, vals);
+                    built.extend(map_and_query.ops);
+                    map_and_query.result
+                };
+                let new_result = vals.mint();
+                // `new_op->setAttrs(op->getAttrs())` (`:652`) — the register and the width travel.
+                built.push(Op::Sentient(if sign > 0 {
+                    sentient::Op::ScalarAdd {
+                        lhs: dominant_value,
+                        rhs: const_result,
+                        result: new_result,
+                        reg,
+                        element_size,
+                        ty,
+                    }
+                } else {
+                    sentient::Op::ScalarSub {
+                        lhs: const_result,
+                        rhs: dominant_value,
+                        result: new_result,
+                        reg,
+                        element_size,
+                        ty,
+                    }
+                }));
+                let Some(at) = utils::path_of(unit_body, current_value) else {
+                    return Reconstruction::Done;
+                };
+                for op in built.into_iter().rev() {
+                    utils::insert_at(unit_body, &at, op);
+                }
+                dialects::replace_all_uses_with(unit_body, current_value, new_result);
+                // ⭐ `DenseMap::operator[]` ON BOTH SIDES (`:654-657`), so a current value that was
+                // never mapped copies an EMPTY offset list and `false` rather than nothing.
+                let offsets = self
+                    .const_offsets
+                    .get(&current_value)
+                    .cloned()
+                    .unwrap_or_default();
+                self.const_offsets.insert(new_result, offsets);
+                let negated = self.negated.get(&current_value).copied().unwrap_or_default();
+                self.negated.insert(new_result, negated);
+                // replace cuurent_value in the position of ssa_list by new_op
+                self.classes[class_index].values[current_value_index] = new_result;
+                Reconstruction::Done
+            }
+            Arm::Transfer(addr) => {
+                let Some(addr) = addr else {
+                    return Reconstruction::Done;
+                };
+                let Some(op_operand) = addr.read(op) else {
+                    return Reconstruction::Done;
+                };
+                if !self.const_offsets.contains_key(&op_operand) {
+                    return Reconstruction::Done;
+                }
+                // No need to reconstruct constant operand — ⭐ THE OP ITSELF (`:711-714`), not
+                // `isConstant<>`: a `uniform.query_map` of constants does NOT stop this one.
+                if matches!(
+                    defs.of(op_operand),
+                    Some(Op::Sentient(sentient::Op::ScalarConstant { .. }))
+                ) {
+                    return Reconstruction::Done;
+                }
+                let sign = self.sign_of(current_value) / self.sign_of(dominant_value);
+                if !self.all_offsets_agree(dominant_value, op_operand, sign) {
+                    return Reconstruction::Done;
+                }
+                let Some(at) = utils::path_of(unit_body, current_value) else {
+                    return Reconstruction::Done;
+                };
+                if let Some(target) = at.op_mut(unit_body) {
+                    addr.write(target, dominant_value);
+                }
+                Reconstruction::Done
+            }
+            Arm::Loop(position) => {
+                let Op::Sentient(sentient::Op::For { carried, .. }) = op else {
+                    return Reconstruction::Done;
+                };
+                let Some(op_operand) = carried.get(position).map(|value| value.init) else {
+                    return Reconstruction::Done;
+                };
+                // ⭐ THIS ARM TESTS THE CONSTANT BEFORE THE MAP, the transfer arm after (`:754-762`).
+                if matches!(
+                    defs.of(op_operand),
+                    Some(Op::Sentient(sentient::Op::ScalarConstant { .. }))
+                ) {
+                    return Reconstruction::Done;
+                }
+                if !self.const_offsets.contains_key(&op_operand) {
+                    return Reconstruction::Done;
+                }
+                let sign = self.sign_of(current_value) / self.sign_of(dominant_value);
+                if !self.all_offsets_agree(dominant_value, op_operand, sign) {
+                    return Reconstruction::Done;
+                }
+                let Some(at) = utils::path_of(unit_body, current_value) else {
+                    return Reconstruction::Done;
+                };
+                if let Some(Op::Sentient(sentient::Op::For { carried, .. })) =
+                    at.op_mut(unit_body)
+                    && let Some(value) = carried.get_mut(position)
+                {
+                    value.init = dominant_value;
+                }
+                Reconstruction::Done
+            }
+            Arm::Uniformize => Reconstruction::Done,
+            Arm::Unsupported => Reconstruction::Unsupported,
+        }
+    }
+}
+
+impl SsaMap {
+    /// Replaces: e503_mapAllValues
+    ///
+    /// Files every register-related value of one program unit into the map, in the pre-order the
+    /// reference's own comment calls topological, and hands back the `unit_name_to_index_map` it
+    /// copies from the analysis (`:830`) for [`create_map_and_query`] to key its mapping by.
+    ///
+    /// ⛔ THE **REVERSE** SCANS (`:836-840`, `:861-864`) DECIDE which value of a class dominates
+    /// another, so they are the port's content and not its style. ⛔ A YIELD MAPS ITS **PARENT'S**
+    /// results, and only for the two parents whose `dyn_cast` succeeds (`:848-850`, `:865-868`).
+    pub fn map_all_values<A: PropagationAnalysis>(
+        &mut self,
+        analysis: &mut A,
+        unit_body: &[Op],
+    ) -> A::Units {
+        // copy unit_name_index_map from expression propagation
+        let index_map = analysis.unit_index_map();
+        self.map_block(analysis, unit_body, None, &[]);
+        index_map
+    }
+
+    /// One block of the `walk<WalkOrder::PreOrder>` — the op, then its regions, which is what makes
+    /// the order topological.
+    fn map_block(
+        &mut self,
+        analysis: &mut impl PropagationAnalysis,
+        block: &[Op],
+        parent: Option<&Op>,
+        enclosing: &[&[Op]],
+    ) {
+        let mut regions: Vec<&[Op]> = Vec::with_capacity(enclosing.len() + 1);
+        regions.push(block);
+        regions.extend_from_slice(enclosing);
+        for op in block {
+            self.map_operation(analysis, op, parent, Definitions::from_innermost(&regions));
+            for region in dialects::regions_ref(op) {
+                self.map_block(analysis, region, Some(op), &regions);
+            }
+        }
+    }
+
+    /// The four `isa<>` arms of the walk body (`:831-873`).
+    fn map_operation(
+        &mut self,
+        analysis: &mut impl PropagationAnalysis,
+        op: &Op,
+        parent: Option<&Op>,
+        defs: Definitions<'_>,
+    ) {
+        match op {
+            Op::Sentient(sentient::Op::For { carried, .. }) => {
+                // scan iter_args in reserve order to preferably shorten the liveRange of the first
+                // iter_arg, which a kernel block load uses first.
+                for value in carried.iter().rev() {
+                    self.add_to_map(analysis, value.arg, defs);
+                }
+                // map constant operands — the eight kernel block loads with constant starting
+                // addresses this exists for (`:842-847`).
+                for operand in dialects::operands(op) {
+                    if is_sentient_constant(operand, defs) {
+                        self.add_to_map(analysis, operand, defs);
+                    }
+                }
+            }
+            Op::Sentient(sentient::Op::Yield { .. }) => {
+                if let Some(Op::Sentient(sentient::Op::For { carried, .. })) = parent {
+                    for value in carried.clone() {
+                        self.add_to_map(analysis, value.result, defs);
+                    }
+                }
+            }
+            Op::Sentient(
+                sentient::Op::ScalarAdd { .. }
+                | sentient::Op::ScalarSub { .. }
+                | sentient::Op::ReceiveAndStore { .. }
+                | sentient::Op::LoadAndSend { .. }
+                | sentient::Op::LoadAndStore { .. }
+                | sentient::Op::LoadAndExtractScalar { .. }
+                | sentient::Op::LoadComputeAndSend { .. },
+            ) => {
+                // scan reversely for the same reason described above.
+                for result in dialects::results(op).into_iter().rev() {
+                    self.add_to_map(analysis, result, defs);
+                }
+            }
+            Op::Uniform(uniform::Op::Yield { .. }) => {
+                if let Some(Op::UniformRegions(UniformRegions::UniformizeRegions {
+                    results, ..
+                })) = parent
+                {
+                    for result in results.clone() {
+                        self.add_to_map(analysis, result, defs);
+                    }
+                }
+            }
+            // ⭐ THE WALK'S OWN FALL-THROUGH: it names seven ops of a dialect with twenty-nine.
+            _ => {}
+        }
+    }
+}
+
+/// `is_any_of(.., SentientRegType::lrf, SentientRegType::jcr)` (`:1186-1188`, `:1199-1203`) — the two
+/// register files a local region will hand a value out through.
+fn is_yieldable_locale(locale: sentient::RegType) -> bool {
+    matches!(locale, sentient::RegType::Lrf | sentient::RegType::Jcr)
+}
+
+/// `curr_op.hasAttr("regLocale")` AND ITS VALUE (`:1183-1188`) — the nine ops that declare the
+/// SINGULAR attribute (`SentientOps.td:473, 521, 567, 681, 705, 806, 821, 834, 852`), `None` for the
+/// rest, all of which bind exactly one result so the reference's default `result_idx = 0` is theirs.
+///
+/// ⭐ THE `Option` FIELDS **ARE** THE `hasAttr` ANSWER: `regLocale` is a `DefaultValuedAttr` on all
+/// nine, so an op no allocator has spoken for carries none — which this island already spells as
+/// `reg: Option<Reg>` on the two adds and `reg_locale: Option<RegType>` on `scalar_mul`.
+fn single_reg_locale(op: &Op) -> Option<sentient::RegType> {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { reg, .. }
+            | sentient::Op::ReceiveAndStore { reg, .. }
+            | sentient::Op::LoadComputeAndSend { reg, .. }
+            | sentient::Op::ReceiveAndExtractScalar { reg, .. }
+            | sentient::Op::ScalarCopy { reg, .. },
+        ) => Some(reg.locale),
+        Op::Sentient(sentient::Op::ScalarAdd { reg, .. } | sentient::Op::ScalarSub { reg, .. }) => {
+            reg.map(|reg| reg.locale)
+        }
+        Op::Sentient(sentient::Op::ScalarMul { reg_locale, .. }) => *reg_locale,
+        Op::Sentient(sentient::Op::ScalarConstant { reg_locale, .. }) => Some(*reg_locale),
+        _ => None,
+    }
+}
+
+/// `regLocales[result_idx + curr_op.getNumOperands()]` (`:1197-1203`) — `None` where the op declares
+/// no such array beside a `sentient.for` or `sentient.if`, which is the `hasAttr("regLocales")` and
+/// the `isa<ForOp, IfOp>` the reference tests together.
+///
+/// ⛔ TRAP: THE REFERENCE'S OWN INDEX IS RIGHT ONLY FOR A LOOP. A `sentient.for` has `1 + n` operands
+/// against a `1 + 2n` array, so `result_idx + numOperands` lands in the result half; a `sentient.if`
+/// has TWO operands against an array of `numResults`, so the same expression runs PAST THE END and
+/// `getValueRegLocale` has no `If` arm to disagree with it. Indexing by result alone is what both
+/// layouts mean — see [`sentient::Carried::reg`] and [`sentient::Yielded::reg`].
+fn result_reg_locale(op: &Op, result_idx: usize) -> Option<sentient::RegType> {
+    match op {
+        Op::Sentient(sentient::Op::For { carried, .. }) => {
+            carried.get(result_idx).map(|value| value.reg.locale)
+        }
+        Op::Sentient(sentient::Op::If { yielded, .. }) => {
+            yielded.get(result_idx).map(|value| value.reg.locale)
+        }
+        _ => None,
+    }
+}
+
+/// Replaces: e504_optimizeUniformRegionYieldedValues
+///
+/// Grows every ONE-REGION `uniform.uniformize_regions` in `body` by one result for each value its
+/// region computes into an `lrf` or `jcr` register and then never reads — a `sentient.for` or
+/// `sentient.if` contributing one per such result rather than one per op.
+///
+/// ⛔ THE OP IS RE-READ FROM ITS SLOT EVERY TIME because [`add_result_to_yield`] answers with a WHOLE
+/// NEW OP whose region-0 values are re-minted, and ⭐ `ops_to_be_delected` (`:1208`) IS that slot
+/// assignment. ⛔ `parent` is REPLACED on the way into a local region, where
+/// `getQueryKeyAndUnitsFromParentRegion` reads exactly its two fields (`Sentient/Utils.cpp:48-53`).
+pub fn optimize_uniform_region_yielded_values(
+    body: &mut Vec<Op>,
+    parent: &ParentRegionQuery,
+    enclosing: &[&[Op]],
+    vals: &mut Values,
+) {
+    for index in 0..body.len() {
+        if dialects::local_region_count(&body[index]) == Some(1) {
+            grow_yielded_values(body, index, parent, enclosing, vals);
+        }
+        if dialects::regions_ref(&body[index]).is_empty() {
+            continue;
+        }
+        // The walk descends AFTER the op itself, and against the block as the rewrite left it.
+        let snapshot = body.clone();
+        let mut scopes: Vec<&[Op]> = Vec::with_capacity(enclosing.len() + 1);
+        scopes.push(&snapshot);
+        scopes.extend_from_slice(enclosing);
+        match &mut body[index] {
+            Op::UniformRegions(regions) => {
+                for region in regions.regions_mut() {
+                    let inner = ParentRegionQuery {
+                        key: region.arg,
+                        units: region.units.clone(),
+                    };
+                    optimize_uniform_region_yielded_values(
+                        &mut region.body,
+                        &inner,
+                        &scopes,
+                        vals,
+                    );
+                }
+            }
+            op => {
+                for region in dialects::regions_mut(op) {
+                    optimize_uniform_region_yielded_values(region, parent, &scopes, vals);
+                }
+            }
+        }
+    }
+}
+
+/// The `region_num`/`op_num` pair of loops (`:1173-1206`) over ONE one-region op, whose slot the
+/// grown op is written back into. `region_num` is only ever 0 there, which is what makes
+/// `addResultToYield`'s own `DT_CHECK(r == 1)` hold.
+fn grow_yielded_values(
+    body: &mut Vec<Op>,
+    index: usize,
+    parent: &ParentRegionQuery,
+    enclosing: &[&[Op]],
+    vals: &mut Values,
+) {
+    let Some(Op::UniformRegions(op)) = body.get(index) else {
+        return;
+    };
+    let Some(num_ops) = op.regions().first().map(|region| region.body.len()) else {
+        return;
+    };
+    for op_num in 0..num_ops {
+        let Some(Op::UniformRegions(op)) = body.get(index) else {
+            return;
+        };
+        let Some(region) = op.regions().first() else {
+            return;
+        };
+        let Some(curr_op) = region.body.get(op_num) else {
+            continue;
+        };
+        // `curr_op.use_empty()` — every result unread, and a value bound inside a local region can
+        // only be read inside it.
+        if dialects::results(curr_op)
+            .iter()
+            .any(|result| dialects::use_count(*result, &region.body) != 0)
+        {
+            continue;
+        }
+        let positions: Vec<usize> = match single_reg_locale(curr_op) {
+            // `hasAttr("regLocale")` — one register for the whole op, hence result 0 alone.
+            Some(locale) if is_yieldable_locale(locale) => vec![0],
+            Some(_) => Vec::new(),
+            None => (0..dialects::results(curr_op).len())
+                .filter(|at| result_reg_locale(curr_op, *at).is_some_and(is_yieldable_locale))
+                .collect(),
+        };
+        for result_idx in positions {
+            let snapshot = body.clone();
+            let mut scopes: Vec<&[Op]> = Vec::with_capacity(enclosing.len() + 1);
+            scopes.push(&snapshot);
+            scopes.extend_from_slice(enclosing);
+            let Some(Op::UniformRegions(op)) = snapshot.get(index) else {
+                return;
+            };
+            let grown = add_result_to_yield(
+                op,
+                parent,
+                0,
+                utils::InBlock(op_num),
+                result_idx,
+                &scopes,
+                vals,
+            );
+            body[index] = Op::UniformRegions(grown);
+        }
+    }
+}
 
 // crustify:todo: e560_reduceLiveRange
 //   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:885  (28 body lines, level 4)
@@ -1568,12 +2264,18 @@ mod unit_tests {
     }
 
     impl PropagationAnalysis for Canned {
+        type Units = OutOfScopeUnitIndexMap;
+
         fn affine_expression(&mut self, _val: Val) -> ExprInfoMap {
             self.map.clone()
         }
 
         fn flattened_affine_expr(&self, map: PropagatedMap) -> FlattenedExpr {
             self.flats[&map.id].clone()
+        }
+
+        fn unit_index_map(&self) -> Self::Units {
+            OutOfScopeUnitIndexMap
         }
     }
 
@@ -2057,6 +2759,285 @@ mod unit_tests {
             &built.ops[3],
             Op::Uniform(uniform::Op::QueryMap { result, map, key: queried })
                 if *result == built.result && map == mapping && *queried == key
+        ));
+    }
+
+    /// e502 — a zero difference collapses the add away, a non-zero one rebuilds it around a fresh
+    /// constant, and a transfer op has its address operand rewritten in place instead.
+    #[test]
+    fn reconstruct_operation_collapses_a_zero_offset_and_rebuilds_a_non_zero_one() {
+        let parent = ParentRegionQuery {
+            key: Val(100),
+            units: vec![Val(101)],
+        };
+        // `%4 = %2 + %3`, with `%3` the constant and `%1` the dominator of `%4`.
+        let body = || {
+            vec![
+                extract(Val(10), (Val(1), Val(11)), 16, RegType::Lar),
+                extract(Val(12), (Val(2), Val(13)), 16, RegType::Lar),
+                constant(Val(3)),
+                add(Val(2), Val(3), Val(4)),
+                extract(Val(4), (Val(5), Val(6)), 16, RegType::Lar),
+            ]
+        };
+        let map = |current: Vec<i64>| SsaMap {
+            classes: vec![EquivalenceClass {
+                expr_info: ExprInfo::default(),
+                values: vec![Val(1), Val(4)],
+            }],
+            const_offsets: BTreeMap::from([
+                (Val(1), vec![4]),
+                (Val(2), vec![7]),
+                (Val(4), current),
+            ]),
+            negated: BTreeMap::from([(Val(1), false), (Val(4), false)]),
+        };
+
+        // ⭐ SAME OFFSET, SAME SIGN — the add is redundant and every reader takes the dominator.
+        let mut collapsing = map(vec![4]);
+        let mut ops = body();
+        let mut erased = Vec::new();
+        let mut vals = Values::default();
+        assert_eq!(
+            collapsing.reconstruct_operation(
+                0,
+                1,
+                0,
+                &mut ops,
+                &parent,
+                &OutOfScopeUnitIndexMap,
+                &mut vals,
+                &mut erased,
+            ),
+            Reconstruction::Done
+        );
+        assert_eq!(collapsing.classes[0].values, vec![Val(1), Val(1)]);
+        assert_eq!(erased, vec![Val(4)]);
+        // ⛔ NOTHING WAS BUILT AND NOTHING WAS ERASED YET — e598 drains the list.
+        assert_eq!(ops.len(), 5);
+        assert_eq!(dialects::operands(&ops[4])[0], Val(1));
+
+        // A difference of 5, agreed by every unit, so ONE immediate constant carries it.
+        let mut rebuilding = map(vec![9]);
+        let mut ops = body();
+        let mut erased = Vec::new();
+        let mut vals = Values::default();
+        vals.mint();
+        rebuilding.reconstruct_operation(
+            0,
+            1,
+            0,
+            &mut ops,
+            &parent,
+            &OutOfScopeUnitIndexMap,
+            &mut vals,
+            &mut erased,
+        );
+        // ⭐ BOTH NEW OPS LAND IN FRONT OF THE OLD ONE, which is where `OpBuilder builder(op)` puts
+        // them, and the old op is left in the block for e598 to erase.
+        assert_eq!(ops.len(), 7);
+        let Op::Sentient(sentient::Op::ScalarConstant { value, result, .. }) = &ops[3] else {
+            panic!("the rebuilt difference is one sentient.scalar_constant")
+        };
+        assert_eq!(*value, 5);
+        let new_result = dialects::results(&ops[4])[0];
+        assert!(matches!(
+            &ops[4],
+            Op::Sentient(sentient::Op::ScalarAdd { lhs, rhs, reg: None, .. })
+                if *lhs == Val(1) && rhs == result
+        ));
+        assert_eq!(rebuilding.classes[0].values, vec![Val(1), new_result]);
+        assert_eq!(rebuilding.const_offsets.get(&new_result), Some(&vec![9]));
+        assert_eq!(dialects::operands(&ops[6])[0], new_result);
+
+        // ⛔ A TRANSFER OP IS NEVER REBUILT: its address operand is repointed, or nothing happens.
+        let mut transfers = SsaMap {
+            classes: vec![EquivalenceClass {
+                expr_info: ExprInfo::default(),
+                values: vec![Val(1), Val(3)],
+            }],
+            const_offsets: BTreeMap::from([(Val(1), vec![8]), (Val(2), vec![8])]),
+            negated: BTreeMap::from([(Val(1), false), (Val(3), false)]),
+        };
+        let mut ops = vec![
+            extract(Val(10), (Val(1), Val(11)), 16, RegType::Lar),
+            extract(Val(12), (Val(2), Val(13)), 16, RegType::Lar),
+            extract(Val(2), (Val(3), Val(4)), 16, RegType::Lar),
+        ];
+        transfers.reconstruct_operation(
+            0,
+            1,
+            0,
+            &mut ops,
+            &parent,
+            &OutOfScopeUnitIndexMap,
+            &mut vals,
+            &mut Vec::new(),
+        );
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(
+            &ops[2],
+            Op::Sentient(sentient::Op::LoadAndExtractScalar { mutable_addr, .. })
+                if *mutable_addr == Val(1)
+        ));
+    }
+
+    /// e503 — the visit order IS the port: an op's results and a loop's arguments are filed in
+    /// reverse, a loop's results forward from its yield, and a constant trip count is mapped only.
+    #[test]
+    fn map_all_values_files_the_results_in_reverse_and_the_loops_yield_forward() {
+        let reg = Reg {
+            locale: RegType::Lrf,
+            index: None,
+        };
+        let ops = vec![
+            constant(Val(1)),
+            extract(Val(20), (Val(2), Val(3)), 16, RegType::Lar),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(4),
+                bound: Val(1),
+                bound_reg: None,
+                carried: vec![
+                    sentient::Carried {
+                        init: Val(2),
+                        arg: Val(5),
+                        result: Val(6),
+                        reg,
+                        program_header: false,
+                        element_size: None,
+                    },
+                    sentient::Carried {
+                        init: Val(3),
+                        arg: Val(7),
+                        result: Val(8),
+                        reg,
+                        program_header: false,
+                        element_size: None,
+                    },
+                ],
+                dbg_name: None,
+                body: vec![Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(5), Val(7)],
+                })],
+            }),
+        ];
+        let mut canned = Canned {
+            map: ExprInfoMap {
+                exprs: vec![bucket(0, 1, vec![Val(9)])],
+                buckets: vec![0],
+            },
+            flats: BTreeMap::from([(
+                0,
+                FlattenedExpr {
+                    coeffs: vec![2, 5],
+                    constraints: FlatAffineValueConstraints(3),
+                    num_local_vars: 0,
+                },
+            )]),
+        };
+
+        let mut map = SsaMap::default();
+        map.map_all_values(&mut canned, &ops);
+
+        // The extract's data result before its address result; the second iter argument before the
+        // first; then the loop's results, in order, from its yield.
+        assert_eq!(
+            map.classes[0].values,
+            vec![Val(3), Val(2), Val(7), Val(5), Val(6), Val(8)]
+        );
+        // ⭐ THE TRIP COUNT IS MAPPED AS A CONSTANT, so it opens no class of its own.
+        assert_eq!(map.const_offsets.get(&Val(1)), Some(&vec![5]));
+        assert_eq!(map.classes.len(), 1);
+    }
+
+    /// e504 — a value computed into an `lrf` register and never read is handed out of the region;
+    /// the `imm` constants beside it, which are read anyway, grow nothing.
+    #[test]
+    fn optimize_uniform_region_yielded_values_hands_out_the_unread_lrf_value() {
+        let mut vals = Values::default();
+        let unit_a = vals.mint();
+        let unit_b = vals.mint();
+        let const_a = vals.mint();
+        let const_b = vals.mint();
+        let offset = vals.mint();
+        let mapping = vals.mint();
+        let query = vals.mint();
+        let sum = vals.mint();
+        let r0_arg = vals.mint();
+
+        let mut body = vec![
+            get_unit(unit_a),
+            get_unit(unit_b),
+            Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![LocalRegion {
+                    arg: r0_arg,
+                    units: vec![unit_a],
+                    body: vec![
+                        constant(const_a),
+                        constant(const_b),
+                        constant(offset),
+                        Op::Uniform(uniform::Op::DefImmutableMapping {
+                            result: mapping,
+                            pairs: vec![(unit_a, const_a), (unit_b, const_b)],
+                        }),
+                        Op::Uniform(uniform::Op::QueryMap {
+                            result: query,
+                            map: mapping,
+                            key: r0_arg,
+                        }),
+                        // `%sum = %query + %offset` in an `lrf` register, read by nobody.
+                        Op::Sentient(sentient::Op::ScalarAdd {
+                            lhs: query,
+                            rhs: offset,
+                            result: sum,
+                            reg: Some(Reg {
+                                locale: RegType::Lrf,
+                                index: None,
+                            }),
+                            ty: ScalarTy::Index,
+                            element_size: Some(Bits(16)),
+                        }),
+                        Op::Uniform(uniform::Op::Yield {
+                            operands: Vec::new(),
+                        }),
+                    ],
+                }],
+                results: Vec::new(),
+                yielded: Vec::new(),
+            }),
+        ];
+        let parent = ParentRegionQuery {
+            key: r0_arg,
+            units: vec![unit_a, unit_b],
+        };
+
+        optimize_uniform_region_yielded_values(&mut body, &parent, &[], &mut vals);
+
+        let Op::UniformRegions(UniformRegions::UniformizeRegions {
+            regions,
+            results,
+            yielded,
+        }) = &body[2]
+        else {
+            panic!("the op keeps its slot")
+        };
+        // ⛔ EXACTLY ONE NEW RESULT: the three `imm` constants are read by the mapping and the add,
+        // and an `imm` locale is not one a region hands a value out through anyway.
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            yielded,
+            &vec![YieldedReg {
+                element_size: Some(Bits(16)),
+                locale: RegType::Lrf,
+            }]
+        );
+        // ⭐ THE ONE-REGION OP BECAME A TWO-REGION ONE, region 1 covering the unit region 0 leaves.
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[1].units, vec![unit_b]);
+        let handed_out = dialects::results(&regions[0].body[5])[0];
+        assert!(matches!(
+            regions[0].body.last(),
+            Some(Op::Uniform(uniform::Op::Yield { operands })) if *operands == vec![handed_out]
         ));
     }
 }
