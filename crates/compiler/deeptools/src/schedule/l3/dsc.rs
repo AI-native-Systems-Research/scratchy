@@ -99,7 +99,7 @@ pub struct LabeledDs {
 }
 
 impl LabeledDs {
-    /// A labelled data structure's layout order paired with its scales, outermost first.
+    /// A labelled data structure's layout order paired with its scales, innermost first.
     #[must_use]
     pub fn new(
         ds_type: DsType,

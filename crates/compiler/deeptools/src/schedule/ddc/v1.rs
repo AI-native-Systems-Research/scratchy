@@ -167,10 +167,10 @@ use crate::schedule::ddc::metadata::{DatastageId, DdcMemory, DestIdx, MetaDimKin
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::dsc2::{
     AddressFold, AllocateNode, BlockNode, CondOp, ComputeNode, ConditionNode, Coordinate, Dsc,
-    FoldCoeff, FoldDim, FoldPosition, LdsIdx, LoopBound, LoopCond, LoopCondComposite, MaxDimSize,
-    NodeName, NumBuffers, Operand, Padding, Precision, RegSlot, ReplicationFactor, SchedNode, Size,
-    SizeAndIndex, StartAddress, StickDimIdx, StickMaskNode, SyncNode, TransferNode, Unroll,
-    generic_comp,
+    FoldCoeff, FoldDim, FoldPosition, LdsIdx, LdsScale, LoopBound, LoopCond, LoopCondComposite,
+    MaxDimSize, NodeName, NumBuffers, Operand, Padding, Precision, RegSlot, ReplicationFactor,
+    SchedNode, Size, SizeAndIndex, StartAddress, StickDimIdx, StickMaskNode, SyncNode,
+    TransferNode, Unroll, generic_comp,
 };
 use crate::units::{Core, Corelet, Row};
 
@@ -613,7 +613,7 @@ pub fn spread_data_in_allocate<A: Arch>(
         {
             continue;
         }
-        let dim = alloc.layout.outermost_dim();
+        let dim = alloc.layout.innermost_dim();
         alloc.gap_stick_spread.insert(dim, Sticks(8));
     }
 }
@@ -1480,9 +1480,11 @@ pub trait StageSizes {
         corelet: Option<Corelet>,
         padding: PadType,
     ) -> Extent;
-    /// `lds.scale_.at(getDimIndexInLayoutOrder(dsType_, dim))` — `ONE` is a dim this lds does NOT
-    /// broadcast.
-    fn lds_replication(&self, lds: LdsIdx, dim: PrimaryDim) -> ReplicationFactor;
+    /// `lds.scale_.at(getDimIndexInLayoutOrder(dsType_, dim))`, and ⛔ [`None`] IS
+    /// `getDimIndexInLayoutOrder < 0` — a dim this ds type's layout order does not name. Entry 259
+    /// indexes with it unguarded, so the reference THROWS there (`ddc/ddcv1.cpp:1899`), while entry
+    /// 260 reads that case as `1` (`:2451-2452`); the two readers below spell that difference.
+    fn lds_scale(&self, lds: LdsIdx, dim: PrimaryDim) -> Option<LdsScale>;
     /// `1.0 / mxInfo_.blkSize` on a scale tensor's mx dim, and [`Density::FULL`] everywhere else.
     fn dim_density(&self, lds: LdsIdx, dim: PrimaryDim) -> Density;
     /// `dsNode.coreletSplit_.at(dim)` — how many elements each corelet takes of that dim.
@@ -1494,8 +1496,13 @@ pub trait StageSizes {
     fn stage_padding_sizes(&self, stage: DatastageId, dim: PrimaryDim) -> Option<PaddingSizes>;
     /// `getSizeDataStageForNode(node, node)` — which datastage sizes this allocation.
     fn size_stage(&self, alloc: AllocId) -> DatastageId;
-    /// The one compute op whose `opFuncName` is `GENERIC_PARTIAL_REDUCTION` takes exactly this lds as
-    /// its only input (`ddc/ddcv1.cpp:1949-1955`).
+    /// SOME compute op whose `opFuncName` is `GENERIC_PARTIAL_REDUCTION` takes exactly this lds as
+    /// its only input, which is how a tensor in a cross-core reduction declines the corelet offset
+    /// (`ddc/ddcv1.cpp:1915-1921`).
+    ///
+    /// ⚠️ THE SWEEP'S OWN `DT_CHECK(compOp.inputLabeledDs.size() == 1)` IS SWALLOWED HERE: it fires
+    /// for ANY partial-reduction op with a different input count, whether or not that op names this
+    /// lds, and a `bool` has nowhere to say so.
     fn is_sole_partial_reduction_input(&self, lds: LdsIdx) -> bool;
 }
 
@@ -1854,7 +1861,8 @@ where
     let mut non_broadcast: Vec<PrimaryDim> = Vec::new();
     let mut split: Option<PrimaryDim> = None;
     for dim in node.layout.dims().iter() {
-        if dsc.lds_replication(lds, dim) != ReplicationFactor::ONE {
+        // ⛔ `scale_.at(-1)` IS THE THROW: entry 259 has no `dimIdx < 0` guard, unlike entry 260.
+        if dsc.lds_scale(lds, dim)? != LdsScale::Unscaled {
             continue;
         }
         non_broadcast.push(dim);
@@ -2477,7 +2485,9 @@ where
                     }
                 }
             }
-            if !relevant || dsc.lds_replication(lds, dim) == ReplicationFactor(0) {
+            // `dimIdx < 0 ? 1 : scale_.at(dimIdx)`, so a dim the layout order does not name reads
+            // as unscaled and is kept.
+            if !relevant || dsc.lds_scale(lds, dim).unwrap_or(LdsScale::Unscaled).is_broadcast() {
                 continue;
             }
             for &corelet in &corelets {
@@ -2544,7 +2554,9 @@ where
         tree.prev(here.0)?;
         let stages = tree.loop_stages(here);
         for (dim, kind) in tree.loop_dims(here) {
-            if !layout.contains(&dim) || dsc.lds_replication(lds, dim) == ReplicationFactor(0) {
+            if !layout.contains(&dim)
+                || dsc.lds_scale(lds, dim).unwrap_or(LdsScale::Unscaled).is_broadcast()
+            {
                 continue;
             }
             let alloc_padding = padding.get(dim);
@@ -3022,8 +3034,12 @@ where
             output.storage
         };
         let alloc = dsc.lds_alloc(lds, comp)?;
-        let dim = inputs.allocs.get(&alloc)?.layout.outermost_dim();
+        // `layoutDimOrder_.at(0)` — the INNERMOST layout dim, whose step is exactly one stick span.
+        let dim = inputs.allocs.get(&alloc)?.layout.innermost_dim();
         let sticks = cumulative_stick_sizes(&dsc.stick_dims(lds), StickPart::Whole)?;
+        // ⚠️ THE REFERENCE'S `size = 1` DEFAULT IS THE MISSING ENTRY, WHICH [`cumulative_stick_size`]
+        // keeps; a STORED zero refuses here where the reference would multiply by it, and a cumulative
+        // stick size of zero is not a shape the reference can hold — entry 259 divides by the same one.
         let size = i64::try_from(cumulative_stick_size(&sticks, dim)?.get()).ok()?;
         let mut factor = i64::try_from(clones.len()).ok()?;
         for &clone in clones {
@@ -4518,6 +4534,7 @@ mod tests_e258_e263 {
     }
 
     /// ONE DESIGN SPACE — every fact entries 258-262 ask a DSC for.
+    #[derive(Clone)]
     struct Space {
         corelets: Vec<Corelet>,
         allocs: BTreeMap<(LdsIdx, SenComponent), AllocId>,
@@ -4528,6 +4545,9 @@ mod tests_e258_e263 {
         span: Extent,
         masking: BTreeMap<PrimaryDim, Vec<MaskRun>>,
         declares_samv: bool,
+        /// `labeledDs_.at(lds).scale_`, per dim; [`None`] is a dim the layout order does not name,
+        /// and an absent entry is unscaled.
+        scales: BTreeMap<PrimaryDim, Option<LdsScale>>,
     }
 
     impl Default for Space {
@@ -4540,6 +4560,7 @@ mod tests_e258_e263 {
                 span: Extent(16),
                 masking: BTreeMap::new(),
                 declares_samv: false,
+                scales: BTreeMap::new(),
             }
         }
     }
@@ -4613,8 +4634,11 @@ mod tests_e258_e263 {
         ) -> Extent {
             if stage == NUM { self.span } else { self.step }
         }
-        fn lds_replication(&self, _lds: LdsIdx, _dim: PrimaryDim) -> ReplicationFactor {
-            ReplicationFactor::ONE
+        fn lds_scale(&self, _lds: LdsIdx, dim: PrimaryDim) -> Option<LdsScale> {
+            self.scales
+                .get(&dim)
+                .copied()
+                .unwrap_or(Some(LdsScale::Unscaled))
         }
         fn dim_density(&self, _lds: LdsIdx, _dim: PrimaryDim) -> Density {
             Density::FULL
@@ -4975,6 +4999,157 @@ mod tests_e258_e263 {
             !sink
                 .fills
                 .contains_key(&OperandSite::TransferDst(NodeId(0), DestIdx(0)))
+        );
+    }
+
+    #[test]
+    fn a_scale_that_is_not_one_drops_a_dim_and_an_unnamed_one_parts_from_an_unscaled_one() {
+        // ⛔ ENTRY 259 TESTS `== 1` (`ddc/ddcv1.cpp:1899`), so a dim held at any OTHER positive scale
+        // is not one of its non-broadcast dims and cannot be its corelet-split dim either.
+        let metadata = Metadata {
+            cl_split_dims: BTreeSet::from([PrimaryDim::I]),
+            ..Metadata::default()
+        };
+        let scaled = Space {
+            corelets: vec![cl0(), cl1()],
+            scales: BTreeMap::from([(PrimaryDim::I, Some(LdsScale::Scaled))]),
+            ..Space::default()
+        };
+        let mut node = alloc_node(SenComponent::Lx, Some(0));
+        node.start_address.insert(core0(), cl0(), Bytes(0x80));
+        let mut allocs = AllocArena::from([(AllocId(0), node.clone())]);
+        assert_eq!(
+            calculate_cl_start_address::<Dd2, _>(&scaled, &metadata, &mut allocs, AllocId(0)),
+            Some(())
+        );
+        assert_eq!(
+            allocs[&AllocId(0)].start_address.at(core0(), cl1()),
+            Some(Bytes(0x80))
+        );
+        // At exactly one the dim IS the split dim, and the size datastage owes a corelet split for it.
+        let unscaled = Space {
+            scales: BTreeMap::from([(PrimaryDim::I, Some(LdsScale::Unscaled))]),
+            ..scaled.clone()
+        };
+        let mut allocs = AllocArena::from([(AllocId(0), node.clone())]);
+        assert_eq!(
+            calculate_cl_start_address::<Dd2, _>(&unscaled, &metadata, &mut allocs, AllocId(0)),
+            None
+        );
+        // ⛔ AND A DIM THE LAYOUT ORDER DOES NOT NAME IS ENTRY 259'S `scale_.at(-1)` THROW — with
+        // NOTHING corelet-split there is no other way for this entry to refuse, so the two spellings
+        // of an unscaled dim part here.
+        let nothing_split = Metadata::default();
+        let mut allocs = AllocArena::from([(AllocId(0), node.clone())]);
+        assert_eq!(
+            calculate_cl_start_address::<Dd2, _>(
+                &unscaled,
+                &nothing_split,
+                &mut allocs,
+                AllocId(0)
+            ),
+            Some(())
+        );
+        let unnamed = Space {
+            scales: BTreeMap::from([(PrimaryDim::I, None)]),
+            ..scaled
+        };
+        let mut allocs = AllocArena::from([(AllocId(0), node)]);
+        assert_eq!(
+            calculate_cl_start_address::<Dd2, _>(&unnamed, &nothing_split, &mut allocs, AllocId(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn entry_260_reads_an_unnamed_dim_as_unscaled_and_skips_one_the_lds_broadcasts() {
+        let base = Space {
+            allocs: BTreeMap::from([((LdsIdx(0), SenComponent::Lx), AllocId(0))]),
+            ..Space::default()
+        };
+        let mut node = alloc_node(SenComponent::Lx, Some(0));
+        node.start_address.insert(core0(), cl0(), Bytes(0x40));
+        let allocs = AllocArena::from([(AllocId(0), node)]);
+        let transfer = TransferNode {
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
+            name: NodeName("t".to_owned()),
+            src: operand(SenComponent::Lxlu, SenComponent::Lx, Some(0)),
+            dsts: Dsts::new(
+                operand(SenComponent::Lxsu, SenComponent::NoComponent, None),
+                Vec::new(),
+            ),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
+        };
+        let tree = Tree {
+            nodes: vec![NodeId(0)],
+            kinds: BTreeMap::from([(NodeId(0), NodeKind::Transfer), (LOOP.0, NodeKind::Loop)]),
+            parents: BTreeMap::from([(NodeId(0), LOOP.0), (LOOP.0, ROOT)]),
+            owners: BTreeMap::from([(NodeId(0), LOOP)]),
+            dims: BTreeMap::from([(LOOP, vec![(PrimaryDim::I, MetaDimKind::Unpadded)])]),
+            transfers: BTreeMap::from([(NodeId(0), transfer)]),
+            ..Tree::default()
+        };
+        let metadata = Metadata::default();
+        let global = GlobalData::default();
+        let offsets = |dsc: &Space| {
+            let inputs = OffsetInputs {
+                dsc,
+                tree: &tree,
+                coords: &NoCoords,
+                metadata: &metadata,
+                allocs: &allocs,
+                global: &global,
+                offsets: ElemOffsets::Datastage,
+                unpadded: UnpaddedIndexing::Forbidden,
+            };
+            let mut sink = Sink::default();
+            let outcome = fill_loop_offsets_and_addresses::<Dd2, _, _, _, _, _>(
+                &inputs,
+                &mut sink,
+                &mut NoSymbols,
+            );
+            (outcome, sink)
+        };
+        // ⭐ `dimIdx < 0 ? 1` (`ddc/ddcv1.cpp:2451-2452`) — entry 260 keeps the dim where entry 259
+        // throws on it.
+        let unnamed = Space {
+            scales: BTreeMap::from([(PrimaryDim::I, None)]),
+            ..base.clone()
+        };
+        let (outcome, sink) = offsets(&unnamed);
+        assert_eq!(outcome, Some(()));
+        assert_eq!(
+            sink.fills[&OperandSite::TransferSrc(NodeId(0))].loop_ele_offsets[&cl0()][&LOOP]
+                [&PrimaryDim::I],
+            LoopEleOffset(4)
+        );
+        // ⭐ AND `> 0` IS NOT `== 1`: a dim held at some OTHER positive scale is still kept, which is
+        // where a fractional `scale_` truncated to zero would have silently dropped it.
+        let scaled = Space {
+            scales: BTreeMap::from([(PrimaryDim::I, Some(LdsScale::Scaled))]),
+            ..base.clone()
+        };
+        let (outcome, sink) = offsets(&scaled);
+        assert_eq!(outcome, Some(()));
+        assert_eq!(
+            sink.fills[&OperandSite::TransferSrc(NodeId(0))].loop_ele_offsets[&cl0()][&LOOP]
+                [&PrimaryDim::I],
+            LoopEleOffset(4)
+        );
+        // A broadcast dim spans nothing of the allocation, so it contributes no element offset.
+        let broadcast = Space {
+            scales: BTreeMap::from([(PrimaryDim::I, Some(LdsScale::Broadcast))]),
+            ..base
+        };
+        let (outcome, sink) = offsets(&broadcast);
+        assert_eq!(outcome, Some(()));
+        assert!(
+            sink.fills[&OperandSite::TransferSrc(NodeId(0))]
+                .loop_ele_offsets
+                .is_empty()
         );
     }
 

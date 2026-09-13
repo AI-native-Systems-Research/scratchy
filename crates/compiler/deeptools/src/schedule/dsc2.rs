@@ -481,12 +481,18 @@ impl AllocLayout {
     }
 
     /// `layoutDimOrder_.at(0)` — total.
+    ///
+    /// ⚠️ INDEX 0 IS THE INNERMOST LAYOUT DIM, NOT THE OUTERMOST: `dsc/dataOpDsc.h:347` says so of
+    /// the same field by name, `dsc/dsc2.cpp:2792-2816` appends the layout dims AFTER the stick dims
+    /// into `sizesNoGaps_`, and `dsc/dsc2.cpp:2961-2963` takes a dim's stride to be the product of
+    /// everything BEFORE its index there — so index 0 has stride one. The reference's own comment at
+    /// `ddc/ddcv1.cpp:1937-1938` walks it "from the innermost to outer dimensions".
     #[must_use]
-    pub const fn outermost_dim(&self) -> PrimaryDim {
+    pub const fn innermost_dim(&self) -> PrimaryDim {
         self.first.0
     }
 
-    /// The dims with their max sizes, outermost first.
+    /// The dims with their max sizes, innermost first.
     pub fn iter(&self) -> impl Iterator<Item = (PrimaryDim, MaxDimSize)> + '_ {
         core::iter::once(self.first).chain(self.rest.iter().copied())
     }
@@ -1026,6 +1032,31 @@ impl ReplicationFactor {
     pub const ONE: Self = Self(1);
 }
 
+/// HOW MUCH OF A LAYOUT DIM ONE LDS ACTUALLY HOLDS — `LabeledDsInfo::scale_`
+/// (`dsc/dscdefn.h:332`), one entry per layout dim, as the arms the ported code distinguishes.
+///
+/// ⛔ THE REFERENCE FIELD IS A `double` AND IS NOT A COUNT: `dsc/dsc_standalone.cpp:377` pushes
+/// `1 / kij`. Nothing in this campaign reads its magnitude — entry 259 tests `== 1`
+/// (`ddc/ddcv1.cpp:1899`) and entry 260 tests `> 0` (`:2452`, `:2629`) — so these three arms are the
+/// whole surface, and a fractional scale cannot silently truncate into [`Self::Broadcast`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LdsScale {
+    /// `scale_[i] <= 0` — this lds broadcasts the dim, so it spans nothing of it.
+    Broadcast,
+    /// `0 < scale_[i] != 1` — the dim is present at a scale that is not one.
+    Scaled,
+    /// `scale_[i] == 1` — the dim is present, unscaled.
+    Unscaled,
+}
+
+impl LdsScale {
+    /// `scale_[i] > 0` INVERTED — the reference's own test, spelled as the question it answers.
+    #[must_use]
+    pub const fn is_broadcast(self) -> bool {
+        matches!(self, Self::Broadcast)
+    }
+}
+
 /// `dsc2::TransferNode` (`dsc/dsc2.h:814`) narrowed to what the ported units read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferNode {
@@ -1320,7 +1351,8 @@ impl LayoutDims {
         Self { first, rest }
     }
 
-    /// The dims, outermost first.
+    /// The dims, innermost first — the order `layoutDimOrder_` itself is in
+    /// (`dsc/dataOpDsc.h:347`, `ddc/ddcv1.cpp:1937-1938`).
     pub fn iter(&self) -> impl Iterator<Item = PrimaryDim> + '_ {
         core::iter::once(self.first).chain(self.rest.iter().copied())
     }
