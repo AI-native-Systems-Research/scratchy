@@ -98,9 +98,11 @@ use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects as lower;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient::RegType;
-use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient, uniform};
-use crate::transform::sentient::ForRef;
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, Op, Val, sentient, uniform,
+};
 use crate::transform::sentient::loop_tree::{LoopNodeId, LoopTree};
+use crate::transform::sentient::{ForRef, ops_are_equivalent};
 
 /// WHERE THE PASS MAY INSERT — the `dataflow.program_unit` the anchor loop sits in.
 ///
@@ -403,6 +405,276 @@ impl<'a> LoopAbsorptionManager<'a> {
         let end = block.len().min(at + 1 + count);
         block.drain(at + 1..end);
     }
+
+    /// Replaces: e506_canAbsorbToTheLeft
+    ///
+    /// Walk the anchor's body backwards from its second-last op against the ops immediately to its
+    /// LEFT: each pair must be the same computation, with the loop side's operands reaching the
+    /// anchor's own iter args, and every result pair must have the same number of readers.
+    ///
+    /// ⛔ THE CHECKER IS WHERE THE EFFECT IS — `iter_arg_num_to_new_start_val` is FILLED here and
+    /// spent by [`Self::absorb_into_anchor_from_left`]; a mismatch leaves whatever it filled, as the
+    /// reference does.
+    /// ⭐ AN EMPTY BODY ANSWERS `true`: the reference's `std::next(rbegin(), 1)` on a body of one op
+    /// is already `rend()`, and on an empty one is undefined.
+    pub(crate) fn can_absorb_to_the_left(&mut self, nodes_to_delete: &mut Vec<LoopNodeId>) -> bool {
+        // `if (!doChildrenLeftSiblingSubtreeHeightsMatch()) return false;` (`:137-144`).
+        if !self.do_children_left_sibling_subtree_heights_match() {
+            return false;
+        }
+        let oe = self.oe;
+        let LoopAbsorptionManager {
+            tree,
+            anchor,
+            anchor_for_op,
+            site,
+            iter_arg_num_to_new_start_val,
+            ..
+        } = self;
+        let anchor_for_op = *anchor_for_op;
+        let unit_body: &[Op] = &*site.body;
+        let Some(AnchorPositions {
+            block,
+            body,
+            terminator,
+        }) = positions_of(anchor_for_op, unit_body)
+        else {
+            return false;
+        };
+        // ⭐ INNERMOST FIRST, and harmless when the anchor is top-level and the two are one region.
+        let scope = [block, unit_body];
+        let defs = Definitions::from_innermost(&scope);
+        let Some(anchor_at) = anchor_index(anchor_for_op, block) else {
+            return false;
+        };
+        // `anchor_for_op_.getInits()` and `terminator_->getOperands()`, indexed alike.
+        let inits: Vec<Val> = carried_of(anchor_for_op, unit_body)
+            .iter()
+            .flat_map(|carried| carried.iter().map(|carried| carried.init))
+            .collect();
+        let yielded = yielded_by(terminator);
+
+        // `dcc::LoopNode *prev_sibling = anchor_->getPrevSibling();` (`:147`).
+        let mut prev_sibling = tree.prev_sibling(*anchor);
+        let mut left = anchor_at;
+        for body_at in (0..body.len().saturating_sub(1)).rev() {
+            // `if (block_it == anchor_bb_->getOperations().rend()) return false;` (`:152`).
+            let Some(next_left) = left.checked_sub(1) else {
+                return false;
+            };
+            left = next_left;
+            let op_in_loop = &body[body_at];
+            let op_to_left_of_loop = &block[left];
+
+            // `check_operand_equivalence` (`:158-188`) — `b_operand` is the loop side.
+            let mut check = |a_operand: Val, b_operand: Val| -> bool {
+                // `if (!isa<BlockArgument>(b_operand)) return false;` and
+                // `if (b_owner != anchor_for_op_) return false;` (`:163-172`).
+                let Some((b_owner, b_arg_idx)) = defs.for_arg_of(b_operand) else {
+                    return false;
+                };
+                if !is_anchor(b_owner, anchor_for_op) {
+                    return false;
+                }
+                let Some(assigned) = iter_arg_num_to_new_start_val
+                    .get(&AnchorArgNumber(b_arg_idx))
+                    .copied()
+                else {
+                    // `iter_arg_num_to_new_start_val_.insert({b_arg_idx, a_operand}); return true;`
+                    iter_arg_num_to_new_start_val.insert(AnchorArgNumber(b_arg_idx), a_operand);
+                    return true;
+                };
+                // `return a_operand_op ? oe_.operationsAreEquivalent(*it_op, *a_operand_op)
+                //                      : (it->second == a_operand);` (`:176-181`).
+                match (defs.of(a_operand), defs.of(assigned)) {
+                    (None, _) => assigned == a_operand,
+                    (Some(a_operand_op), Some(it_op)) => {
+                        ops_are_equivalent(it_op, a_operand_op, defs, oe.block_args, &mut None)
+                    }
+                    // ⛔ THE REFERENCE DEREFERENCES A NULL `it_op` HERE (`:178-181`): the assigned
+                    // start value is itself a region argument while `a_operand` is a result.
+                    (Some(_), None) => todo!(
+                        "LoopAbsorption.cpp:178-181 dereferences a null defining op for the \\
+                         already-assigned starting value"
+                    ),
+                }
+            };
+            let mut checker: Option<&mut dyn FnMut(Val, Val) -> bool> = Some(&mut check);
+            if !ops_are_equivalent(
+                op_to_left_of_loop,
+                op_in_loop,
+                defs,
+                oe.block_args,
+                &mut checker,
+            ) {
+                return false;
+            }
+
+            // `zip(op_to_left_of_loop.getResults(), op_in_loop.getResults())` (`:198-222`).
+            for (left_result, loop_result) in dialects::results(op_to_left_of_loop)
+                .into_iter()
+                .zip(dialects::results(op_in_loop))
+            {
+                if dialects::use_count(left_result, unit_body)
+                    != dialects::use_count(loop_result, unit_body)
+                {
+                    return false;
+                }
+                // Whatever the loop yields must already start from the op to its left.
+                for (i, yielded_val) in yielded.iter().enumerate() {
+                    if *yielded_val == loop_result && inits.get(i) != Some(&left_result) {
+                        return false;
+                    }
+                }
+            }
+
+            // `if (isa<sentient::ForOp>(op_in_loop)) { nodes_to_delete.push_back(prev_sibling); .. }`
+            // (`:223-226`). ⭐ e068 PROVED THE SIBLING IS THERE for every child, so `None` is a
+            // refusal rather than the reference's null push.
+            if matches!(op_in_loop, Op::Sentient(sentient::Op::For { .. })) {
+                let Some(sibling) = prev_sibling else {
+                    return false;
+                };
+                nodes_to_delete.push(sibling);
+                prev_sibling = tree.prev_sibling(sibling);
+            }
+        }
+        true
+    }
+
+    /// Replaces: e507_canAbsorbToTheRight
+    ///
+    /// [`Self::can_absorb_to_the_left`] mirrored: the anchor's body forwards from its FIRST op
+    /// against the ops immediately to its RIGHT, with each iter arg's reader count required to match
+    /// its result's up front.
+    ///
+    /// ⛔ THE EFFECT IS `to_update` — the old→new result rewrites [`Self::absorb_into_anchor_from_right`]
+    /// spends.
+    /// ⭐ THE `- 1` ON THE ARGUMENT NUMBER IS THE REFERENCE'S OWN (`:334-336`), and argument #0 — the
+    /// induction variable — has no carried slot to name, so it never matches.
+    pub(crate) fn can_absorb_to_the_right(
+        &mut self,
+        nodes_to_delete: &mut Vec<LoopNodeId>,
+    ) -> bool {
+        // `if (!doChildrenRightSiblingSubtreeHeightsMatch()) return false;` (`:284-291`).
+        if !self.do_children_right_sibling_subtree_heights_match() {
+            return false;
+        }
+        let oe = self.oe;
+        let LoopAbsorptionManager {
+            tree,
+            anchor,
+            anchor_for_op,
+            site,
+            to_update,
+            ..
+        } = self;
+        let anchor_for_op = *anchor_for_op;
+        let unit_body: &[Op] = &*site.body;
+        let Some(AnchorPositions {
+            block,
+            body,
+            terminator,
+        }) = positions_of(anchor_for_op, unit_body)
+        else {
+            return false;
+        };
+        let scope = [block, unit_body];
+        let defs = Definitions::from_innermost(&scope);
+        let Some(anchor_at) = anchor_index(anchor_for_op, block) else {
+            return false;
+        };
+        let carried = carried_of(anchor_for_op, unit_body);
+        let yielded = yielded_by(terminator);
+
+        // `zip(getRegionIterArgs(), getResults())`: an iter arg read more often than its result is
+        // read is one whose absorption would drop a reader (`:293-307`).
+        for slot in carried.into_iter().flatten() {
+            if dialects::use_count(slot.arg, unit_body)
+                != dialects::use_count(slot.result, unit_body)
+            {
+                return false;
+            }
+        }
+        let results: Vec<Val> = carried
+            .iter()
+            .flat_map(|carried| carried.iter().map(|carried| carried.result))
+            .collect();
+
+        // `dcc::LoopNode *next_sibling = anchor_->getNextSibling();` (`:309`).
+        let mut next_sibling = tree.next_sibling(*anchor);
+        let mut right = anchor_at;
+        for op_in_loop in body.iter().take(body.len().saturating_sub(1)) {
+            right += 1;
+            // `if (block_it == anchor_bb_->getOperations().end()) return false;` (`:318`).
+            let Some(op_to_right_of_loop) = block.get(right) else {
+                return false;
+            };
+
+            // `check_operand_equivalence` (`:322-341`) — here `a_operand` is the loop side.
+            let mut check = |a_operand: Val, b_operand: Val| -> bool {
+                let (Some((a_owner, a_arg_num)), Some(b_operand_op)) =
+                    (defs.for_arg_of(a_operand), defs.of(b_operand))
+                else {
+                    return false;
+                };
+                // `getArgNumber() - 1` — argument #0 is the induction variable and names no slot.
+                let Some(a_arg_idx) = a_arg_num.checked_sub(1) else {
+                    return false;
+                };
+                let Some(b_res_idx) = dialects::results(b_operand_op)
+                    .iter()
+                    .position(|result| *result == b_operand)
+                else {
+                    return false;
+                };
+                is_anchor(a_owner, anchor_for_op)
+                    && is_anchor(b_operand_op, anchor_for_op)
+                    && a_arg_idx == b_res_idx
+            };
+            let mut checker: Option<&mut dyn FnMut(Val, Val) -> bool> = Some(&mut check);
+            if !ops_are_equivalent(
+                op_in_loop,
+                op_to_right_of_loop,
+                defs,
+                oe.block_args,
+                &mut checker,
+            ) {
+                return false;
+            }
+
+            // `zip(op_in_loop.getResults(), op_to_right_of_loop.getResults())` (`:350-374`).
+            for (loop_result, right_result) in dialects::results(op_in_loop)
+                .into_iter()
+                .zip(dialects::results(op_to_right_of_loop))
+            {
+                match yielded.iter().position(|yielded| *yielded == loop_result) {
+                    // A yielded result already leaves the loop, so the op to the right can read it.
+                    Some(yield_idx) => {
+                        if let Some(result) = results.get(yield_idx) {
+                            to_update.insert(right_result, *result);
+                        }
+                    }
+                    None => {
+                        if dialects::use_count(loop_result, unit_body)
+                            != dialects::use_count(right_result, unit_body)
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            if matches!(op_in_loop, Op::Sentient(sentient::Op::For { .. })) {
+                let Some(sibling) = next_sibling else {
+                    return false;
+                };
+                nodes_to_delete.push(sibling);
+                next_sibling = tree.next_sibling(sibling);
+            }
+        }
+        true
+    }
 }
 
 /// `sentient.scalar_constant` holding `value` — the op both `ConstantOp::create` calls mint.
@@ -641,15 +913,42 @@ fn is_used(scope: &mut [Op], val: Val) -> bool {
     false
 }
 
-// crustify:todo: e506_canAbsorbToTheLeft
-//   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:135  (99 body lines, level 3)
-//   original  : bool LoopAbsorptionManager::canAbsorbToTheLeft( std::vector<dcc::LoopNode *> &nodes_to_delete)
-//   calls     : e068_doChildrenLeftSiblingSubtreeHeightsMatch, e422_insert
+/// `op == anchor_for_op_` — the identity comparison both checkers make on a block argument's owner.
+fn is_anchor(op: &Op, anchor_for_op: ForRef) -> bool {
+    matches!(op, Op::Sentient(sentient::Op::For { iv, .. }) if *iv == anchor_for_op.0)
+}
 
-// crustify:todo: e507_canAbsorbToTheRight
-//   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:282  (103 body lines, level 3)
-//   original  : bool LoopAbsorptionManager::canAbsorbToTheRight( std::vector<dcc::LoopNode *> &nodes_to_delete)
-//   calls     : e069_doChildrenRightSiblingSubtreeHeightsMatch, e422_insert
+/// `Block::iterator(anchor_for_op_)` — where the anchor sits in the block holding it.
+fn anchor_index(for_op: ForRef, block: &[Op]) -> Option<usize> {
+    block.iter().position(|op| is_anchor(op, for_op))
+}
+
+/// `anchor_for_op_.getInits()`, `getRegionIterArgs()` and `getResults()` in one lookup — the anchor's
+/// `$initArgs` slots, which hold all three lists side by side.
+fn carried_of(for_op: ForRef, scope: &[Op]) -> Option<&[sentient::Carried]> {
+    for op in scope {
+        if let Op::Sentient(sentient::Op::For { iv, carried, .. }) = op
+            && *iv == for_op.0
+        {
+            return Some(carried.as_slice());
+        }
+        for region in regions_of(op) {
+            if let Some(found) = carried_of(for_op, region) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// `terminator_->getOperands()` — what the anchor's body hands back, and nothing for a body whose
+/// last op is not a `sentient.yield`.
+fn yielded_by(terminator: Option<&sentient::Op>) -> &[Val] {
+    match terminator {
+        Some(sentient::Op::Yield { results }) => results.as_slice(),
+        _ => &[],
+    }
+}
 
 // crustify:todo: e562_absorptionAnalysis
 //   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:424  (65 body lines, level 4)
@@ -721,6 +1020,50 @@ mod unit_tests {
             body.push(for_op(iv, bound, kids));
         }
         (body, anchor_iv)
+    }
+
+    /// One `sentient.for` carrying one value, `body` closed by a `sentient.yield` of `yielded`.
+    fn for_yielding(
+        iv: Val,
+        bound: Val,
+        carried: sentient::Carried,
+        body: Vec<Op>,
+        yielded: Val,
+    ) -> Op {
+        let mut body = body;
+        body.push(Op::Sentient(sentient::Op::Yield {
+            results: vec![yielded],
+        }));
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
+            bound_reg: None,
+            carried: vec![carried],
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// `sentient.scalar_add` — a two-operand op, so a checker is asked twice about one pair of ops.
+    fn add(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            ty: ScalarTy::Index,
+            element_size: None,
+        })
+    }
+
+    /// The manager over `body`, anchored on the loop binding `iv`.
+    fn anchored<'a>(
+        body: &'a mut Vec<Op>,
+        preamble: &'a mut Vec<Op>,
+        tree: &'a mut LoopTree<true>,
+        worklist: &'a mut Vec<LoopNodeId>,
+    ) -> LoopAbsorptionManager<'a> {
+        LoopAbsorptionManager::new(worklist, tree, UnitSite { preamble, body }).unwrap()
     }
 
     /// e068 over one [`scenario`].
@@ -984,5 +1327,99 @@ mod unit_tests {
             Op::Sentient(sentient::Op::ScalarAdd { lhs, rhs, .. })
                 if *lhs == result && *rhs == result
         ));
+    }
+    /// e506, on the vendor's own left case (`LoopAbsorption.cpp:108-120`): the op to the left reads
+    /// `%zero` where the loop's own op reads its iter arg, and that iter arg starts from the left
+    /// op's result — so `%zero` becomes the new starting value. The negative is a second operand the
+    /// already-assigned start value contradicts.
+    #[test]
+    fn can_absorb_to_the_left_records_the_new_starting_value() {
+        fn absorb(second_operand_differs: bool) -> (bool, BTreeMap<AnchorArgNumber, Val>) {
+            let mut vals = Values::default();
+            let bound = vals.mint();
+            let zero = vals.mint();
+            let other = vals.mint();
+            let left = vals.mint();
+            let iv = vals.mint();
+            let arg = vals.mint();
+            let result = vals.mint();
+            let inner = vals.mint();
+            let left_rhs = if second_operand_differs { other } else { zero };
+            let mut body = vec![
+                constant(bound, 5, ScalarTy::Index),
+                constant(zero, 0, ScalarTy::Index),
+                constant(other, 3, ScalarTy::Index),
+                add(zero, left_rhs, left),
+                for_yielding(
+                    iv,
+                    bound,
+                    carried(left, arg, result),
+                    vec![add(arg, arg, inner)],
+                    inner,
+                ),
+            ];
+            let mut tree = LoopTree::<true>::of(&body);
+            let mut worklist = vec![tree.node_of(ForRef(iv)).unwrap()];
+            let mut preamble = Vec::new();
+            let mut manager = anchored(&mut body, &mut preamble, &mut tree, &mut worklist);
+            let mut nodes_to_delete = Vec::new();
+            let answer = manager.can_absorb_to_the_left(&mut nodes_to_delete);
+            assert!(nodes_to_delete.is_empty(), "the absorbed op is not a loop");
+            (answer, manager.iter_arg_num_to_new_start_val.clone())
+        }
+
+        let (matched, assigned) = absorb(false);
+        assert!(matched);
+        // ⭐ ARGUMENT #1, so `inits[0]` — see [`AnchorArgNumber`].
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned.keys().next(), Some(&AnchorArgNumber(1)));
+
+        assert!(!absorb(true).0);
+    }
+
+    /// e507, on the vendor's own right case (`LoopAbsorption.cpp:252-267`): the op to the right reads
+    /// the loop's result where the loop's own op reads the matching iter arg, so the reader is
+    /// repointed at the anchor. The negative is an iter arg read more often than its result.
+    #[test]
+    fn can_absorb_to_the_right_repoints_the_reader_at_the_anchor() {
+        fn absorb(result_read_once: bool) -> (bool, BTreeMap<Val, Val>, Val, Val) {
+            let mut vals = Values::default();
+            let bound = vals.mint();
+            let zero = vals.mint();
+            let other = vals.mint();
+            let iv = vals.mint();
+            let arg = vals.mint();
+            let result = vals.mint();
+            let inner = vals.mint();
+            let right = vals.mint();
+            let right_rhs = if result_read_once { other } else { result };
+            let mut body = vec![
+                constant(bound, 5, ScalarTy::Index),
+                constant(zero, 0, ScalarTy::Index),
+                constant(other, 3, ScalarTy::Index),
+                for_yielding(
+                    iv,
+                    bound,
+                    carried(zero, arg, result),
+                    vec![add(arg, arg, inner)],
+                    inner,
+                ),
+                add(result, right_rhs, right),
+            ];
+            let mut tree = LoopTree::<true>::of(&body);
+            let mut worklist = vec![tree.node_of(ForRef(iv)).unwrap()];
+            let mut preamble = Vec::new();
+            let mut manager = anchored(&mut body, &mut preamble, &mut tree, &mut worklist);
+            let mut nodes_to_delete = Vec::new();
+            let answer = manager.can_absorb_to_the_right(&mut nodes_to_delete);
+            assert!(nodes_to_delete.is_empty(), "the absorbed op is not a loop");
+            (answer, manager.to_update.clone(), right, result)
+        }
+
+        let (matched, to_update, right, result) = absorb(false);
+        assert!(matched);
+        assert_eq!(to_update.get(&right), Some(&result));
+
+        assert!(!absorb(true).0);
     }
 }

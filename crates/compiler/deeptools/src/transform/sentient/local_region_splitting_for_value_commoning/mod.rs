@@ -88,7 +88,12 @@ pub(crate) mod local_region;
 pub(crate) mod uniform_region;
 
 use crate::arch::Arch;
-use crate::islands::sentient::dialects::{Definitions, Op, UniformRegions, Val, sentient, uniform};
+use crate::formats::Bits;
+use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, Op, UniformRegions, Val, sentient, uniform,
+};
+use crate::transform::sentient::utils::{Hoisted, NewUse, move_to_common_dominator, path_of};
 use local_region::{LocalRegion, OriginalRegion};
 use sentient::RegType;
 use sys_arch_spec::regfile::{Component, Presence, RegType as RegFile, depth_of};
@@ -417,11 +422,183 @@ pub fn analyze<A: Arch>(
     answer
 }
 
+/// THE COMMONING KEY — `std::make_tuple(const value, locale, element size)` (`:404-406`, `:418-420`).
+///
+/// ⛔ NOT A MAP KEY: [`RegType`] orders nothing and the reference's `DenseMap` is unordered too —
+/// *first insertion wins* (`:407`) is the whole of that map's contract, and a `Vec` states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyKey {
+    /// `const_op.getValue()`.
+    value: i64,
+    /// `sentient::getValueRegLocale(copy_op.getResult())`, which on a `CopyOp` is its own
+    /// `getRegLocale()` (`Dialect/Sentient/SentientOps.cpp:1758`).
+    locale: RegType,
+    /// `getAttr(copy_op.getResult(), "element_size")` — `None` is the absent attribute the reference's
+    /// `cast<IntegerAttr>` would fail on.
+    element_size: Option<Bits>,
+}
 
-// crustify:todo: e505_transform
-//   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:347  (91 body lines, level 3)
-//   original  : void LocalRegionSplittingForValueCommoningPass::transform( const lrs::UniformRegion &ur)
-//   calls     : e252_size, e395_pruneOutOfScopeEntries, e422_insert
+/// Replaces: e505_transform
+///
+/// Rebuilds the `uniform.uniformize_regions` with one region per local region [`analyze`] decided on,
+/// then commons the constant-fed `sentient.scalar_copy`s of one (value, locale, element size).
+///
+/// ⛔ `replaceAllUsesWith` (`:376`) IS A NO-OP: the new op reuses the original's `$results` verbatim.
+/// ⛔ THE PRUNE (`:379-386`) IS THE UNPORTED `e395_pruneOutOfScopeEntries`, GATED on a map being in the
+/// new op — an unconditional `todo!` would put the commoning below out of reach.
+pub fn transform(unit_body: &mut Vec<Op>, ur: &UniformRegion, values: &mut Values) {
+    let Some(at) = original_op_index(unit_body, ur) else {
+        return;
+    };
+    // ── the new op, region for region with what `analyze` appended (`:349-374`) ──
+    let Op::UniformRegions(UniformRegions::UniformizeRegions {
+        regions,
+        results,
+        yielded,
+    }) = &unit_body[at]
+    else {
+        panic!(
+            "transform takes a uniform.uniformize_regions and nothing else \
+             (LocalRegionSplittingForValueCommoning.cpp:347-360)"
+        )
+    };
+    let (results, yielded) = (results.clone(), yielded.clone());
+    let mut new_regions = Vec::with_capacity(ur.local_regions.len());
+    for local_region in &ur.local_regions {
+        let Some(original) = regions
+            .iter()
+            .find(|region| region.arg == local_region.original_region.0)
+        else {
+            panic!(
+                "a transformed local region names a region the original op does not have \
+                 (LocalRegionSplittingForValueCommoning.cpp:366-368)"
+            )
+        };
+        // `bv_map.map(original.getArgument(0), new_uniform_op.getRegion(i).getArgument(0))` — the one
+        // entry the clone is seeded with, and the reason each new region needs its own argument: one
+        // original region may be split into several.
+        let arg = values.mint();
+        let mut mapping = ValueMapping::new();
+        mapping.map(original.arg, arg);
+        new_regions.push(dialects::LocalRegion {
+            arg,
+            units: local_region.units.clone(),
+            body: dialects::clone_ops(&original.body, values, &mut mapping),
+        });
+    }
+    unit_body[at] = Op::UniformRegions(UniformRegions::UniformizeRegions {
+        regions: new_regions,
+        results,
+        yielded,
+    });
+
+    // ⛔ THE GATE: with no `uniform.def_immutable_mapping` in the new op the reference's walk visits
+    // nothing and `to_be_deleted` stays empty, so this is the whole of `:379-386` for such an op.
+    if holds_uniform_map(core::slice::from_ref(&unit_body[at])) {
+        todo!(
+            "e395_pruneOutOfScopeEntries (dcc/src/Transform/Sentient/Utils.cpp:635) — homed in \
+             transform::sentient::utils, anchor not yet filled"
+        )
+    }
+
+    // ── commoning for copies that have constant operands, no maps (`:388-412`) ──
+    let scope: [&[Op]; 1] = [unit_body.as_slice()];
+    let defs = Definitions::from_innermost(&scope);
+    let mut copies: Vec<(CopyKey, Val)> = Vec::new();
+    for region in dialects::regions_ref(&unit_body[at]) {
+        walk_pre_order(region, &mut |op| {
+            let sentient::Op::ScalarCopy {
+                input,
+                result,
+                reg,
+                element_size,
+                ..
+            } = op
+            else {
+                return;
+            };
+            let Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) = defs.of(*input)
+            else {
+                return;
+            };
+            copies.push((
+                CopyKey {
+                    value: *value,
+                    locale: reg.locale,
+                    element_size: *element_size,
+                },
+                *result,
+            ));
+        });
+    }
+    // `copy_op_aliases.insert(..)` — `DenseMap::insert` leaves an existing entry alone (`:407`).
+    let mut aliases: Vec<(CopyKey, Val)> = Vec::new();
+    for (key, result) in &copies {
+        if !aliases.iter().any(|(seen, _)| seen == key) {
+            aliases.push((*key, *result));
+        }
+    }
+
+    for (key, result) in copies {
+        let Some(alias) = aliases
+            .iter()
+            .find(|(seen, _)| *seen == key)
+            .map(|(_, alias)| *alias)
+        else {
+            continue;
+        };
+        // `if (it->getSecond() == copy_op) continue;` (`:425`).
+        if alias == result {
+            continue;
+        }
+        // ⭐ THE POSITIONS ARE RE-FOUND EVERY ITERATION: the reference holds `Operation *`s, which
+        // survive the erases and moves below, and a path does not.
+        let (Some(alias_at), Some(copy_at)) =
+            (path_of(unit_body, alias), path_of(unit_body, result))
+        else {
+            continue;
+        };
+        // ⭐ THE CLIMB LEAVES THE LOCAL REGION RATHER THAN STOPPING AT IT, and that is `e241`'s
+        // `promote_above_uniform_region` (`Transform/Sentient/Utils.cpp:104-112`) answering true: every
+        // copy collected above reads a `sentient.scalar_constant`, which is one of its three cases.
+        match move_to_common_dominator(unit_body, &alias_at, &NewUse::SameUnit(copy_at)) {
+            Hoisted::Done => {}
+            // ⛔ UNREACHABLE BY [`NewUse`]'S OWN PROOF: both copies are ops of this unit body.
+            Hoisted::OutsideProgramUnit => panic!(
+                "failed to move copy op to common dominator \
+                 (LocalRegionSplittingForValueCommoning.cpp:429-433)"
+            ),
+        }
+        dialects::replace_all_uses_with(unit_body, result, alias);
+        dialects::erase_defining_op(unit_body, result);
+    }
+
+    // TODO(reference `:436-437`): commoning of copies that have maps as operands is only needed once
+    // `cluster` (e308) does actual clustering.
+}
+
+/// `ur.getOriginalOp()` — the `uniform.uniformize_regions` named by the argument of its first region.
+///
+/// ⭐ THE UNIT BODY'S OWN BLOCK AND NOT THE WHOLE TREE: `UniformizeRegions` builds these ops at the top
+/// of a `dataflow.program_unit` and nothing nests one, which is also why `analyze` is handed one op.
+fn original_op_index(unit_body: &[Op], ur: &UniformRegion) -> Option<usize> {
+    unit_body.iter().position(|op| match op {
+        Op::UniformRegions(regions) => regions
+            .regions()
+            .first()
+            .is_some_and(|first| first.arg == ur.original_uro.0),
+        _ => false,
+    })
+}
+
+/// Whether `ops` hold a `uniform.def_immutable_mapping` anywhere under them — the walk at `:381-385`,
+/// asked only whether it would visit anything.
+fn holds_uniform_map(ops: &[Op]) -> bool {
+    ops.iter().any(|op| {
+        matches!(op, Op::Uniform(uniform::Op::DefImmutableMapping { .. }))
+            || dialects::regions_ref(op).into_iter().any(holds_uniform_map)
+    })
+}
 
 // crustify:todo: e561_run
 //   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:252  (19 body lines, level 4)
@@ -639,5 +816,82 @@ mod unit_tests {
         assert_eq!(ur.local_regions[2].units, vec![Val(2)]);
         assert_eq!(ur.local_regions[1].original_region, OriginalRegion(Val(51)));
         assert_eq!(ur.local_regions[2].original_region, OriginalRegion(Val(51)));
+    }
+    /// e505 — two local regions each copying the SAME constant into the same locale: the second copy
+    /// goes, its reader is repointed at the first, and the first is hoisted above the uniform op,
+    /// which is the only block that dominates both regions.
+    #[test]
+    fn transform_commons_a_constant_copy_across_two_local_regions() {
+        let constant = Op::Sentient(sentient::Op::ScalarConstant {
+            value: 7,
+            result: Val(1),
+            reg_locale: RegType::Imm,
+            ty: crate::islands::dataflow_ir::ty::ScalarTy::Index,
+            is_symbol: false,
+        });
+        let mut unit_body = vec![
+            constant,
+            Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![
+                    IrLocalRegion {
+                        arg: Val(10),
+                        units: vec![],
+                        body: vec![scalar_copy(Val(1), Val(11), RegType::Ebr)],
+                    },
+                    IrLocalRegion {
+                        arg: Val(20),
+                        units: vec![],
+                        body: vec![
+                            scalar_copy(Val(1), Val(21), RegType::Ebr),
+                            scalar_copy(Val(21), Val(22), RegType::Ebr),
+                        ],
+                    },
+                ],
+                results: Vec::new(),
+                yielded: Vec::new(),
+            }),
+        ];
+        let ur = UniformRegion {
+            local_regions: vec![
+                LocalRegion {
+                    units: Vec::new(),
+                    original_region: OriginalRegion(Val(10)),
+                },
+                LocalRegion {
+                    units: Vec::new(),
+                    original_region: OriginalRegion(Val(20)),
+                },
+            ],
+            original_uro: uniform_region::UniformizeRegions(Val(10)),
+        };
+        let mut values = Values::default();
+        for _ in 0..30 {
+            values.mint();
+        }
+        transform(&mut unit_body, &ur, &mut values);
+
+        // The survivor sits between the constant and the uniform op.
+        assert_eq!(unit_body.len(), 3);
+        let Op::Sentient(sentient::Op::ScalarCopy {
+            input,
+            result: survivor,
+            ..
+        }) = unit_body[1]
+        else {
+            panic!("the commoned copy was hoisted out of its local region")
+        };
+        assert_eq!(input, Val(1));
+        let Op::UniformRegions(new_op) = &unit_body[2] else {
+            panic!("the rebuilt uniform.uniformize_regions is the last op")
+        };
+        // Region 0 gave up its copy to the hoist; region 1 kept only the reader, now on the survivor.
+        assert!(new_op.regions()[0].body.is_empty());
+        assert_eq!(new_op.regions()[1].body.len(), 1);
+        let Op::Sentient(sentient::Op::ScalarCopy { input: read, .. }) =
+            new_op.regions()[1].body[0]
+        else {
+            panic!("the reader of the erased copy survives")
+        };
+        assert_eq!(read, survivor);
     }
 }

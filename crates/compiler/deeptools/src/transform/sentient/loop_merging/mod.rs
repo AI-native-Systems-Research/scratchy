@@ -82,8 +82,11 @@
 //! | `e601_runOn` | 601 | 5 | 13 | `dcc/src/Transform/Sentient/LoopMerging.cpp:321` |
 //! | `e627_runOnOperation` | 627 | 6 | 5 | `dcc/src/Transform/Sentient/LoopMerging.cpp:335` |
 
+use std::collections::BTreeMap;
+
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
-    DbgNamePrefix, new_dbg_name_from_list,
+    BlockArgEquivalence, DbgNamePrefix, EquivalenceTag, OperationEquivalence, SubregionCompare,
+    new_dbg_name_from_list,
 };
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -91,7 +94,24 @@ use crate::islands::sentient::dialects::{
     Definitions, Op, Val, dataflow, erase_defining_op, replace_all_uses_with, sentient, symbol,
     uniform, use_count,
 };
-use crate::transform::sentient::utils::{ConstKind, is_constant};
+use crate::transform::sentient::loop_coalescing::TripLimit;
+use crate::transform::sentient::regions_are_equivalent;
+use crate::transform::sentient::utils::{ConstKind, ConstantImm, constant_imm, is_constant};
+
+/// `oe_` (`LoopMerging.cpp:58-61`) — this pass's one comparison configuration.
+///
+/// ⛔ `all_block_args_are_equiv` IS `false`, so a pair of iter args the per-call checker declines is a
+/// MISMATCH and not a match. It is built identically to loop absorption's (`LoopAbsorption.cpp:43-46`)
+/// and differs from loop rolling's, which passes `true` (`LoopRolling.cpp:987-989`).
+const OE: OperationEquivalence = OperationEquivalence::tagged(
+    EquivalenceTag::LoopMerging,
+    SubregionCompare::Recursive,
+    BlockArgEquivalence::SameOwnerAndIndex,
+);
+
+/// `cl::opt<bool> EnableDynamicLoopMerging("dcc-loop-merging-dynamic-loops", .., cl::init(false))`
+/// (`LoopMerging.cpp:36-39`) — off, so a loop whose trip count is not a constant never merges.
+pub const ENABLE_DYNAMIC_LOOP_MERGING: bool = false;
 
 /// WHERE AN OP SITS IN ITS BLOCK — the `Operation *` identity `loopsAreMergeable` compares against
 /// the second loop (`:85`).
@@ -419,10 +439,124 @@ enum BuiltBound {
     BeforeTheParentsFirstChild(Op),
 }
 
-// crustify:todo: e508_loopsAreMergeable
-//   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:83  (94 body lines, level 3)
-//   original  : bool LoopMergingPass::loopsAreMergeable(sentient::ForOp loop_a, sentient::ForOp loop_b)
-//   calls     : e075_getNextEligibleOp, e252_size, e422_insert
+/// `dcc::utils::isSumLessThanLCCRMaxValue` (`Analyses/Utils.cpp:343` and `:379`) — BOTH overloads, as
+/// one question about two trip counts.
+///
+/// ⛔ NOT AN ANCHORED UNIT — `Transform/Sentient/Analyses/` is out of campaign scope, and this is the
+/// arithmetic half, which [`ConstantImm`] already carries. The reference's `DT_CHECK` on two query
+/// maps of different lengths is a refusal here.
+fn is_sum_less_than_lccr_max_value(a: &ConstantImm, b: &ConstantImm) -> bool {
+    let fits = |sum: i64| sum <= TripLimit::LCCR.0;
+    match (a, b) {
+        (ConstantImm::Scalar(a), ConstantImm::Scalar(b)) => fits(a.saturating_add(*b)),
+        // The `(op, int64_t)` overload: one side folds to a scalar the other's every unit adds.
+        (ConstantImm::Scalar(scalar), ConstantImm::PerUnit(values))
+        | (ConstantImm::PerUnit(values), ConstantImm::Scalar(scalar)) => values
+            .iter()
+            .all(|value| fits(value.saturating_add(*scalar))),
+        (ConstantImm::PerUnit(a), ConstantImm::PerUnit(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| fits(a.saturating_add(*b)))
+        }
+    }
+}
+
+/// The `sentient.for` body at `at` — `for_op.getLoopBody()`.
+fn loop_body_at(block: &[Op], at: InBlock) -> Option<&[Op]> {
+    match block.get(at.0) {
+        Some(Op::Sentient(sentient::Op::For { body, .. })) => Some(body.as_slice()),
+        _ => None,
+    }
+}
+
+/// Replaces: e508_loopsAreMergeable
+///
+/// Two adjacent `sentient.for`s merge when their trip counts still fit one LCCR, the second picks its
+/// iter args up where the first left them, and their bodies are the same computation modulo that.
+///
+/// ⛔ `mergeable_block_args` IS A LOCAL, not a field: written and read only here (`:130`, `:154-156`).
+/// ⭐ A LOOP CARRYING NOTHING SKIPS THE PICK-UP TEST (`:110`) — effect-only loops merge on bodies alone.
+#[must_use]
+pub fn loops_are_mergeable(
+    unit_body: &[Op],
+    nest: &[usize],
+    loop_a: InBlock,
+    loop_b: InBlock,
+) -> bool {
+    let Some(siblings) = block_at(unit_body, nest) else {
+        return false;
+    };
+    // `if (getNextEligibleOp(loop_a) != loop_b) return false;` (`:85-90`).
+    if get_next_eligible_op(siblings, loop_a) != Some(loop_b) {
+        return false;
+    }
+    let (Some((bound_a, carried_a, _)), Some((bound_b, carried_b, _))) =
+        (loop_at(siblings, loop_a), loop_at(siblings, loop_b))
+    else {
+        return false;
+    };
+    let defs = Definitions::from_innermost(core::slice::from_ref(&unit_body));
+
+    // `isConstant<sentient::ConstantOp>` on both bounds, then their sum against the LCCR (`:92-107`).
+    match (constant_imm(bound_a, defs), constant_imm(bound_b, defs)) {
+        (Some(a), Some(b)) => {
+            if !is_sum_less_than_lccr_max_value(&a, &b) {
+                return false;
+            }
+        }
+        // `else if (!EnableDynamicLoopMerging)` — it is off, so this is always a refusal.
+        _ if !ENABLE_DYNAMIC_LOOP_MERGING => return false,
+        _ => {}
+    }
+
+    // `mergeable_block_args` — a's region iter arg to b's, for the checker below.
+    let mut mergeable_block_args: BTreeMap<Val, Val> = BTreeMap::new();
+    if !carried_a.is_empty() {
+        // *"the iter_args of the second loop pick up where the previous loop left"* (`:111-126`).
+        let picks_up = carried_a.len() == carried_b.len()
+            && carried_a.iter().zip(carried_b).all(|(a, b)| {
+                // `hasOneUse()` AND that one use being `loop_b` IS `result == init`: the init is a
+                // use, so one use that is also the init leaves no other.
+                use_count(a.result, unit_body) == 1 && a.result == b.init
+            });
+        if picks_up {
+            for (a, b) in carried_a.iter().zip(carried_b) {
+                mergeable_block_args.insert(a.arg, b.arg);
+            }
+        } else if carried_a
+            .iter()
+            .map(|a| a.result)
+            .chain(carried_b.iter().map(|b| b.arg))
+            .any(|val| use_count(val, unit_body) != 0)
+        {
+            // *"results or iter_args with non-empty use sets are not constrained"* (`:135-142`).
+            return false;
+        }
+    }
+
+    let (Some(body_a), Some(body_b)) = (
+        loop_body_at(siblings, loop_a),
+        loop_body_at(siblings, loop_b),
+    ) else {
+        return false;
+    };
+    // `operands_are_equiv` (`:146-171`) — a pair of iter args matches only through the map.
+    let mut check = |a_operand: Val, b_operand: Val| -> bool {
+        defs.of(a_operand).is_none()
+            && defs.of(b_operand).is_none()
+            && mergeable_block_args.get(&a_operand) == Some(&b_operand)
+    };
+    let mut checker: Option<&mut dyn FnMut(Val, Val) -> bool> = Some(&mut check);
+    // ⭐ THE BLOCK ARGUMENT COUNT IS `1 + carried` — the induction variable then the iter args.
+    regions_are_equivalent(
+        1 + carried_a.len(),
+        body_a,
+        1 + carried_b.len(),
+        body_b,
+        defs,
+        OE.block_args,
+        &mut checker,
+    )
+}
 
 // crustify:todo: e564_runLoopMerging
 //   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:281  (39 body lines, level 4)
@@ -512,6 +646,24 @@ mod unit_tests {
                 key: Val(3),
             }),
         ]
+    }
+
+    /// Two constant-bounded loops whose counts fit one LCCR are mergeable; the same pair whose counts
+    /// overflow it is not — `isSumLessThanLCCRMaxValue` is the only difference between the two.
+    #[test]
+    fn e508_refuses_a_pair_whose_trip_counts_overflow_one_lccr() {
+        fn mergeable(first: i64, second: i64) -> bool {
+            let block = vec![
+                constant_of(Val(10), first),
+                constant_of(Val(11), second),
+                loop_over(Val(10), Val(20), None),
+                loop_over(Val(11), Val(21), None),
+            ];
+            loops_are_mergeable(&block, &[], InBlock(2), InBlock(3))
+        }
+
+        assert!(mergeable(5, 7));
+        assert!(!mergeable(60_000, 60_000));
     }
 
     /// Two loops separated by all five skipped ops are adjacent; one separated by anything else is

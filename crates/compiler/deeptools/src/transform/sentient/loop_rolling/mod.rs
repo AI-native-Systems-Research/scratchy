@@ -97,26 +97,6 @@
 // ── STILL SCHEDULED IN THIS FILE (levels 1..8) — anchors, not dead comments. ⛔ Do not delete one
 // you did not port; on bridge 2 that silently lost 149 of 384 functions.
 
-// crustify:todo: e509_insertNextInstr
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:114  (15 body lines, level 3)
-//   original  : void insertNextInstr(Block::iterator instr)
-//   calls     : e422_insert
-
-// crustify:todo: e510_insertOperandKind
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:183  (3 body lines, level 3)
-//   original  : void insertOperandKind(unsigned i, OperandKind kind)
-//   calls     : e422_insert
-
-// crustify:todo: e511_insertOperandDelta
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:186  (3 body lines, level 3)
-//   original  : void insertOperandDelta(unsigned i, int delta)
-//   calls     : e422_insert
-
-// crustify:todo: e512_collectStartingValIterArgs
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:592  (86 body lines, level 3)
-//   original  : bool collectStartingValIterArgs(Window *start_window, Window *cur_window, SmallVector<Value, 2> &starting_vals, Value &zero)
-//   calls     : e252_size, e422_insert
-
 // crustify:todo: e565_collectDeltasOfOperands
 //   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:392  (109 body lines, level 4)
 //   original  : bool collectDeltasOfOperands(Window *start_window, Operation &op_a, Operation &op_b, MatchedOp *matched_op)
@@ -153,11 +133,9 @@
 use std::collections::BTreeMap;
 
 use crate::islands::dataflow_ir::Values;
-use crate::islands::dataflow_ir::dialects as lower;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::{
-    self, Definitions, Op, Val, affine, sentient, symbol, uniform,
-};
+use crate::islands::sentient::dialects::{self, Definitions, Op, Val, sentient, symbol, uniform};
+use crate::transform::sentient::skeleton;
 
 /// WHERE AN INSTRUCTION SITS IN THE BLOCK BEING ROLLED — `Block::iterator`.
 ///
@@ -297,6 +275,43 @@ impl Window {
         self.op_to_index.contains_key(&op)
     }
 
+    /// Replaces: e509_insertNextInstr
+    ///
+    /// Extends the window to `instr`, indexing it and remembering it as the first/last rollable op
+    /// when the case admits it.
+    ///
+    /// ⭐ THE L3 CASE ADMITS ONLY THE THREE TRANSFERS, the generic case anything that is not a
+    /// constant or a uniform map lookup — and the reference's note excludes the two loads that
+    /// *"should never provide rolling opportunities"* (`LoopRolling.cpp:118-119`).
+    pub(crate) fn insert_next_instr(&mut self, instr: InstrPos, block: &[Op]) {
+        // `std::map::insert` keeps the first index for a repeated position while `size_` still grows.
+        self.op_to_index.entry(instr).or_insert(self.size.0);
+        self.size = WindowSize(self.size.0 + 1);
+        self.end = instr;
+        let op = &block[instr.0];
+        let generic_case = self.case == RollingCase::SingleInstrWindows
+            && !matches!(
+                op,
+                Op::Sentient(sentient::Op::ScalarConstant { .. })
+                    | Op::Uniform(uniform::Op::QueryMap { .. })
+                    | Op::Uniform(uniform::Op::DefImmutableMapping { .. })
+            );
+        let transfer = matches!(
+            op,
+            Op::Sentient(
+                sentient::Op::LoadAndSend { .. }
+                    | sentient::Op::ReceiveAndStore { .. }
+                    | sentient::Op::LoadAndStore { .. }
+            )
+        );
+        if generic_case || transfer {
+            if self.first_rollable_op.is_none() {
+                self.first_rollable_op = Some(instr);
+            }
+            self.last_rollable_op = Some(instr);
+        }
+    }
+
     /// Replaces: e078_setEffectiveStart
     ///
     /// Points the window at where rolling actually begins, with the matching size — the pair
@@ -365,6 +380,22 @@ impl MatchedOp {
             operand_deltas: BTreeMap::new(),
             iter_arg_to_res_num_and_operand: BTreeMap::new(),
         }
+    }
+
+    /// Replaces: e510_insertOperandKind
+    ///
+    /// Files how operand `i` differs across the windows — ⛔ THE FIRST CLASSIFICATION WINS, because
+    /// `std::map::insert` does not overwrite an existing key.
+    pub(crate) fn insert_operand_kind(&mut self, i: OperandIdx, kind: OperandKind) {
+        self.operand_kinds.entry(i).or_insert(kind);
+    }
+
+    /// Replaces: e511_insertOperandDelta
+    ///
+    /// Files the nonzero stride operand `i` advances by — first write wins, as for
+    /// [`Self::insert_operand_kind`].
+    pub(crate) fn insert_operand_delta(&mut self, i: OperandIdx, delta: Delta) {
+        self.operand_deltas.entry(i).or_insert(delta);
     }
 
     /// Replaces: e080_getOperandKind
@@ -470,56 +501,6 @@ fn ops_are_equivalent(a: &Op, b: &Op, defs: Definitions<'_>) -> bool {
     true
 }
 
-/// ONE OP WITH EVERY VALUE AND EVERY REGION BLANKED — what is left is its NAME AND ATTRIBUTES.
-///
-/// ⛔ NOT AN ANCHORED UNIT — the structural half of [`ops_are_equivalent`], which is
-/// `OperationEquivalence`'s own first test.
-fn skeleton(op: &Op) -> Op {
-    let mut bare = op.clone();
-    match &mut bare {
-        Op::Sentient(inner) => {
-            for val in sentient::operands_mut(inner) {
-                *val = Val(0);
-            }
-            for val in sentient::results_mut(inner) {
-                *val = Val(0);
-            }
-            for val in sentient::block_args_mut(inner) {
-                *val = Val(0);
-            }
-            for region in sentient::regions_mut(inner) {
-                region.clear();
-            }
-        }
-        Op::AffineFor(loop_op) => {
-            loop_op.iv = Val(0);
-            for bound in [&mut loop_op.lo, &mut loop_op.hi] {
-                if let affine::Bound::Val(bound) = bound {
-                    *bound = Val(0);
-                }
-            }
-            for carried in &mut loop_op.carried {
-                carried.init = Val(0);
-                carried.arg = Val(0);
-                carried.result = Val(0);
-            }
-            loop_op.body.clear();
-        }
-        other => {
-            if let Some(mut inner) = dialects::lowered(other) {
-                for (_role, val) in lower::vals_mut(&mut inner) {
-                    *val = Val(0);
-                }
-                for region in lower::regions_mut(&mut inner) {
-                    region.clear();
-                }
-                *other = dialects::raised(inner);
-            }
-        }
-    }
-    bare
-}
-
 /// THE `uniform.def_immutable_mapping` A `uniform.query_map`'S `$map` NAMES, as its `(key, value)`
 /// pairs.
 ///
@@ -599,6 +580,22 @@ fn scalar_constant_value(op: &Op) -> Option<i64> {
     match op {
         Op::Sentient(sentient::Op::ScalarConstant { value, .. }) => Some(*value),
         _ => None,
+    }
+}
+
+/// `MaxIterArgsCreated` — `-loop-rolling-max-iter-args-created`, whose default is the only value
+/// this crate has (`LoopRolling.cpp:59-63`).
+const MAX_ITER_ARGS_CREATED: usize = 4;
+
+/// `zero.getDefiningOp()->erase()`, in the block the constant builder is anchored at.
+///
+/// ⛔ NOT AN ANCHORED UNIT — the *mechanism* for reaching a definition.
+fn erase_definition(val: Val, consts: &mut Vec<Op>) {
+    if let Some(at) = consts
+        .iter()
+        .position(|op| dialects::results(op).contains(&val))
+    {
+        consts.remove(at);
     }
 }
 
@@ -918,6 +915,92 @@ impl LoopRollingManager {
         true
     }
 
+    /// Replaces: e512_collectStartingValIterArgs
+    ///
+    /// Collects the starting value of every iteration argument the rolled loop needs — one per
+    /// recorded delta, one per usage of the last rollable op in the next window's first rollable op,
+    /// and `zero` for each result read past the last window rolled — refusing when more than
+    /// [`MAX_ITER_ARGS_CREATED`] would be built.
+    ///
+    /// ⛔ `zero` IS ERASED ON EVERY PATH THAT DOES NOT PLACE IT, the refusal included: the caller
+    /// mints it into `consts` before asking (`LoopRolling.cpp:806-812`).
+    pub(crate) fn collect_starting_val_iter_args(
+        &mut self,
+        start_window: &Window,
+        cur_window: &Window,
+        starting_vals: &mut Vec<Val>,
+        zero: Val,
+        block: &[Op],
+        consts: &mut Vec<Op>,
+    ) -> bool {
+        let mut used_zero = false;
+        // `operand_to_result_num` is read while the matches are written, so the two are split.
+        let LoopRollingManager {
+            matched_ops,
+            operand_to_result_num,
+            ..
+        } = self;
+        // `matched_ops_` is populated in reverse, so `rbegin()` walks the block FORWARDS.
+        for matched_op in matched_ops.iter_mut().rev() {
+            let op_in_start_window = matched_op.start_op;
+            // Iterator argument(s) for deltas.
+            for operand_idx in matched_op.operand_deltas.keys() {
+                starting_vals.push(dialects::operands(&block[op_in_start_window.0])[operand_idx.0]);
+            }
+
+            // Iterator argument(s) for usages of the last rollable op in the next window's first
+            // rollable op.
+            if start_window.last_rollable_op == Some(op_in_start_window) {
+                let Some(first_rollable_op) = start_window.first_rollable_op else {
+                    todo!(
+                        "collectStartingValIterArgs: the start window has a last rollable op but no                          first one (LoopRolling.cpp:615-616)"
+                    )
+                };
+                for (operand_idx, result_num) in operand_to_result_num.iter() {
+                    // Several iteration arguments may name the same result when it is read more than
+                    // once, to allow for different starting values.
+                    let iter_arg_num = IterArgIdx(starting_vals.len());
+                    matched_op
+                        .iter_arg_to_res_num_and_operand
+                        .insert(iter_arg_num, (*result_num, Some(*operand_idx)));
+                    starting_vals
+                        .push(dialects::operands(&block[first_rollable_op.0])[operand_idx.0]);
+                }
+            }
+
+            // Iterator argument(s) for usages of ops past the last window rolled. These get the
+            // arbitrary starting value 0.
+            let op_in_cur_window = matched_op.end_op;
+            for (i, result) in dialects::results(&block[op_in_cur_window.0])
+                .into_iter()
+                .enumerate()
+            {
+                for user in users_of(result, block) {
+                    if user.is_some_and(|user| cur_window.is_op_in_this_window(user)) {
+                        continue;
+                    }
+                    // Try reusing an existing iterator argument.
+                    let used_previously = matched_op
+                        .iter_arg_to_res_num_and_operand
+                        .values()
+                        .any(|(result_num, _)| *result_num == ResultNum(i));
+                    if !used_previously {
+                        matched_op
+                            .iter_arg_to_res_num_and_operand
+                            .insert(IterArgIdx(starting_vals.len()), (ResultNum(i), None));
+                        used_zero = true;
+                        starting_vals.push(zero);
+                    }
+                }
+            }
+        }
+        let within_allowance = starting_vals.len() <= MAX_ITER_ARGS_CREATED;
+        if !within_allowance || !used_zero {
+            erase_definition(zero, consts);
+        }
+        within_allowance
+    }
+
     /// Replaces: e084_updateBody
     ///
     /// Moves each match's end instance into the loop, re-points its delta operands at the matching
@@ -1104,6 +1187,55 @@ mod unit_tests {
         assert!(window.check_op_usage(InstrPos(1), &block, &next));
     }
 
+    /// `e509_insertNextInstr` — the L3 case rolls only the transfers, the generic case anything that
+    /// is not a constant or a map lookup.
+    #[test]
+    fn insert_next_instr_indexes_the_op_and_names_the_rollable_ones() {
+        let block = vec![
+            scalar_constant(Val(40), 7),
+            receive_and_store(),
+            add(Val(41), Val(42), Val(43)),
+        ];
+        let mut l3 = Window::opening(RollingCase::L3SoftSyncWindows, InstrPos(0));
+        l3.insert_next_instr(InstrPos(0), &block);
+        l3.insert_next_instr(InstrPos(1), &block);
+        assert_eq!(l3.size, WindowSize(2));
+        assert_eq!(l3.end, InstrPos(1));
+        assert_eq!(l3.op_to_index.get(&InstrPos(1)), Some(&1));
+        assert_eq!(l3.first_rollable_op, Some(InstrPos(1)));
+        assert_eq!(l3.last_rollable_op, Some(InstrPos(1)));
+
+        let mut generic = Window::opening(RollingCase::SingleInstrWindows, InstrPos(0));
+        generic.insert_next_instr(InstrPos(0), &block);
+        assert_eq!(generic.first_rollable_op, None);
+        generic.insert_next_instr(InstrPos(2), &block);
+        assert_eq!(generic.first_rollable_op, Some(InstrPos(2)));
+    }
+
+    /// `e510_insertOperandKind` — `std::map::insert` does not overwrite.
+    #[test]
+    fn insert_operand_kind_keeps_the_first_classification() {
+        let mut matched_op = MatchedOp::of(InstrPos(0));
+        matched_op.insert_operand_kind(OperandIdx(1), OperandKind::ConstValueDelta);
+        matched_op.insert_operand_kind(OperandIdx(1), OperandKind::NoDelta);
+        assert_eq!(
+            matched_op.operand_kind(OperandIdx(1)),
+            OperandKind::ConstValueDelta
+        );
+    }
+
+    /// `e511_insertOperandDelta` — likewise the first stride wins.
+    #[test]
+    fn insert_operand_delta_keeps_the_first_stride() {
+        let mut matched_op = MatchedOp::of(InstrPos(0));
+        matched_op.insert_operand_delta(OperandIdx(1), Delta(4));
+        matched_op.insert_operand_delta(OperandIdx(1), Delta(9));
+        assert_eq!(
+            matched_op.operand_deltas.get(&OperandIdx(1)),
+            Some(&Delta(4))
+        );
+    }
+
     /// `e080_getOperandKind` — what `collectDeltasOfOperands` filed.
     #[test]
     fn operand_kind_answers_what_was_recorded() {
@@ -1214,6 +1346,83 @@ mod unit_tests {
             &[],
             defs
         ));
+    }
+
+    /// `e512_collectStartingValIterArgs` — the delta's start-window operand, then `zero` for the
+    /// result a reader outside the window picks up; `zero` survives because it was placed.
+    #[test]
+    fn collect_starting_val_iter_args_takes_the_delta_operand_then_zero() {
+        let block = vec![
+            add(Val(10), Val(11), Val(12)),
+            add(Val(13), Val(11), Val(14)),
+            add(Val(14), Val(15), Val(16)),
+        ];
+        let mut consts = vec![scalar_constant(Val(99), 0)];
+        let start_window = Window::opening(RollingCase::SingleInstrWindows, InstrPos(0));
+        let mut cur_window = Window::opening(RollingCase::SingleInstrWindows, InstrPos(1));
+        cur_window.op_to_index.insert(InstrPos(1), 0);
+        let mut matched_op = MatchedOp::of(InstrPos(0));
+        matched_op.end_op = InstrPos(1);
+        matched_op.operand_deltas.insert(OperandIdx(0), Delta(3));
+        let mut manager = LoopRollingManager::over(
+            RollingCase::SingleInstrWindows,
+            NewLoopCount(0),
+            WindowIndex(0),
+            WindowIndex(2),
+        );
+        manager.matched_ops.push(matched_op);
+        let mut starting_vals: Vec<Val> = Vec::new();
+
+        assert!(manager.collect_starting_val_iter_args(
+            &start_window,
+            &cur_window,
+            &mut starting_vals,
+            Val(99),
+            &block,
+            &mut consts,
+        ));
+        assert_eq!(starting_vals, vec![Val(10), Val(99)]);
+        assert_eq!(
+            manager.matched_ops[0]
+                .iter_arg_to_res_num_and_operand
+                .get(&IterArgIdx(1)),
+            Some(&(ResultNum(0), None))
+        );
+        assert_eq!(consts.len(), 1);
+    }
+
+    /// `e512_collectStartingValIterArgs` — past the allowance nothing rolls, and the unplaced `zero`
+    /// leaves the constant block.
+    #[test]
+    fn collect_starting_val_iter_args_refuses_past_the_allowance() {
+        let block = vec![add(Val(10), Val(11), Val(12)), scalar_constant(Val(50), 0)];
+        let mut consts = vec![scalar_constant(Val(99), 0)];
+        let start_window = Window::opening(RollingCase::SingleInstrWindows, InstrPos(0));
+        let cur_window = Window::opening(RollingCase::SingleInstrWindows, InstrPos(1));
+        let mut manager = LoopRollingManager::over(
+            RollingCase::SingleInstrWindows,
+            NewLoopCount(0),
+            WindowIndex(0),
+            WindowIndex(2),
+        );
+        for _ in 0..=MAX_ITER_ARGS_CREATED {
+            let mut matched_op = MatchedOp::of(InstrPos(0));
+            matched_op.end_op = InstrPos(1);
+            matched_op.operand_deltas.insert(OperandIdx(0), Delta(1));
+            manager.matched_ops.push(matched_op);
+        }
+        let mut starting_vals: Vec<Val> = Vec::new();
+
+        assert!(!manager.collect_starting_val_iter_args(
+            &start_window,
+            &cur_window,
+            &mut starting_vals,
+            Val(99),
+            &block,
+            &mut consts,
+        ));
+        assert_eq!(starting_vals.len(), MAX_ITER_ARGS_CREATED + 1);
+        assert!(consts.is_empty());
     }
 
     /// `e084_updateBody` — the end op moves into the loop reading `iter_arg`, the yield carries

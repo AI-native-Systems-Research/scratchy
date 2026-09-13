@@ -2902,6 +2902,53 @@ pub fn block_args_mut(op: &mut Op) -> Vec<&mut Val> {
     }
 }
 
+/// `$dbgName`, AS A PLACE — `Operation::getAttr(kDbgNameAttrName)` and the slot that erases it.
+///
+/// ⛔⛔ THE ONE ATTRIBUTE EVERY EQUIVALENCE COMPARISON FILTERS OUT. `operationsAreEquivalent` drops
+/// `dataflow::DebugNameOpInterface::kDbgNameAttrName` from both attribute dictionaries before it
+/// compares them (`dcc/src/Analysis/OperationEquivalence.cpp:164-176`), because two ops that compute
+/// the same thing carry different names — so without this accessor loop merging and loop absorption
+/// would decline every pair the reference accepts.
+///
+/// ⛔ `None` SAYS THE OP HAS NO PLACE FOR A NAME, which is a fact about this island and not about the
+/// reference, where any `Operation *` takes a discardable attribute. It is the ten variants
+/// `SentientOps.td` gives no `$dbgName` — the scalars, `sentient.yield`, `sentient.load`,
+/// `sentient.set_send_dst` and `sentient.logical_port`.
+#[must_use]
+pub fn dbg_name_mut(op: &mut Op) -> Option<&mut Option<String>> {
+    match op {
+        Op::For { dbg_name, .. }
+        | Op::If { dbg_name, .. }
+        | Op::VectorMac { dbg_name, .. }
+        | Op::VectorBinary { dbg_name, .. }
+        | Op::VectorUnary { dbg_name, .. }
+        | Op::VectorTernary { dbg_name, .. }
+        | Op::LoadAndSend { dbg_name, .. }
+        | Op::ReceiveAndStore { dbg_name, .. }
+        | Op::LoadAndStore { dbg_name, .. }
+        | Op::LoadComputeAndSend { dbg_name, .. }
+        | Op::LoadAndExtractScalar { dbg_name, .. }
+        | Op::ReceiveAndExtractScalar { dbg_name, .. }
+        | Op::Sync { dbg_name, .. }
+        | Op::Nop { dbg_name, .. }
+        | Op::Splat { dbg_name, .. }
+        | Op::Samv { dbg_name, .. }
+        | Op::SetMask { dbg_name, .. }
+        | Op::IncrMask { dbg_name, .. }
+        | Op::Opaque { dbg_name, .. } => Some(dbg_name),
+        Op::Yield { .. }
+        | Op::Load { .. }
+        | Op::ScalarAdd { .. }
+        | Op::ScalarSub { .. }
+        | Op::ScalarMul { .. }
+        | Op::ScalarCopy { .. }
+        | Op::ScalarConstant { .. }
+        | Op::VectorConstant { .. }
+        | Op::SetSendDst { .. }
+        | Op::LogicalPort { .. } => None,
+    }
+}
+
 /// THE REGIONS ONE `sentient.*` OP HOLDS, in the order `getRegions()` indexes them.
 ///
 /// ⭐ ONLY TWO OPS OF THIS DIALECT HAVE ANY, and their bodies hold [`super::Op`] — the whole mixed

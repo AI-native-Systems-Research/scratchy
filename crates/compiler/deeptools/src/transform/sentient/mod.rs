@@ -132,7 +132,11 @@ pub(crate) mod uniform_map_canonicalization;
 pub(crate) mod utils;
 pub(crate) mod vector_register_initialization;
 
-use crate::islands::sentient::dialects::Val;
+use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::BlockArgEquivalence;
+use crate::islands::dataflow_ir::dialects as lower;
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, Op, Val, affine, sentient,
+};
 use crate::units::DfirUnit;
 
 /// THE `sentient.for` A DESCRIPTOR OR AN ANALYSIS POINTS AT — `sentient::ForOp`, named by its
@@ -209,4 +213,162 @@ pub enum ProgStitch {
     Stitched,
     /// `getProgStitch() == false` — the standalone compilation, and the crate's own path today.
     Standalone,
+}
+
+/// ARE TWO OPS THE SAME COMPUTATION? — `dcc::OperationEquivalence::operationsAreEquivalent`
+/// (`dcc/src/Analysis/OperationEquivalence.cpp:88-334`) at the sentient rung, WITH the per-call
+/// `operands_equiv_checker` that loop absorption and loop merging each pass their own.
+///
+/// ⛔ NOT AN ANCHORED UNIT — `dcc/src/Analysis/` is outside this campaign's file list, and this is
+/// here because e506, e507 and e508 are unportable without it.
+/// ⭐⭐ `operands_equiv` IS AN `Option` AND THAT IS LOAD-BEARING: `else if (operands_equiv_checker)`
+/// (`:287-289`) means a PRESENT checker decides the pair outright, so a closure answering `false`
+/// is not the same as no closure at all, which falls through to `block_args` (`:290-300`).
+/// ⚠️ The equivalence-class memo (`use_equiv_classes_`) is the mechanism this port drops; it can only
+/// short-circuit a repeat question, never answer one differently. `functor_` is `HighPreference::None`
+/// at every sentient site.
+pub(crate) fn ops_are_equivalent(
+    a: &Op,
+    b: &Op,
+    defs: Definitions<'_>,
+    block_args: BlockArgEquivalence,
+    operands_equiv: &mut Option<&mut dyn FnMut(Val, Val) -> bool>,
+) -> bool {
+    // `if (&op_a == &op_b) return true;` (`:99-104`), which is also the recursion's cycle guard.
+    if core::ptr::eq(a, b) {
+        return true;
+    }
+    if skeleton(a) != skeleton(b) {
+        return false;
+    }
+    for (read_a, read_b) in dialects::operands(a).into_iter().zip(dialects::operands(b)) {
+        if read_a == read_b {
+            continue;
+        }
+        match (defs.of(read_a), defs.of(read_b)) {
+            // Both are results (`:258-286`). ⛔ ONE SHARED DEFINITION IS A MISMATCH: the reference
+            // compares result numbers there, and two different values of one op never share one.
+            (Some(def_a), Some(def_b)) => {
+                if core::ptr::eq(def_a, def_b)
+                    || !ops_are_equivalent(def_a, def_b, defs, block_args, operands_equiv)
+                {
+                    return false;
+                }
+            }
+            // `else if (operands_equiv_checker)` — a block argument is in the pair and the caller's
+            // checker owns the answer, whether the other side is one too or not.
+            _ if operands_equiv.is_some() => {
+                if !operands_equiv
+                    .as_mut()
+                    .is_some_and(|checker| checker(read_a, read_b))
+                {
+                    return false;
+                }
+            }
+            // Both are region arguments and no checker was passed. ⛔ `SameOwnerAndIndex` CANNOT SAY
+            // YES HERE: two distinct [`Val`]s are never one argument of one region, and the equal
+            // pair left this loop above.
+            (None, None) => match block_args {
+                BlockArgEquivalence::AllEquivalent => {}
+                BlockArgEquivalence::SameOwnerAndIndex => return false,
+            },
+            (Some(_), None) | (None, Some(_)) => return false,
+        }
+    }
+    // `do_recursive_compare_` is true at every sentient site: descend (`:317-328`).
+    for (region_a, region_b) in dialects::regions(a).into_iter().zip(dialects::regions(b)) {
+        if region_a.len() != region_b.len() {
+            return false;
+        }
+        for (inner_a, inner_b) in region_a.iter().zip(region_b.iter()) {
+            if !ops_are_equivalent(inner_a, inner_b, defs, block_args, operands_equiv) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `dcc::OperationEquivalence::regionsAreEquivalent` (`:65-83`) over its one block — the single-block
+/// region count is 1 on both sides here, so this IS `blocksAreEquivalent` (`:25-63`).
+///
+/// ⛔ NOT AN ANCHORED UNIT, same reason as [`ops_are_equivalent`].
+/// ⚠️ THE BLOCK-ARGUMENT TYPE WALK (`:40-46`) REDUCES TO THE COUNT at this rung: a region argument of
+/// a `sentient.for` is an index, so equal counts already means equal type lists.
+pub(crate) fn regions_are_equivalent(
+    args_a: usize,
+    block_a: &[Op],
+    args_b: usize,
+    block_b: &[Op],
+    defs: Definitions<'_>,
+    block_args: BlockArgEquivalence,
+    operands_equiv: &mut Option<&mut dyn FnMut(Val, Val) -> bool>,
+) -> bool {
+    args_a == args_b
+        && block_a.len() == block_b.len()
+        && block_a.iter().zip(block_b).all(|(inner_a, inner_b)| {
+            ops_are_equivalent(inner_a, inner_b, defs, block_args, operands_equiv)
+        })
+}
+
+/// ONE OP WITH EVERY VALUE AND EVERY REGION BLANKED — what is left is its NAME AND ATTRIBUTES.
+///
+/// ⛔ NOT AN ANCHORED UNIT — the structural half of [`ops_are_equivalent`], which is
+/// `OperationEquivalence`'s own first test (`:122-231`).
+///
+/// ⭐ BLANKING THE BLOCK ARGUMENTS IS CORRECT, NOT A SHORTCUT: MLIR keeps a region's arguments on the
+/// BLOCK, so `operationsAreEquivalent` never compares them at all. This island stores them in the
+/// variant, so leaving them in the skeleton would make every pair of `sentient.for`s inequivalent.
+pub(crate) fn skeleton(op: &Op) -> Op {
+    let mut bare = op.clone();
+    match &mut bare {
+        Op::Sentient(inner) => {
+            for val in sentient::operands_mut(inner) {
+                *val = Val(0);
+            }
+            for val in sentient::results_mut(inner) {
+                *val = Val(0);
+            }
+            for val in sentient::block_args_mut(inner) {
+                *val = Val(0);
+            }
+            for region in sentient::regions_mut(inner) {
+                region.clear();
+            }
+            // The `dbgName` filter (`:164-176`) — ⛔ WITHOUT IT NO TWO NAMED OPS EVER MATCH.
+            if let Some(name) = sentient::dbg_name_mut(inner) {
+                *name = None;
+            }
+        }
+        Op::AffineFor(loop_op) => {
+            loop_op.iv = Val(0);
+            loop_op.dbg_name = None;
+            for bound in [&mut loop_op.lo, &mut loop_op.hi] {
+                if let affine::Bound::Val(bound) = bound {
+                    *bound = Val(0);
+                }
+            }
+            for carried in &mut loop_op.carried {
+                carried.init = Val(0);
+                carried.arg = Val(0);
+                carried.result = Val(0);
+            }
+            loop_op.body.clear();
+        }
+        other => {
+            if let Some(mut inner) = dialects::lowered(other) {
+                for (_role, val) in lower::vals_mut(&mut inner) {
+                    *val = Val(0);
+                }
+                for region in lower::regions_mut(&mut inner) {
+                    region.clear();
+                }
+                if let Some(name) = lower::dbg_name_mut(&mut inner) {
+                    *name = None;
+                }
+                *other = dialects::raised(inner);
+            }
+        }
+    }
+    bare
 }
