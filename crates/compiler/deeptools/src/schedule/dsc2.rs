@@ -896,6 +896,26 @@ pub struct BlockNode {
     pub children: Vec<SchedNode>,
 }
 
+impl BlockNode {
+    /// The position of the child named `name`, which is how `addChildNode`'s `siblingRefNode` is
+    /// named in the sequences that insert beside a node they already found.
+    #[must_use]
+    pub fn child_pos(&self, name: &NodeName) -> Option<ChildPos> {
+        self.children
+            .iter()
+            .position(|child| child.name() == name)
+            .map(ChildPos)
+    }
+
+    /// `addChildNode(node, /*addBefore*/ false, sibling)` (`dsc/dsc2.cpp:2013`) — insert `node`
+    /// IMMEDIATELY AFTER `at`, answering its own position so a run of nodes chains in order.
+    pub fn insert_after(&mut self, at: ChildPos, node: SchedNode) -> ChildPos {
+        let pos = (at.0 + 1).min(self.children.len());
+        self.children.insert(pos, node);
+        ChildPos(pos)
+    }
+}
+
 /// WHICH END OF A SIGNAL PAIR A SYNC NODE IS — `SyncNode::isReceive_` (`dsc/dsc2.h:967`), whose
 /// `false` default is the sending end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,8 +963,6 @@ impl SyncUnits {
 /// `dsc2::SyncNode` (`dsc/dsc2.h:964`) narrowed to what minting one writes and what entry 261 then
 /// binds onto it.
 ///
-/// ⛔ `otherEndOfTheSignals_` IS STILL NOT HERE: it is empty on a fresh node, and the unit that pairs
-/// two ends up owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncNode {
     /// `name_`.
@@ -958,6 +976,9 @@ pub struct SyncNode {
     /// `implicitSyncRefTransfer_` (`dsc/dsc2.h:969`) — `nullptr` until entry 261 picks the transfer
     /// this sync stands in for.
     pub implicit_sync_ref_transfer: Option<NodeId>,
+    /// `otherEndOfTheSignals_` (`dsc/dsc2.h:970`) BY NAME, empty on a fresh node: a sequence that
+    /// mints both ends pairs them, and a name is the link a tree of owned nodes can hold.
+    pub other_ends: Vec<NodeName>,
 }
 
 /// HOW A LOOP CONDITION COMPARES — `dsc2::CondOp` (`dsc/dscdefn.h:95`), verbatim.
@@ -1308,10 +1329,33 @@ pub enum SchedNode {
     Guarded(Box<ConditionNode>),
     /// `nodeType_ == STICK_MASK` — a leaf that carries its mask.
     StickMask(Box<StickMaskNode>),
-    /// An allocate, compute, transfer or sync node — `isBlockNode()` is false and it has no children,
-    /// so the walk neither yields nor descends.
+    /// `nodeType_ == SYNC`: a leaf that carries its own node, because the sequences that mint syncs
+    /// cross-link the pair they minted and a bare name cannot be linked.
+    Sync(SyncNode),
+    /// An allocate, compute or transfer node — `isBlockNode()` is false and it has no children, so the
+    /// walk neither yields nor descends.
     Leaf(NodeName),
 }
+
+impl SchedNode {
+    /// `ScheduleNode::name_`, whichever kind of node this is.
+    #[must_use]
+    pub const fn name(&self) -> &NodeName {
+        match self {
+            Self::Block(block) | Self::Loop(block) | Self::Condition(block) => &block.name,
+            Self::Guarded(cond) => &cond.name,
+            Self::StickMask(mask) => &mask.name,
+            Self::Sync(sync) => &sync.name,
+            Self::Leaf(name) => name,
+        }
+    }
+}
+
+/// WHERE IN A BLOCK'S CHILDREN A NODE SITS — the `siblingRefNode` position `addChildNode`
+/// (`dsc/dsc2.cpp:2013`) inserts relative to, minted only by [`BlockNode::child_pos`] so an index
+/// into one block cannot be applied to another block's shorter child vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildPos(usize);
 
 /// A DSC'S SCHEDULE TREE — `dsc2::ScheduleTree` (`dsc/dsc2.h:621`) reduced to `head_`, whose
 /// children are the frontier every traversal starts from.
@@ -1383,7 +1427,7 @@ fn collect_blocks_in<'a>(children: &'a [SchedNode], found: &mut Vec<&'a BlockNod
                 collect_blocks_in(&cond.then_region, found);
                 collect_blocks_in(&cond.else_region, found);
             }
-            SchedNode::StickMask(_) | SchedNode::Leaf(_) => {}
+            SchedNode::StickMask(_) | SchedNode::Sync(_) | SchedNode::Leaf(_) => {}
         }
     }
 }
@@ -1424,7 +1468,7 @@ fn find_block_mut_in(
                     return Some(found);
                 }
             }
-            SchedNode::StickMask(_) | SchedNode::Leaf(_) => {}
+            SchedNode::StickMask(_) | SchedNode::Sync(_) | SchedNode::Leaf(_) => {}
         }
     }
     None

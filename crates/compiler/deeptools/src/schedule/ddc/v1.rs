@@ -4996,6 +4996,7 @@ mod tests_e258_e263 {
                 direction: SyncDirection::Send,
                 strength: SyncStrength::Hard,
                 implicit_sync_ref_transfer: None,
+                other_ends: Vec::new(),
             },
         )]);
         let mut computes = ComputeArena::new();

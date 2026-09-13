@@ -278,19 +278,20 @@ use crate::schedule::ddc::transformation_util::{
 };
 use crate::schedule::ddc::v1::{self, ComputeOps};
 use crate::schedule::dsc2::{
-    AllocateNode, BlockNode, Dsc, Dsts, Fold, FoldDim, LdsIdx, Node, NodeName, ReplicationFactor,
-    ScheduleTree, SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, Via,
+    AllocateNode, BlockNode, ChildPos, Dsc, Dsts, Fold, FoldDim, LdsIdx, Node, NodeName, ReplicationFactor,
+    SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, Via,
 };
 use crate::schedule::l3::dsc::{
     AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare,
-    DATA_STAGE_CHUNK, DATA_STAGE_CORE, DesignSpaceConfig, DimPadding, DimStage, DscGroup, DscIdx,
-    DscParamCandidates, FilledDims, IndexTensor, IndirectAlloc, InitialPlacement, LabeledDs,
-    MemOrg, MulticastDegree, Pinning, ScheduleNodes, ScheduleTrees, SchedulerMetadata, StickVolume,
-    StickVolumes, SuperChunkStage, SuperDsc, SymbolicDimInfo, UnneededPad, WkSlice, WkSliceCount,
-    WkSliceId,
+    DATA_STAGE_CHUNK, DATA_STAGE_CORE, DesignSpaceConfig, DimCandidates, DimPadding, DimStage,
+    DscCandidates, DscGroup, DscIdx, DscParamCandidates, FilledDims, IndexTensor, IndirectAlloc,
+    InitialPlacement, InsertSide, L3Transfer, LabeledDs, MemOrg, MemOrgs, MulticastDegree,
+    NodeParents, PagedStages, Pinning, ScheduleNodes, ScheduleTrees, SchedulerMetadata, StickVolume,
+    StickVolumes, SuperChunkStage, SuperDsc, SymbolicDimInfo, TransferNodes, UnneededPad, WkSlice,
+    WkSliceCount, WkSliceId,
 };
 use crate::units::{Core, Corelet};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU32;
 use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
@@ -1620,6 +1621,7 @@ pub fn create_sync_node(
         direction,
         strength,
         implicit_sync_ref_transfer: None,
+        other_ends: Vec::new(),
     }
 }
 
@@ -3649,6 +3651,22 @@ mod tests_e049_e056 {
         fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
             BTreeSet::new()
         }
+
+        fn lx_padding(&self) -> Option<PaddingForm> {
+            None
+        }
+
+        fn lx_page_sizes(&self) -> BTreeMap<PrimaryDim, Extent> {
+            BTreeMap::new()
+        }
+
+        fn hbm_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
+        }
+
+        fn lx_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
+        }
     }
 
     /// e050 — a pinned DS takes its buffer offset from the node while an unpinned one is always at
@@ -4210,6 +4228,22 @@ mod tests_e057_e064 {
 
         fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
             self.pages.clone()
+        }
+
+        fn lx_padding(&self) -> Option<PaddingForm> {
+            None
+        }
+
+        fn lx_page_sizes(&self) -> BTreeMap<PrimaryDim, Extent> {
+            BTreeMap::new()
+        }
+
+        fn hbm_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
+        }
+
+        fn lx_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
         }
     }
 
@@ -5420,6 +5454,18 @@ mod tests_e197_e204 {
         fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
             BTreeSet::new()
         }
+        fn lx_padding(&self) -> Option<PaddingForm> {
+            None
+        }
+        fn lx_page_sizes(&self) -> BTreeMap<PrimaryDim, Extent> {
+            BTreeMap::new()
+        }
+        fn hbm_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
+        }
+        fn lx_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
+        }
     }
 
     /// THE NEST BOTH SIBLING WALKS SEE — the `lx_below_schedule` block at node 10, inside loop 9,
@@ -5932,61 +5978,953 @@ mod tests_e197_e204 {
     }
 }
 
-// crustify:todo: e205_isOpFuncBmm
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:804  (5 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncBmm(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2327-2332
-//   calls     : e025_isOpFuncBmmInt4, e026_isOpFuncBmmInt8, e027_isOpFuncBmmFp8NonXrf, e028_isOpFuncBmmFp8Xrf, e029_isOpFuncBmmFp16
+/// Replaces: e205_isOpFuncBmm
+///
+/// Whether the op is a batch matmul of ANY weight format — the five format families disjoined.
+#[must_use]
+pub const fn is_op_func_bmm(op_func: OpFunc) -> bool {
+    is_op_func_bmm_fp16(op_func)
+        || is_op_func_bmm_fp8_xrf(op_func)
+        || is_op_func_bmm_fp8_non_xrf(op_func)
+        || is_op_func_bmm_int4(op_func)
+        || is_op_func_bmm_int8(op_func)
+}
 
-// crustify:todo: e206_getMinParamBmm
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:925  (80 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : long L3DlOpsScheduler::getMinParamBmm(const DesignSpaceConfig& dsc, const PrimaryDimTypes dim, const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2342-2424
-//   calls     : e025_isOpFuncBmmInt4, e026_isOpFuncBmmInt8, e027_isOpFuncBmmFp8NonXrf, e028_isOpFuncBmmFp8Xrf, e029_isOpFuncBmmFp16
+/// Replaces: e206_getMinParamBmm
+///
+/// The smallest chunk a batch matmul may take of `dim`: 64/128/256 on the INPUT channel by weight
+/// format and core extent, 64 on the OUTPUT channel, the largest divisor of the core extent up to 64
+/// on a weight-reuse dim, else 1.
+///
+/// ⛔ [`None`] IS BOTH `DT_CHECK(size() == 1)`s, the `primaryDsInfo_.at()` and `labeledDs_.at(1)`
+/// throws, AND the reference's `-1` return for an unstated core extent, which its caller writes
+/// straight into a data stage.
+/// ⛔ DIVERGENCE: THE WEIGHT-REUSE ARM CANNOT MATCH ON AN EMPTY `inp1_reuse_dim` — the reference
+/// dereferences `*begin()` on an empty `std::set` there, which is no answer at all.
+#[must_use]
+pub fn min_param_bmm<A: Arch>(
+    dsc: &DesignSpaceConfig,
+    dim: PrimaryDim,
+    op_func: OpFunc,
+) -> Option<Extent> {
+    let core_param = dsc.core_stage().dims().extent(dim);
+    let core = core_param.map_or(-1, |extent| extent.0);
+    let layout = |lds: &LabeledDs| Some(dsc.primary_ds_info.get(&lds.ds_type())?.layout.to_vec());
+    let inp0 = layout(dsc.labeled_ds.front())?;
+    let inp1 = layout(dsc.labeled_ds.at(LdsIdx(1))?)?;
+    let out = layout(dsc.labeled_ds.back())?;
+    let reuse = |from: &[PrimaryDim], within: &[PrimaryDim], without: &[PrimaryDim]| {
+        from.iter()
+            .filter(|named| within.contains(named) && !without.contains(named))
+            .copied()
+            .collect::<BTreeSet<PrimaryDim>>()
+    };
+    let inp0_reuse = reuse(&inp1, &out, &inp0);
+    let inp1_reuse = reuse(&inp0, &out, &inp1);
+    let out_reuse = reuse(&inp0, &inp1, &out);
+    (inp0_reuse.len() == 1).then_some(())?;
+    (out_reuse.len() == 1).then_some(())?;
+    if out_reuse.first() == Some(&dim) {
+        // The input channel.
+        let param = if is_op_func_bmm_int4(op_func) {
+            128
+        } else if is_op_func_bmm_int8(op_func) || is_op_func_bmm_fp8_non_xrf(op_func) {
+            if core % 256 == 0 {
+                256
+            } else if core % 128 == 0 {
+                128
+            } else {
+                64
+            }
+        } else if is_op_func_bmm_fp16(op_func) {
+            if A::GEN > IsaGen::Rcudd1a && core >= 1024 && core % 256 == 0 {
+                256
+            } else if core % 128 == 0 {
+                128
+            } else {
+                64
+            }
+        } else if is_op_func_bmm_fp8_xrf(op_func) {
+            64
+        } else {
+            DEFAULT_MIN_PARAM.0
+        };
+        return Some(Extent(param));
+    }
+    if inp0_reuse.first() == Some(&dim) {
+        // The output channel.
+        return Some(Extent(64));
+    }
+    if inp1_reuse.first() == Some(&dim) {
+        // A weight-reuse dim: 64 is 80% utilisation for int8, and below-LX XRF reuse takes the rest.
+        let found = (1i64..=64).rev().find(|reuse| core % reuse == 0);
+        return Some(found.map_or(DEFAULT_MIN_PARAM, Extent));
+    }
+    if core < 0 {
+        return core_param;
+    }
+    Some(DEFAULT_MIN_PARAM)
+}
 
-// crustify:todo: e207_generateDscParamCandidates
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1172  (204 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : auto L3DlOpsScheduler::generateDscParamCandidates( const SuperDsc &mySDsc, const std::vector<DataStructDims> &dscParams, const std::vector<PrimaryDimTypes> &primaryDims, const std::unordered_set<PrimaryDimTypes> &chunkDims, const std::unordered_set<PrimaryDimTypes> &coreSplitDims) -> DscParamCandida
-//   extract   : crustify-ddc/cpp/l3.cpp:2434-2643
-//   calls     : e003_isDimensionCoreletSplit, e009_getStickSize, e056_isIndexLds, e059_getPagedDimensions
+/// `mySDsc.dscs_.at(idx).labeledDs_`'s memory organisations, in `labeledDs_` order.
+fn lds_orgs<'o, O: MemOrgs>(
+    orgs: &'o O,
+    idx: DscIdx,
+    dsc: &DesignSpaceConfig,
+) -> Option<Vec<&'o O::Org>> {
+    dsc.labeled_ds
+        .indexed()
+        .map(|(at, _)| orgs.mem_org(idx, at))
+        .collect()
+}
 
-// crustify:todo: e208_getLdsL3TransferNodes
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1571  (34 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : std::vector<const dsc2::TransferNode *> L3DlOpsScheduler::getLdsL3TransferNodes( const SuperDsc &mySDsc, const int dscIdx, const int ldsIdx, const std::vector<SenComponents> &srcStorages, const std::vector<SenComponents> &dstStorages) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2653-2690
-//   calls     : e014_isLabeledDsLXNeighbor
+/// `value % divisor == 0`, [`None`] for the divisor of zero the reference's `%` cannot take.
+fn is_multiple_of(value: i64, divisor: i64) -> Option<bool> {
+    (divisor != 0).then(|| value % divisor == 0)
+}
 
-// crustify:todo: e209_getLabeledDsChunkStickVolume
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1628  (64 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : unsigned long L3DlOpsScheduler::getLabeledDsChunkStickVolume( const DesignSpaceConfig &dsc, const int ldsIdx)
-//   extract   : crustify-ddc/cpp/l3.cpp:2700-2765
-//   calls     : e009_getStickSize, e056_isIndexLds
+/// `isDimensionParamMultipleOfStickSize` (`L3DlOpsScheduler.cpp:1310`) — every non-index labelled
+/// DS's stick size along `dim` divides `param`, a scale tensor's stick multiplied by its own block.
+fn param_multiple_of_stick_size<M: MemOrg + ?Sized>(
+    dsc: &DesignSpaceConfig,
+    dim: PrimaryDim,
+    param: i64,
+    orgs: &[&M],
+) -> Option<bool> {
+    for (lds, org) in dsc.labeled_ds.iter().zip(orgs) {
+        if is_index_lds(*org)? {
+            continue;
+        }
+        let mut min_dim_size = i64::try_from(stick_size(dsc, lds.ds_type(), dim)?.0).ok()?;
+        if let Some(mx) = lds.scale_tensor().filter(|mx| mx.dim == dim) {
+            min_dim_size =
+                min_dim_size.saturating_mul(i64::try_from(mx.blk_size.count().0).ok()?);
+        }
+        if !is_multiple_of(param, min_dim_size)? {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
 
-// crustify:todo: e210_isOpCrossCoreReduction
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:2734  (7 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpCrossCoreReduction( const SuperDsc &mySDsc, const DesignSpaceConfig &dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2775-2783
-//   calls     : e044_getOpReducedDimSet
+/// `isParamCoreletSplitValid` (`:1330`) — a corelet-split dim's parameter must split equally across
+/// the corelets AND each corelet's share must itself be a multiple of every stick size.
+fn param_corelet_split_valid<M: MemOrg + ?Sized>(
+    dsc: &DesignSpaceConfig,
+    dim: PrimaryDim,
+    param: i64,
+    orgs: &[&M],
+) -> Option<bool> {
+    if !is_dimension_corelet_split(dsc, dim) {
+        return Some(true);
+    }
+    let corelets = i64::from(dsc.corelets_used.get());
+    if param % corelets != 0 {
+        return Some(false);
+    }
+    param_multiple_of_stick_size(dsc, dim, param / corelets, orgs)
+}
 
-// crustify:todo: e211_getInsertionNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3376  (89 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::ScheduleNode* L3DlOpsScheduler::getInsertionNode( const std::unordered_set<dsc2::ScheduleNode*>& refNodeSet, const bool insertBefore) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2793-2884
-//   calls     : e104_clear, e187_clear
+/// Replaces: e207_generateDscParamCandidates
+///
+/// EVERY DSC'S CANDIDATE CHUNK EXTENT PER DIM: a non-chunk dim keeps its core extent alone; a chunk
+/// dim takes every divisor of the core (scale-down-adjusted) upper bound from the lower bound up that
+/// the symbolic granularity, the page sizes, the corelet split and every stick size all admit.
+///
+/// ⛔ [`None`] IS EVERY `DT_CHECK_MSG` AND `.at()` THROW: an invalid bound pair, a `getPageSize` or
+/// symbolic lookup with no stage stated for it, an index tensor holding indices, a stick size of zero
+/// — and, at the end, *"There must be at least one valid candidate."*, which [`Candidates`]' own
+/// non-emptiness raises for whichever `(dsc, dim)` came up empty.
+/// ⛔ DIVERGENCE: A NON-CHUNK DIM THE CORE STAGE DOES NOT STATE IS REFUSED rather than recorded as
+/// the reference's single candidate of `-1`, which is not a chunk extent.
+#[must_use]
+pub fn generate_dsc_param_candidates<O: MemOrgs>(
+    sdsc: &SuperDsc,
+    dsc_params: &[FilledDims],
+    primary_dims: &[PrimaryDim],
+    chunk_dims: &BTreeSet<PrimaryDim>,
+    core_split_dims: &BTreeSet<PrimaryDim>,
+    orgs: &O,
+    paged: Option<PagedStages>,
+) -> Option<DscCandidates> {
+    let mut per_dsc: Vec<BTreeMap<PrimaryDim, Vec<Extent>>> =
+        vec![BTreeMap::new(); sdsc.dscs().iter().count()];
+    for &dim in primary_dims {
+        for (idx, dsc) in (0u32..).map(DscIdx).zip(sdsc.dscs().iter()) {
+            let slot = per_dsc.get_mut(usize::try_from(idx.0).ok()?)?;
+            let core = dsc.core_stage().dims();
+            if !chunk_dims.contains(&dim) {
+                slot.insert(dim, vec![core.extent(dim)?]);
+                continue;
+            }
+            let l_bound = dsc_params
+                .get(usize::try_from(idx.0).ok()?)?
+                .dims()
+                .extent(dim)?;
+            // A block transfer with a symbolic size cannot be broken in ALxS yet, so a symbolic dim
+            // with an LX->HBM transfer on it is forced to chunk on its granularity.
+            let output = dsc.labeled_ds.back();
+            let chunk_symbolic = output.pinning().hbm()
+                && dsc
+                    .non_broadcast_lds_dims(output.recorded())?
+                    .contains(&dim);
+            let density = output
+                .scale_tensor()
+                .filter(|mx| mx.dim == dim)
+                .map(|mx| mx.blk_size);
+            let u_bound =
+                core.scaled_extent(dim, &PaddingForm::default(), density, chunk_symbolic)?;
+            (l_bound.0 > 0 && u_bound.0 >= l_bound.0).then_some(())?;
+            let mem_orgs = lds_orgs(orgs, idx, dsc)?;
+            let paged_dims = get_paged_dimensions(&mem_orgs);
+            if l_bound == u_bound {
+                // No chunking on this dim, so the core extent is the one candidate and only its own
+                // stick alignment is verified — `getMinParamForDim` uses this to force no chunking
+                // on a dim whose padded parameter would be far harder to check.
+                slot.insert(dim, vec![l_bound]);
+                for (lds, org) in dsc.labeled_ds.iter().zip(&mem_orgs) {
+                    if is_index_lds(*org)? {
+                        continue;
+                    }
+                    let stick = i64::try_from(stick_size(dsc, lds.ds_type(), dim)?.0).ok()?;
+                    let ubound_lds = core.scaled_extent(dim, &org.lx_padding()?, None, false)?;
+                    is_multiple_of(ubound_lds.0, stick)?.then_some(())?;
+                }
+                continue;
+            }
+            let mut found: Vec<Extent> = Vec::new();
+            for param in l_bound.0..=u_bound.0 {
+                // Equal chunks only, so the upper bound must be a multiple of the parameter.
+                if u_bound.0 % param != 0 {
+                    continue;
+                }
+                // A symbolic dim's candidate must divide its granularity, the upper bound being its
+                // max size.
+                if core.symbolic.info().contains_key(&dim) && param < u_bound.0 {
+                    let granularity =
+                        core.scaled_extent(dim, &PaddingForm::default(), density, true)?;
+                    if param > granularity.0 || !is_multiple_of(granularity.0, param)? {
+                        continue;
+                    }
+                }
+                // A paged dim's candidate must be whole pages, and must divide both the steady-state
+                // and the epilogue size one index-tensor stick represents.
+                if paged_dims.contains(&dim) {
+                    let stages = paged?;
+                    let one_page = dsc.data_stages.at(stages.one_page)?.ss_extent(dim)?;
+                    let ibr = dsc.data_stages.at(stages.ibr)?;
+                    let steady = ibr.ss.dims.dims().extent(dim)?;
+                    let epilogue = ibr.el.dims.dims().extent(dim)?;
+                    if !is_multiple_of(param, one_page.0)?
+                        || !is_multiple_of(steady.0, param)?
+                        || !is_multiple_of(epilogue.0, param)?
+                    {
+                        continue;
+                    }
+                }
+                // The corelet split applies to THIS DSC for a core-split dim and to EVERY DSC
+                // otherwise.
+                let split_valid = if core_split_dims.contains(&dim) {
+                    param_corelet_split_valid(dsc, dim, param, &mem_orgs)?
+                } else {
+                    let mut all = true;
+                    for (other_idx, other) in (0u32..).map(DscIdx).zip(sdsc.dscs().iter()) {
+                        let other_orgs = lds_orgs(orgs, other_idx, other)?;
+                        if !param_corelet_split_valid(other, dim, param, &other_orgs)? {
+                            all = false;
+                            break;
+                        }
+                    }
+                    all
+                };
+                if !split_valid || !param_multiple_of_stick_size(dsc, dim, param, &mem_orgs)? {
+                    continue;
+                }
+                found.push(Extent(param));
+            }
+            slot.insert(dim, found);
+        }
+    }
+    per_dsc
+        .into_iter()
+        .map(DimCandidates::of)
+        .collect::<Option<Vec<_>>>()
+        .map(DscCandidates::new)
+}
 
-// crustify:todo: e212_addL3LUAndLXLUSyncNodeSequence
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3912  (45 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::addL3LUAndLXLUSyncNodeSequence( const dsc2::ScheduleNode *insertAfterNode) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2894-2940
-//   calls     : e020_createSyncNode
+/// Replaces: e208_getLdsL3TransferNodes
+///
+/// THE DSC'S L3 TRANSFERS FOR ONE LABELLED DS — the transfers that use its allocation and run between
+/// one of `src_storages` and one of `dst_storages`. An LX-PINNED DS HAS NONE, and that empty answer
+/// is not a refusal.
+///
+/// ⛔ [`None`] IS EVERY `DT_CHECK_MSG`: both `.at()` throws, *"Expect input neighbor fetch."* for an
+/// unpinned DS that is no LX neighbour, *"Expect HBM/LX in memOrg_."* with *"Expect a valid allocate
+/// node."*, and *"Expect valid alloc users."* — which is the allocation naming NO user.
+#[must_use]
+pub fn lds_l3_transfer_nodes<M: MemOrg + ?Sized, T: TransferNodes + ?Sized>(
+    sdsc: &SuperDsc,
+    dsc: DscIdx,
+    lds: LdsIdx,
+    org: &M,
+    trees: &T,
+    src_storages: &[SenComponent],
+    dst_storages: &[SenComponent],
+) -> Option<Vec<L3Transfer>> {
+    let entry = sdsc.dscs().at(dsc)?.labeled_ds.at(lds)?;
+    if entry.pinning().lx {
+        return Some(Vec::new());
+    }
+    let users = if entry.pinning().hbm() {
+        org.hbm_alloc_users()?
+    } else {
+        is_labeled_ds_lx_neighbor(sdsc, dsc, entry)?.then_some(())?;
+        org.lx_alloc_users()?
+    };
+    (!users.is_empty()).then_some(())?;
+    Some(
+        trees
+            .transfers(dsc)
+            .into_iter()
+            .filter(|transfer| {
+                users.contains(&transfer.node)
+                    && src_storages.contains(&transfer.src)
+                    && dst_storages.contains(&transfer.dst)
+            })
+            .collect(),
+    )
+}
+
+/// Replaces: e209_getLabeledDsChunkStickVolume
+///
+/// HOW MANY CONSECUTIVE STICKS ONE CHUNK OF A LABELLED DS SPANS — the product of each non-broadcast
+/// dim's chunk parameter over its stick size, innermost outwards, stopping at the first dim whose
+/// chunk falls below its core extent or whose symbolic-ness disagrees between the two stages.
+///
+/// ⛔ A SYMBOLIC DIM IS TAKEN AT ITS GRANULARITY on BOTH stages — the smallest volume it can have,
+/// which is the conservative estimate the reference wants — and a paged dim is CAPPED at its page.
+/// ⛔ [`None`] IS EVERY `DT_CHECK_MSG`: *"Cannot getLabeledDsChunkStickVolume on indirect access index
+/// tensor"*, *"Expect LX in labeledDs memOrg_."* with *"Expect a valid allocate node."*, *"Expect a
+/// valid parameter value."* (`param > 0`), and the stick size not dividing the parameter.
+#[must_use]
+pub fn labeled_ds_chunk_stick_volume<M: MemOrg + ?Sized>(
+    dsc: &DesignSpaceConfig,
+    lds: LdsIdx,
+    org: &M,
+) -> Option<StickVolume> {
+    let entry = dsc.labeled_ds.at(lds)?;
+    (!is_index_lds(org)?).then_some(())?;
+    let padding = org.lx_padding()?;
+    let pages = org.lx_page_sizes();
+    let core = dsc.data_stages.core().ss.dims.dims();
+    let chunk = dsc.data_stages.chunk().ss.dims.dims();
+    // A broadcast dim holds one stick, which is consecutive by itself.
+    let mut volume: u64 = 1;
+    for dim in dsc.non_broadcast_lds_dims(lds)? {
+        let stick = i64::try_from(stick_size(dsc, entry.ds_type(), dim)?.0).ok()?;
+        let density = entry
+            .scale_tensor()
+            .filter(|mx| mx.dim == dim)
+            .map(|mx| mx.blk_size);
+        let mut param = chunk.scaled_extent(dim, &padding, density, true)?;
+        (param.0 > 0).then_some(())?;
+        let upper = core.scaled_extent(dim, &padding, density, true)?;
+        if let Some(page) = pages.get(&dim).filter(|page| page.0 < param.0) {
+            param = *page;
+        }
+        is_multiple_of(param.0, stick)?.then_some(())?;
+        volume = volume.checked_mul(u64::try_from(param.0 / stick).ok()?)?;
+        // Below the core extent the outer dims are no longer contiguous, and so is a dim that is
+        // symbolic on one stage and not the other.
+        if param.0 < upper.0
+            || chunk.symbolic.info().contains_key(&dim) != core.symbolic.info().contains_key(&dim)
+        {
+            break;
+        }
+    }
+    std::num::NonZeroU64::new(volume).map(StickVolume::new)
+}
+
+/// Replaces: e210_isOpCrossCoreReduction
+///
+/// Whether the op reduces across cores — some dim it reduces away is split over more than one work
+/// slice.
+///
+/// ⛔ [`None`] IS `numWkSlicesPerDim_.at(dim)`'s THROW, reached in the reference's `any_of` order: a
+/// dim with more than one slice ANSWERS before a later unnamed dim can refuse.
+#[must_use]
+pub fn is_op_cross_core_reduction(sdsc: &SuperDsc, dsc: &DesignSpaceConfig) -> Option<bool> {
+    for dim in op_reduced_dim_set(dsc)? {
+        if sdsc.num_wk_slices_per_dim.get(&dim)?.get() > 1 {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Replaces: e211_getInsertionNode
+///
+/// WHERE A NODE GOES RELATIVE TO A SET OF REFERENCE NODES — walks each one's parents up to the
+/// innermost parent they all share, then answers that parent's first or last child on the path down
+/// to a reference node.
+///
+/// ⛔ [`None`] IS THE REFERENCE'S `nullptr` FOR ALL FOUR OF ITS CAUSES AT ONCE: an empty set, a
+/// reference node sharing no parent with the others, and both `DT_CHECK_MSG`s — *"Parent node must be
+/// a block node."* and *"Expect node to have the same parent."*.
+/// ⛔ DIVERGENCE: THE SET IS WALKED SMALLEST ID FIRST where the reference walks an `unordered_set` in
+/// an unspecified order, which its own seeding of `parentNodesOuterToInner` depends on.
+#[must_use]
+pub fn insertion_node<T: NodeParents + ?Sized>(
+    tree: &T,
+    ref_nodes: &BTreeSet<NodeId>,
+    side: InsertSide,
+) -> Option<NodeId> {
+    let first = *ref_nodes.first()?;
+    let mut outer_to_inner: VecDeque<NodeId> = VecDeque::new();
+    let mut curr = Some(first);
+    while let Some(node) = curr {
+        let parent = tree.parent(node);
+        if let Some(parent) = parent {
+            outer_to_inner.push_front(parent);
+        }
+        curr = parent;
+    }
+    let mut insertion: BTreeSet<NodeId> = BTreeSet::new();
+    insertion.insert(first);
+    for &ref_node in ref_nodes {
+        if ref_node == first {
+            continue;
+        }
+        let mut curr = Some(ref_node);
+        let mut shared = false;
+        while let Some(node) = curr {
+            let parent = tree.parent(node);
+            let at = outer_to_inner
+                .iter()
+                .position(|held| Some(*held) == parent);
+            if let Some(at) = at {
+                if at + 1 != outer_to_inner.len() {
+                    // The shared parent is not the innermost held, so the set restarts from the
+                    // parent's own child on the first node's path and the inner parents are dropped.
+                    insertion.clear();
+                    insertion.insert(outer_to_inner[at + 1]);
+                    outer_to_inner.truncate(at + 1);
+                }
+                insertion.insert(node);
+                shared = true;
+                break;
+            }
+            curr = parent;
+        }
+        if !shared {
+            return None;
+        }
+    }
+    let common_parent = tree.parent(*insertion.first()?)?;
+    for &node in &insertion {
+        (tree.parent(node) == Some(common_parent)).then_some(())?;
+    }
+    let children = tree.children(common_parent);
+    match side {
+        InsertSide::Before => children.into_iter().find(|child| insertion.contains(child)),
+        InsertSide::After => children
+            .into_iter()
+            .rev()
+            .find(|child| insertion.contains(child)),
+    }
+}
+
+/// Replaces: e212_addL3LUAndLXLUSyncNodeSequence
+///
+/// ADDS THE FOUR-NODE L3LU/LXLU HANDSHAKE immediately after `at`: L3LU sends, LXLU receives, LXLU
+/// sends, L3LU receives, each pair cross-linked as the other's other end and every one of them a HARD
+/// signal.
+///
+/// ⭐ THE NAMES ARE BUILT FROM [`SenComponent::spelling`], which is the same
+/// `senComponentsToString` map the reference concatenates and is LOWERCASE — `sync_send_l3lu_to_lxlu`
+/// and its three siblings.
+pub fn add_l3_lu_and_lx_lu_sync_node_sequence(parent: &mut BlockNode, at: ChildPos) {
+    let pair = |sender: SenComponent, receiver: SenComponent| {
+        let send = NodeName(format!(
+            "sync_send_{}_to_{}",
+            sender.spelling(),
+            receiver.spelling()
+        ));
+        let receive = NodeName(format!(
+            "sync_receive_{}_from_{}",
+            receiver.spelling(),
+            sender.spelling()
+        ));
+        let mut send_node = create_sync_node(
+            SyncUnits::new(sender, []),
+            send.clone(),
+            SyncDirection::Send,
+            SyncStrength::Hard,
+        );
+        let mut receive_node = create_sync_node(
+            SyncUnits::new(receiver, []),
+            receive.clone(),
+            SyncDirection::Receive,
+            SyncStrength::Hard,
+        );
+        send_node.other_ends.push(receive);
+        receive_node.other_ends.push(send);
+        (send_node, receive_node)
+    };
+    let (l3_send, l3_receive) = pair(SenComponent::L3lu, SenComponent::Lxlu);
+    let (lx_send, lx_receive) = pair(SenComponent::Lxlu, SenComponent::L3lu);
+    let at = parent.insert_after(at, SchedNode::Sync(l3_send));
+    let at = parent.insert_after(at, SchedNode::Sync(l3_receive));
+    let at = parent.insert_after(at, SchedNode::Sync(lx_send));
+    parent.insert_after(at, SchedNode::Sync(lx_receive));
+}
+
+#[cfg(test)]
+mod tests_e205_e212 {
+    use super::*;
+    use crate::arch::Sen1p5;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
+    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::l3::dsc::{
+        Candidates, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DscList, LabeledDsList,
+        NamedDims, PrimaryDsInfo, StageDims,
+    };
+    use std::num::NonZeroU64;
+
+    /// One labelled DS's `memOrg_` as this batch reads it, stated by field.
+    #[derive(Default)]
+    struct Org {
+        indirection: Option<IndirectAlloc>,
+        padding: Option<PaddingForm>,
+        pages: BTreeMap<PrimaryDim, Extent>,
+        hbm_users: Option<Vec<NodeId>>,
+        lx_users: Option<Vec<NodeId>>,
+    }
+
+    impl MemOrg for Org {
+        fn hbm_pinned(&self) -> bool {
+            false
+        }
+
+        fn lx_buffering(&self) -> Option<Buffering> {
+            None
+        }
+
+        fn lx_start_address(&self, _at: &AddressCoord) -> Option<ByteAddress> {
+            None
+        }
+
+        fn lx_buffer_offset(&self, _core: Core, _corelet: Corelet) -> Option<BufferOffset> {
+            None
+        }
+
+        fn hbm_indirection(&self) -> Option<IndirectAlloc> {
+            self.indirection
+        }
+
+        fn hbm_allocation(&self) -> Option<NodeName> {
+            None
+        }
+
+        fn hbm_layout_dims(&self) -> Option<LayoutDims> {
+            None
+        }
+
+        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
+            BTreeSet::new()
+        }
+
+        fn lx_padding(&self) -> Option<PaddingForm> {
+            self.padding.clone()
+        }
+
+        fn lx_page_sizes(&self) -> BTreeMap<PrimaryDim, Extent> {
+            self.pages.clone()
+        }
+
+        fn hbm_alloc_users(&self) -> Option<Vec<NodeId>> {
+            self.hbm_users.clone()
+        }
+
+        fn lx_alloc_users(&self) -> Option<Vec<NodeId>> {
+            self.lx_users.clone()
+        }
+    }
+
+    /// Every labelled DS of every DSC sharing one organisation, which is all these tests state.
+    struct Orgs(Org);
+
+    impl MemOrgs for Orgs {
+        type Org = Org;
+
+        fn mem_org(&self, _dsc: DscIdx, _lds: LdsIdx) -> Option<&Org> {
+            Some(&self.0)
+        }
+    }
+
+    /// One DSC's transfer nodes, whichever DSC is asked for.
+    struct Transfers(Vec<L3Transfer>);
+
+    impl TransferNodes for Transfers {
+        fn transfers(&self, _dsc: DscIdx) -> Vec<L3Transfer> {
+            self.0.clone()
+        }
+    }
+
+    /// A tree of one block, node 0, whose children are nodes 1, 2 and 3 in that order.
+    struct Parents;
+
+    impl NodeParents for Parents {
+        fn parent(&self, node: NodeId) -> Option<NodeId> {
+            (node != NodeId(0)).then_some(NodeId(0))
+        }
+
+        fn children(&self, parent: NodeId) -> Vec<NodeId> {
+            if parent == NodeId(0) {
+                vec![NodeId(1), NodeId(2), NodeId(3)]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    fn dims(extents: &[(PrimaryDim, i64)]) -> FilledDims {
+        let mut stage = StageDims::default();
+        for (dim, extent) in extents {
+            stage.extents.insert(*dim, Extent(*extent));
+        }
+        FilledDims::of(stage).expect("a stage that states a dim")
+    }
+
+    fn stage(name: &str, extents: &[(PrimaryDim, i64)]) -> DataStage {
+        let name = StageName(name.to_owned());
+        DataStage {
+            ss: NamedDims {
+                name: name.clone(),
+                dims: dims(extents),
+            },
+            el: NamedDims {
+                name,
+                dims: dims(extents),
+            },
+        }
+    }
+
+    /// A primary data structure that lays out the dims given, outermost first, on a one-element stick.
+    fn layout(dims: &[PrimaryDim]) -> PrimaryDsInfo {
+        let (first, rest) = dims.split_first().expect("a layout with a dim in it");
+        PrimaryDsInfo {
+            layout: LayoutDims::new(*first, rest.to_vec()),
+            stick: StickDims::default(),
+        }
+    }
+
+    fn labeled(ds_type: DsType, recorded: LdsIdx, dims: &[PrimaryDim]) -> LabeledDs {
+        LabeledDs::new(
+            ds_type,
+            dims.iter().map(|dim| (*dim, Scale::Sized(1.0))).collect(),
+            recorded,
+            Pinning::default(),
+        )
+    }
+
+    fn dsc(core: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
+        DesignSpaceConfig {
+            corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: Some(CoreletsUsed::ONE),
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), vec![]),
+            layout_dims: BTreeMap::new(),
+            labeled_ds: LabeledDsList::new(labeled(DsType::Input, LdsIdx(0), &[]), vec![]),
+            data_stages: DataStages::new(stage("core", core), stage("chunk", chunk)),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+        }
+    }
+
+    fn sdsc(dsc: DesignSpaceConfig, slices: &[(PrimaryDim, u32)]) -> SuperDsc {
+        SuperDsc::new(
+            DscList::new(dsc, vec![]),
+            slices
+                .iter()
+                .map(|&(dim, count)| {
+                    (
+                        dim,
+                        WkSliceCount::new(NonZeroU32::new(count).expect("a positive slice count")),
+                    )
+                })
+                .collect(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    }
+
+    /// e205 — any of the five weight formats is a batch matmul, and a convolution is not.
+    #[test]
+    fn a_bmm_is_a_bmm_of_any_weight_format() {
+        assert!(is_op_func_bmm(OpFunc::BatchmatmulInt8Fwd));
+        assert!(is_op_func_bmm(OpFunc::BatchmatmulXrfFp8Fwd));
+        assert!(!is_op_func_bmm(OpFunc::Conv2DInt4Fwd));
+    }
+
+    /// e206 — the three reuse dims of `inp0 x inp1 -> out` take the three arms, and a dim in all
+    /// three structures takes none of them.
+    #[test]
+    fn min_param_bmm_answers_per_reuse_arm() {
+        let mut dsc = dsc(
+            &[
+                (PrimaryDim::Mb, 2),
+                (PrimaryDim::Ki, 512),
+                (PrimaryDim::I, 48),
+                (PrimaryDim::J, 64),
+            ],
+            &[(PrimaryDim::I, 1)],
+        );
+        dsc.labeled_ds = LabeledDsList::new(
+            labeled(DsType::Input, LdsIdx(0), &[]),
+            vec![
+                labeled(DsType::Kernel, LdsIdx(1), &[]),
+                labeled(DsType::Output, LdsIdx(2), &[]),
+            ],
+        );
+        dsc.primary_ds_info.insert(
+            DsType::Input,
+            layout(&[PrimaryDim::Mb, PrimaryDim::Ki, PrimaryDim::I]),
+        );
+        dsc.primary_ds_info.insert(
+            DsType::Kernel,
+            layout(&[PrimaryDim::Mb, PrimaryDim::Ki, PrimaryDim::J]),
+        );
+        dsc.primary_ds_info.insert(
+            DsType::Output,
+            layout(&[PrimaryDim::Mb, PrimaryDim::I, PrimaryDim::J]),
+        );
+        let int8 = OpFunc::BatchmatmulInt8Fwd;
+        // The input channel: 512 is a multiple of 256.
+        assert_eq!(
+            min_param_bmm::<Sen1p5>(&dsc, PrimaryDim::Ki, int8),
+            Some(Extent(256))
+        );
+        // The output channel.
+        assert_eq!(
+            min_param_bmm::<Sen1p5>(&dsc, PrimaryDim::J, int8),
+            Some(Extent(64))
+        );
+        // Weight reuse: 48 is the largest divisor of 48 up to 64.
+        assert_eq!(
+            min_param_bmm::<Sen1p5>(&dsc, PrimaryDim::I, int8),
+            Some(Extent(48))
+        );
+        // A dim every structure carries reuses nothing.
+        assert_eq!(
+            min_param_bmm::<Sen1p5>(&dsc, PrimaryDim::Mb, int8),
+            Some(Extent(1))
+        );
+    }
+
+    /// e207 — a chunk dim takes every divisor of the core extent from the lower bound up.
+    #[test]
+    fn dsc_param_candidates_are_the_divisors_from_the_lower_bound_up() {
+        let mut dsc = dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 2)]);
+        dsc.primary_ds_info
+            .insert(DsType::Input, layout(&[PrimaryDim::I]));
+        let sdsc = sdsc(dsc, &[]);
+        let candidates = generate_dsc_param_candidates(
+            &sdsc,
+            &[dims(&[(PrimaryDim::I, 2)])],
+            &[PrimaryDim::I],
+            &BTreeSet::from([PrimaryDim::I]),
+            &BTreeSet::new(),
+            &Orgs(Org::default()),
+            None,
+        )
+        .expect("every dim has a candidate");
+        assert_eq!(
+            candidates
+                .at(DscIdx(0))
+                .and_then(|per_dim| per_dim.get(PrimaryDim::I))
+                .map(Candidates::extents),
+            Some([Extent(2), Extent(4), Extent(8)].as_slice())
+        );
+    }
+
+    /// e208 — only a transfer the allocation names and whose two storages match is kept, and an
+    /// LX-pinned structure has none of them at all.
+    #[test]
+    fn lds_l3_transfers_are_the_alloc_users_between_the_two_storages() {
+        let transfer = |node: u32, name: &str, dst: SenComponent| L3Transfer {
+            node: NodeId(node),
+            name: NodeName(name.to_owned()),
+            src: SenComponent::Hbm,
+            dst,
+        };
+        let trees = Transfers(vec![
+            transfer(7, "hbm_to_lx", SenComponent::Lx),
+            transfer(9, "not_a_user", SenComponent::Lx),
+            transfer(7, "wrong_destination", SenComponent::Hbm),
+        ]);
+        let org = Org {
+            hbm_users: Some(vec![NodeId(7)]),
+            ..Org::default()
+        };
+        let mut hbm = dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 2)]);
+        hbm.labeled_ds = LabeledDsList::new(
+            LabeledDs::new(
+                DsType::Input,
+                Vec::new(),
+                LdsIdx(0),
+                Pinning {
+                    mem_org: BTreeMap::from([(SenComponent::Hbm, true)]),
+                    ..Pinning::default()
+                },
+            ),
+            vec![],
+        );
+        assert_eq!(
+            lds_l3_transfer_nodes(
+                &sdsc(hbm, &[]),
+                DscIdx(0),
+                LdsIdx(0),
+                &org,
+                &trees,
+                &[SenComponent::Hbm],
+                &[SenComponent::Lx],
+            ),
+            Some(vec![transfer(7, "hbm_to_lx", SenComponent::Lx)])
+        );
+        let mut pinned = dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 2)]);
+        pinned.labeled_ds = LabeledDsList::new(
+            LabeledDs::new(
+                DsType::Input,
+                Vec::new(),
+                LdsIdx(0),
+                Pinning {
+                    lx: true,
+                    ..Pinning::default()
+                },
+            ),
+            vec![],
+        );
+        assert_eq!(
+            lds_l3_transfer_nodes(
+                &sdsc(pinned, &[]),
+                DscIdx(0),
+                LdsIdx(0),
+                &org,
+                &trees,
+                &[SenComponent::Hbm],
+                &[SenComponent::Lx],
+            ),
+            Some(Vec::new())
+        );
+    }
+
+    /// e209 — four sticks of the chunk, and the walk stops there because the chunk is below the core
+    /// extent.
+    #[test]
+    fn chunk_stick_volume_multiplies_until_the_chunk_falls_below_the_core() {
+        let mut dsc = dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 4)]);
+        dsc.labeled_ds = LabeledDsList::new(labeled(DsType::Input, LdsIdx(0), &[PrimaryDim::I]), vec![]);
+        dsc.layout_dims
+            .insert(LdsIdx(0), LayoutDims::new(PrimaryDim::I, vec![]));
+        dsc.primary_ds_info
+            .insert(DsType::Input, layout(&[PrimaryDim::I]));
+        let org = Org {
+            padding: Some(PaddingForm::default()),
+            ..Org::default()
+        };
+        assert_eq!(
+            labeled_ds_chunk_stick_volume(&dsc, LdsIdx(0), &org),
+            Some(StickVolume::new(
+                NonZeroU64::new(4).expect("a positive volume")
+            ))
+        );
+    }
+
+    /// e210 — a reduced dim split over two work slices reduces across cores, and a reduced dim the
+    /// super-DSC states no slice count for is the `.at()` throw.
+    #[test]
+    fn cross_core_reduction_is_a_reduced_dim_on_more_than_one_slice() {
+        let mut dsc = dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 2)]);
+        dsc.labeled_ds = LabeledDsList::new(
+            labeled(DsType::Input, LdsIdx(0), &[PrimaryDim::I, PrimaryDim::Ki]),
+            vec![labeled(DsType::Output, LdsIdx(1), &[PrimaryDim::I])],
+        );
+        dsc.layout_dims.insert(
+            LdsIdx(0),
+            LayoutDims::new(PrimaryDim::I, vec![PrimaryDim::Ki]),
+        );
+        dsc.layout_dims
+            .insert(LdsIdx(1), LayoutDims::new(PrimaryDim::I, vec![]));
+        let split = sdsc(dsc.clone(), &[(PrimaryDim::Ki, 2)]);
+        assert_eq!(is_op_cross_core_reduction(&split, &dsc), Some(true));
+        let solo = sdsc(dsc.clone(), &[(PrimaryDim::Ki, 1)]);
+        assert_eq!(is_op_cross_core_reduction(&solo, &dsc), Some(false));
+        assert_eq!(is_op_cross_core_reduction(&sdsc(dsc.clone(), &[]), &dsc), None);
+    }
+
+    /// e211 — the insertion point is the common parent's first or last child on the way down to a
+    /// reference node.
+    #[test]
+    fn the_insertion_node_is_the_outermost_child_on_the_chosen_side() {
+        let refs = BTreeSet::from([NodeId(1), NodeId(3)]);
+        assert_eq!(
+            insertion_node(&Parents, &refs, InsertSide::Before),
+            Some(NodeId(1))
+        );
+        assert_eq!(
+            insertion_node(&Parents, &refs, InsertSide::After),
+            Some(NodeId(3))
+        );
+        assert_eq!(
+            insertion_node(&Parents, &BTreeSet::new(), InsertSide::Before),
+            None
+        );
+    }
+
+    /// e212 — THE EMISSION: four sync nodes land in the tree after the node named, each cross-linked
+    /// to the other end of its own signal.
+    #[test]
+    fn the_sync_sequence_adds_four_cross_linked_nodes_to_the_tree() {
+        let mut parent = BlockNode {
+            name: NodeName("block".to_owned()),
+            children: vec![SchedNode::Leaf(NodeName("transfer".to_owned()))],
+        };
+        let at = parent
+            .child_pos(&NodeName("transfer".to_owned()))
+            .expect("the child the sequence is added after");
+        add_l3_lu_and_lx_lu_sync_node_sequence(&mut parent, at);
+        let names: Vec<&str> = parent
+            .children
+            .iter()
+            .map(|child| child.name().0.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "transfer",
+                "sync_send_l3lu_to_lxlu",
+                "sync_receive_lxlu_from_l3lu",
+                "sync_send_lxlu_to_l3lu",
+                "sync_receive_l3lu_from_lxlu",
+            ]
+        );
+        let SchedNode::Sync(first) = &parent.children[1] else {
+            panic!("the sequence adds sync nodes");
+        };
+        assert_eq!(first.direction, SyncDirection::Send);
+        assert_eq!(first.strength, SyncStrength::Hard);
+        assert_eq!(
+            first.other_ends,
+            vec![NodeName("sync_receive_lxlu_from_l3lu".to_owned())]
+        );
+        assert_eq!(
+            first.units.iter().collect::<Vec<_>>(),
+            vec![SenComponent::L3lu]
+        );
+    }
+}
 
 // crustify:todo: e213_addL3LUAndLXLUSoftSyncNodeSequence
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3959  (26 body lines, level 1)
