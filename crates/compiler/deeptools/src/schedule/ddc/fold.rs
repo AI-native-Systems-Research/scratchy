@@ -168,6 +168,7 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, SliceElems, Stage, StickDims, StickPart, cumulative_stick_sizes,
 };
 use crate::generated::DataConnect;
+use crate::schedule::ddc::RefRole;
 use crate::schedule::ddc::metadata::MetaDimKind;
 use crate::schedule::ddc::transformation::Scale;
 use crate::schedule::ddc::transformation_util::{LoopNode, PaddingForm, PrimaryDimAndKind};
@@ -4602,12 +4603,327 @@ where
     FoldPropagation::Built
 }
 
-// crustify:todo: e337_gatherRelatedPTRows
-//   authority : ddc/ddc_fold.cpp:959  (298 body lines, level 3)
-//   class     : Ddc
-//   original  : bool Ddc::gatherRelatedPTRows( RowGroupInfo &refRowGroup, const dsc2::CoordPropInfoType &coordPropInfo, const dsc2::CoordinateType<CoordinateBaseType> &refCoordinate)
-//   extract   : crustify-ddc/cpp/ddc.cpp:11783-12083
-//   calls     : e076_print, e082_getCompRowId, e091_matchDataStream, e102_print, e297_gatherRelatedPTRowsBase
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// WHICH PT ROWS ONE PROPAGATION SPANS — entry 337 and the vocabulary it reads its two units off.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE OPERAND AS ENTRY 337 READS IT — an `inputs_`/`outputs_` component beside the
+/// `inputsLdsAndLoopOffsets_`/`outputsLdsAndLoopOffsets_` entry the reference indexes in lockstep
+/// with it (`ddc/ddc_fold.cpp:1046-1054`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitStream {
+    /// `inputs_.at(i)` / `outputs_.at(i)` — a UNIT, not a storage.
+    pub unit: SenComponent,
+    /// `..LdsAndLoopOffsets_.at(i)`, in that operand's storage.
+    pub stream: StoredStream,
+}
+
+/// ONE END OF ENTRY 337'S PROPAGATION — `refNode`/`nodeToFold`'s `nodeType_` with the units it
+/// reads off each kind. [`PropEnd`] is the same pair as [`match_data_stream`] needs them; this is
+/// the same pair as the ROW question needs them.
+pub enum PropUnits<'a> {
+    /// `TRANSFER` — `src_.unit_`, and `dstVias_` zipped with `dstLdsAndLoopOffsets_`.
+    Transfer {
+        /// `src_.unit_`.
+        src: SenComponent,
+        /// `dstVias_`, non-empty so neither `dstVias_.at(0)` read can throw.
+        dsts: &'a TransferDsts,
+    },
+    /// `COMPUTE` — `exUnit_` and both operand vectors.
+    Compute {
+        /// `exUnit_`.
+        ex_unit: SenComponent,
+        /// `inputs_`.
+        inputs: &'a [UnitStream],
+        /// `outputs_`.
+        outputs: &'a [UnitStream],
+    },
+    /// `ALLOCATE` — `component_`, the only field this unit reads off one.
+    Allocate {
+        /// `component_`.
+        component: SenComponent,
+    },
+    /// Any other `nodeType_`.
+    Other,
+}
+
+/// ENTRY 337'S PROPAGATION WITH BOTH PROPAGATION UNITS RESOLVED — `propSrcUnit` and `propDestUnit`.
+///
+/// ⛔⛔ EVERY ABORT OF THE 100-LINE RESOLUTION IS THIS WITNESS MISSING: all five
+/// `DT_CHECK(prop*Unit != NO_COMPONENT)` (`:1010`, `:1060`, `:1084`, `:1105`, `:1156`), the
+/// `abs(refRowId - getCompRowId(propDestUnit)) <= 1` check (`:1184`), and *"[gatherRelatedPTRows]
+/// Unsupported reference node for propagation"* for an allocation folded against neither a transfer
+/// nor a compute (`:1162`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtRowPropagation {
+    src: SenComponent,
+    dest: SenComponent,
+}
+
+impl PtRowPropagation {
+    /// Both units, or [`None`] for any of those seven stops.
+    ///
+    /// ⚠️ TRAP: the two ends are read with OPPOSITE `checkRefForAllocate` — `true` where the node to
+    /// fold is the transfer or compute, `false` where it is the allocation — because the flag names
+    /// which end of the propagation the allocation is.
+    #[must_use]
+    pub fn of<A: Allocations + ?Sized>(
+        dsc: &A,
+        prop: &CoordPropInfo,
+        role: RefRole,
+        ref_node: &PropUnits<'_>,
+        node_to_fold: &PropUnits<'_>,
+    ) -> Option<Self> {
+        let none = SenComponent::NoComponent;
+        let matched = |operands: &[UnitStream], check_ref: bool| {
+            operands
+                .iter()
+                .find(|operand| match_data_stream(dsc, prop, operand.stream, check_ref))
+                .map(|operand| operand.unit)
+        };
+        let matched_dst = |dsts: &TransferDsts, check_ref: bool| {
+            dsts.iter()
+                .find(|dst| match_data_stream(dsc, prop, dst.stream, check_ref))
+                .map(|dst| dst.unit)
+        };
+        let mut src = none;
+        let mut dest = none;
+        match *node_to_fold {
+            PropUnits::Transfer { src: from, dsts } => {
+                // The destination unit for propagation is the transfer node's own; where neither end
+                // of it is a row unit that stays the source.
+                dest = from;
+                if comp_row_id(dest).is_none() {
+                    if let Some(row) = dsts.iter().find(|dst| comp_row_id(dst.unit).is_some()) {
+                        dest = row.unit;
+                    }
+                }
+                src = match role {
+                    RefRole::Producer => from,
+                    RefRole::Consumer => matched_dst(dsts, true)?,
+                };
+            }
+            PropUnits::Compute {
+                ex_unit,
+                inputs,
+                outputs,
+            } => {
+                dest = ex_unit;
+                match role {
+                    // A compute's `inputs_` names the GENERIC unit (`l0lu`), so where the reference
+                    // node is a transfer the row-specific unit comes off its matching destination.
+                    RefRole::Producer => {
+                        src = match *ref_node {
+                            PropUnits::Transfer { dsts, .. } => matched_dst(dsts, true)?,
+                            _ => matched(inputs, true)?,
+                        };
+                    }
+                    RefRole::Consumer => {
+                        src = matched(outputs, true).unwrap_or(none);
+                        // Override the comp in case the transfer is for a single PT row: for LXLU to
+                        // PTRow4 the coordinate is for row 4 only.
+                        if let PropUnits::Transfer { src: from, dsts } = *ref_node {
+                            if comp_row_id(src).is_none() {
+                                if comp_row_id(from).is_some() {
+                                    src = from;
+                                } else if comp_row_id(dsts.first().unit).is_some() {
+                                    src = dsts.first().unit;
+                                }
+                            }
+                        }
+                        if src == none {
+                            return None;
+                        }
+                    }
+                }
+            }
+            PropUnits::Allocate { component } => match *ref_node {
+                PropUnits::Transfer { src: from, dsts } => {
+                    match role {
+                        RefRole::Producer => {
+                            dest = matched_dst(dsts, false)?;
+                            src = dest;
+                        }
+                        RefRole::Consumer => {
+                            src = dsts.first().unit;
+                            if comp_row_id(src).is_none() {
+                                if let Some(row) = dsts
+                                    .iter()
+                                    .skip(1)
+                                    .find(|dst| comp_row_id(dst.unit).is_some())
+                                {
+                                    src = row.unit;
+                                }
+                            }
+                            dest = from;
+                        }
+                    }
+                    if comp_row_id(src).is_none() && comp_row_id(from).is_some() {
+                        src = from;
+                    }
+                    // PTARF and PTXRF hold the allocation for ALL rows, so the allocation's own
+                    // component outranks the transfer end.
+                    if matches!(component, SenComponent::Ptarf | SenComponent::Ptxrf) {
+                        dest = component;
+                    }
+                }
+                PropUnits::Compute {
+                    ex_unit,
+                    inputs,
+                    outputs,
+                } => {
+                    src = ex_unit;
+                    dest = match role {
+                        RefRole::Producer => matched(outputs, false)?,
+                        RefRole::Consumer => matched(inputs, false)?,
+                    };
+                }
+                // *"Unsupported reference node for propagation"*.
+                PropUnits::Allocate { .. } | PropUnits::Other => return None,
+            },
+            // The reference's chain has no `else`, so both units stay `NO_COMPONENT`.
+            PropUnits::Other => {}
+        }
+        if let (Some(src_row), Some(dest_row)) = (comp_row_id(src), comp_row_id(dest)) {
+            if !src_row.is_adjacent_or_same(dest_row) {
+                return None;
+            }
+        }
+        Some(Self { src, dest })
+    }
+}
+
+/// THE SAME NODES SCANNED FROM BOTH SIDES — entry 337's unbundling arm hands the base a propagation
+/// with `refIsProducer` NEGATED and both ends swapped (`:12053-12057`), and the role is exactly what
+/// decides which side of a candidate is scanned.
+pub struct RowCandidates<'a, F: AffineFoldDims + ?Sized> {
+    /// Scanned for the propagation as given.
+    pub forward: &'a [RowCandidate<'a, F>],
+    /// Scanned for the reversed propagation.
+    pub reverse: &'a [RowCandidate<'a, F>],
+}
+
+/// WHAT ENTRY 337 FOUND — the `RowGroupInfo` it writes through its `&` fused with its `bool`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PtRowGrouping {
+    /// `cat = NO_BUNDLING` AND NOTHING ELSE WRITTEN — neither unit is on a PT row, or no dim is row
+    /// split. ⭐ The caller's `nodeInfo` is left standing, which is why this is not an empty group.
+    NoBundling,
+    /// `cat = ROW_TO_SAME_ROW`, `activeRow` and the ONE `nodeInfo` entry this unit pushes itself.
+    SameRow(PtRowId, RowGroupNode),
+    /// The category set BEFORE the base call, and what the base then found —
+    /// [`RelatedPtRows::NoBundling`] overwrites it and every other variant leaves it standing, which
+    /// is what the reference's *"Category can be overwritten by the base function"* says.
+    Bundled(RowGroupCategory, RelatedPtRows),
+}
+
+/// The base's answer as this unit's. Its [`RelatedPtRows::NotFolded`] IS its own `false`, so it
+/// propagates as this unit's `false` and never reaches a category.
+fn bundled(cat: RowGroupCategory, found: Option<RelatedPtRows>) -> Option<PtRowGrouping> {
+    match found? {
+        RelatedPtRows::NotFolded => None,
+        other => Some(PtRowGrouping::Bundled(cat, other)),
+    }
+}
+
+/// Replaces: e337_gatherRelatedPTRows
+///
+/// WHICH PT ROWS ONE COORDINATE PROPAGATION SPANS, from the two units it runs between: no bundling,
+/// one row, or a group the base collects (`ddc/ddc_fold.cpp:959`).
+///
+/// ⛔ THE ROW-TO-SAME-ROW ARMS ARE THE ONLY ONES THIS UNIT ANSWERS ITSELF; the other three set a
+/// category and hand the work to entry 297, whose own answer may overwrite it.
+/// ⚠️ TRAP: PTXRF/PTARF TO A ROW UNIT IS `ROW_TO_SAME_ROW` AND TAKES `alpha * row` UNCONDITIONALLY,
+/// where the row-to-same-row arm proper takes `beta` unless the rowsplit fold steps more than once.
+/// ⚠️ `refCoordinate.coordinates_.at(rowSplitDim)` throws where the reference coordinate has no fold
+/// for that dim, and both single-row arms read it; that is one of this [`None`].
+#[must_use]
+pub fn gather_related_pt_rows<A, D, S, T, F>(
+    dsc: &D,
+    core_ds: &S,
+    tree: &T,
+    prop: &CoordPropInfo,
+    units: PtRowPropagation,
+    ref_node: NodeId,
+    ref_coord: &RowCoordinate<'_, F>,
+    scale_down: crate::schedule::ddc::ScaleDown,
+    candidates: &RowCandidates<'_, F>,
+    sdsc_slices: &WorkSlices,
+) -> Option<PtRowGrouping>
+where
+    A: Arch,
+    D: Dsc + Allocations,
+    S: Stage + ?Sized,
+    T: ScheduleTree + ?Sized,
+    F: AffineFoldDims + ?Sized,
+{
+    let src_row = comp_row_id(units.src);
+    let dest_row = comp_row_id(units.dest);
+    if src_row.is_none() && dest_row.is_none() {
+        // Neither reference nor working node corresponds to a PT row.
+        return Some(PtRowGrouping::NoBundling);
+    }
+    let Some(row_split_dim) = PrimaryDim::ALL
+        .into_iter()
+        .find(|&dim| core_ds.is_row_split(dim))
+    else {
+        // No dimension is split across PT rows.
+        return Some(PtRowGrouping::NoBundling);
+    };
+    let base = |prop: &CoordPropInfo, candidates: &[RowCandidate<'_, F>]| {
+        gather_related_pt_rows_base::<A, D, S, T, F>(
+            dsc, core_ds, tree, prop, scale_down, candidates, sdsc_slices,
+        )
+    };
+    let single_row = |row: PtRowId, scaled: bool| {
+        let folds = *ref_coord.dims.get(&row_split_dim)?;
+        let (alpha, beta) = folds.alpha_beta(FoldPosition::RowSplit.index());
+        let beta = if scaled || folds.dim_size(FoldPosition::RowSplit.index()).0 > 1 {
+            Beta(alpha.0 * i64::from(row.ordinal()))
+        } else {
+            beta
+        };
+        Some(PtRowGrouping::SameRow(
+            row,
+            RowGroupNode {
+                node: ref_node,
+                row: Some(row),
+                beta,
+            },
+        ))
+    };
+
+    match (src_row, dest_row) {
+        (Some(_), None) => {
+            bundled(RowGroupCategory::RowToNonRow, base(prop, candidates.forward))
+        }
+        // No need to collect nodes for all rows: the reference node's own row is the group.
+        (Some(row), Some(dest)) if row == dest => single_row(row, false),
+        (Some(_), Some(_)) => {
+            bundled(RowGroupCategory::RowNorthSouth, base(prop, candidates.forward))
+        }
+        // Propagation from PTXRF/PTARF to a row unit counts as ROW_TO_SAME_ROW.
+        (None, Some(dest))
+            if matches!(units.src, SenComponent::Ptxrf | SenComponent::Ptarf) =>
+        {
+            single_row(dest, true)
+        }
+        // UN-bundling is needed in this scenario.
+        (None, Some(_)) => {
+            let reversed = CoordPropInfo {
+                data_connect: prop.data_connect,
+                ref_node: prop.node_to_fold,
+                node_to_fold: prop.ref_node,
+            };
+            bundled(
+                RowGroupCategory::NonRowToRow,
+                base(&reversed, candidates.reverse),
+            )
+        }
+        // Both absent is the early answer above, so the reference's chain has no fallthrough.
+        (None, None) => Some(PtRowGrouping::NoBundling),
+    }
+}
 
 // crustify:todo: e356_buildFoldForAllocation
 //   authority : ddc/ddc_fold.cpp:2395  (473 body lines, level 4)
@@ -4710,6 +5026,7 @@ mod tests_e078_e085 {
                 data_connect: connect,
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
@@ -5634,7 +5951,9 @@ mod tests_e233_e240 {
     }
 }
 
-/// ⭐ TESTS FOR ENTRIES 297-299. Union this module with this file's other test modules when they land.
+/// ⭐ TESTS FOR ENTRIES 297-299, AND FOR ENTRY 337, whose two single-row arms read the same fold
+/// managers and whose other three arms are entry 297's own. Union this module with this file's other
+/// test modules when they land.
 #[cfg(test)]
 mod tests_e297_e299 {
     use super::*;
@@ -5867,6 +6186,7 @@ mod tests_e297_e299 {
                 data_connect: Some(DataConnect::AconstConnect),
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
@@ -6176,6 +6496,104 @@ mod tests_e297_e299 {
                 ("loopB out".to_owned(), 16, 4),
                 ("elem_arr_0".to_owned(), 2, 4),
             ]
+        );
+    }
+    /// The three rowsplit levels entry 337's two single-row arms read: alpha 32 and beta 7 at
+    /// [`FoldPosition::RowSplit`], stepping ONCE so the row-to-same-row arm takes the beta.
+    fn one_step_row_split() -> Levels {
+        Levels(vec![
+            level(100, 0, 2, Some(FoldLabel::CoreWorksliceFoldDim)),
+            level(50, 0, 2, Some(FoldLabel::CoreletFoldDim)),
+            level(32, 7, 1, Some(FoldLabel::RowSplitFold)),
+        ])
+    }
+
+    fn on_row(unit: SenComponent) -> Vec<UnitStream> {
+        vec![UnitStream {
+            unit,
+            stream: matched_stream(),
+        }]
+    }
+
+    #[test]
+    fn ptxrf_to_a_row_offsets_by_alpha_where_the_same_row_arm_takes_the_rowsplit_beta() {
+        let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, vec![PrimaryDim::In]));
+        let core_ds = RowSplitOn(vec![PrimaryDim::Out]);
+        let tree = Tree(vec![None]);
+        let levels = one_step_row_split();
+        let slices = WorkSlices::default();
+        let coord = RowCoordinate {
+            dims: BTreeMap::from([(PrimaryDim::Out, &levels)]),
+            work_slices: &slices,
+        };
+        let no_candidates: RowCandidates<'_, Levels> = RowCandidates {
+            forward: &[],
+            reverse: &[],
+        };
+        let gather = |units| {
+            gather_related_pt_rows::<Target, _, _, _, Levels>(
+                &dsc,
+                &core_ds,
+                &tree,
+                &propagation(),
+                units,
+                NodeId(0),
+                &coord,
+                crate::schedule::ddc::ScaleDown::No,
+                &no_candidates,
+                &slices,
+            )
+        };
+        let row3 = comp_row_id(SenComponent::Ptrow3);
+        let on_ptrow3 = on_row(SenComponent::Ptrow3);
+        let on_ptxrf = on_row(SenComponent::Ptxrf);
+
+        // Row 3 producing for row 3: the rowsplit fold steps once, so its own beta stands.
+        let same_row = PtRowPropagation::of(
+            &dsc,
+            &propagation(),
+            RefRole::Producer,
+            &PropUnits::Other,
+            &PropUnits::Compute {
+                ex_unit: SenComponent::Ptrow3,
+                inputs: &on_ptrow3,
+                outputs: &[],
+            },
+        );
+        assert_eq!(
+            gather(same_row.expect("both units resolve to row 3")),
+            Some(PtRowGrouping::SameRow(
+                row3.expect("ptrow3 is a row"),
+                RowGroupNode {
+                    node: NodeId(0),
+                    row: row3,
+                    beta: Beta(7),
+                },
+            ))
+        );
+
+        // PTXRF consumed by row 3: the same category, but alpha times the row REGARDLESS.
+        let from_ptxrf = PtRowPropagation::of(
+            &dsc,
+            &propagation(),
+            RefRole::Consumer,
+            &PropUnits::Other,
+            &PropUnits::Compute {
+                ex_unit: SenComponent::Ptrow3,
+                inputs: &[],
+                outputs: &on_ptxrf,
+            },
+        );
+        assert_eq!(
+            gather(from_ptxrf.expect("PTXRF is the source unit and row 3 the destination")),
+            Some(PtRowGrouping::SameRow(
+                row3.expect("ptrow3 is a row"),
+                RowGroupNode {
+                    node: NodeId(0),
+                    row: row3,
+                    beta: Beta(32 * 3),
+                },
+            ))
         );
     }
 }

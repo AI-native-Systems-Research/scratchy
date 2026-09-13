@@ -305,7 +305,15 @@ pub struct DataInfo {
     pub my_lds_idx: Option<LdsIdx>,
     /// `constantId_` (`dsc/dsc2.h:726`), once its `-1` is an [`Option`].
     pub constant_id: Option<ConstIdx>,
+    /// `latchDataId_` (`dsc/dsc2.h:725`), *"used to link producer and consumer when using LATCH"*,
+    /// once its `-1` is an [`Option`]. Entry 339 is the one unit that mints one.
+    pub latch_data_id: Option<LatchDataId>,
 }
+
+/// WHICH LATCHED RESULT AN OPERAND IS LINKED TO — one `latchDataId_` (`dsc/dsc2.h:725`). Producer
+/// and consumers carry the SAME id, which is the whole point of the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LatchDataId(pub u32);
 
 /// A NODE OPERAND — its component and its [`DataInfo`] AS ONE VALUE.
 ///
@@ -773,6 +781,7 @@ impl Via {
                 data_connect: None,
                 my_lds_idx: self.lds,
                 constant_id: None,
+                latch_data_id: None,
             },
         }
     }
