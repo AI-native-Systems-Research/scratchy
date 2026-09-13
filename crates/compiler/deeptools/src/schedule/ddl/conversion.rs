@@ -445,8 +445,8 @@ pub fn add_internal_tensor<S: InternalTensorSite + ?Sized>(
         }
     }
     let prefilled = &mut metadata.prefilled_external_transfer_data_connects;
-    if let Some(slot) = prefilled.remove(&(old_last, ExternalStorage::Lx)) {
-        prefilled.insert((new_last, ExternalStorage::Lx), slot);
+    if let Some(slot) = prefilled.remove(&(Some(old_last), ExternalStorage::Lx)) {
+        prefilled.insert((Some(new_last), ExternalStorage::Lx), slot);
     }
     Some(tail.insert_position)
 }
@@ -1786,7 +1786,7 @@ mod unit_tests {
             },
         );
         metadata.prefilled_external_transfer_data_connects.insert(
-            (LdsIdx(1), ExternalStorage::Lx),
+            (Some(LdsIdx(1)), ExternalStorage::Lx),
             DataConnectSlot {
                 transfer: NodeId(5),
                 end: TransferEnd::Src,
@@ -1828,7 +1828,7 @@ mod unit_tests {
         assert!(
             metadata
                 .prefilled_external_transfer_data_connects
-                .contains_key(&(LdsIdx(2), ExternalStorage::Lx))
+                .contains_key(&(Some(LdsIdx(2)), ExternalStorage::Lx))
         );
     }
 

@@ -282,9 +282,9 @@ use crate::schedule::ddc::transformation_util::{
 use crate::schedule::ddc::v1::{self, ComputeOps};
 use crate::schedule::dsc2::{
     AddressFold, AllocateNode, BlockNode, ChildPos, Coordinate, CoordinateCategory, Dsc, Dsts, Fold,
-    FoldCardinality, FoldCoeff, FoldDim, FoldLabel, FoldPosition, LdsIdx, Node, NodeName, PadFold,
-    ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength, SyncUnits,
-    TransferNode, TransferPadding, Via, ZeroPadFolds,
+    FoldCardinality, FoldCoeff, FoldDim, FoldLabel, FoldPosition, LdsIdx, Node, NodeName, NumChunks,
+    PadFold, ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength,
+    SyncUnits, TransferNode, TransferPadding, Via, ZeroPadFolds,
 };
 use crate::schedule::l3::dsc::{
     AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare, CoreletsUsed,
@@ -1543,6 +1543,7 @@ pub fn create_transfer_node(src: Via, dst: Via, more_dsts: &[Via], name: NodeNam
         ),
         replication_factor: ReplicationFactor::ONE,
         unit_time_transfer_chunk_size: Vec::new(),
+        unit_time_transfer_num_chunks: NumChunks::ONE,
     }
 }
 
