@@ -3473,8 +3473,9 @@ pub enum DimScale {
 ///
 /// ⛔⛔ `ldsIdx_ < 0` IS NOT A STATE HERE (`:2249`): the reference returns having done nothing, so an
 /// allocation with no labeled DS is simply one this value cannot be built for.
-/// ⭐ `setPadding(allocNode->padding_)` IMMEDIATELY FOLLOWED BY `getPadding(dim)` COLLAPSES to
-/// reading the allocation's own form, so the coordinate carries no padding state.
+/// ⭐ `setPadding(allocNode->padding_)` (`:2268`) STAMPS THE FORM ONTO THE COORDINATE and it STAYS
+/// THERE: other units read the coordinate's own form afterwards (`:2718`, `:2821`, `:3774`,
+/// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7581`), so it is state, not a re-spelling of `padding_`.
 pub struct ExternalAllocation<'a> {
     /// `ldsIdx_`.
     pub lds: LdsIdx,
@@ -3574,6 +3575,8 @@ pub fn build_fold_for_external_allocation<'l, S, T>(
         return;
     }
 
+    coord.set_padding_form(alloc.padding.stated());
+
     // Construct a foldManager for each relevant dimension.
     for &(curr_dim, dim_scale) in alloc.layout {
         let dim = curr_dim.dim;
@@ -3581,7 +3584,7 @@ pub fn build_fold_for_external_allocation<'l, S, T>(
             continue;
         }
         let fold_dim_str = dim.spelling();
-        let alloc_padding_for_curr_dim = alloc.padding.padding(dim);
+        let alloc_padding_for_curr_dim = coord.padding(dim);
 
         // Build element arrangement info along with the temporal fold. TO DO: this is a placeholder
         // and includes only the monotonically increasing contiguous case.
@@ -4654,5 +4657,73 @@ mod tests_e233_e240 {
                 (0, 0, 1, "elem_arr_0".to_owned()),
             ]
         );
+    }
+
+    /// REGRESSION, entry 240: the port used to read `allocNode->padding_` directly and never run
+    /// `setPadding(allocNode->padding_)` (`ddc/ddc_fold.cpp:2268`), so the coordinate went out
+    /// carrying no form and every later `getPadding()` of it (`:2718`, `:2821`, `:3774`) read `NOPAD`.
+    #[test]
+    fn an_external_allocations_form_is_stamped_onto_its_coordinate_and_only_past_the_early_returns() {
+        let stage = ExternalStage {
+            corelet_extent: Extent(16),
+            core_extent: Extent(64),
+            corelets: Cardinality(1),
+            slices: Cardinality(2),
+            trip: LoopTrip::Staged {
+                iterations: Cardinality(4),
+                alpha: Alpha(16),
+            },
+        };
+        let mut padding = PaddingForm::default();
+        padding.set_padding(PrimaryDim::Out, PadType::PaddedWZeroPad);
+        let sized = [(
+            PrimaryDimAndKind {
+                dim: PrimaryDim::Out,
+                kind: MetaDimKind::Unpadded,
+            },
+            DimScale::Sized,
+        )];
+        let alloc = ExternalAllocation {
+            lds: LdsIdx(0),
+            component: SenComponent::Lx,
+            layout: &sized,
+            padding: &padding,
+        };
+        let loop_node = loop_named("loop_ds0_ds1", PrimaryDim::Out);
+        let chain = [LoopAndDim {
+            loop_node: &loop_node,
+            dim: PrimaryDimAndKind {
+                dim: PrimaryDim::Out,
+                kind: MetaDimKind::Unpadded,
+            },
+            distribution: LoopDistribution::AboveChunk,
+        }];
+        let distribution = Distributor(vec![level(1, 0, 16)]);
+
+        let mut coord = dsc2::Coordinate::default();
+        build_fold_for_external_allocation(
+            &alloc,
+            NodeId(9),
+            &stage,
+            &distribution,
+            &chain,
+            &mut coord,
+            &mut (),
+        );
+        assert_eq!(coord.padding(PrimaryDim::Out), PadType::PaddedWZeroPad);
+
+        // `setPadding` sits BELOW the empty-loop-chain return (`:2258-2268`), so a coordinate that
+        // never reaches the dim loop is left exactly as it came in.
+        let mut untouched = dsc2::Coordinate::default();
+        build_fold_for_external_allocation(
+            &alloc,
+            NodeId(9),
+            &stage,
+            &distribution,
+            &[],
+            &mut untouched,
+            &mut (),
+        );
+        assert_eq!(untouched.padding(PrimaryDim::Out), PadType::NoPad);
     }
 }
