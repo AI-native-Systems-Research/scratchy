@@ -154,8 +154,12 @@ impl ChainFlags {
 /// clears — so each descriptor is reached, and freed, through exactly one container. Owning `Vec` is
 /// that, minus the delete loop.
 ///
-/// ⛔ NO `sorted_list_`: it is a lookup memoisation (`:937`), which the campaign lets a port drop —
-/// `lookup` (`e423`) is scheduled separately and owns that decision.
+/// ⛔ NO `sorted_list_`, AND ITS OWN COMMENT ("only read when doing lookups", `:935-937`) UNDERSTATES
+/// IT: `getSortedList()` (`:893`) has a second reader, `computeAddressInfoList` (e614, `:1685-1686`),
+/// which ZIPS this container against the other one. That pairing survives the drop — both containers
+/// are inserted into in lockstep from the same op (`:1410-1426`, sizes checked equal at `:1367`), so
+/// descriptor `i` here describes the same transfer as descriptor `i` there under insertion order
+/// exactly as it did under address order. ⭐ e614 PAIRS BY INDEX; only the visit ORDER is lost.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DataTransferDescriptorContainer {
     /// The descriptors, in the syntactic order `insert` saw them.
@@ -170,13 +174,14 @@ impl DataTransferDescriptorContainer {
     /// Takes ownership of one descriptor, appended in the syntactic order the walk found it, and
     /// answers WHICH one it now is (`:2169-2177`).
     ///
-    /// ⛔ THE `std::sort` GOES WITH `sorted_list_`, AND ORDERS NOTHING OBSERVABLE: its comparator is
-    /// `&a->getOperation() < &b->getOperation()` (`:2173-2176`), the raw ADDRESS of the op, and the
-    /// only reader of that order is [`Self::lookup`]'s `lower_bound`. Reproducing it would need
-    /// allocation addresses Rust does not hand out, and it would still answer the same question.
-    /// ⭐ IT RETURNS THE [`DescriptorId`] THE REFERENCE'S CALLER ALREADY HELD: the reference is handed
-    /// a pointer it keeps using (`:1444`, `:2226`), so a `()` return would make the descriptor it just
-    /// moved in unreachable.
+    /// ⛔ THE `std::sort` IS NOT REPRODUCIBLE, AND `lookup` IS NOT ITS ONLY READER: the comparator is
+    /// the raw ADDRESS of the op (`:2173-2176`), which Rust does not hand out, and besides
+    /// [`Self::lookup`]'s `lower_bound` that order reaches `computeAddressInfoList`'s zip
+    /// (`:1685-1686`) — [`DataTransferDescriptorContainer`] says why an index pairs that zip.
+    /// ⭐ IT RETURNS AN ID THE REFERENCE'S CALLER DOES NOT KEEP: the `new`'d pointer is discarded at
+    /// every callsite (`:1410-1431`) and descriptors are reached again by iterating (`:1443`, `:1452`)
+    /// or by `lookup` (`:2225`) — but this `insert` MOVES the descriptor in, so the [`DescriptorId`] is
+    /// the only handle those two readers have left.
     pub fn insert(&mut self, desc: DataTransferDescriptor) -> DescriptorId {
         self.validate();
         let id = DescriptorId(self.descriptors.len() as u32);

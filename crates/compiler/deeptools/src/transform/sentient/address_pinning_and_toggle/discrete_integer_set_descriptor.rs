@@ -120,8 +120,9 @@ impl DiscreteIntegerSetDescriptor {
     /// ⛔ AND A VALID DESCRIPTOR CAN CARRY `None` THERE: `isValid()` (`:468`) reads only
     /// `iter_arg_index_` and `outer_loop_`, so the reference's `*init_` here is an unguarded
     /// dereference of a pointer its own validity test never covered.
-    /// ⭐ NOTE THE SPACE BEFORE THE FIRST NEWLINE (`"…Descriptor: \n"`), which its two sibling dumps
-    /// have and `ConditionalConstantDescriptor`'s does not.
+    /// ⭐ NOTE THE SPACE BEFORE THE FIRST NEWLINE (`"…Descriptor: \n"`): of the six pattern-descriptor dumps
+    /// only this one and `LoopingChainMutableAddrDescriptor`'s carry it (`:2956`, `:3123`) — the other
+    /// four do not (`:2630`, `:2726`, `:2782`, `:2879`), so it is no family convention to align to.
     #[must_use]
     pub fn dump(&self) -> String {
         let mut out = String::from("Constant Discrete Integer Set Descriptor: \n");

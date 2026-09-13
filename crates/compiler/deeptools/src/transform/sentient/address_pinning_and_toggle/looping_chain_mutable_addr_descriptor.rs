@@ -180,8 +180,9 @@ impl LoopingChainMutableAddrDescriptor {
     ///
     /// ⛔ A NON-BLOCK-ARGUMENT `base_addr` IS AN ABORT HERE, not a quiet default (`:3096`) — this is
     /// the one descriptor whose constructor asserts rather than returning unmatched.
-    /// ⭐ `op_` AND `mutable_addr_result_idx_` BECOME THE `end` ARGUMENT: the index is the only one of
-    /// the two the walk reads, and `op_` is read by `e427_dump` alone.
+    /// ⭐ ONLY `mutable_addr_result_idx_` SURVIVES, AS THE `end` ARGUMENT: the walk reads it (`:3221`,
+    /// `:3225`, `:3289`, `:3293`) and `op_` is read by NOTHING once the ctor stores it (`:3087`) —
+    /// e427_dump prints `size_`, `init_` and `increment_` only.
     #[must_use]
     pub fn new(
         base_addr: Val,
