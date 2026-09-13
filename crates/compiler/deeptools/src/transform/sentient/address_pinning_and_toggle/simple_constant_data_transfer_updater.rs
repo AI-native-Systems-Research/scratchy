@@ -95,7 +95,7 @@ impl SimpleConstantDataTransferUpdater {
     /// Replaces: e420_updateImmutableAddr
     ///
     /// Pins the transfer's immutable address: the closest pinned address to its ONE constant base
-    /// address (`:1897-1899`) becomes `op`'s immutable-addr operand, and that answer is handed back
+    /// address (`:1897-1900`) becomes `op`'s immutable-addr operand, and that answer is handed back
     /// for the mutable half to re-base against.
     ///
     /// ⭐ THE ONE-ADDRESS `findClosestPinnedAddr` IS THE PAIR CALL WITH `X == Y` by its own body
@@ -128,12 +128,12 @@ impl SimpleConstantDataTransferUpdater {
     /// Replaces: e421_updateConstantMutableAddr
     ///
     /// Re-bases the transfer's constant mutable address onto the address just pinned:
-    /// `(const_mutable_addr + base_addr) - new_immut_addr_ev` (`:1918-1920`) becomes the new
+    /// `(const_mutable_addr + base_addr) - new_immut_addr_ev` (`:1922-1924`) becomes the new
     /// mutable-addr operand.
     ///
     /// ⭐ THE SUM RESTORES THE ABSOLUTE ADDRESS AND THE SUB RE-RELATIVISES IT: `mutable_addr_[0]` is
     /// an offset from the OLD base, so it is only meaningful once `dtd_.getBaseAddr()` is added back.
-    /// ⛔ `overflowsRegister` TRUE IS THE ABORT (`:1924-1925`) — LAR/EAR cannot hold the new offset.
+    /// ⛔ `overflowsRegister` TRUE IS THE ABORT (`:1927-1928`) — LAR/EAR cannot hold the new offset.
     pub fn update_constant_mutable_addr(
         self,
         dtd: &DataTransferDescriptor,
@@ -148,7 +148,7 @@ impl SimpleConstantDataTransferUpdater {
     ) {
         let mutable_addr = *mutable_addr_mut(op, end);
         if !is_constant(mutable_addr, ConstKind::ScalarConstant, defs) {
-            panic!("DT_CHECK(\"Expect constant mutable addr\") (`:1911-1912`) for {mutable_addr:?}")
+            panic!("DT_CHECK(\"Expect constant mutable addr\") (`:1910-1912`) for {mutable_addr:?}")
         }
         let Some(base_addr) = dtd.base_addr() else {
             panic!(
@@ -161,7 +161,7 @@ impl SimpleConstantDataTransferUpdater {
         let absolute = evaluator.evaluate_sum_handle(const_ma_ev, base_addr);
         let new_mut_addr_ev = evaluator.evaluate_sub_handle(absolute, new_immut_addr_ev);
         if ps_manager.overflows_register(new_mut_addr_ev, element_size) {
-            panic!("DT_CHECK_MSG(\"LAR/EAR overflow detected\") (`:1924-1925`)")
+            panic!("DT_CHECK_MSG(\"LAR/EAR overflow detected\") (`:1927-1928`)")
         }
         *mutable_addr_mut(op, end) = create_offset_value(new_mut_addr_ev, ty);
     }

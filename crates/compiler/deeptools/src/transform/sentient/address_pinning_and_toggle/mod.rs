@@ -740,12 +740,12 @@ impl DataTransferDescriptorContainer {
 impl DataTransferDescriptorContainer {
     /// Replaces: e417_isHeadOfLoopingChain
     ///
-    /// Whether `desc` heads a chain whose last link reaches back to it (`:920-927`).
+    /// Whether `desc` heads a chain whose last link reaches back to it (`:920-926`).
     ///
     /// ⭐ THE `isHeadOfChain` GUARD DOES FIRE, UNLIKE e273'S: `computeChainingInfo`'s second loop runs
     /// over EVERY valid descriptor and sets `kHeadOfLoopingChain` on each one whose mutable-address
     /// result is yielded by its own enclosing `sentient.for` (`:2251-2278`) — which the tail link of a
-    /// two-link chain is, holding `kPartOfChain` with `kHeadOfChain` explicitly cleared (`:2219-2220`).
+    /// two-link chain is, holding `kPartOfChain` with `kHeadOfChain` explicitly cleared (`:2219`).
     #[must_use]
     pub fn is_head_of_looping_chain(&self, desc: DescriptorId) -> bool {
         self.is_head_of_chain(desc)
@@ -1086,8 +1086,8 @@ impl DataTransferDescriptor {
     ///
     /// ⛔ THE `isValid()` CONJUNCT IS SPECIALISED, NOT DROPPED, exactly as in [`Self::is_toggle`]:
     /// with the arm destructured, `isValid() && isa<SimpleConstantDescriptor>` is e278's TAIL arm
-    /// (`:2497-2499`) — the reference's `dyn_cast` chain has no `SimpleConstant` case and this
-    /// descriptor is never invalid (`:191`) — so exactly one stored base address is required.
+    /// (`:2499`) — the reference's `dyn_cast` chain has no `SimpleConstant` case and this
+    /// descriptor is never invalid (`:193`) — so exactly one stored base address is required.
     #[must_use]
     pub fn is_simple_constant(&self) -> bool {
         matches!(
@@ -1629,7 +1629,7 @@ impl LoopingChainMutableAddrDescriptor {
     /// `initializeDescriptor` pushes as the transfer's one base address (`:2414`).
     ///
     /// ⛔ `None` IS THAT `DT_CHECK`, AND [`Self::invalidate`] REACHES IT WITHOUT CLEARING `init_` —
-    /// the head flag and the outer loop are what it drops (`:589-592`).
+    /// the head flag and the outer loop are what it drops (`:600-603`).
     #[must_use]
     pub fn init(&self) -> Option<EvaluatedValue> {
         if self.is_valid() { self.init } else { None }

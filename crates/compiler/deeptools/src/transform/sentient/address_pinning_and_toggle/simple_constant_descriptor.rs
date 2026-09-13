@@ -82,7 +82,7 @@ use crate::transform::sentient::analyses::EvaluatedValue;
 /// A BASE ADDRESS THAT IS ONE CONSTANT — `class SimpleConstantDescriptor`
 /// (`AddressPinningAndToggle.cpp:161-198`), matched on a `ConstantOp` or a constant `QueryMapOp`.
 ///
-/// ⭐ NO INVALID STATE: "Descriptor is always valid once constructed" (`:191`), so there is no
+/// ⭐ NO INVALID STATE: "Descriptor is always valid once constructed" (`:192`), so there is no
 /// `invalidate()` and no `Option` here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimpleConstantDescriptor {
@@ -96,7 +96,7 @@ impl SimpleConstantDescriptor {
     /// The descriptor's debug block: its header and then its one constant, tab-indented.
     ///
     /// ⭐ THE `Invalid` BRANCH (`:2632-2635`) IS UNREACHABLE, not dropped: this class's `isValid()` is
-    /// `return true` (`:191`), so no `SimpleConstantDescriptor` can take it and there is no state here
+    /// `return true` (`:193`), so no `SimpleConstantDescriptor` can take it and there is no state here
     /// to test — see the type's own note.
     /// ⛔ THE CONSTANT'S DIGITS ARE THE ANALYSIS'S — [`EvaluatedValue::rendered`], not `self.ev.0`,
     /// which is an arena slot.
