@@ -376,6 +376,16 @@ impl DimSet {
         })
     }
 
+    /// The ONE-DIM key `{dim}` — the `std::set<PrimaryDimTypes>` a braced single dim initialises
+    /// (`ddc/ddc_transformation.cpp:1044`, `:1085`), TOTAL because one dim is already non-empty.
+    #[must_use]
+    pub const fn single(dim: PrimaryDim) -> DimSet {
+        DimSet {
+            head: dim,
+            rest: Vec::new(),
+        }
+    }
+
     /// `*dims.begin()` — the smallest dim, which is the one a single-dim key holds.
     #[must_use]
     pub fn first(&self) -> PrimaryDim {
