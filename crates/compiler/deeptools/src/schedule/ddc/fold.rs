@@ -2126,7 +2126,7 @@ pub struct ElemArrDistribution<'l> {
 
 /// THE TWO `dsc/dsc2.cpp` HELPERS ENTRY 241 REACHES OUT TO — both OUTSIDE this campaign's file list
 /// (`crustify-ddc/OUTSIDE-DEPS.tsv`, "dsc2 tree utilities"), so they are seams here and not ports.
-pub trait TemporalLoopDistribution<'l> {
+pub trait TemporalLoopDistribution {
     /// `dsc2::LoopDistributionParamPerNodeType` — the out-param entry 241 threads through, whose
     /// contents are the distributor's own business.
     type LoopParams;
@@ -2134,7 +2134,7 @@ pub trait TemporalLoopDistribution<'l> {
     /// `collectRelatedLoops(currDsc, dimToFind, allEnclosingLoops, relatedLoops, accessPadType)`
     /// (`dsc/dsc2.cpp:6575`) — the enclosing chain filtered to the loops that walk this dim, and
     /// INNERMOST FIRST because the chain is.
-    fn related_loops(
+    fn related_loops<'l>(
         &self,
         dim: PrimaryDimAndKind,
         chain: &[LoopAndDim<'l>],
@@ -2144,12 +2144,19 @@ pub trait TemporalLoopDistribution<'l> {
     /// `distributeElemArrToTemporalLoops(.., targetCoreletId = 0, ..)` (`dsc/dsc2.cpp:5934`) — for
     /// ONE corelet, as entry 241's own argument comment says (`ddc/ddc_fold.cpp:3038`).
     ///
+    /// ⚠️ ENTRY 229 PASSES `-1` *"for both corelets"* (`L3DlOpsScheduler.cpp:7676`) AND IT IS INERT
+    /// THERE: `targetCoreletId` is read on the `BELOW_CHUNK` arm alone (`dsc/dsc2.cpp:6054`) and
+    /// every loop that unit hands over is tagged `ABOVE_CHUNK`, so the seam takes no such argument.
+    ///
+    /// ⛔ THE REQUEST'S LIFETIME IS THE CALL'S, not the implementor's: entry 229 distributes over a
+    /// loop it MINTS ON THE SPOT, which no `'l` outliving the seam could name.
+    ///
     /// ⛔ IT RETURNS `elemArrParamsAfterDistribution`, the redistributed element-arrangement levels
     /// OUTERMOST FIRST. Entry 241 drops them (`:3029`); entries 234 and 240 append them to a fold
     /// list, so the out-param cannot be dropped from the seam.
     fn distribute(
         &self,
-        request: &ElemArrDistribution<'l>,
+        request: &ElemArrDistribution<'_>,
         loop_params: &mut Self::LoopParams,
     ) -> Vec<FoldParamInfo>;
 
@@ -2192,7 +2199,7 @@ pub fn relate_loops_to_alloc_elem_arr<'l, A, T, F>(
     loop_params: &mut T::LoopParams,
 ) where
     A: Allocations + ?Sized,
-    T: TemporalLoopDistribution<'l> + ?Sized,
+    T: TemporalLoopDistribution + ?Sized,
     F: AffineFoldDims + ?Sized,
 {
     let components = ref_components(dsc, prop);
@@ -2316,10 +2323,10 @@ mod tests_e241 {
     /// distributor records its request in the out-param.
     struct Seams;
 
-    impl<'l> TemporalLoopDistribution<'l> for Seams {
+    impl TemporalLoopDistribution for Seams {
         type LoopParams = Option<Recorded>;
 
-        fn related_loops(
+        fn related_loops<'l>(
             &self,
             dim: PrimaryDimAndKind,
             chain: &[LoopAndDim<'l>],
@@ -2334,7 +2341,7 @@ mod tests_e241 {
 
         fn distribute(
             &self,
-            request: &ElemArrDistribution<'l>,
+            request: &ElemArrDistribution<'_>,
             loop_params: &mut Self::LoopParams,
         ) -> Vec<FoldParamInfo> {
             *loop_params = Some(Recorded {
@@ -2657,7 +2664,7 @@ pub fn scale_up_coord<'l, T, F, C>(
     loop_chain: &[LoopAndDim<'l>],
     loop_params: &mut T::LoopParams,
 ) where
-    T: TemporalLoopDistribution<'l> + ?Sized,
+    T: TemporalLoopDistribution + ?Sized,
     F: AffineFoldDims + ?Sized,
     C: Coordinate + ?Sized,
 {
@@ -3556,7 +3563,7 @@ pub fn build_fold_for_external_allocation<'l, S, T>(
     loop_params: &mut T::LoopParams,
 ) where
     S: ExternalFoldStage + ?Sized,
-    T: TemporalLoopDistribution<'l> + ?Sized,
+    T: TemporalLoopDistribution + ?Sized,
 {
     if coord.fold_constructed() {
         // Upstream-filled coordinates of an external allocate node.
@@ -4076,10 +4083,10 @@ mod tests_e233_e240 {
     /// answers one fixed element arrangement, and it decided nothing for any loop.
     struct Distributor(Vec<FoldParamInfo>);
 
-    impl<'l> TemporalLoopDistribution<'l> for Distributor {
+    impl TemporalLoopDistribution for Distributor {
         type LoopParams = ();
 
-        fn related_loops(
+        fn related_loops<'l>(
             &self,
             _dim: PrimaryDimAndKind,
             chain: &[LoopAndDim<'l>],
@@ -4090,7 +4097,7 @@ mod tests_e233_e240 {
 
         fn distribute(
             &self,
-            _request: &ElemArrDistribution<'l>,
+            _request: &ElemArrDistribution<'_>,
             _loop_params: &mut Self::LoopParams,
         ) -> Vec<FoldParamInfo> {
             self.0.clone()
