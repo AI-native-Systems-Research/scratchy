@@ -97,7 +97,8 @@
 
 use super::{
     Builders, ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS, Entries, EvaluatedValueId,
-    ExpressionEvaluator, IntervalMarker, IntervalStride, Sequence, SequenceKind, Table, TableSlice,
+    ExpressionEvaluator, IntervalMarker, IntervalStride, Leaf, Sequence, SequenceKind, Table,
+    TableIndex, TableSlice,
 };
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{self as ir, Op, Val, affine, arith, sentient};
@@ -158,6 +159,10 @@ pub enum Mark {
     ResultReplacedByIterArg,
     /// `LHS_IN_PRED_TO_BE_REPLACED_BY_ITER_ARG` — "lhs-replaced-by-iter-arg".
     LhsInPredReplacedByIterArg,
+    /// `TO_DELETE` — "to-delete".
+    ToDelete,
+    /// `PREVIOUS_FOR_OP_CREATED` — "previous-for-op-created".
+    PreviousForOpCreated,
 }
 
 /// Which ops carry which [`Mark`] — `setAttr`, `hasAttr` and `removeAttr` over paths.
@@ -267,6 +272,29 @@ impl IvValuesAndFilters {
             .and_then(|entry| entry.chosen)
     }
 
+    /// `it->first` at position `at` — the map iterator [`LeafSink::process_leaf`] advances, whose
+    /// `end()` is `None`.
+    #[must_use]
+    pub fn iv_at(&self, at: usize) -> Option<Val> {
+        self.entries.get(at).map(|entry| entry.iv)
+    }
+
+    /// `.second[iteration]`, READ-ONLY: an IV with no entry, or an iteration past the array its trip
+    /// count sized, reads the `false` the reference's `new bool[num_iterations]` holds there.
+    #[must_use]
+    pub fn filter_bit(&self, iv: Val, iteration: i64) -> bool {
+        self.entries
+            .iter()
+            .find(|entry| entry.iv == iv)
+            .and_then(|entry| {
+                usize::try_from(iteration)
+                    .ok()
+                    .and_then(|at| entry.filter.get(at))
+            })
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// `.first = value`.
     pub fn set_chosen(&mut self, iv: Val, value: Option<i64>, iterations: i64) {
         self.entry(iv, iterations).chosen = value;
@@ -336,6 +364,9 @@ pub struct Branch {
     pub dead: bool,
     /// `getFirstChild()`.
     pub child: Option<Box<CondNode>>,
+    /// `getResults()` and `getBlock()` — what [`LeafSink::process_leaf`] hands to
+    /// [`Table::create_table_entry_at_idx`] when this branch IS a leaf.
+    pub leaf: Leaf,
 }
 
 /// `PatternSimplificationManager` (`:537-695`) — the members the units in this file read.
@@ -399,21 +430,16 @@ pub struct IterArgTarget {
     /// `target_lb`.
     pub lb: Val,
     /// `target_step`; `None` is the case where `monotone_seq_val_step_` stands in for it (`:1522-1523`).
-    pub step: Option<EvaluatedValue>,
+    ///
+    /// ⭐ AN `EvaluatedValueId`, NOT A `Val`: every caller's target step comes from the evaluator —
+    /// `getConstant(table_step)` (`:1638`) or `*monotone_seq_int_step_` (`:1650`).
+    pub step: Option<EvaluatedValueId>,
     /// `type`.
     pub ty: ScalarTy,
 }
 
-/// One `EvaluatedValue` — the expression evaluator's answer for a value.
-///
-/// ⛔ `Analyses/ExpressionEvaluatorUtils` IS OUT OF CAMPAIGN SCOPE. This is the NAME and the value it
-/// was asked about, nothing more: every question about one goes through [`step_matches_target`],
-/// which is a `todo!` rather than a guess at what the evaluator would have said.
-#[derive(Debug, Clone, Copy)]
-pub struct EvaluatedValue(pub Val);
-
 /// `*step_as_ev == evaluator_.evaluateMultiplyByConst(*target_step, multiplier)` (`:1519-1520`).
-fn step_matches_target(step: Val, target_step: EvaluatedValue, multiplier: i64) -> bool {
+fn step_matches_target(step: Val, target_step: EvaluatedValueId, multiplier: i64) -> bool {
     let _ = (step, target_step, multiplier);
     todo!(
         "ExpressionEvaluator::evaluateValue / evaluateMultiplyByConst — out of campaign scope \
@@ -523,6 +549,39 @@ fn op_at<'a>(root: &'a [Op], path: &[(u32, u32)]) -> Option<&'a Op> {
         Op::AffineFor(loop_op) => op_at(&loop_op.body, rest),
         // The path [`walk`] hands out numbers a local region, so this resolves one.
         Op::UniformRegions(regions) => op_at(&regions.regions().get(region as usize)?.body, rest),
+        Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_) => None,
+    }
+}
+
+/// [`op_at`] FOR A REWRITE — the same descent over a mutable tree, which e432's cleanup needs to set
+/// an already-built loop's `init` and its terminator's operands.
+fn op_at_mut<'a>(root: &'a mut [Op], path: &[(u32, u32)]) -> Option<&'a mut Op> {
+    let (&(_, index), rest) = path.split_first()?;
+    let op = root.get_mut(index as usize)?;
+    if rest.is_empty() {
+        return Some(op);
+    }
+    let (region, _) = rest[0];
+    match op {
+        Op::Sentient(inner) => op_at_mut(
+            sentient::regions_mut(inner)
+                .into_iter()
+                .nth(region as usize)?,
+            rest,
+        ),
+        Op::AffineFor(loop_op) => op_at_mut(&mut loop_op.body, rest),
+        Op::UniformRegions(regions) => op_at_mut(
+            &mut regions.regions_mut().get_mut(region as usize)?.body,
+            rest,
+        ),
         Op::Dataflow(_)
         | Op::Agen(_)
         | Op::VectorChain(_)
@@ -1640,30 +1699,1063 @@ impl PatternSimplificationManager {
     }
 }
 
-// crustify:todo: e431_processLeaf
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:1023  (64 body lines, level 2)
-//   original  : template <typename MapTy> bool PatternSimplificationManager::processLeaf( dcc::CFGSCondNode *leaf, MapTy &ivs_to_values_and_filters, typename MapTy::iterator it, std::vector<dcc::WidestIntType> &tuple_so_far)
-//   calls     : e288_createTableEntryAtIdx
+// ── THE FOUR LEVEL-2 REWRITERS AND THEIR CALL VOCABULARY ────────────────────────────────────────
 
-// crustify:todo: e432_transformInContiguousSequenceCase
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:1597  (321 body lines, level 2)
-//   original  : bool PatternSimplificationManager::transformInContiguousSequenceCase( dcc::CFGSSentientLevelConditionalTree &tree, Operation *if_op, Value new_if, int num_new_iter_args, bool has_positive_step)
-//   calls     : e032_findExistingIterArg, e033_replaceResultByIterArg, e034_replaceIfOpByIterArg, e035_replacePredicateIVByIterArg, e036_checkCascadingArgUses, e252_size, e393_createSentientForOpWithAdditionalIterArgs
+/// `cl::opt<int> MaximumIterArgs("dcc-cfg-sentient-level-max-num-iter-args", .., cl::init(6))`
+/// (`:70-74`) — how many iterator arguments one loop may carry.
+const MAXIMUM_ITER_ARGS: usize = 6;
 
-// crustify:todo: e433_transformInMonotoneSequenceCase
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:1923  (91 body lines, level 2)
-//   original  : bool PatternSimplificationManager::transformInMonotoneSequenceCase( Operation *for_op, Operation *if_op, Value new_if)
-//   calls     : e032_findExistingIterArg, e033_replaceResultByIterArg, e034_replaceIfOpByIterArg, e252_size, e393_createSentientForOpWithAdditionalIterArgs
+/// THE THREE THINGS ONE LEAF TOUCHES, SPLIT OUT OF THE MANAGER —
+/// [`PatternSimplificationManager::populate_table`] already holds `&mut self` while it calls the leaf
+/// handler, so the handler borrows the two maps it reads plus the table it writes, not the manager.
+pub struct LeafSink<'a> {
+    /// `ivs_dimensions_multipliers_`, read positionally against the accumulated tuple.
+    pub ivs_dimensions_multipliers: &'a [IvDim],
+    /// `lhs_to_for_op_or_null_`.
+    pub lhs_to_for_op_or_null: &'a BTreeMap<Val, LoopInfo>,
+    /// `table_` — a `&mut`, because the entry it writes IS the leaf's effect. Also discharges the
+    /// reference's unchecked `table_->` on a null table.
+    pub table: &'a mut Table,
+}
 
-// crustify:todo: e434_parseSequence
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2177  (176 body lines, level 2)
-//   original  : void PatternSimplificationManager::parseSequence( dcc::WidestIntType iv_cur_val, dcc::WidestIntType iv_step, Value &iv, dcc::WidestIntType index, dcc::WidestIntType length_remaining, TableSlice *table_slice)
-//   calls     : e023_incrementLength, e024_incrementIntervalMarker, e028_getPrevVal, e029_getEV, e287_getTableEntryAtIdx, e290_insertSequence
+impl LeafSink<'_> {
+    /// Replaces: e431_processLeaf
+    ///
+    /// Expands one leaf over every iteration tuple its IVs still allow, writing the leaf into the
+    /// table at each tuple's flattened index, and answers whether any tuple survived.
+    ///
+    /// TRAP: THE RECURSIVE ANSWER IS DISCARDED (`:1069`, `:1082`) — only a filter allowing NO
+    /// iteration of the IV AT THIS LEVEL kills the leaf. An IV with no recorded loop takes
+    /// `lhs_to_for_op_or_null_[iv]`'s default of zero iterations, which is that same dead leaf.
+    pub fn process_leaf(
+        &mut self,
+        leaf: &Branch,
+        ivs: &IvValuesAndFilters,
+        at: usize,
+        tuple_so_far: &mut Vec<i64>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> bool {
+        let Some(iv) = ivs.iv_at(at) else {
+            // `c1 (i2*..*in) + .. + cn (1)` — each IV's multiplier already holds its tail product.
+            let idx: i64 = self
+                .ivs_dimensions_multipliers
+                .iter()
+                .zip(tuple_so_far.iter().copied())
+                .map(|(dim, iteration)| dim.multiplier * iteration)
+                .sum();
+            self.table
+                .create_table_entry_at_idx(TableIndex(idx), &leaf.leaf, evaluator);
+            return true;
+        };
+        let info = self.lhs_to_for_op_or_null.get(&iv);
+        match ivs.chosen(iv) {
+            Some(value) => {
+                // `(value - lb) / step`, which without a loop would be the reference's divide by zero.
+                let Some(info) = info else { return true };
+                tuple_so_far.push((value - info.lb) / info.step.get());
+                self.process_leaf(leaf, ivs, at + 1, tuple_so_far, evaluator);
+                tuple_so_far.pop();
+            }
+            None => {
+                let mut at_least_one_allowed_value = false;
+                for iteration in 0..info.map_or(0, |info| info.iterations) {
+                    if !ivs.filter_bit(iv, iteration) {
+                        at_least_one_allowed_value = true;
+                        tuple_so_far.push(iteration);
+                        self.process_leaf(leaf, ivs, at + 1, tuple_so_far, evaluator);
+                        tuple_so_far.pop();
+                    }
+                }
+                if !at_least_one_allowed_value {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
 
-// crustify:todo: e435_codeGenGenericNestedIf
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2556  (71 body lines, level 2)
-//   original  : llvm::SmallVector<Value> PatternSimplificationManager::codeGenGenericNestedIf( bool is_start, bool generate_encoding, std::vector<std::tuple<Value, dcc::WidestIntType, dcc::WidestIntType>>::iterator it_cur, std::vector<std::tuple<Value, dcc::WidestIntType, dcc::WidestIntType>>::iterator it_free_dime
-//   calls     : e293_generateEncodingTuple, e295_codeGenGenericTableSlice
+/// THE LOOP CLONE BOTH TRANSFORMS NEED — `createSentientForOpWithAdditionalIterArgs(for_op,
+/// start_vals_and_steps)` (`Analyses/Utils.cpp:195`), plus the loops the tree refuses to grow.
+///
+/// ⛔ e393 IS NOT PORTED, so the clone arrives as a closure exactly as the leaf handler does for
+/// [`PatternSimplificationManager::populate_table`]: given the tree, the loop and one
+/// `(start_val, step)` per new iterator argument, it answers where the clone landed.
+pub struct LoopCloning<'a> {
+    /// `tree.isForOpToAvoidNewIterArgs(for_op)` — the loops loop splitting has claimed.
+    pub for_ops_to_avoid_new_iter_args: &'a [OpPath],
+    /// `createSentientForOpWithAdditionalIterArgs`.
+    pub clone: &'a mut dyn FnMut(&mut Vec<Op>, &OpPath, &[(Val, Val)]) -> OpPath,
+}
+
+/// THE CONTIGUOUS-SEQUENCE CALL (`:1597-1601`) — the conditional being replaced, what replaces it,
+/// and the two facts `findPatternsAndSimplify` already established about the table.
+pub struct ContiguousCase<'a> {
+    /// `if_op`.
+    pub if_op: &'a OpPath,
+    /// `new_if` — the nested conditional built over the table slice.
+    pub new_if: Val,
+    /// `num_new_iter_args` — up to two per IV, one fewer for each existing iter arg reused.
+    pub num_new_iter_args: usize,
+    /// `has_positive_step`.
+    pub has_positive_step: bool,
+}
+
+/// THE MONOTONE-SEQUENCE CALL (`:1922`) — the free IV's loop, the conditional being replaced and
+/// the value replacing it.
+pub struct MonotoneCase<'a> {
+    /// `for_op`, the free IV's `sentient.for`.
+    pub for_op: &'a OpPath,
+    /// `if_op`.
+    pub if_op: &'a OpPath,
+    /// `new_if`.
+    pub new_if: Val,
+}
+
+/// THE RECURSION STATE `codeGenGenericNestedIf` THREADS (`:2557-2564`).
+pub struct GenericNest<'a, 'slices> {
+    /// `generate_encoding`.
+    pub generate_encoding: bool,
+    /// `types` — REPRESENTED BY ITS LENGTH ALONE: a `sentient.if` in this island carries a register
+    /// per yielded value rather than a type, and the reference's own `locale_attr` holds exactly one.
+    pub types: &'a [ScalarTy],
+    /// `iter_table_slice`, advanced once per leaf.
+    pub slices: core::slice::Iter<'slices, TableSlice>,
+}
+
+/// ONE LEVEL OF THE CHAIN e435 BUILDS, kept as a struct so the assembly pass carries a named record
+/// rather than a tuple of four vectors.
+struct NestedLevel {
+    /// The constant this level's predicate tests the IV against.
+    rhs: Val,
+    /// The values this level's `sentient.if` binds, one per result type.
+    results: Vec<Val>,
+    /// The ops the `then` recursion produced.
+    then_ops: Vec<Op>,
+    /// What that recursion answers, which the `then` region yields.
+    then_results: Vec<Val>,
+}
+
+/// WHICH OF e434's THREE CONTINUATIONS THE NEXT ENTRY TAKES (`:2306-2350`).
+enum SequenceStep {
+    /// The entry's difference matches the last sequence's stride, so it joins it.
+    Extend,
+    /// The entry starts a new sequence.
+    Start,
+    /// The last sequence has one entry, so it swallows this one and adopts the difference.
+    Greedy {
+        /// Whether that difference is zero, which decides the sequence's kind.
+        difference_is_zero: bool,
+    },
+}
+
+/// `iv_cur_val + by * iv_step`.
+fn advanced(marker: IntervalMarker, stride: IntervalStride, by: i64) -> IntervalMarker {
+    let mut moved = marker;
+    moved += stride * Entries(by);
+    moved
+}
+
+/// `new Sequence(lb, <int> stride, ..)` (`:269-280`) — the overload the [`Sequence`] type leaves to
+/// its callers, since interning the constant belongs to the out-of-scope evaluator.
+fn const_stride_sequence(
+    evaluator: &mut impl ExpressionEvaluator,
+    lb: EvaluatedValueId,
+    stride: i64,
+    length: Entries,
+    interval_marker: IntervalMarker,
+    interval_stride: IntervalStride,
+    kind: SequenceKind,
+) -> Sequence {
+    let stride = evaluator.get_constant(stride);
+    Sequence::new(lb, stride, length, interval_marker, interval_stride, kind)
+}
+
+/// `cur_seq->incrementLength(1); cur_seq->incrementIntervalMarker(1)` — the pair that always travels
+/// together, on a slice whose last sequence may have no marker to step.
+fn extend_last_sequence(table_slice: &mut TableSlice) {
+    if let Some(seq) = table_slice.sequences.last_mut() {
+        seq.increment_length(Entries(1));
+        if let Some(mut marked) = seq.marked_mut() {
+            marked.increment_interval_marker(Entries(1));
+        }
+    }
+}
+
+impl PatternSimplificationManager {
+    /// Replaces: e432_transformInContiguousSequenceCase
+    ///
+    /// Secures one synthetic-IV and one monotone-sequence iterator argument across the whole loop
+    /// nest — reusing an existing one or cloning each loop to add it — then retires the original
+    /// conditional in favour of `new_if` and points its placeholders at those arguments.
+    ///
+    /// TRAP: EVERY REFUSAL IS GATED ON `num_new_iter_args > 0` (`:1682`, `:1690`), including the
+    /// capacity check, so a nest that needs nothing is never rejected. The outermost loop's veto is
+    /// `isa<BlockArgument>(init)`, i.e. an initial value with no defining op.
+    pub fn transform_in_contiguous_sequence_case(
+        &mut self,
+        root: &mut Vec<Op>,
+        case: &ContiguousCase<'_>,
+        cloning: &mut LoopCloning<'_>,
+        builders: &mut Builders<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> bool {
+        let Some(table) = self.table.as_ref() else {
+            return false;
+        };
+        let predicate_type = table.predicate_type();
+        let table_entry_type = table.table_entry_type();
+        let table_size = i64::try_from(table.size().0).unwrap_or(i64::MAX);
+        let mut num_new_iter_args = case.num_new_iter_args;
+        let mut create_mono_seq_iter_arg = self.monotone_seq_start_val.is_some();
+        let mut create_synthetic_iv = self.ivs_dimensions_multipliers.len() > 1;
+        let mut synthetic_iv_idx = None;
+        let mut seq_iter_arg_idx = None;
+        let mut start_vals_and_steps: Vec<(Val, Val)> = Vec::new();
+        // `rbegin()`..`rend()`, innermost IV first; `rest` runs to and includes the outermost, which
+        // is the reference's `std::prev(rend(), 1)`.
+        let ivs: Vec<IvDim> = self
+            .ivs_dimensions_multipliers
+            .iter()
+            .rev()
+            .copied()
+            .collect();
+        let Some((cur, rest)) = ivs.split_first() else {
+            return false;
+        };
+
+        if create_synthetic_iv {
+            let table_lb = if case.has_positive_step {
+                0
+            } else {
+                table_size.saturating_sub(1)
+            };
+            let table_step = if case.has_positive_step { 1 } else { -1 };
+            let table_lb_val = builders.values.mint();
+            builders
+                .consts
+                .push(scalar_constant(table_lb_val, table_lb, predicate_type));
+            let step = evaluator.get_constant(table_step);
+            synthetic_iv_idx = self.find_existing_iter_arg(
+                root,
+                cur,
+                rest,
+                None,
+                &IterArgTarget {
+                    lb: table_lb_val,
+                    step: Some(step),
+                    ty: predicate_type,
+                },
+                None,
+            );
+            if synthetic_iv_idx.is_some() {
+                create_synthetic_iv = false;
+                num_new_iter_args = num_new_iter_args.saturating_sub(1);
+            } else {
+                // `std::make_pair(table_lb_val, table_lb_val)` — a dummy step, replaced per loop.
+                start_vals_and_steps.push((table_lb_val, table_lb_val));
+            }
+        }
+        if create_mono_seq_iter_arg {
+            // `DT_CHECK(monotone_seq_int_step_ && monotone_seq_start_val_.has_value())` (`:1646-1647`).
+            let (Some(start_val), Some(step_val)) =
+                (self.monotone_seq_start_val, self.monotone_seq_int_step)
+            else {
+                return false;
+            };
+            seq_iter_arg_idx = self.find_existing_iter_arg(
+                root,
+                cur,
+                rest,
+                None,
+                &IterArgTarget {
+                    lb: start_val,
+                    step: Some(step_val),
+                    ty: table_entry_type,
+                },
+                None,
+            );
+            if seq_iter_arg_idx.is_some() {
+                create_mono_seq_iter_arg = false;
+                num_new_iter_args = num_new_iter_args.saturating_sub(1);
+            } else {
+                start_vals_and_steps.push((start_val, start_val));
+            }
+        }
+
+        for (level, dim) in ivs.iter().enumerate() {
+            let Some(for_op) = self
+                .lhs_to_for_op_or_null
+                .get(&dim.iv)
+                .and_then(|info| info.for_op.clone())
+            else {
+                return false;
+            };
+            if num_new_iter_args > 0 && cloning.for_ops_to_avoid_new_iter_args.contains(&for_op) {
+                return false;
+            }
+            // `DT_CHECK_MSG(sentient_for, "Expect sentient.for op.")` (`:1687`) — NOT gated.
+            let Some(Op::Sentient(sentient::Op::For { carried, .. })) = op_at(root, for_op.path())
+            else {
+                return false;
+            };
+            if num_new_iter_args == 0 {
+                continue;
+            }
+            if carried.len() + num_new_iter_args > MAXIMUM_ITER_ARGS {
+                return false;
+            }
+            if level + 1 == ivs.len()
+                && carried
+                    .iter()
+                    .any(|entry| defining_path(entry.init, root).is_none())
+            {
+                return false;
+            }
+            if level == 0 && !self.check_free_iv_uses(root, cur, rest) {
+                return false;
+            }
+        }
+
+        // `if_op->getResult(0)` read before the mark, since the rewrite below consumes `root`.
+        let original_result = first_result_of_if(root, case.if_op);
+        self.marks.set(Mark::ToDelete, case.if_op.path());
+        let is_one_monotone_seq = matches!(
+            self.template_sequences.as_slice(),
+            [only] if only.kind == SequenceKind::MonotoneSequence
+        );
+        if is_one_monotone_seq {
+            self.marks
+                .set(Mark::IfOpReplacedByIterArg, case.if_op.path());
+        } else if let Some(result) = original_result {
+            ir::replace_all_uses_with(root, result, case.new_if);
+        }
+
+        if !create_synthetic_iv && !create_mono_seq_iter_arg {
+            // Nothing to add: the iterator arguments already found do the job (`:1878-1915`).
+            let Some(for_op) = self
+                .lhs_to_for_op_or_null
+                .get(&cur.iv)
+                .and_then(|info| info.for_op.clone())
+            else {
+                return false;
+            };
+            let Some(carried) = carried_of_for(root, &for_op) else {
+                return false;
+            };
+            let synthetic_iv_replacement =
+                synthetic_iv_idx.and_then(|at| carried.get(at).map(|entry| entry.arg));
+            let seq_replacement =
+                seq_iter_arg_idx.and_then(|at| carried.get(at).map(|entry| entry.arg));
+            self.finish_placeholders(
+                root,
+                &for_op,
+                is_one_monotone_seq,
+                synthetic_iv_replacement,
+                seq_replacement,
+            );
+            return true;
+        }
+
+        let mut previous_for_op: Option<OpPath> = None;
+        for (level, dim) in ivs.iter().enumerate() {
+            if create_synthetic_iv {
+                let step_as_int = if case.has_positive_step {
+                    dim.multiplier
+                } else {
+                    0 - dim.multiplier
+                };
+                let step = builders.values.mint();
+                builders
+                    .consts
+                    .push(scalar_constant(step, step_as_int, predicate_type));
+                if let Some(first) = start_vals_and_steps.first_mut() {
+                    first.1 = step;
+                }
+            }
+            if create_mono_seq_iter_arg && let Some(int_step) = self.monotone_seq_int_step {
+                let scaled =
+                    evaluator.evaluate_multiply_by_const(int_step, Entries(dim.multiplier));
+                let step = evaluator.build_offset_value(scaled, table_entry_type, builders);
+                if let Some(last) = start_vals_and_steps.last_mut() {
+                    last.1 = step;
+                }
+            }
+            let Some(for_op) = self
+                .lhs_to_for_op_or_null
+                .get(&dim.iv)
+                .and_then(|info| info.for_op.clone())
+            else {
+                return false;
+            };
+            let new_for_op = (cloning.clone)(root, &for_op, &start_vals_and_steps);
+            let Some((carried, body_len)) = carried_and_body_len(root, &new_for_op) else {
+                return false;
+            };
+            let first_new = carried.len().saturating_sub(num_new_iter_args);
+            let new_iter_arg: Vec<Val> =
+                carried[first_new..].iter().map(|entry| entry.arg).collect();
+            let synthetic_iv_replacement = match synthetic_iv_idx {
+                Some(at) => carried.get(at).map(|entry| entry.arg),
+                None => new_iter_arg.first().copied(),
+            };
+            let seq_replacement = match seq_iter_arg_idx {
+                Some(at) => carried.get(at).map(|entry| entry.arg),
+                None => new_iter_arg.last().copied(),
+            };
+            if level == 0 {
+                self.finish_placeholders(
+                    root,
+                    &new_for_op,
+                    is_one_monotone_seq,
+                    synthetic_iv_replacement,
+                    seq_replacement,
+                );
+            } else if let Some(prev) = previous_for_op.take() {
+                self.rewire_previous_loop(root, &prev, &new_for_op, &new_iter_arg, body_len);
+            }
+            self.marks
+                .set(Mark::PreviousForOpCreated, new_for_op.path());
+            previous_for_op = Some(new_for_op);
+        }
+        if let Some(last) = previous_for_op {
+            self.marks.take(Mark::PreviousForOpCreated, last.path());
+        }
+        true
+    }
+
+    /// The innermost loop's IV, and any `sentient.sub` over it, may only be read where turning it into
+    /// an iterator argument still leaves loop coalescing possible (`:1708-1744`).
+    fn check_free_iv_uses(&self, root: &[Op], cur: &IvDim, rest: &[IvDim]) -> bool {
+        let mut sub_result = None;
+        for use_path in uses_of(cur.iv, root) {
+            let Some(use_owner) = op_at(root, use_path.path()) else {
+                continue;
+            };
+            if let Op::Sentient(sentient::Op::ScalarSub { result, .. }) = use_owner {
+                sub_result = Some(*result);
+            } else if !self
+                .marks
+                .has(Mark::LhsInPredReplacedByIterArg, use_path.path())
+                && !self.marks.has(Mark::ToDelete, use_path.path())
+                && !self.check_cascading_arg_uses(root, &use_path, cur, rest)
+            {
+                return false;
+            }
+        }
+        let Some(sub_result) = sub_result else {
+            return true;
+        };
+        uses_of(sub_result, root).into_iter().all(|use_path| {
+            self.marks.has(Mark::ToDelete, use_path.path())
+                || self.check_cascading_arg_uses(root, &use_path, cur, rest)
+        })
+    }
+
+    /// The cleanup both transforms share (`:1830-1846`, `:1893-1915`): the marked conditional, yield
+    /// and predicate inside `new_if` take the iterator arguments that were just secured.
+    fn finish_placeholders(
+        &mut self,
+        root: &mut Vec<Op>,
+        for_op: &OpPath,
+        is_one_monotone_seq: bool,
+        synthetic_iv_replacement: Option<Val>,
+        seq_replacement: Option<Val>,
+    ) {
+        if is_one_monotone_seq {
+            if let Some(replacement) = seq_replacement {
+                self.replace_if_op_by_iter_arg(root, for_op, replacement);
+            }
+            return;
+        }
+        if self.monotone_seq_start_val.is_some()
+            && let Some(replacement) = seq_replacement
+        {
+            self.replace_result_by_iter_arg(root, for_op, replacement);
+        }
+        if self.ivs_dimensions_multipliers.len() > 1
+            && let Some(replacement) = synthetic_iv_replacement
+        {
+            self.replace_predicate_iv_by_iter_arg(root, for_op, replacement);
+        }
+    }
+
+    /// `new_for_op->walk(..)` (`:1852-1876`) — the clone built one level in starts its new iterator
+    /// arguments from this clone's, and when the two loops are directly nested this clone's terminator
+    /// yields the inner loop's matching results.
+    ///
+    /// ⭐ THE REFERENCE'S WALK IS A TRACKED PATH HERE: exactly one `PREVIOUS_FOR_OP_CREATED` is ever
+    /// live, so searching for it and remembering where it was put are the same thing.
+    fn rewire_previous_loop(
+        &mut self,
+        root: &mut Vec<Op>,
+        prev: &OpPath,
+        new_for_op: &OpPath,
+        new_iter_arg: &[Val],
+        body_len: usize,
+    ) {
+        if !self.marks.take(Mark::PreviousForOpCreated, prev.path()) {
+            return;
+        }
+        let are_loops_consecutive = prev.parent().as_ref() == Some(new_for_op);
+        let mut prev_results = Vec::new();
+        if let Some(Op::Sentient(sentient::Op::For { carried, .. })) = op_at_mut(root, prev.path())
+        {
+            let first_new = carried.len().saturating_sub(new_iter_arg.len());
+            for (entry, arg) in carried[first_new..].iter_mut().zip(new_iter_arg) {
+                entry.init = *arg;
+                prev_results.push(entry.result);
+            }
+        }
+        if !are_loops_consecutive {
+            return;
+        }
+        let Some(index) = body_len
+            .checked_sub(1)
+            .and_then(|last| u32::try_from(last).ok())
+        else {
+            return;
+        };
+        if let Some(Op::Sentient(sentient::Op::Yield { results })) =
+            op_at_mut(root, new_for_op.child(0, index).path())
+        {
+            let first_new = results.len().saturating_sub(prev_results.len());
+            for (slot, value) in results[first_new..].iter_mut().zip(&prev_results) {
+                *slot = *value;
+            }
+        }
+    }
+
+    /// Replaces: e433_transformInMonotoneSequenceCase
+    ///
+    /// Secures one iterator argument for the monotone sequence on the free IV's loop — reusing an
+    /// existing one or cloning the loop — retires the conditional in favour of `new_if`, and points
+    /// the marked placeholder at that argument.
+    ///
+    /// TRAP: THE CAPACITY CHECK IS `+ 1`, NOT `+ num_new_iter_args` (`:1953`), and it is reached only
+    /// when no existing iterator argument matched.
+    pub fn transform_in_monotone_sequence_case(
+        &mut self,
+        root: &mut Vec<Op>,
+        case: &MonotoneCase<'_>,
+        cloning: &mut LoopCloning<'_>,
+        builders: &mut Builders<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> bool {
+        let Some(table_entry_type) = self.table.as_ref().map(Table::table_entry_type) else {
+            return false;
+        };
+        let is_one_monotone_seq = matches!(
+            self.template_sequences.as_slice(),
+            [only] if only.kind == SequenceKind::MonotoneSequence
+        );
+        let create_new_iter_arg = self.monotone_seq_start_val.is_some();
+        let mut seq_iter_arg = None;
+        if let Some(start_val) = self.monotone_seq_start_val {
+            // `findExistingIterArg(rbegin(), rbegin(), ..)`: the free IV alone, so `rest` is empty.
+            let Some(innermost) = self.ivs_dimensions_multipliers.last().copied() else {
+                return false;
+            };
+            let found = self.find_existing_iter_arg(
+                root,
+                &innermost,
+                &[],
+                None,
+                &IterArgTarget {
+                    lb: start_val,
+                    step: None,
+                    ty: table_entry_type,
+                },
+                None,
+            );
+            let Some(carried) = carried_of_for(root, case.for_op) else {
+                return false;
+            };
+            match found {
+                Some(index) => seq_iter_arg = carried.get(index).map(|entry| entry.arg),
+                None if carried.len() + 1 > MAXIMUM_ITER_ARGS => return false,
+                None => {}
+            }
+        }
+
+        let original_result = first_result_of_if(root, case.if_op);
+        self.marks.set(Mark::ToDelete, case.if_op.path());
+        if is_one_monotone_seq {
+            self.marks
+                .set(Mark::IfOpReplacedByIterArg, case.if_op.path());
+        } else if let Some(result) = original_result {
+            ir::replace_all_uses_with(root, result, case.new_if);
+        }
+        if !create_new_iter_arg {
+            return true;
+        }
+
+        let mut for_op_containing_iter_arg = case.for_op.clone();
+        if seq_iter_arg.is_none() {
+            let Some(start_val) = self.monotone_seq_start_val else {
+                return true;
+            };
+            // The step is either a value a previous nested conditional built, or an evaluated one.
+            let int_step = self.monotone_seq_int_step;
+            let Some(step) = self.monotone_seq_val_step.or_else(|| {
+                int_step.map(|step| evaluator.build_offset_value(step, table_entry_type, builders))
+            }) else {
+                return false;
+            };
+            for_op_containing_iter_arg = (cloning.clone)(root, case.for_op, &[(start_val, step)]);
+            seq_iter_arg = carried_of_for(root, &for_op_containing_iter_arg)
+                .and_then(|carried| carried.last().map(|entry| entry.arg));
+        }
+        if let Some(replacement) = seq_iter_arg {
+            if is_one_monotone_seq {
+                self.replace_if_op_by_iter_arg(root, &for_op_containing_iter_arg, replacement);
+            } else {
+                self.replace_result_by_iter_arg(root, &for_op_containing_iter_arg, replacement);
+            }
+        }
+        true
+    }
+
+    /// `table_->getTableEntryAtIdx(index)->getEV()`, absent where the reference's `DT_CHECK_MSG`
+    /// (`:2189`) or its null `getEV` would fire.
+    fn table_ev(&self, at: TableIndex) -> Option<EvaluatedValueId> {
+        self.table.as_ref()?.table_entry_at_idx(at)?.ev()
+    }
+
+    /// Replaces: e434_parseSequence
+    ///
+    /// Walks one table slice front to back, opening the first sequence from the first two or three
+    /// entries and then folding each later entry into the last sequence or starting a new one.
+    ///
+    /// TRAP: `Value &iv` IS UNUSED IN THE REFERENCE BODY and is dropped. Every `EvaluatedValue`
+    /// comparison is CONTENT equality, hence [`ExpressionEvaluator::equal`] and not `==`.
+    ///
+    /// TRAP: THE TWO DIFFERENCES ARE INTERNED IN THE REFERENCE'S OWN ORDER (`:2256-2257`) and inside
+    /// the arm that needs them — hoisting them would change what the evaluator has seen.
+    pub fn parse_sequence(
+        &mut self,
+        iv_cur_val: IntervalMarker,
+        iv_step: IntervalStride,
+        index: TableIndex,
+        length_remaining: Entries,
+        table_slice: &mut TableSlice,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) {
+        if length_remaining.0 == 0 || self.abort_pattern {
+            return;
+        }
+        let idx_stride = table_slice.idx_stride.0;
+        let next_index = TableIndex(index.0 + idx_stride);
+        let Some(val) = self.table_ev(index) else {
+            return;
+        };
+        let one_on = advanced(iv_cur_val, iv_step, 1);
+        if table_slice.sequences.is_empty() {
+            if length_remaining.0 == 1 {
+                // Pattern: D
+                let seq = const_stride_sequence(
+                    evaluator,
+                    val,
+                    0,
+                    Entries(1),
+                    iv_cur_val,
+                    iv_step,
+                    SequenceKind::DefaultValue,
+                );
+                self.insert_sequence(seq, table_slice);
+                return;
+            }
+            let Some(next_val) = self.table_ev(next_index) else {
+                return;
+            };
+            if length_remaining.0 == 2 {
+                if evaluator.equal(next_val, val) {
+                    // Pattern: D D
+                    let seq = const_stride_sequence(
+                        evaluator,
+                        val,
+                        0,
+                        Entries(2),
+                        one_on,
+                        iv_step,
+                        SequenceKind::DefaultValue,
+                    );
+                    self.insert_sequence(seq, table_slice);
+                } else if ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS {
+                    // Pattern: a1 a2
+                    let stride = evaluator.evaluate_sub(next_val, val);
+                    let seq = Sequence::new(
+                        val,
+                        stride,
+                        Entries(2),
+                        one_on,
+                        iv_step,
+                        SequenceKind::MonotoneSequence,
+                    );
+                    self.insert_sequence(seq, table_slice);
+                } else {
+                    // Pattern: D D'
+                    let head = const_stride_sequence(
+                        evaluator,
+                        val,
+                        0,
+                        Entries(1),
+                        iv_cur_val,
+                        iv_step,
+                        SequenceKind::DefaultValue,
+                    );
+                    self.insert_sequence(head, table_slice);
+                    let tail = const_stride_sequence(
+                        evaluator,
+                        next_val,
+                        0,
+                        Entries(1),
+                        one_on,
+                        iv_step,
+                        SequenceKind::DefaultValue,
+                    );
+                    self.insert_sequence(tail, table_slice);
+                }
+                return;
+            }
+            let next_next_index = TableIndex(next_index.0 + idx_stride);
+            let Some(next_next_val) = self.table_ev(next_next_index) else {
+                return;
+            };
+            let two_on = advanced(iv_cur_val, iv_step, 2);
+            if evaluator.equal(val, next_val) && evaluator.equal(next_val, next_next_val) {
+                // Pattern: D D D
+                let seq = const_stride_sequence(
+                    evaluator,
+                    val,
+                    0,
+                    Entries(3),
+                    two_on,
+                    iv_step,
+                    SequenceKind::DefaultValue,
+                );
+                self.insert_sequence(seq, table_slice);
+            } else if evaluator.equal(val, next_val) {
+                // Pattern: D D a1, or D D D'
+                let head = const_stride_sequence(
+                    evaluator,
+                    val,
+                    0,
+                    Entries(2),
+                    one_on,
+                    iv_step,
+                    SequenceKind::DefaultValue,
+                );
+                self.insert_sequence(head, table_slice);
+                let kind = if ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS {
+                    SequenceKind::MonotoneSequence
+                } else {
+                    SequenceKind::DefaultValue
+                };
+                let tail = const_stride_sequence(
+                    evaluator,
+                    next_next_val,
+                    0,
+                    Entries(1),
+                    two_on,
+                    iv_step,
+                    kind,
+                );
+                self.insert_sequence(tail, table_slice);
+            } else {
+                let second_difference = evaluator.evaluate_sub(next_next_val, next_val);
+                let first_difference = evaluator.evaluate_sub(next_val, val);
+                if evaluator.equal(second_difference, first_difference)
+                    && ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS
+                {
+                    // Pattern: a1 a2 a3
+                    let seq = Sequence::new(
+                        val,
+                        first_difference,
+                        Entries(3),
+                        two_on,
+                        iv_step,
+                        SequenceKind::MonotoneSequence,
+                    );
+                    self.insert_sequence(seq, table_slice);
+                } else {
+                    // Conservatively, the pattern: D a1 a2
+                    let head = const_stride_sequence(
+                        evaluator,
+                        val,
+                        0,
+                        Entries(1),
+                        iv_cur_val,
+                        iv_step,
+                        SequenceKind::DefaultValue,
+                    );
+                    self.insert_sequence(head, table_slice);
+                    if ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS {
+                        let seq = Sequence::new(
+                            next_val,
+                            second_difference,
+                            Entries(2),
+                            two_on,
+                            iv_step,
+                            SequenceKind::MonotoneSequence,
+                        );
+                        self.insert_sequence(seq, table_slice);
+                    } else if evaluator.equal(next_val, next_next_val) {
+                        // Pattern: D D' D'
+                        let seq = const_stride_sequence(
+                            evaluator,
+                            next_val,
+                            0,
+                            Entries(2),
+                            two_on,
+                            iv_step,
+                            SequenceKind::DefaultValue,
+                        );
+                        self.insert_sequence(seq, table_slice);
+                    } else {
+                        // Pattern: D D' D''
+                        let first = const_stride_sequence(
+                            evaluator,
+                            next_val,
+                            0,
+                            Entries(1),
+                            one_on,
+                            iv_step,
+                            SequenceKind::DefaultValue,
+                        );
+                        self.insert_sequence(first, table_slice);
+                        let second = const_stride_sequence(
+                            evaluator,
+                            next_next_val,
+                            0,
+                            Entries(1),
+                            two_on,
+                            iv_step,
+                            SequenceKind::DefaultValue,
+                        );
+                        self.insert_sequence(second, table_slice);
+                    }
+                }
+            }
+            table_slice.set_prev_val(next_next_val);
+            self.parse_sequence(
+                two_on,
+                iv_step,
+                TableIndex(next_next_index.0 + idx_stride),
+                Entries(length_remaining.0 - 3),
+                table_slice,
+                evaluator,
+            );
+            return;
+        }
+
+        let prev_val = table_slice.prev_val();
+        let difference = evaluator.evaluate_sub(val, prev_val);
+        let Some(cur_seq) = table_slice.sequences.last() else {
+            return;
+        };
+        let cur_seq_length = cur_seq.length;
+        let cur_seq_kind = cur_seq.kind;
+        let stride_matches = cur_seq
+            .stride
+            .is_some_and(|stride| evaluator.equal(stride, difference));
+        let has_monotone_before_last = table_slice.has_inserted_monotone_seq_before_last;
+        let step = if cur_seq_length.0 > 1 {
+            if stride_matches {
+                SequenceStep::Extend
+            } else {
+                SequenceStep::Start
+            }
+        } else {
+            let zero = evaluator.get_constant(0);
+            let difference_is_zero = evaluator.equal(difference, zero);
+            if !difference_is_zero
+                && (!ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS || has_monotone_before_last)
+            {
+                SequenceStep::Start
+            } else {
+                SequenceStep::Greedy { difference_is_zero }
+            }
+        };
+        match step {
+            SequenceStep::Extend => extend_last_sequence(table_slice),
+            SequenceStep::Start => {
+                // A value after a monotone sequence is always treated as a default value.
+                let new_kind = if cur_seq_kind == SequenceKind::MonotoneSequence
+                    || has_monotone_before_last
+                    || !ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS
+                {
+                    SequenceKind::DefaultValue
+                } else {
+                    SequenceKind::MonotoneSequence
+                };
+                let seq =
+                    const_stride_sequence(evaluator, val, 0, Entries(1), one_on, iv_step, new_kind);
+                self.insert_sequence(seq, table_slice);
+            }
+            SequenceStep::Greedy { difference_is_zero } => {
+                extend_last_sequence(table_slice);
+                if let Some(seq) = table_slice.sequences.last_mut() {
+                    seq.stride = Some(difference);
+                    seq.kind = if difference_is_zero {
+                        SequenceKind::DefaultValue
+                    } else {
+                        SequenceKind::MonotoneSequence
+                    };
+                }
+            }
+        }
+        table_slice.set_prev_val(val);
+        self.parse_sequence(
+            one_on,
+            iv_step,
+            next_index,
+            Entries(length_remaining.0 - 1),
+            table_slice,
+            evaluator,
+        );
+    }
+
+    /// Replaces: e435_codeGenGenericNestedIf
+    ///
+    /// Builds `if (i1 == c1) {..} else if (i1 == c2) {..} else {..}` over every fixed IV, each leaf
+    /// holding one table slice's code, and answers the outermost chain's results.
+    ///
+    /// TRAP: `is_start`, `index` AND `multiplier` ARE ALL DEAD in the reference — `!is_start && i != 0`
+    /// is `i != 0` at every call site, and `index` is only ever advanced, never read.
+    ///
+    /// TRAP: A DIMENSION OF ONE leaves the reference's `result` null, so this answers no results while
+    /// still emitting the `else` recursion's ops and the yield over them.
+    pub fn code_gen_generic_nested_if(
+        &self,
+        nest: &mut GenericNest<'_, '_>,
+        ivs: &[IvDim],
+        at: &OpPath,
+        builders: &mut Builders<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> (Vec<Op>, Vec<Val>) {
+        // `it_cur == it_free_dimension`: the free IV is the last, so one IV left IS the leaf.
+        if ivs.len() <= 1 {
+            let (Some(free), Some(slice)) = (ivs.last(), nest.slices.next()) else {
+                return (Vec::new(), Vec::new());
+            };
+            if nest.generate_encoding {
+                return (
+                    Vec::new(),
+                    self.generate_encoding_tuple(slice, builders, evaluator),
+                );
+            }
+            let mut ops = Vec::new();
+            let mut site = Site {
+                block: &mut ops,
+                at: at.clone(),
+            };
+            let result =
+                self.code_gen_generic_table_slice(free.iv, slice, &mut site, builders, evaluator);
+            return (ops, result.into_iter().collect());
+        }
+        let Some((cur, rest)) = ivs.split_first() else {
+            return (Vec::new(), Vec::new());
+        };
+        // `DT_CHECK_MSG(step != 0, "Expect non-zero stride.")` (`:2585`) is the loop's own type.
+        let Some(info) = self.lhs_to_for_op_or_null.get(&cur.iv) else {
+            return (Vec::new(), Vec::new());
+        };
+        let (lb, step) = (info.lb, info.step.get());
+        let Some(predicate_type) = self.table.as_ref().map(Table::predicate_type) else {
+            return (Vec::new(), Vec::new());
+        };
+
+        let level_count = usize::try_from(cur.dimension.saturating_sub(1)).unwrap_or(0);
+        let mut levels: Vec<NestedLevel> = Vec::new();
+        for depth in 0..level_count {
+            let rhs = builders.values.mint();
+            let value = lb + i64::try_from(depth).unwrap_or(0) * step;
+            builders
+                .consts
+                .push(scalar_constant(rhs, value, predicate_type));
+            let results: Vec<Val> = nest.types.iter().map(|_| builders.values.mint()).collect();
+            let (then_ops, then_results) = self.code_gen_generic_nested_if(
+                nest,
+                rest,
+                &level_path(at, depth).child(0, 0),
+                builders,
+                evaluator,
+            );
+            levels.push(NestedLevel {
+                rhs,
+                results,
+                then_ops,
+                then_results,
+            });
+        }
+        // The last value of this IV falls under the innermost "else" (`:2628-2633`).
+        let (else_ops, else_results) = self.code_gen_generic_nested_if(
+            nest,
+            rest,
+            &level_path(at, level_count),
+            builders,
+            evaluator,
+        );
+        let mut built = else_ops;
+        built.push(yield_of(&else_results));
+        let mut outer_results = Vec::new();
+        for (depth, level) in levels.into_iter().enumerate().rev() {
+            let mut then_body = level.then_ops;
+            then_body.push(yield_of(&level.then_results));
+            let if_op = Op::Sentient(sentient::Op::If {
+                predicate: sentient::CmpPredicate::Eq,
+                lhs: cur.iv,
+                rhs: level.rhs,
+                yielded: level
+                    .results
+                    .iter()
+                    .map(|&result| sentient::Yielded {
+                        result,
+                        reg: UNKNOWN_LOCALE,
+                    })
+                    .collect(),
+                dbg_name: None,
+                then_body,
+                else_body: built,
+            });
+            if depth == 0 {
+                // The caller creates the yield over the outermost conditional (`:2612-2617`).
+                built = vec![if_op];
+                outer_results = level.results;
+            } else {
+                built = vec![if_op, yield_of(&level.results)];
+            }
+        }
+        (built, outer_results)
+    }
+}
+
+/// `if_op->getResult(0)` — the value a `sentient.if` binds first, if it binds one.
+fn first_result_of_if(root: &[Op], if_op: &OpPath) -> Option<Val> {
+    let Some(Op::Sentient(sentient::Op::If { yielded, .. })) = op_at(root, if_op.path()) else {
+        return None;
+    };
+    yielded.first().map(|entry| entry.result)
+}
+
+/// `sentient_for.getRegionIterArgs()` and its inits, cloned because the callers below go on to mutate
+/// the tree they came from.
+fn carried_of_for(root: &[Op], for_op: &OpPath) -> Option<Vec<sentient::Carried>> {
+    let Some(Op::Sentient(sentient::Op::For { carried, .. })) = op_at(root, for_op.path()) else {
+        return None;
+    };
+    Some(carried.clone())
+}
+
+/// [`carried_of_for`] plus the body length, which names the loop's terminator.
+fn carried_and_body_len(root: &[Op], for_op: &OpPath) -> Option<(Vec<sentient::Carried>, usize)> {
+    let Some(Op::Sentient(sentient::Op::For { carried, body, .. })) = op_at(root, for_op.path())
+    else {
+        return None;
+    };
+    Some((carried.clone(), body.len()))
+}
 
 // crustify:todo: e496_parseFixedDims
 //   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2021  (59 body lines, level 3)
@@ -2435,5 +3527,432 @@ mod unit_tests {
                 scalar_constant(Val(4), 7, ScalarTy::Int(1)),
             ]
         );
+    }
+
+    /// e431 — the fixed IV contributes its one chosen iteration and the free IV every iteration its
+    /// filter still allows, so the leaf lands at the flattened index of each surviving tuple; an IV
+    /// with no allowed iteration at all kills the leaf.
+    #[test]
+    fn process_leaf_writes_one_entry_per_allowed_iteration_tuple() {
+        let (fixed, free) = (Val(0), Val(1));
+        let dims = [
+            IvDim {
+                iv: fixed,
+                dimension: 2,
+                multiplier: 2,
+            },
+            IvDim {
+                iv: free,
+                dimension: 2,
+                multiplier: 1,
+            },
+        ];
+        let loops = BTreeMap::from([(fixed, loop_info(None, 2)), (free, loop_info(None, 2))]);
+        let mut table = Table::new(TableSize(4), ScalarTy::Int(1), ScalarTy::Index);
+        let mut evaluator = FakeEvaluator::default();
+        let leaf = Branch {
+            leaf: Leaf {
+                results: vec![Val(7)],
+                block: None,
+            },
+            ..Branch::default()
+        };
+        let mut ivs = IvValuesAndFilters::of([(fixed, 2), (free, 2)]);
+        ivs.set_chosen(fixed, Some(1), 2);
+        // Iteration 0 of the free IV is filtered out, so only the tuple `(1, 1)` survives.
+        ivs.set_filter(
+            free,
+            TableIdx::of(0, &loop_info(None, 2)).expect("iteration 0"),
+            true,
+            2,
+        );
+
+        let alive = {
+            let mut sink = LeafSink {
+                ivs_dimensions_multipliers: &dims,
+                lhs_to_for_op_or_null: &loops,
+                table: &mut table,
+            };
+            sink.process_leaf(&leaf, &ivs, 0, &mut Vec::new(), &mut evaluator)
+        };
+
+        assert!(alive);
+        // `2 * 1 + 1 * 1`, and nothing at the filtered `2 * 1 + 1 * 0`.
+        let entry = table
+            .table_entry_at_idx(TableIndex(3))
+            .expect("the tuple (1, 1)");
+        assert_eq!(entry.ev(), Some(evaluator.evaluate_value(Val(7))));
+        assert!(table.table_entry_at_idx(TableIndex(2)).is_none());
+
+        let mut all_filtered = IvValuesAndFilters::of([(free, 2)]);
+        for iteration in 0..2 {
+            all_filtered.set_filter(
+                free,
+                TableIdx::of(iteration, &loop_info(None, 2)).expect("an iteration"),
+                true,
+                2,
+            );
+        }
+        let mut sink = LeafSink {
+            ivs_dimensions_multipliers: &dims,
+            lhs_to_for_op_or_null: &loops,
+            table: &mut table,
+        };
+        assert!(!sink.process_leaf(&leaf, &all_filtered, 0, &mut Vec::new(), &mut evaluator));
+    }
+
+    /// e432 — a nest needing no new iterator argument is never refused: the conditional is marked for
+    /// deletion and its readers move onto `new_if`. Asking for one against a full loop is refused.
+    #[test]
+    fn transform_in_contiguous_sequence_case_needs_no_iter_arg_but_respects_the_cap() {
+        let iv = Val(1);
+        let if_path = OpPath::at(&[(0, 1), (0, 0)]);
+        let body = vec![
+            if_op(
+                iv,
+                Val(4),
+                vec![Yielded {
+                    result: Val(20),
+                    reg: UNASSIGNED,
+                }],
+                vec![yield_op(vec![Val(21)])],
+            ),
+            scalar_add(Val(20), Val(5), Val(22)),
+            yield_op(Vec::new()),
+        ];
+        let manager = PatternSimplificationManager {
+            lhs_to_for_op_or_null: BTreeMap::from([(
+                iv,
+                loop_info(Some(OpPath::at(&[(0, 1)])), 4),
+            )]),
+            ivs_dimensions_multipliers: vec![IvDim {
+                iv,
+                dimension: 4,
+                multiplier: 1,
+            }],
+            table: Some(table()),
+            ..PatternSimplificationManager::default()
+        };
+        let mut evaluator = FakeEvaluator::default();
+        let mut clone = |_: &mut Vec<Op>, at: &OpPath, _: &[(Val, Val)]| at.clone();
+
+        let mut nothing_to_add = manager.clone();
+        let mut root = vec![constant(5, Val(5)), for_op(Vec::new(), body.clone())];
+        let mut consts = Vec::new();
+        let mut query_maps = Vec::new();
+        let mut values = Values::default();
+        let case = ContiguousCase {
+            if_op: &if_path,
+            new_if: Val(30),
+            num_new_iter_args: 0,
+            has_positive_step: true,
+        };
+        let transformed = {
+            let mut cloning = LoopCloning {
+                for_ops_to_avoid_new_iter_args: &[],
+                clone: &mut clone,
+            };
+            let mut builders = Builders {
+                consts: &mut consts,
+                query_maps: &mut query_maps,
+                values: &mut values,
+            };
+            nothing_to_add.transform_in_contiguous_sequence_case(
+                &mut root,
+                &case,
+                &mut cloning,
+                &mut builders,
+                &mut evaluator,
+            )
+        };
+
+        assert!(transformed);
+        assert!(nothing_to_add.marks.has(Mark::ToDelete, if_path.path()));
+        assert_eq!(
+            op_at(&root, &[(0, 1), (0, 1)]),
+            Some(&scalar_add(Val(30), Val(5), Val(22)))
+        );
+
+        // Six iterator arguments already, so the one this nest asks for does not fit (`:1691`).
+        let full: Vec<Carried> = (0..6)
+            .map(|i| Carried {
+                init: Val(5),
+                arg: Val(40 + i),
+                result: Val(50 + i),
+                reg: UNASSIGNED,
+                program_header: false,
+                element_size: None,
+            })
+            .collect();
+        let mut at_capacity = manager;
+        let mut root = vec![constant(5, Val(5)), for_op(full, body)];
+        let case = ContiguousCase {
+            num_new_iter_args: 1,
+            ..case
+        };
+        let mut cloning = LoopCloning {
+            for_ops_to_avoid_new_iter_args: &[],
+            clone: &mut clone,
+        };
+        let mut builders = Builders {
+            consts: &mut consts,
+            query_maps: &mut query_maps,
+            values: &mut values,
+        };
+        assert!(!at_capacity.transform_in_contiguous_sequence_case(
+            &mut root,
+            &case,
+            &mut cloning,
+            &mut builders,
+            &mut evaluator,
+        ));
+        assert!(!at_capacity.marks.has(Mark::ToDelete, if_path.path()));
+    }
+
+    /// e433 — with no iterator argument to reuse, the free IV's loop is cloned for the monotone
+    /// sequence's `(start, step)` pair, the conditional is retired in favour of `new_if`, and the
+    /// marked yield hands back the clone's new argument.
+    #[test]
+    fn transform_in_monotone_sequence_case_clones_the_loop_for_the_sequence_arg() {
+        let iv = Val(1);
+        let (for_path, if_path) = (OpPath::at(&[(0, 0)]), OpPath::at(&[(0, 0), (0, 0)]));
+        let mut root = vec![for_op(
+            Vec::new(),
+            vec![
+                if_op(
+                    iv,
+                    Val(4),
+                    vec![Yielded {
+                        result: Val(20),
+                        reg: UNASSIGNED,
+                    }],
+                    vec![yield_op(vec![Val(21)])],
+                ),
+                scalar_add(Val(20), Val(5), Val(22)),
+                yield_op(vec![Val(22)]),
+            ],
+        )];
+        let mut manager = PatternSimplificationManager {
+            lhs_to_for_op_or_null: BTreeMap::from([(iv, loop_info(Some(for_path.clone()), 4))]),
+            ivs_dimensions_multipliers: vec![IvDim {
+                iv,
+                dimension: 4,
+                multiplier: 1,
+            }],
+            table: Some(table()),
+            monotone_seq_start_val: Some(Val(10)),
+            monotone_seq_val_step: Some(Val(11)),
+            ..PatternSimplificationManager::default()
+        };
+        manager
+            .marks
+            .set(Mark::ResultReplacedByIterArg, &[(0, 0), (0, 2)]);
+        let mut evaluator = FakeEvaluator::default();
+        let mut requests: Vec<(Val, Val)> = Vec::new();
+        let mut clone = |root: &mut Vec<Op>, at: &OpPath, pairs: &[(Val, Val)]| {
+            requests.extend_from_slice(pairs);
+            if let Some(Op::Sentient(sentient::Op::For { carried, .. })) =
+                op_at_mut(root, at.path())
+            {
+                for &(init, _) in pairs {
+                    carried.push(Carried {
+                        init,
+                        arg: Val(60),
+                        result: Val(61),
+                        reg: UNASSIGNED,
+                        program_header: false,
+                        element_size: None,
+                    });
+                }
+            }
+            at.clone()
+        };
+        let mut consts = Vec::new();
+        let mut query_maps = Vec::new();
+        let mut values = Values::default();
+
+        let transformed = {
+            let mut cloning = LoopCloning {
+                for_ops_to_avoid_new_iter_args: &[],
+                clone: &mut clone,
+            };
+            let mut builders = Builders {
+                consts: &mut consts,
+                query_maps: &mut query_maps,
+                values: &mut values,
+            };
+            manager.transform_in_monotone_sequence_case(
+                &mut root,
+                &MonotoneCase {
+                    for_op: &for_path,
+                    if_op: &if_path,
+                    new_if: Val(30),
+                },
+                &mut cloning,
+                &mut builders,
+                &mut evaluator,
+            )
+        };
+
+        assert!(transformed);
+        assert_eq!(requests, vec![(Val(10), Val(11))]);
+        assert!(manager.marks.has(Mark::ToDelete, if_path.path()));
+        assert_eq!(
+            op_at(&root, &[(0, 0), (0, 1)]),
+            Some(&scalar_add(Val(30), Val(5), Val(22)))
+        );
+        assert_eq!(
+            op_at(&root, &[(0, 0), (0, 2)]),
+            Some(&yield_op(vec![Val(60)]))
+        );
+    }
+
+    /// e434 — three equal entries open one default-value sequence of length three, and the fourth,
+    /// whose difference matches that sequence's zero stride, starts a second sequence of its own.
+    #[test]
+    fn parse_sequence_opens_a_run_of_three_then_starts_a_new_one() {
+        let mut evaluator = FakeEvaluator::default();
+        let zero = evaluator.get_constant(0);
+        let mut table = Table::new(TableSize(4), ScalarTy::Int(1), ScalarTy::Index);
+        for at in 0..3 {
+            table.create_table_entry_at_idx(
+                TableIndex(at),
+                &Leaf {
+                    results: vec![Val(7)],
+                    block: None,
+                },
+                &mut evaluator,
+            );
+        }
+        table.create_table_entry_at_idx(
+            TableIndex(3),
+            &Leaf {
+                results: vec![Val(8)],
+                block: None,
+            },
+            &mut evaluator,
+        );
+        let mut manager = PatternSimplificationManager {
+            table: Some(table),
+            ..PatternSimplificationManager::default()
+        };
+        let mut slice = table_slice(zero, Vec::new(), false);
+
+        manager.parse_sequence(
+            IntervalMarker(0),
+            IntervalStride::new(ONE),
+            TableIndex(0),
+            Entries(4),
+            &mut slice,
+            &mut evaluator,
+        );
+
+        assert_eq!(
+            slice
+                .sequences
+                .iter()
+                .map(|s| (s.kind, s.length, s.interval_marker, s.lb))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    SequenceKind::DefaultValue,
+                    Entries(3),
+                    Some(IntervalMarker(2)),
+                    Some(evaluator.evaluate_value(Val(7))),
+                ),
+                (
+                    SequenceKind::DefaultValue,
+                    Entries(1),
+                    Some(IntervalMarker(3)),
+                    Some(evaluator.evaluate_value(Val(8))),
+                ),
+            ]
+        );
+        assert!(!manager.abort_pattern);
+    }
+
+    /// e435 — a fixed IV of dimension two becomes one `if (iv == lb)` whose two arms each hold one
+    /// table slice's value, and the chain answers the conditional's own result.
+    #[test]
+    fn code_gen_generic_nested_if_builds_one_branch_per_fixed_iteration() {
+        let (fixed, free) = (Val(1), Val(2));
+        let mut evaluator = FakeEvaluator::default();
+        let zero = evaluator.get_constant(0);
+        let first = evaluator.get_constant(11);
+        let second = evaluator.get_constant(22);
+        let slices = vec![
+            table_slice(
+                zero,
+                vec![sequence(SequenceKind::DefaultValue, first, zero, 1, 0)],
+                false,
+            ),
+            table_slice(
+                zero,
+                vec![sequence(SequenceKind::DefaultValue, second, zero, 1, 0)],
+                false,
+            ),
+        ];
+        let manager = PatternSimplificationManager {
+            lhs_to_for_op_or_null: BTreeMap::from([(fixed, loop_info(None, 2))]),
+            table: Some(table()),
+            ..PatternSimplificationManager::default()
+        };
+        let ivs = [
+            IvDim {
+                iv: fixed,
+                dimension: 2,
+                multiplier: 1,
+            },
+            IvDim {
+                iv: free,
+                dimension: 2,
+                multiplier: 1,
+            },
+        ];
+        let types = [ScalarTy::Index];
+        let mut nest = GenericNest {
+            generate_encoding: false,
+            types: &types,
+            slices: slices.iter(),
+        };
+        let mut consts = Vec::new();
+        let mut query_maps = Vec::new();
+        let mut values = Values::default();
+
+        let (ops, results) = {
+            let mut builders = Builders {
+                consts: &mut consts,
+                query_maps: &mut query_maps,
+                values: &mut values,
+            };
+            manager.code_gen_generic_nested_if(
+                &mut nest,
+                &ivs,
+                &OpPath::at(&[(0, 0)]),
+                &mut builders,
+                &mut evaluator,
+            )
+        };
+
+        assert_eq!(results, vec![Val(1)]);
+        assert_eq!(
+            ops,
+            vec![Op::Sentient(sentient::Op::If {
+                predicate: CmpPredicate::Eq,
+                lhs: fixed,
+                rhs: Val(0),
+                yielded: vec![Yielded {
+                    result: Val(1),
+                    reg: UNKNOWN_LOCALE,
+                }],
+                dbg_name: None,
+                then_body: vec![yield_op(vec![Val(2)])],
+                else_body: vec![yield_op(vec![Val(3)])],
+            })]
+        );
+        assert_eq!(consts, vec![scalar_constant(Val(0), 0, ScalarTy::Int(1))]);
+        // Both slices are consumed, the `then` one first.
+        assert_eq!(evaluator.built, vec![first, second]);
+        assert!(nest.slices.next().is_none());
     }
 }

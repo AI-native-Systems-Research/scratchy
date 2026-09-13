@@ -239,10 +239,33 @@ pub(crate) fn is_operation_a_use(_op: &Op) -> bool {
     false
 }
 
-// crustify:todo: e438_runOn
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:58  (18 body lines, level 2)
-//   original  : void runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e378_optimize
+/// `cl::opt<bool> EnableDynamicLoopHoisting("dcc-implicit-sync-re-dynamic-loops", .., cl::init(false))`
+/// (`ImplicitSyncRE.cpp:45-49`) — what e438 hands the optimizer.
+pub(crate) const ENABLE_DYNAMIC_LOOP_HOISTING: bool = false;
+
+/// `Statistic implicit_sync_re_count` — the pass's own count, set from `optimizer.optimize()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ImplicitSyncReCount(pub(crate) u32);
+
+/// Replaces: e438_runOn
+///
+/// Builds the implicit-sync RDE tree over one program unit, simplifies it, and rewrites the unit from
+/// the optimizer's decisions, answering how many `sentient.sync`s it removed.
+///
+/// ⛔ EVERY STEP OF THIS BODY IS `Analyses/` WORK. `ImplicitSyncRDETree`'s constructor, `compute`,
+/// `print` and `simplify` are all `RedundantDefinitionEliminationTree`'s, and the whole rewrite is
+/// `RDETreeOptimizer<T>::optimize`; this module holds only the four hooks the subclass overrides
+/// (e044-e050). ⛔ DO NOT SUBSTITUTE A CONSTANT FOR THE COUNT: the tree decides what the pass deletes.
+///
+/// ⭐ THE ANCHOR IS FILLED so the unit is not lost, and the seam is named exactly: only the tree needs
+/// porting for this to become real, and [`ENABLE_DYNAMIC_LOOP_HOISTING`] is already the flag it takes.
+pub(crate) fn run_on(unit_body: &mut Vec<Op>) -> ImplicitSyncReCount {
+    let _ = (unit_body, ENABLE_DYNAMIC_LOOP_HOISTING);
+    todo!(
+        "RDETreeOptimizer<ImplicitSyncRDETree>::optimize \
+         (Analyses/RedundantDefinitionEliminationTreeImpl.cpp:168) — out of campaign scope"
+    )
+}
 
 // crustify:todo: e501_runOn
 //   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:77  (4 body lines, level 3)
@@ -258,7 +281,10 @@ pub(crate) fn is_operation_a_use(_op: &Op) -> bool {
 mod unit_tests {
     use core::num::NonZeroU32;
 
-    use super::{ENABLE_DEAD_DEF_REMOVAL, ImplicitSyncGenValue, TileSize, is_operation_a_use};
+    use super::{
+        ENABLE_DEAD_DEF_REMOVAL, ENABLE_DYNAMIC_LOOP_HOISTING, ImplicitSyncGenValue, TileSize,
+        is_operation_a_use, run_on,
+    };
     use crate::islands::sentient::dialects::{Op, sentient};
 
     /// `sentient.nop` — the `op_` a GenValue points at, whatever it is.
@@ -326,5 +352,16 @@ mod unit_tests {
     fn no_operation_is_a_use_in_an_implicit_sync_tree() {
         assert!(!is_operation_a_use(&nop()));
         assert!(!ENABLE_DEAD_DEF_REMOVAL);
+    }
+
+    /// e438 — the pass hands one program unit to the RDE tree optimizer, which is `Analyses/` work.
+    /// ⭐ REACHING THE SEAM IS WHAT IS TESTABLE, and the flag the optimizer takes is off.
+    #[test]
+    #[should_panic(expected = "RDETreeOptimizer<ImplicitSyncRDETree>::optimize")]
+    fn run_on_hands_the_unit_to_the_rde_tree_optimizer() {
+        assert!(!ENABLE_DYNAMIC_LOOP_HOISTING);
+        let mut unit_body = vec![nop()];
+
+        run_on(&mut unit_body);
     }
 }

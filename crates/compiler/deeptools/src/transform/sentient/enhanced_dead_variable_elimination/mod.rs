@@ -773,10 +773,36 @@ fn constant_iter_arg(for_op: &Op, i: usize) -> Option<(Val, Val, Val)> {
     (*yielded.get(i)? == carried.arg).then_some((carried.arg, carried.init, carried.result))
 }
 
-// crustify:todo: e437_initializeWorkList
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:685  (4 body lines, level 2)
-//   original  : void EnhancedDeadVariableEliminationPass::initializeWorkList()
-//   calls     : e301_initializeAssignmentForAnOperation
+impl EnhancedDeadVariableElimination {
+    /// Replaces: e437_initializeWorkList
+    ///
+    /// Seeds the assignments and the worklist from every operation of the program unit, pre-order —
+    /// `current_unit_->walk<WalkOrder::PreOrder>(initializeAssignmentForAnOperation)`.
+    ///
+    /// ⭐ THE REGION STACK IS THE WALK: [`Definitions`] resolves a value against the innermost
+    /// enclosing regions first, so each level pushes its own block ahead of `enclosing` before it
+    /// recurses. `current_unit_` is the body plus the unit it runs on, both handed in.
+    pub(crate) fn initialize_work_list(
+        &mut self,
+        unit_body: &[Op],
+        unit: GenericComp,
+        enclosing: &[&[Op]],
+    ) {
+        let mut regions: Vec<&[Op]> = Vec::with_capacity(enclosing.len() + 1);
+        regions.push(unit_body);
+        regions.extend_from_slice(enclosing);
+        for op in unit_body {
+            self.initialize_assignment_for_an_operation(
+                op,
+                unit,
+                Definitions::from_innermost(&regions),
+            );
+            for region in dialects::regions_ref(op) {
+                self.initialize_work_list(region, unit, &regions);
+            }
+        }
+    }
+}
 
 // crustify:todo: e498_updateForOperation
 //   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:127  (141 body lines, level 3)
@@ -1112,5 +1138,49 @@ mod unit_tests {
             })
             .collect();
         assert_eq!(bounds, vec![Val(41), Val(10)]);
+    }
+
+    /// e437 — the pre-order walk seeds the loop's induction variable and its non-constant bound at
+    /// the top level and then descends into its body, where the nested `set_mask`'s operand resolves
+    /// against the enclosing block the region stack carries.
+    #[test]
+    fn initialize_work_list_walks_into_a_loop_body_with_the_enclosing_block_in_scope() {
+        let unit_body = vec![
+            Op::Sentient(sentient::Op::ScalarCopy {
+                input: Val(0),
+                result: Val(31),
+                reg: Reg {
+                    locale: RegType::Unknown,
+                    index: None,
+                },
+                element_size: None,
+                program_header: false,
+            }),
+            constant(Val(20), 7),
+            for_op(
+                30,
+                31,
+                Vec::new(),
+                vec![
+                    Op::Sentient(sentient::Op::SetMask {
+                        mask_value: Val(20),
+                        dbg_name: None,
+                    }),
+                    yield_op(Vec::new()),
+                ],
+            ),
+        ];
+        let mut pass = EnhancedDeadVariableElimination::default();
+
+        pass.initialize_work_list(&unit_body, GenericComp::Lxlu, &[]);
+
+        assert_eq!(
+            pass.assignments.keys().copied().collect::<Vec<Val>>(),
+            vec![Val(20), Val(30), Val(31)]
+        );
+        assert_eq!(pass.influence_type(Val(20)), Influence::Memory);
+        assert_eq!(pass.influence_type(Val(30)), Influence::ControlFlow);
+        assert_eq!(pass.influence_type(Val(31)), Influence::ControlFlow);
+        assert!(pass.conflicts().is_empty());
     }
 }

@@ -298,10 +298,52 @@ pub fn expand_all_groups_to_units_and_update_sizes(op: &mut Op, defs: Definition
     }
 }
 
-// crustify:todo: e436_duplicateAndUpdateEntriesOfQueryMapInLocalRegions
-//   authority : dcc/src/Transform/Sentient/Deuniform.cpp:139  (13 body lines, level 2)
-//   original  : void DeuniformPass::duplicateAndUpdateEntriesOfQueryMapInLocalRegions( mlir::Operation *local_region_op, std::vector<mlir::Value> &new_units, std::vector<mlir::Operation *> &to_be_deleted)
-//   calls     : e298_duplicateAndUpdateEntriesOfQueryMap
+/// Replaces: e436_duplicateAndUpdateEntriesOfQueryMapInLocalRegions
+///
+/// Every `uniform.query_map` directly inside a local region op's regions gets a narrowed duplicate —
+/// mapping only `new_units` — its readers repointed at the duplicate, and its own result queued for
+/// deletion.
+///
+/// ⛔ TRAP: `OpBuilder(Region&)` INSERTS AT THE START OF THE ENTRY BLOCK (`:143`), so each duplicate
+/// lands IN FRONT of the query it replaces and the reference's `getOps()` range never revisits it.
+/// Appending would make the walk re-see its own output.
+///
+/// ⛔ `defs` IS THE ENCLOSING SCOPE, supplied by the caller: the mappings a query reads are defined
+/// above the local region op, and the region being rewritten cannot be borrowed twice.
+pub fn duplicate_and_update_entries_of_query_map_in_local_regions(
+    local_region_op: &mut Op,
+    new_units: &[Val],
+    to_be_deleted: &mut Vec<Val>,
+    defs: Definitions<'_>,
+    values: &mut Values,
+) {
+    for region in dialects::regions_mut(local_region_op) {
+        let queries: Vec<(Val, Val, Val)> = region
+            .iter()
+            .filter_map(|op| match op {
+                Op::Uniform(uniform::Op::QueryMap { result, map, key }) => {
+                    Some((*result, *map, *key))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut prepended = Vec::new();
+        for (result, map, key) in queries {
+            let (new_map, new_query) =
+                duplicate_and_update_entries_of_query_map(map, key, new_units, defs, values);
+            if let Op::Uniform(uniform::Op::QueryMap {
+                result: new_result, ..
+            }) = new_query
+            {
+                dialects::replace_all_uses_with(region, result, new_result);
+            }
+            to_be_deleted.push(result);
+            prepended.push(new_map);
+            prepended.push(new_query);
+        }
+        region.splice(0..0, prepended);
+    }
+}
 
 // crustify:todo: e497_duplicateAndUpdateRegionsOfLocalRegionOps
 //   authority : dcc/src/Transform/Sentient/Deuniform.cpp:284  (88 body lines, level 3)
@@ -506,5 +548,70 @@ mod unit_tests {
         };
         assert_eq!(rewritten.regions()[0].units, vec![Val(1), Val(2)]);
         assert_eq!(rewritten.regions()[1].units, vec![Val(3)]);
+    }
+
+    /// e436 — the query inside the local region gains a narrowed duplicate IN FRONT of itself, its
+    /// reader moves onto the duplicate, and the query it replaces is queued for deletion.
+    #[test]
+    fn a_local_region_query_map_is_duplicated_ahead_of_itself() {
+        let scope = vec![
+            get_unit(1),
+            get_unit(2),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(10),
+                pairs: vec![(Val(1), Val(20)), (Val(2), Val(21))],
+            }),
+        ];
+        let regions: Vec<&[Op]> = vec![&scope];
+        let defs = Definitions::within_program_unit(&regions, Val(9), &[Val(1), Val(2)]);
+        let mut values = Values::default();
+        let mut op = Op::UniformRegions(UniformRegions::UniformizeRegions {
+            regions: vec![region(
+                11,
+                &[2],
+                vec![
+                    Op::Uniform(uniform::Op::QueryMap {
+                        result: Val(41),
+                        map: Val(10),
+                        key: Val(9),
+                    }),
+                    copy(42, 41),
+                ],
+            )],
+            results: Vec::new(),
+            yielded: Vec::new(),
+        });
+        let mut to_be_deleted = Vec::new();
+
+        duplicate_and_update_entries_of_query_map_in_local_regions(
+            &mut op,
+            &[Val(2)],
+            &mut to_be_deleted,
+            defs,
+            &mut values,
+        );
+
+        let Op::UniformRegions(rewritten) = &op else {
+            panic!("expected a uniformize_regions, got {op:?}");
+        };
+        let body = &rewritten.regions()[0].body;
+        assert_eq!(body.len(), 4);
+        assert_eq!(
+            body[0],
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(0),
+                pairs: vec![(Val(2), Val(21))],
+            })
+        );
+        assert_eq!(
+            body[1],
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(1),
+                map: Val(0),
+                key: Val(9),
+            })
+        );
+        assert_eq!(copies(body), vec![(42, 1)]);
+        assert_eq!(to_be_deleted, vec![Val(41)]);
     }
 }

@@ -622,7 +622,7 @@ pub(crate) struct BlockPath {
 /// ⛔ `Analyses/CFGSSentientLevelConditionalTree.*` IS OUT OF CAMPAIGN SCOPE, so this is the leaf's
 /// PROJECTION rather than the node: exactly `getResults()` (`:469-471`) and `getBlock()` (`:472`),
 /// which is every field of the entry the reference builds from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Leaf {
     /// `getResults()` (`Analyses/CFGSSentientLevelConditionalTree.hpp:77`) — what this leaf yields.
     pub(crate) results: Vec<Val>,
@@ -692,6 +692,12 @@ impl Table {
             predicate_type,
             entry_type,
         }
+    }
+
+    /// `int64_t getSize() const` (`:525`) — an excluded field accessor.
+    #[must_use]
+    pub(crate) const fn size(&self) -> TableSize {
+        TableSize(self.entries.len())
     }
 
     /// `Type getTableEntryType() const` (`:522`) — an excluded field accessor.
