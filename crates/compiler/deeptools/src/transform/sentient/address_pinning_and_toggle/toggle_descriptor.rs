@@ -78,19 +78,11 @@
 //! | `e552_ToggleDescriptor` | 552 | 4 | 68 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2642` |
 //! | `e553_dump` | 553 | 4 | 16 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2724` |
 
-// crustify:todo: e552_ToggleDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2642  (68 body lines, level 4)
-//   original  : ToggleDescriptor::ToggleDescriptor(ExpressionEvaluator &evaluator, Value base_addr) : DynamicPatternDescriptorBase(PatternKind::kToggle, evaluator)
-//   calls     : e001_invalidate, e003_invalidate, e004_invalidate, e005_invalidate, e017_getOutermostConstInitialization, e485_getX
-
-// crustify:todo: e553_dump
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2724  (16 body lines, level 4)
-//   original  : void ToggleDescriptor::dump() const
-//   calls     : e278_isValid, e279_canBeSimplified, e401_getC1, e485_getX
-
+use super::discrete_integer_set_descriptor::num_users_except;
+use super::write_evaluated_value;
 use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
-use crate::transform::sentient::analyses::EvaluatedValue;
-use crate::transform::sentient::utils::{ConstKind, is_constant};
+use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator};
+use crate::transform::sentient::utils::{ConstKind, is_constant, outermost_const_initialization};
 use crate::transform::sentient::{ForRef, IterArgIndex};
 
 /// A BASE ADDRESS TOGGLING BETWEEN TWO CONSTANTS — `class ToggleDescriptor`
@@ -117,6 +109,155 @@ pub struct ToggleDescriptor {
 }
 
 impl ToggleDescriptor {
+    /// Replaces: e552_ToggleDescriptor
+    ///
+    /// Matches `base_addr` as `c1 - %argN` around a loop whose outermost initialisation is constant,
+    /// recording that loop, its index and `c1`, then flagging a "toggle" whose two values are one
+    /// (`:2642-2711`).
+    ///
+    /// ⛔ THE LADDER HAS TWO DIFFERENT FAILURES. The four shape tests return the descriptor UNTOUCHED
+    /// (`:2646`, `:2653`, `:2662`, `:2669` — default, and already invalid); the two later ones
+    /// `invalidate()` fields the walk had filled (`:2680`, `:2691`).
+    /// ⛔ `setCanBeSimplified(getX() == getY())` COMPARES VALUES, NOT HANDLES (`:2710`) —
+    /// `EvaluatedValue::operator==`, which is [`ExpressionEvaluator::values_equal`].
+    #[must_use]
+    pub fn new(
+        base_addr: Val,
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> ToggleDescriptor {
+        // `isa<BlockArgument>(base_addr)` (`:2646`) — `sentient.for` is the only op of this island that
+        // binds one, so the lookup that answers it is the same one `:2669` needs.
+        if defs.for_arg_of(base_addr).is_some() {
+            return ToggleDescriptor::default();
+        }
+        // `base_addr.getDefiningOp<sentient::SubOp>()` (`:2653`).
+        let Some(Op::Sentient(sentient::Op::ScalarSub {
+            lhs: inp1,
+            rhs: inp2,
+            ..
+        })) = defs.of(base_addr)
+        else {
+            return ToggleDescriptor::default();
+        };
+        // `dyn_cast<BlockArgument>(sub.getInp2())` AND `isConstant<ConstantOp>(sub.getInp1())`
+        // (`:2657-2662`), then `dyn_cast<ForOp>(iter_arg.getOwner()->getParentOp())` (`:2666-2669`).
+        let iter_arg = *inp2;
+        let Some((for_op, arg_number)) = defs.for_arg_of(iter_arg) else {
+            return ToggleDescriptor::default();
+        };
+        if !is_constant(*inp1, ConstKind::ScalarConstant, defs) {
+            return ToggleDescriptor::default();
+        }
+        let c1_operand = *inp1;
+
+        // `std::tie(outer_loop_, iter_arg_index_, std::ignore) = getOutermostConstInitialization(..)`
+        // (`:2671-2672`); whole-`None` is its `{nullptr, -1, size}`.
+        let found = outermost_const_initialization(iter_arg, defs);
+        let mut desc = ToggleDescriptor {
+            outer_loop: found.map(|found| found.loop_op),
+            iter_arg_index: found.and_then(|found| found.iter_arg),
+            c1: None,
+            can_be_simplified: false,
+        };
+        // `if (iter_arg_index_ < 0) { invalidate(); return; }` (`:2674-2681`).
+        if desc.iter_arg_index.is_none() {
+            desc.invalidate();
+            return desc;
+        }
+
+        // `int iter_arg_index = getIndexOfLoopRegionIterArgs(iter_arg)` (`:2683`) — a LOCAL and NOT the
+        // member above: `getRegionIterArgs()` drops the induction variable, so it is one less than the
+        // raw argument number (`Analyses/Utils.cpp:257-271`).
+        let Some(region_iter_arg_index) = arg_number.checked_sub(1) else {
+            desc.invalidate();
+            return desc;
+        };
+        let Op::Sentient(sentient::Op::For { body, .. }) = for_op else {
+            desc.invalidate();
+            return desc;
+        };
+        // `DT_CHECK_MSG(yield, "expected terminator of loop body to be a yield")` (`:2684-2685`).
+        let Some(Op::Sentient(sentient::Op::Yield { results })) = body.last() else {
+            todo!(
+                "ToggleDescriptor: DT_CHECK_MSG(yield, \"expected terminator of loop body to be a \
+                 yield\") (:2684-2685) — the loop binding {iter_arg:?} ends in {:?}",
+                body.last()
+            )
+        };
+        // `if (yield.getOperand(iter_arg_index) != base_addr) { invalidate(); return; }` (`:2686-2693`).
+        if results.get(region_iter_arg_index) != Some(&base_addr) {
+            desc.invalidate();
+            return desc;
+        }
+
+        desc.c1 = Some(evaluator.evaluate_value_handle(c1_operand));
+        // `DT_CHECK_MSG(num_non_yield_feeding_uses == 1, ..)` (`:2696-2700`) — an ABORT there, so a
+        // named stop here. ⚠️ DIVERGENCE: the reference filters the ONE terminator by identity and this
+        // filters every `sentient.yield`, as its e017 sibling already does.
+        let uses = num_users_except(base_addr, body, &|op| {
+            matches!(op, Op::Sentient(sentient::Op::Yield { .. }))
+        });
+        if uses != 1 {
+            todo!(
+                "ToggleDescriptor: DT_CHECK_MSG(num_non_yield_feeding_uses == 1, \"base_addr should \
+                 only be used in memory op and to feed the yield op\") — {uses} such uses of \
+                 {base_addr:?} (:2696-2700)"
+            )
+        }
+
+        // `setCanBeSimplified(getX() == getY())` (`:2710`).
+        let x = desc.x(evaluator, body, defs);
+        let y = desc.init(body, defs);
+        desc.can_be_simplified = match x {
+            Some(x) => evaluator.values_equal(x, y),
+            None => false,
+        };
+        desc
+    }
+
+    /// Replaces: e553_dump
+    ///
+    /// This toggle as debug text (`:2724-2739`) — `\t`-indented, `X`/`Y`/`c1`, the outer loop's nest
+    /// level and its iter-arg index.
+    ///
+    /// ⛔ TRAP: THE VALID BRANCH ENDS IN [`write_evaluated_value`], so only the `Invalid` branch is
+    /// complete — the same seam as e425's.
+    /// ⛔ `(Simplified)` PRECEDES THE VALUES AND DOES NOT REPLACE THEM (`:2731`).
+    #[must_use]
+    pub fn dump(
+        &self,
+        body: &[Op],
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> String {
+        let mut out = String::from("Toggle Descriptor:\n");
+        // `const char indent = '\t'` (`:2727`), streamed before each line the reference indents.
+        if !self.is_valid() {
+            out.push_str("\tInvalid\n");
+            return out;
+        }
+        if self.can_be_simplified {
+            out.push_str("\t(Simplified)\n");
+        }
+        out.push_str("\tX = ");
+        write_evaluated_value(self.x(evaluator, body, defs), &mut out);
+        out.push_str("\n\tY = ");
+        write_evaluated_value(Some(self.init(body, defs)), &mut out);
+        out.push_str("\n\tc1 = ");
+        write_evaluated_value(self.c1, &mut out);
+        out.push_str("\n\touter loop at level (");
+        // `-1` is the reference's initial `level`, unreachable past the `isValid()` above.
+        out.push_str(&self.outer_loop.map_or(-1, |l| loop_nest_level(l, body)).to_string());
+        out.push_str(")\n\titer arg index of outer loop: ");
+        out.push_str(&match self.iter_arg_index {
+            Some(index) => index.0.to_string(),
+            None => "-1".to_owned(),
+        });
+        out.push('\n');
+        out
+    }
+
     /// Replaces: e015_getInit
     ///
     /// The evaluated constant the outer loop's iter arg starts at —
@@ -161,6 +302,51 @@ impl ToggleDescriptor {
     }
 }
 
+/// `dcc::utils::getLoopNestLevel<sentient::ForOp>(outer_loop_)` (`dcc/src/Utils/Utils.cpp:211-220`) —
+/// how many `sentient.for`s enclose this one, the outermost answering 0.
+///
+/// ⛔ ZERO-BASED BECAUSE THE WALK COUNTS THE LOOP ITSELF: `level` starts at `-1` and its first step
+/// goes to the loop's own parent, so an unnested loop answers 0.
+/// ⭐ FINDING THE LOOP IS THE DROPPABLE MECHANISM `getParentOfType` HAS FOR FREE; not finding it is
+/// this island's version of `DT_CHECK_MSG(loop_op && isa<LoopTy>(loop_op), "expected valid loop")`
+/// (`:213`).
+fn loop_nest_level(outer_loop: ForRef, scope: &[Op]) -> i64 {
+    /// The count of enclosing `sentient.for`s at the point `outer_loop` is found, if it is here.
+    fn find(outer_loop: ForRef, scope: &[Op], enclosing: i64) -> Option<i64> {
+        for op in scope {
+            if let Op::Sentient(inner) = op {
+                if let sentient::Op::For { iv, .. } = inner
+                    && *iv == outer_loop.0
+                {
+                    return Some(enclosing);
+                }
+                // ⭐ ONLY A `sentient.for` COUNTS — `getParentOfType<LoopTy>` skips every other
+                // enclosing op, `affine.for` included.
+                let deeper = enclosing + i64::from(matches!(inner, sentient::Op::For { .. }));
+                for region in sentient::regions(inner) {
+                    if let Some(level) = find(outer_loop, region, deeper) {
+                        return Some(level);
+                    }
+                }
+            }
+            if let Op::AffineFor(loop_op) = op
+                && let Some(level) = find(outer_loop, &loop_op.body, enclosing)
+            {
+                return Some(level);
+            }
+        }
+        None
+    }
+    match find(outer_loop, scope, 0) {
+        Some(level) => level,
+        None => todo!(
+            "getLoopNestLevel<sentient::ForOp>: {outer_loop:?} is not in the body this descriptor \
+             was dumped against, so the walk to its parents has nowhere to start \
+             (dcc/src/Utils/Utils.cpp:213)"
+        ),
+    }
+}
+
 /// `outer_loop.getIterOperands()[iter_arg_index]` — the loop named by its induction variable, then
 /// the initial value of the one carried entry that index picks out.
 fn iter_operand(outer_loop: ForRef, iter_arg_index: IterArgIndex, scope: &[Op]) -> Option<Val> {
@@ -193,6 +379,51 @@ mod unit_tests {
     use super::*;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType};
+    use crate::transform::sentient::analyses::OutOfScopeEvaluator;
+
+    /// `%base = sentient.scalar_sub %c, %arg` inside a loop that carries `%base` back — the shape
+    /// e552 matches, with the pieces the ladder reads at the positions it reads them.
+    fn toggle_body(yielded: Val) -> Vec<Op> {
+        vec![
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: 4096,
+                result: Val(1),
+                reg_locale: RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(2),
+                bound: Val(0),
+                bound_reg: None,
+                carried: vec![Carried {
+                    init: Val(1),
+                    arg: Val(3),
+                    result: Val(4),
+                    reg: Reg {
+                        locale: RegType::Lbr,
+                        index: None,
+                    },
+                    program_header: false,
+                    element_size: None,
+                }],
+                dbg_name: None,
+                body: vec![
+                    Op::Sentient(sentient::Op::ScalarSub {
+                        lhs: Val(1),
+                        rhs: Val(3),
+                        result: Val(5),
+                        reg: None,
+                        element_size: None,
+                        ty: ScalarTy::Index,
+                    }),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![yielded],
+                    }),
+                ],
+            }),
+        ]
+    }
 
     /// The resolution IS the ported half, so the seam it stops at names the value it resolved.
     #[test]
@@ -233,5 +464,43 @@ mod unit_tests {
         };
         let regions: [&[Op]; 1] = [&body];
         let _evaluated = toggle.init(&body, Definitions::from_innermost(&regions));
+    }
+
+    /// 552/656 — the whole ladder passes on the vendor's shape and stops at the evaluator: the sub of
+    /// a constant and a loop-carried arg, the loop's outermost constant initialization, the yield
+    /// operand being the sub itself and its one other use.
+    #[test]
+    #[should_panic(expected = "evaluateValue")]
+    fn e552_matches_a_sub_of_a_constant_and_the_iter_arg_the_loop_yields_back() {
+        let body = toggle_body(Val(5));
+        let regions: [&[Op]; 2] = [&body[1..], &body];
+        let defs = Definitions::from_innermost(&regions);
+        let _desc = ToggleDescriptor::new(Val(5), defs, &mut OutOfScopeEvaluator);
+    }
+
+    /// A loop that yields something ELSE back is `invalidate()`, not a toggle — and the fields the
+    /// walk had already filled are cleared with it.
+    #[test]
+    fn e552_invalidates_when_the_loop_does_not_yield_the_base_address_back() {
+        let body = toggle_body(Val(3));
+        let regions: [&[Op]; 2] = [&body[1..], &body];
+        let defs = Definitions::from_innermost(&regions);
+        assert_eq!(
+            ToggleDescriptor::new(Val(5), defs, &mut OutOfScopeEvaluator),
+            ToggleDescriptor::default()
+        );
+    }
+
+    /// 553/656 — an invalid toggle dumps its one indented line and nothing else, which is the whole
+    /// branch that does not reach the out-of-scope `operator<<`.
+    #[test]
+    fn e553_dumps_invalid_and_stops() {
+        let regions: [&[Op]; 1] = [&[]];
+        let dumped = ToggleDescriptor::default().dump(
+            &[],
+            Definitions::from_innermost(&regions),
+            &mut OutOfScopeEvaluator,
+        );
+        assert_eq!(dumped, "Toggle Descriptor:\n\tInvalid\n");
     }
 }

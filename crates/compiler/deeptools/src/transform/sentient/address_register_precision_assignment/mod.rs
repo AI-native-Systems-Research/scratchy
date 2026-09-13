@@ -83,12 +83,17 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::dialects::{
     self, Op, UniformRegions, Val, sentient, symbol, uniform,
 };
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::workload::Workload;
 
 /// `-dcc-address-register-precision-assignment-const-commoning`, `cl::init(false)`.
 ///
@@ -1123,16 +1128,267 @@ fn op_at_mut<'a>(id: &OpId, scope: &'a mut [Op]) -> Option<&'a mut Op> {
     None
 }
 
-// crustify:todo: e554_runOnOperation
-//   authority : dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:449  (100 body lines, level 4)
-//   original  : void AddressRegisterPrecisionAssignmentPass::runOnOperation()
-//   calls     : e019_initializePrecision, e252_size, e428_addToWorkListAndAssignPrecision, e494_processAddressSSAValue
+/// Replaces: e554_runOnOperation
+///
+/// Gives every op of a load/store unit a precision slot, seeds the transfers' own element sizes,
+/// walks each one upward through the addressing chain and writes the result back as `element_size`
+/// and `element_sizes` (`:449-546`).
+///
+/// ⛔ PER UNIT AND NOT PER MODULE, unlike the reference's one `assignments_`: an [`OpId`] is a
+/// position within ONE body, so two units would collide on a key. Nothing crosses a unit — a value
+/// is bound where it is used — so only the order of the units' drains differs.
+/// ⛔ THE `sentient.for` ENTRY 0 (`bound`) HAS NOWHERE TO GO, this island keeping one
+/// [`sentient::Carried`] slot per carried value; see [`write_element_sizes`].
+/// ⭐ THE `stringToSenComponents` MISS IS A TYPE HERE — [`GenericComp`] is closed.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+) -> Vec<PrecisionFailure> {
+    let mut failures = Vec::new();
+    for unit in program.units.iter_mut() {
+        // `is_any_of(senCompToGenericComp.at(..), L0LU, L0SU, LXLU, LXSU, L3LU, L3SU)` (`:453-464`).
+        if !matches!(
+            unit.on.kind().generic(),
+            GenericComp::L0lu
+                | GenericComp::L0su
+                | GenericComp::Lxlu
+                | GenericComp::Lxsu
+                | GenericComp::L3lu
+                | GenericComp::L3su
+        ) {
+            continue;
+        }
+        failures.extend(run_on_unit(unit, values));
+    }
+    failures
+}
+
+/// ONE UNIT'S FOUR PHASES — the initialising walk, the seeding, the drain and the writeback
+/// (`:466-546`), each of which the reference runs over every collected unit in turn.
+fn run_on_unit<A: Arch>(unit: &mut ProgramUnit<A>, values: &mut Values) -> Vec<PrecisionFailure> {
+    // "we cannot merge the initial_ops calculation with adding it to worklist because the use of
+    // load/stores may not be already initialized because of preorder walk" (`:469-471`).
+    let mut assignments = PrecisionAssignments::default();
+    let mut seeds = Vec::new();
+    initialize_and_collect(&mut assignments, &unit.body, &[], 0, &mut seeds);
+
+    // ⭐ THE COLLECTED POSITIONS SURVIVE THIS LOOP: `assignPrecisionHelper` inserts only for a
+    // `scalar_copy` of a constant (`:110-140`) and every seed names a transfer.
+    let mut worklist = AddressWorklist::default();
+    for (at, val, element_size) in seeds {
+        let outcome = assignments.add_to_worklist_and_assign_precision(
+            &mut unit.body,
+            values,
+            &mut worklist,
+            val,
+            element_size,
+            &at,
+        );
+        if matches!(
+            outcome,
+            PrecisionAssigned::UnknownParentOp | PrecisionAssigned::DifferentPrecisions { .. }
+        ) {
+            assignments.failures.push(PrecisionFailure { val, outcome });
+        }
+    }
+
+    // `while (!worklist_.empty()) { .. if (failed(..)) { signalPassFailure(); break; } }` (`:525-531`).
+    while let Some(val) = worklist.pop() {
+        if assignments.process_address_ssa_value(&mut unit.body, values, &mut worklist, val)
+            == AddressWalk::NotALoopArgument
+        {
+            // ⭐ THE SAME FACT [`PrecisionAssigned::UnknownParentOp`] NAMES — a region argument of
+            // something that is not a `sentient.for` is the walk's only failure (`:437`).
+            assignments.failures.push(PrecisionFailure {
+                val,
+                outcome: PrecisionAssigned::UnknownParentOp,
+            });
+            break;
+        }
+    }
+
+    write_back(&assignments, &mut unit.body, &[], 0);
+    assignments.failures
+}
+
+/// `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp, LoadAndExtractScalarOp,
+/// LoadComputeAndSendOp, CopyOp, ForOp, IfOp, AddOp, SubOp, UniformizeRegionsOp>(op)` (`:474-480`).
+///
+/// ⛔ `uniform.uniformize_regions` IS THIS RUNG'S [`UniformRegions`] SPELLING, as it is for e494: the
+/// shared [`uniform::Op`] one holds the rung below's ops and carries no `element_sizes` at all.
+fn takes_a_precision_slot(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Sentient(
+            sentient::Op::LoadAndSend { .. }
+                | sentient::Op::ReceiveAndStore { .. }
+                | sentient::Op::LoadAndStore { .. }
+                | sentient::Op::LoadAndExtractScalar { .. }
+                | sentient::Op::LoadComputeAndSend { .. }
+                | sentient::Op::ScalarCopy { .. }
+                | sentient::Op::For { .. }
+                | sentient::Op::If { .. }
+                | sentient::Op::ScalarAdd { .. }
+                | sentient::Op::ScalarSub { .. }
+        ) | Op::UniformRegions(UniformRegions::UniformizeRegions { .. })
+    )
+}
+
+/// WHAT ONE TRANSFER SEEDS THE WORKLIST WITH — its own results and the element size the address
+/// arithmetic behind them is counted in (`:499-521`), in the reference's own order.
+///
+/// ⛔ THE **SRC** WIDTH FOR A `load_compute_and_send`: *"the src_element_size indicates how the
+/// address should be calculated"* (`:515-516`).
+fn transfer_seeds(op: &Op) -> Vec<(Val, Bits)> {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { result, extent, .. }
+            | sentient::Op::ReceiveAndStore { result, extent, .. },
+        ) => vec![(*result, extent.element_size)],
+        Op::Sentient(sentient::Op::LoadAndStore { results, extent, .. }) => vec![
+            (results.0, extent.element_size),
+            (results.1, extent.element_size),
+        ],
+        Op::Sentient(sentient::Op::LoadAndExtractScalar {
+            addr_result,
+            data_result,
+            element_size,
+            ..
+        }) => vec![(*addr_result, *element_size), (*data_result, *element_size)],
+        Op::Sentient(sentient::Op::LoadComputeAndSend {
+            result,
+            src_element_size,
+            ..
+        }) => vec![(*result, *src_element_size)],
+        _ => Vec::new(),
+    }
+}
+
+/// THE PREORDER WALK OF `:472-486`, in [`bound_slot`]'s numbering so that the keys it writes are the
+/// ones every later phase looks up.
+fn initialize_and_collect(
+    assignments: &mut PrecisionAssignments,
+    scope: &[Op],
+    prefix: &[u32],
+    base: usize,
+    seeds: &mut Vec<(OpId, Val, Bits)>,
+) {
+    for (position, op) in scope.iter().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(u32::try_from(base + position).unwrap_or_default());
+        if takes_a_precision_slot(op) {
+            let at = OpId::at(&path);
+            assignments.initialize_precision(at.clone(), op);
+            seeds.extend(
+                transfer_seeds(op)
+                    .into_iter()
+                    .map(|(val, size)| (at.clone(), val, size)),
+            );
+        }
+        let mut region_base = 0usize;
+        for region in dialects::regions_ref(op) {
+            initialize_and_collect(assignments, region, &path, region_base, seeds);
+            region_base += region.len();
+        }
+    }
+}
+
+/// `record.first->setAttr(..)` FOR EVERY ASSIGNMENT (`:534-545`), re-deriving each position from the
+/// body as it now stands rather than from a key taken before the drain inserted anything.
+fn write_back(
+    assignments: &PrecisionAssignments,
+    scope: &mut [Op],
+    prefix: &[u32],
+    base: usize,
+) {
+    for (position, op) in scope.iter_mut().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(u32::try_from(base + position).unwrap_or_default());
+        if let Some(slots) = assignments.slots(&OpId::at(&path)) {
+            write_element_sizes(op, slots);
+        }
+        let mut region_base = 0usize;
+        for region in dialects::regions_mut(op) {
+            write_back(assignments, region, &path, region_base);
+            region_base += region.len();
+        }
+    }
+}
+
+/// ONE OP'S SLOTS AS THIS ISLAND'S TYPED FIELDS — `element_sizes` for the three region ops the
+/// reference always writes an array on, `element_size` for the single-slot rest (`:535-544`).
+///
+/// ⛔ A `sentient.for`'S ENTRY 0 IS DROPPED AND ITS TWO REMAINING SLOTS SHARE ONE FIELD.
+/// [`sentient::Carried::element_size`] is *"this loop's `element_sizes` collapsed to one slot per
+/// carried value"*, which the iter arg's slot fills and the result's slot backs up — the reference
+/// assigns both off the same walk. The `bound` slot has no field to reach, and no reader of this
+/// island asks for it.
+/// ⛔ THE FIVE TRANSFERS GET NOTHING WRITTEN: their slots hold the element size THEY seeded the
+/// worklist with, which is already a typed field of the op ([`sentient::Extent::element_size`],
+/// `element_size`, `src_element_size`), so the attribute the reference sets there restates the op.
+fn write_element_sizes(op: &mut Op, slots: &[Option<Bits>]) {
+    let slot = |k: usize| slots.get(k).copied().flatten();
+    match op {
+        Op::Sentient(sentient::Op::For { carried, .. }) => {
+            // `[iv, iter_args…, results…]` — iter arg `i` at `1 + i`, result `i` at `1 + n + i`.
+            let offset = 1 + carried.len();
+            for (i, entry) in carried.iter_mut().enumerate() {
+                entry.element_size = slot(1 + i).or_else(|| slot(offset + i));
+            }
+        }
+        Op::Sentient(sentient::Op::If { yielded, .. }) => {
+            for (i, entry) in yielded.iter_mut().enumerate() {
+                entry.element_size = slot(i);
+            }
+        }
+        Op::UniformRegions(UniformRegions::UniformizeRegions { yielded, .. }) => {
+            for (i, entry) in yielded.iter_mut().enumerate() {
+                entry.element_size = slot(i);
+            }
+        }
+        Op::Sentient(
+            sentient::Op::ScalarAdd { element_size, .. }
+            | sentient::Op::ScalarSub { element_size, .. }
+            | sentient::Op::ScalarCopy { element_size, .. },
+        ) => *element_size = slot(0),
+        // The five transfers and every op no walk keyed — see this function's note.
+        _ => {}
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::{Dd2, Elements};
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType};
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::islands::sentient::dialects::sentient::{
+        Carried, Extent, Reg, RegType, ShuffleMode,
+    };
+    use crate::units::DfirUnit;
+
+    /// A model and a rung, so the program is typed; nothing this pass reads is on either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
 
     fn constant(value: i64, result: Val) -> Op {
         Op::Sentient(sentient::Op::ScalarConstant {
@@ -1417,5 +1673,86 @@ mod unit_tests {
             assignments.process_address_ssa_value(&mut body, &mut values, &mut worklist, Val(99)),
             AddressWalk::NotALoopArgument
         );
+    }
+
+    /// A unit whose `load_and_send` reads its mutable address off an `add` in an addressing
+    /// register — the four constants around it are all on the skip list.
+    fn transfer_unit(on: DfirUnit) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(on, Val(100)),
+            precision: None,
+            body: vec![
+                constant(0, Val(1)),
+                constant(0, Val(2)),
+                constant(0, Val(3)),
+                Op::Sentient(sentient::Op::ScalarAdd {
+                    lhs: Val(1),
+                    rhs: Val(1),
+                    result: Val(4),
+                    reg: Some(Reg {
+                        locale: RegType::Lar,
+                        index: None,
+                    }),
+                    ty: ScalarTy::Index,
+                    element_size: None,
+                }),
+                Op::Sentient(sentient::Op::LoadAndSend {
+                    mutable_addr: Val(4),
+                    immutable_addr: Val(2),
+                    increment: Val(3),
+                    consumer: SendEnd::to_self(Val(100)),
+                    result: Val(5),
+                    extent: Extent {
+                        total_elements: Elements(64),
+                        element_size: Bits(16),
+                        chunk_size: Elements(1),
+                        chunk_stride: Elements(1),
+                        burst_size: Elements(1),
+                    },
+                    interleaved_group: Elements(0),
+                    rotate_val: None,
+                    dir: None,
+                    shuffle_mode: ShuffleMode::NoShuffle,
+                    reg: Reg {
+                        locale: RegType::Lar,
+                        index: None,
+                    },
+                    dbg_name: None,
+                }),
+            ],
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// The `element_size` of the add that computes an address, off the transfer that consumes it.
+    fn add_element_size(unit: &ProgramUnit<Dd2>) -> Option<Bits> {
+        match &unit.body[3] {
+            Op::Sentient(sentient::Op::ScalarAdd { element_size, .. }) => *element_size,
+            other => panic!("the fixture's add moved: {other:?}"),
+        }
+    }
+
+    /// 554/656 — the transfer's own element size reaches the add that computes its address and is
+    /// written back onto it; a unit that is neither a load nor a store half is not walked at all.
+    #[test]
+    fn e554_writes_the_transfers_element_size_onto_the_address_add_of_a_load_unit() {
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(transfer_unit(DfirUnit::L0lu), vec![transfer_unit(DfirUnit::Pe)]),
+            bound: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+
+        let failures = run_on_operation(&mut program, &mut values);
+
+        let mut units = program.units.iter();
+        assert_eq!(add_element_size(units.next().unwrap()), Some(Bits(16)));
+        assert_eq!(add_element_size(units.next().unwrap()), None);
+        assert!(failures.is_empty(), "{failures:?}");
     }
 }

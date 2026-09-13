@@ -160,6 +160,7 @@ fn nest(
                     locale: sen::RegType::Unknown,
                     index: None,
                 },
+                element_size: None,
             })
             .collect(),
         dbg_name: None,
@@ -480,6 +481,7 @@ mod unit_tests {
                 .map(|result| sen::Yielded {
                     result: *result,
                     reg: unknown,
+                    element_size: None,
                 })
                 .collect::<Vec<_>>()
         };

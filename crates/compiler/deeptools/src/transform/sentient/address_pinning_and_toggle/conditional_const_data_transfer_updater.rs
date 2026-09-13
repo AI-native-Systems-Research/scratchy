@@ -399,6 +399,7 @@ mod unit_tests {
                     locale: RegType::Lbr,
                     index: None,
                 },
+                element_size: None,
             }],
             dbg_name: None,
             then_body,

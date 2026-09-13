@@ -171,6 +171,7 @@ fn local_region(out: &mut String, region: &LocalRegion, depth: usize) {
 
 #[cfg(test)]
 mod unit_tests {
+    use crate::formats::Bits;
     use crate::islands::dataflow_ir::dialects::{self as lower, Val, uniform as lower_uniform};
     use crate::islands::sentient::dialects::{LocalRegion, Op, UniformRegions, sentient, uniform};
     use crate::islands::sentient::print::emit;
@@ -235,5 +236,41 @@ mod unit_tests {
             ),
             "{got}"
         );
+    }
+
+    /// ⭐ ONE `element_sizes` ENTRY PER RESULT ON AN `if`, WITH NO LEADING `bound` SLOT — the array
+    /// its readers index by the plain result number (`LowerSentientHelper.cpp:806`), written by
+    /// `AddressRegisterPrecisionAssignment` (e554).
+    #[test]
+    fn an_if_prints_one_element_size_per_result() {
+        let reg = sentient::Reg {
+            locale: sentient::RegType::Lar,
+            index: None,
+        };
+        let op = Op::Sentient(sentient::Op::If {
+            predicate: sentient::CmpPredicate::Eq,
+            lhs: Val(1),
+            rhs: Val(2),
+            yielded: vec![
+                sentient::Yielded {
+                    result: Val(3),
+                    reg,
+                    element_size: Some(Bits(16)),
+                },
+                sentient::Yielded {
+                    result: Val(4),
+                    reg,
+                    element_size: None,
+                },
+            ],
+            dbg_name: None,
+            then_body: Vec::new(),
+            else_body: Vec::new(),
+        });
+        let mut got = String::new();
+        emit(&mut got, &op, 0);
+        // ⭐ THE ISLAND'S OWN SPELLING OF THE ARRAY, THE SAME ONE `sentient.for` PRINTS — see
+        // `sentient::size_array`, whose `-1` is an absent slot.
+        assert!(got.contains("element_sizes = [16, -1]"), "{got}");
     }
 }

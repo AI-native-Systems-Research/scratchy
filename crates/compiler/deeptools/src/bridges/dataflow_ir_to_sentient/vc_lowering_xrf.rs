@@ -2461,6 +2461,7 @@ mod unit_tests {
                         locale: sentient::RegType::Unknown,
                         index: None,
                     },
+                    element_size: None,
                 })
                 .collect(),
             dbg_name: None,
@@ -2881,6 +2882,7 @@ pub fn create_if_op_with_return_value(if_op: &sen::Op, vals: &mut Values) -> Opt
                     }),
                 index: None,
             },
+            element_size: None,
         })
         .collect();
 
@@ -3909,6 +3911,7 @@ mod xrf_lowering_unit_tests {
                     locale: sentient::RegType::Lrf,
                     index: None,
                 },
+                element_size: None,
             }],
             dbg_name: Some("SCF-If #2".to_owned()),
             then_body: vec![sen::Op::Sentient(sentient::Op::Yield {

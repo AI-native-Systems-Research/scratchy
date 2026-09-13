@@ -720,10 +720,12 @@ mod unit_tests {
                 Yielded {
                     result: Val(3),
                     reg: unassigned(RegType::Jcr),
+                    element_size: None,
                 },
                 Yielded {
                     result: Val(4),
                     reg: unassigned(RegType::Lrf),
+                    element_size: None,
                 },
             ],
             dbg_name: None,

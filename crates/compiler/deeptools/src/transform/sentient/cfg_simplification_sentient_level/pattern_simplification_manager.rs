@@ -912,6 +912,7 @@ fn if_chain(levels: &[IfLevel], iv: Val, else_result: Val) -> Option<Op> {
             yielded: vec![sentient::Yielded {
                 result: level.result,
                 reg: UNKNOWN_LOCALE,
+                element_size: None,
             }],
             dbg_name: None,
             then_body: vec![yield_of(&[level.then_result])],
@@ -2717,6 +2718,7 @@ impl PatternSimplificationManager {
                     .map(|&result| sentient::Yielded {
                         result,
                         reg: UNKNOWN_LOCALE,
+                        element_size: None,
                     })
                     .collect(),
                 dbg_name: None,
@@ -3157,6 +3159,7 @@ mod unit_tests {
                     vec![Yielded {
                         result: Val(5),
                         reg: UNASSIGNED,
+                        element_size: None,
                     }],
                     vec![yield_op(vec![Val(6)])],
                 ),
@@ -3479,6 +3482,7 @@ mod unit_tests {
             yielded: vec![Yielded {
                 result: Val(4),
                 reg: UNKNOWN_LOCALE,
+                element_size: None,
             }],
             dbg_name: None,
             then_body: vec![yield_op(vec![Val(100)])],
@@ -3491,6 +3495,7 @@ mod unit_tests {
             yielded: vec![Yielded {
                 result: Val(2),
                 reg: UNKNOWN_LOCALE,
+                element_size: None,
             }],
             dbg_name: None,
             then_body: vec![yield_op(vec![Val(0)])],
@@ -3570,6 +3575,7 @@ mod unit_tests {
             yielded: vec![Yielded {
                 result: Val(5),
                 reg: UNKNOWN_LOCALE,
+                element_size: None,
             }],
             dbg_name: None,
             then_body: vec![yield_op(vec![Val(3)])],
@@ -3582,6 +3588,7 @@ mod unit_tests {
             yielded: vec![Yielded {
                 result: Val(2),
                 reg: UNKNOWN_LOCALE,
+                element_size: None,
             }],
             dbg_name: None,
             then_body: vec![yield_op(vec![Val(0)])],
@@ -3684,6 +3691,7 @@ mod unit_tests {
                 vec![Yielded {
                     result: Val(20),
                     reg: UNASSIGNED,
+                    element_size: None,
                 }],
                 vec![yield_op(vec![Val(21)])],
             ),
@@ -3795,6 +3803,7 @@ mod unit_tests {
                     vec![Yielded {
                         result: Val(20),
                         reg: UNASSIGNED,
+                        element_size: None,
                     }],
                     vec![yield_op(vec![Val(21)])],
                 ),
@@ -4014,6 +4023,7 @@ mod unit_tests {
                 yielded: vec![Yielded {
                     result: Val(1),
                     reg: UNKNOWN_LOCALE,
+                    element_size: None,
                 }],
                 dbg_name: None,
                 then_body: vec![yield_op(vec![Val(2)])],

@@ -1644,6 +1644,13 @@ pub struct Yielded {
     pub result: Val,
     /// Where it lives.
     pub reg: Reg,
+    /// This result's slot of the `element_sizes` ARRAY, `None` being the reference's `-1`.
+    ///
+    /// ⛔ ONE SLOT PER RESULT AND NO ENTRY 0 — `sentient.if` has no `bound`, so the array its two
+    /// readers index is `getResultNumber()`-aligned (`Conversion/SentientToProgIR/
+    /// LowerSentientHelper.cpp:806`, `:1075`, both of which take `[i]` for an `IfOp` parent and
+    /// `[i + 1]` for a `ForOp` one). `AddressRegisterPrecisionAssignment` (e554) is its writer.
+    pub element_size: Option<Bits>,
 }
 
 /// ONE COMPUTE OPERAND'S WHOLE DESCRIPTION — the six attributes that repeat per operand.
@@ -3272,6 +3279,15 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 attr("regLocales", &locale_array(yielded.iter().map(|y| y.reg))),
                 attr("regIndices", &index_array(yielded.iter().map(|y| y.reg))),
             ];
+            // ⭐ ONE ENTRY PER RESULT AND NO LEADING SLOT — an `if` has no `bound`, so its readers
+            // index `element_sizes` by the plain result number (`LowerSentientHelper.cpp:806`). ⛔ THE
+            // WHOLE ATTRIBUTE IS ABSENT UNTIL A SLOT IS FILLED, as on `sentient.for` above.
+            if yielded.iter().any(|y| y.element_size.is_some()) {
+                attrs.push(attr(
+                    "element_sizes",
+                    &size_array(yielded.iter().map(|y| y.element_size)),
+                ));
+            }
             if let Some(name) = dbg_name {
                 attrs.push(attr("dbgName", &quoted(name)));
             }

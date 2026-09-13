@@ -531,6 +531,7 @@ mod unit_tests {
                         locale: sentient::RegType::Lrf,
                         index: Some(sentient::RegIndex::at::<2>()),
                     },
+                    element_size: None,
                 }],
                 dbg_name: None,
                 then_body: vec![Op::Sentient(sentient::Op::Yield { results: vec![g1] })],
@@ -565,10 +566,12 @@ mod unit_tests {
                 sentient::Yielded {
                     result: chosen,
                     reg: unassigned,
+                    element_size: None,
                 },
                 sentient::Yielded {
                     result: Val(8),
                     reg: unassigned,
+                    element_size: None,
                 },
             ]
         );
@@ -819,6 +822,7 @@ fn grow_if(
         yielded.push(sentient::Yielded {
             result: values.mint(),
             reg: unassigned,
+            element_size: None,
         });
     }
     maps.results

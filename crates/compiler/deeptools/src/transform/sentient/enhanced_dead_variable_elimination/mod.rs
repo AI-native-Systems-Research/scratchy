@@ -1348,6 +1348,7 @@ mod unit_tests {
                 locale,
                 index: None,
             },
+            element_size: None,
         };
         let mut scope = vec![Op::Sentient(sentient::Op::If {
             predicate: CmpPredicate::Eq,

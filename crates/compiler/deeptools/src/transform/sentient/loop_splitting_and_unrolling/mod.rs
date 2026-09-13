@@ -1944,6 +1944,7 @@ mod unit_tests {
                                 locale: RegType::Lrf,
                                 index: None,
                             },
+                            element_size: None,
                         }],
                         dbg_name: None,
                         // The `then` branch reads the induction variable and the `else` branch does

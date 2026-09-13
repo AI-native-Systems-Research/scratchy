@@ -353,6 +353,7 @@ impl NestedIf {
                             locale: sen::RegType::Unknown,
                             index: None,
                         },
+                        element_size: None,
                     }],
                     dbg_name: conjunct.dbg_name,
                     then_body: nest,
@@ -764,6 +765,7 @@ fn one_if(
                     locale: sen::RegType::Unknown,
                     index: None,
                 },
+                element_size: None,
             }],
             dbg_name: dbg_name.map(str::to_owned),
             then_body: vec![SenOp::Sentient(sen::Op::Yield {
@@ -846,6 +848,8 @@ fn clone_if(op: &SenOp, values: &mut dfir::Values, mapping: &mut dfir::ValueMapp
                     sen::Yielded {
                         result: fresh,
                         reg: one.reg.clone(),
+                        // ⭐ `Operation::clone` COPIES EVERY ATTRIBUTE, `element_sizes` INCLUDED.
+                        element_size: one.element_size,
                     }
                 })
                 .collect();
@@ -1537,6 +1541,7 @@ mod unit_tests {
             yielded: vec![sen::Yielded {
                 result: Val(22),
                 reg: unknown,
+                element_size: None,
             }],
             dbg_name: Some("IfOp #1".to_owned()),
             then_body: vec![
@@ -1547,6 +1552,7 @@ mod unit_tests {
                     yielded: vec![sen::Yielded {
                         result: Val(23),
                         reg: unknown,
+                        element_size: None,
                     }],
                     dbg_name: Some("IfOp #1".to_owned()),
                     then_body: vec![SenOp::Sentient(sen::Op::Yield {
@@ -1597,6 +1603,7 @@ mod unit_tests {
                         locale: sen::RegType::Unknown,
                         index: None,
                     },
+                    element_size: None,
                 }],
                 dbg_name: None,
                 then_body: vec![SenOp::Sentient(sen::Op::Yield {
@@ -1859,6 +1866,7 @@ mod unit_tests {
                         locale: sen::RegType::Unknown,
                         index: None,
                     },
+                    element_size: None,
                 }],
                 dbg_name: None,
                 then_body: vec![SenOp::Sentient(sen::Op::Yield {
@@ -1920,6 +1928,7 @@ mod unit_tests {
                             locale: sen::RegType::Unknown,
                             index: None,
                         },
+                        element_size: None,
                     }],
                     dbg_name: None,
                     then_body: vec![SenOp::Sentient(sen::Op::Yield {
@@ -2199,6 +2208,7 @@ mod unit_tests {
                 locale: sen::RegType::Unknown,
                 index: None,
             },
+            element_size: None,
         }
     }
 

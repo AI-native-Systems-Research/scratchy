@@ -172,9 +172,13 @@ pub(crate) mod toggle_descriptor;
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::arch::Arch;
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, UniformRegions, Val, dataflow, sentient, uniform,
 };
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::workload::Workload;
 use crate::transform::sentient::analyses::{
     EvAddressInfo, EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites,
 };
@@ -541,6 +545,32 @@ impl ToggleSub {
     #[must_use]
     pub const fn result(self) -> Val {
         self.0
+    }
+
+    /// `toggle_sub_.getInp1Mutable().assign(v)` (`:2003`, `:2041`) — the CONSTANT TERM operand of the
+    /// toggle's own `scalar_sub`, which both toggle updaters re-point at the new `c1`.
+    ///
+    /// ⛔ `$inp1` AND NOT `$inp2`: the toggle is `X = c1 - Y` with `c1` first and the loop's iter arg
+    /// second (`:2660-2662`), so writing `$inp2` would replace the carried half.
+    /// ⛔ FALSE WHERE THE SUB IS NOT IN `scope` — `DT_CHECK_MSG(toggle_sub_, "expected valid
+    /// toggle_sub")` (`:2002`) is the type's existence, but an op the caller cannot reach is a
+    /// different failure and the caller names it.
+    #[must_use]
+    pub fn set_inp1(self, scope: &mut [Op], val: Val) -> bool {
+        for op in scope.iter_mut() {
+            if let Op::Sentient(sentient::Op::ScalarSub { lhs, result, .. }) = op
+                && *result == self.0
+            {
+                *lhs = val;
+                return true;
+            }
+            for region in dialects::regions_mut(op) {
+                if self.set_inp1(region, val) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1699,20 +1729,107 @@ impl AddressPinningAndTogglePass {
     }
 }
 
-// crustify:todo: e547_getMin
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:235  (4 body lines, level 4)
-//   original  : const EvaluatedValue &getMin() override
-//   calls     : e278_isValid, e485_getX
+impl ToggleDescriptor {
+    /// Replaces: e547_getMin
+    ///
+    /// The lower of the two constants the base address alternates between —
+    /// `evaluateMinMax({&getX(), &getY()}, compute_min = true)` (`:235-238`), `Y` being
+    /// [`ToggleDescriptor::init`].
+    ///
+    /// ⛔ `None` IS `DT_CHECK(isValid())` (`:236`), the same encoding as [`Self::c1`]; the `?` after it
+    /// is unreachable and is there only because [`Self::x`] answers an [`Option`].
+    /// ⛔ `getX()` IS EVALUATED FIRST AND IT EVALUATES `getInit()` ITSELF — a braced init list is
+    /// sequenced left to right, so an evaluator that interns in call order sees `X`'s operands before
+    /// `Y`, and swapping the two lines would renumber its arena.
+    #[must_use]
+    pub fn min(
+        &self,
+        evaluator: &mut impl ExpressionEvaluator,
+        body: &[Op],
+        defs: Definitions<'_>,
+    ) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let x = self.x(evaluator, body, defs)?;
+        let y = self.init(body, defs);
+        Some(evaluator.evaluate_min_max(&[x, y], MinMax::Min))
+    }
 
-// crustify:todo: e548_getMax
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:240  (4 body lines, level 4)
-//   original  : const EvaluatedValue &getMax() override
-//   calls     : e278_isValid, e485_getX
+    /// Replaces: e548_getMax
+    ///
+    /// The higher of the same pair (`:240-243`) — `compute_min = false` and nothing else; see
+    /// [`ToggleDescriptor::min`] for the `None` and for why `X` is evaluated first.
+    #[must_use]
+    pub fn max(
+        &self,
+        evaluator: &mut impl ExpressionEvaluator,
+        body: &[Op],
+        defs: Definitions<'_>,
+    ) -> Option<EvaluatedValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let x = self.x(evaluator, body, defs)?;
+        let y = self.init(body, defs);
+        Some(evaluator.evaluate_min_max(&[x, y], MinMax::Max))
+    }
+}
 
-// crustify:todo: e549_runOn
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1187  (12 body lines, level 4)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e489_cleanup
+impl AddressPinningAndTogglePass {
+    /// Replaces: e549_runOn
+    ///
+    /// Runs the pass over every program unit of one module, then canonicalises every query map the
+    /// rewrites left behind (`:1187-1198`).
+    ///
+    /// ⛔ NAMED FOR ITS ARGUMENT: `runOn(ModuleOp)` and `runOn(dataflow::ProgramUnitOp)` (e656) are one
+    /// C++ overload set and cannot both be `run_on` here.
+    /// ⭐ `new DominanceInfo(unit)` / `delete dom_info_` IS THE MECHANISM FOR REACHING OPERANDS, which
+    /// the campaign names droppable — the per-unit `runOn` is handed the unit and asks for dominance
+    /// where it needs it.
+    pub fn run_on_program<A: Arch, M: Model, W: Workload>(&mut self, program: &mut Program<A, M, W>) {
+        for unit in program.units.iter_mut() {
+            self.cleanup();
+            self.run_on_unit(unit);
+        }
+
+        // THE CLEANUP WALK (`:1194-1197`) — every `uniform.query_map` in the module, the preamble
+        // included, since a walk from the module op reaches both.
+        let mut simplify = |op: &Op| {
+            if matches!(op, Op::Uniform(uniform::Op::QueryMap { .. })) {
+                todo!(
+                    "dcc::uniform::utils::simplifyQueryMapWithSameTarget \
+                     (Dialect/Uniform/Utils.cpp:1263) — out of campaign scope; bridge 2 ports it at \
+                     the DataflowIR rung as the private `simplify_query_map_with_same_target`"
+                )
+            }
+        };
+        walk_pre_order(&program.preamble, &mut simplify);
+        for unit in program.units.iter() {
+            walk_pre_order(&unit.body, &mut simplify);
+        }
+    }
+
+    /// `runOn(dataflow::ProgramUnitOp)` — entry 656, level 12, not yet ported.
+    fn run_on_unit<A: Arch>(&mut self, unit: &mut ProgramUnit<A>) -> ! {
+        let _ = unit;
+        todo!(
+            "e656_runOn(dataflow::ProgramUnitOp) — the L3LU/L3SU gate, the per-unit descriptor \
+             collection and the toggle rewrite (AddressPinningAndToggle.cpp:1337)"
+        )
+    }
+}
+
+/// `Operation::walk<WalkOrder::PreOrder>` OVER A REGION — the op itself before its own regions, which
+/// is the order [`AddressPinningAndTogglePass::run_on_program`]'s second walk asks for.
+fn walk_pre_order(scope: &[Op], visit: &mut impl FnMut(&Op)) {
+    for op in scope {
+        visit(op);
+        for region in dialects::regions_ref(op) {
+            walk_pre_order(region, visit);
+        }
+    }
+}
 
 // crustify:todo: e587_getMin
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:749  (4 body lines, level 5)
@@ -1805,6 +1922,10 @@ mod unit_tests {
     use crate::transform::sentient::analyses::{
         Evaluation, OffsetSites, OutOfScopeEvaluator, RegionSite,
     };
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
     use crate::transform::sentient::{ForRef, IterArgIndex};
     use crate::units::Residency;
 
@@ -3074,5 +3195,108 @@ mod unit_tests {
         assert!(pass.immut_data_transfer_descriptors.descriptors.is_empty());
         assert!(pass.mut_data_transfer_descriptors.descriptors.is_empty());
         assert!(pass.ev_addr_info_list.is_empty());
+    }
+
+    /// A model and a rung, so a program is typed; nothing this pass reads is on either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// The loop [`matched_toggle`] names: `%7` is its induction variable, and the iter arg at index 1
+    /// starts at the constant `%1` — which is the `Y` both ends of the pair fold `X` against.
+    fn toggled_loop() -> Vec<Op> {
+        let carried = |init, arg, result| sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: Reg {
+                locale: RegType::Lbr,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        };
+        vec![
+            scalar_const(1, 4096),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(7),
+                bound: Val(0),
+                bound_reg: None,
+                carried: vec![
+                    carried(Val(0), Val(8), Val(9)),
+                    carried(Val(1), Val(10), Val(11)),
+                ],
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+        ]
+    }
+
+    /// 547/656 — the lower end is folded from `X` and `Y`, and `getX()` resolves `getInit()` on the way:
+    /// the loop's own constant initializer, whose EVALUATION is the out-of-scope seam this stops at.
+    #[test]
+    #[should_panic(expected = "constant iter arg init Val(1)")]
+    fn e547_min_folds_x_against_the_loops_constant_init() {
+        let body = toggled_loop();
+        let regions: [&[Op]; 1] = [&body];
+        let _min = matched_toggle().min(
+            &mut OutOfScopeEvaluator,
+            &body,
+            Definitions::from_innermost(&regions),
+        );
+    }
+
+    /// 548/656 — `DT_CHECK(isValid())` (`:236`, `:241`) IS the `None`, and it is one encoding for both
+    /// ends: an invalidated toggle answers neither a max nor a min, and asks the evaluator nothing.
+    #[test]
+    fn e548_max_and_min_answer_nothing_for_an_invalidated_toggle() {
+        let mut toggle = matched_toggle();
+        toggle.invalidate();
+        let regions: [&[Op]; 1] = [&[]];
+        let defs = Definitions::from_innermost(&regions);
+        assert_eq!(toggle.max(&mut OutOfScopeEvaluator, &[], defs), None);
+        assert_eq!(toggle.min(&mut OutOfScopeEvaluator, &[], defs), None);
+    }
+
+    /// 549/656 — the module walk clears the pass's accumulated state and hands each program unit to the
+    /// per-unit `runOn`, which is entry 656 and not this worklist's.
+    #[test]
+    #[should_panic(expected = "e656_runOn(dataflow::ProgramUnitOp)")]
+    fn e549_hands_each_program_unit_to_the_per_unit_pass() {
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::L0lu, Val(100)),
+                    precision: None,
+                    body: Vec::new(),
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+
+        AddressPinningAndTogglePass::default().run_on_program(&mut program);
     }
 }
