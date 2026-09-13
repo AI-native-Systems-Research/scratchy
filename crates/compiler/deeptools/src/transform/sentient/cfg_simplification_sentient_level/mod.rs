@@ -87,10 +87,12 @@
 //! | `e288_createTableEntryAtIdx` | 288 | 1 | 4 | `dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:517` |
 //! | `e594_runOnOperation` | 594 | 5 | 201 | `dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:713` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
-// file's own tests until `e594_runOnOperation` (level 5) lands and something calls it. CI runs clippy
-// with `-D warnings`, so without this the first ported leaf of a 32-unit module fails the gate.
-// ⭐ REMOVE THIS WITH e594: at that point an unused item here is a real defect again.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET: `e594_runOnOperation` is ported, but nothing calls
+// it, so every item below is reachable only from this file's own tests. CI runs clippy with
+// `-D warnings`, so without this the module fails the gate.
+// ⭐ THE CONDITION IS PIPELINE WIRING, NOT e594 — the note here used to say e594 would discharge it,
+// and it does not: every sibling pass module whose entry is ported (`remove_redundant_conditionals`
+// included) still carries this allow for the same reason.
 #![allow(dead_code)]
 
 use core::num::NonZeroI64;
@@ -98,10 +100,18 @@ use core::ops::{AddAssign, Mul, Sub, SubAssign};
 
 pub(crate) mod pattern_simplification_manager;
 
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::{Op, Val};
-use pattern_simplification_manager::OpPath;
+use crate::islands::sentient::Program;
+use crate::islands::sentient::dialects::{self as ir, Op, Val, sentient};
+use crate::model::Model;
+use crate::workload::Workload;
+use pattern_simplification_manager::{
+    CondNode, EncodingIfOpCount, IvDim, IvValuesAndFilters, LeafSink, LoopCloning, LoopInfo, Mark,
+    Marks, OpPath, PatternSimplificationManager, TreeSeam,
+};
+use std::collections::BTreeMap;
 
 /// `EnableNonZeroStrideSeqSimplifications` (`:76-80`) — *"Allow replacing fixed non-zero stride
 /// sequences of values yielded by conditionals with iterator arguments."*, `cl::init(false)`.
@@ -112,6 +122,15 @@ use pattern_simplification_manager::OpPath;
 /// `false` `padTableSlice` pads to the slice's own maximum instead of 3 (`:2422-2423`) and never asks
 /// for a monotone slot (`:2437-2440`), so both branches fold away rather than going unread.
 pub(crate) const ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS: bool = false;
+
+/// `DisableThisPass` (`:66-69`) — `cl::init(false)`, so the pass SHIPS LIVE.
+pub(crate) const DISABLE_THIS_PASS: bool = false;
+
+/// `EnableDeadBranchRemoval` (`:83-88`) — `cl::init(false)`, so a node that is not a candidate for
+/// RESULT-based simplification gets no table at all and its dead branches are never removed
+/// (`:750-752`). ⭐ IT DOES NOT DISABLE THE CLEANUP: a branch e031 marks dead on a node that IS a
+/// candidate is still erased at the end of the round.
+pub(crate) const ENABLE_DEAD_BRANCH_REMOVAL: bool = false;
 
 // ── THE FILE'S VALUE VOCABULARY ─────────────────────────────────────────────────────────────────
 //
@@ -847,10 +866,444 @@ pub(crate) struct Builders<'a> {
     pub(crate) values: &'a mut Values,
 }
 
-// crustify:todo: e594_runOnOperation
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:713  (201 body lines, level 5)
-//   original  : void CFGSimplificationSentientLevelPass::runOnOperation()
-//   calls     : e027_print, e278_isValid, e422_insert, e515_getOrCreateTupleForIV, e555_findPatternsAndSimplify
+/// ONE CANDIDATE NODE, AS MUCH OF `dcc::CFGSCondNode` AS THE WALK READS.
+///
+/// ⛔ `Analyses/CFGSSentientLevelConditionalTree.*` IS OUT OF CAMPAIGN SCOPE — `OUTSIDE-UNITS.tsv`
+/// names it for this very unit — so every predicate the tree computes arrives ANSWERED rather than
+/// guessed at, the same reading [`ExpressionEvaluator`] and [`Leaf`] already make of `Analyses/`.
+/// ⭐ `isLeaf()`, `isThenNode()` AND `isElseNode()` (`:743-745`) NEED NO FIELD: in this projection a
+/// then/else node IS a `Branch` and a leaf is a `Branch` with no child, so being a [`CondNode`] at all
+/// is what those three tests select.
+pub(crate) struct Candidate {
+    /// The node — `getLhs()`, `getRhsVal()`, `getOperation()` and its two branches.
+    pub(crate) node: CondNode,
+    /// `n->isValid() && n->isCandidateForProcessing()` (`:742-743`).
+    pub(crate) valid_candidate_for_processing: bool,
+    /// `n->isCandidateForSimplification()` (`:752`, `:843`).
+    pub(crate) candidate_for_simplification: bool,
+    /// `n->isAncestorLHSInTheSubtree()` (`:758`).
+    pub(crate) ancestor_lhs_in_the_subtree: bool,
+    /// `n->doesTableExceedMaxSize()` (`:766`).
+    pub(crate) table_exceeds_max_size: bool,
+    /// `n->getLhsInSubtree()` (`:792`), in the tree's own order.
+    pub(crate) lhs_in_subtree: Vec<Val>,
+    /// `n->getResultTypes()` (`:833`) — EMPTY IS A CONDITIONAL THAT YIELDS NOTHING, which still gets a
+    /// table so its dead branches can be removed.
+    pub(crate) result_types: Vec<ScalarTy>,
+    /// `n->getLhs().getType()` (`:839`) — the table's predicate type.
+    pub(crate) predicate_type: ScalarTy,
+    /// `n->getNumLeavesInSubtree()`, which [`TreeSeam`] carries into e555.
+    pub(crate) num_leaves_in_subtree: i64,
+}
+
+/// WHAT ONE `tree.compute()` ANSWERS FOR ONE PROGRAM UNIT.
+pub(crate) struct ComputedTree {
+    /// The nodes `CFGSCondNode::walk<kPreOrder>(tree.getRoot(), ..)` visits (`:855`), OUTERMOST FIRST.
+    /// ⭐ EMPTY IS `tree.empty()` (`:729`).
+    pub(crate) candidates: Vec<Candidate>,
+    /// `tree.getLhsToForOpOrNull()` (`:837`) — ⭐ AND `getOrCreateTupleForIV`'s answer (`:794`, `:820`),
+    /// which is the map that call populates.
+    pub(crate) lhs_to_for_op_or_null: BTreeMap<Val, LoopInfo>,
+}
+
+/// THE OUT-OF-SCOPE CONDITIONAL TREE AS A SEAM — a struct of closures for the same reason
+/// [`TreeSeam`] and [`LoopCloning`] are: the caller supplies the analysis's answers, and nothing here
+/// computes them.
+pub(crate) struct ConditionalTree<'a> {
+    /// `CFGSSentientLevelConditionalTree tree(*unit_op); tree.compute(); tree.reorderTreeIfLinear();`
+    /// plus the pre-order walk of `tree.getRoot()` (`:727-736`, `:855`).
+    pub(crate) compute: &'a mut dyn FnMut(&[Op]) -> ComputedTree,
+    /// `tree.replaceIfOpWithOneBranch(if_op, region)` (`:875`, `:881`) — inlines that region where the
+    /// conditional was, leaving the now-unread `sentient.if` for this pass to erase.
+    pub(crate) replace_if_op_with_one_branch: &'a mut dyn FnMut(&mut Vec<Op>, &OpPath, IfRegion),
+    /// `tree.compute(); tree.removeDuplicateConditionals()` on a tree REBUILT after the last round
+    /// (`:893-896`).
+    pub(crate) remove_duplicate_conditionals: &'a mut dyn FnMut(&mut Vec<Op>),
+    /// `n->setNoCandidatesForAllSubtreeNodes()`, on the candidate at that path.
+    pub(crate) set_no_candidates: &'a mut dyn FnMut(&OpPath),
+    /// `simplifySubtree(n, ..)`, answering how many leaves that root has left.
+    pub(crate) simplify_subtree: &'a mut dyn FnMut(&mut Vec<Op>, &OpPath) -> i64,
+    /// `tree.isForOpToAvoidNewIterArgs(for_op)`.
+    pub(crate) for_ops_to_avoid_new_iter_args: &'a [OpPath],
+    /// `createSentientForOpWithAdditionalIterArgs` (e393, not ported) — see [`LoopCloning`].
+    pub(crate) clone_for_op: &'a mut dyn FnMut(&mut Vec<Op>, &OpPath, &[(Val, Val)]) -> OpPath,
+}
+
+/// Replaces: e594_runOnOperation
+///
+/// THE PASS ENTRY (`:713-913`): per program unit, rounds of — build the conditional tree, populate one
+/// candidate subtree's table of yielded values, simplify the patterns found in it, then erase every
+/// conditional the round marked dead — until a round clones no outer loop.
+///
+/// ⚠️ TRAP: `Mark::Processed` OUTLIVES A ROUND (set at `:849`, removed only at `:906`), which is what
+/// stops a later round redoing a node. ⚠️ DIVERGENCE: the walk is restarted over a recomputed tree
+/// whenever a rewrite moved the positions the remaining candidates are named by — see the body.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload, E: ExpressionEvaluator>(
+    program: &mut Program<A, M, W>,
+    values: &mut Values,
+    query_maps: &mut Vec<Op>,
+    tree: &mut ConditionalTree<'_>,
+    fresh_evaluator: &mut impl FnMut() -> E,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    // `OpBuilder const_builder(unit_op); const_builder.setInsertionPointToStart(unit_op->getBlock())`
+    // (`:718-719`) — the block the `dataflow.program_unit` SITS IN, which is the preamble here.
+    // `query_map_builder` is `getLocalOrGlobalRegion(n->getOperation())` (`:835-836`), which CAN be a
+    // region of the body being rewritten; one `&mut` cannot be handed out twice, so it is the
+    // caller's — exactly what `analyses::OffsetSites::query_maps` states for the same pair.
+    let Program {
+        preamble, units, ..
+    } = program;
+    'units: for unit in units.iter_mut() {
+        // The op markers of `:42-50` — pass-local, and they outlive the manager instance that set them.
+        let mut marks = Marks::default();
+        // `int encoding_if_op_count_ = 0` (`:710`) — THE PASS'S counter, borrowed by every instance.
+        let mut encoding_if_op_count = EncodingIfOpCount(0);
+        // `do { .. } while (for_loop_cloned);` (`:722-892`).
+        loop {
+            // `ExpressionEvaluator evaluator;` (`:724`) — A FRESH ONE PER ROUND: the last round
+            // rewrote the body, so anything it memoised about a value is stale.
+            let mut evaluator = fresh_evaluator();
+            let mut for_loop_cloned = false;
+            let mut computed = (tree.compute)(&unit.body);
+            if computed.candidates.is_empty() {
+                // `if (tree.empty()) return;` (`:729`) returns from the WALK LAMBDA, so it abandons
+                // this unit's remaining rounds, its cleanup AND its flag removal.
+                continue 'units;
+            }
+            // `CFGSCondNode::walk<kPreOrder>(tree.getRoot(), computeTableAndSimplify)` (`:855`).
+            'walk: loop {
+                let mut rewritten = false;
+                {
+                    let ComputedTree {
+                        candidates,
+                        lhs_to_for_op_or_null,
+                    } = &mut computed;
+                    for candidate in candidates.iter_mut() {
+                        // `if (for_loop_cloned || !n->isValid() || !n->isCandidateForProcessing() ||
+                        // n->isLeaf() || n->isThenNode() || n->isElseNode()) return nullptr;`
+                        // (`:741-745`). ⭐ `dcc::CFGSCondNode *parent = n->getParentNode();` (`:746`)
+                        // IS DEAD IN THE REFERENCE — assigned and never read.
+                        if for_loop_cloned || !candidate.valid_candidate_for_processing {
+                            continue;
+                        }
+                        // `!EnableDeadBranchRemoval && !n->isCandidateForSimplification()` (`:750-752`).
+                        if !ENABLE_DEAD_BRANCH_REMOVAL && !candidate.candidate_for_simplification {
+                            continue;
+                        }
+                        // `n->isAncestorLHSInTheSubtree()` (`:758`) — the table would be missing what
+                        // the ancestor predicates fixed, so it may be wrong.
+                        if candidate.ancestor_lhs_in_the_subtree {
+                            continue;
+                        }
+                        let at = candidate.node.op.clone();
+                        // `hasAttr(PROCESSED_SIMPLIFICATIONS) || hasAttr(TO_DELETE)` (`:760-764`).
+                        if marks.has(Mark::Processed, at.path())
+                            || marks.has(Mark::ToDelete, at.path())
+                        {
+                            continue;
+                        }
+                        // `n->doesTableExceedMaxSize()` (`:766-769`).
+                        if candidate.table_exceeds_max_size {
+                            continue;
+                        }
+                        // `ivs_to_values_and_filters` (`:786-789`), a `std::map` ordered by
+                        // `compare_values` (`:771-781`): the IVs' loops outermost first.
+                        // ⛔ THE COMPARATOR IS THE KEY, so two IVs whose loops sit at the SAME nest
+                        // level compare EQUIVALENT — `insert` (`:812-813`) drops the second while
+                        // `table_size` (`:815`) still multiplies by its trip count, leaving a table
+                        // with holes that `is_full` then refuses.
+                        let mut dims: Vec<(i64, Val, i64)> = Vec::new();
+                        let mut table_size: i64 = 1;
+                        let mut one_iteration = false;
+                        for &lhs in &candidate.lhs_in_subtree {
+                            // `DT_CHECK_MSG(num_iterations > 0, ..)` (`:794-796`) over
+                            // `getOrCreateTupleForIV`, whose miss is `{nullptr,-1,-1,-1,-1}`.
+                            let Some(info) = lhs_to_for_op_or_null
+                                .get(&lhs)
+                                .filter(|info| info.iterations > 0)
+                            else {
+                                panic!(
+                                    "DT_CHECK(num_iterations > 0) Expect a nonzero number of \
+                                     iterations of loop. \
+                                     (`CFGSimplificationSentientLevel.cpp:794`): {lhs:?}"
+                                )
+                            };
+                            // `if (num_iterations == 1) return nullptr;` (`:797-806`) — one possible
+                            // value of the IV, and a conditional this pass simplifies has to have at
+                            // least two branches.
+                            if info.iterations == 1 {
+                                one_iteration = true;
+                                break;
+                            }
+                            let level = nest_level(&unit.body, info.for_op.as_ref());
+                            if !dims.iter().any(|&(seen, _, _)| seen == level) {
+                                dims.push((level, lhs, info.iterations));
+                            }
+                            table_size *= info.iterations;
+                        }
+                        if one_iteration {
+                            continue;
+                        }
+                        dims.sort_by_key(|&(level, _, _)| level);
+                        // `ivs_dimensions_multipliers` (`:817-830`): each dimension's multiplier is the
+                        // product of the trip counts INSIDE it.
+                        let mut multiplier = table_size;
+                        let mut ivs_dimensions_multipliers = Vec::new();
+                        for &(_, iv, iterations) in &dims {
+                            multiplier /= iterations;
+                            ivs_dimensions_multipliers.push(IvDim {
+                                iv,
+                                dimension: iterations,
+                                multiplier,
+                            });
+                        }
+                        // `n->getResultTypes().empty() ? const_builder.getIndexType() : ..front()`
+                        // (`:832-834`).
+                        let table_type = candidate
+                            .result_types
+                            .first()
+                            .copied()
+                            .unwrap_or(ScalarTy::Index);
+                        let mut table = Table::new(
+                            TableSize(usize::try_from(table_size).unwrap_or_default()),
+                            candidate.predicate_type,
+                            table_type,
+                        );
+                        let mut ivs = IvValuesAndFilters::of(
+                            dims.iter().map(|&(_, iv, iterations)| (iv, iterations)),
+                        );
+                        // `PatternSimplificationManager instance(..)` (`:837-842`).
+                        let mut instance = PatternSimplificationManager {
+                            lhs_to_for_op_or_null: lhs_to_for_op_or_null.clone(),
+                            ivs_dimensions_multipliers: ivs_dimensions_multipliers.clone(),
+                            marks: core::mem::take(&mut marks),
+                            encoding_if_op_count,
+                            ..PatternSimplificationManager::default()
+                        };
+                        // `instance.populateTable(n, ivs_to_values_and_filters)` (`:843-847`), whose
+                        // leaf handler is e431 writing into the table this instance then owns.
+                        {
+                            let mut sink = LeafSink {
+                                ivs_dimensions_multipliers: &ivs_dimensions_multipliers,
+                                lhs_to_for_op_or_null,
+                                table: &mut table,
+                            };
+                            instance.populate_table(
+                                &mut candidate.node,
+                                &mut ivs,
+                                &mut |leaf, ivs| {
+                                    sink.process_leaf(leaf, ivs, 0, &mut Vec::new(), &mut evaluator)
+                                },
+                            );
+                        }
+                        instance.table = Some(table);
+                        // `n->getOperation()->setAttr(PROCESSED_SIMPLIFICATIONS, i32 1)` (`:849-850`) —
+                        // BEFORE any simplification, and it outlives the round.
+                        instance.marks.set(Mark::Processed, at.path());
+                        // `if (n->isCandidateForSimplification()) if (instance.hasFullTable())` (`:852`)
+                        // — `hasFullTable()` IS `table_->isFull()` (`:1093`), and a table with a hole
+                        // means the predicates did not cover the IVs' whole range.
+                        if candidate.candidate_for_simplification
+                            && instance.table.as_ref().is_some_and(Table::is_full)
+                        {
+                            let before = unit.body.clone();
+                            let mut set_no_candidates = || (tree.set_no_candidates)(&at);
+                            let mut seam = TreeSeam {
+                                num_leaves_in_subtree: candidate.num_leaves_in_subtree,
+                                set_no_candidates: &mut set_no_candidates,
+                                simplify_subtree: &mut *tree.simplify_subtree,
+                            };
+                            let mut cloning = LoopCloning {
+                                for_ops_to_avoid_new_iter_args: tree.for_ops_to_avoid_new_iter_args,
+                                clone: &mut *tree.clone_for_op,
+                            };
+                            let mut builders = Builders {
+                                consts: &mut *preamble,
+                                query_maps: &mut *query_maps,
+                                values: &mut *values,
+                            };
+                            for_loop_cloned = instance.find_patterns_and_simplify(
+                                &mut unit.body,
+                                &candidate.node,
+                                &mut seam,
+                                &mut cloning,
+                                &mut builders,
+                                &mut evaluator,
+                            );
+                            rewritten = unit.body != before;
+                        }
+                        marks = core::mem::take(&mut instance.marks);
+                        encoding_if_op_count = instance.encoding_if_op_count;
+                        if rewritten {
+                            break;
+                        }
+                    }
+                }
+                if for_loop_cloned || !rewritten {
+                    break 'walk;
+                }
+                // ⚠️ DIVERGENCE: THE WALK IS RESTARTED OVER A RECOMPUTED TREE. The reference's nodes
+                // are `Operation *` and survive a sibling insertion; a candidate here is a POSITION,
+                // and e555's rewrite moved every position after the one it rewrote. `Mark::Processed`
+                // is already set on every node this walk handled, so the restarted walk skips exactly
+                // those and reaches the same set of nodes the reference's single walk does.
+                computed = (tree.compute)(&unit.body);
+                if computed.candidates.is_empty() {
+                    break 'walk;
+                }
+            }
+            // `unit_op.walk<PreOrder>` collecting every marked `sentient.if` (`:857-863`), then
+            // erasing them IN REVERSE so that no position still to be erased has moved (`:865-889`).
+            let doomed: Vec<OpPath> = if_paths(&unit.body)
+                .into_iter()
+                .filter(|at| {
+                    marks.has(Mark::ToDelete, at.path())
+                        || marks.has(Mark::DeadThenBranch, at.path())
+                        || marks.has(Mark::DeadElseBranch, at.path())
+                })
+                .collect();
+            for at in doomed.iter().rev() {
+                if marks.has(Mark::DeadThenBranch, at.path()) {
+                    (tree.replace_if_op_with_one_branch)(&mut unit.body, at, IfRegion::Else);
+                } else if marks.has(Mark::DeadElseBranch, at.path()) {
+                    (tree.replace_if_op_with_one_branch)(&mut unit.body, at, IfRegion::Then);
+                }
+                erase_conditional(&mut unit.body, at);
+            }
+            if !for_loop_cloned {
+                break;
+            }
+        }
+        // `tree.compute(); tree.removeDuplicateConditionals()` (`:893-896`) — duplicate side-effect-free
+        // siblings, on a tree rebuilt after the last round.
+        (tree.remove_duplicate_conditionals)(&mut unit.body);
+        // `if_op->removeAttr(PROCESSED_SIMPLIFICATIONS); if_op->removeAttr(TABLE_TOO_LARGE)`
+        // (`:904-908`). ⭐ THE MARKS ARE PASS-LOCAL (see [`Mark`]) and go with the unit, so this states
+        // the reference's effect rather than being the only thing that discharges it.
+        for at in if_paths(&unit.body) {
+            marks.take(Mark::Processed, at.path());
+            marks.take(Mark::TableTooLarge, at.path());
+        }
+    }
+}
+
+/// Every `sentient.if` of a body, PRE-ORDER — `unit_op.walk<WalkOrder::PreOrder>(..)` (`:858`, `:905`).
+fn if_paths(body: &[Op]) -> Vec<OpPath> {
+    fn collect(body: &[Op], at: &mut Vec<(u32, u32)>, region: u32, out: &mut Vec<OpPath>) {
+        for (index, op) in body.iter().enumerate() {
+            at.push((region, index as u32));
+            if matches!(op, Op::Sentient(sentient::Op::If { .. })) {
+                out.push(OpPath::at(at));
+            }
+            for (sub_region, sub) in ir::regions_ref(op).into_iter().enumerate() {
+                collect(sub, at, sub_region as u32, out);
+            }
+            at.pop();
+        }
+    }
+    let mut out = Vec::new();
+    collect(body, &mut Vec::new(), 0, &mut out);
+    out
+}
+
+/// `dcc::utils::getLoopNestLevel<sentient::ForOp>(for_op)` (`Utils/Utils.cpp:211-220`) over a POSITION:
+/// how many `sentient.for`s enclose the loop, the outermost answering 0.
+///
+/// ⛔ THE `None`s ARE ALL ONE STOP — `DT_CHECK_MSG(loop_op && isa<LoopTy>(loop_op), "expected valid
+/// loop")` (`:213`), which is what a null tuple entry or a path naming something else reaches.
+fn nest_level(body: &[Op], for_op: Option<&OpPath>) -> i64 {
+    fn level_of(body: &[Op], steps: &[(u32, u32)]) -> Option<i64> {
+        let mut scope = body;
+        let mut level = 0;
+        for (depth, &(_, index)) in steps.iter().enumerate() {
+            let op = scope.get(index as usize)?;
+            let is_loop = matches!(op, Op::Sentient(sentient::Op::For { .. }));
+            if depth + 1 == steps.len() {
+                return is_loop.then_some(level);
+            }
+            // ⭐ ONLY A `sentient.for` COUNTS: `getParentOfType<LoopTy>` skips every other enclosing
+            // op, `affine.for` and `uniform.uniformize_regions` included.
+            level += i64::from(is_loop);
+            scope = ir::regions_ref(op)
+                .into_iter()
+                .nth(steps[depth + 1].0 as usize)?;
+        }
+        None
+    }
+    match for_op.and_then(|for_op| level_of(body, for_op.path())) {
+        Some(level) => level,
+        None => panic!(
+            "DT_CHECK(loop_op && isa<LoopTy>(loop_op)) expected valid loop \
+             (`dcc/src/Utils/Utils.cpp:213`): {for_op:?} names no `sentient.for` of this unit"
+        ),
+    }
+}
+
+/// `DT_CHECK_MSG(if_op.use_empty(), ..); if_op->erase()` (`:885-888`) — the conditional whose surviving
+/// branch has just been inlined in its place.
+fn erase_conditional(body: &mut Vec<Op>, at: &OpPath) {
+    let read = op_ref(body, at.path())
+        .map(ir::results)
+        .is_some_and(|results| results.iter().any(|result| is_read(body, *result)));
+    if read {
+        panic!(
+            "DT_CHECK(if_op.use_empty()) Expect conditional marked for deletion to have no uses. \
+             (`CFGSimplificationSentientLevel.cpp:885`): {at:?} is still read"
+        )
+    }
+    if let Some((block, index)) = block_of(body, at)
+        && index < block.len()
+    {
+        block.remove(index);
+    }
+}
+
+/// The op those steps name — `Operation *` as the position this module's [`OpPath`] states.
+fn op_ref<'a>(body: &'a [Op], steps: &[(u32, u32)]) -> Option<&'a Op> {
+    let mut scope = body;
+    for (depth, &(_, index)) in steps.iter().enumerate() {
+        let op = scope.get(index as usize)?;
+        if depth + 1 == steps.len() {
+            return Some(op);
+        }
+        scope = ir::regions_ref(op)
+            .into_iter()
+            .nth(steps[depth + 1].0 as usize)?;
+    }
+    None
+}
+
+/// The block an op sits in and its position in it — `Operation::getBlock()`, for an erase.
+fn block_of<'a>(body: &'a mut Vec<Op>, at: &OpPath) -> Option<(&'a mut Vec<Op>, usize)> {
+    let (&(region, index), under) = at.path().split_last()?;
+    if under.is_empty() {
+        return Some((body, index as usize));
+    }
+    let mut scope: &mut Vec<Op> = body;
+    for (depth, &(_, step)) in under.iter().enumerate() {
+        let op = scope.get_mut(step as usize)?;
+        let next = if depth + 1 == under.len() {
+            region as usize
+        } else {
+            under[depth + 1].0 as usize
+        };
+        scope = ir::regions_mut(op).into_iter().nth(next)?;
+    }
+    Some((scope, index as usize))
+}
+
+/// `Value::use_empty()` for one result of the op being erased.
+fn is_read(body: &[Op], val: Val) -> bool {
+    body.iter().any(|op| {
+        ir::operands(op).contains(&val)
+            || ir::regions_ref(op)
+                .into_iter()
+                .any(|region| is_read(region, val))
+    })
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -1183,5 +1636,150 @@ mod unit_tests {
         assert_eq!(second.ev(), None);
         assert_eq!(second.block, Some(block));
         assert!(table.is_full());
+    }
+
+    /// e594 — one round over two candidates: the 2-iteration one is analysed, its dead then-branch is
+    /// marked by `populate_table` and the round's cleanup erases the conditional through the tree
+    /// seam; the 1-iteration one bails at `:797` and is left exactly as it was.
+    #[test]
+    fn e594_erases_the_marked_conditional_and_leaves_the_one_iteration_candidate_alone() {
+        use crate::arch::Dd2;
+        use crate::generated::OpFunc;
+        use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+        use crate::islands::sentient::{ProgramUnit, ProgramUnits};
+        use crate::units::DfirUnit;
+        use pattern_simplification_manager::Branch;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct AnyModel;
+        impl Model for AnyModel {
+            const QUERY_HEADS: u32 = 32;
+            const KV_HEADS: u32 = 8;
+            const HEAD_DIM: u32 = 64;
+            const HIDDEN: u32 = 2048;
+            const LAYERS: u32 = 40;
+            const FFN: u32 = 8192;
+            const VOCAB: u32 = 49152;
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct AnyRung;
+        impl Workload for AnyRung {
+            const ROWS: u32 = 1;
+            const ACTIVE_CAP: u32 = 64;
+        }
+
+        fn conditional(lhs: Val, rhs: Val) -> Op {
+            Op::Sentient(sentient::Op::If {
+                predicate: sentient::CmpPredicate::Eq,
+                lhs,
+                rhs,
+                yielded: Vec::new(),
+                dbg_name: None,
+                then_body: Vec::new(),
+                else_body: Vec::new(),
+            })
+        }
+
+        fn loop_over(iv: Val, bound: Val, body: Vec<Op>) -> Op {
+            Op::Sentient(sentient::Op::For {
+                iv,
+                bound,
+                bound_reg: None,
+                carried: Vec::new(),
+                dbg_name: None,
+                body,
+            })
+        }
+
+        let (iv_a, iv_b, rhs) = (Val(10), Val(11), Val(12));
+        // `sentient.for %iv { sentient.if %iv == %rhs }`, twice.
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(0)),
+                    precision: None,
+                    body: vec![
+                        loop_over(iv_a, Val(1), vec![conditional(iv_a, rhs)]),
+                        loop_over(iv_b, Val(2), vec![conditional(iv_b, rhs)]),
+                    ],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let at_a = OpPath::at(&[(0, 0), (0, 0)]);
+        let at_b = OpPath::at(&[(0, 1), (0, 0)]);
+        let info = |for_op: &[(u32, u32)], iterations| LoopInfo {
+            for_op: Some(OpPath::at(for_op)),
+            lb: 0,
+            ub: iterations,
+            step: NonZeroI64::new(1).expect("one is not zero"),
+            iterations,
+        };
+        // ⭐ A's then-branch ARRIVES DEAD, which is `populate_table`'s `setAttr(DEAD_THEN_BRANCH)` at
+        // `:947` and the only thing the cleanup needs; B's loop runs ONCE, which is the `:797` bail.
+        let candidate = |lhs: Val, at: &OpPath, dead_then: bool| Candidate {
+            node: CondNode {
+                lhs,
+                rhs_val: 0,
+                op: at.clone(),
+                then_node: Branch {
+                    dead: dead_then,
+                    ..Branch::default()
+                },
+                else_node: Branch::default(),
+            },
+            valid_candidate_for_processing: true,
+            candidate_for_simplification: true,
+            ancestor_lhs_in_the_subtree: false,
+            table_exceeds_max_size: false,
+            lhs_in_subtree: vec![lhs],
+            result_types: Vec::new(),
+            predicate_type: ScalarTy::Int(1),
+            num_leaves_in_subtree: 2,
+        };
+        let computed = || ComputedTree {
+            candidates: vec![candidate(iv_b, &at_b, true), candidate(iv_a, &at_a, false)],
+            lhs_to_for_op_or_null: [(iv_a, info(&[(0, 0)], 1)), (iv_b, info(&[(0, 1)], 2))]
+                .into_iter()
+                .collect(),
+        };
+        let mut replaced: Vec<(OpPath, IfRegion)> = Vec::new();
+        let mut deduplicated = 0_u32;
+        let mut tree = ConditionalTree {
+            compute: &mut |_| computed(),
+            replace_if_op_with_one_branch: &mut |_, at, region| {
+                replaced.push((at.clone(), region));
+            },
+            remove_duplicate_conditionals: &mut |_| deduplicated += 1,
+            set_no_candidates: &mut |_| panic!("no candidate is simplified here"),
+            simplify_subtree: &mut |_, _| panic!("no subtree is simplified here"),
+            for_ops_to_avoid_new_iter_args: &[],
+            clone_for_op: &mut |_, at, _| at.clone(),
+        };
+        let mut values = Values::default();
+        let mut query_maps = Vec::new();
+        run_on_operation(
+            &mut program,
+            &mut values,
+            &mut query_maps,
+            &mut tree,
+            &mut StatedEvaluator::default,
+        );
+
+        // B's dead then-branch was replaced by its else region and the conditional erased; A's
+        // 1-iteration loop was never touched, so its conditional is still there.
+        assert_eq!(replaced, vec![(at_b, IfRegion::Else)]);
+        assert_eq!(deduplicated, 1);
+        let body = &program.units.iter_mut().next().expect("one unit").body;
+        assert_eq!(if_paths(body), vec![at_a]);
     }
 }

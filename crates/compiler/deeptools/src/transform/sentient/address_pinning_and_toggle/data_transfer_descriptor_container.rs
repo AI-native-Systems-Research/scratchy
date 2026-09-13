@@ -380,7 +380,7 @@ fn is_transfer(op: &Op) -> bool {
 /// index straight into `getResult(..)` (`:2239-2242`, `:2256-2257`) and into
 /// `getMutableAndImmutableAddr`, whose `{nullptr, nullptr}` then meets an `isa<BlockArgument>`
 /// (`:2215`). Both are the reference's own stop, so the two non-answers stay named stops here.
-fn mutable_addr_end(op: &Op, unit: DfirUnit, defs: Definitions<'_>) -> TransferEnd {
+pub(super) fn mutable_addr_end(op: &Op, unit: DfirUnit, defs: Definitions<'_>) -> TransferEnd {
     match op {
         // `return 0` for the three single-address ops, and `getAddrResultIdx()` for
         // `LoadAndExtractScalarOp`, whose ONE address is its [`TransferEnd::Src`] here.
@@ -535,6 +535,8 @@ mod unit_tests {
             base_addrs: Vec::new(),
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Val(0),
+            is_base_addr_mutable: false,
         }
     }
 

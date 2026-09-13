@@ -276,6 +276,8 @@ mod unit_tests {
             base_addrs: vec![init],
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Val(0),
+            is_base_addr_mutable: false,
         };
         let updater = IntegerSequenceDataTransferUpdater { iter_arg: Val(11) };
         {

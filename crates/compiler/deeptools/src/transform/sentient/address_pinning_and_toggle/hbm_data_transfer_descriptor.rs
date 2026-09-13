@@ -82,3 +82,16 @@
 //   original  : HBMDataTransferDescriptor::HBMDataTransferDescriptor( SenComponents comp, Operation &op, ExpressionEvaluator &evaluator, bool is_base_addr_mutable, int increment_via_burst, Operation *region_op, int region_num) : DataTransferDescriptor(comp, op, evaluator, region_op, region_num, is_base_addr_mutable
 //   calls     : e262_isLoopingChainMutableAddr, e278_isValid, e593_initializeDescriptor
 
+/// `total_chain_increment_` — the total mutable-address increment of a NON-LOOPING chain this
+/// transfer heads (`:861`, `using AddrTy = int64_t` at `:98`), zero when it heads none.
+///
+/// ⛔ ITS SIGN IS THE ONLY THING READ: `getMin` widens downward unless it is `> 0` and `getMax`
+/// widens upward unless it is `< 0` (`:829-855`), so a distinct type from [`BurstIncrement`] is what
+/// keeps the two out of each other's argument slot in `getMax`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+pub struct ChainIncrement(pub i64);
+
+/// `increment_via_burst_` — how far the burst dimension carries this HBM transfer's address past its
+/// pattern's own maximum (`:863`), zero for a transfer that does not burst.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+pub struct BurstIncrement(pub i32);

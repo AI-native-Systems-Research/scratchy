@@ -79,16 +79,20 @@
 //! | `e492_dump` | 492 | 3 | 28 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2521` |
 //! | `e593_initializeDescriptor` | 593 | 5 | 161 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2316` |
 
-// crustify:todo: e593_initializeDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2316  (161 body lines, level 5)
-//   original  : void DataTransferDescriptor::initializeDescriptor()
-//   calls     : e002_getAllConstants, e015_getInit, e016_ConditionalConstantDescriptor, e252_size, e278_isValid, e279_canBeSimplified, e280_IntegerSequenceDescriptor, e281_DiscreteIntegerSetDescriptor, e282_LoopingChainMutableAddrDescriptor, e407_getInit, e408_getAllConstants, e411_getInit, e414_getInit, e485_getX …
 
-use super::{BaseAddrList, PatternDescriptor, op_at, write_evaluated_value};
+use super::hbm_data_transfer_descriptor::{BurstIncrement, ChainIncrement};
+use super::data_transfer_descriptor_container::mutable_addr_end;
+use super::{
+    ASSERT_ON_UNEXPECTED_PATTERNS, BaseAddrList, ConditionalConstantDescriptor,
+    DiscreteIntegerSetDescriptor, HANDLE_CONDITIONAL_CONSTANTS, IntegerSequenceDescriptor,
+    LoopingChainMutableAddrDescriptor, PatternDescriptor, SimpleConstantDescriptor, ToggleDescriptor,
+    op_at, write_evaluated_value,
+};
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
-use crate::islands::sentient::dialects::Op;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient, symbol, uniform};
 use crate::islands::sentient::print;
 use crate::transform::sentient::analyses::{ExpressionEvaluator, RegionSite};
+use crate::transform::sentient::utils::{ConstKind, is_constant};
 use crate::units::DfirUnit;
 
 /// WHICH MEMORY THIS DESCRIPTOR'S ADDRESS LIVES IN — the pure virtual `getMemoryUnit()` (`:671`),
@@ -97,13 +101,21 @@ use crate::units::DfirUnit;
 ///
 /// ⭐ A FIELD, NOT TWO TYPES: `collectDataTransfers` (`:1400-1435`) pushes BOTH subclasses into the
 /// one `immut_data_transfer_descriptors_`, so descriptors in a single container disagree about it.
+/// ⛔ COMPARE [`Self::dfir_unit`], NEVER THIS ENUM: the `Hbm` arm carries the HBM subclass's own two
+/// private fields (`:861-863`), so two HBM descriptors are `!=` here while `getMemoryUnit()` says
+/// `HBM` for both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DescriptorMemoryUnit {
-    /// `LXDataTransferDescriptor` (`:806`).
+    /// `LXDataTransferDescriptor` (`:806`), which adds no state of its own.
     #[default]
     Lx,
-    /// `HBMDataTransferDescriptor` (`:827`).
-    Hbm,
+    /// `HBMDataTransferDescriptor` (`:827`) and the two increments only its overrides read.
+    Hbm {
+        /// `total_chain_increment_` (`:861`), the reference's `= 0` default.
+        total_chain_increment: ChainIncrement,
+        /// `increment_via_burst_` (`:863`), the reference's `= 0` default.
+        increment_via_burst: BurstIncrement,
+    },
 }
 
 impl DescriptorMemoryUnit {
@@ -113,7 +125,7 @@ impl DescriptorMemoryUnit {
     pub const fn dfir_unit(self) -> DfirUnit {
         match self {
             Self::Lx => DfirUnit::Lx,
-            Self::Hbm => DfirUnit::Hbm,
+            Self::Hbm { .. } => DfirUnit::Hbm,
         }
     }
 }
@@ -159,6 +171,19 @@ pub struct DataTransferDescriptor {
     /// `getMemoryUnit()` — which of the two subclasses this descriptor is (`:806`, `:827`), read by
     /// every `getMutableAndImmutableAddr(op, getMemoryUnit())` call. See [`DescriptorMemoryUnit`].
     pub memory_unit: DescriptorMemoryUnit,
+    /// `base_addr_` — the ORIGINAL SSA value carrying this transfer's address (`:779-781`), which the
+    /// subclass constructors take from `getMutableAndImmutableAddr(op, getMemoryUnit())` (`:2573`,
+    /// `:2591-2596`) and `getOriginalBaseAddrSSA()` (`:663-664`) hands back.
+    ///
+    /// ⛔ [`Self::initialize_descriptor`] REWRITES IT, through the `Value &` it takes (`:2317`): the
+    /// value stored afterwards is the one at the far end of the `sentient.scalar_copy` chain, and
+    /// `AbstractDataTransferUpdater::update` compares two descriptors' stored values (`:1775-1776`).
+    pub base_addr: Val,
+    /// `is_base_addr_mutable_` (`:787`) — whether [`Self::base_addr`] is the transfer's MUTABLE
+    /// address rather than its immutable one, the base constructor's own defaulted parameter
+    /// (`:637`, `= false`) that only `HBMDataTransferDescriptor` ever passes `true` (`:1414`,
+    /// `:1426`).
+    pub is_base_addr_mutable: bool,
 }
 
 impl DataTransferDescriptor {
@@ -287,15 +312,317 @@ impl DataTransferDescriptor {
     }
 }
 
+impl DataTransferDescriptor {
+    /// Replaces: e593_initializeDescriptor
+    ///
+    /// Recognises this transfer's base address, filling [`Self::pattern_desc`] and
+    /// [`Self::base_addrs`] with the first pattern that fits and a toggle as the fall-back
+    /// (`:2316-2467`).
+    ///
+    /// ⛔ THE COPY WALK IS A WRITE-BACK: `Value &base_addr = getOriginalBaseAddrSSA()` (`:2317`) is a
+    /// REFERENCE to the field, so stripping the `scalar_copy` chain changes what every later reader of
+    /// [`Self::base_addr`] sees.
+    /// ⛔ TWO ARMS FALL THROUGH TO THE TOGGLE rather than returning — an unrecognised block argument
+    /// (`:2437`) and an unrecognised `sentient.if` (`:2465`) both set the pattern to `None` and then
+    /// try a toggle; only the memory-op arm (`:2443`) leaves without one.
+    /// ⭐ `new`/`delete` PAIRS ARE THE `Option` ITSELF: the reference builds each candidate, keeps it
+    /// in `pattern_desc_` and frees it on failure, so a candidate that fails simply is not stored.
+    pub fn initialize_descriptor(
+        &mut self,
+        body: &[Op],
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) {
+        while let Some(Op::Sentient(sentient::Op::ScalarCopy { input, .. })) = defs.of(self.base_addr)
+        {
+            self.base_addr = *input;
+        }
+        let base_addr = self.base_addr;
+
+        // `if (dcc::utils::isSymbol(base_addr))` (`:2325-2328`).
+        if is_symbol(base_addr, defs) {
+            self.pattern_desc = None;
+            return;
+        }
+
+        // Case 1: the address is itself constant (`:2336-2343`).
+        if is_constant(base_addr, ConstKind::ScalarConstant, defs) {
+            let ev = evaluator.evaluate_value_handle(base_addr);
+            self.base_addrs.push(ev);
+            self.pattern_desc = Some(PatternDescriptor::SimpleConstant(SimpleConstantDescriptor {
+                ev,
+            }));
+            return;
+        }
+
+        // Case 2: `%base = scalar_add %c1, %c2`, `%c1` reached through its own copy chain
+        // (`:2345-2367`). ⛔ `%c2` IS EVALUATED FIRST, before that walk, and the sum is `%c1 + %c2`.
+        if let Some(Op::Sentient(sentient::Op::ScalarAdd { lhs, rhs, .. })) = defs.of(base_addr)
+            && is_constant(*rhs, ConstKind::ScalarConstant, defs)
+        {
+            let right_summand_ev = evaluator.evaluate_value_handle(*rhs);
+            let mut left_summand = *lhs;
+            while let Some(Op::Sentient(sentient::Op::ScalarCopy { input, .. })) =
+                defs.of(left_summand)
+            {
+                left_summand = *input;
+            }
+            if is_constant(left_summand, ConstKind::ScalarConstant, defs) {
+                let left_summand_ev = evaluator.evaluate_value_handle(left_summand);
+                let sum_ev = evaluator.evaluate_sum_handle(left_summand_ev, right_summand_ev);
+                self.base_addrs.push(sum_ev);
+                self.pattern_desc =
+                    Some(PatternDescriptor::SimpleConstant(SimpleConstantDescriptor {
+                        ev: sum_ev,
+                    }));
+                return;
+            }
+        }
+
+        if defs.of(base_addr).is_none() {
+            // `isa<BlockArgument>(base_addr)` (`:2377`) — an integer sequence, then a discrete
+            // integer set, then a looping chain if this is the mutable address (`:2378-2437`).
+            let isq_desc = IntegerSequenceDescriptor::new(base_addr, defs, evaluator);
+            if isq_desc.is_valid() {
+                isq_desc.get_all_constants(&mut self.base_addrs, evaluator);
+                self.pattern_desc = Some(PatternDescriptor::IntegerSequence(isq_desc));
+                return;
+            }
+            let dis_desc = DiscreteIntegerSetDescriptor::new(base_addr, defs, evaluator);
+            if dis_desc.is_valid() {
+                if let Some(init) = dis_desc.init() {
+                    self.base_addrs.push(init);
+                }
+                self.pattern_desc = Some(PatternDescriptor::DiscreteIntegerSet(dis_desc));
+                return;
+            }
+            if self.is_base_addr_mutable {
+                let Some(op) = op_at(&self.op, body) else {
+                    todo!(
+                        "initializeDescriptor: `op_` is at {:?}, which this unit body does not reach",
+                        self.op
+                    )
+                };
+                let end = mutable_addr_end(op, self.memory_unit.dfir_unit(), defs);
+                let lcma_desc =
+                    LoopingChainMutableAddrDescriptor::new(base_addr, end, body, defs, evaluator);
+                if lcma_desc.is_valid() {
+                    if let Some(init) = lcma_desc.init() {
+                        self.base_addrs.push(init);
+                    }
+                    self.pattern_desc = Some(PatternDescriptor::LoopingChainMutableAddr(lcma_desc));
+                    return;
+                }
+            }
+            self.pattern_desc = None;
+        } else if matches!(
+            defs.of(base_addr),
+            Some(Op::Sentient(
+                sentient::Op::ReceiveAndStore { .. }
+                    | sentient::Op::LoadAndSend { .. }
+                    | sentient::Op::LoadAndStore { .. }
+                    | sentient::Op::For { .. }
+            ))
+        ) {
+            // Part of a chain: the previous transfer owns the pattern (`:2438-2443`).
+            if !self.is_base_addr_mutable {
+                todo!(
+                    "initializeDescriptor: DT_CHECK_MSG(is_base_addr_mutable_, \"Do not expect \
+                     memory op result as immutable addr\") on {base_addr:?} (:2431-2432)"
+                )
+            }
+            return;
+        } else if HANDLE_CONDITIONAL_CONSTANTS
+            && matches!(defs.of(base_addr), Some(Op::Sentient(sentient::Op::If { .. })))
+        {
+            let cc_desc = ConditionalConstantDescriptor::new(base_addr, defs, evaluator);
+            if cc_desc.is_valid() {
+                cc_desc.get_all_constants(&mut self.base_addrs);
+                self.pattern_desc = Some(PatternDescriptor::ConditionalConstant(cc_desc));
+                return;
+            }
+            self.pattern_desc = None;
+        }
+
+        // The fall-back: a toggle, whose two constants are `X` and — unless it simplified away — `Y`
+        // (`:2452-2467`).
+        let toggle_desc = ToggleDescriptor::new(base_addr, defs, evaluator);
+        if ASSERT_ON_UNEXPECTED_PATTERNS && !toggle_desc.is_valid() {
+            todo!(
+                "initializeDescriptor: DT_CHECK(toggle_desc->isValid()) under \
+                 -dcc-address-pinning-and-toggle-assert on {base_addr:?} (:2454)"
+            )
+        }
+        if !toggle_desc.is_valid() {
+            return;
+        }
+        if let Some(x) = toggle_desc.x(evaluator, body, defs) {
+            self.base_addrs.push(x);
+        }
+        if !toggle_desc.can_be_simplified {
+            self.base_addrs.push(toggle_desc.init(body, defs));
+        }
+        self.pattern_desc = Some(PatternDescriptor::Toggle(toggle_desc));
+    }
+}
+
+/// `dcc::utils::isSymbol(val)` (`Analyses/Utils.cpp:141-154`) — the value, or ANY value of the
+/// `uniform.query_map` it reads, is a `symbol.create_symbol`.
+///
+/// ⛔ `any`, WHERE [`is_constant`]'s QUERY-MAP ARM IS `all`: one symbolic entry makes the whole
+/// address symbolic. ⭐ A block argument is `false`, which here is simply having no defining op.
+fn is_symbol(val: Val, defs: Definitions<'_>) -> bool {
+    let Some(def) = defs.of(val) else {
+        return false;
+    };
+    if let Op::Uniform(uniform::Op::QueryMap { map, .. }) = def
+        && let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(*map)
+        && pairs.iter().any(|(_, value)| {
+            matches!(
+                defs.of(*value),
+                Some(Op::Symbol(symbol::Op::CreateSymbol { .. }))
+            )
+        })
+    {
+        return true;
+    }
+    matches!(def, Op::Symbol(symbol::Op::CreateSymbol { .. }))
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{Reg, RegType};
     use crate::islands::sentient::dialects::{Val, symbol};
     use crate::transform::sentient::address_pinning_and_toggle::{
         SimpleConstantDescriptor, ToggleDescriptor,
     };
-    use crate::transform::sentient::analyses::{EvaluatedValue, OutOfScopeEvaluator};
+    use crate::transform::sentient::analyses::{
+        Evaluation, EvaluatedValue, OffsetSites, OutOfScopeEvaluator,
+    };
     use crate::transform::sentient::{ForRef, IterArgIndex};
+
+    /// An evaluator that answers for a CONSTANT and a SUM, which is everything e593 asks before it
+    /// reaches a pattern: the handle IS the value it names, so a sum's handle is the two added.
+    struct StatedEvaluator;
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, value: Val) -> Evaluation {
+            OutOfScopeEvaluator.evaluate_value(value)
+        }
+
+        fn evaluate_sum(&mut self, lhs: &Evaluation, rhs: &Evaluation) -> Evaluation {
+            OutOfScopeEvaluator.evaluate_sum(lhs, rhs)
+        }
+
+        fn build_offset_value(
+            &mut self,
+            evaluation: &Evaluation,
+            sites: &mut OffsetSites<'_>,
+            walked: &mut Vec<Op>,
+            ty: ScalarTy,
+        ) -> Val {
+            OutOfScopeEvaluator.build_offset_value(evaluation, sites, walked, ty)
+        }
+
+        fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+            EvaluatedValue(value.0)
+        }
+
+        fn evaluate_sum_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            EvaluatedValue(lhs.0 + rhs.0)
+        }
+    }
+
+    /// `%1 = 4096`, `%2 = copy %1`, `%3 = 64`, `%4 = %2 + %3`, and a symbol `%5`.
+    fn constants() -> Vec<Op> {
+        vec![
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: 4096,
+                result: Val(1),
+                reg_locale: RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Sentient(sentient::Op::ScalarCopy {
+                input: Val(1),
+                result: Val(2),
+                reg: Reg {
+                    locale: RegType::Lbr,
+                    index: None,
+                },
+                element_size: None,
+                program_header: false,
+            }),
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: 64,
+                result: Val(3),
+                reg_locale: RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Sentient(sentient::Op::ScalarAdd {
+                lhs: Val(2),
+                rhs: Val(3),
+                result: Val(4),
+                reg: None,
+                element_size: None,
+                ty: ScalarTy::Index,
+            }),
+            Op::Symbol(symbol::Op::CreateSymbol {
+                result: Val(5),
+                symbol_id: 7,
+                max_value: None,
+            }),
+        ]
+    }
+
+    /// 593/656 — a copy chain ending in a constant is a simple constant AND the walk is written back
+    /// into `base_addr_`; `%c1 + %c2` is the one summed constant, its own left-hand copy chain walked
+    /// without touching the field; a symbol is left with no pattern at all.
+    #[test]
+    fn e593_strips_the_copy_chain_and_recognises_both_simple_constant_shapes() {
+        let body = constants();
+        let scopes: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&scopes);
+        let initialized = |base_addr| {
+            let mut dtd = DataTransferDescriptor {
+                base_addr,
+                ..descriptor(None, 0)
+            };
+            dtd.initialize_descriptor(&body, defs, &mut StatedEvaluator);
+            dtd
+        };
+
+        let copied = initialized(Val(2));
+        assert_eq!(copied.base_addr, Val(1));
+        assert_eq!(copied.base_addrs, vec![EvaluatedValue(1)]);
+        assert_eq!(
+            copied.pattern_desc,
+            Some(PatternDescriptor::SimpleConstant(SimpleConstantDescriptor {
+                ev: EvaluatedValue(1),
+            }))
+        );
+
+        let summed = initialized(Val(4));
+        assert_eq!(summed.base_addr, Val(4));
+        assert_eq!(summed.base_addrs, vec![EvaluatedValue(4)]);
+        assert_eq!(
+            summed.pattern_desc,
+            Some(PatternDescriptor::SimpleConstant(SimpleConstantDescriptor {
+                ev: EvaluatedValue(4),
+            }))
+        );
+
+        let symbolic = initialized(Val(5));
+        assert_eq!(symbolic.pattern_desc, None);
+        assert!(symbolic.base_addrs.is_empty());
+    }
 
     /// A toggle that matched, so only the base-address count decides.
     fn matched_toggle(can_be_simplified: bool) -> ToggleDescriptor {
@@ -314,6 +641,8 @@ mod unit_tests {
             base_addrs: (0..base_addrs).map(EvaluatedValue).collect(),
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Val(0),
+            is_base_addr_mutable: false,
         }
     }
 

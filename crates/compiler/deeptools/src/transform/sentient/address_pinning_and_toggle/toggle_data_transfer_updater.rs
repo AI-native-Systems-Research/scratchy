@@ -176,6 +176,8 @@ mod unit_tests {
             base_addrs: vec![EvaluatedValue(7), EvaluatedValue(9)],
             region: RegionSite::ProgramUnitBody,
             memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Val(0),
+            is_base_addr_mutable: false,
         };
         let mut op = Op::Sentient(sentient::Op::LoadAndSend {
             mutable_addr: Val(1),
@@ -302,6 +304,8 @@ mod unit_tests {
             base_addrs: vec![EvaluatedValue(7), EvaluatedValue(9)],
             region: RegionSite::ProgramUnitBody,
             memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Val(0),
+            is_base_addr_mutable: false,
         }
     }
 

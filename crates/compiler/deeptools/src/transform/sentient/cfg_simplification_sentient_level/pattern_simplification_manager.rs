@@ -149,6 +149,13 @@ impl OpPath {
 /// the same conclusion for the same marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Mark {
+    /// `PROCESSED_SIMPLIFICATIONS` — "processed", set as `i32 1` on a node the walk has analysed
+    /// (`:849-850`) and removed only once the whole unit is done (`:906`), so it OUTLIVES A ROUND and
+    /// is what makes a later round skip what an earlier one did.
+    Processed,
+    /// `TABLE_TOO_LARGE` — "table too large". ⛔ NOTHING IN THIS FILE SETS IT: the out-of-scope
+    /// `doesTableExceedMaxSize()` does, and `runOnOperation` only removes it again (`:907`).
+    TableTooLarge,
     /// `DEAD_THEN_BRANCH` — "dead-then-branch".
     DeadThenBranch,
     /// `DEAD_ELSE_BRANCH` — "dead-else-branch".

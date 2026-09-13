@@ -172,7 +172,7 @@ pub(crate) mod toggle_descriptor;
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::arch::Arch;
+use crate::arch::{Arch, IsaGen};
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, UniformRegions, Val, dataflow, sentient, uniform,
 };
@@ -193,6 +193,7 @@ pub use data_transfer_descriptor_container::{
     ChainFlag, ChainFlags, DataTransferDescriptorContainer, DescriptorId,
 };
 pub use discrete_integer_set_descriptor::DiscreteIntegerSetDescriptor;
+pub use hbm_data_transfer_descriptor::{BurstIncrement, ChainIncrement};
 pub use integer_sequence_descriptor::{IntegerSequenceDescriptor, SequenceSize};
 pub use looping_chain_mutable_addr_descriptor::{ChainSize, LoopingChainMutableAddrDescriptor};
 pub use simple_constant_descriptor::SimpleConstantDescriptor;
@@ -1666,6 +1667,22 @@ impl LoopingChainMutableAddrDescriptor {
     }
 }
 
+/// `-dcc-address-pinning-and-toggle-disable` (`:68-72`) — `cl::init(false)`, so the pass SHIPS LIVE.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `-dcc-address-pinning-force` (`:74-78`) — `cl::init(false)`; the arch gate in
+/// [`AddressPinningAndTogglePass::run_on_operation`] is the only thing that turns it on.
+const FORCE_ADDRESS_PINNING: bool = false;
+
+/// `-dcc-address-pinning-and-toggle-assert` (`:80-87`) — `cl::init(false)`, so an unrecognised
+/// pattern is SILENTLY SKIPPED rather than asserted on: *"loop spliting might be able to legalize
+/// them"*.
+pub(super) const ASSERT_ON_UNEXPECTED_PATTERNS: bool = false;
+
+/// `-dcc-address-pinning-and-toggle-conditional-constants` (`:89-94`) — `cl::init(true)`, so the
+/// `sentient.if` arm of [`DataTransferDescriptor::initialize_descriptor`] SHIPS LIVE.
+pub(super) const HANDLE_CONDITIONAL_CONSTANTS: bool = true;
+
 /// HOW MANY DISTINCT BASE ADDRESSES A UNIT'S IMMUTABLE TRANSFERS STREAM FROM — the reference's
 /// `int num_streams_` (`AddressPinningAndToggle.cpp:1268`), a COUNT and never an index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1688,6 +1705,10 @@ pub struct AddressPinningAndTogglePass {
     pub mut_data_transfer_descriptors: DataTransferDescriptorContainer,
     /// `ev_addr_info_list_` — one entry per base address of each sorted transfer pair.
     pub ev_addr_info_list: Vec<EvAddressInfo>,
+    /// `ForceAddressPinning` (`:74-78`, `cl::init(false)`) AS [`Self::run_on_operation`] LEAVES IT,
+    /// read once at `:1510`. ⛔ NOT RESET BY [`Self::cleanup`]: the reference's is a `cl::opt` global
+    /// that outlives every unit and every pass instance, so a per-unit reset would drop e591's forcing.
+    pub force_address_pinning: bool,
 }
 
 impl AddressPinningAndTogglePass {
@@ -1831,30 +1852,174 @@ fn walk_pre_order(scope: &[Op], visit: &mut impl FnMut(&Op)) {
     }
 }
 
-// crustify:todo: e587_getMin
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:749  (4 body lines, level 5)
-//   original  : virtual const EvaluatedValue &getMin() const
-//   calls     : e399_getMin, e403_getMin, e405_getMin, e409_getMin, e412_getMin, e547_getMin, e589_getMin
+impl PatternDescriptor {
+    /// `DynamicPatternDescriptorBase::getMin()`'s VTABLE (`:142`, pure virtual — no body, so no unit
+    /// of its own): the six subclasses' `getMin` reached through one `match`.
+    fn min(
+        &self,
+        evaluator: &mut impl ExpressionEvaluator,
+        body: &[Op],
+        defs: Definitions<'_>,
+    ) -> Option<EvaluatedValue> {
+        match self {
+            Self::SimpleConstant(sc) => Some(sc.min()),
+            Self::Toggle(toggle) => toggle.min(evaluator, body, defs),
+            Self::ConditionalConstant(cc) => cc.min(evaluator),
+            Self::IntegerSequence(isq) => isq.min(evaluator),
+            Self::DiscreteIntegerSet(dis) => dis.min(evaluator),
+            Self::LoopingChainMutableAddr(lcma) => lcma.min(evaluator),
+        }
+    }
 
-// crustify:todo: e588_getMax
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:754  (4 body lines, level 5)
-//   original  : virtual const EvaluatedValue &getMax() const
-//   calls     : e400_getMax, e404_getMax, e406_getMax, e410_getMax, e413_getMax, e548_getMax, e590_getMax
+    /// `DynamicPatternDescriptorBase::getMax()`'s VTABLE (`:143`) — the same six subclasses.
+    fn max(
+        &self,
+        evaluator: &mut impl ExpressionEvaluator,
+        body: &[Op],
+        defs: Definitions<'_>,
+    ) -> Option<EvaluatedValue> {
+        match self {
+            Self::SimpleConstant(sc) => Some(sc.max()),
+            Self::Toggle(toggle) => toggle.max(evaluator, body, defs),
+            Self::ConditionalConstant(cc) => cc.max(evaluator),
+            Self::IntegerSequence(isq) => isq.max(evaluator),
+            Self::DiscreteIntegerSet(dis) => dis.max(evaluator),
+            Self::LoopingChainMutableAddr(lcma) => lcma.max(evaluator),
+        }
+    }
+}
 
-// crustify:todo: e589_getMin
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:829  (9 body lines, level 5)
-//   original  : const EvaluatedValue &getMin() const override
-//   calls     : e399_getMin, e403_getMin, e405_getMin, e409_getMin, e412_getMin, e547_getMin, e587_getMin
+impl DataTransferDescriptor {
+    /// Replaces: e587_getMin
+    ///
+    /// The lowest address this transfer's base address can take — its matched pattern's own minimum
+    /// (`:749-752`).
+    ///
+    /// ⛔ `None` IS `DT_CHECK_MSG(pattern_desc_, "Expect valid pattern descriptor")`: an unmatched
+    /// transfer has no range and the reference aborts rather than answer.
+    /// ⭐ THE `Hbm` ARM IS THE VTABLE, NOT AN ADDITION: [`Self::hbm_min`] (e589) overrides this
+    /// `virtual`, and every caller reaches both through one `DataTransferDescriptor *`.
+    #[must_use]
+    pub fn min(
+        &self,
+        evaluator: &mut impl ExpressionEvaluator,
+        body: &[Op],
+        defs: Definitions<'_>,
+    ) -> Option<EvaluatedValue> {
+        match self.memory_unit {
+            DescriptorMemoryUnit::Hbm { .. } => self.hbm_min(evaluator, body, defs),
+            DescriptorMemoryUnit::Lx => self.pattern_desc.as_ref()?.min(evaluator, body, defs),
+        }
+    }
 
-// crustify:todo: e590_getMax
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:839  (14 body lines, level 5)
-//   original  : const EvaluatedValue &getMax() const override
-//   calls     : e400_getMax, e404_getMax, e406_getMax, e410_getMax, e413_getMax, e548_getMax, e588_getMax
+    /// Replaces: e588_getMax
+    ///
+    /// The highest address the same base address can take (`:754-757`) — see [`Self::min`] for the
+    /// `None` and for why the `Hbm` arm dispatches to [`Self::hbm_max`] (e590).
+    #[must_use]
+    pub fn max(
+        &self,
+        evaluator: &mut impl ExpressionEvaluator,
+        body: &[Op],
+        defs: Definitions<'_>,
+    ) -> Option<EvaluatedValue> {
+        match self.memory_unit {
+            DescriptorMemoryUnit::Hbm { .. } => self.hbm_max(evaluator, body, defs),
+            DescriptorMemoryUnit::Lx => self.pattern_desc.as_ref()?.max(evaluator, body, defs),
+        }
+    }
 
-// crustify:todo: e591_runOnOperation
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1200  (9 body lines, level 5)
-//   original  : void runOnOperation()
-//   calls     : e549_runOn
+    /// Replaces: e589_getMin
+    ///
+    /// `HBMDataTransferDescriptor::getMin` (`:829-837`) — the pattern's own minimum, widened DOWN by a
+    /// non-looping chain's total increment unless that increment is positive.
+    ///
+    /// ⛔ `getConstant` RUNS BEFORE `getMin` (`:834-836`), and an evaluator that interns in call order
+    /// numbers its arena by that: the constant is a statement of its own, the pattern's minimum an
+    /// argument to the sum that follows.
+    /// ⛔ `None` FOR AN `Lx` DESCRIPTOR IS UNREACHABLE, not a refusal — this override exists only on
+    /// the HBM subclass, and [`Self::min`] is what picks it.
+    #[must_use]
+    pub fn hbm_min(
+        &self,
+        evaluator: &mut impl ExpressionEvaluator,
+        body: &[Op],
+        defs: Definitions<'_>,
+    ) -> Option<EvaluatedValue> {
+        let DescriptorMemoryUnit::Hbm {
+            total_chain_increment,
+            ..
+        } = self.memory_unit
+        else {
+            return None;
+        };
+        let pattern = self.pattern_desc.as_ref()?;
+        if total_chain_increment.0 > 0 {
+            return pattern.min(evaluator, body, defs);
+        }
+        let total_incr_ev = evaluator.constant(total_chain_increment.0);
+        let pattern_min = pattern.min(evaluator, body, defs)?;
+        Some(evaluator.evaluate_sum_handle(pattern_min, total_incr_ev))
+    }
+
+    /// Replaces: e590_getMax
+    ///
+    /// `HBMDataTransferDescriptor::getMax` (`:839-855`) — the pattern's maximum plus the burst
+    /// increment ALWAYS, plus a non-looping chain's total increment unless that increment is negative.
+    ///
+    /// ⛔ THE BURST INCREMENT IS UNCONDITIONAL WHILE THE CHAIN INCREMENT IS SIGN-GATED, and the two
+    /// are different types precisely so they cannot swap slots.
+    /// ⛔ EVALUATION ORDER IS `getMax`, then `getConstant(burst)`, then the sum (`:840-843`); see
+    /// [`Self::hbm_min`] for why that ordering is load-bearing.
+    #[must_use]
+    pub fn hbm_max(
+        &self,
+        evaluator: &mut impl ExpressionEvaluator,
+        body: &[Op],
+        defs: Definitions<'_>,
+    ) -> Option<EvaluatedValue> {
+        let DescriptorMemoryUnit::Hbm {
+            total_chain_increment,
+            increment_via_burst,
+        } = self.memory_unit
+        else {
+            return None;
+        };
+        let ev = self.pattern_desc.as_ref()?.max(evaluator, body, defs)?;
+        let burst_incr = evaluator.constant(i64::from(increment_via_burst.0));
+        let ev_sum_with_burst = evaluator.evaluate_sum_handle(ev, burst_incr);
+        if total_chain_increment.0 < 0 {
+            return Some(ev_sum_with_burst);
+        }
+        let total_incr_ev = evaluator.constant(total_chain_increment.0);
+        Some(evaluator.evaluate_sum_handle(ev_sum_with_burst, total_incr_ev))
+    }
+}
+
+impl AddressPinningAndTogglePass {
+    /// Replaces: e591_runOnOperation
+    ///
+    /// THE PASS ENTRY (`:1200-1208`): forces address pinning on SEN1P5 and up, then runs over the
+    /// module.
+    ///
+    /// ⛔ THE FORCING OUTLIVES THIS CALL: `ForceAddressPinning = true` writes a `cl::opt` GLOBAL, so it
+    /// stays set for `:1510` and is deliberately not undone — [`Self::force_address_pinning`] carries
+    /// it and [`Self::cleanup`] does not clear it.
+    /// ⭐ SEN1P5 NEEDS IT BECAUSE immutable_addr FIELDS COMING FROM LX ADDRESSES MUST BE ADJUSTED TO 0
+    /// (`:1203-1205`), which only the pinning path does.
+    pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+    ) {
+        if DISABLE_THIS_PASS {
+            return;
+        }
+        if FORCE_ADDRESS_PINNING || A::GEN >= IsaGen::Sen1p5 {
+            self.force_address_pinning = true;
+        }
+        self.run_on_program(program);
+    }
+}
 
 // crustify:todo: e614_computeAddressInfoList
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1675  (59 body lines, level 6)
@@ -1922,7 +2087,7 @@ mod unit_tests {
     use crate::transform::sentient::analyses::{
         Evaluation, OffsetSites, OutOfScopeEvaluator, RegionSite,
     };
-    use crate::arch::Dd2;
+    use crate::arch::{Dd2, Sen1p5};
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::ProgramUnits;
@@ -1998,6 +2163,8 @@ mod unit_tests {
             base_addrs: (0..base_addrs).map(|i| EvaluatedValue(i as u32)).collect(),
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Val(0),
+            is_base_addr_mutable: false,
         }
     }
 
@@ -2210,6 +2377,8 @@ mod unit_tests {
             base_addrs: vec![EvaluatedValue(64)],
             region: RegionSite::default(),
             memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Val(0),
+            is_base_addr_mutable: false,
         }
     }
 
@@ -3298,5 +3467,126 @@ mod unit_tests {
         };
 
         AddressPinningAndTogglePass::default().run_on_program(&mut program);
+    }
+    /// A descriptor with `kind` as its pattern and the HBM subclass's two increments.
+    fn hbm_with_pattern(
+        kind: PatternDescriptor,
+        total_chain_increment: i64,
+        increment_via_burst: i32,
+    ) -> DataTransferDescriptor {
+        DataTransferDescriptor {
+            memory_unit: DescriptorMemoryUnit::Hbm {
+                total_chain_increment: ChainIncrement(total_chain_increment),
+                increment_via_burst: BurstIncrement(increment_via_burst),
+            },
+            ..with_pattern(kind)
+        }
+    }
+
+    /// A one-unit program on arch `A`, whose per-unit `runOn` is entry 656 and not this worklist's.
+    fn one_unit_program<A: Arch>() -> Program<A, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::L0lu, Val(100)),
+                    precision: None,
+                    body: Vec::new(),
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// 587/656 — the base `getMin` is its pattern's own minimum, and `DT_CHECK_MSG(pattern_desc_, ..)`
+    /// is what an unmatched transfer answers instead.
+    #[test]
+    fn e587_min_is_the_patterns_own_min_and_nothing_without_a_pattern() {
+        let mut evaluator = StatedEvaluator::default();
+        let ev = evaluator.constant(64);
+        let regions: [&[Op]; 1] = [&[]];
+        let defs = Definitions::from_innermost(&regions);
+        let dtd = with_pattern(PatternDescriptor::SimpleConstant(SimpleConstantDescriptor { ev }));
+        let min = dtd.min(&mut evaluator, &[], defs);
+        assert_eq!(min.map(|m| evaluator.value(m)), Some(64));
+        let unmatched = DataTransferDescriptor {
+            pattern_desc: None,
+            ..dtd
+        };
+        assert_eq!(unmatched.min(&mut evaluator, &[], defs), None);
+    }
+
+    /// 588/656 — the same dispatch for the other end: a conditional constant's max is the LARGEST of
+    /// the constants it can yield, not the same handle its min folds to.
+    #[test]
+    fn e588_max_is_the_patterns_own_max_over_every_yielded_constant() {
+        let mut evaluator = StatedEvaluator::default();
+        let cc = ConditionalConstantDescriptor {
+            yielded_constants: vec![evaluator.constant(16), evaluator.constant(48)],
+            can_be_simplified: false,
+        };
+        let regions: [&[Op]; 1] = [&[]];
+        let defs = Definitions::from_innermost(&regions);
+        let dtd = with_pattern(PatternDescriptor::ConditionalConstant(cc));
+        let max = dtd.max(&mut evaluator, &[], defs);
+        let min = dtd.min(&mut evaluator, &[], defs);
+        assert_eq!(max.map(|m| evaluator.value(m)), Some(48));
+        assert_eq!(min.map(|m| evaluator.value(m)), Some(16));
+    }
+
+    /// 589/656 — a POSITIVE chain increment leaves the pattern's minimum alone; any other value is
+    /// added to it. ⛔ The burst increment plays no part in the minimum.
+    #[test]
+    fn e589_hbm_min_adds_the_chain_increment_unless_it_is_positive() {
+        let mut evaluator = StatedEvaluator::default();
+        let ev = evaluator.constant(64);
+        let pattern = PatternDescriptor::SimpleConstant(SimpleConstantDescriptor { ev });
+        let regions: [&[Op]; 1] = [&[]];
+        let defs = Definitions::from_innermost(&regions);
+        let positive = hbm_with_pattern(pattern.clone(), 32, 8).min(&mut evaluator, &[], defs);
+        assert_eq!(positive.map(|m| evaluator.value(m)), Some(64));
+        let negative = hbm_with_pattern(pattern, -32, 8).min(&mut evaluator, &[], defs);
+        assert_eq!(negative.map(|m| evaluator.value(m)), Some(32));
+    }
+
+    /// 590/656 — the burst increment is added WHATEVER the chain increment does, and the chain
+    /// increment is added on top unless it is negative.
+    #[test]
+    fn e590_hbm_max_always_adds_the_burst_and_gates_only_the_chain_increment() {
+        let mut evaluator = StatedEvaluator::default();
+        let ev = evaluator.constant(64);
+        let pattern = PatternDescriptor::SimpleConstant(SimpleConstantDescriptor { ev });
+        let regions: [&[Op]; 1] = [&[]];
+        let defs = Definitions::from_innermost(&regions);
+        let negative = hbm_with_pattern(pattern.clone(), -32, 8).max(&mut evaluator, &[], defs);
+        assert_eq!(negative.map(|m| evaluator.value(m)), Some(72));
+        let positive = hbm_with_pattern(pattern, 32, 8).max(&mut evaluator, &[], defs);
+        assert_eq!(positive.map(|m| evaluator.value(m)), Some(104));
+    }
+
+    /// 591/656 — SEN1P5 forces address pinning and RCUDD1A does not; both then run over the module,
+    /// whose per-unit pass is entry 656.
+    #[test]
+    fn e591_forces_address_pinning_on_sen1p5_and_not_before() {
+        let mut on_sen1p5 = AddressPinningAndTogglePass::default();
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            on_sen1p5.run_on_operation(&mut one_unit_program::<Sen1p5>());
+        }));
+        assert!(reached.is_err());
+        assert!(on_sen1p5.force_address_pinning);
+
+        let mut on_dd2 = AddressPinningAndTogglePass::default();
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            on_dd2.run_on_operation(&mut one_unit_program::<Dd2>());
+        }));
+        assert!(reached.is_err());
+        assert!(!on_dd2.force_address_pinning);
     }
 }

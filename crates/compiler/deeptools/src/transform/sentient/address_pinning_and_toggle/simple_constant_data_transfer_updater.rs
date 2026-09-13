@@ -235,6 +235,8 @@ mod unit_tests {
             base_addrs: vec![EvaluatedValue(7)],
             region: RegionSite::ProgramUnitBody,
             memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Val(0),
+            is_base_addr_mutable: false,
         };
         let mut op = load_and_send();
         SimpleConstantDataTransferUpdater.update_immutable_addr(
@@ -323,6 +325,8 @@ mod unit_tests {
             base_addrs: vec![EvaluatedValue(7)],
             region: RegionSite::ProgramUnitBody,
             memory_unit: DescriptorMemoryUnit::Lx,
+            base_addr: Val(0),
+            is_base_addr_mutable: false,
         };
         // `mutable_addr_[0]` is the `sentient.scalar_constant` the DT_CHECK insists on.
         let body = [Op::Sentient(sentient::Op::ScalarConstant {
