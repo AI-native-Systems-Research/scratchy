@@ -409,7 +409,7 @@ fn has_uniform_group_below(body: &[crate::islands::dataflow_ir::dialects::Op]) -
 /// ⚠️ TWO REFERENCE ABORTS BECOME ANSWERS: `DT_CHECK_MSG(val, ..)` and `DT_CHECK(values.size() > 0)`,
 /// the second of which an empty mapping reaches — an empty `all()` is `true`, the answer the loop it
 /// guards would have given.
-fn is_target_constant(val: Val, target: i64, defs: Definitions<'_>) -> bool {
+pub(crate) fn is_target_constant(val: Val, target: i64, defs: Definitions<'_>) -> bool {
     /// The two constant ops the reference `dyn_cast`s, and the literal each carries.
     fn literal(op: &Op) -> Option<i64> {
         match op {

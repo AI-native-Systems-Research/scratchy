@@ -87,10 +87,9 @@
 #![allow(dead_code)]
 
 use crate::arch::Arch;
-use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient, uniform};
+use crate::islands::sentient::{Program, ProgramUnit, Run};
 use crate::model::Model;
 use crate::workload::Workload;
 
@@ -322,7 +321,12 @@ fn take_everywhere<A: Arch, M: Model, W: Workload>(
 /// map or query op with only local-region uses into that region, and nothing should.
 /// ⭐ `to_be_deleted` IS DEFERRED DELETION, NOT AN OUTPUT: `e545_runOn` erases the list after the
 /// walk, because `pruneOutOfScopeEntries` is called from inside one.
-pub(crate) fn run_on(op: &Op, _to_be_deleted: &mut Vec<OpId>) {
+/// ⛔ AND THE QUEUED OP IS NAMED BY ITS RESULT, NOT BY A POSITION. The two things
+/// `pruneOutOfScopeEntries` queues are a `uniform.def_immutable_mapping` and its `uniform.query_map`
+/// users (`Utils.cpp:676-690`), each binding exactly one value; an `OpId` path cannot survive the
+/// erase of an earlier entry and cannot say WHICH unit body it indexes, which is what
+/// `specialized_canonicalization`'s copy of this same `to_be_deleted_` already settled.
+pub(crate) fn run_on(op: &Op, _to_be_deleted: &mut Vec<Val>) {
     let Op::Uniform(uniform::Op::DefImmutableMapping { .. }) = op else {
         return;
     };
@@ -332,15 +336,63 @@ pub(crate) fn run_on(op: &Op, _to_be_deleted: &mut Vec<OpId>) {
     )
 }
 
-// crustify:todo: e544_runOn
-//   authority : dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:75  (7 body lines, level 3)
-//   original  : void UniformMapCanonicalizationPass::runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e484_runOn, e545_runOn
+/// Replaces: e544_runOn
+///
+/// One program unit: on an L3 half only, [`run_on`] every op of its body, pre-order.
+///
+/// ⭐ `dcc::getUnitType(getUnits().begin()->getDefiningOp<GetUnitOp>())` IS ALREADY A TYPE HERE —
+/// [`ProgramUnit::moves_memory`] is `is_any_of(comp, L3LU, L3SU)` over [`Units::kind`], so the
+/// reference's unchecked `getDefiningOp<>` deref has no unwrap to reproduce.
+/// ⛔ THE OP ITSELF IS PART OF `unit->walk`, and skipping it changes nothing: [`run_on`] acts on a
+/// `uniform.def_immutable_mapping` alone and a `dataflow.program_unit` is not one.
+///
+/// [`Units::kind`]: crate::islands::dataflow_ir::Units::kind
+pub(crate) fn run_on_unit<A: Arch>(unit: &ProgramUnit<A>, to_be_deleted: &mut Vec<Val>) {
+    if !unit.moves_memory() {
+        return;
+    }
+    walk_pre_order(&unit.body, to_be_deleted);
+}
 
-// crustify:todo: e545_runOn
-//   authority : dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:96  (8 body lines, level 3)
-//   original  : void UniformMapCanonicalizationPass::runOn(ModuleOp module_op)
-//   calls     : e238_cleanupConstants, e484_runOn, e544_runOn
+/// `Operation::walk<WalkOrder::PreOrder>` — the op, then each of its regions in order.
+fn walk_pre_order(ops: &[Op], to_be_deleted: &mut Vec<Val>) {
+    for op in ops {
+        run_on(op, to_be_deleted);
+        for region in dialects::regions_ref(op) {
+            walk_pre_order(region, to_be_deleted);
+        }
+    }
+}
+
+/// Replaces: e545_runOn
+///
+/// The whole module: unify its constants, [`run_on_unit`] every `dataflow.program_unit`, then erase
+/// everything the walk queued.
+///
+/// ⛔ `WalkResult::skip()` IS NOT A CHOICE HERE — a [`Run`] is a flat list of programs and a program's
+/// units are a flat list too, so a pre-order walk for `dataflow.program_unit` cannot reach a nested
+/// one to skip past.
+/// ⛔ THE ERASE IS PER PROGRAM BECAUSE A [`Val`] IS: the reference holds ONE pass-level
+/// `to_be_deleted_` across the module walk and erases by pointer at the end, and partitioning that
+/// list by program is unobservable — an op queued from one `func.func` is not in another's block —
+/// while a program-wide value search across programs would hit a same-numbered op in the wrong one.
+pub(crate) fn run_on_module<A: Arch, M: Model, W: Workload>(run: &mut Run<A, M, W>) {
+    for program in &mut run.programs {
+        cleanup_constants(program);
+    }
+    for program in &mut run.programs {
+        let mut to_be_deleted: Vec<Val> = Vec::new();
+        for unit in program.units.iter() {
+            run_on_unit(unit, &mut to_be_deleted);
+        }
+        for doomed in &to_be_deleted {
+            dialects::erase_defining_op(&mut program.preamble, *doomed);
+            for unit in program.units.iter_mut() {
+                dialects::erase_defining_op(&mut unit.body, *doomed);
+            }
+        }
+    }
+}
 
 // crustify:todo: e586_runOnOperation
 //   authority : dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:58  (5 body lines, level 4)
@@ -349,13 +401,15 @@ pub(crate) fn run_on(op: &Op, _to_be_deleted: &mut Vec<OpId>) {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{cleanup_constants, run_on};
+    use super::{cleanup_constants, run_on, run_on_module, run_on_unit};
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
-    use crate::islands::sentient::dialects::{Op, Val, sentient};
-    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::islands::dataflow_ir::{GroupId, KernelName, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::dialects::{
+        LocalRegion, Op, UniformRegions, Val, sentient, uniform,
+    };
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits, Run};
     use crate::model::Model;
     use crate::units::DfirUnit;
     use crate::workload::Workload;
@@ -406,6 +460,11 @@ mod unit_tests {
 
     /// A one-unit program running `body`.
     fn program_of(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        program_on(DfirUnit::Lxsu, body)
+    }
+
+    /// The same, on a named unit kind.
+    fn program_on(kind: DfirUnit, body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
         Program {
             name: ProgramName {
                 group: GroupId(0),
@@ -415,7 +474,7 @@ mod unit_tests {
             preamble: Vec::new(),
             units: ProgramUnits::of(
                 ProgramUnit {
-                    on: Units::one(DfirUnit::Lxsu, Val(0)),
+                    on: Units::one(kind, Val(0)),
                     precision: None,
                     body,
                     arch: core::marker::PhantomData,
@@ -424,6 +483,23 @@ mod unit_tests {
             ),
             bound: core::marker::PhantomData,
         }
+    }
+
+    /// A `uniform.uniformize_regions` holding one `uniform.def_immutable_mapping` — the only op
+    /// [`run_on`] reacts to, one region deep so a walk that stops at the top level misses it.
+    fn mapping_in_a_local_region() -> Op {
+        Op::UniformRegions(UniformRegions::UniformizeRegions {
+            regions: vec![LocalRegion {
+                arg: Val(20),
+                units: vec![Val(0)],
+                body: vec![Op::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(21),
+                    pairs: vec![(Val(0), Val(22))],
+                })],
+            }],
+            results: Vec::new(),
+            yielded: Vec::new(),
+        })
     }
 
     /// e238 — two same-valued constants unify onto the first even across a `sentient.for` and across
@@ -520,5 +596,83 @@ mod unit_tests {
             &mut to_be_deleted,
         );
         assert!(to_be_deleted.is_empty());
+    }
+
+    /// e544 — ⛔ THE GUARD IS THE WHOLE UNIT: a unit that is not an L3 half is not walked at all, so
+    /// the mapping one region down is never reached.
+    #[test]
+    fn e544_leaves_a_unit_that_is_not_an_l3_half_unwalked() {
+        let program = program_on(DfirUnit::Lxsu, vec![mapping_in_a_local_region()]);
+        let mut to_be_deleted = Vec::new();
+        run_on_unit(
+            program.units.iter().next().expect("the head unit"),
+            &mut to_be_deleted,
+        );
+        assert!(to_be_deleted.is_empty());
+    }
+
+    /// e544 — and on an L3 half the walk DOES descend into the local region and hand the mapping to
+    /// [`run_on`], whose `e395_pruneOutOfScopeEntries` arm is the still-unfilled `todo!`.
+    ///
+    /// ⭐ THE PANIC IS THE OBSERVATION: with the prune unported, reaching the op is the only effect
+    /// this half of the guard has, and a walk that stopped at the unit body would return quietly.
+    #[test]
+    #[should_panic(expected = "e395_pruneOutOfScopeEntries")]
+    fn e544_walks_an_l3_half_down_into_its_local_regions() {
+        let program = program_on(DfirUnit::L3lu, vec![mapping_in_a_local_region()]);
+        let mut to_be_deleted = Vec::new();
+        run_on_unit(
+            program.units.iter().next().expect("the head unit"),
+            &mut to_be_deleted,
+        );
+    }
+
+    /// e545 — every program of the run has its constants unified and hoisted, every unit is walked,
+    /// and the deferred-deletion list is drained afterwards.
+    #[test]
+    fn e545_cleans_up_the_constants_of_every_program_then_walks_the_units() {
+        let mut run = Run {
+            kernel: KernelName(GroupId(0)),
+            programs: vec![
+                program_of(vec![
+                    constant(7, Val(1), sentient::RegType::Imm),
+                    constant(7, Val(2), sentient::RegType::Lrf),
+                    adds(Val(2), Val(3)),
+                ]),
+                program_of(vec![
+                    constant(5, Val(4), sentient::RegType::Imm),
+                    adds(Val(4), Val(5)),
+                ]),
+            ],
+        };
+        run_on_module(&mut run);
+
+        // Both programs hoisted their survivor; the duplicate's reader moved onto `%1`.
+        assert_eq!(
+            run.programs[0].preamble,
+            vec![constant(7, Val(1), sentient::RegType::Imm)]
+        );
+        assert_eq!(
+            run.programs[0]
+                .units
+                .iter()
+                .next()
+                .expect("the head unit")
+                .body,
+            vec![adds(Val(1), Val(3))]
+        );
+        assert_eq!(
+            run.programs[1].preamble,
+            vec![constant(5, Val(4), sentient::RegType::Imm)]
+        );
+        assert_eq!(
+            run.programs[1]
+                .units
+                .iter()
+                .next()
+                .expect("the head unit")
+                .body,
+            vec![adds(Val(4), Val(5))]
+        );
     }
 }

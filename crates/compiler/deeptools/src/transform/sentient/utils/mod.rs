@@ -103,17 +103,20 @@
 use core::num::{NonZeroU32, NonZeroU64};
 
 use super::analyses::{UnitIndex, UnitIndexMap};
+use super::old_register_initialization::register_init_info::is_target_constant;
 use super::register_packing::constant_target_values;
 use super::scalar_op_merging_and_hoisting::{ScalarOpComp, compute_address_scale};
 use super::{ForRef, IterArgIndex};
 use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
-use sys_arch_spec::fields::{self, ImmSpec, ImmWidth, Sign};
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, dataflow, operands, regions_mut, regions_ref, results, sentient, symbol,
-    uniform, use_count,
+    Definitions, Op, Val, dataflow, defining_op, erase_defining_op, operands, regions_mut,
+    regions_ref, replace_all_uses_with, results, sentient, set_operand, symbol, uniform, use_count,
 };
+use sys_arch_spec::fields::{self, ImmSpec, ImmWidth, Sign};
 
 pub(crate) mod units_and_their_values;
 
@@ -1285,10 +1288,368 @@ pub fn has_uniformize_region(unit_body: &[Op]) -> bool {
 //   original  : void replaceValue(size_t index, mlir::Value new_val)
 //   calls     : e252_size
 
-// crustify:todo: e546_findAndReplaceRedundantIterArgsUsedInConditions
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:257  (138 body lines, level 3)
-//   original  : LogicalResult findAndReplaceRedundantIterArgsUsedInConditions( mlir::sentient::ForOp loop, std::set<int> &iter_arg_indices_to_delete)
-//   calls     : e422_insert
+/// THE STRIDE THIS UNIT ACCEPTS — `+1` or `-1` and nothing else (`Utils.cpp:286-301`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterArgStride {
+    /// `stride = 1` — the iter arg counts UP while the induction variable counts down.
+    Up,
+    /// `stride = -1` — it counts down with the induction variable.
+    Down,
+}
+
+impl IterArgStride {
+    /// The signed step the reference multiplies by.
+    const fn signed(self) -> i64 {
+        match self {
+            IterArgStride::Up => 1,
+            IterArgStride::Down => -1,
+        }
+    }
+}
+
+/// THE `LogicalResult` — `failure()` when the set is empty (`:392-393`).
+///
+/// ⛔ THE ANSWER IS ABOUT THE SET, NOT ABOUT THIS CALL: the reference tests
+/// `iter_arg_indices_to_delete.empty()`, and the greedy driver hands the SAME set back on every
+/// re-visit, so a call that replaced nothing still succeeds once an earlier one put an index in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum RedundantIterArgs {
+    /// `success()` — the set names at least one index for `EnhancedDeadVariableElimination`.
+    ToDelete,
+    /// `failure()` — it is empty.
+    None,
+}
+
+/// ONE ACCEPTED ITER ARG, DECIDED BEFORE ANYTHING IS WRITTEN — the read half of one turn of the
+/// reference's descending `for (int i = ..)`.
+struct IterArgPlan {
+    /// The body argument being replaced by the induction variable.
+    iter_arg: Val,
+    /// `yield_operand` — the add's result, dropped from the yield and then erased if unread.
+    add_result: Val,
+    /// `stride`.
+    stride: IterArgStride,
+    /// `adjustment_val` = `const_loop_bound + stride * const_init_val`.
+    adjustment: i64,
+    /// `const_init_val + stride * const_loop_bound`, with the type `init_val` carries.
+    result_const: (i64, ScalarTy),
+    /// One entry per `sentient.if` of `list_of_if_ops`, in walk order: which operand slot holds the
+    /// NON-iter-arg side, and the value and type of the `sentient.scalar_constant` sitting there.
+    predicates: Vec<(usize, i64, ScalarTy)>,
+}
+
+/// Replaces: e546_findAndReplaceRedundantIterArgsUsedInConditions
+///
+/// Replaces every iter arg of `loop_op` that is `const ± IV` and read only by constant-compared
+/// `sentient.if` predicates with the induction variable itself, adjusting those predicates, dropping
+/// the yielded increment and folding the loop's result to a constant.
+///
+/// ⛔ THE ITER ARG AND ITS RESULT STAY ON THE LOOP — this unit only names their indices, so the yield
+/// is deliberately left ONE OPERAND SHORT of the loop's results (`:378`) and
+/// `EnhancedDeadVariableElimination` finishes the job; see [`RedundantIterArgs`].
+/// ⛔ TRAP: DESCENDING `i` IS LOAD-BEARING — `eraseOperand(i)` renumbers every later yield operand.
+/// ⭐ THE IV COUNTS DOWN FROM `$bound` TO ZERO (`SentientOps.td:55`), which is why `stride = 1` SWAPS
+/// the compared operands and `stride = -1` moves only the constant: `iter_arg = adjustment - IV`
+/// reverses a comparison and `iter_arg = IV - adjustment` preserves it.
+/// ⚠️ THE `DT_CHECK_MSG` AT `:344` IS UNREACHABLE — the non-iter-arg side was already proved a
+/// `sentient.scalar_constant` when the use was accepted (`:314-321`), and the plan carries its value
+/// rather than re-deriving it from a position the inserted constants have since shifted.
+pub fn find_and_replace_redundant_iter_args_used_in_conditions(
+    unit_body: &mut Vec<Op>,
+    loop_op: ForRef,
+    values: &mut Values,
+    iter_arg_indices_to_delete: &mut Vec<IterArgIndex>,
+) -> RedundantIterArgs {
+    let Some(mut at) = for_path(unit_body, loop_op) else {
+        return redundant_iter_args(iter_arg_indices_to_delete);
+    };
+    let Some(carried) = carried_count(unit_body, &at) else {
+        return redundant_iter_args(iter_arg_indices_to_delete);
+    };
+    for i in (0..carried).rev() {
+        let Some(plan) = plan_for(unit_body, &at, i) else {
+            continue;
+        };
+        apply_iter_arg_plan(unit_body, &at, i, &plan, values);
+        insert_iter_arg_index(iter_arg_indices_to_delete, IterArgIndex(i as u32));
+
+        // `builder.setInsertionPoint(loop)` (`:385`) — the folded result lands in the loop's OWN
+        // block, immediately in front of it, which moves the loop down one position.
+        let folded = values.mint();
+        let (value, ty) = plan.result_const;
+        insert_at(
+            unit_body,
+            &at,
+            Op::Sentient(ops::Op::ScalarConstant {
+                value,
+                result: folded,
+                reg_locale: ops::RegType::Imm,
+                ty,
+                is_symbol: false,
+            }),
+        );
+        at = at.next();
+        if let Some(result) = loop_result(unit_body, &at, i) {
+            replace_all_uses_with(unit_body, result, folded);
+        }
+    }
+    redundant_iter_args(iter_arg_indices_to_delete)
+}
+
+/// `iter_arg_indices_to_delete.empty()` (`:392`).
+fn redundant_iter_args(indices: &[IterArgIndex]) -> RedundantIterArgs {
+    if indices.is_empty() {
+        RedundantIterArgs::None
+    } else {
+        RedundantIterArgs::ToDelete
+    }
+}
+
+/// `std::set<int>::insert` — sorted and unique, which is how the caller reads the set back.
+fn insert_iter_arg_index(indices: &mut Vec<IterArgIndex>, index: IterArgIndex) {
+    if let Err(at) = indices.binary_search(&index) {
+        indices.insert(at, index);
+    }
+}
+
+/// WHERE THE `sentient.for` NAMED BY ITS INDUCTION VARIABLE SITS — the `Operation *` the reference
+/// holds, re-found by position because a [`ForRef`] is an identity and not one.
+fn for_path(unit_body: &[Op], loop_op: ForRef) -> Option<OpAt> {
+    fn walk(block: &[Op], iv: Val, enclosing: &mut Vec<(InBlock, usize)>) -> Option<OpAt> {
+        for (index, op) in block.iter().enumerate() {
+            if matches!(op, Op::Sentient(ops::Op::For { iv: found, .. }) if *found == iv) {
+                return Some(OpAt::at(enclosing, InBlock(index)));
+            }
+            for (region, inner) in regions_ref(op).into_iter().enumerate() {
+                enclosing.push((InBlock(index), region));
+                let found = walk(inner, iv, enclosing);
+                enclosing.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    }
+    walk(unit_body, loop_op.0, &mut Vec::new())
+}
+
+/// `loop.getNumRegionIterArgs()` (`:262`).
+fn carried_count(unit_body: &[Op], at: &OpAt) -> Option<usize> {
+    match at.op(unit_body)? {
+        Op::Sentient(ops::Op::For { carried, .. }) => Some(carried.len()),
+        _ => None,
+    }
+}
+
+/// `loop.getResult(i)`.
+fn loop_result(unit_body: &[Op], at: &OpAt, i: usize) -> Option<Val> {
+    match at.op(unit_body)? {
+        Op::Sentient(ops::Op::For { carried, .. }) => carried.get(i).map(|carried| carried.result),
+        _ => None,
+    }
+}
+
+/// EVERY `continue` OF THE REFERENCE'S LOOP BODY AS ONE READ (`:263-341`) — `None` is a rejected iter
+/// arg.
+///
+/// ⭐ THE LOOP BODY IS THE INNERMOST SCOPE AND THE ENCLOSING ONES STILL COUNT: the vendor's own
+/// worked example defines the init value, the bound, the stride's `1` and the compared constant
+/// OUTSIDE the loop (`Utils.hpp:97-108`), so a body-only lookup would reject its own example.
+fn plan_for(unit_body: &[Op], at: &OpAt, i: usize) -> Option<IterArgPlan> {
+    let outer = visible_from(unit_body, at);
+    let Op::Sentient(ops::Op::For {
+        bound,
+        carried,
+        body,
+        ..
+    }) = at.op(unit_body)?
+    else {
+        return None;
+    };
+    let entry = carried.get(i)?;
+    let mut scopes: Vec<&[Op]> = vec![body.as_slice()];
+    scopes.extend(outer.iter().copied());
+    let defs = Definitions::from_innermost(&scopes);
+
+    // `isa<BlockArgument>(..)` is "nothing in scope defines it", and both must be a `ConstantOp`.
+    let (init, init_ty) = match defs.of(entry.init)? {
+        Op::Sentient(ops::Op::ScalarConstant { value, ty, .. }) => (*value, *ty),
+        _ => return None,
+    };
+    let bound = match defs.of(*bound)? {
+        Op::Sentient(ops::Op::ScalarConstant { value, .. }) => *value,
+        _ => return None,
+    };
+    // `init_val.getType() != loop.getInductionVar().getType()` — body argument 0 is `index`.
+    if init_ty != ScalarTy::Index {
+        return None;
+    }
+
+    // `loop.getLoopBody().front().getTerminator()->getOperand(i)`, which must be `iter_arg ± 1`.
+    let Some(Op::Sentient(ops::Op::Yield { results })) = body.last() else {
+        return None;
+    };
+    let add_result = *results.get(i)?;
+    let Some(Op::Sentient(ops::Op::ScalarAdd { lhs, rhs, .. })) = defining_op(add_result, body)
+    else {
+        return None;
+    };
+    let step = if *lhs == entry.arg {
+        *rhs
+    } else if *rhs == entry.arg {
+        *lhs
+    } else {
+        return None;
+    };
+    let stride = if is_target_constant(step, 1, defs) {
+        IterArgStride::Up
+    } else if is_target_constant(step, -1, defs) {
+        IterArgStride::Down
+    } else {
+        return None;
+    };
+
+    // `for (auto &use : iter_arg.getUses())` (`:322-338`).
+    let mut predicates: Vec<(usize, i64, ScalarTy)> = Vec::new();
+    if !accepts_every_iter_arg_use(body, entry.arg, add_result, defs, &mut predicates) {
+        return None;
+    }
+    Some(IterArgPlan {
+        iter_arg: entry.arg,
+        add_result,
+        stride,
+        adjustment: bound + stride.signed() * init,
+        result_const: (init + stride.signed() * bound, init_ty),
+        predicates,
+    })
+}
+
+/// `skip_iter_arg_replacement` INVERTED — every reader of the iter arg must be the yielded add or a
+/// `sentient.if` whose other side is a `sentient.scalar_constant`, and `list_of_if_ops` is collected
+/// in the same walk order the writer re-finds them in.
+fn accepts_every_iter_arg_use(
+    block: &[Op],
+    iter_arg: Val,
+    add_result: Val,
+    defs: Definitions<'_>,
+    predicates: &mut Vec<(usize, i64, ScalarTy)>,
+) -> bool {
+    for op in block {
+        if operands(op).contains(&iter_arg) {
+            match op {
+                Op::Sentient(ops::Op::If { lhs, rhs, .. }) => {
+                    // `(getLhs() == iter_arg) ? getRhs() : getLhs()`, and the slot it sits in.
+                    let (slot, other) = if *lhs == iter_arg {
+                        (1, *rhs)
+                    } else {
+                        (0, *lhs)
+                    };
+                    match defs.of(other) {
+                        Some(Op::Sentient(ops::Op::ScalarConstant { value, ty, .. })) => {
+                            predicates.push((slot, *value, *ty));
+                        }
+                        _ => return false,
+                    }
+                }
+                // `use.getOwner() != yield_operand_op` — anything but the yielded add disqualifies.
+                _ if results(op).contains(&add_result) => {}
+                _ => return false,
+            }
+        }
+        for region in regions_ref(op) {
+            if !accepts_every_iter_arg_use(region, iter_arg, add_result, defs, predicates) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `:341-384` — the writes, in the reference's own order so the minted constants land in its order.
+fn apply_iter_arg_plan(
+    unit_body: &mut Vec<Op>,
+    at: &OpAt,
+    i: usize,
+    plan: &IterArgPlan,
+    values: &mut Values,
+) {
+    let Some(Op::Sentient(ops::Op::For { iv, body, .. })) = at.op_mut(unit_body) else {
+        return;
+    };
+    let iv = *iv;
+
+    // `builder.setInsertionPointToStart(loop.getBody(0))` — every adjusted predicate mints its
+    // constant at the head of the body, in the order the uses were collected.
+    let mut minted: Vec<Op> = Vec::new();
+    let mut planned = plan.predicates.iter();
+    adjust_iter_arg_predicates(body, plan, iv, &mut planned, &mut minted, values);
+    body.splice(0..0, minted);
+
+    replace_all_uses_with(body, plan.iter_arg, iv);
+    if let Some(Op::Sentient(ops::Op::Yield { results })) = body.last_mut()
+        && i < results.len()
+    {
+        results.remove(i);
+    }
+    // `if (add_op->use_empty()) add_op.erase();`
+    if use_count(plan.add_result, body) == 0 {
+        erase_defining_op(body, plan.add_result);
+    }
+}
+
+/// The `for (auto sentient_if : list_of_if_ops)` body (`:341-375`), re-finding each `sentient.if` by
+/// the operand that accepted it and consuming the plan in the same walk order.
+fn adjust_iter_arg_predicates<'a>(
+    block: &mut Vec<Op>,
+    plan: &IterArgPlan,
+    iv: Val,
+    planned: &mut impl Iterator<Item = &'a (usize, i64, ScalarTy)>,
+    minted: &mut Vec<Op>,
+    values: &mut Values,
+) {
+    for index in 0..block.len() {
+        if matches!(&block[index], Op::Sentient(ops::Op::If { .. }))
+            && operands(&block[index]).contains(&plan.iter_arg)
+            && let Some(&(slot, constant, ty)) = planned.next()
+        {
+            match plan.stride {
+                // `iter_arg == IV`, so the predicate already compares the right two values.
+                IterArgStride::Down if plan.adjustment == 0 => {}
+                // `iter_arg = IV - adjustment_val`: only the compared constant moves.
+                IterArgStride::Down => {
+                    let updated = mint_constant(minted, values, plan.adjustment + constant, ty);
+                    set_operand(&mut block[index], slot, updated);
+                }
+                // `iter_arg = adjustment_val - IV`: the comparison reverses, so the NON-iter-arg slot
+                // takes the induction variable and the iter arg's slot takes the new constant
+                // (`:370-372`).
+                IterArgStride::Up => {
+                    let updated = mint_constant(minted, values, plan.adjustment - constant, ty);
+                    set_operand(&mut block[index], slot, iv);
+                    set_operand(&mut block[index], 1 - slot, updated);
+                }
+            }
+        }
+        for region in regions_mut(&mut block[index]) {
+            adjust_iter_arg_predicates(region, plan, iv, planned, minted, values);
+        }
+    }
+}
+
+/// `mlir::sentient::ConstantOp::create(builder, ..)` at the pending insertion point.
+fn mint_constant(minted: &mut Vec<Op>, values: &mut Values, value: i64, ty: ScalarTy) -> Val {
+    let result = values.mint();
+    minted.push(Op::Sentient(ops::Op::ScalarConstant {
+        value,
+        result,
+        reg_locale: ops::RegType::Imm,
+        ty,
+        is_symbol: false,
+    }));
+    result
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -1495,6 +1856,31 @@ mod unit_tests {
             reg: None,
             element_size: None,
             ty: ScalarTy::Index,
+        })
+    }
+
+    /// `%out = sentient.scalar_add %lhs, %rhs : index`.
+    fn scalar_add(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    /// `sentient.if slt, %lhs, %rhs { sentient.nop }`.
+    fn if_slt(lhs: Val, rhs: Val) -> Op {
+        Op::Sentient(sentient::Op::If {
+            predicate: sentient::CmpPredicate::Slt,
+            lhs,
+            rhs,
+            yielded: Vec::new(),
+            dbg_name: None,
+            then_body: vec![nop()],
+            else_body: Vec::new(),
         })
     }
 
@@ -1834,5 +2220,90 @@ mod unit_tests {
                 ),
             })
         );
+    }
+
+    /// The vendor's own worked example (`Utils.hpp:97-118`): bound 2, init 3, stride +1, so
+    /// `%arg2 = 5 - %arg1`, the predicate's constant becomes `5 - 3 = 2` and swaps sides, and the
+    /// loop's result folds to `3 + 1 * 2 = 5` — ⛔ FIVE, NOT THE `4` THE COMMENT DRAWS; the code
+    /// (`Utils.cpp:387-389`) is the authority.
+    #[test]
+    fn e546_replaces_the_iter_arg_with_the_iv_and_reverses_the_predicate() {
+        let body = vec![
+            if_slt(Val(4), Val(2)),
+            scalar_add(Val(4), Val(0), Val(6)),
+            yield_op(vec![Val(6)]),
+        ];
+        let mut unit_body = vec![
+            constant(Val(0), 1),
+            constant(Val(1), 2),
+            constant(Val(2), 3),
+            for_op(Val(3), Val(1), vec![carried(Val(2), Val(4), Val(5))], body),
+            copy(Val(5), Val(7)),
+        ];
+        let mut values = Values::default();
+        while values.issued() < 10 {
+            let _ = values.mint();
+        }
+        let mut indices = Vec::new();
+        assert_eq!(
+            find_and_replace_redundant_iter_args_used_in_conditions(
+                &mut unit_body,
+                ForRef(Val(3)),
+                &mut values,
+                &mut indices,
+            ),
+            RedundantIterArgs::ToDelete
+        );
+        assert_eq!(indices, vec![IterArgIndex(0)]);
+        // The folded result sits in front of the loop and the only reader of the loop's result now
+        // reads it instead.
+        assert_eq!(unit_body[3], constant(Val(11), 5));
+        assert_eq!(unit_body[5], copy(Val(11), Val(7)));
+        // The predicate compares the new constant against the induction variable, the yield is one
+        // operand short of the loop's results, and the increment is gone.
+        let Op::Sentient(sentient::Op::For { body, carried, .. }) = &unit_body[4] else {
+            panic!("the fixture's own loop");
+        };
+        assert_eq!(carried.len(), 1);
+        assert_eq!(
+            body,
+            &vec![
+                constant(Val(10), 2),
+                if_slt(Val(10), Val(3)),
+                yield_op(Vec::new()),
+            ]
+        );
+    }
+
+    /// A use that is neither the yielded add nor a constant-compared `sentient.if` disqualifies the
+    /// iter arg, and nothing is rewritten (`Utils.cpp:333-341`).
+    #[test]
+    fn e546_leaves_an_iter_arg_with_another_reader_alone() {
+        let body = vec![
+            if_slt(Val(4), Val(2)),
+            copy(Val(4), Val(8)),
+            scalar_add(Val(4), Val(0), Val(6)),
+            yield_op(vec![Val(6)]),
+        ];
+        let mut unit_body = vec![
+            constant(Val(0), 1),
+            constant(Val(1), 2),
+            constant(Val(2), 3),
+            for_op(Val(3), Val(1), vec![carried(Val(2), Val(4), Val(5))], body),
+        ];
+        let before = unit_body.clone();
+        let mut values = Values::default();
+        let mut indices = Vec::new();
+        assert_eq!(
+            find_and_replace_redundant_iter_args_used_in_conditions(
+                &mut unit_body,
+                ForRef(Val(3)),
+                &mut values,
+                &mut indices,
+            ),
+            RedundantIterArgs::None
+        );
+        assert_eq!(unit_body, before);
+        assert!(indices.is_empty());
     }
 }
