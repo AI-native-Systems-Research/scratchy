@@ -80,16 +80,24 @@
 //! | `e388_isSubSet` | 388 | 1 | 5 | `dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:60` |
 //! | `e389_runOnOperation` | 389 | 1 | 26 | `dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:120` |
 
-// ⛔ THE PASS DRIVER IS `e389_runOnOperation`, STILL AN OPEN ANCHOR BELOW, so nothing outside this
-// file calls any of it yet and CI's `-D warnings` would fail on the first ported leaf.
-// ⭐ REMOVE THIS WITH `e389_runOnOperation`.
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — [`run_on_operation`] (e389) is the entry, and
+// there is no ported D29-D75 pass driver to call it, so nothing but this file's own tests reaches
+// anything here. CI runs clippy with `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: e389 is filled and the pass is still unwired.
 #![allow(dead_code)]
 
+use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
     DbgNamePrefix, new_dbg_name_from_list,
 };
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::sentient::SyncHalf;
-use crate::islands::sentient::dialects::{Op, dataflow, sentient, symbol, uniform};
+use crate::islands::sentient::dialects::{
+    self as dialects, Op, dataflow, sentient, symbol, uniform,
+};
+use crate::model::Model;
+use crate::transform::sentient::analyses::{InstructionEstimator, OutOfScopeInstructionEstimator};
+use crate::workload::Workload;
 
 /// WHERE AN OP SITS IN ITS BLOCK — the `Operation *` the pass carries in `to_be_deleted` and hands to
 /// [`fuse_sync_send_recv`] as the pair to fuse (`:123`, `:137-139`).
@@ -104,14 +112,24 @@ pub fn is_in(a: SyncHalf, b: &[SyncHalf]) -> bool {
     b.contains(&a)
 }
 
+/// Replaces: e388_isSubSet
+///
+/// Whether every peer of `a` is also a peer of `b` — the `for (auto a : A) if (!isIn(a, B))` of
+/// `:60-64`.
+///
+/// ⛔ AN EMPTY `A` IS A SUBSET OF ANYTHING, so two syncs naming no peers at all agree — which is what
+/// [`is_equal_sets`] then reports for the `getUnits()` of a broadcast-less pair.
+#[must_use]
+pub fn is_sub_set(a: &[SyncHalf], b: &[SyncHalf]) -> bool {
+    a.iter().all(|a| is_in(*a, b))
+}
+
 /// `isEqualSets` (`:66`) — mutual containment of the two syncs' peer lists.
 ///
-/// ⛔ ITS `isSubSet` HALF IS `e388_isSubSet`, WHOSE ANCHOR IS STILL OPEN BELOW, so each direction is
-/// written here as the one `all(is_in)` line `:60` is. e388's porter should collapse both onto it.
-/// `isEqualSets` itself is no ledger unit at all — one body line, and it is private here for that
+/// ⛔ NO LEDGER UNIT AT ALL: one body line, both halves being [`is_sub_set`], and private for that
 /// reason.
 fn is_equal_sets(a: &[SyncHalf], b: &[SyncHalf]) -> bool {
-    a.iter().all(|a| is_in(*a, b)) && b.iter().all(|b| is_in(*b, a))
+    is_sub_set(a, b) && is_sub_set(b, a)
 }
 
 /// THE FIVE OPS THE ELIGIBILITY WALK STEPS OVER — `dataflow.get_unit`, `sentient.scalar_constant`,
@@ -217,21 +235,140 @@ pub fn fuse_sync_send_recv(
     })
 }
 
-// crustify:todo: e388_isSubSet
-//   authority : dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:60  (5 body lines, level 1)
-//   original  : static bool isSubSet(mlir::ArrayAttr A, mlir::ArrayAttr B)
-//   calls     : e229_isIn
+/// `-dcc-sync-send-recv-fusion-disable`, `cl::init(false)` (`:33-36`) — a `dcc-opt` command-line flag,
+/// not a program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
 
-// crustify:todo: e389_runOnOperation
-//   authority : dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:120  (26 body lines, level 1)
-//   original  : void SyncSendRecvFusionPass::runOnOperation()
-//   calls     : e230_FuseSyncSendRecv, e231_getNextEligableNode
+/// `opts_.OptLevel == 0` (`:127`) — the PIPELINE's optimisation level, which is `2` by default
+/// (`dcc/tools/Options/dcc-pass-option.h:63-65`), so the shipped pipeline never reaches the
+/// `haveIbuffSpace` half of the `&&`.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// ONE BLOCK AND EVERY BLOCK NESTED IN IT — `unit_op.walk([&](mlir::Operation *op) { … })` (`:131-140`),
+/// whose default order is post-order.
+///
+/// ⛔ THE CURSOR STEPS **TWO** OVER A FUSION, AND THAT IS THE WALK, NOT AN OPTIMISATION. e230 inserts
+/// the new `sentient.sync sendrecv` BEFORE `op`, so the send the reference's iterator is standing on
+/// has moved to `at + 1` and its own next node is `at + 2`; the newly inserted op sits behind the
+/// cursor and is never visited.
+/// ⛔ THE QUEUE IS PER BLOCK, NOT PER MODULE. The reference keeps one `std::vector<Operation *>` for
+/// the whole module and erases at the very end; an [`InBlock`] indexes ONE `Vec<Op>`, so a shared queue
+/// would collide. It is observationally identical because `getNextEligableNode` is `getNextNode()` — a
+/// block sibling — so no fusion ever reads outside the block it started in.
+/// ⭐ AND THE QUEUE COMES OUT ASCENDING: a later fusion's send sits past the earlier pair's recv, since
+/// every op between a queued send and its recv is one of [`skipped_between_syncs`] and so is no sync.
+/// The erase therefore runs it in REVERSE and the indices stay valid.
+fn fuse_block(block: &mut Vec<Op>) {
+    for at in 0..block.len() {
+        for region in dialects::regions_mut(&mut block[at]) {
+            fuse_block(region);
+        }
+    }
+    let mut to_be_deleted: Vec<InBlock> = Vec::new();
+    let mut at = 0;
+    while at < block.len() {
+        // `std::find(to_be_deleted.begin(), to_be_deleted.end(), op) == to_be_deleted.end()`.
+        if to_be_deleted.contains(&InBlock(at)) {
+            at += 1;
+            continue;
+        }
+        let next_op = get_next_eligable_node(block, InBlock(at));
+        match fuse_sync_send_recv(block, InBlock(at), next_op) {
+            Some(fused) => {
+                to_be_deleted.push(fused.consumed.0);
+                to_be_deleted.push(fused.consumed.1);
+                at += 2;
+            }
+            None => at += 1,
+        }
+    }
+    for op in to_be_deleted.iter().rev() {
+        block.remove(op.0);
+    }
+}
+
+/// Replaces: e389_runOnOperation
+///
+/// The pass entry: unless the flag disables it, replace every send/recv pair of every program unit
+/// with one `sentient.sync sendrecv` and erase the pair (`:119-143`).
+///
+/// ⛔ NO UNIT FILTER — every `dataflow.program_unit` of the module, unlike
+/// [`super::store_and_forward_fusion::run_on_operation`]'s SFP/PE gate.
+/// ⛔ THE MISSING ANALYSIS IS NAMED, NOT SUBSTITUTED FOR: `haveIbuffSpace` stays a `todo!` behind
+/// [`OPT_LEVEL_ZERO`], whose value the pipeline fixes rather than this pass.
+/// ⭐ `getChildAnalysis<InstructionEstimator>(unit_op)` IS PER UNIT, constructed even for a unit the
+/// `&&` never asks anything of, exactly as the reference does (`:124-129`).
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    for unit in program.units.iter_mut() {
+        let mut instruction_estimator = OutOfScopeInstructionEstimator;
+        if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        fuse_block(&mut unit.body);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Fused, InBlock, fuse_sync_send_recv, get_next_eligable_node, is_in};
+    use super::{
+        Fused, InBlock, fuse_sync_send_recv, get_next_eligable_node, is_in, is_sub_set,
+        run_on_operation,
+    };
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::{Op, Val, sentient, symbol};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
+    use crate::units::DfirUnit;
+    use crate::workload::Workload;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One program whose only unit holds `body`.
+    fn program_of(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::L3lu, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
 
     /// One half of a rendezvous, from the arm that names a lowered destination.
     fn peer(dst: sentient::Consumer) -> sentient::SyncHalf {
@@ -358,5 +495,49 @@ mod unit_tests {
         // And the end of a block fuses with nothing.
         let mut block = vec![sync(sentient::SyncMode::Send, units, false, "a")];
         assert_eq!(fuse_sync_send_recv(&mut block, InBlock(0), None), None);
+    }
+
+    /// 🎯 e388 — containment is ONE-WAY: the smaller side is a subset, the larger is not, and the
+    /// empty side is a subset of anything.
+    #[test]
+    fn a_subset_is_one_way_and_the_empty_set_is_a_subset() {
+        let both = [
+            peer(sentient::Consumer::L3lu),
+            peer(sentient::Consumer::L0su),
+        ];
+        let one = [peer(sentient::Consumer::L0su)];
+        assert!(is_sub_set(&one, &both));
+        assert!(!is_sub_set(&both, &one));
+        assert!(is_sub_set(&[], &one));
+    }
+
+    /// 🎯 e389 — the driver fuses EVERY pair of a unit and erases all four originals: the second
+    /// pair still fuses although the first insertion shifted it, and nothing of the pairs survives.
+    /// ⭐ THE CURSOR STEP AND THE REVERSED ERASE ARE THE PORT.
+    #[test]
+    fn e389_fuses_every_pair_of_a_unit_and_erases_all_four_originals() {
+        let a = vec![peer(sentient::Consumer::L3lu)];
+        let b = vec![peer(sentient::Consumer::L0su)];
+        let mut program = program_of(vec![
+            sync(sentient::SyncMode::Send, a.clone(), false, "a0"),
+            sync(sentient::SyncMode::Recv, a.clone(), false, "a1"),
+            sync(sentient::SyncMode::Recv, b.clone(), false, "b0"),
+            sync(sentient::SyncMode::Send, b.clone(), false, "b1"),
+        ]);
+        run_on_operation(&mut program);
+
+        let sendrecv = |peers: Vec<sentient::SyncHalf>, dbg_name: &str| {
+            Op::Sentient(sentient::Op::Sync {
+                mode: sentient::SyncMode::SendRecv,
+                peers,
+                soft: false,
+                implicit_sync_memory_boundary: None,
+                dbg_name: Some(dbg_name.to_owned()),
+            })
+        };
+        assert_eq!(
+            program.units.iter().next().expect("the one unit").body,
+            vec![sendrecv(a, "SSRF(a0, a1)"), sendrecv(b, "SSRF(b0, b1)")]
+        );
     }
 }

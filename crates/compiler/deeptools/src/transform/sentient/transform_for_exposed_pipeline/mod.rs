@@ -513,11 +513,7 @@ impl Dependencies {
             for interval in intervals {
                 // `getIndexOfEntry(dependencies_with_min_gap_, op_interval.src) == -1` — the FIRST
                 // interval reduction to reach a source keeps it and every later one is dropped.
-                if !self
-                    .with_min_gap
-                    .iter()
-                    .any(|held| held.src == interval.src)
-                {
+                if index_of_entry(&self.with_min_gap, &interval.src).is_none() {
                     self.with_min_gap.push(interval);
                 }
             }
@@ -565,7 +561,7 @@ impl Dependencies {
                     continue;
                 }
                 if src == dst {
-                    match self.with_min_gap.iter().position(|held| held.src == *src) {
+                    match index_of_entry(&self.with_min_gap, src) {
                         None => self.with_min_gap.push(Dependency {
                             src: src.clone(),
                             dst: dst.clone(),
@@ -593,7 +589,7 @@ impl Dependencies {
                 ts.reduce_intervals(&mut deps);
             }
             for dep in deps {
-                if !self.with_min_gap.iter().any(|held| held.src == dep.src) {
+                if index_of_entry(&self.with_min_gap, &dep.src).is_none() {
                     self.with_min_gap.push(dep);
                 }
             }
@@ -601,10 +597,16 @@ impl Dependencies {
     }
 }
 
-// crustify:todo: e391_getIndexOfEntry
-//   authority : dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:131  (6 body lines, level 1)
-//   original  : int TransformForExposedPipelinePass::getIndexOfEntry( std::vector<Dependency> &op_and_gap_list, mlir::Operation *op)
-//   calls     : e252_size
+/// Replaces: e391_getIndexOfEntry
+///
+/// Where `op` is banked as a SOURCE in `op_and_gap_list`, if it is (`:131-137`).
+///
+/// ⛔ THE MATCH IS ON `src` ONLY: a source already banked against ANY destination is found, which is
+/// what makes the first hazard to reach a source the one that keeps it.
+/// ⛔ `-1` IS `None` — every caller tests it against `-1` before indexing, never arithmetically.
+fn index_of_entry(op_and_gap_list: &[Dependency], op: &OpId) -> Option<usize> {
+    op_and_gap_list.iter().position(|entry| entry.src == *op)
+}
 
 impl Dependencies {
     /// Replaces: e543_computeDependencies
@@ -734,7 +736,7 @@ fn precision_of<A: Arch>(unit: &ProgramUnit<A>) -> Precision {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Dependencies, mac_ops_flow_dependence, run_on_operation};
+    use super::{Dependencies, index_of_entry, mac_ops_flow_dependence, run_on_operation};
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::generated::OpFunc;
@@ -1440,5 +1442,27 @@ mod unit_tests {
         );
         // `t`→`u`'s gap of 4 is outside the reduced budget of 2, so `u` is left standing.
         assert_eq!(units.next().expect("the SFP unit").body, vec![nop("kept", 0)]);
+    }
+
+    /// 🎯 e391 — a banked SOURCE is found whatever destination it was banked against, and one that is
+    /// banked only as a DESTINATION is not found at all.
+    #[test]
+    fn e391_finds_a_banked_source_and_not_a_banked_destination() {
+        let banked = [
+            Dependency {
+                src: OpId::at(&[0]),
+                dst: OpId::at(&[1]),
+                gap: Cycles(3),
+            },
+            Dependency {
+                src: OpId::at(&[2]),
+                dst: OpId::at(&[2]),
+                gap: Cycles(0),
+            },
+        ];
+        assert_eq!(index_of_entry(&banked, &OpId::at(&[0])), Some(0));
+        assert_eq!(index_of_entry(&banked, &OpId::at(&[2])), Some(1));
+        assert_eq!(index_of_entry(&banked, &OpId::at(&[1])), None);
+        assert_eq!(index_of_entry(&[], &OpId::at(&[0])), None);
     }
 }
