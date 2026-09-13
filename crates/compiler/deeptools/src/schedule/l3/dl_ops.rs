@@ -9760,6 +9760,284 @@ mod tests_e221_e228 {
         assert_eq!(node.dst_indirect, None);
     }
 
+    /// The trackers and the placement entry 294 reaches through, which entry 336's own tests ask
+    /// nothing of beyond letting the index tensor fit the remaining LX whole.
+    struct PagedTrackers;
+
+    impl ExPhaseTrackers for PagedTrackers {
+        fn ex_phases(&self) -> Vec<ExPhase> {
+            vec![ExPhase(0)]
+        }
+
+        fn capacity(&self, _at: L3TrackerSite) -> Bytes {
+            Bytes(4096)
+        }
+
+        fn backup(&mut self, _at: L3TrackerSite) {}
+
+        fn restore_all(&mut self) {}
+
+        fn remove(&mut self, _at: L3TrackerSite, _name: &v1::StorageName) {}
+
+        fn check_and_add(
+            &mut self,
+            _at: L3TrackerSite,
+            _phase: ExPhase,
+            _name: &v1::StorageName,
+            _size: Bytes,
+        ) -> Option<v1::Placed> {
+            Some(v1::Placed::At(Bytes(0)))
+        }
+    }
+
+    struct PagedPlacement;
+
+    impl L3Placement for PagedPlacement {
+        fn buffer_capacity_even_sticks(
+            &self,
+            _alloc: AllocId,
+            _lds: LdsIdx,
+            _corelet: Corelet,
+            _row: Row,
+        ) -> Bytes {
+            Bytes(64)
+        }
+
+        fn address_fold_depth(&self) -> usize {
+            2
+        }
+
+        fn address_fold_coords(&self) -> usize {
+            1
+        }
+    }
+
+    impl v1::StorageNames for PagedPlacement {
+        fn lds_name(&self, lds: LdsIdx) -> v1::StorageName {
+            v1::StorageName(format!("lds{}", lds.0))
+        }
+
+        fn constant_name(&self, constant: ConstIdx) -> v1::StorageName {
+            v1::StorageName(format!("const{}", constant.0))
+        }
+    }
+
+    /// A DSC labelling the paged tensor at position 0 and its index tensor, whose ONE stick dim is
+    /// `Ki`, at position 1.
+    fn paged_and_index_dsc() -> DesignSpaceConfig {
+        let mut config = dsc(LdsIdx(7), &[(PrimaryDim::X, 8)], Pinning::default());
+        let index_layout = LayoutDims::new(PrimaryDim::Ki, Vec::new());
+        config.labeled_ds = LabeledDsList::new(
+            config.labeled_ds.front().clone(),
+            vec![LabeledDs::new(
+                DsType::KernelIdx,
+                vec![(PrimaryDim::Ki, Scale::Sized(1.0))],
+                LdsIdx(9),
+                Pinning::default(),
+            )],
+        );
+        config.primary_ds_info.insert(
+            DsType::KernelIdx,
+            PrimaryDsInfo {
+                layout: index_layout.clone(),
+                stick: StickDims(vec![(PrimaryDim::Ki, Elements(4))]),
+            },
+        );
+        config.layout_dims.insert(LdsIdx(1), index_layout);
+        config
+    }
+
+    /// One of the paged tensor's HBM<->LX transfers — the paged tensor names BOTH ends, and it is the
+    /// SOURCE end entry 336 selects on.
+    fn paged_transfer(unit: SenComponent, src: SenComponent, dst: SenComponent) -> TransferNode {
+        create_transfer_node(
+            Via {
+                loc: DataLocation { unit, storage: src },
+                lds: Some(LdsIdx(0)),
+            },
+            Via {
+                loc: DataLocation { unit, storage: dst },
+                lds: Some(LdsIdx(0)),
+            },
+            &[],
+            NodeName(format!(
+                "transfer_lds7_src:{}_dst:{}",
+                src.spelling(),
+                dst.spelling()
+            )),
+        )
+    }
+
+    /// e336 — the one paged tensor's load and its store both go indirect: the load stages the index
+    /// tensor into the L3LU IBR, the store stages it into LX and then into the L3SU IBR, and each
+    /// transfer ends up under a chunk/1page loop over the index stick dim.
+    #[test]
+    fn the_paged_tensors_load_and_store_both_reach_their_pages_through_an_ibr() {
+        let config = paged_and_index_dsc();
+        let mut tree = Tree::default();
+        let root = tree.add("root", Kind::Block, None);
+        let index_hbm = tree.add("allocate_lds9_hbm", Kind::Block, Some(root));
+        // The nest entry 225 left behind: its ibr/chunk loop still owns the two transfers.
+        let outer = tree.loop_over(CoreWindowDims::CORE, DatastageId(2), PrimaryDim::Ki, root);
+        let new_chunk = tree.loop_over(DatastageId(2), DATA_STAGE_CHUNK, PrimaryDim::Ki, outer.0);
+        let load = tree.add(
+            "load",
+            Kind::Transfer(paged_transfer(
+                SenComponent::L3lu,
+                SenComponent::Hbm,
+                SenComponent::Lx,
+            )),
+            Some(new_chunk.0),
+        );
+        let store = tree.add(
+            "store",
+            Kind::Transfer(paged_transfer(
+                SenComponent::L3su,
+                SenComponent::Lx,
+                SenComponent::Hbm,
+            )),
+            Some(new_chunk.0),
+        );
+        let mut metadata = BTreeMap::from([(
+            DscIdx(0),
+            DscMetadata {
+                new_allocations: BTreeMap::new(),
+            },
+        )]);
+        let mut allocs: v1::AllocArena = BTreeMap::new();
+
+        process_paged_tensor_transfers(
+            &mut tree,
+            &window_dims(&[]),
+            &config,
+            &mut metadata,
+            DscIdx(0),
+            &[load, store],
+            &[PagedTensorSite {
+                lds: Some(LdsIdx(0)),
+                lx: Some(AllocId(3)),
+                index: Some(PagedIndexSite {
+                    node: index_hbm,
+                    lds: Some(LdsIdx(1)),
+                    allocation: IndexHbmAllocation {
+                        alloc: AllocId(9),
+                        indirect: Some(IndirectAlloc::IndexTensor(IndexTensor::Index)),
+                        related_indirect: Some(AllocId(4)),
+                    },
+                }),
+            }],
+            &BTreeMap::from([(PrimaryDim::Ki, new_chunk)]),
+            PrimaryDim::Ki,
+            staged(&[(PrimaryDim::Ki, 8)])
+                .one_page(DatastageId(3))
+                .expect("a stated one-page stage"),
+            None,
+            &mut allocs,
+            &mut PagedTrackers,
+            &PagedPlacement,
+        )
+        .expect("both paged transfers went indirect");
+
+        // The load's IBR staging and then the store's, every node of both before the chunk loop.
+        let nest = tree.children(outer.0);
+        assert_eq!(
+            tree.names(&nest),
+            vec![
+                "allocate_lds9_l3luibr".to_owned(),
+                "transfer_lds9_src:hbm_dst:l3luibr".to_owned(),
+                "sync_send_l3lu_to_l3lu_paged_index_1".to_owned(),
+                "sync_receive_l3lu_from_l3lu_paged_index_1".to_owned(),
+                "allocate_lds9_l3suibr".to_owned(),
+                "transfer_lds9_src:lx_dst:l3suibr".to_owned(),
+                "sync_send_l3su_to_l3su_paged_index_1".to_owned(),
+                "sync_receive_l3su_from_l3su_paged_index_1".to_owned(),
+                tree.node_name(new_chunk.0).0,
+            ]
+        );
+        // The store's LX preload sits beside the index tensor's HBM allocation, outside the nest.
+        assert_eq!(
+            tree.names(&tree.children(root)),
+            vec![
+                "allocate_lds9_hbm".to_owned(),
+                "allocate_lds9_lx".to_owned(),
+                "transfer_lds9_src:hbm_dst:lx".to_owned(),
+                "sync_send_l3lu_to_l3su_paged_index_1".to_owned(),
+                "sync_receive_l3su_from_l3lu_paged_index_1".to_owned(),
+                tree.node_name(outer.0).0,
+            ]
+        );
+        // Each transfer gained its OWN chunk/1page loop inside the chunk loop.
+        let over_load = tree.parent(load).expect("the load has a parent");
+        let over_store = tree.parent(store).expect("the store has a parent");
+        assert_eq!(
+            tree.names(&[over_load, over_store]),
+            vec![
+                "loop_chunk_1page_ds1_ds3_ki_to_lx".to_owned(),
+                "loop_chunk_1page_ds1_ds3_ki_to_hbm".to_owned(),
+            ]
+        );
+        assert_eq!(tree.parent(over_load), Some(new_chunk.0));
+        assert_eq!(tree.parent(over_store), Some(new_chunk.0));
+        // The load reads its addresses through the load unit's IBR; the store writes through its own.
+        let ibr = |unit, storage| {
+            Some(Via {
+                loc: DataLocation { unit, storage },
+                lds: Some(LdsIdx(1)),
+            })
+        };
+        let loaded = tree.transfer(load);
+        assert_eq!(
+            (loaded.src_indirect, loaded.dst_indirect),
+            (ibr(SenComponent::L3lu, SenComponent::L3luibr), None)
+        );
+        let stored = tree.transfer(store);
+        assert_eq!(
+            (stored.src_indirect, stored.dst_indirect),
+            (None, ibr(SenComponent::L3su, SenComponent::L3suibr))
+        );
+        // Every staged allocation was recorded on the INDEX tensor's own organisations.
+        assert_eq!(
+            tree.mem_orgs,
+            vec![
+                (LdsIdx(1), SenComponent::L3luibr, AllocId(0)),
+                (LdsIdx(1), SenComponent::Lx, AllocId(1)),
+                (LdsIdx(1), SenComponent::L3suibr, AllocId(2)),
+            ]
+        );
+    }
+
+    /// e336 — a second paged tensor is *"Support no more than one paged tensor for now."*, refused
+    /// before anything at all is read off either one.
+    #[test]
+    fn a_second_paged_tensor_is_refused_before_any_of_it_is_read() {
+        let unread = PagedTensorSite {
+            lds: None,
+            lx: None,
+            index: None,
+        };
+        assert_eq!(
+            process_paged_tensor_transfers(
+                &mut Tree::default(),
+                &window_dims(&[]),
+                &paged_and_index_dsc(),
+                &mut BTreeMap::new(),
+                DscIdx(0),
+                &[],
+                &[unread, unread],
+                &BTreeMap::new(),
+                PrimaryDim::Ki,
+                staged(&[(PrimaryDim::Ki, 8)])
+                    .one_page(DatastageId(3))
+                    .expect("a stated one-page stage"),
+                None,
+                &mut BTreeMap::new(),
+                &mut PagedTrackers,
+                &PagedPlacement,
+            ),
+            None
+        );
+    }
+
     /// e228 — the node's own enclosing loop is distributed over the reference's element arrangement,
     /// and the whole list is added back as one spatial, one temporal and one elem-arr fold.
     #[test]
@@ -13452,12 +13730,141 @@ where
 //   extract   : crustify-ddc/cpp/l3.cpp:7448-7480
 //   calls     : e058_getNewDataStageIndex, e224_getAllPagedLdsIndices, e283_addOrUpdateCoreletSplitInParams
 
-// crustify:todo: e336_processPagedTensorTransfers
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6870  (71 body lines, level 3)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::processPagedTensorTransfers( SuperDsc &mySDsc, const int dscIdx, const std::vector<dsc2::TransferNode *> &l3TransferNodesAllTensors, const std::vector<dsc2::AllocateNode *> &pagedLdsHbmAllocNodes, const std::unordered_map<PrimaryDimTypes, dsc2::LoopNode *> &newPagedDimChunkLoo
-//   extract   : crustify-ddc/cpp/l3.cpp:7490-7567
-//   calls     : e226_createStoreIndexTensorToIbr, e227_convertTransferDirectToIndirect, e294_createStoreIndexTensorToLx
+/// THE INDEX TENSOR'S HBM ALLOCATION AS ENTRY 336 REACHES IT — the paged tensor's
+/// `relatedIndirectAccessAlloc_`, reduced to the node, the `ldsIdx_` and the allocation entries 226
+/// and 294 are handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedIndexSite {
+    /// The tree node it sits at — entry 294 inserts the index's LX allocation AFTER it.
+    pub node: NodeId,
+    /// `ldsIdx_` — [`None`] is *"Expect a valid index tensor."*
+    pub lds: Option<LdsIdx>,
+    /// The allocation itself, as entry 226 reads one.
+    pub allocation: IndexHbmAllocation,
+}
+
+/// ONE PAGED TENSOR'S HBM ALLOCATION AS ENTRY 336 READS IT — a `VALUE_TENSOR` HBM allocate node
+/// reduced to its `ldsIdx_`, the LX allocation of that labelled DS and the index one it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedTensorSite {
+    /// `ldsIdx_` — [`None`] is *"Expect a valid paged tensor ldsIdx."*
+    pub lds: Option<LdsIdx>,
+    /// `labeledDs_.at(ldsIdx_).memOrg_.at(LX).allocateNode_` — entry 294's `pagedLdsLxAllocNode`,
+    /// [`None`] being *"Expect LX in memOrg_."* and *"Expect valid paged tensor LX allocate node."*
+    /// both. ⛔ READ ON THE STORE ARM ONLY, exactly where entry 294 reads it.
+    pub lx: Option<AllocId>,
+    /// `relatedIndirectAccessAlloc_` — [`None`] is *"Expect a valid HBM allocate node."*
+    pub index: Option<PagedIndexSite>,
+}
+
+/// Replaces: e336_processPagedTensorTransfers
+///
+/// TURNS THE ONE PAGED TENSOR'S HBM<->LX TRANSFERS INDIRECT: per transfer, stages its index tensor
+/// into LX (stores only) and into that direction's IBR before the new chunk loop, then rewrites the
+/// transfer to reach its pages through that IBR.
+///
+/// ⚠️ TRAP: THE TRANSFER FILTER READS THE **SOURCE** LDS AT BOTH ENDS —
+/// `srcLdsAndLoopOffsets_.myLdsIdx_` — so the LX->HBM store is selected by its source too.
+/// ⛔ [`None`] IS *"Support no more than one paged tensor for now."*, both `ldsIdx_` checks, *"Expect
+/// a valid HBM allocate node."*, `labeledDs_.at()`, *"Expect a HBM->LX and/or a LX->HBM transfer
+/// node."*, *"Support only one stick dimension for now."*, *"Expect index stick dim to be innermost
+/// in chunk loop order"*, *"Expect the new chunk loop for the current dimension."* and entries 226,
+/// 227 and 294's own refusals.
+pub fn process_paged_tensor_transfers<T, M, P>(
+    tree: &mut T,
+    core: &CoreWindowDims,
+    dsc: &DesignSpaceConfig,
+    metadata: &mut BTreeMap<DscIdx, DscMetadata>,
+    dsc_idx: DscIdx,
+    l3_transfers: &[NodeId],
+    paged_hbm_allocations: &[PagedTensorSite],
+    new_paged_dim_chunk_loops: &BTreeMap<PrimaryDim, LoopId>,
+    inner_index_dim_in_chunk_loops: PrimaryDim,
+    one_page: OnePageStage,
+    super_chunk: Option<SuperChunkStage>,
+    allocs: &mut v1::AllocArena,
+    trackers: &mut M,
+    placement: &P,
+) -> Option<()>
+where
+    T: L3TreeSurgery + ?Sized,
+    M: ExPhaseTrackers + ?Sized,
+    P: L3Placement + v1::StorageNames,
+{
+    // "Support no more than one paged tensor for now."
+    (paged_hbm_allocations.len() <= 1).then_some(())?;
+    for site in paged_hbm_allocations {
+        let paged_lds = site.lds?;
+        dsc.labeled_ds.at(paged_lds)?;
+        let index = site.index?;
+        let index_lds = index.lds?;
+
+        // The paged tensor's HBM<->LX transfer nodes, both of them named by their SOURCE.
+        let mut paged_transfers = Vec::new();
+        for &node in l3_transfers {
+            let transfer = tree.transfer(node);
+            if transfer.src.data.my_lds_idx == Some(paged_lds) {
+                paged_transfers.push((node, transfer.src.storage));
+            }
+        }
+        // "Expect a HBM->LX and/or a LX->HBM transfer node."
+        (!paged_transfers.is_empty() && paged_transfers.len() <= 2).then_some(())?;
+
+        for (node, src_storage) in paged_transfers {
+            let direction = if src_storage == SenComponent::Hbm {
+                IbrDirection::In
+            } else {
+                IbrDirection::Out
+            };
+            // "Support only one stick dimension for now."
+            let [index_stick_dim] = dsc.stick_dims(index_lds)?[..] else {
+                return None;
+            };
+            // "Expect index stick dim to be innermost in chunk loop order"
+            (inner_index_dim_in_chunk_loops == index_stick_dim).then_some(())?;
+            // "Expect the new chunk loop for the current dimension."
+            let new_chunk_loop = *new_paged_dim_chunk_loops.get(&inner_index_dim_in_chunk_loops)?;
+
+            if direction == IbrDirection::Out {
+                create_store_index_tensor_to_lx(
+                    tree,
+                    dsc,
+                    metadata,
+                    dsc_idx,
+                    index_lds,
+                    index.allocation,
+                    index.node,
+                    site.lx?,
+                    new_chunk_loop,
+                    allocs,
+                    trackers,
+                    placement,
+                )?;
+            }
+            create_store_index_tensor_to_ibr(
+                tree,
+                dsc,
+                metadata,
+                dsc_idx,
+                index_lds,
+                index.allocation,
+                new_chunk_loop,
+                direction,
+            )?;
+            convert_transfer_direct_to_indirect(
+                tree,
+                core,
+                node,
+                one_page,
+                super_chunk,
+                index_lds,
+                index_stick_dim,
+                direction,
+            )?;
+        }
+    }
+    Some(())
+}
 
 // crustify:todo: e350_getMinParamConv2d
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:896  (26 body lines, level 4)

@@ -455,6 +455,19 @@ impl DesignSpaceConfig {
         let info = self.primary_ds_info.get(&ds_type)?;
         shape_constraints::cumulative_stick_sizes(&info.stick, StickPart::Whole)
     }
+
+    /// `getStickDims(ldsIdx)` (`dsc/designSpaceConfig.h:244`) — `primaryDsInfo_.at(dsType_)
+    /// .stickDimOrder_` of the labelled DS sitting at that POSITION, in `stickDimOrder_` order.
+    ///
+    /// ⛔ [`None`] IS EITHER `.at()` THROWING: a position past `labeledDs_`, or a DS type this DSC
+    /// states no `primaryDsInfo_` entry for.
+    #[must_use]
+    pub fn stick_dims(&self, lds: LdsIdx) -> Option<Vec<PrimaryDim>> {
+        let info = self
+            .primary_ds_info
+            .get(&self.labeled_ds.at(lds)?.ds_type())?;
+        Some(info.stick.0.iter().map(|&(dim, _)| dim).collect())
+    }
 }
 
 /// WHICH DSC OF THE SUPER-DSC — an index into `dscs_` (`dsc/superdsc.h:67`), which is also the key
