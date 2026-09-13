@@ -94,14 +94,16 @@
 pub(crate) mod register_init_candidate_promoter;
 pub(crate) mod register_init_info;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use crate::arch::Arch;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
 use crate::islands::sentient::print;
-use crate::transform::sentient::analyses::UniformGroups;
+use crate::transform::sentient::analyses::{Liveness, RegisterGraphs, UniformGroups};
 use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
 
 use self::register_init_info::{RegisterInitInfo, SsaWeights};
@@ -349,10 +351,51 @@ pub fn get_first_source<U: UniformGroups>(
     tmp_uvs.pairs.first().and_then(|(_unit, value)| *value)
 }
 
-// crustify:todo: e631_promoteRegisterInitCandidatesAboveUniformRegion
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1036  (5 body lines, level 6)
-//   original  : void OldRegisterInitializationPass:: promoteRegisterInitCandidatesAboveUniformRegion( dataflow::ProgramUnitOp &unit, std::vector<mlir::Value> &base_fold_units, Liveness &liveness, llvm::DenseMap<mlir::Value, RegisterInitInfo> &rtis, const UniformGroupAnalyzer &uga)
-//   calls     : e606_run
+/// Replaces: e631_promoteRegisterInitCandidatesAboveUniformRegion
+///
+/// Runs [`register_init_candidate_promoter::run`] over one unit — the whole body is constructing the
+/// promoter and calling it.
+///
+/// ⛔ THE PROMOTER'S THREE STORAGE MEMBERS ARE FRESH PER CALL (`:798-800`): the candidates, the
+/// erasures and the replacement pairs die with the promoter, so they are locals here and NOT the
+/// pass's own state, which `runOnOperation` keeps separately.
+/// ⭐ `arg` IS A PARAMETER BECAUSE THE ISLAND CARRIES NO `iter_arg` — the recorded gap
+/// [`crate::islands::sentient::dialects::Definitions::within_program_unit`] names, and the same
+/// mechanism-supplied-by-the-caller decision.
+pub fn promote_register_init_candidates_above_uniform_region<
+    A: Arch,
+    L: Liveness + Clone,
+    G: RegisterGraphs + Default,
+    U: UniformGroups,
+>(
+    unit: &mut ProgramUnit<A>,
+    arg: Val,
+    base_fold_units: &[Val],
+    liveness: &mut L,
+    rtis: &mut BTreeMap<Val, RegisterInitInfo>,
+    uga: &U,
+    values: &mut Values,
+) {
+    let on = unit.on.kind();
+    let units = unit.on.vals();
+    let mut to_be_erased = BTreeSet::new();
+    let mut all_reginit_candidates = Vec::new();
+    let mut all_replacement_pairs = Vec::new();
+    register_init_candidate_promoter::run::<A, L, G, U>(
+        &mut unit.body,
+        on,
+        arg,
+        &units,
+        base_fold_units,
+        rtis,
+        liveness,
+        uga,
+        values,
+        &mut to_be_erased,
+        &mut all_reginit_candidates,
+        &mut all_replacement_pairs,
+    );
+}
 
 // crustify:todo: e644_runOnOperation
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1203  (111 body lines, level 7)
@@ -364,15 +407,20 @@ mod unit_tests {
     use super::register_init_info::{RegisterInitInfo, SsaWeight, SsaWeights};
     use super::{
         dump_weight, dump_weights, erase_deleted_ops, get_first_source, has_same_attr,
-        move_ssa_to_init, remove_init_attr_from_ops,
+        move_ssa_to_init, promote_register_init_candidates_above_uniform_region,
+        remove_init_attr_from_ops,
     };
+    use crate::arch::Dd2;
     use crate::formats::Bits;
-    use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{Units, Values};
+    use crate::islands::sentient::ProgramUnit;
     use crate::islands::sentient::dialects::{Op, Val, dataflow, sentient};
-    use crate::transform::sentient::analyses::UniformGroups;
+    use crate::transform::sentient::analyses::{
+        Liveness, OutOfScopeRegisterGraphs, UniformGroups, VirtualAssigns,
+    };
     use crate::units::{DfirUnit, Residency};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// The out-of-scope group analysis, answering for ONE leader with no followers.
     struct OneUnit(Val);
@@ -612,5 +660,67 @@ mod unit_tests {
         // ⭐ AND A LOOP ITER ARGUMENT READS THE LOOP'S OWN ARRAY AT ITS POSITION.
         assert!(has_same_attr(Some(Val(8)), Some(Val(4)), &scope));
         assert!(!has_same_attr(Some(Val(8)), Some(Val(2)), &scope));
+    }
+
+    /// The out-of-scope liveness, recording only what the promoter's post-processing asks of it.
+    #[derive(Clone, Default)]
+    struct Recording {
+        cleared: Vec<VirtualAssigns>,
+        recomputed: Vec<usize>,
+    }
+
+    impl Liveness for Recording {
+        fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {
+            todo!("no candidate is promoted here")
+        }
+
+        fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
+            todo!("this fake is never asked about an overlap")
+        }
+
+        fn clear(&mut self, virtual_assigns: VirtualAssigns) {
+            self.cleared.push(virtual_assigns);
+        }
+
+        fn compute_register_live_range(&mut self, unit: &[Op]) {
+            self.recomputed.push(unit.len());
+        }
+
+        fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {
+            todo!("this fake is never given an optional assignment")
+        }
+
+        fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
+            todo!("this fake is never given an enforced assignment")
+        }
+    }
+
+    /// e631 — the promoter runs over the unit's own body and units, and its post-processing lands on
+    /// the caller's liveness even when there is no core to take a candidate from.
+    #[test]
+    fn e631_runs_the_promoter_over_the_unit_and_keeps_none_of_its_state() {
+        let mut unit = ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::L3lu, Val(1)),
+            precision: None,
+            body: vec![copy(7, 8, None, false)],
+            arch: core::marker::PhantomData,
+        };
+        let mut liveness = Recording::default();
+        let mut rtis = BTreeMap::new();
+        let uga = OneUnit(Val(1));
+        let mut values = Values::default();
+        promote_register_init_candidates_above_uniform_region::<Dd2, _, OutOfScopeRegisterGraphs, _>(
+            &mut unit,
+            Val(0),
+            &[],
+            &mut liveness,
+            &mut rtis,
+            &uga,
+            &mut values,
+        );
+        // No core, so the first round broke on `all_empty` — and `postProcessing` still ran.
+        assert_eq!(liveness.cleared, vec![VirtualAssigns::Kept]);
+        assert_eq!(liveness.recomputed, vec![1]);
+        assert_eq!(unit.body.len(), 1);
     }
 }

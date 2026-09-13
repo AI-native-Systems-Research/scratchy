@@ -82,15 +82,32 @@
 //! | `e604_findCandidates` | 604 | 5 | 30 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:402` |
 //! | `e630_run` | 630 | 6 | 130 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:607` |
 
+#![allow(dead_code)]
+// ⛔ NOTHING CALLS THIS FILE'S MANAGER YET — `e630_run` below is ported, but the pass ENTRY that
+// constructs a manager per top-level loop is `e643_runOnOperation` (`MultiDimLoopPeeling.cpp:738`),
+// still an unfilled anchor in this module's `mod.rs`. CI runs clippy with `-D warnings`, so without
+// this the batch fails its own gate.
+// ⭐ REMOVE THIS WITH `e643_runOnOperation`: an unused item here is a real defect at that point.
+
 use super::{IvLoopInfo, Peeling, PeelingCandidates};
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, StaticBranch, Val, replace_if_with_region, sentient, static_if_branch,
     static_operand,
 };
 use crate::transform::sentient::ForRef;
-use crate::transform::sentient::utils::reverse_predicate;
+use crate::transform::sentient::analyses::{
+    ExpressionEvaluator, InstructionCount, InstructionEstimator, PropagationAnalysis, UnitIndexMap,
+};
+use crate::transform::sentient::lightweight_simplification::sentient::run_light_weight_simplifications;
+use crate::transform::sentient::loop_absorption::run_loop_absorption;
+use crate::transform::sentient::loop_merging::run_loop_merging;
+use crate::transform::sentient::op_rerolling::{MergeXrfIntoMac, RerollScope, run_op_rerolling};
+use crate::transform::sentient::scalar_simplifications::sentient::Propagation;
+use crate::transform::sentient::utils::{InBlock, OpAt, reverse_predicate};
 
 /// WHERE ONE OP SITS IN A REGION TREE — the block reached by taking region `r` of the op at index `i`
 /// for each `(i, r)` of `into`, then index `at` in that block.
@@ -353,14 +370,21 @@ fn next_static_if(candidates: IfOpsToSimplify, block: &[Op]) -> Option<(RegionPa
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        IfOpsToSimplify, IvLoopInfo, Peeling, PeelingCandidates, PredicatesOnIv, compute_peeling_info,
-        copy_one_iter, decrement_predicates_on_iv, find_candidates, perform_loop_peeling,
-        simplify_conditionals,
+        IfOpsToSimplify, IvLoopInfo, Peeling, PeelingCandidates, PredicatesOnIv, ProgramUnit,
+        compute_peeling_info, copy_one_iter, decrement_predicates_on_iv, find_candidates,
+        perform_loop_peeling, run, simplify_conditionals, top_level_at,
     };
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
     use crate::transform::sentient::ForRef;
+    use crate::transform::sentient::analyses::{
+        Evaluation, ExpressionEvaluator, InstructionCount, InstructionEstimator, OffsetSites,
+        Offsets, OutOfScopePropagationAnalysis, OutOfScopeUnitIndexMap,
+    };
+    use crate::units::DfirUnit;
 
     /// e568 — on a loop of bound 8 (whose IV counts 8 down to 1) `%iv >= 8` names the FIRST
     /// iteration and reads the same way with the operands swapped, `%iv > 1` names the LAST, and a
@@ -862,6 +886,195 @@ mod unit_tests {
             Op::Sentient(sentient::Op::ScalarAdd { lhs, .. }) if lhs == last_yielded
         ));
     }
+
+    /// AN ESTIMATOR THAT STATES ITS TWO ANSWERS — the reference's `UnderEstimateInstructionEstimator`
+    /// is out of campaign scope, and only these two of its methods are asked.
+    struct StatedEstimator {
+        original: InstructionCount,
+        per_op: i32,
+        ibuff: InstructionCount,
+    }
+
+    impl InstructionEstimator for StatedEstimator {
+        fn recalculate(&mut self, _unit: &[Op]) {
+            todo!("no run of this fixture recalculates")
+        }
+
+        fn estimated_instruction_count_of_op(&mut self, op: &Op) -> InstructionCount {
+            // The first question is about the loop being peeled; every later one is about one op of
+            // the dummy loop's body.
+            if matches!(op, Op::Sentient(sentient::Op::For { .. })) && self.original.0 > 0 {
+                let answer = self.original;
+                self.original = InstructionCount(0);
+                return answer;
+            }
+            InstructionCount(self.per_op)
+        }
+
+        fn estimated_instruction_count_of_region(&mut self, _region: &[Op]) -> InstructionCount {
+            todo!("no run of this fixture counts a region")
+        }
+
+        fn have_ibuff_space(&mut self, _unit: &[Op]) -> bool {
+            todo!("no run of this fixture asks whether the unit fits")
+        }
+
+        fn remaining_ibuff_space(&mut self, _unit: &[Op]) -> InstructionCount {
+            self.ibuff
+        }
+    }
+
+    /// An evaluator that knows nothing, so no simplification below turns on an offset it stated.
+    struct BlindEvaluator;
+
+    impl ExpressionEvaluator for BlindEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            Evaluation {
+                known_absolute: false,
+                base: None,
+                offsets: Offsets::PerUnit(Vec::new()),
+            }
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("no op of this fixture evaluates a sum")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("no op of this fixture is known absolute")
+        }
+    }
+
+    /// An SFP unit holding `body` — one of the three components the pass runs on.
+    fn sfp_unit(body: Vec<Op>) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(DfirUnit::Sfp, Val(900)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e630's vendor shape — a loop of bound 8 whose body tests its own first iteration goes into the
+    /// throwaway loop and is peeled there.
+    ///
+    /// ⛔ THE SPECULATION CANNOT BE SCORED YET: the third compression pass `run` runs over the dummy
+    /// is [`run_op_rerolling`], and `e519_processOneBlock` reaches unported `e335` at the dummy body's
+    /// first op — so what is observable is the state at that seam, with the dummy loop built beside an
+    /// original that has not been replaced. ⭐ REVISIT THIS ASSERTION WITH e335.
+    #[test]
+    fn e630_peels_into_the_dummy_loop_and_stops_at_the_unported_rerolling() {
+        let mut unit = sfp_unit(vec![
+            constant(8, Val(1)),
+            for_loop(
+                Val(3),
+                Val(1),
+                Vec::new(),
+                vec![
+                    if_op(
+                        sentient::CmpPredicate::Sge,
+                        Val(3),
+                        Val(1),
+                        vec![add(Val(1), Val(1), Val(5))],
+                        Vec::new(),
+                    ),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: Vec::new(),
+                    }),
+                ],
+            ),
+        ]);
+        let mut preamble = Vec::new();
+        let mut values = Values::default();
+        for _ in 0..100 {
+            values.mint();
+        }
+
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(
+                ForRef(Val(3)),
+                &mut unit,
+                &mut preamble,
+                &mut IvLoopInfo::default(),
+                &mut StatedEstimator {
+                    original: InstructionCount(100),
+                    per_op: 1,
+                    ibuff: InstructionCount(0),
+                },
+                &mut BlindEvaluator,
+                &mut OutOfScopePropagationAnalysis,
+                &OutOfScopeUnitIndexMap,
+                &mut values,
+            );
+        }));
+
+        assert!(
+            reached.is_err(),
+            "rerolling the dummy loop reaches unported e335"
+        );
+        // The dummy loop was built beside the original, and the original is still standing because
+        // the profitability comparison is downstream of the seam.
+        assert!(top_level_at(&unit.body, ForRef(Val(3))).is_some());
+        assert_eq!(
+            unit.body
+                .iter()
+                .filter(|op| matches!(op, Op::Sentient(sentient::Op::For { .. })))
+                .count(),
+            2,
+            "the throwaway loop holding the peeled clone, and the original"
+        );
+    }
+
+    /// e630's negative — ⛔ A LOOP WITH NOTHING TO PEEL LEAVES THE UNIT EXACTLY AS IT WAS: the dummy
+    /// loop and its constant are both erased, so a non-candidate costs the unit nothing.
+    #[test]
+    fn e630_a_loop_with_no_candidate_leaves_the_unit_untouched() {
+        let body = vec![
+            constant(8, Val(1)),
+            for_loop(
+                Val(3),
+                Val(1),
+                Vec::new(),
+                vec![
+                    add(Val(1), Val(1), Val(5)),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: Vec::new(),
+                    }),
+                ],
+            ),
+        ];
+        let mut unit = sfp_unit(body.clone());
+        let mut preamble = Vec::new();
+        let mut values = Values::default();
+        for _ in 0..100 {
+            values.mint();
+        }
+
+        run(
+            ForRef(Val(3)),
+            &mut unit,
+            &mut preamble,
+            &mut IvLoopInfo::default(),
+            &mut StatedEstimator {
+                original: InstructionCount(100),
+                per_op: 1,
+                ibuff: InstructionCount(0),
+            },
+            &mut BlindEvaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut values,
+        );
+
+        assert_eq!(unit.body, body);
+        assert!(preamble.is_empty());
+    }
 }
 
 /// Replaces: e322_copyOneIter
@@ -1209,7 +1422,219 @@ pub fn find_candidates(for_op: ForRef, unit: &[Op], ivs: &mut IvLoopInfo) -> Pee
     candidates
 }
 
-// crustify:todo: e630_run
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:607  (130 body lines, level 6)
-//   original  : void LoopPeelingManager::run()
-//   calls     : e321_printLoopToPeelingType, e448_performLoopPeeling, e564_runLoopMerging, e571_runOpRerolling, e597_runLightWeightSimplifications, e600_runLoopAbsorption, e604_findCandidates
+/// `SkipPeelingIfLeadsToMoreInstrs`, `cl::init(false)` (`:41-44`) — a `dcc-opt` flag, and this crate
+/// has no flags.
+const SKIP_PEELING_IF_LEADS_TO_MORE_INSTRS: bool = false;
+
+/// The top-level index of the `sentient.for` `loop_ref` names.
+fn top_level_at(block: &[Op], loop_ref: ForRef) -> Option<usize> {
+    block.iter().position(
+        |op| matches!(op, Op::Sentient(sentient::Op::For { iv, .. }) if *iv == loop_ref.0),
+    )
+}
+
+/// `dcc::utils::getLoopNestLevel<sentient::ForOp>` (`dcc/src/Utils/Utils.cpp:211-220`) — how many
+/// `sentient.for`s enclose this one, the outermost answering 0 and a loop not here `i64::MAX`.
+fn loop_nest_level(loop_ref: ForRef, scope: &[Op], enclosing: i64) -> i64 {
+    for op in scope {
+        if let Op::Sentient(inner) = op {
+            if let sentient::Op::For { iv, .. } = inner
+                && *iv == loop_ref.0
+            {
+                return enclosing;
+            }
+            let deeper = enclosing + i64::from(matches!(inner, sentient::Op::For { .. }));
+            for region in sentient::regions(inner) {
+                let level = loop_nest_level(loop_ref, region, deeper);
+                if level < i64::MAX {
+                    return level;
+                }
+            }
+        }
+    }
+    i64::MAX
+}
+
+/// Drops the dummy loop and its constant, whatever became of the nest inside it — the reference's
+/// `dummy_loop->erase(); dummy_constant->erase();` (`:732-733`).
+fn erase_dummy(block: &mut Vec<Op>, dummy_loop: ForRef, dummy_value: Val) {
+    if let Some(at) = top_level_at(block, dummy_loop) {
+        block.remove(at);
+    }
+    block.retain(
+        |op| !matches!(op, Op::Sentient(sentient::Op::ScalarConstant { result, .. }) if *result == dummy_value),
+    );
+}
+
+/// Replaces: e630_run
+///
+/// Peels one top-level loop SPECULATIVELY: a clone of it goes inside a throwaway loop, every peelable
+/// loop of the clone is peeled and the result compressed, and the clone replaces the original only if
+/// it costs no more instructions — or overruns by less than the IBUFF has left (`:607-734`).
+///
+/// ⛔⛔ THE DUMMY LOOP IS WHAT MAKES THE COMPARISON POSSIBLE AND ITS BOUND OF 2 IS LOAD-BEARING
+/// (`:625-627`): at 0 or 1 [`run_light_weight_simplifications`] would delete the loop it is holding,
+/// and its `sentient.yield` is what keeps the last iteration's results used.
+/// ⛔ `orig_instr_count` IS TAKEN UP FRONT, unlike the reference (`:687-688`), because the four
+/// compression passes below reach the whole unit here and would have counted the peeled loop.
+/// ⚠️ DIVERGENCE, AND IT IS THE SAME ONE e448 MAKES: absorption, merging and simplification are
+/// scoped to the unit body rather than to the dummy loop, since a nested block cannot resolve the
+/// constants above it. Only [`RerollScope`] can state the reference's narrower scope, so it does.
+/// ⭐ `llvm_unreachable("failed in simplifying code")` (`:670`) IS AN ABORT, which is what the
+/// `panic!` is; [`Propagation::Failed`] is unreachable on the shipped simplification path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run<
+    A: Arch,
+    I: InstructionEstimator,
+    E: ExpressionEvaluator,
+    P: PropagationAnalysis,
+    U: UnitIndexMap,
+>(
+    outer_loop: ForRef,
+    unit: &mut ProgramUnit<A>,
+    preamble: &mut Vec<Op>,
+    ivs: &mut IvLoopInfo,
+    estimator: &mut I,
+    evaluator: &mut E,
+    propagation: &mut P,
+    unit_index_map: &U,
+    values: &mut Values,
+) {
+    let avail_ibuff_space = estimator.remaining_ibuff_space(&unit.body);
+    let Some(at) = top_level_at(&unit.body, outer_loop) else {
+        return;
+    };
+    let orig_instr_count = estimator.estimated_instruction_count_of_op(&unit.body[at]);
+
+    // The dummy loop: a bound of 2, one dummy init per result of the loop being peeled, and a clone of
+    // that loop yielding its results (`:610-653`).
+    let Op::Sentient(sentient::Op::For { carried, .. }) = &unit.body[at] else {
+        return;
+    };
+    let original_results: Vec<Val> = carried.iter().map(|entry| entry.result).collect();
+    let dummy_value = values.mint();
+    let dummy_carried: Vec<sentient::Carried> = carried
+        .iter()
+        .map(|entry| sentient::Carried {
+            init: dummy_value,
+            arg: values.mint(),
+            result: values.mint(),
+            // `outer_loop_.getRegLocales()` — the loop being peeled carries the locales.
+            reg: entry.reg,
+            program_header: false,
+            element_size: entry.element_size,
+        })
+        .collect();
+    let mut mapping = ValueMapping::default();
+    let Some(cloned) =
+        dialects::clone_ops(core::slice::from_ref(&unit.body[at]), values, &mut mapping).pop()
+    else {
+        return;
+    };
+    let Op::Sentient(sentient::Op::For {
+        iv: cloned_iv,
+        carried: cloned_carried,
+        ..
+    }) = &cloned
+    else {
+        return;
+    };
+    let cloned_loop = ForRef(*cloned_iv);
+    let yielded: Vec<Val> = cloned_carried.iter().map(|entry| entry.result).collect();
+    let dummy_loop = ForRef(values.mint());
+    let dummy = Op::Sentient(sentient::Op::For {
+        iv: dummy_loop.0,
+        bound: dummy_value,
+        bound_reg: None,
+        carried: dummy_carried,
+        dbg_name: None,
+        body: vec![
+            cloned,
+            Op::Sentient(sentient::Op::Yield { results: yielded }),
+        ],
+    });
+    // ⭐ THE CONSTANT LANDS IN THE UNIT BODY, not at `const_builder_`'s module-block position, for
+    // e322's reason: a bound is resolved by [`dialects::defining_op`] against the block it is in.
+    unit.body
+        .insert(at, scalar_constant(2, dummy_value, ScalarTy::Index));
+    unit.body.insert(at + 1, dummy);
+
+    let mut candidates = find_candidates(cloned_loop, &unit.body, ivs);
+    if candidates.records().is_empty() {
+        erase_dummy(&mut unit.body, dummy_loop, dummy_value);
+        return;
+    }
+    // `std::sort(.., getLoopNestLevel(a) < getLoopNestLevel(b))` — outermost first, which is the order
+    // [`perform_loop_peeling`] consumes in REVERSE.
+    candidates
+        .0
+        .sort_by_key(|&(loop_ref, _)| loop_nest_level(loop_ref, &unit.body, 0));
+    perform_loop_peeling(&candidates, &mut unit.body, values);
+
+    let mut consts = Vec::new();
+    let simplified = run_light_weight_simplifications(
+        &mut consts,
+        &mut unit.body,
+        evaluator,
+        propagation,
+        unit_index_map,
+        values,
+    );
+    preamble.splice(0..0, consts);
+    if simplified == Propagation::Failed {
+        panic!("failed in simplifying code");
+    }
+    if let Some(dummy_at) = top_level_at(&unit.body, dummy_loop) {
+        run_op_rerolling(
+            unit,
+            &RerollScope::Op(OpAt::top(InBlock(dummy_at))),
+            MergeXrfIntoMac::No,
+        );
+    }
+    run_loop_absorption(preamble, &mut unit.body, values);
+    run_loop_merging(&mut unit.body, values);
+
+    // Cost analysis: the dummy loop's body up to but not including its `sentient.yield` (`:690-695`).
+    let Some(dummy_at) = top_level_at(&unit.body, dummy_loop) else {
+        return;
+    };
+    let Op::Sentient(sentient::Op::For { body, .. }) = &unit.body[dummy_at] else {
+        return;
+    };
+    let mut new_instr_count = InstructionCount(0);
+    for op in body
+        .iter()
+        .take_while(|op| !matches!(op, Op::Sentient(sentient::Op::Yield { .. })))
+    {
+        new_instr_count.0 += estimator.estimated_instruction_count_of_op(op).0;
+    }
+    let profitable = new_instr_count <= orig_instr_count
+        || (!SKIP_PEELING_IF_LEADS_TO_MORE_INSTRS
+            && new_instr_count.0 - orig_instr_count.0 < avail_ibuff_space.0);
+    if !profitable {
+        // "Revert to the original by deleting dummy_loop" (`:726-727`).
+        erase_dummy(&mut unit.body, dummy_loop, dummy_value);
+        return;
+    }
+
+    // The original loop's results become what the dummy's terminator hands back, then the dummy's body
+    // takes the original loop's place and the original goes (`:710-722`).
+    let Op::Sentient(sentient::Op::For { body, .. }) = &mut unit.body[dummy_at] else {
+        return;
+    };
+    let mut moved = core::mem::take(body);
+    let terminator = moved.pop();
+    if let Some(Op::Sentient(sentient::Op::Yield { results })) = &terminator {
+        for (of, with) in original_results.iter().zip(results) {
+            dialects::replace_all_uses_with(&mut unit.body, *of, *with);
+        }
+    }
+    let Some(original_at) = top_level_at(&unit.body, outer_loop) else {
+        return;
+    };
+    unit.body.splice(original_at..original_at, moved);
+    if let Some(original_at) = top_level_at(&unit.body, outer_loop) {
+        unit.body.remove(original_at);
+    }
+    erase_dummy(&mut unit.body, dummy_loop, dummy_value);
+}

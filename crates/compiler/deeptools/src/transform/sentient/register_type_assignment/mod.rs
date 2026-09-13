@@ -107,9 +107,14 @@ use crate::islands::dataflow_ir::Values;
 use crate::islands::sentient::dialects::{
     self as dialects, Op, UniformRegions, Val, dataflow, sentient, symbol, uniform,
 };
-use crate::islands::sentient::print;
+use crate::islands::sentient::{Program, print};
+use crate::model::Model;
 use crate::transform::sentient::utils::{self, Hoisted, InBlock, NewUse, OpAt};
 use crate::units::{Core, DfirUnit};
+use crate::workload::Workload;
+
+/// `DisableThisPass`, `cl::init(false)` (`:52-56`).
+const DISABLE_THIS_PASS: bool = false;
 
 /// `RegisterLocales` (`:87-102`) IS THE ISLAND'S [`sentient::RegType`], not a second enum.
 ///
@@ -2391,19 +2396,62 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
     }
 }
 
-// crustify:todo: e633_runOnOperation
-//   authority : dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:113  (17 body lines, level 6)
-//   original  : void runOnOperation() override
-//   calls     : e524_initializeAssignmentForAnOperation, e609_runOn
+impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
+    /// Replaces: e633_runOnOperation
+    ///
+    /// The pass entry: record the module-level `imm` locales — constants, then symbols, then unit
+    /// handles — and then run [`Self::run_on`] over every program unit (`:113-129`).
+    ///
+    /// ⛔ THE THREE MODULE WALKS ARE THREE PASSES OVER THE SAME BLOCK, IN THAT ORDER, and the order
+    /// is observable: `global_const_assignments` is a map, but e524's [`OpScope::Module`] arm
+    /// `insert`s, so the FIRST of two ops binding one value wins.
+    /// ⛔ NEITHER WALK DESCENDS: `func.getOps<T>()` is the func's own block, so a constant inside a
+    /// unit is e574's to find, not this one's — and the [`OpScope::Module`] arm creates no copies, so
+    /// no cursor can be stepped over here.
+    pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+        values: &mut Values,
+    ) {
+        if DISABLE_THIS_PASS {
+            return;
+        }
+        let Program {
+            preamble, units, ..
+        } = program;
+        for is_kind in [
+            (|op| matches!(op, Op::Sentient(sentient::Op::ScalarConstant { .. })))
+                as fn(&Op) -> bool,
+            |op| matches!(op, Op::Symbol(symbol::Op::CreateSymbol { .. })),
+            |op| matches!(op, Op::Dataflow(dataflow::Op::GetUnit { .. })),
+        ] {
+            for index in 0..preamble.len() {
+                let at = OpAt::top(InBlock(index));
+                if at.op(preamble).is_some_and(is_kind) {
+                    self.initialize_assignment_for_an_operation::<A>(
+                        preamble,
+                        &at,
+                        OpScope::Module,
+                        values,
+                    );
+                }
+            }
+        }
+        for unit in units.iter_mut() {
+            self.run_on::<A>(preamble, unit, values);
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::{Dd2, Elements};
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::dataflow_ir::Units;
-    use crate::islands::sentient::ProgramUnit;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
     use crate::units::Residency;
 
     /// `%r = sentient.scalar_constant {value = <value>}`.
@@ -3010,6 +3058,79 @@ mod unit_tests {
         // ⭐ ASSIGNED BUT NOT YIELDED HERE, and unrecorded though yielded — both are `continue`s.
         assert_eq!(get_unit_locale(&preamble[1]), None);
         assert_eq!(get_unit_locale(&preamble[2]), None);
+        assert!(pass.failures.is_empty());
+    }
+
+    /// A model and rung, for the same reason [`ProgramUnit`] needs an arch: the pass reads neither.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e633 — the module's constant, symbol and unit handle each get `imm` and the `scalar_copy`
+    /// between them gets nothing; the per-unit run then starts from all three.
+    #[test]
+    fn e633_records_the_three_module_op_kinds_and_seeds_each_unit_with_them() {
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: vec![
+                Op::Dataflow(dataflow::Op::GetUnit {
+                    result: Val(1),
+                    residency: Residency::Global,
+                    unit: DfirUnit::Lxlu,
+                    num_folds: None,
+                    reg_locale: None,
+                }),
+                copy(Val(1), Val(2)),
+                Op::Symbol(symbol::Op::CreateSymbol {
+                    result: Val(3),
+                    symbol_id: 0,
+                    max_value: None,
+                }),
+                constant(Val(4), 7),
+            ],
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(1)),
+                    precision: None,
+                    body: Vec::new(),
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut pass = TypesAndCopies::new();
+        let mut values = Values::default();
+
+        pass.run_on_operation(&mut program, &mut values);
+
+        let recorded = BTreeMap::from([
+            (Val(1), RegType::Imm),
+            (Val(3), RegType::Imm),
+            (Val(4), RegType::Imm),
+        ]);
+        assert_eq!(pass.per_module.global_const_assignments, recorded);
+        // `initializeWorkList` re-inserted the module's three into the unit it then ran.
+        assert_eq!(pass.per_unit.assignments, recorded);
         assert!(pass.failures.is_empty());
     }
 }

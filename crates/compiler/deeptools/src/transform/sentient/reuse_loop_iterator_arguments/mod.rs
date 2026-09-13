@@ -85,9 +85,9 @@
 // ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
 // file's own tests until `e355_runOnOperation` lands and something calls it. CI runs clippy with
 // `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e634_runOn`, NOT WITH `e355_runOnOperation`: this module is `pub(crate) mod`
-// and e355 is the pass ENTRY, so filling it adds no caller — the first real caller of anything here is
-// e634, which is what `run_on_unit` still `todo!`s.
+// ⭐ AND `e634_runOn` DID NOT REMOVE IT: e634 is now ported and calls e467, e356 and e597, but e634's
+// own caller is e147, whose caller is the pass ENTRY e355 — and nothing calls a pass entry until the
+// pipeline is wired. ⭐ REMOVE THIS WHEN SOMETHING CALLS `run_on_operation`.
 #![allow(dead_code)]
 
 use crate::arch::Arch;
@@ -96,11 +96,22 @@ use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
-use crate::transform::sentient::analyses::{CorrelatedEquivClasses, Liveness, PropagationAnalysis};
+use crate::transform::sentient::ForRef;
+use crate::transform::sentient::analyses::{
+    CorrelatedEquivClasses, Correlation, CorrelationAnalysis, ExpressionEvaluator, Liveness,
+    PropagationAnalysis, UnitIndexMap,
+};
+use crate::transform::sentient::lightweight_simplification::sentient::run_light_weight_simplifications;
+use crate::transform::sentient::scalar_simplifications::sentient::Propagation;
+use crate::units::DfirUnit;
 use crate::workload::Workload;
 
 /// `-dcc-reuse-loop-iterator-arguments-disable`, `cl::init(false)` (`:57-60`).
 const DISABLE_THIS_PASS: bool = false;
+
+/// `-l3-lxlu-toggle-correlation-only`, `cl::init(true)` (`:61-65`) — ⛔ NOTE THE `true`: the pass's
+/// default is to run on the L3 halves and the LX load unit ONLY.
+const UNIT_SPECIFIC_TOGGLE_CORRELATION: bool = true;
 
 /// Replaces: e147_runOn
 ///
@@ -112,23 +123,182 @@ const DISABLE_THIS_PASS: bool = false;
 ///
 /// ⭐ `WalkResult::skip()` NEEDS NO EXPRESSION: a program's units are a flat list on this island, so
 /// there is no nested `dataflow.program_unit` for the walk to have to decline.
-#[expect(
-    clippy::never_loop,
-    reason = "the body diverges only because `run_on_unit` is e634's `todo!`; the loop is the port"
-)]
-pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
-    for unit in program.units.iter_mut() {
-        run_on_unit(unit);
+///
+/// ⭐ THE RETURNED [`Refused`]S ARE EVERY UNIT'S, IN UNIT ORDER — `signalPassFailure()` is a flag on
+/// the pass and the walk does not stop for it, so this is a list and not a first failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_on_program<
+    A: Arch,
+    M: Model,
+    W: Workload,
+    L: Liveness,
+    T: CorrelationAnalysis,
+    F: CorrelationAnalysis,
+    P: PropagationAnalysis,
+    E: ExpressionEvaluator,
+    U: UnitIndexMap,
+>(
+    program: &mut Program<A, M, W>,
+    liveness: &L,
+    toggle_correlation: &mut T,
+    affine_correlation: &mut F,
+    propagation: &mut P,
+    evaluator: &mut E,
+    unit_index_map: &U,
+    values: &mut Values,
+) -> Vec<Refused> {
+    let Program {
+        preamble, units, ..
+    } = program;
+    let mut refused = Vec::new();
+    for unit in units.iter_mut() {
+        refused.extend(run_on_unit(
+            preamble,
+            unit,
+            liveness,
+            toggle_correlation,
+            affine_correlation,
+            propagation,
+            evaluator,
+            unit_index_map,
+            values,
+        ));
+    }
+    refused
+}
+
+/// `unit_op->emitError(..); signalPassFailure();` AS DATA — which of the round's four analyses
+/// refused (`:152-153`, `:200-201`, `:213-214`, `:239-241`).
+///
+/// ⭐ NOT A `Result`: the reference has no `return` after any of the four, so a refusal names one
+/// analysis and every later round of the same unit still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// "Unable to perform toggle correlation analysis".
+    ToggleCorrelation,
+    /// "failed in simplifying code".
+    Simplification,
+    /// "Unable to perform expression propagation".
+    ExpressionPropagation,
+    /// "Unable to perform affine expression correlation analysis".
+    AffineExpressionCorrelation,
+}
+
+/// `unit_op->walk<WalkOrder::PostOrder>([&](sentient::ForOp op) { .. })` — every `sentient.for` under
+/// the unit, innermost first. ⭐ NO REWRITE HERE GROWS THE BLOCK BEING WALKED: both round-1 and
+/// round-3 insert into the module preamble and into the loop's OWN body.
+fn walk_for_ops_post_order(block: &mut [Op], visit: &mut impl FnMut(&mut Op)) {
+    for op in block.iter_mut() {
+        for region in dialects::regions_mut(op).iter_mut() {
+            walk_for_ops_post_order(region, visit);
+        }
+        if matches!(op, Op::Sentient(sentient::Op::For { .. })) {
+            visit(op);
+        }
     }
 }
 
-/// `runOn(dataflow::ProgramUnitOp)` — entry 634, level 6, not yet ported.
-fn run_on_unit<A: Arch>(unit: &mut ProgramUnit<A>) -> ! {
-    let _ = unit;
-    todo!(
-        "e634_runOn(dataflow::ProgramUnitOp) — the toggle-correlation round, the identical-iter-arg \
-         round and the correlated-equivalence-class round (ReuseLoopIteratorArguments.cpp:140)"
-    )
+/// Replaces: e634_runOn
+///
+/// One program unit in three rounds: correlated toggles become the head toggle plus an offset, the
+/// arithmetic that leaves behind is simplified, and then identical and correlated AFFINE iterator
+/// arguments are reused the same way (`:140-257`).
+///
+/// ⛔ THE WHOLE BODY IS UNDER ONE UNIT GATE (`:148-149`): with
+/// [`UNIT_SPECIFIC_TOGGLE_CORRELATION`] on, a unit that is not an L3 half or the LX load unit gets
+/// NOTHING from this pass — not even rounds 2 and 3.
+/// ⛔ SIMPLIFICATION RUNS BETWEEN ROUND 1 AND ROUND 2 AND THAT ORDER IS LOAD-BEARING (`:195-199`,
+/// the reference's own note): round 3 breaks the one-use assumption the simplifications rely on.
+/// ⛔ THE CONST BUILDER IS IN THE **MODULE'S** BLOCK (`:161`, `unit_op->getBlock()`), which is where
+/// both rounds' correlation constants and e597's constants go.
+/// ⚠️ THE TWO CORRELATION ANALYSES ARE THE CALLER'S: the reference constructs one of each PER UNIT
+/// (`:150`, `:236-237`), and their constructors are the walks `Analyses/` owns and this campaign does
+/// not carry. ⭐ `DT_CHECK_MSG(get_unit_op, "Cannot determine GetUnitOp!")` is discharged by
+/// [`crate::islands::dataflow_ir::Units`], which cannot name a unit without one.
+#[allow(clippy::too_many_arguments)]
+fn run_on_unit<
+    A: Arch,
+    L: Liveness,
+    T: CorrelationAnalysis,
+    F: CorrelationAnalysis,
+    P: PropagationAnalysis,
+    E: ExpressionEvaluator,
+    U: UnitIndexMap,
+>(
+    preamble: &mut Vec<Op>,
+    unit: &mut ProgramUnit<A>,
+    liveness: &L,
+    toggle_correlation: &mut T,
+    affine_correlation: &mut F,
+    propagation: &mut P,
+    evaluator: &mut E,
+    unit_index_map: &U,
+    values: &mut Values,
+) -> Vec<Refused> {
+    let mut refused = Vec::new();
+    if UNIT_SPECIFIC_TOGGLE_CORRELATION
+        && !matches!(
+            unit.on.kind(),
+            DfirUnit::L3lu | DfirUnit::L3su | DfirUnit::Lxlu
+        )
+    {
+        return refused;
+    }
+    if toggle_correlation.is_correlation_successful() == Correlation::Failed {
+        refused.push(Refused::ToggleCorrelation);
+    }
+    // Optimization 1: every non-head iterator argument of a correlated-toggle class becomes its head
+    // plus an offset. ⭐ AND WITHOUT THE LIVE-RANGE CHECK, for the reason the reference gives at
+    // `:167-186`: an inner loop's arguments cannot correlate until these ones have.
+    walk_for_ops_post_order(&mut unit.body, &mut |for_op| {
+        let Op::Sentient(sentient::Op::For { iv, .. }) = for_op else {
+            return;
+        };
+        let classes = toggle_correlation.correlated_equiv_classes(ForRef(*iv));
+        replace_correlated_iter_args_in_equiv_class(
+            preamble, for_op, classes, liveness, false, values,
+        );
+    });
+    // ⭐ E597 SHARES THE SAME CONST BUILDER (`:200`), so its constants land at the front of the module
+    // block beside round 1's rather than in the unit's own body.
+    let mut consts = Vec::new();
+    let simplified = run_light_weight_simplifications(
+        &mut consts,
+        &mut unit.body,
+        evaluator,
+        propagation,
+        unit_index_map,
+        values,
+    );
+    preamble.splice(0..0, consts);
+    if simplified == Propagation::Failed {
+        refused.push(Refused::Simplification);
+    }
+    if !propagation.is_propagation_successful() {
+        refused.push(Refused::ExpressionPropagation);
+    }
+    // Optimization 2: iterator arguments with identical affine expressions share one slot's argument.
+    walk_for_ops_post_order(&mut unit.body, &mut |for_op| {
+        let Op::Sentient(sentient::Op::For { carried, body, .. }) = for_op else {
+            return;
+        };
+        reuse_identical_iter_args(body, carried, propagation);
+    });
+    if affine_correlation.is_correlation_successful() == Correlation::Failed {
+        refused.push(Refused::AffineExpressionCorrelation);
+    }
+    // Optimization 3: round 1 again over the AFFINE classes — and this one does check the users' live
+    // ranges (`:249`).
+    walk_for_ops_post_order(&mut unit.body, &mut |for_op| {
+        let Op::Sentient(sentient::Op::For { iv, .. }) = for_op else {
+            return;
+        };
+        let classes = affine_correlation.correlated_equiv_classes(ForRef(*iv));
+        replace_correlated_iter_args_in_equiv_class(
+            preamble, for_op, classes, liveness, true, values,
+        );
+    });
+    refused
 }
 
 /// ONE LOOP ITERATOR ARGUMENT AND WHAT ITS SLOT YIELDS — `iter_arg` paired with
@@ -297,10 +467,40 @@ fn result_corresponding_to_operand_num(op: &Op, operand_num: usize) -> Option<Va
 /// ⛔ A THIRD NAME FOR A THIRD ENTRY: `runOnOperation`, `runOn(ModuleOp)` (e147) and
 /// `runOn(dataflow::ProgramUnitOp)` (e634) are three members of one class, and only C++ overloading
 /// lets two of them share a spelling.
-pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
-    if !DISABLE_THIS_PASS {
-        run_on_program(program);
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_on_operation<
+    A: Arch,
+    M: Model,
+    W: Workload,
+    L: Liveness,
+    T: CorrelationAnalysis,
+    F: CorrelationAnalysis,
+    P: PropagationAnalysis,
+    E: ExpressionEvaluator,
+    U: UnitIndexMap,
+>(
+    program: &mut Program<A, M, W>,
+    liveness: &L,
+    toggle_correlation: &mut T,
+    affine_correlation: &mut F,
+    propagation: &mut P,
+    evaluator: &mut E,
+    unit_index_map: &U,
+    values: &mut Values,
+) -> Vec<Refused> {
+    if DISABLE_THIS_PASS {
+        return Vec::new();
     }
+    run_on_program(
+        program,
+        liveness,
+        toggle_correlation,
+        affine_correlation,
+        propagation,
+        evaluator,
+        unit_index_map,
+        values,
+    )
 }
 
 /// Replaces: e356_reuseIdenticalIterArgs
@@ -488,26 +688,31 @@ pub fn replace_correlated_iter_args_in_equiv_class(
     }
 }
 
-// crustify:todo: e634_runOn
-//   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:140  (118 body lines, level 6)
-//   original  : void ReuseLoopIteratorArgumentsPass::runOn(dataflow::ProgramUnitOp unit_op)
-//   calls     : e356_reuseIdenticalIterArgs, e467_replaceCorrelatedIterArgsInEquivClass, e597_runLightWeightSimplifications
-
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        IterArg, are_users_liveranges_overlapping, collect_results_of_non_yield_feeding_users,
-        replace_correlated_iter_args_in_equiv_class, reuse_identical_iter_args,
+        IterArg, Program, ProgramUnit, are_users_liveranges_overlapping,
+        collect_results_of_non_yield_feeding_users, replace_correlated_iter_args_in_equiv_class,
+        reuse_identical_iter_args, run_on_program,
     };
+    use crate::arch::Dd2;
     use crate::arch::Elements;
     use crate::formats::Bits;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
     use crate::islands::sentient::dialects::sentient::StoreSource;
     use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::model::Model;
     use crate::transform::sentient::analyses::{
-        CorrelatedEquivClass, CorrelatedEquivClasses, Liveness, PropagationAnalysis, VirtualAssigns,
+        CorrelatedEquivClass, CorrelatedEquivClasses, Liveness,
+        OutOfScopeAffineExpressionCorrelation, OutOfScopeEvaluator, OutOfScopePropagationAnalysis,
+        OutOfScopeToggleCorrelation, OutOfScopeUnitIndexMap, PropagationAnalysis, VirtualAssigns,
     };
+    use crate::units::DfirUnit;
+    use crate::workload::Workload;
 
     /// `%out = sentient.scalar_add %lhs, %rhs : index`.
     fn add(lhs: Val, rhs: Val, result: Val) -> Op {
@@ -806,5 +1011,98 @@ mod unit_tests {
         );
         // ⛔ THE `carried` LIST IS UNTOUCHED — only uses moved.
         assert_eq!(carried.len(), 2);
+    }
+
+    /// ANY MODEL AND ANY RUNG — this pass reads neither.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One program of one unit running on `on`, carrying the e467 fixture's loop.
+    fn program_on(on: DfirUnit) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(on, Val(1)),
+                    precision: None,
+                    body: vec![Op::Sentient(sentient::Op::For {
+                        iv: Val(9),
+                        bound: Val(8),
+                        bound_reg: None,
+                        carried: vec![carried(Val(1), Val(10), Val(20))],
+                        dbg_name: None,
+                        body: vec![
+                            store(Val(10), Val(31)),
+                            Op::Sentient(sentient::Op::Yield {
+                                results: vec![Val(50)],
+                            }),
+                        ],
+                    })],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// e634 — an LXLU unit is inside the gate, so the first thing the pass asks for is the toggle
+    /// correlation this campaign does not carry.
+    #[test]
+    #[should_panic(expected = "ToggleCorrelationAnalysis::isCorrelationSuccessful")]
+    fn e634_a_gated_in_unit_asks_for_the_toggle_correlation_first() {
+        let mut program = program_on(DfirUnit::Lxlu);
+        let _ = run_on_program(
+            &mut program,
+            &NeverOverlaps,
+            &mut OutOfScopeToggleCorrelation,
+            &mut OutOfScopeAffineExpressionCorrelation,
+            &mut OutOfScopePropagationAnalysis,
+            &mut OutOfScopeEvaluator,
+            &OutOfScopeUnitIndexMap,
+            &mut Values::default(),
+        );
+    }
+
+    /// e634's negative — ⛔ AN SFP UNIT GETS NOTHING, not even rounds 2 and 3: every analysis here
+    /// `todo!`s, so reaching any round at all would panic instead of returning.
+    #[test]
+    fn e634_a_unit_outside_the_gate_is_skipped_without_asking_anything() {
+        let mut program = program_on(DfirUnit::Sfp);
+        let before = program.units.iter().next().expect("one unit").body.clone();
+        let refused = run_on_program(
+            &mut program,
+            &NeverOverlaps,
+            &mut OutOfScopeToggleCorrelation,
+            &mut OutOfScopeAffineExpressionCorrelation,
+            &mut OutOfScopePropagationAnalysis,
+            &mut OutOfScopeEvaluator,
+            &OutOfScopeUnitIndexMap,
+            &mut Values::default(),
+        );
+        assert_eq!(refused, Vec::new());
+        assert_eq!(program.units.iter().next().expect("one unit").body, before);
+        assert!(program.preamble.is_empty());
     }
 }

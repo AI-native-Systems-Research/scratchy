@@ -96,7 +96,7 @@
 
 use std::collections::BTreeMap;
 
-use super::analyses::{ColoringGraph, LiveRange};
+use super::analyses::{ColoringGraph, GreedyAllocator, LiveRange, NumColors};
 use crate::arch::{Arch, IsaGen};
 use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::sentient::{BinaryOp, Port, Precision, TernaryOp, UnaryOp};
@@ -112,6 +112,9 @@ pub(crate) enum PortId {
 }
 
 impl PortId {
+    /// `performGraphColoring(3)` (`:784`) — how many colours the interference graph may use.
+    pub(crate) const COUNT: NumColors = NumColors(3);
+
     /// The `si32` an `opXPortID` attribute carries (`:208`).
     pub(crate) const fn get(self) -> i32 {
         match self {
@@ -965,10 +968,64 @@ impl<G: ColoringGraph> PortAssignment<G> {
     }
 }
 
-// crustify:todo: e632_doPortAssignments
-//   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:776  (12 body lines, level 6)
-//   original  : void PortAssignmentPass::doPortAssignments(dataflow::ProgramUnitOp &unit, const SenComponents comp)
-//   calls     : e123_clean, e340_updateSentientIRPorts, e341_addReuseToDummyOperands, e382_performGraphColoring, e455_buildGraphNodes, e608_buildGraphEdges
+impl<G: ColoringGraph> PortAssignment<G> {
+    /// Replaces: e632_doPortAssignments
+    ///
+    /// One compute unit's whole port assignment: clear the state, build the interference graph from
+    /// the ISA restrictions, colour it with three colours and write the colours back onto the ops.
+    ///
+    /// ⛔ `getNumNodes() != 0` GUARDS EVERYTHING AFTER THE NODES (`:782`) — a unit whose ops name no
+    /// operand value is left exactly as it came in, with `port_assignment_` empty.
+    /// ⛔ `performGraphColoring(3)` IS INLINE HERE, NOT `e382`: `PortAssignmentPass`'s own three-line
+    /// member (`:735`) is the field write EXCLUSIONS.tsv:181 classifies as an accessor, and the
+    /// same-named `e382` is `SmartRegisterAllocation.cpp:136`, an unrelated 484-line function.
+    pub(crate) fn do_port_assignments<A: Arch, R: LiveRanges>(
+        &mut self,
+        unit: &mut ProgramUnit<A>,
+        comp: DfirUnit,
+        live_ranges: &mut R,
+    ) -> LiveRangeComputed {
+        self.clean();
+        self.build_graph_nodes::<A>(unit, comp);
+        if self.graph.num_nodes() == 0 {
+            return LiveRangeComputed::Yes;
+        }
+        let computed = self.build_graph_edges(&unit.body, live_ranges);
+        self.port_assignment = self
+            .graph
+            .do_graph_coloring(PortId::COUNT, GreedyAllocator::No);
+        self.update_sentient_ir_ports(unit);
+        self.add_reuse_to_dummy_operands(unit);
+        computed
+    }
+
+    /// `PortAssignmentPass::updateSentientIRPorts(dataflow::ProgramUnitOp &)` — SENPASS UNIT e340,
+    /// whose anchor is still open above; the `2a8195231` seam precedent, and filling it is not this
+    /// batch's work.
+    fn update_sentient_ir_ports<A: Arch>(&mut self, unit: &mut ProgramUnit<A>) {
+        let _ = unit;
+        todo!(
+            "PortAssignmentPass::updateSentientIRPorts — senpass e340 (PortAssignment.cpp:682) is \
+             not ported yet, and the {} colours this unit just got have nowhere to go",
+            self.port_assignment.len()
+        )
+    }
+
+    /// `PortAssignmentPass::addReuseToDummyOperands()` — SENPASS UNIT e341, whose anchor is still open
+    /// above.
+    ///
+    /// ⭐ IT TAKES THE UNIT HERE AND NOT IN THE REFERENCE because `operand_to_owners_` holds
+    /// `Operation *` there and an [`OpAt`] position here, so the ops it latches have to be reached
+    /// through the body they sit in.
+    fn add_reuse_to_dummy_operands<A: Arch>(&mut self, unit: &mut ProgramUnit<A>) {
+        let _ = unit;
+        todo!(
+            "PortAssignmentPass::addReuseToDummyOperands — senpass e341 (PortAssignment.cpp:739) is \
+             not ported yet, and this unit has {} reuse pairs waiting on it",
+            self.reuse_nodes_per_op.len()
+        )
+    }
+}
 
 // crustify:todo: e645_runOnOperation
 //   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:793  (21 body lines, level 7)
@@ -993,6 +1050,7 @@ mod unit_tests {
         clears: u32,
         nodes: Vec<DataId>,
         edges: Vec<(DataId, DataId)>,
+        colorings: Vec<(NumColors, GreedyAllocator)>,
     }
 
     impl ColoringGraph for CountingGraph {
@@ -1006,6 +1064,26 @@ mod unit_tests {
 
         fn add_bidirectional_edge(&mut self, node1: DataId, node2: DataId) {
             self.edges.push((node1, node2));
+        }
+
+        fn num_nodes(&self) -> usize {
+            self.nodes.len()
+        }
+
+        /// Answers ONE NODE PER COLOUR, so what a caller asked for is observable in what it stored;
+        /// a greedy allocation answers nothing, which is how the flag is told apart.
+        fn do_graph_coloring(
+            &mut self,
+            num_colors: NumColors,
+            greedy: GreedyAllocator,
+        ) -> BTreeMap<DataId, PortId> {
+            self.colorings.push((num_colors, greedy));
+            match greedy {
+                GreedyAllocator::No => (0..num_colors.0)
+                    .map(|color| (DataId(color.unsigned_abs()), PortId::P0))
+                    .collect(),
+                GreedyAllocator::Yes => BTreeMap::new(),
+            }
         }
     }
 
@@ -1579,6 +1657,43 @@ mod unit_tests {
         assert_eq!(
             pass.reuse_nodes_per_op,
             vec![vec![DataId(7), DataId(8)], vec![DataId(8), DataId(7)]]
+        );
+    }
+
+    /// e632 — a unit whose ops name no operand value stops after the nodes: no edges, no colouring and
+    /// no rewrite, which is the only way past `updateSentientIRPorts` while e340 is unported.
+    #[test]
+    fn e632_leaves_a_unit_with_no_graph_nodes_alone() {
+        let mut pass = PortAssignment::<CountingGraph>::default();
+        let mut unit = pe_unit(Vec::new());
+        assert_eq!(
+            pass.do_port_assignments::<Dd2, _>(
+                &mut unit,
+                DfirUnit::Pe,
+                &mut RecordingLiveRanges::default()
+            ),
+            LiveRangeComputed::Yes
+        );
+        // `clean()` ran, and nothing after the node count did.
+        assert_eq!(pass.graph.clears, 1);
+        assert!(pass.graph.colorings.is_empty());
+        assert!(pass.port_assignment.is_empty());
+    }
+
+    /// e632's positive — a graph with nodes IS coloured, with three colours and no greedy allocator
+    /// (the double answers one node per colour), and the result then goes to e340, which is not ported.
+    #[test]
+    #[should_panic(expected = "the 3 colours")]
+    fn e632_colours_a_populated_graph_with_three_ports() {
+        let mut pass = PortAssignment::<CountingGraph>::default();
+        // The graph already carries a node, so `build_graph_nodes` over an empty body still passes the
+        // `getNumNodes() != 0` guard (`clean()` asks the graph to clear, and this one only counts).
+        pass.graph.nodes.push(DataId(1));
+        let mut unit = pe_unit(Vec::new());
+        let _ = pass.do_port_assignments::<Dd2, _>(
+            &mut unit,
+            DfirUnit::Pe,
+            &mut RecordingLiveRanges::default(),
         );
     }
 }

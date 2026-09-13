@@ -10,15 +10,18 @@
 //! invent the analysis, do not inline a guess at what it would have returned, and do not substitute
 //! a constant for its result.
 
+use std::collections::BTreeMap;
+
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient::{RegIndex, RegType};
 use crate::islands::sentient::dialects::{Op, Val};
+use crate::transform::sentient::ForRef;
 use crate::transform::sentient::canonicalize_xrf_pointers::XrfMinExpr;
 use crate::transform::sentient::local_region_splitting_for_value_commoning::MaxRegNum;
-use crate::transform::sentient::port_assignment::DataId;
+use crate::transform::sentient::port_assignment::{DataId, PortId};
 use crate::units::DfirUnit;
 
 /// AN `EvaluatedValue` THE EXPRESSION EVALUATOR OWNS — an identity, not a value.
@@ -834,13 +837,36 @@ impl UniformGroups for OutOfScopeUniformGroups {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LiveRange;
 
+/// HOW MANY COLOURS A COLOURING MAY USE — `doGraphColoring(int)`'s only argument
+/// (`Analyses/GraphColoring.hpp:82`).
+///
+/// ⭐ A NEWTYPE BECAUSE THE TWO CALLERS COUNT DIFFERENT THINGS: for port assignment it is the three
+/// compute ports ([`PortId::COUNT`]), for register allocation the locale's register count
+/// ([`MaxRegNum`]) — and a bare `3` beside a bare register count is the confusion this crate's
+/// newtypes exist to make an E0308.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NumColors(pub i32);
+
+/// `doGraphColoring(int, bool use_greedy_allocator = false)`'S SECOND ARGUMENT
+/// (`Analyses/GraphColoring.hpp:82`) — a closed set, so an `enum` and not the reference's `bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GreedyAllocator {
+    /// The default the port assignment relies on (`PortAssignment.cpp:736`).
+    No,
+    /// `use_greedy_allocator = true`.
+    Yes,
+}
+
 /// THE `GraphColoring` A PASS OWNS — a trait, for the same reason [`ExpressionEvaluator`] is one: the
 /// analysis is not in this campaign and a test must still be able to observe what a pass asks it.
 ///
 /// ⛔ `Analyses/GraphColoring.{hpp,cpp}` IS OUT OF CAMPAIGN SCOPE. Only the methods a ported unit
 /// actually calls are declared; `getOrAddNode`, `addBidirectionalEdge`, `addSameColorEdge` and
 /// `doGraphColoring` belong to `e339`, `e608` and `e382` and are added by those units.
-pub trait ColoringGraph {
+// ⭐ `pub(crate)`, UNLIKE THE OTHER SEAMS IN THIS FILE: the colour and the node index are
+// [`PortId`] and [`DataId`], which port assignment owns and keeps crate-private, and this trait's
+// only consumer is that pass's own `pub(crate) struct PortAssignment<G: ColoringGraph>`.
+pub(crate) trait ColoringGraph {
     /// `GraphColoring::clear()` (`Analyses/GraphColoring.hpp:52-60`).
     ///
     /// ⛔⛔ NOT A RE-DEFAULT-CONSTRUCTION, AND THE DIFFERENCE OUTLIVES A PROGRAM UNIT. It deletes and
@@ -860,6 +886,26 @@ pub trait ColoringGraph {
     /// `addBidirectionalEdge(int node1, int node2)` (`Analyses/GraphColoring.hpp:80`) — an interference
     /// edge recorded on BOTH nodes.
     fn add_bidirectional_edge(&mut self, node1: DataId, node2: DataId);
+
+    /// `int getNumNodes() const` (`Analyses/GraphColoring.hpp:118`) — `nodes_.size()`.
+    ///
+    /// ⛔ IT IS THE NODE MAP AND NOT `max_node_id_`, which `clear()` leaves standing: a graph cleared
+    /// between units answers 0 here even though it still remembers the highest id it ever issued.
+    fn num_nodes(&self) -> usize;
+
+    /// `std::map<int, int> doGraphColoring(int, bool)` (`Analyses/GraphColoring.hpp:82`) — the colour
+    /// each node was given.
+    ///
+    /// ⛔ THE COLOUR IS A [`PortId`] BECAUSE [`DataId`] IS ALREADY THE PORT ASSIGNMENT'S NODE INDEX:
+    /// this seam is the graph AS PORT ASSIGNMENT HOLDS IT, and the register allocator's own colouring
+    /// reaches the same analysis through [`RegisterGraphs`].
+    /// ⛔ A NODE THE COLOURING COULD NOT PLACE IS SIMPLY ABSENT FROM THE MAP, which is what
+    /// `getPortAttr`'s `port_assignment_.at(opID)` throws on (`:207`).
+    fn do_graph_coloring(
+        &mut self,
+        num_colors: NumColors,
+        greedy: GreedyAllocator,
+    ) -> BTreeMap<DataId, PortId>;
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
@@ -878,6 +924,20 @@ impl ColoringGraph for OutOfScopeColoringGraph {
     fn add_bidirectional_edge(&mut self, _node1: DataId, _node2: DataId) {
         todo!(
             "GraphColoring::addBidirectionalEdge (Analyses/GraphColoring.hpp:80) — out of campaign scope"
+        )
+    }
+
+    fn num_nodes(&self) -> usize {
+        todo!("GraphColoring::getNumNodes (Analyses/GraphColoring.hpp:118) — out of campaign scope")
+    }
+
+    fn do_graph_coloring(
+        &mut self,
+        _num_colors: NumColors,
+        _greedy: GreedyAllocator,
+    ) -> BTreeMap<DataId, PortId> {
+        todo!(
+            "GraphColoring::doGraphColoring (Analyses/GraphColoring.hpp:82) — out of campaign scope"
         )
     }
 }
@@ -1022,6 +1082,82 @@ impl CorrelatedEquivClasses {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.classes.is_empty()
+    }
+}
+
+/// WHETHER A CORRELATION ANALYSIS ANSWERED — `isCorrelationSuccessful()`'s `LogicalResult`
+/// (`Analyses/CorrelationAnalysis.h:330`), which reports THE ANALYSIS'S state and not a failure of the
+/// pass reading it, so the crate's refusal ban is not in play.
+///
+/// ⛔ THE REFERENCE DOES NOT `return` ON `Failed`: `emitError` + `signalPassFailure()` mark the
+/// pipeline and fall straight through into the round that needed the analysis
+/// (`ReuseLoopIteratorArguments.cpp:151-155`). A port that returned here would run less than the
+/// reference does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Correlation {
+    /// `LogicalResult::success()`.
+    Succeeded,
+    /// `LogicalResult::failure()`.
+    Failed,
+}
+
+/// A `CorrelationAnalysisBase` A PASS IS HANDED — a trait for the same reason [`ExpressionEvaluator`]
+/// is one: the analysis is not in this campaign, and a test must still be able to state its answers.
+///
+/// ⛔ `Analyses/CorrelationAnalysis.{h,cpp}` IS OUT OF CAMPAIGN SCOPE. `ToggleCorrelationAnalysis`
+/// and `AffineExpressionCorrelationAnalysis` are two DERIVED classes reached through this same base
+/// (`:150`, `:246`), which is why one trait carries both and the crate has one `OutOfScope*` per
+/// derived class rather than per method.
+/// ⭐ EACH IS CONSTRUCTED OVER ONE `dataflow.program_unit`, so a value handed in is already scoped to
+/// the unit its reader is walking; the affine one also takes the propagation analysis (`:248`).
+pub trait CorrelationAnalysis {
+    /// `isCorrelationSuccessful()` — whether the constructor's walk completed.
+    fn is_correlation_successful(&mut self) -> Correlation;
+
+    /// `getCorrelatedEquivClasses(sentient::ForOp)` — the classes recorded for one loop, keyed by the
+    /// loop itself.
+    ///
+    /// ⭐ `None` IS THE REFERENCE'S NULL CONTAINER POINTER, which its readers guard against
+    /// (`ReuseLoopIteratorArguments.cpp:267`).
+    fn correlated_equiv_classes(&self, for_op: ForRef) -> Option<&CorrelatedEquivClasses>;
+}
+
+/// THE CRATE IMPLEMENTATION OF `ToggleCorrelationAnalysis`: not ported, so asking it anything is a
+/// `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeToggleCorrelation;
+
+impl CorrelationAnalysis for OutOfScopeToggleCorrelation {
+    fn is_correlation_successful(&mut self) -> Correlation {
+        todo!(
+            "ToggleCorrelationAnalysis::isCorrelationSuccessful (Analyses/CorrelationAnalysis.h:150) — out of campaign scope"
+        )
+    }
+
+    fn correlated_equiv_classes(&self, _for_op: ForRef) -> Option<&CorrelatedEquivClasses> {
+        todo!(
+            "ToggleCorrelationAnalysis::getCorrelatedEquivClasses (Analyses/CorrelationAnalysis.h:150) — out of campaign scope"
+        )
+    }
+}
+
+/// THE CRATE IMPLEMENTATION OF `AffineExpressionCorrelationAnalysis`: not ported, so asking it
+/// anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeAffineExpressionCorrelation;
+
+impl CorrelationAnalysis for OutOfScopeAffineExpressionCorrelation {
+    fn is_correlation_successful(&mut self) -> Correlation {
+        todo!(
+            "AffineExpressionCorrelationAnalysis::isCorrelationSuccessful (Analyses/CorrelationAnalysis.h:246) — out of campaign scope"
+        )
+    }
+
+    fn correlated_equiv_classes(&self, _for_op: ForRef) -> Option<&CorrelatedEquivClasses> {
+        todo!(
+            "AffineExpressionCorrelationAnalysis::getCorrelatedEquivClasses (Analyses/CorrelationAnalysis.h:246) — out of campaign scope"
+        )
     }
 }
 

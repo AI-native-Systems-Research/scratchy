@@ -89,10 +89,10 @@
 //! | `e635_runScalarOpHoisting` | 635 | 6 | 61 | `dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2184` |
 
 #![allow(dead_code)]
-// ⛔ NOTHING CALLS THESE FOUR LEAVES YET — every caller is a later level in a different batch
-// (`e529`, `e530`, `e578`, `e612`, `e613`) and so is the pass entry `e635_runScalarOpHoisting`. CI
-// runs clippy with `-D warnings`, so without this the batch fails its own gate.
-// ⭐ REMOVE THIS WITH `e635_runScalarOpHoisting`: an unused item here is a real defect at that point.
+// ⛔ NOTHING CALLS THIS FILE'S PASS ENTRY YET — `e635_runScalarOpHoisting` below is ported, but its
+// own caller is `e366_runOn` (`ScalarOpMergingAndHoisting.cpp:2258`), which is a different batch's
+// unit. CI runs clippy with `-D warnings`, so without this the batch fails its own gate.
+// ⭐ REMOVE THIS WITH `e366_runOn`: an unused item here is a real defect at that point.
 
 use super::{AddressScale, MemoryOpInfo, OperationData, ScalarOpComp, does_value_exceed_lrf_range};
 use crate::arch::{Arch, Elements};
@@ -1317,10 +1317,159 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
     true
 }
 
-// crustify:todo: e635_runScalarOpHoisting
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2184  (61 body lines, level 6)
-//   original  : void ScalarOpHoisting::runScalarOpHoisting()
-//   calls     : e530_processForDerivedIVElimination, e612_processForLinearChain, e613_processForGenericHoisting
+/// `MaxHoists`, `cl::init(-1)` — "-1 indicates no maximum" (`:121-125`).
+///
+/// ⭐ THE CAP IS INERT AS SHIPPED, AND `None` IS WHY RATHER THAN A BIG NUMBER: the option is
+/// `cl::opt<unsigned>`, so its `-1` is `UINT_MAX` and the guard `MaxHoists != -1` is FALSE (`:2189`).
+const MAX_HOISTS: Option<HoistCount> = None;
+
+/// ONE `iter_arg.getUsers()` ENTRY, READ BEFORE ANY REWRITE — [`users`] cannot report a user's PARENT,
+/// and the candidate gate declines a user a `sentient.if` holds (`:2213`).
+struct MainIvUser {
+    /// The add or sub's result, which is the candidate's identity for the reason
+    /// [`crate::transform::sentient::ForRef`] gives. `None` is
+    /// `!isa<AddOp, SubOp>(user) || getFirstConstOperandIndex(user) == -1` (`:2202-2203`).
+    candidate: Option<Val>,
+    /// `isa<sentient::IfOp>(user->getParentOp())`.
+    parent_is_if: bool,
+}
+
+/// `iter_arg.getUsers()` in block order, each entry carrying whether a `sentient.if` is its parent.
+fn main_iv_users(
+    iter_arg: Val,
+    block: &[Op],
+    parent_is_if: bool,
+    defs: Definitions<'_>,
+    found: &mut Vec<MainIvUser>,
+) {
+    for op in block {
+        if operands(op).contains(&iter_arg) {
+            let eligible =
+                is_scalar_add_or_sub(op) && first_const_operand_index(op, defs).is_some();
+            found.push(MainIvUser {
+                candidate: eligible.then(|| results(op).first().copied()).flatten(),
+                parent_is_if,
+            });
+        }
+        let is_if = matches!(op, Op::Sentient(ops::Op::If { .. }));
+        for region in regions_ref(op) {
+            main_iv_users(iter_arg, region, is_if, defs, found);
+        }
+    }
+}
+
+/// Replaces: e635_runScalarOpHoisting
+///
+/// One candidate loop, iter arg by iter arg: collect the adds and subs of a constant that read it and
+/// offer each in turn to derived-IV elimination, then to linear-chain hoisting, then to generic
+/// hoisting, re-examining the same iter arg after every hoist that took (`:2184-2245`).
+///
+/// ⛔ ONE INELIGIBLE USER DISQUALIFIES THE WHOLE ITER ARG (`hoisting_candidates.clear(); break;`,
+/// `:2205-2215`) — the candidates are not filtered, they are dropped.
+/// ⛔ `idx` ONLY ADVANCES WHEN NOTHING HOISTED (`:2244`): a hoist creates new opportunities on the
+/// same iter arg, and the number of iter args is re-read because the hoist rewrote the loop.
+/// ⛔ AND THE LOOP MOVES. `hoistCandidateOutOfLoop` inserts the new add AHEAD of it, so `at` is
+/// re-found by the induction variable — MLIR's `for_op_` is a pointer, this island's is a position.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_scalar_op_hoisting<A: Arch, E: ExpressionEvaluator>(
+    scope: &mut Vec<Op>,
+    at: usize,
+    innermost: Innermost,
+    comp: GenericComp,
+    scale: AddressScale,
+    evaluator: &mut E,
+    sites: &mut OffsetSites<'_>,
+    ibuff_space: &mut IbuffSpace,
+    hoists: &mut HoistCount,
+) {
+    let Some(Op::Sentient(ops::Op::For { iv, .. })) = scope.get(at) else {
+        return;
+    };
+    let for_iv = *iv;
+    let mut at = at;
+    let mut idx = 0;
+    loop {
+        // `num_hoists_executed_per_unit >= MaxHoists` (`:2189`).
+        if MAX_HOISTS.is_some_and(|max| *hoists >= max) {
+            return;
+        }
+        let Some(Op::Sentient(ops::Op::For { carried, body, .. })) = scope.get(at) else {
+            return;
+        };
+        // `idx < for_op_->getNumRegionIterArgs()`, re-read at every pass.
+        let Some(entry) = carried.get(idx as usize) else {
+            return;
+        };
+        let main_iv = IterArgIndex(idx);
+        let iter_arg = entry.arg;
+        let regions: [&[Op]; 2] = [body.as_slice(), scope.as_slice()];
+        let defs = Definitions::from_innermost(&regions);
+        let mut found = Vec::new();
+        main_iv_users(iter_arg, body, false, defs, &mut found);
+        let mut candidates = Vec::new();
+        for user in found {
+            match user.candidate {
+                Some(candidate) if !user.parent_is_if => candidates.push(candidate),
+                _ => {
+                    candidates.clear();
+                    break;
+                }
+            }
+        }
+        // `isa<sentient::YieldOp>(candidate_user)` — a candidate the loop yields would need its own
+        // adjustment put back, so it is passed over rather than dropped (`:2223-2231`).
+        candidates.retain(|candidate| {
+            !users(&[*candidate], body)
+                .iter()
+                .any(|user| matches!(user, Op::Sentient(ops::Op::Yield { .. })))
+        });
+
+        let mut reanalyze_candidates = false;
+        for candidate in candidates {
+            if process_for_derived_iv_elimination::<A, E>(
+                scope, at, main_iv, candidate, comp, scale, evaluator, hoists,
+            ) || process_for_linear_chain::<A, E>(
+                scope,
+                at,
+                main_iv,
+                candidate,
+                innermost,
+                comp,
+                scale,
+                evaluator,
+                sites,
+                ibuff_space,
+                hoists,
+            ) || process_for_generic_hoisting::<A, E>(
+                scope,
+                at,
+                main_iv,
+                candidate,
+                innermost,
+                comp,
+                scale,
+                evaluator,
+                sites,
+                ibuff_space,
+                hoists,
+            ) {
+                reanalyze_candidates = true;
+                break;
+            }
+        }
+
+        if reanalyze_candidates {
+            let Some(moved) = scope.iter().position(
+                |op| matches!(op, Op::Sentient(ops::Op::For { iv, .. }) if *iv == for_iv),
+            ) else {
+                return;
+            };
+            at = moved;
+        } else {
+            idx += 1;
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -2107,5 +2256,31 @@ mod unit_tests {
         ));
         assert_eq!(scope, untouched);
         assert_eq!(hoists, HoistCount(0));
+    }
+    /// e635 — the driver takes the loop's one iter arg, finds the add of a constant that reads it, and
+    /// offers that add to derived-IV elimination first: which is [`loop_with_a_derived_iv`]'s own case,
+    /// so it reaches `applyOperationData` — e365, and not ported.
+    ///
+    /// ⭐ THE PANIC IS THE DISPATCH: nothing else in this driver can reach e365, so arriving there
+    /// proves the candidate found was `Val(6)` on iter arg 0 and that the first of the three ran.
+    #[test]
+    #[should_panic(expected = "senpass e365")]
+    fn e635_offers_each_iter_arg_candidate_to_derived_iv_elimination_first() {
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
+        run_scalar_op_hoisting::<Dd2, _>(
+            &mut loop_with_a_derived_iv(),
+            0,
+            Innermost::Yes,
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut StatedEvaluator {
+                offset: Val(9),
+                sums: Vec::new(),
+            },
+            &mut sites_of(&mut consts, &mut values),
+            &mut IbuffSpace(4),
+            &mut HoistCount(0),
+        );
     }
 }

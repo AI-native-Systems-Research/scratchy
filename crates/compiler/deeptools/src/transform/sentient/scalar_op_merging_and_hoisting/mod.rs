@@ -95,12 +95,23 @@
 
 use std::num::NonZeroU32;
 
-use super::analyses::{EvaluatedValue, Evaluation, InstructionCount, ScalarOffset};
+use self::scalar_op_hoisting::HoistCount;
+use super::analyses::{
+    EvaluatedValue, Evaluation, ExpressionEvaluator, InstructionCount, PropagationAnalysis,
+    ScalarOffset, UnitIndexMap,
+};
+use super::lightweight_simplification::sentient::run_light_weight_simplifications;
+use super::scalar_simplifications::sentient::Propagation;
 use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
+use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{Op, Val, results};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 pub(crate) mod scalar_op_hoisting;
 pub(crate) mod scalar_op_merging;
@@ -597,10 +608,78 @@ impl ScalarOpMergingBlock {
 //   original  : void runOn(dataflow::ProgramUnitOp unit, ModuleOp module_op)
 //   calls     : e252_size
 
-// crustify:todo: e636_runOn
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2389  (14 body lines, level 6)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e366_runOn, e597_runLightWeightSimplifications
+/// `DisableSOMAHSimplification`, `cl::init(false)` (`:127-131`) — a `dcc-opt` flag, and this crate
+/// has no flags.
+const DISABLE_SOMAH_SIMPLIFICATION: bool = false;
+
+/// `ScalarOpMergingAndHoistingPass::runOn(dataflow::ProgramUnitOp, ModuleOp)` (`:2258`) — ⛔⛔
+/// **e366_runOn**, the anchor above, WHICH IS NOT IN THIS BATCH. This function is that one call and
+/// nothing else, and it goes away when e366 lands. ⛔ Not written here: filling another batch's
+/// anchor would double-fill it and take the unit out of the campaign's accounting.
+fn merge_and_hoist_one_unit<A: Arch>(
+    preamble: &mut Vec<Op>,
+    unit: &mut ProgramUnit<A>,
+    hoists: &mut HoistCount,
+) {
+    let _ = (preamble, unit, hoists);
+    todo!(
+        "ScalarOpMergingAndHoisting::runOn(unit, module_op) — senpass e366 \
+         (ScalarOpMergingAndHoisting.cpp:2258) is not ported yet, so nothing in this unit merges or \
+         hoists and the simplification below has nothing to clean up"
+    )
+}
+
+/// Replaces: e636_runOn
+///
+/// Every program unit of the module in order: reset the unit's hoist count, merge and hoist its
+/// scalar ops, then simplify what that left behind (`:2389-2402`).
+///
+/// ⛔ THE HOIST COUNT IS PER UNIT, RESET BY THE WALK ITSELF (`:2391`), so it is a local here — no
+/// unit inherits the hoists of the unit ahead of it.
+/// ⛔ THE CONST BUILDER SITS IN THE **MODULE'S** BLOCK, NOT THE UNIT'S (`:2393-2394`):
+/// `unit->getBlock()` is the block that HOLDS the unit, so e597's constants land in the preamble.
+/// ⭐ THE RETURNED UNITS ARE `emitError("failed in simplifying code") + signalPassFailure()` AS DATA
+/// (`:2398-2399`): the reference does not `return`, so the units behind a failure still run.
+pub(crate) fn run_on_module<
+    A: Arch,
+    M: Model,
+    W: Workload,
+    E: ExpressionEvaluator,
+    P: PropagationAnalysis,
+    U: UnitIndexMap,
+>(
+    program: &mut Program<A, M, W>,
+    evaluator: &mut E,
+    propagation: &mut P,
+    unit_index_map: &U,
+    values: &mut Values,
+) -> Vec<DfirUnit> {
+    let Program {
+        preamble, units, ..
+    } = program;
+    let mut failed_to_simplify = Vec::new();
+    for unit in units.iter_mut() {
+        let mut hoists = HoistCount(0);
+        merge_and_hoist_one_unit(preamble, unit, &mut hoists);
+        if DISABLE_SOMAH_SIMPLIFICATION {
+            continue;
+        }
+        let mut consts = Vec::new();
+        let simplified = run_light_weight_simplifications(
+            &mut consts,
+            &mut unit.body,
+            evaluator,
+            propagation,
+            unit_index_map,
+            values,
+        );
+        preamble.splice(0..0, consts);
+        if simplified == Propagation::Failed {
+            failed_to_simplify.push(unit.on.kind());
+        }
+    }
+    failed_to_simplify
+}
 
 // crustify:todo: e646_runOnOperation
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2404  (5 body lines, level 7)
@@ -611,8 +690,15 @@ impl ScalarOpMergingBlock {
 mod unit_tests {
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::link::SendEnd;
-    use crate::transform::sentient::analyses::Offsets;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
+    use crate::model::Model;
+    use crate::transform::sentient::analyses::{
+        Offsets, OutOfScopeEvaluator, OutOfScopePropagationAnalysis, OutOfScopeUnitIndexMap,
+    };
+    use crate::workload::Workload;
 
     /// An evaluation of one all-unit offset.
     fn all_unit(offset: i64) -> Evaluation {
@@ -889,5 +975,58 @@ mod unit_tests {
         block.add_unroll_candidate(candidate(Val(2), InstructionCount(6)));
         assert_eq!(block.required_ibuff, InstructionCount(10));
         assert_eq!(block.unroll_candidates.len(), 2);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e636 — the walk reaches its first unit's merge-and-hoist. ⛔ THE ONLY ASSERTION THERE IS UNTIL
+    /// e366 LANDS: [`ProgramUnits`] cannot be empty, so no run of this entry skips the seam.
+    #[test]
+    #[should_panic(expected = "senpass e366")]
+    fn e636_walks_every_unit_through_merging_and_hoisting() {
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(1)),
+                    precision: None,
+                    body: Vec::new(),
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+
+        let _ = run_on_module(
+            &mut program,
+            &mut OutOfScopeEvaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut values,
+        );
     }
 }
