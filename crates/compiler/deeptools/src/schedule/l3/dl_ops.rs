@@ -4955,8 +4955,10 @@ mod tests_e065_e072 {
 ///
 /// ⭐ THE `numCoreletsUsed_ > 1` GUARD IS REDUNDANT (it is the predicate's own first term), and A SET
 /// FOR ITS VECTOR CHANGES NOTHING: it walks the KEYS of a `std::map` (`dsc/dims.cpp:22`), so the
-/// answer is already each dim once in ordinal order and both callers only iterate it (`:108`,
-/// `:5279`). `PrimaryDimTypesCount` is not a [`PrimaryDim`], so the third skip has no input.
+/// answer is already each dim once in ordinal order, and NEITHER CALLER CAN SEE THE DIFFERENCE — one
+/// iterates it (`:109`), the other hands it to `fillFinalStartAddressAndOffset` (`:5288`), which only
+/// membership-tests it (`DCGUtils::isValPresent`, `:4995`). `PrimaryDimTypesCount` is not a
+/// [`PrimaryDim`], so the third skip has no input.
 #[must_use]
 pub fn corelet_split_dimensions(dsc: &DesignSpaceConfig) -> BTreeSet<PrimaryDim> {
     PrimaryDim::ALL
@@ -5063,15 +5065,15 @@ pub trait LoopStages: LoopNesting {
     fn loop_num(&self, loop_node: LoopId) -> DatastageId;
     /// `loopNode->denId_` — the denominator data stage.
     fn loop_den(&self, loop_node: LoopId) -> DatastageId;
-    /// `loopNode->dims_` (`dsc/dsc2.h:601`).
+    /// `loopNode->dims_` (`dsc/dsc2.h:575`).
     fn loop_dims(&self, loop_node: LoopId) -> LoopDims;
 }
 
 /// WHICH LX BUFFERING THE SCHEDULER CHOSE — `lxBufferType` (`L3DlOpsScheduler.h:221`) FUSED with
-/// `dataStageSuperChunkIdx` (`:227`).
+/// `dataStageSuperChunkIdx` (`:224`).
 ///
 /// ⭐ ONE TYPE FOR TWO FIELDS DISCHARGES `DT_CHECK_MSG(lxBufferType != SPATIAL_DOUBLE ||
-/// dsc.dataStageParam_.count(dataStageSuperChunkIdx), ..)` (`:4643`): spatial-double buffering is the
+/// dsc.dataStageParam_.count(dataStageSuperChunkIdx), ..)` (`:4124-4125`): spatial-double is the
 /// ONLY writer of that index (`:4648`) and this type cannot be spelled without it. Its `-1` unset
 /// state and its `BUFFER_TYPE_COUNT` terminator both stop existing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5086,7 +5088,7 @@ pub enum LxBuffering {
 /// tensor.")`, which entries 201 and 202 each state once.
 ///
 /// ⭐ EXACT AND NOT STRONGER: their one caller collects `allValueLdsIndices` through that very
-/// predicate (`:3137`) BEFORE either call, so every labelled DS either function is ever handed has one.
+/// predicate (`:3138`) BEFORE either call, so every labelled DS either function is ever handed has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueLds(());
 
@@ -5102,7 +5104,7 @@ impl ValueLds {
 /// with the loops enclosing it INNERMOST FIRST.
 ///
 /// ⭐ THE PAIR THE CALLER ALREADY BUILDS AS A PAIR: `getLxBelowBlockNode` and then
-/// `getParentLoopNodes(*lxBelowBlockNode, dsc)` (`:3128-3132`), which turns
+/// `getParentLoopNodes(*lxBelowBlockNode, dsc)` (`:3128-3133`), which turns
 /// `DT_CHECK_MSG(startNode && startNode->name_ == lxBelowBlockNodeName, ..)` into a constructor and
 /// makes it impossible to walk one DSC's loops from another DSC's block.
 pub struct LxBelowWalk<'a, T: ?Sized> {
@@ -5157,8 +5159,9 @@ fn sole_loop_dim<T: LoopStages + ?Sized>(tree: &T, loop_node: LoopId) -> Option<
 ///
 /// ⛔ [`None`] IS THE `nullptr` AND EVERY ABORT ALIKE, which the caller cannot tell apart either —
 /// `DT_CHECK_MSG(allocSiblingLoopNode, "Expect a valid node.")` (`:3157`). It covers a DS pinned
-/// NOWHERE, a loop pair the spatial-double walk never matches, and the two places the reference is
-/// UNDEFINED: `parentLoop->numId_` on a loop with no enclosing loop, and `.back()` on an empty walk.
+/// NOWHERE, a loop pair the spatial-double walk never matches, and `.back()` on an empty walk.
+/// ⛔ DIVERGENCE: A SUPER-CHUNK-BY-CHUNK LOOP WITH NO ENCLOSING LOOP IS SKIPPED and a later loop may
+/// still answer, where the reference dereferences the null `parentLoop->numId_` (`:457`).
 #[must_use]
 pub fn compute_lds_allocate_sibling_loop_node<T: LoopStages + ?Sized>(
     walk: &LxBelowWalk<'_, T>,
@@ -5269,7 +5272,7 @@ pub fn compute_lds_transfer_sibling_loop_node<T: LoopStages + ?Sized>(
 
 /// WHICH ARITHMETIC FORMAT AN OP FUNC IS CHARGED AT — the `std::string` `getOpFuncDataFormat` returns,
 /// whose four spellings are EXACTLY the four keys `sysFlopsPerByte` states
-/// (`sys-arch-spec/sysdef.cpp:297-306`), so the `.at(dataFormat)` beside it (`:2525`) cannot throw.
+/// (`sys-arch-spec/sysdef.cpp:297-306`), so the `.at(dataFormat)` beside it (`:2523`) cannot throw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OpFuncDataFormat {
     /// `"int4"`.
@@ -5300,9 +5303,10 @@ impl OpFuncDataFormat {
 /// WHICH ARITHMETIC FORMAT the DSC's first op func is charged at.
 ///
 /// ⛔ TRAP, AND IT IS THE REFERENCE'S: THIS IS A LITERAL ENUMERATION, NOT A PRECISION PREDICATE.
-/// `CSQ_INT8_V2`, `CSQ_INT8_MB_V2`, `Q_FP8_MB`, `BATCHMATMUL_FP8_FWD_MB`, `BATCHMATMUL_MXFP8_FWD` and
-/// `BATCHMATMUL_MXFP4_W_FWD` each NAME their format and each fall to the `default:` `"fp16"`, so the
-/// arithmetic intensity they are scored with is another format's (`:2521-2525`). Ported verbatim.
+/// SIXTEEN of the 176 op funcs NAME a non-fp16 format and fall to the `default:` `"fp16"` all the
+/// same — the plain `MATMUL_INT4/INT8/FP8_FWD`, `SCALED_GROUP_MATMUL_FP4_FWD`, `BATCHMATMUL_MXFP8_FWD`,
+/// `BATCHMATMUL_MXFP4W_FWD`, `CSQ_INT8_V2` and nine more — so the arithmetic intensity they are scored
+/// with is another format's (`:2521-2525`). Ported verbatim.
 /// ⭐ TOTAL: the default arm answers for `OpFuncs::NONE` too, so `DT_CHECK(hasComputeOp)` has no say.
 #[must_use]
 pub fn op_func_data_format<D: ComputeOps + ?Sized>(dsc: &D) -> OpFuncDataFormat {
@@ -5359,7 +5363,7 @@ pub fn op_func_data_format<D: ComputeOps + ?Sized>(dsc: &D) -> OpFuncDataFormat 
 /// nine fp16, fp8 and int8 forward spellings its own `static` set names.
 ///
 /// ⭐ THE UNION IS EVERY `CONV2D_*` THE ISA NAMES — sixteen variants
-/// (`sys-arch-spec/arch_enums.h:196-218`, `:241-244`) — so this is Conv2d-ness and not a subset of it,
+/// (`sys-arch-spec/arch_enums.h:204-215`, `:241-244`) — so this is Conv2d-ness and not a subset of it,
 /// and the `static const std::unordered_set` built once per process is a `matches!` here.
 #[must_use]
 pub fn is_op_func_conv2d(op_func: Option<OpFunc>) -> bool {
@@ -5946,8 +5950,8 @@ mod tests_e197_e204 {
         }
     }
 
-    /// e203 — one representative of each of the four keys, and the six op funcs that NAME a format
-    /// the reference does not charge them at.
+    /// e203 — one representative of each of the four keys, and nine of the SIXTEEN op funcs that NAME
+    /// a format the reference does not charge them at.
     #[test]
     fn the_data_format_is_a_literal_enumeration_and_not_a_precision_predicate() {
         for (op, format) in [
@@ -5976,6 +5980,9 @@ mod tests_e197_e204 {
             OpFunc::BatchmatmulFp8FwdMb,
             OpFunc::BatchmatmulMxfp8Fwd,
             OpFunc::BatchmatmulMxfp4WFwd,
+            OpFunc::MatmulInt4Fwd,
+            OpFunc::MatmulInt8Fwd,
+            OpFunc::MatmulFp8Fwd,
         ] {
             assert_eq!(op_func_data_format(&Ops(Some(op))), OpFuncDataFormat::Fp16);
         }
@@ -6117,7 +6124,7 @@ fn is_multiple_of(value: i64, divisor: i64) -> Option<bool> {
     (divisor != 0).then(|| value % divisor == 0)
 }
 
-/// `isDimensionParamMultipleOfStickSize` (`L3DlOpsScheduler.cpp:1310`) — every non-index labelled
+/// `isDimensionParamMultipleOfStickSize` (`L3DlOpsScheduler.cpp:1312`) — every non-index labelled
 /// DS's stick size along `dim` divides `param`, a scale tensor's stick multiplied by its own block.
 fn param_multiple_of_stick_size<M: MemOrg + ?Sized>(
     dsc: &DesignSpaceConfig,
@@ -6141,7 +6148,7 @@ fn param_multiple_of_stick_size<M: MemOrg + ?Sized>(
     Some(true)
 }
 
-/// `isParamCoreletSplitValid` (`:1330`) — a corelet-split dim's parameter must split equally across
+/// `isParamCoreletSplitValid` (`:1334`) — a corelet-split dim's parameter must split equally across
 /// the corelets AND each corelet's share must itself be a multiple of every stick size.
 fn param_corelet_split_valid<M: MemOrg + ?Sized>(
     dsc: &DesignSpaceConfig,
@@ -6403,8 +6410,8 @@ pub fn is_op_cross_core_reduction(sdsc: &SuperDsc, dsc: &DesignSpaceConfig) -> O
 /// to a reference node.
 ///
 /// ⛔ [`None`] IS THE REFERENCE'S `nullptr` FOR ALL FOUR OF ITS CAUSES AT ONCE: an empty set, a
-/// reference node sharing no parent with the others, and both `DT_CHECK_MSG`s — *"Parent node must be
-/// a block node."* and *"Expect node to have the same parent."*.
+/// reference node sharing no parent with the others, and the two `DT_CHECK_MSG`s a [`NodeId`] can
+/// still reach — *"Parent node must be a block node."* and *"Expect node to have the same parent."*.
 /// ⛔ DIVERGENCE: THE SET IS WALKED SMALLEST ID FIRST where the reference walks an `unordered_set` in
 /// an unspecified order, which its own seeding of `parentNodesOuterToInner` depends on.
 #[must_use]
