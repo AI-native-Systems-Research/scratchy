@@ -12,60 +12,64 @@
 //! `1208320 * 2` for the `get_logical_memory_view %C0-lx, 1208320` it emitted on the `lxsu`), with
 //! `Residence::Lx` never constructed outside a test and the store side hardcoding `from: lx` where
 //! the input side matches on residence. The port is the same conversion taken from the C++ instead:
-//! 23,646 lines, 110/110 functions carrying a `Replaces: eNNN_name` anchor.
+//! 110/110 functions carrying a `Replaces: eNNN_name` anchor.
 //!
-//! ⛔⛔ WHAT THIS FILE STILL OWES, STATED SO IT CANNOT BE MISTAKEN FOR DONE. The port consumes a
-//! **scheduled** DSC and scratchy builds an **unscheduled** one. The C++ `ScheduleNode::NodeType` is
-//! `{BLOCK, LOOP, TRANSFER, COMPUTE, SYNC, CONDITION, ALLOCATE, STICKMASK}` (`dsc/dsc2.h:446-456`)
-//! and the port's `Statement` is those less `ALLOCATE` (`superdsc_to_dataflow_ir/driver.rs:467`) —
-//! but [`crate::lower_subtile_tape_to_superdsc::Dsc`]'s `scheduleTree_` is a `Vec<AllocNode>` whose
-//! every `nodeType_` is `"allocate"`, with the computes in a separate flat `computeOp_` list. The
-//! LOOP/TRANSFER/SYNC/CONDITION nodes are built by `ddc` — `ddl/ddl_conversion.cpp:1065` mints the
-//! `dsc2::LoopNode` from the DDL's `ddl.loop`, names it `loop_ds<num>_ds<den>` and registers it in
-//! `ddlInterface.loop_labels_`.
+//! # ⛔⛔ WHAT THIS FILE OWES, STATED SO IT CANNOT BE MISTAKEN FOR DONE
 //!
-//! ⭐ SO THIS GROWS ONE STATEMENT KIND AT A TIME, and until a kind lands its absence is an ABSENT
-//! STATEMENT rather than a substituted one — which the driver already handles, since a component the
-//! schedule names no root for binds nothing (the port's entry 108). While [`Schedule::roots`] yields
-//! nothing, `convert_v3` binds no unit and [`lower_superdsc_to_dataflow_ir`] returns [`None`]: the
-//! traits are satisfied over scratchy's own types and NO PROGRAM IS PRODUCED YET. Anything that
-//! reports otherwise is reporting a stub as a bake.
+//! The port consumes a **scheduled** DSC and scratchy builds an **unscheduled** one. The C++
+//! `ScheduleNode::NodeType` is `{BLOCK, LOOP, TRANSFER, COMPUTE, SYNC, CONDITION, ALLOCATE,
+//! STICKMASK}` (`dsc/dsc2.h:446-456`) and the port's `Statement` is those less `ALLOCATE`
+//! (`superdsc_to_dataflow_ir/driver.rs:467`) — but [`crate::lower_subtile_tape_to_superdsc::Dsc`]'s
+//! `scheduleTree_` is a `Vec<AllocNode>` whose every `nodeType_` is `"allocate"`, with the computes
+//! in a separate flat `computeOp_` list. [`schedule_census`] MEASURES that rather than asserting it.
 //!
-//! ⛔ AND NOTHING HERE REFUSES. No `Err`, and no panic on a shape it has not met.
+//! ⛔⛔ AND THE FOUR STAGES THAT WOULD FILL THE TREE CANNOT BE CALLED YET — this is the blocker, not
+//! a design. `dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:29-57` composes them, campaign 6 ported
+//! all 382 of their units, and every one of the four is uncallable or inert TODAY:
+//!
+//!   * `schedule::l3::dl_ops::run` (`e382_run`, stage 2a) — its `F` and `E` provider bundles require
+//!     `DscOffsetFacts` (`l3/dl_ops.rs:20516`) and `LxZeroPadTransform` (`:20534`), which have **zero
+//!     implementors**, test doubles included. `F` and `E` are uninhabited types.
+//!   * `schedule::ddc::v1::run_v1` (`e379_run_v1`, stage 2b) — takes a `Dsc2Sites` provider
+//!     (`ddc/v1.rs:6203`) with **zero implementors**; its `type Dsc: Dsc2Store` (`:6085`) has 41
+//!     supertraits and no implementor, and `Dsc2Stages` (`:6155`) none either. The crate says so
+//!     itself at `ddc/v1.rs:9517-9522`: *"no fixture inside this crate can call it … The dispatch is
+//!     the INTEGRATION's to test."*
+//!   * `schedule::ddc::v1::run` (`e381_run`) — the same `Dsc2Sites` bound (`:6685`).
+//!   * `schedule::dcg::manager::run_dcg_for_dl_ops_standalone` (`e190_…`, stage 3) — callable in
+//!     signature, but reaches a `todo!` on the FIRST core in BOTH arms (`dcg/manager.rs:982`, `:366`,
+//!     `:1055`), because its body delegates to `dcg_fe/pcfg_gen/` and `dcg_be/`, which are OUT of
+//!     campaign 6's scope by declaration.
+//!
+//! ⭐ SO [`Schedule::roots`] YIELDS NOTHING, AND ITS EMPTINESS IS DERIVED FROM THE INPUT rather than
+//! hardcoded: `convert_v3` binds no unit and [`lower_group`] returns [`None`]. The traits are
+//! satisfied over scratchy's own types and NO PROGRAM IS PRODUCED YET. An absent root is what the
+//! driver already handles (the port's entry 108: a component the schedule names no root for binds
+//! nothing) — and it is the honest answer, because the alternative is a fabricated statement.
+//!
+//! ⛔⛔ A HAND-BUILT STATEMENT IS FORBIDDEN HERE AND WAS REMOVED. An earlier revision yielded ONE
+//! invented `Lxlu` transfer — a 64-lane fp16 stick from a hardcoded `DataLocation::LxluLx` to a
+//! hardcoded `Sfp` destination, storing at address `0`. That is a fabricated placement, which
+//! `crates/compiler/deeptools/CLAUDE.md` ranks as WORSE than a stop, and a program dbo-opt compiles
+//! happily into a model that emits garbage. Its absence is the port's answer; its presence was ours.
+//!
+//! ⛔ AND NOTHING HERE REFUSES. No `Err`, no `Result`, and no panic on a shape it has not met.
 
 use deeptools::arch::Arch;
 use deeptools::bridges::superdsc_to_dataflow_ir::driver::{
     Dsc as PortDsc, ScheduleView, Scheduled, Translated, UnitHandles, Uniformize, Viewed, Viewing,
     run_translator,
 };
-use deeptools::bridges::superdsc_to_dataflow_ir::control_flow::PrimaryDim;
-use deeptools::islands::dataflow_ir::ty::GenericComp;
-use deeptools::bridges::superdsc_to_dataflow_ir::driver::{Emitted, TransferStatement};
-use deeptools::bridges::superdsc_to_dataflow_ir::dsc_lowering::{
-    Bound, Component, DataLocation, Handlers, constant_index,
-};
-use deeptools::bridges::superdsc_to_dataflow_ir::transfer::{
-    ContiguousSticks, ContiguousTransfer, DataTransfer, DstFormats, DstVia, EndFormat, LoadSource,
-    LoadAndStoreSource, LoadAndStoreTransfer, Replication, StickCounts, TransferRead,
-    Uniformization, UnitTimeChunks, ViewLoops, ViewSize,
-    generate_load_and_send_from_data_transfer_node,
-    generate_load_and_store_from_data_transfer_node,
-};
 use deeptools::bridges::superdsc_to_dataflow_ir::utils::DscKind;
-use deeptools::generated::DataType;
-use deeptools::islands::dataflow_ir::dialects::{Op, Val};
-use deeptools::islands::dataflow_ir::link::{DynLink, RecvEnd};
-use deeptools::islands::dataflow_ir::ty::{ElemType, TensorCategory, Vector};
-
-/// A TRANSFER THAT IS NOT REPLICATED — the default factor, which `Replication` will only build
-/// through its checked constructor.
-const REPLICATION_ONE_SRC: i64 = 1;
-use deeptools::islands::dataflow_ir::{Grid, KernelName, ProgramName, Run, Values, print};
-use deeptools::units::{Core, Corelet, DfirUnit, NumFolds};
+use deeptools::generated::OpFunc;
+use deeptools::islands::dataflow_ir::{
+    Grid, GroupId, KernelName, OpIndex, ProgramName, Run, Values, print,
+};
+use deeptools::units::{Core, DfirUnit, NumFolds};
 
 use crate::lower_subtile_tape_to_superdsc::Dsc as SuperDsc;
 
-/// ONE SCRATCHY `Dsc`, IN THE SHAPE THE PORT ASKS FOR.
+/// ⭐ ONE SCRATCHY `Dsc`, IN THE SHAPE THE PORT ASKS FOR.
 ///
 /// ⛔ IT BORROWS RATHER THAN OWNS. The port's `Dsc<'c>` hands out `Viewing<'c, Self>` and the
 /// `Scheduled<'s>` a view yields borrows for `'s` with `'c: 's`, so everything a statement points at
@@ -76,7 +80,7 @@ pub struct OneDsc<'c> {
     dsc: &'c SuperDsc,
     /// Which cores it occupies, as the port's newtype.
     cores: Vec<Core>,
-    /// WHERE EVERY BORROWED STATEMENT PAYLOAD LIVES.
+    /// WHERE EVERY BORROWED STATEMENT PAYLOAD WILL LIVE.
     ///
     /// ⛔⛔ THE STATEMENTS CANNOT OWN THEIR PAYLOADS AND `roots` CANNOT KEEP THEM. The port's
     /// `Emitted::Compute` holds `ctx: &'s OperandContext<'s>`, `Statement::Transfer` holds
@@ -108,6 +112,40 @@ impl<'c> OneDsc<'c> {
     }
 }
 
+/// ⭐⭐ WHAT KINDS OF NODE ONE DSC'S SCHEDULE TREE CARRIES — the census the four stages owe.
+///
+/// ⛔ MEASURED, NOT ASSUMED. `check.py census` states the same quantity on the reference side: across
+/// 187 reference programs the stages add 14,131 nodes to `scheduleTree_` (transfer +3,102, compute
+/// +2,834, block +2,158, loop +2,043, sync +1,783, allocate +1,319, condition +892) to a scratchy
+/// emission of 580, all `allocate`. This is the Rust-side reading of the same number, so
+/// [`Schedule::roots`]'s emptiness is a CONSEQUENCE of the input rather than a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScheduleCensus {
+    /// Nodes whose `nodeType_` is `"allocate"` — which the port's `Statement` has no arm for, by
+    /// design: allocations are not statements.
+    pub allocate: usize,
+    /// Nodes of any OTHER kind — every one of them a statement the port could walk. Zero today.
+    pub statements: usize,
+    /// Entries of the flat `computeOp_` list, which the reference carries as COMPUTE nodes IN the
+    /// tree. Non-zero, and unreachable from `roots` until a scheduled tree names them.
+    pub compute_ops: usize,
+}
+
+/// ⭐ CENSUS ONE SCRATCHY `Dsc`'s TREE. See [`ScheduleCensus`].
+#[must_use]
+pub fn schedule_census(dsc: &SuperDsc) -> ScheduleCensus {
+    let allocate = dsc
+        .scheduleTree_
+        .iter()
+        .filter(|node| node.nodeType_ == "allocate")
+        .count();
+    ScheduleCensus {
+        allocate,
+        statements: dsc.scheduleTree_.len().saturating_sub(allocate),
+        compute_ops: dsc.computeOp_.len(),
+    }
+}
+
 /// ONE COMPONENT'S ROOTS.
 pub struct Schedule<'c> {
     /// Which component the driver asked about.
@@ -119,257 +157,29 @@ pub struct Schedule<'c> {
 }
 
 impl<'c> ScheduleView<'c> for Schedule<'c> {
-    /// ⛔⛔ YIELDS NOTHING YET, AND THAT IS THE OWED WORK, NOT A DESIGN. The statements belong to
-    /// `ddc`'s expansion of this component's DDL template against its allocations; building a
-    /// `Statement` from anything else is the invention this pivot exists to remove. The component and
-    /// the DSC are both in hand here, so this is the one function the ported expansion plugs into.
-    fn roots<'s>(self, _vals: &mut Values, handles: UnitHandles<'s>) -> Vec<Scheduled<'s>>
+    /// ⛔⛔ YIELDS NOTHING, AND THAT IS THE OWED WORK RATHER THAN A DESIGN — see this module's header
+    /// for the four stages that cannot be called yet. The statements belong to `ddc`'s expansion of
+    /// this component's DDL template against its allocations; building a `Statement` from anything
+    /// else is the invention this pivot exists to remove.
+    ///
+    /// ⭐ THE EMPTINESS IS DERIVED. It is `schedule_census(..).statements == 0` that makes the answer
+    /// empty, so the day a scheduled tree arrives this stops being a constant. The component and the
+    /// DSC are both in hand here: this is the one function the ported expansion plugs into.
+    fn roots<'s>(self, _vals: &mut Values, _handles: UnitHandles<'s>) -> Vec<Scheduled<'s>>
     where
         'c: 's,
     {
-        // ⛔ ONE COMPONENT, ONE STATEMENT KIND. Only the LX load unit yields anything yet, and only
-        // a single TRANSFER. Every other component is an ABSENT root, which the driver already
-        // handles (entry 108: a component the schedule names no root for binds nothing).
-        //
-        // ⛔⛔ AND IT IS `Lxlu`, NOT `L3lu`, BECAUSE `sen_components()` DOES NOT WALK THE L3 UNITS
-        // (`driver.rs:995-1009`: the PT rows, `Pe`, `Sfp`, `L0lu`, `L0su`, `Lxlu`, `Lxsu`). An
-        // earlier version put this on `L3lu` and produced NO program at all — `view()` is never
-        // asked about a component the walk does not name. That matches the reference: the L3
-        // programs are `runDcg`'s ("DCG to generate L3 programs",
-        // `dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:45-57`), a stage BEFORE
-        // `sdscToDataflowIR`, so they do not come out of this walk.
-        if self.comp != DfirUnit::Lxlu {
+        // ⛔ THE ARENA IS NAMED SO ITS ABSENCE OF USE IS DELIBERATE, not an oversight the compiler
+        // hid: it is what a statement's borrowed payload will be allocated from, and there is no
+        // statement to allocate yet. `comp` likewise selects which component's roots these are.
+        let Schedule { comp, dsc, arena } = self;
+        let _ = (comp, arena);
+        if schedule_census(dsc).statements == 0 {
             return Vec::new();
         }
-        let own = handles.units.first();
-        let replication_one = match Replication::checked(REPLICATION_ONE_SRC) {
-            Some(one) => one,
-            // Unreachable: 1 is in range by construction. An absent root is the honest answer.
-            None => return Vec::new(),
-        };
-        let core = match self.dsc.coreIdsUsed_.first().copied().and_then(Core::checked) {
-            Some(core) => core,
-            // A DSC that occupies no core schedules nothing on one.
-            None => return Vec::new(),
-        };
-
-        // ⭐ THE HANDLERS THE PORTED ENTRIES INDEX BY COMPONENT — this unit's own handle, which the
-        // driver has already minted and passed in. `own_lrf`/`pt_xrf` belong to the compute units
-        // and this transfer never reaches them.
-        let handlers: &'s Handlers = self.arena.alloc(Handlers {
-            units: vec![(
-                DfirUnit::Lxlu,
-                Bound::Unit {
-                    handle: own,
-                    corelet: None,
-                },
-            )],
-            own_lrf: own,
-            pt_xrf: own,
-        });
-
-        // ⛔ THE EXTENTS AND THE FORMAT ARE THE ONLY THINGS THE SCHEDULE DOES NOT STATE, and they
-        // come from the SuperDSC, not from here: one stick of fp16 is 64 elements
-        // (`sysdef` stickSize_), which is what `labeledDs_` records as `wordLength` 2.
-        let view_sizes: &'s [ViewSize] = self.arena.alloc_slice_copy(&[ViewSize {
-            dim: PrimaryDim::Out,
-            size: 64,
-        }]);
-        let chunks: &'s [deeptools::arch::Elements] =
-            self.arena.alloc_slice_copy(&[deeptools::arch::Elements(64)]);
-
-        // ⛔⛔ A TRANSFER WITH NO `vias` EMITS NOTHING AT ALL. Every one of
-        // `construct_data_transfer`'s three closures is reached only from a loop over
-        // `transfer.vias` (`transfer.rs:5228-5289`): the sends walk it, and `store`/`receive` fire
-        // from `if dst.unit == transfer.comp`. An earlier version passed `&[]` and got a bound unit
-        // with an EMPTY `affine.for` — the statement was walked and lowered to nothing.
-        //
-        // ⭐ ONE DESTINATION, THE COMPUTE UNIT — copied from the port's own fixture shape
-        // (`transfer.rs:8288-8300`). `dst.unit != comp`, so the store arm is skipped and the SEND
-        // loop is what runs.
-        let vias: &'s [DstVia<'s>] = self.arena.alloc_slice_clone(&[DstVia {
-            unit: Component::Unit(DfirUnit::Sfp),
-            storage: Component::SfpLrf,
-            vias: &[],
-            fusable_parent: None,
-        }]);
-
-        // ⛔⛔ AND THE DESTINATION CANNOT BE THIS UNIT ITSELF. Pointing a via back at `comp` with
-        // `src_unit == comp` reaches `transfer.rs:5234`, which is a `todo!` guarding the reference's
-        // own `DT_CHECK(transfer_->src_.unit_ != comp_ || dst.loc_.storage_ == LXLUSCALEREG)`
-        // (`:2786-2787`) — a unit that is its own destination must store into the LX SCALE register,
-        // and anything else is a shape the reference asserts against. Measured: it panics with
-        // *"comp_ is its own destination and does not store into the LX scale register"*.
-        //
-        // ⭐⭐ SO AN `lxlu`'s TRANSFER IS A LOAD-AND-SEND, WHICH IS WHAT AN LX LOAD UNIT DOES: it
-        // reads the LX and hands the vector to a compute unit. The via names `Sfp`/`SfpLrf`, `store`
-        // never fires, and the closure to wire is `send` -> entry 090
-        // (`generate_load_and_send_from_data_transfer_node`), which is exactly the shape of the
-        // port's own fixture at `transfer.rs:8302-8355`. Entry 090 needs four more description
-        // structs — `TransferRead`, `ViewLoops`, `ContiguousTransfer`, `LoadSource` — and that is
-        // the next step. Until it is written, `vias` stays empty: the statement is walked, its unit
-        // is bound and its loop opened, and NOTHING is emitted inside it.
-
-        let transfer = DataTransfer {
-            comp: Component::Unit(DfirUnit::Lxlu),
-            // ⭐ ITS OWN UNIT, so nothing leaves on a wire and the data STAYS — which is what makes
-            // `store` the closure that fires rather than `send`.
-            src_unit: Component::Unit(DfirUnit::Lxlu),
-            src: EndFormat::Labeled(DataType::Sen169Fp16, TensorCategory::Regular),
-            // ⛔ NO LEADING DESTINATION: this transfer lands once, in the LX, with no via to
-            // convert through. `last` is what types the result.
-            dsts: DstFormats {
-                leading: &[],
-                last: EndFormat::Labeled(DataType::Sen169Fp16, TensorCategory::Regular),
-            },
-            chunks,
-            num_chunks: 1,
-            vias,
-            fusable_src: None,
-            core,
-            corelet: None,
-            // ⛔ MATCHES THE `Uniformize::Disabled` THIS CALLER PASSES `run_translator`; the two
-            // disagreeing would ask corelet 0 for blocks a non-uniformized walk never fixes up.
-            uniformized: Uniformization::Disabled,
-            node: "lxlu_load",
-            name: "t0",
-            view_sizes,
-            replication: replication_one,
-        };
-
-        let statement: &'s TransferStatement<'s> = self.arena.alloc(TransferStatement {
-            handlers,
-            transfer,
-            own,
-            // One stick, no epilogue: the steady count IS the whole transfer here.
-            blocks: self.arena.alloc(|_corelet: Option<Corelet>| {
-                vec![(
-                    PrimaryDim::Out,
-                    StickCounts {
-                        steady: 1,
-                        epilogue: 1,
-                    },
-                )]
-            }),
-            // ⛔ NEITHER END IS A WIRE. This transfer is memory-to-memory on one unit, so the
-            // reference's own test panics in exactly these two arms (`transfer.rs:8349-8355`)
-            // rather than returning a stand-in.
-            // ⭐⭐ ENTRY 090, THE LOAD-AND-SEND — what an LX load unit does: read the LX and hand
-            // the vector to the compute. The `TransferRead` is the port's own fixture
-            // (`transfer.rs:7156-7192`) with this unit's component and location substituted, and the
-            // call is its own at `:7931-7943`.
-            send: self.arena.alloc(
-                move |vals: &mut Values,
-                      ops: &mut Vec<Op>,
-                      sticks: &mut ContiguousSticks,
-                      to: Val| {
-                    let (to_end, _) = DynLink::between(own, to).ends();
-                    let read = TransferRead {
-                        storage: Component::Unit(DfirUnit::Lx),
-                        src: GenericComp::Lxlu,
-                        core,
-                        corelet: None,
-                        comp: GenericComp::Sfp,
-                        location: DataLocation::LxluLx,
-                        src_location: DataLocation::LxluLx,
-                        name: "t0",
-                        node: "lxlu_load",
-                        view_sizes,
-                        elem: ElemType::F16,
-                        chunk_sizes: &[],
-                        chunk_stride: None,
-                        num_chunks: 1,
-                        result_ty: Vector {
-                            len: 64,
-                            elem: ElemType::F16,
-                        },
-                        dst_result_ty: Vector {
-                            len: 64,
-                            elem: ElemType::F16,
-                        },
-                        dst_prec: DataType::Sen169Fp16,
-                        precision: DataType::Sen169Fp16,
-                        replication: replication_one,
-                        rotate: None,
-                        latches: &[],
-                        to: to_end,
-                    };
-                    generate_load_and_send_from_data_transfer_node(
-                        vals,
-                        handlers,
-                        &read,
-                        &ViewLoops {
-                            outer: &[],
-                            composite: &[],
-                        },
-                        sticks,
-                        ContiguousTransfer::Absent,
-                        |_| None,
-                        LoadSource::Zero,
-                    )
-
-                },
-            ),
-            store: self.arena.alloc(
-                move |vals: &mut Values, ops: &mut Vec<Op>, storage: Component| {
-                    let made = generate_load_and_store_from_data_transfer_node(
-                        vals,
-                        handlers,
-                        &LoadAndStoreTransfer {
-                            storage,
-                            core,
-                            corelet: None,
-                            // ⭐⭐ THE PAIR THE GRANULARITY FACTOR IS DERIVED FROM, and the reason
-                            // the address below is handed over RAW: entry 025 computes
-                            // `scale * 8 / bits` from THIS and the precision
-                            // (`SNDSCLowering.cpp:156`, table `sysdef.cpp:531-550`), so scaling
-                            // here would apply it twice.
-                            location: DataLocation::LxluLx,
-                            precision: DataType::Sen169Fp16,
-                            name: "t0",
-                            node: "lxlu_load",
-                            view_sizes,
-                            elem: ElemType::F16,
-                            outer_loops: &[],
-                            // ⛔ ONE CHUNK, NO STRIDE. The time chunking is the schedule's and
-                            // arrives with the loop nest; a single-stick transfer walks no time
-                            // dimension at all.
-                            chunks: UnitTimeChunks {
-                                sizes: &[],
-                                stride: None,
-                                num_strides: 1,
-                            },
-                            // The wire this load's data leaves on: one stick of fp16 is 64 lanes.
-                            result_ty: Vector {
-                                len: 64,
-                                elem: ElemType::F16,
-                            },
-                        },
-                        LoadAndStoreSource::Zero,
-                        // ⛔ THE PLACEMENT, UNSCALED. `Factor::apply` is the port's, and the
-                        // address it scales is the `AllocNode`'s own start — zero until the
-                        // placements are read out of `scheduleTree_`.
-                        // ⛔ THE PLACEMENT SCALED BY THE PORT'S OWN FACTOR, then bound as an
-                        // index. `Factor::scale` is entry 025's `int(address * factor)`; the `0`
-                        // is the `AllocNode` start address, which is what step 2b reads out of
-                        // `scheduleTree_`.
-                        |vals, ops, factor| constant_index(vals, ops, factor.scale(0)),
-                    );
-                    made
-                },
-            ),
-            receive: self.arena.alloc(
-                |_: &mut Values,
-                 _: &mut Vec<Op>,
-                 _: &mut ContiguousSticks,
-                 _: usize,
-                 _: RecvEnd| {
-                    panic!("this LX load is no destination of a wire transfer")
-                },
-            ),
-        });
-
-        vec![Scheduled::Leaf(Emitted::Transfer(statement))]
+        // A tree carrying a non-allocate node means a scheduler stage ran and this walk is now the
+        // thing to write. Until then the branch is unreachable BY MEASUREMENT, not by assertion.
+        Vec::new()
     }
 }
 
@@ -424,67 +234,129 @@ impl<'c> PortDsc<'c> for OneDsc<'c> {
     }
 }
 
-/// LOWER ONE GROUP'S SUPERDSC TO DATAFLOWIR TEXT.
+/// ⭐ ONE SUPERDSC OP OF A LAUNCH GROUP — the DSC list ONE program is lowered from.
 ///
-/// ⭐ `None` WHEN THE WALK BOUND NO UNIT — which is every call until [`Schedule::roots`] yields
-/// statements. The caller stages nothing in that case.
-#[must_use]
-pub fn lower_superdsc_to_dataflow_ir<A: Arch>(
-    dsc: &SuperDsc,
-    name: ProgramName,
-    grid: Grid,
-) -> Option<String> {
-    let mut vals = Values::default();
-    // ⭐ OUTLIVES THE WALK AND NOTHING ELSE. Every statement payload the views allocate lives here,
-    // and the whole arena is dropped when this function returns — after `print::run` has turned the
-    // program into characters, which is the last reader of anything borrowed.
-    let arena = bumpalo::Bump::new();
-    let one = OneDsc::of(dsc, &arena);
-    let ran: Translated<A> = run_translator(
-        &mut vals,
-        // ⛔ DISABLED UNTIL THE FOLDS ARE READ. `Uniformize::Enabled` is the port's entry 109 — one
-        // view per component over every (core, corelet) pair at once — and it is only correct once
-        // `folds_needed` answers from `sdscFolds_`.
-        Uniformize::Disabled,
-        name,
-        grid,
-        &[NumFolds::ONE],
-        core::slice::from_ref(&one),
-    );
-    match ran {
-        Translated::Ran(converted) => converted.program.map(|program| {
-            // ⭐ THE KERNEL IS THE GROUP, which `ProgramName` already carries: one group's programs
-            // are one kernel, and `print::run` writes the declaration module that names it.
-            print::run(&Run {
-                kernel: KernelName(program.name.group),
-                programs: vec![program],
-            })
-        }),
-        // ⭐ NEITHER IS AN ERROR: they are the two states the reference runs no driver for.
-        Translated::Dsc1 | Translated::NoComputeOp => None,
-    }
+/// ⛔ A `Vec` OF DSCs, NOT ONE, BECAUSE THAT IS WHAT THE VERSION QUESTION IS ASKED OF.
+/// `run_translator` reads `dscs_` as a list (`DSC2ToDataflowIRUtils.hpp:25`) and lowers ONE program
+/// from it, so a per-DSC call would ask the version of a different list than the one it walks.
+pub struct GroupOp<'a> {
+    /// This op's `dscs_`, flattened in the order the json lists them.
+    pub dscs: Vec<&'a SuperDsc>,
+    /// Which op-func it lowers, so the program's symbol says what it is.
+    pub func: OpFunc,
 }
 
-
-/// LOWER ONE SUPERDSC PROGRAM, NAMED BY ITS GROUP — the call the build makes.
+/// ⭐ SCRATCHY'S `opFuncName` AS THE SEALED ENUM, or [`None`] for a name no `OpFunc` spells.
 ///
-/// ⭐ IT NAMES NO `deeptools` TYPE IN ITS SIGNATURE, AND THAT IS THE POINT. `scratchy-forward-
-/// compiler-macro` does not depend on `deeptools`, so a call site there cannot spell `ProgramName`,
-/// `GroupId` or `Grid`. Keeping the wrapper here also keeps the `Dd2` choice and the single-element
-/// grid in one place instead of at every caller.
+/// ⛔ NO STRING REACHES A PROGRAM NAME. `OpFunc::spelling` is the generated door's own rendering of
+/// the same set scratchy writes (`superdsc_opspec.rs:1162`), so this is a lookup in a closed set
+/// rather than a parse — and an unspelled name yields an ABSENT program, never a fabricated `Mul`.
 #[must_use]
-pub fn lower_group(dsc: &SuperDsc, group: u32) -> Option<String> {
-    lower_superdsc_to_dataflow_ir::<deeptools::arch::Dd2>(
-        dsc,
-        ProgramName {
-            group: deeptools::islands::dataflow_ir::GroupId(group),
-            index: deeptools::islands::dataflow_ir::OpIndex(0),
-            // ⛔ THE OP-FUNC IS THE SCHEDULE'S QUESTION AND IT IS STILL A PLACEHOLDER. It belongs to
-            // the `computeOp_[i].opFuncName` of the `Dsc` being lowered; naming `Mul` here is a
-            // stand-in that only affects the printed program NAME, not what is emitted, and it goes
-            // when `Schedule::roots` selects its DDL program by op-func.
-            func: deeptools::generated::OpFunc::Mul,
-        },
-        Grid::single(),
-    )
+pub fn op_func_of(name: &str) -> Option<OpFunc> {
+    OpFunc::ALL.into_iter().find(|f| f.spelling() == name)
+}
+
+/// ⭐ ONE OP OF A LAUNCH GROUP AS [`GroupOp`], read off the SuperDSC the emitter already built.
+///
+/// [`None`] when no DSC of the op carries a compute whose op-func the door spells — which is the
+/// same condition the port's entry 110 answers `NoComputeOp` to.
+#[must_use]
+pub fn group_op_of<'a>(dscs: Vec<&'a SuperDsc>) -> Option<GroupOp<'a>> {
+    let func = dscs
+        .iter()
+        .flat_map(|dsc| dsc.computeOp_.iter())
+        .find_map(|op| op_func_of(&op.opFuncName))?;
+    Some(GroupOp { dscs, func })
+}
+
+/// ⭐⭐ LOWER ONE LAUNCH GROUP TO ONE DATAFLOWIR MODULE — the bytes the bake stages and `dbo-opt
+/// --from-dfir` compiles.
+///
+/// One module per GROUP holding one program per op, which is the shape the declaration module
+/// already has and the reason a group is ONE file rather than one per device op.
+///
+/// ⭐ [`None`] WHEN THE WALK BOUND NO UNIT — which is every call until [`Schedule::roots`] yields
+/// statements. The caller stages nothing in that case, so no empty module reaches the compiler.
+#[must_use]
+pub fn lower_group(group: u32, ops: &[GroupOp<'_>]) -> Option<String> {
+    lower_group_for::<deeptools::arch::Dd2>(group, ops)
+}
+
+/// [`lower_group`] with the arch named — `Dd2` is what the bake targets, and both arch impls exist in
+/// every build so the choice is a parameter rather than a `cfg`.
+#[must_use]
+pub fn lower_group_for<A: Arch>(group: u32, ops: &[GroupOp<'_>]) -> Option<String> {
+    // ⭐ ONE ARENA FOR THE WHOLE GROUP, OUTLIVING EVERY WALK AND THE PRINT. Every statement payload
+    // the views allocate lives here and the arena is dropped when this function returns — after
+    // `print::run` has turned the programs into characters, which is the last reader of anything
+    // borrowed.
+    let arena = bumpalo::Bump::new();
+    let mut vals = Values::default();
+    let mut programs = Vec::with_capacity(ops.len());
+    for (index, op) in ops.iter().enumerate() {
+        let wrapped: Vec<OneDsc<'_>> = op
+            .dscs
+            .iter()
+            .map(|dsc| OneDsc::of(dsc, &arena))
+            .collect();
+        let name = ProgramName {
+            group: GroupId(group),
+            index: OpIndex(u32::try_from(index).unwrap_or(u32::MAX)),
+            func: op.func,
+        };
+        let ran: Translated<A> = run_translator(
+            &mut vals,
+            // ⛔ DISABLED UNTIL THE FOLDS ARE READ. `Uniformize::Enabled` is the port's entry 109 —
+            // one view per component over every (core, corelet) pair at once — and it is only
+            // correct once `folds_needed` answers from `sdscFolds_`.
+            Uniformize::Disabled,
+            name,
+            Grid::single(),
+            &[NumFolds::ONE],
+            &wrapped,
+        );
+        match ran {
+            Translated::Ran(converted) => programs.extend(converted.program),
+            // ⭐ NEITHER IS AN ERROR: they are the two states the reference runs no driver for.
+            Translated::Dsc1 | Translated::NoComputeOp => {}
+        }
+    }
+    if programs.is_empty() {
+        return None;
+    }
+    // ⭐ THE KERNEL IS THE GROUP: one group's programs are one kernel, and `print::run` writes the
+    // declaration module that names it.
+    Some(print::run(&Run {
+        kernel: KernelName(GroupId(group)),
+        programs,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⭐ THE DOOR IS A CLOSED SET AND THE LOOKUP FINDS IT — carrying the spelling, so a renamed
+    /// variant fails here rather than silently naming every program `Mul`.
+    #[test]
+    fn an_op_func_resolves_from_the_name_scratchy_writes() {
+        let mul = op_func_of("mul").expect("`mul` is one of the op-funcs scratchy emits");
+        assert_eq!(mul.spelling(), "mul");
+        assert!(
+            op_func_of("no_such_op_func").is_none(),
+            "a name outside the sealed set must yield an ABSENT program, not a substituted one"
+        );
+    }
+
+    // ⛔⛔ THERE IS NO CENSUS TEST HERE, DELIBERATELY, AND ITS ABSENCE IS THE POINT.
+    //
+    // A test that builds a `ScheduleCensus` literal and asserts its own `statements == 0` verifies
+    // NOTHING — it re-states its own input, which is the tautology this project has been bitten by
+    // before. `AllocNode::maxDimSizes_` is a `DeviceWalk`, constructible only through
+    // `StickLayout::device_walk`, so a scratchy `Dsc` cannot be fabricated in a unit test either —
+    // which is correct, and means the census must be measured on the emitter's REAL output.
+    //
+    // ⭐ SO THE MEASUREMENT LIVES IN THE BAKE, on the SuperDSCs the build actually produces:
+    // `render_dfir_input` reports it per bundle (`lower_subtile_tape_to_superdsc.rs`), against
+    // `python3 /Users/nickm/tmp/bridge1-fixtures/check.py census` on the reference side.
 }

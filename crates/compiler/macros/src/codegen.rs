@@ -9297,127 +9297,21 @@ fn dump_wavefront_mega(
                         Ok(valid) => {
                             let tape_unrolled = lower_dag_to_tape(&valid);
                             let tape_rolled = reroll_subtile_tape(&tape_unrolled, &krg);
-                            // ⭐⭐ BRIDGE 1: THE SAME TAPE, STRAIGHT TO DATAFLOWIR. Not from the
-                            // SuperDSC below and not from its `EmittedOp`s — from `krg`, the graph
-                            // both readings start at. The seven model numbers come out of the
-                            // config the macro already parsed (`head_dim` among them: absent from
-                            // granite's json and derived by `derive_implicit_bounds`, which is why
-                            // this reads `bounds` rather than the file).
-                            {
-                                // ⛔ NO SILENT ZERO. `unwrap_or(0)` here would hand the door a
-                                // head dim of nought and turn a missing field into "no config
-                                // declares this model", which names the wrong problem. A field
-                                // that is absent says so, by name.
-                                const NEEDED: [&str; 7] = [
-                                    "num_attention_heads",
-                                    "num_key_value_heads",
-                                    "head_dim",
-                                    "hidden_size",
-                                    "num_hidden_layers",
-                                    "intermediate_size",
-                                    "vocab_size",
-                                ];
-                                let mut numbers = [0u32; 7];
-                                let mut missing: Option<&str> = None;
-                                for (slot, key) in numbers.iter_mut().zip(NEEDED) {
-                                    match model.bounds.get(key).copied() {
-                                        Some(v) if v > 0 => {
-                                            *slot = u32::try_from(v).unwrap_or(u32::MAX);
-                                        }
-                                        _ => missing = missing.or(Some(key)),
-                                    }
-                                }
-                                if let Some(key) = missing {
-                                    eprintln!(
-                                        "[spyre-dfir] {base}: config declares no `{key}` — every \
-                                         one of the seven is a constant the lowering specialises \
-                                         on, and `head_dim` is derived by `derive_implicit_bounds` \
-                                         when the json omits it, so an absence here is a real gap"
-                                    );
-                                }
-                                use scratchy_target_spyre::lower_subtile_tape_to_dataflow_ir as dfir;
-                                use scratchy_target_spyre::superdsc_bake as bake_q;
-
-                                // ⭐ ONE MODULE PER LAUNCH GROUP, and the groups are `group_ranges`'
-                                // — the SAME fusion walk the other path uses, not a partition
-                                // invented here.
-                                // ⛔⛔ NO `match` ON A `Result` HERE, BECAUSE THERE IS NO `Result`.
-                                // The DataflowIR lowering is TOTAL: it returns the groups. Its
-                                // error type was deleted after a refusal added to it stopped the
-                                // tape before dbo-opt was ever invoked — and this arm LOGGED that
-                                // refusal and carried on, so the build printed our sentence, exited
-                                // on something else entirely, and the loop went blind.
-                                {
-                                    let groups = dfir::lower_subtile_tape_to_dataflow_ir(
-                                        &krg,
-                                        &weight_ids,
-                                        !is_prefill && decode_rows > 1,
-                                        decode_rows,
-                                        // ⛔ THE SENTINEL AND ITS CAP, RESOLVED BY THE BRIDGE. `ActiveCap`
-                                        // is a sentinel type — FULL is 0 ("sweep everything") and NONE
-                                        // is u32::MAX ("sweep nothing") — so handing the rung door
-                                        // `.get()` passes a sentinel where an extent belongs, which is
-                                        // what "rung (rows 1, active_cap 0)" and "active_cap 4294967295"
-                                        // were. `ActiveCap::resolve` is THE ONLY place a rung becomes a
-                                        // tile extent, and it lives beside the bridge rather than here.
-                                        active_cap,
-                                        cap,
-                                        numbers,
-                                    );
-                                    {
-                                        eprintln!(
-                                            "[spyre-dfir] {base}: {} nodes -> {} launch group(s)",
-                                            krg.nodes.len(),
-                                            groups.len()
-                                        );
-                                        for (gi, mlir) in groups.iter().enumerate() {
-                                            // ⛔⛔ THROUGH THE BAKE, NEVER A PLAIN WRITE. The queue
-                                            // owns the BLOCKING disk bound (`reserve` waits at
-                                            // MAX_STAGED_BYTES), the compile queue (COMPILE_WIDTH),
-                                            // memoization on the content key, and deletion of the
-                                            // staging dir once compiled. A direct write bypasses all
-                                            // four and leaves megabytes on disk, never compiled,
-                                            // reading exactly like progress.
-                                            let Some(q) = bake_q::global() else { break };
-                                            let key = {
-                                                use std::hash::{Hash as _, Hasher as _};
-                                                let mut h =
-                                                    std::collections::hash_map::DefaultHasher::new(
-                                                    );
-                                                mlir.as_bytes().hash(&mut h);
-                                                h.finish()
-                                            };
-                                            let gdir = q.stage().group_dir(&base, gi);
-                                            q.reserve(mlir.len());
-                                            let staged =
-                                                std::fs::create_dir_all(&gdir).and_then(|()| {
-                                                    std::fs::write(
-                                                        gdir.join(bake_q::PROGRAM_FILE),
-                                                        mlir,
-                                                    )
-                                                });
-                                            if let Err(e) = staged {
-                                                eprintln!("[spyre-dfir] {base} g{gi}: stage: {e}");
-                                                break;
-                                            }
-                                            if let Err(e) = q.submit(bake_q::SealedGroup::sealed(
-                                                gdir,
-                                                bake_q::GroupId {
-                                                    fp: base.clone(),
-                                                    group: u32::try_from(gi).unwrap_or(0),
-                                                },
-                                                mlir.len(),
-                                                key,
-                                            )) {
-                                                eprintln!(
-                                                    "[spyre-dfir] {base} g{gi}: dbo-opt: {e}"
-                                                );
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            // ⛔⛔ THE SECOND PRODUCER IS GONE, AND ITS REMOVAL IS PART OF THE SWAP.
+                            // This block lowered the tape STRAIGHT to DataflowIR by hand
+                            // (`lower_subtile_tape_to_dataflow_ir`) and staged it under `base` — an
+                            // fp NO bundle reads, because `EmittedBundle::into_code` reads the ids
+                            // `emit_bundle_inner` collected under the bundle FINGERPRINT. So every
+                            // one of those groups was compiled by dbo-opt and thrown away, while the
+                            // bundle's own groups staged `sdsc_*.json` for a `--from-dfir`
+                            // invocation that reads `group.mlir` and never found one.
+                            //
+                            // ⭐ THERE IS NOW ONE PIPELINE: the tape becomes a SuperDSC below, the
+                            // SuperDSC is lowered by the PORT in `render_dfir_input`, and that is
+                            // what `dbo-opt --from-dfir` compiles into the bundle. The hand-written
+                            // module stays on disk (it is what the port replaces, and the audit that
+                            // found it emitting an HBM offset as an LX address is recorded in
+                            // `lower_superdsc_to_dataflow_ir.rs`), but nothing calls it.
                             match superdsc::lower_subtile_tape_to_superdsc(
                                 &tape_rolled,
                                 &krg,

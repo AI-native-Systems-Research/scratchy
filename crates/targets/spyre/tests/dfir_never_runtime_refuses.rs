@@ -94,6 +94,60 @@ const FROZEN: &[Ratchet] = &[
 /// The scratchy half of bridge 1 — the file that turns the tape into `deeptools`' vocabulary.
 const BRIDGE: &str = "src/lower_subtile_tape_to_dataflow_ir.rs";
 
+/// ⭐⭐ THE PIVOTED BRIDGE — scratchy's SuperDSC handed to the PORT, which is what the bake now
+/// compiles. It is a second file under the same rule, so it needs its own frozen table: the counts
+/// above describe the hand-written module, not this one.
+const PIVOT: &str = "src/lower_superdsc_to_dataflow_ir.rs";
+
+/// ⭐⭐ THE PIVOT'S FROZEN COUNTS — every refusal at ZERO, and it starts there.
+///
+/// ⛔ THE ONE NON-ZERO IS A TEST'S. `.expect(` occurs once, in this module's own
+/// `an_op_func_resolves_from_the_name_scratchy_writes` — a test asserting the sealed op-func set
+/// contains what scratchy writes. It is not on the lowering path, and it is capped rather than
+/// permitted so a second one has to be argued for.
+const PIVOT_FROZEN: &[Ratchet] = &[
+    Ratchet {
+        construct: "Err(",
+        today: 0,
+    },
+    Ratchet {
+        construct: ".ok_or",
+        today: 0,
+    },
+    Ratchet {
+        construct: "Result<",
+        today: 0,
+    },
+    // ⛔⛔ ZERO PANICS AND ZERO `todo!`, WHICH IS THE POINT OF THE PIVOT. The scheduling half is not
+    // written, and its absence is expressed as an ABSENT ROOT — `Schedule::roots` yields nothing and
+    // the driver binds no unit (the port's entry 108) — never as a stop. A `todo!` here would refuse
+    // every group of every bundle and dbo-opt would never be invoked at all.
+    Ratchet {
+        construct: "panic!",
+        today: 0,
+    },
+    Ratchet {
+        construct: "todo!",
+        today: 0,
+    },
+    Ratchet {
+        construct: "unimplemented!",
+        today: 0,
+    },
+    Ratchet {
+        construct: "unreachable!",
+        today: 0,
+    },
+    Ratchet {
+        construct: ".expect(",
+        today: 1,
+    },
+    Ratchet {
+        construct: ".unwrap(",
+        today: 0,
+    },
+];
+
 /// Count non-comment occurrences of `needle`.
 ///
 /// ⛔ COMMENTS ARE SKIPPED SO THE RULE CAN BE WRITTEN DOWN. This file's own doc comments name every
@@ -109,30 +163,40 @@ fn occurrences(source: &str, needle: &str) -> usize {
         .sum()
 }
 
-/// ⭐⭐ NO NEW WAY FOR THE BRIDGE TO STOP BEFORE dbo-opt.
+/// Read one bridge file, or fail naming it.
+fn read_bridge(file: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("the bridge must be readable at {}: {e}", path.display()))
+}
+
+/// ⭐⭐ NO NEW WAY FOR EITHER BRIDGE FILE TO STOP BEFORE dbo-opt.
+///
+/// ⛔ BOTH FILES, EACH AGAINST ITS OWN TABLE. `PIVOT` is the file the bake compiles now; guarding
+/// only `BRIDGE` would have left the live lowering unratcheted, which is exactly how this went blind
+/// before.
 #[test]
 fn the_dataflow_ir_bridge_gains_no_new_runtime_refusal() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(BRIDGE);
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("the bridge must be readable at {}: {e}", path.display()));
-
     let mut grew = Vec::new();
-    for r in FROZEN {
-        let now = occurrences(&source, r.construct);
-        if now > r.today {
-            grew.push(format!(
-                "  `{}`: {} -> {} (+{})",
-                r.construct,
-                r.today,
-                now,
-                now - r.today
-            ));
+    for (file, frozen) in [(BRIDGE, FROZEN), (PIVOT, PIVOT_FROZEN)] {
+        let source = read_bridge(file);
+        for r in frozen {
+            let now = occurrences(&source, r.construct);
+            if now > r.today {
+                grew.push(format!(
+                    "  {file} `{}`: {} -> {} (+{})",
+                    r.construct,
+                    r.today,
+                    now,
+                    now - r.today
+                ));
+            }
         }
     }
 
     assert!(
         grew.is_empty(),
-        "🛑 A NEW RUNTIME REFUSAL ENTERED THE DATAFLOWIR BRIDGE ({BRIDGE}):\n{}\n\n\
+        "🛑 A NEW RUNTIME REFUSAL ENTERED THE DATAFLOWIR BRIDGE:\n{}\n\n\
          A refusal stops the lowering BEFORE the tape is emitted, so dbo-opt is never invoked and \
          the loop that drives this bridge goes blind — it has cost hours and a revert five times. \
          The fact you are trying to state belongs in a TYPE: an arity is an array length, a pairing \
@@ -150,8 +214,10 @@ fn the_dataflow_ir_bridge_gains_no_new_runtime_refusal() {
 /// silently stopped matching, the ratchet would read zero for everything and pass forever.
 #[test]
 fn the_ratchet_counts_what_is_actually_there() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(BRIDGE);
-    let source = std::fs::read_to_string(&path).expect("the bridge must be readable");
+    // ⛔ MEASURED ON `BRIDGE`, WHICH IS THE FILE THAT STILL CARRIES REFUSALS. `PIVOT`'s table is all
+    // zeros bar one `.expect(` in its own tests, so it cannot witness the counter — this test's job
+    // is to prove `occurrences` still matches, and only a non-zero row can do that.
+    let source = read_bridge(BRIDGE);
 
     let present: Vec<&str> = FROZEN
         .iter()

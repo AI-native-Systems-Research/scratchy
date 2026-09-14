@@ -7204,6 +7204,98 @@ pub fn render_dxp_input(ops: &[EmittedOp], fold: FoldGrouping) -> std::io::Resul
     Ok(out)
 }
 
+/// ⭐⭐ RENDER EVERY LAUNCH GROUP'S **DataflowIR** — what the bake stages and `dbo-opt --from-dfir`
+/// compiles, in place of the per-op json `dxp_standalone` read.
+///
+/// ⛔⛔ THE SAME PARTITION, NOT A SECOND ONE. `trip_kinds_for` + `group_ranges` at `group_size()` is
+/// exactly [`render_dxp_input`]'s walk, and it must stay so: a manifest partitioned one way against
+/// programs partitioned another launches a different set of groups than the index describes. The one
+/// thing that differs is the BYTES — one `group.mlir` per group instead of one json per trip plus a
+/// declaration module.
+///
+/// ⛔⛔ ALL-OR-NOTHING PER BUNDLE, AND THAT IS A CORRECTNESS PROPERTY. A group the port lowers no
+/// program for cannot simply be dropped: the launch index still names it, so the bundle would launch
+/// a SHORTER sequence than the manifest describes — a hole in the middle of a layer, silently wrong.
+/// So if any group yields nothing, this yields NOTHING, the bundle stages no group at all, and
+/// `bundle::have_device_code()` reports the absence honestly.
+///
+/// ⭐ IT ALSO REPORTS THE CENSUS ON REAL DATA — see
+/// [`crate::lower_superdsc_to_dataflow_ir::ScheduleCensus`]. Today every DSC's `scheduleTree_` is
+/// all-`allocate`, so `statements` is 0, `Schedule::roots` is empty and every group lowers to
+/// nothing. That number is the scheduling stage's whole debt and it is measured here rather than
+/// asserted anywhere.
+pub fn render_dfir_input(
+    ops: &[EmittedOp],
+    fold: FoldGrouping,
+    fp: &str,
+) -> std::io::Result<Vec<GroupInput>> {
+    use crate::lower_superdsc_to_dataflow_ir as dfir;
+
+    // The SAME pre-unroll as `render_dxp_input`, kept as VALUES rather than json: the port reads the
+    // `Dsc`s, not their serialization.
+    let trips: Vec<SdscOp> = ops.iter().flat_map(concrete_trips).collect();
+    let mut census = dfir::ScheduleCensus::default();
+    for trip in &trips {
+        for dsc in trip.dscs_.iter().flat_map(BTreeMap::values) {
+            let one = dfir::schedule_census(dsc);
+            census.allocate += one.allocate;
+            census.statements += one.statements;
+            census.compute_ops += one.compute_ops;
+        }
+    }
+
+    let (kinds, _owner) = trip_kinds_for(ops, fold);
+    let ranges = group_ranges(&kinds, group_size());
+    let mut out = Vec::with_capacity(ranges.len());
+    for (gi, r) in ranges.iter().enumerate() {
+        // ⛔ ONE PROGRAM PER TRIP, and its DSC LIST is what the version question is asked of — see
+        // [`dfir::GroupOp`]. A trip whose op-func the door does not spell names no program.
+        let group_ops: Vec<dfir::GroupOp<'_>> = trips[r.start..r.end]
+            .iter()
+            .filter_map(|trip| {
+                dfir::group_op_of(trip.dscs_.iter().flat_map(BTreeMap::values).collect())
+            })
+            .collect();
+        let Some(module) = dfir::lower_group(gi as u32, &group_ops) else {
+            eprintln!(
+                "[spyre-dfir] {fp}: the port lowered NO program for group {gi} of {} — \
+                 scheduleTree_ carries {} allocate node(s) and {} statement node(s) across {} \
+                 compute op(s), and `superdsc_to_dataflow_ir` walks STATEMENTS. The four stages of \
+                 SchedulerStages.cpp:29-57 are what fill the tree; they are ported (382/382) and \
+                 uncallable (see lower_superdsc_to_dataflow_ir.rs's header). Staging NO group for \
+                 this bundle rather than a partial launch sequence.",
+                ranges.len(),
+                census.allocate,
+                census.statements,
+                census.compute_ops,
+            );
+            return Ok(Vec::new());
+        };
+        // ⭐ THE KEY HASHES EXACTLY WHAT THE COMPILER WILL READ, which for this leg is the module.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            module.hash(&mut h);
+            h.finish()
+        };
+        out.push(GroupInput {
+            group: gi as u32,
+            bytes: module.len(),
+            key,
+            files: vec![(crate::superdsc_bake::PROGRAM_FILE.to_string(), module)],
+        });
+    }
+    eprintln!(
+        "[spyre-dfir] {fp}: {} group(s) lowered through the port ({} allocate / {} statement node(s), \
+         {} compute op(s))",
+        out.len(),
+        census.allocate,
+        census.statements,
+        census.compute_ops,
+    );
+    Ok(out)
+}
+
 /// Write the rendered dxp input into `dir/group_{gi}/` — the ARTIFACT DUMP.
 ///
 /// Not part of the build (the bake queue stages its own copy and reclaims it): this is for handing a
@@ -7534,23 +7626,30 @@ fn emit_bundle_inner(
     // is a CAPABILITY probe, not a behaviour flag: there is one code path and it is taken whenever the
     // tool exists.
     if let Some(bake) = crate::superdsc_bake::global() {
-        for g in render_dxp_input(ops, fold)? {
+        // ⭐⭐ THE ONE LEG THAT CHANGED. This used to be `render_dxp_input` — one json per device op,
+        // read by `dxp_standalone --bundle -d <dir>`. It is now the SuperDSC lowered through the Rust
+        // port of `sdscToDataflowIR`, one `group.mlir` per group, read by `dbo-opt --from-dfir`.
+        // ⛔ EVERYTHING ELSE IS UNTOUCHED — the partition, the launch index, `reserve`/`submit`, the
+        // memo key, the staging reclaim, the `spyreCodeDir/{init_binary.bin,spyrecode.json}` the
+        // runtime reads. `render_dxp_input` stays for `write_dxp_input`, which is how a refusal on the
+        // json leg still gets diagnosed by hand.
+        for g in render_dfir_input(ops, fold, &fp)? {
             let id = crate::superdsc_bake::GroupId {
                 fp: fp.clone(),
                 group: g.group,
             };
             let gdir = bake.stage().group_dir(&fp, g.group as usize);
-            // ⭐ CLAIM THE DISK BEFORE USING IT. The size is exact — the json is already rendered —
+            // ⭐ CLAIM THE DISK BEFORE USING IT. The size is exact — the module is already rendered —
             // and `reserve` BLOCKS until it fits under `MAX_STAGED_BYTES`. This is what bounds
-            // staging: without it the emitter runs ahead of dxp and stages the whole ladder.
+            // staging: without it the emitter runs ahead of dbo-opt and stages the whole ladder.
             bake.reserve(g.bytes);
             std::fs::create_dir_all(&gdir)?;
             for (name, contents) in &g.files {
                 std::fs::write(gdir.join(name), contents)?;
             }
-            // SEALED HERE and nowhere else: `bundle.mlir` is rendered LAST in `files`, so this is the
-            // one point at which the group is complete and safe to compile. `submit` returns the first
-            // dxp refusal, so a ladder that cannot compile stops on its first group.
+            // SEALED HERE and nowhere else: the group's last file has just been written, so this is
+            // the one point at which it is complete and safe to compile. `submit` returns the first
+            // dbo-opt refusal, so a ladder that cannot compile stops on its first group.
             bake.submit(crate::superdsc_bake::SealedGroup::sealed(
                 gdir,
                 id.clone(),
