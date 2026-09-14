@@ -1954,7 +1954,7 @@ impl SelectedDscCandidates {
     }
 
     /// Every DSC's candidates over `primaryDims` with every index at zero — the
-    /// `entry.emplace(dim, 0)` seeding (`L3DlOpsScheduler.cpp:8886`); `None` where a listed dim has
+    /// `entry.emplace(dim, 0)` seeding (`L3DlOpsScheduler.cpp:1520`); `None` where a listed dim has
     /// no candidates on some DSC.
     #[must_use]
     pub fn starting(candidates: &DscCandidates, primary_dims: &[PrimaryDim]) -> Option<Self> {
