@@ -13440,8 +13440,8 @@ mod tests_e283_e295 {
     use crate::schedule::ddc::fold::{ConstIdx, DistributedLoop, Stride};
     use crate::schedule::dsc2::{AllocLayout, AllocPlacement, LayoutDims, MaxDimSize, StartAddress};
     use crate::schedule::l3::dsc::{
-        CoreIdsUsed, DataStage, DscList, LabeledDsList, NamedDims, PlacedAllocation, PrimaryDsInfo,
-        SelectedCandidate, StageDims,
+        CoreIdsUsed, DataStage, DscList, Granularity, LabeledDsList, MaxSize, NamedDims,
+        PlacedAllocation, PrimaryDsInfo, SelectedCandidate, StageDims, VolumeLimit,
     };
 
     fn core(index: u32) -> Core {
@@ -15735,22 +15735,22 @@ mod tests_e283_e295 {
         );
     }
 
+    /// `computeOp_` naming no op func at all, which entry 365 answers with `defaultParam`.
+    struct NoOps;
+
+    impl ComputeOps for NoOps {
+        fn op_funcs(&self) -> v1::OpFuncs {
+            v1::OpFuncs::new(None, Vec::new())
+        }
+        fn set_first_op_func(&mut self, _op_func: OpFunc) {}
+    }
+
     /// e373 — OUT OF SPAN, on entry 287's own cross-core reduction: a corelet-split dim of one may not
     /// be chunked below the WHOLE core extent, which is the reference's own FIXME. ⛔ Every dim the
     /// corelet split does not name keeps entry 365's `defaultParam` of one, and a dim it DOES name
     /// but the core stage states no extent for answers the reference's `-1`.
     #[test]
     fn a_cross_core_reductions_corelet_split_dim_may_not_be_chunked_at_all() {
-        /// `computeOp_` naming no op func at all, which entry 365 answers with `defaultParam`.
-        struct NoOps;
-
-        impl ComputeOps for NoOps {
-            fn op_funcs(&self) -> v1::OpFuncs {
-                v1::OpFuncs::new(None, Vec::new())
-            }
-            fn set_first_op_func(&mut self, _op_func: OpFunc) {}
-        }
-
         let (sdsc, mut dsc) = a_cross_core_reduction();
         let mut core = dsc.data_stages.core().clone();
         core.ss
@@ -15778,40 +15778,85 @@ mod tests_e283_e295 {
         );
     }
 
-    /// e374 — OUT OF SPAN, over entry 369's own coordinate build: the HBM allocation seeds the walk,
-    /// its one HBM->LX transfer user names the LX allocation, and the coordinate entry 369 builds is
-    /// WRITTEN ONTO that node. ⛔ The walk back from the LX end reaches the seed again and skips it,
-    /// so nothing is built twice.
+    /// e377 — OUT OF SPAN, on entry 287's own cross-core reduction: the CORE stage copied in with its
+    /// symbolic state GONE, the one chunk dim pulled down to entry 373's minimum, and `IJ` recompounded
+    /// from THAT minimum rather than from the core extent. ⛔ A chunk dim the core stage states no
+    /// positive extent for refuses before entry 373 is reached.
     #[test]
-    fn the_coordinate_propagates_from_the_hbm_allocation_onto_the_lx_one_and_no_further() {
-        /// The two allocate nodes and the one transfer between them, keyed as entry 374 asks.
-        struct CoordTree {
-            allocs: BTreeMap<NodeName, PropagatedAllocation>,
-            load: TransferNode,
-            written: Vec<(NodeId, Coordinate)>,
+    fn the_initial_chunk_params_are_the_core_stage_minus_its_symbolic_state() {
+        let (sdsc, mut dsc) = a_cross_core_reduction();
+        let mut core = dsc.data_stages.core().clone();
+        core.ss.dims.set_extent(PrimaryDim::J, Extent(2));
+        *core.ss.dims.symbolic_mut() = Symbolic::new(
+            BTreeMap::from([(
+                PrimaryDim::I,
+                SymbolicDimInfo {
+                    max_size: MaxSize(8),
+                    granularity: Granularity::new(NonZeroU32::new(2).expect("a step of two")),
+                },
+            )]),
+            BTreeMap::from([(BTreeSet::from([PrimaryDim::I]), VolumeLimit(64))]),
+        );
+        dsc.data_stages.set(DATA_STAGE_CORE, core);
+        let params =
+            initial_chunk_params::<Target, _>(&sdsc, &dsc, &NoOps, &BTreeSet::from([PrimaryDim::I]))
+                .expect("the one chunk dim states a positive core extent");
+        assert_eq!(
+            [PrimaryDim::I, PrimaryDim::Ki, PrimaryDim::J, PrimaryDim::Ij]
+                .map(|dim| params.dims().extent(dim)),
+            [
+                Some(DEFAULT_MIN_PARAM),
+                Some(Extent(8)),
+                Some(Extent(2)),
+                Some(Extent(2)),
+            ]
+        );
+        assert_eq!(params.dims().symbolic, Symbolic::default());
+
+        // ⛔ `Mb` is a dim the core stage states NO extent for, so `isValidDimParam` refuses it here
+        // even though entry 373 would answer it with `defaultParam`.
+        assert_eq!(
+            initial_chunk_params::<Target, _>(
+                &sdsc,
+                &dsc,
+                &NoOps,
+                &BTreeSet::from([PrimaryDim::Mb])
+            ),
+            None
+        );
+    }
+
+    /// The two allocate nodes and the one transfer between them, keyed as entry 374 asks.
+    struct CoordTree {
+        allocs: BTreeMap<NodeName, PropagatedAllocation>,
+        load: TransferNode,
+        written: Vec<(NodeId, Coordinate)>,
+    }
+
+    impl CoordPropTree for CoordTree {
+        fn allocation(&self, name: &NodeName) -> Option<PropagatedAllocation> {
+            self.allocs.get(name).cloned()
         }
 
-        impl CoordPropTree for CoordTree {
-            fn allocation(&self, name: &NodeName) -> Option<PropagatedAllocation> {
-                self.allocs.get(name).cloned()
-            }
-
-            fn mem_org_allocation(&self, lds: LdsIdx, storage: SenComponent) -> Option<NodeName> {
-                self.allocs
-                    .values()
-                    .find(|held| held.alloc.lds == Some(lds) && held.alloc.component == storage)
-                    .map(|held| held.alloc.name.clone())
-            }
-
-            fn transfer(&self, node: NodeId) -> Option<TransferNode> {
-                (node == NodeId(9)).then(|| self.load.clone())
-            }
-
-            fn set_allocate_coordinate(&mut self, node: NodeId, coordinate: Coordinate) {
-                self.written.push((node, coordinate));
-            }
+        fn mem_org_allocation(&self, lds: LdsIdx, storage: SenComponent) -> Option<NodeName> {
+            self.allocs
+                .values()
+                .find(|held| held.alloc.lds == Some(lds) && held.alloc.component == storage)
+                .map(|held| held.alloc.name.clone())
         }
 
+        fn transfer(&self, node: NodeId) -> Option<TransferNode> {
+            (node == NodeId(9)).then(|| self.load.clone())
+        }
+
+        fn set_allocate_coordinate(&mut self, node: NodeId, coordinate: Coordinate) {
+            self.written.push((node, coordinate));
+        }
+    }
+
+    /// Entry 374's own walk as ONE DSC's surface: a broadcast-input DSC, the HBM->LX allocate pair with
+    /// the reference coordinate on the HBM end, and the `memOrg_` that names the HBM allocation.
+    fn a_propagated_coordinate() -> (SuperDsc, DesignSpaceConfig, CoordTree, Org) {
         let (sdsc, mut dsc) = a_cross_core_reduction();
         // `int scale = 0.5` is 0, so entry 369 takes its broadcast arm; an INPUT is not the output of
         // a reduction, so its cross-core arm is not the one this walk reaches.
@@ -15878,7 +15923,7 @@ mod tests_e283_e295 {
                 coordinate,
             }
         };
-        let mut tree = CoordTree {
+        let tree = CoordTree {
             allocs: BTreeMap::from([
                 (
                     NodeName("allocate_hbm".to_owned()),
@@ -15907,6 +15952,17 @@ mod tests_e283_e295 {
             hbm_alloc: Some(NodeName("allocate_hbm".to_owned())),
             ..Org::default()
         };
+
+        (sdsc, dsc, tree, org)
+    }
+
+    /// e374 — OUT OF SPAN, over entry 369's own coordinate build: the HBM allocation seeds the walk,
+    /// its one HBM->LX transfer user names the LX allocation, and the coordinate entry 369 builds is
+    /// WRITTEN ONTO that node. ⛔ The walk back from the LX end reaches the seed again and skips it,
+    /// so nothing is built twice.
+    #[test]
+    fn the_coordinate_propagates_from_the_hbm_allocation_onto_the_lx_one_and_no_further() {
+        let (sdsc, dsc, mut tree, org) = a_propagated_coordinate();
         let mut seam = Seam(DataStages(BTreeMap::new()));
         assert_eq!(
             propagate_coordinate_dsc(
@@ -15934,6 +15990,71 @@ mod tests_e283_e295 {
                 ("elem_arr_0".to_owned(), FoldCardinality(4), FoldCoeff(1)),
             ]
         );
+    }
+
+    /// EVERY DSC'S COORDINATE-PROPAGATION SURFACE — one entry 374 fixture per `dscs_` position, whose
+    /// tree is handed out MUTABLY beside the shared org and the one distribution seam.
+    struct Trees {
+        trees: Vec<CoordTree>,
+        orgs: Vec<Org>,
+        seam: Seam,
+        loop_params: (),
+    }
+
+    impl CoordPropTrees for Trees {
+        type Layout = OneDim;
+        type Org = Org;
+        type Tree = CoordTree;
+        type Env = Seam;
+
+        fn coord_prop(
+            &mut self,
+            dsc: DscIdx,
+        ) -> Option<DscCoordProp<'_, OneDim, Org, CoordTree, Seam>> {
+            let at = usize::try_from(dsc.0).ok()?;
+            Some(DscCoordProp {
+                layout: &OneDim,
+                orgs: vec![self.orgs.get(at)?],
+                tree: self.trees.get_mut(at)?,
+                env: &mut self.seam,
+                loop_params: &mut self.loop_params,
+            })
+        }
+    }
+
+    /// e378 — entry 374 over BOTH DSCs of a two-DSC super-DSC, so each one's own LX allocation gets the
+    /// coordinate its own HBM allocation propagates into its own tree. ⛔ A `dscs_` position the seam
+    /// holds no surface for refuses the WHOLE walk rather than being skipped.
+    #[test]
+    fn every_dsc_of_the_super_dsc_propagates_its_own_coordinates() {
+        let (one, dsc, tree_a, org_a) = a_propagated_coordinate();
+        let (_, _, tree_b, org_b) = a_propagated_coordinate();
+        let sdsc = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![dsc]),
+            one.num_wk_slices_per_dim,
+            one.core_id_to_wk_slice,
+            one.core_id_to_dsc_schedule,
+        );
+        let surfaces = |trees: Vec<CoordTree>, orgs: Vec<Org>| Trees {
+            trees,
+            orgs,
+            seam: Seam(DataStages(BTreeMap::new())),
+            loop_params: (),
+        };
+        let mut both = surfaces(vec![tree_a, tree_b], vec![org_a, org_b]);
+        assert_eq!(propagate_coordinate(&sdsc, &mut both), Some(()));
+        assert_eq!(
+            both.trees
+                .iter()
+                .map(|tree| tree.written.iter().map(|&(node, _)| node).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![NodeId(1)], vec![NodeId(1)]]
+        );
+
+        // ⛔ The SECOND DSC has no surface at all, and that refuses.
+        let (_, _, tree, org) = a_propagated_coordinate();
+        let mut short = surfaces(vec![tree], vec![org]);
+        assert_eq!(propagate_coordinate(&sdsc, &mut short), None);
     }
 }
 
@@ -19779,19 +19900,97 @@ where
     Some(())
 }
 
-// crustify:todo: e377_getInitialChunkParams
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1382  (20 body lines, level 7)
-//   class     : L3DlOpsScheduler
-//   original  : DataStructDims L3DlOpsScheduler::getInitialChunkParams( const SuperDsc &mySDsc, const DesignSpaceConfig &dsc, const std::unordered_set<PrimaryDimTypes> &chunkDims)
-//   extract   : crustify-ddc/cpp/l3.cpp:8762-8784
-//   calls     : e104_clear, e187_clear, e373_getMinParamForDim
+/// Replaces: e377_getInitialChunkParams
+///
+/// THE STAGE BOTH CHUNK-PARAMETER SEARCHES START FROM — the CORE stage's stick dims with their
+/// symbolic state DROPPED and every chunk dim pulled down to entry 373's minimum, then compounded.
+///
+/// ⛔ [`None`] IS `DT_CHECK(isValidDimParam(..))` — `param > 0.0` (`L3DlOpsScheduler.h:227`) asked of
+/// the CORE stage's OWN extent, so an unstated or non-positive chunk dim refuses BEFORE entry 373 is
+/// reached — plus every refusal entry 373 makes. ⭐ THE TWO `clear` CALLEES ARE CONTAINER CLEARS, ONE
+/// [`Symbolic`] default here because this type holds `symbolicDimInfo_` and `maxSymbolicVolume_` as
+/// one value. ⭐ THE SET'S ORDER IS IMMATERIAL: each write names a distinct dim, and entry 373 reads
+/// `dsc` alone and never the copy being written.
+#[must_use]
+pub fn initial_chunk_params<A: Arch, D: ComputeOps + ?Sized>(
+    sdsc: &SuperDsc,
+    dsc: &DesignSpaceConfig,
+    ops: &D,
+    chunk_dims: &BTreeSet<PrimaryDim>,
+) -> Option<FilledDims> {
+    // "Expect dataStageParam_ entry for the core data stage." is `core_stage()`'s own.
+    let mut params = dsc.core_stage().clone();
+    *params.symbolic_mut() = Symbolic::default();
+    for &dim in chunk_dims {
+        // "Expect the chunk dimension has a valid parameter value."
+        dsc.core_stage()
+            .dims()
+            .extent(dim)
+            .filter(|extent| extent.0 > 0)?;
+        params.set_extent(dim, min_param_for_dim::<A, D>(sdsc, dsc, ops, dim)?);
+    }
+    params.compound();
+    Some(params)
+}
 
-// crustify:todo: e378_propagateCoordinate
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7757  (3 body lines, level 7)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::propagateCoordinate(SuperDsc &mySDsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:8794-8797
-//   calls     : e374_propagateCoordinateDSC
+/// ONE DSC'S COORDINATE-PROPAGATION SURFACE — the borrows entry 374 takes of a single DSC, handed out
+/// TOGETHER because its schedule tree is WRITTEN while the layout order, the `memOrg_`s and the
+/// distribution seam are READ, and separate accessors could not hold all four at once.
+pub struct DscCoordProp<'a, D: ?Sized, M: ?Sized, T: ?Sized, E: TemporalLoopDistribution + ?Sized> {
+    /// `getLayoutDims(ldsIdx)` on this DSC.
+    pub layout: &'a D,
+    /// This DSC's `labeledDs_` organisations, POSITIONALLY beside
+    /// [`crate::schedule::l3::dsc::LabeledDsList::indexed`].
+    pub orgs: Vec<&'a M>,
+    /// `dscs_.at(dsc).scheduleTree_`, which is where each built coordinate lands.
+    pub tree: &'a mut T,
+    /// The seam entry 369 distributes and corelet-slices through.
+    pub env: &'a mut E,
+    /// `distributeElemArrToTemporalLoops`' accumulated loop parameters.
+    pub loop_params: &'a mut E::LoopParams,
+}
+
+/// EVERY DSC'S COORDINATE-PROPAGATION SURFACE, KEYED BY `dscs_` POSITION — what [`CoordPropTree`]
+/// alone cannot give: entry 378 walks the WHOLE list and each DSC carries its own tree.
+pub trait CoordPropTrees {
+    /// Where one DSC's layout order comes from.
+    type Layout: Dsc + ?Sized;
+    /// One labelled DS's `memOrg_`.
+    type Org: MemOrg + ?Sized;
+    /// One DSC's schedule tree.
+    type Tree: CoordPropTree + ?Sized;
+    /// The distribution and corelet-slice seam.
+    type Env: AllocCoordinateSeam + CoreletSliceSeam + ?Sized;
+
+    /// That DSC's surface, [`None`] for a `dscs_` position the caller holds none for.
+    fn coord_prop(
+        &mut self,
+        dsc: DscIdx,
+    ) -> Option<DscCoordProp<'_, Self::Layout, Self::Org, Self::Tree, Self::Env>>;
+}
+
+/// Replaces: e378_propagateCoordinate
+///
+/// Entry 374 over EVERY DSC of the super-DSC in `dscs_` order, so every allocate node of every tree
+/// carries the coordinate that DSC's own HBM allocations propagate.
+///
+/// ⛔ [`None`] IS EVERY REFUSAL ENTRY 374 MAKES, and a `dscs_` position the seam holds no surface for.
+pub fn propagate_coordinate<S: CoordPropTrees + ?Sized>(
+    sdsc: &SuperDsc,
+    trees: &mut S,
+) -> Option<()> {
+    for (dsc, index) in sdsc.dscs().iter().zip(0u32..) {
+        let DscCoordProp {
+            layout,
+            orgs,
+            tree,
+            env,
+            loop_params,
+        } = trees.coord_prop(DscIdx(index))?;
+        propagate_coordinate_dsc(sdsc, dsc, layout, &orgs, tree, env, loop_params)?;
+    }
+    Some(())
+}
 
 // crustify:todo: e380_setChunkDataStageParams
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1439  (129 body lines, level 8)
