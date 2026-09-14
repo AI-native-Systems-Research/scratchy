@@ -7388,9 +7388,13 @@ const INPUT_RULE: &str = "\n--------------------------";
 ///
 /// ⚠️ TRAP: LEVEL 2 PRINTS EXACTLY WHAT LEVEL 1 PRINTS — `debugPrint` never reads its `printContent`
 /// or `ps` parameters (`dsc/dsc2.h:361-429`), so the `> 1` argument is inert.
-/// ⚠️ TRAP: a compute's `"(storage=..)"` labels read `inputs_`/`outputs_`, which are the UNIT vectors
-/// (`dsc/dsc2.h:906`), while the loops are bounded by the `..LdsAndLoopOffsets_` sizes — a `.at`
-/// throw the fused [`Operand`] cannot spell.
+/// ⚠️ TRAP: a compute's `"(storage=..)"` labels read `inputs_`/`outputs_` (`dsc/dsc2.h:935-936`),
+/// which are the COMPONENT vectors carried by [`Operand::unit`] here — the reference pairs
+/// `inputs_[i]` as the *storage* half of `DataLocation{exUnit_, inputs_[i]}` when it fills the
+/// operand's data (`ddc/ddcv1.cpp:3045-3056`), which is why the label spells "storage=".
+/// ⚠️ TRAP: the reference bounds these loops by `inputs_`/`outputs_` and indexes
+/// `..LdsAndLoopOffsets_` with the same `i`; its own `DT_ERROR` at `ddc/ddcv1.cpp:3040-3043` rejects
+/// any compute whose two vectors disagree, so the fused [`Operand`] cannot spell that `.at` throw.
 pub fn coordinate_capture<S: CoordinateCapture + ?Sized>(
     dsc: &mut S,
     report: CoordFoldReport,
@@ -7543,11 +7547,13 @@ mod tests_e375 {
             name: NodeName("c0".to_owned()),
             op: DdlComputeType::Macc,
             ex_unit: SenComponent::Pe,
+            // A compute operand's component is `inputs_[i]` / `outputs_[i]`, which this tree carries
+            // in [`Operand::unit`]; `storage` is unset so the expected text pins the field read.
             inputs: vec![
-                operand(SenComponent::Pe, SenComponent::Pelrf),
-                operand(SenComponent::Sfp, SenComponent::Sfplrf),
+                operand(SenComponent::Pelrf, SenComponent::NoComponent),
+                operand(SenComponent::Sfplrf, SenComponent::NoComponent),
             ],
-            outputs: vec![operand(SenComponent::Lx, SenComponent::Lx)],
+            outputs: vec![operand(SenComponent::Lx, SenComponent::NoComponent)],
             num_folds_engaged: NumFolds::ONE,
             data_format: None,
             instr_attribute: InstrAttribute::default(),
@@ -7601,7 +7607,7 @@ mod tests_e375 {
              \n<coord 1 Included>\
              \n================================\
              \nComputeNode: c0\
-             \nOp: macc, inputs:[ (storage=pe) (storage=sfp) ], outputs:[ (storage=lx) ]\
+             \nOp: macc, inputs:[ (storage=pelrf) (storage=sfplrf) ], outputs:[ (storage=lx) ]\
              \n<print 3>\
              \n\nInput coordinates:\
              \n--------------------------\
