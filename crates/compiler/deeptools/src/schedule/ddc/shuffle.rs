@@ -1633,9 +1633,8 @@ impl GCVTF16F8MergeAction {
 ///
 /// ⛔ AN ENUM, NOT A `dyn` TRAIT, BECAUSE THE SET IS CLOSED: the reference dispatches its virtuals
 /// over these eight and nothing else, and `get_legal_transforms` needs them as ONE element type.
-/// ⛔ ALL EIGHT VARIANTS ARE DECLARED, THREE OF THE OFFERS ARE PORTED. e310, e312, e314, e316 and
-/// e317 still carry their anchors below, so a variant nothing constructs yet is UNFILLED WORK, not
-/// a dead arm — and the per-variant `act`/`cost`/`out_format` dispatch is e362's.
+/// ⛔ ALL EIGHT OFFERS ARE PORTED AND EVERY VARIANT IS CONSTRUCTED BELOW, so an unread field is a
+/// REAL gap, not pending work — the per-variant `act`/`cost`/`out_format` dispatch is e362's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShuffleAction {
     /// `MergeAction` (`shuffle.cpp:207`).
