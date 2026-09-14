@@ -18652,6 +18652,13 @@ mod tests_e328_e335 {
             .mint_ibr(DatastageId(3));
         assert_eq!(ibr.index(), DatastageId(3));
         assert_eq!(new_data_stage_index(&sdsc), DatastageId(4));
+        // ⭐ THE SIBLING'S OWN STAGE IS SKIPPED TOO, which a scan asking only DSC 0 would miss.
+        sdsc.dscs_mut()
+            .at_mut(DscIdx(1))
+            .expect("DSC 1")
+            .data_stages
+            .mint_ibr(DatastageId(4));
+        assert_eq!(new_data_stage_index(&sdsc), DatastageId(5));
         let orgs = Orgs(BTreeMap::from([(
             LdsIdx(0),
             Org {
@@ -20532,17 +20539,18 @@ pub trait LxZeroPadTransform {
 /// WHAT ENTRY 382 READS — the scheduler's construction arguments and the ONE read-only view of the
 /// super-DSC every step of the stage shares.
 ///
-/// ⛔⛔ [`Self::reads`] AND [`L3RunSurgery::env`] MUST BE VIEWS OF THE SAME TREES. Every landed step
-/// of this stage takes its reads and its writes as two carriers because the reference holds one
-/// `this`; a caller handing over two unrelated tree carriers has the surgery land where nothing
-/// reads it back.
+/// ⛔⛔ REVIEW 382 — [`Self::reads`] AND [`L3RunSurgery::env`] CANNOT BE ONE STORE FOR ANY CALLER:
+/// `&F` shared and `&mut E` exclusive cannot view one object, so BOTH of the reference's chains
+/// through its single `this` are severed here — the placed address (`:5687` writes, `:4971`/`:5034`
+/// rewrite, `:5816` reads back) and the minted tree (290/353/368 write `env`; 289/295/332 read
+/// `reads`). Unifying the carriers is cross-entry work over entries 050/219/220/222/292/333.
 pub struct L3RunInputs<'a, F, P> {
     /// The read side of `mySDsc` — every `memOrg_`, transfer, allocation, datastage, loop nesting and
     /// op func the stage looks at.
     pub reads: &'a F,
     /// The design space's placement, which entry 222 sizes and names buffers through.
     pub placement: &'a P,
-    /// `lxBufferTypeMode` (`L3DlOpsScheduler.h:222`).
+    /// `lxBufferTypeMode` (`L3DlOpsScheduler.h:220`).
     pub lx_buffer_mode: LxBufferTypeMode,
     /// The fold manager's own address coordinates, which entry 292 places along.
     pub coords: &'a AddressFoldCoords,
@@ -20567,9 +20575,11 @@ pub struct L3RunSurgery<'a, E: ?Sized, M: ?Sized, K: ?Sized, S: ?Sized> {
 /// `getNewDataStageIndex(mySDsc, dsc)` (`L3DlOpsScheduler.cpp:6606`) — the first datastage index
 /// ABOVE the chunk stage that NO DSC of the super-DSC holds.
 ///
-/// ⭐ THE SCAN ASKS EVERY DSC AT ONCE, and that is entry 058's own documented divergence: the
-/// reference skips the indices `dsc` holds in an inner `while` and then RESTARTS its outer loop on a
-/// clash with another DSC, which only terminates once the index is free everywhere.
+/// ⛔ REVIEW 382 — THE DIVERGENCE IS RIGHT, ITS OLD JUSTIFICATION WAS FALSE: the reference HANGS,
+/// restarting its outer loop WITHOUT advancing `newIdx` once a SIBLING holds it (`:6610-6621`),
+/// exactly as entry 058 records. ⭐ AND THIS IS A SECOND SPELLING OF 058, which it cannot call:
+/// 058 is homed on `transformation_util::DataStages<D>` and mints a `DataStage`, while a DSC holds
+/// `L3DataStages` and entries 334/335 need the extent-less `mint_one_page`/`mint_ibr` witness.
 fn new_data_stage_index(sdsc: &SuperDsc) -> DatastageId {
     let mut index = DatastageId(DATA_STAGE_CHUNK.0.saturating_add(1));
     while sdsc.dscs().iter().any(|dsc| dsc.data_stages.holds(index)) {
