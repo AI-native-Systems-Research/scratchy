@@ -12,106 +12,14 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 5,
-  "layer_count": 1,
-  "batch_count": 1,
-  "file_count": 1
+  "unit_count": 0,
+  "layer_count": 0,
+  "batch_count": 0,
+  "file_count": 0
  },
- "waves": [
-  {
-   "unit_count": 5,
-   "batches": [
-    {
-     "kind": "symbol",
-     "source_file": "crustify-ddc/cpp/l3.cpp",
-     "items": [
-      {
-       "name": "e213_addL3LUAndLXLUSoftSyncNodeSequence",
-       "defined_in": "crustify-ddc/cpp/l3.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 1,
-       "loc": 26,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e214_optimizeHbmLdsOutputInScheduleTree",
-       "defined_in": "crustify-ddc/cpp/l3.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 1,
-       "loc": 94,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e215_buildScheduleDimensionsTable",
-       "defined_in": "crustify-ddc/cpp/l3.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 1,
-       "loc": 103,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e216_buildLoopOrder",
-       "defined_in": "crustify-ddc/cpp/l3.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 1,
-       "loc": 231,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e217_createChunkLoopNodes",
-       "defined_in": "crustify-ddc/cpp/l3.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 1,
-       "loc": 58,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      }
-     ]
-    }
-   ]
-  }
- ],
+ "waves": [],
  "_comment": [
-  "PORT REMAINDER for level1-helpers: the 5 of 86 units in level(s) [1] that still have no",
+  "PORT REMAINDER for level1-helpers: the 0 of 86 units in level(s) [1] that still have no",
   "`/// Replaces:` anchor under crates/compiler/deeptools/src/schedule.",
   "Batches are packed WITHIN A SINGLE HOME FILE so two concurrent agents rarely touch the same",
   "file; where a home holds more than max_syms units its batches do run concurrently, and the",
