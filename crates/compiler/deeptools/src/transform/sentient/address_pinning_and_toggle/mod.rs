@@ -181,12 +181,14 @@ use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
 use crate::workload::Workload;
 use crate::transform::sentient::analyses::{
-    EvAddressInfo, EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites, RegionSite,
+    BodyIndex, EvAddressInfo, EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites,
+    PinningSchemeManager, RegionNum, RegionSite,
 };
 use crate::transform::sentient::{ForRef, IterArgIndex};
 use crate::units::DfirUnit;
+use abstract_data_transfer_updater::DataTransferUpdater;
 use looping_chain_mutable_addr_descriptor::TransferEnd;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use conditional_constant_descriptor::ConditionalConstantDescriptor;
 pub use data_transfer_descriptor::{DataTransferDescriptor, DescriptorMemoryUnit};
@@ -2261,30 +2263,371 @@ impl AddressPinningAndTogglePass {
     }
 }
 
-// crustify:todo: e647_CollectDataTransfersAndComputeMaxStreams
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1293  (39 body lines, level 8)
-//   original  : void AddressPinningAndTogglePass::CollectDataTransfersAndComputeMaxStreams( dataflow::ProgramUnitOp unit, SenComponents comp, SenComponents memory_unit)
-//   calls     : e637_collectDataTransfers
+/// ONE PREORDER STOP OF e647'S WALK — where the transfer is, which [`RegionSite`] it belongs to,
+/// and which uniformized region's unit list it counts against, [`None`] being the unit's own body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransferVisit {
+    /// The op the walk stopped at.
+    op: OpId,
+    /// `region_op`/`region_num` for this stop, as `collectDataTransfers` is handed them.
+    region: RegionSite,
+    /// Which entry of e647's `groups` — `None` for a common transfer.
+    group: Option<usize>,
+}
 
-// crustify:todo: e648_processToggle
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1522  (13 body lines, level 8)
-//   original  : void AddressPinningAndTogglePass::processToggle( DataTransferDescriptor &dtd, const PinningSchemeManager &ps_manager, mlir::MutableOperandRange mutable_addr, mlir::MutableOperandRange immutable_addr, uint32_t element_size)
-//   calls     : e263_getToggleDescriptor, e264_getToggleDescriptor, e278_isValid, e638_update
+/// `unit->walk<WalkOrder::PreOrder>` (`:1297-1323`) — the unit's ops in preorder with a
+/// `uniform.uniformize_regions` SKIPPED as a whole, its regions walked separately under their own
+/// [`RegionSite`] and a fresh `groups` entry holding `getRegionUnitList(i)`.
+///
+/// ⛔ `uniform.equalize_pattern` FALLS TO THE ORDINARY ARM, faithful to a failing
+/// `dyn_cast<UniformizeRegionsOp>`: its regions are the unit's own and their transfers common ones.
+fn collect_transfer_visits(
+    block: &[Op],
+    base: usize,
+    prefix: &mut Vec<u32>,
+    visits: &mut Vec<TransferVisit>,
+    groups: &mut Vec<Vec<Val>>,
+) {
+    for (index, op) in block.iter().enumerate() {
+        prefix.push(u32::try_from(base + index).unwrap_or_default());
+        if let Op::UniformRegions(UniformRegions::UniformizeRegions { regions, .. }) = op {
+            if prefix.len() != 1 {
+                todo!(
+                    "CollectDataTransfersAndComputeMaxStreams: a NESTED \
+                     `uniform.uniformize_regions` at {prefix:?}, which `BodyIndex` cannot name"
+                )
+            }
+            let at = BodyIndex(prefix[0] as usize);
+            let mut region_base = 0usize;
+            for (num, region) in regions.iter().enumerate() {
+                let group = groups.len();
+                groups.push(region.units.clone());
+                let site = RegionSite::UniformizedRegion {
+                    at,
+                    region: RegionNum(num),
+                };
+                collect_region_visits(&region.body, region_base, prefix, visits, site, group);
+                region_base += region.body.len();
+            }
+        } else {
+            visits.push(TransferVisit {
+                op: OpId::at(prefix),
+                region: RegionSite::ProgramUnitBody,
+                group: None,
+            });
+            let mut region_base = 0usize;
+            for region in dialects::regions_ref(op) {
+                collect_transfer_visits(region, region_base, prefix, visits, groups);
+                region_base += region.len();
+            }
+        }
+        prefix.pop();
+    }
+}
 
-// crustify:todo: e649_processConditionalConstant
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1539  (10 body lines, level 8)
-//   original  : void AddressPinningAndTogglePass::processConditionalConstant( DataTransferDescriptor &dtd, const PinningSchemeManager &ps_manager, mlir::MutableOperandRange mutable_addr, mlir::MutableOperandRange immutable_addr, uint32_t element_size)
-//   calls     : e638_update
+/// `region.walk<WalkOrder::PreOrder>` (`:1304-1308`) — every op of ONE uniformized region, nested
+/// ops included and nothing skipped, all charged to the region that owns them.
+///
+/// ⛔ A NESTED `uniform.uniformize_regions` IS NOT SKIPPED HERE: this walk has no `WalkResult`, so
+/// its ops belong to the OUTER region's site and unit list, whichever op holds them.
+fn collect_region_visits(
+    block: &[Op],
+    base: usize,
+    prefix: &mut Vec<u32>,
+    visits: &mut Vec<TransferVisit>,
+    site: RegionSite,
+    group: usize,
+) {
+    for (index, op) in block.iter().enumerate() {
+        prefix.push(u32::try_from(base + index).unwrap_or_default());
+        visits.push(TransferVisit {
+            op: OpId::at(prefix),
+            region: site,
+            group: Some(group),
+        });
+        let mut region_base = 0usize;
+        for region in dialects::regions_ref(op) {
+            collect_region_visits(region, region_base, prefix, visits, site, group);
+            region_base += region.len();
+        }
+        prefix.pop();
+    }
+}
 
-// crustify:todo: e650_processIntegerSequence
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1553  (8 body lines, level 8)
-//   original  : void AddressPinningAndTogglePass::processIntegerSequence( DataTransferDescriptor &dtd, const PinningSchemeManager &ps_manager, mlir::MutableOperandRange mutable_addr, mlir::MutableOperandRange immutable_addr, uint32_t element_size)
-//   calls     : e638_update
+impl AddressPinningAndTogglePass {
+    /// Replaces: e647_CollectDataTransfersAndComputeMaxStreams
+    ///
+    /// Files every transfer of one unit and leaves `num_streams_` at the WIDEST count any single
+    /// physical unit needs at once: the unit body's own transfers are charged to all of them, a
+    /// uniformized region's only to the units that region maps onto (`:1292-1332`).
+    ///
+    /// ⛔ THE `WalkResult::skip()` IS THE WHOLE POINT (`:1316`) — without it a uniformized transfer
+    /// is ALSO a common one; ⛔ AND AN EMPTY MAP IS `common_transfers`, NOT `0` (`:1330`).
+    pub fn collect_data_transfers_and_compute_max_streams(
+        &mut self,
+        comp: DfirUnit,
+        unit_body: &[Op],
+        defs: Definitions<'_>,
+        memory_unit: DfirUnit,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) {
+        let mut visits = Vec::new();
+        let mut groups: Vec<Vec<Val>> = Vec::new();
+        collect_transfer_visits(unit_body, 0, &mut Vec::new(), &mut visits, &mut groups);
+        let mut common_transfers = 0usize;
+        let mut region_transfers = vec![0usize; groups.len()];
+        for visit in visits {
+            if !self.collect_data_transfers(
+                comp,
+                visit.op,
+                unit_body,
+                defs,
+                memory_unit,
+                visit.region,
+                evaluator,
+            ) {
+                continue;
+            }
+            match visit.group {
+                Some(group) => region_transfers[group] += 1,
+                None => common_transfers += 1,
+            }
+        }
+        // `per_unit_transfer_counts[tmp_unit] += region_transfers` (`:1310-1312`) — one region's
+        // count charged to every unit it runs on, and a unit two regions name pays for both.
+        let mut per_unit_transfer_counts: BTreeMap<Val, usize> = BTreeMap::new();
+        for (group, units) in groups.iter().enumerate() {
+            for unit in units {
+                *per_unit_transfer_counts.entry(*unit).or_default() += region_transfers[group];
+            }
+        }
+        self.num_streams = Some(StreamCount(
+            per_unit_transfer_counts
+                .values()
+                .map(|count| count + common_transfers)
+                .max()
+                .unwrap_or(common_transfers),
+        ));
+    }
+}
 
-// crustify:todo: e651_processSimpleConstant
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1565  (6 body lines, level 8)
-//   original  : void AddressPinningAndTogglePass::processSimpleConstant( DataTransferDescriptor &dtd, const PinningSchemeManager &ps_manager, mlir::MutableOperandRange mutable_addr, mlir::MutableOperandRange immutable_addr, uint32_t element_size)
-//   calls     : e638_update
+/// ONE TRANSFER'S DESCRIPTOR AND THE OP IT DESCRIBES — what all four `process*` open by reaching
+/// for, `dtd_.getOperation()` resolved through the unit body this pass is running over.
+fn transfer_of<'a>(
+    descs: &'a DataTransferDescriptorContainer,
+    desc: DescriptorId,
+    unit_body: &'a [Op],
+) -> (&'a DataTransferDescriptor, &'a Op) {
+    let Some(dtd) = descs.descriptors.get(desc.0 as usize) else {
+        todo!("processDataTransfer: `dtd_` is {desc:?}, which this container does not hold")
+    };
+    let Some(transfer) = op_at(&dtd.op, unit_body) else {
+        todo!(
+            "processDataTransfer: `dtd_.getOperation()` is at {:?}, which this unit body does not \
+             reach",
+            dtd.op
+        )
+    };
+    (dtd, transfer)
+}
+
+impl AddressPinningAndTogglePass {
+    /// Replaces: e648_processToggle
+    ///
+    /// Pins a toggling transfer through [`ToggleDataTransferUpdater`], whose `toggle_sub_` is the
+    /// `sentient.scalar_sub` DEFINING the immutable-addr operand (`:1522-1537`).
+    ///
+    /// ⛔ ONE `None` CARRIES BOTH `DT_CHECK`s: [`DataTransferDescriptor::toggle_descriptor`]'s
+    /// `isToggle()` (`:711`) already contains the `toggle.isValid()` of `:1526`.
+    pub fn process_toggle<E: ExpressionEvaluator>(
+        &self,
+        desc: DescriptorId,
+        unit_body: &mut Vec<Op>,
+        end: TransferEnd,
+        ty: ScalarTy,
+        element_size: Bits,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        sites: &mut OffsetSites<'_>,
+    ) {
+        let toggle_sub = {
+            let (dtd, transfer) =
+                transfer_of(&self.immut_data_transfer_descriptors, desc, unit_body);
+            if dtd.toggle_descriptor().is_none() {
+                panic!(
+                    "DT_CHECK(isToggle()) (`:711`) / DT_CHECK_MSG(toggle.isValid(), \"descriptor \
+                     may be corrupt\") (`:1526`) for {:?}",
+                    dtd.pattern_desc
+                )
+            }
+            let immutable_addr = immutable_addr_of(transfer, end);
+            let regions: [&[Op]; 1] = [unit_body.as_slice()];
+            match Definitions::from_innermost(&regions).of(immutable_addr) {
+                Some(Op::Sentient(sentient::Op::ScalarSub { result, .. })) => {
+                    ToggleSub::of(*result)
+                }
+                other => panic!(
+                    "DT_CHECK_MSG(toggle_sub, \"unable to find the toggle sub, perhaps incorrect \
+                     immutable addr is passed to this function\") (`:1529-1532`): {other:?}"
+                ),
+            }
+        };
+        abstract_data_transfer_updater::update(
+            &mut DataTransferUpdater::Toggle(ToggleDataTransferUpdater { toggle_sub }),
+            &self.immut_data_transfer_descriptors,
+            desc,
+            unit_body,
+            end,
+            ty,
+            element_size,
+            evaluator,
+            ps_manager,
+            sites,
+        );
+    }
+
+    /// Replaces: e649_processConditionalConstant
+    ///
+    /// Pins a conditionally chosen base address through [`ConditionalConstDataTransferUpdater`],
+    /// whose `if_op_` is the `sentient.if` DEFINING the immutable-addr operand (`:1539-1551`).
+    ///
+    /// ⛔ THE ONE-USE CHECK IS ON `getResult(0)` AND NOT ON THE RESULT THIS TRANSFER USES (`:1546`):
+    /// a second result of the same conditional would not fail it, however many users it has.
+    pub fn process_conditional_constant<E: ExpressionEvaluator>(
+        &self,
+        desc: DescriptorId,
+        unit_body: &mut Vec<Op>,
+        end: TransferEnd,
+        ty: ScalarTy,
+        element_size: Bits,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        sites: &mut OffsetSites<'_>,
+    ) {
+        let if_result = {
+            let (_, transfer) = transfer_of(&self.immut_data_transfer_descriptors, desc, unit_body);
+            let immutable_addr = immutable_addr_of(transfer, end);
+            let regions: [&[Op]; 1] = [unit_body.as_slice()];
+            let Some(if_op @ Op::Sentient(sentient::Op::If { .. })) =
+                Definitions::from_innermost(&regions).of(immutable_addr)
+            else {
+                panic!(
+                    "DT_CHECK_MSG(if_op, \"expected IfOp as the original base addr\") (`:1544`) \
+                     for {immutable_addr:?}"
+                )
+            };
+            let results = dialects::results(if_op);
+            let Some(index) = results.iter().position(|result| *result == immutable_addr) else {
+                todo!(
+                    "processConditionalConstant: {immutable_addr:?} is not among the results of \
+                     the `sentient.if` that binds it"
+                )
+            };
+            if dialects::use_count(results[0], unit_body) != 1 {
+                panic!(
+                    "DT_CHECK_MSG(if_op->getResult(0).hasOneUse(), \"Conditional expected to have \
+                     exactly one use.\") (`:1546-1547`)"
+                )
+            }
+            ConditionalConstResult {
+                index: YieldedIndex(index),
+                val: immutable_addr,
+            }
+        };
+        abstract_data_transfer_updater::update(
+            &mut DataTransferUpdater::ConditionalConst(ConditionalConstDataTransferUpdater {
+                if_result,
+            }),
+            &self.immut_data_transfer_descriptors,
+            desc,
+            unit_body,
+            end,
+            ty,
+            element_size,
+            evaluator,
+            ps_manager,
+            sites,
+        );
+    }
+
+    /// Replaces: e650_processIntegerSequence
+    ///
+    /// Pins a sequence-carried base address through [`IntegerSequenceDataTransferUpdater`], whose
+    /// `iter_arg_` is the immutable-addr operand itself (`:1553-1563`).
+    ///
+    /// ⛔ `dyn_cast<BlockArgument>` IS "NOTHING IN THIS SCOPE DEFINES IT" (`:1557`): an operand
+    /// some op of the unit binds is a result, not a loop-carried argument, and that is the abort.
+    pub fn process_integer_sequence<E: ExpressionEvaluator>(
+        &self,
+        desc: DescriptorId,
+        unit_body: &mut Vec<Op>,
+        end: TransferEnd,
+        ty: ScalarTy,
+        element_size: Bits,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        sites: &mut OffsetSites<'_>,
+    ) {
+        let iter_arg = {
+            let (_, transfer) = transfer_of(&self.immut_data_transfer_descriptors, desc, unit_body);
+            let immutable_addr = immutable_addr_of(transfer, end);
+            let regions: [&[Op]; 1] = [unit_body.as_slice()];
+            if let Some(defining) = Definitions::from_innermost(&regions).of(immutable_addr) {
+                panic!(
+                    "DT_CHECK_MSG(iter_arg, \"expected iter-arg as the original base addr\") \
+                     (`:1558`): {defining:?} defines it"
+                )
+            }
+            immutable_addr
+        };
+        abstract_data_transfer_updater::update(
+            &mut DataTransferUpdater::IntegerSequence(IntegerSequenceDataTransferUpdater {
+                iter_arg,
+            }),
+            &self.immut_data_transfer_descriptors,
+            desc,
+            unit_body,
+            end,
+            ty,
+            element_size,
+            evaluator,
+            ps_manager,
+            sites,
+        );
+    }
+
+    /// Replaces: e651_processSimpleConstant
+    ///
+    /// Pins a transfer whose base address is one constant through
+    /// [`SimpleConstantDataTransferUpdater`] (`:1565-1573`).
+    ///
+    /// ⛔ NO CHECK OF ITS OWN — the reference's body is the constructor and the `update()` call, and
+    /// the `isValid()` that admits a transfer here belongs to e653's `else if` (`:1516`).
+    pub fn process_simple_constant<E: ExpressionEvaluator>(
+        &self,
+        desc: DescriptorId,
+        unit_body: &mut Vec<Op>,
+        end: TransferEnd,
+        ty: ScalarTy,
+        element_size: Bits,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        sites: &mut OffsetSites<'_>,
+    ) {
+        abstract_data_transfer_updater::update(
+            &mut DataTransferUpdater::SimpleConstant(SimpleConstantDataTransferUpdater),
+            &self.immut_data_transfer_descriptors,
+            desc,
+            unit_body,
+            end,
+            ty,
+            element_size,
+            evaluator,
+            ps_manager,
+            sites,
+        );
+    }
+}
 
 // crustify:todo: e653_processDataTransfer
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1492  (26 body lines, level 9)
@@ -2312,7 +2655,9 @@ mod unit_tests {
     use crate::arch::Elements;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
     use crate::formats::Bits;
-    use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
+    use crate::islands::sentient::dialects::sentient::{
+        CmpPredicate, Extent, Reg, RegType, ShuffleMode, Yielded,
+    };
     use crate::islands::sentient::dialects::{LocalRegion, Val, sentient};
     use crate::transform::sentient::analyses::{
         Evaluation, OffsetSites, OutOfScopeEvaluator, RegionSite,
@@ -3949,6 +4294,350 @@ mod unit_tests {
                 total_chain_increment: ChainIncrement(0),
                 increment_via_burst: BurstIncrement(64),
             }
+        );
+    }
+
+    /// 647/656 — the walk SKIPS a `uniform.uniformize_regions` as a whole and charges each region's
+    /// transfers only to the units that region runs on: one common transfer plus regions of one and
+    /// of two transfers is THREE streams for the busiest unit, where a non-skipping walk says six.
+    #[test]
+    fn e647_charges_a_uniformized_region_only_to_the_units_it_runs_on() {
+        fn hbm_load_and_store(result: u32) -> Op {
+            Op::Sentient(sentient::Op::LoadAndStore {
+                src: Val(1),
+                dst: Val(2),
+                src_mutable_addr: Val(3),
+                src_immutable_addr: Val(5),
+                src_inc: Val(4),
+                dst_mutable_addr: Val(0),
+                dst_immutable_addr: Val(0),
+                dst_inc: Val(0),
+                multicast_info: None,
+                results: (Val(result), Val(result + 1)),
+                extent: Extent::of(Elements(8), Bits(16)),
+                stride: 1,
+                rotate_val: None,
+                shuffle_mode: ShuffleMode::NoShuffle,
+                src_reg: Reg {
+                    locale: RegType::Lar,
+                    index: None,
+                },
+                dst_reg: Reg {
+                    locale: RegType::Lbr,
+                    index: None,
+                },
+                dir: None,
+                is_ibr_write: false,
+                dbg_name: None,
+            })
+        }
+
+        let body = vec![
+            get_unit(1, DfirUnit::Hbm),
+            get_unit(2, DfirUnit::Lx),
+            scalar_const(3, 4096),
+            scalar_const(4, 64),
+            scalar_const(5, 8192),
+            hbm_load_and_store(20),
+            Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![
+                    LocalRegion {
+                        arg: Val(30),
+                        units: vec![Val(40)],
+                        body: vec![hbm_load_and_store(22)],
+                    },
+                    LocalRegion {
+                        arg: Val(31),
+                        units: vec![Val(41)],
+                        body: vec![hbm_load_and_store(24), hbm_load_and_store(26)],
+                    },
+                ],
+                results: Vec::new(),
+                yielded: Vec::new(),
+            }),
+        ];
+        let regions: [&[Op]; 1] = [body.as_slice()];
+        let mut pass = AddressPinningAndTogglePass::default();
+        let mut evaluator = StatedEvaluator::default();
+
+        pass.collect_data_transfers_and_compute_max_streams(
+            DfirUnit::L3lu,
+            &body,
+            Definitions::from_innermost(&regions),
+            DfirUnit::Hbm,
+            &mut evaluator,
+        );
+
+        let sites: Vec<RegionSite> = pass
+            .immut_data_transfer_descriptors
+            .descriptors
+            .iter()
+            .map(|desc| desc.region)
+            .collect();
+        assert_eq!(
+            sites,
+            vec![
+                RegionSite::ProgramUnitBody,
+                RegionSite::UniformizedRegion {
+                    at: BodyIndex(6),
+                    region: RegionNum(0),
+                },
+                RegionSite::UniformizedRegion {
+                    at: BodyIndex(6),
+                    region: RegionNum(1),
+                },
+                RegionSite::UniformizedRegion {
+                    at: BodyIndex(6),
+                    region: RegionNum(1),
+                },
+            ]
+        );
+        // `max(1 + 1, 2 + 1)` — and 2 + 4 without the `WalkResult::skip()`.
+        assert_eq!(pass.num_streams, Some(StreamCount(3)));
+    }
+
+    /// 648/656 — a toggle is pinned between the PAIR its descriptor holds, through the updater built
+    /// on the `sentient.scalar_sub` that defines its immutable address. ⛔ `create_offset_value` is
+    /// out of campaign scope, so the choice of address is what this can check.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e648_pins_a_toggle_between_the_two_addresses_its_descriptor_holds() {
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn find_closest_pinned_addr(
+                &self,
+                ev_x: EvaluatedValue,
+                ev_y: EvaluatedValue,
+                region: RegionSite,
+                element_size: Bits,
+            ) -> EvaluatedValue {
+                assert_eq!((ev_x, ev_y), (EvaluatedValue(0), EvaluatedValue(1)));
+                assert_eq!(
+                    (region, element_size),
+                    (RegionSite::ProgramUnitBody, Bits(16))
+                );
+                EvaluatedValue(0)
+            }
+        }
+
+        let mut body = vec![
+            load_and_store(1, 2, 5, 10),
+            Op::Sentient(sentient::Op::ScalarSub {
+                lhs: Val(3),
+                rhs: Val(4),
+                result: Val(5),
+                reg: None,
+                element_size: None,
+                ty: ScalarTy::Index,
+            }),
+        ];
+        let mut pass = AddressPinningAndTogglePass::default();
+        let desc = pass
+            .immut_data_transfer_descriptors
+            .insert(transfer(Some(PatternDescriptor::Toggle(matched_toggle())), 2));
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_toggle(
+            desc,
+            &mut body,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            Bits(16),
+            &mut OutOfScopeEvaluator,
+            &StatedScheme,
+            &mut sites,
+        );
+    }
+
+    /// 649/656 — a conditional base address is pinned between the LOWEST and the HIGHEST constant its
+    /// `sentient.if` can yield, in that order. ⛔ stops at the out-of-scope offset builder.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e649_pins_a_conditional_between_its_lowest_and_highest_yielded_constant() {
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn find_closest_pinned_addr(
+                &self,
+                ev_x: EvaluatedValue,
+                ev_y: EvaluatedValue,
+                region: RegionSite,
+                element_size: Bits,
+            ) -> EvaluatedValue {
+                // The handles `evaluate_min_max` interned for 4096 then 8192 — the constants go in
+                // HIGHEST FIRST, so a swapped min/max would arrive here as `(3, 2)`.
+                assert_eq!((ev_x, ev_y), (EvaluatedValue(2), EvaluatedValue(3)));
+                assert_eq!(
+                    (region, element_size),
+                    (RegionSite::ProgramUnitBody, Bits(16))
+                );
+                EvaluatedValue(2)
+            }
+        }
+
+        let mut evaluator = StatedEvaluator::default();
+        let yielded_constants = vec![evaluator.constant(8192), evaluator.constant(4096)];
+        let mut body = vec![
+            load_and_store(1, 2, 5, 10),
+            Op::Sentient(sentient::Op::If {
+                predicate: CmpPredicate::Eq,
+                lhs: Val(6),
+                rhs: Val(7),
+                yielded: vec![Yielded {
+                    result: Val(5),
+                    reg: Reg {
+                        locale: RegType::Lbr,
+                        index: None,
+                    },
+                    element_size: None,
+                }],
+                dbg_name: None,
+                then_body: Vec::new(),
+                else_body: Vec::new(),
+            }),
+        ];
+        let mut pass = AddressPinningAndTogglePass::default();
+        let desc = pass.immut_data_transfer_descriptors.insert(transfer(
+            Some(PatternDescriptor::ConditionalConstant(
+                ConditionalConstantDescriptor {
+                    yielded_constants,
+                    can_be_simplified: false,
+                },
+            )),
+            1,
+        ));
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_conditional_constant(
+            desc,
+            &mut body,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            Bits(16),
+            &mut evaluator,
+            &StatedScheme,
+            &mut sites,
+        );
+    }
+
+    /// 650/656 — a sequence-carried base address is pinned across its FIRST and LAST terms, and the
+    /// operand nothing in the unit defines is what makes it an iter arg. ⛔ stops at the out-of-scope
+    /// offset builder.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e650_pins_a_sequence_across_its_first_and_last_term() {
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn find_closest_pinned_addr(
+                &self,
+                ev_x: EvaluatedValue,
+                ev_y: EvaluatedValue,
+                region: RegionSite,
+                element_size: Bits,
+            ) -> EvaluatedValue {
+                // The handles `getMin`/`getMax` interned for `init` 1024 and `init + 256 * 4` 2048.
+                assert_eq!((ev_x, ev_y), (EvaluatedValue(4), EvaluatedValue(7)));
+                assert_eq!(
+                    (region, element_size),
+                    (RegionSite::ProgramUnitBody, Bits(16))
+                );
+                EvaluatedValue(4)
+            }
+        }
+
+        let mut evaluator = StatedEvaluator::default();
+        let (init, stride) = (evaluator.constant(1024), evaluator.constant(256));
+        // ⛔ NOTHING HERE DEFINES `Val(5)`, which is `dyn_cast<BlockArgument>` succeeding.
+        let mut body = vec![load_and_store(1, 2, 5, 10)];
+        let mut pass = AddressPinningAndTogglePass::default();
+        let desc = pass.immut_data_transfer_descriptors.insert(transfer(
+            Some(PatternDescriptor::IntegerSequence(integer_sequence(
+                SequenceSize::Terms(4),
+                init,
+                stride,
+            ))),
+            1,
+        ));
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_integer_sequence(
+            desc,
+            &mut body,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            Bits(16),
+            &mut evaluator,
+            &StatedScheme,
+            &mut sites,
+        );
+    }
+
+    /// 651/656 — a simple constant is pinned at its ONE base address, which goes into the pair call
+    /// TWICE. ⛔ stops at the out-of-scope offset builder.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e651_pins_a_simple_constant_at_its_one_base_address_passed_twice() {
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn find_closest_pinned_addr(
+                &self,
+                ev_x: EvaluatedValue,
+                ev_y: EvaluatedValue,
+                region: RegionSite,
+                element_size: Bits,
+            ) -> EvaluatedValue {
+                assert_eq!((ev_x, ev_y), (EvaluatedValue(0), EvaluatedValue(0)));
+                assert_eq!(
+                    (region, element_size),
+                    (RegionSite::ProgramUnitBody, Bits(16))
+                );
+                EvaluatedValue(0)
+            }
+        }
+
+        let mut body = vec![load_and_store(1, 2, 5, 10)];
+        let mut pass = AddressPinningAndTogglePass::default();
+        let desc = pass
+            .immut_data_transfer_descriptors
+            .insert(transfer(None, 1));
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_simple_constant(
+            desc,
+            &mut body,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            Bits(16),
+            &mut OutOfScopeEvaluator,
+            &StatedScheme,
+            &mut sites,
         );
     }
 }

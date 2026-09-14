@@ -189,6 +189,14 @@ impl UnitFilter {
         matches!(self, UnitFilter::Include(_))
     }
 
+    /// `getInclExclList().empty()` (`LoopRolling.cpp:873`) — the list names NO unit, whichever kind of
+    /// list it is, which is how a pass tells its own `dcc-opt` flag from the pipeline's invocation.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        let (UnitFilter::Include(list) | UnitFilter::Exclude(list)) = self;
+        list.is_empty()
+    }
+
     /// `getInclExclList().count(unit) != 0` — whether the list NAMES this unit kind, whichever kind
     /// of list it is.
     #[must_use]

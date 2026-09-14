@@ -94,31 +94,22 @@
 //! | `e652_runOnOperation` | 652 | 8 | 53 | `dcc/src/Transform/Sentient/LoopRolling.cpp:966` |
 
 
-// ── STILL SCHEDULED IN THIS FILE (levels 1..8) — anchors, not dead comments. ⛔ Do not delete one
-// you did not port; on bridge 2 that silently lost 149 of 384 functions.
-
-// crustify:todo: e652_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:966  (53 body lines, level 8)
-//   original  : void runOnOperation()
-//   calls     : e252_size, e642_rollInstrsInBlock
-
-
-// ⛔ THE REMOVAL TRIGGER IS `e652_runOnOperation`. Every type and method below is reached only from
-// the pass entry, which is this file's last unfilled anchor (level 8): until it lands, the whole
-// module is unreachable from the crate and `dead_code` would fire on all of it. ⭐ DELETE THIS LINE
-// WHEN THAT ANCHOR IS FILLED — a warning that survives it is a unit nothing calls, which the
-// campaign's own note names as the failure mode to catch.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::{
     self, Definitions, Op, Val, dataflow, sentient, symbol, uniform,
 };
+use crate::model::Model;
+use crate::transform::sentient::analyses::{InstructionEstimator, OutOfScopeInstructionEstimator};
+use crate::transform::sentient::loop_tree::{LoopNodeId, LoopTree};
 use crate::transform::sentient::skeleton;
+use crate::transform::sentient::{ForRef, UnitFilter};
 use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 /// WHERE AN INSTRUCTION SITS IN THE BLOCK BEING ROLLED — `Block::iterator`.
 ///
@@ -1623,11 +1614,164 @@ fn uniform_delta(deltas: &[Delta]) -> Option<Delta> {
     deltas.iter().all(|delta| *delta == first).then_some(first)
 }
 
+/// The body of the `sentient.for` whose induction variable is `iv` — `*for_op.getBody(0)`, the loop
+/// being named by the value it binds ([`ForRef`], which is how the tree holds it).
+fn for_body_mut(block: &mut Vec<Op>, iv: Val) -> Option<&mut Vec<Op>> {
+    for op in block.iter_mut() {
+        let regions: Vec<&mut Vec<Op>> = match op {
+            Op::Sentient(sentient::Op::For { iv: at, body, .. }) => {
+                if *at == iv {
+                    return Some(body);
+                }
+                vec![body]
+            }
+            other => dialects::regions_mut(other),
+        };
+        for region in regions {
+            if let Some(found) = for_body_mut(region, iv) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// `tree.walk(rollSingleInstrsInInnermostLoop, kPreOrder)` REDUCED TO THE NODES ITS ACTION ACTS ON —
+/// `if (!n->isInnermostLoop()) return nullptr;`.
+///
+/// ⭐ A FIXED LIST IS THE SAME WALK HERE, unlike [`super::loop_absorption`]'s: this action removes no
+/// node, so `preOrderWalk`'s re-reading of `getFirstChild()`/`getNextSibling()` sees what it saw.
+/// ⭐ THE SYNTHETIC ROOT IS FILTERED BY [`LoopTree::loop_of`], which is `getOpAs<sentient::ForOp>()`.
+fn innermost_loops(tree: &LoopTree<false>, n: LoopNodeId, out: &mut Vec<ForRef>) {
+    if tree.is_innermost_loop(n) {
+        out.extend(tree.loop_of(n));
+        return;
+    }
+    let mut child = tree.first_child(n);
+    while let Some(c) = child {
+        innermost_loops(tree, c, out);
+        child = tree.next_sibling(c);
+    }
+}
+
+/// `-dcc-loop-rolling-disable`, `cl::init(false)` (`:47-49`) — a `dcc-opt` command-line flag, not a
+/// program property, and this crate has no flags.
+const DISABLE_THIS_PASS: bool = false;
+
+/// `-l3-loop-rolling-only`, `cl::init(false)` (`:50-54`) — *"Only roll windows delimited by soft syncs
+/// at the outermost level in L3 units."*
+const L3_ONLY_LOOP_ROLLING: bool = false;
+
+/// `-single-instr-loop-rolling-only`, `cl::init(false)` (`:55-58`) — *"Only roll windows of size 1 at
+/// the innermost level."*
+const SINGLE_INSTR_ONLY_LOOP_ROLLING: bool = false;
+
+/// `opts_.OptLevel == 0` (`:971`) — the PIPELINE's optimisation level, which is `2` by default
+/// (`dcc/tools/Options/dcc-pass-option.h:63-65`), so the shipped pipeline never reaches the
+/// `haveIbuffSpace` half of the `&&`.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// Replaces: e652_runOnOperation
+///
+/// The pass entry: for every program unit the filter admits and whose instruction buffer is not
+/// already roomy, roll the soft-sync windows of its outermost blocks — or, when only single-instruction
+/// rolling is on, the single instructions of each of its innermost loops (`:966-1018`).
+///
+/// ⛔ THE TWO CASES ARE EXCLUSIVE AND `L3_rolling_` WINS: with a filter that names nothing both flags
+/// come out true (`:873-879`), so the shipped standalone invocation takes the L3 arm only.
+/// ⛔ `new_loop_count_` IS A PASS MEMBER: the `LR loop #n` numbering runs across the whole module.
+/// ⭐ `key_vals` IS THE UNIT'S OWN LIST, from `getListOfKeyOpsFromUniformMapping`'s
+/// `dataflow.program_unit` arm (`Dialect/Uniform/Utils.cpp:180-186`).
+/// ⭐ `oe`/`const_builder` ARE THE MECHANISM FOR REACHING OPERANDS, which the campaign names
+/// droppable — the builder's block is the one the unit sits in, which is `preamble`.
+/// ⭐ `unit_list` COLLAPSES for [`super::loop_absorption::run_on`]'s reason: rolling in one unit
+/// reaches no other, and the gate that selects a unit rewrites nothing.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    opts: &UnitFilter,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    // The constructor's two flags (`:873-879`): *"the include/exclude list for this pass is either
+    // empty (if the pass is called with --dcc-loop-rolling) or {L3SU, L3LU} (if the pass is called in
+    // the pipeline)"*.
+    let is_invoked_by_option = opts.is_empty();
+    let l3_rolling =
+        (is_invoked_by_option || opts.is_include_list()) && !SINGLE_INSTR_ONLY_LOOP_ROLLING;
+    let single_instr_loop_rolling =
+        (is_invoked_by_option || !opts.is_include_list()) && !L3_ONLY_LOOP_ROLLING;
+
+    let Program {
+        preamble, units, ..
+    } = program;
+    let mut new_loop_count = NewLoopCount(0);
+    for unit in units.iter_mut() {
+        // `getChildAnalysis<InstructionEstimator>(unit_op)` IS CONSTRUCTED PER UNIT (`:970`), even for
+        // one the `&&` never asks anything of.
+        let mut instruction_estimator = OutOfScopeInstructionEstimator;
+        if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        // `DT_CHECK(unit_op.getUnits().size() >= 1)` IS DISCHARGED BY THE TYPE: a
+        // [`Units`](crate::islands::dataflow_ir::Units) always has a head, and `getUnitType` of it is
+        // the GENERIC component, which is [`UnitFilter::names_component`].
+        let unit_is_in_incl_excl_list = opts.names_component(unit.on.kind());
+        let skip_loop_rolling = if opts.is_include_list() {
+            !unit_is_in_incl_excl_list
+        } else {
+            unit_is_in_incl_excl_list
+        };
+        if skip_loop_rolling {
+            continue;
+        }
+        let key_vals = {
+            let scope: [&[Op]; 1] = [preamble.as_slice()];
+            dialects::collect_unit_ops(&unit.on.vals(), Definitions::from_innermost(&scope))
+        };
+        if l3_rolling {
+            roll_instrs_in_block(
+                RollingCase::L3SoftSyncWindows,
+                &mut unit.body,
+                preamble,
+                &key_vals,
+                &mut new_loop_count,
+                values,
+            );
+        } else if single_instr_loop_rolling {
+            // ⛔ THE TREE IS BUILT ONCE, BEFORE ANY ROLL: its nodes are the loops the unit came in
+            // with, so a loop this pass creates is never itself descended into.
+            let tree: LoopTree<false> = LoopTree::of(&unit.body);
+            if tree.empty() {
+                continue;
+            }
+            let mut innermost = Vec::new();
+            innermost_loops(&tree, tree.root(), &mut innermost);
+            for for_op in innermost {
+                if let Some(body) = for_body_mut(&mut unit.body, for_op.0) {
+                    roll_instrs_in_block(
+                        RollingCase::SingleInstrWindows,
+                        body,
+                        preamble,
+                        &key_vals,
+                        &mut new_loop_count,
+                        values,
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::arch::Elements;
+    use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
 
     /// A `sentient.scalar_add` reading `lhs`/`rhs` and binding `result`.
     fn add(lhs: Val, rhs: Val, result: Val) -> Op {
@@ -2258,5 +2402,96 @@ mod unit_tests {
             })
             .collect();
         assert_eq!(names, vec!["LR loop #1", "LR loop #2"]);
+    }
+
+    /// A model and a rung, so the program is typed; nothing here reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e652 — the pass entry through the invocation that reaches the single-instruction arm, which is
+    /// the PIPELINE's: an exclude list naming the two L3 halves leaves `L3_rolling_` false, the LXLU
+    /// unit it does not name is admitted, and the four adds inside the unit's one innermost loop are
+    /// rolled into a loop NESTED IN THAT LOOP'S BODY rather than beside it.
+    #[test]
+    fn e652_rolls_the_single_instructions_of_each_innermost_loop() {
+        let mut values = Values::default();
+        let (unit_val, iv, bound, shared) =
+            (values.mint(), values.mint(), values.mint(), values.mint());
+        let pairs: Vec<(Val, Val)> = (0..4).map(|_| (values.mint(), values.mint())).collect();
+        // `%c = constant 4 + 6n` four times then one `%r = add %c, %shared` per constant, all inside
+        // the loop: e642's own single-instruction case, moved one region in.
+        let mut inner: Vec<Op> = pairs
+            .iter()
+            .enumerate()
+            .map(|(n, (constant, _))| scalar_constant(*constant, 4 + 6 * n as i64))
+            .collect();
+        inner.extend(
+            pairs
+                .iter()
+                .map(|(constant, result)| add(*constant, shared, *result)),
+        );
+        inner.push(Op::Sentient(sentient::Op::Yield {
+            results: Vec::new(),
+        }));
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, unit_val),
+                    precision: None,
+                    body: vec![Op::Sentient(sentient::Op::For {
+                        iv,
+                        bound,
+                        bound_reg: None,
+                        carried: Vec::new(),
+                        dbg_name: None,
+                        body: inner,
+                    })],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+
+        run_on_operation(
+            &mut program,
+            &UnitFilter::Exclude(vec![DfirUnit::L3su, DfirUnit::L3lu]),
+            &mut values,
+        );
+
+        let unit = program.units.iter().next().expect("the one unit");
+        let Op::Sentient(sentient::Op::For { body, .. }) = &unit.body[0] else {
+            panic!("the loop the tree found is still the unit's only op: {:?}", unit.body)
+        };
+        let names: Vec<&str> = body
+            .iter()
+            .filter_map(|op| match op {
+                Op::Sentient(sentient::Op::For { dbg_name, .. }) => dbg_name.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["LR loop #1"]);
     }
 }

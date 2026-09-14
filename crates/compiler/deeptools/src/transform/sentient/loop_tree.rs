@@ -138,6 +138,13 @@ impl<const HEIGHTS: bool> LoopTree<HEIGHTS> {
         self.tree.first_child(n.0).map(LoopNodeId)
     }
 
+    /// `LoopNode::isInnermostLoop()` — `LoopTree.hpp:56`, which is `isLeaf()` and nothing else, so the
+    /// synthetic root of an EMPTY forest answers `true`: that is what a caller's `empty()` guard is for.
+    #[must_use]
+    pub fn is_innermost_loop(&self, n: LoopNodeId) -> bool {
+        self.first_child(n).is_none()
+    }
+
     /// `LoopNode::getNextSibling()` — `LoopTree.hpp:39-41`.
     #[must_use]
     pub fn next_sibling(&self, n: LoopNodeId) -> Option<LoopNodeId> {
