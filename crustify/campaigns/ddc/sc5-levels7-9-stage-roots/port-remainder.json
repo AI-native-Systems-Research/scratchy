@@ -12,42 +12,14 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 1,
-  "layer_count": 1,
-  "batch_count": 1,
-  "file_count": 1
+  "unit_count": 0,
+  "layer_count": 0,
+  "batch_count": 0,
+  "file_count": 0
  },
- "waves": [
-  {
-   "unit_count": 1,
-   "batches": [
-    {
-     "kind": "symbol",
-     "source_file": "crustify-ddc/cpp/ddc.cpp",
-     "items": [
-      {
-       "name": "e379_run_v1",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 7,
-       "loc": 109,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      }
-     ]
-    }
-   ]
-  }
- ],
+ "waves": [],
  "_comment": [
-  "PORT REMAINDER for levels7-9-stage-roots: the 1 of 6 units in level(s) [7, 8, 9] that still have no",
+  "PORT REMAINDER for levels7-9-stage-roots: the 0 of 6 units in level(s) [7, 8, 9] that still have no",
   "`/// Replaces:` anchor under crates/compiler/deeptools/src/schedule.",
   "Batches are packed WITHIN A SINGLE HOME FILE so two concurrent agents rarely touch the same",
   "file; where a home holds more than max_syms units its batches do run concurrently, and the",
