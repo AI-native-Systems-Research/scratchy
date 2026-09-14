@@ -293,6 +293,13 @@ impl Coordinate {
         self.core_id_to_wk_slice.iter().map(|(&core, at)| (core, at))
     }
 
+    /// `getPadding()` (`dsc/dsc2.h:239`) — the WHOLE padding form, which entry 356 hands straight to
+    /// another coordinate's [`Self::set_padding_form`]. Only the dims carrying a style are named;
+    /// [`Self::padding`] already reads every other one as `NOPAD`.
+    pub fn padding_form(&self) -> impl Iterator<Item = (PrimaryDim, PadType)> + '_ {
+        self.padding.dims().map(|dim| (dim, self.padding.get(dim)))
+    }
+
     /// `foldConstructed()` (`dsc/dsc2.h:119`).
     #[must_use]
     pub const fn fold_constructed(&self) -> bool {
@@ -302,6 +309,23 @@ impl Coordinate {
     /// `completeFoldConstruction()` — a one-way latch, as the reference's own setter is.
     pub const fn complete_fold_construction(&mut self) {
         self.fold_constructed = true;
+    }
+
+    /// `fm.insertBeta(offset + fm.getBeta(fm.getNumDims() - 1), fm.getNumDims() - 1)` — the ONE
+    /// positional beta write in the fold builders (`ddc/ddc_fold.cpp:4576-4578`), which adds an
+    /// offset to the INNERMOST level of a dim's fold list.
+    ///
+    /// ⛔ THE READ AND THE WRITE ARE ONE OPERATION, which is what makes this total: the reference's
+    /// `getNumDims() - 1` underflows on an empty fold list and its `insertBeta` then `DT_CHECK`s the
+    /// position, so a dim carrying no fold has no innermost level and this does nothing.
+    pub fn add_to_innermost_beta(&mut self, dim: PrimaryDim, offset: FoldCoeff) {
+        if let Some(fold) = self
+            .dims
+            .get_mut(&dim)
+            .and_then(|entry| entry.folds.back_mut())
+        {
+            fold.beta = FoldCoeff(fold.beta.0 + offset.0);
+        }
     }
 }
 

@@ -219,6 +219,17 @@ use crate::schedule::ddc::transformation_util::{
 };
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐ USES FOR ENTRIES 359-360.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+use crate::formats::DataFormat;
+use crate::schedule::ddc::transformation_util::{
+    ExternalStreams, FifoConsumer, LatchDataIds, SkipRegResults, SkipRegTarget, TransferDest,
+    UnplacedNode, convert_result_to_skip_reg, dest_related_to_external_nodes,
+    insert_compute_between_transfer_and_reg, is_register,
+};
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 // THE STICK-PACKING AND OFFSET-ADJUSTMENT VOCABULARY — as entries 105-109 read it.
 //
 // ⭐ THE TRAITS ARE THE MECHANISM FOR REACHING OPERANDS, the one part the campaign statement names
@@ -2759,19 +2770,230 @@ where
     true
 }
 
-// crustify:todo: e359_transformRegToFifoOrLatch
-//   authority : ddc/ddc_transformation.cpp:610  (82 body lines, level 4)
-//   class     : Ddc
-//   original  : bool Ddc::transformRegToFifoOrLatch()
-//   extract   : crustify-ddc/cpp/ddc.cpp:14093-14175
-//   calls     : e117_getNodeDescription, e242_canUseFifo, e243_canUseLatch, e254_destRelatedToExternalNodes, e305_destRelatedToExternalNodes, e339_convertResultToSkipReg
+/// Replaces: e359_transformRegToFifoOrLatch
+///
+/// TURNS EVERY SINGLE-CONSUMER REGISTER RESULT INTO A FIFO, ELSE A LATCH (`:610`) — entry 242 then
+/// entry 243 over each internal transfer's register destinations, entry 339 doing the rewrite.
+///
+/// ⛔ `dataStageExplorationDone_` IS `stages.is_some()`, as [`StageExtents`] already states.
+/// ⚠️ TRAP: AN OPAQUE COMPUTE CONSUMER REFUSES THE DESTINATION, and a connect the census does not
+/// carry answers as one with NO consumer — which absorbs the reference's own `.at(resultDC)` throw.
+pub fn transform_reg_to_fifo_or_latch<D, S>(
+    dsc: &mut D,
+    stages: Option<&S>,
+    metadata: &mut Metadata,
+    latch_ids: &mut LatchDataIds,
+) -> bool
+where
+    D: TransferWalk
+        + ScopeTree
+        + TransferLoads
+        + SkipRegResults
+        + DscAllocations
+        + ExternalStreams
+        + ?Sized,
+    S: StageExtents + ?Sized,
+{
+    let mut did_transformation = false;
+    for node in dsc.transfers() {
+        let ends = TransferWalk::transfer(dsc, node).dsts.len();
+        for index in 0..ends {
+            // The bound is captured once and the body re-read, exactly as the reference indexes the
+            // LIVE node every time round.
+            let body = TransferWalk::transfer(dsc, node);
+            let at = DestIdx(u32::try_from(index).unwrap_or(u32::MAX));
+            let Some(dest) = TransferDest::of(metadata, node, &body, at) else {
+                continue;
+            };
+            let dst = dest.operand();
+            if !is_register(dst.storage) && dst.unit != SenComponent::Lxluvalue {
+                continue;
+            }
+            let consumers = dsc.connect_consumers(dst.data.data_connect);
+            let Some((first, rest)) = consumers.split_first() else {
+                continue;
+            };
+            if dest_related_to_external_nodes(dsc, &dst) {
+                continue;
+            }
+            if consumers
+                .iter()
+                .any(|consumer| matches!(consumer, FifoConsumer::Compute(compute, _) if dsc.is_opaque(*compute)))
+            {
+                continue;
+            }
+            let Some(view) = TransferDst::of(node, &body, at) else {
+                continue;
+            };
+            let sole = rest.is_empty();
+            let target = if sole && can_use_fifo(dsc, stages, &view, first.node()) {
+                SkipRegTarget::Fifo
+            } else if sole
+                && stages.is_some()
+                && can_use_latch(
+                    dsc,
+                    metadata,
+                    &view,
+                    &Consumers::new(first.node(), Vec::new()),
+                )
+            {
+                SkipRegTarget::Latch
+            } else {
+                continue;
+            };
+            if convert_result_to_skip_reg(dsc, metadata, latch_ids, dest, target) {
+                did_transformation = true;
+            }
+        }
+    }
+    did_transformation
+}
 
-// crustify:todo: e360_transformFor4BsplatRead
-//   authority : ddc/ddc_transformation.cpp:1766  (87 body lines, level 4)
-//   class     : Ddc
-//   original  : bool Ddc::transformFor4BsplatRead()
-//   extract   : crustify-ddc/cpp/ddc.cpp:14185-14272
-//   calls     : e250_convertResultFromFIFOtoReg, e340_insertComputeBetweenTransferAndReg
+/// WHAT ENTRY 360 READS BESIDE THE TRANSFER WALK, AND THE ONE NODE IT MINTS.
+pub trait Splat4bRead:
+    LabeledDs + DsSticks + SkipRegResults + DscAllocations + ExternalStreams + AllocationPaddings
+{
+    /// `labeledDs_.at(lds).dataFormat_`, once its `DataFormats::INVALID` default is an [`Option`].
+    fn lds_data_format(&self, lds: LdsIdx) -> Option<DataFormat>;
+
+    /// `lds.scale_.at(getDimIndexInLayoutOrder(lds.dsType_, dim))` for EVERY `labeledDs_` entry —
+    /// ⛔ [`None`] IS the reference's own `dimIdx < 0`, its first `broadcastNeeded` arm.
+    fn every_lds_scale_on(&self, dim: PrimaryDim) -> Vec<Option<Scale>>;
+
+    /// `new dsc2::ComputeNode()` with its fields, unparented — as [`PackStickDim::new_compute`].
+    fn mint_compute(&mut self, node: ComputeNode) -> NodeId;
+
+    /// The identity a freshly minted `dsc2::AllocateNode` takes, as
+    /// [`HoistTransfers::free_alloc_id`].
+    fn free_alloc(&self) -> AllocId;
+}
+
+/// AN LXLU READ THAT NEEDS AN EXPLICIT 4-BYTE SPLAT.
+///
+/// ⛔⛔ THE THREE `DT_CHECK`s AND THE `DT_CHECK_MSG` ARE THIS WITNESS MISSING: a source labelling no
+/// data structure, a source format that is not one of the three 32-bit ones, a source scaled on no
+/// stick dim, a ds type whose stick order is not exactly one dim, and the *"can only be done when
+/// sending data from LXLU to SFP"* route. ⛔ THE `replicationFactor_ != 8` AND `!broadcastNeeded`
+/// arms are here too, and those two ARE the reference's own `continue`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplatCandidate {
+    transfer: NodeId,
+}
+
+impl SplatCandidate {
+    /// The candidate, or [`None`] for an external transfer, a replication factor other than eight, a
+    /// broadcast every layout already states, and each collapsed check.
+    #[must_use]
+    pub fn of<S: Splat4bRead + ?Sized>(
+        tree: &S,
+        metadata: &Metadata,
+        transfer: NodeId,
+    ) -> Option<Self> {
+        InternalNode::of(metadata, transfer)?;
+        let node = ScheduleSurgery::transfer(tree, transfer);
+        if node.replication_factor != ReplicationFactor(8) {
+            return None;
+        }
+        let lds = node.src.data.my_lds_idx?;
+        match tree.lds_data_format(lds)? {
+            DataFormat::IeeeFp32 | DataFormat::IeeeInt32 | DataFormat::Senuint32 => {}
+            _ => return None,
+        }
+        if !tree.scale(lds).contains(&Scale::StickDim) {
+            return None;
+        }
+        let bcast_dim = match tree.ds_stick_dims(lds).0.as_slice() {
+            [(dim, _)] => *dim,
+            _ => return None,
+        };
+        if tree
+            .every_lds_scale_on(bcast_dim)
+            .into_iter()
+            .all(|scale| scale == Some(Scale::StickDim))
+        {
+            return None;
+        }
+        if node.src.unit != SenComponent::Lxlu
+            || node.src.storage != SenComponent::Lx
+            || node.dsts.first().unit != SenComponent::Sfp
+        {
+            return None;
+        }
+        Some(Self { transfer })
+    }
+}
+
+/// Replaces: e360_transformFor4BsplatRead
+///
+/// PUTS AN EXPLICIT SPLAT BETWEEN AN LXLU READ AND THE SFP REGISTER FILE (`:1766`): entry 250 moves
+/// any FIFO result into a register, then entry 340 mints one `compute_splat_4B_lxlu_<unit>` per
+/// destination and hands it that register file.
+///
+/// ⛔ DELIBERATE DIVERGENCE: a destination not on `SFPLRF`, and one entry 340 refuses, are SKIPPED —
+/// both abort in the reference and this pass has no refusal. ⚠️ TRAP: THE `SFPLRF` CHECK COMES AFTER
+/// ENTRY 250, which is what makes a FIFO destination pass it.
+pub fn transform_for_4b_splat_read<D>(
+    dsc: &mut D,
+    metadata: &mut Metadata,
+    exploration: DatastageExploration,
+) -> bool
+where
+    D: Splat4bRead + TransferWalk + ?Sized,
+{
+    let mut did_transformation = false;
+    for transfer in dsc.transfers() {
+        let Some(candidate) = SplatCandidate::of(&*dsc, metadata, transfer) else {
+            continue;
+        };
+        let transfer = candidate.transfer;
+
+        // `getNonMemoryResultIndex() != -1` — the transfer writes a FIFO, so entry 250 moves that
+        // result into a register file first and THAT is what satisfies the `SFPLRF` check below.
+        if ScheduleSurgery::transfer(dsc, transfer)
+            .dsts
+            .iter()
+            .any(|dst| !is_memory(dst.storage))
+        {
+            let fresh = dsc.free_alloc();
+            let Some(site) = FifoConversionSite::of(metadata, transfer, exploration) else {
+                continue;
+            };
+            if !convert_result_from_fifo_to_reg(dsc, metadata, site, fresh) {
+                continue;
+            }
+        }
+
+        let ends = ScheduleSurgery::transfer(dsc, transfer).dsts.len();
+        for index in 0..ends {
+            let body = ScheduleSurgery::transfer(dsc, transfer);
+            let Some(dst) = body.dsts.get(index).copied() else {
+                continue;
+            };
+            if dst.storage != SenComponent::Sfplrf {
+                continue;
+            }
+            let compute = dsc.mint_compute(ComputeNode {
+                name: NodeName(format!("compute_splat_4B_lxlu_{}", dst.unit.spelling())),
+                op: DdlComputeType::Splat,
+                ex_unit: dst.unit,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                num_folds_engaged: NumFolds::ONE,
+                data_format: Some(DataFormat::IeeeFp32),
+                instr_attribute: InstrAttribute::default(),
+            });
+            let at = DestIdx(u32::try_from(index).unwrap_or(u32::MAX));
+            let dest = TransferDest::of(metadata, transfer, &body, at);
+            let unplaced = UnplacedNode::of(&*dsc, compute);
+            if let Some((dest, unplaced)) = dest.zip(unplaced) {
+                let _ = insert_compute_between_transfer_and_reg(dsc, dest, unplaced, InputIdx(0));
+            }
+        }
+
+        did_transformation = true;
+    }
+    did_transformation
+}
 
 // crustify:todo: e376_performAutomaticShuffling
 //   authority : ddc/ddc_transformation.cpp:1855  (167 body lines, level 6)
@@ -4212,6 +4434,464 @@ mod tests_e338 {
         assert!(
             metadata.node_cloning_map.is_empty(),
             "an LXLU-to-LXSU transfer involves neither PE nor SFP, so nothing is cloned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e359_e360 {
+    // ⭐ TESTS FOR ENTRIES 359-360. Union this module with this file's other test modules when the
+    // rest of its entries land.
+    use super::*;
+    use crate::schedule::ddc::fold::StoredStream;
+    use crate::schedule::ddc::transformation_util::{
+        AllocationUse, CanDelete, DdcAllocateNode, LoopNode, PaddingForm, StreamDirection,
+        TransferEnds,
+    };
+    use crate::schedule::dsc2::{Dsc as Dsc2, Hops, LatchDataId};
+    use std::collections::BTreeMap;
+
+    fn operand(
+        unit: SenComponent,
+        storage: SenComponent,
+        connect: Option<DataConnect>,
+        lds: Option<u32>,
+    ) -> Operand {
+        Operand {
+            unit,
+            storage,
+            data: DataInfo {
+                data_connect: connect,
+                my_lds_idx: lds.map(LdsIdx),
+                constant_id: None,
+                latch_data_id: None,
+            },
+        }
+    }
+
+    fn compute_node(inputs: Vec<Operand>) -> ComputeNode {
+        ComputeNode {
+            name: NodeName("c".to_owned()),
+            op: DdlComputeType::Macc,
+            ex_unit: SenComponent::Sfp,
+            inputs,
+            outputs: Vec::new(),
+            num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
+        }
+    }
+
+    fn transfer_node(src: Operand, dsts: Dsts, replication: u64) -> TransferNode {
+        TransferNode {
+            name: NodeName("t".to_owned()),
+            src,
+            dsts,
+            replication_factor: ReplicationFactor(replication),
+            unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
+        }
+    }
+
+    /// Everything the two passes write, in call order.
+    #[derive(Default)]
+    struct Written {
+        dst_storage: Vec<(usize, SenComponent)>,
+        dst_latch: Vec<(usize, LatchDataId)>,
+        compute_inputs: Vec<(NodeId, usize, SenComponent)>,
+        compute_latch: Vec<(NodeId, usize, LatchDataId)>,
+        placed: Vec<NodeId>,
+        outputs: Vec<(NodeId, SenComponent)>,
+        inputs: Vec<(NodeId, InputIdx, SenComponent)>,
+    }
+
+    /// A tree holding ONE transfer at node 1, with its result's consumer census stated.
+    struct Skipping {
+        transfer: TransferNode,
+        consumers: Vec<FifoConsumer>,
+        opaque: bool,
+        scales: Vec<Scale>,
+        sticks: StickDims,
+        lds_format: Option<DataFormat>,
+        every_scale: Vec<Option<Scale>>,
+        minted: Vec<ComputeNode>,
+        written: Written,
+    }
+
+    impl TransferWalk for Skipping {
+        fn transfers(&self) -> Vec<NodeId> {
+            vec![NodeId(1)]
+        }
+        fn transfer(&self, _node: NodeId) -> TransferNode {
+            self.transfer.clone()
+        }
+    }
+
+    impl ScheduleSurgery for Skipping {
+        fn node_name(&self, _node: NodeId) -> NodeName {
+            NodeName::default()
+        }
+        fn set_node_name(&mut self, _node: NodeId, _name: NodeName) {}
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+        fn owner_loop(&self, _node: NodeId) -> Option<LoopId> {
+            None
+        }
+        fn transfer(&self, _node: NodeId) -> TransferNode {
+            self.transfer.clone()
+        }
+        fn loop_num(&self, _loop_node: LoopId) -> DatastageId {
+            unimplemented!("no loop is read")
+        }
+        fn loop_den(&self, _loop_node: LoopId) -> DatastageId {
+            unimplemented!("no loop is read")
+        }
+        fn loop_dims(&self, _loop_node: LoopId) -> LoopDims {
+            unimplemented!("no loop is read")
+        }
+        fn is_parametric(&self, _loop_node: LoopId) -> bool {
+            unimplemented!("no loop is read")
+        }
+        fn new_loop(&mut self, _loop_node: LoopNode) -> LoopId {
+            unimplemented!("no loop is minted")
+        }
+        fn new_block(&mut self, _name: NodeName) -> NodeId {
+            unimplemented!("no block is minted")
+        }
+        fn add_child_node(&mut self, node: NodeId, _at: InsertionPoint) {
+            self.written.placed.push(node);
+        }
+        fn move_node(&mut self, _node: NodeId, _at: InsertionPoint) {
+            unimplemented!("nothing is moved")
+        }
+        fn conditions_under(&self, _root: NodeId) -> Vec<NodeId> {
+            Vec::new()
+        }
+        fn loop_cond(&self, _condition: NodeId) -> LoopCondComposite {
+            unimplemented!("no condition is read")
+        }
+        fn set_loop_cond(&mut self, _condition: NodeId, _cond: LoopCondComposite) {}
+    }
+
+    impl FifoResults for Skipping {
+        fn connect_consumers(&self, _connect: Option<DataConnect>) -> Vec<FifoConsumer> {
+            self.consumers.clone()
+        }
+        fn is_opaque(&self, _compute: NodeId) -> bool {
+            self.opaque
+        }
+        fn transfer_ends(&self, _transfer: NodeId) -> TransferEnds {
+            unimplemented!("no allocation is minted")
+        }
+        fn insert_allocate(&mut self, _alloc: AllocId, _node: DdcAllocateNode, _at: InsertionPoint) {
+            unimplemented!("no allocation is minted")
+        }
+        fn set_dst_storage(&mut self, _transfer: NodeId, dst: usize, storage: SenComponent) {
+            self.written.dst_storage.push((dst, storage));
+        }
+        fn set_src_storage(&mut self, _transfer: NodeId, _storage: SenComponent) {
+            unimplemented!("no transfer consumes this result")
+        }
+        fn set_compute_input_unit(&mut self, compute: NodeId, input: usize, unit: SenComponent) {
+            self.written.compute_inputs.push((compute, input, unit));
+        }
+        fn add_alloc_user(&mut self, _alloc: AllocId, _user: NodeId) {}
+    }
+
+    impl SkipRegResults for Skipping {
+        fn set_dst_latch_data_id(&mut self, _transfer: NodeId, dst: usize, id: LatchDataId) {
+            self.written.dst_latch.push((dst, id));
+        }
+        fn set_src_latch_data_id(&mut self, _transfer: NodeId, _id: LatchDataId) {
+            unimplemented!("no transfer consumes this result")
+        }
+        fn set_compute_input_latch_data_id(
+            &mut self,
+            compute: NodeId,
+            input: usize,
+            id: LatchDataId,
+        ) {
+            self.written.compute_latch.push((compute, input, id));
+        }
+        fn remove_alloc_use(&mut self, _alloc_use: AllocationUse) {}
+        fn set_sole_compute_output(&mut self, compute: NodeId, unit: SenComponent, _data: DataInfo) {
+            self.written.outputs.push((compute, unit));
+        }
+        fn resize_compute_inputs_to(
+            &mut self,
+            compute: NodeId,
+            input: InputIdx,
+            unit: SenComponent,
+            _data: DataInfo,
+        ) {
+            self.written.inputs.push((compute, input, unit));
+        }
+    }
+
+    impl Dsc2 for Skipping {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            unimplemented!("no layout is read")
+        }
+    }
+
+    impl DscAllocations for Skipping {
+        fn own_lds_idx(&self, _lds: LdsIdx) -> LdsIdx {
+            unimplemented!("no lds is renamed")
+        }
+        fn allocation_in(&self, _origin: DataOrigin, _storage: DdcMemory) -> Option<AllocId> {
+            Some(AllocId(9))
+        }
+        fn set_allocation_in(&mut self, _lds: LdsIdx, _storage: DdcMemory, _alloc: AllocId) {
+            unimplemented!("no allocation is placed")
+        }
+        fn alloc_users(&self, _alloc: AllocId) -> Vec<NodeId> {
+            vec![NodeId(1)]
+        }
+        fn alloc_component(&self, _alloc: AllocId) -> DdcMemory {
+            unimplemented!("no allocation is reached")
+        }
+        fn alloc_origin(&self, _alloc: AllocId) -> DataOrigin {
+            unimplemented!("no allocation is reached")
+        }
+        fn alloc_node(&self, _alloc: AllocId) -> NodeId {
+            unimplemented!("no allocation is reached")
+        }
+        fn reduce_users_or_delete(&mut self, _use: AllocationUse, _can: CanDelete) -> bool {
+            unimplemented!("no allocation is deleted")
+        }
+    }
+
+    impl Allocations for Skipping {
+        fn allocation(&self, _stored: StoredStream) -> Option<AllocId> {
+            None
+        }
+        fn value_allocation(&self, _scale: AllocId) -> Option<AllocId> {
+            None
+        }
+    }
+
+    impl AllocationPaddings for Skipping {
+        fn padding(&self, _alloc: AllocId) -> PaddingForm {
+            unimplemented!("no allocation is minted")
+        }
+    }
+
+    impl ExternalStreams for Skipping {
+        fn storage_or_datastream_is_external(
+            &self,
+            _data: DataInfo,
+            _storage: SenComponent,
+            _direction: StreamDirection,
+        ) -> bool {
+            false
+        }
+    }
+
+    impl ScopeTree for Skipping {
+        fn ancestry(&self, _transfer: NodeId, _consumer: NodeId) -> Ancestry {
+            unimplemented!("an LXLUVALUE destination is answered before any scope is walked")
+        }
+        fn scope_node(&self, _node: NodeId) -> ScopeNode {
+            unimplemented!("an LXLUVALUE destination is answered before any scope is walked")
+        }
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            unimplemented!("an LXLUVALUE destination is answered before any scope is walked")
+        }
+        fn non_broadcast_lds_dims(&self, _lds: Option<LdsIdx>) -> BTreeSet<PrimaryDim> {
+            unimplemented!("an LXLUVALUE destination is answered before any scope is walked")
+        }
+    }
+
+    impl TransferLoads for Skipping {
+        fn corelets(&self) -> Vec<Corelet> {
+            unimplemented!("an LXLUVALUE destination is answered before any load is counted")
+        }
+        fn block_transfer_loads(&self, _transfer: NodeId, _corelet: Corelet) -> Loads {
+            unimplemented!("an LXLUVALUE destination is answered before any load is counted")
+        }
+    }
+
+    impl LabeledDs for Skipping {
+        fn scale(&self, _lds: LdsIdx) -> Vec<Scale> {
+            self.scales.clone()
+        }
+        fn ds_type(&self, _lds: LdsIdx) -> DsType {
+            unimplemented!("the ds type is only reached through its stick order")
+        }
+    }
+
+    impl DsSticks for Skipping {
+        fn ds_stick_dims(&self, _lds: LdsIdx) -> StickDims {
+            self.sticks.clone()
+        }
+    }
+
+    impl Splat4bRead for Skipping {
+        fn lds_data_format(&self, _lds: LdsIdx) -> Option<DataFormat> {
+            self.lds_format
+        }
+        fn every_lds_scale_on(&self, _dim: PrimaryDim) -> Vec<Option<Scale>> {
+            self.every_scale.clone()
+        }
+        fn mint_compute(&mut self, node: ComputeNode) -> NodeId {
+            self.minted.push(node);
+            NodeId(7)
+        }
+        fn free_alloc(&self) -> AllocId {
+            AllocId(9)
+        }
+    }
+
+    /// `dataStageParam_`, which an LXLUVALUE destination is answered without ever reaching.
+    struct Stages;
+
+    impl StageExtents for Stages {
+        fn stage_extent(&self, _stage: DatastageId, _dim: PrimaryDim) -> Extent {
+            unimplemented!("an LXLUVALUE destination is answered before any extent is compared")
+        }
+    }
+
+    /// An LXLU transfer whose ONE destination is an `LXLUVALUE` result read by one compute.
+    fn one_lxlu_value_result(opaque: bool) -> Skipping {
+        Skipping {
+            transfer: transfer_node(
+                operand(
+                    SenComponent::Lxlu,
+                    SenComponent::Lx,
+                    Some(DataConnect::PeHtOut),
+                    Some(0),
+                ),
+                Dsts::new(
+                    operand(
+                        SenComponent::Lxluvalue,
+                        SenComponent::Lxlu,
+                        Some(DataConnect::PeHtOut),
+                        Some(1),
+                    ),
+                    Vec::new(),
+                ),
+                1,
+            ),
+            consumers: vec![FifoConsumer::Compute(
+                NodeId(2),
+                compute_node(vec![operand(
+                    SenComponent::Lxlu,
+                    SenComponent::Lxlu,
+                    Some(DataConnect::PeHtOut),
+                    Some(1),
+                )]),
+            )],
+            opaque,
+            scales: Vec::new(),
+            sticks: StickDims::default(),
+            lds_format: None,
+            every_scale: Vec::new(),
+            minted: Vec::new(),
+            written: Written::default(),
+        }
+    }
+
+    /// e359: entry 243 admits every LXLUVALUE destination, so a single-consumer one becomes a LATCH
+    /// carrying one shared id — and an OPAQUE consumer refuses the very same destination.
+    #[test]
+    fn a_sole_non_opaque_consumer_latches_the_result_and_an_opaque_one_refuses_it() {
+        let mut metadata = Metadata::default();
+        let mut ids = LatchDataIds::default();
+
+        let mut latching = one_lxlu_value_result(false);
+        assert!(transform_reg_to_fifo_or_latch(
+            &mut latching,
+            Some(&Stages),
+            &mut metadata,
+            &mut ids
+        ));
+        assert_eq!(
+            latching.written.dst_storage,
+            vec![(0, SenComponent::Latch)],
+            "the destination now writes the latch"
+        );
+        assert_eq!(latching.written.dst_latch, vec![(0, LatchDataId(0))]);
+        assert_eq!(
+            latching.written.compute_inputs,
+            vec![(NodeId(2), 0, SenComponent::Latch)],
+            "and its one consumer reads the latch"
+        );
+        assert_eq!(
+            latching.written.compute_latch,
+            vec![(NodeId(2), 0, LatchDataId(0))],
+            "under the producer's own id"
+        );
+
+        let mut opaque = one_lxlu_value_result(true);
+        assert!(!transform_reg_to_fifo_or_latch(
+            &mut opaque,
+            Some(&Stages),
+            &mut metadata,
+            &mut ids
+        ));
+        assert!(opaque.written.dst_storage.is_empty());
+        assert!(opaque.written.dst_latch.is_empty());
+    }
+
+    /// e360: the LXLU→SFP read is split in two — the transfer writes its last hop and a fresh
+    /// `SPLAT` writes the SFP register file, which is what makes the 4-byte broadcast explicit.
+    #[test]
+    fn an_lxlu_read_that_still_needs_a_broadcast_gains_a_splat_onto_the_register_file() {
+        let mut splatting = Skipping {
+            transfer: transfer_node(
+                operand(SenComponent::Lxlu, SenComponent::Lx, None, Some(0)),
+                Dsts::new(
+                    operand(SenComponent::Sfp, SenComponent::Sfplrf, None, Some(1)),
+                    Vec::new(),
+                )
+                .with_hops(vec![Hops(vec![SenComponent::L0, SenComponent::Sfp])]),
+                8,
+            ),
+            consumers: Vec::new(),
+            opaque: false,
+            scales: vec![Scale::StickDim],
+            sticks: StickDims(vec![(PrimaryDim::X, Elements(8))]),
+            lds_format: Some(DataFormat::IeeeFp32),
+            // One labelled DS does NOT span the stick on `X`, so the broadcast is still needed.
+            every_scale: vec![Some(Scale::StickDim), None],
+            minted: Vec::new(),
+            written: Written::default(),
+        };
+        let mut metadata = Metadata::default();
+
+        assert!(transform_for_4b_splat_read(
+            &mut splatting,
+            &mut metadata,
+            DatastageExploration::Open
+        ));
+
+        let minted = splatting.minted.first().expect("one splat per destination");
+        assert_eq!(minted.name, NodeName("compute_splat_4B_lxlu_sfp".to_owned()));
+        assert_eq!(minted.op, DdlComputeType::Splat);
+        assert_eq!(minted.ex_unit, SenComponent::Sfp);
+        assert_eq!(minted.data_format, Some(DataFormat::IeeeFp32));
+
+        assert_eq!(splatting.written.placed, vec![NodeId(7)]);
+        assert_eq!(
+            splatting.written.outputs,
+            vec![(NodeId(7), SenComponent::Sfplrf)],
+            "the splat writes the register file the transfer used to"
+        );
+        assert_eq!(
+            splatting.written.inputs,
+            vec![(NodeId(7), InputIdx(0), SenComponent::Sfp)],
+            "and reads the last hop"
+        );
+        assert_eq!(
+            splatting.written.dst_storage,
+            vec![(0, SenComponent::Sfp)],
+            "which is what the transfer now writes"
         );
     }
 }

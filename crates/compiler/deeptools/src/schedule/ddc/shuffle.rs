@@ -1704,6 +1704,64 @@ impl ShuffleAction {
             )],
         }
     }
+
+    /// `action->act(layout)` (`shuffle.h:229`) — the virtual the search crosses an edge with, over
+    /// all eight subclasses (e141, e144, e146, e148, e149, e151, e153, e155).
+    #[must_use]
+    pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
+        match self {
+            Self::Merge(action) => action.act(input),
+            Self::Pack(action) => action.act(input),
+            Self::ShiftLeft(action) => action.act(input),
+            Self::Pack8(action) => action.act(input),
+            Self::Pack9(action) => action.act(input),
+            Self::Pack24(action) => action.act(input),
+            Self::GcvtF16F8Pack(action) => action.act(input),
+            Self::GcvtF16F8Merge(action) => action.act(input),
+        }
+    }
+
+    /// `action->cost(layout)` (`shuffle.h:230`) — Dijkstra's edge weight for this offer.
+    ///
+    /// ⭐ FIVE ARMS ARE INLINE BECAUSE THEY HAVE NO ENTRY OF THEIR OWN: EXCLUSIONS.tsv carries
+    /// `PackAction`, `Pack8Action`, `Pack24Action`, `GCVTF16F8PackAction` and
+    /// `GCVTF16F8MergeAction`'s `cost` as 3-line `field_accessor`s (`shuffle.cpp:362`, `:486`,
+    /// `:584`, `:627`, `:672`), and all five are one instruction per two input sticks; the three
+    /// that do are delegated to (e142, e147, e150).
+    /// ⛔ INTEGER DIVISION, AS THE REFERENCE HAS IT: a one-stick layout costs 0, not 0.5.
+    #[must_use]
+    pub fn cost(&self, input: &AbstractLayout) -> ShuffleCost {
+        match self {
+            Self::Merge(action) => action.cost(input),
+            Self::ShiftLeft(action) => action.cost(input),
+            Self::Pack9(action) => action.cost(input),
+            Self::Pack(_)
+            | Self::Pack8(_)
+            | Self::Pack24(_)
+            | Self::GcvtF16F8Pack(_)
+            | Self::GcvtF16F8Merge(_) => ShuffleCost((input.num_sticks().0 / 2) as f64),
+        }
+    }
+
+    /// `action->out_format(in_format, goal)` (`shuffle.h:232`) — the format this offer leaves the
+    /// sticks in, absent where it cannot be applied to `in_format` at all.
+    ///
+    /// ⛔ THE BASE IS THE INPUT FORMAT UNCHANGED (`shuffle.h:233-234`) and only the two GCVT actions
+    /// override it (`shuffle.cpp:633`, `:678`), so [`None`] — e362's *"Illegal format applied to
+    /// action"* — is reachable from those two alone.
+    #[must_use]
+    pub fn out_format(&self, in_format: DataFormat, goal: &AbstractLayout) -> Option<DataFormat> {
+        match self {
+            Self::GcvtF16F8Pack(_) => GCVTF16F8PackAction::out_format(in_format, goal),
+            Self::GcvtF16F8Merge(_) => GCVTF16F8MergeAction::out_format(in_format, goal),
+            Self::Merge(_)
+            | Self::Pack(_)
+            | Self::ShiftLeft(_)
+            | Self::Pack8(_)
+            | Self::Pack9(_)
+            | Self::Pack24(_) => Some(in_format),
+        }
+    }
 }
 
 /// ONE STEP OF A SHUFFLE — a graph node TOGETHER WITH the action that reached it, which is what
@@ -1730,13 +1788,12 @@ pub struct ShuffleStep {
 pub struct GraphNodeId(usize);
 
 /// ONE LAYOUT REACHED BY THE SEARCH, with Dijkstra's bookkeeping (`shuffle.h:238-256`).
-///
-/// ⛔ `prev_action` IS REDUCED HERE: the reference's `std::shared_ptr<ShuffleAction>` needs the
-/// action family as one type, which e343 mints. Nothing this batch fills reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphNode {
     /// The layout this node stands for.
     pub layout: AbstractLayout,
+    /// `prev_action` — the action the search crossed to reach here, absent at the origin.
+    pub prev_action: Option<ShuffleAction>,
     /// The node this one was reached from, absent at the origin.
     pub previous_node: Option<GraphNodeId>,
     /// Best cost known from the origin to here — `INFINITY` until first relaxed.
@@ -1753,6 +1810,7 @@ impl GraphNode {
     pub const fn new(layout: AbstractLayout) -> Self {
         Self {
             layout,
+            prev_action: None,
             previous_node: None,
             cost_origin_to_here: ShuffleCost(f64::INFINITY),
             heuristic_cost_here_to_goal: ShuffleCost(0.0),
@@ -2646,12 +2704,78 @@ impl AutoShuffler {
     }
 }
 
-// crustify:todo: e362_get_shuffle
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:1161  (61 body lines, level 4)
-//   class     : AutoShuffler
-//   original  : std::vector<std::shared_ptr<GraphNode>> AutoShuffler::get_shuffle( const AbstractLayout& input, const AbstractLayout& output)
-//   extract   : crustify-ddc/cpp/ddc.cpp:14312-14374
-//   calls     : e141_act, e142_cost, e144_act, e146_act, e147_cost, e148_act, e149_act, e150_cost, e151_act, e153_act, e155_act, e157_get_node, e160_update_worklist, e266_canonicalize_layout …
+impl AutoShuffler {
+    /// Replaces: e362_get_shuffle
+    ///
+    /// THE CHEAPEST ACTION SEQUENCE FROM ONE ABSTRACT LAYOUT TO ANOTHER — Dijkstra over the layout
+    /// graph from the input canonicalized against the goal, read back off the predecessor chain.
+    ///
+    /// ⛔ [`None`] IS BOTH OF THE REFERENCE'S STOPS — *"Requested layout not reachable."* (`:1218`)
+    /// and *"Illegal format applied to action"* (`:1195`); this crate does not runtime refuse and
+    /// this file already answers with [`Option`] (e270, e342).
+    pub fn get_shuffle(
+        &mut self,
+        input: &AbstractLayout,
+        output: &AbstractLayout,
+    ) -> Option<Vec<ShuffleStep>> {
+        self.reset_graph();
+
+        let origin = self.get_node(&Self::canonicalize_layout(input, output));
+        self.node_mut(origin).cost_origin_to_here = ShuffleCost(0.0);
+        self.update_worklist(origin);
+
+        // Dijkstras
+        while let Some(entry) = self.pop_worklist() {
+            if self.node(entry.node).finalized {
+                continue;
+            }
+            self.node_mut(entry.node).finalized = true;
+
+            // "If this node implements our goal, we are done. Due to canonicalization we shouldn't
+            // have to worry about inexact matches (i.e. [][abcd] is a valid implementation of
+            // [][aXcX])"
+            let layout = self.node(entry.node).layout.clone();
+            if layout == *output {
+                break;
+            }
+            let cost_here = self.node(entry.node).cost_origin_to_here;
+
+            for action in Self::get_legal_transforms(&layout, output) {
+                let mut neighbor_layout = action.act(&layout);
+                neighbor_layout.format = action.out_format(layout.format, output)?;
+                let cost_to_neighbor = ShuffleCost(cost_here.0 + action.cost(&layout).0);
+                let neighbor = self.get_node(&neighbor_layout);
+
+                if cost_to_neighbor.0 < self.node(neighbor).cost_origin_to_here.0 {
+                    let relaxed = self.node_mut(neighbor);
+                    relaxed.cost_origin_to_here = cost_to_neighbor;
+                    relaxed.previous_node = Some(entry.node);
+                    relaxed.prev_action = Some(action);
+                    self.update_worklist(neighbor);
+                }
+            }
+        }
+
+        let goal = self.get_node(output);
+        if !self.node(goal).finalized {
+            return None;
+        }
+
+        let mut shuffle = Vec::new();
+        let mut at = goal;
+        // The reference's `while (node->previous_node != nullptr)`, reading the step's action out of
+        // the same node so a [`ShuffleStep`] cannot exist without one.
+        while let (Some(previous), Some(action)) = {
+            let node = self.node(at);
+            (node.previous_node, node.prev_action.clone())
+        } {
+            shuffle.push(ShuffleStep { node: at, action });
+            at = previous;
+        }
+        shuffle.reverse();
+        Some(shuffle)
+    }
+}
 
 // crustify:todo: e371_replace_assign
 //   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:788  (119 body lines, level 5)
@@ -4286,5 +4410,66 @@ mod tests_e342_e343 {
                 "r3 = packmerge r0 r1 [ 1 17 3 19 5 21 7 23 9 25 11 27 13 29 15 31 ]".to_owned(),
             ])
         );
+    }
+}
+
+// ⭐ TESTS FOR ENTRY 362. Union this module with this file's other test modules when the rest of the
+// search's entries land.
+#[cfg(test)]
+mod tests_e362 {
+    use super::{
+        AbstractLayout, AutoShuffler, DIMS_PER_SLICE, DimSymbol, MergeAction, MergeDim, ShuffleCost,
+        ShuffleAction,
+    };
+    use crate::formats::DataFormat;
+    use std::collections::BTreeSet;
+
+    /// Symbols 1 and 2 — `getDefaultSymbol()` and its successor.
+    const A: DimSymbol = DimSymbol::DEFAULT;
+    const B: DimSymbol = A.next();
+    const DUMMY: DimSymbol = DimSymbol::DUMMY;
+
+    /// A layout with the given stick dimensions and slice, in `Senint8`.
+    fn layout(sticks: &[DimSymbol], slice: [DimSymbol; DIMS_PER_SLICE]) -> AbstractLayout {
+        AbstractLayout::new(
+            sticks.iter().copied().collect::<BTreeSet<_>>(),
+            slice,
+            DataFormat::Senint8,
+        )
+    }
+
+    /// The goal one merge away: the first offer of the first-explored family reaches it, and the
+    /// walk returns that single step carrying the action it crossed.
+    #[test]
+    fn the_shuffle_is_the_predecessor_chain_in_origin_to_goal_order() {
+        let input = layout(&[A], [DUMMY; DIMS_PER_SLICE]);
+        let output = layout(&[], [DUMMY, DUMMY, A, DUMMY, DUMMY, DUMMY]);
+
+        let mut shuffler = AutoShuffler::new();
+        let shuffle = shuffler
+            .get_shuffle(&input, &output)
+            .expect("one merge reaches the goal");
+
+        assert_eq!(shuffle.len(), 1);
+        assert_eq!(
+            shuffle[0].action,
+            ShuffleAction::Merge(MergeAction::new(A, MergeDim::Bit8, DUMMY))
+        );
+        assert_eq!(shuffler.node(shuffle[0].node).layout, output);
+        // Two sticks, one instruction per two of them.
+        assert_eq!(
+            shuffler.node(shuffle[0].node).cost_origin_to_here,
+            ShuffleCost(1.0)
+        );
+    }
+
+    /// *"Requested layout not reachable."* — canonicalization drops the input's only dimension
+    /// because the goal does not hold it, and nothing the empty layout can do mints one.
+    #[test]
+    fn a_goal_naming_a_dimension_the_input_lacks_is_unreachable() {
+        let input = layout(&[A], [DUMMY; DIMS_PER_SLICE]);
+        let output = layout(&[], [DUMMY, DUMMY, B, DUMMY, DUMMY, DUMMY]);
+
+        assert_eq!(AutoShuffler::new().get_shuffle(&input, &output), None);
     }
 }

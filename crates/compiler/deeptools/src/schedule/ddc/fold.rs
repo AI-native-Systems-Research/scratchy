@@ -169,8 +169,8 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, SliceElems, Stage, StickDims, StickPart, cumulative_stick_sizes,
 };
 use crate::generated::DataConnect;
-use crate::schedule::ddc::RefRole;
-use crate::schedule::ddc::metadata::MetaDimKind;
+use crate::schedule::ddc::{CoordPropTracker, NodeNames, Propagation, RefRole};
+use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, Metadata};
 use crate::schedule::ddc::transformation::Scale;
 use crate::schedule::ddc::transformation_util::{LoopNode, PaddingForm, PrimaryDimAndKind};
 use crate::schedule::dsc2;
@@ -442,7 +442,10 @@ pub fn layout_dims_from_node(dsc: &impl Dsc, node: Node<'_>, pos: OperandPos) ->
 ///
 /// ⛔ The reference's `refCoord` argument is never read (`ddc/ddc_fold.cpp:190-198`).
 #[must_use]
-pub fn need_to_consider_row_bundling<S: Stage>(core_ds: &S, working_dims: &[PrimaryDim]) -> bool {
+pub fn need_to_consider_row_bundling<S: Stage + ?Sized>(
+    core_ds: &S,
+    working_dims: &[PrimaryDim],
+) -> bool {
     PrimaryDim::ALL
         .into_iter()
         .find(|&dim| core_ds.is_row_split(dim))
@@ -739,6 +742,20 @@ impl FoldLabel {
             Self::ElemArrScaleUp => "elem_arr_scaleup",
         }
     }
+
+    /// The read-back of [`Self::spelling`] — `None` for the open spellings the propagation units
+    /// write (`"elem_arr_<n>"`, `"<loop> <dim>"`), which no closed label can carry.
+    #[must_use]
+    pub fn of_spelling(text: &str) -> Option<Self> {
+        match text {
+            "corelet_fold_dim" => Some(Self::CoreletFoldDim),
+            "core_workslice_fold_dim" => Some(Self::CoreWorksliceFoldDim),
+            "elem_arr_layout_split" => Some(Self::ElemArrLayoutSplit),
+            "rowsplit_fold" => Some(Self::RowSplitFold),
+            "elem_arr_scaleup" => Some(Self::ElemArrScaleUp),
+            _ => None,
+        }
+    }
 }
 
 /// ONE FOLD LEVEL — `dsc2::FoldParamInfoType` (`dsc/dsc2.h:1081`).
@@ -829,6 +846,17 @@ pub trait LoopLevels {
     /// `++loopInfo.at(dim).relatedElemArrLevel` for EVERY loop whose `dim` entry sits at or inside
     /// `level` (`ddc/ddc_fold.cpp:376-381`) — one insert shifted them all by one.
     fn bump_levels_at_or_inside(&mut self, dim: PrimaryDim, level: ElemArrLevel);
+
+    /// `loopParamInfo[loopNode][dim] = {alpha, beta, relatedElemArrLevel}`
+    /// (`ddc/ddc_fold.cpp:2811-2817`) — the link entry 356 records ITSELF, because no distribution
+    /// runs for a propagation onto an allocation and so nothing else would record one.
+    fn record_loop_level(
+        &mut self,
+        loop_node: &LoopNode,
+        dim: PrimaryDim,
+        decided: DistributedLoop,
+        level: ElemArrLevel,
+    );
 }
 
 /// AN ALLOCATE NODE'S LAYOUT — `layoutDimOrder_` zipped with `maxDimSizes_`
@@ -1244,10 +1272,10 @@ pub fn build_spatial_fold<S: CoreStage + ?Sized, C: Coordinate + ?Sized>(
 mod tests_e086_e093 {
     use super::{
         AllocId, AllocLayout, Allocations, Alpha, Beta, BlockId, Cardinality, CoordPropInfo,
-        Coordinate, CoordinateCategory, CoreStage, DataOrigin, DataStream, ElemArrFolds,
-        ElemArrLevel, Fold, FoldLabel, FoldParamInfo, Incoming, IncomingStreams, LdsIdx,
-        LoopLevels, NodeId, NodeKind, PadType, PropEnd, ScaledLds, ScheduleTree, SizeStage,
-        StoredStream, Stride, build_spatial_fold, combine_contigous_levels,
+        Coordinate, CoordinateCategory, CoreStage, DataOrigin, DataStream, DistributedLoop,
+        ElemArrFolds, ElemArrLevel, Fold, FoldLabel, FoldParamInfo, Incoming, IncomingStreams,
+        LdsIdx, LoopLevels, LoopNode, NodeId, NodeKind, PadType, PropEnd, ScaledLds, ScheduleTree,
+        SizeStage, StoredStream, Stride, build_spatial_fold, combine_contigous_levels,
         construct_alloc_elem_arr_layout, find_common_ancestor, is_allocate_incoming,
         match_data_stream, num_elements_in_pt_slice, order_descendants,
     };
@@ -1349,6 +1377,15 @@ mod tests_e086_e093 {
     impl LoopLevels for Bumps {
         fn bump_levels_at_or_inside(&mut self, dim: PrimaryDim, level: ElemArrLevel) {
             self.0.push((dim, level));
+        }
+
+        fn record_loop_level(
+            &mut self,
+            _loop_node: &LoopNode,
+            _dim: PrimaryDim,
+            _decided: DistributedLoop,
+            _level: ElemArrLevel,
+        ) {
         }
     }
 
@@ -1762,6 +1799,39 @@ pub trait AffineFoldDims {
     fn dim_label(&self, dim: usize) -> Option<FoldLabel>;
 }
 
+/// ⭐ THE READ SIDE OF THE SEAM MEETS THE CONCRETE COORDINATE, as `impl Coordinate for
+/// dsc2::Coordinate` is the write side: the fold builders gather their params off the coordinate the
+/// schedule tree actually carries.
+///
+/// ⛔ TOTAL WHERE `getFoldDimSize(pos)` THROWS: an index past the last level answers
+/// `FoldParamInfoType`'s own defaults, and [`AffineFoldDims::num_dims`] is the only bound any caller
+/// here derives an index from.
+/// ⚠️ AN OPEN LABEL READS BACK AS [`None`] — the closed set cannot spell `"elem_arr_<c>"` or
+/// `"corelet_fold"`, which is why [`PropagatedLevel`] carries the string beside it.
+impl AffineFoldDims for dsc2::FoldDim {
+    fn num_dims(&self) -> usize {
+        self.folds().count()
+    }
+
+    fn alpha_beta(&self, dim: usize) -> (Alpha, Beta) {
+        self.folds().nth(dim).map_or((Alpha(1), Beta(0)), |fold| {
+            (Alpha(fold.alpha.0), Beta(fold.beta.0))
+        })
+    }
+
+    fn dim_size(&self, dim: usize) -> Cardinality {
+        self.folds()
+            .nth(dim)
+            .map_or(Cardinality(1), |fold| Cardinality(fold.cardinality.0.into()))
+    }
+
+    fn dim_label(&self, dim: usize) -> Option<FoldLabel> {
+        self.folds()
+            .nth(dim)
+            .and_then(|fold| FoldLabel::of_spelling(&fold.label.0))
+    }
+}
+
 /// Replaces: e094_getDefaultRowSplitFold
 ///
 /// THE IDENTITY ROWSPLIT FOLD — one fold index, contributing no coordinate at all
@@ -2015,6 +2085,7 @@ pub enum TransferDirection {
 
 /// THE PROPAGATION'S NON-ALLOC END — `coordPropInfo.refNode`'s `nodeType_` reduced to the three arms
 /// entry 241 distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefNode<'a> {
     /// `COMPUTE`.
     Compute {
@@ -4964,26 +5035,2211 @@ where
     }
 }
 
-// crustify:todo: e356_buildFoldForAllocation
-//   authority : ddc/ddc_fold.cpp:2395  (473 body lines, level 4)
-//   class     : Ddc
-//   original  : bool Ddc::buildFoldForAllocation( dsc2::CoordPropInfoType &coordPropInfo, const dsc2::CoordinateType<CoordinateBaseType> &inputRefCoord, dsc2::AllocateNode *allocNode)
-//   extract   : crustify-ddc/cpp/ddc.cpp:12521-12997
-//   calls     : e062_getEnclosingLoopsAndRelatedDims, e074_retry, e078_dbgPrint, e079_dbgPrint, e080_allDimsCovered, e085_needToConsiderRowBundling, e089_constructAllocElemArrLayout, e092_getNumElementsInPTSlice, e094_getDefaultRowSplitFold, e095_gatherFoldParams, e233_dbgPrint, e234_scaleUpCoord, e235_scaleDownCoord, e237_sameCoordinateRange …
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE THREE FOLD BUILDERS' SHARED VOCABULARY — entries 356, 357 and 358 each dispatch on the
+// reference node's kind, and every one of the nine arms opens with the SAME row-bundling gate.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 
-// crustify:todo: e357_buildFoldForCompute
-//   authority : ddc/ddc_fold.cpp:3656  (773 body lines, level 4)
-//   class     : Ddc
-//   original  : bool Ddc::buildFoldForCompute(dsc2::ComputeNode *computeNode, dsc2::CoordPropInfoType &coordPropInfo, std::vector<int> &constructedInputCoords, std::vector<int> &constructedOutputCoords)
-//   extract   : crustify-ddc/cpp/ddc.cpp:13007-13783
-//   calls     : e074_retry, e078_dbgPrint, e079_dbgPrint, e080_allDimsCovered, e081_buildFoldForBroadcastDim, e082_getCompRowId, e085_needToConsiderRowBundling, e104_clear, e233_dbgPrint, e234_scaleUpCoord, e235_scaleDownCoord, e236_needNonRowBundling, e238_getRelatedComputeCoord, e298_buildFoldFromAllocation …
+/// A NODE'S ENCLOSING LOOPS — `getEnclosingLoops(node)`, INNERMOST FIRST and THE NODE ITSELF FIRST
+/// when it is a loop, which is what [`NonAllocTarget::row_bundling`] reads (`:8768-8778`).
+///
+/// ⛔ A CAPABILITY AND NOT A WITNESS FIELD: the node asked about is
+/// `refRowGroup.commonGroupAncestor`, which the row-bundling gate only discovers mid-call.
+pub trait EnclosingLoops {
+    /// The loops enclosing a node, innermost first.
+    fn enclosing_loops(&self, node: NodeId) -> Vec<&LoopNode>;
 
-// crustify:todo: e358_buildFoldForTransfer
-//   authority : ddc/ddc_fold.cpp:4433  (289 body lines, level 4)
-//   class     : Ddc
-//   original  : bool Ddc::buildFoldForTransfer(dsc2::TransferNode *transferNode, dsc2::CoordPropInfoType &coordPropInfo)
-//   extract   : crustify-ddc/cpp/ddc.cpp:13793-14083
-//   calls     : e074_retry, e078_dbgPrint, e079_dbgPrint, e082_getCompRowId, e085_needToConsiderRowBundling, e122_isNodeRelatedToComps, e178_getAccessPattern, e233_dbgPrint, e238_getRelatedComputeCoord, e298_buildFoldFromAllocation, e299_buildFoldFromNonAllocRef, e337_gatherRelatedPTRows
+    /// `getEnclosingLoopsAndRelatedDims(currDsc, node, chain, loopsBelowChunkBoundary,
+    /// buildCoreletFold)` — the same walk with each loop's dim and distribution tag, which is what
+    /// [`TemporalLoopDistribution::related_loops`] then filters per dim.
+    ///
+    /// ⛔ THE CORELET-FOLD REQUEST IS AN ARGUMENT AND NOT A FIELD: entry 356 decides it from the
+    /// allocation's own external-node state and work slices, and it is the only thing that puts a
+    /// [`LoopDistribution::CoreletSlice`] entry in the chain.
+    fn enclosing_loop_chain(&self, node: NodeId, build_corelet_fold: bool) -> Vec<LoopAndDim<'_>>;
+}
+
+/// `dsc2::computeLoopElemOffsetsFromCoordinates(currDsc, node, coord, refAllocNode, loopParams,
+/// dimsToPropagate, ..)` — the one effect entries 356-358's ALLOCATE arms perform besides the fold.
+///
+/// ⛔ A CAPABILITY AND NOT A DROP. It writes each loop's element offset back onto the node, so a
+/// port that omitted it would be the documented-predicate failure this campaign forbids; it is not a
+/// unit of this campaign, so the effect is declared here and supplied from outside.
+pub trait LoopElemOffsets {
+    /// Records the loop element offsets a node's freshly built coordinate implies, against the
+    /// allocation it was propagated from.
+    fn compute_loop_elem_offsets(
+        &mut self,
+        node: NodeId,
+        coord: &dsc2::Coordinate,
+        alloc: NodeId,
+        dims: &[PrimaryDim],
+    );
+}
+
+/// THE AMBIENT STATE THE THREE FOLD BUILDERS READ — `Ddc`'s own members, which the reference reaches
+/// through `this` and a port has to be handed.
+pub struct FoldContext<'a, D, S: ?Sized, T: ?Sized, L: ?Sized, E: ?Sized, N: ?Sized> {
+    /// `currDsc`.
+    pub dsc: &'a D,
+    /// `currDsc->dataStageParam_.at(metadata.core_dstgid)`.
+    pub core_ds: &'a S,
+    /// The schedule tree the row walk descends.
+    pub tree: &'a T,
+    /// What decides whether a loop is relevant to a dim, and how a slice is distributed.
+    pub distribution: &'a L,
+    /// A node's enclosing loop chain.
+    pub ancestors: &'a E,
+    /// `name_`, which only the retry's threshold message reads.
+    pub names: &'a N,
+    /// `metadata`.
+    pub meta: &'a Metadata,
+}
+
+/// `refRowGroup` AS THE TWO PROPAGATORS TAKE IT — the group entry 337 found with the
+/// `commonGroupAncestor` beside it, which [`NonAllocTarget::row_bundling`] is derived from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefRowGroup {
+    /// `nodeInfo` with its category, absent for the empty group [`RowGroup`] cannot spell.
+    pub group: Option<RowGroup>,
+    /// `commonGroupAncestor`, absent where no group was collected at all.
+    pub ancestor: Option<NodeId>,
+}
+
+/// `refRowGroup` from what entry 337 answered.
+///
+/// ⛔ AN EMPTY GROUP IS AN ABSENT ONE, as [`RowGroup`]'s own note says: the reference's
+/// default-constructed `RowGroupInfo` and one whose `nodeInfo` was replaced by an empty list reach
+/// the two propagators identically, and both read `nodeInfo.at(0)` before any category test.
+fn ref_row_group(found: PtRowGrouping) -> RefRowGroup {
+    match found {
+        PtRowGrouping::NoBundling => RefRowGroup::default(),
+        PtRowGrouping::SameRow(_, node) => RefRowGroup {
+            group: Some(RowGroup::new(
+                RowGroupCategory::RowToSameRow,
+                node,
+                Vec::new(),
+            )),
+            ancestor: None,
+        },
+        PtRowGrouping::Bundled(
+            cat,
+            RelatedPtRows::Group {
+                nodes,
+                common_ancestor,
+            },
+        ) => {
+            let mut nodes = nodes.into_iter();
+            RefRowGroup {
+                group: nodes
+                    .next()
+                    .map(|first| RowGroup::new(cat, first, nodes.collect())),
+                ancestor: Some(common_ancestor),
+            }
+        }
+        // `NO_BUNDLING` overwrites the category and the other two leave `nodeInfo` empty.
+        PtRowGrouping::Bundled(..) => RefRowGroup::default(),
+    }
+}
+
+/// THE ROW-BUNDLING SCAN'S ARGUMENTS THAT DO NOT DEPEND ON A COORDINATE — everything
+/// `gatherRelatedPTRows(refRowGroup, coordPropInfo, <a coordinate>)` needs besides that coordinate.
+///
+/// ⛔ APART FROM [`RowBundling`] BECAUSE ENTRY 356 PRODUCES ITS OWN GATE COORDINATE: its reference
+/// coordinate is a local copy the scale-down rewrites, so no caller can hand one over.
+pub struct RowBundlingScan<'a, F: AffineFoldDims + ?Sized> {
+    /// `propSrcUnit`/`propDestUnit`, resolved off both ends by [`PtRowPropagation::of`].
+    pub units: PtRowPropagation,
+    /// `coordPropInfo.refNode`'s tree identity.
+    pub ref_node: NodeId,
+    /// The nodes the reference's DFS offered, scanned from both sides.
+    pub candidates: RowCandidates<'a, F>,
+    /// `sdscWkSlices`.
+    pub sdsc_slices: &'a WorkSlices,
+}
+
+/// THE ROW-BUNDLING GATE'S ARGUMENTS — `needToConsiderRowBundling(coreDs, <a coordinate>,
+/// dimsToPropagate) && !gatherRelatedPTRows(refRowGroup, coordPropInfo, <that coordinate>)`, spelled
+/// identically in all nine of entries 356-358's dispatch arms.
+///
+/// ⛔ TWO COORDINATES, NOT ONE, AND A PORT CANNOT FUSE THEM: the gate asks `effectiveRefCoord` while
+/// the `retry` beside it charges `refAllocNode->allocateCoordinates_.getTensorDims()`
+/// (`ddc/ddc_fold.cpp:4501-4509`). ⭐ Entry 085 never reads the coordinate it is handed, so only the
+/// RETRY's dims are a field here.
+pub struct RowBundling<'a, F: AffineFoldDims + ?Sized> {
+    /// Everything the scan needs that the coordinate does not decide.
+    pub scan: RowBundlingScan<'a, F>,
+    /// `effectiveRefCoord` / `refTransferNode->transferCoordinates_` / `refCoordinate`.
+    pub ref_coord: RowCoordinate<'a, F>,
+    /// `getTensorDims()` OF THE COORDINATE THE RETRY NAMES, which is not always the gate's.
+    pub retry_dims: &'a [PrimaryDim],
+}
+
+/// The gate, and the retry it charges where the group cannot be collected. [`None`] IS THE CALLER'S
+/// `return false` — the propagation has already been re-queued by then.
+fn gated_row_group<A, D, S, T, N, F>(
+    dsc: &D,
+    core_ds: &S,
+    tree: &T,
+    names: &N,
+    tracker: &mut CoordPropTracker,
+    prop: &Propagation,
+    dims_to_propagate: &[PrimaryDim],
+    scan: &RowBundlingScan<'_, F>,
+    ref_coord: &RowCoordinate<'_, F>,
+    retry_dims: &[PrimaryDim],
+) -> Option<RefRowGroup>
+where
+    A: Arch,
+    D: Dsc + Allocations,
+    S: Stage + ?Sized,
+    T: ScheduleTree + ?Sized,
+    N: NodeNames + ?Sized,
+    F: AffineFoldDims + ?Sized,
+{
+    if !need_to_consider_row_bundling(core_ds, dims_to_propagate) {
+        // `refRowGroup` stays default-constructed; the gate never writes it.
+        return Some(RefRowGroup::default());
+    }
+    match gather_related_pt_rows::<A, D, S, T, F>(
+        dsc,
+        core_ds,
+        tree,
+        &prop.ends,
+        scan.units,
+        scan.ref_node,
+        ref_coord,
+        prop.scale_down,
+        &scan.candidates,
+        scan.sdsc_slices,
+    ) {
+        Some(found) => Some(ref_row_group(found)),
+        None => {
+            // Could not collect PT-row group. Schedule the propagation to retry later.
+            tracker.retry(names, *prop, retry_dims);
+            None
+        }
+    }
+}
+
+/// `propRefComp` FOR A NON-ALLOCATION REFERENCE — ⛔ THE TWO KINDS SPELL IT DIFFERENTLY, which is
+/// the only thing past the coordinate selection that distinguishes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonAllocPropComp {
+    /// `TRANSFER` — BOTH ends of the reference transfer. Entry 358 names its OWN source where the
+    /// reference produces and `src` only where it consumes (`:4562`); entry 357, having no source
+    /// of its own, names `dst` when the reference produces and reads both to find a PT row
+    /// (`:13152-13166`).
+    TransferEnds {
+        /// `refTransferNode->src_.unit_`.
+        src: SenComponent,
+        /// `refTransferNode->dstVias_.at(0).loc_.unit_`.
+        dst: SenComponent,
+    },
+    /// `COMPUTE` — `refComputeNode->exUnit_`, whatever the role (`:4589`).
+    ComputeUnit(SenComponent),
+}
+
+/// WHICH KIND OF REFERENCE THE PROPAGATION COMES FROM, pre-resolved except for `sizeRefComp`,
+/// `propRefComp` and `refRowGroup`, which the fold builder itself derives.
+pub enum FoldReferenceKind<'a, 'l, F: AffineFoldDims + ?Sized> {
+    /// `ALLOCATE`.
+    Allocate {
+        /// `refAllocNode`'s tree identity.
+        node: NodeId,
+        /// `refAllocNode->ldsIdx_`.
+        lds: LdsIdx,
+        /// `refAllocNode->component_`, which entry 357 kludges to the compute node's own unit for
+        /// a PT-row reference (`:13103-13107`).
+        component: SenComponent,
+        /// `effectiveRefCoord.coordinates_` ∩ `dimsToPropagate` with BOTH of the allocation's
+        /// coordinates per dim — [`AllocCoordinates::effective`] is entry 298's own choice off
+        /// `sizeRefComp`, so nothing here selects the slice view.
+        dims: Vec<(PrimaryDim, AllocCoordinates<'a, F>)>,
+        /// `allocateCoordinates_.coreIdToWkSlice_`.
+        work_slices: &'a WorkSlices,
+        /// `labeledDs_.at(ldsIdx_).scale_` per dim.
+        dim_scales: BTreeMap<PrimaryDim, Scale>,
+        /// `coreletSplitDim`.
+        corelet_split_dim: Option<PrimaryDim>,
+    },
+    /// `TRANSFER` or `COMPUTE` — ONE arm, because everything the propagator needs past the
+    /// coordinate selection is shared and [`NonAllocPropComp`] carries the one difference.
+    ///
+    /// ⭐ `getRelatedComputeCoord` (entry 238) IS THE CALLER'S: in this unit its `refInputPos`,
+    /// `refOutputPos` and `selectedLdsIdx` are all written and never read, so it serves only to
+    /// reach the reference coordinate, and reaching an operand is the droppable mechanism.
+    NonAlloc {
+        /// `refNode`'s tree identity.
+        node: NodeId,
+        /// `refCoordinate.coordinates_` ∩ `dimsToPropagate`, each with its counts and padding.
+        dims: Vec<(PrimaryDim, CoordDim<'a, F>)>,
+        /// `refLds.scale_` per dim.
+        dim_scales: BTreeMap<PrimaryDim, Scale>,
+        /// `refNode`'s enclosing loops, INNERMOST FIRST and unfiltered.
+        loops: &'a [&'l LoopNode],
+        /// `propRefComp` as this kind spells it.
+        prop_comp: NonAllocPropComp,
+    },
+}
+
+/// THE REFERENCE SIDE OF ONE PROPAGATION — its kind and the gate its arm opens with.
+pub struct FoldReference<'a, 'l, F: AffineFoldDims + ?Sized> {
+    /// The row-bundling gate.
+    pub gate: RowBundling<'a, F>,
+    /// The kind.
+    pub kind: FoldReferenceKind<'a, 'l, F>,
+    /// `refCoordinate.getPadding()` — the reference coordinate's WHOLE padding form, which entry
+    /// 357 copies onto the coordinate it folds before dispatching (`:13126`, `:13154`, `:13202`).
+    ///
+    /// ⛔ THE ALLOCATE ARM NAMES `allocateCoordinates_.getPadding()` and NOT the slice view its own
+    /// gate may have selected.
+    pub ref_padding: &'a PaddingForm,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ENTRY 356 — BUILDING AN ALLOCATION'S FOLD.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE DIM OF A CONCRETE COORDINATE AS THE FOLD SEAMS TAKE IT — the read side of
+/// `impl Coordinate for dsc2::Coordinate`, for the unit that holds a real coordinate rather than a
+/// caller-supplied witness. An uncovered dim is the absent fold manager [`CoordDim`] already spells.
+fn coord_dim_of(coord: &dsc2::Coordinate, dim: PrimaryDim) -> CoordDim<'_, dsc2::FoldDim> {
+    let folds = coord.fold_dim(dim);
+    CoordDim {
+        folds,
+        spatial: SpatialFolds(folds.map_or(0, dsc2::FoldDim::spatial_folds)),
+        temporal: TemporalFolds(folds.map_or(0, dsc2::FoldDim::temporal_folds)),
+        pad: coord.padding(dim),
+    }
+}
+
+/// [`gather_fold_params`] BESIDE THE OPEN LABEL EACH LEVEL ACTUALLY CARRIES — entry 095's answer
+/// zipped with the `foldDimLabel` strings, because entry 356 hands the label it read to `addFold`
+/// verbatim and the closed [`FoldLabel`] set cannot spell `"elem_arr_<c>"` or `"corelet_fold"`.
+fn gather_propagated_levels(folds: &dsc2::FoldDim) -> Vec<PropagatedLevel> {
+    gather_fold_params(folds)
+        .into_iter()
+        .zip(folds.folds())
+        .map(|(level, fold)| PropagatedLevel {
+            level,
+            label: fold.label.0.clone(),
+        })
+        .collect()
+}
+
+/// The construction tail entry 356 ends each dim with (`:12883-12895`, `:12934-12946`): every level
+/// re-added at the FRONT so the list lands outermost first, categorised by where it sits.
+///
+/// ⛔ NOT [`add_propagated_folds`], WHICH RELABELS THE ELEMENT ARRANGEMENT: this unit passes each
+/// level's OWN label to the add site, having relabelled the elem-arr levels earlier and on ONE
+/// branch only (`:12823-12826`), so relabelling again here would rename the levels it did not.
+fn add_carried_folds(
+    coord: &mut dsc2::Coordinate,
+    dim: PrimaryDim,
+    levels: &[PropagatedLevel],
+    spatial_ends: i64,
+    temporal_ends: i64,
+) {
+    for (at, level) in levels.iter().enumerate().rev() {
+        let pos = i64::try_from(at).unwrap_or(i64::MAX);
+        let category = if pos > temporal_ends {
+            CoordinateCategory::ElemArr
+        } else if pos > spatial_ends {
+            CoordinateCategory::Temporal
+        } else {
+            CoordinateCategory::Spatial
+        };
+        add_labelled_fold(coord, dim, category, level.label.clone(), level.level);
+    }
+}
+
+/// THE MX SCALE PAIR AN L0 VALUE ALLOCATION IS BUILT FROM — the value tensor and BOTH coordinates of
+/// the allocation `getScaleAllocation(currDsc, allocNode)` finds behind it (`:12578`).
+///
+/// ⭐ THE LOOKUP IS DROPPED, NOT ITS ANSWER; [`MxValueTensor::of`] already carries the `VALUE_TENSOR`
+/// test, so only the `component_ == L0` half of the arm is left to spell in code.
+pub struct AllocScaleUp<'a> {
+    /// `allocLds.mxInfo_` as entry 234 takes it.
+    pub value: MxValueTensor,
+    /// `scaleAlloc->allocateCoordinates_`.
+    pub allocate: &'a dsc2::Coordinate,
+    /// `scaleAlloc->sliceViewCoordinates_`.
+    pub slice_view: &'a dsc2::Coordinate,
+}
+
+/// THE CONSISTENCY CHECK ENTRY 356 RUNS FOR A DIM THE ALLOCATION ALREADY COVERS (`:12952-12974`).
+///
+/// ⛔ PRESENT EXACTLY WHEN `refNode->nodeType_ == TRANSFER` AND ITS `transferCoordinates_
+/// .foldConstructed()` — the reference's two guards reach the same skip, and neither can be asked of
+/// a transfer coordinate the caller has not resolved.
+pub struct AllocFoldConsistency<'a> {
+    /// `transferNode` with `transferCoordinates_`, its work slices, and the cores of the unit
+    /// `refIsProducer` picks — `dstVias_.at(0).loc_.unit_` or `src_.unit_` (`:12960-12962`).
+    pub transfer: CoordSide<'a, dsc2::FoldDim>,
+    /// `allocNode->getRelevantCoreCl(comp)` for that same unit.
+    pub alloc_cores: BTreeMap<CoreOrdinal, BTreeSet<CoreletOrdinal>>,
+    /// `sdscWkSlices`.
+    pub sdsc_slices: &'a WorkSlices,
+    /// The broadcast dims of `allocNode->ldsIdx_`, which entry 237 excuses.
+    pub broadcast_dims: &'a BTreeSet<PrimaryDim>,
+}
+
+/// THE ALLOCATION ENTRY 356 BUILDS THE FOLD FOR — `allocNode` plus the `Ddc` members keyed on it.
+///
+/// ⛔ ITS `ldsIdx_ < 0` RETURN (`:12568`) IS DISCHARGED BY TYPE, as [`BaseAllocation`]'s is.
+pub struct AllocationFoldTarget<'a, Z: SizeStage + ?Sized> {
+    /// `allocNode`'s tree identity.
+    pub node: NodeId,
+    /// `ldsIdx_`.
+    pub lds: LdsIdx,
+    /// `component_`.
+    pub component: SenComponent,
+    /// `layoutDimOrder_` zipped with `maxDimSizes_` — BOTH the walk order (`:12638`) and entry 089's
+    /// own cap list, which is why one value serves.
+    pub layout: &'a AllocLayout,
+    /// `padding_`.
+    pub padding: &'a PaddingForm,
+    /// `allocateCoordinates_.coreIdToWkSlice_`.
+    pub work_slices: &'a WorkSlices,
+    /// `labeledDs_.at(ldsIdx_).scale_` per dim, absent where the layout order does not name the dim
+    /// — which the reference reads as a scale of 1 (`:12663`).
+    pub dim_scales: BTreeMap<PrimaryDim, Scale>,
+    /// The scale pair, present only for an MX value tensor.
+    pub scale_up: Option<AllocScaleUp<'a>>,
+    /// `labeledDs_.at(ldsIdx_).mxInfo_` where the allocation is an MX SCALE tensor, the only case
+    /// `scaleDownCoord(.., allocNode->ldsIdx_)` (`:12530`) does anything for.
+    pub scale_down: Option<MxScaleTensor>,
+    /// The stick dims of `ldsIdx_`, which entry 092 measures one PT slice over.
+    pub stick_dims: &'a StickDims,
+    /// `coreletSplitDim`, absent for its `PrimaryDimTypesCount`.
+    pub corelet_split_dim: Option<PrimaryDim>,
+    /// `getSizeDataStageForNode(allocNode, allocNode).ss_`, as entry 089 reads it.
+    pub size_stage: &'a Z,
+    /// `refNode`'s kind, which entry 241 derives both components from.
+    pub ref_kind: RefNode<'a>,
+    /// The consistency check, where there is one to run.
+    pub consistency: Option<AllocFoldConsistency<'a>>,
+}
+
+/// Replaces: e356_buildFoldForAllocation
+///
+/// Propagates a transfer's or a compute's coordinate ONTO an allocation: per layout dim the
+/// reference's own levels with the row split recomputed and the surplus temporal levels turned into
+/// element arrangement, added to both the allocate and the slice-view coordinate.
+///
+/// ⛔ THE REFERENCE COORDINATE IS A LOCAL COPY THE SCALE-DOWN REWRITES (`:12527-12534`), so this
+/// takes the coordinate itself and not a witness over it — a borrow taken before the rewrite reads
+/// the stale folds. ⛔ FIVE `panic!`s CARRY FIVE REFERENCE ABORTS; none of them is a refusal.
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference reads eleven `Ddc` members and a port is handed each one"
+)]
+pub fn build_fold_for_allocation<A, D, S, T, L, E, N, Z>(
+    ctx: &FoldContext<'_, D, S, T, L, E, N>,
+    alloc: &AllocationFoldTarget<'_, Z>,
+    prop: &Propagation,
+    dims_to_propagate: &[PrimaryDim],
+    gate: &RowBundlingScan<'_, dsc2::FoldDim>,
+    input_ref_coord: &dsc2::Coordinate,
+    input_ref_slices: &WorkSlices,
+    coord: &mut dsc2::Coordinate,
+    slice_view: &mut dsc2::Coordinate,
+    tracker: &mut CoordPropTracker,
+    loop_params: &mut L::LoopParams,
+) -> bool
+where
+    A: Arch,
+    D: Dsc + Allocations,
+    S: Stage + ?Sized,
+    T: ScheduleTree + ?Sized,
+    L: LoopRelevance + ?Sized,
+    L::LoopParams: LoopLevels,
+    E: EnclosingLoops + ?Sized,
+    N: NodeNames + ?Sized,
+    Z: SizeStage + ?Sized,
+{
+    let mut ref_coord = input_ref_coord.clone();
+    if prop.scale_down == crate::schedule::ddc::ScaleDown::Yes {
+        if let Some(scale) = alloc.scale_down {
+            // Compress the coordinates of the scale tensor along the MX dimension.
+            let _compressed = scale_down_coord(
+                &scale,
+                &coord_dim_of(input_ref_coord, scale.dim),
+                &mut ref_coord,
+            );
+        }
+    }
+
+    // `refNodeCoordinates.getTensorDims()` OF THE LOCAL COPY, which is what both retries charge.
+    let retry_dims: Vec<PrimaryDim> = ref_coord.iter().map(|(dim, _)| dim).collect();
+    let Some(row_group) = gated_row_group::<A, D, S, T, N, dsc2::FoldDim>(
+        ctx.dsc,
+        ctx.core_ds,
+        ctx.tree,
+        ctx.names,
+        tracker,
+        prop,
+        dims_to_propagate,
+        gate,
+        &RowCoordinate {
+            dims: ref_coord.iter().collect(),
+            work_slices: input_ref_slices,
+        },
+        &retry_dims,
+    ) else {
+        return false;
+    };
+
+    let alloc_chain = ctx.ancestors.enclosing_loop_chain(alloc.node, false);
+    if alloc.component == SenComponent::L0 {
+        if let Some(up) = &alloc.scale_up {
+            if !coord.covers(up.value.dim) {
+                // The value tensor's coordinates on L0 are constructed from the coordinates of the
+                // corresponding scale tensor allocation on L0_SCALE.
+                if !up.allocate.covers(up.value.dim) {
+                    // The scale coordinates are not built yet. Retry the propagation later.
+                    tracker.retry(ctx.names, *prop, &retry_dims);
+                    return false;
+                }
+                scale_up_coord(
+                    &up.value,
+                    &coord_dim_of(up.allocate, up.value.dim),
+                    coord,
+                    alloc.node,
+                    alloc.component,
+                    ctx.distribution,
+                    &alloc_chain,
+                    loop_params,
+                );
+                scale_up_coord(
+                    &up.value,
+                    &coord_dim_of(up.slice_view, up.value.dim),
+                    slice_view,
+                    alloc.node,
+                    alloc.component,
+                    ctx.distribution,
+                    &alloc_chain,
+                    loop_params,
+                );
+            }
+        }
+    }
+
+    // An external allocation with the default work slicing takes the corelet loop one level lower.
+    let lower_corelet_loop = ctx.meta.external_nodes.contains(&alloc.node)
+        && alloc.corelet_split_dim.is_some()
+        && alloc.work_slices.0.is_empty();
+    let ref_chain = ctx
+        .ancestors
+        .enclosing_loop_chain(prop.ref_node, lower_corelet_loop);
+
+    if alloc.padding.stated().next().is_some() {
+        coord.set_padding_form(alloc.padding.stated());
+    } else {
+        let carried: Vec<(PrimaryDim, PadType)> = ref_coord.padding_form().collect();
+        coord.set_padding_form(carried);
+    }
+    // `loopDistributionParamInfo[refNode][allocNode]` (`:12621`) is the one `loop_params` the caller
+    // hands over for this very pair, so the reference's bare touch is already discharged.
+
+    let mut processed: BTreeSet<PrimaryDim> = BTreeSet::new();
+    for &(dim, _) in &alloc.layout.0 {
+        if !dims_to_propagate.contains(&dim) || !ref_coord.covers(dim) {
+            continue;
+        }
+        // A dim may appear more than once in the allocation's layout order.
+        if !processed.insert(dim) {
+            continue;
+        }
+        let alloc_fold_already_exists = coord.covers(dim);
+        let ref_folds = ref_coord.fold_dim(dim);
+        let mut levels = ref_folds.map(gather_propagated_levels).unwrap_or_default();
+        // ⛔ `foldParams.at(FOLD_POS_CORELET)` and `.at(FOLD_POS_ROWSPLIT)` index the role slots
+        // directly (`:12690`, `:12716`), so a fold list too short for them throws in the reference.
+        if levels.len() <= FoldPosition::RowSplit.index() {
+            panic!(
+                "[buildFoldForAllocation] the coordinate of {} carries no role folds for {}.",
+                ctx.names.name(prop.ref_node),
+                dim.spelling(),
+            );
+        }
+        let count = |folds: u32| usize::try_from(folds).unwrap_or(usize::MAX);
+        let num_spatial_ref = count(ref_folds.map_or(0, dsc2::FoldDim::spatial_folds));
+        let num_temporal_ref = count(ref_folds.map_or(0, dsc2::FoldDim::temporal_folds))
+            + usize::from(lower_corelet_loop);
+        let mut orig_elem_arr_ref = count(ref_folds.map_or(0, dsc2::FoldDim::elem_arr_folds));
+
+        // Note: dim is of type PrimaryDimTypes, metaDimKind is missing here.
+        let curr_dim = PrimaryDimAndKind {
+            dim,
+            kind: MetaDimKind::Unpadded,
+        };
+        let scale_is_non_broadcast = |scale| matches!(scale, Scale::Sized(scale) if scale > 0.0);
+        let non_broadcast = alloc
+            .dim_scales
+            .get(&dim)
+            .copied()
+            .is_none_or(scale_is_non_broadcast);
+        let mut related_for_alloc: Vec<LoopAndDim<'_>> = Vec::new();
+        let mut related_for_ref: Vec<LoopAndDim<'_>> = Vec::new();
+        if non_broadcast {
+            related_for_alloc =
+                ctx.distribution
+                    .related_loops(curr_dim, &alloc_chain, alloc.padding.padding(dim));
+            related_for_ref =
+                ctx.distribution
+                    .related_loops(curr_dim, &ref_chain, ref_coord.padding(dim));
+            if lower_corelet_loop && alloc.corelet_split_dim == Some(dim) {
+                let Some(corelet_pos) = related_for_ref
+                    .iter()
+                    .position(|walked| walked.distribution == LoopDistribution::CoreletSlice)
+                else {
+                    panic!(
+                        "[buildFoldForAllocation] Could not find corelet_slice loop in the \
+                         loop-chain of {}.",
+                        ctx.names.name(prop.ref_node),
+                    );
+                };
+                // Move the corelet fold to a new temporal position just inside the chunk loops, and
+                // leave the corelet slot itself a single no-op trip.
+                let corelet = levels[FoldPosition::Corelet.index()].level;
+                let at = (num_spatial_ref + corelet_pos).min(levels.len());
+                levels.insert(
+                    at,
+                    PropagatedLevel {
+                        level: corelet,
+                        label: "corelet_fold".to_owned(),
+                    },
+                );
+                levels[FoldPosition::Corelet.index()] = PropagatedLevel {
+                    level: FoldParamInfo {
+                        alpha: Alpha(0),
+                        beta: Beta(0),
+                        cardinality: Cardinality(1),
+                        label: None,
+                    },
+                    label: "corelet_fold".to_owned(),
+                };
+            }
+        }
+
+        // The allocateNode sits in the same loop as the refNode or above it.
+        if num_temporal_ref < related_for_alloc.len() {
+            panic!(
+                "[buildFoldForAllocation] {} has more loops related to {} than {} has temporal \
+                 folds.",
+                ctx.names.name(alloc.node),
+                dim.spelling(),
+                ctx.names.name(prop.ref_node),
+            );
+        }
+        let mut num_temporal_alloc = num_temporal_ref;
+
+        let Some(row_fold) =
+            compute_params_for_row_split_fold::<A, S>(ctx.core_ds, dim, row_group.group.as_ref())
+        else {
+            panic!(
+                "[buildFoldForAllocation] the PT-row group of {} cannot be folded over {}.",
+                ctx.names.name(prop.ref_node),
+                dim.spelling(),
+            );
+        };
+        let row_bundling_needed = ctx.core_ds.is_row_split(dim)
+            && row_group.group.as_ref().map_or(0, RowGroup::count)
+                == usize::try_from(A::PT_ROWS).unwrap_or(usize::MAX);
+        if !row_bundling_needed
+            || matches!(alloc.component, SenComponent::Ptxrf | SenComponent::Ptarf)
+        {
+            levels[FoldPosition::RowSplit.index()] = propagated_level(row_fold);
+        } else {
+            // Bundling coordinates from PT-rows: the spatial row fold becomes the no-op, and a
+            // virtual row fold goes just inside the temporal fold of the innermost loop common to
+            // the reference node and its row siblings.
+            levels[FoldPosition::RowSplit.index()] = propagated_level(default_row_split_fold());
+            let ancestor_loop = row_group.ancestor.and_then(|ancestor| {
+                ctx.ancestors
+                    .enclosing_loops(ancestor)
+                    .into_iter()
+                    .find(|walked| {
+                        ctx.distribution
+                            .loop_relevant_for_dim(dim, walked, ref_coord.padding(dim))
+                    })
+            });
+            let Some(ancestor_loop) = ancestor_loop else {
+                panic!(
+                    "[buildFoldForAllocation] (RefNode={}, workingNode={}Failed to find common \
+                     ancestor loop for PT-row bundling.",
+                    ctx.names.name(prop.ref_node),
+                    ctx.names.name(alloc.node),
+                );
+            };
+            // ⛔ THE REFERENCE COMPARES LOOP POINTERS (`:12746`); [`LoopNode`] carries no identity of
+            // its own, so this is value equality, as every other loop lookup in this file is.
+            if let Some(found) = related_for_ref
+                .iter()
+                .position(|walked| walked.loop_node == ancestor_loop)
+            {
+                // ⚠️ The reference's `begin() + ..` can run past the end, which this clamps.
+                let at = (num_spatial_ref + num_temporal_ref)
+                    .saturating_sub(found)
+                    .min(levels.len());
+                levels.insert(at, propagated_level(row_fold));
+                orig_elem_arr_ref += 1;
+            }
+        }
+
+        // If the allocateNode is above the refNode, the temporal folds between them become element
+        // arrangement. This assumes stores at the destination are linear, which holds below LX.
+        if num_temporal_ref > related_for_alloc.len() {
+            num_temporal_alloc = related_for_alloc.len();
+            let mut num_elem_arr_alloc =
+                orig_elem_arr_ref + num_temporal_ref - num_temporal_alloc;
+            if alloc_fold_already_exists {
+                // The existing element arrangement cannot change — other nodes' loops may already
+                // be tied to specific levels of it — so simulate a distribution over it instead.
+                let allocate = coord_dim_of(coord, dim);
+                let slice = slice_view.fold_constructed();
+                let slice_view: &dsc2::Coordinate = slice_view;
+                let propagation = AllocPropagation {
+                    alloc: BaseAllocation {
+                        component: alloc.component,
+                        lds: alloc.lds,
+                        coordinates: AllocCoordinates {
+                            allocate,
+                            slice_view: slice.then(|| coord_dim_of(slice_view, dim)),
+                        },
+                        dim_scale: alloc.dim_scales.get(&dim).copied(),
+                    },
+                    ref_node: prop.ref_node,
+                    ref_kind: alloc.ref_kind,
+                    streams: &prop.ends,
+                };
+                relate_loops_to_alloc_elem_arr::<D, L, dsc2::FoldDim>(
+                    ctx.dsc,
+                    ctx.distribution,
+                    &propagation,
+                    dim,
+                    ref_coord.padding(dim),
+                    &ref_chain,
+                    loop_params,
+                );
+            } else {
+                // First-time construction: relate the loops enclosing the reference node to the
+                // element arrangement levels of the allocate node.
+                //
+                //   Ref Fold  :  0 1 2 3 4 5 6
+                //                S S T T T T E
+                //   Alloc Fold:  S S T T E E E
+                //     For loops related to positions [4-5]
+                //       loop_elem_arr_level = foldNumDims - i - 1
+                let fold_dim_count = i64::try_from(levels.len()).unwrap_or(i64::MAX);
+                let spatial = i64::try_from(num_spatial_ref).unwrap_or(i64::MAX);
+                let related_count = i64::try_from(related_for_ref.len()).unwrap_or(i64::MAX);
+                let mut curr_elem_arr_level = orig_elem_arr_ref;
+                let mut at = fold_dim_count - i64::try_from(orig_elem_arr_ref).unwrap_or(0) - 1;
+                let ends = fold_dim_count - i64::try_from(num_elem_arr_alloc).unwrap_or(0);
+                while at >= ends {
+                    // The related chain runs INNER to OUTER where the fold list runs outer to inner.
+                    let related_index = related_count - (at - spatial) - 1;
+                    let level = usize::try_from(at)
+                        .ok()
+                        .and_then(|at| levels.get(at))
+                        .map(|level| level.level);
+                    let related = usize::try_from(related_index)
+                        .ok()
+                        .and_then(|at| related_for_ref.get(at));
+                    if let (Some(level), Some(related)) = (level, related) {
+                        loop_params.record_loop_level(
+                            related.loop_node,
+                            dim,
+                            DistributedLoop {
+                                alpha: level.alpha,
+                                beta: level.beta,
+                            },
+                            ElemArrLevel(u32::try_from(curr_elem_arr_level).unwrap_or(u32::MAX)),
+                        );
+                    }
+                    curr_elem_arr_level += 1;
+                    at -= 1;
+                }
+                let mut params: Vec<FoldParamInfo> =
+                    levels.iter().map(|level| level.level).collect();
+                let mut elem_arr =
+                    ElemArrFolds(u32::try_from(num_elem_arr_alloc).unwrap_or(u32::MAX));
+                let _split = construct_alloc_elem_arr_layout(
+                    alloc.size_stage,
+                    alloc.layout,
+                    dim,
+                    &mut params,
+                    &mut elem_arr,
+                    loop_params,
+                );
+                num_elem_arr_alloc = usize::try_from(elem_arr.0).unwrap_or(usize::MAX);
+                // ⭐ ENTRY 089 ONLY INSERTS INSIDE THE ELEMENT ARRANGEMENT, so every level outside
+                // it keeps both its position and its label; the rest are relabelled `elem_arr_<c>`
+                // from the innermost end, which is exactly what the reference does next.
+                let outer = params.len().saturating_sub(num_elem_arr_alloc);
+                levels = params
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &level)| PropagatedLevel {
+                        level,
+                        label: if at < outer {
+                            levels
+                                .get(at)
+                                .map_or_else(String::new, |old| old.label.clone())
+                        } else {
+                            format!("elem_arr_{}", params.len() - 1 - at)
+                        },
+                    })
+                    .collect();
+            }
+        } else if non_broadcast {
+            // Otherwise the two nodes must share their innermost loop relevant to the dim.
+            let innermost_ref = ctx
+                .ancestors
+                .enclosing_loops(prop.ref_node)
+                .into_iter()
+                .find(|walked| {
+                    ctx.distribution
+                        .loop_relevant_for_dim(dim, walked, ref_coord.padding(dim))
+                })
+                .cloned();
+            let innermost_alloc = ctx
+                .ancestors
+                .enclosing_loops(alloc.node)
+                .into_iter()
+                .find(|walked| {
+                    ctx.distribution
+                        .loop_relevant_for_dim(dim, walked, coord.padding(dim))
+                })
+                .cloned();
+            if innermost_alloc != innermost_ref {
+                panic!(
+                    "[buildFoldForAllocation] {} and {} do not share their innermost loop relevant \
+                     to {}.",
+                    ctx.names.name(alloc.node),
+                    ctx.names.name(prop.ref_node),
+                    dim.spelling(),
+                );
+            }
+        }
+
+        if alloc_fold_already_exists {
+            // Verification: an allocation with custom work slicing must span the same range as the
+            // transfer it was propagated from.
+            if let Some(check) = &alloc.consistency {
+                if !alloc.work_slices.0.is_empty() {
+                    let alloc_side = CoordSide {
+                        dims: coord.iter().collect(),
+                        work_slices: alloc.work_slices,
+                        cores: check.alloc_cores.clone(),
+                    };
+                    if !same_coordinate_range(
+                        &alloc_side,
+                        &check.transfer,
+                        check.sdsc_slices,
+                        check.broadcast_dims,
+                        DimCoverage::EveryDim,
+                    ) {
+                        panic!(
+                            "Coordinates of transfer {} and allocateNode {} are not consistent.",
+                            ctx.names.name(prop.ref_node),
+                            ctx.names.name(alloc.node),
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Construct the folds for the allocateNode.
+        let spatial_ends = i64::try_from(num_spatial_ref).unwrap_or(i64::MAX) - 1;
+        let temporal_ends = spatial_ends + i64::try_from(num_temporal_alloc).unwrap_or(i64::MAX);
+        add_carried_folds(coord, dim, &levels, spatial_ends, temporal_ends);
+
+        // Where the allocation needs a sliced view, build a separate fold for the sliced
+        // arrangement.
+        if matches!(alloc.component, SenComponent::L0 | SenComponent::L0Scale) {
+            if ctx.core_ds.is_row_split(dim) {
+                // Find the element arrangement level a single PT slice chunk ends in.
+                let target = num_elements_in_pt_slice::<A>(alloc.stick_dims, dim)
+                    .map_or(1, |elems| i64::try_from(elems.0).unwrap_or(i64::MAX));
+                let levels_count = i64::try_from(levels.len()).unwrap_or(i64::MAX);
+                let ends = levels_count
+                    - 1
+                    - i64::from(coord.fold_dim(dim).map_or(0, dsc2::FoldDim::elem_arr_folds));
+                let mut inner_card: i64 = 1;
+                let mut elem_arr_index = levels_count - 1;
+                while elem_arr_index > ends {
+                    let card = usize::try_from(elem_arr_index)
+                        .ok()
+                        .and_then(|at| levels.get(at))
+                        .map_or(1, |level| {
+                            i64::try_from(level.level.cardinality.0).unwrap_or(i64::MAX)
+                        });
+                    if inner_card.saturating_mul(card) > target {
+                        break;
+                    }
+                    inner_card = inner_card.saturating_mul(card);
+                    elem_arr_index -= 1;
+                }
+                // ⚠️ A list whose element arrangement never fills one slice chunk walks off the
+                // FRONT, where the reference reaches `.at(-1)` and throws.
+                let chunk = usize::try_from(elem_arr_index).ok();
+                let alpha = chunk
+                    .and_then(|at| levels.get(at))
+                    .map_or(Alpha(0), |level| level.level.alpha);
+                let row_split = FoldPosition::RowSplit.index();
+                levels[row_split].level.alpha = Alpha(if inner_card == 0 {
+                    0
+                } else {
+                    target.saturating_mul(alpha.0) / inner_card
+                });
+                levels[row_split].level.beta = Beta(0);
+                levels[row_split].level.cardinality = Cardinality(u64::from(A::PT_ROWS));
+                if let Some(level) = chunk.and_then(|at| levels.get_mut(at)) {
+                    let rows = u64::from(A::PT_ROWS).max(1);
+                    level.level.cardinality = Cardinality(level.level.cardinality.0.div_ceil(rows));
+                }
+            }
+            add_carried_folds(slice_view, dim, &levels, spatial_ends, temporal_ends);
+            slice_view.set_padding(dim, coord.padding(dim));
+        }
+    }
+
+    if all_dims_covered(ctx.dsc, coord, alloc.lds) {
+        coord.complete_fold_construction();
+        if slice_view.iter().next().is_some() {
+            slice_view.complete_fold_construction();
+        }
+    }
+    true
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ENTRY 358 — BUILDING A TRANSFER'S FOLD.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE END OF A TRANSFER AS ENTRY 358 READS IT — the operand with the allocation
+/// `getAllocation(di, storage, /*allowMissingAlloc=*/true)` finds behind it.
+///
+/// ⭐ THE LOOKUP IS DROPPED, NOT ITS ANSWER, and the allocation's `padding_` comes WITH it so that an
+/// allocation without its padding form is unspellable.
+pub struct TransferFoldEnd<'a> {
+    /// `src_` / `dstVias_.at(i)` zipped with its `..LdsAndLoopOffsets_` entry.
+    pub operand: Operand,
+    /// The allocation found behind it and that allocation's `padding_`, absent for `nullptr`.
+    pub alloc: Option<(AllocId, &'a PaddingForm)>,
+}
+
+/// A TRANSFER'S DESTINATIONS AS ENTRY 358 READS THEM — NON-EMPTY, so that neither of its two
+/// `dstVias_.at(0)` reads and neither `dstLdsAndLoopOffsets_.at(0)` read can throw.
+pub struct TransferFoldDsts<'a> {
+    /// `dstVias_.at(0)` — total.
+    pub first: TransferFoldEnd<'a>,
+    /// The remaining destinations, in `dstVias_` order.
+    pub rest: Vec<TransferFoldEnd<'a>>,
+}
+
+impl<'a> TransferFoldDsts<'a> {
+    /// Every destination in order.
+    pub fn iter(&self) -> impl Iterator<Item = &TransferFoldEnd<'a>> {
+        std::iter::once(&self.first).chain(self.rest.iter())
+    }
+}
+
+/// THE TRANSFER ENTRY 358 BUILDS THE FOLD FOR.
+pub struct TransferFold<'a, 'l> {
+    /// `transferNode`'s tree identity.
+    pub node: NodeId,
+    /// `src_` zipped with `srcLdsAndLoopOffsets_`, and its allocation.
+    pub src: TransferFoldEnd<'a>,
+    /// `dstVias_` zipped with `dstLdsAndLoopOffsets_`, and their allocations.
+    pub dsts: TransferFoldDsts<'a>,
+    /// `getNonBroadcastLdsDims(srcLdsAndLoopOffsets_.myLdsIdx_)`.
+    pub transfer_dims: &'a [PrimaryDim],
+    /// `transferSize_`, which the non-allocation propagator may need to override its element
+    /// arrangement from.
+    pub transfer_size: &'a BTreeMap<PrimaryDim, Cardinality>,
+    /// This transfer's own enclosing loops as [`AllocFoldTarget`] takes them — `loopChain` from
+    /// `getEnclosingLoopsAndRelatedDims`, INNERMOST FIRST.
+    pub alloc_loops: &'a [LoopAndDim<'l>],
+    /// The same loops as [`NonAllocTarget`] takes them, with their `loopsBelowChunkBoundary` tags.
+    pub non_alloc_loops: &'a [(&'l LoopNode, LoopDistribution)],
+    /// `getBlockTransferSizePerDim(*transferNode, transferComp, 0)`, ABSENT WHERE
+    /// `isNodeRelatedToComps(transferNode, {PE, SFP}, transferComp)` answered false.
+    ///
+    /// ⭐ ENTRY 122 FUSED INTO THE WITNESS: its `transferComp` is read only to key this one lookup,
+    /// so an absent map IS that `false` and the size needs no second seam.
+    pub pe_sfp_transfer_size: Option<&'a BTreeMap<PrimaryDim, Elements>>,
+}
+
+/// Replaces: e358_buildFoldForTransfer
+///
+/// Propagates one coordinate onto a transfer: its destination padding, then the reference's kind
+/// picks the propagator, then the PE-SFP split offset lands on the innermost element arrangement.
+///
+/// ⛔ FIVE OF THE SIX `false`s ARE "NOTHING TO PROPAGATE HERE" and one is the charged retry.
+/// ⚠️ AN EMPTY `dataConnect` MATCHES AN EMPTY ONE (`:4384`), so a transfer whose source states no
+/// connect, against a propagation that states none either, is read as REFERENCE-IS-SOURCE.
+#[must_use]
+pub fn build_fold_for_transfer<A, D, S, T, L, E, N, O, F>(
+    ctx: &FoldContext<'_, D, S, T, L, E, N>,
+    transfer: &TransferFold<'_, '_>,
+    prop: &Propagation,
+    dims_to_propagate: &[PrimaryDim],
+    reference: FoldReference<'_, '_, F>,
+    coord: &mut dsc2::Coordinate,
+    tracker: &mut CoordPropTracker,
+    loop_params: &mut L::LoopParams,
+    offsets: &mut O,
+) -> bool
+where
+    A: Arch,
+    D: Dsc + Allocations,
+    S: PropagatedFoldStage + ?Sized,
+    T: ScheduleTree + ?Sized,
+    L: LoopRelevance + ?Sized,
+    E: EnclosingLoops + ?Sized,
+    N: NodeNames + ?Sized,
+    O: LoopElemOffsets + ?Sized,
+    F: AffineFoldDims + ?Sized,
+{
+    let FoldReference { gate, kind, .. } = reference;
+    // Skipping external transfer.
+    if ctx.meta.external_nodes.contains(&transfer.node) {
+        return false;
+    }
+    // Skipping transfer from HBM, and skipping transfer to HBM.
+    if transfer.src.operand.storage == SenComponent::Hbm
+        || transfer
+            .dsts
+            .iter()
+            .any(|dst| dst.operand.storage == SenComponent::Hbm)
+    {
+        return false;
+    }
+
+    let meta_info = ctx.meta.datatransfers.get(&transfer.node);
+    let access = |dim| {
+        meta_info.and_then(|info| info.access_pattern_per_dim.get(&dim).copied())
+    };
+
+    let mut src_pad = PaddingForm::default();
+    if let Some((_, padding)) = transfer.src.alloc {
+        src_pad = padding.clone();
+    } else if meta_info.is_some() {
+        for &dim in transfer.transfer_dims {
+            if let Some(pattern) = access(dim) {
+                src_pad.set_padding(dim, pattern.from);
+            }
+        }
+    }
+
+    // Determine if reference is source or destination.
+    let ref_alloc = match prop.ends.ref_node {
+        PropEnd::Allocate { alloc, .. } => Some(alloc),
+        PropEnd::Compute { .. } | PropEnd::Other => None,
+    };
+    let names_ref = |end: &TransferFoldEnd<'_>| {
+        (ref_alloc.is_some() && end.alloc.map(|(alloc, _)| alloc) == ref_alloc)
+            || end.operand.data.data_connect == prop.ends.data_connect
+    };
+    let ref_is_src = names_ref(&transfer.src);
+
+    let mut dest_pad = PaddingForm::default();
+    let dest_pad_computed = transfer.dsts.iter().any(|dst| match dst.alloc {
+        Some((_, padding)) if padding.stated().next().is_some() => {
+            dest_pad = padding.clone();
+            true
+        }
+        _ => false,
+    });
+    if !dest_pad_computed && meta_info.is_some() {
+        for &dim in transfer.transfer_dims {
+            let pad = access(dim).map_or_else(|| src_pad.padding(dim), |pattern| pattern.to);
+            dest_pad.set_padding(dim, pad);
+        }
+    }
+    coord.set_padding_form(dest_pad.stated());
+
+    // Record whether coordinates for the pe-sfp split dimensions are already constructed.
+    let existing_pe_sfp: Vec<PrimaryDim> = ctx
+        .meta
+        .pe_sfp_split_dims
+        .iter()
+        .copied()
+        .filter(|&dim| coord.covers(dim))
+        .collect();
+
+    let Some(lds_for_prop) = transfer.dsts.first.operand.data.my_lds_idx.or_else(|| {
+        transfer
+            .src
+            .operand
+            .data
+            .my_lds_idx
+            .filter(|_| meta_info.is_some_and(|info| info.access_pattern_per_dim.is_empty()))
+    }) else {
+        // Most likely a transfer of constant. No coordinate is needed in that case.
+        return false;
+    };
+
+    let mut size_ref_comp = if ref_is_src {
+        transfer.src.operand.unit
+    } else {
+        match transfer.dsts.iter().find(|dst| names_ref(dst)) {
+            Some(dst) => dst.operand.unit,
+            // ⛔ `dstVias_.at(refPosInDest)` with `refPosInDest` still `-1`: no end of the transfer
+            // names the reference at all, and the reference indexes the vector with `size_t(-1)`.
+            // Reproduced as the abort it is, as `CoordPropTracker::retry`'s threshold is.
+            None => panic!(
+                "[buildFoldForTransfer] No end of the transfer names the reference {}.",
+                ctx.names.name(prop.ref_node),
+            ),
+        }
+    };
+    // Override the comp in case transfer is for a single PT row. Example: transfer from LXLU to
+    // PTRow4 — the coordinate should be for PT row 4 only.
+    let is_row = |comp| comp_row_id(comp).is_some();
+    if !is_row(size_ref_comp) {
+        if is_row(transfer.src.operand.unit) {
+            size_ref_comp = transfer.src.operand.unit;
+        } else if is_row(transfer.dsts.first.operand.unit) {
+            size_ref_comp = transfer.dsts.first.operand.unit;
+        }
+    }
+    // Override the comp in case transfer involves PE or SFP, to account for PE-SFP splitting. A comp
+    // already representing an individual PT row has higher priority than PE or SFP.
+    let is_pe_sfp = |comp| matches!(comp, SenComponent::Pe | SenComponent::Sfp);
+    if !is_row(size_ref_comp) && !is_pe_sfp(size_ref_comp) {
+        if is_pe_sfp(transfer.src.operand.unit) {
+            size_ref_comp = transfer.src.operand.unit;
+        } else if is_pe_sfp(transfer.dsts.first.operand.unit) {
+            size_ref_comp = transfer.dsts.first.operand.unit;
+        }
+    }
+
+    let Some(row_group) = gated_row_group::<A, D, S, T, N, F>(
+        ctx.dsc,
+        ctx.core_ds,
+        ctx.tree,
+        ctx.names,
+        tracker,
+        prop,
+        dims_to_propagate,
+        &gate.scan,
+        &gate.ref_coord,
+        gate.retry_dims,
+    ) else {
+        return false;
+    };
+
+    match kind {
+        FoldReferenceKind::Allocate {
+            node,
+            lds,
+            dims,
+            work_slices,
+            dim_scales,
+            corelet_split_dim,
+            ..
+        } => {
+            // TO DO: Try to find a more general checking. Skipping forward coordinate propagation
+            // for transfer to lxluScaledValue.
+            if transfer.dsts.first.operand.unit == SenComponent::Lxluvalue
+                && prop.ref_role == RefRole::Producer
+            {
+                return false;
+            }
+            let prop_comp = match prop.ref_role {
+                RefRole::Producer => transfer.src.operand.unit,
+                RefRole::Consumer => transfer.dsts.first.operand.unit,
+            };
+            let alloc = AllocationFold {
+                lds,
+                dims,
+                work_slices,
+                dim_scales,
+                propagated_dims: dims_to_propagate,
+                corelet_split_dim,
+                components: RefComponents {
+                    size: size_ref_comp,
+                    prop: prop_comp,
+                },
+                row_group: row_group.group.as_ref(),
+            };
+            let target = AllocFoldTarget {
+                node: transfer.node,
+                loops: transfer.alloc_loops,
+            };
+            let _ = build_fold_from_allocation::<A, D, S, L, F>(
+                ctx.dsc,
+                ctx.core_ds,
+                ctx.distribution,
+                &alloc,
+                &target,
+                coord,
+                loop_params,
+            );
+            offsets.compute_loop_elem_offsets(transfer.node, coord, node, dims_to_propagate);
+        }
+        FoldReferenceKind::NonAlloc {
+            dims,
+            dim_scales,
+            loops,
+            prop_comp,
+            ..
+        } => {
+            let prop_comp = match prop_comp {
+                NonAllocPropComp::TransferEnds { src, .. } => match prop.ref_role {
+                    RefRole::Producer => transfer.src.operand.unit,
+                    RefRole::Consumer => src,
+                },
+                NonAllocPropComp::ComputeUnit(unit) => unit,
+            };
+            let ref_fold = NonAllocReference {
+                lds: lds_for_prop,
+                dims,
+                dim_scales,
+                loops,
+                components: RefComponents {
+                    size: size_ref_comp,
+                    prop: prop_comp,
+                },
+                row_group: row_group.group.as_ref(),
+            };
+            let bundling = row_group
+                .ancestor
+                .map(|ancestor| ctx.ancestors.enclosing_loops(ancestor))
+                .unwrap_or_default();
+            let target = NonAllocTarget {
+                node: transfer.node,
+                kind: FoldTargetKind::Transfer(transfer.transfer_size),
+                loops: transfer.non_alloc_loops,
+                row_bundling: &bundling,
+            };
+            let _ = build_fold_from_non_alloc_ref::<A, D, S, L, F>(
+                ctx.dsc,
+                ctx.core_ds,
+                ctx.distribution,
+                &ref_fold,
+                &target,
+                coord,
+                loop_params,
+            );
+        }
+    }
+
+    // Add offset for PE-SFP split to the innermost element-arrangement. The fold parameter for
+    // PE-SFP split differs from the rowsplit, which has a dedicated fold level built further down.
+    let splitting = meta_info.is_some_and(|info| {
+        info.apply_pe_sfp_split_offset_src || !info.apply_pe_sfp_split_offset_dest.is_empty()
+    });
+    if splitting {
+        if let Some(sizes) = transfer.pe_sfp_transfer_size {
+            let split_dims: Vec<PrimaryDim> = coord
+                .iter()
+                .map(|(dim, _)| dim)
+                .filter(|dim| {
+                    ctx.meta.pe_sfp_split_dims.contains(dim) && !existing_pe_sfp.contains(dim)
+                })
+                .collect();
+            for dim in split_dims {
+                // ⛔ `transferSizePerDim.at(dim)` throws for a dim the block size does not name;
+                // there is nothing to offset that level by, so the level keeps its own beta.
+                if let Some(&size) = sizes.get(&dim) {
+                    coord.add_to_innermost_beta(dim, FoldCoeff(size.0.cast_signed()));
+                }
+            }
+        }
+    }
+    true
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ENTRY 357 — BUILDING A COMPUTE'S FOLD, AND SPREADING IT ACROSS ITS DATASTREAMS.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `dataStageParam_.at(loop->denId_).ss_.paddingSizes_.at(dim).windowDim_` — which of a loop's dims
+/// walks the window of a padded dim, absent where that stage records no padding sizes for the dim.
+///
+/// ⛔ KEYED ON THE **LOOP'S OWN** DENOMINATOR STAGE (`:13701`), which is why this is neither a
+/// [`CoreStage`] question nor the per-dim `window_dim` the hoisting units ask.
+pub trait WindowDims {
+    /// The window dim a data stage pairs with a padded dim.
+    fn window_dim(&self, stage: DatastageId, dim: PrimaryDim) -> Option<PrimaryDim>;
+}
+
+/// WHICH SIDE OF A COMPUTE ONE PROPAGATION PASS WALKS — the lambda's `forInput`, which selects the
+/// stream list, the coordinate it writes and the constructed-index list in one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamSide {
+    /// `inputsLdsAndLoopOffsets_` / `inputCoordinates_` / `constructedInputCoords`.
+    Inputs,
+    /// `outputsLdsAndLoopOffsets_` / `outputCoordinate_` / `constructedOutputCoords`.
+    Outputs,
+}
+
+/// A COMPUTE'S COORDINATES, MUTABLY — `inputCoordinates_` and the single `outputCoordinate_`.
+///
+/// ⛔ ONE OUTPUT COORDINATE HOWEVER MANY OUTPUTS, as [`RelatedComputeCoord`]'s own note says.
+pub struct ComputeCoordinates<'a> {
+    /// `inputCoordinates_`, which may be SHORTER than an opaque op's attribute list.
+    pub inputs: &'a mut [dsc2::Coordinate],
+    /// `outputCoordinate_`.
+    pub output: &'a mut dsc2::Coordinate,
+}
+
+/// `constructedInputCoords` AND `constructedOutputCoords` — the two out-vectors entry 357 clears,
+/// pushes into and hands back, and which its caller reads to know what it touched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConstructedCoords {
+    /// `constructedInputCoords` — input positions.
+    pub inputs: Vec<usize>,
+    /// `constructedOutputCoords` — output positions, and every push past the first is a literal `0`.
+    pub outputs: Vec<usize>,
+}
+
+/// A LABELED DS'S `mxInfo_` AS ENTRY 357 READS IT (`dsc/dscdefn.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MxFold {
+    /// `mxInfo_.dim`.
+    pub dim: PrimaryDim,
+    /// `mxInfo_.relatedLdsIdx`, absent for its `-1`.
+    pub related_lds: Option<LdsIdx>,
+    /// `mxInfo_.blkSize`.
+    pub blk_size: ScaleBlock,
+}
+
+/// ONE LABELED DS AS THE PER-DIM PROPAGATION READS IT — `labeledDs_.at(ldsIdx)` reduced to the facts
+/// the copy / scale-up / scale-down choice turns on.
+pub struct LabeledDsFold<'a> {
+    /// `scale_` per dim, absent where the layout order does not name the dim — a scale of 1
+    /// (`:13317`, `:13333`).
+    pub dim_scales: BTreeMap<PrimaryDim, Scale>,
+    /// `getCumulativeStickSizes(dsType_)`, which only a `StickDim` scale is charged.
+    pub stick_sizes: BTreeMap<PrimaryDim, FoldCardinality>,
+    /// `memOrg_.begin()->second.allocateNode_->padding_` — ⛔ AN EMPTY `memOrg_` IS THE DEFAULT FORM
+    /// the reference leaves under its bare *"TO DO: Any action needed?"* (`:13296-13300`).
+    pub padding: &'a PaddingForm,
+    /// `scaledLdsCategory_`.
+    pub category: ScaledLds,
+    /// `mxInfo_`.
+    pub mx: Option<MxFold>,
+}
+
+/// THE COMPUTE ENTRY 357 BUILDS THE FOLD FOR.
+pub struct ComputeFold<'a, 'l> {
+    /// `computeNode`'s tree identity.
+    pub node: NodeId,
+    /// `exUnit_` — ⛔ A [`SenComponent`] AND NOT [`ComputeStreams`]'s [`DfirUnit`]: it is both
+    /// `sizeRefComp` and the PTXRF/PTARF kludge's replacement, and both of those are row-aware.
+    pub ex_unit: SenComponent,
+    /// `inputsLdsAndLoopOffsets_` zipped with `inputs_`.
+    pub inputs: &'a [StoredStream],
+    /// `outputsLdsAndLoopOffsets_` zipped with `outputs_`.
+    pub outputs: &'a [StoredStream],
+    /// `isOpaqueOp_`, with the attribute lists it makes readable.
+    pub opaque: Option<OpaqueStreams<'a>>,
+    /// `labeledDs_`, for the indices this unit reaches — an absent key is that map's own `.at` throw.
+    pub labeled_ds: &'a BTreeMap<LdsIdx, LabeledDsFold<'a>>,
+    /// `dataConnects_.at(inputsLdsAndLoopOffsets_.at(constructedInputCoords.at(0)).dataConnect_)
+    /// .producers_` (`:13054-13057`) — the ONE connect entry 236 is asked about, resolved off the
+    /// index entry 238 selected.
+    pub bundling_producers: &'a [ConnectedNode<'a>],
+    /// The output padding form the reference hunts for at `:13551-13592`: the first `ALLOCATE`
+    /// consumer's `padding_`, else the output transfer's own once its folds are constructed.
+    ///
+    /// ⛔ [`None`] IS `!outputPaddingAvailable`, the reference's `return true`. Both `DT_CHECK`s and
+    /// the `dataConnects_` walk are the caller's, and `DT_CHECK(outputNode)` (`:13596`) is DEAD:
+    /// the only path leaving it null returns first.
+    pub output_padding: Option<&'a PaddingForm>,
+    /// This compute's own enclosing loops as [`AllocFoldTarget`] takes them, INNERMOST FIRST.
+    pub alloc_loops: &'a [LoopAndDim<'l>],
+    /// The same loops as [`NonAllocTarget`] takes them, with their `loopsBelowChunkBoundary` tags.
+    pub non_alloc_loops: &'a [(&'l LoopNode, LoopDistribution)],
+}
+
+/// `workingAllocNode`, `workingDc` and `rhsLdsIdx` — the three keys one propagation pass matches a
+/// datastream against, any one of which makes it a whole-coordinate copy (`:13248-13250`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkingStream {
+    /// `workingAllocNode`, whose null is what makes the allocation test not fire.
+    alloc: Option<AllocId>,
+    /// `workingDc` — ⚠️ AN EMPTY CONNECT MATCHES AN EMPTY ONE, as entry 358's own note says.
+    data_connect: Option<DataConnect>,
+    /// `rhsLdsIdx`.
+    lds: LdsIdx,
+}
+
+/// `inputCoordinates_.at(i)` — ⛔ its throw, which an opaque op whose attribute list outruns its
+/// coordinate list reaches.
+fn input_at<'c>(coords: &'c mut ComputeCoordinates<'_>, at: usize) -> &'c mut dsc2::Coordinate {
+    match coords.inputs.get_mut(at) {
+        Some(coord) => coord,
+        None => panic!("[buildFoldForCompute] input {at} has no coordinate."),
+    }
+}
+
+/// The coordinate one side names at a position, mutably.
+fn side_coord_mut<'c>(
+    coords: &'c mut ComputeCoordinates<'_>,
+    side: StreamSide,
+    at: usize,
+) -> &'c mut dsc2::Coordinate {
+    match side {
+        StreamSide::Inputs => input_at(coords, at),
+        StreamSide::Outputs => &mut *coords.output,
+    }
+}
+
+/// The coordinate entry 238 selected, mutably.
+fn selected_coord_mut<'c>(
+    coords: &'c mut ComputeCoordinates<'_>,
+    selected: RelatedComputeCoord,
+) -> &'c mut dsc2::Coordinate {
+    match selected {
+        RelatedComputeCoord::Input(at) => side_coord_mut(coords, StreamSide::Inputs, at),
+        RelatedComputeCoord::Output(at) => side_coord_mut(coords, StreamSide::Outputs, at),
+    }
+}
+
+/// `computeCoord` AS THE CATEGORISING SNAPSHOT — ⛔ THE REFERENCE'S IS A LIVE REFERENCE, and by the
+/// last propagation pass (`:13773`) the dim loop above has rewritten what it points at, so it is
+/// re-read at every call site rather than snapshotted once.
+fn categorising_coord(
+    coords: &ComputeCoordinates<'_>,
+    selected: RelatedComputeCoord,
+) -> dsc2::Coordinate {
+    match selected {
+        RelatedComputeCoord::Input(at) => match coords.inputs.get(at) {
+            Some(coord) => coord.clone(),
+            None => panic!("[buildFoldForCompute] input {at} has no coordinate."),
+        },
+        RelatedComputeCoord::Output(_) => coords.output.clone(),
+    }
+}
+
+/// `labeledDs_.at(ldsIdx)` — ⛔ its throw, for an index the caller resolved no labeled DS for.
+fn lds_fold<'a>(compute: &ComputeFold<'a, '_>, lds: LdsIdx) -> &'a LabeledDsFold<'a> {
+    match compute.labeled_ds.get(&lds) {
+        Some(found) => found,
+        None => panic!("[buildFoldForCompute] labeledDs {} is not resolved.", lds.0),
+    }
+}
+
+/// `scale_.at(dimIdx)` with the reference's `dimIdx < 0 ⇒ 1` (`:13317`, `:13333`, `:13632`, `:13642`).
+fn dim_scale_of(lds: &LabeledDsFold<'_>, dim: PrimaryDim) -> Scale {
+    lds.dim_scales
+        .get(&dim)
+        .copied()
+        .unwrap_or(Scale::Sized(1.0))
+}
+
+/// `scale < 0` WITH THE COST IT CARRIES — ⛔ [`Scale::Sized`] IS THE NON-NEGATIVE ARM BY
+/// CONSTRUCTION, so the two sentinels are exactly the reference's broadcast test, and
+/// `getCumulativeStickSizes(dsType_).at(dim)` throws for a stick dim those sizes do not name.
+fn broadcast_of(lds: &LabeledDsFold<'_>, dim: PrimaryDim, scale: Scale) -> Option<BroadcastScale> {
+    match scale {
+        Scale::Sized(_) => None,
+        Scale::UnitStick => Some(BroadcastScale::Unit),
+        Scale::StickDim => match lds.stick_sizes.get(&dim) {
+            Some(&card) => Some(BroadcastScale::CumulativeStickSize(card)),
+            None => panic!(
+                "[buildFoldForCompute] no cumulative stick size for {}.",
+                dim.spelling(),
+            ),
+        },
+    }
+}
+
+/// `computeCoord.getFoldCategory(dim, pos)` (`dsc/dsc2.h:223-234`) — which band a level sits in, read
+/// off the CATEGORISING coordinate while the level itself comes from the reference's.
+///
+/// ⛔ ONE `panic!` FOR TWO REFERENCE ABORTS: `coordinates_.at(dim)` throws for a dim the categorising
+/// coordinate does not cover, and a `pos` past its fold list answers `UNKNOWN_COORD`, which `addFold`
+/// then aborts on. ⭐ The element arrangement is the UNBOUNDED TAIL BAND, not a third count.
+fn fold_category(
+    categories: &dsc2::Coordinate,
+    dim: PrimaryDim,
+    pos: usize,
+    node: &str,
+) -> CoordinateCategory {
+    let count = |folds: u32| usize::try_from(folds).unwrap_or(usize::MAX);
+    let Some(folds) = categories
+        .fold_dim(dim)
+        .filter(|folds| pos < folds.folds().count())
+    else {
+        panic!(
+            "[buildFoldForCompute] {node} has no fold category for {} at level {pos}.",
+            dim.spelling(),
+        );
+    };
+    let spatial = count(folds.spatial_folds());
+    if pos < spatial {
+        CoordinateCategory::Spatial
+    } else if pos < spatial + count(folds.temporal_folds()) {
+        CoordinateCategory::Temporal
+    } else {
+        CoordinateCategory::ElemArr
+    }
+}
+
+/// `for (i = numDims-1; i >= 0; --i) lhsCoord.addFold(dim, computeCoord.getFoldCategory(dim, i), ..)`
+/// (`:13368-13377`, `:13652-13661`) — every level of one dim re-added at the FRONT, outermost last.
+fn copy_levels(
+    target: &mut dsc2::Coordinate,
+    categories: &dsc2::Coordinate,
+    source: &dsc2::Coordinate,
+    dim: PrimaryDim,
+    node: &str,
+) {
+    let levels = source
+        .fold_dim(dim)
+        .map(gather_propagated_levels)
+        .unwrap_or_default();
+    for (at, level) in levels.iter().enumerate().rev() {
+        let category = fold_category(categories, dim, at, node);
+        add_labelled_fold(target, dim, category, level.label.clone(), level.level);
+    }
+}
+
+/// `propagateToDataStream(workingAllocNode, workingDc, rhsLdsIdx, rhsCoord, forInput)`
+/// (`:13219-13437`) — one coordinate spread over one side of a compute: a whole-coordinate copy for
+/// every stream sharing the working allocation, connect or labeled DS, and a per-dim copy, scale-up or
+/// scale-down for the rest.
+///
+/// ⛔ `rhsCoord` AND `computeCoord` ARE TWO COORDINATES, NOT ONE: the levels come off the first and
+/// the categories off the second, and by the last pass they hold different folds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference's lambda captures nine of the enclosing scope's bindings"
+)]
+fn propagate_to_data_stream<D, S, T, L, E, N>(
+    ctx: &FoldContext<'_, D, S, T, L, E, N>,
+    compute: &ComputeFold<'_, '_>,
+    working: WorkingStream,
+    rhs: &dsc2::Coordinate,
+    categories: &dsc2::Coordinate,
+    side: StreamSide,
+    coords: &mut ComputeCoordinates<'_>,
+    constructed: &mut ConstructedCoords,
+    loop_params: &mut L::LoopParams,
+) where
+    D: Dsc + Allocations,
+    S: ?Sized,
+    T: ?Sized,
+    L: LoopRelevance + ?Sized,
+    E: EnclosingLoops + ?Sized,
+    N: NodeNames + ?Sized,
+{
+    let streams = match side {
+        StreamSide::Inputs => compute.inputs,
+        StreamSide::Outputs => compute.outputs,
+    };
+    let name = ctx.names.name(compute.node);
+    let rhs_lds = lds_fold(compute, working.lds);
+    for at in 0..streams.len() {
+        let stored = streams[at];
+        let first_recorded = match side {
+            StreamSide::Inputs => constructed.inputs.first().copied(),
+            StreamSide::Outputs => constructed.outputs.first().copied(),
+        };
+        if first_recorded == Some(at) {
+            continue;
+        }
+        let Some(my_lds) = selected_lds(stored) else {
+            continue;
+        };
+        if my_lds == working.lds
+            || (working.alloc.is_some() && ctx.dsc.allocation(stored) == working.alloc)
+            || working.data_connect == stored.stream.data_connect
+        {
+            // Copying the coordinate over: this stream shares the working ldsIdx, allocation or
+            // data_connect.
+            match side {
+                StreamSide::Inputs => {
+                    if !input_at(coords, at).fold_constructed() {
+                        *input_at(coords, at) = rhs.clone();
+                        if all_dims_covered(ctx.dsc, input_at(coords, at), my_lds) {
+                            input_at(coords, at).complete_fold_construction();
+                        }
+                        if !constructed.inputs.contains(&at) {
+                            constructed.inputs.push(at);
+                        }
+                    }
+                }
+                // ⚠️ NO `foldConstructed` GUARD ON THE OUTPUT (`:13278`), and the push is
+                // unconditional where the input's is not.
+                StreamSide::Outputs => {
+                    *coords.output = rhs.clone();
+                    if all_dims_covered(ctx.dsc, coords.output, my_lds) {
+                        coords.output.complete_fold_construction();
+                    }
+                    constructed.outputs.push(0);
+                }
+            }
+            continue;
+        }
+
+        // Try to propagate the coordinate of individual dimensions.
+        let lhs_lds = lds_fold(compute, my_lds);
+        let lhs_dims = ctx.dsc.layout_dims(my_lds).to_vec();
+        let mut added_new_dim = false;
+        // ⛔ `rowSplitDim` (`:13085-13091`) AND `rowSplitDimPropagated` (`:13302`, `:13337-13339`) ARE
+        // DROPPED: the flag is written and never read, so the row-split dim is not a fact this unit
+        // needs at all.
+        for &lhs_dim in &lhs_dims {
+            if side_coord_mut(coords, side, at).covers(lhs_dim) {
+                continue;
+            }
+            if !rhs.covers(lhs_dim) {
+                continue;
+            }
+            if rhs.padding(lhs_dim) != lhs_lds.padding.padding(lhs_dim) {
+                continue;
+            }
+            let lhs_scale = dim_scale_of(lhs_lds, lhs_dim);
+            if let Some(broadcast) = broadcast_of(lhs_lds, lhs_dim, lhs_scale) {
+                // Constructing the broadcast coordinate for the dim.
+                build_fold_for_broadcast_dim(side_coord_mut(coords, side, at), lhs_dim, broadcast);
+                continue;
+            }
+            if lhs_scale != dim_scale_of(rhs_lds, lhs_dim) {
+                continue;
+            }
+            let lhs_mx = lhs_lds.mx.filter(|mx| mx.dim == lhs_dim);
+            let scaled = lhs_lds.category != rhs_lds.category;
+            if scaled {
+                if let Some(mx) = lhs_mx {
+                    // The labeledDs must be related in the context of mxScale. Assumption:
+                    // verifying one direction of the relation is sufficient.
+                    if mx.related_lds != Some(working.lds) {
+                        continue;
+                    }
+                } else if rhs_lds.mx.is_some_and(|mx| mx.dim == lhs_dim) {
+                    continue;
+                }
+            }
+            let pad = lhs_lds.padding.padding(lhs_dim);
+            side_coord_mut(coords, side, at).set_padding(lhs_dim, pad);
+            match lhs_mx.filter(|_| scaled) {
+                None => copy_levels(
+                    side_coord_mut(coords, side, at),
+                    categories,
+                    rhs,
+                    lhs_dim,
+                    name,
+                ),
+                Some(mx) => match lhs_lds.category {
+                    // Scale-tensor coordinate to value-tensor coordinate.
+                    ScaledLds::Value => scale_up_coord(
+                        &MxValueTensor {
+                            lds: my_lds,
+                            dim: lhs_dim,
+                            blk_size: mx.blk_size,
+                        },
+                        &coord_dim_of(rhs, lhs_dim),
+                        side_coord_mut(coords, side, at),
+                        compute.node,
+                        compute.ex_unit,
+                        ctx.distribution,
+                        &ctx.ancestors.enclosing_loop_chain(compute.node, false),
+                        loop_params,
+                    ),
+                    // Value-tensor coordinate to scale-tensor coordinate.
+                    ScaledLds::Scale => {
+                        let _compressed = scale_down_coord(
+                            &MxScaleTensor {
+                                dim: lhs_dim,
+                                blk_size: mx.blk_size,
+                            },
+                            &coord_dim_of(rhs, lhs_dim),
+                            side_coord_mut(coords, side, at),
+                        );
+                    }
+                    ScaledLds::Regular => panic!(
+                        "[buildfoldForCompute] Unhandled ScaledLdsCategory found for labeledDs {}.",
+                        my_lds.0,
+                    ),
+                },
+            }
+            added_new_dim = true;
+        }
+        if added_new_dim {
+            match side {
+                StreamSide::Inputs => {
+                    if all_dims_covered(ctx.dsc, input_at(coords, at), my_lds) {
+                        input_at(coords, at).complete_fold_construction();
+                    }
+                    if !constructed.inputs.contains(&at) {
+                        constructed.inputs.push(at);
+                    }
+                }
+                StreamSide::Outputs => constructed.outputs.push(0),
+            }
+        }
+    }
+}
+
+/// `output_data_connects_.at(at)` / `input_data_connects_.at(at)` — ⛔ their throws.
+fn attribute_connect(connects: &[DataConnect], at: usize) -> DataConnect {
+    match connects.get(at) {
+        Some(&connect) => connect,
+        None => panic!("[buildFoldForCompute] no data_connect at attribute position {at}."),
+    }
+}
+
+/// `for inpIndex : input_data_connects_` — an opaque op's copy onto every non-constructed input
+/// naming the working connect (`:13445-13462`, `:13500-13518`, `:13751-13764`).
+///
+/// ⚠️ THE LAST SITE LATCHES AND PUSHES UNCONDITIONALLY; the other two latch only where the source is
+/// itself constructed and push only where the index is absent.
+fn copy_to_opaque_inputs(
+    opaque: &OpaqueStreams<'_>,
+    working_dc: DataConnect,
+    source: &dsc2::Coordinate,
+    always_latch: bool,
+    coords: &mut ComputeCoordinates<'_>,
+    constructed: &mut ConstructedCoords,
+) {
+    for at in 0..opaque.inputs.len() {
+        if input_at(coords, at).fold_constructed() {
+            continue;
+        }
+        if attribute_connect(opaque.inputs, at) != working_dc {
+            continue;
+        }
+        *input_at(coords, at) = source.clone();
+        if always_latch || source.fold_constructed() {
+            input_at(coords, at).complete_fold_construction();
+        }
+        if always_latch || !constructed.inputs.contains(&at) {
+            constructed.inputs.push(at);
+        }
+    }
+}
+
+/// `workingAllocNode`/`workingDc` off one of the compute's own streams (`:13464-13470`,
+/// `:13520-13526`, `:13768-13772`) — ⛔ `..LdsAndLoopOffsets_.at(i)`'s throw for a recorded index
+/// with no stream behind it.
+fn working_stream<D: Allocations + ?Sized>(
+    dsc: &D,
+    streams: &[StoredStream],
+    at: usize,
+    lds: LdsIdx,
+) -> WorkingStream {
+    let Some(&stored) = streams.get(at) else {
+        panic!("[buildFoldForCompute] no datastream at position {at}.");
+    };
+    WorkingStream {
+        alloc: dsc.allocation(stored),
+        data_connect: stored.stream.data_connect,
+        lds,
+    }
+}
+
+/// Replaces: e357_buildFoldForCompute
+///
+/// Propagates one coordinate onto a compute: the reference's kind picks the propagator, the result is
+/// spread to every input and output sharing its allocation, connect or labeled DS, and the input folds
+/// are converted onto the output where the two read the dim's padding differently.
+///
+/// ⛔ THE `refNode == computeNode` RETURN PRECEDES EVERY CLEAR (`:13017`), so the caller's two
+/// out-vectors SURVIVE it and are emptied on all five later `false`s. ⛔ `computeDims` (`:13092`),
+/// `loopParamsAfterDistribution` (`:13598`) and the nested *"Unsupported padtype conversion"*
+/// `DT_ERROR` (`:13725`, unreachable behind its own two guards) are dead and dropped as such.
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference reads twelve `Ddc` members and a port is handed each one"
+)]
+pub fn build_fold_for_compute<A, D, S, T, L, E, N, O, W, F>(
+    ctx: &FoldContext<'_, D, S, T, L, E, N>,
+    compute: &ComputeFold<'_, '_>,
+    windows: &W,
+    prop: &Propagation,
+    dims_to_propagate: &[PrimaryDim],
+    reference: FoldReference<'_, '_, F>,
+    selected: RelatedCoord,
+    coords: &mut ComputeCoordinates<'_>,
+    constructed: &mut ConstructedCoords,
+    tracker: &mut CoordPropTracker,
+    loop_params: &mut L::LoopParams,
+    offsets: &mut O,
+) -> bool
+where
+    A: Arch,
+    D: Dsc + Allocations,
+    S: PropagatedFoldStage + ?Sized,
+    T: ScheduleTree + ?Sized,
+    L: LoopRelevance + ?Sized,
+    E: EnclosingLoops + ?Sized,
+    N: NodeNames + ?Sized,
+    O: LoopElemOffsets + ?Sized,
+    W: WindowDims + ?Sized,
+    F: AffineFoldDims + ?Sized,
+{
+    let FoldReference {
+        gate,
+        kind,
+        ref_padding,
+    } = reference;
+    // A computeNode can be both a consumer and a producer of the same data_connect.
+    if prop.ref_node == compute.node {
+        return false;
+    }
+    // `clearWorkDone()`, then the one position entry 238 selected — that unit clears both lists
+    // itself before recording it (`:3818-3819`).
+    let clear = |constructed: &mut ConstructedCoords| {
+        constructed.inputs.clear();
+        constructed.outputs.clear();
+    };
+    clear(constructed);
+    match selected.coord {
+        RelatedComputeCoord::Input(at) => constructed.inputs.push(at),
+        RelatedComputeCoord::Output(at) => constructed.outputs.push(at),
+    }
+
+    if selected_coord_mut(coords, selected.coord).fold_constructed() {
+        // The fold is already constructed for the coordinate.
+        clear(constructed);
+        return false;
+    }
+    if compute.opaque.is_none()
+        && !constructed.inputs.is_empty()
+        && matches!(kind, FoldReferenceKind::NonAlloc { .. })
+        && need_non_row_bundling(ctx.tree, compute.bundling_producers, ConnectEnd::Producers)
+    {
+        // Non-row bundling is not supported for the compute node.
+        clear(constructed);
+        return false;
+    }
+    let Some(compute_lds) = selected.lds else {
+        panic!(
+            "[buildFoldForCompute] Can not propagate the coordinate to computeNode {} as its ldsIdx \
+             is not set.",
+            ctx.names.name(compute.node),
+        );
+    };
+    // ⛔ HOISTED WITH ITS ARM'S GATE BUT AHEAD OF IT: the reference asks this at `:13177`, BEFORE the
+    // `:13190` gate the port lifts out.
+    if matches!(
+        kind,
+        FoldReferenceKind::NonAlloc {
+            prop_comp: NonAllocPropComp::ComputeUnit(_),
+            ..
+        }
+    ) && prop.ends.data_connect.is_none()
+    {
+        panic!(
+            "[buildFoldForCompute] RefNode= {}, computeNode= {}: data_connect is not set.",
+            ctx.names.name(prop.ref_node),
+            ctx.names.name(compute.node),
+        );
+    }
+
+    // ⭐ ONE GATE FOR ALL THREE ARMS: they spell it identically, and entry 085 never reads the
+    // coordinate it is handed. ⛔ ITS `false` CLEARS, where entry 358's does not.
+    let Some(row_group) = gated_row_group::<A, D, S, T, N, F>(
+        ctx.dsc,
+        ctx.core_ds,
+        ctx.tree,
+        ctx.names,
+        tracker,
+        prop,
+        dims_to_propagate,
+        &gate.scan,
+        &gate.ref_coord,
+        gate.retry_dims,
+    ) else {
+        clear(constructed);
+        return false;
+    };
+
+    let mut can_proceed = true;
+    {
+        let compute_coord = selected_coord_mut(coords, selected.coord);
+        compute_coord.set_padding_form(ref_padding.stated());
+        match kind {
+            FoldReferenceKind::Allocate {
+                node,
+                lds,
+                component,
+                dims,
+                work_slices,
+                dim_scales,
+                corelet_split_dim,
+            } => {
+                // *** This is a kludge. FIND A GENERAL SOLUTION *** PTXRF and PTARF represent the
+                // allocation for all PT rows, while a computeNode on the PT represents the
+                // computation on an individual PT row.
+                let prop_comp = match component {
+                    SenComponent::Ptxrf | SenComponent::Ptarf => compute.ex_unit,
+                    other => other,
+                };
+                let alloc = AllocationFold {
+                    lds,
+                    dims,
+                    work_slices,
+                    dim_scales,
+                    propagated_dims: dims_to_propagate,
+                    corelet_split_dim,
+                    components: RefComponents {
+                        size: compute.ex_unit,
+                        prop: prop_comp,
+                    },
+                    row_group: row_group.group.as_ref(),
+                };
+                let target = AllocFoldTarget {
+                    node: compute.node,
+                    loops: compute.alloc_loops,
+                };
+                // ⚠️ THE ANSWER IS DISCARDED HERE (`:13128`), so an allocation reference never fails
+                // this unit: `canProceed` stays `true` whatever entry 298 reports.
+                let _propagated = build_fold_from_allocation::<A, D, S, L, F>(
+                    ctx.dsc,
+                    ctx.core_ds,
+                    ctx.distribution,
+                    &alloc,
+                    &target,
+                    compute_coord,
+                    loop_params,
+                );
+                offsets.compute_loop_elem_offsets(
+                    compute.node,
+                    compute_coord,
+                    node,
+                    dims_to_propagate,
+                );
+            }
+            FoldReferenceKind::NonAlloc {
+                dims,
+                dim_scales,
+                loops,
+                prop_comp,
+                ..
+            } => {
+                let mut components = RefComponents {
+                    size: compute.ex_unit,
+                    prop: match prop_comp {
+                        NonAllocPropComp::TransferEnds { src, dst } => match prop.ref_role {
+                            RefRole::Producer => dst,
+                            RefRole::Consumer => src,
+                        },
+                        // A computeNode corresponding to an individual PT row is expected to carry
+                        // that row's unit.
+                        NonAllocPropComp::ComputeUnit(unit) => unit,
+                    },
+                };
+                if let NonAllocPropComp::TransferEnds { src, dst } = prop_comp {
+                    // Override the components in case one end of the transfer is a single PT row.
+                    // ⛔ A DEFAULT `RowGroupInfo` IS `NO_BUNDLING`, so an absent group RUNS this.
+                    let row_to_non_row = row_group
+                        .group
+                        .as_ref()
+                        .is_some_and(|group| group.category() == RowGroupCategory::RowToNonRow);
+                    if !row_to_non_row {
+                        if comp_row_id(src).is_some() {
+                            components = RefComponents { size: src, prop: src };
+                        } else if comp_row_id(dst).is_some() {
+                            components = RefComponents { size: dst, prop: dst };
+                        }
+                    }
+                }
+                let ref_fold = NonAllocReference {
+                    lds: compute_lds,
+                    dims,
+                    dim_scales,
+                    loops,
+                    components,
+                    row_group: row_group.group.as_ref(),
+                };
+                let bundling = row_group
+                    .ancestor
+                    .map(|ancestor| ctx.ancestors.enclosing_loops(ancestor))
+                    .unwrap_or_default();
+                let target = NonAllocTarget {
+                    node: compute.node,
+                    kind: FoldTargetKind::Compute,
+                    loops: compute.non_alloc_loops,
+                    row_bundling: &bundling,
+                };
+                // ⛔ ENTRY 299 ANSWERS `false` FOR EXACTLY ONE STATE (`:8653`), so this is the whole
+                // of `canProceed`.
+                can_proceed = build_fold_from_non_alloc_ref::<A, D, S, L, F>(
+                    ctx.dsc,
+                    ctx.core_ds,
+                    ctx.distribution,
+                    &ref_fold,
+                    &target,
+                    compute_coord,
+                    loop_params,
+                ) != FoldPropagation::AlreadyConstructed;
+            }
+        }
+    }
+    if !can_proceed {
+        clear(constructed);
+        return false;
+    }
+    if all_dims_covered(
+        ctx.dsc,
+        selected_coord_mut(coords, selected.coord),
+        compute_lds,
+    ) {
+        selected_coord_mut(coords, selected.coord).complete_fold_construction();
+    }
+
+    if let Some(&first_input) = constructed.inputs.first() {
+        match &compute.opaque {
+            Some(opaque) => {
+                let working_dc = attribute_connect(opaque.inputs, first_input);
+                let source = categorising_coord(coords, selected.coord);
+                copy_to_opaque_inputs(opaque, working_dc, &source, false, coords, constructed);
+            }
+            None => {
+                let working = working_stream(ctx.dsc, compute.inputs, first_input, compute_lds);
+                // ⭐ ONE SNAPSHOT SERVES AS BOTH LEVELS AND CATEGORIES ACROSS BOTH CALLS: the
+                // selected input is protected from the first by its own recorded position, and
+                // `constructedOutputCoords` is provably empty through it because only the OUTPUT arms
+                // push there.
+                let source = categorising_coord(coords, selected.coord);
+                propagate_to_data_stream(
+                    ctx,
+                    compute,
+                    working,
+                    &source,
+                    &source,
+                    StreamSide::Inputs,
+                    coords,
+                    constructed,
+                    loop_params,
+                );
+                let source = categorising_coord(coords, selected.coord);
+                propagate_to_data_stream(
+                    ctx,
+                    compute,
+                    working,
+                    &source,
+                    &source,
+                    StreamSide::Outputs,
+                    coords,
+                    constructed,
+                    loop_params,
+                );
+            }
+        }
+    }
+
+    // Propagate the coordinate to the output(s) of the compute node. The output may not carry all the
+    // dimensions of the inputs; pooling is the example.
+    if let Some(&first_output) = constructed.outputs.first() {
+        match &compute.opaque {
+            Some(opaque) => {
+                let working_dc = attribute_connect(opaque.outputs, first_output);
+                let source = coords.output.clone();
+                copy_to_opaque_inputs(opaque, working_dc, &source, false, coords, constructed);
+            }
+            None => {
+                let working = working_stream(ctx.dsc, compute.outputs, first_output, compute_lds);
+                let source = coords.output.clone();
+                let categories = categorising_coord(coords, selected.coord);
+                propagate_to_data_stream(
+                    ctx,
+                    compute,
+                    working,
+                    &source,
+                    &categories,
+                    StreamSide::Inputs,
+                    coords,
+                    constructed,
+                    loop_params,
+                );
+            }
+        }
+    }
+
+    if coords.output.fold_constructed() {
+        return true;
+    }
+
+    // Find the output ldsIdx.
+    let output_lds_idx = compute.outputs.iter().copied().find_map(selected_lds);
+    let Some(output_padding) = compute.output_padding else {
+        return true;
+    };
+    coords.output.set_padding_form(output_padding.stated());
+
+    // ⭐ THE OPAQUE `outputDims` LDS *IS* `computeLdsIdx`: entry 238's opaque arm answers
+    // `opaqueOps_.at(node).ldsIdx_` itself, and an absent one has already panicked above.
+    let output_dims: Vec<PrimaryDim> = if compute.opaque.is_some() {
+        ctx.dsc.layout_dims(compute_lds).to_vec()
+    } else {
+        output_lds_idx.map_or_else(Vec::new, |lds| ctx.dsc.layout_dims(lds).to_vec())
+    };
+    let output_lds = output_lds_idx.map(|lds| lds_fold(compute, lds));
+    let compute_lds_fold = lds_fold(compute, compute_lds);
+    let name = ctx.names.name(compute.node);
+    let categories = categorising_coord(coords, selected.coord);
+
+    // Propagate the newly constructed input folds to the output.
+    for &dim in &output_dims {
+        if coords.output.covers(dim) {
+            continue;
+        }
+        // The coordinate of all the dimensions may not be available in the base coordinate.
+        if !categories.covers(dim) {
+            continue;
+        }
+        // A negative scale indicates the broadcast property of the dimension.
+        let dim_scale = output_lds.map_or(Scale::Sized(1.0), |lds| dim_scale_of(lds, dim));
+        if let Some(broadcast) = output_lds.and_then(|lds| broadcast_of(lds, dim, dim_scale)) {
+            build_fold_for_broadcast_dim(&mut *coords.output, dim, broadcast);
+            continue;
+        }
+        // The reference dim is a broadcast dim while the current dim is not.
+        let ref_scale = dim_scale_of(compute_lds_fold, dim);
+        let non_broadcast = matches!(dim_scale, Scale::Sized(scale) if scale > 0.0);
+        if non_broadcast && matches!(ref_scale, Scale::UnitStick | Scale::StickDim) {
+            continue;
+        }
+
+        let input_padding = categories.padding(dim);
+        if input_padding == coords.output.padding(dim) {
+            copy_levels(&mut *coords.output, &categories, &categories, dim, name);
+            continue;
+        }
+        // ⛔ THE `else` UNDER THIS IS THE UNREACHABLE `DT_ERROR`: an output padding of `NOPAD` that
+        // differs from the input's leaves the input NOT `NOPAD` by construction.
+        if coords.output.padding(dim) != PadType::NoPad {
+            continue;
+        }
+        // Unpadded access to a padded arrangement: the loops relevant to the dim decide which
+        // temporal levels survive, and the core datastage's stride divides what is left.
+        let curr_loop_chain: Vec<&LoopNode> = ctx
+            .ancestors
+            .enclosing_loops(compute.node)
+            .into_iter()
+            .filter(|walked| {
+                ctx.distribution
+                    .loop_relevant_for_dim(dim, walked, input_padding)
+            })
+            .collect();
+        let levels = categories
+            .fold_dim(dim)
+            .map(gather_propagated_levels)
+            .unwrap_or_default();
+        let num_elem_arr = usize::try_from(
+            categories
+                .fold_dim(dim)
+                .map_or(0, dsc2::FoldDim::elem_arr_folds),
+        )
+        .unwrap_or(usize::MAX);
+        for (at, level) in levels.iter().enumerate().rev() {
+            let category = fold_category(&categories, dim, at, name);
+            // Do we need to get the stride from the loop denominator? For now, using the stride from
+            // the core datastage.
+            let mut factor = 1;
+            if matches!(
+                category,
+                CoordinateCategory::Temporal | CoordinateCategory::Spatial
+            ) {
+                let Some(stride) = ctx.core_ds.pad_stride(dim) else {
+                    panic!(
+                        "[buildFoldForCompute] {name} states no padding stride for {}.",
+                        dim.spelling(),
+                    );
+                };
+                factor = if stride.get() == -1 { 1 } else { stride.get() };
+            }
+            // TO DO: We need to reduce the cardinality of the window loop to 1.
+            if category == CoordinateCategory::Temporal {
+                // No fold is needed for a window loop while accessing an unpadded data structure.
+                // ⛔ THE INDEX GOES NEGATIVE FOR A CHAIN SHORTER THAN THE FOLD LIST, where the
+                // reference's `.at(size_t(-1))` throws.
+                let Some(loop_node) = (levels.len().checked_sub(1))
+                    .and_then(|last| last.checked_sub(at))
+                    .and_then(|rest| rest.checked_sub(num_elem_arr))
+                    .and_then(|position| curr_loop_chain.get(position))
+                else {
+                    panic!(
+                        "[buildFoldForCompute] {name} has fewer loops related to {} than temporal \
+                         folds.",
+                        dim.spelling(),
+                    );
+                };
+                let window = windows.window_dim(loop_node.den, dim);
+                let is_window_loop = loop_node
+                    .dims
+                    .iter()
+                    .any(|walked| walked.kind == MetaDimKind::WindowDim && window == Some(walked.dim));
+                if is_window_loop {
+                    continue;
+                }
+            }
+            // Should we scale beta for the temporal folds as well?
+            let beta = if category == CoordinateCategory::Spatial {
+                Beta(level.level.beta.0 / factor)
+            } else {
+                level.level.beta
+            };
+            add_labelled_fold(
+                &mut *coords.output,
+                dim,
+                category,
+                level.label.clone(),
+                FoldParamInfo {
+                    alpha: Alpha(level.level.alpha.0 / factor),
+                    beta,
+                    ..level.level
+                },
+            );
+        }
+    }
+
+    // ⚠️ THIS COVERAGE TEST IS TAKEN BEFORE the copies below, which the reference's own ordering
+    // (`:13736-13745` then `:13748`) puts first.
+    let all_covered = output_dims.iter().all(|&dim| coords.output.covers(dim));
+    // Propagate/copy to the inputs associated with the same allocation or data_connect as any of the
+    // outputs.
+    match &compute.opaque {
+        Some(opaque) => {
+            let working_dc = attribute_connect(opaque.outputs, 0);
+            let source = coords.output.clone();
+            copy_to_opaque_inputs(opaque, working_dc, &source, true, coords, constructed);
+        }
+        None => {
+            if let Some(output_lds_idx) = output_lds_idx {
+                for at in 0..compute.outputs.len() {
+                    let working = working_stream(ctx.dsc, compute.outputs, at, output_lds_idx);
+                    let source = coords.output.clone();
+                    let categories = categorising_coord(coords, selected.coord);
+                    propagate_to_data_stream(
+                        ctx,
+                        compute,
+                        working,
+                        &source,
+                        &categories,
+                        StreamSide::Inputs,
+                        coords,
+                        constructed,
+                        loop_params,
+                    );
+                }
+            }
+        }
+    }
+
+    constructed.outputs.push(0);
+    if all_covered {
+        coords.output.complete_fold_construction();
+    }
+    true
+}
 
 // crustify:todo: e370_buildAndPropagateFold
 //   authority : ddc/ddc_fold.cpp:1625  (350 body lines, level 5)
@@ -6768,5 +9024,634 @@ mod tests_e297_e299 {
             ),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_e356_e358 {
+    use super::*;
+    use crate::arch::Target;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{PaddedExtent, Sample};
+    use crate::schedule::ddc::transformation_util::LoopDims;
+    use crate::schedule::dsc2::{DataInfo, LayoutDims, NodeName};
+
+    /// One labelled data structure whose layout order is a single dim.
+    struct OneLds(LayoutDims);
+
+    impl Dsc for OneLds {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            self.0.clone()
+        }
+    }
+
+    impl Allocations for OneLds {
+        fn allocation(&self, _stored: StoredStream) -> Option<AllocId> {
+            None
+        }
+        fn value_allocation(&self, _scale: AllocId) -> Option<AllocId> {
+            None
+        }
+    }
+
+    /// A core data stage that splits no row and no corelet, which is what leaves the row-bundling
+    /// gate answering the default group without ever reading the scan.
+    struct NoSplit;
+
+    impl Stage for NoSplit {
+        fn is_symbolic(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_corelet_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_row_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_pe_sfp_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn splits_any_row(&self) -> bool {
+            false
+        }
+        fn extent(&self, _dim: PrimaryDim, _at: Sample) -> Extent {
+            Extent(0)
+        }
+        fn padded_extent(&self, _dim: PrimaryDim, _at: Sample) -> Option<PaddedExtent> {
+            None
+        }
+    }
+
+    impl CoreStage for NoSplit {
+        fn pad_stride(&self, _dim: PrimaryDim) -> Option<Stride> {
+            None
+        }
+        fn first_corelet_share(&self, _dim: PrimaryDim) -> Option<Extent> {
+            None
+        }
+        fn core_extent(&self, _dim: PrimaryDim) -> Extent {
+            Extent(0)
+        }
+        fn corelets_used(&self) -> Cardinality {
+            Cardinality(2)
+        }
+        fn work_slices(&self, _dim: PrimaryDim) -> Cardinality {
+            Cardinality(1)
+        }
+    }
+
+    impl PropagatedFoldStage for NoSplit {
+        fn loop_iterations(
+            &self,
+            _loop_node: &LoopNode,
+            _dim: PrimaryDimAndKind,
+            _prop: SenComponent,
+            _row: Option<PtRowId>,
+        ) -> Cardinality {
+            Cardinality(4)
+        }
+    }
+
+    impl SizeStage for NoSplit {
+        fn padded(&self, _dim: PrimaryDim, val: i64) -> Alpha {
+            Alpha(val)
+        }
+    }
+
+    /// A tree answered from a parent table; node 0 is the block that holds the rest.
+    struct Tree(Vec<Option<u32>>);
+
+    impl ScheduleTree for Tree {
+        fn kind(&self, node: NodeId) -> NodeKind {
+            if self.0[node.0 as usize].is_none() {
+                NodeKind::Block
+            } else {
+                NodeKind::Transfer
+            }
+        }
+        fn parent(&self, node: NodeId) -> Option<NodeId> {
+            self.0[node.0 as usize].map(NodeId)
+        }
+        fn children(&self, block: BlockId) -> Vec<NodeId> {
+            (0..u32::try_from(self.0.len()).unwrap_or(0))
+                .map(NodeId)
+                .filter(|&node| self.parent(node) == Some(block.node()))
+                .collect()
+        }
+    }
+
+    /// `loopParamInfo` as the two levels-recording seams write it.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Params(Vec<(PrimaryDim, ElemArrLevel)>);
+
+    impl LoopLevels for Params {
+        fn bump_levels_at_or_inside(&mut self, dim: PrimaryDim, level: ElemArrLevel) {
+            self.0.push((dim, level));
+        }
+        fn record_loop_level(
+            &mut self,
+            _loop_node: &LoopNode,
+            dim: PrimaryDim,
+            _decided: DistributedLoop,
+            level: ElemArrLevel,
+        ) {
+            self.0.push((dim, level));
+        }
+    }
+
+    /// The dsc2 seams, tabulated: every loop walks every dim and the distributor answers one fixed
+    /// stride.
+    struct Seams;
+
+    impl TemporalLoopDistribution for Seams {
+        type LoopParams = Params;
+
+        fn related_loops<'l>(
+            &self,
+            _dim: PrimaryDimAndKind,
+            chain: &[LoopAndDim<'l>],
+            _pad: PadType,
+        ) -> Vec<LoopAndDim<'l>> {
+            chain.to_vec()
+        }
+
+        fn distribute(
+            &self,
+            _request: &ElemArrDistribution<'_>,
+            _loop_params: &mut Self::LoopParams,
+        ) -> Vec<FoldParamInfo> {
+            Vec::new()
+        }
+
+        fn distributed(
+            &self,
+            _loop_params: &Self::LoopParams,
+            _loop_node: &LoopNode,
+            _dim: PrimaryDim,
+        ) -> Option<DistributedLoop> {
+            Some(DistributedLoop {
+                alpha: Alpha(16),
+                beta: Beta(0),
+            })
+        }
+    }
+
+    impl LoopRelevance for Seams {
+        fn loop_relevant_for_dim(
+            &self,
+            _dim: PrimaryDim,
+            _loop_node: &LoopNode,
+            _pad: PadType,
+        ) -> bool {
+            true
+        }
+        fn distributed_corelet_slice(
+            &self,
+            _loop_params: &Self::LoopParams,
+            _dim: PrimaryDim,
+        ) -> Option<DistributedLoop> {
+            None
+        }
+    }
+
+    /// No node has an enclosing loop of its own; each unit's loop chain is handed over as a witness
+    /// field instead, so this seam is only reached for the row-bundling ancestor.
+    struct NoLoops;
+
+    impl EnclosingLoops for NoLoops {
+        fn enclosing_loops(&self, _node: NodeId) -> Vec<&LoopNode> {
+            Vec::new()
+        }
+        fn enclosing_loop_chain(
+            &self,
+            _node: NodeId,
+            _build_corelet_fold: bool,
+        ) -> Vec<LoopAndDim<'_>> {
+            Vec::new()
+        }
+    }
+
+    struct Named;
+
+    impl NodeNames for Named {
+        fn name(&self, _node: NodeId) -> &str {
+            "n"
+        }
+    }
+
+    /// The loop element offsets, recorded per node — the ALLOCATE arms' second effect.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Offsets(Vec<NodeId>);
+
+    impl LoopElemOffsets for Offsets {
+        fn compute_loop_elem_offsets(
+            &mut self,
+            node: NodeId,
+            _coord: &dsc2::Coordinate,
+            _alloc: NodeId,
+            _dims: &[PrimaryDim],
+        ) {
+            self.0.push(node);
+        }
+    }
+
+    /// No data stage pairs a window dim with a padded one.
+    struct NoWindows;
+
+    impl WindowDims for NoWindows {
+        fn window_dim(&self, _stage: DatastageId, _dim: PrimaryDim) -> Option<PrimaryDim> {
+            None
+        }
+    }
+
+    fn loop_named(name: &str) -> LoopNode {
+        LoopNode {
+            name: NodeName(name.to_owned()),
+            num: DatastageId(0),
+            den: DatastageId(1),
+            dims: LoopDims::new(
+                PrimaryDimAndKind {
+                    dim: PrimaryDim::Out,
+                    kind: MetaDimKind::Unpadded,
+                },
+                Vec::new(),
+            ),
+        }
+    }
+
+    /// The reference's coordinate for one dim: the three role folds and one element arrangement.
+    fn ref_coordinate(dim: PrimaryDim) -> dsc2::Coordinate {
+        let mut coord = dsc2::Coordinate::default();
+        let mut front = |category, cardinality, label: &str, alpha| {
+            coord.add_fold_front(
+                dim,
+                category,
+                FoldCardinality(cardinality),
+                dsc2::FoldLabel(label.to_owned()),
+                FoldCoeff(alpha),
+                FoldCoeff(0),
+            );
+        };
+        // Added at the FRONT, so the innermost level goes on first.
+        front(CoordinateCategory::ElemArr, 8, "elem_arr_0", 1);
+        front(CoordinateCategory::Spatial, 1, "rowsplit_fold", 0);
+        front(CoordinateCategory::Spatial, 2, "corelet_fold_dim", 50);
+        front(CoordinateCategory::Spatial, 2, "core_workslice_fold_dim", 100);
+        coord
+    }
+
+    /// What [`ref_coordinate`] propagates to: the same four levels, the row split recomputed to the
+    /// identity fold it already was.
+    fn propagated() -> Vec<(String, i64, u32)> {
+        vec![
+            ("core_workslice_fold_dim".to_owned(), 100, 2),
+            ("corelet_fold_dim".to_owned(), 50, 2),
+            ("rowsplit_fold".to_owned(), 0, 1),
+            ("elem_arr_0".to_owned(), 1, 8),
+        ]
+    }
+
+    /// One dim's folds as `(label, alpha, cardinality)`, OUTERMOST FIRST.
+    fn folds_of(coord: &dsc2::Coordinate, dim: PrimaryDim) -> Vec<(String, i64, u32)> {
+        coord.fold_dim(dim).map_or_else(Vec::new, |folds| {
+            folds
+                .folds()
+                .map(|fold| (fold.label.0.clone(), fold.alpha.0, fold.cardinality.0))
+                .collect()
+        })
+    }
+
+    /// A step matched on its `data_connect=` alone, so no allocation lookup is reached.
+    fn propagation(ref_node: NodeId, node_to_fold: NodeId) -> Propagation {
+        Propagation {
+            ends: CoordPropInfo {
+                data_connect: Some(DataConnect::AconstConnect),
+                ref_node: PropEnd::Other,
+                node_to_fold: PropEnd::Other,
+            },
+            ref_node,
+            node_to_fold,
+            ref_role: RefRole::Producer,
+            scale_down: crate::schedule::ddc::ScaleDown::No,
+        }
+    }
+
+    fn scan<'a>(slices: &'a WorkSlices) -> RowBundlingScan<'a, dsc2::FoldDim> {
+        RowBundlingScan {
+            units: PtRowPropagation {
+                src: SenComponent::Lx,
+                dest: SenComponent::L0,
+            },
+            ref_node: NodeId(2),
+            candidates: RowCandidates {
+                forward: &[],
+                reverse: &[],
+            },
+            sdsc_slices: slices,
+        }
+    }
+
+    fn stored(lds: u32) -> StoredStream {
+        StoredStream {
+            stream: DataStream {
+                origin: DataOrigin::LabeledDs(LdsIdx(lds)),
+                data_connect: Some(DataConnect::AconstConnect),
+            },
+            storage: DfirUnit::L0,
+        }
+    }
+
+    fn end(unit: SenComponent, connect: Option<DataConnect>) -> TransferFoldEnd<'static> {
+        TransferFoldEnd {
+            operand: Operand {
+                unit,
+                storage: SenComponent::NoComponent,
+                data: DataInfo {
+                    data_connect: connect,
+                    my_lds_idx: Some(LdsIdx(0)),
+                    constant_id: None,
+                    latch_data_id: None,
+                },
+            },
+            alloc: None,
+        }
+    }
+
+    #[test]
+    fn an_l0_allocation_below_its_reference_gains_both_its_own_folds_and_the_slice_views() {
+        let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, Vec::new()));
+        let core_ds = NoSplit;
+        let tree = Tree(vec![None, Some(0), Some(0)]);
+        let meta = Metadata::default();
+        let ctx = FoldContext {
+            dsc: &dsc,
+            core_ds: &core_ds,
+            tree: &tree,
+            distribution: &Seams,
+            ancestors: &NoLoops,
+            names: &Named,
+            meta: &meta,
+        };
+        let layout = AllocLayout(vec![(PrimaryDim::Out, None)]);
+        let padding = PaddingForm::default();
+        let slices = WorkSlices::default();
+        let sticks = StickDims::default();
+        let alloc = AllocationFoldTarget {
+            node: NodeId(1),
+            lds: LdsIdx(0),
+            component: SenComponent::L0,
+            layout: &layout,
+            padding: &padding,
+            work_slices: &slices,
+            dim_scales: BTreeMap::new(),
+            scale_up: None,
+            scale_down: None,
+            stick_dims: &sticks,
+            corelet_split_dim: None,
+            size_stage: &core_ds,
+            ref_kind: RefNode::Other,
+            consistency: None,
+        };
+        let ref_coord = ref_coordinate(PrimaryDim::Out);
+        let mut coord = dsc2::Coordinate::default();
+        let mut slice_view = dsc2::Coordinate::default();
+        let mut tracker = CoordPropTracker::default();
+        let mut params = Params::default();
+
+        assert!(build_fold_for_allocation::<Target, _, _, _, _, _, _, _>(
+            &ctx,
+            &alloc,
+            &propagation(NodeId(2), NodeId(1)),
+            &[PrimaryDim::Out],
+            &scan(&slices),
+            &ref_coord,
+            &slices,
+            &mut coord,
+            &mut slice_view,
+            &mut tracker,
+            &mut params,
+        ));
+        assert_eq!(folds_of(&coord, PrimaryDim::Out), propagated());
+        // ⭐ THE L0 ARM BUILDS A SECOND COORDINATE over the same levels — a port that wrote only the
+        // allocate one would pass every assertion above it.
+        assert_eq!(folds_of(&slice_view, PrimaryDim::Out), propagated());
+        assert!(coord.fold_constructed() && slice_view.fold_constructed());
+    }
+
+    #[test]
+    fn a_computes_second_input_on_the_same_labeled_ds_takes_the_whole_coordinate_over() {
+        let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, Vec::new()));
+        let core_ds = NoSplit;
+        let tree = Tree(vec![None, Some(0), Some(0)]);
+        let meta = Metadata::default();
+        let ctx = FoldContext {
+            dsc: &dsc,
+            core_ds: &core_ds,
+            tree: &tree,
+            distribution: &Seams,
+            ancestors: &NoLoops,
+            names: &Named,
+            meta: &meta,
+        };
+        let padding = PaddingForm::default();
+        let labeled_ds = BTreeMap::from([(
+            LdsIdx(0),
+            LabeledDsFold {
+                dim_scales: BTreeMap::new(),
+                stick_sizes: BTreeMap::new(),
+                padding: &padding,
+                category: ScaledLds::Regular,
+                mx: None,
+            },
+        )]);
+        let inputs_streams = [stored(0), stored(0)];
+        let loop_node = loop_named("loop0");
+        let non_alloc_loops = [(&loop_node, LoopDistribution::AboveChunk)];
+        let compute = ComputeFold {
+            node: NodeId(1),
+            ex_unit: SenComponent::Ptrow0,
+            inputs: &inputs_streams,
+            outputs: &[],
+            opaque: None,
+            labeled_ds: &labeled_ds,
+            bundling_producers: &[],
+            output_padding: None,
+            alloc_loops: &[],
+            non_alloc_loops: &non_alloc_loops,
+        };
+        let ref_coord = ref_coordinate(PrimaryDim::Out);
+        let ref_loops = [&loop_node];
+        let slices = WorkSlices::default();
+        let dims = [PrimaryDim::Out];
+        let reference = || FoldReference {
+            gate: RowBundling {
+                scan: scan(&slices),
+                ref_coord: RowCoordinate {
+                    dims: ref_coord.iter().collect(),
+                    work_slices: &slices,
+                },
+                retry_dims: &dims,
+            },
+            kind: FoldReferenceKind::NonAlloc {
+                node: NodeId(2),
+                dims: vec![(PrimaryDim::Out, coord_dim_of(&ref_coord, PrimaryDim::Out))],
+                dim_scales: BTreeMap::new(),
+                loops: &ref_loops,
+                prop_comp: NonAllocPropComp::TransferEnds {
+                    src: SenComponent::Lx,
+                    dst: SenComponent::L0,
+                },
+            },
+            ref_padding: &padding,
+        };
+        let selected = RelatedCoord {
+            coord: RelatedComputeCoord::Input(0),
+            lds: Some(LdsIdx(0)),
+        };
+        let prop = propagation(NodeId(2), NodeId(1));
+        let mut inputs = vec![dsc2::Coordinate::default(), dsc2::Coordinate::default()];
+        let mut output = dsc2::Coordinate::default();
+        let mut constructed = ConstructedCoords::default();
+        let mut tracker = CoordPropTracker::default();
+        let mut params = Params::default();
+        let mut offsets = Offsets::default();
+
+        let built = build_fold_for_compute::<Target, _, _, _, _, _, _, _, _, _>(
+            &ctx,
+            &compute,
+            &NoWindows,
+            &prop,
+            &dims,
+            reference(),
+            selected,
+            &mut ComputeCoordinates {
+                inputs: &mut inputs,
+                output: &mut output,
+            },
+            &mut constructed,
+            &mut tracker,
+            &mut params,
+            &mut offsets,
+        );
+        assert!(built);
+        assert_eq!(folds_of(&inputs[0], PrimaryDim::Out), propagated());
+        // The second input shares the working labeled DS, so it takes the whole coordinate.
+        assert_eq!(inputs[1], inputs[0]);
+        assert_eq!(constructed.inputs, vec![0, 1]);
+
+        // ⛔ THE TRAP: a compute that is its own reference answers BEFORE either out-vector is
+        // cleared, so a caller's earlier record survives.
+        let mut untouched = ConstructedCoords {
+            inputs: vec![7],
+            outputs: vec![9],
+        };
+        assert!(!build_fold_for_compute::<Target, _, _, _, _, _, _, _, _, _>(
+            &ctx,
+            &compute,
+            &NoWindows,
+            &Propagation {
+                ref_node: compute.node,
+                ..prop
+            },
+            &dims,
+            reference(),
+            selected,
+            &mut ComputeCoordinates {
+                inputs: &mut inputs,
+                output: &mut output,
+            },
+            &mut untouched,
+            &mut tracker,
+            &mut params,
+            &mut offsets,
+        ));
+        assert_eq!(
+            untouched,
+            ConstructedCoords {
+                inputs: vec![7],
+                outputs: vec![9],
+            }
+        );
+    }
+
+    #[test]
+    fn a_transfer_naming_its_reference_on_its_own_source_takes_that_references_levels() {
+        let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, Vec::new()));
+        let core_ds = NoSplit;
+        let tree = Tree(vec![None, Some(0), Some(0)]);
+        let meta = Metadata::default();
+        let ctx = FoldContext {
+            dsc: &dsc,
+            core_ds: &core_ds,
+            tree: &tree,
+            distribution: &Seams,
+            ancestors: &NoLoops,
+            names: &Named,
+            meta: &meta,
+        };
+        let loop_node = loop_named("loop0");
+        let non_alloc_loops = [(&loop_node, LoopDistribution::AboveChunk)];
+        let transfer_dims = [PrimaryDim::Out];
+        let transfer_size = BTreeMap::new();
+        let transfer = TransferFold {
+            node: NodeId(1),
+            // The source states the propagation's own `data_connect=`, which is what makes the
+            // reference the SOURCE end.
+            src: end(SenComponent::Lx, Some(DataConnect::AconstConnect)),
+            dsts: TransferFoldDsts {
+                first: end(SenComponent::L0, None),
+                rest: Vec::new(),
+            },
+            transfer_dims: &transfer_dims,
+            transfer_size: &transfer_size,
+            alloc_loops: &[],
+            non_alloc_loops: &non_alloc_loops,
+            pe_sfp_transfer_size: None,
+        };
+        let padding = PaddingForm::default();
+        let ref_coord = ref_coordinate(PrimaryDim::Out);
+        let ref_loops = [&loop_node];
+        let slices = WorkSlices::default();
+        let dims = [PrimaryDim::Out];
+        let reference = FoldReference {
+            gate: RowBundling {
+                scan: scan(&slices),
+                ref_coord: RowCoordinate {
+                    dims: ref_coord.iter().collect(),
+                    work_slices: &slices,
+                },
+                retry_dims: &dims,
+            },
+            kind: FoldReferenceKind::NonAlloc {
+                node: NodeId(2),
+                dims: vec![(PrimaryDim::Out, coord_dim_of(&ref_coord, PrimaryDim::Out))],
+                dim_scales: BTreeMap::new(),
+                loops: &ref_loops,
+                prop_comp: NonAllocPropComp::TransferEnds {
+                    src: SenComponent::Lx,
+                    dst: SenComponent::L0,
+                },
+            },
+            ref_padding: &padding,
+        };
+        let mut coord = dsc2::Coordinate::default();
+        let mut tracker = CoordPropTracker::default();
+        let mut params = Params::default();
+        let mut offsets = Offsets::default();
+
+        assert!(build_fold_for_transfer::<Target, _, _, _, _, _, _, _, _>(
+            &ctx,
+            &transfer,
+            &propagation(NodeId(2), NodeId(1)),
+            &dims,
+            reference,
+            &mut coord,
+            &mut tracker,
+            &mut params,
+            &mut offsets,
+        ));
+        assert_eq!(folds_of(&coord, PrimaryDim::Out), propagated());
+        // A non-allocation reference reaches no allocation, so the offsets seam is not one of this
+        // arm's effects.
+        assert_eq!(offsets, Offsets::default());
     }
 }
