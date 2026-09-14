@@ -15737,7 +15737,8 @@ mod tests_e283_e295 {
 
     /// e373 — OUT OF SPAN, on entry 287's own cross-core reduction: a corelet-split dim of one may not
     /// be chunked below the WHOLE core extent, which is the reference's own FIXME. ⛔ Every dim the
-    /// corelet split does not name keeps entry 365's `defaultParam` of one.
+    /// corelet split does not name keeps entry 365's `defaultParam` of one, and a dim it DOES name
+    /// but the core stage states no extent for answers the reference's `-1`.
     #[test]
     fn a_cross_core_reductions_corelet_split_dim_may_not_be_chunked_at_all() {
         /// `computeOp_` naming no op func at all, which entry 365 answers with `defaultParam`.
@@ -15760,6 +15761,21 @@ mod tests_e283_e295 {
         let min = |dim| min_param_for_dim::<Target, _>(&sdsc, &dsc, &NoOps, dim);
         assert_eq!(min(PrimaryDim::I), Some(Extent(8)));
         assert_eq!(min(PrimaryDim::Ki), Some(DEFAULT_MIN_PARAM));
+        // The control for the arm below: with no corelet split on it, `Mb` reaches entry 365.
+        assert_eq!(min(PrimaryDim::Mb), Some(DEFAULT_MIN_PARAM));
+
+        // ⛔ A corelet-split dim the core stage states NO extent for reaches the FIRST arm and
+        // answers the reference's `-1` default, which is this arm's absence and not a refusal.
+        let mut core = dsc.data_stages.core().clone();
+        core.ss
+            .dims
+            .corelet_split_mut()
+            .insert(PrimaryDim::Mb, vec![Extent(1), Extent(1)]);
+        dsc.data_stages.set(DATA_STAGE_CORE, core);
+        assert_eq!(
+            min_param_for_dim::<Target, _>(&sdsc, &dsc, &NoOps, PrimaryDim::Mb),
+            None
+        );
     }
 
     /// e374 — OUT OF SPAN, over entry 369's own coordinate build: the HBM allocation seeds the walk,
@@ -19584,8 +19600,17 @@ where
 /// is the CORE STAGE'S WHOLE EXTENT — the reference's own FIXME, which refuses to chunk that dim at
 /// all because neither an LX-opted half-and-half split nor a work-slice psum fold can state it.
 ///
+/// ⭐ THE WHOLE EXTENT AND NOT THE CORELET'S SHARE: `primaryDimToVal_st(dim)` passes no corelet id,
+/// so `primaryDimToVal_clView_st` (`dsc/dims.cpp:631`) skips its `coreletSplit_.at(clId)` arm and
+/// falls through to `primaryDimToVal_base_st` (`:516`) — for the very dim this arm has just found a
+/// corelet split for.
+///
 /// ⛔ [`None`] IS ENTRY 210'S REFUSAL — the LEFT operand of the `&&`, so it is reached whatever the
-/// corelet split says — as well as every one of entry 365's.
+/// corelet split says — as well as every one of entry 365's. ⛔ AND IN THE CORELET-SPLIT ARM IT IS A
+/// VALUE RATHER THAN A REFUSAL: a dim the core stage's `coreletSplit_` names but states no extent for
+/// answers the reference's `-1` default (`dsc/dims.h:162-193`), which is [`StageDims::extent`]'s
+/// absence. `isValidDimParam` (`L3DlOpsScheduler.h:227`) rejects that either way, and entry 377 asks
+/// it of the SAME value before it calls here.
 #[must_use]
 pub fn min_param_for_dim<A: Arch, D: ComputeOps + ?Sized>(
     sdsc: &SuperDsc,
@@ -19610,7 +19635,15 @@ pub fn min_param_for_dim<A: Arch, D: ComputeOps + ?Sized>(
 pub struct PropagatedAllocation {
     /// The node's tree identity.
     pub node: NodeId,
-    /// The allocate node itself — `name_`, `ldsIdx_`, `padding_` and `allocUsers_` are what is read.
+    /// The allocate node itself — `name_`, `component_`, `ldsIdx_`, `padding_`, `layoutDimOrder_`
+    /// and `allocUsers_` are what is read.
+    ///
+    /// ⛔ `component_` AND `layoutDimOrder_` ARE BOTH READ, AND A SEAM THAT LEAVES EITHER UNFILLED
+    /// CHANGES THE ANSWER SILENTLY: entry 369 tests `component_ == LX` for its cross-core arm
+    /// (`L3DlOpsScheduler.cpp:7173`) and `sliceCoordinateForCorelet` tests it again (`:7525`), so a
+    /// target held in another component takes neither; and `layoutDimOrder_` is half of entry 062's
+    /// related-dim set (`:7279`), which is what decides WHICH of the reference's coordinate dims are
+    /// copied at all — a target stating no layout keeps only the dims its enclosing loops name.
     pub alloc: AllocateNode,
     /// `getMutableOwnerLoop()` from that node, INNERMOST FIRST and the root loop LAST.
     pub loops: Vec<LoopNode>,
@@ -19634,6 +19667,13 @@ pub trait CoordPropTree {
     fn mem_org_allocation(&self, lds: LdsIdx, storage: SenComponent) -> Option<NodeName>;
 
     /// `userNode->nodeType_ == TRANSFER` ANSWERED WITH THE NODE, [`None`] for every other kind.
+    ///
+    /// ⛔ A TRANSFER WHOSE `dstLdsAndLoopOffsets_` IS EMPTY IS STILL A TRANSFER HERE. [`Dsts`] is
+    /// non-empty, so such a node is answered WITH a destination whose `data` names no lds and NOT
+    /// turned away: the HBM<->LX filter below reads only `dstVias_.front()`
+    /// (`L3DlOpsScheduler.cpp:7790-7797`), so the reference keeps the transfer and
+    /// `isDstLabeledDs()` (`dsc/dsc2.h:868`) alone drops the destination end — leaving the SOURCE
+    /// end a target that a [`None`] here would lose.
     fn transfer(&self, node: NodeId) -> Option<TransferNode>;
 
     /// `allocNode->allocateCoordinates_ = coordinate`.
