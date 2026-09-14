@@ -319,7 +319,7 @@ pub enum LdsSlot {
 }
 
 /// WHAT ENTRY 173 DOES TO THE DSC — the tail it reads, the LDS it inserts, the index it bumps, the
-/// tensor definition it follows, the interim list it appends to, and the tree slots it retags.
+/// interim list it appends to, and the tree slots it retags.
 ///
 /// ⭐ EVERY MUTATION THE REFERENCE PERFORMS IS ONE METHOD HERE; WHICH to call, in what order and
 /// with what value stays in the port. The `oldNewLdsPtrs` fixup is not here: re-seating raw pointers
@@ -329,10 +329,6 @@ pub trait InternalTensorSite {
     fn labeled_ds_tail(&self) -> Option<LabeledDsTail>;
     /// `++dsc.labeledDs_.back().ldsIdx_`.
     fn set_last_lds_idx(&mut self, lds: LdsIdx);
-    /// `ddlInterface.tensor_definition_`'s SSA names whose `ldsIdx_` is this one, IN MAP ORDER.
-    fn tensors_with_lds(&self, lds: LdsIdx) -> Vec<NameId>;
-    /// `tensor_definition_[tensor].ldsIdx_ = lds`.
-    fn set_tensor_lds(&mut self, tensor: NameId, lds: LdsIdx);
     /// `dsc.labeledDs_.insert(end() - 1, newLds)`, where `newLds` copies `dsType_`, `scale_`,
     /// `density_`, `wordLength` and `dataFormat_` from [`InternalTensor::reference`] and takes
     /// `segment_ = LdsSegment::STACK`, `isFirstUse_ = true` and
@@ -414,11 +410,15 @@ pub fn process_types(program: &Program, supported_types: &[NameId]) -> Option<Ve
 /// LDS's own index, appends it to the compute's `interimLabeledDs`, and retags every schedule-tree
 /// slot, allocation and prefilled external transfer that named the old last index.
 ///
-/// ⛔ TRAP: the `tensor_definition_` retag `break`s after the FIRST match over an `unordered_map`, so
-/// where several tensors carry the old last index WHICH ONE FOLLOWS IT IS ARBITRARY in the reference.
+/// ⛔⛔ REVIEWED: THE `tensor_definition_` RETAG WAS ROUTED THROUGH THE SITE, WHICH CANNOT REACH IT —
+/// the map `:499-504` bumps is the one `matchDdl2Dsc` prunes each LDS from (`:2336-2341`), and every
+/// caller threads it as `interface`, a borrow DISJOINT from `site`, so the effect was DROPPED.
+/// ⛔ TRAP: the retag `break`s after the FIRST match over an `unordered_map`, so WHICH tensor follows
+/// the old last index is ARBITRARY in the reference; here it is the lowest [`NameId`].
 /// ⛔ [`None`] where `labeledDs_` is empty — see [`LabeledDsTail`].
 pub fn add_internal_tensor<S: InternalTensorSite + ?Sized>(
     site: &mut S,
+    interface: &mut DdlInterface,
     metadata: &mut Metadata,
     reference: LdsIdx,
     compute_op: ComputeOpIdx,
@@ -427,8 +427,12 @@ pub fn add_internal_tensor<S: InternalTensorSite + ?Sized>(
     let old_last = tail.last_lds;
     let new_last = LdsIdx(old_last.0 + 1);
     site.set_last_lds_idx(new_last);
-    if let Some(&tensor) = site.tensors_with_lds(old_last).first() {
-        site.set_tensor_lds(tensor, new_last);
+    if let Some(prop) = interface
+        .tensor_definition
+        .values_mut()
+        .find(|prop| prop.lds == Some(old_last))
+    {
+        prop.lds = Some(new_last);
     }
     site.insert_internal_tensor(InternalTensor {
         lds: tail.insert_position,
@@ -3574,7 +3578,8 @@ fn op_opaque<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Op
         operand_at(stmt.operands, 0)?,
     )?
     .lds?;
-    let lds = add_internal_tensor(ctx.site, ctx.metadata, reference, ComputeOpIdx(0))?;
+    let lds =
+        add_internal_tensor(ctx.site, ctx.interface, ctx.metadata, reference, ComputeOpIdx(0))?;
     let ex_unit = *unroll_row_units(unit).first()?;
     // ⭐ THE OPAQUE FUNC IS A COMPUTE TYPE: the reference looks `op=` up in `stringToComputeType`,
     // so `muli32toi32` is a `type_` and not a separate opaque marker. ⛔ [`None`] IS *"Unknown
@@ -5079,7 +5084,8 @@ const fn data_origin(data: &DataInfo) -> Option<DataOrigin> {
 /// Replaces: e345_exportToDdl
 ///
 /// THE EXPORT ENTRY — `convertDsc2Ddl` verbatim, whose `std::ostream&` it forwards and which never
-/// writes it, so the emitted DDL IS the result and printing it is the caller's.
+/// writes it: the reference's only output is `ddlMlirRoot->dump()` to `llvm::errs()` (`:3507`), so
+/// the emitted DDL IS the result and printing it is the caller's.
 pub fn export_to_ddl<S: DdlSizes + ?Sized>(
     program: &Program,
     state: &DdlConversion,
@@ -5123,8 +5129,10 @@ pub struct RegionTree<'d> {
 /// a fresh `<parent>_region<n>` block where the op opened more than one.
 ///
 /// ⛔ [`None`] IS THE `DT_CHECK(numRegions == 0 || insertionPoint != nullptr)` and every refusal
-/// [`process_op`] answers with. ⛔ TRAP: an outcome region is an IDENTITY where the op's own list
-/// names it and a POSITION into that list otherwise — `ddl.loop` answers `RegionId(0)` positionally.
+/// [`process_op`] answers with. ⛔ TRAP: the reference is ALWAYS positional (`op.getRegion(i)`); an
+/// outcome region here is an IDENTITY where the op's own list names it, which agrees because only
+/// `ddl.if` answers more than one and it answers identities — every positional arm answers one, where
+/// both readings land on `regions[0]`.
 #[expect(
     clippy::too_many_arguments,
     reason = "the reference's own member state"
@@ -5259,8 +5267,11 @@ fn operand_group(operands: &[Operand], at: usize) -> Option<Vec<NameId>> {
     }
 }
 
-/// `layout_op.getDimensions()` with `getIsOrderFixed()`, and [`None`] for *"This op is used as a
-/// layout, but it is not"*.
+/// `layout_op.getDimensions()` with `getIsOrderFixed()`, and [`None`] for `DT_ERROR("Illegal ddl")`.
+///
+/// ⛔ REVIEWED: THE *"This op is used as a layout, but it is not"* DIAGNOSTIC IS NEVER PRINTED — the
+/// reference calls `emitError` ON THE NULL `LayoutOp` its own failed `dyn_cast` just handed back
+/// (`:2296-2297`), so it dereferences null before reaching the `DT_ERROR` this [`None`] stands for.
 fn layout_dims_of(program: &Program, layout: NameId) -> Option<(Vec<NameId>, bool)> {
     let stmt = program.definition(layout)?;
     let Attrs::Layout { order_fixed } = stmt.attrs else {
@@ -5321,7 +5332,7 @@ fn match_tensor<S: MatchSite + ?Sized>(
             let reference = operand_at(stmt.operands, 0)?;
             let reference =
                 tensor_prop(program, &mut interface.tensor_definition, reference)?.lds?;
-            let new_lds = add_internal_tensor(site, metadata, reference, compute_op)?;
+            let new_lds = add_internal_tensor(site, interface, metadata, reference, compute_op)?;
             let types = process_types(program, &operand_group(stmt.operands, 1)?)?;
             let ty = match types.as_slice() {
                 [only] => *only,
@@ -5478,7 +5489,8 @@ fn try_dim_mapping(
 /// per interim tensor, prunes each DDL dim's candidates from the layouts it appears in, then
 /// backtracks a dim assignment covering every non-broadcast DSC dim and fills the padded dims.
 ///
-/// ⛔ `Some(false)` IS *"Template not suitable for DSC"* and [`None`] IS EVERY `DT_ERROR`.
+/// ⛔ `Some(false)` IS A **SILENT** FALSE — *"Template not suitable for DSC"* is COMMENTED OUT at
+/// `:2285`, the tree's only occurrence — and [`None`] IS EVERY `DT_ERROR`.
 /// ⛔ TRAP: AN LDS INDEX IS POSITIONAL where a format, word length or stick is read from it and
 /// RECORDED where a layout is — the reference's `labeledDs_.at()` conflates the two.
 #[expect(
@@ -5607,6 +5619,8 @@ pub fn match_ddl2_dsc<S: MatchSite + ?Sized>(
                 site.set_slot_lds(slot, new);
             }
         }
+        // ⛔ THE KEYS FIRST: the reference `extract`s the element its own loop iterator points at and
+        // then `it++`s that now-invalidated iterator (`:2269-2278`).
         let prefilled = &mut metadata.prefilled_external_transfer_data_connects;
         let keys: Vec<(LdsIdx, ExternalStorage)> = prefilled
             .keys()
@@ -5747,6 +5761,8 @@ pub fn match_ddl2_dsc<S: MatchSite + ?Sized>(
     {
         return None;
     }
+    // ⛔ A SNAPSHOT OF THE KEYS: the reference reads `dim_association_[nonPaddedDim]` — an
+    // `operator[]` that may INSERT — while iterating that same map (`:2511-2515`).
     for dim in interface
         .dim_association
         .keys()
@@ -5921,11 +5937,10 @@ mod unit_tests {
     /// the one tensor definition that follows the old last index, and every retagged slot.
     #[test]
     fn mints_an_internal_tensor_and_retags_the_old_last_index() {
-        /// `labeledDs_` = [lds0, lds1], `tensor_definition_` = {%a: 1, %b: 1}, a tree naming lds1
-        /// from a compute input and an allocate, and one metadata-owned allocate node on lds1.
+        /// `labeledDs_` = [lds0, lds1], a tree naming lds1 from a compute input and an allocate,
+        /// and one metadata-owned allocate node on lds1.
         struct Site {
             last_lds: LdsIdx,
-            tensors: BTreeMap<NameId, LdsIdx>,
             slots: BTreeMap<LdsSlot, LdsIdx>,
             allocations: BTreeMap<AllocId, LdsIdx>,
             inserted: Vec<InternalTensor>,
@@ -5940,16 +5955,6 @@ mod unit_tests {
             }
             fn set_last_lds_idx(&mut self, lds: LdsIdx) {
                 self.last_lds = lds;
-            }
-            fn tensors_with_lds(&self, lds: LdsIdx) -> Vec<NameId> {
-                self.tensors
-                    .iter()
-                    .filter(|(_, at)| **at == lds)
-                    .map(|(name, _)| *name)
-                    .collect()
-            }
-            fn set_tensor_lds(&mut self, tensor: NameId, lds: LdsIdx) {
-                self.tensors.insert(tensor, lds);
             }
             fn insert_internal_tensor(&mut self, new: InternalTensor) {
                 self.inserted.push(new);
@@ -5978,7 +5983,6 @@ mod unit_tests {
 
         let mut site = Site {
             last_lds: LdsIdx(1),
-            tensors: BTreeMap::from([(NameId(0), LdsIdx(1)), (NameId(1), LdsIdx(1))]),
             slots: BTreeMap::from([
                 (LdsSlot::ComputeInput(NodeId(3), 0), LdsIdx(1)),
                 (LdsSlot::ComputeInput(NodeId(3), 1), LdsIdx(0)),
@@ -5988,6 +5992,16 @@ mod unit_tests {
             inserted: Vec::new(),
             interim: Vec::new(),
         };
+        // `tensor_definition_` = {%a: 1, %b: 1} — both name the old last index.
+        let mut interface = DdlInterface::default();
+        for name in [NameId(0), NameId(1)] {
+            interface.tensor_definition.insert(
+                name,
+                TensorProp {
+                    lds: Some(LdsIdx(1)),
+                },
+            );
+        }
         let mut metadata = Metadata::default();
         metadata.opaque_ops.insert(
             NodeId(7),
@@ -6012,7 +6026,13 @@ mod unit_tests {
             },
         );
 
-        let new = add_internal_tensor(&mut site, &mut metadata, LdsIdx(0), ComputeOpIdx(2));
+        let new = add_internal_tensor(
+            &mut site,
+            &mut interface,
+            &mut metadata,
+            LdsIdx(0),
+            ComputeOpIdx(2),
+        );
 
         assert_eq!(new, Some(LdsIdx(1)));
         assert_eq!(site.last_lds, LdsIdx(2));
@@ -6025,10 +6045,24 @@ mod unit_tests {
             }]
         );
         assert_eq!(site.interim, vec![(ComputeOpIdx(2), LdsIdx(1))]);
-        // ⛔ THE FIRST MATCH ONLY — `%b` keeps the old index, exactly as the reference's `break` does.
+        // ⛔⛔ ON THE INTERFACE AND NOT ON THE SITE — this is the map `matchDdl2Dsc` prunes from, and
+        // ⛔ THE FIRST MATCH ONLY: `%b` keeps the old index, exactly as the reference's `break` does.
         assert_eq!(
-            site.tensors,
-            BTreeMap::from([(NameId(0), LdsIdx(2)), (NameId(1), LdsIdx(1))])
+            interface.tensor_definition,
+            BTreeMap::from([
+                (
+                    NameId(0),
+                    TensorProp {
+                        lds: Some(LdsIdx(2))
+                    }
+                ),
+                (
+                    NameId(1),
+                    TensorProp {
+                        lds: Some(LdsIdx(1))
+                    }
+                ),
+            ])
         );
         assert_eq!(
             site.slots,
@@ -7116,10 +7150,6 @@ mod unit_tests {
             None
         }
         fn set_last_lds_idx(&mut self, _lds: LdsIdx) {}
-        fn tensors_with_lds(&self, _lds: LdsIdx) -> Vec<NameId> {
-            Vec::new()
-        }
-        fn set_tensor_lds(&mut self, _tensor: NameId, _lds: LdsIdx) {}
         fn insert_internal_tensor(&mut self, _new: InternalTensor) {}
         fn add_interim_lds(&mut self, _compute_op: ComputeOpIdx, _lds: LdsIdx) {}
         fn lds_slots(&self) -> Vec<LdsSlot> {
