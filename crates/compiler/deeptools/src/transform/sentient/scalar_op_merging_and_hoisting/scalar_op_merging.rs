@@ -839,8 +839,9 @@ fn record<E: ExpressionEvaluator>(
 /// one the operand chains walked so far have not already absorbed (`:869-895`).
 ///
 /// ⭐ ONE LOOP FOR THE REFERENCE'S TWO: a region at this rung is a single flat block.
-/// ⛔ THE SKIP SET IS KEYED BY THE RESULT AN OP BINDS, which is all [`build_block`] ever writes into
-/// it; an op that binds nothing takes the same `continue` the reference's `else` does.
+/// ⛔ THE SKIP SET IS KEYED BY THE RESULT AN OP BINDS, where the reference keys it by `Operation *`
+/// and records EVERY op it reaches (`:886`), arithmetic or not. Equivalent because the only reads of
+/// it are [`build_block`]'s climb up the operand chains, which an op binding nothing is not on.
 pub(crate) fn collect_blocks<A: Arch, E: ExpressionEvaluator>(
     region: &[Op],
     ibuff_space: IbuffSpace,

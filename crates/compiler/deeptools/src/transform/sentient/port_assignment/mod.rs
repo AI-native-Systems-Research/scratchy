@@ -1054,9 +1054,9 @@ impl<G: ColoringGraph> PortAssignment<G> {
     /// Numbers the unit's compute ops and yields in pre-order, then widens each compute operand's live
     /// range to every op that reads it (`:165-204`).
     ///
-    /// ⛔ TWO WALKS AND NOT ONE — *"Don't merge this step with before"* (`:175`): e520 reads the index
+    /// ⛔ TWO WALKS AND NOT ONE — *"Don't merge this step with before"* (`:174`): e520 reads the index
     /// of ops it has not reached yet, and an unnumbered one would read as instruction 0.
-    /// ⛔ A `select` LEAVES `$opA` UNPROCESSED (`:194-197`), and it is the only ternary operator there
+    /// ⛔ A `select` LEAVES `$opA` UNPROCESSED (`:193-196`), and it is the only ternary operator there
     /// is, so the arm is written as a match that a second one would break.
     /// ⭐ ONE `No` LOSES: it is the reference's `signalPassFailure()`, which does not unwind.
     pub(crate) fn compute_port_live_range<R: LiveRanges>(

@@ -707,7 +707,7 @@ fn simplified_value(
 /// not a program property, and this crate has no flags.
 const DISABLE_THIS_PASS: bool = false;
 
-/// `opts_.OptLevel == 0` (`:884`) — the pipeline's optimisation level, which is `2` by default
+/// `opts_.OptLevel == 0` (`:885`) — the pipeline's optimisation level, which is `2` by default
 /// (`dcc/tools/Options/dcc-pass-option.h:63-65`), so the shipped pipeline never reaches the
 /// `haveIbuffSpace` half of the `&&`.
 const OPT_LEVEL_ZERO: bool = false;
@@ -732,7 +732,7 @@ fn simplify_conditionals_pre_order(
     }
 }
 
-/// THE SECOND WALK — `unit->walk<PreOrder>` over the arithmetic and the transfers (`:897-914`).
+/// THE SECOND WALK — `unit->walk<PreOrder>` over the arithmetic and the transfers (`:904-919`).
 ///
 /// ⚠️ ONE [`ConstSink`] PER BLOCK where the reference has one for the whole unit: a nested op's
 /// constant lands at the head of ITS block, which still dominates the use.
@@ -749,7 +749,7 @@ fn simplify_arithmetic_pre_order(
         let before = scope.len();
         match &scope[at] {
             Op::Sentient(ops::Op::ScalarAdd { ty, .. } | ops::Op::ScalarSub { ty, .. }) => {
-                // `add_op.getInp1().getType()` (`:901`, `:906`) — the op's own type, which
+                // `add_op.getInp1().getType()` (`:908`, `:912`) — the op's own type, which
                 // `SameOperandsAndResultType` makes the first operand's.
                 let operand_type = *ty;
                 simplify_binary_operation(
@@ -803,7 +803,7 @@ fn simplify_arithmetic_pre_order(
 /// `signalPassFailure()`, so both walks still run.
 /// ⛔ THE MISSING ANALYSIS IS NAMED, NOT SUBSTITUTED FOR — `haveIbuffSpace` stays a `todo!` behind
 /// [`OPT_LEVEL_ZERO`], which the pipeline fixes rather than this pass.
-/// ⚠️ `markAnalysesPreserved<PropagationAnalysis>()` (`:917`) IS PASS-MANAGER BOOKKEEPING: no IR.
+/// ⚠️ `markAnalysesPreserved<PropagationAnalysis>()` (`:924`) IS PASS-MANAGER BOOKKEEPING: no IR.
 pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
     program: &mut Program<A, M, W>,
     expr_prop_analysis: &mut impl PropagationAnalysis,

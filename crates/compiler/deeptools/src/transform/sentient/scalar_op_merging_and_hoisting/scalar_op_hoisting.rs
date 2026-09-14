@@ -1031,7 +1031,7 @@ pub(crate) fn process_for_derived_iv_elimination<A: Arch, E: ExpressionEvaluator
     true
 }
 
-/// `-dcc-hoist-without-absorbing-ops` (`:114-119`) — *"Enable scalar op hoisting even if there are no
+/// `-dcc-hoist-without-absorbing-ops` (`:115-120`) — *"Enable scalar op hoisting even if there are no
 /// absorbing ops for the adjustment add op (innermost loop will always attempt to hoist)"*, whose
 /// `llvm::cl::init(true)` is this value.
 const HOIST_WITHOUT_ABSORBING_OPS: bool = true;

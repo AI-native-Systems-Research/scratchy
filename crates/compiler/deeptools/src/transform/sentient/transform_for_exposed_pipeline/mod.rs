@@ -688,7 +688,7 @@ fn erase_nops(scope: &mut Vec<Op>) {
 ///
 /// ⛔ THE NOP SWEEP IS UNCONDITIONAL AND COMES FIRST (`:353-359`), so a unit whose hazards have all
 /// been closed since loses its NOPs and gains none back — this pass is idempotent by rebuilding.
-/// ⛔ `precision->str()` ON A PT UNIT CARRYING NONE IS A `bad_optional_access` (`:362`), the same
+/// ⛔ `precision->str()` ON A PT UNIT CARRYING NONE IS A `bad_optional_access` (`:362-364`), the same
 /// unchecked deref [`super::canonicalize_xrf_pointers::run_on_operation`] preserves.
 /// ⛔ `cycles -= 1` "covering the exiting FMA operation" (`:365-367`) happens BEFORE the analysis, so
 /// both the hazard filter and the NOP count spend the reduced budget.

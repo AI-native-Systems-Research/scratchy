@@ -273,7 +273,7 @@ const DISABLE_THIS_PASS: bool = false;
 /// module.
 ///
 /// ⭐ THE STATISTIC IS BANKED INSIDE THE TREE SEAM: the reference assigns `set_send_dst_re_count` from
-/// `optimizer.optimize()` per unit (`:135`), which is [`run_on`]'s `tree.optimize` call, so the entry
+/// `optimizer.optimize()` per unit (`:136`), which is [`run_on`]'s `tree.optimize` call, so the entry
 /// has nothing of its own to answer with.
 pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(
     program: &mut Program<A, M, W>,

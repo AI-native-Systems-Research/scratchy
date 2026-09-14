@@ -93,7 +93,7 @@ use crate::islands::sentient::dialects::{
 use crate::model::Model;
 use crate::transform::sentient::ForRef;
 use crate::transform::sentient::remove_redundant_conditionals::redundant_conditional_manager::{
-    Doomed, process_if_op,
+    Doomed, InsertedAfter, process_if_op,
 };
 use crate::transform::sentient::utils::{InBlock, OpAt};
 use crate::workload::Workload;
@@ -102,18 +102,51 @@ use crate::workload::Workload;
 /// a program property, and this crate has no flags.
 const DISABLE_THIS_PASS: bool = false;
 
-/// `dcc::ConditionalTree`'s nodes that carry a `sentient.if` — the tree itself is the droppable
-/// mechanism for reaching them, so what is left is where each one SITS.
-fn if_paths(scope: &[Op], enclosing: &mut Vec<(InBlock, usize)>, out: &mut Vec<OpAt>) {
-    for (index, op) in scope.iter().enumerate() {
-        if matches!(op, Op::Sentient(sentient::Op::If { .. })) {
-            out.push(OpAt::at(enclosing, InBlock(index)));
-        }
-        for (region, block) in regions_ref(op).into_iter().enumerate() {
-            enclosing.push((InBlock(index), region));
-            if_paths(block, enclosing, out);
+/// `dcc::CondNode::walk<kPostOrder>` OVER THE CONDITIONALS OF ONE UNIT (`:318-319`) — the tree is the
+/// droppable mechanism for reaching them, so what is left is where each one SITS and IN WHAT ORDER: a
+/// conditional nested in an op before the op itself, and SIBLINGS IN PROGRAM ORDER, which is what
+/// `insertChildNode(child, nullptr)` appends off a pre-order build (`Analysis/OperationTree.cpp:145-153`
+/// and `:239-254`, `Analysis/ConditionalTree.cpp:185-223`). ⛔ ONLY `IfOp`s ARE NODES (`:225-227`), and
+/// a then-region node precedes an else-region one, which is this island's region order.
+///
+/// ⛔ THE REFERENCE HOLDS `Operation *` AND THIS HOLDS PATHS: what e466 inserted lands between the
+/// conditional it rewrote and the next one owed a visit, so the step is [`InsertedAfter`] wide and the
+/// conditional it created — no node of that tree — is stepped over rather than processed. The loop it
+/// moved in there took its own nested conditionals with it, which the reference still reaches as its
+/// own tree siblings, hence the descent.
+/// ⚠️ DIVERGENCE: those relocated conditionals are visited AT the fused conditional and not at the
+/// loop's old position, so a conditional standing between the two is visited after them, not before.
+fn simplify_post_order(
+    unit_body: &mut Vec<Op>,
+    enclosing: &mut Vec<(InBlock, usize)>,
+    to_be_deleted: &mut Vec<Doomed>,
+    values: &mut Values,
+) {
+    let mut index = InBlock(0);
+    loop {
+        let at = OpAt::at(enclosing, index);
+        let Some(regions) = at.op(unit_body).map(|op| regions_ref(op).len()) else {
+            return;
+        };
+        for region in 0..regions {
+            enclosing.push((index, region));
+            simplify_post_order(unit_body, enclosing, to_be_deleted, values);
             enclosing.pop();
         }
+        let mut step = 1;
+        if matches!(
+            at.op(unit_body),
+            Some(Op::Sentient(sentient::Op::If { .. }))
+        ) {
+            let InsertedAfter(inserted) = process_if_op(unit_body, &at, to_be_deleted, values);
+            step += inserted;
+            if inserted > 0 {
+                enclosing.push((InBlock(index.0 + inserted), 0));
+                simplify_post_order(unit_body, enclosing, to_be_deleted, values);
+                enclosing.pop();
+            }
+        }
+        index = InBlock(index.0 + step);
     }
 }
 
@@ -139,10 +172,11 @@ fn erase_for_op(scope: &mut Vec<Op>, iv: Val) {
 ///
 /// ⚠️ TRAP: THE QUEUE IS DRAINED PER UNIT AND NOT PER CONDITIONAL, because e466 leaves an emptied
 /// `sentient.for` standing while a later conditional may still be read against it.
-/// ⚠️ DIVERGENCE: `CondNode::walk<kPostOrder>` visits SIBLINGS FORWARD; we visit them backward, so
-/// that e466's insertions — always after the conditional it rewrote — cannot invalidate a path not yet
-/// processed. The outcome set is unchanged: the only cross-sibling coupling is e465's
-/// order-insensitive *"the parent has no more uses"* test.
+/// ⛔ THE ORDER IS THE PORT, AND IT IS [`simplify_post_order`]'s: e465 copies the predicate its
+/// producer carries AT THAT MOMENT, so a chain of conditionals collapses onto the outermost one only
+/// when the producer was reached first. Visiting siblings backward leaves the head of every chain
+/// alive, with its uses still standing.
+/// ⭐ `tree.empty()` (`:303`) NEEDS NO ARM: a unit holding no conditional gives the walk nothing.
 pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
     program: &mut Program<A, M, W>,
     values: &mut Values,
@@ -151,12 +185,8 @@ pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
         return;
     }
     for unit in program.units.iter_mut() {
-        let mut paths = Vec::new();
-        if_paths(&unit.body, &mut Vec::new(), &mut paths);
         let mut to_be_deleted: Vec<Doomed> = Vec::new();
-        for if_at in paths.iter().rev() {
-            process_if_op(&mut unit.body, if_at, &mut to_be_deleted, values);
-        }
+        simplify_post_order(&mut unit.body, &mut Vec::new(), &mut to_be_deleted, values);
         for doomed in to_be_deleted {
             match doomed {
                 Doomed::If(result) => erase_defining_op(&mut unit.body, result),
@@ -235,6 +265,77 @@ mod unit_tests {
             ),
             bound: core::marker::PhantomData,
         }
+    }
+
+    /// `sentient.if %lhs <pred> %rhs -> %result` yielding `then_val` and `else_val` and nothing else —
+    /// e354's *simple* conditional, which is the only shape e465 folds a parent of.
+    fn simple_if(
+        predicate: sentient::CmpPredicate,
+        lhs: Val,
+        rhs: Val,
+        result: Val,
+        then_val: Val,
+        else_val: Val,
+    ) -> Op {
+        Op::Sentient(sentient::Op::If {
+            predicate,
+            lhs,
+            rhs,
+            yielded: vec![sentient::Yielded {
+                result,
+                reg: sentient::Reg {
+                    locale: sentient::RegType::Unknown,
+                    index: None,
+                },
+                element_size: None,
+            }],
+            dbg_name: None,
+            then_body: vec![yield_op(vec![then_val])],
+            else_body: vec![yield_op(vec![else_val])],
+        })
+    }
+
+    /// e575 — THE SIBLING ORDER IS THE PORT: three conditionals, each testing the one before it,
+    /// collapse onto the OUTERMOST predicate and leave ONE, which is what reaching the producer first
+    /// gives. Backward, the head of the chain keeps a use and survives.
+    #[test]
+    fn e575_collapses_a_chain_onto_the_outermost_predicate() {
+        let (a, b, zero, one) = (Val(0), Val(1), Val(2), Val(3));
+        let (grand, parent, child) = (Val(4), Val(5), Val(6));
+        let mut program = one_unit(vec![
+            constant(a, 3),
+            constant(b, 4),
+            constant(zero, 0),
+            constant(one, 1),
+            simple_if(sentient::CmpPredicate::Slt, a, b, grand, one, zero),
+            simple_if(sentient::CmpPredicate::Eq, grand, one, parent, one, zero),
+            simple_if(sentient::CmpPredicate::Eq, parent, one, child, one, zero),
+        ]);
+        let mut values = Values::default();
+        // Val(0)..=Val(6) are taken above.
+        for _ in 0..7 {
+            let _ = values.mint();
+        }
+
+        run_on_operation(&mut program, &mut values);
+
+        let unit = program.units.iter().next().expect("the one unit");
+        let body = &unit.body;
+        // The four constants and the last conditional, now testing `%a slt %b` itself.
+        assert_eq!(body.len(), 5);
+        let Op::Sentient(sentient::Op::If {
+            predicate,
+            lhs,
+            rhs,
+            yielded,
+            ..
+        }) = &body[4]
+        else {
+            panic!("the surviving conditional");
+        };
+        assert_eq!(*predicate, sentient::CmpPredicate::Slt);
+        assert_eq!((*lhs, *rhs), (a, b));
+        assert_eq!(yielded[0].result, child);
     }
 
     /// e575 — e466's own case through the pass entry: the loop guarded by a conditional becomes a

@@ -2271,8 +2271,10 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
     /// Starts one unit from nothing but the module's constant locales, then records what every op in
     /// it already fixes (`:987-995`).
     ///
-    /// ⛔ TRAP: `std::map::insert` DOES NOT OVERWRITE — a value this unit already assigned keeps the
-    /// locale it has, which is why the seeding loop is an `or_insert`.
+    /// ⭐ `std::map::insert` DOES NOT OVERWRITE, AND HERE IT CANNOT MATTER: `clear()` empties
+    /// `assignments_` on the line above (`:988`, `:222-227`) and `global_const_assignments_` is a map,
+    /// so every key the loop seeds is fresh. The `or_insert` is the reference's spelling, not a live
+    /// tie-break — nothing this unit assigned survives to be kept.
     pub(crate) fn initialize_work_list<A: Arch>(
         &mut self,
         unit_type: DfirUnit,
@@ -2286,7 +2288,7 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
         self.initialize_assignments_in::<A>(unit_type, unit_body, &[], values);
     }
 
-    /// The `walk<WalkOrder::PreOrder>` of `:993-994`, one block at a time.
+    /// The `walk<WalkOrder::PreOrder>` of `:992-993`, one block at a time.
     ///
     /// ⛔ TRAP: e524 CREATES COPIES IN FRONT OF THE OP IT IS GIVEN, and MLIR's walk holds an iterator
     /// that an insertion before the current op does not move. The cursor therefore steps over

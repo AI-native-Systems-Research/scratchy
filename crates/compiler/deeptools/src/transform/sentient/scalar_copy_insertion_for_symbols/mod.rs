@@ -1008,7 +1008,7 @@ fn collect_usage(
 /// it, and the reason the trace calls below are present but not taken.
 const DEBUG: bool = false;
 
-/// `DEBUG_WITH_TYPE(VerboseDebug, ..)` — `DEBUG_TYPE "-verbose"` (`:41`), a second and narrower flag.
+/// `DEBUG_WITH_TYPE(VerboseDebug, ..)` — `DEBUG_TYPE "-verbose"` (`:60`), a second and narrower flag.
 const VERBOSE_DEBUG: bool = false;
 
 /// Replaces: e576_runOn
@@ -1021,8 +1021,9 @@ const VERBOSE_DEBUG: bool = false;
 /// `symbol_queries_` that `collectOpsOfInterest` filled, and `pessimizeLiveness` reads the
 /// `symbolic_locales_` that `collectSymbolUsage` filled — swapping any pair silently empties the next.
 /// ⭐ THE `Liveness` AND `RegisterPressure` ARE PARAMETERS, not built here: both are out of campaign
-/// scope, and the reference's own note is that an `rp` built before `pessimizeLiveness` is invalid
-/// afterwards — which is why its first dump, under [`VERBOSE_DEBUG`], reads a DIFFERENT instance.
+/// scope. ⛔ THE REFERENCE READS TWO PRESSURES — the child analysis for the first dump (`:151-152`)
+/// and a fresh `RegisterPressure rp(unit, liveness, ..)` built AFTER `pessimizeLiveness` for the
+/// candidates (`:194`, `:197`) — so the `rp` handed here must read the very `liveness` it pessimizes.
 #[expect(
     clippy::too_many_arguments,
     reason = "the reference reaches five of these through `this` and two more through the pass \

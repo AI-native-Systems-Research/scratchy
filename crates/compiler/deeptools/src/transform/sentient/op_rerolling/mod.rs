@@ -1435,7 +1435,7 @@ pub(crate) enum MergeXrfIntoMac {
 /// the unit it indexes: `op->getParentOfType<ProgramUnitOp>()` (`:1009-1012`) is the caller's fact.
 #[derive(Debug, Clone)]
 pub(crate) enum RerollScope {
-    /// `isa<dataflow::ProgramUnitOp>(op)` — the unit body itself (`:1004`).
+    /// `isa<dataflow::ProgramUnitOp>(op)` — the unit body itself (`:1010`).
     WholeUnit,
     /// An op inside it, whose own regions are what gets walked (`MultiDimLoopPeeling.cpp:676`).
     Op(OpAt),
@@ -1446,8 +1446,9 @@ pub(crate) enum RerollScope {
 /// Rerolls every block of the scope, innermost first, on the nine components that reroll at all, then
 /// merges a PT unit's scalar ops into the MAC ahead of them (`:1008-1036`).
 ///
-/// ⛔ TRAP: THE DD2 LDST BUG IS A `return`, NOT A SKIP (`:1024-1028`) — on `RCUDD1A` an L0, L0LU or
-/// L0SU unit leaves this having done nothing at all, the PT tail included.
+/// ⛔ TRAP: THE DD2 LDST BUG IS A `return` AND THIS SKIPS (`:1025-1027`) — on `RCUDD1A` an L0, L0LU
+/// or L0SU unit rerolls nothing; falling through to the PT tail instead of leaving costs nothing,
+/// because no unit is both `L0*` and `PT`.
 /// ⭐ `getUnitType` IS THE GENERIC COMPONENT, so a PT row and a PT row span are both `PT` here.
 /// ⛔ `DT_CHECK(unit_op.getUnits().size() >= 1)` IS DISCHARGED BY [`crate::islands::dataflow_ir::Units`].
 pub(crate) fn run_op_rerolling<A: Arch>(
@@ -1496,7 +1497,7 @@ pub(crate) fn run_op_rerolling<A: Arch>(
     }
 }
 
-/// The `walk<WalkOrder::PostOrder>` over blocks (`:1029-1030`): the nested ones first.
+/// The `walk<WalkOrder::PostOrder>` over blocks (`:1028-1029`): the nested ones first.
 fn reroll_blocks(ty: DfirUnit, block: &mut Vec<Op>, sen_target: SenTarget, values: &mut Values) {
     for at in 0..block.len() {
         for region in regions_mut(&mut block[at]) {

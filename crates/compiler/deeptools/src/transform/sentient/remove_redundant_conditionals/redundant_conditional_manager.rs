@@ -177,6 +177,14 @@ pub enum Doomed {
     For(ForRef),
 }
 
+/// HOW MANY OPS A REWRITE PUT DIRECTLY AFTER THE CONDITIONAL IT REWROTE — 0, or e466's two.
+///
+/// ⛔⛔ THE REFERENCE NEEDS NO SUCH ANSWER: its tree node holds an `Operation *`, which an insertion
+/// into the block cannot move, while a path is an index. The walk that carries one has to step over
+/// what landed behind it, and over the conditional e466 created, which is no node of that tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertedAfter(pub usize);
+
 /// WHAT THE PARENT CONDITIONAL LETS THIS ONE DO — the two arms of `:172` and `:194` as one answer, so
 /// that every read of the IR happens before the first write to it.
 #[derive(Debug, Clone)]
@@ -449,9 +457,9 @@ pub fn update_if_op_feeding_dyn_loop_bound(
     if_at: &OpAt,
     to_be_deleted: &mut Vec<Doomed>,
     values: &mut Values,
-) {
+) -> InsertedAfter {
     let Some(plan) = fuse_plan(unit_body, if_at) else {
-        return;
+        return InsertedAfter(0);
     };
     let new_loop_bound = values.mint();
     let for_at = if_at.sibling(plan.for_index);
@@ -510,6 +518,7 @@ pub fn update_if_op_feeding_dyn_loop_bound(
         then_body.splice(0..0, moved);
     }
     to_be_deleted.push(Doomed::If(plan.if_result));
+    InsertedAfter(2)
 }
 
 /// Which side of the predicate a `sentient.scalar_constant` defines — `const_val_` with the OTHER side
@@ -539,17 +548,18 @@ fn predicate_constant(unit_body: &[Op], if_at: &OpAt) -> Option<(WidestInt, Val)
 /// ⛔ TRAP: `isa<BlockArgument>` IS A NULL GUARD, NOT A CASE — a bare `dyn_cast` on a region argument's
 /// null `getDefiningOp()` asserts, and [`Definitions::of`] answering [`None`] covers both.
 /// ⚠️ TRAP: THE LHS WINS WHEN BOTH SIDES ARE CONSTANT, so `non_const_side_` is then the constant RHS.
+/// ⭐ IT ANSWERS [`InsertedAfter`], which is the walk's business and none of the reference's.
 pub fn process_if_op(
     unit_body: &mut Vec<Op>,
     if_at: &OpAt,
     to_be_deleted: &mut Vec<Doomed>,
     values: &mut Values,
-) {
+) -> InsertedAfter {
     let Some((const_val, non_const_side)) = predicate_constant(unit_body, if_at) else {
-        return;
+        return InsertedAfter(0);
     };
     update_if_op_based_on_parent_if_op(unit_body, if_at, non_const_side, const_val, to_be_deleted);
-    update_if_op_feeding_dyn_loop_bound(unit_body, if_at, to_be_deleted, values);
+    update_if_op_feeding_dyn_loop_bound(unit_body, if_at, to_be_deleted, values)
 }
 
 #[cfg(test)]

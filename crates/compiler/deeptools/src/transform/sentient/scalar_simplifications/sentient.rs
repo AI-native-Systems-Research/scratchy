@@ -667,8 +667,9 @@ pub(crate) enum Propagation {
 /// [`light_weight_simplify_binary_arithmetic`], then erases what the walk queued.
 ///
 /// ⛔ A FAILED PROPAGATION ANALYSIS SIMPLIFIES NOTHING (`:691-693`), and the entry WIDENS TO THE
-/// PARENT for `uniform.uniformize_regions`/`uniform.equalize_pattern` (`:696-698`) — the block this
-/// takes is the widened one, which for every caller in the tree is a unit body (`:700`).
+/// PARENT for `uniform.uniformize_regions`/`uniform.equalize_pattern` (`:698-699`) before taking the
+/// first block of its region 0 (`:700`) — the block this takes is that one, and the widening is
+/// unreached for every caller in the tree, which all pass a `dataflow.program_unit`.
 pub(crate) fn run_old_light_weight_simplifications(
     scope: &mut Vec<Op>,
     expr_prop_analysis: &mut impl PropagationAnalysis,
