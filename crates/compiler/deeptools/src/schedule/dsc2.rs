@@ -1949,7 +1949,7 @@ impl ScheduleTree {
 
     /// The same search over the `SYNC` nodes, which neither [`Self::find_block_mut`] nor
     /// [`Self::find_guarded_mut`] yields — `otherEndOfTheSignals_` is bound onto the sync nodes
-    /// THEMSELVES (`ddc/ddl/ddl_conversion.cpp:2810`), and a signal names its two ends by name.
+    /// THEMSELVES (`ddc/ddl/ddl_conversion.cpp:2813`), and a signal names its two ends by name.
     pub fn find_sync_mut(
         &mut self,
         accepts: impl Fn(&SyncNode) -> bool + Copy,

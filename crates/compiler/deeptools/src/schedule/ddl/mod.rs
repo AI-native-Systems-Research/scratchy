@@ -237,8 +237,10 @@ impl DdlModuleOp {
     /// ⭐ THE CONTEXT IS NOT OBSERVABLE: `mlir_context_` is read at ONE place in the whole tree, the
     /// `DdlMain` call on the next line (`ddl.cpp:128`), so a fresh per-buffer `Threading::DISABLED`
     /// context is [`Dialect::initialize`] plus a performance decision.
-    /// ⛔ A FAILED PARSE CLEARS THE MODULE rather than leaving the previous one — the assignment is
-    /// unconditional, and `OwningOpRef`'s move-assign destroys whatever it held.
+    /// ⛔ A FAILED OPEN CLEARS THE MODULE rather than leaving the previous one — the assignment is
+    /// unconditional and `OwningOpRef`'s move-assign ERASES whatever it held. A source that opens and
+    /// then parses to nothing never reaches that assignment, because `DdlMain`'s own `DT_CHECK(op)`
+    /// (`ddl.cpp:106`) raises first; both failures are [`None`] here, and entry 372 stops on either.
     pub fn parse_ddl(&mut self, input_file: Option<impl DdlSource>) {
         let registry = Dialect::initialize();
         self.module = ddl_main_of_file(input_file, &registry);
@@ -252,13 +254,16 @@ impl DdlModuleOp {
     }
 
     /// `ddl_module_op_.release()` — GIVES UP THE PARSED MODULE, which entry 372 does after a candidate
-    /// that did not match (`ddl_conversion.cpp:80`).
+    /// that did not match (`ddl_conversion.cpp:88`).
     ///
     /// ⛔ NOT REDUNDANT WITH THE NEXT [`Self::parse_ddl`], even though the reference's own comment reads
-    /// *"clear for next try"*: on the LAST candidate there is no next parse, so this is what leaves the
-    /// unmatched module behind instead of holding it.
-    /// ⛔ AND IT LEAKS IN THE REFERENCE — `OwningOpRef::release()` hands back a pointer nobody takes —
-    /// which is a fact about `MLIRContext` ownership and not about the module this held.
+    /// *"clear for next try"*: that one replaces `mlir_context_` FIRST and `ddl_module_op_` SECOND
+    /// (`ddl.cpp:126-128`), the reverse of the member order `~DdlModuleOp` unwinds (`ddl.h:21-22`), so a
+    /// module still held there would be erased by the move-assign only after the context owning its
+    /// storage had already gone. Nulling it first is what keeps that order from inverting — and on the
+    /// LAST candidate there is no next parse at all.
+    /// ⛔ AND IT LEAKS: `release()` swaps in `nullptr` and RETURNS the op, and line 88 discards it, so
+    /// nothing ever erases the operation tree.
     pub fn release(&mut self) {
         self.module = None;
     }

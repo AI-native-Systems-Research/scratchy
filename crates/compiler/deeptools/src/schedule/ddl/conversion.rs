@@ -1985,6 +1985,10 @@ impl DdlConversion {
 
     /// The name of the block a [`BlockId`] addresses, which is how `belowLxScheduleInsertBlock`
     /// resolves to a block of [`Self::tree`].
+    ///
+    /// ⛔ MINTED NODES ONLY — [`Self::node_ids`] is written by [`Self::mint_node`], so neither the head
+    /// nor a block the tree was seeded with is ever named here. That is the other half of entry 364's
+    /// trap: its `belowLxScheduleInsertBlock == getHeadMutable()` comparison cannot hold.
     fn block_name(&self, block: BlockId) -> Option<NodeName> {
         let node = block.node();
         self.node_ids
@@ -5827,7 +5831,7 @@ pub struct DdlRoot<'d> {
     pub transformations: Vec<Vec<Transformation>>,
 }
 
-/// `insertOtherEnds` (`ddl_conversion.cpp:2795-2814`) — every node of `other_end` appended to the
+/// `insertOtherEnds` (`ddl_conversion.cpp:2798-2817`) — every node of `other_end` appended to the
 /// other-end list of every node of `base`.
 ///
 /// ⛔ BOTH `DT_ERROR`S ARE [`None`]: an empty `other_end` is *"does not have matching syncs"*, and one
@@ -5910,7 +5914,7 @@ pub fn parse_ddl2_dsc<S: DdlSite + ?Sized>(
             program, interface, metadata, dsc, body,
         )?);
     }
-    // `// connect sync nodes` (`:2793`) — every signal, per corelet, in both directions.
+    // `// connect sync nodes` (`:2796`) — every signal, per corelet, in both directions.
     for prop in interface.sync_definitions.values() {
         for ends in prop.syncs_per_cl.values() {
             insert_other_ends(state, &ends.senders, &ends.receivers)?;
@@ -6129,11 +6133,14 @@ mod unit_tests {
     /// ⭐⭐ THE WHOLE OF ENTRY 364 OVER ONE MODULE: `root_level_operations` is minted at the FRONT of
     /// the head, the dataflow region is walked under THAT block, the transformations region turns
     /// transfer promotion off, and each end of the signal gains the other's name.
-    /// ⛔ AND THE NEGATIVE: senders with NO receivers is *"does not have matching syncs"*.
+    /// ⛔ AND BOTH NEGATIVES: senders with NO receivers is *"does not have matching syncs"*, and two
+    /// senders sharing a unit is *"Multiple sync ops ... have same unit"* — the second is the ONLY way
+    /// that check can fire, since [`SyncUnits`] makes a repeat WITHIN one node unconstructible.
     #[test]
     fn walks_both_regions_under_a_minted_root_block_and_pairs_the_sync_ends() {
         let program = synthetic(&[], &[]);
         let sender = NodeName("send".to_owned());
+        let twin = NodeName("send_twin".to_owned());
         let receiver = NodeName("recv".to_owned());
         let sync = |name: &NodeName, direction| {
             SchedNode::Sync(SyncNode {
@@ -6145,19 +6152,13 @@ mod unit_tests {
                 other_ends: Vec::new(),
             })
         };
-        let run = |receivers: Vec<NodeName>| {
+        let run = |senders: Vec<NodeName>, receivers: Vec<NodeName>| {
             let mut interface = DdlInterface::default();
             interface.sync_definitions.insert(
                 SyncSignal::InputToLxsuToLxluToSync,
                 SyncProp {
                     separate_corelets: false,
-                    syncs_per_cl: BTreeMap::from([(
-                        None,
-                        SyncEnds {
-                            senders: vec![sender.clone()],
-                            receivers,
-                        },
-                    )]),
+                    syncs_per_cl: BTreeMap::from([(None, SyncEnds { senders, receivers })]),
                 },
             );
             let mut metadata = Metadata::default();
@@ -6168,6 +6169,7 @@ mod unit_tests {
                 name: NodeName("head".to_owned()),
                 children: vec![
                     sync(&sender, SyncDirection::Send),
+                    sync(&twin, SyncDirection::Send),
                     sync(&receiver, SyncDirection::Receive),
                 ],
             });
@@ -6186,7 +6188,7 @@ mod unit_tests {
             );
             (said, state, interface, metadata)
         };
-        let (said, state, interface, metadata) = run(vec![receiver.clone()]);
+        let (said, state, interface, metadata) = run(vec![sender.clone()], vec![receiver.clone()]);
         assert_eq!(said, Some(vec![TRANSFER_PROMOTION_DISABLED.to_owned()]));
         assert!(!metadata.transformation_config.enable_moving_data_transfer);
         let root = NodeName("root_level_operations".to_owned());
@@ -6206,9 +6208,13 @@ mod unit_tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![vec![receiver.clone()], vec![sender.clone()]]
+            vec![vec![receiver.clone()], Vec::new(), vec![sender.clone()]]
         );
-        assert_eq!(run(Vec::new()).0, None);
+        assert_eq!(run(vec![sender.clone()], Vec::new()).0, None);
+        assert_eq!(
+            run(vec![sender.clone(), twin.clone()], vec![receiver.clone()]).0,
+            None
+        );
     }
 
     /// A program with hand-written statements, wearing the first vendored program's template so that
