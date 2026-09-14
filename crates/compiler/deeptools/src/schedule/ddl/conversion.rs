@@ -180,7 +180,7 @@ use crate::schedule::ddc::metadata::{
 };
 use crate::schedule::ddc::transformation::{DsType, LoopId, Scale};
 use crate::schedule::ddc::transformation_util::StageName;
-use crate::schedule::ddc::transformation_util::{LoopCond, LoopCondComposite};
+use crate::schedule::ddc::transformation_util::{LoopCond, LoopCondComposite, is_memory};
 use crate::schedule::ddc::v1::CoreClSet;
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::dsc2::{
@@ -191,7 +191,9 @@ use crate::schedule::dsc2::{
     Repetition, ReplicationFactor, SchedNode, ScheduleTree, StartAddress, SyncDirection, SyncNode,
     SyncStrength, SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
 };
-use crate::schedule::l3::dsc::{CoreCount, DesignSpaceConfig, EmptyStage, PadSizes};
+use crate::schedule::l3::dsc::{
+    CoreCount, CoreletsUsed, DesignSpaceConfig, EmptyStage, PadSizes, WkSlice, WkSliceId,
+};
 use crate::units::{Core, Corelet, NumFolds, rows_of};
 
 // ⭐ TYPES FOR ENTRIES 172-179 — the `DdlInterface` sub-structures those entries read and write, and
@@ -1640,9 +1642,9 @@ pub struct PaddedDimension<'d> {
 /// TIES A PADDED DDL DIM TO ITS UNPADDED ONE and admits its meta dims — at most one dim of each kind,
 /// each carrying the unpadded dim as its own `nonPaddedDim`.
 ///
-/// ⛔⛔ ONE `dimsSeen` MAP SPANS BOTH LOOPS. No kind is admissible in both groups, so the shared
-/// budget is only observable through a `window=` dim whose kind a `padding=` dim already claimed —
-/// which cannot happen, making the second loop's repeat check dead for every legal DDL.
+/// ⛔⛔ ONE `dimsSeen` MAP SPANS BOTH LOOPS, and only the CROSS-GROUP half of that is unobservable:
+/// no kind is admissible in both groups. Each group's OWN repeat check is load-bearing — two
+/// `padding=` dims of one kind, or two `window=` dims of one kind, are the refusal.
 /// ⛔ [`None`] IS EVERY *"Illegal ddl"*: a definition that is not a `ddl.padded_dimension`, a primary
 /// dim that is not `Unpadded`, an inadmissible kind, and a repeated kind.
 pub fn process_padded_dimension_op(
@@ -1840,8 +1842,14 @@ pub trait DdlSite: AllocationSite + InternalTensorSite {
     /// `sdsc.numWkSlicesPerDim_.at(dim)`, absent for a dim the SuperDSC does not split.
     fn wk_slices(&self, dim: PrimaryDim) -> Option<u32>;
 
-    /// `sdsc.findCoreBySlice(dim, slice)`.
-    fn core_by_slice(&self, dim: PrimaryDim, slice: u32) -> Option<Core>;
+    /// `sdsc.coreIdToWkSlice_` — every core the super-DSC states, with its work slice per dim.
+    ///
+    /// ⛔⛔ NOT A `findCoreBySlice(dim, slice)`, WHICH IS WHAT THIS ASKED FOR AND DOES NOT EXIST: the
+    /// ring's neighbour lookup (`ddl_conversion.cpp:1966-1972`) is a LOCAL LAMBDA that replaces ONE
+    /// coordinate of the visited core's FULL slice vector and searches for the core holding the
+    /// result. A work split over two dims puts several cores on one elected slice and only the whole
+    /// vector tells them apart, so a per-slice lookup cannot express it.
+    fn core_work_slices(&self) -> BTreeMap<Core, WkSlice>;
 
     /// `dsc.primaryDsInfo_.at(labeledDs_.at(lds).dsType_)`'s `stickDimOrder_`/`stickSize_` pair —
     /// what [`cumulative_stick_sizes`] is asked of.
@@ -2097,9 +2105,23 @@ fn corelet(index: u32) -> Option<Corelet> {
     Corelet::checked(index)
 }
 
+/// `dsc.numCoreletsUsed_DSC2_ == 2` — the gate the sync split and the ring's second corelet share,
+/// whose `-1` is `false` rather than a refusal.
+fn corelets_used_dsc2(dsc: &DesignSpaceConfig) -> bool {
+    dsc.corelets_used_dsc2.is_some_and(|used| used.get() == 2)
+}
+
 /// `numCoreletsUsed_DSC2_` as the corelets themselves.
+///
+/// ⛔⛔ REVIEWED: THIS READ `numCoreletsUsed_` — every one of the eight corelet counts in the
+/// reference file is `numCoreletsUsed_DSC2_` (`ddl_conversion.cpp:331`, `:340`, `:1029`, `:1733`,
+/// `:1978`, `:1986`, `:1995`, `:2164`), never the other field, and the two differ before entry 054's
+/// `prepDsc` runs. The `-1` a DSC is built with is a loop that does not execute, so [`None`] is NO
+/// corelets rather than a refusal.
 fn corelets_of(dsc: &DesignSpaceConfig) -> Vec<Corelet> {
-    (0..dsc.corelets_used.get()).filter_map(corelet).collect()
+    (0..dsc.corelets_used_dsc2.map_or(0, CoreletsUsed::get))
+        .filter_map(corelet)
+        .collect()
 }
 
 /// The `dsc2` spelling of a comparison — both enums are `dsc/dscdefn.h:95` verbatim, so the join is
@@ -2136,21 +2158,14 @@ fn dsts_from(ends: Vec<DscOperand>, hops: Vec<Hops>) -> Option<Dsts> {
     Some(Dsts::new(*first, rest.to_vec()).with_hops(hops))
 }
 
-/// `dsc2::memories.count(component)` — the eight components an allocation may name.
-#[must_use]
-pub const fn is_memory(component: SenComponent) -> bool {
-    matches!(
-        component,
-        SenComponent::L0
-            | SenComponent::L0Scale
-            | SenComponent::Lx
-            | SenComponent::Pelrf
-            | SenComponent::Ptarf
-            | SenComponent::Ptxrf
-            | SenComponent::Sfplrf
-            | SenComponent::Sfpstate
-    )
-}
+// ⛔⛔ REVIEWED: `dsc2::memories` HAS SIXTEEN MEMBERS (`dsc/dscdefn.cpp:142-144`) and this file
+// carried a local EIGHT — the image of `memory_component`, which is a different question. Every
+// live ask here is `dsc2::memories.count(..)` in the reference (`ddl_conversion.cpp:967`, `:985`,
+// `:1198`, `:1203`, `:3091`, `:3162`; the compute and transfer arms share one `Emission::unit`), and
+// the last two read a storage off the DSC's own `DataLocation`, where HBM and PTIRF are ordinary: on
+// those the local set answered false and entry 325 emitted a bare `ddl.unit` where the reference
+// emits its tensor/allocate pair. Entry 250's `is_memory` is the one verified table, so this file
+// asks it.
 
 /// The `Metadata::newAllocations_` key a storage component is — `ddc::memories`, which has no
 /// `Sfpstate` and so refuses one.
@@ -2574,6 +2589,12 @@ fn process_allocation<S: DdlSite + ?Sized>(
                 .new_allocations
                 .entry(ddc_memory(storage)?)
                 .or_default();
+            // `DT_CHECK(allocMeta.find(constIdx_) == allocMeta.end())` (`:846`) — the constant arm's
+            // own duplicate guard, which the LDS arm above keeps too. `allocations_[storage]` beside
+            // it IS an overwriting `operator[]`, so only this one refuses.
+            if held.cons_id_and_alloc_node.contains_key(&constant) {
+                return None;
+            }
             held.cons_id_and_alloc_node.insert(constant, alloc);
             AllocateNode {
                 name: NodeName(format!(
@@ -2585,6 +2606,12 @@ fn process_allocation<S: DdlSite + ?Sized>(
                 lds: None,
                 const_idx: Some(constant),
                 temp_storage_for_compute: None,
+                // ⛔ THE REFERENCE LEAVES `layoutDimOrder_` AND `maxDimSizes_` EMPTY HERE — only the
+                // LDS arm fills them (`:798-803`) — and [`AllocLayout`] is non-empty by construction
+                // because `layoutDimOrder_.at(0)` is unguarded wherever it is read. Every reader
+                // reaches an allocation through an LDS, so this stands in for a layout nothing asks
+                // of a constant; entry 325's emission is gated on [`AllocateNode::lds`] to keep it
+                // out of the DDL.
                 layout: AllocLayout::new((PrimaryDim::X, MaxDimSize::Unset), Vec::new()),
                 start_address: StartAddress::default(),
                 placement,
@@ -3485,7 +3512,8 @@ fn op_get_external_datastage<S: DdlSite + ?Sized>(
 /// ⛔ A RESOLVED CONDITION DESCENDS EXACTLY ONE REGION and mints nothing, which is how a template's
 /// dead branch never reaches the tree at all. ⭐ THE SPLIT-LOOP ADJUSTMENT IS DEFERRED: every
 /// core/chunk dim with more than one loop needs its terms re-pointed, and
-/// `adjustConditionForSplitLoop` is a `dsc/` function outside this campaign's file list.
+/// `adjustConditionForSplitLoop` is a `dsc/` function outside this campaign's file list — the same
+/// gap entry 250 declares as `ScheduleSurgery::adjust_condition_for_split_loop`.
 fn op_if<S: DdlSite + ?Sized>(
     ctx: &mut OpContext<'_, S>,
     condition: NameId,
@@ -3729,7 +3757,10 @@ fn op_sync<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
         implicit_sync_ref_transfer: None,
         other_ends: Vec::new(),
     };
-    if separate_corelets && ctx.dsc.corelets_used.get() == 2 {
+    // `syncProp.separateCorelets_ && dsc.numCoreletsUsed_DSC2_ == 2` (`:1733`) — ⛔ REVIEWED: the
+    // DSC2 count and not `numCoreletsUsed_`, and the `-1` an unprepared DSC carries is `false`.
+    let two_corelets = corelets_used_dsc2(ctx.dsc);
+    if separate_corelets && two_corelets {
         let guard = NodeName(format!("condition_separate_corelets_{name}"));
         let then_name = NodeName(format!("{name}_then_region"));
         let else_name = NodeName(format!("{name}_else_region"));
@@ -3988,64 +4019,95 @@ fn op_force_innermost_dimensions<S: DdlSite + ?Sized>(
 /// `ddl::CoreToCoreCommunicationOp` — resolves the SFPRING ring: which core each (core, corelet)
 /// sends to and receives from, plus the two conditions that name the ends of the chain.
 ///
-/// ⛔ A SINGLE SLICE RESOLVES BOTH CONDITIONS TRUE and walks no ring at all — one core is both the
-/// start and the end of its own chain. ⭐ THE TWO CORELETS WALK OPPOSITE WAYS: corelet 0 increasing
-/// and corelet 1 decreasing, which is what makes the ring a ring rather than two chains.
+/// ⛔⛔ A SINGLE SLICE RESOLVES BOTH CONDITIONS STATICALLY TRUE AND WRITES NO CORE/CORELET SET
+/// (`:1951-1953`) — one core is both ends of its own chain, so entry 323's `ddl.if` mints NO
+/// condition node for either. ⛔ THE ELECTED DIM IS THE FIRST MAPPED ONE, OVERRIDDEN BY A SPLIT ONE,
+/// and a `dropDim_` operand is skipped. ⭐ THE TWO CORELETS WALK OPPOSITE WAYS — corelet 0 toward the
+/// increasing slice, corelet 1 the other way — and corelet 1 is written ONLY where
+/// `numCoreletsUsed_DSC2_ == 2`. ⛔ [`None`] IS *"More than one reduction dim is split across
+/// cores"*, *"None of the dimensions is mapped"* and *"Slice not found"*.
 fn op_core_to_core<S: DdlSite + ?Sized>(
     ctx: &mut OpContext<'_, S>,
     stmt: &Stmt,
 ) -> Option<OpOutcome> {
-    let dim = operand_names(stmt.operands)
-        .into_iter()
-        .flatten()
-        .find_map(|name| ctx.interface.dim_association.get(&name)?.dim)?;
+    let mut elected: Option<PrimaryDim> = None;
+    let mut split_found = false;
+    for name in operand_names(stmt.operands).into_iter().flatten() {
+        // An operand that is no dim of this template, and a DROPPED dim, are both the `continue`.
+        let Some(prop) = ctx.interface.dim_association.get(&name) else {
+            continue;
+        };
+        if prop.drop_dim {
+            continue;
+        }
+        // ⛔ AN UNASSIGNED DIM IS `numWkSlicesPerDim_.at(PrimaryDimTypesCount)`, which THROWS.
+        let dim = prop.dim?;
+        elected = elected.or(Some(dim));
+        if ctx.site.wk_slices(dim)? > 1 {
+            if split_found {
+                return None;
+            }
+            elected = Some(dim);
+            split_found = true;
+        }
+    }
+    let dim = elected?;
     let slices = ctx.site.wk_slices(dim)?;
     let mut prop = CoreToCoreProp {
         dim: Some(dim),
         next_core: BTreeMap::new(),
         prev_core: BTreeMap::new(),
     };
+    let mut resolved = None;
     let mut start = CoreClSet::default();
     let mut end = CoreClSet::default();
     if slices <= 1 {
-        for core in ctx.dsc.core_ids_used.iter() {
-            for corelet in corelets_of(ctx.dsc) {
-                start.0.entry(core).or_default().insert(corelet);
-                end.0.entry(core).or_default().insert(corelet);
-            }
-        }
+        resolved = Some(true);
     } else {
-        for corelet in corelets_of(ctx.dsc) {
-            let increasing = corelet.get() == 0;
-            for slice in 0..slices {
-                let core = ctx.site.core_by_slice(dim, slice)?;
-                let step = if increasing {
-                    slice.checked_add(1).filter(|next| *next < slices)
-                } else {
-                    slice.checked_sub(1)
-                };
-                match step {
-                    Some(next) => {
-                        prop.next_core
-                            .insert((core, corelet), ctx.site.core_by_slice(dim, next)?);
-                    }
-                    None => {
-                        end.0.entry(core).or_default().insert(corelet);
-                    }
+        let last = WkSliceId(i32::try_from(slices).ok()?.checked_sub(1)?);
+        let cl0 = corelet(0)?;
+        let cl1 = corelet(1).filter(|_| corelets_used_dsc2(ctx.dsc));
+        // ⛔ EVERY USED CORE THE SUPER-DSC STATES A SLICE FOR, not one core per slice.
+        let work = ctx.site.core_work_slices();
+        for (core, slice_of) in &work {
+            if !ctx.dsc.core_ids_used.iter().any(|used| used == *core) {
+                continue;
+            }
+            let at = slice_of.at(dim)?;
+            let neighbour = |towards: i32| -> Option<Core> {
+                let mut wanted = slice_of.clone();
+                wanted.0.insert(dim, WkSliceId(towards));
+                work.iter()
+                    .find(|(_, other)| **other == wanted)
+                    .map(|(found, _)| *found)
+            };
+            let chain = |set: &mut CoreClSet, corelet| {
+                set.0.entry(*core).or_default().insert(corelet);
+            };
+            if at == WkSliceId(0) {
+                chain(&mut start, cl0);
+                let up = neighbour(at.0.checked_add(1)?)?;
+                prop.next_core.insert((*core, cl0), up);
+                if let Some(cl1) = cl1 {
+                    chain(&mut end, cl1);
+                    prop.prev_core.insert((*core, cl1), up);
                 }
-                let back = if increasing {
-                    slice.checked_sub(1)
-                } else {
-                    slice.checked_add(1).filter(|prev| *prev < slices)
-                };
-                match back {
-                    Some(prev) => {
-                        prop.prev_core
-                            .insert((core, corelet), ctx.site.core_by_slice(dim, prev)?);
-                    }
-                    None => {
-                        start.0.entry(core).or_default().insert(corelet);
-                    }
+            } else if at == last {
+                chain(&mut end, cl0);
+                let down = neighbour(at.0.checked_sub(1)?)?;
+                prop.prev_core.insert((*core, cl0), down);
+                if let Some(cl1) = cl1 {
+                    chain(&mut start, cl1);
+                    prop.next_core.insert((*core, cl1), down);
+                }
+            } else {
+                let up = neighbour(at.0.checked_add(1)?)?;
+                let down = neighbour(at.0.checked_sub(1)?)?;
+                prop.next_core.insert((*core, cl0), up);
+                prop.prev_core.insert((*core, cl0), down);
+                if let Some(cl1) = cl1 {
+                    prop.prev_core.insert((*core, cl1), up);
+                    prop.next_core.insert((*core, cl1), down);
                 }
             }
         }
@@ -4061,7 +4123,7 @@ fn op_core_to_core<S: DdlSite + ?Sized>(
             ctx.interface.resolved_conditions.insert(
                 *name,
                 CondProp {
-                    resolved: None,
+                    resolved,
                     loop_cond: LoopCondComposite::default(),
                     core_cl_cond: set,
                 },
@@ -4947,7 +5009,12 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
             padding_styles,
             component: node.component,
             num_buffers: node.placement.num_buffers,
-            layout_dim_order: node.layout.iter().map(|(dim, _)| dim).collect(),
+            // ⛔ EMPTY FOR A CONSTANT ALLOCATION: `layoutDimOrder_` is written only in the LDS arm
+            // of `processAllocation`, and this attribute is set from it unconditionally (`:3460`).
+            layout_dim_order: match node.lds {
+                Some(_) => node.layout.iter().map(|(dim, _)| dim).collect(),
+                None => Vec::new(),
+            },
             allocation_size: node.lds.and_then(|_| self.site.buffer_capacity(alloc)),
         });
         self.allocations.push(EmittedAllocate {
@@ -5751,12 +5818,12 @@ mod unit_tests {
         DdlConversion, DdlInterface, DdlOp, DdlSite, DdlSizes, DimMapping, DimProp,
         EmittedAllocate, EmittedDdl, EmittedOp, EmittedStage, EmittedTensor, ExprValue,
         GlobalLayoutRefs, InternalTensor, InternalTensorSite, LabeledDsTail, LdsSlot, LoopCount,
-        MatchSite, OperationBind, PaddedDimension, RegionId, RegionOp, RegionTree, StyledDims,
-        SyncLabel, TensorAndAllocation, TensorProp, TypeDefinition, add_internal_tensor,
-        allocation_pad_type, check_meta_dimensions, convert_dsc2_ddl, export_to_ddl,
-        match_ddl2_dsc, pad_type_spelling, process_access_patterns, process_condition,
-        process_dimension_op, process_expression, process_region, process_types, tensor,
-        tensor_and_allocation, tensor_prop, transfer_access_pattern, verify_ddl_constraint,
+        MatchSite, OpContext, OpOutcome, OperationBind, PaddedDimension, RegionId, RegionOp,
+        RegionTree, StyledDims, SyncLabel, TensorAndAllocation, TensorProp, TypeDefinition,
+        add_internal_tensor, allocation_pad_type, check_meta_dimensions, convert_dsc2_ddl, corelet,
+        export_to_ddl, match_ddl2_dsc, op_core_to_core, pad_type_spelling, process_access_patterns,
+        process_condition, process_dimension_op, process_expression, process_region, process_types,
+        tensor, tensor_and_allocation, tensor_prop, transfer_access_pattern, verify_ddl_constraint,
     };
     use crate::arch::{Dd2, Elements};
     use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
@@ -5775,6 +5842,7 @@ mod unit_tests {
     };
     use crate::schedule::ddc::transformation::{DsType, Scale};
     use crate::schedule::ddc::transformation_util::{LoopCond, StageName};
+    use crate::schedule::ddc::v1::CoreClSet;
     use crate::schedule::dsc2::{
         AllocLayout, AllocPlacement, AllocateNode, BlockNode, LayoutDims, LdsIdx, LoopDim,
         LoopNode, MaxDimSize, NodeName, NumBuffers, SchedNode, StartAddress, SyncDirection,
@@ -5783,6 +5851,7 @@ mod unit_tests {
     use crate::schedule::l3::dsc::{
         CoreCount, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DimPadding,
         FilledDims, LabeledDs, LabeledDsList, NamedDims, PadElems, PadSizes, Pinning, StageDims,
+        WkSlice, WkSliceId,
     };
     use crate::units::Core;
 
@@ -7024,8 +7093,13 @@ mod unit_tests {
 
     /// A DSC seam that answers the four questions the match asks and nothing else: every tensor is
     /// two bytes of fp16, one stick of `X = 4` over `Y = 2`, and no allocation is placed.
+    #[derive(Default)]
     struct Match {
         ops: Vec<BindableOp>,
+        /// `numWkSlicesPerDim_`.
+        slices: BTreeMap<PrimaryDim, u32>,
+        /// `coreIdToWkSlice_`.
+        work: BTreeMap<Core, WkSlice>,
     }
 
     impl AllocationSite for Match {
@@ -7074,11 +7148,11 @@ mod unit_tests {
         fn dim_in_layout_order(&self, _lds: LdsIdx, _dim: PrimaryDim) -> bool {
             false
         }
-        fn wk_slices(&self, _dim: PrimaryDim) -> Option<u32> {
-            None
+        fn wk_slices(&self, dim: PrimaryDim) -> Option<u32> {
+            self.slices.get(&dim).copied()
         }
-        fn core_by_slice(&self, _dim: PrimaryDim, _slice: u32) -> Option<Core> {
-            None
+        fn core_work_slices(&self) -> BTreeMap<Core, WkSlice> {
+            self.work.clone()
         }
         fn stick_dims(&self, _lds: LdsIdx) -> Option<StickDims> {
             Some(StickDims(vec![
@@ -7182,7 +7256,7 @@ mod unit_tests {
             .insert(NameId(0), CondProp::default());
         let mut metadata = Metadata::default();
         let mut dsc = config(Pinning::default(), None);
-        let mut site = Match { ops: Vec::new() };
+        let mut site = Match::default();
         let head = NodeName("head".to_owned());
         let mut state = DdlConversion::new(BlockNode {
             name: head.clone(),
@@ -7236,6 +7310,134 @@ mod unit_tests {
                 NodeName("condition_region0".to_owned()),
                 NodeName("condition_region1".to_owned()),
             ]
+        );
+    }
+
+    /// ⭐⭐ THE RING IS WALKED PER USED CORE AND KEYED BY THE WHOLE WORK SLICE — four cores split
+    /// 2×2 over `X` and `Y` with the reduction on `Y` give every core its neighbour in its OWN `X`
+    /// column, and `c1`/`c3` are the entries a per-slice lookup drops. Corelet 1 walks the other
+    /// way, so it is the START where corelet 0 is the END.
+    /// ⛔ AND ONE SLICE RESOLVES BOTH CONDITIONS STATICALLY TRUE, writing neither a set nor a ring.
+    #[test]
+    fn resolves_the_sfpring_over_every_used_core() {
+        /// `%psum_start, %psum_end, %next_core, %prev_core = ddl.core_to_core_communication(%in)`
+        /// (`ddl_templates/bmm.ddl:172`).
+        const C2C: &Stmt = &Stmt {
+            kind: StmtKind::CoreToCoreCommunication,
+            depth: 0,
+            attrs: Attrs::Bare(StmtKind::CoreToCoreCommunication),
+            results: &[NameId(1), NameId(2), NameId(3), NameId(4)],
+            operands: &[Operand::One(NameId(0))],
+            path: &[],
+        };
+        let program = synthetic(&[], &[]);
+        let cl = |index| corelet(index).expect("a corelet in range");
+        let slice = |x, y| {
+            WkSlice(BTreeMap::from([
+                (PrimaryDim::X, WkSliceId(x)),
+                (PrimaryDim::Y, WkSliceId(y)),
+            ]))
+        };
+        let work = BTreeMap::from([
+            (core(0), slice(0, 0)),
+            (core(1), slice(1, 0)),
+            (core(2), slice(0, 1)),
+            (core(3), slice(1, 1)),
+        ]);
+        let run = |slices: u32| {
+            let mut interface = DdlInterface::default();
+            interface.dim_association.insert(
+                NameId(0),
+                DimProp {
+                    dim: Some(PrimaryDim::Y),
+                    ..DimProp::default()
+                },
+            );
+            let mut dsc = config(Pinning::default(), None);
+            dsc.core_ids_used = CoreIdsUsed::new(core(0), vec![core(1), core(2), core(3)]);
+            let mut site = Match {
+                slices: BTreeMap::from([(PrimaryDim::Y, slices)]),
+                work: work.clone(),
+                ..Match::default()
+            };
+            let head = NodeName("head".to_owned());
+            let mut state = DdlConversion::new(BlockNode {
+                name: head.clone(),
+                children: Vec::new(),
+            });
+            assert_eq!(
+                op_core_to_core(
+                    &mut OpContext {
+                        program: &program,
+                        state: &mut state,
+                        interface: &mut interface,
+                        metadata: &mut Metadata::default(),
+                        dsc: &mut dsc,
+                        site: &mut site,
+                        curr_parent: head.clone(),
+                    },
+                    C2C,
+                ),
+                Some(OpOutcome {
+                    parent: Some(head),
+                    regions: Vec::new(),
+                })
+            );
+            (
+                interface.core_to_core_definitions[&NameId(1)].clone(),
+                interface.resolved_conditions[&NameId(1)].clone(),
+                interface.resolved_conditions[&NameId(2)].clone(),
+            )
+        };
+        let (ring, start, end) = run(2);
+        assert_eq!(ring.dim, Some(PrimaryDim::Y));
+        assert_eq!(
+            ring.next_core,
+            BTreeMap::from([
+                ((core(0), cl(0)), core(2)),
+                ((core(1), cl(0)), core(3)),
+                ((core(2), cl(1)), core(0)),
+                ((core(3), cl(1)), core(1)),
+            ])
+        );
+        assert_eq!(
+            ring.prev_core,
+            BTreeMap::from([
+                ((core(0), cl(1)), core(2)),
+                ((core(1), cl(1)), core(3)),
+                ((core(2), cl(0)), core(0)),
+                ((core(3), cl(0)), core(1)),
+            ])
+        );
+        assert_eq!((start.resolved, end.resolved), (None, None));
+        assert_eq!(
+            start.core_cl_cond,
+            CoreClSet(BTreeMap::from([
+                (core(0), BTreeSet::from([cl(0)])),
+                (core(1), BTreeSet::from([cl(0)])),
+                (core(2), BTreeSet::from([cl(1)])),
+                (core(3), BTreeSet::from([cl(1)])),
+            ]))
+        );
+        assert_eq!(
+            end.core_cl_cond,
+            CoreClSet(BTreeMap::from([
+                (core(0), BTreeSet::from([cl(1)])),
+                (core(1), BTreeSet::from([cl(1)])),
+                (core(2), BTreeSet::from([cl(0)])),
+                (core(3), BTreeSet::from([cl(0)])),
+            ]))
+        );
+        let (ring, start, end) = run(1);
+        assert_eq!((start.resolved, end.resolved), (Some(true), Some(true)));
+        assert_eq!(
+            (
+                ring.next_core.len(),
+                ring.prev_core.len(),
+                start.core_cl_cond.0.len(),
+                end.core_cl_cond.0.len()
+            ),
+            (0, 0, 0, 0)
         );
     }
 
@@ -7340,6 +7542,7 @@ mod unit_tests {
         let mut dsc = matchable();
         let mut site = Match {
             ops: vec![compute.clone()],
+            ..Match::default()
         };
         assert_eq!(
             match_ddl2_dsc(
@@ -7386,7 +7589,10 @@ mod unit_tests {
                 &mut DdlInterface::default(),
                 &mut Metadata::default(),
                 &mut matchable(),
-                &mut Match { ops: vec![compute] },
+                &mut Match {
+                    ops: vec![compute],
+                    ..Match::default()
+                },
                 &[two_inputs],
                 &padded,
             ),
