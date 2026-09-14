@@ -498,6 +498,14 @@ impl DscList {
         }
     }
 
+    /// `dscs_.at(idx)` TO BE WRITTEN, `None` past the end — `auto& dsc = mySDsc.dscs_.at(dscIdx)`.
+    pub fn at_mut(&mut self, idx: DscIdx) -> Option<&mut DesignSpaceConfig> {
+        match idx.0 {
+            0 => Some(&mut self.first),
+            n => self.rest.get_mut(usize::try_from(n).ok()? - 1),
+        }
+    }
+
     /// `dscs_.at(0)`.
     #[must_use]
     pub const fn first(&self) -> &DesignSpaceConfig {
