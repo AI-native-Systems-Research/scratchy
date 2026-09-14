@@ -26,7 +26,7 @@ use crate::schedule::dsc2::{
     TransferNode,
 };
 use crate::schedule::l3::dl_ops::{
-    GtrGroupId, L3AllocateNode, L3Sync, LX_BELOW_BLOCK_NODE_NAME,
+    GtrGroupId, L3AllocateNode, L3Sync, L3WalkNode, LX_BELOW_BLOCK_NODE_NAME,
 };
 use crate::schedule::l3::dsc::{
     AddressCoord, Buffering, BufferOffset, ByteAddress, IndirectAlloc, L3Transfer, MemOrg,
@@ -193,6 +193,72 @@ impl TreeData {
     /// `node->name_`.
     pub(super) fn name(&self, node: NodeId) -> Option<NodeName> {
         self.nodes.get(&node).map(|entry| entry.name.clone())
+    }
+
+    /// `node->name_ = name`.
+    pub(super) fn set_name(&mut self, node: NodeId, name: NodeName) {
+        if let Some(entry) = self.nodes.get_mut(&node) {
+            entry.name = name;
+        }
+    }
+
+    /// `sync->otherEndOfTheSignals_.push_back(other)`, held BY NAME as [`SyncNode`] does.
+    pub(super) fn add_sync_other_end(&mut self, sync: NodeId, other: NodeName) {
+        if let Some(Entry {
+            kind: Kind::Sync(held),
+            ..
+        }) = self.nodes.get_mut(&sync)
+        {
+            held.other_ends.push(other);
+        }
+    }
+
+    /// `traverseTreeDFSMutable(nullptr, {LOOP, TRANSFER, ALLOCATE})` PROJECTED OUT, in DFS order.
+    pub(super) fn loops_transfers_and_allocates(&self) -> Vec<L3WalkNode> {
+        self.dfs()
+            .into_iter()
+            .filter_map(|node| match &self.nodes.get(&node)?.kind {
+                Kind::Loop(_) => Some(L3WalkNode::Loop(LoopId(node))),
+                Kind::Transfer(_) => Some(L3WalkNode::Transfer(node)),
+                Kind::Allocate(_, held) => Some(L3WalkNode::Allocate(node, held.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `traverseTreeDFSMutable(root, {CONDITION})` — every condition node below `root`.
+    pub(super) fn conditions_under(&self, root: NodeId) -> Vec<NodeId> {
+        let mut found = Vec::new();
+        let mut stack = vec![root];
+        while let Some(at) = stack.pop() {
+            if matches!(
+                self.nodes.get(&at).map(|entry| &entry.kind),
+                Some(Kind::Condition(_))
+            ) {
+                found.push(at);
+            }
+            stack.extend(self.children(at).into_iter().rev());
+        }
+        found
+    }
+
+    /// `condNode->loopCond_`.
+    pub(super) fn loop_cond(&self, condition: NodeId) -> Option<LoopCondComposite> {
+        match &self.nodes.get(&condition)?.kind {
+            Kind::Condition(cond) => cond.loop_cond.clone(),
+            _ => None,
+        }
+    }
+
+    /// `condNode->loopCond_ = cond`.
+    pub(super) fn set_loop_cond(&mut self, condition: NodeId, cond: LoopCondComposite) {
+        if let Some(Entry {
+            kind: Kind::Condition(held),
+            ..
+        }) = self.nodes.get_mut(&condition)
+        {
+            held.loop_cond = Some(cond);
+        }
     }
 
     /// `node->nodeType_`.

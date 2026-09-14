@@ -172,6 +172,13 @@ impl ScheduleNodes for DscTree {
 #[derive(Debug, Default)]
 pub struct DscState {
     dscs: Vec<DscTree>,
+    /// ⭐ EVERY PROVIDER METHOD THAT REFUSED, IN THE ORDER IT WAS ASKED — the FIRST entry is the one
+    /// fact that decides what happens next, and it is recorded rather than printed so a caller can
+    /// report it.
+    ///
+    /// ⛔ AN OBSERVER AND NOT A BEHAVIOUR: nothing in the port reads it, and a refusal is recorded
+    /// on the way to answering [`None`], which is the ported units' own idiom.
+    refusals: RefCell<Vec<&'static str>>,
 }
 
 impl DscState {
@@ -195,12 +202,32 @@ impl DscState {
     pub fn seeded(sdsc: &SuperDsc) -> Self {
         Self {
             dscs: sdsc.dscs().iter().map(seed_dsc).collect(),
+            refusals: RefCell::new(Vec::new()),
         }
     }
 
     /// That DSC's tree, [`None`] for a `dscs_` position this state holds none for.
     pub(super) fn dsc(&self, at: DscIdx) -> Option<&DscTree> {
         self.dscs.get(usize::try_from(at.0).ok()?)
+    }
+
+    /// ⭐ A PROVIDER METHOD'S OWN REFUSAL, RECORDED AND THEN PROPAGATED — `<Trait>::<method>` plus
+    /// the fact it wants and where that fact lives.
+    pub(super) fn refuse<T>(&self, what: &'static str) -> Option<T> {
+        self.refusals.borrow_mut().push(what);
+        None
+    }
+
+    /// Every refusal so far, in the order it was made.
+    #[must_use]
+    pub fn refusals(&self) -> Vec<&'static str> {
+        self.refusals.borrow().clone()
+    }
+
+    /// The FIRST refusal — the one fact that decides what happens next.
+    #[must_use]
+    pub fn first_refusal(&self) -> Option<&'static str> {
+        self.refusals.borrow().first().copied()
     }
 
     /// Every DSC's tree, in `dscs_` order.

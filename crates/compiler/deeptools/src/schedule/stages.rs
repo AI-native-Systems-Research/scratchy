@@ -46,9 +46,13 @@
 //! answered is a `todo!` NAMING THE TRAIT AND METHOD, never a plausible constant: a fabricated
 //! placement is the failure this crate ranks worse than a stop.
 
+mod carriers;
+mod env;
 mod state;
 mod tree;
 
+pub use carriers::{Placement, Sink, Symbols, Trackers};
+pub use env::Env;
 pub use state::{DscState, DscTree};
 
 use super::l3;
