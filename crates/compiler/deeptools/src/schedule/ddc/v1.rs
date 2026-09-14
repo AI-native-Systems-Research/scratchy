@@ -22,7 +22,7 @@
 //          numCoreletsPerCore == 2, and scratchy emits numCoreletsUsed_ = 1 in all 313 sampled
 //          SuperDSCs. See crustify-ddc/EXCLUSIONS.tsv.
 //      2a. L3DlOpsScheduler(dscGlobal, memTrackers, {executionStep}, verbose).run(sdsc)
-//      2b. ddc::Ddc(dscGlobal, ..).run_v1(sdsc)      entry: ddc/ddcv1.cpp:3695
+//      2b. ddc::Ddc(dscGlobal, ..).run_v1(sdsc)      entry: ddc/ddcv1.cpp:3692
 //      3.  DcgManager::runDcgForDlOpsStandalone(sdsc)   dcg/dcg_manager/dcg_manager.cpp:449
 //          ⛔ THAT branch, NOT `runDcg`: SchedulerStages.cpp:53-57 picks it whenever `dscs_` is
 //          non-empty, always true for scratchy's input. ⚠️ Its body delegates almost entirely to
@@ -2012,12 +2012,20 @@ impl OperandSite {
     }
 }
 
-/// WHERE THE LOOP ELEMENT OFFSETS COME FROM — the `ddcGlobal` pair `datastageBasedElemOff` and
-/// `verifyCoordinateBasedLoopElemOff` as the three states they have.
+/// WHERE THE LOOP ELEMENT OFFSETS COME FROM — the two `Ddc` members `datastageBasedElemOff` and
+/// `verifyCoordinateBasedLoopElemOff` (`ddc/ddc.h:43-44`) as the three states they have.
 ///
+/// ⛔ NOT A BUILD OPTION, AND THE TWO HALVES DO NOT SHARE A PROVENANCE. Neither field is in
+/// `DesignSpaceConfigGlobal` (there is no `ddcGlobal` in the reference at all):
+/// `verifyCoordinateBasedLoopElemOff` is set once by the `Ddc` constructor off `DDCCOORD` carrying
+/// `verify_loopelemoff` (`ddc/ddc.h:72-76`), while `datastageBasedElemOff` is written by ENTRY 379
+/// ITSELF (`ddc/ddcv1.cpp:3713`) from the op-funcs of the DSC it is about to work on — so this is
+/// per-super-DSC state stage 2b mints, and it cannot become a const generic the way entry 381's
+/// [`DdcVersion`] did.
 /// ⛔ AN ENUM AND NOT TWO `bool`s: their fourth combination is `datastageBasedElemOff` with a verify
-/// that can no longer fail, because that arm writes the very value the check compares against
-/// (`ddc/ddcv1.cpp:2585-2589`), so it is not a state.
+/// that can no longer fail, because that arm writes the very value the check compares against —
+/// `di.loopEleOffsets_[clId][loopPtr][dim] = loopEleOffs` at `ddc/ddcv1.cpp:2598` immediately ahead
+/// of the `!= loopEleOffs` check at `:2600`, and the parametric pair at `:2470` ahead of `:2474`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElemOffsets {
     /// Neither switch — `loopDistributionParamInfo` alone, and the constant offsets come from the
@@ -6083,11 +6091,43 @@ pub trait SdscName {
 
 /// STAGE 2B ITSELF — `Ddc::run_v1` (`ddc/ddcv1.cpp:3692`), which is entry 379 of this campaign.
 ///
-/// ⛔ NOT A PORT AND NOT A STAND-IN. Entry 379 is unported — its scheduler anchor stands directly
-/// above — and it is the unit that PLACES ADDRESSES. Answering
+/// ⛔ NOT A PORT AND NOT A STAND-IN. Entry 379 is unported — its `// crustify:todo: e379_run_v1`
+/// anchor stands at the head of this section — and it is the DRIVER of the units that place
+/// addresses, not itself an arithmetic: its 109 lines compute no address. Answering
 /// [`DscFilled::Yes`] here would report a placed DSC2 that nothing placed, so this stays a stop
 /// naming the translator that owns it. When entry 379 lands, its own `run_v1` collides with this
 /// name and the wiring is an E0428 rather than a judgement call.
+///
+/// ⭐ WHAT ITS OWN BODY IS, reviewed against the authority so the port is not hunting for one: the
+/// `sdsc_` back-pointer (`:3693`), a loop over `sdsc.dscs_` skipping every DSC with an empty
+/// `computeOp_` (`:3697`), five per-DSC state writes (`:3700`, `:3706`, `:3707`, `:3708`, and the
+/// `:3713-3714` pair), and a fixed sequence of 31 in-campaign callees plus
+/// `createDataConnectMetadata` THREE times (`:3755`, `:3765`, `:3781`) and two `DesignSpaceConfig`
+/// methods this campaign does not own — `setRelevantCompCoreCl` (`:3779`, `dsc/dsc2.cpp:2647`) and
+/// `finalizeScheduleTree` (`:3790`, `dsc/dsc2.cpp:2749`). Every one of the 31 is already filled, so
+/// nothing blocks the port.
+///
+/// 🛑 THE LATCH — the one trap that makes a per-DSC port diverge. `metadata.clear()` (`:3706`)
+/// reinitialises the whole `Metadata` and `dataStageExplorationDone_`/`latchDataIdCounter_`
+/// (`:3707-3708`) are reset at the top of EVERY iteration, but `datastageBasedElemOff` (`ddc/ddc.h:44`)
+/// is only ever SET (`:3713`) and is cleared NOWHERE in the reference tree. So one DSC carrying a
+/// `ReStickifyOpLx`/`ReStickifyOpHBM` op suppresses `coordinateCapture()` (`:3785`) for that DSC AND
+/// for every LATER DSC of the same super-DSC, and latches `sdsc.datastageBasedElemOff`
+/// (`dsc/superdsc.h:116`, read at `dsc/dsc2.cpp:3034`). [`ElemOffsets`] is that state, not an option.
+///
+/// ⚠️ TWO RECORDED CALL EDGES NEVER FIRE ON OUR PATH. `e300_packStickDim`'s only callsite here is
+/// inside `#if 0` (`:3735-3752`), and `e345_exportToDdl` is behind `dscToDdl_` (`ddc/ddc.h:45`),
+/// which only `ddc/ddc_standalone.cpp:40` sets — `SchedulerStages.cpp:35` passes `false` explicitly
+/// and `deeprt.cpp:2178` takes the default.
+///
+/// ⚠️ `enableMovingDataTransfer` IS NOT ITS DEFAULT AT THE READ. The hoist gate (`:3758`) is read
+/// AFTER `selectAndParseDdlTemplate()` (`:3725`), whose `parseDdl2Dsc` reaches the one writer in the
+/// tree — `DdlConversion::processTransformations` clearing it on a `DisableTransferPromotion` op
+/// (`ddc/ddl/ddl_conversion.cpp:2044`). So the flag is what the SELECTED TEMPLATE said.
+///
+/// ⚠️ THE ABANDONMENT IS MID-LOOP. The single `return false` (`:3728`) restores only the DSC that
+/// found no DDL; every DSC of `dscs_` filled before it stays filled. Both callers turn that into a
+/// hard stop, so no path observes the partial fill.
 fn run_v1<S: SdscName + ?Sized>(sdsc: &mut S) -> DscFilled {
     let _ = sdsc;
     todo!("e379_run_v1: Ddc::run_v1 (ddc/ddcv1.cpp:3692) — stage 2b — is not ported")
