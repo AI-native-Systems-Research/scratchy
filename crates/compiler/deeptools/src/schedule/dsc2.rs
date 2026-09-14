@@ -1660,6 +1660,12 @@ impl LayoutDims {
         Self { first, rest }
     }
 
+    /// The outermost dim — `getLayoutDims(...).at(0)`, total because the order is NON-EMPTY.
+    #[must_use]
+    pub const fn first(&self) -> PrimaryDim {
+        self.first
+    }
+
     /// The dims, innermost first — the order `layoutDimOrder_` itself is in
     /// (`dsc/dataOpDsc.h:347`, `ddc/ddcv1.cpp:1937-1938`).
     pub fn iter(&self) -> impl Iterator<Item = PrimaryDim> + '_ {

@@ -173,12 +173,16 @@
 //! | `e362_get_shuffle` | 362 | 4 | 61 | `AutoShuffler` | `ddc/transformations/automatic_shuffle/shuffle.cpp:1161` |
 //! | `e371_replace_assign` | 371 | 5 | 119 | `AutoShuffler` | `ddc/transformations/automatic_shuffle/shuffle.cpp:788` |
 
-use crate::arch::{Arch, Sticks};
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{PrimaryDim, StickDims};
+use crate::arch::{Arch, Elements, Sticks};
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+    PrimaryDim, StickDims, StickPart, cumulative_stick_sizes,
+};
 use crate::formats::{Bits, DataFormat};
 use crate::schedule::ddc::fold::{AllocId, NodeId};
 use crate::schedule::ddc::metadata::OwnedAllocateNode;
-use crate::schedule::dsc2::{ComputeNode, DataInfo, WordLength};
+use crate::schedule::ddc::v1::{ConstEleOffset, CoresUsed};
+use crate::schedule::dsc2::{ComputeNode, DataInfo, LayoutDims, LdsIdx, WordLength};
+use crate::units::{Core, Corelet};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::hash::{Hash, Hasher};
@@ -421,6 +425,21 @@ impl AbstractLayout {
             }
         }
         narrow_to_usize(hash)
+    }
+
+    /// `AbstractLayout(ConcreteLayout layout, DataFormats format)` (`shuffle.h:86`) — the stick order
+    /// dropped into a set, the slice carried across.
+    ///
+    /// ⛔ [`None`] IS THE SLICE-LENGTH `DT_CHECK` (`shuffle.cpp:692-693`) THIS TYPE HOLDS AS AN ARRAY:
+    /// the reference's constructor copies a `std::vector` of any length, and every consumer then
+    /// indexes six slots.
+    #[must_use]
+    pub fn of(layout: &ConcreteLayout, format: DataFormat) -> Option<Self> {
+        Some(Self {
+            format,
+            stick_dims: layout.stick_dims.iter().copied().collect(),
+            slice_dims: <[DimSymbol; DIMS_PER_SLICE]>::try_from(layout.slice_dims.as_slice()).ok()?,
+        })
     }
 }
 
@@ -776,6 +795,26 @@ impl ComputationOp {
             )],
             _ => vec![],
         }
+    }
+
+    /// `op.codegen(builder, in, out)` (`shuffle.h:211`) — the `std::function` [`Self::bin_op`] and
+    /// [`Self::unary_op`] install, which is one `insert_packmerge` and nothing else. Yields the node
+    /// it placed.
+    ///
+    /// ⛔ THE SECOND OPERAND IS THE FIRST ONE AGAIN for a one-input op (`shuffle.cpp:167`), so the
+    /// reference's two arity `DT_CHECK`s are that choice rather than stops — exactly as on
+    /// [`Self::codegen_psuedocode`].
+    /// ⛔ [`None`] IS `std::bad_function_call` on an op whose table was never installed, which is the
+    /// same absence `codegen_psuedocode` answers with no line.
+    pub fn codegen<B: ComputationBuilder + ?Sized>(
+        &self,
+        builder: &mut B,
+        inputs: &[DataEdge],
+        output: &mut DataEdge,
+    ) -> Option<NodeId> {
+        let packmerge = self.packmerge.as_ref()?;
+        let (first, rest) = inputs.split_first()?;
+        Some(builder.insert_packmerge(first, rest.first().unwrap_or(first), output, packmerge))
     }
 }
 
@@ -2336,6 +2375,20 @@ impl<E> NodeEdges<E> {
     pub const fn is_last(&self) -> bool {
         self.below.is_empty()
     }
+
+    /// `outputs = builder.allocate_sticks(..)` (`shuffle.cpp:848`) — a vector whose `back()` is the
+    /// LAST edge pushed, which is the opposite end from [`Self::per_stick`]'s.
+    ///
+    /// ⛔ THE LENGTH IS NOT `numSticks()`: `allocate_sticks` forces the count to 1 for an assign
+    /// already reading a register file (`ddc/ddc_transformation.cpp:1901`), and the walk's
+    /// `pop_back_unless_last` is what makes that one edge do for every computation.
+    /// ⛔ [`None`] IS THE REFERENCE'S UNGUARDED `outputs.back()` (`shuffle.cpp:1002`) on an empty
+    /// list, which only a zero stick count reaches.
+    #[must_use]
+    pub fn in_push_order(mut edges: Vec<E>) -> Option<Self> {
+        let last = edges.pop()?;
+        Some(Self { below: edges, last })
+    }
 }
 
 impl<E: Clone> NodeEdges<E> {
@@ -2517,6 +2570,17 @@ impl InsertPoint {
     }
 }
 
+/// `dsc2::DataInfo::constEleOffsets_` — one constant element offset per layout dim, per corelet, per
+/// core, which is the nesting entry 260 fills (`DataInfoFill::const_ele_offsets`).
+///
+/// ⛔ A MAP AND NOT AN ARRAY: `replace_assign` writes only the cores in `coreIdsUsed_` and only the
+/// corelets below `numCoreletsUsed_`, and an absent entry is the reference's absent key rather than a
+/// zero offset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConstEleOffsets(
+    pub BTreeMap<Core, BTreeMap<Corelet, BTreeMap<PrimaryDim, ConstEleOffset>>>,
+);
+
 /// AN EDGE BETWEEN TWO STICK COMPUTATIONS — `DataEdge` (`shuffle.h:170`): which data, on which
 /// component, and the allocate node that backs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2535,6 +2599,15 @@ pub struct DataEdge {
     /// (`:824`), and `insert_packmerge` mutates it THROUGH the edge after insertion
     /// (`ddc/ddc_transformation.cpp:1988`) — so a by-value copy here would fork the node.
     pub allocation: Option<AllocId>,
+    /// `dinfo.constEleOffsets_`, WHICH IS WHERE `do_codegen`'S STICK JUMP LANDS
+    /// (`shuffle.cpp:881-883`, `:894-896`).
+    ///
+    /// ⛔⛔ ON THE EDGE AND NOT ON [`DataInfo`] BECAUSE THE EFFECT WOULD OTHERWISE BE DROPPED. The
+    /// reference writes it into the `dsc2::DataInfo` the edge holds by value, and `insert_packmerge`
+    /// then COPIES that dinfo into the new packmerge's operands (`ddc/ddc_transformation.cpp:1963`);
+    /// the Rust [`DataInfo`] is the four-field identity with no offset map, so the offsets travel here
+    /// and the builder installs them on the node it inserts.
+    pub const_ele_offsets: ConstEleOffsets,
     /// `alloc_added`.
     ///
     /// ⛔ NOT DERIVABLE FROM `allocation`, WHICH IS WHY IT IS A SEPARATE BIT: it means "already in
@@ -2600,10 +2673,66 @@ pub trait ComputationBuilder {
         out: &mut DataEdge,
         packmerge: &Packmerge,
     ) -> NodeId;
+
+    /// `assign->inputs_[0]`/`outputs_[0]` with their `..LdsAndLoopOffsets_[0]` and the allocation
+    /// `getAllocation(dinfo, component, /*allowMissingAlloc=*/true)` finds for each
+    /// (`shuffle.cpp:816-822`, `:830-837`).
+    ///
+    /// ⛔ [`None`] IS `DT_CHECK(inputs_.size() == 1)` AND `DT_CHECK(outputs_.size() == 1)`
+    /// (`shuffle.cpp:792-793`) — the assign witness holds the other three, so these are the two left.
+    fn assign_edges(&self) -> Option<AssignEdges>;
+
+    /// The four DSC reads `replace_assign` makes of ONE operand's labelled DS — `labeledDs_` (`:802`),
+    /// `primaryDsInfo_.at(dsType_)` (`:805`), `getLayoutDims(ldsIdx_)` (`:873`) and
+    /// `getStickSizes(dsType_)` (`:876`) — as one value, [`None`] for those `.at()`s.
+    fn operand_sticks(&self, dinfo: DataInfo) -> Option<OperandSticks>;
+
+    /// `currDsc->coreIdsUsed_` (`:881`).
+    fn cores_used(&self) -> CoresUsed;
+
+    /// `0 .. currDsc->numCoreletsUsed_` (`:882`). ⛔ NOT `numCoreletsUsed_DSC2_`, the neighbouring
+    /// field the corelet-split walks read.
+    fn corelets_used(&self) -> Vec<Corelet>;
+
+    /// `allocation.value()->getPrev()` (`:868`) — whether that allocate node already has a preceding
+    /// sibling, which is how `do_codegen` tells a positioned node from a held one.
+    fn allocation_has_prev(&self, alloc: AllocId) -> bool;
 }
 
-/// WHAT ENTRY 376 CANNOT REACH YET — `AutoShuffler::replace_assign(dsc, builder, assign)`
-/// (`shuffle.cpp:788`), which is e371 and not this batch.
+/// THE TWO EDGES THE ASSIGN ITSELF NAMES — `input_edge` and `edge_from_output`
+/// (`shuffle.cpp:816-822`, `:830-837`).
+///
+/// ⭐ `alloc_added` IS NOT SET HERE: `create_node_allocations` sets the output's, and only on the step
+/// whose layout IS the goal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignEdges {
+    /// `assign->inputs_[0]` with `inputsLdsAndLoopOffsets_[0]`.
+    pub input: DataEdge,
+    /// `assign->outputs_[0]` with `outputsLdsAndLoopOffsets_[0]`.
+    pub output: DataEdge,
+}
+
+/// WHAT ONE OPERAND'S LABELLED DS TELLS `replace_assign` — `inferLayouts`' end of it, its element
+/// format, and the two lookups `do_codegen` turns a stick number into an element offset with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperandSticks {
+    /// `primaryDsInfo_.at(dsType_).stickDimOrder_` zipped with its `stickSize_`.
+    pub primary_sticks: StickDims,
+    /// `primaryDsInfo_.at(dsType_).stickRepl_`, CARRIED UNFOLDED because `all_one` is
+    /// [`AutoShuffler::infer_layouts`]' own `DT_CHECK` and stays there.
+    pub primary_stick_repl: Vec<StickRepl>,
+    /// `labeledDs_[myLdsIdx_].dataFormat_`.
+    pub format: DataFormat,
+    /// `getLayoutDims(labeledDs_[myLdsIdx_].ldsIdx_)`, whose FIRST dim is the one the stick jump lands
+    /// on.
+    pub layout_dims: LayoutDims,
+    /// `getStickSizes(labeledDs_[myLdsIdx_].dsType_)` — entry 071'S INPUT AND NOT ITS ANSWER, so the
+    /// accumulation stays the ported one.
+    pub stick_dims: StickDims,
+}
+
+/// HOW ENTRY 376 REACHES `AutoShuffler::replace_assign(dsc, builder, assign)` (`shuffle.cpp:788`),
+/// which is e371.
 ///
 /// ⛔ THE SEAM ENTRY 376 REACHES IT THROUGH, AND NOT A STAND-IN: entry 376 mints the builder and the
 /// shuffler and hands both over, and every decision between the two is e371's.
@@ -2611,14 +2740,15 @@ pub trait ComputationBuilder {
 /// `labeledDs_` (`:802`), `primaryDsInfo_` (`:805`) and `getAllocation` (`:821`) in its own body, and
 /// `getLayoutDims` (`:873`), `getCumulativeStickSizes` (`:876`), `coreIdsUsed_` (`:881`) and
 /// `numCoreletsUsed_` (`:882`) inside `do_codegen` alone — off the SAME DSC the builder writes, which
-/// one `&mut` carrier cannot lend twice, so all seven belong on [`ComputationBuilder`] when e371 lands.
+/// one `&mut` carrier cannot lend twice, so all seven sit on [`ComputationBuilder`].
+/// ⛔ THE ARCH IS A PARAMETER BECAUSE `inferLayouts` READS `numSlicesPerStick`: the reference takes it
+/// off the process-wide `sysdef`, and this crate makes every such read a type the caller names.
 pub trait AssignReplacement {
     /// `replace_assign(dsc, builder, assign)`.
-    fn replace_assign<B: ComputationBuilder + ?Sized>(
-        &mut self,
-        builder: &mut B,
-        assign: NodeId,
-    ) -> bool;
+    fn replace_assign<B, A>(&mut self, builder: &mut B, assign: NodeId) -> bool
+    where
+        B: ComputationBuilder + ?Sized,
+        A: Arch;
 }
 
 impl CodegenGeneric for AutoShuffler {
@@ -2835,12 +2965,360 @@ impl AutoShuffler {
     }
 }
 
-// crustify:todo: e371_replace_assign
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:788  (119 body lines, level 5)
-//   class     : AutoShuffler
-//   original  : bool AutoShuffler::replace_assign(DesignSpaceConfig* dsc, ComputationBuilder& builder, ComputeNode* assign)
-//   extract   : crustify-ddc/cpp/ddc.cpp:14744-14865
-//   calls     : e270_inferLayouts, e362_get_shuffle
+/// `create_node_allocations` AND `do_codegen` AS ONE VALUE — each captures a piece of
+/// `replace_assign`'s frame by reference (`shuffle.cpp:827`, `:857`), and one implementor is what
+/// gives the builder, the goal layout and the added-allocation list the same lifetime here.
+struct DataEdgeCodegen<'a, B: ComputationBuilder + ?Sized> {
+    /// `builder`, captured by both lambdas.
+    builder: &'a mut B,
+    /// `out_layout` — how the first lambda tells the goal from an intermediate layout.
+    out_layout: AbstractLayout,
+    /// `edge_from_output`, before `alloc_added` is set.
+    output_edge: DataEdge,
+    /// `added_alloc_lds`.
+    added_alloc_lds: Vec<Option<LdsIdx>>,
+}
+
+impl<B: ComputationBuilder + ?Sized> DataEdgeCodegen<'_, B> {
+    /// `jump_to_stick[first_dim] = factor * stick_id` written at every core and corelet the DSC uses
+    /// (`shuffle.cpp:872-883`), where `factor` is entry 071's cumulative stick size for the operand's
+    /// FIRST LAYOUT dim — 1 for a stick that does not name that dim, which is the reference's own
+    /// initialiser.
+    fn jump_to_stick(&mut self, edge: &mut DataEdge, stick: StickNumber) {
+        let Some(sticks) = self.builder.operand_sticks(edge.dinfo) else {
+            return;
+        };
+        let first_dim = sticks.layout_dims.first();
+        let mut factor = Elements(1);
+        for (stick_dim, stick_size) in
+            cumulative_stick_sizes(&sticks.stick_dims, StickPart::Whole).unwrap_or_default()
+        {
+            if stick_dim == first_dim {
+                factor = stick_size;
+            }
+        }
+        let jump = BTreeMap::from([(
+            first_dim,
+            ConstEleOffset(
+                i64::try_from(factor.0.saturating_mul(u64::from(stick.0))).unwrap_or(i64::MAX),
+            ),
+        )]);
+        // `constEleOffsets_[core][corelet] = jump_to_stick` — one corelet's whole map at a time, so a
+        // core or corelet this DSC does not use keeps whatever it had.
+        let corelets = self.builder.corelets_used();
+        for core in self.builder.cores_used().iter() {
+            let per_core = edge.const_ele_offsets.0.entry(core).or_default();
+            for &corelet in &corelets {
+                per_core.insert(corelet, jump.clone());
+            }
+        }
+    }
+}
+
+impl<B: ComputationBuilder + ?Sized> ShuffleCodegen for DataEdgeCodegen<'_, B> {
+    type Edge = DataEdge;
+
+    fn edges_for_node(&mut self, layout: &AbstractLayout) -> NodeEdges<DataEdge> {
+        if *layout == self.out_layout {
+            let mut edge = self.output_edge.clone();
+            edge.alloc_added = true;
+            return NodeEdges::repeated(layout.num_sticks(), edge);
+        }
+        // "Word length is partially independent to bit size- e.g. a freshly quantized f16->int4 now
+        // has type int4 but keeps word length of 2"
+        let mut bits = layout.format.bits().0;
+        for dim in layout.slice_dims {
+            if dim.is_dummy() {
+                bits *= 2;
+            }
+        }
+        let minted = self.builder.allocate_sticks(
+            layout.format,
+            WordLength(bits.div_ceil(8)),
+            layout.num_sticks(),
+        );
+        match NodeEdges::in_push_order(minted) {
+            Some(edges) => edges,
+            // `outputs.back()` (`shuffle.cpp:1002`) on an empty list — which `allocate_sticks` hands
+            // back only for a zero stick count.
+            None => panic!("replace_assign: a shuffle step was given no register to write"),
+        }
+    }
+
+    fn op_codegen(
+        &mut self,
+        op: &ComputationOp,
+        inputs: &[DataEdge],
+        output: &mut DataEdge,
+        sticks: &StickIds,
+        _output_added: bool,
+    ) {
+        // ⛔ `out_added` IS TAKEN AND NEVER READ (`shuffle.cpp:857-861`): what this lambda decides
+        // about the output's `alloc_added` comes from the already-added list and `getPrev()` alone.
+        if self.added_alloc_lds.contains(&output.dinfo.my_lds_idx) {
+            output.alloc_added = true;
+        } else {
+            self.added_alloc_lds.push(output.dinfo.my_lds_idx);
+            if output
+                .allocation
+                .is_some_and(|alloc| !self.builder.allocation_has_prev(alloc))
+            {
+                output.alloc_added = false;
+            }
+        }
+
+        let mut in_edges = inputs.to_vec();
+        for (i, edge) in in_edges.iter_mut().enumerate() {
+            if let Some(&stick) = sticks.inputs.get(i) {
+                self.jump_to_stick(edge, stick);
+            }
+        }
+        self.jump_to_stick(output, sticks.output);
+        // The reference discards the node too — `op.codegen(builder, in, out)` is its last statement.
+        let _ = op.codegen(&mut *self.builder, &in_edges, output);
+    }
+}
+
+impl AssignReplacement for AutoShuffler {
+    /// Replaces: e371_replace_assign
+    ///
+    /// Replaces one PE/SFP `ASSIGN` with the cheapest PACKMERGE sequence between its two ends'
+    /// inferred layouts: a fresh single-stick register per intermediate layout, the assign's own
+    /// output edge for the goal, every operand's constant element offset set to the stick it reads or
+    /// writes, and then the assign deleted.
+    ///
+    /// ⛔ `false` IS EVERY ABORT THE REFERENCE HAS NO OTHER ANSWER FOR — its two operand-count
+    /// `DT_CHECK`s ([`ComputationBuilder::assign_edges`]), `inferLayouts`' (e270), the slice-length
+    /// one ([`AbstractLayout::of`]), `get_shuffle`'s (e362) and the write-order one (e342). The
+    /// reference returns `true` unconditionally.
+    /// ⚠️ TRAP: `wl / 8.0` (`shuffle.cpp:848`) is a `double` landing in a `double wordLength`, so the
+    /// reference really stores a fraction there; [`WordLength`] counts WHOLE BYTES and this rounds UP,
+    /// which no format in a 128-bit slice reaches.
+    fn replace_assign<B, A>(&mut self, builder: &mut B, assign: NodeId) -> bool
+    where
+        B: ComputationBuilder + ?Sized,
+        A: Arch,
+    {
+        let Some(edges) = builder.assign_edges() else {
+            return false;
+        };
+        let Some(input) = builder.operand_sticks(edges.input.dinfo) else {
+            return false;
+        };
+        let Some(output) = builder.operand_sticks(edges.output.dinfo) else {
+            return false;
+        };
+        let Some(in_sticks) = SubdividedSticks::new(&input.primary_sticks, &input.primary_stick_repl)
+        else {
+            return false;
+        };
+        let Some(out_sticks) =
+            SubdividedSticks::new(&output.primary_sticks, &output.primary_stick_repl)
+        else {
+            return false;
+        };
+        let Some((in_concrete, out_concrete)) = Self::infer_layouts::<A>(&in_sticks, &out_sticks)
+        else {
+            return false;
+        };
+        let Some(in_layout) = AbstractLayout::of(&in_concrete, input.format) else {
+            return false;
+        };
+        let Some(out_layout) = AbstractLayout::of(&out_concrete, output.format) else {
+            return false;
+        };
+        let Some(shuffle) = self.get_shuffle(&in_layout, &out_layout) else {
+            return false;
+        };
+
+        let count = usize::try_from(in_layout.num_sticks().0).unwrap_or(usize::MAX);
+        let input_edges = vec![edges.input; count];
+        let mut codegen = DataEdgeCodegen {
+            builder: &mut *builder,
+            out_layout,
+            output_edge: edges.output,
+            added_alloc_lds: Vec::new(),
+        };
+        if self
+            .codegen_generic(
+                &in_concrete,
+                &out_concrete,
+                &shuffle,
+                &input_edges,
+                &mut codegen,
+            )
+            .is_none()
+        {
+            return false;
+        }
+        builder.delete_node(assign);
+        true
+    }
+}
+
+// ⭐ TEST FOR ENTRY 371.
+#[cfg(test)]
+mod tests_e371 {
+    use super::{
+        AssignEdges, AssignReplacement, AutoShuffler, ComputationBuilder, ConstEleOffsets, DataEdge,
+        OperandSticks, Packmerge, StickRepl,
+    };
+    use crate::arch::{Dd2, Elements, Sticks};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{PrimaryDim, StickDims};
+    use crate::formats::DataFormat;
+    use crate::schedule::ddc::fold::{AllocId, NodeId};
+    use crate::schedule::ddc::v1::CoresUsed;
+    use crate::schedule::dsc2::{DataInfo, LayoutDims, LdsIdx, WordLength};
+    use crate::units::{Core, Corelet};
+    use sys_arch_spec::arch_enums::SenComponent;
+
+    /// The assign's input labelled DS.
+    const IN_LDS: u32 = 1;
+    /// The assign's output labelled DS.
+    const OUT_LDS: u32 = 2;
+
+    /// EVERY MINT AND EVERY WRITE THE PORT ASKS FOR, over the vendor's own two ends (e270's case): a
+    /// stick of 32 `Out` against one of 4 `X` by 8 `Out`, on one core and one corelet, every
+    /// allocation already positioned in the tree.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        minted: Vec<(DataFormat, WordLength, Sticks)>,
+        merges: Vec<(Option<LdsIdx>, ConstEleOffsets)>,
+        deleted: Vec<NodeId>,
+        next: u32,
+    }
+
+    fn edge(lds: u32) -> DataEdge {
+        DataEdge {
+            dinfo: DataInfo {
+                my_lds_idx: Some(LdsIdx(lds)),
+                ..DataInfo::default()
+            },
+            component: SenComponent::Sfplrf,
+            allocation: Some(AllocId(lds)),
+            const_ele_offsets: ConstEleOffsets::default(),
+            alloc_added: false,
+        }
+    }
+
+    fn stick_dims(dims: &[(PrimaryDim, u64)]) -> StickDims {
+        StickDims(
+            dims.iter()
+                .map(|&(dim, extent)| (dim, Elements(extent)))
+                .collect(),
+        )
+    }
+
+    impl ComputationBuilder for Recorder {
+        fn delete_node(&mut self, node: NodeId) {
+            self.deleted.push(node);
+        }
+
+        fn allocate_sticks(
+            &mut self,
+            format: DataFormat,
+            word_length: WordLength,
+            n: Sticks,
+        ) -> Vec<DataEdge> {
+            self.minted.push((format, word_length, n));
+            let mut minted = Vec::new();
+            for _ in 0..n.0 {
+                self.next += 1;
+                minted.push(edge(100 + self.next));
+            }
+            minted
+        }
+
+        fn insert_packmerge(
+            &mut self,
+            _in1: &DataEdge,
+            _in2: &DataEdge,
+            out: &mut DataEdge,
+            _packmerge: &Packmerge,
+        ) -> NodeId {
+            self.merges
+                .push((out.dinfo.my_lds_idx, out.const_ele_offsets.clone()));
+            NodeId(u32::try_from(self.merges.len()).unwrap_or(0))
+        }
+
+        fn assign_edges(&self) -> Option<AssignEdges> {
+            Some(AssignEdges {
+                input: edge(IN_LDS),
+                output: edge(OUT_LDS),
+            })
+        }
+
+        fn operand_sticks(&self, dinfo: DataInfo) -> Option<OperandSticks> {
+            let primary_sticks = if dinfo.my_lds_idx == Some(LdsIdx(IN_LDS)) {
+                stick_dims(&[(PrimaryDim::Out, 32)])
+            } else {
+                stick_dims(&[(PrimaryDim::X, 4), (PrimaryDim::Out, 8)])
+            };
+            Some(OperandSticks {
+                primary_stick_repl: vec![StickRepl(1); primary_sticks.0.len()],
+                stick_dims: primary_sticks.clone(),
+                primary_sticks,
+                format: DataFormat::Sen169Fp16,
+                layout_dims: LayoutDims::new(PrimaryDim::Out, vec![PrimaryDim::X]),
+            })
+        }
+
+        fn cores_used(&self) -> CoresUsed {
+            CoresUsed::new(Core::checked(0).expect("core 0"), Vec::new())
+        }
+
+        fn corelets_used(&self) -> Vec<Corelet> {
+            vec![Corelet::checked(0).expect("corelet 0")]
+        }
+
+        fn allocation_has_prev(&self, _alloc: AllocId) -> bool {
+            true
+        }
+    }
+
+    /// e371: every intermediate layout gets one 16-bit register per stick, the goal step writes the
+    /// assign's OWN output, every packmerge's output carries the stick jump at the first layout dim as
+    /// a multiple of that dim's cumulative stick size, and the assign is deleted.
+    #[test]
+    fn replace_assign_shuffles_between_the_two_ends_and_deletes_the_assign() {
+        let mut builder = Recorder::default();
+        let mut shuffler = AutoShuffler::new();
+
+        assert!(shuffler.replace_assign::<Recorder, Dd2>(&mut builder, NodeId(7)));
+
+        assert_eq!(builder.deleted, vec![NodeId(7)], "the assign is deleted");
+        assert!(!builder.merges.is_empty(), "the shuffle emitted packmerges");
+        for &(format, word_length, sticks) in &builder.minted {
+            assert_eq!(format, DataFormat::Sen169Fp16, "the layout's own format");
+            assert_eq!(sticks, Sticks(4), "one register per stick of the layout");
+            assert!(
+                word_length.0 >= 2 && word_length.0.is_power_of_two(),
+                "16 bits doubled once per dummy slice dim, in whole bytes: {word_length:?}"
+            );
+        }
+
+        let core = Core::checked(0).expect("core 0");
+        let corelet = Corelet::checked(0).expect("corelet 0");
+        let jumps: Vec<i64> = builder
+            .merges
+            .iter()
+            .map(|(_, offsets)| offsets.0[&core][&corelet][&PrimaryDim::Out].0)
+            .collect();
+        assert!(
+            jumps.iter().all(|jump| jump % 8 == 0),
+            "`Out`'s cumulative stick size is 8, so every jump is a multiple of it: {jumps:?}"
+        );
+        assert!(
+            jumps.iter().any(|jump| *jump != 0),
+            "some computation writes a stick past the zeroth: {jumps:?}"
+        );
+        assert_eq!(
+            builder.merges.last().map(|(lds, _)| *lds),
+            Some(Some(LdsIdx(OUT_LDS))),
+            "the goal step writes the assign's own output edge"
+        );
+    }
+}
 
 // ⭐ TESTS FOR ENTRIES 137-144. Union this module with this file's other test modules when they land.
 #[cfg(test)]
@@ -3437,9 +3915,9 @@ mod tests_e153_e160 {
 #[cfg(test)]
 mod tests_e161_e164 {
     use super::{
-        AbstractLayout, CodegenGeneric, ComputationOp, ConcreteLayout, DIMS_PER_SLICE, DataEdge,
-        DimSymbol, IndexExpansion, InsertPoint, Packmerge, ShuffleCodegen, ShuffleIndex, StickIds,
-        StickIndex, StickNumber, narrow_to_usize,
+        AbstractLayout, CodegenGeneric, ComputationOp, ConcreteLayout, ConstEleOffsets,
+        DIMS_PER_SLICE, DataEdge, DimSymbol, IndexExpansion, InsertPoint, Packmerge, ShuffleCodegen,
+        ShuffleIndex, StickIds, StickIndex, StickNumber, narrow_to_usize,
     };
     use crate::formats::DataFormat;
     use crate::schedule::ddc::fold::AllocId;
@@ -3566,6 +4044,7 @@ mod tests_e161_e164 {
             dinfo: DataInfo::default(),
             component: SenComponent::Ptrow0,
             allocation: Some(allocation),
+            const_ele_offsets: ConstEleOffsets::default(),
             alloc_added: false,
         };
 
