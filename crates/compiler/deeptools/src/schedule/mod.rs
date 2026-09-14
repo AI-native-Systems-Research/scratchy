@@ -128,9 +128,18 @@
 
 pub mod dcg;
 pub mod ddc;
-pub(crate) mod ddl;
+/// ⭐ `pub` FOR THE INTEGRATION, WHICH IS THE CALLER. Every unit of this module was `pub(crate)`
+/// while nothing called the stages; the DDL template set and the loop labels are what stage 2b asks
+/// a provider for, so the provider's home has to be able to name them.
+pub mod ddl;
 /// The `dsc/dsc2.h` vocabulary these stages read and write — NOT a scheduled unit of the campaign,
 /// but the types its units traffic in. Each declaration cites the C++ one it narrows.
 pub mod dsc2;
-pub(crate) mod l3;
+/// ⭐ `pub` FOR THE SAME REASON AS [`ddl`]: `l3::dsc::SuperDsc` is the type the bake must BUILD from
+/// scratchy's own SuperDSC in order to hand it to `l3::dl_ops::run`, so it cannot be crate-private.
+pub mod l3;
+/// ⭐⭐ THE STAGES, COMPOSED AND CALLABLE — `SchedulerStages.cpp:29-57` with the concrete providers
+/// the ported units take as type parameters. This is the module that makes the campaign's 382 units
+/// run instead of sitting there; see its own header for what is wired and what is not.
+pub mod stages;
 
