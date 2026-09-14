@@ -85,12 +85,6 @@
 //! | `e631_promoteRegisterInitCandidatesAboveUniformRegion` | 631 | 6 | 5 | `dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1036` |
 //! | `e644_runOnOperation` | 644 | 7 | 111 | `dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1203` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
-// file's own tests until `e644_runOnOperation` lands and something calls it. CI runs clippy with
-// `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e644_runOnOperation`: at that point an unused item here is a real defect again.
-#![allow(dead_code)]
-
 pub(crate) mod register_init_candidate_promoter;
 pub(crate) mod register_init_info;
 
@@ -100,13 +94,21 @@ use std::fmt::Write as _;
 use crate::arch::Arch;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::Values;
-use crate::islands::sentient::ProgramUnit;
-use crate::islands::sentient::dialects::{self, Op, Val, sentient};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, LocalRegion, Op, Val, regions_ref, sentient,
+};
 use crate::islands::sentient::print;
-use crate::transform::sentient::analyses::{Liveness, RegisterGraphs, UniformGroups};
+use crate::model::Model;
+use crate::transform::sentient::analyses::{
+    InstructionEstimator, Liveness, RegisterGraphs, UniformGroups,
+};
 use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
+use crate::workload::Workload;
 
-use self::register_init_info::{RegisterInitInfo, SsaWeights};
+use self::register_init_info::{
+    EarlyStop, Enclosing, GtrRegInit, RegisterInitInfo, SsaWeights, has_uniformize_region,
+};
 
 /// Replaces: e102_dumpWeights
 ///
@@ -397,10 +399,224 @@ pub fn promote_register_init_candidates_above_uniform_region<
     );
 }
 
-// crustify:todo: e644_runOnOperation
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1203  (111 body lines, level 7)
-//   original  : void OldRegisterInitializationPass::runOnOperation()
-//   calls     : e107_hasUniformizeRegion, e108_removeInitAttrFromOps, e327_calcSSAWeight, e328_sortRegCoalescingCandidates, e329_collectAllRegCoalescingCandidates, e332_moveSSAToInit, e422_insert, e449_calcSSAWeight, e450_collectAllRegCoalescingCandidates, e451_collectRegInitAndRegCoalescingCandidateFast, e631_promoteRegisterInitCandidatesAboveUniformRegion
+/// `DisableThisPass` — `-dcc-old-register-initialization-disable`, `cl::init(false)` (`:51-54`).
+const DISABLE_THIS_PASS: bool = false;
+
+/// `DoPromoteAboveUniform` — `cl::init(true)` (`:61-65`).
+const DO_PROMOTE_ABOVE_UNIFORM: bool = true;
+
+/// `DoUniformGroupLeadersOnly` — `cl::init(true)` (`:75-79`).
+const DO_UNIFORM_GROUP_LEADERS_ONLY: bool = true;
+
+/// `opts_.OptLevel == 0` (`:1211`) — the pipeline runs this pass above level zero, so the
+/// IBUFF-space bail-out is unreachable and the child estimator is never asked.
+const OPT_LEVEL_ZERO: bool = false;
+
+/// `UniformizeRegionsOp::getRegionFromUnit` and its `EqualizePatternOp` twin
+/// (`dataflow-scheduler/.../lib/Dialect/Uniform/Uniform.cpp:215-229`, `:391`).
+///
+/// ⭐ "THE FIRST REGION WHOSE UNIT LIST HOLDS `u`" IS THE WHOLE REFERENCE: it indexes the flat unit
+/// list, then walks `list_sizes` until the running total passes that index — and a unit the op does
+/// not name leaves the index at the total, which no partial sum exceeds, hence `None`.
+fn region_from_unit(regions: &[LocalRegion], u: Val) -> Option<&LocalRegion> {
+    regions.iter().find(|region| region.units.contains(&u))
+}
+
+/// `CollectAndFinalizeRegInitAndCoalescingCandidates`' walk (`:1235-1261`) — every op of the program
+/// unit scored and collected for ONE unit value, a `uniform` op contributing the one region that unit
+/// runs and its subtree skipped with it.
+#[allow(clippy::too_many_arguments)]
+fn walk_for_unit<'a, L: Liveness>(
+    region: &'a [Op],
+    u: Val,
+    outer_ops: &[&'a Op],
+    outer_scopes: &[&'a [Op]],
+    preamble: &'a [Op],
+    prog_unit: (Val, &'a [Val]),
+    liveness: &L,
+    rti: &mut RegisterInitInfo,
+) {
+    let mut scopes: Vec<&'a [Op]> = Vec::with_capacity(outer_scopes.len() + 1);
+    scopes.push(region);
+    scopes.extend_from_slice(outer_scopes);
+    // ⭐ TWO CHAINS, BECAUSE `getDefiningOp()` IS GLOBAL AND `hasOneUse()` IS TOO: the preamble's
+    // `dataflow.get_unit`s and constants must be visible to a lookup, while the scope `e329` counts
+    // uses in is the one that holds them, which is the unit body.
+    let mut global: Vec<&'a [Op]> = scopes.clone();
+    global.push(preamble);
+    let use_scope: &[Op] = outer_scopes.last().copied().unwrap_or(region);
+    for op in region {
+        let enclosing = Enclosing::from_innermost(outer_ops);
+        let defs = Definitions::within_program_unit(&global, prog_unit.0, prog_unit.1);
+        if let Op::UniformRegions(uniform) = op {
+            if let Some(local) = region_from_unit(uniform.regions(), u) {
+                rti.calc_ssa_weight_in_region(
+                    &local.body,
+                    enclosing,
+                    &global,
+                    GtrRegInit::default(),
+                );
+                rti.collect_all_reg_coalescing_candidates_in_region(&local.body, &scopes, liveness);
+            }
+            continue;
+        }
+        rti.calc_ssa_weight(op, enclosing, defs, GtrRegInit::default());
+        rti.collect_all_reg_coalescing_candidates(op, use_scope, defs, liveness);
+        let mut inner_ops: Vec<&'a Op> = Vec::with_capacity(outer_ops.len() + 1);
+        inner_ops.push(op);
+        inner_ops.extend_from_slice(outer_ops);
+        for inner in regions_ref(op) {
+            walk_for_unit(
+                inner, u, &inner_ops, &scopes, preamble, prog_unit, liveness, rti,
+            );
+        }
+    }
+}
+
+/// The rest of `CollectAndFinalizeRegInitAndCoalescingCandidates` (`:1262-1265`) — the scoreboard one
+/// unit value earned, sorted and then vetted.
+#[allow(clippy::too_many_arguments)]
+fn collect_and_finalize<A: Arch, L: Liveness + Clone, G: RegisterGraphs + Default>(
+    unit_body: &[Op],
+    preamble: &[Op],
+    prog_unit_arg: Val,
+    unit_units: &[Val],
+    u: Val,
+    liveness: &L,
+    rtis: &mut BTreeMap<Val, RegisterInitInfo>,
+) {
+    let mut rti = RegisterInitInfo::default();
+    let none: [&Op; 0] = [];
+    walk_for_unit(
+        unit_body,
+        u,
+        &none,
+        &[],
+        preamble,
+        (prog_unit_arg, unit_units),
+        liveness,
+        &mut rti,
+    );
+    rti.sort_reg_coalescing_candidates();
+    let global: [&[Op]; 2] = [unit_body, preamble];
+    let defs = Definitions::within_program_unit(&global, prog_unit_arg, unit_units);
+    rti.collect_reg_init_and_reg_coalescing_candidate_fast::<A, L, G>(
+        unit_body,
+        u,
+        defs,
+        liveness,
+        EarlyStop::default(),
+    );
+    rtis.insert(u, rti);
+}
+
+/// Replaces: e644_runOnOperation
+///
+/// THE PASS ENTRY (`:1203-1313`): every program unit loses its old header flags and then earns one
+/// scoreboard per unit value, which is spent by promoting the candidates above the uniform region
+/// when the unit has one and by moving them into the program header when it has not.
+///
+/// ⛔ THE `cached_rtis` MEMO CAN NEVER HIT: `base_fold_units` already deduplicates on
+/// `get_unit_op->getResult(0)`, which is the memo's own key, so it is dropped as mechanism.
+/// ⛔ `prog_unit_args` IS THE DROPPED MECHANISM, one per unit of `program.units` in order — no
+/// [`ProgramUnit`] carries its body's argument; see [`super::deuniform::run_on_operation`].
+/// ⛔ `markAnalysesPreserved<Liveness>` (`:1312`) is pass-manager bookkeeping and is dropped.
+#[allow(clippy::too_many_arguments)]
+pub fn run_on_operation<
+    A: Arch,
+    M: Model,
+    W: Workload,
+    I: InstructionEstimator,
+    L: Liveness + Clone,
+    G: RegisterGraphs + Default,
+    U: UniformGroups,
+>(
+    program: &mut Program<A, M, W>,
+    prog_unit_args: &[Val],
+    estimator: &mut I,
+    liveness: &mut L,
+    uga: &mut U,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    let Program {
+        preamble, units, ..
+    } = program;
+    for (index, unit) in units.iter_mut().enumerate() {
+        let Some(prog_unit_arg) = prog_unit_args.get(index).copied() else {
+            todo!(
+                "OldRegisterInitializationPass::runOnOperation: no program-unit argument for unit \
+                 {index}, which `prog_unit_op.getBody()->getArgument(0)` is (:1240)"
+            )
+        };
+        if OPT_LEVEL_ZERO && estimator.have_ibuff_space(&unit.body) {
+            continue;
+        }
+        // "always remove existing programheader attr" (`:1215-1216`).
+        remove_init_attr_from_ops(&mut unit.body);
+        let mut rtis: BTreeMap<Val, RegisterInitInfo> = BTreeMap::new();
+        let unit_units = unit.on.vals();
+        if has_uniformize_region(&unit.body) {
+            if DO_UNIFORM_GROUP_LEADERS_ONLY {
+                uga.collect_exclusive_group_leaders();
+            }
+            let units_ref = if DO_UNIFORM_GROUP_LEADERS_ONLY {
+                uga.group_leaders()
+            } else {
+                unit_units.clone()
+            };
+            let mut base_fold_units: Vec<Val> = Vec::new();
+            for u in units_ref {
+                // `get_unit_op->getResult(0)` IS `u`: a `dataflow.get_unit` binds exactly one result.
+                if !base_fold_units.contains(&u) {
+                    collect_and_finalize::<A, L, G>(
+                        &unit.body,
+                        preamble,
+                        prog_unit_arg,
+                        &unit_units,
+                        u,
+                        liveness,
+                        &mut rtis,
+                    );
+                    base_fold_units.push(u);
+                }
+            }
+            if DO_PROMOTE_ABOVE_UNIFORM {
+                promote_register_init_candidates_above_uniform_region::<A, L, G, U>(
+                    unit,
+                    prog_unit_arg,
+                    &base_fold_units,
+                    liveness,
+                    &mut rtis,
+                    uga,
+                    values,
+                );
+            }
+        } else {
+            // "All unit share the code so any one arg is ok in this case" (`:1294-1295`).
+            collect_and_finalize::<A, L, G>(
+                &unit.body,
+                preamble,
+                prog_unit_arg,
+                &unit_units,
+                unit.on.first(),
+                liveness,
+                &mut rtis,
+            );
+            for rti in rtis.values_mut() {
+                // `final_reginit_candidates_` IS A `std::stack`, so `top()` is the LAST entry.
+                while let Some(val) = rti.final_reginit_candidates.pop() {
+                    liveness.update_live_ranges_for_program_header_promotion(val);
+                    move_ssa_to_init(&mut unit.body, val);
+                }
+                liveness.add_virtual_assign_optional(&rti.final_reg_coalescing_candidates);
+                liveness.add_virtual_assign_enforced(&rti.enforced_virtual_assign);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -408,18 +624,22 @@ mod unit_tests {
     use super::{
         dump_weight, dump_weights, erase_deleted_ops, get_first_source, has_same_attr,
         move_ssa_to_init, promote_register_init_candidates_above_uniform_region,
-        remove_init_attr_from_ops,
+        remove_init_attr_from_ops, run_on_operation,
     };
     use crate::arch::Dd2;
     use crate::formats::Bits;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::dataflow_ir::{Units, Values};
-    use crate::islands::sentient::ProgramUnit;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units, Values};
     use crate::islands::sentient::dialects::{Op, Val, dataflow, sentient};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
     use crate::transform::sentient::analyses::{
-        Liveness, OutOfScopeRegisterGraphs, UniformGroups, VirtualAssigns,
+        Liveness, OutOfScopeInstructionEstimator, OutOfScopeRegisterGraphs, UniformGroups,
+        VirtualAssigns,
     };
     use crate::units::{DfirUnit, Residency};
+    use crate::workload::Workload;
     use std::collections::{BTreeMap, BTreeSet};
 
     /// The out-of-scope group analysis, answering for ONE leader with no followers.
@@ -662,16 +882,20 @@ mod unit_tests {
         assert!(!has_same_attr(Some(Val(8)), Some(Val(2)), &scope));
     }
 
-    /// The out-of-scope liveness, recording only what the promoter's post-processing asks of it.
+    /// The out-of-scope liveness, recording what the promoter's post-processing and e644's spending of
+    /// a scoreboard ask of it.
     #[derive(Clone, Default)]
     struct Recording {
         cleared: Vec<VirtualAssigns>,
         recomputed: Vec<usize>,
+        promoted: Vec<Val>,
+        optional: Vec<Vec<Vec<Val>>>,
+        enforced: Vec<Vec<(Val, Val)>>,
     }
 
     impl Liveness for Recording {
-        fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {
-            todo!("no candidate is promoted here")
+        fn update_live_ranges_for_program_header_promotion(&mut self, candidate: Val) {
+            self.promoted.push(candidate);
         }
 
         fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
@@ -686,12 +910,12 @@ mod unit_tests {
             self.recomputed.push(unit.len());
         }
 
-        fn add_virtual_assign_optional(&mut self, _set_of_subsets: &[Vec<Val>]) {
-            todo!("this fake is never given an optional assignment")
+        fn add_virtual_assign_optional(&mut self, set_of_subsets: &[Vec<Val>]) {
+            self.optional.push(set_of_subsets.to_vec());
         }
 
-        fn add_virtual_assign_enforced(&mut self, _set_of_pairs: &[(Val, Val)]) {
-            todo!("this fake is never given an enforced assignment")
+        fn add_virtual_assign_enforced(&mut self, set_of_pairs: &[(Val, Val)]) {
+            self.enforced.push(set_of_pairs.to_vec());
         }
         fn operand_to_index(
             &mut self,
@@ -728,5 +952,83 @@ mod unit_tests {
         assert_eq!(liveness.cleared, vec![VirtualAssigns::Kept]);
         assert_eq!(liveness.recomputed, vec![1]);
         assert_eq!(unit.body.len(), 1);
+    }
+
+    /// A model and a rung, so the program is typed; nothing this pass does reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e644 — a unit with no uniform region earns its scoreboard from the one unit value it shares,
+    /// and the `lbr` copy the scoreboard REQUIRES lands in the program header: the flag is set on the
+    /// op and the promotion reaches liveness, which is the whole effect of the else arm.
+    #[test]
+    fn e644_moves_the_required_candidate_into_the_program_header() {
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: vec![Op::Dataflow(dataflow::Op::GetUnit {
+                result: Val(1),
+                residency: Residency::Global,
+                unit: DfirUnit::L3lu,
+                num_folds: None,
+                reg_locale: None,
+            })],
+            units: ProgramUnits::of(
+                ProgramUnit::<Dd2> {
+                    on: Units::one(DfirUnit::L3lu, Val(1)),
+                    precision: None,
+                    body: vec![
+                        Op::Sentient(sentient::Op::ScalarConstant {
+                            value: 4,
+                            result: Val(9),
+                            reg_locale: sentient::RegType::Imm,
+                            ty: ScalarTy::Index,
+                            is_symbol: false,
+                        }),
+                        copy(9, 10, None, false),
+                    ],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut liveness = Recording::default();
+        let mut uga = OneUnit(Val(1));
+
+        run_on_operation::<Dd2, _, _, _, _, OutOfScopeRegisterGraphs, _>(
+            &mut program,
+            &[Val(0)],
+            &mut OutOfScopeInstructionEstimator,
+            &mut liveness,
+            &mut uga,
+            &mut Values::default(),
+        );
+
+        let body = &program.units.iter().next().expect("one unit").body;
+        assert_eq!(body[1], copy(9, 10, None, true), "the `lbr` copy is in the header");
+        assert_eq!(liveness.promoted, vec![Val(10)]);
+        // Nothing coalesces here, and both spendings still happen once for the one scoreboard.
+        assert_eq!(liveness.optional, vec![Vec::<Vec<Val>>::new()]);
+        assert_eq!(liveness.enforced, vec![Vec::<(Val, Val)>::new()]);
     }
 }

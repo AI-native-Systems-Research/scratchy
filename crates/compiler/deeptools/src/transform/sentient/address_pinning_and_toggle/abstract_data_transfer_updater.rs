@@ -80,14 +80,19 @@
 
 use super::looping_chain_mutable_addr_descriptor::{TransferEnd, mutable_addr_of};
 use super::{
-    ConditionalConstDataTransferUpdater, DataTransferDescriptor, IntegerSequenceDataTransferUpdater,
-    SimpleConstantDataTransferUpdater, ToggleDataTransferUpdater, mutable_addr_mut, op_at,
+    ConditionalConstDataTransferUpdater, DataTransferDescriptor, DataTransferDescriptorContainer,
+    DescriptorId, IntegerSequenceDataTransferUpdater, SimpleConstantDataTransferUpdater,
+    ToggleDataTransferUpdater, data_transfer_descriptor_container, mutable_addr_mut, op_at,
     set_iter_operand,
 };
 use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
+use crate::formats::Bits;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{self, Definitions, Op, Val, sentient};
-use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator, OffsetSites};
+use crate::transform::sentient::analyses::{
+    EvaluatedValue, ExpressionEvaluator, OffsetSites, PinningSchemeManager,
+};
+use crate::transform::sentient::cfg_simplification_sentient_level::pattern_simplification_manager::is_same_constant;
 use crate::transform::sentient::utils::{ConstKind, is_constant};
 use crate::transform::sentient::{ForRef, IterArgIndex};
 
@@ -129,6 +134,167 @@ impl DataTransferUpdater {
             Self::Toggle(updater) => updater.get_offset(new_immut_addr_ev),
             Self::ConditionalConst(updater) => updater.get_offset(new_immut_addr_ev),
             Self::IntegerSequence(updater) => updater.get_offset(new_immut_addr_ev),
+        }
+    }
+
+    /// `updateImmutableAddr()` on whichever subclass this is (`:1017`, pure virtual).
+    ///
+    /// ⛔ NO VARIANT INSERTS: all four rewrite `op`'s immutable operand in place, which is why e638
+    /// can hand them a copy taken out of the body and put it back afterwards.
+    pub fn update_immutable_addr<E: ExpressionEvaluator>(
+        &mut self,
+        dtd: &DataTransferDescriptor,
+        op: &mut Op,
+        end: TransferEnd,
+        ty: ScalarTy,
+        defs: Definitions<'_>,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        element_size: Bits,
+    ) -> EvaluatedValue {
+        match self {
+            Self::SimpleConstant(updater) => {
+                updater.update_immutable_addr(dtd, op, end, ty, ps_manager, element_size)
+            }
+            Self::Toggle(updater) => {
+                updater.update_immutable_addr(dtd, op, end, ty, ps_manager, element_size)
+            }
+            Self::ConditionalConst(updater) => updater.update_immutable_addr(
+                dtd,
+                op,
+                end,
+                ty,
+                defs,
+                evaluator,
+                ps_manager,
+                element_size,
+            ),
+            Self::IntegerSequence(updater) => {
+                updater.update_immutable_addr(dtd, op, end, ty, evaluator, ps_manager, element_size)
+            }
+        }
+    }
+
+    /// `updateConstantMutableAddr(new_immut_addr_ev)` on whichever subclass this is (`:1019`).
+    ///
+    /// ⭐ THE TWO ARMS THAT TAKE THE OP BY ITSELF GET A COPY AND HAVE IT PUT BACK: neither inserts, and
+    /// the other two reach the transfer through `body` because they DO (`:2106-2109`, `:2160-2163`).
+    pub fn update_constant_mutable_addr<E: ExpressionEvaluator>(
+        self,
+        dtd: &DataTransferDescriptor,
+        end: TransferEnd,
+        ty: ScalarTy,
+        defs: Definitions<'_>,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        element_size: Bits,
+        new_immut_addr_ev: EvaluatedValue,
+        sites: &mut OffsetSites<'_>,
+        body: &mut Vec<Op>,
+    ) {
+        match self {
+            Self::SimpleConstant(updater) => {
+                let Some(mut memory_op) = op_at(&dtd.op, body).cloned() else {
+                    return;
+                };
+                updater.update_constant_mutable_addr(
+                    dtd,
+                    &mut memory_op,
+                    end,
+                    ty,
+                    defs,
+                    evaluator,
+                    ps_manager,
+                    element_size,
+                    new_immut_addr_ev,
+                );
+                if let Some(slot) = op_at_mut(body, dtd.op.path()) {
+                    *slot = memory_op;
+                }
+            }
+            Self::Toggle(updater) => {
+                let Some(mut memory_op) = op_at(&dtd.op, body).cloned() else {
+                    return;
+                };
+                updater.update_constant_mutable_addr(
+                    dtd,
+                    &mut memory_op,
+                    end,
+                    body,
+                    defs,
+                    ty,
+                    evaluator,
+                    ps_manager,
+                    element_size,
+                    new_immut_addr_ev,
+                );
+                if let Some(slot) = op_at_mut(body, dtd.op.path()) {
+                    *slot = memory_op;
+                }
+            }
+            Self::ConditionalConst(updater) => updater.update_constant_mutable_addr(
+                dtd,
+                end,
+                ty,
+                evaluator,
+                ps_manager,
+                element_size,
+                new_immut_addr_ev,
+                sites,
+                body,
+            ),
+            Self::IntegerSequence(updater) => updater.update_constant_mutable_addr(
+                dtd,
+                end,
+                ty,
+                evaluator,
+                ps_manager,
+                element_size,
+                new_immut_addr_ev,
+                sites,
+                body,
+            ),
+        }
+    }
+
+    /// `updateVariableOffsetCalculation(new_immut_addr_ev)` on whichever subclass this is (`:1021`).
+    pub fn update_variable_offset_calculation<E: ExpressionEvaluator>(
+        self,
+        dtd: &DataTransferDescriptor,
+        ty: ScalarTy,
+        defs: Definitions<'_>,
+        evaluator: &mut E,
+        new_immut_addr_ev: EvaluatedValue,
+        sites: &mut OffsetSites<'_>,
+        body: &mut Vec<Op>,
+    ) {
+        match self {
+            Self::SimpleConstant(updater) => {
+                updater.update_variable_offset_calculation(new_immut_addr_ev);
+            }
+            Self::Toggle(updater) => updater.update_variable_offset_calculation(
+                dtd,
+                body,
+                defs,
+                ty,
+                evaluator,
+                new_immut_addr_ev,
+            ),
+            Self::ConditionalConst(updater) => updater.update_variable_offset_calculation(
+                new_immut_addr_ev,
+                ty,
+                evaluator,
+                sites,
+                body,
+            ),
+            Self::IntegerSequence(updater) => updater.update_variable_offset_calculation(
+                dtd,
+                new_immut_addr_ev,
+                ty,
+                evaluator,
+                sites,
+                body,
+            ),
         }
     }
 }
@@ -533,10 +699,165 @@ pub(super) fn insert_before(scope: &mut Vec<Op>, path: &[u32], op: Op) {
     }
 }
 
-// crustify:todo: e638_update
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1738  (60 body lines, level 7)
-//   original  : void AbstractDataTransferUpdater::update()
-//   calls     : e007_isPartOfSomeChain, e010_updateVariableOffsetCalculation, e011_getOffset, e012_getOffset, e013_getOffset, e014_dump, e273_isHeadOfChain, e276_updateImmutableAddr, e277_updateVariableOffsetCalculation, e417_isHeadOfLoopingChain, e418_getOffset, e420_updateImmutableAddr, e421_updateConstantMutableAddr, e423_lookup …
+/// Replaces: e638_update
+///
+/// Rewrites one transfer onto the address just pinned for it: the immutable operand always, then the
+/// mutable one by chain position — a constant folds in place, a looping chain's head has its
+/// initializer shifted, a non-head link is only CHECKED, and anything else gets a `sentient.scalar_add`
+/// right ahead of the transfer (`:1738-1797`).
+///
+/// ⛔ THE MIDDLE-OF-CHAIN ARM EDITS NOTHING: it proves the predecessor carries the SAME original base
+/// address, and two different ones are `DT_ERROR("unhandled corner case")`.
+/// ⛔ THE OP IS TAKEN OUT AND PUT BACK, and `defs` reads a SNAPSHOT while the arms rewrite the live
+/// body — this crate's read-then-write idiom, for [`update_head_of_chain_mutable_addr_initializer`]'s
+/// reason: every insert moves the paths after it.
+pub(crate) fn update<E: ExpressionEvaluator>(
+    updater: &mut DataTransferUpdater,
+    descs: &DataTransferDescriptorContainer,
+    desc: DescriptorId,
+    unit_body: &mut Vec<Op>,
+    end: TransferEnd,
+    ty: ScalarTy,
+    element_size: Bits,
+    evaluator: &mut E,
+    ps_manager: &impl PinningSchemeManager,
+    sites: &mut OffsetSites<'_>,
+) {
+    let Some(dtd) = descs.descriptors.get(desc.0 as usize) else {
+        todo!("update: `dtd_` is {desc:?}, which this container does not hold")
+    };
+    let Some(mut memory_op) = op_at(&dtd.op, unit_body).cloned() else {
+        todo!(
+            "update: `dtd_.getOperation()` is at {:?}, which this unit body does not reach",
+            dtd.op
+        )
+    };
+    // `const EvaluatedValue &new_immut_addr_ev = updateImmutableAddr();` (`:1749`)
+    let new_immut_addr_ev = {
+        let snapshot = unit_body.clone();
+        let regions: [&[Op]; 1] = [&snapshot];
+        updater.update_immutable_addr(
+            dtd,
+            &mut memory_op,
+            end,
+            ty,
+            Definitions::from_innermost(&regions),
+            evaluator,
+            ps_manager,
+            element_size,
+        )
+    };
+    if let Some(slot) = op_at_mut(unit_body, dtd.op.path()) {
+        *slot = memory_op;
+    }
+
+    let snapshot = unit_body.clone();
+    let regions: [&[Op]; 1] = [&snapshot];
+    let defs = Definitions::from_innermost(&regions);
+    let Some(mutable_addr) = op_at(&dtd.op, &snapshot).map(|op| mutable_addr_of(op, end)) else {
+        return;
+    };
+
+    // "if mutable_addr is a constant it cannot be in the middle of a chain. ie it's either not in a
+    // chain or is the head and therefore requires full update." (`:1751-1753`)
+    if is_constant(mutable_addr, ConstKind::ScalarConstant, defs) {
+        updater.update_constant_mutable_addr(
+            dtd,
+            end,
+            ty,
+            defs,
+            evaluator,
+            ps_manager,
+            element_size,
+            new_immut_addr_ev,
+            sites,
+            unit_body,
+        );
+        return;
+    }
+    if descs.is_head_of_looping_chain(desc) {
+        updater.update_variable_offset_calculation(
+            dtd,
+            ty,
+            defs,
+            evaluator,
+            new_immut_addr_ev,
+            sites,
+            unit_body,
+        );
+        update_head_of_chain_mutable_addr_initializer(
+            unit_body,
+            dtd,
+            end,
+            *updater,
+            new_immut_addr_ev,
+            ty,
+            evaluator,
+            sites,
+        );
+        return;
+    }
+    if descs.is_part_of_some_chain(desc) && !descs.is_head_of_chain(desc) {
+        // "Nothing to do here, however the above logic assumes the immutable_addr of every load/store
+        // in a chain is identical." (`:1759-1766`) — and only a transfer feeding the mutable address is
+        // asked, for the reason e637 gives: the other two memory ops live in LX alone.
+        let previous = defining_of(&snapshot, mutable_addr)
+            .filter(|op| data_transfer_descriptor_container::is_transfer(op))
+            .and(defining_op_id(&snapshot, mutable_addr));
+        let Some(prev_at) = previous else {
+            return;
+        };
+        let Some(prev) = descs
+            .lookup(&prev_at)
+            .and_then(|id| descs.descriptors.get(id.0 as usize))
+        else {
+            todo!(
+                "update: DT_ERROR(\"expected a previous descriptor; possible problem in calculating \
+                 chaining info\") for the transfer at {prev_at:?} (:1770-1773)"
+            )
+        };
+        if prev.base_addr == dtd.base_addr {
+            return;
+        }
+        let (Some(prev_v), Some(this_v)) = (prev.base_addr, dtd.base_addr) else {
+            todo!(
+                "update: `getOriginalBaseAddrSSA()` is the null `Value` of a descriptor that never \
+                 reached one (:1774-1775)"
+            )
+        };
+        if is_same_constant(prev_v, this_v, &snapshot) {
+            return;
+        }
+        todo!(
+            "update: DT_ERROR(\"unhandled corner case\") — the chain link at {:?} carries {this_v:?} \
+             where its predecessor carries {prev_v:?} (:1776-1779)",
+            dtd.op
+        )
+    }
+
+    // The `else`: "Offset added by address pinning without semantic verification." is an
+    // `LLVM_DEBUG` warning (`:1785-1787`), and the offset is added right before the transfer.
+    updater.update_variable_offset_calculation(
+        dtd,
+        ty,
+        defs,
+        evaluator,
+        new_immut_addr_ev,
+        sites,
+        unit_body,
+    );
+    let offset = updater.get_offset(dtd, new_immut_addr_ev, ty, evaluator, sites, unit_body);
+    let result = sites.values.mint();
+    // ⛔ THE OPERAND IS ASSIGNED BEFORE THE INSERT: the insert moves `dtd.op`'s own path.
+    if let Some(op) = op_at_mut(unit_body, dtd.op.path()) {
+        *mutable_addr_mut(op, end) = result;
+    }
+    insert_before(
+        unit_body,
+        dtd.op.path(),
+        scalar_add(mutable_addr, offset, result, ty),
+    );
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -895,5 +1216,56 @@ mod unit_tests {
                 ..
             })
         ));
+    }
+
+    /// 638/656 — the update PINS THE IMMUTABLE ADDRESS FIRST, through the subclass the descriptor
+    /// names, and the scheme sees that descriptor's base address, region and element size.
+    ///
+    /// ⛔ NO TEST REACHES THE MUTABLE HALF: all four `updateImmutableAddr`s end in
+    /// [`super::create_offset_value`], which is `buildOffsetValue` and out of campaign scope — but the
+    /// scheme's own assertions run BEFORE that stop, so this is more than a reachability check.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e638_pins_the_immutable_address_first_through_the_subclass_the_descriptor_names() {
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn find_closest_pinned_addr(
+                &self,
+                ev_x: EvaluatedValue,
+                ev_y: EvaluatedValue,
+                region: RegionSite,
+                element_size: Bits,
+            ) -> EvaluatedValue {
+                assert_eq!((ev_x, ev_y), (EvaluatedValue(7), EvaluatedValue(7)));
+                assert_eq!(region, RegionSite::ProgramUnitBody);
+                assert_eq!(element_size, Bits(16));
+                EvaluatedValue(21)
+            }
+        }
+
+        let mut body = vec![load_and_send(Val(110))];
+        let mut descs = DataTransferDescriptorContainer::default();
+        let desc = descs.insert(transfer(&[0]));
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        update(
+            &mut DataTransferUpdater::SimpleConstant(SimpleConstantDataTransferUpdater),
+            &descs,
+            desc,
+            &mut body,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            Bits(16),
+            &mut OutOfScopeEvaluator,
+            &StatedScheme,
+            &mut sites,
+        );
     }
 }

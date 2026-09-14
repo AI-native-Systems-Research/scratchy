@@ -90,22 +90,18 @@
 //! | `e622_runOn` | 622 | 6 | 36 | `dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:710` |
 //! | `e639_runOnOperation` | 639 | 7 | 6 | `dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:58` |
 
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
-// file's own tests until `e639_runOnOperation` (level 7) lands and something calls it. CI runs clippy
-// with `-D warnings`, so without this the first ported leaf of a 15-unit module fails the gate.
-// ⭐ REMOVE THIS WITH e639: at that point an unused item here is a real defect again.
-#![allow(dead_code)]
-
 use core::fmt::Write as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::ty::GenericComp;
-use crate::islands::sentient::ProgramUnit;
+use crate::islands::sentient::{Program, ProgramUnit};
 use crate::islands::sentient::dialects::{
     self as dialects, Definitions, Op, UniformRegions, Val, sentient, symbol, uniform,
 };
 use crate::islands::sentient::print;
+use crate::model::Model;
+use crate::workload::Workload;
 
 /// `InfluenceType` (`EnhancedDeadVariableElimination.hpp:42`) — what an SSA value's value decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1105,17 +1101,40 @@ impl EnhancedDeadVariableElimination {
     }
 }
 
-// crustify:todo: e639_runOnOperation
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:58  (6 body lines, level 7)
-//   original  : void EnhancedDeadVariableEliminationPass::runOnOperation()
-//   calls     : e622_runOn
+/// `DisableThisPass` — the `-dcc-enhanced-dead-variable-elimination-disable` `cl::opt`,
+/// `cl::init(false)` (`:51-54`).
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e639_runOnOperation
+///
+/// THE PASS ENTRY (`:58-63`): eliminates the dead variables of every program unit of the module, in
+/// walk order.
+///
+/// ⭐ ONE PASS OBJECT SPANS THE MODULE — e622's `clear()` clears the ASSIGNMENTS alone, so the
+/// conflicts, misplacements and stale worklist this object keeps accumulate across the units.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    pass: &mut EnhancedDeadVariableElimination,
+    program: &mut Program<A, M, W>,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    let Program {
+        preamble, units, ..
+    } = program;
+    for unit in units.iter_mut() {
+        pass.run_on(preamble, unit);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::{Dd2, Elements};
     use crate::formats::Bits;
-    use crate::islands::dataflow_ir::Units;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
+    use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::units::DfirUnit;
@@ -1683,5 +1702,55 @@ mod unit_tests {
         assert!(pass.conflicts().is_empty());
         assert!(pass.misplaced().is_empty());
         assert!(pass.stale_worklist().is_empty());
+    }
+
+    /// A model and a rung, so the program is typed; nothing this pass does reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e639 — the module walk reaches EVERY program unit: both units lose their unread chain, and the
+    /// one pass object carries no conflict out of either of them.
+    #[test]
+    fn e639_runs_the_elimination_over_every_program_unit() {
+        let unit = || ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::Lxlu, Val(0)),
+            precision: None,
+            body: vec![constant(Val(0), 4), scalar_add(0, 0, 1), nop()],
+            arch: core::marker::PhantomData,
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(), vec![unit()]),
+            bound: core::marker::PhantomData,
+        };
+        let mut pass = EnhancedDeadVariableElimination::default();
+
+        run_on_operation(&mut pass, &mut program);
+
+        for unit in program.units.iter() {
+            assert_eq!(unit.body, vec![nop()], "the unread chain is gone");
+        }
+        assert!(pass.conflicts().is_empty());
     }
 }

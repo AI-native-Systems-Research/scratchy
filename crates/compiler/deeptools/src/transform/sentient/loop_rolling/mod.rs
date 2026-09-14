@@ -97,11 +97,6 @@
 // ── STILL SCHEDULED IN THIS FILE (levels 1..8) — anchors, not dead comments. ⛔ Do not delete one
 // you did not port; on bridge 2 that silently lost 149 of 384 functions.
 
-// crustify:todo: e642_rollInstrsInBlock
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:886  (77 body lines, level 7)
-//   original  : void rollInstrsInBlock(dcc::OperationEquivalence &oe, dcc::CommonPassOptions &opts, OpBuilder &const_builder, Block &bb, bool is_L3_case)
-//   calls     : e509_insertNextInstr, e628_matchAndRoll
-
 // crustify:todo: e652_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:966  (53 body lines, level 8)
 //   original  : void runOnOperation()
@@ -1498,6 +1493,116 @@ impl LoopRollingManager {
     }
 }
 
+/// Replaces: e642_rollInstrsInBlock
+///
+/// Collects the block's windows — soft-sync delimited in the L3 case, one rollable instruction each
+/// otherwise — and rolls every run of matching consecutive windows (`:886-962`).
+///
+/// ⛔ EVERY WINDOW PAST `next` IS REMAPPED AFTER A ROLL: the reference's `Block::iterator`s survive
+/// another op's erasure and an [`InstrPos`] ordinal does not, and they all sit in the untouched tail.
+/// ⭐ THE L3 RECURSION IS HOISTED ahead of collection; it rewrites only nested bodies.
+pub(crate) fn roll_instrs_in_block(
+    case: RollingCase,
+    block: &mut Vec<Op>,
+    consts: &mut Vec<Op>,
+    key_vals: &[Val],
+    new_loop_count: &mut NewLoopCount,
+    values: &mut Values,
+) {
+    // "In the L3 case, we need to recurse inside uniformize regions and equalize patterns as their
+    // contents are still at the outermost level so LoopRolling may be applied."
+    if case == RollingCase::L3SoftSyncWindows {
+        for at in 0..block.len() {
+            if !matches!(&block[at], Op::UniformRegions(_)) {
+                continue;
+            }
+            for region in dialects::regions_mut(&mut block[at]) {
+                roll_instrs_in_block(case, region, consts, key_vals, new_loop_count, values);
+            }
+        }
+    }
+
+    // "Collect the windows delimited by soft sync's in the L3 case, or size 1 windows in the single
+    // instruction case" — a window that closes on neither is the reference's `delete w`, which here
+    // is the binding going out of scope.
+    let mut windows: Vec<Window> = Vec::new();
+    let mut at = 0;
+    while at < block.len() {
+        let mut window = Window::opening(case, InstrPos(at));
+        while at < block.len() {
+            let this = InstrPos(at);
+            window.insert_next_instr(this, block);
+            at += 1;
+            let closes = match case {
+                // "Only push windows terminating in a soft sync."
+                RollingCase::L3SoftSyncWindows => matches!(
+                    &block[this.0],
+                    Op::Sentient(sentient::Op::Sync { soft: true, .. })
+                ),
+                // "Greedily include SetMaskOps/ConstantOps/QueryMapOps/DefImmutableMappingOps at the
+                // start of the current window and IncrMask ops at the end of the current window."
+                RollingCase::SingleInstrWindows => {
+                    !matches!(
+                        &block[this.0],
+                        Op::Sentient(
+                            sentient::Op::SetMask { .. } | sentient::Op::ScalarConstant { .. }
+                        ) | Op::Uniform(
+                            uniform::Op::DefImmutableMapping { .. } | uniform::Op::QueryMap { .. }
+                        )
+                    ) && !matches!(
+                        block.get(at),
+                        Some(Op::Sentient(sentient::Op::IncrMask { .. }))
+                    )
+                }
+            };
+            if closes {
+                windows.push(window);
+                break;
+            }
+        }
+    }
+
+    // "Try to roll sequences of consecutive equivalent windows": `next` is left on the window that
+    // failed to match, and that window is the next instance's start.
+    let mut start = WindowIndex(0);
+    while start.0 + 1 < windows.len() {
+        let mut next = WindowIndex(start.0 + 1);
+        let end = WindowIndex(windows.len());
+        let mut manager = LoopRollingManager::over(case, *new_loop_count, start, end);
+        let length_before = block.len();
+        manager.match_and_roll(&mut next, &mut windows, block, consts, key_vals, values);
+        // `int &new_loop_count_`, shared across every manager this block builds.
+        *new_loop_count = manager.new_loop_count;
+        let moved_by = block.len() as isize - length_before as isize;
+        if moved_by != 0 {
+            for window in windows.iter_mut().skip(next.0) {
+                shift_window(window, moved_by);
+            }
+        }
+        start = next;
+    }
+}
+
+/// EVERY POSITION ONE WINDOW HOLDS, MOVED BY `by` — what a `Block::iterator` gets for free from the
+/// erasure of another op and an [`InstrPos`] ordinal does not.
+///
+/// ⛔ NOT AN ANCHORED UNIT: it exists because this module names an instruction by its ordinal, which
+/// [`InstrPos`] says out loud, and the reference has nothing for it to replace.
+fn shift_window(window: &mut Window, by: isize) {
+    let moved = |at: InstrPos| InstrPos(at.0.saturating_add_signed(by));
+    window.start = moved(window.start);
+    window.effective_start = moved(window.effective_start);
+    window.end = moved(window.end);
+    let op_to_index = window
+        .op_to_index
+        .iter()
+        .map(|(at, index)| (moved(*at), *index))
+        .collect();
+    window.op_to_index = op_to_index;
+    window.first_rollable_op = window.first_rollable_op.map(moved);
+    window.last_rollable_op = window.last_rollable_op.map(moved);
+}
+
 /// The `uniform.query_map`'s `$map`, when that is what defines a value.
 fn query_map_of(op: &Op) -> Option<Val> {
     match op {
@@ -2104,5 +2209,54 @@ mod unit_tests {
             block[5],
             add(carried[1].result, carried[1].result, tail)
         );
+    }
+
+    /// e642 — the driver over one block: it collects the windows itself, greedily folding the leading
+    /// constants into the first, and rolls the two runs of four matching adds into two `sentient.for`s.
+    /// ⛔ THE SECOND ROLL IS WHAT PROVES THE REMAP: its windows name ops by ordinals that the first
+    /// roll shortened the block under.
+    #[test]
+    fn e642_collects_the_windows_and_rolls_both_runs() {
+        let mut values = Values::default();
+        let shared = values.mint();
+        // `%c = constant 4 + 6n` four times and `%c = constant 100 + 5n` four times, then one
+        // `%r = add %c, %shared` per constant: two runs a single delta apart, at different deltas.
+        let runs: Vec<Vec<(Val, Val)>> = (0..2)
+            .map(|_| (0..4).map(|_| (values.mint(), values.mint())).collect())
+            .collect();
+        let mut block: Vec<Op> = Vec::new();
+        for (run, (base, stride)) in runs.iter().zip([(4, 6), (100, 5)]) {
+            for (n, (constant, _)) in run.iter().enumerate() {
+                block.push(scalar_constant(*constant, base + stride * n as i64));
+            }
+        }
+        for run in &runs {
+            for (constant, result) in run {
+                block.push(add(*constant, shared, *result));
+            }
+        }
+        let mut consts: Vec<Op> = Vec::new();
+        let mut new_loop_count = NewLoopCount(0);
+
+        roll_instrs_in_block(
+            RollingCase::SingleInstrWindows,
+            &mut block,
+            &mut consts,
+            &[],
+            &mut new_loop_count,
+            &mut values,
+        );
+
+        assert_eq!(new_loop_count, NewLoopCount(2));
+        // The eight constants stand; the eight adds are gone into the two loops that took their place.
+        assert_eq!(block.len(), 10);
+        let names: Vec<&str> = block
+            .iter()
+            .filter_map(|op| match op {
+                Op::Sentient(sentient::Op::For { dbg_name, .. }) => dbg_name.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["LR loop #1", "LR loop #2"]);
     }
 }

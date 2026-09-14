@@ -84,10 +84,22 @@ pub(crate) mod loop_peeling_manager;
 
 use std::collections::BTreeMap;
 
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 use crate::islands::sentient::print;
+use crate::model::Model;
 use crate::transform::sentient::ForRef;
-use crate::transform::sentient::utils::{ForLoopInfo, NormalizedIv, for_loop_info_if_iv};
+use crate::transform::sentient::analyses::{
+    ExpressionEvaluator, InstructionEstimator, PropagationAnalysis, UnitIndexMap,
+};
+use crate::transform::sentient::loop_tree::LoopTree;
+use crate::transform::sentient::utils::{
+    ForLoopInfo, NormalizedIv, SenTarget, for_loop_info_if_iv,
+};
+use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 /// WHICH ITERATION(S) OF A LOOP GET PEELED — `LoopPeelingManager::PeelingType`
 /// (`dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:86-91`).
@@ -244,9 +256,20 @@ fn for_op_at(unit: &[Op], loop_ref: ForRef) -> Option<&Op> {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{IvLoopInfo, Peeling, PeelingCandidates, PeelingType};
+    use super::{
+        DfirUnit, IvLoopInfo, Model, Peeling, PeelingCandidates, PeelingType, Program, SenTarget,
+        Values, Workload, run_on_operation,
+    };
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
     use crate::transform::sentient::ForRef;
+    use crate::transform::sentient::analyses::{
+        OutOfScopeEvaluator, OutOfScopeInstructionEstimator, OutOfScopePropagationAnalysis,
+        OutOfScopeUnitIndexMap,
+    };
 
     /// The four spellings `updateDbgName` writes into `MDLP(..)`.
     #[test]
@@ -334,6 +357,92 @@ mod unit_tests {
         assert!(printed.contains("sentient.for "));
         assert!(printed.contains("sentient.nop"));
     }
+
+    /// A model and a rung, so the program is typed; nothing this pass does reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// One program unit holding one top-level `sentient.for`, on `on`.
+    fn one_loop_on(on: DfirUnit) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(on, Val(0)),
+                    precision: None,
+                    body: vec![Op::Sentient(sentient::Op::For {
+                        iv: Val(1),
+                        bound: Val(2),
+                        bound_reg: None,
+                        carried: Vec::new(),
+                        dbg_name: None,
+                        body: vec![Op::Sentient(sentient::Op::Nop { dbg_name: None })],
+                    })],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// e643 — an SFP unit's top-level loop reaches `loop_peeling_manager::run`, whose first act is
+    /// to ask the under-estimating estimator how much IBUFF is left.
+    #[test]
+    #[should_panic(expected = "getRemainingIbuffSpace")]
+    fn e643_peels_the_top_level_loops_of_an_sfp_unit() {
+        let mut program = one_loop_on(DfirUnit::Sfp);
+        run_on_operation(
+            &mut program,
+            &mut OutOfScopeInstructionEstimator,
+            &mut OutOfScopeEvaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut Values::default(),
+            SenTarget::Sentient,
+        );
+    }
+
+    /// e643's negative control: `is_any_of(unit_comp, SFP, PE, PT)` skips an LX unit outright, so the
+    /// estimator is never asked and the loop is left standing.
+    #[test]
+    fn e643_skips_a_unit_that_is_not_sfp_pe_or_pt() {
+        let mut program = one_loop_on(DfirUnit::Lxlu);
+        let before = program.units.iter().next().expect("one unit").body.clone();
+
+        run_on_operation(
+            &mut program,
+            &mut OutOfScopeInstructionEstimator,
+            &mut OutOfScopeEvaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut Values::default(),
+            SenTarget::Sentient,
+        );
+
+        assert_eq!(program.units.iter().next().expect("one unit").body, before);
+    }
 }
 
 /// `LoopPeelingManager::iv_to_loop_info_` — every value this pass has already resolved as an
@@ -359,7 +468,70 @@ impl IvLoopInfo {
     }
 }
 
-// crustify:todo: e643_runOnOperation
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:738  (34 body lines, level 7)
-//   original  : void MultiDimLoopPeelingPass::runOnOperation()
-//   calls     : e630_run
+/// `DisableThisPass` — the `-dcc-multi-dim-loop-peeling-disable` `cl::opt`, `cl::init(false)`
+/// (`:36-39`).
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e643_runOnOperation
+///
+/// THE PASS ENTRY (`:738-771`): peels every TOP-LEVEL loop of every SFP, PE or PT program unit.
+///
+/// ⛔ ONE [`IvLoopInfo`] PER LOOP — `iv_to_loop_info_` is a per-manager field (`:132`) and the
+/// reference builds one `LoopPeelingManager` per top-level loop.
+/// ⛔ THE SIBLING CHAIN IS TAKEN BEFORE ANY PEELING (`:759-760`), so the loops peeling creates are not
+/// themselves visited; `markAnalysesPreserved` (`:770`) is pass-manager bookkeeping and is dropped.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    under_estimating_ie: &mut impl InstructionEstimator,
+    evaluator: &mut impl ExpressionEvaluator,
+    propagation: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    values: &mut Values,
+    sen_target: SenTarget,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    let Program {
+        preamble, units, ..
+    } = program;
+    for unit in units.iter_mut() {
+        // `DT_CHECK_MSG(get_unit_op, "Cannot determine GetUnitOp!")` (`:744`) HAS NO ARM HERE: a
+        // [`ProgramUnit`] always names the units it runs on.
+        if !matches!(
+            unit.on.kind(),
+            DfirUnit::Sfp | DfirUnit::Pe | DfirUnit::PtRow(_)
+        ) {
+            continue;
+        }
+        let tree: LoopTree<false> = LoopTree::of(&unit.body);
+        if tree.empty() {
+            continue;
+        }
+        let mut top_level = Vec::new();
+        let mut node = tree.first_child(tree.root());
+        while let Some(n) = node {
+            // `dyn_cast_or_null<sentient::ForOp>(n->getOperation())` — a node the tree kept but whose
+            // op is not a `sentient.for` is skipped, not peeled.
+            if let Some(for_op) = tree.loop_of(n) {
+                top_level.push(for_op);
+            }
+            node = tree.next_sibling(n);
+        }
+        for outer_loop in top_level {
+            let mut ivs = IvLoopInfo::default();
+            loop_peeling_manager::run(
+                outer_loop,
+                unit,
+                preamble,
+                &mut ivs,
+                under_estimating_ie,
+                evaluator,
+                propagation,
+                unit_index_map,
+                values,
+                sen_target,
+            );
+        }
+    }
+}

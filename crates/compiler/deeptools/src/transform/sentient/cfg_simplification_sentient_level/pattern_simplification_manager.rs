@@ -703,7 +703,7 @@ fn const_value(val: Val, root: &[Op]) -> Option<i64> {
 
 /// `dcc::utils::isSameConstant` (`Analyses/Utils.cpp:185`) — a constant on one side and the same
 /// literal on the other; a region argument on either side is never one.
-fn is_same_constant(val: Val, target: Val, root: &[Op]) -> bool {
+pub(crate) fn is_same_constant(val: Val, target: Val, root: &[Op]) -> bool {
     match (const_value(val, root), const_value(target, root)) {
         (Some(left), Some(right)) => left == right,
         _ => false,

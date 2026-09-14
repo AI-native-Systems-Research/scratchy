@@ -181,7 +181,7 @@ use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
 use crate::workload::Workload;
 use crate::transform::sentient::analyses::{
-    EvAddressInfo, EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites,
+    EvAddressInfo, EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites, RegionSite,
 };
 use crate::transform::sentient::{ForRef, IterArgIndex};
 use crate::units::DfirUnit;
@@ -2182,10 +2182,84 @@ fn element_size_of_mem_op(op: &Op) -> Bits {
     }
 }
 
-// crustify:todo: e637_collectDataTransfers
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1395  (41 body lines, level 7)
-//   original  : bool AddressPinningAndTogglePass::collectDataTransfers( SenComponents comp, Operation *op, SenComponents memory_unit, Operation *region_op, int region_num)
-//   calls     : e422_insert, e619_LXDataTransferDescriptor, e620_HBMDataTransferDescriptor
+impl AddressPinningAndTogglePass {
+    /// Replaces: e637_collectDataTransfers
+    ///
+    /// Files one transfer's descriptors: an LX transfer gets ONE immutable descriptor, and an HBM
+    /// `sentient.load_and_store` with an HBM end gets a PAIR — immutable at increment zero and mutable
+    /// at the increment that end carries (`:1395-1437`).
+    ///
+    /// ⛔ AN HBM `load_and_send`/`receive_and_store` IS COLLECTED BY NEITHER ARM: the LX arm is the
+    /// `else if` of the HBM one, so it never sees a unit whose memory is the HBM, and `false` is the
+    /// answer. ⭐ `region_op`/`region_num` ARE ONE [`RegionSite`], which is what the descriptors store.
+    pub fn collect_data_transfers(
+        &mut self,
+        comp: DfirUnit,
+        op: OpId,
+        body: &[Op],
+        defs: Definitions<'_>,
+        memory_unit: DfirUnit,
+        region: RegionSite,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> bool {
+        // "LoadAndExtractScalarOp, LoadComputeAndSendOp are ignored as they are not supported
+        // outside LX."
+        let Some(transfer) =
+            op_at(&op, body).filter(|op| data_transfer_descriptor_container::is_transfer(op))
+        else {
+            return false;
+        };
+        let is_send_or_receive = matches!(
+            transfer,
+            Op::Sentient(sentient::Op::LoadAndSend { .. } | sentient::Op::ReceiveAndStore { .. })
+        );
+        if memory_unit == DfirUnit::Hbm && !is_send_or_receive {
+            let Op::Sentient(sentient::Op::LoadAndStore { src, dst, .. }) = transfer else {
+                return false;
+            };
+            let end = if is_hbm(*src, defs) {
+                TransferEnd::Src
+            } else if is_hbm(*dst, defs) {
+                TransferEnd::Dst
+            } else {
+                return false;
+            };
+            // `int increment = dyn_cast<sentient::ConstantOp>(get{Src,Dst}Inc()).getValue()` — the
+            // reference's own narrowing of that constant into the descriptor's `int`.
+            let increment = looping_chain_mutable_addr_descriptor::increment_val(
+                transfer, end, defs,
+            ) as i32;
+            let immutable = hbm_data_transfer_descriptor::new_hbm(
+                op.clone(),
+                body,
+                defs,
+                evaluator,
+                false,
+                BurstIncrement(0),
+                region,
+            );
+            self.immut_data_transfer_descriptors.insert(immutable);
+            let mutable = hbm_data_transfer_descriptor::new_hbm(
+                op,
+                body,
+                defs,
+                evaluator,
+                true,
+                BurstIncrement(increment),
+                region,
+            );
+            self.mut_data_transfer_descriptors.insert(mutable);
+            return true;
+        }
+        if memory_unit == DfirUnit::Lx {
+            let descriptor =
+                lx_data_transfer_descriptor::new_lx(comp, op, body, defs, evaluator, region);
+            self.immut_data_transfer_descriptors.insert(descriptor);
+            return true;
+        }
+        false
+    }
+}
 
 // crustify:todo: e647_CollectDataTransfersAndComputeMaxStreams
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1293  (39 body lines, level 8)
@@ -2963,6 +3037,12 @@ mod unit_tests {
                     is_symbol: false,
                 }));
             result
+        }
+
+        /// ⭐ THE HANDLE NAMES THE VALUE IT WAS ASKED ABOUT — e637 files descriptors and never reads
+        /// back what the arena holds for one.
+        fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+            self.hold(i64::from(value.0))
         }
 
         fn constant(&mut self, value: i64) -> EvaluatedValue {
@@ -3793,5 +3873,82 @@ mod unit_tests {
         assert!(!info.is_toggle);
         assert_eq!(info.region, RegionSite::default());
         assert_eq!(info.ba_max_mut_addr_ev, EvaluatedValue(8));
+    }
+
+    /// 637/656 — one HBM transfer files TWO descriptors: the immutable one at burst increment zero,
+    /// the mutable one at the `src_inc` constant that end carries.
+    #[test]
+    fn e637_files_the_immutable_and_mutable_hbm_pair_of_one_transfer() {
+        let body = vec![
+            get_unit(1, DfirUnit::Hbm),
+            get_unit(2, DfirUnit::Lx),
+            scalar_const(3, 4096),
+            scalar_const(4, 64),
+            scalar_const(5, 8192),
+            Op::Sentient(sentient::Op::LoadAndStore {
+                src: Val(1),
+                dst: Val(2),
+                src_mutable_addr: Val(3),
+                src_immutable_addr: Val(5),
+                src_inc: Val(4),
+                dst_mutable_addr: Val(0),
+                dst_immutable_addr: Val(0),
+                dst_inc: Val(0),
+                multicast_info: None,
+                results: (Val(10), Val(11)),
+                extent: Extent::of(Elements(8), Bits(16)),
+                stride: 1,
+                rotate_val: None,
+                shuffle_mode: ShuffleMode::NoShuffle,
+                src_reg: Reg {
+                    locale: RegType::Lar,
+                    index: None,
+                },
+                dst_reg: Reg {
+                    locale: RegType::Lbr,
+                    index: None,
+                },
+                dir: None,
+                is_ibr_write: false,
+                dbg_name: None,
+            }),
+        ];
+        let regions: [&[Op]; 1] = [body.as_slice()];
+        let mut pass = AddressPinningAndTogglePass::default();
+        let mut evaluator = StatedEvaluator::default();
+
+        let collected = pass.collect_data_transfers(
+            DfirUnit::L3lu,
+            OpId::at(&[5]),
+            &body,
+            Definitions::from_innermost(&regions),
+            DfirUnit::Hbm,
+            RegionSite::default(),
+            &mut evaluator,
+        );
+
+        assert!(collected);
+        let immut = &pass.immut_data_transfer_descriptors.descriptors;
+        let mutable = &pass.mut_data_transfer_descriptors.descriptors;
+        assert_eq!((immut.len(), mutable.len()), (1, 1));
+        assert_eq!(immut[0].base_addr, Some(Val(5)));
+        assert!(!immut[0].is_base_addr_mutable);
+        assert_eq!(
+            immut[0].memory_unit,
+            DescriptorMemoryUnit::Hbm {
+                total_chain_increment: ChainIncrement(0),
+                increment_via_burst: BurstIncrement(0),
+            }
+        );
+        assert_eq!(mutable[0].base_addr, Some(Val(3)));
+        assert!(mutable[0].is_base_addr_mutable);
+        // `64`, narrowed the way the reference's `int increment` narrows that constant.
+        assert_eq!(
+            mutable[0].memory_unit,
+            DescriptorMemoryUnit::Hbm {
+                total_chain_increment: ChainIncrement(0),
+                increment_via_burst: BurstIncrement(64),
+            }
+        );
     }
 }

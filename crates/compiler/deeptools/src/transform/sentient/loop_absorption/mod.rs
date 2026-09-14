@@ -78,10 +78,6 @@
 //! | `e625_runOn` | 625 | 6 | 13 | `dcc/src/Transform/Sentient/LoopAbsorption.cpp:544` |
 //! | `e640_runOnOperation` | 640 | 7 | 5 | `dcc/src/Transform/Sentient/LoopAbsorption.cpp:558` |
 
-// ⛔ `e625_runOn` BELOW HAS NO CALLER UNTIL `e640_runOnOperation` (level 7) LANDS, and CI runs
-// clippy with `-D warnings`. ⭐ REMOVE THIS WITH e640, when the pipeline calls the pass.
-#![allow(dead_code)]
-
 pub(crate) mod loop_absorption_manager;
 
 use crate::arch::Arch;
@@ -216,10 +212,24 @@ pub fn run_on<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>, va
     }
 }
 
-// crustify:todo: e640_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:558  (5 body lines, level 7)
-//   original  : void LoopAbsorptionPass::runOnOperation()
-//   calls     : e625_runOn
+/// `DisableThisPass` — the `-dcc-loop-absorption-disable` `cl::opt`, `cl::init(false)` (`:27-29`).
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e640_runOnOperation
+///
+/// THE PASS ENTRY (`:558-562`): absorbs into the loops of every program unit of the module.
+///
+/// ⭐ `getOperation()` IS THE `ModuleOp` AND [`Program`] IS THAT MODULE, so the reference's one
+/// indirection through `runOn(module_op)` is the whole body.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    vals: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    run_on(program, vals);
+}
 
 
 #[cfg(test)]
@@ -401,5 +411,70 @@ mod unit_tests {
             })
             .count();
         assert_eq!(new_bounds, 2);
+    }
+
+    /// e640 — the pass entry runs the absorption: the neighbour of the unit's one loop is gone and the
+    /// trip count came out one higher, which is what `runOn` does and `DisableThisPass` would skip.
+    #[test]
+    fn e640_the_pass_entry_reaches_the_program() {
+        let mut vals = Values::default();
+        let bound = vals.mint();
+        let (zero, other, iv, arg) = (vals.mint(), vals.mint(), vals.mint(), vals.mint());
+        let (result, inner, right) = (vals.mint(), vals.mint(), vals.mint());
+        let body = vec![
+            constant(bound, 5),
+            constant(zero, 0),
+            constant(other, 3),
+            Op::Sentient(sentient::Op::For {
+                iv,
+                bound,
+                bound_reg: None,
+                carried: vec![sentient::Carried {
+                    init: zero,
+                    arg,
+                    result,
+                    reg: sentient::Reg {
+                        locale: RegType::Unknown,
+                        index: None,
+                    },
+                    program_header: false,
+                    element_size: None,
+                }],
+                dbg_name: None,
+                body: vec![
+                    add(arg, arg, inner),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![inner],
+                    }),
+                ],
+            }),
+            add(result, result, right),
+        ];
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+
+        run_on_operation(&mut program, &mut vals);
+
+        assert_eq!(program.units.iter().next().expect("one unit").body.len(), 3);
+        assert!(program.preamble.iter().any(|op| matches!(
+            op,
+            Op::Sentient(sentient::Op::ScalarConstant { value: 6, .. })
+        )));
     }
 }

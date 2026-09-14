@@ -86,10 +86,11 @@ use std::num::NonZeroU32;
 
 use crate::arch::{Arch, Elements, IsaGen};
 use crate::islands::dataflow_ir::Values;
-use crate::islands::sentient::ProgramUnit;
+use crate::islands::sentient::{Program, ProgramUnit};
 use crate::islands::sentient::dialects::{
     Definitions, Op, Val, regions_mut, replace_all_uses_with, sentient,
 };
+use crate::model::Model;
 use crate::transform::sentient::ForRef;
 use crate::transform::sentient::analyses::{
     ExpressionEvaluator, PropagationAnalysis, UnitIndexMap,
@@ -98,6 +99,7 @@ use crate::transform::sentient::burst_splitting::max_burst_size;
 use crate::transform::sentient::lightweight_simplification::sentient::run_light_weight_simplifications;
 use crate::transform::sentient::utils::{SenTarget, round_down_unroll_factor};
 use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 /// WHERE AN OP SITS IN A LOOP BODY — one entry of the reference's `std::vector<Operation *>`.
 ///
@@ -796,17 +798,52 @@ pub fn run_on<A: Arch>(
     }
 }
 
-// crustify:todo: e641_runOnOperation
-//   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:410  (8 body lines, level 7)
-//   original  : void runOnOperation()
-//   calls     : e626_runOn
+/// `DisableThisPass` — the `-dcc-loop-elim-via-rerolling-disable` `cl::opt`, `cl::init(false)`
+/// (`:37-40`).
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e641_runOnOperation
+///
+/// THE PASS ENTRY (`:410-418`): rerolls the single-op loops of every program unit of the module, in
+/// walk order.
+///
+/// ⭐ THE TARGET AND THE THREE ANALYSES ARE PARAMETERS HERE — the reference reads them off the pass
+/// object and the pass manager, so the entry has nothing to do but forward them per unit.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    program: &mut Program<A, M, W>,
+    sen_target: SenTarget,
+    evaluator: &mut impl ExpressionEvaluator,
+    propagation: &mut impl PropagationAnalysis,
+    unit_index_map: &impl UnitIndexMap,
+    values: &mut Values,
+) {
+    if DISABLE_THIS_PASS {
+        return;
+    }
+    let Program {
+        preamble, units, ..
+    } = program;
+    for unit in units.iter_mut() {
+        run_on(
+            preamble,
+            unit,
+            sen_target,
+            evaluator,
+            propagation,
+            unit_index_map,
+            values,
+        );
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
     use crate::formats::Bits;
-    use crate::islands::dataflow_ir::Units;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::transform::sentient::analyses::{
@@ -1287,5 +1324,82 @@ mod unit_tests {
             unit.body.iter().filter_map(dbg_name_of).collect::<Vec<_>>(),
             ["LEVR(LS)", "LS"]
         );
+    }
+
+    /// A model and a rung, so the program is typed; nothing this pass does reads either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// e641 — the module walk reaches EVERY program unit: both units lose their rerolled loop, and both
+    /// simplifications run against the ONE module block the `dataflow.program_unit`s sit in.
+    #[test]
+    fn e641_rerolls_in_every_program_unit() {
+        let unit = || ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::Lxlu, Val(30)),
+            precision: None,
+            body: vec![
+                scalar_constant_of(Val(1), 3),
+                sentient_for_carrying(
+                    Val(1),
+                    vec![carried(Val(10), Val(11), Val(12))],
+                    vec![
+                        load_and_send(Val(11), Val(13), Elements(4), Elements(0)),
+                        yield_op(vec![Val(13)]),
+                    ],
+                ),
+                load_and_send(Val(12), Val(14), Elements(0), Elements(0)),
+            ],
+            arch: core::marker::PhantomData,
+        };
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit(), vec![unit()]),
+            bound: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+        for _ in 0..40 {
+            let _ = values.mint();
+        }
+
+        run_on_operation(
+            &mut program,
+            SenTarget::Sentient,
+            &mut BlindEvaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut values,
+        );
+
+        for unit in program.units.iter() {
+            assert!(
+                !unit
+                    .body
+                    .iter()
+                    .any(|op| matches!(op, Op::Sentient(sentient::Op::For { .. }))),
+                "the rerolled loop is gone: {:?}",
+                unit.body
+            );
+        }
     }
 }
