@@ -3016,11 +3016,11 @@ use crate::schedule::dsc2::{PackIndex, WordLength};
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // THE AUTOMATIC-SHUFFLE VOCABULARY — what entry 376's local `BuilderImpl`
-// (`ddc/ddc_transformation.cpp:1857`) writes into, and the two absences that replace its aborts.
+// (`ddc/ddc_transformation.cpp:1858`) writes into, and the two absences that replace its aborts.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
 /// WHICH UNIT'S REGISTER FILE AN AUTOMATIC SHUFFLE STAGES THROUGH — `assign->exUnit_` narrowed to
-/// the two the walk accepts (`ddc/ddc_transformation.cpp:1868-1878`, `:2005-2007`).
+/// the two the walk accepts (`ddc/ddc_transformation.cpp:1875-1881`, `:2005-2007`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShuffleUnit {
     /// `PE` → `PELRF`.
@@ -3087,8 +3087,9 @@ pub trait AutoShuffling:
     /// `ds_info.wordLength = word_length`.
     fn set_lds_word_length(&mut self, lds: LdsIdx, length: WordLength);
 
-    /// `currDsc->computeOp_.back()`. ⛔ `DT_CHECK(currDsc->computeOp_.size() == 1)` IS THIS
-    /// [`None`]: `back()` on any other size is not the op the interim DS belongs to.
+    /// `currDsc->computeOp_.back()`, [`None`] on any other size — `DT_CHECK(computeOp_.size() == 1)`
+    /// (`ddc/ddc_transformation.cpp:1908`) sits at the ONE call site, inside `allocate_sticks`, so
+    /// this absence is not a property of the assign and cannot be hoisted onto [`ShuffleAssign`].
     fn sole_compute_op(&self) -> Option<ComputeOpIdx>;
 
     /// `currDsc->computeOp_.back().interimLabeledDs.push_back(&currDsc->labeledDs_[lds])`.
@@ -3120,8 +3121,14 @@ pub trait AutoShuffling:
 /// THE ASSIGN ENTRY 376 REPLACES, WITH EVERYTHING ITS BUILDER TEMPLATES OFF — `BuilderImpl`'s
 /// constructor (`ddc/ddc_transformation.cpp:1868-1884`) as one value.
 ///
-/// ⛔ THREE ABORTS COLLAPSE INTO THIS WITNESS: `DT_CHECK(assign->type_ == ASSIGN)`,
-/// `DT_ERROR("Unrecognized shuffle storage location")` and `DT_CHECK(computeOp_.size() == 1)`.
+/// ⛔ TWO ABORTS COLLAPSE INTO THIS WITNESS: `DT_CHECK(assign->type_ == ASSIGN)` (`:1874`) and
+/// `DT_ERROR("Unrecognized shuffle storage location")` (`:1880`). The constructor's remaining two
+/// reads are unguarded — `inputsLdsAndLoopOffsets_[0]` (`:1882`) and `labeledDs_[myLdsIdx_]`
+/// (`:1883`) — and each is a further [`None`] here.
+///
+/// ⛔ `DT_CHECK(currDsc->computeOp_.size() == 1)` IS NOT ONE OF THEM: the reference makes it inside
+/// `allocate_sticks` (`:1908`), so an assign whose DSC has no sole compute op is still walked,
+/// templated and handed to the shuffler. Hoisting it here silently skipped such an assign.
 #[derive(Debug, Clone)]
 pub struct ShuffleAssign<E> {
     node: NodeId,
@@ -3129,12 +3136,11 @@ pub struct ShuffleAssign<E> {
     unit: ShuffleUnit,
     dinfo_template: DataInfo,
     dsinfo_template: E,
-    compute_op: ComputeOpIdx,
 }
 
 impl<E: LabeledDsEntry> ShuffleAssign<E> {
-    /// The witness, or [`None`] where the walk's own two `continue`s or any of the three aborts
-    /// would fire.
+    /// The witness, or [`None`] where the walk's own two `continue`s, either of the constructor's
+    /// two aborts, or either of its two unguarded reads would fire.
     #[must_use]
     pub fn of<S: AutoShuffling<Entry = E> + ?Sized>(dsc: &S, node: NodeId) -> Option<Self> {
         let body = dsc.compute(node);
@@ -3150,12 +3156,11 @@ impl<E: LabeledDsEntry> ShuffleAssign<E> {
             unit,
             dinfo_template,
             dsinfo_template,
-            compute_op: dsc.sole_compute_op()?,
         })
     }
 }
 
-/// `expand_indices(compact_indices, element_bit_width)` (`ddc/ddc_transformation.cpp:1937`) — widens
+/// `expand_indices(compact_indices, element_bit_width)` (`ddc/ddc_transformation.cpp:1939`) — widens
 /// each lane selector to the `128 / n`-bit index field the instruction actually carries.
 ///
 /// ⚠️ TRAP: every PRODUCT of the reference's `-1` *"selects nothing"* marker lands on
@@ -3193,7 +3198,7 @@ fn pack_index(raw: i64) -> PackIndex {
     u32::try_from(raw).map_or(PackIndex::Extend, PackIndex::Slice)
 }
 
-/// ENTRY 376'S `BuilderImpl` (`ddc/ddc_transformation.cpp:1857`) — the one implementation of
+/// ENTRY 376'S `BuilderImpl` (`ddc/ddc_transformation.cpp:1858`) — the one implementation of
 /// [`ComputationBuilder`], writing into the DSC the assign lives in.
 ///
 /// ⛔ IT HOLDS THE ALLOCATE NODES IT MINTS: `constructAllocation` hands back a heap node that is NOT
@@ -3271,7 +3276,13 @@ impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
                 .set_lds_name(lds, StorageName(format!("autoshuffle_reg_{}", suffix.0)));
             self.dsc.set_lds_format(lds, format);
             self.dsc.set_lds_word_length(lds, word_length);
-            self.dsc.add_interim_lds(self.assign.compute_op, lds);
+            // `DT_CHECK(currDsc->computeOp_.size() == 1)` (`ddc/ddc_transformation.cpp:1908`) is an
+            // `assert`, so with NDEBUG the reference reads `back()` on whatever is there; the abort
+            // belongs at THIS site and to the sticks path only.
+            let Some(compute_op) = self.dsc.sole_compute_op() else {
+                panic!("autoshuffle_reg_{}: the DSC has no sole compute op", suffix.0)
+            };
+            self.dsc.add_interim_lds(compute_op, lds);
 
             let mut dinfo = self.assign.dinfo_template;
             dinfo.data_connect = Some(
@@ -3434,6 +3445,8 @@ mod tests_e376 {
         deleted: Vec<NodeId>,
         next_alloc: Cell<u32>,
         next_node: u32,
+        /// `currDsc->computeOp_.back()`, or [`None`] where `computeOp_.size() != 1`.
+        sole_op: Option<ComputeOpIdx>,
     }
 
     /// The assign the walk reaches: PE, `ASSIGN`, and its first input on LX so the stick count is
@@ -3487,6 +3500,7 @@ mod tests_e376 {
             deleted: Vec::new(),
             next_alloc: Cell::new(50),
             next_node: 2,
+            sole_op: Some(ComputeOpIdx(0)),
         }
     }
 
@@ -3621,7 +3635,7 @@ mod tests_e376 {
         }
 
         fn sole_compute_op(&self) -> Option<ComputeOpIdx> {
-            Some(ComputeOpIdx(0))
+            self.sole_op
         }
 
         fn add_interim_lds(&mut self, compute_op: ComputeOpIdx, lds: LdsIdx) {
@@ -3685,6 +3699,49 @@ mod tests_e376 {
             builder.delete_node(assign);
             true
         }
+    }
+
+    /// A STAND-IN FOR ENTRY 371 THAT ALLOCATES NO STICKS — the reference reaches this shuffler
+    /// whatever `computeOp_.size()` is, because its check lives in `allocate_sticks`.
+    #[derive(Debug, Default)]
+    struct NoSticks;
+
+    impl AssignReplacement for NoSticks {
+        fn replace_assign<B: ComputationBuilder + ?Sized>(
+            &mut self,
+            builder: &mut B,
+            assign: NodeId,
+        ) -> bool {
+            builder.delete_node(assign);
+            true
+        }
+    }
+
+    #[test]
+    fn an_assign_whose_dsc_has_no_sole_compute_op_is_still_walked_and_shuffled() {
+        let mut dsc = tree();
+        dsc.sole_op = None;
+        let mut metadata = Metadata::default();
+        let mut names = AutoShuffleNames::default();
+        // `DT_CHECK(computeOp_.size() == 1)` (`ddc/ddc_transformation.cpp:1908`) guards the interim
+        // push, NOT the walk: the assign reaches `replace_assign` and the reference answers `true`.
+        assert!(perform_automatic_shuffling::<Tree, NoSticks>(
+            &mut dsc,
+            &mut metadata,
+            &mut names
+        ));
+        assert_eq!(dsc.deleted, vec![ASSIGN]);
+        assert!(dsc.interim.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "autoshuffle_reg_0: the DSC has no sole compute op")]
+    fn allocating_a_stick_without_a_sole_compute_op_is_the_references_own_abort() {
+        let mut dsc = tree();
+        dsc.sole_op = None;
+        let mut metadata = Metadata::default();
+        let mut names = AutoShuffleNames::default();
+        perform_automatic_shuffling::<Tree, OneMerge>(&mut dsc, &mut metadata, &mut names);
     }
 
     #[test]
