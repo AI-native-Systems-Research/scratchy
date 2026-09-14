@@ -12,58 +12,14 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 2,
-  "layer_count": 1,
-  "batch_count": 1,
-  "file_count": 1
+  "unit_count": 0,
+  "layer_count": 0,
+  "batch_count": 0,
+  "file_count": 0
  },
- "waves": [
-  {
-   "unit_count": 2,
-   "batches": [
-    {
-     "kind": "symbol",
-     "source_file": "crustify-ddc/cpp/ddc.cpp",
-     "items": [
-      {
-       "name": "e370_buildAndPropagateFold",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 5,
-       "loc": 350,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e371_replace_assign",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 5,
-       "loc": 119,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      }
-     ]
-    }
-   ]
-  }
- ],
+ "waves": [],
  "_comment": [
-  "PORT REMAINDER for levels4-6-drivers: the 2 of 27 units in level(s) [4, 5, 6] that still have no",
+  "PORT REMAINDER for levels4-6-drivers: the 0 of 27 units in level(s) [4, 5, 6] that still have no",
   "`/// Replaces:` anchor under crates/compiler/deeptools/src/schedule.",
   "Batches are packed WITHIN A SINGLE HOME FILE so two concurrent agents rarely touch the same",
   "file; where a home holds more than max_syms units its batches do run concurrently, and the",
