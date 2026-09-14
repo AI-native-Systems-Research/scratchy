@@ -5164,13 +5164,19 @@ pub struct RowBundlingScan<'a, F: AffineFoldDims + ?Sized> {
 ///
 /// ⛔ TWO COORDINATES, NOT ONE, AND A PORT CANNOT FUSE THEM: the gate asks `effectiveRefCoord` while
 /// the `retry` beside it charges `refAllocNode->allocateCoordinates_.getTensorDims()`
-/// (`ddc/ddc_fold.cpp:4501-4509`). ⭐ Entry 085 never reads the coordinate it is handed, so only the
-/// RETRY's dims are a field here.
+/// (`:13972-13981`). ⭐ Entry 085 never reads the coordinate it is handed, so only the RETRY's dims
+/// are a field here.
 pub struct RowBundling<'a, F: AffineFoldDims + ?Sized> {
     /// Everything the scan needs that the coordinate does not decide.
     pub scan: RowBundlingScan<'a, F>,
-    /// `effectiveRefCoord` / `refTransferNode->transferCoordinates_` / `refCoordinate`.
+    /// `effectiveRefCoord` / `refTransferNode->transferCoordinates_` / `refCoordinate`, as the arm
+    /// that has already chosen states it — for entry 358's ALLOCATE arm, `allocateCoordinates_`.
     pub ref_coord: RowCoordinate<'a, F>,
+    /// `refAllocNode->sliceViewCoordinates_` where it `foldConstructed()` — ⛔ ENTRY 358'S ALLOCATE
+    /// ARM SELECTS `effectiveRefCoord` OFF ITS OWN `sizeRefComp` (`:13966-13970`), which the caller
+    /// cannot derive without redoing that unit's two overrides, so there the choice is the unit's
+    /// and this is the alternative. Every other arm has chosen already and leaves this [`None`].
+    pub ref_slice_view: Option<RowCoordinate<'a, F>>,
     /// `getTensorDims()` OF THE COORDINATE THE RETRY NAMES, which is not always the gate's.
     pub retry_dims: &'a [PrimaryDim],
 }
@@ -5227,16 +5233,16 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NonAllocPropComp {
     /// `TRANSFER` — BOTH ends of the reference transfer. Entry 358 names its OWN source where the
-    /// reference produces and `src` only where it consumes (`:4562`); entry 357, having no source
-    /// of its own, names `dst` when the reference produces and reads both to find a PT row
-    /// (`:13152-13166`).
+    /// reference produces and `src` only where it consumes (`:14025-14026`); entry 357, having no
+    /// source of its own, names `dst` when the reference produces and reads both to find a PT row
+    /// (`:13155-13170`).
     TransferEnds {
         /// `refTransferNode->src_.unit_`.
         src: SenComponent,
         /// `refTransferNode->dstVias_.at(0).loc_.unit_`.
         dst: SenComponent,
     },
-    /// `COMPUTE` — `refComputeNode->exUnit_`, whatever the role (`:4589`).
+    /// `COMPUTE` — `refComputeNode->exUnit_`, whatever the role (`:14052`).
     ComputeUnit(SenComponent),
 }
 
@@ -5250,7 +5256,7 @@ pub enum FoldReferenceKind<'a, 'l, F: AffineFoldDims + ?Sized> {
         /// `refAllocNode->ldsIdx_`.
         lds: LdsIdx,
         /// `refAllocNode->component_`, which entry 357 kludges to the compute node's own unit for
-        /// a PT-row reference (`:13103-13107`).
+        /// a PT-row reference (`:13117-13125`).
         component: SenComponent,
         /// `effectiveRefCoord.coordinates_` ∩ `dimsToPropagate` with BOTH of the allocation's
         /// coordinates per dim — [`AllocCoordinates::effective`] is entry 298's own choice off
@@ -5816,6 +5822,9 @@ where
                         .loop_relevant_for_dim(dim, walked, coord.padding(dim))
                 })
                 .cloned();
+            // ⛔ THE REFERENCE COMPARES LOOP POINTERS HERE TOO (`:12874`), so two distinct loops that
+            // state the same name, tiling and dims abort there and pass here; [`LoopNode`] carries no
+            // identity of its own. The two chain prints before it (`:12851-12872`) are debug output.
             if innermost_alloc != innermost_ref {
                 panic!(
                     "[buildFoldForAllocation] {} and {} do not share their innermost loop relevant \
@@ -5983,8 +5992,8 @@ pub struct TransferFold<'a, 'l> {
 /// picks the propagator, then the PE-SFP split offset lands on the innermost element arrangement.
 ///
 /// ⛔ FIVE OF THE SIX `false`s ARE "NOTHING TO PROPAGATE HERE" and one is the charged retry.
-/// ⚠️ AN EMPTY `dataConnect` MATCHES AN EMPTY ONE (`:4384`), so a transfer whose source states no
-/// connect, against a propagation that states none either, is read as REFERENCE-IS-SOURCE.
+/// ⚠️ AN EMPTY `dataConnect` MATCHES AN EMPTY ONE (`:13854-13856`), so a transfer whose source states
+/// no connect, against a propagation that states none either, is read as REFERENCE-IS-SOURCE.
 #[must_use]
 pub fn build_fold_for_transfer<A, D, S, T, L, E, N, O, F>(
     ctx: &FoldContext<'_, D, S, T, L, E, N>,
@@ -6122,6 +6131,12 @@ where
         }
     }
 
+    // ⛔ `effectiveRefCoord` (`:13966-13970`) KEYS OFF `sizeRefComp`, WHICH IS DERIVED ABOVE, so the
+    // slice view is selected here and not by the caller.
+    let gate_coord = match &gate.ref_slice_view {
+        Some(slice_view) if is_row(size_ref_comp) => slice_view,
+        _ => &gate.ref_coord,
+    };
     let Some(row_group) = gated_row_group::<A, D, S, T, N, F>(
         ctx.dsc,
         ctx.core_ds,
@@ -6131,7 +6146,7 @@ where
         prop,
         dims_to_propagate,
         &gate.scan,
-        &gate.ref_coord,
+        gate_coord,
         gate.retry_dims,
     ) else {
         return false;
@@ -6572,7 +6587,7 @@ fn propagate_to_data_stream<D, S, T, L, E, N>(
                         }
                     }
                 }
-                // ⚠️ NO `foldConstructed` GUARD ON THE OUTPUT (`:13278`), and the push is
+                // ⚠️ NO `foldConstructed` GUARD ON THE OUTPUT (`:13274-13288`), and the push is
                 // unconditional where the input's is not.
                 StreamSide::Outputs => {
                     *coords.output = rhs.clone();
@@ -6750,7 +6765,8 @@ fn working_stream<D: Allocations + ?Sized>(
 ///
 /// ⛔ THE `refNode == computeNode` RETURN PRECEDES EVERY CLEAR (`:13017`), so the caller's two
 /// out-vectors SURVIVE it and are emptied on all five later `false`s. ⛔ `computeDims` (`:13092`),
-/// `loopParamsAfterDistribution` (`:13598`) and the nested *"Unsupported padtype conversion"*
+/// `loopParamsAfterDistribution` (`:13598` — never read again, and its `operator[]` mints only an
+/// empty entry no reader can tell from absent) and the nested *"Unsupported padtype conversion"*
 /// `DT_ERROR` (`:13725`, unreachable behind its own two guards) are dead and dropped as such.
 #[must_use]
 #[expect(
@@ -9407,25 +9423,25 @@ mod tests_e356_e358 {
         }
     }
 
-    /// A core data stage that splits no row and no corelet, which is what leaves the row-bundling
-    /// gate answering the default group without ever reading the scan.
-    struct NoSplit;
+    /// A core data stage that splits the dims it names across PT rows and no corelet; the EMPTY set
+    /// is what leaves the row-bundling gate answering the default group without reading the scan.
+    struct RowSplitOn(Vec<PrimaryDim>);
 
-    impl Stage for NoSplit {
+    impl Stage for RowSplitOn {
         fn is_symbolic(&self, _dim: PrimaryDim) -> bool {
             false
         }
         fn is_corelet_split(&self, _dim: PrimaryDim) -> bool {
             false
         }
-        fn is_row_split(&self, _dim: PrimaryDim) -> bool {
-            false
+        fn is_row_split(&self, dim: PrimaryDim) -> bool {
+            self.0.contains(&dim)
         }
         fn is_pe_sfp_split(&self, _dim: PrimaryDim) -> bool {
             false
         }
         fn splits_any_row(&self) -> bool {
-            false
+            !self.0.is_empty()
         }
         fn extent(&self, _dim: PrimaryDim, _at: Sample) -> Extent {
             Extent(0)
@@ -9435,7 +9451,7 @@ mod tests_e356_e358 {
         }
     }
 
-    impl CoreStage for NoSplit {
+    impl CoreStage for RowSplitOn {
         fn pad_stride(&self, _dim: PrimaryDim) -> Option<Stride> {
             None
         }
@@ -9453,7 +9469,7 @@ mod tests_e356_e358 {
         }
     }
 
-    impl PropagatedFoldStage for NoSplit {
+    impl PropagatedFoldStage for RowSplitOn {
         fn loop_iterations(
             &self,
             _loop_node: &LoopNode,
@@ -9465,7 +9481,7 @@ mod tests_e356_e358 {
         }
     }
 
-    impl SizeStage for NoSplit {
+    impl SizeStage for RowSplitOn {
         fn padded(&self, _dim: PrimaryDim, val: i64) -> Alpha {
             Alpha(val)
         }
@@ -9733,7 +9749,7 @@ mod tests_e356_e358 {
     #[test]
     fn an_l0_allocation_below_its_reference_gains_both_its_own_folds_and_the_slice_views() {
         let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, Vec::new()));
-        let core_ds = NoSplit;
+        let core_ds = RowSplitOn(Vec::new());
         let tree = Tree(vec![None, Some(0), Some(0)]);
         let meta = Metadata::default();
         let ctx = FoldContext {
@@ -9794,7 +9810,7 @@ mod tests_e356_e358 {
     #[test]
     fn a_computes_second_input_on_the_same_labeled_ds_takes_the_whole_coordinate_over() {
         let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, Vec::new()));
-        let core_ds = NoSplit;
+        let core_ds = RowSplitOn(Vec::new());
         let tree = Tree(vec![None, Some(0), Some(0)]);
         let meta = Metadata::default();
         let ctx = FoldContext {
@@ -9843,6 +9859,7 @@ mod tests_e356_e358 {
                     dims: ref_coord.iter().collect(),
                     work_slices: &slices,
                 },
+                ref_slice_view: None,
                 retry_dims: &dims,
             },
             kind: FoldReferenceKind::NonAlloc {
@@ -9930,7 +9947,7 @@ mod tests_e356_e358 {
     #[test]
     fn a_transfer_naming_its_reference_on_its_own_source_takes_that_references_levels() {
         let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, Vec::new()));
-        let core_ds = NoSplit;
+        let core_ds = RowSplitOn(Vec::new());
         let tree = Tree(vec![None, Some(0), Some(0)]);
         let meta = Metadata::default();
         let ctx = FoldContext {
@@ -9973,6 +9990,7 @@ mod tests_e356_e358 {
                     dims: ref_coord.iter().collect(),
                     work_slices: &slices,
                 },
+                ref_slice_view: None,
                 retry_dims: &dims,
             },
             kind: FoldReferenceKind::NonAlloc {
@@ -10007,5 +10025,114 @@ mod tests_e356_e358 {
         // A non-allocation reference reaches no allocation, so the offsets seam is not one of this
         // arm's effects.
         assert_eq!(offsets, Offsets::default());
+    }
+
+    /// ⭐ THE GATE'S COORDINATE IS THIS UNIT'S CHOICE AND NOT THE CALLER'S: `effectiveRefCoord`
+    /// (`:13966-13970`) keys off `sizeRefComp`, which entry 358 derives off its own transfer.
+    #[test]
+    fn the_gate_takes_the_slice_view_only_where_this_units_own_size_comp_is_a_row() {
+        let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, Vec::new()));
+        let core_ds = RowSplitOn(vec![PrimaryDim::Out]);
+        let tree = Tree(vec![None, Some(0), Some(0)]);
+        let meta = Metadata::default();
+        let ctx = FoldContext {
+            dsc: &dsc,
+            core_ds: &core_ds,
+            tree: &tree,
+            distribution: &Seams,
+            ancestors: &NoLoops,
+            names: &Named,
+            meta: &meta,
+        };
+        let loop_node = loop_named("loop0");
+        let non_alloc_loops = [(&loop_node, LoopDistribution::AboveChunk)];
+        let transfer_dims = [PrimaryDim::Out];
+        let transfer_size = BTreeMap::new();
+        let padding = PaddingForm::default();
+        let ref_coord = ref_coordinate(PrimaryDim::Out);
+        let ref_loops = [&loop_node];
+        let slices = WorkSlices::default();
+        let dims = [PrimaryDim::Out];
+        // `allocateCoordinates_`, stating no fold for the row-split dim, so the same-row arm can only
+        // collect a group off the slice view.
+        let unfolded = dsc2::Coordinate::default();
+        let slice_view = || {
+            Some(RowCoordinate {
+                dims: ref_coord.iter().collect(),
+                work_slices: &slices,
+            })
+        };
+
+        let built = |src, slice_view| {
+            let transfer = TransferFold {
+                node: NodeId(1),
+                src: end(src, Some(DataConnect::AconstConnect)),
+                dsts: TransferFoldDsts {
+                    first: end(SenComponent::L0, None),
+                    rest: Vec::new(),
+                },
+                transfer_dims: &transfer_dims,
+                transfer_size: &transfer_size,
+                alloc_loops: &[],
+                non_alloc_loops: &non_alloc_loops,
+                pe_sfp_transfer_size: None,
+            };
+            let reference = FoldReference {
+                gate: RowBundling {
+                    scan: RowBundlingScan {
+                        units: PtRowPropagation {
+                            src: SenComponent::Ptrow3,
+                            dest: SenComponent::Ptrow3,
+                        },
+                        ref_node: NodeId(2),
+                        candidates: RowCandidates {
+                            forward: &[],
+                            reverse: &[],
+                        },
+                        sdsc_slices: &slices,
+                    },
+                    ref_coord: RowCoordinate {
+                        dims: unfolded.iter().collect(),
+                        work_slices: &slices,
+                    },
+                    ref_slice_view: slice_view,
+                    retry_dims: &dims,
+                },
+                kind: FoldReferenceKind::NonAlloc {
+                    node: NodeId(2),
+                    dims: vec![(PrimaryDim::Out, coord_dim_of(&ref_coord, PrimaryDim::Out))],
+                    dim_scales: BTreeMap::new(),
+                    loops: &ref_loops,
+                    prop_comp: NonAllocPropComp::TransferEnds {
+                        src: SenComponent::Lx,
+                        dst: SenComponent::L0,
+                    },
+                },
+                ref_padding: &padding,
+            };
+            let mut coord = dsc2::Coordinate::default();
+            let mut tracker = CoordPropTracker::default();
+            let mut params = Params::default();
+            let mut offsets = Offsets::default();
+            build_fold_for_transfer::<Target, _, _, _, _, _, _, _, _>(
+                &ctx,
+                &transfer,
+                &propagation(NodeId(2), NodeId(1)),
+                &dims,
+                reference,
+                &mut coord,
+                &mut tracker,
+                &mut params,
+                &mut offsets,
+            )
+        };
+
+        // A PT-row source makes `sizeRefComp` a row, so the slice view is what the gate asks.
+        assert!(built(SenComponent::Ptrow3, slice_view()));
+        // Without one the gate falls back to the coordinate the caller states and collects nothing.
+        assert!(!built(SenComponent::Ptrow3, None));
+        // ⛔ AND THE GUARD IS `sizeRefComp`, NOT THE SCAN'S UNITS: an LX source leaves it a non-row,
+        // so the slice view goes unread even though it is right there.
+        assert!(!built(SenComponent::Lx, slice_view()));
     }
 }
