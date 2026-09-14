@@ -3904,6 +3904,7 @@ dependencies = [
  "flex-rs",
  "half",
  "ktir-emulator",
+ "libc",
  "scratchy-layers",
  "scratchy-quantizations",
  "scratchy-spyre-bundle",
