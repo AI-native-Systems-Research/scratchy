@@ -15568,10 +15568,40 @@ mod tests_e283_e295 {
         // A non-chunk dim's one candidate is the core extent, which is what gets written back.
         assert_eq!(chunk.ss.dims.dims().extent(PrimaryDim::J), Some(Extent(1)));
 
-        // Nothing pinned and nothing fetched: `addOrUpdateDataStageParam(core.ss_, "chunk", ..)`.
+        // Nothing pinned and nothing fetched: `addOrUpdateDataStageParam(core.ss_, "chunk", core.el_,
+        // "chunk", ..)` — each half's dims copied verbatim, each half's name overwritten on its own.
         let mut dsc = a_dsc(&stated, &[(PrimaryDim::I, 2)]);
         dsc.primary_ds_info
             .insert(DsType::Input, layout(&[PrimaryDim::I]));
+        // ⛔ THE TWO HALVES STATE DIFFERENT `I` EXTENTS AND THE STICK SIDE CARRIES SYMBOLIC STATE, so
+        // a port that copied `ss_` into both halves — or one that routed this arm through a trial
+        // copy, which clears `symbolicDimInfo_` — fails here.
+        let el: Vec<(PrimaryDim, i64)> = stated
+            .iter()
+            .map(|&(dim, extent)| (dim, if dim == PrimaryDim::I { 8 } else { extent }))
+            .collect();
+        let mut ss = dims(&stated);
+        *ss.symbolic_mut() = Symbolic::new(
+            BTreeMap::from([(
+                PrimaryDim::I,
+                SymbolicDimInfo {
+                    max_size: MaxSize(4),
+                    granularity: Granularity::new(NonZeroU32::new(2).expect("a step of two")),
+                },
+            )]),
+            BTreeMap::new(),
+        );
+        let core_stage = DataStage {
+            ss: NamedDims {
+                name: StageName("core".to_owned()),
+                dims: ss,
+            },
+            el: NamedDims {
+                name: StageName("core".to_owned()),
+                dims: dims(&el),
+            },
+        };
+        dsc.data_stages.set(DATA_STAGE_CORE, core_stage.clone());
         let mut local = a_sdsc(
             dsc,
             &[(PrimaryDim::I, 1)],
@@ -15595,8 +15625,14 @@ mod tests_e283_e295 {
             Some(())
         );
         let chunk = local.dscs().first().data_stages.chunk();
-        assert_eq!(chunk.ss.name, StageName::chunk());
-        assert_eq!(chunk.ss.dims.dims().extent(PrimaryDim::I), Some(Extent(4)));
+        assert_eq!(
+            (&chunk.ss.name, &chunk.el.name),
+            (&StageName::chunk(), &StageName::chunk())
+        );
+        assert_eq!(
+            (&chunk.ss.dims, &chunk.el.dims),
+            (&core_stage.ss.dims, &core_stage.el.dims)
+        );
 
         // One HBM-pinned tensor and one LX input neighbour in the same DSC is the refusal.
         let mut dsc = a_dsc(&stated, &[(PrimaryDim::I, 2)]);
@@ -19514,7 +19550,8 @@ where
 {
     for at in dsc_indices(sdsc) {
         let dsc = sdsc.dscs_mut().at_mut(at)?;
-        // The reference's two clears (entries 104 and 187) on the copy of the core stage's `ss_`.
+        // The copy's two `std::map::clear`s — `symbolicDimInfo_` and `maxSymbolicVolume_`, ONE
+        // value here. ⛔ NOT entries 104 and 187: the scope misresolved a bare `clear` to those.
         let mut params = dsc.core_stage().clone();
         *params.symbolic_mut() = Symbolic::default();
         update_chunk_data_stages_from_candidates::<CARRY_UNNEEDED_PAD>(
@@ -20310,7 +20347,7 @@ where
 /// from them, and the settled selection is written onto every DSC and probed again.
 ///
 /// ⛔ THE COMMITTING LOOP STILL PROBES WITH [`v1::Commit::No`] — the reference's own fourth argument
-/// (`L3DlOpsScheduler.cpp:8933`) despite its *"Memory allocation must be valid to commit."*, so this
+/// (`L3DlOpsScheduler.cpp:1563`) despite its *"Memory allocation must be valid to commit."*, so this
 /// unit places nothing; entry 382's own `allocAllMem` is what commits.
 /// ⛔ `DT_CHECK((dim != IJ || dim != KIJ))` IS A TAUTOLOGY: no dim is both, so no chunk dim is checked.
 /// ⛔⛔ TRAP, AND IT IS ENTRY 207'S DOCUMENTED DIVERGENCE BITING HERE: `primaryDims` is EVERY
@@ -20319,9 +20356,9 @@ where
 /// (`dsc/dims.h:162-193`), so a real DSC states only its layout dims and refuses here. This unit
 /// passes the reference's list; narrowing it would be a second divergence.
 /// ⛔ [`None`] IS *"Do not support double buffering and input-neighbor fetch coexisting in the same
-/// DSC."*, both allocation probes, and every refusal entries 014, 207, 222, 352, 366, 367 and 377
-/// make. Both *"Number of DSCs does not match."* checks are unspellable: each list is built by walking
-/// `dscs_`.
+/// DSC."*, `getNonBroadcastLdsDims`' own `DT_CHECK`, both allocation probes, and every refusal
+/// entries 014, 207, 222, 352, 366, 367 and 377 make. Both *"Number of DSCs does not match."* checks
+/// are unspellable: each list is built by walking `dscs_`.
 pub fn set_chunk_data_stage_params<
     const CHUNK_EXPLORE: bool,
     const CARRY_UNNEEDED_PAD: bool,
