@@ -6015,12 +6015,119 @@ where
 //   extract   : crustify-ddc/cpp/ddc.cpp:15148-15257
 //   calls     : e104_clear, e125_minimizeAllocations, e126_populateUnitTimeTransfers, e127_spreadDataInAllocate, e128_finalizeAllocateLayouts, e132_restoreDsc, e133_adjustLoopOffsetsAndAddresses, e134_simplifyScheduleTree, e135_updateLdsIdxMetadata, e136_initGlobalData, e244_cloneForOffsetAdjustment, e245_setSizeForFixedSizeTransfers, e246_transformForInterSliceRestickify, e260_fillLoopOffsetsAndAddresses …
 
-// crustify:todo: e381_run
-//   authority : ddc/ddcv1.cpp:3802  (15 body lines, level 8)
-//   class     : Ddc
-//   original  : void Ddc::run(SuperDsc& sdsc)
-//   extract   : crustify-ddc/cpp/ddc.cpp:15267-15282
-//   calls     : e379_run_v1
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE STAGE-2B GATE — the two `dscGlobal` options entry 381 reads, as TYPES and not as fields.
+//
+// ⭐ THE SAME MECHANISM STAGE 3 USES for `dtVersion` and `enableL3DlScheduler`
+// (`super::super::dcg::manager::DcgManager`): a build choice REMOVES the call it turns off instead
+// of being tested again on every super-DSC.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH DDC THE BUILD ASKED FOR — `dscGlobal.ddcVersion`
+/// (`sys-arch-spec/dscglobal/dscglobal.h:82`), whose `int` entry 381 reads at TWO thresholds: `> 0`
+/// to run stage 2b at all, `== 2` to make an unfilled DSC2 end the run.
+///
+/// ⭐ THREE TYPES AND NOT AN `int`: `setDtVersion` states only 0 and 2 (`:122`, `:127`), and the
+/// `ddcversion=<n>` option (`sys-arch-spec/dscglobal/dscglobal.cpp:238`) is the only writer that can
+/// state anything else.
+pub trait DdcVersion {
+    /// `dscGlobal.ddcVersion > 0` (`ddc/ddcv1.cpp:3809`).
+    const RUNS: bool;
+
+    /// `dscGlobal.ddcVersion == 2` (`:3811`) — the force-request.
+    const FORCED: bool;
+}
+
+/// `ddcVersion == 0`, what `setDtVersion(1)` sets (`dscglobal.h:127`) — no stage 2b at all.
+pub struct DdcOff;
+
+/// `0 < ddcVersion != 2` — stage 2b runs and an unfilled DSC2 is TOLERATED. Only an explicit
+/// `ddcversion=1` states it.
+pub struct DdcV1;
+
+/// `ddcVersion == 2` — the field's default (`dscglobal.h:82`) and what `setDtVersion(2)` sets
+/// (`:122`), so it is every 2.0 build's value: stage 2b runs and an unfilled DSC2 ends the run.
+pub struct DdcV1Required;
+
+impl DdcVersion for DdcOff {
+    const RUNS: bool = false;
+    const FORCED: bool = false;
+}
+
+impl DdcVersion for DdcV1 {
+    const RUNS: bool = true;
+    const FORCED: bool = false;
+}
+
+impl DdcVersion for DdcV1Required {
+    const RUNS: bool = true;
+    const FORCED: bool = true;
+}
+
+/// WHETHER STAGE 2B FILLED THE DSC2 — `run_v1`'s `bool` (`ddc/ddcv1.cpp:3810`), which is `false`
+/// only where no DDL template served one of the super-DSC's DSCs (`:3725-3728`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DscFilled {
+    /// `false` — that DSC was restored and stage 2b gave up on the whole super-DSC.
+    No,
+    /// `true`.
+    Yes,
+}
+
+/// THE SUPER-DSC'S NAME — `SuperDsc::name_` (`dsc/superdsc.h:50`), all entry 381 itself reads of the
+/// super-DSC it hands to stage 2b.
+pub trait SdscName {
+    /// `sdsc.name_`.
+    fn name(&self) -> &str;
+}
+
+/// STAGE 2B ITSELF — `Ddc::run_v1` (`ddc/ddcv1.cpp:3692`), which is entry 379 of this campaign.
+///
+/// ⛔ NOT A PORT AND NOT A STAND-IN. Entry 379 is unported — its scheduler anchor stands directly
+/// above — and it is the unit that PLACES ADDRESSES. Answering
+/// [`DscFilled::Yes`] here would report a placed DSC2 that nothing placed, so this stays a stop
+/// naming the translator that owns it. When entry 379 lands, its own `run_v1` collides with this
+/// name and the wiring is an E0428 rather than a judgement call.
+fn run_v1<S: SdscName + ?Sized>(sdsc: &mut S) -> DscFilled {
+    let _ = sdsc;
+    todo!("e379_run_v1: Ddc::run_v1 (ddc/ddcv1.cpp:3692) — stage 2b — is not ported")
+}
+
+/// Replaces: e381_run
+///
+/// `deeprt`'s ENTRY INTO STAGE 2B: it runs entry 379 over the super-DSC unless the build asked for
+/// data-op testing or turned the DDC off, and ends the run when a force-requested DDCv1 left the
+/// DSC2 unfilled.
+///
+/// ⛔⛔ OUR OWN PATH DOES NOT COME THROUGH HERE, so neither gate below can be assumed to have been
+/// consulted: `dbo-opt`'s `runDdc` calls `ddc.run_v1(sdsc)` itself and wraps it in its OWN
+/// `DT_CHECK_MSG("Scheduler failed to find a suitable op mapping for sdsc: ...")`
+/// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:35-42`) — a different message, and one that fires
+/// for `ddcVersion == 1` too. This gate is `deeprt`'s alone (`deeprt/deeprt.cpp:2182`,
+/// `deeprt/deeprt_scheduler_codegen_pipeline.cpp:100`).
+/// ⚠️ `bool useDdc = true` (`:3807`) IS DEAD — nothing writes it, so `ddcVersion > 0 && useDdc` is
+/// the version alone.
+/// ⛔ STAGE 2B RUNS WHENEVER THE VERSION IS ON, and only the CHECK is the force-request's: the
+/// reference calls `run_v1` before it looks at `ddcVersion == 2`, so the call is not short-circuited
+/// by [`DdcVersion::FORCED`].
+/// 🛑 THE ABORT STAYS A STOP. "DSC2 not filled" is entry 379's answer about a whole super-DSC, given
+/// after it has already restored the DSC it gave up on, so no type states it in advance.
+pub fn run<V: DdcVersion, S: SdscName + ?Sized, const DATA_OP_TESTING: bool>(sdsc: &mut S) {
+    if DATA_OP_TESTING {
+        // If we only want to run dataOps through DCC, don't do any further work here, return.
+        return;
+    }
+    if !V::RUNS {
+        return;
+    }
+    let filled = run_v1(sdsc);
+    if V::FORCED && filled == DscFilled::No {
+        panic!(
+            "DDCv1 force-requested but DSC2 not filled for node: {}",
+            sdsc.name()
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests_e132_e136 {
@@ -8789,5 +8896,36 @@ mod tests_e307_e309 {
         let (refused, keyed) = attach(None);
         assert_eq!(refused, None);
         assert!(keyed.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests_e381 {
+    use super::{DdcOff, DdcV1Required, SdscName, run};
+
+    /// The one field entry 381 reads of a super-DSC.
+    struct NamedSdsc(&'static str);
+
+    impl SdscName for NamedSdsc {
+        fn name(&self) -> &str {
+            self.0
+        }
+    }
+
+    /// ⭐ BOTH OFF ARMS REMOVE THE CALL, and returning is the whole assertion: reaching stage 2b
+    /// would trip its stop. Data-op testing wins over a force-requested `ddcVersion == 2`, and
+    /// `ddcVersion == 0` skips stage 2b with data-op testing off.
+    #[test]
+    fn a_disabled_ddc_runs_nothing() {
+        run::<DdcV1Required, _, true>(&mut NamedSdsc("dataop_testing"));
+        run::<DdcOff, _, false>(&mut NamedSdsc("ddc_off"));
+    }
+
+    /// THE NEGATIVE CONTROL for the pair above: with the DDC requested and data-op testing off, the
+    /// gate DOES dispatch to entry 379.
+    #[test]
+    #[should_panic(expected = "e379_run_v1")]
+    fn a_requested_ddc_dispatches_to_stage_2b() {
+        run::<DdcV1Required, _, false>(&mut NamedSdsc("requested"));
     }
 }
