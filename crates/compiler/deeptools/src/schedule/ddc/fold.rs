@@ -861,7 +861,9 @@ pub trait CoreStage {
     /// (`dsc/dims.h:277`) — one core's whole extent for the dim, with no component, corelet or
     /// padding view.
     fn core_extent(&self, dim: PrimaryDim) -> Extent;
-    /// `currDsc->numCoreletsUsed_` (`dsc/designSpaceConfig.h:74`).
+    /// `currDsc->numCoreletsUsed_DSC2_` (`dsc/designSpaceConfig.h:104`) — the DM-filled copy entry
+    /// 298 reads (`ddc_fold.cpp:3228`), which `prepDsc` assigns from `numCoreletsUsed_`
+    /// (`ddcv1.cpp:2024`), so the two agree today but only one of them is this reference's.
     fn corelets_used(&self) -> Cardinality;
     /// `sdsc_->numWkSlicesPerDim_.at(dim)` (`dsc/superdsc.h:69`).
     fn work_slices(&self, dim: PrimaryDim) -> Cardinality;
@@ -4098,6 +4100,10 @@ pub struct AllocationFold<'a, F: AffineFoldDims + ?Sized> {
     /// `labeledDs_.at(ldsIdx_).scale_` per dim, absent where the layout order does not name the dim —
     /// which the reference reads as a scale of 1 (`:8477`).
     pub dim_scales: BTreeMap<PrimaryDim, Scale>,
+    /// `coordPropInfo.dimsToPropagate` IN FULL (`dsc/dsc2.h:1094`) — ⛔ NOT the dims of
+    /// [`Self::dims`], which is that list INTERSECTED with the coordinate: the corelet-split stop
+    /// (`:8429`) asks the REQUEST, so a split dim asked for but carrying no fold still stops it.
+    pub propagated_dims: &'a [PrimaryDim],
     /// `coreletSplitDim`, absent for its `PrimaryDimTypesCount` (`:8432`).
     pub corelet_split_dim: Option<PrimaryDim>,
     /// `sizeRefComp` and `propRefComp`, which this unit receives rather than derives.
@@ -4142,7 +4148,7 @@ where
     F: AffineFoldDims + ?Sized,
 {
     if let Some(split) = alloc.corelet_split_dim {
-        if alloc.dims.iter().any(|&(dim, _)| dim == split)
+        if alloc.propagated_dims.contains(&split)
             && work_slice_varies_on_dim(alloc.work_slices, split)
         {
             // Can not propagate coordinates for a coreletSplit dimension from an allocateNode with a
@@ -6405,6 +6411,7 @@ mod tests_e297_e299 {
             )],
             work_slices: &slices,
             dim_scales: BTreeMap::new(),
+            propagated_dims: &[PrimaryDim::Out],
             corelet_split_dim: None,
             components: RefComponents {
                 size: SenComponent::All,
@@ -6450,6 +6457,70 @@ mod tests_e297_e299 {
             ]
         );
         assert!(coord.fold_constructed());
+    }
+
+    #[test]
+    fn a_corelet_split_dim_that_is_requested_but_carries_no_fold_still_stops_the_propagation() {
+        let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, Vec::new()));
+        let core_ds = RowSplitOn(Vec::new());
+        let distribution = Seams(Vec::new());
+        let slices = WorkSlices(BTreeMap::from([
+            (
+                CoreOrdinal(0),
+                BTreeMap::from([(PrimaryDim::Out, WorkSlice(0))]),
+            ),
+            (
+                CoreOrdinal(1),
+                BTreeMap::from([(PrimaryDim::Out, WorkSlice(1))]),
+            ),
+        ]));
+        // `dims` is EMPTY — the split dim is asked for and the coordinate has no fold manager for it,
+        // so only `propagated_dims` can see the request the reference refuses on (`:8429`).
+        let mut alloc: AllocationFold<'_, Levels> = AllocationFold {
+            lds: LdsIdx(0),
+            dims: Vec::new(),
+            work_slices: &slices,
+            dim_scales: BTreeMap::new(),
+            propagated_dims: &[PrimaryDim::Out],
+            corelet_split_dim: Some(PrimaryDim::Out),
+            components: RefComponents {
+                size: SenComponent::All,
+                prop: SenComponent::Lx,
+            },
+            row_group: None,
+        };
+        let target = AllocFoldTarget {
+            node: NodeId(1),
+            loops: &[],
+        };
+        let mut coord = dsc2::Coordinate::default();
+        assert_eq!(
+            build_fold_from_allocation::<Target, _, _, _, _>(
+                &dsc,
+                &core_ds,
+                &distribution,
+                &alloc,
+                &target,
+                &mut coord,
+                &mut (),
+            ),
+            FoldPropagation::CoreletSplitVaries
+        );
+        // The negative: the same varying slice map is no obstacle to a dim nobody asked to propagate.
+        alloc.propagated_dims = &[];
+        let mut coord = dsc2::Coordinate::default();
+        assert_eq!(
+            build_fold_from_allocation::<Target, _, _, _, _>(
+                &dsc,
+                &core_ds,
+                &distribution,
+                &alloc,
+                &target,
+                &mut coord,
+                &mut (),
+            ),
+            FoldPropagation::Built
+        );
     }
 
     #[test]
