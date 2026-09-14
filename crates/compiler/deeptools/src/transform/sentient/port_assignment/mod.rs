@@ -88,20 +88,24 @@
 //! | `e632_doPortAssignments` | 632 | 6 | 12 | `dcc/src/Transform/Sentient/PortAssignment.cpp:776` |
 //! | `e645_runOnOperation` | 645 | 7 | 21 | `dcc/src/Transform/Sentient/PortAssignment.cpp:793` |
 
-// ⛔ NINE OF THE THIRTEEN ANCHORS BELOW ARE UNFILLED, so the pass state has no writer and
-// `getPortAttr` no caller until they land; CI runs clippy with `-D warnings`
+// ⛔ ALL THIRTEEN ANCHORS ARE FILLED AND THE PASS IS STILL NOT WIRED INTO THE PIPELINE —
+// [`PortAssignment::run_on_operation`] (e645) is its entry and there is no ported D29-D75 pass driver
+// to call it, so nothing outside this module reaches any of it. CI runs clippy with `-D warnings`
 // (the `lexical_ordering/mod.rs:83` precedent).
-// ⭐ REMOVE THIS WITH `e645_runOnOperation`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: the [`super::toggle_reordering`] precedent.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
 use super::analyses::{ColoringGraph, GreedyAllocator, LiveRange, NumColors};
 use crate::arch::{Arch, IsaGen};
-use crate::islands::sentient::ProgramUnit;
+use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::dialects::sentient::{BinaryOp, Port, Precision, TernaryOp, UnaryOp};
 use crate::islands::sentient::dialects::{Op, regions_mut, regions_ref, sentient};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
 use crate::units::DfirUnit;
+use crate::workload::Workload;
 
 /// WHICH OF THE THREE COMPUTE PORTS — the count is fixed at `performGraphColoring(3)` (`:784`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1416,16 +1420,50 @@ fn op_at_mut(unit: &mut [Op], target: OpAt) -> Option<&mut Op> {
     walk(unit, &mut 0, target)
 }
 
-// crustify:todo: e645_runOnOperation
-//   authority : dcc/src/Transform/Sentient/PortAssignment.cpp:793  (21 body lines, level 7)
-//   original  : void PortAssignmentPass::runOnOperation()
-//   calls     : e632_doPortAssignments
+impl<G: ColoringGraph> PortAssignment<G> {
+    /// Replaces: e645_runOnOperation
+    ///
+    /// The pass entry: assigns the three compute ports on every PT row, PE and SFP unit of the
+    /// module in walk order, and answers with the units whose live range could not be computed
+    /// (`:793-813`).
+    ///
+    /// ⛔ ONLY THE PT ARM ASKS THE GENERIC MAP (`:800-806`): the PE and SFP arms compare the RAW
+    /// component, so the reference leaves a unit bound as `pe0`/`sfp0` unassigned — [`DfirUnit`]
+    /// carries no fold copy of either, so every `Pe`/`Sfp` reaching here IS the reference's `PE`/`SFP`.
+    /// ⛔ `emitError("Unknown unit for port assignment") + signalPassFailure()` (`:808-810`) IS
+    /// UNREACHABLE FROM HERE: the string lookup is [`crate::islands::dataflow_ir::Units::kind`],
+    /// already an enum, and `senCompToGenericComp.at()`'s own throw for `L0`/`CONSTANT`/`SFPRING`
+    /// answers itself in [`DfirUnit::generic`] — no such answer is PT, PE or SFP, so the unit is left
+    /// exactly as it came in.
+    pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload, R: LiveRanges>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+        live_ranges: &mut R,
+    ) -> Vec<DfirUnit> {
+        let mut without_a_live_range = Vec::new();
+        for unit in program.units.iter_mut() {
+            let comp = unit.on.kind();
+            if !matches!(
+                comp.generic(),
+                GenericComp::Pt | GenericComp::Pe | GenericComp::Sfp
+            ) {
+                continue;
+            }
+            if self.do_port_assignments(unit, comp, live_ranges) == LiveRangeComputed::No {
+                without_a_live_range.push(comp);
+            }
+        }
+        without_a_live_range
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
-    use crate::islands::dataflow_ir::Units;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
     use crate::islands::sentient::dialects::Val;
     use crate::islands::sentient::dialects::sentient::{
         Binary, LrfIndex, Operand, RegType, ResultPorts,
@@ -2266,5 +2304,71 @@ mod unit_tests {
             unreachable!("the first op is a vector_mac")
         };
         assert_eq!(op_a.port, Port::West);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// A `dataflow.program_unit` on `on` with nothing in it.
+    fn unit_on(on: DfirUnit) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(on, Val(0)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e645 — WHICH UNITS GET A PORT ASSIGNMENT AT ALL: the PT row, the PE and the SFP each go
+    /// through `doPortAssignments` once, and the L3 half — whose generic component is neither PT, PE
+    /// nor SFP — is not asked anything, so the graph is cleared and coloured three times and not four.
+    #[test]
+    fn e645_assigns_ports_on_every_compute_unit_and_skips_the_memory_units() {
+        let mut pass = PortAssignment::<CountingGraph>::default();
+        // The seeded node survives `clean()` (this graph only counts clears), so each compute unit
+        // passes e632's `getNumNodes() != 0` guard and is coloured.
+        pass.graph.nodes.push(DataId(1));
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                unit_on(pt()),
+                vec![
+                    unit_on(DfirUnit::L3lu),
+                    unit_on(DfirUnit::Pe),
+                    unit_on(DfirUnit::Sfp),
+                ],
+            ),
+            bound: core::marker::PhantomData,
+        };
+
+        let failed = pass.run_on_operation(&mut program, &mut RecordingLiveRanges::default());
+
+        assert!(failed.is_empty());
+        assert_eq!(pass.graph.clears, 3);
+        assert_eq!(
+            pass.graph.colorings,
+            vec![(PortId::COUNT, GreedyAllocator::No); 3]
+        );
     }
 }

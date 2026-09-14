@@ -87,11 +87,12 @@
 //! | `e636_runOn` | 636 | 6 | 14 | `dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2389` |
 //! | `e646_runOnOperation` | 646 | 7 | 5 | `dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2404` |
 
+// ⛔ EVERY ANCHOR OF THIS PASS IS FILLED AND THE PASS IS STILL NOT WIRED INTO THE PIPELINE —
+// [`run_on_operation`] (e646) is its entry and there is no ported D29-D75 pass driver to call it, so
+// nothing outside this module reaches any of it, its two submodules included. CI runs clippy with
+// `-D warnings`.
+// ⭐ REMOVE THIS WITH THAT DRIVER, not with an anchor: the [`super::toggle_reordering`] precedent.
 #![allow(dead_code)]
-// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e646_runOnOperation` (level 7) is the unit that
-// calls everything below, and it is not in this batch. CI runs clippy with `-D warnings`, so without
-// this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH e646: at that point an unused item here is a real defect again.
 
 use std::num::NonZeroU32;
 
@@ -885,10 +886,45 @@ pub(crate) fn run_on_module<
     failed_to_simplify
 }
 
-// crustify:todo: e646_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2404  (5 body lines, level 7)
-//   original  : void runOnOperation()
-//   calls     : e366_runOn, e636_runOn
+/// `DisableThisPass`, `cl::init(false)` (`:105-108`) — a `dcc-opt` flag, and this crate has none.
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e646_runOnOperation
+///
+/// The pass entry: unless the flag turns the whole pass off, merge and hoist the scalar ops of every
+/// unit of the module (`:2404-2408`).
+///
+/// ⛔ THE UNITS THAT FAILED TO SIMPLIFY COME BACK OUT because that is `signalPassFailure()` AS DATA
+/// (see [`run_on_module`]); the disabled pass fails nothing, so it answers with none.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_on_operation<
+    A: Arch,
+    M: Model,
+    W: Workload,
+    E: ExpressionEvaluator,
+    I: InstructionEstimator,
+    P: PropagationAnalysis,
+    U: UnitIndexMap,
+>(
+    program: &mut Program<A, M, W>,
+    evaluator: &mut E,
+    estimator: &mut I,
+    propagation: &mut P,
+    unit_index_map: &U,
+    values: &mut Values,
+) -> Vec<DfirUnit> {
+    if DISABLE_THIS_PASS {
+        return Vec::new();
+    }
+    run_on_module(
+        program,
+        evaluator,
+        estimator,
+        propagation,
+        unit_index_map,
+        values,
+    )
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -1332,6 +1368,43 @@ mod unit_tests {
         );
         assert!(failed.is_empty());
         assert_eq!(estimator.recalculated, vec![1, 1, 1, 1, 1, 1]);
+        for unit in program.units.iter() {
+            assert!(unit.body.is_empty(), "the empty loop was simplified away");
+        }
+    }
+
+    /// e646 — the entry reaches the IR: with the pass's own flag off, the module's units are walked
+    /// and each unit's empty loop is gone afterwards, exactly as through [`run_on_module`].
+    #[test]
+    fn e646_runs_the_whole_pass_over_the_module() {
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                unit_with_one_loop(DfirUnit::Lxlu, Val(1)),
+                vec![unit_with_one_loop(DfirUnit::L3lu, Val(2))],
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+        let mut estimator = CountingEstimator::default();
+
+        let failed = run_on_operation(
+            &mut program,
+            &mut OutOfScopeEvaluator,
+            &mut estimator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut values,
+        );
+
+        assert!(failed.is_empty());
+        // The LX unit measures three phases and the L3 unit only its hoist — the walk reached both.
+        assert_eq!(estimator.recalculated, vec![1, 1, 1, 1]);
         for unit in program.units.iter() {
             assert!(unit.body.is_empty(), "the empty loop was simplified away");
         }
