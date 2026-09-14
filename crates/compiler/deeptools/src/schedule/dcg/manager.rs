@@ -2258,7 +2258,7 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
     }
 }
 
-/// ONE CORE'S PROGRAM AS TEXT — `psCore.second.print(fileFP)` (`dcg_manager.cpp:952`), which is
+/// ONE CORE'S PROGRAM AS TEXT — `psCore.second.print(fileFP)` (`dcg_manager.cpp:953`), which is
 /// `ProgramAndStateInfo::print` (`sys-arch-spec/progir/progir.cpp:1449`), out of this campaign's file
 /// list: spelling one unit's opcodes needs `Isa::getOpCodePrefix` (`progir.cpp:1462`), the ISA tables
 /// `crustify-ddc/OUTSIDE-DEPS.tsv` records as owed.
@@ -2277,11 +2277,17 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
     ///
     /// THE MERGE WITH NO L3 PCFG SUPPLIED — [`Self::merge_pcfg_in_super_dsc`] over two empty vectors, so
     /// every step's DL arm merges nothing and `pcfg_` is rebuilt from the data ops alone
-    /// (`dcg_manager.cpp:629-633`). This is the overload the data-DSC stitch calls (`:913`).
+    /// (`dcg_manager.cpp:629-633`). This is the overload the data-DSC stitch calls (`:913`) — and its
+    /// ONLY in-scope caller: the reference's other two (`:36`, `:141`) sit in `runDcg` and
+    /// `runDcgGeneratePCFG`, both named exclusions (`crustify-ddc/EXCLUSIONS.tsv:11-12`).
     ///
     /// ⚠️ THE REFERENCE PASSES `pcfgL3lu` TWICE (`:632`) — a typo for `pcfgL3su`, and inert: both are
     /// default-constructed and the arm reading them needs `size() > 0` on EACH (`:780`). One empty
     /// table states that once; see [`DlPcfgSource`].
+    /// ⛔ AND IT CAN NEVER SATISFY `DT_CHECK(useActualDLpcfg)` (`:740-742`), BECAUSE SUPPLYING NO L3
+    /// PCFG *IS* `useActualDLpcfg == false`: on a `SENPCFG` target, a step naming BOTH a data op and a
+    /// DL DSC throws there, so this overload has no answer for that super-DSC at all — [`None`], and
+    /// not the empty merge the paragraph above describes.
     pub fn merge_pcfg_in_super_dsc_without_l3_pcfg<const DATA_OPS: bool, const FOLDED: bool>(
         &self,
         sdsc: &mut SuperDsc<DATA_OPS, FOLDED>,
@@ -3045,8 +3051,63 @@ mod unit_tests {
             .merge_pcfg_in_super_dsc(&mut sdsc, DlPcfgSource::L3Halves(&halves));
     }
 
-    /// e327 — the header is this entry's own emission (`:951`) and the body is
-    /// `ProgramAndStateInfo::print`'s, out of scope (`:952`), so the walk writes core 3's header and then
+    /// THE SAME ONE STEP NAMING BOTH A DATA OP AND A DL DSC, on the given target — the shape `:737-742`
+    /// reads. Its data side holds a pcfg entry for this core with nothing in it, so the data arm merges
+    /// nothing and only the DL arm can decide the outcome.
+    fn one_mixed_step_on(target: SenTarget) -> SuperDsc<true, false> {
+        SuperDsc::of(PerCoreDscs::of(core::<0>(), DscVersion::Dsc2).with_dl_pcfg(
+            DscIdx(0),
+            core::<0>(),
+            SenPcfg::rooted_at(PcfgNodeId::new(1)),
+        ))
+        .with_target(target)
+        .with_data_op(DataOpDsc {
+            op: OpFunc::ReStickifyOpWithPtLx,
+            pcfg: BTreeMap::from([(core::<0>(), Vec::new())]),
+        })
+        .with_core_schedule(
+            core::<0>(),
+            CoreSchedule::with_dl(
+                Vec::new(),
+                DlStep {
+                    data_dsc: Some(DataOpIndex(0)),
+                    dl_dsc: DscIdx(0),
+                    before_sync: false,
+                    after_sync: false,
+                },
+                Vec::new(),
+            ),
+        )
+    }
+
+    /// e326 — SUPPLYING NO L3 PCFG *IS* `useActualDLpcfg == false`, so a `SENPCFG` target whose one step
+    /// names both a data op and a DL DSC reaches `DT_CHECK(useActualDLpcfg)` (`:740-742`) and throws:
+    /// through this overload that super-DSC has no answer at all, which is [`None`] and NOT an empty
+    /// merge.
+    #[test]
+    fn e326_cannot_serve_a_sen_pcfg_target_whose_step_names_both() {
+        let mut sdsc = one_mixed_step_on(SenTarget::SenPcfg);
+
+        let merged = StageThreeDcg::new().merge_pcfg_in_super_dsc_without_l3_pcfg(&mut sdsc);
+
+        assert_eq!(merged, None);
+    }
+
+    /// e326's second control — THE SAME MIXED STEP on any other target merges fine, because `:737-739`
+    /// skips the DL arm entirely once the step also names a data op. So the [`None`] above is the
+    /// `SENPCFG` check and not the mixed step, nor the data op's empty pcfg table.
+    #[test]
+    fn e326_serves_the_same_mixed_step_on_a_sentient_target() {
+        let mut sdsc = one_mixed_step_on(SenTarget::Sentient);
+
+        let merged = StageThreeDcg::new().merge_pcfg_in_super_dsc_without_l3_pcfg(&mut sdsc);
+
+        assert_eq!(merged, Some(()));
+        assert!(sdsc.pcfg.is_empty(), "{:?}", sdsc.pcfg);
+    }
+
+    /// e327 — the header is this entry's own emission (`:952`) and the body is
+    /// `ProgramAndStateInfo::print`'s, out of scope (`:953`), so the walk writes core 3's header and then
     /// stops there. ⭐ Caught off the unwind because the seam IS what stops it.
     #[test]
     fn e327_writes_each_core_header_then_stops_at_the_prog_state_printer() {
