@@ -2284,7 +2284,7 @@ struct TransferVisit {
     group: Option<usize>,
 }
 
-/// `unit->walk<WalkOrder::PreOrder>` (`:1297-1323`) — the unit's ops in preorder with a
+/// `unit->walk<WalkOrder::PreOrder>` (`:1298-1324`) — the unit's ops in preorder with a
 /// `uniform.uniformize_regions` SKIPPED as a whole, its regions walked separately under their own
 /// [`RegionSite`] and a fresh `groups` entry holding `getRegionUnitList(i)`.
 ///
@@ -2334,7 +2334,7 @@ fn collect_transfer_visits(
     }
 }
 
-/// `region.walk<WalkOrder::PreOrder>` (`:1304-1308`) — every op of ONE uniformized region, nested
+/// `region.walk<WalkOrder::PreOrder>` (`:1305-1309`) — every op of ONE uniformized region, nested
 /// ops included and nothing skipped, all charged to the region that owns them.
 ///
 /// ⛔ A NESTED `uniform.uniformize_regions` IS NOT SKIPPED HERE: this walk has no `WalkResult`, so
@@ -2368,7 +2368,7 @@ impl AddressPinningAndTogglePass {
     ///
     /// Files every transfer of one unit and leaves `num_streams_` at the WIDEST count any single
     /// physical unit needs at once: the unit body's own transfers are charged to all of them, a
-    /// uniformized region's only to the units that region maps onto (`:1292-1332`).
+    /// uniformized region's only to the units that region maps onto (`:1293-1333`).
     ///
     /// ⛔ THE `WalkResult::skip()` IS THE WHOLE POINT (`:1316`) — without it a uniformized transfer
     /// is ALSO a common one; ⛔ AND AN EMPTY MAP IS `common_transfers`, NOT `0` (`:1330`).
@@ -2402,7 +2402,7 @@ impl AddressPinningAndTogglePass {
                 None => common_transfers += 1,
             }
         }
-        // `per_unit_transfer_counts[tmp_unit] += region_transfers` (`:1310-1312`) — one region's
+        // `per_unit_transfer_counts[tmp_unit] += region_transfers` (`:1311-1313`) — one region's
         // count charged to every unit it runs on, and a unit two regions name pays for both.
         let mut per_unit_transfer_counts: BTreeMap<Val, usize> = BTreeMap::new();
         for (group, units) in groups.iter().enumerate() {
@@ -2447,7 +2447,7 @@ impl AddressPinningAndTogglePass {
     /// `sentient.scalar_sub` DEFINING the immutable-addr operand (`:1522-1537`).
     ///
     /// ⛔ ONE `None` CARRIES BOTH `DT_CHECK`s: [`DataTransferDescriptor::toggle_descriptor`]'s
-    /// `isToggle()` (`:711`) already contains the `toggle.isValid()` of `:1526`.
+    /// `isToggle()` (`:711`) already contains the `toggle.isValid()` of `:1527`.
     pub fn process_toggle<E: ExpressionEvaluator>(
         &self,
         desc: DescriptorId,
@@ -2465,7 +2465,7 @@ impl AddressPinningAndTogglePass {
             if dtd.toggle_descriptor().is_none() {
                 panic!(
                     "DT_CHECK(isToggle()) (`:711`) / DT_CHECK_MSG(toggle.isValid(), \"descriptor \
-                     may be corrupt\") (`:1526`) for {:?}",
+                     may be corrupt\") (`:1527`) for {:?}",
                     dtd.pattern_desc
                 )
             }
@@ -2500,7 +2500,7 @@ impl AddressPinningAndTogglePass {
     /// Pins a conditionally chosen base address through [`ConditionalConstDataTransferUpdater`],
     /// whose `if_op_` is the `sentient.if` DEFINING the immutable-addr operand (`:1539-1551`).
     ///
-    /// ⛔ THE ONE-USE CHECK IS ON `getResult(0)` AND NOT ON THE RESULT THIS TRANSFER USES (`:1546`):
+    /// ⛔ THE ONE-USE CHECK IS ON `getResult(0)` AND NOT ON THE RESULT THIS TRANSFER USES (`:1545`):
     /// a second result of the same conditional would not fail it, however many users it has.
     pub fn process_conditional_constant<E: ExpressionEvaluator>(
         &self,
@@ -2535,7 +2535,7 @@ impl AddressPinningAndTogglePass {
             if dialects::use_count(results[0], unit_body) != 1 {
                 panic!(
                     "DT_CHECK_MSG(if_op->getResult(0).hasOneUse(), \"Conditional expected to have \
-                     exactly one use.\") (`:1546-1547`)"
+                     exactly one use.\") (`:1545-1546`)"
                 )
             }
             ConditionalConstResult {
@@ -2611,7 +2611,7 @@ impl AddressPinningAndTogglePass {
     /// [`SimpleConstantDataTransferUpdater`] (`:1565-1573`).
     ///
     /// ⛔ NO CHECK OF ITS OWN — the reference's body is the constructor and the `update()` call, and
-    /// the `isValid()` that admits a transfer here belongs to e653's `else if` (`:1516`).
+    /// the `isValid()` that admits a transfer here belongs to e653's `else if` (`:1515`).
     pub fn process_simple_constant<E: ExpressionEvaluator>(
         &self,
         desc: DescriptorId,

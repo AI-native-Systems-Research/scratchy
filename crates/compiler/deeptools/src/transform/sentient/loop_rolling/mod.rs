@@ -1666,7 +1666,7 @@ const L3_ONLY_LOOP_ROLLING: bool = false;
 /// the innermost level."*
 const SINGLE_INSTR_ONLY_LOOP_ROLLING: bool = false;
 
-/// `opts_.OptLevel == 0` (`:971`) — the PIPELINE's optimisation level, which is `2` by default
+/// `opts_.OptLevel == 0` (`:973`) — the PIPELINE's optimisation level, which is `2` by default
 /// (`dcc/tools/Options/dcc-pass-option.h:63-65`), so the shipped pipeline never reaches the
 /// `haveIbuffSpace` half of the `&&`.
 const OPT_LEVEL_ZERO: bool = false;
@@ -1677,8 +1677,9 @@ const OPT_LEVEL_ZERO: bool = false;
 /// already roomy, roll the soft-sync windows of its outermost blocks — or, when only single-instruction
 /// rolling is on, the single instructions of each of its innermost loops (`:966-1018`).
 ///
-/// ⛔ THE TWO CASES ARE EXCLUSIVE AND `L3_rolling_` WINS: with a filter that names nothing both flags
-/// come out true (`:873-879`), so the shipped standalone invocation takes the L3 arm only.
+/// ⛔ THE TWO ARMS ARE EXCLUSIVE AND `L3_rolling_` WINS ON AN EMPTY LIST (`:873-879`), which is
+/// `dcc-opt`'s no-argument factory (`:1041-1045`) — the SHIPPED pipeline adds this pass TWICE and
+/// reaches BOTH arms (`dcc-standalone-main.cpp:469-471` include-list, `:514-517` exclude-list).
 /// ⛔ `new_loop_count_` IS A PASS MEMBER: the `LR loop #n` numbering runs across the whole module.
 /// ⭐ `key_vals` IS THE UNIT'S OWN LIST, from `getListOfKeyOpsFromUniformMapping`'s
 /// `dataflow.program_unit` arm (`Dialect/Uniform/Utils.cpp:180-186`).
@@ -1708,7 +1709,7 @@ pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
     } = program;
     let mut new_loop_count = NewLoopCount(0);
     for unit in units.iter_mut() {
-        // `getChildAnalysis<InstructionEstimator>(unit_op)` IS CONSTRUCTED PER UNIT (`:970`), even for
+        // `getChildAnalysis<InstructionEstimator>(unit_op)` IS CONSTRUCTED PER UNIT (`:972`), even for
         // one the `&&` never asks anything of.
         let mut instruction_estimator = OutOfScopeInstructionEstimator;
         if OPT_LEVEL_ZERO && instruction_estimator.have_ibuff_space(&unit.body) {
