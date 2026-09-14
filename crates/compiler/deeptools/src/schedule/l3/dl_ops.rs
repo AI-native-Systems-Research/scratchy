@@ -15400,11 +15400,42 @@ mod tests_e283_e295 {
             .at(DATA_STAGE_CHUNK)
             .expect("the chunk stage the search settled on");
         assert_eq!(chunk.ss.dims.dims().extent(PrimaryDim::I), Some(Extent(4)));
+
+        // `dscCandidates[dscIdx].at(dim)`: the layout order is what makes a dim explored, so a second
+        // layout dim the candidates never state is the refusal.
+        let (mut sdsc, orgs, transfers, tree) = a_transferred_input();
+        sdsc.dscs_mut()
+            .at_mut(DscIdx(0))
+            .expect("the one DSC of the fixture")
+            .primary_ds_info
+            .insert(DsType::Input, layout(&[PrimaryDim::I, PrimaryDim::J]));
+        let mut selected = SelectedDscCandidates::new(vec![DscParamCandidates(BTreeMap::from([(
+            PrimaryDim::I,
+            SelectedCandidate::new(vec![Extent(2), Extent(4)], 0).expect("a seeded candidate"),
+        )]))]);
+        assert_eq!(
+            find_best_params_for_memory_bandwidth::<false, _, _, _, _, _>(
+                &mut selected,
+                &mut sdsc,
+                &BTreeSet::new(),
+                LxBuffering::Double,
+                true,
+                &BTreeMap::new(),
+                &orgs,
+                &transfers,
+                &tree,
+                &mut v1::AllocArena::new(),
+                &mut Trackers,
+                &Placement,
+            ),
+            None
+        );
     }
 
     /// e367 — OUT OF SPAN, on the same transferred input: the wider chunk doubles the Flops/Byte, so a
     /// system value the group is still short of pulls the search up one candidate. ⛔ A system value
-    /// the seeded candidate ALREADY overshoots leaves it exactly where it stood.
+    /// the seeded candidate ALREADY overshoots leaves it exactly where it stood, and the SAME value
+    /// moves it once the corelets in use scale the system value past it.
     #[test]
     fn the_arithmetic_intensity_search_climbs_towards_the_system_value_and_no_further() {
         /// `computeOp_` naming no op func at all, which entry 203 still scores at fp16.
@@ -15427,8 +15458,14 @@ mod tests_e283_e295 {
             }
         }
 
-        let search = |sys: f64| {
+        let search = |sys: f64, corelets: u32| {
             let (mut sdsc, orgs, transfers, tree) = a_transferred_input();
+            sdsc.dscs_mut()
+                .at_mut(DscIdx(0))
+                .expect("the one DSC of the fixture")
+                .corelets_used = CoreletsUsed::new(
+                NonZeroU32::new(corelets).expect("a positive corelet count"),
+            );
             let mut selected =
                 SelectedDscCandidates::new(vec![DscParamCandidates(BTreeMap::from([(
                     PrimaryDim::I,
@@ -15456,8 +15493,13 @@ mod tests_e283_e295 {
             (done, selected.selected_index(DscIdx(0), PrimaryDim::I))
         };
 
-        assert_eq!(search(1.0), (Some(()), Some(1)));
-        assert_eq!(search(0.001), (Some(()), Some(0)));
+        assert_eq!(search(1.0, 1), (Some(()), Some(1)));
+        assert_eq!(search(0.001, 1), (Some(()), Some(0)));
+        // The chunk's Flops/Byte are 4/512 seeded and 8/512 advanced, so a system value of 0.005 sits
+        // BELOW the seeded one at one corelet — nothing is better — and above it at two, where the
+        // advance is the improvement towards it.
+        assert_eq!(search(0.005, 1), (Some(()), Some(0)));
+        assert_eq!(search(0.005, 2), (Some(()), Some(1)));
     }
 
     /// The output's layout order, which is all the coordinate build asks of the DSC.
@@ -19133,7 +19175,11 @@ where
 /// ⛔ `std::sort` over an `unordered_map` walk leaves TIED counts in an unspecified order; the
 /// [`BTreeMap`] tally with a stable sort by count makes that order the dim order.
 /// ⛔ [`None`] is every refusal, `dscCandidates[dscIdx].at(dim)`'s throw for an explored dim with no
-/// candidates included. `primaryDims` is dead in both callees and is gone.
+/// candidates included.
+/// ⛔ `primaryDims` is dropped for TWO DIFFERENT reasons: `calculateBurstEfficiency` only reaches
+/// `getLabeledDsNumOfStickVolumesInCore` (`:1694`), which never reads it, whereas
+/// `getChunkParamsFromCandidates` (`:1423`) DOES iterate it — there it is absorbed, because
+/// `generateDscParamCandidates` (`:1180`) mints one entry per element, so the keyset IS `primaryDims`.
 pub fn find_best_params_for_memory_bandwidth<const CARRY_UNNEEDED_PAD: bool, O, T, S, M, P>(
     selected: &mut SelectedDscCandidates,
     sdsc: &mut SuperDsc,
@@ -19317,10 +19363,12 @@ where
     for at in dsc_indices(sdsc) {
         total_cores += sdsc.dscs().at(at)?.core_ids_used.count().0;
     }
-    let system = sys.sys_flops_per_byte(op_func_data_format(ops)).0
-        * f64::from(sdsc.dscs().first().corelets_used.get())
-        * f64::from(total_cores)
-        / (f64::from(A::CORELETS_PER_CORE) * f64::from(A::CORES));
+    // ⛔ `f * (c * t)`, NOT `(f * c) * t`: the reference (`:2521-2525`) parenthesises an `int * int`
+    // product on each side (both counts are `int`, `dsc/designSpaceConfig.h:72-74`), and `system` is
+    // the threshold of the three-case heuristic below, so one extra rounding flips a selection.
+    let used = u64::from(sdsc.dscs().first().corelets_used.get()) * u64::from(total_cores);
+    let whole = u64::from(A::CORELETS_PER_CORE) * u64::from(A::CORES);
+    let system = sys.sys_flops_per_byte(op_func_data_format(ops)).0 * used as f64 / whole as f64;
     // "Expect valid chunk size that fits in LX."
     write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
         sdsc, selected, buffering, true, metadata, allocs, trackers, placement,
