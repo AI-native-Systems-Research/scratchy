@@ -14616,6 +14616,8 @@ mod tests_e283_e295 {
                 hbm(),
             )],
         );
+        let mut unprepared = config.clone();
+        unprepared.corelets_used_dsc2 = None;
         let sdsc = a_sdsc(
             config,
             &[(PrimaryDim::I, 2), (PrimaryDim::J, 1)],
@@ -14642,6 +14644,24 @@ mod tests_e283_e295 {
             src: SenComponent::Lx,
             dst: SenComponent::Hbm,
         }]);
+        // ⭐ THE NEGATIVE — an unprepared `numCoreletsUsed_DSC2_` is the reference's `-1`: it fails
+        // `> 1`, so the DSC is SKIPPED and the walk succeeds with nothing written.
+        let unprepared_sdsc = a_sdsc(
+            unprepared,
+            &[(PrimaryDim::I, 2), (PrimaryDim::J, 1)],
+            &[(core(0), slice(&[(PrimaryDim::I, 0)]))],
+        );
+        assert_eq!(
+            fill_explicit_transfer_size(&unprepared_sdsc, &trees, &mut tree),
+            Some(())
+        );
+        assert!(
+            DscTransferWrites::transfer(&tree, DscIdx(0), store)
+                .expect("the store")
+                .transfer_size
+                .is_empty()
+        );
+
         assert_eq!(fill_explicit_transfer_size(&sdsc, &trees, &mut tree), Some(()));
         assert_eq!(
             DscTransferWrites::transfer(&tree, DscIdx(0), store)
@@ -15032,7 +15052,7 @@ where
 /// ⛔ ONE CORELET AND NOT ALL OF THEM IS THE WHOLE POINT — a cross-core reduction has every corelet
 /// carrying the same reduced block, so the derived size (which sums them) would overstate the store.
 /// ⛔ [`None`] IS *"Currently support at most one L3SU transfer."*, *"Expect empty transferSize_
-/// field."*, an unprepared `numCoreletsUsed_DSC2_`, entry 210's refusals and the size walk's own.
+/// field."*, entry 210's refusals and the size walk's own.
 pub fn fill_explicit_transfer_size<T, E>(sdsc: &SuperDsc, trees: &T, env: &mut E) -> Option<()>
 where
     T: TransferNodes + ?Sized,
@@ -15040,7 +15060,12 @@ where
 {
     for dsc_idx in dsc_indices(sdsc) {
         let dsc = sdsc.dscs().at(dsc_idx)?;
-        if dsc.corelets_used_dsc2?.get() <= 1 || !is_op_cross_core_reduction(sdsc, dsc)? {
+        // ⭐ AN UNPREPARED `numCoreletsUsed_DSC2_` IS THE REFERENCE'S `-1`, which fails `> 1` and
+        // SKIPS this DSC rather than refusing the walk.
+        let Some(corelets) = dsc.corelets_used_dsc2 else {
+            continue;
+        };
+        if corelets.get() <= 1 || !is_op_cross_core_reduction(sdsc, dsc)? {
             continue;
         }
         let mut stores = Vec::new();
