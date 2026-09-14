@@ -16,6 +16,18 @@ pub enum Error {
     #[error("{repo}: no such file `{filename}`")]
     NotFound { repo: String, filename: String },
 
+    /// The Hub answered a redirect it will not serve the file for. A
+    /// wrongly-cased or renamed repo id is the usual cause.
+    #[error(
+        "{repo}: the Hub redirected to `{location}` rather than serving \
+         `{filename}` — check the repo id's spelling and case"
+    )]
+    RepoRedirect {
+        repo: String,
+        filename: String,
+        location: String,
+    },
+
     /// Hub returned a status we do not know how to act on.
     #[error("{url}: unexpected HTTP status {status}")]
     UnexpectedStatus { url: String, status: u16 },

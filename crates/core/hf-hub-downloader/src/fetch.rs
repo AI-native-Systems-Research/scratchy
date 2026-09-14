@@ -210,7 +210,17 @@ fn probe_once(opts: &Opts<'_>, url: &str, repo_id: &str, filename: &str) -> Resu
         url: url.to_string(),
         header,
     };
-    let commit = header("x-repo-commit").ok_or_else(|| missing("x-repo-commit"))?;
+    let commit = match (header("x-repo-commit"), header("location")) {
+        (Some(commit), _) => commit,
+        (None, Some(location)) => {
+            return Err(Error::RepoRedirect {
+                repo: repo_id.to_string(),
+                filename: filename.to_string(),
+                location,
+            })
+        }
+        (None, None) => return Err(missing("x-repo-commit")),
+    };
 
     match status {
         // LFS: redirected off-host to a presigned CDN URL.
