@@ -2866,12 +2866,15 @@ impl AddressPinningAndTogglePass {
     ///
     /// ⛔ `initialize(unit)` IS `num_streams_ = -1` AND NOTHING ELSE (`:1575-1577`), so `calls
     /// e221_initialize` is a name collision with `SpecializedCanonicalization`'s, as e456's note says.
-    /// ⛔ NEITHER `int ns = computeOrGetNumberOfStreams()` RECOMPUTES ANYTHING (`:1358`, `:1386`): e647
+    /// ⛔ NEITHER `int ns = computeOrGetNumberOfStreams()` RECOMPUTES ANYTHING (`:1359`, `:1385`): e647
     /// has just memoised `num_streams_`, and both reads feed a debug print only.
+    /// ⛔ THE `DT_CHECK` THAT THE TWO CONTAINERS PAIR UP (`:1367-1369`) IS DROPPED, per the crate's
+    /// no-assert rule; e614's `min`-length zip is what tolerates a mismatch, as its own note records.
     /// ⭐ `getChildAnalysis<Static/DynamicPinningSchemeManager>(unit)` IS PER-UNIT AND OUT OF SCOPE, so
     /// `eval` is where an L3 unit stops and the two managers are locals rather than parameters.
     /// ⭐ `ScalarTy::Index` IS THE OP DEFINITION: `ty` is `mutable_addr_[0].get().getType()` (`:1029`)
-    /// and every sentient memory op declares both address operands `Arg<Index, ..>` (`SentientOps.td:460`).
+    /// and all three COLLECTED transfer ops declare both address operands `Arg<Index, ..>`
+    /// (`SentientOps.td:507-508`, `:550-551`, `:724-728`).
     fn run_on_unit<A: Arch, E: ExpressionEvaluator>(
         &mut self,
         unit: &mut ProgramUnit<A>,
@@ -2894,7 +2897,7 @@ impl AddressPinningAndTogglePass {
             return;
         }
 
-        // THE LX PHASE (`:1348-1362`) — the unit's own transfers, pinned under the static scheme.
+        // THE LX PHASE (`:1348-1363`) — the unit's own transfers, pinned under the static scheme.
         {
             // The scopes a `getDefiningOp()` searches: the unit body, then the enclosing function's
             // entry block, which is where every `dataflow.get_unit` this island declares lives.
@@ -2939,7 +2942,7 @@ impl AddressPinningAndTogglePass {
         }
         self.cleanup();
 
-        // THE HBM PHASE (`:1364-1392`) — the SAME unit collected again, this time for its HBM ends.
+        // THE HBM PHASE (`:1365-1392`) — the SAME unit collected again, this time for its HBM ends.
         {
             let regions: [&[Op]; 2] = [unit.body.as_slice(), preamble.as_slice()];
             self.collect_data_transfers_and_compute_max_streams(
@@ -5439,6 +5442,34 @@ mod unit_tests {
         assert_eq!(preamble[1], scalar_const(14, 64));
         assert!(pass.immut_data_transfer_descriptors.descriptors.is_empty());
         assert!(pass.mut_data_transfer_descriptors.descriptors.is_empty());
+        assert_eq!(pass.num_streams, None);
+    }
+
+    /// 656/656's inlined `initialize(unit)` (`:1338`, `:1575-1577`) — the one line neither test above
+    /// can see, both starting from a default pass whose count is already unset.
+    #[test]
+    fn e656_the_inlined_initialize_drops_a_stale_stream_count() {
+        let mut unit: ProgramUnit<Dd2> = ProgramUnit {
+            on: Units::one(DfirUnit::Lxlu, Val(100)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        };
+        let mut preamble = Vec::new();
+        let mut values = Values::default();
+        let mut pass = AddressPinningAndTogglePass::default();
+        pass.num_streams = Some(StreamCount(7));
+
+        pass.run_on_unit(
+            &mut unit,
+            &mut preamble,
+            ProgStitch::Stitched,
+            &mut OutOfScopeEvaluator,
+            &mut values,
+        );
+
+        // The component gate returned before anything was collected, so only the inlined `initialize`
+        // can have dropped the count this pass instance was carrying.
         assert_eq!(pass.num_streams, None);
     }
 }
