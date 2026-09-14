@@ -2564,14 +2564,14 @@ impl DataEdge {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
-// THE BUILDER SEAM — `ComputationBuilder` (`shuffle.h:183`), what a shuffle's codegen writes through.
+// THE BUILDER SEAM — `ComputationBuilder` (`shuffle.h:185`), what a shuffle's codegen writes through.
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 
 /// WHAT THE SHUFFLE CODEGEN ASKS OF THE SCHEDULE IT WRITES INTO — `ComputationBuilder`
-/// (`shuffle.h:183`), the pure abstract class `replace_assign` is handed and every
+/// (`shuffle.h:185`), the pure abstract class `replace_assign` is handed and every
 /// [`ComputationOp`]'s codegen calls through.
 ///
-/// ⭐ ENTRY 376'S LOCAL `BuilderImpl` (`ddc/ddc_transformation.cpp:1857`) IS THE ONE IMPLEMENTATION,
+/// ⭐ ENTRY 376'S LOCAL `BuilderImpl` (`ddc/ddc_transformation.cpp:1858`) IS THE ONE IMPLEMENTATION,
 /// and the declaration sits here because this is `shuffle.h`'s Rust home and all three methods trade
 /// in [`DataEdge`].
 pub trait ComputationBuilder {
@@ -2581,7 +2581,7 @@ pub trait ComputationBuilder {
     /// `allocate_sticks(format, word_length, n)` — `n` fresh single-stick registers, each with its own
     /// labelled DS and allocation, as edges.
     ///
-    /// ⛔ `double word_length`: its one producer computes `wl / 8.0` (`shuffle.cpp:845`) and the field
+    /// ⛔ `double word_length`: its one producer computes `wl / 8.0` (`shuffle.cpp:848`) and the field
     /// it lands in is `LabeledDsInfo::wordLength` (`dsc/dscdefn.h:334`), so [`WordLength`]'s
     /// whole-byte narrowing is where a sub-byte width goes, and the rounding is e371's to state.
     fn allocate_sticks(
@@ -2607,9 +2607,11 @@ pub trait ComputationBuilder {
 ///
 /// ⛔ THE SEAM ENTRY 376 REACHES IT THROUGH, AND NOT A STAND-IN: entry 376 mints the builder and the
 /// shuffler and hands both over, and every decision between the two is e371's.
-/// ⛔ THE DSC IS NOT A SECOND PARAMETER. `replace_assign` reads `labeledDs_`, `primaryDsInfo_` and
-/// `getAllocation` off the SAME DSC the builder writes, and one `&mut` carrier cannot be borrowed
-/// twice — so those reads belong on [`ComputationBuilder`] when e371 lands and names them.
+/// ⛔ THE DSC IS NOT A SECOND PARAMETER, AND IT IS READ SEVEN WAYS, NOT THREE. `replace_assign` reads
+/// `labeledDs_` (`:802`), `primaryDsInfo_` (`:805`) and `getAllocation` (`:821`) in its own body, and
+/// `getLayoutDims` (`:873`), `getCumulativeStickSizes` (`:876`), `coreIdsUsed_` (`:881`) and
+/// `numCoreletsUsed_` (`:882`) inside `do_codegen` alone — off the SAME DSC the builder writes, which
+/// one `&mut` carrier cannot lend twice, so all seven belong on [`ComputationBuilder`] when e371 lands.
 pub trait AssignReplacement {
     /// `replace_assign(dsc, builder, assign)`.
     fn replace_assign<B: ComputationBuilder + ?Sized>(
