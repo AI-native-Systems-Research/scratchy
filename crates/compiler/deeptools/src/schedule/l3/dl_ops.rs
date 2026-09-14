@@ -1594,6 +1594,19 @@ impl CoreWindowDims {
     pub fn windows(&self, dim: PrimaryDim) -> bool {
         self.0.contains(&dim)
     }
+
+    /// The witness FROM THE L3 DSC, whose core data stage is MANDATORY and so cannot refuse —
+    /// `ss_.ki_ > 0` / `ss_.kj_ > 0` on `dataStageParam_.at(dataStageCoreIdx)` (`dsc/dims.h:183`).
+    #[must_use]
+    pub fn of_l3(dsc: &DesignSpaceConfig) -> Self {
+        let core = dsc.core_stage().dims();
+        Self(
+            [PrimaryDim::Ki, PrimaryDim::Kj]
+                .into_iter()
+                .filter(|dim| core.extent(*dim).is_some_and(|extent| extent.0 > 0))
+                .collect(),
+        )
+    }
 }
 
 /// Replaces: e018_createLoopNode
@@ -6582,23 +6595,28 @@ impl SyncInsertion for BlockNode {
     }
 }
 
-/// THE TWO CROSS-LINKED ENDS OF ONE `sync_send_<a>_to_<b>` / `sync_receive_<b>_from_<a>` PAIR.
+/// THE TWO CROSS-LINKED ENDS OF ONE `sync_<infix>send_<a>_to_<b>` /
+/// `sync_<infix>receive_<b>_from_<a>` PAIR.
 ///
 /// ⭐ THE NAMES ARE BUILT FROM [`SenComponent::spelling`], which is the same
 /// `senComponentsToString` map the reference concatenates and is LOWERCASE.
+///
+/// ⚠️ TRAP: `infix` GOES AFTER `sync_` WHILE `suffix` GOES ON THE END — entry 213's soft pair is
+/// `sync_soft_send_l3lu_to_lxlu`, so the two are different slots and neither is the strength.
 fn sync_pair(
     sender: SenComponent,
     receiver: SenComponent,
+    infix: &str,
     suffix: &str,
     strength: SyncStrength,
 ) -> (SyncNode, SyncNode) {
     let send = NodeName(format!(
-        "sync_send_{}_to_{}{suffix}",
+        "sync_{infix}send_{}_to_{}{suffix}",
         sender.spelling(),
         receiver.spelling()
     ));
     let receive = NodeName(format!(
-        "sync_receive_{}_from_{}{suffix}",
+        "sync_{infix}receive_{}_from_{}{suffix}",
         receiver.spelling(),
         sender.spelling()
     ));
@@ -6630,7 +6648,7 @@ fn sync_pair(
 /// and its three siblings.
 pub fn add_l3_lu_and_lx_lu_sync_node_sequence<I: SyncInsertion + ?Sized>(tree: &mut I, at: I::At) {
     let pair = |sender: SenComponent, receiver: SenComponent| {
-        sync_pair(sender, receiver, "", SyncStrength::Hard)
+        sync_pair(sender, receiver, "", "", SyncStrength::Hard)
     };
     let (l3_send, l3_receive) = pair(SenComponent::L3lu, SenComponent::Lxlu);
     let (lx_send, lx_receive) = pair(SenComponent::Lxlu, SenComponent::L3lu);
@@ -7093,40 +7111,1214 @@ mod tests_e205_e212 {
     }
 }
 
-// crustify:todo: e213_addL3LUAndLXLUSoftSyncNodeSequence
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3959  (26 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::addL3LUAndLXLUSoftSyncNodeSequence( const dsc2::ScheduleNode* insertAfterNode) const
-//   extract   : crustify-ddc/cpp/l3.cpp:2950-2977
-//   calls     : e020_createSyncNode
+/// Replaces: e213_addL3LUAndLXLUSoftSyncNodeSequence
+///
+/// ADDS THE SOFT L3LU/LXLU HALF-HANDSHAKE immediately after `at`: L3LU sends, LXLU receives, the two
+/// cross-linked as each other's other end and both SOFT signals.
+///
+/// ⚠️ TRAP: THE `soft_` GOES AFTER `sync_`, NOT ON THE END — `sync_soft_send_l3lu_to_lxlu` and
+/// `sync_soft_receive_lxlu_from_l3lu` (`L3DlOpsScheduler.cpp:3963,3970`); entry 212's four nodes are
+/// plain `sync_send_`/`sync_receive_`.
+pub fn add_l3_lu_and_lx_lu_soft_sync_node_sequence<I: SyncInsertion + ?Sized>(
+    tree: &mut I,
+    at: I::At,
+) {
+    let (send, receive) = sync_pair(
+        SenComponent::L3lu,
+        SenComponent::Lxlu,
+        "soft_",
+        "",
+        SyncStrength::Soft,
+    );
+    let at = tree.insert_sync_after(at, send);
+    tree.insert_sync_after(at, receive);
+}
 
-// crustify:todo: e214_optimizeHbmLdsOutputInScheduleTree
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4018  (94 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::optimizeHbmLdsOutputInScheduleTree(SuperDsc &mySDsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:2987-3081
-//   calls     : e015_getParentLoopNodes, e072_getTripCount
+/// ONE SYNC NODE OF A DSC'S TREE AS ENTRY 214 SWEEPS IT — `units_`, the end, and the units of every
+/// node `otherEndOfTheSignals_` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L3Sync {
+    /// The node itself, which is what the sweep deletes.
+    pub node: NodeId,
+    /// `syncNode->units_`.
+    pub units: SyncUnits,
+    /// `syncNode->isReceive_`.
+    pub direction: SyncDirection,
+    /// `otherEndOfTheSignals_` RESOLVED TO THEIR `units_` — all the sweep asks of the other ends.
+    pub other_ends: Vec<SyncUnits>,
+}
 
-// crustify:todo: e215_buildScheduleDimensionsTable
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4236  (103 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : auto L3DlOpsScheduler::buildScheduleDimensionsTable( SuperDsc &mySDsc, const int dscIdx, std::vector<PrimaryDimTypes> &dims, const bool isReuse) -> ScheduleDimTableType
-//   extract   : crustify-ddc/cpp/l3.cpp:3091-3196
-//   calls     : e007_scheduleDimTypeToString, e056_isIndexLds
+/// WHAT ENTRY 214 ADDITIONALLY ASKS OF A DSC'S TREE — its sync nodes, and the deletion that IS the
+/// unit's effect, on top of the transfer list and the loop walk entries 288 and 289 share.
+pub trait DscSyncSurgery: DscTrees + TransferNodes {
+    /// `traverseTreeDFSMutable(nullptr, {SYNC})` — every sync node of the DSC's tree, in DFS order.
+    fn syncs(&self, dsc: DscIdx) -> Vec<L3Sync>;
 
-// crustify:todo: e216_buildLoopOrder
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4377  (231 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : std::vector<PrimaryDimTypes> L3DlOpsScheduler::buildLoopOrder( SuperDsc &mySDsc, const int dscIdx, const std::vector<PrimaryDimTypes> &dims, const ScheduleDimTableType &schedDimTypesTable, const bool isReuse)
-//   extract   : crustify-ddc/cpp/l3.cpp:3206-3440
-//   calls     : e011_getLabeledDsWithDsType, e014_isLabeledDsLXNeighbor, e052_verifyLoopOrder, e056_isIndexLds, e059_getPagedDimensions, e138_swap
+    /// `node->getMutableParent()->deleteChildNode(&dsc, node)` (`dsc/dsc2.cpp:2085`).
+    fn delete_node(&mut self, dsc: DscIdx, node: NodeId);
+}
 
-// crustify:todo: e217_createChunkLoopNodes
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4612  (58 body lines, level 1)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::createChunkLoopNodes( SuperDsc &mySDsc, const std::vector<PrimaryDimTypes> &loopOrderInnerToOuter)
-//   extract   : crustify-ddc/cpp/l3.cpp:3450-3510
-//   calls     : e018_createLoopNode, e019_createBlockNode, e058_getNewDataStageIndex
+/// `DT_CHECK_MSG(units_.size() == 1, ..)` AND THE UNIT IT PROVES, as one answer.
+fn lone_sync_unit(units: &SyncUnits) -> Option<SenComponent> {
+    let mut walk = units.iter();
+    let only = walk.next()?;
+    walk.next().is_none().then_some(only)
+}
+
+/// Replaces: e214_optimizeHbmLdsOutputInScheduleTree
+///
+/// DROPS THE OUTPUT TENSOR'S HBM->LX LOAD, and the L3SU/L3LU sync pair guarding it, from every DSC
+/// whose enclosing loops each walk the output exactly once.
+///
+/// ⚠️ TRAP: `if (!ldsOutput.isHbmPinned()) return;` LEAVES THE WHOLE FUNCTION from inside the per-DSC
+/// loop, so a first DSC with an LX-resident output stops the later ones being optimised at all.
+/// ⚠️ AND `getNonBroadcastLdsDimSet` RUNS BEFORE the possibly-null load pointer is dereferenced.
+pub fn optimize_hbm_lds_output_in_schedule_tree<E: DscSyncSurgery + ?Sized>(
+    sdsc: &SuperDsc,
+    env: &mut E,
+) -> Option<()> {
+    for (config, index) in sdsc.dscs().iter().zip(0u32..) {
+        let dsc_idx = DscIdx(index);
+        env.root(dsc_idx)?;
+        let output = config.labeled_ds.back();
+        if !output.pinning().hbm() {
+            return Some(());
+        }
+        let output = output.recorded();
+        let load = env.transfers(dsc_idx).into_iter().find(|transfer| {
+            transfer.src == SenComponent::Hbm
+                && env.transfer_src_lds(dsc_idx, transfer.node) == Some(output)
+        });
+        let unrelated = config.non_broadcast_lds_dim_set(output)?;
+        let load = load?.node;
+        let tree = env.tree(dsc_idx)?;
+        let mut optimize = true;
+        'enclosing: for enclosing in parent_loop_nodes(tree, load) {
+            for walked in tree.loop_dims(enclosing).iter() {
+                if unrelated.contains(&walked.dim) {
+                    continue;
+                }
+                let count = trip_count(
+                    &config.data_stages,
+                    walked.dim,
+                    tree.loop_num(enclosing),
+                    tree.loop_den(enclosing),
+                )?;
+                if count.get() > 1 {
+                    optimize = false;
+                    break 'enclosing;
+                }
+            }
+        }
+        if !optimize {
+            continue;
+        }
+        env.delete_node(dsc_idx, load);
+        let mut doomed: Vec<NodeId> = Vec::new();
+        for sync in env.syncs(dsc_idx) {
+            let unit = lone_sync_unit(&sync.units)?;
+            (sync.other_ends.len() == 1).then_some(())?;
+            let other = lone_sync_unit(sync.other_ends.first()?)?;
+            if !matches!(
+                (unit, other),
+                (SenComponent::L3su, SenComponent::L3lu) | (SenComponent::L3lu, SenComponent::L3su)
+            ) {
+                continue;
+            }
+            ((unit == SenComponent::L3su && sync.direction == SyncDirection::Send)
+                || (unit == SenComponent::L3lu && sync.direction == SyncDirection::Receive))
+                .then_some(())?;
+            doomed.push(sync.node);
+        }
+        for node in doomed {
+            env.delete_node(dsc_idx, node);
+        }
+    }
+    Some(())
+}
+
+/// WHETHER THE DSC REUSES A DIM — `isReuse`, the [`has_dimension_reuse`] answer entries 215 and 216
+/// are HANDED rather than asked to recompute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimReuse {
+    /// `isReuse == false`.
+    Absent,
+    /// `isReuse == true`.
+    Present,
+}
+
+impl DimReuse {
+    /// The flag as [`has_dimension_reuse`] answers it.
+    #[must_use]
+    pub const fn of(reuse: bool) -> Self {
+        if reuse { Self::Present } else { Self::Absent }
+    }
+}
+
+/// ONE LABELLED DS'S DIM ROLES — `ScheduleDimMapType` (`L3DlOpsScheduler.h:95`), a `std::map` from
+/// role to the dims playing it.
+///
+/// ⛔ AN ABSENT KEY AND A PRESENT-BUT-EMPTY ONE ARE DIFFERENT ANSWERS: entry 215 inserts REUSE even
+/// when no dim is left over, and entry 216 gates whole blocks on `count(REUSE)` rather than on how
+/// many dims the entry holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduleDimMap(BTreeMap<ScheduleDimType, Vec<PrimaryDim>>);
+
+impl ScheduleDimMap {
+    /// `map.at(ty)`'s dims, EMPTY where the key is absent — the `count(ty) ? at(ty) : {}` its readers
+    /// spell out.
+    #[must_use]
+    pub fn dims(&self, ty: ScheduleDimType) -> &[PrimaryDim] {
+        self.0.get(&ty).map_or(&[], Vec::as_slice)
+    }
+
+    /// `map.count(ty)`, which is TRUE for a key holding no dims at all.
+    #[must_use]
+    pub fn states(&self, ty: ScheduleDimType) -> bool {
+        self.0.contains_key(&ty)
+    }
+
+    /// `map.count(ty) ? map.at(ty).push_back(dim) : map.emplace(ty, {dim})`.
+    pub fn push(&mut self, ty: ScheduleDimType, dim: PrimaryDim) {
+        self.0.entry(ty).or_default().push(dim);
+    }
+
+    /// `map.insert(make_pair(ty, dims))`, which KEEPS whatever the key already holds.
+    pub fn insert(&mut self, ty: ScheduleDimType, dims: Vec<PrimaryDim>) {
+        self.0.entry(ty).or_insert(dims);
+    }
+
+    /// `map.empty()`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// THE SCHEDULE DIMENSIONS TABLE — `ScheduleDimTableType` (`L3DlOpsScheduler.h:96`), keyed by the
+/// labelled DS index each role map belongs to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduleDimTable(BTreeMap<LdsIdx, ScheduleDimMap>);
+
+impl ScheduleDimTable {
+    /// `table.at(lds)`, [`None`] for that `.at()`'s throw.
+    #[must_use]
+    pub fn at(&self, lds: LdsIdx) -> Option<&ScheduleDimMap> {
+        self.0.get(&lds)
+    }
+
+    /// `table.empty()`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Replaces: e215_buildScheduleDimensionsTable
+///
+/// CLASSIFIES EVERY LAYOUT DIM OF EVERY VALUE TENSOR: a window-padded I/J, else its `scale_` — 1 is
+/// elementwise, below 1 a reduction on the output tensor and a broadcast elsewhere — plus, under
+/// reuse, the loop-order dims that tensor's own layout never named.
+///
+/// ⚠️ TRAP: KEYED BY THE ENTRY'S RECORDED `ldsIdx_` while the `labeledDs_.at()` beside it is
+/// POSITIONAL, and entry 216 reads the table back BY POSITION.
+pub fn build_schedule_dimensions_table<M: MemOrg + ?Sized>(
+    dsc: &DesignSpaceConfig,
+    orgs: &[&M],
+    dims: &[PrimaryDim],
+    reuse: DimReuse,
+) -> Option<ScheduleDimTable> {
+    let mut analyzed: Vec<LdsIdx> = Vec::new();
+    for (entry, org) in dsc.labeled_ds.iter().zip(orgs) {
+        if !is_index_lds(*org)? {
+            analyzed.push(entry.recorded());
+        }
+    }
+    let mut table = ScheduleDimTable::default();
+    for lds in &analyzed {
+        let entry = dsc.labeled_ds.at(*lds)?;
+        // `primaryDsInfo_.at(dsType_)` is read into an unused reference, and it still throws.
+        dsc.primary_ds_info.get(&entry.ds_type())?;
+        let reduced = if dsc.labeled_ds.is_output(*lds) {
+            ScheduleDimType::Reduction
+        } else {
+            ScheduleDimType::Broadcast
+        };
+        let mut roles = ScheduleDimMap::default();
+        let mut carried: BTreeSet<PrimaryDim> = BTreeSet::new();
+        for dim in dsc.layout_dims.get(lds)?.iter() {
+            let windowed = matches!(dim, PrimaryDim::I | PrimaryDim::J)
+                && dsc
+                    .full_padding
+                    .get(&dim)
+                    .is_some_and(|padding| padding.window_dim.is_some());
+            let role = if windowed {
+                ScheduleDimType::WindowPadded
+            } else {
+                match entry.scale(dim)? {
+                    // The `-1` and `-2` sentinels are both `scale_ < 1`.
+                    Scale::UnitStick | Scale::StickDim => reduced,
+                    Scale::Sized(scale) if scale < 1.0 => reduced,
+                    // `scale_ == 1`, stated without an equality on a float.
+                    Scale::Sized(scale) if scale <= 1.0 => ScheduleDimType::Elementwise,
+                    // `DT_ERROR("Invalid scale_ number")`, which a NaN also reaches.
+                    Scale::Sized(_) => return None,
+                }
+            };
+            roles.push(role, dim);
+            carried.insert(dim);
+        }
+        if reuse == DimReuse::Present {
+            roles.insert(
+                ScheduleDimType::Reuse,
+                dims.iter()
+                    .copied()
+                    .filter(|dim| !carried.contains(dim))
+                    .collect(),
+            );
+        }
+        (!roles.is_empty()).then_some(())?;
+        table.0.entry(*lds).or_insert(roles);
+    }
+    (table.0.len() == analyzed.len()).then_some(table)
+}
+
+/// `if (remainingDims.count(dim)) pushBackToLoopOrder(dim);`, which is every call site of it.
+fn place(dim: PrimaryDim, order: &mut Vec<PrimaryDim>, remaining: &mut BTreeSet<PrimaryDim>) {
+    if remaining.remove(&dim) {
+        order.push(dim);
+    }
+}
+
+/// `for (type : types) if (map.count(type)) for (dim : map.at(type)) push(dim);`.
+fn place_roles(
+    roles: &ScheduleDimMap,
+    types: &[ScheduleDimType],
+    order: &mut Vec<PrimaryDim>,
+    remaining: &mut BTreeSet<PrimaryDim>,
+) {
+    for ty in types {
+        for dim in roles.dims(*ty) {
+            place(*dim, order, remaining);
+        }
+    }
+}
+
+/// `for (dim : dims) for (target : targets) if (dim == target) push(dim);` — the double walk both
+/// kernel-reuse arms spell, which places a dim ONCE because the first placement clears it.
+fn place_shared(
+    dims: &[PrimaryDim],
+    targets: &[PrimaryDim],
+    order: &mut Vec<PrimaryDim>,
+    remaining: &mut BTreeSet<PrimaryDim>,
+) {
+    for dim in dims {
+        for target in targets {
+            if dim == target {
+                place(*dim, order, remaining);
+            }
+        }
+    }
+}
+
+/// Replaces: e216_buildLoopOrder
+///
+/// ORDERS THE CHUNK LOOP DIMS INNERMOST FIRST: the output tensor's reuse then reduction dims, each
+/// input's dims by the role priority its DS type and the reuse flag pick, every dim still unplaced in
+/// `labeledDs_` layout order, then an index tensor's stick dim swapped inside the paged dims.
+///
+/// ⚠️ TRAP: THE TABLE IS READ BY POSITION here (`schedDimTypesTable.at(ldsIdx)`) though entry 215
+/// keyed it by the RECORDED `ldsIdx_` — except for the output, which IS read by its recorded index.
+pub fn build_loop_order<M: MemOrg + ?Sized>(
+    sdsc: &SuperDsc,
+    dsc_idx: DscIdx,
+    orgs: &[&M],
+    dims: &[PrimaryDim],
+    table: &ScheduleDimTable,
+    reuse: DimReuse,
+) -> Option<LoopOrder> {
+    (!table.is_empty()).then_some(())?;
+    let dsc = sdsc.dscs().at(dsc_idx)?;
+    let mut order: Vec<PrimaryDim> = Vec::new();
+    let mut remaining: BTreeSet<PrimaryDim> = dims.iter().copied().collect();
+
+    // The output tensor first, by the index it RECORDS.
+    let output = dsc.labeled_ds.back();
+    if output.pinning().hbm() {
+        place_roles(
+            table.at(output.recorded())?,
+            &[ScheduleDimType::Reuse, ScheduleDimType::Reduction],
+            &mut order,
+            &mut remaining,
+        );
+    }
+
+    // Then the input tensors BY POSITION, the index tensors excluded.
+    let mut inputs: Vec<LdsIdx> = Vec::new();
+    for ((position, _), org) in dsc.labeled_ds.indexed().zip(orgs) {
+        if !dsc.labeled_ds.is_output(position) && !is_index_lds(*org)? {
+            inputs.push(position);
+        }
+    }
+    for position in inputs {
+        let lds = dsc.labeled_ds.at(position)?;
+        if reuse == DimReuse::Absent {
+            if lds.pinning().hbm() {
+                place_roles(
+                    table.at(position)?,
+                    &[ScheduleDimType::Broadcast, ScheduleDimType::WindowPadded],
+                    &mut order,
+                    &mut remaining,
+                );
+            }
+            continue;
+        }
+        if lds.ds_type() == DsType::Input
+            && (lds.pinning().hbm() || is_labeled_ds_lx_neighbor(sdsc, dsc_idx, lds)?)
+        {
+            let mut kernels: Vec<LdsIdx> = Vec::new();
+            labeled_ds_with_ds_type(dsc, DsType::Kernel, &mut kernels);
+            if let Some(kernel) = kernels.first().copied() {
+                (position == LdsIdx(0)).then_some(())?;
+                (kernels.len() == 1).then_some(())?;
+                let shared = table.at(kernel)?;
+                if shared.states(ScheduleDimType::Reuse) {
+                    let targets = shared.dims(ScheduleDimType::Reuse);
+                    let roles = table.at(position)?;
+                    for ty in [ScheduleDimType::WindowPadded, ScheduleDimType::Elementwise] {
+                        place_shared(roles.dims(ty), targets, &mut order, &mut remaining);
+                    }
+                    let layout: Vec<PrimaryDim> = dsc.layout_dims.get(&position)?.iter().collect();
+                    place_shared(&layout, targets, &mut order, &mut remaining);
+                    for dim in &layout {
+                        place(*dim, &mut order, &mut remaining);
+                    }
+                }
+            } else {
+                place_roles(
+                    table.at(position)?,
+                    &[ScheduleDimType::Broadcast, ScheduleDimType::WindowPadded],
+                    &mut order,
+                    &mut remaining,
+                );
+            }
+        } else if lds.ds_type() == DsType::Kernel && lds.pinning().hbm() {
+            let mut sources: Vec<LdsIdx> = Vec::new();
+            labeled_ds_with_ds_type(dsc, DsType::Input, &mut sources);
+            (sources.len() <= 1).then_some(())?;
+            if let Some(source) = sources.first().copied() {
+                let shared = table.at(source)?;
+                if shared.states(ScheduleDimType::Reuse) {
+                    let targets = shared.dims(ScheduleDimType::Reuse);
+                    let layout: Vec<PrimaryDim> = dsc.layout_dims.get(&position)?.iter().collect();
+                    place_shared(&layout, targets, &mut order, &mut remaining);
+                    for dim in &layout {
+                        place(*dim, &mut order, &mut remaining);
+                    }
+                }
+            }
+        } else if matches!(lds.ds_type(), DsType::Output | DsType::KernelIdx) && lds.pinning().hbm()
+        {
+            place_roles(
+                table.at(position)?,
+                &[ScheduleDimType::Reuse, ScheduleDimType::Broadcast],
+                &mut order,
+                &mut remaining,
+            );
+        }
+    }
+
+    // Whatever is left, in `labeledDs_` order with the index structures last — and pushing each
+    // entry's RECORDED index, exactly as entry 047 does.
+    let mut lds_order: Vec<LdsIdx> = Vec::new();
+    let mut low_priority: Vec<LdsIdx> = Vec::new();
+    for (position, entry) in dsc.labeled_ds.indexed() {
+        if dsc.indirect_access_index_lds.contains(&position) {
+            low_priority.push(entry.recorded());
+        } else {
+            lds_order.push(entry.recorded());
+        }
+    }
+    lds_order.append(&mut low_priority);
+    for lds in lds_order {
+        if remaining.is_empty() {
+            break;
+        }
+        for dim in dsc.layout_dims.get(&lds)?.iter() {
+            place(dim, &mut order, &mut remaining);
+        }
+    }
+
+    // An index tensor's stick dim must sit inside every paged dim, so the outermost paged dim below
+    // it trades places with it.
+    let paged = get_paged_dimensions(orgs);
+    if paged.len() > 1 {
+        for ((position, _), org) in dsc.labeled_ds.indexed().zip(orgs) {
+            if dsc.labeled_ds.is_output(position) || !is_index_lds(*org)? {
+                continue;
+            }
+            let sticks = dsc.stick_dims(position)?;
+            (sticks.len() == 1).then_some(())?;
+            let stick = *sticks.first()?;
+            let at = order.iter().position(|dim| *dim == stick)?;
+            for below in 0..at {
+                if order.get(below).is_some_and(|dim| paged.contains(dim)) {
+                    order.swap(below, at);
+                    break;
+                }
+            }
+        }
+    }
+    remaining.is_empty().then_some(())?;
+    LoopOrder::of(&order)
+}
+
+/// WHAT ENTRY 217 DOES TO THE SUPER-DSC — mints the chunk loop nest into every DSC's schedule tree,
+/// which is the whole effect of the unit.
+pub trait ChunkLoopNest {
+    /// `for (dscIdx = 0; dscIdx < mySDsc.dscs_.size(); ++dscIdx)`.
+    fn dscs(&self) -> Vec<DscIdx>;
+
+    /// [`CoreWindowDims::of_l3`] of that DSC, which `createLoopNode` takes its window dims from.
+    fn core_window_dims(&self, dsc: DscIdx) -> Option<CoreWindowDims>;
+
+    /// `dsc.scheduleTree_.getHeadMutable()->denId_ = den`.
+    fn set_head_den(&mut self, dsc: DscIdx, den: DatastageId) -> Option<()>;
+
+    /// `dsc.scheduleTree_.getHeadMutable()` — the node the whole chain hangs from.
+    fn head(&self, dsc: DscIdx) -> Option<NodeId>;
+
+    /// `getNewDataStageIndex(mySDsc, dsc)` NAMING THE ENTRY IT DEFAULT-INSERTS.
+    fn mint_super_chunk_stage(&mut self, dsc: DscIdx) -> Option<SuperChunkStage>;
+
+    /// `currNode->addChildNode(loopNode)`, answering with the child so the next level chains from it.
+    fn add_loop(&mut self, dsc: DscIdx, parent: NodeId, node: LoopNode) -> Option<NodeId>;
+
+    /// `currNode->addChildNode(dummyBlockNode)`.
+    fn add_block(&mut self, dsc: DscIdx, parent: NodeId, node: BlockNode) -> Option<NodeId>;
+}
+
+/// Replaces: e217_createChunkLoopNodes
+///
+/// CHAINS THE CHUNK LOOP NEST UNDER EVERY DSC'S ROOT — one loop per order dim, OUTERMOST FIRST,
+/// per data-stage band, closed by an `lx_below_schedule` block; the root's own `denId_` becomes
+/// the core stage, the field `scheduleTreeHeadDenId_` serialises (`dsc/dsc2.cpp:368`).
+///
+/// ⭐ THE SUPERCHUNK STAGE IS MINTED ONCE BEFORE THE DSC WALK, not inside it under
+/// `dataStageSuperChunkIdx == -1`: same effect, and it fuses the answer into [`LxBuffering`].
+pub fn create_chunk_loop_nodes<T: ChunkLoopNest + ?Sized>(
+    nest: &mut T,
+    order: &LoopOrder,
+    choice: LxBufferChoice,
+) -> Option<LxBuffering> {
+    let dscs = nest.dscs();
+    // "Expect valid loop order." — an order that names no dim at all.
+    order.dims().first()?;
+    let buffering = match choice {
+        LxBufferChoice::Double => LxBuffering::Double,
+        LxBufferChoice::SpatialDouble => {
+            LxBuffering::SpatialDouble(nest.mint_super_chunk_stage(*dscs.first()?)?)
+        }
+    };
+    let bands: Vec<(DatastageId, DatastageId)> = match buffering {
+        LxBuffering::Double => vec![(DATA_STAGE_CORE, DATA_STAGE_CHUNK)],
+        LxBuffering::SpatialDouble(stage) => vec![
+            (DATA_STAGE_CORE, stage.index()),
+            (stage.index(), DATA_STAGE_CHUNK),
+        ],
+    };
+    for dsc in dscs {
+        nest.set_head_den(dsc, DATA_STAGE_CORE)?;
+        let core = nest.core_window_dims(dsc)?;
+        let mut curr = nest.head(dsc)?;
+        for &(num, den) in &bands {
+            for dim in order.dims().iter().rev().copied() {
+                let name = NodeName(format!("loop_ds{}_ds{}_{}", num.0, den.0, dim.spelling()));
+                let node = create_loop_node(&core, dim, &[], num, den, name);
+                curr = nest.add_loop(dsc, curr, node)?;
+            }
+        }
+        let block = create_block_node(NodeName(LX_BELOW_BLOCK_NODE_NAME.to_owned()));
+        nest.add_block(dsc, curr, block)?;
+    }
+    Some(buffering)
+}
+
+#[cfg(test)]
+mod tests_e213_e217 {
+    // ⭐ TESTS FOR ENTRIES 213-217, PLUS ENTRY 290, which is the one caller that composes 215, 216
+    // and 217 and so needs exactly these stubs.
+    use super::*;
+
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
+    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, DataStage, DscList, LabeledDsList, PrimaryDsInfo, StageDims,
+    };
+
+    fn dims(extents: &[(PrimaryDim, i64)]) -> FilledDims {
+        let mut stage = StageDims::default();
+        for &(dim, extent) in extents {
+            stage.extents.insert(dim, Extent(extent));
+        }
+        FilledDims::of(stage).expect("a stage that states a dim")
+    }
+
+    fn stage(name: &str, extents: &[(PrimaryDim, i64)]) -> DataStage {
+        let name = StageName(name.to_owned());
+        DataStage {
+            ss: NamedDims {
+                name: name.clone(),
+                dims: dims(extents),
+            },
+            el: NamedDims {
+                name,
+                dims: dims(extents),
+            },
+        }
+    }
+
+    /// A primary data structure laying out the dims given, outermost first, on a one-element stick.
+    fn layout(dims: &[PrimaryDim]) -> PrimaryDsInfo {
+        let (first, rest) = dims.split_first().expect("a layout with a dim in it");
+        PrimaryDsInfo {
+            layout: LayoutDims::new(*first, rest.to_vec()),
+            stick: StickDims::default(),
+        }
+    }
+
+    /// `memOrg_.at(HBM).isPresent` — what makes a tensor transferred rather than resident.
+    fn hbm() -> Pinning {
+        Pinning {
+            mem_org: BTreeMap::from([(SenComponent::Hbm, true)]),
+            lx: false,
+            lx_padded: false,
+        }
+    }
+
+    fn labeled(ds_type: DsType, recorded: LdsIdx, scales: &[(PrimaryDim, f64)]) -> LabeledDs {
+        LabeledDs::new(
+            ds_type,
+            scales
+                .iter()
+                .map(|&(dim, scale)| (dim, Scale::Sized(scale)))
+                .collect(),
+            recorded,
+            hbm(),
+        )
+    }
+
+    fn a_dsc(core: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
+        DesignSpaceConfig {
+            gtr_ids_used: BTreeSet::new(),
+            corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: Some(CoreletsUsed::ONE),
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), vec![]),
+            layout_dims: BTreeMap::new(),
+            labeled_ds: LabeledDsList::new(
+                labeled(DsType::Output, LdsIdx(0), &[(PrimaryDim::I, 1.0)]),
+                vec![],
+            ),
+            data_stages: L3DataStages::new(stage("core", core), stage("chunk", chunk)),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+            full_padding: BTreeMap::new(),
+        }
+    }
+
+    /// THE VENDOR'S THREE-TENSOR BATCH MATMUL — `inp(mb,ki,i) x ker(mb,ki,j) -> out(mb,i,j)`, whose
+    /// output reduces along `j`, and which [`has_dimension_reuse`] answers `true` for.
+    fn a_bmm() -> DesignSpaceConfig {
+        let mut dsc = a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 1)]);
+        dsc.labeled_ds = LabeledDsList::new(
+            labeled(
+                DsType::Input,
+                LdsIdx(0),
+                &[
+                    (PrimaryDim::Mb, 1.0),
+                    (PrimaryDim::Ki, 1.0),
+                    (PrimaryDim::I, 1.0),
+                ],
+            ),
+            vec![
+                labeled(
+                    DsType::Kernel,
+                    LdsIdx(1),
+                    &[
+                        (PrimaryDim::Mb, 1.0),
+                        (PrimaryDim::Ki, 1.0),
+                        (PrimaryDim::J, 1.0),
+                    ],
+                ),
+                labeled(
+                    DsType::Output,
+                    LdsIdx(2),
+                    &[
+                        (PrimaryDim::Mb, 1.0),
+                        (PrimaryDim::I, 1.0),
+                        (PrimaryDim::J, 0.5),
+                    ],
+                ),
+            ],
+        );
+        for (ds_type, order) in [
+            (
+                DsType::Input,
+                [PrimaryDim::Mb, PrimaryDim::Ki, PrimaryDim::I],
+            ),
+            (
+                DsType::Kernel,
+                [PrimaryDim::Mb, PrimaryDim::Ki, PrimaryDim::J],
+            ),
+            (
+                DsType::Output,
+                [PrimaryDim::Mb, PrimaryDim::I, PrimaryDim::J],
+            ),
+        ] {
+            dsc.primary_ds_info.insert(ds_type, layout(&order));
+        }
+        for (lds, order) in [
+            (LdsIdx(0), [PrimaryDim::Mb, PrimaryDim::Ki, PrimaryDim::I]),
+            (LdsIdx(1), [PrimaryDim::Mb, PrimaryDim::Ki, PrimaryDim::J]),
+            (LdsIdx(2), [PrimaryDim::Mb, PrimaryDim::I, PrimaryDim::J]),
+        ] {
+            let (first, rest) = order.split_first().expect("a layout with a dim in it");
+            dsc.layout_dims
+                .insert(lds, LayoutDims::new(*first, rest.to_vec()));
+        }
+        dsc
+    }
+
+    fn a_sdsc(dsc: DesignSpaceConfig) -> SuperDsc {
+        SuperDsc::new(
+            DscList::new(dsc, vec![]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    }
+
+    /// A labelled DS's `memOrg_` that indirects through nothing, which is every tensor here.
+    struct Org;
+
+    impl MemOrg for Org {
+        fn hbm_pinned(&self) -> bool {
+            true
+        }
+
+        fn lx_buffering(&self) -> Option<Buffering> {
+            None
+        }
+
+        fn lx_start_address(&self, _at: &AddressCoord) -> Option<ByteAddress> {
+            None
+        }
+
+        fn lx_buffer_offset(&self, _core: Core, _corelet: Corelet) -> Option<BufferOffset> {
+            None
+        }
+
+        fn hbm_indirection(&self) -> Option<IndirectAlloc> {
+            None
+        }
+
+        fn hbm_allocation(&self) -> Option<NodeName> {
+            None
+        }
+
+        fn hbm_layout_dims(&self) -> Option<LayoutDims> {
+            None
+        }
+
+        fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>> {
+            None
+        }
+
+        fn lx_padding(&self) -> Option<PaddingForm> {
+            None
+        }
+
+        fn lx_page_sizes(&self) -> BTreeMap<PrimaryDim, Extent> {
+            BTreeMap::new()
+        }
+
+        fn hbm_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
+        }
+
+        fn lx_alloc_users(&self) -> Option<Vec<NodeId>> {
+            None
+        }
+
+        fn lx_zero_padded(&self) -> Option<bool> {
+            Some(false)
+        }
+    }
+
+    /// The kinds of node entry 214 walks.
+    #[derive(Debug, Clone)]
+    enum Kind {
+        Block,
+        Loop(LoopNode),
+        Transfer,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Entry {
+        parent: Option<NodeId>,
+        children: Vec<NodeId>,
+        kind: Kind,
+    }
+
+    /// ONE DSC'S SCHEDULE TREE BY NODE ID, plus the transfer sources, the sync ends and the deletion
+    /// log entry 214 is judged by.
+    #[derive(Debug, Default)]
+    struct Env {
+        nodes: BTreeMap<NodeId, Entry>,
+        next: u32,
+        head: Option<NodeId>,
+        transfers: Vec<L3Transfer>,
+        src_lds: BTreeMap<NodeId, LdsIdx>,
+        syncs: Vec<L3Sync>,
+        deleted: Vec<NodeId>,
+    }
+
+    impl Env {
+        fn add(&mut self, kind: Kind, parent: Option<NodeId>) -> NodeId {
+            let id = NodeId(self.next);
+            self.next += 1;
+            self.nodes.insert(
+                id,
+                Entry {
+                    parent,
+                    children: Vec::new(),
+                    kind,
+                },
+            );
+            if let Some(parent) = parent {
+                self.nodes
+                    .get_mut(&parent)
+                    .expect("parent exists")
+                    .children
+                    .push(id);
+            }
+            id
+        }
+
+        fn root_block(&mut self) -> NodeId {
+            let id = self.add(Kind::Block, None);
+            self.head = Some(id);
+            id
+        }
+
+        fn loop_over(&mut self, dim: PrimaryDim, parent: NodeId) -> NodeId {
+            let node = create_loop_node(
+                &CoreWindowDims(BTreeSet::new()),
+                dim,
+                &[],
+                DATA_STAGE_CORE,
+                DATA_STAGE_CHUNK,
+                NodeName(format!("loop_{}", dim.spelling())),
+            );
+            self.add(Kind::Loop(node), Some(parent))
+        }
+
+        /// A transfer out of HBM whose source is the labelled DS given.
+        fn load(&mut self, parent: NodeId, src: LdsIdx) -> NodeId {
+            let id = self.add(Kind::Transfer, Some(parent));
+            self.src_lds.insert(id, src);
+            self.transfers.push(L3Transfer {
+                node: id,
+                name: NodeName("transfer_hbm_to_lx".to_owned()),
+                src: SenComponent::Hbm,
+                dst: SenComponent::Lx,
+            });
+            id
+        }
+
+        fn sync(&mut self, unit: SenComponent, direction: SyncDirection, other: SenComponent) {
+            let node = self.add(Kind::Block, self.head);
+            self.syncs.push(L3Sync {
+                node,
+                units: SyncUnits::new(unit, []),
+                direction,
+                other_ends: vec![SyncUnits::new(other, [])],
+            });
+        }
+
+        fn minted(&self, node: LoopId) -> &LoopNode {
+            match &self.nodes[&node.0].kind {
+                Kind::Loop(node) => node,
+                other => panic!("not a loop: {other:?}"),
+            }
+        }
+    }
+
+    impl NodeParents for Env {
+        fn parent(&self, node: NodeId) -> Option<NodeId> {
+            self.nodes[&node].parent
+        }
+
+        fn children(&self, parent: NodeId) -> Vec<NodeId> {
+            self.nodes[&parent].children.clone()
+        }
+    }
+
+    impl LoopNesting for Env {
+        fn owner_loop(&self, node: NodeId) -> Option<LoopId> {
+            let mut current = self.nodes[&node].parent;
+            while let Some(candidate) = current {
+                if matches!(self.nodes[&candidate].kind, Kind::Loop(_)) {
+                    return Some(LoopId(candidate));
+                }
+                current = self.nodes[&candidate].parent;
+            }
+            None
+        }
+
+        fn has_parent(&self, node: LoopId) -> bool {
+            self.nodes[&node.0].parent.is_some()
+        }
+    }
+
+    impl LoopStages for Env {
+        fn loop_num(&self, loop_node: LoopId) -> DatastageId {
+            self.minted(loop_node).num
+        }
+
+        fn loop_den(&self, loop_node: LoopId) -> DatastageId {
+            self.minted(loop_node).den
+        }
+
+        fn loop_dims(&self, loop_node: LoopId) -> LoopDims {
+            self.minted(loop_node).dims.clone()
+        }
+    }
+
+    impl DscTrees for Env {
+        type Tree = Self;
+
+        fn tree(&self, _dsc: DscIdx) -> Option<&Self> {
+            Some(self)
+        }
+
+        fn root(&self, _dsc: DscIdx) -> Option<NodeId> {
+            self.head
+        }
+
+        fn lx_below_block(&self, _dsc: DscIdx) -> Option<NodeId> {
+            None
+        }
+
+        fn allocation(&self, _dsc: DscIdx, _lds: LdsIdx, _storage: SenComponent) -> Option<NodeId> {
+            None
+        }
+
+        fn transfer_src_lds(&self, _dsc: DscIdx, node: NodeId) -> Option<LdsIdx> {
+            self.src_lds.get(&node).copied()
+        }
+
+        fn transfer_dst_is_lds(&self, _dsc: DscIdx, _node: NodeId) -> bool {
+            true
+        }
+    }
+
+    impl TransferNodes for Env {
+        fn transfers(&self, _dsc: DscIdx) -> Vec<L3Transfer> {
+            self.transfers.clone()
+        }
+    }
+
+    impl DscSyncSurgery for Env {
+        fn syncs(&self, _dsc: DscIdx) -> Vec<L3Sync> {
+            self.syncs.clone()
+        }
+
+        fn delete_node(&mut self, _dsc: DscIdx, node: NodeId) {
+            self.deleted.push(node);
+        }
+    }
+
+    /// EVERY DSC'S CHUNK LOOP NEST AS ENTRY 217 CHAINS IT — one `(dsc, parent, child, name)` row per
+    /// linked node, in the order they were linked.
+    #[derive(Debug)]
+    struct Nest {
+        dscs: Vec<DscIdx>,
+        next: u32,
+        heads: BTreeMap<DscIdx, NodeId>,
+        head_dens: BTreeMap<DscIdx, DatastageId>,
+        chain: Vec<(DscIdx, NodeId, NodeId, NodeName)>,
+        stages: L3DataStages,
+    }
+
+    impl Nest {
+        fn new(dscs: &[DscIdx]) -> Self {
+            let mut nest = Self {
+                dscs: dscs.to_vec(),
+                next: 0,
+                heads: BTreeMap::new(),
+                head_dens: BTreeMap::new(),
+                chain: Vec::new(),
+                stages: L3DataStages::new(
+                    stage("core", &[(PrimaryDim::I, 8)]),
+                    stage("chunk", &[(PrimaryDim::I, 1)]),
+                ),
+            };
+            for dsc in dscs {
+                let head = NodeId(nest.next);
+                nest.next += 1;
+                nest.heads.insert(*dsc, head);
+            }
+            nest
+        }
+
+        fn link(&mut self, dsc: DscIdx, parent: NodeId, name: NodeName) -> Option<NodeId> {
+            let id = NodeId(self.next);
+            self.next += 1;
+            self.chain.push((dsc, parent, id, name));
+            Some(id)
+        }
+
+        /// The chained node names under one DSC's root, outermost first, PROVED to form one chain.
+        fn chained(&self, dsc: DscIdx) -> Vec<String> {
+            let rows: Vec<&(DscIdx, NodeId, NodeId, NodeName)> =
+                self.chain.iter().filter(|row| row.0 == dsc).collect();
+            let mut expected = self.heads[&dsc];
+            for row in &rows {
+                assert_eq!(row.1, expected, "each level hangs from the one above it");
+                expected = row.2;
+            }
+            rows.iter().map(|row| row.3.0.clone()).collect()
+        }
+    }
+
+    impl ChunkLoopNest for Nest {
+        fn dscs(&self) -> Vec<DscIdx> {
+            self.dscs.clone()
+        }
+
+        fn core_window_dims(&self, _dsc: DscIdx) -> Option<CoreWindowDims> {
+            Some(CoreWindowDims(BTreeSet::new()))
+        }
+
+        fn set_head_den(&mut self, dsc: DscIdx, den: DatastageId) -> Option<()> {
+            self.head_dens.insert(dsc, den);
+            Some(())
+        }
+
+        fn head(&self, dsc: DscIdx) -> Option<NodeId> {
+            self.heads.get(&dsc).copied()
+        }
+
+        fn mint_super_chunk_stage(&mut self, _dsc: DscIdx) -> Option<SuperChunkStage> {
+            let index = self.stages.next_index();
+            self.stages
+                .set(index, stage("super_chunk", &[(PrimaryDim::I, 4)]));
+            self.stages.super_chunk(index)
+        }
+
+        fn add_loop(&mut self, dsc: DscIdx, parent: NodeId, node: LoopNode) -> Option<NodeId> {
+            self.link(dsc, parent, node.name)
+        }
+
+        fn add_block(&mut self, dsc: DscIdx, parent: NodeId, node: BlockNode) -> Option<NodeId> {
+            self.link(dsc, parent, node.name)
+        }
+    }
+
+    /// e213 — THE EMISSION: the soft pair lands after the node named, cross-linked, and the `soft_`
+    /// sits between `sync_` and the end.
+    #[test]
+    fn the_soft_sync_sequence_adds_two_cross_linked_soft_nodes() {
+        let mut parent = BlockNode {
+            name: NodeName("block".to_owned()),
+            children: vec![SchedNode::Leaf(NodeName("transfer".to_owned()))],
+        };
+        let at = parent
+            .child_pos(&NodeName("transfer".to_owned()))
+            .expect("the child the sequence is added after");
+        add_l3_lu_and_lx_lu_soft_sync_node_sequence(&mut parent, at);
+        let names: Vec<&str> = parent
+            .children
+            .iter()
+            .map(|child| child.name().0.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "transfer",
+                "sync_soft_send_l3lu_to_lxlu",
+                "sync_soft_receive_lxlu_from_l3lu",
+            ]
+        );
+        let SchedNode::Sync(send) = &parent.children[1] else {
+            panic!("the sequence adds sync nodes");
+        };
+        assert_eq!(send.direction, SyncDirection::Send);
+        assert_eq!(send.strength, SyncStrength::Soft);
+        assert_eq!(
+            send.other_ends,
+            vec![NodeName("sync_soft_receive_lxlu_from_l3lu".to_owned())]
+        );
+        assert_eq!(
+            send.units.iter().collect::<Vec<_>>(),
+            vec![SenComponent::L3lu]
+        );
+    }
+
+    /// e214 — THE EMISSION: the load and the L3SU/L3LU pair guarding it are deleted, while a loop the
+    /// output does depend on and an LXLU sync are left alone.
+    #[test]
+    fn the_hbm_output_load_and_its_l3_sync_pair_are_deleted() {
+        let mut dsc = a_dsc(
+            &[(PrimaryDim::I, 8), (PrimaryDim::Mb, 1)],
+            &[(PrimaryDim::I, 1), (PrimaryDim::Mb, 1)],
+        );
+        dsc.primary_ds_info
+            .insert(DsType::Output, layout(&[PrimaryDim::I]));
+        let sdsc = a_sdsc(dsc);
+        let mut env = Env::default();
+        let root = env.root_block();
+        let outer = env.loop_over(PrimaryDim::Mb, root);
+        let inner = env.loop_over(PrimaryDim::I, outer);
+        let load = env.load(inner, LdsIdx(0));
+        env.sync(SenComponent::L3su, SyncDirection::Send, SenComponent::L3lu);
+        env.sync(
+            SenComponent::L3lu,
+            SyncDirection::Receive,
+            SenComponent::L3su,
+        );
+        env.sync(SenComponent::Lxlu, SyncDirection::Send, SenComponent::L3lu);
+        let doomed_syncs: Vec<NodeId> = env.syncs[..2].iter().map(|sync| sync.node).collect();
+        assert_eq!(
+            optimize_hbm_lds_output_in_schedule_tree(&sdsc, &mut env),
+            Some(())
+        );
+        let mut expected = vec![load];
+        expected.extend(doomed_syncs);
+        assert_eq!(env.deleted, expected);
+    }
+
+    /// e215 — the vendor's batch matmul: every layout dim takes its role, the reducing `j` becomes a
+    /// REDUCTION on the output alone, and each tensor's REUSE entry is the dims its layout omits.
+    #[test]
+    fn the_schedule_dimensions_table_states_a_role_per_layout_dim() {
+        let dsc = a_bmm();
+        let orgs: Vec<&Org> = vec![&Org, &Org, &Org];
+        let order = collect_all_dimensions_for_loop_order(&dsc).expect("the loop order dims");
+        assert_eq!(
+            order,
+            vec![PrimaryDim::Mb, PrimaryDim::Ki, PrimaryDim::I, PrimaryDim::J]
+        );
+        let table = build_schedule_dimensions_table(&dsc, &orgs, &order, DimReuse::Present)
+            .expect("a role for every dim of every tensor");
+        let roles = |lds: LdsIdx, ty: ScheduleDimType| {
+            table
+                .at(lds)
+                .map(|map| map.dims(ty).to_vec())
+                .expect("a table entry per analysed tensor")
+        };
+        assert_eq!(
+            roles(LdsIdx(0), ScheduleDimType::Elementwise),
+            vec![PrimaryDim::Mb, PrimaryDim::Ki, PrimaryDim::I]
+        );
+        assert_eq!(
+            roles(LdsIdx(0), ScheduleDimType::Reuse),
+            vec![PrimaryDim::J]
+        );
+        assert_eq!(
+            roles(LdsIdx(1), ScheduleDimType::Reuse),
+            vec![PrimaryDim::I]
+        );
+        assert_eq!(
+            roles(LdsIdx(2), ScheduleDimType::Elementwise),
+            vec![PrimaryDim::Mb, PrimaryDim::I]
+        );
+        assert_eq!(
+            roles(LdsIdx(2), ScheduleDimType::Reduction),
+            vec![PrimaryDim::J]
+        );
+        assert_eq!(
+            roles(LdsIdx(2), ScheduleDimType::Reuse),
+            vec![PrimaryDim::Ki]
+        );
+    }
+
+    /// e216 — the output's reuse then reduction dims come first, then the input's elementwise dims
+    /// that the kernel reuses, then whatever is left in layout order.
+    #[test]
+    fn the_loop_order_runs_output_reuse_first_and_placement_once_per_dim() {
+        let dsc = a_bmm();
+        let orgs: Vec<&Org> = vec![&Org, &Org, &Org];
+        let order = collect_all_dimensions_for_loop_order(&dsc).expect("the loop order dims");
+        let table = build_schedule_dimensions_table(&dsc, &orgs, &order, DimReuse::Present)
+            .expect("a role for every dim of every tensor");
+        let sdsc = a_sdsc(dsc);
+        let built = build_loop_order(&sdsc, DscIdx(0), &orgs, &order, &table, DimReuse::Present)
+            .expect("every dim placed exactly once");
+        assert_eq!(
+            built.dims(),
+            [PrimaryDim::Ki, PrimaryDim::J, PrimaryDim::I, PrimaryDim::Mb]
+        );
+    }
+
+    /// e217 — THE EMISSION: spatial double buffering chains two bands of loops, OUTERMOST FIRST, per
+    /// DSC, closed by the `lx_below_schedule` block, and every root's `denId_` becomes the core stage.
+    #[test]
+    fn the_chunk_loop_nest_chains_one_band_per_data_stage_pair() {
+        let order = LoopOrder::of(&[PrimaryDim::I, PrimaryDim::J]).expect("a good loop order");
+        let mut nest = Nest::new(&[DscIdx(0), DscIdx(1)]);
+        let buffering = create_chunk_loop_nodes(&mut nest, &order, LxBufferChoice::SpatialDouble);
+        assert_eq!(
+            buffering,
+            Some(LxBuffering::SpatialDouble(
+                nest.stages
+                    .super_chunk(DatastageId(2))
+                    .expect("the minted superchunk stage")
+            ))
+        );
+        assert_eq!(
+            nest.chained(DscIdx(0)),
+            vec![
+                "loop_ds0_ds2_j",
+                "loop_ds0_ds2_i",
+                "loop_ds2_ds1_j",
+                "loop_ds2_ds1_i",
+                "lx_below_schedule",
+            ]
+        );
+        assert_eq!(nest.chained(DscIdx(1)).len(), 5);
+        assert_eq!(
+            nest.head_dens,
+            BTreeMap::from([(DscIdx(0), DATA_STAGE_CORE), (DscIdx(1), DATA_STAGE_CORE)])
+        );
+    }
+
+    /// e290 — the whole chain: the batch matmul's loop order becomes the chunk loop nest, outermost
+    /// first, under double buffering.
+    #[test]
+    fn creating_the_chunk_loops_nests_the_bmm_loop_order() {
+        let orgs: Vec<&Org> = vec![&Org, &Org, &Org];
+        let sdsc = a_sdsc(a_bmm());
+        let mut nest = Nest::new(&[DscIdx(0)]);
+        assert_eq!(
+            create_chunk_loops(&sdsc, &orgs, &mut nest, LxBufferChoice::Double),
+            Some(LxBuffering::Double)
+        );
+        assert_eq!(
+            nest.chained(DscIdx(0)),
+            vec![
+                "loop_ds0_ds1_mb",
+                "loop_ds0_ds1_i",
+                "loop_ds0_ds1_j",
+                "loop_ds0_ds1_ki",
+                "lx_below_schedule",
+            ]
+        );
+    }
+}
 
 /// ONE PARENT LOOP WHOSE TRIP COUNT DIFFERS BETWEEN DSCs — the `{loopNode, dim, currTripCount,
 /// otherTripCount}` tuple entry 291 builds and entry 218 conditions on.
@@ -11450,16 +12642,6 @@ impl<E: DscTreeSurgery + ?Sized> SyncInsertion for DscSyncs<'_, E> {
     }
 }
 
-/// `addL3LUAndLXLUSoftSyncNodeSequence(at)` — ENTRY 213, WHICH THIS BATCH DOES NOT SCHEDULE. Its
-/// anchor is still open in this file and its body is a SOFT L3LU/LXLU pair, so a second spelling here
-/// would be a second answer to that unit.
-fn add_l3_lu_and_lx_lu_soft_sync_node_sequence<I: SyncInsertion + ?Sized>(
-    _tree: &mut I,
-    _at: I::At,
-) {
-    todo!("e213_addL3LUAndLXLUSoftSyncNodeSequence is not scheduled in this batch")
-}
-
 /// `allocNode->allocUsers_` RESTRICTED TO ITS TRANSFER USERS running `src` to `dst`, in the tree's own
 /// DFS order — the walk entry 288 writes out five times over.
 fn alloc_user_transfers<T: TransferNodes + ?Sized>(
@@ -11721,6 +12903,7 @@ fn add_output_store_sync_nodes<E: DscTreeSurgery + ?Sized>(
         SenComponent::Lxsu,
         SenComponent::L3su,
         "",
+        "",
         SyncStrength::Hard,
     );
     env.insert_sync(dsc_idx, send, InsertionPoint::Before(store));
@@ -11728,6 +12911,7 @@ fn add_output_store_sync_nodes<E: DscTreeSurgery + ?Sized>(
     let (send, receive) = sync_pair(
         SenComponent::L3su,
         SenComponent::Lxsu,
+        "",
         "",
         SyncStrength::Hard,
     );
@@ -11756,6 +12940,7 @@ fn add_output_load_sync_nodes<E: DscTreeSurgery + ?Sized>(
         SenComponent::L3su,
         SenComponent::L3lu,
         "",
+        "",
         SyncStrength::Hard,
     );
     let lds = env.transfer_src_lds(dsc_idx, load)?;
@@ -11769,6 +12954,7 @@ fn add_output_load_sync_nodes<E: DscTreeSurgery + ?Sized>(
         let (send, receive) = sync_pair(
             SenComponent::L3su,
             SenComponent::L3lu,
+            "",
             &format!("_outermost_{outermost}"),
             SyncStrength::Hard,
         );
@@ -11866,26 +13052,29 @@ where
 /// BUILDS THE CHUNK LOOP NEST from DSC 0's loop order — the group's DSCs share one order and one set
 /// of transfers, so the first DSC decides both and each DSC's own chunk parameters then size the nest.
 ///
-/// ⛔ `if (dsc.labeledDs_.size() < 1) return;` IS UNSPELLABLE: [`LabeledDsList`] is non-empty by
-/// construction.
-/// ⛔ THREE OF ITS FIVE CALLEES ARE NOT SCHEDULED IN THIS BATCH — entries 215, 216 and 217, whose
-/// anchors are still open in this file — and they are what mints the loop nodes, so the nest cannot be
-/// stated here without a second answer to each of them.
-pub fn create_chunk_loops(sdsc: &SuperDsc) -> Option<()> {
+/// ⛔ `if (dsc.labeledDs_.size() < 1) return;` IS UNSPELLABLE, and so is the commented-out block
+/// beside it that would have hung a bare `lx_below_schedule` off an empty DSC's root:
+/// [`LabeledDsList`] is non-empty by construction.
+pub fn create_chunk_loops<M: MemOrg + ?Sized, T: ChunkLoopNest + ?Sized>(
+    sdsc: &SuperDsc,
+    orgs: &[&M],
+    nest: &mut T,
+    choice: LxBufferChoice,
+) -> Option<LxBuffering> {
+    const MAIN: DscIdx = DscIdx(0);
     let main = sdsc.dscs().first();
-    let _reuse = has_dimension_reuse(main);
-    let _loop_order_dims = collect_all_dimensions_for_loop_order(main)?;
-    todo!(
-        "e215_buildScheduleDimensionsTable, e216_buildLoopOrder and e217_createChunkLoopNodes are \
-         not scheduled in this batch"
-    )
+    let reuse = DimReuse::of(has_dimension_reuse(main));
+    let loop_order_dims = collect_all_dimensions_for_loop_order(main)?;
+    let table = build_schedule_dimensions_table(main, orgs, &loop_order_dims, reuse)?;
+    let order = build_loop_order(sdsc, MAIN, orgs, &loop_order_dims, &table, reuse)?;
+    create_chunk_loop_nodes(nest, &order, choice)
 }
 
 #[cfg(test)]
 mod tests_e283_e295 {
     // ⭐ TESTS FOR ENTRIES 283-295. One node-id tree, one organisation map and one transfer list
-    // serve all of them. ⛔ ENTRY 290 HAS NO TEST: its body is a `todo!` naming entries 215, 216 and
-    // 217, which this batch does not schedule.
+    // serve all of them. ⛔ ENTRY 290 IS TESTED IN `tests_e213_e217` instead, beside the three
+    // callees that mint its loop nodes, whose stubs are the ones its chain needs.
     // ⭐ ENTRIES 218, 219 AND 220 ARE TESTED HERE TOO, out of span: they are entries 291's and 292's
     // own callees, and the tree, organisation and allocation-site stubs they need are these.
     use super::*;

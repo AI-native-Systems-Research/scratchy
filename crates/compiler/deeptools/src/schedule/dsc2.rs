@@ -1827,19 +1827,36 @@ pub struct ChildPos(usize);
 /// A DSC'S SCHEDULE TREE — `dsc2::ScheduleTree` (`dsc/dsc2.h:621`) reduced to `head_`, whose
 /// children are the frontier every traversal starts from.
 ///
-/// ⭐ `head_` IS NEVER VISITED. `traverseTreeDFS(nullptr, ..)` seeds the queue with `head_.next_`
-/// (`dsc/dsc2.cpp:2233`), and `head_` is a `LoopNode` with `denId_ = 0` in any case, so a `{BLOCK}`
-/// filter could not name it.
+/// ⭐ `head_` IS NEVER VISITED BY A TRAVERSAL. `traverseTreeDFS(nullptr, ..)` seeds the queue with
+/// `head_.next_` (`dsc/dsc2.cpp:2233`), and `head_` is a `LoopNode`, so a `{BLOCK}` filter could not
+/// name it — but its `denId_` IS OBSERVED: `writeToJson` serialises it as `"scheduleTreeHeadDenId_"`
+/// (`dsc/dsc2.cpp:368`) and the parser reads it straight back onto the head (`:1159`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScheduleTree {
     head: BlockNode,
+    head_den: Option<DatastageId>,
 }
 
 impl ScheduleTree {
-    /// A tree over `head_`'s children.
+    /// A tree over `head_`'s children, whose head names no denominator data stage yet.
     #[must_use]
     pub const fn new(head: BlockNode) -> Self {
-        Self { head }
+        Self {
+            head,
+            head_den: None,
+        }
+    }
+
+    /// `getHead()->denId_`, [`None`] for the `-1` an unwritten head carries.
+    #[must_use]
+    pub const fn head_den(&self) -> Option<DatastageId> {
+        self.head_den
+    }
+
+    /// `getHeadMutable()->denId_ = den` — the write entry 217 makes onto the root before it chains
+    /// the chunk loops under it.
+    pub fn set_head_den(&mut self, den: DatastageId) {
+        self.head_den = Some(den);
     }
 
     /// `getHead()` — the root's block part.

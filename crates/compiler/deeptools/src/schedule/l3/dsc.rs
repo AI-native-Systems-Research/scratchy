@@ -361,9 +361,9 @@ pub struct DesignSpaceConfig {
     /// `N_.paddingSizes_` (`dsc/designSpaceConfig.h:103`) — the WHOLE data structure's padding, which
     /// is where the window a padded dim belongs to is stated. EMPTY where nothing is padded.
     ///
-    /// ⭐ THE PADDING ALONE AND NOT THE `N_` STAGE: entry 221 is the only reader and it asks this map
-    /// and nothing else of it, and a second copy of the extents is a second answer that can disagree
-    /// with [`Self::data_stages`].
+    /// ⭐ THE PADDING ALONE AND NOT THE `N_` STAGE: entries 215 and 221 read this map and nothing else
+    /// of it, and a second copy of the extents is a second answer that can disagree with
+    /// [`Self::data_stages`].
     pub full_padding: BTreeMap<PrimaryDim, DimPadding>,
     /// `gtrIdsUsed_` (`dsc/designSpaceConfig.h:116`) — which group tag registers this DSC's
     /// multicast transfers claim. EMPTY on a DSC the L3 scheduler has not reached; entries 218 and
