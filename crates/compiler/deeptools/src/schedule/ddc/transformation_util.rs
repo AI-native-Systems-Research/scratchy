@@ -1830,7 +1830,7 @@ impl TransferDest {
 }
 
 /// A NODE PROVED NOT TO BE IN THE SCHEDULE TREE YET — `DT_CHECK(computeNode->getPrev() == nullptr)`
-/// (`:1032`), which is entry 340's one remaining abort.
+/// (`:1035`), which is entry 340's one remaining abort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnplacedNode(NodeId);
 
@@ -1905,9 +1905,9 @@ fn reduce_users_of<D: SkipRegResults + DscAllocations + ?Sized>(
 /// from, and repoints every consumer of its connect under one shared fresh [`LatchDataId`].
 ///
 /// ⛔ `true` AND NOTHING DONE where the destination ALREADY skips the register file; any other
-/// non-register, non-`LXLUVALUE` storage is `false`. ⚠️ TRAP: an `LXLUVALUE` destination keeps every
-/// allocation — its own and its consumers' — and is repointed anyway; *"Unsupported consumer type"*
-/// becomes a skipped consumer.
+/// non-register, non-`LXLUVALUE` storage is `false`. ⚠️ TRAP: an `LXLUVALUE` destination keeps its
+/// own allocation and its COMPUTE consumers' inputs' (`:999`) but NEVER a transfer consumer's source,
+/// which is dropped either way (`:985`); *"Unsupported consumer type"* becomes a skipped consumer.
 pub fn convert_result_to_skip_reg<D>(
     dsc: &mut D,
     metadata: &mut Metadata,
@@ -3117,6 +3117,8 @@ impl FifoConsumer {
 pub trait FifoResults: ScheduleSurgery {
     /// `metadata.dataConnects_[connect].consumers_`. ⛔ An UNSET `dataConnect_` is the reference's
     /// `dataConnects_[""]`, which DEFAULT-CONSTRUCTS an empty entry — so it has no consumers.
+    /// ⭐ Entry 339 reads the same map with `.at` (`:980`) and still cannot throw: entry 002 keys
+    /// every transfer destination's connect (`ddc/ddcv1.cpp:3296-3297`).
     fn connect_consumers(&self, connect: Option<DataConnect>) -> Vec<FifoConsumer>;
 
     /// `computeNode->isOpaqueOp_` (`dsc/dsc2.h:531`).
