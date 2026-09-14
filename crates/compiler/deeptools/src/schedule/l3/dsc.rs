@@ -1884,6 +1884,21 @@ impl SelectedCandidate {
     pub fn candidates(&self) -> &[Extent] {
         &self.candidates
     }
+
+    /// `selectedIndices[dscIdx].at(dim)` — the index itself, for the search's `startIdx + 1` walk.
+    #[must_use]
+    pub const fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    /// The same candidates under a different choice, or `None` where the index is past their end.
+    #[must_use]
+    pub fn with_index(&self, selected: usize) -> Option<Self> {
+        (selected < self.candidates.len()).then(|| Self {
+            candidates: self.candidates.clone(),
+            selected,
+        })
+    }
 }
 
 /// ONE DSC'S SELECTED CHUNK PARAMETERS — `dscCandidates[dscIdx]` and `selectedIndices[dscIdx]`
@@ -1891,6 +1906,86 @@ impl SelectedCandidate {
 /// reaching this unit's operands.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DscParamCandidates(pub BTreeMap<PrimaryDim, SelectedCandidate>);
+
+/// EVERY DSC'S SELECTED CHUNK PARAMETERS — `DscParamCandidatesType` AND
+/// `DscParamCandidateIndicesType` (`L3DlOpsScheduler.h:100-103`) AS ONE VALUE, one entry per DSC in
+/// `dscs_` order.
+///
+/// ⭐ ONE VALUE AND NOT TWO PARALLEL VECTORS: the searches advance an index and read the list it
+/// indexes in the same step, and `DT_CHECK_MSG(idx < dscCandidates[dscIdx].at(dim).size(), "Index is
+/// out of range.")` is unspellable once the two travel together.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedDscCandidates(Vec<DscParamCandidates>);
+
+impl SelectedDscCandidates {
+    /// One entry per DSC, in `dscs_` order.
+    #[must_use]
+    pub const fn new(per_dsc: Vec<DscParamCandidates>) -> Self {
+        Self(per_dsc)
+    }
+
+    /// Every DSC's candidates over `primaryDims` with every index at zero — the
+    /// `entry.emplace(dim, 0)` seeding (`L3DlOpsScheduler.cpp:8886`); `None` where a listed dim has
+    /// no candidates on some DSC.
+    #[must_use]
+    pub fn starting(candidates: &DscCandidates, primary_dims: &[PrimaryDim]) -> Option<Self> {
+        candidates
+            .iter()
+            .map(|dims| {
+                primary_dims
+                    .iter()
+                    .map(|dim| {
+                        let found = dims.get(*dim)?;
+                        Some((*dim, SelectedCandidate::new(found.extents().to_vec(), 0)?))
+                    })
+                    .collect::<Option<BTreeMap<_, _>>>()
+                    .map(DscParamCandidates)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Self)
+    }
+
+    /// `selectedIndices[dscIdx]`, [`None`] past the end.
+    #[must_use]
+    pub fn at(&self, dsc: DscIdx) -> Option<&DscParamCandidates> {
+        self.0.get(usize::try_from(dsc.0).ok()?)
+    }
+
+    /// `selectedIndices[dscIdx].at(dim)`, [`None`] where the DSC or the dim is absent.
+    #[must_use]
+    pub fn selected_index(&self, dsc: DscIdx, dim: PrimaryDim) -> Option<usize> {
+        Some(self.at(dsc)?.0.get(&dim)?.selected_index())
+    }
+
+    /// `dscCandidates[dscIdx].at(dim).size()`, [`None`] where the DSC or the dim is absent.
+    #[must_use]
+    pub fn candidate_count(&self, dsc: DscIdx, dim: PrimaryDim) -> Option<usize> {
+        Some(self.at(dsc)?.0.get(&dim)?.candidates().len())
+    }
+
+    /// The same selection with ONE DSC's dim moved to `idx` — the core-split arm's per-DSC advance;
+    /// [`None`] where the DSC, the dim or the index is out of range.
+    #[must_use]
+    pub fn with_selection(&self, dsc: DscIdx, dim: PrimaryDim, idx: usize) -> Option<Self> {
+        let at = usize::try_from(dsc.0).ok()?;
+        let mut moved = self.0.clone();
+        let selected = moved.get_mut(at)?.0.get_mut(&dim)?;
+        *selected = selected.with_index(idx)?;
+        Some(Self(moved))
+    }
+
+    /// The same selection with EVERY DSC's dim moved to `idx` — the non-core-split arm's shared
+    /// advance; [`None`] where any DSC lacks the dim or the index is past its candidates.
+    #[must_use]
+    pub fn with_selection_on_every_dsc(&self, dim: PrimaryDim, idx: usize) -> Option<Self> {
+        let mut moved = self.0.clone();
+        for entry in &mut moved {
+            let selected = entry.0.get_mut(&dim)?;
+            *selected = selected.with_index(idx)?;
+        }
+        Some(Self(moved))
+    }
+}
 
 /// HOW MANY STICKS ONE STICK VOLUME SPANS — `stickVolume`, POSITIVE BY TYPE, which is
 /// `DT_CHECK_MSG(stickVolume > 0, "Invalid stick volume.")` (`L3DlOpsScheduler.cpp:1703`).
