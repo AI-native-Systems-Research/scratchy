@@ -2384,8 +2384,9 @@ const PROGRAM_BODY: &str = r#"        }
     /// `DdlConversion::selectAndParseDdlTemplate` (`ddc/ddl/ddl_conversion.cpp:63-85`) — walks the
     /// candidates in order, skips on arch, and then calls `matchDdl2Dsc()`, taking the FIRST THAT
     /// MATCHES. Matching includes the op's data format against the bind's declared types
-    /// (`:2137-2144`, "Check supported data formats for op"). Reading only the arch tag transcribes
-    /// half of that rule, and the half it drops is the half that tells two precisions apart.
+    /// (`:2137-2144`, under the *"Check supported data formats for op"* of `:2121`). Reading only
+    /// the arch tag transcribes half of that rule, and the half it drops is the half that tells two
+    /// precisions apart.
     ///
     /// ⛔ A FORMAT NO CANDIDATE ADMITS PANICS, and this runs inside the `#[forward]` expansion, so
     /// that is a build failure. Falling through to the first template instead is what gave an fp16
@@ -2491,7 +2492,7 @@ fn codegen_ddl_templates(out: &mut String) {
 
     out.push_str(
         "/// EVERY `.ddl` TEMPLATE THAT SERVES AN OP-FUNC, PER GENERATION AND IN dxp'S OWN ORDER —\n\
-         /// `opFuncToDdlTemplate` (`ddc/ddl/ddl_conversion.h:86-267`, ported to `ddl/selection.rs`)\n\
+         /// `opFuncToDdlTemplate` (`ddc/ddl/ddl_conversion.h:86-271`, ported to `ddl/selection.rs`)\n\
          /// with each candidate's ISA tag already resolved.\n\
          pub const DDL_TEMPLATES: &[(&str, &[(crate::arch::IsaGen, &[Template])])] = &[\n",
     );
