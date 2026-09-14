@@ -2995,12 +2995,754 @@ where
     did_transformation
 }
 
-// crustify:todo: e376_performAutomaticShuffling
-//   authority : ddc/ddc_transformation.cpp:1855  (167 body lines, level 6)
-//   class     : Ddc
-//   original  : bool Ddc::performAutomaticShuffling()
-//   extract   : crustify-ddc/cpp/ddc.cpp:14971-15138
-//   calls     : e110_constructAllocation, e164_insert_before, e257_addNewLds, e371_replace_assign
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐ USES FOR ENTRY 376.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+use crate::arch::Sticks;
+use crate::formats::Bits;
+use crate::schedule::ddc::shuffle::{
+    AssignReplacement, ComputationBuilder, DataEdge, IndexExpansion, InsertPoint, Packmerge,
+    ShuffleIndex,
+};
+use crate::schedule::ddc::transformation_util::{
+    AutoShuffleName, DdcAllocateNode, FreshAllocation, LabeledDsEntry, PaddingForm,
+    construct_allocation,
+};
+use crate::schedule::ddl::conversion::ComputeOpIdx;
+use crate::schedule::dsc2::{PackIndex, WordLength};
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE AUTOMATIC-SHUFFLE VOCABULARY — what entry 376's local `BuilderImpl`
+// (`ddc/ddc_transformation.cpp:1857`) writes into, and the two absences that replace its aborts.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH UNIT'S REGISTER FILE AN AUTOMATIC SHUFFLE STAGES THROUGH — `assign->exUnit_` narrowed to
+/// the two the walk accepts (`ddc/ddc_transformation.cpp:1868-1878`, `:2005-2007`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShuffleUnit {
+    /// `PE` → `PELRF`.
+    Pe,
+    /// `SFP` → `SFPLRF`.
+    Sfp,
+}
+
+impl ShuffleUnit {
+    /// `is_any_of(computeNode->exUnit_, PE, SFP)` — the walk's `continue` for every other unit.
+    #[must_use]
+    pub const fn of(ex_unit: SenComponent) -> Option<Self> {
+        match ex_unit {
+            SenComponent::Pe => Some(Self::Pe),
+            SenComponent::Sfp => Some(Self::Sfp),
+            _ => None,
+        }
+    }
+
+    /// `BuilderImpl::storage`, where the intermediate registers are allocated.
+    ///
+    /// ⛔ `DT_ERROR("Unrecognized shuffle storage location")` IS THIS TYPE'S ABSENCE: the walk has
+    /// already refused every unit that is not `PE` or `SFP` before the builder is constructed.
+    #[must_use]
+    pub const fn memory(self) -> DdcMemory {
+        match self {
+            Self::Pe => DdcMemory::PeLrf,
+            Self::Sfp => DdcMemory::SfpLrf,
+        }
+    }
+}
+
+/// THE `name_counter` (`ddc/ddc_transformation.cpp:1854`) THAT SUFFIXES BOTH AN INTERMEDIATE
+/// REGISTER'S `dsName_` AND ITS `dataConnect_`, so the two always agree.
+///
+/// ⚠️ TRAP: the reference's counter is a FILE-SCOPE GLOBAL that never resets, so it is a parameter
+/// here rather than builder state — one builder per assign, and every builder shares the count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AutoShuffleNames(u32);
+
+impl AutoShuffleNames {
+    /// `std::to_string(name_counter); name_counter++;`.
+    pub fn next_name(&mut self) -> AutoShuffleName {
+        let name = AutoShuffleName(self.0);
+        self.0 += 1;
+        name
+    }
+}
+
+/// WHAT ENTRY 376'S BUILDER DOES TO THE SCHEDULE — every mutation `BuilderImpl` performs, as one
+/// method each; which to call, in what order and with what value stays in the port.
+pub trait AutoShuffling:
+    ComputeWalk + ComputeCloning + DscAllocations + NewLabeledDs + MintedConnects
+{
+    /// `currDsc->labeledDs_[lds]`.
+    fn lds_entry(&self, lds: LdsIdx) -> Option<Self::Entry>;
+
+    /// `ds_info.dsName_ = name`, written at the position the insert put the copy at.
+    fn set_lds_name(&mut self, lds: LdsIdx, name: StorageName);
+
+    /// `ds_info.dataFormat_ = format`.
+    fn set_lds_format(&mut self, lds: LdsIdx, format: DataFormat);
+
+    /// `ds_info.wordLength = word_length`.
+    fn set_lds_word_length(&mut self, lds: LdsIdx, length: WordLength);
+
+    /// `currDsc->computeOp_.back()`. ⛔ `DT_CHECK(currDsc->computeOp_.size() == 1)` IS THIS
+    /// [`None`]: `back()` on any other size is not the op the interim DS belongs to.
+    fn sole_compute_op(&self) -> Option<ComputeOpIdx>;
+
+    /// `currDsc->computeOp_.back().interimLabeledDs.push_back(&currDsc->labeledDs_[lds])`.
+    fn add_interim_lds(&mut self, compute_op: ComputeOpIdx, lds: LdsIdx);
+
+    /// An [`AllocId`] no allocation carries yet — `new dsc2::AllocateNode()`'s identity.
+    fn free_alloc(&self) -> AllocId;
+
+    /// `parent->addChildNode(allocation.value(), true, insert_point)` (`shuffle.h:175`) — the held
+    /// allocate node handed to the tree, which is where it takes ownership of it.
+    fn insert_allocate(&mut self, alloc: AllocId, node: DdcAllocateNode, at: InsertionPoint);
+
+    /// `allocNode->addAllocUser(user)`, for an allocation already in the tree.
+    fn add_alloc_user(&mut self, alloc: AllocId, user: NodeId);
+
+    /// `new dsc2::ComputeNode(*assign)` placed by `assign_parent->addChildNode(node, true, assign)`.
+    fn insert_compute_before(&mut self, node: ComputeNode, before: NodeId) -> NodeId;
+
+    /// `node->getMutableParent()->deleteChildNode(currDsc, node)`.
+    fn delete_node(&mut self, node: NodeId);
+
+    /// `dataFormatsToBitWidth.at(currDsc->labeledDs_[dinfo.myLdsIdx_].dataFormat_)`.
+    ///
+    /// ⛔ TOTAL, AND IT STATES BOTH OF THE REFERENCE'S UNGUARDED LOOKUPS: a PACKMERGE input always
+    /// names a labelled DS, and that DS always carries a format.
+    fn operand_element_bits(&self, dinfo: DataInfo) -> Bits;
+}
+
+/// THE ASSIGN ENTRY 376 REPLACES, WITH EVERYTHING ITS BUILDER TEMPLATES OFF — `BuilderImpl`'s
+/// constructor (`ddc/ddc_transformation.cpp:1868-1884`) as one value.
+///
+/// ⛔ THREE ABORTS COLLAPSE INTO THIS WITNESS: `DT_CHECK(assign->type_ == ASSIGN)`,
+/// `DT_ERROR("Unrecognized shuffle storage location")` and `DT_CHECK(computeOp_.size() == 1)`.
+#[derive(Debug, Clone)]
+pub struct ShuffleAssign<E> {
+    node: NodeId,
+    body: ComputeNode,
+    unit: ShuffleUnit,
+    dinfo_template: DataInfo,
+    dsinfo_template: E,
+    compute_op: ComputeOpIdx,
+}
+
+impl<E: LabeledDsEntry> ShuffleAssign<E> {
+    /// The witness, or [`None`] where the walk's own two `continue`s or any of the three aborts
+    /// would fire.
+    #[must_use]
+    pub fn of<S: AutoShuffling<Entry = E> + ?Sized>(dsc: &S, node: NodeId) -> Option<Self> {
+        let body = dsc.compute(node);
+        if body.op != DdlComputeType::Assign {
+            return None;
+        }
+        let unit = ShuffleUnit::of(body.ex_unit)?;
+        let dinfo_template = body.inputs.first()?.data;
+        let dsinfo_template = dsc.lds_entry(dinfo_template.my_lds_idx?)?;
+        Some(Self {
+            node,
+            body,
+            unit,
+            dinfo_template,
+            dsinfo_template,
+            compute_op: dsc.sole_compute_op()?,
+        })
+    }
+}
+
+/// `expand_indices(compact_indices, element_bit_width)` (`ddc/ddc_transformation.cpp:1937`) — widens
+/// each lane selector to the `128 / n`-bit index field the instruction actually carries.
+///
+/// ⚠️ TRAP: every PRODUCT of the reference's `-1` *"selects nothing"* marker lands on
+/// [`PackIndex::Extend`] — `-1 * scale + j` is `-1` only at `scale == 1`, and the reference leaves
+/// the other negatives to a downstream translation that has no meaning for them.
+/// ⛔ `DT_CHECK(element_bit_width <= compact_indices_bit_width)` — *"not set up to deal with, say,
+/// 8-bit pack on 16-bit values"* — is the reference's own abort and stays one.
+fn expand_indices(compact: &[ShuffleIndex], element_bits: Bits) -> Vec<PackIndex> {
+    const SLICE_BITS: u32 = 128;
+
+    let lanes = u32::try_from(compact.len()).unwrap_or(SLICE_BITS);
+    if lanes == 0 || element_bits.0 == 0 {
+        return Vec::new();
+    }
+    let field_bits = SLICE_BITS / lanes;
+    if element_bits.0 > field_bits {
+        panic!(
+            "expand_indices: {}-bit elements do not fit a {field_bits}-bit index field",
+            element_bits.0
+        );
+    }
+    let scale = field_bits / element_bits.0;
+
+    compact
+        .iter()
+        .flat_map(|index| {
+            (0..scale).map(move |j| pack_index(i64::from(index.0) * i64::from(scale) + i64::from(j)))
+        })
+        .collect()
+}
+
+/// One `instrAttribute_.indices_` element as the reference's `int`, whose negatives are all its
+/// *"zero/sign extend"* marker.
+fn pack_index(raw: i64) -> PackIndex {
+    u32::try_from(raw).map_or(PackIndex::Extend, PackIndex::Slice)
+}
+
+/// ENTRY 376'S `BuilderImpl` (`ddc/ddc_transformation.cpp:1857`) — the one implementation of
+/// [`ComputationBuilder`], writing into the DSC the assign lives in.
+///
+/// ⛔ IT HOLDS THE ALLOCATE NODES IT MINTS: `constructAllocation` hands back a heap node that is NOT
+/// yet in the tree and the edge only aliases it, so `held` is that aliasing and `insert_before` is
+/// what hands ownership over ([`DataEdge::alloc_added`]).
+pub struct ShuffleBuilder<'a, S: AutoShuffling + ?Sized> {
+    dsc: &'a mut S,
+    metadata: &'a mut Metadata,
+    names: &'a mut AutoShuffleNames,
+    assign: ShuffleAssign<S::Entry>,
+    op_names: u32,
+    held: BTreeMap<AllocId, DdcAllocateNode>,
+}
+
+impl<'a, S: AutoShuffling + ?Sized> ShuffleBuilder<'a, S> {
+    /// `BuilderImpl builder(this, currDsc, computeNode)`.
+    pub fn new(
+        dsc: &'a mut S,
+        metadata: &'a mut Metadata,
+        names: &'a mut AutoShuffleNames,
+        assign: ShuffleAssign<S::Entry>,
+    ) -> Self {
+        Self {
+            dsc,
+            metadata,
+            names,
+            assign,
+            op_names: 0,
+            held: BTreeMap::new(),
+        }
+    }
+
+    /// `allocation.value()->addAllocUser(user)`, whichever side of the handover the node is on.
+    fn add_user(&mut self, alloc: AllocId, user: NodeId) {
+        if self.held.contains_key(&alloc) {
+            if let Some(node) = self.held.get_mut(&alloc) {
+                node.add_alloc_user(user);
+            }
+        } else {
+            self.dsc.add_alloc_user(alloc, user);
+        }
+    }
+}
+
+impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
+    fn delete_node(&mut self, node: NodeId) {
+        self.dsc.delete_node(node);
+    }
+
+    fn allocate_sticks(
+        &mut self,
+        format: DataFormat,
+        word_length: WordLength,
+        n: Sticks,
+    ) -> Vec<DataEdge> {
+        // `if (input_comp == SFPLRF || input_comp == PELRF) num_intermidate_reg = 1;` — one register
+        // does for an assign already reading a register file. `inputs_.at(0)` is the witness's own.
+        let count = if matches!(
+            self.assign.body.inputs.first().map(|input| input.unit),
+            Some(SenComponent::Sfplrf | SenComponent::Pelrf)
+        ) {
+            1
+        } else {
+            n.0
+        };
+        let storage = self.assign.unit.memory();
+        let mut outputs = Vec::new();
+        for _ in 0..count {
+            let suffix = self.names.next_name();
+            // The copy of `dsinfo_template` is placed first and its three overwritten fields are
+            // written at the position the insert chose; the reference writes them before inserting,
+            // and no reader sits between the two.
+            let lds = add_new_lds(self.dsc, self.metadata, &self.assign.dsinfo_template);
+            self.dsc
+                .set_lds_name(lds, StorageName(format!("autoshuffle_reg_{}", suffix.0)));
+            self.dsc.set_lds_format(lds, format);
+            self.dsc.set_lds_word_length(lds, word_length);
+            self.dsc.add_interim_lds(self.assign.compute_op, lds);
+
+            let mut dinfo = self.assign.dinfo_template;
+            dinfo.data_connect = Some(
+                self.dsc
+                    .intern_connect(MintedConnect::AutoshuffleEdge(suffix)),
+            );
+            dinfo.my_lds_idx = Some(lds);
+
+            // `PaddingFormType padding;  // TODO` — default-constructed, so no dim is padded.
+            let Some(fresh) = FreshAllocation::of(&*self.dsc, self.metadata, lds, storage) else {
+                panic!("autoshuffle_reg_{}: {storage:?} allocation is not fresh", suffix.0)
+            };
+            let alloc = self.dsc.free_alloc();
+            let mut node = construct_allocation(
+                self.dsc,
+                self.metadata,
+                fresh,
+                PaddingForm::default(),
+                self.assign.node,
+                alloc,
+            );
+            // `alloc->numBuffers_ = 1` is a no-op: `int numBuffers_ = 1` (`dsc/dsc2.h:984`) is what a
+            // freshly minted node already carries, which is why the field is not on the Rust node.
+            node.remove_alloc_user(self.assign.node);
+            self.held.insert(alloc, node);
+
+            outputs.push(DataEdge {
+                dinfo,
+                component: memory_component(storage),
+                allocation: Some(alloc),
+                alloc_added: false,
+            });
+        }
+        outputs
+    }
+
+    fn insert_packmerge(
+        &mut self,
+        in1: &DataEdge,
+        in2: &DataEdge,
+        out: &mut DataEdge,
+        packmerge: &Packmerge,
+    ) -> NodeId {
+        let operand = |edge: &DataEdge| Operand {
+            unit: edge.component,
+            storage: edge.component,
+            data: edge.dinfo,
+        };
+        let mut body = self.assign.body.clone();
+        body.op = DdlComputeType::Packmerge;
+        body.instr_attribute.indices = match packmerge.expansion {
+            IndexExpansion::ByElementWidth => expand_indices(
+                &packmerge.indices,
+                self.dsc.operand_element_bits(in1.dinfo),
+            ),
+            IndexExpansion::AsWritten => packmerge
+                .indices
+                .iter()
+                .map(|index| pack_index(i64::from(index.0)))
+                .collect(),
+        };
+        // Going from two inputs to one.
+        body.inputs = vec![operand(in1), operand(in2)];
+        body.outputs = vec![operand(out)];
+        body.name = NodeName(format!(
+            "{}_autoshuffle_{}",
+            self.assign.body.name.0, self.op_names
+        ));
+        self.op_names += 1;
+
+        // The node is placed before its users are recorded, because the reference's `new` already
+        // gives it an identity and here the placement is what issues one; nothing reads between.
+        let node = self.dsc.insert_compute_before(body.clone(), self.assign.node);
+        for edge in [&*out, in1, in2] {
+            if let Some(alloc) = edge.allocation {
+                self.add_user(alloc, node);
+            }
+        }
+
+        let mut point = InsertPoint::new(body);
+        out.insert_before(&mut point);
+        let latched: Vec<AllocId> = point.preceding().map(|owned| owned.0).collect();
+        for alloc in latched {
+            if let Some(held) = self.held.remove(&alloc) {
+                self.dsc
+                    .insert_allocate(alloc, held, InsertionPoint::Before(node));
+            }
+        }
+        node
+    }
+}
+
+/// Replaces: e376_performAutomaticShuffling
+///
+/// Hands every PE/SFP `ASSIGN` in the schedule tree to the automatic shuffler, which replaces it
+/// with the PACKMERGE sequence and the intermediate register allocations that shuffle needs.
+///
+/// ⚠️ TRAP: `success` is set for every assign the walk REACHES, before the shuffler has decided
+/// anything — so the answer means *an assign was visited*, not *the tree changed*.
+/// ⛔ `names` OUTLIVES THE CALL because the reference's `name_counter` is a file-scope global.
+pub fn perform_automatic_shuffling<S, A>(
+    dsc: &mut S,
+    metadata: &mut Metadata,
+    names: &mut AutoShuffleNames,
+) -> bool
+where
+    S: AutoShuffling + ?Sized,
+    A: AssignReplacement + Default,
+{
+    let mut shuffler = A::default();
+    let mut success = false;
+    for compute in dsc.computes() {
+        let Some(assign) = ShuffleAssign::of(&*dsc, compute) else {
+            continue;
+        };
+        let mut builder = ShuffleBuilder::new(dsc, metadata, names, assign);
+        shuffler.replace_assign(&mut builder, compute);
+        success = true;
+    }
+    success
+}
+
+#[cfg(test)]
+mod tests_e376 {
+    use super::*;
+    use crate::schedule::ddc::transformation_util::{AllocationUse, CanDelete, TreeLdsSlot};
+    use crate::schedule::dsc2::{Dsc as Dsc2, InstrAttribute, LayoutDims};
+    use crate::units::NumFolds;
+    use std::cell::Cell;
+
+    /// One `labeledDs_` entry, holding the three fields `allocate_sticks` overwrites.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Lds {
+        recorded: LdsIdx,
+        name: Option<StorageName>,
+        format: Option<DataFormat>,
+        word_length: Option<WordLength>,
+    }
+
+    impl LabeledDsEntry for Lds {
+        fn recorded_lds_idx(&self) -> LdsIdx {
+            self.recorded
+        }
+
+        fn set_recorded_lds_idx(&mut self, recorded: LdsIdx) {
+            self.recorded = recorded;
+        }
+
+        fn set_reference_lds_idx(&mut self, _reference: LdsIdx) {}
+    }
+
+    /// A DSC HOLDING ONE PE `ASSIGN` AND EVERY WRITE THE BUILDER MAKES, IN ORDER.
+    struct Tree {
+        entries: Vec<Lds>,
+        interim: Vec<(ComputeOpIdx, LdsIdx)>,
+        minted: Vec<MintedConnect>,
+        mem_org: BTreeMap<(DataOrigin, DdcMemory), AllocId>,
+        computes: BTreeMap<NodeId, ComputeNode>,
+        placed: Vec<(DdcAllocateNode, InsertionPoint)>,
+        deleted: Vec<NodeId>,
+        next_alloc: Cell<u32>,
+        next_node: u32,
+    }
+
+    /// The assign the walk reaches: PE, `ASSIGN`, and its first input on LX so the stick count is
+    /// NOT forced down to one.
+    const ASSIGN: NodeId = NodeId(1);
+
+    fn operand(unit: SenComponent, lds: u32) -> Operand {
+        Operand {
+            unit,
+            storage: unit,
+            data: DataInfo {
+                data_connect: Some(DataConnect::ArfPt),
+                my_lds_idx: Some(LdsIdx(lds)),
+                constant_id: None,
+                latch_data_id: None,
+            },
+        }
+    }
+
+    fn tree() -> Tree {
+        let assign = ComputeNode {
+            name: NodeName("assign".to_owned()),
+            op: DdlComputeType::Assign,
+            ex_unit: SenComponent::Pe,
+            inputs: vec![operand(SenComponent::Lx, 0)],
+            outputs: vec![operand(SenComponent::Pelrf, 1)],
+            num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
+        };
+        Tree {
+            entries: vec![
+                Lds {
+                    recorded: LdsIdx(0),
+                    name: None,
+                    format: None,
+                    word_length: None,
+                },
+                Lds {
+                    recorded: LdsIdx(1),
+                    name: None,
+                    format: None,
+                    word_length: None,
+                },
+            ],
+            interim: Vec::new(),
+            minted: Vec::new(),
+            mem_org: BTreeMap::new(),
+            computes: BTreeMap::from([(ASSIGN, assign)]),
+            placed: Vec::new(),
+            deleted: Vec::new(),
+            next_alloc: Cell::new(50),
+            next_node: 2,
+        }
+    }
+
+    impl Dsc2 for Tree {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            // Distinct dims, so the allocation witness holds.
+            LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out])
+        }
+    }
+
+    impl DscAllocations for Tree {
+        fn own_lds_idx(&self, lds: LdsIdx) -> LdsIdx {
+            lds
+        }
+
+        fn allocation_in(&self, origin: DataOrigin, storage: DdcMemory) -> Option<AllocId> {
+            self.mem_org.get(&(origin, storage)).copied()
+        }
+
+        fn set_allocation_in(&mut self, lds: LdsIdx, storage: DdcMemory, alloc: AllocId) {
+            self.mem_org
+                .insert((DataOrigin::LabeledDs(lds), storage), alloc);
+        }
+
+        fn alloc_users(&self, _alloc: AllocId) -> Vec<NodeId> {
+            Vec::new()
+        }
+
+        fn alloc_component(&self, _alloc: AllocId) -> DdcMemory {
+            DdcMemory::PeLrf
+        }
+
+        fn alloc_origin(&self, _alloc: AllocId) -> DataOrigin {
+            DataOrigin::LabeledDs(LdsIdx(0))
+        }
+
+        fn alloc_node(&self, alloc: AllocId) -> NodeId {
+            NodeId(alloc.0)
+        }
+
+        fn reduce_users_or_delete(&mut self, _use: AllocationUse, _can: CanDelete) -> bool {
+            todo!("tests_e376: no unit under test reduces an allocation's users")
+        }
+    }
+
+    impl NewLabeledDs for Tree {
+        type Entry = Lds;
+
+        fn last_lds_pos(&self) -> LdsIdx {
+            LdsIdx(self.entries.len() as u32 - 1)
+        }
+
+        fn last_recorded_lds_idx(&self) -> LdsIdx {
+            self.entries[self.entries.len() - 1].recorded
+        }
+
+        fn set_last_recorded_lds_idx(&mut self, recorded: LdsIdx) {
+            let last = self.entries.len() - 1;
+            self.entries[last].recorded = recorded;
+        }
+
+        fn insert_lds_before_last(&mut self, entry: Self::Entry) {
+            let was_last = self.entries.len() - 1;
+            self.entries.insert(was_last, entry);
+        }
+
+        fn clear_mem_org(&mut self, _pos: LdsIdx) {}
+
+        fn mem_org_allocations(&self, _pos: LdsIdx) -> Vec<AllocId> {
+            Vec::new()
+        }
+
+        fn alloc_lds_idx(&self, _alloc: AllocId) -> Option<LdsIdx> {
+            None
+        }
+
+        fn set_alloc_lds_idx(&mut self, _alloc: AllocId, _lds: LdsIdx) {}
+
+        fn tree_lds_slots(&self) -> Vec<(TreeLdsSlot, Option<LdsIdx>)> {
+            Vec::new()
+        }
+
+        fn set_tree_lds(&mut self, _slot: TreeLdsSlot, _lds: LdsIdx) {}
+
+        fn opaque_computes(&self) -> Vec<NodeId> {
+            Vec::new()
+        }
+    }
+
+    impl MintedConnects for Tree {
+        fn intern_connect(&mut self, connect: MintedConnect) -> DataConnect {
+            self.minted.push(connect);
+            DataConnect::ArfPt
+        }
+    }
+
+    impl ComputeWalk for Tree {
+        fn computes(&self) -> Vec<NodeId> {
+            self.computes.keys().copied().collect()
+        }
+
+        fn compute_op(&self, _node: NodeId) -> ComputeOp {
+            ComputeOp::Other
+        }
+    }
+
+    impl ComputeCloning for Tree {
+        fn compute(&self, node: NodeId) -> ComputeNode {
+            self.computes[&node].clone()
+        }
+
+        fn clone_compute_after(&mut self, _node: NodeId, _body: ComputeNode) -> NodeId {
+            todo!("tests_e376: entry 376 inserts a fresh compute, it does not clone in place")
+        }
+    }
+
+    impl AutoShuffling for Tree {
+        fn lds_entry(&self, lds: LdsIdx) -> Option<Self::Entry> {
+            self.entries.get(lds.0 as usize).cloned()
+        }
+
+        fn set_lds_name(&mut self, lds: LdsIdx, name: StorageName) {
+            self.entries[lds.0 as usize].name = Some(name);
+        }
+
+        fn set_lds_format(&mut self, lds: LdsIdx, format: DataFormat) {
+            self.entries[lds.0 as usize].format = Some(format);
+        }
+
+        fn set_lds_word_length(&mut self, lds: LdsIdx, length: WordLength) {
+            self.entries[lds.0 as usize].word_length = Some(length);
+        }
+
+        fn sole_compute_op(&self) -> Option<ComputeOpIdx> {
+            Some(ComputeOpIdx(0))
+        }
+
+        fn add_interim_lds(&mut self, compute_op: ComputeOpIdx, lds: LdsIdx) {
+            self.interim.push((compute_op, lds));
+        }
+
+        fn free_alloc(&self) -> AllocId {
+            let next = self.next_alloc.get();
+            self.next_alloc.set(next + 1);
+            AllocId(next)
+        }
+
+        fn insert_allocate(&mut self, _alloc: AllocId, node: DdcAllocateNode, at: InsertionPoint) {
+            self.placed.push((node, at));
+        }
+
+        fn add_alloc_user(&mut self, _alloc: AllocId, _user: NodeId) {
+            todo!("tests_e376: every allocation here is still held by the builder")
+        }
+
+        fn insert_compute_before(&mut self, node: ComputeNode, _before: NodeId) -> NodeId {
+            let id = NodeId(self.next_node);
+            self.next_node += 1;
+            self.computes.insert(id, node);
+            id
+        }
+
+        fn delete_node(&mut self, node: NodeId) {
+            self.deleted.push(node);
+        }
+
+        fn operand_element_bits(&self, _dinfo: DataInfo) -> Bits {
+            Bits(16)
+        }
+    }
+
+    /// A STAND-IN FOR ENTRY 371 that drives the three builder methods in `replace_assign`'s own
+    /// order — two registers, one PACKMERGE onto the second, then the assign deleted.
+    #[derive(Debug, Default)]
+    struct OneMerge;
+
+    impl AssignReplacement for OneMerge {
+        fn replace_assign<B: ComputationBuilder + ?Sized>(
+            &mut self,
+            builder: &mut B,
+            assign: NodeId,
+        ) -> bool {
+            let mut edges =
+                builder.allocate_sticks(DataFormat::Sen169Fp16, WordLength(2), Sticks(2));
+            let mut out = edges.pop().expect("the second register");
+            let input = edges.pop().expect("the first register");
+            builder.insert_packmerge(
+                &input,
+                &input,
+                &mut out,
+                &Packmerge {
+                    indices: vec![ShuffleIndex(0), ShuffleIndex(1)],
+                    expansion: IndexExpansion::AsWritten,
+                },
+            );
+            builder.delete_node(assign);
+            true
+        }
+    }
+
+    #[test]
+    fn a_pe_assign_gains_two_named_registers_a_packmerge_and_its_allocation() {
+        let mut dsc = tree();
+        let mut metadata = Metadata::default();
+        let mut names = AutoShuffleNames::default();
+        assert!(perform_automatic_shuffling::<Tree, OneMerge>(
+            &mut dsc,
+            &mut metadata,
+            &mut names
+        ));
+
+        // Both registers were inserted before the last entry, named off the shared counter, and
+        // pushed onto the sole compute op's interim list.
+        let named: Vec<Option<&str>> = dsc
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_ref().map(|name| name.0.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![None, Some("autoshuffle_reg_0"), Some("autoshuffle_reg_1"), None]
+        );
+        assert_eq!(dsc.entries[1].format, Some(DataFormat::Sen169Fp16));
+        assert_eq!(dsc.entries[1].word_length, Some(WordLength(2)));
+        assert_eq!(
+            dsc.interim,
+            vec![(ComputeOpIdx(0), LdsIdx(1)), (ComputeOpIdx(0), LdsIdx(2))]
+        );
+        // Each register's edge is named by the SAME counter value as its storage.
+        assert_eq!(
+            dsc.minted,
+            vec![
+                MintedConnect::AutoshuffleEdge(AutoShuffleName(0)),
+                MintedConnect::AutoshuffleEdge(AutoShuffleName(1))
+            ]
+        );
+
+        // The PACKMERGE took the assign's body, its own name and the lane table as written.
+        let packmerge = dsc.computes[&NodeId(2)].clone();
+        assert_eq!(packmerge.name, NodeName("assign_autoshuffle_0".to_owned()));
+        assert_eq!(packmerge.op, DdlComputeType::Packmerge);
+        assert_eq!(
+            packmerge.instr_attribute.indices,
+            vec![PackIndex::Slice(0), PackIndex::Slice(1)]
+        );
+        assert_eq!(packmerge.inputs.len(), 2);
+        assert_eq!(packmerge.outputs[0].unit, SenComponent::Pelrf);
+
+        // The output's allocation reached the tree just before the PACKMERGE, and the assign that
+        // `constructAllocation` recorded as its user was taken back off it.
+        let (node, at) = dsc.placed.first().expect("the output register's allocation");
+        assert_eq!(dsc.placed.len(), 1);
+        assert_eq!(node.name, NodeName("allocate_lds2_pelrf".to_owned()));
+        assert_eq!(node.alloc_users, BTreeMap::from([(NodeId(2), 1)]));
+        assert_eq!(*at, InsertionPoint::Before(NodeId(2)));
+        assert_eq!(dsc.deleted, vec![ASSIGN]);
+    }
+}
 
 #[cfg(test)]
 mod tests_e105_e109 {

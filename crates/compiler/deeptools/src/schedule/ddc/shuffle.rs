@@ -176,9 +176,9 @@
 use crate::arch::{Arch, Sticks};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{PrimaryDim, StickDims};
 use crate::formats::{Bits, DataFormat};
-use crate::schedule::ddc::fold::AllocId;
+use crate::schedule::ddc::fold::{AllocId, NodeId};
 use crate::schedule::ddc::metadata::OwnedAllocateNode;
-use crate::schedule::dsc2::{ComputeNode, DataInfo};
+use crate::schedule::dsc2::{ComputeNode, DataInfo, WordLength};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::hash::{Hash, Hasher};
@@ -2561,6 +2561,62 @@ impl DataEdge {
             }
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// THE BUILDER SEAM — `ComputationBuilder` (`shuffle.h:183`), what a shuffle's codegen writes through.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// WHAT THE SHUFFLE CODEGEN ASKS OF THE SCHEDULE IT WRITES INTO — `ComputationBuilder`
+/// (`shuffle.h:183`), the pure abstract class `replace_assign` is handed and every
+/// [`ComputationOp`]'s codegen calls through.
+///
+/// ⭐ ENTRY 376'S LOCAL `BuilderImpl` (`ddc/ddc_transformation.cpp:1857`) IS THE ONE IMPLEMENTATION,
+/// and the declaration sits here because this is `shuffle.h`'s Rust home and all three methods trade
+/// in [`DataEdge`].
+pub trait ComputationBuilder {
+    /// `delete_node(node)` — takes `node` out of its own parent's child list.
+    fn delete_node(&mut self, node: NodeId);
+
+    /// `allocate_sticks(format, word_length, n)` — `n` fresh single-stick registers, each with its own
+    /// labelled DS and allocation, as edges.
+    ///
+    /// ⛔ `double word_length`: its one producer computes `wl / 8.0` (`shuffle.cpp:845`) and the field
+    /// it lands in is `LabeledDsInfo::wordLength` (`dsc/dscdefn.h:334`), so [`WordLength`]'s
+    /// whole-byte narrowing is where a sub-byte width goes, and the rounding is e371's to state.
+    fn allocate_sticks(
+        &mut self,
+        format: DataFormat,
+        word_length: WordLength,
+        n: Sticks,
+    ) -> Vec<DataEdge>;
+
+    /// `insert_packmerge(in1, in2, out, indices, expand_indices)` — the `PACKMERGE` and its lane table
+    /// as one [`Packmerge`], placed immediately before the assign being replaced. Yields the node.
+    fn insert_packmerge(
+        &mut self,
+        in1: &DataEdge,
+        in2: &DataEdge,
+        out: &mut DataEdge,
+        packmerge: &Packmerge,
+    ) -> NodeId;
+}
+
+/// WHAT ENTRY 376 CANNOT REACH YET — `AutoShuffler::replace_assign(dsc, builder, assign)`
+/// (`shuffle.cpp:788`), which is e371 and not this batch.
+///
+/// ⛔ THE SEAM ENTRY 376 REACHES IT THROUGH, AND NOT A STAND-IN: entry 376 mints the builder and the
+/// shuffler and hands both over, and every decision between the two is e371's.
+/// ⛔ THE DSC IS NOT A SECOND PARAMETER. `replace_assign` reads `labeledDs_`, `primaryDsInfo_` and
+/// `getAllocation` off the SAME DSC the builder writes, and one `&mut` carrier cannot be borrowed
+/// twice — so those reads belong on [`ComputationBuilder`] when e371 lands and names them.
+pub trait AssignReplacement {
+    /// `replace_assign(dsc, builder, assign)`.
+    fn replace_assign<B: ComputationBuilder + ?Sized>(
+        &mut self,
+        builder: &mut B,
+        assign: NodeId,
+    ) -> bool;
 }
 
 impl CodegenGeneric for AutoShuffler {
