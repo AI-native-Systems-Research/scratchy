@@ -8549,6 +8549,44 @@ fn superdsc_bundle_tokens() -> proc_macro2::TokenStream {
         bundles.len(),
         n_bytes as f64 / 1048576.0,
     );
+    // ⛔⛔ A BUNDLE SET WITH NO LAUNCH GROUPS IS THE FAILURE `no_compiler_or_die` EXISTS TO PREVENT,
+    // AND THAT GUARD CANNOT SEE IT. It fires when the compiler is MISSING; this fires when the
+    // compiler was present and never invoked, because the lowering produced no program to hand it.
+    // The consequence is identical and is the one this codebase has already paid for: "that binary
+    // links and serves: every session reports ready, nothing is ever launched, and every completion
+    // comes back EMPTY (`finish_reason: \"length\"`, ~0.6 ms/token) with no error anywhere"
+    // (`superdsc_bake.rs`'s own words).
+    //
+    // ⭐ SO IT IS A BUILD-TIME PANIC, which is this crate's established mechanism for a scope that
+    // would ship a silently-inert binary — the same one naming zero models uses. `SCRATCHY_PLAN_ONLY_BAKE`
+    // is the existing on-purpose claim that a host has no card, and it is honoured here for the same
+    // reason: a plan-only bake is a stated intent, not a fallback the build picks by itself.
+    //
+    // ⛔ THIS IS NOT A LOWERING REFUSAL. It is downstream of every emission and of dbo-opt; nothing
+    // about it pre-empts the oracle. It stops a binary that cannot compute from being shipped.
+    if n_groups == 0
+        && std::env::var_os("SCRATCHY_PLAN_ONLY_BAKE").is_none()
+        && scratchy_target_spyre::superdsc_bake::global().is_some()
+    {
+        panic!(
+            "[spyre-superdsc] {} bundle(s) baked and NOT ONE LAUNCH GROUP — a device compiler is \
+             present, so every group was skipped because the lowering produced no program for it. \
+             This binary would link and serve with nothing ever launched and every completion empty.\n\
+             \n\
+             • BRIDGE 1'S SCHEDULING HALF IS THE CAUSE. `render_dfir_input` lowers each SuperDSC \
+             through `superdsc_to_dataflow_ir`, whose driver walks STATEMENTS; scratchy's \
+             `scheduleTree_` is all `allocate` nodes, so `Schedule::roots` yields none and \
+             `Converted::program` is `None`. Read the `[spyre-dfir]` lines above for the per-bundle \
+             census — you need `-vv`, cargo hides them.\n\
+             • THE FOUR STAGES THAT FILL THE TREE (`SchedulerStages.cpp:29-57`) are ported 382/382 \
+             and uncallable: `DscOffsetFacts`/`LxZeroPadTransform` and `Dsc2Sites`/`Dsc2Store`/\
+             `Dsc2Stages` have no implementor, and stage 3 `todo!`s into out-of-scope `dcg_fe`/\
+             `dcg_be`. See `lower_superdsc_to_dataflow_ir.rs`'s header.\n\
+             • To bake the memory plan alone ON PURPOSE, set `SCRATCHY_PLAN_ONLY_BAKE=1`. That is a \
+             claim about what you want, not a way past this.",
+            bundles.len(),
+        );
+    }
     out
 }
 
