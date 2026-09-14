@@ -541,6 +541,29 @@ pub trait PinningSchemeManager {
             "StaticPinningSchemeManager::eval (Analyses/AddressPinningScheme.h:267) — out of campaign scope"
         )
     }
+
+    /// `DynamicPinningSchemeManager::eval(dcc_ext_context, evaluator, memory_unit, ev_addr_info_list)`
+    /// (`Analyses/AddressPinningScheme.h:309-311`) — the same per-unit computation as [`Self::eval`]
+    /// for the DERIVED **dynamic** manager, whose schemes are driven by the observed addresses it is
+    /// handed rather than by the unit alone.
+    ///
+    /// ⛔ A SECOND METHOD, NOT AN OPTIONAL ARGUMENT ON [`Self::eval`]: the two are three- and
+    /// four-parameter members of two DIFFERENT subclasses (`:267-268`, `:309-311`), and
+    /// `AddressPinningAndTogglePass::run_on_unit` calls exactly one of each on two different managers —
+    /// so a manager that answered both would erase which scheme kind it is.
+    /// ⭐ THE LIST IS `&[EvAddressInfo]` FOR ITS OWN REASON: `EVAddrInfoListTy` is
+    /// `SmallVector<EVAddressInfo, 1>` (`:296`) and this seam only reads it.
+    fn eval_observed_addresses(
+        &mut self,
+        evaluator: &mut dyn ExpressionEvaluator,
+        memory_unit: DfirUnit,
+        ev_addr_info_list: &[EvAddressInfo],
+    ) {
+        let _ = (evaluator, memory_unit, ev_addr_info_list);
+        todo!(
+            "DynamicPinningSchemeManager::eval (Analyses/AddressPinningScheme.h:309) — out of campaign scope"
+        )
+    }
 }
 
 /// THE ONE CRATE IMPLEMENTATION, for the reason [`OutOfScopeEvaluator`] is the evaluator's.

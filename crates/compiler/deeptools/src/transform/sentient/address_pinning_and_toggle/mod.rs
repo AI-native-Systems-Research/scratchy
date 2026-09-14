@@ -182,7 +182,7 @@ use crate::model::Model;
 use crate::workload::Workload;
 use crate::transform::sentient::analyses::{
     BodyIndex, EvAddressInfo, EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites,
-    PinningSchemeManager, RegionNum, RegionSite,
+    OutOfScopePinningSchemeManager, PinningSchemeManager, RegionNum, RegionSite,
 };
 use crate::transform::sentient::{ForRef, IterArgIndex, ProgStitch};
 use crate::units::DfirUnit;
@@ -1841,10 +1841,22 @@ impl AddressPinningAndTogglePass {
     /// ⭐ `new DominanceInfo(unit)` / `delete dom_info_` IS THE MECHANISM FOR REACHING OPERANDS, which
     /// the campaign names droppable — the per-unit `runOn` is handed the unit and asks for dominance
     /// where it needs it.
-    pub fn run_on_program<A: Arch, M: Model, W: Workload>(&mut self, program: &mut Program<A, M, W>) {
-        for unit in program.units.iter_mut() {
+    /// ⭐ THE AMBIENT SERVICES ARE PARAMETERS, per e591 — and the preamble is destructured out of the
+    /// program because the per-unit `runOn` writes it (`createOffsetValue`'s `const_builder`) while it
+    /// holds the unit body.
+    pub fn run_on_program<A: Arch, M: Model, W: Workload, E: ExpressionEvaluator>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+        prog_stitch: ProgStitch,
+        evaluator: &mut E,
+        values: &mut Values,
+    ) {
+        let Program {
+            preamble, units, ..
+        } = program;
+        for unit in units.iter_mut() {
             self.cleanup();
-            self.run_on_unit(unit);
+            self.run_on_unit(unit, preamble, prog_stitch, evaluator, values);
         }
 
         // THE CLEANUP WALK (`:1194-1197`) — every `uniform.query_map` in the module, the preamble
@@ -1858,19 +1870,10 @@ impl AddressPinningAndTogglePass {
                 )
             }
         };
-        walk_pre_order(&program.preamble, &mut simplify);
-        for unit in program.units.iter() {
+        walk_pre_order(preamble, &mut simplify);
+        for unit in units.iter() {
             walk_pre_order(&unit.body, &mut simplify);
         }
-    }
-
-    /// `runOn(dataflow::ProgramUnitOp)` — entry 656, level 12, not yet ported.
-    fn run_on_unit<A: Arch>(&mut self, unit: &mut ProgramUnit<A>) -> ! {
-        let _ = unit;
-        todo!(
-            "e656_runOn(dataflow::ProgramUnitOp) — the L3LU/L3SU gate, the per-unit descriptor \
-             collection and the toggle rewrite (AddressPinningAndToggle.cpp:1337)"
-        )
     }
 }
 
@@ -2040,9 +2043,15 @@ impl AddressPinningAndTogglePass {
     /// it and [`Self::cleanup`] does not clear it.
     /// ⭐ SEN1P5 NEEDS IT BECAUSE immutable_addr FIELDS COMING FROM LX ADDRESSES MUST BE ADJUSTED TO 0
     /// (`:1203-1205`), which only the pinning path does.
-    pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    /// ⭐ THE THREE AMBIENT SERVICES ARE PARAMETERS: `dccExtContext().getProgStitch()` (read at
+    /// `:1510`), the pass's `evaluator_` — ONE arena for the whole module, which is why it is not
+    /// remade per unit — and the value minter every created op binds a result from.
+    pub fn run_on_operation<A: Arch, M: Model, W: Workload, E: ExpressionEvaluator>(
         &mut self,
         program: &mut Program<A, M, W>,
+        prog_stitch: ProgStitch,
+        evaluator: &mut E,
+        values: &mut Values,
     ) {
         if DISABLE_THIS_PASS {
             return;
@@ -2050,7 +2059,7 @@ impl AddressPinningAndTogglePass {
         if FORCE_ADDRESS_PINNING || A::GEN >= IsaGen::Sen1p5 {
             self.force_address_pinning = true;
         }
-        self.run_on_program(program);
+        self.run_on_program(program, prog_stitch, evaluator, values);
     }
 }
 
@@ -2835,10 +2844,131 @@ impl AddressPinningAndTogglePass {
     }
 }
 
-// crustify:todo: e656_runOn
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1337  (57 body lines, level 12)
-//   original  : void AddressPinningAndTogglePass::runOn(dataflow::ProgramUnitOp unit)
-//   calls     : e014_dump, e221_initialize, e252_size, e419_turnHBMConstantOpAddrsToQueryMapsInUniformRegions, e488_computeOrGetNumberOfStreams, e489_cleanup, e491_computeChainingInfo, e614_computeAddressInfoList, e647_CollectDataTransfersAndComputeMaxStreams, e655_processDataTransfers
+impl AddressPinningAndTogglePass {
+    /// Replaces: e656_runOn
+    ///
+    /// ONE PROGRAM UNIT, AND ONLY AN L3 HALF: pin its LX transfers under the STATIC pinning scheme,
+    /// then collect its HBM transfers afresh and pin those under the DYNAMIC one (`:1337-1393`).
+    ///
+    /// ⛔ `initialize(unit)` IS `num_streams_ = -1` AND NOTHING ELSE (`:1575-1577`), so `calls
+    /// e221_initialize` is a name collision with `SpecializedCanonicalization`'s, as e456's note says.
+    /// ⛔ NEITHER `int ns = computeOrGetNumberOfStreams()` RECOMPUTES ANYTHING (`:1358`, `:1386`): e647
+    /// has just memoised `num_streams_`, and both reads feed a debug print only.
+    /// ⭐ `getChildAnalysis<Static/DynamicPinningSchemeManager>(unit)` IS PER-UNIT AND OUT OF SCOPE, so
+    /// `eval` is where an L3 unit stops and the two managers are locals rather than parameters.
+    /// ⭐ `ScalarTy::Index` IS THE OP DEFINITION: `ty` is `mutable_addr_[0].get().getType()` (`:1029`)
+    /// and every sentient memory op declares both address operands `Arg<Index, ..>` (`SentientOps.td:460`).
+    fn run_on_unit<A: Arch, E: ExpressionEvaluator>(
+        &mut self,
+        unit: &mut ProgramUnit<A>,
+        preamble: &mut Vec<Op>,
+        prog_stitch: ProgStitch,
+        evaluator: &mut E,
+        values: &mut Values,
+    ) {
+        // `initialize(unit)` (`:1338`), inlined for the reason above.
+        self.num_streams = None;
+        turn_hbm_constant_op_addrs_to_query_maps_in_uniform_regions(
+            &mut unit.body,
+            preamble,
+            values,
+        );
+        // `getUnitType((*unit.getUnits().begin()).getDefiningOp<dataflow::GetUnitOp>())` (`:1340-1342`)
+        // is [`Units::kind`]: this island binds the component to the program unit itself.
+        let comp = unit.on.kind();
+        if !matches!(comp, DfirUnit::L3lu | DfirUnit::L3su) {
+            return;
+        }
+
+        // THE LX PHASE (`:1348-1362`) — the unit's own transfers, pinned under the static scheme.
+        {
+            // The scopes a `getDefiningOp()` searches: the unit body, then the enclosing function's
+            // entry block, which is where every `dataflow.get_unit` this island declares lives.
+            let regions: [&[Op]; 2] = [unit.body.as_slice(), preamble.as_slice()];
+            self.collect_data_transfers_and_compute_max_streams(
+                comp,
+                &unit.body,
+                Definitions::from_innermost(&regions),
+                DfirUnit::Lx,
+                evaluator,
+            );
+        }
+        self.immut_data_transfer_descriptors
+            .compute_chaining_info(&unit.body);
+        let mut static_pinning_scheme_manager = OutOfScopePinningSchemeManager;
+        static_pinning_scheme_manager.eval(&mut *evaluator, DfirUnit::Lx);
+        let _ns = self.compute_or_get_number_of_streams();
+        {
+            // `const_builder` IS THE ENCLOSING FUNCTION'S ENTRY BLOCK and `query_map_builder` is the
+            // walked region itself (`:1017-1030`), which is what [`OffsetSites::query_maps`] spells
+            // `None`.
+            let mut sites = OffsetSites {
+                consts: preamble,
+                query_maps: None,
+                values,
+            };
+            self.process_data_transfers(
+                &mut unit.body,
+                ScalarTy::Index,
+                prog_stitch,
+                evaluator,
+                &static_pinning_scheme_manager,
+                &mut sites,
+            );
+        }
+        self.cleanup();
+
+        // THE HBM PHASE (`:1364-1392`) — the SAME unit collected again, this time for its HBM ends.
+        {
+            let regions: [&[Op]; 2] = [unit.body.as_slice(), preamble.as_slice()];
+            self.collect_data_transfers_and_compute_max_streams(
+                comp,
+                &unit.body,
+                Definitions::from_innermost(&regions),
+                DfirUnit::Hbm,
+                evaluator,
+            );
+        }
+        self.immut_data_transfer_descriptors
+            .compute_chaining_info(&unit.body);
+        {
+            let regions: [&[Op]; 2] = [unit.body.as_slice(), preamble.as_slice()];
+            self.compute_address_info_list::<A>(
+                comp,
+                &unit.body,
+                Definitions::from_innermost(&regions),
+                evaluator,
+            );
+        }
+        if self.ev_addr_info_list.is_empty() {
+            // `LLVM_DEBUG(llvm::dbgs() << "No HBM data streams.\n")` (`:1391`) — the whole arm.
+            return;
+        }
+        let mut dynamic_pinning_scheme_manager = OutOfScopePinningSchemeManager;
+        dynamic_pinning_scheme_manager.eval_observed_addresses(
+            &mut *evaluator,
+            DfirUnit::Hbm,
+            &self.ev_addr_info_list,
+        );
+        let _ns = self.compute_or_get_number_of_streams();
+        {
+            let mut sites = OffsetSites {
+                consts: preamble,
+                query_maps: None,
+                values,
+            };
+            self.process_data_transfers(
+                &mut unit.body,
+                ScalarTy::Index,
+                prog_stitch,
+                evaluator,
+                &dynamic_pinning_scheme_manager,
+                &mut sites,
+            );
+        }
+        self.cleanup();
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -4220,10 +4350,10 @@ mod unit_tests {
         assert_eq!(toggle.min(&mut OutOfScopeEvaluator, &[], defs), None);
     }
 
-    /// 549/656 — the module walk clears the pass's accumulated state and hands each program unit to the
-    /// per-unit `runOn`, which is entry 656 and not this worklist's.
+    /// 549/656 — the module walk clears the pass's accumulated state and hands each program unit to
+    /// e656, whose L3 half stops at the out-of-scope static pinning scheme.
     #[test]
-    #[should_panic(expected = "e656_runOn(dataflow::ProgramUnitOp)")]
+    #[should_panic(expected = "StaticPinningSchemeManager::eval")]
     fn e549_hands_each_program_unit_to_the_per_unit_pass() {
         let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
             name: ProgramName {
@@ -4234,9 +4364,14 @@ mod unit_tests {
             preamble: Vec::new(),
             units: ProgramUnits::of(
                 ProgramUnit {
-                    on: Units::one(DfirUnit::L0lu, Val(100)),
+                    on: Units::one(DfirUnit::L3lu, Val(100)),
                     precision: None,
-                    body: Vec::new(),
+                    body: vec![
+                        get_unit(1, DfirUnit::Lx),
+                        get_unit(2, DfirUnit::Hbm),
+                        scalar_const(5, 8192),
+                        load_and_store(1, 2, 5, 10),
+                    ],
                     arch: core::marker::PhantomData,
                 },
                 Vec::new(),
@@ -4244,8 +4379,14 @@ mod unit_tests {
             bound: core::marker::PhantomData,
         };
 
-        AddressPinningAndTogglePass::default().run_on_program(&mut program);
+        AddressPinningAndTogglePass::default().run_on_program(
+            &mut program,
+            ProgStitch::Stitched,
+            &mut StatedEvaluator::default(),
+            &mut Values::default(),
+        );
     }
+
     /// A descriptor with `kind` as its pattern and the HBM subclass's two increments.
     fn hbm_with_pattern(
         kind: PatternDescriptor,
@@ -4261,7 +4402,8 @@ mod unit_tests {
         }
     }
 
-    /// A one-unit program on arch `A`, whose per-unit `runOn` is entry 656 and not this worklist's.
+    /// A one-unit program on arch `A`, whose one unit is no L3 half — so the per-unit `runOn` (e656)
+    /// returns after e419 and the module walk finds no query map to canonicalise.
     fn one_unit_program<A: Arch>() -> Program<A, AnyModel, AnyRung> {
         Program {
             name: ProgramName {
@@ -4350,21 +4492,25 @@ mod unit_tests {
     }
 
     /// 591/656 — SEN1P5 forces address pinning and RCUDD1A does not; both then run over the module,
-    /// whose per-unit pass is entry 656.
+    /// whose one unit is no L3 half and so is returned from.
     #[test]
     fn e591_forces_address_pinning_on_sen1p5_and_not_before() {
         let mut on_sen1p5 = AddressPinningAndTogglePass::default();
-        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            on_sen1p5.run_on_operation(&mut one_unit_program::<Sen1p5>());
-        }));
-        assert!(reached.is_err());
+        on_sen1p5.run_on_operation(
+            &mut one_unit_program::<Sen1p5>(),
+            ProgStitch::Stitched,
+            &mut StatedEvaluator::default(),
+            &mut Values::default(),
+        );
         assert!(on_sen1p5.force_address_pinning);
 
         let mut on_dd2 = AddressPinningAndTogglePass::default();
-        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            on_dd2.run_on_operation(&mut one_unit_program::<Dd2>());
-        }));
-        assert!(reached.is_err());
+        on_dd2.run_on_operation(
+            &mut one_unit_program::<Dd2>(),
+            ProgStitch::Stitched,
+            &mut StatedEvaluator::default(),
+            &mut Values::default(),
+        );
         assert!(!on_dd2.force_address_pinning);
     }
 
@@ -5059,5 +5205,101 @@ mod unit_tests {
         assert_eq!(pass.num_streams, Some(StreamCount(2)));
         assert_eq!(body, original);
         assert!(consts.is_empty());
+    }
+
+    /// 656/656 — an L3 half collects its own LX transfers, chains them and then stops at the
+    /// out-of-scope static pinning scheme, which is the seam every L3 unit reaches (`:1355-1357`).
+    #[test]
+    fn e656_an_l3_half_collects_its_lx_transfers_before_the_static_scheme() {
+        let mut unit: ProgramUnit<Dd2> = ProgramUnit {
+            on: Units::one(DfirUnit::L3lu, Val(100)),
+            precision: None,
+            body: vec![
+                get_unit(1, DfirUnit::Lx),
+                get_unit(2, DfirUnit::Hbm),
+                scalar_const(5, 8192),
+                load_and_store(1, 2, 5, 10),
+            ],
+            arch: core::marker::PhantomData,
+        };
+        let mut preamble = Vec::new();
+        let mut pass = AddressPinningAndTogglePass::default();
+        let mut evaluator = StatedEvaluator::default();
+        let mut values = Values::default();
+
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pass.run_on_unit(
+                &mut unit,
+                &mut preamble,
+                ProgStitch::Stitched,
+                &mut evaluator,
+                &mut values,
+            );
+        }))
+        .unwrap_err();
+
+        // `todo!` with no interpolation panics with a `&'static str` payload, not a `String`.
+        let message = stopped
+            .downcast_ref::<&str>()
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            message.contains("StaticPinningSchemeManager::eval"),
+            "{message}"
+        );
+        // The whole LX phase ran BEFORE that seam: one immutable descriptor, its constant base
+        // address matched, and e647's stream count memoised.
+        let immut = &pass.immut_data_transfer_descriptors.descriptors;
+        assert_eq!(immut.len(), 1);
+        assert_eq!(immut[0].memory_unit, DescriptorMemoryUnit::Lx);
+        assert_eq!(immut[0].base_addr, Some(Val(5)));
+        assert_eq!(pass.num_streams, Some(StreamCount(1)));
+    }
+
+    /// 656/656's negative — the component gate comes AFTER e419 (`:1339-1343`): a unit that is no L3
+    /// half still has its constant HBM addresses query-mapped, and then nothing is collected.
+    #[test]
+    fn e656_a_unit_that_is_not_an_l3_half_is_query_mapped_and_nothing_else() {
+        let mut preamble = vec![
+            get_unit(1, DfirUnit::Hbm),
+            get_unit(2, DfirUnit::Hbm),
+            get_unit(3, DfirUnit::Pe),
+            scalar_const(4, 64),
+        ];
+        let mut unit: ProgramUnit<Dd2> = ProgramUnit {
+            on: Units::one(DfirUnit::Lxlu, Val(100)),
+            precision: None,
+            body: vec![Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![LocalRegion {
+                    arg: Val(5),
+                    units: vec![Val(1), Val(2)],
+                    body: vec![load_and_store(1, 3, 4, 6)],
+                }],
+                results: Vec::new(),
+                yielded: Vec::new(),
+            })],
+            arch: core::marker::PhantomData,
+        };
+        let mut values = Values::default();
+        for _ in 0..13 {
+            let _ = values.mint();
+        }
+        let mut pass = AddressPinningAndTogglePass::default();
+
+        pass.run_on_unit(
+            &mut unit,
+            &mut preamble,
+            ProgStitch::Stitched,
+            &mut OutOfScopeEvaluator,
+            &mut values,
+        );
+
+        // e419's constants head the preamble, so it ran; and the gate returned before any descriptor
+        // was filed or any stream counted.
+        assert_eq!(preamble[0], scalar_const(13, 64));
+        assert_eq!(preamble[1], scalar_const(14, 64));
+        assert!(pass.immut_data_transfer_descriptors.descriptors.is_empty());
+        assert!(pass.mut_data_transfer_descriptors.descriptors.is_empty());
+        assert_eq!(pass.num_streams, None);
     }
 }
