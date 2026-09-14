@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //! IBM'S TEMPLATE-SELECTION TABLE, PORTED TO RUST — which `.ddl` serves each op-func, per core generation.
 //!
-//! Ported from two places in the deeptools source on the pod, read 2026-08-13:
+//! Ported from three places in the deeptools source:
 //!
-//! | fact | pod path |
+//! | fact | authority path |
 //! |---|---|
-//! | the (op-func → ordered candidates) table | `/project_src/deeptools/ddc/ddl/ddl_conversion.h:86-267` (`opFuncToDdlTemplate`) |
-//! | each `OpFuncs` variant's DDL spelling | `/project_src/deeptools/sys-arch-spec/arch_enums.cpp:308-481` (`opFuncsToString`) |
-//! | the core generations | `/project_src/deeptools/sys-arch-spec/isa/isa.hpp:25-32` (`enum IsaCoreGen`) |
+//! | the (op-func → ordered candidates) table | `ddc/ddl/ddl_conversion.h:86-271` (`opFuncToDdlTemplate`) |
+//! | each `OpFuncs` variant's DDL spelling | `sys-arch-spec/arch_enums.cpp:322-499` (`opFuncsToString`) |
+//! | the core generations | `sys-arch-spec/isa/isa.hpp:25-32` (`enum IsaCoreGen`) |
+//!
+//! ⛔ REVIEWED: RE-CITED AGAINST THE AUTHORITY. The three ranges were first read off the pod (2026-08-13) as
+//! `:86-267`, `:308-481` and `:25-32`; against the tree this campaign declares its authority only the last held.
+//! `:267` stops three rows SHORT of the table's `};` at `:271` — and stopping there is exactly what dropped four of
+//! its rows, see `OP_FUNC_TEMPLATES`.
 //!
 //! ⭐ THIS RESOLVES EVERY OP-FUNC, where the file stems alone resolve only the 73 that exactly one template
 //! declares — and it corrects the guess those stems invite, because `_dd1` is MPW4 rather than RCUDD1A, so plain
@@ -17,9 +22,9 @@
 //! restickify ones spell CamelCase (`ReStickifyOpLx`) — exactly as `opFuncsToString` writes them, because the `.ddl`
 //! templates match against these strings.
 //!
-//! ⛔ `CSQ_INT4` IS DECLARED TWICE IN THE C++ AND THE FIRST IS COMMENTED OUT (`ddl_conversion.h:207-208`), so the
-//! table holds 117 op-funcs and not 118. Both spell the same candidate, so a port that missed the comment would agree
-//! on behaviour and disagree on the count.
+//! ⛔ `CSQ_INT4` IS DECLARED TWICE IN THE C++ AND THE FIRST IS COMMENTED OUT (`ddl_conversion.h:210-211`), so the
+//! table holds 121 op-funcs across 122 declarations. Both spell the same candidate, so a port that missed the comment
+//! would agree on behaviour and disagree on the count.
 //!
 //! This file lives in `ddl/`, outside `src/`, because it holds TEXT: `build.rs` includes it, so the template file
 //! names cannot reach an island.
@@ -86,7 +91,16 @@ pub struct Candidate {
 /// ⛔ THE ORDER INSIDE AN ENTRY IS LOAD-BEARING. `opFuncToDdlTemplate` is an ORDERED list and dxp takes the first
 /// candidate whose ISA tag admits the target, so re-sorting an entry changes which template serves an op-func.
 ///
-/// 118 op-funcs, naming 30 distinct templates.
+/// ⛔ REVIEWED: FOUR ROWS WERE MISSING AND THREE ARE NOW BACK — `batchmatmulmxfp4w` (`ddl_conversion.h:107`),
+/// `addi32toi32` (`:169`) and `addi64toi64` (`:170`), each of which `ddl_templates` was answering
+/// with the *"no DDL available for op"* `None` that belongs to an op-func the table does not name at all. All four
+/// live past the `:267` the first read stopped at.
+/// ⛔ THE FOURTH IS STILL MISSING AND IT IS BLOCKED, NOT DECIDED: `StzLatch` → `stz_latch.ddl` (`:270`). That
+/// template is the one `ddc/ddl_templates/*.ddl` the crate has not vendored, so `Template` has no variant to name it
+/// and the row cannot be written until it is. Until then `selectAndParseDdlTemplate` answers *"no DDL available for
+/// op StzLatch"* where the reference would try `stz_latch.ddl`.
+///
+/// 120 of the authority's 121 op-funcs, naming 30 of its 31 distinct templates.
 pub const OP_FUNC_TEMPLATES: &[(&str, &[Candidate])] = &[
     (
         "matmul",
@@ -172,6 +186,13 @@ pub const OP_FUNC_TEMPLATES: &[(&str, &[Candidate])] = &[
                 serves: Serves::Only(IsaGen::Sen1p5),
             },
         ],
+    ),
+    (
+        "batchmatmulmxfp4w",
+        &[Candidate {
+            template: "bmm_sen1p5.ddl",
+            serves: Serves::Only(IsaGen::Sen1p5),
+        }],
     ),
     (
         "batchmatmulfp8",
@@ -512,6 +533,20 @@ pub const OP_FUNC_TEMPLATES: &[(&str, &[Candidate])] = &[
     ),
     (
         "add",
+        &[Candidate {
+            template: "broadcast_ops.ddl",
+            serves: Serves::EveryArch,
+        }],
+    ),
+    (
+        "addi32toi32",
+        &[Candidate {
+            template: "broadcast_ops.ddl",
+            serves: Serves::EveryArch,
+        }],
+    ),
+    (
+        "addi64toi64",
         &[Candidate {
             template: "broadcast_ops.ddl",
             serves: Serves::EveryArch,

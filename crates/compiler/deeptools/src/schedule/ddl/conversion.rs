@@ -5978,10 +5978,19 @@ pub struct DdlSelection {
 /// the walk goes on.
 ///
 /// ⛔ [`None`] IS THE `ENABLE_LN32` ABORT, every refusal the four callees answer with, and a parse
-/// yielding nothing — which the reference would walk as a null root. The `enableLn32 = true; continue`
-/// after that abort is DEAD, since `DT_ERROR` throws; the `DEEPTOOLS_PATH` abort is unspellable,
-/// because the template directory is how a candidate is REACHED and one arrives here as a [`Template`].
+/// yielding nothing. The `enableLn32 = true; continue` after that abort is DEAD, since `DT_ERROR`
+/// throws; the `DEEPTOOLS_PATH` abort is unspellable, because the template directory is how a
+/// candidate is REACHED and one arrives here as a [`Template`].
+/// ⛔ REVIEWED: THE TWO PARSE FAILURES ARE NOT THE SAME FAILURE, and the earlier note named the
+/// wrong one. A buffer that OPENS and then parses to nothing RAISES — `DdlMain`'s own `DT_CHECK(op)`
+/// (`ddl.cpp:106`); it is the buffer that does not OPEN AT ALL that returns `nullptr` from `:103`,
+/// three lines BEFORE that check, leaving `ddl_module_op_` null for `matchDdl2Dsc` to walk as a null
+/// root (`ddl_conversion.cpp:2111`). [`DdlModuleOp::module`] answers [`None`] for both, so this stops
+/// on either.
 /// ⛔ THE ARCH SKIP IS [`ddl_templates`]'S, resolved at build time: MPW4 has no [`crate::arch::IsaGen`].
+/// ⛔ TRAP: `ddl_templates` MUST NAME EVERY ROW OF `opFuncToDdlTemplate`, because its [`None`] is the
+/// *"no DDL available"* answer. `StzLatch` is one row it cannot name yet — see `OP_FUNC_TEMPLATES` in
+/// `ddl/selection.rs`.
 #[expect(
     clippy::too_many_arguments,
     reason = "the reference's own member state"
@@ -6078,7 +6087,7 @@ mod unit_tests {
         process_condition, process_dimension_op, process_expression, process_region, process_types,
         tensor, tensor_and_allocation, tensor_prop, transfer_access_pattern, verify_ddl_constraint,
     };
-    use crate::arch::{Dd2, Elements};
+    use crate::arch::{Dd2, Elements, IsaGen};
     use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
         Extent, PrimaryDim, StickDims,
@@ -6109,7 +6118,8 @@ mod unit_tests {
     use crate::units::Core;
 
     use super::{
-        DdlRoot, SyncEnds, SyncProp, TRANSFER_PROMOTION_DISABLED, Transformation, parse_ddl2_dsc,
+        DdlRoot, SyncEnds, SyncProp, TRANSFER_PROMOTION_DISABLED, Transformation, ddl_templates,
+        parse_ddl2_dsc,
     };
     use crate::generated::SyncSignal;
     use crate::schedule::ddc::fold::{BlockId, NodeKind, ScheduleTree};
@@ -8145,5 +8155,45 @@ mod unit_tests {
             None
         );
         assert_eq!(run(Some(OpFunc::Exx2), second, cores, Ln32::On).0, None);
+    }
+
+    /// ⛔ REVIEWED: THE CANDIDATE LOOKUP MUST NAME EVERY ROW OF `opFuncToDdlTemplate`, because
+    /// [`None`] is entry 372's *"no DDL available for op"* and it is the answer for an op-func the
+    /// table does NOT name — never for one it does. Three rows past the `:267` the first read of
+    /// `ddl_conversion.h` stopped at were answering [`None`], and an EMPTY list — every candidate
+    /// skipped on arch — is the third, distinct answer.
+    #[test]
+    fn every_row_of_the_candidate_table_is_named() {
+        // `:169-170`, untagged, so both generations serve them.
+        for op_func in [OpFunc::AddI32ToI32, OpFunc::AddI64ToI64] {
+            for isa in [IsaGen::Rcudd1a, IsaGen::Sen1p5] {
+                assert_eq!(
+                    ddl_templates(op_func.spelling(), isa),
+                    Some([Template::BroadcastOps].as_slice()),
+                    "{} on {isa:?}",
+                    op_func.spelling()
+                );
+            }
+        }
+        // `:107`, SEN1P5 only — so RCUDD1A gets the EMPTY list and not the miss.
+        assert_eq!(
+            ddl_templates(OpFunc::BatchmatmulMxfp4WFwd.spelling(), IsaGen::Sen1p5),
+            Some([Template::BmmSen1p5].as_slice())
+        );
+        assert_eq!(
+            ddl_templates(OpFunc::BatchmatmulMxfp4WFwd.spelling(), IsaGen::Rcudd1a),
+            Some([].as_slice())
+        );
+        // `:270`, and STILL A MISS: `stz_latch.ddl` is unvendored, so `Template` cannot name it. This
+        // assertion FAILS the day it is vendored and the row restored, which is when it should.
+        assert_eq!(
+            ddl_templates(OpFunc::StzLatch.spelling(), IsaGen::Rcudd1a),
+            None
+        );
+        // The control: an op-func the table genuinely does not name.
+        assert_eq!(
+            ddl_templates(OpFunc::Softmax.spelling(), IsaGen::Rcudd1a),
+            None
+        );
     }
 }
