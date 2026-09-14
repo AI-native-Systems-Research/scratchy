@@ -169,10 +169,12 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, SliceElems, Stage, StickDims, StickPart, cumulative_stick_sizes,
 };
 use crate::generated::DataConnect;
-use crate::schedule::ddc::{CoordPropTracker, NodeNames, Propagation, RefRole};
-use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, Metadata};
-use crate::schedule::ddc::transformation::Scale;
-use crate::schedule::ddc::transformation_util::{LoopNode, PaddingForm, PrimaryDimAndKind};
+use crate::schedule::ddc::{CoordPropTracker, NodeNames, Propagation, QueuedProp, RefRole};
+use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, Metadata, NodeIndex};
+use crate::schedule::ddc::transformation::{DsType, Scale};
+use crate::schedule::ddc::transformation_util::{
+    LoopNode, PaddingForm, PrimaryDimAndKind, is_memory,
+};
 use crate::schedule::dsc2;
 use crate::schedule::dsc2::{
     ComputeNode, CoordinateCategory, Dsc, FoldCardinality, FoldCoeff, LdsIdx, Node, Operand,
@@ -504,6 +506,24 @@ pub enum NodeKind {
     Allocate,
     /// `STICKMASK`.
     StickMask,
+}
+
+impl NodeKind {
+    /// `ScheduleNode::nodeTypeToString.at(nodeType_)` (`dsc/dsc2.cpp:1879-1888`) — this enum's name
+    /// lowered, for every kind it spells.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Loop => "loop",
+            Self::Transfer => "transfer",
+            Self::Compute => "compute",
+            Self::Sync => "sync",
+            Self::Condition => "condition",
+            Self::Allocate => "allocate",
+            Self::StickMask => "stickmask",
+        }
+    }
 }
 
 /// ONE SCHEDULE NODE'S IDENTITY — the reference compares `ScheduleNode*`, and every question these
@@ -7257,12 +7277,1054 @@ where
     true
 }
 
-// crustify:todo: e370_buildAndPropagateFold
-//   authority : ddc/ddc_fold.cpp:1625  (350 body lines, level 5)
-//   class     : Ddc
-//   original  : void Ddc::buildAndPropagateFold()
-//   extract   : crustify-ddc/cpp/ddc.cpp:14384-14734
-//   calls     : e073_addPropInfo, e075_getCurrItem, e078_dbgPrint, e079_dbgPrint, e082_getCompRowId, e086_isAllocateIncoming, e230_addPropInfo, e232_reset, e233_dbgPrint, e238_getRelatedComputeCoord, e240_buildFoldForExternalAllocation, e356_buildFoldForAllocation, e357_buildFoldForCompute, e358_buildFoldForTransfer
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐ ENTRY 370 — THE DRIVER THAT BUILDS EVERY FOLD AND PROPAGATES IT.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `coordPropReportLevel_` AS ITS TWO THRESHOLDS — `> 0` and `> 2` is the whole of what the level
+/// means to entry 370.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum CoordPropReport {
+    /// `0` — no report.
+    #[default]
+    Off,
+    /// `1` and `2` — every propagation step's header. ⭐ LEVEL 2 ADDS NOTHING AT THIS ENTRY.
+    Steps,
+    /// `3` and above — the same, plus every labeled DS and every unsupported node kind.
+    Labels,
+}
+
+impl CoordPropReport {
+    /// `coordPropReportLevel_ > 0`.
+    const fn reports(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// `coordPropReportLevel_ > 2`.
+    const fn labels(self) -> bool {
+        matches!(self, Self::Labels)
+    }
+}
+
+/// ONE LABELED DATA STRUCTURE AS THE EXTERNAL SCAN READS IT — a `currDsc->labeledDs_` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropLds {
+    /// Which entry this is.
+    pub idx: LdsIdx,
+    /// `dsType_`.
+    pub ds_type: DsType,
+    /// `memOrg_.at(SenComponents::LX).allocateNode_`, absent where `memOrg_.count(LX)` is zero —
+    /// which is the reference's `extAllocNode == nullptr`.
+    pub external: Option<NodeId>,
+}
+
+/// AN ALLOCATE NODE'S COORDINATE AS THE PROPAGATION READS IT — `allocateCoordinates_`'s tensor dims
+/// with the work slices that filter them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllocateCoord {
+    /// `getTensorDims()`.
+    pub dims: Vec<PrimaryDim>,
+    /// `coreIdToWkSlice_` — empty is a state and not an absence, as [`WorkSlices`] says.
+    pub work_slices: WorkSlices,
+}
+
+/// AN ALLOCATE NODE AS THE PROPAGATION KEYS ON ONE — its two identities plus the labeled-DS facts
+/// the MX value-to-scale redirect reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropAlloc {
+    /// The node — `refsAdded_`'s key and `dimsToPropagate`'s owner.
+    pub node: NodeId,
+    /// The allocation the node holds, which is what entry 086 compares.
+    pub alloc: AllocId,
+    /// `component_`.
+    pub component: SenComponent,
+    /// `ldsIdx_`, absent for its `-1`.
+    pub lds: Option<LdsIdx>,
+    /// `labeledDs_.at(ldsIdx_).scaledLdsCategory_`, absent for that same `-1`.
+    pub scaled: Option<ScaledLds>,
+}
+
+/// ONE DATASTREAM END AS THE PROPAGATION READS IT — the reference's `(dataInfo, comp)` argument pair.
+///
+/// ⚠️ THE STORAGE IS HERE TWICE BECAUSE THE CRATE SPELLS IT TWICE: `getAllocation` is keyed on
+/// [`StoredStream`]'s [`DfirUnit`], while the PT_NORTH/PT_SOUTH test compares the reference's own
+/// `SenComponents`. Converging the two spellings is the note on [`dsc2::DataInfo`]'s, not this
+/// entry's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropStream {
+    /// `dataInfo` with the memory it is looked up in.
+    pub stored: StoredStream,
+    /// `comp` — the same storage as a `SenComponents`.
+    pub component: SenComponent,
+}
+
+/// AN OPAQUE OP'S CONNECT LISTS — `instrAttribute_`'s two `data_connects_` vectors, which are the
+/// only handle on an opaque op's operands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueConnects {
+    /// `input_data_connects_`.
+    pub inputs: Vec<DataConnect>,
+    /// `output_data_connects_`.
+    pub outputs: Vec<DataConnect>,
+}
+
+/// A COMPUTE NODE AS ENTRY 370 READS IT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropCompute {
+    /// `exUnit_` in the fold vocabulary, for [`PropEnd::Compute`].
+    pub ex_unit: DfirUnit,
+    /// `senCompToRowId.count(exUnit_) ? .at(exUnit_) : -1` — the INLINE table read, which is why it
+    /// is not [`comp_row_id`]'s call.
+    pub row: Option<PtRowId>,
+    /// `isOpaqueOp_`, with the connect lists it makes readable.
+    pub opaque: Option<OpaqueConnects>,
+    /// `inputsLdsAndLoopOffsets_` paired with `inputs_`.
+    pub inputs: Vec<PropStream>,
+    /// `outputsLdsAndLoopOffsets_` paired with `outputs_`.
+    pub outputs: Vec<PropStream>,
+}
+
+/// ONE END OF A TRANSFER — a `..LdsAndLoopOffsets_`/`DataLocation` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropTransferEnd {
+    /// The stream, in the storage it is looked up in.
+    pub stream: PropStream,
+    /// `loc_.unit_` — what [`comp_row_id`] is asked about.
+    pub unit: SenComponent,
+}
+
+/// A TRANSFER NODE AS ENTRY 370 READS IT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropTransfer {
+    /// `srcLdsAndLoopOffsets_` with `src_`.
+    pub src: PropTransferEnd,
+    /// `dstLdsAndLoopOffsets_` with `dstVias_`, in destination order.
+    pub dsts: Vec<PropTransferEnd>,
+}
+
+/// ONE USER'S INCOMING DATASTREAMS, OWNED — what entry 086's borrowed [`IncomingStreams`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserStreams {
+    /// `TRANSFER` — `srcLdsAndLoopOffsets_` in `src_.storage_`.
+    Transfer(StoredStream),
+    /// `COMPUTE` — every input.
+    Compute(Vec<StoredStream>),
+}
+
+impl UserStreams {
+    /// The same streams as entry 086 reads them.
+    #[must_use]
+    pub fn borrow(&self) -> IncomingStreams<'_> {
+        match self {
+            Self::Transfer(src) => IncomingStreams::Transfer(*src),
+            Self::Compute(inputs) => IncomingStreams::Compute(inputs),
+        }
+    }
+}
+
+/// WHICH COORDINATE THE ALLOCATE ARM PROPAGATES FROM — `refCoordinate`, NAMED and not lent because
+/// both of the calls it feeds mutate the node it lives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropRefCoord {
+    /// `static_cast<TransferNode *>(refNode)->transferCoordinates_`.
+    Transfer(NodeId),
+    /// `getRelatedComputeCoord(refCompute, reverseCoordPropInfo, ..)`'s pick on that compute.
+    Compute(NodeId, RelatedCoord),
+}
+
+/// `SenComponents::L0_SCALE` / `PTXRF` — the memory a value tensor's scale tensor is allocated in,
+/// and [`None`] for the reference's `NO_COMPONENT` `DT_ERROR` (`ddc/ddc_fold.cpp:1737-1744`).
+const fn scale_memory(component: SenComponent) -> Option<SenComponent> {
+    match component {
+        SenComponent::L0 => Some(SenComponent::L0Scale),
+        SenComponent::Ptxrf => Some(SenComponent::Ptxrf),
+        _ => None,
+    }
+}
+
+/// WHAT ENTRY 370 READS AND MUTATES, AND THE SEAM IT REACHES THE FOUR FOLD BUILDERS THROUGH.
+///
+/// ⛔⛔ THE SEAM, AND NOT A STAND-IN: the five builder methods below MUST call the landed
+/// [`build_fold_for_external_allocation`], [`build_fold_for_compute`], [`build_fold_for_transfer`],
+/// [`build_fold_for_allocation`] and [`get_related_compute_coord`]. Their argument lists take eight
+/// to twelve witnesses each — `FoldContext`, `ComputeFold`, `FoldReference`, `RowBundlingScan`,
+/// `WorkSlices` and the rest — and only the whole `Ddc` can assemble those, which is the mechanism
+/// for reaching operands and the one part of this entry that is not stated here. A stand-in fold
+/// leaves every coordinate below LX unbuilt and this entry has nothing left to propagate.
+/// ⛔ THE COORDINATES STAY IN THE DSC. `refCoordinate` is named by [`PropRefCoord`] rather than lent
+/// because entry 356 and `computeLoopElemOffsetsFromCoordinates` both write through it.
+pub trait FoldDriver: ScheduleTree + Allocations {
+    /// `scheduleTree_.traverseTreeDFSMutable(nullptr, {COMPUTE})`.
+    fn computes(&self) -> Vec<NodeId>;
+
+    /// `computeNode->inputCoordinates_.resize(slots)`.
+    fn resize_input_coordinates(&mut self, compute: NodeId, slots: usize);
+
+    /// `currDsc->labeledDs_`, in order.
+    fn labeled_ds(&self) -> Vec<PropLds>;
+
+    /// `currDsc->printLabeledDs(std::cout, lds, "  ")`.
+    fn labeled_ds_text(&self, lds: LdsIdx) -> String;
+
+    /// `isExternalNode(node)`.
+    fn is_external_node(&self, node: NodeId) -> bool;
+
+    /// `allocNode->allocateCoordinates_`.
+    fn allocate_coord(&self, alloc: NodeId) -> AllocateCoord;
+
+    /// `sdsc_->coreIdToWkSlice_`.
+    fn sdsc_work_slices(&self) -> WorkSlices;
+
+    /// `allocNode->allocUsers_`'s keys, in the map's order. ⛔ THE REF COUNT BESIDE EACH IS UNREAD.
+    fn allocation_users(&self, alloc: NodeId) -> Vec<NodeId>;
+
+    /// The incoming datastreams entry 086 reads off one user.
+    fn incoming_streams(&self, node: NodeId) -> Option<UserStreams>;
+
+    /// An allocate node's identities and labeled-DS facts, absent for a node that is not one.
+    fn prop_allocation(&self, node: NodeId) -> Option<PropAlloc>;
+
+    /// The node an allocation is held by — what `getMutableAllocation`'s answer is keyed back to.
+    fn allocation_node(&self, alloc: AllocId) -> Option<NodeId>;
+
+    /// `labeledDs_.at(labeledDs_.at(lds).mxInfo_.relatedLdsIdx).memOrg_.at(memory).allocateNode_`,
+    /// and [`None`] where either of those two `.at()` throws.
+    fn related_scale_allocation(&self, lds: LdsIdx, memory: SenComponent) -> Option<NodeId>;
+
+    /// A compute node as this entry reads it, absent for a node that is not one.
+    fn prop_compute(&self, compute: NodeId) -> Option<PropCompute>;
+
+    /// A transfer node as this entry reads it, absent for a node that is not one.
+    fn prop_transfer(&self, transfer: NodeId) -> Option<PropTransfer>;
+
+    /// `inputCoordinates_.at(i).getTensorDims()` / `outputCoordinate_.getTensorDims()`. ⛔ AN OUTPUT
+    /// POSITION NAMES THE SINGLE `outputCoordinate_` whatever its index, as [`RelatedComputeCoord`]
+    /// says.
+    fn compute_coord_dims(&self, compute: NodeId, at: OperandPos) -> Vec<PrimaryDim>;
+
+    /// `transferCoordinates_.getTensorDims()`, and [`None`] where `coordinates_` is EMPTY — which is
+    /// the emptiness the TRANSFER arm tests before it walks the ends.
+    fn transfer_coord_dims(&self, transfer: NodeId) -> Option<Vec<PrimaryDim>>;
+
+    /// The node the census indexed at that position — `metadata.dataConnects_` holds its ends
+    /// positionally, and the propagation queue keys on the tree.
+    fn node_at(&self, index: NodeIndex) -> Option<NodeId>;
+
+    /// The node itself, for entry 233's debug line.
+    fn schedule_node(&self, node: NodeId) -> Option<Node<'_>>;
+
+    /// `buildFoldForExternalAllocation(extAllocNode)` — entry 240 with its witnesses assembled.
+    fn build_fold_for_external_allocation(&mut self, alloc: NodeId);
+
+    /// `buildFoldForCompute(computeNode, coordPropInfo, constructedInputCoords,
+    /// constructedOutputCoords)` — entry 357, whose two out-vectors are the answer.
+    fn build_fold_for_compute(
+        &mut self,
+        compute: NodeId,
+        item: &QueuedProp,
+        tracker: &mut CoordPropTracker,
+    ) -> ConstructedCoords;
+
+    /// `buildFoldForTransfer(transferNode, coordPropInfo)` — entry 358.
+    fn build_fold_for_transfer(
+        &mut self,
+        transfer: NodeId,
+        item: &QueuedProp,
+        tracker: &mut CoordPropTracker,
+    ) -> bool;
+
+    /// `buildFoldForAllocation(coordPropInfo, refCoordinate, allocNode)` — entry 356.
+    fn build_fold_for_allocation(
+        &mut self,
+        alloc: NodeId,
+        item: &QueuedProp,
+        reference: PropRefCoord,
+        tracker: &mut CoordPropTracker,
+    ) -> bool;
+
+    /// `getRelatedComputeCoord(refCompute, reverseCoordPropInfo, inputCoords, outputCoords, ldsIdx)`
+    /// — entry 238 over the compute's own streams, which only the DSC can lend.
+    fn related_compute_coord(
+        &self,
+        compute: NodeId,
+        reference: &ComputeCoordRef,
+    ) -> Option<RelatedCoord>;
+
+    /// `dsc2::computeLoopElemOffsetsFromCoordinates(currDsc, refNode, refCoordinate, allocNode,
+    /// loopDistributionParamInfo.at(refNode).at(allocNode), dimsToPropagate, coordPropReportLevel_)`
+    /// — the [`LoopElemOffsets`] capability, reached over the coordinate this entry named.
+    fn loop_elem_offsets_from_coordinates(
+        &mut self,
+        reference: PropRefCoord,
+        alloc: NodeId,
+        dims: &[PrimaryDim],
+        report: CoordPropReport,
+    );
+}
+
+/// `coordPropInfo.refNode` / `.nodeToFold` as [`PropEnd`] spells one — the ALLOCATE and COMPUTE arms
+/// carry what entry 091's match reads and every other kind is [`PropEnd::Other`].
+fn prop_end<S: FoldDriver + ?Sized>(dsc: &S, node: NodeId) -> PropEnd {
+    match dsc.kind(node) {
+        NodeKind::Allocate => match dsc.prop_allocation(node) {
+            Some(alloc) => PropEnd::Allocate {
+                alloc: alloc.alloc,
+                scaled: alloc.scaled,
+            },
+            None => PropEnd::Other,
+        },
+        NodeKind::Compute => match dsc.prop_compute(node) {
+            Some(compute) => PropEnd::Compute {
+                ex_unit: compute.ex_unit,
+            },
+            None => PropEnd::Other,
+        },
+        _ => PropEnd::Other,
+    }
+}
+
+/// `for (auto &[userNode, refCount] : allocNode->allocUsers_)` — the block the external scan and the
+/// ALLOCATE arm run WORD FOR WORD (`ddc/ddc_fold.cpp:1690-1710`, `:1901-1921`): every COMPUTE or
+/// TRANSFER user that is not an opaque compute is queued against this allocation.
+fn queue_allocation_users<S: FoldDriver + ?Sized>(
+    dsc: &S,
+    tracker: &mut CoordPropTracker,
+    alloc: NodeId,
+    dims: &[PrimaryDim],
+) {
+    let Some(owner) = dsc.prop_allocation(alloc) else {
+        return;
+    };
+    let users = dsc.allocation_users(alloc);
+    for &user in &users {
+        let end = match dsc.kind(user) {
+            NodeKind::Compute => {
+                let Some(body) = dsc.prop_compute(user) else {
+                    continue;
+                };
+                // Opaque operations do not maintain dataInfos. Currently, it is not possible to
+                // determine which input or output of an opaque op corresponds to an allocateNode
+                // unless the associated data_connect is also specified.
+                if body.opaque.is_some() {
+                    continue;
+                }
+                PropEnd::Compute {
+                    ex_unit: body.ex_unit,
+                }
+            }
+            NodeKind::Transfer => PropEnd::Other,
+            _ => continue,
+        };
+        // ⭐ NEITHER OF ENTRY 086'S REFUSALS IS REACHABLE HERE: the list IS `allocUsers_`, and the
+        // kind is already one of the two that carry incoming datastreams.
+        let streams = dsc.incoming_streams(user);
+        let incoming = Incoming::of(&users, user, streams.as_ref().map(UserStreams::borrow));
+        let ref_role = match incoming {
+            Some(user) if is_allocate_incoming(dsc, owner.alloc, &user) => RefRole::Producer,
+            _ => RefRole::Consumer,
+        };
+        tracker.add_prop_info(
+            Propagation {
+                ends: CoordPropInfo {
+                    data_connect: None,
+                    ref_node: PropEnd::Allocate {
+                        alloc: owner.alloc,
+                        scaled: owner.scaled,
+                    },
+                    node_to_fold: end,
+                },
+                ref_node: alloc,
+                node_to_fold: user,
+                ref_role,
+                scale_down: super::ScaleDown::No,
+            },
+            dims,
+        );
+    }
+}
+
+/// `collectAndProcessDatastreamNodes` (`ddc/ddc_fold.cpp:1714-1830`) — entry 370's own lambda: one
+/// datastream end either reaches an allocation, which is queued (with its MX scale tensor behind it),
+/// or it is a FIFO, whose peers on that `data_connect=` are queued after the PT-row filter.
+fn collect_and_process_datastream_nodes<S: FoldDriver + ?Sized>(
+    dsc: &S,
+    metadata: &Metadata,
+    tracker: &mut CoordPropTracker,
+    curr: NodeId,
+    ref_for_curr: NodeId,
+    stream: PropStream,
+    ref_dims: &[PrimaryDim],
+    row: Option<PtRowId>,
+    side: StreamSide,
+) {
+    let curr_end = prop_end(dsc, curr);
+    let ref_role = match side {
+        StreamSide::Inputs => RefRole::Consumer,
+        StreamSide::Outputs => RefRole::Producer,
+    };
+    if let Some(alloc) = dsc.allocation(stream.stored) {
+        let Some(owner) = dsc
+            .allocation_node(alloc)
+            .and_then(|node| dsc.prop_allocation(node))
+        else {
+            return;
+        };
+        if owner.node == ref_for_curr {
+            return;
+        }
+        let mut prop = Propagation {
+            ends: CoordPropInfo {
+                data_connect: None,
+                ref_node: curr_end,
+                node_to_fold: PropEnd::Allocate {
+                    alloc: owner.alloc,
+                    scaled: owner.scaled,
+                },
+            },
+            ref_node: curr,
+            node_to_fold: owner.node,
+            ref_role,
+            scale_down: super::ScaleDown::No,
+        };
+        tracker.add_prop_info(prop, ref_dims);
+        // In case a computeNode consumes from or produces to a value tensor allocation in MX-scale
+        // mode, include the corresponding scale tensor allocation in the propagation queue.
+        if let PropEnd::Compute { .. } = curr_end
+            && let Some(lds) = owner.lds
+            && owner.scaled == Some(ScaledLds::Value)
+        {
+            let memory = scale_memory(owner.component).unwrap_or_else(|| {
+                panic!(
+                    "Unsupported component {} for value tensor allocation.",
+                    owner.component.spelling()
+                )
+            });
+            let Some(scale) = dsc
+                .related_scale_allocation(lds, memory)
+                .and_then(|node| dsc.prop_allocation(node))
+            else {
+                return;
+            };
+            prop.ends.node_to_fold = PropEnd::Allocate {
+                alloc: scale.alloc,
+                scaled: scale.scaled,
+            };
+            prop.node_to_fold = scale.node;
+            prop.scale_down = super::ScaleDown::Yes;
+            tracker.add_prop_info(prop, ref_dims);
+        }
+        return;
+    }
+    // The datastream is a FIFO.
+    if is_memory(stream.component) || stream.component == SenComponent::NoComponent {
+        return;
+    }
+    let Some(dc) = stream.stored.stream.data_connect else {
+        return;
+    };
+    let Some(ends) = metadata.data_connects.get(&dc) else {
+        return;
+    };
+    let peers = match side {
+        StreamSide::Inputs => ends.producers(),
+        StreamSide::Outputs => ends.consumers(),
+    };
+    for &index in peers {
+        let Some(peer) = dsc.node_at(index) else {
+            continue;
+        };
+        let peer_end = match dsc.kind(peer) {
+            NodeKind::Compute => {
+                let Some(body) = dsc.prop_compute(peer) else {
+                    continue;
+                };
+                if let Some(row) = row
+                    && !row_matches_compute(row, body.row, curr_end, stream.component)
+                {
+                    continue;
+                }
+                PropEnd::Compute {
+                    ex_unit: body.ex_unit,
+                }
+            }
+            NodeKind::Transfer => {
+                let Some(body) = dsc.prop_transfer(peer) else {
+                    continue;
+                };
+                if let Some(row) = row {
+                    // Transfer's destination corresponds to the input dataInfo, and its source to
+                    // the output one.
+                    let peer_row = match side {
+                        StreamSide::Inputs => body.dsts.iter().find_map(|dst| {
+                            (dst.stream.stored.stream.data_connect == Some(dc))
+                                .then(|| comp_row_id(dst.unit))
+                                .flatten()
+                        }),
+                        StreamSide::Outputs => comp_row_id(body.src.unit),
+                    };
+                    if peer_row != Some(row) {
+                        continue;
+                    }
+                }
+                PropEnd::Other
+            }
+            _ => continue,
+        };
+        tracker.add_prop_info(
+            Propagation {
+                ends: CoordPropInfo {
+                    data_connect: Some(dc),
+                    ref_node: curr_end,
+                    node_to_fold: peer_end,
+                },
+                ref_node: curr,
+                node_to_fold: peer,
+                ref_role,
+                scale_down: super::ScaleDown::No,
+            },
+            ref_dims,
+        );
+    }
+}
+
+/// THE PT-ROW FILTER FOR A COMPUTE PEER (`ddc/ddc_fold.cpp:1782-1800`) — the same row, or one row
+/// north or south of it when both ends are computes.
+///
+/// ⚠️⚠️ TRAP, AND IT IS THE REFERENCE'S ARITHMETIC: `dcNodePtRowId == ptRowId - 1` HOLDS FOR A PEER
+/// ON NO ROW AT ALL when `ptRowId` is 0, because both sides are then `-1`. The comparison is kept
+/// signed for exactly that arm; `ptRowId + 1` can never be `-1`, so PT_SOUTH has no twin case.
+fn row_matches_compute(
+    row: PtRowId,
+    peer: Option<PtRowId>,
+    curr_end: PropEnd,
+    component: SenComponent,
+) -> bool {
+    let ref_row = i16::from(row.ordinal());
+    let peer_row = peer.map_or(-1, |peer| i16::from(peer.ordinal()));
+    if let PropEnd::Compute { .. } = curr_end {
+        // Allow ComputeNode -> ComputeNode with row difference of 1 to cover for PT_NORTH and
+        // PT_SOUTH dataflow.
+        (component == SenComponent::Ptnorth && peer_row == ref_row - 1)
+            || (component == SenComponent::Ptsouth && peer_row == ref_row + 1)
+            || peer_row == ref_row
+    } else {
+        peer_row == ref_row
+    }
+}
+
+/// Replaces: e370_buildAndPropagateFold
+///
+/// Builds every external LX allocation's fold, then drains the propagation queue: each step builds
+/// the fold of one compute, transfer or allocation and queues the datastream nodes behind it.
+///
+/// ⚠️ TRAP: `sdsc_->coreIdToWkSlice_.at(customCore).at(refDim)` throws where the SuperDSC has no
+/// slice for that core or dim; a missing slice is a MISMATCH here, which drops the dim from `refDims`
+/// rather than ending the run.
+/// ⚠️ TRAP: the reference `static_cast<ComputeNode *>`s the ALLOCATE arm's ref node whatever its kind
+/// (`:1892-1897`); a ref node that is neither a transfer nor a compute is skipped here.
+/// ⚠️ TRAP: entry 238's [`None`] is the reference's `DT_ERROR`, which ENDS the run — the step is
+/// dropped here instead. The reversed record's negated `refIsProducer` is unread either way:
+/// [`ComputeCoordRef`] carries only the two fields entry 238 asks for.
+pub fn build_and_propagate_fold<S: FoldDriver + ?Sized>(
+    dsc: &mut S,
+    metadata: &Metadata,
+    tracker: &mut CoordPropTracker,
+    report: CoordPropReport,
+) -> String {
+    let mut out = String::new();
+    // Reserve placeholders for coordinates in computeNodes.
+    for compute in dsc.computes() {
+        let Some(body) = dsc.prop_compute(compute) else {
+            continue;
+        };
+        let slots = match &body.opaque {
+            Some(opaque) => opaque.inputs.len(),
+            None => body.inputs.len(),
+        };
+        dsc.resize_input_coordinates(compute, slots);
+    }
+    tracker.reset();
+    // TO DO: Consider moving the external allocations to prepDsc to simulate the computation in
+    // upstream components. First, construct folds for the external allocateNodes.
+    for lds in dsc.labeled_ds() {
+        if report.labels() {
+            out.push_str("\nLDS: ");
+            out.push_str(&dsc.labeled_ds_text(lds.idx));
+            out.push_str("\n  extAllocNode: ");
+            match lds
+                .external
+                .and_then(|node| dsc.schedule_node(node).map(|node| node.name().0.clone()))
+            {
+                Some(name) => out.push_str(&name),
+                None => out.push_str("<not found>"),
+            }
+        }
+        let Some(external) = lds.external else {
+            continue;
+        };
+        if lds.ds_type == DsType::Internal || !dsc.is_external_node(external) {
+            continue;
+        }
+        dsc.build_fold_for_external_allocation(external);
+        let coord = dsc.allocate_coord(external);
+        let ref_dims: Vec<PrimaryDim> = if coord.work_slices.0.is_empty() {
+            coord.dims
+        } else {
+            let sdsc = dsc.sdsc_work_slices();
+            coord
+                .dims
+                .iter()
+                .copied()
+                .filter(|ref_dim| {
+                    coord.work_slices.0.iter().all(|(core, per_dim)| {
+                        per_dim.get(ref_dim).is_none_or(|slice| {
+                            sdsc.0.get(core).and_then(|dims| dims.get(ref_dim)) == Some(slice)
+                        })
+                    })
+                })
+                .collect()
+        };
+        if !ref_dims.is_empty() {
+            queue_allocation_users(dsc, tracker, external, &ref_dims);
+        }
+    }
+
+    // Construct folds for below-LX scheduleNodes based on the folds of the external allocateNodes.
+    while let Some(item) = tracker.next_item() {
+        let node = item.prop.node_to_fold;
+        if report.reports() {
+            out.push_str("\n>>> CoordinatePropagationInfo:\n      refNode=");
+            if let Some(ref_node) = dsc.schedule_node(item.prop.ref_node) {
+                out.push_str(&dbg_print(ref_node));
+            }
+            out.push_str("\n      nodeTofold= ");
+            if let Some(to_fold) = dsc.schedule_node(node) {
+                out.push_str(&dbg_print(to_fold));
+            }
+            out.push_str(&format!(
+                "\n      data_connect= {}, refIsProducer= {}\n      Dims:",
+                item.prop
+                    .ends
+                    .data_connect
+                    .map_or("", |connect| connect.spelling()),
+                match item.prop.ref_role {
+                    RefRole::Producer => "T",
+                    RefRole::Consumer => "F",
+                }
+            ));
+            for dim in &item.dims {
+                out.push(' ');
+                out.push_str(dim.spelling());
+            }
+            out.push('\n');
+        }
+        // Check if a fold is constructed already.
+        match dsc.kind(node) {
+            NodeKind::Compute => {
+                let constructed = dsc.build_fold_for_compute(node, &item, tracker);
+                let Some(body) = dsc.prop_compute(node) else {
+                    continue;
+                };
+                if let Some(opaque) = &body.opaque {
+                    for &at in &constructed.inputs {
+                        let Some(&working) = opaque.inputs.get(at) else {
+                            continue;
+                        };
+                        let dims = dsc.compute_coord_dims(node, OperandPos::Input(at));
+                        queue_opaque_peers(
+                            dsc,
+                            metadata,
+                            tracker,
+                            node,
+                            working,
+                            &dims,
+                            StreamSide::Inputs,
+                        );
+                    }
+                    if !constructed.outputs.is_empty() {
+                        // Include all outputs for propagation.
+                        let dims = dsc.compute_coord_dims(node, OperandPos::Output(0));
+                        for &working in &opaque.outputs {
+                            queue_opaque_peers(
+                                dsc,
+                                metadata,
+                                tracker,
+                                node,
+                                working,
+                                &dims,
+                                StreamSide::Outputs,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                for (side, positions) in [
+                    (StreamSide::Inputs, &constructed.inputs),
+                    (StreamSide::Outputs, &constructed.outputs),
+                ] {
+                    for &at in positions {
+                        let (streams, coord) = match side {
+                            StreamSide::Inputs => (&body.inputs, OperandPos::Input(at)),
+                            StreamSide::Outputs => (&body.outputs, OperandPos::Output(at)),
+                        };
+                        let Some(&stream) = streams.get(at) else {
+                            continue;
+                        };
+                        let dims = dsc.compute_coord_dims(node, coord);
+                        collect_and_process_datastream_nodes(
+                            dsc,
+                            metadata,
+                            tracker,
+                            node,
+                            item.prop.ref_node,
+                            stream,
+                            &dims,
+                            body.row,
+                            side,
+                        );
+                    }
+                }
+            }
+            NodeKind::Transfer => {
+                if !dsc.build_fold_for_transfer(node, &item, tracker) {
+                    continue;
+                }
+                let Some(dims) = dsc.transfer_coord_dims(node) else {
+                    continue;
+                };
+                let Some(body) = dsc.prop_transfer(node) else {
+                    continue;
+                };
+                for (end, side) in std::iter::once((body.src, StreamSide::Inputs))
+                    .chain(body.dsts.iter().map(|&dst| (dst, StreamSide::Outputs)))
+                {
+                    collect_and_process_datastream_nodes(
+                        dsc,
+                        metadata,
+                        tracker,
+                        node,
+                        item.prop.ref_node,
+                        end.stream,
+                        &dims,
+                        comp_row_id(end.unit),
+                        side,
+                    );
+                }
+            }
+            NodeKind::Allocate => {
+                let reverse = ComputeCoordRef {
+                    data_connect: item.prop.ends.data_connect,
+                    ref_node: match item.prop.ends.node_to_fold {
+                        PropEnd::Allocate { alloc, scaled } => {
+                            ComputeRefNode::Allocation { alloc, scaled }
+                        }
+                        PropEnd::Compute { .. } | PropEnd::Other => ComputeRefNode::Streamed,
+                    },
+                };
+                let ref_node = item.prop.ref_node;
+                let reference = match dsc.kind(ref_node) {
+                    NodeKind::Transfer => PropRefCoord::Transfer(ref_node),
+                    NodeKind::Compute => match dsc.related_compute_coord(ref_node, &reverse) {
+                        Some(selected) => PropRefCoord::Compute(ref_node, selected),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                if !dsc.build_fold_for_allocation(node, &item, reference, tracker) {
+                    continue;
+                }
+                dsc.loop_elem_offsets_from_coordinates(reference, node, &item.dims, report);
+                let coord = dsc.allocate_coord(node);
+                if coord.work_slices.0.is_empty() {
+                    queue_allocation_users(dsc, tracker, node, &coord.dims);
+                }
+            }
+            kind => {
+                if report.labels() {
+                    out.push_str(&format!(
+                        "[buildAndPropagateFold] Unsupported user node type {}",
+                        kind.spelling()
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `for (auto producer : metadata.dataConnects_.at(workingDc).producers_)` and its consumer twin
+/// (`ddc/ddc_fold.cpp:1849-1873`) — an opaque op's peers are queued by `data_connect=` alone, with
+/// no allocation lookup and no row filter.
+fn queue_opaque_peers<S: FoldDriver + ?Sized>(
+    dsc: &S,
+    metadata: &Metadata,
+    tracker: &mut CoordPropTracker,
+    compute: NodeId,
+    working: DataConnect,
+    dims: &[PrimaryDim],
+    side: StreamSide,
+) {
+    let Some(ends) = metadata.data_connects.get(&working) else {
+        return;
+    };
+    let (peers, ref_role) = match side {
+        StreamSide::Inputs => (ends.producers(), RefRole::Consumer),
+        StreamSide::Outputs => (ends.consumers(), RefRole::Producer),
+    };
+    let curr_end = prop_end(dsc, compute);
+    for &index in peers {
+        let Some(peer) = dsc.node_at(index) else {
+            continue;
+        };
+        tracker.add_prop_info(
+            Propagation {
+                ends: CoordPropInfo {
+                    data_connect: Some(working),
+                    ref_node: curr_end,
+                    node_to_fold: prop_end(dsc, peer),
+                },
+                ref_node: compute,
+                node_to_fold: peer,
+                ref_role,
+                scale_down: super::ScaleDown::No,
+            },
+            dims,
+        );
+    }
+}
+
+// ⭐ TESTS FOR ENTRY 370. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e370 {
+    use super::*;
+    use crate::schedule::ddc::CoordPropTracker;
+
+    /// The three-node schedule the walk runs over — an external LX allocation on labeled DS 0, the
+    /// compute that consumes it, and the allocation on labeled DS 1 that it writes — recording every
+    /// fold the driver was asked to build.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Walk {
+        resized: Vec<(NodeId, usize)>,
+        externals: Vec<NodeId>,
+        computes: Vec<NodeId>,
+        allocs: Vec<NodeId>,
+        offsets: Vec<(NodeId, Vec<PrimaryDim>)>,
+    }
+
+    /// The stream backed by labeled DS `lds`, which is how this double keys its allocations.
+    fn stream(lds: u32) -> StoredStream {
+        StoredStream {
+            stream: DataStream {
+                origin: DataOrigin::LabeledDs(LdsIdx(lds)),
+                data_connect: None,
+            },
+            storage: DfirUnit::Lx,
+        }
+    }
+
+    impl ScheduleTree for Walk {
+        fn kind(&self, node: NodeId) -> NodeKind {
+            if node == NodeId(2) {
+                NodeKind::Compute
+            } else {
+                NodeKind::Allocate
+            }
+        }
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+        fn children(&self, _block: BlockId) -> Vec<NodeId> {
+            Vec::new()
+        }
+    }
+
+    impl Allocations for Walk {
+        fn allocation(&self, stored: StoredStream) -> Option<AllocId> {
+            match stored.stream.origin {
+                DataOrigin::LabeledDs(lds) => Some(AllocId(lds.0)),
+                DataOrigin::Constant(_) => None,
+            }
+        }
+        fn value_allocation(&self, _scale: AllocId) -> Option<AllocId> {
+            None
+        }
+    }
+
+    impl FoldDriver for Walk {
+        fn computes(&self) -> Vec<NodeId> {
+            vec![NodeId(2)]
+        }
+        fn resize_input_coordinates(&mut self, compute: NodeId, slots: usize) {
+            self.resized.push((compute, slots));
+        }
+        fn labeled_ds(&self) -> Vec<PropLds> {
+            vec![PropLds {
+                idx: LdsIdx(0),
+                ds_type: DsType::Input,
+                external: Some(NodeId(0)),
+            }]
+        }
+        fn labeled_ds_text(&self, _lds: LdsIdx) -> String {
+            String::new()
+        }
+        fn is_external_node(&self, node: NodeId) -> bool {
+            node == NodeId(0)
+        }
+        fn allocate_coord(&self, alloc: NodeId) -> AllocateCoord {
+            let dim = if alloc == NodeId(0) {
+                PrimaryDim::In
+            } else {
+                PrimaryDim::Out
+            };
+            AllocateCoord {
+                dims: vec![dim],
+                work_slices: WorkSlices::default(),
+            }
+        }
+        fn sdsc_work_slices(&self) -> WorkSlices {
+            WorkSlices::default()
+        }
+        fn allocation_users(&self, _alloc: NodeId) -> Vec<NodeId> {
+            vec![NodeId(2)]
+        }
+        fn incoming_streams(&self, node: NodeId) -> Option<UserStreams> {
+            (node == NodeId(2)).then(|| UserStreams::Compute(vec![stream(0)]))
+        }
+        fn prop_allocation(&self, node: NodeId) -> Option<PropAlloc> {
+            (node != NodeId(2)).then(|| PropAlloc {
+                node,
+                alloc: AllocId(node.0),
+                component: SenComponent::L0,
+                lds: Some(LdsIdx(node.0)),
+                scaled: None,
+            })
+        }
+        fn allocation_node(&self, alloc: AllocId) -> Option<NodeId> {
+            Some(NodeId(alloc.0))
+        }
+        fn related_scale_allocation(&self, _lds: LdsIdx, _memory: SenComponent) -> Option<NodeId> {
+            None
+        }
+        fn prop_compute(&self, compute: NodeId) -> Option<PropCompute> {
+            (compute == NodeId(2)).then(|| PropCompute {
+                ex_unit: DfirUnit::Sfp,
+                row: None,
+                opaque: None,
+                inputs: vec![PropStream {
+                    stored: stream(0),
+                    component: SenComponent::L0,
+                }],
+                outputs: vec![PropStream {
+                    stored: stream(1),
+                    component: SenComponent::L0,
+                }],
+            })
+        }
+        fn prop_transfer(&self, _transfer: NodeId) -> Option<PropTransfer> {
+            None
+        }
+        fn compute_coord_dims(&self, _compute: NodeId, at: OperandPos) -> Vec<PrimaryDim> {
+            match at {
+                OperandPos::Input(_) => vec![PrimaryDim::In],
+                OperandPos::Output(_) => vec![PrimaryDim::Out],
+            }
+        }
+        fn transfer_coord_dims(&self, _transfer: NodeId) -> Option<Vec<PrimaryDim>> {
+            None
+        }
+        fn node_at(&self, _index: NodeIndex) -> Option<NodeId> {
+            None
+        }
+        fn schedule_node(&self, _node: NodeId) -> Option<Node<'_>> {
+            None
+        }
+        fn build_fold_for_external_allocation(&mut self, alloc: NodeId) {
+            self.externals.push(alloc);
+        }
+        fn build_fold_for_compute(
+            &mut self,
+            compute: NodeId,
+            _item: &QueuedProp,
+            _tracker: &mut CoordPropTracker,
+        ) -> ConstructedCoords {
+            self.computes.push(compute);
+            ConstructedCoords {
+                inputs: vec![0],
+                outputs: vec![0],
+            }
+        }
+        fn build_fold_for_transfer(
+            &mut self,
+            _transfer: NodeId,
+            _item: &QueuedProp,
+            _tracker: &mut CoordPropTracker,
+        ) -> bool {
+            false
+        }
+        fn build_fold_for_allocation(
+            &mut self,
+            alloc: NodeId,
+            _item: &QueuedProp,
+            _reference: PropRefCoord,
+            _tracker: &mut CoordPropTracker,
+        ) -> bool {
+            self.allocs.push(alloc);
+            true
+        }
+        fn related_compute_coord(
+            &self,
+            _compute: NodeId,
+            _reference: &ComputeCoordRef,
+        ) -> Option<RelatedCoord> {
+            Some(RelatedCoord {
+                coord: RelatedComputeCoord::Input(0),
+                lds: Some(LdsIdx(0)),
+            })
+        }
+        fn loop_elem_offsets_from_coordinates(
+            &mut self,
+            _reference: PropRefCoord,
+            alloc: NodeId,
+            dims: &[PrimaryDim],
+            _report: CoordPropReport,
+        ) {
+            self.offsets.push((alloc, dims.to_vec()));
+        }
+    }
+
+    /// e370: the external allocation's fold is built first, its compute user is propagated to, and the
+    /// compute's own output allocation is reached behind it — then the walk comes BACK through the
+    /// compute to the input allocation and stops, because the ledger already holds that pair's dim.
+    #[test]
+    fn the_external_fold_is_built_then_the_walk_propagates_both_ways_and_terminates() {
+        let mut walk = Walk::default();
+        let mut tracker = CoordPropTracker::default();
+
+        let out = build_and_propagate_fold(
+            &mut walk,
+            &Metadata::default(),
+            &mut tracker,
+            CoordPropReport::Labels,
+        );
+
+        // One placeholder per non-opaque input, and the external LX allocation's fold before any
+        // propagation step.
+        assert_eq!(walk.resized, vec![(NodeId(2), 1)]);
+        assert_eq!(walk.externals, vec![NodeId(0)]);
+        // Allocation 0 -> compute -> allocation 1 -> compute -> allocation 0, and no sixth step.
+        assert_eq!(walk.computes, vec![NodeId(2), NodeId(2)]);
+        assert_eq!(walk.allocs, vec![NodeId(1), NodeId(0)]);
+        assert_eq!(
+            walk.offsets,
+            vec![
+                (NodeId(1), vec![PrimaryDim::Out]),
+                (NodeId(0), vec![PrimaryDim::In]),
+            ]
+        );
+        assert!(out.starts_with("\nLDS: \n  extAllocNode: <not found>"));
+        assert_eq!(out.matches(">>> CoordinatePropagationInfo:").count(), 4);
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // ⭐ USES FOR ENTRY 375.
@@ -7270,11 +8332,14 @@ where
 
 use crate::schedule::dsc2::NodeName;
 
-/// WHAT ENTRY 375 CANNOT REACH YET — `buildAndPropagateFold()` (`ddc/ddc_fold.cpp:1625`), which is
-/// entry 370 and not this batch.
+/// HOW ENTRY 375 REACHES `buildAndPropagateFold()` (`ddc/ddc_fold.cpp:1625`) — a DSC's own call into
+/// the landed [`build_and_propagate_fold`], which is where the fold this report reads off every node
+/// is built. Only the report itself is entry 375's.
 ///
-/// ⛔ THE SEAM ENTRY 375 REACHES IT THROUGH, AND NOT A STAND-IN: the fold this report reads off every
-/// node is built there, and only the report itself is entry 375's.
+/// ⛔ THE SEAM, AND NOT A STAND-IN: an implementation that does anything but call
+/// [`build_and_propagate_fold`] over its own [`FoldDriver`] leaves every coordinate unbuilt and
+/// the report empty. The call is not made here because the driver takes the `Metadata`, the
+/// [`CoordPropTracker`] and the report level, which are the `Ddc`'s and not this trait's.
 pub trait FoldConstruction {
     /// `buildAndPropagateFold()`.
     fn build_and_propagate_fold(&mut self);

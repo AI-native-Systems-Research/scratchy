@@ -3004,15 +3004,16 @@ where
 use crate::arch::Sticks;
 use crate::formats::Bits;
 use crate::schedule::ddc::shuffle::{
-    AssignReplacement, ComputationBuilder, DataEdge, IndexExpansion, InsertPoint, Packmerge,
-    ShuffleIndex,
+    AssignEdges, AssignReplacement, ComputationBuilder, ConstEleOffsets, DataEdge, IndexExpansion,
+    InsertPoint, OperandSticks, Packmerge, ShuffleIndex,
 };
 use crate::schedule::ddc::transformation_util::{
     AutoShuffleName, DdcAllocateNode, FreshAllocation, LabeledDsEntry, PaddingForm,
-    construct_allocation,
+    component_memory, construct_allocation, data_origin,
 };
+use crate::schedule::ddc::v1::CoresUsed;
 use crate::schedule::ddl::conversion::ComputeOpIdx;
-use crate::schedule::dsc2::{PackIndex, WordLength};
+use crate::schedule::dsc2::{OperandPos, PackIndex, WordLength};
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // THE AUTOMATIC-SHUFFLE VOCABULARY — what entry 376's local `BuilderImpl`
@@ -3116,6 +3117,24 @@ pub trait AutoShuffling:
     /// ⛔ TOTAL, AND IT STATES BOTH OF THE REFERENCE'S UNGUARDED LOOKUPS: a PACKMERGE input always
     /// names a labelled DS, and that DS always carries a format.
     fn operand_element_bits(&self, dinfo: DataInfo) -> Bits;
+
+    /// `labeledDs_[dinfo.myLdsIdx_]` with `primaryDsInfo_.at(dsType_)`, `getLayoutDims(ldsIdx_)` and
+    /// `getStickSizes(dsType_)` — the four reads e371 makes of one operand (`shuffle.cpp:802-805`,
+    /// `:873-876`), as one value because [`Self::Entry`] carries neither the DS type nor the format.
+    fn operand_sticks(&self, dinfo: DataInfo) -> Option<OperandSticks>;
+
+    /// `currDsc->coreIdsUsed_`.
+    fn cores_used(&self) -> CoresUsed;
+
+    /// `0 .. currDsc->numCoreletsUsed_`. ⛔ NOT `numCoreletsUsed_DSC2_`.
+    fn corelets_used(&self) -> Vec<Corelet>;
+
+    /// `allocNode->getPrev()` — whether that allocate node already has a preceding sibling.
+    fn allocation_has_prev(&self, alloc: AllocId) -> bool;
+
+    /// `node->{inputs,outputs}LdsAndLoopOffsets_[pos].constEleOffsets_ = offsets`, the stick jump
+    /// `do_codegen` wrote into the edge's dinfo before the packmerge copied it (`shuffle.cpp:881-896`).
+    fn set_const_ele_offsets(&mut self, node: NodeId, at: OperandPos, offsets: ConstEleOffsets);
 }
 
 /// THE ASSIGN ENTRY 376 REPLACES, WITH EVERYTHING ITS BUILDER TEMPLATES OFF — `BuilderImpl`'s
@@ -3313,6 +3332,7 @@ impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
                 dinfo,
                 component: memory_component(storage),
                 allocation: Some(alloc),
+                const_ele_offsets: ConstEleOffsets::default(),
                 alloc_added: false,
             });
         }
@@ -3362,6 +3382,15 @@ impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
             }
         }
 
+        // ⛔ THE STICK JUMP LANDS HERE OR NOWHERE: `do_codegen` wrote it into the dinfo the edge holds
+        // by value, and `new dsc2::ComputeNode(*assign)` then copied that dinfo into these operands.
+        self.dsc
+            .set_const_ele_offsets(node, OperandPos::Input(0), in1.const_ele_offsets.clone());
+        self.dsc
+            .set_const_ele_offsets(node, OperandPos::Input(1), in2.const_ele_offsets.clone());
+        self.dsc
+            .set_const_ele_offsets(node, OperandPos::Output(0), out.const_ele_offsets.clone());
+
         let mut point = InsertPoint::new(body);
         out.insert_before(&mut point);
         let latched: Vec<AllocId> = point.preceding().map(|owned| owned.0).collect();
@@ -3373,6 +3402,46 @@ impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
         }
         node
     }
+
+    fn assign_edges(&self) -> Option<AssignEdges> {
+        // `DT_CHECK(inputs_.size() == 1)` / `DT_CHECK(outputs_.size() == 1)` (`shuffle.cpp:792-793`).
+        if self.assign.body.inputs.len() != 1 || self.assign.body.outputs.len() != 1 {
+            return None;
+        }
+        let edge = |operand: &Operand| DataEdge {
+            dinfo: operand.data,
+            component: operand.unit,
+            // `if (alloc) input_edge.allocation = alloc;` — `allowMissingAlloc=true`, so absent stays
+            // absent rather than aborting.
+            allocation: component_memory(operand.unit).and_then(|storage| {
+                data_origin(operand.data)
+                    .and_then(|origin| self.dsc.allocation_in(origin, storage))
+            }),
+            const_ele_offsets: ConstEleOffsets::default(),
+            alloc_added: false,
+        };
+        Some(AssignEdges {
+            input: edge(self.assign.body.inputs.first()?),
+            output: edge(self.assign.body.outputs.first()?),
+        })
+    }
+
+    fn operand_sticks(&self, dinfo: DataInfo) -> Option<OperandSticks> {
+        self.dsc.operand_sticks(dinfo)
+    }
+
+    fn cores_used(&self) -> CoresUsed {
+        self.dsc.cores_used()
+    }
+
+    fn corelets_used(&self) -> Vec<Corelet> {
+        self.dsc.corelets_used()
+    }
+
+    fn allocation_has_prev(&self, alloc: AllocId) -> bool {
+        // A node this builder still HOLDS is not in the tree at all, so it has no preceding sibling.
+        !self.held.contains_key(&alloc) && self.dsc.allocation_has_prev(alloc)
+    }
 }
 
 /// Replaces: e376_performAutomaticShuffling
@@ -3383,7 +3452,7 @@ impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
 /// ⚠️ TRAP: `success` is set for every assign the walk REACHES, before the shuffler has decided
 /// anything — so the answer means *an assign was visited*, not *the tree changed*.
 /// ⛔ `names` OUTLIVES THE CALL because the reference's `name_counter` is a file-scope global.
-pub fn perform_automatic_shuffling<S, A>(
+pub fn perform_automatic_shuffling<S, A, Ar>(
     dsc: &mut S,
     metadata: &mut Metadata,
     names: &mut AutoShuffleNames,
@@ -3391,6 +3460,7 @@ pub fn perform_automatic_shuffling<S, A>(
 where
     S: AutoShuffling + ?Sized,
     A: AssignReplacement + Default,
+    Ar: Arch,
 {
     let mut shuffler = A::default();
     let mut success = false;
@@ -3399,7 +3469,7 @@ where
             continue;
         };
         let mut builder = ShuffleBuilder::new(dsc, metadata, names, assign);
-        shuffler.replace_assign(&mut builder, compute);
+        shuffler.replace_assign::<_, Ar>(&mut builder, compute);
         success = true;
     }
     success
@@ -3408,6 +3478,7 @@ where
 #[cfg(test)]
 mod tests_e376 {
     use super::*;
+    use crate::arch::Dd2;
     use crate::schedule::ddc::transformation_util::{AllocationUse, CanDelete, TreeLdsSlot};
     use crate::schedule::dsc2::{Dsc as Dsc2, InstrAttribute, LayoutDims};
     use crate::units::NumFolds;
@@ -3447,6 +3518,8 @@ mod tests_e376 {
         next_node: u32,
         /// `currDsc->computeOp_.back()`, or [`None`] where `computeOp_.size() != 1`.
         sole_op: Option<ComputeOpIdx>,
+        /// Every `constEleOffsets_` write `insert_packmerge` makes on the node it inserted.
+        offsets: Vec<(NodeId, OperandPos, ConstEleOffsets)>,
     }
 
     /// The assign the walk reaches: PE, `ASSIGN`, and its first input on LX so the stick count is
@@ -3501,6 +3574,7 @@ mod tests_e376 {
             next_alloc: Cell::new(50),
             next_node: 2,
             sole_op: Some(ComputeOpIdx(0)),
+            offsets: Vec::new(),
         }
     }
 
@@ -3670,6 +3744,31 @@ mod tests_e376 {
         fn operand_element_bits(&self, _dinfo: DataInfo) -> Bits {
             Bits(16)
         }
+
+        fn operand_sticks(&self, _dinfo: DataInfo) -> Option<OperandSticks> {
+            todo!("tests_e376: the stand-in shufflers here infer no layout")
+        }
+
+        fn cores_used(&self) -> CoresUsed {
+            CoresUsed::new(Core::checked(0).expect("core 0"), Vec::new())
+        }
+
+        fn corelets_used(&self) -> Vec<Corelet> {
+            vec![Corelet::at::<0>()]
+        }
+
+        fn allocation_has_prev(&self, _alloc: AllocId) -> bool {
+            false
+        }
+
+        fn set_const_ele_offsets(
+            &mut self,
+            node: NodeId,
+            at: OperandPos,
+            offsets: ConstEleOffsets,
+        ) {
+            self.offsets.push((node, at, offsets));
+        }
     }
 
     /// A STAND-IN FOR ENTRY 371 that drives the three builder methods in `replace_assign`'s own
@@ -3678,11 +3777,11 @@ mod tests_e376 {
     struct OneMerge;
 
     impl AssignReplacement for OneMerge {
-        fn replace_assign<B: ComputationBuilder + ?Sized>(
-            &mut self,
-            builder: &mut B,
-            assign: NodeId,
-        ) -> bool {
+        fn replace_assign<B, A>(&mut self, builder: &mut B, assign: NodeId) -> bool
+        where
+            B: ComputationBuilder + ?Sized,
+            A: Arch,
+        {
             let mut edges =
                 builder.allocate_sticks(DataFormat::Sen169Fp16, WordLength(2), Sticks(2));
             let mut out = edges.pop().expect("the second register");
@@ -3707,11 +3806,11 @@ mod tests_e376 {
     struct NoSticks;
 
     impl AssignReplacement for NoSticks {
-        fn replace_assign<B: ComputationBuilder + ?Sized>(
-            &mut self,
-            builder: &mut B,
-            assign: NodeId,
-        ) -> bool {
+        fn replace_assign<B, A>(&mut self, builder: &mut B, assign: NodeId) -> bool
+        where
+            B: ComputationBuilder + ?Sized,
+            A: Arch,
+        {
             builder.delete_node(assign);
             true
         }
@@ -3725,7 +3824,7 @@ mod tests_e376 {
         let mut names = AutoShuffleNames::default();
         // `DT_CHECK(computeOp_.size() == 1)` (`ddc/ddc_transformation.cpp:1908`) guards the interim
         // push, NOT the walk: the assign reaches `replace_assign` and the reference answers `true`.
-        assert!(perform_automatic_shuffling::<Tree, NoSticks>(
+        assert!(perform_automatic_shuffling::<Tree, NoSticks, Dd2>(
             &mut dsc,
             &mut metadata,
             &mut names
@@ -3741,7 +3840,7 @@ mod tests_e376 {
         dsc.sole_op = None;
         let mut metadata = Metadata::default();
         let mut names = AutoShuffleNames::default();
-        perform_automatic_shuffling::<Tree, OneMerge>(&mut dsc, &mut metadata, &mut names);
+        perform_automatic_shuffling::<Tree, OneMerge, Dd2>(&mut dsc, &mut metadata, &mut names);
     }
 
     #[test]
@@ -3749,7 +3848,7 @@ mod tests_e376 {
         let mut dsc = tree();
         let mut metadata = Metadata::default();
         let mut names = AutoShuffleNames::default();
-        assert!(perform_automatic_shuffling::<Tree, OneMerge>(
+        assert!(perform_automatic_shuffling::<Tree, OneMerge, Dd2>(
             &mut dsc,
             &mut metadata,
             &mut names
