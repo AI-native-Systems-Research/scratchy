@@ -15303,7 +15303,9 @@ mod tests_e283_e295 {
 
     /// e355 — OUT OF SPAN callers, IN SPAN here: each corelet-split dim's per-core slice is rewritten
     /// to `corelets * orig + offset`, the offset stepping from `corelets - 1` down the ascending cores,
-    /// so the LARGER core id takes the SMALLER slice. ⛔ A split of the wrong length is refused.
+    /// so the LARGER core id takes the SMALLER slice. ⛔ A split of the wrong length is refused, WHICH
+    /// THE REFERENCE'S `=` DOES NOT DO — it would proceed on the length — and so is an lds the DSC
+    /// does not have.
     #[test]
     fn the_larger_core_id_takes_the_smaller_of_the_corelet_split_slices() {
         /// This module's DSC with `shares` corelet shares stated on the core stage's `Y`, and TWO
@@ -15350,6 +15352,14 @@ mod tests_e283_e295 {
         let sdsc = a_sdsc(dsc.clone(), &[(PrimaryDim::Y, 1)], &cores);
         assert_eq!(
             fill_coordinate_custom_wk_slice_id(&sdsc, &dsc, LdsIdx(0), &mut Coordinate::default()),
+            None
+        );
+
+        // `labeledDs_.at(ldsIdx)`: the split is well-formed, and the lds alone is the refusal.
+        let dsc = a_split_dsc(2);
+        let sdsc = a_sdsc(dsc.clone(), &[(PrimaryDim::Y, 1)], &cores);
+        assert_eq!(
+            fill_coordinate_custom_wk_slice_id(&sdsc, &dsc, LdsIdx(7), &mut Coordinate::default()),
             None
         );
     }
@@ -18972,14 +18982,24 @@ where
 /// so the LARGER core id takes the SMALLER slice — corelet 0's SFP ring direction.
 ///
 /// ⛔ TRAP: THE REFERENCE'S CHECK IS AN ASSIGNMENT — `numCoreletsUsed_DSC2_ = coreletSplitArr.size()`
-/// WRITES the split length and tests truthiness; ported as the `==` it spells, which agrees wherever
-/// that check would have held. [`None`] is it, *"Core ID not found."* and both `.at()` throws.
+/// (`:7218`) WRITES the split's length ONTO THE DSC and tests only that it is NON-ZERO, so the
+/// mismatch its own message names never refuses and the body below then counts corelets by that
+/// length. Ported as the `==` it spells, DELIBERATELY DIVERGING: a mismatch is [`None`], and the
+/// stray write — the only reason the reference takes `dsc` mutably at all — is dropped. `prepDsc`
+/// (entry 054) states `numCoreletsUsed_DSC2_ = numCoreletsUsed_` (`:6415`) and entry 283 sizes every
+/// split it writes by `numCoreletsUsed_`, so on the L3 path only a core stage whose `coreletSplit_`
+/// was IMPORTED at another length reaches the divergence.
+/// ⛔ [`None`] IS that check, `labeledDs_.at(ldsIdx)`, *"Core ID not found."* and both remaining
+/// `.at()` throws. A slice count past `i32` is the port's OWN refusal — the reference's counter and
+/// its bound are both `int`, so it cannot hold one.
 pub fn fill_coordinate_custom_wk_slice_id(
     sdsc: &SuperDsc,
     dsc: &DesignSpaceConfig,
     lds: LdsIdx,
     coordinate: &mut Coordinate,
 ) -> Option<()> {
+    // `labeledDs_.at(ldsIdx)`, the throw the entry reaches before anything else.
+    dsc.labeled_ds.at(lds)?;
     let mut ascending = lds_transfer_core_ids(sdsc, dsc, lds)?;
     ascending.sort_unstable();
     for &core in &ascending {
@@ -18991,7 +19011,8 @@ pub fn fill_coordinate_custom_wk_slice_id(
     for (&dim, split) in &dsc.core_stage().dims().corelet_split {
         (usize::try_from(corelets).ok()? == split.len()).then_some(())?;
         let mut visited: BTreeSet<Core> = BTreeSet::new();
-        // ⭐ `currWkSliceId` IS AN `int`, so a count past its width never terminates in the reference.
+        // `numWkSlicesPerDim_` is itself an `int` (`dsc/superdsc.h:69`), so a count this newtype can
+        // state and `currWkSliceId` cannot is a state the reference has no way to reach.
         let slices = i32::try_from(sdsc.num_wk_slices_per_dim.get(&dim)?.get()).ok()?;
         for current in 0..slices {
             let mut offset = corelets - 1;
