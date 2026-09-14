@@ -1147,9 +1147,13 @@ pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
     let Some(scalar_comp) = ScalarOpComp::of(comp) else {
         return false;
     };
-    let Some(Op::Sentient(ops::Op::For { carried, body, .. })) = scope.get(at) else {
+    let Some(Op::Sentient(ops::Op::For {
+        iv, carried, body, ..
+    })) = scope.get(at)
+    else {
         return false;
     };
+    let for_iv = *iv;
     let Some(main_iv_arg) = carried.get(main_iv.0 as usize).map(|entry| entry.arg) else {
         return false;
     };
@@ -1157,7 +1161,10 @@ pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
     if use_count(derived_iv, body) != 1 || use_count(main_iv_arg, body) != 1 {
         return false;
     }
-    let regions: [&[Op]; 1] = [body.as_slice()];
+    // ⛔ THE ENCLOSING BLOCK IS PART OF THE SCOPE: `isConstant` resolves an operand through a bare
+    // `getDefiningOp()` with no region restriction (`Utils/Utils.cpp:424-439`), so a constant hoisted
+    // ahead of this loop is just as visible to `getFirstConstOperandIndex` as one inside the body.
+    let regions: [&[Op]; 2] = [body.as_slice(), scope.as_slice()];
     let defs = Definitions::from_innermost(&regions);
     let Some(derived_iv_op) = defining_op(derived_iv, body) else {
         return false;
@@ -1300,6 +1307,16 @@ pub(crate) fn process_for_linear_chain<A: Arch, E: ExpressionEvaluator>(
     ) {
         return false;
     }
+    // ⭐ THE LOOP IS RE-FOUND BY ITS INDUCTION VARIABLE, for the reason e170 states: the adjustment
+    // above builds a constant, and building one can insert at the START of this block — after which
+    // the hoist below would find something other than the loop at `at` and silently do nothing while
+    // this still reported a hoist.
+    let Some(at) = scope
+        .iter()
+        .position(|op| matches!(op, Op::Sentient(ops::Op::For { iv, .. }) if *iv == for_iv))
+    else {
+        return false;
+    };
     hoist_for_linear_chain(
         scope, at, main_iv, derived_iv, &comp_ops, comp, evaluator, sites,
     );
@@ -1343,7 +1360,8 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
     let Some(main_iv_arg) = carried.get(main_iv.0 as usize).map(|entry| entry.arg) else {
         return false;
     };
-    let regions: [&[Op]; 1] = [body.as_slice()];
+    // ⛔ THE ENCLOSING BLOCK IS PART OF THE SCOPE, for the reason e612 states.
+    let regions: [&[Op]; 2] = [body.as_slice(), scope.as_slice()];
     let defs = Definitions::from_innermost(&regions);
     let Some(derived_iv_op) = defining_op(derived_iv, body) else {
         return false;
@@ -1402,7 +1420,7 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
         return false;
     }
     // Every OTHER reader of the op feeding the yield has to be mergeable, and takes the opposite
-    // adjustment (`:2118-2128`).
+    // adjustment (`:2119-2130`).
     for user in users(&[yielded_val], body) {
         if core::ptr::eq(user, main_yield) {
             continue;
@@ -1422,7 +1440,7 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
             replace_with_mod: false,
         });
     }
-    // And every other use of the main IV, once the derived one is gone (`:2130-2140`).
+    // And every other use of the main IV, once the derived one is gone (`:2132-2140`).
     for user in users(&[main_iv_arg], body) {
         if core::ptr::eq(user, derived_iv_op) {
             continue;
@@ -1430,7 +1448,7 @@ pub(crate) fn process_for_generic_hoisting<A: Arch, E: ExpressionEvaluator>(
         let Some(user_val) = results(user).first().copied() else {
             todo!(
                 "processForGenericHoisting: applyOperationData's \
-                 llvm_unreachable (ScalarOpMergingAndHoisting.cpp:1793) — {user:?} reads the main IV \
+                 llvm_unreachable (ScalarOpMergingAndHoisting.cpp:1791) — {user:?} reads the main IV \
                  and binds no result to modify"
             )
         };
@@ -1667,6 +1685,9 @@ mod unit_tests {
     struct StatedEvaluator {
         /// What `build_offset_value` materialises the offset as.
         offset: Val,
+        /// A constant `build_offset_value` inserts at the START of the walked block before answering,
+        /// which is what [`OffsetSites::query_maps`] being `None` lets the reference's builder do.
+        prepend: Option<Val>,
         /// Every `evaluate_sum` this evaluator was asked for, as `(lhs, rhs)`.
         sums: Vec<(Evaluation, Evaluation)>,
         /// Every `evaluate_sum_handle`, as `(lhs, rhs)` — where a NEGATED modifier shows.
@@ -1689,9 +1710,12 @@ mod unit_tests {
             &mut self,
             _evaluation: &Evaluation,
             _sites: &mut OffsetSites<'_>,
-            _walked: &mut Vec<Op>,
+            walked: &mut Vec<Op>,
             _ty: ScalarTy,
         ) -> Val {
+            if let Some(val) = self.prepend {
+                walked.insert(0, constant(0, val));
+            }
             self.offset
         }
 
@@ -1742,6 +1766,7 @@ mod unit_tests {
     fn stated_evaluator() -> StatedEvaluator {
         StatedEvaluator {
             offset: Val(9),
+            prepend: None,
             sums: Vec::new(),
             handle_sums: Vec::new(),
             built: Vec::new(),
@@ -2465,6 +2490,61 @@ mod unit_tests {
                 ]
             )
         );
+        assert_eq!(hoists, HoistCount(1));
+    }
+
+    /// e612 — THE SAME CHAIN WHEN THE ADJUSTMENT PREPENDS A CONST: the loop result has a reader that
+    /// cannot absorb the adjustment, so e578 takes e170's path, whose `buildOffsetValue` inserts at the
+    /// START of this block — and the hoist still has to happen, at the loop's NEW position.
+    #[test]
+    fn a_linear_chain_still_hoists_when_the_adjustment_prepends_a_const_to_the_block() {
+        let mut scope = loop_with(vec![load_and_send(Val(5), Val(11), Val(12))], vec![Val(31)]);
+        // Neither operand resolves to a constant here, so `isMergeableOpOrChain` declines it and the
+        // adjustment cannot be absorbed by the users of the loop result.
+        scope.push(add(Val(4), Val(20), Val(6), None));
+        let mut consts = Vec::new();
+        let mut values = values_after(40);
+        let mut hoists = HoistCount(0);
+        let mut evaluator = StatedEvaluator {
+            prepend: Some(Val(50)),
+            ..stated_evaluator()
+        };
+        assert!(process_for_linear_chain::<Dd2, _>(
+            &mut scope,
+            0,
+            IterArgIndex(0),
+            Val(5),
+            Innermost::Yes,
+            imm_window(),
+            GenericComp::Lxlu,
+            AddressScale::ONE,
+            &mut evaluator,
+            &mut sites_of(&mut consts, &mut values),
+            &mut IbuffSpace(4),
+            &mut hoists,
+        ));
+        assert_eq!(scope[0], constant(0, Val(50)));
+        // The hoisted add and the loop it feeds, both moved along by the prepended constant.
+        assert_eq!(scope[1], add(Val(2), Val(11), Val(41), Some(Bits(8))));
+        assert_eq!(
+            scope[2],
+            for_op(
+                vec![carried(Val(41), Val(3), Val(4), Some(Bits(8)))],
+                vec![
+                    constant(4, Val(10)),
+                    constant(6, Val(11)),
+                    constant(0, Val(12)),
+                    load_and_send(Val(3), Val(9), Val(9)),
+                    Op::Sentient(ops::Op::Yield {
+                        results: vec![Val(31)]
+                    }),
+                ]
+            )
+        );
+        // e170's adjustment, behind the loop, and the reader now reading it.
+        assert_eq!(scope[3], add(Val(4), Val(9), Val(40), Some(Bits(8))));
+        assert_eq!(scope[4], add(Val(40), Val(20), Val(6), None));
+        assert_eq!(scope.len(), 5);
         assert_eq!(hoists, HoistCount(1));
     }
 
