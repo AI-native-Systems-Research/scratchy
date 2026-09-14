@@ -2824,8 +2824,13 @@ impl AddressPinningAndTogglePass {
     /// manager (`:1450-1454`).
     ///
     /// ⛔ INSERTION ORDER, NOT `getSortedList()`: the container's `begin`/`end` are the `std::vector`
-    /// base's (`:875-878`), so the visit order is syntactic and never op address. And there is NO
+    /// base's (`:874-877`), so the visit order is syntactic and never op address. And there is NO
     /// validity filter — an invalid descriptor is visited too; e653's `isValid()` arm is what stops it.
+    /// ⛔ TRAP FOR WHOEVER PORTS `buildOffsetValue`: `dtd_->getOperation()` is a pointer the
+    /// reference's inserts cannot move, and a [`DataTransferDescriptor`]'s `op` is a POSITION they do
+    /// — so the moment [`create_offset_value`] stops being a `todo!`, e638's `insert_before` ahead of
+    /// one transfer leaves every LATER descriptor of this loop one ordinal stale. Unreachable today:
+    /// every driver builds that offset before it edits anything, so no visit here mutates the body.
     pub fn process_data_transfers<E: ExpressionEvaluator>(
         &mut self,
         unit_body: &mut Vec<Op>,
