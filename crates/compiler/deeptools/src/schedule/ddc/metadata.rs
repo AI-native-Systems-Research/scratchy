@@ -785,7 +785,7 @@ pub struct ExternalTransfer {
 }
 
 /// WHICH END of a transfer's datastreams a data connect is filled through — the source's, or the
-/// FIRST destination's when the source is external (`ddc/ddcv1.cpp:2312-2327`).
+/// FIRST destination's when the source is external (`ddc/ddcv1.cpp:2312-2322`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TransferEnd {
     /// `&tn->srcLdsAndLoopOffsets_.dataConnect_`.
@@ -807,7 +807,7 @@ pub struct DataConnectSlot {
 }
 
 /// A STORAGE AN EXTERNAL TRANSFER MAY BE PREFILLED IN — `is_any_of(storage, LX, PTXRF, L3LUIBR)`,
-/// the guard every insert into that map passes (`ddc/ddcv1.cpp:2331-2336`).
+/// the guard every insert into that map passes (`ddc/ddcv1.cpp:2331`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExternalStorage {
     /// `LX`.
@@ -929,11 +929,11 @@ pub struct Metadata {
     pub external_transfers: Vec<ExternalTransfer>,
     /// `prefilledExternalTransferToDataConnectToFill_` (:138), keyed by labeled DS and storage.
     ///
-    /// ⛔ THE LDS IS OPTIONAL BECAUSE ENTRY 309'S GUARD IS ONE-SIDED: it refuses `ldsIdx >=
-    /// labeledDs_.size()` and NOT `ldsIdx < 0` (`ddc/ddcv1.cpp:2331-2336`), so a `NO_TRANSFER_FROM_TENSOR`
-    /// redirected onto a destination that names no labelled DS keys this map at `-1`.
+    /// ⛔ THE LDS IS NOT OPTIONAL: entry 309's `ldsIdx >= labeledDs_.size()` (`ddc/ddcv1.cpp:2330`)
+    /// compares an `int` against a `size_t`, which promotes `-1` to `SIZE_MAX`, so an end naming no
+    /// labelled DS is refused and never reaches this map.
     pub prefilled_external_transfer_data_connects:
-        BTreeMap<(Option<LdsIdx>, ExternalStorage), DataConnectSlot>,
+        BTreeMap<(LdsIdx, ExternalStorage), DataConnectSlot>,
     /// `externalNodes_` (:140).
     pub external_nodes: BTreeSet<NodeId>,
     /// `TransferNodesInterSliceTranspose_` (:141).
@@ -1271,7 +1271,7 @@ mod tests_e104 {
         });
         // The non-owning slot beside them, which the reset drops without destroying anything.
         md.prefilled_external_transfer_data_connects.insert(
-            (Some(LdsIdx(3)), ExternalStorage::Lx),
+            (LdsIdx(3), ExternalStorage::Lx),
             DataConnectSlot {
                 transfer: NodeId(7),
                 end: TransferEnd::Src,

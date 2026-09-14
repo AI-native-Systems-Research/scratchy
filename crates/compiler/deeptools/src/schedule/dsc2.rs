@@ -1124,7 +1124,7 @@ impl NumChunks {
 /// ⛔ THE REFERENCE FIELD IS A `double` AND IS NOT A COUNT: `dsc/dsc_standalone.cpp:377` pushes
 /// `1 / kij`. Nothing in this campaign reads its magnitude — entry 259 tests `== 1`
 /// (`ddc/ddcv1.cpp:1899`), entry 260 tests `> 0` (`:2452`, `:2629`) and entry 307 tests `== -2`
-/// (`:1256`, `:1727`) — so a fractional scale cannot silently truncate into an arm below.
+/// (`:1058`, `:1505`) — so a fractional scale cannot silently truncate into an arm below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LdsScale {
     /// `scale_[i] == -2` — the dim is broadcast ALONG THE STICK, which entry 307 replicates over
