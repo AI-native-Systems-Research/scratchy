@@ -460,8 +460,8 @@ pub fn add_internal_tensor<S: InternalTensorSite + ?Sized>(
         }
     }
     let prefilled = &mut metadata.prefilled_external_transfer_data_connects;
-    if let Some(slot) = prefilled.remove(&(Some(old_last), ExternalStorage::Lx)) {
-        prefilled.insert((Some(new_last), ExternalStorage::Lx), slot);
+    if let Some(slot) = prefilled.remove(&(old_last, ExternalStorage::Lx)) {
+        prefilled.insert((new_last, ExternalStorage::Lx), slot);
     }
     Some(tail.insert_position)
 }
@@ -2746,7 +2746,7 @@ fn set_data_loc_and_info<S: DdlSite + ?Sized>(
                             // unfilled, and this is the statement that fills it.
                             let slot = *metadata
                                 .prefilled_external_transfer_data_connects
-                                .get(&(Some(lds), external_storage(storage)?))?;
+                                .get(&(lds, external_storage(storage)?))?;
                             let filled = state.transfers.get_mut(&slot.transfer)?;
                             match slot.end {
                                 TransferEnd::Src => {
@@ -5608,14 +5608,14 @@ pub fn match_ddl2_dsc<S: MatchSite + ?Sized>(
             }
         }
         let prefilled = &mut metadata.prefilled_external_transfer_data_connects;
-        let keys: Vec<(Option<LdsIdx>, ExternalStorage)> = prefilled
+        let keys: Vec<(LdsIdx, ExternalStorage)> = prefilled
             .keys()
-            .filter(|(lds, _)| *lds == Some(old))
+            .filter(|(lds, _)| *lds == old)
             .copied()
             .collect();
         for key in keys {
             if let Some(slot) = prefilled.remove(&key) {
-                prefilled.insert((Some(new), key.1), slot);
+                prefilled.insert((new, key.1), slot);
             }
         }
     }
@@ -6005,7 +6005,7 @@ mod unit_tests {
             },
         );
         metadata.prefilled_external_transfer_data_connects.insert(
-            (Some(LdsIdx(1)), ExternalStorage::Lx),
+            (LdsIdx(1), ExternalStorage::Lx),
             DataConnectSlot {
                 transfer: NodeId(5),
                 end: TransferEnd::Src,
@@ -6047,7 +6047,7 @@ mod unit_tests {
         assert!(
             metadata
                 .prefilled_external_transfer_data_connects
-                .contains_key(&(Some(LdsIdx(2)), ExternalStorage::Lx))
+                .contains_key(&(LdsIdx(2), ExternalStorage::Lx))
         );
     }
 
