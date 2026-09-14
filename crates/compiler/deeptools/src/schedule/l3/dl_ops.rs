@@ -13988,7 +13988,9 @@ mod tests_e283_e295 {
     /// e331 — OUT OF SPAN: not exploring, the walk starts at the loop owning the lx_below block and
     /// stops at the first CORE-numbered loop, so a super-chunk loop directly above the core one gives
     /// the stage nothing to double; a super-chunk loop that chunks the CORE stage instead is the
-    /// `DT_CHECK` on the two loops above that block.
+    /// `DT_CHECK` on the two loops above that block. ⛔ REGRESSIONS: a loop dim NEITHER stage states
+    /// is the reference's `-1 > -1`, which SKIPS it, and the exploring maximum for a NON-PAGED dim
+    /// never asks whether the chunk extent divides it.
     #[test]
     fn the_non_exploring_walk_stops_at_the_core_loop_and_checks_the_one_above_it() {
         #[derive(Default)]
@@ -14100,6 +14102,59 @@ mod tests_e283_e295 {
             ),
             None
         );
+
+        // A loop over a dim NEITHER the core nor the super-chunk stage states: both answer the
+        // reference's `-1`, `-1 > -1` is false, and the walk climbs on instead of refusing.
+        let (mut dsc, super_chunk) = a_super_chunk_dsc();
+        let mut tree = Tree::default();
+        let root = tree.root_block("root");
+        let above = tree.loop_over(DatastageId(2), DATA_STAGE_CHUNK, PrimaryDim::J, root);
+        let innermost = tree.loop_over(DatastageId(2), DATA_STAGE_CHUNK, PrimaryDim::J, above.0);
+        tree.lx_below = Some(tree.add("lx_below", Kind::Block, Some(innermost.0)));
+        assert_eq!(
+            explore_super_chunk_data_stage_params::<false, false, _, _, _, _>(
+                &mut dsc,
+                DscIdx(0),
+                super_chunk,
+                None,
+                &tree,
+                &Orgs(BTreeMap::new()),
+                &BTreeMap::new(),
+                &mut allocs,
+                &mut Trackers,
+                &Placement,
+            ),
+            Some(())
+        );
+        let held = dsc.data_stages.at(DatastageId(2)).expect("the super-chunk stage");
+        assert_eq!(held.ss.dims.dims().extent(PrimaryDim::I), Some(Extent(4)));
+
+        // Exploring, a NON-PAGED dim's maximum is the whole core extent and the chunk stage is never
+        // asked to divide it: the stage is WRITTEN to 8 before the trial allocation is even reached.
+        let mut dsc = a_dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 3)]);
+        dsc.data_stages
+            .set(DatastageId(2), stage("super_chunk", &[(PrimaryDim::I, 3)]));
+        let super_chunk = dsc
+            .data_stages
+            .super_chunk(DatastageId(2))
+            .expect("the super-chunk stage exists");
+        assert_eq!(
+            explore_super_chunk_data_stage_params::<true, false, _, _, _, _>(
+                &mut dsc,
+                DscIdx(0),
+                super_chunk,
+                None,
+                &a_tree(DatastageId(2), DATA_STAGE_CHUNK),
+                &Orgs(BTreeMap::from([(LdsIdx(0), Org::default())])),
+                &BTreeMap::new(),
+                &mut allocs,
+                &mut Trackers,
+                &Placement,
+            ),
+            None
+        );
+        let held = dsc.data_stages.at(DatastageId(2)).expect("the super-chunk stage");
+        assert_eq!(held.ss.dims.dims().extent(PrimaryDim::I), Some(Extent(8)));
     }
 
     /// e332 — OUT OF SPAN: the walk synchronises EVERY DSC, so entry 288's handshake lands once per
@@ -15146,7 +15201,7 @@ pub fn compute_min_param_for_padded_dim<D: ComputeOps + ?Sized>(
 /// split over them, the core stage's padding voided where chunking moved it, and its symbolic dims —
 /// then writes that one `DataStructDims` into the chunk stage AS BOTH HALVES.
 ///
-/// ⛔ BOTH HALVES ARE THE SAME VALUE (`:1418-1419`), so a chunk stage has no epilogue of its own.
+/// ⛔ BOTH HALVES ARE THE SAME VALUE (`:1419-1420`), so a chunk stage has no epilogue of its own.
 /// ⛔ [`None`] IS entry 283's refusals; *"Core data stage parameters are unavailable."* is discharged
 /// by [`L3DataStages`] holding the core stage as a field. `chunkParams` stays the caller's, filled.
 pub fn add_chunk_data_stage_from_candidates<const CARRY_UNNEEDED_PAD: bool>(
@@ -15223,10 +15278,11 @@ fn write_super_chunk_extents(
 ///
 /// ⛔ THE TRIAL IS THE PORT: entry 222 without a commit restores its trackers, so only the extents
 /// standing when one trial SUCCEEDS are kept, and a failed step is left written for the next dim.
-/// ⛔ [`None`] IS *"Expect IBR data stage."*, *"The SuperChunk value must be multiple of the chunk
-/// value."*, *"Expect the same ss_ and el_ values."*, *"A valid set of SuperChunk parameters must be
-/// found."*, the non-exploring path's `DT_CHECK` on the two loops above the lx_below block, entries
-/// 222's and 283's — and a non-positive chunk extent, whose `-=` HANGS the reference.
+/// ⛔ [`None`] IS *"Expect SuperChunk data stage."*, *"Expect IBR data stage."*, *"The SuperChunk
+/// value must be multiple of the chunk value."*, *"Expect the same ss_ and el_ values."*, *"A valid
+/// set of SuperChunk parameters must be found."*, the non-exploring path's `DT_CHECK` on the two
+/// loops above the lx_below block, a null `lxBelowBlockNode`, an empty `dims_`, entries 222's and
+/// 283's — and a non-positive chunk extent, whose `-=` HANGS the reference.
 pub fn explore_super_chunk_data_stage_params<const EXPLORE: bool, const EPILOGUE: bool, R, O, M, P>(
     dsc: &mut DesignSpaceConfig,
     dsc_idx: DscIdx,
@@ -15245,6 +15301,8 @@ where
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement + v1::StorageNames,
 {
+    // "Expect SuperChunk data stage."
+    dsc.data_stages.at(super_chunk.index())?;
     let tree = nesting.tree(dsc_idx)?;
     let innermost = tree.owner_loop(nesting.lx_below_block(dsc_idx)?);
     if !EXPLORE {
@@ -15255,9 +15313,13 @@ where
         let mut at = Some(innermost);
         while let Some(walked) = at.filter(|&it| tree.loop_num(it) != DATA_STAGE_CORE) {
             let dim = tree.loop_dims(walked).iter().last()?.dim;
-            let core = dsc.data_stages.core().ss.dims.dims().extent(dim)?;
-            let held = dsc.data_stages.at(super_chunk.index())?.ss.dims.dims().extent(dim)?;
-            if core.0 > held.0 && is_multiple_of(core.0, held.0)? {
+            // ⛔ AN UNSTATED EXTENT IS THE REFERENCE'S `-1`, NOT A REFUSAL: `-1 > -1` is false, so a
+            // dim neither stage states is SKIPPED and the walk climbs on (`:2954-2957`).
+            let stages = &dsc.data_stages;
+            let core = stages.core().ss.dims.dims().extent(dim).map_or(-1, |it| it.0);
+            let held = stages.at(super_chunk.index())?.ss.dims.dims().extent(dim);
+            let held = Extent(held.map_or(-1, |it| it.0));
+            if core > held.0 && is_multiple_of(core, held.0)? {
                 let doubled = Extent(held.0 * 2);
                 write_super_chunk_extents(dsc, super_chunk, &[(dim, doubled, doubled)], false)?;
                 if alloc_all_mem(dsc, metadata, dsc_idx, allocs, trackers, placement, v1::Commit::No)?
@@ -15287,12 +15349,16 @@ where
     // Initialize the SuperChunk parameters to the maximum, outer loop dim first.
     let mut maxima: Vec<(PrimaryDim, Extent, Extent)> = Vec::new();
     for &dim in inner_to_outer.iter().rev() {
-        let chunk = dsc.data_stages.chunk().ss.dims.dims().extent(dim)?.0;
         let (ss, el) = if paged_dims.contains(&dim) {
+            // ⛔ ONLY THIS ARM READS THE CHUNK EXTENT AND CHECKS THE TWO MULTIPLES (`:2857-2882`);
+            // the non-paged arm below asks nothing of the chunk stage (`:2883-2892`).
+            let chunk = dsc.data_stages.chunk().ss.dims.dims().extent(dim)?.0;
             let stage = dsc.data_stages.at(ibr?.index())?;
             let ibr_ss = stage.ss.dims.dims().extent(dim)?.0;
             let ss = ibr_ss.min(stage.el.dims.dims().extent(dim)?.0);
+            is_multiple_of(ss, chunk)?.then_some(())?;
             let el = if is_multiple_of(ibr_ss, ss)? { ss } else { ibr_ss % ss };
+            is_multiple_of(el, chunk)?.then_some(())?;
             (ss, el)
         } else {
             let core = dsc.data_stages.core();
@@ -15300,7 +15366,6 @@ where
             (ss == core.el.dims.dims().extent(dim)?.0).then_some(())?;
             (ss, ss)
         };
-        (is_multiple_of(ss, chunk)? && is_multiple_of(el, chunk)?).then_some(())?;
         maxima.push((dim, Extent(ss), Extent(el)));
     }
     write_super_chunk_extents(dsc, super_chunk, &maxima, true)?;
@@ -15373,8 +15438,8 @@ where
 // IS [`v1::padded_loop_offset`], the memory set is [`v1::is_dsc_memory`], and the symbolic division
 // is [`v1::Symbols`].
 //
-// WHAT THE L3 COPY DROPS (`L3DlOpsScheduler.cpp:5750-6364` against `ddc/ddcv1.cpp:2359-2673`):
-//   · `loopsBelowChunkBoundary` IS FILLED BY DEAD CODE — `:5765-5781` is commented out with *"there
+// WHAT THE L3 COPY DROPS (`L3DlOpsScheduler.cpp:5750-6364` against `ddc/ddcv1.cpp:2355-3199`):
+//   · `loopsBelowChunkBoundary` IS FILLED BY DEAD CODE — `:5766-5781` is commented out with *"there
 //     are no loops below chunk boundary in ALxS"* — so `belowChunkLimit` is ALWAYS false and the
 //     corelet view is ALWAYS `-1`. No `both_corelets` tracking, and `is_non_corelet_memory` is
 //     never asked.
@@ -15385,28 +15450,28 @@ where
 //     construction and the fixup is unspellable.
 //   · no replication, pe/sfp-split or cloned-compute-repetition fixups.
 //   · `findLastFusableLoop` has NEITHER the CONDITION break NOR the symbolic-loop break
-//     (`:6329-6338` against `ddc/ddcv1.cpp:2818-2857`), so an L3 transfer fuses through both.
+//     (`:6283-6295` against `ddc/ddcv1.cpp:2816-2858`), so an L3 transfer fuses through both.
 //
 // WHAT IT ADDS:
 //   · the cross-core-reduction HBM adjustment, which shifts the address at corelet 1's END CORE by
-//     that corelet's own byte offset (`:5820-5848`).
+//     that corelet's own byte offset (`:5821-5848`).
 //   · the INDIRECT (IBR) operand — a SECOND `DataInfo` whose start address is the index tensor's
 //     re-laid with a MAPPED core axis, shifted by each core's work slice within its stick, in bytes
-//     or as a symbol tree where a sliced dim's per-core size is itself a symbol (`:5865-5981`).
-//   · the MX `scaleDownFactor`, which is [`v1::Density`] (`:6034-6041`).
+//     or as a symbol tree where a sliced dim's per-core size is itself a symbol (`:5865-5988`).
+//   · the MX `scaleDownFactor`, which is [`v1::Density`] (`:6042-6047`).
 //   · the paged-dim ladder, which divides an offset by the page size and ROUTES it to the indirect
-//     `DataInfo` (`:6390-6409`).
+//     `DataInfo` (`:6151-6174`).
 //
 // ⛔ AND ONE DIVERGENCE THAT IS THE REFERENCE'S, NOT OURS: `numPTRows` does NOT divide the START
-// ADDRESS here (`:5850-5863`), only `bufferAddrOffset_` (`:6521`). Entry 260 folds [`Arch::PT_ROWS`]
-// into its scale for BOTH (`ddc/ddcv1.cpp:2417-2420`), so an L0LU operand's start address differs
-// between the two schedulers by exactly that factor. Both are ported as written.
+// ADDRESS here (`:5850-5863`), only `bufferAddrOffset_` (`:6262-6274`). Entry 260 folds
+// [`Arch::PT_ROWS`] into its scale for BOTH (`ddc/ddcv1.cpp:2392-2394`), so an L0LU operand's start
+// address differs between the two schedulers by exactly that factor. Both are ported as written.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
 /// ONE SYMBOL OF `mySDsc.symbolDefinitions_` — a `VariableSymbol` (`dsc/symbolDefinitions.h`).
 ///
 /// ⭐ A SYMBOLIC ADDRESS *IS* ITS SYMBOL ID. Under `isStartAddrSymbolic_` the reference stores the
-/// id in the very `int64_t` slot a byte count would occupy (`L3DlOpsScheduler.cpp:5978-5990`), so
+/// id in the very `int64_t` slot a byte count would occupy (`L3DlOpsScheduler.cpp:5962-5986`), so
 /// the two conversions below are the reinterpretation it performs and not a lossy cast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VariableSymbol(pub u64);
@@ -15429,7 +15494,7 @@ pub enum SymbolOperand {
     Literal(i64),
 }
 
-/// `VariableOperator` NARROWED TO ENTRY 333'S SIX (`:5857`, `:5905`, `:5983-5996`).
+/// `VariableOperator` NARROWED TO ENTRY 333'S SIX (`:5857`, `:5909`, `:5965-5979`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolOp {
     /// `CONST`.
@@ -15460,7 +15525,7 @@ pub trait SymbolTable: v1::Symbols {
 /// ONE OPERAND'S TWO `DataInfo`s — the direct fill and, where the operand gathers through an index
 /// tensor, the INDIRECT one beside it.
 ///
-/// ⭐ ONE VALUE BECAUSE THE PAGED LADDER ROUTES BETWEEN THEM (`:6402-6409`): a paged offset that
+/// ⭐ ONE VALUE BECAUSE THE PAGED LADDER ROUTES BETWEEN THEM (`:6163-6172`): a paged offset that
 /// overflows one page is written to the indirect `DataInfo` and to no other, so a caller holding
 /// only the direct fill would silently drop it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15491,16 +15556,16 @@ pub trait L3OffsetFacts: MemOrgs {
     /// However the caller carries a `DataStructDims`.
     type Stage: DimStage + ?Sized;
 
-    /// `allocNode->getPageSize()` (`dsc/dsc2.cpp:4479`), EMPTY where nothing pages.
+    /// `allocNode->getPageSize()` (`dsc/dsc2.cpp:4480`), EMPTY where nothing pages.
     ///
     /// ⛔ A SEAM AND NOT A DERIVATION: `getPageSize` dispatches on `indirectAllocType_` and reads
-    /// `relatedIndirectAccessAlloc_` for an `INDEX_TENSOR` (`:4483-4491`), and
+    /// `relatedIndirectAccessAlloc_` for an `INDEX_TENSOR` (`:4483-4495`), and
     /// [`dsc2::AllocateNode`](AllocateNode) carries NEITHER — only [`L3AllocateNode`] does.
     /// ⛔ NON-ZERO BY TYPE, WHICH IS THE DIVISOR GUARD: the page size divides an element offset
-    /// (`:6396`) and bounds it (`:6400`), and a page of no elements is not a page.
+    /// (`:6156-6160`) and bounds it (`:6164`), and a page of no elements is not a page.
     fn page_sizes(&self, alloc: AllocId) -> BTreeMap<PrimaryDim, NonZeroU64>;
 
-    /// `getBufferCapacityForNodePerDim(alloc, lds, storage, -1, -1, /*noRounding=*/true)` (`:5875`)
+    /// `getBufferCapacityForNodePerDim(alloc, lds, storage, -1, -1, /*noRounding=*/true)` (`:5886`)
     /// — the index tensor's IBR extent per dim WITHOUT rounding up to a whole stick.
     fn ibr_sizes_no_rounding(
         &self,
@@ -15509,12 +15574,12 @@ pub trait L3OffsetFacts: MemOrgs {
         storage: SenComponent,
     ) -> Option<BTreeMap<PrimaryDim, Elements>>;
 
-    /// `labeledDs_.at(lds).wordLength` (`dsc/dsc2.h:296`).
+    /// `labeledDs_.at(lds).wordLength` (`dsc/dscdefn.h:334`), which is a `double`.
     fn word_length(&self, lds: LdsIdx) -> Option<WordLength>;
 
     /// `dimToSymbolMapping_.at(dim)`, and the EMPTY vector is `count(dim) == 0`.
     ///
-    /// ⛔ A LIST AND NOT AN [`Option`]: "no entry" makes the reference SKIP the dim (`:5155`) while
+    /// ⛔ A LIST AND NOT AN [`Option`]: "no entry" makes the reference SKIP the dim (`:5904`) while
     /// "not exactly one symbol" makes it ABORT on `DT_CHECK(symbols.size() == 1)`, and one
     /// [`Option`] would conflate a skip with a refusal.
     fn dim_symbols(&self, dim: PrimaryDim) -> Vec<VariableSymbol>;
@@ -15556,7 +15621,7 @@ impl<P: ?Sized, T: ?Sized, G: ?Sized> L3OffsetInputs<'_, P, T, G> {
 }
 
 /// WHERE ONE TRIP'S ELEMENT OFFSET LANDS — `storeLoopEleOffs` AND `isIndirectLoopEleOffs`
-/// (`:6376-6377`) AS ONE VALUE.
+/// (`:6036-6037`) AS ONE VALUE.
 ///
 /// ⛔ TWO `bool`s CANNOT SPELL THIS: `!store && indirect` is not a state the reference can be in,
 /// and reading the pair in the wrong order writes a paged offset into the direct `DataInfo`.
@@ -15677,13 +15742,13 @@ where
     Some(())
 }
 
-/// `fillDataInfo(di, indirectDi, loc, indirectLoc, loopLocation, isProducer)` (`:5783-6528`) as the
+/// `fillDataInfo(di, indirectDi, loc, indirectLoc, loopLocation, isProducer)` (`:5783-6275`) as the
 /// value it computes rather than the two references it mutates.
 ///
 /// [`None`] is every abort; `Some(None)` is the lambda's two early returns, which leave the operand
 /// exactly as it was.
 /// ⚠️ `isProducer` IS DROPPED: its only reader is the `dataConnectLoops` block, commented out at
-/// `:6337-6340`.
+/// `:5998-6000`.
 fn l3_fill_data_info<A, P, T, G, S>(
     inputs: &L3OffsetInputs<'_, P, T, G>,
     symbols: &mut S,
@@ -15719,10 +15784,13 @@ where
     let mut start_address = allocation.start_address.clone();
 
     // ── the cross-core reduction's corelet-1 HBM shift ──────────────────────────────────────────
+    // ⛔ THE REFERENCE'S CONJUNCT ORDER IS THE PORT (`:5821-5824`): entry 210 stands SECOND, so its
+    // refusal is reached for every corelet-split DSC — moving it last would hide it behind the
+    // operand's own storage and output tests.
     if dsc.corelets_used_dsc2.is_some_and(CoreletsUsed::splits)
-        && loc.storage == SenComponent::Hbm
-        && loc.data.my_lds_idx.is_some_and(|lds| dsc.labeled_ds.is_output(lds))
         && is_op_cross_core_reduction(inputs.sdsc, dsc)?
+        && loc.data.my_lds_idx.is_some_and(|lds| dsc.labeled_ds.is_output(lds))
+        && loc.storage == SenComponent::Hbm
     {
         // ⛔ `DT_ERROR("Currently no support; work in progress")`.
         (!is_symbolic).then_some(())?;
@@ -15965,7 +16033,7 @@ where
         let switch_at = alloc_owner?;
         tree.owner_loop(switch_at.0)?;
         fill.buffer_switch_position = Some(switch_at);
-        // ⭐ HERE `numPTRows` DOES divide, and only for an L0LU (`:6521`).
+        // ⭐ HERE `numPTRows` DOES divide, and only for an L0LU (`:6271`).
         let divisor = if generic == GenericComp::L0lu {
             scale.get().checked_mul(u64::from(A::PT_ROWS))?
         } else {
@@ -15992,7 +16060,7 @@ where
     }))
 }
 
-/// The indirect operand's whole `DataInfo` (`:5865-5981`) — the index tensor's start address re-laid
+/// The indirect operand's whole `DataInfo` (`:5865-5988`) — the index tensor's start address re-laid
 /// with a MAPPED core axis and then, at every fold coordinate whose core takes work, shifted by that
 /// core's work slice within its own stick.
 ///
@@ -16160,7 +16228,7 @@ where
     ))
 }
 
-/// The NOPAD arm's paged block (`:6390-6409`) — where a paged dim's element offset goes.
+/// The NOPAD arm's paged block (`:6151-6174`) — where a paged dim's element offset goes.
 ///
 /// ⛔ THE FLOOR IS AN INTEGER DIVISION: `std::floor(float(loopEleOffs) / pageSize)` on a datastage
 /// extent, which is non-negative, so truncation IS the floor. A negative offset is not a value the
@@ -16193,7 +16261,7 @@ fn paged_place<M: MemOrg + ?Sized>(
     Some(OffsetPlace::Indirect(scaled))
 }
 
-/// `findLastFusableLoop(unit)` (`:6329-6338`) — the outermost enclosing loop this unit can still see
+/// `findLastFusableLoop(unit)` (`:6283-6295`) — the outermost enclosing loop this unit can still see
 /// a single child through.
 ///
 /// ⛔ NOT [`v1`]'S: the L3 copy has NEITHER the `CONDITION` break NOR the symbolic-loop break, so an
@@ -16248,7 +16316,8 @@ fn padding_form(padding: &Padding) -> PaddingForm {
 /// ⛔ THE `-1` RESOLUTION IS THE CALLER'S: [`IbrStage`] and [`OnePageStage`] witness that entry 058
 /// already minted both indices, so *"Expect the .. datastage available."* is discharged before entry.
 /// ⛔ [`None`] IS *"Support only one index tensor."*, `DT_CHECK(coreSs % pageSize == 0)`, entries 005
-/// and 283, AND the unguarded `numPagesInCore % ssNumPages` divide that a zero page count would make.
+/// and 283, the unguarded `numPagesInCore % ssNumPages` divide that a zero page count would make, and
+/// an unstated 1Page or core extent for a paged dim, which the reference reads as `-1` and divides by.
 pub fn add_ibr_data_stage<O: MemOrgs + ?Sized>(
     dsc: &mut DesignSpaceConfig,
     dsc_idx: DscIdx,
@@ -16312,8 +16381,9 @@ pub fn add_ibr_data_stage<O: MemOrgs + ?Sized>(
 ///
 /// ⛔ [`None`] IS *"Exepect HBM in memOrg_."* with *"Expect a valid HBM allocate node."* (both
 /// [`MemOrg::hbm_page_sizes`]), *"Expect paged dim in paged tensor."*, *"Page size does not match for
-/// this dimension."* and entry 283's. ⛔ DIVERGENCE: no paged dim writes an EMPTY stage in the
-/// reference and refuses here — [`FilledDims`] is the type that says a stage states something.
+/// this dimension."* and entry 283's. ⛔ DIVERGENCE: NO VALUE-TENSOR LDS — which a non-empty
+/// `pagedDims` does NOT imply, that being read off INDEX tensors (`:6716` against `:6600`) — writes
+/// an EMPTY stage in the reference and refuses here: [`FilledDims`] says a stage states something.
 pub fn add_one_page_data_stage<O: MemOrgs + ?Sized>(
     dsc: &mut DesignSpaceConfig,
     dsc_idx: DscIdx,
