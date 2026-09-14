@@ -250,6 +250,18 @@ impl DdlModuleOp {
     pub fn module(&self) -> Option<&Verified> {
         self.module.as_ref()
     }
+
+    /// `ddl_module_op_.release()` — GIVES UP THE PARSED MODULE, which entry 372 does after a candidate
+    /// that did not match (`ddl_conversion.cpp:80`).
+    ///
+    /// ⛔ NOT REDUNDANT WITH THE NEXT [`Self::parse_ddl`], even though the reference's own comment reads
+    /// *"clear for next try"*: on the LAST candidate there is no next parse, so this is what leaves the
+    /// unmatched module behind instead of holding it.
+    /// ⛔ AND IT LEAKS IN THE REFERENCE — `OwningOpRef::release()` hands back a pointer nobody takes —
+    /// which is a fact about `MLIRContext` ownership and not about the module this held.
+    pub fn release(&mut self) {
+        self.module = None;
+    }
 }
 
 //   authority : ddc/ddl/ddl.cpp:121  (9 body lines, level 4)

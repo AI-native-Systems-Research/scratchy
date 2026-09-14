@@ -170,7 +170,8 @@ use crate::formats::{Bits, DataFormat};
 use crate::generated::{
     AccessPattern, Attrs, Buffers, ComputeType, ConstName, DataConnect, DatastageProperty,
     DimProperty, LoopLabel, MaxUnroll, Memory, Mode, NameId, Operand, Operand as DdlOperand,
-    PaddingType, Program, Stmt, StmtKind, Strategy, SyncSignal, Unit, Via as DdlVia,
+    PaddingType, Program, Stmt, StmtKind, Strategy, SyncSignal, Template, Unit, Via as DdlVia,
+    ddl_templates,
 };
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{AllocId, BlockId, ConstIdx, DataOrigin, NodeId, PadType};
@@ -181,8 +182,9 @@ use crate::schedule::ddc::metadata::{
 use crate::schedule::ddc::transformation::{DsType, LoopId, Scale};
 use crate::schedule::ddc::transformation_util::StageName;
 use crate::schedule::ddc::transformation_util::{LoopCond, LoopCondComposite, is_memory};
-use crate::schedule::ddc::v1::CoreClSet;
+use crate::schedule::ddc::v1::{CoreClSet, Ln32};
 use crate::schedule::ddl::ops::DdlComputeType;
+use crate::schedule::ddl::{DdlModuleOp, DdlSource};
 use crate::schedule::dsc2::{
     AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeMask, ComputeNode,
     CondOp as DscCondOp, ConditionNode, DataInfo, Dsts, Hops, InstrAttribute, LdsIdx, LoopBound,
@@ -5924,7 +5926,129 @@ pub fn parse_ddl2_dsc<S: DdlSite + ?Sized>(
 //   extract   : crustify-ddc/cpp/ddl.cpp:4316-4370
 //   calls     : e324_processTransformations, e346_processRegion
 
-// crustify:todo: e372_selectAndParseDdlTemplate
+/// THE PER-CANDIDATE FACTS ONE `.ddl` STATES — what [`match_ddl2_dsc`], [`verify_ddl_constraint`] and
+/// [`parse_ddl2_dsc`] each take beyond the census, plus the buffer [`DdlModuleOp::parse_ddl`] reads.
+pub struct StatedTemplate<'d, P> {
+    /// The buffer `ddlTemplateDir + ddlFile` names.
+    pub source: P,
+    /// The walked program — the census's side of the same template.
+    pub program: &'d Program,
+    /// Every `ddl.operation_bind`, in the pre-order the match walks.
+    pub binds: Vec<OperationBind>,
+    /// Every `ddl.padded_dimension`, keyed by its own result.
+    pub padded: BTreeMap<NameId, PaddedDimension<'d>>,
+    /// Every `ddl.constraint` the module states, with the operands it names — `verifyDdlConstraints`
+    /// is a pre-order walk over `ConstraintOp` (`ddl_conversion.cpp:2553`) and entry 276 is one stop
+    /// of it, so the walk is the caller's.
+    pub constraints: Vec<(&'d [Operand], DdlConstraint)>,
+    /// The regions [`parse_ddl2_dsc`] walks.
+    pub root: DdlRoot<'d>,
+}
+
+/// WHERE A CANDIDATE TEMPLATE IS READ FROM — one [`Template`] to everything it states.
+///
+/// ⛔ ITS OWN SEAM AND NOT A METHOD ON [`MatchSite`]: what a template states is held ACROSS the `&mut`
+/// that the match and the walk take, so one seam for both would be a borrow that cannot be reborrowed.
+pub trait DdlTemplateSet {
+    /// The buffer type this set parses its candidates from.
+    type Source: DdlSource;
+
+    /// What `template` states, [`None`] where this set does not hold it.
+    fn stated(&self, template: Template) -> Option<StatedTemplate<'_, Self::Source>>;
+}
+
+/// WHAT ONE SELECTION ANSWERS — `matchedDdlFile`, and the complaints instead of `std::cout`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DdlSelection {
+    /// The `.ddl` whose match succeeded; [`None`] is each of the reference's three `false`s.
+    pub template: Option<Template>,
+    /// What `verbose_ >= 0` printed, plus [`parse_ddl2_dsc`]'s own diagnostics.
+    pub said: Vec<String>,
+}
+
+/// Replaces: e372_selectAndParseDdlTemplate
+///
+/// PARSES THE FIRST CANDIDATE `.ddl` THAT MATCHES ONTO THE DSC — the op-func of `computeOp_.front()`
+/// names an ordered candidate list, and each candidate is parsed and verified, matched, its
+/// constraints checked and then WALKED INTO THE SCHEDULE TREE; one that does not match is RELEASED and
+/// the walk goes on.
+///
+/// ⛔ [`None`] IS THE `ENABLE_LN32` ABORT, every refusal the four callees answer with, and a parse
+/// yielding nothing — which the reference would walk as a null root. The `enableLn32 = true; continue`
+/// after that abort is DEAD, since `DT_ERROR` throws; the `DEEPTOOLS_PATH` abort is unspellable,
+/// because the template directory is how a candidate is REACHED and one arrives here as a [`Template`].
+/// ⛔ THE ARCH SKIP IS [`ddl_templates`]'S, resolved at build time: MPW4 has no [`crate::arch::IsaGen`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference's own member state"
+)]
+pub fn select_and_parse_ddl_template<A: Arch, S: MatchSite + ?Sized, T: DdlTemplateSet + ?Sized>(
+    parser: &mut DdlModuleOp,
+    state: &mut DdlConversion,
+    interface: &mut DdlInterface,
+    metadata: &mut Metadata,
+    dsc: &mut DesignSpaceConfig,
+    site: &mut S,
+    templates: &T,
+    ln32: Ln32,
+) -> Option<DdlSelection> {
+    let Some(first) = site.bindable_ops().first().map(|op| op.op_func) else {
+        return Some(DdlSelection::default());
+    };
+    let Some(candidates) = ddl_templates(first.spelling(), A::GEN) else {
+        return Some(DdlSelection {
+            template: None,
+            said: vec![format!(
+                "[DDC] no DDL available for op {}",
+                first.spelling()
+            )],
+        });
+    };
+    for template in candidates {
+        if matches!(first, OpFunc::Exx2 | OpFunc::LayernormScale) && ln32 == Ln32::On {
+            return None;
+        }
+        let stated = templates.stated(*template)?;
+        interface.clear();
+        parser.parse_ddl(Some(stated.source));
+        parser.module()?;
+        if match_ddl2_dsc(
+            stated.program,
+            interface,
+            metadata,
+            dsc,
+            site,
+            &stated.binds,
+            &stated.padded,
+        )? {
+            for (operands, constraint) in &stated.constraints {
+                verify_ddl_constraint::<A>(stated.program, interface, dsc, operands, *constraint)?;
+            }
+            let said = parse_ddl2_dsc(
+                stated.program,
+                state,
+                interface,
+                metadata,
+                dsc,
+                site,
+                &stated.root,
+            )?;
+            return Some(DdlSelection {
+                template: Some(*template),
+                said,
+            });
+        }
+        parser.release();
+    }
+    Some(DdlSelection {
+        template: None,
+        said: vec![format!(
+            "[DDC] DDL found but not suitable for op {}",
+            first.spelling()
+        )],
+    })
+}
+
 //   authority : ddc/ddl/ddl_conversion.cpp:42  (59 body lines, level 5)
 //   class     : DdlConversion
 //   original  : bool DdlConversion::selectAndParseDdlTemplate()
@@ -7844,5 +7968,176 @@ mod unit_tests {
             ),
             Some(false)
         );
+    }
+
+    use super::{DdlSelection, DdlTemplateSet, StatedTemplate, select_and_parse_ddl_template};
+    use crate::generated::Template;
+    use crate::schedule::ddc::v1::Ln32;
+    use crate::schedule::ddl::ops::Dialect;
+    use crate::schedule::ddl::{DdlModuleOp, DdlSource, ParsedDdl};
+
+    /// A BUFFER THAT PARSES — a module stating no op at all, which every verifier accepts.
+    struct Buffer;
+
+    impl DdlSource for Buffer {
+        fn parse(&self, _dialect: &Dialect) -> Option<ParsedDdl> {
+            Some(ParsedDdl {
+                defining: Vec::new(),
+                verifiable: Vec::new(),
+            })
+        }
+    }
+
+    /// EVERY CANDIDATE OF ONE OP-FUNC, all stating the same empty program — and a
+    /// `ddl.operation_bind` for `matches` ALONE, which is what makes exactly that one match: a
+    /// template with no bind leaves the DSC's compute op unmapped, and that is entry 347's `false`.
+    struct Candidates {
+        program: Program,
+        matches: Template,
+        constraint: DdlConstraint,
+    }
+
+    impl DdlTemplateSet for Candidates {
+        type Source = Buffer;
+
+        fn stated(&self, template: Template) -> Option<StatedTemplate<'_, Buffer>> {
+            Some(StatedTemplate {
+                source: Buffer,
+                program: &self.program,
+                binds: if template == self.matches {
+                    vec![OperationBind {
+                        result: NameId(0),
+                        op_func: Some(OpFunc::Exx2),
+                        required: true,
+                        data_formats: Vec::new(),
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        interim: Vec::new(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                padded: BTreeMap::new(),
+                constraints: vec![(&[], self.constraint)],
+                root: DdlRoot {
+                    regions: RegionTree::default(),
+                    dataflows: vec![RegionId(0)],
+                    transformations: vec![vec![Transformation::DisableTransferPromotion]],
+                },
+            })
+        }
+    }
+
+    /// ⭐⭐ THE WHOLE WALK OVER `exx2`'S THREE CANDIDATES: the first does not match and is RELEASED,
+    /// the second does — the stale interface is cleared, its constraint checked, and its dataflow
+    /// reaches the tree as `root_level_operations` — and the template it settled on is the answer.
+    /// ⛔ AND EVERY REFUSAL: an empty `computeOp_` states nothing, an op-func the table does not name
+    /// says so, an exhausted walk says so, a constraint the DSC fails aborts, and so does `ENABLE_LN32`
+    /// on an `exx2`.
+    #[test]
+    fn walks_the_candidates_until_one_matches_and_parses_it_onto_the_dsc() {
+        let run =
+            |op_func: Option<OpFunc>, matches: Template, constraint: DdlConstraint, ln32: Ln32| {
+                let templates = Candidates {
+                    program: synthetic(&[], &[]),
+                    matches,
+                    constraint,
+                };
+                let mut parser = DdlModuleOp::default();
+                let mut interface = DdlInterface::default();
+                interface
+                    .region2blocks
+                    .insert(RegionId(1), NodeName("stale".to_owned()));
+                let mut metadata = Metadata::default();
+                metadata.below_lx_schedule_insert_block = BlockId::of(&OneBlock, NodeId(0));
+                let mut dsc = matchable();
+                let mut site = Match {
+                    ops: op_func
+                        .map(|op_func| BindableOp {
+                            op_func,
+                            format: Some(DataFormat::Sen169Fp16),
+                            inputs: Vec::new(),
+                            outputs: Vec::new(),
+                            core_exclude: BTreeSet::new(),
+                            core_cl_exclude: BTreeSet::new(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Match::default()
+                };
+                let mut state = DdlConversion::new(BlockNode {
+                    name: NodeName("head".to_owned()),
+                    children: Vec::new(),
+                });
+                let selected = select_and_parse_ddl_template::<Dd2, _, _>(
+                    &mut parser,
+                    &mut state,
+                    &mut interface,
+                    &mut metadata,
+                    &mut dsc,
+                    &mut site,
+                    &templates,
+                    ln32,
+                );
+                (selected, parser, state, interface)
+            };
+        let cores = DdlConstraint::MinNumCores(CoreCount(2));
+        let second = Template::Summeanmaxexx2Fp32;
+        let (selected, parser, state, interface) =
+            run(Some(OpFunc::Exx2), second, cores, Ln32::Off);
+        assert_eq!(
+            selected,
+            Some(DdlSelection {
+                template: Some(second),
+                said: vec![TRANSFER_PROMOTION_DISABLED.to_owned()],
+            })
+        );
+        assert_eq!(
+            interface.operation_definition[&NameId(0)].compute_op,
+            Some(ComputeOpIdx(0))
+        );
+        let root = NodeName("root_level_operations".to_owned());
+        assert_eq!(
+            interface.region2blocks,
+            BTreeMap::from([(RegionId(0), root)])
+        );
+        assert_eq!(
+            state.tree.head().children.len(),
+            1,
+            "the matched template's dataflow reached the tree"
+        );
+        assert!(parser.module().is_some());
+
+        let (exhausted, parser, ..) = run(Some(OpFunc::Exx2), Template::Argmax, cores, Ln32::Off);
+        assert_eq!(
+            exhausted,
+            Some(DdlSelection {
+                template: None,
+                said: vec!["[DDC] DDL found but not suitable for op exx2".to_owned()],
+            })
+        );
+        assert!(parser.module().is_none());
+        assert_eq!(
+            run(None, second, cores, Ln32::Off).0,
+            Some(DdlSelection::default())
+        );
+        assert_eq!(
+            run(Some(OpFunc::Softmax), second, cores, Ln32::Off).0,
+            Some(DdlSelection {
+                template: None,
+                said: vec!["[DDC] no DDL available for op softmax".to_owned()],
+            })
+        );
+        assert_eq!(
+            run(
+                Some(OpFunc::Exx2),
+                second,
+                DdlConstraint::MinNumCores(CoreCount(3)),
+                Ln32::Off
+            )
+            .0,
+            None
+        );
+        assert_eq!(run(Some(OpFunc::Exx2), second, cores, Ln32::On).0, None);
     }
 }

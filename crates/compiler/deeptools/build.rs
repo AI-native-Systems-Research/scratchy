@@ -357,6 +357,7 @@ fn main() {
     check_every_opaque_hole_is_filled(&programs);
     check_every_op_func_in_scope_has_a_program(&programs);
     codegen_op_func(&mut out, &programs);
+    codegen_ddl_templates(&mut out);
 
     // 🛑 THE LEDGER OF WHAT THE WALK FLATTENED. A `ddl.if` whose condition is a LOOP POSITION keeps
     // BOTH arms, because which one runs depends on an extent the walk does not have. Those arms are
@@ -2465,6 +2466,82 @@ fn select_programs(
     );
     out
 }
+
+/// `opFuncToDdlTemplate` ITSELF — the ordered candidate list per (op-func, generation), with each
+/// candidate's `dedicatedArch` skip already applied.
+///
+/// ⭐⭐ THE WHOLE TABLE AND NOT JUST [`IN_SCOPE`]. What `selectAndParseDdlTemplate` answers for an
+/// op-func the table names is a candidate list; answering *"no DDL available for op"* instead, because
+/// scratchy cannot emit that op, would NARROW the reference rather than scope it. That is also why
+/// nothing here joins to `PROGRAMS`: three of the table's pairs name a template that declares no
+/// `operation_bind` for them (`fastexp`/`unary_parallel.ddl`, `ReStickifyOpLx`/`restickify.ddl` twice),
+/// and a candidate the vendored text does not bind is still a candidate the reference tries.
+///
+/// ⛔ THE ARCH SKIP IS RESOLVED HERE because `crate::arch::IsaGen` models two of the table's three
+/// generations: a candidate tagged MPW4 has no `IsaGen` to compare against, so `arch.value() !=
+/// coreArch` is answered per MODELLED generation instead. An op-func every candidate skips keeps an
+/// EMPTY list rather than losing its row — the reference's *"DDL found but not suitable"* and not its
+/// *"no DDL available"*.
+fn codegen_ddl_templates(out: &mut String) {
+    // (arch generation as `crate::arch::IsaGen` spells it, the same generation as the table spells it)
+    const GENERATIONS: &[(&str, selection::IsaGen)] = &[
+        ("Rcudd1a", selection::IsaGen::Rcudd1a),
+        ("Sen1p5", selection::IsaGen::Sen1p5),
+    ];
+
+    out.push_str(
+        "/// EVERY `.ddl` TEMPLATE THAT SERVES AN OP-FUNC, PER GENERATION AND IN dxp'S OWN ORDER —\n\
+         /// `opFuncToDdlTemplate` (`ddc/ddl/ddl_conversion.h:86-267`, ported to `ddl/selection.rs`)\n\
+         /// with each candidate's ISA tag already resolved.\n\
+         pub const DDL_TEMPLATES: &[(&str, &[(crate::arch::IsaGen, &[Template])])] = &[\n",
+    );
+    for (op_func, candidates) in selection::OP_FUNC_TEMPLATES {
+        let _ = writeln!(out, "    (\"{op_func}\", &[");
+        for (arch_variant, table_gen) in GENERATIONS {
+            let serving = candidates
+                .iter()
+                .filter(|candidate| candidate.serves.covers(*table_gen))
+                .map(|candidate| {
+                    format!(
+                        "Template::{}",
+                        ident_of(candidate.template.trim_end_matches(".ddl"))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "        (crate::arch::IsaGen::{arch_variant}, &[{serving}]),"
+            );
+        }
+        out.push_str("    ]),\n");
+    }
+    out.push_str("];\n\n");
+    out.push_str(DDL_TEMPLATES_LOOKUP);
+}
+
+/// The lookup over the emitted table, which is `opFuncToDdlTemplate.find()` itself.
+const DDL_TEMPLATES_LOOKUP: &str = r#"/// THE CANDIDATES `selectAndParseDdlTemplate` WALKS for one op-func on one generation.
+///
+/// ⛔ [`None`] IS `opFuncToDdlTemplate.find() == end()`, the *"no DDL available for op"* answer, and it
+/// is DISTINCT from an EMPTY list — a row whose every candidate this generation skips.
+#[must_use]
+pub fn ddl_templates(
+    op_func: &str,
+    generation: crate::arch::IsaGen,
+) -> Option<&'static [Template]> {
+    DDL_TEMPLATES
+        .iter()
+        .find(|(name, _)| *name == op_func)
+        .and_then(|(_, per_generation)| {
+            per_generation
+                .iter()
+                .find(|(isa, _)| *isa == generation)
+                .map(|(_, templates)| *templates)
+        })
+}
+
+"#;
 
 /// THE SEALED SET, transcribed from `OpFunc::name()`
 /// (`crates/compiler/subtile/src/superdsc_opspec.rs:1162`).
