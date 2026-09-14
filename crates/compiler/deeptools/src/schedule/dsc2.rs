@@ -1902,6 +1902,16 @@ impl ScheduleTree {
     ) -> Option<&mut ConditionNode> {
         find_guarded_mut(&mut self.head, accepts)
     }
+
+    /// The same search over the `SYNC` nodes, which neither [`Self::find_block_mut`] nor
+    /// [`Self::find_guarded_mut`] yields — `otherEndOfTheSignals_` is bound onto the sync nodes
+    /// THEMSELVES (`ddc/ddl/ddl_conversion.cpp:2810`), and a signal names its two ends by name.
+    pub fn find_sync_mut(
+        &mut self,
+        accepts: impl Fn(&SyncNode) -> bool + Copy,
+    ) -> Option<&mut SyncNode> {
+        find_sync_mut(&mut self.head, accepts)
+    }
 }
 
 /// Pre-order DFS over the `BLOCK` nodes below `block`, which is itself never yielded.
@@ -2012,6 +2022,50 @@ fn find_guarded_mut_in(
                 }
             }
             SchedNode::StickMask(_) | SchedNode::Sync(_) | SchedNode::Leaf(_) => {}
+        }
+    }
+    None
+}
+
+/// The first accepted `SYNC` node below `block`, in the same pre-order.
+fn find_sync_mut(
+    block: &mut BlockNode,
+    accepts: impl Fn(&SyncNode) -> bool + Copy,
+) -> Option<&mut SyncNode> {
+    find_sync_mut_in(&mut block.children, accepts)
+}
+
+/// The same search over a child list.
+fn find_sync_mut_in(
+    children: &mut [SchedNode],
+    accepts: impl Fn(&SyncNode) -> bool + Copy,
+) -> Option<&mut SyncNode> {
+    for child in children {
+        match child {
+            SchedNode::Sync(sync) => {
+                if accepts(sync) {
+                    return Some(sync);
+                }
+            }
+            SchedNode::Block(inner) | SchedNode::Condition(inner) => {
+                if let Some(found) = find_sync_mut(inner, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::Loop(node) => {
+                if let Some(found) = find_sync_mut(&mut node.block, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::Guarded(cond) => {
+                if let Some(found) = find_sync_mut_in(&mut cond.then_region, accepts) {
+                    return Some(found);
+                }
+                if let Some(found) = find_sync_mut_in(&mut cond.else_region, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::StickMask(_) | SchedNode::Leaf(_) => {}
         }
     }
     None
