@@ -2644,9 +2644,9 @@ impl AddressPinningAndTogglePass {
     /// Routes ONE transfer to the pinning driver its matched pattern names, or SKIPS pinning it
     /// when the unit holds an immutable-address register for every stream (`:1492-1520`).
     ///
-    /// ⛔ THE SKIP ARM IS NOT THE LAST ONE: a transfer it declines is NOT then handed to
-    /// [`Self::process_simple_constant`] (`:1509-1516`). Its stream count is asked LAST because
-    /// asking MEMOISES [`Self::num_streams`] (`:1508`), so it stays behind a short-circuiting `&&`.
+    /// ⛔ THE SKIP ARM IS NOT THE LAST ONE: a transfer it SKIPS is NOT then handed to
+    /// [`Self::process_simple_constant`] (`:1506-1517`). Its stream count is the SECOND conjunct and
+    /// stays there (`:1507`): asking MEMOISES [`Self::num_streams`], behind a short-circuiting `&&`.
     pub fn process_data_transfer<E: ExpressionEvaluator>(
         &mut self,
         desc: DescriptorId,
@@ -2707,7 +2707,7 @@ impl AddressPinningAndTogglePass {
                 sites,
             );
         } else if !can_be_simplified
-            // `ns <= getMaxNumRegisters()` (`:1508`) — the one place a stream count meets a register
+            // `ns <= getMaxNumRegisters()` (`:1507`) — the one place a stream count meets a register
             // count, which is why neither newtype absorbs the other.
             && self.compute_or_get_number_of_streams().0
                 <= ps_manager.max_num_registers().0 as usize
@@ -2715,7 +2715,7 @@ impl AddressPinningAndTogglePass {
                 || prog_stitch == ProgStitch::Standalone)
             && !self.force_address_pinning
         {
-            // `LLVM_DEBUG(.. "Skipping addr pinning for data transfer .." )` (`:1511-1515`): the whole
+            // `LLVM_DEBUG(.. "Skipping addr pinning for data transfer .." )` (`:1511-1514`): the whole
             // arm is that print, and leaving the transfer as it came in IS the effect.
         } else if is_valid {
             self.process_simple_constant(
@@ -5071,6 +5071,67 @@ mod unit_tests {
             &SpareRegisters,
             &mut sites,
         );
+    }
+
+    /// 653/656's negative — an INVALID transfer reaches no driver and is left as it came in, and
+    /// the register ask the skip arm's second conjunct made still memoised the stream count.
+    #[test]
+    fn e653_leaves_an_invalid_transfer_alone_after_asking_for_the_stream_count() {
+        struct StitchedLx;
+
+        impl PinningSchemeManager for StitchedLx {
+            fn max_num_registers(&self) -> MaxRegNum {
+                MaxRegNum(4)
+            }
+
+            // LX on a stitched program fails the skip arm's disjunct, so the routing runs past it.
+            fn memory_unit(&self) -> DfirUnit {
+                DfirUnit::Lx
+            }
+
+            fn find_closest_pinned_addr(
+                &self,
+                _ev_x: EvaluatedValue,
+                _ev_y: EvaluatedValue,
+                _region: RegionSite,
+                _element_size: Bits,
+            ) -> EvaluatedValue {
+                unreachable!("an invalid transfer is pinned by no driver")
+            }
+        }
+
+        let original = vec![load_and_store(1, 2, 5, 10)];
+        let mut body = original.clone();
+        let mut pass = AddressPinningAndTogglePass::default();
+        // Two base addresses under no pattern, so `isValid()` is false and the last arm is the one.
+        let desc = pass
+            .immut_data_transfer_descriptors
+            .insert(transfer(None, 2));
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_data_transfer(
+            desc,
+            &mut body,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            Bits(16),
+            ProgStitch::Stitched,
+            &mut OutOfScopeEvaluator,
+            &StitchedLx,
+            &mut sites,
+        );
+
+        // `AssertOnUnexpectedPatterns` ships false, so an unrecognised pattern is SILENTLY skipped.
+        assert_eq!(body, original);
+        assert!(consts.is_empty());
+        // The ask landed AHEAD of the disjunct that declined the skip: it is the second conjunct.
+        assert_eq!(pass.num_streams, Some(StreamCount(2)));
     }
 
     /// 654/656 — the DST end is the one pinned when the SRC unit is not the descriptor's memory unit,
