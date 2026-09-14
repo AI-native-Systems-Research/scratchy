@@ -2728,10 +2728,78 @@ impl AddressPinningAndTogglePass {
     }
 }
 
-// crustify:todo: e654_processDataTransfer
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1456  (34 body lines, level 10)
-//   original  : void AddressPinningAndTogglePass::processDataTransfer( DataTransferDescriptor &dtd, const PinningSchemeManager &ps_manager)
-//   calls     : e653_processDataTransfer
+impl AddressPinningAndTogglePass {
+    /// Replaces: e654_processDataTransfer
+    ///
+    /// Finds ON THE TRANSFER ITSELF the address end and element size
+    /// [`Self::process_data_transfer`] pins with: the one address of a `sentient.load_and_send` or
+    /// `sentient.receive_and_store`, which must be an LX transfer, and the `sentient.load_and_store`
+    /// end whose unit is the descriptor's own memory unit (`:1456-1490`).
+    ///
+    /// ⛔ NAMED FOR WHAT IT RESOLVES — this and e653 are one C++ overload set.
+    /// ⛔ THE END IS A TERNARY, NOT `getMutableAddrResultIndex`: only the SRC unit is compared, so a
+    /// transfer with NEITHER end on the memory unit takes the DST end here (`:1482-1487`), and a
+    /// `load_and_extract_scalar`/`load_compute_and_send` hits the `cast` (`:1474`) its own note says
+    /// it must.
+    pub fn process_data_transfer_op<E: ExpressionEvaluator>(
+        &mut self,
+        desc: DescriptorId,
+        unit_body: &mut Vec<Op>,
+        ty: ScalarTy,
+        prog_stitch: ProgStitch,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        sites: &mut OffsetSites<'_>,
+    ) {
+        let (end, element_size) = {
+            let regions: [&[Op]; 1] = [unit_body.as_slice()];
+            let defs = Definitions::from_innermost(&regions);
+            let (dtd, transfer) =
+                transfer_of(&self.immut_data_transfer_descriptors, desc, unit_body);
+            let memory_unit = dtd.memory_unit.dfir_unit();
+            match transfer {
+                // The `getMutableAddrMutable()`/`getImmutableAddrMutable()` pair of the two
+                // single-address ops is [`TransferEnd::Src`], their only end.
+                Op::Sentient(
+                    sentient::Op::LoadAndSend { extent, .. }
+                    | sentient::Op::ReceiveAndStore { extent, .. },
+                ) => {
+                    if memory_unit != DfirUnit::Lx {
+                        panic!(
+                            "DT_CHECK_MSG(dtd.getMemoryUnit() == LX, \"Expect LX data transfer\") \
+                             (`:1462`, `:1468`): {memory_unit:?}"
+                        )
+                    }
+                    (TransferEnd::Src, extent.element_size)
+                }
+                Op::Sentient(sentient::Op::LoadAndStore { src, extent, .. }) => {
+                    // `(src_unit == dtd.getMemoryUnit()) ? getSrc..Mutable() : getDst..Mutable()`
+                    // (`:1482-1487`) — the `DEBUG_WITH_TYPE` print between them is droppable.
+                    let end = if unit_type_of(*src, defs) == Some(memory_unit) {
+                        TransferEnd::Src
+                    } else {
+                        TransferEnd::Dst
+                    };
+                    (end, extent.element_size)
+                }
+                other => panic!(
+                    "cast<sentient::LoadAndStoreOp>(dtd.getOperation()) (`:1474`): {other:?}"
+                ),
+            }
+        };
+        self.process_data_transfer(
+            desc,
+            unit_body,
+            end,
+            ty,
+            element_size,
+            prog_stitch,
+            evaluator,
+            ps_manager,
+            sites,
+        );
+    }
+}
 
 // crustify:todo: e655_processDataTransfers
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1450  (4 body lines, level 11)
@@ -4826,6 +4894,72 @@ mod unit_tests {
             ProgStitch::Stitched,
             &mut OutOfScopeEvaluator,
             &SpareRegisters,
+            &mut sites,
+        );
+    }
+
+    /// 654/656 — the DST end is the one pinned when the SRC unit is not the descriptor's memory unit,
+    /// and the element size handed down is the transfer's own. ⛔ stops at `create_offset_value`, which
+    /// either end reaches before anything end-specific becomes observable.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e654_resolves_the_load_and_store_end_and_element_size_from_the_transfer() {
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn max_num_registers(&self) -> MaxRegNum {
+                MaxRegNum(4)
+            }
+
+            // An LX manager on a stitched program fails the skip arm's disjunct, so the routing
+            // reaches the simple-constant driver.
+            fn memory_unit(&self) -> DfirUnit {
+                DfirUnit::Lx
+            }
+
+            fn find_closest_pinned_addr(
+                &self,
+                _ev_x: EvaluatedValue,
+                _ev_y: EvaluatedValue,
+                _region: RegionSite,
+                element_size: Bits,
+            ) -> EvaluatedValue {
+                // `load_and_store.getElementSize()` (`:1488`), not the `Bits(16)` every other
+                // transfer in this module carries.
+                assert_eq!(element_size, Bits(32));
+                EvaluatedValue(0)
+            }
+        }
+
+        let mut transfer_op = load_and_store(1, 2, 5, 10);
+        if let Op::Sentient(sentient::Op::LoadAndStore { extent, .. }) = &mut transfer_op {
+            extent.element_size = Bits(32);
+        }
+        // The SRC is on the HBM while the descriptor's memory unit is LX, so the DST end is the one.
+        let mut body = vec![
+            get_unit(1, DfirUnit::Hbm),
+            get_unit(2, DfirUnit::Lx),
+            transfer_op,
+        ];
+        let mut pass = AddressPinningAndTogglePass::default();
+        let mut dtd = transfer(None, 1);
+        dtd.op = OpId::at(&[2]);
+        let desc = pass.immut_data_transfer_descriptors.insert(dtd);
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_data_transfer_op(
+            desc,
+            &mut body,
+            ScalarTy::Index,
+            ProgStitch::Stitched,
+            &mut OutOfScopeEvaluator,
+            &StatedScheme,
             &mut sites,
         );
     }
