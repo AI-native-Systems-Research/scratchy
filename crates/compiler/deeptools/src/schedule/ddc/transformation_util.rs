@@ -161,7 +161,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::arch_enums::SenComponent;
 
 use super::fold::{
-    AllocId, AllocLayout, Allocations, ConstIdx, DataOrigin, NodeId, PadType, StoredStream,
+    AllocId, AllocLayout, Allocations, BlockId, ConstIdx, DataOrigin, NodeId, PadType, StoredStream,
 };
 use super::metadata::{DatastageId, DdcMemory, DestIdx, MetaDimKind, Metadata, NodeIndex};
 use super::transformation::{LoopId, SkipMetadataUpdate};
@@ -2051,12 +2051,62 @@ pub fn transfer_related_to_external_nodes<E: ExternalStreams + ?Sized>(
         || any_dest_related_to_external_nodes(streams, transfer)
 }
 
-// crustify:todo: e361_relatedToExternalNodes
-//   authority : ddc/ddc_transformation_util.cpp:1757  (20 body lines, level 4)
-//   class     : Ddc
-//   original  : bool Ddc::relatedToExternalNodes(const dsc2::BlockNode *root) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:14282-14302
-//   calls     : e121_relatedToExternalNodes, e306_relatedToExternalNodes, e341_relatedToExternalNodes
+/// ONE NODE OF THE SUBTREE ENTRY 361 WALKS — the three `nodeType_` arms of its one
+/// `{ALLOCATE, COMPUTE, TRANSFER}` traversal, each carrying what its own arm reads.
+///
+/// ⛔ THE BODY TRAVELS WITH THE NODE because the two live arms ask entries 306 and 341, which take
+/// the compute and the transfer themselves; an allocate is asked nothing but `isExternalNode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubtreeNode {
+    /// `ALLOCATE`.
+    Allocate(NodeId),
+    /// `COMPUTE`, whose datastreams entry 306 reads.
+    Compute(NodeId, ComputeNode),
+    /// `TRANSFER`, whose ends entry 341 reads.
+    Transfer(NodeId, TransferNode),
+}
+
+impl SubtreeNode {
+    /// The schedule node itself, which is what `isExternalNode` is asked about.
+    #[must_use]
+    pub const fn node(&self) -> NodeId {
+        match self {
+            Self::Allocate(node) | Self::Compute(node, _) | Self::Transfer(node, _) => *node,
+        }
+    }
+}
+
+/// WHAT ENTRY 361 ASKS OF THE SCHEDULE TREE.
+pub trait ExternalSubtree: ExternalStreams {
+    /// `scheduleTree_.traverseTreeDFS(root, {ALLOCATE, COMPUTE, TRANSFER})` (`:1758`).
+    fn subtree_nodes(&self, root: BlockId) -> Vec<SubtreeNode>;
+}
+
+/// Replaces: e361_relatedToExternalNodes
+///
+/// Whether ANYTHING UNDER THIS BLOCK touches an external datastream (`:1757`) — `isExternalNode` on
+/// every allocate, compute and transfer under `root`, then entry 306 on the computes and entry 341
+/// on the transfers.
+///
+/// ⛔ A DISTINCT NAME, as entries 121/306/341 each needed one. ⚠️ TRAP: ENTRY 121 IS UNREACHABLE
+/// FROM HERE — the traversal filter admits no `SYNC` node, however the call graph reads.
+#[must_use]
+pub fn subtree_related_to_external_nodes<S: ExternalSubtree + ?Sized>(
+    tree: &S,
+    metadata: &Metadata,
+    root: BlockId,
+) -> bool {
+    tree.subtree_nodes(root).into_iter().any(|node| {
+        metadata.external_nodes.contains(&node.node())
+            || match &node {
+                SubtreeNode::Allocate(_) => false,
+                SubtreeNode::Compute(_, compute) => compute_related_to_external_nodes(tree, compute),
+                SubtreeNode::Transfer(_, transfer) => {
+                    transfer_related_to_external_nodes(tree, transfer)
+                }
+            }
+    })
+}
 
 // ⭐ USES FOR ENTRIES 255-257: `DataInfo`, `OperandPos` and `SenComponent`, added to this file's top
 // block. TYPES FOR ENTRIES 255-257 follow; union them with this file's other vocabulary as its
@@ -6623,5 +6673,158 @@ mod tests_e118_e123 {
             metadata.new_allocations[&DdcMemory::PeLrf].lds_idx_and_alloc_node,
             BTreeMap::from([(new, alloc)])
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_e361 {
+    // ⭐ TESTS FOR ENTRY 361. Union this module with this file's other test modules when they land.
+    use super::*;
+
+    use super::super::fold::{NodeKind, ScheduleTree};
+    use crate::schedule::ddl::ops::DdlComputeType;
+    use crate::schedule::dsc2::{InstrAttribute, NumChunks, ReplicationFactor, TransferPadding};
+    use crate::units::NumFolds;
+    use sys_arch_spec::arch_enums::SenComponent;
+
+    /// THE SUBTREE AS THE WALK HANDS IT OVER, with the ONE datastream this stand-in calls external.
+    struct Subtree {
+        nodes: Vec<SubtreeNode>,
+        external: Option<(Option<DataConnect>, SenComponent, StreamDirection)>,
+    }
+
+    impl ScheduleTree for Subtree {
+        fn kind(&self, _node: NodeId) -> NodeKind {
+            NodeKind::Block
+        }
+
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+
+        fn children(&self, _block: BlockId) -> Vec<NodeId> {
+            Vec::new()
+        }
+    }
+
+    impl ExternalStreams for Subtree {
+        fn storage_or_datastream_is_external(
+            &self,
+            data: DataInfo,
+            storage: SenComponent,
+            direction: StreamDirection,
+        ) -> bool {
+            self.external == Some((data.data_connect, storage, direction))
+        }
+    }
+
+    impl ExternalSubtree for Subtree {
+        fn subtree_nodes(&self, _root: BlockId) -> Vec<SubtreeNode> {
+            self.nodes.clone()
+        }
+    }
+
+    fn operand(connect: DataConnect, storage: SenComponent) -> Operand {
+        Operand {
+            unit: SenComponent::Pe,
+            storage,
+            data: DataInfo {
+                data_connect: Some(connect),
+                my_lds_idx: Some(LdsIdx(1)),
+                constant_id: None,
+                latch_data_id: None,
+            },
+        }
+    }
+
+    fn compute(node: NodeId, connect: DataConnect) -> SubtreeNode {
+        SubtreeNode::Compute(
+            node,
+            ComputeNode {
+                name: NodeName("c0".to_string()),
+                op: DdlComputeType::Macc,
+                ex_unit: SenComponent::Pe,
+                inputs: vec![operand(connect, SenComponent::Hbm)],
+                outputs: Vec::new(),
+                num_folds_engaged: NumFolds::ONE,
+                data_format: None,
+                instr_attribute: InstrAttribute::default(),
+            },
+        )
+    }
+
+    fn transfer(node: NodeId, connect: DataConnect) -> SubtreeNode {
+        SubtreeNode::Transfer(
+            node,
+            TransferNode {
+                name: NodeName("t0".to_string()),
+                src: operand(connect, SenComponent::L0),
+                dsts: Dsts::new(operand(DataConnect::ArfPt, SenComponent::Lx), Vec::new()),
+                replication_factor: ReplicationFactor::ONE,
+                unit_time_transfer_chunk_size: Vec::new(),
+                unit_time_transfer_num_chunks: NumChunks::ONE,
+                padding: TransferPadding::default(),
+                src_indirect: None,
+                dst_indirect: None,
+                core_id_to_gtr_info: BTreeMap::new(),
+                transfer_size: BTreeMap::new(),
+            },
+        )
+    }
+
+    /// A block whose three node kinds are each the one that answers, and the same block with
+    /// NOTHING external under it.
+    #[test]
+    fn a_block_is_related_through_an_external_node_a_computes_input_or_a_transfers_source() {
+        let root = BlockId::of(
+            &Subtree {
+                nodes: Vec::new(),
+                external: None,
+            },
+            NodeId(0),
+        )
+        .expect("the stand-in calls every node a block");
+        let nodes = vec![
+            SubtreeNode::Allocate(NodeId(1)),
+            compute(NodeId(2), DataConnect::ArfPtsum),
+            transfer(NodeId(3), DataConnect::OuttensorToSfp),
+        ];
+        let clean = Metadata::default();
+
+        // The ALLOCATE arm: nothing but `isExternalNode` reaches it.
+        let mut external_node = Metadata::default();
+        external_node.external_nodes.insert(NodeId(1));
+        let tree = Subtree {
+            nodes: nodes.clone(),
+            external: None,
+        };
+        assert!(subtree_related_to_external_nodes(
+            &tree,
+            &external_node,
+            root
+        ));
+        assert!(!subtree_related_to_external_nodes(&tree, &clean, root));
+
+        // The COMPUTE arm, through entry 306: its input's own component as the storage.
+        let by_compute = Subtree {
+            nodes: nodes.clone(),
+            external: Some((
+                Some(DataConnect::ArfPtsum),
+                SenComponent::Pe,
+                StreamDirection::Incoming,
+            )),
+        };
+        assert!(subtree_related_to_external_nodes(&by_compute, &clean, root));
+
+        // The TRANSFER arm, through entry 341: the source's STORAGE, incoming.
+        let by_transfer = Subtree {
+            nodes,
+            external: Some((
+                Some(DataConnect::OuttensorToSfp),
+                SenComponent::L0,
+                StreamDirection::Incoming,
+            )),
+        };
+        assert!(subtree_related_to_external_nodes(&by_transfer, &clean, root));
     }
 }
