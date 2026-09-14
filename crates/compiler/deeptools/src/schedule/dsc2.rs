@@ -32,6 +32,7 @@ use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::l3::dl_ops::{GtrGroupId, Shares};
+use crate::schedule::l3::dsc::WkSlice;
 use crate::units::{Core, Corelet, NumFolds};
 
 impl PrimaryDim {
@@ -185,6 +186,9 @@ pub struct Coordinate {
     dims: BTreeMap<PrimaryDim, FoldDim>,
     padding: Padding,
     fold_constructed: bool,
+    /// `coreIdToWkSlice_` (`dsc/dsc2.h:81`) — WHICH WORK SLICE EACH CORE TAKES per dim as THIS
+    /// coordinate reads it, which entry 355 rewrites away from the super-DSC's own answer.
+    core_id_to_wk_slice: BTreeMap<Core, WkSlice>,
 }
 
 impl Coordinate {
@@ -271,6 +275,22 @@ impl Coordinate {
         for (dim, pad) in form {
             self.padding.set(dim, pad);
         }
+    }
+
+    /// `coreIdToWkSlice_.at(core)` TO BE WRITTEN, [`None`] where the coordinate states no slice for
+    /// the core — *"Core ID not found."*.
+    pub fn wk_slice_mut(&mut self, core: Core) -> Option<&mut WkSlice> {
+        self.core_id_to_wk_slice.get_mut(&core)
+    }
+
+    /// `coreIdToWkSlice_[core] = slice`.
+    pub fn set_wk_slice(&mut self, core: Core, slice: WkSlice) {
+        self.core_id_to_wk_slice.insert(core, slice);
+    }
+
+    /// `coreIdToWkSlice_`, in core order.
+    pub fn wk_slices(&self) -> impl Iterator<Item = (Core, &WkSlice)> {
+        self.core_id_to_wk_slice.iter().map(|(&core, at)| (core, at))
     }
 
     /// `foldConstructed()` (`dsc/dsc2.h:119`).
