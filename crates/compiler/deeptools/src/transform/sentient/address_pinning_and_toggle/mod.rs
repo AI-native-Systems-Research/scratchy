@@ -2750,10 +2750,15 @@ impl AddressPinningAndTogglePass {
     /// transfer with NEITHER end on the memory unit takes the DST end here (`:1482-1487`), and a
     /// `load_and_extract_scalar`/`load_compute_and_send` hits the `cast` (`:1474`) its own note says
     /// it must.
+    /// ⛔ `getSrc().getDefiningOp()` LEAVES THE UNIT BODY (`:1475`): every `dataflow.get_unit` this
+    /// island declares lives in the enclosing [`crate::islands::sentient::Program`]'s `preamble`, so
+    /// `enclosing` is the outward scope e637 and e614 are already handed. Without it `src_unit` is no
+    /// unit at all, and the SRC arm of that ternary is unreachable.
     pub fn process_data_transfer_op<E: ExpressionEvaluator>(
         &mut self,
         desc: DescriptorId,
         unit_body: &mut Vec<Op>,
+        enclosing: &[&[Op]],
         ty: ScalarTy,
         prog_stitch: ProgStitch,
         evaluator: &mut E,
@@ -2761,8 +2766,10 @@ impl AddressPinningAndTogglePass {
         sites: &mut OffsetSites<'_>,
     ) {
         let (end, element_size) = {
-            let regions: [&[Op]; 1] = [unit_body.as_slice()];
-            let defs = Definitions::from_innermost(&regions);
+            let mut scopes: Vec<&[Op]> = Vec::with_capacity(enclosing.len() + 1);
+            scopes.push(unit_body.as_slice());
+            scopes.extend_from_slice(enclosing);
+            let defs = Definitions::from_innermost(&scopes);
             let (dtd, transfer) =
                 transfer_of(&self.immut_data_transfer_descriptors, desc, unit_body);
             let memory_unit = dtd.memory_unit.dfir_unit();
@@ -2822,6 +2829,7 @@ impl AddressPinningAndTogglePass {
     pub fn process_data_transfers<E: ExpressionEvaluator>(
         &mut self,
         unit_body: &mut Vec<Op>,
+        enclosing: &[&[Op]],
         ty: ScalarTy,
         prog_stitch: ProgStitch,
         evaluator: &mut E,
@@ -2834,6 +2842,7 @@ impl AddressPinningAndTogglePass {
             self.process_data_transfer_op(
                 DescriptorId(index as u32),
                 unit_body,
+                enclosing,
                 ty,
                 prog_stitch,
                 evaluator,
@@ -2902,6 +2911,12 @@ impl AddressPinningAndTogglePass {
             // `const_builder` IS THE ENCLOSING FUNCTION'S ENTRY BLOCK and `query_map_builder` is the
             // walked region itself (`:1017-1030`), which is what [`OffsetSites::query_maps`] spells
             // `None`.
+            //
+            // ⭐ THE OUTWARD SCOPE IS A SNAPSHOT, for e419's reason: e654's `getSrc().getDefiningOp()`
+            // reads that same entry block while `const_builder` appends to it, and what it appends is
+            // offset constants and query maps — never a `dataflow.get_unit`.
+            let scope = preamble.clone();
+            let enclosing: [&[Op]; 1] = [&scope];
             let mut sites = OffsetSites {
                 consts: preamble,
                 query_maps: None,
@@ -2909,6 +2924,7 @@ impl AddressPinningAndTogglePass {
             };
             self.process_data_transfers(
                 &mut unit.body,
+                &enclosing,
                 ScalarTy::Index,
                 prog_stitch,
                 evaluator,
@@ -2952,6 +2968,9 @@ impl AddressPinningAndTogglePass {
         );
         let _ns = self.compute_or_get_number_of_streams();
         {
+            // The same snapshot as the LX phase, for the same reason.
+            let scope = preamble.clone();
+            let enclosing: [&[Op]; 1] = [&scope];
             let mut sites = OffsetSites {
                 consts: preamble,
                 query_maps: None,
@@ -2959,6 +2978,7 @@ impl AddressPinningAndTogglePass {
             };
             self.process_data_transfers(
                 &mut unit.body,
+                &enclosing,
                 ScalarTy::Index,
                 prog_stitch,
                 evaluator,
@@ -5136,7 +5156,8 @@ mod unit_tests {
 
     /// 654/656 — the DST end is the one pinned when the SRC unit is not the descriptor's memory unit,
     /// and the element size handed down is the transfer's own. ⛔ stops at `create_offset_value`, which
-    /// either end reaches before anything end-specific becomes observable.
+    /// either end reaches before anything end-specific becomes observable — the SRC arm is the test
+    /// below.
     #[test]
     #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
     fn e654_resolves_the_load_and_store_end_and_element_size_from_the_transfer() {
@@ -5171,16 +5192,15 @@ mod unit_tests {
         if let Op::Sentient(sentient::Op::LoadAndStore { extent, .. }) = &mut transfer_op {
             extent.element_size = Bits(32);
         }
-        // The SRC is on the HBM while the descriptor's memory unit is LX, so the DST end is the one.
-        let mut body = vec![
-            get_unit(1, DfirUnit::Hbm),
-            get_unit(2, DfirUnit::Lx),
-            transfer_op,
-        ];
+        // The two units are declared WHERE THE ISLAND DECLARES THEM — the enclosing preamble, not the
+        // unit body. The SRC is on the HBM while the descriptor's memory unit is LX, so the DST end
+        // is the one.
+        let preamble = vec![get_unit(1, DfirUnit::Hbm), get_unit(2, DfirUnit::Lx)];
+        let mut body = vec![transfer_op];
         let mut pass = AddressPinningAndTogglePass::default();
-        let mut dtd = transfer(None, 1);
-        dtd.op = OpId::at(&[2]);
-        let desc = pass.immut_data_transfer_descriptors.insert(dtd);
+        let desc = pass
+            .immut_data_transfer_descriptors
+            .insert(transfer(None, 1));
         let mut consts = Vec::new();
         let mut values = Values::default();
         let mut sites = OffsetSites {
@@ -5192,6 +5212,57 @@ mod unit_tests {
         pass.process_data_transfer_op(
             desc,
             &mut body,
+            &[preamble.as_slice()],
+            ScalarTy::Index,
+            ProgStitch::Stitched,
+            &mut OutOfScopeEvaluator,
+            &StatedScheme,
+            &mut sites,
+        );
+    }
+
+    /// 654/656 — the SRC end when the SRC unit IS the descriptor's memory unit, which only the
+    /// ENCLOSING scope can say.
+    ///
+    /// ⛔ THE REGRESSION: with the unit body as the only scope `src_unit` was no unit at all, so this
+    /// arm was dead — the toggle driver would name the DST end's undefined `%0` instead of the
+    /// `sentient.scalar_constant` the SRC end carries.
+    #[test]
+    #[should_panic(expected = "value: 4242")]
+    fn e654_takes_the_src_end_when_the_enclosing_scope_puts_the_src_on_the_memory_unit() {
+        struct StatedScheme;
+
+        impl PinningSchemeManager for StatedScheme {
+            fn find_closest_pinned_addr(
+                &self,
+                _ev_x: EvaluatedValue,
+                _ev_y: EvaluatedValue,
+                _region: RegionSite,
+                _element_size: Bits,
+            ) -> EvaluatedValue {
+                unreachable!("the toggle driver stops at the immutable address it was handed")
+            }
+        }
+
+        let preamble = vec![get_unit(1, DfirUnit::Lx), get_unit(2, DfirUnit::Hbm)];
+        // `%5` is the SRC end's immutable address, and nothing defines the DST end's `%0`.
+        let mut body = vec![load_and_store(1, 2, 5, 10), scalar_const(5, 4242)];
+        let mut pass = AddressPinningAndTogglePass::default();
+        let desc = pass
+            .immut_data_transfer_descriptors
+            .insert(transfer(Some(PatternDescriptor::Toggle(matched_toggle())), 2));
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_data_transfer_op(
+            desc,
+            &mut body,
+            &[preamble.as_slice()],
             ScalarTy::Index,
             ProgStitch::Stitched,
             &mut OutOfScopeEvaluator,
@@ -5252,6 +5323,8 @@ mod unit_tests {
 
         pass.process_data_transfers(
             &mut body,
+            // No unit declared anywhere: both transfers take e653's skip arm, which reads no end.
+            &[],
             ScalarTy::Index,
             ProgStitch::Stitched,
             &mut OutOfScopeEvaluator,
