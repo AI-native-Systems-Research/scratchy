@@ -12,122 +12,14 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 6,
-  "layer_count": 1,
-  "batch_count": 1,
-  "file_count": 1
+  "unit_count": 0,
+  "layer_count": 0,
+  "batch_count": 0,
+  "file_count": 0
  },
- "waves": [
-  {
-   "unit_count": 6,
-   "batches": [
-    {
-     "kind": "symbol",
-     "source_file": "crustify-ddc/cpp/ddc.cpp",
-     "items": [
-      {
-       "name": "e118_cloneForPeSfpWorkSplit",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 0,
-       "loc": 114,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e119_cloneForPeSfpWorkSplit",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 0,
-       "loc": 115,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e120_storageOrDatastreamIsExternal",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 0,
-       "loc": 32,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e121_relatedToExternalNodes",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 0,
-       "loc": 8,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e122_isNodeRelatedToComps",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 0,
-       "loc": 30,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e123_updateNodesWithNewLds",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 0,
-       "loc": 57,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      }
-     ]
-    }
-   ]
-  }
- ],
+ "waves": [],
  "_comment": [
-  "PORT REMAINDER for level0-leaves: the 6 of 196 units in level(s) [0] that still have no",
+  "PORT REMAINDER for level0-leaves: the 0 of 196 units in level(s) [0] that still have no",
   "`/// Replaces:` anchor under crates/compiler/deeptools/src/schedule.",
   "Batches are packed WITHIN A SINGLE HOME FILE so two concurrent agents rarely touch the same",
   "file; where a home holds more than max_syms units its batches do run concurrently, and the",

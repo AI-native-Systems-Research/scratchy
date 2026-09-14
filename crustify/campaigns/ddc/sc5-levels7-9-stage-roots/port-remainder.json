@@ -12,14 +12,14 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 6,
-  "layer_count": 3,
-  "batch_count": 5,
-  "file_count": 2
+  "unit_count": 1,
+  "layer_count": 1,
+  "batch_count": 1,
+  "file_count": 1
  },
  "waves": [
   {
-   "unit_count": 3,
+   "unit_count": 1,
    "batches": [
     {
      "kind": "symbol",
@@ -34,217 +34,7 @@
        "loc": 109,
        "deps": {
         "types": [],
-        "symbols": [
-         {
-          "name": "e359_transformRegToFifoOrLatch",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e360_transformFor4BsplatRead",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e372_selectAndParseDdlTemplate",
-          "defined_in": "crustify-ddc/cpp/ddl.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e375_coordinateCapture",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e376_performAutomaticShuffling",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         }
-        ]
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      }
-     ]
-    },
-    {
-     "kind": "symbol",
-     "source_file": "crustify-ddc/cpp/l3.cpp",
-     "items": [
-      {
-       "name": "e377_getInitialChunkParams",
-       "defined_in": "crustify-ddc/cpp/l3.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 7,
-       "loc": 20,
-       "deps": {
-        "types": [],
-        "symbols": [
-         {
-          "name": "e373_getMinParamForDim",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         }
-        ]
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      },
-      {
-       "name": "e378_propagateCoordinate",
-       "defined_in": "crustify-ddc/cpp/l3.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 7,
-       "loc": 3,
-       "deps": {
-        "types": [],
-        "symbols": [
-         {
-          "name": "e374_propagateCoordinateDSC",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         }
-        ]
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      }
-     ]
-    }
-   ]
-  },
-  {
-   "unit_count": 2,
-   "batches": [
-    {
-     "kind": "symbol",
-     "source_file": "crustify-ddc/cpp/ddc.cpp",
-     "items": [
-      {
-       "name": "e381_run",
-       "defined_in": "crustify-ddc/cpp/ddc.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 8,
-       "loc": 15,
-       "deps": {
-        "types": [],
-        "symbols": [
-         {
-          "name": "e379_run_v1",
-          "defined_in": "crustify-ddc/cpp/ddc.cpp",
-          "scope": "port"
-         }
-        ]
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      }
-     ]
-    },
-    {
-     "kind": "symbol",
-     "source_file": "crustify-ddc/cpp/l3.cpp",
-     "items": [
-      {
-       "name": "e380_setChunkDataStageParams",
-       "defined_in": "crustify-ddc/cpp/l3.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 8,
-       "loc": 129,
-       "deps": {
-        "types": [],
-        "symbols": [
-         {
-          "name": "e352_updateChunkDataStagesFromCandidates",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e366_findBestParamsForMemoryBandwidth",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e367_findBestParamsForArithmeticIntensity",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e377_getInitialChunkParams",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         }
-        ]
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": []
-      }
-     ]
-    }
-   ]
-  },
-  {
-   "unit_count": 1,
-   "batches": [
-    {
-     "kind": "symbol",
-     "source_file": "crustify-ddc/cpp/l3.cpp",
-     "items": [
-      {
-       "name": "e382_run",
-       "defined_in": "crustify-ddc/cpp/l3.cpp",
-       "kind": "symbol",
-       "source_kind": "function",
-       "layer": 9,
-       "loc": 122,
-       "deps": {
-        "types": [],
-        "symbols": [
-         {
-          "name": "e214_optimizeHbmLdsOutputInScheduleTree",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e351_setSuperChunkDataStageParams",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e353_createAllocationAndTransfer",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e368_processHbmPagedTensors",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e378_propagateCoordinate",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e380_setChunkDataStageParams",
-          "defined_in": "crustify-ddc/cpp/l3.cpp",
-          "scope": "port"
-         }
-        ]
+        "symbols": []
        },
        "fallback": [],
        "back_fill": [],
@@ -257,7 +47,7 @@
   }
  ],
  "_comment": [
-  "PORT REMAINDER for levels7-9-stage-roots: the 6 of 6 units in level(s) [7, 8, 9] that still have no",
+  "PORT REMAINDER for levels7-9-stage-roots: the 1 of 6 units in level(s) [7, 8, 9] that still have no",
   "`/// Replaces:` anchor under crates/compiler/deeptools/src/schedule.",
   "Batches are packed WITHIN A SINGLE HOME FILE so two concurrent agents rarely touch the same",
   "file; where a home holds more than max_syms units its batches do run concurrently, and the",
