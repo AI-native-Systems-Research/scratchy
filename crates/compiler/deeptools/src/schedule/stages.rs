@@ -46,6 +46,11 @@
 //! answered is a `todo!` NAMING THE TRAIT AND METHOD, never a plausible constant: a fabricated
 //! placement is the failure this crate ranks worse than a stop.
 
+mod state;
+mod tree;
+
+pub use state::{DscState, DscTree};
+
 use super::l3;
 
 /// ⭐ WHAT STAGE 2A LEFT — the answer the caller measures, and the reason this returns a value rather
