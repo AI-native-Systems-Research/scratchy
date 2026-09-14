@@ -139,8 +139,8 @@ impl DataTransferUpdater {
 /// iter arg's own uses allow: at the outermost loop's initializer, else beside that loop, else beside
 /// the memory op (`:1799-1890`).
 ///
-/// ⛔ `getOffset` IS CALLED TWICE, AND FOR e418 THAT BUILDS THE OFFSET TWICE (`:1802`, `:1848`) — the
-/// second value is only tested for constness and then dropped, and the ops it left stay in the IR.
+/// ⛔ THE SECOND `getOffset` IS THE THIRD CONJUNCT (`:1846-1848`), so `&&` SHORT-CIRCUITS IT AWAY —
+/// and for e418 asking it materialises an offset value, which shifts every position after it.
 /// ⛔ EACH INSERT MOVES EVERY LATER SIBLING, so the fall-back arm assigns the memory op's operand
 /// BEFORE inserting ahead of it: after the insert `dtd.op`'s recorded path names the new `scalar_add`.
 /// ⭐ `DT_CHECK_MSG(cur_val == mutable_addr, ..)` NEEDS NO EXPRESSION: `cur_val` only ever moves in
@@ -197,12 +197,7 @@ pub(crate) fn update_head_of_chain_mutable_addr_initializer<E: ExpressionEvaluat
             )
         };
         let loop_at = for_op_id_of(unit_body, next_loop);
-        let Some(offset_at) = defining_op_id(unit_body, offset) else {
-            // `dominates(Value, Operation *)` FOR A BLOCK ARGUMENT dominates its whole loop body, so an
-            // offset that is one is the reference's `true` here.
-            break;
-        };
-        if !dominates(&offset_at, &loop_at) {
+        if !offset_dominates(unit_body, offset, &loop_at) {
             break;
         }
         if !can_update_iter_arg(unit_body, cur_val, &dtd.op) {
@@ -215,14 +210,16 @@ pub(crate) fn update_head_of_chain_mutable_addr_initializer<E: ExpressionEvaluat
         cur_val = init;
     }
 
-    let both_constant = {
+    // `cur_loop && isConstant(cur_val) && isConstant(getOffset(..))` (`:1846-1848`), CONJUNCT BY
+    // CONJUNCT: the second `getOffset` is only asked once the two before it hold.
+    let both_constant = cur_loop.is_some() && {
         let regions: [&[Op]; 1] = [unit_body];
         let defs = Definitions::from_innermost(&regions);
         is_constant(cur_val, ConstKind::ScalarConstant, defs)
     };
-    // ⛔ THE SECOND `getOffset` (`:1848`) — for e418 a second built value, tested and dropped.
-    let second_offset = updater.get_offset(dtd, new_immut_addr_ev, ty, evaluator, sites, unit_body);
-    let offset_constant = {
+    let offset_constant = both_constant && {
+        let second_offset =
+            updater.get_offset(dtd, new_immut_addr_ev, ty, evaluator, sites, unit_body);
         let regions: [&[Op]; 1] = [unit_body];
         let defs = Definitions::from_innermost(&regions);
         is_constant(second_offset, ConstKind::ScalarConstant, defs)
@@ -230,7 +227,7 @@ pub(crate) fn update_head_of_chain_mutable_addr_initializer<E: ExpressionEvaluat
 
     match (cur_loop, iter_arg_index) {
         // `new_init = old_init + dtd_.getBaseAddr() - new_immut_addr_ev` (`:1850-1859`).
-        (Some(loop_op), Some(index)) if both_constant && offset_constant => {
+        (Some(loop_op), Some(index)) if offset_constant => {
             let Some(base_addr) = dtd.base_addr() else {
                 todo!(
                     "updateHeadOfChainMutableAddrInitializer: DT_CHECK(base_addrs_.size() == 1) \
@@ -385,6 +382,31 @@ fn dominates(a: &OpId, b: &OpId) -> bool {
     }
 }
 
+/// `dom_info_->dominates(offset, next_loop)` (`:1823`) — the offset against the loop about to be
+/// stepped over.
+///
+/// ⛔ A BLOCK-ARGUMENT OFFSET IS BLOCK DOMINANCE OF ITS OWNER AND NOT A REFUSAL:
+/// `properlyDominates(Value, Operation *)` degrades to `dominates(blockArg.getOwner(), b->getBlock())`
+/// (`Dominance.cpp:334-338`), which over one-block regions holds exactly where the loop owning the arg
+/// STRICTLY ENCLOSES `next_loop` — so e013's carried offset does reach an inner loop's initializer.
+fn offset_dominates(unit_body: &[Op], offset: Val, loop_at: &OpId) -> bool {
+    if let Some(offset_at) = defining_op_id(unit_body, offset) {
+        return dominates(&offset_at, loop_at);
+    }
+    match for_arg_of(unit_body, offset) {
+        Some((owner, _index)) => encloses(&for_op_id_of(unit_body, owner), loop_at),
+        // An argument of the unit's own entry block, which encloses every loop in the body.
+        None => true,
+    }
+}
+
+/// Whether the op at `a` HOLDS the one at `b` in one of its regions — a STRICT prefix of the position,
+/// which is [`dominates`] without the half that answers for a position against itself.
+fn encloses(a: &OpId, b: &OpId) -> bool {
+    let (a, b) = (a.path(), b.path());
+    a.len() < b.len() && a.iter().zip(b).all(|(la, lb)| la == lb)
+}
+
 /// `:1826-1840` — whether every user of the iter arg is one this pass may leave behind when it
 /// rewrites the arg's initializer: an inner loop, the yield, an op feeding only the yield, or the
 /// memory op itself.
@@ -525,7 +547,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::sentient::dialects::sentient::{Reg, RegType, ShuffleMode};
     use crate::transform::sentient::address_pinning_and_toggle::{DescriptorMemoryUnit, ToggleSub};
-    use crate::transform::sentient::analyses::{OutOfScopeEvaluator, RegionSite};
+    use crate::transform::sentient::analyses::{Evaluation, OutOfScopeEvaluator, RegionSite};
 
     /// `%t = sentient.load_and_send` reading its mutable address from `%mutable_addr`.
     fn load_and_send(mutable_addr: Val) -> Op {
@@ -608,6 +630,57 @@ mod unit_tests {
             body,
         }));
         unit
+    }
+
+    /// `%init = 4096`, an OUTER loop carrying the integer sequence `%130`, and inside it the loop whose
+    /// carried argument `%110` the chain head reads — the shape e013's offset is a block argument of.
+    fn nested_chain() -> Vec<Op> {
+        let carried = |init: Val, arg: Val, result: Val| sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: Reg {
+                locale: RegType::Lbr,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        };
+        let inner = Op::Sentient(sentient::Op::For {
+            iv: Val(117),
+            bound: Val(118),
+            bound_reg: None,
+            carried: vec![carried(Val(101), Val(110), Val(111))],
+            dbg_name: None,
+            body: vec![
+                load_and_send(Val(110)),
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(110)],
+                }),
+            ],
+        });
+        vec![
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: 4096,
+                result: Val(101),
+                reg_locale: RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(107),
+                bound: Val(108),
+                bound_reg: None,
+                carried: vec![carried(Val(121), Val(130), Val(131))],
+                dbg_name: None,
+                body: vec![
+                    inner,
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![Val(130)],
+                    }),
+                ],
+            }),
+        ]
     }
 
     /// The transfer at `at`, with no pattern and one base address.
@@ -701,5 +774,126 @@ mod unit_tests {
                 )
         ));
         assert_eq!(init_and_mutable_addr(&nested, 1, 2), (Val(101), Val(1)));
+
+        // e013's offset is the OUTER loop's carried argument, which as a block argument dominates
+        // every loop that loop holds — so the walk steps over the inner loop at `[1, 0]` and the add
+        // lands at ITS initializer rather than beside the transfer at `[1, 0, 0]`.
+        let mut carried_offset = nested_chain();
+        update_head_of_chain_mutable_addr_initializer(
+            &mut carried_offset,
+            &transfer(&[1, 0, 0]),
+            TransferEnd::Src,
+            DataTransferUpdater::IntegerSequence(IntegerSequenceDataTransferUpdater {
+                iter_arg: Val(130),
+            }),
+            EvaluatedValue(9),
+            ScalarTy::Index,
+            &mut OutOfScopeEvaluator,
+            &mut sites,
+        );
+        let Op::Sentient(sentient::Op::For { body, .. }) = &carried_offset[1] else {
+            panic!("the outer loop survives")
+        };
+        let Op::Sentient(sentient::Op::ScalarAdd { lhs, rhs, result, .. }) = &body[0] else {
+            panic!("the add lands at the inner loop's initializer")
+        };
+        assert_eq!((*lhs, *rhs), (Val(101), Val(130)));
+        let Op::Sentient(sentient::Op::For { carried, .. }) = &body[1] else {
+            panic!("the inner loop survives")
+        };
+        assert_eq!(carried[0].init, *result);
+    }
+
+    /// An evaluator that COUNTS the offsets it materialises, putting each in the body it is handed —
+    /// which is where `buildOffsetValue` writes when `sites.query_maps` is `None`.
+    struct CountingEvaluator {
+        built: usize,
+    }
+
+    impl ExpressionEvaluator for CountingEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("e418 asks for handles, never for a decoded evaluation")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("e418 asks for handles, never for a decoded evaluation")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e418 builds from a handle")
+        }
+
+        fn evaluate_sub_handle(
+            &mut self,
+            _lhs: EvaluatedValue,
+            _rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            EvaluatedValue(11)
+        }
+
+        fn build_offset_value_of(
+            &mut self,
+            _immutable: EvaluatedValue,
+            sites: &mut OffsetSites<'_>,
+            walked: &mut Vec<Op>,
+            ty: ScalarTy,
+        ) -> Val {
+            self.built += 1;
+            let result = sites.values.mint();
+            walked.push(Op::Sentient(sentient::Op::ScalarConstant {
+                value: 64,
+                result,
+                reg_locale: RegType::Imm,
+                ty,
+                is_symbol: false,
+            }));
+            result
+        }
+    }
+
+    /// 592/656, THE NEGATIVE — the second `getOffset` is the third conjunct of `:1846-1848`, so a
+    /// chain that finds no dominating loop never asks it, and e418 materialises ONE offset and not two.
+    #[test]
+    fn e592_does_not_ask_a_materialising_get_offset_for_a_second_offset() {
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+        let mut evaluator = CountingEvaluator { built: 0 };
+
+        // The offset is built at `[3]`, after the loop at `[2]`, so it dominates no loop in the chain.
+        let mut unit = chain(false);
+        update_head_of_chain_mutable_addr_initializer(
+            &mut unit,
+            &transfer(&[2, 0]),
+            TransferEnd::Src,
+            DataTransferUpdater::SimpleConstant(SimpleConstantDataTransferUpdater),
+            EvaluatedValue(9),
+            ScalarTy::Index,
+            &mut evaluator,
+            &mut sites,
+        );
+        assert_eq!(evaluator.built, 1);
+        assert_eq!(unit.len(), 4);
+        let Op::Sentient(sentient::Op::For { body, .. }) = &unit[2] else {
+            panic!("the loop survives")
+        };
+        assert!(matches!(
+            body[0],
+            Op::Sentient(sentient::Op::ScalarAdd {
+                lhs: Val(110),
+                rhs: Val(0),
+                ..
+            })
+        ));
     }
 }
