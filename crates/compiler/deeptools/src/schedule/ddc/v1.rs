@@ -6049,8 +6049,11 @@ pub trait DdcVersion {
 /// `ddcVersion == 0`, what `setDtVersion(1)` sets (`dscglobal.h:127`) — no stage 2b at all.
 pub struct DdcOff;
 
-/// `0 < ddcVersion != 2` — stage 2b runs and an unfilled DSC2 is TOLERATED. Only an explicit
-/// `ddcversion=1` states it.
+/// `0 < ddcVersion != 2` — stage 2b runs and an unfilled DSC2 is TOLERATED.
+///
+/// ⚠️ NOT ONLY `ddcversion=1`: `dscglobal.cpp:238` assigns the parsed `optionVal` UNVALIDATED, so
+/// every `ddcversion=<n>` with `n > 0` and `n != 2` — 3, 4, … — states this state too. No
+/// `setDtVersion` path reaches it, and no `int` outside the option string can.
 pub struct DdcV1;
 
 /// `ddcVersion == 2` — the field's default (`dscglobal.h:82`) and what `setDtVersion(2)` sets
@@ -6145,6 +6148,12 @@ fn run_v1<S: SdscName + ?Sized>(sdsc: &mut S) -> DscFilled {
 /// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:35-42`) — a different message, and one that fires
 /// for `ddcVersion == 1` too. This gate is `deeprt`'s alone (`deeprt/deeprt.cpp:2182`,
 /// `deeprt/deeprt_scheduler_codegen_pipeline.cpp:100`).
+/// ⛔ AND THE BYPASS IS NOT JUST OURS. The reference tree constructs a `ddc::Ddc` in FOUR places, and
+/// both of the two outside `deeprt` call `run_v1` themselves: `SchedulerStages.cpp:41`, and
+/// `ddc/ddc_standalone.cpp:74`, which turns the very same `bool` into an EXIT CODE
+/// (`return !success`, `:82`) and not a stop at all. So "an unfilled DSC2 ends the run" is one
+/// caller's rule and not stage 2b's — which is why [`DscFilled`] is a VALUE here and the abort lives
+/// in `run` alone.
 /// ⚠️ `bool useDdc = true` (`:3807`) IS DEAD — nothing writes it, so `ddcVersion > 0 && useDdc` is
 /// the version alone.
 /// ⛔ STAGE 2B RUNS WHENEVER THE VERSION IS ON, and only the CHECK is the force-request's: the
@@ -8941,7 +8950,7 @@ mod tests_e307_e309 {
 
 #[cfg(test)]
 mod tests_e381 {
-    use super::{DdcOff, DdcV1Required, SdscName, run};
+    use super::{DdcOff, DdcV1, DdcV1Required, SdscName, run};
 
     /// The one field entry 381 reads of a super-DSC.
     struct NamedSdsc(&'static str);
@@ -8967,5 +8976,17 @@ mod tests_e381 {
     #[should_panic(expected = "e379_run_v1")]
     fn a_requested_ddc_dispatches_to_stage_2b() {
         run::<DdcV1Required, _, false>(&mut NamedSdsc("requested"));
+    }
+
+    /// ⭐ THE MIDDLE ARM DISPATCHES TOO: what reaches stage 2b is `DdcVersion::RUNS` and never
+    /// `DdcVersion::FORCED`, so a TOLERATING `ddcversion=1` calls entry 379 exactly as a required
+    /// one does — the reference's `run_v1` call sits above its `ddcVersion == 2` test.
+    ///
+    /// ⚠️ THE TOLERATION ITSELF IS UNTESTABLE UNTIL ENTRY 379 LANDS: only a real `DscFilled::No` can
+    /// show [`DdcV1`] RETURNING where [`DdcV1Required`] stops, and the seam has no answer to give.
+    #[test]
+    #[should_panic(expected = "e379_run_v1")]
+    fn a_tolerating_ddc_dispatches_to_stage_2b_as_well() {
+        run::<DdcV1, _, false>(&mut NamedSdsc("tolerated"));
     }
 }
