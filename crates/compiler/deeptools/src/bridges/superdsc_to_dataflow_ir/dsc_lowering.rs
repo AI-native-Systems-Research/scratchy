@@ -780,7 +780,11 @@ pub(super) fn query_over_handles(
 }
 
 /// `mlir::arith::ConstantIndexOp::create(builder, builder.getUnknownLoc(), value)`.
-pub(super) fn constant_index(vals: &mut Values, ops: &mut Vec<DfirOp>, value: i64) -> Val {
+///
+/// ⭐ `pub` BECAUSE THE SCRATCHY-SIDE ADAPTER BINDS THE PLACEMENT WITH IT. A `LoadAndStore`
+/// statement's address is the `AllocNode`'s own start scaled by entry 025's factor, and the scaling
+/// happens in the closure the caller supplies — so the caller needs this to bind the result.
+pub fn constant_index(vals: &mut Values, ops: &mut Vec<DfirOp>, value: i64) -> Val {
     let result = vals.mint();
     ops.push(DfirOp::Arith(arith::Op::Constant { result, value }));
     result

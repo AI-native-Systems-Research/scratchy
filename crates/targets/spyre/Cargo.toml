@@ -41,6 +41,12 @@ scratchy-layers = { path = "../../layers" }
 # Neutral leaf — the affine/nvfp4 quant layer TYPES the macro's `Weights` struct
 # names (`AffineQuantEmbedding`, `AffineQuantLinear`, `Nvfp4Linear`).
 scratchy-quantizations = { path = "../../models/quantization" }
+# ⛔ THE ARENA BRIDGE 1'S STATEMENT PAYLOADS LIVE IN, AND THE SIGNATURE IS WHAT FORCES ONE.
+# `Statement::Transfer` holds `&'s TransferStatement<'s>` whose `send`/`store`/`receive` are
+# `&'s dyn Fn(..)`, and `ScheduleView::roots` takes `self` BY VALUE — so a payload built inside
+# `roots` is dropped at its return. `Bump` allocates through `&self`, which is what lets
+# `Dsc::view(&self, ..)` hand one out and the statements borrow from it for the whole walk.
+bumpalo = "3"
 half = { workspace = true }
 # Native Rust port of flex. In-tree crate; the ONLY fxa_* implementation
 # (see fxa_rust_abi.rs) — pure Rust so it compiles on any host regardless

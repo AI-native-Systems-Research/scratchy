@@ -34,6 +34,10 @@ pub mod ir;
 /// what the `with_config_model` door needs, and `lower_subtile_tape_to_superdsc` imports the sibling
 /// geometry door unconditionally for the same reason.
 pub mod lower_subtile_tape_to_dataflow_ir;
+/// ⭐⭐ BRIDGE 1, THE PIVOTED LEG — scratchy's SuperDSC handed to the RUST PORT of
+/// `sdscToDataflowIR`, and what the bake compiles. Peer of
+/// [`lower_subtile_tape_to_dataflow_ir`], which hand-wrote the same conversion and is abandoned.
+pub mod lower_superdsc_to_dataflow_ir;
 /// KTIR emission — MOVED here from `scratchy-subtile` (M3): target
 /// emission belongs in the target crate; the shared crate keeps only
 /// the SubtileIR substrate both backends consume.
