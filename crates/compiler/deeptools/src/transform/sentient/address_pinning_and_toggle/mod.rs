@@ -184,7 +184,7 @@ use crate::transform::sentient::analyses::{
     BodyIndex, EvAddressInfo, EvaluatedValue, ExpressionEvaluator, MinMax, OffsetSites,
     PinningSchemeManager, RegionNum, RegionSite,
 };
-use crate::transform::sentient::{ForRef, IterArgIndex};
+use crate::transform::sentient::{ForRef, IterArgIndex, ProgStitch};
 use crate::units::DfirUnit;
 use abstract_data_transfer_updater::DataTransferUpdater;
 use looping_chain_mutable_addr_descriptor::TransferEnd;
@@ -2629,10 +2629,104 @@ impl AddressPinningAndTogglePass {
     }
 }
 
-// crustify:todo: e653_processDataTransfer
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1492  (26 body lines, level 9)
-//   original  : void AddressPinningAndTogglePass::processDataTransfer( DataTransferDescriptor &dtd, const PinningSchemeManager &ps_manager, mlir::MutableOperandRange mutable_addr, mlir::MutableOperandRange immutable_addr, uint32_t element_size)
-//   calls     : e252_size, e258_isToggle, e259_isConditionalConstant, e260_isIntegerSequence, e278_isValid, e279_canBeSimplified, e488_computeOrGetNumberOfStreams, e648_processToggle, e649_processConditionalConstant, e650_processIntegerSequence, e651_processSimpleConstant
+impl AddressPinningAndTogglePass {
+    /// Replaces: e653_processDataTransfer
+    ///
+    /// Routes ONE transfer to the pinning driver its matched pattern names, or SKIPS pinning it
+    /// when the unit holds an immutable-address register for every stream (`:1492-1520`).
+    ///
+    /// ⛔ THE SKIP ARM IS NOT THE LAST ONE: a transfer it declines is NOT then handed to
+    /// [`Self::process_simple_constant`] (`:1509-1516`). Its stream count is asked LAST because
+    /// asking MEMOISES [`Self::num_streams`] (`:1508`), so it stays behind a short-circuiting `&&`.
+    pub fn process_data_transfer<E: ExpressionEvaluator>(
+        &mut self,
+        desc: DescriptorId,
+        unit_body: &mut Vec<Op>,
+        end: TransferEnd,
+        ty: ScalarTy,
+        element_size: Bits,
+        prog_stitch: ProgStitch,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        sites: &mut OffsetSites<'_>,
+    ) {
+        // ⭐ `DT_CHECK(mutable_addr.size() == immutable_addr.size() && .. == 1)` (`:1496-1497`) is
+        // discharged by the signature — ONE `Val` per `TransferEnd` — so `e252_size` is a call
+        // this port does not make. The predicates below are pure, and the reference reaches
+        // `canBeSimplified()` on every path.
+        let (is_toggle, is_conditional_constant, is_integer_sequence, can_be_simplified, is_valid) = {
+            let (dtd, _) = transfer_of(&self.immut_data_transfer_descriptors, desc, unit_body);
+            (
+                dtd.is_toggle(),
+                dtd.is_conditional_constant(),
+                dtd.is_integer_sequence(),
+                dtd.can_be_simplified(),
+                dtd.is_valid(),
+            )
+        };
+        if is_toggle && !can_be_simplified {
+            self.process_toggle(
+                desc,
+                unit_body,
+                end,
+                ty,
+                element_size,
+                evaluator,
+                ps_manager,
+                sites,
+            );
+        } else if is_conditional_constant && !can_be_simplified {
+            self.process_conditional_constant(
+                desc,
+                unit_body,
+                end,
+                ty,
+                element_size,
+                evaluator,
+                ps_manager,
+                sites,
+            );
+        } else if is_integer_sequence && !can_be_simplified {
+            self.process_integer_sequence(
+                desc,
+                unit_body,
+                end,
+                ty,
+                element_size,
+                evaluator,
+                ps_manager,
+                sites,
+            );
+        } else if !can_be_simplified
+            // `ns <= getMaxNumRegisters()` (`:1508`) — the one place a stream count meets a register
+            // count, which is why neither newtype absorbs the other.
+            && self.compute_or_get_number_of_streams().0
+                <= ps_manager.max_num_registers().0 as usize
+            && (ps_manager.memory_unit() == DfirUnit::Hbm
+                || prog_stitch == ProgStitch::Standalone)
+            && !self.force_address_pinning
+        {
+            // `LLVM_DEBUG(.. "Skipping addr pinning for data transfer .." )` (`:1511-1515`): the whole
+            // arm is that print, and leaving the transfer as it came in IS the effect.
+        } else if is_valid {
+            self.process_simple_constant(
+                desc,
+                unit_body,
+                end,
+                ty,
+                element_size,
+                evaluator,
+                ps_manager,
+                sites,
+            );
+        } else if ASSERT_ON_UNEXPECTED_PATTERNS {
+            todo!(
+                "processDataTransfer: DT_CHECK_MSG(!AssertOnUnexpectedPatterns, \"Unexpected \
+                 pattern\") under -dcc-address-pinning-and-toggle-assert for {desc:?} (:1518-1519)"
+            )
+        }
+    }
+}
 
 // crustify:todo: e654_processDataTransfer
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1456  (34 body lines, level 10)
@@ -4637,6 +4731,101 @@ mod unit_tests {
             Bits(16),
             &mut OutOfScopeEvaluator,
             &StatedScheme,
+            &mut sites,
+        );
+    }
+
+    use crate::transform::sentient::local_region_splitting_for_value_commoning::MaxRegNum;
+
+    /// The manager e653's skip arm interrogates: four immutable-address registers in HBM, and the
+    /// pinned address the simple-constant driver asks for once the skip no longer applies.
+    struct SpareRegisters;
+
+    impl PinningSchemeManager for SpareRegisters {
+        fn max_num_registers(&self) -> MaxRegNum {
+            MaxRegNum(4)
+        }
+
+        fn memory_unit(&self) -> DfirUnit {
+            DfirUnit::Hbm
+        }
+
+        fn find_closest_pinned_addr(
+            &self,
+            _ev_x: EvaluatedValue,
+            _ev_y: EvaluatedValue,
+            _region: RegionSite,
+            _element_size: Bits,
+        ) -> EvaluatedValue {
+            EvaluatedValue(0)
+        }
+    }
+
+    /// 653/656 — a VALID transfer whose unit holds a register for every stream is left exactly as it
+    /// came in: the skip arm sits AHEAD of the simple-constant one, so declining it ends the routing.
+    #[test]
+    fn e653_skips_a_valid_transfer_whose_streams_all_fit_in_registers() {
+        let original = vec![load_and_store(1, 2, 5, 10)];
+        let mut body = original.clone();
+        let mut pass = AddressPinningAndTogglePass::default();
+        let desc = pass
+            .immut_data_transfer_descriptors
+            .insert(transfer(None, 1));
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_data_transfer(
+            desc,
+            &mut body,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            Bits(16),
+            // `getMemoryUnit() == HBM` carries the disjunct however the program is stitched.
+            ProgStitch::Stitched,
+            &mut OutOfScopeEvaluator,
+            &SpareRegisters,
+            &mut sites,
+        );
+
+        // One stream against four EBRs — and the ask is what MEMOISED this.
+        assert_eq!(pass.num_streams, Some(StreamCount(1)));
+        assert_eq!(body, original);
+        assert!(consts.is_empty());
+    }
+
+    /// 653/656 — and with `ForceAddressPinning` set the very same transfer is pinned instead, which is
+    /// the arm the skip was hiding. ⛔ stops at the out-of-scope offset builder.
+    #[test]
+    #[should_panic(expected = "EvaluatedValue::buildOffsetValue")]
+    fn e653_forced_pinning_sends_that_same_transfer_to_the_simple_constant_driver() {
+        let mut body = vec![load_and_store(1, 2, 5, 10)];
+        let mut pass = AddressPinningAndTogglePass::default();
+        pass.force_address_pinning = true;
+        let desc = pass
+            .immut_data_transfer_descriptors
+            .insert(transfer(None, 1));
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_data_transfer(
+            desc,
+            &mut body,
+            TransferEnd::Src,
+            ScalarTy::Index,
+            Bits(16),
+            ProgStitch::Stitched,
+            &mut OutOfScopeEvaluator,
+            &SpareRegisters,
             &mut sites,
         );
     }

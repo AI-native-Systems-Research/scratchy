@@ -450,6 +450,26 @@ pub struct EvAddressInfo {
 /// [`ExpressionEvaluator`] is one: `Analyses/AddressPinningScheme.{h,cpp}` is not in this campaign and
 /// a test must still be able to state which pinned address it chose.
 pub trait PinningSchemeManager {
+    /// `PinningSchemeManager::getMaxNumRegisters()` (`Analyses/AddressPinningScheme.h:194-196`) — the
+    /// IMMUTABLE-address registers the manager's unit has: the LBR file's `maxNum` for LX (0 on
+    /// SEN1P5) and the EBR file's otherwise (`AddressPinningScheme.cpp:57-67`).
+    ///
+    /// ⛔ A `todo!` THOUGH EVERY NUMBER IN IT IS `sysDef`'s: `UnitAndHardwareInfo` is filled by the
+    /// out-of-scope `setUnitHardwareInfo`, and its getters all open `DT_CHECK(evaluated_)`.
+    fn max_num_registers(&self) -> MaxRegNum {
+        todo!(
+            "PinningSchemeManager::getMaxNumRegisters (Analyses/AddressPinningScheme.h:194) — out of campaign scope"
+        )
+    }
+
+    /// `PinningSchemeManager::getMemoryUnit()` (`Analyses/AddressPinningScheme.h:198-200`) — LX or
+    /// HBM, the memory this manager's schemes pin addresses in, as [`Self::eval`] was handed it.
+    fn memory_unit(&self) -> DfirUnit {
+        todo!(
+            "PinningSchemeManager::getMemoryUnit (Analyses/AddressPinningScheme.h:198) — out of campaign scope"
+        )
+    }
+
     /// `PinningSchemeManager::findClosestPinnedAddr(ev_x, ev_y, region_op_and_region_num,
     /// element_size_in_bits)` (`Analyses/AddressPinningScheme.h:229-233`) — the closest pinned
     /// address, in ELEMENT addresses, for a pair of toggling addresses.
