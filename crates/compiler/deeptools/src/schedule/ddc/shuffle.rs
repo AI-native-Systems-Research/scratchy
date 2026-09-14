@@ -2515,9 +2515,9 @@ impl CodegenGeneric for AutoShuffler {
     /// drives one op at a time into that step's edges, then routes those edges into the next step's
     /// inputs.
     ///
-    /// ⛔ [`None`] IS `edges.first().at(key)` (`shuffle.cpp:998`) — a computation reading a stick the
-    /// previous step never wrote — and the write-order `DT_ERROR` (`:989`) is the `todo!` it names.
-    /// ⚠️ THE `write_in_order` ARM RE-SEEDING THE OUTPUT EDGE MAP FROM `input_edges` (`:956`) IS
+    /// ⛔ [`None`] IS `edges.first().at(key)` (`shuffle.cpp:1013`) — a computation reading a stick the
+    /// previous step never wrote — and the write-order `DT_ERROR` (`:997`) is the `todo!` it names.
+    /// ⚠️ THE `write_in_order` ARM RE-SEEDING THE OUTPUT EDGE MAP FROM `input_edges` (`:948-950`) IS
     /// INERT — that map is read only after a swap, and the arm runs only on the last step. Kept.
     fn codegen_generic<C: ShuffleCodegen>(
         &mut self,

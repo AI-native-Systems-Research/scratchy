@@ -4631,7 +4631,7 @@ where
 
 /// ONE OPERAND AS ENTRY 337 READS IT — an `inputs_`/`outputs_` component beside the
 /// `inputsLdsAndLoopOffsets_`/`outputsLdsAndLoopOffsets_` entry the reference indexes in lockstep
-/// with it (`ddc/ddc_fold.cpp:1046-1054`).
+/// with it (`ddc/ddc_fold.cpp:1024-1033`, `:1038-1047`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnitStream {
     /// `inputs_.at(i)` / `outputs_.at(i)` — a UNIT, not a storage.
@@ -4671,11 +4671,11 @@ pub enum PropUnits<'a> {
 
 /// ENTRY 337'S PROPAGATION WITH BOTH PROPAGATION UNITS RESOLVED — `propSrcUnit` and `propDestUnit`.
 ///
-/// ⛔⛔ EVERY ABORT OF THE 100-LINE RESOLUTION IS THIS WITNESS MISSING: all five
-/// `DT_CHECK(prop*Unit != NO_COMPONENT)` (`:1010`, `:1060`, `:1084`, `:1105`, `:1156`), the
-/// `abs(refRowId - getCompRowId(propDestUnit)) <= 1` check (`:1184`), and *"[gatherRelatedPTRows]
-/// Unsupported reference node for propagation"* for an allocation folded against neither a transfer
-/// nor a compute (`:1162`).
+/// ⛔⛔ EVERY ABORT OF THE 100-LINE RESOLUTION IS THIS WITNESS MISSING: all six
+/// `DT_CHECK(prop*Unit != NO_COMPONENT)` (`:999`, `:1035`, `:1066`, `:1084`, `:1137`, `:1151`) and
+/// *"[gatherRelatedPTRows] Unsupported reference node for propagation"* for an allocation folded
+/// against neither a transfer nor a compute (`:1154`). ⛔ THE ADJACENCY CHECK (`:1184`) IS NOT ONE OF
+/// THEM: the reference asks it inside its both-rows arm, past the `rowSplit_` early return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtRowPropagation {
     src: SenComponent,
@@ -4697,16 +4697,21 @@ impl PtRowPropagation {
         node_to_fold: &PropUnits<'_>,
     ) -> Option<Self> {
         let none = SenComponent::NoComponent;
+        // ⛔ THE FIRST MATCH'S UNIT AND NOTHING FURTHER: the reference `break`s on the match and
+        // THEN checks the unit, so a matched operand sitting on `NO_COMPONENT` is one of the six
+        // `DT_CHECK`s and not a reason to keep scanning.
         let matched = |operands: &[UnitStream], check_ref: bool| {
             operands
                 .iter()
                 .find(|operand| match_data_stream(dsc, prop, operand.stream, check_ref))
                 .map(|operand| operand.unit)
+                .filter(|&unit| unit != none)
         };
         let matched_dst = |dsts: &TransferDsts, check_ref: bool| {
             dsts.iter()
                 .find(|dst| match_data_stream(dsc, prop, dst.stream, check_ref))
                 .map(|dst| dst.unit)
+                .filter(|&unit| unit != none)
         };
         let mut src = none;
         let mut dest = none;
@@ -4806,18 +4811,13 @@ impl PtRowPropagation {
             // The reference's chain has no `else`, so both units stay `NO_COMPONENT`.
             PropUnits::Other => {}
         }
-        if let (Some(src_row), Some(dest_row)) = (comp_row_id(src), comp_row_id(dest)) {
-            if !src_row.is_adjacent_or_same(dest_row) {
-                return None;
-            }
-        }
         Some(Self { src, dest })
     }
 }
 
 /// THE SAME NODES SCANNED FROM BOTH SIDES — entry 337's unbundling arm hands the base a propagation
-/// with `refIsProducer` NEGATED and both ends swapped (`:12053-12057`), and the role is exactly what
-/// decides which side of a candidate is scanned.
+/// with `refIsProducer` NEGATED and both ends swapped (`ddc/ddc_fold.cpp:1222-1226`), and the role
+/// is exactly what decides which side of a candidate is scanned.
 pub struct RowCandidates<'a, F: AffineFoldDims + ?Sized> {
     /// Scanned for the propagation as given.
     pub forward: &'a [RowCandidate<'a, F>],
@@ -4892,9 +4892,11 @@ where
         // No dimension is split across PT rows.
         return Some(PtRowGrouping::NoBundling);
     };
-    let base = |prop: &CoordPropInfo, candidates: &[RowCandidate<'_, F>]| {
+    let base = |prop: &CoordPropInfo,
+                scaled: crate::schedule::ddc::ScaleDown,
+                candidates: &[RowCandidate<'_, F>]| {
         gather_related_pt_rows_base::<A, D, S, T, F>(
-            dsc, core_ds, tree, prop, scale_down, candidates, sdsc_slices,
+            dsc, core_ds, tree, prop, scaled, candidates, sdsc_slices,
         )
     };
     let single_row = |row: PtRowId, scaled: bool| {
@@ -4916,13 +4918,22 @@ where
     };
 
     match (src_row, dest_row) {
-        (Some(_), None) => {
-            bundled(RowGroupCategory::RowToNonRow, base(prop, candidates.forward))
-        }
+        (Some(_), None) => bundled(
+            RowGroupCategory::RowToNonRow,
+            base(prop, scale_down, candidates.forward),
+        ),
         // No need to collect nodes for all rows: the reference node's own row is the group.
         (Some(row), Some(dest)) if row == dest => single_row(row, false),
-        (Some(_), Some(_)) => {
-            bundled(RowGroupCategory::RowNorthSouth, base(prop, candidates.forward))
+        // `DT_CHECK(abs(refRowId - getCompRowId(propDestUnit)) <= 1)` (`:1184`) — asked ONLY here,
+        // so a propagation between two non-adjacent rows with nothing row split answers above.
+        (Some(row), Some(dest)) => {
+            if !row.is_adjacent_or_same(dest) {
+                return None;
+            }
+            bundled(
+                RowGroupCategory::RowNorthSouth,
+                base(prop, scale_down, candidates.forward),
+            )
         }
         // Propagation from PTXRF/PTARF to a row unit counts as ROW_TO_SAME_ROW.
         (None, Some(dest))
@@ -4937,9 +4948,15 @@ where
                 ref_node: prop.node_to_fold,
                 node_to_fold: prop.ref_node,
             };
+            // ⛔ A FRESH `CoordPropInfoType`, so the base reads the DEFAULT `scaleDown`
+            // (`dsc/dsc2.h:1095`) and never this propagation's.
             bundled(
                 RowGroupCategory::NonRowToRow,
-                base(&reversed, candidates.reverse),
+                base(
+                    &reversed,
+                    crate::schedule::ddc::ScaleDown::No,
+                    candidates.reverse,
+                ),
             )
         }
         // Both absent is the early answer above, so the reference's chain has no fallthrough.
@@ -6681,6 +6698,75 @@ mod tests_e297_e299 {
                     beta: Beta(32 * 3),
                 },
             ))
+        );
+    }
+
+    /// ⭐ THE TWO STOPS THAT ARE NOT WHERE THEY LOOK: the adjacency `DT_CHECK` (`:1184`) sits PAST
+    /// the `rowSplit_` return, and a matched operand ON `NO_COMPONENT` is a stop and not a miss.
+    #[test]
+    fn non_adjacent_rows_stop_only_past_the_rowsplit_return_and_a_no_component_match_stops_too() {
+        let dsc = OneLds(LayoutDims::new(PrimaryDim::Out, vec![PrimaryDim::In]));
+        let tree = Tree(vec![None]);
+        let levels = one_step_row_split();
+        let slices = WorkSlices::default();
+        let coord = RowCoordinate {
+            dims: BTreeMap::from([(PrimaryDim::Out, &levels)]),
+            work_slices: &slices,
+        };
+        let no_candidates: RowCandidates<'_, Levels> = RowCandidates {
+            forward: &[],
+            reverse: &[],
+        };
+        let on_ptrow3 = on_row(SenComponent::Ptrow3);
+        let unresolved = on_row(SenComponent::NoComponent);
+
+        // Row 3 feeding a compute on row 5: both units resolve, non-adjacent as they are.
+        let north_south = PtRowPropagation::of(
+            &dsc,
+            &propagation(),
+            RefRole::Producer,
+            &PropUnits::Other,
+            &PropUnits::Compute {
+                ex_unit: SenComponent::Ptrow5,
+                inputs: &on_ptrow3,
+                outputs: &[],
+            },
+        )
+        .expect("row 3 and row 5 are both units");
+        let gather = |core_ds: &RowSplitOn| {
+            gather_related_pt_rows::<Target, _, _, _, Levels>(
+                &dsc,
+                core_ds,
+                &tree,
+                &propagation(),
+                north_south,
+                NodeId(0),
+                &coord,
+                crate::schedule::ddc::ScaleDown::No,
+                &no_candidates,
+                &slices,
+            )
+        };
+
+        // Nothing row split: the reference answers before it ever asks about adjacency.
+        assert_eq!(gather(&RowSplitOn(vec![])), Some(PtRowGrouping::NoBundling));
+        // Past that answer, rows 3 and 5 are two apart and the `DT_CHECK` fires.
+        assert_eq!(gather(&RowSplitOn(vec![PrimaryDim::Out])), None);
+
+        // A matched input sitting on `NO_COMPONENT` is the `DT_CHECK` on `propSrcUnit`.
+        assert_eq!(
+            PtRowPropagation::of(
+                &dsc,
+                &propagation(),
+                RefRole::Producer,
+                &PropUnits::Other,
+                &PropUnits::Compute {
+                    ex_unit: SenComponent::Ptrow3,
+                    inputs: &unresolved,
+                    outputs: &[],
+                },
+            ),
+            None
         );
     }
 }

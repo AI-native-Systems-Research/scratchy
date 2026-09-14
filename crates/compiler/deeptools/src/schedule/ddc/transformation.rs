@@ -2681,7 +2681,7 @@ pub enum SkipMetadataUpdate {
 ///
 /// ⛔ ONE WALK, INTERLEAVED IN TREE ORDER and NOT three walks grouped by kind: a transfer's clone is
 /// minted before a later allocate's is, which is what the reference's own *"TO VERIFY: Can unrolling
-/// invalidate the traversal result"* (`:1431`) is about.
+/// invalidate the traversal result"* (`:1422`) is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeSfpSplitNode {
     /// `ALLOCATE`, with its `tempStorageForCompute_` read as entry 118's flag.
