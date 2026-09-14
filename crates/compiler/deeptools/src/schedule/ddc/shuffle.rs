@@ -2766,7 +2766,7 @@ impl AutoShuffler {
     /// THE CHEAPEST ACTION SEQUENCE FROM ONE ABSTRACT LAYOUT TO ANOTHER — Dijkstra over the layout
     /// graph from the input canonicalized against the goal, read back off the predecessor chain.
     ///
-    /// ⛔ [`None`] IS BOTH OF THE REFERENCE'S STOPS — *"Requested layout not reachable."* (`:1218`)
+    /// ⛔ [`None`] IS BOTH OF THE REFERENCE'S STOPS — *"Requested layout not reachable."* (`:1212`)
     /// and *"Illegal format applied to action"* (`:1195`); this crate does not runtime refuse and
     /// this file already answers with [`Option`] (e270, e342).
     pub fn get_shuffle(

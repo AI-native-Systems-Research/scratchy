@@ -2929,9 +2929,9 @@ impl SplatCandidate {
 /// any FIFO result into a register, then entry 340 mints one `compute_splat_4B_lxlu_<unit>` per
 /// destination and hands it that register file.
 ///
-/// ⛔ DELIBERATE DIVERGENCE: a destination not on `SFPLRF`, and one entry 340 refuses, are SKIPPED —
-/// both abort in the reference and this pass has no refusal. ⚠️ TRAP: THE `SFPLRF` CHECK COMES AFTER
-/// ENTRY 250, which is what makes a FIFO destination pass it.
+/// ⛔ DELIBERATE DIVERGENCE — THREE ABORTS BECOME SKIPS, this pass having no refusal: a FIFO result
+/// entry 250 cannot convert, a destination not on `SFPLRF`, and one entry 340 refuses. ⚠️ TRAP: THE
+/// `SFPLRF` CHECK COMES AFTER ENTRY 250, which is what makes a FIFO destination pass it.
 pub fn transform_for_4b_splat_read<D>(
     dsc: &mut D,
     metadata: &mut Metadata,
@@ -2954,6 +2954,8 @@ where
             .iter()
             .any(|dst| !is_memory(dst.storage))
         {
+            // ⛔ THE REFERENCE ABORTS INSTEAD (`:14240-14245`), so an unconvertible FIFO result skips
+            // the whole transfer here and no SPLAT is inserted for any of its destinations.
             let fresh = dsc.free_alloc();
             let Some(site) = FifoConversionSite::of(metadata, transfer, exploration) else {
                 continue;
