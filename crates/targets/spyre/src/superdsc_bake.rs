@@ -42,12 +42,165 @@
 //! baked, and `bundle::have_device_code()` reports the absence of the programs. That is a CAPABILITY
 //! probe, not a behaviour flag: there is one code path and it is taken whenever the tool exists.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use scratchy_spyre_bundle::correction;
+
+/// ⭐ THE BUILD'S FAILURE AND EVERY LIVE COMPILER PROCESS, UNDER ONE LOCK.
+///
+/// ⛔ WHY THESE TWO FACTS SHARE A MUTEX: a worker that found a failure used to just record it and
+/// return; the other `COMPILE_WIDTH - 1` workers' `dxp_standalone` children kept running with nothing
+/// tracking them. When the build then exits on that failure (the normal `finish()` -> `Err` path), Unix
+/// does not kill a process's children for it — they are orphaned onto whatever reparents them, which on
+/// a pod is often a bare `sleep 1` that never calls `wait()`. Orphan now, zombie forever.
+///
+/// So the failure has to KILL them, which means the failing worker needs a registry of children it did
+/// not spawn. And that registry cannot be a second lock beside the error: "has the build failed?" and
+/// "spawn and record a child" would then be separately ordered, and a sweep could slip between a
+/// worker's check and its insert, leaving exactly the untracked child this exists to prevent. One lock
+/// makes [`Self::register`] and [`Self::fail`] mutually exclusive, so a child is either registered
+/// before the sweep (and killed by it) or refused after it (and killed by its own guard) — never
+/// neither.
+#[derive(Debug, Default)]
+struct Reaper {
+    inner: Mutex<ReaperInner>,
+}
+
+#[derive(Debug, Default)]
+struct ReaperInner {
+    /// First failure, which is also the "the build is over" flag — ONE fact, not a message beside a
+    /// bool that has to be kept in step with it.
+    err: Option<String>,
+    /// pgid of every `dxp_standalone` currently running. Each is its own process group, so a kill
+    /// reaches its descendants without touching this process or a sibling compile.
+    live: HashSet<i32>,
+}
+
+impl Reaper {
+    /// Every critical section here is a `HashSet` operation and `kill(2)`, neither of which can panic
+    /// or leave a half-updated invariant, so a poisoned lock cannot mean broken state — recovering
+    /// beats propagating a spurious failure through every call site.
+    fn inner(&self) -> std::sync::MutexGuard<'_, ReaperInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Record `pgid` as live, or REFUSE because the build has already failed — in which case the
+    /// caller's guard kills it immediately rather than adding a child nothing will reap.
+    fn register(&self, pgid: i32) -> bool {
+        let mut g = self.inner();
+        if g.err.is_some() {
+            return false;
+        }
+        g.live.insert(pgid);
+        true
+    }
+
+    fn deregister(&self, pgid: i32) {
+        self.inner().live.remove(&pgid);
+    }
+
+    /// Record the first failure and SIGKILL every live compiler. Later failures only report: the sweep
+    /// has happened, and everything it could still kill is already dying.
+    fn fail(&self, e: String) {
+        let mut g = self.inner();
+        if g.err.is_some() {
+            return;
+        }
+        g.err = Some(e);
+        for &pgid in g.live.iter() {
+            kill_group(pgid);
+        }
+    }
+
+    fn first_error(&self) -> Option<String> {
+        self.inner().err.clone()
+    }
+
+    fn has_failed(&self) -> bool {
+        self.inner().err.is_some()
+    }
+}
+
+/// SIGKILL a whole process group.
+///
+/// ⚠️ Only sound while the group is known to have a live member: a pgid is reusable once its last
+/// member is reaped, so a kill sent after that could in principle land on an unrelated new group. Every
+/// caller here sends it to a group it is still holding a `Child` for, or has just refused to reap.
+fn kill_group(pgid: i32) {
+    // SAFETY: a negative pid targets the process group rather than one pid. ESRCH (the group is
+    // already gone) is the expected outcome of a race with normal exit, not an error to surface.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+/// ⭐ ONE `dxp_standalone` CHILD, OWNED — its own process group, registered in the [`Reaper`] for as
+/// long as `Self` is alive.
+///
+/// `Drop`, not the order of statements in [`DxpTool::compile`], is what guarantees the registry entry
+/// is cleared and an unreaped group is killed: true today (the only path is spawn then wait), and still
+/// true of whatever `compile` grows into later — an early `?`, a timeout, a panic on this thread. A bare
+/// insert-then-remove around the wait call gets that right only until someone edits the function
+/// between the two lines.
+struct ChildGroup<'a> {
+    /// `None` once [`Self::wait_with_output`] has reaped the leader — which is what tells `Drop` the
+    /// group must NOT be killed, its pgid being free for reuse from that moment on.
+    child: Option<std::process::Child>,
+    pgid: i32,
+    reaper: &'a Reaper,
+}
+
+impl<'a> ChildGroup<'a> {
+    /// Spawn `cmd` into a FRESH process group (pgid == its own pid, via `process_group(0)`) — detached
+    /// from this process's group and every sibling's — and register it.
+    ///
+    /// `Err` once the build has already failed: the child is spawned but immediately torn down by the
+    /// guard's own `Drop`, so losing the registration race cannot leave it running.
+    fn spawn(cmd: &mut std::process::Command, reaper: &'a Reaper) -> Result<Self, String> {
+        let child = cmd
+            .process_group(0)
+            .spawn()
+            .map_err(|e| format!("spawn: {e}"))?;
+        let pgid = child.id() as i32;
+        // Construct the guard BEFORE registering, so the refusal path below tears the child down
+        // through the same `Drop` as every other exit.
+        let guard = ChildGroup {
+            child: Some(child),
+            pgid,
+            reaper,
+        };
+        if !reaper.register(pgid) {
+            return Err("the bake already failed in another group".to_string());
+        }
+        Ok(guard)
+    }
+
+    /// Wait for the leader and collect its output, consuming the guard so `Drop` runs immediately
+    /// after — deregistering either way.
+    fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        self.child
+            .take()
+            .expect("ChildGroup::spawn is the only constructor and it always fills child")
+            .wait_with_output()
+    }
+}
+
+impl Drop for ChildGroup<'_> {
+    fn drop(&mut self) {
+        self.reaper.deregister(self.pgid);
+        // Kill ONLY while the leader is still unreaped. Once `wait_with_output` has reaped it the group
+        // may be empty and its pgid already recycled, so a kill here could hit an unrelated process
+        // group; while we still hold the `Child`, the group is guaranteed to be ours.
+        if self.child.is_some() {
+            kill_group(self.pgid);
+        }
+    }
+}
 
 /// ⭐ THE DISK BOUND: staged json bytes that may exist at once, across every bundle.
 ///
@@ -317,19 +470,48 @@ impl DxpTool {
     /// Compile ONE group dir in place. `Ok(())` leaves `spyreCodeDir/{init_binary.bin,
     /// spyrecode.json}` beside the json; `Err` carries dxp's own message, which is the only useful
     /// thing about a scheduler refusal.
-    fn compile(&self, group: &Path) -> Result<(), String> {
+    ///
+    /// Runs under a [`ChildGroup`] — its own process group, torn down by `Drop` — so a DIFFERENT
+    /// worker's failure can reach and kill this child (via [`Reaper::fail`]) instead of leaving it to be
+    /// orphaned when the build exits.
+    fn compile(&self, group: &Path, reaper: &Reaper) -> Result<(), String> {
         // DUMP_SPYRE_CODE=1 is what makes dxp emit `spyreCodeDir/` — the artifact the runtime reads
         // and the marker `build.rs` skips on. Mirrors build.rs's invocation exactly.
-        let out = std::process::Command::new(&self.bin)
-            .arg("--bundle")
+        let mut cmd = std::process::Command::new(&self.bin);
+        cmd.arg("--bundle")
             .arg("-d")
             .arg(group)
             .arg("-b")
             .arg("sentient")
             .env("DEEPTOOLS_PATH", &self.deeptools)
             .env("DUMP_SPYRE_CODE", "1")
-            .output()
-            .map_err(|e| format!("spawn {}: {e}", self.bin.display()))?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // What `Command::output()` did implicitly, and spawning by hand does NOT: dxp gets EOF
+            // rather than the build's own stdin. Inheriting it would hand the same descriptor to all
+            // `COMPILE_WIDTH` compilers at once.
+            .stdin(Stdio::null());
+        // ⭐ THE KERNEL-SIDE BACKSTOP for the teardown a userspace sweep CANNOT see. `Reaper::fail`
+        // only runs when a dxp compile fails; if the build dies any other way — a panic elsewhere in
+        // the emit, an OOM kill, Ctrl-C on cargo — no destructor on these worker threads ever runs, and
+        // in-flight children orphan exactly as before. PDEATHSIG makes the kernel SIGKILL the child
+        // when the thread that spawned it dies, which covers all of those without our cooperation.
+        #[cfg(target_os = "linux")]
+        // SAFETY: `pre_exec` runs between fork and exec, where only async-signal-safe calls are
+        // permitted. `prctl` is a bare syscall — it allocates nothing and takes no lock.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let guard = ChildGroup::spawn(&mut cmd, reaper)
+            .map_err(|e| format!("{}: {e}", self.bin.display()))?;
+        let out = guard
+            .wait_with_output()
+            .map_err(|e| format!("wait {}: {e}", self.bin.display()))?;
         let marker = group.join("spyreCodeDir").join("spyrecode.json");
         if out.status.success() && marker.exists() {
             return Ok(());
@@ -416,8 +598,10 @@ pub struct BakeQueue<const N: usize> {
     /// the threads; keeping them is what leaves a real shutdown available if one is ever wanted.
     #[allow(dead_code)]
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    /// First failure, kept so `submit` can refuse further work and the caller can surface it.
-    err: Arc<Mutex<Option<String>>>,
+    /// First failure — kept so `submit` can refuse further work and the caller can surface it — TOGETHER
+    /// with every live `dxp_standalone`, because recording that failure is what kills them. See
+    /// [`Reaper`].
+    reaper: Arc<Reaper>,
     compiled: Arc<AtomicUsize>,
     /// Device-image bytes compiled, for the build log.
     device_bytes: Arc<AtomicUsize>,
@@ -441,7 +625,7 @@ impl<const N: usize> BakeQueue<N> {
         // A SyncSender IS the bound: `send` blocks while `N` items are unclaimed.
         let (tx, rx) = std::sync::mpsc::sync_channel::<SealedGroup>(N);
         let rx = Arc::new(Mutex::new(rx));
-        let err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let reaper: Arc<Reaper> = Arc::new(Reaper::default());
         let compiled = Arc::new(AtomicUsize::new(0));
         let device_bytes = Arc::new(AtomicUsize::new(0));
         let results: Arc<Mutex<HashMap<GroupId, Arc<CompiledGroup>>>> =
@@ -455,7 +639,7 @@ impl<const N: usize> BakeQueue<N> {
         let inflight: Arc<Latch> = Arc::new(Latch::default());
         let mut workers = Vec::with_capacity(COMPILE_WIDTH);
         for _ in 0..COMPILE_WIDTH {
-            let (rx, err, tool) = (Arc::clone(&rx), Arc::clone(&err), tool.clone());
+            let (rx, reaper, tool) = (Arc::clone(&rx), Arc::clone(&reaper), tool.clone());
             let (compiled, device_bytes) = (Arc::clone(&compiled), Arc::clone(&device_bytes));
             let results = Arc::clone(&results);
             let budget = Arc::clone(&budget);
@@ -472,7 +656,7 @@ impl<const N: usize> BakeQueue<N> {
                     let Ok(job) = job else { return };
                     // Already failed? Drain without working, so the emitter's `submit` error is the
                     // one that surfaces rather than a pile of consequences.
-                    if err.lock().is_ok_and(|e| e.is_some()) {
+                    if reaper.has_failed() {
                         // Still release: the emitter may be blocked in `reserve` and has to be able
                         // to reach its own `submit` error rather than deadlocking behind a drain.
                         let _ = std::fs::remove_dir_all(&job.stage);
@@ -528,7 +712,7 @@ impl<const N: usize> BakeQueue<N> {
                             job.key
                         )),
                         (None, true) => tool
-                            .compile(job.path())
+                            .compile(job.path(), &reaper)
                             .and_then(|()| read_compiled(&job.stage, &job.id))
                             .map(Arc::new),
                     };
@@ -558,11 +742,9 @@ impl<const N: usize> BakeQueue<N> {
                                 r.insert(job.id.clone(), g);
                             }
                         }
-                        Err(e) => {
-                            if let Ok(mut slot) = err.lock() {
-                                slot.get_or_insert(e);
-                            }
-                        }
+                        // Records the failure AND, if it is the first, SIGKILLs every other live
+                        // compiler — one call, because they are one decision under one lock.
+                        Err(e) => reaper.fail(e),
                     }
                     inflight.leave();
                 }
@@ -575,7 +757,7 @@ impl<const N: usize> BakeQueue<N> {
             memo_hits,
             tx: Mutex::new(Some(tx)),
             workers: Mutex::new(workers),
-            err,
+            reaper,
             compiled,
             device_bytes,
             results,
@@ -604,7 +786,7 @@ impl<const N: usize> BakeQueue<N> {
     /// the disk bound. `Err` as soon as any group has failed, so the emitter stops instead of
     /// writing the rest of a ladder that cannot compile.
     pub fn submit(&self, group: SealedGroup) -> Result<(), String> {
-        if let Some(e) = self.err.lock().ok().and_then(|g| g.clone()) {
+        if let Some(e) = self.reaper.first_error() {
             return Err(e);
         }
         // Clone the sender out from under the lock: `send` BLOCKS when the queue is full, and
@@ -622,10 +804,8 @@ impl<const N: usize> BakeQueue<N> {
                 self.inflight.enter();
                 tx.send(group).map_err(|_| {
                     self.inflight.cancel();
-                    self.err
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone())
+                    self.reaper
+                        .first_error()
                         .unwrap_or_else(|| "bake workers exited".to_string())
                 })
             }
@@ -655,9 +835,8 @@ impl<const N: usize> BakeQueue<N> {
     /// ⭐ THE COUNTS ARE CUMULATIVE across expansions, deliberately: they describe what the BUILD
     /// compiled, which is what the log line is for.
     pub fn finish(&self) -> Result<BakeStats, String> {
-        self.inflight
-            .wait_empty(&|| self.err.lock().is_ok_and(|e| e.is_some()));
-        if let Some(e) = self.err.lock().ok().and_then(|g| g.clone()) {
+        self.inflight.wait_empty(&|| self.reaper.has_failed());
+        if let Some(e) = self.reaper.first_error() {
             return Err(e);
         }
         Ok(BakeStats {

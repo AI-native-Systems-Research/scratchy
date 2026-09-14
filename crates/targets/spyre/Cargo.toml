@@ -32,6 +32,8 @@ sendnn = ["dep:flex-rs"]
 # not the runtime.
 scratchy-spyre-bundle = { path = "bundle" }
 scratchy-tensors = { path = "../../tensors" }
+# `kill(-pid, SIGKILL)` on a `dxp_standalone` process group — see `superdsc_bake`'s worker pool.
+libc = { workspace = true }
 # Neutral leaf crate (NOT a `targets/` crate) — holds the shared `GpuWeights`
 # container the spyre `__gpu` facade re-exports for the macro's load path.
 scratchy-layers = { path = "../../layers" }
