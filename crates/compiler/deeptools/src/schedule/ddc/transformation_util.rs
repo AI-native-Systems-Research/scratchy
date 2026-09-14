@@ -160,17 +160,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sys_arch_spec::arch_enums::SenComponent;
 
-use super::fold::{AllocId, AllocLayout, Allocations, DataOrigin, NodeId, PadType, StoredStream};
-use super::metadata::{DatastageId, DdcMemory, DestIdx, MetaDimKind, Metadata};
-use super::transformation::LoopId;
+use super::fold::{
+    AllocId, AllocLayout, Allocations, ConstIdx, DataOrigin, NodeId, PadType, StoredStream,
+};
+use super::metadata::{DatastageId, DdcMemory, DestIdx, MetaDimKind, Metadata, NodeIndex};
+use super::transformation::{LoopId, SkipMetadataUpdate};
 use super::v1::CoreClSet;
 use crate::arch::Elements;
 use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::generated::{DataConnect, Strategy};
 use crate::schedule::dsc2::{
-    ComputeNode, DataInfo, Dsc, Dsts, Hops, LatchDataId, LdsIdx, NodeName, Operand, OperandPos,
-    TransferNode, TransferSide,
+    AllocateNode, ComputeNode, DataInfo, Dsc, Dsts, Hops, LatchDataId, LdsIdx, NodeName, Operand,
+    OperandPos, SyncNode, TransferNode, TransferSide,
 };
 use crate::schedule::l3::dsc::SymbolicDimInfo;
 use crate::units::{Core, Corelet};
@@ -843,41 +845,614 @@ pub fn get_node_description(node: UtilNode<'_>) -> String {
     description
 }
 
-// crustify:todo: e118_cloneForPeSfpWorkSplit
-//   authority : ddc/ddc_transformation_util.cpp:1306  (114 body lines, level 0)
-//   class     : Ddc
-//   original  : dsc2::AllocateNode *Ddc::cloneForPeSfpWorkSplit( dsc2::AllocateNode *node, bool skipMetadataUpdate /* = false */)
-//   extract   : crustify-ddc/cpp/ddc.cpp:1523-1638
+// ⭐ TYPES FOR ENTRIES 118-123. Union this section with this file's other vocabulary when its
+// remaining entries land.
 
-// crustify:todo: e119_cloneForPeSfpWorkSplit
-//   authority : ddc/ddc_transformation_util.cpp:1422  (115 body lines, level 0)
-//   class     : Ddc
-//   original  : dsc2::ComputeNode *Ddc::cloneForPeSfpWorkSplit(dsc2::ComputeNode *node)
-//   extract   : crustify-ddc/cpp/ddc.cpp:1648-1763
+/// THE ALLOCATION ONE SCHEDULE NODE IS — [`DscAllocations::alloc_node`] READ THE OTHER WAY, which is
+/// what turns a `nodeCloningMap_` entry back into an allocation: the reference holds ONE
+/// `AllocateNode*` in both and `static_cast`s it back (`:1728`).
+pub trait AllocationsByNode {
+    /// The allocation at `node`, [`None`] where the node is not an `ALLOCATE`.
+    fn allocation_of(&self, node: NodeId) -> Option<AllocId>;
+}
 
-// crustify:todo: e120_storageOrDatastreamIsExternal
-//   authority : ddc/ddc_transformation_util.cpp:1652  (32 body lines, level 0)
-//   class     : Ddc
-//   original  : bool Ddc::storageOrDatastreamIsExternal(const dsc2::DataInfo &dataInfo, SenComponents storage, bool isIncoming) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:1773-1807
+/// WHAT ENTRIES 118 AND 119 DO TO AN ALLOCATION — its body, the clone, the placement and the one
+/// field entry 119 writes on an allocation it did not mint.
+pub trait AllocateCloning: DscAllocations + AllocationsByNode {
+    /// `allocNode` as the carrier holds it.
+    fn allocate(&self, alloc: AllocId) -> AllocateNode;
 
-// crustify:todo: e121_relatedToExternalNodes
-//   authority : ddc/ddc_transformation_util.cpp:1748  (8 body lines, level 0)
-//   class     : Ddc
-//   original  : bool Ddc::relatedToExternalNodes(const dsc2::SyncNode *node) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:1817-1825
+    /// `node->clone()` with `body` for its state, placed IMMEDIATELY AFTER `alloc`'s node among its
+    /// parent's children (`parent->addChildNode(newNode, false, node)`). Yields the clone.
+    fn clone_allocate_after(&mut self, alloc: AllocId, body: AllocateNode) -> AllocId;
 
-// crustify:todo: e122_isNodeRelatedToComps
-//   authority : ddc/ddc_transformation_util.cpp:1778  (30 body lines, level 0)
-//   class     : Ddc
-//   original  : bool Ddc::isNodeRelatedToComps(const dsc2::ScheduleNode *node, const std::vector<SenComponents> &comps, SenComponents &nodeComp)
-//   extract   : crustify-ddc/cpp/ddc.cpp:1835-1867
+    /// `allocNode->tempStorageForCompute_ = compute` (`dsc/dsc2.h:978`).
+    fn set_temp_storage_for_compute(&mut self, alloc: AllocId, compute: NodeName);
+}
 
-// crustify:todo: e123_updateNodesWithNewLds
-//   authority : ddc/ddc_transformation_util.cpp:1919  (57 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::updateNodesWithNewLds(int newLdsIdx, int oldLdsIdx, dsc2::ScheduleNode *startNode)
-//   extract   : crustify-ddc/cpp/ddc.cpp:1877-1935
+/// WHAT ENTRIES 118 AND 119 DO TO A COMPUTE — its body, the clone and the placement.
+pub trait ComputeCloning {
+    /// `computeNode` as the carrier holds it.
+    fn compute(&self, node: NodeId) -> ComputeNode;
+
+    /// `node->clone()` with `body` for its state, placed immediately after `node` among its parent's
+    /// children. Yields the clone.
+    fn clone_compute_after(&mut self, node: NodeId, body: ComputeNode) -> NodeId;
+}
+
+/// THE `memOrg_` AND `constantInfo_` SLOTS KEYED BY A FULL `SenComponents` — the ones entry 118
+/// writes.
+///
+/// ⛔ NOT [`DscAllocations::allocation_in`], WHICH IS KEYED BY [`DdcMemory`]: `toggleMap` names `PE`,
+/// `SFP`, `PESTATE` and `SFPSTATE`, none of which has a [`DdcMemory`] spelling, and this is the same
+/// `memOrg_` reached under the vocabulary that can state them.
+/// ⛔ PRESENCE AND A SET ALLOCATION ARE TWO QUESTIONS: the reference tests `memOrg_.count(c)` and
+/// then `memOrg_.at(c).allocateNode_` separately, and an entry whose allocation is still null is
+/// exactly what its own copy-then-fill sequence creates.
+pub trait ComponentAllocations {
+    /// `labeledDs_.at(lds).memOrg_.count(storage)`.
+    fn has_mem_org(&self, lds: LdsIdx, storage: SenComponent) -> bool;
+
+    /// `memOrg_[to] = memOrg_[from]` with the copy's `allocateNode_` CLEARED (`:1399`).
+    fn copy_mem_org_without_allocation(
+        &mut self,
+        lds: LdsIdx,
+        from: SenComponent,
+        to: SenComponent,
+    );
+
+    /// `memOrg_.at(storage).allocateNode_`, [`None`] for an absent entry and a null one alike.
+    fn mem_org_allocation(&self, lds: LdsIdx, storage: SenComponent) -> Option<AllocId>;
+
+    /// `memOrg_.at(storage).allocateNode_ = alloc`.
+    fn set_mem_org_allocation(&mut self, lds: LdsIdx, storage: SenComponent, alloc: AllocId);
+
+    /// `constantInfo_.at(constant).allocations_.count(storage)`.
+    fn has_constant_allocation(&self, constant: ConstIdx, storage: SenComponent) -> bool;
+
+    /// `constantInfo_.at(constant).allocations_[storage] = alloc`.
+    fn set_constant_allocation(
+        &mut self,
+        constant: ConstIdx,
+        storage: SenComponent,
+        alloc: AllocId,
+    );
+}
+
+/// AN ALLOCATION PROVED CLONEABLE FOR THE PE/SFP WORK SPLIT, CARRYING THE SUFFIX ITS CLONE TAKES.
+///
+/// ⛔⛔ TWO ABORTS AND THE `nullptr` ANSWER COLLAPSE INTO THIS TYPE: *"has already been cloned"*,
+/// *"as none of ldsIdx_ and constIdx_ is set"*, and the component `toggleMap` has no entry for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeSfpAllocateSplit {
+    alloc: AllocId,
+    body: AllocateNode,
+    origin: DataOrigin,
+    toggled: SenComponent,
+    suffix: ParallelSuffix,
+}
+
+impl PeSfpAllocateSplit {
+    /// The witness, or [`None`] for either abort and for the `nullptr`.
+    ///
+    /// ⚠️⚠️ TRAP, AND IT IS THE REFERENCE'S: THE SUFFIX IS NOT THE TOGGLE. It is `"_sfp_parallel"`
+    /// for `PELRF` and `PESTATE` ALONE (`:1332`), so a `PE` allocation's clone runs on SFP and is
+    /// still named `"_pe_parallel"` — the opposite of entry 119's rule for that same pair.
+    /// ⛔ `ldsIdx_` WINS: the reference tests it first and the constant branch is its `else`.
+    #[must_use]
+    pub fn of<D: AllocateCloning + ?Sized>(
+        dsc: &D,
+        metadata: &Metadata,
+        alloc: AllocId,
+    ) -> Option<Self> {
+        let body = dsc.allocate(alloc);
+        let toggled = toggle_pe_sfp(body.component)?;
+        if metadata
+            .node_cloning_map
+            .contains_key(&dsc.alloc_node(alloc))
+        {
+            return None;
+        }
+        let origin = match (body.lds, body.const_idx) {
+            (Some(lds), _) => DataOrigin::LabeledDs(lds),
+            (None, Some(constant)) => DataOrigin::Constant(constant),
+            (None, None) => return None,
+        };
+        let suffix = match body.component {
+            SenComponent::Pelrf | SenComponent::Pestate => ParallelSuffix::Sfp,
+            _ => ParallelSuffix::Pe,
+        };
+        Some(Self {
+            alloc,
+            body,
+            origin,
+            toggled,
+            suffix,
+        })
+    }
+
+    /// Which labeled DS or constant the allocation is for.
+    #[must_use]
+    pub const fn origin(&self) -> DataOrigin {
+        self.origin
+    }
+
+    /// The component the clone is placed on — `toggleMap.at(node->component_)`.
+    #[must_use]
+    pub const fn toggled(&self) -> SenComponent {
+        self.toggled
+    }
+}
+
+/// Replaces: e118_cloneForPeSfpWorkSplit
+///
+/// CLONES ONE ALLOCATION ONTO THE OTHER HALF OF THE PE/SFP PAIR (`:1306`): a copy right after it with
+/// the component toggled, the suffix on its name and no users or temp storage, registered under the
+/// new component in `newAllocations_` and filling that component's `memOrg_` or `allocations_` slot.
+///
+/// ⛔ THE [`None`]s ARE FOUR MORE ABORTS: the original missing under its own component, either target
+/// slot already taken, or the labeled DS holding no `memOrg_` entry for the original component.
+pub fn clone_allocate_for_pe_sfp_work_split<D>(
+    dsc: &mut D,
+    metadata: &mut Metadata,
+    split: PeSfpAllocateSplit,
+    update: SkipMetadataUpdate,
+) -> Option<AllocId>
+where
+    D: AllocateCloning + ComponentAllocations + ?Sized,
+{
+    let PeSfpAllocateSplit {
+        alloc,
+        body,
+        origin,
+        toggled,
+        suffix,
+    } = split;
+    let node = dsc.alloc_node(alloc);
+
+    // ⚠️ EVERY REFUSAL IS ANSWERED BEFORE THE CLONE IS MINTED, so a `None` leaves nothing behind.
+    // The reference instead places the node between its metadata writes and its `memOrg_` writes.
+    // `newAllocations_[newNode->component_]` and `.at(node->component_)` — a component with no
+    // [`DdcMemory`] spelling is not a key of that map, which is what its `.at()` throws on.
+    let registration = match update {
+        SkipMetadataUpdate::No => {
+            let (from, to) = component_memory(body.component).zip(component_memory(toggled))?;
+            if registered_allocation(metadata, from, origin) != Some(alloc) {
+                return None;
+            }
+            if registered_allocation(metadata, to, origin).is_some() {
+                return None;
+            }
+            Some(to)
+        }
+        SkipMetadataUpdate::Yes => None,
+    };
+
+    match origin {
+        DataOrigin::LabeledDs(lds) => {
+            if !dsc.has_mem_org(lds, body.component) {
+                return None;
+            }
+            if dsc.mem_org_allocation(lds, toggled).is_some() {
+                return None;
+            }
+        }
+        DataOrigin::Constant(constant) => {
+            if dsc.has_constant_allocation(constant, toggled) {
+                return None;
+            }
+        }
+    }
+
+    let mut clone_body = body.clone();
+    clone_body.name = NodeName(format!("{}{}", body.name.0, suffix.spelling()));
+    clone_body.component = toggled;
+    clone_body.alloc_users.clear();
+    clone_body.temp_storage_for_compute = None;
+    let clone = dsc.clone_allocate_after(alloc, clone_body);
+
+    if let Some(to) = registration {
+        let allocated = metadata.new_allocations.entry(to).or_default();
+        match origin {
+            DataOrigin::LabeledDs(lds) => {
+                allocated.lds_idx_and_alloc_node.insert(lds, clone);
+            }
+            DataOrigin::Constant(constant) => {
+                allocated.cons_id_and_alloc_node.insert(constant, clone);
+            }
+        }
+    }
+    let clone_node = dsc.alloc_node(clone);
+    metadata
+        .node_cloning_map
+        .entry(node)
+        .or_default()
+        .push(clone_node);
+
+    match origin {
+        DataOrigin::LabeledDs(lds) => {
+            if !dsc.has_mem_org(lds, toggled) {
+                dsc.copy_mem_org_without_allocation(lds, body.component, toggled);
+            }
+            dsc.set_mem_org_allocation(lds, toggled, clone);
+        }
+        DataOrigin::Constant(constant) => {
+            dsc.set_constant_allocation(constant, toggled, clone);
+        }
+    }
+
+    Some(clone)
+}
+
+/// `newAllocations_.at(memory).ldsIdxAndAllocNode`, else `.consIdAndAllocNode`, keyed by the origin —
+/// the two branches entry 118 spells twice over.
+fn registered_allocation(
+    metadata: &Metadata,
+    memory: DdcMemory,
+    origin: DataOrigin,
+) -> Option<AllocId> {
+    let allocated = metadata.new_allocations.get(&memory)?;
+    match origin {
+        DataOrigin::LabeledDs(lds) => allocated.lds_idx_and_alloc_node.get(&lds).copied(),
+        DataOrigin::Constant(constant) => allocated.cons_id_and_alloc_node.get(&constant).copied(),
+    }
+}
+
+/// A COMPUTE PROVED CLONEABLE FOR THE PE/SFP WORK SPLIT, CARRYING THE SUFFIX ITS CLONE TAKES.
+///
+/// ⛔⛔ THREE ABORTS AND THE `nullptr` ANSWER COLLAPSE INTO THIS TYPE: an input sent from the other
+/// half of the pair, an output sent to it, *"has already been cloned"*, and an `exUnit_` that is
+/// neither PE nor SFP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeSfpComputeSplit {
+    node: NodeId,
+    toggled: SenComponent,
+    suffix: ParallelSuffix,
+}
+
+impl PeSfpComputeSplit {
+    /// The witness, or [`None`] for any abort and for the `nullptr`.
+    ///
+    /// ⚠️ THE SUFFIX IS THE HALF THE CLONE RUNS ON here — `PE` becomes `"_sfp_parallel"` (`:1685`),
+    /// which is NOT what [`PeSfpAllocateSplit`] does with the same component.
+    #[must_use]
+    pub fn of(metadata: &Metadata, node: NodeId, compute: &ComputeNode) -> Option<Self> {
+        let ex_unit = pe_or_sfp(compute.ex_unit)?;
+        let operands = compute.inputs.iter().chain(compute.outputs.iter());
+        if operands
+            .clone()
+            .any(|operand| pe_or_sfp(operand.unit).is_some())
+        {
+            return None;
+        }
+        if metadata.node_cloning_map.contains_key(&node) {
+            return None;
+        }
+        let (toggled, suffix) = if ex_unit == SenComponent::Pe {
+            (SenComponent::Sfp, ParallelSuffix::Sfp)
+        } else {
+            (SenComponent::Pe, ParallelSuffix::Pe)
+        };
+        Some(Self {
+            node,
+            toggled,
+            suffix,
+        })
+    }
+}
+
+/// Replaces: e119_cloneForPeSfpWorkSplit
+///
+/// CLONES ONE COMPUTE ONTO THE OTHER HALF OF THE PE/SFP PAIR (`:1422`): a copy right after it with
+/// `exUnit_` flipped and the suffix on its name, whose named operand connects take the suffix and
+/// whose operand units toggle — or, for an opaque op, whose register allocations follow their clones.
+///
+/// ⚠️⚠️ TRAP: A NAMED CONNECT TAKES THE SUFFIX UNCONDITIONALLY, whether or not that operand's unit
+/// toggled — the opposite of [`toggle_for_split`], which entry 304 uses on a transfer.
+pub fn clone_compute_for_pe_sfp_work_split<D>(
+    dsc: &mut D,
+    metadata: &mut Metadata,
+    split: PeSfpComputeSplit,
+) -> Option<NodeId>
+where
+    D: ComputeCloning + AllocateCloning + FifoResults + MintedConnects + ?Sized,
+{
+    let PeSfpComputeSplit {
+        node,
+        toggled,
+        suffix,
+    } = split;
+    let mut body = dsc.compute(node);
+    body.name = NodeName(format!("{}{}", body.name.0, suffix.spelling()));
+    body.ex_unit = toggled;
+
+    // ⛔ THE OPAQUE BRANCH'S `None`s ARE THE REFERENCE'S `DT_CHECK`s: no metadata entry, no internal
+    // register allocation, or a register allocation that was not cloned exactly once.
+    let mut opaque = None;
+    if dsc.is_opaque(node) {
+        let mut op = metadata.opaque_ops.get(&node)?.clone();
+        let internal = sole_allocation_clone(dsc, metadata, op.internal_reg_alloc?)?;
+        op.internal_reg_alloc = Some(internal);
+        for alloc in op.in_out_reg_allocs.values_mut() {
+            *alloc = sole_allocation_clone(dsc, metadata, *alloc)?;
+        }
+        let connects = body
+            .instr_attribute
+            .input_data_connects
+            .iter_mut()
+            .chain(body.instr_attribute.output_data_connects.iter_mut());
+        for connect in connects {
+            *connect = dsc.intern_connect(MintedConnect::Parallel(*connect, suffix));
+        }
+        opaque = Some((op, internal));
+    } else {
+        for operand in body.inputs.iter_mut().chain(body.outputs.iter_mut()) {
+            if let Some(base) = operand.data.data_connect {
+                operand.data.data_connect =
+                    Some(dsc.intern_connect(MintedConnect::Parallel(base, suffix)));
+            }
+            if let Some(unit) = toggle_pe_sfp(operand.unit) {
+                operand.unit = unit;
+            }
+        }
+    }
+
+    // `getMutableAllocation(offsets.at(i), newNode-><in|out>puts_.at(i), true)` for each operand
+    // whose unit moved — and `toggleMap` is its own inverse, so the toggled unit answers that.
+    let users: Vec<(DataOrigin, DdcMemory)> = if opaque.is_none() {
+        body.inputs
+            .iter()
+            .chain(body.outputs.iter())
+            .filter(|operand| toggle_pe_sfp(operand.unit).is_some())
+            .filter_map(|operand| data_origin(operand.data).zip(component_memory(operand.unit)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let name = body.name.clone();
+    let clone = dsc.clone_compute_after(node, body);
+
+    for (origin, memory) in users {
+        if let Some(alloc) = dsc.allocation_in(origin, memory) {
+            dsc.add_alloc_user(alloc, clone);
+        }
+    }
+    if let Some((op, internal)) = opaque {
+        let memory = dsc.alloc_component(internal);
+        metadata
+            .new_allocations
+            .entry(memory)
+            .or_default()
+            .comp_and_alloc_node
+            .insert(clone, internal);
+        dsc.set_temp_storage_for_compute(internal, name);
+        dsc.add_alloc_user(internal, clone);
+        for &alloc in op.in_out_reg_allocs.values() {
+            dsc.add_alloc_user(alloc, clone);
+        }
+        metadata.opaque_ops.insert(clone, op);
+    }
+    metadata
+        .node_cloning_map
+        .entry(node)
+        .or_default()
+        .push(clone);
+
+    Some(clone)
+}
+
+/// THE ONE CLONE OF AN ALLOCATION — `DT_CHECK(nodeCloningMap_.at(alloc).size() == 1)` and the `.at(0)`
+/// that follows it (`:1725`, `:1740`), [`None`] where the allocation was not cloned exactly once.
+fn sole_allocation_clone<D>(dsc: &D, metadata: &Metadata, alloc: AllocId) -> Option<AllocId>
+where
+    D: DscAllocations + AllocationsByNode + ?Sized,
+{
+    let clones = metadata.node_cloning_map.get(&dsc.alloc_node(alloc))?;
+    let &[only] = clones.as_slice() else {
+        return None;
+    };
+    dsc.allocation_of(only)
+}
+
+/// THE CENSUS' POSITIONAL IDENTITY AS A SCHEDULE NODE — `dataConnects_`' ends are [`NodeIndex`] while
+/// `externalNodes_` holds [`NodeId`], and the reference holds ONE `ScheduleNode*` in both.
+///
+/// ⛔ THE SEAM IS THE IDENTITY RESOLUTION ALONE: the census read and the external test both stay in
+/// entry 120. `metadata.rs`' own note says unifying the two spellings belongs to whichever batch first
+/// owns a schedule-tree type, and this is not it.
+pub trait CensusNodes {
+    /// The schedule node the census recorded at that position.
+    fn census_node(&self, node: NodeIndex) -> NodeId;
+}
+
+/// Replaces: e120_storageOrDatastreamIsExternal
+///
+/// Whether the datastream's allocation in `storage`, or ANY node on the connect's producer side —
+/// consumer side, outgoing — is an `externalNodes_` member (`:1652`).
+///
+/// ⚠️ TRAP: the allocation is looked up under `storage`, which entries 253/254 reach with an operand's
+/// `storage_` and entries 255/256 with its `unit_`. ⛔ An unset `dataConnect_` is the reference's
+/// `dataConnects_.count("")`, which no census inserts; its `> 2` `std::cerr` notes are droppable.
+#[must_use]
+pub fn storage_or_datastream_is_external<D>(
+    dsc: &D,
+    metadata: &Metadata,
+    data: DataInfo,
+    storage: SenComponent,
+    direction: StreamDirection,
+) -> bool
+where
+    D: DscAllocations + CensusNodes + ?Sized,
+{
+    let allocation = data_origin(data)
+        .zip(component_memory(storage))
+        .and_then(|(origin, memory)| dsc.allocation_in(origin, memory));
+    if let Some(alloc) = allocation {
+        if metadata.external_nodes.contains(&dsc.alloc_node(alloc)) {
+            return true;
+        }
+    }
+
+    let Some(ends) = data
+        .data_connect
+        .and_then(|connect| metadata.data_connects.get(&connect))
+    else {
+        return false;
+    };
+    let nodes = match direction {
+        StreamDirection::Incoming => ends.producers(),
+        StreamDirection::Outgoing => ends.consumers(),
+    };
+    nodes
+        .iter()
+        .any(|&node| metadata.external_nodes.contains(&dsc.census_node(node)))
+}
+
+/// THE SCHEDULE NODE ONE `name_` NAMES — [`SyncNode::other_ends`] holds names where the reference
+/// holds `SyncNode*`, and `isExternalNode` is asked of the node itself.
+pub trait SyncNodesByName {
+    /// The node named `name`, [`None`] where the tree holds none.
+    fn node_named(&self, name: &NodeName) -> Option<NodeId>;
+}
+
+/// Replaces: e121_relatedToExternalNodes
+///
+/// Whether ANY node at the other end of one of this sync's signals is external (`:1748`).
+///
+/// ⛔ A DISTINCT NAME: five C++ `relatedToExternalNodes` overloads differ only in their argument
+/// type — entries 306, 341 and 361 are the others — and Rust must name each of them.
+/// ⚠️ A NAME THE TREE HOLDS NO NODE FOR IS NOT EXTERNAL, which is also the reference's answer for a
+/// signal end that is not an `externalNodes_` member.
+#[must_use]
+pub fn sync_related_to_external_nodes<N: SyncNodesByName + ?Sized>(
+    nodes: &N,
+    metadata: &Metadata,
+    node: &SyncNode,
+) -> bool {
+    node.other_ends.iter().any(|name| {
+        nodes
+            .node_named(name)
+            .is_some_and(|end| metadata.external_nodes.contains(&end))
+    })
+}
+
+/// A SCHEDULE NODE AS ENTRY 122 READS ONE — the three `nodeType_`s that carry a component, and every
+/// other kind, which the reference's `if`/`else if` chain leaves unrelated.
+///
+/// ⛔ NEITHER [`UtilNode`] NOR [`crate::schedule::dsc2::Node`] SPELLS THIS SET: the first has no
+/// `ALLOCATE` arm and the second has no fourth arm, and entry 122 is asked of a whole tree's nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentNode<'a> {
+    /// `ALLOCATE` — its `component_`.
+    Allocate(&'a AllocateNode),
+    /// `COMPUTE` — its `exUnit_`.
+    Compute(&'a ComputeNode),
+    /// `TRANSFER` — its `src_.unit_`, then each `dstVias_.at(i).loc_.unit_`.
+    Transfer(&'a TransferNode),
+    /// Every other `nodeType_`, which carries no component of its own.
+    Other,
+}
+
+/// Replaces: e122_isNodeRelatedToComps
+///
+/// WHICH OF `comps` THE NODE IS ON, if any (`:1778`) — an allocation's component, a compute's
+/// execution unit, or a transfer's source unit and then each destination's, first match winning.
+///
+/// ⭐ THE `nodeComp` OUT-PARAMETER AND THE `bool` ARE ONE [`Option`]: the reference writes
+/// `NO_COMPONENT` and answers `false` together, and no caller can read one without the other.
+#[must_use]
+pub fn is_node_related_to_comps(
+    node: ComponentNode<'_>,
+    comps: &[SenComponent],
+) -> Option<SenComponent> {
+    let related = |comp: SenComponent| comps.contains(&comp).then_some(comp);
+    match node {
+        ComponentNode::Allocate(alloc) => related(alloc.component),
+        ComponentNode::Compute(compute) => related(compute.ex_unit),
+        ComponentNode::Transfer(transfer) => related(transfer.src.unit)
+            .or_else(|| transfer.dsts.iter().find_map(|dst| related(dst.unit))),
+        ComponentNode::Other => None,
+    }
+}
+
+/// WHAT ENTRY 123 ASKS OF THE DSC AND ITS SCHEDULE TREE — the same walk [`NewLabeledDs`] states,
+/// SCOPED TO ONE SUBTREE, plus the `memOrg_` move the allocate branch performs.
+///
+/// ⛔ [`TreeLdsSlot::ParametricLoop`] NEVER APPEARS HERE: entry 123's filter is `{ALLOCATE, TRANSFER,
+/// COMPUTE}` and entry 257's adds `LOOP`, so the loop arm is unreachable under this walk.
+pub trait SubtreeLds: NewLabeledDs + AllocationsByNode {
+    /// Every lds slot the `{ALLOCATE, TRANSFER, COMPUTE}` walk from `start` reaches WITH the index it
+    /// holds, in DFS order — `traverseTreeDFSMutable(startNode, .., ALL, -1, -1)`.
+    fn tree_lds_slots_under(&self, start: NodeId) -> Vec<(TreeLdsSlot, Option<LdsIdx>)>;
+
+    /// The `isOpaqueOp_` computes that same walk reaches.
+    fn opaque_computes_under(&self, start: NodeId) -> Vec<NodeId>;
+
+    /// The `memOrg_` storages of `labeledDs_.at(lds)` whose `allocateNode_` IS `alloc`.
+    fn mem_org_storages_of(&self, lds: LdsIdx, alloc: AllocId) -> Vec<SenComponent>;
+
+    /// `memorgNew[storage] = memorgOld.at(storage)` with the SOURCE's `allocateNode_` cleared.
+    fn move_mem_org(&mut self, from: LdsIdx, to: LdsIdx, storage: SenComponent);
+}
+
+/// Replaces: e123_updateNodesWithNewLds
+///
+/// REPOINTS EVERY DATASTREAM UNDER `start` FROM ONE LABELED DS INDEX TO ANOTHER (`:1919`): each
+/// compute operand's and transfer end's `myLdsIdx_`, each opaque op's `ldsIdx_`, and each allocation's
+/// `ldsIdx_` — whose `memOrg_` entry moves across and whose `newAllocations_` key rekeys to `new_lds`.
+///
+/// ⛔ DELIBERATE DIVERGENCE: the reference inserts `ldsToAlloc[newLdsIdx]` INTO the `std::map` its own
+/// range-`for` walks, so a `newLdsIdx` above `oldLdsIdx` is revisited and erased; here the key lives.
+pub fn update_nodes_with_new_lds<D: SubtreeLds + ?Sized>(
+    dsc: &mut D,
+    metadata: &mut Metadata,
+    new_lds: LdsIdx,
+    old_lds: LdsIdx,
+    start: NodeId,
+) {
+    for compute in dsc.opaque_computes_under(start) {
+        if let Some(opaque) = metadata.opaque_ops.get_mut(&compute) {
+            if opaque.lds_idx == Some(old_lds) {
+                opaque.lds_idx = Some(new_lds);
+            }
+        }
+    }
+
+    // ⛔ *"the node has to be either compute, transfer or allocate."* is unspellable: the walk's own
+    // filter admits exactly those three kinds.
+    for (slot, held) in dsc.tree_lds_slots_under(start) {
+        if held != Some(old_lds) {
+            continue;
+        }
+        dsc.set_tree_lds(slot, new_lds);
+        let TreeLdsSlot::Allocate(node) = slot else {
+            continue;
+        };
+        let Some(alloc) = dsc.allocation_of(node) else {
+            continue;
+        };
+        for storage in dsc.mem_org_storages_of(old_lds, alloc) {
+            dsc.move_mem_org(old_lds, new_lds, storage);
+        }
+        for allocated in metadata.new_allocations.values_mut() {
+            let held_under: Vec<LdsIdx> = allocated
+                .lds_idx_and_alloc_node
+                .iter()
+                .filter(|&(_, &at)| at == alloc)
+                .map(|(&lds, _)| lds)
+                .collect();
+            if held_under.is_empty() {
+                continue;
+            }
+            allocated.lds_idx_and_alloc_node.insert(new_lds, alloc);
+            for lds in held_under {
+                if lds != new_lds {
+                    allocated.lds_idx_and_alloc_node.remove(&lds);
+                }
+            }
+        }
+    }
+}
 
 // ⭐ TYPES FOR ENTRIES 304-306. Union this section with this file's other vocabulary when its
 // remaining entries land.
@@ -955,10 +1530,10 @@ pub trait MintedConnects {
 /// (`ddc/ddc_transformation_util.cpp:1919`), which repoints every datastream under `start` from one
 /// labeled DS index to another.
 ///
-/// ⛔ ENTRY 123 IS NOT PORTED — its anchor is still open above and the scheduler put it in no batch
-/// of this wave, so this trait is the SEAM entry 300 reaches it through and NOT a stand-in: it walks
-/// the whole subtree rewriting transfer, compute and allocate operands at once, which is a carrier's
-/// job however it is spelled. Its port is the one implementation of this method.
+/// ⛔ THE SEAM ENTRY 300 REACHES IT THROUGH, AND NOT A STAND-IN: it walks the whole subtree rewriting
+/// transfer, compute and allocate operands at once, which is a carrier's job however it is spelled.
+/// ⭐ [`update_nodes_with_new_lds`] IS THE PORT, and it is the one implementation of this method: a
+/// carrier states [`SubtreeLds`] and delegates.
 pub trait NewLdsRewrite {
     /// `updateNodesWithNewLds(new_lds, old_lds, start)`.
     fn update_nodes_with_new_lds(&mut self, new_lds: LdsIdx, old_lds: LdsIdx, start: NodeId);
@@ -1505,12 +2080,11 @@ pub enum StreamDirection {
 /// isIncoming)` (`ddc/ddc_transformation_util.cpp:1652`): whether that datastream's allocation in
 /// `storage`, or any node on its `data_connect=`, is an `externalNodes_` member (`ddc/ddc.h:298`).
 ///
-/// ⛔ ENTRY 120 IS NOT PORTED YET — its anchor is still open above and the scheduler put it in no
-/// batch of this wave, so this trait is the SEAM entries 253-256 reach it through and NOT a stand-in
-/// predicate: entry 120 is a `const` method over `currDsc`'s allocations, `metadata.dataConnects_`,
-/// `metadata.externalNodes_` and `transformationReportLevel_` at once, which is a carrier's question
-/// however it is spelled. Its port is the one implementation of this method, and entries
-/// 305/306/341/361 above will ask through it too.
+/// ⛔ THE SEAM ENTRIES 253-256 REACH IT THROUGH, AND NOT A STAND-IN PREDICATE: entry 120 reads
+/// `currDsc`'s allocations, `metadata.dataConnects_` and `metadata.externalNodes_` at once, which is
+/// a carrier's question however it is spelled, and entries 305/306/341/361 ask through it too.
+/// ⭐ [`storage_or_datastream_is_external`] IS THE PORT, and it is the one implementation of this
+/// method: a carrier states [`CensusNodes`] beside its allocations and delegates.
 pub trait ExternalStreams {
     /// `storageOrDatastreamIsExternal(dataInfo, storage, isIncoming)`.
     fn storage_or_datastream_is_external(
@@ -5183,5 +5757,869 @@ mod tests_e247_e254 {
             vec![(computing, InputIdx(2), SenComponent::Sfp, dst.data)]
         );
         assert_eq!(tree.dst_storage, vec![(t0, 0, SenComponent::Sfp)]);
+    }
+}
+
+#[cfg(test)]
+mod tests_e118_e123 {
+    // ⭐ TESTS FOR ENTRIES 118-123. Union this module with this file's other test modules when they
+    // land.
+    use super::*;
+
+    use super::super::metadata::{Allocation, Ends, OpaqueOp};
+    use crate::generated::RegName;
+    use crate::schedule::ddl::ops::DdlComputeType;
+    use crate::schedule::dsc2::{
+        AllocLayout, AllocPlacement, FoldDim, InstrAttribute, LayoutDims, MaxDimSize, NumChunks,
+        ReplicationFactor, StartAddress, SyncDirection, SyncStrength, SyncUnits, TransferPadding,
+    };
+    use crate::units::NumFolds;
+
+    /// ONE DSC'S ALLOCATIONS, COMPUTES AND CENSUS, stated as the tables entries 118-120 read and the
+    /// lists of what they wrote.
+    #[derive(Default)]
+    struct Cloning {
+        allocs: BTreeMap<AllocId, AllocateNode>,
+        alloc_nodes: BTreeMap<AllocId, NodeId>,
+        computes: BTreeMap<NodeId, ComputeNode>,
+        opaque: BTreeSet<NodeId>,
+        in_memory: BTreeMap<(DataOrigin, DdcMemory), AllocId>,
+        mem_org: BTreeMap<(LdsIdx, SenComponent), Option<AllocId>>,
+        constants: BTreeMap<(ConstIdx, SenComponent), AllocId>,
+        census: BTreeMap<NodeIndex, NodeId>,
+        placed: Vec<(NodeId, NodeId)>,
+        users: Vec<(AllocId, NodeId)>,
+        temp_storage: Vec<(AllocId, NodeName)>,
+        minted: Vec<String>,
+        next: u32,
+    }
+
+    impl Cloning {
+        /// One allocation on `component` for `origin`, with the schedule node that is it.
+        fn with_alloc(&mut self, component: SenComponent, origin: DataOrigin) -> AllocId {
+            let alloc = AllocId(self.mint());
+            let node = NodeId(self.mint());
+            let (lds, const_idx) = match origin {
+                DataOrigin::LabeledDs(lds) => (Some(lds), None),
+                DataOrigin::Constant(constant) => (None, Some(constant)),
+            };
+            self.allocs.insert(
+                alloc,
+                AllocateNode {
+                    name: NodeName(format!("a{}", alloc.0)),
+                    component,
+                    lds,
+                    const_idx,
+                    temp_storage_for_compute: Some(NodeName("stale".to_string())),
+                    layout: AllocLayout::new(
+                        (PrimaryDim::I, MaxDimSize::Resolved(Elements(64))),
+                        Vec::new(),
+                    ),
+                    start_address: StartAddress::new(FoldDim::default()),
+                    placement: AllocPlacement::default(),
+                    gap_stick_spread: BTreeMap::new(),
+                    alloc_users: vec![NodeId(999)],
+                },
+            );
+            self.alloc_nodes.insert(alloc, node);
+            if let Some(memory) = component_memory(component) {
+                self.in_memory.insert((origin, memory), alloc);
+            }
+            alloc
+        }
+
+        fn mint(&mut self) -> u32 {
+            self.next += 1;
+            self.next
+        }
+    }
+
+    impl Dsc for Cloning {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            unimplemented!("no layout is read")
+        }
+    }
+
+    impl DscAllocations for Cloning {
+        fn own_lds_idx(&self, _lds: LdsIdx) -> LdsIdx {
+            unimplemented!("no lds is renamed")
+        }
+
+        fn allocation_in(&self, origin: DataOrigin, storage: DdcMemory) -> Option<AllocId> {
+            self.in_memory.get(&(origin, storage)).copied()
+        }
+
+        fn set_allocation_in(&mut self, _lds: LdsIdx, _storage: DdcMemory, _alloc: AllocId) {
+            unimplemented!("no allocation is placed")
+        }
+
+        fn alloc_users(&self, _alloc: AllocId) -> Vec<NodeId> {
+            unimplemented!("no user list is read")
+        }
+
+        fn alloc_component(&self, alloc: AllocId) -> DdcMemory {
+            component_memory(self.allocs[&alloc].component).expect("a memory component")
+        }
+
+        fn alloc_origin(&self, _alloc: AllocId) -> DataOrigin {
+            unimplemented!("no origin is read")
+        }
+
+        fn alloc_node(&self, alloc: AllocId) -> NodeId {
+            self.alloc_nodes[&alloc]
+        }
+
+        fn reduce_users_or_delete(&mut self, _use: AllocationUse, _can: CanDelete) -> bool {
+            unimplemented!("no allocation is deleted")
+        }
+    }
+
+    impl AllocationsByNode for Cloning {
+        fn allocation_of(&self, node: NodeId) -> Option<AllocId> {
+            self.alloc_nodes
+                .iter()
+                .find(|&(_, &at)| at == node)
+                .map(|(&alloc, _)| alloc)
+        }
+    }
+
+    impl AllocateCloning for Cloning {
+        fn allocate(&self, alloc: AllocId) -> AllocateNode {
+            self.allocs[&alloc].clone()
+        }
+
+        fn clone_allocate_after(&mut self, alloc: AllocId, body: AllocateNode) -> AllocId {
+            let clone = AllocId(self.mint());
+            let node = NodeId(self.mint());
+            self.placed.push((self.alloc_nodes[&alloc], node));
+            self.allocs.insert(clone, body);
+            self.alloc_nodes.insert(clone, node);
+            clone
+        }
+
+        fn set_temp_storage_for_compute(&mut self, alloc: AllocId, compute: NodeName) {
+            self.temp_storage.push((alloc, compute));
+        }
+    }
+
+    impl ComputeCloning for Cloning {
+        fn compute(&self, node: NodeId) -> ComputeNode {
+            self.computes[&node].clone()
+        }
+
+        fn clone_compute_after(&mut self, node: NodeId, body: ComputeNode) -> NodeId {
+            let clone = NodeId(self.mint());
+            self.placed.push((node, clone));
+            self.computes.insert(clone, body);
+            clone
+        }
+    }
+
+    impl ComponentAllocations for Cloning {
+        fn has_mem_org(&self, lds: LdsIdx, storage: SenComponent) -> bool {
+            self.mem_org.contains_key(&(lds, storage))
+        }
+
+        fn copy_mem_org_without_allocation(
+            &mut self,
+            lds: LdsIdx,
+            _from: SenComponent,
+            to: SenComponent,
+        ) {
+            self.mem_org.insert((lds, to), None);
+        }
+
+        fn mem_org_allocation(&self, lds: LdsIdx, storage: SenComponent) -> Option<AllocId> {
+            self.mem_org.get(&(lds, storage)).copied().flatten()
+        }
+
+        fn set_mem_org_allocation(&mut self, lds: LdsIdx, storage: SenComponent, alloc: AllocId) {
+            self.mem_org.insert((lds, storage), Some(alloc));
+        }
+
+        fn has_constant_allocation(&self, constant: ConstIdx, storage: SenComponent) -> bool {
+            self.constants.contains_key(&(constant, storage))
+        }
+
+        fn set_constant_allocation(
+            &mut self,
+            constant: ConstIdx,
+            storage: SenComponent,
+            alloc: AllocId,
+        ) {
+            self.constants.insert((constant, storage), alloc);
+        }
+    }
+
+    impl ScheduleSurgery for Cloning {
+        fn node_name(&self, _node: NodeId) -> NodeName {
+            unimplemented!("no name is read off the tree")
+        }
+
+        fn set_node_name(&mut self, _node: NodeId, _name: NodeName) {
+            unimplemented!("a clone carries its own name")
+        }
+
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            unimplemented!("the placement is the carrier's")
+        }
+
+        fn owner_loop(&self, _node: NodeId) -> Option<LoopId> {
+            unimplemented!("no loop is walked")
+        }
+
+        fn transfer(&self, _node: NodeId) -> TransferNode {
+            unimplemented!("no transfer is cloned here")
+        }
+
+        fn loop_num(&self, _loop_node: LoopId) -> DatastageId {
+            unimplemented!("no loop is read")
+        }
+
+        fn loop_den(&self, _loop_node: LoopId) -> DatastageId {
+            unimplemented!("no loop is read")
+        }
+
+        fn loop_dims(&self, _loop_node: LoopId) -> LoopDims {
+            unimplemented!("no loop is read")
+        }
+
+        fn is_parametric(&self, _loop_node: LoopId) -> bool {
+            unimplemented!("no loop is read")
+        }
+
+        fn new_loop(&mut self, _loop_node: LoopNode) -> LoopId {
+            unimplemented!("no loop is minted")
+        }
+
+        fn new_block(&mut self, _name: NodeName) -> NodeId {
+            unimplemented!("no block is minted")
+        }
+
+        fn add_child_node(&mut self, _node: NodeId, _at: InsertionPoint) {
+            unimplemented!("a clone is placed by its own cloner")
+        }
+
+        fn move_node(&mut self, _node: NodeId, _at: InsertionPoint) {
+            unimplemented!("nothing moves")
+        }
+
+        fn conditions_under(&self, _root: NodeId) -> Vec<NodeId> {
+            unimplemented!("no condition is read")
+        }
+
+        fn loop_cond(&self, _condition: NodeId) -> LoopCondComposite {
+            unimplemented!("no condition is read")
+        }
+
+        fn set_loop_cond(&mut self, _condition: NodeId, _cond: LoopCondComposite) {
+            unimplemented!("no condition is written")
+        }
+    }
+
+    impl FifoResults for Cloning {
+        fn connect_consumers(&self, _connect: Option<DataConnect>) -> Vec<FifoConsumer> {
+            unimplemented!("no consumer is walked")
+        }
+
+        fn is_opaque(&self, compute: NodeId) -> bool {
+            self.opaque.contains(&compute)
+        }
+
+        fn transfer_ends(&self, _transfer: NodeId) -> TransferEnds {
+            unimplemented!("no transfer is read")
+        }
+
+        fn insert_allocate(
+            &mut self,
+            _alloc: AllocId,
+            _node: DdcAllocateNode,
+            _at: InsertionPoint,
+        ) {
+            unimplemented!("no allocation is inserted")
+        }
+
+        fn set_dst_storage(&mut self, _transfer: NodeId, _dst: usize, _storage: SenComponent) {
+            unimplemented!("no destination is repointed")
+        }
+
+        fn set_src_storage(&mut self, _transfer: NodeId, _storage: SenComponent) {
+            unimplemented!("no source is repointed")
+        }
+
+        fn set_compute_input_unit(&mut self, _compute: NodeId, _input: usize, _unit: SenComponent) {
+            unimplemented!("a clone carries its own units")
+        }
+
+        fn add_alloc_user(&mut self, alloc: AllocId, user: NodeId) {
+            self.users.push((alloc, user));
+        }
+    }
+
+    impl MintedConnects for Cloning {
+        fn intern_connect(&mut self, connect: MintedConnect) -> DataConnect {
+            self.minted.push(connect.spelling());
+            DataConnect::OuttensorToSfp
+        }
+    }
+
+    impl CensusNodes for Cloning {
+        fn census_node(&self, node: NodeIndex) -> NodeId {
+            self.census[&node]
+        }
+    }
+
+    fn operand(unit: SenComponent, connect: Option<DataConnect>, lds: Option<u32>) -> Operand {
+        Operand {
+            unit,
+            storage: unit,
+            data: DataInfo {
+                data_connect: connect,
+                my_lds_idx: lds.map(LdsIdx),
+                constant_id: None,
+                latch_data_id: None,
+            },
+        }
+    }
+
+    fn compute(ex_unit: SenComponent, inputs: Vec<Operand>, outputs: Vec<Operand>) -> ComputeNode {
+        ComputeNode {
+            name: NodeName("c0".to_string()),
+            op: DdlComputeType::Macc,
+            ex_unit,
+            inputs,
+            outputs,
+            num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
+        }
+    }
+
+    #[test]
+    fn an_allocation_clone_registers_itself_under_the_toggled_component_and_fills_its_mem_org() {
+        // The vendor's own labeled-DS case: a PELRF allocation of lds 1, registered in
+        // `newAllocations_[PELRF]` and holding the `memOrg_` entry for its own component.
+        let mut dsc = Cloning::default();
+        let lds = LdsIdx(1);
+        let origin = DataOrigin::LabeledDs(lds);
+        let alloc = dsc.with_alloc(SenComponent::Pelrf, origin);
+        dsc.mem_org.insert((lds, SenComponent::Pelrf), Some(alloc));
+        let node = dsc.alloc_nodes[&alloc];
+
+        let mut metadata = Metadata::default();
+        metadata.new_allocations.insert(
+            DdcMemory::PeLrf,
+            Allocation {
+                lds_idx_and_alloc_node: BTreeMap::from([(lds, alloc)]),
+                ..Allocation::default()
+            },
+        );
+
+        let split = PeSfpAllocateSplit::of(&dsc, &metadata, alloc).expect("cloneable");
+        assert_eq!(split.origin(), origin);
+        assert_eq!(split.toggled(), SenComponent::Sfplrf);
+        let clone = clone_allocate_for_pe_sfp_work_split(
+            &mut dsc,
+            &mut metadata,
+            split,
+            SkipMetadataUpdate::No,
+        )
+        .expect("cloned");
+
+        // The clone's own state: the suffix, the toggled component, no users and no temp storage.
+        let body = &dsc.allocs[&clone];
+        assert_eq!(body.name, NodeName("a1_sfp_parallel".to_string()));
+        assert_eq!(body.component, SenComponent::Sfplrf);
+        assert_eq!(body.lds, Some(lds));
+        assert!(body.alloc_users.is_empty());
+        assert_eq!(body.temp_storage_for_compute, None);
+
+        // Placed immediately after the original, and recorded as its clone.
+        let clone_node = dsc.alloc_nodes[&clone];
+        assert_eq!(dsc.placed, vec![(node, clone_node)]);
+        assert_eq!(
+            metadata.node_cloning_map,
+            BTreeMap::from([(node, vec![clone_node])])
+        );
+
+        // Registered under SFPLRF, and the labeled DS's SFPLRF slot now holds it.
+        assert_eq!(
+            metadata.new_allocations[&DdcMemory::SfpLrf].lds_idx_and_alloc_node,
+            BTreeMap::from([(lds, clone)])
+        );
+        assert_eq!(dsc.mem_org[&(lds, SenComponent::Sfplrf)], Some(clone));
+
+        // And a second attempt refuses, because the first recorded itself.
+        assert!(PeSfpAllocateSplit::of(&dsc, &metadata, alloc).is_none());
+    }
+
+    #[test]
+    fn a_pe_allocations_clone_runs_on_sfp_and_is_still_named_pe_parallel() {
+        // ⚠️ THE TRAP: the suffix is `"_sfp_parallel"` for PELRF and PESTATE ALONE, so a PE
+        // allocation's clone toggles to SFP under the OPPOSITE name. PE has no `DdcMemory`
+        // spelling, which is why this is the `skipMetadataUpdate` path.
+        let mut dsc = Cloning::default();
+        let lds = LdsIdx(2);
+        let alloc = dsc.with_alloc(SenComponent::Pe, DataOrigin::LabeledDs(lds));
+        dsc.mem_org.insert((lds, SenComponent::Pe), Some(alloc));
+
+        let mut metadata = Metadata::default();
+        let split = PeSfpAllocateSplit::of(&dsc, &metadata, alloc).expect("cloneable");
+        let clone = clone_allocate_for_pe_sfp_work_split(
+            &mut dsc,
+            &mut metadata,
+            split,
+            SkipMetadataUpdate::Yes,
+        )
+        .expect("cloned");
+
+        assert_eq!(
+            dsc.allocs[&clone].name,
+            NodeName("a1_pe_parallel".to_string())
+        );
+        assert_eq!(dsc.allocs[&clone].component, SenComponent::Sfp);
+
+        // Nothing was registered, and the fresh SFP `memOrg_` entry was copied before being filled.
+        assert!(metadata.new_allocations.is_empty());
+        assert_eq!(dsc.mem_org[&(lds, SenComponent::Sfp)], Some(clone));
+    }
+
+    #[test]
+    fn a_compute_clones_suffix_every_named_connect_even_where_the_unit_did_not_toggle() {
+        // ⚠️ THE TRAP: input 0 sits on LX, which `toggleMap` has no entry for, and its connect takes
+        // the suffix all the same.
+        let mut dsc = Cloning::default();
+        let lds = LdsIdx(3);
+        let origin = DataOrigin::LabeledDs(lds);
+        let read = dsc.with_alloc(SenComponent::Sfplrf, origin);
+        let written = dsc.with_alloc(SenComponent::Pelrf, origin);
+        let node = NodeId(100);
+        dsc.computes.insert(
+            node,
+            compute(
+                SenComponent::Pe,
+                vec![
+                    operand(SenComponent::Lx, Some(DataConnect::ArfPt), Some(lds.0)),
+                    operand(
+                        SenComponent::Pelrf,
+                        Some(DataConnect::ArfPtsum),
+                        Some(lds.0),
+                    ),
+                ],
+                vec![operand(SenComponent::Sfplrf, None, Some(lds.0))],
+            ),
+        );
+
+        let mut metadata = Metadata::default();
+        let body = dsc.computes[&node].clone();
+        let split = PeSfpComputeSplit::of(&metadata, node, &body).expect("cloneable");
+        let clone =
+            clone_compute_for_pe_sfp_work_split(&mut dsc, &mut metadata, split).expect("cloned");
+
+        let cloned = &dsc.computes[&clone];
+        assert_eq!(cloned.name, NodeName("c0_sfp_parallel".to_string()));
+        assert_eq!(cloned.ex_unit, SenComponent::Sfp);
+
+        // Input 0's unit is untouched and its connect is not; input 1 and the output both toggle.
+        assert_eq!(cloned.inputs[0].unit, SenComponent::Lx);
+        assert_eq!(cloned.inputs[1].unit, SenComponent::Sfplrf);
+        assert_eq!(cloned.outputs[0].unit, SenComponent::Pelrf);
+        assert_eq!(
+            dsc.minted,
+            vec![
+                "arf_pt_sfp_parallel".to_string(),
+                "arf_ptsum_sfp_parallel".to_string()
+            ]
+        );
+
+        // The toggled operands' allocations gained the clone as a user; the untoggled LX one did not.
+        assert_eq!(dsc.users, vec![(read, clone), (written, clone)]);
+        assert_eq!(dsc.placed, vec![(node, clone)]);
+        assert_eq!(
+            metadata.node_cloning_map,
+            BTreeMap::from([(node, vec![clone])])
+        );
+    }
+
+    #[test]
+    fn an_opaque_computes_clone_repoints_every_register_allocation_at_its_sole_clone() {
+        let mut dsc = Cloning::default();
+        let origin = DataOrigin::LabeledDs(LdsIdx(4));
+        let internal = dsc.with_alloc(SenComponent::Pelrf, origin);
+        let internal_clone = dsc.with_alloc(SenComponent::Sfplrf, origin);
+        let in_out = dsc.with_alloc(SenComponent::Pelrf, DataOrigin::Constant(ConstIdx(0)));
+        let in_out_clone = dsc.with_alloc(SenComponent::Sfplrf, DataOrigin::Constant(ConstIdx(1)));
+        let node = NodeId(200);
+        dsc.opaque.insert(node);
+        let mut body = compute(SenComponent::Sfp, Vec::new(), Vec::new());
+        body.instr_attribute.input_data_connects = vec![DataConnect::ArfPt];
+        dsc.computes.insert(node, body.clone());
+
+        let mut metadata = Metadata::default();
+        // Both register allocations were themselves cloned exactly once, which is the `DT_CHECK`.
+        metadata.node_cloning_map.insert(
+            dsc.alloc_nodes[&internal],
+            vec![dsc.alloc_nodes[&internal_clone]],
+        );
+        metadata.node_cloning_map.insert(
+            dsc.alloc_nodes[&in_out],
+            vec![dsc.alloc_nodes[&in_out_clone]],
+        );
+        metadata.opaque_ops.insert(
+            node,
+            OpaqueOp {
+                in_out_reg_allocs: BTreeMap::from([(RegName::A00, in_out)]),
+                internal_reg_alloc: Some(internal),
+                ..OpaqueOp::default()
+            },
+        );
+
+        let split = PeSfpComputeSplit::of(&metadata, node, &body).expect("cloneable");
+        let clone =
+            clone_compute_for_pe_sfp_work_split(&mut dsc, &mut metadata, split).expect("cloned");
+
+        // The clone's own metadata entry names the CLONED registers, not the originals.
+        let op = &metadata.opaque_ops[&clone];
+        assert_eq!(op.internal_reg_alloc, Some(internal_clone));
+        assert_eq!(
+            op.in_out_reg_allocs,
+            BTreeMap::from([(RegName::A00, in_out_clone)])
+        );
+
+        // The internal allocation is the clone's temp storage, and both registers gained it as user.
+        assert_eq!(
+            dsc.temp_storage,
+            vec![(internal_clone, NodeName("c0_pe_parallel".to_string()))]
+        );
+        assert_eq!(
+            dsc.users,
+            vec![(internal_clone, clone), (in_out_clone, clone)]
+        );
+        assert_eq!(
+            metadata.new_allocations[&DdcMemory::SfpLrf].comp_and_alloc_node,
+            BTreeMap::from([(clone, internal_clone)])
+        );
+
+        // The instruction's own data connects took the suffix; no operand did, there being none.
+        assert_eq!(dsc.minted, vec!["arf_pt_pe_parallel".to_string()]);
+        assert_eq!(
+            dsc.computes[&clone].instr_attribute.input_data_connects,
+            vec![DataConnect::OuttensorToSfp]
+        );
+    }
+
+    #[test]
+    fn a_datastream_is_external_through_its_allocation_or_through_either_end_of_its_connect() {
+        let mut dsc = Cloning::default();
+        let lds = LdsIdx(5);
+        let alloc = dsc.with_alloc(SenComponent::Pelrf, DataOrigin::LabeledDs(lds));
+        dsc.census.insert(NodeIndex(0), NodeId(700));
+        dsc.census.insert(NodeIndex(1), NodeId(701));
+
+        let data = DataInfo {
+            data_connect: Some(DataConnect::ArfPt),
+            my_lds_idx: Some(lds),
+            constant_id: None,
+            latch_data_id: None,
+        };
+        let mut metadata = Metadata::default();
+        let mut ends = Ends::default();
+        ends.insert_producer(NodeIndex(0));
+        ends.insert_consumer(NodeIndex(1));
+        metadata.data_connects.insert(DataConnect::ArfPt, ends);
+
+        // Nothing external yet.
+        assert!(!storage_or_datastream_is_external(
+            &dsc,
+            &metadata,
+            data,
+            SenComponent::Pelrf,
+            StreamDirection::Incoming
+        ));
+
+        // The connect's PRODUCER is external, which only the incoming question reaches.
+        metadata.external_nodes.insert(NodeId(700));
+        assert!(storage_or_datastream_is_external(
+            &dsc,
+            &metadata,
+            data,
+            SenComponent::Pelrf,
+            StreamDirection::Incoming
+        ));
+        assert!(!storage_or_datastream_is_external(
+            &dsc,
+            &metadata,
+            data,
+            SenComponent::Pelrf,
+            StreamDirection::Outgoing
+        ));
+
+        // The allocation in `storage` is external, which both questions reach.
+        metadata.external_nodes.insert(dsc.alloc_nodes[&alloc]);
+        assert!(storage_or_datastream_is_external(
+            &dsc,
+            &metadata,
+            data,
+            SenComponent::Pelrf,
+            StreamDirection::Outgoing
+        ));
+
+        // ... and a DIFFERENT storage does not reach that allocation at all.
+        assert!(!storage_or_datastream_is_external(
+            &dsc,
+            &metadata,
+            data,
+            SenComponent::Sfplrf,
+            StreamDirection::Outgoing
+        ));
+    }
+
+    /// THE SIGNAL ENDS ONE TREE NAMES — entry 121's `otherEndOfTheSignals_` resolved back to nodes.
+    struct Signals(BTreeMap<NodeName, NodeId>);
+
+    impl SyncNodesByName for Signals {
+        fn node_named(&self, name: &NodeName) -> Option<NodeId> {
+            self.0.get(name).copied()
+        }
+    }
+
+    #[test]
+    fn a_sync_is_related_to_external_nodes_through_the_other_end_of_any_one_signal() {
+        let near = NodeName("sync_near".to_string());
+        let far = NodeName("sync_far".to_string());
+        let nodes = Signals(BTreeMap::from([
+            (near.clone(), NodeId(1)),
+            (far.clone(), NodeId(2)),
+        ]));
+        let node = SyncNode {
+            name: NodeName("s0".to_string()),
+            units: SyncUnits::new(SenComponent::Pe, []),
+            direction: SyncDirection::Receive,
+            strength: SyncStrength::Hard,
+            implicit_sync_ref_transfer: None,
+            other_ends: vec![near, far],
+        };
+
+        let mut metadata = Metadata::default();
+        assert!(!sync_related_to_external_nodes(&nodes, &metadata, &node));
+
+        // The SECOND end alone is external, and that is enough.
+        metadata.external_nodes.insert(NodeId(2));
+        assert!(sync_related_to_external_nodes(&nodes, &metadata, &node));
+    }
+
+    #[test]
+    fn a_node_is_related_to_comps_through_the_first_of_its_components_the_set_holds() {
+        let comps = [SenComponent::Sfp, SenComponent::Pelrf];
+
+        let mut dsc = Cloning::default();
+        let alloc = dsc.with_alloc(SenComponent::Pelrf, DataOrigin::LabeledDs(LdsIdx(1)));
+        assert_eq!(
+            is_node_related_to_comps(ComponentNode::Allocate(&dsc.allocs[&alloc]), &comps),
+            Some(SenComponent::Pelrf)
+        );
+
+        let computing = compute(SenComponent::Pe, Vec::new(), Vec::new());
+        assert_eq!(
+            is_node_related_to_comps(ComponentNode::Compute(&computing), &comps),
+            None
+        );
+
+        // A transfer's SOURCE is asked first, then each destination in turn.
+        let transfer = TransferNode {
+            name: NodeName("t0".to_string()),
+            src: operand(SenComponent::Lx, None, None),
+            dsts: Dsts::new(
+                operand(SenComponent::L0, None, None),
+                vec![operand(SenComponent::Sfp, None, None)],
+            ),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
+        };
+        assert_eq!(
+            is_node_related_to_comps(ComponentNode::Transfer(&transfer), &comps),
+            Some(SenComponent::Sfp)
+        );
+
+        assert_eq!(is_node_related_to_comps(ComponentNode::Other, &comps), None);
+    }
+
+    /// ONE SUBTREE'S LDS SLOTS, stated as the lists entry 123's walk returns.
+    #[derive(Default)]
+    struct Subtree {
+        slots: Vec<(TreeLdsSlot, Option<LdsIdx>)>,
+        opaque: Vec<NodeId>,
+        alloc_nodes: BTreeMap<AllocId, NodeId>,
+        mem_org: BTreeMap<(LdsIdx, SenComponent), Option<AllocId>>,
+        rewritten: Vec<(TreeLdsSlot, LdsIdx)>,
+    }
+
+    #[derive(Clone)]
+    struct Entry;
+
+    impl LabeledDsEntry for Entry {
+        fn recorded_lds_idx(&self) -> LdsIdx {
+            unimplemented!("no entry is read")
+        }
+
+        fn set_recorded_lds_idx(&mut self, _recorded: LdsIdx) {
+            unimplemented!("no entry is written")
+        }
+
+        fn set_reference_lds_idx(&mut self, _reference: LdsIdx) {
+            unimplemented!("no entry is written")
+        }
+    }
+
+    impl NewLabeledDs for Subtree {
+        type Entry = Entry;
+
+        fn last_lds_pos(&self) -> LdsIdx {
+            unimplemented!("no lds is inserted")
+        }
+
+        fn last_recorded_lds_idx(&self) -> LdsIdx {
+            unimplemented!("no lds is inserted")
+        }
+
+        fn set_last_recorded_lds_idx(&mut self, _recorded: LdsIdx) {
+            unimplemented!("no lds is inserted")
+        }
+
+        fn insert_lds_before_last(&mut self, _entry: Self::Entry) {
+            unimplemented!("no lds is inserted")
+        }
+
+        fn clear_mem_org(&mut self, _pos: LdsIdx) {
+            unimplemented!("entry 123 moves entries, it does not clear them")
+        }
+
+        fn mem_org_allocations(&self, _pos: LdsIdx) -> Vec<AllocId> {
+            unimplemented!("the move is asked per allocation")
+        }
+
+        fn alloc_lds_idx(&self, _alloc: AllocId) -> Option<LdsIdx> {
+            unimplemented!("the slot carries the index")
+        }
+
+        fn set_alloc_lds_idx(&mut self, _alloc: AllocId, _lds: LdsIdx) {
+            unimplemented!("the allocate slot is what is rewritten")
+        }
+
+        fn tree_lds_slots(&self) -> Vec<(TreeLdsSlot, Option<LdsIdx>)> {
+            unimplemented!("entry 123 walks ONE subtree")
+        }
+
+        fn set_tree_lds(&mut self, slot: TreeLdsSlot, lds: LdsIdx) {
+            self.rewritten.push((slot, lds));
+        }
+
+        fn opaque_computes(&self) -> Vec<NodeId> {
+            unimplemented!("entry 123 walks ONE subtree")
+        }
+    }
+
+    impl AllocationsByNode for Subtree {
+        fn allocation_of(&self, node: NodeId) -> Option<AllocId> {
+            self.alloc_nodes
+                .iter()
+                .find(|&(_, &at)| at == node)
+                .map(|(&alloc, _)| alloc)
+        }
+    }
+
+    impl SubtreeLds for Subtree {
+        fn tree_lds_slots_under(&self, _start: NodeId) -> Vec<(TreeLdsSlot, Option<LdsIdx>)> {
+            self.slots.clone()
+        }
+
+        fn opaque_computes_under(&self, _start: NodeId) -> Vec<NodeId> {
+            self.opaque.clone()
+        }
+
+        fn mem_org_storages_of(&self, lds: LdsIdx, alloc: AllocId) -> Vec<SenComponent> {
+            self.mem_org
+                .iter()
+                .filter(|&(&(at, _), &held)| at == lds && held == Some(alloc))
+                .map(|(&(_, storage), _)| storage)
+                .collect()
+        }
+
+        fn move_mem_org(&mut self, from: LdsIdx, to: LdsIdx, storage: SenComponent) {
+            let held = self.mem_org.insert((from, storage), None);
+            self.mem_org.insert((to, storage), held.flatten());
+        }
+    }
+
+    #[test]
+    fn a_new_lds_index_reaches_every_operand_the_allocation_and_the_metadata_that_names_it() {
+        // ⛔ THE DIVERGENCE UNDER TEST: `new_lds` is ABOVE `old_lds`, which is exactly the case the
+        // reference's insert-while-iterating loses.
+        let old = LdsIdx(1);
+        let new = LdsIdx(5);
+        let alloc = AllocId(7);
+        let allocating = NodeId(10);
+        let computing = NodeId(11);
+        let transferring = NodeId(12);
+        let untouched = TreeLdsSlot::Transfer(transferring, OperandPos::Output(0));
+        let mut dsc = Subtree {
+            slots: vec![
+                (
+                    TreeLdsSlot::Compute(computing, OperandPos::Input(1)),
+                    Some(old),
+                ),
+                (untouched, Some(LdsIdx(9))),
+                (TreeLdsSlot::Allocate(allocating), Some(old)),
+            ],
+            opaque: vec![computing],
+            alloc_nodes: BTreeMap::from([(alloc, allocating)]),
+            mem_org: BTreeMap::from([((old, SenComponent::Pelrf), Some(alloc))]),
+            rewritten: Vec::new(),
+        };
+
+        let mut metadata = Metadata::default();
+        metadata.opaque_ops.insert(
+            computing,
+            OpaqueOp {
+                lds_idx: Some(old),
+                ..OpaqueOp::default()
+            },
+        );
+        metadata.new_allocations.insert(
+            DdcMemory::PeLrf,
+            Allocation {
+                lds_idx_and_alloc_node: BTreeMap::from([(old, alloc)]),
+                ..Allocation::default()
+            },
+        );
+
+        update_nodes_with_new_lds(&mut dsc, &mut metadata, new, old, NodeId(0));
+
+        // Every slot HOLDING the old index was rewritten, and the one holding another was not.
+        assert_eq!(
+            dsc.rewritten,
+            vec![
+                (TreeLdsSlot::Compute(computing, OperandPos::Input(1)), new),
+                (TreeLdsSlot::Allocate(allocating), new)
+            ]
+        );
+        assert!(!dsc.rewritten.iter().any(|&(slot, _)| slot == untouched));
+
+        // The opaque op's own index moved, and so did the allocation's `memOrg_` entry.
+        assert_eq!(metadata.opaque_ops[&computing].lds_idx, Some(new));
+        assert_eq!(dsc.mem_org[&(old, SenComponent::Pelrf)], None);
+        assert_eq!(dsc.mem_org[&(new, SenComponent::Pelrf)], Some(alloc));
+
+        // ⛔ AND THE REKEY SURVIVES: the new key is the only one left.
+        assert_eq!(
+            metadata.new_allocations[&DdcMemory::PeLrf].lds_idx_and_alloc_node,
+            BTreeMap::from([(new, alloc)])
+        );
     }
 }

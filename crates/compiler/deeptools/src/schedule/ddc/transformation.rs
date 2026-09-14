@@ -212,7 +212,10 @@ use crate::units::{Core, NumFolds};
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
 use crate::schedule::ddc::transformation_util::{
-    NodeCloning, PeSfpTransferSplit, clone_transfer_for_pe_sfp_work_split,
+    AllocateCloning, AllocationsByNode, ComponentAllocations, ComputeCloning, NodeCloning,
+    PeSfpAllocateSplit, PeSfpComputeSplit, PeSfpTransferSplit,
+    clone_allocate_for_pe_sfp_work_split, clone_compute_for_pe_sfp_work_split,
+    clone_transfer_for_pe_sfp_work_split,
 };
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -2708,16 +2711,23 @@ pub trait PeSfpWorkSplit: NodeCloning {
 /// is a `std::cerr` line and this pass has no other answer.
 /// ⚠️ EVERY CLONE'S ANSWER IS DISCARDED, the transfer arm's `nullptr` included, so a transfer that
 /// cannot be unrolled or was already cloned is silently left alone.
-/// ⛔ ENTRIES 118 AND 119 ARE NOT PORTED — their anchors are still open in
-/// [`super::transformation_util`], so those two arms `todo!` NAMING them rather than silently
-/// narrowing this pass to transfers.
+/// ⛔ AN ALLOCATE NODE THAT IS NOT AN ALLOCATION IS LEFT ALONE, which is the one refusal this pass
+/// adds to the three clones' own: the walk names schedule nodes and entry 118 takes the allocation.
 pub fn perform_pe_sfp_work_split<S, D>(
     tree: &mut S,
     stages: &mut DataStages<D>,
     metadata: &mut Metadata,
 ) -> bool
 where
-    S: PeSfpWorkSplit + FifoResults + Allocations + TransferUnrolling + MintedConnects + ?Sized,
+    S: PeSfpWorkSplit
+        + FifoResults
+        + Allocations
+        + TransferUnrolling
+        + MintedConnects
+        + AllocateCloning
+        + ComponentAllocations
+        + ComputeCloning
+        + ?Sized,
     D: Default,
 {
     if !tree.has_pe_sfp_split() {
@@ -2726,7 +2736,11 @@ where
     for candidate in tree.split_candidates() {
         match candidate {
             PeSfpSplitNode::Allocate(node, skip) => {
-                todo!("e118_cloneForPeSfpWorkSplit({node:?}, {skip:?})")
+                if let Some(alloc) = tree.allocation_of(node) {
+                    if let Some(split) = PeSfpAllocateSplit::of(tree, metadata, alloc) {
+                        let _ = clone_allocate_for_pe_sfp_work_split(tree, metadata, split, skip);
+                    }
+                }
             }
             PeSfpSplitNode::Transfer(node) => {
                 let body = ScheduleSurgery::transfer(tree, node);
@@ -2734,7 +2748,12 @@ where
                     let _ = clone_transfer_for_pe_sfp_work_split(tree, stages, metadata, split);
                 }
             }
-            PeSfpSplitNode::Compute(node) => todo!("e119_cloneForPeSfpWorkSplit({node:?})"),
+            PeSfpSplitNode::Compute(node) => {
+                let body = ComputeCloning::compute(tree, node);
+                if let Some(split) = PeSfpComputeSplit::of(metadata, node, &body) {
+                    let _ = clone_compute_for_pe_sfp_work_split(tree, metadata, split);
+                }
+            }
         }
     }
     true
@@ -3924,10 +3943,12 @@ mod tests_e300 {
 #[cfg(test)]
 mod tests_e338 {
     use super::*;
+    use crate::schedule::ddc::fold::ConstIdx;
     use crate::schedule::ddc::fold::StoredStream;
     use crate::schedule::ddc::transformation_util::{
-        DdcAllocateNode, FifoConsumer, LoopNode, TransferEnds,
+        AllocationUse, CanDelete, DdcAllocateNode, FifoConsumer, LoopNode, TransferEnds,
     };
+    use crate::schedule::dsc2::AllocateNode;
     use crate::schedule::dsc2::Dsc as Dsc2;
     use std::cell::Cell;
 
@@ -4051,6 +4072,98 @@ mod tests_e338 {
     impl MintedConnects for Split {
         fn intern_connect(&mut self, _connect: MintedConnect) -> DataConnect {
             unimplemented!("no connect is minted")
+        }
+    }
+
+    // ⭐ THE CLONE VOCABULARY ENTRIES 118 AND 119 REACH THE TREE THROUGH. This tree holds ONE
+    // transfer, so the walk hands the pass no allocate and no compute and none of it is reached.
+    impl DscAllocations for Split {
+        fn own_lds_idx(&self, _lds: LdsIdx) -> LdsIdx {
+            unimplemented!("no lds is renamed")
+        }
+        fn allocation_in(&self, _origin: DataOrigin, _storage: DdcMemory) -> Option<AllocId> {
+            unimplemented!("no allocation is reached")
+        }
+        fn set_allocation_in(&mut self, _lds: LdsIdx, _storage: DdcMemory, _alloc: AllocId) {
+            unimplemented!("no allocation is placed")
+        }
+        fn alloc_users(&self, _alloc: AllocId) -> Vec<NodeId> {
+            unimplemented!("no user list is read")
+        }
+        fn alloc_component(&self, _alloc: AllocId) -> DdcMemory {
+            unimplemented!("no allocation is reached")
+        }
+        fn alloc_origin(&self, _alloc: AllocId) -> DataOrigin {
+            unimplemented!("no allocation is reached")
+        }
+        fn alloc_node(&self, _alloc: AllocId) -> NodeId {
+            unimplemented!("no allocation is reached")
+        }
+        fn reduce_users_or_delete(&mut self, _use: AllocationUse, _can: CanDelete) -> bool {
+            unimplemented!("no allocation is deleted")
+        }
+    }
+
+    impl AllocationsByNode for Split {
+        fn allocation_of(&self, _node: NodeId) -> Option<AllocId> {
+            unimplemented!("the walk hands this pass no allocate node")
+        }
+    }
+
+    impl AllocateCloning for Split {
+        fn allocate(&self, _alloc: AllocId) -> AllocateNode {
+            unimplemented!("no allocation is cloned")
+        }
+        fn clone_allocate_after(&mut self, _alloc: AllocId, _body: AllocateNode) -> AllocId {
+            unimplemented!("no allocation is cloned")
+        }
+        fn set_temp_storage_for_compute(&mut self, _alloc: AllocId, _compute: NodeName) {
+            unimplemented!("no allocation is cloned")
+        }
+    }
+
+    impl ComputeCloning for Split {
+        fn compute(&self, _node: NodeId) -> ComputeNode {
+            unimplemented!("the walk hands this pass no compute node")
+        }
+        fn clone_compute_after(&mut self, _node: NodeId, _body: ComputeNode) -> NodeId {
+            unimplemented!("no compute is cloned")
+        }
+    }
+
+    impl ComponentAllocations for Split {
+        fn has_mem_org(&self, _lds: LdsIdx, _storage: SenComponent) -> bool {
+            unimplemented!("no mem org is reached")
+        }
+        fn copy_mem_org_without_allocation(
+            &mut self,
+            _lds: LdsIdx,
+            _from: SenComponent,
+            _to: SenComponent,
+        ) {
+            unimplemented!("no mem org is reached")
+        }
+        fn mem_org_allocation(&self, _lds: LdsIdx, _storage: SenComponent) -> Option<AllocId> {
+            unimplemented!("no mem org is reached")
+        }
+        fn set_mem_org_allocation(
+            &mut self,
+            _lds: LdsIdx,
+            _storage: SenComponent,
+            _alloc: AllocId,
+        ) {
+            unimplemented!("no mem org is reached")
+        }
+        fn has_constant_allocation(&self, _constant: ConstIdx, _storage: SenComponent) -> bool {
+            unimplemented!("no constant is reached")
+        }
+        fn set_constant_allocation(
+            &mut self,
+            _constant: ConstIdx,
+            _storage: SenComponent,
+            _alloc: AllocId,
+        ) {
+            unimplemented!("no constant is reached")
         }
     }
 
