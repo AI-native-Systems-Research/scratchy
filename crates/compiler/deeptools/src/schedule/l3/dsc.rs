@@ -1683,7 +1683,7 @@ pub struct DataStages {
 /// [`DataStage`] would reopen every one of them. This stage HAS no extents, so [`DataStages::at`]
 /// answers [`None`] for it — which is what `primaryDimToVal_st` answers for each of its dims — and
 /// the two things the reference does write are reachable by name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EmptyStage {
     /// `ss_.name_`, which is the stage's index spelled out.
     pub name: StageName,
@@ -1746,6 +1746,9 @@ impl DataStages {
 
     /// `dataStageParam_[index] = stage`.
     pub fn set(&mut self, index: DatastageId, stage: DataStage) {
+        // ⭐ THE BARE ENTRY [`Self::mint_one_page`] LEFT IS REPLACED AND NOT SHADOWED: the reference
+        // holds ONE `dataStageParam_`, so filling an index cannot leave an empty stage beside it.
+        self.empty.remove(&index);
         match index {
             DATA_STAGE_CORE => self.core = stage,
             DATA_STAGE_CHUNK => self.chunk = stage,
@@ -1810,10 +1813,36 @@ impl DataStages {
     pub fn one_page(&self, index: DatastageId) -> Option<OnePageStage> {
         self.at(index).map(|_| OnePageStage(index))
     }
+
+    /// `dataStageParam_.count(index)` — whether this DSC holds a stage under that index AT ALL, the
+    /// extent-less ones included, which is the test `getNewDataStageIndex` searches on.
+    #[must_use]
+    pub fn holds(&self, index: DatastageId) -> bool {
+        self.at(index).is_some() || self.empty.contains_key(&index)
+    }
+
+    /// `dsc.dataStageParam_[dataStageOnePageIdx];` — the BARE DEFAULT INSERT `getNewDataStageIndex`
+    /// ends on (`L3DlOpsScheduler.cpp:6622`), and the witness that insert makes true.
+    ///
+    /// ⭐⭐ A MINT AND NOT [`Self::one_page`], WHICH CANNOT ANSWER YET: entry 335 needs the witness
+    /// in order to WRITE the stage, and `getNewDataStageIndex` is what makes the index name an entry
+    /// before it does. The name is default-constructed exactly as the reference's `operator[]` leaves
+    /// it; entry 335 writes `"1page"` over it.
+    pub fn mint_one_page(&mut self, index: DatastageId) -> OnePageStage {
+        self.empty.entry(index).or_default();
+        OnePageStage(index)
+    }
+
+    /// The same bare insert for `dataStageIbrIdx` (`:6630`), and its witness — entry 334 writes
+    /// `"ibr"` over the default name.
+    pub fn mint_ibr(&mut self, index: DatastageId) -> IbrStage {
+        self.empty.entry(index).or_default();
+        IbrStage(index)
+    }
 }
 
-/// AN IBR DATA-STAGE INDEX THAT NAMES AN EXISTING ENTRY — minted by [`DataStages::ibr`] and by
-/// nothing else, as [`SuperChunkStage`] is.
+/// AN IBR DATA-STAGE INDEX THAT NAMES AN EXISTING ENTRY — minted by [`DataStages::ibr`] and
+/// [`DataStages::mint_ibr`] and by nothing else, as [`SuperChunkStage`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IbrStage(DatastageId);
 
