@@ -13560,6 +13560,8 @@ mod tests_e283_e295 {
         start: BTreeMap<(Core, Vec<i64>), ByteAddress>,
         offset: Option<BufferOffset>,
         indirection: Option<IndirectAlloc>,
+        /// The HBM allocate node entry 374's walk seeds itself from.
+        hbm_alloc: Option<NodeName>,
     }
 
     impl MemOrg for Org {
@@ -13584,7 +13586,7 @@ mod tests_e283_e295 {
         }
 
         fn hbm_allocation(&self) -> Option<NodeName> {
-            None
+            self.hbm_alloc.clone()
         }
 
         fn hbm_layout_dims(&self) -> Option<LayoutDims> {
@@ -15448,111 +15450,111 @@ mod tests_e283_e295 {
         assert_eq!(search(0.001), (Some(()), Some(0)));
     }
 
+    /// The output's layout order, which is all the coordinate build asks of the DSC.
+    struct OneDim;
+
+    impl Dsc for OneDim {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            LayoutDims::new(PrimaryDim::I, Vec::new())
+        }
+    }
+
+    /// A data stage half that splits nothing, so entry 229's `dimIdx < 0` fallback is the arm.
+    #[derive(Clone)]
+    struct NoSplit;
+
+    impl CoreletSliceDims for NoSplit {
+        fn first_corelet_split_dim(&self) -> Option<PrimaryDim> {
+            None
+        }
+        fn divide_for_corelets(&mut self, _dim: PrimaryDim, _corelets: CoreletsUsed) {}
+        fn comp_view_extent(&self, _dim: PrimaryDim, _comp: SenComponent) -> Option<Extent> {
+            None
+        }
+    }
+
+    /// The two seams entry 369 reaches through: one corelet slices nothing, and a broadcast dim
+    /// distributes nothing.
+    struct Seam(DataStages<NoSplit>);
+
+    impl TemporalLoopDistribution for Seam {
+        type LoopParams = ();
+
+        fn related_loops<'l>(
+            &self,
+            _dim: PrimaryDimAndKind,
+            _chain: &[LoopAndDim<'l>],
+            _pad: PadType,
+        ) -> Vec<LoopAndDim<'l>> {
+            unreachable!("a broadcast dim relates no loops")
+        }
+
+        fn distribute(
+            &self,
+            _request: &ElemArrDistribution<'_>,
+            _loop_params: &mut Self::LoopParams,
+        ) -> Vec<FoldParamInfo> {
+            unreachable!("a broadcast dim distributes nothing")
+        }
+
+        fn distributed(
+            &self,
+            _loop_params: &Self::LoopParams,
+            _loop_node: &LoopNode,
+            _dim: PrimaryDim,
+        ) -> Option<DistributedLoop> {
+            None
+        }
+    }
+
+    impl AllocCoordinateSeam for Seam {
+        fn parametric_iter_count(&self, _loop_node: &LoopNode) -> Option<FoldCardinality> {
+            None
+        }
+
+        fn comp_view(&self, _stage: DatastageId, _dim: PrimaryDim) -> Option<Extent> {
+            None
+        }
+
+        fn stage_padding(
+            &self,
+            _stage: DatastageId,
+        ) -> Option<&BTreeMap<PrimaryDim, DimPadding>> {
+            None
+        }
+    }
+
+    impl CoreletSliceSeam for Seam {
+        type Dims = NoSplit;
+
+        fn stages(&self) -> &DataStages<Self::Dims> {
+            &self.0
+        }
+
+        fn stages_mut(&mut self) -> &mut DataStages<Self::Dims> {
+            &mut self.0
+        }
+
+        fn loop_relevant(
+            &self,
+            _dim: PrimaryDimAndKind,
+            _loop_node: &LoopNode,
+            _pad: PadType,
+        ) -> bool {
+            unreachable!("one corelet slices nothing")
+        }
+
+        fn lx_below_chunk_loops(&self) -> Option<Vec<&LoopNode>> {
+            unreachable!("one corelet slices nothing")
+        }
+    }
+
     /// e369 — OUT OF SPAN, on entry 287's own cross-core reduction: the LX output's coordinate takes
     /// the custom work-slice ids of the two cores its groups END at, carries the allocation's own
     /// padding form and then the reference allocation's folds. ⛔ Any other reference node type is
     /// *"Unsupported schedule node type."*
     #[test]
     fn the_lx_output_of_a_reduction_gets_its_custom_slices_and_then_the_reference_folds() {
-        /// The output's layout order, which is all the coordinate build asks of the DSC.
-        struct OneDim;
-
-        impl Dsc for OneDim {
-            fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
-                LayoutDims::new(PrimaryDim::I, Vec::new())
-            }
-        }
-
-        /// A data stage half that splits nothing, so entry 229's `dimIdx < 0` fallback is the arm.
-        #[derive(Clone)]
-        struct NoSplit;
-
-        impl CoreletSliceDims for NoSplit {
-            fn first_corelet_split_dim(&self) -> Option<PrimaryDim> {
-                None
-            }
-            fn divide_for_corelets(&mut self, _dim: PrimaryDim, _corelets: CoreletsUsed) {}
-            fn comp_view_extent(&self, _dim: PrimaryDim, _comp: SenComponent) -> Option<Extent> {
-                None
-            }
-        }
-
-        /// The two seams entry 369 reaches through: one corelet slices nothing, and a broadcast dim
-        /// distributes nothing.
-        struct Seam(DataStages<NoSplit>);
-
-        impl TemporalLoopDistribution for Seam {
-            type LoopParams = ();
-
-            fn related_loops<'l>(
-                &self,
-                _dim: PrimaryDimAndKind,
-                _chain: &[LoopAndDim<'l>],
-                _pad: PadType,
-            ) -> Vec<LoopAndDim<'l>> {
-                unreachable!("a broadcast dim relates no loops")
-            }
-
-            fn distribute(
-                &self,
-                _request: &ElemArrDistribution<'_>,
-                _loop_params: &mut Self::LoopParams,
-            ) -> Vec<FoldParamInfo> {
-                unreachable!("a broadcast dim distributes nothing")
-            }
-
-            fn distributed(
-                &self,
-                _loop_params: &Self::LoopParams,
-                _loop_node: &LoopNode,
-                _dim: PrimaryDim,
-            ) -> Option<DistributedLoop> {
-                None
-            }
-        }
-
-        impl AllocCoordinateSeam for Seam {
-            fn parametric_iter_count(&self, _loop_node: &LoopNode) -> Option<FoldCardinality> {
-                None
-            }
-
-            fn comp_view(&self, _stage: DatastageId, _dim: PrimaryDim) -> Option<Extent> {
-                None
-            }
-
-            fn stage_padding(
-                &self,
-                _stage: DatastageId,
-            ) -> Option<&BTreeMap<PrimaryDim, DimPadding>> {
-                None
-            }
-        }
-
-        impl CoreletSliceSeam for Seam {
-            type Dims = NoSplit;
-
-            fn stages(&self) -> &DataStages<Self::Dims> {
-                &self.0
-            }
-
-            fn stages_mut(&mut self) -> &mut DataStages<Self::Dims> {
-                &mut self.0
-            }
-
-            fn loop_relevant(
-                &self,
-                _dim: PrimaryDimAndKind,
-                _loop_node: &LoopNode,
-                _pad: PadType,
-            ) -> bool {
-                unreachable!("one corelet slices nothing")
-            }
-
-            fn lx_below_chunk_loops(&self) -> Option<Vec<&LoopNode>> {
-                unreachable!("one corelet slices nothing")
-            }
-        }
-
         let (sdsc, dsc) = a_cross_core_reduction();
         let mut reference = Coordinate::default();
         reference.add_fold_front(
@@ -15678,6 +15680,191 @@ mod tests_e283_e295 {
                 &mut Coordinate::default(),
             ),
             None
+        );
+    }
+
+    /// e373 — OUT OF SPAN, on entry 287's own cross-core reduction: a corelet-split dim of one may not
+    /// be chunked below the WHOLE core extent, which is the reference's own FIXME. ⛔ Every dim the
+    /// corelet split does not name keeps entry 365's `defaultParam` of one.
+    #[test]
+    fn a_cross_core_reductions_corelet_split_dim_may_not_be_chunked_at_all() {
+        /// `computeOp_` naming no op func at all, which entry 365 answers with `defaultParam`.
+        struct NoOps;
+
+        impl ComputeOps for NoOps {
+            fn op_funcs(&self) -> v1::OpFuncs {
+                v1::OpFuncs::new(None, Vec::new())
+            }
+            fn set_first_op_func(&mut self, _op_func: OpFunc) {}
+        }
+
+        let (sdsc, mut dsc) = a_cross_core_reduction();
+        let mut core = dsc.data_stages.core().clone();
+        core.ss
+            .dims
+            .corelet_split_mut()
+            .insert(PrimaryDim::I, vec![Extent(4), Extent(4)]);
+        dsc.data_stages.set(DATA_STAGE_CORE, core);
+        let min = |dim| min_param_for_dim::<Target, _>(&sdsc, &dsc, &NoOps, dim);
+        assert_eq!(min(PrimaryDim::I), Some(Extent(8)));
+        assert_eq!(min(PrimaryDim::Ki), Some(DEFAULT_MIN_PARAM));
+    }
+
+    /// e374 — OUT OF SPAN, over entry 369's own coordinate build: the HBM allocation seeds the walk,
+    /// its one HBM->LX transfer user names the LX allocation, and the coordinate entry 369 builds is
+    /// WRITTEN ONTO that node. ⛔ The walk back from the LX end reaches the seed again and skips it,
+    /// so nothing is built twice.
+    #[test]
+    fn the_coordinate_propagates_from_the_hbm_allocation_onto_the_lx_one_and_no_further() {
+        /// The two allocate nodes and the one transfer between them, keyed as entry 374 asks.
+        struct CoordTree {
+            allocs: BTreeMap<NodeName, PropagatedAllocation>,
+            load: TransferNode,
+            written: Vec<(NodeId, Coordinate)>,
+        }
+
+        impl CoordPropTree for CoordTree {
+            fn allocation(&self, name: &NodeName) -> Option<PropagatedAllocation> {
+                self.allocs.get(name).cloned()
+            }
+
+            fn mem_org_allocation(&self, lds: LdsIdx, storage: SenComponent) -> Option<NodeName> {
+                self.allocs
+                    .values()
+                    .find(|held| held.alloc.lds == Some(lds) && held.alloc.component == storage)
+                    .map(|held| held.alloc.name.clone())
+            }
+
+            fn transfer(&self, node: NodeId) -> Option<TransferNode> {
+                (node == NodeId(9)).then(|| self.load.clone())
+            }
+
+            fn set_allocate_coordinate(&mut self, node: NodeId, coordinate: Coordinate) {
+                self.written.push((node, coordinate));
+            }
+        }
+
+        let (sdsc, mut dsc) = a_cross_core_reduction();
+        // `int scale = 0.5` is 0, so entry 369 takes its broadcast arm; an INPUT is not the output of
+        // a reduction, so its cross-core arm is not the one this walk reaches.
+        dsc.labeled_ds = LabeledDsList::new(
+            labeled(
+                DsType::Input,
+                LdsIdx(0),
+                &[(PrimaryDim::I, Scale::Sized(0.5))],
+                Pinning::default(),
+            ),
+            Vec::new(),
+        );
+        let mut reference = Coordinate::default();
+        reference.add_fold_front(
+            PrimaryDim::I,
+            CoordinateCategory::ElemArr,
+            FoldCardinality(4),
+            FoldLabel("kept".to_owned()),
+            FoldCoeff(1),
+            FoldCoeff(0),
+        );
+        reference.add_fold_front(
+            PrimaryDim::I,
+            CoordinateCategory::Spatial,
+            FoldCardinality(2),
+            FoldLabel("core".to_owned()),
+            FoldCoeff(8),
+            FoldCoeff(0),
+        );
+        let mut placement = AllocPlacement::default();
+        placement
+            .padding
+            .set(PrimaryDim::I, PadType::PaddedNoZeroPad);
+        let over = |num, den, dim| {
+            construct_loop_node(
+                DatastageId(num),
+                DatastageId(den),
+                LoopDims::new(
+                    PrimaryDimAndKind {
+                        dim,
+                        kind: MetaDimKind::Unpadded,
+                    },
+                    Vec::new(),
+                ),
+            )
+        };
+        let loops = vec![over(1, 2, PrimaryDim::I), over(0, 1, PrimaryDim::Ki)];
+        let held = |node: NodeId, name: &str, component: SenComponent, coordinate: Coordinate| {
+            PropagatedAllocation {
+                node,
+                alloc: AllocateNode {
+                    name: NodeName(name.to_owned()),
+                    component,
+                    lds: Some(LdsIdx(0)),
+                    const_idx: None,
+                    temp_storage_for_compute: None,
+                    layout: AllocLayout::new((PrimaryDim::I, MaxDimSize::Unset), Vec::new()),
+                    start_address: StartAddress::default(),
+                    placement: placement.clone(),
+                    gap_stick_spread: BTreeMap::new(),
+                    alloc_users: vec![NodeId(9)],
+                },
+                loops: loops.clone(),
+                coordinate,
+            }
+        };
+        let mut tree = CoordTree {
+            allocs: BTreeMap::from([
+                (
+                    NodeName("allocate_hbm".to_owned()),
+                    held(NodeId(0), "allocate_hbm", SenComponent::Hbm, reference),
+                ),
+                (
+                    NodeName("allocate_lx".to_owned()),
+                    held(
+                        NodeId(1),
+                        "allocate_lx",
+                        SenComponent::Lx,
+                        Coordinate::default(),
+                    ),
+                ),
+            ]),
+            load: create_transfer_node(
+                via(SenComponent::Hbm, SenComponent::Hbm, LdsIdx(0)),
+                via(SenComponent::L3lu, SenComponent::Lx, LdsIdx(0)),
+                &[],
+                NodeName("load".to_owned()),
+            ),
+            written: Vec::new(),
+        };
+        let org = Org {
+            hbm: true,
+            hbm_alloc: Some(NodeName("allocate_hbm".to_owned())),
+            ..Org::default()
+        };
+        let mut seam = Seam(DataStages(BTreeMap::new()));
+        assert_eq!(
+            propagate_coordinate_dsc(
+                &sdsc,
+                &dsc,
+                &OneDim,
+                &[&org],
+                &mut tree,
+                &mut seam,
+                &mut ()
+            ),
+            Some(())
+        );
+        let (node, coordinate) = tree.written.first().expect("the one node newly visited");
+        assert_eq!((tree.written.len(), *node), (1, NodeId(1)));
+        assert_eq!(
+            coordinate
+                .fold_dim(PrimaryDim::I)
+                .expect("the dim the reference shares")
+                .folds()
+                .map(|fold| (fold.label.0.clone(), fold.cardinality, fold.alpha))
+                .collect::<Vec<_>>(),
+            vec![
+                ("core".to_owned(), FoldCardinality(2), FoldCoeff(8)),
+                ("elem_arr_0".to_owned(), FoldCardinality(4), FoldCoeff(1)),
+            ]
         );
     }
 }
@@ -19322,19 +19509,166 @@ where
     Some(())
 }
 
-// crustify:todo: e373_getMinParamForDim
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1119  (15 body lines, level 6)
-//   class     : L3DlOpsScheduler
-//   original  : long L3DlOpsScheduler::getMinParamForDim(const SuperDsc& mySDsc, const DesignSpaceConfig& dsc, PrimaryDimTypes dim) const
-//   extract   : crustify-ddc/cpp/l3.cpp:8615-8632
-//   calls     : e210_isOpCrossCoreReduction, e365_getMinParamForDimFromOpFunc
+/// Replaces: e373_getMinParamForDim
+///
+/// THE SMALLEST CHUNK EXTENT ONE DIM MAY TAKE, and for a cross-core reduction's corelet-split dim it
+/// is the CORE STAGE'S WHOLE EXTENT — the reference's own FIXME, which refuses to chunk that dim at
+/// all because neither an LX-opted half-and-half split nor a work-slice psum fold can state it.
+///
+/// ⛔ [`None`] IS ENTRY 210'S REFUSAL — the LEFT operand of the `&&`, so it is reached whatever the
+/// corelet split says — as well as every one of entry 365's.
+#[must_use]
+pub fn min_param_for_dim<A: Arch, D: ComputeOps + ?Sized>(
+    sdsc: &SuperDsc,
+    dsc: &DesignSpaceConfig,
+    ops: &D,
+    dim: PrimaryDim,
+) -> Option<Extent> {
+    let core = dsc.core_stage().dims();
+    if is_op_cross_core_reduction(sdsc, dsc)? && core.corelet_split.contains_key(&dim) {
+        return core.extent(dim);
+    }
+    min_param_for_dim_from_op_func::<A, D>(dsc, ops, dim)
+}
 
-// crustify:todo: e374_propagateCoordinateDSC
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7761  (109 body lines, level 6)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::propagateCoordinateDSC(SuperDsc &mySDsc, DesignSpaceConfig &dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:8642-8752
-//   calls     : e060_getHbmAllocations, e369_buildCoordinateForAllocation
+/// ONE ALLOCATE NODE AS THE COORDINATE PROPAGATION HOLDS IT — a `dsc2::AllocateNode` with its tree
+/// identity, its enclosing loops and its `allocateCoordinates_`.
+///
+/// ⭐ BY VALUE, exactly as [`DscTransferWrites::transfer`] hands a transfer out: the walk reads the
+/// reference node's coordinate while it rewrites the target node's, and two nodes of one tree cannot
+/// be one borrow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropagatedAllocation {
+    /// The node's tree identity.
+    pub node: NodeId,
+    /// The allocate node itself — `name_`, `ldsIdx_`, `padding_` and `allocUsers_` are what is read.
+    pub alloc: AllocateNode,
+    /// `getMutableOwnerLoop()` from that node, INNERMOST FIRST and the root loop LAST.
+    pub loops: Vec<LoopNode>,
+    /// `allocateCoordinates_`.
+    pub coordinate: Coordinate,
+}
+
+/// WHAT THE COORDINATE PROPAGATION ASKS OF ONE DSC'S SCHEDULE TREE — the allocate nodes it walks
+/// between and the ONE write it performs, all `dsc2::ScheduleNode` MECHANISM rather than an L3
+/// scheduling decision.
+///
+/// ⭐ KEYED BY NAME, which is the identity [`get_hbm_allocations`] hands the walk and the one entry
+/// 053 makes distinct within a tree.
+pub trait CoordPropTree {
+    /// The `ALLOCATE` node of that name, [`None`] where the tree holds no such node.
+    fn allocation(&self, name: &NodeName) -> Option<PropagatedAllocation>;
+
+    /// `labeledDs_.at(lds).memOrg_.at(storage).allocateNode_->name_` — *"Expect a valid labeledDs_
+    /// entry."*, *"Expect the storage entry in memOrg_."* and *"Expect a valid allocate node."* as ONE
+    /// [`None`].
+    fn mem_org_allocation(&self, lds: LdsIdx, storage: SenComponent) -> Option<NodeName>;
+
+    /// `userNode->nodeType_ == TRANSFER` ANSWERED WITH THE NODE, [`None`] for every other kind.
+    fn transfer(&self, node: NodeId) -> Option<TransferNode>;
+
+    /// `allocNode->allocateCoordinates_ = coordinate`.
+    fn set_allocate_coordinate(&mut self, node: NodeId, coordinate: Coordinate);
+}
+
+/// `collectTargetNodes` — the allocate nodes on the labelled-DS ends of one allocation's HBM<->LX
+/// transfer users, less the allocation itself.
+///
+/// ⭐ `storage == HBM || storage == LX` IS DISCHARGED BY THE FILTER ABOVE IT: an end of an HBM<->LX
+/// transfer is one or the other, so `addAllocNodesToTarget`'s gate can turn nothing away.
+fn coord_prop_targets<T: CoordPropTree + ?Sized>(
+    tree: &T,
+    reference: &PropagatedAllocation,
+) -> Option<Vec<NodeName>> {
+    let mut targets = Vec::new();
+    for user in &reference.alloc.alloc_users {
+        let Some(transfer) = tree.transfer(*user) else {
+            continue;
+        };
+        let (src, dst) = (transfer.src, *transfer.dsts.first());
+        let hbm_lx = matches!(
+            (src.storage, dst.storage),
+            (SenComponent::Hbm, SenComponent::Lx) | (SenComponent::Lx, SenComponent::Hbm)
+        );
+        if !hbm_lx {
+            continue;
+        }
+        for end in [src, dst] {
+            let Some(lds) = end.data.my_lds_idx else {
+                continue;
+            };
+            let name = tree.mem_org_allocation(lds, end.storage)?;
+            if name != reference.alloc.name {
+                targets.push(name);
+            }
+        }
+    }
+    Some(targets)
+}
+
+/// Replaces: e374_propagateCoordinateDSC
+///
+/// PROPAGATES ONE DSC'S COORDINATES OUTWARD FROM ITS HBM ALLOCATIONS — a breadth-first walk over the
+/// HBM<->LX transfer users of every allocate node already reached, WRITING entry 369's coordinate
+/// onto each allocate node the walk newly visits.
+///
+/// ⛔ [`None`] IS *"Unsupported schedule node type."* and every `DT_CHECK` the seam folds into one.
+/// ⚠️ TRAP: AN ALREADY-VISITED TARGET IS SKIPPED WHOLE — neither rebuilt nor re-enqueued — so the
+/// coordinate a node keeps is the one its FIRST reference gave it, and the seed order decides which.
+pub fn propagate_coordinate_dsc<D, E, M, T>(
+    sdsc: &SuperDsc,
+    dsc: &DesignSpaceConfig,
+    layout: &D,
+    orgs: &[&M],
+    tree: &mut T,
+    env: &mut E,
+    loop_params: &mut <E as TemporalLoopDistribution>::LoopParams,
+) -> Option<()>
+where
+    D: Dsc + ?Sized,
+    E: AllocCoordinateSeam + CoreletSliceSeam + ?Sized,
+    M: MemOrg + ?Sized,
+    T: CoordPropTree + ?Sized,
+{
+    let mut visited: BTreeSet<NodeName> = BTreeSet::new();
+    let mut refs: VecDeque<NodeName> = VecDeque::new();
+    for hbm in get_hbm_allocations(orgs)? {
+        visited.insert(hbm.clone());
+        refs.push_back(hbm);
+    }
+
+    while let Some(name) = refs.pop_front() {
+        let reference = tree.allocation(&name)?;
+        for target in coord_prop_targets(tree, &reference)? {
+            if !visited.insert(target.clone()) {
+                continue;
+            }
+            refs.push_back(target.clone());
+            let node = tree.allocation(&target)?;
+            let loops = OwnerLoops::of(node.loops.iter().collect())?;
+            let ref_lds = reference.alloc.lds?;
+            let mut coordinate = node.coordinate.clone();
+            build_coordinate_for_allocation(
+                sdsc,
+                dsc,
+                layout,
+                &node.alloc,
+                node.node,
+                &loops,
+                CoordPropRefNode::Allocate(ReferenceAllocation {
+                    coordinate: &reference.coordinate,
+                    lds: ref_lds,
+                    labeled_ds: dsc.labeled_ds.at(ref_lds)?,
+                }),
+                env,
+                loop_params,
+                &mut coordinate,
+            )?;
+            tree.set_allocate_coordinate(node.node, coordinate);
+        }
+    }
+    Some(())
+}
 
 // crustify:todo: e377_getInitialChunkParams
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1382  (20 body lines, level 7)
