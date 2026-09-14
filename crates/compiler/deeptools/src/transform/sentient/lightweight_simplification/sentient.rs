@@ -325,8 +325,14 @@ fn simplify_blocks<E: ExpressionEvaluator>(
 ///
 /// ⛔ THE FIRST SWEEP REWIRES AS IT WALKS AND ERASES ONLY AFTERWARDS (`:229-231`), which is
 /// load-bearing between SIBLINGS: one loop's bound can be the loop ahead of it handing back an init.
-/// ⛔ `op == for_op` (`:211`) IS ALWAYS FALSE — every caller in the tree hands this a
-/// `dataflow.program_unit`, never a `sentient.for`.
+/// ⛔ `op == for_op` (`:211`) IS DISCHARGED BY THIS SIGNATURE, NOT BY THE CALLERS — two of the six
+/// hand the reference a `sentient.for`: e629 its loop's `getParentOp()`
+/// (`LoopSplittingAndUnrolling.cpp:1055`) and e630 the peeling `dummy_loop`
+/// (`MultiDimLoopPeeling.cpp:671`). This takes the walked BLOCK, which cannot hold the op owning it.
+/// ⚠️ DIVERGENCE: the size-zero/one test resolves the bound with `defining_op(bound, unit_body)`,
+/// inside the walked block, where `getBound().getDefiningOp<ConstantOp>()` (`:209-210`) reaches the
+/// value's own owner — and the `sentient.constant` this pass tree builds is placed in the MODULE
+/// block, outside it. A loop whose bound is a preamble constant is therefore not simplified at all.
 /// ⚠️ DIVERGENCE: the query-map builder is positioned at `getLocalOrGlobalRegion(..)`'s front block
 /// (`:277-281`); here it is the block being walked. Positioning a builder is the mechanism, the two
 /// differ only for a block inside a loop or a conditional, and [`OffsetSites::query_maps`] cannot name

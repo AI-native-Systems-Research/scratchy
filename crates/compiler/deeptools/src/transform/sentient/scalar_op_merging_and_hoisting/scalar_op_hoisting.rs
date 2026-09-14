@@ -1523,6 +1523,11 @@ struct MainIvUser {
 }
 
 /// `iter_arg.getUsers()` in block order, each entry carrying whether a `sentient.if` is its parent.
+///
+/// ⛔ THE REFERENCE'S ORDER IS THE USE LIST'S, NOT THE BLOCK'S — MLIR prepends each new use, so
+/// `getUsers()` reads newest-first and e635 can therefore offer a DIFFERENT candidate to the hoists
+/// first. The SET is the same either way, because ONE ineligible user drops the whole list
+/// (`:2205-2215`), so the two orders differ only in WHICH of several eligible adds is hoisted first.
 fn main_iv_users(
     iter_arg: Val,
     block: &[Op],

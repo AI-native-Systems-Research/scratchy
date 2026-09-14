@@ -113,7 +113,7 @@ use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
-    Op, Val, clone_ops, defining_op, replace_all_uses_with, use_count,
+    Op, Val, clone_ops, defining_op, regions_mut, regions_ref, replace_all_uses_with, use_count,
 };
 use crate::model::Model;
 use crate::units::DfirUnit;
@@ -1818,9 +1818,104 @@ pub enum IeMode {
     UnderEstimate,
 }
 
-/// THE BLOCK A LOOP SITS IN AND ITS POSITION THERE, MUTABLY — `getParentOp()`'s region, which is both
-/// the scope [`do_split_or_unroll`] rewrites and the one e629 then simplifies. [`loop_site`] answers
-/// the same question for a reader that also needs the enclosing scopes.
+/// `node_to_opt->getOperation()->getParentOp()` AS A PATH FROM THE UNIT BODY — one `(op, region)` step
+/// per level down to the region holding the loop, so the last step's op IS the parent. EMPTY when the
+/// unit body holds the loop itself and the parent is therefore the `dataflow.program_unit`.
+///
+/// ⭐ TAKEN BEFORE `doSplitOrUnroll` (`:1055`) AND STILL VALID AFTER IT: the rewrite happens strictly
+/// inside the region the last step names, so no index on the way down moves.
+fn loop_parent_path(scope: &[Op], loop_ref: ForRef, path: &mut Vec<(usize, usize)>) -> bool {
+    if scope
+        .iter()
+        .any(|op| matches!(op, Op::Sentient(ops::Op::For { iv, .. }) if *iv == loop_ref.0))
+    {
+        return true;
+    }
+    for (at, op) in scope.iter().enumerate() {
+        for (which, region) in regions_ref(op).into_iter().enumerate() {
+            path.push((at, which));
+            if loop_parent_path(region, loop_ref, path) {
+                return true;
+            }
+            path.pop();
+        }
+    }
+    false
+}
+
+/// THE BLOCK ONE [`loop_parent_path`] STEP LIST NAMES, MUTABLY.
+fn block_at_mut<'a>(scope: &'a mut Vec<Op>, path: &[(usize, usize)]) -> Option<&'a mut Vec<Op>> {
+    let Some((&(at, which), rest)) = path.split_first() else {
+        return Some(scope);
+    };
+    let mut regions = regions_mut(scope.get_mut(at)?);
+    if which >= regions.len() {
+        return None;
+    }
+    block_at_mut(regions.swap_remove(which), rest)
+}
+
+/// `runLightWeightSimplifications(const_builder, parentOp)` (`:1066-1068`) — the WHOLE parent op,
+/// which is EVERY one of its regions and not only the one the rewrite touched.
+///
+/// ⛔ A `sentient.if` PARENT HAS TWO REGIONS: simplifying only the one the chosen loop sat in leaves
+/// the sibling arm's size-zero and size-one loops standing, which the reference's walk over `parentOp`
+/// erases. ⭐ AN EMPTY PATH IS THE `dataflow.program_unit`, whose one region is the unit body.
+fn simplify_parent_op<E: ExpressionEvaluator, P: PropagationAnalysis, U: UnitIndexMap>(
+    preamble: &mut Vec<Op>,
+    unit_body: &mut Vec<Op>,
+    parent: &[(usize, usize)],
+    evaluator: &mut E,
+    propagation: &mut P,
+    unit_index_map: &U,
+    values: &mut Values,
+) {
+    let Some((&(parent_at, _), stem)) = parent.split_last() else {
+        let _ = run_light_weight_simplifications(
+            preamble,
+            unit_body,
+            evaluator,
+            propagation,
+            unit_index_map,
+            values,
+        );
+        return;
+    };
+    let regions = {
+        let Some(block) = block_at_mut(unit_body, stem) else {
+            return;
+        };
+        let Some(parent_op) = block.get_mut(parent_at) else {
+            return;
+        };
+        regions_mut(parent_op).len()
+    };
+    for which in 0..regions {
+        let mut path = stem.to_vec();
+        path.push((parent_at, which));
+        let Some(region) = block_at_mut(unit_body, &path) else {
+            continue;
+        };
+        let _ = run_light_weight_simplifications(
+            preamble,
+            region,
+            evaluator,
+            propagation,
+            unit_index_map,
+            values,
+        );
+    }
+}
+
+/// THE BLOCK A LOOP SITS IN AND ITS POSITION THERE, MUTABLY — `getParentOp()`'s region, which is the
+/// scope [`do_split_or_unroll`] rewrites. [`loop_site`] answers the same question for a reader that
+/// also needs the enclosing scopes, and [`loop_parent_path`] names the op holding that region.
+///
+/// ⚠️ NEITHER THIS DESCENT NOR [`LoopForest::compute`]'S ENTERS A `uniform.uniformize_regions`, whose
+/// regions ARE this rung's and CAN hold a `sentient.for`. The reference's `LoopTree` walk enters them,
+/// and this pass is registered through `addPassWithDeuniform` precisely because they may still be live
+/// (`dcc/tools/dcc-standalone/dcc-standalone-main.cpp:127-135`, `:399`). Systematic — the whole
+/// `loop_site` family across `transform/sentient/` shares it — so widening it is not one unit's call.
 fn loop_site_mut(scope: &mut Vec<Op>, loop_ref: ForRef) -> Option<(&mut Vec<Op>, usize)> {
     let here = scope
         .iter()
@@ -1884,15 +1979,18 @@ fn optimize_one_unit<E: InstructionEstimator, C: IfOpCanonicalizer, T: Condition
         };
         // `auto parentOp = ...getParentOp()` IS TAKEN BEFORE THE REWRITE (`:1055`) — the block stays
         // put while `doSplitOrUnroll` replaces the loop inside it.
+        let mut parent = Vec::new();
+        loop_parent_path(unit_body, chosen, &mut parent);
         let Some((parent_block, at)) = loop_site_mut(unit_body, chosen) else {
             break;
         };
         do_split_or_unroll(pass, chosen, best.optimization, parent_block, at, values);
         // "Unrolling or Splitting can present some opportunities for simplification" (`:1063-1069`);
         // a refusal is `emitError` + `signalPassFailure()`, which stops neither the walk nor the loop.
-        let _simplified = run_light_weight_simplifications(
+        simplify_parent_op(
             preamble,
-            parent_block,
+            unit_body,
+            &parent,
             evaluator,
             propagation,
             unit_index_map,
@@ -2981,6 +3079,65 @@ mod unit_tests {
     /// e629 — the driver reaches EVERY unit and keeps going until nothing is left to optimise: each
     /// unit's bound-1 loop is unrolled away, and the trailing `cleanupAndRecalculate` runs once more
     /// after the round that found nothing.
+    /// e629 hands the reference's `runLightWeightSimplifications` the chosen loop's `parentOp`, so
+    /// BOTH arms of a `sentient.if` parent are simplified — not only the arm the rewrite touched.
+    #[test]
+    fn e629_simplifies_every_region_of_the_parent_op_not_only_the_rewritten_one() {
+        let mut values = Values::default();
+        let (rewritten_iv, sibling_iv) = (values.mint(), values.mint());
+        // The sibling arm's loop has an empty body, which e597 replaces by its inits and erases; the
+        // rewritten arm's bound has no constant behind it, so only the sibling one can go.
+        let mut unit_body = vec![if_op(
+            Val(90),
+            Val(91),
+            vec![for_loop(
+                rewritten_iv,
+                Val(99),
+                Vec::new(),
+                vec![nop("body"), yields(Vec::new())],
+            )],
+            vec![for_loop(
+                sibling_iv,
+                Val(98),
+                Vec::new(),
+                vec![yields(Vec::new())],
+            )],
+        )];
+        let mut preamble = Vec::new();
+
+        // `(op 0, region 0)` — the chosen loop sat in the THEN arm.
+        simplify_parent_op(
+            &mut preamble,
+            &mut unit_body,
+            &[(0, 0)],
+            &mut OutOfScopeEvaluator,
+            &mut OutOfScopePropagationAnalysis,
+            &OutOfScopeUnitIndexMap,
+            &mut values,
+        );
+
+        let Op::Sentient(ops::Op::If {
+            then_body,
+            else_body,
+            ..
+        }) = &unit_body[0]
+        else {
+            panic!("the parent is still the `sentient.if`: {unit_body:?}")
+        };
+        assert!(
+            then_body
+                .iter()
+                .any(|op| matches!(op, Op::Sentient(ops::Op::For { .. }))),
+            "the rewritten arm's loop stays, its bound being unknown: {then_body:?}"
+        );
+        assert!(
+            else_body
+                .iter()
+                .all(|op| !matches!(op, Op::Sentient(ops::Op::For { .. }))),
+            "the SIBLING arm's empty loop is simplified away too: {else_body:?}"
+        );
+    }
+
     #[test]
     fn e629_optimizes_every_unit_until_no_loop_is_left_worth_it() {
         let mut values = Values::default();

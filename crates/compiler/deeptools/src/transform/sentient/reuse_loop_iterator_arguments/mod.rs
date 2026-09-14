@@ -208,7 +208,7 @@ fn walk_for_ops_post_order(block: &mut [Op], visit: &mut impl FnMut(&mut Op)) {
 /// [`UNIT_SPECIFIC_TOGGLE_CORRELATION`] on, a unit that is not an L3 half or the LX load unit gets
 /// NOTHING from this pass — not even rounds 2 and 3.
 /// ⛔ SIMPLIFICATION RUNS BETWEEN ROUND 1 AND ROUND 2 AND THAT ORDER IS LOAD-BEARING (`:195-199`,
-/// the reference's own note): round 3 breaks the one-use assumption the simplifications rely on.
+/// the reference's own note): round 2 breaks the one-use assumption the simplifications rely on.
 /// ⛔ THE CONST BUILDER IS IN THE **MODULE'S** BLOCK (`:161`, `unit_op->getBlock()`), which is where
 /// both rounds' correlation constants and e597's constants go.
 /// ⚠️ THE TWO CORRELATION ANALYSES ARE THE CALLER'S: the reference constructs one of each PER UNIT
