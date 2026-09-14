@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use hf_hub_downloader::{Client, Progress};
+use hf_hub_downloader::{Client, Error, Progress};
 
 /// Small, public, stable, and — importantly — has both a git-tracked file
 /// (307 + git blob SHA-1) and an LFS file (302 + SHA-256).
@@ -252,6 +252,27 @@ fn an_absent_file_is_not_found_and_does_not_burn_the_retry_ladder() {
     assert!(
         elapsed < std::time::Duration::from_millis(2500),
         "took {elapsed:?} — a 404 was retried instead of returned"
+    );
+}
+
+/// A wrongly-cased repo id is the commonest way to hold this crate wrong, and
+/// the Hub answers it with a redirect with no `x-repo-commit`. The redirect
+/// already carries the answer, so the error has to hand it back.
+#[test]
+#[ignore = "requires network"]
+fn a_wrongly_cased_repo_id_reports_what_the_hub_wants_instead() {
+    let root = scratch("wrong-case");
+    let client = Client::builder().cache_root(&root).build();
+
+    let err = client
+        .model("Qwen/qwen3-0.6b")
+        .get(GIT_FILE)
+        .expect_err("a repo the Hub redirects but will not serve must not succeed");
+
+    assert!(
+        matches!(&err, Error::RepoRedirect { location, .. } if location.contains(REPO)),
+        "the error must name the id that works, and it is right there in \
+         `location`: {err:?}"
     );
 }
 
