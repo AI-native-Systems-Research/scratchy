@@ -1009,9 +1009,10 @@ impl DcgFrontEnd {
     /// `dcg_fe_.generatePcfgIRForDataOp(mySDsc, myDataOpDsc, c)` (`:354`) — the data op's own per-core
     /// pcfg list, whose NOP nodes are named after `seq` (`pcfg_gen.cpp:31`).
     ///
-    /// ⭐ NO `first_avail`, UNLIKE THE TRANSFER SEAM: the only writer of `firstAvailGlobalGrpId_` this
-    /// body could reach is `collectArrayBCPieceInfo` (`gatherOp.cpp:911-912`), which has no callers —
-    /// `computerGTRInfo` is reached from `transfer_compute.cpp:74`, `:114` alone.
+    /// ⭐ NO `first_avail`, UNLIKE THE TRANSFER SEAM: the group-id writer this body might have reached,
+    /// `collectArrayBCPieceInfo` (`gatherOp.cpp:911-912`), is called ONLY from inside
+    /// `computeTranferforDataOp` (`transfer_compute.cpp:258-259`, `:271-272`), as is `computerGTRInfo`
+    /// (`:74`, `:114`) — both writers belong to the transfer seam, not to this one.
     pub fn generate_pcfg_ir_for_data_op<const F: bool>(
         sdsc: &mut SuperDsc<true, F>,
         at: DataOpIndex,
@@ -1089,12 +1090,17 @@ impl DcgFrontEnd {
 
     /// `dcg_fe_.generatePcfgIRForDataOpInpFetch(mySDscMain, mySDscPre, 0)` (`:522`), whose result is
     /// either an entry of the main super-DSC or a data op it minted.
+    ///
+    /// ⛔ IT ADVANCES `first_avail`, ON BOTH BRANCHES: each calls `createPcfgForInputFetchNeighbor`
+    /// (`pcfg_gen.cpp:173`, `:180`), which calls `computerGTRInfoInpFetchNeighbor`
+    /// (`inputNeighFetchOp.cpp:562`), whose tail writes it (`:1605-1606`).
     pub fn generate_pcfg_ir_for_data_op_inp_fetch<const F: bool>(
         main: &mut SuperDsc<true, F>,
         pre: Option<&mut SuperDsc<true, F>>,
         at: DataOpIndex,
+        first_avail: &mut GtrGroupId,
     ) -> DataOpTarget {
-        let _ = (main, pre, at);
+        let _ = (main, pre, at, first_avail);
         todo!("dcg_fe/: DcgFE::generatePcfgIRForDataOpInpFetch is out of scope")
     }
 }
@@ -1989,12 +1995,17 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
     /// ⛔ THE I-BUFF ARM IS THE REFERENCE'S OWN ABORT: `DT_CHECK(0); // not ready` (`:552`) stands
     /// between the clear and the regeneration, so that path is unfinished THERE and not here.
     pub fn run_dcg_for_input_fetch_neighbor<const FOLDED: bool>(
-        self,
+        mut self,
         main: &mut SuperDsc<true, FOLDED>,
         pre: Option<&mut SuperDsc<true, FOLDED>>,
     ) -> InpFetchNeighDcg<C, DT2, L3_DL_SCHEDULER> {
         let data_dsc_idx = DataOpIndex(0);
-        let at = DcgFrontEnd::generate_pcfg_ir_for_data_op_inp_fetch(main, pre, data_dsc_idx);
+        let at = DcgFrontEnd::generate_pcfg_ir_for_data_op_inp_fetch(
+            main,
+            pre,
+            data_dsc_idx,
+            &mut self.first_avail_global_grp_id,
+        );
 
         // ⛔ `createSenProg && FOLDED`, for the reason entry 280 states (`:526-528`).
         const {
@@ -2475,8 +2486,14 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
             // `DT_CHECK(mySDsc.dscs_.size() > data_dldscIdx_inf.second)` (`:399`).
             sdsc.dscs.at(dl)?;
             self.data_dsc_idx = Some(data);
-            // ⚠️ THE RETURNED `DataOpDsc&` IS BOUND AND NEVER READ (`:401-402`).
-            let _ = DcgFrontEnd::generate_pcfg_ir_for_data_op_inp_fetch(sdsc, None, data);
+            // ⚠️ THE RETURNED `DataOpDsc&` IS BOUND AND NEVER READ (`:401-402`) — but the group-id
+            // counter it advances is the manager's own, and IS carried on.
+            let _ = DcgFrontEnd::generate_pcfg_ir_for_data_op_inp_fetch(
+                sdsc,
+                None,
+                data,
+                &mut self.first_avail_global_grp_id,
+            );
         } else if !has_syncs {
             // `DT_CHECK(hasSyncs)` (`:404`).
             return None;
@@ -2545,10 +2562,11 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
     /// Generates the SEN programs for a data-op super-DSC: from its ONE data op, or — after stitching
     /// more than one op's pcfgs into `pcfg_` — from `pcfg_` itself (`dcg_manager.cpp:898-943`).
     ///
-    /// ⚠️ THE SECOND `pcfg_.empty()` (`:913`) IS INERT: the stitch that could change it runs only for
-    /// MORE THAN ONE data op, and that same count already sends this to the `pcfg_` arm.
+    /// ⭐ BOTH CONJUNCTS OF `:916` ARE LOAD-BEARING. The stitch cannot change which arm it takes — when
+    /// the stitch runs (`:912-913`) `size() > 1` already fails the `<= 1` — but an ALREADY-SUPPLIED
+    /// `pcfg_` still sends a one-data-op super-DSC down the `fillAndCreateSenProgInfoUsingSuperDSC` arm.
     /// ⚠️ NO FOLD CHECK HERE, unlike every other codegen tail, and the reference's diagnostic also
-    /// names `mySDsc.name_` (`:936`), which this super-DSC does not carry.
+    /// names `mySDsc.name_` (`:935`), which this super-DSC does not carry.
     pub fn convert_to_prog_ir_data_op<const FOLDED: bool>(
         &self,
         sdsc: &mut SuperDsc<true, FOLDED>,
@@ -2566,12 +2584,13 @@ impl<C: SenProgGen, const DT2: bool, const L3_DL_SCHEDULER: bool>
         }
 
         if sdsc.data_op_dscs.len() <= 1 && sdsc.pcfg.is_empty() {
-            // `DT_CHECK(mySDsc.dataOpdscs_.size())` (`:920`); the `GatherOpHBM` arm's two ISA checks
-            // (`:924-927`) are compile-time truths — see [`Self::run_dcg_generate_prog_ir`].
+            // `DT_CHECK(mySDsc.dataOpdscs_.size())` (`:921`), which `:907-909` has already proved on
+            // this arm; the `GatherOpHBM` arm's two ISA checks (`:924-927`) are compile-time truths —
+            // see [`Self::run_dcg_generate_prog_ir`].
             sdsc.data_op_dscs.first()?;
             let at = DataOpTarget::InMain(DataOpIndex(0));
             let statuses = DcgBackEnd::create_sen_program_stcdp_op(sdsc, &at);
-            // ⛔ EVERY FILED CORE IS A FAILURE, WHATEVER ITS STATUS (`:932-939`): this entry has no
+            // ⛔ EVERY FILED CORE IS A FAILURE, WHATEVER ITS STATUS (`:931-937`): this entry has no
             // I-buff recovery arm, unlike entries 280 and 281.
             for (core, (_, message)) in &statuses {
                 self.verification_failure(*core, message);
@@ -3190,6 +3209,48 @@ mod unit_tests {
 
         let _ = DcgManager::<DcgSenProg, true, true>::new()
             .run_dcg_for_data_ops_dl_ops::<true, false>(&mut sdsc);
+    }
+
+    /// e348 — ⭐ THE INPUT-FETCH ARM, the one whose seam advances the group-id counter. A step naming
+    /// BOTH a data op and a DL DSC on a non-`SENPCFG` target is an input-fetch step (`:290`, `:297-299`),
+    /// the data-op walk SKIPS that index (`:351-352`), and `reqDLOp` is false so ACT2 (`:360`) is not
+    /// entered — the FIRST seam this reaches is `generatePcfgIRForDataOpInpFetch` (`:401-402`).
+    #[test]
+    #[should_panic(expected = "DcgFE::generatePcfgIRForDataOpInpFetch")]
+    fn e348_a_mixed_step_reaches_the_input_fetch_seam() {
+        let mut sdsc = one_mixed_step_on(SenTarget::Sentient);
+
+        let _ = DcgManager::<DcgSenProg, true, true>::new()
+            .run_dcg_for_data_ops_dl_ops::<false, false>(&mut sdsc);
+    }
+
+    /// e348's negative — *"we only allow 1 InpFetch op"* (`:296`): a SECOND core whose mixed step names
+    /// a DIFFERENT data op is refused during classification, before the seam above.
+    #[test]
+    fn e348_a_second_input_fetch_index_is_refused() {
+        let mut sdsc = one_mixed_step_on(SenTarget::Sentient)
+            .with_data_op(DataOpDsc {
+                op: OpFunc::ReStickifyOpWithPtLx,
+                pcfg: BTreeMap::from([(core::<0>(), Vec::new())]),
+            })
+            .with_core_schedule(
+                core::<1>(),
+                CoreSchedule::with_dl(
+                    Vec::new(),
+                    DlStep {
+                        data_dsc: Some(DataOpIndex(1)),
+                        dl_dsc: DscIdx(0),
+                        before_sync: false,
+                        after_sync: false,
+                    },
+                    Vec::new(),
+                ),
+            );
+
+        let mode = DcgManager::<DcgSenProg, true, true>::new()
+            .run_dcg_for_data_ops_dl_ops::<false, false>(&mut sdsc);
+
+        assert!(mode.is_none());
     }
 
     /// e349 — `DT_CHECK(!mySDsc.dataOpdscs_.empty())` under an empty `pcfg_` (`:907-909`) is the only
