@@ -154,22 +154,42 @@ use sys_arch_spec::arch_enums::{DataLocation, OpFunc, SenComponent};
 
 use crate::arch::{Arch, Bytes, Elements, FoldedUnit, IsaGen, Sticks};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
-    AbsoluteMin, Constraint, ConstraintKind, DimConstraint, DimSet, Extent, PrimaryDim, Sample,
-    SliceElems, Stage, StickDims, StickPart, VectorComp, check_constraints, cumulative_stick_sizes,
-    stick_sizes,
+    AbsoluteMin, Constraint, ConstraintKind, DataConnects, DimConstraint, DimSet, Extent,
+    PrimaryDim, Sample, ScheduleNode, SliceElems, Stage, StickDims, StickPart, VectorComp,
+    check_constraints, create_data_connect_metadata, cumulative_stick_sizes, stick_sizes,
 };
 use crate::formats::DataFormat;
 use crate::generated::{RegName, Strategy};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{
-    AllocId, BlockId, ConstIdx, NodeId, NodeKind, PadType, ScaleBlock, ScaledLds, comp_row_id,
+    AllocId, Allocations, BlockId, ConstIdx, CoordFoldReport, CoordinateCapture, NodeId, NodeKind,
+    PadType, ScaleBlock, ScaledLds, comp_row_id, coordinate_capture,
 };
 use crate::schedule::ddc::metadata::{
     DataConnectSlot, Datastage, DatastageId, DdcMemory, DestIdx, ExternalStorage, LoopMultiple,
     MetaDimKind, Metadata, StoredConstraint, TransferEnd,
 };
-use crate::schedule::ddc::transformation::LoopId;
-use crate::schedule::ddc::transformation_util::{NewLabeledDs, add_new_lds};
+use crate::schedule::ddc::shuffle::AutoShuffler;
+use crate::schedule::ddc::transformation::{
+    AutoShuffleNames, AutoShuffling, ComputeMasking, ComputeNodes, ComputeWalk, DsSticks,
+    FixedSizeTransfers, HoistTransfers, LoopId, OffsetAdjustment, PeSfpWorkSplit, ScopeTree,
+    Splat4bRead, SpreadTransfers, StageExtents as TrStageExtents, SymbolicTransfers, TransferLoads,
+    TransferWalk, clone_for_offset_adjustment, hoist_transfers_up_for_reuse,
+    perform_automatic_shuffling, perform_pe_sfp_work_split, set_size_for_fixed_size_transfers,
+    transform_for_4b_splat_read, transform_for_inter_slice_restickify,
+    transform_reg_to_fifo_or_latch, unroll_spread_transfers, unroll_symbolic_transfers,
+};
+use crate::schedule::ddc::transformation_util::{
+    AllocateCloning, ComponentAllocations, ComputeCloning, DataStages as UtilDataStages,
+    DatastageExploration, DscAllocations, ExternalStreams, FifoResults, LatchDataIds,
+    MintedConnects, NewLabeledDs, SkipRegResults, StageExtents as UtilStageExtents,
+    TransferUnrolling, add_new_lds,
+};
+use crate::schedule::ddl::DdlModuleOp;
+use crate::schedule::ddl::conversion::{
+    DdlConversion, DdlInterface, DdlSizes, DdlTemplateSet, EmittedDdl, MatchSite, export_to_ddl,
+    select_and_parse_ddl_template,
+};
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::dsc2::{
     AddressFold, AllocateNode, BlockNode, CondOp, ComputeNode, ConditionNode, Coordinate,
@@ -179,7 +199,7 @@ use crate::schedule::dsc2::{
     StickMaskNode, SyncNode, TransferKind, TransferNode, TransferPadding, Unroll, Via, WordLength,
     generic_comp,
 };
-use crate::schedule::l3::dsc::{DimPadding, SymbolicDimInfo, UnneededPad};
+use crate::schedule::l3::dsc::{DimPadding, DscIdx, SuperDsc, SymbolicDimInfo, UnneededPad};
 use crate::units::{Core, Corelet, Row};
 
 /// AN ALLOCATION ARENA — the `dsc2::AllocateNode*`s the metadata's maps name.
@@ -6016,12 +6036,265 @@ where
     // "Missing below-lx schedule insert block".
     metadata.below_lx_schedule_insert_block.map(|_| ())
 }
-// crustify:todo: e379_run_v1
-//   authority : ddc/ddcv1.cpp:3692  (109 body lines, level 7)
-//   class     : Ddc
-//   original  : bool Ddc::run_v1(SuperDsc& sdsc)
-//   extract   : crustify-ddc/cpp/ddc.cpp:15148-15257
-//   calls     : e104_clear, e125_minimizeAllocations, e126_populateUnitTimeTransfers, e127_spreadDataInAllocate, e128_finalizeAllocateLayouts, e132_restoreDsc, e133_adjustLoopOffsetsAndAddresses, e134_simplifyScheduleTree, e135_updateLdsIdxMetadata, e136_initGlobalData, e244_cloneForOffsetAdjustment, e245_setSizeForFixedSizeTransfers, e246_transformForInterSliceRestickify, e260_fillLoopOffsetsAndAddresses …
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// STAGE 2B'S CARRIERS — the ONE `currDsc` entry 379 drives, its data stages, and the per-DSC stores
+// its callees write through.
+//
+// ⭐ ONE CARRIER PER C++ OBJECT, NOT ONE PER CALLEE. `Ddc::currDsc` is a single pointer, so two
+// carriers over it would let entry 308's writes be invisible to entry 307's reads — the defect
+// review 382 recorded on `L3RunInputs`. [`Dsc2Store::split`] is the ONLY place a shared and an
+// exclusive view of it are held at once, and it hands out the REAL sub-objects of ONE store, so a
+// caller holding `struct { reads, tree }` satisfies it — which is what makes it satisfiable at all.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT THE SHARED HALF OF `currDsc` ANSWERS — entries 307 and 262 read the design space while
+/// writing the tree, and entries 260, 261 and 309 read both.
+pub trait Dsc2Reads:
+    ExploreDsc
+    + LabeledDsIndices
+    + Masking
+    + LdsSticks
+    + Dsc
+    + Placement
+    + StorageNames
+    + StageSizes
+    + OffsetSizes
+{
+}
+
+impl<T> Dsc2Reads for T where
+    T: ExploreDsc
+        + LabeledDsIndices
+        + Masking
+        + LdsSticks
+        + Dsc
+        + Placement
+        + StorageNames
+        + StageSizes
+        + OffsetSizes
+        + ?Sized
+{
+}
+
+/// THE WHOLE OF ONE `currDsc` — every seam entry 379's callees reach it through, plus the five facts
+/// none of them owns.
+///
+/// ⛔ THE LAST TWO ARE OUTSIDE THIS CAMPAIGN (`dsc/dsc2.cpp:2647`, `:2749`), so they are seams and
+/// not ports; the reference calls both on `dsc` itself, between entry 302 and entry 134 and again
+/// after entry 261.
+pub trait Dsc2Store:
+    AllocateCloning
+    + Allocations
+    + AutoShuffling
+    + ComponentAllocations
+    + ComputeCloning
+    + ComputeMasking
+    + ComputeMasks
+    + ComputeNodes
+    + ComputeOps
+    + ComputeWalk
+    + ConditionSimplification
+    + CoordinateCapture
+    + CoreletShapes
+    + DataStages
+    + Dsc
+    + DscAllocations
+    + DsSticks
+    + ExternalStreams
+    + FifoResults
+    + FixedSizeTransfers
+    + HoistTransfers
+    + LabeledDsIndices
+    + LdsSticks
+    + LoopOffsets
+    + Masking
+    + MintedConnects
+    + OffsetAdjustment
+    + PeSfpWorkSplit
+    + PrepDsc
+    + ScopeTree
+    + SkipRegResults
+    + Splat4bRead
+    + SpreadTransfers
+    + SymbolicTransfers
+    + TransferLoads
+    + TransferUnrolling
+    + TransferWalk
+{
+    /// The shared half [`Self::split`] hands out.
+    type Reads: Dsc2Reads + ?Sized;
+    /// The exclusive half — `currDsc->scheduleTree_`.
+    type Tree: ExploreTree + ScheduleNodes + MaskInsertion + ?Sized;
+
+    /// BOTH VIEWS OF ONE STORE AT ONCE, which is what a single `this` is.
+    fn split(&mut self) -> (&Self::Reads, &mut Self::Tree);
+
+    /// `getTransferType()` with the labelled DS the matching side names — entry 126's operands.
+    fn transfer_operands(&self, transfer: NodeId) -> TransferOperands;
+
+    /// `traverseTreeDFSMutable(nullptr, {COMPUTE, TRANSFER})` as entry 002 censuses it.
+    fn census_nodes(&self) -> Vec<ScheduleNode>;
+
+    /// `scheduleTree_.getHead()` as the block one `DdlConvertInterface` is opened over.
+    fn schedule_head_block(&self) -> BlockNode;
+
+    /// `dsc.setRelevantCompCoreCl()` (`dsc/dsc2.cpp:2647`).
+    fn set_relevant_comp_core_cl(&mut self);
+
+    /// `dsc.finalizeScheduleTree(sdsc, dscGlobal.sysDef)` (`dsc/dsc2.cpp:2749`).
+    fn finalize_schedule_tree(&mut self, sdsc: &SuperDsc);
+}
+
+/// `currDsc->dataStageParam_` THROUGH ITS THREE VOCABULARIES — the exploration's, entry 242's extent
+/// read, and the transformation utilities' own [`UtilDataStages`].
+///
+/// ⛔ ONE STORE AND NOT THREE: [`Self::as_util`] must hand back THE MAP THIS TYPE'S OWN
+/// [`ExploreStages`] READS — a caller holding `struct S(UtilDataStages<D>)` answers with `&mut self.0`
+/// — so a datastage entry 338 mints is the one entry 128 then lays out. A freshly built map here
+/// would DROP every effect entries 302, 303 and 338 have, and it would still compile.
+pub trait Dsc2Stages: ExploreStages + TrStageExtents {
+    /// `dataStageParam_` as entries 302, 303 and 338 rewrite it.
+    fn as_util(&mut self) -> &mut UtilDataStages<Self::Dims>;
+}
+
+/// THE AMBIENT READS ENTRY 379'S CALLEES TAKE AS ARGUMENTS — two `dtGetEnv`s, one `Ddc` construction
+/// parameter and the two `bool`s entry 260 is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dsc2Options {
+    /// `ENABLE_LN32`, for entries 308 and 372.
+    pub ln32: Ln32,
+    /// `trueLXTracker_`, for entry 307.
+    pub lx: LxTrackers,
+    /// `allowUnpaddedIndexingAtPaddedNoZeroPad`, for entry 260.
+    pub unpadded: UnpaddedIndexing,
+    /// `verifyCoordinateBasedLoopElemOff` — the state the latch starts in.
+    pub offsets: ElemOffsets,
+    /// `coordFoldReportLevel_`, for entry 375.
+    pub report: CoordFoldReport,
+}
+
+/// ONE DSC'S STORES, ALL BORROWED FROM THE PROVIDER TOGETHER — what the reference reaches as
+/// `currDsc`, `memTrackers`, the arenas and `sdsc_`'s tables.
+pub struct Dsc2Carriers<'a, E, S, Y, M, K, X, C> {
+    /// `currDsc`.
+    pub dsc: &'a mut E,
+    /// `currDsc->dataStageParam_`.
+    pub stages: &'a mut S,
+    /// The DSC as the DDL match and the export read and write it.
+    pub ddl: &'a mut Y,
+    /// The allocate nodes the tree's ALLOCATEs name.
+    pub allocs: &'a mut AllocArena,
+    /// The compute nodes entry 261 finalizes.
+    pub computes: &'a mut ComputeArena,
+    /// The sync nodes entry 261 mints.
+    pub syncs: &'a mut BTreeMap<NodeId, SyncNode>,
+    /// `memTrackers`.
+    pub trackers: &'a mut M,
+    /// Where entry 260 writes each node's `DataInfo`.
+    pub sink: &'a mut K,
+    /// `sdsc_->symbolDefinitions_`.
+    pub symbols: &'a mut X,
+    /// The coordinate and work-slice tables.
+    pub coords: &'a C,
+}
+
+/// WHERE ONE DSC'S CARRIERS COME FROM — `sdsc.dscs_.at(idx)` and everything hung off it, keyed the
+/// way `L3DlOpsScheduler`'s own per-DSC provider is.
+pub trait Dsc2Sites {
+    /// `currDsc`.
+    type Dsc: Dsc2Store;
+    /// `currDsc->dataStageParam_`.
+    type Stages: Dsc2Stages;
+    /// The DDL match and export site.
+    type Ddl: MatchSite + DdlSizes;
+    /// `memTrackers`.
+    type Trackers: MemTrackers;
+    /// Entry 260's `DataInfo` sink.
+    type Sink: DataInfoSink;
+    /// `symbolDefinitions_`.
+    type Symbols: Symbols;
+    /// The coordinate tables.
+    type Coords: CoordinateOffsets;
+
+    /// `dsc.name_` (`dsc/designSpaceConfig.h:60`), which only the two verbose lines read.
+    fn dsc_name(&self, dsc: DscIdx) -> StorageName;
+
+    /// Every store of that DSC at once — ⛔ [`None`] is `dscs_.at(idx)`'s own throw.
+    fn carriers(
+        &mut self,
+        dsc: DscIdx,
+    ) -> Option<
+        Dsc2Carriers<
+            '_,
+            Self::Dsc,
+            Self::Stages,
+            Self::Ddl,
+            Self::Trackers,
+            Self::Sink,
+            Self::Symbols,
+            Self::Coords,
+        >,
+    >;
+}
+
+/// WHAT STAGE 2B ANSWERS — the `bool`, and the two things the reference wrote to `std::cout` instead
+/// of returning.
+#[derive(Debug)]
+pub struct Dsc2Fill {
+    /// `run_v1`'s own `bool`.
+    pub filled: DscFilled,
+    /// Every `verbose_ > 0` line, entry 372's diagnostics and entry 375's fold report, in order.
+    pub said: Vec<String>,
+    /// Entry 345's emitted DDL per DSC, EMPTY unless `dscToDdl_` asked for it.
+    pub exported: BTreeMap<DscIdx, EmittedDdl>,
+}
+
+/// `datastageBasedElemOff` (`ddc/ddc.h:44`) AFTER ONE DSC'S OP SCAN (`ddc/ddcv1.cpp:3712-3718`).
+///
+/// 🛑 IT IS ONLY EVER SET. Nothing in the reference tree clears it, so this takes the state IN and
+/// hands the latched state back — a `bool` computed per DSC would silently un-suppress entry 375.
+#[must_use]
+pub fn latched_elem_offsets(offsets: ElemOffsets, ops: &[DscComputeOp]) -> ElemOffsets {
+    let restickify = ops.iter().any(|op| {
+        matches!(
+            op.op_func,
+            Some(OpFunc::ReStickifyOpLx | OpFunc::ReStickifyOpHbm)
+        )
+    });
+    if restickify {
+        return ElemOffsets::Datastage;
+    }
+    offsets
+}
+
+/// EVERY ALLOCATION WITH ITS LIVE RANGE OVER THE TREE'S DFS ORDER — entry 125's `node_to_index`
+/// (`ddc/ddcv1.cpp:39-58`), which is the mechanism entry 125 itself does not own.
+///
+/// ⛔ THE ORDER IS OVER *EVERY* NODE, not over the ALLOCATEs: `traverseTreeDFSMutable(nullptr, {})`
+/// indexes the whole walk, so an allocation's users are positions in that one numbering.
+/// ⛔ [`None`] is an ALLOCATE the arena has no node for, which is the reference's `.at()` throw.
+fn alloc_lives<T: ExploreTree + ?Sized>(tree: &T, allocs: &AllocArena) -> Option<Vec<AllocLive>> {
+    let mut order: BTreeMap<NodeId, DfsIndex> = BTreeMap::new();
+    for (at, node) in tree.all_nodes().into_iter().enumerate() {
+        order.insert(node, DfsIndex(u32::try_from(at).ok()?));
+    }
+    let mut lives = Vec::new();
+    for alloc in tree.allocates() {
+        let anode = allocs.get(&alloc)?;
+        let users: Vec<DfsIndex> = anode
+            .alloc_users
+            .iter()
+            .filter_map(|user| order.get(user).copied())
+            .collect();
+        lives.push(AllocLive {
+            alloc,
+            component: anode.component,
+            lds: anode.lds,
+            range: LiveRange::of(&users),
+        });
+    }
+    Some(lives)
+}
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // THE STAGE-2B GATE — the two `dscGlobal` options entry 381 reads, as TYPES and not as fields.
@@ -6092,48 +6365,277 @@ pub trait SdscName {
     fn name(&self) -> &str;
 }
 
-/// STAGE 2B ITSELF — `Ddc::run_v1` (`ddc/ddcv1.cpp:3692`), which is entry 379 of this campaign.
+/// `dataStageExplorationDone_` AS THE TWO UNITS THAT READ IT SPELL IT (`ddc/ddc.h:108`).
+const fn exploration_of(global: &GlobalData) -> DatastageExploration {
+    if global.data_stage_exploration_done {
+        DatastageExploration::Done
+    } else {
+        DatastageExploration::Open
+    }
+}
+
+/// `metadata.dataConnects_ = createDataConnectMetadata()` — the ASSIGNMENT the three callsites make.
 ///
-/// ⛔ NOT A PORT AND NOT A STAND-IN. Entry 379 is unported — its `// crustify:todo: e379_run_v1`
-/// anchor stands at the head of this section — and it is the DRIVER of the units that place
-/// addresses, not itself an arithmetic: its 109 lines compute no address. Answering
-/// [`DscFilled::Yes`] here would report a placed DSC2 that nothing placed, so this stays a stop
-/// naming the translator that owns it. When entry 379 lands, its own `run_v1` collides with this
-/// name and the wiring is an E0428 rather than a judgement call.
+/// ⛔ [`None`] IS [`DataConnects::NoProducer`], the reference's illegal-DDL stop.
+fn apply_data_connects(metadata: &mut Metadata, nodes: &[ScheduleNode]) -> Option<()> {
+    match create_data_connect_metadata(nodes) {
+        DataConnects::Census(census) => {
+            metadata.data_connects = census.into_iter().collect();
+            Some(())
+        }
+        DataConnects::NoProducer(_) => None,
+    }
+}
+
+/// Replaces: e379_run_v1
 ///
-/// ⭐ WHAT ITS OWN BODY IS, reviewed against the authority so the port is not hunting for one: the
-/// `sdsc_` back-pointer (`:3693`), a loop over `sdsc.dscs_` skipping every DSC with an empty
-/// `computeOp_` (`:3697`), five per-DSC state writes (`:3700`, `:3706`, `:3707`, `:3708`, and the
-/// `:3713-3714` pair), and a fixed sequence of 31 in-campaign callees plus
-/// `createDataConnectMetadata` THREE times (`:3755`, `:3765`, `:3781`) and two `DesignSpaceConfig`
-/// methods this campaign does not own — `setRelevantCompCoreCl` (`:3779`, `dsc/dsc2.cpp:2647`) and
-/// `finalizeScheduleTree` (`:3790`, `dsc/dsc2.cpp:2749`). Every one of the 31 is already filled, so
-/// nothing blocks the port.
+/// STAGE 2B — drives every DSC of the super-DSC whose `computeOp_` is non-empty through the 31 units
+/// that fill its DSC2, and answers [`DscFilled::No`] for the first DSC no DDL template served.
 ///
-/// 🛑 THE LATCH — the one trap that makes a per-DSC port diverge. `metadata.clear()` (`:3706`)
-/// reinitialises the whole `Metadata` and `dataStageExplorationDone_`/`latchDataIdCounter_`
-/// (`:3707-3708`) are reset at the top of EVERY iteration, but `datastageBasedElemOff` (`ddc/ddc.h:44`)
-/// is only ever SET (`:3713`) and is cleared NOWHERE in the reference tree. So one DSC carrying a
-/// `ReStickifyOpLx`/`ReStickifyOpHBM` op suppresses `coordinateCapture()` (`:3785`) for that DSC AND
-/// for every LATER DSC of the same super-DSC, and latches `sdsc.datastageBasedElemOff`
-/// (`dsc/superdsc.h:116`, read at `dsc/dsc2.cpp:3034`). [`ElemOffsets`] is that state, not an option.
-///
-/// ⚠️ TWO RECORDED CALL EDGES NEVER FIRE ON OUR PATH. `e300_packStickDim`'s only callsite here is
-/// inside `#if 0` (`:3735-3752`), and `e345_exportToDdl` is behind `dscToDdl_` (`ddc/ddc.h:45`),
-/// which only `ddc/ddc_standalone.cpp:40` sets — `SchedulerStages.cpp:35` passes `false` explicitly
-/// and `deeprt.cpp:2178` takes the default.
-///
-/// ⚠️ `enableMovingDataTransfer` IS NOT ITS DEFAULT AT THE READ. The hoist gate (`:3758`) is read
-/// AFTER `selectAndParseDdlTemplate()` (`:3725`), whose `parseDdl2Dsc` reaches the one writer in the
-/// tree — `DdlConversion::processTransformations` clearing it on a `DisableTransferPromotion` op
-/// (`ddc/ddl/ddl_conversion.cpp:2044`). So the flag is what the SELECTED TEMPLATE said.
-///
-/// ⚠️ THE ABANDONMENT IS MID-LOOP. The single `return false` (`:3728`) restores only the DSC that
-/// found no DDL; every DSC of `dscs_` filled before it stays filled. Both callers turn that into a
-/// hard stop, so no path observes the partial fill.
-fn run_v1<S: SdscName + ?Sized>(sdsc: &mut S) -> DscFilled {
-    let _ = sdsc;
-    todo!("e379_run_v1: Ddc::run_v1 (ddc/ddcv1.cpp:3692) — stage 2b — is not ported")
+/// 🛑 `datastageBasedElemOff` IS A LATCH NOTHING CLEARS (`ddc/ddc.h:44`): one DSC's `ReStickifyOpLx`/
+/// `ReStickifyOpHBM` suppresses entry 375 for that DSC *and every later one*, and sets
+/// `sdsc.datastageBasedElemOff` — so [`latched_elem_offsets`] threads the state, and the re-set of
+/// the super-DSC's own flag on every later DSC is the same idempotent write the reference makes.
+/// ⚠️ `enableMovingDataTransfer` IS READ AFTER ENTRY 372 (`:3758` vs `:3725`), whose `parseDdl2Dsc`
+/// reaches the flag's one writer — so the hoist gate is what the SELECTED TEMPLATE said.
+/// ⚠️ TWO CALL EDGES NEVER FIRE, and one is not emitted at all: `e300_packStickDim`'s only callsite
+/// here is inside `#if 0` (`:3735-3752`), and entry 345 is behind `dscToDdl_`, which only
+/// `ddc/ddc_standalone.cpp:40` sets.
+/// ⚠️ THE ABANDONMENT IS MID-LOOP (`:3728`): only the DSC that found no DDL is restored, and every
+/// DSC filled before it stays filled.
+/// ⚠️ THE `verbose_ > 0` LINES AND ENTRY 375'S REPORT ARE RETURNED, not printed — [`Dsc2Fill::said`],
+/// the same convention [`DdlSelection::said`] already uses.
+/// ⛔ [`None`] IS EVERY CALLEE'S OWN STOP plus a `dscs_.at()` the provider does not hold.
+pub fn run_v1<A, T, P, const DSC_TO_DDL: bool>(
+    sdsc: &mut SuperDsc,
+    sites: &mut P,
+    templates: &T,
+    shuffle_names: &mut AutoShuffleNames,
+    options: Dsc2Options,
+) -> Option<Dsc2Fill>
+where
+    A: Arch,
+    T: DdlTemplateSet + ?Sized,
+    P: Dsc2Sites + ?Sized,
+    <P::Stages as ExploreStages>::Dims: Default + Clone + UtilStageExtents,
+{
+    let mut fill = Dsc2Fill {
+        filled: DscFilled::Yes,
+        said: Vec::new(),
+        exported: BTreeMap::new(),
+    };
+    let mut metadata = Metadata::default();
+    let mut global = GlobalData::default();
+    // 🛑 THE LATCH LIVES ACROSS THE WHOLE LOOP, unlike `metadata` and the two counters below.
+    let mut offsets = options.offsets;
+
+    let mut idx = DscIdx(0);
+    while sdsc.dscs().at(idx).is_some() {
+        let name = sites.dsc_name(idx);
+        let Dsc2Carriers {
+            dsc: store,
+            stages,
+            ddl,
+            allocs,
+            computes,
+            syncs,
+            trackers,
+            sink,
+            symbols,
+            coords,
+        } = sites.carriers(idx)?;
+
+        // ⛔ READ BEFORE ENTRY 308, which REWRITES `computeOp_`: the skip and the latch scan are the
+        // reference's pre-`prepDsc` reads (`:3697`, `:3712-3718`).
+        let ops = PrepDsc::compute_ops(&*store);
+        if ops.is_empty() {
+            idx.0 += 1;
+            continue;
+        }
+        fill.said
+            .push(format!("[DDC] start working on DSC: {}", name.0));
+
+        metadata.clear();
+        global.data_stage_exploration_done = false;
+        let mut latch = LatchDataIds::default();
+
+        offsets = latched_elem_offsets(offsets, &ops);
+        if offsets.is_datastage() {
+            sdsc.datastage_based_elem_off = true;
+        }
+
+        prep_dsc::<A, _, _>(store, stages, &mut metadata, &*allocs, options.ln32)?;
+        init_global_data(&mut global, &*store);
+        {
+            let (reads, tree) = store.split();
+            attach_to_prefilled_schedule::<A, _, _, _>(
+                reads,
+                &*tree,
+                &*stages,
+                &mut metadata,
+                allocs,
+                offsets,
+            )?;
+        }
+
+        // ⛔ ONE `DdlConvertInterface` PER DSC (`:3723`), so all three of its members are locals.
+        let mut parser = DdlModuleOp::default();
+        let mut state = DdlConversion::new(store.schedule_head_block());
+        let mut interface = DdlInterface::default();
+        let selection = select_and_parse_ddl_template::<A, _, _>(
+            &mut parser,
+            &mut state,
+            &mut interface,
+            &mut metadata,
+            sdsc.dscs_mut().at_mut(idx)?,
+            ddl,
+            templates,
+            options.ln32,
+        )?;
+        fill.said.extend(selection.said);
+        let Some(template) = selection.template else {
+            restore_dsc(&metadata, store);
+            fill.filled = DscFilled::No;
+            return Some(fill);
+        };
+
+        let has_auto_shuffling =
+            perform_automatic_shuffling::<_, AutoShuffler, A>(store, &mut metadata, shuffle_names);
+        update_lds_idx_metadata(&mut metadata, &*store);
+        clone_for_offset_adjustment(store);
+        let _ = perform_pe_sfp_work_split(store, stages.as_util(), &mut metadata);
+
+        for node in TransferWalk::transfers(&*store) {
+            let operands = store.transfer_operands(node);
+            let limit = metadata
+                .datatransfers
+                .get(&node)
+                .and_then(|data| data.force_num_elements);
+            let mut transfer = TransferWalk::transfer(&*store, node);
+            populate_unit_time_transfers::<A>(&mut transfer, &operands, limit)?;
+            let (_, tree) = store.split();
+            tree.set_transfer(node, transfer)?;
+        }
+
+        apply_data_connects(&mut metadata, &store.census_nodes())?;
+        if metadata.transformation_config.enable_moving_data_transfer {
+            let _ = hoist_transfers_up_for_reuse(store, &mut metadata, exploration_of(&global));
+        }
+        let _ = transform_for_4b_splat_read(store, &mut metadata, exploration_of(&global));
+        let _ = transform_reg_to_fifo_or_latch(
+            store,
+            if global.data_stage_exploration_done {
+                Some(&*stages)
+            } else {
+                None
+            },
+            &mut metadata,
+            &mut latch,
+        );
+        transform_for_inter_slice_restickify(store);
+        apply_data_connects(&mut metadata, &store.census_nodes())?;
+
+        let lives = {
+            let (_, tree) = store.split();
+            alloc_lives(&*tree, allocs)?
+        };
+        minimize_allocations(&lives, has_auto_shuffling, &mut metadata);
+        // ⛔ RE-READ: entry 308 inserted ops into `computeOp_`, so `ops` above is stale here.
+        let compute_ops: Vec<ComputeOp> = PrepDsc::compute_ops(&*store)
+            .into_iter()
+            .map(|op| ComputeOp {
+                op_func: op.op_func,
+                format: op.format,
+            })
+            .collect();
+        spread_data_in_allocate::<A>(&compute_ops, &metadata, allocs, &*store);
+        let _ = unroll_spread_transfers(store, stages.as_util(), &mut metadata);
+        set_size_for_fixed_size_transfers(store);
+        {
+            let (reads, tree) = store.split();
+            explore_assign_data_stages::<A, _, _, _, _>(
+                reads,
+                tree,
+                stages,
+                &mut metadata,
+                allocs,
+                trackers,
+                &mut global,
+                options.lx,
+            )?;
+        }
+
+        let ids = stages.stages();
+        let snapshot: BTreeMap<DatastageId, <P::Stages as ExploreStages>::Dims> = ids
+            .into_iter()
+            .filter_map(|stage| stages.dims(StageSite::ss(stage)).map(|dims| (stage, dims)))
+            .collect();
+        finalize_allocate_layouts(&metadata, allocs, &snapshot, &*store)?;
+        {
+            let (reads, tree) = store.split();
+            coordinate_masking::<A, _, _>(reads, &metadata, tree)?;
+        }
+        let _ = transform_reg_to_fifo_or_latch(
+            store,
+            if global.data_stage_exploration_done {
+                Some(&*stages)
+            } else {
+                None
+            },
+            &mut metadata,
+            &mut latch,
+        );
+        let _ = unroll_symbolic_transfers(store, stages.as_util(), &mut metadata);
+        store.set_relevant_comp_core_cl();
+        // ⛔ THE LINE ABOVE IS WHAT MAKES THIS HEAD EXIST, so [`None`] here is a real anomaly.
+        let head = ScheduleHead::of(&*store)?;
+        simplify_schedule_tree(store, &metadata, head);
+        apply_data_connects(&mut metadata, &store.census_nodes())?;
+        {
+            let (_, tree) = store.split();
+            identify_below_chunk_boundary_loops(&*tree, &metadata, &mut global)?;
+        }
+        if !offsets.is_datastage() {
+            fill.said.push(coordinate_capture(store, options.report));
+        }
+        {
+            let (reads, tree) = store.split();
+            let inputs = OffsetInputs {
+                dsc: reads,
+                tree: &*tree,
+                coords,
+                metadata: &metadata,
+                allocs: &*allocs,
+                global: &global,
+                offsets,
+                unpadded: options.unpadded,
+            };
+            fill_loop_offsets_and_addresses::<A, _, _, _, _, _>(&inputs, sink, symbols)?;
+        }
+        adjust_loop_offsets_and_addresses::<A, _>(store);
+        {
+            let (reads, tree) = store.split();
+            finalize_ops::<A, _, _>(reads, &*tree, &metadata, &*allocs, computes, syncs)?;
+        }
+        store.finalize_schedule_tree(&*sdsc);
+        restore_dsc(&metadata, store);
+        fill.said
+            .push("\n[DDC] DSC2 successfully filled".to_owned());
+        if DSC_TO_DDL {
+            let stated = templates.stated(template)?;
+            let emitted = export_to_ddl(
+                stated.program,
+                &state,
+                &interface,
+                &metadata,
+                sdsc.dscs().at(idx)?,
+                &*ddl,
+            )?;
+            fill.exported.insert(idx, emitted);
+        }
+        idx.0 += 1;
+    }
+    Some(fill)
 }
 
 /// Replaces: e381_run
@@ -6161,21 +6663,44 @@ fn run_v1<S: SdscName + ?Sized>(sdsc: &mut S) -> DscFilled {
 /// by [`DdcVersion::FORCED`].
 /// 🛑 THE ABORT STAYS A STOP. "DSC2 not filled" is entry 379's answer about a whole super-DSC, given
 /// after it has already restored the DSC it gave up on, so no type states it in advance.
-pub fn run<V: DdcVersion, S: SdscName + ?Sized, const DATA_OP_TESTING: bool>(sdsc: &mut S) {
+/// ⚠️ [`None`] IS BOTH GATES' SKIP AND EVERY CALLEE'S STOP, and it is unambiguous per
+/// instantiation because both gates are CONSTS: a `DdcOff`/data-op-testing `run` answers [`None`]
+/// always, and one with [`DdcVersion::RUNS`] answers it only where entry 379 stopped.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference's own member state"
+)]
+pub fn run<V, A, T, P, N, const DATA_OP_TESTING: bool, const DSC_TO_DDL: bool>(
+    sdsc: &mut SuperDsc,
+    name: &N,
+    sites: &mut P,
+    templates: &T,
+    shuffle_names: &mut AutoShuffleNames,
+    options: Dsc2Options,
+) -> Option<Dsc2Fill>
+where
+    V: DdcVersion,
+    A: Arch,
+    T: DdlTemplateSet + ?Sized,
+    P: Dsc2Sites + ?Sized,
+    N: SdscName + ?Sized,
+    <P::Stages as ExploreStages>::Dims: Default + Clone + UtilStageExtents,
+{
     if DATA_OP_TESTING {
         // If we only want to run dataOps through DCC, don't do any further work here, return.
-        return;
+        return None;
     }
     if !V::RUNS {
-        return;
+        return None;
     }
-    let filled = run_v1(sdsc);
-    if V::FORCED && filled == DscFilled::No {
+    let fill = run_v1::<A, T, P, DSC_TO_DDL>(sdsc, sites, templates, shuffle_names, options)?;
+    if V::FORCED && fill.filled == DscFilled::No {
         panic!(
             "DDCv1 force-requested but DSC2 not filled for node: {}",
-            sdsc.name()
+            name.name()
         );
     }
+    Some(fill)
 }
 
 #[cfg(test)]
@@ -8949,44 +9474,60 @@ mod tests_e307_e309 {
 }
 
 #[cfg(test)]
-mod tests_e381 {
-    use super::{DdcOff, DdcV1, DdcV1Required, SdscName, run};
+mod tests_e379_e381 {
+    use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
-    /// The one field entry 381 reads of a super-DSC.
-    struct NamedSdsc(&'static str);
+    use super::{
+        DdcOff, DdcV1, DdcV1Required, DdcVersion, DscComputeOp, ElemOffsets, latched_elem_offsets,
+    };
 
-    impl SdscName for NamedSdsc {
-        fn name(&self) -> &str {
-            self.0
+    fn op(op_func: Option<OpFunc>) -> DscComputeOp {
+        DscComputeOp {
+            op_func,
+            ex_unit: SenComponent::Pe,
+            format: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
         }
     }
 
-    /// ⭐ BOTH OFF ARMS REMOVE THE CALL, and returning is the whole assertion: reaching stage 2b
-    /// would trip its stop. Data-op testing wins over a force-requested `ddcVersion == 2`, and
-    /// `ddcVersion == 0` skips stage 2b with data-op testing off.
+    /// 🛑 THE LATCH: a `ReStickifyOpHBM` op forces the datastage ladder for its DSC, and a
+    /// LATER DSC naming no restickify does not put the distribution ladder back — which is what keeps
+    /// entry 375 suppressed for the rest of the super-DSC.
     #[test]
-    fn a_disabled_ddc_runs_nothing() {
-        run::<DdcV1Required, _, true>(&mut NamedSdsc("dataop_testing"));
-        run::<DdcOff, _, false>(&mut NamedSdsc("ddc_off"));
+    fn a_restickify_op_latches_the_datastage_ladder() {
+        let plain = [op(Some(OpFunc::Exx2)), op(None)];
+        let restickify = [op(Some(OpFunc::ReStickifyOpHbm)), op(None)];
+        assert_eq!(
+            latched_elem_offsets(ElemOffsets::Distribution, &plain),
+            ElemOffsets::Distribution
+        );
+        assert_eq!(
+            latched_elem_offsets(ElemOffsets::Distribution, &restickify),
+            ElemOffsets::Datastage
+        );
+        assert_eq!(
+            latched_elem_offsets(ElemOffsets::Datastage, &plain),
+            ElemOffsets::Datastage
+        );
     }
 
-    /// THE NEGATIVE CONTROL for the pair above: with the DDC requested and data-op testing off, the
-    /// gate DOES dispatch to entry 379.
-    #[test]
-    #[should_panic(expected = "e379_run_v1")]
-    fn a_requested_ddc_dispatches_to_stage_2b() {
-        run::<DdcV1Required, _, false>(&mut NamedSdsc("requested"));
-    }
-
-    /// ⭐ THE MIDDLE ARM DISPATCHES TOO: what reaches stage 2b is `DdcVersion::RUNS` and never
-    /// `DdcVersion::FORCED`, so a TOLERATING `ddcversion=1` calls entry 379 exactly as a required
-    /// one does — the reference's `run_v1` call sits above its `ddcVersion == 2` test.
+    /// ⭐ THE TWO THRESHOLDS `ddcVersion` IS READ AT, one per arm: `> 0` runs stage 2b and `== 2`
+    /// makes an unfilled DSC2 end the run, so the tolerating middle arm RUNS and does not force.
     ///
-    /// ⚠️ THE TOLERATION ITSELF IS UNTESTABLE UNTIL ENTRY 379 LANDS: only a real `DscFilled::No` can
-    /// show [`DdcV1`] RETURNING where [`DdcV1Required`] stops, and the seam has no answer to give.
+    /// ⚠️ WHAT THIS NO LONGER COVERS. Until entry 379 landed, this module dispatched through
+    /// [`super::run`] and caught the stub's stop, which named the arm that reached stage 2b. Entry
+    /// 379's `run_v1` now takes a [`super::Dsc2Sites`] provider whose seven associated types are the
+    /// whole of one DSC's state, so no fixture inside this crate can call it — not even one whose
+    /// `carriers` answers [`None`], because the associated types must still be inhabited by real
+    /// impls. The dispatch is the INTEGRATION's to test.
     #[test]
-    #[should_panic(expected = "e379_run_v1")]
-    fn a_tolerating_ddc_dispatches_to_stage_2b_as_well() {
-        run::<DdcV1, _, false>(&mut NamedSdsc("tolerated"));
+    fn the_gate_reads_two_thresholds() {
+        assert!(!DdcOff::RUNS);
+        assert!(!DdcOff::FORCED);
+        assert!(DdcV1::RUNS);
+        assert!(!DdcV1::FORCED);
+        assert!(DdcV1Required::RUNS);
+        assert!(DdcV1Required::FORCED);
     }
 }

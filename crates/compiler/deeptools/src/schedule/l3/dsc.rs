@@ -639,6 +639,11 @@ pub struct SuperDsc {
     /// reference's default construction does. Entry 291 reads it to widen a conditional-GTR group
     /// beyond one DSC's cores, and an empty map makes that arm REFUSE rather than answer wrongly.
     pub core_id_to_dsc: BTreeMap<Core, DscIdx>,
+    /// `datastageBasedElemOff` (`dsc/superdsc.h:116`), read at `dsc/dsc2.cpp:3034`.
+    ///
+    /// 🛑 A LATCH AND NOT A CHOICE: entry 379 only ever SETS it, from the first DSC carrying a
+    /// `ReStickifyOpLx`/`ReStickifyOpHBM` op onwards, and nothing in the reference tree clears it.
+    pub datastage_based_elem_off: bool,
 }
 
 impl SuperDsc {
@@ -656,6 +661,7 @@ impl SuperDsc {
             core_id_to_wk_slice,
             core_id_to_dsc_schedule,
             core_id_to_dsc: BTreeMap::new(),
+            datastage_based_elem_off: false,
         }
     }
 
