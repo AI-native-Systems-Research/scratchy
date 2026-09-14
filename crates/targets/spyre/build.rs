@@ -43,20 +43,9 @@ fn main() {
 /// Linker flags the adapter needs, emitted whether or not we compiled it here.
 fn emit_link_flags(lib: &str, _spyre_root: &str) {
     println!("cargo:rustc-link-search=native={lib}");
-    // libflex's DT_NEEDED transitively pulls EVERY sibling sendnn lib (ops/runtime/util/…) and
-    // boost at load time, so the runtime resolves cross-lib globals (e.g. `OpRegister::by_name` in
-    // libsendnn_ops). flex-rs references flex directly, which keeps libflex in DT_NEEDED under
-    // `--as-needed` and makes the whole cascade load.
     let boost_lib = std::env::var("BOOST_LIB").unwrap_or_else(|_| "/usr/lib64".into());
     println!("cargo:rustc-link-search=native={boost_lib}");
     for l in [
-        "sendnn_interface",
-        "sendnn_graph",
-        "sendnn_tensor",
-        "sendnn_runtime",
-        "sendnn_util",
-        "sendnn_ops",
-        "flex",
         // The SDK shared libs are themselves linked against boost (verified via `ldd`: libflex.so →
         // libboost_log/thread/filesystem/…); the adapter TU includes NO boost headers. Linking
         // these resolves the SDK libs' transitive boost symbols at link time.
