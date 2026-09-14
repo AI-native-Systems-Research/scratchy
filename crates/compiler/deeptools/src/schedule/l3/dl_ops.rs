@@ -15925,45 +15925,75 @@ mod tests_e283_e295 {
             min_param_for_dim::<Target, _>(&sdsc, &dsc, &NoOps, PrimaryDim::Mb),
             None
         );
+
+        // ⛔ THE SAME DIM MADE SYMBOLIC ANSWERS `maxSize_` AND NOT THAT ABSENCE: this arm's
+        // `primaryDimToVal_st` reaches `primaryDimToVal_base_st`, whose symbolic lookup comes FIRST.
+        let mut core = dsc.data_stages.core().clone();
+        core.ss.dims.symbolic_mut().add_dim(
+            PrimaryDim::Mb,
+            SymbolicDimInfo {
+                max_size: MaxSize(6),
+                granularity: Granularity::new(NonZeroU32::new(3).expect("a step of three")),
+            },
+        );
+        dsc.data_stages.set(DATA_STAGE_CORE, core);
+        assert_eq!(
+            min_param_for_dim::<Target, _>(&sdsc, &dsc, &NoOps, PrimaryDim::Mb),
+            Some(Extent(6))
+        );
     }
 
     /// e377 — OUT OF SPAN, on entry 287's own cross-core reduction: the CORE stage copied in with its
-    /// symbolic state GONE, the one chunk dim pulled down to entry 373's minimum, and `IJ` recompounded
-    /// from THAT minimum rather than from the core extent. ⛔ A chunk dim the core stage states no
-    /// positive extent for refuses before entry 373 is reached.
+    /// symbolic state GONE, each chunk dim pulled down to entry 373's minimum, and `IJ` recompounded
+    /// from THAT minimum rather than from the core extent. ⛔ `Y` STATES NO RAW EXTENT AND ONLY A
+    /// SYMBOLIC ONE, so it discriminates the check's `primaryDimToVal_st` from the raw field: the
+    /// reference reads `maxSize_` and accepts it. ⛔ A chunk dim with NEITHER refuses before entry 373.
     #[test]
     fn the_initial_chunk_params_are_the_core_stage_minus_its_symbolic_state() {
         let (sdsc, mut dsc) = a_cross_core_reduction();
         let mut core = dsc.data_stages.core().clone();
         core.ss.dims.set_extent(PrimaryDim::J, Extent(2));
+        let symbolic = |max: u32| SymbolicDimInfo {
+            max_size: MaxSize(max),
+            granularity: Granularity::new(NonZeroU32::new(2).expect("a step of two")),
+        };
         *core.ss.dims.symbolic_mut() = Symbolic::new(
-            BTreeMap::from([(
-                PrimaryDim::I,
-                SymbolicDimInfo {
-                    max_size: MaxSize(8),
-                    granularity: Granularity::new(NonZeroU32::new(2).expect("a step of two")),
-                },
-            )]),
+            BTreeMap::from([
+                (PrimaryDim::I, symbolic(8)),
+                // ⛔ NO `set_extent` FOR `Y`: its raw field keeps the reference's `-1`.
+                (PrimaryDim::Y, symbolic(4)),
+            ]),
             BTreeMap::from([(BTreeSet::from([PrimaryDim::I]), VolumeLimit(64))]),
         );
         dsc.data_stages.set(DATA_STAGE_CORE, core);
-        let params =
-            initial_chunk_params::<Target, _>(&sdsc, &dsc, &NoOps, &BTreeSet::from([PrimaryDim::I]))
-                .expect("the one chunk dim states a positive core extent");
+        let params = initial_chunk_params::<Target, _>(
+            &sdsc,
+            &dsc,
+            &NoOps,
+            &BTreeSet::from([PrimaryDim::I, PrimaryDim::Y]),
+        )
+        .expect("both chunk dims state a positive core `primaryDimToVal_st`");
         assert_eq!(
-            [PrimaryDim::I, PrimaryDim::Ki, PrimaryDim::J, PrimaryDim::Ij]
-                .map(|dim| params.dims().extent(dim)),
+            [
+                PrimaryDim::I,
+                PrimaryDim::Ki,
+                PrimaryDim::J,
+                PrimaryDim::Ij,
+                PrimaryDim::Y
+            ]
+            .map(|dim| params.dims().extent(dim)),
             [
                 Some(DEFAULT_MIN_PARAM),
                 Some(Extent(8)),
                 Some(Extent(2)),
                 Some(Extent(2)),
+                Some(DEFAULT_MIN_PARAM),
             ]
         );
         assert_eq!(params.dims().symbolic, Symbolic::default());
 
-        // ⛔ `Mb` is a dim the core stage states NO extent for, so `isValidDimParam` refuses it here
-        // even though entry 373 would answer it with `defaultParam`.
+        // ⛔ `Mb` is a dim the core stage states NEITHER a raw NOR a symbolic extent for, so
+        // `isValidDimParam` refuses it here even though entry 373 would answer it with `defaultParam`.
         assert_eq!(
             initial_chunk_params::<Target, _>(
                 &sdsc,
@@ -19934,10 +19964,14 @@ where
 /// falls through to `primaryDimToVal_base_st` (`:516`) — for the very dim this arm has just found a
 /// corelet split for.
 ///
+/// ⛔⛔ AND `primaryDimToVal_base_st`'S FIRST ACT IS THE SYMBOLIC LOOKUP (`dsc/dims.cpp:517-522`): a
+/// SYMBOLIC dim answers `symbolicDimInfo_.at(dim).maxSize_` and never the raw field, so this arm is
+/// [`StageDims::scaled_extent`] and not [`StageDims::extent`], which reads the raw field alone.
+///
 /// ⛔ [`None`] IS ENTRY 210'S REFUSAL — the LEFT operand of the `&&`, so it is reached whatever the
 /// corelet split says — as well as every one of entry 365's. ⛔ AND IN THE CORELET-SPLIT ARM IT IS A
-/// VALUE RATHER THAN A REFUSAL: a dim the core stage's `coreletSplit_` names but states no extent for
-/// answers the reference's `-1` default (`dsc/dims.h:162-193`), which is [`StageDims::extent`]'s
+/// VALUE RATHER THAN A REFUSAL: a dim the core stage's `coreletSplit_` names, states no extent for and
+/// does NOT carry symbolic answers the reference's `-1` default (`dsc/dims.h:162-193`), which is that
 /// absence. `isValidDimParam` (`L3DlOpsScheduler.h:227`) rejects that either way, and entry 377 asks
 /// it of the SAME value before it calls here.
 #[must_use]
@@ -19949,7 +19983,7 @@ pub fn min_param_for_dim<A: Arch, D: ComputeOps + ?Sized>(
 ) -> Option<Extent> {
     let core = dsc.core_stage().dims();
     if is_op_cross_core_reduction(sdsc, dsc)? && core.corelet_split.contains_key(&dim) {
-        return core.extent(dim);
+        return core.scaled_extent(dim, &PaddingForm::default(), None, false);
     }
     min_param_for_dim_from_op_func::<A, D>(dsc, ops, dim)
 }
@@ -20114,11 +20148,23 @@ where
 /// symbolic state DROPPED and every chunk dim pulled down to entry 373's minimum, then compounded.
 ///
 /// ⛔ [`None`] IS `DT_CHECK(isValidDimParam(..))` — `param > 0.0` (`L3DlOpsScheduler.h:227`) asked of
-/// the CORE stage's OWN extent, so an unstated or non-positive chunk dim refuses BEFORE entry 373 is
-/// reached — plus every refusal entry 373 makes. ⭐ THE TWO `clear` CALLEES ARE CONTAINER CLEARS, ONE
-/// [`Symbolic`] default here because this type holds `symbolicDimInfo_` and `maxSymbolicVolume_` as
-/// one value. ⭐ THE SET'S ORDER IS IMMATERIAL: each write names a distinct dim, and entry 373 reads
-/// `dsc` alone and never the copy being written.
+/// the ORIGINAL core stage's `primaryDimToVal_st(dim)`, so an unstated or non-positive chunk dim
+/// refuses BEFORE entry 373 is reached — plus every refusal entry 373 makes.
+///
+/// ⛔⛔ AND THAT READ IS THE WHOLE REASON THE REFERENCE RE-READS THE ORIGINAL RATHER THAN THE COPY IT
+/// ALREADY HOLDS: `primaryDimToVal_base_st` answers a SYMBOLIC dim with `symbolicDimInfo_.at(dim)
+/// .maxSize_` and never the raw field (`dsc/dims.cpp:517-522`), and the copy's symbolic state has
+/// just been dropped — so [`StageDims::extent`], the raw field, is exactly the copy's answer and not
+/// the original's. This is [`StageDims::scaled_extent`], which is that lookup.
+///
+/// ⭐ THE TWO `clear()` CALLS ARE `std::map::clear` ON `symbolicDimInfo_` AND `maxSymbolicVolume_`,
+/// which this type holds as ONE value, so both are the single [`Symbolic`] default. ⛔ THEY ARE NOT
+/// ENTRIES 104 AND 187: the scope resolved a bare `clear` to `Metadata::clear`
+/// (`ddc/ddc_metadata.h:223`) and `DdlInterface::clear` (`ddc/ddl/ddl_conversion.h:458`), two
+/// destroy-and-reconstruct reinitializers on classes this body never reaches.
+///
+/// ⭐ THE SET'S ORDER IS IMMATERIAL: each write names a distinct dim, and entry 373 reads `dsc` alone
+/// and never the copy being written.
 #[must_use]
 pub fn initial_chunk_params<A: Arch, D: ComputeOps + ?Sized>(
     sdsc: &SuperDsc,
@@ -20133,7 +20179,7 @@ pub fn initial_chunk_params<A: Arch, D: ComputeOps + ?Sized>(
         // "Expect the chunk dimension has a valid parameter value."
         dsc.core_stage()
             .dims()
-            .extent(dim)
+            .scaled_extent(dim, &PaddingForm::default(), None, false)
             .filter(|extent| extent.0 > 0)?;
         params.set_extent(dim, min_param_for_dim::<A, D>(sdsc, dsc, ops, dim)?);
     }
@@ -20141,9 +20187,10 @@ pub fn initial_chunk_params<A: Arch, D: ComputeOps + ?Sized>(
     Some(params)
 }
 
-/// ONE DSC'S COORDINATE-PROPAGATION SURFACE — the borrows entry 374 takes of a single DSC, handed out
-/// TOGETHER because its schedule tree is WRITTEN while the layout order, the `memOrg_`s and the
-/// distribution seam are READ, and separate accessors could not hold all four at once.
+/// ONE DSC'S COORDINATE-PROPAGATION SURFACE — the FIVE borrows entry 374 takes of a single DSC, handed
+/// out TOGETHER because its schedule tree AND the distribution seam are both WRITTEN — the seam
+/// through [`CoreletSliceSeam::stages_mut`], which entry 229 mints a denominator stage in — while the
+/// layout order and the `memOrg_`s are READ, and separate accessors could not hold all five at once.
 pub struct DscCoordProp<'a, D: ?Sized, M: ?Sized, T: ?Sized, E: TemporalLoopDistribution + ?Sized> {
     /// `getLayoutDims(ldsIdx)` on this DSC.
     pub layout: &'a D,
