@@ -2801,10 +2801,39 @@ impl AddressPinningAndTogglePass {
     }
 }
 
-// crustify:todo: e655_processDataTransfers
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1450  (4 body lines, level 11)
-//   original  : void AddressPinningAndTogglePass::processDataTransfers( const PinningSchemeManager &ps_manager)
-//   calls     : e653_processDataTransfer, e654_processDataTransfer
+impl AddressPinningAndTogglePass {
+    /// Replaces: e655_processDataTransfers
+    ///
+    /// Hands EVERY immutable descriptor to [`Self::process_data_transfer_op`] under the one scheme
+    /// manager (`:1450-1454`).
+    ///
+    /// ⛔ INSERTION ORDER, NOT `getSortedList()`: the container's `begin`/`end` are the `std::vector`
+    /// base's (`:875-878`), so the visit order is syntactic and never op address. And there is NO
+    /// validity filter — an invalid descriptor is visited too; e653's `isValid()` arm is what stops it.
+    pub fn process_data_transfers<E: ExpressionEvaluator>(
+        &mut self,
+        unit_body: &mut Vec<Op>,
+        ty: ScalarTy,
+        prog_stitch: ProgStitch,
+        evaluator: &mut E,
+        ps_manager: &impl PinningSchemeManager,
+        sites: &mut OffsetSites<'_>,
+    ) {
+        // A range-for caches its `end` once and so does this range; the loop is by index because e654
+        // takes `&mut self` while the descriptor it names lives in a field of that same `self`.
+        for index in 0..self.immut_data_transfer_descriptors.descriptors.len() {
+            self.process_data_transfer_op(
+                DescriptorId(index as u32),
+                unit_body,
+                ty,
+                prog_stitch,
+                evaluator,
+                ps_manager,
+                sites,
+            );
+        }
+    }
+}
 
 // crustify:todo: e656_runOn
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1337  (57 body lines, level 12)
@@ -4962,5 +4991,73 @@ mod unit_tests {
             &StatedScheme,
             &mut sites,
         );
+    }
+
+    /// 655/656 — every immutable descriptor is visited under the one manager, the invalid one
+    /// included: two skipping transfers ask `getMaxNumRegisters()` twice, and the memoised stream
+    /// count spans both of their base addresses.
+    #[test]
+    fn e655_visits_every_immutable_descriptor_including_the_invalid_one() {
+        struct CountingRegisters {
+            asked: std::cell::Cell<usize>,
+        }
+
+        impl PinningSchemeManager for CountingRegisters {
+            fn max_num_registers(&self) -> MaxRegNum {
+                self.asked.set(self.asked.get() + 1);
+                MaxRegNum(4)
+            }
+
+            fn memory_unit(&self) -> DfirUnit {
+                DfirUnit::Hbm
+            }
+
+            fn find_closest_pinned_addr(
+                &self,
+                _ev_x: EvaluatedValue,
+                _ev_y: EvaluatedValue,
+                _region: RegionSite,
+                _element_size: Bits,
+            ) -> EvaluatedValue {
+                unreachable!("both transfers take the skip arm, so neither is pinned")
+            }
+        }
+
+        let original = vec![load_and_store(1, 2, 5, 10)];
+        let mut body = original.clone();
+        let mut pass = AddressPinningAndTogglePass::default();
+        // The second descriptor is INVALID — two base addresses under no pattern — and the loop
+        // visits it all the same.
+        pass.immut_data_transfer_descriptors
+            .insert(transfer(None, 1));
+        pass.immut_data_transfer_descriptors
+            .insert(transfer(None, 2));
+        let scheme = CountingRegisters {
+            asked: std::cell::Cell::new(0),
+        };
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+
+        pass.process_data_transfers(
+            &mut body,
+            ScalarTy::Index,
+            ProgStitch::Stitched,
+            &mut OutOfScopeEvaluator,
+            &scheme,
+            &mut sites,
+        );
+
+        // Both descriptors reached e653's skip arm, which is the only arm that asks the manager for a
+        // register count.
+        assert_eq!(scheme.asked.get(), 2);
+        // `EvaluatedValue(0)` and `EvaluatedValue(1)`, so the count spans BOTH descriptors.
+        assert_eq!(pass.num_streams, Some(StreamCount(2)));
+        assert_eq!(body, original);
+        assert!(consts.is_empty());
     }
 }
