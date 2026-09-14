@@ -5808,7 +5808,116 @@ pub fn match_ddl2_dsc<S: MatchSite + ?Sized>(
 //   extract   : crustify-ddc/cpp/ddl.cpp:3845-4287
 //   calls     : e021_getOpFuncName, e172_processTypes, e173_addInternalTensor, e175_getTensorProp, e177_dump, e183_dump, e187_clear, e272_print, e274_processDimensionOp, e278_checkMetaDimensions, e322_processPaddedDimensionOp
 
-// crustify:todo: e364_parseDdl2Dsc
+/// THE PARSED DDL ROOT AS ITS TWO PRE-ORDER WALKS SEE IT — every region of the module, plus the body
+/// of each `ddl.dataflow` and each `ddl.transformations` in walk order.
+///
+/// ⛔ A PARAMETER AND NOT [`crate::schedule::ddl::DdlModuleOp`]'S OWN VALUE, for the same reason
+/// [`RegionTree`] is one: `ddlMlirRoot->walk<WalkOrder::PreOrder>` is the MECHANISM for reaching a
+/// region, the generated tables carry no `mlir::Region` identity, and what entry 363 stores is the
+/// verifier witnesses rather than a region graph.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DdlRoot<'d> {
+    /// Every region of the module, which is what [`process_region`] descends.
+    pub regions: RegionTree<'d>,
+    /// `dfOp.getBody()` per `ddl.dataflow`.
+    pub dataflows: Vec<RegionId>,
+    /// `trOp.getBody()` per `ddl.transformations`.
+    pub transformations: Vec<Vec<Transformation>>,
+}
+
+/// `insertOtherEnds` (`ddl_conversion.cpp:2795-2814`) — every node of `other_end` appended to the
+/// other-end list of every node of `base`.
+///
+/// ⛔ BOTH `DT_ERROR`S ARE [`None`]: an empty `other_end` is *"does not have matching syncs"*, and one
+/// unit on two nodes of `base` is *"Multiple sync ops ... have same unit"* — the unit set spans the
+/// WHOLE list, so that check is ACROSS the nodes and not within one.
+/// ⛔ AND A THIRD IS THIS PORT'S OWN: [`SyncEnds`] links by NAME where the reference holds live tree
+/// pointers, so a name no `SYNC` node of the tree carries is a link that cannot be followed.
+fn insert_other_ends(
+    state: &mut DdlConversion,
+    base: &[NodeName],
+    other_end: &[NodeName],
+) -> Option<()> {
+    if other_end.is_empty() {
+        return None;
+    }
+    let mut units: BTreeSet<SenComponent> = BTreeSet::new();
+    for name in base {
+        let node = state.tree.find_sync_mut(|sync| sync.name == *name)?;
+        for unit in node.units.iter() {
+            if !units.insert(unit) {
+                return None;
+            }
+        }
+        node.other_ends.extend(other_end.iter().cloned());
+    }
+    Some(())
+}
+
+/// Replaces: e364_parseDdl2Dsc
+///
+/// WALKS THE MATCHED DDL INTO THE SCHEDULE TREE — every `ddl.dataflow` body under one root-level
+/// block, then every `ddl.transformations` body, then the two ends of every sync signal onto each
+/// other. The diagnostics are [`process_transformations`]'s, forwarded.
+///
+/// ⛔ [`None`] IS `DT_CHECK(metadata_.belowLxScheduleInsertBlock)`, every refusal the two walks
+/// answer with, and both `DT_ERROR`s of the pairing.
+/// ⛔ TRAP: `root_level_operations` IS ALWAYS MINTED IN PRACTICE — `belowLxScheduleInsertBlock` is
+/// found by `traverseTreeDFSMutable`, which seeds from `head_.next_` and so never yields `head_`
+/// (`dsc/dsc2.cpp:2233`) — but the comparison is the reference's and is kept, not collapsed.
+pub fn parse_ddl2_dsc<S: DdlSite + ?Sized>(
+    program: &Program,
+    state: &mut DdlConversion,
+    interface: &mut DdlInterface,
+    metadata: &mut Metadata,
+    dsc: &mut DesignSpaceConfig,
+    site: &mut S,
+    root: &DdlRoot<'_>,
+) -> Option<Vec<String>> {
+    let head = state.tree.head().name.clone();
+    let below = metadata.below_lx_schedule_insert_block?;
+    let insertion = if state.block_name(below) == Some(head.clone()) {
+        head
+    } else {
+        let name = NodeName("root_level_operations".to_owned());
+        state
+            .tree
+            .head_mut()
+            .add_child_front(SchedNode::Block(BlockNode {
+                name: name.clone(),
+                children: Vec::new(),
+            }));
+        name
+    };
+    for region in &root.dataflows {
+        process_region(
+            program,
+            state,
+            interface,
+            metadata,
+            dsc,
+            site,
+            &root.regions,
+            *region,
+            &insertion,
+        )?;
+    }
+    let mut said = Vec::new();
+    for body in &root.transformations {
+        said.extend(process_transformations(
+            program, interface, metadata, dsc, body,
+        )?);
+    }
+    // `// connect sync nodes` (`:2793`) — every signal, per corelet, in both directions.
+    for prop in interface.sync_definitions.values() {
+        for ends in prop.syncs_per_cl.values() {
+            insert_other_ends(state, &ends.senders, &ends.receivers)?;
+            insert_other_ends(state, &ends.receivers, &ends.senders)?;
+        }
+    }
+    Some(said)
+}
+
 //   authority : ddc/ddl/ddl_conversion.cpp:2770  (54 body lines, level 4)
 //   class     : DdlConversion
 //   original  : void DdlConversion::parseDdl2Dsc()
@@ -5870,6 +5979,113 @@ mod unit_tests {
         WkSlice, WkSliceId,
     };
     use crate::units::Core;
+
+    use super::{
+        DdlRoot, SyncEnds, SyncProp, TRANSFER_PROMOTION_DISABLED, Transformation, parse_ddl2_dsc,
+    };
+    use crate::generated::SyncSignal;
+    use crate::schedule::ddc::fold::{BlockId, NodeKind, ScheduleTree};
+
+    /// A ONE-BLOCK TREE, WHICH IS ALL A [`BlockId`] NEEDS: the conversion addresses its own blocks by
+    /// NAME, so `belowLxScheduleInsertBlock` reaches entry 364 as an id it only compares.
+    struct OneBlock;
+
+    impl ScheduleTree for OneBlock {
+        fn kind(&self, _node: NodeId) -> NodeKind {
+            NodeKind::Block
+        }
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+        fn children(&self, _block: BlockId) -> Vec<NodeId> {
+            Vec::new()
+        }
+    }
+
+    /// ⭐⭐ THE WHOLE OF ENTRY 364 OVER ONE MODULE: `root_level_operations` is minted at the FRONT of
+    /// the head, the dataflow region is walked under THAT block, the transformations region turns
+    /// transfer promotion off, and each end of the signal gains the other's name.
+    /// ⛔ AND THE NEGATIVE: senders with NO receivers is *"does not have matching syncs"*.
+    #[test]
+    fn walks_both_regions_under_a_minted_root_block_and_pairs_the_sync_ends() {
+        let program = synthetic(&[], &[]);
+        let sender = NodeName("send".to_owned());
+        let receiver = NodeName("recv".to_owned());
+        let sync = |name: &NodeName, direction| {
+            SchedNode::Sync(SyncNode {
+                name: name.clone(),
+                units: SyncUnits::new(SenComponent::Lxsu, []),
+                direction,
+                strength: SyncStrength::Hard,
+                implicit_sync_ref_transfer: None,
+                other_ends: Vec::new(),
+            })
+        };
+        let run = |receivers: Vec<NodeName>| {
+            let mut interface = DdlInterface::default();
+            interface.sync_definitions.insert(
+                SyncSignal::InputToLxsuToLxluToSync,
+                SyncProp {
+                    separate_corelets: false,
+                    syncs_per_cl: BTreeMap::from([(
+                        None,
+                        SyncEnds {
+                            senders: vec![sender.clone()],
+                            receivers,
+                        },
+                    )]),
+                },
+            );
+            let mut metadata = Metadata::default();
+            metadata.below_lx_schedule_insert_block = BlockId::of(&OneBlock, NodeId(0));
+            let mut dsc = config(Pinning::default(), None);
+            let mut site = Match::default();
+            let mut state = DdlConversion::new(BlockNode {
+                name: NodeName("head".to_owned()),
+                children: vec![
+                    sync(&sender, SyncDirection::Send),
+                    sync(&receiver, SyncDirection::Receive),
+                ],
+            });
+            let said = parse_ddl2_dsc(
+                &program,
+                &mut state,
+                &mut interface,
+                &mut metadata,
+                &mut dsc,
+                &mut site,
+                &DdlRoot {
+                    regions: RegionTree::default(),
+                    dataflows: vec![RegionId(0)],
+                    transformations: vec![vec![Transformation::DisableTransferPromotion]],
+                },
+            );
+            (said, state, interface, metadata)
+        };
+        let (said, state, interface, metadata) = run(vec![receiver.clone()]);
+        assert_eq!(said, Some(vec![TRANSFER_PROMOTION_DISABLED.to_owned()]));
+        assert!(!metadata.transformation_config.enable_moving_data_transfer);
+        let root = NodeName("root_level_operations".to_owned());
+        assert_eq!(
+            state.tree.head().children.first().map(SchedNode::name),
+            Some(&root)
+        );
+        assert_eq!(interface.region2blocks, BTreeMap::from([(RegionId(0), root)]));
+        assert_eq!(
+            state
+                .tree
+                .head()
+                .children
+                .iter()
+                .filter_map(|child| match child {
+                    SchedNode::Sync(node) => Some(node.other_ends.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![vec![receiver.clone()], vec![sender.clone()]]
+        );
+        assert_eq!(run(Vec::new()).0, None);
+    }
 
     /// A program with hand-written statements, wearing the first vendored program's template so that
     /// the census enum is not restated here.

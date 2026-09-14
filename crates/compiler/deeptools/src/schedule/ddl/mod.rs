@@ -219,7 +219,39 @@ pub fn ddl_main_of_file(file: Option<impl DdlSource>, dialect: &Dialect) -> Opti
 //   extract   : crustify-ddc/cpp/ddl.cpp:3772-3785
 //   calls     : e321_DdlMain
 
-// crustify:todo: e363_parseDdl
+/// `DdlModuleOp` (`ddc/ddl/ddl.h:20`) — one parsed DDL module.
+///
+/// ⛔ ALL FOUR COPY/MOVE MEMBERS ARE `= delete` there, because an `mlir::Operation*` may not outlive
+/// the `MLIRContext` owning its storage; [`Verified`] is self-contained, so that coupling is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DdlModuleOp {
+    /// `ddl_module_op_`.
+    module: Option<Verified>,
+}
+
+impl DdlModuleOp {
+    /// Replaces: e363_parseDdl
+    ///
+    /// PARSES ONE `.ddl` ONTO THIS MODULE — a registry holding the `ddl` dialect, then the parse.
+    ///
+    /// ⭐ THE CONTEXT IS NOT OBSERVABLE: `mlir_context_` is read at ONE place in the whole tree, the
+    /// `DdlMain` call on the next line (`ddl.cpp:128`), so a fresh per-buffer `Threading::DISABLED`
+    /// context is [`Dialect::initialize`] plus a performance decision.
+    /// ⛔ A FAILED PARSE CLEARS THE MODULE rather than leaving the previous one — the assignment is
+    /// unconditional, and `OwningOpRef`'s move-assign destroys whatever it held.
+    pub fn parse_ddl(&mut self, input_file: Option<impl DdlSource>) {
+        let registry = Dialect::initialize();
+        self.module = ddl_main_of_file(input_file, &registry);
+    }
+
+    /// `ddl_module_op_.get()` — the module the conversion walks, [`None`] before any parse and after
+    /// one that failed.
+    #[must_use]
+    pub fn module(&self) -> Option<&Verified> {
+        self.module.as_ref()
+    }
+}
+
 //   authority : ddc/ddl/ddl.cpp:121  (9 body lines, level 4)
 //   class     : DdlModuleOp
 //   original  : void DdlModuleOp::parseDdl(const char* input_file)
@@ -229,7 +261,9 @@ pub fn ddl_main_of_file(file: Option<impl DdlSource>, dialect: &Dialect) -> Opti
 #[cfg(test)]
 mod tests_e171 {
     use super::ops::{DdlOp, Dialect, StorageBits, Unverified, Value};
-    use super::{DdlSource, ParsedDdl, ddl_main_of_file, perform_actions, process_buffer};
+    use super::{
+        DdlModuleOp, DdlSource, ParsedDdl, ddl_main_of_file, perform_actions, process_buffer,
+    };
 
     /// A source that hands back a fixed module, standing in for `parseSourceFileForTool`.
     struct Fixed(ParsedDdl);
@@ -293,5 +327,18 @@ mod tests_e171 {
             Some(2)
         );
         assert_eq!(process_buffer(module(Some(StorageBits(4))), &dialect), None);
+    }
+
+    /// ⭐⭐ THE MODULE IS STORED, AND A FAILED PARSE CLEARS IT: `ddl_module_op_ = DdlMain(..)` is
+    /// unconditional, so an unopenable source leaves NOTHING on the op rather than the previous
+    /// module.
+    #[test]
+    fn parse_ddl_stores_the_module_and_a_failed_parse_clears_it() {
+        let mut op = DdlModuleOp::default();
+        assert_eq!(op.module(), None);
+        op.parse_ddl(Some(module(Some(StorageBits(16)))));
+        assert_eq!(op.module().map(|ok| ok.ops().len()), Some(2));
+        op.parse_ddl(None::<Fixed>);
+        assert_eq!(op.module(), None);
     }
 }
