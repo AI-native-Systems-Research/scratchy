@@ -1487,7 +1487,7 @@ impl LoopRollingManager {
 /// Replaces: e642_rollInstrsInBlock
 ///
 /// Collects the block's windows — soft-sync delimited in the L3 case, one rollable instruction each
-/// otherwise — and rolls every run of matching consecutive windows (`:886-962`).
+/// otherwise — and rolls every run of matching consecutive windows (`:886-964`).
 ///
 /// ⛔ EVERY WINDOW PAST `next` IS REMAPPED AFTER A ROLL: the reference's `Block::iterator`s survive
 /// another op's erasure and an [`InstrPos`] ordinal does not, and they all sit in the untouched tail.

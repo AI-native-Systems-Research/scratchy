@@ -548,7 +548,7 @@ pub fn run_on_operation<
         let Some(prog_unit_arg) = prog_unit_args.get(index).copied() else {
             todo!(
                 "OldRegisterInitializationPass::runOnOperation: no program-unit argument for unit \
-                 {index}, which `prog_unit_op.getBody()->getArgument(0)` is (:1240)"
+                 {index}, which `unit_.getRegion().getArguments()[0]` is (:934)"
             )
         };
         if OPT_LEVEL_ZERO && estimator.have_ibuff_space(&unit.body) {

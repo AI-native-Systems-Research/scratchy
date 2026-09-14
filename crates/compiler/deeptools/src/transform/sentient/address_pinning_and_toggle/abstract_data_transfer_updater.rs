@@ -732,7 +732,7 @@ pub(crate) fn update<E: ExpressionEvaluator>(
             dtd.op
         )
     };
-    // `const EvaluatedValue &new_immut_addr_ev = updateImmutableAddr();` (`:1749`)
+    // `const EvaluatedValue &new_immut_addr_ev = updateImmutableAddr();` (`:1748`)
     let new_immut_addr_ev = {
         let snapshot = unit_body.clone();
         let regions: [&[Op]; 1] = [&snapshot];
@@ -759,7 +759,7 @@ pub(crate) fn update<E: ExpressionEvaluator>(
     };
 
     // "if mutable_addr is a constant it cannot be in the middle of a chain. ie it's either not in a
-    // chain or is the head and therefore requires full update." (`:1751-1753`)
+    // chain or is the head and therefore requires full update." (`:1750-1752`)
     if is_constant(mutable_addr, ConstKind::ScalarConstant, defs) {
         updater.update_constant_mutable_addr(
             dtd,
@@ -822,7 +822,7 @@ pub(crate) fn update<E: ExpressionEvaluator>(
         let (Some(prev_v), Some(this_v)) = (prev.base_addr, dtd.base_addr) else {
             todo!(
                 "update: `getOriginalBaseAddrSSA()` is the null `Value` of a descriptor that never \
-                 reached one (:1774-1775)"
+                 reached one (:1775-1776)"
             )
         };
         if is_same_constant(prev_v, this_v, &snapshot) {
@@ -830,13 +830,13 @@ pub(crate) fn update<E: ExpressionEvaluator>(
         }
         todo!(
             "update: DT_ERROR(\"unhandled corner case\") — the chain link at {:?} carries {this_v:?} \
-             where its predecessor carries {prev_v:?} (:1776-1779)",
+             where its predecessor carries {prev_v:?} (:1779-1780)",
             dtd.op
         )
     }
 
     // The `else`: "Offset added by address pinning without semantic verification." is an
-    // `LLVM_DEBUG` warning (`:1785-1787`), and the offset is added right before the transfer.
+    // `LLVM_DEBUG` warning (`:1786-1787`), and the offset is added right before the transfer.
     updater.update_variable_offset_calculation(
         dtd,
         ty,
