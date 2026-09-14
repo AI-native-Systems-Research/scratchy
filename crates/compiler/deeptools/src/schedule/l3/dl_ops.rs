@@ -18557,6 +18557,65 @@ mod tests_e328_e335 {
         assert_eq!(filled.el.dims.dims().extent(PrimaryDim::X), Some(Extent(2)));
     }
 
+    /// e382 — OUT OF SPAN, on this module's `a_dsc`/`Orgs` pair: the two paged datastages are minted
+    /// ONCE, at the first index ABOVE the chunk stage that NO DSC holds, and filling one REPLACES the
+    /// bare entry it was minted as.
+    #[test]
+    fn the_paged_datastages_are_minted_once_above_the_chunk_stage() {
+        let a_paged_dsc = || a_dsc(&[(PrimaryDim::X, 8)], &[(PrimaryDim::X, 2)]);
+        let mut sdsc = SuperDsc::new(
+            DscList::new(a_paged_dsc(), vec![a_paged_dsc()]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        // Above the chunk stage, and each mint makes its own index taken for the WHOLE super-DSC.
+        assert_eq!(new_data_stage_index(&sdsc), DatastageId(2));
+        let one_page = sdsc
+            .dscs_mut()
+            .at_mut(DscIdx(0))
+            .expect("DSC 0")
+            .data_stages
+            .mint_one_page(DatastageId(2));
+        assert_eq!(new_data_stage_index(&sdsc), DatastageId(3));
+        let ibr = sdsc
+            .dscs_mut()
+            .at_mut(DscIdx(0))
+            .expect("DSC 0")
+            .data_stages
+            .mint_ibr(DatastageId(3));
+        assert_eq!(ibr.index(), DatastageId(3));
+        assert_eq!(new_data_stage_index(&sdsc), DatastageId(4));
+        let orgs = Orgs(BTreeMap::from([(
+            LdsIdx(0),
+            Org {
+                indirection: Some(IndirectAlloc::ValueTensor),
+                hbm_pages: Some(BTreeMap::from([(PrimaryDim::X, Extent(2))])),
+            },
+        )]));
+        assert_eq!(
+            add_one_page_data_stage(
+                sdsc.dscs_mut().at_mut(DscIdx(0)).expect("DSC 0"),
+                DscIdx(0),
+                one_page,
+                &[PrimaryDim::X],
+                &orgs,
+            ),
+            Some(())
+        );
+        let stages = &sdsc.dscs().at(DscIdx(0)).expect("DSC 0").data_stages;
+        // The bare entry is GONE, with the stated stage in its place; the IBR's is still bare.
+        assert_eq!(stages.empty_stage(DatastageId(2)), None);
+        assert_eq!(
+            stages
+                .at(DatastageId(2))
+                .and_then(|stage| stage.ss.dims.dims().extent(PrimaryDim::X)),
+            Some(Extent(2))
+        );
+        assert!(stages.holds(DatastageId(3)));
+        assert_eq!(stages.at(DatastageId(3)), None);
+    }
+
     /// e350 — OUT OF SPAN, on this module's `a_dsc`/`Ops`: int4 fixes `IN` at 128 and `OUT` at 64
     /// whatever the core stage says, `J` IS the core stage's extent, an unpadded `I` and everything
     /// else is one, and a dim the core stage does not state is the reference's `-1`.
@@ -20361,12 +20420,307 @@ where
     )
 }
 
-// crustify:todo: e382_run
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7912  (122 body lines, level 9)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::run(SuperDsc &mySDsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:8946-9068
-//   calls     : e001_isSameDscGroup, e053_verifyScheduleTree, e054_prepDsc, e059_getPagedDimensions, e214_optimizeHbmLdsOutputInScheduleTree, e221_fillTransferZeroPaddingInfo, e222_allocAllMem, e289_optimizeHbmTransfers, e290_createChunkLoops, e291_fillTransferMulticastInfo, e292_fillAllocationStartAddrAndOffset, e293_setLxBufferType, e295_fillExplicitTransferSize, e332_createSynchronization …
+/// WHAT ENTRY 333 IS ASKED PER DSC — the three read-only surfaces [`L3OffsetInputs`] carries beside
+/// the super-DSC, keyed by `dscs_` position because entry 382 fills EVERY DSC in turn.
+pub trait DscOffsetFacts {
+    /// That DSC's datastage extents and its address granularity table.
+    type Sizes: v1::StageSizes + v1::OffsetSizes + ?Sized;
+    /// `dscs_.at(dsc).scheduleTree_` as entry 333 walks it.
+    type Nodes: v1::ScheduleNodes + ?Sized;
+    /// The accessors outside this campaign's file list.
+    type Facts: L3OffsetFacts + ?Sized;
+
+    /// [`L3OffsetInputs::sizes`] for that DSC.
+    fn offset_sizes(&self, dsc: DscIdx) -> Option<&Self::Sizes>;
+    /// [`L3OffsetInputs::tree`] for that DSC.
+    fn offset_nodes(&self, dsc: DscIdx) -> Option<&Self::Nodes>;
+    /// [`L3OffsetInputs::facts`] for that DSC.
+    fn offset_facts(&self, dsc: DscIdx) -> Option<&Self::Facts>;
+}
+
+/// `dsc2::transformLxZeroPadInfoInScheduleTree(mySDsc)` — a whole pass over the super-DSC's trees
+/// that lives in `dsc/dsc2.cpp`, OUTSIDE this campaign's file list, so it is one seam call.
+pub trait LxZeroPadTransform {
+    /// That pass, [`None`] for its own refusals.
+    fn transform_lx_zero_pad_info(&mut self, sdsc: &SuperDsc) -> Option<()>;
+}
+
+/// WHAT ENTRY 382 READS — the scheduler's construction arguments and the ONE read-only view of the
+/// super-DSC every step of the stage shares.
+///
+/// ⛔⛔ [`Self::reads`] AND [`L3RunSurgery::env`] MUST BE VIEWS OF THE SAME TREES. Every landed step
+/// of this stage takes its reads and its writes as two carriers because the reference holds one
+/// `this`; a caller handing over two unrelated tree carriers has the surgery land where nothing
+/// reads it back.
+pub struct L3RunInputs<'a, F, P> {
+    /// The read side of `mySDsc` — every `memOrg_`, transfer, allocation, datastage, loop nesting and
+    /// op func the stage looks at.
+    pub reads: &'a F,
+    /// The design space's placement, which entry 222 sizes and names buffers through.
+    pub placement: &'a P,
+    /// `lxBufferTypeMode` (`L3DlOpsScheduler.h:222`).
+    pub lx_buffer_mode: LxBufferTypeMode,
+    /// The fold manager's own address coordinates, which entry 292 places along.
+    pub coords: &'a AddressFoldCoords,
+}
+
+/// WHERE ENTRY 382 WRITES — the five mutable carriers the stage's steps take, held TOGETHER because
+/// three of them go to a single callee at once and separate accessors could not borrow all three.
+pub struct L3RunSurgery<'a, E: ?Sized, M: ?Sized, K: ?Sized, S: ?Sized> {
+    /// The schedule-tree surgery, the transfer writes and the allocation sites — ONE carrier because
+    /// it is the reference's one `this`.
+    pub env: &'a mut E,
+    /// The allocate nodes every committed LX allocation is written into.
+    pub allocs: &'a mut v1::AllocArena,
+    /// `memTrackers` — where entry 222 places each allocation, per execution phase.
+    pub trackers: &'a mut M,
+    /// Where entry 333's `DataInfo` fills land.
+    pub sink: &'a mut K,
+    /// `dimToSymbolMapping_`'s table, which entry 333 defines variables in.
+    pub symbols: &'a mut S,
+}
+
+/// `getNewDataStageIndex(mySDsc, dsc)` (`L3DlOpsScheduler.cpp:6606`) — the first datastage index
+/// ABOVE the chunk stage that NO DSC of the super-DSC holds.
+///
+/// ⭐ THE SCAN ASKS EVERY DSC AT ONCE, and that is entry 058's own documented divergence: the
+/// reference skips the indices `dsc` holds in an inner `while` and then RESTARTS its outer loop on a
+/// clash with another DSC, which only terminates once the index is free everywhere.
+fn new_data_stage_index(sdsc: &SuperDsc) -> DatastageId {
+    let mut index = DatastageId(DATA_STAGE_CHUNK.0.saturating_add(1));
+    while sdsc.dscs().iter().any(|dsc| dsc.data_stages.holds(index)) {
+        index = DatastageId(index.0.saturating_add(1));
+    }
+    index
+}
+
+/// Replaces: e382_run
+///
+/// STAGE 2A: prepares every DSC, picks the LX buffering, builds the chunk loop nest with its
+/// allocations and transfers, states the paged, chunk and super-chunk datastages, optimises,
+/// synchronises and commits, then fills every address, offset, pad, multicast and coordinate.
+///
+/// ⛔ [`None`] IS EVERY CALLEE'S REFUSAL AND *"Memory allocation must be valid to commit."*.
+/// ⛔ `DISABLE_ABOVE_LX_CHUNK_EXPLORE` IS `CHUNK_EXPLORE` — this crate forbids env gates.
+pub fn run<const CHUNK_EXPLORE: bool, A, F, P, E, M, K, S>(
+    sdsc: &mut SuperDsc,
+    inputs: &L3RunInputs<'_, F, P>,
+    surgery: &mut L3RunSurgery<'_, E, M, K, S>,
+) -> Option<()>
+where
+    A: Arch,
+    F: MemOrgs
+        + TransferNodes
+        + ScheduleTrees
+        + DscStages
+        + DscLoopStages
+        + DscTrees
+        + SysFlopsPerByte
+        + ComputeOps
+        + DscOffsetFacts,
+    P: L3Placement + v1::StorageNames,
+    E: DscL3Surgery
+        + DscSyncSurgery
+        + DscTransfers
+        + DscTransferSizes
+        + ChunkLoopNest
+        + DscPagedTrees
+        + CoordPropTrees
+        + AllocationSites
+        + LxZeroPadTransform
+        + ?Sized,
+    <E as DscTrees>::Tree: ScheduleNodes,
+    M: ExPhaseTrackers + ?Sized,
+    K: L3DataInfoSink + ?Sized,
+    S: SymbolTable + ?Sized,
+{
+    // ⭐ ENTRY 054'S METADATA IS DISCARDED: both ids are [`DATA_STAGE_CORE`] and
+    // [`DATA_STAGE_CHUNK`], which every callee below names directly.
+    let _: BTreeMap<DscIdx, SchedulerMetadata> = prep_dsc(sdsc);
+    // "Expect DSCs in the same group" — entry 001 reads no field of any DSC.
+    let _: SameDscGroup = same_dsc_group(sdsc);
+    // `dscMetadata.emplace(dscIdx, Metadata())` — one default entry per DSC, which
+    // `createAllocationAndTransfer` then fills.
+    let mut metadata: BTreeMap<DscIdx, DscMetadata> = dsc_indices(sdsc)
+        .into_iter()
+        .map(|at| (at, DscMetadata::default()))
+        .collect();
+
+    let choice = set_lx_buffer_type::<A, _>(sdsc, inputs.lx_buffer_mode, inputs.reads)?;
+    // The group shares DSC 0's loop order, so entry 290 takes DSC 0's organisations.
+    let orgs = lds_orgs(inputs.reads, DscIdx(0), sdsc.dscs().first())?;
+    let buffering = create_chunk_loops(sdsc, &orgs, &mut *surgery.env, choice)?;
+    create_allocation_and_transfer(
+        sdsc,
+        &mut metadata,
+        buffering,
+        inputs.reads,
+        &mut *surgery.env,
+    )?;
+
+    // The paged datastages, MINTED ONCE FOR THE WHOLE SUPER-DSC: both indices are scheduler members
+    // and entries 334 and 335 mint only on their own `-1`, so the first DSC with paged dims names
+    // them and every later one writes its own stage under the same two.
+    let mut minted: Option<(OnePageStage, IbrStage)> = None;
+    for dsc_idx in dsc_indices(sdsc) {
+        // "Expect a core data stage entry." is [`DesignSpaceConfig::core_stage`]'s own.
+        let paged_dims = {
+            let dsc = sdsc.dscs().at(dsc_idx)?;
+            get_paged_dimensions(&lds_orgs(inputs.reads, dsc_idx, dsc)?)
+        };
+        if paged_dims.is_empty() {
+            continue;
+        }
+        let (one_page, ibr) = match minted {
+            Some(stages) => stages,
+            None => {
+                let at = new_data_stage_index(sdsc);
+                let one_page = sdsc
+                    .dscs_mut()
+                    .at_mut(dsc_idx)?
+                    .data_stages
+                    .mint_one_page(at);
+                let at = new_data_stage_index(sdsc);
+                let ibr = sdsc.dscs_mut().at_mut(dsc_idx)?.data_stages.mint_ibr(at);
+                *minted.insert((one_page, ibr))
+            }
+        };
+        add_one_page_data_stage(
+            sdsc.dscs_mut().at_mut(dsc_idx)?,
+            dsc_idx,
+            one_page,
+            &paged_dims,
+            inputs.reads,
+        )?;
+        add_ibr_data_stage(
+            sdsc.dscs_mut().at_mut(dsc_idx)?,
+            dsc_idx,
+            ibr,
+            one_page,
+            &paged_dims,
+            inputs.reads,
+        )?;
+    }
+
+    // ⭐ THE OTHER THREE FILE STATICS ARE LITERALS: `carryUnneededPadToChunk` (`:48`),
+    // `enableSuperChunkExplore` (`:51`) and `enableSuperChunkEpilogue` (`:54`) are never written.
+    set_chunk_data_stage_params::<CHUNK_EXPLORE, true, A, _, _, _, _, _, _, _>(
+        sdsc,
+        inputs.reads,
+        buffering,
+        minted.map(|(one_page, ibr)| PagedStages {
+            one_page: one_page.index(),
+            ibr: ibr.index(),
+        }),
+        inputs.reads,
+        &metadata,
+        inputs.reads,
+        inputs.reads,
+        inputs.reads,
+        &mut *surgery.allocs,
+        &mut *surgery.trackers,
+        inputs.placement,
+    )?;
+    set_super_chunk_data_stage_params::<true, false, _, _, _, _>(
+        sdsc,
+        buffering,
+        minted.map(|(_, ibr)| ibr),
+        inputs.reads,
+        inputs.reads,
+        &metadata,
+        &mut *surgery.allocs,
+        &mut *surgery.trackers,
+        inputs.placement,
+    )?;
+
+    optimize_hbm_lds_output_in_schedule_tree(sdsc, &mut *surgery.env)?;
+    optimize_hbm_transfers(sdsc, inputs.reads, &mut *surgery.env)?;
+    create_synchronization(
+        sdsc,
+        buffering,
+        inputs.reads,
+        inputs.reads,
+        &mut *surgery.env,
+    )?;
+    // ⭐ NO PAGED DATASTAGE MEANS NO PAGED TENSOR IN ANY DSC, and entry 368's per-DSC pass answers
+    // `Some(())` for an empty `pagedDims` — so skipping the call is the walk the reference makes.
+    if let Some((one_page, ibr)) = minted {
+        let lx_buffer = match buffering {
+            LxBuffering::Double => LxBufferType::Double,
+            LxBuffering::SpatialDouble(stage) => LxBufferType::SpatialDouble(stage),
+        };
+        process_hbm_paged_tensors(
+            sdsc,
+            &mut *surgery.env,
+            &mut metadata,
+            inputs.reads,
+            lx_buffer,
+            ibr,
+            one_page,
+            &mut *surgery.allocs,
+            &mut *surgery.trackers,
+            inputs.placement,
+        )?;
+    }
+
+    for dsc_idx in dsc_indices(sdsc) {
+        // "Memory allocation must be valid to commit." — after this point nothing allocates LX.
+        alloc_all_mem(
+            sdsc.dscs().at(dsc_idx)?,
+            &metadata,
+            dsc_idx,
+            &mut *surgery.allocs,
+            &mut *surgery.trackers,
+            inputs.placement,
+            v1::Commit::IfValid,
+        )?
+        .then_some(())?;
+    }
+
+    fill_transfer_zero_padding_info(sdsc, &mut *surgery.env)?;
+    // `coresSetToGtrGroupNameMap` starts empty on a scheduler built for this one `run`.
+    let mut names = GtrGroupNames::new();
+    fill_transfer_multicast_info(
+        sdsc,
+        inputs.reads,
+        inputs.reads,
+        &mut names,
+        &mut *surgery.env,
+    )?;
+    fill_allocation_start_addr_and_offset(
+        sdsc,
+        inputs.reads,
+        inputs.reads,
+        inputs.coords,
+        &mut *surgery.env,
+    )?;
+    for dsc_idx in dsc_indices(sdsc) {
+        fill_loop_offsets_and_addresses::<A, _, _, _, _, _>(
+            &L3OffsetInputs {
+                sdsc,
+                dsc_idx,
+                sizes: inputs.reads.offset_sizes(dsc_idx)?,
+                tree: inputs.reads.offset_nodes(dsc_idx)?,
+                facts: inputs.reads.offset_facts(dsc_idx)?,
+                allocs: &*surgery.allocs,
+                metadata: metadata.get(&dsc_idx)?,
+                unpadded: v1::UnpaddedIndexing::Allowed,
+            },
+            &mut *surgery.sink,
+            &mut *surgery.symbols,
+        )?;
+    }
+
+    surgery.env.transform_lx_zero_pad_info(sdsc)?;
+    propagate_coordinate(sdsc, &mut *surgery.env)?;
+    fill_explicit_transfer_size(sdsc, inputs.reads, &mut *surgery.env)?;
+    for dsc_idx in dsc_indices(sdsc) {
+        // "Invalid scheduleTree." — read through the carrier that DID the surgery, and the DFS
+        // node-name dump beside it is diagnostics.
+        VerifiedScheduleTree::of(surgery.env.tree(dsc_idx)?)?;
+    }
+    Some(())
+}
 
 #[cfg(test)]
 mod unit_tests {
