@@ -251,6 +251,19 @@ impl DdcAllocateNode {
     pub fn add_alloc_user(&mut self, user: NodeId) {
         *self.alloc_users.entry(user).or_insert(0) += 1;
     }
+
+    /// `removeAllocUser(userNode)` (`dsc/dsc2.h:1022`) — decrements, and erases at zero.
+    ///
+    /// ⛔ ITS *"Schedule node <n> is not in the user list of allocate node <a>"* IS AN ABSENT ENTRY,
+    /// which here is simply no write: a node that was never a user cannot lose a reference.
+    pub fn remove_alloc_user(&mut self, user: NodeId) {
+        if let Some(count) = self.alloc_users.get_mut(&user) {
+            *count -= 1;
+            if *count == 0 {
+                self.alloc_users.remove(&user);
+            }
+        }
+    }
 }
 
 /// WHETHER AN UNUSED ALLOCATION MAY LEAVE THE TREE — `reduceUsersOrDeleteAllocation`'s `canDelete`
@@ -1503,6 +1516,8 @@ pub enum MintedConnect {
     SfpCompressOutputExp,
     /// `<base> + <suffix>` — entry 304's suffix on a connect that is already named.
     Parallel(DataConnect, ParallelSuffix),
+    /// `"autoshuffle_edge_<n>"` — entry 376's edge into one freshly allocated shuffle register.
+    AutoshuffleEdge(AutoShuffleName),
 }
 
 impl MintedConnect {
@@ -1516,9 +1531,15 @@ impl MintedConnect {
             Self::LxCompressOutputExp => "lx_compress_output_exp".to_string(),
             Self::SfpCompressOutputExp => "sfp_compress_output_exp".to_string(),
             Self::Parallel(base, suffix) => format!("{}{}", base.spelling(), suffix.spelling()),
+            Self::AutoshuffleEdge(name) => format!("autoshuffle_edge_{}", name.0),
         }
     }
 }
+
+/// ONE AUTOMATIC-SHUFFLE NAME SUFFIX — entry 376's `name_counter` (`ddc/ddc_transformation.cpp:1854`),
+/// which suffixes BOTH an intermediate register's `dsName_` and its `dataConnect_` so the two agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AutoShuffleName(pub u32);
 
 /// HOW A MINTED `data_connect=` REACHES THE CRATE'S CENSUS.
 pub trait MintedConnects {

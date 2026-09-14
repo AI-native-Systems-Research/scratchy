@@ -7248,12 +7248,366 @@ where
 //   extract   : crustify-ddc/cpp/ddc.cpp:14384-14734
 //   calls     : e073_addPropInfo, e075_getCurrItem, e078_dbgPrint, e079_dbgPrint, e082_getCompRowId, e086_isAllocateIncoming, e230_addPropInfo, e232_reset, e233_dbgPrint, e238_getRelatedComputeCoord, e240_buildFoldForExternalAllocation, e356_buildFoldForAllocation, e357_buildFoldForCompute, e358_buildFoldForTransfer
 
-// crustify:todo: e375_coordinateCapture
-//   authority : ddc/ddc_fold.cpp:1538  (86 body lines, level 6)
-//   class     : Ddc
-//   original  : void Ddc::coordinateCapture()
-//   extract   : crustify-ddc/cpp/ddc.cpp:14875-14961
-//   calls     : e076_print, e102_print, e370_buildAndPropagateFold
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐ USES FOR ENTRY 375.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+use crate::schedule::dsc2::NodeName;
+
+/// WHAT ENTRY 375 CANNOT REACH YET — `buildAndPropagateFold()` (`ddc/ddc_fold.cpp:1625`), which is
+/// entry 370 and not this batch.
+///
+/// ⛔ THE SEAM ENTRY 375 REACHES IT THROUGH, AND NOT A STAND-IN: the fold this report reads off every
+/// node is built there, and only the report itself is entry 375's.
+pub trait FoldConstruction {
+    /// `buildAndPropagateFold()`.
+    fn build_and_propagate_fold(&mut self);
+}
+
+/// `debugPrint`'s `printContent` (`dsc/dsc2.h:361`) as entry 375 sets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordContent {
+    /// `printContent = true`.
+    Included,
+    /// `printContent = false`.
+    Omitted,
+}
+
+/// `coordFoldReportLevel_` AS ITS THREE THRESHOLDS — `> 0`, `> 1` and `> 2` is the whole of what the
+/// level means to entry 375.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum CoordFoldReport {
+    /// `0` — no report.
+    #[default]
+    Off,
+    /// `1` — every node's header and every coordinate.
+    Coordinates,
+    /// `2` — the same, with `printContent` set.
+    CoordinateContent,
+    /// `3` and above — the same, plus each node's own `print`.
+    NodeContent,
+}
+
+impl CoordFoldReport {
+    /// `coordFoldReportLevel_ > 0`.
+    const fn reports(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// `coordFoldReportLevel_ > 1`.
+    const fn content(self) -> CoordContent {
+        match self {
+            Self::Off | Self::Coordinates => CoordContent::Omitted,
+            Self::CoordinateContent | Self::NodeContent => CoordContent::Included,
+        }
+    }
+
+    /// `coordFoldReportLevel_ > 2`.
+    const fn prints_nodes(self) -> bool {
+        matches!(self, Self::NodeContent)
+    }
+}
+
+/// ONE NODE OF THE CAPTURE WALK WITH THE COORDINATES THE FOLD GAVE IT —
+/// `traverseTreeDFSMutable(nullptr, {ALLOCATE, COMPUTE, TRANSFER})` projected onto exactly the
+/// fields entry 375 reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapturedNode {
+    /// `ALLOCATE` — `name_`, `component_` and `allocateCoordinates_`.
+    Allocate {
+        /// The node itself, for `allocNode->print`.
+        node: NodeId,
+        /// `name_`.
+        name: NodeName,
+        /// `component_`.
+        memory: SenComponent,
+        /// `allocateCoordinates_`.
+        coordinates: dsc2::Coordinate,
+    },
+    /// `TRANSFER` — its two ends and `transferCoordinates_`.
+    Transfer {
+        /// The node itself, for `transferNode->print`.
+        node: NodeId,
+        /// `name_`, `src_` and `dstVias_`.
+        body: TransferNode,
+        /// `transferCoordinates_`.
+        coordinates: dsc2::Coordinate,
+    },
+    /// `COMPUTE` — its op and operands, `inputCoordinates_` and `outputCoordinate_`.
+    Compute {
+        /// The node itself, for `computeNode->print`.
+        node: NodeId,
+        /// `name_`, `type_`, `inputs_` and `outputs_`.
+        body: ComputeNode,
+        /// `inputCoordinates_`, in order.
+        inputs: Vec<dsc2::Coordinate>,
+        /// `outputCoordinate_`.
+        output: dsc2::Coordinate,
+    },
+}
+
+/// WHAT ENTRY 375 READS TO WRITE ITS REPORT — the capture walk, plus the two `dsc/dsc2.h` printers
+/// that sit outside this campaign's file census.
+pub trait CoordinateCapture: FoldConstruction {
+    /// `traverseTreeDFSMutable(nullptr, {ALLOCATE, COMPUTE, TRANSFER})`, in the traversal's order.
+    fn captured_nodes(&self) -> Vec<CapturedNode>;
+
+    /// `coord.debugPrint(std::cout, printContent)` (`dsc/dsc2.h:361`).
+    fn coordinate_text(&self, coord: &dsc2::Coordinate, content: CoordContent) -> String;
+
+    /// `node->print(std::cout)` — `AllocateNode`, `TransferNode` and `ComputeNode` each override it.
+    fn node_text(&self, node: NodeId) -> String;
+}
+
+/// `"\n================================"` — 32 columns, per node.
+const CAPTURE_RULE: &str = "\n================================";
+
+/// `"\n--------------------------"` — 26 columns, around each input's number.
+const INPUT_RULE: &str = "\n--------------------------";
+
+/// Replaces: e375_coordinateCapture
+///
+/// Builds and propagates the fold, then reports every allocate, transfer and compute node together
+/// with the coordinates that fold gave it.
+///
+/// ⚠️ TRAP: LEVEL 2 PRINTS EXACTLY WHAT LEVEL 1 PRINTS — `debugPrint` never reads its `printContent`
+/// or `ps` parameters (`dsc/dsc2.h:361-429`), so the `> 1` argument is inert.
+/// ⚠️ TRAP: a compute's `"(storage=..)"` labels read `inputs_`/`outputs_`, which are the UNIT vectors
+/// (`dsc/dsc2.h:906`), while the loops are bounded by the `..LdsAndLoopOffsets_` sizes — a `.at`
+/// throw the fused [`Operand`] cannot spell.
+pub fn coordinate_capture<S: CoordinateCapture + ?Sized>(
+    dsc: &mut S,
+    report: CoordFoldReport,
+) -> String {
+    dsc.build_and_propagate_fold();
+    if !report.reports() {
+        return String::new();
+    }
+
+    let content = report.content();
+    let mut out = String::new();
+    for captured in dsc.captured_nodes() {
+        out.push_str(CAPTURE_RULE);
+        match captured {
+            CapturedNode::Allocate {
+                node,
+                name,
+                memory,
+                coordinates,
+            } => {
+                out.push_str(&format!("\nAllocateNode: {}", name.0));
+                out.push_str(&format!("\nMemory: {}", memory.spelling()));
+                if report.prints_nodes() {
+                    out.push_str(&dsc.node_text(node));
+                }
+                out.push_str(&dsc.coordinate_text(&coordinates, content));
+            }
+            CapturedNode::Transfer {
+                node,
+                body,
+                coordinates,
+            } => {
+                out.push_str(&format!("\nTransferNode: {}", body.name.0));
+                let dst = body.dsts.first();
+                out.push_str(&format!(
+                    "\nsrc storage: {}, src unit : {}, dst storage: {}, dst unit: {}",
+                    body.src.storage.spelling(),
+                    body.src.unit.spelling(),
+                    dst.storage.spelling(),
+                    dst.unit.spelling()
+                ));
+                if report.prints_nodes() {
+                    out.push_str(&dsc.node_text(node));
+                }
+                out.push_str(&dsc.coordinate_text(&coordinates, content));
+            }
+            CapturedNode::Compute {
+                node,
+                body,
+                inputs,
+                output,
+            } => {
+                out.push_str(&format!("\nComputeNode: {}", body.name.0));
+                out.push_str(&format!("\nOp: {}", body.op.cpp_spelling()));
+                out.push_str(", inputs:[ ");
+                for input in &body.inputs {
+                    out.push_str(&format!("(storage={}) ", input.unit.spelling()));
+                }
+                out.push_str("], outputs:[ ");
+                for output in &body.outputs {
+                    out.push_str(&format!("(storage={}) ", output.unit.spelling()));
+                }
+                out.push(']');
+                if report.prints_nodes() {
+                    out.push_str(&dsc.node_text(node));
+                }
+                out.push_str("\n\nInput coordinates:");
+                for (index, coord) in inputs.iter().enumerate() {
+                    // The reference's `std::endl` is the newline that closes the second rule.
+                    out.push_str(&format!("{INPUT_RULE}\n  input= {index}{INPUT_RULE}\n"));
+                    out.push_str(&dsc.coordinate_text(coord, content));
+                }
+                out.push_str("\n\nOutput coordinates:");
+                out.push_str(&dsc.coordinate_text(&output, content));
+            }
+        }
+    }
+    out
+}
+
+// ⭐ TESTS FOR ENTRY 375.
+#[cfg(test)]
+mod tests_e375 {
+    use super::*;
+    use crate::schedule::ddl::ops::DdlComputeType;
+    use crate::schedule::dsc2::{
+        DataInfo, Dsts, InstrAttribute, NodeName, NumChunks, ReplicationFactor, TransferPadding,
+    };
+    use crate::units::NumFolds;
+    use std::cell::Cell;
+
+    /// A DSC WHOSE THREE CAPTURED NODES COVER ALL THREE ARMS, and whose two printers TAG what they
+    /// were handed so the report's order and its `printContent` argument are both readable.
+    struct Report {
+        built: Cell<u32>,
+        coords: Cell<u32>,
+        nodes: Vec<CapturedNode>,
+    }
+
+    impl FoldConstruction for Report {
+        fn build_and_propagate_fold(&mut self) {
+            self.built.set(self.built.get() + 1);
+        }
+    }
+
+    impl CoordinateCapture for Report {
+        fn captured_nodes(&self) -> Vec<CapturedNode> {
+            self.nodes.clone()
+        }
+
+        fn coordinate_text(&self, _coord: &dsc2::Coordinate, content: CoordContent) -> String {
+            let index = self.coords.get();
+            self.coords.set(index + 1);
+            format!("\n<coord {index} {content:?}>")
+        }
+
+        fn node_text(&self, node: NodeId) -> String {
+            format!("\n<print {}>", node.0)
+        }
+    }
+
+    fn operand(unit: SenComponent, storage: SenComponent) -> Operand {
+        Operand {
+            unit,
+            storage,
+            data: DataInfo {
+                data_connect: None,
+                my_lds_idx: None,
+                constant_id: None,
+                latch_data_id: None,
+            },
+        }
+    }
+
+    fn report() -> Report {
+        let transfer = TransferNode {
+            name: NodeName("t0".to_owned()),
+            src: operand(SenComponent::L3lu, SenComponent::Hbm),
+            dsts: Dsts::new(operand(SenComponent::Lxlu0, SenComponent::Lx), Vec::new()),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
+        };
+        let compute = ComputeNode {
+            name: NodeName("c0".to_owned()),
+            op: DdlComputeType::Macc,
+            ex_unit: SenComponent::Pe,
+            inputs: vec![
+                operand(SenComponent::Pe, SenComponent::Pelrf),
+                operand(SenComponent::Sfp, SenComponent::Sfplrf),
+            ],
+            outputs: vec![operand(SenComponent::Lx, SenComponent::Lx)],
+            num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
+        };
+        Report {
+            built: Cell::new(0),
+            coords: Cell::new(0),
+            nodes: vec![
+                CapturedNode::Allocate {
+                    node: NodeId(1),
+                    name: NodeName("allocate_lds0_lx".to_owned()),
+                    memory: SenComponent::Lx,
+                    coordinates: dsc2::Coordinate::default(),
+                },
+                CapturedNode::Transfer {
+                    node: NodeId(2),
+                    body: transfer,
+                    coordinates: dsc2::Coordinate::default(),
+                },
+                CapturedNode::Compute {
+                    node: NodeId(3),
+                    body: compute,
+                    inputs: vec![dsc2::Coordinate::default(), dsc2::Coordinate::default()],
+                    output: dsc2::Coordinate::default(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn the_top_level_reports_every_node_with_the_coordinates_the_fold_gave_it() {
+        let mut dsc = report();
+        let text = coordinate_capture(&mut dsc, CoordFoldReport::NodeContent);
+        assert_eq!(dsc.built.get(), 1);
+        // The two rules are 32 and 26 columns wide, counted rather than transcribed.
+        assert_eq!(text.matches(&"=".repeat(32)).count(), 3);
+        assert!(!text.contains(&"=".repeat(33)));
+        assert_eq!(text.matches(&"-".repeat(26)).count(), 4);
+        assert!(!text.contains(&"-".repeat(27)));
+        assert_eq!(
+            text,
+            "\n================================\
+             \nAllocateNode: allocate_lds0_lx\
+             \nMemory: lx\
+             \n<print 1>\
+             \n<coord 0 Included>\
+             \n================================\
+             \nTransferNode: t0\
+             \nsrc storage: hbm, src unit : l3lu, dst storage: lx, dst unit: lxlu0\
+             \n<print 2>\
+             \n<coord 1 Included>\
+             \n================================\
+             \nComputeNode: c0\
+             \nOp: macc, inputs:[ (storage=pe) (storage=sfp) ], outputs:[ (storage=lx) ]\
+             \n<print 3>\
+             \n\nInput coordinates:\
+             \n--------------------------\
+             \n  input= 0\
+             \n--------------------------\
+             \n\n<coord 2 Included>\
+             \n--------------------------\
+             \n  input= 1\
+             \n--------------------------\
+             \n\n<coord 3 Included>\
+             \n\nOutput coordinates:\
+             \n<coord 4 Included>"
+        );
+    }
+
+    #[test]
+    fn level_zero_still_builds_the_fold_and_reports_nothing() {
+        let mut dsc = report();
+        assert!(coordinate_capture(&mut dsc, CoordFoldReport::Off).is_empty());
+        assert_eq!(dsc.built.get(), 1);
+    }
+}
 
 // ⭐ TESTS FOR ENTRIES 078-085. Union this module with this file's other test modules when they land.
 #[cfg(test)]
