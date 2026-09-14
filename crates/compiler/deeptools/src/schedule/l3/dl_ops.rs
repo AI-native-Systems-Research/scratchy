@@ -13433,6 +13433,8 @@ mod tests_e283_e295 {
     // ⭐ AND SO ARE ENTRIES 366, 367 AND 369: the two searches score with entries 285's and 286's own
     // `a_transferred_input`, and entry 369's coordinate is entry 355's work slices over entry 287's
     // cross-core reduction — a second copy of either fixture would be a second answer.
+    // ⭐ AND SO IS ENTRY 380, whose own two searches ARE entries 366 and 367 — it drives them over
+    // this module's `a_transferred_input`, so a third copy of that fixture would be a third answer.
     use super::*;
 
     use crate::arch::{Dd2, Sen1p5};
@@ -13440,8 +13442,8 @@ mod tests_e283_e295 {
     use crate::schedule::ddc::fold::{ConstIdx, DistributedLoop, Stride};
     use crate::schedule::dsc2::{AllocLayout, AllocPlacement, LayoutDims, MaxDimSize, StartAddress};
     use crate::schedule::l3::dsc::{
-        CoreIdsUsed, DataStage, DscList, Granularity, LabeledDsList, MaxSize, NamedDims,
-        PlacedAllocation, PrimaryDsInfo, SelectedCandidate, StageDims, VolumeLimit,
+        CoreIdsUsed, DataStage, DscList, DscScheduleStep, Granularity, LabeledDsList, MaxSize,
+        NamedDims, PlacedAllocation, PrimaryDsInfo, SelectedCandidate, StageDims, VolumeLimit,
     };
 
     fn core(index: u32) -> Core {
@@ -15500,6 +15502,153 @@ mod tests_e283_e295 {
         // advance is the improvement towards it.
         assert_eq!(search(0.005, 1), (Some(()), Some(0)));
         assert_eq!(search(0.005, 2), (Some(()), Some(1)));
+    }
+
+    /// e380 — OUT OF SPAN, on entries 285's and 286's own `a_transferred_input`: the transferred input
+    /// is double-buffered, so entry 366's search runs and settles `I` on the widest candidate the core
+    /// extent admits; a DSC nothing pins is all-LX-local, so its chunk stage IS its core stage renamed;
+    /// and a DSC that is BOTH HBM-pinned and neighbour-fetched is *"Do not support double buffering and
+    /// input-neighbor fetch coexisting in the same DSC."*
+    #[test]
+    fn the_chunk_stage_is_the_core_stage_renamed_unless_a_tensor_is_transferred() {
+        /// `computeOp_` naming no op func, so entry 377's minimum is the default one.
+        struct NoOps;
+
+        impl ComputeOps for NoOps {
+            fn op_funcs(&self) -> v1::OpFuncs {
+                v1::OpFuncs::new(None, Vec::new())
+            }
+            fn set_first_op_func(&mut self, _op_func: OpFunc) {}
+        }
+
+        /// `sysFlopsPerByte` — unreached, because this fixture has no dimension reuse.
+        struct Sys;
+
+        impl SysFlopsPerByte for Sys {
+            fn sys_flops_per_byte(&self, _format: OpFuncDataFormat) -> FlopPerByte {
+                FlopPerByte(0.0)
+            }
+        }
+
+        // ⛔ EVERY non-combined dim STATED on the core stage: entry 207's documented divergence refuses
+        // a non-chunk dim the stage leaves at the reference's `-1`, and this unit explores all ten.
+        let stated: Vec<(PrimaryDim, i64)> = explored_primary_dims()
+            .into_iter()
+            .map(|dim| (dim, if dim == PrimaryDim::I { 4 } else { 1 }))
+            .collect();
+
+        let (mut sdsc, orgs, transfers, tree) = a_transferred_input();
+        sdsc.dscs_mut()
+            .at_mut(DscIdx(0))
+            .expect("the one DSC of the fixture")
+            .data_stages
+            .set(DATA_STAGE_CORE, stage("core", &stated));
+        assert_eq!(
+            set_chunk_data_stage_params::<true, false, Target, _, _, _, _, _, _, _>(
+                &mut sdsc,
+                &NoOps,
+                LxBuffering::Double,
+                None,
+                &Sys,
+                &BTreeMap::from([(DscIdx(0), DscMetadata::default())]),
+                &orgs,
+                &transfers,
+                &tree,
+                &mut v1::AllocArena::new(),
+                &mut Trackers,
+                &Placement,
+            ),
+            Some(())
+        );
+        let chunk = sdsc.dscs().first().data_stages.chunk().clone();
+        assert_eq!(chunk.ss.name, StageName::chunk());
+        // `I` is the one chunk dim: its candidates run from entry 377's minimum of 1 up to the core
+        // extent, and the widest of them bursts widest.
+        assert_eq!(chunk.ss.dims.dims().extent(PrimaryDim::I), Some(Extent(4)));
+        // A non-chunk dim's one candidate is the core extent, which is what gets written back.
+        assert_eq!(chunk.ss.dims.dims().extent(PrimaryDim::J), Some(Extent(1)));
+
+        // Nothing pinned and nothing fetched: `addOrUpdateDataStageParam(core.ss_, "chunk", ..)`.
+        let mut dsc = a_dsc(&stated, &[(PrimaryDim::I, 2)]);
+        dsc.primary_ds_info
+            .insert(DsType::Input, layout(&[PrimaryDim::I]));
+        let mut local = a_sdsc(
+            dsc,
+            &[(PrimaryDim::I, 1)],
+            &[(core(0), slice(&[(PrimaryDim::I, 0)]))],
+        );
+        assert_eq!(
+            set_chunk_data_stage_params::<true, false, Target, _, _, _, _, _, _, _>(
+                &mut local,
+                &NoOps,
+                LxBuffering::Double,
+                None,
+                &Sys,
+                &BTreeMap::new(),
+                &Orgs(BTreeMap::new()),
+                &Transfers(Vec::new()),
+                &Tree::default(),
+                &mut v1::AllocArena::new(),
+                &mut Trackers,
+                &Placement,
+            ),
+            Some(())
+        );
+        let chunk = local.dscs().first().data_stages.chunk();
+        assert_eq!(chunk.ss.name, StageName::chunk());
+        assert_eq!(chunk.ss.dims.dims().extent(PrimaryDim::I), Some(Extent(4)));
+
+        // One HBM-pinned tensor and one LX input neighbour in the same DSC is the refusal.
+        let mut dsc = a_dsc(&stated, &[(PrimaryDim::I, 2)]);
+        dsc.primary_ds_info
+            .insert(DsType::Input, layout(&[PrimaryDim::I]));
+        dsc.labeled_ds = LabeledDsList::new(
+            labeled(
+                DsType::Input,
+                LdsIdx(0),
+                &[(PrimaryDim::I, Scale::Sized(1.0))],
+                hbm(),
+            ),
+            vec![labeled(
+                DsType::Input,
+                LdsIdx(1),
+                &[(PrimaryDim::I, Scale::Sized(1.0))],
+                lx(),
+            )],
+        );
+        for lds in [LdsIdx(0), LdsIdx(1)] {
+            dsc.layout_dims
+                .insert(lds, LayoutDims::new(PrimaryDim::I, Vec::new()));
+        }
+        let mut both = a_sdsc(
+            dsc,
+            &[(PrimaryDim::I, 1)],
+            &[(core(0), slice(&[(PrimaryDim::I, 0)]))],
+        );
+        both.core_id_to_dsc_schedule.insert(
+            core(0),
+            vec![DscScheduleStep {
+                data_dsc: Some(DscIdx(0)),
+                dl_dsc: Some(DscIdx(0)),
+            }],
+        );
+        assert_eq!(
+            set_chunk_data_stage_params::<true, false, Target, _, _, _, _, _, _, _>(
+                &mut both,
+                &NoOps,
+                LxBuffering::Double,
+                None,
+                &Sys,
+                &BTreeMap::new(),
+                &Orgs(BTreeMap::new()),
+                &Transfers(Vec::new()),
+                &Tree::default(),
+                &mut v1::AllocArena::new(),
+                &mut Trackers,
+                &Placement,
+            ),
+            None
+        );
     }
 
     /// The output's layout order, which is all the coordinate build asks of the DSC.
@@ -19992,12 +20141,225 @@ pub fn propagate_coordinate<S: CoordPropTrees + ?Sized>(
     Some(())
 }
 
-// crustify:todo: e380_setChunkDataStageParams
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1439  (129 body lines, level 8)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::setChunkDataStageParams(SuperDsc &mySDsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:8807-8936
-//   calls     : e008_hasDimensionReuse, e010_getCoreSplitDimensions, e014_isLabeledDsLXNeighbor, e022_addOrUpdateDataStageParam, e207_generateDscParamCandidates, e222_allocAllMem, e352_updateChunkDataStagesFromCandidates, e366_findBestParamsForMemoryBandwidth, e367_findBestParamsForArithmeticIntensity, e377_getInitialChunkParams
+/// EVERY DIM THE CHUNK SEARCH RANGES OVER — `EnumsConversion::primaryDimToString` LESS the combined
+/// `IJ` and `KIJ`. That map is a `std::map` (`dsc/dims.h:123`), so this is `PrimaryDimTypes`' ordinal
+/// order, and `PrimaryDimTypesCount` is not a [`PrimaryDim`] for the reference's third skip to skip.
+fn explored_primary_dims() -> Vec<PrimaryDim> {
+    PrimaryDim::ALL
+        .into_iter()
+        .filter(|dim| !matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij))
+        .collect()
+}
+
+/// `updateChunkDataStagesFromCandidates` OVER EVERY DSC IN `dscs_` ORDER — entry 380's loop, run once
+/// on the seeded selection and once on the settled one, each DSC's allocation PROBED where the caller
+/// demands it.
+///
+/// ⛔ [`None`] IS THE PROBE THAT DID NOT FIT, which is entry 380's *"Unable to map graph within
+/// architecture constraints"* before the searches and its *"Memory allocation must be valid to
+/// commit."* after them, plus every refusal entry 352 or 222 makes.
+fn write_selected_chunk_stages<const CARRY_UNNEEDED_PAD: bool, M, P>(
+    sdsc: &mut SuperDsc,
+    chunk_params: &mut [FilledDims],
+    selected: &SelectedDscCandidates,
+    buffering: LxBuffering,
+    check_lx: bool,
+    metadata: &BTreeMap<DscIdx, DscMetadata>,
+    allocs: &mut v1::AllocArena,
+    trackers: &mut M,
+    placement: &P,
+) -> Option<()>
+where
+    M: ExPhaseTrackers + ?Sized,
+    P: L3Placement + v1::StorageNames,
+{
+    for at in dsc_indices(sdsc) {
+        let params = chunk_params.get_mut(usize::try_from(at.0).ok()?)?;
+        update_chunk_data_stages_from_candidates::<CARRY_UNNEEDED_PAD>(
+            params,
+            sdsc.dscs_mut().at_mut(at)?,
+            selected.at(at)?,
+            buffering,
+        )?;
+        if check_lx {
+            alloc_all_mem(
+                sdsc.dscs().at(at)?,
+                metadata,
+                at,
+                allocs,
+                trackers,
+                placement,
+                v1::Commit::No,
+            )?
+            .then_some(())?;
+        }
+    }
+    Some(())
+}
+
+/// Replaces: e380_setChunkDataStageParams
+///
+/// STATES EVERY DSC'S CHUNK DATA STAGE. With every tensor LX-local it IS the core stage under the
+/// chunk name; otherwise the initial chunk extents are written and probed, entries 366 and 367 search
+/// from them, and the settled selection is written onto every DSC and probed again.
+///
+/// ⛔ THE COMMITTING LOOP STILL PROBES WITH [`v1::Commit::No`] — the reference's own fourth argument
+/// (`L3DlOpsScheduler.cpp:8933`) despite its *"Memory allocation must be valid to commit."*, so this
+/// unit places nothing; entry 382's own `allocAllMem` is what commits.
+/// ⛔ `DT_CHECK((dim != IJ || dim != KIJ))` IS A TAUTOLOGY: no dim is both, so no chunk dim is checked.
+/// ⛔⛔ TRAP, AND IT IS ENTRY 207'S DOCUMENTED DIVERGENCE BITING HERE: `primaryDims` is EVERY
+/// non-combined dim, and entry 207 REFUSES a non-chunk dim the core stage states no extent for where
+/// the reference records its `-1` as the single candidate. Every `DataStructDims` dim defaults to `-1`
+/// (`dsc/dims.h:162-193`), so a real DSC states only its layout dims and refuses here. This unit
+/// passes the reference's list; narrowing it would be a second divergence.
+/// ⛔ [`None`] IS *"Do not support double buffering and input-neighbor fetch coexisting in the same
+/// DSC."*, both allocation probes, and every refusal entries 014, 207, 222, 352, 366, 367 and 377
+/// make. Both *"Number of DSCs does not match."* checks are unspellable: each list is built by walking
+/// `dscs_`.
+pub fn set_chunk_data_stage_params<
+    const CHUNK_EXPLORE: bool,
+    const CARRY_UNNEEDED_PAD: bool,
+    A: Arch,
+    D,
+    F,
+    O,
+    T,
+    S,
+    M,
+    P,
+>(
+    sdsc: &mut SuperDsc,
+    ops: &D,
+    buffering: LxBuffering,
+    paged: Option<PagedStages>,
+    sys: &F,
+    metadata: &BTreeMap<DscIdx, DscMetadata>,
+    orgs: &O,
+    trees: &T,
+    nesting: &S,
+    allocs: &mut v1::AllocArena,
+    trackers: &mut M,
+    placement: &P,
+) -> Option<()>
+where
+    D: ComputeOps + ?Sized,
+    F: SysFlopsPerByte + ?Sized,
+    O: MemOrgs,
+    T: TransferNodes + ?Sized,
+    S: DscLoopStages + DscTrees + ?Sized,
+    M: ExPhaseTrackers + ?Sized,
+    P: L3Placement + v1::StorageNames,
+{
+    // The residency and the chunk dims are identical across a DSC group, so DSC 0 answers for all of
+    // them.
+    let main = sdsc.dscs().first();
+    let is_reuse = has_dimension_reuse(main);
+    let mut double_buffering = false;
+    let mut input_neighbor_fetch = false;
+    let mut chunk_dims: BTreeSet<PrimaryDim> = BTreeSet::new();
+    for lds in main.labeled_ds.iter() {
+        let hbm_pinned = lds.pinning().hbm();
+        let neighbor = is_labeled_ds_lx_neighbor(sdsc, DscIdx(0), lds)?;
+        if !hbm_pinned && !neighbor {
+            continue;
+        }
+        chunk_dims.extend(main.non_broadcast_lds_dims(lds.recorded())?);
+        double_buffering |= hbm_pinned;
+        input_neighbor_fetch |= neighbor;
+    }
+    // "Do not support double buffering and input-neighbor fetch coexisting in the same DSC."
+    (!(double_buffering && input_neighbor_fetch)).then_some(())?;
+
+    // When all tensors are LX-local the chunk parameters ARE the core parameters, both halves.
+    if !double_buffering && !input_neighbor_fetch {
+        for dsc in sdsc.dscs_mut().iter_mut() {
+            let mut chunk = dsc.data_stages.core().clone();
+            chunk.rename(StageName::chunk());
+            dsc.data_stages.set(DATA_STAGE_CHUNK, chunk);
+        }
+        return Some(());
+    }
+
+    let primary_dims = explored_primary_dims();
+    let mut chunk_params: Vec<FilledDims> = Vec::new();
+    for dsc in sdsc.dscs().iter() {
+        chunk_params.push(initial_chunk_params::<A, D>(sdsc, dsc, ops, &chunk_dims)?);
+    }
+    let core_split_dims = core_split_dimensions(sdsc);
+    let candidates = generate_dsc_param_candidates(
+        sdsc,
+        &chunk_params,
+        &primary_dims,
+        &chunk_dims,
+        &core_split_dims,
+        orgs,
+        paged,
+    )?;
+    let mut selected = SelectedDscCandidates::starting(&candidates, &primary_dims)?;
+
+    // The initial selection is stated first, and under double buffering the chunks it names must
+    // already fit in LX.
+    write_selected_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
+        sdsc,
+        &mut chunk_params,
+        &selected,
+        buffering,
+        double_buffering,
+        metadata,
+        allocs,
+        trackers,
+        placement,
+    )?;
+
+    if CHUNK_EXPLORE {
+        find_best_params_for_memory_bandwidth::<CARRY_UNNEEDED_PAD, _, _, _, _, _>(
+            &mut selected,
+            sdsc,
+            &core_split_dims,
+            buffering,
+            input_neighbor_fetch,
+            metadata,
+            orgs,
+            trees,
+            nesting,
+            allocs,
+            trackers,
+            placement,
+        )?;
+        // Only tensor reuse carried over HBM transfers has a Flops/Byte to trade against.
+        if is_reuse && !input_neighbor_fetch {
+            find_best_params_for_arithmetic_intensity::<CARRY_UNNEEDED_PAD, A, _, _, _, _, _, _, _>(
+                &mut selected,
+                sdsc,
+                ops,
+                &primary_dims,
+                &core_split_dims,
+                buffering,
+                sys,
+                metadata,
+                orgs,
+                trees,
+                nesting,
+                allocs,
+                trackers,
+                placement,
+            )?;
+        }
+    }
+
+    // The settled selection, stated on every DSC — "Memory allocation must be valid to commit."
+    write_selected_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
+        sdsc,
+        &mut chunk_params,
+        &selected,
+        buffering,
+        true,
+        metadata,
+        allocs,
+        trackers,
+        placement,
+    )
+}
 
 // crustify:todo: e382_run
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7912  (122 body lines, level 9)
