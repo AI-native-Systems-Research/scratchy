@@ -25,10 +25,11 @@ use std::collections::BTreeMap;
 use std::num::NonZeroI64;
 
 use crate::arch::{Arch, Bytes};
-use crate::schedule::ddc::fold::{AllocId, ConstIdx, NodeId};
+use crate::schedule::ddc::fold::{AllocId, NodeId};
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{LdsIdx, StartAddress};
+use crate::schedule::l3::dsc::DscIdx;
 use crate::schedule::l3::dl_ops::{
     AddressFoldCoords, ExPhase, ExPhaseTrackers, L3DataInfoSink, L3Fill, L3Placement,
     L3TrackerSite, SymbolOp, SymbolOperand, SymbolTable, VariableSymbol,
@@ -68,8 +69,24 @@ impl L3Placement for Placement {
     /// super-DSC; `DesignSpaceConfig::lx_chunk_capacity` is the SAME call already made for the CHUNK
     /// stage, and reusing it for an arbitrary `(alloc, lds, corelet, row)` would answer a different
     /// question with the same number.
+    /// ⛔⛔ NOT A THREADING GAP — THE CALLEE IS UNPORTED, AND `dsc` NOW PROVES IT. The index reaches
+    /// this method, so it can say WHICH DSC is asked; the body still cannot answer, because
+    /// `getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`) is a thin wrapper that accumulates
+    /// `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3755-3963`, ~210 lines) over the
+    /// layout dims — and THAT is not ported. It needs `getLayoutDims`, `getSizeDataStageForNode`,
+    /// `getCumulativeStickSizes`, `getDimIndexInLayoutOrder`, `primaryDimToVal_st` with padding and
+    /// granularity, `maxSymbolicVolume_`/`symbolicDimInfo_`, the fold-coordinate arm
+    /// (`coreIdToWkSlice_`, `getCoordinateCategoryOfPos`, `getFoldDimSize`), `getPageSize`'s two
+    /// indirect arms, `mxInfo_`, `backGapCore_` and `gapStickSpread_`.
+    /// ⭐ THE PROOF THAT NO ARGUMENT UNBLOCKS IT: the SAME `todo!` stands at
+    /// [`super::Dsc2Reads`]'s `v1::Placement::buffer_capacity` (`stages/ddc_reads.rs:298`), a carrier
+    /// bound to ONE DSC by construction — it already has what this one was missing and still refuses.
+    /// ⛔ `DesignSpaceConfig::lx_chunk_capacity` IS A PRECOMPUTED FIELD, not this call: it is that
+    /// call already made for the CHUNK stage at one site, so reusing it answers a different question
+    /// with the same number.
     fn buffer_capacity_even_sticks(
         &self,
+        _dsc: DscIdx,
         _alloc: AllocId,
         _lds: LdsIdx,
         _corelet: Corelet,
@@ -77,8 +94,9 @@ impl L3Placement for Placement {
     ) -> Bytes {
         todo!(
             "L3Placement::buffer_capacity_even_sticks: wants \
-             DesignSpaceConfig::getBufferCapacityForNode (dsc/dsc2.cpp:3977) over the live \
-             super-DSC's stick sizes — a fabricated capacity would commit a fabricated placement"
+             DesignSpaceConfig::getBufferCapacityForNode (dsc/dsc2.cpp:3977) accumulating \
+             getBufferCapacityForNodePerDimCustomLocation (dsc/dsc2.cpp:3755), which is UNPORTED — \
+             a fabricated capacity would commit a fabricated placement"
         )
     }
 
@@ -95,43 +113,19 @@ impl L3Placement for Placement {
     }
 }
 
-impl v1::StorageNames for Placement {
-    /// ⛔⛔ THE FIELD EXISTS NOW AND THE CARRIER STILL CANNOT SAY WHICH DSC'S. `dsName_` is
-    /// [`crate::schedule::l3::dsc::LdsRecord::name`] and `name_` is
-    /// [`crate::schedule::l3::dsc::ConstantInfo::name`] — [`super::Dsc2Reads`] answers both off them.
-    /// What blocks it HERE is the SHAPE of the stage-2a carrier, not the projection:
-    ///
-    ///   * [`v1::StorageNames`] takes an [`LdsIdx`] and NO [`crate::schedule::l3::dsc::DscIdx`],
-    ///     because the reference reads it off `currDsc_` — a member the scheduler re-points as it goes.
-    ///   * `P` is ONE object for the WHOLE run: [`super::run_l3`] builds a single [`Placement`] and
-    ///     [`crate::schedule::l3::dl_ops::run`] then loops `for dsc_idx in dsc_indices(sdsc)`
-    ///     (`l3/dl_ops.rs:20712`) with that same `&P`.
-    ///
-    /// So an `LdsIdx` reaching this method names a position in SOME DSC's `labeledDs_` and the carrier
-    /// cannot tell which. ⛔ ANSWERING OFF `dscs_.first()` WOULD BE THE FABRICATION: every name here
-    /// goes STRAIGHT TO THE MEMORY TRACKER as a DS key (`ddc/ddcv1.cpp:280`, `:336`, `:341`), so a
-    /// two-DSC super-DSC would place two different tensors against one tracker entry — and it would
-    /// compile, because all 187 programs of `g0/` have exactly one DSC. Threading `currDsc` into this
-    /// trait is the cross-entry work review 382 names, the same cut as [`super::Reads`]/[`super::Env`].
-    fn lds_name(&self, _lds: LdsIdx) -> v1::StorageName {
-        todo!(
-            "v1::StorageNames::lds_name: wants currDsc_->labeledDs_.at(lds).dsName_ — the FIELD is \
-             now l3::dsc::LdsRecord::name, but v1::StorageNames takes no DscIdx and `P` is ONE \
-             carrier for a run that loops every DSC (l3/dl_ops.rs:20712), so this cannot say WHICH \
-             DSC's labeledDs_ the index names; the name is a memory-tracker DS key"
-        )
-    }
-
-    /// ⛔ THE SAME CUT — `constantInfo_.at(constant).name_` is
-    /// [`crate::schedule::l3::dsc::ConstantInfo::name`] now, and `constantInfo_` is a PER-DSC table.
-    fn constant_name(&self, _constant: ConstIdx) -> v1::StorageName {
-        todo!(
-            "v1::StorageNames::constant_name: wants currDsc_->constantInfo_.at(constant).name_ — the \
-             FIELD is now l3::dsc::ConstantInfo::name, but constantInfo_ is PER DSC and \
-             v1::StorageNames takes no DscIdx; see lds_name"
-        )
-    }
-}
+// ⭐⭐ `Placement` NO LONGER ANSWERS [`v1::StorageNames`], AND THAT IS THE FIX RATHER THAN A GAP.
+// The two names were never `P`'s to give: the L3 copy of entry 124 is
+// `getLdsOrConstNameOfAllocNode(DesignSpaceConfig *currDsc, dsc2::AllocateNode *anode)`
+// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5493-5494`) and reads
+// `currDsc->labeledDs_.at(anode->ldsIdx_).dsName_` (`:5498`) and
+// `currDsc->constantInfo_.at(anode->constIdx_).name_` (`:5500`) off the DSC POINTER
+// `allocAllMem(mySDsc, currDsc, dscIdx, commitIfValid)` (`:5509-5511`) was handed — not off a member
+// and not off the scheduler's construction arguments. Only the ddc copy reads a `currDsc_` member,
+// with a ONE-argument call (`ddc/ddcv1.cpp:20-30`, `:280`, `:336`, `:341`), which is why
+// [`v1::StorageNames`] itself keeps its DSC-less signature and [`super::Dsc2Reads`] still implements
+// it. `try_alloc_l3` already holds the very `&DesignSpaceConfig` the reference passes, so the L3 side
+// asks [`crate::schedule::l3::dl_ops::DscNames`] instead and a name can no longer come from the wrong
+// DSC BY CONSTRUCTION — there is no index to get wrong and no `dscs_.first()` to reach for.
 
 /// THE EXECUTION PHASE A PROGRAM IS ACCOUNTED TO — `runDdc`'s `int executionStep`
 /// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:29-30`), which it hands the scheduler as the

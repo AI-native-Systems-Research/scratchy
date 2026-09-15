@@ -273,8 +273,8 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
 };
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{
-    AllocId, AllocLayout, Alpha, Beta, Cardinality, ElemArrDistribution, FoldParamInfo, NodeId,
-    NodeKind, PadType, RefComponents, TemporalLoopDistribution,
+    AllocId, AllocLayout, Alpha, Beta, Cardinality, ConstIdx, ElemArrDistribution, FoldParamInfo,
+    NodeId, NodeKind, PadType, RefComponents, TemporalLoopDistribution,
 };
 use crate::schedule::ddc::metadata::{
     DatastageId, DestIdx, MetaDimKind, stricter_max, stricter_min,
@@ -3294,20 +3294,67 @@ pub fn initial_start_address_and_offset<M: MemOrg + ?Sized>(
     })
 }
 
+/// ⭐⭐ ONE DSC AS THE DDC BODY'S NAME TABLE — the `currDsc` the L3 copy is HANDED.
+///
+/// ⛔⛔ THE TWO AUTHORITY COPIES TAKE DIFFERENT ARGUMENTS, AND THAT IS WHY THIS TYPE EXISTS. The ddc
+/// copy is `getLdsOrConstNameOfAllocNode(dsc2::AllocateNode *anode)` — ONE argument reading the
+/// `currDsc_` MEMBER (`ddc/ddcv1.cpp:20-30`, called that way at `:280`, `:336`, `:341`) — so
+/// [`v1::StorageNames`] rightly takes no DSC and its ddc implementor is bound to one by construction.
+/// The L3 copy is `getLdsOrConstNameOfAllocNode(DesignSpaceConfig *currDsc, dsc2::AllocateNode
+/// *anode)` — TWO (`L3DlOpsScheduler.cpp:5493-5494`), because the L3 scheduler serves the WHOLE
+/// super-DSC and `allocAllMem(mySDsc, currDsc, dscIdx, commitIfValid)` (`:5509-5511`) is handed the
+/// DSC it must read. This is that second argument, so the shared ddc body is reused unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct DscNames<'a>(pub &'a DesignSpaceConfig);
+
+impl v1::StorageNames for DscNames<'_> {
+    /// `currDsc->labeledDs_.at(lds).dsName_` (`L3DlOpsScheduler.cpp:5498`) — off [`LdsRecord::name`].
+    ///
+    /// ⛔ TOTAL BY THE TRAIT'S SIGNATURE, and `.at()` on a `std::vector` THROWS for an index the list
+    /// does not hold — so an absent index panics rather than answering the empty name, which would
+    /// key the memory tracker by a name the reference never used. Same reading as `Dsc2Reads`'.
+    fn lds_name(&self, lds: LdsIdx) -> v1::StorageName {
+        match self.0.labeled_ds.at(lds) {
+            Some(held) => held.record().name.clone(),
+            None => panic!(
+                "v1::StorageNames::lds_name: labeledDs_.at({lds:?}) throws for an absent index"
+            ),
+        }
+    }
+
+    /// `currDsc->constantInfo_.at(constant).name_` (`:5500`) — off [`ConstantInfo::name`].
+    ///
+    /// ⛔ TOTAL LIKEWISE: the empty name is a real value of the field (a constant nothing named), so
+    /// it cannot double as the missing-entry answer — that is the `.at()` throw.
+    fn constant_name(&self, constant: ConstIdx) -> v1::StorageName {
+        match self.0.ddc.constants.get(&constant) {
+            Some(held) => held.name.clone(),
+            None => panic!(
+                "v1::StorageNames::constant_name: constantInfo_.at({constant:?}) throws for an id \
+                 this DSC's table does not hold"
+            ),
+        }
+    }
+}
+
 /// Replaces: e051_getLdsOrConstNameOfAllocNode
 ///
 /// The L3 scheduler's own copy of [`v1::get_lds_or_const_name_of_alloc_node`].
 ///
 /// ⭐⭐ IT DELEGATES BECAUSE THE TWO BODIES ARE IDENTICAL — `Ddc::getLdsOrConstNameOfAllocNode`
 /// (`ddc/ddcv1.cpp:20-30`) differs only in `currDsc` being a member there and a parameter here.
+/// ⭐⭐ SO IT TAKES THE DSC, NOT A NAME CARRIER: that parameter IS `currDsc`
+/// (`L3DlOpsScheduler.cpp:5493-5494`) and a carrier holding none could not say WHICH `labeledDs_` an
+/// index named — while every name it returns goes STRAIGHT to the memory tracker as a DS key
+/// (`ddc/ddcv1.cpp:280`, `:336`, `:341`), so two DSCs answered as one collide two tensors on one entry.
 /// ⚠️ The *"mostly copied from DDC ... frequently synchronize"* TODO the file carries is NOT on this
 /// function: it sits on `allocAllMem` (`:5505`) and `fillLoopOffsetsAndAddresses` (`:5747`).
 #[must_use]
 pub fn get_lds_or_const_name_of_alloc_node(
     anode: &AllocateNode,
-    names: &impl v1::StorageNames,
+    dsc: &DesignSpaceConfig,
 ) -> Option<v1::StorageName> {
-    v1::get_lds_or_const_name_of_alloc_node(anode, names)
+    v1::get_lds_or_const_name_of_alloc_node(anode, &DscNames(dsc))
 }
 
 /// A LOOP ORDER PROVED TO NAME EACH DIM ONCE — `verifyLoopOrder`'s `isGood` made unconstructible
@@ -3802,25 +3849,12 @@ mod tests_e049_e056 {
         );
     }
 
-    /// e051 — it is the DDC's resolver, reached through the L3 scheduler's copy.
-    #[test]
-    fn lds_name_delegates_to_the_ddc_resolver() {
-        struct Names;
-        impl v1::StorageNames for Names {
-            fn lds_name(&self, lds: LdsIdx) -> v1::StorageName {
-                v1::StorageName(format!("lds{}", lds.0))
-            }
-            fn constant_name(
-                &self,
-                _constant: crate::schedule::ddc::fold::ConstIdx,
-            ) -> v1::StorageName {
-                v1::StorageName("constant".to_owned())
-            }
-        }
-        let anode = AllocateNode {
+    /// An LX allocate node naming one labelled DS — the `kv.first` of `tryAlloc`'s `nodeAndSize`.
+    fn lx_alloc_of(lds: LdsIdx) -> AllocateNode {
+        AllocateNode {
             name: NodeName("alloc".to_owned()),
             component: SenComponent::Lx,
-            lds: Some(LdsIdx(2)),
+            lds: Some(lds),
             const_idx: None,
             temp_storage_for_compute: None,
             layout: AllocLayout::new((PrimaryDim::Out, MaxDimSize::Unset), Vec::new()),
@@ -3828,15 +3862,90 @@ mod tests_e049_e056 {
             placement: AllocPlacement::default(),
             gap_stick_spread: BTreeMap::new(),
             alloc_users: Vec::new(),
+        }
+    }
+
+    /// A DSC whose `labeledDs_` holds THREE entries, the one at `at` named `name`.
+    fn dsc_naming(at: LdsIdx, name: &str) -> DesignSpaceConfig {
+        let mut held = dsc(&[(PrimaryDim::Out, 1)], &[(PrimaryDim::Out, 1)]);
+        let entry = |recorded: LdsIdx| {
+            LabeledDs::new(
+                DsType::Input,
+                vec![(PrimaryDim::Out, Scale::Sized(1.0))],
+                recorded,
+                Pinning::default(),
+            )
         };
+        held.labeled_ds = LabeledDsList::new(
+            entry(LdsIdx(0)),
+            vec![entry(LdsIdx(1)), entry(LdsIdx(2))],
+        );
+        held.labeled_ds
+            .at_mut(at)
+            .expect("the fixture states three entries")
+            .set_name(v1::StorageName(name.to_owned()));
+        held
+    }
+
+    /// e051 — it is the DDC's resolver, reached through the L3 scheduler's copy.
+    #[test]
+    fn lds_name_delegates_to_the_ddc_resolver() {
+        let held = dsc_naming(LdsIdx(2), "lds2");
+        let anode = lx_alloc_of(LdsIdx(2));
         assert_eq!(
-            get_lds_or_const_name_of_alloc_node(&anode, &Names),
-            v1::get_lds_or_const_name_of_alloc_node(&anode, &Names)
+            get_lds_or_const_name_of_alloc_node(&anode, &held),
+            v1::get_lds_or_const_name_of_alloc_node(&anode, &DscNames(&held))
         );
         assert_eq!(
-            get_lds_or_const_name_of_alloc_node(&anode, &Names),
+            get_lds_or_const_name_of_alloc_node(&anode, &held),
             Some(v1::StorageName("lds2".to_owned()))
         );
+    }
+
+    /// ⭐⭐ e051 — TWO DSCs, ONE `LdsIdx`, TWO NAMES: the per-DSC thread, tested where a one-DSC
+    /// fixture CANNOT see it.
+    ///
+    /// ⛔⛔ THIS IS THE ONLY TEST THAT SEPARATES A REAL THREAD FROM ONE PLUMBED TO `dscs_.first()`.
+    /// Every other test of this resolver passes either way, because all 187 programs of `g0/` carry
+    /// exactly one DSC (`len(dscs_) == 1`, measured) — so this super-DSC is built BY HAND.
+    ///
+    /// ⭐ WHAT THE REFERENCE DOES, CITED: `getLdsOrConstNameOfAllocNode(currDsc, kv.first)` reads
+    /// `currDsc->labeledDs_.at(anode->ldsIdx_).dsName_` (`L3DlOpsScheduler.cpp:5498`) off the DSC
+    /// `allocAllMem(mySDsc, currDsc, dscIdx, commitIfValid)` (`:5509-5511`) was handed, and entry 382
+    /// hands it each DSC of `dscs_` in turn. So ONE `ldsIdx_` under TWO DSCs is TWO names.
+    ///
+    /// ⛔ AND THE NAMES ARE THE TRACKER'S KEYS — `myTracker->removeDs(...)` (`:5606-5607`) and
+    /// `checkAndAddDs(...)` (`:5620-5622`) take this string, so answering both DSCs off one would
+    /// place two different tensors against ONE `dsInMem_` entry. The assertion carries the VALUES.
+    #[test]
+    fn two_dscs_name_one_lds_index_differently() {
+        // `dscs_` = two DSCs; `DscList::new` takes a non-empty rest, which is the two-DSC case.
+        let dscs = DscList::new(
+            dsc_naming(LdsIdx(1), "Tensor1_of_dsc0"),
+            vec![dsc_naming(LdsIdx(1), "Tensor1_of_dsc1")],
+        );
+        // ONE allocate node, so the only thing that can differ is WHICH DSC was asked.
+        let anode = lx_alloc_of(LdsIdx(1));
+        let at = |index: u32| {
+            get_lds_or_const_name_of_alloc_node(
+                &anode,
+                dscs.at(DscIdx(index)).expect("both DSCs are stated"),
+            )
+        };
+
+        assert_eq!(
+            at(0),
+            Some(v1::StorageName("Tensor1_of_dsc0".to_owned())),
+            "DSC 0's labeledDs_.at(1).dsName_"
+        );
+        assert_eq!(
+            at(1),
+            Some(v1::StorageName("Tensor1_of_dsc1".to_owned())),
+            "DSC 1's labeledDs_.at(1).dsName_ — a DIFFERENT tensor at the SAME index"
+        );
+        // ⛔ THE COLLISION THIS FORBIDS, STATED AS THE VALUES IT WOULD HAVE PRODUCED: answering off
+        // `dscs_.first()` makes both of these `Tensor1_of_dsc0` and the tracker sees ONE key.
+        assert_ne!(at(0), at(1), "two DSCs must not key the tracker identically");
     }
 
     /// e052 — a repeated dim has no loop order, and one that names each dim once keeps its order.
@@ -9029,10 +9138,15 @@ pub trait ExPhaseTrackers {
 /// WHAT ENTRY 222 ASKS OF THE DESIGN SPACE AND THE SUPER-DSC'S FOLD PROPS — all of it
 /// `dsc/designSpaceConfig.h`, outside this campaign's file list.
 pub trait L3Placement {
-    /// `getBufferCapacityForNode(node, lds, comp, corelet, row, bytesPerStick,
+    /// `currDsc->getBufferCapacityForNode(node, lds, comp, corelet, row, bytesPerStick,
     /// /*forceEvenNumSticks*/ true)` — the L3 rounds to an EVEN stick count for ring polarity.
+    ///
+    /// ⛔ `dsc` IS THE `currDsc` THE CALL IS MADE ON (`L3DlOpsScheduler.cpp:5560-5563`): it is a
+    /// `DesignSpaceConfig` METHOD, so which DSC is asked decides `labeledDs_`, `primaryDsInfo_` and
+    /// the layout the capacity is walked over. A carrier answering without it names no DSC at all.
     fn buffer_capacity_even_sticks(
         &self,
+        dsc: DscIdx,
         alloc: AllocId,
         lds: LdsIdx,
         corelet: Corelet,
@@ -9227,6 +9341,7 @@ struct L3Placements {
 /// `DT_ERROR("No support")`, and neither map exists in this stage's [`L3Allocation`] projection.
 fn try_alloc_l3<M, P>(
     dsc: &DesignSpaceConfig,
+    dsc_idx: DscIdx,
     metadata: &DscMetadata,
     allocs: &v1::AllocArena,
     trackers: &mut M,
@@ -9236,7 +9351,7 @@ fn try_alloc_l3<M, P>(
 ) -> Option<bool>
 where
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     let phases = trackers.ex_phases();
     for (&memory, allocation) in &metadata.new_allocations {
@@ -9264,7 +9379,7 @@ where
                 }
                 // The LX buffer must be an even number of sticks for ring polarity (refer to DSI).
                 let capacity =
-                    placement.buffer_capacity_even_sticks(alloc, lds, at.corelet, at.row);
+                    placement.buffer_capacity_even_sticks(dsc_idx, alloc, lds, at.corelet, at.row);
                 let buffers = node.placement.num_buffers.reserved();
                 node_and_size.push((alloc, Bytes(capacity.0.checked_mul(buffers.get())?)));
             }
@@ -9272,7 +9387,7 @@ where
             // before the small ones is what keeps that fragmentation from costing a buffer.
             node_and_size.sort_by(|left, right| right.1.cmp(&left.1));
             for &(alloc, _) in &node_and_size {
-                let name = get_lds_or_const_name_of_alloc_node(allocs.get(&alloc)?, placement)?;
+                let name = get_lds_or_const_name_of_alloc_node(allocs.get(&alloc)?, dsc)?;
                 trackers.remove(at, &name);
             }
             for &(alloc, size) in &node_and_size {
@@ -9282,7 +9397,7 @@ where
                     // Full capacity reserved for a circular buffer.
                     my_size = my_size.max(trackers.capacity(at));
                 }
-                let name = get_lds_or_const_name_of_alloc_node(node, placement)?;
+                let name = get_lds_or_const_name_of_alloc_node(node, dsc)?;
                 let mut addresses: Vec<Bytes> = Vec::new();
                 for &phase in &phases {
                     match trackers.check_and_add(at, phase, &name, my_size)? {
@@ -9342,11 +9457,12 @@ pub fn alloc_all_mem<M, P>(
 ) -> Option<bool>
 where
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     let mut placed = L3Placements::default();
     let success = try_alloc_l3(
         dsc,
+        dsc_idx,
         metadata.get(&dsc_idx)?,
         allocs,
         trackers,
@@ -9983,15 +10099,23 @@ mod tests_e221_e228 {
             // reference's own readers are split over which one they hand the layout map.
             layout_dims: BTreeMap::from([(LdsIdx(0), layout.clone()), (recorded, layout)]),
             labeled_ds: LabeledDsList::new(
-                LabeledDs::new(
-                    DsType::Input,
-                    core_extents
-                        .iter()
-                        .map(|&(dim, _)| (dim, Scale::Sized(1.0)))
-                        .collect(),
-                    recorded,
-                    pinning,
-                ),
+                {
+                    let mut entry = LabeledDs::new(
+                        DsType::Input,
+                        core_extents
+                            .iter()
+                            .map(|&(dim, _)| (dim, Scale::Sized(1.0)))
+                            .collect(),
+                        recorded,
+                        pinning,
+                    );
+                    // ⭐ `dsName_`, WHICH IS WHERE THE TRACKER KEY COMES FROM: entry 222 reads
+                    // `currDsc->labeledDs_.at(ldsIdx).dsName_` (`L3DlOpsScheduler.cpp:5498`), so a
+                    // fixture that named nothing would key the tracker on the empty string.
+                    // Named after the POSITION the entry sits at, which is the index `.at()` takes.
+                    entry.set_name(v1::StorageName("lds0".to_owned()));
+                    entry
+                },
                 vec![],
             ),
             data_stages: DataStages::new(stage("0", core_extents), stage("1", &halved)),
@@ -10677,6 +10801,7 @@ mod tests_e221_e228 {
         impl L3Placement for Placement {
             fn buffer_capacity_even_sticks(
                 &self,
+                _dsc: DscIdx,
                 _alloc: AllocId,
                 _lds: LdsIdx,
                 _corelet: Corelet,
@@ -10691,16 +10816,6 @@ mod tests_e221_e228 {
 
             fn address_fold_coords(&self) -> usize {
                 2
-            }
-        }
-
-        impl v1::StorageNames for Placement {
-            fn lds_name(&self, lds: LdsIdx) -> v1::StorageName {
-                v1::StorageName(format!("lds{}", lds.0))
-            }
-
-            fn constant_name(&self, constant: ConstIdx) -> v1::StorageName {
-                v1::StorageName(format!("const{}", constant.0))
             }
         }
 
@@ -10960,6 +11075,7 @@ mod tests_e221_e228 {
         impl L3Placement for Placement {
             fn buffer_capacity_even_sticks(
                 &self,
+                _dsc: DscIdx,
                 _alloc: AllocId,
                 _lds: LdsIdx,
                 _corelet: Corelet,
@@ -11161,6 +11277,7 @@ mod tests_e221_e228 {
     impl L3Placement for PagedPlacement {
         fn buffer_capacity_even_sticks(
             &self,
+            _dsc: DscIdx,
             _alloc: AllocId,
             _lds: LdsIdx,
             _corelet: Corelet,
@@ -14472,6 +14589,7 @@ mod tests_e283_e295 {
     impl L3Placement for Placement {
         fn buffer_capacity_even_sticks(
             &self,
+            _dsc: DscIdx,
             _alloc: AllocId,
             _lds: LdsIdx,
             _corelet: Corelet,
@@ -16593,7 +16711,7 @@ pub fn create_store_index_tensor_to_lx<T, M, P>(
 where
     T: L3TreeSurgery + ?Sized,
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     let recorded = dsc.labeled_ds.at(index_lds)?.recorded();
     let fresh = FreshL3Allocation::of(dsc, index_lds, SenComponent::Lx)?;
@@ -16895,7 +17013,7 @@ where
     R: DscTrees + ?Sized,
     O: MemOrgs + ?Sized,
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     // "Expect SuperChunk data stage."
     dsc.data_stages.at(super_chunk.index())?;
@@ -18905,7 +19023,7 @@ pub fn process_paged_tensor_transfers<T, M, P>(
 where
     T: L3TreeSurgery + ?Sized,
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     // "Support no more than one paged tensor for now."
     (paged_hbm_allocations.len() <= 1).then_some(())?;
@@ -19030,7 +19148,7 @@ where
     R: DscTrees + ?Sized,
     O: MemOrgs + ?Sized,
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     let LxBuffering::SpatialDouble(super_chunk) = buffering else {
         return Some(());
@@ -19399,7 +19517,7 @@ where
     T: L3TreeSurgery + ?Sized,
     O: MemOrgs,
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     let paged_dims = get_paged_dimensions(&lds_orgs(orgs, dsc_idx, dsc)?);
     if paged_dims.is_empty() {
@@ -19606,7 +19724,7 @@ fn write_trial_chunk_stages<const CARRY_UNNEEDED_PAD: bool, M, P>(
 ) -> Option<bool>
 where
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     for at in dsc_indices(sdsc) {
         let dsc = sdsc.dscs_mut().at_mut(at)?;
@@ -19671,7 +19789,7 @@ where
     T: TransferNodes + ?Sized,
     S: DscLoopStages + DscTrees + ?Sized,
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     // "Expect that schedule nodes have already been created."
     for at in dsc_indices(sdsc) {
@@ -19822,7 +19940,7 @@ where
     T: TransferNodes + ?Sized,
     S: DscLoopStages + DscTrees + ?Sized,
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     // The reference's own heuristic value.
     const ALPHA: f64 = 1.1;
@@ -19945,7 +20063,7 @@ where
     E: DscPagedTrees + ?Sized,
     O: MemOrgs,
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     for at in dsc_indices(sdsc) {
         let dsc = sdsc.dscs().at(at)?;
@@ -20374,7 +20492,7 @@ fn write_selected_chunk_stages<const CARRY_UNNEEDED_PAD: bool, M, P>(
 ) -> Option<()>
 where
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     for at in dsc_indices(sdsc) {
         let params = chunk_params.get_mut(usize::try_from(at.0).ok()?)?;
@@ -20451,7 +20569,7 @@ where
     T: TransferNodes + ?Sized,
     S: DscLoopStages + DscTrees + ?Sized,
     M: ExPhaseTrackers + ?Sized,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
 {
     // The residency and the chunk dims are identical across a DSC group, so DSC 0 answers for all of
     // them.
@@ -20665,7 +20783,7 @@ where
         + SysFlopsPerByte
         + ComputeOps
         + DscOffsetFacts,
-    P: L3Placement + v1::StorageNames,
+    P: L3Placement,
     E: DscL3Surgery
         + DscSyncSurgery
         + DscTransfers
