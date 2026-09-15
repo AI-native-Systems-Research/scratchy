@@ -7271,10 +7271,11 @@ pub fn render_dfir_input(
     // ⭐⭐ AND THE SCHEDULING LEG IS RUN OVER THE SAME PROGRAMS — the census above says what
     // scratchy's `scheduleTree_` HOLDS (all `allocate`); this one says what stage 2a MAKES of it.
     //
-    // ⛔ THE STAGE ENDS IN A `todo!` TODAY (`ExPhaseTrackers::backup` — the unported memory tracker)
-    // and that panic is CAUGHT in [`crate::superdsc_to_l3_sdsc::run_stage_2a`], reported as *where it
-    // stopped*, and never allowed to escape: it would kill the bake. That is measurement
-    // instrumentation and NOT a runtime refusal — nothing here decides what the bake emits.
+    // ⛔ THE STAGE ENDS IN A PORTED UNIT'S `None` TODAY — entry 222's arena lookup, measured over all
+    // 24,363 programs with ZERO panics — and a stop that PANICS instead is still CAUGHT in
+    // [`crate::superdsc_to_l3_sdsc::run_stage_2a`], reported as *where it stopped*, and never allowed
+    // to escape: it would kill the bake. That is measurement instrumentation and NOT a runtime
+    // refusal — nothing here decides what the bake emits.
     for line in crate::superdsc_to_l3_sdsc::census(&trips).report() {
         eprintln!("[spyre-dfir] {fp}: {line}");
     }

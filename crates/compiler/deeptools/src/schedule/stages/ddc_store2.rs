@@ -744,10 +744,13 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
     /// [`crate::formats::DataFormat::bits`], which IS that table
     /// (`util/sendefs/sendefs.cpp:129-141`).
     ///
-    /// ⛔ TOTAL BY THE TRAIT, AND BOTH ABSENCES ARE THE REFERENCE'S OWN THROW, not a width: an operand
-    /// naming no labelled DS is `labeledDs_[-1]`, an lds the list does not hold is past its end, and a
-    /// `dataFormat_` of `INVALID` is a key `dataFormatsToBitWidth` has no row for. This is an ELEMENT
-    /// WIDTH — a stand-in resizes every packmerge operand — so each of the three panics.
+    /// ⛔ TOTAL BY THE TRAIT, AND NEITHER ABSENCE HAS AN ANSWER IN THE REFERENCE, not a width. The
+    /// expression is `dataFormatsToBitWidth.at(currDsc->labeledDs_[in1.dinfo.myLdsIdx_].dataFormat_)`
+    /// (`ddc/ddc_transformation.cpp:1966-1968`), and the two halves fail DIFFERENTLY: the index is
+    /// `operator[]`, so `myLdsIdx_ = -1` or an lds past the end is UNDEFINED BEHAVIOUR there rather
+    /// than a throw — stated as a divergence, and a panic is the only honest reading of it — while the
+    /// `.at()` on the width table IS the throw for a `dataFormat_` of `INVALID`. This is an ELEMENT
+    /// WIDTH: a stand-in resizes every packmerge operand, so both stop.
     fn operand_element_bits(&self, dinfo: DataInfo) -> crate::formats::Bits {
         let lds = dinfo.my_lds_idx.unwrap_or_else(|| {
             panic!(
@@ -1001,15 +1004,17 @@ fn head_block_of(tree: &super::tree::TreeData, block: NodeId) -> BlockNode {
 /// ⛔ AND A `SYNC` CARRIES ITS WHOLE NODE, not its name: *"the sequences that mint syncs cross-link the
 /// pair they minted and a bare name cannot be linked"*
 /// ([`crate::schedule::dsc2::SchedNode::Sync`]).
+/// ⭐⭐ IT MATCHES THE NODE'S OWN [`super::tree::Kind`] AND NOT ITS `nodeType_`, WHICH IS WHAT MAKES
+/// "a `LOOP` without its `LoopNode`" UNSPELLABLE RATHER THAN A PANIC: `node_kind()` is DERIVED from
+/// that same enum (`Kind::node_kind`), so a second lookup keyed by the derived answer could only ever
+/// restate what the match already proved. Three stops came off this function that way.
 fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule::dsc2::SchedNode {
+    use super::tree::Kind;
     use crate::schedule::dsc2::{LoopDim, SchedNode};
 
-    match tree.node_kind(node) {
-        Some(NodeKind::Block) => SchedNode::Block(head_block_of(tree, node)),
-        Some(NodeKind::Loop) => {
-            let held = tree.loop_at(node).cloned().unwrap_or_else(|| {
-                panic!("a node whose nodeType_ is LOOP holds a LoopNode: {node:?}")
-            });
+    match tree.kind_of(node) {
+        Some(Kind::Block) => SchedNode::Block(head_block_of(tree, node)),
+        Some(Kind::Loop(held)) => {
             SchedNode::Loop(Box::new(crate::schedule::dsc2::LoopNode {
                 block: head_block_of(tree, node),
                 // `dims_` — the SAME order [`tu::LoopDims`] states, which is the order the loop's own
@@ -1033,10 +1038,7 @@ fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule:
                 parametric_lds: None,
             }))
         }
-        Some(NodeKind::Condition) => {
-            let held = tree.condition(node).unwrap_or_else(|| {
-                panic!("a node whose nodeType_ is CONDITION holds a guard: {node:?}")
-            });
+        Some(Kind::Condition(held)) => {
             // ⭐ THE TWO REGIONS AS `addThenRegion`/`addElseRegion` FILLED THEM, each a list of BLOCKS
             // (`dsc/dsc2.cpp:2143`'s *"ConditionNode only accepts 2 BlockNodes as children"*).
             SchedNode::Guarded(Box::new(crate::schedule::dsc2::ConditionNode {
@@ -1063,11 +1065,11 @@ fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule:
                     .collect(),
             }))
         }
-        Some(NodeKind::Sync) => SchedNode::Sync(tree.sync_node(node).unwrap_or_else(|| {
-            panic!("a node whose nodeType_ is SYNC holds a SyncNode: {node:?}")
-        })),
-        // `ALLOCATE` and `TRANSFER` — `isBlockNode()` is false and neither has children.
-        Some(NodeKind::Allocate | NodeKind::Transfer | NodeKind::Compute | NodeKind::StickMask) => {
+        Some(Kind::Sync(held)) => SchedNode::Sync(held.clone()),
+        // `ALLOCATE` and `TRANSFER` — `isBlockNode()` is false and neither has children. ⛔ THERE IS
+        // NO COMPUTE OR STICK-MASK ARM BECAUSE [`super::tree::Kind`] HAS NO SUCH VARIANT: this tree
+        // cannot hold one, where a match on `nodeType_` had to name both.
+        Some(Kind::Allocate(..) | Kind::Transfer(_)) => {
             SchedNode::Leaf(tree.name(node).unwrap_or_default())
         }
         None => panic!(

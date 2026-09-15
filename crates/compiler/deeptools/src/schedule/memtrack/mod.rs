@@ -148,7 +148,7 @@
 //     (util/smallmap.hpp:223-230) CONSTRUCTS AND DISCARDS `std::out_of_range` instead of throwing,
 //     then dereferences `vec_.end()`. There is no defined behaviour to port.
 
-//! THE LX MEMORY ALLOCATOR — the single thing blocking bridge 1. All 24,363 of 24,363 programs in scratchy's corpus reach `ExPhaseTrackers::backup` and stop there, with zero other refusals. Three C++ pairs, ONE ladder: `bundle` → `tracker` → `memory`.
+//! THE LX MEMORY ALLOCATOR — what used to block bridge 1, now WIRED: `stages::Trackers` answers `ExPhaseTrackers` off a `MemTrackBundle` of these trackers, and all 24,363 programs of scratchy's corpus run THROUGH it (gated against the reference's own addresses for 187 programs in `stages/carriers/lx_oracle.rs`). Three C++ pairs, ONE ladder: `bundle` → `tracker` → `memory`.
 //!
 //! 38 units across 3 file(s).
 

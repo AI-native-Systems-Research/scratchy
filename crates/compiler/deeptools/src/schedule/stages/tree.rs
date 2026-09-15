@@ -290,6 +290,16 @@ impl TreeData {
         self.nodes.get(&node).map(|entry| entry.kind.node_kind())
     }
 
+    /// `node->nodeType_` **WITH THE NODE'S OWN PAYLOAD** — the one [`Kind`] the entry holds.
+    ///
+    /// ⭐⭐ ASKING FOR BOTH AT ONCE IS WHAT MAKES A `LOOP` WITHOUT ITS `LoopNode` UNSPELLABLE.
+    /// [`Self::node_kind`] is DERIVED from this same enum ([`Kind::node_kind`]), so a caller that
+    /// switched on the derived answer and then looked the payload up again had to state what to do
+    /// when the two disagreed — which they cannot. See [`super::ddc_store2`]'s `sched_node_of`.
+    pub(super) fn kind_of(&self, node: NodeId) -> Option<&Kind> {
+        self.nodes.get(&node).map(|entry| &entry.kind)
+    }
+
     /// `node->getOwnerLoop()` — the nearest enclosing `LOOP`, walking `prev_`.
     pub(super) fn owner_loop(&self, node: NodeId) -> Option<LoopId> {
         let mut walk = self.nodes.get(&node)?.parent;

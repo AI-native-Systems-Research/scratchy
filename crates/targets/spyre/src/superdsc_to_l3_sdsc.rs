@@ -55,9 +55,19 @@
 //! region per condition. `sync` and `compute` are ZERO because `create_synchronization` runs AFTER the
 //! stop and the computes are stage 2b's.
 //!
-//! ⭐⭐ AND ALL 24,363 STOP AT **ONE** PLACE — `ExPhaseTrackers::backup`, the unported memory
-//! tracker — with **zero** carrier refusals. Not one program stopped anywhere else, so this conversion
-//! hands stage 2a nothing the reference fixture did not.
+//! ⭐⭐ AND ALL 24,363 NOW RUN **THROUGH** THE MEMORY TRACKER, with **zero** panics and **zero**
+//! carrier refusals: re-measured after `stages::Trackers` was wired over the ported LX allocator, the
+//! census above is UNCHANGED to the node (the stop moved three statements, and nothing is minted
+//! between them) and not one `stage2a-stop:` or `stage2a-refusal:` line is printed for any program.
+//!
+//! ⛔ 0 of 24,363 COMPLETED, AND WHERE THEY STOP IS NOW A BARE `None` RATHER THAN A NAMED PANIC:
+//! `try_alloc_l3`'s `allocs.get(&alloc)?` (`l3/dl_ops.rs:9261`). Entry 222 looks the allocate node it
+//! is about to place up in the `v1::AllocArena`, and NO UNIT OF STAGE 2A EVER WRITES THAT ARENA —
+//! `l3/dl_ops.rs` holds no `allocs.insert` outside its own tests, because the minting units call
+//! `L3TreeSurgery::fresh_alloc` + `new_allocate` and put an `L3AllocateNode` in the TREE. The
+//! reference has ONE `dsc2::AllocateNode *` and the port split it in two, writing only the tree half.
+//! That the arena is never written is a static fact, so every program reaching the placement loop
+//! stops exactly there; it was confirmed directly, with the id, on `0_rmsq_o728`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -783,12 +793,15 @@ pub struct StageEffect {
 /// ⛔ [`None`] IS THE CONVERSION REFUSING ([`super_dsc`]) — the program is not measured, and the
 /// caller reports that rather than counting it as zero nodes.
 ///
-/// ⛔⛔ THE `catch_unwind` IS MEASUREMENT INSTRUMENTATION, NOT A RUNTIME REFUSAL. Stage 2a ends in a
-/// `todo!` — `ExPhaseTrackers::backup`, the unported 703-line `util/memtracker/mem_track.{h,cpp}`
-/// allocator, which is scoped separately and must NOT be faked: a tracker answering a plausible
+/// ⛔⛔ THE `catch_unwind` IS MEASUREMENT INSTRUMENTATION, NOT A RUNTIME REFUSAL. Stage 2a holds
+/// `todo!`s — a fact it cannot answer must NOT be faked, because a carrier answering a plausible
 /// offset would place real tensors at invented addresses. A panic escaping here would kill the BAKE,
 /// so the panic is caught, its message reported as *where it stopped*, and nothing is substituted for
 /// the answer it did not give.
+///
+/// ⭐ AS MEASURED TODAY NOT ONE OF THE 24,363 PROGRAMS PANICS: every one stops on a ported unit's own
+/// `None` at entry 222's arena lookup, so [`StageEffect::stopped_at`] is [`None`] corpus-wide. The
+/// `catch_unwind` stays because the next frontier is not guaranteed to be a `None`.
 ///
 /// ⛔ IT IS SOUND TO READ THE STATE AFTER THE UNWIND. Every [`DscState`] interior is a `RefCell` whose
 /// borrow guards are dropped BY the unwind, so no guard outlives it and the tree is readable.
@@ -864,8 +877,9 @@ pub fn run_stage_2a(op: &SdscOp) -> Option<StageEffect> {
 /// ⭐⭐ THE CORPUS CENSUS — every program of one bundle, aggregated.
 ///
 /// ⭐ MEASURED, and the whole-build aggregate of these is in this module's header: 134 bundles,
-/// 24,363 programs, all converted, 93,110 -> 347,939 nodes, every one stopping at the memory tracker
-/// and none anywhere else.
+/// 24,363 programs, all converted, 93,110 -> 347,939 nodes, 0 completed — every one now running
+/// THROUGH the memory tracker and stopping at entry 222's arena lookup, with no `stops` entry and no
+/// `refusals` entry anywhere in the corpus.
 #[derive(Debug, Clone, Default)]
 pub struct Corpus {
     /// How many programs were offered.
@@ -1159,13 +1173,13 @@ mod tests {
     ///
     /// ⭐⭐ IT CARRIES THE VALUES, NOT A VERDICT. The seed is one root block plus one HBM allocate per
     /// HBM-pinned tensor (three, for `A·W→O`); stage 2a's growers then mint the chunk loop nest, the
-    /// LX allocations and their transfers, and the stage stops at the memory tracker. Both counts and
-    /// the per-kind census are asserted, so a regression to a refusal AND a regression to an
-    /// unexpectedly-different stop both fail here.
+    /// LX allocations and their transfers, and the stage runs THROUGH the memory tracker and stops at
+    /// entry 222's arena lookup. Both counts and the per-kind census are asserted, so a regression to
+    /// a refusal AND a regression to an unexpectedly-different stop both fail here.
     ///
-    /// ⛔ THE STOP IS NAMED, NOT `is_some()`. A bare "it panicked" would pass on the FIRST `todo!` of
-    /// eighty-six and say nothing about how far the stage got — `ExPhaseTrackers::backup` makes this
-    /// a ratchet in both directions, exactly as `schedule::stages`' own fixture test is.
+    /// ⛔ THE ABSENCE OF A PANIC IS ASSERTED BY VALUE — `stopped_at == None`. A `todo!` reappearing
+    /// anywhere on this path fails here, which is the ratchet in the other direction now that the
+    /// tracker no longer stops the stage, exactly as `schedule::stages`' own fixture test is.
     #[test]
     fn a_real_emitted_matmul_converts_and_stage_2a_grows_its_tree() {
         use crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec;

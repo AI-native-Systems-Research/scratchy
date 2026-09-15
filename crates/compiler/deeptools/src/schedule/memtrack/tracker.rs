@@ -743,7 +743,8 @@ impl DsTrackInMem {
     /// The snapshot `restoreEps` (unit e035) replays: every ds this phase tracks, its capacity, and
     /// the address its block list holds it at (`mem_track.cpp:566-578`).
     ///
-    /// ⛔ THIS IS WHERE ALL 24,363 PROGRAMS STOP TODAY, through `ExPhaseTrackers::backup`, and THE
+    /// ⭐ THIS IS WHAT `ExPhaseTrackers::backup` IS NOW WIRED TO (`stages/carriers.rs`), where all
+    /// 24,363 programs of the corpus used to stop; THE
     /// CALLER'S IDEMPOTENCE IS LOAD-BEARING: `trackerBackups.try_emplace` snapshots a tracker ONCE
     /// per `allocAllMem` (`L3DlOpsScheduler.cpp:5537-5543`), so a second backup would capture
     /// post-allocation state and `restoreEps` would commit the trial placement.

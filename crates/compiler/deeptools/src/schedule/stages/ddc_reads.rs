@@ -139,8 +139,10 @@ impl v1::StorageNames for Dsc2Reads<'_, '_> {
     /// `labeledDs_.at(lds).dsName_` (`dsc/dscdefn.h:326`) — ⭐ ANSWERED off [`LdsRecord::name`].
     ///
     /// ⛔ TOTAL BY THE TRAIT'S SIGNATURE, and the reference's `.at()` THROWS for an index the list
-    /// does not hold — so an absent index panics rather than answering the empty name, which would
-    /// key the memory tracker by a name the reference never used.
+    /// does not hold — `currDsc->labeledDs_.at(anode->ldsIdx_).dsName_`
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5498`) over a `std::vector`. So an absent index
+    /// panics rather than answering the empty name, which would key the memory tracker by a name the
+    /// reference never used.
     fn lds_name(&self, lds: LdsIdx) -> v1::StorageName {
         self.facts()
             .with_lds(lds, |held| held.record().name.clone())
@@ -151,8 +153,9 @@ impl v1::StorageNames for Dsc2Reads<'_, '_> {
 
     /// `constantInfo_.at(constant).name_` (`dsc/dsc2.h:48`) — ⭐ ANSWERED off [`DdcFacts::constants`].
     ///
-    /// ⛔ TOTAL LIKEWISE, and `constantInfo_` is a `std::map` reached with `.at()`: a constant id the
-    /// table does not hold is that throw. The empty name is a real value of the field (a constant
+    /// ⛔ TOTAL LIKEWISE, and `constantInfo_` is reached with `.at()` —
+    /// `currDsc->constantInfo_.at(anode->constIdx_).name_` (`L3DlOpsScheduler.cpp:5500`): a constant
+    /// id the table does not hold is that throw. The empty name is a real value of the field (a constant
     /// nothing named), so it cannot double as the missing-entry answer.
     fn constant_name(&self, constant: ConstIdx) -> v1::StorageName {
         self.facts()
@@ -175,8 +178,10 @@ impl v1::ExploreDsc for Dsc2Reads<'_, '_> {
     /// `labeledDs_.at(lds).scaledLdsCategory_` (`dsc/dscdefn.h:352-356`) — ⭐ ANSWERED AS THE CLOSED
     /// THREE-WAY IT IS, off [`crate::schedule::l3::dsc::LabeledDs::scaled_category`].
     ///
-    /// ⛔ AN ABSENT INDEX IS THE `.at()` THROW and not `REGULAR_TENSOR`: the trait is total, and
-    /// `REGULAR_TENSOR` is a real category entry 307 branches on.
+    /// ⛔ AN ABSENT INDEX IS THE `.at()` THROW and not `REGULAR_TENSOR`: the trait is total,
+    /// `REGULAR_TENSOR` is a real category entry 307 branches on, and the reference reads it as
+    /// `currDsc->labeledDs_.at(allocNodeToMatch->ldsIdx_).scaledLdsCategory_`
+    /// (`ddc/ddc_fold.cpp:463`).
     fn scaled_category(&self, lds: LdsIdx) -> ScaledLds {
         self.facts()
             .with_lds(lds, crate::schedule::l3::dsc::LabeledDs::scaled_category)

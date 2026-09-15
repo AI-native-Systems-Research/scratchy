@@ -114,10 +114,11 @@ pub fn run_stages(sdsc: &mut l3::dsc::SuperDsc) -> StagesRan {
 /// `computeOp_`-less [`v1::OpFuncs`] and the same flat [`l3::dl_ops::AddressFoldCoords`].
 ///
 /// ⛔⛔ IT EXISTS SO A CALLER CAN STILL READ THE TREE AFTER THE STAGE STOPS. Stage 2a's stop today is
-/// the memory tracker's `todo!` ([`carriers`]'s `ExPhaseTrackers::backup`), and a [`DscState`] built
-/// INSIDE [`run_stages`] is dropped by that unwind — so the nodes the growers minted, which are the
-/// whole measurement, are unreachable. A caller that owns the state measures
-/// [`DscState::kinds`] afterwards.
+/// entry 222's own `None` — `try_alloc_l3`'s `allocs.get(&alloc)?` (`l3/dl_ops.rs:9261`), an arena no
+/// unit of the stage writes — and a stop that PANICS instead (any remaining `todo!` on a colder path)
+/// drops a [`DscState`] built INSIDE [`run_stages`] with its unwind, so the nodes the growers minted,
+/// which are the whole measurement, would be unreachable. A caller that owns the state measures
+/// [`DscState::kinds`] afterwards either way.
 ///
 /// ⭐ [`StagesRan`] IS THE SAME ANSWER EITHER WAY: it is read off the state this takes, so the two
 /// entry points cannot report different numbers for one run.
