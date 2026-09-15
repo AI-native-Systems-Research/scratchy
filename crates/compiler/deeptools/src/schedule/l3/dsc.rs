@@ -1158,24 +1158,20 @@ impl StageDims {
         self.extents.get(&dim).copied()
     }
 
-    /// `primaryDimToVal_st(dim, NO_COMPONENT, /*ptrowId=*/-1, /*clId=*/-1, padded, density,
-    /// granularity)` (`dsc/dims.h:267`) — the GENERAL form, which with no component and a negative
-    /// row id falls through to `primaryDimToVal_base_st` (`dsc/dims.cpp:516`) and then
-    /// `calculate_padded` (`:562`).
+    /// Replaces: e010_primaryDimToVal_base_st
     ///
-    /// `granularity` selects a symbolic dim's `granularity_` over its `maxSize_`; `density` is
-    /// `dimDensity`, stated as the MX scale block the callers divide by rather than as the reciprocal
-    /// they pass.
+    /// One dim's stated extent — `symbolicDimInfo_`'s `maxSize_` or `granularity_` where the dim is
+    /// symbolic, else the stored slot — scaled by `dimDensity` and then rewritten by
+    /// [`Self::calculate_padded`]. This is also `primaryDimToVal_st(dim, NO_COMPONENT, -1, -1, ..)`
+    /// (`dsc/dims.h:269-273`): no component and a negative row/corelet id fall through to here.
     ///
-    /// ⛔ [`None`] IS THE `-1` AND EVERY ABORT AT ONCE: an unstated extent, a negative one (which
-    /// `calculate_padded` short-circuits on BEFORE any abort), *"Cannot calculate padded version of
-    /// compound dim"*, *"Padded access is not valid in datastage"* for a [`PadSizes::Voided`]
-    /// non-window dim, a missing `paddingSizes_` entry, *"Missing window size"*, and each
-    /// *"Unsupported padding type"*. Spans SATURATE rather than wrap.
+    /// ⛔ [`None`] IS THE REFERENCE'S `-1` — an unstated slot, plus every abort of
+    /// [`Self::calculate_padded`]. `DT_CHECK(dimDensity > 0.0 && dimDensity <= 1.0)`
+    /// (`dsc/dims.cpp:558`) is discharged by [`ScaleBlock`], whose reciprocal cannot leave that
+    /// range.
     ///
-    /// ⛔ DIVERGENCE: the density is INTEGER DIVISION where the reference multiplies by the `double`
-    /// `1.0/blkSize` and truncates. The two agree for every power-of-two block size; for a block of
-    /// three the reference's product falls just short and loses one.
+    /// ⛔ DIVERGENCE: INTEGER DIVISION where the reference multiplies by the `double` `1.0/blkSize`
+    /// and truncates — equal for every power-of-two block, one short for a block of three.
     #[must_use]
     pub fn scaled_extent(
         &self,
@@ -1193,6 +1189,32 @@ impl StageDims {
             Some(block) => stated / i64::try_from(block.count().0).unwrap_or(i64::MAX),
             None => stated,
         };
+        self.calculate_padded(dim, Extent(val), padded, granularity)
+    }
+
+    /// Replaces: e009_calculate_padded
+    ///
+    /// `val` rewritten by `dim`'s padding: the front and back edges for a non-window dim, or the
+    /// window span `wSize + (val - 1) * stride_` for a windowed one, across the six `PadType`s.
+    ///
+    /// ⭐ `val` IS A PARAMETER, NOT A READ. `ddc/ddc_fold.cpp:367` and `primaryDimToVal_st`
+    /// (`dsc/dims.cpp:701`) each pass a val this function did not read, so it cannot be fused into
+    /// [`Self::scaled_extent`]; `granularity` only reaches the recursive window read.
+    ///
+    /// ⛔ [`None`] IS THE `-1` AND EVERY ABORT AT ONCE: a negative `val` (short-circuited BEFORE any
+    /// abort, `:567-568`), *"Cannot calculate padded version of compound dim"*, a missing
+    /// `paddingSizes_` entry, *"Padded access is not valid in datastage"* for a
+    /// [`PadSizes::Voided`] edge, *"Missing window size"*, and each *"Unsupported padding type"*.
+    /// Spans SATURATE rather than wrap.
+    #[must_use]
+    pub fn calculate_padded(
+        &self,
+        dim: PrimaryDim,
+        val: Extent,
+        padded: &PaddingForm,
+        granularity: bool,
+    ) -> Option<Extent> {
+        let val = val.0;
         if val < 0 {
             return None;
         }
@@ -2649,6 +2671,208 @@ mod tests_e008 {
         assert_eq!(
             *fused.volumes(),
             BTreeMap::from([(BTreeSet::from([B, C]), VolumeLimit(512))])
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e009_e010 {
+    //! ⭐⭐ THE REFERENCE PUBLISHES THIS PAIR'S ANSWER. `paddingSizes_[dim].totalSize_` in a
+    //! reference export IS `primaryDimToVal_base_st(dim, {dim, PADDED_FULLSPAN_WUNNEEDED}, 1.0,
+    //! false)` (`dsc/dims.cpp:298-299`), so every number below is the reference's own, read from
+    //! `g0/debug/sdsc_14/sdsc.json` — the ONLY one of the 187 g0 programs that states any
+    //! `paddingSizes_` at all (18 entries, 4 of them `"N/A"`).
+    //!
+    //! ⛔ WHAT THE CORPUS CANNOT SHOW, MEASURED OVER ALL 187: no entry anywhere states a non-zero
+    //! `padFront_`/`padBack_`/`unneededPad_`/`stride_`, and none states a `windowDim_`. The window
+    //! and unneeded arms below are therefore CONSTRUCTED from the reference's own formulae, and are
+    //! marked as such.
+
+    use super::{DimPadding, PadElems, PadSizes, StageDims, UnneededPad};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+    use crate::schedule::ddc::fold::{PadType, Stride};
+    use crate::schedule::ddc::transformation_util::PaddingForm;
+    use std::collections::BTreeMap;
+
+    /// `sdsc_14`'s `dataStageParam_["0"].ss_` — `name_: "core"`, `out_: 128`, `mb_: 1`, `y_: 1`, with
+    /// an all-zero `paddingSizes_` entry on `out` and on `mb`.
+    fn core_stage() -> StageDims {
+        StageDims {
+            extents: BTreeMap::from([
+                (PrimaryDim::Out, Extent(128)),
+                (PrimaryDim::Mb, Extent(1)),
+                (PrimaryDim::Y, Extent(1)),
+            ]),
+            padding: BTreeMap::from([
+                (PrimaryDim::Out, DimPadding::default()),
+                (PrimaryDim::Mb, DimPadding::default()),
+            ]),
+            ..StageDims::default()
+        }
+    }
+
+    /// `getPadding(dim) == PADDED_FULLSPAN_WUNNEEDED` on one dim, which is the form the export's
+    /// `totalSize_` is written through.
+    fn full_span(dim: PrimaryDim) -> PaddingForm {
+        let mut form = PaddingForm::default();
+        form.set_padding(dim, PadType::PaddedFullSpanWUnneeded);
+        form
+    }
+
+    /// e009 + e010 — the four `totalSize_` values `sdsc_14` exports, and the plain read 186 of the
+    /// 187 g0 programs take instead.
+    #[test]
+    fn the_reference_s_own_total_size_export_is_what_this_pair_computes() {
+        let core = core_stage();
+
+        // `dataStageParam_["0"].ss_.paddingSizes_`: `out` -> `totalSize_: 128`, `mb` -> `1`. All six
+        // pad counts are zero, so the full-span arm adds nothing to the stated extent.
+        assert_eq!(
+            core.padded_extent(PrimaryDim::Out, PadType::PaddedFullSpanWUnneeded),
+            Some(Extent(128))
+        );
+        assert_eq!(
+            core.padded_extent(PrimaryDim::Mb, PadType::PaddedFullSpanWUnneeded),
+            Some(Extent(1))
+        );
+
+        // `N_.paddingSizes_`: the same two dims of the same program at `out_: 2048`, `totalSize_:
+        // 2048`, which pins the arm on the extent and not on the stage.
+        let mut whole = core.clone();
+        whole.extents.insert(PrimaryDim::Out, Extent(2048));
+        assert_eq!(
+            whole.padded_extent(PrimaryDim::Out, PadType::PaddedFullSpanWUnneeded),
+            Some(Extent(2048))
+        );
+
+        // e010 ALONE — `getPadding(d) == NOPAD`, the arm 186 of 187 g0 programs take, which returns
+        // the stated slot before any `paddingSizes_` lookup.
+        assert_eq!(
+            core.scaled_extent(PrimaryDim::Out, &PaddingForm::default(), None, false),
+            Some(Extent(128))
+        );
+        // `in_: -1` in the same export — the unstated slot, which `calculate_padded` short-circuits
+        // to `-1` (`dsc/dims.cpp:567-568`).
+        assert_eq!(
+            core.scaled_extent(PrimaryDim::In, &PaddingForm::default(), None, false),
+            None
+        );
+
+        // e009 ALONE, WITH A VAL IT DID NOT READ — the `ddc/ddc_fold.cpp:367` call shape, whose
+        // `innerCard` is a fold cardinality and not this stage's extent.
+        assert_eq!(
+            core.calculate_padded(
+                PrimaryDim::Out,
+                Extent(64),
+                &full_span(PrimaryDim::Out),
+                false
+            ),
+            Some(Extent(64))
+        );
+    }
+
+    /// e009 — the abort set, led by the one the reference EXPORTS as `"N/A"`.
+    #[test]
+    fn a_voided_edge_a_missing_entry_and_a_wrong_pad_type_are_each_the_refusal() {
+        // `dataStageParam_["2"].ss_.paddingSizes_["out"]`: `padFront_: -1, padBack_: -1` and
+        // `totalSize_: "N/A"` — the export's own guard (`dsc/dims.cpp:295-296`) standing in for
+        // *"Padded access is not valid in datastage"* (`:581-582`). 4 of the corpus's 18 entries.
+        let mut voided = core_stage();
+        voided.extents.insert(PrimaryDim::Out, Extent(64));
+        voided.padding.insert(
+            PrimaryDim::Out,
+            DimPadding {
+                sizes: PadSizes::Voided,
+                ..DimPadding::default()
+            },
+        );
+        assert_eq!(
+            voided.padded_extent(PrimaryDim::Out, PadType::PaddedFullSpanWUnneeded),
+            None
+        );
+        // ⭐ AND THE SAME STAGE STILL ANSWERS ITS PLAIN READ: `out_: 64` is what that export states,
+        // and NOPAD returns before the voided edge is ever reached.
+        assert_eq!(
+            voided.scaled_extent(PrimaryDim::Out, &PaddingForm::default(), None, false),
+            Some(Extent(64))
+        );
+
+        // *"Padded dimension without padding sizes information in datastage"* (`:575-577`) — the dim
+        // is stated and positive, and `paddingSizes_` does not name it.
+        let core = core_stage();
+        assert_eq!(
+            core.padded_extent(PrimaryDim::Y, PadType::PaddedFullSpanWUnneeded),
+            None
+        );
+
+        // *"Cannot calculate padded version of compound dim"* (`:572-573`), which needs a POSITIVE
+        // val to be reached at all — a compound dim left at `-1` takes the short-circuit instead.
+        let mut compound = core.clone();
+        compound.extents.insert(PrimaryDim::Ij, Extent(16));
+        compound
+            .padding
+            .insert(PrimaryDim::Ij, DimPadding::default());
+        assert_eq!(
+            compound.padded_extent(PrimaryDim::Ij, PadType::PaddedFullSpanWUnneeded),
+            None
+        );
+
+        // *"Unsupported padding type requested for padded non-window operation"* (`:589-592`): a
+        // window pad type on a dim with no `windowDim_`.
+        assert_eq!(
+            core.padded_extent(PrimaryDim::Out, PadType::PaddedWZeroPad),
+            None
+        );
+    }
+
+    /// e009 — CONSTRUCTED, no g0 program states a `windowDim_`: the window span and the unneeded
+    /// counts, from `dsc/dims.cpp:593-613`.
+    #[test]
+    fn the_window_span_is_the_kernel_plus_the_strided_tail() {
+        let mut windowed = core_stage();
+        // A 3-wide kernel on `ki`, stride 2, over 5 outputs: `wSize + (val - 1) * stride_`.
+        windowed.extents.insert(PrimaryDim::Ki, Extent(3));
+        windowed.extents.insert(PrimaryDim::Out, Extent(5));
+        windowed.padding.insert(
+            PrimaryDim::Out,
+            DimPadding {
+                window_dim: Some(PrimaryDim::Ki),
+                stride: Stride::new(2).expect("a moving stride"),
+                unneeded: UnneededPad {
+                    total: PadElems(4),
+                    front: PadElems(1),
+                    back: PadElems(2),
+                },
+                sizes: PadSizes::of(PadElems(1), PadElems(1)),
+                ..DimPadding::default()
+            },
+        );
+
+        // `PADDED_WZEROPAD`: 3 + (5 - 1) * 2 = 11.
+        assert_eq!(
+            windowed.padded_extent(PrimaryDim::Out, PadType::PaddedWZeroPad),
+            Some(Extent(11))
+        );
+        // `PADDED_FULLSPAN_WUNNEEDED` adds `unneededPad_` alone: 11 + 4 = 15.
+        assert_eq!(
+            windowed.padded_extent(PrimaryDim::Out, PadType::PaddedFullSpanWUnneeded),
+            Some(Extent(15))
+        );
+        // `PADDED_NOZEROPAD` subtracts the two unneeded edges and both pads: 15 - 1 - 2 - 1 - 1 = 10.
+        assert_eq!(
+            windowed.padded_extent(PrimaryDim::Out, PadType::PaddedNoZeroPad),
+            Some(Extent(10))
+        );
+        // `LOWERED_PADDED` is `wSize * val` and ignores the stride entirely: 3 * 5 = 15.
+        assert_eq!(
+            windowed.padded_extent(PrimaryDim::Out, PadType::LoweredPadded),
+            Some(Extent(15))
+        );
+        // *"Missing window size"* (`:596-597`) — `ki` unstated makes the recursive read `-1`.
+        windowed.extents.remove(&PrimaryDim::Ki);
+        assert_eq!(
+            windowed.padded_extent(PrimaryDim::Out, PadType::PaddedWZeroPad),
+            None
         );
     }
 }
