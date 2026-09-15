@@ -268,13 +268,13 @@ impl v1::ExploreTree for Dsc2Tree<'_, '_> {
         })
     }
 
-    /// ⛔ `computeNode->isOpaqueOp_` (`dsc/dsc2.h:531`) — a COMPUTE-node field. This tree holds no
+    /// ⛔ `computeNode->isOpaqueOp_` (`dsc/dsc2.h:941`) — a COMPUTE-node field. This tree holds no
     /// COMPUTE nodes at all yet: stage 2a mints none (the census over 24,363 programs reads
     /// `compute: 0`) and entry 345's parse is what mints them, so there is nothing here to read the
     /// flag off.
     fn is_opaque_compute(&self, _node: NodeId) -> bool {
         todo!(
-            "v1::ExploreTree::is_opaque_compute: wants computeNode->isOpaqueOp_ (dsc/dsc2.h:531) — \
+            "v1::ExploreTree::is_opaque_compute: wants computeNode->isOpaqueOp_ (dsc/dsc2.h:941) — \
              a COMPUTE-node field, and super::tree::Kind has no Compute arm"
         )
     }
@@ -294,13 +294,25 @@ impl v1::ExploreTree for Dsc2Tree<'_, '_> {
         )
     }
 
-    /// ⛔ `computeOp_`'s entry for a COMPUTE node — the pairing between a schedule node and a
-    /// `computeOp_` index, which the reference holds on the node (`ComputeNode::opIdx_`) and this
-    /// tree does not carry.
+    /// ⛔⛔ THERE IS NO SUCH PAIRING, AND THIS DOC USED TO INVENT ONE. It claimed the reference
+    /// *"holds the pairing on the node (`ComputeNode::opIdx_`)"*. **`opIdx_` appears ZERO times in
+    /// `dsc/dsc2.h`**, and `computeOp_` is a `DesignSpaceConfig` member, not a field of `ComputeNode`
+    /// (`dsc2.h:900-962`) — the node has no back-pointer at all. The reference's only reader of what
+    /// this seam is for (`ddc/ddcv1.cpp:1092-1113`) takes `compute->exUnit_` and
+    /// `compute->outputsLdsAndLoopOffsets_.at(i).myLdsIdx_` STRAIGHT OFF THE NODE.
+    ///
+    /// ⛔ SO THE BLOCKER IS NOW THE RETURN TYPE, NOT THE TREE. [`super::tree::Kind::Compute`] holds the
+    /// whole `ComputeNode`, so `ex_unit` and `outputs` are in hand — but [`v1::DscComputeOp`] also
+    /// carries `op_func`, `format` and `inputs`, which a `ComputeNode` does not have, and this seam's
+    /// two live readers touch only `.ex_unit` and `.outputs`. Answering it means NARROWING the return
+    /// to those two, not synthesising the other three; a fabricated `op_func` here is a compute the
+    /// backend would happily lower as the wrong opcode.
     fn compute_op(&self, _node: NodeId) -> Option<v1::DscComputeOp> {
         todo!(
-            "v1::ExploreTree::compute_op: wants computeOp_'s entry for that COMPUTE node — the \
-             node-to-op-index pairing, which super::tree::Kind has no Compute arm to hold"
+            "v1::ExploreTree::compute_op: wants `exUnit_` and `outputsLdsAndLoopOffsets_` off the \
+             COMPUTE node (ddc/ddcv1.cpp:1092-1113) — both now held by tree::Kind::Compute, but \
+             DscComputeOp also carries op_func/format/inputs, which a dsc2::ComputeNode does not \
+             have; narrow the return before answering this"
         )
     }
 

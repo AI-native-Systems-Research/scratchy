@@ -3192,7 +3192,7 @@ pub trait FifoResults: ScheduleSurgery {
     /// every transfer destination's connect (`ddc/ddcv1.cpp:3296-3297`).
     fn connect_consumers(&self, connect: Option<DataConnect>) -> Vec<FifoConsumer>;
 
-    /// `computeNode->isOpaqueOp_` (`dsc/dsc2.h:531`).
+    /// `computeNode->isOpaqueOp_` (`dsc/dsc2.h:941`).
     fn is_opaque(&self, compute: NodeId) -> bool;
 
     /// The transfer's ends as allocation lookups, for [`get_padding_per_dim`].

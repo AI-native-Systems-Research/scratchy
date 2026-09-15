@@ -1289,6 +1289,52 @@ pub fn build_spatial_fold<S: CoreStage + ?Sized, C: Coordinate + ?Sized>(
 
 // ⭐ TESTS FOR ENTRIES 086-093. Union this module with this file's other test modules when they land.
 #[cfg(test)]
+mod tests_node_kind {
+    use super::NodeKind;
+
+    /// ⭐⭐ EVERY `nodeType_` SPELLING IS THE REFERENCE'S OWN TABLE — `ScheduleNode::nodeTypeToString`
+    /// (`dsc/dsc2.cpp:1879-1888`), transcribed as VALUES.
+    ///
+    /// ⛔ THE EIGHT ARE ALSO A CLOSED SET IN `NodeType`'s DECLARATION ORDER (`dsc/dsc2.h:446-456`:
+    /// `INVALID`, `BLOCK`, `LOOP`, `TRANSFER`, `COMPUTE`, `SYNC`, `CONDITION`, `ALLOCATE`, `STICKMASK`)
+    /// less `INVALID`, which the reference calls a sentinel and which has no variant here. So the
+    /// ORDER is asserted too, not just the membership: a variant inserted in the wrong place would
+    /// still spell correctly and still be wrong to anything comparing `as u32`.
+    ///
+    /// ⛔ WHY THIS EXISTS NOW: `Compute` and `StickMask` were the two kinds
+    /// [`crate::schedule::stages::Kind`] could not hold, and nothing pinned their spellings — a
+    /// `"stick_mask"` or a `"COMPUTE"` here would reach the emitted json and nothing would say so.
+    #[test]
+    fn every_node_kind_spells_what_the_reference_spells_in_the_references_own_order() {
+        assert_eq!(
+            [
+                NodeKind::Block,
+                NodeKind::Loop,
+                NodeKind::Transfer,
+                NodeKind::Compute,
+                NodeKind::Sync,
+                NodeKind::Condition,
+                NodeKind::Allocate,
+                NodeKind::StickMask,
+            ]
+            .map(NodeKind::spelling),
+            [
+                "block",
+                "loop",
+                "transfer",
+                "compute",
+                "sync",
+                "condition",
+                "allocate",
+                "stickmask",
+            ],
+            "`ScheduleNode::nodeTypeToString` (`dsc/dsc2.cpp:1879-1888`), in `NodeType`'s own \
+             declaration order less the `INVALID` sentinel"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests_e086_e093 {
     use super::{
         AllocId, AllocLayout, Allocations, Alpha, Beta, BlockId, Cardinality, CoordPropInfo,

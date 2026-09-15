@@ -239,7 +239,7 @@ impl tu::FifoResults for Dsc2Store<'_, '_> {
     /// ⛔ `computeNode->isOpaqueOp_`.
     fn is_opaque(&self, _compute: NodeId) -> bool {
         todo!(
-            "tu::FifoResults::is_opaque: wants computeNode->isOpaqueOp_ (dsc/dsc2.h:531) — no \
+            "tu::FifoResults::is_opaque: wants computeNode->isOpaqueOp_ (dsc/dsc2.h:941) — no \
              Compute arm"
         )
     }
@@ -989,17 +989,22 @@ fn head_block_of(tree: &super::tree::TreeData, block: NodeId) -> BlockNode {
     }
 }
 
-/// ONE NODE AS THE `dsc2::SchedNode` ITS `nodeType_` MAKES IT — the same six kinds
+/// ONE NODE AS THE `dsc2::SchedNode` ITS `nodeType_` MAKES IT — the same eight kinds
 /// [`super::tree::Kind`] holds, arm for arm.
 ///
 /// ⛔ EVERY BLOCK KIND RECURSES AND EVERY LEAF DOES NOT, which is `isBlockNode()`
 /// (`dsc/dsc2.h:479`): a `BLOCK`, a `LOOP` and a `CONDITION` own children, and an `ALLOCATE`, a
-/// `TRANSFER` and a `SYNC` do not.
+/// `TRANSFER`, a `COMPUTE`, a `SYNC` and a `STICKMASK` do not.
 ///
-/// ⛔ AN `ALLOCATE` AND A `TRANSFER` ARE [`crate::schedule::dsc2::SchedNode::Leaf`] — NAME ONLY, by
-/// that type's own statement, so materialising this tree needs no COMPUTE arm and drops no field of
-/// either: the DDL conversion reaches an allocation through `metadata.newAllocations_` and a transfer
-/// through the arena, both keyed by identity, not through this block.
+/// ⛔ AN `ALLOCATE`, A `TRANSFER` AND A `COMPUTE` ARE [`crate::schedule::dsc2::SchedNode::Leaf`] —
+/// NAME ONLY, by that type's own statement — and none of the three drops a field: the DDL conversion
+/// reaches an allocation through `metadata.newAllocations_`, a transfer through the arena and a compute
+/// through the arena too, all keyed by identity rather than through this block.
+///
+/// ⛔ THIS DOC USED TO SAY *"materialising this tree needs no COMPUTE arm"*, WHICH WAS TRUE ONLY
+/// BECAUSE [`super::tree::Kind`] COULD NOT HOLD ONE. It can now, so the arm is here — and the two
+/// kinds that DO carry their node rather than their name, `SYNC` and `STICKMASK`, are the two whose
+/// minters cross-link what they minted.
 ///
 /// ⛔ AND A `SYNC` CARRIES ITS WHOLE NODE, not its name: *"the sequences that mint syncs cross-link the
 /// pair they minted and a bare name cannot be linked"*
@@ -1066,10 +1071,18 @@ fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule:
             }))
         }
         Some(Kind::Sync(held)) => SchedNode::Sync(held.clone()),
-        // `ALLOCATE` and `TRANSFER` — `isBlockNode()` is false and neither has children. ⛔ THERE IS
-        // NO COMPUTE OR STICK-MASK ARM BECAUSE [`super::tree::Kind`] HAS NO SUCH VARIANT: this tree
-        // cannot hold one, where a match on `nodeType_` had to name both.
-        Some(Kind::Allocate(..) | Kind::Transfer(_)) => {
+        // ⭐ `STICKMASK` CARRIES ITS MASK, not its name — *"a leaf that carries its mask"*
+        // ([`crate::schedule::dsc2::SchedNode::StickMask`]), the same reason a `SYNC` carries its whole
+        // node.
+        Some(Kind::StickMask(held)) => SchedNode::StickMask(Box::new(held.clone())),
+        // `ALLOCATE`, `TRANSFER` and `COMPUTE` — `isBlockNode()` is false and none has children, which
+        // is exactly the set [`crate::schedule::dsc2::SchedNode::Leaf`]'s own doc names.
+        //
+        // ⛔ A COMPUTE IS A **NAME** HERE AND ITS NODE IS NOT DROPPED. `Kind::Compute` holds the whole
+        // `ComputeNode`, and this function materialises the BLOCK the DDL conversion is handed — which
+        // reaches a compute through the arena by identity, not through this block, exactly as the
+        // comment above says of an allocation and a transfer.
+        Some(Kind::Allocate(..) | Kind::Transfer(_) | Kind::Compute(_)) => {
             SchedNode::Leaf(tree.name(node).unwrap_or_default())
         }
         None => panic!(

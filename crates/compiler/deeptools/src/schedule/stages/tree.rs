@@ -23,8 +23,8 @@ use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::transformation_util::{InsertionPoint, LoopDims, LoopNode, PaddingForm};
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{
-    AllocateNode, Coordinate, LayoutDims, LdsIdx, LoopCondComposite, NodeName, SyncNode,
-    TransferNode,
+    AllocateNode, ComputeNode, Coordinate, LayoutDims, LdsIdx, LoopCondComposite, NodeName,
+    StickMaskNode, SyncNode, TransferNode,
 };
 use crate::schedule::l3::dl_ops::{
     GtrGroupId, L3AllocateNode, L3Sync, L3WalkNode, LX_BELOW_BLOCK_NODE_NAME,
@@ -35,22 +35,74 @@ use crate::schedule::l3::dsc::{
 };
 use crate::units::{Core, Corelet};
 
+// ⭐⭐ THE READ SURFACE OF THIS FILE IS `pub`; EVERY WRITE STAYS `pub(super)`.
+//
+// The DataflowIR lowering has to walk the tree the stages GREW — `Schedule::roots` read
+// `dsc.scheduleTree_`, the WIRE vec, which the stages never write and whose `AllocNode` cannot even
+// represent a non-`allocate` node. So the typed tree is the truth, and a consumer outside `stages`
+// needs to name [`TreeData`], [`Kind`] and [`Cond`] and to read nodes off them.
+//
+// ⛔ BUT ONLY TO READ. A target crate composing a lowering has no business mutating the scheduler's
+// tree, and the asymmetry is the guard: `add`, `link`, `delete`, `move_children`, `set_*` and the L3
+// walks stay `pub(super)`, so the seam is a VIEW. That is the capability twin of the path rule
+// `crates/targets/spyre/tests/scratchy_knows_nothing_about_l3.rs` enforces — a target names
+// `deeptools::sdsc` and, through it, can look at this tree and not change it.
+//
+// ⛔ AND THE SEAM IS NAMED, NOT WHOLESALE: nine reads and three types, which is what the census and
+// the root walk need. Raising the other fifty would be publishing surface nothing asked for.
+
 /// WHICH KIND OF NODE, CARRYING WHAT THAT KIND IS READ FOR — `dsc2::ScheduleNode::nodeType_` and the
 /// downcast beside every use of it.
+///
+/// ⭐ THE VARIANTS ARE `dsc2::ScheduleNode::NodeType`'s OWN ORDER (`dsc/dsc2.h:446-456`: `INVALID`,
+/// `BLOCK`, `LOOP`, `TRANSFER`, `COMPUTE`, `SYNC`, `CONDITION`, `ALLOCATE`, `STICKMASK`) less
+/// `INVALID`, which is an absence and has no variant.
+///
+/// ⛔⛔ `Compute` AND `StickMask` EXIST HERE BUT NOTHING CONSTRUCTS THEM YET, AND THAT MUST NOT BE READ
+/// AS "COMPUTES APPEAR". The type gap is closed — [`Self::node_kind`] can now return
+/// `NodeKind::Compute`, which stage 2b already switches on (`schedule/ddc/v1.rs:2416`, `:4911`) — but
+/// the DDL walk that mints computes writes into a **detached copy**: `ddc/v1.rs:6489` is
+/// `DdlConversion::new(store.schedule_head_block())` and `schedule_head_block`
+/// (`stages/ddc_store2.rs`) hands back a `BlockNode` **by value**, while the reference's
+/// `DdlConversion` holds a `DesignSpaceConfig&` (`ddc/ddl/ddl_conversion.h:511`) and `parseDdl2Dsc`
+/// starts from `dsc.scheduleTree_.getHeadMutable()` (`ddl_conversion.cpp:2774`). Until that seam
+/// writes back, `op_compute`/`op_opaque` mint into a value that is dropped and this variant has no
+/// producer.
+///
+/// ⛔ SO NOTHING HERE FABRICATES A NODE TO MOVE A CENSUS. The corpus compute count stays 0 after this,
+/// and a stand-in node is the fabricated-placement failure this crate ranks worse than a stop.
+///
+/// ⛔ AND THE "+2,834 COMPUTES ACROSS 187 PROGRAMS" THIS DOC USED TO CITE IS **UNSOURCED** — it traces
+/// to a comment and a build log, not to a census anyone ran, so it is not repeated as a number. What
+/// IS measured is the scratchy side: `sync 0, compute 0` over 24,363 programs
+/// (`crates/targets/spyre/src/superdsc_to_l3_sdsc.rs`'s corpus report).
 #[derive(Debug, Clone)]
-pub(super) enum Kind {
+pub enum Kind {
     /// `BLOCK`.
     Block,
     /// `LOOP`, holding the node entry 217 and entry 018 minted.
     Loop(LoopNode),
     /// `TRANSFER`.
     Transfer(TransferNode),
-    /// `ALLOCATE`, with the L3 view of the node and its allocation identity.
-    Allocate(AllocId, L3AllocateNode),
+    /// `COMPUTE` — `dsc2::ComputeNode` (`dsc/dsc2.h:900`).
+    ///
+    /// ⭐ THE WHOLE NODE, WHICH IS WHY NO OP-INDEX PAIRING IS PORTED WITH IT. `ComputeNode` has NO
+    /// back-pointer to `computeOp_`: `opIdx_` appears ZERO times in `dsc2.h` and `computeOp_` is a
+    /// `DesignSpaceConfig` member, not a node field. The reference's only reader of that pairing
+    /// (`ddc/ddcv1.cpp:1092-1113`) takes `compute->exUnit_` and
+    /// `compute->outputsLdsAndLoopOffsets_.at(i).myLdsIdx_` straight off the node — so holding the
+    /// node IS the answer, and `stages/ddc_tree.rs`'s claim that the reference "holds the pairing on
+    /// the node (`ComputeNode::opIdx_`)" describes a field that does not exist.
+    Compute(ComputeNode),
     /// `SYNC`.
     Sync(SyncNode),
     /// `CONDITION` — a `loopCond_` guard, a `coreClCond_` guard, or neither.
     Condition(Cond),
+    /// `ALLOCATE`, with the L3 view of the node and its allocation identity.
+    Allocate(AllocId, L3AllocateNode),
+    /// `STICKMASK` — `dsc2::StickMaskNode` (`dsc/dsc2.h:1059`), which `dsc2::SchedNode` already
+    /// carries an arm for.
+    StickMask(StickMaskNode),
 }
 
 impl Kind {
@@ -60,9 +112,11 @@ impl Kind {
             Self::Block => NodeKind::Block,
             Self::Loop(_) => NodeKind::Loop,
             Self::Transfer(_) => NodeKind::Transfer,
-            Self::Allocate(..) => NodeKind::Allocate,
+            Self::Compute(_) => NodeKind::Compute,
             Self::Sync(_) => NodeKind::Sync,
             Self::Condition(_) => NodeKind::Condition,
+            Self::Allocate(..) => NodeKind::Allocate,
+            Self::StickMask(_) => NodeKind::StickMask,
         }
     }
 }
@@ -70,15 +124,15 @@ impl Kind {
 /// ONE CONDITION NODE'S GUARD AND ITS TWO REGIONS — `loopCond_` XOR `coreClCond_`, which is what
 /// `hasCoreClCond()` distinguishes.
 #[derive(Debug, Clone, Default)]
-pub(super) struct Cond {
+pub struct Cond {
     /// `loopCond_`, absent on a core/corelet-guarded condition.
-    pub(super) loop_cond: Option<LoopCondComposite>,
+    pub loop_cond: Option<LoopCondComposite>,
     /// `coreClCond_`, absent on a loop-guarded one.
-    pub(super) cores: Option<v1::CoreClSet>,
+    pub cores: Option<v1::CoreClSet>,
     /// The blocks added to the then-region, in order.
-    pub(super) then_region: Vec<NodeId>,
+    pub then_region: Vec<NodeId>,
     /// The blocks added to the else-region, in order.
-    pub(super) else_region: Vec<NodeId>,
+    pub else_region: Vec<NodeId>,
 }
 
 /// ONE NODE — its name, its `prev_` parent, its `next_` children and its kind.
@@ -91,8 +145,17 @@ struct Entry {
 }
 
 /// ONE DSC'S `scheduleTree_` BY NODE ID.
+///
+/// ⭐⭐ THIS IS THE TREE THE STAGES ACTUALLY GROW, and the reason it is `pub`. The wire
+/// `SuperDsc::scheduleTree_` is a `Vec<AllocNode>` whose every `nodeType_` is the string
+/// `"allocate"` — it cannot represent a loop, a transfer or a sync at all — and nothing writes the
+/// stages' nodes back into it. A consumer that censused the wire vec was therefore measuring an
+/// unscheduled tree; this is the one to ask.
+///
+/// ⛔ READ-ONLY FROM OUTSIDE `stages`. See this file's header: the accessors are `pub`, every mutator
+/// is `pub(super)`.
 #[derive(Debug, Default)]
-pub(super) struct TreeData {
+pub struct TreeData {
     nodes: BTreeMap<NodeId, Entry>,
     next_node: u32,
     next_alloc: u32,
@@ -138,7 +201,7 @@ impl TreeData {
     }
 
     /// `scheduleTree_.getHead()`.
-    pub(super) const fn head(&self) -> Option<NodeId> {
+    pub const fn head(&self) -> Option<NodeId> {
         self.head
     }
 
@@ -193,12 +256,12 @@ impl TreeData {
     }
 
     /// `node->getPrev()` — the PARENT block, absent at the root.
-    pub(super) fn parent(&self, node: NodeId) -> Option<NodeId> {
+    pub fn parent(&self, node: NodeId) -> Option<NodeId> {
         self.nodes.get(&node)?.parent
     }
 
     /// `next_` of that node, in order; EMPTY for a node the tree does not hold.
-    pub(super) fn children(&self, parent: NodeId) -> Vec<NodeId> {
+    pub fn children(&self, parent: NodeId) -> Vec<NodeId> {
         self.nodes
             .get(&parent)
             .map(|entry| entry.children.clone())
@@ -206,7 +269,7 @@ impl TreeData {
     }
 
     /// `node->name_`.
-    pub(super) fn name(&self, node: NodeId) -> Option<NodeName> {
+    pub fn name(&self, node: NodeId) -> Option<NodeName> {
         self.nodes.get(&node).map(|entry| entry.name.clone())
     }
 
@@ -286,7 +349,7 @@ impl TreeData {
     }
 
     /// `node->nodeType_`.
-    pub(super) fn node_kind(&self, node: NodeId) -> Option<NodeKind> {
+    pub fn node_kind(&self, node: NodeId) -> Option<NodeKind> {
         self.nodes.get(&node).map(|entry| entry.kind.node_kind())
     }
 
@@ -296,7 +359,7 @@ impl TreeData {
     /// [`Self::node_kind`] is DERIVED from this same enum ([`Kind::node_kind`]), so a caller that
     /// switched on the derived answer and then looked the payload up again had to state what to do
     /// when the two disagreed — which they cannot. See [`super::ddc_store2`]'s `sched_node_of`.
-    pub(super) fn kind_of(&self, node: NodeId) -> Option<&Kind> {
+    pub fn kind_of(&self, node: NodeId) -> Option<&Kind> {
         self.nodes.get(&node).map(|entry| &entry.kind)
     }
 
@@ -344,7 +407,7 @@ impl TreeData {
     }
 
     /// `traverseTreeDFS()` from the head — every node in pre-order, PARENT BEFORE CHILDREN.
-    pub(super) fn dfs(&self) -> Vec<NodeId> {
+    pub fn dfs(&self) -> Vec<NodeId> {
         let mut order = Vec::new();
         let Some(head) = self.head else {
             return order;
@@ -368,7 +431,7 @@ impl TreeData {
 
     /// HOW MANY NODES THE TREE HOLDS — every node, linked or not, which is what a caller measuring
     /// the stage's effect counts.
-    pub(super) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
@@ -378,7 +441,7 @@ impl TreeData {
     /// ⛔ EVERY NODE, LINKED OR NOT, EXACTLY AS [`Self::len`] COUNTS THEM, so the counts SUM to it. A
     /// per-kind census taken over [`Self::dfs`] instead would silently omit a minted node the stage
     /// had not linked yet, and the two totals would disagree with no way to tell which was short.
-    pub(super) fn node_kinds(&self) -> BTreeMap<NodeKind, usize> {
+    pub fn node_kinds(&self) -> BTreeMap<NodeKind, usize> {
         let mut census = BTreeMap::new();
         for entry in self.nodes.values() {
             *census.entry(entry.kind.node_kind()).or_insert(0) += 1;

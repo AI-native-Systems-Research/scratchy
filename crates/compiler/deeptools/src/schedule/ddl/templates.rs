@@ -676,12 +676,15 @@ mod tests {
     /// itself. This names it.
     #[test]
     fn every_templates_source_parses_and_survives_its_verifiers() {
-        let dialect = Dialect::initialize();
         let mut refused = Vec::new();
         for module in MODULES {
             let stated = DdlTemplates
                 .stated(module.template)
                 .expect("a censused template");
+            // ⛔ THROUGH `parse_ddl`, NOT `DdlSource::parse` DIRECTLY — that is the seam
+            // `select_and_parse_ddl_template` takes (`ddl/conversion.rs:6026-6027`), and it mints the
+            // registry and runs `perform_actions`' verifiers. Calling `parse` alone would test the
+            // projection and skip the five verifiers this test exists for.
             let mut parser = crate::schedule::ddl::DdlModuleOp::default();
             parser.parse_ddl(Some(stated.source));
             if parser.module().is_none() {

@@ -68,6 +68,11 @@ pub use ddc_tree::Dsc2Tree;
 pub use env::Env;
 pub use reads::Reads;
 pub use state::{DscState, DscTree};
+// ⭐ THE TYPED TREE'S OWN TYPES, so a consumer can name what `DscTree::with` hands it. `mod tree` is
+// private, so without this row the types are `pub` and unnameable — and `deeptools::sdsc`, which is the
+// only path a target crate may use, cannot re-export what it cannot name. Reads only: see
+// `stages/tree.rs`'s header for why every mutator stays `pub(super)`.
+pub use tree::{Cond, Kind, TreeData};
 
 use super::ddc::v1;
 use super::l3;

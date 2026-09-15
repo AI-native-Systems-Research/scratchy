@@ -1028,7 +1028,7 @@ impl Default for Unroll {
     }
 }
 
-/// `dsc2::ComputeNode` (`dsc/dsc2.h:948`) narrowed to what the fold units read.
+/// `dsc2::ComputeNode` (`dsc/dsc2.h:900`) narrowed to what the fold units read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputeNode {
     /// `name_`.

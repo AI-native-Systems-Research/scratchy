@@ -56,7 +56,10 @@ pub struct DscTree {
 
 impl DscTree {
     /// The tree, for the length of ONE question.
-    pub(super) fn with<T>(&self, ask: impl FnOnce(&TreeData) -> T) -> T {
+    /// ⭐ `pub` WHILE [`Self::with_mut`] STAYS `pub(super)` — the read/write asymmetry
+    /// [`super::tree`]'s header states. A consumer outside `stages` may LOOK at the grown tree; the
+    /// stages alone may change it.
+    pub fn with<T>(&self, ask: impl FnOnce(&TreeData) -> T) -> T {
         ask(&self.tree.borrow())
     }
 
@@ -247,7 +250,12 @@ impl DscState {
     }
 
     /// That DSC's tree, [`None`] for a `dscs_` position this state holds none for.
-    pub(super) fn dsc(&self, at: DscIdx) -> Option<&DscTree> {
+    ///
+    /// ⭐ `pub` BECAUSE THE LOWERING IS PER-DSC. [`Self::dscs`] hands out the whole slice and
+    /// [`Self::kinds`] sums every tree; a lowering walks ONE DSC at a time and needs it by
+    /// [`DscIdx`], which is the index the super-DSC already keys its `dscs_` by.
+    #[must_use]
+    pub fn dsc(&self, at: DscIdx) -> Option<&DscTree> {
         self.dscs.get(usize::try_from(at.0).ok()?)
     }
 
