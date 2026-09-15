@@ -482,6 +482,60 @@ mod tests {
     /// scratchy emits a single `dataStageParam_["0"]`, `dxp`'s `SdscCoreletSplit.cpp:70` asserts that
     /// size and synthesises the chunk stage from it, and `ddl_conversion.cpp:2585-2591` is how.
     /// [`crate::schedule::l3::dsc::DataStages::new`] demands both, so the synthesis happens here.
+    /// ⛔⛔ THE FIXTURE'S STICK IS THE ONE ON DISK, AND A DEFAULTED ONE IS UNSATISFIABLE.
+    ///
+    /// `a_rmsq_dsc` carried `StickDims::default()`, which multiplies to `elemInSlice = 1`. The
+    /// reference's own guard is `DT_CHECK(elemInSlice > 0 && elemInSlice % numSlices == 0)`
+    /// (`dsc/dsc2.cpp:4083`), so `1 % 8 != 0` **aborts the reference too** — the fixture modelled a
+    /// DSC IBM also refuses, stage 2b stopped on it, and the stop was then written down as
+    /// *"a fact about the DSC, not about a missing table"*. It was a fact about the fixture.
+    ///
+    /// ⭐ THIS TEST IS THE FALSIFIABLE HALF, which the DDL-conversion test is NOT: that one asserts
+    /// `ran.is_none()` and `refusals().is_empty()`, and **both hold whether the stick is present or
+    /// empty**, so it cannot see this defect at all. Here the empty case is the negative control and
+    /// it must answer [`None`].
+    ///
+    /// ⭐ VALUES FROM `g0/sdsc_0.json`, verified identical in `g0/debug/sdsc_0/sdsc.json` after
+    /// scheduling: `primaryDsInfo_.OUTPUT.stickDimOrder_ = ["out"]`, `stickSize_ = [64]`, so
+    /// `64 / 8 slices = 8` per slice. Census over all 187 programs (363 entries): zero empty sticks,
+    /// zero failing the `% 8` check.
+    #[test]
+    fn the_fixtures_stick_is_the_one_on_disk_and_an_empty_one_is_unsatisfiable() {
+        use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::SliceElems;
+
+        let dsc = a_rmsq_dsc();
+        let stick = &dsc
+            .primary_ds_info
+            .get(&DsType::Output)
+            .expect("`primaryDsInfo_` states the OUTPUT role, as the fixture JSON does")
+            .stick;
+
+        // The extents themselves, carried as VALUES rather than as "it did not refuse".
+        assert_eq!(
+            stick.0,
+            vec![(PrimaryDim::Out, crate::arch::Elements(64))],
+            "`stickDimOrder_ [\"out\"]` / `stickSize_ [64]` is what g0/sdsc_0.json states"
+        );
+        assert_eq!(
+            stick.0.iter().map(|(_, e)| e.0).product::<u64>(),
+            64,
+            "`elemInSlice` before the divide (`dsc/dsc2.cpp:4082`)"
+        );
+
+        // The guard the reference runs, on this stick: satisfiable.
+        assert!(
+            SliceElems::per_stick::<Dd2>(stick).is_some(),
+            "64 % 8 == 0, so `getStickSizes` reaches its comparison instead of aborting"
+        );
+
+        // ⛔ THE NEGATIVE CONTROL — revert the fixture to `default()` and this is what happens.
+        assert!(
+            SliceElems::per_stick::<Dd2>(&StickDims::default()).is_none(),
+            "an EMPTY stick multiplies to 1, and `1 % 8 != 0` is the reference's own DT_CHECK \
+             failing (`dsc/dsc2.cpp:4083`) — never a fact about a DSC scratchy emits"
+        );
+    }
+
     fn a_rmsq_dsc() -> DesignSpaceConfig {
         let cores: Vec<Core> = (1..CORES).filter_map(Core::checked).collect();
         DesignSpaceConfig {
@@ -497,7 +551,22 @@ mod tests {
                 DsType::Output,
                 PrimaryDsInfo {
                     layout: LayoutDims::new(LAYOUT[0], LAYOUT[1..].to_vec()),
-                    stick: StickDims::default(),
+                    // ⛔⛔ TRANSCRIBED FROM `g0/sdsc_0.json`, NOT DEFAULTED — an EMPTY `StickDims`
+                    // multiplies to `elemInSlice = 1`, and `1 % 8 != 0` makes
+                    // [`SliceElems::per_stick`] answer [`None`], which is the reference's own
+                    // `DT_CHECK(elemInSlice > 0 && elemInSlice % numSlices == 0)`
+                    // (`dsc/dsc2.cpp:4083`) aborting. So `StickDims::default()` here did not model a
+                    // DSC scratchy emits — it modelled one the REFERENCE also refuses, and the stage
+                    // stopped on a fixture artifact that was then documented as a fact about the DSC.
+                    //
+                    // ⭐ THE VALUE IS THE ONE ON DISK, BOTH SIDES OF THE STAGES: our input's
+                    // `primaryDsInfo_.OUTPUT` is `stickDimOrder_ ["out"]` / `stickSize_ [64]`, and
+                    // `g0/debug/sdsc_0/sdsc.json` carries the same after scheduling (plus a
+                    // `stickRepl_ [1]` that `getStickSizes` never reads). Census over all 187 of our
+                    // programs: 363 `primaryDsInfo_` entries, ZERO empty sticks and ZERO that fail
+                    // the `% 8` check — and the emitter cannot write an empty one
+                    // (`lower_subtile_tape_to_superdsc.rs:5020-5040` always writes both fields).
+                    stick: StickDims(vec![(PrimaryDim::Out, crate::arch::Elements(64))]),
                 },
             )]),
             core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), cores),
