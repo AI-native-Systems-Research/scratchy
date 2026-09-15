@@ -80,6 +80,18 @@ pub const SEG_KV: SegIdx = SegIdx::known::<2>();
 /// without disturbing the running softmax state or any other activation.
 pub const SEG_MASK: SegIdx = SegIdx::known::<3>();
 
+/// ⭐ THE SEGMENTS A BORROWER ADOPTS INSTEAD OF FILLING — the resident ones. Three sites read this
+/// (host-shadow sizing, device sizing, H2D) and they MUST agree: a segment sized as a placeholder but
+/// then H2D'd from that placeholder writes 128 B of zeros over the owner's live data. Spelling the
+/// set once is what keeps the three in step, and it is the list to extend if the weights ever occupy
+/// more than one segment (see `scratchy_spyre_bundle::MAX_SEGMENT_BYTES`).
+pub const SEG_RESIDENT: [SegIdx; 2] = [SEG_WEIGHT, SEG_KV];
+
+/// Whether `i` names a resident segment (see [`SEG_RESIDENT`]).
+fn is_resident_seg(i: usize) -> bool {
+    SEG_RESIDENT.iter().any(|s| s.get() == i)
+}
+
 /// Logits column count.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Vocab(pub usize);
@@ -324,8 +336,12 @@ enum SourceFiller {
     WeightLoader,
     /// A forward-tape step bound it this step (`bind_input`) — activations, masks, block tables.
     TapeStep,
-    /// Declared device-resident by the generated wiring: a source BY ID that nothing binds, because
-    /// the device wrote it on a previous step. The paged KV cache is the whole population.
+    /// Declared device-resident by the LOADER: a source BY ID that nothing binds per step, because
+    /// its bytes were put there once and persist. Two populations, and they arrive differently — the
+    /// paged KV cache, which the DEVICE wrote on a previous step, and the spilled weight tail, which
+    /// the host copied into this session's own region at load (`adopt_from_owner`) because its slot
+    /// cannot be aliased: the slot also carries an intermediate color, so no two bundles agree on that
+    /// segment's extent and [`Self::SegmentOwner`] is unavailable to it.
     DeclaredResident,
     /// Its segment is ALIASED onto another session's region, so the OWNER filled it. The prefill
     /// ladder rungs and the batched-prefill session are entirely this case for seg1 (weights) and
@@ -343,6 +359,16 @@ struct Rolled {
     iters: i64,
     /// seg1 per-layer byte stride.
     weight_stride: u64,
+    /// ⭐ LAYERS PER WEIGHT BANK. Layer `v` is `(v / layers_per_bank)`'s bank at
+    /// `(v % layers_per_bank) · weight_stride` — the whole of banking, at launch time. Equal to
+    /// `iters` when the weights fit one region, which makes the division a no-op and this path
+    /// byte-identical to the single-region one. NEVER 0 (`load_rolled` refuses that: it would divide
+    /// by zero on the first launch).
+    layers_per_bank: i64,
+    /// The bank the PREFIX program's weight operands were baked in, and the SUFFIX's — the emitter
+    /// proved each group's weights live in ONE bank, because a launch has one base per segment.
+    prefix_weight_bank: usize,
+    suffix_weight_bank: usize,
     /// seg2 per-layer byte stride.
     kv_stride: u64,
     // ⛔ NO HIDDEN-STREAM FIELDS. reroll_meta names `hidden_in`/`hidden_out`/`suffix_in` tids, but
@@ -421,6 +447,21 @@ pub struct Executor {
     // `impl Drop for OpProg` for the abort that forced it.
     stream: Option<Stream>,
     seg_addr: [Option<DevAddr>; NUM_SEGMENTS],
+    /// ⭐ THE WEIGHT SEGMENT'S EXTRA BANKS — regions, host shadows and extents for banks `1..N`,
+    /// index `b - 1`. Bank 0 IS `seg_addr[SEG_WEIGHT]` / `seg_host[SEG_WEIGHT]`, so these three are
+    /// EMPTY for every bundle whose weights fit one device region and every path below then behaves
+    /// exactly as it did before banking existed.
+    ///
+    /// A bank is not another segment (there is no free slot, and the SDSC addresses all of them as
+    /// segment 1); it is a different REGION bound into the same positional slot by the launch that
+    /// needs it. See [`bundle::Placement::bank`] and [`Executor::slot_of`].
+    weight_bank_addr: Vec<Option<DevAddr>>,
+    weight_bank_host: Vec<Vec<u8>>,
+    weight_bank_bytes: Vec<u64>,
+    /// Per extra bank: its region is BORROWED from an owner session, so never H2D this session's
+    /// shadow over it. Mirrors [`Self::seg_aliased`], which cannot cover banks because it is indexed
+    /// by segment.
+    weight_bank_aliased: Vec<bool>,
     /// Host staging (sen bytes) per segment.
     seg_host: [Vec<u8>; NUM_SEGMENTS],
     /// This segment's device region is BORROWED from another session, so `seg_host` is NOT its
@@ -527,6 +568,18 @@ impl Executor {
             split_bodies_ready: false,
             stream: None,
             seg_addr: [const { None }; NUM_SEGMENTS],
+            // ⭐ THE WEIGHT BANKS, STRAIGHT FROM THE BAKED LAYOUT — the bundle decided how many
+            // regions its weights need at cargo-build; nothing here chooses. Empty (one bank) for
+            // every model whose weights fit one region.
+            weight_bank_addr: code.layout.weight_bank_bytes.iter().map(|_| None).collect(),
+            weight_bank_host: code
+                .layout
+                .weight_bank_bytes
+                .iter()
+                .map(|_| Vec::new())
+                .collect(),
+            weight_bank_bytes: code.layout.weight_bank_bytes.to_vec(),
+            weight_bank_aliased: vec![false; code.layout.weight_bank_bytes.len()],
             seg_host: [const { Vec::new() }; NUM_SEGMENTS],
             seg_aliased: [false; NUM_SEGMENTS],
             seg_borrowed: [false; NUM_SEGMENTS],
@@ -584,9 +637,38 @@ impl Executor {
     }
 
     fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
+        // ⛔ `layers_per_bank` DIVIDES a layer index on every launch, so a 0 here is a division by
+        // zero on the first body launch — and it can only be 0 if a bundle was baked before the
+        // field existed or by an emitter that did not set it. Refuse at LOAD, naming the bundle,
+        // rather than faulting mid-forward.
+        if m.layers_per_bank == 0 {
+            bail!(
+                "load: reroll meta declares layers_per_bank=0 (iters={}, {} weight bank(s)) — the \
+                 per-layer advance divides by it",
+                m.iters,
+                self.weight_bank_bytes.len() + 1
+            );
+        }
+        // A bank index the session has no region for would silently fall back to another bank's
+        // base, which is a whole program reading the wrong weights. Check both groups at load.
+        let banks = self.weight_bank_bytes.len() + 1;
+        for (what, b) in [
+            ("prefix", m.prefix_weight_bank),
+            ("suffix", m.suffix_weight_bank),
+        ] {
+            if b as usize >= banks {
+                bail!(
+                    "load: reroll meta puts the {what}'s weights in bank {b}, but this bundle has \
+                     only {banks} weight bank(s)"
+                );
+            }
+        }
         self.rolled = Some(Rolled {
             iters: m.iters as i64,
             weight_stride: m.weight_stride,
+            layers_per_bank: m.layers_per_bank as i64,
+            prefix_weight_bank: m.prefix_weight_bank as usize,
+            suffix_weight_bank: m.suffix_weight_bank as usize,
             kv_stride: m.kv_stride,
         });
         self.prefix_ops = Self::sibling_ops("rolled prefix", &m.prefix)?;
@@ -900,6 +982,34 @@ impl Executor {
     /// Split out of prepare so the caller can run it WHILE the background device prewarm brings the
     /// card up — the ~1s convert then costs nothing on the critical path. Idempotent; prepare falls
     /// back to staging inline if this was never called.
+    /// ⭐ THE SHADOW/REGION SLOT a `(segment, bank)` pair names: the segments first, then the weight
+    /// segment's EXTRA banks, which is why staging can treat both as one flat list.
+    ///
+    /// ⛔ THE SEGMENT INDEX ALONE STOPPED BEING AN ADDRESS the moment one segment could be served by
+    /// several regions. Everything that reaches for a shadow or a region by segment goes through
+    /// here, so a banked weight cannot silently resolve to bank 0's bytes — which would be one whole
+    /// program (the suffix, i.e. the lm_head) reading another bank's weights: fluent, wrong output.
+    ///
+    /// `None` for a bank this session has no region for, which callers turn into a refusal rather
+    /// than a fallback.
+    fn slot_of(&self, seg: usize, bank: u32) -> Option<usize> {
+        match bank {
+            0 => (seg < NUM_SEGMENTS).then_some(seg),
+            b if seg == SEG_WEIGHT.get() && (b as usize) <= self.weight_bank_bytes.len() => {
+                Some(NUM_SEGMENTS + b as usize - 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// Slot `s`'s host shadow (read-only). Slots past the segments are weight banks.
+    fn shadow(&self, s: usize) -> &[u8] {
+        match s.checked_sub(NUM_SEGMENTS) {
+            None => &self.seg_host[s],
+            Some(b) => &self.weight_bank_host[b],
+        }
+    }
+
     pub fn stage_weights(&mut self) -> Result<()> {
         if self.staged_host {
             return Ok(());
@@ -913,9 +1023,9 @@ impl Executor {
         for i in 0..NUM_SEGMENTS {
             // A BORROWED segment is never staged or H2D'd by this session, so it gets the
             // placeholder rather than a zero-fill the width of the whole segment. ...but ONLY for
-            // the segments an alias replaces: seg1 (weights) and seg2 (KV). The ACTIVATION segments
-            // are bound per-forward by this very session and must keep their real size.
-            let aliased_later = reserve_only && (i == SEG_WEIGHT.get() || i == SEG_KV.get());
+            // the segments an alias replaces ([`SEG_RESIDENT`]). The ACTIVATION segments are bound
+            // per-forward by this very session and must keep their real size.
+            let aliased_later = reserve_only && is_resident_seg(i);
             let bytes = if self.seg_borrowed[i] || aliased_later {
                 128
             } else if self.segment_bytes[i] > 0 {
@@ -925,10 +1035,24 @@ impl Executor {
             };
             self.seg_host[i] = vec![0u8; bytes];
         }
+        // ⭐ AND ONE SHADOW PER EXTRA WEIGHT BANK, sized the same way. A bank holds only weights, so
+        // it follows the RESIDENT rule exactly: a session that binds nothing gets a placeholder
+        // because an owner's region will replace it.
+        for b in 0..self.weight_bank_bytes.len() {
+            let bytes = if reserve_only || self.seg_borrowed[SEG_WEIGHT.get()] {
+                128
+            } else {
+                self.weight_bank_bytes[b].max(128) as usize
+            };
+            self.weight_bank_host[b] = vec![0u8; bytes];
+        }
 
         // ── Collect the weight placements, validating each against its own extent. ──
         struct Item<'a> {
-            seg: usize,
+            /// The SHADOW SLOT this weight stages into — a segment, or a weight bank beyond bank 0.
+            /// See [`Executor::slot_of`]: banking gives one segment several regions, so the segment
+            /// index alone stopped being an address.
+            slot: usize,
             offset: usize,
             src: &'a [u8],
             walk: Option<(&'a KernelWeight<'a>, Element)>,
@@ -963,13 +1087,23 @@ impl Executor {
                     p.offset
                 );
             }
-            if p.offset as usize + src.len() > self.seg_host[seg.get()].len() {
+            let Some(slot) = self.slot_of(seg.get(), p.bank) else {
                 bail!(
-                    "stage: weight '{nm}' off {} + {} B exceeds seg{} ({} B)",
+                    "stage: weight '{nm}' names seg{} bank {}, which this session has no shadow for \
+                     ({} weight bank(s))",
+                    p.segment,
+                    p.bank,
+                    self.weight_bank_bytes.len() + 1
+                );
+            };
+            if p.offset as usize + src.len() > self.shadow(slot).len() {
+                bail!(
+                    "stage: weight '{nm}' off {} + {} B exceeds seg{} bank {} ({} B)",
                     p.offset,
                     src.len(),
                     p.segment,
-                    self.seg_host[seg.get()].len()
+                    p.bank,
+                    self.shadow(slot).len()
                 );
             }
             let walk = match self.kernel_weights.get(nm) {
@@ -994,7 +1128,7 @@ impl Executor {
                 None => None,
             };
             items.push(Item {
-                seg: seg.get(),
+                slot,
                 offset: p.offset as usize,
                 src,
                 walk,
@@ -1013,25 +1147,35 @@ impl Executor {
             Option<(&'a KernelWeight<'a>, Element)>,
         );
         let n_items = items.len();
-        items.sort_by_key(|i| (i.seg, i.offset));
+        items.sort_by_key(|i| (i.slot, i.offset));
         let mut tasks: Vec<StageTask<'_>> = Vec::with_capacity(n_items);
         {
-            let mut rests: Vec<&mut [u8]> = self.seg_host.iter_mut().map(|v| &mut v[..]).collect();
-            let mut cursor = [0usize; NUM_SEGMENTS];
+            // ⭐ THE SLOT SPACE IS THE SEGMENTS **THEN** THE EXTRA WEIGHT BANKS, in that order, which
+            // is exactly what `slot_of` returns — one flat list of destinations, so the split-and-
+            // advance below (and its disjointness proof) is unchanged by banking. `chain` here rather
+            // than a second staging loop: a bank holds ~half a model's weights, and a serial pass
+            // over those would cost more than the whole parallel stage it bypassed.
+            let mut rests: Vec<&mut [u8]> = self
+                .seg_host
+                .iter_mut()
+                .chain(self.weight_bank_host.iter_mut())
+                .map(|v| &mut v[..])
+                .collect();
+            let mut cursor = vec![0usize; rests.len()];
             for it in &items {
-                let Some(skip) = it.offset.checked_sub(cursor[it.seg]) else {
+                let Some(skip) = it.offset.checked_sub(cursor[it.slot]) else {
                     bail!(
-                        "stage: placements overlap in seg{} at byte {} — refusing to stage \
+                        "stage: placements overlap in slot {} at byte {} — refusing to stage \
                          (a weight would overwrite the previous one)",
-                        it.seg,
+                        it.slot,
                         it.offset
                     );
                 };
-                let rest = std::mem::take(&mut rests[it.seg]);
+                let rest = std::mem::take(&mut rests[it.slot]);
                 let (_, r) = rest.split_at_mut(skip);
                 let (dst, r2) = r.split_at_mut(it.src.len());
-                rests[it.seg] = r2;
-                cursor[it.seg] = it.offset + it.src.len();
+                rests[it.slot] = r2;
+                cursor[it.slot] = it.offset + it.src.len();
                 tasks.push((it.src, dst, it.walk));
             }
         }
@@ -1180,6 +1324,22 @@ impl Executor {
                     .ok_or_else(|| anyhow!("prepare: seg{i} alloc of {bytes} B failed"))?,
             );
         }
+        // ⭐ AND ONE REGION PER EXTRA WEIGHT BANK, immediately after the weight segment's own —
+        // banks ARE the weight segment, split because a region is capped at 16 GiB while the
+        // addresses are not. Same borrowed-placeholder rule: a borrowing session aliases the owner's
+        // banks (a bank is aliasable BECAUSE it holds only weights, placed identically in every
+        // bundle), so allocating the full extent here would reserve tens of GB only to drop it.
+        for b in 0..self.weight_bank_bytes.len() {
+            let bytes = if self.seg_borrowed[SEG_WEIGHT.get()] {
+                128
+            } else {
+                self.weight_bank_bytes[b].max(128)
+            };
+            self.weight_bank_addr[b] =
+                Some(DevAddr::alloc(bytes, MemKind::Tensor).ok_or_else(|| {
+                    anyhow!("prepare: weight bank {} alloc of {bytes} B failed", b + 1)
+                })?);
+        }
         lap("seg-alloc", &mut t0);
 
         // ── FUSED TWINS ALLOCATE LAST ── They are the only allocation PAGING adds to this session,
@@ -1202,7 +1362,7 @@ impl Executor {
         for i in 0..NUM_SEGMENTS {
             // Same rule as the staging shadow: skip only what an alias replaces. Activation
             // segments still grow to the device extent, because this session fills them itself.
-            if reserve_only && (i == SEG_WEIGHT.get() || i == SEG_KV.get()) {
+            if reserve_only && is_resident_seg(i) {
                 continue;
             }
             // NO HOST MIRROR OF THE KV POOL. seg2 is written by the DEVICE (the on-card `cachewr`
@@ -1217,6 +1377,18 @@ impl Executor {
                 self.seg_host[i].resize(need, 0);
             }
         }
+        // The weight banks follow the weight segment's own rule exactly: grow to the device extent
+        // unless an alias is about to replace the region.
+        if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
+            for b in 0..self.weight_bank_bytes.len() {
+                let need = self.weight_bank_addr[b]
+                    .as_ref()
+                    .map_or(0, |a| a.total_size()) as usize;
+                if self.weight_bank_host[b].len() < need {
+                    self.weight_bank_host[b].resize(need, 0);
+                }
+            }
+        }
         let n_weights = self.n_weights_staged;
         lap("weight-convert", &mut t0);
 
@@ -1229,8 +1401,9 @@ impl Executor {
             if self.seg_borrowed[i] {
                 continue;
             }
-            // Nothing bound ⇒ seg1/seg2 hold no content worth sending and are about to be aliased.
-            if reserve_only && (i == SEG_WEIGHT.get() || i == SEG_KV.get()) {
+            // Nothing bound ⇒ the resident segments hold no content worth sending and are about to
+            // be aliased.
+            if reserve_only && is_resident_seg(i) {
                 continue;
             }
             // The KV pool has NO host mirror to send (see the sizing loop), so it is zeroed
@@ -1248,6 +1421,22 @@ impl Executor {
             stream
                 .h2d(src, addr)
                 .map_err(|rc| anyhow!("prepare: seg{i} H2D rc={rc}"))?;
+        }
+        // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own conditions — it is the same
+        // segment, so "borrowed" and "nothing bound" mean the same thing for it.
+        if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
+            for b in 0..self.weight_bank_bytes.len() {
+                let (stream, addr) = (
+                    self.stream_ref()?,
+                    self.weight_bank_addr[b]
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("prepare: weight bank {} has no region", b + 1))?,
+                );
+                let src = whole_shadow(&self.weight_bank_host[b], addr, NUM_SEGMENTS + b)?;
+                stream
+                    .h2d(src, addr)
+                    .map_err(|rc| anyhow!("prepare: weight bank {} H2D rc={rc}", b + 1))?;
+            }
         }
         lap("tensor-h2d", &mut t0);
         self.stream_ref()?
@@ -1279,6 +1468,13 @@ impl Executor {
                 if i == SEG_KV.get() || has_act {
                     continue;
                 }
+                *host = Vec::new();
+            }
+            // ⭐ AND EVERY BANK SHADOW, unconditionally: a bank holds ONLY weights (that is what
+            // makes it aliasable), so there is no activation to keep one alive and nothing reads its
+            // host bytes after the H2D. Not reclaiming these is the largest host allocation in the
+            // process — a bank is up to 16 GiB.
+            for host in self.weight_bank_host.iter_mut() {
                 *host = Vec::new();
             }
         }
@@ -1537,6 +1733,9 @@ impl Executor {
         slot_pos: SeqPos,
         kv_page_base: Bytes,
         n_fold_pages: i64,
+        // ⭐ WHICH WEIGHT BANK backs positional slot 1 for these launches. 0 for every unbanked
+        // bundle, which is what makes banking invisible to every model whose weights fit one region.
+        weight_bank: usize,
     ) -> Result<()> {
         let d = Diag::get();
         // The list is taken out so `&self` stays free for the stream and the fold state; every op
@@ -1544,7 +1743,15 @@ impl Executor {
         // runs once per forward per REQUEST, so anything written back through it is state one
         // request leaves for the next.
         let ops = std::mem::take(self.list_mut(sel));
-        let r = self.launch_ops_inner(&ops, byte_off, slot_pos, kv_page_base, n_fold_pages, d);
+        let r = self.launch_ops_inner(
+            &ops,
+            byte_off,
+            slot_pos,
+            kv_page_base,
+            n_fold_pages,
+            weight_bank,
+            d,
+        );
         *self.list_mut(sel) = ops;
         r
     }
@@ -1556,6 +1763,7 @@ impl Executor {
         slot_pos: SeqPos,
         kv_page_base: Bytes,
         n_fold_pages: i64,
+        weight_bank: usize,
         d: &Diag,
     ) -> Result<()> {
         // 🛑 THE DRAIN AT THE START IS WHAT MAKES THE LADDER MEAN ANYTHING. A launch is async and
@@ -1653,11 +1861,34 @@ impl Executor {
                 // layer read layer-0's weights). So bake the per-segment offset into a SHIFTED,
                 // non-owning base per segment: all of that segment's tensors then resolve to
                 // seg_base + v·stride = layer v's copy. Layer 0 (off=0) is unshifted.
+                // ⭐ WHICH REGION BACKS THE WEIGHT SLOT: this launch's BANK. Positional slot 1 is
+                // "the weights" to the program, and a `DevAddr` carries no segment identity, so
+                // handing a different region here is the whole mechanism that lets one segment's
+                // worth of addresses span several regions. Bank 0 (`weight_bank` = 0, every unbanked
+                // bundle) is `seg_addr[SEG_WEIGHT]`, exactly as before.
+                let wbase = match weight_bank.checked_sub(1) {
+                    None => self.seg_addr[SEG_WEIGHT.get()].as_ref(),
+                    Some(b) => self
+                        .weight_bank_addr
+                        .get(b)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "launch: weight bank {weight_bank} has no region ({} bank(s))",
+                                self.weight_bank_bytes.len() + 1
+                            )
+                        })?
+                        .as_ref(),
+                };
                 let mut shifted: [Option<DevAddr>; NUM_SEGMENTS] = [const { None }; NUM_SEGMENTS];
                 for i in 0..NUM_SEGMENTS {
                     let sh = off[i];
+                    let base = if i == SEG_WEIGHT.get() {
+                        wbase
+                    } else {
+                        self.seg_addr[i].as_ref()
+                    };
                     if sh > 0
-                        && let Some(base) = self.seg_addr[i].as_ref()
+                        && let Some(base) = base
                         && base.is_single_chunk()
                     {
                         shifted[i] = base.shifted(sh);
@@ -1665,9 +1896,14 @@ impl Executor {
                 }
                 let ta: Vec<&DevAddr> = (0..NUM_SEGMENTS)
                     .map(|i| {
+                        let base = if i == SEG_WEIGHT.get() {
+                            wbase
+                        } else {
+                            self.seg_addr[i].as_ref()
+                        };
                         shifted[i]
                             .as_ref()
-                            .or(self.seg_addr[i].as_ref())
+                            .or(base)
                             .ok_or_else(|| anyhow!("seg{i} has no region"))
                     })
                     .collect::<Result<_>>()?;
@@ -1922,12 +2158,44 @@ impl Executor {
                 .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
             d2h_seg = lp.segment as i64;
             let addr = self.seg_addr[seg.get()].as_ref().unwrap();
-            d2h_bytes = addr.total_size();
-            let host = &mut self.seg_host[seg.get()][..];
+            let tot = addr.total_size();
+            // ⭐ THE LOGITS **PLACEMENT**, NOT ITS SEGMENT'S ALLOCATION — `d2h_bytes =
+            // addr.total_size()` copied the WHOLE region every token to obtain one [1,vocab] row.
+            //
+            // ⛔ THAT COST WAS INVISIBLE BECAUSE IT IS NOT WRITTEN DOWN ANYWHERE: it is whatever
+            // else the layout happens to pack into the logits segment. Today that is nothing (~102
+            // KB, so the whole-region read was ~the row), which is exactly why a whole-region read
+            // survived review. But it is what disqualified seg4 as the weight-tail spill slot in
+            // `spill_weight_tail`: a 419 MB tenant there would have cost ~240 ms PER TOKEN, with
+            // nothing about the placement looking wrong. Reading the PLACEMENT makes the transfer a
+            // property of the logits row (vocab × 2 B) instead of a property of the segment's other
+            // tenants, so no future packing decision can put bytes on this critical path.
+            //
+            // Two facts make the window safe, and both are guarded at cargo-build in
+            // `audit_layout_addresses` rather than trusted here:
+            //   * `lp.offset % 128 == 0` — a chunk offset is written in flits, and flex's
+            //     `each_chunk_128_byte_aligned` rejects an unaligned one.
+            //   * `lp.offset + lp.size <= segment_bytes[seg]` — and `segment_bytes` is an align128
+            //     accumulation, so rounding the LENGTH up to a flit stays inside the region. The
+            //     round-up is not optional: `Flits::from_bytes` TRUNCATES (`>> 7`), so a length that
+            //     is not a multiple of 128 would transfer a short row and lose the tail logits.
+            // The destination is the SAME `[lp.offset, …)` window of the shadow the sen→IEEE convert
+            // below reads from, so the row lands where the caller already looks for it.
+            let lo = lp.offset;
+            let len = crate::lower_subtile_tape_to_superdsc::align128(lp.size).min(tot - lo);
+            // A multi-chunk region has no addressable sub-window (`chunk0` fails); fall back to the
+            // whole-region read, which is what this always did.
+            let win = (len < tot).then(|| addr.window(lo, len)).flatten();
+            let (src, a, b) = match win.as_ref() {
+                Some(w) => (w, lo, lo + len),
+                None => (addr, 0, tot),
+            };
+            d2h_bytes = b - a;
+            let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
             self.stream
                 .as_ref()
                 .unwrap()
-                .d2h(&mut host[..d2h_bytes as usize], addr)
+                .d2h(host, src)
                 .map_err(|rc| anyhow!("logits D2H rc={rc}"))?;
         }
         let t2b = Instant::now();
@@ -2151,11 +2419,19 @@ impl Executor {
             let n_fold_pages = self.n_fold_pages(seq_pos);
             let sel = self.select_body_paged(seq_pos.0 + 1, n_fold_pages)?;
             let base = self.page_base_for_write(seq_pos);
-            return self.launch_ops(sel, zero, seq_pos, base, n_fold_pages);
+            // UNROLLED: one body over the whole model, and an unrolled bundle has no layer boundary
+            // to bank on — its weights are one region by construction (`bank_weight_segment` refuses
+            // to bank without layer classes), so bank 0 is the only bank there is.
+            return self.launch_ops(sel, zero, seq_pos, base, n_fold_pages, 0);
         };
         let (iters, wstride, kvstride) = (rolled.iters, rolled.weight_stride, rolled.kv_stride);
+        let (lpb, pre_bank, suf_bank) = (
+            rolled.layers_per_bank.max(1),
+            rolled.prefix_weight_bank,
+            rolled.suffix_weight_bank,
+        );
 
-        self.launch_ops(ListSel::Prefix, zero, SeqPos(0), Bytes(0), 1)?;
+        self.launch_ops(ListSel::Prefix, zero, SeqPos(0), Bytes(0), 1, pre_bank)?;
 
         // sk_bucket ladder: pick this token's decode body rung by its KV length (valid_len =
         // seq_pos+1 — positions [0..seq_pos] are filled, including the token just written to KV
@@ -2166,16 +2442,26 @@ impl Executor {
         let base = self.page_base_for_write(seq_pos);
         for v in 0..iters {
             let mut off = [0u64; NUM_SEGMENTS];
-            off[SEG_WEIGHT.get()] = v as u64 * wstride;
+            // ⭐ THE PER-LAYER WEIGHT ADDRESS, IN TWO COORDINATES. `v·wstride` alone was a byte
+            // offset into ONE region, which capped a model's weights at that region's 16 GiB. Layer
+            // `v` is now `(v / lpb)`'s BANK at `(v % lpb)·wstride` — the same descriptors, a
+            // different base — so the ceiling is banks × 16 GiB. `lpb == iters` for an unbanked
+            // bundle, which makes this `(0, v·wstride)`: byte-identical to what it replaced.
+            //
+            // ⛔ THE DIVISION AND THE REMAINDER MUST AGREE WITH THE PLACEMENTS, and they are not
+            // checked here — they are PROVEN at cargo-build, per layer, against the addresses that
+            // were actually baked (see the per-layer formula guard in `lower_subtile_tape_to_superdsc`).
+            let wbank = (v / lpb) as usize;
+            off[SEG_WEIGHT.get()] = (v % lpb) as u64 * wstride;
             off[SEG_KV.get()] = v as u64 * kvstride;
             // The WRITE lands in the page holding seq_pos; the FOLD covers every page the RESIDENT
             // PREFIX [0, seq_pos) spans — zero of them when there is no prefix.
-            self.launch_ops(sel, off, seq_pos, base, n_fold_pages)?;
+            self.launch_ops(sel, off, seq_pos, base, n_fold_pages, wbank)?;
         }
         // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
         // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
         // buffer). No D2H/memcpy/H2D — the residual lives on-device across iterations.
-        self.launch_ops(ListSel::Suffix, zero, SeqPos(0), Bytes(0), 1)
+        self.launch_ops(ListSel::Suffix, zero, SeqPos(0), Bytes(0), 1, suf_bank)
     }
 
     /// How many pages the RESIDENT PREFIX `[0, seq_pos)` spans.
@@ -2230,12 +2516,11 @@ impl Executor {
         }
         self.refill_activations(Diag::get())?;
         let zero = [0u64; NUM_SEGMENTS];
-        let sel = if self.rolled.is_some() {
-            ListSel::Prefix
-        } else {
-            ListSel::Body
+        let (sel, bank) = match self.rolled.as_ref() {
+            Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
+            None => (ListSel::Body, 0),
         };
-        self.launch_ops(sel, zero, SeqPos(0), Bytes(0), 1)?;
+        self.launch_ops(sel, zero, SeqPos(0), Bytes(0), 1, bank)?;
         self.stream_ref()?
             .synchronize()
             .map_err(|rc| anyhow!("run_prefix_only sync rc={rc}"))
@@ -2335,6 +2620,18 @@ impl Executor {
             .ok_or_else(|| anyhow!("unknown tensor {id}"))?;
         let seg = SegIdx::checked(p.segment as i64)
             .ok_or_else(|| anyhow!("tensor '{name}' segment {} out of range", p.segment))?;
+        // ⛔ A BANKED TENSOR IS NOT IN ITS SEGMENT'S REGION. `d2h_seg_clamped` reads `seg_addr[seg]`,
+        // which for a weight in bank ≥ 1 is a DIFFERENT region — the read would return bank 0's bytes
+        // at this offset and the caller would compare a golden against another tensor entirely. This
+        // is a selftest/debug reader, so refusing is free; making it bank-aware would mean giving
+        // every segment reader the bank coordinate for a path no forward uses.
+        if p.bank != 0 {
+            bail!(
+                "read_tensor('{name}'): it is in weight bank {}, and a segment read addresses only \
+                 bank 0's region — REFUSING rather than returning another bank's bytes",
+                p.bank
+            );
+        }
         let got = self.d2h_seg_clamped(seg)?;
         let mut elems = (p.size / 2) as usize;
         elems = elems.min(cap_elems);
@@ -2412,6 +2709,43 @@ impl Executor {
         Ok(self.seg_host[seg.get()][..got.min(self.seg_host[seg.get()].len())].to_vec())
     }
 
+    /// Overwrite the FIRST `data.len()` bytes of a tensor segment and H2D exactly that window.
+    ///
+    /// ⛔ WHY NOT [`Executor::write_seg`]: that one is a WHOLE-segment copy, and the thing this
+    /// exists for — handing a BORROWING session its own copy of the spilled weight tail — crosses
+    /// two bundles whose extents for that segment DIFFER. The spill slot is also an intermediate
+    /// COLOR segment, and a prefill rung's intermediates are wider than decode's, so a whole-segment
+    /// copy is not merely wasteful but unrepresentable: MEASURED, 421,257,216 source bytes against a
+    /// 432,218,112 B segment, which `write_seg`'s equality guard correctly refuses.
+    ///
+    /// The tail occupies `[0, len)` by construction (`spill_weight_tail` places it at offset 0 for
+    /// exactly this reason), so writing that prefix and leaving the rest of the shadow as `prepare`
+    /// zeroed it is both the correct result and the smaller transfer.
+    pub fn write_seg_prefix(&mut self, seg: SegIdx, data: &[u8]) -> Result<()> {
+        let i = seg.get();
+        if data.len() > self.seg_host[i].len() {
+            bail!(
+                "write_seg_prefix(seg{i}): {} B does not fit this session's {} B segment",
+                data.len(),
+                self.seg_host[i].len()
+            );
+        }
+        self.seg_host[i][..data.len()].copy_from_slice(data);
+        let addr = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
+        let win = addr
+            .window(0, data.len() as u64)
+            .ok_or_else(|| anyhow!("seg{i} window 0..{} unaddressable", data.len()))?;
+        let stream = self.stream_ref()?;
+        stream
+            .h2d(&self.seg_host[i][..data.len()], &win)
+            .map_err(|rc| anyhow!("write_seg_prefix H2D seg{i} rc={rc}"))?;
+        stream
+            .synchronize()
+            .map_err(|rc| anyhow!("write_seg_prefix sync seg{i} rc={rc}"))
+    }
+
     /// Overwrite the WHOLE tensor segment from raw sen-fp16 bytes + H2D it. The counterpart of
     /// [`Executor::read_seg`].
     pub fn write_seg(&mut self, seg: SegIdx, data: &[u8]) -> Result<()> {
@@ -2472,7 +2806,15 @@ impl Executor {
                 continue;
             }
             match owner.places.get(nm) {
-                Some(q) if q.segment == p.segment && q.offset == p.offset && q.size == p.size => {}
+                // ⛔ THE BANK IS PART OF THE ADDRESS. Two bundles could agree on every offset and
+                // size and still put a weight in DIFFERENT regions, and sharing the regions then
+                // gives the borrower one program's worth of the wrong weights. Comparing the bank is
+                // what makes "the layouts match" mean the same thing it meant before banking.
+                Some(q)
+                    if q.segment == p.segment
+                        && q.bank == p.bank
+                        && q.offset == p.offset
+                        && q.size == p.size => {}
                 _ => bail!("alias_seg(seg{i}): PLACEMENT MISMATCH for '{nm}' — REFUSING"),
             }
         }
@@ -2497,6 +2839,56 @@ impl Executor {
             "[sdsc-superdsc] alias_seg(seg{i}): dst now SHARES src's region ({} B)",
             c0.size
         );
+        // ⭐⭐ AND THE WEIGHT SEGMENT'S EXTRA BANKS — because they ARE the weight segment. Aliasing
+        // seg1 while leaving a bank pointing at this session's own (zero-filled) region would give
+        // the borrower a working body and a suffix that reads zeros: an lm_head of zeros makes every
+        // logit zero, so argmax returns token 0. One wrong token, no crash.
+        //
+        // ⭐ THIS IS THE PAYOFF OVER THE SEG6 TAIL SPILL. A bank holds ONLY weights, placed
+        // identically in every bundle of the ladder, so both equality checks above pass and the
+        // region can be SHARED. The spill slot was also an intermediate COLOUR, whose extent depends
+        // on the rung's query width, so it could never be aliased and every borrowing session needed
+        // its own COPY of the tail — 27–28 × 419,430,400 B = 10.5 GiB of device memory and ~7.6 s of
+        // load for granite-3.1-8b-fp16, all of which banking removes.
+        if i == SEG_WEIGHT.get() {
+            if self.weight_bank_bytes.len() != owner.weight_bank_bytes.len() {
+                bail!(
+                    "alias_seg(seg{i}): BANK COUNT MISMATCH dst has {} extra weight bank(s), src \
+                     has {} — REFUSING",
+                    self.weight_bank_bytes.len(),
+                    owner.weight_bank_bytes.len()
+                );
+            }
+            for b in 0..self.weight_bank_bytes.len() {
+                if self.weight_bank_bytes[b] != owner.weight_bank_bytes[b] {
+                    bail!(
+                        "alias_seg(seg{i}): weight bank {} SIZE MISMATCH dst={} src={} — REFUSING",
+                        b + 1,
+                        self.weight_bank_bytes[b],
+                        owner.weight_bank_bytes[b]
+                    );
+                }
+                let Some(sb) = owner.weight_bank_addr[b].as_ref() else {
+                    bail!(
+                        "alias_seg(seg{i}): src has no region for weight bank {}",
+                        b + 1
+                    );
+                };
+                let bc0 = sb
+                    .chunk0()
+                    .filter(|_| sb.is_single_chunk())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "alias_seg(seg{i}): src weight bank {} is MULTI-CHUNK — REFUSING",
+                            b + 1
+                        )
+                    })?;
+                self.weight_bank_addr[b] = Some(DevAddr::from_chunk(bc0).ok_or_else(|| {
+                    anyhow!("alias_seg(seg{i}): weight bank {} rebuild failed", b + 1)
+                })?);
+                self.weight_bank_aliased[b] = true;
+            }
+        }
         Ok(())
     }
 

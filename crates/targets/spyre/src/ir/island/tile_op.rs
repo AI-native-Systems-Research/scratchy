@@ -84,7 +84,7 @@ impl TileOp {
     pub fn tile<const N: u32>(
         &self,
         budget: MaxCores<N>,
-        splitter: impl FnOnce(&[ItDim], u32) -> std::collections::BTreeMap<&'static str, u32>,
+        splitter: impl Fn(&[ItDim], u32) -> std::collections::BTreeMap<&'static str, u32>,
         tiled_dim: &'static str,
     ) -> Result<TiledOp, scratchy_subtile::superdsc_error::SuperDscError> {
         crate::ir::bridge::tile_op_tiled_op::run_tiler(self, budget, splitter, tiled_dim)

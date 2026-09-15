@@ -76,7 +76,7 @@ pub fn assemble_matmul_split(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    splitter: impl FnOnce(
+    splitter: impl Fn(
         &[scratchy_subtile::superdsc_opspec::ItDim],
         u32,
     ) -> std::collections::BTreeMap<&'static str, u32>,

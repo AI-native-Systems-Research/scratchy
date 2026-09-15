@@ -550,6 +550,7 @@ mod tests {
         let place = |id: PlaceId| Placement {
             id,
             segment: 0,
+            bank: 0,
             offset: 0,
             size: 64,
             is_logits: false,

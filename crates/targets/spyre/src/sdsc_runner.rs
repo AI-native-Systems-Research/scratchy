@@ -531,19 +531,40 @@ impl SuperDscSession {
         self.exec.read_seg(s)
     }
 
+    /// Overwrite the FIRST `bytes.len()` bytes of a tensor segment + H2D exactly that window — the
+    /// spilled-weight-tail copy, whose source is one bundle's segment and whose destination is
+    /// another's of a DIFFERENT extent. See [`Executor::write_seg_prefix`].
+    pub fn write_seg_prefix(&mut self, seg: i64, bytes: &[u8]) -> Result<()> {
+        let s = SegIdx::checked(seg)
+            .ok_or_else(|| anyhow!("write_seg_prefix: segment {seg} out of range"))?;
+        self.exec.write_seg_prefix(s, bytes)
+    }
+
     /// Overwrite the whole tensor segment from raw sen-fp16 bytes + H2D it.
     pub fn write_seg(&mut self, seg: i64, bytes: &[u8]) -> Result<()> {
         let s =
             SegIdx::checked(seg).ok_or_else(|| anyhow!("write_seg: segment {seg} out of range"))?;
-        // GUARD: the KV handoff is a RAW whole-segment copy with no layout cross-check. Assert the
-        // source byte count == THIS session's segment size. A mismatch means the two independently
-        // baked bundles' seg2 layouts diverged — which would silently hand wrong-OFFSET K/V for
-        // every layer past the divergence (semi-coherent garble, no crash).
+        // GUARD: this is a RAW whole-segment copy with no layout cross-check. Assert the source byte
+        // count == THIS session's segment size. A mismatch means the two independently baked bundles
+        // placed the segment differently — which would silently hand wrong-OFFSET data for every
+        // tensor past the divergence (semi-coherent garble, no crash).
+        //
+        // ⛔ THE CAUSE IS NOT ALWAYS A KV ASYMMETRY, which this used to assert outright and cost a
+        // misdiagnosis. A whole-segment copy is only meaningful between bundles whose extent for that
+        // segment AGREES, and that holds for seg2 (nothing in its size depends on the query-row count)
+        // but for very little else: any segment carrying an intermediate COLOR or the logits scales
+        // with m, so its total differs per rung by construction — MEASURED, seg6 is 421,257,216 B in
+        // the decode bundle and 432,218,112 B in a prefill one, the same 419,430,400 B tail beside a
+        // 1,826,816 B and a 12,787,712 B color. For a payload that occupies a PREFIX of the segment
+        // (the spilled weight tail) the copy that is actually well-defined is
+        // [`SuperDscSession::write_seg_prefix`], not this one.
         let expect = self.exec.seg_bytes(s);
         if bytes.len() != expect {
             bail!(
                 "write_seg(seg={seg}): source {} bytes != this session's segment {expect} bytes — \
-                 prefill/decode seg2 layout divergence (resident-kct or KV placement asymmetry)",
+                 the two bundles place seg{seg} differently. A whole-segment copy needs their \
+                 extents to agree; if the payload is a prefix of the segment, copy it with \
+                 write_seg_prefix instead",
                 bytes.len()
             );
         }

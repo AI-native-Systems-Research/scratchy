@@ -736,9 +736,23 @@ pub const MAX_STAGED_BYTES: usize = 512 * 1024 * 1024;
 
 /// ⭐ THE CPU BOUND: concurrent `dxp_standalone` processes.
 ///
-/// dxp is single-threaded per group, so this is the compile width. Capped rather than unbounded so a
-/// 192-core host does not fork 900 compilers at once; the disk bound above is what stops the emitter
-/// running ahead of them.
+/// Capped rather than unbounded so a 192-core host does not fork 900 compilers at once; the disk
+/// bound above is what stops the emitter running ahead of them.
+///
+/// ⛔ dxp IS NOT SINGLE-THREADED PER GROUP, which this used to claim. MEASURED: each
+/// `dxp_standalone` builds an LLVM thread pool from `hardware_concurrency`, so the real thread demand
+/// is `COMPILE_WIDTH × <CPUs the process believes it has>`. That product, not this constant, is what
+/// exhausts the process table as
+/// `LLVM ERROR: pthread_create failed: Resource temporarily unavailable` — a dxp refusal that reads
+/// like a bad descriptor but is the task limit talking (`bash: fork: retry` in the same pod is the
+/// same cause).
+///
+/// ⛔ AND THE FIX IS NOT TO LOWER THIS. `hardware_concurrency` follows CPU AFFINITY, so the multiplier
+/// is the container's business: a pod that publishes `nproc` 192 while its cgroup `cpu.max` grants 20
+/// makes every dxp spawn 192 threads for 20 CPUs of quota, and lowering the width only trades bake
+/// throughput for a smaller multiple of a wrong number. Run the build so the children see the CPUs
+/// they actually have (`taskset -c` matching `cpu.max`) and the product comes down ~10× with the
+/// width, and this constant, untouched. Measured on a 20-CPU-quota pod: width 8 still failed.
 pub const COMPILE_WIDTH: usize = 32;
 
 /// Kept as the queue's const-generic parameter — the channel depth, which only has to exceed the
