@@ -901,41 +901,45 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
         )
     }
 
-    /// ⭐⭐ `scheduleTree_.getHead()` as the block one `DdlConvertInterface` is opened over — AND THIS
-    /// IS WHERE STAGE 2B STOPS ON A REAL PREFILLED SCHEDULE. `run_v1` calls it at `ddc/v1.rs:6483`,
-    /// one line before `select_and_parse_ddl_template`.
+    /// ⭐⭐⭐ `scheduleTree_.getHead()` AS THE WHOLE BLOCK ONE `DdlConvertInterface` IS OPENED OVER —
+    /// ANSWERED, and this is the seam stage 2b used to stop on (`run_v1`'s `ddc/v1.rs:6483`, one line
+    /// before `select_and_parse_ddl_template`).
     ///
-    /// ⛔⛔ IT WANTS THE WHOLE [`BlockNode`], NOT ITS IDENTITY, AND THAT IS A THIRD TREE MODEL.
-    /// [`BlockNode::children`] is a `Vec<SchedNode>` of OWNED nodes and
-    /// [`crate::schedule::ddl::conversion::DdlConversion::new`] wraps it in a
-    /// [`crate::schedule::dsc2::ScheduleTree`] it then splices every parsed DDL node into
-    /// (`ddl/conversion.rs:1914-1916`). [`super::tree::TreeData`] reaches every node by IDENTITY and
-    /// owns no subtree, so satisfying this means materialising all 22 nodes as owned `dsc2::` nodes.
+    /// ⛔⛔ THE `isParametricLoop_` OBJECTION WAS WRONG AND THE AUTHORITY SAYS SO. This method used to
+    /// refuse because a materialised LOOP child needs
+    /// [`crate::schedule::dsc2::LoopNode::parametric_lds`] and *"writing [`None`] there states 'this
+    /// loop is not parametric' as a FACT"*. It IS the fact: `isParametricLoop_ = false` and
+    /// `parametricLdsIdx_ = -1` are the field's own member initializers (`dsc/dsc2.h:617-618`), and
+    /// EXACTLY TWO things in the whole reference ever write them —
     ///
-    /// ⛔ HANDING BACK AN EMPTY-CHILDREN BLOCK IS THE ONE THING THAT MUST NOT HAPPEN: it says the
-    /// DSC's schedule tree is empty, and the DDL conversion would then splice its minted computes and
-    /// transfers into nothing — the parsed template would attach to no schedule at all, and it would
-    /// compile.
+    ///   * `ParametricLoopOp`'s arm of the DDL conversion, which calls `markAsParametricLoop()` then
+    ///     `setParametricLdsIdx(ldsIdx)` on a loop IT mints (`ddc/ddl/ddl_conversion.cpp:1126-1161`);
+    ///   * the JSON importer, reading `parametricLoop_`/`parametricLdsIdx_` back off a SERIALISED
+    ///     super-DSC (`dsc/dsc2.cpp:1409-1416`).
     ///
-    /// ⛔⛔ AND THE MATERIALISATION IS BLOCKED ON A FACT THIS TREE ALREADY REFUSES. Every LOOP child
-    /// must become a [`crate::schedule::dsc2::LoopNode`], whose `parametric_lds` is
-    /// `isParametricLoop_` fused with `parametricLdsIdx_` — the SAME field
-    /// [`v1::ExploreTree::is_parametric_loop`] and [`tu::ScheduleSurgery::is_parametric`] both name as
-    /// missing. Writing [`None`] there states *"this loop is not parametric"* as a FACT, and
-    /// `rmsq_o728`'s tree has three chunk loops it would state it for.
+    /// Neither has run: the tree here is the one stage 2a's growers minted in memory, and the DDL
+    /// conversion is what this call OPENS. So every loop of it is non-parametric by the authority's own
+    /// default, and [`tu::LoopNode`] — the view the tree stores — correspondingly has no such field to
+    /// lose. ⭐ A loop the DDL conversion later mints as parametric carries the flag on ITS node, which
+    /// is why the field stays on [`crate::schedule::dsc2::LoopNode`] rather than being dropped.
     ///
-    /// ⭐ WHAT IS *NOT* THE BLOCKER: the COMPUTE arm. [`crate::schedule::dsc2::SchedNode`] spells an
-    /// ALLOCATE or a TRANSFER as `Leaf(NodeName)` — name only, no children — so the 22-node stage-2a
-    /// tree needs no compute node to materialise.
+    /// ⛔ AN EMPTY-CHILDREN BLOCK IS STILL THE ONE THING THAT MUST NOT HAPPEN — it would say the DSC's
+    /// schedule tree is empty and the conversion would splice the whole parsed template into nothing —
+    /// so the walk below is over `tree.children` from the head, recursively, and every kind the tree
+    /// holds has an arm.
+    ///
+    /// ⛔ TOTAL, BECAUSE `getHead()` IS: the reference reaches it unguarded and every tree
+    /// [`super::DscState::seeded`] builds has a `root_level_operations` block at node `[0]`.
     fn schedule_head_block(&self) -> BlockNode {
-        todo!(
-            "v1::Dsc2Store::schedule_head_block: wants scheduleTree_.getHead() as a whole \
-             dsc2::BlockNode of OWNED SchedNodes (DdlConversion::new splices the parsed DDL into it, \
-             ddl/conversion.rs:1914-1916). super::tree::TreeData reaches nodes by identity and owns \
-             no subtree; materialising one needs dsc2::LoopNode::parametric_lds \
-             (isParametricLoop_ + parametricLdsIdx_), the same field ExploreTree::is_parametric_loop \
-             refuses. An empty-children block would attach the whole parsed template to nothing."
-        )
+        self.with_tree(|tree| {
+            let head = tree.head().unwrap_or_else(|| {
+                panic!(
+                    "v1::Dsc2Store::schedule_head_block: scheduleTree_.getHead() on a tree with no \
+                     head — DscState::seeded sets one root block per DSC"
+                )
+            });
+            head_block_of(tree, head)
+        })
     }
 
     /// ⛔ `dsc.setRelevantCompCoreCl()` (`dsc/dsc2.cpp:2647`) — outside this campaign's file list,
@@ -957,6 +961,119 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
              dsc.finalizeScheduleTree(sdsc, dscGlobal.sysDef) (dsc/dsc2.cpp:2749) — outside this \
              campaign's file list"
         )
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐⭐ `scheduleTree_.getHead()` MATERIALISED — the identity-keyed tree as ONE OWNED `dsc2::BlockNode`.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE BLOCK AND EVERY NODE UNDER IT, AS OWNED `dsc2::` NODES — `BlockNode::next_` is a vector of
+/// `ScheduleNode*` there and a `Vec<SchedNode>` here, so *"the block"* is the whole subtree.
+///
+/// ⛔ THE ORDER IS `tree.children`'s, WHICH IS `getNextView(ALL)`: *"EVERY child in schedule order,
+/// because the `ALL` arm of `isNodeRelevant` filters nothing at all"*
+/// ([`crate::schedule::ddc::fold::ScheduleTree::children`]'s own note). A DDL conversion splices by
+/// position, so a reordering here would move where the parsed template lands.
+fn head_block_of(tree: &super::tree::TreeData, block: NodeId) -> BlockNode {
+    BlockNode {
+        name: tree.name(block).unwrap_or_default(),
+        children: tree
+            .children(block)
+            .into_iter()
+            .map(|child| sched_node_of(tree, child))
+            .collect(),
+    }
+}
+
+/// ONE NODE AS THE `dsc2::SchedNode` ITS `nodeType_` MAKES IT — the same six kinds
+/// [`super::tree::Kind`] holds, arm for arm.
+///
+/// ⛔ EVERY BLOCK KIND RECURSES AND EVERY LEAF DOES NOT, which is `isBlockNode()`
+/// (`dsc/dsc2.h:479`): a `BLOCK`, a `LOOP` and a `CONDITION` own children, and an `ALLOCATE`, a
+/// `TRANSFER` and a `SYNC` do not.
+///
+/// ⛔ AN `ALLOCATE` AND A `TRANSFER` ARE [`crate::schedule::dsc2::SchedNode::Leaf`] — NAME ONLY, by
+/// that type's own statement, so materialising this tree needs no COMPUTE arm and drops no field of
+/// either: the DDL conversion reaches an allocation through `metadata.newAllocations_` and a transfer
+/// through the arena, both keyed by identity, not through this block.
+///
+/// ⛔ AND A `SYNC` CARRIES ITS WHOLE NODE, not its name: *"the sequences that mint syncs cross-link the
+/// pair they minted and a bare name cannot be linked"*
+/// ([`crate::schedule::dsc2::SchedNode::Sync`]).
+fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule::dsc2::SchedNode {
+    use crate::schedule::dsc2::{LoopDim, SchedNode};
+
+    match tree.node_kind(node) {
+        Some(NodeKind::Block) => SchedNode::Block(head_block_of(tree, node)),
+        Some(NodeKind::Loop) => {
+            let held = tree.loop_at(node).cloned().unwrap_or_else(|| {
+                panic!("a node whose nodeType_ is LOOP holds a LoopNode: {node:?}")
+            });
+            SchedNode::Loop(Box::new(crate::schedule::dsc2::LoopNode {
+                block: head_block_of(tree, node),
+                // `dims_` — the SAME order [`tu::LoopDims`] states, which is the order the loop's own
+                // name spells them in.
+                dims: held
+                    .dims
+                    .iter()
+                    .map(|entry| LoopDim {
+                        dim: entry.dim,
+                        kind: entry.kind,
+                    })
+                    .collect(),
+                // ⭐ `numId_`/`denId_` ARE NOT OPTIONAL ON THE STORED VIEW — *"every callsite of the
+                // constructor passes a real pair"* ([`tu::LoopNode`]) — so both are `Some` here and the
+                // `-1` a `dsc2::LoopNode` admits is the DDL's parametric loop, not this one.
+                num: Some(held.num),
+                den: Some(held.den),
+                // ⛔ `isParametricLoop_ = false` / `parametricLdsIdx_ = -1`, the member initializers of
+                // `dsc/dsc2.h:617-618`. See [`v1::Dsc2Store::schedule_head_block`] for the two — and
+                // only two — writers, neither of which has run.
+                parametric_lds: None,
+            }))
+        }
+        Some(NodeKind::Condition) => {
+            let held = tree.condition(node).unwrap_or_else(|| {
+                panic!("a node whose nodeType_ is CONDITION holds a guard: {node:?}")
+            });
+            // ⭐ THE TWO REGIONS AS `addThenRegion`/`addElseRegion` FILLED THEM, each a list of BLOCKS
+            // (`dsc/dsc2.cpp:2143`'s *"ConditionNode only accepts 2 BlockNodes as children"*).
+            SchedNode::Guarded(Box::new(crate::schedule::dsc2::ConditionNode {
+                name: tree.name(node).unwrap_or_default(),
+                // ⛔ THE EMPTY COMPOSITE IS `hasCoreClCond()`, WHICH IS THE REFERENCE'S OWN TEST:
+                // *"`loopCond_.twoLevelOrOfAnds_.empty()`… answers 'the core/corelet set is what guards
+                // this'"* ([`crate::schedule::dsc2::ConditionNode`]), so a core/corelet-guarded
+                // condition's `loopCond_` IS empty there too.
+                loop_cond: held.loop_cond.clone().unwrap_or_default(),
+                core_cl_cond: held
+                    .cores
+                    .as_ref()
+                    .map(|set| set.0.clone())
+                    .unwrap_or_default(),
+                then_region: held
+                    .then_region
+                    .iter()
+                    .map(|child| SchedNode::Block(head_block_of(tree, *child)))
+                    .collect(),
+                else_region: held
+                    .else_region
+                    .iter()
+                    .map(|child| SchedNode::Block(head_block_of(tree, *child)))
+                    .collect(),
+            }))
+        }
+        Some(NodeKind::Sync) => SchedNode::Sync(tree.sync_node(node).unwrap_or_else(|| {
+            panic!("a node whose nodeType_ is SYNC holds a SyncNode: {node:?}")
+        })),
+        // `ALLOCATE` and `TRANSFER` — `isBlockNode()` is false and neither has children.
+        Some(NodeKind::Allocate | NodeKind::Transfer | NodeKind::Compute | NodeKind::StickMask) => {
+            SchedNode::Leaf(tree.name(node).unwrap_or_default())
+        }
+        None => panic!(
+            "v1::Dsc2Store::schedule_head_block: {node:?} is a child of this tree with no \
+             nodeType_ — the walk came out of tree.children, so this is a defect in the tree"
+        ),
     }
 }
 

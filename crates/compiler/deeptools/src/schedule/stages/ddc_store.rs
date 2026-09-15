@@ -91,7 +91,7 @@ impl<'s, 'l> Dsc2Store<'s, 'l> {
     }
 
     /// The tree, for one read.
-    fn with_tree<T>(&self, ask: impl FnOnce(&TreeData) -> T) -> T {
+    pub(super) fn with_tree<T>(&self, ask: impl FnOnce(&TreeData) -> T) -> T {
         self.state
             .tree(self.dsc)
             .expect("a Dsc2Store is only built for a DSC the state holds a tree for")

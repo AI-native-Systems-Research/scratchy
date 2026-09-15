@@ -683,7 +683,6 @@ mod tests {
     /// unit that reads a placed address is reading an unplaced one, and this test asserts only where
     /// the stage stops — never a value derived from an address.
     #[test]
-    #[should_panic(expected = "Dsc2Store::schedule_head_block")]
     fn stage_2b_on_the_grown_stage_2a_tree_reaches_the_ddl_conversion() {
         use crate::schedule::l3::dl_ops as ops;
 
@@ -712,35 +711,178 @@ mod tests {
             &[the_rmsq_compute_ops()],
             &[v1::StorageName("rmsq_o728".to_owned())],
         );
-        // ⭐⭐ AND STAGE 2B RUNS `prep_dsc` AND `attach_to_prefilled_schedule` WHOLE, then stops on
-        // `Dsc2Store::schedule_head_block` — `run_v1`'s line 6483, ONE LINE before
-        // `select_and_parse_ddl_template`.
+        // ⭐⭐⭐ AND STAGE 2B NOW RUNS *THROUGH* `Dsc2Store::schedule_head_block` — `run_v1`'s line
+        // 6483 — INTO `select_and_parse_ddl_template` (`:6489`), which is the DDL step itself.
         //
-        // ⭐ WHAT THAT PROVES RAN, and it is far more than the seed run: `prep_dsc` complete
-        // (including `finalize_external_stage` on BOTH datastages, `get_pe_sfp_split_dim` over the
-        // chunk snapshot, and the cross-core reduction sweep), then `init_global_data`, then the whole
-        // of `attach_to_prefilled_schedule` — its walk over all 22 nodes, every ALLOCATE's
-        // `holds_lds`/`is_dsc_memory`/`lds_alloc` round-trip, every TRANSFER's `transfer_kind` and
-        // bound checks, every LOOP's `loop_dims`, and the `lx_below_schedule` block found BY NAME.
+        // ⭐ WHAT THAT PROVES RAN: `prep_dsc` complete (including `finalize_external_stage` on BOTH
+        // datastages, `get_pe_sfp_split_dim` over the chunk snapshot, and the cross-core reduction
+        // sweep), then `init_global_data`, then the whole of `attach_to_prefilled_schedule` — its walk
+        // over all 22 nodes, every ALLOCATE's `holds_lds`/`is_dsc_memory`/`lds_alloc` round-trip, every
+        // TRANSFER's `transfer_kind` and bound checks, every LOOP's `loop_dims`, and the
+        // `lx_below_schedule` block found BY NAME — then the head block materialised whole, then
+        // `DdlConversion::new` over it, then the template selection.
         //
-        // ⛔ THE EXPECTED MESSAGE IS THE SPECIFIC SEAM, so this is a ratchet in both directions: it
-        // fails if stage 2b regresses to an earlier stop, and it fails the moment the head block can
-        // be materialised — which is the cue to re-measure how far the DDL step then gets.
-        let _ = run_ddc::<Dd2>(
+        let ran = run_ddc::<Dd2>(
             &mut sdsc,
             &state,
             ddc_defaults(),
             &l3::dl_ops::AddressFoldCoords::flat(),
         );
+
+        // ⛔⛔ NOTHING PANICKED — stage 2b reached the DDL step and came back with a callee's own
+        // [`None`], which is the first time this stage has ended in anything but a `todo!`.
+        assert!(
+            ran.is_none(),
+            "the DDL step's own refusal, propagated — not a carrier `todo!`: {ran:?}"
+        );
+
+        // ⭐⭐ AND *WHICH* REFUSAL, EXACTLY ONE, NAMED. `select_and_parse_ddl_template` asked
+        // [`DdcTemplates::stated`] — which it reaches only AFTER `ddl_templates(opFunc, A::GEN)`
+        // answered [`Some`] (`ddl/conversion.rs:6011`), so this is the template set being ASKED and
+        // not an early exit. ⛔ IT IS A `build.rs` GAP AND NOT A CARRIER'S: four of a
+        // `StatedTemplate`'s six parts are never emitted.
+        assert_eq!(
+            state.refusals().len(),
+            1,
+            "one refusal, so nothing else along the way could not answer: {:?}",
+            state.refusals()
+        );
+        assert!(
+            state
+                .first_refusal()
+                .is_some_and(|what| what.starts_with("DdlTemplateSet::stated:")),
+            "the stop is the template set, not a store: {:?}",
+            state.first_refusal()
+        );
+
+        // ⛔⛔ AND THE TREE DID NOT MOVE. The DDL step is where stage 2b MINTS its computes and
+        // transfers, and it minted nothing — so *"stage 2b ran"* must never be read as *"stage 2b did
+        // something"*. The corpus census cannot move until a template is stated AND the allocator
+        // lands.
+        assert_eq!(
+            l3_state.node_count(),
+            22,
+            "still the reference's stage-2a tree, node for node"
+        );
     }
 
-    /// ⭐⭐ WHAT THE DDL STEP WOULD DO NEXT, SETTLED WITHOUT REACHING IT — `select_and_parse_ddl_template`
-    /// asks `ddl_templates(opFunc.spelling(), A::GEN)` BEFORE it touches the template set
+    /// ⭐⭐⭐ `scheduleTree_.getHead()` MATERIALISED IS THE REFERENCE'S OWN TREE, NODE FOR NODE — the
+    /// one thing [`v1::Dsc2Store::schedule_head_block`]'s doc says must not go wrong.
+    ///
+    /// ⛔⛔ AN EMPTY-CHILDREN BLOCK IS WHAT THIS TEST EXISTS TO CATCH. The DDL conversion splices every
+    /// parsed template node into this block by POSITION (`ddl/conversion.rs:1914-1916`), so a head
+    /// block with no children would attach the whole template to nothing — and it would compile, and
+    /// `run_v1` would still return the same [`None`] it does today. So the assertion is on the SHAPE and
+    /// the NAMES, against `REFERENCE_STAGE_2A_TREE`, and not on "it is a block".
+    ///
+    /// ⭐ AND THE LOOP NEST IS CHECKED AS A NEST, not as a count: `loop_ds0_ds1_y` OWNS
+    /// `loop_ds0_ds1_out`, which owns `loop_ds0_ds1_mb` — the three chunk loops
+    /// `debug/sdsc_0/sdsc.json` nests in that order — so a walk that flattened the tree fails here even
+    /// though it would carry all 22 names.
+    #[test]
+    fn the_materialised_head_block_is_the_references_own_tree_nested() {
+        use crate::schedule::dsc2::{BlockNode, SchedNode};
+        use crate::schedule::l3::dl_ops as ops;
+
+        let sdsc = a_rmsq_super_dsc();
+        let l3_state = DscState::seeded(&sdsc);
+        {
+            let (reads, mut env) = grow(&sdsc, &l3_state);
+            ops::optimize_hbm_lds_output_in_schedule_tree(&sdsc, &mut env)
+                .expect("the output tensor's HBM load is dropped");
+            ops::optimize_hbm_transfers(&sdsc, &reads, &mut env)
+                .expect("the HBM transfers are hoisted");
+            ops::create_synchronization(&sdsc, ops::LxBuffering::Double, &reads, &reads, &mut env)
+                .expect("the L3LU/LXLU and LXSU/L3SU sync pairs");
+        }
+        let state = Dsc2State::seeded(
+            &sdsc,
+            &l3_state,
+            &[the_rmsq_compute_ops()],
+            &[v1::StorageName("rmsq_o728".to_owned())],
+        );
+        let mut sites = Dsc2Provider::new(&state, &l3::dl_ops::AddressFoldCoords::flat());
+        let carriers = v1::Dsc2Sites::carriers(&mut sites, l3::dsc::DscIdx(0))
+            .expect("the one DSC's carriers");
+        let head = v1::Dsc2Store::schedule_head_block(&*carriers.dsc);
+
+        /// Every name under one block, in the order its `next_` holds them, depth first.
+        fn names(block: &BlockNode, into: &mut Vec<String>) {
+            into.push(block.name.0.clone());
+            for child in &block.children {
+                match child {
+                    SchedNode::Block(held) | SchedNode::Condition(held) => names(held, into),
+                    SchedNode::Loop(held) => names(&held.block, into),
+                    other => into.push(other.name().0.clone()),
+                }
+            }
+        }
+
+        let mut flat = Vec::new();
+        names(&head, &mut flat);
+        assert_eq!(
+            flat, REFERENCE_STAGE_2A_TREE,
+            "the materialised head block IS the reference's own stage-2a tree, in its own DFS order"
+        );
+        // ⭐ THE NEST, WHICH A FLAT WALK WOULD PASS THE ABOVE WITHOUT: `loop_ds0_ds1_y` owns
+        // `loop_ds0_ds1_out` owns `loop_ds0_ds1_mb`, and the innermost carries the whole LX body.
+        let outer = head
+            .children
+            .iter()
+            .find_map(|child| match child {
+                SchedNode::Loop(held) if held.block.name.0 == "loop_ds0_ds1_y" => Some(held),
+                _ => None,
+            })
+            .expect("`loop_ds0_ds1_y` is a child of the root block");
+        // ⛔ AND ITS `numId_`/`denId_` ARE THE REAL PAIR, so a materialiser that dropped them fails.
+        assert!(
+            outer.num.is_some() && outer.den.is_some(),
+            "numId_/denId_ carried across: {:?}/{:?}",
+            outer.num,
+            outer.den
+        );
+        // ⛔ `isParametricLoop_` IS `false` — the member initializer of `dsc/dsc2.h:617-618`, and the
+        // only two writers of it (`ddl_conversion.cpp:1126-1161`, `dsc/dsc2.cpp:1409-1416`) are the DDL
+        // conversion this call OPENS and the JSON importer, neither of which has run.
+        assert_eq!(
+            outer.parametric_lds, None,
+            "a loop stage 2a minted is not parametric"
+        );
+        let mid = outer
+            .block
+            .children
+            .iter()
+            .find_map(|child| match child {
+                SchedNode::Loop(held) if held.block.name.0 == "loop_ds0_ds1_out" => Some(held),
+                _ => None,
+            })
+            .expect("`loop_ds0_ds1_out` is INSIDE `loop_ds0_ds1_y` and not beside it");
+        let inner = mid
+            .block
+            .children
+            .iter()
+            .find_map(|child| match child {
+                SchedNode::Loop(held) if held.block.name.0 == "loop_ds0_ds1_mb" => Some(held),
+                _ => None,
+            })
+            .expect("`loop_ds0_ds1_mb` is INSIDE `loop_ds0_ds1_out`");
+        assert_eq!(
+            inner.block.children.len(),
+            15,
+            "the innermost chunk loop carries the whole LX body — the fifteen nodes of \
+             `REFERENCE_STAGE_2A_TREE` from `allocate_lds0_lx` on, which is what an empty-children \
+             block would have lost"
+        );
+    }
+
+    /// ⭐⭐ WHY THE DDL STEP ASKS THE TEMPLATE SET AT ALL — `select_and_parse_ddl_template` asks
+    /// `ddl_templates(opFunc.spelling(), A::GEN)` BEFORE it touches the set
     /// (`ddl/conversion.rs:6011`), and that is a build-time table this test can read directly.
     ///
-    /// ⭐ SO THE NEXT STOP AFTER [`v1::Dsc2Store::schedule_head_block`] IS KNOWN: `mul` HAS candidate
-    /// templates on `Dd2`, so the DDL step would NOT take the *"no DDL available for op"* early exit —
-    /// it would ask [`DdcTemplates::stated`], which answers [`None`] because `build.rs` emits one of a
+    /// ⭐ SO THE STOP [`stage_2b_on_the_grown_stage_2a_tree_reaches_the_ddl_conversion`] MEASURES IS
+    /// EXPLAINED HERE: `mul` HAS candidate templates on `Dd2`, so the DDL step does NOT take the *"no
+    /// DDL available for op"* early exit — it ASKS [`DdcTemplates::stated`], which answers [`None`]
+    /// because `build.rs` emits one of a
     /// [`crate::schedule::ddl::conversion::StatedTemplate`]'s six parts. That is stage 2b's LAST
     /// reachable seam, and it is a `build.rs` gap and not a carrier's.
     ///

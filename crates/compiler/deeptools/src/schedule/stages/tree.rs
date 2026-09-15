@@ -428,6 +428,33 @@ impl TreeData {
         }
     }
 
+    /// The WHOLE `dsc2::SyncNode` at that node, [`None`] for a node that is not a `SYNC` — what
+    /// [`crate::schedule::dsc2::SchedNode::Sync`] owns, and the reason it owns the node rather than
+    /// its name (*"the sequences that mint syncs cross-link the pair they minted"*).
+    pub(super) fn sync_node(&self, node: NodeId) -> Option<SyncNode> {
+        match &self.nodes.get(&node)?.kind {
+            Kind::Sync(held) => Some(held.clone()),
+            _ => None,
+        }
+    }
+
+    /// The `dsc2::LoopNode` AT A NODE ID rather than at a [`LoopId`] — [`Self::loop_node`]'s peer, for a
+    /// walk that has a child's id and not yet a proof it is a loop.
+    pub(super) fn loop_at(&self, node: NodeId) -> Option<&LoopNode> {
+        match &self.nodes.get(&node)?.kind {
+            Kind::Loop(held) => Some(held),
+            _ => None,
+        }
+    }
+
+    /// That condition's guard and its two regions, [`None`] for a node that is not a `CONDITION`.
+    pub(super) fn condition(&self, node: NodeId) -> Option<Cond> {
+        match &self.nodes.get(&node)?.kind {
+            Kind::Condition(held) => Some(held.clone()),
+            _ => None,
+        }
+    }
+
     /// `traverseTreeDFSMutable(nullptr, {SYNC})` reduced to what entry 214's sweep reads.
     ///
     /// ⭐ THE OTHER ENDS ARE RESOLVED BY NAME, which is how [`SyncNode::other_ends`] holds them.
