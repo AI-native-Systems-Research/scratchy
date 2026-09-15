@@ -219,13 +219,32 @@ say "=== CAPACITY CAMPAIGN START on $BRANCH at $(git -C $ROOT rev-parse --short 
 count
 remainders
 
+# ⭐⭐ EVERY PORT FIRST, THEN EVERY REVIEW — because a REVIEW IS NOT A DEPENDENCY.
+#
+# ⛔ THE OLD ORDER PUT REVIEWS ON THE CRITICAL PATH AND IT COST HOURS. Measured 2026-09-15:
+# `sc1-port` took 34 min for its 2 remaining units (~17 min/unit, which is the real work), then
+# `sc1-review` ran 25+ min on 7 units — and `sc2` + `sc3`, which are 11 units and 590 of the
+# campaign's 734 lines, had NOT STARTED, queued behind it. Reviewing e002-e008 does not gate porting
+# e009-e019: the dependency the wavefronts encode is between UNITS, and review adds none.
+#
+# ⛔ THE GATES STAY WHERE THEY ARE, one per sub-campaign after its port — `cargo check` + `cargo test`
+# is what keeps a broken port from reaching the next wave, and that IS a dependency. Only the review
+# barrier moves.
+#
+# ⭐ AND THE REVIEWS STILL RUN, ALL OF THEM. They are where the doc-versus-C++ defects surface: the
+# 2026-09-15 review of an already-landed `pruneMaxSymbolicVolumes` found FOUR, including a seam
+# calling a fused wrapper at a non-fused site and a `DT_CHECK` recovery that kept the LARGER bound
+# where the reference aborts the compile. Dropping them to go faster would be trading the only pass
+# that reads the authority for wall-clock.
 stage sc1-level0-leaves/port-remainder.json        port   sc1-port
-stage sc1-level0-leaves/review.json                review sc1-review
 gate sc1
 stage sc2-levels1-2-dim-values/port-remainder.json port   sc2-port
-stage sc2-levels1-2-dim-values/review.json         review sc2-review
 gate sc2
 stage sc3-levels3-6-capacity/port-remainder.json   port   sc3-port
-stage sc3-levels3-6-capacity/review.json           review sc3-review
 gate sc3
+
+stage sc1-level0-leaves/review.json                review sc1-review
+stage sc2-levels1-2-dim-values/review.json         review sc2-review
+stage sc3-levels3-6-capacity/review.json           review sc3-review
+gate reviews
 say "CAMPAIGN DRIVER DONE — 18 units is THIS CAMPAIGN'S SCOPE, not the stage and not the bridge"
