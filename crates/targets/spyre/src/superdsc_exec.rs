@@ -120,6 +120,22 @@ pub struct LayerIdx(pub i64);
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The measurement switches, sampled once per process.
+/// WHERE a launch lands: the per-segment byte offsets it shifts by, which KV slot and page it writes,
+/// how many fold passes it makes, and which weight region fills the positional weight slot.
+///
+/// One value rather than five parameters because they are ONE fact — "this launch, at this position" —
+/// and they are always chosen together at the call site that knows the layer index. Passing them
+/// separately also pushed `launch_ops_inner` past the argument limit.
+#[derive(Clone, Copy)]
+struct LaunchWhere {
+    byte_off: [u64; NUM_SEGMENTS],
+    slot_pos: SeqPos,
+    kv_page_base: Bytes,
+    n_fold_pages: i64,
+    /// Which weight bank backs the positional weight slot — see `weight_bank_for`.
+    weight_bank: usize,
+}
+
 struct Diag {
     /// `SCRATCHY_SDSC_PEROP_SYNC`: re-enable the per-group host drain. DEFAULT-OFF —
     /// pipeline_barrier + the stream's STRICT_ORDERING guarantee the dataflow, and the drain cost
@@ -1745,27 +1761,27 @@ impl Executor {
         let ops = std::mem::take(self.list_mut(sel));
         let r = self.launch_ops_inner(
             &ops,
-            byte_off,
-            slot_pos,
-            kv_page_base,
-            n_fold_pages,
-            weight_bank,
+            LaunchWhere {
+                byte_off,
+                slot_pos,
+                kv_page_base,
+                n_fold_pages,
+                weight_bank,
+            },
             d,
         );
         *self.list_mut(sel) = ops;
         r
     }
 
-    fn launch_ops_inner(
-        &mut self,
-        ops: &Ops,
-        byte_off: [u64; NUM_SEGMENTS],
-        slot_pos: SeqPos,
-        kv_page_base: Bytes,
-        n_fold_pages: i64,
-        weight_bank: usize,
-        d: &Diag,
-    ) -> Result<()> {
+    fn launch_ops_inner(&mut self, ops: &Ops, where_: LaunchWhere, d: &Diag) -> Result<()> {
+        let LaunchWhere {
+            byte_off,
+            slot_pos,
+            kv_page_base,
+            n_fold_pages,
+            weight_bank,
+        } = where_;
         // 🛑 THE DRAIN AT THE START IS WHAT MAKES THE LADDER MEAN ANYTHING. A launch is async and
         // the stream is in-order, so at any moment the device is a whole layer behind the host.
         // Timing from an un-drained start measures `backlog + ops[0..j]`, and the backlog shrinks by
@@ -2074,8 +2090,10 @@ impl Executor {
                 Ok(got) => {
                     let host = &self.seg_host[i][..got.min(self.seg_host[i].len())];
                     let (mut nz, mut mx) = (0usize, 0.0f32);
-                    for c in host.chunks_exact(2) {
-                        let bits = u16::from_le_bytes([c[0], c[1]]);
+                    // `as_chunks` over `chunks_exact`: a CONSTANT chunk width yields `&[u8; 2]`, so the
+                    // pair cannot be short (clippy::chunks_exact_to_as_chunks).
+                    for c in host.as_chunks::<2>().0 {
+                        let bits = u16::from_le_bytes(*c);
                         if bits != 0 {
                             nz += 1;
                             let v = sen_convert::sen_to_f32(sen_convert::SenF16(bits)).abs();
