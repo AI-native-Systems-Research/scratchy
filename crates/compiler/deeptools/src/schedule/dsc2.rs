@@ -2152,17 +2152,33 @@ pub trait LabeledDsAllocations {
 /// CORPUS, MEASURED: 807 of 807 labelled DSs of `g0/debug/sdsc_*/sdsc.json` resolve to a node whose
 /// order IS their `dsType_`'s entry, so this is the derivation and not a defect fix.
 ///
-/// ⭐ THE `LX`/`HBM` PREFERENCE IS AN EARLY EXIT AND CANNOT CHANGE THE ANSWER. `memOrg_` is a
-/// `std::map<SenComponents, MemOrg>` (`dsc/dscdefn.h:337`), so it iterates in ordinal order, and
-/// `HBM = 0`/`LX = 1` are the two lowest keys any entry can hold (`sys-arch-spec/arch_enums.h:13-17`)
-/// — nothing precedes them to be overwritten. The `break` therefore only stops the scan early, and
-/// the last-entry-wins overwrite decides among REGISTER FILES alone, which is live: 227 of those 807
-/// resolve to a `pelrf`/`ptarf`/`sfplrf` node, 12 of them with two register files to choose between.
+/// ⭐ THE `LX`/`HBM` PREFERENCE CANNOT BE REORDERED AWAY, AND THE `break` IS STILL LOAD-BEARING.
+/// `memOrg_` is a `std::map<SenComponents, MemOrg>` (`dsc/dscdefn.h:337`), so it iterates in ordinal
+/// order, and `HBM = 0`/`LX = 1` are the two lowest keys any entry can hold
+/// (`sys-arch-spec/arch_enums.h:13-17`) — nothing PRECEDES them to be overwritten. What can FOLLOW
+/// them is a register file, and the `break` is what stops it overwriting them (`dsc/dsc2.cpp:4016`).
+/// ⛔ SO IT IS NOT "ONLY AN EARLY EXIT". MEASURED over all 807 labelled DSs of
+/// `g0/debug/sdsc_*/sdsc.json`: 238 hold BOTH an `hbm`/`lx` node and a register-file node, and in all
+/// 238 dropping the `break` selects a DIFFERENT node. It reaches the same ANSWER — the two nodes'
+/// `layoutDimOrder_`s are equal in all 238 — but that is a corpus measurement and not the reference's
+/// guarantee, and g0's 187 programs are one of 134 bundles.
 /// ⭐ [`BTreeMap<SenComponent, _>`] IS THAT SAME ORDER, because [`SenComponent`]'s derived [`Ord`] is
 /// its C++ numbering — which is why the seam states its entries "in component order".
 ///
+/// ⭐ THE LAST-ENTRY-WINS ARM DECIDES AMONG REGISTER FILES ALONE, and the corpus does reach it: 219 of
+/// the 807 resolve to a `pelrf`/`ptarf`/`sfplrf` node (580 take `hbm` and 8 take `lx`, so 227 is every
+/// NON-HBM resolution and not this arm's count). 12 of the 219 name TWO register files, and in all 12
+/// their orders are equal — an arm the corpus ENTERS, not a choice the corpus EXERCISES.
+/// ⛔ NEITHER THAT ARM NOR THE `referenceLdsIdx_` HOP IS REACHABLE THROUGH THE ONE PRODUCTION CARRIER.
+/// `WireAllocations` (`crates/targets/spyre/src/superdsc_to_l3_sdsc.rs:557`) REFUSES a `component_`
+/// outside `{hbm, lx}` and answers [`LabeledDsAllocations::reference_lds`] with [`None`], so on our
+/// wire this walk stops inside its first lap every time.
+///
 /// ⛔ [`None`] IS `DT_CHECK(allocNode)` (`dsc/dsc2.cpp:4022`), an unheld index, and a
 /// `referenceLdsIdx_` CYCLE — which the reference does not terminate on at all.
+/// ⭐ `DT_CHECK(!allocNode->layoutDimOrder_.empty())` (`:4023`) IS DISCHARGED BY [`LayoutDims`]' OWN
+/// SHAPE and is not re-checked here: 85 of the corpus's 1899 allocate nodes DO carry an empty order,
+/// and no labelled DS resolves to one of them.
 #[must_use]
 pub fn layout_dims(dsc: &(impl LabeledDsAllocations + ?Sized), lds: LdsIdx) -> Option<LayoutDims> {
     let mut visited = BTreeSet::new();
@@ -2331,6 +2347,29 @@ mod tests_e006 {
             None,
         )]);
         assert_eq!(layout_dims(&sdsc_50, LdsIdx(1)), Some(order(&Y_OUT)));
+
+        // CONSTRUCTED — WHAT THE CORPUS CANNOT DISCRIMINATE, AND THE NEGATIVE CONTROL FOR `:4016`'s
+        // `break`: an `hbm`/`lx` entry and a REGISTER FILE whose orders DISAGREE. 238 of the 807
+        // records hold both kinds of node and dropping the `break` picks the register file in every
+        // one of them; g0 only hides that because the two orders are equal in all 238. Here they are
+        // not, so a lost `break` answers `Y_OUT`/`MB_OUT` instead.
+        let disagreeing = exported(vec![
+            (
+                0,
+                vec![
+                    (SenComponent::Hbm, &MB_OUT_Y),
+                    (SenComponent::Sfplrf, &Y_OUT),
+                ],
+                None,
+            ),
+            (
+                1,
+                vec![(SenComponent::Lx, &IN_OUT), (SenComponent::Pelrf, &MB_OUT)],
+                None,
+            ),
+        ]);
+        assert_eq!(layout_dims(&disagreeing, LdsIdx(0)), Some(order(&MB_OUT_Y)));
+        assert_eq!(layout_dims(&disagreeing, LdsIdx(1)), Some(order(&IN_OUT)));
 
         // CONSTRUCTED — `DT_CHECK(allocNode)` (`:4022`): every entry of the index the walk lands on
         // has a null `allocateNode_`, and `referenceLdsIdx_` is `-1`, so the walk ends with nothing.

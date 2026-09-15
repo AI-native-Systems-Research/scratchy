@@ -1497,16 +1497,41 @@ pub trait MemOrg {
     ///
     /// ⛔ THE SIZES ARE DELIBERATELY NOT ASKED FOR: every reader in scope asks `pageSize.count(dim)`
     /// and nothing more, and `maxDimSizes_` entries are datastage KEYS as often as element counts.
-    /// ⭐ ONE UNBOUNDED ENTRY WINS WHEREVER IT SITS — the reference ERASES an already-multiplied dim
-    /// on meeting a negative `maxSize` and skips every later entry naming it, so the key set is
-    /// "bounded by the layout and never left unbounded", whatever order the layout states them in.
+    /// ⭐ ONE UNBOUNDED ENTRY WINS WHEREVER IT SITS IN THE REFERENCE — it ERASES an already-multiplied
+    /// dim on meeting a negative `maxSize` and skips every later entry naming it
+    /// (`dsc/dsc2.cpp:4498-4511`), so the set IT returns is "bounded by the layout and never left
+    /// unbounded", whatever order the layout states them in.
+    /// ⛔ THAT IS THE REFERENCE AND NOT THIS SEAM. See [`Self::hbm_page_sizes`] for the three ways
+    /// the one production implementation of it departs from `getPageSize()`.
     fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
         self.hbm_page_sizes().unwrap_or_default().into_keys().collect()
     }
 
-    /// `memOrg_.at(HBM).allocateNode_->getPageSize()` ITSELF (`dsc/dsc2.cpp:4480`), [`None`] where
+    /// ONE PAGE'S ELEMENTS PER LAYOUT DIM OF `memOrg_.at(HBM).allocateNode_`, [`None`] where
     /// `memOrg_` names no `HBM` or its entry holds no node — *"Exepect HBM in memOrg_."* and
     /// *"Expect a valid HBM allocate node."* both (`L3DlOpsScheduler.cpp:6686-6691`).
+    ///
+    /// ⛔ IT IS NOT `dsc2::AllocateNode::getPageSize()` ITSELF. That body is `dsc/dsc2.cpp:4480-4513`
+    /// and it is ported, once, as
+    /// [`AllocateNode::page_sizes`](crate::schedule::dsc2::AllocateNode::page_sizes). The only
+    /// production implementation of THIS seam is `Org::page_sizes` (`schedule/stages/tree.rs:785`),
+    /// which reads the layout alone and so departs from the reference three ways:
+    /// 1. NO `indirectAllocType_` GATE. The reference reads that field FIRST and returns an EMPTY
+    ///    map for `NO_INDIRECTION` (`dsc/dsc2.cpp:4483-4485`) — the arm every program we compile
+    ///    takes, by CONSTRUCTION: one emitter site, the literal `"no_indirection"`
+    ///    (`crates/targets/spyre/src/lower_subtile_tape_to_superdsc.rs:5212`). The seam answers from
+    ///    the layout whether the allocation indirects or not.
+    /// 2. NO `INDEX_TENSOR` REDIRECTION. The reference answers an index tensor from
+    ///    `relatedIndirectAccessAlloc_`'s layout and not its own (`dsc/dsc2.cpp:4489-4492`).
+    /// 3. A REPEATED DIM IS OVERWRITTEN, NOT MULTIPLIED, and an unbounded one is SKIPPED rather than
+    ///    ERASING the size already accumulated for it (`dsc/dsc2.cpp:4498-4511`).
+    ///
+    /// ⭐ ALL THREE ARE INERT TODAY, AND ONLY BECAUSE OF THE DATA: every production mint of the
+    /// layout writes `None` for every max size (`stages/tree.rs:910`,
+    /// `ddc/transformation_util.rs:319`, `l3/dl_ops.rs:953`), which is the reference's
+    /// `maxDimSizes_ == [-1,…]` measured on all 187 g0 programs, so the map comes back empty and no
+    /// reader can tell the two apart. The first mint that writes a real max size makes departure 1
+    /// visible to every reader at once.
     ///
     /// ⭐ THE ONE FACT [`MemOrg::hbm_page_dims`] IS A VIEW OF, so a paged dim and its page size can
     /// never disagree about whether the dim pages at all.
@@ -1517,12 +1542,15 @@ pub trait MemOrg {
     /// valid allocate node."* both.
     fn lx_padding(&self) -> Option<PaddingForm>;
 
-    /// `getPageSize()` ON THAT LX NODE (`dsc/dsc2.cpp:4480`) WITH ITS SIZES, empty where nothing
-    /// pages.
+    /// ONE PAGE'S ELEMENTS PER LAYOUT DIM ON THAT LX NODE, WITH ITS SIZES, empty where nothing pages.
     ///
     /// ⛔ A DIFFERENT NODE FROM [`Self::hbm_page_dims`], AND THE SIZES ARE WHY BOTH EXIST: entry 209
-    /// CAPS a chunk parameter at `pageSizes.at(dim)`, so the value it reads is load-bearing, where
-    /// every reader of the HBM node's page set asks only `count(dim)`.
+    /// CAPS a chunk parameter at `pageSizes.at(dim)` (`l3/dl_ops.rs:6640`), so the value it reads is
+    /// load-bearing, where every reader of the HBM node's page set asks only `count(dim)`.
+    /// ⛔ NOR IS IT `getPageSize()` ON THAT NODE: the one production implementation is that same
+    /// `Org::page_sizes` handed `SenComponent::Lx` (`schedule/stages/tree.rs:870`), so all three
+    /// departures [`Self::hbm_page_sizes`] names hold here too — and entry 209 is the ONE reader not
+    /// itself gated on an indirection, so it is where departure 1 would surface first.
     fn lx_page_sizes(&self) -> BTreeMap<PrimaryDim, Extent>;
 
     /// `memOrg_.at(HBM).allocateNode_->allocUsers_` (`dsc/dsc2.h:1000`) by node id — the nodes
