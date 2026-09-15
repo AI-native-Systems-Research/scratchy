@@ -217,7 +217,7 @@ fn probe_once(opts: &Opts<'_>, url: &str, repo_id: &str, filename: &str) -> Resu
                 repo: repo_id.to_string(),
                 filename: filename.to_string(),
                 location,
-            })
+            });
         }
         (None, None) => return Err(missing("x-repo-commit")),
     };

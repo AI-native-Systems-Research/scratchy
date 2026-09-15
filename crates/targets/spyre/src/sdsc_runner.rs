@@ -30,11 +30,25 @@ fn f32_to_f16_le(vals: &[f32]) -> Vec<u8> {
     out
 }
 
+/// The three model extents every constructor here forwards unchanged — one value because they are
+/// always read from the same parse and passed together, and separately they pushed `new_inner` past the
+/// argument limit. Typed wrappers (`Vocab`/`KvDim`/`PoolPages`) are minted from these downstream.
+#[derive(Clone, Copy)]
+struct SessionDims {
+    vocab: usize,
+    kv_dim: usize,
+    num_blocks: usize,
+}
+
 /// LE f16 bytes → f32.
 fn f16_le_to_f32(bytes: &[u8]) -> Vec<f32> {
+    // `as_chunks` over `chunks_exact`: the chunk width is a CONSTANT, so this yields `&[u8; 2]` and the
+    // element indexing below cannot be out of bounds by construction (clippy::chunks_exact_to_as_chunks).
     bytes
-        .chunks_exact(2)
-        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| half::f16::from_le_bytes(*c).to_f32())
         .collect()
 }
 
@@ -137,9 +151,11 @@ impl SuperDscSession {
     ) -> Result<Self> {
         Self::new_inner(
             code,
-            vocab,
-            kv_dim,
-            num_blocks,
+            SessionDims {
+                vocab,
+                kv_dim,
+                num_blocks,
+            },
             num_sources,
             resident_sources,
             weights,
@@ -165,9 +181,11 @@ impl SuperDscSession {
     ) -> Result<Self> {
         Self::new_inner(
             code,
-            vocab,
-            kv_dim,
-            num_blocks,
+            SessionDims {
+                vocab,
+                kv_dim,
+                num_blocks,
+            },
             num_sources,
             resident_sources,
             Vec::new(),
@@ -196,9 +214,11 @@ impl SuperDscSession {
     ) -> Result<Self> {
         Self::new_inner(
             code,
-            vocab,
-            kv_dim,
-            num_blocks,
+            SessionDims {
+                vocab,
+                kv_dim,
+                num_blocks,
+            },
             num_sources,
             resident_sources,
             Vec::new(),
@@ -208,9 +228,7 @@ impl SuperDscSession {
 
     fn new_inner(
         code: &'static crate::bundle_code::BundleCode<'static>,
-        vocab: usize,
-        kv_dim: usize,
-        num_blocks: usize,
+        dims: SessionDims,
         num_sources: u32,
         // The prefix-KV source ids — placed and inside `0..num_sources`, but device-resident, so
         // no per-step bind names them.
@@ -218,6 +236,11 @@ impl SuperDscSession {
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
         borrowed: &[i64],
     ) -> Result<Self> {
+        let SessionDims {
+            vocab,
+            kv_dim,
+            num_blocks,
+        } = dims;
         ensure_deeptools_arch_config()?;
         let mut exec = Executor::load(
             code,
