@@ -692,6 +692,82 @@ mod tests {
         (reads, env)
     }
 
+    /// ⭐⭐⭐ `memOrg_.at(storage).allocateNode_` IS **ONE CELL**, AND THIS IS THE TEST OF THAT — the
+    /// whole defect that stopped stage 2a on all 24,363 programs.
+    ///
+    /// ⛔⛔ THE DEFECT'S SHAPE. The reference holds ONE `dsc2::AllocateNode *` per
+    /// `labeledDs_.at(lds).memOrg_.at(storage)` (`L3DlOpsScheduler.cpp:1642`, `:3890`, `:5811`). The
+    /// port had FOUR projections of it: entry 353's mint wrote a `DscTree`-level map keyed by
+    /// [`l3::dl_ops::L3AllocateNode`]'s node id, entry 222 looked its node up in a
+    /// `v1::AllocArena` keyed by `AllocId`, and the placement seam read an `Org`-level map keyed by
+    /// storage. The mint filled one, the placement read another, and it compiled.
+    ///
+    /// ⛔ SO EVERY READING BELOW CROSSES A CARRIER. The mint went through `Env`
+    /// ([`grow`]'s `create_allocation_and_transfer`); the PROBE reads through `Reads`, which is the
+    /// carrier entry 222 actually uses; and the placement writes through `Env` again and is read back
+    /// through `Reads`. Any one of those being a projection of its own fails this test — which is
+    /// exactly what the frontier tests cannot show, because stage 2a stops on the CAPACITY before the
+    /// committing write ever runs. This is the only direct test of `Env`'s write half.
+    #[test]
+    fn the_mint_the_probe_and_the_placement_all_name_one_memorg_cell() {
+        use crate::arch::Bytes;
+        use crate::schedule::dsc2::AddressFold;
+        use crate::schedule::l3::dl_ops::{AllocationReads, AllocationSites};
+        use crate::schedule::l3::dsc::DscIdx;
+        use crate::units::{Core, Corelet};
+        use sys_arch_spec::arch_enums::SenComponent;
+
+        let sdsc = a_rmsq_super_dsc();
+        let state = DscState::seeded(&sdsc);
+        let (reads, mut env) = grow(&sdsc, &state);
+        let lds = LdsIdx(0);
+
+        // ⭐ THE MINT IS VISIBLE TO THE PROBE'S CARRIER. Before the fix this was `None`: entry 353
+        // wrote the tree-level map and `AllocationReads` read the organisation's.
+        let seen = AllocationReads::allocation(&reads, DscIdx(0), lds, SenComponent::Lx)
+            .expect("entry 353 minted this LX allocation, so the probe's carrier must see it");
+        assert_eq!(seen.component, SenComponent::Lx);
+        assert_eq!(seen.lds, Some(lds));
+        assert!(
+            seen.start_address.has_zero_fold_dim(),
+            "a freshly minted allocation is UNPLACED — `ddc_view` invents no address"
+        );
+
+        // ⭐⭐ AND A PLACEMENT WRITTEN THROUGH `Env` IS READ BACK THROUGH `Reads`. The value is a
+        // sentinel, not a real placement: what is under test is the CELL, not the address.
+        let sentinel = Bytes(0xABC0);
+        AllocationSites::place_allocation(&mut env, DscIdx(0), lds, SenComponent::Lx, &mut |node| {
+            node.start_address
+                .build_fold_space(2, AddressFold::Constant, AddressFold::Constant);
+            node.start_address
+                .insert(Core::checked(0)?, Corelet::at::<0>(), sentinel);
+            Some(())
+        })
+        .expect("`memOrg_` names an LX node here")
+        .expect("and the placement itself did not refuse");
+
+        let placed = AllocationReads::allocation(&reads, DscIdx(0), lds, SenComponent::Lx)
+            .expect("the site is still there");
+        assert_eq!(
+            placed.start_address.at(Core::checked(0).expect("core 0"), Corelet::at::<0>()),
+            Some(sentinel),
+            "the address written through `Env` must be readable through `Reads` — two carriers, ONE \
+             `memOrg_` cell. A `place_allocation` that edited a copy reads back UNPLACED here."
+        );
+        // ⛔ AND THE TREE-LEVEL WALK SEES THE SAME ADDRESS, which is what stage 2b reads offsets off:
+        // `ScheduleTrees::allocations` is a THIRD reader of that one cell.
+        let allocations = crate::schedule::l3::dsc::ScheduleTrees::allocations(&reads, DscIdx(0));
+        assert!(
+            allocations.iter().any(|held| held.lds == Some(lds)
+                && held.component == SenComponent::Lx
+                && held
+                    .addresses
+                    .iter()
+                    .any(|(_, address)| address.0 == sentinel.0)),
+            "the same placement must appear in the tree-level allocation walk: {allocations:?}"
+        );
+    }
+
     /// ⭐⭐ ENTRY 207 RECORDS THE REFERENCE'S `-1` FOR A DIM THE CORE STAGE DOES NOT STATE.
     ///
     /// ⛔ THIS TEST USED TO ASSERT THE OPPOSITE, and it was pinning a PORT DIVERGENCE as if it were
@@ -988,14 +1064,30 @@ mod tests {
             state.refusals()
         );
 
-        // ⛔⛔ AND THE TREE DID NOT MOVE. The DDL step is where stage 2b MINTS its computes and
-        // transfers, and it minted nothing — so *"stage 2b ran"* must never be read as *"stage 2b did
-        // something"*. The corpus census cannot move until a template is stated AND the allocator
-        // lands.
+        // ⭐⭐ AND THE TREE MOVED BY EXACTLY ONE. The DDL expansion no longer mints into a dropped
+        // `BlockNode` copy (`schedule_head_block` used to return by value where the reference holds a
+        // `DesignSpaceConfig&`, `ddl_conversion.h:511`), so its first mint —
+        // `add_root_level_block("root_level_operations")` — lands in the live tree. 22 was the
+        // stage-2a tree; 23 is that tree plus one DDL-minted block.
+        //
+        // ⛔ ONE IS NOT EIGHT. The reference's own output for this program
+        // (`g0/debug/sdsc_0/sdsc.json`, verified: 30 nodes) shows what the DDL template still owes
+        // below `lx_below_schedule` — `loop_ds1_ds2_out_mb_y`, `transfer_lds1_src:lxlu_dst:sfp`,
+        // `loop_ds2_ds3_out_mb_y`, `transfer_lds0_src:lxlu_dst:sfp`, `loop_ds2_ds3_out_mb_y__1`,
+        // `compute_sfp_fma16`, `loop_ds2_ds3_out_mb_y__2`, `transfer_lds2_src:sfp_dst:lxsu`. So
+        // *"stage 2b reaches `parse_ddl2_dsc`"* must never be read as *"the census moves"*: the walk
+        // refuses again inside `process_region`/`process_op` after this node, and two arms are
+        // deliberately unrouted rather than fabricated — `ddl.allocate` (blocked on the two
+        // `AllocateNode` projections) and `ddl.parametric_loop` (`numId_ = denId_ = -1`,
+        // `ddl_conversion.cpp:1127-1128`, which our total `DatastageId` cannot spell, so it REFUSES).
+        //
+        // ⚠️ NOT ESTABLISHED: whether this block IS the reference's head node or a SECOND node
+        // sharing its name. The seed's own head is also called `root_level_operations`, which is why
+        // the conversion's parent lookup had to become a `NodeId` rather than a `NodeName`.
         assert_eq!(
             l3_state.node_count(),
-            22,
-            "still the reference's stage-2a tree, node for node"
+            23,
+            "the stage-2a tree (22) plus the DDL expansion's first live mint"
         );
     }
 
