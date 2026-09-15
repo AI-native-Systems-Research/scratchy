@@ -47,6 +47,7 @@
 //! placement is the failure this crate ranks worse than a stop.
 
 mod carriers;
+mod ddc_reads;
 mod ddc_state;
 mod ddc_tree;
 mod env;

@@ -91,7 +91,7 @@ impl Dsc2Dims {
     /// ⭐ THE SYMBOLIC ARM IS ANSWERED, because it too is a plain field read: `symbolicDimInfo_`'s
     /// `maxSize_` under [`v1::SymbolicRead::Max`] and its `granularity_` under
     /// [`v1::SymbolicRead::Granularity`] (`:522-527`).
-    fn raw_slot(
+    pub(super) fn raw_slot(
         &self,
         dim: PrimaryDim,
         padding: PadType,
