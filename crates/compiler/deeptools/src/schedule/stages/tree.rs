@@ -763,6 +763,21 @@ impl Org {
         self.data.borrow_mut().placed.insert(storage, node);
     }
 
+    /// EVERY PLACED NODE THIS ORGANISATION HOLDS, BY IDENTITY — the `(allocateNode_, its ddc view)`
+    /// pairs [`super::state::DscTree::with_placed`] gathers so that a walk keyed by [`NodeId`] reads
+    /// the SAME cell [`Self::placed`] answers from.
+    ///
+    /// ⛔ A STORAGE WITH A ddc VIEW BUT NO `allocateNode_` IS SKIPPED AND IS NOT A REFUSAL: it cannot
+    /// arise — every write of one goes through [`Self::set_node`] first — and inventing an identity
+    /// for it would name a node the tree does not hold.
+    pub(super) fn placed_nodes(&self) -> Vec<(NodeId, AllocateNode)> {
+        let data = self.data.borrow();
+        data.placed
+            .iter()
+            .filter_map(|(storage, held)| Some((*data.nodes.get(storage)?, held.clone())))
+            .collect()
+    }
+
     /// `getPageSize()` on the node at that storage — every layout dim the allocation BOUNDS.
     ///
     /// ⭐ AN UNBOUNDED `maxDimSizes_` ENTRY IS THE REFERENCE'S `-1` AND PAGES NOTHING, which is why

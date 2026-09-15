@@ -119,11 +119,20 @@ pub fn run_stages(sdsc: &mut l3::dsc::SuperDsc) -> StagesRan {
 /// `computeOp_`-less [`v1::OpFuncs`] and the same flat [`l3::dl_ops::AddressFoldCoords`].
 ///
 /// ⛔⛔ IT EXISTS SO A CALLER CAN STILL READ THE TREE AFTER THE STAGE STOPS. Stage 2a's stop today is
-/// entry 222's own `None` — `try_alloc_l3`'s `allocs.get(&alloc)?` (`l3/dl_ops.rs:9261`), an arena no
-/// unit of the stage writes — and a stop that PANICS instead (any remaining `todo!` on a colder path)
-/// drops a [`DscState`] built INSIDE [`run_stages`] with its unwind, so the nodes the growers minted,
-/// which are the whole measurement, would be unreachable. A caller that owns the state measures
-/// [`DscState::kinds`] afterwards either way.
+/// [`l3::dl_ops::L3Placement::buffer_capacity_even_sticks`]' recorded refusal — the carrier cannot walk
+/// `DesignSpaceConfig::getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`) and its ~210-line
+/// `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3755`), reached one statement after
+/// entry 222 finds the allocate node — and a stop that PANICS instead (any remaining `todo!` on a
+/// colder path) drops a [`DscState`] built INSIDE [`run_stages`] with its unwind, so the nodes the
+/// growers minted, which are the whole measurement, would be unreachable. A caller that owns the state
+/// measures [`DscState::kinds`] afterwards either way.
+///
+/// ⭐ WHAT CHANGED, AND WHY IT IS PROGRESS: the stop used to be a BARE `None` at
+/// `try_alloc_l3`'s `allocs.get(&alloc)?` — an allocate-node map the port invented and no unit of the
+/// stage ever wrote, so `first_refusal` was [`None`] and nothing said what was missing. Entry 222 now
+/// reads `memOrg_.at(storage).allocateNode_` through [`l3::dl_ops::AllocationReads`], the one cell
+/// entry 353's mint fills, so the stop is an UNPORTED VENDOR UNIT that NAMES ITSELF in
+/// [`DscState::refusals`] rather than a dropped effect that says nothing.
 ///
 /// ⭐ [`StagesRan`] IS THE SAME ANSWER EITHER WAY: it is read off the state this takes, so the two
 /// entry points cannot report different numbers for one run.
@@ -167,7 +176,7 @@ pub fn run_l3<const CHUNK_EXPLORE: bool, A: crate::arch::Arch>(
     coords: &l3::dl_ops::AddressFoldCoords,
 ) -> Option<()> {
     let reads = Reads::new(state, ops);
-    let placement = Placement::of(coords.clone());
+    let placement = Placement::of(state, coords.clone());
     let inputs = l3::dl_ops::L3RunInputs {
         reads: &reads,
         placement: &placement,
@@ -175,7 +184,11 @@ pub fn run_l3<const CHUNK_EXPLORE: bool, A: crate::arch::Arch>(
         coords,
     };
     let mut env = Env::new(state, sdsc);
-    let mut allocs = v1::AllocArena::new();
+    // ⛔ EMPTY, AND NOTHING FILLS IT ANY MORE — every LX placement lands on `env`'s
+    // [`l3::dl_ops::AllocationSites`] seam, which is the reference's one `memOrg_.allocateNode_`. The
+    // only reader left is entry 333's constant-allocation conflation, which is unreachable while
+    // `Reads::offset_sizes` refuses; see [`l3::dl_ops::L3RunSurgery::allocs`].
+    let allocs = v1::AllocArena::new();
     // ⭐⭐ THE REAL LX ALLOCATOR, ONE TRACKER PER CORE OVER `A::LX_CAPACITY` AT `A::BYTES_PER_STICK`,
     // with the front end's share pinned at address 0 — see [`Trackers::at_step`]. `ExecutionStep`'s
     // default is `dbo::execStepOf`'s own `0` for a bundle that stamped no `sbf.exec_step`, which is
@@ -185,7 +198,7 @@ pub fn run_l3<const CHUNK_EXPLORE: bool, A: crate::arch::Arch>(
     let mut symbols = Symbols::default();
     let mut surgery = l3::dl_ops::L3RunSurgery {
         env: &mut env,
-        allocs: &mut allocs,
+        allocs: &allocs,
         trackers: &mut trackers,
         sink: &mut sink,
         symbols: &mut symbols,
@@ -1188,24 +1201,28 @@ mod tests {
     /// the output tensor's HBM load, which entry 214 (`optimize_hbm_lds_output_in_schedule_tree`)
     /// DROPS. It sits AFTER the stop, so this run has not reached it yet.
     ///
-    /// ⭐⭐ THE FRONTIER MOVED PAST THE MEMORY TRACKER AND THIS TEST NOW PINS WHERE IT IS. The
-    /// tracker is REAL — [`Trackers`] owns a [`crate::schedule::memtrack::bundle::MemTrackBundle`] of
-    /// ported `DsTrackInMem`s, checked against the reference's own addresses for all 187 programs in
-    /// `carriers/lx_oracle.rs` — so `backup`, `remove`, `capacity`, `check_and_add` and `restore_all`
-    /// no longer stop anything. THE STOP IS NOW `try_alloc_l3`'s `allocs.get(&alloc)?`
-    /// (`l3/dl_ops.rs:9261`): entry 222 looks the allocate node it is about to place up in the
-    /// [`v1::AllocArena`], and NO UNIT OF STAGE 2A EVER WRITES THAT ARENA. The minting units call
-    /// `L3TreeSurgery::fresh_alloc` + `new_allocate` (`:16607`, `:16624`, `:9587`, `:9603`), which put
-    /// an `L3AllocateNode` in the TREE; the reference has ONE `dsc2::AllocateNode *` and the port
-    /// split it in two, writing only the tree half. Filling the arena is a cross-entry port change
-    /// (the two projections carry different fields), not carrier wiring.
+    /// ⭐⭐⭐ THE FRONTIER MOVED PAST THE ALLOCATE-NODE SEAM AND THIS TEST PINS WHERE IT IS NOW.
+    /// The tracker is REAL — [`Trackers`] owns a [`crate::schedule::memtrack::bundle::MemTrackBundle`]
+    /// of ported `DsTrackInMem`s, checked against the reference's own addresses for all 187 programs in
+    /// `carriers/lx_oracle.rs` — and the ALLOCATE NODE ITSELF is now found: entry 222 reads
+    /// `labeledDs_.at(lds).memOrg_.at(storage).allocateNode_` through
+    /// [`l3::dl_ops::AllocationReads`], the ONE cell entry 353's mint writes, so the
+    /// `v1::AllocArena` lookup that used to stop every one of the 24,363 programs is GONE.
     ///
-    /// ⛔ NO `should_panic` ANY MORE, WHICH IS THE RATCHET IN BOTH DIRECTIONS: a `todo!` anywhere in
-    /// this path now FAILS this test, and the fifteen node names below pin how far the growers got, so
-    /// a regression to an earlier stop fails too. The stop itself is a ported unit's `None` and no
-    /// carrier refused, which is what the two assertions beside it say.
+    /// ⛔⛔ THE STOP IS NOW THE **NEXT STATEMENT**, AND IT IS AN UNPORTED VENDOR UNIT rather than a
+    /// dropped effect: `L3Placement::buffer_capacity_even_sticks`
+    /// (`stages/carriers.rs`) — `DesignSpaceConfig::getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`)
+    /// accumulating `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3755-3963`, ~210
+    /// lines over eight further unported accessors). A fabricated capacity would commit a fabricated
+    /// placement, which this crate ranks worse than a stop, so the carrier REFUSES and records which
+    /// vendor unit it lacked.
+    ///
+    /// ⛔ NOTHING PANICS AND THE STOP NAMES ITSELF, WHICH IS THE RATCHET IN BOTH DIRECTIONS. A
+    /// regression to the arena is a stop with NO refusal recorded and fails the assertion below; a
+    /// regression to an earlier seam records a DIFFERENT refusal and fails it too; and the fifteen node
+    /// names pin how far the growers got, read off the state the run was handed.
     #[test]
-    fn stage_2a_runs_past_the_memory_tracker_and_stops_at_the_unwritten_alloc_arena() {
+    fn stage_2a_runs_past_the_allocate_node_seam_and_stops_at_the_unported_buffer_capacity() {
         let mut sdsc = a_rmsq_super_dsc();
         let state = DscState::seeded(&sdsc);
         assert_eq!(
@@ -1221,22 +1238,34 @@ mod tests {
             &l3::dl_ops::AddressFoldCoords::flat(),
         );
 
+        assert_eq!(ran, None, "stage 2a does not complete");
+        // ⭐⭐ AND *WHICH* STOP — the whole point of this commit. It is no longer a bare `None` at an
+        // allocate-node map nothing wrote; it is the CAPACITY carrier saying which vendor unit it
+        // lacks, one statement later.
+        assert_eq!(
+            state.first_refusal().map(|said| said
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .to_owned()),
+            Some("L3Placement".to_owned()),
+            "the frontier is entry 222's capacity question and it is RECORDED: {:?}",
+            state.refusals()
+        );
+        assert!(
+            state
+                .refusals()
+                .iter()
+                .all(|said| said.contains("getBufferCapacityForNode")),
+            "and every refusal on the way is that same one, naming the unported vendor unit: {:?}",
+            state.refusals()
+        );
+
         let names: Vec<String> = state.dscs()[0]
             .names()
             .into_iter()
             .map(|name| name.0)
             .collect();
-        // ⛔ THE STOP IS A PORTED UNIT'S OWN REFUSAL AND NOT A CARRIER'S: nothing here was asked for a
-        // fact it could not give.
-        assert_eq!(
-            ran, None,
-            "entry 222 finds no allocate node in the arena and returns"
-        );
-        assert!(
-            state.refusals().is_empty(),
-            "the stop is entry 222's, not a carrier's: {:?}",
-            state.refusals()
-        );
         assert_eq!(
             names,
             [
@@ -1280,6 +1309,7 @@ mod tests {
     /// is not reached while [`StagesRan::l3`] is false, so [`Scheduling::filled`] is [`None`] rather
     /// than [`v1::DscFilled::Yes`] — the difference between *not reached* and *ran and did nothing*,
     /// which is the false green [`a_dsc_with_no_compute_op_is_skipped_and_the_tree_is_untouched`] pins.
+    ///
     #[test]
     fn the_composition_hands_back_the_tree_it_grew_and_gates_stage_2b_on_stage_2a() {
         let scheduled = run_stages_2a_2b::<Dd2>(
@@ -1334,12 +1364,11 @@ mod tests {
             "`rmsq_o728`'s one DSC"
         );
 
-        // ⛔ STAGE 2A DOES NOT COMPLETE — entry 222's unwritten `AllocArena` — SO STAGE 2B IS NOT
-        // REACHED, and the two readings say which of the two it is.
-        assert!(
-            !ran.l3,
-            "stage 2a stops at `try_alloc_l3`'s `allocs.get(&alloc)?` (`l3/dl_ops.rs:9261`)"
-        );
+        // ⛔ STAGE 2A DOES NOT COMPLETE — SO STAGE 2B IS NOT REACHED, and the two readings say which
+        // of the two it is. ⭐ THE STOP IS NAMED NOW: entry 222's own capacity question, reported by
+        // the carrier that cannot answer it, where it used to be a bare `None` at an allocate-node map
+        // no unit of the stage wrote.
+        assert!(!ran.l3, "stage 2a does not complete");
         assert_eq!(
             (ran.ddc, scheduled.filled()),
             (false, None),
@@ -1351,30 +1380,34 @@ mod tests {
             (None, &[] as &[String]),
             "and no stage-2b carrier was asked anything at all"
         );
-        assert_eq!(
-            ran.first_refusal, None,
-            "the stage-2a stop is a ported unit's own `None`, not a carrier's refusal"
+        assert!(
+            ran.first_refusal
+                .is_some_and(|said| said.contains("buffer_capacity_even_sticks")),
+            "the stage-2a stop is the capacity carrier's recorded refusal: {:?}",
+            ran.first_refusal
         );
     }
 
     /// ⭐ THE FIXED-SIGNATURE ENTRY POINT REACHES THE SAME SEAM — `run_stages` states no compute op
     /// and no fold props of its own (neither is a `SuperDsc` field), so it stops exactly where
-    /// [`stage_2a_runs_past_the_memory_tracker_and_stops_at_the_unwritten_alloc_arena`] does, and the
-    /// node count is what pins that.
+    /// [`stage_2a_runs_past_the_allocate_node_seam_and_stops_at_the_unported_buffer_capacity`] does,
+    /// and the node count is what pins that.
     #[test]
-    fn run_stages_reaches_the_alloc_arena_too() {
+    fn run_stages_reaches_the_buffer_capacity_seam_too() {
         let mut sdsc = a_rmsq_super_dsc();
         let ran = run_stages(&mut sdsc);
         assert_eq!(ran.nodes_before, 4, "the seed");
         assert_eq!(
             ran.nodes_after, 15,
-            "what entry 382 left before entry 222's arena lookup stopped it"
+            "what entry 382 left before entry 222's capacity question stopped it"
         );
         assert!(!ran.l3, "stage 2a did not complete");
-        assert!(!ran.ddc, "stage 2b is not composed yet");
-        assert_eq!(
-            ran.first_refusal, None,
-            "no carrier refused — the stop is entry 222's own `None`"
+        assert!(!ran.ddc, "stage 2b is not reached");
+        assert!(
+            ran.first_refusal
+                .is_some_and(|said| said.contains("getBufferCapacityForNode")),
+            "and the stop is the capacity carrier's, naming the unported vendor unit: {:?}",
+            ran.first_refusal
         );
     }
 

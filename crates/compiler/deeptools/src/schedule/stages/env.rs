@@ -36,7 +36,8 @@ use crate::schedule::dsc2::{
     TransferNode,
 };
 use crate::schedule::l3::dl_ops::{
-    AllocCoordinateSeam, ChunkLoopNest, CoordPropTree, CoordPropTrees, CoreWindowDims,
+    AllocCoordinateSeam, AllocationReads, AllocationSites, AllocationView, ChunkLoopNest,
+    CoordPropTree, CoordPropTrees, CoreWindowDims,
     CoreletSliceDims, CoreletSliceSeam, DscCoordProp, DscGtrSurgery, DscL3Surgery, DscPagedTrees,
     DscSyncSurgery, DscTransferSizes, DscTransferWrites, DscTransfers, DscTreeSurgery, DscTrees,
     GtrGroupId, L3AllocateNode, L3Sync, L3TreeSurgery, L3WalkNode, LoopAndDim, LxZeroPadTransform,
@@ -337,28 +338,35 @@ impl MemOrgs for Env<'_> {
     }
 }
 
-impl crate::schedule::l3::dl_ops::AllocationSites for Env<'_> {
-    fn allocation(&self, dsc: DscIdx, lds: LdsIdx, storage: SenComponent) -> Option<AllocateNode> {
-        let held = self.dsc(dsc)?;
-        held.org(lds)?.placed(storage)
+impl AllocationReads for Env<'_> {
+    fn allocation(
+        &self,
+        dsc: DscIdx,
+        lds: LdsIdx,
+        storage: SenComponent,
+    ) -> Option<AllocationView> {
+        Some(AllocationView::of(self.dsc(dsc)?.org(lds)?.placed(storage)?))
     }
+}
 
-    fn set_allocation(
+impl AllocationSites for Env<'_> {
+    /// ⛔⛔ THE WRITE-BACK IS UNCONDITIONAL AND THAT IS THE REFERENCE: `allocNode` is a POINTER
+    /// (`L3DlOpsScheduler.cpp:1642`, `:5687`), so a placement that refuses part-way leaves what it had
+    /// already written. A `place` that returned before touching the node writes the value it read,
+    /// which is the same cell — so the only observable effect is `place`'s own.
+    fn place_allocation(
         &mut self,
         dsc: DscIdx,
         lds: LdsIdx,
         storage: SenComponent,
-        node: AllocateNode,
-    ) {
-        let Some(held) = self.dsc(dsc) else {
-            return;
-        };
-        if let Some(org) = held.org(lds) {
-            org.set_placed(storage, node.clone());
-            if let Some(at) = org.node(storage) {
-                held.set_placed(at, node);
-            }
-        }
+        place: &mut dyn FnMut(&mut AllocateNode) -> Option<()>,
+    ) -> Option<Option<()>> {
+        let held = self.dsc(dsc)?;
+        let org = held.org(lds)?;
+        let mut node = org.placed(storage)?;
+        let placed = place(&mut node);
+        org.set_placed(storage, node);
+        Some(placed)
     }
 }
 

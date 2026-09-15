@@ -8,11 +8,17 @@
 //! (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:29`) is handed `dscGlobal` — the design space
 //! config and the system definition — and `memTrackers` — `ddc::DsTrackInMem`, the LX allocator's own
 //! book. Neither is serialised into an SDSC, so a caller that has them fills these in and a caller
-//! that does not gets a `todo!` NAMING the fact rather than a plausible byte count.
+//! that does not gets a RECORDED REFUSAL naming the fact rather than a plausible byte count.
 //!
 //! ⛔ A FABRICATED CAPACITY IS THE ONE THING RANKED WORSE THAN A STOP by this crate's own
 //! `CLAUDE.md`: `alloc_all_mem` would place every allocation against it and commit, and the
 //! resulting program reads memory nothing filled.
+//!
+//! ⛔⛔ AND THE REFUSAL IS AN [`Option`], NOT A `todo!`, BECAUSE THIS IS NOW THE FRONTIER. A `todo!`
+//! is loud, which is right for a COLD path — but entry 222's capacity question is on the hot path of
+//! every one of the 24,363 programs, and a panic there unwinds the [`DscState`] the whole node census
+//! is read off. `spyre`'s `run_stages` catches it and reports `Ran::Stopped`, which carries no
+//! artifacts, so a panicking frontier costs the measurement as well as the answer.
 //!
 //! ⭐⭐ `M` IS NO LONGER ONE OF THEM. [`Trackers`] owns a real [`MemTrackBundle`] of ported
 //! [`DsTrackInMem`] trackers, so every capacity it reports and every address it hands out comes off
@@ -42,27 +48,36 @@ use crate::schedule::memtrack::tracker::{
 };
 use crate::units::{Core, Corelet, Row};
 
+use super::state::DscState;
+
 /// `P` — the design space's placement, which entry 222 sizes and names buffers through.
 ///
 /// ⭐ THE FOLD SPACE IS REAL, READ OFF THE COORDINATES `run` IS ALREADY HANDED:
 /// [`AddressFoldCoords::depth`] is `{coreFoldProp_, coreletFoldProp_} ++ sdscFoldProps_`'s size and
 /// its own doc says so, and the coordinate count is that same list's length. Two answers from ONE
 /// value, so the fold space this places along and the fold space entry 292 walks cannot disagree.
+///
+/// ⭐⭐ IT HOLDS THE SAME `&'s DscState` [`super::Reads`] AND [`super::Env`] DO, FOR ONE REASON: so the
+/// capacity it cannot answer is RECORDED as a refusal rather than raised as a `todo!`. A panic here
+/// unwinds every frame of stage 2a, and the [`DscState`] the measurement is read off is built by the
+/// caller — so a panicking carrier costs the node census as well as the answer.
 #[derive(Debug, Clone)]
-pub struct Placement {
+pub struct Placement<'s> {
+    state: &'s DscState,
     coords: AddressFoldCoords,
 }
 
-impl Placement {
+impl<'s> Placement<'s> {
     /// The placement over the fold manager's own address coordinates — the same value
-    /// [`crate::schedule::l3::dl_ops::L3RunInputs::coords`] carries.
+    /// [`crate::schedule::l3::dl_ops::L3RunInputs::coords`] carries — and the state its refusals land
+    /// in.
     #[must_use]
-    pub const fn of(coords: AddressFoldCoords) -> Self {
-        Self { coords }
+    pub const fn of(state: &'s DscState, coords: AddressFoldCoords) -> Self {
+        Self { state, coords }
     }
 }
 
-impl L3Placement for Placement {
+impl L3Placement for Placement<'_> {
     /// ⛔ NEVER A CONSTANT. `getBufferCapacityForNode(node, lds, comp, corelet, row, bytesPerStick,
     /// forceEvenNumSticks=true)` (`dsc/dsc2.cpp:3977`) walks the allocate node's layout against the
     /// DSC's stick sizes and rounds to an EVEN stick count. It is a `dsc/` seam over the live
@@ -84,6 +99,14 @@ impl L3Placement for Placement {
     /// ⛔ `DesignSpaceConfig::lx_chunk_capacity` IS A PRECOMPUTED FIELD, not this call: it is that
     /// call already made for the CHUNK stage at one site, so reusing it answers a different question
     /// with the same number.
+    /// ⛔⛔ IT REFUSES AND NO LONGER PANICS, AND THAT IS A RATCHET DOWN RATHER THAN A SOFTENING. This
+    /// was a `todo!` while it was UNREACHABLE — entry 222 stopped one statement earlier, at an
+    /// allocate-node map the port had invented and no unit ever wrote. That map is gone, so this is
+    /// now the frontier of stage 2a on EVERY program, and a panic at the frontier unwinds the
+    /// [`DscState`] the census is read off: `spyre`'s `run_stages` reports a panicking program as
+    /// `Ran::Stopped`, which carries no artifacts at all. A recorded refusal names the same missing
+    /// fact, `try_alloc_l3` propagates it as its own [`None`], and the tree the growers minted stays
+    /// readable — which is what makes the next frontier measurable rather than merely reported.
     fn buffer_capacity_even_sticks(
         &self,
         _dsc: DscIdx,
@@ -91,12 +114,12 @@ impl L3Placement for Placement {
         _lds: LdsIdx,
         _corelet: Corelet,
         _row: Row,
-    ) -> Bytes {
-        todo!(
+    ) -> Option<Bytes> {
+        self.state.refuse(
             "L3Placement::buffer_capacity_even_sticks: wants \
              DesignSpaceConfig::getBufferCapacityForNode (dsc/dsc2.cpp:3977) accumulating \
              getBufferCapacityForNodePerDimCustomLocation (dsc/dsc2.cpp:3755), which is UNPORTED — \
-             a fabricated capacity would commit a fabricated placement"
+             a fabricated capacity would commit a fabricated placement",
         )
     }
 

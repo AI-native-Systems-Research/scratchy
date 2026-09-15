@@ -33,9 +33,11 @@
 //! the port's own answer; the footprint and the expected address are the reference's.
 //!
 //! ⛔ IT DOES NOT VERIFY THE FOOTPRINT. `getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`) —
-//! [`crate::schedule::l3::dl_ops::L3Placement::buffer_capacity_even_sticks`] — is still a `todo!`,
-//! so the SIZE of each request is taken from the reference's output rather than computed. That is the
-//! next frontier and this test says nothing about it.
+//! [`crate::schedule::l3::dl_ops::L3Placement::buffer_capacity_even_sticks`] — is UNPORTED and
+//! [`super::Placement`] refuses it, so the SIZE of each request is taken from the reference's output
+//! rather than computed. ⭐ THAT REFUSAL IS NOW STAGE 2A'S FRONTIER ON EVERY PROGRAM: entry 222 finds
+//! its allocate node (the port's separate allocate-node map is gone) and stops on the capacity
+//! instead. This test says nothing about it.
 //!
 //! ⛔ AND WHAT THE 187 DO NOT EXERCISE, so a green run here is not a verified allocator: every one
 //! packs consecutively from the base with zero gaps, so there is no fragmented free list, no

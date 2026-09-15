@@ -2602,6 +2602,19 @@ pub struct BurstEfficiency(pub f64);
 ///
 /// ⛔ `rustfmt::skip` SO ONE ROW STAYS ONE LINE, as the `.def` file writes it — a reflowed table
 /// cannot be diffed against its source.
+///
+/// ⛔⛔ TWO CELLS ARE SPELLED AS QUOTIENTS AND THAT IS NOT A SIMPLIFICATION — `0.3180` (row 10,
+/// degree 15) and `0.5235` (row 18, degree 4) are within `clippy::approx_constant`'s tolerance of
+/// `FRAC_1_PI` (0.3183098…) and `FRAC_PI_6` (0.5235987…), which they are NOT: they differ in the
+/// 4th/5th decimal, and taking the lint's "use the constant directly" advice would CHANGE IBM'S
+/// DATA. Every one of the 1024 entries lies on the lattice `(200 + 50·(burst-1) − (degree-1)) /
+/// 2000`, so those two are `636 / 2000` and `1047 / 2000`; IEEE division is correctly rounded, so
+/// each quotient is BIT-IDENTICAL to the literal it replaces (asserted by
+/// `the_two_quotient_cells_are_bit_identical_to_the_def_literals`, which parses the `.def`'s own
+/// spelling rather than re-deriving it), the lint cannot fire on an expression, and no
+/// other cell is touched. ⚠️ THE *FLOAT* CLOSED FORM IS NOT A LEGAL REWRITE: `0.1 + r*0.025 -
+/// c*0.0005` is bit-different in 360 of the 1024 entries, so only the integer form may be used, and
+/// only where the lint forces it.
 #[rustfmt::skip]
 const BURST_EFFICIENCY: [[f64; 32]; 32] = [
     [0.1000, 0.0995, 0.0990, 0.0985, 0.0980, 0.0975, 0.0970, 0.0965, 0.0960, 0.0955, 0.0950, 0.0945, 0.0940, 0.0935, 0.0930, 0.0925, 0.0920, 0.0915, 0.0910, 0.0905, 0.0900, 0.0895, 0.0890, 0.0885, 0.0880, 0.0875, 0.0870, 0.0865, 0.0860, 0.0855, 0.0850, 0.0845],
@@ -2613,7 +2626,7 @@ const BURST_EFFICIENCY: [[f64; 32]; 32] = [
     [0.2500, 0.2495, 0.2490, 0.2485, 0.2480, 0.2475, 0.2470, 0.2465, 0.2460, 0.2455, 0.2450, 0.2445, 0.2440, 0.2435, 0.2430, 0.2425, 0.2420, 0.2415, 0.2410, 0.2405, 0.2400, 0.2395, 0.2390, 0.2385, 0.2380, 0.2375, 0.2370, 0.2365, 0.2360, 0.2355, 0.2350, 0.2345],
     [0.2750, 0.2745, 0.2740, 0.2735, 0.2730, 0.2725, 0.2720, 0.2715, 0.2710, 0.2705, 0.2700, 0.2695, 0.2690, 0.2685, 0.2680, 0.2675, 0.2670, 0.2665, 0.2660, 0.2655, 0.2650, 0.2645, 0.2640, 0.2635, 0.2630, 0.2625, 0.2620, 0.2615, 0.2610, 0.2605, 0.2600, 0.2595],
     [0.3000, 0.2995, 0.2990, 0.2985, 0.2980, 0.2975, 0.2970, 0.2965, 0.2960, 0.2955, 0.2950, 0.2945, 0.2940, 0.2935, 0.2930, 0.2925, 0.2920, 0.2915, 0.2910, 0.2905, 0.2900, 0.2895, 0.2890, 0.2885, 0.2880, 0.2875, 0.2870, 0.2865, 0.2860, 0.2855, 0.2850, 0.2845],
-    [0.3250, 0.3245, 0.3240, 0.3235, 0.3230, 0.3225, 0.3220, 0.3215, 0.3210, 0.3205, 0.3200, 0.3195, 0.3190, 0.3185, 0.3180, 0.3175, 0.3170, 0.3165, 0.3160, 0.3155, 0.3150, 0.3145, 0.3140, 0.3135, 0.3130, 0.3125, 0.3120, 0.3115, 0.3110, 0.3105, 0.3100, 0.3095],
+    [0.3250, 0.3245, 0.3240, 0.3235, 0.3230, 0.3225, 0.3220, 0.3215, 0.3210, 0.3205, 0.3200, 0.3195, 0.3190, 0.3185, 636.0 / 2000.0, 0.3175, 0.3170, 0.3165, 0.3160, 0.3155, 0.3150, 0.3145, 0.3140, 0.3135, 0.3130, 0.3125, 0.3120, 0.3115, 0.3110, 0.3105, 0.3100, 0.3095],
     [0.3500, 0.3495, 0.3490, 0.3485, 0.3480, 0.3475, 0.3470, 0.3465, 0.3460, 0.3455, 0.3450, 0.3445, 0.3440, 0.3435, 0.3430, 0.3425, 0.3420, 0.3415, 0.3410, 0.3405, 0.3400, 0.3395, 0.3390, 0.3385, 0.3380, 0.3375, 0.3370, 0.3365, 0.3360, 0.3355, 0.3350, 0.3345],
     [0.3750, 0.3745, 0.3740, 0.3735, 0.3730, 0.3725, 0.3720, 0.3715, 0.3710, 0.3705, 0.3700, 0.3695, 0.3690, 0.3685, 0.3680, 0.3675, 0.3670, 0.3665, 0.3660, 0.3655, 0.3650, 0.3645, 0.3640, 0.3635, 0.3630, 0.3625, 0.3620, 0.3615, 0.3610, 0.3605, 0.3600, 0.3595],
     [0.4000, 0.3995, 0.3990, 0.3985, 0.3980, 0.3975, 0.3970, 0.3965, 0.3960, 0.3955, 0.3950, 0.3945, 0.3940, 0.3935, 0.3930, 0.3925, 0.3920, 0.3915, 0.3910, 0.3905, 0.3900, 0.3895, 0.3890, 0.3885, 0.3880, 0.3875, 0.3870, 0.3865, 0.3860, 0.3855, 0.3850, 0.3845],
@@ -2621,7 +2634,7 @@ const BURST_EFFICIENCY: [[f64; 32]; 32] = [
     [0.4500, 0.4495, 0.4490, 0.4485, 0.4480, 0.4475, 0.4470, 0.4465, 0.4460, 0.4455, 0.4450, 0.4445, 0.4440, 0.4435, 0.4430, 0.4425, 0.4420, 0.4415, 0.4410, 0.4405, 0.4400, 0.4395, 0.4390, 0.4385, 0.4380, 0.4375, 0.4370, 0.4365, 0.4360, 0.4355, 0.4350, 0.4345],
     [0.4750, 0.4745, 0.4740, 0.4735, 0.4730, 0.4725, 0.4720, 0.4715, 0.4710, 0.4705, 0.4700, 0.4695, 0.4690, 0.4685, 0.4680, 0.4675, 0.4670, 0.4665, 0.4660, 0.4655, 0.4650, 0.4645, 0.4640, 0.4635, 0.4630, 0.4625, 0.4620, 0.4615, 0.4610, 0.4605, 0.4600, 0.4595],
     [0.5000, 0.4995, 0.4990, 0.4985, 0.4980, 0.4975, 0.4970, 0.4965, 0.4960, 0.4955, 0.4950, 0.4945, 0.4940, 0.4935, 0.4930, 0.4925, 0.4920, 0.4915, 0.4910, 0.4905, 0.4900, 0.4895, 0.4890, 0.4885, 0.4880, 0.4875, 0.4870, 0.4865, 0.4860, 0.4855, 0.4850, 0.4845],
-    [0.5250, 0.5245, 0.5240, 0.5235, 0.5230, 0.5225, 0.5220, 0.5215, 0.5210, 0.5205, 0.5200, 0.5195, 0.5190, 0.5185, 0.5180, 0.5175, 0.5170, 0.5165, 0.5160, 0.5155, 0.5150, 0.5145, 0.5140, 0.5135, 0.5130, 0.5125, 0.5120, 0.5115, 0.5110, 0.5105, 0.5100, 0.5095],
+    [0.5250, 0.5245, 0.5240, 1047.0 / 2000.0, 0.5230, 0.5225, 0.5220, 0.5215, 0.5210, 0.5205, 0.5200, 0.5195, 0.5190, 0.5185, 0.5180, 0.5175, 0.5170, 0.5165, 0.5160, 0.5155, 0.5150, 0.5145, 0.5140, 0.5135, 0.5130, 0.5125, 0.5120, 0.5115, 0.5110, 0.5105, 0.5100, 0.5095],
     [0.5500, 0.5495, 0.5490, 0.5485, 0.5480, 0.5475, 0.5470, 0.5465, 0.5460, 0.5455, 0.5450, 0.5445, 0.5440, 0.5435, 0.5430, 0.5425, 0.5420, 0.5415, 0.5410, 0.5405, 0.5400, 0.5395, 0.5390, 0.5385, 0.5380, 0.5375, 0.5370, 0.5365, 0.5360, 0.5355, 0.5350, 0.5345],
     [0.5750, 0.5745, 0.5740, 0.5735, 0.5730, 0.5725, 0.5720, 0.5715, 0.5710, 0.5705, 0.5700, 0.5695, 0.5690, 0.5685, 0.5680, 0.5675, 0.5670, 0.5665, 0.5660, 0.5655, 0.5650, 0.5645, 0.5640, 0.5635, 0.5630, 0.5625, 0.5620, 0.5615, 0.5610, 0.5605, 0.5600, 0.5595],
     [0.6000, 0.5995, 0.5990, 0.5985, 0.5980, 0.5975, 0.5970, 0.5965, 0.5960, 0.5955, 0.5950, 0.5945, 0.5940, 0.5935, 0.5930, 0.5925, 0.5920, 0.5915, 0.5910, 0.5905, 0.5900, 0.5895, 0.5890, 0.5885, 0.5880, 0.5875, 0.5870, 0.5865, 0.5860, 0.5855, 0.5850, 0.5845],
@@ -8700,24 +8713,75 @@ impl AddressFoldCoords {
     }
 }
 
-/// WHERE ENTRIES 219, 220 AND 292 WRITE — `labeledDs_.at(lds).memOrg_.at(storage).allocateNode_`,
-/// handed out BY VALUE and written back, exactly as [`DscTransfers::transfer`] hands out a transfer.
+/// ONE ALLOCATE NODE AS READ OUT OF ITS SITE — LOOK ONLY, AND THAT IS THE POINT.
 ///
-/// ⭐ BY VALUE BECAUSE THE PLACEMENT READS ITS OWN NODE BACK WHILE IT FILLS IT: entry 219 asks
-/// [`MemOrg`] for the LX start address it is about to overwrite, and the two reads cannot be one
-/// borrow. ⛔ [`None`] FROM [`Self::allocation`] IS *"Expect .. in memOrg_."* AND *"Expect a valid
-/// allocate node."* — a storage `memOrg_` does not name and an entry carrying no node are one answer.
-pub trait AllocationSites: MemOrgs {
+/// ⛔⛔ NOTHING CAN BE WRITTEN THROUGH THIS AND NOTHING CAN BE HANDED BACK.
+/// [`AllocationReads::allocation`] used to answer a bare [`AllocateNode`] BY VALUE — a clone — so
+/// `let mut node = sites.allocation(..)`, an edit of it, and no `set_allocation` COMPILED and dropped
+/// the placement silently. That is the FOURTH time on this branch one effect was routed through a
+/// projection disjoint from the state it had to reach. The cure is not a warning: the write is now
+/// the SAME CALL as the edit ([`AllocationSites::place_allocation`]), so there is no second call to
+/// forget, and this type has no `DerefMut`, no `Clone`, and no accessor that yields an owned node —
+/// so the value a dropped write-back would need cannot be built from a read at all.
+///
+/// ⭐ BY VALUE, STILL, BECAUSE THE PLACEMENT READS ITS OWN NODE BACK WHILE IT FILLS IT: entry 219
+/// asks [`MemOrg`] for the LX start address it is about to overwrite, and the two reads cannot be one
+/// borrow.
+#[derive(Debug)]
+pub struct AllocationView(AllocateNode);
+
+impl AllocationView {
+    /// The node an implementation read out of `memOrg_`, sealed against being written anywhere else.
+    #[must_use]
+    pub const fn of(node: AllocateNode) -> Self {
+        Self(node)
+    }
+}
+
+impl core::ops::Deref for AllocationView {
+    type Target = AllocateNode;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// WHERE ENTRIES 219, 220, 222 AND 292 READ — `labeledDs_.at(lds).memOrg_.at(storage).allocateNode_`,
+/// SHARED, exactly as the reference's `const auto *allocNode` reads it (`:1642`, `:3890`, `:5811`).
+///
+/// ⭐⭐ SPLIT FROM [`AllocationSites`] BECAUSE ENTRY 222'S PROBE ONLY READS, AND THE PROBE IS CALLED
+/// WITH A TREE BORROW LIVE: entries 354 and 294 hold `&mut Tree` from [`DscPagedTrees::tree_mut`]
+/// across their `allocAllMem(.., commit = false)` calls, and a second EXCLUSIVE borrow of the same
+/// carrier for the allocate nodes could not exist. Read and write are two traits so that the probe
+/// can take the same state SHARED, which is what removes the port's separate allocate-node map.
+///
+/// ⛔ [`None`] IS *"Expect .. in memOrg_."* AND *"Expect a valid allocate node."* — a storage
+/// `memOrg_` does not name and an entry carrying no node are one answer.
+pub trait AllocationReads {
     /// That allocate node, absent for either refusal above.
-    fn allocation(&self, dsc: DscIdx, lds: LdsIdx, storage: SenComponent) -> Option<AllocateNode>;
-    /// The same node written back.
-    fn set_allocation(
+    fn allocation(&self, dsc: DscIdx, lds: LdsIdx, storage: SenComponent)
+    -> Option<AllocationView>;
+}
+
+/// WHERE ENTRIES 219, 220, 222 AND 292 WRITE — the same
+/// `labeledDs_.at(lds).memOrg_.at(storage).allocateNode_` the reference mutates THROUGH ITS POINTER.
+///
+/// ⛔⛔ ONE METHOD, AND IT IS BOTH HALVES. The reference edits `allocNode->startAddressCoreCorelet_`
+/// in place; a port that hands a copy out and takes one back has two calls where the reference has
+/// none, and the second is forgettable. [`Self::place_allocation`] reads the node, hands it to
+/// `place` as `&mut`, and writes it back UNCONDITIONALLY — including when `place` refuses part-way,
+/// which is what a pointer edit leaves behind.
+pub trait AllocationSites: AllocationReads + MemOrgs {
+    /// That node handed to `place` and written back. The OUTER [`None`] is the two read refusals
+    /// above; the INNER one is `place`'s own, so a site that is merely absent is distinguishable from
+    /// a placement that refused — which is the difference between entry 220's `continue` and its stop.
+    fn place_allocation(
         &mut self,
         dsc: DscIdx,
         lds: LdsIdx,
         storage: SenComponent,
-        node: AllocateNode,
-    );
+        place: &mut dyn FnMut(&mut AllocateNode) -> Option<()>,
+    ) -> Option<Option<()>>;
 }
 
 /// Replaces: e219_fillFinalStartAddressAndOffset
@@ -8886,25 +8950,30 @@ where
     let corelets = dsc.corelets_used_dsc2?.get();
     let mut any = false;
     for ibr in [SenComponent::L3luibr, SenComponent::L3suibr] {
-        let Some(mut node) = sites.allocation(dsc_idx, lds, ibr) else {
+        // ⭐ THE ABSENT SITE AND THE REFUSED PLACEMENT ARE THE TWO `Option` LAYERS, in that order: an
+        // IBR `memOrg_` does not name is the reference's `if (allocNode)` skip, while a refusal from
+        // inside is its `DT_CHECK`.
+        let Some(placed) = sites.place_allocation(dsc_idx, lds, ibr, &mut |node| {
+            node.start_address.has_zero_fold_dim().then_some(())?;
+            node.start_address
+                .build_fold_space(coords.depth(), AddressFold::Constant, AddressFold::Constant);
+            node.start_address
+                .insert(Core::checked(0)?, Corelet::at::<0>(), Bytes(0));
+            for core in dsc.core_ids_used.iter() {
+                for id in 0..corelets {
+                    node.placement
+                        .buffer_offset
+                        .entry(core)
+                        .or_default()
+                        .insert(Corelet::checked(id)?, Bytes(0));
+                }
+            }
+            Some(())
+        }) else {
             continue;
         };
         any = true;
-        node.start_address.has_zero_fold_dim().then_some(())?;
-        node.start_address
-            .build_fold_space(coords.depth(), AddressFold::Constant, AddressFold::Constant);
-        node.start_address
-            .insert(Core::checked(0)?, Corelet::at::<0>(), Bytes(0));
-        for core in dsc.core_ids_used.iter() {
-            for id in 0..corelets {
-                node.placement
-                    .buffer_offset
-                    .entry(core)
-                    .or_default()
-                    .insert(Corelet::checked(id)?, Bytes(0));
-            }
-        }
-        sites.set_allocation(dsc_idx, lds, ibr, node);
+        placed?;
     }
     any.then_some(())
 }
@@ -9144,6 +9213,16 @@ pub trait L3Placement {
     /// ⛔ `dsc` IS THE `currDsc` THE CALL IS MADE ON (`L3DlOpsScheduler.cpp:5560-5563`): it is a
     /// `DesignSpaceConfig` METHOD, so which DSC is asked decides `labeledDs_`, `primaryDsInfo_` and
     /// the layout the capacity is walked over. A carrier answering without it names no DSC at all.
+    ///
+    /// ⛔⛔ [`None`] IS *"THIS CARRIER CANNOT ANSWER"*, NOT A REFERENCE REFUSAL — the vendor's method
+    /// returns an `int` and never fails. It is an [`Option`] for the same reason
+    /// [`DscOffsetFacts::offset_sizes`] is: `getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`)
+    /// accumulates `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3755-3963`) over
+    /// eight further unported accessors, and a carrier that cannot walk it must SAY SO rather than
+    /// panic — a `todo!` here unwinds the whole stage, taking the [`crate::schedule::stages::DscState`]
+    /// the measurement is read off with it, and a fabricated capacity would commit a fabricated
+    /// placement, which this crate ranks worse than either. A refusing carrier records WHICH fact it
+    /// lacked, and entry 222 propagates the stop unchanged.
     fn buffer_capacity_even_sticks(
         &self,
         dsc: DscIdx,
@@ -9151,7 +9230,7 @@ pub trait L3Placement {
         lds: LdsIdx,
         corelet: Corelet,
         row: Row,
-    ) -> Bytes;
+    ) -> Option<Bytes>;
     /// `{coreFoldProp_, coreletFoldProp_} ++ sdscFoldProps_`'s size — how many axes the address fold
     /// space has.
     fn address_fold_depth(&self) -> usize;
@@ -9319,6 +9398,21 @@ pub fn fill_transfer_zero_padding_info<E: DscTransfers + ?Sized>(
     Some(())
 }
 
+/// WHICH `memOrg_` ENTRY ONE PLACEMENT LANDS IN — `labeledDs_.at(lds).memOrg_.at(storage)`, which is
+/// how [`AllocationSites`] is reached and what an [`AllocId`] was standing proxy for here.
+///
+/// ⛔ AN [`AllocId`] CANNOT SPELL IT. That names the allocate node's IDENTITY, and the reference does
+/// not look a node up by identity at all — every one of its thirty-odd reads subscripts
+/// `labeledDs_.at(ldsIdx).memOrg_.at(storage)`. Keying the collected placements by identity is what
+/// made them need a map of their own, which is the map this stage stopped on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AllocSite {
+    /// `ldsIdx` — the key of `newAllocations_.at(storage).ldsIdxAndAllocNode`.
+    lds: LdsIdx,
+    /// `newAllocations_`' own component, which is the `memOrg_` subscript.
+    storage: SenComponent,
+}
+
 /// WHAT ENTRY 222'S `tryAlloc` COLLECTED — held off the allocations until every set has fitted,
 /// because a probe that did not fit must leave them as they were.
 ///
@@ -9327,11 +9421,11 @@ pub fn fill_transfer_zero_padding_info<E: DscTransfers + ?Sized>(
 #[derive(Debug, Default)]
 struct L3Placements {
     /// `startAddressCoreCorelet_`.
-    start: BTreeMap<AllocId, BTreeMap<Core, BTreeMap<Corelet, Vec<Bytes>>>>,
+    start: BTreeMap<AllocSite, BTreeMap<Core, BTreeMap<Corelet, Vec<Bytes>>>>,
     /// `bufferOffsetCoreCorelet_`.
-    offsets: BTreeMap<AllocId, BTreeMap<Core, BTreeMap<Corelet, Bytes>>>,
+    offsets: BTreeMap<AllocSite, BTreeMap<Core, BTreeMap<Corelet, Bytes>>>,
     /// `copyToCoreCl`, whose corelet half is the CONSTANT `true` here.
-    copied_from: BTreeMap<AllocId, v1::Proxy>,
+    copied_from: BTreeMap<AllocSite, v1::Proxy>,
 }
 
 /// `tryAlloc` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5521-5665`) — [`None`] is a `DT_CHECK`,
@@ -9339,17 +9433,18 @@ struct L3Placements {
 ///
 /// ⛔ THE `consIdAndAllocNode` AND `compAndAllocNode` ARMS ARE DEAD TWICE OVER: both open with
 /// `DT_ERROR("No support")`, and neither map exists in this stage's [`L3Allocation`] projection.
-fn try_alloc_l3<M, P>(
+fn try_alloc_l3<R, M, P>(
     dsc: &DesignSpaceConfig,
     dsc_idx: DscIdx,
     metadata: &DscMetadata,
-    allocs: &v1::AllocArena,
+    sites: &R,
     trackers: &mut M,
     placement: &P,
     commit: v1::Commit,
     placed: &mut L3Placements,
 ) -> Option<bool>
 where
+    R: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -9371,33 +9466,38 @@ where
                 row: Row::at::<0>(),
             };
             trackers.backup(at);
-            let mut node_and_size: Vec<(AllocId, Bytes)> = Vec::new();
+            let mut node_and_size: Vec<(AllocSite, Bytes)> = Vec::new();
             for (&lds, &alloc) in &allocation.lds_idx_and_alloc_node {
-                let node = allocs.get(&alloc)?;
+                let site = AllocSite {
+                    lds,
+                    storage: memory,
+                };
+                let node = sites.allocation(dsc_idx, site.lds, site.storage)?;
                 if node.component != SenComponent::Lx {
                     return None;
                 }
                 // The LX buffer must be an even number of sticks for ring polarity (refer to DSI).
                 let capacity =
-                    placement.buffer_capacity_even_sticks(dsc_idx, alloc, lds, at.corelet, at.row);
+                    placement.buffer_capacity_even_sticks(dsc_idx, alloc, lds, at.corelet, at.row)?;
                 let buffers = node.placement.num_buffers.reserved();
-                node_and_size.push((alloc, Bytes(capacity.0.checked_mul(buffers.get())?)));
+                node_and_size.push((site, Bytes(capacity.0.checked_mul(buffers.get())?)));
             }
             // Largest first: LX already holds tensors from other nodes, and placing the big buffers
             // before the small ones is what keeps that fragmentation from costing a buffer.
             node_and_size.sort_by(|left, right| right.1.cmp(&left.1));
-            for &(alloc, _) in &node_and_size {
-                let name = get_lds_or_const_name_of_alloc_node(allocs.get(&alloc)?, dsc)?;
+            for &(site, _) in &node_and_size {
+                let node = sites.allocation(dsc_idx, site.lds, site.storage)?;
+                let name = get_lds_or_const_name_of_alloc_node(&node, dsc)?;
                 trackers.remove(at, &name);
             }
-            for &(alloc, size) in &node_and_size {
-                let node = allocs.get(&alloc)?;
+            for &(site, size) in &node_and_size {
+                let node = sites.allocation(dsc_idx, site.lds, site.storage)?;
                 let mut my_size = size;
                 if node.placement.num_buffers.is_streaming() {
                     // Full capacity reserved for a circular buffer.
                     my_size = my_size.max(trackers.capacity(at));
                 }
-                let name = get_lds_or_const_name_of_alloc_node(node, dsc)?;
+                let name = get_lds_or_const_name_of_alloc_node(&node, dsc)?;
                 let mut addresses: Vec<Bytes> = Vec::new();
                 for &phase in &phases {
                     match trackers.check_and_add(at, phase, &name, my_size)? {
@@ -9412,7 +9512,7 @@ where
                     }
                     placed
                         .start
-                        .entry(alloc)
+                        .entry(site)
                         .or_default()
                         .entry(core)
                         .or_default()
@@ -9420,7 +9520,7 @@ where
                     // ⚠️ THE SIZE ASKED FOR, not the capacity a streaming buffer widened it to.
                     placed
                         .offsets
-                        .entry(alloc)
+                        .entry(site)
                         .or_default()
                         .entry(core)
                         .or_default()
@@ -9428,7 +9528,7 @@ where
                             at.corelet,
                             Bytes(size.0 / node.placement.num_buffers.reserved()),
                         );
-                    placed.copied_from.insert(alloc, copy_core);
+                    placed.copied_from.insert(site, copy_core);
                 }
             }
         }
@@ -9446,16 +9546,29 @@ where
 /// space already dimensioned, a proxied core placed at more than one coordinate, and an address list
 /// that is neither single nor one per fold coordinate. ⚠️ The `coreArch <= MPW4_ISA` PTARF prefill is
 /// dead twice over: [`IsaGen`] has no MPW4, and this stage only ever allocates in LX.
-pub fn alloc_all_mem<M, P>(
+///
+/// ⭐⭐ THIS IS THE `commit = true` HALF AND [`probe_all_mem`] IS THE OTHER — entry 222 is two
+/// functions because `commit` decides WHICH OPS EXIST, which is this crate's const-generic rule:
+/// `allocAllMem` restores the trackers and RETURNS before its three write-backs whenever `commit` is
+/// false (`L3DlOpsScheduler.cpp:5674`), so on that path they do not exist. Eleven of the twelve call
+/// sites pass a literal `false`; only entry 382's own final loop reaches here.
+///
+/// ⛔⛔ AND THE THREE WRITE-BACKS GO THROUGH [`AllocationSites::place_allocation`], NOT THROUGH A
+/// COPY. The reference writes `allocNode->startAddressCoreCorelet_` through its pointer; a port that
+/// reads the node out, edits it and forgets to hand it back compiles and places nothing — which is
+/// exactly the defect that stopped this stage. `place_allocation` is one call that does both, and
+/// each of the three reaches the node the previous one left, because there is now ONE cell per
+/// `memOrg_` entry rather than a tree half and an arena half.
+pub fn alloc_all_mem<A, M, P>(
     dsc: &DesignSpaceConfig,
     metadata: &BTreeMap<DscIdx, DscMetadata>,
     dsc_idx: DscIdx,
-    allocs: &mut v1::AllocArena,
+    sites: &mut A,
     trackers: &mut M,
     placement: &P,
-    commit: v1::Commit,
 ) -> Option<bool>
 where
+    A: AllocationSites + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -9464,21 +9577,21 @@ where
         dsc,
         dsc_idx,
         metadata.get(&dsc_idx)?,
-        allocs,
+        &*sites,
         trackers,
         placement,
-        commit,
+        v1::Commit::IfValid,
         &mut placed,
     )?;
-    if !success || commit == v1::Commit::No {
+    if !success {
         trackers.restore_all();
-        return Some(success);
+        return Some(false);
     }
 
     let depth = placement.address_fold_depth();
     let coords = placement.address_fold_coords();
-    for (&alloc, addresses) in &placed.start {
-        let copy_core = *placed.copied_from.get(&alloc)?;
+    for (&site, addresses) in &placed.start {
+        let copy_core = *placed.copied_from.get(&site)?;
         let default = if addresses
             .values()
             .flat_map(|per_corelet| per_corelet.values())
@@ -9494,50 +9607,101 @@ where
             v1::Proxy::First => AddressFold::Constant,
             v1::Proxy::Each => AddressFold::Map,
         };
-        let node = allocs.get_mut(&alloc)?;
-        if !node.start_address.has_zero_fold_dim()
-            || (copy_core == v1::Proxy::First && addresses.len() != 1)
-        {
-            return None;
-        }
-        node.start_address
-            .build_fold_space_spread(depth, default, core_fold, AddressFold::Map);
-        for (&core, per_corelet) in addresses {
-            for (&corelet, list) in per_corelet {
-                match list.as_slice() {
-                    [only] => node.start_address.insert(core, corelet, *only),
-                    spread if spread.len() == coords => {
-                        node.start_address.insert_spread(core, corelet, spread.to_vec());
+        sites.place_allocation(dsc_idx, site.lds, site.storage, &mut |node| {
+            if !node.start_address.has_zero_fold_dim()
+                || (copy_core == v1::Proxy::First && addresses.len() != 1)
+            {
+                return None;
+            }
+            node.start_address
+                .build_fold_space_spread(depth, default, core_fold, AddressFold::Map);
+            for (&core, per_corelet) in addresses {
+                for (&corelet, list) in per_corelet {
+                    match list.as_slice() {
+                        [only] => node.start_address.insert(core, corelet, *only),
+                        spread if spread.len() == coords => {
+                            node.start_address.insert_spread(core, corelet, spread.to_vec());
+                        }
+                        _ => return None,
                     }
-                    _ => return None,
                 }
             }
-        }
+            Some(())
+        })??;
     }
-    for (&alloc, offsets) in &placed.offsets {
-        allocs.get_mut(&alloc)?.placement.buffer_offset = offsets.clone();
+    for (&site, offsets) in &placed.offsets {
+        sites.place_allocation(dsc_idx, site.lds, site.storage, &mut |node| {
+            node.placement.buffer_offset = offsets.clone();
+            Some(())
+        })??;
     }
-    for (&alloc, &copy_core) in &placed.copied_from {
-        let node = allocs.get_mut(&alloc)?;
-        // ⚠️ `copyCorelet` IS THE UNCONDITIONAL `true` here, so every allocation's offsets copy out.
-        for per_corelet in node.placement.buffer_offset.values_mut() {
-            let head = *per_corelet.get(&Corelet::at::<0>())?;
-            for index in 1..dsc.corelets_used.get() {
-                per_corelet.insert(Corelet::checked(index)?, head);
+    for (&site, &copy_core) in &placed.copied_from {
+        sites.place_allocation(dsc_idx, site.lds, site.storage, &mut |node| {
+            // ⚠️ `copyCorelet` IS THE UNCONDITIONAL `true` here, so every allocation's offsets copy
+            // out.
+            for per_corelet in node.placement.buffer_offset.values_mut() {
+                let head = *per_corelet.get(&Corelet::at::<0>())?;
+                for index in 1..dsc.corelets_used.get() {
+                    per_corelet.insert(Corelet::checked(index)?, head);
+                }
             }
-        }
-        if copy_core == v1::Proxy::First && node.placement.num_buffers.switches() {
-            let at_head = node
-                .placement
-                .buffer_offset
-                .get(&dsc.core_ids_used.first())?
-                .clone();
-            for core in dsc.core_ids_used.iter().skip(1) {
-                node.placement.buffer_offset.insert(core, at_head.clone());
+            if copy_core == v1::Proxy::First && node.placement.num_buffers.switches() {
+                let at_head = node
+                    .placement
+                    .buffer_offset
+                    .get(&dsc.core_ids_used.first())?
+                    .clone();
+                for core in dsc.core_ids_used.iter().skip(1) {
+                    node.placement.buffer_offset.insert(core, at_head.clone());
+                }
             }
-        }
+            Some(())
+        })??;
     }
     Some(true)
+}
+
+/// Replaces: e222_allocAllMem
+///
+/// PROBES every new LX allocation of one DSC against its memory tracker once PER EXECUTION PHASE and
+/// leaves the tracker exactly as it found it — `allocAllMem(dsc, dscIdx, /*commit=*/false)`.
+///
+/// ⭐⭐ THE OTHER HALF OF [`alloc_all_mem`], AND THE REASON THE SPLIT EARNS ITS KEEP: with no
+/// write-back the allocate nodes are only READ, so this half takes them through
+/// [`AllocationReads`] — SHARED — and can therefore be called while a `&mut Tree` from
+/// [`DscPagedTrees::tree_mut`] is live, which entries 354 and 294 both do. One carrier answering both
+/// borrows is what removes the port's separate allocate-node map.
+///
+/// ⛔ [`None`] IS `tryAlloc`'s own; `Some(false)` IS ITS `return false` — *"the chunk size does not
+/// fit in LX"*, which every caller turns into its own refusal or its next candidate.
+pub fn probe_all_mem<R, M, P>(
+    dsc: &DesignSpaceConfig,
+    metadata: &BTreeMap<DscIdx, DscMetadata>,
+    dsc_idx: DscIdx,
+    sites: &R,
+    trackers: &mut M,
+    placement: &P,
+) -> Option<bool>
+where
+    R: AllocationReads + ?Sized,
+    M: ExPhaseTrackers + ?Sized,
+    P: L3Placement,
+{
+    // ⚠️ COLLECTED AND DROPPED, WHICH IS THE REFERENCE: `tryAlloc` fills `placed` only under
+    // `commit`, and this half is the `false` one — so nothing is ever put in it.
+    let mut placed = L3Placements::default();
+    let success = try_alloc_l3(
+        dsc,
+        dsc_idx,
+        metadata.get(&dsc_idx)?,
+        sites,
+        trackers,
+        placement,
+        v1::Commit::No,
+        &mut placed,
+    )?;
+    trackers.restore_all();
+    Some(success)
 }
 
 /// Replaces: e223_getHbmLdsTransferHMIRequestEstimate
@@ -10182,6 +10346,48 @@ mod tests_e221_e228 {
         }
     }
 
+    /// `labeledDs_.at(lds).memOrg_.at(storage).allocateNode_` — the ONE map entry 222 reads its
+    /// allocate nodes out of and writes its placements back into.
+    ///
+    /// ⛔ AN [`AllocId`] IS NOT A KEY HERE, deliberately: the reference reaches a node only by
+    /// `(lds, storage)`, and a placement keyed by identity is what needed a second map.
+    #[derive(Debug, Default)]
+    struct Sites(BTreeMap<(LdsIdx, SenComponent), AllocateNode>);
+
+    impl MemOrgs for Sites {
+        type Org = Org;
+
+        /// ⭐ NOTHING HERE ON PURPOSE: every unit that places an allocation takes the organisation it
+        /// reads as its own argument; the supertrait is only what a driver reaches both through.
+        fn mem_org(&self, _dsc: DscIdx, _lds: LdsIdx) -> Option<&Org> {
+            None
+        }
+    }
+
+    impl AllocationReads for Sites {
+        fn allocation(
+            &self,
+            _dsc: DscIdx,
+            lds: LdsIdx,
+            storage: SenComponent,
+        ) -> Option<AllocationView> {
+            self.0.get(&(lds, storage)).cloned().map(AllocationView::of)
+        }
+    }
+
+    impl AllocationSites for Sites {
+        fn place_allocation(
+            &mut self,
+            _dsc: DscIdx,
+            lds: LdsIdx,
+            storage: SenComponent,
+            place: &mut dyn FnMut(&mut AllocateNode) -> Option<()>,
+        ) -> Option<Option<()>> {
+            let node = self.0.get_mut(&(lds, storage))?;
+            Some(place(node))
+        }
+    }
+
     impl MemOrg for Org {
         fn hbm_pinned(&self) -> bool {
             false
@@ -10722,23 +10928,17 @@ mod tests_e221_e228 {
 
     /// e222 — the two execution phases place the one LX buffer at two addresses, which land in its
     /// fold space as a spread, and its buffer offset copies out to every corelet.
+    ///
+    /// ⛔⛔ EVERY PLACEMENT IS READ BACK **THROUGH THE SEAM**, AND THE SECOND HALF OF THIS TEST IS THE
+    /// NEGATIVE CONTROL FOR THAT. Entry 222 used to write into a map of its own that nothing else
+    /// read, and a test that checked the node it still held would have been green throughout. So the
+    /// only readings below are `AllocationReads::allocation`'s, and the same fixture is then run over a
+    /// seam whose write-back is DROPPED — spelled out on purpose — to show those readings come back
+    /// UNPLACED when the write does not land.
     #[test]
     fn every_new_lx_allocation_is_placed_once_per_execution_phase() {
-        let config = dsc(LdsIdx(0), &[(PrimaryDim::X, 8)], Pinning::default());
-        let metadata = BTreeMap::from([(
-            DscIdx(0),
-            DscMetadata {
-                new_allocations: BTreeMap::from([(
-                    SenComponent::Lx,
-                    L3Allocation {
-                        lds_idx_and_alloc_node: BTreeMap::from([(LdsIdx(0), AllocId(0))]),
-                    },
-                )]),
-                external_nodes: BTreeSet::new(),
-            },
-        )]);
-        let mut allocs: v1::AllocArena = BTreeMap::from([(
-            AllocId(0),
+        /// The one LX allocation as `memOrg_` states it before anything places it.
+        fn unplaced() -> AllocateNode {
             AllocateNode {
                 name: NodeName("allocate_lds0".to_owned()),
                 component: SenComponent::Lx,
@@ -10753,8 +10953,26 @@ mod tests_e221_e228 {
                 },
                 gap_stick_spread: BTreeMap::new(),
                 alloc_users: Vec::new(),
+            }
+        }
+
+        let config = dsc(LdsIdx(0), &[(PrimaryDim::X, 8)], Pinning::default());
+        let metadata = BTreeMap::from([(
+            DscIdx(0),
+            DscMetadata {
+                new_allocations: BTreeMap::from([(
+                    SenComponent::Lx,
+                    L3Allocation {
+                        lds_idx_and_alloc_node: BTreeMap::from([(LdsIdx(0), AllocId(0))]),
+                    },
+                )]),
+                external_nodes: BTreeSet::new(),
             },
         )]);
+        let mut sites = Sites(BTreeMap::from([(
+            (LdsIdx(0), SenComponent::Lx),
+            unplaced(),
+        )]));
 
         /// Two phases, each handing out its own address, and the names it was asked to forget.
         #[derive(Default)]
@@ -10806,8 +11024,8 @@ mod tests_e221_e228 {
                 _lds: LdsIdx,
                 _corelet: Corelet,
                 _row: Row,
-            ) -> Bytes {
-                Bytes(64)
+            ) -> Option<Bytes> {
+                Some(Bytes(64))
             }
 
             fn address_fold_depth(&self) -> usize {
@@ -10824,10 +11042,9 @@ mod tests_e221_e228 {
             &config,
             &metadata,
             DscIdx(0),
-            &mut allocs,
+            &mut sites,
             &mut trackers,
             &Placement,
-            v1::Commit::IfValid,
         );
         assert_eq!(placed, Some(true));
         assert!(!trackers.restored);
@@ -10839,7 +11056,11 @@ mod tests_e221_e228 {
             trackers.placed.iter().map(|(_, _, size)| *size).collect::<Vec<_>>(),
             vec![Bytes(128); 4]
         );
-        let node = &allocs[&AllocId(0)];
+        // ⭐⭐ READ BACK **THROUGH THE SEAM**, not off a node this test still holds — that is the
+        // whole assertion. A `place_allocation` whose write-back were dropped leaves the node exactly
+        // as it was seeded (`StartAddress::default()`, no buffer offsets) and every check below fails.
+        let node = AllocationReads::allocation(&sites, DscIdx(0), LdsIdx(0), SenComponent::Lx)
+            .expect("entry 222 placed the LX allocation at its `memOrg_` site");
         assert_eq!(
             node.start_address.spread(core(1), Corelet::at::<0>()),
             [Bytes(0), Bytes(1024)]
@@ -10862,6 +11083,78 @@ mod tests_e221_e228 {
                 ),
             ])
         );
+        drop(node);
+
+        // ── THE NEGATIVE CONTROL ─────────────────────────────────────────────────────────────────
+        // ⛔⛔ THE DEFECT, SPELLED OUT: a seam that edits a COPY of its node and drops it. The port
+        // did exactly this — entry 222 wrote a [`v1::AllocArena`] entry that entry 292 never read —
+        // and `alloc_all_mem` still answers `Some(true)`. What changes is that NOTHING IS PLACED,
+        // which is what the readings above would have missed had they come off a local.
+        //
+        // ⚠️ THE UNSPELLABILITY IS ON THE **CALLER** SIDE, not this one: no unit can any longer read a
+        // node out, edit it and forget to write it, because [`AllocationSites::place_allocation`] is
+        // one call that does both and [`AllocationView`] cannot be written through. An IMPLEMENTOR of
+        // the seam can still be wrong, and that is precisely what this half pins.
+        struct DroppedWrites(BTreeMap<(LdsIdx, SenComponent), AllocateNode>);
+
+        impl MemOrgs for DroppedWrites {
+            type Org = Org;
+
+            fn mem_org(&self, _dsc: DscIdx, _lds: LdsIdx) -> Option<&Org> {
+                None
+            }
+        }
+
+        impl AllocationReads for DroppedWrites {
+            fn allocation(
+                &self,
+                _dsc: DscIdx,
+                lds: LdsIdx,
+                storage: SenComponent,
+            ) -> Option<AllocationView> {
+                self.0.get(&(lds, storage)).cloned().map(AllocationView::of)
+            }
+        }
+
+        impl AllocationSites for DroppedWrites {
+            fn place_allocation(
+                &mut self,
+                _dsc: DscIdx,
+                lds: LdsIdx,
+                storage: SenComponent,
+                place: &mut dyn FnMut(&mut AllocateNode) -> Option<()>,
+            ) -> Option<Option<()>> {
+                let mut copy = self.0.get(&(lds, storage))?.clone();
+                Some(place(&mut copy))
+            }
+        }
+
+        let mut dropped = DroppedWrites(BTreeMap::from([(
+            (LdsIdx(0), SenComponent::Lx),
+            unplaced(),
+        )]));
+        let mut trackers = Trackers::default();
+        assert_eq!(
+            alloc_all_mem(
+                &config,
+                &metadata,
+                DscIdx(0),
+                &mut dropped,
+                &mut trackers,
+                &Placement,
+            ),
+            Some(true),
+            "the placement still SUCCEEDS — a dropped write-back is silent, which is the whole hazard"
+        );
+        let node = AllocationReads::allocation(&dropped, DscIdx(0), LdsIdx(0), SenComponent::Lx)
+            .expect("the site is still there");
+        assert_eq!(
+            node.start_address,
+            StartAddress::default(),
+            "and NOTHING was placed — so the assertions above are readings of a real write, not of a \
+             local this test kept"
+        );
+        assert!(node.placement.buffer_offset.is_empty());
     }
 
     /// e223 — before SEN1P5 the estimate is the smallest work-slice product over the HBM-pinned
@@ -11080,8 +11373,8 @@ mod tests_e221_e228 {
                 _lds: LdsIdx,
                 _corelet: Corelet,
                 _row: Row,
-            ) -> Bytes {
-                Bytes(64)
+            ) -> Option<Bytes> {
+                Some(Bytes(64))
             }
 
             fn address_fold_depth(&self) -> usize {
@@ -11115,7 +11408,9 @@ mod tests_e221_e228 {
                 external_nodes: BTreeSet::new(),
             },
         )]);
-        let mut allocs: v1::AllocArena = BTreeMap::new();
+        // ⭐ EMPTY, AND THAT IS THE PROBE: this DSC's `newAllocations_` names no LX allocation, so
+        // entry 222 walks nothing and answers `true` without reading a site.
+        let sites = Sites::default();
 
         create_store_index_tensor_to_lx(
             &mut tree,
@@ -11131,7 +11426,7 @@ mod tests_e221_e228 {
             hbm,
             AllocId(3),
             chunk,
-            &mut allocs,
+            &sites,
             &mut Trackers,
             &Placement,
         )
@@ -11282,8 +11577,8 @@ mod tests_e221_e228 {
             _lds: LdsIdx,
             _corelet: Corelet,
             _row: Row,
-        ) -> Bytes {
-            Bytes(64)
+        ) -> Option<Bytes> {
+            Some(Bytes(64))
         }
 
         fn address_fold_depth(&self) -> usize {
@@ -11388,7 +11683,7 @@ mod tests_e221_e228 {
                 external_nodes: BTreeSet::new(),
             },
         )]);
-        let mut allocs: v1::AllocArena = BTreeMap::new();
+        let sites = Sites::default();
 
         process_paged_tensor_transfers(
             &mut tree,
@@ -11416,7 +11711,7 @@ mod tests_e221_e228 {
                 .one_page(DatastageId(3))
                 .expect("a stated one-page stage"),
             None,
-            &mut allocs,
+            &sites,
             &mut PagedTrackers,
             &PagedPlacement,
         )
@@ -11518,7 +11813,7 @@ mod tests_e221_e228 {
                     .one_page(DatastageId(3))
                     .expect("a stated one-page stage"),
                 None,
-                &mut BTreeMap::new(),
+                &Sites::default(),
                 &mut PagedTrackers,
                 &PagedPlacement,
             ),
@@ -11965,7 +12260,7 @@ mod tests_e221_e228 {
                 external_nodes: BTreeSet::new(),
             },
         )]);
-        let mut allocs: v1::AllocArena = BTreeMap::new();
+        let sites = Sites::default();
 
         let (mut tree, load, store) = a_paged_tree();
         assert_eq!(
@@ -11979,7 +12274,7 @@ mod tests_e221_e228 {
                 LxBufferType::Double,
                 ibr,
                 one_page,
-                &mut allocs,
+                &sites,
                 &mut PagedTrackers,
                 &PagedPlacement,
             ),
@@ -12019,7 +12314,7 @@ mod tests_e221_e228 {
                 LxBufferType::Double,
                 ibr,
                 one_page,
-                &mut allocs,
+                &sites,
                 &mut PagedTrackers,
                 &PagedPlacement,
             ),
@@ -12060,7 +12355,7 @@ mod tests_e221_e228 {
             (DscIdx(0), DscMetadata::default()),
             (DscIdx(1), DscMetadata::default()),
         ]);
-        let mut allocs: v1::AllocArena = BTreeMap::new();
+        let sites = Sites::default();
         let (first, first_load, _) = a_paged_tree();
         let (second, second_load, _) = a_paged_tree();
         let mut trees = PagedTrees(vec![first, second]);
@@ -12073,7 +12368,7 @@ mod tests_e221_e228 {
                 LxBufferType::Double,
                 ibr,
                 one_page,
-                &mut allocs,
+                &sites,
                 &mut PagedTrackers,
                 &PagedPlacement,
             ),
@@ -14265,24 +14560,27 @@ mod tests_e283_e295 {
         }
     }
 
-    impl AllocationSites for Sites {
+    impl AllocationReads for Sites {
         fn allocation(
             &self,
             _dsc: DscIdx,
             lds: LdsIdx,
             storage: SenComponent,
-        ) -> Option<AllocateNode> {
-            self.0.get(&(lds, storage)).cloned()
+        ) -> Option<AllocationView> {
+            self.0.get(&(lds, storage)).cloned().map(AllocationView::of)
         }
+    }
 
-        fn set_allocation(
+    impl AllocationSites for Sites {
+        fn place_allocation(
             &mut self,
             _dsc: DscIdx,
             lds: LdsIdx,
             storage: SenComponent,
-            node: AllocateNode,
-        ) {
-            self.0.insert((lds, storage), node);
+            place: &mut dyn FnMut(&mut AllocateNode) -> Option<()>,
+        ) -> Option<Option<()>> {
+            let node = self.0.get_mut(&(lds, storage))?;
+            Some(place(node))
         }
     }
 
@@ -14594,8 +14892,8 @@ mod tests_e283_e295 {
             _lds: LdsIdx,
             _corelet: Corelet,
             _row: Row,
-        ) -> Bytes {
-            Bytes(64)
+        ) -> Option<Bytes> {
+            Some(Bytes(64))
         }
         fn address_fold_depth(&self) -> usize {
             2
@@ -14645,10 +14943,10 @@ mod tests_e283_e295 {
             tree
         }
 
-        let mut allocs = v1::AllocArena::new();
+        let sites = Sites::default();
         let (mut dsc, super_chunk) = a_super_chunk_dsc();
         assert_eq!(
-            explore_super_chunk_data_stage_params::<false, false, _, _, _, _>(
+            explore_super_chunk_data_stage_params::<false, false, _, _, _, _, _>(
                 &mut dsc,
                 DscIdx(0),
                 super_chunk,
@@ -14656,7 +14954,7 @@ mod tests_e283_e295 {
                 &a_tree(DatastageId(2), DATA_STAGE_CHUNK),
                 &Orgs(BTreeMap::new()),
                 &BTreeMap::new(),
-                &mut allocs,
+                &sites,
                 &mut Trackers,
                 &Placement,
             ),
@@ -14668,7 +14966,7 @@ mod tests_e283_e295 {
 
         let (mut dsc, super_chunk) = a_super_chunk_dsc();
         assert_eq!(
-            explore_super_chunk_data_stage_params::<false, false, _, _, _, _>(
+            explore_super_chunk_data_stage_params::<false, false, _, _, _, _, _>(
                 &mut dsc,
                 DscIdx(0),
                 super_chunk,
@@ -14676,7 +14974,7 @@ mod tests_e283_e295 {
                 &a_tree(DatastageId(2), DATA_STAGE_CORE),
                 &Orgs(BTreeMap::new()),
                 &BTreeMap::new(),
-                &mut allocs,
+                &sites,
                 &mut Trackers,
                 &Placement,
             ),
@@ -14692,7 +14990,7 @@ mod tests_e283_e295 {
         let innermost = tree.loop_over(DatastageId(2), DATA_STAGE_CHUNK, PrimaryDim::J, above.0);
         tree.lx_below = Some(tree.add("lx_below", Kind::Block, Some(innermost.0)));
         assert_eq!(
-            explore_super_chunk_data_stage_params::<false, false, _, _, _, _>(
+            explore_super_chunk_data_stage_params::<false, false, _, _, _, _, _>(
                 &mut dsc,
                 DscIdx(0),
                 super_chunk,
@@ -14700,7 +14998,7 @@ mod tests_e283_e295 {
                 &tree,
                 &Orgs(BTreeMap::new()),
                 &BTreeMap::new(),
-                &mut allocs,
+                &sites,
                 &mut Trackers,
                 &Placement,
             ),
@@ -14719,7 +15017,7 @@ mod tests_e283_e295 {
             .super_chunk(DatastageId(2))
             .expect("the super-chunk stage exists");
         assert_eq!(
-            explore_super_chunk_data_stage_params::<true, false, _, _, _, _>(
+            explore_super_chunk_data_stage_params::<true, false, _, _, _, _, _>(
                 &mut dsc,
                 DscIdx(0),
                 super_chunk,
@@ -14727,7 +15025,7 @@ mod tests_e283_e295 {
                 &a_tree(DatastageId(2), DATA_STAGE_CHUNK),
                 &Orgs(BTreeMap::from([(LdsIdx(0), Org::default())])),
                 &BTreeMap::new(),
-                &mut allocs,
+                &sites,
                 &mut Trackers,
                 &Placement,
             ),
@@ -15344,18 +15642,18 @@ mod tests_e283_e295 {
             tree
         }
 
-        let mut allocs = v1::AllocArena::new();
+        let sites = Sites::default();
         let (dsc, super_chunk) = a_split_dsc();
         let mut sdsc = a_sdsc(dsc, &[], &[]);
         assert_eq!(
-            set_super_chunk_data_stage_params::<false, false, _, _, _, _>(
+            set_super_chunk_data_stage_params::<false, false, _, _, _, _, _>(
                 &mut sdsc,
                 LxBuffering::SpatialDouble(super_chunk),
                 None,
                 &a_tree(),
                 &Orgs(BTreeMap::new()),
                 &BTreeMap::new(),
-                &mut allocs,
+                &sites,
                 &mut Trackers,
                 &Placement,
             ),
@@ -15378,14 +15676,14 @@ mod tests_e283_e295 {
         let (dsc, _) = a_split_dsc();
         let mut sdsc = a_sdsc(dsc, &[], &[]);
         assert_eq!(
-            set_super_chunk_data_stage_params::<false, false, _, _, _, _>(
+            set_super_chunk_data_stage_params::<false, false, _, _, _, _, _>(
                 &mut sdsc,
                 LxBuffering::Double,
                 None,
                 &a_tree(),
                 &Orgs(BTreeMap::new()),
                 &BTreeMap::new(),
-                &mut allocs,
+                &sites,
                 &mut Trackers,
                 &Placement,
             ),
@@ -15544,9 +15842,9 @@ mod tests_e283_e295 {
             PrimaryDim::I,
             SelectedCandidate::new(vec![Extent(2), Extent(4)], 0).expect("a seeded candidate"),
         )]))]);
-        let mut allocs = v1::AllocArena::new();
+        let sites = Sites::default();
         assert_eq!(
-            find_best_params_for_memory_bandwidth::<false, _, _, _, _, _>(
+            find_best_params_for_memory_bandwidth::<false, _, _, _, _, _, _>(
                 &mut selected,
                 &mut sdsc,
                 &BTreeSet::new(),
@@ -15556,7 +15854,7 @@ mod tests_e283_e295 {
                 &orgs,
                 &transfers,
                 &tree,
-                &mut allocs,
+                &sites,
                 &mut Trackers,
                 &Placement,
             ),
@@ -15584,7 +15882,7 @@ mod tests_e283_e295 {
             SelectedCandidate::new(vec![Extent(2), Extent(4)], 0).expect("a seeded candidate"),
         )]))]);
         assert_eq!(
-            find_best_params_for_memory_bandwidth::<false, _, _, _, _, _>(
+            find_best_params_for_memory_bandwidth::<false, _, _, _, _, _, _>(
                 &mut selected,
                 &mut sdsc,
                 &BTreeSet::new(),
@@ -15594,7 +15892,7 @@ mod tests_e283_e295 {
                 &orgs,
                 &transfers,
                 &tree,
-                &mut v1::AllocArena::new(),
+                &Sites::default(),
                 &mut Trackers,
                 &Placement,
             ),
@@ -15642,9 +15940,20 @@ mod tests_e283_e295 {
                     SelectedCandidate::new(vec![Extent(2), Extent(4)], 0)
                         .expect("a seeded candidate"),
                 )]))]);
-            let mut allocs = v1::AllocArena::new();
+            let sites = Sites::default();
             let done =
-                find_best_params_for_arithmetic_intensity::<false, Target, _, _, _, _, _, _, _>(
+                find_best_params_for_arithmetic_intensity::<
+                    false,
+                    Target,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                >(
                     &mut selected,
                     &mut sdsc,
                     &NoOps,
@@ -15656,7 +15965,7 @@ mod tests_e283_e295 {
                     &orgs,
                     &transfers,
                     &tree,
-                    &mut allocs,
+                    &sites,
                     &mut Trackers,
                     &Placement,
                 );
@@ -15712,7 +16021,7 @@ mod tests_e283_e295 {
             .data_stages
             .set(DATA_STAGE_CORE, stage("core", &stated));
         assert_eq!(
-            set_chunk_data_stage_params::<true, false, Target, _, _, _, _, _, _, _>(
+            set_chunk_data_stage_params::<true, false, Target, _, _, _, _, _, _, _, _>(
                 &mut sdsc,
                 &NoOps,
                 LxBuffering::Double,
@@ -15722,7 +16031,7 @@ mod tests_e283_e295 {
                 &orgs,
                 &transfers,
                 &tree,
-                &mut v1::AllocArena::new(),
+                &Sites::default(),
                 &mut Trackers,
                 &Placement,
             ),
@@ -15776,7 +16085,7 @@ mod tests_e283_e295 {
             &[(core(0), slice(&[(PrimaryDim::I, 0)]))],
         );
         assert_eq!(
-            set_chunk_data_stage_params::<true, false, Target, _, _, _, _, _, _, _>(
+            set_chunk_data_stage_params::<true, false, Target, _, _, _, _, _, _, _, _>(
                 &mut local,
                 &NoOps,
                 LxBuffering::Double,
@@ -15786,7 +16095,7 @@ mod tests_e283_e295 {
                 &Orgs(BTreeMap::new()),
                 &Transfers(Vec::new()),
                 &Tree::default(),
-                &mut v1::AllocArena::new(),
+                &Sites::default(),
                 &mut Trackers,
                 &Placement,
             ),
@@ -15837,7 +16146,7 @@ mod tests_e283_e295 {
             }],
         );
         assert_eq!(
-            set_chunk_data_stage_params::<true, false, Target, _, _, _, _, _, _, _>(
+            set_chunk_data_stage_params::<true, false, Target, _, _, _, _, _, _, _, _>(
                 &mut both,
                 &NoOps,
                 LxBuffering::Double,
@@ -15847,7 +16156,7 @@ mod tests_e283_e295 {
                 &Orgs(BTreeMap::new()),
                 &Transfers(Vec::new()),
                 &Tree::default(),
-                &mut v1::AllocArena::new(),
+                &Sites::default(),
                 &mut Trackers,
                 &Placement,
             ),
@@ -16629,18 +16938,20 @@ where
             let hbm = entry.pinning().hbm();
             let states_lx = entry.pinning().mem_org.contains_key(&SenComponent::Lx);
             if (hbm && !(index && !states_lx)) || entry.pinning().lx {
-                let mut node = sites.allocation(dsc_idx, lds, SenComponent::Lx)?;
-                fill_final_start_address_and_offset(
-                    dsc,
-                    lds,
-                    mem,
-                    core_stage,
-                    chunk_stage,
-                    &corelet_split_dims,
-                    coords,
-                    &mut node,
-                )?;
-                sites.set_allocation(dsc_idx, lds, SenComponent::Lx, node);
+                // ⛔ BOTH LAYERS ARE REFUSALS HERE, unlike entry 220's skip: an lds whose LX
+                // allocation `memOrg_` does not name is the reference's own `.at()` throw.
+                sites.place_allocation(dsc_idx, lds, SenComponent::Lx, &mut |node| {
+                    fill_final_start_address_and_offset(
+                        dsc,
+                        lds,
+                        mem,
+                        core_stage,
+                        chunk_stage,
+                        &corelet_split_dims,
+                        coords,
+                        node,
+                    )
+                })??;
             }
             if hbm && index {
                 fill_ibr_start_address_and_offset(dsc, dsc_idx, lds, mem, coords, sites)?;
@@ -16694,7 +17005,7 @@ pub fn set_lx_buffer_type<A: Arch, T: ScheduleTrees + ?Sized>(
 /// ⛔ [`None`] IS *"Memory allocation must be valid to commit."*, *"Expect a valid parent node."* and
 /// entries 016's and 222's own refusals. ⚠️ TRAP, AS IN ENTRY 226: the allocate and transfer names
 /// spell the RECORDED `ldsIdx_` while the sync names spell the POSITION handed in.
-pub fn create_store_index_tensor_to_lx<T, M, P>(
+pub fn create_store_index_tensor_to_lx<T, R, M, P>(
     tree: &mut T,
     dsc: &DesignSpaceConfig,
     metadata: &mut BTreeMap<DscIdx, DscMetadata>,
@@ -16704,12 +17015,13 @@ pub fn create_store_index_tensor_to_lx<T, M, P>(
     index_hbm_node: NodeId,
     paged_lx: AllocId,
     new_chunk_loop: LoopId,
-    allocs: &mut v1::AllocArena,
+    sites: &R,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
 where
     T: L3TreeSurgery + ?Sized,
+    R: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -16737,30 +17049,13 @@ where
     tree.parent(index_hbm_node)?;
     tree.add_child_node(allocate, InsertionPoint::After(index_hbm_node));
 
-    let sufficient = alloc_all_mem(
-        dsc,
-        metadata,
-        dsc_idx,
-        allocs,
-        trackers,
-        placement,
-        v1::Commit::No,
-    )?;
+    let sufficient = probe_all_mem(dsc, metadata, dsc_idx, sites, trackers, placement)?;
     if !sufficient {
         tree.set_buffering(alloc, Buffering::Double);
         let above = tree.parent(new_chunk_loop.0)?;
         tree.move_node(allocate, InsertionPoint::FirstIn(above));
         // "Memory allocation must be valid to commit."
-        alloc_all_mem(
-            dsc,
-            metadata,
-            dsc_idx,
-            allocs,
-            trackers,
-            placement,
-            v1::Commit::No,
-        )?
-        .then_some(())?;
+        probe_all_mem(dsc, metadata, dsc_idx, sites, trackers, placement)?.then_some(())?;
     }
 
     let transfer = tree.new_transfer(create_transfer_node(
@@ -16997,7 +17292,15 @@ fn write_super_chunk_extents(
 /// set of SuperChunk parameters must be found."*, the non-exploring path's `DT_CHECK` on the two
 /// loops above the lx_below block, a null `lxBelowBlockNode`, an empty `dims_`, entries 222's and
 /// 283's — and a non-positive chunk extent, whose `-=` HANGS the reference.
-pub fn explore_super_chunk_data_stage_params<const EXPLORE: bool, const EPILOGUE: bool, R, O, M, P>(
+pub fn explore_super_chunk_data_stage_params<
+    const EXPLORE: bool,
+    const EPILOGUE: bool,
+    R,
+    O,
+    S,
+    M,
+    P,
+>(
     dsc: &mut DesignSpaceConfig,
     dsc_idx: DscIdx,
     super_chunk: SuperChunkStage,
@@ -17005,13 +17308,14 @@ pub fn explore_super_chunk_data_stage_params<const EXPLORE: bool, const EPILOGUE
     nesting: &R,
     orgs: &O,
     metadata: &BTreeMap<DscIdx, DscMetadata>,
-    allocs: &mut v1::AllocArena,
+    sites: &S,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
 where
     R: DscTrees + ?Sized,
     O: MemOrgs + ?Sized,
+    S: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -17036,8 +17340,7 @@ where
             if core > held.0 && is_multiple_of(core, held.0)? {
                 let doubled = Extent(held.0 * 2);
                 write_super_chunk_extents(dsc, super_chunk, &[(dim, doubled, doubled)], false)?;
-                if alloc_all_mem(dsc, metadata, dsc_idx, allocs, trackers, placement, v1::Commit::No)?
-                {
+                if probe_all_mem(dsc, metadata, dsc_idx, sites, trackers, placement)? {
                     break;
                 }
                 write_super_chunk_extents(dsc, super_chunk, &[(dim, held, held)], false)?;
@@ -17083,7 +17386,7 @@ where
         maxima.push((dim, Extent(ss), Extent(el)));
     }
     write_super_chunk_extents(dsc, super_chunk, &maxima, true)?;
-    if alloc_all_mem(dsc, metadata, dsc_idx, allocs, trackers, placement, v1::Commit::No)? {
+    if probe_all_mem(dsc, metadata, dsc_idx, sites, trackers, placement)? {
         return Some(());
     }
 
@@ -17110,7 +17413,7 @@ where
                 continue;
             }
             write_super_chunk_extents(dsc, super_chunk, &[(dim, Extent(ss), Extent(el))], true)?;
-            if alloc_all_mem(dsc, metadata, dsc_idx, allocs, trackers, placement, v1::Commit::No)? {
+            if probe_all_mem(dsc, metadata, dsc_idx, sites, trackers, placement)? {
                 return Some(());
             }
         }
@@ -19004,7 +19307,7 @@ pub struct PagedTensorSite {
 /// node."*, *"Support only one stick dimension for now."*, *"Expect index stick dim to be innermost
 /// in chunk loop order"*, *"Expect the new chunk loop for the current dimension."* and entries 226,
 /// 227 and 294's own refusals.
-pub fn process_paged_tensor_transfers<T, M, P>(
+pub fn process_paged_tensor_transfers<T, R, M, P>(
     tree: &mut T,
     core: &CoreWindowDims,
     dsc: &DesignSpaceConfig,
@@ -19016,12 +19319,13 @@ pub fn process_paged_tensor_transfers<T, M, P>(
     inner_index_dim_in_chunk_loops: PrimaryDim,
     one_page: OnePageStage,
     super_chunk: Option<SuperChunkStage>,
-    allocs: &mut v1::AllocArena,
+    sites: &R,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
 where
     T: L3TreeSurgery + ?Sized,
+    R: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -19070,7 +19374,7 @@ where
                     index.node,
                     site.lx?,
                     new_chunk_loop,
-                    allocs,
+                    sites,
                     trackers,
                     placement,
                 )?;
@@ -19133,20 +19437,29 @@ pub fn min_param_conv2d<D: ComputeOps + ?Sized>(
 ///
 /// ⛔ [`None`] IS entries 331's and 283's refusals. The `lxBufferType` test is [`LxBuffering`]'s own
 /// arm, and `dscs_.at(dscIdx)` cannot miss for an index this walk itself produced.
-pub fn set_super_chunk_data_stage_params<const EXPLORE: bool, const EPILOGUE: bool, R, O, M, P>(
+pub fn set_super_chunk_data_stage_params<
+    const EXPLORE: bool,
+    const EPILOGUE: bool,
+    R,
+    O,
+    S,
+    M,
+    P,
+>(
     sdsc: &mut SuperDsc,
     buffering: LxBuffering,
     ibr: Option<IbrStage>,
     nesting: &R,
     orgs: &O,
     metadata: &BTreeMap<DscIdx, DscMetadata>,
-    allocs: &mut v1::AllocArena,
+    sites: &S,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
 where
     R: DscTrees + ?Sized,
     O: MemOrgs + ?Sized,
+    S: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -19156,8 +19469,8 @@ where
     for dsc_idx in dsc_indices(sdsc) {
         let dsc = sdsc.dscs_mut().at_mut(dsc_idx)?;
         add_super_chunk_data_stage(dsc, super_chunk);
-        explore_super_chunk_data_stage_params::<EXPLORE, EPILOGUE, _, _, _, _>(
-            dsc, dsc_idx, super_chunk, ibr, nesting, orgs, metadata, allocs, trackers, placement,
+        explore_super_chunk_data_stage_params::<EXPLORE, EPILOGUE, _, _, _, _, _>(
+            dsc, dsc_idx, super_chunk, ibr, nesting, orgs, metadata, sites, trackers, placement,
         )?;
         write_super_chunk_extents(dsc, super_chunk, &[], true)?;
     }
@@ -19499,7 +19812,7 @@ where
 /// ⛔ [`None`] IS *"Only support one dimension in a chunk loop node for now."*, the `DT_CHECK` that
 /// SOME chunk loop carries a paged dim — which is also *"Expect valid schedule tree."*, since an empty
 /// tree reaches it with no candidate at all — and entries 225's and 336's own refusals.
-pub fn process_dsc_hbm_paged_tensors<T, O, M, P>(
+pub fn process_dsc_hbm_paged_tensors<T, O, R, M, P>(
     tree: &mut T,
     core: &CoreWindowDims,
     dsc: &DesignSpaceConfig,
@@ -19509,13 +19822,14 @@ pub fn process_dsc_hbm_paged_tensors<T, O, M, P>(
     lx_buffer: LxBufferType,
     ibr: IbrStage,
     one_page: OnePageStage,
-    allocs: &mut v1::AllocArena,
+    sites: &R,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
 where
     T: L3TreeSurgery + ?Sized,
     O: MemOrgs,
+    R: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -19600,7 +19914,7 @@ where
         inner_index_dim,
         one_page,
         super_chunk,
-        allocs,
+        sites,
         trackers,
         placement,
     )
@@ -19712,17 +20026,18 @@ pub trait SysFlopsPerByte {
 /// ⛔ `Some(false)` IS THE REFERENCE'S `break`: the DSCs BEFORE the one that did not fit KEEP the
 /// chunk stage this trial wrote, which is why both callers re-run this block over the selection they
 /// settle on. [`None`] is a refusal of the write or of the probe itself.
-fn write_trial_chunk_stages<const CARRY_UNNEEDED_PAD: bool, M, P>(
+fn write_trial_chunk_stages<const CARRY_UNNEEDED_PAD: bool, R, M, P>(
     sdsc: &mut SuperDsc,
     selected: &SelectedDscCandidates,
     buffering: LxBuffering,
     check_lx: bool,
     metadata: &BTreeMap<DscIdx, DscMetadata>,
-    allocs: &mut v1::AllocArena,
+    sites: &R,
     trackers: &mut M,
     placement: &P,
 ) -> Option<bool>
 where
+    R: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -19739,15 +20054,7 @@ where
             buffering,
         )?;
         if check_lx
-            && !alloc_all_mem(
-                sdsc.dscs().at(at)?,
-                metadata,
-                at,
-                allocs,
-                trackers,
-                placement,
-                v1::Commit::No,
-            )?
+            && !probe_all_mem(sdsc.dscs().at(at)?, metadata, at, sites, trackers, placement)?
         {
             return Some(false);
         }
@@ -19770,7 +20077,7 @@ where
 /// `getLabeledDsNumOfStickVolumesInCore` (`:1694`), which never reads it, whereas
 /// `getChunkParamsFromCandidates` (`:1423`) DOES iterate it — there it is absorbed, because
 /// `generateDscParamCandidates` (`:1180`) mints one entry per element, so the keyset IS `primaryDims`.
-pub fn find_best_params_for_memory_bandwidth<const CARRY_UNNEEDED_PAD: bool, O, T, S, M, P>(
+pub fn find_best_params_for_memory_bandwidth<const CARRY_UNNEEDED_PAD: bool, O, T, S, Sites, M, P>(
     selected: &mut SelectedDscCandidates,
     sdsc: &mut SuperDsc,
     core_split_dims: &BTreeSet<PrimaryDim>,
@@ -19780,7 +20087,7 @@ pub fn find_best_params_for_memory_bandwidth<const CARRY_UNNEEDED_PAD: bool, O, 
     orgs: &O,
     trees: &T,
     nesting: &S,
-    allocs: &mut v1::AllocArena,
+    sites: &Sites,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
@@ -19788,6 +20095,7 @@ where
     O: MemOrgs + ?Sized,
     T: TransferNodes + ?Sized,
     S: DscLoopStages + DscTrees + ?Sized,
+    Sites: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -19798,8 +20106,8 @@ where
     // For input-neighbour fetch enough space in LX is already reserved.
     let check_lx = !input_neighbor_fetch;
     // "Expect valid chunk size that fits in LX."
-    write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
-        sdsc, selected, buffering, check_lx, metadata, allocs, trackers, placement,
+    write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _, _>(
+        sdsc, selected, buffering, check_lx, metadata, sites, trackers, placement,
     )?
     .then_some(())?;
     // "Expect positive efficiency value."
@@ -19856,8 +20164,8 @@ where
         }
         let mut best_trial: Option<SelectedDscCandidates> = None;
         for trial in trials {
-            let fitted = write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
-                sdsc, &trial, buffering, check_lx, metadata, allocs, trackers, placement,
+            let fitted = write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _, _>(
+                sdsc, &trial, buffering, check_lx, metadata, sites, trackers, placement,
             )?;
             let efficiency = if fitted {
                 calculate_burst_efficiency(sdsc, orgs, trees, nesting)?
@@ -19876,8 +20184,8 @@ where
 
     // "Expect valid chunk size that fits in LX." — and the one write of the settled selection that
     // every DSC keeps.
-    write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
-        sdsc, selected, buffering, check_lx, metadata, allocs, trackers, placement,
+    write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _, _>(
+        sdsc, selected, buffering, check_lx, metadata, sites, trackers, placement,
     )?
     .then_some(())
 }
@@ -19915,6 +20223,7 @@ pub fn find_best_params_for_arithmetic_intensity<
     O,
     T,
     S,
+    Sites,
     M,
     P,
 >(
@@ -19929,7 +20238,7 @@ pub fn find_best_params_for_arithmetic_intensity<
     orgs: &O,
     trees: &T,
     nesting: &S,
-    allocs: &mut v1::AllocArena,
+    sites: &Sites,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
@@ -19939,6 +20248,7 @@ where
     O: MemOrgs + ?Sized,
     T: TransferNodes + ?Sized,
     S: DscLoopStages + DscTrees + ?Sized,
+    Sites: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -19960,8 +20270,8 @@ where
     let whole = u64::from(A::CORELETS_PER_CORE) * u64::from(A::CORES);
     let system = sys.sys_flops_per_byte(op_func_data_format(ops)).0 * used as f64 / whole as f64;
     // "Expect valid chunk size that fits in LX."
-    write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
-        sdsc, selected, buffering, true, metadata, allocs, trackers, placement,
+    write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _, _>(
+        sdsc, selected, buffering, true, metadata, sites, trackers, placement,
     )?
     .then_some(())?;
     let mut best = calculate_flop_per_byte(sdsc, primary_dims, orgs, trees, nesting)?;
@@ -20006,8 +20316,8 @@ where
         }
         let mut best_trial: Option<SelectedDscCandidates> = None;
         for trial in trials {
-            let fitted = write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
-                sdsc, &trial, buffering, true, metadata, allocs, trackers, placement,
+            let fitted = write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _, _>(
+                sdsc, &trial, buffering, true, metadata, sites, trackers, placement,
             )?;
             let flop_per_byte = if fitted {
                 calculate_flop_per_byte(sdsc, primary_dims, orgs, trees, nesting)?
@@ -20027,8 +20337,8 @@ where
     }
 
     // "Expect valid chunk size that fits in LX." — and the one write every DSC keeps.
-    write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
-        sdsc, selected, buffering, true, metadata, allocs, trackers, placement,
+    write_trial_chunk_stages::<CARRY_UNNEEDED_PAD, _, _, _>(
+        sdsc, selected, buffering, true, metadata, sites, trackers, placement,
     )?
     .then_some(())
 }
@@ -20047,7 +20357,13 @@ pub trait DscPagedTrees {
 ///
 /// PUTS THE PAGED LOOP NEST INTO EVERY DSC'S TREE — entry 354 over each DSC of the group in turn,
 /// each against its own core window dims.
-pub fn process_hbm_paged_tensors<E, O, M, P>(
+/// ⛔⛔ `sites` IS NOT `trees` AND CANNOT BE: [`DscPagedTrees::tree_mut`] holds an EXCLUSIVE borrow of
+/// its carrier for as long as the tree it hands out lives, and entry 294's LX probe reads the
+/// allocate nodes underneath it — so the two must arrive as separate arguments, which is why the
+/// probe takes [`AllocationReads`] SHARED rather than the write seam. Both may still be views of ONE
+/// state (`stages::Reads` and `stages::Env` are), which is what keeps this from being a second
+/// projection.
+pub fn process_hbm_paged_tensors<E, O, R, M, P>(
     sdsc: &SuperDsc,
     trees: &mut E,
     metadata: &mut BTreeMap<DscIdx, DscMetadata>,
@@ -20055,13 +20371,14 @@ pub fn process_hbm_paged_tensors<E, O, M, P>(
     lx_buffer: LxBufferType,
     ibr: IbrStage,
     one_page: OnePageStage,
-    allocs: &mut v1::AllocArena,
+    sites: &R,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
 where
     E: DscPagedTrees + ?Sized,
     O: MemOrgs,
+    R: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -20077,7 +20394,7 @@ where
             lx_buffer,
             ibr,
             one_page,
-            allocs,
+            sites,
             trackers,
             placement,
         )?;
@@ -20479,18 +20796,19 @@ fn explored_primary_dims() -> Vec<PrimaryDim> {
 /// ⛔ [`None`] IS THE PROBE THAT DID NOT FIT, which is entry 380's *"Unable to map graph within
 /// architecture constraints"* before the searches and its *"Memory allocation must be valid to
 /// commit."* after them, plus every refusal entry 352 or 222 makes.
-fn write_selected_chunk_stages<const CARRY_UNNEEDED_PAD: bool, M, P>(
+fn write_selected_chunk_stages<const CARRY_UNNEEDED_PAD: bool, R, M, P>(
     sdsc: &mut SuperDsc,
     chunk_params: &mut [FilledDims],
     selected: &SelectedDscCandidates,
     buffering: LxBuffering,
     check_lx: bool,
     metadata: &BTreeMap<DscIdx, DscMetadata>,
-    allocs: &mut v1::AllocArena,
+    sites: &R,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
 where
+    R: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -20503,16 +20821,8 @@ where
             buffering,
         )?;
         if check_lx {
-            alloc_all_mem(
-                sdsc.dscs().at(at)?,
-                metadata,
-                at,
-                allocs,
-                trackers,
-                placement,
-                v1::Commit::No,
-            )?
-            .then_some(())?;
+            probe_all_mem(sdsc.dscs().at(at)?, metadata, at, sites, trackers, placement)?
+                .then_some(())?;
         }
     }
     Some(())
@@ -20546,6 +20856,7 @@ pub fn set_chunk_data_stage_params<
     O,
     T,
     S,
+    Sites,
     M,
     P,
 >(
@@ -20558,7 +20869,7 @@ pub fn set_chunk_data_stage_params<
     orgs: &O,
     trees: &T,
     nesting: &S,
-    allocs: &mut v1::AllocArena,
+    sites: &Sites,
     trackers: &mut M,
     placement: &P,
 ) -> Option<()>
@@ -20568,6 +20879,7 @@ where
     O: MemOrgs,
     T: TransferNodes + ?Sized,
     S: DscLoopStages + DscTrees + ?Sized,
+    Sites: AllocationReads + ?Sized,
     M: ExPhaseTrackers + ?Sized,
     P: L3Placement,
 {
@@ -20620,20 +20932,20 @@ where
 
     // The initial selection is stated first, and under double buffering the chunks it names must
     // already fit in LX.
-    write_selected_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
+    write_selected_chunk_stages::<CARRY_UNNEEDED_PAD, _, _, _>(
         sdsc,
         &mut chunk_params,
         &selected,
         buffering,
         double_buffering,
         metadata,
-        allocs,
+        sites,
         trackers,
         placement,
     )?;
 
     if CHUNK_EXPLORE {
-        find_best_params_for_memory_bandwidth::<CARRY_UNNEEDED_PAD, _, _, _, _, _>(
+        find_best_params_for_memory_bandwidth::<CARRY_UNNEEDED_PAD, _, _, _, _, _, _>(
             &mut selected,
             sdsc,
             &core_split_dims,
@@ -20643,13 +20955,24 @@ where
             orgs,
             trees,
             nesting,
-            allocs,
+            sites,
             trackers,
             placement,
         )?;
         // Only tensor reuse carried over HBM transfers has a Flops/Byte to trade against.
         if is_reuse && !input_neighbor_fetch {
-            find_best_params_for_arithmetic_intensity::<CARRY_UNNEEDED_PAD, A, _, _, _, _, _, _, _>(
+            find_best_params_for_arithmetic_intensity::<
+                CARRY_UNNEEDED_PAD,
+                A,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+            >(
                 &mut selected,
                 sdsc,
                 ops,
@@ -20661,7 +20984,7 @@ where
                 orgs,
                 trees,
                 nesting,
-                allocs,
+                sites,
                 trackers,
                 placement,
             )?;
@@ -20669,14 +20992,14 @@ where
     }
 
     // The settled selection, stated on every DSC — "Memory allocation must be valid to commit."
-    write_selected_chunk_stages::<CARRY_UNNEEDED_PAD, _, _>(
+    write_selected_chunk_stages::<CARRY_UNNEEDED_PAD, _, _, _>(
         sdsc,
         &mut chunk_params,
         &selected,
         buffering,
         true,
         metadata,
-        allocs,
+        sites,
         trackers,
         placement,
     )
@@ -20727,14 +21050,24 @@ pub struct L3RunInputs<'a, F, P> {
     pub coords: &'a AddressFoldCoords,
 }
 
-/// WHERE ENTRY 382 WRITES — the five mutable carriers the stage's steps take, held TOGETHER because
-/// three of them go to a single callee at once and separate accessors could not borrow all three.
+/// WHERE ENTRY 382 WRITES — the five carriers the stage's steps take, held TOGETHER because three of
+/// them go to a single callee at once and separate accessors could not borrow all three.
 pub struct L3RunSurgery<'a, E: ?Sized, M: ?Sized, K: ?Sized, S: ?Sized> {
     /// The schedule-tree surgery, the transfer writes and the allocation sites — ONE carrier because
-    /// it is the reference's one `this`.
+    /// it is the reference's one `this`, and every LX placement now lands on it via
+    /// [`AllocationSites`] rather than in a map of its own.
     pub env: &'a mut E,
-    /// The allocate nodes every committed LX allocation is written into.
-    pub allocs: &'a mut v1::AllocArena,
+    /// ⛔⛔ WHAT IS LEFT OF THE PORT'S ALLOCATE-NODE ARENA, AND IT IS SHARED BECAUSE NOTHING WRITES
+    /// IT. Entries 222/292/219/220 now read and write `memOrg_.at(storage).allocateNode_` through
+    /// [`AllocationSites`] on `env`, which is the ONE map the reference has. The single reader left is
+    /// entry 333 ([`L3OffsetInputs::allocs`]), whose reference side is `di.myLdsIdx_ >= 0 ?
+    /// labeledDs_.at(lds).memOrg_.at(storage).allocateNode_ : constantInfo_.at(constantId_)
+    /// .allocations_.at(storage)` (`L3DlOpsScheduler.cpp:5810-5814`) — TWO maps conflated into this
+    /// one, of which the second (`constantInfo_.allocations_`) has no seam yet. It is unreachable in
+    /// stage 2a: `stages::Reads::offset_sizes` refuses before entry 333 is entered, so this arena is
+    /// read by nothing that runs. ⚠️ DO NOT WRITE PLACEMENTS HERE — that is the split this commit
+    /// removed.
+    pub allocs: &'a v1::AllocArena,
     /// `memTrackers` — where entry 222 places each allocation, per execution phase.
     pub trackers: &'a mut M,
     /// Where entry 333's `DataInfo` fills land.
@@ -20774,6 +21107,8 @@ pub fn run<const CHUNK_EXPLORE: bool, A, F, P, E, M, K, S>(
 ) -> Option<()>
 where
     A: Arch,
+    // ⭐ `AllocationReads` SITS ON THE **READ** CARRIER because entry 222's probe only reads the
+    // allocate nodes, and the paged chain probes with `surgery.env` exclusively borrowed for its tree.
     F: MemOrgs
         + TransferNodes
         + ScheduleTrees
@@ -20782,6 +21117,7 @@ where
         + DscTrees
         + SysFlopsPerByte
         + ComputeOps
+        + AllocationReads
         + DscOffsetFacts,
     P: L3Placement,
     E: DscL3Surgery
@@ -20869,7 +21205,7 @@ where
 
     // ⭐ THE OTHER THREE FILE STATICS ARE LITERALS: `carryUnneededPadToChunk` (`:48`),
     // `enableSuperChunkExplore` (`:51`) and `enableSuperChunkEpilogue` (`:54`) are never written.
-    set_chunk_data_stage_params::<CHUNK_EXPLORE, true, A, _, _, _, _, _, _, _>(
+    set_chunk_data_stage_params::<CHUNK_EXPLORE, true, A, _, _, _, _, _, _, _, _>(
         sdsc,
         inputs.reads,
         buffering,
@@ -20882,18 +21218,18 @@ where
         inputs.reads,
         inputs.reads,
         inputs.reads,
-        &mut *surgery.allocs,
+        inputs.reads,
         &mut *surgery.trackers,
         inputs.placement,
     )?;
-    set_super_chunk_data_stage_params::<true, false, _, _, _, _>(
+    set_super_chunk_data_stage_params::<true, false, _, _, _, _, _>(
         sdsc,
         buffering,
         minted.map(|(_, ibr)| ibr),
         inputs.reads,
         inputs.reads,
         &metadata,
-        &mut *surgery.allocs,
+        inputs.reads,
         &mut *surgery.trackers,
         inputs.placement,
     )?;
@@ -20922,7 +21258,7 @@ where
             lx_buffer,
             ibr,
             one_page,
-            &mut *surgery.allocs,
+            inputs.reads,
             &mut *surgery.trackers,
             inputs.placement,
         )?;
@@ -20930,14 +21266,15 @@ where
 
     for dsc_idx in dsc_indices(sdsc) {
         // "Memory allocation must be valid to commit." — after this point nothing allocates LX.
+        // ⭐⭐ THE ONE COMMITTING CALL OF THE WHOLE STAGE, and it goes through `env`: this is where
+        // every LX start address and buffer offset is WRITTEN onto `memOrg_.allocateNode_`.
         alloc_all_mem(
             sdsc.dscs().at(dsc_idx)?,
             &metadata,
             dsc_idx,
-            &mut *surgery.allocs,
+            &mut *surgery.env,
             &mut *surgery.trackers,
             inputs.placement,
-            v1::Commit::IfValid,
         )?
         .then_some(())?;
     }
@@ -21200,5 +21537,81 @@ mod unit_tests {
         }
         assert!(!is_op_func_conv2d_os1(Some(OpFunc::Conv2DFwd)));
         assert!(!is_op_func_conv2d_os1(None));
+    }
+
+    /// ⭐⭐ THE TWO QUOTIENT CELLS OF [`BURST_EFFICIENCY`] CARRY THE `.def`'s OWN VALUE, TO THE BIT.
+    ///
+    /// ⛔ NOT A TAUTOLOGY, AND THE EXPECTATION IS NOT RE-DERIVED: the two strings below are the
+    /// `.def`'s own spelling of those cells (`dcg/dcg_fe/scheduler/BurstEfficiency.def`, row 10
+    /// column 15 and row 18 column 4 counting from one), and what is compared is the double THE
+    /// COMPILER WOULD HAVE PARSED FROM THAT TEXT against the double the quotient in the table
+    /// evaluates to. A formula-derived expectation would only prove the formula equals itself.
+    ///
+    /// ⛔ AND `to_bits` RATHER THAN `==`, because this is the whole claim: the rewrite is legal only
+    /// if it changed no bit of IBM's data. `assert_eq!` on `f64` would pass for two values that are
+    /// merely close, which is exactly the mistake `clippy::approx_constant` was asking for.
+    #[test]
+    fn the_two_quotient_cells_are_bit_identical_to_the_def_literals() {
+        // `.def` row 10 (burst 10), column 15 (multicast degree 15) — the `FRAC_1_PI` false alarm.
+        let from_def: f64 = "0.3180".parse().expect("the `.def`'s own spelling");
+        assert_eq!(
+            BURST_EFFICIENCY[9][14].to_bits(),
+            from_def.to_bits(),
+            "`636.0 / 2000.0` must be the SAME DOUBLE as the `.def`'s `0.3180`, not FRAC_1_PI \
+             ({:?})",
+            std::f64::consts::FRAC_1_PI
+        );
+        // `.def` row 18 (burst 18), column 4 — the `FRAC_PI_6` false alarm.
+        let from_def: f64 = "0.5235".parse().expect("the `.def`'s own spelling");
+        assert_eq!(
+            BURST_EFFICIENCY[17][3].to_bits(),
+            from_def.to_bits(),
+            "`1047.0 / 2000.0` must be the SAME DOUBLE as the `.def`'s `0.5235`, not FRAC_PI_6 \
+             ({:?})",
+            std::f64::consts::FRAC_PI_6
+        );
+        // ⛔ AND NEITHER IS THE CONSTANT CLIPPY OFFERED — the lint's advice would have moved the
+        // value, which is why the quotient spelling exists at all.
+        assert_ne!(
+            BURST_EFFICIENCY[9][14].to_bits(),
+            std::f64::consts::FRAC_1_PI.to_bits()
+        );
+        assert_ne!(
+            BURST_EFFICIENCY[17][3].to_bits(),
+            std::f64::consts::FRAC_PI_6.to_bits()
+        );
+    }
+
+    /// ⭐ EVERY ENTRY OF [`BURST_EFFICIENCY`] LIES ON THE `.def`'s INTEGER LATTICE — `(200 +
+    /// 50·(burst-1) − (degree-1)) / 2000`, bit for bit, all 1024 of them.
+    ///
+    /// ⛔ WHAT THIS DOES AND DOES NOT PROVE. For the 1022 cells still spelled as literals it is a
+    /// real check of the transcription against the lattice the `.def` is generated on — a mistyped
+    /// digit anywhere fails it. For the TWO quotient cells it is a tautology by construction, and
+    /// their own non-tautological check is
+    /// `the_two_quotient_cells_are_bit_identical_to_the_def_literals` above.
+    ///
+    /// ⛔ THE INTEGER FORM IS THE ONLY ONE THAT HOLDS: the float closed form `0.1 + r*0.025 -
+    /// c*0.0005` is bit-different in 360 of these 1024 entries, so this test would FAIL against it.
+    /// That is why the table is transcribed rather than computed.
+    #[test]
+    fn every_burst_efficiency_entry_is_an_exact_integer_quotient_over_two_thousand() {
+        for (row, entries) in BURST_EFFICIENCY.iter().enumerate() {
+            for (column, &entry) in entries.iter().enumerate() {
+                let burst = i32::try_from(row).expect("32 rows");
+                let degree = i32::try_from(column).expect("32 columns");
+                let numerator = 200 + 50 * burst - degree;
+                let lattice = f64::from(numerator) / 2000.0;
+                assert_eq!(
+                    entry.to_bits(),
+                    lattice.to_bits(),
+                    "burst {} degree {} is {entry:?}, off the lattice value {numerator}/2000 = \
+                     {lattice:?} — an off-lattice cell is a finding about the `.def`, not something \
+                     to round",
+                    row + 1,
+                    column + 1
+                );
+            }
+        }
     }
 }

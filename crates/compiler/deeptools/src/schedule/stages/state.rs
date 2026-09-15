@@ -46,12 +46,9 @@ const ROOT_BLOCK_NAME: &str = "root_level_operations";
 pub struct DscTree {
     tree: RefCell<TreeData>,
     /// `labeledDs_`'s organisations, POSITIONALLY beside
-    /// [`crate::schedule::l3::dsc::LabeledDsList::indexed`].
+    /// [`crate::schedule::l3::dsc::LabeledDsList::indexed`] — AND THE ONLY PLACE AN ALLOCATE NODE'S
+    /// ddc VIEW LIVES, see [`Self::placed`].
     orgs: Vec<Org>,
-    /// The ddc view of every allocate node this tree holds, by node id — what
-    /// [`crate::schedule::l3::dl_ops::AllocationSites`] places into and what
-    /// [`crate::schedule::l3::dsc::ScheduleTrees::allocations`] reads the address off.
-    placed: RefCell<BTreeMap<NodeId, AllocateNode>>,
 }
 
 impl DscTree {
@@ -88,21 +85,38 @@ impl DscTree {
     }
 
     /// The ddc view of the allocate node at that id.
+    ///
+    /// ⛔⛔ A PROJECTION OF ONE `memOrg_` ENTRY, NOT A MAP OF ITS OWN — AND THAT IS THE WHOLE FIX.
+    /// The reference holds ONE `dsc2::AllocateNode *` per `labeledDs_.at(lds).memOrg_.at(storage)`
+    /// (`L3DlOpsScheduler.cpp:1585`, `:5811`, and thirty more), and this tree used to keep a SECOND
+    /// map of the same nodes keyed by [`NodeId`] beside [`Org`]'s own. Entry 353's mint wrote only
+    /// this one and [`crate::schedule::l3::dl_ops::AllocationSites::allocation`] read only the
+    /// other, so every freshly minted LX allocation was invisible to the stage that places it —
+    /// stage 2a stopped there for all 24,363 programs. One cell cannot disagree with itself.
     pub(super) fn placed(&self, node: NodeId) -> Option<AllocateNode> {
-        self.placed.borrow().get(&node).cloned()
+        let (lds, storage) = self.home_of(node)?;
+        self.org(lds)?.placed(storage)
     }
 
-    /// The same, written back.
+    /// The same, written back — into that one `memOrg_` entry.
     pub(super) fn set_placed(&self, node: NodeId, held: AllocateNode) {
-        self.placed.borrow_mut().insert(node, held);
+        let Some((lds, storage)) = self.home_of(node) else {
+            return;
+        };
+        if let Some(org) = self.org(lds) {
+            org.set_placed(storage, held);
+        }
     }
 
-    /// Every placed node, for one read.
+    /// Every placed node, for one read, gathered BY IDENTITY out of the organisations that hold
+    /// them — the shape [`crate::schedule::stages::tree::TreeData::allocations`] walks.
     pub(super) fn with_placed<T>(
         &self,
         ask: impl FnOnce(&BTreeMap<NodeId, AllocateNode>) -> T,
     ) -> T {
-        ask(&self.placed.borrow())
+        let placed: BTreeMap<NodeId, AllocateNode> =
+            self.orgs.iter().flat_map(Org::placed_nodes).collect();
+        ask(&placed)
     }
 
     /// HOW MANY NODES THIS DSC'S TREE HOLDS — what a caller measuring stage 2a's effect counts.
@@ -333,6 +347,5 @@ fn seed_dsc(dsc: &DesignSpaceConfig) -> DscTree {
     DscTree {
         tree: RefCell::new(tree),
         orgs,
-        placed: RefCell::new(BTreeMap::new()),
     }
 }

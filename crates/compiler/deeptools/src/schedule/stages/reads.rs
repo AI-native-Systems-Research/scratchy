@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! ⭐⭐ THE READ CARRIER — `F` in [`crate::schedule::l3::dl_ops::run`], which is nine traits:
+//! ⭐⭐ THE READ CARRIER — `F` in [`crate::schedule::l3::dl_ops::run`], which is ten traits:
 //! `MemOrgs`, `TransferNodes`, `ScheduleTrees`, `DscStages`, `DscLoopStages`, `DscTrees`,
-//! `SysFlopsPerByte`, `ComputeOps` and `DscOffsetFacts`.
+//! `SysFlopsPerByte`, `ComputeOps`, `AllocationReads` and `DscOffsetFacts`.
 //!
 //! ⭐ IT HOLDS THE SAME `&'s DscState` [`super::Env`] DOES, which is the whole point: entries
 //! 289/295/332 read the tree through `reads` while 290/353/368 write it through `env`, and they name
 //! ONE tree.
+//!
+//! ⭐⭐ AND THAT IS WHY [`AllocationReads`] IS HERE AS WELL AS ON `Env`: entry 222's PROBE only reads
+//! `memOrg_.at(storage).allocateNode_`, and the paged chain (entries 368/354/336/294) probes with
+//! `env` exclusively borrowed for the tree it is rewriting — so the probe reads the allocate nodes
+//! through THIS carrier, which is the same cell `Env`'s write seam places into.
 //!
 //! ⛔⛔ WHAT THIS CARRIER CANNOT SEE, AND WHY. `run` takes `sdsc: &mut SuperDsc` AND
 //! `inputs: &L3RunInputs<'_, F, P>`, so `F` may not alias the super-DSC — every fact that lives in
@@ -21,7 +26,8 @@ use crate::schedule::ddc::transformation_util::PaddingForm;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::LdsIdx;
 use crate::schedule::l3::dl_ops::{
-    DscLoopStages, DscOffsetFacts, DscStages, FlopPerByte, OpFuncDataFormat, SysFlopsPerByte,
+    AllocationReads, AllocationView, DscLoopStages, DscOffsetFacts, DscStages, FlopPerByte,
+    OpFuncDataFormat, SysFlopsPerByte,
 };
 use crate::schedule::l3::dsc::{
     DimStage, DscIdx, L3Transfer, MemOrgs, PlacedAllocation, ScheduleTrees, TransferNodes,
@@ -75,6 +81,17 @@ impl TransferNodes for Reads<'_> {
         self.dsc(dsc)
             .map(|held| held.with(TreeData::transfers))
             .unwrap_or_default()
+    }
+}
+
+impl AllocationReads for Reads<'_> {
+    fn allocation(
+        &self,
+        dsc: DscIdx,
+        lds: LdsIdx,
+        storage: sys_arch_spec::arch_enums::SenComponent,
+    ) -> Option<AllocationView> {
+        Some(AllocationView::of(self.dsc(dsc)?.org(lds)?.placed(storage)?))
     }
 }
 

@@ -82,27 +82,40 @@
 //! census above is UNCHANGED to the node (the stop moved three statements, and nothing is minted
 //! between them) and not one `stage2a-stop:` or `stage2a-refusal:` line is printed for any program.
 //!
-//! ⛔ 0 of 24,363 COMPLETED, AND WHERE THEY STOP IS NOW A BARE `None` RATHER THAN A NAMED PANIC:
-//! `try_alloc_l3`'s `allocs.get(&alloc)?` (`l3/dl_ops.rs:9261`). Entry 222 looks the allocate node it
-//! is about to place up in the `v1::AllocArena`, and NO UNIT OF STAGE 2A EVER WRITES THAT ARENA —
-//! `l3/dl_ops.rs` holds no `allocs.insert` outside its own tests, because the minting units call
-//! `L3TreeSurgery::fresh_alloc` + `new_allocate` and put an `L3AllocateNode` in the TREE. The
-//! reference has ONE `dsc2::AllocateNode *` and the port split it in two, writing only the tree half.
-//! ⛔⛔ AND THAT SAME `None` IS WHY STAGE 2B IS NOT **REACHED** ON THE CORPUS, WHICH IS NOT THE SAME
-//! FACT AS STAGE 2B BEING UNCALLED. [`run_stages`] composes 2a then 2b through
-//! `stages::run_stages_2a_2b`, which gates 2b on 2a completing — `run_l3`'s `None` leaves the LX
-//! allocations MINTED BUT NOT PLACED and 2b computes offsets FROM those placements, so running it on
-//! an abandoned tree would compute addresses from half a placement. So `stage2b:` reports `0 reached`
-//! for as long as `completed` is 0, and the numbers above are stage 2a's alone. ⭐ THE ONE-LINE
-//! CONSEQUENCE: filling the arena (entry 222's frontier) is what turns stage 2b on; nothing else has
-//! to change here.
+//! ⛔⛔ THE ARENA IS GONE, AND THE STOP MOVED ONE STATEMENT — READ THIS BEFORE TRUSTING ANY OLDER
+//! ACCOUNT. The stop used to be a bare `None` at `try_alloc_l3`'s `allocs.get(&alloc)?`: entry 222
+//! looked the allocate node it was about to place up in a `v1::AllocArena` that NO UNIT OF STAGE 2A
+//! EVER WROTE, because the reference has ONE `dsc2::AllocateNode *` per
+//! `labeledDs_.at(lds).memOrg_.at(storage)` and the port had split it into a tree node AND an arena
+//! entry, writing only the tree half. Entry 222 now reads that node through
+//! `deeptools`' `AllocationReads` seam — the one cell entry 353's mint fills — and writes its
+//! placements back through `AllocationSites::place_allocation`, so the arena has no production reader
+//! or writer on the placement path at all.
 //!
-//! ⛔ NOT VERIFIED: the whole-build census has NOT been re-measured since the composition landed — the
-//! acceptance bake needs a card and `dbo-opt`, neither of which this worktree has. The numbers above
-//! are the previously measured stage-2a ones and the `stage2b:` line is what a build will print.
+//! ⛔ 0 of 24,363 STILL COMPLETE, FOR A NEW AND NAMED REASON: `L3Placement::buffer_capacity_even_sticks`
+//! (`deeptools stages/carriers.rs`) is the NEXT statement, and the carrier REFUSES it — it wants
+//! `DesignSpaceConfig::getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`) accumulating
+//! `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3755-3963`, ~210 lines over eight
+//! further unported accessors). A fabricated capacity would commit a fabricated placement, so the stop
+//! stands — but it is a RECORDED refusal rather than the `todo!` it used to be, so it prints as
+//! `stage2a-refusal:` and the node census below survives it. ⭐ THE ONE-LINE CONSEQUENCE: porting
+//! `getBufferCapacityForNode` is entry 222's frontier now; nothing else has to change here.
 //!
-//! That the arena is never written is a static fact, so every program reaching the placement loop
-//! stops exactly there; it was confirmed directly, with the id, on `0_rmsq_o728`.
+//! ⛔⛔ AND THAT STOP IS WHY STAGE 2B IS NOT **REACHED** ON THE CORPUS, WHICH IS NOT THE SAME FACT AS
+//! STAGE 2B BEING UNCALLED. [`run_stages`] composes 2a then 2b through `stages::run_stages_2a_2b`,
+//! which gates 2b on 2a completing — an abandoned stage 2a leaves the LX allocations MINTED BUT NOT
+//! PLACED and 2b computes offsets FROM those placements, so running it there would compute addresses
+//! from half a placement. So `stage2b:` reports `0 reached` for as long as `completed` is 0.
+//!
+//! ⛔⛔ NOT VERIFIED, AND HERE IS EXACTLY WHAT A RE-MEASUREMENT IS EXPECTED TO CHANGE. The whole-build
+//! census has NOT been re-run since the arena was removed — the acceptance bake needs a card and
+//! `dbo-opt`, neither of which this worktree has. The node counts above should stand (the stop moved
+//! ONE statement and nothing is minted between them, exactly as when the tracker landed), `stage-stop:`
+//! should stay absent because the new stop returns rather than panics, and where there were ZERO
+//! `stage2a-refusal:` lines there should now be `stage2a-refusal: 24363 x
+//! L3Placement::buffer_capacity_even_sticks: wants DesignSpaceConfig::getBufferCapacityForNode ..`.
+//! That refusal line appearing is the whole observable effect of this change on the corpus; it was
+//! confirmed directly, with the id, on `0_rmsq_o728`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -1740,26 +1753,38 @@ mod tests {
              `collect_all_dimensions_for_loop_order`, and four here where `rmsq_o728`'s single \
              OUTPUT role gives three"
         );
-        assert_eq!(
-            effect.first_refusal, None,
-            "no carrier was asked for a fact it could not give — the stop is a ported unit's"
-        );
         // ⭐⭐ NOTHING PANICS. The memory tracker is REAL — `stages::Trackers` owns a `MemTrackBundle`
         // of ported `DsTrackInMem`s, gated against the reference's own addresses for all 187 programs
         // (`deeptools`'s `schedule/stages/carriers/lx_oracle.rs`) — so this program runs THROUGH
         // `backup`/`remove`/`check_and_add` and reaches no `todo!` at all. A `Ran::Stopped` would have
         // failed the `let` above, which is that assertion carried by the type.
         //
-        // ⛔ AND STAGE 2A STILL DOES NOT COMPLETE: entry 222 looks its own freshly minted allocate node
-        // up in the `v1::AllocArena` (`l3/dl_ops.rs:9261`) and no unit of stage 2a ever writes that
-        // arena — the port split the reference's ONE `dsc2::AllocateNode *` into a tree node and an
-        // arena entry and writes only the tree. That is the next frontier and it is a port change.
+        // ⛔⛔ AND STAGE 2A STILL DOES NOT COMPLETE, BUT THE STOP HAS MOVED AND NOW NAMES ITSELF. It
+        // used to be a bare `None`: entry 222 looked its own freshly minted allocate node up in a
+        // `v1::AllocArena` that no unit of stage 2a ever wrote, because the port had split the
+        // reference's ONE `dsc2::AllocateNode *` into a tree node AND an arena entry and wrote only the
+        // tree. Entry 222 now reads that node through `deeptools`' `AllocationReads` seam — the cell
+        // entry 353's mint fills — and stops ONE STATEMENT LATER, on the CAPACITY: the `L3Placement`
+        // carrier cannot answer `DesignSpaceConfig::getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`,
+        // ~210 unported lines) and refuses, which is what the assertion below reads.
+        //
+        // ⭐ THE REFUSAL IS THE ASSERTION, NOT ITS ABSENCE, AND THAT IS THE CHANGE: `first_refusal`
+        // was `None` here while the stop was a silent map lookup. A carrier that names the vendor unit
+        // it lacks is what makes this frontier a work item rather than a mystery.
+        assert!(
+            effect
+                .first_refusal
+                .is_some_and(|said| said.contains("getBufferCapacityForNode")),
+            "the stop is the capacity carrier's recorded refusal, naming the unported vendor unit: \
+             {:?}",
+            effect.first_refusal
+        );
         assert!(!effect.l3, "so stage 2a did not complete");
         // ⛔⛔ SO STAGE 2B IS NOT **REACHED** ON THIS PROGRAM, AND THAT IS STATED AS A CONSEQUENCE
         // RATHER THAN AS THE PORT'S BEHAVIOUR. `run_stages_2a_2b` gates stage 2b on stage 2a
         // completing, because `run_l3`'s `None` leaves the LX allocations MINTED BUT NOT PLACED and
         // stage 2b computes offsets FROM those placements — running it over an abandoned tree would
-        // compute addresses from half a placement. When entry 222's arena write lands, `l3` becomes
+        // compute addresses from half a placement. When `getBufferCapacityForNode` lands, `l3` becomes
         // true and stage 2b runs with the list asserted above; nothing else has to change.
         assert_eq!(
             (effect.ddc, scheduled.scheduling.filled()),
