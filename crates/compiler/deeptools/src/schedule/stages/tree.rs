@@ -157,6 +157,20 @@ impl TreeData {
         self.gtr_ids.insert(group);
     }
 
+    /// The identity `new dsc2::AllocateNode()` WOULD issue — a fresh heap pointer in the reference,
+    /// and the next free id here, WITHOUT taking it. What `free_alloc_id`/`free_alloc` answer.
+    pub(super) const fn peek_alloc(&self) -> AllocId {
+        AllocId(self.next_alloc.saturating_add(1))
+    }
+
+    /// `condNode->getThenBranchNode()` (`dsc/dsc2.h:685`) — the FIRST block added to the then-region.
+    pub(super) fn then_branch(&self, condition: NodeId) -> Option<NodeId> {
+        match &self.nodes.get(&condition)?.kind {
+            Kind::Condition(cond) => cond.then_region.first().copied(),
+            _ => None,
+        }
+    }
+
     /// The identity `new dsc2::AllocateNode()` issues.
     pub(super) fn fresh_alloc(&mut self) -> AllocId {
         self.next_alloc = self.next_alloc.saturating_add(1);
@@ -404,6 +418,14 @@ impl TreeData {
                 })
             })
             .collect()
+    }
+
+    /// `syncNode->units_`, [`None`] for a node that is not a `SYNC`.
+    pub(super) fn sync_units(&self, node: NodeId) -> Option<crate::schedule::dsc2::SyncUnits> {
+        match &self.nodes.get(&node)?.kind {
+            Kind::Sync(held) => Some(held.units.clone()),
+            _ => None,
+        }
     }
 
     /// `traverseTreeDFSMutable(nullptr, {SYNC})` reduced to what entry 214's sweep reads.

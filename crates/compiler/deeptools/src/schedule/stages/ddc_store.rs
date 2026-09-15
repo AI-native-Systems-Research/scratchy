@@ -35,24 +35,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
 use crate::arch::Elements;
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
-    PrimaryDim, ScheduleNode, StickDims,
-};
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{PrimaryDim, StickDims};
 use crate::formats::DataFormat;
 use crate::schedule::ddc::fold::{
     AllocId, ConstIdx, DataOrigin, NodeId, NodeKind, ScaledLds, StoredStream,
 };
-use crate::generated::DataConnect;
 use crate::schedule::ddc::metadata::{DatastageId, DdcMemory};
 use crate::schedule::ddc::transformation as tr;
 use crate::schedule::ddc::transformation_util as tu;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{
-    AllocateNode, BlockNode, ComputeNode, LayoutDims, LdsIdx, LoopCondComposite, NodeName, Operand,
-    TransferNode, WordLength,
+    AllocateNode, ComputeNode, LayoutDims, LdsIdx, LoopCondComposite, NodeName, TransferNode,
+    WordLength,
 };
 use crate::schedule::l3::dsc::DscIdx;
-use crate::units::{Core, Corelet};
+use crate::units::Corelet;
 
 use super::ddc_reads::Dsc2Reads;
 use super::ddc_state::{self, Dsc2State};
@@ -107,6 +104,203 @@ impl<'s, 'l> Dsc2Store<'s, 'l> {
             .tree(self.dsc)
             .expect("a Dsc2Store is only built for a DSC the state holds a tree for")
             .with_mut(write)
+    }
+
+    // ⭐ THE HELPERS [`super::ddc_store2`]'S IMPLS READ THROUGH — one per FACT, so the two files
+    // cannot reach the state two different ways.
+
+    /// That DSC's facts.
+    pub(super) fn dsc_facts(&self) -> &'s super::ddc_state::Dsc2Facts {
+        self.facts()
+    }
+
+    /// ⭐⭐ `split`'s OWN BODY — two disjoint fields, both naming one state.
+    pub(super) fn halves(&mut self) -> (&Dsc2Reads<'s, 'l>, &mut Dsc2Tree<'s, 'l>) {
+        (&self.reads, &mut self.tree)
+    }
+
+    /// `0 .. numCoreletsUsed_DSC2_` as corelets.
+    pub(super) fn dsc2_corelets(&self) -> Vec<Corelet> {
+        v1::Placement::corelets_used(&self.reads)
+    }
+
+    /// `coreIdsUsed_`.
+    pub(super) fn cores_used_of(&self) -> v1::CoresUsed {
+        v1::Placement::cores_used(&self.reads)
+    }
+
+    /// `node->nodeType_`.
+    pub(super) fn node_kind_of(&self, node: NodeId) -> Option<NodeKind> {
+        self.with_tree(|tree| tree.node_kind(node))
+    }
+
+    /// The transfer at that node, for a read that may find none.
+    pub(super) fn read_transfer(&self, node: NodeId) -> Option<TransferNode> {
+        self.with_tree(|tree| tree.transfer(node))
+    }
+
+    /// ⭐ ONE READ-MODIFY-WRITE OF A TRANSFER BODY — a NO-OP on a node that is not a transfer, which
+    /// is the reference's own downcast of one.
+    pub(super) fn edit_transfer(&self, node: NodeId, edit: impl FnOnce(&mut TransferNode)) {
+        self.with_tree_mut(|tree| {
+            if let Some(mut held) = tree.transfer(node) {
+                edit(&mut held);
+                tree.set_transfer(node, held);
+            }
+        });
+    }
+
+    /// ⭐ ONE DESTINATION OF A TRANSFER, READ-MODIFY-WRITTEN — [`crate::schedule::dsc2::Dsts`] keeps
+    /// its NON-EMPTINESS by holding `first` and `rest` privately, so a per-destination write goes
+    /// through the constructor and the routes are carried over unchanged.
+    pub(super) fn edit_dst(
+        &self,
+        node: NodeId,
+        dst: usize,
+        edit: impl FnOnce(&mut crate::schedule::dsc2::Operand),
+    ) {
+        self.edit_transfer(node, |held| {
+            let hops: Vec<crate::schedule::dsc2::Hops> = (0..held.dsts.iter().count())
+                .map(|at| crate::schedule::dsc2::Hops(held.dsts.hops(at).to_vec()))
+                .collect();
+            let mut operands: Vec<crate::schedule::dsc2::Operand> =
+                held.dsts.iter().cloned().collect();
+            let Some(target) = operands.get_mut(dst) else {
+                return;
+            };
+            edit(target);
+            let (first, rest) = operands.split_first().expect("Dsts is non-empty by type");
+            held.dsts = crate::schedule::dsc2::Dsts::new(first.clone(), rest.to_vec())
+                .with_hops(hops);
+        });
+    }
+
+    /// `allocNode->addAllocUser(user)` — filed on the labelled DS's `memOrg_`, where the users list
+    /// lives; a NO-OP for an allocation no `memOrg_` names, which is the reference's null node.
+    pub(super) fn add_user_to(&self, alloc: AllocId, user: NodeId) {
+        let Some(tree) = self.state.tree(self.dsc) else {
+            return;
+        };
+        let Some(node) = tree.with(|held| held.node_of_alloc(alloc)) else {
+            return;
+        };
+        if let Some((lds, storage)) = tree.home_of(node)
+            && let Some(org) = tree.org(lds)
+        {
+            org.add_user(storage, user);
+        }
+    }
+
+    /// `condNode->coreClCond_`.
+    pub(super) fn core_cl_cond_of(&self, condition: NodeId) -> Option<v1::CoreClSet> {
+        self.with_tree(|tree| tree.core_cl_cond(condition))
+    }
+
+    /// `condNode->getThenBranchNode()`.
+    pub(super) fn then_region_of(&self, condition: NodeId) -> Option<NodeId> {
+        self.with_tree(|tree| tree.then_branch(condition))
+    }
+
+    /// `new dsc2::ConditionNode()` with its `name_` and `coreClCond_`, and no loop condition.
+    pub(super) fn new_core_cl_condition(&self, name: NodeName, core_cl: v1::CoreClSet) -> NodeId {
+        self.with_tree_mut(|tree| {
+            tree.add(
+                name,
+                Kind::Condition(super::tree::Cond {
+                    loop_cond: None,
+                    cores: Some(core_cl),
+                    then_region: Vec::new(),
+                    else_region: Vec::new(),
+                }),
+                None,
+            )
+        })
+    }
+
+    /// `condNode->addThenRegion(block)` / `addElseRegion(block)`.
+    pub(super) fn add_region_to(&self, condition: NodeId, block: NodeId, then_region: bool) {
+        self.with_tree_mut(|tree| tree.add_region(condition, block, then_region));
+    }
+
+    /// `dataStageParam_.at(core).ss_.paddingSizes_.at(dim)` — ⭐ THE SHARED MAP.
+    pub(super) fn core_stage_padding(
+        &self,
+        dim: PrimaryDim,
+    ) -> Option<crate::schedule::l3::dsc::DimPadding> {
+        self.facts().with_stages(|stages| {
+            stages
+                .0
+                .get(&crate::schedule::ddc::metadata::Metadata::CORE_DSTGID)?
+                .ss
+                .dims
+                .dims
+                .padding
+                .get(&dim)
+                .copied()
+        })
+    }
+
+    /// `dataStageParam_.at(core).ss_.peSfpSplit_.empty()` negated — ⭐ THE SHARED MAP.
+    pub(super) fn core_stage_has_pe_sfp_split(&self) -> bool {
+        self.facts().with_stages(|stages| {
+            stages
+                .0
+                .get(&crate::schedule::ddc::metadata::Metadata::CORE_DSTGID)
+                .is_some_and(|held| !held.ss.dims.pe_sfp_split.is_empty())
+        })
+    }
+
+    /// `traverseTreeDFSMutable(base, {SYNC}, .., excludeList)` reduced to each SYNC's `units_`.
+    pub(super) fn sync_units_below(
+        &self,
+        base: tr::LoopId,
+        exclude: Option<tr::LoopId>,
+    ) -> Vec<crate::schedule::dsc2::SyncUnits> {
+        self.with_tree(|tree| {
+            let mut found = Vec::new();
+            let mut stack = vec![base.0];
+            while let Some(at) = stack.pop() {
+                if exclude.is_some_and(|skip| skip.0 == at) {
+                    continue;
+                }
+                if let Some(units) = tree.sync_units(at) {
+                    found.push(units);
+                }
+                stack.extend(tree.children(at).into_iter().rev());
+            }
+            found
+        })
+    }
+
+    /// The identity a freshly minted `dsc2::AllocateNode` would take.
+    pub(super) fn next_free_alloc(&self) -> AllocId {
+        self.with_tree(super::tree::TreeData::peek_alloc)
+    }
+
+    /// `labeledDs_.at(lds).memOrg_`'s FIRST entry with an `allocateNode_`, in `std::map` order.
+    pub(super) fn first_alloc_of(&self, lds: LdsIdx) -> Option<AllocId> {
+        let tree = self.state.tree(self.dsc)?;
+        let org = tree.org(lds)?;
+        tree.with(|held| {
+            [SenComponent::Hbm, SenComponent::Lx]
+                .into_iter()
+                .filter_map(|storage| org.node(storage))
+                .find_map(|node| held.allocate(node).map(|(alloc, _)| alloc))
+        })
+    }
+
+    /// `alloc->layoutDimOrder_.at(0)` — the OUTERMOST layout dim.
+    pub(super) fn alloc_layout_first(&self, alloc: AllocId) -> Option<PrimaryDim> {
+        self.with_tree(|tree| tree.node_of_alloc(alloc).and_then(|node| tree.allocate(node)))
+            .and_then(|(_, held)| held.layout.0.first().map(|(dim, _)| *dim))
+    }
+
+    /// `allocNode->getPrev()` — whether that allocate node already has a parent.
+    pub(super) fn alloc_has_parent(&self, alloc: AllocId) -> bool {
+        self.with_tree(|tree| {
+            tree.node_of_alloc(alloc)
+                .is_some_and(|node| tree.parent(node).is_some())
+        })
     }
 }
 
