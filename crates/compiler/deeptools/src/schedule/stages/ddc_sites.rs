@@ -687,30 +687,23 @@ impl conv::DdlSizes for Dsc2Ddl<'_, '_> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
-// ⛔⛔ THE DDL TEMPLATE SET — AND WHY IT CANNOT BE INHABITED FROM WHAT `build.rs` EMITS.
+// ⭐⭐ THE DDL TEMPLATE SET — THE GENERATED MODULES, WHICH IS WHERE THIS STAGE USED TO STOP.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
-/// THE `T` CARRIER — [`conv::DdlTemplateSet`], whose one method must hand back a
+/// THE `T` CARRIER — [`conv::DdlTemplateSet`], whose one method hands back a
 /// [`conv::StatedTemplate`] with SIX parts: `source`, `program`, `binds`, `padded`, `constraints`,
 /// `root`.
 ///
-/// ⛔⛔ `build.rs` EMITS EXACTLY ONE OF THE SIX. It parses all 32 `ddl_templates/*.ddl` at build time
-/// into `crate::generated`, and `PROGRAMS` is a real source for `program` — but it DELIBERATELY drops
-/// the other four:
+/// ⭐⭐ ALL SIX NOW COME OUT OF THE `.ddl`. `build.rs` used to emit exactly one — `PROGRAMS` served
+/// `program` and the other four were mentioned ZERO times each — so this carrier's only honest answer
+/// was [`None`], and stage 2b's `run_v1` stopped here. It now walks each template MODULE-WIDE beside
+/// the per-bind walk and emits `crate::generated::MODULES`;
+/// [`crate::schedule::ddl::templates::DdlTemplates`] is the one implementor over it, and this carrier
+/// delegates.
 ///
-/// * `binds` — `ddl.operation_bind` statements are folded into `Program::op_func` and the per-name
-///   roles and kept as NO statement at all (`conv`'s own note at `ddl/conversion.rs:5207-5210`);
-/// * `padded` — the 159 `padded_dimension` statements are emitted with `operands: &[]`, so the
-///   `primary=`/`padding=`/`window=` groups are gone (`:1633-1635`);
-/// * `constraints` — the 1,332 `ddl.constraint` statements are `Attrs::Bare`, and `cmp`, `dim_idx`,
-///   `min_num_cores`, `value` and the rest are filed SEARCH-ONLY and dropped
-///   (`build.rs:1944-1960`), so WHICH [`conv::DdlConstraint`] a statement is cannot be recovered;
-/// * `root` — no `RegionTree` is generated at all.
-///
-/// ⭐ SO [`None`] IS THE TRAIT'S OWN DOCUMENTED ANSWER — *"[`None`] where this set does not hold it"*
-/// — and it is the honest one: this set holds no template, because the generated tables state one
-/// sixth of what a stated template is. It is NOT a fabrication and NOT a `todo!`: a `todo!` would
-/// claim a fact is reachable, and this one is not without `build.rs` emitting four more things.
+/// ⛔ THE DELEGATION IS TOTAL, so nothing is recorded here any more. `Template`'s variants and
+/// `MODULES`' rows are minted from the same census of `ddl_templates/*.ddl`, so a template a candidate
+/// list can name is a template this set holds.
 ///
 /// ⛔ AND IT DOES NOT SHORT-CIRCUIT. `select_and_parse_ddl_template` reaches this only AFTER
 /// `ddl_templates(opFunc, A::GEN)` answered [`Some`] (`ddl/conversion.rs:6011`), so an op-func with no
@@ -718,48 +711,38 @@ impl conv::DdlSizes for Dsc2Ddl<'_, '_> {
 /// [`v1::DscFilled::No`] for the super-DSC, which is a COMPLETE run of stage 2b and not a stop.
 #[derive(Debug)]
 pub struct DdcTemplates<'s, 'l> {
+    /// Kept so a future refusal of this carrier's own has somewhere to go; the set itself has none.
+    #[expect(
+        dead_code,
+        reason = "the state is the refusal sink every other carrier of this module holds, and this \
+                  one no longer refuses — see the type's note"
+    )]
     state: &'s Dsc2State<'l>,
+    /// The generated set this carrier delegates to. A FIELD and not a temporary, because
+    /// [`conv::DdlTemplateSet::stated`] hands back a [`conv::StatedTemplate`] borrowed from the set.
+    set: crate::schedule::ddl::templates::DdlTemplates,
 }
 
 impl<'s, 'l> DdcTemplates<'s, 'l> {
-    /// The (empty) template set, which records its refusal in the state.
+    /// The template set.
     #[must_use]
     pub const fn new(state: &'s Dsc2State<'l>) -> Self {
-        Self { state }
-    }
-}
-
-/// A `DdlSource` NO TEMPLATE OF THIS SET EVER HANDS BACK — an associated type has to be inhabited by
-/// SOMETHING before the carrier compiles, exactly as [`super::offsets`]'s three surfaces are.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DdcTemplateSource;
-
-impl crate::schedule::ddl::DdlSource for DdcTemplateSource {
-    fn parse(
-        &self,
-        _dialect: &crate::schedule::ddl::ops::Dialect,
-    ) -> Option<crate::schedule::ddl::ParsedDdl> {
-        todo!(
-            "DdlSource::parse: unreachable — DdcTemplates::stated answers None for every template, \
-             so no source of this set is ever parsed"
-        )
+        Self {
+            state,
+            set: crate::schedule::ddl::templates::DdlTemplates::new(),
+        }
     }
 }
 
 impl conv::DdlTemplateSet for DdcTemplates<'_, '_> {
-    type Source = DdcTemplateSource;
+    type Source = crate::schedule::ddl::templates::TemplateSource;
 
-    /// ⛔ [`None`] FOR EVERY TEMPLATE, recorded — see this type's own note.
+    /// ⭐ THE GENERATED MODULES, verbatim — see [`crate::schedule::ddl::templates::DdlTemplates`].
     fn stated(
         &self,
-        _template: crate::generated::Template,
+        template: crate::generated::Template,
     ) -> Option<conv::StatedTemplate<'_, Self::Source>> {
-        self.state.refuse(
-            "DdlTemplateSet::stated: build.rs emits `program` (PROGRAMS) but drops `binds` \
-             (operation_bind folded away), `padded` (operand groups dropped), `constraints` \
-             (attributes filed search-only, build.rs:1944-1960) and `root` (no RegionTree emitted) — \
-             four of a StatedTemplate's six parts",
-        )
+        conv::DdlTemplateSet::stated(&self.set, template)
     }
 }
 

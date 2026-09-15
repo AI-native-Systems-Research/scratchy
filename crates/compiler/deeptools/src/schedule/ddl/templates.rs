@@ -665,6 +665,96 @@ mod tests {
         );
     }
 
+    /// ⛔⛔ EVERY TEMPLATE'S SOURCE PARSES **AND PASSES ITS VERIFIERS** — which is the step
+    /// `select_and_parse_ddl_template` takes between `stated` and the match
+    /// (`ddl/conversion.rs:6026-6027`), and the one that stops the whole walk with [`None`] if any of
+    /// the five verifiers rejects.
+    ///
+    /// ⭐ `verifyAfterParse=true` (`ddc/ddl/ddl.cpp:49-50`) is why this is not a formality: one
+    /// rejection anywhere and the parse yields nothing, so a template whose `ddl.compute` arity or
+    /// `ddl.type` bit width this port reads wrongly would take the DDL step down without naming
+    /// itself. This names it.
+    #[test]
+    fn every_templates_source_parses_and_survives_its_verifiers() {
+        let dialect = Dialect::initialize();
+        let mut refused = Vec::new();
+        for module in MODULES {
+            let stated = DdlTemplates
+                .stated(module.template)
+                .expect("a censused template");
+            let mut parser = crate::schedule::ddl::DdlModuleOp::default();
+            parser.parse_ddl(Some(stated.source));
+            if parser.module().is_none() {
+                refused.push(module.template);
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "these templates' generated sources do not survive `perform_actions`, so the DDL step \
+             stops on them before it ever matches: {refused:?}"
+        );
+    }
+
+    /// 🛑🛑 A `ddl.layout` THAT STATES NO `is_order_fixed=` IS **NOT** ORDER-FIXED.
+    ///
+    /// ⛔ THE DIALECT'S OWN DEFAULT, IN SO MANY WORDS: `DdlOps.td:113` declares
+    /// `DefaultValuedAttr<BoolAttr, "false"> : $is_order_fixed`, and `:108` documents it as *"an
+    /// optional attribute is_order_fixed (default false)"*.
+    ///
+    /// 🛑 THE GENERATOR DEFAULTED IT TO `true` AND THAT INVERSION STOPPED THE WHOLE DDL STEP. Fifty of
+    /// the 198 vendored layouts rely on the default; every one read as order-fixed. `addDimConstraints`
+    /// refuses `order_fixed && op_dims.len() > layout_dims.len()` with *"Fixed layout with too many
+    /// dimensions"* / *"Impossible to match for sdsc"* (`ddl_conversion.cpp:2371-2378`), so
+    /// `broadcast_ops.ddl:8`'s six-dim `%global_layout` could not match a three-dim DSC layout and
+    /// `match_ddl2_dsc` answered [`None`] for `OpFunc::Mul`. It answers `Some(true)` with the default
+    /// corrected.
+    ///
+    /// ⭐ SO THIS ASSERTS THE THREE CASES SEPARATELY — absent, explicit `false`, explicit `true` —
+    /// because a test of the default alone would still pass if the explicit readings were dropped.
+    #[test]
+    fn an_unstated_is_order_fixed_is_false_which_is_the_dialects_own_default() {
+        use crate::generated::Attrs;
+
+        let order_fixed_of = |template: Template, spelling: &str| -> bool {
+            let module = template.module();
+            let stmt = module
+                .program
+                .stmts
+                .iter()
+                .find(|stmt| {
+                    stmt.kind == StmtKind::Layout
+                        && stmt
+                            .results
+                            .first()
+                            .is_some_and(|name| module.program.spelling(*name) == spelling)
+                })
+                .unwrap_or_else(|| panic!("{template:?} declares no layout {spelling}"));
+            match stmt.attrs {
+                Attrs::Layout { order_fixed } => order_fixed,
+                other => panic!("a `ddl.layout` carries {other:?}"),
+            }
+        };
+
+        assert!(
+            !order_fixed_of(Template::BroadcastOps, "%global_layout"),
+            "`broadcast_ops.ddl:8` states no `is_order_fixed=`, so the dialect's default FALSE applies"
+        );
+        assert!(
+            !order_fixed_of(Template::Bmm, "%global_layout_input"),
+            "`bmm.ddl:20` writes a bare `{{}}` too, so the default applies to a matmul's global layout \
+             as well"
+        );
+        assert!(
+            !order_fixed_of(Template::Bmm, "%slice_layout_input"),
+            "`bmm.ddl:17` states `is_order_fixed=false` explicitly"
+        );
+        assert!(
+            order_fixed_of(Template::Bmm, "%slice_layout_input_16bit"),
+            "and `bmm.ddl:18` states `is_order_fixed=true`, so an explicit TRUE is still read as fixed \
+             — the default is what changed, not the reading"
+        );
+    }
+
     /// ⛔ EVERY CENSUSED TEMPLATE IS STATED — the set holds all 32, so the DDL step never sees the
     /// trait's [`None`].
     #[test]

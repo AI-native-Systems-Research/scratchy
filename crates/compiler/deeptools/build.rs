@@ -1748,10 +1748,20 @@ fn render_attrs(stmt: &Stmt) -> String {
             format!("Attrs::Dimension {{ property: {property} }}")
         }
         "ddl.layout" => {
-            // ⛔ ABSENT MEANS FIXED. `is_order_fixed=false` is written where the order may be
-            // permuted (`bmm.ddl:18`); a layout that states nothing is one the exploration may not
-            // reorder, which is the conservative reading and the one the templates rely on.
-            let order_fixed = attr_bool(op, "is_order_fixed").unwrap_or(true);
+            // ⛔⛔ ABSENT MEANS **NOT** FIXED, AND THE DIALECT SAYS SO IN SO MANY WORDS.
+            // `DdlOps.td:113` declares `DefaultValuedAttr<BoolAttr, "false"> : $is_order_fixed` and
+            // `:108` documents it as *"an optional attribute is_order_fixed (default false)"*.
+            //
+            // 🛑 THIS DEFAULTED TO `true` AND THAT INVERSION STOPPED THE WHOLE DDL STEP. Of the 198
+            // vendored `ddl.layout`s, 148 state the attribute (88 `true`, 60 `false`) and FIFTY rely
+            // on the default — every one of which the port read as order-fixed. `addDimConstraints`
+            // then refuses `order_fixed && op_dims.len() > layout_dims.len()` with *"Fixed layout with
+            // too many dimensions"* / *"Impossible to match for sdsc"*
+            // (`ddl_conversion.cpp:2371-2378`), so `broadcast_ops.ddl:8`'s six-dim `%global_layout`
+            // could never match a three-dim DSC layout: measured `op_dims=6 layout_dims=3`, and the
+            // match died there for `OpFunc::Mul`. The old comment called `true` "the conservative
+            // reading and the one the templates rely on"; the TableGen refutes both halves.
+            let order_fixed = attr_bool(op, "is_order_fixed").unwrap_or(false);
             format!("Attrs::Layout {{ order_fixed: {order_fixed} }}")
         }
         "ddl.define_constant" | "ddl.get_external_constant" | "ddl.operand_constant" => {
