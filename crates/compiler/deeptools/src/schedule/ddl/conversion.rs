@@ -3524,13 +3524,34 @@ fn op_get_external_datastage<S: DdlSite + ?Sized>(
 /// core/chunk dim with more than one loop needs its terms re-pointed, and
 /// `adjustConditionForSplitLoop` is a `dsc/` function outside this campaign's file list — the same
 /// gap entry 250 declares as `ScheduleSurgery::adjust_condition_for_split_loop`.
+///
+/// ⛔⛔ IT **RESOLVES** THE CONDITION, IT DOES NOT LOOK IT UP. `ddl_conversion.cpp:1541` is
+/// `auto& condProp = processCondition(if_op.getCondition());` — the arm's FIRST statement. This read
+/// `interface.resolved_conditions.get(&condition)?` instead, which is only ever [`Some`] for a name
+/// something else already resolved; nothing else in the walk resolves a dataflow condition
+/// ([`process_condition`] memoises at its own head, and its only other callers are its own recursion
+/// and [`process_transformations`]). So a cold memo made this refuse, and every one of the 564
+/// `ddl.if`s inside the vendored `ddl.dataflow` bodies arrives with a cold memo.
+///
+/// 🛑 THE MEMO IS WHY THE DIVERGENCE WAS INVISIBLE. Asking [`process_condition`] first is a no-op for
+/// a WARM memo — it returns the memoised answer from `:1099` — so every test that seeded
+/// `resolved_conditions` before calling passed either way, and the one that did
+/// (`unit_tests::opens_a_named_block_per_region_of_a_multi_region_op`) is exactly such a test.
+/// `unit_tests::a_cold_memo_still_resolves_an_op_bind_condition_to_one_region` is the one that
+/// distinguishes them.
 fn op_if<S: DdlSite + ?Sized>(
     ctx: &mut OpContext<'_, S>,
     condition: NameId,
     then_region: RegionId,
     else_region: RegionId,
 ) -> Option<OpOutcome> {
-    let prop = ctx.interface.resolved_conditions.get(&condition)?.clone();
+    let prop = process_condition(
+        ctx.program,
+        ctx.interface,
+        ctx.metadata,
+        ctx.dsc,
+        condition,
+    )?;
     if let Some(resolved) = prop.resolved {
         return Some(OpOutcome {
             parent: Some(ctx.curr_parent.clone()),
@@ -6080,12 +6101,13 @@ mod unit_tests {
         DdlConversion, DdlInterface, DdlOp, DdlSite, DdlSizes, DimMapping, DimProp,
         EmittedAllocate, EmittedDdl, EmittedOp, EmittedStage, EmittedTensor, ExprValue,
         GlobalLayoutRefs, InternalTensor, InternalTensorSite, LabeledDsTail, LdsSlot, LoopCount,
-        MatchSite, OpContext, OpOutcome, OperationBind, PaddedDimension, RegionId, RegionOp,
-        RegionTree, StyledDims, SyncLabel, TensorAndAllocation, TensorProp, TypeDefinition,
-        add_internal_tensor, allocation_pad_type, check_meta_dimensions, convert_dsc2_ddl, corelet,
-        export_to_ddl, match_ddl2_dsc, op_core_to_core, pad_type_spelling, process_access_patterns,
-        process_condition, process_dimension_op, process_expression, process_region, process_types,
-        tensor, tensor_and_allocation, tensor_prop, transfer_access_pattern, verify_ddl_constraint,
+        MatchSite, OpContext, OpOutcome, OperationBind, OperationProp, PaddedDimension, RegionId,
+        RegionOp, RegionTree, StyledDims, SyncLabel, TensorAndAllocation, TensorProp,
+        TypeDefinition, add_internal_tensor, allocation_pad_type, check_meta_dimensions,
+        convert_dsc2_ddl, corelet, export_to_ddl, match_ddl2_dsc, op_core_to_core, pad_type_spelling,
+        process_access_patterns, process_condition, process_dimension_op, process_expression,
+        process_op, process_region, process_types, tensor, tensor_and_allocation, tensor_prop,
+        transfer_access_pattern, verify_ddl_constraint,
     };
     use crate::arch::{Dd2, Elements, IsaGen};
     use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
@@ -7632,9 +7654,109 @@ mod unit_tests {
         );
     }
 
+    /// ⭐⭐⭐ A **COLD** MEMO STILL RESOLVES — which is the whole of `op_if`'s divergence, and the one
+    /// thing every other test of it could not see.
+    ///
+    /// ⛔ `ddl_conversion.cpp:1541` IS `auto& condProp = processCondition(if_op.getCondition());` —
+    /// the `IfOp` arm RESOLVES its condition. `op_if` read `resolved_conditions.get(&condition)?`
+    /// instead, and nothing else in the walk resolves a dataflow condition, so it refused on every one
+    /// of the 564 `ddl.if`s inside the vendored `ddl.dataflow` bodies.
+    ///
+    /// 🛑 SO `resolved_conditions` IS LEFT **EMPTY** HERE, AND THAT IS THE POINT. Seeding it makes
+    /// `process_condition` return from its own memo at `:1099`, so the fixed and the broken reading
+    /// agree — which is why
+    /// [`Self::opens_a_named_block_per_region_of_a_multi_region_op`], which seeds it, passes either
+    /// way. This test fails with `None` before the fix.
+    ///
+    /// ⛔ AND IT CARRIES **WHICH REGION**, NOT "IT DID NOT REFUSE". `processCondition`'s first arm is
+    /// `dyn_cast<OperationBindOp>` (`:217`): a bind ABSENT from `operationDefinition_` resolves FALSE
+    /// and the arm descends region 1, a bind PRESENT with an empty `coreClCond_` resolves TRUE and it
+    /// descends region 0 (`:1544-1549`). Both mint NO node. An assertion on `is_some()` would pass on
+    /// a port that always took the `then` arm — the value is the falsifiable part.
+    #[test]
+    fn a_cold_memo_still_resolves_an_op_bind_condition_to_one_region() {
+        // One `ddl.operation_bind` for `processCondition`'s first arm to `dyn_cast` — the shape
+        // `%layernormscale_op` has in `layernormscale_32.ddl`'s transformations section.
+        static BIND: &[Stmt] = &[Stmt {
+            kind: StmtKind::OperationBind,
+            depth: 0,
+            attrs: Attrs::Bare(StmtKind::OperationBind),
+            results: &[NameId(0)],
+            operands: &[],
+            path: &[],
+        }];
+        let program = synthetic(&["%the_op"], BIND);
+
+        let run = |bound: bool| {
+            let mut interface = DdlInterface::default();
+            if bound {
+                // `operationDefinition_.count(cond)` with an EMPTY `coreClCond_` — `:1106-1107`.
+                interface
+                    .operation_definition
+                    .insert(NameId(0), OperationProp::default());
+            }
+            assert!(
+                interface.resolved_conditions.is_empty(),
+                "the memo must be COLD or this test cannot tell the fix from the bug"
+            );
+            let head = NodeName("head".to_owned());
+            let mut state = DdlConversion::new(BlockNode {
+                name: head.clone(),
+                children: Vec::new(),
+            });
+            let mut metadata = Metadata::default();
+            let mut dsc = config(Pinning::default(), None);
+            let mut site = Match::default();
+            let outcome = process_op(
+                &program,
+                &mut state,
+                &mut interface,
+                &mut metadata,
+                &mut dsc,
+                &mut site,
+                &DdlOp::If {
+                    condition: NameId(0),
+                    then_region: RegionId(1),
+                    else_region: RegionId(2),
+                },
+                &head,
+            );
+            (outcome, state.tree.head().children.len())
+        };
+
+        let head = Some(NodeName("head".to_owned()));
+        assert_eq!(
+            run(false),
+            (
+                Some(OpOutcome {
+                    parent: head.clone(),
+                    regions: vec![RegionId(2)],
+                }),
+                0,
+            ),
+            "a bind absent from `operationDefinition_` resolves FALSE, so the arm descends region 1 \
+             — the ELSE — and mints no node"
+        );
+        assert_eq!(
+            run(true),
+            (
+                Some(OpOutcome {
+                    parent: head,
+                    regions: vec![RegionId(1)],
+                }),
+                0,
+            ),
+            "and a bind PRESENT with an empty `coreClCond_` resolves TRUE, so it descends region 0 — \
+             the THEN — and still mints no node"
+        );
+    }
+
     /// ⭐⭐ A MULTI-REGION OP OPENS A BLOCK PER REGION: an unresolved `ddl.if` mints its condition
     /// node and then `condition_region0` and `condition_region1` under it, which is where the THEN
     /// and ELSE arms attach — and every region records the block that was current when it opened.
+    ///
+    /// ⛔ THIS ONE SEEDS `resolved_conditions`, SO IT CANNOT SEE `op_if`'s MEMO DIVERGENCE — see
+    /// [`Self::a_cold_memo_still_resolves_an_op_bind_condition_to_one_region`], which does.
     #[test]
     fn opens_a_named_block_per_region_of_a_multi_region_op() {
         let program = synthetic(&[], &[]);

@@ -703,7 +703,19 @@ impl Census {
                 // (`ddc/ddcv1.cpp:3349-3357`), and those are the names the `.smc` bodies carry —
                 // `gelufwd` asks the backend for `p0_0`, not for `p0_unroll`. Censusing the raw
                 // name built a `RegName` that could not SPELL a single register we have to emit.
-                let max_unroll = attr_int(op, "max_unroll_factor").unwrap_or(1).max(1);
+                // ⛔ READ ONLY OFF AN OPAQUE, WHICH THIS LOOP DID NOT CHECK. `max_unroll_factor` is
+                // `I64Attr:$max_unroll_factor` (`DdlOps.td:658`) — REQUIRED, no default — and it
+                // exists on `ddl.opaque` alone; this is the generic per-statement census, so the old
+                // `unwrap_or(1)` was being evaluated for all 5,000-odd statements of every template.
+                // Harmless in effect, because the only readers below iterate `internal_registers`,
+                // `input_output_registers` and `params`, which nothing but an opaque states — but it
+                // meant a MISSING `max_unroll_factor` on a real opaque would have read as 1 and
+                // expanded `p0_unroll` to the single register `p0_0`.
+                let max_unroll = if stmt.mnemonic == "ddl.opaque" {
+                    expect_int(op, "max_unroll_factor", &stmt.mnemonic).max(1)
+                } else {
+                    0
+                };
                 //
                 // ⭐ BOTH FORMS ARE NEEDED AND THEY ARE DIFFERENT THINGS. The TAPE carries what the
                 // template wrote (`RegName::P0Unroll`, with `OpaqueReg::unrolled` saying it expands);
@@ -1816,7 +1828,11 @@ fn render_attrs(stmt: &Stmt) -> String {
                 .map(|unit| format!("Unit::{}", ident_of(unit)))
                 .collect();
             let signal = ident_of(expect_str(op, "signal_name", &stmt.mnemonic));
-            let receive = attr_bool(op, "is_receive").unwrap_or(false);
+            // ⛔ `is_receive` IS REQUIRED AND `separate_corelets` IS DEFAULTED, and the difference is
+            // the dialect's: `DdlOps.td:675` declares `BoolAttr:$is_receive` beside
+            // `DefaultValuedAttr<BoolAttr, "false">:$separate_corelets`. A synthesised `false` for the
+            // first would silently turn a RECEIVE into a SEND.
+            let receive = expect_bool(op, "is_receive", &stmt.mnemonic);
             let separate = attr_bool(op, "separate_corelets").unwrap_or(false);
             format!(
                 "Attrs::Sync {{ units: &[{}], signal: SyncSignal::{signal}, receive: {receive}, separate_corelets: {separate} }}",
@@ -1865,7 +1881,7 @@ fn render_opaque(op: &ast::Operation, mnemonic: &str) -> String {
     let unit = ident_of(expect_str(op, "unit", mnemonic));
     let internal = attr_strs(op, "internal_registers");
     let in_out = attr_strs(op, "input_output_registers");
-    let max_unroll = attr_int(op, "max_unroll_factor").unwrap_or(1);
+    let max_unroll = expect_int(op, "max_unroll_factor", mnemonic);
 
     // ⛔ "No need unrolling without internal registers" — `ddl_conversion.cpp:1618-1622`, a legality
     // rule of the DDL itself, checked here where the template is still in hand.
@@ -2133,6 +2149,38 @@ fn check_every_attribute_is_modelled(programs: &[Program], modules: &[ModuleWalk
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// 🛑 AN ATTRIBUTE THE **DIALECT** DECLARES WITHOUT A DEFAULT — so absent is not a value, it is a
+/// template MLIR would itself reject, and inventing one here is the mechanism that produced the
+/// `is_order_fixed` inversion.
+///
+/// ⛔ ONLY FOR A PLAIN `BoolAttr`/`I64Attr`, NEVER FOR A `DefaultValuedAttr`. `DdlOps.td` declares
+/// `BoolAttr:$is_receive` (`:675`) and `I64Attr:$max_unroll_factor` (`:658`) with no default, while
+/// `is_order_fixed` (`:113`), `allow_epilogue` (`:362`), `separate_corelets` (`:675`), `num_buffers`
+/// (`:454`), `vias` (`:507`), `values` (`:386`), `dim_property` (`:71`) and the c2c `strategy`
+/// (`:784`) all DO carry one — and for those, reading the dialect's default is correct and this would
+/// be wrong.
+fn expect_int(op: &ast::Operation, key: &str, mnemonic: &str) -> i64 {
+    attr_int(op, key).unwrap_or_else(|| {
+        panic!(
+            "a {mnemonic} binding {:?} states no `{key}=`, which `DdlOps.td` declares with NO \
+             default — so there is no value to read and a synthesised one would be this crate's \
+             invention. Its attributes are {:?}",
+            op.results,
+            op.attrs.iter().map(|(key, _)| key).collect::<Vec<_>>()
+        )
+    })
+}
+
+/// The same for a plain `BoolAttr`. See [`expect_int`].
+fn expect_bool(op: &ast::Operation, key: &str, mnemonic: &str) -> bool {
+    attr_bool(op, key).unwrap_or_else(|| {
+        panic!(
+            "a {mnemonic} states no `{key}=`, which `DdlOps.td` declares with NO default — so there \
+             is no value to read and a synthesised one would be this crate's invention"
+        )
+    })
 }
 
 /// An attribute a statement of this kind MUST state. Absent means the template says something this
