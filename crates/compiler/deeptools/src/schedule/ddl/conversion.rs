@@ -174,7 +174,7 @@ use crate::generated::{
     ddl_templates,
 };
 use crate::islands::dataflow_ir::ty::GenericComp;
-use crate::schedule::ddc::fold::{AllocId, BlockId, ConstIdx, DataOrigin, NodeId, PadType};
+use crate::schedule::ddc::fold::{AllocId, ConstIdx, DataOrigin, NodeId, PadType};
 use crate::schedule::ddc::metadata::{
     DataTransfer, DatastageId, DdcMemory, ExternalStorage, MetaDimKind, Metadata, OpaqueOp,
     TransferAccessPattern, TransferEnd,
@@ -190,8 +190,8 @@ use crate::schedule::dsc2::{
     CondOp as DscCondOp, ConditionNode, DataInfo, Dsts, Hops, InstrAttribute, LdsIdx, LoopBound,
     LoopCond as DscLoopCond, LoopCondComposite as DscLoopCondComposite, LoopDim, LoopNode,
     MaxDimSize, NodeName, NumBuffers, NumChunks, Operand as DscOperand, PackIndex, Padding,
-    Repetition, ReplicationFactor, SchedNode, ScheduleTree, StartAddress, SyncDirection, SyncNode,
-    SyncStrength, SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
+    Repetition, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode, SyncStrength,
+    SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
 };
 use crate::schedule::l3::dsc::{
     CoreCount, CoreletsUsed, DesignSpaceConfig, EmptyStage, PadSizes, WkSlice, WkSliceId,
@@ -799,7 +799,9 @@ pub struct DdlInterface {
     pub operand_constant_tensor: BTreeMap<NameId, SenComponent>,
     /// `region2blocks_` — the block that was `currParent` when a region was opened, which is where an
     /// allocation declared inside it lands.
-    pub region2blocks: BTreeMap<RegionId, NodeName>,
+    ///
+    /// ⭐ THE BLOCK BY IDENTITY, as `std::map<mlir::Region*, dsc2::BlockNode*>` holds it.
+    pub region2blocks: BTreeMap<RegionId, NodeId>,
     /// `sync_definitions_`, keyed by `signal_name=`.
     pub sync_definitions: BTreeMap<SyncSignal, SyncProp>,
     /// `coreToCore_definitions_`, keyed by the `ddl.core_to_core_communication` that states the ring.
@@ -1825,6 +1827,103 @@ pub enum NodeEnd {
     Output(u32),
 }
 
+/// ⭐⭐ `dsc.scheduleTree_` AS THE DDL CONVERSION *READS* IT — the LIVE tree, by node identity.
+///
+/// ⛔⛔ THIS TRAIT EXISTS BECAUSE THE CONVERSION USED TO OWN A DEEP COPY THAT WAS DROPPED. `run_v1`
+/// opened it with `DdlConversion::new(store.schedule_head_block())` — a `dsc2::BlockNode` **BY
+/// VALUE** — so every node the walk minted was written into a temporary and discarded, while the
+/// reference's `DdlConversion` holds a `DesignSpaceConfig&` (`ddc/ddl/ddl_conversion.h:511`) and
+/// `parseDdl2Dsc` starts from `dsc.scheduleTree_.getHeadMutable()` (`ddl_conversion.cpp:2774`).
+/// [`DdlConversion`] therefore carries no tree at all, which is what makes a detached mint
+/// UNSPELLABLE rather than merely avoided.
+///
+/// ⛔ A COMPUTE AND A TRANSFER ARE READ BACK THROUGH HERE AND NOT OUT OF AN ARENA. The reference
+/// mutates `newNode->…` in place on the node hanging off the tree; a `BTreeMap<NodeId, ComputeNode>`
+/// beside the tree would be a second body of the same node, which is the projection defect this whole
+/// seam exists to stop.
+pub trait ScheduleReads {
+    /// `scheduleTree_.getHeadMutable()` — the block `parseDdl2Dsc` starts from.
+    fn head(&self) -> Option<NodeId>;
+
+    /// `node->name_`.
+    fn node_name(&self, node: NodeId) -> Option<NodeName>;
+
+    /// `scheduleTree_.getHead()` MATERIALISED — the whole head block, which is what entry 345's
+    /// export walks. ⛔ A READ AND ONLY A READ: nothing may mint into what this hands back.
+    fn head_block(&self) -> Option<BlockNode>;
+
+    /// The `dsc2::TransferNode` at that identity, [`None`] for a node that is not a `TRANSFER`.
+    fn transfer(&self, node: NodeId) -> Option<TransferNode>;
+
+    /// The `dsc2::ComputeNode` at that identity, [`None`] for a node that is not a `COMPUTE`.
+    fn compute(&self, node: NodeId) -> Option<ComputeNode>;
+
+    /// `syncNode->units_` of the `SYNC` this tree carries by that name — how the sync pairing's
+    /// duplicate-unit check reaches an end it holds only a name for.
+    fn sync_units(&self, name: &NodeName) -> Option<SyncUnits>;
+}
+
+/// ⭐⭐ `currParent->addChildNode(new dsc2::XNode())` — THE ONLY WAY THIS MODULE MINTS A NODE.
+///
+/// ⛔⛔ A PARENT IS AN IDENTITY AND NOT A NAME, exactly as `processOp(Operation&, dsc2::BlockNode*
+/// currParent)` passes one. The port's own name-keyed lookup could not tell two nodes apart:
+/// [`op_if`] names EVERY condition it mints `"condition"`, so the 570 `ddl.if`s of the vendored
+/// templates would all have resolved to the FIRST one and the whole nest would have flattened onto
+/// it. The same defect made `metadata_.belowLxScheduleInsertBlock != getHeadMutable()` — a POINTER
+/// comparison in the reference — unanswerable, and [`op_loop`]'s core/chunk band therefore handed back
+/// no insertion block at all, which refused every template that states one.
+///
+/// ⛔ EVERY METHOD IS `&mut self` BECAUSE EVERY ONE IS A WRITE, whatever interior the implementation
+/// keeps the tree behind.
+pub trait ScheduleWrites: ScheduleReads {
+    /// `getHeadMutable()->addChildNode(new dsc2::BlockNode(), /*addFront=*/true)` — the
+    /// `root_level_operations` block entry 364 opens the dataflow in.
+    fn add_root_level_block(&mut self, name: NodeName) -> Option<NodeId>;
+
+    /// `currParent->addChildNode(new dsc2::BlockNode())`.
+    ///
+    /// ⭐ VIRTUALLY, WHICH IS THE `addChildNode` OVERRIDE: a `CONDITION` parent takes the block as its
+    /// NEXT REGION — `then` while that region is empty, then `else` — and every other parent takes it
+    /// as a child. [`None`] where a condition already holds both regions, which is
+    /// `ConditionNode::add_region`'s own refusal.
+    fn add_block(&mut self, parent: NodeId, name: NodeName) -> Option<NodeId>;
+
+    /// `currParent->addChildNode(new dsc2::LoopNode())`.
+    fn add_loop(&mut self, parent: NodeId, held: LoopNode) -> Option<NodeId>;
+
+    /// `currParent->addChildNode(new dsc2::TransferNode())`.
+    fn add_transfer(&mut self, parent: NodeId, held: TransferNode) -> Option<NodeId>;
+
+    /// The fields the reference goes on writing into that same `newNode` after it is linked.
+    fn set_transfer(&mut self, node: NodeId, held: TransferNode) -> Option<()>;
+
+    /// `currParent->addChildNode(new dsc2::ComputeNode())`.
+    fn add_compute(&mut self, parent: NodeId, held: ComputeNode) -> Option<NodeId>;
+
+    /// `new dsc2::ComputeNode()` **WITHOUT** the `addChildNode` — an identity the arm can name while
+    /// it resolves what hangs off it, linked later by [`Self::link_child`].
+    ///
+    /// ⭐ THE TWO HALVES ARE SEPARATE BECAUSE ONE ARM NEEDS THEM SEPARATE: the opaque op's internal
+    /// register allocation is linked FIRST (`ddc/ddl/ddl_conversion.cpp:1626`) and names the compute as
+    /// its `tempStorageForCompute_` and its `allocUsers_` entry, while the compute itself is linked
+    /// LAST (`:1709`). Minting it linked would put the compute ahead of its own allocation.
+    fn mint_compute(&mut self, held: ComputeNode) -> Option<NodeId>;
+
+    /// `currParent->addChildNode(node)` for a node already minted.
+    fn link_child(&mut self, parent: NodeId, node: NodeId) -> Option<()>;
+
+    /// `currParent->addChildNode(new dsc2::SyncNode())`.
+    fn add_sync(&mut self, parent: NodeId, held: SyncNode) -> Option<NodeId>;
+
+    /// `currParent->addChildNode(new dsc2::ConditionNode())`, whose two regions are minted as blocks
+    /// under it by [`Self::add_block`] and are EMPTY here.
+    fn add_condition(&mut self, parent: NodeId, held: ConditionNode) -> Option<NodeId>;
+
+    /// `sn->otherEndOfTheSignals_.insert(end(), otherEnd.begin(), otherEnd.end())` on the `SYNC` this
+    /// tree carries by that name.
+    fn add_sync_other_ends(&mut self, name: &NodeName, others: &[NodeName]) -> Option<()>;
+}
+
 /// WHAT ENTRY 323 ASKS OF A DSC THAT CANNOT YET BE ASKED — the reads whose fields the ported
 /// [`DesignSpaceConfig`] and [`crate::schedule::l3::dsc::LabeledDs`] do not carry.
 ///
@@ -1832,7 +1931,7 @@ pub enum NodeEnd {
 /// `LabeledDs` has no `dataFormat_` and its fields are private, `computeOp_` is not on the DSC at
 /// all, and `addressGranularityScalePerUnit`, `numWkSlicesPerDim_` and `coreIdToWkSlice_` are on the
 /// system definition and the SuperDSC. [`None`]/`false` is each reference `.at()` throwing.
-pub trait DdlSite: AllocationSite + InternalTensorSite {
+pub trait DdlSite: AllocationSite + InternalTensorSite + ScheduleWrites {
     /// `dsc.computeOp_.front().attributes_.dataFormat_` — the fused op's precision.
     fn fused_format(&self) -> Option<DataFormat>;
 
@@ -1862,23 +1961,37 @@ pub trait DdlSite: AllocationSite + InternalTensorSite {
     fn stick_dims(&self, lds: LdsIdx) -> Option<StickDims>;
 }
 
-/// THE DSC2 STATE ONE DDL TEMPLATE'S WALK BUILDS — `DdlConversion`'s own members, plus arenas for the
-/// nodes the reference keeps as raw `new`ed pointers hanging off the tree.
+/// THE DSC2 STATE ONE DDL TEMPLATE'S WALK BUILDS — `DdlConversion`'s own members, LESS THE TREE.
 ///
-/// ⭐ THE TREE CARRIES A [`SchedNode::Leaf`] PER MINTED ALLOCATE, TRANSFER AND COMPUTE and the body
-/// lives in an arena, because those three are exactly the kinds [`SchedNode`] cannot hold by value;
-/// [`Self::node_ids`] is the join back. Loops, conditions and syncs are tree variants already.
+/// ⛔⛔ THERE IS NO `tree` FIELD AND THERE MUST NOT BE ONE. This type used to own a
+/// `dsc2::ScheduleTree` built from `store.schedule_head_block()` — a deep copy, so every node minted
+/// into it was dropped when `run_v1` returned. The tree is now reached ONLY through
+/// [`ScheduleWrites`], which is [`crate::schedule::stages`]' live `TreeData`; a detached mint is
+/// therefore unspellable rather than merely avoided. See [`ScheduleReads`] for the authority.
+///
+/// ⛔ AND THERE ARE NO `computes`/`transfers` ARENAS EITHER, for the same reason: the reference writes
+/// `newNode->…` in place on the node hanging off the tree, and a second body beside the tree is a
+/// projection that the next mint site drops all over again.
+///
+/// ⭐ WHAT STAYS IS WHAT THE REFERENCE KEEPS OFF THE TREE — `constantInfo_`, the `memOrg_` map, the
+/// `ddlInterface` bookkeeping, and the `allocations` arena, which is the ONE remaining projection and
+/// is named as such below.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DdlConversion {
-    /// The `dsc2::Dsc` schedule tree being built.
-    pub tree: ScheduleTree,
     /// Every minted `dsc2::AllocateNode`.
+    ///
+    /// ⛔⛔ THE ONE ARENA LEFT, AND IT IS THE `AllocArena` DEFECT AND NOT THIS SEAM'S TO CLOSE. A
+    /// DDL-minted allocate cannot become a live [`crate::schedule::stages::tree::Kind::Allocate`]
+    /// without inventing a field: that variant carries the L3 SCHEDULER's projection
+    /// (`L3AllocateNode`, whose `lds` is not optional) while a `ddl.allocate` for a CONSTANT has no
+    /// labelled DS at all, and neither projection is a subset of the other. Every node minted here is
+    /// therefore still absent from the live tree — see [`process_allocation`].
     pub allocations: BTreeMap<AllocId, AllocateNode>,
-    /// Every minted `dsc2::ComputeNode`.
-    pub computes: BTreeMap<NodeId, ComputeNode>,
-    /// Every minted `dsc2::TransferNode`.
-    pub transfers: BTreeMap<NodeId, TransferNode>,
     /// Which node each minted name is, so a `ScheduleNode*` in the metadata resolves.
+    ///
+    /// ⭐ THE IDS ARE THE LIVE TREE'S, handed back by [`ScheduleWrites`]. This is `ddlInterface`
+    /// bookkeeping — a name-to-identity index over what THIS conversion minted — and carries no node
+    /// body, so it is not a second tree.
     pub node_ids: BTreeMap<NodeName, NodeId>,
     /// `labeledDs_.at(lds).memOrg_` — ⛔ DIVERGENCE: `LabeledDs` carries no `memOrg_`, and this is
     /// what [`AllocationSite::lds_allocation`] answers from.
@@ -1904,19 +2017,25 @@ pub struct DdlConversion {
     /// Which region a `ddl.allocate` was written in, which is the block it lands in —
     /// `myAlloc->getParentRegion()`, an identity the generated tables do not record.
     pub alloc_regions: BTreeMap<NameId, RegionId>,
-    next_node: u32,
     next_alloc: u32,
 }
 
+impl Default for DdlConversion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DdlConversion {
-    /// A conversion over one head block, with nothing minted yet.
+    /// A conversion with nothing minted yet.
+    ///
+    /// ⛔ IT TAKES NO TREE. The tree it writes is the caller's own, reached through
+    /// [`ScheduleWrites`]; the `BlockNode` this used to take was a copy and everything minted into it
+    /// was dropped.
     #[must_use]
-    pub fn new(head: BlockNode) -> Self {
+    pub fn new() -> Self {
         Self {
-            tree: ScheduleTree::new(head),
             allocations: BTreeMap::new(),
-            computes: BTreeMap::new(),
-            transfers: BTreeMap::new(),
             node_ids: BTreeMap::new(),
             lds_memory: BTreeMap::new(),
             constants: BTreeMap::new(),
@@ -1927,15 +2046,12 @@ impl DdlConversion {
             alloc_regions: BTreeMap::new(),
             chunk_datastage: None,
             core_datastage: None,
-            next_node: 0,
             next_alloc: 0,
         }
     }
 
-    /// The next unused node identity — `new dsc2::ScheduleNode` as an index.
-    fn mint_node(&mut self, name: &NodeName) -> NodeId {
-        let node = NodeId(self.next_node);
-        self.next_node += 1;
+    /// `ddlInterface`'s own record of what this walk minted, under the identity the tree gave it.
+    fn record(&mut self, name: &NodeName, node: NodeId) -> NodeId {
         self.node_ids.insert(name.clone(), node);
         node
     }
@@ -1956,71 +2072,38 @@ impl DdlConversion {
         id
     }
 
-    /// The block of [`Self::tree`] that carries this name, INCLUDING THE HEAD.
-    ///
-    /// ⛔ `head_` IS NEVER VISITED BY A TRAVERSAL and it is still where the top region's ops attach:
-    /// `processRegion` is entered with `getHeadMutable()`, so a search that could not name it would
-    /// refuse every op of the dataflow.
-    fn block_mut(&mut self, name: &NodeName) -> Option<&mut BlockNode> {
-        if self.tree.head().name == *name {
-            return Some(self.tree.head_mut());
-        }
-        self.tree.find_block_mut(|block| block.name == *name)
-    }
-
-    /// `currParent->addChildNode(node)`, [`None`] where no block of the tree carries that name.
-    fn add_child(&mut self, parent: &NodeName, node: SchedNode) -> Option<()> {
-        self.block_mut(parent)?.add_child(node);
-        Some(())
-    }
-
-    /// The same, VIRTUALLY: a `CONDITION` parent takes the block as its next region and every other
-    /// parent takes it as a child, which is the `addChildNode` override the reference dispatches on.
-    fn add_block_child(&mut self, parent: &NodeName, block: BlockNode) -> Option<()> {
-        if let Some(cond) = self.tree.find_guarded_mut(|node| node.name == *parent) {
-            return cond.add_region(block);
-        }
-        self.add_child(parent, SchedNode::Block(block))
-    }
-
-    /// The name of the block a [`BlockId`] addresses, which is how `belowLxScheduleInsertBlock`
-    /// resolves to a block of [`Self::tree`].
-    ///
-    /// ⛔ MINTED NODES ONLY — [`Self::node_ids`] is written by [`Self::mint_node`], so neither the head
-    /// nor a block the tree was seeded with is ever named here. That is the other half of entry 364's
-    /// trap: its `belowLxScheduleInsertBlock == getHeadMutable()` comparison cannot hold.
-    fn block_name(&self, block: BlockId) -> Option<NodeName> {
-        let node = block.node();
-        self.node_ids
-            .iter()
-            .find_map(|(name, held)| (*held == node).then(|| name.clone()))
-    }
-
-    /// `dsc.getMutableAllocation(..)->addAllocUser(node)` over a transfer's source and every
-    /// destination, which is what makes a split copy a user of the same allocations.
-    fn attribute_transfer_users(&mut self, node: NodeId) {
-        let Some(transfer) = self.transfers.get(&node).cloned() else {
-            return;
-        };
-        let ends: Vec<DscOperand> = core::iter::once(transfer.src)
-            .chain(transfer.dsts.iter().copied())
-            .collect();
-        for end in ends {
-            let alloc = match (end.data.my_lds_idx, end.data.constant_id) {
-                (Some(lds), _) => self.lds_allocation(lds, end.storage),
-                (None, Some(constant)) => self.constant_allocation(constant, end.storage),
-                (None, None) => None,
-            };
-            if let Some(alloc) = alloc {
-                self.add_alloc_user(alloc, Some(node));
-            }
-        }
-    }
-
     /// `allocNode->addAllocUser(userNode)`, which a null `userNode` skips.
     fn add_alloc_user(&mut self, alloc: AllocId, user: Option<NodeId>) {
         if let (Some(node), Some(user)) = (self.allocations.get_mut(&alloc), user) {
             node.alloc_users.push(user);
+        }
+    }
+}
+
+/// `dsc.getMutableAllocation(..)->addAllocUser(node)` over a transfer's source and every destination,
+/// which is what makes a split copy a user of the same allocations.
+///
+/// ⭐ THE TRANSFER IS READ OFF THE LIVE TREE, not out of an arena beside it — the node this attributes
+/// is the one `add_transfer` linked.
+fn attribute_transfer_users<S: ScheduleReads + ?Sized>(
+    state: &mut DdlConversion,
+    site: &S,
+    node: NodeId,
+) {
+    let Some(transfer) = site.transfer(node) else {
+        return;
+    };
+    let ends: Vec<DscOperand> = core::iter::once(transfer.src)
+        .chain(transfer.dsts.iter().copied())
+        .collect();
+    for end in ends {
+        let alloc = match (end.data.my_lds_idx, end.data.constant_id) {
+            (Some(lds), _) => state.lds_allocation(lds, end.storage),
+            (None, Some(constant)) => state.constant_allocation(constant, end.storage),
+            (None, None) => None,
+        };
+        if let Some(alloc) = alloc {
+            state.add_alloc_user(alloc, Some(node));
         }
     }
 }
@@ -2102,10 +2185,13 @@ pub enum DdlOp<'d> {
 ///
 /// ⛔ AN ABSENT PARENT IS THE REFERENCE'S NULL: the core/chunk loop hands back
 /// `metadata_.belowLxScheduleInsertBlock`, which is unset until an L3 unit fills it.
+/// ⛔ AND IT IS AN IDENTITY, NOT A NAME — the reference's `dsc2::BlockNode*`. See [`ScheduleWrites`]
+/// for the two defects a name carried: every `ddl.if` mints a node called `"condition"`, and the
+/// pointer comparison against `getHeadMutable()` had nothing to compare.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OpOutcome {
     /// `blockNodeForInsertion` — where this op's regions attach their children.
-    pub parent: Option<NodeName>,
+    pub parent: Option<NodeId>,
     /// `regionIndecesToProcess`, in the order the walk descends them.
     pub regions: Vec<RegionId>,
 }
@@ -2502,7 +2588,7 @@ fn process_allocation<S: DdlSite + ?Sized>(
     dsc: &DesignSpaceConfig,
     site: &S,
     allocate: NameId,
-    curr_parent: &NodeName,
+    curr_parent: NodeId,
     user: Option<NodeId>,
 ) -> Option<AllocId> {
     let stmt = program.definition(allocate)?;
@@ -2523,11 +2609,14 @@ fn process_allocation<S: DdlSite + ?Sized>(
         site,
         operand_at(stmt.operands, 0)?,
     )?;
-    let parent = state
+    // ⛔ `myAlloc->getParentRegion()`'s block, or `currParent` — the block this allocation would land
+    // in. It is COMPUTED AND NOT USED, because the node it names is not minted: see the tree-child
+    // note at the end of this function.
+    let _parent = state
         .alloc_regions
         .get(&allocate)
-        .and_then(|region| interface.region2blocks.get(region).cloned())
-        .unwrap_or_else(|| curr_parent.clone());
+        .and_then(|region| interface.region2blocks.get(region).copied())
+        .unwrap_or(curr_parent);
     let alloc = state.mint_alloc();
     let mut placement = AllocPlacement {
         num_buffers: match buffers {
@@ -2630,10 +2719,21 @@ fn process_allocation<S: DdlSite + ?Sized>(
             }
         }
     };
-    let name = node.name.clone();
     state.allocations.insert(alloc, node);
-    state.mint_node(&name);
-    state.add_child(&parent, SchedNode::Leaf(name))?;
+    // ⛔⛔ `currParent->addChildNode(myAllocNode)` IS THE ONE MINT THIS SEAM DOES NOT ROUTE, AND THE
+    // NODE IS THEREFORE ABSENT FROM THE LIVE TREE RATHER THAN PRESENT IN A DROPPED COPY.
+    //
+    // The blocker is the `AllocArena` defect and not this seam: the live tree's `ALLOCATE` variant
+    // carries the L3 SCHEDULER's projection of the node (`L3AllocateNode`, whose `lds` is a bare
+    // `LdsIdx`), this arm mints a `dsc2::AllocateNode`, and neither is a subset of the other — a
+    // `ddl.allocate` for a CONSTANT has no labelled DS at all, so no total projection exists. Writing
+    // one anyway would invent the field, which this crate ranks worse than the absence.
+    //
+    // ⭐ WHAT IS NOT LOST: the node is in [`DdlConversion::allocations`] under `alloc`, it is a user of
+    // whatever `user` names, `metadata.new_allocations` records it per memory, and
+    // `interface.alloc_storage` resolves the `ddl.allocate` result to it. Only the tree child is
+    // missing, and the reference's own census counts 1,319 ALLOCATE nodes of ~14,131 across the 187
+    // fixture programs.
     state.add_alloc_user(alloc, user);
     interface.alloc_storage.insert(allocate, alloc);
     Some(alloc)
@@ -2692,9 +2792,9 @@ fn set_data_loc_and_info<S: DdlSite + ?Sized>(
     interface: &mut DdlInterface,
     metadata: &mut Metadata,
     dsc: &DesignSpaceConfig,
-    site: &S,
+    site: &mut S,
     end: NameId,
-    curr_parent: &NodeName,
+    curr_parent: NodeId,
     user: Option<NodeId>,
     takes_vias: bool,
 ) -> Option<ResolvedEnd> {
@@ -2757,7 +2857,7 @@ fn set_data_loc_and_info<S: DdlSite + ?Sized>(
                             let slot = *metadata
                                 .prefilled_external_transfer_data_connects
                                 .get(&(lds, external_storage(storage)?))?;
-                            let filled = state.transfers.get_mut(&slot.transfer)?;
+                            let mut filled = site.transfer(slot.transfer)?;
                             match slot.end {
                                 TransferEnd::Src => {
                                     filled.src.data.data_connect = Some(fill);
@@ -2766,6 +2866,7 @@ fn set_data_loc_and_info<S: DdlSite + ?Sized>(
                                     filled.dsts.first_mut().data.data_connect = Some(fill);
                                 }
                             }
+                            site.set_transfer(slot.transfer, filled)?;
                             interface.alloc_storage.insert(allocation, alloc);
                         }
                         StmtKind::CoreToCoreCommunication => {
@@ -2934,7 +3035,7 @@ struct OpContext<'a, S: DdlSite + ?Sized> {
     metadata: &'a mut Metadata,
     dsc: &'a mut DesignSpaceConfig,
     site: &'a mut S,
-    curr_parent: NodeName,
+    curr_parent: NodeId,
 }
 
 /// `ddl::LoopOp` — one `dsc2::LoopNode`, or NO node at all where its band is empty or is exactly the
@@ -2968,7 +3069,7 @@ fn op_loop<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
         .get(&operand_at(stmt.operands, 1)?)?;
     if dims.is_empty() {
         return Some(OpOutcome {
-            parent: Some(ctx.curr_parent.clone()),
+            parent: Some(ctx.curr_parent),
             regions: vec![RegionId(0)],
         });
     }
@@ -2976,12 +3077,16 @@ fn op_loop<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
         if let Some(label) = label {
             ctx.interface.core_chunk_loop_label = Some(label);
         }
-        let below = ctx
-            .metadata
-            .below_lx_schedule_insert_block
-            .and_then(|block| ctx.state.block_name(block));
+        // ⭐⭐ `blockNodeForInsertion = metadata_.belowLxScheduleInsertBlock` — the L3 block ITSELF,
+        // by identity. This used to go through a name lookup over the conversion's OWN minted names,
+        // which by that method's own admission could never hold an L3-seeded block: the answer was
+        // ALWAYS [`None`], and `process_region`'s `outcome.parent?` therefore refused every template
+        // whose loop band is the core/chunk pair.
         return Some(OpOutcome {
-            parent: below,
+            parent: ctx
+                .metadata
+                .below_lx_schedule_insert_block
+                .map(|block| block.node()),
             regions: vec![RegionId(0)],
         });
     }
@@ -2991,10 +3096,9 @@ fn op_loop<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
         name.push_str(dim.dim.spelling());
     }
     let name = NodeName(name);
-    let node = ctx.state.mint_node(&name);
-    ctx.state.add_child(
-        &ctx.curr_parent.clone(),
-        SchedNode::Loop(Box::new(LoopNode {
+    let node = ctx.site.add_loop(
+        ctx.curr_parent,
+        LoopNode {
             block: BlockNode {
                 name: name.clone(),
                 children: Vec::new(),
@@ -3003,13 +3107,14 @@ fn op_loop<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
             num: Some(num),
             den: Some(den),
             parametric_lds: None,
-        })),
+        },
     )?;
+    ctx.state.record(&name, node);
     if let Some(label) = label {
         ctx.interface.loop_labels.insert(label, node);
     }
     Some(OpOutcome {
-        parent: Some(name),
+        parent: Some(node),
         regions: vec![RegionId(0)],
     })
 }
@@ -3020,11 +3125,25 @@ fn op_loop<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
 /// ⛔ [`None`] IS *"Unknown dimension"*, *"Specified dimension of parametric loop operation is marked
 /// to be dropped"* — a dropped dim is an error HERE and merely skipped in [`op_loop`] — and
 /// *"Specified tensor of parametric loop does not have ldsIdx_"*.
+///
+/// ⛔⛔ AND IT IS ALSO THE ONE ARM WHOSE NODE THE LIVE TREE CANNOT HOLD, WHICH IS A RECORDED
+/// DIVERGENCE AND NOT A READING OF THE REFERENCE. `newLoopNode->numId_ = -1; denId_ = -1;
+/// markAsParametricLoop(); setParametricLdsIdx(ldsIdx)` (`ddc/ddl/ddl_conversion.cpp:1125-1161`) mints
+/// a real node there, and the port's live tree stores a `LOOP` as
+/// [`crate::schedule::ddc::transformation_util::LoopNode`], whose `num`/`den` are `DatastageId` and
+/// NOT optional — `-1` is unspellable in it — and which carries no `parametricLdsIdx_` at all. The
+/// totality is not this file's to relax: [`crate::schedule::l3::dl_ops::LoopStages::loop_num`] returns
+/// a bare `DatastageId` by its own statement *"every loop node carries both"*.
+///
+/// ⛔ SO THIS REFUSES RATHER THAN MINTING A LOOP WITH INVENTED DATASTAGES. A fabricated `numId_` is a
+/// program `dbo-opt` compiles happily and a trip count taken from the wrong stage; the refusal is
+/// loud, reaches `fill.said` as `DscFilled::No`, and costs the three `quantization*` templates (28 of
+/// the 32 vendored templates' `ddl.parametric_loop`s) which were producing nothing at all before this.
 fn op_parametric_loop<S: DdlSite + ?Sized>(
     ctx: &mut OpContext<'_, S>,
     stmt: &Stmt,
 ) -> Option<OpOutcome> {
-    let Attrs::Loop { label } = stmt.attrs else {
+    let Attrs::Loop { label: _ } = stmt.attrs else {
         return None;
     };
     let prop = ctx
@@ -3035,42 +3154,14 @@ fn op_parametric_loop<S: DdlSite + ?Sized>(
     if prop.drop_dim {
         return None;
     }
-    let dim = prop.dim?;
-    let lds = tensor_prop(
+    let _dim = prop.dim?;
+    let _lds = tensor_prop(
         ctx.program,
         &mut ctx.interface.tensor_definition,
         operand_at(stmt.operands, 1)?,
     )?
     .lds?;
-    let name = NodeName(format!(
-        "parametric_loop_{}({})",
-        dim.spelling(),
-        prop.meta_dim_kind.label()
-    ));
-    let node = ctx.state.mint_node(&name);
-    ctx.state.add_child(
-        &ctx.curr_parent.clone(),
-        SchedNode::Loop(Box::new(LoopNode {
-            block: BlockNode {
-                name: name.clone(),
-                children: Vec::new(),
-            },
-            dims: vec![LoopDim {
-                dim,
-                kind: prop.meta_dim_kind,
-            }],
-            num: None,
-            den: None,
-            parametric_lds: Some(lds),
-        })),
-    )?;
-    if let Some(label) = label {
-        ctx.interface.loop_labels.insert(label, node);
-    }
-    Some(OpOutcome {
-        parent: Some(name),
-        regions: vec![RegionId(0)],
-    })
+    None
 }
 
 /// `ddl::DataTransferOp` — one `dsc2::TransferNode`, SPLIT into one node per row where the source or
@@ -3107,9 +3198,9 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
         ctx.interface,
         ctx.metadata,
         ctx.dsc,
-        &*ctx.site,
+        &mut *ctx.site,
         src_name,
-        &ctx.curr_parent.clone(),
+        ctx.curr_parent,
         None,
         false,
     )?;
@@ -3121,9 +3212,9 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
             ctx.interface,
             ctx.metadata,
             ctx.dsc,
-            &*ctx.site,
+            &mut *ctx.site,
             *name,
-            &ctx.curr_parent.clone(),
+            ctx.curr_parent,
             None,
             true,
         )?;
@@ -3175,7 +3266,6 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
     }
     let units: Vec<SenComponent> = dsts.iter().map(|dst| dst.operand.unit).collect();
     let name = transfer_node_name(&src_operand, &units);
-    let node = ctx.state.mint_node(&name);
     let (first, rest) = {
         let mut ends = dsts.iter().map(|dst| dst.operand);
         (ends.next()?, ends.collect::<Vec<_>>())
@@ -3195,6 +3285,11 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
         core_id_to_gtr_info: BTreeMap::new(),
         transfer_size: BTreeMap::new(),
     };
+    // ⭐ `currParent->addChildNode(newNode)` OVER THE LIVE TREE, AND IT IS THE FIRST STATEMENT THAT
+    // NEEDS THE NODE'S IDENTITY — the reference's `new dsc2::TransferNode()`, whose remaining fields it
+    // goes on writing in place below and which this arm writes back with `set_transfer`.
+    let node = ctx.site.add_transfer(ctx.curr_parent, transfer.clone())?;
+    ctx.state.record(&name, node);
     // The styles, and the dims they apply to, which entry 325 writes back in this same order.
     let mut per_dim = BTreeMap::new();
     process_access_patterns(
@@ -3255,12 +3350,12 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
     } else {
         false
     };
-    ctx.state.transfers.insert(node, transfer.clone());
+    // ⭐ THE FIELDS THE REFERENCE WENT ON WRITING INTO `newNode` — the padding, the indirections and
+    // the resolved ends — landing on the node the tree already holds rather than in an arena beside it.
+    ctx.site.set_transfer(node, transfer.clone())?;
     if let Some(rotate) = rotate {
         ctx.state.rotate_elements.insert(node, rotate);
     }
-    ctx.state
-        .add_child(&ctx.curr_parent.clone(), SchedNode::Leaf(name))?;
     if split {
         let rows = src.remaining.len().max(rem_dst.len());
         for row in 0..rows {
@@ -3282,7 +3377,8 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
                 &copy.dsts.iter().map(|end| end.unit).collect::<Vec<_>>(),
             );
             copy.name = copy_name.clone();
-            let copy_node = ctx.state.mint_node(&copy_name);
+            let copy_node = ctx.site.add_transfer(ctx.curr_parent, copy)?;
+            ctx.state.record(&copy_name, copy_node);
             let mut copy_meta = ctx
                 .metadata
                 .datatransfers
@@ -3292,19 +3388,16 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
             copy_meta.apply_row_offset_src = src.remaining.is_empty();
             copy_meta.apply_row_offset_dst = rem_dst.is_empty();
             ctx.metadata.datatransfers.insert(copy_node, copy_meta);
-            ctx.state.transfers.insert(copy_node, copy);
             // `copyNode->rotateNumElements_ = newNode->rotateNumElements_`.
             if let Some(rotate) = rotate {
                 ctx.state.rotate_elements.insert(copy_node, rotate);
             }
-            ctx.state
-                .add_child(&ctx.curr_parent.clone(), SchedNode::Leaf(copy_name))?;
-            ctx.state.attribute_transfer_users(copy_node);
+            attribute_transfer_users(ctx.state, &*ctx.site, copy_node);
         }
     } else {
         // No split: every remaining destination unit becomes another end of the SAME node.
         for unit in &rem_dst {
-            let held = ctx.state.transfers.get_mut(&node)?;
+            let mut held = ctx.site.transfer(node)?;
             let (mut ends, mut hops) = dsts_parts(&held.dsts);
             let mut route = hops.last().cloned().unwrap_or(Hops(Vec::new()));
             let mut end = *ends.last()?;
@@ -3313,11 +3406,12 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
             ends.push(end);
             hops.push(route);
             held.dsts = dsts_from(ends, hops)?;
+            ctx.site.set_transfer(node, held)?;
         }
     }
-    ctx.state.attribute_transfer_users(node);
+    attribute_transfer_users(ctx.state, &*ctx.site, node);
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -3356,9 +3450,9 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
                 ctx.interface,
                 ctx.metadata,
                 ctx.dsc,
-                &*ctx.site,
+                &mut *ctx.site,
                 name,
-                &ctx.curr_parent.clone(),
+                ctx.curr_parent,
                 None,
                 false,
             )?;
@@ -3423,9 +3517,8 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
             ex_unit.spelling(),
             op.cpp_spelling()
         ));
-        let node = ctx.state.mint_node(&name);
-        ctx.state.computes.insert(
-            node,
+        let node = ctx.site.add_compute(
+            ctx.curr_parent,
             ComputeNode {
                 name: name.clone(),
                 op,
@@ -3436,9 +3529,8 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
                 data_format,
                 instr_attribute: attribute.clone(),
             },
-        );
-        ctx.state
-            .add_child(&ctx.curr_parent.clone(), SchedNode::Leaf(name))?;
+        )?;
+        ctx.state.record(&name, node);
         // ⛔ THE CLONES ONLY, verbatim: `setDataLocAndInfo` already attributed the FIRST row's ends
         // while resolving them, and the reference re-walks them under `nodeToInsert != newNode`.
         if row > 0 {
@@ -3450,7 +3542,7 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
         }
     }
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -3487,7 +3579,7 @@ fn op_datastage<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) ->
     held.strategy = strategy;
     held.allow_epilogue = epilogue;
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -3511,7 +3603,7 @@ fn op_get_external_datastage<S: DdlSite + ?Sized>(
         .datastage_definition
         .insert(*stmt.results.first()?, id);
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -3554,24 +3646,27 @@ fn op_if<S: DdlSite + ?Sized>(
     )?;
     if let Some(resolved) = prop.resolved {
         return Some(OpOutcome {
-            parent: Some(ctx.curr_parent.clone()),
+            parent: Some(ctx.curr_parent),
             regions: vec![if resolved { then_region } else { else_region }],
         });
     }
+    // ⛔ EVERY CONDITION THIS ARM MINTS IS CALLED `"condition"` — the reference's own name — which is
+    // why the outcome is the node's IDENTITY. A name-keyed parent would have made the 570 `ddl.if`s of
+    // the vendored templates all resolve to the first one minted.
     let name = NodeName("condition".to_string());
-    ctx.state.mint_node(&name);
-    ctx.state.add_child(
-        &ctx.curr_parent.clone(),
-        SchedNode::Guarded(Box::new(ConditionNode {
+    let node = ctx.site.add_condition(
+        ctx.curr_parent,
+        ConditionNode {
             name: name.clone(),
             loop_cond: dsc_loop_cond(&prop.loop_cond),
             core_cl_cond: prop.core_cl_cond.0.clone(),
             then_region: Vec::new(),
             else_region: Vec::new(),
-        })),
+        },
     )?;
+    ctx.state.record(&name, node);
     Some(OpOutcome {
-        parent: Some(name),
+        parent: Some(node),
         regions: vec![then_region, else_region],
     })
 }
@@ -3617,7 +3712,41 @@ fn op_opaque<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Op
         ex_unit.spelling(),
         func.spelling()
     ));
-    let node = ctx.state.mint_node(&name);
+    // ⭐⭐ `auto newNode = new dsc2::ComputeNode()` (`ddl_conversion.cpp:1574`) — MINTED HERE AND
+    // LINKED AT THE END OF THIS ARM (`:1709`), which is the reference's own order: the internal
+    // register allocation below is linked FIRST (`:1626`) and names this compute as its
+    // `tempStorageForCompute_`, its `allocUsers_` entry and its `compAndAllocNode` key, so a compute
+    // linked here would sit ahead of its own allocation.
+    //
+    // ⛔ EVERY FIELD IT CARRIES IS ALREADY KNOWN: the fused format, the op, the execution unit and the
+    // three attribute lists off `stmt.attrs`. The reference fills them progressively on the same
+    // pointer and reads `dataFormat_` from the same `computeOp_.front()` at `:1708`.
+    // ⚠️ A REFUSAL BELOW LEAVES THIS NODE UNLINKED IN THE TREE, which is the reference's own leaked
+    // `new` on its `DT_ERROR` paths. The DSC is abandoned either way (`DscFilled::No`), so it is an
+    // orphan of a run that produced no schedule and not a node any walk reaches.
+    let node = ctx.site.mint_compute(ComputeNode {
+        name: name.clone(),
+        op,
+        ex_unit,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        num_folds_engaged: NumFolds::ONE,
+        data_format,
+        instr_attribute: InstrAttribute {
+            unroll: Unroll::ONE,
+            precision: None,
+            read_write_regs: BTreeMap::new(),
+            read_only_regs: BTreeMap::new(),
+            mode: None,
+            compute_mask: ComputeMask::ALL,
+            repetition: Repetition::ALL_SLICES,
+            indices: Vec::new(),
+            params: params.iter().copied().collect(),
+            input_data_connects: reads.to_vec(),
+            output_data_connects: writes.to_vec(),
+        },
+    })?;
+    ctx.state.record(&name, node);
     // ⛔ *"No need unrolling without internal registers"* — an unroll factor with nothing to unroll.
     if internal_registers.is_empty() && max_unroll != MaxUnroll(1) {
         return None;
@@ -3667,9 +3796,12 @@ fn op_opaque<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Op
                 alloc_users: vec![node],
             },
         );
-        ctx.state.mint_node(&alloc_name);
-        ctx.state
-            .add_child(&ctx.curr_parent.clone(), SchedNode::Leaf(alloc_name))?;
+        // ⛔⛔ `currParent->addChildNode(myAllocNode)` IS NOT PORTED HERE AND THE NODE IS THEREFORE
+        // ABSENT FROM THE LIVE TREE — see [`DdlConversion::allocations`]. It is the `AllocArena`
+        // defect, not this seam's: the live tree's ALLOCATE variant carries the L3 scheduler's
+        // projection and this is a `dsc2::AllocateNode`. It is stated once, here and in
+        // [`process_allocation`], rather than being minted into a copy that is dropped.
+        let _ = alloc_name;
         ctx.metadata
             .new_allocations
             .entry(memory)
@@ -3695,39 +3827,12 @@ fn op_opaque<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Op
                 ctx.dsc,
                 &*ctx.site,
                 named,
-                &ctx.curr_parent.clone(),
+                ctx.curr_parent,
                 Some(node),
             )?,
         };
         in_out_reg_allocs.insert(reg.name, alloc);
     }
-    ctx.state.computes.insert(
-        node,
-        ComputeNode {
-            name: name.clone(),
-            op,
-            ex_unit,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            num_folds_engaged: NumFolds::ONE,
-            data_format,
-            instr_attribute: InstrAttribute {
-                unroll: Unroll::ONE,
-                precision: None,
-                read_write_regs: BTreeMap::new(),
-                read_only_regs: BTreeMap::new(),
-                mode: None,
-                compute_mask: ComputeMask::ALL,
-                repetition: Repetition::ALL_SLICES,
-                indices: Vec::new(),
-                params: params.iter().copied().collect(),
-                input_data_connects: reads.to_vec(),
-                output_data_connects: writes.to_vec(),
-            },
-        },
-    );
-    ctx.state
-        .add_child(&ctx.curr_parent.clone(), SchedNode::Leaf(name))?;
     ctx.metadata.opaque_ops.insert(
         node,
         OpaqueOp {
@@ -3738,8 +3843,11 @@ fn op_opaque<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Op
             lds_idx: Some(lds),
         },
     );
+    // ⭐ `currParent->addChildNode(newNode)` (`ddc/ddl/ddl_conversion.cpp:1709`) — the LAST statement
+    // of the arm, so the compute lands after the internal register allocation that names it.
+    ctx.site.link_child(ctx.curr_parent, node)?;
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -3814,31 +3922,36 @@ fn op_sync<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
                 ends.senders.push(held_name.clone());
             }
         }
-        ctx.state.mint_node(&cl0.name);
-        ctx.state.mint_node(&cl1.name);
-        ctx.state.mint_node(&guard);
         // ⭐ THE GUARD IS A CORE/CORELET CONDITION AND CARRIES NO LOOP TERMS: corelet 0 takes the
         // `then` branch on every used core, so `loopCond_` stays empty by construction.
         let mut core_cl_cond = BTreeMap::new();
         for core in ctx.dsc.core_ids_used.iter() {
             core_cl_cond.insert(core, BTreeSet::from([corelet(0)?]));
         }
-        ctx.state.add_child(
-            &ctx.curr_parent.clone(),
-            SchedNode::Guarded(Box::new(ConditionNode {
-                name: guard,
+        // ⭐ THE CONDITION, THEN ITS TWO REGION BLOCKS, THEN ONE SYNC IN EACH — the same shape the
+        // nested `SchedNode::Guarded` value spelled, minted into the live tree in the order
+        // `addThenRegion`/`addElseRegion` fill: `add_block` on a CONDITION parent IS that override.
+        let guard_node = ctx.site.add_condition(
+            ctx.curr_parent,
+            ConditionNode {
+                name: guard.clone(),
                 loop_cond: DscLoopCondComposite::default(),
                 core_cl_cond,
-                then_region: vec![SchedNode::Block(BlockNode {
-                    name: then_name,
-                    children: vec![SchedNode::Sync(cl0)],
-                })],
-                else_region: vec![SchedNode::Block(BlockNode {
-                    name: else_name,
-                    children: vec![SchedNode::Sync(cl1)],
-                })],
-            })),
+                then_region: Vec::new(),
+                else_region: Vec::new(),
+            },
         )?;
+        ctx.state.record(&guard, guard_node);
+        let then_block = ctx.site.add_block(guard_node, then_name.clone())?;
+        ctx.state.record(&then_name, then_block);
+        let cl0_name = cl0.name.clone();
+        let cl0_node = ctx.site.add_sync(then_block, cl0)?;
+        ctx.state.record(&cl0_name, cl0_node);
+        let else_block = ctx.site.add_block(guard_node, else_name.clone())?;
+        ctx.state.record(&else_name, else_block);
+        let cl1_name = cl1.name.clone();
+        let cl1_node = ctx.site.add_sync(else_block, cl1)?;
+        ctx.state.record(&cl1_name, cl1_node);
     } else {
         let ends = ctx
             .interface
@@ -3852,12 +3965,12 @@ fn op_sync<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
         } else {
             ends.senders.push(node.name.clone());
         }
-        ctx.state.mint_node(&node.name);
-        ctx.state
-            .add_child(&ctx.curr_parent.clone(), SchedNode::Sync(node))?;
+        let sync_name = node.name.clone();
+        let sync_node = ctx.site.add_sync(ctx.curr_parent, node)?;
+        ctx.state.record(&sync_name, sync_node);
     }
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -3881,21 +3994,21 @@ fn op_implicit_sync<S: DdlSite + ?Sized>(
     components.extend(unroll_row_units(Unit::L0lu));
     let (first, rest) = components.split_first()?;
     let name = NodeName("sync_implicit_L0".to_string());
-    let node = ctx.state.mint_node(&name);
-    ctx.state.add_child(
-        &ctx.curr_parent.clone(),
-        SchedNode::Sync(SyncNode {
-            name,
+    let node = ctx.site.add_sync(
+        ctx.curr_parent,
+        SyncNode {
+            name: name.clone(),
             units: SyncUnits::new(*first, rest.to_vec()),
             direction: SyncDirection::Send,
             strength: SyncStrength::Hard,
             implicit_sync_ref_transfer: None,
             other_ends: Vec::new(),
-        }),
+        },
     )?;
+    ctx.state.record(&name, node);
     ctx.metadata.implicit_syncs.insert(node, alloc);
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -3987,7 +4100,7 @@ fn op_datastage_constraint<S: DdlSite + ?Sized>(
         }
     }
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -4012,7 +4125,7 @@ fn op_force_innermost_dimensions<S: DdlSite + ?Sized>(
             ctx.dsc,
             &*ctx.site,
             named,
-            &ctx.curr_parent.clone(),
+            ctx.curr_parent,
             None,
         )?,
     };
@@ -4043,7 +4156,7 @@ fn op_force_innermost_dimensions<S: DdlSite + ?Sized>(
     let (first, rest) = pinned.split_first()?;
     ctx.state.allocations.get_mut(&alloc)?.layout = AllocLayout::new(*first, rest.to_vec());
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -4170,7 +4283,7 @@ fn op_core_to_core<S: DdlSite + ?Sized>(
         }
     }
     Some(OpOutcome {
-        parent: Some(ctx.curr_parent.clone()),
+        parent: Some(ctx.curr_parent),
         regions: Vec::new(),
     })
 }
@@ -4196,7 +4309,7 @@ pub fn process_op<S: DdlSite + ?Sized>(
     dsc: &mut DesignSpaceConfig,
     site: &mut S,
     op: &DdlOp<'_>,
-    curr_parent: &NodeName,
+    curr_parent: NodeId,
 ) -> Option<OpOutcome> {
     let mut ctx = OpContext {
         program,
@@ -4205,7 +4318,7 @@ pub fn process_op<S: DdlSite + ?Sized>(
         metadata,
         dsc,
         site,
-        curr_parent: curr_parent.clone(),
+        curr_parent,
     };
     match *op {
         DdlOp::Loop(stmt) => op_loop(&mut ctx, stmt),
@@ -4509,7 +4622,12 @@ pub struct EmittedDdl {
 /// THE TWO SIZES ENTRY 325 ASKS OF A DSC THAT ARE NOT PORTED YET — a NARROW trait beside
 /// [`AllocationSite`] and [`DdlSite`], because neither call is in this campaign's file list and
 /// neither is reachable from the state the conversion itself holds.
-pub trait DdlSizes: AllocationSite {
+///
+/// ⭐ IT READS THE TREE TOO, because the export WALKS the tree: `convertDsc2Ddl` starts from
+/// `scheduleTree_.getHead()->next_` and takes each `ComputeNode`/`TransferNode` off the node it
+/// reaches. Those bodies used to come out of [`DdlConversion`]'s arenas, which were a second copy of
+/// the same nodes — see [`ScheduleReads`].
+pub trait DdlSizes: AllocationSite + ScheduleReads {
     /// `getBlockTransferSize(node, src_.unit_, 0, false, true)` FOLDED WITH the
     /// `!getRelevantCoreCl().empty()` that gates it — absent IS a transfer that states no
     /// `transfer_size=` at all.
@@ -4576,7 +4694,10 @@ pub fn convert_dsc2_ddl<S: DdlSizes + ?Sized>(
         external_syncs: BTreeMap::new(),
         next_op: 0,
     };
-    let dataflow = emission.region(&state.tree.head().children)?;
+    // `scheduleTree_.getHead()->next_` — the LIVE tree materialised for the walk, which is a READ and
+    // never a mint target.
+    let head = site.head_block()?;
+    let dataflow = emission.region(&head.children)?;
     Some(EmittedDdl {
         dim_mapping,
         lds_mapping,
@@ -4769,7 +4890,7 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
     /// writes, and nothing else.
     fn sync(&mut self, node: &SyncNode) -> Option<EmittedOp> {
         if let Some(transfer) = node.implicit_sync_ref_transfer {
-            let dst = *self.state.transfers.get(&transfer)?.dsts.first();
+            let dst = *self.site.transfer(transfer)?.dsts.first();
             let pair = self.pair(dst.storage, &dst.data)?;
             return Some(EmittedOp::ImplicitSync {
                 name: node.name.clone(),
@@ -4814,12 +4935,13 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
     fn leaf(&mut self, name: &NodeName, out: &mut Vec<EmittedOp>) -> Option<()> {
         let state = self.state;
         if let Some(id) = state.node_ids.get(name).copied() {
-            if let Some(compute) = state.computes.get(&id) {
-                out.push(self.compute(id, compute)?);
+            // ⭐ THE BODY OFF THE TREE NODE ITSELF, by the identity the mint recorded.
+            if let Some(compute) = self.site.compute(id) {
+                out.push(self.compute(id, &compute)?);
                 return Some(());
             }
-            if let Some(transfer) = state.transfers.get(&id) {
-                out.push(self.transfer(id, transfer)?);
+            if let Some(transfer) = self.site.transfer(id) {
+                out.push(self.transfer(id, &transfer)?);
                 return Some(());
             }
         }
@@ -4827,7 +4949,8 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
             .allocations
             .iter()
             .find(|(_, held)| held.name == *name)?;
-        self.allocate(*alloc, node, out)
+        let (alloc, node) = (*alloc, node.clone());
+        self.allocate(alloc, &node, out)
     }
 
     /// One `ddl.compute`, whose operands take the compute's OWN `exUnit_` wherever the operand names
@@ -5173,9 +5296,9 @@ pub fn process_region<S: DdlSite + ?Sized>(
     site: &mut S,
     regions: &RegionTree<'_>,
     region: RegionId,
-    curr_parent: &NodeName,
+    curr_parent: NodeId,
 ) -> Option<()> {
-    interface.region2blocks.insert(region, curr_parent.clone());
+    interface.region2blocks.insert(region, curr_parent);
     for held in regions.ops.get(&region).map_or(&[][..], Vec::as_slice) {
         let outcome = process_op(
             program,
@@ -5199,20 +5322,20 @@ pub fn process_region<S: DdlSite + ?Sized>(
                 *held.regions.get(usize::try_from(entry.0).ok()?)?
             };
             let parent = if num_regions > 1 {
-                let name = NodeName(format!("{}_region{at}", insertion.0));
-                state.add_block_child(
-                    &insertion,
-                    BlockNode {
-                        name: name.clone(),
-                        children: Vec::new(),
-                    },
-                )?;
-                name
+                // `newBlock->name_ = currParent->name_ + "_region" + i` — the insertion block's own
+                // name, which is why it is read back off the tree rather than carried alongside.
+                let name = NodeName(format!(
+                    "{}_region{at}",
+                    site.node_name(insertion).unwrap_or_default().0
+                ));
+                let block = site.add_block(insertion, name.clone())?;
+                state.record(&name, block);
+                block
             } else {
-                insertion.clone()
+                insertion
             };
             process_region(
-                program, state, interface, metadata, dsc, site, regions, op_region, &parent,
+                program, state, interface, metadata, dsc, site, regions, op_region, parent,
             )?;
         }
     }
@@ -5860,8 +5983,8 @@ pub struct DdlRoot<'d> {
 /// WHOLE list, so that check is ACROSS the nodes and not within one.
 /// ⛔ AND A THIRD IS THIS PORT'S OWN: [`SyncEnds`] links by NAME where the reference holds live tree
 /// pointers, so a name no `SYNC` node of the tree carries is a link that cannot be followed.
-fn insert_other_ends(
-    state: &mut DdlConversion,
+fn insert_other_ends<S: ScheduleWrites + ?Sized>(
+    site: &mut S,
     base: &[NodeName],
     other_end: &[NodeName],
 ) -> Option<()> {
@@ -5870,13 +5993,12 @@ fn insert_other_ends(
     }
     let mut units: BTreeSet<SenComponent> = BTreeSet::new();
     for name in base {
-        let node = state.tree.find_sync_mut(|sync| sync.name == *name)?;
-        for unit in node.units.iter() {
+        for unit in site.sync_units(name)?.iter() {
             if !units.insert(unit) {
                 return None;
             }
         }
-        node.other_ends.extend(other_end.iter().cloned());
+        site.add_sync_other_ends(name, other_end)?;
     }
     Some(())
 }
@@ -5901,20 +6023,19 @@ pub fn parse_ddl2_dsc<S: DdlSite + ?Sized>(
     site: &mut S,
     root: &DdlRoot<'_>,
 ) -> Option<Vec<String>> {
-    let head = state.tree.head().name.clone();
+    let head = site.head()?;
     let below = metadata.below_lx_schedule_insert_block?;
-    let insertion = if state.block_name(below) == Some(head.clone()) {
+    // ⭐⭐ `metadata_.belowLxScheduleInsertBlock != dsc.scheduleTree_.getHeadMutable()` — THE
+    // REFERENCE'S POINTER COMPARISON, now answerable because both sides are identities in the SAME
+    // tree. The old spelling compared a name looked up in the conversion's own minted-names map, which
+    // could never hold an L3-seeded block, so the equal branch was unreachable by construction.
+    let insertion = if below.node() == head {
         head
     } else {
         let name = NodeName("root_level_operations".to_owned());
-        state
-            .tree
-            .head_mut()
-            .add_child_front(SchedNode::Block(BlockNode {
-                name: name.clone(),
-                children: Vec::new(),
-            }));
-        name
+        let block = site.add_root_level_block(name.clone())?;
+        state.record(&name, block);
+        block
     };
     for region in &root.dataflows {
         process_region(
@@ -5926,7 +6047,7 @@ pub fn parse_ddl2_dsc<S: DdlSite + ?Sized>(
             site,
             &root.regions,
             *region,
-            &insertion,
+            insertion,
         )?;
     }
     let mut said = Vec::new();
@@ -5938,8 +6059,8 @@ pub fn parse_ddl2_dsc<S: DdlSite + ?Sized>(
     // `// connect sync nodes` (`:2796`) — every signal, per corelet, in both directions.
     for prop in interface.sync_definitions.values() {
         for ends in prop.syncs_per_cl.values() {
-            insert_other_ends(state, &ends.senders, &ends.receivers)?;
-            insert_other_ends(state, &ends.receivers, &ends.senders)?;
+            insert_other_ends(site, &ends.senders, &ends.receivers)?;
+            insert_other_ends(site, &ends.receivers, &ends.senders)?;
         }
     }
     Some(said)
@@ -6102,12 +6223,12 @@ mod unit_tests {
         EmittedAllocate, EmittedDdl, EmittedOp, EmittedStage, EmittedTensor, ExprValue,
         GlobalLayoutRefs, InternalTensor, InternalTensorSite, LabeledDsTail, LdsSlot, LoopCount,
         MatchSite, OpContext, OpOutcome, OperationBind, OperationProp, PaddedDimension, RegionId,
-        RegionOp, RegionTree, StyledDims, SyncLabel, TensorAndAllocation, TensorProp,
-        TypeDefinition, add_internal_tensor, allocation_pad_type, check_meta_dimensions,
-        convert_dsc2_ddl, corelet, export_to_ddl, match_ddl2_dsc, op_core_to_core, pad_type_spelling,
-        process_access_patterns, process_condition, process_dimension_op, process_expression,
-        process_op, process_region, process_types, tensor, tensor_and_allocation, tensor_prop,
-        transfer_access_pattern, verify_ddl_constraint,
+        RegionOp, RegionTree, ScheduleReads, ScheduleWrites, StyledDims, SyncLabel,
+        TensorAndAllocation, TensorProp, TypeDefinition, add_internal_tensor, allocation_pad_type,
+        check_meta_dimensions, convert_dsc2_ddl, corelet, export_to_ddl, match_ddl2_dsc,
+        op_core_to_core, pad_type_spelling, process_access_patterns, process_condition,
+        process_dimension_op, process_expression, process_op, process_region, process_types,
+        tensor, tensor_and_allocation, tensor_prop, transfer_access_pattern, verify_ddl_constraint,
     };
     use crate::arch::{Dd2, Elements, IsaGen};
     use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
@@ -6128,9 +6249,9 @@ mod unit_tests {
     use crate::schedule::ddc::transformation_util::{LoopCond, StageName};
     use crate::schedule::ddc::v1::CoreClSet;
     use crate::schedule::dsc2::{
-        AllocLayout, AllocPlacement, AllocateNode, BlockNode, LayoutDims, LdsIdx, LoopDim,
-        LoopNode, MaxDimSize, NodeName, NumBuffers, SchedNode, StartAddress, SyncDirection,
-        SyncNode, SyncStrength, SyncUnits, WordLength,
+        AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeNode, ConditionNode,
+        LayoutDims, LdsIdx, LoopDim, LoopNode, MaxDimSize, NodeName, NumBuffers, SchedNode,
+        StartAddress, SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, WordLength,
     };
     use crate::schedule::l3::dsc::{
         CoreCount, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DimPadding,
@@ -6174,15 +6295,13 @@ mod unit_tests {
         let sender = NodeName("send".to_owned());
         let twin = NodeName("send_twin".to_owned());
         let receiver = NodeName("recv".to_owned());
-        let sync = |name: &NodeName, direction| {
-            SchedNode::Sync(SyncNode {
-                name: name.clone(),
-                units: SyncUnits::new(SenComponent::Lxsu, []),
-                direction,
-                strength: SyncStrength::Hard,
-                implicit_sync_ref_transfer: None,
-                other_ends: Vec::new(),
-            })
+        let sync = |name: &NodeName, direction| SyncNode {
+            name: name.clone(),
+            units: SyncUnits::new(SenComponent::Lxsu, []),
+            direction,
+            strength: SyncStrength::Hard,
+            implicit_sync_ref_transfer: None,
+            other_ends: Vec::new(),
         };
         let run = |senders: Vec<NodeName>, receivers: Vec<NodeName>| {
             let mut interface = DdlInterface::default();
@@ -6193,18 +6312,34 @@ mod unit_tests {
                     syncs_per_cl: BTreeMap::from([(None, SyncEnds { senders, receivers })]),
                 },
             );
-            let mut metadata = Metadata::default();
-            metadata.below_lx_schedule_insert_block = BlockId::of(&OneBlock, NodeId(0));
             let mut dsc = config(Pinning::default(), None);
-            let mut site = Match::default();
-            let mut state = DdlConversion::new(BlockNode {
-                name: NodeName("head".to_owned()),
-                children: vec![
-                    sync(&sender, SyncDirection::Send),
-                    sync(&twin, SyncDirection::Send),
-                    sync(&receiver, SyncDirection::Receive),
-                ],
-            });
+            // ⭐ THE THREE SYNCS ARE ALREADY IN THE TREE, as an L3 stage would have left them — the
+            // pairing below reaches each one BY NAME through the seam.
+            let mut site = Match {
+                tree: TestTree::headed("head"),
+                ..Match::default()
+            };
+            let head = site.tree.head().expect("the seeded head block");
+            // ⛔ `belowLxScheduleInsertBlock` IS NOT THE HEAD, and that is the reference's own fact,
+            // not a convenience: it is found by `traverseTreeDFSMutable`, which seeds from
+            // `head_.next_` and so never yields `head_` (`dsc/dsc2.cpp:2233`). So it is a CHILD block
+            // here, and `!=` holds — which is what makes `root_level_operations` get minted.
+            let below = site
+                .tree
+                .add_block(head, NodeName("lx_below_schedule".to_owned()))
+                .expect("the L3 insertion block");
+            for (name, direction) in [
+                (&sender, SyncDirection::Send),
+                (&twin, SyncDirection::Send),
+                (&receiver, SyncDirection::Receive),
+            ] {
+                site.tree
+                    .add_sync(head, sync(name, direction))
+                    .expect("a sync of the seeded tree");
+            }
+            let mut metadata = Metadata::default();
+            metadata.below_lx_schedule_insert_block = BlockId::of(&OneBlock, below);
+            let mut state = DdlConversion::new();
             let said = parse_ddl2_dsc(
                 &program,
                 &mut state,
@@ -6218,21 +6353,29 @@ mod unit_tests {
                     transformations: vec![vec![Transformation::DisableTransferPromotion]],
                 },
             );
-            (said, state, interface, metadata)
+            (said, site, interface, metadata)
         };
-        let (said, state, interface, metadata) = run(vec![sender.clone()], vec![receiver.clone()]);
+        let (said, site, interface, metadata) = run(vec![sender.clone()], vec![receiver.clone()]);
         assert_eq!(said, Some(vec![TRANSFER_PROMOTION_DISABLED.to_owned()]));
         assert!(!metadata.transformation_config.enable_moving_data_transfer);
         let root = NodeName("root_level_operations".to_owned());
+        // ⛔ READ BACK OFF THE TREE THE CALL WROTE, not off a value this test still holds: the
+        // `root_level_operations` block is the FIRST child of the head, which is
+        // `addChildNode(.., /*addFront=*/true)`.
+        let head_block = site.head_block().expect("the head block");
         assert_eq!(
-            state.tree.head().children.first().map(SchedNode::name),
+            head_block.children.first().map(SchedNode::name),
             Some(&root)
         );
-        assert_eq!(interface.region2blocks, BTreeMap::from([(RegionId(0), root)]));
         assert_eq!(
-            state
-                .tree
-                .head()
+            interface.region2blocks,
+            BTreeMap::from([(
+                RegionId(0),
+                site.tree.named(&root).expect("the minted root block")
+            )])
+        );
+        assert_eq!(
+            head_block
                 .children
                 .iter()
                 .filter_map(|child| match child {
@@ -7216,7 +7359,8 @@ mod unit_tests {
     /// the two mappings written onto the parsed ops.
     #[test]
     fn emits_the_whole_schedule_tree_as_a_second_dataflow() {
-        struct Site;
+        /// The tree the export WALKS, plus the two sizes it asks for.
+        struct Site(TestTree);
         impl AllocationSite for Site {
             fn lds_allocation(&self, _lds: LdsIdx, _unit: SenComponent) -> Option<AllocId> {
                 None
@@ -7227,6 +7371,26 @@ mod unit_tests {
                 _unit: SenComponent,
             ) -> Option<AllocId> {
                 None
+            }
+        }
+        impl ScheduleReads for Site {
+            fn head(&self) -> Option<NodeId> {
+                self.0.head()
+            }
+            fn node_name(&self, node: NodeId) -> Option<NodeName> {
+                self.0.node_name(node)
+            }
+            fn head_block(&self) -> Option<BlockNode> {
+                self.0.head_block()
+            }
+            fn transfer(&self, node: NodeId) -> Option<TransferNode> {
+                self.0.transfer(node)
+            }
+            fn compute(&self, node: NodeId) -> Option<ComputeNode> {
+                self.0.compute(node)
+            }
+            fn sync_units(&self, name: &NodeName) -> Option<SyncUnits> {
+                self.0.sync_units(name)
             }
         }
         impl DdlSizes for Site {
@@ -7276,32 +7440,43 @@ mod unit_tests {
         let alloc = NodeName("alloc_l0".to_owned());
         let signal = NodeName("l3_signal".to_owned());
         let held = NodeName("loop_ds0_ds1".to_owned());
-        let mut state = DdlConversion::new(BlockNode {
-            name: NodeName("head".to_owned()),
-            children: vec![SchedNode::Loop(Box::new(LoopNode {
-                block: BlockNode {
-                    name: held.clone(),
-                    children: vec![
-                        SchedNode::Leaf(alloc.clone()),
-                        SchedNode::Sync(SyncNode {
-                            name: signal.clone(),
-                            units: SyncUnits::new(SenComponent::L0, []),
-                            direction: SyncDirection::Receive,
-                            strength: SyncStrength::Hard,
-                            implicit_sync_ref_transfer: None,
-                            other_ends: Vec::new(),
-                        }),
-                    ],
+        // ⭐ THE TREE, AS AN L3 STAGE LEFT IT — a loop over an allocate leaf and an L3 sync. The
+        // allocate is a LEAF here because the export reaches its body through
+        // [`DdlConversion::allocations`], which is the one arena left.
+        let mut tree = TestTree::headed("head");
+        let head = tree.head().expect("the head block");
+        let loop_node = tree
+            .add_loop(
+                head,
+                LoopNode {
+                    block: BlockNode {
+                        name: held.clone(),
+                        children: Vec::new(),
+                    },
+                    dims: vec![LoopDim {
+                        dim: PrimaryDim::X,
+                        kind: MetaDimKind::Unpadded,
+                    }],
+                    num: Some(Metadata::CORE_DSTGID),
+                    den: Some(Metadata::CHUNK_DSTGID),
+                    parametric_lds: None,
                 },
-                dims: vec![LoopDim {
-                    dim: PrimaryDim::X,
-                    kind: MetaDimKind::Unpadded,
-                }],
-                num: Some(Metadata::CORE_DSTGID),
-                den: Some(Metadata::CHUNK_DSTGID),
-                parametric_lds: None,
-            }))],
-        });
+            )
+            .expect("the loop");
+        tree.push(TestNode::Allocate(alloc.clone()), Some(loop_node));
+        tree.add_sync(
+            loop_node,
+            SyncNode {
+                name: signal.clone(),
+                units: SyncUnits::new(SenComponent::L0, []),
+                direction: SyncDirection::Receive,
+                strength: SyncStrength::Hard,
+                implicit_sync_ref_transfer: None,
+                other_ends: Vec::new(),
+            },
+        )
+        .expect("the L3 sync");
+        let mut state = DdlConversion::new();
         state.allocations.insert(
             AllocId(4),
             AllocateNode {
@@ -7322,7 +7497,7 @@ mod unit_tests {
         );
         let dsc = config(Pinning::default(), None);
 
-        let emitted = convert_dsc2_ddl(&program, &state, &interface, &metadata, &dsc, &Site)
+        let emitted = convert_dsc2_ddl(&program, &state, &interface, &metadata, &dsc, &Site(tree))
             .expect("a tree of a loop, an allocate and a sync emits");
         assert_eq!(
             emitted.dim_mapping,
@@ -7505,6 +7680,212 @@ mod unit_tests {
 
     // ⭐ FIXTURES FOR ENTRIES 345-347.
 
+    /// ⭐⭐ A SCHEDULE TREE FOR THE TESTS, BY NODE IDENTITY — the same shape
+    /// [`crate::schedule::stages::tree::TreeData`] is, in miniature, so a test can drive
+    /// [`parse_ddl2_dsc`] and then READ BACK what it minted.
+    ///
+    /// ⛔ IT IS A TEST DOUBLE AND NOT A SECOND TREE ON THE PRODUCTION PATH. Every assertion below
+    /// reads it AFTER the call returns, so nothing minted into it is dropped; the production seam is
+    /// [`crate::schedule::stages`]' own `TreeData` and there is no way to hand the conversion anything
+    /// else — [`DdlConversion`] has no tree field at all.
+    #[derive(Debug, Default, Clone, PartialEq)]
+    struct TestTree {
+        /// Every node's `(name, kind, parent)`, by identity.
+        nodes: BTreeMap<NodeId, TestNode>,
+        /// `next_` per parent, in insertion order.
+        children: BTreeMap<NodeId, Vec<NodeId>>,
+        head: Option<NodeId>,
+        next: u32,
+    }
+
+    /// One node of [`TestTree`] — the payload its `nodeType_` carries.
+    #[derive(Debug, Clone, PartialEq)]
+    enum TestNode {
+        Block(NodeName),
+        Loop(Box<LoopNode>),
+        Transfer(Box<TransferNode>),
+        Compute(Box<ComputeNode>),
+        Sync(Box<SyncNode>),
+        Condition(Box<ConditionNode>),
+        /// An `ALLOCATE` — a name, exactly as `sched_node_of`'s own ALLOCATE arm makes one.
+        Allocate(NodeName),
+    }
+
+    impl TestNode {
+        /// `name_`.
+        fn name(&self) -> NodeName {
+            match self {
+                Self::Block(name) | Self::Allocate(name) => name.clone(),
+                Self::Loop(held) => held.block.name.clone(),
+                Self::Transfer(held) => held.name.clone(),
+                Self::Compute(held) => held.name.clone(),
+                Self::Sync(held) => held.name.clone(),
+                Self::Condition(held) => held.name.clone(),
+            }
+        }
+    }
+
+    impl TestTree {
+        /// A tree with one head block of that name — `ScheduleTree()`'s own `head_`.
+        fn headed(name: &str) -> Self {
+            let mut tree = Self::default();
+            let head = tree.push(TestNode::Block(NodeName(name.to_owned())), None);
+            tree.head = Some(head);
+            tree
+        }
+
+        /// `new dsc2::XNode()` then `parent->addChildNode(..)`.
+        fn push(&mut self, node: TestNode, parent: Option<NodeId>) -> NodeId {
+            let id = NodeId(self.next);
+            self.next += 1;
+            self.nodes.insert(id, node);
+            if let Some(parent) = parent {
+                self.children.entry(parent).or_default().push(id);
+            }
+            id
+        }
+
+        /// The FIRST node of that name, which is how the sync pairing resolves an end.
+        fn named(&self, name: &NodeName) -> Option<NodeId> {
+            self.nodes
+                .iter()
+                .find_map(|(id, held)| (held.name() == *name).then_some(*id))
+        }
+
+        /// One node and everything under it, as `dsc2::` nodes — what a `getHead()` read hands back.
+        fn block_of(&self, at: NodeId) -> BlockNode {
+            BlockNode {
+                name: self.nodes.get(&at).map(TestNode::name).unwrap_or_default(),
+                children: self
+                    .children
+                    .get(&at)
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .filter_map(|child| self.sched_of(*child))
+                    .collect(),
+            }
+        }
+
+        /// One node as the `SchedNode` its kind makes it.
+        fn sched_of(&self, at: NodeId) -> Option<SchedNode> {
+            Some(match self.nodes.get(&at)? {
+                TestNode::Block(_) => SchedNode::Block(self.block_of(at)),
+                TestNode::Loop(held) => {
+                    let mut loop_node = (**held).clone();
+                    loop_node.block = self.block_of(at);
+                    SchedNode::Loop(Box::new(loop_node))
+                }
+                TestNode::Condition(held) => {
+                    let mut cond = (**held).clone();
+                    let regions: Vec<SchedNode> = self
+                        .children
+                        .get(&at)
+                        .map_or(&[][..], Vec::as_slice)
+                        .iter()
+                        .filter_map(|child| self.sched_of(*child))
+                        .collect();
+                    let mut regions = regions.into_iter();
+                    cond.then_region = regions.next().into_iter().collect();
+                    cond.else_region = regions.collect();
+                    SchedNode::Guarded(Box::new(cond))
+                }
+                TestNode::Sync(held) => SchedNode::Sync((**held).clone()),
+                TestNode::Transfer(held) => SchedNode::Leaf(held.name.clone()),
+                TestNode::Compute(held) => SchedNode::Leaf(held.name.clone()),
+                TestNode::Allocate(name) => SchedNode::Leaf(name.clone()),
+            })
+        }
+    }
+
+    impl ScheduleReads for TestTree {
+        fn head(&self) -> Option<NodeId> {
+            self.head
+        }
+        fn node_name(&self, node: NodeId) -> Option<NodeName> {
+            self.nodes.get(&node).map(TestNode::name)
+        }
+        fn head_block(&self) -> Option<BlockNode> {
+            Some(self.block_of(self.head?))
+        }
+        fn transfer(&self, node: NodeId) -> Option<TransferNode> {
+            match self.nodes.get(&node)? {
+                TestNode::Transfer(held) => Some((**held).clone()),
+                _ => None,
+            }
+        }
+        fn compute(&self, node: NodeId) -> Option<ComputeNode> {
+            match self.nodes.get(&node)? {
+                TestNode::Compute(held) => Some((**held).clone()),
+                _ => None,
+            }
+        }
+        fn sync_units(&self, name: &NodeName) -> Option<SyncUnits> {
+            match self.nodes.get(&self.named(name)?)? {
+                TestNode::Sync(held) => Some(held.units.clone()),
+                _ => None,
+            }
+        }
+    }
+
+    impl ScheduleWrites for TestTree {
+        fn add_root_level_block(&mut self, name: NodeName) -> Option<NodeId> {
+            let head = self.head?;
+            let node = self.push(TestNode::Block(name), None);
+            self.children.entry(head).or_default().insert(0, node);
+            Some(node)
+        }
+        fn add_block(&mut self, parent: NodeId, name: NodeName) -> Option<NodeId> {
+            // `ConditionNode::add_region`'s own refusal: both regions already filled.
+            let regions = self.children.get(&parent).map_or(0, Vec::len);
+            if matches!(self.nodes.get(&parent), Some(TestNode::Condition(_))) && regions >= 2 {
+                return None;
+            }
+            Some(self.push(TestNode::Block(name), Some(parent)))
+        }
+        fn add_loop(&mut self, parent: NodeId, held: LoopNode) -> Option<NodeId> {
+            Some(self.push(TestNode::Loop(Box::new(held)), Some(parent)))
+        }
+        fn add_transfer(&mut self, parent: NodeId, held: TransferNode) -> Option<NodeId> {
+            Some(self.push(TestNode::Transfer(Box::new(held)), Some(parent)))
+        }
+        fn set_transfer(&mut self, node: NodeId, held: TransferNode) -> Option<()> {
+            match self.nodes.get_mut(&node)? {
+                slot @ TestNode::Transfer(_) => {
+                    *slot = TestNode::Transfer(Box::new(held));
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+        fn add_compute(&mut self, parent: NodeId, held: ComputeNode) -> Option<NodeId> {
+            Some(self.push(TestNode::Compute(Box::new(held)), Some(parent)))
+        }
+        fn mint_compute(&mut self, held: ComputeNode) -> Option<NodeId> {
+            Some(self.push(TestNode::Compute(Box::new(held)), None))
+        }
+        fn link_child(&mut self, parent: NodeId, node: NodeId) -> Option<()> {
+            self.nodes.contains_key(&node).then(|| {
+                self.children.entry(parent).or_default().push(node);
+            })
+        }
+        fn add_sync(&mut self, parent: NodeId, held: SyncNode) -> Option<NodeId> {
+            Some(self.push(TestNode::Sync(Box::new(held)), Some(parent)))
+        }
+        fn add_condition(&mut self, parent: NodeId, held: ConditionNode) -> Option<NodeId> {
+            Some(self.push(TestNode::Condition(Box::new(held)), Some(parent)))
+        }
+        fn add_sync_other_ends(&mut self, name: &NodeName, others: &[NodeName]) -> Option<()> {
+            let at = self.named(name)?;
+            match self.nodes.get_mut(&at)? {
+                TestNode::Sync(held) => {
+                    held.other_ends.extend(others.iter().cloned());
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+    }
+
     /// A DSC seam that answers the four questions the match asks and nothing else: every tensor is
     /// two bytes of fp16, one stick of `X = 4` over `Y = 2`, and no allocation is placed.
     #[derive(Default)]
@@ -7514,6 +7895,65 @@ mod unit_tests {
         slices: BTreeMap<PrimaryDim, u32>,
         /// `coreIdToWkSlice_`.
         work: BTreeMap<Core, WkSlice>,
+        /// `dsc.scheduleTree_` — the tree the conversion mints into and this test reads back.
+        tree: TestTree,
+    }
+
+    impl ScheduleReads for Match {
+        fn head(&self) -> Option<NodeId> {
+            self.tree.head()
+        }
+        fn node_name(&self, node: NodeId) -> Option<NodeName> {
+            self.tree.node_name(node)
+        }
+        fn head_block(&self) -> Option<BlockNode> {
+            self.tree.head_block()
+        }
+        fn transfer(&self, node: NodeId) -> Option<TransferNode> {
+            self.tree.transfer(node)
+        }
+        fn compute(&self, node: NodeId) -> Option<ComputeNode> {
+            self.tree.compute(node)
+        }
+        fn sync_units(&self, name: &NodeName) -> Option<SyncUnits> {
+            self.tree.sync_units(name)
+        }
+    }
+
+    impl ScheduleWrites for Match {
+        fn add_root_level_block(&mut self, name: NodeName) -> Option<NodeId> {
+            self.tree.add_root_level_block(name)
+        }
+        fn add_block(&mut self, parent: NodeId, name: NodeName) -> Option<NodeId> {
+            self.tree.add_block(parent, name)
+        }
+        fn add_loop(&mut self, parent: NodeId, held: LoopNode) -> Option<NodeId> {
+            self.tree.add_loop(parent, held)
+        }
+        fn add_transfer(&mut self, parent: NodeId, held: TransferNode) -> Option<NodeId> {
+            self.tree.add_transfer(parent, held)
+        }
+        fn set_transfer(&mut self, node: NodeId, held: TransferNode) -> Option<()> {
+            self.tree.set_transfer(node, held)
+        }
+        fn add_compute(&mut self, parent: NodeId, held: ComputeNode) -> Option<NodeId> {
+            self.tree.add_compute(parent, held)
+        }
+        fn mint_compute(&mut self, held: ComputeNode) -> Option<NodeId> {
+            self.tree.mint_compute(held)
+        }
+        fn link_child(&mut self, parent: NodeId, node: NodeId) -> Option<()> {
+            self.tree.link_child(parent, node)
+        }
+        fn add_sync(&mut self, parent: NodeId, held: SyncNode) -> Option<NodeId> {
+            self.tree.add_sync(parent, held)
+        }
+        fn add_condition(&mut self, parent: NodeId, held: ConditionNode) -> Option<NodeId> {
+            self.tree.add_condition(parent, held)
+        }
+        fn add_sync_other_ends(&mut self, name: &NodeName, others: &[NodeName]) -> Option<()> {
+            self.tree.add_sync_other_ends(name, others)
+        }
     }
 
     impl AllocationSite for Match {
@@ -7610,7 +8050,7 @@ mod unit_tests {
     /// same state, and the `std::ostream&` the reference forwards is never written.
     #[test]
     fn exports_exactly_what_the_conversion_emits() {
-        struct Site;
+        struct Site(TestTree);
         impl AllocationSite for Site {
             fn lds_allocation(&self, _lds: LdsIdx, _unit: SenComponent) -> Option<AllocId> {
                 None
@@ -7621,6 +8061,26 @@ mod unit_tests {
                 _unit: SenComponent,
             ) -> Option<AllocId> {
                 None
+            }
+        }
+        impl ScheduleReads for Site {
+            fn head(&self) -> Option<NodeId> {
+                self.0.head()
+            }
+            fn node_name(&self, node: NodeId) -> Option<NodeName> {
+                self.0.node_name(node)
+            }
+            fn head_block(&self) -> Option<BlockNode> {
+                self.0.head_block()
+            }
+            fn transfer(&self, node: NodeId) -> Option<TransferNode> {
+                self.0.transfer(node)
+            }
+            fn compute(&self, node: NodeId) -> Option<ComputeNode> {
+                self.0.compute(node)
+            }
+            fn sync_units(&self, name: &NodeName) -> Option<SyncUnits> {
+                self.0.sync_units(name)
             }
         }
         impl DdlSizes for Site {
@@ -7635,14 +8095,12 @@ mod unit_tests {
         let interface = DdlInterface::default();
         let metadata = Metadata::default();
         let dsc = config(Pinning::default(), None);
-        let state = DdlConversion::new(BlockNode {
-            name: NodeName("head".to_owned()),
-            children: Vec::new(),
-        });
-        let exported = export_to_ddl(&program, &state, &interface, &metadata, &dsc, &Site);
+        let state = DdlConversion::new();
+        let site = || Site(TestTree::headed("head"));
+        let exported = export_to_ddl(&program, &state, &interface, &metadata, &dsc, &site());
         assert_eq!(
             exported,
-            convert_dsc2_ddl(&program, &state, &interface, &metadata, &dsc, &Site)
+            convert_dsc2_ddl(&program, &state, &interface, &metadata, &dsc, &site())
         );
         assert_eq!(
             exported,
@@ -7699,14 +8157,14 @@ mod unit_tests {
                 interface.resolved_conditions.is_empty(),
                 "the memo must be COLD or this test cannot tell the fix from the bug"
             );
-            let head = NodeName("head".to_owned());
-            let mut state = DdlConversion::new(BlockNode {
-                name: head.clone(),
-                children: Vec::new(),
-            });
+            let mut state = DdlConversion::new();
             let mut metadata = Metadata::default();
             let mut dsc = config(Pinning::default(), None);
-            let mut site = Match::default();
+            let mut site = Match {
+                tree: TestTree::headed("head"),
+                ..Match::default()
+            };
+            let head = site.tree.head().expect("the head block");
             let outcome = process_op(
                 &program,
                 &mut state,
@@ -7719,17 +8177,19 @@ mod unit_tests {
                     then_region: RegionId(1),
                     else_region: RegionId(2),
                 },
-                &head,
+                head,
             );
-            (outcome, state.tree.head().children.len())
+            // ⛔ THE CHILD COUNT IS READ OFF THE TREE THE CALL WROTE, after it returned.
+            let minted = site.head_block().map_or(0, |block| block.children.len());
+            (outcome, minted)
         };
 
-        let head = Some(NodeName("head".to_owned()));
+        let head = Some(NodeId(0));
         assert_eq!(
             run(false),
             (
                 Some(OpOutcome {
-                    parent: head.clone(),
+                    parent: head,
                     regions: vec![RegionId(2)],
                 }),
                 0,
@@ -7766,12 +8226,12 @@ mod unit_tests {
             .insert(NameId(0), CondProp::default());
         let mut metadata = Metadata::default();
         let mut dsc = config(Pinning::default(), None);
-        let mut site = Match::default();
-        let head = NodeName("head".to_owned());
-        let mut state = DdlConversion::new(BlockNode {
-            name: head.clone(),
-            children: Vec::new(),
-        });
+        let mut site = Match {
+            tree: TestTree::headed("head"),
+            ..Match::default()
+        };
+        let head = site.tree.head().expect("the head block");
+        let mut state = DdlConversion::new();
         let regions = RegionTree {
             ops: BTreeMap::from([(
                 RegionId(0),
@@ -7795,19 +8255,30 @@ mod unit_tests {
                 &mut site,
                 &regions,
                 RegionId(0),
-                &head,
+                head,
             ),
             Some(())
         );
+        // ⛔ EVERY BLOCK IS NAMED OFF THE TREE, so a region recorded against the wrong node fails
+        // here rather than agreeing with a name this test still holds.
+        let region0 = site
+            .tree
+            .named(&NodeName("condition_region0".to_owned()))
+            .expect("the THEN region block");
+        let region1 = site
+            .tree
+            .named(&NodeName("condition_region1".to_owned()))
+            .expect("the ELSE region block");
         assert_eq!(
             interface.region2blocks,
             BTreeMap::from([
                 (RegionId(0), head),
-                (RegionId(1), NodeName("condition_region0".to_owned())),
-                (RegionId(2), NodeName("condition_region1".to_owned())),
+                (RegionId(1), region0),
+                (RegionId(2), region1),
             ])
         );
-        let [SchedNode::Guarded(cond)] = state.tree.head().children.as_slice() else {
+        let head_block = site.head_block().expect("the head block");
+        let [SchedNode::Guarded(cond)] = head_block.children.as_slice() else {
             panic!("the condition node the unresolved `ddl.if` minted");
         };
         assert_eq!(
@@ -7868,13 +8339,11 @@ mod unit_tests {
             let mut site = Match {
                 slices: BTreeMap::from([(PrimaryDim::Y, slices)]),
                 work: work.clone(),
+                tree: TestTree::headed("head"),
                 ..Match::default()
             };
-            let head = NodeName("head".to_owned());
-            let mut state = DdlConversion::new(BlockNode {
-                name: head.clone(),
-                children: Vec::new(),
-            });
+            let head = site.tree.head().expect("the head block");
+            let mut state = DdlConversion::new();
             assert_eq!(
                 op_core_to_core(
                     &mut OpContext {
@@ -7884,7 +8353,7 @@ mod unit_tests {
                         metadata: &mut Metadata::default(),
                         dsc: &mut dsc,
                         site: &mut site,
-                        curr_parent: head.clone(),
+                        curr_parent: head,
                     },
                     C2C,
                 ),
@@ -8185,11 +8654,8 @@ mod unit_tests {
                 };
                 let mut parser = DdlModuleOp::default();
                 let mut interface = DdlInterface::default();
-                interface
-                    .region2blocks
-                    .insert(RegionId(1), NodeName("stale".to_owned()));
-                let mut metadata = Metadata::default();
-                metadata.below_lx_schedule_insert_block = BlockId::of(&OneBlock, NodeId(0));
+                // A stale entry the successful walk must CLEAR — `ddlInterface.clear()` (`:4396`).
+                interface.region2blocks.insert(RegionId(1), NodeId(99));
                 let mut dsc = matchable();
                 let mut site = Match {
                     ops: op_func
@@ -8203,12 +8669,19 @@ mod unit_tests {
                         })
                         .into_iter()
                         .collect(),
+                    tree: TestTree::headed("head"),
                     ..Match::default()
                 };
-                let mut state = DdlConversion::new(BlockNode {
-                    name: NodeName("head".to_owned()),
-                    children: Vec::new(),
-                });
+                // The L3 insertion block, a CHILD of the head — see
+                // [`Self::walks_both_regions_under_a_minted_root_block_and_pairs_the_sync_ends`].
+                let head = site.tree.head().expect("the head block");
+                let below = site
+                    .tree
+                    .add_block(head, NodeName("lx_below_schedule".to_owned()))
+                    .expect("the L3 insertion block");
+                let mut metadata = Metadata::default();
+                metadata.below_lx_schedule_insert_block = BlockId::of(&OneBlock, below);
+                let mut state = DdlConversion::new();
                 let selected = select_and_parse_ddl_template::<Dd2, _, _>(
                     &mut parser,
                     &mut state,
@@ -8219,12 +8692,11 @@ mod unit_tests {
                     &templates,
                     ln32,
                 );
-                (selected, parser, state, interface)
+                (selected, parser, site, interface)
             };
         let cores = DdlConstraint::MinNumCores(CoreCount(2));
         let second = Template::Summeanmaxexx2Fp32;
-        let (selected, parser, state, interface) =
-            run(Some(OpFunc::Exx2), second, cores, Ln32::Off);
+        let (selected, parser, site, interface) = run(Some(OpFunc::Exx2), second, cores, Ln32::Off);
         assert_eq!(
             selected,
             Some(DdlSelection {
@@ -8239,12 +8711,23 @@ mod unit_tests {
         let root = NodeName("root_level_operations".to_owned());
         assert_eq!(
             interface.region2blocks,
-            BTreeMap::from([(RegionId(0), root)])
+            BTreeMap::from([(
+                RegionId(0),
+                site.tree.named(&root).expect("the minted root block")
+            )])
         );
+        // ⛔ THE MINTED BLOCK IS THE **FIRST** CHILD OF THE HEAD — `addChildNode(.., /*front=*/true)`
+        // — sitting ahead of the L3 insertion block the seeded tree already carried. A count alone
+        // would pass on a tree that appended it.
         assert_eq!(
-            state.tree.head().children.len(),
-            1,
-            "the matched template's dataflow reached the tree"
+            site.head_block()
+                .expect("the head block")
+                .children
+                .iter()
+                .map(|child| child.name().clone())
+                .collect::<Vec<_>>(),
+            vec![root, NodeName("lx_below_schedule".to_owned())],
+            "the matched template's dataflow reached the LIVE tree, at the front of the head"
         );
         assert!(parser.module().is_some());
 

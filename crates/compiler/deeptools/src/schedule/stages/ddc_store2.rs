@@ -978,7 +978,7 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
 /// because the `ALL` arm of `isNodeRelevant` filters nothing at all"*
 /// ([`crate::schedule::ddc::fold::ScheduleTree::children`]'s own note). A DDL conversion splices by
 /// position, so a reordering here would move where the parsed template lands.
-fn head_block_of(tree: &super::tree::TreeData, block: NodeId) -> BlockNode {
+pub(super) fn head_block_of(tree: &super::tree::TreeData, block: NodeId) -> BlockNode {
     BlockNode {
         name: tree.name(block).unwrap_or_default(),
         children: tree

@@ -42,7 +42,10 @@ use crate::schedule::ddc::transformation as tr;
 use crate::schedule::ddc::transformation_util as tu;
 use crate::schedule::ddc::v1;
 use crate::schedule::ddl::conversion as conv;
-use crate::schedule::dsc2::{LdsIdx, WordLength};
+use crate::schedule::dsc2::{
+    BlockNode, ComputeNode, ConditionNode, LdsIdx, LoopNode, NodeName, SyncNode, SyncUnits,
+    TransferNode, WordLength,
+};
 use crate::schedule::l3::dl_ops::AddressFoldCoords;
 use crate::schedule::l3::dsc::{DscIdx, SymbolicDimInfo, WkSlice};
 use crate::units::{Core, Corelet};
@@ -664,6 +667,215 @@ impl conv::MatchSite for Dsc2Ddl<'_, '_> {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐⭐⭐ `dsc.scheduleTree_` — THE LIVE TREE, WHICH IS WHAT THE DDL CONVERSION NOW MINTS INTO.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐⭐ THE SEAM THAT REPLACED A DROPPED DEEP COPY. `run_v1` used to open the conversion with
+/// `DdlConversion::new(store.schedule_head_block())` — a `dsc2::BlockNode` **by value** — so every
+/// compute, transfer, loop, sync and condition the DDL walk minted was written into a temporary and
+/// discarded, and the census could only ever show the `allocate` nodes stage 2a had seeded. The
+/// reference holds `DesignSpaceConfig& dsc` (`ddc/ddl/ddl_conversion.h:511`) and starts
+/// `parseDdl2Dsc` from `dsc.scheduleTree_.getHeadMutable()` (`ddl_conversion.cpp:2774`), which is why
+/// `performAutomaticShuffling`'s `traverseTreeDFSMutable(nullptr, {COMPUTE})`
+/// (`ddc_transformation.cpp:1999`) finds those computes three statements later.
+///
+/// ⭐ NO DISJOINT-BORROW PROBLEM AND NO STUBBED ACCESSOR. [`super::state::DscTree`] keeps its
+/// [`super::tree::TreeData`] behind a [`RefCell`] and hands no borrow of the interior out
+/// ([`super::state::DscTree::with_mut`]), so a `&mut self` write here and the `&self` reads
+/// [`Dsc2Carriers`]' other nine carriers make cannot alias. That is the same property the `dsc`/
+/// `stages` split relies on.
+impl conv::ScheduleReads for Dsc2Ddl<'_, '_> {
+    /// `scheduleTree_.getHeadMutable()`.
+    fn head(&self) -> Option<NodeId> {
+        self.state.tree(self.dsc)?.with(|tree| tree.head())
+    }
+
+    fn node_name(&self, node: NodeId) -> Option<NodeName> {
+        self.state.tree(self.dsc)?.with(|tree| tree.name(node))
+    }
+
+    /// `scheduleTree_.getHead()` MATERIALISED — the same walk
+    /// [`v1::Dsc2Store::schedule_head_block`] answers with, over the LIVE tree.
+    fn head_block(&self) -> Option<BlockNode> {
+        self.state.tree(self.dsc)?.with(|tree| {
+            let head = tree.head()?;
+            Some(super::ddc_store2::head_block_of(tree, head))
+        })
+    }
+
+    fn transfer(&self, node: NodeId) -> Option<TransferNode> {
+        self.state.tree(self.dsc)?.with(|tree| tree.transfer(node))
+    }
+
+    fn compute(&self, node: NodeId) -> Option<ComputeNode> {
+        self.state
+            .tree(self.dsc)?
+            .with(|tree| match tree.kind_of(node) {
+                Some(super::tree::Kind::Compute(held)) => Some(held.clone()),
+                _ => None,
+            })
+    }
+
+    /// The `SYNC` this tree carries by that name — the sync pairing holds its ends by NAME
+    /// ([`crate::schedule::dsc2::SyncNode::other_ends`]) where the reference holds live pointers.
+    fn sync_units(&self, name: &NodeName) -> Option<SyncUnits> {
+        self.state.tree(self.dsc)?.with(|tree| {
+            let node = tree.find_named(&name.0)?;
+            tree.sync_units(node)
+        })
+    }
+}
+
+impl conv::ScheduleWrites for Dsc2Ddl<'_, '_> {
+    /// `getHeadMutable()->addChildNode(new dsc2::BlockNode(), /*addFront=*/true)`.
+    fn add_root_level_block(&mut self, name: NodeName) -> Option<NodeId> {
+        let held = self.state.tree(self.dsc)?;
+        held.with_mut(|tree| {
+            let head = tree.head()?;
+            let node = tree.add(name, super::tree::Kind::Block, None);
+            tree.link(node, tu::InsertionPoint::FirstIn(head));
+            Some(node)
+        })
+    }
+
+    /// `currParent->addChildNode(new dsc2::BlockNode())`, DISPATCHED ON THE PARENT — a `CONDITION`
+    /// takes it as its next region, which is `ConditionNode::addChildNode`'s override.
+    fn add_block(&mut self, parent: NodeId, name: NodeName) -> Option<NodeId> {
+        let held = self.state.tree(self.dsc)?;
+        held.with_mut(|tree| {
+            let then_region = match tree.kind_of(parent) {
+                Some(super::tree::Kind::Condition(cond)) => {
+                    // `addThenRegion` while that region is empty, then `addElseRegion`, then
+                    // `ConditionNode::add_region`'s own refusal.
+                    if cond.then_region.is_empty() {
+                        Some(true)
+                    } else if cond.else_region.is_empty() {
+                        Some(false)
+                    } else {
+                        return None;
+                    }
+                }
+                _ => None,
+            };
+            let node = tree.add(name, super::tree::Kind::Block, None);
+            match then_region {
+                Some(then) => tree.add_region(parent, node, then),
+                None => tree.link(node, tu::InsertionPoint::LastIn(parent)),
+            }
+            Some(node)
+        })
+    }
+
+    /// `currParent->addChildNode(new dsc2::LoopNode())`.
+    ///
+    /// ⛔ `numId_`/`denId_` MUST BOTH BE STATED, which is [`tu::LoopNode`]'s own contract — *"every
+    /// callsite of the constructor passes a real pair"*. A parametric loop carries `-1` for both and
+    /// is the arm [`conv::op_parametric_loop`] refuses rather than inventing a stage for; the
+    /// [`None`] here is that same fact, reached from the other side.
+    fn add_loop(&mut self, parent: NodeId, held: LoopNode) -> Option<NodeId> {
+        let (num, den) = (held.num?, held.den?);
+        if held.parametric_lds.is_some() {
+            return None;
+        }
+        let name = held.block.name.clone();
+        // `dims_`, IN THE LOOP'S OWN ORDER — non-empty by [`tu::LoopDims`]' construction, which is
+        // entry 114's *"Cannot construct loop with no dimensions"* made unspellable. The DDL arm has
+        // already refused an empty band before reaching here.
+        let kinded = |dim: &crate::schedule::dsc2::LoopDim| tu::PrimaryDimAndKind {
+            dim: dim.dim,
+            kind: dim.kind,
+        };
+        let (first, rest) = held.dims.split_first()?;
+        let minted = tu::LoopNode {
+            name: name.clone(),
+            num,
+            den,
+            dims: tu::LoopDims::new(kinded(first), rest.iter().map(kinded).collect()),
+        };
+        let tree = self.state.tree(self.dsc)?;
+        Some(tree.with_mut(|tree| tree.add(name, super::tree::Kind::Loop(minted), Some(parent))))
+    }
+
+    /// `currParent->addChildNode(new dsc2::TransferNode())`.
+    fn add_transfer(&mut self, parent: NodeId, held: TransferNode) -> Option<NodeId> {
+        let tree = self.state.tree(self.dsc)?;
+        let name = held.name.clone();
+        Some(tree.with_mut(|tree| tree.add(name, super::tree::Kind::Transfer(held), Some(parent))))
+    }
+
+    fn set_transfer(&mut self, node: NodeId, held: TransferNode) -> Option<()> {
+        let tree = self.state.tree(self.dsc)?;
+        tree.with_mut(|tree| tree.set_transfer(node, held));
+        Some(())
+    }
+
+    /// `currParent->addChildNode(new dsc2::ComputeNode())`.
+    fn add_compute(&mut self, parent: NodeId, held: ComputeNode) -> Option<NodeId> {
+        let tree = self.state.tree(self.dsc)?;
+        let name = held.name.clone();
+        Some(tree.with_mut(|tree| tree.add(name, super::tree::Kind::Compute(held), Some(parent))))
+    }
+
+    /// `new dsc2::ComputeNode()` alone — `TreeData::add` with no parent, which is a node the tree
+    /// holds and no block yet lists.
+    fn mint_compute(&mut self, held: ComputeNode) -> Option<NodeId> {
+        let tree = self.state.tree(self.dsc)?;
+        let name = held.name.clone();
+        Some(tree.with_mut(|tree| tree.add(name, super::tree::Kind::Compute(held), None)))
+    }
+
+    /// `currParent->addChildNode(node)`.
+    fn link_child(&mut self, parent: NodeId, node: NodeId) -> Option<()> {
+        let tree = self.state.tree(self.dsc)?;
+        tree.with_mut(|tree| tree.link(node, tu::InsertionPoint::LastIn(parent)));
+        Some(())
+    }
+
+    /// `currParent->addChildNode(new dsc2::SyncNode())`.
+    fn add_sync(&mut self, parent: NodeId, held: SyncNode) -> Option<NodeId> {
+        let tree = self.state.tree(self.dsc)?;
+        let name = held.name.clone();
+        Some(tree.with_mut(|tree| tree.add(name, super::tree::Kind::Sync(held), Some(parent))))
+    }
+
+    /// `currParent->addChildNode(new dsc2::ConditionNode())`.
+    ///
+    /// ⛔ THE TWO REGIONS ARE DROPPED HERE AND THAT IS NOT A LOSS: they are EMPTY at every mint site
+    /// ([`conv::op_if`], [`conv::op_sync`]'s corelet split), and the blocks that fill them are minted
+    /// under this node by [`Self::add_block`] — which is where the tree records them.
+    fn add_condition(&mut self, parent: NodeId, held: ConditionNode) -> Option<NodeId> {
+        if !held.then_region.is_empty() || !held.else_region.is_empty() {
+            return None;
+        }
+        let tree = self.state.tree(self.dsc)?;
+        let cond = super::tree::Cond {
+            // ⭐ `hasCoreClCond()` DECIDES WHICH HALF IS STATED — an empty `twoLevelOrOfAnds_` IS the
+            // core/corelet-guarded case (`dsc/dsc2.h:693-695`), so the empty composite is [`None`]
+            // here rather than a stated-empty guard.
+            loop_cond: (!held.loop_cond.two_level_or_of_ands.is_empty())
+                .then(|| held.loop_cond.clone()),
+            cores: (!held.core_cl_cond.is_empty())
+                .then(|| v1::CoreClSet(held.core_cl_cond.clone())),
+            then_region: Vec::new(),
+            else_region: Vec::new(),
+        };
+        let name = held.name.clone();
+        Some(tree.with_mut(|tree| tree.add(name, super::tree::Kind::Condition(cond), Some(parent))))
+    }
+
+    fn add_sync_other_ends(&mut self, name: &NodeName, others: &[NodeName]) -> Option<()> {
+        let tree = self.state.tree(self.dsc)?;
+        tree.with_mut(|tree| {
+            let node = tree.find_named(&name.0)?;
+            for other in others {
+                tree.add_sync_other_end(node, other.clone());
+            }
+            Some(())
+        })
+    }
+}
+
 impl conv::DdlSizes for Dsc2Ddl<'_, '_> {
     /// ⛔ `getBlockTransferSize(node, src_.unit_, 0, false, true)` FOLDED WITH the
     /// `!getRelevantCoreCl().empty()` that gates it — the first is a `dsc/` accessor and the second
@@ -972,3 +1184,290 @@ fn seed_arena(state: &Dsc2State<'_>, dsc: DscIdx) -> v1::AllocArena {
 
 /// ⛔ A `RefCell` IS NAMED IN THIS MODULE'S HEADER — kept referenced so the doc link resolves.
 const _: fn(&RefCell<()>) = |_| ();
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐⭐⭐ THE DDL EXPANSION MINTS INTO THE **LIVE** TREE — the seam this module's `ScheduleWrites`
+// impl exists to be, tested by READING THE CALLER'S OWN `TreeData` BACK AFTER THE CALL RETURNS.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod live_tree_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroU32;
+
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+    use crate::generated::{Attrs, NameId, PROGRAMS, Program, Stmt, StmtKind};
+    use crate::schedule::ddc::fold::{BlockId, NodeId, NodeKind};
+    use crate::schedule::ddc::metadata::Metadata;
+    use crate::schedule::ddc::transformation::DsType;
+    use crate::schedule::ddc::transformation_util::StageName;
+    use crate::schedule::ddc::v1;
+    use crate::schedule::ddl::conversion::{
+        CondProp, DdlConversion, DdlInterface, DdlOp, DdlRoot, RegionId, RegionOp, RegionTree,
+        parse_ddl2_dsc,
+    };
+    use crate::schedule::dsc2::{LdsIdx, NodeName};
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DscIdx, DscList,
+        FilledDims, LabeledDs, LabeledDsList, NamedDims, Pinning, StageDims, SuperDsc,
+    };
+    use crate::units::Core;
+
+    use super::super::ddc_state::Dsc2State;
+    use super::super::state::DscState;
+    use super::Dsc2Ddl;
+
+    /// One core by index.
+    fn core(index: u32) -> Core {
+        Core::checked(index).expect("a core in range")
+    }
+
+    /// THE BAREST DSC THIS WALK NEEDS — no HBM-pinned tensor, so [`DscState::seeded`] leaves exactly
+    /// the `root_level_operations` head block and nothing else, and every node counted afterwards is
+    /// one the DDL expansion minted.
+    fn a_bare_dsc() -> DesignSpaceConfig {
+        let mut dims = StageDims::default();
+        dims.extents.insert(PrimaryDim::X, Extent(4));
+        dims.extents.insert(PrimaryDim::Y, Extent(2));
+        let named = NamedDims {
+            name: StageName::default(),
+            dims: FilledDims::of(dims).expect("a stage that states a dim"),
+        };
+        let stage = DataStage {
+            ss: named.clone(),
+            el: named,
+        };
+        let two = CoreletsUsed::new(NonZeroU32::new(2).expect("two corelets"));
+        DesignSpaceConfig {
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
+            gtr_ids_used: BTreeSet::new(),
+            corelets_used: two,
+            corelets_used_dsc2: Some(two),
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(core(0), vec![core(1)]),
+            layout_dims: BTreeMap::new(),
+            data_stages: DataStages::new(stage.clone(), stage),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+            full_padding: BTreeMap::new(),
+            labeled_ds: LabeledDsList::new(
+                LabeledDs::new(DsType::Input, vec![], LdsIdx(0), Pinning::default()),
+                vec![],
+            ),
+        }
+    }
+
+    /// A program with hand-written statements, wearing the first vendored program's template.
+    fn synthetic(names: &'static [&'static str], stmts: &'static [Stmt]) -> Program {
+        Program {
+            template: PROGRAMS[0].template,
+            op_func: "",
+            bind: "",
+            stmts,
+            roles: &[],
+            names,
+        }
+    }
+
+    /// ⭐⭐⭐ EVERY NODE `parse_ddl2_dsc` MINTS REACHES THE TREE THE CALLER STILL OWNS.
+    ///
+    /// ⛔⛔ THIS IS THE TEST THE DROPPED DEEP COPY COULD NOT FAIL. `run_v1` opened the conversion with
+    /// `DdlConversion::new(store.schedule_head_block())` — a `dsc2::BlockNode` BY VALUE — so the walk
+    /// wrote every compute, loop, transfer, sync, condition and block into a temporary that was
+    /// discarded when the DSC's turn ended, and the live tree kept only the `allocate` nodes stage 2a
+    /// had seeded. The reference holds `DesignSpaceConfig& dsc` (`ddc/ddl/ddl_conversion.h:511`) and
+    /// starts from `dsc.scheduleTree_.getHeadMutable()` (`ddl_conversion.cpp:2774`).
+    ///
+    /// ⛔ SO THE ASSERTIONS READ THE `TreeData` OUT OF THE `DscState` THIS TEST OWNS, **AFTER**
+    /// `parse_ddl2_dsc` HAS RETURNED, BY NAME AND BY `nodeType_`. Nothing is asserted off a local this
+    /// test held before the call, and nothing is asserted off `DdlConversion` — which no longer carries
+    /// a tree to assert against.
+    ///
+    /// ⭐ THE NEGATIVE CONTROL IS THE FIRST ASSERTION, taken on the SAME state before the call: the
+    /// seeded tree is ONE node. Reverting `Dsc2Ddl`'s writes to a by-value copy leaves that one node
+    /// in place and every assertion after it fails.
+    #[test]
+    fn every_node_the_ddl_expansion_mints_reaches_the_live_tree() {
+        /// One `ddl.operation_bind`, so `processCondition`'s first arm has something to `dyn_cast`.
+        static BIND: &[Stmt] = &[Stmt {
+            kind: StmtKind::OperationBind,
+            depth: 0,
+            attrs: Attrs::Bare(StmtKind::OperationBind),
+            results: &[NameId(0)],
+            operands: &[],
+            path: &[],
+        }];
+        let program = synthetic(&["%the_op"], BIND);
+        let sdsc = SuperDsc::new(
+            DscList::new(a_bare_dsc(), Vec::new()),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let l3_state = DscState::seeded(&sdsc);
+
+        // ⭐ THE NEGATIVE CONTROL'S BASELINE: the seed is the root block alone, since this DSC pins
+        // nothing in HBM. A conversion that minted into a copy leaves this number unchanged.
+        assert_eq!(
+            l3_state.node_count(),
+            1,
+            "the seed is `root_level_operations` and nothing else"
+        );
+        let head = l3_state
+            .dsc(DscIdx(0))
+            .expect("the one DSC's tree")
+            .with(|tree| tree.head())
+            .expect("a seeded tree has a head");
+
+        let state2 = Dsc2State::seeded(
+            &sdsc,
+            &l3_state,
+            &[Vec::new()],
+            &[v1::StorageName("bare".to_owned())],
+        );
+        let mut site = Dsc2Ddl::new(&state2, DscIdx(0));
+        // ⛔ `belowLxScheduleInsertBlock` IS NEVER THE HEAD — `traverseTreeDFSMutable` seeds from
+        // `head_.next_` (`dsc/dsc2.cpp:2233`) — so the reference's `!=` holds and
+        // `root_level_operations` gets minted. `NodeId(1)` is the next identity this tree will issue,
+        // which no node holds yet, and the comparison only needs it to differ from the head.
+        let mut metadata = Metadata {
+            below_lx_schedule_insert_block: BlockId::of(&OneBlock, NodeId(1)),
+            ..Metadata::default()
+        };
+
+        // An UNRESOLVED `ddl.if` — `resolved_conditions` seeded with the default `CondProp`, whose
+        // `resolved` is absent — so `op_if` mints a CONDITION and a block per region.
+        let mut interface = DdlInterface::default();
+        interface
+            .resolved_conditions
+            .insert(NameId(0), CondProp::default());
+        let mut dsc = a_bare_dsc();
+        let mut conversion = DdlConversion::new();
+        let said = parse_ddl2_dsc(
+            &program,
+            &mut conversion,
+            &mut interface,
+            &mut metadata,
+            &mut dsc,
+            &mut site,
+            &DdlRoot {
+                regions: RegionTree {
+                    ops: BTreeMap::from([(
+                        RegionId(0),
+                        vec![RegionOp {
+                            op: DdlOp::If {
+                                condition: NameId(0),
+                                then_region: RegionId(1),
+                                else_region: RegionId(2),
+                            },
+                            regions: vec![RegionId(1), RegionId(2)],
+                        }],
+                    )]),
+                },
+                dataflows: vec![RegionId(0)],
+                transformations: Vec::new(),
+            },
+        );
+        assert_eq!(said, Some(Vec::new()), "the walk ran and said nothing");
+
+        // ⭐⭐ READ BACK OUT OF THE TREE THIS TEST STILL OWNS — four nodes the expansion minted, each
+        // by NAME and by `nodeType_`, plus the nesting that says the condition's regions hang off it.
+        let tree = l3_state.dsc(DscIdx(0)).expect("the one DSC's tree");
+        assert_eq!(
+            tree.node_count(),
+            5,
+            "the seeded root block plus `root_level_operations`, the condition and its two regions: \
+             {:?}",
+            tree.names()
+        );
+        assert_eq!(
+            tree.kinds(),
+            BTreeMap::from([(NodeKind::Block, 4), (NodeKind::Condition, 1)]),
+            "one CONDITION and four BLOCKs — a census that still read `Block: 1` would mean the mint \
+             went into a copy"
+        );
+        // ⛔ RESOLVED BY IDENTITY AND NOT BY NAME. The SEED's own head block is called
+        // `root_level_operations` too (`state::ROOT_BLOCK_NAME`), so a name lookup finds the head and
+        // says nothing about what was minted — which is exactly the confusion `OpOutcome::parent`
+        // carrying a `NodeName` used to be made of. The minted block is the head's FIRST child, which
+        // is `addChildNode(.., /*addFront=*/true)`.
+        let (root, root_name, condition, regions) = tree.with(|held| {
+            let root = *held
+                .children(head)
+                .first()
+                .expect("`root_level_operations` reached the LIVE tree as the head's first child");
+            let condition = held
+                .children(root)
+                .into_iter()
+                .find(|node| held.node_kind(*node) == Some(NodeKind::Condition))
+                .expect("the CONDITION the unresolved `ddl.if` minted reached the LIVE tree");
+            let regions: Vec<NodeName> = held
+                .children(condition)
+                .into_iter()
+                .filter_map(|node| held.name(node))
+                .collect();
+            (root, held.name(root), condition, regions)
+        });
+        // ⛔ THE MINTED ROOT BLOCK IS NOT THE SEEDED HEAD, which is what `addChildNode(.., front)`
+        // means: the head keeps its own identity and gains a child.
+        assert_ne!(root, head, "a fresh block, not the seeded head");
+        assert_eq!(
+            root_name,
+            Some(NodeName("root_level_operations".to_owned())),
+            "and it carries the reference's own name for it"
+        );
+        assert_eq!(
+            tree.with(|held| held.parent(root)),
+            Some(head),
+            "`root_level_operations` hangs off `scheduleTree_.getHeadMutable()`"
+        );
+        assert_eq!(
+            tree.with(|held| held.parent(condition)),
+            Some(root),
+            "the condition hangs off the block the dataflow region was entered with"
+        );
+        assert_eq!(
+            regions,
+            vec![
+                NodeName("condition_region0".to_owned()),
+                NodeName("condition_region1".to_owned()),
+            ],
+            "the THEN and ELSE region blocks reached the LIVE tree, under the condition"
+        );
+        // ⛔ AND THE REGIONS ARE RECORDED BY THE LIVE IDENTITY, not by a name that 570 `ddl.if`s share.
+        assert_eq!(
+            interface.region2blocks.get(&RegionId(0)),
+            Some(&root),
+            "region2blocks_ holds the block the region was opened with, by identity"
+        );
+        assert_eq!(
+            tree.with(|held| held
+                .children(condition)
+                .into_iter()
+                .filter_map(|node| interface
+                    .region2blocks
+                    .iter()
+                    .find_map(|(region, held)| (*held == node).then_some(*region)))
+                .collect::<Vec<_>>()),
+            vec![RegionId(1), RegionId(2)],
+            "and each arm's region names its OWN minted block"
+        );
+    }
+
+    /// A tree that calls every node a BLOCK — what `BlockId::of` needs to accept an identity that is
+    /// not yet in the live tree.
+    struct OneBlock;
+
+    impl crate::schedule::ddc::fold::ScheduleTree for OneBlock {
+        fn kind(&self, _node: NodeId) -> NodeKind {
+            NodeKind::Block
+        }
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+        fn children(&self, _block: BlockId) -> Vec<NodeId> {
+            Vec::new()
+        }
+    }
+}

@@ -6485,8 +6485,16 @@ where
         }
 
         // ⛔ ONE `DdlConvertInterface` PER DSC (`:3723`), so all three of its members are locals.
+        //
+        // ⭐⭐⭐ AND `DdlConversion` NO LONGER TAKES A TREE. This line was
+        // `DdlConversion::new(store.schedule_head_block())` — a `dsc2::BlockNode` BY VALUE, a deep
+        // copy — so every node the DDL expansion minted was written into a temporary and dropped when
+        // the loop body ended. The reference's `DdlConversion` holds `DesignSpaceConfig& dsc`
+        // (`ddc/ddl/ddl_conversion.h:511`) and `parseDdl2Dsc` starts from
+        // `dsc.scheduleTree_.getHeadMutable()` (`ddl_conversion.cpp:2774`); the port reaches that same
+        // live tree through `conv::ScheduleWrites` on the DDL carrier, so `ddl` below IS the tree.
         let mut parser = DdlModuleOp::default();
-        let mut state = DdlConversion::new(store.schedule_head_block());
+        let mut state = DdlConversion::new();
         let mut interface = DdlInterface::default();
         let selection = select_and_parse_ddl_template::<A, _, _>(
             &mut parser,
