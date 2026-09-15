@@ -32,6 +32,23 @@ export CARGO_TARGET_DIR=$ROOT/target
 #     pkill -f 'crustify .*worktrees/bridge1-pr'
 # ⚠ This path is deliberately NOT crustify/campaigns/.driver.lock — that file is TRACKED IN GIT and
 # this worktree's checkout of it holds a pid owned by another worktree's driver.
+# ⛔⛔ (1a) A DIRTY TREE MEANS ANOTHER AGENT IS WRITING THIS BRANCH — REFUSE.
+# `promote` runs `git merge --ff-only`, `git rebase` and `git checkout` against $ROOT. With another
+# agent's UNCOMMITTED work in the tree those either fail or discard it, and this worktree is shared:
+# when this campaign was staged, two fenced agents held live edits to schedule/l3/dl_ops.rs,
+# schedule/stages/tree.rs and schedule/stages/state.rs, one of them touched one second earlier.
+# ⛔ THE FIX IS NEVER `git stash` — the stash stack is shared with every other worktree and popping
+# it can take another session's work. Wait for the tree to be clean, or commit the other agent's work
+# WITH that agent, then start this driver.
+dirty=$(git -C $ROOT status --porcelain --untracked-files=no)
+if [ -n "$dirty" ]; then
+  echo "REFUSING TO START: $ROOT has uncommitted changes — another agent is writing this branch:" >&2
+  echo "$dirty" >&2
+  say "REFUSED: dirty tree, another agent is writing $BRANCH"
+  printf '%s\n' "$dirty" >> $TRACE
+  exit 8
+fi
+
 LOCK=$CAMP/.driver.lock
 if [ -e "$LOCK" ] && kill -0 "$(cat $LOCK 2>/dev/null)" 2>/dev/null; then
   echo "driver already running as pid $(cat $LOCK) — refusing to start a second" >&2
