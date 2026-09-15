@@ -65,6 +65,11 @@ mod interpreter_codegen;
 mod opcode_shapes;
 mod parse;
 mod quantization;
+// Exposed so build scripts (`hf_registry_build.rs`) can parse a Hub
+// candidate's OWN `quantization_config` with the exact same logic that
+// decides what a checkpoint means at compile time — not a second,
+// drifting copy of "what counts as e.g. 4-bit affine".
+pub use quantization::{ParseError, QuantMethod, QuantizationConfig};
 mod render;
 /// The build script's other half: `compile_in_dir` makes the tokens,
 /// `render_tokens` turns them into the text rustc reads.

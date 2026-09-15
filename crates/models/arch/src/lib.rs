@@ -15,6 +15,17 @@
 //! `extern crate scratchy_models as _;` to force-link the whole crate — no
 //! per-arch force-links needed now that it's one crate.
 
+// Real HF org/repo ids resolved once against huggingface.co at BUILD time
+// (`hf_registry_build.rs`), scoped to exactly the architectures this binary
+// was compiled to run. `scr model names` completes from this — no runtime
+// network call, no local hf-hub cache read.
+include!(concat!(env!("OUT_DIR"), "/hf_registry.rs"));
+
+/// The compiled-in HF model registry — see [`COMPILED_HF_REGISTRY`].
+pub fn compiled_hf_registry() -> &'static [&'static str] {
+    COMPILED_HF_REGISTRY
+}
+
 #[cfg(all(feature = "arch-commandr", any(feature = "cuda", feature = "metal")))]
 #[path = "arch/commandr.rs"]
 pub mod commandr;

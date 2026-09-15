@@ -3645,6 +3645,7 @@ dependencies = [
  "scratchy-vision",
  "serde_json",
  "syn 2.0.119",
+ "ureq",
 ]
 
 [[package]]

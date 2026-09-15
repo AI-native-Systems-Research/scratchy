@@ -113,7 +113,12 @@ async fn run() -> anyhow::Result<()> {
                 },
                 #[cfg(any(feature = "cuda", feature = "metal"))]
                 ModelSubcommand::Info(args) => commands::model_info::run_info(args).await,
+                #[cfg(feature = "model")]
+                ModelSubcommand::Names(args) => commands::model::run_model_names(args).await,
             }
+        }
+        Commands::Completions(args) => {
+            commands::completions::run_completions(args.shell, args.install)
         }
     }
 }

@@ -587,6 +587,18 @@ superdsc = [
     "scratchy-forward-compiler-macro/superdsc",
     "scratchy-forward-compiler/superdsc",
 ]
+# Shell tab-completion over REAL HuggingFace model ids. Off by default, and
+# deliberately so: the build script resolves the candidate list by querying
+# huggingface.co (one tag search per compiled arch, then one `config.json` per
+# candidate to verify shape + quant family), which is hundreds of HTTPS
+# requests at `all` scope. A default-off feature is what keeps an air-gapped
+# build — and CI, and every ordinary `-Fmodel/<stem>` iteration — completely
+# network-free, rather than relying on the query's own fall-back-to-empty
+# degradation. With the feature off the registry is emitted EMPTY (never
+# absent: `src/lib.rs` includes it unconditionally and `compiled_hf_registry()`
+# is public API), and `scr` completes models from the local hf-hub cache alone.
+# A cargo feature, NOT an env var — same reasoning as `superdsc` above.
+hf-completions = ["dep:ureq"]
 [dependencies]
 scratchy-layers = { path = "../../layers" }
 scratchy-quantizations = { path = "../quantization" }
@@ -617,6 +629,14 @@ serde_json = { workspace = true }
 # Emit arches in parallel (scratchy-forwards.rs), nested with the pipeline's own
 # per-model rayon fan-out.
 rayon = { workspace = true }
+# Build-time HF Hub query (`hf_registry_build.rs`): for every architecture tag
+# enabled models actually compile with, ask huggingface.co which repos claim
+# it, so `scr model names` completes real HF ids without any per-user runtime
+# network call. Same workspace `ureq` edge hf-hub-downloader already uses at
+# runtime, here as a build-dependency — and OPTIONAL, pulled in only by
+# `hf-completions`, so a build without that feature links no HTTP client into
+# the build script at all and cannot reach the network even by accident.
+ureq = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-metal = { version = "0.3", features = ["MTLDevice"] }

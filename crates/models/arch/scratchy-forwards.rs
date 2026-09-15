@@ -19,6 +19,16 @@ use scratchy_forward_compiler_macro::{
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+// Gated on `hf-completions` (on by default for `scratchy-cli` builds; opt out
+// with `--no-default-features` for an air-gapped build). This module owns every
+// huggingface.co request the build makes, and its only dependency, `ureq`, is
+// optional — so a build without the feature cannot reach the network from here
+// even by accident. The registry FILE is still written either way
+// (`write_hf_registry_file` below); only its contents differ.
+#[cfg(feature = "hf-completions")]
+#[path = "hf_registry_build.rs"]
+mod hf_registry_build;
+
 /// The emitted code roots its own items at `crate::` (each arch used to be its
 /// own crate, so `crate::__gpu` / `crate::<Model>` meant "this arch's root").
 /// In the consolidated crate every arch lives under `pub mod <mod>`, so rewrite
@@ -144,6 +154,35 @@ fn item_attrs_mut(item: &mut syn::Item) -> Option<&mut Vec<syn::Attribute>> {
     }
 }
 
+/// Write `$OUT_DIR/hf_registry.rs`, the shell-completion candidate list
+/// `src/lib.rs` includes and `compiled_hf_registry()` returns.
+///
+/// Called on EVERY build, with `ids` empty when no registry was resolved (see
+/// `hf_registry_build`) — the include in `src/lib.rs` carries no cfg
+/// of its own, so the file must always exist. Rewrites only on a real change,
+/// so an unchanged registry doesn't touch the mtime and retrigger downstream
+/// crates.
+fn write_hf_registry_file(out_dir: &Path, ids: &BTreeSet<String>) {
+    let lits: Vec<String> = ids.iter().map(|s| format!("{s:?}")).collect();
+    let rendered = format!(
+        "/// Real HF org/repo ids matching an architecture (AND, when a quant\n\
+         /// preset is enabled, a quant family) this binary compiled in support\n\
+         /// for, resolved once against huggingface.co at BUILD time (see\n\
+         /// `hf_registry_build.rs`). `scr model names` completes from this.\n\
+         ///\n\
+         /// Empty when this build resolved no registry — resolving it needs the\n\
+         /// network, which an air-gapped build deliberately skips. `scr` then\n\
+         /// completes no model names, rather than guessing.\n\
+         pub static COMPILED_HF_REGISTRY: &[&str] = &[{}];\n",
+        lits.join(", ")
+    );
+    let out = out_dir.join("hf_registry.rs");
+    let unchanged = std::fs::read_to_string(&out).is_ok_and(|old| old == rendered);
+    if !unchanged {
+        std::fs::write(&out, rendered).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
+    }
+}
+
 /// Emit one arch: parse its DSL carrier (`dsl/<arch>.rs.in`), run the pipeline
 /// against its configs (`configs/<arch>/`), write `$OUT_DIR/<mod>.rs`. Called
 /// concurrently across arches — must not mutate global state (e.g. env). The
@@ -237,6 +276,14 @@ fn main() {
         // hand-set env var, not Cargo-feature-derived, so it needs explicit
         // tracking or changing it silently reuses the stale config set.
         "SCRATCHY_BUILD_FILTER",
+        // Toggling `hf-completions` changes what the registry contains, and a
+        // feature flip alone doesn't otherwise invalidate this script.
+        "CARGO_FEATURE_HF_COMPLETIONS",
+        // Load-bearing for the registry: gated repos (`meta-llama/*`) 401 and
+        // get dropped when no token is set, so the SAME model scope resolves to
+        // a different candidate list with and without it. Untracked, two
+        // builders would silently disagree about what completes.
+        "HF_TOKEN",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
@@ -305,7 +352,7 @@ fn main() {
         .iter()
         .flat_map(|(_, _, cfg)| enabled_quants(&cfg.join("quantizations.json"), &enabled_presets))
         .collect();
-    let quants = quant_union.into_iter().collect::<Vec<_>>().join(",");
+    let quants = quant_union.iter().cloned().collect::<Vec<_>>().join(",");
     // SAFETY: set once here, before the rayon fan-out reads it; no other thread
     // mutates the environment. `set_var` is unsafe on 2024.
     unsafe {
@@ -321,6 +368,35 @@ fn main() {
         .for_each(|(dsl_path, mod_name, configs_dir)| {
             emit_arch(dsl_path, configs_dir, &out_dir, mod_name);
         });
+
+    // Shell-completion registry. Resolving it needs the network, so it happens
+    // only under `hf-completions`; WRITING it is unconditional, because
+    // `src/lib.rs` includes the file with no cfg of its own and
+    // `compiled_hf_registry()` is public API. Feature off => an empty registry,
+    // not a missing one (same shape as `crates/compiler/subtile/build.rs`'s
+    // `CARGO_FEATURE_SUPERDSC` gate: always emit, vary the contents).
+    #[cfg(feature = "hf-completions")]
+    let hf_ids = {
+        // `crates/models/arch` -> repo root is 3 levels up.
+        let repo_root = manifest
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("crates/models/arch has a repo root 3 levels up")
+            .to_path_buf();
+        // `mod_name` is `arch.replace('-', "_")`; every arch name in
+        // `configs/` uses `-` exclusively (never `_`), so this reverses
+        // cleanly back to the original hyphenated identifier
+        // `resolve_arch_tag`'s candidate rewrites need to split on.
+        let hf_registry_targets: Vec<(String, PathBuf)> = targets
+            .iter()
+            .map(|(_, mod_name, configs_dir)| (mod_name.replace('_', "-"), configs_dir.clone()))
+            .collect();
+        hf_registry_build::resolve_hf_registry(&hf_registry_targets, &quant_union, &repo_root)
+    };
+    #[cfg(not(feature = "hf-completions"))]
+    let hf_ids = BTreeSet::<String>::new();
+    write_hf_registry_file(&out_dir, &hf_ids);
 
     // Every arch's configs/ dir has now been walked, so every
     // SCRATCHY_BUILD_FILTER tag that could ever match has had its chance.

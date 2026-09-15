@@ -15,7 +15,9 @@ cargo build -p scratchy-cli --release --features metal,model/llama-3.2-3b   # or
 
 `cuda` and `metal` are mutually exclusive. Add `serve` for the HTTP server
 (`chat` — the in-process engine — is on by default), `multimodal` for the
-image-decode stack, `bench` for `scr bench serve`.
+image-decode stack, `bench` for `scr bench serve`. Tab completion over real
+HuggingFace model ids is on by default (`hf-completions`); pass
+`--no-default-features` to build with no network access at all.
 
 ## There is no default model or quant scope
 
@@ -107,6 +109,89 @@ model never ends up with zero compiled variants.
   dense on every build using that backend).
 
 No `quant/*` feature named at all = every selected model compiles dense only.
+
+## `hf-completions` — shell tab completion over real model ids
+
+`scr completions bash` / `scr completions zsh` print a completion script for
+this binary. Install it once, either by hand:
+
+```bash
+scr completions zsh  > ~/.zsh/completions/_scr        # dir must be on $fpath
+scr completions bash > /usr/local/etc/bash_completion.d/scr
+```
+
+or let `scr` do it — `--install` writes the script to the standard per-shell
+location AND wires up the shell rc file so it actually loads:
+
+```bash
+scr completions bash --install   # writes ~/.local/share/scr/completions.bash,
+                                  # sources it from ~/.bashrc
+scr completions zsh  --install   # writes ~/.zsh/completions/_scr,
+                                  # adds it to $fpath in ~/.zshrc
+```
+
+`--install` is idempotent (marked block, safe to re-run after a rebuild) and
+never clobbers the rest of the rc file. For zsh specifically, it inserts the
+`fpath` entry *before* the first existing `compinit` call rather than
+appending — zsh's completion system only picks up an autoloadable `#compdef`
+function from a directory that was already on `$fpath` when `compinit` ran, so
+appending after an existing `compinit` call would silently install a script
+that never actually completes anything. If no `compinit` call exists yet,
+`--install` adds one.
+
+Subcommands, flags and enum values in that script come from the binary's own
+clap command tree, so they always match the feature set it was built with —
+a `chat`-only build never offers `serve`. Re-run `--install` (or regenerate by
+hand) after rebuilding with different features.
+
+**Model names come from `hf-completions`, which is on by default.** The build
+asks huggingface.co which repos carry each compiled arch's family
+tag, then fetches each candidate's `config.json` and keeps only those whose
+shape (`hidden_size`, `num_hidden_layers`, expert count) matches a compiled
+config AND whose `quantization_config` matches a compiled quant preset. So the
+completions obey `-Fmodel/<stem>` and `-Fquant/<preset>` exactly: an
+`mlx-affine-b4-g64` build completes 4-bit g64 MLX repos and not their 8-bit
+siblings, and a dense build completes only unquantized repos. The result is
+baked into the binary as a `&'static [&'static str]` — **tab completion itself
+never touches the network.**
+
+```bash
+cargo build -p scratchy-cli --features metal,model/llama-3.2-1b
+scr model names --source compiled      # what this build resolved to
+```
+
+- **On by default, opt out for an air-gapped build.** Verifying candidates
+  costs one HTTP request each — ~160 for a single small arch, and hundreds per
+  arch at `model/all` scope, which a clean build pays in full. To make no
+  network requests at all, drop the feature:
+
+  ```bash
+  cargo build -p scratchy-cli --no-default-features \
+      --features chat,metal,model/llama-3.2-1b
+  ```
+
+  `ureq` is then not even linked into the build script, so the build cannot
+  reach the Hub by accident. The feature rides `scratchy-cli`'s default
+  features via a weak `model?/hf-completions` edge, so it activates only when
+  a `-Fmodel/<stem>` is named; building `-p scratchy-models` directly does not
+  turn it on (its own `default` stays empty, which is what keeps CI's
+  `--workspace` and `metal,all` runs network-free).
+- **`HF_TOKEN` at BUILD time widens the list.** Gated repos (`meta-llama/*`)
+  return 401 without it and are dropped, so the same model scope resolves
+  differently with and without a token.
+- Results are cached under `<target-dir>/hf-registry-cache/` with a 7-day TTL,
+  so repeat builds don't re-hit the Hub. `cargo clean` discards it.
+
+**With no registry there is no model-name completion at all** — subcommands and
+flags still complete, but `scr chat <TAB>` offers nothing. That is deliberate.
+The obvious fallback, completing from the local hf-hub cache, is wrong: the
+cache is whatever has ever been pulled on this machine, not what this binary can
+run, so it offers other architectures, other sizes and other quantizations —
+and being build-independent it produces the *same* list for every `-Fmodel`
+scope, which reads exactly like a broken scope filter. Offering nothing is more
+honest than offering ids that fail at load. Filtering the cache by compiled
+arch/shape/quant would make it a valid source and is tracked in
+[#26](https://github.com/AI-native-Systems-Research/scratchy/issues/26).
 
 ## Fast iteration: scope to one small model
 

@@ -11,7 +11,7 @@ description = "`scr`: the scratchy inference engine CLI"
 # vision was unconditionally compiled anyway. Off by default so a plain
 # `-Fmetal` build is genuinely chat-only-sized; pass `--features
 # chat,multimodal` (or `--features metal,multimodal`) explicitly for vision.
-default = ["chat"]
+default = ["chat", "hf-completions"]
 
 # The in-process ENGINE (local model inference), no HTTP server: `scr chat`
 # running a model locally. Pulls scratchy-serving-api (WITHOUT its `serve`
@@ -55,6 +55,22 @@ superdsc = ["scratchy-serving-api/superdsc", "scratchy-serving-worker/superdsc"]
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to
 # build grammar support into a non-`serve` binary.
 guided-decoding = ["scratchy-serving-api?/guided-decoding"]
+# Shell tab completion over real HuggingFace model ids: forwards into
+# scratchy-models, whose build script resolves the candidate list against
+# huggingface.co at build time (see docs/BUILD.md). ON by default — completing
+# model names is the point of `scr completions`, and a binary that silently
+# can't do it is the confusing case, not the useful one.
+#
+# `model?/...` is a WEAK dependency feature on purpose: it fires only when the
+# `model` dep is actually activated (i.e. the build named a `-Fmodel/<stem>`).
+# A build with no model scope compiles no registry to fill, and CI's
+# `--workspace --features cuda,scratchy-models/all` reaches scratchy-models
+# directly rather than through this edge, so neither pays for a Hub query it
+# has no use for.
+#
+# To build with NO network access at all (air-gapped), drop it:
+#   cargo build -p scratchy-cli --no-default-features #       --features chat,metal,model/<stem>
+hf-completions = ["model?/hf-completions"]
 # Gates the real image-decode stack: scratchy-serving-api/multimodal makes
 # its `scratchy-vision`/`image` deps optional-and-on, forwards
 # `scratchy-forward-compiler/vision` + `scratchy-serving-worker/vision`

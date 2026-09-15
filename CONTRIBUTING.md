@@ -199,6 +199,10 @@ cargo fmt --all -- --check
 # macOS / metal job
 cargo clippy -p scratchy-models --features metal,all -- -D warnings
 
+# macOS / metal job, the hf-completions path (`all` doesn't enable it, so this
+# is the only lint coverage the build-time HF query gets). Needs network.
+cargo clippy -p scratchy-models --features metal,smollm2-135m,hf-completions -- -D warnings
+
 # Linux / cuda job
 SCRATCHY_GPU=h100 CUDA_COMPUTE_CAP=90 SCRATCHY_SKIP_CUDA_KERNELS=1 \
 cargo clippy --workspace --features cuda,scratchy-models/all \

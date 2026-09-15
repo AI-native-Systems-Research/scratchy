@@ -202,7 +202,7 @@ pub struct QuantizationConfig {
 /// supported method we handle; unknown methods produce
 /// [`ParseError::UnsupportedMethod`] so new formats don't silently
 /// degrade to `Dense`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QuantMethod {
     Awq {
         bits: u32,
@@ -284,6 +284,75 @@ pub enum QuantMethod {
     /// Metal; embeddings + `lm_head` stay dense (ModelOpt keeps them
     /// high precision and usually lists `lm_head` in `exclude_modules`).
     Nvfp4 { group_size: u32 },
+}
+
+impl QuantMethod {
+    /// Whether two parsed methods describe the SAME on-disk storage format —
+    /// i.e. whether the kernel selected for `self` can read a checkpoint
+    /// declaring `other` at all.
+    ///
+    /// Same variant, plus the fields that decide tensor layout: bit-width,
+    /// group size, activation scheme, code table. Deliberately ignores
+    /// per-checkpoint bookkeeping that varies model to model without changing
+    /// the FORMAT — `Affine`'s `bits_overrides`/`per_module` (per-layer OptiQ
+    /// overrides are a property of one specific checkpoint, not of "is this
+    /// 4-bit MLX-affine at all") and `quantize_embed` (an embed-tying detail,
+    /// not a storage difference) — and `Awq`'s `zero_point`/`version`, which
+    /// the loader repacks rather than rejects.
+    ///
+    /// The caller is the build-time completion registry
+    /// (`crates/models/arch/hf_registry_build.rs`), which needs to split
+    /// buckets the Hub's own tags cannot: a `filter=mlx` search returns 4-, 6-
+    /// and 8-bit repos indiscriminately, and a compiled `mlx-affine-b4-g64`
+    /// preset can load exactly one of those.
+    pub fn same_storage_format(&self, other: &Self) -> bool {
+        use QuantMethod::*;
+        match (self, other) {
+            (
+                Awq {
+                    bits: b1,
+                    group_size: g1,
+                    ..
+                },
+                Awq {
+                    bits: b2,
+                    group_size: g2,
+                    ..
+                },
+            ) => b1 == b2 && g1 == g2,
+            (
+                Gptq {
+                    bits: b1,
+                    group_size: g1,
+                    sym: s1,
+                    ..
+                },
+                Gptq {
+                    bits: b2,
+                    group_size: g2,
+                    sym: s2,
+                    ..
+                },
+            ) => b1 == b2 && g1 == g2 && s1 == s2,
+            (Bnb4 { quant_type: t1, .. }, Bnb4 { quant_type: t2, .. }) => t1 == t2,
+            (Fp8 { scheme: s1, .. }, Fp8 { scheme: s2, .. }) => s1 == s2,
+            (Ggml, Ggml) => true,
+            (
+                Affine {
+                    bits: b1,
+                    group_size: g1,
+                    ..
+                },
+                Affine {
+                    bits: b2,
+                    group_size: g2,
+                    ..
+                },
+            ) => b1 == b2 && g1 == g2,
+            (Nvfp4 { group_size: g1 }, Nvfp4 { group_size: g2 }) => g1 == g2,
+            _ => false,
+        }
+    }
 }
 
 /// Errors from [`QuantizationConfig::parse`]. All variants preserve
@@ -2181,5 +2250,71 @@ mod tests {
                 ..
             })
         ));
+    }
+    /// `same_storage_format` is what the build-time completion registry uses to
+    /// decide whether a Hub candidate is loadable by THIS build, so the cases
+    /// that matter are the ones the Hub's own `filter=` tags conflate.
+    fn method(s: &str) -> QuantMethod {
+        QuantizationConfig::parse(&json(s)).unwrap().unwrap().method
+    }
+
+    #[test]
+    fn affine_matches_only_same_bits_and_group_size() {
+        // A `filter=mlx` search returns every MLX repo regardless of width; a
+        // compiled `mlx-affine-b4-g64` preset can load exactly the 4-bit g64 ones.
+        let b4g64 = method(r#"{"quantization_config": {"bits": 4, "group_size": 64}}"#);
+        let also_b4g64 = method(r#"{"quantization_config": {"bits": 4, "group_size": 64}}"#);
+        // 8-bit, not 6: the parser only accepts a 4- or 8-bit affine default, so
+        // a 6-bit MLX repo never reaches this comparison — it fails `parse` and
+        // the registry drops it as unloadable, which is also correct.
+        let b8g64 = method(r#"{"quantization_config": {"bits": 8, "group_size": 64}}"#);
+        let b4g128 = method(r#"{"quantization_config": {"bits": 4, "group_size": 128}}"#);
+
+        assert!(b4g64.same_storage_format(&also_b4g64));
+        assert!(
+            !b4g64.same_storage_format(&b8g64),
+            "8-bit is a different format"
+        );
+        assert!(
+            !b4g64.same_storage_format(&b4g128),
+            "g128 is a different format"
+        );
+    }
+
+    #[test]
+    fn affine_ignores_per_checkpoint_bookkeeping() {
+        // `bits_overrides` / `quantize_embed` describe ONE checkpoint, not the
+        // storage format — an OptiQ-style sibling is still loadable 4-bit g64.
+        let plain = method(r#"{"quantization_config": {"bits": 4, "group_size": 64}}"#);
+        let overridden = method(
+            r#"{"quantization_config": {
+                "bits": 4, "group_size": 64,
+                "bits_overrides": {"mlp.gate_proj": 8}
+            }}"#,
+        );
+        assert!(plain.same_storage_format(&overridden));
+    }
+
+    #[test]
+    fn gptq_sym_mismatch_is_a_different_format() {
+        let sym = method(
+            r#"{"quantization_config": {"quant_method": "gptq", "bits": 4,
+                "group_size": 128, "sym": true}}"#,
+        );
+        let asym = method(
+            r#"{"quantization_config": {"quant_method": "gptq", "bits": 4,
+                "group_size": 128, "sym": false}}"#,
+        );
+        assert!(!sym.same_storage_format(&asym));
+        assert!(sym.same_storage_format(&sym.clone()));
+    }
+
+    #[test]
+    fn ggml_matches_itself_and_variants_never_cross() {
+        let ggml = method(r#"{"quantization_config": {"quant_method": "gguf"}}"#);
+        let affine = method(r#"{"quantization_config": {"bits": 4, "group_size": 64}}"#);
+        assert!(ggml.same_storage_format(&ggml.clone()));
+        assert!(!ggml.same_storage_format(&affine));
+        assert!(!affine.same_storage_format(&ggml));
     }
 }

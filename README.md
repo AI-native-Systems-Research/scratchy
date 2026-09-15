@@ -59,6 +59,10 @@ Note the convention for selecting models and quants:
   (`model/<arch>` for every config in an arch, `model/all` for everything).
 - `quant/<preset>` — compiles that quantization instead of dense/bf16
   (e.g. `quant/mlx` for every MLX affine int4 preset at once).
+- `hf-completions` — shell tab completion over the real HuggingFace ids this
+  build can actually run (`scr completions zsh --install`). **On by default**;
+  it resolves that list against huggingface.co at build time, so an air-gapped
+  build wants `--no-default-features`. See [`docs/BUILD.md`](docs/BUILD.md).
 
 ### Deep Dives
 
