@@ -130,6 +130,7 @@
 
 pub(crate) mod conversion;
 pub(crate) mod ops;
+pub(crate) mod templates;
 
 use ops::{DdlOp, Dialect, Unverified, Value, Verified};
 
