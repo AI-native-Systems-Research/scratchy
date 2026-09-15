@@ -339,7 +339,8 @@ fn main() {
         &stems.iter().cloned().collect(),
     );
     codegen_support_types(&mut out);
-    check_every_attribute_is_modelled(&programs);
+    let modules = walk_every_module(&parsed);
+    check_every_attribute_is_modelled(&programs, &modules);
     let binds_per_template: BTreeMap<String, BTreeSet<String>> = parsed
         .iter()
         .map(|(stem, module)| {
@@ -358,6 +359,16 @@ fn main() {
     check_every_op_func_in_scope_has_a_program(&programs);
     codegen_op_func(&mut out, &programs);
     codegen_ddl_templates(&mut out);
+    codegen_modules(&mut out, &modules);
+
+    // 📏 ONE `ddl.constraint` MAY STATE MORE THAN ONE OF `verifyDdlConstraints`'S FOUR TESTS, since
+    // they are sequential `if`s. The counts say whether the vendored set actually does.
+    let (constraint_ops, constraint_rows) = check_one_form_per_constraint(&modules);
+    println!(
+        "cargo:warning=modules: {} templates, {constraint_ops} ddl.constraint ops stating \
+         {constraint_rows} checked forms",
+        modules.len()
+    );
 
     // 🛑 THE LEDGER OF WHAT THE WALK FLATTENED. A `ddl.if` whose condition is a LOOP POSITION keeps
     // BOTH arms, because which one runs depends on an extent the walk does not have. Those arms are
@@ -447,6 +458,7 @@ struct Program {
 }
 
 /// ONE OPERAND OF A STATEMENT, resolved to name ids.
+#[derive(Debug)]
 enum OperandRef {
     /// `%name` or `%name#N`.
     One(u16),
@@ -1930,7 +1942,7 @@ fn render_opaque(op: &ast::Operation, mnemonic: &str) -> String {
 ///
 /// So the modelled set is declared per mnemonic, and anything outside it fails the build naming
 /// itself. Growing [`Attrs`] is the fix; adding a name here without an arm that reads it is not.
-fn check_every_attribute_is_modelled(programs: &[Program]) {
+fn check_every_attribute_is_modelled(programs: &[Program], modules: &[ModuleWalk]) {
     // ⭐⭐ THE SECOND CATEGORY, AND IT IS NOT AN ALLOW-LIST FOR CONVENIENCE. These attributes
     // constrain a SEARCH — the datastage exploration and tile selection DDC performs because it is
     // handed an opaque descriptor and must recover a schedule. scratchy STATES its schedule: the tile
@@ -2033,6 +2045,14 @@ fn check_every_attribute_is_modelled(programs: &[Program]) {
             "ddl.condition",
             &["loop_label", "condition", "value_expr"][..],
         ),
+        // ⭐⭐ MODELLED BY [`BindRow`], AND ONLY SINCE THE MODULE WALK EXISTS. `ddl.operation_bind`
+        // reaches no per-bind program at all — that walk answers `"ddl.operation_bind" => {}` — so
+        // these two attributes were never checked here, which is a different thing from being
+        // modelled. `opFuncName=` is `stringToOpFuncs`' key and `required=` is `getRequired()`.
+        (
+            "ddl.operation_bind",
+            &["opFuncName", "required"][..],
+        ),
     ]);
 
     // ⭐ THE THIRD CATEGORY: an attribute that is really an SSA OPERAND, written in the attribute
@@ -2048,8 +2068,16 @@ fn check_every_attribute_is_modelled(programs: &[Program]) {
     )]);
 
     let mut unmodelled: BTreeMap<String, usize> = BTreeMap::new();
-    for program in programs {
-        for stmt in &program.stmts {
+    // ⛔ BOTH WALKS. The per-bind programs are bridge 1's splice input; the module walk is what a
+    // `StatedTemplate` states — and it reaches statement kinds the per-bind walk never yields
+    // (`ddl.operation_bind`, `ddl.if`, every op of a not-taken arm), so an attribute checked only
+    // over `programs` was unchecked on exactly the statements this table newly carries.
+    let every_stmt = programs
+        .iter()
+        .flat_map(|program| program.stmts.iter())
+        .chain(modules.iter().flat_map(|module| module.stmts.iter()));
+    {
+        for stmt in every_stmt {
             let mnemonic = stmt.mnemonic.as_str();
             for key in operand_refs.get(mnemonic).copied().unwrap_or(&[]) {
                 let Some(value) = attr(&stmt.op, key) else {
@@ -2593,3 +2621,879 @@ const IN_SCOPE: &[&str] = &[
     "minimum",
     "qfp8ch",
 ];
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// THE MODULE-WIDE WALK — the five things a `.ddl` STATES beside one bind's dataflow.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE TEMPLATE'S WHOLE MODULE, WALKED WITH NO `ddl.if` RESOLVED.
+///
+/// ⛔⛔ WHY THIS IS A SECOND WALK AND NOT A ROW OF [`walk_every_program`]. A `NameId` is an index
+/// into ONE program's own name table, and `walk_every_program` mints one table per (template, bind)
+/// pair with every `ddl.if` ALREADY resolved against that bind — so a name only the not-taken arm
+/// declares is absent, and every `ddl.operation_bind` is absent outright, because the per-bind walk
+/// answers `"ddl.operation_bind" => {}` (`ddl/dataflow.rs`'s `walk`). But five of the six parts a
+/// `StatedTemplate` states are MODULE-WIDE facts keyed by `NameId`, and each one needs a lookup that
+/// a per-bind table cannot answer:
+///
+/// * `verifyDdlConstraints` names op-binds AS constraint operands and resolves them through
+///   `getDefiningOp()` (`ddc/ddl/ddl_conversion.cpp:2577`);
+/// * `processCondition`'s FIRST arm is `dyn_cast<OperationBindOp>` (`:217`), which is how
+///   `ddl.if(%layernormscale_op)` resolves at all;
+/// * `parseDdl2Dsc` walks the regions with the `ddl.if`s STILL IN THEM and resolves each one itself
+///   in `processOp`'s `IfOp` arm (`:1541`), so BOTH arms must be reachable;
+/// * `matchDdl2Dsc` walks every bind of the module, not the one a caller picked (`:2110`).
+///
+/// One table over the whole module is what makes all four of those land. The per-bind programs are
+/// untouched: they are bridge 1's SPLICE INPUT, where a resolved `ddl.if` is the whole point.
+struct ModuleWalk {
+    /// The `.ddl` stem.
+    stem: String,
+    /// Every op of the module in pre-order, `ddl.if` and its two arms included.
+    stmts: Vec<Stmt>,
+    /// Every SSA name the module binds, in id order.
+    names: Vec<String>,
+    /// Per statement, the name ids it binds.
+    results: Vec<Vec<u16>>,
+    /// Per statement, its operands in source order.
+    operands: Vec<Vec<OperandRef>>,
+    /// Per statement, the statement index of each enclosing `ddl.loop`, outermost first.
+    ///
+    /// ⭐ NO `Arm` ENTRY, AND THAT IS NOT A DROPPED FACT: an arm is a RESOLVED condition, which this
+    /// walk deliberately does not compute, and the `ddl.if` that would have produced one is carried
+    /// by the region tree instead — where `processOp` reads it. See [`ModuleWalk::homes`].
+    paths: Vec<Vec<usize>>,
+    /// The statement index of every `ddl.operation_bind`, in the module's own order.
+    binds: Vec<usize>,
+    /// The statement index of every `ddl.padded_dimension`.
+    padded: Vec<usize>,
+    /// The statement index of every `ddl.constraint`.
+    constraints: Vec<usize>,
+    /// Per statement, the regions that statement OWNS — `op.getRegions()` order, empty for an op
+    /// that owns none.
+    owned: Vec<Vec<u32>>,
+    /// Per statement, which region HOLDS it; [`None`] for a top-level op of the module body, which
+    /// is not a region either walk of `parseDdl2Dsc` descends.
+    homes: Vec<Option<u32>>,
+    /// `dfOp.getBody()` per `ddl.dataflow`, in the order `walk<WalkOrder::PreOrder>` yields them
+    /// (`ddl_conversion.cpp:2784`).
+    dataflows: Vec<u32>,
+    /// `trOp.getBody()` per `ddl.transformations` (`:2790`).
+    transformations: Vec<u32>,
+}
+
+/// A `%name` written in the attribute dictionary — `primary=%wrdd#0`.
+fn attr_ref<'a>(op: &'a ast::Operation, key: &str) -> Option<&'a str> {
+    match attr(op, key)? {
+        ast::AttrValue::Ref(text) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// A `[%a, %b]` list written in the attribute dictionary — `padding=[%zf, %zb, %padvalid]`.
+fn attr_refs<'a>(op: &'a ast::Operation, key: &str) -> Vec<&'a str> {
+    match attr(op, key) {
+        Some(ast::AttrValue::List(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                ast::AttrValue::Ref(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect(),
+        Some(ast::AttrValue::Ref(text)) => vec![text.as_str()],
+        _ => Vec::new(),
+    }
+}
+
+/// One op of the module as the pre-order scan sees it, before its names are interned.
+struct ScannedOp<'a> {
+    op: &'a ast::Operation,
+    home: Option<u32>,
+    owned: Vec<u32>,
+    depth: u16,
+    path: Vec<usize>,
+}
+
+/// A `ddl.if`'s `else` region, empty where it has none.
+fn else_region(op: &ast::Operation) -> &[ast::Operation] {
+    op.else_body.as_deref().unwrap_or(&[])
+}
+
+/// WHICH REGIONS ONE OP OWNS — `op.getRegions()`, by mnemonic.
+///
+/// ⛔ A `ddl.if` OWNS TWO EVEN WHERE THE TEXT WRITES NO `else`. `IfOp` declares both regions, and
+/// `processOp` answers `regionIndecesToProcess = {1}` for a condition that resolved FALSE
+/// (`ddl_conversion.cpp:1548`) — so the second region has to exist to be descended into and found
+/// empty. Both of the vendored `ddl.if`s in a transformations section are written without an `else`.
+fn regions_owned(mnemonic: &str) -> usize {
+    match mnemonic {
+        "ddl.if" => 2,
+        "ddl.loop" | "ddl.parametric_loop" | "ddl.dataflow" | "ddl.transformations" => 1,
+        _ => 0,
+    }
+}
+
+/// THE PRE-ORDER SCAN — every op of every region, with region identities minted as they are reached.
+///
+/// ⛔ REGION IDS START AT ONE, AND THAT IS WHAT MAKES [`crate::schedule`]'s two readings agree.
+/// `process_region` resolves an outcome entry as an IDENTITY when the op's own region list contains
+/// it and POSITIONALLY otherwise (`ddl/conversion.rs:5188-5192`), because `processOp` answers
+/// `{0}` for a loop but real region pointers for a `ddl.if`. With no region numbered zero, a loop's
+/// `RegionId(0)` can never be mistaken for an identity, so the positional branch is always the one
+/// taken — which is the reference's own reading (`op.getRegion(i)`).
+fn scan_module<'a>(
+    ops: &'a [ast::Operation],
+    home: Option<u32>,
+    depth: u16,
+    path: &[usize],
+    next_region: &mut u32,
+    into: &mut Vec<ScannedOp<'a>>,
+) {
+    for op in ops {
+        let owned: Vec<u32> = (0..regions_owned(op.name.as_str()))
+            .map(|_| {
+                let id = *next_region;
+                *next_region += 1;
+                id
+            })
+            .collect();
+        let at = into.len();
+        into.push(ScannedOp {
+            op,
+            home,
+            owned: owned.clone(),
+            depth,
+            path: path.to_vec(),
+        });
+        match op.name.as_str() {
+            "ddl.if" => {
+                scan_module(&op.body, owned.first().copied(), depth, path, next_region, into);
+                scan_module(
+                    else_region(op),
+                    owned.get(1).copied(),
+                    depth,
+                    path,
+                    next_region,
+                    into,
+                );
+            }
+            "ddl.loop" | "ddl.parametric_loop" => {
+                let mut deeper = path.to_vec();
+                deeper.push(at);
+                scan_module(
+                    &op.body,
+                    owned.first().copied(),
+                    depth + 1,
+                    &deeper,
+                    next_region,
+                    into,
+                );
+            }
+            "ddl.dataflow" | "ddl.transformations" => scan_module(
+                &op.body,
+                owned.first().copied(),
+                depth,
+                path,
+                next_region,
+                into,
+            ),
+            other => assert!(
+                op.body.is_empty() && op.else_body.is_none(),
+                "a `{other}` owns a region this walk does not number; every region has to be \
+                 reachable or `parseDdl2Dsc` descends into nothing"
+            ),
+        }
+    }
+}
+
+/// EVERY TEMPLATE'S MODULE, WALKED.
+fn walk_every_module(parsed: &[(String, ast::Module)]) -> Vec<ModuleWalk> {
+    parsed
+        .iter()
+        .map(|(stem, module)| {
+            let mut scanned = Vec::new();
+            let mut next_region = 1_u32;
+            scan_module(
+                &module.body,
+                None,
+                0,
+                &[],
+                &mut next_region,
+                &mut scanned,
+            );
+
+            // ⛔ TWO PASSES, DECLARATIONS FIRST — the same reason [`walk_every_program`] takes two:
+            // an operand may name a value a LATER statement binds (`bmm.ddl:97`'s
+            // `relative_op_order` constraint names binds declared above it, but a `ddl.dataflow`
+            // body names allocations declared below the dataflow in three templates), and interning
+            // on encounter would mint a second id for one value.
+            let mut names = Names::default();
+            let results: Vec<Vec<u16>> = scanned
+                .iter()
+                .map(|held| {
+                    held.op
+                        .results
+                        .iter()
+                        .flat_map(|text| names.declare(text))
+                        .collect()
+                })
+                .collect();
+            // ⭐ NO BIND IS "OTHER" HERE. Every `ddl.operation_bind` of the module is a statement of
+            // this walk, so its result is interned and every reference to it resolves — which is
+            // exactly what `OperandRef::OtherBind` stands in for in a per-bind walk and what
+            // `processCondition`'s `OperationBindOp` arm needs (`ddl_conversion.cpp:217`).
+            let no_other_binds = BTreeSet::new();
+            let operands: Vec<Vec<OperandRef>> = scanned
+                .iter()
+                .map(|held| resolve_operands(held.op, &names, &no_other_binds))
+                .collect();
+
+            let stmts: Vec<Stmt> = scanned
+                .iter()
+                .map(|held| Stmt {
+                    mnemonic: held.op.name.clone(),
+                    depth: held.depth,
+                    op: held.op.clone(),
+                })
+                .collect();
+            let of_kind = |mnemonic: &str| -> Vec<usize> {
+                stmts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, stmt)| stmt.mnemonic == mnemonic)
+                    .map(|(at, _)| at)
+                    .collect()
+            };
+            let dataflows = scanned
+                .iter()
+                .filter(|held| held.op.name == "ddl.dataflow")
+                .filter_map(|held| held.owned.first().copied())
+                .collect();
+            let transformations = scanned
+                .iter()
+                .filter(|held| held.op.name == "ddl.transformations")
+                .filter_map(|held| held.owned.first().copied())
+                .collect();
+
+            ModuleWalk {
+                stem: stem.clone(),
+                binds: of_kind("ddl.operation_bind"),
+                padded: of_kind("ddl.padded_dimension"),
+                constraints: of_kind("ddl.constraint"),
+                paths: scanned.iter().map(|held| held.path.clone()).collect(),
+                owned: scanned.iter().map(|held| held.owned.clone()).collect(),
+                homes: scanned.iter().map(|held| held.home).collect(),
+                stmts,
+                names: names.order,
+                results,
+                operands,
+                dataflows,
+                transformations,
+            }
+        })
+        .collect()
+}
+
+/// THE TYPES THE MODULE TABLES ARE WRITTEN IN — the const form of five owned parts.
+///
+/// ⛔ EACH ONE IS A CONST MIRROR OF AN OWNED PORT TYPE, AND ONLY BECAUSE THAT TYPE HOLDS A `Vec`.
+/// `PaddedDimension` and `DdlConstraint` already hold slices and a `Copy` payload, so those are
+/// emitted AS THEMSELVES rather than mirrored — the mirrors here exist exactly where a `Vec`,
+/// a `BTreeMap` or a recursive tree cannot be a `const`, and `schedule/ddl/templates.rs` is the one
+/// place that converts.
+const MODULE_TYPES: &str = r#"/// ONE `ddl.operation_bind` AS THE MODULE STATES IT — the const form of
+/// [`crate::schedule::ddl::conversion::OperationBind`], whose four operand lists are `Vec`s.
+///
+/// ⛔ THE OP-FUNC IS ITS SPELLING AND NOT A RESOLVED `OpFunc`, because the resolution IS a ported
+/// step: `stringToOpFuncs.at(getOpFuncName())` (`ddc/ddl/ddl_conversion.cpp:2178`) is
+/// `sys_arch_spec::arch_enums::OpFunc::from_spelling`, and its miss is the reference's own
+/// *"Unrecognized opFuncName"*. Resolving it here would turn that refusal into a build failure and
+/// silently narrow the vendored set to the 176 dxp names scratchy also emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindRow {
+    /// `getResult()`.
+    pub result: NameId,
+    /// `getOpFuncName()`, as the template spells it.
+    pub op_func: &'static str,
+    /// `getRequired()`.
+    pub required: bool,
+    /// `getDataFormats()` — the `[%type_*]` list.
+    pub data_formats: &'static [NameId],
+    /// `getInputs()`.
+    pub inputs: &'static [NameId],
+    /// `getOutputs()`.
+    pub outputs: &'static [NameId],
+    /// `getInterim()`, ABSENT rather than empty in 104 of the 218 vendored binds.
+    pub interim: &'static [NameId],
+}
+
+/// ONE `ddl.padded_dimension`, KEYED BY ITS OWN RESULT — which is how
+/// [`crate::schedule::ddl::conversion::StatedTemplate::padded`] is keyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaddedRow {
+    /// `getResult()` — the padded dim this row states.
+    pub result: NameId,
+    /// The three operand groups, ALREADY IN THE PORT'S OWN TYPE.
+    pub groups: crate::schedule::ddl::conversion::PaddedDimension<'static>,
+}
+
+/// ONE FORM ONE `ddl.constraint` STATES, with the operands it names.
+///
+/// ⛔⛔ ONE ROW PER **FORM**, NOT PER OP, AND THE REFERENCE IS WHY. `verifyDdlConstraints`'s four
+/// tests are SEQUENTIAL `if`s and not an `else if` chain (`ddl_conversion.cpp:2558`, `:2572`,
+/// `:2624`, `:2643`), so an op stating `min_num_cores=` *and* a `cmp=` is checked twice. Collapsing
+/// an op to one variant would silently drop the second check; [`check_one_form_per_constraint`]
+/// reports how many the vendored set actually states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstraintRow {
+    /// `getOperands()`.
+    pub operands: &'static [Operand],
+    /// Which of `verifyDdlConstraints`'s tests this row is.
+    pub form: crate::schedule::ddl::conversion::DdlConstraint,
+}
+
+/// ONE OP OF ONE REGION — the const form of one entry of
+/// [`crate::schedule::ddl::conversion::RegionTree`], whose value is a `Vec` and whose op holds a
+/// borrowed statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionOpRow {
+    /// Which region holds it. Rows are grouped by this and in `getOperations()` order within it.
+    pub region: crate::schedule::ddl::conversion::RegionId,
+    /// Which statement of [`TemplateModule::program`] it is.
+    pub stmt: u32,
+    /// The regions this op OWNS, in `getRegions()` order — two for a `ddl.if`, one for a loop.
+    pub regions: &'static [crate::schedule::ddl::conversion::RegionId],
+}
+
+/// ONE OP OF A `ddl.transformations` SECTION, FLATTENED — the const form of
+/// [`crate::schedule::ddl::conversion::Transformation`], which is a RECURSIVE owned tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransformRow {
+    /// Which section — an index into this template's `ddl.transformations` ops, in the pre-order
+    /// `walk<WalkOrder::PreOrder>` yields them (`ddl_conversion.cpp:2790`).
+    pub section: u32,
+    /// The row of the `ddl.if` enclosing it, [`None`] at the section's own top level.
+    pub parent: Option<u32>,
+    /// Which arm of that `ddl.if`: `true` is region 0, the `then`.
+    pub then_arm: bool,
+    /// What the op is.
+    pub kind: TransformKind,
+}
+
+/// WHAT ONE ROW OF A `ddl.transformations` SECTION IS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformKind {
+    /// `ddl.disable_transfer_promotion`.
+    DisableTransferPromotion,
+    /// `ddl.if(%condition)`, whose arms are the rows naming this one as their parent.
+    If(NameId),
+    /// `ddl.yield`.
+    Yield,
+    /// Any other `ddl.*` — the reference's *"Unexpected operation found in the transformations
+    /// section"*, kept spellable because that section is arbitrary input text.
+    Other(StmtKind),
+}
+
+/// ONE TEMPLATE'S WHOLE MODULE — everything a `StatedTemplate` states except the buffer.
+///
+/// ⛔⛔ [`Self::program`] IS **NOT** ONE OF [`PROGRAMS`], AND MIXING THE TWO IS A WRONG ANSWER, NOT A
+/// SLOW ONE. A `PROGRAMS` entry is ONE (template, bind) pair with every `ddl.if` already resolved
+/// against that bind, and its `NameId`s index ITS OWN table; this one is the whole module with every
+/// arm present and every `ddl.operation_bind` interned. A `NameId` from one means nothing in the
+/// other.
+///
+/// ⛔ SO IT STATES NO `op_func`, NO `bind` AND NO `roles`: all three are per-BIND facts, and this
+/// walk activates none. The roles are in [`Self::binds`], which is where `matchDdl2Dsc` reads them
+/// (`ddc/ddl/ddl_conversion.cpp:2110`); `conversion.rs` asks a program for neither `role_of` nor
+/// `input_arity`, which only bridge 1's splice over `PROGRAMS` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemplateModule {
+    /// Which `.ddl`.
+    pub template: Template,
+    /// The module-wide walk. See this type's own note.
+    pub program: Program,
+    /// Every `ddl.operation_bind`, in the pre-order the match walks.
+    pub binds: &'static [BindRow],
+    /// Every `ddl.padded_dimension`, keyed by its own result.
+    pub padded: &'static [PaddedRow],
+    /// Every form every `ddl.constraint` states, in the pre-order `verifyDdlConstraints` walks.
+    pub constraints: &'static [ConstraintRow],
+    /// Every op of every region, grouped by region and in `getOperations()` order.
+    pub region_ops: &'static [RegionOpRow],
+    /// `dfOp.getBody()` per `ddl.dataflow`.
+    pub dataflows: &'static [crate::schedule::ddl::conversion::RegionId],
+    /// How many `ddl.transformations` sections this module states.
+    pub sections: u32,
+    /// Every op of every section.
+    pub transformations: &'static [TransformRow],
+}
+
+"#;
+
+/// The lookup over the emitted table.
+const MODULE_LOOKUP: &str = r#"impl Template {
+    /// THIS TEMPLATE'S WHOLE MODULE.
+    ///
+    /// ⛔ TOTAL, because [`MODULES`] is emitted from the SAME census of `ddl_templates/*.ddl` that
+    /// mints [`Template`]'s own variants — a template with no module would be a variant with no
+    /// file.
+    #[must_use]
+    pub fn module(self) -> &'static TemplateModule {
+        MODULES
+            .iter()
+            .find(|held| held.template as u32 == self as u32)
+            .unwrap_or_else(|| {
+                panic!("every Template variant is minted from a parsed `.ddl`, so each has a module")
+            })
+    }
+}
+
+"#;
+
+/// One operand as a const expression.
+fn render_operand(operand: &OperandRef) -> String {
+    match operand {
+        OperandRef::One(id) => format!("Operand::One(NameId({id}))"),
+        OperandRef::OtherBind => "Operand::OtherBind".to_owned(),
+        OperandRef::List(ids) => format!(
+            "Operand::List(&[{}])",
+            ids.iter()
+                .map(|id| format!("NameId({id})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// 🛑 EVERY FORM ONE `ddl.constraint` STATES — `verifyDdlConstraints`'s four SEQUENTIAL tests
+/// (`ddl_conversion.cpp:2558`, `:2572`, `:2624`, `:2643`), in that order.
+///
+/// ⛔ THE DEFAULTS ARE THE REFERENCE'S OWN `value_or`: `min_num_valid` defaults to ZERO and
+/// `max_num_valid` to ONE HUNDRED (`:2604-2605`), which is a BOUND and not "unlimited".
+/// ⛔ AN EMPTY ANSWER IS A BUILD FAILURE, not a constraint that checks nothing: a `ddl.constraint`
+/// none of the four tests reads is an op the reference walks and silently accepts, and emitting it as
+/// no row would hide that. Every vendored constraint states one of these five shapes.
+fn constraint_forms(op: &ast::Operation) -> Vec<String> {
+    let mut forms = Vec::new();
+    if let Some(cores) = attr_int(op, "min_num_cores") {
+        forms.push(format!(
+            "crate::schedule::ddl::conversion::DdlConstraint::MinNumCores(\
+             crate::schedule::l3::dsc::CoreCount({cores}))"
+        ));
+    }
+    let (min, max) = (attr_int(op, "min_num_valid"), attr_int(op, "max_num_valid"));
+    if min.is_some() || max.is_some() {
+        forms.push(format!(
+            "crate::schedule::ddl::conversion::DdlConstraint::NumValid {{ min: {}, max: {} }}",
+            min.unwrap_or(0),
+            max.unwrap_or(100)
+        ));
+    }
+    // ⛔ `relative_op_order=false` IS NOT A FORM — the reference tests `has_value() && value()`
+    // (`:2624-2625`) and falls straight through a `false`. All six vendored ones state `true`.
+    if attr_bool(op, "relative_op_order") == Some(true) {
+        forms.push(
+            "crate::schedule::ddl::conversion::DdlConstraint::RelativeOpOrder".to_owned(),
+        );
+    }
+    if let Some(cmp) = attr_str(op, "cmp") {
+        let spelled = match cmp {
+            "equal" => "Equal",
+            "less" => "Less",
+            other => panic!(
+                "a ddl.constraint states cmp={other:?}; `verifyDdlConstraints` admits \"equal\" and \
+                 \"less\" and aborts with \"\\\"cmp\\\" type not yet supported\" on anything else \
+                 (ddl_conversion.cpp:2697)"
+            ),
+        };
+        match attr_str(op, "property") {
+            Some(property) => {
+                // `getProperty().value() == "slice" ? true : false` (`:2646`).
+                let slice = property == "slice";
+                match attr_int(op, "dim_idx") {
+                    Some(dim_idx) => {
+                        // ⛔ THE `dim_idx` FORM IS `cmp == "equal"` ONLY (`:2658`); a `less` beside a
+                        // `dim_idx` reaches the *"cmp type not yet supported"* abort at `:2697`.
+                        assert!(
+                            spelled == "Equal",
+                            "a ddl.constraint states property=, dim_idx= and cmp={cmp:?}; only \
+                             \"equal\" is read there (ddl_conversion.cpp:2658)"
+                        );
+                        let value = attr_int(op, "value").unwrap_or_else(|| {
+                            panic!(
+                                "a ddl.constraint states property= and dim_idx= but no value=; that \
+                                 is the reference's own \"Missing \\\"value\\\" attribute\" abort \
+                                 (ddl_conversion.cpp:2660)"
+                            )
+                        });
+                        forms.push(format!(
+                            "crate::schedule::ddl::conversion::DdlConstraint::StickSizeAt {{ \
+                             slice: {slice}, dim_idx: {dim_idx}, \
+                             value: crate::arch::Elements({value}) }}"
+                        ));
+                    }
+                    None => forms.push(format!(
+                        "crate::schedule::ddl::conversion::DdlConstraint::StickSizesAgree {{ \
+                         slice: {slice} }}"
+                    )),
+                }
+            }
+            None => {
+                let value = attr_int(op, "value").unwrap_or_else(|| {
+                    panic!(
+                        "a ddl.constraint states cmp= and no property= but no value=; that is the \
+                         reference's own \"Missing \\\"value\\\" attribute\" abort \
+                         (ddl_conversion.cpp:2703)"
+                    )
+                });
+                forms.push(format!(
+                    "crate::schedule::ddl::conversion::DdlConstraint::DimSize {{ \
+                     cmp: crate::schedule::ddl::conversion::ConstraintCmp::{spelled}, \
+                     value: crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent({value}) }}"
+                ));
+            }
+        }
+    }
+    assert!(
+        !forms.is_empty(),
+        "a `ddl.constraint` states {:?}, none of which any of `verifyDdlConstraints`'s four tests \
+         reads — so the reference walks it and checks nothing, and this table would say so silently",
+        op.attrs.iter().map(|(key, _)| key).collect::<Vec<_>>()
+    );
+    forms
+}
+
+/// 📏 HOW MANY FORMS THE VENDORED CONSTRAINTS STATE PER OP — one row per form is only interesting if
+/// some op states two, so the count is REPORTED rather than assumed either way.
+fn check_one_form_per_constraint(modules: &[ModuleWalk]) -> (usize, usize) {
+    let mut ops = 0;
+    let mut rows = 0;
+    for module in modules {
+        for at in &module.constraints {
+            ops += 1;
+            rows += constraint_forms(&module.stmts[*at].op).len();
+        }
+    }
+    (ops, rows)
+}
+
+/// THE MODULE-WIDE TABLES.
+fn codegen_modules(out: &mut String, modules: &[ModuleWalk]) {
+    out.push_str(MODULE_TYPES);
+    out.push_str(
+        "/// EVERY VENDORED TEMPLATE'S WHOLE MODULE — the census of `ddl_templates/*.ddl` walked \
+         with\n/// no `ddl.if` resolved. See [`TemplateModule`].\npub const MODULES: \
+         &[TemplateModule] = &[\n",
+    );
+    for module in modules {
+        let index: BTreeMap<&str, u16> = module
+            .names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| {
+                (
+                    name.as_str(),
+                    u16::try_from(id).expect("a module binds at most 65535 names"),
+                )
+            })
+            .collect();
+        // ⛔ `%x:1` IS ALSO `%x`, AND `%wrd:4` IS `%wrd#0..3` — the alias `Names::declare`
+        // registered. A lookup that missed it would leave a `primary=` pointing at nothing.
+        let id_of = |text: &str, what: &str| -> u16 {
+            *index.get(text).unwrap_or_else(|| {
+                panic!(
+                    "`{}.ddl`'s {what} names `{text}`, which no statement of its module binds",
+                    module.stem
+                )
+            })
+        };
+        let ids = |texts: &[&str], what: &str| -> String {
+            texts
+                .iter()
+                .map(|text| format!("NameId({})", id_of(text, what)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let _ = writeln!(
+            out,
+            "    TemplateModule {{ template: Template::{}, sections: {}, dataflows: &[{}],",
+            ident_of(&module.stem),
+            module.transformations.len(),
+            module
+                .dataflows
+                .iter()
+                .map(|id| format!(
+                    "crate::schedule::ddl::conversion::RegionId({id})"
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        // ─── the binds ───
+        out.push_str("        binds: &[\n");
+        for at in &module.binds {
+            let op = &module.stmts[*at].op;
+            let lists: Vec<Vec<&str>> = op
+                .operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    ast::Operand::RefList(names) => {
+                        Some(names.iter().map(String::as_str).collect())
+                    }
+                    ast::Operand::Ref(_) => None,
+                })
+                .collect();
+            let group = |which: usize| -> String {
+                lists
+                    .get(which)
+                    .map(|texts| ids(texts, "operation_bind"))
+                    .unwrap_or_default()
+            };
+            let _ = writeln!(
+                out,
+                "            BindRow {{ result: NameId({}), op_func: \"{}\", required: {}, \
+                 data_formats: &[{}], inputs: &[{}], outputs: &[{}], interim: &[{}] }},",
+                module.results[*at]
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| panic!(
+                        "`{}.ddl` has a `ddl.operation_bind` binding no result; `getResult()` is \
+                         what every reference to it names",
+                        module.stem
+                    )),
+                expect_str(op, "opFuncName", "ddl.operation_bind"),
+                attr_bool(op, "required").unwrap_or(false),
+                group(0),
+                group(1),
+                group(2),
+                group(3),
+            );
+        }
+        out.push_str("        ],\n");
+
+        // ─── the padded dimensions ───
+        out.push_str("        padded: &[\n");
+        for at in &module.padded {
+            let op = &module.stmts[*at].op;
+            let primary = attr_ref(op, "primary").unwrap_or_else(|| {
+                panic!(
+                    "`{}.ddl` has a `ddl.padded_dimension` with no `primary=`; that operand is the \
+                     unpadded dim the whole op ties to (ddl_conversion.cpp:108)",
+                    module.stem
+                )
+            });
+            let _ = writeln!(
+                out,
+                "            PaddedRow {{ result: NameId({}), groups: \
+                 crate::schedule::ddl::conversion::PaddedDimension {{ primary: NameId({}), \
+                 padding: &[{}], window: &[{}] }} }},",
+                module.results[*at].first().copied().unwrap_or_else(|| panic!(
+                    "`{}.ddl` has a `ddl.padded_dimension` binding no result",
+                    module.stem
+                )),
+                id_of(primary, "padded_dimension `primary=`"),
+                ids(&attr_refs(op, "padding"), "padded_dimension `padding=`"),
+                ids(&attr_refs(op, "window"), "padded_dimension `window=`"),
+            );
+        }
+        out.push_str("        ],\n");
+
+        // ─── the constraints ───
+        out.push_str("        constraints: &[\n");
+        for at in &module.constraints {
+            let operands = module.operands[*at]
+                .iter()
+                .map(render_operand)
+                .collect::<Vec<_>>()
+                .join(", ");
+            for form in constraint_forms(&module.stmts[*at].op) {
+                let _ = writeln!(
+                    out,
+                    "            ConstraintRow {{ operands: &[{operands}], form: {form} }},"
+                );
+            }
+        }
+        out.push_str("        ],\n");
+
+        // ─── the region tree ───
+        //
+        // ⛔ ONLY THE FOURTEEN KINDS `processOp` DISPATCHES ON REACH A ROW, and the filter is the
+        // reference's own shape rather than a convenience: its `dyn_cast` chain runs from `LoopOp`
+        // (`ddl_conversion.cpp:1075`) to `CoreCoreletCondOp` (`:2002`) and then falls off the end to
+        // `return {nullptr, {}}` (`:2004`) — no node, no region, no insertion point. So the 1,257
+        // `ddl.unit`s, 311 `ddl.allocate`s, 297 `ddl.condition*`s and 11 `ddl.define_constant`s
+        // inside the vendored dataflow bodies are reached through the OPERANDS of the ops that name
+        // them (`getTensorProp`, `processCondition`), never as ops of a region. `DdlOp` therefore has
+        // no variant for them, and giving them one would be inventing a step the reference does not
+        // take.
+        out.push_str("        region_ops: &[\n");
+        let mut per_region: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (at, home) in module.homes.iter().enumerate() {
+            if let Some(region) = home {
+                per_region.entry(*region).or_default().push(at);
+            }
+        }
+        for (region, held) in &per_region {
+            for at in held {
+                if !DISPATCHED.contains(&module.stmts[*at].mnemonic.as_str()) {
+                    continue;
+                }
+                let _ = writeln!(
+                    out,
+                    "            RegionOpRow {{ region: \
+                     crate::schedule::ddl::conversion::RegionId({region}), stmt: {at}, regions: &[{}] }},",
+                    module.owned[*at]
+                        .iter()
+                        .map(|id| format!(
+                            "crate::schedule::ddl::conversion::RegionId({id})"
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+        out.push_str("        ],\n");
+
+        // ─── the transformations sections ───
+        out.push_str("        transformations: &[\n");
+        let mut rows: Vec<(u32, Option<u32>, bool, String)> = Vec::new();
+        for (section, region) in module.transformations.iter().enumerate() {
+            collect_transform_rows(
+                module,
+                &per_region,
+                *region,
+                u32::try_from(section).expect("a module states few sections"),
+                None,
+                true,
+                &mut rows,
+            );
+        }
+        for (section, parent, then_arm, kind) in &rows {
+            let _ = writeln!(
+                out,
+                "            TransformRow {{ section: {section}, parent: {}, then_arm: {then_arm}, \
+                 kind: {kind} }},",
+                match parent {
+                    Some(at) => format!("Some({at})"),
+                    None => "None".to_owned(),
+                }
+            );
+        }
+        out.push_str("        ],\n");
+
+        // ─── the module-wide program ───
+        let _ = writeln!(
+            out,
+            "        program: Program {{ template: Template::{}, op_func: \"\", bind: \"\", \
+             roles: &[], names: &[{}], stmts: &[",
+            ident_of(&module.stem),
+            module
+                .names
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for (at, stmt) in module.stmts.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "            Stmt {{ kind: StmtKind::{}, depth: {}, attrs: {}, results: &[{}], \
+                 operands: &[{}], path: &[{}] }},",
+                variant_of(&stmt.mnemonic),
+                stmt.depth,
+                render_attrs(stmt),
+                module.results[at]
+                    .iter()
+                    .map(|id| format!("NameId({id})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                module.operands[at]
+                    .iter()
+                    .map(render_operand)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                module.paths[at]
+                    .iter()
+                    .map(|stmt| format!("Enclosing::Loop {{ stmt: {stmt} }}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        out.push_str("        ] } },\n");
+    }
+    out.push_str("];\n\n");
+    out.push_str(MODULE_LOOKUP);
+}
+
+/// THE FOURTEEN KINDS `processOp` HAS AN ARM FOR — its `dyn_cast` chain, in the reference's own
+/// order (`ddc/ddl/ddl_conversion.cpp:1075-2003`), which is exactly
+/// [`crate::schedule::ddl::conversion::DdlOp`]'s variant set.
+const DISPATCHED: [&str; 14] = [
+    "ddl.loop",
+    "ddl.parametric_loop",
+    "ddl.data_transfer",
+    "ddl.compute",
+    "ddl.datastage",
+    "ddl.get_external_datastage",
+    "ddl.if",
+    "ddl.opaque",
+    "ddl.sync",
+    "ddl.implicit_sync",
+    "ddl.datastage_constraint",
+    "ddl.force_innermost_dimensions",
+    "ddl.core_to_core_communication",
+    "ddl.core_corelet_cond",
+];
+
+/// ONE `ddl.transformations` REGION, FLATTENED — every op in order, descending each `ddl.if` into
+/// both of its arms.
+///
+/// ⛔ BOTH ARMS, UNRESOLVED. `processTransformations` resolves the condition itself and walks ONE arm
+/// (`ddl_conversion.cpp:2045-2058`), aborting where it does not resolve — so which arm applies is the
+/// port's answer to give, not this walk's, and dropping the other here would decide it at build time.
+fn collect_transform_rows(
+    module: &ModuleWalk,
+    per_region: &BTreeMap<u32, Vec<usize>>,
+    region: u32,
+    section: u32,
+    parent: Option<u32>,
+    then_arm: bool,
+    rows: &mut Vec<(u32, Option<u32>, bool, String)>,
+) {
+    for at in per_region.get(&region).map_or(&[][..], Vec::as_slice) {
+        let stmt = &module.stmts[*at];
+        let kind = match stmt.mnemonic.as_str() {
+            "ddl.disable_transfer_promotion" => "TransformKind::DisableTransferPromotion".to_owned(),
+            "ddl.yield" => "TransformKind::Yield".to_owned(),
+            "ddl.if" => format!(
+                "TransformKind::If(NameId({}))",
+                match module.operands[*at].first() {
+                    Some(OperandRef::One(id)) => *id,
+                    other => panic!(
+                        "`{}.ddl`'s transformations section has a `ddl.if` whose condition operand \
+                         is {other:?}; `processTransformations` reads `ifOp.getCondition()` \
+                         (ddl_conversion.cpp:2046)",
+                        module.stem
+                    ),
+                }
+            ),
+            other => format!("TransformKind::Other(StmtKind::{})", variant_of(other)),
+        };
+        let mine = u32::try_from(rows.len()).expect("a module states few transformation rows");
+        rows.push((section, parent, then_arm, kind));
+        if stmt.mnemonic == "ddl.if" {
+            for (which, arm) in module.owned[*at].iter().enumerate() {
+                collect_transform_rows(
+                    module,
+                    per_region,
+                    *arm,
+                    section,
+                    Some(mine),
+                    which == 0,
+                    rows,
+                );
+            }
+        }
+    }
+}
