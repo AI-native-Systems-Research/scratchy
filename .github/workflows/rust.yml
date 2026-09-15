@@ -141,6 +141,14 @@ jobs:
       - name: Clippy
         run: cargo clippy -p scratchy-models --features metal,all -- -D warnings
 
+      # `all` is model stems only, so the step above never turns
+      # `hf-completions` on and its build-script path (the huggingface.co query
+      # in hf_registry_build.rs) would otherwise go entirely unlinted. Scoped to
+      # the smallest stem: one arch, one Hub query. Runners have network; a Hub
+      # outage degrades to an empty registry rather than failing the build.
+      - name: Clippy (hf-completions)
+        run: cargo clippy -p scratchy-models --features metal,smollm2-135m,hf-completions -- -D warnings
+
       # `cargo test -p scratchy-models` runs ZERO tests — that crate is a pure
       # re-export umbrella with no test targets, and a dependency's integration
       # tests don't run transitively. Test the crate that actually holds the

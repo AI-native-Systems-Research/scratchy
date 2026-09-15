@@ -10,6 +10,7 @@ pub mod bench;
 pub mod cache;
 pub mod chat;
 pub mod collect_env;
+pub mod completions;
 pub mod convert;
 #[cfg(feature = "claude")]
 pub mod launch;

@@ -46,6 +46,32 @@ pub enum Commands {
     /// Manage models: list/pull/rm/convert/cache, inspect compiled-in
     /// backbones.
     Model(ModelCommand),
+    /// Print (or install) a shell completion script for bash or zsh, enabling
+    /// `scr chat <TAB>` / `scr serve <TAB>` to complete HuggingFace model ids
+    /// this binary was compiled to run. Either pipe the output yourself (e.g.
+    /// `scr completions zsh > ~/.zsh/completions/_scr`) or pass `--install` to
+    /// have `scr` write the script and wire up the shell rc file itself.
+    Completions(CompletionsArgs),
+}
+
+/// Arguments for `scr completions`.
+#[derive(Parser, Debug)]
+pub struct CompletionsArgs {
+    /// Shell to generate a completion script for.
+    #[arg(value_enum)]
+    pub shell: CompletionShell,
+
+    /// Write the script to the standard per-shell location and wire up the
+    /// shell rc file (`~/.bashrc` / `~/.zshrc`) instead of printing the script
+    /// to stdout. Idempotent — safe to run again after a rebuild.
+    #[arg(long)]
+    pub install: bool,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
 }
 
 /// `scr launch <agent>` — serve a model locally and start an external coding
@@ -154,6 +180,62 @@ pub enum ModelSubcommand {
     /// `scr model info llama 3.2 awq`.
     #[cfg(any(feature = "cuda", feature = "metal"))]
     Info(ModelInfoArgs),
+    /// Print compiled-in HuggingFace model ids for shell tab completion
+    /// (one per line), optionally filtered by prefix. Sourced from
+    /// `model::compiled_hf_registry()` — resolved against huggingface.co
+    /// at BUILD time (see `crates/models/arch/hf_registry_build.rs`), not
+    /// a runtime network call or the local hf-hub cache. Hidden — invoked
+    /// by the completion scripts from `scr completions`, not meant to be
+    /// typed directly.
+    #[cfg(feature = "model")]
+    #[command(hide = true)]
+    Names(NamesArgs),
+}
+
+/// Arguments for the hidden `scr model names` completion helper.
+#[cfg(feature = "model")]
+#[derive(Parser, Debug)]
+pub struct NamesArgs {
+    /// Prefix the shell is currently completing (empty = list everything).
+    #[arg(default_value = "")]
+    pub prefix: String,
+
+    /// Which candidate set to draw from. Different arguments want different
+    /// sources: a model argument wants what this build can actually run,
+    /// `scr model rm` wants only what is actually cached, `scr model info`
+    /// wants config stems.
+    #[arg(long, value_enum, default_value_t = NamesSource::Compiled)]
+    pub source: NamesSource,
+}
+
+/// Candidate sets for `scr model names`.
+#[cfg(feature = "model")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum NamesSource {
+    /// The build-time HF registry: repo ids whose arch, shape and quantization
+    /// all match something this binary compiled. The default, and the only
+    /// source valid for a model argument.
+    ///
+    /// Empty when the build resolved no registry — see the note on
+    /// [`Cached`](Self::Cached) for why an empty list beats a plausible-looking
+    /// wrong one.
+    Compiled,
+    /// Locally cached repos — every `org/name` in the hf-hub cache, which is
+    /// whatever has ever been pulled on this machine.
+    ///
+    /// **Not scoped to this build**, which is why it is not part of
+    /// [`Compiled`](Self::Compiled) and never offered for a model argument: a
+    /// cache holds models of other architectures, other sizes and other
+    /// quantizations, none of which this binary can necessarily load. Mixing it
+    /// in made completion look broken — it offered `modernbert-embed-base` (not
+    /// even a decoder) from a llama-only build, and produced the same list
+    /// regardless of `-Fmodel` scope whenever the registry was empty. Used for
+    /// `scr model rm`, whose argument "must match the model ID shown by
+    /// `scr model ls`".
+    Cached,
+    /// Compiled config stems (`llama-3.2-1b`) — for `scr model info` filters.
+    /// Never valid as a model argument.
+    Stems,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
