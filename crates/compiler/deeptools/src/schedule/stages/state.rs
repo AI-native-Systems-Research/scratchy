@@ -24,15 +24,14 @@ use std::collections::BTreeMap;
 
 use sys_arch_spec::arch_enums::SenComponent;
 
-use crate::schedule::ddc::fold::NodeId;
+use crate::schedule::ddc::fold::{NodeId, NodeKind};
 use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::transformation_util::{LoopDims, LoopNode};
-use crate::schedule::dsc2::{AllocateNode, LdsIdx, NodeName};
+use crate::schedule::ddc::v1;
+use crate::schedule::dsc2::{AllocateNode, LdsIdx, LoopCondComposite, NodeName};
 use crate::schedule::l3::dl_ops::{LoopNesting, LoopStages};
-use crate::schedule::l3::dsc::{
-    DesignSpaceConfig, DscIdx, NodeParents, ScheduleNodes, SuperDsc,
-};
+use crate::schedule::l3::dsc::{DesignSpaceConfig, DscIdx, NodeParents, ScheduleNodes, SuperDsc};
 
 use super::tree::{Kind, Org, TreeData, seed_allocate_node};
 
@@ -96,7 +95,10 @@ impl DscTree {
     }
 
     /// Every placed node, for one read.
-    pub(super) fn with_placed<T>(&self, ask: impl FnOnce(&BTreeMap<NodeId, AllocateNode>) -> T) -> T {
+    pub(super) fn with_placed<T>(
+        &self,
+        ask: impl FnOnce(&BTreeMap<NodeId, AllocateNode>) -> T,
+    ) -> T {
         ask(&self.placed.borrow())
     }
 
@@ -110,6 +112,32 @@ impl DscTree {
     #[must_use]
     pub fn names(&self) -> Vec<NodeName> {
         self.with(TreeData::node_names)
+    }
+
+    /// `scheduleTree_.getHead()->denId_`, which serialises as `scheduleTreeHeadDenId_`
+    /// (`dsc/dsc2.cpp:368`) — [`None`] before entry 217 states it.
+    #[must_use]
+    pub fn head_den(&self) -> Option<DatastageId> {
+        self.with(TreeData::head_den)
+    }
+
+    /// `node->nodeType_`, [`None`] for a node this tree does not hold.
+    #[must_use]
+    pub fn node_kind(&self, node: NodeId) -> Option<NodeKind> {
+        self.with(|tree| tree.node_kind(node))
+    }
+
+    /// `condNode->loopCond_` — [`None`] where the node is not a loop-guarded condition.
+    #[must_use]
+    pub fn loop_cond(&self, node: NodeId) -> Option<LoopCondComposite> {
+        self.with(|tree| tree.loop_cond(node))
+    }
+
+    /// `condNode->coreClCond_` — [`None`] where the node is not a core/corelet-guarded condition,
+    /// which is what `hasCoreClCond()` distinguishes.
+    #[must_use]
+    pub fn core_cl_cond(&self, node: NodeId) -> Option<v1::CoreClSet> {
+        self.with(|tree| tree.core_cl_cond(node))
     }
 
     /// The loop minted at that id.
@@ -259,8 +287,7 @@ fn seed_dsc(dsc: &DesignSpaceConfig) -> DscTree {
             .flatten()
             .map(|layout| {
                 let name = NodeName(format!("allocate_lds{}_hbm", at.0));
-                let held =
-                    seed_allocate_node(name.clone(), at, SenComponent::Hbm, layout);
+                let held = seed_allocate_node(name.clone(), at, SenComponent::Hbm, layout);
                 let alloc = tree.fresh_alloc();
                 let node = tree.add(name, Kind::Allocate(alloc, held.clone()), Some(root));
                 (node, held)

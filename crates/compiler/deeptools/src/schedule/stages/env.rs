@@ -419,9 +419,7 @@ impl ChunkLoopNest for Env<'_> {
     }
 
     fn core_window_dims(&self, dsc: DscIdx) -> Option<CoreWindowDims> {
-        self.core_windows
-            .get(usize::try_from(dsc.0).ok()?)
-            .cloned()
+        self.core_windows.get(usize::try_from(dsc.0).ok()?).cloned()
     }
 
     fn set_head_den(&mut self, dsc: DscIdx, den: DatastageId) -> Option<()> {
@@ -611,10 +609,8 @@ impl ScheduleSurgery for PagedCursor<'_> {
     }
 
     fn new_loop(&mut self, loop_node: LoopNode) -> LoopId {
-        self.with_mut(|tree| {
-            LoopId(tree.add(loop_node.name.clone(), Kind::Loop(loop_node), None))
-        })
-        .unwrap_or(LoopId(NodeId(u32::MAX)))
+        self.with_mut(|tree| LoopId(tree.add(loop_node.name.clone(), Kind::Loop(loop_node), None)))
+            .unwrap_or(LoopId(NodeId(u32::MAX)))
     }
 
     fn new_block(&mut self, name: NodeName) -> NodeId {
@@ -946,15 +942,8 @@ impl CoreletSliceSeam for CoordSeam {
         &mut self.stages
     }
 
-    fn loop_relevant(
-        &self,
-        _dim: PrimaryDimAndKind,
-        _loop_node: &LoopNode,
-        _pad: PadType,
-    ) -> bool {
-        todo!(
-            "CoreletSliceSeam::loop_relevant: wants dsc2::loopRelevantForDim (dsc/dsc2.cpp:6550)"
-        )
+    fn loop_relevant(&self, _dim: PrimaryDimAndKind, _loop_node: &LoopNode, _pad: PadType) -> bool {
+        todo!("CoreletSliceSeam::loop_relevant: wants dsc2::loopRelevantForDim (dsc/dsc2.cpp:6550)")
     }
 
     fn lx_below_chunk_loops(&self) -> Option<Vec<&LoopNode>> {

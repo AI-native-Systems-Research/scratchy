@@ -21,6 +21,7 @@ use crate::schedule::ddc::fold::{AllocId, AllocLayout, NodeId, NodeKind};
 use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::transformation_util::{InsertionPoint, LoopDims, LoopNode, PaddingForm};
+use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{
     AllocateNode, Coordinate, LayoutDims, LdsIdx, LoopCondComposite, NodeName, SyncNode,
     TransferNode,
@@ -29,7 +30,7 @@ use crate::schedule::l3::dl_ops::{
     GtrGroupId, L3AllocateNode, L3Sync, L3WalkNode, LX_BELOW_BLOCK_NODE_NAME,
 };
 use crate::schedule::l3::dsc::{
-    AddressCoord, Buffering, BufferOffset, ByteAddress, IndirectAlloc, L3Transfer, MemOrg,
+    AddressCoord, BufferOffset, Buffering, ByteAddress, IndirectAlloc, L3Transfer, MemOrg,
     PlacedAllocation,
 };
 use crate::units::{Core, Corelet};
@@ -73,7 +74,7 @@ pub(super) struct Cond {
     /// `loopCond_`, absent on a core/corelet-guarded condition.
     pub(super) loop_cond: Option<LoopCondComposite>,
     /// `coreClCond_`, absent on a loop-guarded one.
-    pub(super) cores: Option<crate::schedule::ddc::v1::CoreClSet>,
+    pub(super) cores: Option<v1::CoreClSet>,
     /// The blocks added to the then-region, in order.
     pub(super) then_region: Vec<NodeId>,
     /// The blocks added to the else-region, in order.
@@ -250,14 +251,11 @@ impl TreeData {
         }
     }
 
-    /// `condNode->loopCond_ = cond`.
-    pub(super) fn set_loop_cond(&mut self, condition: NodeId, cond: LoopCondComposite) {
-        if let Some(Entry {
-            kind: Kind::Condition(held),
-            ..
-        }) = self.nodes.get_mut(&condition)
-        {
-            held.loop_cond = Some(cond);
+    /// `condNode->coreClCond_`, absent on a loop-guarded condition and on every other kind.
+    pub(super) fn core_cl_cond(&self, condition: NodeId) -> Option<v1::CoreClSet> {
+        match &self.nodes.get(&condition)?.kind {
+            Kind::Condition(cond) => cond.cores.clone(),
+            _ => None,
         }
     }
 
@@ -415,7 +413,10 @@ impl TreeData {
 
     /// `traverseTreeDFS(nullptr, {ALLOCATE})` as entry 055 reads it — the `ldsIdx_`, the
     /// `component_` and every `(core, address)` the node's `startAddressCoreCorelet_` states.
-    pub(super) fn allocations(&self, placed: &BTreeMap<NodeId, AllocateNode>) -> Vec<PlacedAllocation> {
+    pub(super) fn allocations(
+        &self,
+        placed: &BTreeMap<NodeId, AllocateNode>,
+    ) -> Vec<PlacedAllocation> {
         self.dfs()
             .into_iter()
             .filter_map(|node| {
@@ -617,7 +618,12 @@ impl Org {
 
     /// `allocNode->addAllocUser(user)`.
     pub(super) fn add_user(&self, storage: SenComponent, user: NodeId) {
-        self.data.borrow_mut().users.entry(storage).or_default().push(user);
+        self.data
+            .borrow_mut()
+            .users
+            .entry(storage)
+            .or_default()
+            .push(user);
     }
 
     /// The ddc view of the node at that storage.
@@ -682,11 +688,7 @@ impl MemOrg for Org {
     }
 
     fn hbm_indirection(&self) -> Option<IndirectAlloc> {
-        self.data
-            .borrow()
-            .minted
-            .get(&SenComponent::Hbm)?
-            .indirect
+        self.data.borrow().minted.get(&SenComponent::Hbm)?.indirect
     }
 
     fn hbm_allocation(&self) -> Option<NodeName> {

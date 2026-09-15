@@ -15,8 +15,9 @@
 //! over entries 050/219/220/222/292/333 — not a fact scratchy fails to write.
 
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+use crate::schedule::ddc::fold::Stride;
 use crate::schedule::ddc::metadata::DatastageId;
-use crate::schedule::ddc::transformation_util::{PaddingForm, Stride};
+use crate::schedule::ddc::transformation_util::PaddingForm;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::LdsIdx;
 use crate::schedule::l3::dl_ops::{
@@ -190,7 +191,9 @@ impl DimStage for SeveredStage {
         _corelet: Corelet,
         _padded: &PaddingForm,
     ) -> Option<Extent> {
-        todo!("DimStage::corelet_dim_val: wants primaryDimToVal_st on the live dataStageParam_ entry")
+        todo!(
+            "DimStage::corelet_dim_val: wants primaryDimToVal_st on the live dataStageParam_ entry"
+        )
     }
 
     /// ⛔ Wants `coreletSplit_.count(dim)` on the live data stage.
@@ -244,4 +247,3 @@ impl DscOffsetFacts for Reads<'_> {
         )
     }
 }
-

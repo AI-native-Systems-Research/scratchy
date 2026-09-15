@@ -22,14 +22,30 @@ use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{LdsIdx, StartAddress};
 use crate::schedule::l3::dl_ops::{
-    ExPhase, ExPhaseTrackers, L3DataInfoSink, L3Fill, L3Placement, L3TrackerSite, SymbolOp,
-    SymbolOperand, SymbolTable, VariableSymbol,
+    AddressFoldCoords, ExPhase, ExPhaseTrackers, L3DataInfoSink, L3Fill, L3Placement,
+    L3TrackerSite, SymbolOp, SymbolOperand, SymbolTable, VariableSymbol,
 };
 use crate::units::{Corelet, Row};
 
 /// `P` — the design space's placement, which entry 222 sizes and names buffers through.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Placement;
+///
+/// ⭐ THE FOLD SPACE IS REAL, READ OFF THE COORDINATES `run` IS ALREADY HANDED:
+/// [`AddressFoldCoords::depth`] is `{coreFoldProp_, coreletFoldProp_} ++ sdscFoldProps_`'s size and
+/// its own doc says so, and the coordinate count is that same list's length. Two answers from ONE
+/// value, so the fold space this places along and the fold space entry 292 walks cannot disagree.
+#[derive(Debug, Clone)]
+pub struct Placement {
+    coords: AddressFoldCoords,
+}
+
+impl Placement {
+    /// The placement over the fold manager's own address coordinates — the same value
+    /// [`crate::schedule::l3::dl_ops::L3RunInputs::coords`] carries.
+    #[must_use]
+    pub const fn of(coords: AddressFoldCoords) -> Self {
+        Self { coords }
+    }
+}
 
 impl L3Placement for Placement {
     /// ⛔ NEVER A CONSTANT. `getBufferCapacityForNode(node, lds, comp, corelet, row, bytesPerStick,
@@ -52,22 +68,16 @@ impl L3Placement for Placement {
         )
     }
 
-    /// ⛔ Wants `{coreFoldProp_, coreletFoldProp_} ++ sdscFoldProps_`'s size. Those fold props are in
-    /// the SDSC (`sdscFoldProps_` holds one `time` axis for `0_rmsq_o728`) but NOT in
-    /// [`crate::schedule::l3::dsc::SuperDsc`], which carries only the work-slice tables.
+    /// `{coreFoldProp_, coreletFoldProp_} ++ sdscFoldProps_`'s size, which is
+    /// [`AddressFoldCoords::depth`] — the two struck axes plus each tail axis.
     fn address_fold_depth(&self) -> usize {
-        todo!(
-            "L3Placement::address_fold_depth: wants {{coreFoldProp_, coreletFoldProp_}} ++ \
-             sdscFoldProps_, which l3::dsc::SuperDsc does not carry"
-        )
+        self.coords.depth()
     }
 
-    /// ⛔ Wants `getFlattenedCoordinates({{0, 0}, {1, 0}}).size()` off the same fold props.
+    /// `getFlattenedCoordinates({{0, 0}, {1, 0}}).size()` — how many coordinates one
+    /// `(core, corelet)` spreads its address list over, which is how many tails there are.
     fn address_fold_coords(&self) -> usize {
-        todo!(
-            "L3Placement::address_fold_coords: wants \
-             getFlattenedCoordinates({{0,0}},{{1,0}}).size() off the SDSC's fold props"
-        )
+        self.coords.tails().count()
     }
 }
 
@@ -105,7 +115,9 @@ impl ExPhaseTrackers for Trackers {
     /// ⛔ Wants `memCapacity` off `ddc::DsTrackInMem` — never a constant, for the same reason
     /// [`L3Placement::buffer_capacity_even_sticks`] is not.
     fn capacity(&self, _at: L3TrackerSite) -> Bytes {
-        todo!("ExPhaseTrackers::capacity: wants memCapacity off ddc::DsTrackInMem (ddc/memTracker.h)")
+        todo!(
+            "ExPhaseTrackers::capacity: wants memCapacity off ddc::DsTrackInMem (ddc/memTracker.h)"
+        )
     }
 
     /// ⛔ Wants `backupEps(exphase)` on the live tracker.
@@ -115,7 +127,9 @@ impl ExPhaseTrackers for Trackers {
 
     /// ⛔ Wants `restoreEps(exphase, backupInfo)` on the live tracker.
     fn restore_all(&mut self) {
-        todo!("ExPhaseTrackers::restore_all: wants restoreEps(exphase, backupInfo) on ddc::DsTrackInMem")
+        todo!(
+            "ExPhaseTrackers::restore_all: wants restoreEps(exphase, backupInfo) on ddc::DsTrackInMem"
+        )
     }
 
     /// ⛔ Wants `removeDs(name, exphases)` on the live tracker.
