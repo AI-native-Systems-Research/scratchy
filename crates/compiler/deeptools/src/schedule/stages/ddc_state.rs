@@ -51,7 +51,7 @@ use crate::schedule::ddc::transformation_util::{
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::LdsIdx;
 use crate::schedule::l3::dsc::{DesignSpaceConfig, DscIdx, StageDims, SuperDsc, WkSliceCount};
-use crate::units::{Corelet, Row};
+use crate::units::Corelet;
 
 use super::state::{DscState, DscTree};
 
@@ -360,6 +360,8 @@ pub struct Dsc2State<'l> {
     /// `sdsc.numWkSlicesPerDim_` — a [`SuperDsc`] field, copied in because `run_v1` holds the
     /// super-DSC as `&mut`.
     wk_slices: BTreeMap<PrimaryDim, WkSliceCount>,
+    /// `sdsc.coreIdToWkSlice_` — the same, and what the DDL ring's neighbour lookup walks.
+    core_wk_slices: BTreeMap<crate::units::Core, crate::schedule::l3::dsc::WkSlice>,
     /// ⭐ EVERY PROVIDER METHOD THAT REFUSED, in the order it was asked — an OBSERVER and not a
     /// behaviour, exactly as [`DscState::refusals`] is.
     refusals: RefCell<Vec<&'static str>>,
@@ -400,6 +402,7 @@ impl<'l> Dsc2State<'l> {
             l3,
             dscs,
             wk_slices: sdsc.num_wk_slices_per_dim.clone(),
+            core_wk_slices: sdsc.core_id_to_wk_slice.clone(),
             refusals: RefCell::new(Vec::new()),
         }
     }
@@ -417,6 +420,13 @@ impl<'l> Dsc2State<'l> {
     /// `sdsc.numWkSlicesPerDim_.at(dim)`.
     pub(super) fn wk_slices(&self, dim: PrimaryDim) -> Option<WkSliceCount> {
         self.wk_slices.get(&dim).copied()
+    }
+
+    /// `sdsc.coreIdToWkSlice_` — every core the super-DSC states, with its work slice per dim.
+    pub(super) fn core_wk_slices(
+        &self,
+    ) -> BTreeMap<crate::units::Core, crate::schedule::l3::dsc::WkSlice> {
+        self.core_wk_slices.clone()
     }
 
     /// ⭐ A PROVIDER METHOD'S OWN REFUSAL, recorded and then propagated.
@@ -799,7 +809,3 @@ pub(super) fn corelets_of(count: u32) -> Vec<Corelet> {
     (0..count).filter_map(Corelet::checked).collect()
 }
 
-/// Every PT row a stage states — used only where a trait wants `Row` and nothing states a row split.
-pub(super) const fn row_zero() -> Row {
-    Row::at::<0>()
-}

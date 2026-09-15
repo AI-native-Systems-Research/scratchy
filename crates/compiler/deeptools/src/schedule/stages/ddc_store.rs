@@ -134,11 +134,6 @@ impl<'s, 'l> Dsc2Store<'s, 'l> {
         self.with_tree(|tree| tree.node_kind(node))
     }
 
-    /// The transfer at that node, for a read that may find none.
-    pub(super) fn read_transfer(&self, node: NodeId) -> Option<TransferNode> {
-        self.with_tree(|tree| tree.transfer(node))
-    }
-
     /// ⭐ ONE READ-MODIFY-WRITE OF A TRANSFER BODY — a NO-OP on a node that is not a transfer, which
     /// is the reference's own downcast of one.
     pub(super) fn edit_transfer(&self, node: NodeId, edit: impl FnOnce(&mut TransferNode)) {

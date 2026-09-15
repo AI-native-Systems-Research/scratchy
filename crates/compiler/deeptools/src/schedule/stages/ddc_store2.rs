@@ -863,17 +863,40 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
         )
     }
 
-    /// `scheduleTree_.getHead()` as the block one `DdlConvertInterface` is opened over — ⛔ THE WHOLE
-    /// [`BlockNode`] AND NOT ITS IDENTITY: [`BlockNode::children`] is a `Vec<SchedNode>` of OWNED
-    /// nodes, which is a different tree model from this one (reached by identity), so handing it back
-    /// means materialising every child as an owned `dsc2::` node — including the COMPUTE arm this
-    /// tree has none of.
+    /// ⭐⭐ `scheduleTree_.getHead()` as the block one `DdlConvertInterface` is opened over — AND THIS
+    /// IS WHERE STAGE 2B STOPS ON A REAL PREFILLED SCHEDULE. `run_v1` calls it at `ddc/v1.rs:6483`,
+    /// one line before `select_and_parse_ddl_template`.
+    ///
+    /// ⛔⛔ IT WANTS THE WHOLE [`BlockNode`], NOT ITS IDENTITY, AND THAT IS A THIRD TREE MODEL.
+    /// [`BlockNode::children`] is a `Vec<SchedNode>` of OWNED nodes and
+    /// [`crate::schedule::ddl::conversion::DdlConversion::new`] wraps it in a
+    /// [`crate::schedule::dsc2::ScheduleTree`] it then splices every parsed DDL node into
+    /// (`ddl/conversion.rs:1914-1916`). [`super::tree::TreeData`] reaches every node by IDENTITY and
+    /// owns no subtree, so satisfying this means materialising all 22 nodes as owned `dsc2::` nodes.
+    ///
+    /// ⛔ HANDING BACK AN EMPTY-CHILDREN BLOCK IS THE ONE THING THAT MUST NOT HAPPEN: it says the
+    /// DSC's schedule tree is empty, and the DDL conversion would then splice its minted computes and
+    /// transfers into nothing — the parsed template would attach to no schedule at all, and it would
+    /// compile.
+    ///
+    /// ⛔⛔ AND THE MATERIALISATION IS BLOCKED ON A FACT THIS TREE ALREADY REFUSES. Every LOOP child
+    /// must become a [`crate::schedule::dsc2::LoopNode`], whose `parametric_lds` is
+    /// `isParametricLoop_` fused with `parametricLdsIdx_` — the SAME field
+    /// [`v1::ExploreTree::is_parametric_loop`] and [`tu::ScheduleSurgery::is_parametric`] both name as
+    /// missing. Writing [`None`] there states *"this loop is not parametric"* as a FACT, and
+    /// `rmsq_o728`'s tree has three chunk loops it would state it for.
+    ///
+    /// ⭐ WHAT IS *NOT* THE BLOCKER: the COMPUTE arm. [`crate::schedule::dsc2::SchedNode`] spells an
+    /// ALLOCATE or a TRANSFER as `Leaf(NodeName)` — name only, no children — so the 22-node stage-2a
+    /// tree needs no compute node to materialise.
     fn schedule_head_block(&self) -> BlockNode {
         todo!(
             "v1::Dsc2Store::schedule_head_block: wants scheduleTree_.getHead() as a whole \
-             dsc2::BlockNode, whose children are OWNED SchedNodes — super::tree::TreeData reaches \
-             every node by identity and holds no owned subtree, and materialising one needs the \
-             Compute arm it lacks"
+             dsc2::BlockNode of OWNED SchedNodes (DdlConversion::new splices the parsed DDL into it, \
+             ddl/conversion.rs:1914-1916). super::tree::TreeData reaches nodes by identity and owns \
+             no subtree; materialising one needs dsc2::LoopNode::parametric_lds \
+             (isParametricLoop_ + parametricLdsIdx_), the same field ExploreTree::is_parametric_loop \
+             refuses. An empty-children block would attach the whole parsed template to nothing."
         )
     }
 

@@ -48,6 +48,7 @@
 
 mod carriers;
 mod ddc_reads;
+mod ddc_sites;
 mod ddc_state;
 mod ddc_store;
 mod ddc_store2;
@@ -59,6 +60,11 @@ mod state;
 mod tree;
 
 pub use carriers::{Placement, Sink, Symbols, Trackers};
+pub use ddc_reads::Dsc2Reads;
+pub use ddc_sites::{DdcTemplates, Dsc2Ddl, Dsc2Provider, Dsc2Stages};
+pub use ddc_state::{DdcCoords, DdcSink, DdcSymbols, DdcTrackers, Dsc2Dims, Dsc2State};
+pub use ddc_store::{Dsc2LdsEntry, Dsc2Store};
+pub use ddc_tree::Dsc2Tree;
 pub use env::Env;
 pub use reads::Reads;
 pub use state::{DscState, DscTree};
@@ -175,6 +181,52 @@ pub fn run_l3<const CHUNK_EXPLORE: bool, A: crate::arch::Arch>(
         symbols: &mut symbols,
     };
     l3::dl_ops::run::<CHUNK_EXPLORE, A, _, _, _, _, _, _>(sdsc, &inputs, &mut surgery)
+}
+
+/// ⭐⭐ STAGE 2B, COMPOSED AND CALLED — [`run_l3`]'s PEER: it builds the provider over a
+/// [`Dsc2State`] and hands it to [`v1::run_v1`].
+///
+/// ⛔⛔ THE `computeOp_` LIST IS A CONSTRUCTION ARGUMENT AND THAT IS NOT OPTIONAL.
+/// [`v1::PrepDsc::compute_ops`] is the FIRST provider call `run_v1` makes (`ddc/v1.rs:6437`) and an
+/// EMPTY answer makes it `continue` past the DSC — so a caller that stated no ops would get
+/// [`v1::DscFilled::Yes`] having done nothing at all, which is a false green. `computeOp_` is not a
+/// field of [`l3::dsc::DesignSpaceConfig`], so the caller states it, exactly as [`run_l3`] is handed
+/// [`v1::OpFuncs`].
+///
+/// ⛔ `DSC_TO_DDL` IS `false`: entry 345's export is behind `dscToDdl_`, which only
+/// `ddc/ddc_standalone.cpp:40` sets.
+///
+/// ⛔ [`None`] IS EVERY CALLEE'S OWN STOP plus a `dscs_.at()` the provider does not hold;
+/// [`Dsc2State::first_refusal`] says whether a CARRIER made it.
+pub fn run_ddc<A: crate::arch::Arch>(
+    sdsc: &mut l3::dsc::SuperDsc,
+    state: &Dsc2State<'_>,
+    options: v1::Dsc2Options,
+    coords: &l3::dl_ops::AddressFoldCoords,
+) -> Option<v1::Dsc2Fill> {
+    let mut sites = Dsc2Provider::new(state, coords);
+    let templates = DdcTemplates::new(state);
+    let mut shuffle_names = super::ddc::transformation::AutoShuffleNames::default();
+    v1::run_v1::<A, _, _, false>(sdsc, &mut sites, &templates, &mut shuffle_names, options)
+}
+
+/// ⭐ STAGE 2B'S OWN CONSTRUCTION ARGUMENTS AT THEIR REFERENCE DEFAULTS — the five ambient reads
+/// entry 379's callees take, each cited on [`v1::Dsc2Options`]'s own fields.
+///
+/// ⛔ EVERY ONE IS THE `dtGetEnv`/`value_or` DEFAULT AND NOT A CHOICE MADE HERE: `ENABLE_LN32` unset
+/// is [`v1::Ln32::Off`], `trueLXTracker_` false is [`v1::LxTrackers::Ephemeral`],
+/// `allowUnpaddedIndexingAtPaddedNoZeroPad` false is [`v1::UnpaddedIndexing::Forbidden`],
+/// `verifyCoordinateBasedLoopElemOff` unset leaves the latch at [`v1::ElemOffsets::Distribution`],
+/// and `coordFoldReportLevel_` `0` is [`crate::schedule::ddc::fold::CoordFoldReport::Off`].
+#[must_use]
+pub const fn ddc_defaults() -> v1::Dsc2Options {
+    v1::Dsc2Options {
+        ln32: v1::Ln32::Off,
+        lx: v1::LxTrackers::Ephemeral,
+        unpadded: v1::UnpaddedIndexing::Forbidden,
+        offsets: v1::ElemOffsets::Distribution,
+        report: crate::schedule::ddc::fold::CoordFoldReport::Off,
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +532,265 @@ mod tests {
     /// `computeOp_.at(0).opFuncName` on `rmsq_o728` — `"mul"` on the `sfp`, per `g0/sdsc_0.json`.
     fn an_op_func() -> v1::OpFuncs {
         v1::OpFuncs::new(Some(sys_arch_spec::arch_enums::OpFunc::Mul), Vec::new())
+    }
+
+    /// ⭐⭐ `rmsq_o728`'s WHOLE `computeOp_`, TRANSCRIBED FROM `g0/sdsc_0.json`:
+    /// `[{exUnit: "sfp", opFuncName: "mul", attributes_.dataFormat_: "SEN169_FP16",
+    /// inputLabeledDs: ["Tensor0-idx0", "Tensor1-idx1"], outputLabeledDs: ["Tensor2-idx2"]}]`.
+    ///
+    /// ⛔ IT IS A CONSTRUCTION ARGUMENT AND NOT A FIELD OF [`l3::dsc::DesignSpaceConfig`] — see
+    /// [`run_ddc`]. ⭐ AND IT IS A REAL FIELD, NOT A CONSTANT: over the first forty fixtures the
+    /// `(opFuncName, exUnit, #inputs, #outputs)` signature takes TWELVE distinct values —
+    /// `mul`/`mean`/`reciprocal`/`add`/`max`/`maximum`/`sub`/`exp`/`identity`/`minimum`/`sum` on the
+    /// `sfp`, plus one two-op DSC (`batchmatmul` on the `pt` then `stridedadd` on the `sfp`) — so a
+    /// carrier that answered one shape for every program would be wrong on 35 of them.
+    fn the_rmsq_compute_ops() -> Vec<v1::DscComputeOp> {
+        vec![v1::DscComputeOp {
+            op_func: Some(sys_arch_spec::arch_enums::OpFunc::Mul),
+            ex_unit: SenComponent::Sfp,
+            format: Some(crate::formats::DataFormat::Sen169Fp16),
+            inputs: vec![LdsIdx(0), LdsIdx(1)],
+            outputs: vec![LdsIdx(2)],
+        }]
+    }
+
+    /// ⭐⭐ STAGE 2B RUN ON `rmsq_o728`, AND WHERE IT STOPS — the one fact this composition was built
+    /// to produce.
+    ///
+    /// ⛔⛔ THIS IS NOT THE REFERENCE'S COMPOSITION AND THE TEST SAYS SO. The reference runs stage 2a
+    /// to completion and THEN stage 2b over the tree 2a left (`SchedulerStages.cpp:29-57`). Stage 2a
+    /// stops at the memory tracker on every program scratchy emits
+    /// ([`stage_2a_runs_past_entry_207_and_reaches_the_memory_tracker`]), so what stage 2b is handed
+    /// here is the FOUR-NODE SEED and not a grown tree. That is deliberate: stage 2b has its OWN
+    /// [`v1::MemTrackers`] carrier, so running it on the seed exercises stage 2b's own units and says
+    /// where **2b** stops, which is a different question from where 2a stops.
+    ///
+    /// ⭐ WHAT IT PROVES RAN. `run_v1` reaches this seam only after `sites.carriers(0)` handed out all
+    /// ten borrows, [`v1::PrepDsc::compute_ops`] answered the op list (a non-empty answer, or the DSC
+    /// would have been skipped), [`v1::CoreletShapes::corelets_used`] and
+    /// [`v1::PrepDsc::set_corelets_used_dsc2`] ran, [`v1::ExploreStages::dims`] handed back the chunk
+    /// snapshot, `get_pe_sfp_split_dim` walked it, the reduction sweep read every operand's
+    /// non-broadcast dims and `numWkSlicesPerDim_`, and [`v1::ExploreStages::stages`] listed the map.
+    ///
+    /// ⛔ THE EXPECTED MESSAGE IS THE SPECIFIC SEAM, NOT ANY PANIC — the same ratchet
+    /// [`stage_2a_runs_past_entry_207_and_reaches_the_memory_tracker`] is: a bare `should_panic` would
+    /// pass on the first of this module's `todo!`s and so would say nothing about how far 2b got.
+    #[test]
+    fn stage_2b_on_the_seed_tree_stops_on_the_missing_below_lx_block() {
+        let mut sdsc = a_rmsq_super_dsc();
+        let l3_state = DscState::seeded(&sdsc);
+        let state = Dsc2State::seeded(
+            &sdsc,
+            &l3_state,
+            &[the_rmsq_compute_ops()],
+            &[v1::StorageName("rmsq_o728".to_owned())],
+        );
+        let ran = run_ddc::<Dd2>(
+            &mut sdsc,
+            &state,
+            ddc_defaults(),
+            &l3::dl_ops::AddressFoldCoords::flat(),
+        );
+
+        // ⭐ THE STOP IS A PORTED UNIT'S OWN REFUSAL AND NOT A CARRIER'S, and not a `todo!` either:
+        // nothing panicked, and no provider method was asked for a fact it could not give.
+        assert!(ran.is_none(), "stage 2b refuses on the seed tree");
+        assert!(
+            state.refusals().is_empty(),
+            "no carrier refused: {:?}",
+            state.refusals()
+        );
+        assert_eq!(
+            l3_state.node_count(),
+            4,
+            "the tree is untouched — stage 2b refused before minting anything"
+        );
+
+        // ⭐⭐ AND THIS IS *WHICH* REFUSAL, ISOLATED. `attach_to_prefilled_schedule` inserts every
+        // node it VISITS into `metadata.external_nodes` before testing it, so a full set proves the
+        // per-node walk refused on NONE of them — every ALLOCATE passed `holds_lds`, `is_dsc_memory`
+        // and the `lds_alloc(lds, component) == alloc` round-trip through the tree's own `memOrg_`.
+        // What is [`None`] is `below_lx_schedule_insert_block`, and the LAST line of that unit is
+        // `metadata.below_lx_schedule_insert_block.map(|_| ())` — the reference's
+        // *"Missing below-lx schedule insert block"*.
+        let mut sites = Dsc2Provider::new(&state, &l3::dl_ops::AddressFoldCoords::flat());
+        let mut metadata = crate::schedule::ddc::metadata::Metadata::default();
+        let (attached, arena) = {
+            let carriers = v1::Dsc2Sites::carriers(&mut sites, l3::dsc::DscIdx(0))
+                .expect("the one DSC's carriers");
+            let arena = carriers.allocs.len();
+            let (reads, tree) = v1::Dsc2Store::split(carriers.dsc);
+            (
+                v1::attach_to_prefilled_schedule::<Dd2, _, _, _>(
+                    reads,
+                    &*tree,
+                    &*carriers.stages,
+                    &mut metadata,
+                    carriers.allocs,
+                    ddc_defaults().offsets,
+                ),
+                arena,
+            )
+        };
+        assert_eq!(arena, 3, "the arena holds the ddc view of all three HBM allocations");
+        assert_eq!(attached, None, "the same refusal, reached directly");
+        assert_eq!(
+            metadata.external_nodes.len(),
+            4,
+            "the walk visited every node of the seed and refused on none of them"
+        );
+        assert_eq!(
+            metadata.below_lx_schedule_insert_block, None,
+            "and the one thing missing is the `lx_below_schedule` block, which stage 2a mints"
+        );
+    }
+
+    /// ⭐⭐⭐ STAGE 2B ON THE TREE STAGE 2A'S GROWERS ACTUALLY BUILD — the deepest run available today,
+    /// and the one that says where **stage 2b** stops on a real prefilled schedule.
+    ///
+    /// ⛔⛔ THE COMPOSITION IS 2A-MINUS-TWO-STEPS AND THIS TEST SAYS SO LOUDLY. The reference is
+    /// `L3DlOpsScheduler::run` then `Ddc::run_v1` (`SchedulerStages.cpp:29-57`). [`run_l3`] cannot
+    /// complete: it stops at the memory tracker's `todo!`. So the tree here is built by calling stage
+    /// 2a's growers DIRECTLY, in entry 382's own order, skipping exactly the two steps that are not
+    /// growers — `set_chunk_data_stage_params` (entry 207's recorded divergence, which mints no node)
+    /// and the memory tracker (which places addresses and mints no node). That is the SAME tree
+    /// [`the_growers_reproduce_the_references_whole_stage_2a_tree`] checks node for node against
+    /// `g0/debug/sdsc_0/sdsc.json`, so it is the reference's own stage-2a tree and not an invented one.
+    ///
+    /// ⛔ WHAT IS THEREFORE *NOT* TRUE OF THIS RUN: no allocation has been PLACED, because the memory
+    /// tracker never ran. Every `startAddressCoreCorelet_` is the fresh-node default. So any stage-2b
+    /// unit that reads a placed address is reading an unplaced one, and this test asserts only where
+    /// the stage stops — never a value derived from an address.
+    #[test]
+    #[should_panic(expected = "Dsc2Store::schedule_head_block")]
+    fn stage_2b_on_the_grown_stage_2a_tree_reaches_the_ddl_conversion() {
+        use crate::schedule::l3::dl_ops as ops;
+
+        let mut sdsc = a_rmsq_super_dsc();
+        let l3_state = DscState::seeded(&sdsc);
+        // ⭐ ENTRY 382'S GROWERS, IN ITS OWN ORDER — the same six calls
+        // `the_growers_reproduce_the_references_whole_stage_2a_tree` makes.
+        {
+            let (reads, mut env) = grow(&sdsc, &l3_state);
+            ops::optimize_hbm_lds_output_in_schedule_tree(&sdsc, &mut env)
+                .expect("the output tensor's HBM load is dropped");
+            ops::optimize_hbm_transfers(&sdsc, &reads, &mut env)
+                .expect("the HBM transfers are hoisted");
+            ops::create_synchronization(&sdsc, ops::LxBuffering::Double, &reads, &reads, &mut env)
+                .expect("the L3LU/LXLU and LXSU/L3SU sync pairs");
+        }
+        assert_eq!(
+            l3_state.node_count(),
+            22,
+            "the reference's own stage-2a tree for `rmsq_o728`"
+        );
+
+        let state = Dsc2State::seeded(
+            &sdsc,
+            &l3_state,
+            &[the_rmsq_compute_ops()],
+            &[v1::StorageName("rmsq_o728".to_owned())],
+        );
+        // ⭐⭐ AND STAGE 2B RUNS `prep_dsc` AND `attach_to_prefilled_schedule` WHOLE, then stops on
+        // `Dsc2Store::schedule_head_block` — `run_v1`'s line 6483, ONE LINE before
+        // `select_and_parse_ddl_template`.
+        //
+        // ⭐ WHAT THAT PROVES RAN, and it is far more than the seed run: `prep_dsc` complete
+        // (including `finalize_external_stage` on BOTH datastages, `get_pe_sfp_split_dim` over the
+        // chunk snapshot, and the cross-core reduction sweep), then `init_global_data`, then the whole
+        // of `attach_to_prefilled_schedule` — its walk over all 22 nodes, every ALLOCATE's
+        // `holds_lds`/`is_dsc_memory`/`lds_alloc` round-trip, every TRANSFER's `transfer_kind` and
+        // bound checks, every LOOP's `loop_dims`, and the `lx_below_schedule` block found BY NAME.
+        //
+        // ⛔ THE EXPECTED MESSAGE IS THE SPECIFIC SEAM, so this is a ratchet in both directions: it
+        // fails if stage 2b regresses to an earlier stop, and it fails the moment the head block can
+        // be materialised — which is the cue to re-measure how far the DDL step then gets.
+        let _ = run_ddc::<Dd2>(
+            &mut sdsc,
+            &state,
+            ddc_defaults(),
+            &l3::dl_ops::AddressFoldCoords::flat(),
+        );
+    }
+
+    /// ⭐⭐ WHAT THE DDL STEP WOULD DO NEXT, SETTLED WITHOUT REACHING IT — `select_and_parse_ddl_template`
+    /// asks `ddl_templates(opFunc.spelling(), A::GEN)` BEFORE it touches the template set
+    /// (`ddl/conversion.rs:6011`), and that is a build-time table this test can read directly.
+    ///
+    /// ⭐ SO THE NEXT STOP AFTER [`v1::Dsc2Store::schedule_head_block`] IS KNOWN: `mul` HAS candidate
+    /// templates on `Dd2`, so the DDL step would NOT take the *"no DDL available for op"* early exit —
+    /// it would ask [`DdcTemplates::stated`], which answers [`None`] because `build.rs` emits one of a
+    /// [`crate::schedule::ddl::conversion::StatedTemplate`]'s six parts. That is stage 2b's LAST
+    /// reachable seam, and it is a `build.rs` gap and not a carrier's.
+    ///
+    /// ⛔ AND IT IS NOT VACUOUS: the same table has op funcs with NO candidates, and for one of those
+    /// stage 2b would COMPLETE with [`v1::DscFilled::No`] rather than stop. The test carries both
+    /// arms, so a change that emptied the table for `mul` fails it.
+    #[test]
+    fn mul_has_ddl_candidates_so_the_ddl_step_reaches_the_template_set() {
+        use crate::generated::ddl_templates;
+        use sys_arch_spec::arch_enums::OpFunc;
+
+        let candidates = ddl_templates(OpFunc::Mul.spelling(), <Dd2 as crate::arch::Arch>::GEN)
+            .expect("`mul` is one of the op funcs ddl_templates/*.ddl states a template for");
+        assert!(
+            !candidates.is_empty(),
+            "a stated op func has at least one candidate template"
+        );
+        // ⭐ THE OTHER ARM, so this is a value and not a tautology: `GenericPartialReduction` is the
+        // op func `prep_dsc` itself MINTS for a cross-core reduction, and no vendored template states
+        // one — for a DSC whose first op were that, stage 2b would answer DscFilled::No and COMPLETE.
+        assert_eq!(
+            ddl_templates(
+                OpFunc::GenericPartialReduction.spelling(),
+                <Dd2 as crate::arch::Arch>::GEN
+            ),
+            None,
+            "no ddl_templates/*.ddl states a template for GENERIC_PARTIAL_REDUCTION"
+        );
+    }
+
+    /// ⭐ AND A DSC WITH NO `computeOp_` IS SKIPPED WHOLE, exactly as the reference skips it
+    /// (`ddc/v1.rs:6438`) — so stage 2b COMPLETES and answers [`v1::DscFilled::Yes`] having minted
+    /// nothing.
+    ///
+    /// ⛔⛔ THIS IS THE FALSE GREEN [`run_ddc`]'S DOC WARNS ABOUT, PINNED AS SUCH: it is what a caller
+    /// that could not state `computeOp_` would get for EVERY program, and the tree is untouched. The
+    /// test asserts the node count did not move, so "stage 2b completed" can never be read as "stage
+    /// 2b did something".
+    #[test]
+    fn a_dsc_with_no_compute_op_is_skipped_and_the_tree_is_untouched() {
+        let mut sdsc = a_rmsq_super_dsc();
+        let l3_state = DscState::seeded(&sdsc);
+        let before = l3_state.node_count();
+        let state = Dsc2State::seeded(&sdsc, &l3_state, &[], &[]);
+        let fill = run_ddc::<Dd2>(
+            &mut sdsc,
+            &state,
+            ddc_defaults(),
+            &l3::dl_ops::AddressFoldCoords::flat(),
+        )
+        .expect("a super-DSC whose every DSC states no compute op runs to the end of the loop");
+        assert_eq!(
+            fill.filled,
+            v1::DscFilled::Yes,
+            "no DSC found no DDL template, because no DSC was reached at all"
+        );
+        assert!(
+            fill.said.is_empty(),
+            "not even the `[DDC] start working on DSC` line was printed: {:?}",
+            fill.said
+        );
+        assert_eq!(
+            l3_state.node_count(),
+            before,
+            "the tree did not move — DscFilled::Yes here means NOTHING RAN"
+        );
+        assert!(
+            state.refusals().is_empty(),
+            "no carrier was asked anything: {:?}",
+            state.refusals()
+        );
     }
 
     /// ⭐⭐ [`l3::dl_ops::run`] IS CALLED, AND WHAT IT LEAVES IS COUNTED — the fifteen nodes stage 2a's
