@@ -16,14 +16,16 @@ use crate::arch::{Bytes, Elements};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     self as shape_constraints, Extent, PrimaryDim, StickDims, StickPart,
 };
+use crate::formats::DataFormat;
 use crate::schedule::ddc::fold::{
-    Dilation, MxScaleTensor, NodeId, PadType, ScaleBlock, Stride,
+    AllocId, ConstIdx, Dilation, MxScaleTensor, NodeId, PadType, ScaleBlock, ScaledLds, Stride,
 };
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::{DsType, Scale};
 use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
-use crate::schedule::dsc2::{LayoutDims, LdsIdx, NodeName};
-use crate::schedule::l3::dl_ops::GtrGroupId;
+use crate::schedule::ddc::v1::{L0Tethered, StorageName};
+use crate::schedule::dsc2::{LayoutDims, LdsIdx, NodeName, WordLength};
+use crate::schedule::l3::dl_ops::{GtrGroupId, VariableSymbol};
 use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroU64};
@@ -100,6 +102,33 @@ pub struct LabeledDs {
     recorded: LdsIdx,
     pinning: Pinning,
     scale_tensor: Option<MxScaleTensor>,
+    record: LdsRecord,
+    scaled_category: ScaledLds,
+}
+
+/// ⭐⭐ THE THREE `LabeledDsInfo` FIELDS THE DSM *DESCRIBES* AN OPERAND WITH — `dsName_`
+/// (`dsc/dscdefn.h:326`), `wordLength` (`:334`) and `dataFormat_` (`:335`).
+///
+/// ⭐ ONE VALUE BECAUSE THEY ARE WRITTEN AS ONE: `insert_internal_tensor` copies all three off a
+/// reference entry in one statement (`ddc/ddl/ddl_conversion.cpp`'s `newLds`), and
+/// `prep_dsc`'s three writers set the three of one entry in a row (`ddc/v1.rs:4032`, `:4036`,
+/// `:4038`).
+///
+/// ⛔ THE DEFAULTS ARE THE AUTHORITY'S OWN MEMBER INITIALIZERS, VERBATIM, and that is why
+/// [`Default`] is derivable: `dsName_` is a default-constructed `std::string` (EMPTY, `:326` states
+/// no initializer), `wordLength = 0` (`:334`) and `dataFormat_ = DataFormats::INVALID` (`:335`) —
+/// which [`None`] is, because [`DataFormat`] spells no `INVALID` variant and an absent format is
+/// exactly *"no precision information yet"*.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LdsRecord {
+    /// `dsName_` (`dsc/dscdefn.h:326`) — EMPTY on a DS nothing named.
+    pub name: StorageName,
+    /// `wordLength` (`:334`) — ⛔ A `double` THERE AND AN ELEMENT WIDTH IN BYTES HERE: scratchy
+    /// writes `2` for `SEN169_FP16` and `1` for `SEN143_FP8` over `g0/`'s 580 labelled DSs, never a
+    /// fraction. `0` is the field's own initializer, which is *"nobody stated a width"*.
+    pub word_length: WordLength,
+    /// `dataFormat_` (`:335`) — ⛔ [`None`] IS `DataFormats::INVALID`, the field's own initializer.
+    pub data_format: Option<DataFormat>,
 }
 
 impl LabeledDs {
@@ -117,22 +146,91 @@ impl LabeledDs {
             recorded,
             pinning,
             scale_tensor: None,
+            record: LdsRecord::default(),
+            scaled_category: ScaledLds::Regular,
         }
     }
 
     /// `scaledLdsCategory_ == SCALE_TENSOR` WITH ITS `mxInfo_` — a BUILDER and not a `new` argument
     /// because `SCALE_TENSOR` is the rare category and every other site states `REGULAR`.
+    ///
+    /// ⛔ IT SETS `scaledLdsCategory_` TOO, and it must: [`Self::scale_tensor`]'s own doc is *"the
+    /// ONE pair of conditions every reader of it tests"*, so a `mxInfo_` beside a `REGULAR_TENSOR`
+    /// category would be a state the reference cannot hold and a second answer to
+    /// [`Self::scaled_category`].
     #[must_use]
     pub fn with_scale_tensor(mut self, scale_tensor: MxScaleTensor) -> Self {
         self.scale_tensor = Some(scale_tensor);
+        self.scaled_category = ScaledLds::Scale;
+        self
+    }
+
+    /// `{dsName_, wordLength, dataFormat_}` — a BUILDER for the same reason
+    /// [`Self::with_scale_tensor`] is: every existing construction site of this type states the
+    /// authority's own initializers, which is what [`LdsRecord::default`] is.
+    #[must_use]
+    pub fn with_record(mut self, record: LdsRecord) -> Self {
+        self.record = record;
         self
     }
 
     /// `mxInfo_` where `scaledLdsCategory_ == SCALE_TENSOR`, which is the ONE pair of conditions
     /// every reader of it tests — [`None`] for any other category.
+    ///
+    /// ⭐ THE CATEGORY GATE IS IN THE READER, so `mxInfo_` and `scaledLdsCategory_` stay the two
+    /// independent fields the reference has (`copy_mx_info` writes one, `set_lds_scaled_category` the
+    /// other) and the PAIR is still one answer — the same shape [`MxScaleTensor::of`] states.
     #[must_use]
     pub const fn scale_tensor(&self) -> Option<MxScaleTensor> {
-        self.scale_tensor
+        match self.scaled_category {
+            ScaledLds::Scale => self.scale_tensor,
+            ScaledLds::Regular | ScaledLds::Value => None,
+        }
+    }
+
+    /// `scaledLdsCategory_` (`dsc/dscdefn.h:352-356`) as the CLOSED THREE-WAY it is.
+    ///
+    /// ⛔ NOT DERIVABLE FROM [`Self::scale_tensor`]: that answers `SCALE_TENSOR` against everything
+    /// else, and `REGULAR_TENSOR` vs `VALUE_TENSOR` is the pair entry 307 branches on.
+    #[must_use]
+    pub const fn scaled_category(&self) -> ScaledLds {
+        self.scaled_category
+    }
+
+    /// `dsName_`, `wordLength` and `dataFormat_` together.
+    #[must_use]
+    pub const fn record(&self) -> &LdsRecord {
+        &self.record
+    }
+
+    /// `dsName_ = name` — `AutoShuffling::set_lds_name` (`ddc/transformation.rs:3083`).
+    pub fn set_name(&mut self, name: StorageName) {
+        self.record.name = name;
+    }
+
+    /// `dsName_ += suffix` — `PrepDsc::append_lds_name` (`ddc/v1.rs:4032`).
+    pub fn append_name(&mut self, suffix: &str) {
+        self.record.name.0.push_str(suffix);
+    }
+
+    /// `wordLength = length`.
+    pub const fn set_word_length(&mut self, length: WordLength) {
+        self.record.word_length = length;
+    }
+
+    /// `dataFormat_ = format`.
+    pub const fn set_data_format(&mut self, format: DataFormat) {
+        self.record.data_format = Some(format);
+    }
+
+    /// `scaledLdsCategory_ = category`.
+    pub const fn set_scaled_category(&mut self, category: ScaledLds) {
+        self.scaled_category = category;
+    }
+
+    /// `mxInfo_ = labeledDs_.at(from).mxInfo_` — `PrepDsc::copy_mx_info`'s write half.
+    pub const fn set_mx_info(&mut self, mx_info: Option<MxScaleTensor>) {
+        self.scale_tensor = mx_info;
     }
 
     /// `ldsIdx_` — the entry's OWN self-index, which need NOT equal the position it sits at in
@@ -327,10 +425,67 @@ impl LabeledDsList {
     }
 }
 
+/// ONE CONSTANT OF A DSC — `dsc2::ConstantInfo` (`dsc/dsc2.h:46-62`).
+///
+/// ⛔ `data_` IS A `FoldManager<std::vector<int64_t>>` AND THIS IS ITS SINGLE FOLD, which is the ONE
+/// reading the ported units make: `FoldInfraUtils::getSingleDataStrict(constinfo.data_)`
+/// (`ddc/ddcv1.cpp:2067`) is the only accessor of it in the batch, and `getSingleDataStrict` is by its
+/// own name the assertion that there is exactly one. All twelve constants scratchy emits across
+/// `g0/`'s 187 programs carry one datum (`"data_": [10240]` / `[15872]`).
+///
+/// ⛔ `allocations_` IS A `map<SenComponents, dsc2::AllocateNode*>` THERE AND AN [`AllocId`] HERE —
+/// the arena handle, which is how every other allocate-node reference in this crate is spelled. It
+/// is EMPTY on every constant scratchy writes (`"allocations_": {}`), and
+/// `ComponentAllocations::set_constant_allocation` is what fills it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConstantInfo {
+    /// `name_` (`dsc/dsc2.h:48`).
+    pub name: StorageName,
+    /// `dataFormat_` (`:47`) — ⛔ [`None`] IS `DataFormats::INVALID`, the field's own initializer.
+    pub data_format: Option<DataFormat>,
+    /// `getSingleDataStrict(data_)` (`:49`) — the one fold's values, in the stated format.
+    pub data: Vec<i64>,
+    /// `isDataSymbolic_` (`:50`).
+    pub is_data_symbolic: bool,
+    /// `allocations_` (`:51`) as arena handles.
+    pub allocations: BTreeMap<SenComponent, AllocId>,
+}
+
+/// ⭐⭐ THE FOUR `DesignSpaceConfig` FIELDS **ONLY STAGE 2B** READS — `constantInfo_`
+/// (`dsc/designSpaceConfig.h:90`), `maskingConstId_` (`:101`), `dimToSymbolMapping_` (`:76-77`) and
+/// `l0TetheredMode_` (`:117`).
+///
+/// ⛔ ONE VALUE AND NOT FOUR FIELDS OF [`DesignSpaceConfig`], AND THAT IS WHAT KEEPS THE MODULE'S OWN
+/// RULE VISIBLE: `l3::dsc` is *"a reduced per-module projection … each module states the fields its own
+/// units touch and nothing else"*, and no L3 unit reads any of these — [`crate::schedule::ddc::v1`]'s
+/// do. Grouping them says which stage they belong to, and it means every stage-2a construction site
+/// states [`Default::default`], which is each field's OWN C++ initializer and not a value chosen here.
+///
+/// ⛔⛔ AND EVERY ONE OF THOSE INITIALIZERS IS THE STATE SCRATCHY'S SuperDSC ACTUALLY LEAVES.
+/// `dimToSymbolMapping_`, `gtrIdsUsed_` and `l0TetheredMode_` are *"all scheduler outputs — DROPPED"*
+/// by the emitter's own note (`lower_subtile_tape_to_superdsc.rs:1240-1241`), so absence there is the
+/// declared default here (`{}` and `false`) rather than a fact the conversion lost.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DdcFacts {
+    /// `constantInfo_` (`dsc/designSpaceConfig.h:90`), keyed by the `int` id it is filed under.
+    pub constants: BTreeMap<ConstIdx, ConstantInfo>,
+    /// `maskingConstId_` (`:101`) — ⛔ [`None`] IS THE DECLARED `-1`, and *"assuming all tensors use
+    /// same masking constant"* is the field's own comment.
+    pub masking_const: Option<ConstIdx>,
+    /// `dimToSymbolMapping_` (`:76-77`) — *"single value for pure symbolic and pivot dims, multiple
+    /// entries (max-pivot) for irregular dims"*, so a dim's entry is a LIST and an ABSENT dim is a
+    /// `count(dim) == 0`.
+    pub dim_to_symbol: BTreeMap<PrimaryDim, Vec<VariableSymbol>>,
+    /// `l0TetheredMode_` (`:117`) — ⛔ [`L0Tethered::Split`] IS THE DECLARED `false`.
+    pub l0_tethered: L0Tethered,
+}
+
 /// ONE DESIGN SPACE CONFIG — `DesignSpaceConfig` (`dsc/designSpaceConfig.h:74`) reduced to the
 /// fields this batch reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesignSpaceConfig {
+    /// The four fields only stage 2b reads — see [`DdcFacts`].
+    pub ddc: DdcFacts,
     /// `numCoreletsUsed_`.
     pub corelets_used: CoreletsUsed,
     /// `numCoreletsUsed_DSC2_` (`dsc/designSpaceConfig.h:118`).

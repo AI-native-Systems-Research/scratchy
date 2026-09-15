@@ -254,10 +254,11 @@ mod tests {
     };
     use crate::schedule::ddc::transformation::{DsType, Scale};
     use crate::schedule::ddc::transformation_util::StageName;
-    use crate::schedule::dsc2::{LayoutDims, LdsIdx};
+    use crate::schedule::dsc2::{LayoutDims, LdsIdx, WordLength};
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, CoreletsUsed, DataStage, DesignSpaceConfig, DscList, FilledDims, LabeledDs,
-        LabeledDsList, NamedDims, Pinning, PrimaryDsInfo, StageDims, SuperDsc, WkSliceCount,
+        LabeledDsList, LdsRecord, NamedDims, Pinning, PrimaryDsInfo, StageDims, SuperDsc,
+        WkSliceCount,
     };
     use crate::units::Core;
     use sys_arch_spec::arch_enums::SenComponent;
@@ -307,6 +308,13 @@ mod tests {
     }
 
     /// One `labeledDs_` entry — `dsType_ = OUTPUT`, `scale_ = [1, 1, 1]` over the layout order.
+    ///
+    /// ⭐ `dsName_`, `wordLength` AND `dataFormat_` ARE THE FIXTURE'S OWN, TRANSCRIBED:
+    /// `g0/sdsc_0.json`'s three entries are `Tensor{0,1,2}` / `2` / `SEN169_FP16`, and the reference's
+    /// own output names its seed allocate nodes `allocate-Tensor{N}_hbm` off exactly that `dsName_`.
+    ///
+    /// ⛔ `scaledLdsCategory_` IS ABSENT FROM ALL 580 LABELLED DSs OF `g0/`, which is the declared
+    /// `REGULAR_TENSOR` (`dsc/dscdefn.h:356`) — [`LabeledDs::new`]'s own state.
     fn labeled(recorded: LdsIdx) -> LabeledDs {
         LabeledDs::new(
             DsType::Output,
@@ -314,6 +322,11 @@ mod tests {
             recorded,
             pinning(),
         )
+        .with_record(LdsRecord {
+            name: v1::StorageName(format!("Tensor{}", recorded.0)),
+            word_length: WordLength(2),
+            data_format: Some(crate::formats::DataFormat::Sen169Fp16),
+        })
     }
 
     /// ⭐ `0_rmsq_o728`'s ONE DSC, transcribed from `g0/sdsc_0.json`.
@@ -325,6 +338,11 @@ mod tests {
     fn a_rmsq_dsc() -> DesignSpaceConfig {
         let cores: Vec<Core> = (1..CORES).filter_map(Core::checked).collect();
         DesignSpaceConfig {
+            // ⭐ THE FIXTURE'S OWN FOUR, AND EVERY ONE IS AT THE AUTHORITY'S INITIALIZER:
+            // `"constantInfo_": "{}"` (EMPTY), `"maskingConstId_": -1` ([`None`]), and neither
+            // `dimToSymbolMapping_` nor `l0TetheredMode_` is emitted at all — the emitter's own note
+            // calls both scheduler OUTPUTS (`lower_subtile_tape_to_superdsc.rs:1240-1241`).
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),

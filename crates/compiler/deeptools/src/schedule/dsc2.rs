@@ -1308,7 +1308,10 @@ impl TransferNode {
 ///
 /// ⛔ A WIDTH AND NOT A COUNT: entry 308 writes `2` for a BFLOAT16 internal kernel, and an element
 /// count of two would be a different tensor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// ⛔ [`Default`] IS THE FIELD'S OWN `= 0` (`dsc/dscdefn.h:334`) — *"nobody stated a width"*, not a
+/// zero-byte element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct WordLength(pub u32);
 
 /// `dsc2::BlockNode` (`dsc/dsc2.h:526`) narrowed to the `name_` a block is looked up by and the

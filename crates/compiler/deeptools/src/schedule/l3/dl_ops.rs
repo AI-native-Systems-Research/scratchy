@@ -540,6 +540,9 @@ mod tests_e001_e008 {
 
     fn plain_dsc() -> DesignSpaceConfig {
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
@@ -1231,6 +1234,9 @@ mod tests_e009_e016 {
 
     fn a_dsc() -> DesignSpaceConfig {
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
@@ -2311,6 +2317,9 @@ mod tests_e033_e040 {
             el: named,
         };
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
@@ -2943,6 +2952,9 @@ mod tests_e041_e048 {
 
     fn dsc(core: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
@@ -3499,6 +3511,9 @@ mod tests_e049_e056 {
         let mut stage = StageDims::default();
         stage.extents.insert(first, Extent(1));
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: corelets(2),
             corelets_used_dsc2: Some(corelets(2)),
@@ -5539,6 +5554,9 @@ mod tests_e197_e204 {
     /// `Y`, and which uses cores 0 and 1.
     fn a_dsc(scales: &[(PrimaryDim, Scale)], pinning: Pinning) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
@@ -6843,6 +6861,9 @@ mod tests_e205_e212 {
 
     fn dsc(core: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
@@ -7740,6 +7761,9 @@ mod tests_e213_e217 {
 
     fn a_dsc(core: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
@@ -9940,6 +9964,9 @@ mod tests_e221_e228 {
             .map(|&(dim, extent)| (dim, extent / 2))
             .collect();
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: corelets(2),
             corelets_used_dsc2: Some(corelets(2)),
@@ -12382,6 +12409,9 @@ mod tests_e229 {
             }
         };
         let dsc = DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: corelets(2),
             corelets_used_dsc2: Some(corelets(2)),
@@ -13535,6 +13565,9 @@ mod tests_e283_e295 {
 
     fn a_dsc(core_extents: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
@@ -18027,6 +18060,9 @@ mod tests_e328_e335 {
 
     fn a_dsc(core_extents: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — no L3 unit reads any of these four; see
+            // [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),

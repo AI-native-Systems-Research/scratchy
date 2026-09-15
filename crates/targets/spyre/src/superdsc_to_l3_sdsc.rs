@@ -66,17 +66,18 @@ use deeptools::arch::Elements;
 use deeptools::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, StickDims,
 };
-use deeptools::schedule::ddc::fold::NodeKind;
+use deeptools::formats::DataFormat;
+use deeptools::schedule::ddc::fold::{ConstIdx, NodeKind};
 use deeptools::schedule::ddc::transformation::{DsType, Scale};
 use deeptools::schedule::ddc::transformation_util::StageName;
-use deeptools::schedule::dsc2::{LayoutDims, LdsIdx};
+use deeptools::schedule::dsc2::{LayoutDims, LdsIdx, WordLength};
 use deeptools::schedule::l3::dsc::{
-    CoreIdsUsed, CoreletShare, CoreletsUsed, DATA_STAGE_CORE, DataStage, DataStages,
-    DesignSpaceConfig, DscIdx, DscList, DscScheduleStep, FilledDims, LabeledDs, LabeledDsList,
-    NamedDims, Pinning, PrimaryDsInfo, SenComponent, StageDims, SuperDsc, WkSlice, WkSliceCount,
-    WkSliceId,
+    ConstantInfo, CoreIdsUsed, CoreletShare, CoreletsUsed, DATA_STAGE_CORE, DataStage, DataStages,
+    DdcFacts, DesignSpaceConfig, DscIdx, DscList, DscScheduleStep, FilledDims, LabeledDs,
+    LabeledDsList, LdsRecord, NamedDims, Pinning, PrimaryDsInfo, SenComponent, StageDims, SuperDsc,
+    WkSlice, WkSliceCount, WkSliceId,
 };
-use deeptools::schedule::ddc::v1::OpFuncs;
+use deeptools::schedule::ddc::v1::{L0Tethered, OpFuncs, StorageName};
 use deeptools::schedule::l3::dl_ops::AddressFoldCoords;
 use deeptools::schedule::stages::{DscState, run_l3};
 use deeptools::units::Core;
@@ -322,15 +323,23 @@ fn pinning_of(mem: &MemOrg) -> Pinning {
 /// refusal here rather than an out-of-range read later — measured equal on every one of the 580
 /// labelled DSs of `g0/` (`(len scale_, len layout)` ∈ {(3,3), (2,2)}).
 ///
-/// ⛔ `wordLength` AND `dataFormat_` HAVE NO HOME ON THIS TYPE, AND THAT IS THE TARGET'S SCOPE AND
-/// NOT A DROP: `l3::dsc::LabeledDs` is the reduced projection of `LabeledDsInfo` that the L3 units
-/// read, and the two facts reach the scheduler through `PrepDsc::set_lds_word_length` /
-/// `set_lds_format` (`ddc/v1.rs:4036`, `:4038`) — a WRITER on the `P` carrier, not a field of the
-/// super-DSC. Forcing them in would put a second copy of a fact somewhere nothing reads it.
+/// ⭐⭐ `dsName_`, `wordLength` AND `dataFormat_` ARE READ, and all three are on [`LdsRecord`]
+/// because the authority puts them on `LabeledDsInfo` and not on `DesignSpaceConfig` —
+/// `dsc/dscdefn.h:326`, `:334`, `:335`.
 ///
-/// ⛔ `dsName_` LIKEWISE. `DscState::seeded` records that gap itself: the reference names its seed
-/// allocate node `allocate-<dsName_>_hbm` and the ported type carries no name, so the seed is named
-/// after the POSITION instead.
+/// ⛔ AND THEY VARY THE WAY THEY MUST, which is what says this is a reading and not a constant: over
+/// `g0/`'s 580 labelled DSs `dataFormat_` is `SEN169_FP16` on 573 and `SEN143_FP8` on 7, and
+/// `wordLength` is `2` on exactly those 573 and `1` on exactly those 7 — the byte width of the format
+/// beside it. `dsName_` is `Tensor{position}` on all 580, which is the name the reference's own seed
+/// allocate node carries (`allocate-Tensor0_hbm` in `g0/debug/sdsc_0/sdsc.json`).
+///
+/// ⛔ A `dataFormat_` NO [`crate::formats::DataFormat`] SPELLS IS A REFUSAL AND NOT AN ABSENCE.
+/// `LdsRecord::data_format`'s [`None`] means `DataFormats::INVALID`, which is *"nobody stated a
+/// precision"*; a stated-but-unrecognised spelling is a different fact and folding the two together
+/// would silently hand the DDL match an INVALID operand type it would then bind by.
+///
+/// ⛔ `scaledLdsCategory_` IS NOT WRITTEN BY SCRATCHY AT ALL — absent on all 580 — so it stays at the
+/// declared `REGULAR_TENSOR` (`dsc/dscdefn.h:356`), which [`LabeledDs::new`] already is.
 fn labeled_of(
     lds: &WireLabeledDs,
     layouts: &BTreeMap<&'static str, LayoutInfo>,
@@ -345,12 +354,82 @@ fn labeled_of(
         .zip(&lds.scale_)
         .map(|(name, scale)| Some((primary_dim_of(name)?, scale_of(*scale)?)))
         .collect::<Option<Vec<_>>>()?;
-    Some(LabeledDs::new(
-        ds_type,
-        scales,
-        LdsIdx(lds.ldsIdx_),
-        pinning_of(&lds.memOrg_),
-    ))
+    let record = LdsRecord {
+        name: StorageName(lds.dsName_.clone()),
+        word_length: WordLength(lds.wordLength),
+        data_format: Some(DataFormat::from_spelling(lds.dataFormat_)?),
+    };
+    Some(
+        LabeledDs::new(
+            ds_type,
+            scales,
+            LdsIdx(lds.ldsIdx_),
+            pinning_of(&lds.memOrg_),
+        )
+        .with_record(record),
+    )
+}
+
+/// ⭐⭐ `constantInfo_` AS THE MAP THE SCHEDULER READS — `std::map<int, dsc2::ConstantInfo>`
+/// (`dsc/designSpaceConfig.h:90`).
+///
+/// ⛔⛔ THE WIRE CARRIES TWO SHAPES AND BOTH ARE THE SAME FACT: the emitter writes the JSON *string*
+/// `"{}"` for an empty table and a real object otherwise, and its own note says why —
+/// *"the empty OBJECT {} is falsy in dxp's Python so the SFP constant-table / NR-refine setup is
+/// skipped"* (`lower_subtile_tape_to_superdsc.rs:1257-1262`). 175 of `g0/`'s 187 DSCs carry the
+/// string; the other 12 carry `{"0": {"allocations_": {}, "dataFormat_": "SEN169_FP16",
+/// "data_": [10240 | 15872], "name_": "scaling_factor"}}`.
+///
+/// ⛔ [`None`] IS A STATED-BUT-UNREADABLE TABLE: a key that is not an integer id, an entry that is not
+/// an object, a `data_` element that is not an integer, or a `dataFormat_` no [`DataFormat`] spells.
+/// Every one of those is a constant the scheduler WOULD read and we cannot state, and
+/// `declares_zero_mean_constant` turns exactly such a table into an op-func swap
+/// (`ddc/ddcv1.cpp:2064-2072`) — so a dropped entry is a silently different program.
+///
+/// ⛔ `allocations_` IS NOT READ EVEN WHERE IT IS PRESENT, and it is `{}` on every constant scratchy
+/// writes. It holds `dsc2::AllocateNode*`s the ALLOCATOR fills; `ComponentAllocations::
+/// set_constant_allocation` is what writes it, and a non-empty one here would be a placement nobody
+/// made.
+fn constant_info_of(value: &serde_json::Value) -> Option<BTreeMap<ConstIdx, ConstantInfo>> {
+    // The emitter's own empty spelling — a JSON string, not an object.
+    if value.as_str() == Some("{}") {
+        return Some(BTreeMap::new());
+    }
+    let table = value.as_object()?;
+    table
+        .iter()
+        .map(|(id, entry)| {
+            let entry = entry.as_object()?;
+            let data = entry
+                .get("data_")
+                .map_or_else(|| Some(Vec::new()), |data| {
+                    data.as_array()?.iter().map(serde_json::Value::as_i64).collect()
+                })?;
+            let data_format = match entry.get("dataFormat_") {
+                Some(format) => Some(DataFormat::from_spelling(format.as_str()?)?),
+                // ⛔ AN ENTRY THAT NAMES NO FORMAT IS `DataFormats::INVALID`, the field's own
+                // initializer (`dsc/dsc2.h:47`).
+                None => None,
+            };
+            Some((
+                ConstIdx(id.parse::<u32>().ok()?),
+                ConstantInfo {
+                    name: StorageName(
+                        entry.get("name_").and_then(serde_json::Value::as_str)?.to_owned(),
+                    ),
+                    data_format,
+                    data,
+                    // `isDataSymbolic_` (`dsc/dsc2.h:50`) — the emitter writes no such key on any of
+                    // the twelve constants of `g0/`, which is the declared `false`.
+                    is_data_symbolic: entry
+                        .get("isDataSymbolic_")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    allocations: BTreeMap::new(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// ⭐ ONE `primaryDsInfo_` ENTRY — `layoutDimOrder_` and `stickDimOrder_` zipped with `stickSize_`.
@@ -402,10 +481,12 @@ fn primary_ds_info_of(info: &LayoutInfo) -> Option<PrimaryDsInfo> {
 /// EMPTY `labeledDs_` ([`LabeledDsList`] is non-empty by type because
 /// `isLastLds` compares against the UNSIGNED `size() - 1`).
 ///
-/// ⛔ `coordinateMasking_` AND `maskingConstId_` ARE OUTSIDE THE TARGET'S PROJECTION, not dropped
-/// here: `l3::dsc` is *"a reduced per-module projection of one C++ class … each module states the
-/// fields its own units touch and nothing else"* (its own header), and no unit of stage 2a reads
-/// either. Both are empty/`-1` on all 187 programs of `g0/` in any case.
+/// ⛔ `coordinateMasking_` IS OUTSIDE THE TARGET'S PROJECTION, not dropped here: `l3::dsc` is *"a
+/// reduced per-module projection of one C++ class … each module states the fields its own units touch
+/// and nothing else"* (its own header), and stage 2b reaches it through `v1::Masking::
+/// coordinate_masking` rather than off the DSC. It is empty on all 187 programs of `g0/`.
+///
+/// ⭐ `maskingConstId_` AND `constantInfo_` **ARE** READ, ONTO [`DdcFacts`] — see [`constant_info_of`].
 #[must_use]
 pub fn design_space_config(dsc: &WireDsc) -> Option<DesignSpaceConfig> {
     // 1. `numCoreletsUsed_` — READ. Scratchy emits `1` (`ACTIVE_CORELETS`) on all 187 programs, but
@@ -495,7 +576,32 @@ pub fn design_space_config(dsc: &WireDsc) -> Option<DesignSpaceConfig> {
     }
     let full_padding = BTreeMap::new();
 
+    // 13. `constantInfo_` — READ, both wire spellings; see [`constant_info_of`].
+    let constants = constant_info_of(&dsc.constantInfo_)?;
+
+    // 14. `maskingConstId_` — READ. ⭐ [`None`] IS THE DECLARED `-1` (`dsc/designSpaceConfig.h:101`)
+    //     AND A NEGATIVE ID IS THAT AND NOTHING ELSE: scratchy writes `-1` on all 187 programs, and
+    //     `masking_constant` is `constantInfo_.count(maskingConstId_)`, which `-1` never satisfies.
+    //     ⛔ AN ID THAT DOES NOT FIT A `u32` IS A REFUSAL, not a `-1`: it is a stated constant we
+    //     cannot name, and answering "no masking constant" for it would drop entry 262's whole guard.
+    let masking_const = match dsc.maskingConstId_ {
+        -1 => None,
+        id => Some(ConstIdx(u32::try_from(id).ok()?)),
+    };
+
     Some(DesignSpaceConfig {
+        // 15/16. `dimToSymbolMapping_` AND `l0TetheredMode_` — ⭐ THE DECLARED `{}` AND `false`,
+        //        because scratchy EMITS NEITHER: the emitter's own field list calls both scheduler
+        //        OUTPUTS and drops them (`lower_subtile_tape_to_superdsc.rs:1240-1241`). ⛔ THAT IS AN
+        //        INPUT STATE AND NOT A MISSING FACT — `dimToSymbolMapping_` is one of the fields stage
+        //        2b itself WRITES (it appears in `g0/debug/sdsc_0/sdsc.json`, the OUTPUT), and
+        //        `l0TetheredMode_` is `ddc/ddcv1.cpp:271`'s read of a mode nothing has set.
+        ddc: DdcFacts {
+            constants,
+            masking_const,
+            dim_to_symbol: BTreeMap::new(),
+            l0_tethered: L0Tethered::Split,
+        },
         corelets_used,
         // 2. `numCoreletsUsed_DSC2_` — ⭐ [`None`] IS THE REFERENCE'S `-1`, VERBATIM. The field is
         //    declared `-1` (`dsc/designSpaceConfig.h:118`) and `prepDsc` (entry 054) is the only

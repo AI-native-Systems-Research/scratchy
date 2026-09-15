@@ -212,7 +212,10 @@ pub type AllocArena = BTreeMap<AllocId, AllocateNode>;
 pub type ComputeArena = BTreeMap<NodeId, ComputeNode>;
 
 /// WHAT A LABELLED DS OR A CONSTANT IS CALLED — `LabeledDs::dsName_` / `ConstantInfo::name_`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// ⛔ [`Default`] IS THE EMPTY NAME BOTH FIELDS ARE DECLARED WITH — `std::string dsName_`
+/// (`dsc/dscdefn.h:326`) and `std::string name_` (`dsc/dsc2.h:48`), neither carrying an initializer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct StorageName(pub String);
 
 /// THE TWO NAME TABLES — `currDsc->labeledDs_` and `currDsc->constantInfo_`. Both are indexed by an
@@ -1403,9 +1406,12 @@ pub enum Commit {
 
 /// HOW THE MODEL'S L0 IS SHARED — `l0TetheredMode_` (`ddc/ddcv1.cpp:271`): on SEN1P5 two subcores
 /// share one L0, either whole or split half and half.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum L0Tethered {
     /// `l0TetheredMode_ == false` — L0 is split, and each subcore's half of it is blocked off.
+    ///
+    /// ⛔ THE DEFAULT, WHICH IS THE FIELD'S OWN `= false` (`dsc/designSpaceConfig.h:117`).
+    #[default]
     Split,
     /// `l0TetheredMode_ == true` — the buffers are shared between the left and right corelets.
     Whole,

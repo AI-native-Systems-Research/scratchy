@@ -6905,6 +6905,8 @@ mod unit_tests {
         };
         let two = CoreletsUsed::new(NonZeroU32::new(2).expect("two corelets"));
         DesignSpaceConfig {
+            // ⛔ THE AUTHORITY'S OWN INITIALIZERS — see [`crate::schedule::l3::dsc::DdcFacts`].
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
             corelets_used: two,
             corelets_used_dsc2: Some(two),
