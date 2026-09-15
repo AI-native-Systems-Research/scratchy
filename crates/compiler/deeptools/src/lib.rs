@@ -43,6 +43,13 @@ pub mod islands;
 /// scheduler and Deep Dataflow Constructor.
 pub mod schedule;
 
+/// ⛔⛔ BRIDGE 1'S SCHEDULING SEAM — THE ONLY [`schedule`] SURFACE A CRATE OUTSIDE THIS ONE MAY NAME.
+///
+/// A target crate names `deeptools::sdsc` and nothing under `deeptools::schedule`, so
+/// `grep deeptools::schedule crates/targets/` is the audit and its answer is ZERO. See the module's
+/// own header for why, and for what the relocation it does NOT do still owes.
+pub mod sdsc;
+
 /// HOW WIDE ONE ELEMENT OF EACH FORMAT IS — IBM's own bit-width table.
 pub mod formats;
 

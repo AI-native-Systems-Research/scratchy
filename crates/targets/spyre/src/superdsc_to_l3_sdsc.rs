@@ -1,23 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 //! ⭐⭐ SCRATCHY'S SuperDSC AS THE SCHEDULER'S OWN `SuperDsc` — the half of bridge 1's scheduling leg
-//! that speaks scratchy's vocabulary, so that `deeptools::schedule::stages::run_stages` can be handed
-//! REAL DATA instead of a transcribed fixture.
+//! that speaks scratchy's vocabulary, so that `deeptools::sdsc::run_stages_2a_2b` can be handed REAL
+//! DATA instead of a transcribed fixture.
 //!
 //! ```text
 //! SubtileTape ──lower_subtile_tape_to_superdsc──► SdscOp / Dsc   (the json DTOs dxp_standalone reads)
-//!             ──THIS MODULE──────────────────────► l3::dsc::SuperDsc
-//!             ──schedule::stages::run_stages─────► a GROWN scheduleTree_
+//!             ──THIS MODULE──────────────────────► SuperDsc + computeOp_ + dsc.name_
+//!             ──sdsc::run_stages_2a_2b───────────► a GROWN tree, HELD (`sdsc::Scheduling`)
 //! ```
 //!
 //! ⛔⛔ WHY IT LIVES IN THE SPYRE CRATE AND NOT IN `deeptools`. `deeptools` never depends on scratchy —
 //! it is the port of the vendor compiler and knows nothing of `EmittedOp`, `OpSpec` or the tape. So
 //! the conversion cannot live there: the side that names BOTH vocabularies is this one.
 //!
+//! # ⛔⛔ THE LAYERING, AND WHAT IS STILL OWED — *"scratchy knows nothing about l3"*
+//!
+//! Two separate things had to come out of this file, and only ONE of them is done:
+//!
+//! 1. ✅ **THE COMPOSITION**, which is a target-neutral pass and now lives in
+//!    `deeptools::schedule::stages` (`run_stages_2a_2b`) — the root `CLAUDE.md`'s *"one implementation
+//!    of every target-neutral pass"*. Nothing here names `DscState`, `run_l3`, `run_ddc`,
+//!    `AddressFoldCoords`, `ddc_defaults` or `Dsc2State` any more.
+//! 2. ✅ **THE VOCABULARY REACH-IN**. This file used to name NINE `deeptools::schedule` internals
+//!    directly — `l3::dsc`, `dsc2`, `ddc::fold`, `ddc::v1`, `ddc::transformation`,
+//!    `transformation_util`, `stages`. It now names ONE declared seam, [`deeptools::sdsc`], and
+//!    `grep deeptools::schedule crates/targets/` answers ZERO in code. That is what lets the
+//!    scheduler's internals be rearranged without touching a target.
+//! 3. ⛔ **THE FILE ITSELF IS STILL HERE, AND THAT IS THE OWED MOVE.** The wire→[`SuperDsc`]
+//!    conversion belongs inside `deeptools`, and moving it needs the SuperDSC WIRE SCHEMA to move with
+//!    it — blocked twice today: the DTOs are `serde`/`serde_json::Value` types and `deeptools` has NO
+//!    serde dependency (its `Cargo.toml` lists only `sys-arch-spec`), and `SdscOp::coreIdToWkSlice_` /
+//!    `AllocNode::maxDimSizes_` are typed by `scratchy_subtile` (`SliceIndex`, `DeviceWalk`), which
+//!    `deeptools` may never depend on. ⭐ THE SEAM IS WHAT MAKES THAT A MOVE RATHER THAN A REWRITE:
+//!    relocating this file deletes one `use` line instead of re-pointing nine.
+//!
 //! ⛔⛔ AND WHY IT IS NOT IN [`crate::lower_superdsc_to_dataflow_ir`]. That file's ratchet
 //! (`tests/dfir_never_runtime_refuses.rs`) freezes `panic!`, `todo!` and `Result` at ZERO, because it
-//! is the lowering the bake compiles and a stop there pre-empts dbo-opt. This module is
-//! MEASUREMENT — it runs a scheduler stage that ends in a `todo!` today and reports where — and it
-//! reaches nothing the bake stages. Keeping the two apart is what lets the ratchet stay at zero.
+//! is the lowering the bake compiles and a stop there pre-empts dbo-opt. This module RUNS the stages
+//! and reports where they stop, catching a panic rather than letting one kill the bake; it produces
+//! the schedule the lowering is to take but decides nothing about what the bake emits. Keeping the two
+//! apart is what lets the ratchet stay at zero.
 //!
 //! # ⛔⛔ NO FABRICATED VALUE, ANYWHERE
 //!
@@ -66,6 +88,19 @@
 //! `l3/dl_ops.rs` holds no `allocs.insert` outside its own tests, because the minting units call
 //! `L3TreeSurgery::fresh_alloc` + `new_allocate` and put an `L3AllocateNode` in the TREE. The
 //! reference has ONE `dsc2::AllocateNode *` and the port split it in two, writing only the tree half.
+//! ⛔⛔ AND THAT SAME `None` IS WHY STAGE 2B IS NOT **REACHED** ON THE CORPUS, WHICH IS NOT THE SAME
+//! FACT AS STAGE 2B BEING UNCALLED. [`run_stages`] composes 2a then 2b through
+//! `stages::run_stages_2a_2b`, which gates 2b on 2a completing — `run_l3`'s `None` leaves the LX
+//! allocations MINTED BUT NOT PLACED and 2b computes offsets FROM those placements, so running it on
+//! an abandoned tree would compute addresses from half a placement. So `stage2b:` reports `0 reached`
+//! for as long as `completed` is 0, and the numbers above are stage 2a's alone. ⭐ THE ONE-LINE
+//! CONSEQUENCE: filling the arena (entry 222's frontier) is what turns stage 2b on; nothing else has
+//! to change here.
+//!
+//! ⛔ NOT VERIFIED: the whole-build census has NOT been re-measured since the composition landed — the
+//! acceptance bake needs a card and `dbo-opt`, neither of which this worktree has. The numbers above
+//! are the previously measured stage-2a ones and the `stage2b:` line is what a build will print.
+//!
 //! That the arena is never written is a static fact, so every program reaching the placement loop
 //! stops exactly there; it was confirmed directly, with the id, on `0_rmsq_o728`.
 
@@ -73,23 +108,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 use deeptools::arch::Elements;
-use deeptools::bridges::superdsc_to_dataflow_ir::shape_constraints::{
-    Extent, PrimaryDim, StickDims,
-};
 use deeptools::formats::DataFormat;
-use deeptools::schedule::ddc::fold::{ConstIdx, NodeKind};
-use deeptools::schedule::ddc::transformation::{DsType, Scale};
-use deeptools::schedule::ddc::transformation_util::StageName;
-use deeptools::schedule::dsc2::{LayoutDims, LdsIdx, WordLength};
-use deeptools::schedule::l3::dsc::{
-    ConstantInfo, CoreIdsUsed, CoreletShare, CoreletsUsed, DATA_STAGE_CORE, DataStage, DataStages,
-    DdcFacts, DesignSpaceConfig, DscIdx, DscList, DscScheduleStep, FilledDims, LabeledDs,
-    LabeledDsList, LdsRecord, NamedDims, Pinning, PrimaryDsInfo, SenComponent, StageDims, SuperDsc,
-    WkSlice, WkSliceCount, WkSliceId,
+// ⛔⛔ ONE deeptools PATH, AND IT IS THE DECLARED SEAM. `deeptools::sdsc` re-exports bridge 1's whole
+// scheduling vocabulary; NOTHING here may name `deeptools::schedule::*`, because *"scratchy knows
+// nothing about l3"* and the scheduler is a target-neutral pass. This file used to reach into nine
+// separate `schedule` internals — `l3::dsc`, `dsc2`, `ddc::fold`, `ddc::v1`, `ddc::transformation`,
+// `ddc::transformation_util` and `stages` — which is the boundary being absent rather than declared.
+// ⭐ THE AUDIT IS `grep deeptools::schedule crates/targets/` AND ITS ANSWER IS ZERO.
+use deeptools::sdsc::{
+    ConstIdx, ConstantInfo, CoreIdsUsed, CoreletShare, CoreletsUsed, DATA_STAGE_CORE, DataStage,
+    DataStages, DdcFacts, DesignSpaceConfig, DscComputeOp, DscFilled, DscIdx, DscList,
+    DscScheduleStep, DscState, DsType, Extent, FilledDims, L0Tethered, LabeledDs, LabeledDsList,
+    LayoutDims, LdsIdx, LdsRecord, NamedDims, NodeKind, OpFunc, OpFuncs, Pinning, PrimaryDim,
+    PrimaryDsInfo, Scale, Scheduling, SenComponent, StageDims, StageName, StickDims, StorageName,
+    SuperDsc, WkSlice, WkSliceCount, WkSliceId, WordLength, run_stages_2a_2b,
 };
-use deeptools::schedule::ddc::v1::{L0Tethered, OpFuncs, StorageName};
-use deeptools::schedule::l3::dl_ops::AddressFoldCoords;
-use deeptools::schedule::stages::{DscState, run_l3};
 use deeptools::units::Core;
 use scratchy_subtile::superdsc_opspec::Role;
 
@@ -145,6 +178,26 @@ const fn slot(space: &IterSpace, dim: PrimaryDim) -> i64 {
 #[must_use]
 pub fn primary_dim_of(name: &str) -> Option<PrimaryDim> {
     PrimaryDim::ALL.into_iter().find(|d| d.spelling() == name)
+}
+
+/// ⭐ AN `exUnit` SPELLING AS THE SEALED [`SenComponent`], or [`None`] for one the wire cannot write.
+///
+/// ⛔ THE CLOSED SET IS THE TWO COMPONENTS THE EMITTER'S OWN PRODUCER CAN NAME, and both producers
+/// are exhaustive matches with a two-value range: `OpFunc::ex_unit` answers `"pt"` for
+/// `Matmul`/`BatchMatmul`/`Transpose` and `"sfp"` for everything else
+/// (`scratchy_subtile::superdsc_opspec` `:1210-1221`), and
+/// [`crate::lower_subtile_tape_to_superdsc::ex_unit`] (`:937-942`) is the same two. So no third
+/// spelling reaches this, and the lookup goes through [`SenComponent::spelling`] rather than a table
+/// written here — a renamed variant fails at the round trip instead of resolving to a neighbour.
+///
+/// ⛔ AND A SPELLING NEITHER NAMES IS A STOP, NOT A DEFAULT. `DscComputeOp::ex_unit` is what
+/// `usePt` (`ddc/ddcv1.cpp:2026`) reads to decide whether the DSC's first compute runs on the PT,
+/// which is what makes a row split meaningful — answering `Sfp` for an unknown unit would split the
+/// wrong dim.
+#[must_use]
+pub fn ex_unit_of(spelling: &str) -> Option<SenComponent> {
+    const UNITS: [SenComponent; 2] = [SenComponent::Pt, SenComponent::Sfp];
+    UNITS.into_iter().find(|unit| unit.spelling() == spelling)
 }
 
 /// ⭐ A `dsType_` AS [`DsType`], or [`None`] for a role scratchy's frontend cannot state.
@@ -220,7 +273,7 @@ fn extents_of(space: &IterSpace) -> BTreeMap<PrimaryDim, Extent> {
 ///     `!DataStructDims::empty()` (`dsc/dims.cpp:112`) as a type;
 ///   * A NON-EMPTY `paddingSizes_`, `symbolicDimInfo_`, `maxSymbolicVolume_`, `coreletSplit_`,
 ///     `rowSplit_` OR `peSfpSplit_`. Each has a home on [`StageDims`] whose SHAPE differs from the
-///     wire's — `paddingSizes_` is one number per dim where [`deeptools::schedule::l3::dsc::DimPadding`]
+///     wire's — `paddingSizes_` is one number per dim where [`deeptools::sdsc::DimPadding`]
 ///     wants a front AND a back edge, and `symbolicDimInfo_` likewise carries a `maxSize_` and a
 ///     `granularity_`. Carrying a single number into either would be inventing the other half, and
 ///     dropping the map silently would lose a stated fact, so the honest third answer is to refuse.
@@ -562,20 +615,25 @@ pub fn design_space_config(dsc: &WireDsc) -> Option<DesignSpaceConfig> {
         })
         .collect();
 
-    // 9. `computeOp_.at(0).indirectAccessIndexLabeledDs` — EMPTY, and empty BY CONSTRUCTION rather
-    //    than by measurement: both `ComputeOp` build sites in the emitter write
-    //    `indirectAccessIndexLabeledDs: vec![]` (`lower_subtile_tape_to_superdsc.rs:5251`, `:5338`),
-    //    so no scratchy program states one. ⛔ AND A NON-EMPTY ONE IS A REFUSAL, not a guess: the wire
-    //    carries operand NAMES (`"Tensor0-idx0"`) and this field wants an `LdsIdx`, so resolving it
-    //    needs the name→position mapping the emitter does not yet write down.
-    let indirect_named = dsc
+    // 9. `computeOp_.at(0).indirectAccessIndexLabeledDs` — READ, THROUGH [`lds_by_operand_name`].
+    //    ⭐⭐ EMPTY ON EVERY SCRATCHY PROGRAM TODAY, BY CONSTRUCTION: both `ComputeOp` build sites in
+    //    the emitter write `indirectAccessIndexLabeledDs: vec![]`
+    //    (`lower_subtile_tape_to_superdsc.rs:5275`, `:5362`). ⛔⛔ IT USED TO REFUSE A NON-EMPTY ONE,
+    //    CITING A MAPPING THAT DOES NOT EXIST — *"the wire carries operand NAMES (`"Tensor0-idx0"`)
+    //    and this field wants an `LdsIdx`, so resolving it needs the name→position mapping the emitter
+    //    does not yet write down"*. THAT WAS FALSE. The wire `LabeledDs`
+    //    (`lower_subtile_tape_to_superdsc.rs:1043-1045`) carries `ldsIdx_: u32` AND `dsName_: String`
+    //    on the SAME record, and the operand spelling is those two composed — see
+    //    [`lds_by_operand_name`]. So the field is resolved rather than refused, and a name the map
+    //    does not hold is a STOP.
+    let by_name = lds_by_operand_name(dsc);
+    let indirect_access_index_lds = dsc
         .computeOp_
         .first()
-        .is_some_and(|op| !op.indirectAccessIndexLabeledDs.is_empty());
-    if indirect_named {
-        return None;
-    }
-    let indirect_access_index_lds = BTreeSet::new();
+        .into_iter()
+        .flat_map(|op| op.indirectAccessIndexLabeledDs.iter())
+        .map(|name| by_name.get(name.as_str()).copied())
+        .collect::<Option<BTreeSet<_>>>()?;
 
     // 11. `N_.paddingSizes_` — EMPTY. Nothing in the emitter ever writes an `IterSpace`'s
     //     `paddingSizes_` (every one comes from `IterSpace::empty()`), measured empty on all 187
@@ -641,6 +699,143 @@ pub fn design_space_config(dsc: &WireDsc) -> Option<DesignSpaceConfig> {
         //     Stage 2a is what runs next, so this is its input state and not a missing fact.
         gtr_ids_used: BTreeSet::new(),
     })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  `computeOp_` — stage 2b's own construction argument
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐⭐ EVERY LABELLED DS BY THE NAME A `computeOp_` OPERAND CALLS IT — the mapping a stale comment
+/// in this very file claimed did not exist.
+///
+/// ⛔⛔ THE OPERAND SPELLING IS `{dsName_}-idx{ldsIdx_}`, NOT `dsName_`. Both facts are on the SAME
+/// wire record (`lower_subtile_tape_to_superdsc.rs:1043-1045`: `ldsIdx_: u32` beside
+/// `dsName_: String`), and the emitter composes the operand reference out of exactly those two at
+/// both `ComputeOp` build sites — `format!("Tensor{i}-idx{i}")` (`:5049-5057`, `:5248-5249`) beside
+/// `ldsIdx_: i as u32` / `dsName_: format!("Tensor{i}")` (`:4989-4990`). So the suffix is not
+/// decoration to be stripped: it is the INDEX restated, and keying by the composed spelling checks
+/// the two agree instead of trusting either alone.
+///
+/// ⭐⭐ AND THE AUTHORITY AGREES, ON BOTH SIDES OF THE STAGES. `g0/sdsc_0.json` — the input
+/// `dxp_standalone` compiles to a working `init_binary` — carries `dsName_` `"Tensor0"`/`"Tensor1"`/
+/// `"Tensor2"` with `computeOp_[0].inputLabeledDs` `["Tensor0-idx0", "Tensor1-idx1"]`, and
+/// `g0/debug/sdsc_0/sdsc.json` — the same programs AFTER both stages — carries those same operand
+/// names unchanged. So the spelling is stable across the stages and is what stage 2b reads.
+///
+/// ⛔ A DUPLICATE SPELLING IS NOT MERGED SILENTLY: the map is keyed by the composed name, so two
+/// entries claiming one spelling collapse to the LAST, and [`dsc_compute_ops`] would then resolve an
+/// operand to the wrong DS. That cannot happen while `ldsIdx_` is the entry's own position — the
+/// suffix makes every key distinct by construction — and it is the reason the index is in the key.
+#[must_use]
+fn lds_by_operand_name(dsc: &WireDsc) -> BTreeMap<String, LdsIdx> {
+    dsc.labeledDs_
+        .iter()
+        .map(|lds| {
+            (
+                format!("{}-idx{}", lds.dsName_, lds.ldsIdx_),
+                LdsIdx(lds.ldsIdx_),
+            )
+        })
+        .collect()
+}
+
+/// ⭐⭐⭐ ONE DSC'S `computeOp_` AS STAGE 2B'S OWN [`DscComputeOp`] LIST — the construction argument
+/// [`run_stages_2a_2b`] cannot be called without.
+///
+/// ⛔⛔ AN EMPTY LIST IS A FALSE GREEN AND NOT A CHEAP ANSWER. `v1::PrepDsc::compute_ops` is the
+/// FIRST provider call `run_v1` makes (`ddc/v1.rs:6437`) and an empty answer makes it `continue` past
+/// the DSC — so a caller stating no ops gets [`DscFilled::Yes`] having placed no address and
+/// minted no node. That is why every one of the five fields below is READ, and why a field that
+/// cannot be read stops the whole conversion.
+///
+/// ⛔⛔ A NAME THAT DOES NOT RESOLVE IS A STOP, NOT A GUESS. No index 0, no positional fallback, no
+/// skipped operand: `inputLabeledDs`/`outputLabeledDs` are what entries 307 and 308 sweep to decide
+/// the reduction axis and the tensor sizes, so an operand pointing at the wrong labelled DS is a
+/// wrong extent and then a wrong address. [`None`] here means the composition is not called at all.
+///
+/// ⭐ THE FIVE FIELDS, EACH ONE READ:
+///
+/// * `op_func` — `opFuncName` through `OpFunc::from_spelling`, which is
+///   `EnumsConversion::stringToOpFuncs`. ⛔ A NAME THE SET DOES NOT SPELL IS [`None`] FOR THAT OP,
+///   which is `OpFuncs::NONE` — the reference's own `ComputeOpInfo::opFuncName` default — exactly as
+///   [`op_funcs_of`] already reads the same field. Never a plausible neighbour.
+/// * `ex_unit` — `exUnit` through [`ex_unit_of`], a STOP for a spelling the emitter cannot write.
+/// * `format` — `attributes_.dataFormat_` through [`DataFormat::from_spelling`], whose [`None`] is
+///   `DataFormats::INVALID`, *"nobody stated a precision"*. ⛔ AND A STATED-BUT-UNRECOGNISED
+///   SPELLING IS A STOP RATHER THAN THAT ABSENCE — the same distinction [`labeled_of`] already draws
+///   on `LdsRecord::data_format`: folding the two together would hand the DDL match an INVALID
+///   operand type it would then bind by. The emitter writes only `DataFormat` spellings
+///   (`lower_subtile_tape_to_superdsc.rs:5326-5348`), so the stop is unreachable on scratchy's own
+///   programs and is here because the wire type is a `&'static str`.
+/// * `inputs` / `outputs` — `inputLabeledDs` / `outputLabeledDs` through [`lds_by_operand_name`].
+///
+/// ⛔ `interimLabeledDs` AND `indirectAccessIndexLabeledDs` ARE NOT ON [`DscComputeOp`] — its
+/// five fields are *"the four beyond [`ComputeOp`]'s two that the reduction sweep and the size sweep
+/// need"* (`ddc/v1.rs:3795`), and the indirect list reaches the stage through
+/// `DesignSpaceConfig::indirect_access_index_lds` instead, which [`design_space_config`] now fills
+/// off the same map.
+#[must_use]
+pub fn dsc_compute_ops(dsc: &WireDsc) -> Option<Vec<DscComputeOp>> {
+    let by_name = lds_by_operand_name(dsc);
+    let operands = |named: &[String]| {
+        named
+            .iter()
+            .map(|name| by_name.get(name.as_str()).copied())
+            .collect::<Option<Vec<_>>>()
+    };
+    dsc.computeOp_
+        .iter()
+        .map(|compute| {
+            let format = match compute.attributes_.dataFormat_ {
+                // `DataFormats::INVALID`'s own spelling — the one absence, and the only one.
+                "INVALID" => None,
+                stated => Some(DataFormat::from_spelling(stated)?),
+            };
+            Some(DscComputeOp {
+                op_func: OpFunc::from_spelling(&compute.opFuncName),
+                ex_unit: ex_unit_of(compute.exUnit)?,
+                format,
+                inputs: operands(&compute.inputLabeledDs)?,
+                outputs: operands(&compute.outputLabeledDs)?,
+            })
+        })
+        .collect()
+}
+
+/// ⭐⭐ EVERY DSC'S `computeOp_` LIST, POSITIONALLY BESIDE `dscs_` — what
+/// `Dsc2State::seeded` indexes by.
+///
+/// ⛔ ONE `Vec` PER DSC AND NO GAPS: a position the caller states no list for gets an EMPTY one from
+/// `seeded`, which is `run_v1`'s own `continue`, so a DROPPED entry would silently skip that DSC.
+/// [`None`] from any DSC therefore refuses the whole list rather than shortening it.
+#[must_use]
+pub fn compute_ops_of(op: &SdscOp) -> Option<Vec<Vec<DscComputeOp>>> {
+    op.dscs_
+        .iter()
+        .flat_map(BTreeMap::values)
+        .map(dsc_compute_ops)
+        .collect()
+}
+
+/// ⭐⭐ EVERY DSC'S `name_`, POSITIONALLY BESIDE `dscs_` — READ, and read from the one place scratchy
+/// writes it.
+///
+/// ⭐ `dsc.name_` IS THE `dscs_` MAP **KEY**. The wire's `dscs_` is a `Vec<BTreeMap<String, Dsc>>`
+/// (`lower_subtile_tape_to_superdsc.rs:1300`) whose key is the program name the emitter states
+/// (`"MatMul_0"`, `"rmsq_o728"` in `g0/sdsc_0.json`), and `dsc/designSpaceConfig.h:60`'s `name_` is
+/// the same fact — so this is a READ and not the positional `dsc{at}` spelling
+/// `Dsc2State::seeded` falls back to.
+///
+/// ⛔ IT IS NOT LOAD-BEARING BEYOND DIAGNOSTICS — only `v1::Dsc2Fill::said`'s two verbose lines read
+/// it — which is why an absent key is not a refusal here; there is no absent key, because a
+/// `BTreeMap` entry has one by construction.
+#[must_use]
+pub fn dsc_names(op: &SdscOp) -> Vec<StorageName> {
+    op.dscs_
+        .iter()
+        .flat_map(BTreeMap::keys)
+        .map(|name| StorageName(name.clone()))
+        .collect()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -770,44 +965,6 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     "a panic payload that is neither `String` nor `&str`".to_owned()
 }
 
-/// ⭐⭐ WHAT STAGE 2A LEFT ON ONE PROGRAM — the measurement, carried as VALUES.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StageEffect {
-    /// The seed: `root_level_operations` plus one HBM allocate per HBM-pinned labelled DS.
-    pub nodes_before: usize,
-    /// What the tree holds AFTER the stage, whether or not it completed.
-    pub nodes_after: usize,
-    /// ⭐ THE SAME COUNT BROKEN OUT BY `nodeType_` — the census the four stages owe, per kind.
-    pub kinds: BTreeMap<NodeKind, usize>,
-    /// Whether stage 2a ran to completion.
-    pub l3: bool,
-    /// The FIRST provider method that refused, if any — a CARRIER gap rather than a ported unit's.
-    pub first_refusal: Option<&'static str>,
-    /// ⭐ WHERE IT STOPPED — the panic message, [`None`] where the stage returned instead of
-    /// panicking. It is REPORTED and never swallowed into a substituted value.
-    pub stopped_at: Option<String>,
-}
-
-/// ⭐⭐ CONVERT ONE SCRATCHY `SdscOp` AND RUN STAGE 2A OVER IT, REPORTING WHAT IT LEFT.
-///
-/// ⛔ [`None`] IS THE CONVERSION REFUSING ([`super_dsc`]) — the program is not measured, and the
-/// caller reports that rather than counting it as zero nodes.
-///
-/// ⛔⛔ THE `catch_unwind` IS MEASUREMENT INSTRUMENTATION, NOT A RUNTIME REFUSAL. Stage 2a holds
-/// `todo!`s — a fact it cannot answer must NOT be faked, because a carrier answering a plausible
-/// offset would place real tensors at invented addresses. A panic escaping here would kill the BAKE,
-/// so the panic is caught, its message reported as *where it stopped*, and nothing is substituted for
-/// the answer it did not give.
-///
-/// ⭐ AS MEASURED TODAY NOT ONE OF THE 24,363 PROGRAMS PANICS: every one stops on a ported unit's own
-/// `None` at entry 222's arena lookup, so [`StageEffect::stopped_at`] is [`None`] corpus-wide. The
-/// `catch_unwind` stays because the next frontier is not guaranteed to be a `None`.
-///
-/// ⛔ IT IS SOUND TO READ THE STATE AFTER THE UNWIND. Every [`DscState`] interior is a `RefCell` whose
-/// borrow guards are dropped BY the unwind, so no guard outlives it and the tree is readable.
-/// [`std::panic::AssertUnwindSafe`] is what lets the `&mut` cross the boundary; the state is only
-/// READ afterwards, never handed back to the stage.
-#[must_use]
 /// ⭐⭐ `computeOp_`'s `opFuncName`s AS THE SEALED ENUM — every op of the SuperDSC's first (and only)
 /// DSC, in `computeOp_` order.
 ///
@@ -824,145 +981,334 @@ pub struct StageEffect {
 ///
 /// ⭐ EMPTY `computeOp_` STILL YIELDS ONE ENTRY, because [`OpFuncs`] is non-empty by construction and
 /// a compute-less DSC is exactly what `OpFuncs::NONE` says.
+#[must_use]
 pub fn op_funcs_of(op: &SdscOp) -> OpFuncs {
-    let named: Vec<Option<deeptools::sys_arch_spec::arch_enums::OpFunc>> = op
+    let named: Vec<Option<OpFunc>> = op
         .dscs_
         .first()
         .into_iter()
         .flat_map(|per_name| per_name.values())
         .flat_map(|dsc| dsc.computeOp_.iter())
-        .map(|compute| {
-            deeptools::sys_arch_spec::arch_enums::OpFunc::from_spelling(&compute.opFuncName)
-        })
+        .map(|compute| OpFunc::from_spelling(&compute.opFuncName))
         .collect();
     let mut entries = named.into_iter();
     let first = entries.next().flatten();
     OpFuncs::new(first, entries.collect())
 }
 
-pub fn run_stage_2a(op: &SdscOp) -> Option<StageEffect> {
-    let mut sdsc = super_dsc(op)?;
-    let state = DscState::seeded(&sdsc);
-    let nodes_before = state.node_count();
+/// ⭐⭐ ONE PROGRAM, SCHEDULED — the artifacts the LOWERING takes, plus the two readings
+/// [`deeptools::sdsc::StagesRan`] does not carry.
+///
+/// ⛔⛔ THE ARTIFACTS ARE THE POINT, AND THEY USED TO BE DROPPED. The old `census` ran the stages,
+/// absorbed the numbers into a [`Corpus`] and let the scheduled super-DSC fall off the end of the loop
+/// — so the DSC handed to the lowering was the UNSCHEDULED wire one, which is why the bake reported
+/// 134 bundles and 0 launch groups. Carrying [`Scheduling`] out is what closes that.
+#[derive(Debug)]
+pub struct Scheduled {
+    /// ⭐ THE SCHEDULED SUPER-DSC AND ITS TREE — see [`Scheduling::state`], which is where every node
+    /// the stages minted lives.
+    pub scheduling: Scheduling,
+    /// ⭐ THE PER-`nodeType_` CENSUS of that tree — the count the four stages owe, per kind.
+    pub kinds: BTreeMap<NodeKind, usize>,
+    /// ⭐⭐ HOW MANY [`DscComputeOp`]s WERE HANDED TO STAGE 2B, over every DSC.
+    ///
+    /// ⛔ A ZERO HERE IS THE FALSE GREEN, NAMED. `v1::PrepDsc::compute_ops` is the first provider
+    /// call `run_v1` makes and an empty answer makes it `continue` past the DSC, so a `0` beside a
+    /// [`DscFilled::Yes`] is a stage that did nothing — which is why the count is carried out
+    /// rather than left implicit in the wire.
+    pub compute_ops: usize,
+}
+
+impl Scheduled {
+    /// ⭐⭐⭐ THE SCHEDULE TREE, FOR THE LOWERING TO WALK — every node stages 2a and 2b minted.
+    ///
+    /// ⛔⛔ THIS IS THE HAND-OFF THE WHOLE TASK EXISTS FOR, AND IT IS THE TYPED TREE RATHER THAN THE
+    /// WIRE'S `nodeType_` STRING. The lowering reads `crate::lower_subtile_tape_to_superdsc::Dsc`'s
+    /// `scheduleTree_`, which is a `Vec<AllocNode>` whose every `nodeType_` is `"allocate"` — so it
+    /// walks no statement and lowers no program. [`DscState::dscs`] hands out one `DscTree` per DSC,
+    /// positionally beside [`Scheduling::sdsc`]'s own `dscs()`, and THAT is what carries the loops,
+    /// transfers, syncs and computes.
+    ///
+    /// ⛔ IT IS BORROWED FROM THE [`Scheduling`] THIS VALUE OWNS, so the lowering's `'c` must not
+    /// outlive the [`Bundle`] the walk holds — which is why `render_dfir_input` keeps the bundle alive
+    /// across the whole group loop rather than per group.
+    #[must_use]
+    pub const fn state(&self) -> &DscState {
+        self.scheduling.state()
+    }
+
+    /// ⭐⭐ HOW MANY **STATEMENT** NODES THE SCHEDULED TREE HOLDS — every node that is not an
+    /// `ALLOCATE`, which is exactly what a lowering walks.
+    ///
+    /// ⛔ THE NUMBER THAT DECIDES WHETHER THE LOWERING PRODUCES A PROGRAM. `ScheduleNode::NodeType`
+    /// is `{BLOCK, LOOP, TRANSFER, COMPUTE, SYNC, CONDITION, ALLOCATE, STICKMASK}` and the port's
+    /// `Statement` is those less `ALLOCATE` (`superdsc_to_dataflow_ir/driver.rs:467`), so a tree of
+    /// nothing but allocations lowers to nothing — which is what scratchy's own unscheduled
+    /// `scheduleTree_` is, and what these two stages exist to change.
+    #[must_use]
+    pub fn statements(&self) -> usize {
+        self.kinds
+            .iter()
+            .filter(|(kind, _)| **kind != NodeKind::Allocate)
+            .map(|(_, count)| count)
+            .sum()
+    }
+}
+
+/// ⭐⭐ WHAT ONE PROGRAM DID — the three outcomes, told apart by TYPE rather than by a `None` that
+/// folds two of them together.
+#[derive(Debug)]
+pub enum Ran {
+    /// ⛔ THE CONVERSION REFUSED — [`super_dsc`] or [`compute_ops_of`]. NO STAGE WAS CALLED, and the
+    /// program is reported as unconverted rather than counted as zero nodes.
+    NotConverted,
+    /// ⛔⛔ A STAGE PANICKED, and the message is carried so the loop is not blind.
+    ///
+    /// ⛔ NO ARTIFACTS, AND NOT BY OVERSIGHT: the super-DSC is MOVED into
+    /// [`run_stages_2a_2b`], so the unwind takes it and the tree with
+    /// it. Re-seeding an empty one here would report a program that *scheduled to nothing*, which is
+    /// a different fact from one that stopped.
+    Stopped(String),
+    /// ⭐ BOTH STAGES RETURNED — the artifacts, and which of them completed
+    /// ([`Scheduling::ran`]).
+    Scheduled(Scheduled),
+}
+
+impl Ran {
+    /// ⭐ THE SCHEDULED ARTIFACTS, [`None`] for a program that did not convert or that stopped.
+    ///
+    /// ⛔ THE TWO ABSENCES ARE FOLDED **ONLY HERE**, for a caller that needs the schedule and cannot
+    /// act on the difference; [`Ran`] itself keeps them apart so the census can report each by name.
+    #[must_use]
+    pub const fn scheduled(&self) -> Option<&Scheduled> {
+        match self {
+            Self::Scheduled(held) => Some(held),
+            Self::NotConverted | Self::Stopped(_) => None,
+        }
+    }
+}
+
+/// ⭐⭐⭐ CONVERT ONE SCRATCHY `SdscOp` AND RUN **BOTH** SCHEDULER STAGES OVER IT, KEEPING WHAT THEY
+/// LEFT.
+///
+/// ⛔⛔ [`Ran::NotConverted`] IS A CONVERSION REFUSING, and there are now TWO of them —
+/// [`super_dsc`] and [`compute_ops_of`]. The second is the one that matters: an operand name no
+/// labelled DS answers to stops the program HERE rather than handing stage 2b a shortened list,
+/// because `v1::PrepDsc::compute_ops` is `run_v1`'s first call and an empty answer makes it
+/// `continue` past the DSC — [`DscFilled::Yes`] having done nothing at all. If the ops cannot be
+/// built, the stage must not be called.
+///
+/// ⛔⛔ THE `catch_unwind` IS MEASUREMENT INSTRUMENTATION, NOT A RUNTIME REFUSAL. Both stages hold
+/// `todo!`s — a fact they cannot answer must NOT be faked, because a carrier answering a plausible
+/// offset would place real tensors at invented addresses. A panic escaping here would kill the BAKE,
+/// so the panic is caught, its message reported as *where it stopped*, and nothing is substituted for
+/// the answer it did not give.
+///
+/// ⛔ IT IS SOUND TO READ THE ARTIFACTS AFTER THE UNWIND — and they SURVIVE it, which is why the
+/// `Option` is unwrapped outside the closure. `sdsc`, `ops` and `names` are owned by THIS frame, so an
+/// unwind inside [`run_stages_2a_2b`] would drop the [`Scheduling`] it
+/// was building; a caught panic therefore reports where it stopped and carries no artifacts, which is
+/// the honest answer rather than a half-scheduled tree.
+///
+/// ⭐ THE REAL OP-FUNC, NOT `None`: `run_stages` states `OpFuncs::new(None, ..)` because `computeOp_`
+/// is not a field of `l3::dsc::SuperDsc`, and scratchy holds it as `computeOp_[i].opFuncName`.
+#[must_use]
+pub fn run_stages(op: &SdscOp) -> Ran {
+    let (Some(sdsc), Some(dsc_ops)) = (super_dsc(op), compute_ops_of(op)) else {
+        return Ran::NotConverted;
+    };
     let ops = op_funcs_of(op);
+    let names = dsc_names(op);
+    let compute_ops = dsc_ops.iter().map(Vec::len).sum();
 
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // ⭐⭐ THE REAL OP-FUNC, NOT `None`. `run_stages_with` states `OpFuncs::new(None, ..)`
-        // because `computeOp_` is not a field of `l3::dsc::SuperDsc`; a caller that HOLDS the op func
-        // is meant to call [`run_l3`], and scratchy holds it as `computeOp_[i].opFuncName`.
-        //
-        // ⛔ `AddressFoldCoords::flat()` IS DELIBERATELY UNCHANGED. The corpus declares ONE `time`
-        // axis of factor 1, so one coordinate is right and `flat()` gives exactly that — but the
-        // fold DEPTH (2 vs 3) is not stated anywhere we read, and a wrong fold coordinate is a wrong
-        // ADDRESS. Guessing it is the fabricated placement this crate ranks worse than a stop.
-        run_l3::<false, deeptools::arch::Dd2>(&mut sdsc, &state, ops.clone(), &AddressFoldCoords::flat())
+        run_stages_2a_2b::<deeptools::arch::Dd2>(sdsc, ops, &dsc_ops, &names)
     }));
-
-    // ⭐ THE COUNTS COME OFF THE STATE EITHER WAY, so a run that panicked and one that returned are
-    // measured by the same reading and cannot report different totals for one tree.
-    let (l3, stopped_at) = match ran {
-        Ok(done) => (done.is_some(), None),
-        Err(payload) => (false, Some(panic_text(payload.as_ref()))),
-    };
-    Some(StageEffect {
-        nodes_before,
-        nodes_after: state.node_count(),
-        kinds: state.kinds(),
-        l3,
-        first_refusal: state.first_refusal(),
-        stopped_at,
-    })
+    match ran {
+        Ok(scheduling) => Ran::Scheduled(Scheduled {
+            kinds: scheduling.state().kinds(),
+            compute_ops,
+            scheduling,
+        }),
+        Err(payload) => Ran::Stopped(panic_text(payload.as_ref())),
+    }
 }
 
 /// ⭐⭐ THE CORPUS CENSUS — every program of one bundle, aggregated.
 ///
 /// ⭐ MEASURED, and the whole-build aggregate of these is in this module's header: 134 bundles,
-/// 24,363 programs, all converted, 93,110 -> 347,939 nodes, 0 completed — every one now running
-/// THROUGH the memory tracker and stopping at entry 222's arena lookup, with no `stops` entry and no
+/// 24,363 programs, all converted, 93,110 -> 347,939 nodes, 0 completed — every one running THROUGH
+/// the memory tracker and stopping at entry 222's arena lookup, with no `stops` entry and no
 /// `refusals` entry anywhere in the corpus.
+///
+/// ⛔ THE STAGE-2A AND STAGE-2B COUNTS ARE SEPARATE FIELDS AND ARE NEVER ADDED. Reporting one total
+/// for two stages is how a scope's completion gets read as the stage's; `completed` is 2a's and
+/// `ddc_ran`/`ddc_filled` are 2b's, and 2b is only ever REACHED on a program `completed` counts.
 #[derive(Debug, Clone, Default)]
 pub struct Corpus {
     /// How many programs were offered.
     pub programs: usize,
-    /// How many the conversion produced an `l3::dsc::SuperDsc` for.
+    /// How many the conversion produced an `l3::dsc::SuperDsc` AND a `computeOp_` list for.
     pub converted: usize,
     /// Seed nodes over every converted program.
     pub nodes_before: usize,
-    /// Nodes after stage 2a over every converted program.
+    /// Nodes after both stages over every converted program.
     pub nodes_after: usize,
     /// ⭐ THE PER-`nodeType_` TOTAL, which is the gate.
     pub kinds: BTreeMap<NodeKind, usize>,
-    /// How many programs stage 2a completed on.
+    /// ⭐ HOW MANY COMPUTE OPS RESOLVED, over every converted program — the number that says the list
+    /// handed to stage 2b is not empty. An empty list is `run_v1`'s own `continue`.
+    pub compute_ops: usize,
+    /// How many programs stage 2a completed on — and therefore how many stage 2b was REACHED on.
     pub completed: usize,
+    /// How many programs stage 2b RETURNED on, whether it filled them or not.
+    pub ddc_ran: usize,
+    /// How many of those it answered `DscFilled::Yes` for.
+    pub ddc_filled: usize,
     /// ⭐⭐ WHERE THE PROGRAMS STOPPED, one entry per distinct message with its count — so a stop
     /// anywhere OTHER than the memory tracker is visible by name rather than folded into a total.
     pub stops: BTreeMap<String, usize>,
-    /// Every carrier refusal, by method, with its count — a provider gap as opposed to a ported
-    /// unit's own stop.
+    /// Every stage-2a carrier refusal, by method, with its count — a provider gap as opposed to a
+    /// ported unit's own stop.
     pub refusals: BTreeMap<&'static str, usize>,
+    /// The same for stage 2b's own carriers, kept apart because they are DIFFERENT traits over the
+    /// same state.
+    pub ddc_refusals: BTreeMap<&'static str, usize>,
 }
 
 impl Corpus {
     /// Fold one program's measurement in.
-    fn absorb(&mut self, effect: &StageEffect) {
+    fn absorb(&mut self, scheduled: &Scheduled) {
+        let ran = scheduled.scheduling.ran();
         self.converted += 1;
-        self.nodes_before += effect.nodes_before;
-        self.nodes_after += effect.nodes_after;
-        for (kind, count) in &effect.kinds {
+        self.nodes_before += ran.nodes_before;
+        self.nodes_after += ran.nodes_after;
+        for (kind, count) in &scheduled.kinds {
             *self.kinds.entry(*kind).or_insert(0) += count;
         }
-        if effect.l3 {
+        self.compute_ops += scheduled.compute_ops;
+        if ran.l3 {
             self.completed += 1;
         }
-        if let Some(stop) = &effect.stopped_at {
-            *self.stops.entry(stop.clone()).or_insert(0) += 1;
+        if ran.ddc {
+            self.ddc_ran += 1;
         }
-        if let Some(refusal) = effect.first_refusal {
+        if scheduled.scheduling.filled() == Some(DscFilled::Yes) {
+            self.ddc_filled += 1;
+        }
+        if let Some(refusal) = ran.first_refusal {
             *self.refusals.entry(refusal).or_insert(0) += 1;
+        }
+        if let Some(refusal) = scheduled.scheduling.ddc_refusal() {
+            *self.ddc_refusals.entry(refusal).or_insert(0) += 1;
         }
     }
 
     /// ⭐ THE CENSUS AS ONE LINE PER FACT — what the bake prints and the aggregation greps.
     #[must_use]
     pub fn report(&self) -> Vec<String> {
-        let mut lines = vec![format!(
-            "stage2a: {} program(s), {} converted, {} completed; nodes {} -> {}",
-            self.programs, self.converted, self.completed, self.nodes_before, self.nodes_after,
-        )];
+        let mut lines = vec![
+            format!(
+                "stage2a: {} program(s), {} converted, {} completed; nodes {} -> {}",
+                self.programs,
+                self.converted,
+                self.completed,
+                self.nodes_before,
+                self.nodes_after,
+            ),
+            // ⛔ REPORTED PER STAGE. `reached` is `completed` restated on purpose: stage 2b runs only
+            // over a program stage 2a finished, so a zero there is the whole explanation for a zero
+            // here and the two must be readable on one line.
+            format!(
+                "stage2b: {} reached, {} returned, {} filled; {} compute op(s) offered",
+                self.completed, self.ddc_ran, self.ddc_filled, self.compute_ops,
+            ),
+        ];
         for (kind, count) in &self.kinds {
-            lines.push(format!("stage2a-kind: {} {count}", kind.spelling()));
+            lines.push(format!("stage-kind: {} {count}", kind.spelling()));
         }
         for (stop, count) in &self.stops {
-            lines.push(format!("stage2a-stop: {count} x {stop}"));
+            lines.push(format!("stage-stop: {count} x {stop}"));
         }
         for (refusal, count) in &self.refusals {
             lines.push(format!("stage2a-refusal: {count} x {refusal}"));
+        }
+        for (refusal, count) in &self.ddc_refusals {
+            lines.push(format!("stage2b-refusal: {count} x {refusal}"));
         }
         lines
     }
 }
 
-/// ⭐⭐ CONVERT AND RUN STAGE 2A OVER EVERY PROGRAM OF ONE BUNDLE.
+/// ⭐⭐⭐ CONVERT AND RUN BOTH STAGES OVER EVERY PROGRAM OF ONE BUNDLE, **KEEPING WHAT THEY LEFT** —
+/// the whole correction, in the return type.
+///
+/// ⛔⛔ THE OLD `census` RETURNED ONLY THE [`Corpus`], AND THAT WAS THE DEFECT. It ran the stages over
+/// every program, absorbed the node counts, and let each scheduled super-DSC drop at the end of the
+/// loop iteration; the DSC then handed to the lowering was the UNSCHEDULED wire one. So the bake
+/// reported 134 bundles, 0 launch groups and 0.0 MB of device code from a scheduler that had run
+/// 24,363 times. [`Self::programs`] is what closes it — and the function is named
+/// [`schedule_bundle`] rather than `census` because a census is what it used to be and a name that
+/// says *statistics* is how the artifacts came to be droppable in the first place.
+#[derive(Debug)]
+pub struct Bundle {
+    /// The aggregate reading, which is what the bake prints.
+    pub corpus: Corpus,
+    /// ⭐⭐ EVERY PROGRAM'S OUTCOME, **POSITIONALLY BESIDE THE INPUT** — so the lowering can take the
+    /// scheduled artifacts for the very program it is lowering. A dropped entry would misalign every
+    /// later program with its schedule, which is why the walk pushes one per input unconditionally.
+    pub programs: Vec<Ran>,
+}
+
+impl Bundle {
+    /// ⭐⭐⭐ THE SCHEDULE TREE OF THE PROGRAM AT ONE INPUT POSITION — **the hand-off the lowering
+    /// takes**, and the reason [`Self::programs`] is positional.
+    ///
+    /// ⛔⛔ THE INDEX IS INTO THE `&[SdscOp]` [`schedule_bundle`] WAS GIVEN, not into the group or the
+    /// launch order. `render_dfir_input` partitions those same programs into groups with
+    /// `group_ranges`, so a group's `i`-th program is input `r.start + i` — reading it by the group's
+    /// own offset would pair every program past group 0 with ANOTHER program's addresses, which
+    /// compiles and lowers and is silently wrong.
+    ///
+    /// ⛔ [`None`] IS A PROGRAM THAT DID NOT CONVERT OR THAT STOPPED, and a lowering must treat that as
+    /// *no schedule* rather than an empty one — the two are the difference between a stop and a program
+    /// that scheduled to nothing.
+    #[must_use]
+    pub fn state_of(&self, at: usize) -> Option<&DscState> {
+        Some(self.programs.get(at)?.scheduled()?.state())
+    }
+}
+
+/// ⭐⭐ CONVERT AND RUN BOTH STAGES OVER EVERY PROGRAM OF ONE BUNDLE — see [`Bundle`].
 ///
 /// ⛔ THE PANIC HOOK IS SILENCED FOR THE WHOLE WALK AND RESTORED AFTER — see [`QuietPanics`].
 #[must_use]
-pub fn census(ops: &[SdscOp]) -> Corpus {
+pub fn schedule_bundle(ops: &[SdscOp]) -> Bundle {
     let _quiet = QuietPanics::install();
     let mut corpus = Corpus {
         programs: ops.len(),
         ..Corpus::default()
     };
+    let mut programs = Vec::with_capacity(ops.len());
     for op in ops {
-        if let Some(effect) = run_stage_2a(op) {
-            corpus.absorb(&effect);
+        let ran = run_stages(op);
+        match &ran {
+            Ran::NotConverted => {}
+            Ran::Stopped(stop) => *corpus.stops.entry(stop.clone()).or_insert(0) += 1,
+            Ran::Scheduled(scheduled) => corpus.absorb(scheduled),
         }
+        programs.push(ran);
     }
-    corpus
+    Bundle { corpus, programs }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `scaledLdsCategory_`'s declared `REGULAR_TENSOR` — read only by the assertion that scratchy
+    /// emits no such field, so it is imported HERE and not beside the lib's own seam row.
+    use deeptools::sdsc::ScaledLds;
 
     /// ⭐ THE TWO NAME LOOKUPS ARE CLOSED-SET LOOKUPS, CARRYING THE VALUES — so a renamed variant
     /// fails here rather than silently making every dim `In` or every role `Output`.
@@ -1257,7 +1603,7 @@ mod tests {
             // `SCALE_TENSOR` an `Option<MxScaleTensor>` used to collapse it with.
             assert_eq!(
                 converted.scaled_category(),
-                deeptools::schedule::ddc::fold::ScaledLds::Regular,
+                ScaledLds::Regular,
                 "`scaledLdsCategory_` is emitted by nothing, which is REGULAR_TENSOR"
             );
         }
@@ -1322,25 +1668,47 @@ mod tests {
             );
         }
 
-        // ⭐⭐ AND NOW THE STAGE, OVER THAT SAME CONVERSION.
-        let effect = run_stage_2a(&wire).expect("the same conversion, run through stage 2a");
+        // ⭐⭐ AND NOW THE STAGES, OVER THAT SAME CONVERSION.
+        let ran = run_stages(&wire);
+        let scheduled = ran
+            .scheduled()
+            .expect("the same conversion, run through both scheduler stages");
+        let effect = scheduled.scheduling.ran();
+        // ⭐⭐⭐ THE COMPUTE-OP LIST IS NON-EMPTY AND CARRIES REAL RESOLVED VALUES — the whole point,
+        // asserted BEFORE the node counts because it is the fact the counts depend on. A zero here
+        // beside a `DscFilled::Yes` is stage 2b's `continue`, which is a stage that did nothing.
+        assert_eq!(
+            scheduled.compute_ops, wire_dsc.computeOp_.len(),
+            "every `computeOp_` entry the emitter wrote reached stage 2b — a SHORT list would skip \
+             ops and an EMPTY one would skip the DSC entirely (`ddc/v1.rs:6437`)"
+        );
         assert_eq!(
             effect.nodes_before, 4,
             "the seed: `root_level_operations` plus one HBM allocate per HBM-pinned tensor"
         );
+        // ⛔⛔ THE CENSUS IS STRICTLY GREATER THAN THE SEED, AND THAT IS THE TEST THIS DEFECT NEEDED.
+        // The stages ran over the tree this `Scheduling` HOLDS, so a composition that scheduled a
+        // throwaway copy — the defect: `census` absorbed the numbers and dropped the artifacts —
+        // would leave `state()` at the seed and fail here. "It ran" would not.
         assert!(
             effect.nodes_after > effect.nodes_before,
-            "stage 2a MINTED nodes on real data — {} -> {}",
+            "the stages MINTED nodes on the tree this value carries — {} -> {}",
             effect.nodes_before,
             effect.nodes_after,
         );
         assert_eq!(
-            effect.kinds.values().sum::<usize>(),
+            scheduled.scheduling.state().node_count(),
+            effect.nodes_after,
+            "and the count is read off the SAME state the caller now holds, not off a copy the \
+             composition kept to itself"
+        );
+        assert_eq!(
+            scheduled.kinds.values().sum::<usize>(),
             effect.nodes_after,
             "the per-kind census must account for every node, or one of the two is short"
         );
         assert_eq!(
-            effect.kinds.get(&NodeKind::Block),
+            scheduled.kinds.get(&NodeKind::Block),
             Some(&2),
             "`root_level_operations` and `lx_below_schedule`"
         );
@@ -1366,7 +1734,7 @@ mod tests {
              reduction axis the KERNEL and INPUT carry and the OUTPUT does not"
         );
         assert_eq!(
-            effect.kinds.get(&NodeKind::Loop),
+            scheduled.kinds.get(&NodeKind::Loop),
             Some(&order.len()),
             "one chunk loop per DISTINCT layout dim across `labeledDs_` — which is
              `collect_all_dimensions_for_loop_order`, and four here where `rmsq_o728`'s single \
@@ -1376,19 +1744,161 @@ mod tests {
             effect.first_refusal, None,
             "no carrier was asked for a fact it could not give — the stop is a ported unit's"
         );
-        // ⭐⭐ NOTHING PANICS ANY MORE. The memory tracker is REAL — `stages::Trackers` owns a
-        // `MemTrackBundle` of ported `DsTrackInMem`s, gated against the reference's own addresses for
-        // all 187 programs (`deeptools`'s `schedule/stages/carriers/lx_oracle.rs`) — so this program
-        // runs THROUGH `backup`/`remove`/`check_and_add` and reaches no `todo!` at all.
-        assert_eq!(
-            effect.stopped_at, None,
-            "no `todo!` is reached on this path any more"
-        );
-        // ⛔ AND IT STILL DOES NOT COMPLETE: entry 222 looks its own freshly minted allocate node up
-        // in the `v1::AllocArena` (`l3/dl_ops.rs:9261`) and no unit of stage 2a ever writes that
+        // ⭐⭐ NOTHING PANICS. The memory tracker is REAL — `stages::Trackers` owns a `MemTrackBundle`
+        // of ported `DsTrackInMem`s, gated against the reference's own addresses for all 187 programs
+        // (`deeptools`'s `schedule/stages/carriers/lx_oracle.rs`) — so this program runs THROUGH
+        // `backup`/`remove`/`check_and_add` and reaches no `todo!` at all. A `Ran::Stopped` would have
+        // failed the `let` above, which is that assertion carried by the type.
+        //
+        // ⛔ AND STAGE 2A STILL DOES NOT COMPLETE: entry 222 looks its own freshly minted allocate node
+        // up in the `v1::AllocArena` (`l3/dl_ops.rs:9261`) and no unit of stage 2a ever writes that
         // arena — the port split the reference's ONE `dsc2::AllocateNode *` into a tree node and an
         // arena entry and writes only the tree. That is the next frontier and it is a port change.
         assert!(!effect.l3, "so stage 2a did not complete");
+        // ⛔⛔ SO STAGE 2B IS NOT **REACHED** ON THIS PROGRAM, AND THAT IS STATED AS A CONSEQUENCE
+        // RATHER THAN AS THE PORT'S BEHAVIOUR. `run_stages_2a_2b` gates stage 2b on stage 2a
+        // completing, because `run_l3`'s `None` leaves the LX allocations MINTED BUT NOT PLACED and
+        // stage 2b computes offsets FROM those placements — running it over an abandoned tree would
+        // compute addresses from half a placement. When entry 222's arena write lands, `l3` becomes
+        // true and stage 2b runs with the list asserted above; nothing else has to change.
+        assert_eq!(
+            (effect.ddc, scheduled.scheduling.filled()),
+            (false, None),
+            "stage 2b is gated on stage 2a completing, and `l3` is false — so this is NOT REACHED, \
+             which `filled() == None` says and a `DscFilled::Yes` would contradict"
+        );
+        assert_eq!(
+            scheduled.scheduling.ddc_refusal(),
+            None,
+            "and no stage-2b carrier was asked anything at all"
+        );
+    }
+
+    /// ⭐⭐⭐ THE `computeOp_` OPERAND NAMES RESOLVE TO `LdsIdx` VALUES, AND THE VALUES ARE THE
+    /// ANSWER — the seam whose empty answer is stage 2b's `continue` (`ddc/v1.rs:6437-6438`).
+    ///
+    /// ⛔⛔ A STALE COMMENT IN THIS FILE CLAIMED THIS MAPPING DID NOT EXIST — *"resolving it needs the
+    /// name→position mapping the emitter does not yet write down"*. It does: `ldsIdx_` and `dsName_`
+    /// are on the SAME wire record (`lower_subtile_tape_to_superdsc.rs:1043-1045`) and the operand
+    /// spelling is those two composed, `{dsName_}-idx{ldsIdx_}`.
+    ///
+    /// ⭐⭐ THE ANSWER KEY IS THE AUTHORITY'S, NOT OURS. `g0/sdsc_0.json` — the input
+    /// `dxp_standalone` compiles to a working `init_binary` — pairs `dsName_` `"Tensor0"` with
+    /// `inputLabeledDs` `"Tensor0-idx0"`, and `g0/debug/sdsc_0/sdsc.json` carries the SAME operand
+    /// names after both stages have run. So the composed spelling is what stage 2b reads.
+    ///
+    /// ⛔ AND THE NEGATIVE CONTROL IS THE POINT OF THE TEST, not decoration: a resolver that fell back
+    /// to index 0, to positional order, or that skipped the operand would pass an "it resolved" check
+    /// and fail these value assertions.
+    #[test]
+    fn an_operand_name_resolves_to_its_own_lds_index_and_an_unknown_one_stops() {
+        use crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec;
+        use crate::lower_subtile_tape_to_superdsc::emit_sdsc;
+        use scratchy_subtile::superdsc_opspec::SdscFoldSet;
+
+        let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2")
+            .expect("a 384x384x64 matmul is a shape the emitter builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let wire = emit_sdsc("MatMul_0", &op, &folds, None).expect("the emitter lowers it");
+        let wire_dsc = wire
+            .dscs_
+            .iter()
+            .flat_map(BTreeMap::values)
+            .next()
+            .expect("the emitter writes one `dscs_` entry");
+
+        let ops = dsc_compute_ops(wire_dsc).expect("every operand name resolves");
+        assert_eq!(
+            ops.len(),
+            wire_dsc.computeOp_.len(),
+            "one `DscComputeOp` per `computeOp_` entry — a dropped one is an op stage 2b never sees"
+        );
+        assert!(
+            !ops.is_empty(),
+            "an EMPTY list makes `run_v1` `continue` past the DSC and answer `DscFilled::Yes` \
+             having done nothing — the false green this whole conversion exists to avoid"
+        );
+
+        // ⭐⭐ THE VALUES, AGAINST THE WIRE'S OWN `ldsIdx_` — an IDENTITY over the record beside it,
+        // so a resolver keyed on the wrong field fails here rather than resolving plausibly.
+        let by_name: BTreeMap<&str, u32> = wire_dsc
+            .labeledDs_
+            .iter()
+            .map(|lds| (lds.dsName_.as_str(), lds.ldsIdx_))
+            .collect();
+        for (converted, wire_op) in ops.iter().zip(&wire_dsc.computeOp_) {
+            for (named, resolved) in [
+                (&wire_op.inputLabeledDs, &converted.inputs),
+                (&wire_op.outputLabeledDs, &converted.outputs),
+            ] {
+                assert_eq!(
+                    named.len(),
+                    resolved.len(),
+                    "every operand resolves — a SKIPPED one changes the reduction sweep's arity"
+                );
+                for (name, lds) in named.iter().zip(resolved) {
+                    // The spelling the emitter wrote, split back into the two facts it composes.
+                    let (base, idx) = name
+                        .rsplit_once("-idx")
+                        .expect("the emitter writes `{dsName_}-idx{ldsIdx_}`");
+                    let expected = *by_name
+                        .get(base)
+                        .expect("the base name is a `labeledDs_` entry's own `dsName_`");
+                    assert_eq!(
+                        idx.parse::<u32>().ok(),
+                        Some(expected),
+                        "`{name}`'s own suffix IS `{base}`'s `ldsIdx_` — the suffix is the index \
+                         restated, which is why the key carries both"
+                    );
+                    assert_eq!(
+                        *lds,
+                        LdsIdx(expected),
+                        "`{name}` resolved to the labelled DS that answers to it — NOT index 0, not \
+                         the operand's position in the list"
+                    );
+                }
+            }
+            assert_eq!(
+                converted.op_func,
+                OpFunc::from_spelling(&wire_op.opFuncName),
+                "`opFuncName` through the closed set — `None` is `OpFuncs::NONE`, never a neighbour"
+            );
+            assert_eq!(
+                converted.ex_unit,
+                ex_unit_of(wire_op.exUnit).expect("`pt` or `sfp`"),
+                "`exUnit` through `SenComponent::spelling` — what `usePt` reads"
+            );
+            assert_eq!(
+                converted.format,
+                DataFormat::from_spelling(wire_op.attributes_.dataFormat_),
+                "`attributes_.dataFormat_` through the same closed-set lookup `labeled_of` uses"
+            );
+        }
+
+        // ⛔⛔ THE NEGATIVE CONTROL: A NAME NOTHING ANSWERS TO IS A STOP. Not index 0, not a skip.
+        let mut broken = wire_dsc.clone();
+        broken.computeOp_[0].inputLabeledDs[0] = "Tensor0-idx7".to_owned();
+        assert_eq!(
+            dsc_compute_ops(&broken),
+            None,
+            "`Tensor0-idx7` names no labelled DS — resolving it to `Tensor0`'s real index would put \
+             the operand on the wrong DS, which is a wrong extent and then a wrong address"
+        );
+        let mut renamed = wire_dsc.clone();
+        renamed.computeOp_[0].exUnit = "pe";
+        assert_eq!(
+            dsc_compute_ops(&renamed),
+            None,
+            "`pe` is a real `SenComponent` but not one the emitter's own `ex_unit` producer can \
+             write, so it must STOP rather than resolve — a wrong `usePt` splits the wrong dim"
+        );
+
+        // ⭐ AND THE PER-DSC NAME IS THE `dscs_` MAP KEY, READ — not the positional `dsc0` fallback.
+        assert_eq!(
+            dsc_names(&wire),
+            vec![StorageName("MatMul_0".to_owned())],
+            "`dsc.name_` is the key the emitter states, which is what `Dsc2Fill::said` prints"
+        );
     }
 
     /// ⭐⭐ THE CORE STAGE IS COPIED UNDER THE NAME `"chunk"`, WHICH IS THE REFERENCE'S OWN MOVE —

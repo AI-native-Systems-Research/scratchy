@@ -7268,15 +7268,21 @@ pub fn render_dfir_input(
         }
     }
 
-    // ⭐⭐ AND THE SCHEDULING LEG IS RUN OVER THE SAME PROGRAMS — the census above says what
-    // scratchy's `scheduleTree_` HOLDS (all `allocate`); this one says what stage 2a MAKES of it.
+    // ⭐⭐⭐ AND THE SCHEDULING LEG IS RUN OVER THE SAME PROGRAMS, **AND ITS RESULT IS KEPT** — the
+    // census above says what scratchy's `scheduleTree_` HOLDS (all `allocate`); this says what the two
+    // scheduler stages MAKE of it, and `scheduled.programs` carries the artifacts POSITIONALLY beside
+    // `trips` so the lowering can be handed the schedule for the very program it is lowering.
     //
-    // ⛔ THE STAGE ENDS IN A PORTED UNIT'S `None` TODAY — entry 222's arena lookup, measured over all
-    // 24,363 programs with ZERO panics — and a stop that PANICS instead is still CAUGHT in
-    // [`crate::superdsc_to_l3_sdsc::run_stage_2a`], reported as *where it stopped*, and never allowed
-    // to escape: it would kill the bake. That is measurement instrumentation and NOT a runtime
+    // ⛔⛔ IT USED TO DROP THEM, AND THAT WAS THE DEFECT. `census` absorbed each program's node counts
+    // into a statistics object and let the scheduled super-DSC fall off the end of the loop, so the
+    // DSC handed to `superdsc_to_dataflow_ir` was the UNSCHEDULED wire one — 134 bundles, 0 launch
+    // groups, 0.0 MB of device code, from a scheduler that had run 24,363 times.
+    //
+    // ⛔ A STOP THAT PANICS IS CAUGHT INSIDE `run_stages`, reported as *where it stopped*, and never
+    // allowed to escape: it would kill the bake. That is measurement instrumentation and NOT a runtime
     // refusal — nothing here decides what the bake emits.
-    for line in crate::superdsc_to_l3_sdsc::census(&trips).report() {
+    let scheduled = crate::superdsc_to_l3_sdsc::schedule_bundle(&trips);
+    for line in scheduled.corpus.report() {
         eprintln!("[spyre-dfir] {fp}: {line}");
     }
 
@@ -7286,6 +7292,21 @@ pub fn render_dfir_input(
     for (gi, r) in ranges.iter().enumerate() {
         // ⛔ ONE PROGRAM PER TRIP, and its DSC LIST is what the version question is asked of — see
         // [`dfir::GroupOp`]. A trip whose op-func the door does not spell names no program.
+        //
+        // ⛔⛔ THE SCHEDULE TREE IS NOT PASSED HERE YET, AND THAT IS THE LAST LINE OF GAP 3. `GroupOp`
+        // (`lower_superdsc_to_dataflow_ir.rs:242`) carries only `dscs`/`func`, so the lowering still
+        // reads the wire `Dsc`'s `scheduleTree_` — a `Vec<AllocNode>` whose every `nodeType_` is
+        // `"allocate"`, which walks NO statement. The schedule is built, held and available:
+        // `scheduled.state_of(r.start + i)` is the tree for this group's `i`-th program. The moment
+        // `group_op_of` takes it, this becomes
+        //     .enumerate()
+        //     .filter_map(|(i, trip)| dfir::group_op_of(
+        //         trip.dscs_.iter().flat_map(BTreeMap::values).collect(),
+        //         scheduled.state_of(r.start + i),
+        //     ))
+        // ⛔ AND THE INDEX MUST BE `r.start + i`, NOT `i`: `scheduled.programs` is positional beside
+        // `trips`, so a group's own offset would pair every program past group 0 with ANOTHER
+        // program's addresses — which compiles, lowers, and is silently wrong.
         let group_ops: Vec<dfir::GroupOp<'_>> = trips[r.start..r.end]
             .iter()
             .filter_map(|trip| {
@@ -7293,13 +7314,27 @@ pub fn render_dfir_input(
             })
             .collect();
         let Some(module) = dfir::lower_group(gi as u32, &group_ops) else {
+            // ⭐⭐ THE TWO TREES, SIDE BY SIDE, WHICH IS THE WHOLE DIAGNOSTIC. `census.statements` is
+            // what scratchy's own `scheduleTree_` holds (zero — it is all `allocate`);
+            // `scheduled_statements` is what the two scheduler stages LEFT for these same programs.
+            // While the second is also zero the lowering has nothing to walk and the reason is stage
+            // 2a's stop; once it is non-zero and the lowering still yields nothing, the defect is the
+            // lowering's. Reading it here is what tells those two apart.
+            // ⭐ INDEXED BY THE **ABSOLUTE** TRIP POSITION, which is the same indexing
+            // `Bundle::state_of` uses and the same the hand-off will use — so this number describes
+            // the very pairing the lowering is going to be given.
+            let scheduled_statements: usize = (r.start..r.end)
+                .filter_map(|ti| Some(scheduled.programs.get(ti)?.scheduled()?.statements()))
+                .sum();
             eprintln!(
                 "[spyre-dfir] {fp}: the port lowered NO program for group {gi} of {} — \
                  scheduleTree_ carries {} allocate node(s) and {} statement node(s) across {} \
-                 compute op(s), and `superdsc_to_dataflow_ir` walks STATEMENTS. The four stages of \
-                 SchedulerStages.cpp:29-57 are what fill the tree; they are ported (382/382) and \
-                 uncallable (see lower_superdsc_to_dataflow_ir.rs's header). Staging NO group for \
-                 this bundle rather than a partial launch sequence.",
+                 compute op(s), the two scheduler stages left {scheduled_statements} statement \
+                 node(s) on these programs, and `superdsc_to_dataflow_ir` walks STATEMENTS. \
+                 SchedulerStages.cpp:29-57's stages 2a and 2b are composed and CALLED \
+                 (`deeptools::sdsc::run_stages_2a_2b`); what remains is handing the \
+                 scheduled tree to the lowering, which reads the wire `Dsc` alone today. Staging NO \
+                 group for this bundle rather than a partial launch sequence.",
                 ranges.len(),
                 census.allocate,
                 census.statements,

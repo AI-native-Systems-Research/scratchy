@@ -44,9 +44,13 @@ pub mod lower_superdsc_to_dataflow_ir;
 pub mod lower_subtile_tape_to_ktir;
 pub mod lower_subtile_tape_to_superdsc;
 /// ⭐⭐ BRIDGE 1'S SCHEDULING LEG, SCRATCHY SIDE — the emitted SuperDSC as
-/// `deeptools::schedule::l3::dsc::SuperDsc`, so `schedule::stages::run_stages` runs over REAL bake
-/// data instead of a transcribed fixture. It lives here and not in `deeptools` because `deeptools`
-/// never depends on scratchy: the side that names both vocabularies is this one.
+/// `deeptools::sdsc::SuperDsc`, so `deeptools::sdsc::run_stages_2a_2b` runs over REAL bake data
+/// instead of a transcribed fixture. It lives here and not in `deeptools` because `deeptools` never
+/// depends on scratchy: the side that names both vocabularies is this one.
+///
+/// ⛔ IT NAMES `deeptools::sdsc` AND NOTHING UNDER `deeptools::schedule` — the scheduler is a
+/// target-neutral pass and *"scratchy knows nothing about l3"*. Relocating this module INTO
+/// `deeptools` is still owed; see its own header for the two things blocking it.
 pub mod superdsc_to_l3_sdsc;
 mod op_abi;
 pub mod superdsc_bake;
