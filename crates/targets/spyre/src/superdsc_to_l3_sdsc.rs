@@ -1216,6 +1216,65 @@ mod tests {
             wire_dsc.labeledDs_.len(),
             "and each has its own layout order, keyed by the POSITION it sits at"
         );
+        // ⭐⭐ `dsName_`, `wordLength` AND `dataFormat_` AS AN IDENTITY OVER THE WIRE ENTRY BESIDE IT —
+        // not against a transcribed constant, so a conversion that read the WRONG entry (or the same
+        // entry three times) fails here.
+        for (converted, wire_lds) in dsc.labeled_ds.iter().zip(&wire_dsc.labeledDs_) {
+            assert_eq!(
+                converted.record().name,
+                StorageName(wire_lds.dsName_.clone()),
+                "`dsName_` verbatim — this is the name the reference's own seed allocate node carries \
+                 (`allocate-Tensor0_hbm`)"
+            );
+            assert_eq!(
+                converted.record().word_length,
+                WordLength(wire_lds.wordLength),
+                "`wordLength` verbatim — an ELEMENT WIDTH the DDL match compares against a template's \
+                 own `bitSize_ / 8`"
+            );
+            assert_eq!(
+                converted.record().data_format,
+                DataFormat::from_spelling(wire_lds.dataFormat_),
+                "`dataFormat_` through the closed-set lookup — what the DDL match BINDS each operand \
+                 by"
+            );
+            // ⛔ AND `scaledLdsCategory_` IS THE DECLARED `REGULAR_TENSOR` (`dsc/dscdefn.h:356`): the
+            // emitter writes no such field, so this is the authority's initializer and not a
+            // `SCALE_TENSOR` an `Option<MxScaleTensor>` used to collapse it with.
+            assert_eq!(
+                converted.scaled_category(),
+                deeptools::schedule::ddc::fold::ScaledLds::Regular,
+                "`scaledLdsCategory_` is emitted by nothing, which is REGULAR_TENSOR"
+            );
+        }
+        // ⭐ AND THE THREE PER-DSC ONES. `constantInfo_` is the wire's own table (the emitter writes the
+        // string `"{}"` for this op), `maskingConstId_` is its declared `-1`, and neither
+        // `dimToSymbolMapping_` nor `l0TetheredMode_` is emitted at all.
+        assert_eq!(
+            dsc.ddc.constants.len(),
+            constant_info_of(&wire_dsc.constantInfo_)
+                .expect("the emitter's own table reads")
+                .len(),
+            "`constantInfo_` converts whichever of its two wire spellings this op wrote"
+        );
+        assert_eq!(
+            dsc.ddc.masking_const,
+            match wire_dsc.maskingConstId_ {
+                -1 => None,
+                id => Some(ConstIdx(u32::try_from(id).expect("a non-negative id"))),
+            },
+            "`maskingConstId_` — `None` IS the declared -1"
+        );
+        assert!(
+            dsc.ddc.dim_to_symbol.is_empty(),
+            "`dimToSymbolMapping_` is a scheduler OUTPUT the emitter drops \
+             (lower_subtile_tape_to_superdsc.rs:1240-1241), so `{{}}` is its input state"
+        );
+        assert_eq!(
+            dsc.ddc.l0_tethered,
+            L0Tethered::Split,
+            "`l0TetheredMode_` likewise — `false` is what nothing set"
+        );
         assert!(
             dsc.corelet_shares
                 .values()
