@@ -622,6 +622,12 @@ impl SliceIndex {
     pub fn of_core_decomposition(digit: u32) -> SliceIndex {
         SliceIndex(digit)
     }
+
+    /// The digit itself — what the wire integer is, for a reader that needs the VALUE rather than
+    /// the serialization (bridge 1's `coreIdToWkSlice_` → `l3::dsc::WkSliceId` conversion).
+    pub const fn get(self) -> u32 {
+        self.0
+    }
 }
 
 impl serde::Serialize for SliceIndex {

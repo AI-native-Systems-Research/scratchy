@@ -27,7 +27,10 @@ use crate::schedule::l3::dl_ops::GtrGroupId;
 use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroU64};
-use sys_arch_spec::arch_enums::SenComponent;
+/// ⭐ RE-EXPORTED BECAUSE [`Pinning::mem_org`] IS A PUBLIC FIELD KEYED BY IT — a caller outside this
+/// crate that builds a [`Pinning`] has to be able to NAME the component, and `sys-arch-spec` is not
+/// its dependency. One path, so the key type cannot be reached through two.
+pub use sys_arch_spec::arch_enums::SenComponent;
 
 /// WHERE ONE LABELLED DATA STRUCTURE LIVES — `memOrg_` (`dsc/dscdefn.h:337`): every component the
 /// map names with that entry's `isPresent`, plus the two LX questions a component set cannot answer.
@@ -1610,6 +1613,19 @@ impl StageName {
     #[must_use]
     pub fn chunk() -> Self {
         Self("chunk".to_owned())
+    }
+
+    /// `"core"` — the name the stage at [`DATA_STAGE_CORE`] carries
+    /// (`ddc/ddl/ddl_conversion.cpp:2976`: `loopnode->numId_ == metadata_.chunk_dstgid ? "chunk" :
+    /// "core"`).
+    ///
+    /// ⭐ IT IS THE INDEX THAT IDENTIFIES THE CORE STAGE, NOT THE NAME: `dataStageCoreIdx` is `0`
+    /// (`L3DlOpsScheduler.cpp:275`), so a converter reading `dataStageParam_[0]` builds the name
+    /// rather than carrying whatever string its input spelled — which is what keeps a stage name out
+    /// of the closed set of things an input can decide.
+    #[must_use]
+    pub fn core() -> Self {
+        Self("core".to_owned())
     }
 
     /// `"ibr"` (`L3DlOpsScheduler.cpp:6664`).

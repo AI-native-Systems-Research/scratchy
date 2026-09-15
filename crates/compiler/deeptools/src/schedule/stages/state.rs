@@ -114,6 +114,18 @@ impl DscTree {
         self.with(TreeData::node_names)
     }
 
+    /// ⭐⭐ THE PER-`nodeType_` CENSUS OF THIS TREE — [`Self::node_count`] broken out by kind, which
+    /// is what a caller measuring stage 2a's effect on real data reports.
+    ///
+    /// ⭐ A VALUE AND NOT A RATIO, and the counts SUM to [`Self::node_count`]: the reference side
+    /// states the same quantity per kind (`check.py census`: transfer +3,102, compute +2,834, block
+    /// +2,158, loop +2,043, sync +1,783, allocate +1,319, condition +892 over 187 programs), so a
+    /// per-kind reading here is comparable against it kind for kind rather than as one total.
+    #[must_use]
+    pub fn kinds(&self) -> BTreeMap<NodeKind, usize> {
+        self.with(TreeData::node_kinds)
+    }
+
     /// `scheduleTree_.getHead()->denId_`, which serialises as `scheduleTreeHeadDenId_`
     /// (`dsc/dsc2.cpp:368`) — [`None`] before entry 217 states it.
     #[must_use]
@@ -269,6 +281,19 @@ impl DscState {
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.dscs.iter().map(DscTree::node_count).sum()
+    }
+
+    /// ⭐⭐ THE WHOLE SUPER-DSC'S PER-`nodeType_` CENSUS — [`DscTree::kinds`] summed over every DSC,
+    /// so the counts sum to [`Self::node_count`].
+    #[must_use]
+    pub fn kinds(&self) -> BTreeMap<NodeKind, usize> {
+        let mut census: BTreeMap<NodeKind, usize> = BTreeMap::new();
+        for tree in &self.dscs {
+            for (kind, count) in tree.kinds() {
+                *census.entry(kind).or_insert(0) += count;
+            }
+        }
+        census
     }
 }
 

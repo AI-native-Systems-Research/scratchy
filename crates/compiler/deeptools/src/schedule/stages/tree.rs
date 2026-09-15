@@ -336,6 +336,20 @@ impl TreeData {
         self.nodes.len()
     }
 
+    /// ⭐ HOW MANY NODES OF EACH `nodeType_` THE TREE HOLDS — the per-kind reading of [`Self::len`],
+    /// which is the quantity `check.py census` states on the reference side.
+    ///
+    /// ⛔ EVERY NODE, LINKED OR NOT, EXACTLY AS [`Self::len`] COUNTS THEM, so the counts SUM to it. A
+    /// per-kind census taken over [`Self::dfs`] instead would silently omit a minted node the stage
+    /// had not linked yet, and the two totals would disagree with no way to tell which was short.
+    pub(super) fn node_kinds(&self) -> BTreeMap<NodeKind, usize> {
+        let mut census = BTreeMap::new();
+        for entry in self.nodes.values() {
+            *census.entry(entry.kind.node_kind()).or_insert(0) += 1;
+        }
+        census
+    }
+
     /// The FIRST node of that name in DFS order, which is how `getLxBelowBlockNode` finds its block.
     pub(super) fn find_named(&self, name: &str) -> Option<NodeId> {
         self.dfs()

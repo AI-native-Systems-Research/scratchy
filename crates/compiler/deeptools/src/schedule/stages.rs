@@ -96,10 +96,26 @@ pub struct StagesRan {
 #[must_use]
 pub fn run_stages(sdsc: &mut l3::dsc::SuperDsc) -> StagesRan {
     let state = DscState::seeded(sdsc);
+    run_stages_with(sdsc, &state)
+}
+
+/// ⭐⭐ [`run_stages`]' OWN BODY WITH THE SEED STATE HANDED IN — the same composition, the same
+/// `computeOp_`-less [`v1::OpFuncs`] and the same flat [`l3::dl_ops::AddressFoldCoords`].
+///
+/// ⛔⛔ IT EXISTS SO A CALLER CAN STILL READ THE TREE AFTER THE STAGE STOPS. Stage 2a's stop today is
+/// the memory tracker's `todo!` ([`carriers`]'s `ExPhaseTrackers::backup`), and a [`DscState`] built
+/// INSIDE [`run_stages`] is dropped by that unwind — so the nodes the growers minted, which are the
+/// whole measurement, are unreachable. A caller that owns the state measures
+/// [`DscState::kinds`] afterwards.
+///
+/// ⭐ [`StagesRan`] IS THE SAME ANSWER EITHER WAY: it is read off the state this takes, so the two
+/// entry points cannot report different numbers for one run.
+#[must_use]
+pub fn run_stages_with(sdsc: &mut l3::dsc::SuperDsc, state: &DscState) -> StagesRan {
     let nodes_before = state.node_count();
     let l3 = run_l3::<false, Dd2>(
         sdsc,
-        &state,
+        state,
         // ⛔ `computeOp_` IS NOT A FIELD OF [`l3::dsc::DesignSpaceConfig`] — see
         // [`Reads::new`]'s own note. A `computeOp_` entry whose `opFuncName` is unset is what a
         // caller holding no op func can state, and the ported min-param units refuse on it exactly

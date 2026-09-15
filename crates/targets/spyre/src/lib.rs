@@ -43,6 +43,11 @@ pub mod lower_superdsc_to_dataflow_ir;
 /// the SubtileIR substrate both backends consume.
 pub mod lower_subtile_tape_to_ktir;
 pub mod lower_subtile_tape_to_superdsc;
+/// ⭐⭐ BRIDGE 1'S SCHEDULING LEG, SCRATCHY SIDE — the emitted SuperDSC as
+/// `deeptools::schedule::l3::dsc::SuperDsc`, so `schedule::stages::run_stages` runs over REAL bake
+/// data instead of a transcribed fixture. It lives here and not in `deeptools` because `deeptools`
+/// never depends on scratchy: the side that names both vocabularies is this one.
+pub mod superdsc_to_l3_sdsc;
 mod op_abi;
 pub mod superdsc_bake;
 /// Path shims kept from `scratchy-subtile`'s lib so the moved lowering

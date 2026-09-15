@@ -991,6 +991,30 @@ impl MemOrg {
             lx: Some(MemPresence { isPresent: 1 }),
         }
     }
+
+    /// ⭐ `memOrg_.count(HBM)` AND `memOrg_.at(HBM).isPresent` AS ONE ANSWER — [`None`] where the map
+    /// does not NAME the component, `Some(isPresent)` where it does.
+    ///
+    /// ⛔ THE KEY AND THE FLAG ARE DIFFERENT QUESTIONS AND THE REFERENCE ASKS BOTH: `isLxPinned()`
+    /// tests `memOrg_.count(LX) > 0` while `isHbmPinned()` tests `memOrg_.at(HBM).isPresent`
+    /// (`dsc/dscdefn.h:368-375`, `:424-427`), so an entry present as a key with `isPresent = 0`
+    /// answers one and not the other. Collapsing the pair to a `bool` would lose that.
+    #[must_use]
+    pub const fn hbm(&self) -> Option<bool> {
+        match &self.hbm {
+            Some(p) => Some(p.isPresent != 0),
+            None => None,
+        }
+    }
+
+    /// `memOrg_.count(LX)` with its `isPresent` — see [`MemOrg::hbm`].
+    #[must_use]
+    pub const fn lx(&self) -> Option<bool> {
+        match &self.lx {
+            Some(p) => Some(p.isPresent != 0),
+            None => None,
+        }
+    }
 }
 // Custom Serialize so absent components are simply omitted (never a `null`),
 // matching torch-spyre's conditional dict; and so NO register-file key exists.
@@ -7242,6 +7266,17 @@ pub fn render_dfir_input(
             census.statements += one.statements;
             census.compute_ops += one.compute_ops;
         }
+    }
+
+    // ⭐⭐ AND THE SCHEDULING LEG IS RUN OVER THE SAME PROGRAMS — the census above says what
+    // scratchy's `scheduleTree_` HOLDS (all `allocate`); this one says what stage 2a MAKES of it.
+    //
+    // ⛔ THE STAGE ENDS IN A `todo!` TODAY (`ExPhaseTrackers::backup` — the unported memory tracker)
+    // and that panic is CAUGHT in [`crate::superdsc_to_l3_sdsc::run_stage_2a`], reported as *where it
+    // stopped*, and never allowed to escape: it would kill the bake. That is measurement
+    // instrumentation and NOT a runtime refusal — nothing here decides what the bake emits.
+    for line in crate::superdsc_to_l3_sdsc::census(&trips).report() {
+        eprintln!("[spyre-dfir] {fp}: {line}");
     }
 
     let (kinds, _owner) = trip_kinds_for(ops, fold);

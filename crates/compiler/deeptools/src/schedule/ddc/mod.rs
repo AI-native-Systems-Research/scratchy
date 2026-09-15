@@ -136,7 +136,10 @@ pub mod fold;
 pub mod metadata;
 pub mod shuffle;
 pub mod transformation;
-pub(crate) mod transformation_util;
+/// ⭐ PUBLIC BECAUSE THE `l3` VIEW'S OWN PUBLIC FIELDS NAME IT — `l3::dsc::NamedDims::name` is a
+/// `StageName` and `EmptyStage::name` another, so a caller outside this crate that builds a data
+/// stage has to be able to name the type. It was `pub(crate)`, which made those fields unnameable.
+pub mod transformation_util;
 pub mod v1;
 
 // ⭐ USES FOR ENTRIES 073-077 AND 230-232. Union these into this file's top block when its other
