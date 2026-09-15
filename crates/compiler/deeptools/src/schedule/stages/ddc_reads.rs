@@ -40,9 +40,12 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
 };
 use crate::formats::DataFormat;
 use crate::islands::dataflow_ir::ty::GenericComp;
-use crate::schedule::ddc::fold::{AllocId, ConstIdx, NodeId, PadType, ScaleBlock, ScaledLds};
+use crate::schedule::ddc::fold::{
+    AllocId, Cardinality, ConstIdx, NodeId, PadType, ScaleBlock, ScaledLds,
+};
 use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::LoopId;
+use crate::schedule::ddc::transformation_util::PaddingForm;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{LayoutDims, LdsIdx, LdsScale};
 use crate::schedule::l3::dl_ops::AddressFoldCoords;
@@ -344,9 +347,14 @@ impl v1::Placement for Dsc2Reads<'_, '_> {
 }
 
 impl v1::StageSizes for Dsc2Reads<'_, '_> {
-    /// `primaryDimToVal_st(dim, comp, -1, corelet, padding, density)` — ⭐ THE SHARED MAP, read in
-    /// the ONE case the authority's own control flow is a plain field read; see
-    /// [`super::ddc_state::Dsc2Dims`].
+    /// `primaryDimToVal_st(dim, comp, -1, corelet, padding, density)` —
+    /// [`StageDims::sampled_extent`](crate::schedule::l3::dsc::StageDims::sampled_extent) (entry
+    /// 012) with `ptrowId = -1`, this [`PadType`] as the dim's own padding form and the density as
+    /// its divisor.
+    ///
+    /// ⛔ THE UNSTATED SLOT IS THE REFERENCE'S OWN `-1` AND NOT A REFUSAL, so `plain_slot` still
+    /// answers it. Only what the FOLD stops on — a corelet the split does not name, an aborted
+    /// `calculate_padded` — is a `todo!`, because a substituted extent is a fabricated one.
     fn dim_extent(
         &self,
         stage: DatastageId,
@@ -356,21 +364,29 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
         padding: PadType,
         density: v1::Density,
     ) -> Extent {
-        let plain = corelet.is_none()
-            && padding == PadType::NoPad
-            && density == v1::Density::FULL
-            && !matches!(unit, SenComponent::Pe | SenComponent::Sfp | SenComponent::Pelrf | SenComponent::Sfplrf);
-        if plain
-            && let Some(half) = self.steady(stage)
-            && let Some(extent) = plain_slot(&half, dim)
-        {
-            return extent;
+        if let Some(half) = self.steady(stage) {
+            let mut form = PaddingForm::default();
+            form.set_padding(dim, padding);
+            let at = v1::DimSample {
+                comp: v1::sampled_as(unit),
+                row: None,
+                corelet,
+            };
+            // `dimDensity` is `1.0` or `1.0 / mxInfo_.blkSize`, so the block is the divisor and a
+            // block of one is the identity the reference's `1.0` multiply is.
+            let density = ScaleBlock::of(Cardinality(density.get().get()));
+            if let Some(extent) = half.dims.sampled_extent(dim, at, &form, density, false) {
+                return extent;
+            }
+            if let Some(extent) = plain_slot(&half, dim) {
+                return extent;
+            }
         }
         todo!(
-            "v1::StageSizes::dim_extent: wants primaryDimToVal_st (dsc/dims.cpp:653-704) to fold \
-             coreletSplit_/rowSplit_/peSfpSplit_, calculate_padded (:563-616) and the density \
-             divide for stage {stage:?} dim {dim:?} unit {unit:?} — a hand-rolled fold is a \
-             fabricated extent"
+            "v1::StageSizes::dim_extent: primaryDimToVal_st (dsc/dims.cpp:653-704) STOPS for stage \
+             {stage:?} dim {dim:?} unit {unit:?} corelet {corelet:?} padding {padding:?} — either \
+             dataStageParam_ states no such stage, or the split names that corelet nowhere, or \
+             calculate_padded (:563-616) aborted"
         )
     }
 
@@ -391,7 +407,7 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
             && density == v1::Density::FULL;
         if plain
             && let Some(half) = self.steady(stage)
-            && half.row_split.is_empty()
+            && half.dims.row_split.is_empty()
             && !matches!(unit, SenComponent::Pe | SenComponent::Sfp | SenComponent::Pelrf | SenComponent::Sfplrf)
             && let Some(extent) = plain_slot(&half, dim)
         {
@@ -593,7 +609,7 @@ impl v1::OffsetSizes for Dsc2Reads<'_, '_> {
     /// `dataStageParam_.at(stage).ss_.peSfpSplit_` — ⭐ THE SHARED MAP.
     fn pe_sfp_split_dims(&self, stage: DatastageId) -> Vec<PrimaryDim> {
         self.steady(stage)
-            .map(|half| half.pe_sfp_split.keys().copied().collect())
+            .map(|half| half.dims.pe_sfp_split.keys().copied().collect())
             .unwrap_or_default()
     }
 

@@ -277,7 +277,7 @@ pub enum Ln32 {
 /// `primaryDimToVal_st`'s `comp` ARGUMENT for an allocation's component (`dsc/dims.cpp:659-663`) —
 /// only the PE and the SFP, with their register files, name a vector component; every other
 /// component falls through as `NO_COMPONENT` (`:683`).
-fn sampled_as(component: SenComponent) -> Option<VectorComp> {
+pub(crate) fn sampled_as(component: SenComponent) -> Option<VectorComp> {
     match component {
         SenComponent::Pelrf | SenComponent::Pe => Some(VectorComp::Pe),
         SenComponent::Sfplrf | SenComponent::Sfp => Some(VectorComp::Sfp),

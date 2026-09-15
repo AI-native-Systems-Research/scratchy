@@ -14,7 +14,7 @@
 
 use crate::arch::{Bytes, Elements};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
-    self as shape_constraints, Extent, PrimaryDim, StickDims, StickPart,
+    self as shape_constraints, Extent, PrimaryDim, StickDims, StickPart, VectorComp,
 };
 use crate::formats::DataFormat;
 use crate::schedule::ddc::fold::{
@@ -23,10 +23,10 @@ use crate::schedule::ddc::fold::{
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::{DsType, Scale};
 use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
-use crate::schedule::ddc::v1::{L0Tethered, StorageName};
+use crate::schedule::ddc::v1::{DimSample, L0Tethered, PeSfpShares, StorageName};
 use crate::schedule::dsc2::{LayoutDims, LdsIdx, NodeName, WordLength};
 use crate::schedule::l3::dl_ops::{GtrGroupId, VariableSymbol};
-use crate::units::{Core, Corelet};
+use crate::units::{Core, Corelet, Row};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroU64};
 /// ⭐ RE-EXPORTED BECAUSE [`Pinning::mem_org`] IS A PUBLIC FIELD KEYED BY IT — a caller outside this
@@ -1148,6 +1148,18 @@ pub struct StageDims {
     pub symbolic: Symbolic,
     /// `coreletSplit_` — per corelet-split dim, one extent per corelet of the core.
     pub corelet_split: BTreeMap<PrimaryDim, Vec<Extent>>,
+    /// `rowSplit_` (`dsc/dims.h:209`) — per corelet, that corelet's share of the dim broken up
+    /// across the PT's rows, indexed BY ROW.
+    ///
+    /// ⛔ THE OUTER KEY IS THE CORELET AND ONLY THE CORELETS THE SPLIT NAMES ARE PRESENT, which is
+    /// what makes `primaryDimToVal_st`'s `clId = -1` arm read the FIRST corelet and not the core
+    /// (`dsc/dims.cpp:668-675`).
+    pub row_split: BTreeMap<PrimaryDim, BTreeMap<Corelet, Vec<Extent>>>,
+    /// `peSfpSplit_` (`dsc/dims.h:210-214`) — per corelet, the PE's and the SFP's shares.
+    ///
+    /// ⭐ BOTH SIDES ARE ALWAYS PRESENT, so `.at(peOrSfp)`'s throw (`dsc/dims.cpp:686`) is
+    /// discharged by [`PeSfpShares`] rather than checked; its own doc names the three writers.
+    pub pe_sfp_split: BTreeMap<PrimaryDim, BTreeMap<Corelet, PeSfpShares>>,
 }
 
 impl StageDims {
@@ -1299,6 +1311,107 @@ impl StageDims {
             return self.scaled_extent(dim, padded, density, granularity);
         };
         let share = *split.get(usize::try_from(corelet.get()).ok()?)?;
+        let share = if granularity {
+            self.symbolic.scale_from_max_to_granularity(dim, share)?
+        } else {
+            share
+        };
+        let scaled = match density {
+            Some(block) => share.0 / i64::try_from(block.count().0).unwrap_or(i64::MAX),
+            None => share.0,
+        };
+        self.calculate_padded(dim, Extent(scaled), padded, granularity)
+    }
+
+    /// `rowSplit_.at(dim)` READ AT ONE ROW — one named corelet's share, else the SUM over the
+    /// corelets the split names when `coreletSplit_` names the dim too, else the FIRST corelet's
+    /// share alone (`dsc/dims.cpp:665-675`).
+    fn row_share(
+        &self,
+        dim: PrimaryDim,
+        per_corelet: &BTreeMap<Corelet, Vec<Extent>>,
+        row: Row,
+        corelet: Option<Corelet>,
+    ) -> Option<Extent> {
+        let index = usize::try_from(row.get()).ok()?;
+        let at_row = |shares: &[Extent]| shares.get(index).copied();
+        match corelet {
+            Some(corelet) => at_row(per_corelet.get(&corelet)?),
+            None if self.corelet_split.contains_key(&dim) => per_corelet
+                .values()
+                .try_fold(0i64, |sum, shares| {
+                    Some(sum.saturating_add(at_row(shares)?.0))
+                })
+                .map(Extent),
+            None => at_row(per_corelet.values().next()?),
+        }
+    }
+
+    /// `peSfpSplit_.at(dim)` READ ON ONE SIDE — the same three-way over the PE's or the SFP's half
+    /// (`dsc/dims.cpp:684-694`).
+    fn pe_sfp_share(
+        &self,
+        dim: PrimaryDim,
+        per_corelet: &BTreeMap<Corelet, PeSfpShares>,
+        comp: VectorComp,
+        corelet: Option<Corelet>,
+    ) -> Option<Extent> {
+        match corelet {
+            Some(corelet) => Some(per_corelet.get(&corelet)?.get(comp)),
+            None if self.corelet_split.contains_key(&dim) => {
+                Some(Extent(per_corelet.values().fold(0i64, |sum, shares| {
+                    sum.saturating_add(shares.get(comp).0)
+                })))
+            }
+            None => Some(per_corelet.values().next()?.get(comp)),
+        }
+    }
+
+    /// Replaces: e012_primaryDimToVal_st
+    ///
+    /// ONE SAMPLE'S VIEW OF A DIM — the PT row's `rowSplit_` share where the sample names a row AND
+    /// the stage splits that dim across rows, else the PE's or the SFP's `peSfpSplit_` share where it
+    /// names a vector component, else [`Self::corelet_extent`]'s corelet view. The share is
+    /// re-expressed in granularity units where asked, density-scaled, then rewritten by
+    /// [`Self::calculate_padded`] — the same tail as the corelet view.
+    ///
+    /// ⛔ `clId = -1` IS A SUM ONLY WHERE THE DIM IS ALSO CORELET-SPLIT (`dsc/dims.cpp:668-674`);
+    /// otherwise it is the FIRST corelet's share alone. Summing unconditionally would multiply a
+    /// single-corelet stage's extent by the corelet count.
+    ///
+    /// ⛔ EVERY `.at` IS A STOP, NOT A FALL-THROUGH, exactly as in [`Self::corelet_extent`]: a
+    /// corelet the split does not name (`:666`) and a row past the end of its vector both throw, and
+    /// answering the whole core there hands one row the core's extent.
+    ///
+    /// ⛔ AND `rowSplit_.at(d).begin()` ON AN EMPTY INNER MAP (`:672`) IS [`None`] — the reference
+    /// dereferences its end iterator there.
+    ///
+    /// ⭐ `PELRF -> PE` AND `SFPLRF -> SFP` (`:659-663`) ARE DISCHARGED BY THE TYPE: [`VectorComp`]
+    /// spells only the two compute components, and `v1::sampled_as` is where a [`SenComponent`] is
+    /// mapped onto it.
+    ///
+    /// ⭐ THE PE/SFP ARM IS PORTED, NOT DEFERRED, though `peSfpSplit_` is empty on all 187 g0
+    /// reference exports: [`PeSfpShares`] already spells both halves, so the arm costs a `todo!` that
+    /// a bundle outside g0 could walk into.
+    ///
+    /// ⛔ DIVERGENCE, AS IN [`Self::scaled_extent`]: INTEGER DIVISION where the reference multiplies
+    /// by the `double` `1.0/blkSize` and truncates.
+    #[must_use]
+    pub fn sampled_extent(
+        &self,
+        dim: PrimaryDim,
+        at: DimSample,
+        padded: &PaddingForm,
+        density: Option<ScaleBlock>,
+        granularity: bool,
+    ) -> Option<Extent> {
+        let share = if let (Some(row), Some(per_corelet)) = (at.row, self.row_split.get(&dim)) {
+            self.row_share(dim, per_corelet, row, at.corelet)?
+        } else if let (Some(comp), Some(per_corelet)) = (at.comp, self.pe_sfp_split.get(&dim)) {
+            self.pe_sfp_share(dim, per_corelet, comp, at.corelet)?
+        } else {
+            return self.corelet_extent(dim, at.corelet, padded, density, granularity);
+        };
         let share = if granularity {
             self.symbolic.scale_from_max_to_granularity(dim, share)?
         } else {
@@ -3137,6 +3250,242 @@ mod tests_e011 {
                 false
             ),
             Some(Extent(64))
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e012 {
+    //! ⭐⭐ THE REFERENCE PUBLISHES BOTH SIDES OF THIS FUNCTION TOO. MEASURED over all 187 g0
+    //! reference exports: 1,270 of their 4,850 dim blocks state a non-empty `rowSplit_` (93 of 187
+    //! programs), and in EVERY one `sum(rowSplit_[d][cl]) == the whole-core slot` with each row's
+    //! share `slot / 8` — so the row view's answer and the base view's answer are both the
+    //! reference's own numbers rather than ours.
+    //!
+    //! ⛔ WHAT THE CORPUS CANNOT SHOW, SAME MEASUREMENT: every one of those 1,270 inner maps is
+    //! keyed on corelet `"0"` ALONE, none of their dims is in `coreletSplit_` too, and `peSfpSplit_`
+    //! is empty on all 4,850 — so the SUM arm and the PE/SFP arm are CONSTRUCTED from the
+    //! reference's own code and marked as such.
+
+    use super::StageDims;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+        Extent, PrimaryDim, VectorComp,
+    };
+    use crate::schedule::ddc::transformation_util::PaddingForm;
+    use crate::schedule::ddc::v1::{DimSample, PeSfpShares};
+    use crate::units::{Corelet, Row};
+    use std::collections::BTreeMap;
+
+    /// `g0/debug/sdsc_100/sdsc.json`'s `dataStageParam_["0"].ss_` — `name_: "core"`, `in_: 64`,
+    /// `out_: 64`, `mb_: 1`, `y_: 1`, `i_: -1`, `rowSplit_: {"in": {"0": [8, 8, 8, 8, 8, 8, 8, 8]}}`
+    /// and EMPTY `coreletSplit_`/`peSfpSplit_`/`paddingSizes_`/`symbolicDimInfo_`.
+    fn row_split_stage() -> StageDims {
+        StageDims {
+            extents: BTreeMap::from([
+                (PrimaryDim::In, Extent(64)),
+                (PrimaryDim::Out, Extent(64)),
+                (PrimaryDim::Mb, Extent(1)),
+                (PrimaryDim::Y, Extent(1)),
+            ]),
+            row_split: BTreeMap::from([(
+                PrimaryDim::In,
+                BTreeMap::from([(Corelet::at::<0>(), vec![Extent(8); 8])]),
+            )]),
+            ..StageDims::default()
+        }
+    }
+
+    /// `ptrowId = row`, and `clId` where one is named.
+    fn at_row(row: u32, corelet: Option<Corelet>) -> DimSample {
+        DimSample {
+            comp: None,
+            row: Some(Row::checked(row).expect("a row of this PT")),
+            corelet,
+        }
+    }
+
+    /// e012 — the row view answers the SHARE and the base view the WHOLE, on the reference's own
+    /// row-split exports.
+    #[test]
+    fn the_reference_s_own_row_split_export_is_what_the_row_view_answers() {
+        let stage = row_split_stage();
+        let plain = PaddingForm::default();
+
+        // `rowSplit_["in"]["0"] = [8; 8]` read with `clId = -1` — the `begin()` arm, since
+        // `coreletSplit_` is empty in that export. Each of the eight rows answers its own share.
+        for row in 0..8 {
+            assert_eq!(
+                stage.sampled_extent(PrimaryDim::In, at_row(row, None), &plain, None, false),
+                Some(Extent(8))
+            );
+        }
+        // The same share through `.at(0).at(row)`.
+        assert_eq!(
+            stage.sampled_extent(
+                PrimaryDim::In,
+                at_row(3, Some(Corelet::at::<0>())),
+                &plain,
+                None,
+                false
+            ),
+            Some(Extent(8))
+        );
+        // `in_: 64` with no row named — and 8 shares of 8 summing to 64 is the pair that export
+        // states together, so reading either for the other is the defect this asserts against.
+        assert_eq!(
+            stage.sampled_extent(PrimaryDim::In, DimSample::WHOLE, &plain, None, false),
+            Some(Extent(64))
+        );
+
+        // ⛔ THE NEGATIVE CONTROL — corelet 1 is not a key of that inner map, and the reference is
+        // already committed to `.at(clId)` (`dsc/dims.cpp:666`). It does NOT come back with `in_`.
+        assert_eq!(
+            stage.sampled_extent(
+                PrimaryDim::In,
+                at_row(0, Some(Corelet::at::<1>())),
+                &plain,
+                None,
+                false
+            ),
+            None
+        );
+
+        // `rowSplit_` names only `in`, so a row id on `out` is still the whole `out_: 64` ...
+        assert_eq!(
+            stage.sampled_extent(PrimaryDim::Out, at_row(0, None), &plain, None, false),
+            Some(Extent(64))
+        );
+        // ... and `i_: -1` is the unstated slot, reached through that same base arm.
+        assert_eq!(
+            stage.sampled_extent(PrimaryDim::I, at_row(0, None), &plain, None, false),
+            None
+        );
+
+        // `g0/debug/sdsc_15/sdsc.json`'s `dataStageParam_["0"].ss_`: `in_: 2048` with
+        // `rowSplit_: {"in": {"0": [256 x 8]}}` — a second published pair, at another scale.
+        let mut wide = row_split_stage();
+        wide.extents.insert(PrimaryDim::In, Extent(2048));
+        wide.row_split.insert(
+            PrimaryDim::In,
+            BTreeMap::from([(Corelet::at::<0>(), vec![Extent(256); 8])]),
+        );
+        assert_eq!(
+            wide.sampled_extent(PrimaryDim::In, at_row(7, None), &plain, None, false),
+            Some(Extent(256))
+        );
+        assert_eq!(
+            wide.sampled_extent(PrimaryDim::In, DimSample::WHOLE, &plain, None, false),
+            Some(Extent(2048))
+        );
+    }
+
+    /// e012 — CONSTRUCTED, no g0 export states a `peSfpSplit_` or a row-split dim that
+    /// `coreletSplit_` names too: the PE/SFP side, the conditional `clId = -1` sum and the arm order
+    /// (`dsc/dims.cpp:665-694`).
+    #[test]
+    fn the_pe_sfp_side_and_the_conditional_corelet_sum_follow_the_reference_s_arms() {
+        let plain = PaddingForm::default();
+        let at_comp = |comp, corelet| DimSample {
+            comp: Some(comp),
+            row: None,
+            corelet,
+        };
+
+        // `peSfpSplit_["in"]["0"] = {PE: 32, SFP: 16}` with an empty `coreletSplit_`: `.begin()` for
+        // `clId = -1`, `.at(0)` for corelet 0, and each side reads its own half.
+        let mut vector = row_split_stage();
+        vector.row_split.clear();
+        vector.pe_sfp_split = BTreeMap::from([(
+            PrimaryDim::In,
+            BTreeMap::from([(
+                Corelet::at::<0>(),
+                PeSfpShares {
+                    pe: Extent(32),
+                    sfp: Extent(16),
+                },
+            )]),
+        )]);
+        for (comp, share) in [(VectorComp::Pe, 32), (VectorComp::Sfp, 16)] {
+            assert_eq!(
+                vector.sampled_extent(PrimaryDim::In, at_comp(comp, None), &plain, None, false),
+                Some(Extent(share))
+            );
+            assert_eq!(
+                vector.sampled_extent(
+                    PrimaryDim::In,
+                    at_comp(comp, Some(Corelet::at::<0>())),
+                    &plain,
+                    None,
+                    false
+                ),
+                Some(Extent(share))
+            );
+        }
+        // The same stop as the row arm — corelet 1 is not a key (`dsc/dims.cpp:685`).
+        assert_eq!(
+            vector.sampled_extent(
+                PrimaryDim::In,
+                at_comp(VectorComp::Pe, Some(Corelet::at::<1>())),
+                &plain,
+                None,
+                false
+            ),
+            None
+        );
+
+        // ⛔ THE SUM IS CONDITIONAL: `clId = -1` adds the corelets' row shares only where
+        // `coreletSplit_` names the dim as well (`:668-674`); otherwise it is the FIRST corelet's
+        // share alone, and summing unconditionally doubles this stage's answer.
+        let mut two = row_split_stage();
+        two.row_split.insert(
+            PrimaryDim::In,
+            BTreeMap::from([
+                (Corelet::at::<0>(), vec![Extent(4); 8]),
+                (Corelet::at::<1>(), vec![Extent(4); 8]),
+            ]),
+        );
+        assert_eq!(
+            two.sampled_extent(PrimaryDim::In, at_row(0, None), &plain, None, false),
+            Some(Extent(4))
+        );
+        two.corelet_split
+            .insert(PrimaryDim::In, vec![Extent(32), Extent(32)]);
+        assert_eq!(
+            two.sampled_extent(PrimaryDim::In, at_row(0, None), &plain, None, false),
+            Some(Extent(8))
+        );
+        // A named corelet is still that corelet's share, corelet-split or not.
+        assert_eq!(
+            two.sampled_extent(
+                PrimaryDim::In,
+                at_row(0, Some(Corelet::at::<1>())),
+                &plain,
+                None,
+                false
+            ),
+            Some(Extent(4))
+        );
+
+        // ⭐ THE ROW ARM IS TESTED FIRST (`:665` before `:682`), so a sample naming both a row and a
+        // component reads `rowSplit_`.
+        let mut both = two.clone();
+        both.pe_sfp_split = BTreeMap::from([(
+            PrimaryDim::In,
+            BTreeMap::from([(Corelet::at::<0>(), PeSfpShares::both(Extent(99)))]),
+        )]);
+        assert_eq!(
+            both.sampled_extent(
+                PrimaryDim::In,
+                DimSample {
+                    comp: Some(VectorComp::Pe),
+                    row: Some(Row::at::<0>()),
+                    corelet: Some(Corelet::at::<0>()),
+                },
+                &plain,
+                None,
+                false
+            ),
+            Some(Extent(4))
         );
     }
 }

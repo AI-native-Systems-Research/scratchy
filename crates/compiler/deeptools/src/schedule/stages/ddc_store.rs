@@ -241,7 +241,7 @@ impl<'s, 'l> Dsc2Store<'s, 'l> {
             stages
                 .0
                 .get(&crate::schedule::ddc::metadata::Metadata::CORE_DSTGID)
-                .is_some_and(|held| !held.ss.dims.pe_sfp_split.is_empty())
+                .is_some_and(|held| !held.ss.dims.dims.pe_sfp_split.is_empty())
         })
     }
 

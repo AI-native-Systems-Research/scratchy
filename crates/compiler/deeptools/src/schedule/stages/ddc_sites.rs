@@ -196,7 +196,7 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         at: v1::StageSite,
         dim: PrimaryDim,
     ) -> Option<BTreeMap<Corelet, Vec<Extent>>> {
-        self.half(at)?.row_split.get(&dim).cloned()
+        self.half(at)?.dims.row_split.get(&dim).cloned()
     }
 
     /// `rowSplit_[dim] = shares`.
@@ -207,7 +207,7 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         shares: BTreeMap<Corelet, Vec<Extent>>,
     ) {
         self.edit(at, |half| {
-            half.row_split.insert(dim, shares);
+            half.dims.row_split.insert(dim, shares);
         });
     }
 
@@ -217,7 +217,7 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         at: v1::StageSite,
         dim: PrimaryDim,
     ) -> Option<BTreeMap<Corelet, v1::PeSfpShares>> {
-        self.half(at)?.pe_sfp_split.get(&dim).cloned()
+        self.half(at)?.dims.pe_sfp_split.get(&dim).cloned()
     }
 
     /// `peSfpSplit_[dim] = shares`.
@@ -228,7 +228,7 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         shares: BTreeMap<Corelet, v1::PeSfpShares>,
     ) {
         self.edit(at, |half| {
-            half.pe_sfp_split.insert(dim, shares);
+            half.dims.pe_sfp_split.insert(dim, shares);
         });
     }
 

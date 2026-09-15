@@ -45,7 +45,7 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
 };
 use crate::schedule::ddc::fold::PadType;
 use crate::schedule::ddc::transformation_util::{
-    DataStage as UtilDataStage, DataStages as UtilDataStages, DimSplit,
+    DataStage as UtilDataStage, DataStages as UtilDataStages, DimSplit, PaddingForm,
     StageDims as UtilStageDims, StageExtents as UtilStageExtents, StageName,
 };
 use crate::schedule::ddc::v1;
@@ -59,34 +59,45 @@ use super::state::{DscState, DscTree};
 /// [`v1::ExploreStages::Dims`], which must be `Stage + UtilStageExtents + Default + Clone`
 /// (`ddc/v1.rs:6420`).
 ///
-/// ⭐ THE FOUR MAPS `l3::dsc::StageDims` ALREADY IS, PLUS THE TWO IT LACKS. `StageDims` carries
-/// `primaryDimToValHandler_st`'s slots, `paddingSizes_`, `symbolicDimInfo_`/`maxSymbolicVolume_` and
-/// `coreletSplit_`; `rowSplit_` and `peSfpSplit_` are stated here beside it rather than in a second
-/// extents type, so [`UtilStageExtents::states`] answers all four splits off one value.
+/// ⭐ EVERY MAP IS `l3::dsc::StageDims`' OWN — `primaryDimToValHandler_st`'s slots,
+/// `paddingSizes_`, `symbolicDimInfo_`/`maxSymbolicVolume_`, `coreletSplit_`, `rowSplit_` and
+/// `peSfpSplit_`.
+///
+/// ⛔ `rowSplit_` AND `peSfpSplit_` WERE STATED HERE BESIDE IT, AND A SECOND HOME IS WHY THEY MOVED:
+/// entry 012 ([`StageDims::sampled_extent`]) is the fold that reads them, so a duplicate here would
+/// leave that fold looking at an EMPTY map at this call site and answering the whole core for one
+/// row.
 #[derive(Debug, Clone, Default)]
 pub struct Dsc2Dims {
     /// `name_`.
     pub name: StageName,
-    /// The four maps `l3::dsc` already models.
+    /// Every map of `DataStructDims` this crate models.
     pub dims: StageDims,
-    /// `rowSplit_` — per corelet, each PT row's share.
-    pub row_split: BTreeMap<PrimaryDim, BTreeMap<Corelet, Vec<Extent>>>,
-    /// `peSfpSplit_` — per corelet, the PE's and the SFP's shares.
-    pub pe_sfp_split: BTreeMap<PrimaryDim, BTreeMap<Corelet, v1::PeSfpShares>>,
+}
+
+/// [`Sample`]'s corelet is always one corelet; `primaryDimToVal_st`'s `clId` is `-1` for the whole
+/// core (`dsc/dims.h:250-255`), which is what [`v1::DimSample`] spells.
+const fn dim_sample(at: Sample) -> v1::DimSample {
+    v1::DimSample {
+        comp: at.comp,
+        row: at.row,
+        corelet: Some(at.corelet),
+    }
 }
 
 impl Dsc2Dims {
     /// ⭐⭐ `primaryDimToVal_base_st`'S PLAIN FIELD READ, AND NOTHING ELSE —
     /// `dsc/dims.cpp:516-560`, the same citation entry 207 already stands on in this crate.
     ///
-    /// ⛔⛔ [`None`] WHERE THE AUTHORITY'S CONTROL FLOW LEAVES THAT READ, and that is deliberate.
-    /// `primaryDimToVal_st` (`dsc/dims.cpp:653-704`) folds in `rowSplit_`, then `peSfpSplit_`, then
-    /// `primaryDimToVal_clView_st`'s `coreletSplit_` (`:631-645`), and `calculate_padded`
-    /// (`:563-616`) rewrites the result through the window dim, the stride and six pad types. Every
-    /// one of those is an EXTENT a placement is computed from, and a hand-rolled fold here would be
-    /// a fabricated extent — the failure this crate ranks worse than a stop. So the reader answers
-    /// only where the authority provably returns the stored slot: the dim is not symbolic, no split
-    /// names it, the padding is `NOPAD`, and the sample asks for the whole of every axis.
+    /// ⛔⛔ [`None`] WHERE THE AUTHORITY'S CONTROL FLOW LEAVES THAT READ, and that is deliberate:
+    /// this reader answers only where the authority provably returns the stored slot — the dim is
+    /// not symbolic, no split names it, and the padding is `NOPAD`.
+    ///
+    /// ⭐ THE FOLD ABOVE IT IS [`StageDims::sampled_extent`] (entry 012, `dsc/dims.cpp:653-704`),
+    /// which folds `rowSplit_`, then `peSfpSplit_`, then `coreletSplit_` (`:631-645`) and
+    /// `calculate_padded` (`:563-616`). ⛔ THIS READER IS STILL WHAT ANSWERS THE UNSTATED SLOT, since
+    /// that fold's [`None`] cannot tell the reference's own `-1` from the reference aborting, and
+    /// answering a stop with a number is the failure this crate ranks worse than a stop.
     ///
     /// ⭐ THE SYMBOLIC ARM IS ANSWERED, because it too is a plain field read: `symbolicDimInfo_`'s
     /// `maxSize_` under [`v1::SymbolicRead::Max`] and its `granularity_` under
@@ -100,8 +111,8 @@ impl Dsc2Dims {
         if padding != PadType::NoPad {
             return None;
         }
-        if self.row_split.contains_key(&dim)
-            || self.pe_sfp_split.contains_key(&dim)
+        if self.dims.row_split.contains_key(&dim)
+            || self.dims.pe_sfp_split.contains_key(&dim)
             || self.dims.corelet_split.contains_key(&dim)
         {
             return None;
@@ -127,8 +138,8 @@ impl Dsc2Dims {
     fn split_dims(&self, split: DimSplit) -> BTreeSet<PrimaryDim> {
         match split {
             DimSplit::Corelet => self.dims.corelet_split.keys().copied().collect(),
-            DimSplit::Row => self.row_split.keys().copied().collect(),
-            DimSplit::PeSfp => self.pe_sfp_split.keys().copied().collect(),
+            DimSplit::Row => self.dims.row_split.keys().copied().collect(),
+            DimSplit::PeSfp => self.dims.pe_sfp_split.keys().copied().collect(),
             DimSplit::Padding => self.dims.padding.keys().copied().collect(),
         }
     }
@@ -144,42 +155,57 @@ impl crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Stage for Dsc2D
     }
 
     fn is_row_split(&self, dim: PrimaryDim) -> bool {
-        self.row_split.contains_key(&dim)
+        self.dims.row_split.contains_key(&dim)
     }
 
     fn is_pe_sfp_split(&self, dim: PrimaryDim) -> bool {
-        self.pe_sfp_split.contains_key(&dim)
+        self.dims.pe_sfp_split.contains_key(&dim)
     }
 
     fn splits_any_row(&self) -> bool {
-        !self.row_split.is_empty()
+        !self.dims.row_split.is_empty()
     }
 
-    /// `primaryDimToVal_st(dim, comp, row, cl)` — ⛔ [`Self::raw_slot`]'s refusal is a `todo!` here,
-    /// because the trait's return type is TOTAL and a substituted extent is a fabricated one.
+    /// `primaryDimToVal_st(dim, comp, row, cl)` — [`StageDims::sampled_extent`] (entry 012) at this
+    /// sample, with the reference's own defaults for the padding form, the density and the symbolic
+    /// read (`dsc/dims.cpp:653-704`).
+    ///
+    /// ⛔ THE UNSTATED SLOT IS THE REFERENCE'S OWN `-1` AND NOT A REFUSAL, so [`Self::raw_slot`]
+    /// still answers it — 187 of 187 g0 programs read a dim their stage leaves at `-1`. Only what the
+    /// FOLD stops on (a corelet or row the split does not name, an aborted `calculate_padded`) is a
+    /// `todo!`, because the trait's return type is TOTAL and a substituted extent is a fabricated
+    /// one.
     fn extent(&self, dim: PrimaryDim, at: Sample) -> Extent {
-        // The whole of every axis is what `primaryDimToVal_st`'s own defaults ask for
-        // (`dsc/dims.cpp:647`); a sampled axis reaches one of the three fold arms.
-        if at.row.is_none()
-            && at.comp.is_none()
-            && let Some(extent) = self.raw_slot(dim, PadType::NoPad, v1::SymbolicRead::Max)
+        if let Some(extent) =
+            self.dims
+                .sampled_extent(dim, dim_sample(at), &PaddingForm::default(), None, false)
         {
             return extent;
         }
+        // The whole of every axis, and the dim unstated: `primaryDimToVal_base_st` answers its `-1`
+        // slot (`dsc/dims.cpp:516-560`) and every arm above passes that through.
+        if let Some(extent) = self.raw_slot(dim, PadType::NoPad, v1::SymbolicRead::Max) {
+            return extent;
+        }
         todo!(
-            "Stage::extent: wants primaryDimToVal_st (dsc/dims.cpp:653-704) to fold rowSplit_/\
-             peSfpSplit_/coreletSplit_ for a SAMPLED axis — this stage states a split on {dim:?} or \
-             the sample names a row/vector component. A hand-rolled fold would be a fabricated \
-             extent."
+            "Stage::extent: primaryDimToVal_st (dsc/dims.cpp:653-704) STOPS on {dim:?} at {at:?} — \
+             the split names neither that corelet nor that row, or calculate_padded (:563-616) \
+             aborted. Substituting the whole core's extent there would be a fabricated extent."
         )
     }
 
-    /// The same with `PADDED_WZEROPAD` on `dim` — ⛔ ALWAYS `calculate_padded`
-    /// (`dsc/dims.cpp:563-616`), so there is no plain-read case to answer.
-    fn padded_extent(&self, _dim: PrimaryDim, _at: Sample) -> Option<PaddedExtent> {
-        todo!(
-            "Stage::padded_extent: wants calculate_padded (dsc/dims.cpp:563-616) — the window dim, \
-             the stride and the six PadTypes. Never a plain read, so never answerable by a carrier."
+    /// The same with `PADDED_WZEROPAD` on `dim` — one `PaddingFormType` handed to the same fold, so
+    /// `calculate_padded`'s window span (`dsc/dims.cpp:596-602`) is what comes back.
+    ///
+    /// ⛔ [`None`] IS *"dim not relevant"* AND EVERY ABORT OF THAT REWRITE AT ONCE — see
+    /// [`PaddedExtent`], where the `DT_ERROR` this feeds is argued unreachable from a positive span.
+    fn padded_extent(&self, dim: PrimaryDim, at: Sample) -> Option<PaddedExtent> {
+        let mut padded = PaddingForm::default();
+        padded.set_padding(dim, PadType::PaddedWZeroPad);
+        PaddedExtent::of(
+            self.dims
+                .sampled_extent(dim, dim_sample(at), &padded, None, false)?
+                .0,
         )
     }
 }
@@ -208,13 +234,13 @@ impl UtilStageExtents for Dsc2Dims {
                 }
             }
             DimSplit::Row => {
-                if let Some(held) = other.row_split.get(&dim) {
-                    self.row_split.insert(dim, held.clone());
+                if let Some(held) = other.dims.row_split.get(&dim) {
+                    self.dims.row_split.insert(dim, held.clone());
                 }
             }
             DimSplit::PeSfp => {
-                if let Some(held) = other.pe_sfp_split.get(&dim) {
-                    self.pe_sfp_split.insert(dim, held.clone());
+                if let Some(held) = other.dims.pe_sfp_split.get(&dim) {
+                    self.dims.pe_sfp_split.insert(dim, held.clone());
                 }
             }
             DimSplit::Padding => {
@@ -243,8 +269,8 @@ impl UtilStageExtents for Dsc2Dims {
     fn clear_split(&mut self, split: DimSplit) {
         match split {
             DimSplit::Corelet => self.dims.corelet_split.clear(),
-            DimSplit::Row => self.row_split.clear(),
-            DimSplit::PeSfp => self.pe_sfp_split.clear(),
+            DimSplit::Row => self.dims.row_split.clear(),
+            DimSplit::PeSfp => self.dims.pe_sfp_split.clear(),
             DimSplit::Padding => self.dims.padding.clear(),
         }
     }
@@ -265,6 +291,7 @@ impl UtilStageExtents for Dsc2Dims {
                 })
                 .unwrap_or_default(),
             DimSplit::Row => self
+                .dims
                 .row_split
                 .get(&dim)
                 .map(|per_corelet| {
@@ -524,8 +551,6 @@ fn seed_stages(dsc: &DesignSpaceConfig) -> UtilDataStages<Dsc2Dims> {
                     dims: Dsc2Dims {
                         name: stage.ss.name.clone(),
                         dims: stage.ss.dims.dims().clone(),
-                        row_split: BTreeMap::new(),
-                        pe_sfp_split: BTreeMap::new(),
                     },
                 },
                 el: UtilStageDims {
@@ -533,8 +558,6 @@ fn seed_stages(dsc: &DesignSpaceConfig) -> UtilDataStages<Dsc2Dims> {
                     dims: Dsc2Dims {
                         name: stage.el.name.clone(),
                         dims: stage.el.dims.dims().clone(),
-                        row_split: BTreeMap::new(),
-                        pe_sfp_split: BTreeMap::new(),
                     },
                 },
             },
