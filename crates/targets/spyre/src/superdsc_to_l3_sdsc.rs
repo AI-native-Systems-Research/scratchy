@@ -131,10 +131,11 @@ use deeptools::formats::DataFormat;
 use deeptools::sdsc::{
     ConstIdx, ConstantInfo, CoreIdsUsed, CoreletShare, CoreletsUsed, DATA_STAGE_CORE, DataStage,
     DataStages, DdcFacts, DesignSpaceConfig, DscComputeOp, DscFilled, DscIdx, DscList,
-    DscScheduleStep, DscState, DsType, Extent, FilledDims, L0Tethered, LabeledDs, LabeledDsList,
-    LayoutDims, LdsIdx, LdsRecord, NamedDims, NodeKind, OpFunc, OpFuncs, Pinning, PrimaryDim,
-    PrimaryDsInfo, Scale, Scheduling, SenComponent, StageDims, StageName, StickDims, StorageName,
-    SuperDsc, WkSlice, WkSliceCount, WkSliceId, WordLength, run_stages_2a_2b,
+    DscScheduleStep, DscState, DsType, Extent, FilledDims, L0Tethered, LabeledDs,
+    LabeledDsAllocations, LabeledDsList, LayoutDims, LdsIdx, LdsRecord, NamedDims, NodeKind, OpFunc,
+    OpFuncs, Pinning, PrimaryDim, PrimaryDsInfo, Scale, Scheduling, SenComponent, StageDims,
+    StageName, StickDims, StorageName, SuperDsc, WkSlice, WkSliceCount, WkSliceId, WordLength,
+    layout_dims, run_stages_2a_2b,
 };
 use deeptools::units::Core;
 use scratchy_subtile::superdsc_opspec::Role;
@@ -543,6 +544,59 @@ fn primary_ds_info_of(info: &LayoutInfo) -> Option<PrimaryDsInfo> {
     })
 }
 
+/// ⭐⭐ THE WIRE'S ALLOCATE NODES AS `getLayoutDims` WALKS THEM — `scheduleTree_` keyed by `ldsIdx_`
+/// and `component_`, which IS `memOrg_[component].allocateNode_->layoutDimOrder_`: the emitter writes
+/// one node per view (`lower_subtile_tape_to_superdsc.rs:5150-5161`) beside the `labeledDs_` entry for
+/// the same view (`:4988`), both with `ldsIdx_: i as u32`, so every labelled DS position answers.
+/// MEASURED over `g0/sdsc_*.json`: 580 allocate nodes, one per labelled DS, every `component_`
+/// `"hbm"` — `scheduleTree_` carries nothing else (`nodeType_` is `"allocate"` on all of them).
+///
+/// ⛔ `referenceLdsIdx_` IS ABSENT FROM THE WIRE RECORD (`:1043-1051`), which is the reference's `-1`:
+/// the walk resolves on the labelled DS's own `memOrg_` and never takes a second lap. The field is
+/// absent from all 580 wire records AND from all 807 records of the reference's own export.
+struct WireAllocations(BTreeMap<LdsIdx, BTreeMap<SenComponent, LayoutDims>>);
+
+impl WireAllocations {
+    /// ⛔ [`None`] IS A `component_` NO [`SenComponent`] SPELLS, or a layout order naming a dim no
+    /// [`PrimaryDim`] spells, or an EMPTY one — the refusals [`primary_ds_info_of`] makes of the
+    /// other order, over the allocate node's.
+    fn of(dsc: &WireDsc) -> Option<Self> {
+        let mut held: BTreeMap<LdsIdx, BTreeMap<SenComponent, LayoutDims>> = BTreeMap::new();
+        for node in &dsc.scheduleTree_ {
+            let component = [SenComponent::Hbm, SenComponent::Lx]
+                .into_iter()
+                .find(|component| component.spelling() == node.component_)?;
+            let mut order = node
+                .layoutDimOrder_
+                .iter()
+                .map(|name| primary_dim_of(name))
+                .collect::<Option<Vec<_>>>()?
+                .into_iter();
+            let first = order.next()?;
+            held.entry(LdsIdx(node.ldsIdx_))
+                .or_default()
+                .insert(component, LayoutDims::new(first, order.collect()));
+        }
+        Some(Self(held))
+    }
+}
+
+impl LabeledDsAllocations for WireAllocations {
+    fn alloc_layout_orders(&self, lds: LdsIdx) -> Option<Vec<(SenComponent, LayoutDims)>> {
+        Some(
+            self.0
+                .get(&lds)?
+                .iter()
+                .map(|(component, order)| (*component, order.clone()))
+                .collect(),
+        )
+    }
+
+    fn reference_lds(&self, _lds: LdsIdx) -> Option<LdsIdx> {
+        None
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  One DSC
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -590,14 +644,24 @@ pub fn design_space_config(dsc: &WireDsc) -> Option<DesignSpaceConfig> {
         .into_iter();
     let labeled_ds = LabeledDsList::new(labelled.next()?, labelled.collect());
 
-    // 6. `getLayoutDims(ldsIdx)` — READ, per labelled DS, as the `LayoutDims` of ITS `dsType_`'s
-    //    `primaryDsInfo_` entry. ⭐ KEYED BY THE POSITION the DS sits at in `labeledDs_`, which is
-    //    what `LabeledDsList::indexed` and `DscState::seeded` index by — NOT by the entry's own
-    //    `recorded()` index. The emitter writes `ldsIdx_: i as u32`, so the two agree today; keying by
-    //    position is what stays correct if they ever drift.
+    // 6. `getLayoutDims(ldsIdx)` — READ, per labelled DS, THROUGH THE WALK ITSELF; see
+    //    [`WireAllocations`]. ⭐ KEYED BY THE POSITION the DS sits at in `labeledDs_`, which is what
+    //    `LabeledDsList::indexed` and `DscState::seeded` index by — NOT by the entry's own
+    //    `recorded()` index. The emitter writes `ldsIdx_: i as u32` on BOTH records, so the position
+    //    keys the allocate nodes too.
+    //
+    // ⭐⭐ IT USED TO ANSWER `primary_ds_info.get(&lds.ds_type())?.layout`, WHICH IS THE OTHER LIST —
+    //    AND THE TWO AGREE ON THE WHOLE CORPUS, 580 of 580 labelled DSs of `g0/sdsc_*.json` and 807 of
+    //    807 of the reference's own export. This is NOT a defect fix; it is the derivation.
+    //    `primaryDsInfo_` holds ONE entry per `dsType_` and the emitter's
+    //    `primary.entry(v.role.ds_type()).or_insert_with(..)` (`:5021`) lets the FIRST view of a role
+    //    fix it, while `getLayoutDims` answers the ALLOCATE NODE's own `layoutDimOrder_`
+    //    (`dsc/dsc2.cpp:4007-4025`), which the emitter writes PER VIEW (`:5161`). The day two views of
+    //    one role carry different orders, only this spelling stays right.
+    let allocations = WireAllocations::of(dsc)?;
     let layout_dims = labeled_ds
         .indexed()
-        .map(|(at, lds)| Some((at, primary_ds_info.get(&lds.ds_type())?.layout.clone())))
+        .map(|(at, _)| Some((at, layout_dims(&allocations, at)?)))
         .collect::<Option<BTreeMap<_, _>>>()?;
 
     // 8. `dataStageParam_` — READ (core) + SYNTHESISED (chunk), see [`data_stages`].

@@ -595,7 +595,7 @@ impl conv::DdlSite for Dsc2Ddl<'_, '_> {
         self.facts().with_dsc(|dsc| {
             dsc.layout_dims
                 .get(&lds)
-                .is_some_and(|layout| layout.iter().any(|named| named == dim))
+                .is_some_and(|layout| layout.index_of(dim).is_some())
         })
     }
 

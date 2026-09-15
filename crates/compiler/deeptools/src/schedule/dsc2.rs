@@ -1688,7 +1688,8 @@ impl LayoutDims {
 /// (`dsc/dsc2.cpp:4007`) walks `referenceLdsIdx_` until it finds a `memOrg_` entry with an
 /// allocate node, preferring `LX`/`HBM`; what every caller wants is the order it lands on.
 pub trait Dsc {
-    /// `DesignSpaceConfig::getLayoutDims(ldsIdx)`.
+    /// `DesignSpaceConfig::getLayoutDims(ldsIdx)` — the ANSWER, whose walk is [`layout_dims`]. A
+    /// carrier states what that walk landed on; it does not re-derive it.
     fn layout_dims(&self, lds: LdsIdx) -> LayoutDims;
 }
 
@@ -2122,4 +2123,230 @@ fn find_sync_mut_in(
         }
     }
     None
+}
+
+/// WHAT `getLayoutDims` WALKS — one labelled DS's `memOrg_` allocate nodes and its
+/// `referenceLdsIdx_` (`dsc/dscdefn.h:324`, `:337`), neither of which a [`LayoutDims`] carrier holds.
+pub trait LabeledDsAllocations {
+    /// `labeledDs_.at(lds).memOrg_`'s entries THAT HOLD AN ALLOCATE NODE, in component order, each
+    /// with that node's `layoutDimOrder_` (`dsc/dsc2.h:982`) — an entry with a null
+    /// `allocateNode_` contributes nothing to the walk, so it is filtered here rather than there.
+    ///
+    /// ⛔ [`None`] IS `labeledDs_.at(ldsIdx)`'s THROW, which is the one `DT_CHECK(ldsIdx >= 0 &&
+    /// ldsIdx < labeledDs_.size())` guards for the FIRST index and nothing guards for a referenced one.
+    fn alloc_layout_orders(&self, lds: LdsIdx) -> Option<Vec<(SenComponent, LayoutDims)>>;
+
+    /// `labeledDs_.at(lds).referenceLdsIdx_`, [`None`] for the `-1` that ends the walk.
+    fn reference_lds(&self, lds: LdsIdx) -> Option<LdsIdx>;
+}
+
+/// Replaces: e006_getLayoutDims
+///
+/// THE LAYOUT ORDER OF THE ALLOCATE NODE A LABELLED DS RESOLVES TO — follows `referenceLdsIdx_`
+/// until some `memOrg_` entry holds an allocate node, keeping the FIRST `LX`/`HBM` entry it meets and
+/// otherwise the LAST entry with a node, and answers THAT node's `layoutDimOrder_`.
+///
+/// ⛔⛔ NOT `primaryDsInfo_.at(dsType_).layoutDimOrder_`, which [`LayoutDims::index_of`] and
+/// [`LayoutDims::to_set`] read: THE TWO ORDERS STAY TWO — a second labelled DS of one `dsType_` has
+/// its own allocate node, and `primaryDsInfo_` holds one entry for both. ⭐ THEY AGREE ON THE WHOLE
+/// CORPUS, MEASURED: 807 of 807 labelled DSs of `g0/debug/sdsc_*/sdsc.json` resolve to a node whose
+/// order IS their `dsType_`'s entry, so this is the derivation and not a defect fix.
+///
+/// ⭐ THE `LX`/`HBM` PREFERENCE IS AN EARLY EXIT AND CANNOT CHANGE THE ANSWER. `memOrg_` is a
+/// `std::map<SenComponents, MemOrg>` (`dsc/dscdefn.h:337`), so it iterates in ordinal order, and
+/// `HBM = 0`/`LX = 1` are the two lowest keys any entry can hold (`sys-arch-spec/arch_enums.h:13-17`)
+/// — nothing precedes them to be overwritten. The `break` therefore only stops the scan early, and
+/// the last-entry-wins overwrite decides among REGISTER FILES alone, which is live: 227 of those 807
+/// resolve to a `pelrf`/`ptarf`/`sfplrf` node, 12 of them with two register files to choose between.
+/// ⭐ [`BTreeMap<SenComponent, _>`] IS THAT SAME ORDER, because [`SenComponent`]'s derived [`Ord`] is
+/// its C++ numbering — which is why the seam states its entries "in component order".
+///
+/// ⛔ [`None`] IS `DT_CHECK(allocNode)` (`dsc/dsc2.cpp:4022`), an unheld index, and a
+/// `referenceLdsIdx_` CYCLE — which the reference does not terminate on at all.
+#[must_use]
+pub fn layout_dims(dsc: &(impl LabeledDsAllocations + ?Sized), lds: LdsIdx) -> Option<LayoutDims> {
+    let mut visited = BTreeSet::new();
+    let mut at = Some(lds);
+    while let Some(idx) = at {
+        if !visited.insert(idx) {
+            return None;
+        }
+        let mut found = None;
+        for (component, order) in dsc.alloc_layout_orders(idx)? {
+            let preferred = matches!(component, SenComponent::Lx | SenComponent::Hbm);
+            found = Some(order);
+            if preferred {
+                break;
+            }
+        }
+        if found.is_some() {
+            return found;
+        }
+        at = dsc.reference_lds(idx);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests_e006 {
+    //! ⭐⭐ `getLayoutDims`' WALK OVER THE REFERENCE'S OWN `memOrg_` TABLES.
+    //!
+    //! # WHERE THE NUMBERS COME FROM
+    //!
+    //! `/Users/nickm/tmp/bridge1-fixtures/g0/debug/sdsc_<N>/sdsc.json` — the reference's export after
+    //! its own L3/ddc/dcg ran. Each case below is one `labeledDs_[i].memOrg_`, with every component
+    //! it names, whether that entry holds an `allocateNode_`, and that node's own `layoutDimOrder_`.
+    //!
+    //! ⭐ THE EXPECTED ORDER IS A VALUE THE REFERENCE WROTE, not a re-derivation: `constructAllocation`
+    //! assigns `allocNode->layoutDimOrder_ = currDsc->getLayoutDims(labelledDS.ldsIdx_)`
+    //! (`ddc/ddc_transformation_util.cpp:20-60`), so every node the scheduler MINTED carries this
+    //! function's own answer. MEASURED across the 187 programs: 1,197 of 1,213 `allocate_lds<N>_*`
+    //! nodes carry exactly the order this walk answers for `<N>` over the exported `memOrg_`. The 16
+    //! exceptions are all in the eight `attn_newkt*` transposes, where lds 1's `lx` entry points at
+    //! `allocate_lds0_lx_internalInput` and the node still NAMED `allocate_lds1_lx` is the stale one —
+    //! the name is stale, not the walk.
+    //!
+    //! ⛔ WHAT THE CORPUS CANNOT DISCRIMINATE, MEASURED: within one labelled DS every component's
+    //! node carries the SAME order (0 of 807 records disagree), so no g0 program can tell which entry
+    //! was picked — only whether SOME entry answered. And `referenceLdsIdx_` is absent from all 807
+    //! records. The cases marked CONSTRUCTED below cover those two, from `dsc/dsc2.cpp:4007-4025`.
+
+    use super::{LabeledDsAllocations, LayoutDims, LdsIdx, layout_dims};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+    use std::collections::BTreeMap;
+    use sys_arch_spec::arch_enums::SenComponent;
+
+    /// ONE PROGRAM'S `labeledDs_` AS THE WALK SEES IT — per index, the components whose entry holds an
+    /// allocate node with that node's order, and the `referenceLdsIdx_`.
+    struct Exported(BTreeMap<LdsIdx, (Vec<(SenComponent, LayoutDims)>, Option<LdsIdx>)>);
+
+    impl LabeledDsAllocations for Exported {
+        fn alloc_layout_orders(&self, lds: LdsIdx) -> Option<Vec<(SenComponent, LayoutDims)>> {
+            self.0.get(&lds).map(|(orders, _)| orders.clone())
+        }
+
+        fn reference_lds(&self, lds: LdsIdx) -> Option<LdsIdx> {
+            self.0.get(&lds).and_then(|(_, reference)| *reference)
+        }
+    }
+
+    fn order(dims: &[PrimaryDim]) -> LayoutDims {
+        let (first, rest) = dims.split_first().expect("a non-empty layout order");
+        LayoutDims::new(*first, rest.to_vec())
+    }
+
+    fn exported(entries: Vec<(u32, Vec<(SenComponent, &[PrimaryDim])>, Option<u32>)>) -> Exported {
+        Exported(
+            entries
+                .into_iter()
+                .map(|(lds, orders, reference)| {
+                    (
+                        LdsIdx(lds),
+                        (
+                            orders
+                                .into_iter()
+                                .map(|(component, dims)| (component, order(dims)))
+                                .collect(),
+                            reference.map(LdsIdx),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    const MB_OUT_Y: [PrimaryDim; 3] = [PrimaryDim::Mb, PrimaryDim::Out, PrimaryDim::Y];
+    const IN_OUT: [PrimaryDim; 2] = [PrimaryDim::In, PrimaryDim::Out];
+    const MB_OUT: [PrimaryDim; 2] = [PrimaryDim::Mb, PrimaryDim::Out];
+    const Y_OUT: [PrimaryDim; 2] = [PrimaryDim::Y, PrimaryDim::Out];
+
+    /// e006 — six exported `memOrg_` tables, then the arms the corpus does not reach.
+    #[test]
+    fn a_labelled_ds_resolves_to_the_order_the_reference_recorded() {
+        // `sdsc_0` — lds 0 `{hbm, lx}`, both with a node; lds 1 `{hbm, lx, sfplrf}` where the
+        // `sfplrf` entry's `allocateNode_` is the EMPTY STRING, so the seam does not list it (48 of
+        // the 807 records have such an entry).
+        let sdsc_0 = exported(vec![
+            (
+                0,
+                vec![
+                    (SenComponent::Hbm, &MB_OUT_Y),
+                    (SenComponent::Lx, &MB_OUT_Y),
+                ],
+                None,
+            ),
+            (
+                1,
+                vec![
+                    (SenComponent::Hbm, &MB_OUT_Y),
+                    (SenComponent::Lx, &MB_OUT_Y),
+                ],
+                None,
+            ),
+        ]);
+        assert_eq!(layout_dims(&sdsc_0, LdsIdx(0)), Some(order(&MB_OUT_Y)));
+        assert_eq!(layout_dims(&sdsc_0, LdsIdx(1)), Some(order(&MB_OUT_Y)));
+        // `DT_CHECK(ldsIdx >= 0 && ldsIdx < labeledDs_.size())` — an index the program does not hold.
+        assert_eq!(layout_dims(&sdsc_0, LdsIdx(2)), None);
+
+        // `sdsc_1` lds 1 — `{pelrf, sfplrf}`, NO `hbm`/`lx`: the scan never breaks and the LAST entry
+        // with a node is the answer.
+        let sdsc_1 = exported(vec![(
+            1,
+            vec![
+                (SenComponent::Pelrf, &MB_OUT_Y),
+                (SenComponent::Sfplrf, &MB_OUT_Y),
+            ],
+            None,
+        )]);
+        assert_eq!(layout_dims(&sdsc_1, LdsIdx(1)), Some(order(&MB_OUT_Y)));
+
+        // `sdsc_15` — lds 1 is the KERNEL `{hbm, lx, ptxrf}` on `["in", "out"]`, lds 2 an OUTPUT held
+        // ONLY in `{ptarf}`, and lds 3 the same in `{pelrf}`. A DIFFERENT order from `sdsc_0`'s.
+        let sdsc_15 = exported(vec![
+            (
+                1,
+                vec![
+                    (SenComponent::Hbm, &IN_OUT),
+                    (SenComponent::Lx, &IN_OUT),
+                    (SenComponent::Ptxrf, &IN_OUT),
+                ],
+                None,
+            ),
+            (2, vec![(SenComponent::Ptarf, &MB_OUT)], None),
+            (3, vec![(SenComponent::Pelrf, &MB_OUT)], None),
+        ]);
+        assert_eq!(layout_dims(&sdsc_15, LdsIdx(1)), Some(order(&IN_OUT)));
+        assert_eq!(layout_dims(&sdsc_15, LdsIdx(2)), Some(order(&MB_OUT)));
+        assert_eq!(layout_dims(&sdsc_15, LdsIdx(3)), Some(order(&MB_OUT)));
+
+        // `sdsc_50` lds 1 — `{lx, l0, sfplrf}`, an INTERNAL tensor with no HBM at all.
+        let sdsc_50 = exported(vec![(
+            1,
+            vec![
+                (SenComponent::Lx, &Y_OUT),
+                (SenComponent::L0, &Y_OUT),
+                (SenComponent::Sfplrf, &Y_OUT),
+            ],
+            None,
+        )]);
+        assert_eq!(layout_dims(&sdsc_50, LdsIdx(1)), Some(order(&Y_OUT)));
+
+        // CONSTRUCTED — `DT_CHECK(allocNode)` (`:4022`): every entry of the index the walk lands on
+        // has a null `allocateNode_`, and `referenceLdsIdx_` is `-1`, so the walk ends with nothing.
+        let starved = exported(vec![(0, vec![], None)]);
+        assert_eq!(layout_dims(&starved, LdsIdx(0)), None);
+
+        // CONSTRUCTED — the `referenceLdsIdx_` hop, which no g0 record takes: lds 1 holds no node and
+        // names lds 0 as its reference, so the answer is lds 0's node.
+        let referenced = exported(vec![
+            (0, vec![(SenComponent::Hbm, &MB_OUT_Y)], None),
+            (1, vec![], Some(0)),
+        ]);
+        assert_eq!(layout_dims(&referenced, LdsIdx(1)), Some(order(&MB_OUT_Y)));
+
+        // CONSTRUCTED — a `referenceLdsIdx_` CYCLE, which the reference spins on forever.
+        let cycle = exported(vec![(0, vec![], Some(1)), (1, vec![], Some(0))]);
+        assert_eq!(layout_dims(&cycle, LdsIdx(0)), None);
+    }
 }

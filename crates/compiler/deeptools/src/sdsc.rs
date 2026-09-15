@@ -66,7 +66,9 @@ pub use crate::schedule::ddc::v1::{DscComputeOp, DscFilled, L0Tethered, OpFuncs,
 /// `EnumsConversion::stringToOpFuncs`, the reference's own parse boundary. Re-exported here so a
 /// caller reads `opFuncName` through the same seam it builds everything else through.
 pub use sys_arch_spec::arch_enums::OpFunc;
-pub use crate::schedule::dsc2::{LayoutDims, LdsIdx, WordLength};
+pub use crate::schedule::dsc2::{
+    LabeledDsAllocations, LayoutDims, LdsIdx, WordLength, layout_dims,
+};
 pub use crate::schedule::l3::dsc::{
     ConstantInfo, CoreIdsUsed, CoreletShare, CoreletsUsed, DATA_STAGE_CORE, DataStage, DataStages,
     DdcFacts, DesignSpaceConfig, DimPadding, DscIdx, DscList, DscScheduleStep, FilledDims, LabeledDs,

@@ -311,9 +311,9 @@ impl FreshAllocation {
         {
             return None;
         }
-        let dims = dsc.layout_dims(dsc.own_lds_idx(lds)).to_vec();
-        let distinct: BTreeSet<PrimaryDim> = dims.iter().copied().collect();
-        (distinct.len() == dims.len()).then(|| Self {
+        let layout = dsc.layout_dims(dsc.own_lds_idx(lds));
+        let dims = layout.to_vec();
+        (layout.to_set().len() == dims.len()).then(|| Self {
             lds,
             storage,
             layout: AllocLayout(dims.into_iter().map(|dim| (dim, None)).collect()),

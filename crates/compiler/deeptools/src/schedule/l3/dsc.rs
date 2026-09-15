@@ -1091,6 +1091,29 @@ impl Symbolic {
         self.info.insert(dim, info);
     }
 
+    /// Replaces: e003_scaleFromMaxToGranularity
+    ///
+    /// RE-EXPRESSES A SIZE FROM MAX UNITS IN GRANULARITY UNITS — a symbolic dim's corelet and row
+    /// splits are filled against `maxSize_`, so a granularity-unit reader divides by
+    /// `maxSize_ / granularity_`. A dim `symbolicDimInfo_` does not name passes through UNTOUCHED.
+    ///
+    /// ⛔ [`None`] IS BOTH `DT_CHECK`s AT ONCE (`dsc/dims.cpp:623`, `:625`): a `maxSize_` the
+    /// granularity does not divide, a zero factor, and a `val` the factor does not divide.
+    #[must_use]
+    pub fn scale_from_max_to_granularity(&self, dim: PrimaryDim, val: Extent) -> Option<Extent> {
+        let Some(info) = self.info.get(&dim) else {
+            return Some(val);
+        };
+        if info.max_size.0 % info.granularity.get() != 0 {
+            return None;
+        }
+        let factor = i64::from(info.max_size.0 / info.granularity.get());
+        if factor == 0 || val.0 % factor != 0 {
+            return None;
+        }
+        Some(Extent(val.0 / factor))
+    }
+
     /// `DataStructDims::pruneMaxSymbolicVolumes` (`dsc/dims.cpp:729`) FUSED WITH THE ASSIGNMENT THAT
     /// PRECEDES ITS CALL: adopts `reference`'s volume limits, re-keyed onto the symbolic dims THIS
     /// stage still has, and divided down by the granularity of each dim it lost.
@@ -1351,8 +1374,15 @@ impl FilledDims {
         &mut self.0.corelet_split
     }
 
-    /// `primaryDimToValHandler_st(dim) = extent` — the scheduler's one way to write a dim. Adding an
-    /// extent cannot empty the map, so the non-emptiness survives it.
+    /// Replaces: e002_primaryDimToValHandler_st
+    ///
+    /// THE ADDRESSABLE SLOT OF ONE PRIMARY DIM — `double&` for the field naming `d`, which every
+    /// caller assigns through (`ddc/ddc_transformation_util.cpp:1270`). Adding an extent cannot empty
+    /// the map, so [`FilledDims`]' non-emptiness survives it; the READ half is [`StageDims::extent`],
+    /// whose [`None`] is the `-1` an unwritten field carries.
+    ///
+    /// ⭐ TOTAL: its 12 arms are exactly the 12 `PrimaryDimTypes` (`dsc/dims.h:34-47`), spelled without
+    /// `PrimaryDimTypesCount`, so `DT_ERROR("Invalid PrimaryDim")` is unspellable.
     pub fn set_extent(&mut self, dim: PrimaryDim, extent: Extent) {
         self.0.extents.insert(dim, extent);
     }
@@ -2244,3 +2274,220 @@ impl StickVolume {
 /// HOW MANY STICK VOLUMES — the count `getLabeledDsNumOfStickVolumesInCore` returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StickVolumes(pub u64);
+
+// ────────────────────────────────────────────────────────────────────────────────────────────────
+// THE TWO QUESTIONS ASKED OF A LAYOUT ORDER — both over `primaryDsInfo_.at(dsType).layoutDimOrder_`,
+// which is a DIFFERENT list from the allocate node's order [`crate::schedule::dsc2::layout_dims`]
+// walks to. The two orders stay two.
+// ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// WHERE A DIM SITS IN A LAYOUT ORDER — the `int` index `getDimIndexInLayoutOrder`
+/// (`dsc/designSpaceConfig.cpp:429`) returns, which is what subscripts `LabeledDsInfo::scale_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LayoutPos(pub usize);
+
+impl LayoutDims {
+    /// Replaces: e004_getDimIndexInLayoutOrder
+    ///
+    /// THE POSITION OF ONE DIM IN THE LAYOUT ORDER — a linear scan of
+    /// `primaryDsInfo_.at(dstype).layoutDimOrder_` for `dim`, first match winning.
+    ///
+    /// ⛔ [`None`] IS THE REFERENCE'S `-1`, A REAL ANSWER AND NOT AN ABORT: entry 017 branches on it
+    /// (`dsc/dsc2.cpp:3820`) and `isLabeledDsDimensionBroadcast` asks only `>= 0`
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:68`).
+    #[must_use]
+    pub fn index_of(&self, dim: PrimaryDim) -> Option<LayoutPos> {
+        self.iter().position(|named| named == dim).map(LayoutPos)
+    }
+
+    /// Replaces: e005_getLayoutDimSet
+    ///
+    /// THE LAYOUT ORDER AS A SET — `std::set<PrimaryDimTypes>(ldov.begin(), ldov.end())`, for the
+    /// readers that ask `count(dim)` and never a position.
+    ///
+    /// ⭐ THE `int ldsIdx` OVERLOAD (`dsc/designSpaceConfig.h:238-240`) IS THIS SAME CALL through
+    /// `labeledDs_.at(ldsIdx).dsType_`, so [`DesignSpaceConfig::primary_ds_info`] keyed by
+    /// [`LabeledDs::ds_type`] spells it and there is no second method.
+    #[must_use]
+    pub fn to_set(&self) -> BTreeSet<PrimaryDim> {
+        self.iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests_e002_e005 {
+    //! ⭐⭐ THE FOUR DIMS-AND-LAYOUT UNITS AGAINST THE REFERENCE'S OWN EXPORT.
+    //!
+    //! # WHERE THE NUMBERS COME FROM
+    //!
+    //! `/Users/nickm/tmp/bridge1-fixtures/g0/debug/sdsc_<N>/sdsc.json` — the SCHEDULED output of the
+    //! reference's own run over `g0/sdsc_<N>.json`, i.e. what its L3/ddc/dcg wrote. Two programs:
+    //!
+    //!   * `sdsc_15`, DSC `t729_fq_mm` — `dataStageParam_["0"].ss_` (`name_: "core"`) states
+    //!     `in_: 2048`, `out_: 64`, `mb_: 1` and `-1` for the other seven, and `["7"].ss_`
+    //!     (`name_: "7"`) states `in_: 16` for the SAME dim. Three DISTINCT values, so a test that
+    //!     transposed two of them would go red.
+    //!   * `sdsc_2`, DSC `rmeps_o728` — `primaryDsInfo_["OUTPUT"].layoutDimOrder_` is
+    //!     `["mb", "out", "y"]` and `labeledDs_[1].scale_` is `[-1, -2, 1]`, three DISTINCT scales.
+    //!     Each names a different `getBufferCapacityForNodePerDim` arm (`dsc/dsc2.cpp:3824-3830`), so
+    //!     an off-by-one index answers a different arm rather than a different number.
+    //!
+    //! ⛔ WHAT THE CORPUS CANNOT SHOW, MEASURED: `symbolicDimInfo_` is EMPTY on all 2,232 stage
+    //! halves of the 187 programs, so `scaleFromMaxToGranularity`'s divide is not reached by any g0
+    //! program and its expected values below are computed from `dsc/dims.cpp:618-628` by hand and
+    //! labelled as such. Only its PASSTHROUGH is corpus-grounded.
+
+    use super::{
+        FilledDims, Granularity, LabeledDs, LayoutPos, MaxSize, Pinning, StageDims, Symbolic,
+        SymbolicDimInfo,
+    };
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+    use crate::schedule::ddc::transformation::{DsType, Scale};
+    use crate::schedule::dsc2::{LayoutDims, LdsIdx};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroU32;
+
+    /// `sdsc_2`'s `primaryDsInfo_["OUTPUT"].layoutDimOrder_`, VERBATIM.
+    fn rmeps_layout() -> LayoutDims {
+        LayoutDims::new(PrimaryDim::Mb, vec![PrimaryDim::Out, PrimaryDim::Y])
+    }
+
+    /// `sdsc_2`'s `labeledDs_[1].scale_`, VERBATIM and positional against [`rmeps_layout`].
+    const RMEPS_SCALE: [f64; 3] = [-1.0, -2.0, 1.0];
+
+    fn granularity(step: u32) -> Granularity {
+        Granularity::new(NonZeroU32::new(step).expect("a positive step"))
+    }
+
+    fn symbolic(max: u32, step: u32) -> Symbolic {
+        Symbolic::new(
+            BTreeMap::from([(
+                PrimaryDim::In,
+                SymbolicDimInfo {
+                    max_size: MaxSize(max),
+                    granularity: granularity(step),
+                },
+            )]),
+            BTreeMap::new(),
+        )
+    }
+
+    /// e002 — the extents `sdsc_15`'s `core` stage states, written through the slot and read back,
+    /// with the reference's `-1` for `y_` reading as an ABSENCE and its `["7"]` value OVERWRITING the
+    /// `["0"]` one through the same slot.
+    #[test]
+    fn one_stages_extents_are_the_reference_s() {
+        let mut dims = StageDims::default();
+        dims.extents.insert(PrimaryDim::In, Extent(2048));
+        let mut filled = FilledDims::of(dims).expect("a stage that states a dim");
+        filled.set_extent(PrimaryDim::Out, Extent(64));
+        filled.set_extent(PrimaryDim::Mb, Extent(1));
+
+        assert_eq!(filled.dims().extent(PrimaryDim::In), Some(Extent(2048)));
+        assert_eq!(filled.dims().extent(PrimaryDim::Out), Some(Extent(64)));
+        assert_eq!(filled.dims().extent(PrimaryDim::Mb), Some(Extent(1)));
+        // `y_: -1` in the export — an unwritten field, which is an absence and not a zero.
+        assert_eq!(filled.dims().extent(PrimaryDim::Y), None);
+        assert_eq!(filled.dims().extent(PrimaryDim::Kij), None);
+
+        // `dataStageParam_["7"].ss_.in_` is 16: the handler hands back the SAME `double&`, so the
+        // second assignment through it replaces the first rather than adding a dim.
+        filled.set_extent(PrimaryDim::In, Extent(16));
+        assert_eq!(filled.dims().extent(PrimaryDim::In), Some(Extent(16)));
+        assert_eq!(filled.dims().extents.len(), 3);
+    }
+
+    /// e003 — the passthrough every g0 stage takes, then the divide and both `DT_CHECK`s computed
+    /// from `dsc/dims.cpp:618-628`.
+    #[test]
+    fn a_max_unit_size_re_expressed_in_granularity_units() {
+        // MEASURED: `symbolicDimInfo_` is `{}` on all 2,232 stage halves, so THIS is the arm every
+        // g0 program takes, and the value is `sdsc_15`'s own `in_`.
+        let plain = Symbolic::new(BTreeMap::new(), BTreeMap::new());
+        assert_eq!(
+            plain.scale_from_max_to_granularity(PrimaryDim::In, Extent(2048)),
+            Some(Extent(2048))
+        );
+
+        // CONSTRUCTED, not corpus-measured: `maxSize_ / granularity_` = 2048 / 64 = 32, and
+        // 2048 / 32 = 64.
+        assert_eq!(
+            symbolic(2048, 64).scale_from_max_to_granularity(PrimaryDim::In, Extent(2048)),
+            Some(Extent(64))
+        );
+        // A dim the map does not name is UNTOUCHED even when another dim is symbolic.
+        assert_eq!(
+            symbolic(2048, 64).scale_from_max_to_granularity(PrimaryDim::Out, Extent(2048)),
+            Some(Extent(2048))
+        );
+        // `DT_CHECK(maxSize_ % granularity_ == 0)` (`:623`).
+        assert_eq!(
+            symbolic(2048, 3).scale_from_max_to_granularity(PrimaryDim::In, Extent(2048)),
+            None
+        );
+        // `DT_CHECK(factor != 0 ...)` (`:625`) — a zero `maxSize_`, which a positive granularity
+        // does NOT discharge.
+        assert_eq!(
+            symbolic(0, 64).scale_from_max_to_granularity(PrimaryDim::In, Extent(2048)),
+            None
+        );
+        // `DT_CHECK(... && val % factor == 0)` (`:625`).
+        assert_eq!(
+            symbolic(2048, 64).scale_from_max_to_granularity(PrimaryDim::In, Extent(33)),
+            None
+        );
+    }
+
+    /// e004 — every position `sdsc_2`'s layout order gives, checked by the `scale_` each one selects.
+    #[test]
+    fn a_dim_s_position_selects_the_scale_the_reference_wrote() {
+        let layout = rmeps_layout();
+        assert_eq!(layout.index_of(PrimaryDim::Mb), Some(LayoutPos(0)));
+        assert_eq!(layout.index_of(PrimaryDim::Out), Some(LayoutPos(1)));
+        assert_eq!(layout.index_of(PrimaryDim::Y), Some(LayoutPos(2)));
+        // The reference's `-1`: a REAL answer, which `isLabeledDsDimensionBroadcast` tests with
+        // `>= 0` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:68`).
+        assert_eq!(layout.index_of(PrimaryDim::In), None);
+        assert_eq!(layout.index_of(PrimaryDim::Kij), None);
+
+        // `scale_[getDimIndexInLayoutOrder(dsType_, dim)]`, which is the read every capacity arm
+        // makes of it (`dsc/dsc2.cpp:3820-3830`).
+        let scale_at = |dim| RMEPS_SCALE[layout.index_of(dim).expect("a dim in the order").0];
+        assert_eq!(scale_at(PrimaryDim::Mb), -1.0);
+        assert_eq!(scale_at(PrimaryDim::Out), -2.0);
+        assert_eq!(scale_at(PrimaryDim::Y), 1.0);
+
+        // The same three scales as scratchy states them, reached through the zip that replaced the
+        // subscript — `Scale::UnitStick` is the `-1` and `Scale::StickDim` the `-2`.
+        let lds = LabeledDs::new(
+            DsType::Output,
+            vec![
+                (PrimaryDim::Mb, Scale::UnitStick),
+                (PrimaryDim::Out, Scale::StickDim),
+                (PrimaryDim::Y, Scale::Sized(1.0)),
+            ],
+            LdsIdx(1),
+            Pinning::default(),
+        );
+        assert_eq!(lds.scale(PrimaryDim::Out), Some(Scale::StickDim));
+        assert_eq!(lds.scale(PrimaryDim::In), None);
+    }
+
+    /// e005 — `sdsc_2`'s layout order as the set its `count(dim)` readers ask.
+    #[test]
+    fn the_layout_order_as_a_set_is_the_dims_the_reference_named() {
+        let set = rmeps_layout().to_set();
+        assert_eq!(
+            set,
+            BTreeSet::from([PrimaryDim::Mb, PrimaryDim::Out, PrimaryDim::Y])
+        );
+        assert!(set.contains(&PrimaryDim::Y));
+        // `count(IN) == 0` — the question `FreshAllocation::of` and the broadcast readers ask.
+        assert!(!set.contains(&PrimaryDim::In));
+        // `sdsc_15`'s KERNEL order `["in", "out"]` is a DIFFERENT set, and the two-dim order's set
+        // has two members and not three.
+        let kernel = LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out]).to_set();
+        assert_eq!(kernel, BTreeSet::from([PrimaryDim::In, PrimaryDim::Out]));
+        assert_ne!(kernel, set);
+    }
+}
