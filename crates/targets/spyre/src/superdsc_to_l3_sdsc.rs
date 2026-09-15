@@ -76,7 +76,9 @@ use deeptools::schedule::l3::dsc::{
     NamedDims, Pinning, PrimaryDsInfo, SenComponent, StageDims, SuperDsc, WkSlice, WkSliceCount,
     WkSliceId,
 };
-use deeptools::schedule::stages::{DscState, StagesRan, run_stages_with};
+use deeptools::schedule::ddc::v1::OpFuncs;
+use deeptools::schedule::l3::dl_ops::AddressFoldCoords;
+use deeptools::schedule::stages::{DscState, run_l3};
 use deeptools::units::Core;
 use scratchy_subtile::superdsc_opspec::Role;
 
@@ -687,19 +689,60 @@ pub struct StageEffect {
 /// [`std::panic::AssertUnwindSafe`] is what lets the `&mut` cross the boundary; the state is only
 /// READ afterwards, never handed back to the stage.
 #[must_use]
+/// ⭐⭐ `computeOp_`'s `opFuncName`s AS THE SEALED ENUM — every op of the SuperDSC's first (and only)
+/// DSC, in `computeOp_` order.
+///
+/// ⛔ THE MAPPING IS THE REFERENCE'S OWN PARSE BOUNDARY, NOT A TABLE WE WROTE.
+/// `sys_arch_spec::arch_enums::OpFunc::from_spelling` is documented as
+/// `EnumsConversion::stringToOpFuncs`, and its `SPELLINGS` are the lowercase names scratchy already
+/// writes (`"floor"`, `"batchmatmulmxfp8"`, …). So this is a lookup in a closed set — no string
+/// reaches a typed field, and no name→op table is invented here.
+///
+/// ⛔ A NAME THE SET DOES NOT SPELL IS [`None`] FOR THAT OP, WHICH IS `OpFuncs::NONE` — the same
+/// thing the reference's own default (`ComputeOpInfo::opFuncName` = `NONE`) states. It is NOT
+/// substituted with a plausible neighbour: specialising the scheduler on the wrong op-func picks the
+/// wrong data format and the wrong conv2d arm.
+///
+/// ⭐ EMPTY `computeOp_` STILL YIELDS ONE ENTRY, because [`OpFuncs`] is non-empty by construction and
+/// a compute-less DSC is exactly what `OpFuncs::NONE` says.
+pub fn op_funcs_of(op: &SdscOp) -> OpFuncs {
+    let named: Vec<Option<deeptools::sys_arch_spec::arch_enums::OpFunc>> = op
+        .dscs_
+        .first()
+        .into_iter()
+        .flat_map(|per_name| per_name.values())
+        .flat_map(|dsc| dsc.computeOp_.iter())
+        .map(|compute| {
+            deeptools::sys_arch_spec::arch_enums::OpFunc::from_spelling(&compute.opFuncName)
+        })
+        .collect();
+    let mut entries = named.into_iter();
+    let first = entries.next().flatten();
+    OpFuncs::new(first, entries.collect())
+}
+
 pub fn run_stage_2a(op: &SdscOp) -> Option<StageEffect> {
     let mut sdsc = super_dsc(op)?;
     let state = DscState::seeded(&sdsc);
     let nodes_before = state.node_count();
+    let ops = op_funcs_of(op);
 
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_stages_with(&mut sdsc, &state)
+        // ⭐⭐ THE REAL OP-FUNC, NOT `None`. `run_stages_with` states `OpFuncs::new(None, ..)`
+        // because `computeOp_` is not a field of `l3::dsc::SuperDsc`; a caller that HOLDS the op func
+        // is meant to call [`run_l3`], and scratchy holds it as `computeOp_[i].opFuncName`.
+        //
+        // ⛔ `AddressFoldCoords::flat()` IS DELIBERATELY UNCHANGED. The corpus declares ONE `time`
+        // axis of factor 1, so one coordinate is right and `flat()` gives exactly that — but the
+        // fold DEPTH (2 vs 3) is not stated anywhere we read, and a wrong fold coordinate is a wrong
+        // ADDRESS. Guessing it is the fabricated placement this crate ranks worse than a stop.
+        run_l3::<false, deeptools::arch::Dd2>(&mut sdsc, &state, ops.clone(), &AddressFoldCoords::flat())
     }));
 
     // ⭐ THE COUNTS COME OFF THE STATE EITHER WAY, so a run that panicked and one that returned are
     // measured by the same reading and cannot report different totals for one tree.
     let (l3, stopped_at) = match ran {
-        Ok(StagesRan { l3, .. }) => (l3, None),
+        Ok(done) => (done.is_some(), None),
         Err(payload) => (false, Some(panic_text(payload.as_ref()))),
     };
     Some(StageEffect {

@@ -123,5 +123,7 @@
 //! 144 units across 1 file(s).
 
 pub mod dsc;
-pub(crate) mod dl_ops;
+/// ⭐ `pub` FOR THE INTEGRATION, the same reason [`super::l3`] itself is: a caller handing stage 2a its
+/// two construction arguments must be able to name `AddressFoldCoords` and `L3RunInputs`.
+pub mod dl_ops;
 

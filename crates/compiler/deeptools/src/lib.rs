@@ -57,6 +57,15 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 }
 
+/// ⭐ THE ARCH ENUM VOCABULARY, RE-EXPORTED — `SenComponent`, `OpFunc`, `DataLocation` and the rest of
+/// `sys-arch-spec`, which this crate's public signatures already name.
+///
+/// ⛔ A CALLER CANNOT SPELL A TYPE IT CANNOT REACH. `schedule::ddc::v1::OpFuncs::new` takes an
+/// `arch_enums::OpFunc`, so an integration handing stage 2a its compute ops has to name that type —
+/// and re-exporting it here is what stops every such caller adding its own `sys-arch-spec` dependency
+/// and risking two versions of one enum.
+pub use sys_arch_spec;
+
 /// THE UNITS A PROGRAM DECLARES, and what each one is next to.
 pub mod units;
 
