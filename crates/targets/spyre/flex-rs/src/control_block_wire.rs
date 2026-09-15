@@ -733,6 +733,10 @@ const XLAT_SECTION: usize = 64;
 pub const CB_NUM_BYTES: usize = 128;
 /// Port of `hal/1p0/response_block_sbf.hpp`'s `RB_NUM_BYTES`.
 pub const RB_NUM_BYTES: usize = 64;
+/// Port of `hal/1p0/response_block_sbf.hpp`'s `APP_SECTION` — where the application-specific
+/// (QGI/HMI, DMA, R5) union starts in a response block. The section runs to [`RB_NUM_BYTES`], i.e.
+/// four 64-bit beats; see [`AppQgiSection`].
+pub const APP_SECTION: usize = 32;
 
 /// A fully-encoded, hardware-ready control block: the real bytes that get
 /// queued via `senlib_ffi_scheduler::cbi_queue_control_blocks_sbf`. This is
@@ -972,6 +976,11 @@ impl ControlBlockWire {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseBlockWire {
     ret_word: u64,
+    /// The APPLICATION-SPECIFIC section, `APP_SECTION..RB_NUM_BYTES` (bytes 32..64) as four
+    /// little-endian 64-bit BEATS — kept verbatim rather than decoded here because the section is a
+    /// UNION whose meaning depends on `locator()`. [`Self::app_qgi`] reads it as the QGI/HMI variant,
+    /// which is the one that carries a faulting device address. See [`AppQgiSection`].
+    app_beats: [u64; 4],
 }
 
 /// Port of `SentientSoc::V1::RBStatusTypeEnum`.
@@ -995,16 +1004,52 @@ impl ResponseBlockWire {
     /// disjunction are always evaluated. Decodes to `status = Good`,
     /// `cancel = 0`: absence contributes NOTHING to a completion verdict, and
     /// in particular cannot erase the `state == TIMED_OUT` arm.
-    pub const ZERO: Self = Self { ret_word: 0 };
+    pub const ZERO: Self = Self {
+        ret_word: 0,
+        app_beats: [0; 4],
+    };
 
-    /// Decode from the raw 64-byte RB. Only the `ReturnSectionSBF` (bytes
-    /// 0..8, `RET_SECTION`) is decoded — timestamps/power/app-specific
-    /// sections are not consumed by this crate's completion path.
+    /// Decode from the raw 64-byte RB: the `ReturnSectionSBF` (bytes 0..8, `RET_SECTION`) that decides
+    /// completion, plus the APP section (bytes 32..64) held as raw beats for [`Self::app_qgi`].
+    /// Timestamps and power (bytes 8..32) are still not consumed by this crate.
     pub fn from_bytes(bytes: &[u8; RB_NUM_BYTES]) -> Self {
         let mut word = [0u8; 8];
         word.copy_from_slice(&bytes[0..8]);
+        // `APP_SECTION = 32`, `RB_NUM_BYTES = 64` (`response_block_sbf.hpp:36-39`), and the QGI
+        // variant is a `BEGIN_SAFE_BITFIELD_UNION(QGIBeatUnion, 4, std::uint64_t)` — four u64 beats,
+        // beat `i` at bits `64i..64i+63`, which the header's own comments confirm ("Beat 2: QGI" for
+        // 191:158, "Beat 1: HMI" for 119:112..69:64, "Beat 0" for 63:56..15:0).
+        let mut app_beats = [0u64; 4];
+        for (i, beat) in app_beats.iter_mut().enumerate() {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[APP_SECTION + i * 8..APP_SECTION + i * 8 + 8]);
+            *beat = u64::from_le_bytes(b);
+        }
         Self {
             ret_word: u64::from_le_bytes(word),
+            app_beats,
+        }
+    }
+
+    /// ⭐ THE APP SECTION READ AS THE QGI/HMI VARIANT — the faulting device address of a compute-side
+    /// fault, which is otherwise thrown away.
+    ///
+    /// `Some` exactly when the vendor's stated validity condition holds: `status == RB_ERROR` and
+    /// `locator` is `QGI_DIAG` or `QGI_NO_DIAG` (`app_data_sbf.hpp:299-305` — "This section is valid
+    /// when rb.ret().GetStatus() == RB_ERROR and rb.ret().GetLocator() == QGI || ... == QGI_NO_DIAG").
+    ///
+    /// ⛔ `QGI_NO_DIAG` (`0x2`) DOES NOT MEAN THE SYNDROME IS ABSENT. It means the CB was submitted
+    /// with `extended_diagnostic_` clear, which is what `CreateComputePhysical` and our own
+    /// `ComputeSection::new` both do. The syndrome beats are still written. A fault reported only as
+    /// `locator=0x2` is therefore a fault whose address we HAD and discarded.
+    pub const fn app_qgi(self) -> Option<AppQgiSection> {
+        match (self.status(), self.locator_bytes()) {
+            (ResponseStatus::Error, LOCATOR_QGI_DIAG | LOCATOR_QGI_NO_DIAG) => {
+                Some(AppQgiSection {
+                    beats: self.app_beats,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -1049,6 +1094,214 @@ impl ResponseBlockWire {
     /// `ReturnSectionSBF::GetCancel` (bit 2).
     pub const fn cancelled(self) -> bool {
         BitField::<2, 2>::unpack(self.ret_word) != 0
+    }
+}
+
+/// `RBLocatorTypeEnum::QGI_DIAG` (`return_section_sbf.hpp:26-34`).
+pub const LOCATOR_QGI_DIAG: u8 = 0x3;
+/// `RBLocatorTypeEnum::QGI_NO_DIAG` (`return_section_sbf.hpp:26-34`) — the locator our compute faults
+/// report, because compute CBs are submitted with extended diagnostics off.
+pub const LOCATOR_QGI_NO_DIAG: u8 = 0x2;
+
+/// A flit is 128 B (`sys-arch-spec/sysdef.cpp:206 bytesPerStick`), which is the unit BOTH QGI and HMI
+/// report their addresses in. Corroborated by the field widths: `qgi_addr_` is 30 bits of flits =
+/// exactly the 128 GiB `DMVA_SIZE` (`control_block_stream.cpp:58`).
+pub const FLIT_BYTES: u64 = 128;
+
+/// ⭐ THE QGI/HMI SECTION OF A RESPONSE BLOCK — what turns `locator=0x2` from an opaque fault into a
+/// faulting DEVICE ADDRESS and a named cause.
+///
+/// Port of `SentientSoc::V1::AppQGISection` (`senlib/include/hal/1p0/app_data_sbf.hpp:309-431`). Four
+/// `u64` beats; every bit range below is the header's, and the header labels the beats itself. Two
+/// independent error classes share the section, each with its own validity flag:
+///
+/// * **HMI** — a memory-access error. Valid when [`Self::hmi_syndrome`] is non-zero.
+/// * **QGI** — an RCU error. Valid when [`Self::qgi_syndrome`] is non-zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppQgiSection {
+    beats: [u64; 4],
+}
+
+impl AppQgiSection {
+    /// `job_count_` (bits 15:0, beat 0).
+    pub const fn job_count(self) -> u64 {
+        BitField::<15, 0>::unpack(self.beats[0])
+    }
+
+    /// `logout_resp_` (bits 23:16, beat 0).
+    pub const fn logout_response(self) -> u64 {
+        BitField::<23, 16>::unpack(self.beats[0])
+    }
+
+    /// `beat0_byte8_` (bits 63:56, beat 0) — documented UNUSED, and both `isQGI()` and `isHMI()`
+    /// require it to be ZERO, so a non-zero value means this is not really a QGI/HMI section.
+    pub const fn beat0_byte8(self) -> u64 {
+        BitField::<63, 56>::unpack(self.beats[0])
+    }
+
+    /// `hmi_snid_` (bits 69:64 ⇒ beat 1, local 5:0).
+    pub const fn hmi_snid(self) -> u64 {
+        BitField::<5, 0>::unpack(self.beats[1])
+    }
+
+    /// `hmi_mode_` (bit 70 ⇒ beat 1, local 6). `false` = FETCH, `true` = STORE — the header's own
+    /// "0-fetch 1-store". Which side faulted is the first thing you want: a store fault past a
+    /// translation's `length` is a write running off the end of a region.
+    pub const fn hmi_is_store(self) -> bool {
+        BitField::<6, 6>::unpack(self.beats[1]) != 0
+    }
+
+    /// `hmi_addr_` (bits 101:71 ⇒ beat 1, local 37:7), in FLITS.
+    pub const fn hmi_address_flits(self) -> u64 {
+        BitField::<37, 7>::unpack(self.beats[1])
+    }
+
+    /// The HMI faulting address in BYTES — `hmi_address_flits × FLIT_BYTES`. This is the number to
+    /// compare against a segment's base and declared extent.
+    pub const fn hmi_address_bytes(self) -> u64 {
+        self.hmi_address_flits() * FLIT_BYTES
+    }
+
+    /// `hmi_synd_` (bits 111:104 ⇒ beat 1, local 47:40). Non-zero ⇒ the HMI fields are valid.
+    pub const fn hmi_syndrome(self) -> u64 {
+        BitField::<47, 40>::unpack(self.beats[1])
+    }
+
+    /// `hmi_tag_` (bits 119:112 ⇒ beat 1, local 55:48).
+    pub const fn hmi_tag(self) -> u64 {
+        BitField::<55, 48>::unpack(self.beats[1])
+    }
+
+    /// `qgi_addr_` (bits 157:128 ⇒ beat 2, local 29:0), in FLITS.
+    pub const fn qgi_address_flits(self) -> u64 {
+        BitField::<29, 0>::unpack(self.beats[2])
+    }
+
+    /// The QGI faulting address in BYTES.
+    pub const fn qgi_address_bytes(self) -> u64 {
+        self.qgi_address_flits() * FLIT_BYTES
+    }
+
+    /// `qgi_synd_` (bits 191:158 ⇒ beat 2, local 63:30) — `NUM_QGI_SYND_BITS = 34`. Non-zero ⇒ the QGI
+    /// fields are valid. A BITMASK, not an ordinal: bit `n` set means [`QgiErrorCase`] `n` fired.
+    pub const fn qgi_syndrome(self) -> u64 {
+        BitField::<63, 30>::unpack(self.beats[2])
+    }
+
+    /// `isHMI()` — a memory-access error is described here.
+    pub const fn is_hmi(self) -> bool {
+        self.hmi_syndrome() != 0 && self.beat0_byte8() == 0
+    }
+
+    /// `isQGI()` — an RCU error is described here.
+    pub const fn is_qgi(self) -> bool {
+        self.qgi_syndrome() != 0 && self.beat0_byte8() == 0
+    }
+
+    /// Every [`QgiErrorCase`] whose bit is set in [`Self::qgi_syndrome`], lowest bit first.
+    pub fn qgi_error_cases(self) -> impl Iterator<Item = QgiErrorCase> {
+        let synd = self.qgi_syndrome();
+        (0u32..QGI_SYNDROME_BITS)
+            .filter(move |b| synd & (1u64 << b) != 0)
+            .map(|b| QgiErrorCase::from_bit(b as u8))
+    }
+}
+
+/// `NUM_QGI_SYND_BITS` (`app_data_sbf.hpp:308`), and the width of `qgi_synd_` (191:158).
+pub const QGI_SYNDROME_BITS: u32 = 34;
+
+/// `AppQGISection::ErrorCaseTypes` (`app_data_sbf.hpp:336-372`), transcribed verbatim. These are BIT
+/// POSITIONS within [`AppQgiSection::qgi_syndrome`], not values — 34 cases for 34 syndrome bits.
+///
+/// ⭐ The two that name an address the hardware could not translate are [`Self::RiuUnmpErr`] (19) and
+/// [`Self::PrepUnmpErr`] (20) — i.e. an access outside the `paddr..paddr+length` a translation
+/// declared. Those are the ones to look for when a segment's declared extent is suspected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QgiErrorCase {
+    SocIoErr,
+    AbortHang,
+    LocalRing,
+    CoreSwFault,
+    CoreHwFault,
+    RiuSyncErr,
+    PrepTagCorr,
+    PrepCntCorr,
+    PrepHeadFlitCnt,
+    PrepJobFlitCnt,
+    PrepZeroFlitCnt,
+    PrepSwVer,
+    PrepDecision,
+    ExcNoJob,
+    HmiErrNoPrep,
+    SlhKillMiss,
+    HmiErrNoExec,
+    PrepDaCap,
+    RiuSlfrErr,
+    RiuUnmpErr,
+    PrepUnmpErr,
+    PrepRqfcCorr,
+    PrepAddrPerr,
+    PrepBufWrap,
+    PrepSttqErr,
+    PrepSttqCorr,
+    PrepLsmCorr,
+    PrepUsmCorr,
+    ExecEsmCorr,
+    RiuDataPerr,
+    HmiErrPerr,
+    SlhReqPerr,
+    PrepBuffPerr,
+    LogoBuffPerr,
+    /// A syndrome bit at or above [`QGI_SYNDROME_BITS`], or any position the header does not name —
+    /// kept explicit because this decodes bytes written by hardware.
+    Unknown(u8),
+}
+
+impl QgiErrorCase {
+    /// The case at syndrome bit `bit`.
+    pub const fn from_bit(bit: u8) -> Self {
+        match bit {
+            0 => Self::SocIoErr,
+            1 => Self::AbortHang,
+            2 => Self::LocalRing,
+            3 => Self::CoreSwFault,
+            4 => Self::CoreHwFault,
+            5 => Self::RiuSyncErr,
+            6 => Self::PrepTagCorr,
+            7 => Self::PrepCntCorr,
+            8 => Self::PrepHeadFlitCnt,
+            9 => Self::PrepJobFlitCnt,
+            10 => Self::PrepZeroFlitCnt,
+            11 => Self::PrepSwVer,
+            12 => Self::PrepDecision,
+            13 => Self::ExcNoJob,
+            14 => Self::HmiErrNoPrep,
+            15 => Self::SlhKillMiss,
+            16 => Self::HmiErrNoExec,
+            17 => Self::PrepDaCap,
+            18 => Self::RiuSlfrErr,
+            19 => Self::RiuUnmpErr,
+            20 => Self::PrepUnmpErr,
+            21 => Self::PrepRqfcCorr,
+            22 => Self::PrepAddrPerr,
+            23 => Self::PrepBufWrap,
+            24 => Self::PrepSttqErr,
+            25 => Self::PrepSttqCorr,
+            26 => Self::PrepLsmCorr,
+            27 => Self::PrepUsmCorr,
+            28 => Self::ExecEsmCorr,
+            29 => Self::RiuDataPerr,
+            30 => Self::HmiErrPerr,
+            31 => Self::SlhReqPerr,
+            32 => Self::PrepBuffPerr,
+            33 => Self::LogoBuffPerr,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// True for the two cases that mean "the hardware could not translate this address".
+    pub const fn is_unmapped_address(self) -> bool {
+        matches!(self, Self::RiuUnmpErr | Self::PrepUnmpErr)
     }
 }
 
@@ -1381,5 +1634,173 @@ mod tests {
         let rb = ResponseBlockWire::from_bytes(&bytes);
         assert_eq!(rb.status(), ResponseStatus::Error);
         assert!(rb.cancelled());
+    }
+
+    // ── the QGI/HMI app section (bytes 32..64) ────────────────────────────────────────────────────
+
+    /// Build a 64-byte RB with `status`/`locator` in the return section and one QGI app-section field
+    /// set, addressed by the header's ABSOLUTE bit number (`app_data_sbf.hpp:313-322`).
+    ///
+    /// ⛔ THIS IS THE POINT OF THE HELPER: it places bits by `bit / 64` and `bit % 64` over the whole
+    /// 256-bit section, which is the vendor's own numbering, and NEVER reuses the per-beat local
+    /// ranges the accessors are written in. So these tests exercise the beat-splitting arithmetic
+    /// instead of restating it — a test that re-derived the local ranges would be a tautology and
+    /// would pass even if every accessor read the wrong beat.
+    fn rb_with_qgi_bits(status: u64, locator: u8, fields: &[(u32, u32, u64)]) -> ResponseBlockWire {
+        let ret_word = (status << 5) | ((locator as u64) << 32);
+        let mut bytes = [0u8; RB_NUM_BYTES];
+        bytes[0..8].copy_from_slice(&ret_word.to_le_bytes());
+        let mut beats = [0u64; 4];
+        for &(hi, lo, value) in fields {
+            let width = hi - lo + 1;
+            assert!(hi / 64 == lo / 64, "test fields must not cross a beat");
+            let mask = if width == 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
+            beats[(lo / 64) as usize] |= (value & mask) << (lo % 64);
+        }
+        for (i, beat) in beats.iter().enumerate() {
+            bytes[APP_SECTION + i * 8..APP_SECTION + i * 8 + 8]
+                .copy_from_slice(&beat.to_le_bytes());
+        }
+        ResponseBlockWire::from_bytes(&bytes)
+    }
+
+    /// The section is `Some` ONLY under the vendor's stated validity condition — `RB_ERROR` plus a QGI
+    /// locator (`app_data_sbf.hpp:299-305`). A `Good` response, or an error from a non-QGI locator,
+    /// carries no QGI syndrome and must not be read as one.
+    #[test]
+    fn qgi_section_is_only_valid_for_an_error_with_a_qgi_locator() {
+        let synd = [(191, 158, 1u64 << 19)];
+        assert!(
+            rb_with_qgi_bits(0b11, LOCATOR_QGI_NO_DIAG, &synd)
+                .app_qgi()
+                .is_some(),
+            "RB_ERROR + QGI_NO_DIAG (the locator our compute faults report) must decode"
+        );
+        assert!(
+            rb_with_qgi_bits(0b11, LOCATOR_QGI_DIAG, &synd)
+                .app_qgi()
+                .is_some(),
+            "RB_ERROR + QGI_DIAG must decode"
+        );
+        assert!(
+            rb_with_qgi_bits(0b00, LOCATOR_QGI_NO_DIAG, &synd)
+                .app_qgi()
+                .is_none(),
+            "a GOOD response has no QGI section however the app bytes read"
+        );
+        assert!(
+            rb_with_qgi_bits(0b11, 0x1, &synd).app_qgi().is_none(),
+            "an error from CB_QUEUE is not a compute-section fault"
+        );
+    }
+
+    /// ⭐ THE FAULTING ADDRESS, which is the whole reason to decode this section: `hmi_addr_` is bits
+    /// 101:71 in FLITS, so it lands in beat 1 at local 37:7 and 128 B/flit converts it to the byte
+    /// address to compare against a translation's `paddr..paddr+length`. `hmi_mode_` (bit 70) says
+    /// which side faulted.
+    #[test]
+    fn qgi_section_decodes_the_hmi_faulting_address_and_direction() {
+        let addr_flits = 0x1234_5678u64;
+        let qgi = rb_with_qgi_bits(
+            0b11,
+            LOCATOR_QGI_NO_DIAG,
+            &[
+                (101, 71, addr_flits),
+                (70, 70, 1), // store
+                (111, 104, 0x42),
+                (119, 112, 0x7),
+                (69, 64, 0x2A),
+            ],
+        )
+        .app_qgi()
+        .expect("RB_ERROR + QGI_NO_DIAG");
+
+        assert_eq!(qgi.hmi_address_flits(), addr_flits);
+        assert_eq!(qgi.hmi_address_bytes(), addr_flits * 128);
+        assert!(
+            qgi.hmi_is_store(),
+            "hmi_mode_ = 1 is a STORE (header: 0-fetch 1-store)"
+        );
+        assert_eq!(qgi.hmi_syndrome(), 0x42);
+        assert_eq!(qgi.hmi_tag(), 0x7);
+        assert_eq!(qgi.hmi_snid(), 0x2A);
+        assert!(
+            qgi.is_hmi(),
+            "a non-zero HMI syndrome makes the HMI fields valid"
+        );
+        assert!(!qgi.is_qgi(), "no QGI syndrome was set");
+    }
+
+    /// `qgi_synd_` is a 34-bit BITMASK of `ErrorCaseTypes` BIT POSITIONS, not an ordinal — the
+    /// distinction that decides whether "19" means `riu_unmp_err` or bit 19. Both unmapped-address
+    /// cases are named, since those are the ones that mean an access fell outside a translation's
+    /// declared extent.
+    #[test]
+    fn qgi_syndrome_is_a_bitmask_of_named_error_cases() {
+        let qgi = rb_with_qgi_bits(
+            0b11,
+            LOCATOR_QGI_NO_DIAG,
+            &[
+                (191, 158, (1u64 << 19) | (1u64 << 20) | (1u64 << 4)),
+                (157, 128, 0x2_0000),
+            ],
+        )
+        .app_qgi()
+        .expect("RB_ERROR + QGI_NO_DIAG");
+
+        let cases: Vec<_> = qgi.qgi_error_cases().collect();
+        assert_eq!(
+            cases,
+            vec![
+                QgiErrorCase::CoreHwFault, // 4
+                QgiErrorCase::RiuUnmpErr,  // 19
+                QgiErrorCase::PrepUnmpErr, // 20
+            ],
+            "lowest syndrome bit first, decoded by POSITION"
+        );
+        assert!(cases.iter().filter(|c| c.is_unmapped_address()).count() == 2);
+        assert!(qgi.is_qgi());
+        assert_eq!(qgi.qgi_address_bytes(), 0x2_0000 * 128);
+    }
+
+    /// Both validity predicates ALSO require `beat0_byte8_` (bits 63:56) to be zero — the header's
+    /// `isQGI()`/`isHMI()` check the documented-unused byte, so a non-zero value means the section is
+    /// not really a QGI/HMI record and its addresses must not be trusted.
+    #[test]
+    fn a_nonzero_unused_beat0_byte_invalidates_both_predicates() {
+        let qgi = rb_with_qgi_bits(
+            0b11,
+            LOCATOR_QGI_NO_DIAG,
+            &[
+                (191, 158, 1u64 << 19),
+                (111, 104, 0x42),
+                (63, 56, 0x1), // documented unused -> must invalidate
+            ],
+        )
+        .app_qgi()
+        .expect("the section still decodes; it is the PREDICATES that must refuse");
+        assert_eq!(qgi.beat0_byte8(), 0x1);
+        assert!(!qgi.is_qgi(), "isQGI() requires beat0_byte8_ == 0");
+        assert!(!qgi.is_hmi(), "isHMI() requires beat0_byte8_ == 0");
+    }
+
+    /// The beats are read from `APP_SECTION` (32), not from the start of the block — an off-by-one
+    /// beat would still pass a test that only ever set fields in one beat.
+    #[test]
+    fn app_section_starts_at_byte_32() {
+        assert_eq!(APP_SECTION, 32);
+        assert_eq!(RB_NUM_BYTES - APP_SECTION, 4 * 8, "four 64-bit beats");
+        // job_count_ is bits 15:0 => beat 0 => the FIRST two bytes of the app section.
+        let mut bytes = [0u8; RB_NUM_BYTES];
+        let ret_word = (0b11u64 << 5) | ((LOCATOR_QGI_NO_DIAG as u64) << 32);
+        bytes[0..8].copy_from_slice(&ret_word.to_le_bytes());
+        bytes[APP_SECTION] = 0xCD;
+        bytes[APP_SECTION + 1] = 0xAB;
+        let qgi = ResponseBlockWire::from_bytes(&bytes).app_qgi().unwrap();
+        assert_eq!(qgi.job_count(), 0xABCD);
     }
 }
