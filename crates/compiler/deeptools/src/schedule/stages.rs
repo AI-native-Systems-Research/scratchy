@@ -234,6 +234,143 @@ pub const fn ddc_defaults() -> v1::Dsc2Options {
     }
 }
 
+/// ⭐⭐ WHAT THE TWO STAGES LEFT — the SCHEDULED super-DSC and the tree its growers minted, BOTH,
+/// owned, because they are two halves of one artifact and either alone is useless.
+///
+/// ⛔⛔ THE SCHEDULE TREE IS NOT IN `SuperDsc::scheduleTree_` — IT IS IN [`DscState`]. That is the
+/// whole reason this type exists rather than the stages answering a `SuperDsc`. The port severed the
+/// reference's single `this` into a shared `L3RunInputs::reads` and an exclusive `L3RunSurgery::env`
+/// (`l3/dl_ops.rs:20556-20560`), and [`DscState`] is the cell both name; every node stages 2a and 2b
+/// mint lands there and NOWHERE on the super-DSC. A caller handed only the [`l3::dsc::SuperDsc`]
+/// back would hold the input it started with — which is exactly the defect this type closes: a
+/// composition that ran the stages over a THROWAWAY copy and lowered the unscheduled original.
+///
+/// ⭐ AND THE SUPER-DSC IS STILL CARRIED, because it is not redundant: `computeOp_`,
+/// `numCoreletsUsed_`, `labeledDs_` and `dataStageParam_` are read off it and are not on the tree.
+#[derive(Debug)]
+pub struct Scheduling {
+    sdsc: l3::dsc::SuperDsc,
+    state: DscState,
+    ran: StagesRan,
+    filled: Option<v1::DscFilled>,
+    ddc_refusal: Option<&'static str>,
+    said: Vec<String>,
+}
+
+impl Scheduling {
+    /// The super-DSC the stages ran over — `computeOp_`, `numCoreletsUsed_` and `labeledDs_` are read
+    /// off this, and stage 2b's `select_and_parse_ddl_template` wrote through it.
+    #[must_use]
+    pub const fn sdsc(&self) -> &l3::dsc::SuperDsc {
+        &self.sdsc
+    }
+
+    /// ⭐ THE SCHEDULE TREE — every node stages 2a and 2b minted, which is what a lowering walks.
+    #[must_use]
+    pub const fn state(&self) -> &DscState {
+        &self.state
+    }
+
+    /// Which stages completed, and the node census either side of them.
+    #[must_use]
+    pub const fn ran(&self) -> StagesRan {
+        self.ran
+    }
+
+    /// Stage 2b's own `bool`, [`None`] where the stage was NOT REACHED (stage 2a did not complete) or
+    /// stopped inside — the two are told apart by [`StagesRan::l3`].
+    #[must_use]
+    pub const fn filled(&self) -> Option<v1::DscFilled> {
+        self.filled
+    }
+
+    /// The FIRST stage-2b provider method that refused — a CARRIER gap as opposed to a ported unit's
+    /// own stop, and a DIFFERENT reading from [`StagesRan::first_refusal`], which is stage 2a's.
+    #[must_use]
+    pub const fn ddc_refusal(&self) -> Option<&'static str> {
+        self.ddc_refusal
+    }
+
+    /// Every line stage 2b returned instead of printing — [`v1::Dsc2Fill::said`].
+    #[must_use]
+    pub fn said(&self) -> &[String] {
+        &self.said
+    }
+}
+
+/// ⭐⭐⭐ STAGE 2A **THEN** STAGE 2B, OVER ONE SUPER-DSC AND ONE TREE — the composition
+/// `SchedulerStages.cpp:29-57` is, and the thing nothing in this workspace had: [`run_ddc`] had ZERO
+/// callers, so the stage that PLACES ADDRESSES never ran.
+///
+/// ⛔⛔ ONE STATE, NOT TWO. [`Dsc2State::seeded`]'s own doc prescribes it — *"composing the two
+/// stages means handing [`Dsc2State::seeded`] the SAME [`DscState`] [`run_l3`] grew"* — and the
+/// alternative is the defect this whole function exists to close: a second [`DscState`] would give
+/// stage 2b a SEED tree, so every node stage 2a minted would be invisible to it and every node stage
+/// 2b minted would be invisible to the caller. It compiles either way; only one of them schedules.
+///
+/// ⛔ THE BORROWS PERMIT IT AND THAT IS NOT AN ACCIDENT. [`Dsc2State`] holds OWNED clones of the
+/// DSCs and copies `numWkSlicesPerDim_`/`coreIdToWkSlice_` in, borrowing only `&'l DscState` — so the
+/// `&SuperDsc` [`Dsc2State::seeded`] reads ends at that call and [`run_ddc`] can still take `&mut`.
+///
+/// ⛔⛔ STAGE 2B RUNS ONLY IF STAGE 2A COMPLETED, and that gate is a correctness property rather
+/// than caution. [`run_l3`]'s [`None`] is a ported unit's refusal part-way through the placement
+/// loop — the LX allocations are MINTED but not PLACED — and stage 2b's whole job is to compute
+/// offsets from those placements. Running it over an abandoned tree would compute addresses from
+/// half a placement, which is the fabricated address this crate ranks worse than a stop.
+///
+/// ⛔ `AddressFoldCoords::flat()` IS NOT A CHOICE MADE HERE: it is *"the ONE coordinate a super-DSC
+/// declaring no folds of its own has"*, which is literally true of a corpus declaring one `time`
+/// axis of factor 1 — but the fold DEPTH is not stated anywhere read, and a wrong fold coordinate is
+/// a wrong ADDRESS. A caller holding the SDSC's own `sdscFoldProps_` builds them with
+/// [`l3::dl_ops::AddressFoldCoords::of`] and calls [`run_l3`]/[`run_ddc`] itself.
+///
+/// ⛔ `ops` AND `names` ARE POSITIONAL BESIDE `sdsc.dscs()`, and `dsc_ops` MUST NOT BE EMPTY for a
+/// DSC that has computes: [`v1::PrepDsc::compute_ops`] is the FIRST provider call `run_v1` makes
+/// (`ddc/v1.rs:6437`) and an empty answer makes it `continue` past the DSC — [`v1::DscFilled::Yes`]
+/// having done nothing at all, which is a false green and not a schedule.
+#[must_use]
+pub fn run_stages_2a_2b<A: crate::arch::Arch>(
+    mut sdsc: l3::dsc::SuperDsc,
+    ops: v1::OpFuncs,
+    dsc_ops: &[Vec<v1::DscComputeOp>],
+    names: &[v1::StorageName],
+) -> Scheduling {
+    let state = DscState::seeded(&sdsc);
+    let nodes_before = state.node_count();
+    let coords = l3::dl_ops::AddressFoldCoords::flat();
+
+    let l3 = run_l3::<false, A>(&mut sdsc, &state, ops, &coords).is_some();
+
+    // ⭐ THE SAME `state`, HANDED ON. This is the line the composition is.
+    let (fill, ddc_refusal) = if l3 {
+        let dsc2 = Dsc2State::seeded(&sdsc, &state, dsc_ops, names);
+        let fill = run_ddc::<A>(&mut sdsc, &dsc2, ddc_defaults(), &coords);
+        (fill, dsc2.first_refusal())
+    } else {
+        (None, None)
+    };
+
+    let (filled, said) = match fill {
+        Some(v1::Dsc2Fill { filled, said, .. }) => (Some(filled), said),
+        None => (None, Vec::new()),
+    };
+    Scheduling {
+        ran: StagesRan {
+            l3,
+            ddc: filled.is_some(),
+            nodes_before,
+            // ⭐ READ AFTER BOTH STAGES, so the growth this reports is 2a's AND 2b's.
+            nodes_after: state.node_count(),
+            first_refusal: state.first_refusal(),
+        },
+        sdsc,
+        state,
+        filled,
+        ddc_refusal,
+        said,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // ⭐⭐ THE ANSWER KEY IS THE REFERENCE PIPELINE'S OWN OUTPUT ON SCRATCHY'S OWN STAGED BUNDLE:
@@ -741,23 +878,27 @@ mod tests {
             "the DDL step's own refusal, propagated — not a carrier `todo!`: {ran:?}"
         );
 
-        // ⭐⭐ AND *WHICH* REFUSAL, EXACTLY ONE, NAMED. `select_and_parse_ddl_template` asked
-        // [`DdcTemplates::stated`] — which it reaches only AFTER `ddl_templates(opFunc, A::GEN)`
-        // answered [`Some`] (`ddl/conversion.rs:6011`), so this is the template set being ASKED and
-        // not an early exit. ⛔ IT IS A `build.rs` GAP AND NOT A CARRIER'S: four of a
-        // `StatedTemplate`'s six parts are never emitted.
-        assert_eq!(
-            state.refusals().len(),
-            1,
-            "one refusal, so nothing else along the way could not answer: {:?}",
-            state.refusals()
-        );
+        // ⭐⭐ AND *WHICH* REFUSAL — AND IT IS NO LONGER A CARRIER'S AT ALL. This asserted ONE refusal,
+        // `DdlTemplateSet::stated:`, because `build.rs` emitted one of a `StatedTemplate`'s six parts.
+        // All six now come out of the `.ddl` (`crate::generated::MODULES`,
+        // `schedule/ddl/templates.rs`), so the template set answers and the DDL step walks ON:
+        //
+        // * `templates.stated(BroadcastOps)` answers — 32 of 32 templates are stated;
+        // * `parse_ddl` + `module()` answer — all 32 sources survive their five verifiers
+        //   ([`crate::schedule::ddl::templates`]'s own test);
+        // * `match_ddl2_dsc` answers **`Some(true)`** — `%mul_op` binds `ComputeOpIdx(0)`, all three
+        //   tensors match, and every one of the nine layouts narrows its dims;
+        // * `verify_ddl_constraint` is where it now stops, on `StickSizesAgree { slice: true }`.
+        //
+        // ⛔ ZERO CARRIER REFUSALS IS THE ASSERTION, because it is the falsifiable half: a provider
+        // method that could not answer would record one, and none did. The remaining stop is a ported
+        // unit's own `DT_ERROR` on this fixture's DSC — `stick_extents` over two operands whose slice
+        // extents do not agree — which is a fact about the DSC, not about a missing table.
         assert!(
-            state
-                .first_refusal()
-                .is_some_and(|what| what.starts_with("DdlTemplateSet::stated:")),
-            "the stop is the template set, not a store: {:?}",
-            state.first_refusal()
+            state.refusals().is_empty(),
+            "no carrier refused — the stop is inside the ported DDL step, not at a provider seam: \
+             {:?}",
+            state.refusals()
         );
 
         // ⛔⛔ AND THE TREE DID NOT MOVE. The DDL step is where stage 2b MINTS its computes and
@@ -1042,6 +1183,103 @@ mod tests {
                 "transfer_lds2_src:lx_dst:hbm",
             ],
             "the tree stage 2a left"
+        );
+    }
+
+    /// ⭐⭐⭐ THE COMPOSITION HANDS THE CALLER **THE TREE ITS STAGES GREW** — and that is the whole
+    /// defect this function closes.
+    ///
+    /// ⛔⛔ THE FAILURE MODE IT GUARDS. A caller that ran the stages and returned only a statistics
+    /// object — which is exactly what `spyre`'s `census` did — left the scheduled tree to drop at the
+    /// end of the loop, so the DSC the lowering then walked was the UNSCHEDULED input: 134 bundles, 0
+    /// launch groups, 0.0 MB of device code, from a scheduler that had run 24,363 times. The same
+    /// shape of bug is a composition that seeds a SECOND [`DscState`] for stage 2b, which compiles and
+    /// makes every node stage 2a minted invisible to it.
+    ///
+    /// ⛔ SO THIS ASSERTS THE NODE **NAMES**, NOT JUST A COUNT, and reads them off the state the
+    /// caller was HANDED. `nodes_after == state().node_count()` alone would be a tautology — both
+    /// readings come from the same call — whereas a state that had been re-seeded or swapped holds
+    /// `root_level_operations` and three HBM allocates and NONE of the names below. Every one is the
+    /// reference's own, from `g0/debug/sdsc_0/sdsc.json`.
+    ///
+    /// ⛔ AND IT ASSERTS THE GATE AS A CONSEQUENCE OF STAGE 2A, NOT AS STAGE 2B'S OWN ANSWER: stage 2b
+    /// is not reached while [`StagesRan::l3`] is false, so [`Scheduling::filled`] is [`None`] rather
+    /// than [`v1::DscFilled::Yes`] — the difference between *not reached* and *ran and did nothing*,
+    /// which is the false green [`a_dsc_with_no_compute_op_is_skipped_and_the_tree_is_untouched`] pins.
+    #[test]
+    fn the_composition_hands_back_the_tree_it_grew_and_gates_stage_2b_on_stage_2a() {
+        let scheduled = run_stages_2a_2b::<Dd2>(
+            a_rmsq_super_dsc(),
+            an_op_func(),
+            &[the_rmsq_compute_ops()],
+            &[v1::StorageName("rmsq_o728".to_owned())],
+        );
+        let ran = scheduled.ran();
+        assert_eq!(
+            ran.nodes_before, 4,
+            "the seed: `root_level_operations` plus one HBM allocate per HBM-pinned tensor"
+        );
+        assert!(
+            ran.nodes_after > ran.nodes_before,
+            "the stages MINTED nodes — {} -> {}",
+            ran.nodes_before,
+            ran.nodes_after
+        );
+
+        // ⭐⭐ THE NAMES, OFF THE STATE THE CALLER HOLDS — a re-seeded or throwaway state fails here.
+        let names: Vec<String> = scheduled.state().dscs()[0]
+            .names()
+            .into_iter()
+            .map(|name| name.0)
+            .collect();
+        for minted in [
+            "loop_ds0_ds1_y",
+            "loop_ds0_ds1_out",
+            "loop_ds0_ds1_mb",
+            "allocate_lds0_lx",
+            "transfer_lds0_src:hbm_dst:lx",
+            "lx_below_schedule",
+        ] {
+            assert!(
+                names.iter().any(|name| name == minted),
+                "`{minted}` is a node stage 2a's growers minted and the reference's own output \
+                 carries — the state handed back must be the one they grew, not a seed: {names:?}"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            ran.nodes_after,
+            "and every node of that tree is accounted for by the count reported beside it"
+        );
+
+        // ⭐ THE SUPER-DSC IS CARRIED TOO, because `computeOp_`, `numCoreletsUsed_` and `labeledDs_`
+        // are read off it and are not on the tree.
+        assert_eq!(
+            scheduled.sdsc().dscs().iter().count(),
+            1,
+            "`rmsq_o728`'s one DSC"
+        );
+
+        // ⛔ STAGE 2A DOES NOT COMPLETE — entry 222's unwritten `AllocArena` — SO STAGE 2B IS NOT
+        // REACHED, and the two readings say which of the two it is.
+        assert!(
+            !ran.l3,
+            "stage 2a stops at `try_alloc_l3`'s `allocs.get(&alloc)?` (`l3/dl_ops.rs:9261`)"
+        );
+        assert_eq!(
+            (ran.ddc, scheduled.filled()),
+            (false, None),
+            "so stage 2b was NOT REACHED — `None` here, never `Some(DscFilled::Yes)`, which would be \
+             a stage that ran and skipped every DSC"
+        );
+        assert_eq!(
+            (scheduled.ddc_refusal(), scheduled.said()),
+            (None, &[] as &[String]),
+            "and no stage-2b carrier was asked anything at all"
+        );
+        assert_eq!(
+            ran.first_refusal, None,
+            "the stage-2a stop is a ported unit's own `None`, not a carrier's refusal"
         );
     }
 
