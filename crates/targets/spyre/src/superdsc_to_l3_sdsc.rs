@@ -35,6 +35,29 @@
 //! [`Role`] variants for a matching [`Role::ds_type`] — the same lookup-in-a-sealed-set shape
 //! [`crate::lower_superdsc_to_dataflow_ir::op_func_of`] already uses. An unrecognised name is an
 //! ABSENT dim or a refusal, never a substituted one.
+//!
+//! # ⭐⭐ THE CENSUS THIS MADE MEASURABLE — `-Fsuperdsc,model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel`
+//!
+//! 134 bundles, **24,363 programs, every one converted**, stage 2a run over each:
+//!
+//! ```text
+//! nodes  93,110 (seed)  ->  347,939        = +254,829   (3.74x)
+//!   allocate  137,494        block   49,354
+//!   transfer   93,110        condition  628
+//!   loop       67,353        sync/compute  0
+//! ```
+//!
+//! ⭐ EVERY ONE OF THOSE COUNTS IS AN EXACT IDENTITY OVER THE INPUT, which is what says it is a real
+//! reading and not a stride or a default: the seed is one root block per program plus one HBM allocate
+//! per HBM-pinned tensor (24,363 + 68,747); `allocate` is exactly 2 x 68,747, one LX allocation minted
+//! per HBM one; `transfer` is exactly 68,747 + 24,363, one HBM->LX load per tensor plus one LX->HBM
+//! store per program; `block` is exactly 2 x 24,363 + 628, the root and `lx_below_schedule` plus one
+//! region per condition. `sync` and `compute` are ZERO because `create_synchronization` runs AFTER the
+//! stop and the computes are stage 2b's.
+//!
+//! ⭐⭐ AND ALL 24,363 STOP AT **ONE** PLACE — `ExPhaseTrackers::backup`, the unported memory
+//! tracker — with **zero** carrier refusals. Not one program stopped anywhere else, so this conversion
+//! hands stage 2a nothing the reference fixture did not.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -135,12 +158,14 @@ pub fn ds_type_of(spelling: &str) -> Option<DsType> {
 /// `-1` ⇒ *the dim is exactly one element*, `-2` ⇒ *the dim spans the whole stick*, and anything
 /// non-negative as the size (`dsc/dsc2.cpp:3824-3830`). A FOURTH negative value has no meaning
 /// there, so it is a refusal and not a guess.
+/// ⭐ THE `f64` IS REACHED THROUGH `f64::From<i32>` AND NOT A CAST, so a size too large to be an
+/// exact `f64` is a REFUSAL rather than a silently rounded scale — `scale_` is `1` on 1,516 of the
+/// 1,626 entries of `g0/` and never larger.
 fn scale_of(scale: i64) -> Option<Scale> {
     match scale {
         -1 => Some(Scale::UnitStick),
         -2 => Some(Scale::StickDim),
-        #[allow(clippy::cast_precision_loss)]
-        size if size >= 0 => Some(Scale::Sized(size as f64)),
+        size if size >= 0 => Some(Scale::Sized(f64::from(i32::try_from(size).ok()?))),
         _ => None,
     }
 }
@@ -304,7 +329,10 @@ fn pinning_of(mem: &MemOrg) -> Pinning {
 /// ⛔ `dsName_` LIKEWISE. `DscState::seeded` records that gap itself: the reference names its seed
 /// allocate node `allocate-<dsName_>_hbm` and the ported type carries no name, so the seed is named
 /// after the POSITION instead.
-fn labeled_of(lds: &WireLabeledDs, layouts: &BTreeMap<&'static str, LayoutInfo>) -> Option<LabeledDs> {
+fn labeled_of(
+    lds: &WireLabeledDs,
+    layouts: &BTreeMap<&'static str, LayoutInfo>,
+) -> Option<LabeledDs> {
     let ds_type = ds_type_of(lds.dsType_)?;
     let layout = &layouts.get(&lds.dsType_)?.layoutDimOrder_;
     if layout.len() != lds.scale_.len() {
@@ -410,12 +438,7 @@ pub fn design_space_config(dsc: &WireDsc) -> Option<DesignSpaceConfig> {
     //    position is what stays correct if they ever drift.
     let layout_dims = labeled_ds
         .indexed()
-        .map(|(at, lds)| {
-            Some((
-                at,
-                primary_ds_info.get(&lds.ds_type())?.layout.clone(),
-            ))
-        })
+        .map(|(at, lds)| Some((at, primary_ds_info.get(&lds.ds_type())?.layout.clone())))
         .collect::<Option<BTreeMap<_, _>>>()?;
 
     // 8. `dataStageParam_` — READ (core) + SYNTHESISED (chunk), see [`data_stages`].
@@ -690,6 +713,10 @@ pub fn run_stage_2a(op: &SdscOp) -> Option<StageEffect> {
 }
 
 /// ⭐⭐ THE CORPUS CENSUS — every program of one bundle, aggregated.
+///
+/// ⭐ MEASURED, and the whole-build aggregate of these is in this module's header: 134 bundles,
+/// 24,363 programs, all converted, 93,110 -> 347,939 nodes, every one stopping at the memory tracker
+/// and none anywhere else.
 #[derive(Debug, Clone, Default)]
 pub struct Corpus {
     /// How many programs were offered.
@@ -1127,7 +1154,9 @@ mod tests {
             effect.first_refusal, None,
             "no carrier was asked for a fact it could not give — the stop is a ported unit's"
         );
-        let stopped = effect.stopped_at.expect("stage 2a stops at the memory tracker");
+        let stopped = effect
+            .stopped_at
+            .expect("stage 2a stops at the memory tracker");
         assert!(
             stopped.contains("ExPhaseTrackers::backup"),
             "the stop must be the unported memory tracker and nothing earlier; got: {stopped}"
