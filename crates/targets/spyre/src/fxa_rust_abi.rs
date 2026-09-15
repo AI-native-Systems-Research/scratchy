@@ -178,14 +178,65 @@ pub fn device_memory_bytes() -> Option<CardMemory> {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct CardMemory(u64);
 
+// ⛔ THE EMITTER'S CEILING AND THE ALLOCATOR'S ARE ONE NUMBER. `scratchy_spyre_bundle` is a leaf
+// (it may depend on neither end of the pipeline), so it states `MAX_SEGMENT_BYTES` itself; this is
+// the only crate that sees both, and it refuses to compile if they ever diverge — the build-time
+// segment guard would otherwise silently stop matching what the card can serve.
+const _: () =
+    assert!(crate::bundle_code::MAX_SEGMENT_BYTES == flex_rs::allocator::MAX_REGION_BYTES);
+
 impl CardMemory {
-    /// The capacity in bytes, spent into the shared KV-budget formula
-    /// (`gpu_budget::compute_available_kv_bytes`).
+    /// The card's TOTAL capacity in bytes — the number to REPORT, not the number to size an
+    /// allocation from. See [`Self::tensor_capacity`] / [`Self::max_single_allocation`], which are
+    /// the two quantities an allocation actually has to fit.
     ///
-    /// Deliberately the ONLY accessor and deliberately not `From<u64>`/`new`: the value leaves this
-    /// type freely, but nothing outside `device_memory_bytes` can put one IN.
+    /// Deliberately not `From<u64>`/`new`: the value leaves this type freely, but nothing outside
+    /// `device_memory_bytes` can put one IN.
     pub const fn bytes(self) -> u64 {
         self.0
+    }
+
+    /// ⛔⛔⛔ THE BYTES A TENSOR ALLOCATION CAN ACTUALLY BE SERVED FROM — **not** the card.
+    ///
+    /// `FlexAllocator::pre_allocate_regions` carves the card into
+    /// [`flex_rs::allocator::DEFAULT_MAX_REGIONS`] equal regions and reserves the first
+    /// [`flex_rs::allocator::DEFAULT_NUM_PROGRAM_REGIONS`] of them for PROGRAM memory. A tensor
+    /// allocation may only be served from the rest, so a budget derived from the whole card
+    /// over-states what exists by one region's worth.
+    ///
+    /// 🛑 MEASURED, and it is the same class of bug [`CardMemory`] was created to stop — provenance
+    /// was guarded, MEANING was not. `bytes()` (114,688 MB on dd2) was spent where this belonged, so
+    /// the paged KV budget printed `86491 MB` while the allocator's own OOM diagnostic for the very
+    /// next allocation reported `total_capacity_bytes=103079215104` — 96 GiB, i.e. 6 of 7 regions.
+    /// The pool that budget sizes is one allocation on that same 96 GiB, so the missing 16 GiB was
+    /// never the KV cache's to spend.
+    pub const fn tensor_capacity(self) -> u64 {
+        let regions = flex_rs::allocator::DEFAULT_MAX_REGIONS as u64;
+        let program = flex_rs::allocator::DEFAULT_NUM_PROGRAM_REGIONS as u64;
+        self.region_bytes() * (regions - program)
+    }
+
+    /// ⛔ THE LARGEST **SINGLE** ALLOCATION THIS CARD CAN SERVE = one region.
+    ///
+    /// A `FlexAllocator` allocation is satisfied from ONE pre-allocated region
+    /// (`allocate_in_region`): the free space of several regions never combines. So an allocation
+    /// larger than a region fails with plenty free — the exact fault shape that reads as a
+    /// self-contradictory OOM (`requested_bytes=17365082112, free_space_bytes=103048964224`), and
+    /// the reason the granite-3.1-8b fp16 weight segment (16.17 GiB) cannot load on a card whose
+    /// regions are 16 GiB.
+    pub const fn max_single_allocation(self) -> u64 {
+        self.region_bytes()
+    }
+
+    /// One region's size, exactly as `pre_allocate_regions` computes it: an equal share of the card,
+    /// capped at the hardware ceiling.
+    const fn region_bytes(self) -> u64 {
+        let per = self.0 / flex_rs::allocator::DEFAULT_MAX_REGIONS as u64;
+        if per < flex_rs::allocator::MAX_REGION_BYTES {
+            per
+        } else {
+            flex_rs::allocator::MAX_REGION_BYTES
+        }
     }
 }
 

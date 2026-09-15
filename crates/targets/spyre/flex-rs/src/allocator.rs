@@ -31,7 +31,12 @@ pub const DEVICE_ALIGNMENT: u64 = 128;
 /// Hardware ceiling on a single region's size (16 GiB). Port of
 /// `flex::MAX_REGION_SIZE` (`allocation_constants.hpp`), enforced by
 /// `preAllocateRegions`.
-const MAX_REGION_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+///
+/// `pub` because it is also the ceiling on a single ALLOCATION — `allocate_in_region` serves a
+/// request from ONE region and never spans two — so every caller that sizes a device-resident
+/// allocation (a bundle segment, the paged KV pool) has to know it. See
+/// `scratchy_target_spyre::fxa_rust_abi::CardMemory::max_single_allocation`.
+pub const MAX_REGION_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Port of `flex::DEFAULT_1P0_MAX_REGIONS` (`allocation_constants.hpp`).
 pub const DEFAULT_MAX_REGIONS: usize = 7;

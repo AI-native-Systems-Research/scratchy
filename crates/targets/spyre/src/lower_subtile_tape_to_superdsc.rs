@@ -1528,6 +1528,20 @@ pub const SEGMENT_OFFSETS: [u64; 7] = [
 /// 16 GiB segment stride (torch-spyre `constants.py:55` `SEGMENT_SIZE`).
 pub const SEGMENT_SIZE: u64 = 0x4_0000_0000;
 
+// ⛔⛔⛔ AND IT IS THE SAME 16 GiB THE ALLOCATOR CAPS A REGION AT — for two INDEPENDENT reasons, which
+// is why an over-size segment is worse than a failed allocation.
+//
+//   * flex serves a segment's allocation from ONE region, capped at `MAX_REGION_BYTES` ⇒ it fails.
+//   * this ADDRESSING scheme puts segment `s` at `s · SEGMENT_SIZE` and `hbm_seg_off` recovers
+//     `(s, intra)` by dividing — which is exact ONLY while `intra < SEGMENT_SIZE`. A placement past
+//     that decomposes into the NEXT segment: granite-3.1-8b-fp16's tied embedding starts at
+//     16,945,651,712 in seg1, so `SEGMENT_OFFSETS[1] + off` lands beyond `SEGMENT_OFFSETS[2]` and the
+//     lm_head weight would have been addressed inside the KV segment. Not a fault — wrong logits.
+//
+// So the `audit_layout_addresses` ceiling check is an ADDRESSING guard as much as an allocation one,
+// and this assert is what keeps the number it uses tied to this scheme.
+const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
+
 /// Decompose an HBM byte address into its `(segment_index, intra_segment_offset)`.
 /// Every HBM address our emitter produces is `SEGMENT_OFFSETS[seg] + intra` with
 /// `intra < SEGMENT_SIZE` (each dataspace lives in its own 16 GiB segment), so the
@@ -1950,6 +1964,59 @@ pub enum SegRole {
     Logits = 4,
 }
 
+// ⛔⛔⛔ THERE IS NO FREE SEGMENT FOR A SECOND WEIGHT SEGMENT, so an over-size weight segment
+// (see [`bundle::MAX_SEGMENT_BYTES`]) has to SHARE one. All 7 of `SEGMENT_OFFSETS`'s non-aliasing
+// slots are allocated: 0 intermediates, 1 weights, 2 KV, 3 activations/mask, 4 logits, and
+// **5 + 6 are intermediate COLORS** (`inter_segs` in `compute_bundle_layout` — dxp's ModuleStitcher
+// wires producer→consumer BY SEGMENT, so simultaneously-live intermediates must not share one;
+// cramming them together was the "multi-op all-seg3 orphans" bug). Trying `WeightOverflow = 5`
+// TOOK one of those colors, and a per-layer intermediate colored into seg5 then tripped `reroll`'s
+// per-layer-stride guard. A color is not available to take: MEASURED on granite-3.1-8b-fp16, all
+// three are occupied (seg0 13,495,424 B / seg5 2,850,816 B / seg6 1,826,816 B), so dropping to two
+// pushes live intermediates into the offset-packed `None` arm that the stitcher cannot tell apart.
+//
+// ⭐ BUT A COLOR SEGMENT IS 16 GiB AND HOLDS 1.8 MB OF IT. Sharing needs no color, so the ceiling
+// moves without touching the coloring at all — see [`WEIGHT_SPILL_SEGS`].
+
+/// ⭐ THE SLOTS AN OVER-SIZE WEIGHT SEGMENT MAY SPILL ITS **NON-PER-LAYER** TAIL INTO, and the
+/// reason this table has exactly one row.
+///
+/// A spill slot has to survive four independent per-step mechanisms, and each one eliminates a
+/// candidate outright. All four were read off the code, not assumed:
+///
+/// | slot | per-step H2D | per-step D2H | fold-shifted | also in the SUFFIX program |
+/// |------|--------------|--------------|--------------|----------------------------|
+/// | 0 intermediates | no | no | **yes** (`off[SEG_INTERMEDIATE] += delta.intermediate`) | the residual + the lm_head's activation input |
+/// | 3 activations   | covering runs | no | **yes** (`off[SEG_MASK] += delta.mask`) | — |
+/// | 4 logits        | no | **THE WHOLE SEGMENT** | no | the logits |
+/// | 5 color 2       | no | no | no | **the lm_head's OUTPUT** |
+/// | **6 color 3**   | **no** | **no** | **no** | **nothing** |
+///
+/// 🛑 seg4 is the trap, and it looks like the obvious answer: it holds ONE tensor (the 102,400 B
+/// logits row) in a 16 GiB slot. But `predict`'s logits readback is `d2h_bytes =
+/// addr.total_size()` — the whole segment, every token, as its own comment measures ("~3 MB of
+/// untouched memory (~1.7 ms)"). A 419 MB tail there costs ~240 ms PER TOKEN. Nothing about the
+/// placement would look wrong; the model would simply be an order of magnitude slow.
+///
+/// seg6 survives all four: intermediates are never in `Executor::bound`, so `refill_activations`
+/// never marks it dirty; only the logits segment is read back; no `LaunchDelta` names it; and
+/// `zero_seg` is only ever called for seg2. What makes it *correct* rather than merely cheap is the
+/// last column — MEASURED on granite-3.1-8b-fp16, the suffix's four tensors are t1127 and t1128 in
+/// seg0, t1129 in seg5 and t1130 in seg4, so a tail spilled here is the SOLE seg6 dataspace in the
+/// one program that reads it, and the stitcher has nothing to confuse it with. Sharing with seg5
+/// would put the lm_head's weight input and its own output in one segment, which is the
+/// producer→consumer ambiguity this whole coloring pass exists to prevent.
+///
+/// ⛔ ONLY THE NON-PER-LAYER TAIL. The rolled body reaches layer `v` by advancing ONE segment's base
+/// (`off[SEG_WEIGHT] = v · weight_stride`), so a per-layer weight outside [`SegRole::Weight`] gets no
+/// stride and every layer reads layer 0's copy — silent garbage. `reroll` refuses that by ROLE (a
+/// per-layer *intermediate* colored here is fine and must stay fine — that distinction is what the
+/// `WeightOverflow = 5` attempt got wrong). So this raises the ceiling on the tail, NOT on the
+/// per-layer block: the per-layer block still has to fit one segment, which caps dense fp16 near 8B.
+/// Splitting THAT needs the body launch to pick a segment per layer — expressible, for the reasons
+/// `spill_weight_tail` records, but not built here.
+pub const WEIGHT_SPILL_SEGS: [usize; 1] = [6];
+
 /// Pages one request's block table can address — the validity rows the mask reserves.
 ///
 /// 32 is chosen so the reservation is `32 * 256 * 2` = 16384 B, byte-identical to the pre-paged
@@ -1982,7 +2049,10 @@ pub struct TensorPlacement {
     pub tid: u32,
     pub role: SegRole,
     pub segment: usize,
-    /// Byte offset WITHIN the segment region (128 B aligned).
+    /// Which BANK of that segment — see [`bundle::Placement::bank`]. 0 for everything except a
+    /// weight in a bundle whose weights need more than one device region.
+    pub bank: u32,
+    /// Byte offset WITHIN the segment region (128 B aligned), and within its BANK when banked.
     pub offset: u64,
     /// Byte size (f16 = 2 B/elem, rows*cols*2).
     pub size: u64,
@@ -2024,8 +2094,14 @@ pub struct BundleLayout {
     /// that spelling to its own identity, filled where the spelling is created.
     #[serde(skip)]
     pub ids: std::cell::RefCell<std::collections::BTreeMap<String, bundle::PlaceId>>,
-    /// Bytes occupied per segment (index = segment id 0..6).
+    /// Bytes occupied per segment (index = segment id 0..6). For the weight segment this is BANK
+    /// 0's bytes — see [`BundleLayout::weight_bank_bytes`].
     pub segment_bytes: [u64; 7],
+    /// ⭐ THE WEIGHT SEGMENT'S EXTRA BANKS: bytes of banks `1..N`, empty when the weights fit ONE
+    /// device region (every model that worked before banking existed). See
+    /// [`bundle::Placement::bank`] and [`bank_weight_segment`].
+    #[serde(default)]
+    pub weight_bank_bytes: Vec<u64>,
     /// Matmul KERNEL weights → their device-tile [`RetileDescriptor`] (built ONLY via
     /// `DeviceTileLayout`, the same witness the per-core address uses). The PT array
     /// reads the device TILE layout `[out/64, in, 64]`, NOT the row-major flat bytes;
@@ -2135,8 +2211,66 @@ fn synth_footprint_bytes(dims: &[u32], df: Df) -> u64 {
 ///    other's, which is silent: wrong output, or a fault when the second is a kernel.
 ///  * **Non-empty.** A zero-length field is read by the device as `1 << 27` flits = 16 GiB, in both
 ///    `handleHostDMA` and `handleXLATentry`. Zero does not mean nothing.
-fn audit_layout_addresses(places: &[bundle::Placement], segment_bytes: &[u64; 7], fp: &str) {
+///  * **Allocatable.** A segment is ONE `FlexAllocator` allocation, served from ONE region, so it
+///    cannot exceed [`bundle::MAX_SEGMENT_BYTES`] — see that constant for the granite-3.1-8b-fp16
+///    weight segment this catches.
+fn audit_layout_addresses(
+    places: &[bundle::Placement],
+    segment_bytes: &[u64; 7],
+    // Extents of weight banks 1..N (empty ⇒ one bank). A banked placement is bounded by ITS OWN
+    // bank, not by the segment total — see [`bundle::Placement::bank`].
+    weight_bank_bytes: &[u64],
+    fp: &str,
+) {
     let mut fail: Vec<String> = Vec::new();
+    let w_seg = SegRole::Weight.segment();
+    // The extent a placement is checked against: its bank's, which for bank 0 (everything in an
+    // unbanked bundle) is the segment's own total.
+    let extent = |seg: usize, bank: u32| -> Option<u64> {
+        match (seg == w_seg, bank) {
+            (_, 0) => segment_bytes.get(seg).copied(),
+            (true, b) => weight_bank_bytes.get(b as usize - 1).copied(),
+            (false, _) => None,
+        }
+    };
+
+    // ── ALLOCATABLE: each segment is one device region, and a region is capped ──
+    //
+    // ⛔ THIS WAS THE CARD'S JOB AND THE CARD IS BAD AT IT. `prepare` allocates a segment with
+    // `DevAddr::alloc(segment_bytes[i])`, and flex serves that from a single region: over the cap it
+    // returns an OOM whose numbers deny each other (`requested_bytes` well under `free_space_bytes`),
+    // because the free bytes are in the regions the request cannot reach. Nothing in that message
+    // names a segment, a tensor, or a model. All of it is decided here, by constants.
+    // A weight BANK is a device region like any other, so it is bound by the same cap; checking the
+    // banks here is what stops banking from trading one over-size allocation for another.
+    for (b, &bytes) in weight_bank_bytes.iter().enumerate() {
+        if bytes > bundle::MAX_SEGMENT_BYTES {
+            fail.push(format!(
+                "weight bank {} packs {bytes} B, {} B past the {} B a single device region can hold",
+                b + 1,
+                bytes - bundle::MAX_SEGMENT_BYTES,
+                bundle::MAX_SEGMENT_BYTES,
+            ));
+        }
+    }
+    for (seg, &bytes) in segment_bytes.iter().enumerate() {
+        if bytes > bundle::MAX_SEGMENT_BYTES {
+            let (biggest, share) = places
+                .iter()
+                .filter(|p| p.segment as usize == seg)
+                .fold((0u64, 0u64), |(mx, sum), p| (mx.max(p.size), sum + p.size));
+            fail.push(format!(
+                "seg{seg} packs {bytes} B, which is {} B past the {} B a single device region — and \
+                 therefore a single segment — can hold. A segment is ONE allocation; the other \
+                 regions' free space cannot be reached from it. ({} placement(s) totalling {share} \
+                 B, largest {biggest} B.) Shrink the segment: split it, or drop the device padding \
+                 that grew it",
+                bytes - bundle::MAX_SEGMENT_BYTES,
+                bundle::MAX_SEGMENT_BYTES,
+                places.iter().filter(|p| p.segment as usize == seg).count(),
+            ));
+        }
+    }
 
     for p in places {
         let seg = p.segment as usize;
@@ -2159,13 +2293,22 @@ fn audit_layout_addresses(places: &[bundle::Placement], segment_bytes: &[u64; 7]
                 p.id
             ));
         }
-        if p.offset + p.size > segment_bytes[seg] {
+        let Some(cap) = extent(seg, p.bank) else {
             fail.push(format!(
-                "{} spans [{}, {}) of seg{seg}, which is only {} B",
+                "{} is in seg{seg} bank {}, which this bundle does not have ({} weight bank(s))",
+                p.id,
+                p.bank,
+                1 + weight_bank_bytes.len(),
+            ));
+            continue;
+        };
+        if p.offset + p.size > cap {
+            fail.push(format!(
+                "{} spans [{}, {}) of seg{seg} bank {}, which is only {cap} B",
                 p.id,
                 p.offset,
                 p.offset + p.size,
-                segment_bytes[seg]
+                p.bank,
             ));
         }
     }
@@ -2372,6 +2515,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // and so does the attention pad's door: a decode width must be a baked ladder rung
     // (`PaddedMq::of_bundle`), which is the `Err` this returns.
     rows_are_requests: bool,
+    // ⭐ THE LAYER STRUCTURE, so the weight segment can be split into BANKS at a LAYER boundary —
+    // see [`bank_weight_segment`]. From [`per_layer_external_tids`], a pre-pass over the re-rolled
+    // tape; EMPTY for an unrolled bundle, which has no layer boundary and therefore cannot bank.
+    per_layer_ext: &std::collections::BTreeMap<u32, Vec<u32>>,
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
@@ -2433,6 +2580,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 tid,
                 role,
                 segment: seg,
+                // Bank 0 — every placement is packed into one region here, and `bank_weight_segment`
+                // is the ONE pass that ever moves a weight to another bank.
+                bank: 0,
                 offset: off,
                 size: sz,
             },
@@ -2459,6 +2609,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         })
         .flatten()
         .collect();
+
     // Sources first (deterministic id order): weights → seg1, activations → seg3 (Activation role).
     for tid in 0..ir.num_sources {
         if prefix_kv_tids.contains(&tid) {
@@ -2483,6 +2634,57 @@ pub fn compute_bundle_layout<F: RopeForm>(
     if result >= ir.num_sources {
         pack(result, SegRole::Logits, &mut seg_bytes, &mut placements);
     }
+    // ⭐ THE SEGMENT BUDGET — every weight is packed by now, so this is the first point that knows
+    //    whether seg1 fits one device region, and it runs BEFORE the intermediate coloring so a
+    //    spilled tail lands at offset 0 of its slot. That offset is not cosmetic: the spill slot is
+    //    NOT aliasable (it also holds mq-dependent intermediates, so its extent differs per rung),
+    //    so every borrowing session has to be handed the tail's own device image — and an image is
+    //    only portable between bundles of different seg6 extents if the tail starts at 0 in all of
+    //    them. See `spill_weight_tail`.
+    //
+    // ⭐ THE PROVEN LEVER FIRST, AND BANKING ONLY WHERE THE SPILL CANNOT REACH. Two passes can bring
+    //    an over-size weight segment under the cap, and they are NOT interchangeable — one of them
+    //    keeps a segment number naming exactly one region and the other does not:
+    //
+    //    * [`spill_weight_tail`] moves the NON-PER-LAYER tail to a DISTINCT segment number. Every
+    //      address it emits stays unambiguous, because `SEGMENT_OFFSETS[seg] + offset` still resolves
+    //      to one region per segment. MEASURED on the card, granite-3.1-8b-instruct at fp16: coherent
+    //      prose, TTFT 206.9 ms, ITL 189.2 ms, 5.3 tok/s, 0 WARN/SKIPPED/REFUSED.
+    //    * [`bank_weight_segment`] backs ONE segment number with SEVERAL regions. It is the only lever
+    //      on the PER-LAYER block (which the spill cannot touch) and its banks are aliasable where the
+    //      spill slot is not — but it makes two regions share a segment number, and with it EVERY
+    //      forward faulted `CB tag=ResponseTag(7341) state=Succeeded status=Error locator=0x2`,
+    //      unchanged across three fixes that MOVED the addresses. An unchanged fault across an address
+    //      change says the addresses are not what is wrong: dxp wires producer→consumer BY SEGMENT, so
+    //      a shared segment number is suspected to be structurally inexpressible.
+    //
+    //    So take the spill wherever it has a lever at all — i.e. wherever the PER-LAYER BLOCK ALONE
+    //    fits one region, which is the only part the spill cannot move — and fall back to banking only
+    //    for a model whose per-layer block is itself over the cap (13B/30B/70B dense fp16), where the
+    //    spill is powerless and banking is the only expressible answer. Both are no-ops for the
+    //    overwhelming case of a weight segment that fits one region.
+    //
+    //    ⛔ Do NOT reorder these on the grounds that banking is more general. It is more general and
+    //    it does not work yet; the spill is narrower and it is measured. Settle the stitcher question
+    //    (`ModuleStitcher` in deeptools) before promoting banking.
+    let per_layer_tids: std::collections::BTreeSet<u32> =
+        per_layer_ext.values().flatten().copied().collect();
+    let per_layer_block_end = placements
+        .values()
+        .filter(|p| {
+            p.segment == SegRole::Weight.segment()
+                && matches!(p.role, SegRole::Weight)
+                && per_layer_tids.contains(&p.tid)
+        })
+        .map(|p| align128(p.offset + p.size))
+        .max()
+        .unwrap_or(0);
+    let weight_bank_bytes = if per_layer_block_end <= bundle::MAX_SEGMENT_BYTES {
+        spill_weight_tail(&mut placements, &mut seg_bytes, &per_layer_tids)?;
+        Vec::new()
+    } else {
+        bank_weight_segment(&mut placements, &mut seg_bytes, per_layer_ext)?
+    };
     // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
     // any RopeRotate/RopeAppend, `lower_rope_node` emits `rot = matmul(x, P)` (the
     // rotate-half as a 64-stick-aligned matmul, avoiding the 32-half sub-stick). P is
@@ -2506,6 +2708,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             ROPE_P_TID,
             TensorPlacement {
                 tid: ROPE_P_TID,
+                bank: 0,
                 role: SegRole::Activation,
                 segment: seg,
                 offset: off,
@@ -2566,6 +2769,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             IDENTITY_TID,
             TensorPlacement {
                 tid: IDENTITY_TID,
+                bank: 0,
                 role: SegRole::Activation,
                 segment: seg,
                 offset: off,
@@ -2633,6 +2837,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             ATTN_ZERO_TID,
             TensorPlacement {
                 tid: ATTN_ZERO_TID,
+                bank: 0,
                 role: SegRole::Activation,
                 segment: seg,
                 offset: off,
@@ -2664,6 +2869,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             RMS_HALF_TID,
             TensorPlacement {
                 tid: RMS_HALF_TID,
+                bank: 0,
                 role: SegRole::Activation,
                 segment: a,
                 offset: hoff,
@@ -2677,6 +2883,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             RMS_INVCOLS_TID,
             TensorPlacement {
                 tid: RMS_INVCOLS_TID,
+                bank: 0,
                 role: SegRole::Activation,
                 segment: a,
                 offset: ioff,
@@ -2705,6 +2912,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     tid,
                     role: SegRole::Activation,
                     segment: a,
+                    bank: 0,
                     offset: off,
                     size: sz,
                 },
@@ -2779,6 +2987,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 tid,
                 role: SegRole::Intermediate,
                 segment: seg,
+                bank: 0,
                 offset: off,
                 size: nbytes(tid),
             },
@@ -2876,6 +3085,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         tid,
                         role: SegRole::Kv,
                         segment: seg,
+                        bank: 0,
                         offset: layer_base + plane_off,
                         size: plane_bytes,
                     },
@@ -2907,6 +3117,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         nid,
                         TensorPlacement {
                             tid: nid,
+                            bank: 0,
                             role: SegRole::Intermediate,
                             segment: seg3i,
                             offset: off,
@@ -2976,6 +3187,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     ATTN_MASK_TID,
                     TensorPlacement {
                         tid: ATTN_MASK_TID,
+                        bank: 0,
                         role: SegRole::Activation,
                         segment: mseg,
                         offset: pmoff,
@@ -2992,6 +3204,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     ATTN_CAUSAL_TID,
                     TensorPlacement {
                         tid: ATTN_CAUSAL_TID,
+                        bank: 0,
                         role: SegRole::Activation,
                         segment: a,
                         offset: cmoff,
@@ -3009,6 +3222,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         NEW_V_PROBE_TID,
                         TensorPlacement {
                             tid: NEW_V_PROBE_TID,
+                            bank: 0,
                             role: SegRole::Activation,
                             segment: a,
                             offset: npoff,
@@ -3101,6 +3315,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 tid,
                 role: SegRole::Activation,
                 segment: a,
+                bank: 0,
                 offset: off,
                 size: 2,
             },
@@ -3126,12 +3341,406 @@ pub fn compute_bundle_layout<F: RopeForm>(
         placements,
         ids,
         segment_bytes: seg_bytes,
+        weight_bank_bytes,
         kernel_weights: std::collections::BTreeMap::new(),
         scalarmul_scales,
         synth,
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         kv_request_stride_bytes,
     })
+}
+
+/// ⭐ THE SEGMENT BUDGET: give the weight segment's TRAILING placements to [`WEIGHT_SPILL_SEGS`]
+/// until what is left fits one device region.
+///
+/// A segment is one `FlexAllocator` allocation served from ONE 16 GiB region, and the same 16 GiB is
+/// the addressing stride (`SEGMENT_OFFSETS`), so over the cap a bundle both fails to allocate AND
+/// decomposes its own addresses into the next segment. Both are decided by constants here, which is
+/// why this is a `cargo build` pass and not a load-time fallback.
+///
+/// 🛑 MEASURED, granite-3.1-8b at fp16 — and the arithmetic is the whole design:
+///
+/// ```text
+///   40 layers × 423,641,088 = 16,945,643,520   the PER-LAYER block   ⎫ 15.78 GiB — FITS,
+///                    + 8,192 =      final norm                       ⎬ with 223 MiB spare
+///              + 419,430,400 = the tied embedding (51200 × 4096 × 2) ⎭
+///                            = 17,365,082,112   177 MiB PAST the cap
+/// ```
+///
+/// The overflow is caused ENTIRELY by the non-per-layer tail, and the per-layer block alone clears
+/// the cap with 223 MiB to spare. So the fix is not to split the per-layer block (which the rolled
+/// body could not address — see below) but to move the tail, which nothing strides.
+///
+/// ⛔ FROM THE END, AND ONLY THE END. Weights are packed in tid order and the non-per-layer ones
+/// (final norm, then the tied embedding) sort LAST, so taking a trailing suffix leaves every
+/// remaining weight at the offset it already had — which is what keeps `weight_stride` uniform, keeps
+/// every model whose weights already fit BYTE-IDENTICAL, and keeps seg1's measurably load-bearing
+/// placement untouched. Taking from the front, or repacking, would move all 362 of them.
+///
+/// ⛔ THIS DOES NOT RAISE THE CEILING ON THE PER-LAYER BLOCK, and it is worth being exact about why.
+/// The rolled body reaches layer `v` by advancing ONE segment's base (`off[SEG_WEIGHT] = v·wstride`
+/// in `superdsc_exec::launch_forward`), so every per-layer weight must sit in one strided segment.
+/// Splitting the per-layer block IS expressible without touching any SDSC — `tensor_allocs` is
+/// positional per launch and `DevAddr::shifted` exists, so layer `v` could be handed a different
+/// region's base in slot 1 — but it needs the weight segment to become a *bank* of regions (staging,
+/// H2D and `alias_seg_from` all per bank), and it is NOT built here. Dense fp16 therefore still tops
+/// out where 40 layers of weights top out; this is what unblocks the tail, not a 30B.
+fn spill_weight_tail(
+    placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
+    seg_bytes: &mut [u64; 7],
+    per_layer_tids: &std::collections::BTreeSet<u32>,
+) -> Result<(), SuperDscError> {
+    let w_seg = SegRole::Weight.segment();
+    if seg_bytes[w_seg] <= bundle::MAX_SEGMENT_BYTES {
+        return Ok(()); // the overwhelming case: nothing moves, nothing is re-offset.
+    }
+    // The weight segment's own high-water, recomputed from what REMAINS after each move. The
+    // original packing bumped `seg_bytes` cumulatively, so the high-water is the max end — taking
+    // the trailing placement lowers it to the next one's end and never leaves a hole.
+    let high_water = |pl: &std::collections::BTreeMap<u32, TensorPlacement>| -> u64 {
+        pl.values()
+            .filter(|p| p.segment == w_seg)
+            .map(|p| align128(p.offset + p.size))
+            .max()
+            .unwrap_or(0)
+    };
+    // Trailing first. Only `Weight`-role placements are movable: seg1 also carries a tiny attention
+    // `scale` const, and moving a non-weight would take it away from the role that binds it.
+    let mut tail: Vec<u32> = placements
+        .values()
+        .filter(|p| p.segment == w_seg && matches!(p.role, SegRole::Weight))
+        .map(|p| p.tid)
+        .collect();
+    tail.sort_by_key(|t| std::cmp::Reverse(placements[t].offset));
+
+    let mut moved: Vec<(u32, usize, u64)> = Vec::new();
+    for tid in tail {
+        if seg_bytes[w_seg] <= bundle::MAX_SEGMENT_BYTES {
+            break;
+        }
+        // ⛔⛔⛔ ROLE, NOT POSITION: A PER-LAYER WEIGHT MAY NEVER LEAVE THE STRIDED SEGMENT.
+        // The rolled body reaches layer `v` by advancing ONE segment's base
+        // (`off[SEG_WEIGHT] = v·weight_stride` in `superdsc_exec::launch_forward`), so a per-layer
+        // weight moved out of `w_seg` is no longer strided by `v` — every layer would read LAYER 0's
+        // copy of it. That is FLUENT GARBAGE: the model generates confident, well-formed text from
+        // the wrong weights, and no load, no bake and no on-card fault reports it. It has to die at
+        // `cargo build`.
+        //
+        // This holds today by CONSTRUCTION and not by luck — weights pack in tid order and the
+        // non-per-layer ones (final norm, tied embedding) sort LAST, so a trailing suffix is exactly
+        // the non-per-layer tail — but "by construction" is a fact about the CURRENT packing of the
+        // CURRENT configs, not an invariant. A config whose last-packed weight is per-layer would
+        // otherwise be silently mis-emitted, so the guard is keyed on the tensor's ROLE.
+        //
+        // ⚠️ And note what is NOT refused: a per-layer INTERMEDIATE coloured into a spill slot is
+        // perfectly legal — intermediates are re-bound per launch and carry no `v·stride`. Refusing
+        // on "is in a spill segment" instead of "is a per-layer WEIGHT" is what broke an earlier
+        // attempt at this guard.
+        if per_layer_tids.contains(&tid) {
+            return Err(SuperDscError(format!(
+                "seg{w_seg} packs {} B, {} B past the {} B one device region can hold, and the next \
+                 tensor the tail spill would move (t{tid}) is a PER-LAYER weight. Moving it out of \
+                 the strided weight segment would leave every layer reading layer 0's copy — fluent \
+                 garbage that nothing downstream can detect — so this is a build refusal. The \
+                 non-per-layer tail is already spilled; what remains over the cap is the per-layer \
+                 block itself, and splitting THAT needs the weight segment to become a bank of \
+                 regions (see `bank_weight_segment`).",
+                seg_bytes[w_seg],
+                seg_bytes[w_seg] - bundle::MAX_SEGMENT_BYTES,
+                bundle::MAX_SEGMENT_BYTES,
+            )));
+        }
+        let sz = placements[&tid].size;
+        // First declared slot with room for it. `MAX_SEGMENT_BYTES` binds the spill slot too — it is
+        // a device region like any other — so this cannot trade one over-size segment for another.
+        let Some(&spill) = WEIGHT_SPILL_SEGS
+            .iter()
+            .find(|&&s| align128(seg_bytes[s]) + sz <= bundle::MAX_SEGMENT_BYTES)
+        else {
+            return Err(SuperDscError(format!(
+                "seg{w_seg} packs {} B, {} B past the {} B one device region can hold, and every \
+                 declared spill slot {WEIGHT_SPILL_SEGS:?} is too full to take t{tid} ({sz} B). The \
+                 tail that CAN move is already moved: what is left is the per-layer block, and the \
+                 rolled body advances exactly one segment's base per layer, so it cannot be split \
+                 without making the weight segment a bank of regions (see `spill_weight_tail`).",
+                seg_bytes[w_seg],
+                seg_bytes[w_seg] - bundle::MAX_SEGMENT_BYTES,
+                bundle::MAX_SEGMENT_BYTES,
+            )));
+        };
+        // Land above whatever the slot already holds — which is NOTHING, because this runs before
+        // the intermediate coloring, so the first spilled tensor sits at offset 0 and the colored
+        // intermediates pack above it. That is deliberate and load-bearing: the runtime hands each
+        // borrowing session a COPY of `[0, tail_len)` of this segment (the slot cannot be aliased),
+        // and one image is only portable to a bundle of a different extent if the tail starts at 0.
+        let off = align128(seg_bytes[spill]);
+        let p = placements.get_mut(&tid).expect("tid came from this map");
+        p.segment = spill;
+        p.offset = off;
+        seg_bytes[spill] = align128(off + sz);
+        seg_bytes[w_seg] = high_water(placements);
+        moved.push((tid, spill, sz));
+    }
+    // Emit runs at cargo-build, so the spill is visible in the build log rather than inferred from a
+    // segment total. Not gated: a bundle that had to re-budget its segments should say so once.
+    eprintln!(
+        "[superdsc-layout] SEGMENT BUDGET: spilled {} weight tensor(s) out of seg{w_seg}, leaving \
+         {} B of the {} B cap; {}",
+        moved.len(),
+        seg_bytes[w_seg],
+        bundle::MAX_SEGMENT_BYTES,
+        moved
+            .iter()
+            .map(|(t, s, sz)| format!("t{t} → seg{s} ({sz} B)"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    Ok(())
+}
+
+/// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
+/// EXISTS — one `Vec<u32>` per repeating weight/KV tensor, indexed by layer.
+///
+/// ⛔ THIS IS WHY IT IS A PRE-PASS AND NOT PART OF THE WALK. The walk that emits the body collects
+/// the same fact (`ComputeInput::External::per_layer`), but it collects it while BAKING addresses —
+/// far too late for the layout to use it. And the layout is exactly what needs it: a weight BANK
+/// boundary may only fall on a LAYER boundary (a launch has one base per segment, so a launch that
+/// straddled two banks would be inexpressible), so `compute_bundle_layout` cannot decide banks
+/// without knowing which tids are the same tensor in different layers.
+///
+/// The walk is fed FROM here rather than re-deriving it, so the fact is collected once: the
+/// `External` arm downstream extends this map, it does not rebuild it.
+fn per_layer_external_tids(
+    tape: &scratchy_subtile::subtile_tape::SubtileTape,
+) -> std::collections::BTreeMap<u32, Vec<u32>> {
+    use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
+    let mut iters: u32 = 0;
+    for instr in tape.instrs() {
+        if let Instr::OpenLoop {
+            bound: LoopBound::Const(it),
+            ..
+        } = instr
+        {
+            iters = *it;
+        }
+    }
+    let mut out: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+    if iters < 2 {
+        return out; // nothing repeats: no layer structure, so no banking is expressible
+    }
+    for instr in tape.instrs() {
+        if let Instr::Compute { inputs, .. } = instr {
+            for ci in inputs.iter() {
+                if let ComputeInput::External {
+                    tensor,
+                    per_layer: pl,
+                    ..
+                } = ci
+                    && pl.len() as u32 == iters
+                {
+                    out.entry(tensor.index() as u32)
+                        .or_insert_with(|| pl.iter().map(|t| t.index() as u32).collect());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// ⭐⭐⭐ THE WEIGHT SEGMENT AS A **BANK** OF DEVICE REGIONS — what lifts the 16 GiB ceiling on a
+/// model's weights, and the one pass that ever sets [`TensorPlacement::bank`].
+///
+/// A segment is ONE `FlexAllocator` allocation served from ONE region, and a region is
+/// [`bundle::MAX_SEGMENT_BYTES`]; the same 16 GiB is the addressing stride (`SEGMENT_OFFSETS`). That
+/// bounded the WEIGHTS of any model at 16 GiB — fp16 dense topped out near 8B — and no segment slot
+/// is free to take a second one (0 intermediates, 1 weights, 2 KV, 3 activations, 4 logits, 5+6
+/// intermediate COLORS, all occupied; taking a colour is what the `WeightOverflow = 5` attempt got
+/// wrong).
+///
+/// ⭐ BUT 16 GiB IS A LIMIT ON BYTES PER REGION, NOT ON ADDRESSES PER SEGMENT. The rolled body bakes
+/// only LAYER 0's offsets and reaches layer `v` by advancing the base it is handed
+/// (`off[SEG_WEIGHT] = v·weight_stride`), and `tensor_allocs` is positional per launch with no
+/// segment identity in a `DevAddr`. So layer `v` can be handed a DIFFERENT REGION in slot 1 with the
+/// same descriptors — the weight segment becomes N regions, and the ceiling becomes N × 16 GiB.
+///
+/// ⛔ THREE RULES, EACH ONE A FAILURE MODE THAT IS SILENT IF IT IS NOT CHECKED HERE:
+///
+///  1. **A launch has ONE base per segment**, so a bank boundary may only fall on a LAYER boundary —
+///     `lpb` whole layers per bank. A launch straddling two banks cannot be expressed at all.
+///  2. **Every layer must keep the SAME intra-layer offsets**, because ONE baked body serves all of
+///     them. This pass therefore only ever SUBTRACTS a whole number of layer strides from an
+///     existing offset; it never repacks a layer, so `weight_stride` and every relative address
+///     survive untouched.
+///  3. **The non-per-layer weights go in ONE bank together.** The suffix reads the final norm AND
+///     the lm_head; if those two landed in different banks the suffix would be inexpressible. That
+///     is the defect the seg6 tail spill hid: it moved only as many trailing tensors as it took to
+///     fit, which for granite-3.1-8b-fp16 was the embedding alone, leaving the final norm behind.
+///
+/// A bank is ALIASABLE, which is the second half of the payoff: it holds only weights, placed
+/// identically in every bundle, so `alias_seg_from`'s size + placement equality checks pass and every
+/// borrowing session SHARES the owner's regions. The spill slot could not be aliased (its co-tenant
+/// intermediate colour is m-dependent), so each of granite-3.1-8b-fp16's 27–28 sessions needed its
+/// own 419,430,400 B COPY of the tail — 10.5 GiB of device memory and ~7.6 s of the 25.2 s load.
+///
+/// Returns the extents of banks `1..N` (empty ⇒ one bank ⇒ nothing moved, and every model whose
+/// weights already fit is byte-identical, including its `seg_bytes`).
+fn bank_weight_segment(
+    placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
+    seg_bytes: &mut [u64; 7],
+    per_layer_ext: &std::collections::BTreeMap<u32, Vec<u32>>,
+) -> Result<Vec<u64>, SuperDscError> {
+    let w_seg = SegRole::Weight.segment();
+    if seg_bytes[w_seg] <= bundle::MAX_SEGMENT_BYTES {
+        return Ok(Vec::new()); // the overwhelming case: one region holds every weight.
+    }
+    // ── The per-layer WEIGHT classes, as layer-indexed tid lists ──
+    // Only classes whose layer-0 tid is a WEIGHT in this segment: `per_layer_ext` also carries the
+    // KV caches (seg2), which have their own stride and their own segment.
+    let classes: Vec<&Vec<u32>> = per_layer_ext
+        .values()
+        .filter(|tids| {
+            tids.first().is_some_and(|t0| {
+                placements
+                    .get(t0)
+                    .is_some_and(|p| p.segment == w_seg && matches!(p.role, SegRole::Weight))
+            })
+        })
+        .collect();
+    let Some(layers) = classes.iter().map(|c| c.len()).max() else {
+        return Err(SuperDscError(format!(
+            "seg{w_seg} packs {} B, {} B past the {} B one device region can hold, and the tape has \
+             NO per-layer weight classes — so there is no layer boundary to split the segment on. \
+             Banking a weight segment needs the re-rolled layer loop; an unrolled bundle this large \
+             cannot be addressed.",
+            seg_bytes[w_seg],
+            seg_bytes[w_seg] - bundle::MAX_SEGMENT_BYTES,
+            bundle::MAX_SEGMENT_BYTES,
+        )));
+    };
+    if classes.iter().any(|c| c.len() != layers) {
+        return Err(SuperDscError(
+            "bank_weight_segment: per-layer weight classes disagree on the layer count — one \
+             tensor repeats fewer times than another, so no layer boundary is well defined"
+                .into(),
+        ));
+    }
+    // ── The per-layer stride, from the packing that already exists ──
+    // Layer v's tids all sit at `their layer-0 offset + v·stride`; that uniformity is what the
+    // rolled body needs and what `reroll` re-verifies. Derive it here from layer 0 → layer 1 and
+    // hold every class to it, because banking DIVIDES by it.
+    let off_of = |t: &u32| -> Option<u64> { placements.get(t).map(|p| p.offset) };
+    let mut stride: u64 = 0;
+    for c in &classes {
+        let (Some(a), Some(b)) = (off_of(&c[0]), off_of(&c[1])) else {
+            return Err(SuperDscError(
+                "bank_weight_segment: a per-layer weight has no placement".into(),
+            ));
+        };
+        let d = b.wrapping_sub(a);
+        if stride == 0 {
+            stride = d;
+        } else if stride != d {
+            return Err(SuperDscError(format!(
+                "bank_weight_segment: NON-UNIFORM per-layer weight stride ({stride} vs {d} B). \
+                 Banking splits the segment at a layer boundary, which needs every layer packed at \
+                 one stride."
+            )));
+        }
+    }
+    if stride == 0 {
+        return Err(SuperDscError(
+            "bank_weight_segment: per-layer weight stride is 0 — every layer would read layer 0's \
+             weights"
+                .into(),
+        ));
+    }
+    if stride > bundle::MAX_SEGMENT_BYTES {
+        return Err(SuperDscError(format!(
+            "bank_weight_segment: ONE layer is {stride} B, past the {} B a single device region can \
+             hold. A bank boundary can only fall on a layer boundary, so this model cannot be \
+             addressed by advancing a per-layer base — it needs the layer itself split, which the \
+             rolled body cannot express.",
+            bundle::MAX_SEGMENT_BYTES,
+        )));
+    }
+    // ── How many whole layers one region holds, and therefore how many banks ──
+    let lpb = (bundle::MAX_SEGMENT_BYTES / stride) as usize;
+    let layer_banks = layers.div_ceil(lpb);
+    // Which layer each per-layer tid belongs to, and the base every layer's offsets are measured
+    // from (the first per-layer weight's offset). Subtracting `pl_base` puts layer 0 at offset 0 in
+    // bank 0, so banks ≥ 1 have no leading hole where the non-per-layer head used to sit.
+    let mut layer_of: std::collections::BTreeMap<u32, usize> = Default::default();
+    for c in &classes {
+        for (v, t) in c.iter().enumerate() {
+            layer_of.insert(*t, v);
+        }
+    }
+    let pl_base = layer_of
+        .keys()
+        .filter_map(off_of)
+        .min()
+        .expect("a class exists, so a placement exists");
+    // ── Re-place: per-layer weights by formula, everything else into the tail bank ──
+    let mut bank_bytes = vec![0u64; layer_banks];
+    let mut tail: Vec<u32> = placements
+        .values()
+        .filter(|p| {
+            p.segment == w_seg
+                && matches!(p.role, SegRole::Weight)
+                && !layer_of.contains_key(&p.tid)
+        })
+        .map(|p| p.tid)
+        .collect();
+    tail.sort_by_key(|t| placements[t].offset); // keep the packed order the tape produced
+    for (tid, v) in layer_of.clone() {
+        let b = v / lpb;
+        let p = placements
+            .get_mut(&tid)
+            .expect("layer_of was built from placements");
+        p.bank = b as u32;
+        p.offset = p.offset - pl_base - (b * lpb) as u64 * stride;
+        bank_bytes[b] = bank_bytes[b].max(align128(p.offset + p.size));
+    }
+    // The non-per-layer weights (the head that sorted before layer 0, the final norm, the lm_head /
+    // tied embedding) share ONE bank: the last layer bank if they fit in it, else a bank of their
+    // own. Sharing costs nothing and saves a region; what matters is that they are TOGETHER, so the
+    // suffix — which reads the norm and the lm_head in one launch — needs exactly one base.
+    let tail_len: u64 = tail
+        .iter()
+        .fold(0u64, |acc, t| align128(acc + placements[t].size));
+    // An empty tail needs no room, so it "fits" the last layer bank trivially — one condition, not
+    // two arms that happen to agree.
+    let tail_bank = if tail.is_empty()
+        || align128(bank_bytes[layer_banks - 1]) + tail_len <= bundle::MAX_SEGMENT_BYTES
+    {
+        layer_banks - 1
+    } else {
+        bank_bytes.push(0);
+        layer_banks
+    };
+    let mut cur = align128(bank_bytes[tail_bank]);
+    for tid in &tail {
+        let p = placements.get_mut(tid).expect("tid came from this map");
+        p.bank = tail_bank as u32;
+        p.offset = cur;
+        cur = align128(cur + p.size);
+        bank_bytes[tail_bank] = cur;
+    }
+    // ── Prove every bank is allocatable BEFORE anything is baked ──
+    for (b, &bytes) in bank_bytes.iter().enumerate() {
+        if bytes > bundle::MAX_SEGMENT_BYTES {
+            return Err(SuperDscError(format!(
+                "bank_weight_segment: weight bank {b} packs {bytes} B, {} B past the {} B one \
+                 device region can hold (stride {stride} B/layer, {lpb} layer(s)/bank, {layers} \
+                 layers, {} bank(s)).",
+                bytes - bundle::MAX_SEGMENT_BYTES,
+                bundle::MAX_SEGMENT_BYTES,
+                bank_bytes.len(),
+            )));
+        }
+    }
+    seg_bytes[w_seg] = bank_bytes[0];
+    Ok(bank_bytes[1..].to_vec())
 }
 
 /// The deterministic synthetic source value (MUST match the worker self-test in
@@ -7238,6 +7847,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         ids,
         placements,
         segment_bytes,
+        weight_bank_bytes,
         kernel_weights,
         scalarmul_scales,
         synth,
@@ -7254,6 +7864,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         .map(|(tid, p)| bundle::Placement {
             id: bundle::PlaceId::Act(*tid),
             segment: p.segment as u32,
+            bank: p.bank,
             offset: p.offset,
             size: p.size,
             is_logits: p.role == SegRole::Logits,
@@ -7273,6 +7884,8 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
                 .get(name)
                 .unwrap_or_else(|| panic!("synthetic '{name}' was allocated without an identity")),
             segment: SegRole::Intermediate as u32,
+            // Synthetics are intermediates; only the WEIGHT segment is ever banked.
+            bank: 0,
             offset: *off,
             // ⛔ NO `unwrap_or(0)`. A zero-length field is read by the device as `1 << 27` flits —
             // 16 GiB — in both `handleHostDMA` and `handleXLATentry`. Every synthetic now has a size,
@@ -7287,10 +7900,11 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     }));
 
     // ⭐ EVERY ADDRESS THIS BUNDLE WILL USE IS NOW DECIDED. Prove them before emitting.
-    audit_layout_addresses(&places, segment_bytes, "<layout>");
+    audit_layout_addresses(&places, segment_bytes, weight_bank_bytes, "<layout>");
 
     bundle::BundleLayout {
         segment_bytes: *segment_bytes,
+        weight_bank_bytes: std::borrow::Cow::Owned(weight_bank_bytes.clone()),
         places: std::borrow::Cow::Owned(places),
         kernel_weights: std::borrow::Cow::Owned(
             kernel_weights
@@ -10945,7 +11559,12 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     // tensor shared across ops gets the SAME address — fixing the per-op `arg_index`
     // segment-aliasing bug. Threaded as `Some(&layout)` into every node-lowering; the
     // populated layout (incl. synthetic seg3 offsets) is RETURNED for the manifest.
-    let mut bundle_layout = compute_bundle_layout(ir, weight_ids, rows_are_requests)?;
+    // ⛔ NO LAYER CLASSES: this is the UNROLLED lowering, which has no layer loop and therefore no
+    // layer boundary to split the weight segment on. An empty map is what tells the layout that
+    // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
+    // rather than a bool, so there is one spelling of "the layer structure" and not two).
+    let mut bundle_layout =
+        compute_bundle_layout(ir, weight_ids, rows_are_requests, &Default::default())?;
     let layout = Some(&bundle_layout);
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // The SINGLE monotonic negative-symbol-id counter for the WHOLE bundle (design
@@ -11101,6 +11720,18 @@ pub struct RolledSuperDsc {
     /// layer-0 offsets shift to layer-v). UNIFORM across all per-layer weights (a
     /// build guard enforces it). 0 if no per-layer weights.
     pub weight_stride: u64,
+    /// ⭐ LAYERS PER WEIGHT BANK — the divisor that turns layer `v` into `(bank, offset)`:
+    /// `bank = v / layers_per_bank`, `offset = (v % layers_per_bank) · weight_stride`.
+    ///
+    /// READ OFF THE PLACEMENTS the banking pass wrote, never recomputed from the policy — the
+    /// placements ARE the decision, and a second copy of `MAX_SEGMENT_BYTES / stride` here could
+    /// disagree with the addresses that were actually baked. Equal to `iters` for an unbanked bundle,
+    /// which makes the division a no-op and the launch sequence byte-identical.
+    pub layers_per_bank: u32,
+    /// The weight bank the PREFIX's weight operands live in, and the SUFFIX's — proven to be a single
+    /// bank each (a launch has ONE base per segment). 0 when the group reads no weights.
+    pub prefix_weight_bank: u32,
+    pub suffix_weight_bank: u32,
     /// Per-layer byte stride of the KV segment (seg2), same contract. 0 if none.
     pub kv_stride: u64,
     /// Bytes between two REQUESTS' KV within one page+layer — the launch shifts seg2 by
@@ -11169,7 +11800,12 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
         }
     }
     let _restore_split_gate = RestoreSplitGate(_prev_split_gate);
-    let mut bundle_layout = compute_bundle_layout(ir, weight_ids, rows_are_requests)?;
+    // ⭐ THE LAYER STRUCTURE FIRST, because the layout needs it: a weight BANK boundary may only fall
+    // on a LAYER boundary, and `compute_bundle_layout` is where the weight segment is packed. Same
+    // tape, same `ComputeInput::External::per_layer` the walk below reads — collected once, here.
+    let per_layer_ext = per_layer_external_tids(tape);
+    let mut bundle_layout =
+        compute_bundle_layout(ir, weight_ids, rows_are_requests, &per_layer_ext)?;
     // ON-CARD RESIDUAL (unconditional): thread the loop-carried hidden IN-PLACE, no copy. Pre-scan the
     // loop body for hidden_in (first body node input[0]) + hidden_out (last body node output) and ALIAS
     // hidden_out's placement to hidden_in's → every iteration reads+writes ONE resident buffer, so the
@@ -11225,8 +11861,20 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
     // and the reusing matmul lands in the SAME segment as the quant it reuses (shared tid ⇒ same segment).
     let mut fp8_quantized: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut unhandled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut per_layer: std::collections::BTreeMap<u32, Vec<u32>> =
-        std::collections::BTreeMap::new();
+    // ⭐ SEEDED FROM THE PRE-PASS RATHER THAN REBUILT. `per_layer_external_tids` already read every
+    // per-layer WEIGHT/KV class off this same tape — it had to, because `compute_bundle_layout` needs
+    // the layer boundaries to decide weight BANKS, and that runs before any op is emitted. The walk
+    // below then adds only what the pre-pass cannot see (node outputs, the resident Kᵀ), and its own
+    // `or_insert_with` is a no-op for anything already here.
+    //
+    // ⛔ A DISAGREEMENT BETWEEN THE TWO IS CAUGHT, NOT ASSUMED AWAY: a class the pre-pass missed was
+    // never banked, so its layers sit at their un-banked offsets and the per-layer FORMULA check
+    // after this walk refuses the bundle naming that tensor.
+    let mut per_layer: std::collections::BTreeMap<u32, Vec<u32>> = per_layer_ext.clone();
+    // Which weight BANKS each launch group addresses (0 = prefix, 1 = body, 2 = suffix), accumulated
+    // as the ops are emitted. A launch has ONE base per segment, so a group may address exactly one;
+    // `group_bank` checks that after the walk.
+    let mut group_weight_banks: [std::collections::BTreeSet<u32>; 3] = Default::default();
     // First/last body Compute node (for the residual-stream hidden in/out tids).
     let mut first_body_node: Option<u32> = None;
     let mut last_body_node: Option<u32> = None;
@@ -11354,6 +12002,18 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
                 // Push each block's kernel0 `[KB,dev_out]` descriptor + its per-layer tid list; collect the
                 // down_proj weight's per-layer list for the POST-LOOP placement overlay (block (v,b) at
                 // dp_Lv.offset + b·KB·dev_out·2, so weight_stride is unchanged). All offsets Kani-proven.
+                // ⭐ THE WEIGHT BANK THIS OP'S GROUP NEEDS. Recorded per group as the ops are emitted
+                // because it is a property of the OPERANDS, which only the node knows; a launch binds
+                // ONE base per segment, so the set for each group must end up with at most one
+                // member. Empty for every op of every unbanked bundle.
+                for r in &n.inputs {
+                    let tid = r.tensor.index() as u32;
+                    if let Some(p) = bundle_layout.placements.get(&tid)
+                        && matches!(p.role, SegRole::Weight)
+                    {
+                        group_weight_banks[(seg as usize).min(2)].insert(p.bank);
+                    }
+                }
                 match lower_one_node(
                     n,
                     ir,
@@ -11490,8 +12150,27 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
             &mut weight_stride
         } else if seg == kv_seg {
             &mut kv_stride
+        } else if matches!(p0.role, SegRole::Weight) {
+            // ⛔⛔⛔ A PER-LAYER **WEIGHT** OUTSIDE THE STRIDED SEGMENT IS SILENT GARBAGE, and the
+            // arm below would have `continue`d past it. The rolled body advances only seg{w_seg}'s
+            // base, so layer v would read layer 0's copy of this tensor for all `iters` layers:
+            // fluent output, wrong model. [`spill_weight_tail`] may only move the NON-per-layer tail,
+            // and this is what holds it to that.
+            //
+            // ⛔ KEYED ON THE **ROLE**, NOT THE SEGMENT. A per-layer INTERMEDIATE colored into a
+            // spill slot is legitimate and must keep falling through — the `WeightOverflow = 5`
+            // attempt refused exactly that case (per-layer intermediate t448 in seg5) and read it as
+            // proof no segment was available, when the real defect was taking a COLOR.
+            return Err(SuperDscError(format!(
+                "reroll-superdsc: per-layer WEIGHT t{} is placed in seg{seg}, which gets no \
+                 per-layer stride — the rolled body advances only seg{w_seg}, so every one of the \
+                 {} layers would read layer 0's copy. Only NON-per-layer weights (the final norm, \
+                 the lm_head / tied embedding) may spill; see `spill_weight_tail`.",
+                tids[0],
+                tids.len(),
+            )));
         } else {
-            continue; // seg3 hidden / other: not stride-advanced
+            continue; // seg3 hidden / per-layer intermediate color: not stride-advanced
         };
         for w in tids.windows(2) {
             let (Some(a), Some(b)) = (
@@ -11506,6 +12185,14 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
                 return Err(SuperDscError(
                     "reroll-superdsc: a per-layer tensor changes segment across layers".into(),
                 ));
+            }
+            // ⭐ A BANK BOUNDARY IS THE ONE PLACE THE STRIDE LEGITIMATELY DOES NOT APPLY: layer `v`
+            // is `(v / lpb, (v % lpb)·stride)`, so crossing into the next bank resets the offset
+            // instead of advancing it. Skipping the pair here is not a hole in the guard — the FULL
+            // per-layer formula (bank AND offset, for every layer, not just consecutive pairs) is
+            // checked below, which is strictly stronger than this pairwise delta ever was.
+            if a.bank != b.bank {
+                continue;
             }
             let d = b.offset.wrapping_sub(a.offset);
             if *target == 0 {
@@ -11522,6 +12209,106 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
                 )));
             }
         }
+    }
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    //  ⭐ THE WEIGHT BANK CONTRACT — the launch-time arithmetic, proven here against the addresses
+    //  that were actually baked.
+    //
+    //  The executor reaches layer `v` with `bank = v / layers_per_bank` and
+    //  `off[SEG_WEIGHT] = (v % layers_per_bank) · weight_stride`. Every term of that is decided in
+    //  `bank_weight_segment`, so all three checks below compare the FORMULA against the placements
+    //  rather than re-deriving the policy — the failure mode is a layer reading another layer's
+    //  weights, which is fluent, wrong output and nothing else.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // `layers_per_bank` is READ OFF the placements: how many layers share bank 0. Every layer in one
+    // bank (the unbanked case) gives `iters`, which makes the division a no-op.
+    let mut layers_per_bank: u32 = iters.max(1);
+    for tids in per_layer.values() {
+        let Some(p0) = bundle_layout.placements.get(&tids[0]) else {
+            continue;
+        };
+        if p0.segment != w_seg || !matches!(p0.role, SegRole::Weight) || tids.len() as u32 != iters
+        {
+            continue;
+        }
+        let in_bank0 = tids
+            .iter()
+            .filter(|t| {
+                bundle_layout
+                    .placements
+                    .get(*t)
+                    .is_some_and(|p| p.bank == 0)
+            })
+            .count() as u32;
+        if in_bank0 == 0 {
+            return Err(SuperDscError(format!(
+                "reroll-superdsc: per-layer weight class t{} has NO layer in bank 0, but the rolled \
+                 body is baked at LAYER 0 — its addresses would name a bank no launch binds.",
+                tids[0],
+            )));
+        }
+        layers_per_bank = layers_per_bank.min(in_bank0);
+    }
+    // Now hold EVERY per-layer weight to `(v / lpb, (v % lpb)·stride + its layer-0 offset)`. This is
+    // the check the pairwise delta above cannot make: it validates the bank as well as the offset,
+    // and it validates every layer rather than every consecutive pair.
+    for tids in per_layer.values() {
+        let Some(p0) = bundle_layout.placements.get(&tids[0]) else {
+            continue;
+        };
+        if p0.segment != w_seg || !matches!(p0.role, SegRole::Weight) || tids.len() as u32 != iters
+        {
+            continue;
+        }
+        for (v, t) in tids.iter().enumerate() {
+            let Some(p) = bundle_layout.placements.get(t) else {
+                continue;
+            };
+            let want_bank = v as u32 / layers_per_bank;
+            let want_off = (v as u64 % layers_per_bank as u64) * weight_stride + p0.offset;
+            if p.bank != want_bank || p.offset != want_off {
+                return Err(SuperDscError(format!(
+                    "reroll-superdsc: per-layer weight t{t} (layer {v} of class t{}) is placed at \
+                     bank {} offset {}, but the executor will address layer {v} at bank \
+                     {want_bank} offset {want_off} ({} layer(s)/bank, stride {weight_stride} B, \
+                     layer-0 offset {}). Every layer must sit where the per-layer advance looks, or \
+                     that layer reads another layer's weights.",
+                    tids[0], p.bank, p.offset, layers_per_bank, p0.offset,
+                )));
+            }
+        }
+    }
+    // ⛔ AND ONE BANK PER LAUNCH GROUP. A launch is handed ONE base per segment, so a program whose
+    // weight operands span two banks cannot be expressed AT ALL — there is no offset that reaches
+    // both. `group_weight_banks` was accumulated over the ops as they were emitted, so this is the
+    // set of banks each program actually addresses.
+    let group_bank = |s: usize, what: &str| -> Result<u32, SuperDscError> {
+        let banks = &group_weight_banks[s];
+        match banks.len() {
+            0 => Ok(0), // reads no weights at all: any bank will do, so bind bank 0
+            1 => Ok(*banks.iter().next().expect("len 1")),
+            _ => Err(SuperDscError(format!(
+                "reroll-superdsc: the {what} program's weights span weight banks {banks:?}, and a \
+                 launch has ONE base per segment — no offset reaches both. The non-per-layer weights \
+                 (final norm, lm_head / tied embedding) are placed in ONE bank together for exactly \
+                 this reason; a weight the {what} reads from another bank would have to be \
+                 REPLICATED into every bank that reads it, which `bank_weight_segment` does not do."
+            ))),
+        }
+    };
+    let prefix_weight_bank = group_bank(0, "prefix")?;
+    let suffix_weight_bank = group_bank(2, "suffix")?;
+    // The BODY is baked at layer 0, which the loop above has already proven lives in bank 0, so any
+    // OTHER bank in the body means it also reads a weight that is not per-layer — the replication
+    // case, refused with its own name rather than as a stride mismatch three steps later.
+    if group_bank(1, "body")? != 0 {
+        return Err(SuperDscError(format!(
+            "reroll-superdsc: the body program addresses weight bank(s) {:?}, but it is baked at \
+             LAYER 0 and every launch of it advances bank 0's base. A NON-per-layer weight read \
+             inside the layer loop would need replicating into every bank.",
+            group_weight_banks[1],
+        )));
     }
     // Residual-stream hidden in/out tids for the executor's loop-carried threading:
     // the FIRST body node's input[0] (the layer's hidden-in, e.g. the rmsnorm x) and
@@ -11588,6 +12375,9 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
         layout: bundle_layout,
         per_layer,
         weight_stride,
+        layers_per_bank,
+        prefix_weight_bank,
+        suffix_weight_bank,
         kv_stride,
         kv_request_stride,
         kv_request_rows,
@@ -11874,7 +12664,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false)
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
             .expect("a layout for a plain matmul bundle");
 
         // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned

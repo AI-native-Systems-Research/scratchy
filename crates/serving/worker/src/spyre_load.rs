@@ -31,6 +31,89 @@ use scratchy_target_spyre::sdsc_runner::SuperDscSession;
 use scratchy_tensors::DType as SDType;
 use tracing::{debug, info, warn};
 
+/// ⭐ THE RESIDENT SEGMENTS EVERY BORROWER ADOPTS, AS ONE LIST. Four sites alias these (the
+/// prefix-capable prefill, the prefill ladder rungs, the decode batch rungs, and the top prefill
+/// session), and a segment missing from ONE of them leaves that session pointing at a 128 B
+/// placeholder where the model's weights should be — which is not a crash, it is garbage output from
+/// one rung only. Mirrors `superdsc_exec::SEG_RESIDENT`, which is what the executor's own
+/// placeholder/H2D skips read; seg5 is empty for every model whose weights fit one segment, and
+/// aliasing an empty segment is a no-op the size/placement checks accept.
+const RESIDENT_SEGS: [(i64, &str); 2] = [(1, "resident WEIGHTS"), (2, "resident KV")];
+
+/// ⭐ EVERYTHING A BORROWING SESSION NEEDS FROM THE OWNER, AS ONE CALL: the resident segments it
+/// ADOPTS by alias, and the spilled weight tail it must be handed its own COPY of.
+///
+/// ⛔ THE TWO ARE NOT INTERCHANGEABLE, which is the whole reason this exists. A resident segment
+/// (weights, KV) is placed identically in every rung's bundle, so the borrower can share the owner's
+/// region outright and pay nothing. The weight SPILL slot cannot be shared: it is also an
+/// intermediate COLOR segment (`WEIGHT_SPILL_SEGS`), so its extent depends on the rung's query width
+/// and `alias_seg_from`'s placement-equality check would — correctly — refuse it. The borrower needs
+/// its own region holding its own copy, and `write_seg` from offset 0 is what puts it there:
+/// `spill_weight_tail` places the tail at offset 0 of the slot precisely so ONE device image is
+/// portable to a bundle whose extent for that segment differs.
+///
+/// ⛔ AND IT IS NOT OPTIONAL FOR ANY SESSION THAT PRODUCES LOGITS. The spilled tail IS the lm_head /
+/// tied embedding, and every prefill rung and decode rung runs the suffix. A session that skips this
+/// reads a zero-filled weight where the embedding should be: zero logits, so argmax returns token 0.
+/// Not a crash — one wrong token from one rung, exactly the failure shape [`RESIDENT_SEGS`] warns of.
+/// The IMAGE is taken from the owner AFTER its prepare, so it is the converted, re-tiled device bytes
+/// and not the host weight layout, which is why this copies a segment rather than re-staging a
+/// tensor.
+fn adopt_from_owner(
+    borrower: &mut SuperDscSession,
+    owner: &SuperDscSession,
+    spill: &[(i64, Vec<u8>)],
+) -> Result<(), String> {
+    for (seg, what) in RESIDENT_SEGS {
+        borrower
+            .alias_seg_from(owner, seg)
+            .map_err(|e| format!("seg{seg} ({what}) alias failed: {e}"))?;
+    }
+    for (seg, image) in spill {
+        borrower.write_seg_prefix(*seg, image).map_err(|e| {
+            format!(
+                "seg{seg} (spilled weight tail, {} B) copy failed: {e}",
+                image.len()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The segments this bundle spilled weights into and HOW MANY BYTES of each the spill occupies —
+/// [`adopt_from_owner`]'s work list, empty for every model whose weights fit one segment.
+///
+/// Derived from the LAYOUT and the bound weight ids rather than from a baked flag: a spill slot is a
+/// declared [`WEIGHT_SPILL_SEGS`] segment that some bound WEIGHT is actually placed in. Asking the
+/// two sources that already exist keeps this from drifting out of step with the emitter's decision.
+///
+/// ⛔ THE LENGTH IS NOT A DETAIL — it is what stops this from corrupting the borrower's scratch. The
+/// spill slot is ALSO an intermediate color segment, and a prefill rung's intermediates are WIDER
+/// than the decode owner's (they scale with the query rows), so the borrower's segment is larger than
+/// the owner's. Copying the owner's WHOLE segment image would therefore land the owner's intermediate
+/// bytes on top of the borrower's zero-initialised scratch — turning a zeroed slot into arbitrary
+/// non-zero data for any tensor read before it is written. Bounding the copy to the tail's own
+/// `[0, len)` leaves every borrower's scratch exactly as `prepare` zeroed it.
+fn spilled_weight_spans(
+    layout: &scratchy_target_spyre::bundle_code::BundleLayout<'static>,
+    weight_ids: impl IntoIterator<Item = usize>,
+) -> Vec<(i64, usize)> {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::WEIGHT_SPILL_SEGS;
+    let mut spans: std::collections::BTreeMap<i64, usize> = Default::default();
+    for id in weight_ids {
+        let Some(p) = layout.place_of_tid(id as u32) else {
+            continue;
+        };
+        if !WEIGHT_SPILL_SEGS.contains(&(p.segment as usize)) {
+            continue;
+        }
+        let end = (p.offset + p.size) as usize;
+        let e = spans.entry(p.segment as i64).or_insert(0);
+        *e = (*e).max(end);
+    }
+    spans.into_iter().collect()
+}
+
 use crate::error::ExecutorResult;
 use crate::spyre_pool::*;
 use crate::spyre_types::*;
@@ -291,10 +374,44 @@ pub(crate) fn gpu_tensor_bytes(t: &scratchy_tensors::GpuTensor) -> &[u8] {
 /// device's own cachewr, so `Executor::require_sources_filled` must know to skip them or it
 /// refuses every launch. Derived from the wiring rather than listed by hand, so a model with a
 /// different layer count cannot desync it.
-fn resident_source_ids(w: &scratchy_target_spyre::wiring::Wiring) -> Vec<u32> {
+fn resident_source_ids(
+    w: &scratchy_target_spyre::wiring::Wiring,
+    // ⛔ THE SPILLED WEIGHT TAIL BELONGS HERE, and leaving it out is a REFUSED LAUNCH, not a silent
+    // wrong answer — `require_sources_filled` classifies it `SourceFiller::Nobody` and stops.
+    //
+    // 🛑 MEASURED: `superdsc prefill run_step (mq=21, start=0): predict: 1 caller-filled source(s)
+    // were never written this step — t446`. A borrowing session binds NOTHING (that is the point:
+    // one stage+H2D for the whole ladder), so a weight normally classifies as
+    // `SourceFiller::SegmentOwner` — its segment is ALIASED and the owner filled it. A spilled tail
+    // cannot be aliased (its slot also holds an intermediate color, whose extent is m-dependent, so
+    // no two bundles agree on the segment's size), so it is handed over as a COPY into this session's
+    // own region instead — `adopt_from_owner`. Nothing binds it and nothing aliases it, so the only
+    // accurate answer left is that the LOADER declared it resident, which is what this list says.
+    spilled_weight_tail: &[u32],
+) -> Vec<u32> {
     w.layers
         .iter()
         .flat_map(|l| [l.prefix_k, l.prefix_v])
+        .chain(spilled_weight_tail.iter().copied())
+        .collect()
+}
+
+/// The tensor ids of the spilled weight tail — the companion of [`spilled_weight_spans`], which
+/// carries the same decision as byte ranges. Both read it off the layout so neither can drift from
+/// the emitter.
+fn spilled_weight_tail_tids(
+    layout: &scratchy_target_spyre::bundle_code::BundleLayout<'static>,
+    weight_ids: impl IntoIterator<Item = usize>,
+) -> Vec<u32> {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::WEIGHT_SPILL_SEGS;
+    weight_ids
+        .into_iter()
+        .filter(|id| {
+            layout
+                .place_of_tid(*id as u32)
+                .is_some_and(|p| WEIGHT_SPILL_SEGS.contains(&(p.segment as usize)))
+        })
+        .map(|id| id as u32)
         .collect()
 }
 
@@ -745,6 +862,14 @@ impl SpyreWorker {
                         scratchy_target_spyre::bundle_code::registered_fps(),
                     ))
                 })?;
+                // ⭐ THE SEGMENT BUDGET's runtime work list, read BEFORE any session is built (the
+                // first of them is constructed below, and `weights` moves into the DECODE session
+                // later on): which weights the emitter spilled out of the weight segment, as byte
+                // spans to copy and as ids to declare resident. Empty for every model whose weights
+                // fit one segment, which makes every use of it below a no-op.
+                let spill_spans = spilled_weight_spans(&code.layout, weights.iter().map(|w| w.0));
+                let spill_tids =
+                    spilled_weight_tail_tids(&code.layout, weights.iter().map(|w| w.0));
                 // Model dims from the SAME decode parse the other sessions read: vocab +
                 // kv_dim. The resident KV pool is `num_blocks` blocks of 64 slots covering
                 // the prefix capacity (mask cols) — same block_size the paged path uses.
@@ -892,16 +1017,57 @@ impl SpyreWorker {
                 // segment except the KV one, whose bytes are what we are about to size. The segments are
                 // typed (`SEG_INTERMEDIATE`/`SEG_WEIGHT`/`SEG_KV`/`SEG_MASK`), so this reads the KV segment
                 // out by name rather than by index arithmetic.
+                // ⛔⛔⛔ AND THE WEIGHT SEGMENT'S EXTRA BANKS, WHICH `segment_bytes` DOES NOT COUNT.
+                // `segment_bytes[SEG_WEIGHT]` is BANK 0's bytes; a banked bundle's remaining banks are
+                // separate device regions of exactly the same kind — resident weights, allocated once
+                // and aliased by every borrower. Leaving them out authorises a KV pool against memory
+                // the weights already hold: 419 MB for granite-3.1-8b-fp16, and the size of half a
+                // model for anything that needs banking to fit at all.
+                //
+                // Charged ONCE, not per session, precisely because a bank IS aliasable — that is the
+                // difference between this and the spilled tail below.
+                let bank_bytes: u64 = code.layout.weight_bank_bytes.iter().sum();
                 let seg_bytes = code.layout.segment_bytes;
-                let non_kv_bytes: u64 = seg_bytes
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != scratchy_target_spyre::superdsc_exec::SEG_KV.get())
-                    .map(|(_, b)| *b)
-                    .sum();
+                let non_kv_bytes: u64 = bank_bytes
+                    + seg_bytes
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != scratchy_target_spyre::superdsc_exec::SEG_KV.get())
+                        .map(|(_, b)| *b)
+                        .sum::<u64>();
+                // ⛔⛔⛔ AND THE SPILLED WEIGHT TAIL IS CHARGED ONCE PER SESSION, NOT ONCE.
+                //
+                // `segment_bytes` describes ONE bundle, so summing it counts every segment a single
+                // time. That is right for the segments a borrower ADOPTS ([`RESIDENT_SEGS`]: it holds a
+                // 128 B placeholder and aliases the owner's region) and WRONG for the spill slot, which
+                // cannot be aliased — its co-tenant intermediate colour is m-dependent, so every
+                // borrowing session allocates the slot and takes its own COPY of the tail.
+                //
+                // 🛑 MEASURED on granite-3.1-8b fp16: 27 sessions × 419,430,400 B = 10.55 GiB of device
+                // memory that this budget could not see, so it authorised a KV pool against ~10 GiB that
+                // was already spoken for. Harmless at `--max-model-len 4096` (the pool wanted 1,980 MB
+                // of a far larger budget) and a real OOM the moment the context grows. The tail bytes,
+                // not the whole slot: the slot's intermediate colour is allocated per session with or
+                // without a spill, so only the tail is new — and only for the sessions BEYOND the owner,
+                // which `non_kv_bytes` has already counted once above.
+                //
+                // The session count is an UPPER BOUND from the declared rung lists rather than the
+                // sessions that will actually be built (a rung may fail to build and be skipped, and the
+                // ladder is constructed further down, after this budget). Over-charging shrinks the KV
+                // pool; under-charging hands out memory that does not exist.
+                let tail_bytes: u64 = spill_spans.iter().map(|(_, len)| *len as u64).sum();
+                let borrowers = (g0.prefill_rungs.len() + g0.decode_rungs.len() + 1) as u64;
+                let non_kv_bytes = non_kv_bytes + tail_bytes * borrowers;
+                // ⛔⛔⛔ THE ALLOCATABLE TENSOR CAPACITY, NOT THE CARD. `FlexAllocator` reserves one
+                // of its seven equal regions for PROGRAM memory, so a tensor allocation is served
+                // from six — and the budget below sizes exactly such an allocation. Spending
+                // `card_bytes.bytes()` here over-stated the pool by a full region: the log said
+                // `KV budget 86491 MB` while the allocator's own OOM for the next allocation
+                // reported `total_capacity_bytes=103079215104` (96 GiB = 6/7 of 112 GiB). See
+                // `CardMemory::tensor_capacity`.
                 let pool_budget_bytes =
                     scratchy_serving_engine::gpu_budget::compute_available_kv_bytes(
-                        card_bytes.bytes() as usize,
+                        card_bytes.tensor_capacity() as usize,
                         non_kv_bytes as usize,
                         // No separate activation profile on this backend: the intermediate segment IS the
                         // activation footprint and it is already counted in `non_kv_bytes` above. Passing it
@@ -909,13 +1075,25 @@ impl SpyreWorker {
                         0,
                         self.gpu_memory_utilization,
                     ) as u64;
+                // ⛔ AND THE POOL IS **ONE** ALLOCATION, so it cannot exceed one region however much
+                // tensor capacity is left over. Without this cap the budget can authorise a pool the
+                // allocator will refuse with a self-contradictory OOM (requested < free) — the same
+                // failure mode as an over-sized weight segment, one layer up.
+                let pool_budget_bytes = pool_budget_bytes.min(card_bytes.max_single_allocation());
                 tracing::info!(
-                    "superdsc paged: KV budget {} MB = card {} MB × --gpu-memory-utilization {:.2} − {} MB \
-                     already reserved by the bundle (all segments but KV) − 150 MB redundancy",
+                    "superdsc paged: KV budget {} MB = {} MB allocatable tensor memory (card {} MB \
+                     less the flex program region) × --gpu-memory-utilization {:.2} − {} MB already \
+                     reserved by the bundle (all segments but KV, incl. {} MB of spilled weight tail \
+                     copied into {} borrowing session(s)) − 150 MB redundancy, capped at the \
+                     {} MB a single allocation can be",
                     pool_budget_bytes / (1024 * 1024),
+                    card_bytes.tensor_capacity() / (1024 * 1024),
                     card_bytes.bytes() / (1024 * 1024),
                     self.gpu_memory_utilization,
                     non_kv_bytes / (1024 * 1024),
+                    (tail_bytes * borrowers) / (1024 * 1024),
+                    borrowers,
+                    card_bytes.max_single_allocation() / (1024 * 1024),
                 );
                 if pool_budget_bytes == 0 {
                     return Err(werr(format!(
@@ -1159,6 +1337,7 @@ impl SpyreWorker {
                                 .num_sources,
                             &resident_source_ids(
                                 wirings.prefill.as_ref().unwrap_or(&wirings.decode),
+                                &spill_tids,
                             ),
                         )
                         .map_err(|e| werr(format!("build SuperDSC PREFILL dxp session: {e}")))?;
@@ -1263,10 +1442,14 @@ impl SpyreWorker {
                     } else {
                         ladder.chunks(chunk).map(|c| c.to_vec()).collect()
                     };
+                    // Owned copy for the background build: the spilled tail's ids are declared
+                    // resident by every session, and these rungs are built off this thread.
+                    let ladder_spill = spill_tids.clone();
                     std::thread::spawn(move || {
                         let workers: Vec<_> = chunks
                             .into_iter()
                             .map(|part| {
+                                let rung_spill = ladder_spill.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
@@ -1276,7 +1459,7 @@ impl SpyreWorker {
                                                 kv_dim,
                                                 num_blocks,
                                                 wirings.decode.num_sources,
-                                                &resident_source_ids(&wirings.decode),
+                                                &resident_source_ids(&wirings.decode, &rung_spill),
                                                 &[1, 2],
                                             );
                                             (rm, r)
@@ -1303,10 +1486,41 @@ impl SpyreWorker {
                     kv_dim,
                     num_blocks,
                     wirings.decode.num_sources,
-                    &resident_source_ids(&wirings.decode),
+                    &resident_source_ids(&wirings.decode, &spill_tids),
                     weights,
                 )
                 .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
+                // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
+                // prepare has staged and uploaded it. Every borrowing session gets a copy of this
+                // (see `adopt_from_owner`) because the slot it lives in cannot be aliased. Empty —
+                // and every line below a no-op — for every model whose weights fit one segment.
+                let mut spill_images: Vec<(i64, Vec<u8>)> = Vec::new();
+                for (seg, len) in spill_spans {
+                    let mut image = ss.read_seg(seg).map_err(|e| {
+                        werr(format!(
+                            "reading the DECODE session's seg{seg} (the spilled weight tail, which \
+                             every borrowing session needs its own copy of): {e}"
+                        ))
+                    })?;
+                    // A short read is a wiring bug, not something to copy a truncated weight from:
+                    // the borrower would then hold a HALF tail and produce plausible-looking wrong
+                    // logits. The tail spans [0, len) by construction (`spill_weight_tail`).
+                    if image.len() < len {
+                        return Err(werr(format!(
+                            "the DECODE session's seg{seg} read back only {} B, but its spilled \
+                             weight tail spans {len} B — refusing to hand the borrowing sessions a \
+                             truncated lm_head",
+                            image.len()
+                        )));
+                    }
+                    image.truncate(len);
+                    info!(
+                        "[spyre-worker] sendnn: SEGMENT BUDGET: seg{seg} holds a {len} B spilled \
+                         weight tail; captured its device image for the borrowing sessions, which \
+                         cannot alias that segment"
+                    );
+                    spill_images.push((seg, image));
+                }
 
                 // ZERO THE KV POOL ONCE. A page handed to a request holds whatever was in pool
                 // memory, and decode attention computes q·k over the WHOLE page and applies the
@@ -1369,14 +1583,12 @@ impl SpyreWorker {
                 // borrower adopts holds freshly-written weights. Aliasing does NOT save prefill's initial
                 // H2D — that already happened during its own `prepare`; it reclaims the duplicate region.
                 if let Some(pf) = prefill_ss.as_mut() {
-                    for (seg, what) in [(1i64, "resident WEIGHTS"), (2, "resident KV")] {
-                        pf.alias_seg_from(&ss, seg).map_err(|e| {
-                            werr(format!(
-                                "aliasing the PREFILL session's seg{seg} ({what}) onto the DECODE \
-                                 session's failed: {e}"
-                            ))
-                        })?;
-                    }
+                    adopt_from_owner(pf, &ss, &spill_images).map_err(|e| {
+                        werr(format!(
+                            "the PREFILL session could not take the DECODE session's resident \
+                             state: {e}"
+                        ))
+                    })?;
                     info!(
                         "[spyre-worker] sendnn: PREFILL/DECODE now SHARE seg1 (weights, ~2.6 GB \
                          reclaimed) + seg2 (resident KV) — per-prompt KV handoff eliminated"
@@ -1396,15 +1608,12 @@ impl SpyreWorker {
                     match built {
                         Ok(mut rs) => {
                             let mut ok = true;
-                            for seg in [1i64, 2] {
-                                if let Err(e) = rs.alias_seg_from(&ss, seg) {
-                                    warn!(
-                                        "[spyre-worker] sendnn: prefill ladder rung m={rm}: seg{seg} \
-                                         alias failed: {e} — SKIPPED (a wider rung covers this width)"
-                                    );
-                                    ok = false;
-                                    break;
-                                }
+                            if let Err(e) = adopt_from_owner(&mut rs, &ss, &spill_images) {
+                                warn!(
+                                    "[spyre-worker] sendnn: prefill ladder rung m={rm}: {e} — \
+                                     SKIPPED (a wider rung covers this width)"
+                                );
+                                ok = false;
                             }
                             if ok {
                                 _n_ladder += 1;
@@ -1459,21 +1668,18 @@ impl SpyreWorker {
                                     .num_sources,
                                 &resident_source_ids(
                                     wirings.prefill.as_ref().unwrap_or(&wirings.decode),
+                                    &spill_tids,
                                 ),
                                 &[1, 2],
                             ) {
                                 Ok(mut ps) => {
                                     let mut ok = true;
-                                    for seg in [1i64, 2] {
-                                        if let Err(e) = ps.alias_seg_from(&ss, seg) {
-                                            warn!(
-                                                "[spyre-worker] sendnn: prefix-capable prefill m={pmq}: \
-                                                 seg{seg} alias failed: {e} — continuation chunks will \
-                                                 be REFUSED"
-                                            );
-                                            ok = false;
-                                            break;
-                                        }
+                                    if let Err(e) = adopt_from_owner(&mut ps, &ss, &spill_images) {
+                                        warn!(
+                                            "[spyre-worker] sendnn: prefix-capable prefill \
+                                             m={pmq}: {e} — continuation chunks will be REFUSED"
+                                        );
+                                        ok = false;
                                     }
                                     if ok {
                                         info!(
@@ -1642,20 +1848,17 @@ impl SpyreWorker {
                         kv_dim,
                         num_blocks,
                         wirings.decode.num_sources,
-                        &resident_source_ids(&wirings.decode),
+                        &resident_source_ids(&wirings.decode, &spill_tids),
                         &[1, 2],
                     ) {
                         Ok(mut rs) => {
                             let mut ok = true;
-                            for seg in [1i64, 2] {
-                                if let Err(e) = rs.alias_seg_from(&ss, seg) {
-                                    warn!(
-                                        "[spyre-worker] sendnn: decode batch rung seqs={rn}: seg{seg} \
-                                         alias failed: {e} — SKIPPED"
-                                    );
-                                    ok = false;
-                                    break;
-                                }
+                            if let Err(e) = adopt_from_owner(&mut rs, &ss, &spill_images) {
+                                warn!(
+                                    "[spyre-worker] sendnn: decode batch rung seqs={rn}: {e} — \
+                                     SKIPPED"
+                                );
+                                ok = false;
                             }
                             if ok {
                                 info!(

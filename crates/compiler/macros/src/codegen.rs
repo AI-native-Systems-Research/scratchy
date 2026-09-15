@@ -8673,19 +8673,21 @@ fn placement_tokens(
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::Placement {
         id,
         segment,
+        bank,
         offset,
         size,
         is_logits,
     } = p;
     let id = place_id_tokens(id);
-    let (segment, offset, size) = (
+    let (segment, bank, offset, size) = (
         proc_macro2::Literal::u32_unsuffixed(*segment),
+        proc_macro2::Literal::u32_unsuffixed(*bank),
         proc_macro2::Literal::u64_unsuffixed(*offset),
         proc_macro2::Literal::u64_unsuffixed(*size),
     );
     quote! {
         ::scratchy_target_spyre::bundle_code::Placement {
-            id: #id, segment: #segment, offset: #offset, size: #size,
+            id: #id, segment: #segment, bank: #bank, offset: #offset, size: #size,
             is_logits: #is_logits,
         }
     }
@@ -8724,12 +8726,16 @@ fn layout_tokens(
 ) -> proc_macro2::TokenStream {
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout {
         segment_bytes,
+        weight_bank_bytes,
         places,
         kernel_weights,
         scalarmul_scales,
         kv_request_stride_bytes,
     } = l;
     let segs = segment_bytes
+        .iter()
+        .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
+    let wbanks = weight_bank_bytes
         .iter()
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let places = places.iter().map(placement_tokens);
@@ -8743,6 +8749,7 @@ fn layout_tokens(
     quote! {
         ::scratchy_target_spyre::bundle_code::BundleLayout {
             segment_bytes: [#(#segs),*],
+            weight_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#wbanks),*]),
             places: ::std::borrow::Cow::Borrowed(&[#(#places),*]),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
             scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
@@ -8856,6 +8863,9 @@ fn reroll_tokens(
         iters,
         weight_stride,
         kv_stride,
+        layers_per_bank,
+        prefix_weight_bank,
+        suffix_weight_bank,
     } = m;
     let sib = |s: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::SiblingFp<'_>| {
         let inner = cow_str(s.as_str());
@@ -8883,6 +8893,11 @@ fn reroll_tokens(
         proc_macro2::Literal::u64_unsuffixed(*weight_stride),
         proc_macro2::Literal::u64_unsuffixed(*kv_stride),
     );
+    let (lpb, pwb, swb) = (
+        proc_macro2::Literal::u32_unsuffixed(*layers_per_bank),
+        proc_macro2::Literal::u32_unsuffixed(*prefix_weight_bank),
+        proc_macro2::Literal::u32_unsuffixed(*suffix_weight_bank),
+    );
     quote! {
         ::scratchy_target_spyre::bundle_code::RerollMeta {
             prefix: #prefix,
@@ -8892,6 +8907,9 @@ fn reroll_tokens(
             iters: #iters,
             weight_stride: #ws,
             kv_stride: #ks,
+            layers_per_bank: #lpb,
+            prefix_weight_bank: #pwb,
+            suffix_weight_bank: #swb,
         }
     }
 }
@@ -9451,6 +9469,9 @@ fn dump_wavefront_mega(
                                                     iters: rolled.iters,
                                                     weight_stride: rolled.weight_stride,
                                                     kv_stride: rolled.kv_stride,
+                                                    layers_per_bank: rolled.layers_per_bank,
+                                                    prefix_weight_bank: rolled.prefix_weight_bank,
+                                                    suffix_weight_bank: rolled.suffix_weight_bank,
                                                 },
                                             );
                                             // ── NUMERIC BISECTION oracle (opt-in SCRATCHY_SUPERDSC_DBG):

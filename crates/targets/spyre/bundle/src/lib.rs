@@ -113,6 +113,23 @@ impl SweptCols {
 /// The ≤7-packed-segment executor model: one device region per occupied segment.
 pub const NUM_SEGMENTS: usize = 7;
 
+/// ⛔⛔⛔ THE BYTES ONE SEGMENT MAY HOLD — because "one device region per occupied segment" (above)
+/// is not just a mental model, it is an ALLOCATION, and a flex region is capped at 16 GiB
+/// (`flex::MAX_REGION_SIZE`; the port is `flex_rs::allocator::MAX_REGION_BYTES`, and
+/// `scratchy-target-spyre` const-asserts the two are equal so they cannot drift). A `FlexAllocator`
+/// request is served from ONE region and never spans two, so this is a hard ceiling on a segment
+/// regardless of how much of the card is free.
+///
+/// 🛑 MEASURED, and it is why this constant exists rather than being discovered on a card:
+/// granite-3.1-8b at **fp16** packs a 17,365,082,112 B (16.17 GiB) weight segment — 40 layers ×
+/// 423,641,088 B, plus the 51200-wide tied embedding — which is 177 MiB past this ceiling. The load
+/// dies in `prepare` with an OOM whose own numbers look self-contradictory
+/// (`requested_bytes=17365082112, free_space_bytes=103048964224`) because the free space is spread
+/// across the five regions the request cannot reach. Every byte in that sum is a compile-time
+/// constant of the bundle, so the refusal belongs at `cargo build`, naming the segment — see
+/// `audit_layout_addresses`.
+pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// What a synthetic intermediate IS — the role it plays for the tensor it derives from.
 ///
 /// ⛔ THESE ARE NOT NAME SUFFIXES. Every one of these was a `format!("{out}_rot")`-style
@@ -291,7 +308,25 @@ pub struct Placement {
     pub id: PlaceId,
     /// Segment id (`0..NUM_SEGMENTS`).
     pub segment: u32,
-    /// Byte offset WITHIN the segment region (128 B aligned).
+    /// ⭐ WHICH **BANK** OF THAT SEGMENT — the second coordinate a weight needs once one segment's
+    /// worth of addresses is no longer one device region's worth of bytes.
+    ///
+    /// A segment is ONE region and a region is [`MAX_SEGMENT_BYTES`], so the weight segment used to
+    /// be the ceiling on a model. It is not a ceiling on the *addresses*: the rolled body bakes only
+    /// LAYER 0's offsets and reaches layer `v` by advancing the base it is handed
+    /// (`off[SEG_WEIGHT] = v·weight_stride`), and `tensor_allocs` is positional PER LAUNCH with no
+    /// segment identity in a `DevAddr`. So the weight segment can be a BANK of regions, each holding
+    /// a whole number of layers and each addressed as segment 1 by the same descriptors.
+    ///
+    /// ⛔ A LAUNCH HAS ONE BASE PER SEGMENT, so a launch may only touch ONE bank — which is why this
+    /// is a property of the PLACEMENT and the split is at a LAYER boundary. The emitter proves the
+    /// one-bank-per-launch-group rule at build time (`bank_weight_segment`); nothing here can.
+    ///
+    /// 0 for every tensor of every bundle whose weights fit one region — which is every bundle that
+    /// worked before banking existed, so their placements are byte-identical.
+    pub bank: u32,
+    /// Byte offset WITHIN the segment region (128 B aligned) — and within its BANK, when `bank` is
+    /// set: each bank is packed from 0, so this is what the descriptor bakes either way.
     pub offset: u64,
     /// Byte size.
     pub size: u64,
@@ -321,8 +356,18 @@ pub struct KernelWeight<'a> {
 /// The whole-bundle memory plan.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BundleLayout<'a> {
-    /// Bytes occupied per segment.
+    /// Bytes occupied per segment. For the weight segment this is BANK 0's bytes — see
+    /// [`BundleLayout::weight_bank_bytes`].
     pub segment_bytes: [u64; NUM_SEGMENTS],
+    /// ⭐ THE WEIGHT SEGMENT'S EXTRA BANKS, in bank order — bytes of banks `1..N`, so bank `b`'s
+    /// extent is `weight_bank_bytes[b - 1]` and bank 0's is `segment_bytes[SEG_WEIGHT]`.
+    ///
+    /// EMPTY for every bundle whose weights fit one device region, which is what keeps every such
+    /// bundle's layout and every runtime path byte-identical: an empty list means "one bank", the
+    /// single-region case that existed before banking. See [`Placement::bank`] for why a bank is a
+    /// coordinate rather than another segment (there is no free segment slot: 0/3 are
+    /// intermediates+activations, 2 is KV, 4 logits, 5+6 intermediate COLORS).
+    pub weight_bank_bytes: Cow<'a, [u64]>,
     /// Every placed tensor, in a deterministic order.
     pub places: Cow<'a, [Placement]>,
     /// The matmul kernel weights that must be staged tiled.
@@ -355,6 +400,22 @@ impl<'a> BundleLayout<'a> {
     /// The graph result's placement (`SegRole::Logits`).
     pub fn logits(&self) -> Option<&Placement> {
         self.places.iter().find(|p| p.is_logits)
+    }
+
+    /// How many BANKS the weight segment occupies — always ≥ 1, and exactly 1 for every bundle
+    /// whose weights fit one device region. Derived from [`Self::weight_bank_bytes`] so the count
+    /// and the extents cannot disagree.
+    pub fn weight_banks(&self) -> usize {
+        1 + self.weight_bank_bytes.len()
+    }
+
+    /// Bank `b`'s extent in bytes: bank 0 is the weight segment's own total, the rest come from
+    /// [`Self::weight_bank_bytes`]. `None` for a bank this bundle does not have.
+    pub fn weight_bank_extent(&self, b: usize, weight_seg: usize) -> Option<u64> {
+        match b.checked_sub(1) {
+            None => self.segment_bytes.get(weight_seg).copied(),
+            Some(i) => self.weight_bank_bytes.get(i).copied(),
+        }
     }
 }
 
@@ -522,6 +583,21 @@ pub struct RerollMeta<'a> {
     /// Byte stride between one layer's KV and the next (seg2). `page_stride = iters × kv_stride`,
     /// which is why an absent meta used to yield a zero-byte KV pool rather than an error.
     pub kv_stride: u64,
+    /// ⭐ HOW MANY LAYERS ONE WEIGHT BANK HOLDS — the divisor that turns a layer index into
+    /// `(bank, offset)`: layer `v` lives in bank `v / layers_per_bank` at
+    /// `(v % layers_per_bank) · weight_stride`.
+    ///
+    /// `iters` (every layer in one bank) whenever the weights fit one device region, which makes the
+    /// division a no-op and every existing bundle's launch sequence byte-identical. See
+    /// [`Placement::bank`].
+    pub layers_per_bank: u32,
+    /// The weight bank the PREFIX program's weight operands live in, and the SUFFIX's.
+    ///
+    /// ⛔ A LAUNCH HAS ONE BASE PER SEGMENT, so each group's weights must be in ONE bank — proven at
+    /// build time by `bank_weight_segment`, carried here because the runtime cannot re-derive which
+    /// bank a program's baked operands came from. 0 for an unbanked bundle.
+    pub prefix_weight_bank: u32,
+    pub suffix_weight_bank: u32,
 }
 
 impl<'a> RerollMeta<'a> {
@@ -729,6 +805,10 @@ mod tests {
             iters: 40,
             weight_stride: 60872704,
             kv_stride: 786432,
+            // Every layer in one bank — the unbanked case, where `v / layers_per_bank` is always 0.
+            layers_per_bank: 40,
+            prefix_weight_bank: 0,
+            suffix_weight_bank: 0,
         };
         let sibs: Vec<&str> = m.siblings().collect();
         for want in [
@@ -759,6 +839,7 @@ mod tests {
                 Placement {
                     id: PlaceId::Act(788),
                     segment: 4,
+                    bank: 0,
                     offset: 0,
                     size: 98304,
                     is_logits: true,
@@ -766,6 +847,7 @@ mod tests {
                 Placement {
                     id: PlaceId::Act(728).synth(SynthRole::Sq16),
                     segment: 0,
+                    bank: 0,
                     offset: 4096,
                     size: 2048,
                     is_logits: false,

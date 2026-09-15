@@ -192,7 +192,7 @@ pub fn matmul_opspec_split<DF: DataFormat, S>(
     splitter: S,
 ) -> Result<OpSpec, String>
 where
-    S: FnOnce(
+    S: Fn(
         &[scratchy_subtile::superdsc_opspec::ItDim],
         u32,
     ) -> std::collections::BTreeMap<&'static str, u32>,

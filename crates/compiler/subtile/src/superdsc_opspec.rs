@@ -904,8 +904,108 @@ impl WorkPlan {
              (resident at out_per_time={stk} is {single_stick_resident} B > {USABLE_LX_BYTES} B). \
              This matmul needs K-time PSUM accumulation (Stage 2), which the frontend does not \
              yet emit. Refusing to bake — this would be an on-card DtException 1535 \
-             (register-file / LX over-subscription).",
-            df.dataformat()
+             (register-file / LX over-subscription). {}",
+            df.dataformat(),
+            self.shape_note()
+        )))
+    }
+
+    /// The iteration extents and per-core slices behind an LX-fit refusal — the numbers that decide
+    /// [`Self::time_tile_for_lx`]'s answer, so the message names the shape instead of only the byte
+    /// count. Without it the refusal says a matmul is too big without saying which one or how it was
+    /// divided, and finding that out costs a whole traced rebuild.
+    fn shape_note(&self) -> String {
+        let per = self
+            .dims
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}={}/{}={}",
+                    d.name,
+                    d.size,
+                    self.split_of(d.name),
+                    self.per_core_extent(d.name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("(extent/split=per-core: {per})")
+    }
+
+    /// ⭐ THE WHOLE TILER: work-division, LX-fit time-tiling, and — when the cost model's own split
+    /// admits NO time-tile that fits — a REDUCTION-SPLIT REPAIR that trades spatial cores for
+    /// reduction cores and tries again.
+    ///
+    /// [`Self::time_tile_for_lx`]'s only lever is the OUTPUT stick dim, and that lever bottoms out at
+    /// one stick. Past that point the per-core resident set is
+    /// `per_core_mb·per_core_in + per_core_in·stick + per_core_mb·stick` — a function of the SPLIT,
+    /// not of the time-tiling — so "does not fit even at one stick" is a statement about the
+    /// work-division, and the frontier is the per-core REDUCTION extent. Splitting the reduction axis
+    /// `r` ways divides it by `r`: the `r` cores each contract a K-slice into a partial product dxp
+    /// PSUM-accumulates into the shared output tile (the output carries no `in`, so the disjoint-write
+    /// rule #50 does not apply), and each weight byte is still read exactly once card-wide — unlike an
+    /// `mb` split, which hands every core the SAME stationary weight and so multiplies the weight
+    /// stream that a decode is bandwidth-bound on.
+    ///
+    /// ⛔ MEASURED, and it is why this exists: granite-3.1-8b at fp16 has a `k=12800 n=4096` down_proj.
+    /// At one decode row the cost model's `out=32` leaves `per_core_in=12800`, whose one-stick weight
+    /// slab is 12800·64·2 = 1,638,400 B — 97.7 % of [`USABLE_LX_BYTES`] on its own. It fits with 0.8 %
+    /// spare. At TWO rows the activation slab grows by 25,600 B and the same op needs 1,689,856 B, so
+    /// every decode-batch rung of the model was a build refusal reading "needs Stage 2" for a shape
+    /// one reduction split away from fitting.
+    ///
+    /// The repair fires ONLY where the build would otherwise fail, and asks for the SMALLEST reduction
+    /// split that fits, so every op the cost model already placed is untouched and byte-identical.
+    /// Exhausting every divisor of the reduction stick count still yields the Stage-2 `Err` — a shape
+    /// that genuinely needs K-TIME (not K-core) accumulation is still a `cargo build` failure, never
+    /// an on-card DtException 1535.
+    pub fn divide_and_time_tile_for_lx<const N: u32>(
+        dims: &[ItDim],
+        budget: MaxCores<N>,
+        tiled_dim: &'static str,
+        splitter: impl Fn(&[ItDim], u32) -> BTreeMap<&'static str, u32>,
+        resident_bytes_fn: impl Fn(&WorkPlan, u32) -> u64,
+    ) -> Result<(WorkPlan, Option<TimeTile>), crate::superdsc_error::SuperDscError> {
+        use crate::superdsc_error::SuperDscError;
+
+        let plan = WorkPlan::divide(dims, budget, &splitter).map_err(SuperDscError)?;
+        let refusal = match plan.time_tile_for_lx(&resident_bytes_fn, tiled_dim) {
+            Ok(tt) => return Ok((plan, tt)),
+            Err(e) => e,
+        };
+
+        // The reduction axis is the ONLY per-core extent left to shrink (see the doc above). A
+        // non-stick or absent reduction dim has no divisor ladder to walk, so the refusal stands.
+        let Some(red) = dims.iter().find(|d| d.is_reduction && d.is_stick) else {
+            return Err(refusal);
+        };
+        let red_sticks = red.size / stick_basis(red).max(1);
+        for r in 2..=red_sticks.min(N) {
+            if !red_sticks.is_multiple_of(r) {
+                continue;
+            }
+            // Ask the cost model for its own best split of the cores the reduction does NOT take, then
+            // pin the reduction to `r` (or to its own larger choice). Re-running the SAME splitter
+            // under a smaller budget keeps the spatial shape the model's decision, not this pass's.
+            let mut splits = splitter(dims, (N / r).max(1));
+            let own = splits.get(red.name).copied().unwrap_or(1);
+            splits.insert(red.name, own.max(r));
+            // `divide` re-checks the core budget and the whole-stick-per-core law, so an illegal
+            // candidate self-eliminates here rather than reaching dxp.
+            let Ok(cand) = WorkPlan::divide(dims, budget, |_, _| splits.clone()) else {
+                continue;
+            };
+            if let Ok(tt) = cand.time_tile_for_lx(&resident_bytes_fn, tiled_dim) {
+                return Ok((cand, tt));
+            }
+        }
+        Err(SuperDscError(format!(
+            "{} A reduction-core split was also tried at every divisor of '{}'s {red_sticks}-stick \
+             reduction (2..={}) and none of them fit either — this shape needs K-TIME accumulation, \
+             not more K cores.",
+            refusal.0,
+            red.name,
+            red_sticks.min(N)
         )))
     }
 }
@@ -1996,7 +2096,18 @@ mod tests {
     /// x=batch) and a validated WorkPlan with an explicit split, for the
     /// time-tiling tests.
     fn matmul_plan(m: u32, n: u32, k: u32, batch: u32, mb_split: u32, out_split: u32) -> WorkPlan {
-        let dims = [
+        WorkPlan::divide(
+            &matmul_dims(m, n, k, batch),
+            MaxCores::<MAX_CORES>,
+            |_, _| BTreeMap::from([("mb", mb_split), ("out", out_split)]),
+        )
+        .unwrap()
+    }
+
+    /// [`matmul_plan`]'s iteration vocabulary on its own — what
+    /// [`WorkPlan::divide_and_time_tile_for_lx`] takes, since it owns the division itself.
+    fn matmul_dims(m: u32, n: u32, k: u32, batch: u32) -> [ItDim; 5] {
+        [
             ItDim {
                 name: "mb",
                 size: m,
@@ -2032,11 +2143,7 @@ mod tests {
                 is_stick: false,
                 df: Df::Fp16,
             },
-        ];
-        WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
-            BTreeMap::from([("mb", mb_split), ("out", out_split)])
-        })
-        .unwrap()
+        ]
     }
 
     /// The matmul per-core LX residency (a + w + o), fp16 = 2 B, INCLUDING the
@@ -2119,6 +2226,140 @@ mod tests {
         assert!(
             r.is_err(),
             "a matmul too big to tile on N alone must be a build Err (DtException-1535 guard), got {r:?}"
+        );
+    }
+
+    // ── the reduction-split LX repair (`divide_and_time_tile_for_lx`) ──────────────────────────
+
+    /// The residency the LIVE emitter uses (`TileOp::resident_bytes` → `matmul_lx_resident_generic`):
+    /// the reduction extent is the PER-CORE one, which is what makes a reduction split a lever on the
+    /// per-core tile at all. [`matmul_resident`] above deliberately reads the FULL `in` extent (the
+    /// "K is not divided" form the older tests were written against), so it cannot exercise the repair.
+    fn matmul_resident_per_core_k(plan: &WorkPlan, out_per_time: u32) -> u64 {
+        let per_core_mb = plan.per_core_extent("mb") as u64;
+        let k = plan.per_core_extent("in") as u64;
+        let batch = plan.extent("x").max(plan.extent("y")).max(1) as u64;
+        let opt = out_per_time as u64;
+        per_core_mb * k * batch * FP16_BYTES
+            + k * opt * batch * FP16_BYTES
+            + per_core_mb * opt * batch * FP16_BYTES
+    }
+
+    /// Give every core its own `out` stick-slice and never split `mb` — the live decode-batch policy,
+    /// reduced to what these tests need. It HONOURS the core budget it is handed, which is what lets
+    /// the repair trade cores away from it.
+    fn out_only_splitter(dims: &[ItDim], max_cores: u32) -> BTreeMap<&'static str, u32> {
+        let out = dims.iter().find(|d| d.name == "out").map_or(1, |d| d.size);
+        let sticks = (out / 64).max(1);
+        let mut s = max_cores.min(sticks).max(1);
+        while s > 1 && !sticks.is_multiple_of(s) {
+            s -= 1;
+        }
+        BTreeMap::from([("out", s)])
+    }
+
+    /// ⭐ granite-3.1-8b fp16 down_proj (k=12800, n=4096) at a TWO-ROW decode batch — the shape that
+    /// refused to bake. The control comes first: the cost model's own `out=32` division has NO
+    /// time-tile that fits (this is the exact `Err` the build reported), and the repair then places it
+    /// with the SMALLEST reduction split that does.
+    #[test]
+    fn lx_repair_places_granite_8b_down_proj_at_two_decode_rows() {
+        let dims = matmul_dims(2, 4096, 12800, 1);
+
+        // CONTROL — without the repair this shape is a build refusal, so the assertions below are
+        // measuring the repair and not a plan that fitted all along.
+        let unrepaired = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, out_only_splitter).unwrap();
+        assert_eq!(unrepaired.split_of("out"), 32);
+        assert_eq!(
+            matmul_resident_per_core_k(&unrepaired, 64),
+            1_689_856,
+            "the measured per-core resident at one out-stick"
+        );
+        assert!(
+            unrepaired
+                .time_tile_for_lx(matmul_resident_per_core_k, "out")
+                .is_err(),
+            "out-tiling alone must still refuse this shape"
+        );
+
+        let (plan, tt) = WorkPlan::divide_and_time_tile_for_lx(
+            &dims,
+            MaxCores::<MAX_CORES>,
+            "out",
+            out_only_splitter,
+            matmul_resident_per_core_k,
+        )
+        .expect("the reduction-split repair must place the down_proj");
+        assert_eq!(
+            plan.split_of("in"),
+            2,
+            "the SMALLEST reduction split that fits (6400 per core), not a bigger one"
+        );
+        assert_eq!(plan.per_core_extent("in"), 6400);
+        assert_eq!(
+            plan.cores_used().get(),
+            32,
+            "the reduction cores come OUT of the out split — the card stays full"
+        );
+        let tt = tt.expect("a 6400-deep reduction still needs an out time-tile");
+        let out_per_time = plan.per_core_extent("out") / tt.count();
+        assert!(
+            out_per_time.is_multiple_of(64),
+            "whole fp16 sticks per trip"
+        );
+        assert!(
+            matmul_resident_per_core_k(&plan, out_per_time) <= USABLE_LX_BYTES,
+            "the repaired per-time tile must actually fit LX"
+        );
+    }
+
+    /// An op the cost model already placed is returned UNTOUCHED — the repair is reachable only from
+    /// a refusal, so every bundle that bakes today keeps its division and its trip count.
+    #[test]
+    fn lx_repair_leaves_a_fitting_op_byte_identical() {
+        let dims = matmul_dims(384, 384, 64, 16);
+        let fixed = |_: &[ItDim], _: u32| BTreeMap::from([("mb", 16u32), ("out", 2u32)]);
+        let (plan, tt) = WorkPlan::divide_and_time_tile_for_lx(
+            &dims,
+            MaxCores::<MAX_CORES>,
+            "out",
+            fixed,
+            matmul_resident_per_core_k,
+        )
+        .expect("the known-good bmm fits");
+        assert!(tt.is_none(), "it fitted in one trip before and still does");
+        assert_eq!(
+            plan.splits(),
+            &BTreeMap::from([("mb", 16u32), ("out", 2u32)])
+        );
+        assert_eq!(plan.split_of("in"), 1, "no reduction split was introduced");
+    }
+
+    /// NEGATIVE CONTROL: a shape whose OUTPUT tile alone busts LX (`per_core_mb · stick · 2` =
+    /// 2,097,152 B at mb=16384 unsplit) cannot be rescued by any reduction split, because the
+    /// reduction is absent from the output term. It stays a `cargo build` failure — the Stage-2 guard
+    /// is narrowed by the repair, not removed — and the message says the ladder was walked.
+    #[test]
+    fn lx_repair_still_refuses_a_shape_that_needs_k_time() {
+        let dims = matmul_dims(16384, 4096, 4096, 1);
+        let fixed = |_: &[ItDim], _: u32| BTreeMap::new();
+        let e = WorkPlan::divide_and_time_tile_for_lx(
+            &dims,
+            MaxCores::<MAX_CORES>,
+            "out",
+            fixed,
+            matmul_resident_per_core_k,
+        )
+        .expect_err("no reduction split can shrink the OUTPUT tile");
+        assert!(
+            e.0.contains("reduction-core split was also tried"),
+            "the refusal must say the reduction ladder was walked, got: {}",
+            e.0
+        );
+        assert!(
+            e.0.contains("K-TIME accumulation"),
+            "and must name what the shape actually needs, got: {}",
+            e.0
         );
     }
 }
