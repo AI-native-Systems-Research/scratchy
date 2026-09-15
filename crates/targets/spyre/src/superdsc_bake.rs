@@ -113,7 +113,7 @@ impl Reaper {
         }
         g.err = Some(e);
         for &pgid in g.live.iter() {
-            kill_group(pgid);
+            teardown::sigkill_and_leave_the_reap_to_the_owner(pgid);
         }
     }
 
@@ -124,18 +124,210 @@ impl Reaper {
     fn has_failed(&self) -> bool {
         self.inner().err.is_some()
     }
+
+    /// ⭐ KILL AND REAP EVERY LIVE COMPILER — the teardown for the exits NO destructor sees.
+    ///
+    /// ⛔ THIS IS THE PATH THAT LEAKED, AND [`Self::fail`] IS NOT IT. `fail` runs only when a dxp compile
+    /// fails, and every child it kills is reaped by the worker that owns it. But the emit dies other ways:
+    /// `audit_layout_addresses` refusing a layout, any other panic in the lowering, the `panic!` that
+    /// turns the first bake error into the build's error. Each of those unwinds the MAIN thread of the
+    /// build script, and no destructor on a WORKER thread ever runs — so `COMPILE_WIDTH` children are
+    /// still running when the process exits. MEASURED on the pod, granite-3.1-2b, staging turned read-only
+    /// mid-emit so the emitter's own write failed and no dxp compile did: **30 permanent `dxp_standalone`
+    /// zombies, one per live compiler, and 0 with this sweep in place.** The build failed identically both
+    /// times (`panicked at codegen.rs:9534`, zero `dxp refused` lines), so the sweep is the only variable.
+    ///
+    /// `PR_SET_PDEATHSIG` (see [`DxpTool::compile`]) covers the KILL for that case — the kernel signals
+    /// each child when its spawning thread dies — but nothing covered the REAP, and a killed-but-unreaped
+    /// child re-parented to a `sleep infinity` PID 1 is a zombie forever. This is the reap.
+    ///
+    /// ⛔ CLOSE THE DOOR BEFORE COUNTING. The workers keep running all through `atexit`, so a ONE-SHOT
+    /// snapshot of `live` is a sample, not a set: a child registered after it is never swept. Marking the
+    /// build over FIRST — under the same lock [`Self::register`] takes — is what turns the sample into a
+    /// set. From that moment every later spawn is REFUSED, and a refused spawn is killed and reaped by its
+    /// own guard's `Drop`, so `live` can only shrink and a bounded number of rounds drains it. The rounds
+    /// catch a worker that was between `spawn` and `register` when the door closed: it appears in `live` a
+    /// moment later and the next round takes it.
+    ///
+    /// ⚠️ HONEST SCOPE: the leak this whole sweep fixes was measured at 30 permanent `dxp_standalone`
+    /// zombies per failed emit — one per live compiler — going to 0. The door-closing above is a race
+    /// closed BY CONSTRUCTION, not by measurement: a snapshot-only sweep also measured 0, because the
+    /// window between it and process exit is short. It is here because "short" is not "empty" and the
+    /// window widens with anything that slows teardown.
+    fn kill_and_reap_all(&self) {
+        {
+            let mut g = self.inner();
+            if g.err.is_none() {
+                g.err = Some("the build script is exiting".to_string());
+            }
+        }
+        // Bounded: `live` only shrinks now, so this converges. The sleep gives a worker caught mid-`spawn`
+        // time to reach its refusal, which is where its own teardown happens.
+        for round in 0..32 {
+            // Snapshot under the lock, then kill and reap OUTSIDE it: reaping sleeps, and holding the
+            // registry across it would stall the `deregister` of every worker still trying to exit.
+            let live: Vec<i32> = self.inner().live.iter().copied().collect();
+            if live.is_empty() {
+                break;
+            }
+            teardown::kill_and_reap_each(&live);
+            if round > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
 }
 
-/// SIGKILL a whole process group.
+/// The process-wide [`Reaper`], published for [`reap_on_exit`].
 ///
-/// ⚠️ Only sound while the group is known to have a live member: a pgid is reusable once its last
-/// member is reaped, so a kill sent after that could in principle land on an unrelated new group. Every
-/// caller here sends it to a group it is still holding a `Child` for, or has just refused to reap.
-fn kill_group(pgid: i32) {
-    // SAFETY: a negative pid targets the process group rather than one pid. ESRCH (the group is
-    // already gone) is the expected outcome of a race with normal exit, not an error to surface.
+/// A `static` beside the queue rather than a reach into [`global`], because an `atexit` handler must
+/// never be the thing that CREATES the queue: `global()` would spawn `COMPILE_WIDTH` worker threads
+/// during process teardown on a build that never baked anything at all.
+static EXIT_REAPER: std::sync::OnceLock<Arc<Reaper>> = std::sync::OnceLock::new();
+
+/// `atexit` hook: kill and reap every compiler still live at process exit.
+///
+/// Covers a panic unwind, a `main` that returns, and `process::exit` — every way the build script can end
+/// short of being SIGKILLed itself, which nothing in userspace can cover. Registered rather than called
+/// from a destructor because the queue lives in a `static` ([`global`]), and statics are never dropped.
+extern "C" fn reap_on_exit() {
+    if let Some(reaper) = EXIT_REAPER.get() {
+        reaper.kill_and_reap_all();
+        // Last resort for a child forked but never registered: the registry cannot name it, so nothing
+        // else can reap it. ⛔ ONLY HERE, never inside `kill_and_reap_all`: this reaps by `-1`, so any
+        // caller that is not the dying process would steal an exit status from unrelated code — in the
+        // unit tests, from a sibling test's own child.
+        teardown::drain_dead_children();
+    }
+}
+
+/// Publish `reaper` to [`reap_on_exit`] and register that hook — ONCE per process.
+fn arm_exit_teardown(reaper: &Arc<Reaper>) {
+    if EXIT_REAPER.set(Arc::clone(reaper)).is_err() {
+        // Already armed. One queue serves the whole process ([`global`]), so the hook registered by the
+        // first arming already points at the reaper that owns every live child.
+        return;
+    }
+    // SAFETY: `atexit` stores a plain `extern "C"` function pointer, which has static lifetime here. The
+    // handler only reads a `OnceLock` and calls `kill`/`waitpid`, so it is safe to run during teardown
+    // while worker threads are still live.
     unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
+        libc::atexit(reap_on_exit);
+    }
+}
+
+/// ⛔⛔ KILL AND REAP ARE ONE OPERATION — AND THIS MODULE IS WHY THAT IS NOT MERELY A COMMENT.
+///
+/// 🛑 SIGKILL ENDS A PROCESS; ONLY `wait` CLEARS ITS TASK-TABLE ENTRY. `libc::kill` and `libc::waitpid`
+/// are unrelated FFI calls and nothing in the type system ties them together, which is precisely how the
+/// previous fix shipped a `kill` with no `wait`: the guard, the `Drop`, the whole RAII shape was right,
+/// and it still leaked, because `std::process::Child` is the one std type that deliberately has NO `Drop`
+/// — dropping it neither waits nor kills. So the language will not catch this for you. A MODULE BOUNDARY
+/// will: [`kill`] and [`reap`] are private here, and the only teardown spellable from outside is one that
+/// reaps. The single caller that legitimately does not reap has to say so in the function's name.
+///
+/// What a leaked zombie costs: it is re-parented to PID 1 on exit, and PID 1 in a dev pod is
+/// `sleep infinity`, which never calls `wait()`. So it is PERMANENT and unclearable without restarting
+/// the pod — 227 counted across one session.
+mod teardown {
+    /// End one group we own: SIGKILL, then reap. The only way out of this module for a group we hold.
+    pub(super) fn kill_and_reap(pgid: i32) {
+        kill(pgid);
+        reap(pgid);
+    }
+
+    /// End many. Kills EVERY group before reaping any, so the deaths overlap and the reaps almost all
+    /// return on their first poll — at `COMPILE_WIDTH` groups that is the difference between
+    /// milliseconds and a visible stall on the way out.
+    pub(super) fn kill_and_reap_each(pgids: &[i32]) {
+        for &pgid in pgids {
+            kill(pgid);
+        }
+        for &pgid in pgids {
+            reap(pgid);
+        }
+    }
+
+    /// ⚠️ SIGKILL WITH NO REAP — the one legitimate caller, and it is NOT teardown.
+    ///
+    /// [`super::Reaper::fail`] hurries along a group whose `Child` another worker still holds, and that
+    /// worker's `wait_with_output` is what reaps it. Reaping here would race the owner and turn a
+    /// diagnostic `dxp refused …` into `wait: No child processes`. The reap obligation travels with the
+    /// [`super::ChildGroup`], never with the killer — spelled out in the name so this cannot be mistaken
+    /// for the functions above.
+    pub(super) fn sigkill_and_leave_the_reap_to_the_owner(pgid: i32) {
+        kill(pgid);
+    }
+
+    /// Collect any child of ours that is ALREADY dead, without blocking and without knowing its pgid.
+    ///
+    /// The backstop for a child that was forked but not yet registered when the door closed: the
+    /// registry cannot name it, so nothing else can reap it. Non-blocking, so it can never hang the
+    /// exit; it only ever clears corpses.
+    pub(super) fn drain_dead_children() {
+        for _ in 0..1024 {
+            let mut status: libc::c_int = 0;
+            // SAFETY: -1 waits on any child of this process; `status` is a live local. Only reached at
+            // process exit, where stealing a status from code that is itself about to die is harmless.
+            let got = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            if got <= 0 {
+                return;
+            }
+        }
+    }
+
+    /// ⚠️ Only sound while the group is known to have a live, UNREAPED member: a pgid is reusable once
+    /// its last member is reaped, so a kill sent after that could land on an unrelated new group.
+    fn kill(pgid: i32) {
+        // SAFETY: a negative pid targets the process group rather than one pid. ESRCH (the group is
+        // already gone) is the expected outcome of a race with normal exit, not an error to surface.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+
+    /// BOUNDED, and polling rather than blocking, on purpose. SIGKILL is asynchronous — the leader is
+    /// not reaped the instant `kill` returns — but a blocking `waitpid` on a leader wedged in
+    /// uninterruptible I/O would hang the build, and a hung build is worse than the zombie this exists
+    /// to prevent. The first or second poll succeeds in practice; the budget only bounds the
+    /// pathological case.
+    ///
+    /// Reaps until `ECHILD` rather than after one success, because `waitpid(-pgid, …)` is scoped to the
+    /// GROUP. dxp forks nothing — measured on the pod, 0 children on every live `dxp_standalone`
+    /// sampled — so today the group is just the leader; a group that ever grew a second member would
+    /// otherwise leave it behind.
+    fn reap(pgid: i32) {
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+        let mut waited = std::time::Duration::ZERO;
+        let mut backoff = std::time::Duration::from_micros(200);
+        loop {
+            let mut status: libc::c_int = 0;
+            // SAFETY: a negative pid waits on the process group rather than one pid, and `status` is a
+            // live local. Only this process's own children are reapable, and each `dxp_standalone` is
+            // its own group (pgid == its pid), so the groups are disjoint and this cannot steal a
+            // sibling compile's child.
+            let reaped = unsafe { libc::waitpid(-pgid, &mut status, libc::WNOHANG) };
+            if reaped > 0 {
+                // Took one. There may be another member, so ask again before sleeping.
+                continue;
+            }
+            if reaped < 0 {
+                // ECHILD — nothing in this group is ours to reap any more, which IS the success
+                // condition. EINTR is the only outcome worth retrying.
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return;
+            }
+            // 0: a member is alive but not yet reapable — the SIGKILL is still in flight.
+            if waited >= BUDGET {
+                return;
+            }
+            std::thread::sleep(backoff);
+            waited += backoff;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
     }
 }
 
@@ -148,11 +340,30 @@ fn kill_group(pgid: i32) {
 /// insert-then-remove around the wait call gets that right only until someone edits the function
 /// between the two lines.
 struct ChildGroup<'a> {
-    /// `None` once [`Self::wait_with_output`] has reaped the leader — which is what tells `Drop` the
-    /// group must NOT be killed, its pgid being free for reuse from that moment on.
-    child: Option<std::process::Child>,
+    /// Where the leader is in its lifecycle — which is precisely what `Drop` has to decide from.
+    leader: Leader,
     pgid: i32,
     reaper: &'a Reaper,
+}
+
+/// The leader's place in its lifecycle: spawned, being waited on, or reaped.
+///
+/// ⛔ THE MIDDLE STATE IS THE POINT, and an `Option<Child>` could not express it. With two states —
+/// "holding a `Child`" and "not" — a panic inside [`ChildGroup::wait_with_output`], which has already
+/// MOVED the `Child` out by the time anything in it can panic, left `Drop` reading the "already reaped"
+/// case: it neither killed nor reaped, and the child ran on to be orphaned. `Waiting` says "the leader
+/// is still ours and still unreaped, but the `Child` is gone" — killable and reapable, and reachable
+/// only by unwinding.
+enum Leader {
+    /// Spawned, not yet waited on. `Drop` must kill the group and reap it.
+    Running(std::process::Child),
+    /// [`ChildGroup::wait_with_output`] has taken the `Child` and is waiting on it. Seen by `Drop` only
+    /// if that wait unwound, in which case the leader is unreaped and must be killed and reaped by
+    /// pgid — there is no `Child` left to wait on.
+    Waiting,
+    /// Reaped. `Drop` must NOT kill: the pgid is free for reuse from this moment on, so a kill could
+    /// land on an unrelated group.
+    Reaped,
 }
 
 impl<'a> ChildGroup<'a> {
@@ -170,7 +381,7 @@ impl<'a> ChildGroup<'a> {
         // Construct the guard BEFORE registering, so the refusal path below tears the child down
         // through the same `Drop` as every other exit.
         let guard = ChildGroup {
-            child: Some(child),
+            leader: Leader::Running(child),
             pgid,
             reaper,
         };
@@ -182,22 +393,50 @@ impl<'a> ChildGroup<'a> {
 
     /// Wait for the leader and collect its output, consuming the guard so `Drop` runs immediately
     /// after — deregistering either way.
+    ///
+    /// Advances to [`Leader::Reaped`] when the leader is gone — on success, and equally on `ECHILD`,
+    /// which says something else reaped it first. ⚠️ THAT SECOND CASE IS A SAFETY CONDITION, NOT
+    /// TIDINESS: a reaped pgid is free for reuse, so treating `ECHILD` as "still ours" would send `Drop`
+    /// on to `kill(-pgid)` and it could land the SIGKILL on an unrelated process group. Only
+    /// [`Reaper::kill_and_reap_all`] can get there first, and only during process exit.
+    ///
+    /// Any OTHER error leaves the leader's fate unknown, so the state stays [`Leader::Waiting`] and
+    /// `Drop` kills and reaps — the group is still ours in that case.
     fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
-        self.child
-            .take()
-            .expect("ChildGroup::spawn is the only constructor and it always fills child")
-            .wait_with_output()
+        let child = match std::mem::replace(&mut self.leader, Leader::Waiting) {
+            Leader::Running(child) => child,
+            // Unreachable: `spawn` is the only constructor, it always sets `Running`, and this method
+            // consumes `self` so it cannot run twice. Reported rather than panicked so an impossible
+            // state costs a build error instead of a crash — and the state is put BACK, so `Drop` still
+            // makes the right kill/reap decision.
+            already => {
+                self.leader = already;
+                return Err(std::io::Error::other(
+                    "ChildGroup: the leader was already taken",
+                ));
+            }
+        };
+        let out = child.wait_with_output();
+        let gone = match &out {
+            Ok(_) => true,
+            Err(e) => e.raw_os_error() == Some(libc::ECHILD),
+        };
+        if gone {
+            self.leader = Leader::Reaped;
+        }
+        out
     }
 }
 
 impl Drop for ChildGroup<'_> {
     fn drop(&mut self) {
         self.reaper.deregister(self.pgid);
-        // Kill ONLY while the leader is still unreaped. Once `wait_with_output` has reaped it the group
-        // may be empty and its pgid already recycled, so a kill here could hit an unrelated process
-        // group; while we still hold the `Child`, the group is guaranteed to be ours.
-        if self.child.is_some() {
-            kill_group(self.pgid);
+        // KILL AND REAP AS A PAIR, and only while the leader is still unreaped. Once `wait_with_output`
+        // has reaped it the group may be empty and its pgid already recycled, so a kill here could hit
+        // an unrelated process group; until then the group is guaranteed to be ours. The reap is what
+        // keeps the SIGKILL from leaving a zombie nothing will ever collect — see [`teardown`].
+        if !matches!(self.leader, Leader::Reaped) {
+            teardown::kill_and_reap(self.pgid);
         }
     }
 }
@@ -659,6 +898,9 @@ impl<const N: usize> BakeQueue<N> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<SealedGroup>(N);
         let rx = Arc::new(Mutex::new(rx));
         let reaper: Arc<Reaper> = Arc::new(Reaper::default());
+        // Arm the process-exit teardown before the first child can exist: the emit's own panics unwind
+        // only the main thread, so this hook is the ONLY thing that reaps a worker's in-flight child.
+        arm_exit_teardown(&reaper);
         let compiled = Arc::new(AtomicUsize::new(0));
         let device_bytes = Arc::new(AtomicUsize::new(0));
         let results: Arc<Mutex<HashMap<GroupId, Arc<CompiledGroup>>>> =
@@ -969,4 +1211,105 @@ pub struct BakeStats {
     pub peak_staged_bytes: usize,
     /// dxp invocations SKIPPED because an identical group had already been compiled.
     pub memo_hits: usize,
+}
+
+/// ⛔ THE ZOMBIE REGRESSION TESTS — a leak that is COUNTED, so the test counts it.
+///
+/// Each asks the one question the process table answers: after the teardown under test, is the child
+/// still THIS process's child? `waitpid` says `ECHILD` only once a child has been reaped, so `ECHILD` is
+/// the pass condition and BOTH other answers are the bug — `0` means it is still running, and a positive
+/// return means it was sitting there as a zombie and the test itself just collected it.
+///
+/// These run anywhere `dxp` does not have to exist (a Mac included): the leak is about this process's own
+/// children, so `sleep` and `true` stand in for the compiler exactly.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Is `pid` still ours — alive or a zombie? `false` (i.e. `ECHILD`) is the only answer that means
+    /// REAPED.
+    fn still_ours(pid: i32) -> bool {
+        let mut status: libc::c_int = 0;
+        // SAFETY: a positive pid waits on exactly that child, and `status` is a live local.
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) >= 0 }
+    }
+
+    /// A child that outlives the test if the reap is missing, so a leak is visible rather than racing
+    /// with normal exit.
+    fn sleeper() -> std::process::Command {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
+        cmd
+    }
+
+    /// Dropping a guard that never waited must leave NOTHING behind. This is the path a refused
+    /// registration takes (`spawn` returns `Err` and only `Drop` will ever see that child), and the path
+    /// an unwound `wait_with_output` takes. Before the reap, the SIGKILL alone left a zombie this process
+    /// still owned — which on exit re-parented to a PID 1 that never calls `wait()`.
+    #[test]
+    fn dropping_an_unwaited_guard_reaps_the_child() {
+        let reaper = Reaper::default();
+        let guard = ChildGroup::spawn(&mut sleeper(), &reaper).expect("spawn");
+        let pgid = guard.pgid;
+        drop(guard);
+        assert!(!still_ours(pgid), "pid {pgid} survived Drop unreaped");
+        assert!(reaper.inner().live.is_empty(), "Drop must deregister");
+    }
+
+    /// The exit sweep reaps a child whose owning worker will NEVER run again — the `atexit` path, and the
+    /// one [`Reaper::fail`] cannot cover.
+    #[test]
+    fn the_exit_sweep_reaps_a_child_no_destructor_will_see() {
+        let reaper = Reaper::default();
+        let child = sleeper().process_group(0).spawn().expect("spawn");
+        let pgid = child.id() as i32;
+        assert!(reaper.register(pgid), "a fresh Reaper must accept a child");
+        // Dropping a `std::process::Child` does NOT reap it — that fact is the whole bug — so this is
+        // exactly the shape of a worker thread frozen mid-compile by process exit.
+        drop(child);
+        reaper.kill_and_reap_all();
+        assert!(
+            !still_ours(pgid),
+            "pid {pgid} survived the exit sweep unreaped"
+        );
+    }
+
+    /// ⛔ THE SWEEP MUST CLOSE THE DOOR BEFORE IT COUNTS, or its snapshot of `live` is a sample rather than
+    /// a set — the workers are still running during `atexit` and a child registered after the snapshot is
+    /// never swept. Refusing every later spawn is what makes `live` monotonically shrink, and so what makes
+    /// the sweep's bounded rounds converge.
+    #[test]
+    fn the_exit_sweep_refuses_every_later_spawn() {
+        let reaper = Reaper::default();
+        reaper.kill_and_reap_all();
+        assert!(
+            !reaper.register(4242),
+            "a registration after the sweep must be refused, or it escapes the sweep"
+        );
+        // And a refused spawn is torn down by its own guard, which is the path that makes the refusal safe.
+        let err = ChildGroup::spawn(&mut sleeper(), &reaper)
+            .err()
+            .expect("spawn must be refused once the sweep has run");
+        assert!(err.contains("already failed"), "unexpected refusal: {err}");
+    }
+
+    /// The SUCCESS path must not regress: a guard that DID wait has nothing left to kill, and killing
+    /// there would target a pgid already free for reuse.
+    #[test]
+    fn a_waited_guard_leaves_nothing_behind() {
+        let reaper = Reaper::default();
+        let mut cmd = std::process::Command::new("true");
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
+        let guard = ChildGroup::spawn(&mut cmd, &reaper).expect("spawn");
+        let pgid = guard.pgid;
+        let out = guard.wait_with_output().expect("wait");
+        assert!(out.status.success(), "`true` must exit 0");
+        assert!(!still_ours(pgid), "a waited leader must already be reaped");
+        assert!(reaper.inner().live.is_empty(), "the guard must deregister");
+    }
 }
