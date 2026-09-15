@@ -1274,6 +1274,43 @@ impl StageDims {
         Some(Extent(span))
     }
 
+    /// Replaces: e011_primaryDimToVal_clView_st
+    ///
+    /// ONE CORELET'S VIEW OF A DIM — that corelet's `coreletSplit_` share, re-expressed in
+    /// granularity units where asked, density-scaled, then rewritten by [`Self::calculate_padded`]. A
+    /// dim the split does not name, or no corelet at all, is [`Self::scaled_extent`]'s whole-core
+    /// answer.
+    ///
+    /// ⛔ A SHORT SPLIT IS A STOP, NOT A FALL-THROUGH: once `clId >= 0 && coreletSplit_.count(d)` both
+    /// hold the reference is committed to `.at(clId)` (`dsc/dims.cpp:635`) and that throw is
+    /// [`None`] — answering the base extent there hands one corelet the WHOLE core's extent.
+    ///
+    /// ⛔ DIVERGENCE, AS IN [`Self::scaled_extent`]: INTEGER DIVISION for the `double` density.
+    #[must_use]
+    pub fn corelet_extent(
+        &self,
+        dim: PrimaryDim,
+        corelet: Option<Corelet>,
+        padded: &PaddingForm,
+        density: Option<ScaleBlock>,
+        granularity: bool,
+    ) -> Option<Extent> {
+        let (Some(corelet), Some(split)) = (corelet, self.corelet_split.get(&dim)) else {
+            return self.scaled_extent(dim, padded, density, granularity);
+        };
+        let share = *split.get(usize::try_from(corelet.get()).ok()?)?;
+        let share = if granularity {
+            self.symbolic.scale_from_max_to_granularity(dim, share)?
+        } else {
+            share
+        };
+        let scaled = match density {
+            Some(block) => share.0 / i64::try_from(block.count().0).unwrap_or(i64::MAX),
+            None => share.0,
+        };
+        self.calculate_padded(dim, Extent(scaled), padded, granularity)
+    }
+
     /// `primaryDimToVal_st(dim, NO_COMPONENT, -1, -1, {dim, pad})` — [`Self::scaled_extent`] with the
     /// default density and the max symbolic size, which is what every caller that names one padding
     /// type asks for.
@@ -2873,6 +2910,233 @@ mod tests_e009_e010 {
         assert_eq!(
             windowed.padded_extent(PrimaryDim::Out, PadType::PaddedWZeroPad),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e011 {
+    //! ⭐⭐ THE REFERENCE PUBLISHES BOTH SIDES OF THIS FUNCTION. MEASURED over all 187 g0 reference
+    //! exports: exactly 8 of their 4,850 dim blocks state a non-empty `coreletSplit_` and all 8 are
+    //! `g0/debug/sdsc_49/sdsc.json`, the ONLY program with `numCoreletsUsed_ > 1` — and each states
+    //! the split BESIDE the whole-core slot, so the corelet view's answer and the base view's answer
+    //! are both the reference's own numbers rather than ours.
+    //!
+    //! ⛔ WHAT THE CORPUS CANNOT SHOW, SAME MEASUREMENT: 0 of those 4,850 blocks states any
+    //! `symbolicDimInfo_`, so the granularity arm and the density divide are CONSTRUCTED from the
+    //! reference's own formulae and are marked as such.
+
+    use super::{Granularity, MaxSize, StageDims, Symbolic, SymbolicDimInfo};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+    use crate::schedule::ddc::fold::{Cardinality, ScaleBlock};
+    use crate::schedule::ddc::transformation_util::PaddingForm;
+    use crate::units::Corelet;
+    use std::collections::BTreeMap;
+    use std::num::NonZeroU32;
+
+    /// `sdsc_49`'s `dataStageParam_["0"].ss_` — `name_: "core"`, `out_: 512`, `mb_: 2`, `y_: 1`,
+    /// `in_: -1`, `coreletSplit_: {"out": [256, 256]}` and an EMPTY `paddingSizes_`.
+    fn core_stage() -> StageDims {
+        StageDims {
+            extents: BTreeMap::from([
+                (PrimaryDim::Out, Extent(512)),
+                (PrimaryDim::Mb, Extent(2)),
+                (PrimaryDim::Y, Extent(1)),
+            ]),
+            corelet_split: BTreeMap::from([(PrimaryDim::Out, vec![Extent(256), Extent(256)])]),
+            ..StageDims::default()
+        }
+    }
+
+    /// e011 — the corelet view answers the SHARE and the base view the WHOLE, on the one g0 program
+    /// that splits a dim across corelets.
+    #[test]
+    fn the_reference_s_own_corelet_split_export_is_what_the_corelet_view_answers() {
+        let core = core_stage();
+        let plain = PaddingForm::default();
+
+        // `coreletSplit_["out"] = [256, 256]` — each corelet's own share.
+        assert_eq!(
+            core.corelet_extent(
+                PrimaryDim::Out,
+                Some(Corelet::at::<0>()),
+                &plain,
+                None,
+                false
+            ),
+            Some(Extent(256))
+        );
+        assert_eq!(
+            core.corelet_extent(
+                PrimaryDim::Out,
+                Some(Corelet::at::<1>()),
+                &plain,
+                None,
+                false
+            ),
+            Some(Extent(256))
+        );
+        // `clId = -1` on the SAME dim is `out_: 512`, the whole core — this is the pair the reference
+        // exports together, and reading either for the other is the defect this asserts against.
+        assert_eq!(
+            core.corelet_extent(PrimaryDim::Out, None, &plain, None, false),
+            Some(Extent(512))
+        );
+
+        // ⭐ A CORELET ID WITH NO SPLIT ON THE DIM IS STILL THE BASE READ: `mb_: 2` and `y_: 1` are
+        // whole-core values in that export, and `coreletSplit_` names only `out`.
+        assert_eq!(
+            core.corelet_extent(
+                PrimaryDim::Mb,
+                Some(Corelet::at::<1>()),
+                &plain,
+                None,
+                false
+            ),
+            Some(Extent(2))
+        );
+        assert_eq!(
+            core.corelet_extent(PrimaryDim::Y, Some(Corelet::at::<0>()), &plain, None, false),
+            Some(Extent(1))
+        );
+        // `in_: -1` in the same export — the unstated slot, reached through the base arm.
+        assert_eq!(
+            core.corelet_extent(
+                PrimaryDim::In,
+                Some(Corelet::at::<0>()),
+                &plain,
+                None,
+                false
+            ),
+            None
+        );
+
+        // The same program's `dataStageParam_["2"].ss_`: `out_: 128`, `coreletSplit_: {"out": [64,
+        // 64]}`, `mb_: 1`, `y_: -1` — a second published pair, which pins the answer to the stage.
+        let mut inner = core_stage();
+        inner.extents.insert(PrimaryDim::Out, Extent(128));
+        inner.extents.insert(PrimaryDim::Mb, Extent(1));
+        inner.extents.remove(&PrimaryDim::Y);
+        inner
+            .corelet_split
+            .insert(PrimaryDim::Out, vec![Extent(64), Extent(64)]);
+        assert_eq!(
+            inner.corelet_extent(
+                PrimaryDim::Out,
+                Some(Corelet::at::<0>()),
+                &plain,
+                None,
+                false
+            ),
+            Some(Extent(64))
+        );
+        assert_eq!(
+            inner.corelet_extent(PrimaryDim::Out, None, &plain, None, false),
+            Some(Extent(128))
+        );
+
+        // ⛔ THE SHORT SPLIT — `coreletSplit_.at("out")` holding ONE share while corelet 1 is asked
+        // for. The reference is already committed to `.at(1)` and throws (`dsc/dims.cpp:635`); it does
+        // NOT come back with `out_`.
+        let mut short = core_stage();
+        short
+            .corelet_split
+            .insert(PrimaryDim::Out, vec![Extent(256)]);
+        assert_eq!(
+            short.corelet_extent(
+                PrimaryDim::Out,
+                Some(Corelet::at::<1>()),
+                &plain,
+                None,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            short.corelet_extent(
+                PrimaryDim::Out,
+                Some(Corelet::at::<0>()),
+                &plain,
+                None,
+                false
+            ),
+            Some(Extent(256))
+        );
+    }
+
+    /// e011 — CONSTRUCTED, no g0 stage states a `symbolicDimInfo_`: the granularity re-expression
+    /// (`dsc/dims.cpp:618-628`) and the density divide, both applied to the SHARE and not the whole.
+    #[test]
+    fn the_share_is_re_expressed_in_granularity_units_and_then_density_scaled() {
+        let mut symbolic = core_stage();
+        symbolic.symbolic = Symbolic::new(
+            BTreeMap::from([(
+                PrimaryDim::Out,
+                SymbolicDimInfo {
+                    max_size: MaxSize(512),
+                    granularity: Granularity::new(NonZeroU32::new(128).expect("a positive step")),
+                },
+            )]),
+            BTreeMap::new(),
+        );
+        let plain = PaddingForm::default();
+
+        // `maxSize_ / granularity_ = 4`, and the share is filled against the max — so 256 max units
+        // is 64 granularity units. ⭐ THE BASE ARM ANSWERS THE WHOLE CORE'S `granularity_` INSTEAD,
+        // which is what makes the two reads different questions.
+        assert_eq!(
+            symbolic.corelet_extent(
+                PrimaryDim::Out,
+                Some(Corelet::at::<0>()),
+                &plain,
+                None,
+                true
+            ),
+            Some(Extent(64))
+        );
+        assert_eq!(
+            symbolic.corelet_extent(PrimaryDim::Out, None, &plain, None, true),
+            Some(Extent(128))
+        );
+        // The same share unscaled, so the granularity flag is the only difference.
+        assert_eq!(
+            symbolic.corelet_extent(
+                PrimaryDim::Out,
+                Some(Corelet::at::<0>()),
+                &plain,
+                None,
+                false
+            ),
+            Some(Extent(256))
+        );
+
+        // `val % factor != 0` (`:625`) reached through the SHARE: 250 is not a multiple of 4.
+        let mut ragged = symbolic.clone();
+        ragged
+            .corelet_split
+            .insert(PrimaryDim::Out, vec![Extent(256), Extent(250)]);
+        assert_eq!(
+            ragged.corelet_extent(
+                PrimaryDim::Out,
+                Some(Corelet::at::<1>()),
+                &plain,
+                None,
+                true
+            ),
+            None
+        );
+
+        // `size *= dimDensity` with `dimDensity = 1.0 / 4`: the share divided, not the whole.
+        let block = ScaleBlock::of(Cardinality(4)).expect("four elements is a scale block");
+        assert_eq!(
+            core_stage().corelet_extent(
+                PrimaryDim::Out,
+                Some(Corelet::at::<0>()),
+                &plain,
+                Some(block),
+                false
+            ),
+            Some(Extent(64))
         );
     }
 }
