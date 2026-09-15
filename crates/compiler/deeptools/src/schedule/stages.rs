@@ -143,7 +143,7 @@ pub fn run_l3<const CHUNK_EXPLORE: bool, A: crate::arch::Arch>(
     };
     let mut env = Env::new(state, sdsc);
     let mut allocs = v1::AllocArena::new();
-    let mut trackers = Trackers;
+    let mut trackers = Trackers::default();
     let mut sink = Sink::default();
     let mut symbols = Symbols::default();
     let mut surgery = l3::dl_ops::L3RunSurgery {
@@ -369,8 +369,20 @@ mod tests {
         (reads, env)
     }
 
+    /// ⭐⭐ ENTRY 207 RECORDS THE REFERENCE'S `-1` FOR A DIM THE CORE STAGE DOES NOT STATE.
+    ///
+    /// ⛔ THIS TEST USED TO ASSERT THE OPPOSITE, and it was pinning a PORT DIVERGENCE as if it were
+    /// the reference's behaviour — which is how the divergence survived: it stopped stage 2a at
+    /// `set_chunk_data_stage_params` on every program scratchy emits, and a green test said that was
+    /// correct. The authority has ONE `DT_CHECK` there — that `dataStageParam_` holds the core stage
+    /// (`L3DlOpsScheduler.cpp:1186`) — and `primaryDimToVal_base_st` then reads the field raw
+    /// (`dsc/dims.cpp:516-560`), returning the `-1` default with no throw.
+    ///
+    /// ⭐ IT CARRIES THE VALUES, not just the verdict: the ten explored dims all get exactly one
+    /// candidate, the three the core stage states are positive, and the seven it does not are
+    /// [`ops::UNSTATED_EXTENT`] — so a regression to a refusal, or to a fabricated extent, both fail.
     #[test]
-    fn entry_207_refuses_every_primary_dim_the_core_stage_does_not_state() {
+    fn entry_207_records_the_unstated_extent_rather_than_refusing() {
         use crate::schedule::l3::dl_ops as ops;
         let sdsc = a_rmsq_super_dsc();
         let state = DscState::seeded(&sdsc);
@@ -394,29 +406,53 @@ mod tests {
             .into_iter()
             .filter(|dim| !matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij))
             .collect();
-        let candidates = |dims: &[PrimaryDim]| {
-            ops::generate_dsc_param_candidates(
-                &sdsc,
-                &params,
-                dims,
-                &chunk_dims,
-                &BTreeSet::new(),
-                &reads,
-                None,
-            )
-            .is_some()
-        };
+        let candidates = ops::generate_dsc_param_candidates(
+            &sdsc,
+            &params,
+            &explored,
+            &chunk_dims,
+            &BTreeSet::new(),
+            &reads,
+            None,
+        )
+        .expect("entry 207 answers for every explored dim, stated or not");
+        let per_dim = candidates
+            .at(crate::schedule::l3::dsc::DscIdx(0))
+            .expect("the one DSC's candidates");
 
-        let stated: Vec<PrimaryDim> = chunk_dims.iter().copied().collect();
-        assert!(
-            candidates(&stated),
-            "the three dims the core stage states have candidates"
+        // ⭐ EVERY EXPLORED DIM IS ANSWERED FOR — the count, not just "it did not refuse".
+        let answered = per_dim.iter().count();
+        assert_eq!(
+            answered,
+            explored.len(),
+            "entry 207 must answer for all {} explored dims; it answered {answered}",
+            explored.len(),
         );
-        assert!(
-            !candidates(&explored),
-            "entry 207 refuses the {} explored dims the core stage does not state",
-            explored.len() - stated.len()
-        );
+
+        // ⭐ AND THE ANSWER IS THE RIGHT ONE PER DIM: positive where the core stage states it,
+        // exactly the reference's `-1` where it does not. A fabricated extent fails both arms.
+        let stated: BTreeSet<PrimaryDim> = chunk_dims.iter().copied().collect();
+        for &dim in &explored {
+            let got = per_dim
+                .get(dim)
+                .unwrap_or_else(|| panic!("no candidate list for {dim:?}"));
+            if stated.contains(&dim) {
+                assert!(
+                    got.extents().iter().all(|extent| extent.0 > 0),
+                    "{dim:?} is stated by the core stage, so every candidate must be a real \
+                     extent; got {:?}",
+                    got.extents()
+                );
+            } else {
+                assert_eq!(
+                    got.extents(),
+                    [ops::UNSTATED_EXTENT],
+                    "{dim:?} is not stated by the core stage, so entry 207 must record the \
+                     reference's single candidate of {:?}",
+                    ops::UNSTATED_EXTENT
+                );
+            }
+        }
         assert!(state.refusals().is_empty(), "no carrier was asked anything");
     }
 
@@ -436,8 +472,22 @@ mod tests {
     /// ⛔ `transfer_lds2_src:hbm_dst:lx` IS MINTED HERE AND IS NOT IN THE REFERENCE'S OUTPUT — that is
     /// the output tensor's HBM load, which entry 214 (`optimize_hbm_lds_output_in_schedule_tree`)
     /// DROPS. It sits AFTER the stop, so this run has not reached it yet.
+    ///
+    /// ⭐⭐ THE FRONTIER MOVED PAST ENTRY 207 AND THIS TEST NOW PINS WHERE IT IS. With 207 recording
+    /// the reference's `-1` instead of refusing, stage 2a runs on past `set_chunk_data_stage_params`
+    /// and reaches the MEMORY TRACKER — `ddc::DsTrackInMem`, whose `checkAndAddDs` DECIDES the byte
+    /// offset of every allocation. That is an unported seam and it must stay a `todo!`: a tracker that
+    /// answered a plausible capacity or offset would place real tensors at invented addresses, which
+    /// this crate ranks worse than a stop.
+    ///
+    /// ⛔ THE EXPECTED MESSAGE IS THE SPECIFIC SEAM, NOT ANY PANIC. A bare `should_panic` here would
+    /// pass on the FIRST `todo!` of eighty-six and so would say nothing about how far the stage got;
+    /// naming `ExPhaseTrackers::backup` makes this a ratchet in both directions — it fails if the
+    /// stage regresses to an earlier stop, and it fails the moment the tracker lands, which is the
+    /// cue to re-measure the census.
     #[test]
-    fn stage_2a_runs_and_grows_the_seed_tree() {
+    #[should_panic(expected = "ExPhaseTrackers::backup")]
+    fn stage_2a_runs_past_entry_207_and_reaches_the_memory_tracker() {
         let mut sdsc = a_rmsq_super_dsc();
         let state = DscState::seeded(&sdsc);
         assert_eq!(
@@ -489,11 +539,13 @@ mod tests {
         );
     }
 
-    /// ⭐ THE FIXED-SIGNATURE ENTRY POINT IS TOTAL AND REPORTS THE SAME EFFECT — `run_stages` states
-    /// no compute op and no fold props of its own (neither is a `SuperDsc` field), and the tree it
-    /// leaves is the same one entry 207 stops.
+    /// ⭐ THE FIXED-SIGNATURE ENTRY POINT REACHES THE SAME SEAM — `run_stages` states no compute op
+    /// and no fold props of its own (neither is a `SuperDsc` field), so it stops exactly where
+    /// [`stage_2a_runs_past_entry_207_and_reaches_the_memory_tracker`] does. Pinned by the same named
+    /// seam and for the same reason.
     #[test]
-    fn run_stages_reports_the_nodes_it_left_and_the_first_refusal() {
+    #[should_panic(expected = "ExPhaseTrackers::backup")]
+    fn run_stages_reaches_the_memory_tracker_too() {
         let mut sdsc = a_rmsq_super_dsc();
         let ran = run_stages(&mut sdsc);
         assert_eq!(ran.nodes_before, 4, "the seed");

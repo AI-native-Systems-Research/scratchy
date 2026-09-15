@@ -98,18 +98,33 @@ impl v1::StorageNames for Placement {
     }
 }
 
+/// THE EXECUTION PHASE A PROGRAM IS ACCOUNTED TO — `runDdc`'s `int executionStep`
+/// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:29-30`), which it hands the scheduler as the
+/// ONE-element list `{executionStep}`.
+///
+/// ⭐ ZERO IS THE REFERENCE'S OWN DEFAULT AND IT IS DOCUMENTED AS SUCH, not a value chosen here:
+/// `dbo::execStepOf` (`dbo/src/ProgramAttrs.h:100-104`) reads the `sbf.exec_step` module attribute
+/// and returns `0` when nothing stamped one, because *"a bundle whose SDSCs were not loaded has no
+/// tree to take phases from, and one phase is what a single-phase run would have used anyway"*.
+/// A scratchy bake is exactly that single-phase run.
+///
+/// ⛔ A NEWTYPE AND A PARAMETER, NOT A CONSTANT IN A METHOD BODY. It is a construction argument of
+/// the stage; the caller states it, so a multi-phase bake cannot silently inherit phase 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecutionStep(pub u32);
+
 /// `M` — `memTrackers`, where entry 222 places each allocation, per execution phase.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Trackers;
+pub struct Trackers {
+    /// The one phase this run places into — see [`ExecutionStep`].
+    pub step: ExecutionStep,
+}
 
 impl ExPhaseTrackers for Trackers {
-    /// ⛔ Wants the scheduler's `{executionStep}` construction argument
-    /// (`SchedulerStages.cpp:29`) — which phases each allocation is placed in separately.
+    /// ⭐ ONE PHASE, WHICH IS WHAT `{executionStep}` IS — a single-element initializer list
+    /// (`SchedulerStages.cpp:30`), not a range. See [`ExecutionStep`] for why 0 is the default.
     fn ex_phases(&self) -> Vec<ExPhase> {
-        todo!(
-            "ExPhaseTrackers::ex_phases: wants the scheduler's {{executionStep}} construction \
-             argument (dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:29)"
-        )
+        vec![ExPhase(self.step.0)]
     }
 
     /// ⛔ Wants `memCapacity` off `ddc::DsTrackInMem` — never a constant, for the same reason

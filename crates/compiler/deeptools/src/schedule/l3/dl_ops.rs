@@ -6276,6 +6276,12 @@ fn param_corelet_split_valid<M: MemOrg + ?Sized>(
     param_multiple_of_stick_size(dsc, dim, param / corelets, orgs)
 }
 
+/// ⭐ THE EXTENT OF A DIM A STAGE DOES NOT STATE — the `-1` every `DataStructDims` dim defaults to
+/// (`dsc/dims.h:161-193`), which the reference reads as *this stage has no such dim* rather than as
+/// an error. Named so the value cannot be mistaken for a measured extent: it is not a chunk extent
+/// and nothing may compute with it — `isValidDimParam` is `param > 0.0`, so every consumer skips it.
+pub const UNSTATED_EXTENT: Extent = Extent(-1);
+
 /// Replaces: e207_generateDscParamCandidates
 ///
 /// EVERY DSC'S CANDIDATE CHUNK EXTENT PER DIM: a non-chunk dim keeps its core extent alone; a chunk
@@ -6286,8 +6292,19 @@ fn param_corelet_split_valid<M: MemOrg + ?Sized>(
 /// symbolic lookup with no stage stated for it, an index tensor holding indices, a stick size of zero
 /// — and, at the end, *"There must be at least one valid candidate."*, which [`Candidates`]' own
 /// non-emptiness raises for whichever `(dsc, dim)` came up empty.
-/// ⛔ DIVERGENCE: A NON-CHUNK DIM THE CORE STAGE DOES NOT STATE IS REFUSED rather than recorded as
-/// the reference's single candidate of `-1`, which is not a chunk extent.
+/// ⭐ A NON-CHUNK DIM THE CORE STAGE DOES NOT STATE RECORDS [`UNSTATED_EXTENT`], which is what the
+/// reference records. `dscCandidates[dscIdx][dim] = {..primaryDimToVal_st(dim)}`
+/// (`L3DlOpsScheduler.cpp:1187-1188`) has exactly ONE `DT_CHECK` above it — that `dataStageParam_`
+/// holds the CORE STAGE (`:1186`), not that the stage states the dim — and
+/// `primaryDimToVal_base_st` then reads the field raw (`val = out_`, `val = mb_`, …,
+/// `dsc/dims.cpp:516-560`), returning the `-1` every `DataStructDims` dim defaults to. No throw, no
+/// refusal.
+///
+/// ⛔⛔ THIS WAS A REFUSAL AND IT STOPPED STAGE 2A ON EVERY PROGRAM WE EMIT. `explored_primary_dims()`
+/// is ten dims; `0_rmsq_o728`'s core stage states three (`out`, `mb`, `y`), so the other seven each
+/// refused and the stage died at `set_chunk_data_stage_params` before minting anything. It was also
+/// the ONLY site in this file that read an unstated extent as an error — `:2673`, `:12786` and
+/// `:16862` all already record the reference's `-1` and say so.
 #[must_use]
 pub fn generate_dsc_param_candidates<O: MemOrgs>(
     sdsc: &SuperDsc,
@@ -6305,7 +6322,7 @@ pub fn generate_dsc_param_candidates<O: MemOrgs>(
             let slot = per_dsc.get_mut(usize::try_from(idx.0).ok()?)?;
             let core = dsc.core_stage().dims();
             if !chunk_dims.contains(&dim) {
-                slot.insert(dim, vec![core.extent(dim)?]);
+                slot.insert(dim, vec![core.extent(dim).unwrap_or(UNSTATED_EXTENT)]);
                 continue;
             }
             let l_bound = dsc_params
