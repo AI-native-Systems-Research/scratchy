@@ -489,6 +489,26 @@ mod tests {
         );
     }
 
+    /// ⭐ THE FIXED-SIGNATURE ENTRY POINT IS TOTAL AND REPORTS THE SAME EFFECT — `run_stages` states
+    /// no compute op and no fold props of its own (neither is a `SuperDsc` field), and the tree it
+    /// leaves is the same one entry 207 stops.
+    #[test]
+    fn run_stages_reports_the_nodes_it_left_and_the_first_refusal() {
+        let mut sdsc = a_rmsq_super_dsc();
+        let ran = run_stages(&mut sdsc);
+        assert_eq!(ran.nodes_before, 4, "the seed");
+        assert_eq!(
+            ran.nodes_after, 15,
+            "what entry 382 left before entry 207 stopped it"
+        );
+        assert!(!ran.l3, "stage 2a did not complete");
+        assert!(!ran.ddc, "stage 2b is not composed yet");
+        assert_eq!(
+            ran.first_refusal, None,
+            "no carrier refused — the stop is entry 207's own divergence"
+        );
+    }
+
     /// ⭐⭐ AND WHAT THE GROWERS REACH ONCE ENTRY 207 IS ANSWERED — the reference's whole stage-2a
     /// tree, TWENTY-TWO NODES, node for node and in DFS order.
     ///
