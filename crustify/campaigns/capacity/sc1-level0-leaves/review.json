@@ -1,0 +1,157 @@
+{
+ "schema_version": 3,
+ "oracle_config": {
+  "path": "crustify/campaigns/capacity/sc1-level0-leaves/wavefront-config.json",
+  "sha256": "caabd4eca57c60287ebb5d4e04b1ca907e4250d68ea6c807293228a2e29ba30c"
+ },
+ "api_headers_only": false,
+ "budgets": {
+  "max_syms": 24,
+  "max_loc": 320,
+  "max_types": 5,
+  "min_fields": 20
+ },
+ "summary": {
+  "unit_count": 7,
+  "layer_count": 1,
+  "batch_count": 1,
+  "file_count": 1
+ },
+ "waves": [
+  {
+   "unit_count": 7,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-capacity/cpp/capacity.cpp",
+     "items": [
+      {
+       "name": "e002_primaryDimToValHandler_st",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 30,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e003_scaleFromMaxToGranularity",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 12,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e004_getDimIndexInLayoutOrder",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 10,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e005_getLayoutDimSet",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e006_getLayoutDims",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 19,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e007_getPageSize",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 34,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e006_getLayoutDims",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e008_pruneMaxSymbolicVolumes",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 34,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e003_scaleFromMaxToGranularity",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

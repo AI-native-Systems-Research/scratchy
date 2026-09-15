@@ -1,0 +1,30 @@
+{
+ "_comment": [
+  "Narrow inventory for sub-campaign `sc3-levels3-6-capacity`: capacity.cpp LEVEL(S) [3, 4, 5, 6] \u2014 6 of the campaign's 18 portable units, 416 lines. the capacity closure itself. Every wave is one unit because every unit calls the one before it. e019 is what unblocks all three carriers.",
+  "impl_files is the same single translation unit as the campaign-wide config (the campaign has exactly one); the NARROWING is the level range above. Every producer level lands before this one starts.",
+  "\u26d4 READ crustify-capacity/AGENT-BRIEF.md IN FULL FIRST. It carries the arm-by-arm fixture measurement that says which arms to port and which to DEFER with a citation, the two traps (CoordinateOffsets::alloc_coordinate's selector is NOT this one's; FoldDim::cardinality_at cannot reach an ELEM_ARR_COORD fold), the rust_home rule (impl DesignSpaceConfig is FORBIDDEN), and the fenced files."
+ ],
+ "campaign_objective": "port",
+ "impl_files": [
+  "crustify-capacity/cpp/capacity.cpp"
+ ],
+ "api_headers": [],
+ "out_of_scope": {
+  "paths": [
+   "crustify-capacity/cpp/prelude.inc"
+  ],
+  "features": []
+ },
+ "_comment_authority": [
+  "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE EXTRACT AND NOT A RUST COMMENT:",
+  "  /Users/nickm/git/deeptools-src   (the revision bridges 1 and 2 cite)",
+  "Every span in capacity.cpp is brace-verified and includes its closing brace \u2014 the bridge-2 extract was truncated at the tail of 366 of 384 bodies, and this one is not. Use the banners for WHICH function and WHAT ORDER; port from the authority at the cited line, because a body's CALLEES are only legible there.",
+  "\u26d4 /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it."
+ ],
+ "_comment_levels": [
+  3,
+  4,
+  5,
+  6
+ ]
+}

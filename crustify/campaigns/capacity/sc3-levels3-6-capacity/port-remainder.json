@@ -1,0 +1,260 @@
+{
+ "schema_version": 3,
+ "oracle_config": {
+  "path": "crustify/campaigns/capacity/sc3-levels3-6-capacity/wavefront-config.json",
+  "sha256": "654477b9d213c9f5de21aa43cb6f422f31d7eb93143f77bf6ca83c0a8c79f74e"
+ },
+ "api_headers_only": false,
+ "budgets": {
+  "max_syms": 8,
+  "max_loc": 320,
+  "max_types": 5,
+  "min_fields": 20
+ },
+ "summary": {
+  "unit_count": 6,
+  "layer_count": 6,
+  "batch_count": 6,
+  "file_count": 1
+ },
+ "waves": [
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-capacity/cpp/capacity.cpp",
+     "items": [
+      {
+       "name": "e014_parametricStride",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 3,
+       "loc": 25,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e006_getLayoutDims",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-capacity/cpp/capacity.cpp",
+     "items": [
+      {
+       "name": "e015_getSizeDataStageForNode",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 3,
+       "loc": 137,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e008_pruneMaxSymbolicVolumes",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e012_primaryDimToVal_st",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e013_primaryDimToVal_st_1arg",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e014_parametricStride",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-capacity/cpp/capacity.cpp",
+     "items": [
+      {
+       "name": "e016_getSizeDataStageForNode_2arg",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 3,
+       "loc": 4,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e015_getSizeDataStageForNode",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-capacity/cpp/capacity.cpp",
+     "items": [
+      {
+       "name": "e017_getBufferCapacityForNodePerDimCustomLocation",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 4,
+       "loc": 211,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e004_getDimIndexInLayoutOrder",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e005_getLayoutDimSet",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e006_getLayoutDims",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e007_getPageSize",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e012_primaryDimToVal_st",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e016_getSizeDataStageForNode_2arg",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-capacity/cpp/capacity.cpp",
+     "items": [
+      {
+       "name": "e018_getBufferCapacityForNodePerDim",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 5,
+       "loc": 10,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e017_getBufferCapacityForNodePerDimCustomLocation",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-capacity/cpp/capacity.cpp",
+     "items": [
+      {
+       "name": "e019_getBufferCapacityForNode",
+       "defined_in": "crustify-capacity/cpp/capacity.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 6,
+       "loc": 29,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e018_getBufferCapacityForNodePerDim",
+          "defined_in": "crustify-capacity/cpp/capacity.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
