@@ -48,6 +48,7 @@
 
 mod carriers;
 mod ddc_state;
+mod ddc_tree;
 mod env;
 mod offsets;
 mod reads;
