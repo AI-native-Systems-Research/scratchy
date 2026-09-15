@@ -1114,62 +1114,25 @@ impl Symbolic {
         Some(Extent(val.0 / factor))
     }
 
-    /// `DataStructDims::pruneMaxSymbolicVolumes` (`dsc/dims.cpp:729`) FUSED WITH THE ASSIGNMENT THAT
-    /// PRECEDES ITS CALL: adopts `reference`'s volume limits, re-keyed onto the symbolic dims THIS
-    /// stage still has, and divided down by the granularity of each dim it lost.
+    /// `maxSymbolicVolume_ = ref.maxSymbolicVolume_` THEN `pruneMaxSymbolicVolumes(ref)` — the FUSED
+    /// call shape, which is ONE of the reference's four
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:171-172`); the other three are UNFUSED and take
+    /// [`Self::prune_volumes`].
     ///
-    /// ⭐ THE FUSION IS WHAT KEEPS THE TYPE HONEST — `maxSymbolicVolume_ = ref.maxSymbolicVolume_`
-    /// followed by a prune passes through the one state a well-formed [`Symbolic`] cannot hold, and
-    /// this is the only call shape the reference ever uses (`L3DlOpsScheduler.cpp:171-172`).
-    ///
-    /// ⭐ Every write the reference makes is `min`-guarded and no erased key is ever a write target,
-    /// so rebuilding the map with a `min`-insert is its in-place erase-and-insert walk exactly.
-    ///
-    /// ⛔ DIVERGENCE: where the limit does not divide by a lost dim's granularity — the reference's
-    /// `DT_CHECK` at `dsc/dims.cpp:748` — the entry is kept UNTOUCHED, which is the reference's own
-    /// `!needPruning` arm rather than an invented divisibility rule.
+    /// ⭐ `DT_CHECK(refDstg.symbolicDimInfo_.count(symDim))` (`dsc/dims.cpp:745`) CANNOT FIRE HERE:
+    /// the limits are `reference`'s own, and its own `info` names their keys by construction.
     pub fn prune_volumes_from(&mut self, reference: &Symbolic) {
-        let mut pruned: BTreeMap<BTreeSet<PrimaryDim>, VolumeLimit> = BTreeMap::new();
-        let mut keep_min = |dims: BTreeSet<PrimaryDim>, limit: VolumeLimit| {
-            let entry = pruned.entry(dims).or_insert(limit);
-            *entry = (*entry).min(limit);
-        };
-        for (sym_dims, limit) in &reference.volumes {
-            if sym_dims.iter().all(|dim| self.info.contains_key(dim)) {
-                keep_min(sym_dims.clone(), *limit);
-                continue;
-            }
-            let mut mine = BTreeSet::new();
-            let mut my_limit = *limit;
-            let mut mul_of_maxes = VolumeLimit::ONE;
-            let mut exact = true;
-            for &sym_dim in sym_dims {
-                match self.info.get(&sym_dim) {
-                    Some(info) => {
-                        mine.insert(sym_dim);
-                        mul_of_maxes = mul_of_maxes.times(info.max_size);
-                    }
-                    None => match reference
-                        .info
-                        .get(&sym_dim)
-                        .and_then(|info| my_limit.divided_exactly_by(info.granularity))
-                    {
-                        Some(reduced) => my_limit = reduced,
-                        None => {
-                            exact = false;
-                            break;
-                        }
-                    },
-                }
-            }
-            if !exact {
-                keep_min(sym_dims.clone(), *limit);
-                continue;
-            }
-            if !mine.is_empty() {
-                keep_min(mine, my_limit.min(mul_of_maxes));
-            }
-        }
+        let stated = StatedVolumes::new(reference.volumes.clone());
+        let pruned = stated.pruned_against(self, reference);
+        self.volumes = pruned;
+    }
+
+    /// `pruneMaxSymbolicVolumes(refDstg)` UNFUSED — THIS stage's OWN limits re-keyed onto the dims it
+    /// still calls symbolic, which is what `ddc/ddcv1.cpp:1424`, `:1425` and `dsc/dsc2.cpp:3719` ask
+    /// for; adopting `reference`'s map there DISCARDS the stage's own limits for the core's.
+    pub fn prune_volumes(&mut self, reference: &Symbolic) {
+        let stated = StatedVolumes::new(std::mem::take(&mut self.volumes));
+        let pruned = stated.pruned_against(self, reference);
         self.volumes = pruned;
     }
 }
@@ -2489,5 +2452,175 @@ mod tests_e002_e005 {
         let kernel = LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out]).to_set();
         assert_eq!(kernel, BTreeSet::from([PrimaryDim::In, PrimaryDim::Out]));
         assert_ne!(kernel, set);
+    }
+}
+
+/// A STAGE'S `maxSymbolicVolume_` AS IT STANDS BEFORE THE PRUNE — volume limits that MAY be keyed on
+/// dims the stage's own `symbolicDimInfo_` does not name, which is the one state a well-formed
+/// [`Symbolic`] cannot hold and is exactly the input `pruneMaxSymbolicVolumes` exists to consume.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatedVolumes(BTreeMap<BTreeSet<PrimaryDim>, VolumeLimit>);
+
+impl StatedVolumes {
+    /// The limits as a stage states them, before any key is read against a `symbolicDimInfo_`.
+    #[must_use]
+    pub const fn new(volumes: BTreeMap<BTreeSet<PrimaryDim>, VolumeLimit>) -> Self {
+        Self(volumes)
+    }
+
+    /// Replaces: e008_pruneMaxSymbolicVolumes
+    ///
+    /// RE-KEYS EACH LIMIT ONTO THE DIMS `mine` STILL CALLS SYMBOLIC — divided by the granularity
+    /// `reference` gives every dim that was lost, capped at the product of the survivors' `maxSize_`,
+    /// and DROPPED where no survivor is left. A key `mine` names in full passes through untouched.
+    ///
+    /// ⭐ Every write the reference makes is `min`-guarded and no erased key is ever a write target,
+    /// so rebuilding the map with a `min`-insert is its in-place erase-and-insert walk exactly.
+    ///
+    /// ⛔ BOTH `DT_CHECK`s THROW (`dsc/dims.cpp:745`, `:748`) AND SO DO THESE: keeping an entry the
+    /// prune could not reduce would state a volume limit no stage asked for.
+    #[must_use]
+    pub fn pruned_against(
+        self,
+        mine: &Symbolic,
+        reference: &Symbolic,
+    ) -> BTreeMap<BTreeSet<PrimaryDim>, VolumeLimit> {
+        let mut pruned: BTreeMap<BTreeSet<PrimaryDim>, VolumeLimit> = BTreeMap::new();
+        let mut keep_min = |dims: BTreeSet<PrimaryDim>, limit: VolumeLimit| {
+            let entry = pruned.entry(dims).or_insert(limit);
+            *entry = (*entry).min(limit);
+        };
+        for (sym_dims, limit) in self.0 {
+            if sym_dims.iter().all(|dim| mine.info.contains_key(dim)) {
+                keep_min(sym_dims, limit);
+                continue;
+            }
+            let mut survivors = BTreeSet::new();
+            let mut my_limit = limit;
+            let mut mul_of_maxes = VolumeLimit::ONE;
+            for &sym_dim in &sym_dims {
+                if let Some(info) = mine.info.get(&sym_dim) {
+                    survivors.insert(sym_dim);
+                    mul_of_maxes = mul_of_maxes.times(info.max_size);
+                    continue;
+                }
+                let Some(lost) = reference.info.get(&sym_dim) else {
+                    panic!(
+                        "StatedVolumes::pruned_against: \
+                         DT_CHECK(refDstg.symbolicDimInfo_.count({sym_dim:?})) throws for a lost dim \
+                         the reference stage does not call symbolic"
+                    )
+                };
+                match my_limit.divided_exactly_by(lost.granularity) {
+                    Some(reduced) => my_limit = reduced,
+                    None => panic!(
+                        "StatedVolumes::pruned_against: \
+                         DT_CHECK(myVolumeLimit % dimGranularity == 0) throws for {my_limit:?} over \
+                         {sym_dim:?}'s {step:?}",
+                        step = lost.granularity
+                    ),
+                }
+            }
+            if !survivors.is_empty() {
+                keep_min(survivors, my_limit.min(mul_of_maxes));
+            }
+        }
+        pruned
+    }
+}
+
+#[cfg(test)]
+mod tests_e008 {
+    //! ⭐ THE PRUNER AGAINST THE REFERENCE'S OWN WORKED EXAMPLE (`dsc/dims.cpp:719-728`).
+    //!
+    //! ⛔ WHAT THE CORPUS CANNOT SHOW, MEASURED: `maxSymbolicVolume_` is EMPTY on every data stage of
+    //! all 187 g0 programs, so no g0 program reaches this walk. The numbers are the reference's own
+    //! comment — `a,b,c -> 2048`, `a` lost at `gr=4 max=64`, `b` and `c` symbolic at `gr=16 max=64`,
+    //! and `min(64*64, 2048/4) = 512`.
+
+    use super::{Granularity, MaxSize, StatedVolumes, Symbolic, SymbolicDimInfo, VolumeLimit};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroU32;
+
+    /// `a`, `b` and `c` of the reference's comment, as three members of the closed dim set.
+    const A: PrimaryDim = PrimaryDim::Mb;
+    const B: PrimaryDim = PrimaryDim::Out;
+    const C: PrimaryDim = PrimaryDim::Y;
+
+    fn info(max: u32, step: u32) -> SymbolicDimInfo {
+        SymbolicDimInfo {
+            max_size: MaxSize(max),
+            granularity: Granularity::new(NonZeroU32::new(step).expect("a positive step")),
+        }
+    }
+
+    /// The reference stage of the comment: all three dims still symbolic.
+    fn core() -> Symbolic {
+        Symbolic::new(
+            BTreeMap::from([(A, info(64, 4)), (B, info(64, 16)), (C, info(64, 16))]),
+            BTreeMap::from([(BTreeSet::from([A, B, C]), VolumeLimit(2048))]),
+        )
+    }
+
+    /// e008 — the reference's own worked example, then its `mulOfMaxes` cap winning instead.
+    #[test]
+    fn a_lost_dim_divides_the_limit_and_re_keys_it_onto_the_survivors() {
+        let chunk = Symbolic::new(
+            BTreeMap::from([(B, info(64, 16)), (C, info(64, 16))]),
+            BTreeMap::new(),
+        );
+        let stated = StatedVolumes::new(BTreeMap::from([(
+            BTreeSet::from([A, B, C]),
+            VolumeLimit(2048),
+        )]));
+        // `min(max(b) * max(c), 2048 / gr(a)) = min(4096, 512) = 512`, keyed on `{b, c}` and not on
+        // `{a, b, c}` — the erase and the insert are one step.
+        assert_eq!(
+            stated.pruned_against(&chunk, &core()),
+            BTreeMap::from([(BTreeSet::from([B, C]), VolumeLimit(512))])
+        );
+
+        // `mulOfMaxes` the other way round: with `b` the only survivor, 2048 / gr(a) = 512 is capped
+        // at max(b) = 64.
+        let one = Symbolic::new(BTreeMap::from([(B, info(64, 16))]), BTreeMap::new());
+        let stated = StatedVolumes::new(BTreeMap::from([(
+            BTreeSet::from([A, B]),
+            VolumeLimit(2048),
+        )]));
+        assert_eq!(
+            stated.pruned_against(&one, &core()),
+            BTreeMap::from([(BTreeSet::from([B]), VolumeLimit(64))])
+        );
+    }
+
+    /// e008 — THE NEGATIVE THAT PINS THE FUSION: the two call shapes give DIFFERENT maps, so the one
+    /// that adopts the reference's limits cannot stand in for the one that keeps this stage's.
+    #[test]
+    fn the_unfused_prune_keeps_this_stage_s_own_limits() {
+        let mine = || {
+            Symbolic::new(
+                BTreeMap::from([(B, info(64, 16)), (C, info(64, 16))]),
+                BTreeMap::from([(BTreeSet::from([B, C]), VolumeLimit(256))]),
+            )
+        };
+
+        // `ddc/ddcv1.cpp:1424` — every dim this stage's own limit names is still symbolic here, so
+        // `needPruning` is false and the 256 stands.
+        let mut unfused = mine();
+        unfused.prune_volumes(&core());
+        assert_eq!(
+            *unfused.volumes(),
+            BTreeMap::from([(BTreeSet::from([B, C]), VolumeLimit(256))])
+        );
+
+        // `L3DlOpsScheduler.cpp:171-172` — the assignment first, so the core's 2048 becomes 512 and
+        // this stage's own 256 is gone.
+        let mut fused = mine();
+        fused.prune_volumes_from(&core());
+        assert_eq!(
+            *fused.volumes(),
+            BTreeMap::from([(BTreeSet::from([B, C]), VolumeLimit(512))])
+        );
     }
 }

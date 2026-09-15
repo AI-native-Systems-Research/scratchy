@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 
 use crate::arch::{Bytes, Elements, Sticks};
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
 use crate::formats::DataFormat;
 use crate::generated::{DataConnect, Mode, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::ty::GenericComp;
@@ -32,7 +32,7 @@ use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::l3::dl_ops::{GtrGroupId, Shares};
-use crate::schedule::l3::dsc::WkSlice;
+use crate::schedule::l3::dsc::{IndirectAlloc, WkSlice};
 use crate::units::{Core, Corelet, NumFolds};
 
 impl PrimaryDim {
@@ -2348,5 +2348,75 @@ mod tests_e006 {
         // CONSTRUCTED — a `referenceLdsIdx_` CYCLE, which the reference spins on forever.
         let cycle = exported(vec![(0, vec![], Some(1)), (1, vec![], Some(0))]);
         assert_eq!(layout_dims(&cycle, LdsIdx(0)), None);
+    }
+}
+
+impl AllocateNode {
+    /// Replaces: e007_getPageSize
+    ///
+    /// ONE PAGE'S ELEMENTS PER LAYOUT DIM — EMPTY for an allocation that indirects through nothing
+    /// (`dsc/dsc2.cpp:4483-4485`), which is what every program we compile states: `indirectAllocType_`
+    /// has ONE emitter construction site and it writes `"no_indirection"`.
+    ///
+    /// ⛔ THE INDIRECTION IS A PARAMETER, NOT A FIELD: `indirectAllocType_` (`dsc/dsc2.h:990`) and
+    /// `relatedIndirectAccessAlloc_` are typed on
+    /// [`L3AllocateNode`](crate::schedule::l3::dl_ops::L3AllocateNode), whose file another agent owns
+    /// this wave, so the caller hands over what it reads — as e015 takes its ancestor loop chain.
+    #[must_use]
+    pub fn page_sizes(&self, indirect: Option<IndirectAlloc>) -> BTreeMap<PrimaryDim, Extent> {
+        match indirect {
+            None => BTreeMap::new(),
+            Some(through) => todo!(
+                "dsc2::AllocateNode::page_sizes: dsc/dsc2.cpp:4486-4511 — {through:?} wants the \
+                 REFERENCE allocation (this node for VALUE_TENSOR, relatedIndirectAccessAlloc_ for \
+                 INDEX_TENSOR, whose DT_CHECK at :4492 is its presence) and then that node's \
+                 layoutDimOrder_/maxDimSizes_ walk, where a NEGATIVE max size UNBOUNDS the dim and \
+                 ERASES the page size it had"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_e007 {
+    //! ⭐ EXHAUSTIVE BY CONSTRUCTION AND NOT SAMPLED: `indirectAllocType_` has ONE emitter
+    //! construction site (`crates/targets/spyre/src/lower_subtile_tape_to_superdsc.rs:5212`) and it
+    //! writes `"no_indirection"`, so `NO_INDIRECTION` is the arm all 24,363 programs take.
+
+    use super::{
+        AllocLayout, AllocPlacement, AllocateNode, BTreeMap, Elements, LdsIdx, MaxDimSize,
+        NodeName, NumBuffers, Padding, PrimaryDim, SenComponent, StartAddress,
+    };
+
+    /// An HBM allocation with a BOUNDED two-dim layout, so an answer keyed on a layout dim would show.
+    fn hbm_alloc() -> AllocateNode {
+        AllocateNode {
+            name: NodeName("kv_cache".to_owned()),
+            component: SenComponent::Hbm,
+            lds: Some(LdsIdx(0)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new(
+                (PrimaryDim::Out, MaxDimSize::Resolved(Elements(64))),
+                vec![(PrimaryDim::Y, MaxDimSize::Resolved(Elements(16)))],
+            ),
+            start_address: StartAddress::default(),
+            placement: AllocPlacement {
+                num_buffers: NumBuffers::Single,
+                padding: Padding::default(),
+                buffer_offset: BTreeMap::new(),
+                is_start_addr_symbolic: false,
+            },
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        }
+    }
+
+    /// e007 — the arm every program takes, and it reads no layout at all.
+    #[test]
+    fn an_allocation_that_indirects_through_nothing_has_no_page_size() {
+        // `NO_INDIRECTION` returns BEFORE `layoutDimOrder_` is touched (`dsc/dsc2.cpp:4483-4485`), so
+        // a bounded 64x16 layout still pages nothing — 64 and 16 must not appear.
+        assert_eq!(hbm_alloc().page_sizes(None), BTreeMap::new());
     }
 }

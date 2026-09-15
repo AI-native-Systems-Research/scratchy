@@ -294,14 +294,15 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
     }
 
     /// `pruneMaxSymbolicVolumes(refDstg)` (`dsc/dims.cpp:729-760`) — ⭐ ALREADY PORTED, as
-    /// [`crate::schedule::l3::dsc::Symbolic::prune_volumes_from`], which FUSES the
-    /// `maxSymbolicVolume_ = ref.maxSymbolicVolume_` assignment the reference makes before the prune.
+    /// [`crate::schedule::l3::dsc::Symbolic::prune_volumes`], the UNFUSED shape `ddc/ddcv1.cpp:1424`
+    /// and `:1425` call: THIS stage keeps its own `maxSymbolicVolume_`, re-keyed onto the dims it still
+    /// calls symbolic, and does not adopt the core's.
     fn prune_max_symbolic_volumes(&mut self, at: v1::StageSite, from: v1::StageSite) {
         let Some(reference) = self.half(from) else {
             return;
         };
         self.edit(at, |half| {
-            half.dims.symbolic.prune_volumes_from(&reference.dims.symbolic);
+            half.dims.symbolic.prune_volumes(&reference.dims.symbolic);
         });
     }
 
