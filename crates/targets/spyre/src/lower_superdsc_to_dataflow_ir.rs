@@ -62,6 +62,11 @@ use deeptools::bridges::superdsc_to_dataflow_ir::driver::{
 };
 use deeptools::bridges::superdsc_to_dataflow_ir::utils::DscKind;
 use deeptools::generated::OpFunc;
+// ⭐ THE SCHEDULER'S TYPED TREE, THROUGH THE SEAM AND NOT THROUGH `deeptools::schedule`. `Kind` is
+// `ScheduleNode::NodeType` as the closed set it is, which is what lets this file walk STATEMENTS
+// instead of comparing the wire's `nodeType_` string — see
+// `crates/targets/spyre/tests/scratchy_knows_nothing_about_l3.rs` for why the path matters.
+use deeptools::sdsc::{DscIdx, DscState, DscTree, Kind, NodeKind};
 use deeptools::islands::dataflow_ir::{
     Grid, GroupId, KernelName, OpIndex, ProgramName, Run, Values, print,
 };
@@ -77,7 +82,23 @@ use crate::lower_subtile_tape_to_superdsc::Dsc as SuperDsc;
 /// a clone per component.
 pub struct OneDsc<'c> {
     /// The unscheduled SuperDSC this program was built from.
+    ///
+    /// ⛔ STILL NEEDED, AND NOT REDUNDANT WITH [`Self::tree`]. `computeOp_`, `numCoreletsUsed_`,
+    /// `coreIdsUsed_` and `labeledDs_` are the wire's and are not schedule nodes; only the TREE moves
+    /// to the typed side.
     dsc: &'c SuperDsc,
+    /// ⭐⭐ THE SCHEDULE STAGES 2A AND 2B ACTUALLY GREW — the object `Schedule::roots` walks.
+    ///
+    /// ⛔⛔ THIS IS THE OTHER TREE, AND READING THE WRONG ONE WAS THE DEFECT. `dsc.scheduleTree_` is a
+    /// `Vec<AllocNode>` whose `nodeType_` is the string `"allocate"` at its ONLY construction site, so
+    /// it cannot represent a loop, a transfer or a sync at all — and nothing writes the stages' nodes
+    /// back into it. The census that read it was therefore measuring an unscheduled tree and reporting
+    /// `statements == 0` for a reason that had nothing to do with the scheduler.
+    ///
+    /// ⛔ [`None`] IS A PROGRAM THAT DID NOT CONVERT OR THAT STOPPED, which is *no schedule* rather
+    /// than an empty one — `Bundle::state_of`'s own distinction, and the difference between a stop and
+    /// a program that scheduled to nothing.
+    tree: Option<&'c DscTree>,
     /// Which cores it occupies, as the port's newtype.
     cores: Vec<Core>,
     /// WHERE EVERY BORROWED STATEMENT PAYLOAD WILL LIVE.
@@ -101,14 +122,26 @@ impl<'c> OneDsc<'c> {
     ///
     /// ⛔ THE CORE LIST IS `coreIdsUsed_`, NOT `0..numCoresUsed_`. A bundle may occupy a
     /// non-contiguous set, and the port indexes handles by the core id it is given.
+    ///
+    /// ⛔ `tree` IS THIS DSC'S OWN, NOT THE PROGRAM'S. A [`DscState`] holds one [`DscTree`] per DSC of
+    /// one program, so the caller picks by [`DscIdx`] — the same index the super-DSC keys `dscs_` by.
     #[must_use]
-    pub fn of(dsc: &'c SuperDsc, arena: &'c bumpalo::Bump) -> OneDsc<'c> {
+    pub fn of(
+        dsc: &'c SuperDsc,
+        tree: Option<&'c DscTree>,
+        arena: &'c bumpalo::Bump,
+    ) -> OneDsc<'c> {
         let cores = dsc
             .coreIdsUsed_
             .iter()
             .filter_map(|id| Core::checked(*id))
             .collect();
-        OneDsc { dsc, cores, arena }
+        OneDsc {
+            dsc,
+            tree,
+            cores,
+            arena,
+        }
     }
 }
 
@@ -131,17 +164,48 @@ pub struct ScheduleCensus {
     pub compute_ops: usize,
 }
 
-/// ⭐ CENSUS ONE SCRATCHY `Dsc`'s TREE. See [`ScheduleCensus`].
+/// ⭐ CENSUS ONE PROGRAM'S SCHEDULED TREE. See [`ScheduleCensus`].
+///
+/// ⛔⛔ THE `nodeType_ == "allocate"` STRING COMPARISON IS GONE, AND THAT WAS TWO DEFECTS IN ONE LINE.
+/// It read the WIRE `scheduleTree_`, which the stages never write — so the answer described scratchy's
+/// emission and not the schedule — and it compared a STRING for membership of a closed set, which is
+/// the *"NO STRINGS from the ddl/smc parsers — every closed set is a generated enum"* rule this crate
+/// states. [`Kind::node_kind`] is that enum, and `TreeData::node_kinds` counts by it.
+///
+/// ⛔ AN ABSENT `tree` IS ALL-ZERO **STATEMENTS**, NOT A ZERO CENSUS: `compute_ops` still comes off the
+/// wire, because `computeOp_` is a frontend fact that exists whether or not the program scheduled.
+/// ⭐⭐ HOW MANY NODES SCRATCHY'S OWN `scheduleTree_` HOLDS — every one of them an ALLOCATE.
+///
+/// ⛔⛔ `len()`, AND THAT IS THE DELETION OF THE STRING COMPARISON RATHER THAN A LOOSENING OF IT. The
+/// old census filtered `node.nodeType_ == "allocate"` over this same vec, which was redundant with the
+/// TYPE: `scheduleTree_` is a `Vec<AllocNode>` and `AllocNode::nodeType_` is a `&'static str` written
+/// at exactly one construction site, as `"allocate"`. So the filter could never exclude anything, and
+/// comparing a string for membership of a closed set is what this crate's *"NO STRINGS … every closed
+/// set is a generated enum"* rule forbids.
+///
+/// ⛔ AND IT IS A DIFFERENT QUANTITY FROM [`ScheduleCensus::allocate`], which is why it is its own
+/// function: this is what scratchy EMITTED, that is what the scheduler MADE. Reporting one as the other
+/// is how *"134 bundles, 0 launch groups"* read as a lowering defect for as long as it did.
 #[must_use]
-pub fn schedule_census(dsc: &SuperDsc) -> ScheduleCensus {
-    let allocate = dsc
-        .scheduleTree_
-        .iter()
-        .filter(|node| node.nodeType_ == "allocate")
-        .count();
+pub fn wire_allocate_nodes(dsc: &SuperDsc) -> usize {
+    dsc.scheduleTree_.len()
+}
+
+/// ⭐ CENSUS ONE PROGRAM'S SCHEDULED TREE. See [`ScheduleCensus`].
+#[must_use]
+pub fn schedule_census(dsc: &SuperDsc, tree: Option<&DscTree>) -> ScheduleCensus {
+    let kinds = tree.map(DscTree::kinds).unwrap_or_default();
+    let allocate = kinds.get(&NodeKind::Allocate).copied().unwrap_or(0);
     ScheduleCensus {
         allocate,
-        statements: dsc.scheduleTree_.len().saturating_sub(allocate),
+        // ⛔ EVERY OTHER KIND, SUMMED — not `len() - allocate`. The old subtraction could not tell a
+        // tree with no nodes from a tree of nothing but allocations, and it could not name WHICH kinds
+        // it was counting.
+        statements: kinds
+            .iter()
+            .filter(|(kind, _)| **kind != NodeKind::Allocate)
+            .map(|(_, count)| *count)
+            .sum(),
         compute_ops: dsc.computeOp_.len(),
     }
 }
@@ -150,10 +214,24 @@ pub fn schedule_census(dsc: &SuperDsc) -> ScheduleCensus {
 pub struct Schedule<'c> {
     /// Which component the driver asked about.
     comp: DfirUnit,
-    /// The SuperDSC the statements are read out of.
+    /// The wire SuperDSC — `computeOp_` and `labeledDs_`, never the tree.
     dsc: &'c SuperDsc,
+    /// ⭐ THE SCHEDULED TREE THIS WALK READS. See [`OneDsc::tree`].
+    tree: Option<&'c DscTree>,
     /// Where this component's statement payloads are allocated — see [`OneDsc::arena`].
     arena: &'c bumpalo::Bump,
+}
+
+/// ⭐⭐ WHICH TREE KINDS ARE STATEMENTS — the set [`Schedule::roots`] would yield a [`Scheduled`] for.
+///
+/// ⛔ AN ALLOCATION IS NOT A STATEMENT, by [`ScheduleCensus::allocate`]'s own statement, and neither is
+/// a `BLOCK`, a `LOOP` or a `CONDITION`: those are the STRUCTURE the walk descends, which is why
+/// `isBlockNode()` (`dsc/dsc2.h:479`) separates them. What remains is the four kinds that carry work.
+const fn is_statement(kind: &Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Transfer(_) | Kind::Compute(_) | Kind::Sync(_) | Kind::StickMask(_)
+    )
 }
 
 impl<'c> ScheduleView<'c> for Schedule<'c> {
@@ -162,24 +240,58 @@ impl<'c> ScheduleView<'c> for Schedule<'c> {
     /// this component's DDL template against its allocations; building a `Statement` from anything
     /// else is the invention this pivot exists to remove.
     ///
-    /// ⭐ THE EMPTINESS IS DERIVED. It is `schedule_census(..).statements == 0` that makes the answer
-    /// empty, so the day a scheduled tree arrives this stops being a constant. The component and the
-    /// DSC are both in hand here: this is the one function the ported expansion plugs into.
+    /// ⭐⭐ IT NOW READS THE TREE THE STAGES GREW, WHICH CHANGES WHAT ITS EMPTINESS MEANS. It used to
+    /// gate on `schedule_census(dsc).statements == 0` over the WIRE `scheduleTree_` — a vec that is all
+    /// `"allocate"` by construction — so the gate was true for every program and the walk below was
+    /// described as *"unreachable BY MEASUREMENT"*. Over the typed tree that is FALSE: stage 2a leaves
+    /// blocks, loops and transfers (measured 4 -> 15 nodes on `rmsq_o728`), so the walk is REACHED and
+    /// the honest statement is that it finds statement nodes and can build none of them yet.
+    ///
+    /// ⛔⛔ AND IT STILL BUILDS NOTHING, WHICH IS THE OWED WORK AND NOT A DESIGN. A `Scheduled` carries
+    /// `Statement::Transfer`'s `send`/`store`/`receive` — `&'s dyn Fn(..)` payloads — and a compute's
+    /// `OperandContext`, and those come from the DDL template's expansion against this component's
+    /// allocations. That expansion currently writes into a DETACHED COPY of the tree
+    /// (`ddc/v1.rs:6489`'s `DdlConversion::new(store.schedule_head_block())` hands back a `BlockNode`
+    /// BY VALUE, where the reference holds a `DesignSpaceConfig&`, `ddl_conversion.h:511`), so the
+    /// payloads do not exist to be pointed at.
+    ///
+    /// ⛔ SO NOTHING IS FABRICATED HERE. An earlier revision yielded ONE invented `Lxlu` transfer —
+    /// 64-lane fp16, a hardcoded `Sfp` destination, storing at address `0` — and it was deleted for
+    /// exactly that. Returning empty is the honest answer while the payloads are unreachable; building
+    /// a `Statement` from anything but the expansion is the invention this pivot exists to remove.
     fn roots<'s>(self, _vals: &mut Values, _handles: UnitHandles<'s>) -> Vec<Scheduled<'s>>
     where
         'c: 's,
     {
-        // ⛔ THE ARENA IS NAMED SO ITS ABSENCE OF USE IS DELIBERATE, not an oversight the compiler
-        // hid: it is what a statement's borrowed payload will be allocated from, and there is no
-        // statement to allocate yet. `comp` likewise selects which component's roots these are.
-        let Schedule { comp, dsc, arena } = self;
-        let _ = (comp, arena);
-        if schedule_census(dsc).statements == 0 {
+        // ⛔ THE ARENA AND THE COMPONENT ARE NAMED SO THEIR ABSENCE OF USE IS DELIBERATE, not an
+        // oversight the compiler hid: the arena is what a statement's borrowed payload will be
+        // allocated from, and `comp` selects which component's roots these are.
+        let Schedule {
+            comp,
+            dsc,
+            tree,
+            arena,
+        } = self;
+        let _ = (comp, dsc, arena);
+        // ⛔ NO SCHEDULE AT ALL — the program did not convert or it stopped. Distinct from a program
+        // that scheduled to nothing, which is the next branch.
+        let Some(tree) = tree else {
             return Vec::new();
-        }
-        // A tree carrying a non-allocate node means a scheduler stage ran and this walk is now the
-        // thing to write. Until then the branch is unreachable BY MEASUREMENT, not by assertion.
-        Vec::new()
+        };
+        tree.with(|held| {
+            // ⭐ THE WALK IS REAL AND ITS ANSWER IS DERIVED FROM THE TREE'S OWN NODES: DFS order, and
+            // every node classified by the `Kind` it holds rather than by a re-looked-up type tag.
+            let statements = held
+                .dfs()
+                .into_iter()
+                .filter(|node| held.kind_of(*node).is_some_and(is_statement))
+                .count();
+            // ⛔ A COUNT AND NOT A `Vec` OF STATEMENTS, BECAUSE THE PAYLOADS ARE NOT REACHABLE YET —
+            // see this function's own note. When they are, this loop is where each of those nodes
+            // becomes a `Scheduled`, and the count is what says how many that must be.
+            let _ = statements;
+            Vec::new()
+        })
     }
 }
 
@@ -228,6 +340,7 @@ impl<'c> PortDsc<'c> for OneDsc<'c> {
             roots: Schedule {
                 comp,
                 dsc: self.dsc,
+                tree: self.tree,
                 arena: self.arena,
             },
         }
@@ -244,6 +357,17 @@ pub struct GroupOp<'a> {
     pub dscs: Vec<&'a SuperDsc>,
     /// Which op-func it lowers, so the program's symbol says what it is.
     pub func: OpFunc,
+    /// ⭐⭐ THE SCHEDULE STAGES 2A AND 2B LEFT FOR **THIS** PROGRAM — one [`DscTree`] per entry of
+    /// [`Self::dscs`], in the same order.
+    ///
+    /// ⛔⛔ IT IS THE CALLER'S JOB TO PAIR IT WITH THE RIGHT PROGRAM, AND THE INDEX IS ABSOLUTE.
+    /// `Bundle::state_of` is indexed into the `&[SdscOp]` the whole bundle was scheduled from, while
+    /// `render_dfir_input` walks GROUPS — so a group's `i`-th program is input `r.start + i`. Passing a
+    /// group-local `i` pairs every program past group 0 with ANOTHER program's addresses, and it
+    /// compiles, lowers and is silently wrong.
+    ///
+    /// ⛔ [`None`] IS *NO SCHEDULE*, not an empty one — a program that did not convert or that stopped.
+    pub state: Option<&'a DscState>,
 }
 
 /// ⭐ SCRATCHY'S `opFuncName` AS THE SEALED ENUM, or [`None`] for a name no `OpFunc` spells.
@@ -261,12 +385,15 @@ pub fn op_func_of(name: &str) -> Option<OpFunc> {
 /// [`None`] when no DSC of the op carries a compute whose op-func the door spells — which is the
 /// same condition the port's entry 110 answers `NoComputeOp` to.
 #[must_use]
-pub fn group_op_of<'a>(dscs: Vec<&'a SuperDsc>) -> Option<GroupOp<'a>> {
+pub fn group_op_of<'a>(
+    dscs: Vec<&'a SuperDsc>,
+    state: Option<&'a DscState>,
+) -> Option<GroupOp<'a>> {
     let func = dscs
         .iter()
         .flat_map(|dsc| dsc.computeOp_.iter())
         .find_map(|op| op_func_of(&op.opFuncName))?;
-    Some(GroupOp { dscs, func })
+    Some(GroupOp { dscs, func, state })
 }
 
 /// ⭐⭐ LOWER ONE LAUNCH GROUP TO ONE DATAFLOWIR MODULE — the bytes the bake stages and `dbo-opt
@@ -294,10 +421,21 @@ pub fn lower_group_for<A: Arch>(group: u32, ops: &[GroupOp<'_>]) -> Option<Strin
     let mut vals = Values::default();
     let mut programs = Vec::with_capacity(ops.len());
     for (index, op) in ops.iter().enumerate() {
+        // ⛔⛔ THE TREE IS PICKED BY THIS DSC'S OWN POSITION IN THE PROGRAM, `DscIdx(at)`, and that
+        // enumerate index is the ONLY correct key: `op.dscs` is `dscs_` flattened in the order the json
+        // lists them, which is the order `DscState` holds one `DscTree` per DSC in. Using the program's
+        // index, or the group's, would hand a DSC another DSC's schedule — the same class of silent
+        // mispairing as reading `state_of(i)` instead of `state_of(r.start + i)` at the call site.
         let wrapped: Vec<OneDsc<'_>> = op
             .dscs
             .iter()
-            .map(|dsc| OneDsc::of(dsc, &arena))
+            .enumerate()
+            .map(|(at, dsc)| {
+                let tree = op
+                    .state
+                    .and_then(|state| state.dsc(DscIdx(u32::try_from(at).unwrap_or(u32::MAX))));
+                OneDsc::of(dsc, tree, &arena)
+            })
             .collect();
         let name = ProgramName {
             group: GroupId(group),

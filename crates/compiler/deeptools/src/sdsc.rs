@@ -79,17 +79,14 @@ pub use crate::schedule::stages::{Scheduling, StagesRan, run_stages_2a_2b};
 // `nodeType_` STRING. [`Scheduling::state`] hands out a [`DscState`]; [`DscState::dscs`] hands out one
 // [`DscTree`] per DSC, and that is the object carrying the nodes stages 2a and 2b minted.
 //
-// ⛔⛔ THREE MORE ROWS ARE OWED AND ARE DELIBERATELY ABSENT: `TreeData`, `Kind` and `Cond`
-// (`schedule/stages/tree.rs`). A lowering that walks the tree must match on `Kind` —
-// `ScheduleNode::NodeType` as the closed set it is — or the only thing it can read is the wire's
-// `nodeType_` STRING, which is the reach-in this seam exists to remove. They need TWO edits in files
-// this module does not own: `pub(super)` -> `pub` in `stages/tree.rs`, and a
+// ⭐ AND THE TREE'S OWN TYPES, WHICH ARRIVED IN `c1f5c63fa`. A lowering that walks the tree must match
+// on [`Kind`] — `ScheduleNode::NodeType` as the closed set it is — or the only thing it can read is
+// the wire's `nodeType_` STRING, which is the reach-in this seam exists to remove. The two edits that
+// row waited on are both landed: `pub(super)` -> `pub` on the READ surface of `stages/tree.rs`, and
 // `pub use tree::{Cond, Kind, TreeData};` in `stages.rs` (whose `mod tree;` is private).
 //
-// ⛔ AND THEY ARE ABSENT BECAUSE THOSE EDITS ARE NOT COMMITTED YET, NOT BECAUSE THEY ARE UNWANTED. The
-// row below is exactly what to add once they are, and adding it FIRST would red the whole crate on a
-// clean checkout while passing in a working tree that happens to hold the other agent's changes —
-// which is a green caused by somebody else's build.
-//
-//     pub use crate::schedule::stages::{Cond, Kind, TreeData};
-pub use crate::schedule::stages::{DscState, DscTree};
+// ⛔ READS ONLY, BY CONSTRUCTION AND NOT BY CONVENTION. `TreeData`'s accessors are `pub` and every
+// mutator — `add`, `link`, `delete`, `move_children`, every `set_*` — stayed `pub(super)`, so this seam
+// cannot hand a target crate the ability to change the scheduler's tree. That is the capability twin of
+// the path rule `crates/targets/spyre/tests/scratchy_knows_nothing_about_l3.rs` enforces.
+pub use crate::schedule::stages::{Cond, DscState, DscTree, Kind, TreeData};

@@ -7258,13 +7258,15 @@ pub fn render_dfir_input(
     // The SAME pre-unroll as `render_dxp_input`, kept as VALUES rather than json: the port reads the
     // `Dsc`s, not their serialization.
     let trips: Vec<SdscOp> = ops.iter().flat_map(concrete_trips).collect();
+    // ⛔ THIS CENSUS IS THE **WIRE**'S AND IT RUNS BEFORE THE SCHEDULER, so it takes no tree: it says
+    // what scratchy's own `scheduleTree_` holds, which is allocations and nothing else. `statements`
+    // stays 0 here BY CONSTRUCTION and not by measurement — `AllocNode` cannot represent another kind —
+    // and the scheduled counterpart is `scheduled.programs[..].scheduled().statements()` below.
     let mut census = dfir::ScheduleCensus::default();
     for trip in &trips {
         for dsc in trip.dscs_.iter().flat_map(BTreeMap::values) {
-            let one = dfir::schedule_census(dsc);
-            census.allocate += one.allocate;
-            census.statements += one.statements;
-            census.compute_ops += one.compute_ops;
+            census.allocate += dfir::wire_allocate_nodes(dsc);
+            census.compute_ops += dsc.computeOp_.len();
         }
     }
 
@@ -7293,24 +7295,27 @@ pub fn render_dfir_input(
         // ⛔ ONE PROGRAM PER TRIP, and its DSC LIST is what the version question is asked of — see
         // [`dfir::GroupOp`]. A trip whose op-func the door does not spell names no program.
         //
-        // ⛔⛔ THE SCHEDULE TREE IS NOT PASSED HERE YET, AND THAT IS THE LAST LINE OF GAP 3. `GroupOp`
-        // (`lower_superdsc_to_dataflow_ir.rs:242`) carries only `dscs`/`func`, so the lowering still
-        // reads the wire `Dsc`'s `scheduleTree_` — a `Vec<AllocNode>` whose every `nodeType_` is
-        // `"allocate"`, which walks NO statement. The schedule is built, held and available:
-        // `scheduled.state_of(r.start + i)` is the tree for this group's `i`-th program. The moment
-        // `group_op_of` takes it, this becomes
-        //     .enumerate()
-        //     .filter_map(|(i, trip)| dfir::group_op_of(
-        //         trip.dscs_.iter().flat_map(BTreeMap::values).collect(),
-        //         scheduled.state_of(r.start + i),
-        //     ))
-        // ⛔ AND THE INDEX MUST BE `r.start + i`, NOT `i`: `scheduled.programs` is positional beside
-        // `trips`, so a group's own offset would pair every program past group 0 with ANOTHER
-        // program's addresses — which compiles, lowers, and is silently wrong.
+        // ⭐⭐ AND THE SCHEDULE TREE IS HANDED OVER HERE, which is what lets the lowering walk
+        // STATEMENTS instead of the wire `Dsc`'s `scheduleTree_` — a `Vec<AllocNode>` whose every
+        // `nodeType_` is `"allocate"` and which walks none.
+        //
+        // ⛔⛔ THE INDEX IS `r.start + i`, NOT `i`, AND THIS IS THE ONE LINE TO GET RIGHT.
+        // `scheduled.programs` is positional beside `trips` — indexed into the whole bundle — while this
+        // loop walks GROUPS. A group-local offset pairs every program past group 0 with ANOTHER
+        // program's addresses, and it compiles, lowers and is silently wrong: the fabricated-placement
+        // failure this crate ranks worse than any stop. `Bundle::state_of`'s own doc says the same.
+        //
+        // ⛔ `filter_map` KEEPS THE PAIRING BECAUSE THE INDEX COMES FROM `enumerate` BEFORE THE FILTER,
+        // not from the surviving position: a trip whose op-func the door does not spell drops out, and
+        // every trip that stays keeps the `i` it entered with.
         let group_ops: Vec<dfir::GroupOp<'_>> = trips[r.start..r.end]
             .iter()
-            .filter_map(|trip| {
-                dfir::group_op_of(trip.dscs_.iter().flat_map(BTreeMap::values).collect())
+            .enumerate()
+            .filter_map(|(i, trip)| {
+                dfir::group_op_of(
+                    trip.dscs_.iter().flat_map(BTreeMap::values).collect(),
+                    scheduled.state_of(r.start + i),
+                )
             })
             .collect();
         let Some(module) = dfir::lower_group(gi as u32, &group_ops) else {
