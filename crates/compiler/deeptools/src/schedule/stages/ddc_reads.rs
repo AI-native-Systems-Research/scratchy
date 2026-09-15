@@ -103,10 +103,7 @@ impl crate::schedule::dsc2::Dsc for Dsc2Reads<'_, '_> {
     /// `getLayoutDims` ABORTS for an index it holds no order for (`dsc/dsc2.cpp:4007`).
     fn layout_dims(&self, lds: LdsIdx) -> LayoutDims {
         self.facts()
-            .dsc()
-            .layout_dims
-            .get(&lds)
-            .cloned()
+            .with_dsc(|dsc| dsc.layout_dims.get(&lds).cloned())
             .unwrap_or_else(|| {
                 panic!(
                     "Dsc::layout_dims: getLayoutDims({lds:?}) aborts for an lds this DSC states no \
@@ -120,81 +117,82 @@ impl v1::LabeledDsIndices for Dsc2Reads<'_, '_> {
     /// `labeledDs_.at(i).ldsIdx_` for every entry, in order — ⭐ THE ENTRY'S OWN RECORDED INDEX and
     /// not its position, which is what [`crate::schedule::l3::dsc::LabeledDs::recorded`] holds.
     fn labeled_ds_indices(&self) -> Vec<LdsIdx> {
-        self.facts()
-            .dsc()
-            .labeled_ds
-            .iter()
-            .map(crate::schedule::l3::dsc::LabeledDs::recorded)
-            .collect()
+        self.facts().with_dsc(|dsc| {
+            dsc.labeled_ds
+                .iter()
+                .map(crate::schedule::l3::dsc::LabeledDs::recorded)
+                .collect()
+        })
     }
 }
 
 impl v1::LdsSticks for Dsc2Reads<'_, '_> {
     /// `primaryDsInfo_.at(labeledDs_.at(lds).dsType_)`'s stick order zipped with its sizes.
     fn stick_dims(&self, lds: LdsIdx) -> StickDims {
-        ddc_state::stick_dims_of(self.facts().dsc(), lds).unwrap_or_default()
+        self.facts()
+            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
+            .unwrap_or_default()
     }
 }
 
 impl v1::StorageNames for Dsc2Reads<'_, '_> {
-    /// ⛔ Wants `labeledDs_.at(lds).dsName_` — the SAME gap stage 2a's
-    /// [`super::Placement`](super::carriers::Placement) records, and the reason
-    /// [`super::DscState::seeded`] names its own allocate nodes positionally.
-    fn lds_name(&self, _lds: LdsIdx) -> v1::StorageName {
-        todo!(
-            "v1::StorageNames::lds_name: wants labeledDs_.at(lds).dsName_, which \
-             l3::dsc::LabeledDs does not carry — present in g0/sdsc_0.json, dropped by the l3 \
-             projection. It NAMES a tracker entry, so a positional stand-in would key the memory \
-             tracker by a name the reference never used."
-        )
+    /// `labeledDs_.at(lds).dsName_` (`dsc/dscdefn.h:326`) — ⭐ ANSWERED off [`LdsRecord::name`].
+    ///
+    /// ⛔ TOTAL BY THE TRAIT'S SIGNATURE, and the reference's `.at()` THROWS for an index the list
+    /// does not hold — so an absent index panics rather than answering the empty name, which would
+    /// key the memory tracker by a name the reference never used.
+    fn lds_name(&self, lds: LdsIdx) -> v1::StorageName {
+        self.facts()
+            .with_lds(lds, |held| held.record().name.clone())
+            .unwrap_or_else(|| {
+                panic!("v1::StorageNames::lds_name: labeledDs_.at({lds:?}) throws for an absent index")
+            })
     }
 
-    /// ⛔ Wants `constantInfo_.at(constant).name_` — `constantInfo_` is not a field of
-    /// [`crate::schedule::l3::dsc::DesignSpaceConfig`] at all.
-    fn constant_name(&self, _constant: ConstIdx) -> v1::StorageName {
-        todo!(
-            "v1::StorageNames::constant_name: wants constantInfo_.at(constant).name_ — \
-             constantInfo_ is not projected onto l3::dsc::DesignSpaceConfig"
-        )
+    /// `constantInfo_.at(constant).name_` (`dsc/dsc2.h:48`) — ⭐ ANSWERED off [`DdcFacts::constants`].
+    ///
+    /// ⛔ TOTAL LIKEWISE, and `constantInfo_` is a `std::map` reached with `.at()`: a constant id the
+    /// table does not hold is that throw. The empty name is a real value of the field (a constant
+    /// nothing named), so it cannot double as the missing-entry answer.
+    fn constant_name(&self, constant: ConstIdx) -> v1::StorageName {
+        self.facts()
+            .with_dsc(|dsc| dsc.ddc.constants.get(&constant).map(|held| held.name.clone()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "v1::StorageNames::constant_name: constantInfo_.at({constant:?}) throws for an \
+                     id this DSC's table does not hold"
+                )
+            })
     }
 }
 
 impl v1::ExploreDsc for Dsc2Reads<'_, '_> {
     /// `lds < labeledDs_.size()`.
     fn holds_lds(&self, lds: LdsIdx) -> bool {
-        self.facts().dsc().labeled_ds.at(lds).is_some()
+        self.facts().with_lds(lds, |_| ()).is_some()
     }
 
-    /// `labeledDs_.at(lds).scaledLdsCategory_` — ⭐ THE `SCALE_TENSOR` ARM IS PROVED:
-    /// [`crate::schedule::ddc::fold::MxScaleTensor::of`] answers [`Some`] for that category ALONE
-    /// (`ddc/fold.rs:2707-2712`).
+    /// `labeledDs_.at(lds).scaledLdsCategory_` (`dsc/dscdefn.h:352-356`) — ⭐ ANSWERED AS THE CLOSED
+    /// THREE-WAY IT IS, off [`crate::schedule::l3::dsc::LabeledDs::scaled_category`].
     ///
-    /// ⛔ ITS ABSENCE COLLAPSES THE OTHER TWO. `REGULAR_TENSOR` and `VALUE_TENSOR` are both a `None`
-    /// scale tensor, and entry 307 branches on which — so the absence is named rather than guessed.
+    /// ⛔ AN ABSENT INDEX IS THE `.at()` THROW and not `REGULAR_TENSOR`: the trait is total, and
+    /// `REGULAR_TENSOR` is a real category entry 307 branches on.
     fn scaled_category(&self, lds: LdsIdx) -> ScaledLds {
-        match self
-            .facts()
-            .dsc()
-            .labeled_ds
-            .at(lds)
-            .and_then(crate::schedule::l3::dsc::LabeledDs::scale_tensor)
-        {
-            Some(_) => ScaledLds::Scale,
-            None => todo!(
-                "v1::ExploreDsc::scaled_category: l3::dsc::LabeledDs projects \
-                 scaledLdsCategory_ ONLY as Option<MxScaleTensor>, which collapses REGULAR_TENSOR \
-                 and VALUE_TENSOR into one absence — and entry 307 branches on which"
-            ),
-        }
+        self.facts()
+            .with_lds(lds, crate::schedule::l3::dsc::LabeledDs::scaled_category)
+            .unwrap_or_else(|| {
+                panic!(
+                    "v1::ExploreDsc::scaled_category: labeledDs_.at({lds:?}) throws for an absent \
+                     index"
+                )
+            })
     }
 
     /// `labeledDs_.at(lds).mxInfo_`'s dim and block size.
     fn mx_info(&self, lds: LdsIdx) -> Option<(PrimaryDim, ScaleBlock)> {
         self.facts()
-            .dsc()
-            .labeled_ds
-            .at(lds)
-            .and_then(crate::schedule::l3::dsc::LabeledDs::scale_tensor)
+            .with_lds(lds, crate::schedule::l3::dsc::LabeledDs::scale_tensor)
+            .flatten()
             .map(|held| (held.dim, held.blk_size))
     }
 }
@@ -219,12 +217,14 @@ impl v1::Masking for Dsc2Reads<'_, '_> {
         )
     }
 
-    /// ⛔ Wants `constantInfo_.count(maskingConstId_)`.
+    /// `constantInfo_.count(maskingConstId_)` as the constant it then names (`:101`) — ⭐ ANSWERED
+    /// off [`DdcFacts`], and the `count` is the whole of it: an id the table does NOT hold is
+    /// [`None`], exactly as a `maskingConstId_` of `-1` is.
     fn masking_constant(&self) -> Option<ConstIdx> {
-        todo!(
-            "v1::Masking::masking_constant: wants constantInfo_.count(maskingConstId_) \
-             (dsc/designSpaceConfig.h:101) — neither field is projected onto l3::dsc"
-        )
+        self.facts().with_dsc(|dsc| {
+            let named = dsc.ddc.masking_const?;
+            dsc.ddc.constants.contains_key(&named).then_some(named)
+        })
     }
 
     /// `sdsc_->numWkSlicesPerDim_.at(dim) > 1` (`dsc/superdsc.h:69`) — ⭐ THE SUPER-DSC'S OWN MAP,
@@ -235,34 +235,39 @@ impl v1::Masking for Dsc2Reads<'_, '_> {
             .is_some_and(|count| count.get() > 1)
     }
 
-    /// ⛔ Wants `dimToSymbolMapping_.count(dim)` (`dsc/designSpaceConfig.h:77`).
-    fn is_symbolic(&self, _dim: PrimaryDim) -> bool {
-        todo!(
-            "v1::Masking::is_symbolic: wants dimToSymbolMapping_.count(dim) \
-             (dsc/designSpaceConfig.h:77) — not projected onto l3::dsc::DesignSpaceConfig, and it \
-             is one of the fields stage 2b WRITES (dimToSymbolMapping_ in g0/debug/sdsc_0/sdsc.json)"
-        )
+    /// `dimToSymbolMapping_.count(dim)` (`dsc/designSpaceConfig.h:77`) — ⭐ ANSWERED off
+    /// [`DdcFacts::dim_to_symbol`], and it is the `count` and not the entry: a dim the map NAMES is
+    /// symbolic whatever its symbol list holds.
+    fn is_symbolic(&self, dim: PrimaryDim) -> bool {
+        self.facts()
+            .with_dsc(|dsc| dsc.ddc.dim_to_symbol.contains_key(&dim))
     }
 
     /// `getNonBroadcastLdsDimSet(lds)` (`dsc/dsc2.cpp:4050`).
     fn non_broadcast_dims(&self, lds: LdsIdx) -> BTreeSet<PrimaryDim> {
-        ddc_state::non_broadcast_dims_of(self.facts().dsc(), lds)
+        self.facts()
+            .with_dsc(|dsc| ddc_state::non_broadcast_dims_of(dsc, lds))
     }
 
-    /// ⛔ Wants `labeledDs_.at(lds).dataFormat_`.
-    fn lds_format(&self, _lds: LdsIdx) -> Option<DataFormat> {
-        todo!(
-            "v1::Masking::lds_format: wants labeledDs_.at(lds).dataFormat_, which l3::dsc::LabeledDs \
-             does not carry — present in g0/sdsc_0.json, dropped by the l3 projection"
-        )
+    /// `labeledDs_.at(lds).dataFormat_` — ⭐ ANSWERED off [`LdsRecord::data_format`].
+    ///
+    /// ⛔ THE TWO ABSENCES ARE ONE HERE AND THE TRAIT SAYS SO: its return is already
+    /// `Option<DataFormat>`, whose [`None`] is `DataFormats::INVALID` — and a labelled DS the list does
+    /// not hold has no format either.
+    fn lds_format(&self, lds: LdsIdx) -> Option<DataFormat> {
+        self.facts()
+            .with_lds(lds, |held| held.record().data_format)
+            .flatten()
     }
 }
 
 impl v1::Placement for Dsc2Reads<'_, '_> {
     /// `coreIdsUsed_`.
     fn cores_used(&self) -> v1::CoresUsed {
-        let used = &self.facts().dsc().core_ids_used;
-        v1::CoresUsed::new(used.first(), used.iter().skip(1).collect())
+        self.facts().with_dsc(|dsc| {
+            let used = &dsc.core_ids_used;
+            v1::CoresUsed::new(used.first(), used.iter().skip(1).collect())
+        })
     }
 
     /// `numCoreletsUsed_DSC2_` as the corelets it names — ⛔ EMPTY BEFORE ENTRY 308 STATES IT, which
@@ -277,7 +282,7 @@ impl v1::Placement for Dsc2Reads<'_, '_> {
 
     /// `numCoreletsUsed_` — ⚠️ A DIFFERENT COUNT, and entry 258 reads both.
     fn corelets_used_total(&self) -> Vec<Corelet> {
-        ddc_state::corelets_of(self.facts().dsc().corelets_used.get())
+        ddc_state::corelets_of(self.facts().with_dsc(|dsc| dsc.corelets_used.get()))
     }
 
     /// ⛔ NEVER A CONSTANT. `getBufferCapacityForNode(node, ldsIdx, comp, corelet, row)`
@@ -303,20 +308,16 @@ impl v1::Placement for Dsc2Reads<'_, '_> {
     /// [`v1::ExploreDsc::scaled_category`]'s three-way is not.
     fn is_scale_tensor(&self, lds: LdsIdx) -> bool {
         self.facts()
-            .dsc()
-            .labeled_ds
-            .at(lds)
-            .and_then(crate::schedule::l3::dsc::LabeledDs::scale_tensor)
+            .with_lds(lds, crate::schedule::l3::dsc::LabeledDs::scale_tensor)
+            .flatten()
             .is_some()
     }
 
-    /// ⛔ Wants `l0TetheredMode_` (`dsc/designSpaceConfig.h`).
+    /// `l0TetheredMode_` (`dsc/designSpaceConfig.h:117`) — ⭐ ANSWERED off
+    /// [`DdcFacts::l0_tethered`], which the conversion states as the field's own declared `false`
+    /// because scratchy emits no `l0TetheredMode_` at all.
     fn l0_tethered(&self) -> v1::L0Tethered {
-        todo!(
-            "v1::Placement::l0_tethered: wants l0TetheredMode_, not projected onto \
-             l3::dsc::DesignSpaceConfig — it DECIDES whether the L0 address is per-subcore, so \
-             either arm chosen here is a placement decision"
-        )
+        self.facts().with_dsc(|dsc| dsc.ddc.l0_tethered)
     }
 
     /// ⛔ Wants `coreIdToTetheredCoreCoord(core).subcoreId`.
@@ -403,14 +404,16 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
     /// `getDimIndexInLayoutOrder < 0`, a dim this ds type's layout order does not name, which is
     /// what the trait's own doc distinguishes entry 259's throw from entry 260's `1`.
     fn lds_scale(&self, lds: LdsIdx, dim: PrimaryDim) -> Option<LdsScale> {
-        let dsc = self.facts().dsc();
-        let held = dsc.labeled_ds.at(lds)?;
-        dsc.layout_dims
-            .get(&lds)?
-            .iter()
-            .any(|named| named == dim)
-            .then(|| held.scale(dim))
-            .flatten()
+        self.facts()
+            .with_dsc(|dsc| {
+                let held = dsc.labeled_ds.at(lds)?;
+                dsc.layout_dims
+                    .get(&lds)?
+                    .iter()
+                    .any(|named| named == dim)
+                    .then(|| held.scale(dim))
+                    .flatten()
+            })
             .map(|scale| match scale {
                 crate::schedule::ddc::transformation::Scale::StickDim => LdsScale::StickBroadcast,
                 crate::schedule::ddc::transformation::Scale::UnitStick => LdsScale::Broadcast,
@@ -430,10 +433,8 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
     fn dim_density(&self, lds: LdsIdx, dim: PrimaryDim) -> v1::Density {
         match self
             .facts()
-            .dsc()
-            .labeled_ds
-            .at(lds)
-            .and_then(crate::schedule::l3::dsc::LabeledDs::scale_tensor)
+            .with_lds(lds, crate::schedule::l3::dsc::LabeledDs::scale_tensor)
+            .flatten()
         {
             Some(held) if held.dim == dim => NonZeroU64::new(held.blk_size.count().0)
                 .map_or(v1::Density::FULL, v1::Density::per_block),
@@ -533,12 +534,23 @@ impl v1::OffsetSizes for Dsc2Reads<'_, '_> {
         tree.with(|held| held.allocate(node).map(|(alloc, _)| alloc))
     }
 
-    /// ⛔ Wants `constantInfo_.at(constant).allocations_.at(storage)`.
-    fn const_alloc(&self, _constant: ConstIdx, _storage: SenComponent) -> Option<AllocId> {
-        todo!(
-            "v1::OffsetSizes::const_alloc: wants constantInfo_.at(constant).allocations_.at(\
-             storage) — constantInfo_ is not projected onto l3::dsc::DesignSpaceConfig"
-        )
+    /// `constantInfo_.at(constant).allocations_.at(storage)` — ⭐ ANSWERED off
+    /// [`crate::schedule::l3::dsc::ConstantInfo::allocations`].
+    ///
+    /// ⛔ [`None`] IS EITHER `.at()`'s THROW, AND THE TRAIT'S RETURN ALREADY IS ONE: an id no
+    /// `constantInfo_` entry is filed under, or a component no allocation of that constant names. It is
+    /// EMPTY on every constant scratchy writes (`"allocations_": {}` on all twelve of `g0/`), and
+    /// `ComponentAllocations::set_constant_allocation` is what fills it — so absence here is the
+    /// unplaced state and not a lost fact.
+    fn const_alloc(&self, constant: ConstIdx, storage: SenComponent) -> Option<AllocId> {
+        self.facts().with_dsc(|dsc| {
+            dsc.ddc
+                .constants
+                .get(&constant)?
+                .allocations
+                .get(&storage)
+                .copied()
+        })
     }
 
     /// ⛔ Wants `dscGlobal.sysDef.addressGranularityScalePerUnit.at({generic, storage})` — a

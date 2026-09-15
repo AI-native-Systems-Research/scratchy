@@ -393,8 +393,11 @@ mod tests {
     /// `debug/sdsc_0/sdsc.json`'s thirty nodes that stage 2a owns.
     ///
     /// ⛔ THE FIRST THREE ALLOCATES ARE SPELLED `allocate-Tensor{N}_hbm` THERE. `Tensor{N}` is
-    /// `labeledDs_.at(N).dsName_`, which [`crate::schedule::l3::dsc::LabeledDs`] does not carry — the
-    /// one gap [`DscState::seeded`] records, and the only name below that is not the reference's own.
+    /// `labeledDs_.at(N).dsName_`, which [`DscState::seeded`] does not reach: the seed is built off the
+    /// SUPER-DSC alone, and `dsName_` arrives at the scheduler through
+    /// [`v1::StorageNames`] — a method on the `P` carrier that takes no
+    /// [`l3::dsc::DscIdx`], so it cannot say which DSC's `labeledDs_` an index names
+    /// ([`carriers::Placement`]'s own note). So the names below are positional.
     const REFERENCE_STAGE_2A_TREE: [&str; 22] = [
         "root_level_operations",
         "allocate_lds0_hbm",
@@ -953,5 +956,350 @@ mod tests {
             "twenty-two nodes from a four-node seed"
         );
         assert!(state.refusals().is_empty(), "no carrier refused");
+    }
+
+    /// ⭐⭐ THE SEVEN FIELDS `l3::dsc` USED TO DROP, ANSWERED WITH `g0/sdsc_0.json`'S OWN VALUES —
+    /// `dsName_`, `wordLength`, `dataFormat_`, `scaledLdsCategory_`, `constantInfo_`,
+    /// `dimToSymbolMapping_` and `l0TetheredMode_`.
+    ///
+    /// ⛔ EVERY EXPECTATION IS A VALUE READ OFF THE FIXTURE, not a shape: `Tensor{0,1,2}` /
+    /// `wordLength: 2` / `dataFormat_: "SEN169_FP16"` on each of the three `labeledDs_` entries,
+    /// `constantInfo_: "{}"` (so no constant and `masking_constant` is [`None`]), `maskingConstId_: -1`,
+    /// and NEITHER `dimToSymbolMapping_` NOR `l0TetheredMode_` emitted — the declared `{}` and `false`.
+    ///
+    /// ⛔ AND `holds_lds(3)` IS THE OTHER ARM, so `lds_name` is not satisfied by any total function: the
+    /// list holds exactly three entries and the fourth index is `labeledDs_.at()`'s throw.
+    #[test]
+    fn the_seven_dropped_fields_answer_with_the_fixtures_own_values() {
+        use crate::schedule::ddc::fold::ScaledLds;
+        use crate::schedule::ddc::v1::{ExploreDsc, Masking, Placement, StorageNames};
+
+        let sdsc = a_rmsq_super_dsc();
+        let l3_state = DscState::seeded(&sdsc);
+        let state = Dsc2State::seeded(
+            &sdsc,
+            &l3_state,
+            &[the_rmsq_compute_ops()],
+            &[v1::StorageName("rmsq_o728".to_owned())],
+        );
+        let mut sites = Dsc2Provider::new(&state, &l3::dl_ops::AddressFoldCoords::flat());
+        let carriers = v1::Dsc2Sites::carriers(&mut sites, l3::dsc::DscIdx(0))
+            .expect("the one DSC's carriers");
+        let (reads, _) = v1::Dsc2Store::split(carriers.dsc);
+
+        // `dsName_` — `allocate-Tensor{N}_hbm` in `debug/sdsc_0/sdsc.json` is named off THIS.
+        for at in 0u32..3 {
+            assert!(reads.holds_lds(LdsIdx(at)), "labeledDs_ holds position {at}");
+            assert_eq!(
+                reads.lds_name(LdsIdx(at)),
+                v1::StorageName(format!("Tensor{at}")),
+                "labeledDs_.at({at}).dsName_"
+            );
+            // `dataFormat_` — what the DDL match binds each operand's type by.
+            assert_eq!(
+                Masking::lds_format(reads, LdsIdx(at)),
+                Some(crate::formats::DataFormat::Sen169Fp16),
+                "labeledDs_.at({at}).dataFormat_"
+            );
+            // `scaledLdsCategory_` — ABSENT on all 580 labelled DSs of `g0/`, which is the declared
+            // `REGULAR_TENSOR` (`dsc/dscdefn.h:356`) and NOT the `SCALE_TENSOR` an
+            // `Option<MxScaleTensor>` used to collapse it with.
+            assert_eq!(
+                reads.scaled_category(LdsIdx(at)),
+                ScaledLds::Regular,
+                "labeledDs_.at({at}).scaledLdsCategory_"
+            );
+            assert!(
+                !Placement::is_scale_tensor(reads, LdsIdx(at)),
+                "and REGULAR_TENSOR is not a scale tensor"
+            );
+        }
+        // ⛔ THE OTHER ARM: three entries, so the fourth index is the `.at()` throw and `lds_name` is
+        // not a total function over `LdsIdx`.
+        assert!(
+            !reads.holds_lds(LdsIdx(3)),
+            "labeledDs_ has exactly three entries"
+        );
+
+        // `constantInfo_` is the string `"{}"` and `maskingConstId_` is `-1`, so there is no masking
+        // constant — and `masking_constant` is `constantInfo_.count(maskingConstId_)`, which `-1` never
+        // satisfies.
+        assert_eq!(
+            reads.masking_constant(),
+            None,
+            "constantInfo_ is empty and maskingConstId_ is -1"
+        );
+        // ⛔ AND NEITHER IS A SUBSTITUTED DEFAULT: `dimToSymbolMapping_` is emitted by nothing, which is
+        // `count(dim) == 0` for every dim, and `l0TetheredMode_` likewise is the declared `false`.
+        for dim in [PrimaryDim::Mb, PrimaryDim::Out, PrimaryDim::Y] {
+            assert!(
+                !Masking::is_symbolic(reads, dim),
+                "dimToSymbolMapping_.count({dim:?}) == 0"
+            );
+        }
+        assert_eq!(
+            Placement::l0_tethered(reads),
+            v1::L0Tethered::Split,
+            "l0TetheredMode_ == false"
+        );
+
+        // `wordLength` — read through the DDL match site, which is what compares it against a
+        // template's own `bitSize_ / 8`.
+        for at in 0u32..3 {
+            assert_eq!(
+                crate::schedule::ddl::conversion::MatchSite::lds_word_length(
+                    &*carriers.ddl,
+                    LdsIdx(at)
+                ),
+                Some(WordLength(2)),
+                "labeledDs_.at({at}).wordLength"
+            );
+        }
+    }
+
+    /// ⭐⭐⭐ AND THE WRITES REACH THE READS — the ONE property [`v1::Dsc2Store::split`]'s own doc
+    /// (`ddc/v1.rs:6040-6047`) says a caller must not break: *"two carriers over one `currDsc` would
+    /// let entry 308's writes be invisible to entry 307's reads"*.
+    ///
+    /// ⛔⛔ THIS TEST IS THE ONE THAT WOULD FAIL ON A SECOND COPY, AND NOTHING ELSE WOULD. Every setter
+    /// below is a `&mut self` method on [`super::Dsc2Store`] and every read is through the `&Reads` half
+    /// [`v1::Dsc2Store::split`] hands out; a `Dsc2Facts` that gave the writers their own
+    /// `DesignSpaceConfig` would compile, silently drop all five writes, and every other test in this
+    /// module would still pass.
+    ///
+    /// ⛔ AND IT CARRIES VALUES: each assertion names the value the setter wrote, so a setter that
+    /// wrote *something* to the right field does not satisfy it.
+    #[test]
+    fn entry_308_and_372_writes_are_visible_to_the_shared_reads_half() {
+        use crate::schedule::ddc::fold::ScaledLds;
+        use crate::schedule::ddc::transformation::AutoShuffling;
+        use crate::schedule::ddc::v1::{ExploreDsc, Masking, PrepDsc, StorageNames};
+
+        let sdsc = a_rmsq_super_dsc();
+        let l3_state = DscState::seeded(&sdsc);
+        let state = Dsc2State::seeded(
+            &sdsc,
+            &l3_state,
+            &[the_rmsq_compute_ops()],
+            &[v1::StorageName("rmsq_o728".to_owned())],
+        );
+        let mut sites = Dsc2Provider::new(&state, &l3::dl_ops::AddressFoldCoords::flat());
+        let carriers = v1::Dsc2Sites::carriers(&mut sites, l3::dsc::DscIdx(0))
+            .expect("the one DSC's carriers");
+        let store = carriers.dsc;
+
+        // ⭐ ENTRY 308'S OWN WRITES ON THE MINTED INTERNAL INPUT (`ddc/ddcv1.cpp:2098-2162`):
+        // `dsName_ += "_internalInput"`, `dsType_ = INTERNAL`, `wordLength = 2`,
+        // `dataFormat_ = SEN143_FP8`, `scaledLdsCategory_ = VALUE_TENSOR`.
+        PrepDsc::append_lds_name(store, LdsIdx(1), v1::InternalLds::Input);
+        PrepDsc::set_lds_internal(store, LdsIdx(1));
+        PrepDsc::set_lds_word_length(store, LdsIdx(1), WordLength(1));
+        PrepDsc::set_lds_format(store, LdsIdx(1), crate::formats::DataFormat::Sen143Fp8);
+        PrepDsc::set_lds_scaled_category(store, LdsIdx(1), ScaledLds::Value);
+        // ⭐ AND ENTRY 372'S, WHICH *ASSIGNS* THE NAME RATHER THAN APPENDING IT
+        // (`ddc/transformation.rs:3295`).
+        AutoShuffling::set_lds_name(
+            store,
+            LdsIdx(2),
+            v1::StorageName("autoshuffle_reg_0".to_owned()),
+        );
+
+        // `dsType_` is on the STORE's own [`crate::schedule::ddc::transformation::LabeledDs`], read
+        // before the split so the two halves are not both borrowed at once.
+        assert_eq!(
+            crate::schedule::ddc::transformation::LabeledDs::ds_type(&*store, LdsIdx(1)),
+            DsType::Internal,
+            "dsType_ = INTERNAL"
+        );
+
+        let (reads, _) = v1::Dsc2Store::split(store);
+        assert_eq!(
+            reads.lds_name(LdsIdx(1)),
+            v1::StorageName("Tensor1_internalInput".to_owned()),
+            "append_lds_name APPENDED to the fixture's own `Tensor1`, it did not replace it"
+        );
+        assert_eq!(
+            Masking::lds_format(reads, LdsIdx(1)),
+            Some(crate::formats::DataFormat::Sen143Fp8),
+            "set_lds_format is visible through the shared currDsc"
+        );
+        assert_eq!(
+            reads.scaled_category(LdsIdx(1)),
+            ScaledLds::Value,
+            "VALUE_TENSOR — the arm an Option<MxScaleTensor> could not state at all"
+        );
+        assert_eq!(
+            reads.lds_name(LdsIdx(2)),
+            v1::StorageName("autoshuffle_reg_0".to_owned()),
+            "set_lds_name ASSIGNED, so `Tensor2` is gone"
+        );
+        // ⛔ AND THE UNTOUCHED ENTRY IS UNTOUCHED, so none of the above is a write to every entry.
+        assert_eq!(
+            reads.lds_name(LdsIdx(0)),
+            v1::StorageName("Tensor0".to_owned()),
+            "labeledDs_.at(0) was not written"
+        );
+        assert_eq!(
+            Masking::lds_format(reads, LdsIdx(0)),
+            Some(crate::formats::DataFormat::Sen169Fp16),
+            "and it keeps the fixture's own format"
+        );
+    }
+
+    /// ⭐⭐ `constantInfo_` WITH A REAL CONSTANT IN IT — `g0/sdsc_1.json`'s `1_rmmean_o728`, whose table
+    /// is `{"0": {"name_": "scaling_factor", "dataFormat_": "SEN169_FP16", "data_": [10240],
+    /// "allocations_": {}}}`.
+    ///
+    /// ⛔ THE `useZeroMean` PREDICATE IS ASSERTED ON BOTH ARMS, and its datum is what decides:
+    /// `getSingleDataStrict(constinfo.data_).at(0) == 1` (`ddc/ddcv1.cpp:2066-2068`) swaps `EXX2` for
+    /// `EXX2_ZEROMEAN`, so a constant of that NAME whose datum is `0` must answer `false` — otherwise
+    /// the predicate is satisfied by any wrong behaviour of the right shape.
+    #[test]
+    fn a_real_constant_info_table_answers_its_name_its_id_and_the_zero_mean_swap() {
+        use crate::schedule::ddc::fold::ConstIdx;
+        use crate::schedule::ddc::v1::{Masking, PrepDsc, StorageNames};
+        use crate::schedule::l3::dsc::{ConstantInfo, DdcFacts};
+
+        /// One super-DSC whose one DSC carries that `constantInfo_` table and `maskingConstId_`.
+        fn with_constants(constants: DdcFacts) -> SuperDsc {
+            let mut dsc = a_rmsq_dsc();
+            dsc.ddc = constants;
+            SuperDsc::new(
+                DscList::new(dsc, Vec::new()),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        }
+
+        /// `sdsc_1.json`'s own entry, with the datum the caller states.
+        fn scaling_factor(datum: i64) -> ConstantInfo {
+            ConstantInfo {
+                name: v1::StorageName("scaling_factor".to_owned()),
+                data_format: Some(crate::formats::DataFormat::Sen169Fp16),
+                data: vec![datum],
+                is_data_symbolic: false,
+                allocations: BTreeMap::new(),
+            }
+        }
+
+        let ask = |facts: DdcFacts, check: &dyn Fn(&mut super::Dsc2Store<'_, '_>)| {
+            let sdsc = with_constants(facts);
+            let l3_state = DscState::seeded(&sdsc);
+            let state = Dsc2State::seeded(
+                &sdsc,
+                &l3_state,
+                &[the_rmsq_compute_ops()],
+                &[v1::StorageName("rmmean_o728".to_owned())],
+            );
+            let mut sites = Dsc2Provider::new(&state, &l3::dl_ops::AddressFoldCoords::flat());
+            let carriers = v1::Dsc2Sites::carriers(&mut sites, l3::dsc::DscIdx(0))
+                .expect("the one DSC's carriers");
+            check(carriers.dsc);
+        };
+
+        // `constantInfo_.at(0).name_` — the value the reference keys its memory tracker by.
+        ask(
+            DdcFacts {
+                constants: BTreeMap::from([(ConstIdx(0), scaling_factor(10240))]),
+                ..DdcFacts::default()
+            },
+            &|store| {
+                // ⛔ AND THE NAME IS NOT `useZeroMean`, so no swap.
+                assert!(
+                    !PrepDsc::declares_zero_mean_constant(&*store),
+                    "`scaling_factor` is not `useZeroMean`"
+                );
+                let (reads, _) = v1::Dsc2Store::split(store);
+                assert_eq!(
+                    reads.constant_name(ConstIdx(0)),
+                    v1::StorageName("scaling_factor".to_owned()),
+                    "constantInfo_.at(0).name_ off `g0/sdsc_1.json`"
+                );
+                // ⛔ `maskingConstId_` IS STILL `-1`, so a table WITH a constant in it does not by
+                // itself make a masking constant.
+                assert_eq!(
+                    reads.masking_constant(),
+                    None,
+                    "constantInfo_.count(-1) is zero however full the table is"
+                );
+            },
+        );
+
+        // ⭐ `maskingConstId_ = 0` WITH THE TABLE HOLDING 0 — `constantInfo_.count(maskingConstId_)`.
+        ask(
+            DdcFacts {
+                constants: BTreeMap::from([(ConstIdx(0), scaling_factor(10240))]),
+                masking_const: Some(ConstIdx(0)),
+                ..DdcFacts::default()
+            },
+            &|store| {
+                let (reads, _) = v1::Dsc2Store::split(store);
+                assert_eq!(
+                    reads.masking_constant(),
+                    Some(ConstIdx(0)),
+                    "the table holds the id maskingConstId_ names"
+                );
+            },
+        );
+
+        // ⛔ AND `maskingConstId_ = 7` WITH THE TABLE HOLDING ONLY 0 IS [`None`] — the `count` is the
+        // whole of the reference's test, so a bare `Some(maskingConstId_)` would fail here.
+        ask(
+            DdcFacts {
+                constants: BTreeMap::from([(ConstIdx(0), scaling_factor(10240))]),
+                masking_const: Some(ConstIdx(7)),
+                ..DdcFacts::default()
+            },
+            &|store| {
+                let (reads, _) = v1::Dsc2Store::split(store);
+                assert_eq!(
+                    reads.masking_constant(),
+                    None,
+                    "constantInfo_.count(7) is zero, so entry 262 has no masking constant"
+                );
+            },
+        );
+
+        // ⭐ THE ZERO-MEAN SWAP, BOTH ARMS — the DATUM decides, not the name.
+        ask(
+            DdcFacts {
+                constants: BTreeMap::from([(
+                    ConstIdx(0),
+                    ConstantInfo {
+                        name: v1::StorageName("useZeroMean".to_owned()),
+                        data: vec![1],
+                        ..scaling_factor(1)
+                    },
+                )]),
+                ..DdcFacts::default()
+            },
+            &|store| {
+                assert!(
+                    PrepDsc::declares_zero_mean_constant(&*store),
+                    "`useZeroMean` with datum 1 swaps EXX2 for EXX2_ZEROMEAN"
+                );
+            },
+        );
+        ask(
+            DdcFacts {
+                constants: BTreeMap::from([(
+                    ConstIdx(0),
+                    ConstantInfo {
+                        name: v1::StorageName("useZeroMean".to_owned()),
+                        data: vec![0],
+                        ..scaling_factor(0)
+                    },
+                )]),
+                ..DdcFacts::default()
+            },
+            &|store| {
+                assert!(
+                    !PrepDsc::declares_zero_mean_constant(&*store),
+                    "`useZeroMean` with datum 0 is the switch turned OFF — this arm is what a \
+                     `has a datum` predicate would get wrong"
+                );
+            },
+        );
     }
 }

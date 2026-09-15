@@ -233,6 +233,19 @@ impl LabeledDs {
         self.scale_tensor = mx_info;
     }
 
+    /// `dsType_ = ds_type` — `PrepDsc::set_lds_internal` writes `DsTypes::INTERNAL` here.
+    pub const fn set_ds_type(&mut self, ds_type: DsType) {
+        self.ds_type = ds_type;
+    }
+
+    /// `ldsIdx_ = recorded` — `NewLabeledDs::set_last_recorded_lds_idx`'s `++back().ldsIdx_`.
+    ///
+    /// ⛔ THE ENTRY'S OWN INDEX AND NOT ITS POSITION, which is the drift [`Self::recorded`] documents:
+    /// writing it does NOT move the entry.
+    pub const fn set_recorded(&mut self, recorded: LdsIdx) {
+        self.recorded = recorded;
+    }
+
     /// `ldsIdx_` — the entry's OWN self-index, which need NOT equal the position it sits at in
     /// `labeledDs_`: it defaults to `183` (`dsc/dscdefn.h:323`) and is written independently.
     #[must_use]
@@ -411,6 +424,22 @@ impl LabeledDsList {
         self.indexed()
             .find(|(at, _)| *at == idx)
             .map(|(_, lds)| lds)
+    }
+
+    /// `labeledDs_.at(idx)` AS THE REFERENCE'S NON-CONST `.at()` — the same position, writable, for the
+    /// five `prep_dsc`/`AutoShuffling` setters that rewrite one entry's record.
+    ///
+    /// ⛔ THE POSITION AND NOT [`LabeledDs::recorded`], exactly as [`Self::at`] is: the two can drift.
+    pub fn at_mut(&mut self, idx: LdsIdx) -> Option<&mut LabeledDs> {
+        match idx.0 {
+            0 => Some(&mut self.first),
+            at => self.rest.get_mut(usize::try_from(at).ok()? - 1),
+        }
+    }
+
+    /// `labeledDs_.back()`, writable — TOTAL for the same reason [`Self::back`] is.
+    pub fn back_mut(&mut self) -> &mut LabeledDs {
+        self.rest.last_mut().unwrap_or(&mut self.first)
     }
 
     /// `isOutputLabeledDs(ldsIdx, dsc)` (`L3DlOpsScheduler.h:228`) — `ldsIdx == labeledDs_.size()

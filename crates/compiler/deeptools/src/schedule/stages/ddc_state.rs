@@ -294,7 +294,18 @@ pub struct Dsc2Facts {
     /// `currDsc` IS that entry; `run_v1` takes `sdsc: &mut SuperDsc` beside `sites: &mut P`, so no
     /// provider may borrow it. `select_and_parse_ddl_template` writes the DSC through the super-DSC
     /// path (`ddc/v1.rs:6489`) and this clone does not see those writes.
-    dsc: DesignSpaceConfig,
+    ///
+    /// ⭐⭐ BEHIND THE SAME CELL [`Self::stages`] AND [`Self::ops`] ARE, AND FOR THE SAME REASON:
+    /// entry 308 (`prep_dsc`) and entry 372 (`AutoShuffling`) REWRITE `labeledDs_` — `dsName_`,
+    /// `wordLength`, `dataFormat_`, `scaledLdsCategory_`, `dsType_` — through `&mut self` methods on
+    /// [`super::Dsc2Store`], while [`super::Dsc2Reads`] reads the SAME entries through `&self`. The
+    /// reference has one `currDsc`, so a second copy for the writers would make entry 308's writes
+    /// invisible to entry 307's reads — the defect review 382 recorded on `L3RunInputs`.
+    ///
+    /// ⭐ SOUND FOR THE REASON THE MODULE HEADER GIVES: every design-space trait answers BY VALUE, so
+    /// no borrow of the interior outlives the call that took it — which is why the accessors below are
+    /// CLOSURES and not a [`std::cell::Ref`] a caller could hold across a write.
+    dsc: RefCell<DesignSpaceConfig>,
     /// `computeOp_` — a construction argument; see the module note.
     ops: RefCell<Vec<v1::DscComputeOp>>,
     /// `numCoreletsUsed_DSC2_` as `prep_dsc` (entry 308) writes it, [`None`] before it runs, which
@@ -311,9 +322,35 @@ impl Dsc2Facts {
         self.name.clone()
     }
 
-    /// The design space, for the length of one read.
-    pub(super) const fn dsc(&self) -> &DesignSpaceConfig {
-        &self.dsc
+    /// The design space, for the length of ONE read.
+    pub(super) fn with_dsc<T>(&self, ask: impl FnOnce(&DesignSpaceConfig) -> T) -> T {
+        ask(&self.dsc.borrow())
+    }
+
+    /// The design space, for the length of ONE write — `currDsc->...= ` as entries 308 and 372 make
+    /// it.
+    pub(super) fn with_dsc_mut<T>(&self, write: impl FnOnce(&mut DesignSpaceConfig) -> T) -> T {
+        write(&mut self.dsc.borrow_mut())
+    }
+
+    /// `labeledDs_.at(lds)`, for one read — ⛔ [`None`] IS that `.at()`'s own throw.
+    pub(super) fn with_lds<T>(
+        &self,
+        lds: LdsIdx,
+        ask: impl FnOnce(&crate::schedule::l3::dsc::LabeledDs) -> T,
+    ) -> Option<T> {
+        self.with_dsc(|dsc| dsc.labeled_ds.at(lds).map(ask))
+    }
+
+    /// `labeledDs_.at(lds)`, for one write — the five setters entry 308 and entry 372 rewrite an
+    /// entry's record with. ⛔ [`None`] IS THE `.at()` THROW, so a write to an absent index is
+    /// reported and not silently dropped.
+    pub(super) fn with_lds_mut<T>(
+        &self,
+        lds: LdsIdx,
+        write: impl FnOnce(&mut crate::schedule::l3::dsc::LabeledDs) -> T,
+    ) -> Option<T> {
+        self.with_dsc_mut(|dsc| dsc.labeled_ds.at_mut(lds).map(write))
     }
 
     /// `computeOp_`, in order.
@@ -392,7 +429,7 @@ impl<'l> Dsc2State<'l> {
                 name: names.get(at).cloned().unwrap_or_else(|| {
                     v1::StorageName(format!("dsc{at}"))
                 }),
-                dsc: dsc.clone(),
+                dsc: RefCell::new(dsc.clone()),
                 ops: RefCell::new(ops.get(at).cloned().unwrap_or_default()),
                 corelets_dsc2: Cell::new(dsc.corelets_used_dsc2.map(|used| used.get())),
                 stages: RefCell::new(seed_stages(dsc)),

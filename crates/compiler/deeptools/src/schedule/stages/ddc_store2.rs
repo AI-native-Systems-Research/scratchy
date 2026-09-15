@@ -45,36 +45,42 @@ impl tr::LabeledDs for Dsc2Store<'_, '_> {
     /// `labeledDs_.at(lds).scale_`, one entry per layout dim — IN LAYOUT ORDER, which is what the
     /// reference's positional `scale_.at(i)` means.
     fn scale(&self, lds: LdsIdx) -> Vec<tr::Scale> {
-        let dsc = self.dsc_facts().dsc();
-        let Some(held) = dsc.labeled_ds.at(lds) else {
-            return Vec::new();
-        };
-        dsc.layout_dims
-            .get(&lds)
-            .map(|layout| layout.iter().filter_map(|dim| held.scale(dim)).collect())
-            .unwrap_or_default()
+        self.dsc_facts().with_dsc(|dsc| {
+            let Some(held) = dsc.labeled_ds.at(lds) else {
+                return Vec::new();
+            };
+            dsc.layout_dims
+                .get(&lds)
+                .map(|layout| layout.iter().filter_map(|dim| held.scale(dim)).collect())
+                .unwrap_or_default()
+        })
     }
 
     /// `labeledDs_.at(lds).dsType_` — ⛔ TOTAL, and the reference's `.at()` throws for an index the
     /// list does not hold.
     fn ds_type(&self, lds: LdsIdx) -> tr::DsType {
-        ddc_state::ds_type_of(self.dsc_facts().dsc(), lds).unwrap_or_else(|| {
-            panic!("tr::LabeledDs::ds_type: labeledDs_.at({lds:?}) throws for an absent index")
-        })
+        self.dsc_facts()
+            .with_dsc(|dsc| ddc_state::ds_type_of(dsc, lds))
+            .unwrap_or_else(|| {
+                panic!("tr::LabeledDs::ds_type: labeledDs_.at({lds:?}) throws for an absent index")
+            })
     }
 }
 
 impl tr::DsSticks for Dsc2Store<'_, '_> {
     /// `labeledDs_.at(lds).dsType_`'s `stickDimOrder_` zipped with its `stickSize_`.
     fn ds_stick_dims(&self, lds: LdsIdx) -> StickDims {
-        ddc_state::stick_dims_of(self.dsc_facts().dsc(), lds).unwrap_or_default()
+        self.dsc_facts()
+            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
+            .unwrap_or_default()
     }
 }
 
 impl tu::TransferUnrolling for Dsc2Store<'_, '_> {
     /// `currDsc->getNonBroadcastLdsDims(lds)` — ⛔ [`None`] is its own `getLayoutDims` abort.
     fn non_broadcast_lds_dims(&self, lds: LdsIdx) -> Option<Vec<PrimaryDim>> {
-        self.dsc_facts().dsc().non_broadcast_lds_dims(lds)
+        self.dsc_facts()
+            .with_dsc(|dsc| dsc.non_broadcast_lds_dims(lds))
     }
 }
 
@@ -152,7 +158,8 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
 
     /// `getStickDims(lds)`.
     fn stick_dims(&self, lds: LdsIdx) -> Vec<PrimaryDim> {
-        ddc_state::stick_dims_of(self.dsc_facts().dsc(), lds)
+        self.dsc_facts()
+            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
             .map(|dims| dims.0.iter().map(|(dim, _)| *dim).collect())
             .unwrap_or_default()
     }
@@ -402,7 +409,8 @@ impl tu::TransferMoves for Dsc2Store<'_, '_> {
 
     /// `currDsc->coreIdsUsed_`.
     fn core_ids_used(&self) -> Vec<Core> {
-        self.dsc_facts().dsc().core_ids_used.iter().collect()
+        self.dsc_facts()
+            .with_dsc(|dsc| dsc.core_ids_used.iter().collect())
     }
 
     /// ⛔ `metadata.dataConnects_.at(connect).getProducerLoops()` — the METADATA's census, which no
@@ -485,27 +493,29 @@ impl tr::HoistTransfers for Dsc2Store<'_, '_> {
 }
 
 impl tr::Splat4bRead for Dsc2Store<'_, '_> {
-    /// ⛔ `labeledDs_.at(lds).dataFormat_`.
-    fn lds_data_format(&self, _lds: LdsIdx) -> Option<DataFormat> {
-        todo!(
-            "tr::Splat4bRead::lds_data_format: wants labeledDs_.at(lds).dataFormat_, which \
-             l3::dsc::LabeledDs does not carry"
-        )
+    /// `labeledDs_.at(lds).dataFormat_` — ⭐ ANSWERED off
+    /// [`crate::schedule::l3::dsc::LdsRecord::data_format`]. ⛔ [`None`] IS `DataFormats::INVALID` or
+    /// an lds the list does not hold, which the trait's own [`Option`] already spells.
+    fn lds_data_format(&self, lds: LdsIdx) -> Option<DataFormat> {
+        self.dsc_facts()
+            .with_lds(lds, |held| held.record().data_format)
+            .flatten()
     }
 
     /// `lds.scale_.at(getDimIndexInLayoutOrder(dsType_, dim))` for EVERY `labeledDs_` entry — ⭐
     /// ANSWERED, and ⛔ [`None`] IS the reference's own `dimIdx < 0`, its first `broadcastNeeded` arm.
     fn every_lds_scale_on(&self, dim: PrimaryDim) -> Vec<Option<tr::Scale>> {
-        let dsc = self.dsc_facts().dsc();
-        dsc.labeled_ds
-            .indexed()
-            .map(|(at, held)| {
-                dsc.layout_dims
-                    .get(&at)
-                    .filter(|layout| layout.iter().any(|named| named == dim))
-                    .and_then(|_| held.scale(dim))
-            })
-            .collect()
+        self.dsc_facts().with_dsc(|dsc| {
+            dsc.labeled_ds
+                .indexed()
+                .map(|(at, held)| {
+                    dsc.layout_dims
+                        .get(&at)
+                        .filter(|layout| layout.iter().any(|named| named == dim))
+                        .and_then(|_| held.scale(dim))
+                })
+                .collect()
+        })
     }
 
     /// ⛔ No COMPUTE arm.
@@ -654,28 +664,27 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
         v1::PrepDsc::lds_entry(self, lds)
     }
 
-    /// ⛔ `ds_info.dsName_ = name` — the field `l3::dsc::LabeledDs` does not carry.
-    fn set_lds_name(&mut self, _lds: LdsIdx, _name: v1::StorageName) {
-        todo!(
-            "tr::AutoShuffling::set_lds_name: wants ds_info.dsName_ = name, which \
-             l3::dsc::LabeledDs does not carry"
-        )
+    /// `ds_info.dsName_ = name` — ⭐ ANSWERED through the shared `currDsc` cell. ⛔ AN ASSIGNMENT AND
+    /// NOT AN APPEND, unlike [`v1::PrepDsc::append_lds_name`]: entry 372 NAMES its minted register
+    /// `autoshuffle_reg_{n}` outright (`ddc/transformation.rs:3295`).
+    fn set_lds_name(&mut self, lds: LdsIdx, name: v1::StorageName) {
+        let _: Option<()> = self
+            .dsc_facts()
+            .with_lds_mut(lds, |held| held.set_name(name));
     }
 
-    /// ⛔ `ds_info.dataFormat_ = format`.
-    fn set_lds_format(&mut self, _lds: LdsIdx, _format: DataFormat) {
-        todo!(
-            "tr::AutoShuffling::set_lds_format: wants ds_info.dataFormat_ = format, which \
-             l3::dsc::LabeledDs does not carry"
-        )
+    /// `ds_info.dataFormat_ = format` — ⭐ ANSWERED.
+    fn set_lds_format(&mut self, lds: LdsIdx, format: DataFormat) {
+        let _: Option<()> = self
+            .dsc_facts()
+            .with_lds_mut(lds, |held| held.set_data_format(format));
     }
 
-    /// ⛔ `ds_info.wordLength = word_length`.
-    fn set_lds_word_length(&mut self, _lds: LdsIdx, _length: WordLength) {
-        todo!(
-            "tr::AutoShuffling::set_lds_word_length: wants ds_info.wordLength = length, which \
-             l3::dsc::LabeledDs does not carry"
-        )
+    /// `ds_info.wordLength = word_length` — ⭐ ANSWERED.
+    fn set_lds_word_length(&mut self, lds: LdsIdx, length: WordLength) {
+        let _: Option<()> = self
+            .dsc_facts()
+            .with_lds_mut(lds, |held| held.set_word_length(length));
     }
 
     /// `currDsc->computeOp_.back()` — ⛔ [`None`] on any other size, which is the ONE call site's own
@@ -730,23 +739,52 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
         v1::ConditionSimplification::delete_node(self, node);
     }
 
-    /// ⛔ `dataFormatsToBitWidth.at(labeledDs_[dinfo.myLdsIdx_].dataFormat_)` — TOTAL by the trait's
-    /// own statement, and it wants the `dataFormat_` `l3::dsc::LabeledDs` drops.
-    fn operand_element_bits(&self, _dinfo: DataInfo) -> crate::formats::Bits {
-        todo!(
-            "tr::AutoShuffling::operand_element_bits: wants \
-             dataFormatsToBitWidth.at(labeledDs_[dinfo.myLdsIdx_].dataFormat_) — dataFormat_ is not \
-             carried by l3::dsc::LabeledDs, and this is an ELEMENT WIDTH, so a stand-in resizes every \
-             packmerge operand"
-        )
+    /// `dataFormatsToBitWidth.at(labeledDs_[dinfo.myLdsIdx_].dataFormat_)` — ⭐ ANSWERED off
+    /// [`crate::schedule::l3::dsc::LdsRecord::data_format`] and
+    /// [`crate::formats::DataFormat::bits`], which IS that table
+    /// (`util/sendefs/sendefs.cpp:129-141`).
+    ///
+    /// ⛔ TOTAL BY THE TRAIT, AND BOTH ABSENCES ARE THE REFERENCE'S OWN THROW, not a width: an operand
+    /// naming no labelled DS is `labeledDs_[-1]`, an lds the list does not hold is past its end, and a
+    /// `dataFormat_` of `INVALID` is a key `dataFormatsToBitWidth` has no row for. This is an ELEMENT
+    /// WIDTH — a stand-in resizes every packmerge operand — so each of the three panics.
+    fn operand_element_bits(&self, dinfo: DataInfo) -> crate::formats::Bits {
+        let lds = dinfo.my_lds_idx.unwrap_or_else(|| {
+            panic!(
+                "tr::AutoShuffling::operand_element_bits: labeledDs_[myLdsIdx_] on an operand whose \
+                 myLdsIdx_ is the reference's -1"
+            )
+        });
+        self.dsc_facts()
+            .with_lds(lds, |held| held.record().data_format)
+            .flatten()
+            .unwrap_or_else(|| {
+                panic!(
+                    "tr::AutoShuffling::operand_element_bits: \
+                     dataFormatsToBitWidth.at(labeledDs_[{lds:?}].dataFormat_) has no row for an \
+                     absent lds or a dataFormat_ of INVALID"
+                )
+            })
+            .bits()
     }
 
-    /// ⛔ The four reads entry 371 makes of one operand — one of them is the `dataFormat_` above.
+    /// ⛔⛔ THE `dataFormat_` HALF IS NOW CARRIED AND `stickRepl_` IS WHAT IS LEFT.
+    /// [`crate::schedule::ddc::shuffle::OperandSticks::primary_stick_repl`] is
+    /// `primaryDsInfo_.at(dsType_).stickRepl_` (`shuffle.cpp:805-813`), which
+    /// [`crate::schedule::l3::dsc::PrimaryDsInfo`] projects as neither of its two fields and which
+    /// scratchy emits nowhere — `primaryDsInfo_` on the wire is `layoutDimOrder_`/`stickDimOrder_`/
+    /// `stickSize_` and nothing else.
+    ///
+    /// ⛔ AND AN EMPTY LIST WOULD NOT BE ITS ABSENCE: `all_one` (entry 159) is
+    /// [`crate::schedule::ddc::shuffle::AutoShuffler::infer_layouts`]' own `DT_CHECK`
+    /// (`shuffle.cpp:1043-1045`), which an empty `stickRepl_` PASSES — so a fresh empty vector here
+    /// would assert *"nothing is replicated"* for an operand that may well be, and it would compile.
     fn operand_sticks(&self, _dinfo: DataInfo) -> Option<crate::schedule::ddc::shuffle::OperandSticks> {
         todo!(
-            "tr::AutoShuffling::operand_sticks: wants labeledDs_[dinfo.myLdsIdx_] with \
-             primaryDsInfo_.at(dsType_), getLayoutDims(ldsIdx_) and getStickSizes(dsType_) \
-             (shuffle.cpp:802-805) — the dsType_ and dataFormat_ halves are not both carried"
+            "tr::AutoShuffling::operand_sticks: wants primaryDsInfo_.at(dsType_).stickRepl_ \
+             (shuffle.cpp:805-813), which l3::dsc::PrimaryDsInfo does not project and scratchy's \
+             primaryDsInfo_ does not emit — an EMPTY stickRepl_ PASSES all_one's DT_CHECK, so it \
+             would assert 'nothing is replicated' for an operand that may be"
         )
     }
 
@@ -757,7 +795,7 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
 
     /// `0 .. currDsc->numCoreletsUsed_` — ⛔ NOT `numCoreletsUsed_DSC2_`.
     fn corelets_used(&self) -> Vec<Corelet> {
-        ddc_state::corelets_of(self.dsc_facts().dsc().corelets_used.get())
+        ddc_state::corelets_of(self.dsc_facts().with_dsc(|dsc| dsc.corelets_used.get()))
     }
 
     /// `allocNode->getPrev()` — whether that allocate node already has a preceding sibling.

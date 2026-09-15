@@ -353,7 +353,7 @@ impl v1::Masking for Dsc2Store<'_, '_> {
 impl v1::CoreletShapes for Dsc2Store<'_, '_> {
     /// `numCoreletsUsed_`.
     fn corelets_used(&self) -> u32 {
-        self.facts().dsc().corelets_used.get()
+        self.facts().with_dsc(|dsc| dsc.corelets_used.get())
     }
 
     /// ⛔ `CoreD_.primaryDimToVal_st(dim)` — `CoreD_` is a `DataStructDims` member of
@@ -802,8 +802,11 @@ impl tr::ScopeTree for Dsc2Store<'_, '_> {
     /// `getNonBroadcastLdsDimSet(myLdsIdx_)` — EMPTY for an absent index, which is the reference's
     /// own `ldsIdx < 0` arm.
     fn non_broadcast_lds_dims(&self, lds: Option<LdsIdx>) -> BTreeSet<PrimaryDim> {
-        lds.map(|lds| ddc_state::non_broadcast_dims_of(self.facts().dsc(), lds))
-            .unwrap_or_default()
+        lds.map(|lds| {
+            self.facts()
+                .with_dsc(|dsc| ddc_state::non_broadcast_dims_of(dsc, lds))
+        })
+        .unwrap_or_default()
     }
 }
 
@@ -875,20 +878,36 @@ impl tu::DscAllocations for Dsc2Store<'_, '_> {
     /// `labeledDs_.at(lds).ldsIdx_` — ⛔ THE ENTRY'S OWN self-index, and NOT `referenceLdsIdx_`.
     fn own_lds_idx(&self, lds: LdsIdx) -> LdsIdx {
         self.facts()
-            .dsc()
-            .labeled_ds
-            .at(lds)
-            .map_or(lds, crate::schedule::l3::dsc::LabeledDs::recorded)
+            .with_lds(lds, crate::schedule::l3::dsc::LabeledDs::recorded)
+            .unwrap_or(lds)
     }
 
-    /// ⛔ `getAllocation(di, storage, allowMissingAlloc=true)` — [`DataOrigin`] is an lds OR a
-    /// CONSTANT, and `constantInfo_` is not projected onto `l3::dsc`.
-    fn allocation_in(&self, _origin: DataOrigin, _storage: DdcMemory) -> Option<AllocId> {
-        todo!(
-            "tu::DscAllocations::allocation_in: wants getAllocation(di, storage, \
-             allowMissingAlloc=true) (dsc/dsc2.cpp:2586) — its constant arm reads constantInfo_, \
-             which l3::dsc::DesignSpaceConfig does not project"
-        )
+    /// `getAllocation(di, storage, allowMissingAlloc=true)` (`dsc/dsc2.cpp:2586-2625`) — ⭐ ANSWERED
+    /// ON BOTH ARMS, the labelled-DS one off the tree's own `memOrg_` and the CONSTANT one off
+    /// [`crate::schedule::l3::dsc::ConstantInfo::allocations`].
+    ///
+    /// ⛔⛔ `allowMissingAlloc = true` MAKES EVERY ONE OF ITS FOUR ERROR PATHS `return nullptr`, so
+    /// [`None`] here IS the reference's answer and not a refusal: neither index set (`:2589-2596`), a
+    /// `storage` that is not a memory (`:2597-2603` — unspellable, [`DdcMemory`] is a memory by type),
+    /// a labelled DS with no `memOrg_` entry or a null node in it (`:2605-2615`), and a constant with
+    /// no `allocations_` entry or a null one in it (`:2617-2625`).
+    fn allocation_in(&self, origin: DataOrigin, storage: DdcMemory) -> Option<AllocId> {
+        let component = tu::memory_component(storage);
+        match origin {
+            // `labeledDs_.at(myLdsIdx_).memOrg_.at(storage).allocateNode_`.
+            DataOrigin::LabeledDs(lds) => {
+                tu::ComponentAllocations::mem_org_allocation(self, lds, component)
+            }
+            // `constantInfo_.at(constantId_).allocations_.at(storage)`.
+            DataOrigin::Constant(constant) => self.facts().with_dsc(|dsc| {
+                dsc.ddc
+                    .constants
+                    .get(&constant)?
+                    .allocations
+                    .get(&component)
+                    .copied()
+            }),
+        }
     }
 
     /// `labeledDs_.at(lds).memOrg_[storage] = { isPresent, allocateNode_ }` — ⛔ THE NODE THE
@@ -927,10 +946,28 @@ impl tu::DscAllocations for Dsc2Store<'_, '_> {
     /// `allocNode->component_` — ⭐ ANSWERED off the L3 view the tree holds, through the one closed
     /// mapping `SenComponent` has onto [`DdcMemory`].
     ///
-    /// ⛔ `L0` IS THE ONE COMPONENT THAT DOES NOT MAP. [`DdcMemory`] distinguishes `L0` from
-    /// `L0_SCALE` — the scale half of a scaled L0 allocation, which entry 258 places under a
-    /// DIFFERENT tracker (`ddc/ddcv1.cpp:184-190`) — and `component_` alone cannot say which. Picking
-    /// either would place a scale buffer against the wrong tracker's capacity.
+    /// ⛔⛔ A RECORDED DIVERGENCE FROM THIS PORT, RESOLVED IN THE AUTHORITY'S FAVOUR. This method used
+    /// to `todo!` on `L0` saying *"`component_` alone cannot say which [of L0 / L0_SCALE] — it needs
+    /// the allocation's `scaledLdsCategory_`"*. IT DOES SAY WHICH, and no `scaledLdsCategory_` is
+    /// consulted anywhere:
+    ///
+    ///   * `L0` and `L0_SCALE` ARE TWO DISTINCT `SenComponents` VALUES — the reference tests them side
+    ///     by side as such, `comp == SenComponents::LX || comp == SenComponents::L0 || comp ==
+    ///     SenComponents::L0_SCALE` (`ddc/ddcv1.cpp:191-192`) — and this crate spells both:
+    ///     [`SenComponent::L0`] and [`SenComponent::L0Scale`]
+    ///     (`sys-arch-spec/src/arch_enums.rs:1275`, `L0Scale = 99`).
+    ///   * The map that loop walks is `metadata.newAllocations_`, keyed by `allocNode->component_`
+    ///     ITSELF (`ddc/ddc_transformation_util.cpp:59`, `:1339`, `:1506`;
+    ///     `ddc/ddl/ddl_conversion.cpp:820`, `:844`, `:1642`) — so the component IS the tracker key,
+    ///     and the two L0 halves are already distinct keys before any category is read.
+    ///
+    /// So the mapping below is total on both, and the `todo!` was over-refusing.
+    ///
+    /// ⚠️ AND ONE THING THE AUTHORITY DOES *NOT* SAY, LEFT AS IT IS: `ddc::memories`
+    /// (`ddc/ddc_metadata.h:20-21`) is the EIGHT-element set `{LX, L0, PELRF, SFPLRF, PTARF, PTXRF,
+    /// PTIRF, HBM}` and `L0_SCALE` is NOT in it, while [`DdcMemory`] has nine arms including
+    /// [`DdcMemory::L0Scale`]. The two are different objects — that set is a membership test, this enum
+    /// is `newAllocations_`'s key — and nothing here needs them reconciled.
     fn alloc_component(&self, alloc: AllocId) -> DdcMemory {
         let component = self
             .with_tree(|tree| tree.node_of_alloc(alloc).and_then(|node| tree.allocate(node)))
@@ -949,11 +986,8 @@ impl tu::DscAllocations for Dsc2Store<'_, '_> {
             SenComponent::Ptarf => DdcMemory::PtaRf,
             SenComponent::Ptxrf => DdcMemory::PtxRf,
             SenComponent::Ptirf => DdcMemory::PtiRf,
-            SenComponent::L0 => todo!(
-                "tu::DscAllocations::alloc_component: DdcMemory distinguishes L0 from L0_SCALE \
-                 (ddc/ddcv1.cpp:184-190, two different trackers) and allocNode->component_ alone \
-                 cannot say which — it needs the allocation's scaledLdsCategory_"
-            ),
+            SenComponent::L0 => DdcMemory::L0,
+            SenComponent::L0Scale => DdcMemory::L0Scale,
             other => todo!(
                 "tu::DscAllocations::alloc_component: {other:?} has no DdcMemory arm — ddc tracks \
                  nine memories (ddc/metadata.rs:840-861) and this component is not one of them"
@@ -1006,12 +1040,21 @@ impl tu::AllocationsByNode for Dsc2Store<'_, '_> {
 }
 
 impl crate::schedule::ddc::fold::Allocations for Dsc2Store<'_, '_> {
-    /// ⛔ The allocation one STREAM has in a memory — [`StoredStream`]'s constant arm reads
-    /// `constantInfo_`.
+    /// ⛔⛔ `constantInfo_` IS NO LONGER WHAT BLOCKS THIS — [`tu::DscAllocations::allocation_in`] makes
+    /// the SAME `getAllocation` call on both arms now. What is left is the KEY:
+    /// [`StoredStream::storage`] is a [`crate::units::DfirUnit`] and `getAllocation`'s `storage` is a
+    /// `SenComponents` (`dsc/dsc2.cpp:2587`), and the two are not the same set —
+    /// [`crate::units::DfirUnit`] is *"the `SenComponents` subset DataflowIR binds"* with a
+    /// `PtRow(Row)` arm that aggregates several of them and no reverse mapping. Picking one
+    /// `SenComponents` per `DfirUnit` here would be a new closed table, and a WRONG row silently looks
+    /// the stream up in a memory it does not live in — `getAllocation` then answers `nullptr` and the
+    /// fold drops the coordinate.
     fn allocation(&self, _stored: StoredStream) -> Option<AllocId> {
         todo!(
-            "fold::Allocations::allocation: wants getAllocation(stream, memory) — its constant arm \
-             reads constantInfo_, which l3::dsc::DesignSpaceConfig does not project"
+            "fold::Allocations::allocation: wants getAllocation(stream, memory) keyed by a \
+             SenComponents (dsc/dsc2.cpp:2587), and StoredStream::storage is a DfirUnit — a subset \
+             with a PtRow(Row) arm and no reverse mapping. constantInfo_ IS carried now; see \
+             tu::DscAllocations::allocation_in for the same call on both arms"
         )
     }
 
@@ -1075,27 +1118,37 @@ impl tu::ComponentAllocations for Dsc2Store<'_, '_> {
         )
     }
 
-    /// ⛔ `constantInfo_.at(constant).allocations_.count(storage)`.
-    fn has_constant_allocation(&self, _constant: ConstIdx, _storage: SenComponent) -> bool {
-        todo!(
-            "tu::ComponentAllocations::has_constant_allocation: wants \
-             constantInfo_.at(constant).allocations_.count(storage) — constantInfo_ is not \
-             projected onto l3::dsc::DesignSpaceConfig"
-        )
+    /// `constantInfo_.at(constant).allocations_.count(storage)` — ⭐ ANSWERED off
+    /// [`crate::schedule::l3::dsc::ConstantInfo::allocations`].
+    ///
+    /// ⛔ AN ID THE TABLE DOES NOT HOLD IS `false` AND NOT A THROW, and that is the trait's own return:
+    /// it asks whether an allocation EXISTS, and a constant that does not exist has none.
+    fn has_constant_allocation(&self, constant: ConstIdx, storage: SenComponent) -> bool {
+        self.facts().with_dsc(|dsc| {
+            dsc.ddc
+                .constants
+                .get(&constant)
+                .is_some_and(|held| held.allocations.contains_key(&storage))
+        })
     }
 
-    /// ⛔ Likewise.
+    /// `constantInfo_.at(constant).allocations_[storage] = alloc` — ⭐ ANSWERED through the shared
+    /// `currDsc` cell.
+    ///
+    /// ⛔ A NO-OP FOR A CONSTANT THE TABLE DOES NOT HOLD, which is `constantInfo_.at()`'s throw:
+    /// `operator[]` fills a slot of an entry that EXISTS, and inventing the entry would put an
+    /// allocation on a constant no DSC declared.
     fn set_constant_allocation(
         &mut self,
-        _constant: ConstIdx,
-        _storage: SenComponent,
-        _alloc: AllocId,
+        constant: ConstIdx,
+        storage: SenComponent,
+        alloc: AllocId,
     ) {
-        todo!(
-            "tu::ComponentAllocations::set_constant_allocation: wants \
-             constantInfo_.at(constant).allocations_[storage] = alloc — constantInfo_ is not \
-             projected onto l3::dsc::DesignSpaceConfig"
-        )
+        self.facts().with_dsc_mut(|dsc| {
+            if let Some(held) = dsc.ddc.constants.get_mut(&constant) {
+                held.allocations.insert(storage, alloc);
+            }
+        });
     }
 }
 
@@ -1193,38 +1246,37 @@ impl tu::NewLabeledDs for Dsc2Store<'_, '_> {
     /// `labeledDs_.size() - 1` — ⛔ TOTAL because [`crate::schedule::l3::dsc::LabeledDsList`] is
     /// non-empty by type.
     fn last_lds_pos(&self) -> LdsIdx {
-        let positions = ddc_state::lds_positions(self.facts().dsc());
-        positions
-            .last()
-            .copied()
+        self.facts()
+            .with_dsc(|dsc| ddc_state::lds_positions(dsc).last().copied())
             .unwrap_or_else(|| panic!("LabeledDsList is non-empty by type"))
     }
 
     /// `labeledDs_.back().ldsIdx_`.
     fn last_recorded_lds_idx(&self) -> LdsIdx {
-        self.facts().dsc().labeled_ds.back().recorded()
+        self.facts()
+            .with_dsc(|dsc| dsc.labeled_ds.back().recorded())
     }
 
-    /// ⛔ `labeledDs_.back().ldsIdx_ = recorded` — the DSC in this state is a CLONE and its
-    /// `labeledDs_` is not behind a cell, because every other reader of it is a `&self` read. A
-    /// writable `labeledDs_` is the shape entry 308's minting needs and the one this carrier does not
-    /// have; see the module note and [`Self::insert_lds_before_last`].
-    fn set_last_recorded_lds_idx(&mut self, _recorded: LdsIdx) {
-        todo!(
-            "tu::NewLabeledDs::set_last_recorded_lds_idx: wants labeledDs_.back().ldsIdx_ = \
-             recorded — l3::dsc::LabeledDs has no setter and DesignSpaceConfig::labeled_ds is not \
-             behind a cell in Dsc2Facts"
-        )
+    /// `labeledDs_.back().ldsIdx_ = recorded` — ⭐ ANSWERED through the shared `currDsc` cell, and it
+    /// is the LAST entry's OWN index, which [`tu::add_new_lds`] bumps by one before the insert.
+    fn set_last_recorded_lds_idx(&mut self, recorded: LdsIdx) {
+        self.facts().with_dsc_mut(|dsc| {
+            dsc.labeled_ds.back_mut().set_recorded(recorded);
+        });
     }
 
-    /// ⛔ `labeledDs_.insert(end() - 1, entry)` — the one method that GROWS `labeledDs_`, and the
-    /// reason entry 308 needs a writable list: every position `0 .. size()-2` keeps its entry, the
-    /// entry that was last moves up one, and nothing may point at the new one.
+    /// ⛔⛔ `labeledDs_.insert(end() - 1, entry)` — AND THE CELL IS NO LONGER WHAT BLOCKS IT.
+    /// `referenceLdsIdx_` (`dsc/dscdefn.h:324`) is: [`Dsc2LdsEntry`] carries it because
+    /// [`crate::schedule::l3::dsc::LabeledDs`] does not, and `add_new_lds` STAMPS it on the entry it
+    /// inserts (`tu::LabeledDsEntry::set_reference_lds_idx`). Pushing the projected half alone would
+    /// drop which tensor this internal one is derived from — the field the reference itself writes
+    /// here and nowhere else — and it would compile.
     fn insert_lds_before_last(&mut self, _entry: Self::Entry) {
         todo!(
-            "tu::NewLabeledDs::insert_lds_before_last: wants labeledDs_.insert(end() - 1, entry) — \
-             DesignSpaceConfig::labeled_ds is a LabeledDsList this carrier holds by clone and not \
-             behind a cell, so entry 308 cannot grow it"
+            "tu::NewLabeledDs::insert_lds_before_last: wants labeledDs_.insert(end() - 1, entry) \
+             carrying its referenceLdsIdx_ (dsc/dscdefn.h:324), which l3::dsc::LabeledDs does not \
+             project — add_new_lds stamps it on exactly the entry this inserts, so pushing the \
+             projected half alone drops it"
         )
     }
 
@@ -1338,14 +1390,21 @@ impl v1::PrepDsc for Dsc2Store<'_, '_> {
         });
     }
 
-    /// ⛔ SOME `constantInfo_` entry named `useZeroMean` whose single datum is `1`.
+    /// SOME `constantInfo_` entry named `useZeroMean` whose single datum is `1` — ⭐ ANSWERED off
+    /// [`crate::schedule::l3::dsc::DdcFacts::constants`].
+    ///
+    /// ⛔ IT IS `getSingleDataStrict(constinfo.data_).at(0) == 1` AND NOT *"has a datum"*
+    /// (`ddc/ddcv1.cpp:2066-2068`): an entry called `useZeroMean` whose datum is `0` is the SWITCH
+    /// TURNED OFF, and answering `true` for it would swap `EXX2` for `EXX2_ZEROMEAN` on a program that
+    /// asked for the opposite. `.at(0)` on an EMPTY data vector is that vector's own throw, which is
+    /// [`Option::is_some_and`]'s `false` here — no scratchy constant is empty (all twelve of `g0/`
+    /// carry one datum).
     fn declares_zero_mean_constant(&self) -> bool {
-        todo!(
-            "v1::PrepDsc::declares_zero_mean_constant: wants a constantInfo_ entry named \
-             \"useZeroMean\" with datum 1 (ddc/ddcv1.cpp:2066-2072) — constantInfo_ is not \
-             projected onto l3::dsc::DesignSpaceConfig, and this DECIDES an EXX2 -> EXX2_ZEROMEAN \
-             op-func swap"
-        )
+        self.facts().with_dsc(|dsc| {
+            dsc.ddc.constants.values().any(|held| {
+                held.name.0 == "useZeroMean" && held.data.first().is_some_and(|datum| *datum == 1)
+            })
+        })
     }
 
     /// ⛔ `computeOp_.at(at).opConsts.at("useZeroMean")[0] == 1`.
@@ -1359,7 +1418,7 @@ impl v1::PrepDsc for Dsc2Store<'_, '_> {
 
     /// `labeledDs_.at(lds)` — ⭐ ANSWERED: the entry [`tu::add_new_lds`] clones.
     fn lds_entry(&self, lds: LdsIdx) -> Option<Self::Entry> {
-        let held = self.facts().dsc().labeled_ds.at(lds)?.clone();
+        let held = self.facts().with_lds(lds, Clone::clone)?;
         Some(Dsc2LdsEntry {
             recorded: held.recorded(),
             held,
@@ -1367,66 +1426,76 @@ impl v1::PrepDsc for Dsc2Store<'_, '_> {
         })
     }
 
-    /// ⛔ `dsName_ += suffix` — the field `l3::dsc::LabeledDs` does not carry.
-    fn append_lds_name(&mut self, _lds: LdsIdx, _suffix: v1::InternalLds) {
-        todo!(
-            "v1::PrepDsc::append_lds_name: wants dsName_ += suffix, and l3::dsc::LabeledDs carries \
-             no dsName_ — present in g0/sdsc_0.json, dropped by the l3 projection"
-        )
+    /// `dsName_ += suffix` — ⭐ ANSWERED, and it is `+=` and NOT `=`: the reference APPENDS
+    /// `_internalInput`/`_internalKernel` to the name the cloned entry already carries
+    /// (`ddc/ddcv1.cpp:2098`), so an assignment would lose which tensor the internal one was derived
+    /// from in the one place a human reads it.
+    ///
+    /// ⛔ A NO-OP FOR AN INDEX THE LIST DOES NOT HOLD, which is `labeledDs_.at()`'s throw.
+    fn append_lds_name(&mut self, lds: LdsIdx, suffix: v1::InternalLds) {
+        let _: Option<()> = self
+            .facts()
+            .with_lds_mut(lds, |held| held.append_name(suffix.suffix()));
     }
 
-    /// ⛔ `dsType_ = DsTypes::INTERNAL` — no setter, and the list is not behind a cell.
-    fn set_lds_internal(&mut self, _lds: LdsIdx) {
-        todo!(
-            "v1::PrepDsc::set_lds_internal: wants dsType_ = INTERNAL — l3::dsc::LabeledDs has no \
-             setter and DesignSpaceConfig::labeled_ds is not behind a cell in Dsc2Facts"
-        )
+    /// `dsType_ = DsTypes::INTERNAL` — ⭐ ANSWERED through the shared `currDsc` cell.
+    fn set_lds_internal(&mut self, lds: LdsIdx) {
+        let _: Option<()> = self
+            .facts()
+            .with_lds_mut(lds, |held| held.set_ds_type(tr::DsType::Internal));
     }
 
-    /// ⛔ `wordLength = length` — the field `l3::dsc::LabeledDs` does not carry.
-    fn set_lds_word_length(&mut self, _lds: LdsIdx, _length: WordLength) {
-        todo!(
-            "v1::PrepDsc::set_lds_word_length: wants wordLength = length, which l3::dsc::LabeledDs \
-             does not carry"
-        )
+    /// `wordLength = length` — ⭐ ANSWERED.
+    fn set_lds_word_length(&mut self, lds: LdsIdx, length: WordLength) {
+        let _: Option<()> = self
+            .facts()
+            .with_lds_mut(lds, |held| held.set_word_length(length));
     }
 
-    /// ⛔ `dataFormat_ = format` — likewise.
-    fn set_lds_format(&mut self, _lds: LdsIdx, _format: DataFormat) {
-        todo!(
-            "v1::PrepDsc::set_lds_format: wants dataFormat_ = format, which l3::dsc::LabeledDs does \
-             not carry"
-        )
+    /// `dataFormat_ = format` — ⭐ ANSWERED.
+    fn set_lds_format(&mut self, lds: LdsIdx, format: DataFormat) {
+        let _: Option<()> = self
+            .facts()
+            .with_lds_mut(lds, |held| held.set_data_format(format));
     }
 
-    /// ⛔ `scaledLdsCategory_ = category` — `l3::dsc::LabeledDs` projects it only as
-    /// `Option<MxScaleTensor>`, which cannot state `REGULAR_TENSOR` vs `VALUE_TENSOR`.
-    fn set_lds_scaled_category(&mut self, _lds: LdsIdx, _category: ScaledLds) {
-        todo!(
-            "v1::PrepDsc::set_lds_scaled_category: wants scaledLdsCategory_ = category — \
-             l3::dsc::LabeledDs projects it only as Option<MxScaleTensor>, which collapses \
-             REGULAR_TENSOR and VALUE_TENSOR"
-        )
+    /// `scaledLdsCategory_ = category` — ⭐ ANSWERED as the closed three-way, which is why the
+    /// `REGULAR_TENSOR`/`VALUE_TENSOR` write entry 308 makes is now expressible.
+    fn set_lds_scaled_category(&mut self, lds: LdsIdx, category: ScaledLds) {
+        let _: Option<()> = self
+            .facts()
+            .with_lds_mut(lds, |held| held.set_scaled_category(category));
     }
 
-    /// ⛔ `mxInfo_ = labeledDs_.at(from).mxInfo_` — no setter, list not behind a cell.
-    fn copy_mx_info(&mut self, _to: LdsIdx, _from: LdsIdx) {
-        todo!(
-            "v1::PrepDsc::copy_mx_info: wants mxInfo_ = labeledDs_.at(from).mxInfo_ — \
-             l3::dsc::LabeledDs has no setter for its scale tensor"
-        )
+    /// `mxInfo_ = labeledDs_.at(from).mxInfo_` — ⭐ ANSWERED.
+    ///
+    /// ⛔ THE COPY IS OF THE RAW FIELD, so it is read back through `from`'s own category exactly as the
+    /// reference's `labeledDs_.at(from).mxInfo_` is: a `from` that is not a `SCALE_TENSOR` copies the
+    /// `mxInfo_` it holds, which is `{blkSize: 0, relatedLdsIdx: -1}` — [`None`] here.
+    fn copy_mx_info(&mut self, to: LdsIdx, from: LdsIdx) {
+        let Some(mx_info) = self
+            .facts()
+            .with_lds(from, crate::schedule::l3::dsc::LabeledDs::scale_tensor)
+        else {
+            return;
+        };
+        let _: Option<()> = self
+            .facts()
+            .with_lds_mut(to, |held| held.set_mx_info(mx_info));
     }
 
     /// `primaryDsInfo_.at(lds's dsType_).stickDimOrder_` — ⭐ ANSWERED.
     fn stick_order(&self, lds: LdsIdx) -> Vec<PrimaryDim> {
-        ddc_state::stick_dims_of(self.facts().dsc(), lds)
+        self.facts()
+            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
             .map(|dims| dims.0.iter().map(|(dim, _)| *dim).collect())
             .unwrap_or_default()
     }
 
     /// `primaryDsInfo_.at(lds's dsType_).stickSize_` — ⭐ ANSWERED.
     fn stick_sizes_of(&self, lds: LdsIdx) -> Vec<Elements> {
-        ddc_state::stick_dims_of(self.facts().dsc(), lds)
+        self.facts()
+            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
             .map(|dims| dims.0.iter().map(|(_, size)| *size).collect())
             .unwrap_or_default()
     }

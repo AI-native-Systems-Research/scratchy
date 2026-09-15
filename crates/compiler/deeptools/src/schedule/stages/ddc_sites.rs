@@ -450,44 +450,60 @@ impl conv::AllocationSite for Dsc2Ddl<'_, '_> {
         tree.with(|held| held.allocate(node).map(|(alloc, _)| alloc))
     }
 
-    /// ⛔ `constantInfo_.at(constant).allocations_.at(unit)`.
-    fn constant_allocation(&self, _constant: ConstIdx, _unit: SenComponent) -> Option<AllocId> {
-        todo!(
-            "conv::AllocationSite::constant_allocation: wants \
-             constantInfo_.at(constant).allocations_.at(unit) — constantInfo_ is not projected onto \
-             l3::dsc::DesignSpaceConfig"
-        )
+    /// `constantInfo_.at(constant).allocations_.at(unit)` — ⭐ ANSWERED off
+    /// [`crate::schedule::l3::dsc::ConstantInfo::allocations`], with [`None`] for either `.at()`'s
+    /// throw exactly as the trait's own [`Option`] spells it.
+    fn constant_allocation(&self, constant: ConstIdx, unit: SenComponent) -> Option<AllocId> {
+        self.facts().with_dsc(|dsc| {
+            dsc.ddc
+                .constants
+                .get(&constant)?
+                .allocations
+                .get(&unit)
+                .copied()
+        })
     }
 }
 
 impl conv::InternalTensorSite for Dsc2Ddl<'_, '_> {
     /// `dsc.labeledDs_`'s tail — ⭐ ANSWERED.
     fn labeled_ds_tail(&self) -> Option<conv::LabeledDsTail> {
-        let dsc = self.facts().dsc();
-        let positions = ddc_state::lds_positions(dsc);
-        Some(conv::LabeledDsTail {
-            insert_position: *positions.last()?,
-            last_lds: dsc.labeled_ds.back().recorded(),
+        self.facts().with_dsc(|dsc| {
+            let positions = ddc_state::lds_positions(dsc);
+            Some(conv::LabeledDsTail {
+                insert_position: *positions.last()?,
+                last_lds: dsc.labeled_ds.back().recorded(),
+            })
         })
     }
 
-    /// ⛔ `++dsc.labeledDs_.back().ldsIdx_` — no setter, and the list is not behind a cell; the same
-    /// gap [`tu::NewLabeledDs::set_last_recorded_lds_idx`] names.
-    fn set_last_lds_idx(&mut self, _lds: LdsIdx) {
-        todo!(
-            "conv::InternalTensorSite::set_last_lds_idx: wants ++labeledDs_.back().ldsIdx_ — \
-             l3::dsc::LabeledDs has no setter and DesignSpaceConfig::labeled_ds is not behind a cell"
-        )
+    /// `++dsc.labeledDs_.back().ldsIdx_` — ⭐ ANSWERED through the shared `currDsc` cell, the same
+    /// write [`tu::NewLabeledDs::set_last_recorded_lds_idx`] makes.
+    fn set_last_lds_idx(&mut self, lds: LdsIdx) {
+        self.facts().with_dsc_mut(|dsc| {
+            dsc.labeled_ds.back_mut().set_recorded(lds);
+        });
     }
 
-    /// ⛔ `dsc.labeledDs_.insert(end() - 1, newLds)` — and the copy takes `density_`, `wordLength`
-    /// and `dataFormat_` from the reference entry, none of which `l3::dsc::LabeledDs` carries.
+    /// ⛔⛔ `dsc.labeledDs_.insert(end() - 1, newLds)` — AND WHAT BLOCKS IT IS NOW `density_` AND
+    /// `referenceLdsIdx_`, NOT THE CELL OR THE RECORD. `addInternalTensor`
+    /// (`ddc/ddl/ddl_conversion.cpp:482-498`) copies EIGHT fields off the reference entry —
+    /// `dsType_`, `segment_ = STACK`, `isFirstUse_`, `scale_`, `density_`, `wordLength`,
+    /// `dataFormat_`, `referenceLdsIdx_` — and [`crate::schedule::l3::dsc::LabeledDs`] projects
+    /// neither `density_` (`dsc/dscdefn.h:333`), `segment_` (`:328`), `isFirstUse_` (`:331`) nor
+    /// `referenceLdsIdx_` (`:324`).
+    ///
+    /// ⛔ AND THE ONE THAT DECIDES A SIZE IS `density_`: it is the per-layout-dim occupancy
+    /// `getBufferCapacityForNode` multiplies an extent by, so a copy that dropped it would size the
+    /// internal tensor's buffer as if it were dense.
     fn insert_internal_tensor(&mut self, _new: conv::InternalTensor) {
         todo!(
             "conv::InternalTensorSite::insert_internal_tensor: wants \
-             labeledDs_.insert(end() - 1, newLds) copying dsType_/scale_/density_/wordLength/\
-             dataFormat_ from the reference — l3::dsc::LabeledDs carries neither density_, \
-             wordLength nor dataFormat_, and the list is not behind a cell"
+             labeledDs_.insert(end() - 1, newLds) copying dsType_/segment_/isFirstUse_/scale_/\
+             density_/wordLength/dataFormat_/referenceLdsIdx_ off the reference \
+             (ddc/ddl/ddl_conversion.cpp:482-498). wordLength and dataFormat_ ARE now carried; \
+             density_ (dsc/dscdefn.h:333), segment_, isFirstUse_ and referenceLdsIdx_ are not, and \
+             density_ is what getBufferCapacityForNode multiplies an extent by"
         )
     }
 
@@ -550,13 +566,14 @@ impl conv::DdlSite for Dsc2Ddl<'_, '_> {
         self.facts().ops().first().and_then(|op| op.format)
     }
 
-    /// ⛔ `dsc.labeledDs_.at(lds).dataFormat_`.
-    fn lds_format(&self, _lds: LdsIdx) -> Option<DataFormat> {
-        todo!(
-            "conv::DdlSite::lds_format: wants labeledDs_.at(lds).dataFormat_, which \
-             l3::dsc::LabeledDs does not carry — present in g0/sdsc_0.json, dropped by the l3 \
-             projection, and it is what the DDL match BINDS each operand's type by"
-        )
+    /// `dsc.labeledDs_.at(lds).dataFormat_` — ⭐ ANSWERED off
+    /// [`crate::schedule::l3::dsc::LdsRecord::data_format`]. This is what the DDL match BINDS each
+    /// operand's type by, and it VARIES on real data: `SEN143_FP8` on 7 of `g0/`'s 580 labelled DSs and
+    /// `SEN169_FP16` on the other 573.
+    fn lds_format(&self, lds: LdsIdx) -> Option<DataFormat> {
+        self.facts()
+            .with_lds(lds, |held| held.record().data_format)
+            .flatten()
     }
 
     /// ⛔ `addressGranularityScalePerUnit.count({senCompToGenericComp.at(unit), storage})` — the
@@ -572,11 +589,11 @@ impl conv::DdlSite for Dsc2Ddl<'_, '_> {
     /// `dsc.getDimIndexInLayoutOrder(labeledDs_.at(lds).dsType_, dim) >= 0` — ⭐ ANSWERED off
     /// `layoutDimOrder_`.
     fn dim_in_layout_order(&self, lds: LdsIdx, dim: PrimaryDim) -> bool {
-        self.facts()
-            .dsc()
-            .layout_dims
-            .get(&lds)
-            .is_some_and(|layout| layout.iter().any(|named| named == dim))
+        self.facts().with_dsc(|dsc| {
+            dsc.layout_dims
+                .get(&lds)
+                .is_some_and(|layout| layout.iter().any(|named| named == dim))
+        })
     }
 
     /// `sdsc.numWkSlicesPerDim_.at(dim)` — ⭐ ANSWERED off the super-DSC's map, copied into the state.
@@ -592,7 +609,8 @@ impl conv::DdlSite for Dsc2Ddl<'_, '_> {
 
     /// `dsc.primaryDsInfo_.at(labeledDs_.at(lds).dsType_)`'s stick pair — ⭐ ANSWERED.
     fn stick_dims(&self, lds: LdsIdx) -> Option<StickDims> {
-        ddc_state::stick_dims_of(self.facts().dsc(), lds)
+        self.facts()
+            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
     }
 }
 
@@ -621,28 +639,28 @@ impl conv::MatchSite for Dsc2Ddl<'_, '_> {
             .collect()
     }
 
-    /// ⛔ `dsc.labeledDs_.at(lds).wordLength`.
-    fn lds_word_length(&self, _lds: LdsIdx) -> Option<WordLength> {
-        todo!(
-            "conv::MatchSite::lds_word_length: wants labeledDs_.at(lds).wordLength, which \
-             l3::dsc::LabeledDs does not carry"
-        )
+    /// `dsc.labeledDs_.at(lds).wordLength` — ⭐ ANSWERED off
+    /// [`crate::schedule::l3::dsc::LdsRecord::word_length`]. ⛔ [`None`] IS THAT `.at()`'s THROW and
+    /// NOT the declared `0`: the DDL match compares this width against the template's own
+    /// `bitSize_ / 8`, and a `0` for an absent entry would report a mismatch instead of a missing
+    /// operand.
+    fn lds_word_length(&self, lds: LdsIdx) -> Option<WordLength> {
+        self.facts().with_lds(lds, |held| held.record().word_length)
     }
 
-    /// ⛔ `newLds.wordLength = type->bitSize_ / 8`.
-    fn set_lds_word_length(&mut self, _lds: LdsIdx, _length: WordLength) {
-        todo!(
-            "conv::MatchSite::set_lds_word_length: wants newLds.wordLength = type->bitSize_ / 8 — \
-             l3::dsc::LabeledDs carries no wordLength and is not behind a cell"
-        )
+    /// `newLds.wordLength = type->bitSize_ / 8` — ⭐ ANSWERED through the shared `currDsc` cell.
+    fn set_lds_word_length(&mut self, lds: LdsIdx, length: WordLength) {
+        let _: Option<()> = self
+            .facts()
+            .with_lds_mut(lds, |held| held.set_word_length(length));
     }
 
-    /// ⛔ `newLds.dataFormat_ = type->dataFormat_`.
-    fn set_lds_format(&mut self, _lds: LdsIdx, _format: DataFormat) {
-        todo!(
-            "conv::MatchSite::set_lds_format: wants newLds.dataFormat_ = type->dataFormat_ — \
-             l3::dsc::LabeledDs carries no dataFormat_ and is not behind a cell"
-        )
+    /// `newLds.dataFormat_ = type->dataFormat_` — ⭐ ANSWERED, and it is the SAME `labeledDs_` entry
+    /// [`Self::lds_word_length`] reads, so the width and the format a template binds cannot drift.
+    fn set_lds_format(&mut self, lds: LdsIdx, format: DataFormat) {
+        let _: Option<()> = self
+            .facts()
+            .with_lds_mut(lds, |held| held.set_data_format(format));
     }
 }
 

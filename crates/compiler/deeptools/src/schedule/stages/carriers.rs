@@ -82,19 +82,40 @@ impl L3Placement for Placement {
 }
 
 impl v1::StorageNames for Placement {
-    /// ⛔ Wants `labeledDs_.at(lds).dsName_`, which [`crate::schedule::l3::dsc::LabeledDs`] does not
-    /// carry — the same gap the seed allocate node's name records in
-    /// [`super::DscState::seeded`](super::state::DscState::seeded).
+    /// ⛔⛔ THE FIELD EXISTS NOW AND THE CARRIER STILL CANNOT SAY WHICH DSC'S. `dsName_` is
+    /// [`crate::schedule::l3::dsc::LdsRecord::name`] and `name_` is
+    /// [`crate::schedule::l3::dsc::ConstantInfo::name`] — [`super::Dsc2Reads`] answers both off them.
+    /// What blocks it HERE is the SHAPE of the stage-2a carrier, not the projection:
+    ///
+    ///   * [`v1::StorageNames`] takes an [`LdsIdx`] and NO [`crate::schedule::l3::dsc::DscIdx`],
+    ///     because the reference reads it off `currDsc_` — a member the scheduler re-points as it goes.
+    ///   * `P` is ONE object for the WHOLE run: [`super::run_l3`] builds a single [`Placement`] and
+    ///     [`crate::schedule::l3::dl_ops::run`] then loops `for dsc_idx in dsc_indices(sdsc)`
+    ///     (`l3/dl_ops.rs:20712`) with that same `&P`.
+    ///
+    /// So an `LdsIdx` reaching this method names a position in SOME DSC's `labeledDs_` and the carrier
+    /// cannot tell which. ⛔ ANSWERING OFF `dscs_.first()` WOULD BE THE FABRICATION: every name here
+    /// goes STRAIGHT TO THE MEMORY TRACKER as a DS key (`ddc/ddcv1.cpp:280`, `:336`, `:341`), so a
+    /// two-DSC super-DSC would place two different tensors against one tracker entry — and it would
+    /// compile, because all 187 programs of `g0/` have exactly one DSC. Threading `currDsc` into this
+    /// trait is the cross-entry work review 382 names, the same cut as [`super::Reads`]/[`super::Env`].
     fn lds_name(&self, _lds: LdsIdx) -> v1::StorageName {
         todo!(
-            "v1::StorageNames::lds_name: wants labeledDs_.at(lds).dsName_, which l3::dsc::LabeledDs \
-             does not carry"
+            "v1::StorageNames::lds_name: wants currDsc_->labeledDs_.at(lds).dsName_ — the FIELD is \
+             now l3::dsc::LdsRecord::name, but v1::StorageNames takes no DscIdx and `P` is ONE \
+             carrier for a run that loops every DSC (l3/dl_ops.rs:20712), so this cannot say WHICH \
+             DSC's labeledDs_ the index names; the name is a memory-tracker DS key"
         )
     }
 
-    /// ⛔ Wants `constantInfo_.at(constant).name_`, which the super-DSC does not carry either.
+    /// ⛔ THE SAME CUT — `constantInfo_.at(constant).name_` is
+    /// [`crate::schedule::l3::dsc::ConstantInfo::name`] now, and `constantInfo_` is a PER-DSC table.
     fn constant_name(&self, _constant: ConstIdx) -> v1::StorageName {
-        todo!("v1::StorageNames::constant_name: wants constantInfo_.at(constant).name_")
+        todo!(
+            "v1::StorageNames::constant_name: wants currDsc_->constantInfo_.at(constant).name_ — the \
+             FIELD is now l3::dsc::ConstantInfo::name, but constantInfo_ is PER DSC and \
+             v1::StorageNames takes no DscIdx; see lds_name"
+        )
     }
 }
 
