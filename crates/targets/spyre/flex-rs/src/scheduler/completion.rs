@@ -231,7 +231,7 @@ pub(super) fn eval_cb_complete_status(pr: &PendingRequest) -> CbOutcome {
             pr.state, pr.node_name,
         ),
         Some(rb) => format!(
-            "CB tag={:?} state={:?} cancel={} status={:?} locator={:#x} mark={} edep={} flr={} node_name={:?}",
+            "CB tag={:?} state={:?} cancel={} status={:?} locator={:#x} mark={} edep={} flr={} node_name={:?}{}",
             rb.tag(),
             pr.state,
             rb.cancelled(),
@@ -241,9 +241,61 @@ pub(super) fn eval_cb_complete_status(pr: &PendingRequest) -> CbOutcome {
             rb.edep(),
             rb.flr(),
             pr.node_name,
+            qgi_detail(rb),
         ),
     };
     CbOutcome::Failed(CbCompleteError { timed_out, detail })
+}
+
+/// ⭐ THE FAULTING DEVICE ADDRESS, APPENDED TO THE DIAGNOSTIC — empty for every response that does not
+/// carry one, so a non-compute failure reads exactly as it did before.
+///
+/// ⛔ THIS EXISTS BECAUSE `locator=0x2` ON ITS OWN COST A SESSION. A compute-side fault reported only
+/// as `status=Error locator=0x2` says nothing about WHERE it faulted, and the response block was
+/// carrying the address the whole time in its app section (see
+/// [`ResponseBlockWire::app_qgi`]) — we decoded the first 8 bytes and threw the rest away. An
+/// unmapped-address case (`riu_unmp_err`/`prep_unmp_err`) means the access fell outside the
+/// `paddr..paddr+length` some translation declared, which is a statement about a SEGMENT'S EXTENT and
+/// is not otherwise deducible from the failure at all.
+fn qgi_detail(rb: ResponseBlockWire) -> String {
+    let Some(qgi) = rb.app_qgi() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if qgi.is_hmi() {
+        out.push_str(&format!(
+            " HMI={} addr={:#x} ({} flits) syndrome={:#x} tag={:#x} snid={:#x}",
+            if qgi.hmi_is_store() { "STORE" } else { "FETCH" },
+            qgi.hmi_address_bytes(),
+            qgi.hmi_address_flits(),
+            qgi.hmi_syndrome(),
+            qgi.hmi_tag(),
+            qgi.hmi_snid(),
+        ));
+    }
+    if qgi.is_qgi() {
+        let cases: Vec<String> = qgi.qgi_error_cases().map(|c| format!("{c:?}")).collect();
+        out.push_str(&format!(
+            " QGI addr={:#x} ({} flits) syndrome={:#x} cases=[{}]",
+            qgi.qgi_address_bytes(),
+            qgi.qgi_address_flits(),
+            qgi.qgi_syndrome(),
+            cases.join(","),
+        ));
+        if qgi.qgi_error_cases().any(|c| c.is_unmapped_address()) {
+            out.push_str(
+                " — UNMAPPED ADDRESS: this access fell outside the paddr..paddr+length a \
+                 translation declared, so suspect a segment's declared EXTENT, not its base",
+            );
+        }
+    }
+    if out.is_empty() && qgi.beat0_byte8() != 0 {
+        out.push_str(&format!(
+            " (app section is not a QGI/HMI record: beat0_byte8={:#x}, documented unused)",
+            qgi.beat0_byte8()
+        ));
+    }
+    out
 }
 
 /// A DMA buffer parked because the control block naming it may still be live
