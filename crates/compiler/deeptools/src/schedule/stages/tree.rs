@@ -251,6 +251,18 @@ impl TreeData {
         }
     }
 
+    /// `condNode->loopCond_ = cond` — a NO-OP on a node that is not a condition, which is the
+    /// reference's own downcast of a non-`CONDITION` node.
+    pub(super) fn set_loop_cond(&mut self, condition: NodeId, cond: LoopCondComposite) {
+        if let Some(Entry {
+            kind: Kind::Condition(held),
+            ..
+        }) = self.nodes.get_mut(&condition)
+        {
+            held.loop_cond = Some(cond);
+        }
+    }
+
     /// `condNode->coreClCond_`, absent on a loop-guarded condition and on every other kind.
     pub(super) fn core_cl_cond(&self, condition: NodeId) -> Option<v1::CoreClSet> {
         match &self.nodes.get(&condition)?.kind {
