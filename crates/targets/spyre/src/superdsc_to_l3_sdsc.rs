@@ -1362,13 +1362,18 @@ mod tests {
             effect.first_refusal, None,
             "no carrier was asked for a fact it could not give — the stop is a ported unit's"
         );
-        let stopped = effect
-            .stopped_at
-            .expect("stage 2a stops at the memory tracker");
-        assert!(
-            stopped.contains("ExPhaseTrackers::backup"),
-            "the stop must be the unported memory tracker and nothing earlier; got: {stopped}"
+        // ⭐⭐ NOTHING PANICS ANY MORE. The memory tracker is REAL — `stages::Trackers` owns a
+        // `MemTrackBundle` of ported `DsTrackInMem`s, gated against the reference's own addresses for
+        // all 187 programs (`deeptools`'s `schedule/stages/carriers/lx_oracle.rs`) — so this program
+        // runs THROUGH `backup`/`remove`/`check_and_add` and reaches no `todo!` at all.
+        assert_eq!(
+            effect.stopped_at, None,
+            "no `todo!` is reached on this path any more"
         );
+        // ⛔ AND IT STILL DOES NOT COMPLETE: entry 222 looks its own freshly minted allocate node up
+        // in the `v1::AllocArena` (`l3/dl_ops.rs:9261`) and no unit of stage 2a ever writes that
+        // arena — the port split the reference's ONE `dsc2::AllocateNode *` into a tree node and an
+        // arena entry and writes only the tree. That is the next frontier and it is a port change.
         assert!(!effect.l3, "so stage 2a did not complete");
     }
 

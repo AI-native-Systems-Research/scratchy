@@ -59,7 +59,7 @@ mod reads;
 mod state;
 mod tree;
 
-pub use carriers::{Placement, Sink, Symbols, Trackers};
+pub use carriers::{ExecutionStep, LxAvailFraction, Placement, Sink, Symbols, Trackers};
 pub use ddc_reads::Dsc2Reads;
 pub use ddc_sites::{DdcTemplates, Dsc2Ddl, Dsc2Provider, Dsc2Stages};
 pub use ddc_state::{DdcCoords, DdcSink, DdcSymbols, DdcTrackers, Dsc2Dims, Dsc2State};
@@ -170,7 +170,11 @@ pub fn run_l3<const CHUNK_EXPLORE: bool, A: crate::arch::Arch>(
     };
     let mut env = Env::new(state, sdsc);
     let mut allocs = v1::AllocArena::new();
-    let mut trackers = Trackers::default();
+    // ⭐⭐ THE REAL LX ALLOCATOR, ONE TRACKER PER CORE OVER `A::LX_CAPACITY` AT `A::BYTES_PER_STICK`,
+    // with the front end's share pinned at address 0 — see [`Trackers::at_step`]. `ExecutionStep`'s
+    // default is `dbo::execStepOf`'s own `0` for a bundle that stamped no `sbf.exec_step`, which is
+    // what a single-phase scratchy bake is.
+    let mut trackers = Trackers::at_step::<A>(ExecutionStep::default());
     let mut sink = Sink::default();
     let mut symbols = Symbols::default();
     let mut surgery = l3::dl_ops::L3RunSurgery {
@@ -968,21 +972,24 @@ mod tests {
     /// the output tensor's HBM load, which entry 214 (`optimize_hbm_lds_output_in_schedule_tree`)
     /// DROPS. It sits AFTER the stop, so this run has not reached it yet.
     ///
-    /// ⭐⭐ THE FRONTIER MOVED PAST ENTRY 207 AND THIS TEST NOW PINS WHERE IT IS. With 207 recording
-    /// the reference's `-1` instead of refusing, stage 2a runs on past `set_chunk_data_stage_params`
-    /// and reaches the MEMORY TRACKER — `ddc::DsTrackInMem`, whose `checkAndAddDs` DECIDES the byte
-    /// offset of every allocation. That is an unported seam and it must stay a `todo!`: a tracker that
-    /// answered a plausible capacity or offset would place real tensors at invented addresses, which
-    /// this crate ranks worse than a stop.
+    /// ⭐⭐ THE FRONTIER MOVED PAST THE MEMORY TRACKER AND THIS TEST NOW PINS WHERE IT IS. The
+    /// tracker is REAL — [`Trackers`] owns a [`crate::schedule::memtrack::bundle::MemTrackBundle`] of
+    /// ported `DsTrackInMem`s, checked against the reference's own addresses for all 187 programs in
+    /// `carriers/lx_oracle.rs` — so `backup`, `remove`, `capacity`, `check_and_add` and `restore_all`
+    /// no longer stop anything. THE STOP IS NOW `try_alloc_l3`'s `allocs.get(&alloc)?`
+    /// (`l3/dl_ops.rs:9261`): entry 222 looks the allocate node it is about to place up in the
+    /// [`v1::AllocArena`], and NO UNIT OF STAGE 2A EVER WRITES THAT ARENA. The minting units call
+    /// `L3TreeSurgery::fresh_alloc` + `new_allocate` (`:16607`, `:16624`, `:9587`, `:9603`), which put
+    /// an `L3AllocateNode` in the TREE; the reference has ONE `dsc2::AllocateNode *` and the port
+    /// split it in two, writing only the tree half. Filling the arena is a cross-entry port change
+    /// (the two projections carry different fields), not carrier wiring.
     ///
-    /// ⛔ THE EXPECTED MESSAGE IS THE SPECIFIC SEAM, NOT ANY PANIC. A bare `should_panic` here would
-    /// pass on the FIRST `todo!` of eighty-six and so would say nothing about how far the stage got;
-    /// naming `ExPhaseTrackers::backup` makes this a ratchet in both directions — it fails if the
-    /// stage regresses to an earlier stop, and it fails the moment the tracker lands, which is the
-    /// cue to re-measure the census.
+    /// ⛔ NO `should_panic` ANY MORE, WHICH IS THE RATCHET IN BOTH DIRECTIONS: a `todo!` anywhere in
+    /// this path now FAILS this test, and the fifteen node names below pin how far the growers got, so
+    /// a regression to an earlier stop fails too. The stop itself is a ported unit's `None` and no
+    /// carrier refused, which is what the two assertions beside it say.
     #[test]
-    #[should_panic(expected = "ExPhaseTrackers::backup")]
-    fn stage_2a_runs_past_entry_207_and_reaches_the_memory_tracker() {
+    fn stage_2a_runs_past_the_memory_tracker_and_stops_at_the_unwritten_alloc_arena() {
         let mut sdsc = a_rmsq_super_dsc();
         let state = DscState::seeded(&sdsc);
         assert_eq!(
@@ -1005,10 +1012,13 @@ mod tests {
             .collect();
         // ⛔ THE STOP IS A PORTED UNIT'S OWN REFUSAL AND NOT A CARRIER'S: nothing here was asked for a
         // fact it could not give.
-        assert_eq!(ran, None, "entry 207's divergence stops the stage");
+        assert_eq!(
+            ran, None,
+            "entry 222 finds no allocate node in the arena and returns"
+        );
         assert!(
             state.refusals().is_empty(),
-            "the stop is entry 207's, not a carrier's: {:?}",
+            "the stop is entry 222's, not a carrier's: {:?}",
             state.refusals()
         );
         assert_eq!(
@@ -1036,23 +1046,22 @@ mod tests {
 
     /// ⭐ THE FIXED-SIGNATURE ENTRY POINT REACHES THE SAME SEAM — `run_stages` states no compute op
     /// and no fold props of its own (neither is a `SuperDsc` field), so it stops exactly where
-    /// [`stage_2a_runs_past_entry_207_and_reaches_the_memory_tracker`] does. Pinned by the same named
-    /// seam and for the same reason.
+    /// [`stage_2a_runs_past_the_memory_tracker_and_stops_at_the_unwritten_alloc_arena`] does, and the
+    /// node count is what pins that.
     #[test]
-    #[should_panic(expected = "ExPhaseTrackers::backup")]
-    fn run_stages_reaches_the_memory_tracker_too() {
+    fn run_stages_reaches_the_alloc_arena_too() {
         let mut sdsc = a_rmsq_super_dsc();
         let ran = run_stages(&mut sdsc);
         assert_eq!(ran.nodes_before, 4, "the seed");
         assert_eq!(
             ran.nodes_after, 15,
-            "what entry 382 left before entry 207 stopped it"
+            "what entry 382 left before entry 222's arena lookup stopped it"
         );
         assert!(!ran.l3, "stage 2a did not complete");
         assert!(!ran.ddc, "stage 2b is not composed yet");
         assert_eq!(
             ran.first_refusal, None,
-            "no carrier refused — the stop is entry 207's own divergence"
+            "no carrier refused — the stop is entry 222's own `None`"
         );
     }
 

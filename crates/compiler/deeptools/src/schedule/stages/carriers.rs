@@ -13,10 +13,18 @@
 //! ⛔ A FABRICATED CAPACITY IS THE ONE THING RANKED WORSE THAN A STOP by this crate's own
 //! `CLAUDE.md`: `alloc_all_mem` would place every allocation against it and commit, and the
 //! resulting program reads memory nothing filled.
+//!
+//! ⭐⭐ `M` IS NO LONGER ONE OF THEM. [`Trackers`] owns a real [`MemTrackBundle`] of ported
+//! [`DsTrackInMem`] trackers, so every capacity it reports and every address it hands out comes off
+//! `initMemTrack`'s own operands and `checkAndAddDs`' own block list — see [`Trackers::at_step`].
+
+#[cfg(test)]
+mod lx_oracle;
 
 use std::collections::BTreeMap;
+use std::num::NonZeroI64;
 
-use crate::arch::Bytes;
+use crate::arch::{Arch, Bytes};
 use crate::schedule::ddc::fold::{AllocId, ConstIdx, NodeId};
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::v1;
@@ -25,7 +33,13 @@ use crate::schedule::l3::dl_ops::{
     AddressFoldCoords, ExPhase, ExPhaseTrackers, L3DataInfoSink, L3Fill, L3Placement,
     L3TrackerSite, SymbolOp, SymbolOperand, SymbolTable, VariableSymbol,
 };
-use crate::units::{Corelet, Row};
+use crate::schedule::memtrack::bundle::{BundleSite, MemTrackBundle};
+use crate::schedule::memtrack::memory::{Address, Capacity};
+use crate::schedule::memtrack::tracker::{
+    AllocEnd, AllocGranularity, BoundPhase, DsAddress, DsMemInfo, DsTrackInMem, ExPhaseCount,
+    Margin, MemName, TrackingMode,
+};
+use crate::units::{Core, Corelet, Row};
 
 /// `P` — the design space's placement, which entry 222 sizes and names buffers through.
 ///
@@ -134,11 +148,166 @@ impl v1::StorageNames for Placement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExecutionStep(pub u32);
 
-/// `M` — `memTrackers`, where entry 222 places each allocation, per execution phase.
-#[derive(Debug, Clone, Copy, Default)]
+/// WHAT FRACTION OF EACH CORE'S LX A PROGRAM MAY ALLOCATE FROM — `DXP_LX_FRAC_AVAIL`, whose
+/// `value_or` default is 0.2 (`dbo/src/Transforms/ProgramLayout.cpp:82-83`).
+///
+/// ⛔ A CONST INPUT AND NOT AN ENVIRONMENT READ, and an exact RATIONAL where the reference multiplies
+/// by a `double`: `const int64_t reserved = lx_tracker.memCapacity * (1 - lx_avail_frac)` (`:92`)
+/// truncates. Over LX's own 2,031,616 bytes both spellings give 1,625,292, which
+/// [`DsTrackInMem::check_and_add_ds_at_addr`] then rounds UP to 1,625,344 — the address every LX
+/// allocation of all 187 reference programs is placed at or above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LxAvailFraction {
+    /// How much of the space the program may allocate from, over [`Self::denominator`].
+    numerator: i64,
+    /// What that share is out of.
+    denominator: NonZeroI64,
+}
+
+impl LxAvailFraction {
+    /// `dtGetEnv<double>("DXP_LX_FRAC_AVAIL").value_or(0.2)` — one fifth
+    /// (`ProgramLayout.cpp:82-83`).
+    pub const DEFAULT: Self = Self {
+        numerator: 1,
+        denominator: NonZeroI64::new(5).expect("five is not zero"),
+    };
+
+    /// `memCapacity * (1 - lx_avail_frac)` (`ProgramLayout.cpp:92`) — what the front end holds,
+    /// BEFORE the tracker rounds the request up to a stick.
+    #[must_use]
+    const fn reserved(self, capacity: Capacity) -> Capacity {
+        let denominator = self.denominator.get();
+        Capacity(capacity.0 * (denominator - self.numerator) / denominator)
+    }
+}
+
+/// THE DS `reserveFrontendLx` PINS AT ADDRESS 0 — `"reserved-frontend"`
+/// (`dbo/src/Transforms/ProgramLayout.cpp:93`).
+///
+/// ⛔ A TRACKER KEY AND NOT A TENSOR: it names no `labeledDs_` entry, which is why nothing else in
+/// this stage can collide with it.
+fn reserved_frontend() -> v1::StorageName {
+    v1::StorageName("reserved-frontend".to_owned())
+}
+
+/// `M` — `memTrackers`, the run's own [`MemTrackBundle`], where entry 222 places each allocation per
+/// execution phase.
+///
+/// ⭐⭐ THE LX FAMILY, WHICH IS THE ONLY ONE THIS STAGE PLACES INTO: entry 222's own
+/// `DT_CHECK_MSG(allocNode->component_ == LX, "Expect only LX.")`
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5548`) refuses every other component BEFORE it asks
+/// for a capacity or an address, and the reference's own 187-program output confirms it — the HBM
+/// nodes carry scratchy's addresses through unchanged, and the register-file and L0 nodes are placed
+/// by stage 2b.
+///
+/// ⛔ `initializeMemoryTrackers` (`sys-arch-spec/memtracker/mem_track_bundle.cpp:38`) IS NOT CALLED,
+/// AND ONE MISSING OPERAND IS WHY. Its per-corelet loop reads
+/// `regInfoPerUnit.at(LXLU).at(RegType::SCALE)` (`:82-84`, one 1024-bit register at
+/// `sysdef.cpp:367-368`) and `sys_arch_spec::regfile::RegType` HAS NO `SCALE` ARM — the twelve
+/// (component, file) tables are exhaustive `match`es over thirteen variants, so adding it is a
+/// vendored-table change and not this wiring's. So [`Trackers::at_step`] seeds the LX family exactly
+/// as that unit seeds it (`:57-63`) and a site in any other family is a `todo!` naming this gap.
+#[derive(Debug, Clone)]
 pub struct Trackers {
     /// The one phase this run places into — see [`ExecutionStep`].
-    pub step: ExecutionStep,
+    step: ExecutionStep,
+    /// `memTrackers` — the bundle itself.
+    bundle: MemTrackBundle<DsTrackInMem>,
+    /// `trackerBackups` (`L3DlOpsScheduler.cpp:5518-5519`) — one `backupEps` snapshot per phase, per
+    /// site, taken before a trial placement and replayed by [`ExPhaseTrackers::restore_all`].
+    backups: BTreeMap<BundleSite, Vec<Vec<DsMemInfo>>>,
+}
+
+impl Trackers {
+    /// ⭐⭐ THE BUNDLE ENTRY 222 PLACES INTO, BUILT THE WAY THE REFERENCE PIPELINE BUILDS IT: one LX
+    /// tracker per core over `lxCapacity` bytes at a granularity of `bytesPerStick`
+    /// (`mem_track_bundle.cpp:57-63`), grown to hold `step`'s phase
+    /// (`dbo/src/Transforms/sdsc_bundle/MemTrackerInit.cpp:92`), with the front end's share of every
+    /// core's LX pinned at address 0 across every phase (`:99`, `ProgramLayout.cpp:81-98`).
+    ///
+    /// ⛔ EVERY NUMBER IS AN `Arch` CONSTANT AND NONE IS A LITERAL HERE: [`Arch::LX_CAPACITY`] is
+    /// `lxCap - 64*1024` (`sysdef.cpp:211`) and [`Arch::BYTES_PER_STICK`] is `bytesPerStick`
+    /// (`sysdef.cpp:206`). The capacity a caller reads back is the tracker's own `memCapacity`.
+    ///
+    /// ⭐ THE PHASE COUNT IS `step + 1`, WHICH PLACES IDENTICALLY TO THE WHOLE BUNDLE'S `numSteps`:
+    /// each phase owns its own `free_`, `dsInMem_` and block list (`mem_track.cpp:117`), the reserve
+    /// covers `0..numSteps` uniformly, and entry 222 places into `{executionStep}` alone — so a
+    /// bundle with more phases answers the same addresses for this program. A caller that holds the
+    /// bundle's real `numSteps` states it through [`ExecutionStep`] of the LAST program instead.
+    #[must_use]
+    pub fn at_step<A: Arch>(step: ExecutionStep) -> Self {
+        // `numSteps` (`MemTrackerInit.cpp:85`) — a phase count, not a phase index.
+        let count = ExPhaseCount(
+            i32::try_from(step.0)
+                .expect("a bundle holds fewer SDSC nodes than i32::MAX")
+                .saturating_add(1),
+        );
+        // `std::iota(phases.begin(), phases.end(), 0)` (`ProgramLayout.cpp:89-90`).
+        let phases: Vec<ExPhase> = (0..count.0)
+            .filter_map(|phase| u32::try_from(phase).ok())
+            .map(ExPhase)
+            .collect();
+        let capacity = Capacity(
+            i64::try_from(A::LX_CAPACITY.0).expect("lxCapacity is 2 MiB, far inside an i64"),
+        );
+        let granularity = AllocGranularity(
+            NonZeroI64::new(
+                i64::try_from(A::BYTES_PER_STICK.get())
+                    .expect("bytesPerStick is 128, far inside an i64"),
+            )
+            .expect("a stick is not zero bytes"),
+        );
+        let mut bundle = MemTrackBundle::<DsTrackInMem>::default();
+        for core in (0..).map_while(Core::checked) {
+            let tracker = bundle.lx_track_per_core.entry(core).or_default();
+            tracker.init_mem_track(
+                MemName(format!("lxCore{}", core.get())),
+                capacity,
+                count,
+                granularity,
+                // `isStrict` defaults to `true` (`mem_track.h:57-58`): this tracker ASSIGNS
+                // addresses rather than only counting bytes.
+                TrackingMode::AddressAssignment,
+            );
+            // The explicit second format the reference writes after each `initMemTrack`
+            // (`mem_track_bundle.cpp:62`) — a no-op, because unit e032 already calls unit e028.
+            tracker.format_mem_track();
+            // ⭐ THE BASE EVERY LX ADDRESS OF THE CORPUS IS MEASURED FROM. `reserveFrontendLx`
+            // returns an ERROR STRING the pass turns into a `signalPassFailure` when this refuses
+            // (`ProgramLayout.cpp:93-97`); it cannot refuse here, because `reserved` is
+            // `memCapacity * 4/5` of a tracker that holds nothing else.
+            let _reserved = tracker.check_and_add_ds_at_addr(
+                &reserved_frontend(),
+                LxAvailFraction::DEFAULT.reserved(capacity),
+                &phases,
+                Some(Address::ZERO),
+                Margin::NONE,
+            );
+        }
+        Self {
+            step,
+            bundle,
+            backups: BTreeMap::new(),
+        }
+    }
+
+    /// `memTrackers->getTracker(comp, core, corelet, row)` (`mem_track_bundle.cpp:174`) reduced to
+    /// the coordinates the component's own arm reads.
+    ///
+    /// ⛔ THE `todo!` IS THE ONE GAP THIS CARRIER HAS LEFT, and it is not a placement: no site
+    /// outside the LX family is reachable before entry 222's *"Expect only LX."* — see [`Trackers`].
+    fn site(at: L3TrackerSite) -> BundleSite {
+        match BundleSite::of(at.memory, at.core, at.corelet, at.row) {
+            Some(site @ BundleSite::Lx(_)) => site,
+            Some(_) | None => todo!(
+                "ExPhaseTrackers: a {:?} site wants MemTrackBundle::initializeMemoryTrackers \
+                 (mem_track_bundle.cpp:38), whose per-corelet loop reads \
+                 regInfoPerUnit.at(LXLU).at(SCALE) — sys_arch_spec::regfile::RegType has no SCALE \
+                 arm, so this bundle holds the LX family only",
+                at.memory
+            ),
+        }
+    }
 }
 
 impl ExPhaseTrackers for Trackers {
@@ -148,77 +317,110 @@ impl ExPhaseTrackers for Trackers {
         vec![ExPhase(self.step.0)]
     }
 
-    /// ⛔⛔ WANTS `DsTrackInMem`, WHICH IS AN UNPORTED 703-LINE C++ ALLOCATOR — `util/memtracker/
-    /// mem_track.{h,cpp}` (107 + 596 lines), OUTSIDE every campaign's file list. `checkAndAddDs`
-    /// (`mem_track.cpp:395-415`) rounds the request to `allocGranularity`, asks
-    /// `checkDsForStartAddr(ds, capRound, eps, -1, margin, allocFromBack)` for an address and records
-    /// it with `addDsAtStartAddr` — with per-exphase free lists, a `margin`, an `allocFromBack`
-    /// direction, overlap handling (`checkAndAddDsWithOvl`) and a `strict` mode carrying an
-    /// `occupied_` block list. THIS IS A PORT, NOT INTEGRATION WIRING, and it needs its own campaign
-    /// unit.
+    /// `myTracker->memCapacity` (`L3DlOpsScheduler.cpp:5617`) — the WHOLE space of this site, which
+    /// entry 222 widens a streaming buffer's request to.
     ///
-    /// ⛔⛔ DO NOT HAND-ROLL IT FROM THE FIXTURE. The verified oracle below is THREE consecutive
-    /// allocations, and three points fit many laws — none of them exercise `margin`,
-    /// `allocFromBack`, the per-exphase free lists, the overlap path or `strict`. Inventing a
-    /// placement policy that reproduces three addresses is exactly the fabricated placement this
-    /// crate ranks worse than a stop.
-    ///
-    /// ⭐⭐ THE ORACLE, MEASURED, for whoever ports it — `g0/debug/sdsc_0/sdsc.json`, DSC `rmsq_o728`,
-    /// every value uniform across all 32 cores:
-    ///
-    /// | node | `startAddressCoreCorelet_.data_` | `numBuffers_` | `bufferOffsetCoreCorelet_` |
-    /// |---|---|---|---|
-    /// | `allocate_lds0_lx` | 1_625_344 | 2 | 256 |
-    /// | `allocate_lds1_lx` | 1_625_856 | 2 | 256 |
-    /// | `allocate_lds2_lx` | 1_626_368 | 2 | 256 |
-    ///
-    /// ⛔ AND `bufferOffsetCoreCorelet_` IS NOT THE PLACED ADDRESS — it is the DOUBLE-BUFFER STRIDE,
-    /// identical (256) on all three nodes and on all 32 cores, which is why it cannot be the address
-    /// of three distinct allocations. The placed address is `startAddressCoreCorelet_.data_`.
-    /// Validating a tracker against the buffer offset would pass for one that allocated everything at
-    /// 256. The consecutive delta is 512 = `numBuffers` x `bufferOffset`.
-    ///
-    /// ⭐ THE HBM NODES ARE NOT THE TRACKER'S: `allocate-Tensor{0,1}_hbm` sit at `128 * core` and
-    /// `Tensor2_hbm` at `6_610_944 + 128 * core`, which is scratchy's OWN
-    /// `startAddressCoreCorelet_` carried through unchanged. Only LX is placed here.
-    fn capacity(&self, _at: L3TrackerSite) -> Bytes {
-        todo!(
-            "ExPhaseTrackers::capacity: wants memCapacity off DsTrackInMem — an UNPORTED 703-line \
-             C++ allocator (util/memtracker/mem_track.{{h,cpp}}), outside every campaign's file \
-             list. It is a PORT, not wiring; see this method's doc for the measured oracle."
+    /// ⛔ THE TRACKER'S OWN FIELD, NOT A CONSTANT HERE: it is what `initMemTrack` was handed
+    /// (`mem_track.cpp:109`), so a caller cannot read a capacity the trackers were not built with.
+    /// ⛔ NON-NEGATIVE BY CONSTRUCTION — [`Trackers::at_step`] sets it from [`Arch::LX_CAPACITY`].
+    /// ⚠️ NOT EXERCISED BY THE CORPUS: all 588 LX allocations of the 187 reference programs carry
+    /// `numBuffers_` ∈ {1, 2}, and only `-1` (streaming) reaches this call.
+    fn capacity(&self, at: L3TrackerSite) -> Bytes {
+        Bytes(
+            self.bundle
+                .tracker(Self::site(at))
+                .mem_capacity
+                .0
+                .unsigned_abs(),
         )
     }
 
-    /// ⛔ Wants `backupEps(exphase)` on the live tracker.
-    fn backup(&mut self, _at: L3TrackerSite) {
-        todo!("ExPhaseTrackers::backup: wants backupEps(exphase) on ddc::DsTrackInMem")
+    /// `backupEps(exphase)` for every phase, once per site — `trackerBackups.try_emplace(myTracker)`
+    /// then a `backupEps` per phase (`L3DlOpsScheduler.cpp:5539-5542`).
+    ///
+    /// ⛔⛔ THE SNAPSHOT IS RE-TAKEN, AND `try_emplace` IS WHY THAT IS THE SAME BEHAVIOUR:
+    /// `trackerBackups` is a LOCAL of `allocAllMem` (`:5518-5519`), so its idempotence is scoped to
+    /// ONE call — and within one call a site is visited at most once, because the `(comp, core)`
+    /// pairs it loops over are distinct (`:5521-5537`) and no two components share a tracker family.
+    /// Across calls re-taking it is REQUIRED: a snapshot that survived a committing call would let a
+    /// later failing call's `restoreEps` roll a committed placement back.
+    fn backup(&mut self, at: L3TrackerSite) {
+        let site = Self::site(at);
+        let tracker = self.bundle.tracker(site);
+        let snapshot: Vec<Vec<DsMemInfo>> = self
+            .ex_phases()
+            .iter()
+            .map(|phase| tracker.backup_eps(*phase))
+            .collect();
+        self.backups.insert(site, snapshot);
     }
 
-    /// ⛔ Wants `restoreEps(exphase, backupInfo)` on the live tracker.
+    /// `restoreEps(exphases.at(i), backupInfo.at(i))` for every tracker backed up since
+    /// (`L3DlOpsScheduler.cpp:5739-5742`) — the exact replay that leaves a failed trial placement
+    /// with no trace.
+    ///
+    /// ⛔ IT ENDS THE TRANSACTION, which is what dropping `trackerBackups` at the close of
+    /// `allocAllMem` does: a snapshot replayed twice would undo whatever was placed in between.
     fn restore_all(&mut self) {
-        todo!(
-            "ExPhaseTrackers::restore_all: wants restoreEps(exphase, backupInfo) on ddc::DsTrackInMem"
-        )
+        let phases = self.ex_phases();
+        for (site, snapshot) in std::mem::take(&mut self.backups) {
+            let tracker = self.bundle.tracker_mut(site);
+            for (phase, info) in phases.iter().zip(&snapshot) {
+                tracker.restore_eps(*phase, info);
+            }
+        }
     }
 
-    /// ⛔ Wants `removeDs(name, exphases)` on the live tracker.
-    fn remove(&mut self, _at: L3TrackerSite, _name: &v1::StorageName) {
-        todo!("ExPhaseTrackers::remove: wants removeDs(name, exphases) on ddc::DsTrackInMem")
+    /// `myTracker->removeDs(name, exphases)` (`L3DlOpsScheduler.cpp:5608-5610`) — every candidate is
+    /// removed before any is placed, so a retry cannot collide with its own previous attempt.
+    ///
+    /// ⛔ A PHASE THIS TRACKER DOES NOT HOLD IS DROPPED HERE where the reference's
+    /// `epsToListIter.at(eps)` throws (`mem_track.cpp:442`): [`BoundPhase`] is mintable only off a
+    /// bound phase and `removeDs` returns `void`, so there is nowhere to put that throw. Unreachable
+    /// from [`Trackers::at_step`], which binds every phase up to [`ExecutionStep`]'s own.
+    fn remove(&mut self, at: L3TrackerSite, name: &v1::StorageName) {
+        let phases = self.ex_phases();
+        let tracker = self.bundle.tracker_mut(Self::site(at));
+        let bound: Vec<BoundPhase> = phases
+            .iter()
+            .filter_map(|phase| tracker.bound_phase(*phase))
+            .collect();
+        tracker.remove_ds(name, &bound);
     }
 
-    /// ⛔ Wants `checkAndAddDs(name, size, {exphase})` — the call that DECIDES the byte offset. This
-    /// is the placement authority itself; an invented [`v1::Placed`] is a fabricated address.
+    /// ⭐⭐ `myTracker->checkAndAddDs(name, mySize, {exphase})` (`L3DlOpsScheduler.cpp:5629-5631`) —
+    /// THE CALL THAT DECIDES THE BYTE OFFSET, and it commits: the `dsInMem_` entry, the `free_` debit
+    /// and the block are one act (`mem_track.cpp:377-393`).
+    ///
+    /// ⛔ THE THREE ANSWERS ARE THREE ARMS. `EXISTS` is [`None`] — the reference's
+    /// `DT_CHECK(addr != EXISTS)` (`:5632`), a name already in the tracker meaning this set is being
+    /// placed twice over itself; `DOESNT_FIT` is [`v1::Placed::DoesntFit`], its `return false`; an
+    /// address is [`v1::Placed::At`]. [`DsAddress::Incoherant`] and [`DsAddress::Unplaced`] are
+    /// unreachable from unit e037 (unit e034 answers only those three) and are the same `DT_CHECK`.
+    /// ⛔ `margin` IS 0 AND THE END IS THE FRONT — both are `checkAndAddDs`' own defaults
+    /// (`mem_track.h:81-82`), and the call site takes them.
     fn check_and_add(
         &mut self,
-        _at: L3TrackerSite,
-        _phase: ExPhase,
-        _name: &v1::StorageName,
-        _size: Bytes,
+        at: L3TrackerSite,
+        phase: ExPhase,
+        name: &v1::StorageName,
+        size: Bytes,
     ) -> Option<v1::Placed> {
-        todo!(
-            "ExPhaseTrackers::check_and_add: wants checkAndAddDs(name, size, {{exphase}}) on \
-             ddc::DsTrackInMem — this call IS the placement authority"
-        )
+        // `int64_t cap` — [`None`] is the `DT_CHECK` a request no `int64_t` can carry would take.
+        let cap = Capacity(i64::try_from(size.0).ok()?);
+        let placed = self.bundle.tracker_mut(Self::site(at)).check_and_add_ds(
+            name,
+            cap,
+            &[phase],
+            Margin::NONE,
+            AllocEnd::Front,
+        );
+        match placed {
+            // `DT_CHECK(startAddr >= 0)` (`mem_track.cpp:411`) is this conversion.
+            DsAddress::At(address) => Some(v1::Placed::At(Bytes(u64::try_from(address.0).ok()?))),
+            DsAddress::DoesntFit => Some(v1::Placed::DoesntFit),
+            DsAddress::Exists | DsAddress::Incoherant | DsAddress::Unplaced => None,
+        }
     }
 }
 
