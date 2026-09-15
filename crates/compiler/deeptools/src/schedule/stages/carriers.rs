@@ -127,11 +127,44 @@ impl ExPhaseTrackers for Trackers {
         vec![ExPhase(self.step.0)]
     }
 
-    /// ⛔ Wants `memCapacity` off `ddc::DsTrackInMem` — never a constant, for the same reason
-    /// [`L3Placement::buffer_capacity_even_sticks`] is not.
+    /// ⛔⛔ WANTS `DsTrackInMem`, WHICH IS AN UNPORTED 703-LINE C++ ALLOCATOR — `util/memtracker/
+    /// mem_track.{h,cpp}` (107 + 596 lines), OUTSIDE every campaign's file list. `checkAndAddDs`
+    /// (`mem_track.cpp:395-415`) rounds the request to `allocGranularity`, asks
+    /// `checkDsForStartAddr(ds, capRound, eps, -1, margin, allocFromBack)` for an address and records
+    /// it with `addDsAtStartAddr` — with per-exphase free lists, a `margin`, an `allocFromBack`
+    /// direction, overlap handling (`checkAndAddDsWithOvl`) and a `strict` mode carrying an
+    /// `occupied_` block list. THIS IS A PORT, NOT INTEGRATION WIRING, and it needs its own campaign
+    /// unit.
+    ///
+    /// ⛔⛔ DO NOT HAND-ROLL IT FROM THE FIXTURE. The verified oracle below is THREE consecutive
+    /// allocations, and three points fit many laws — none of them exercise `margin`,
+    /// `allocFromBack`, the per-exphase free lists, the overlap path or `strict`. Inventing a
+    /// placement policy that reproduces three addresses is exactly the fabricated placement this
+    /// crate ranks worse than a stop.
+    ///
+    /// ⭐⭐ THE ORACLE, MEASURED, for whoever ports it — `g0/debug/sdsc_0/sdsc.json`, DSC `rmsq_o728`,
+    /// every value uniform across all 32 cores:
+    ///
+    /// | node | `startAddressCoreCorelet_.data_` | `numBuffers_` | `bufferOffsetCoreCorelet_` |
+    /// |---|---|---|---|
+    /// | `allocate_lds0_lx` | 1_625_344 | 2 | 256 |
+    /// | `allocate_lds1_lx` | 1_625_856 | 2 | 256 |
+    /// | `allocate_lds2_lx` | 1_626_368 | 2 | 256 |
+    ///
+    /// ⛔ AND `bufferOffsetCoreCorelet_` IS NOT THE PLACED ADDRESS — it is the DOUBLE-BUFFER STRIDE,
+    /// identical (256) on all three nodes and on all 32 cores, which is why it cannot be the address
+    /// of three distinct allocations. The placed address is `startAddressCoreCorelet_.data_`.
+    /// Validating a tracker against the buffer offset would pass for one that allocated everything at
+    /// 256. The consecutive delta is 512 = `numBuffers` x `bufferOffset`.
+    ///
+    /// ⭐ THE HBM NODES ARE NOT THE TRACKER'S: `allocate-Tensor{0,1}_hbm` sit at `128 * core` and
+    /// `Tensor2_hbm` at `6_610_944 + 128 * core`, which is scratchy's OWN
+    /// `startAddressCoreCorelet_` carried through unchanged. Only LX is placed here.
     fn capacity(&self, _at: L3TrackerSite) -> Bytes {
         todo!(
-            "ExPhaseTrackers::capacity: wants memCapacity off ddc::DsTrackInMem (ddc/memTracker.h)"
+            "ExPhaseTrackers::capacity: wants memCapacity off DsTrackInMem — an UNPORTED 703-line \
+             C++ allocator (util/memtracker/mem_track.{{h,cpp}}), outside every campaign's file \
+             list. It is a PORT, not wiring; see this method's doc for the measured oracle."
         )
     }
 
