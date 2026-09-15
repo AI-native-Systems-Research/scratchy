@@ -103,9 +103,15 @@ count() {
 # ⭐ (4) REMAINDER SCHEDULES, AND THE REMAINDER OVERRULES THE MARKER. Rebuild each
 # port-remainder.json from the anchors actually filled on the branch: the schedules are static and
 # crustify has no idea which units are done, so without this a restart re-ports what already landed.
+# ⛔⛔ SCOPED THE SAME WAY `count` IS, AND FOR A SHARPER REASON. The first version grepped the whole
+# crate and handed the regenerator 72 anchors as "filled" — bridge-1 and ddc entry numbers on
+# entirely different functions. It happened not to collide, but a collision DROPS A UNIT FROM THE
+# REMAINDER THAT WAS NEVER PORTED, and nothing downstream would ever ask for it again. This is the
+# one place a bad anchor filter loses work rather than just misreporting it.
 remainders() {
-  grep -rhoE '/// Replaces: e0(0[2-9]|1[0-9])_[A-Za-z0-9_]+' $ROOT/crates/compiler/deeptools/src \
-    | sed 's|/// Replaces: ||' | sort -u > /tmp/filled-capacity.txt
+  grep -hoE '/// Replaces: e[0-9]{3}_[A-Za-z0-9_]+' $HOMES 2>/dev/null \
+    | sed 's|/// Replaces: ||' | sort -u \
+    | grep -Fxf <(printf '%s\n' "$NAMES") > /tmp/filled-capacity.txt
   python3 $CAMP/regen-remainders.py >> $TRACE 2>&1
 }
 
