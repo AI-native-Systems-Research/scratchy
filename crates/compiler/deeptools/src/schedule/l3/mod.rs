@@ -122,6 +122,10 @@
 //!
 //! 144 units across 1 file(s).
 
+/// `getBufferCapacityForNode` and its closure (`dsc/dsc2.cpp:3977`) — the one `dsc/` question
+/// [`dl_ops`]'s `try_alloc_l3` stops on, in its own module so that none of its three carriers owns
+/// it. Empty until the capacity campaign lands; see `crustify-capacity/UNITS.tsv`.
+pub mod capacity;
 pub mod dsc;
 /// ⭐ `pub` FOR THE INTEGRATION, the same reason [`super::l3`] itself is: a caller handing stage 2a its
 /// two construction arguments must be able to name `AddressFoldCoords` and `L3RunInputs`.

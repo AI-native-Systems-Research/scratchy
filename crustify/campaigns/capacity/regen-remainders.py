@@ -64,9 +64,27 @@ for d in [
         })
     nb = sum(len(w["batches"]) for w in waves)
     nu = sum(w["unit_count"] for w in waves)
+    # ⛔ `layer_count` IS THE NUMBER OF DISTINCT `layer` VALUES, **NOT** THE NUMBER OF WAVES.
+    # crustify checks `len({item["layer"] for item in items}) == summary["layer_count"]`
+    # (wave.py:107-112) and exits with "schedule summary or batched item identities disagree".
+    # Bridge 1's regen script writes `len(waves)` and gets away with it only because its waves
+    # coincide with its levels. THIS campaign cuts waves by ACTUAL DEPENDENCY inside a level — sc1
+    # is two waves at layer 0 alone — so the two numbers differ and every remainder was rejected in
+    # under a second. Derive it from the items, never from the wave count.
+    layers = {i["layer"] for w in waves for b in w["batches"] for i in b["items"]}
     s["waves"] = waves
-    s["summary"].update(batch_count=nb, unit_count=nu, layer_count=len(waves))
+    s["summary"].update(batch_count=nb, unit_count=nu, layer_count=len(layers))
+    # ⭐ ASSERT THE FOUR THINGS crustify CHECKS, HERE, WHERE THE NUMBER IS WRITTEN. A remainder that
+    # disagrees with its own items costs a whole driver sweep to discover (19 seconds, three
+    # sub-campaigns, zero units) and the message names none of the five clauses.
+    items = [i for w in waves for b in w["batches"] for i in b["items"]]
+    ids = [(i["name"], i["defined_in"]) for i in items]
+    assert len(set(ids)) == len(ids), f"{d}: duplicate (name, defined_in) identity"
+    assert len(items) == s["summary"]["unit_count"], f"{d}: unit_count"
+    assert len({i["layer"] for i in items}) == s["summary"]["layer_count"], f"{d}: layer_count"
+    assert nb == s["summary"]["batch_count"], f"{d}: batch_count"
     json.dump(s, open(f.with_name("port-remainder.json"), "w"), indent=1)
-    print(f"  {d}: {nu} units left, {nb} batches")
+    print(f"  {d}: {nu} units left, {nb} batches, "
+          f"{s['summary']['layer_count']} distinct layer(s) — summary agrees with items")
 
 print(f"filled anchors accounted for: {len(filled)} (an anchor is NOT the acceptance gate)")

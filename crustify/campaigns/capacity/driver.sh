@@ -67,10 +67,37 @@ mkdir -p $STATE
 
 # ⭐ (3) ANCHOR CENSUS — A PROGRESS SIGNAL, NEVER THE GATE. "1,076 units ported" once meant 238
 # stubs. OUTSTANDING WORK IS JUDGED FROM UNITS.tsv AND FROM `todo!` COUNTS, never from anchors.
+#
+# ⛔ SCOPED TO THIS CAMPAIGN'S OWN HOME FILES AND ITS OWN 18 NAMES. The first version grepped the
+# whole crate for `e0NN_` and reported "filled=72 of 18" — nonsense, because e002-e019 are also
+# bridge-1 and ddc entry numbers on entirely different functions. A counter that can never read
+# 17-of-18 can never trip the ANCHOR LOSS alarm below, which is the safeguard that catches a stage
+# silently dropping units. The home list is exactly UNITS.tsv's rust_home column.
+HOMES="$ROOT/crates/compiler/deeptools/src/schedule/l3/dsc.rs
+$ROOT/crates/compiler/deeptools/src/schedule/dsc2.rs
+$ROOT/crates/compiler/deeptools/src/schedule/l3/capacity.rs"
+# The 18 portable unit names, read from UNITS.tsv so the driver and the schedule cannot drift.
+UNITS_TSV=$ROOT/crustify-capacity/UNITS.tsv
+NAMES=$(awk -F'\t' 'NR>1 && $2!="-" {print $1}' $UNITS_TSV | sort -u)
+NUNITS=$(printf '%s\n' "$NAMES" | grep -c .)
+LAST_FILLED=-1
 count() {
-  filled=$(grep -rhoE '/// Replaces: e0(0[2-9]|1[0-9])_[A-Za-z0-9_]+' $ROOT/crates/compiler/deeptools/src | sort -u | wc -l | tr -d ' ')
-  todos=$(grep -rc 'todo!' $ROOT/crates/compiler/deeptools/src/schedule/l3/capacity.rs 2>/dev/null | tr -d ' ')
-  say "ANCHORS: filled=$filled of 18   todo! in capacity.rs=${todos:-n/a}"
+  filled=$(grep -hoE '/// Replaces: e[0-9]{3}_[A-Za-z0-9_]+' $HOMES 2>/dev/null \
+             | sed 's|/// Replaces: ||' | sort -u | grep -Fxf <(printf '%s\n' "$NAMES") | wc -l | tr -d ' ')
+  # ⛔ NON-COMMENT LINES ONLY, the same rule `dfir_never_runtime_refuses.rs` counts by. The first
+  # version read `todo! in capacity.rs=1` on an EMPTY module, because the module doc says the words
+  # "no `todo!` bodies". A censor that counts its own prose reports work that is not there.
+  todos=$(grep -hE 'todo!' $ROOT/crates/compiler/deeptools/src/schedule/l3/capacity.rs 2>/dev/null \
+            | grep -vE '^\s*(//|/\*|\*)' | wc -l | tr -d ' ')
+  say "ANCHORS: filled=$filled of $NUNITS   todo! in capacity.rs=${todos:-0}"
+  # ⛔⛔ ANCHOR LOSS. A stage that ends with FEWER anchors than it started with has dropped landed
+  # work — a bad rebase, a promote that took the wrong branch, an agent that rewrote a file whole.
+  # Stop and let a human look; the work is still on the session branch.
+  if [ "$LAST_FILLED" -ge 0 ] && [ "$filled" -lt "$LAST_FILLED" ]; then
+    say "⛔ ANCHOR LOSS: $LAST_FILLED -> $filled — landed units disappeared. STOPPING."
+    exit 6
+  fi
+  LAST_FILLED=$filled
 }
 
 # ⭐ (4) REMAINDER SCHEDULES, AND THE REMAINDER OVERRULES THE MARKER. Rebuild each
@@ -161,7 +188,15 @@ stage() { # $1 schedule json (relative to $CAMP)  $2 objective  $3 tag
   promote $LOGDIR/driver-$3.log
   count
   prune
-  touch "$STATE/.done-$3"
+  # ⛔ ONLY A STAGE THAT EXITED 0 IS DONE. The first version touched the marker unconditionally, so
+  # the three stages that died on a malformed schedule were all recorded as complete. The remainder
+  # check above overrules a stale marker, so this never lost work — but a marker that lies about a
+  # failure is a marker nobody can read, and it hid three failures behind "SKIPPED" on the next run.
+  if [ "$rc" -eq 0 ]; then
+    touch "$STATE/.done-$3"
+  else
+    say "STAGE $3 NOT marked done (exit=$rc) — it will re-run"
+  fi
 }
 
 # ⛔ THE GATE IS deeptools ONLY. Never the workspace and never the acceptance build from here: 6 GB
