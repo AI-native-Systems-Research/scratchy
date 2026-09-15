@@ -1515,3 +1515,94 @@ impl SenComponent {
         })
     }
 }
+
+/// A SEGMENT OF THE LDS — `LdsSegment` (`arch_enums.h:338`), in BOTH of its naming schemes.
+///
+/// 🔑 The C++ writes out forty enumerators; here the eight ROLE-named ones are variants and the
+/// thirty-two POSITION-named ones are the [`HmiSegment`] grid, so which scheme a value belongs to is
+/// the variant rather than a range check on an integer — see [`TWO_SEGMENT_SCHEMES_IN_ONE_ENUM`].
+///
+/// ⭐ IT IS A MAP KEY: `MemTrackBundle::hbmTrack` is a `std::map<LdsSegment, DsTrackInMem>`
+/// (`sys-arch-spec/memtracker/mem_track_bundle.h:22`) whose `begin()` is read for the phase count
+/// (`mem_track_bundle.cpp:52`), which is why [`Ord`] here is the enumerator order and not derived.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum LdsSegment {
+    /// `OUTPUT`.
+    Output,
+    /// `INPUT`.
+    Input,
+    /// `STACK`.
+    Stack,
+    /// `MODEL`.
+    Model,
+    /// `HEAP`.
+    Heap,
+    /// `RESERVE1` — one of the two placeholders the position scheme does not need.
+    Reserve1,
+    /// `RESERVE2`.
+    Reserve2,
+    /// `CONST`.
+    Const,
+    /// One of the thirty-two `SEGn_HMIm` segments.
+    Positioned(HmiSegment),
+}
+
+impl LdsSegment {
+    /// The eight role-named segments, in declaration order.
+    pub const BY_ROLE: [Self; SegmentScheme::ByRole.enumerators()] = [
+        Self::Output,
+        Self::Input,
+        Self::Stack,
+        Self::Model,
+        Self::Heap,
+        Self::Reserve1,
+        Self::Reserve2,
+        Self::Const,
+    ];
+
+    /// Its index in the C++ enum — what a `std::map<LdsSegment, ..>` orders by.
+    #[must_use]
+    pub const fn enum_index(self) -> usize {
+        match self {
+            Self::Output => 0,
+            Self::Input => 1,
+            Self::Stack => 2,
+            Self::Model => 3,
+            Self::Heap => 4,
+            Self::Reserve1 => 5,
+            Self::Reserve2 => 6,
+            Self::Const => 7,
+            Self::Positioned(segment) => segment.enum_index(),
+        }
+    }
+
+    /// Which naming scheme it belongs to.
+    #[must_use]
+    pub const fn scheme(self) -> SegmentScheme {
+        match self {
+            Self::Positioned(_) => SegmentScheme::ByPosition,
+            _ => SegmentScheme::ByRole,
+        }
+    }
+}
+
+/// 🔑 THE ORDER IS THE C++ ENUM'S OWN, NOT [`HmiSegment`]'S FIELD ORDER. A derived `Ord` would order
+/// the position-named segments segment-major over `(segment, hmi)`, where the C++ declares them
+/// hmi-major (`SEG0_HMI0 .. SEG3_HMI0, SEG0_HMI1 ..`), so a `BTreeMap` keyed by this would iterate in
+/// a different order than the `std::map` it stands for.
+impl Ord for LdsSegment {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.enum_index().cmp(&other.enum_index())
+    }
+}
+
+impl PartialOrd for LdsSegment {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+const _: () = assert!(
+    LdsSegment::BY_ROLE.len() + SegmentScheme::ByPosition.enumerators() == LDS_SEGMENTS,
+    "the role variants plus the HMI grid are the whole enum"
+);

@@ -138,6 +138,16 @@ pub mod dsc2;
 /// ⭐ `pub` FOR THE SAME REASON AS [`ddl`]: `l3::dsc::SuperDsc` is the type the bake must BUILD from
 /// scratchy's own SuperDSC in order to hand it to `l3::dl_ops::run`, so it cannot be crate-private.
 pub mod l3;
+/// ⭐⭐ THE MEMORY TRACKER — `util/memtracker/mem_track.{h,cpp}` plus the two pairs beside it,
+/// `MemoryOrganizer` (`memtrack/memory.rs`, where an address actually comes from) and
+/// `MemTrackBundle` (`memtrack/bundle.rs`, which sets every capacity and granularity and whose
+/// `getTracker(comp, core, corelet, row)` IS `l3::dl_ops::L3TrackerSite`). 38/38 units, ported by the
+/// `memtrack-campaign`; `e037_checkAndAddDs` is at `memtrack/tracker.rs`.
+///
+/// ⛔ THIS IS WHAT STAGE 2A STOPPED ON. `stages::carriers`'s `ExPhaseTrackers` left `capacity`,
+/// `backup` and `check_and_add` as `todo!` because a fabricated capacity places real tensors at
+/// invented addresses — worse than a stop, by this crate's own ranking. It has a real allocator now.
+pub mod memtrack;
 /// ⭐⭐ THE STAGES, COMPOSED AND CALLABLE — `SchedulerStages.cpp:29-57` with the concrete providers
 /// the ported units take as type parameters. This is the module that makes the campaign's 382 units
 /// run instead of sitting there; see its own header for what is wired and what is not.
