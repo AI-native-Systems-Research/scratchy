@@ -485,6 +485,39 @@ impl DxpTool {
             .arg("sentient")
             .env("DEEPTOOLS_PATH", &self.deeptools)
             .env("DUMP_SPYRE_CODE", "1")
+            // ⛔⛔⛔ CAP dxp's OWN THREAD POOL, or `COMPILE_WIDTH` children is a thread bomb.
+            //
+            // dxp sizes its pool from `hardware_concurrency` (`dscglobal.h:56`
+            // `parallelThreads = std::thread::hardware_concurrency()`), which reports the HOST's core
+            // count and ignores the cgroup quota. MEASURED with `ps -eo nlwp=,pcpu=,rss=` across a real
+            // bake: each `dxp_standalone` is **193 threads, ~1.9 GB RSS**, on a pod that advertises
+            // `nproc` 192 while `cpu.max` is `2000000 100000` = **20 CPUs**. At `COMPILE_WIDTH` = 32 that
+            // is ~6,200 threads, and the bake dies part-way through a group with
+            // `LLVM ERROR: pthread_create failed: Resource temporarily unavailable`.
+            //
+            // `DT_PARALLEL_THREADS` is deeptools' own knob (`util/utils.cpp:18 parseDtParallelThreads`:
+            // absolute count, `N%` of hardware_concurrency, or negative for all-minus-N, clamped >= 1).
+            // `dxp_standalone` exposes no equivalent flag (`-d`/`-b`/`--dump-bundle-module`/`--use-dxp`
+            // only), so the environment is the only seam.
+            //
+            // ⭐ AND IT IS FASTER THAN THROTTLING THE WIDTH, which is the fix this replaces. Measured on
+            // granite-3.1-8b fp16, one build at a time on an otherwise idle pod:
+            //
+            //   | COMPILE_WIDTH | DT_PARALLEL_THREADS | result                    |
+            //   |---------------|---------------------|---------------------------|
+            //   | 32            | unset               | ✗ pthread_create (121 s)  |
+            //   | 20            | unset               | ✗ pthread_create ( 88 s)  |
+            //   | 12            | unset               | ✓ 680 s                   |
+            //   | 32            | 1                   | ✓ **448 s**               |
+            //
+            // ⛔ THE WIDTH IS THE WRONG LEVER, and not merely the slower one: width 32 with no cap
+            // SUCCEEDS on one pod (471 s) and fails on another, so any width constant is tuned to one
+            // host's quota. A per-child cap is host-independent.
+            //
+            // ⚠️ NOT CLAIMED: that those 192 threads do no work. `pcpu` sampled ~105 % per dxp, but that
+            // is instantaneous and a bursty pool would look the same. The 448 s vs 680 s above is the
+            // evidence that 1 is not slower here — not the thread count.
+            .env("DT_PARALLEL_THREADS", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // What `Command::output()` did implicitly, and spawning by hand does NOT: dxp gets EOF
