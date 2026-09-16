@@ -128,20 +128,40 @@ impl Dsc2Store<'_, '_> {
     /// every entry of it names a layout dim — [`v1::SplatDims`](crate::schedule::ddc::v1::SplatDims)'
     /// own note.
     ///
-    /// ⛔ TOTAL, AND BOTH STOPS ARE `.at()`s: an lds this list does not hold, and the
-    /// `dataFormat_` of `INVALID` [`v1::TransferLds`](crate::schedule::ddc::v1::TransferLds) has no
-    /// spelling for. See [`v1::Dsc2Store::transfer_operands`] for why neither may be an absent lds
-    /// instead.
+    /// ⛔ TOTAL, AND EVERY STOP IS A THROW OF THE REFERENCE'S OWN — ⛔⛔ NOT AN EMPTY, WHICH IS THE
+    /// WHOLE POINT: entry 126 turns this value straight into `unitTimeTransferChunkSize_`, so a
+    /// defaulted [`StickDims`] or an empty splat set does not narrow the answer, it EMITS A DIFFERENT
+    /// TRANSFER — one that moves no elements, or one that is not a splat when it is. The four:
+    ///
+    ///   * `labeledDs_.at(ldsIdx)` — the throw entry 126 reaches unguarded (`ddc/ddcv1.cpp:490`);
+    ///   * `getStickSizes(lds.dsType_, ..)` opens with `primaryDsInfo_.at(dsType)`
+    ///     (`dsc/dsc2.cpp:4077`), so a `dsType_` that table has no row for throws THERE, and an empty
+    ///     stick would instead push NO chunks at all;
+    ///   * `getLayoutDims`' own `DT_CHECK` that the layout order is non-empty (`dsc/dsc2.cpp:4007`) —
+    ///     needed here because [`crate::schedule::l3::dsc::LabeledDs`] exposes `scale(dim)` and no
+    ///     whole-`scale_` accessor, so the layout order is the only way to enumerate the `-2` set that
+    ///     `is_any_of(-2, lds.scale_)` walks positionally. ⭐ AN `l3::dsc` ACCESSOR FOR `scales`
+    ///     WOULD REMOVE THIS ONE;
+    ///   * a `dataFormat_` of `INVALID`, which
+    ///     [`v1::TransferLds`](crate::schedule::ddc::v1::TransferLds)`::format` has no spelling for —
+    ///     the ⚠️ DIVERGENCE [`v1::Dsc2Store::transfer_operands`]' second stop states.
     fn transfer_lds(&self, lds: LdsIdx, transfer: NodeId) -> v1::TransferLds {
         self.dsc_facts().with_dsc(|dsc| {
             let held = dsc.labeled_ds.at(lds).unwrap_or_else(|| {
                 panic!(
                     "v1::Dsc2Store::transfer_operands: labeledDs_.at({lds:?}) throws for the end \
-                     {transfer:?} names"
+                     {transfer:?} names (ddc/ddcv1.cpp:490)"
                 )
             });
             v1::TransferLds {
-                stick: ddc_state::stick_dims_of(dsc, lds).unwrap_or_default(),
+                stick: ddc_state::stick_dims_of(dsc, lds).unwrap_or_else(|| {
+                    panic!(
+                        "v1::Dsc2Store::transfer_operands: getStickSizes' own \
+                         primaryDsInfo_.at(dsType_) (dsc/dsc2.cpp:4077) has no row for \
+                         labeledDs_.at({lds:?})'s dsType_ — an empty stick would push NO \
+                         unitTimeTransferChunkSize_ and move nothing"
+                    )
+                }),
                 splat_dims: crate::schedule::ddc::v1::SplatDims(
                     dsc.layout_dims
                         .get(&lds)
@@ -151,13 +171,21 @@ impl Dsc2Store<'_, '_> {
                                 .filter(|dim| held.scale(*dim) == Some(tr::Scale::StickDim))
                                 .collect()
                         })
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "v1::Dsc2Store::transfer_operands: getLayoutDims DT_CHECKs a \
+                                 non-empty layout order (dsc/dsc2.cpp:4007) and this DSC states none \
+                                 for {lds:?} — `scale_`'s -2 set cannot be enumerated without it, \
+                                 and an EMPTY set would say 'not a splat' and change \
+                                 replicationFactor_"
+                            )
+                        }),
                 ),
                 format: held.record().data_format.unwrap_or_else(|| {
                     panic!(
                         "v1::Dsc2Store::transfer_operands: labeledDs_.at({lds:?}).dataFormat_ is \
                          DataFormats::INVALID and v1::TransferLds::format is not an Option — see \
-                         that method's third stop"
+                         that method's second stop"
                     )
                 }),
             }
@@ -1308,15 +1336,28 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
     /// that index PRESENT, so the [`Option`] the type keeps for the reference's `ldsIdx < 0` skip is
     /// filled on every arm here rather than being a place to put a different absence.
     ///
-    /// # ⛔ THREE STOPS, AND EACH IS NAMED
+    /// ⭐⭐ THE CLASSIFICATION IS NOT RE-DERIVED HERE — it is
+    /// [`crate::schedule::dsc2::TransferNode::transfer_kind`], which IS `getTransferType()` already
+    /// ported, five arms and its `Invalid` sixth. Restating those five predicates in this carrier
+    /// would be a SECOND `getTransferType` that could disagree with the first; this method's own job
+    /// is only *which side's labelled DS goes with the answer*, and the reference states that
+    /// separately as the ternary `((constantToTensor || noTransToTensor) ?
+    /// dstLdsAndLoopOffsets_.front().myLdsIdx_ : srcLdsAndLoopOffsets_.myLdsIdx_)`
+    /// (`ddc/ddcv1.cpp:481-484`).
     ///
-    /// * **BOTH INDICES SET** is `DT_CHECK_MSG(!(myLdsIdx_ >= 0 && constantId_ >= 0), "Cannot be
-    ///   both labeledDs and constant.")` (`dsc/dsc2.h:742`, `:747`) — `isLabeledDs()` and
-    ///   `isConstant()` each assert it before answering, so this is the reference's abort and not one
-    ///   added here.
-    /// * **`INVALID_TRANSFER_TYPE`** has no arm, which is [`v1::TransferOperands`]' own statement, and
-    ///   the one caller's `DT_CHECK_MSG(.., "Unexpected transfer type.")` (`ddc/ddcv1.cpp:479`) is
-    ///   that same abort reached from the other side.
+    /// ⛔ AND THE BOTH-INDICES-SET `DT_CHECK` IS DELIBERATELY NOT GUARDED, because
+    /// [`crate::schedule::dsc2::DataInfo::is_labeled_ds`] has already settled it: *"the reference
+    /// stops, we do not, and no caller distinguishes"*. A guard here would be this port disagreeing
+    /// with itself about one field.
+    ///
+    /// # ⛔ TWO STOPS
+    ///
+    /// * **`INVALID_TRANSFER_TYPE`** has no arm, which is [`v1::TransferOperands`]' own statement
+    ///   (*"five arms and no sixth"*), and entry 126's `DT_CHECK_MSG(.., "Unexpected transfer
+    ///   type.")` (`ddc/ddcv1.cpp:479`) is that same abort reached from the other side. The
+    ///   `ConstantToConstant`-without-a-`constantId_` case folds into it: `transfer_kind` answers
+    ///   that arm only for `src.is_constant()`, so a missing id there is a defect in this port and
+    ///   not an input.
     /// * **`dataFormat_` OF `INVALID`** on the selected labelled DS cannot be spelled:
     ///   [`v1::TransferLds`](crate::schedule::ddc::v1::TransferLds)`::format` is a
     ///   [`DataFormat`] and not an [`Option`]. ⛔ AND [`None`] WOULD BE THE WRONG ANSWER, not a
@@ -1327,45 +1368,43 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
     ///   (*"No system in place for splatting of data formats with <16b"*), so it processes an
     ///   INVALID-format transfer on every other path and this stops one.
     fn transfer_operands(&self, transfer: NodeId) -> v1::TransferOperands {
+        use crate::schedule::dsc2::TransferKind;
+
         let held = tu::ScheduleSurgery::transfer(self, transfer);
-        let src = held.src.data;
-        let dst = held.dsts.first().data;
-        let both_set = |data: DataInfo| {
-            assert!(
-                !(data.my_lds_idx.is_some() && data.constant_id.is_some()),
-                "v1::Dsc2Store::transfer_operands: {transfer:?} has an end that is both a labelled \
-                 DS and a constant — DT_CHECK_MSG(\"Cannot be both labeledDs and constant.\") \
-                 (dsc/dsc2.h:742)"
-            );
-        };
-        both_set(src);
-        both_set(dst);
-        match (src.my_lds_idx, src.constant_id, dst.my_lds_idx, dst.constant_id) {
-            // `isSrcConstant() && isDstConstant()`.
-            (_, Some(constant), _, Some(_)) => {
+        let kind = held.transfer_kind();
+        // ⭐ THE REFERENCE'S OWN TERNARY, AND NOTHING ELSE. Each arm's predicate already proved the
+        // index it names PRESENT, so [`None`] here is unreachable for the four tensor arms — and it
+        // is still the right spelling for them, because it is exactly the `ldsIdx < 0` skip
+        // [`v1::TransferOperands`] keeps the [`Option`] for.
+        let named = match kind {
+            TransferKind::ConstantToTensor | TransferKind::NoTransferToTensor => {
+                held.dsts.first().data.my_lds_idx
+            }
+            TransferKind::TensorToTensor | TransferKind::NoTransferFromTensor => {
+                held.src.data.my_lds_idx
+            }
+            TransferKind::ConstantToConstant | TransferKind::Invalid => None,
+        }
+        .map(|lds| self.transfer_lds(lds, transfer));
+
+        match (kind, held.src.data.constant_id) {
+            (TransferKind::ConstantToConstant, Some(constant)) => {
                 v1::TransferOperands::ConstantToConstant(self.constant_data(constant, transfer))
             }
-            // `isSrcConstant() && isDstLabeledDs()`.
-            (_, Some(_), Some(lds), _) => {
-                v1::TransferOperands::ConstantToTensor(Some(self.transfer_lds(lds, transfer)))
+            (TransferKind::ConstantToTensor, _) => v1::TransferOperands::ConstantToTensor(named),
+            (TransferKind::TensorToTensor, _) => v1::TransferOperands::TensorToTensor(named),
+            (TransferKind::NoTransferToTensor, _) => {
+                v1::TransferOperands::NoTransferToTensor(named)
             }
-            // `isSrcLabeledDs() && isDstLabeledDs()`.
-            (Some(lds), _, Some(_), _) => {
-                v1::TransferOperands::TensorToTensor(Some(self.transfer_lds(lds, transfer)))
+            (TransferKind::NoTransferFromTensor, _) => {
+                v1::TransferOperands::NoTransferFromTensor(named)
             }
-            // `(!isSrcLabeledDs() && !isSrcConstant()) && isDstLabeledDs()`.
-            (None, None, Some(lds), _) => {
-                v1::TransferOperands::NoTransferToTensor(Some(self.transfer_lds(lds, transfer)))
-            }
-            // `isSrcLabeledDs() && (!isDstLabeledDs() && !isDstConstant())`.
-            (Some(lds), _, None, None) => {
-                v1::TransferOperands::NoTransferFromTensor(Some(self.transfer_lds(lds, transfer)))
-            }
-            // `INVALID_TRANSFER_TYPE` — the caller's own `DT_CHECK_MSG("Unexpected transfer type.")`.
-            _ => panic!(
+            (TransferKind::Invalid | TransferKind::ConstantToConstant, _) => panic!(
                 "v1::Dsc2Store::transfer_operands: {transfer:?} is INVALID_TRANSFER_TYPE — neither \
-                 end is a labelled DS or a constant, which is entry 126's own \
-                 DT_CHECK_MSG(\"Unexpected transfer type.\") (ddc/ddcv1.cpp:479)"
+                 end names a labelled DS or a constant, which is entry 126's own \
+                 DT_CHECK_MSG(\"Unexpected transfer type.\") (ddc/ddcv1.cpp:479); a \
+                 CONSTANT_TO_CONSTANT reaching this arm means transfer_kind answered it for an \
+                 unset src constantId_"
             ),
         }
     }
@@ -1591,3 +1630,549 @@ fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule:
     }
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐⭐ THE FIVE ANSWERS THIS FILE GAINED, AGAINST THE REFERENCE'S OWN VALUES.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod authority_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroU32;
+
+    use sys_arch_spec::arch_enums::SenComponent;
+
+    use crate::arch::Elements;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+        Extent, PrimaryDim, StickDims,
+    };
+    use crate::formats::DataFormat;
+    use crate::schedule::ddc::fold::{ConstIdx, NodeId, NodeKind};
+    use crate::schedule::ddc::transformation::{self as tr, DsType, Scale};
+    use crate::schedule::ddc::transformation_util as tu;
+    use crate::schedule::ddc::v1;
+    use crate::schedule::ddl::conversion as conv;
+    use crate::schedule::ddl::ops::DdlComputeType;
+    use crate::schedule::dsc2::{
+        ComputeNode, DataInfo, Dsts, InstrAttribute, LayoutDims, LdsIdx, NodeName, NumChunks,
+        Operand, ReplicationFactor, TransferNode, TransferPadding,
+    };
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DscIdx, DscList,
+        FilledDims, LabeledDs, LabeledDsList, NamedDims, Pinning, PrimaryDsInfo, StageDims,
+        SuperDsc,
+    };
+    use crate::schedule::l3::dl_ops::AddressFoldCoords;
+    use crate::units::{Core, NumFolds};
+
+    use super::super::ddc_sites::Dsc2Ddl;
+    use super::super::ddc_state::Dsc2State;
+    use super::super::state::DscState;
+    use super::Dsc2Store;
+
+    /// `labeledDs_[0]` — an `INPUT`, HBM-PINNED so [`DscState::seeded`] mints its `ALLOCATE` and files
+    /// it in `memOrg_[HBM]`, with `scale_` stating `-2` on `X` and a non-negative scale on `Y`.
+    const TENSOR: LdsIdx = LdsIdx(0);
+    /// `labeledDs_[1]` — a `KERNEL`, pinned NOWHERE and carrying a DIFFERENT `dataFormat_`, so *which
+    /// side's labelled DS an arm names* is observable rather than a coincidence.
+    const KERNEL: LdsIdx = LdsIdx(1);
+
+    fn core(index: u32) -> Core {
+        Core::checked(index).expect("a core in range")
+    }
+
+    /// One stage stating two extents — the shape [`FilledDims::of`] demands.
+    fn a_stage() -> DataStage {
+        let mut dims = StageDims::default();
+        dims.extents.insert(PrimaryDim::X, Extent(4));
+        dims.extents.insert(PrimaryDim::Y, Extent(2));
+        let named = NamedDims {
+            name: crate::schedule::ddc::transformation_util::StageName::default(),
+            dims: FilledDims::of(dims).expect("a stage that states a dim"),
+        };
+        DataStage {
+            ss: named.clone(),
+            el: named,
+        }
+    }
+
+    /// TWO LABELLED DSs, ONE HBM-PINNED, WITH DISTINCT STICKS AND DISTINCT FORMATS.
+    fn a_dsc() -> DesignSpaceConfig {
+        let hbm_pinned = Pinning {
+            mem_org: BTreeMap::from([(SenComponent::Hbm, true)]),
+            lx: false,
+            lx_padded: false,
+        };
+        // `scale_`: `-2` on X (a STICK dim, entry 126's splat test) and `1.0` on Y.
+        let mut tensor = LabeledDs::new(
+            DsType::Input,
+            vec![(PrimaryDim::X, Scale::StickDim), (PrimaryDim::Y, Scale::Sized(1.0))],
+            TENSOR,
+            hbm_pinned,
+        );
+        tensor.set_data_format(DataFormat::Sen169Fp16);
+        let mut kernel = LabeledDs::new(
+            DsType::Kernel,
+            vec![(PrimaryDim::X, Scale::Sized(1.0))],
+            KERNEL,
+            Pinning::default(),
+        );
+        // ⭐ A DIFFERENT FORMAT FROM THE TENSOR'S — this is what makes "which side" a VALUE.
+        kernel.set_data_format(DataFormat::Sen143Fp8);
+        let two = CoreletsUsed::new(NonZeroU32::new(2).expect("two corelets"));
+        DesignSpaceConfig {
+            ddc: crate::schedule::l3::dsc::DdcFacts {
+                // `constantInfo_[7]` — four elements of FP32, which is entry 126's
+                // `numElemInConst`/`dataFormat_` pair.
+                constants: BTreeMap::from([(
+                    ConstIdx(7),
+                    crate::schedule::l3::dsc::ConstantInfo {
+                        name: v1::StorageName("k".to_owned()),
+                        data_format: Some(DataFormat::IeeeFp32),
+                        data: vec![1, 2, 3, 4],
+                        is_data_symbolic: false,
+                        allocations: BTreeMap::new(),
+                    },
+                )]),
+                ..crate::schedule::l3::dsc::DdcFacts::default()
+            },
+            gtr_ids_used: BTreeSet::new(),
+            corelets_used: two,
+            corelets_used_dsc2: Some(two),
+            corelet_shares: BTreeMap::new(),
+            // `primaryDsInfo_.at(dsType_)` — `getStickSizes`' own `.at()` (`dsc/dsc2.cpp:4077`),
+            // keyed by DS TYPE and not by lds, which is why the two entries differ.
+            primary_ds_info: BTreeMap::from([
+                (
+                    DsType::Input,
+                    PrimaryDsInfo {
+                        layout: LayoutDims::new(PrimaryDim::X, vec![PrimaryDim::Y]),
+                        stick: StickDims(vec![(PrimaryDim::X, Elements(64))]),
+                    },
+                ),
+                (
+                    DsType::Kernel,
+                    PrimaryDsInfo {
+                        layout: LayoutDims::new(PrimaryDim::X, vec![]),
+                        stick: StickDims(vec![(PrimaryDim::X, Elements(32))]),
+                    },
+                ),
+            ]),
+            core_ids_used: CoreIdsUsed::new(core(0), vec![]),
+            layout_dims: BTreeMap::from([
+                (TENSOR, LayoutDims::new(PrimaryDim::X, vec![PrimaryDim::Y])),
+                (KERNEL, LayoutDims::new(PrimaryDim::X, vec![])),
+            ]),
+            data_stages: DataStages::new(a_stage(), a_stage()),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+            full_padding: BTreeMap::new(),
+            labeled_ds: LabeledDsList::new(tensor, vec![kernel]),
+        }
+    }
+
+    /// One end — `src_.unit_`/`dstVias_.at(i).loc_` zipped with its `..LdsAndLoopOffsets_`.
+    fn end(unit: SenComponent, storage: SenComponent, data: DataInfo) -> Operand {
+        Operand {
+            unit,
+            storage,
+            data,
+        }
+    }
+
+    /// `myLdsIdx_ = lds`, every other `DataInfo` field at its own initializer.
+    fn of_lds(lds: LdsIdx) -> DataInfo {
+        DataInfo {
+            data_connect: None,
+            my_lds_idx: Some(lds),
+            constant_id: None,
+            latch_data_id: None,
+        }
+    }
+
+    /// `constantId_ = id`, `myLdsIdx_ = -1`.
+    fn of_constant(id: ConstIdx) -> DataInfo {
+        DataInfo {
+            data_connect: None,
+            my_lds_idx: None,
+            constant_id: Some(id),
+            latch_data_id: None,
+        }
+    }
+
+    /// A fresh `dsc2::TransferNode` between two ends — every other field its own initializer.
+    fn a_transfer(name: &str, src: Operand, dst: Operand) -> TransferNode {
+        TransferNode {
+            name: NodeName(name.to_owned()),
+            src,
+            dsts: Dsts::new(dst, Vec::new()),
+            replication_factor: ReplicationFactor(1),
+            unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks(1),
+            padding: TransferPadding::default(),
+            src_indirect: None,
+            dst_indirect: None,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
+        }
+    }
+
+    /// ⭐⭐⭐ EVERY ANSWER THIS FILE GAINED, READ OFF A TREE THE DDL EXPANSION'S OWN WRITERS FILLED.
+    ///
+    /// ⛔ THE VALUES ARE THE REFERENCE'S, NOT OURS. The two labelled DSs carry DIFFERENT
+    /// `dataFormat_`s and DIFFERENT stick extents, so every assertion that names one of them would
+    /// FAIL if the arm took the other side — which is the whole content of `getTransferType`'s
+    /// ternary (`ddc/ddcv1.cpp:481-484`).
+    #[test]
+    fn the_five_gained_answers_carry_the_references_own_values() {
+        let sdsc = SuperDsc::new(
+            DscList::new(a_dsc(), Vec::new()),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let l3 = DscState::seeded(&sdsc);
+        // ⭐ THE SEED: the root block plus ONE `ALLOCATE`, because `TENSOR` is HBM-pinned and `KERNEL`
+        // is pinned nowhere. That allocate node is what `destination_allocation` must find.
+        assert_eq!(
+            l3.node_count(),
+            2,
+            "root_level_operations plus the HBM allocation of the one pinned labelled DS: {:?}",
+            l3.dsc(DscIdx(0)).expect("the one DSC").names()
+        );
+        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()], &[v1::StorageName("d".to_owned())]);
+
+        // ── MINT INTO THE LIVE TREE through the DDL expansion's own writer ─────────────────────
+        let head = l3
+            .dsc(DscIdx(0))
+            .expect("the one DSC's tree")
+            .with(|tree| tree.head())
+            .expect("a seeded tree has a head");
+        let (tensor_to_tensor, constant_to_tensor, compute, loop_node, condition) = {
+            let mut ddl = Dsc2Ddl::new(&state, DscIdx(0));
+            let tensor_to_tensor = conv::ScheduleWrites::add_transfer(
+                &mut ddl,
+                head,
+                a_transfer(
+                    "t2t",
+                    end(SenComponent::Lxlu, SenComponent::Lx, of_lds(TENSOR)),
+                    end(SenComponent::Pe, SenComponent::Pelrf, of_lds(KERNEL)),
+                ),
+            )
+            .expect("the tree took the transfer");
+            // ⛔ SOURCE IS THE CONSTANT AND THE DESTINATION IS `KERNEL`, so the arm must name
+            // `KERNEL`'s FP8 — naming the source's lds is unspellable and naming `TENSOR` is the bug
+            // this catches.
+            let constant_to_tensor = conv::ScheduleWrites::add_transfer(
+                &mut ddl,
+                head,
+                a_transfer(
+                    "c2t",
+                    end(
+                        SenComponent::Constant,
+                        SenComponent::Lx,
+                        of_constant(ConstIdx(7)),
+                    ),
+                    end(SenComponent::Pe, SenComponent::Hbm, of_lds(KERNEL)),
+                ),
+            )
+            .expect("the tree took the transfer");
+            let compute = conv::ScheduleWrites::add_compute(
+                &mut ddl,
+                head,
+                ComputeNode {
+                    name: NodeName("mm".to_owned()),
+                    op: DdlComputeType::Fma16,
+                    ex_unit: SenComponent::Pe,
+                    inputs: vec![end(SenComponent::Lx, SenComponent::Lx, of_lds(KERNEL))],
+                    // ⭐ THE OUTPUT'S **UNIT** IS `HBM`, which is the key
+                    // `memOrg_.at(outputs_.at(idx))` uses — NOT its `storage`, which is `LX` here so
+                    // that a port reading the wrong half finds nothing.
+                    outputs: vec![end(SenComponent::Hbm, SenComponent::Lx, of_lds(TENSOR))],
+                    num_folds_engaged: NumFolds::ONE,
+                    data_format: Some(DataFormat::Sen169Fp16),
+                    instr_attribute: InstrAttribute::default(),
+                },
+            )
+            .expect("the tree took the compute");
+            let loop_node = conv::ScheduleWrites::add_block(&mut ddl, head, NodeName("b".to_owned()))
+                .expect("the tree took the block");
+            let condition = conv::ScheduleWrites::add_condition(
+                &mut ddl,
+                head,
+                crate::schedule::dsc2::ConditionNode {
+                    name: NodeName("cond".to_owned()),
+                    loop_cond: crate::schedule::dsc2::LoopCondComposite::default(),
+                    core_cl_cond: BTreeMap::from([(
+                        core(0),
+                        BTreeSet::from([crate::units::Corelet::at::<0>()]),
+                    )]),
+                    then_region: Vec::new(),
+                    else_region: Vec::new(),
+                },
+            )
+            .expect("the tree took the condition");
+            (
+                tensor_to_tensor,
+                constant_to_tensor,
+                compute,
+                loop_node,
+                condition,
+            )
+        };
+
+        let store = Dsc2Store::new(&state, DscIdx(0), AddressFoldCoords::flat());
+
+        // ── 1. `hoist_parent` — `nodeType_` AND NOTHING ELSE ──────────────────────────────────
+        // ⛔ A COMPUTE PARENT IS `Other`, which is the `continue` at
+        // `ddc/ddc_transformation.cpp:1503-1505`. A HoistParent with a Compute arm is what the old
+        // refusal claimed the trait had.
+        assert_eq!(
+            tr::HoistTransfers::hoist_parent(&store, condition),
+            tr::HoistParent::Condition,
+            "nodeType_ == CONDITION takes collectLoopReferences' arm"
+        );
+        assert_eq!(
+            tr::HoistTransfers::hoist_parent(&store, compute),
+            tr::HoistParent::Other,
+            "a COMPUTE parent takes the same `continue` a BLOCK does"
+        );
+        assert_eq!(
+            tr::HoistTransfers::hoist_parent(&store, loop_node),
+            tr::HoistParent::Other,
+            "a BLOCK parent is Other"
+        );
+        assert_eq!(
+            tr::HoistTransfers::hoist_parent(&store, head),
+            tr::HoistParent::Other,
+            "the head block is Other, not the walk's Loop arm"
+        );
+
+        // ── 2. `v1::LoopOffsets::compute` — the whole node off `Kind::Compute` ─────────────────
+        let held = v1::LoopOffsets::compute(&store, compute);
+        assert_eq!(held.op, DdlComputeType::Fma16, "type_");
+        assert_eq!(held.ex_unit, SenComponent::Pe, "exUnit_");
+        assert_eq!(
+            held.inputs.first().map(|input| input.data.my_lds_idx),
+            Some(Some(KERNEL)),
+            "inputs_ zipped with inputsLdsAndLoopOffsets_"
+        );
+
+        // ── 3. `destination_allocation` — `getAllocation(dst, dst storage, true)` ──────────────
+        let seeded = l3
+            .dsc(DscIdx(0))
+            .expect("the one DSC's tree")
+            .with(|tree| tree.children(head).first().copied())
+            .expect("the seeded HBM allocation is the head's first child");
+        assert_eq!(
+            tu::TransferMoves::destination_allocation(
+                &store,
+                &end(SenComponent::Pe, SenComponent::Hbm, of_lds(TENSOR)),
+            ),
+            Some(seeded),
+            "memOrg_[HBM].allocateNode_ of the pinned labelled DS"
+        );
+        // ⛔ `allowMissingAlloc = true`'s `nullptr`: `KERNEL` is pinned nowhere, so its `memOrg_`
+        // names no HBM entry.
+        assert_eq!(
+            tu::TransferMoves::destination_allocation(
+                &store,
+                &end(SenComponent::Pe, SenComponent::Hbm, of_lds(KERNEL)),
+            ),
+            None,
+            "a labelled DS with no memOrg_ entry is the reference's nullptr, not a stop"
+        );
+        // ⛔ AND `dsc2::memories.count(storage) == 0` (`dsc/dsc2.cpp:2597-2603`): the PE is a unit,
+        // not a memory.
+        assert_eq!(
+            tu::TransferMoves::destination_allocation(
+                &store,
+                &end(SenComponent::Pe, SenComponent::Pe, of_lds(TENSOR)),
+            ),
+            None,
+            "a storage that is not a memory is the reference's nullptr"
+        );
+
+        // ── 4. `output_allocation` — keyed by the output's UNIT, not its storage ───────────────
+        let alloc = crate::schedule::ddc::transformation_util::AllocationsByNode::allocation_of(
+            &store, seeded,
+        )
+        .expect("the seeded node names an allocation");
+        assert_eq!(
+            tr::OffsetAdjustment::output_allocation(&store, compute, tr::OutputIdx(0)),
+            Some(alloc),
+            "labeledDs_.at(outputsLdsAndLoopOffsets_.at(0).myLdsIdx_).memOrg_.at(outputs_.at(0))"
+        );
+        // ⛔ PAST THE END OF `outputs_` is the reference's `.at()` and this port's [`None`], which
+        // entry 108's own doc calls a stated divergence.
+        assert_eq!(
+            tr::OffsetAdjustment::output_allocation(&store, compute, tr::OutputIdx(1)),
+            None,
+            "an output index past the end"
+        );
+
+        // ── 5. `transfer_operands` — `getTransferType()` AND WHICH SIDE'S LDS ─────────────────
+        // ⭐ TENSOR_TO_TENSOR NAMES THE **SOURCE**, so the stick is the INPUT's 64 and the format is
+        // the INPUT's FP16 — the destination is `KERNEL`, whose stick is 32 and whose format is FP8.
+        let said = v1::Dsc2Store::transfer_operands(&store, tensor_to_tensor);
+        let v1::TransferOperands::TensorToTensor(Some(lds)) = said else {
+            panic!("a labelled-DS-to-labelled-DS transfer is TENSOR_TO_TENSOR: {said:?}");
+        };
+        assert_eq!(
+            lds.stick,
+            StickDims(vec![(PrimaryDim::X, Elements(64))]),
+            "getStickSizes(SOURCE lds.dsType_) — 32 here would mean the arm took the destination"
+        );
+        assert_eq!(
+            lds.format,
+            DataFormat::Sen169Fp16,
+            "the SOURCE's dataFormat_ — FP8 would mean the arm took the destination"
+        );
+        assert_eq!(
+            lds.splat_dims.0,
+            BTreeSet::from([PrimaryDim::X]),
+            "`is_any_of(-2, scale_)` as dims: X is Scale::StickDim and Y is not"
+        );
+
+        // ⭐ CONSTANT_TO_TENSOR NAMES THE **DESTINATION**, which is `KERNEL` — so the same two values
+        // must come back as 32 and FP8. This pair is the ternary, carried as values.
+        let said = v1::Dsc2Store::transfer_operands(&store, constant_to_tensor);
+        let v1::TransferOperands::ConstantToTensor(Some(lds)) = said else {
+            panic!("a constant-to-labelled-DS transfer is CONSTANT_TO_TENSOR: {said:?}");
+        };
+        assert_eq!(
+            lds.stick,
+            StickDims(vec![(PrimaryDim::X, Elements(32))]),
+            "getStickSizes(DESTINATION lds.dsType_) — 64 would mean the arm took the source"
+        );
+        assert_eq!(
+            lds.format,
+            DataFormat::Sen143Fp8,
+            "the DESTINATION's dataFormat_"
+        );
+        assert!(
+            lds.splat_dims.0.is_empty(),
+            "KERNEL's scale_ states no -2"
+        );
+    }
+
+    /// ⭐ THE CONSTANT ARM, WHOSE WHOLE POINT IS THAT `l3::dsc` **DOES** PROJECT `constantInfo_` —
+    /// `data_.getSingleData().size()` and `dataFormat_`, carried as the two divisors entry 126 forms
+    /// `replicationFactor_` from (`ddc/ddcv1.cpp:456-458`).
+    #[test]
+    fn constant_to_constant_carries_the_constants_own_element_count_and_format() {
+        let sdsc = SuperDsc::new(
+            DscList::new(a_dsc(), Vec::new()),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let l3 = DscState::seeded(&sdsc);
+        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()], &[v1::StorageName("d".to_owned())]);
+        let head = l3
+            .dsc(DscIdx(0))
+            .expect("the one DSC's tree")
+            .with(|tree| tree.head())
+            .expect("a seeded tree has a head");
+        let transfer = {
+            let mut ddl = Dsc2Ddl::new(&state, DscIdx(0));
+            conv::ScheduleWrites::add_transfer(
+                &mut ddl,
+                head,
+                a_transfer(
+                    "c2c",
+                    end(
+                        SenComponent::Constant,
+                        SenComponent::Lx,
+                        of_constant(ConstIdx(7)),
+                    ),
+                    end(
+                        SenComponent::Constant,
+                        SenComponent::Lx,
+                        of_constant(ConstIdx(7)),
+                    ),
+                ),
+            )
+            .expect("the tree took the transfer")
+        };
+        let store = Dsc2Store::new(&state, DscIdx(0), AddressFoldCoords::flat());
+        let said = v1::Dsc2Store::transfer_operands(&store, transfer);
+        let v1::TransferOperands::ConstantToConstant(constant) = said else {
+            panic!("a constant-to-constant transfer is CONSTANT_TO_CONSTANT: {said:?}");
+        };
+        assert_eq!(
+            constant.elements.get(),
+            4,
+            "constantInfo_.at(7).data_.getSingleData().size()"
+        );
+        assert_eq!(
+            constant.format,
+            DataFormat::IeeeFp32,
+            "constantInfo_.at(7).dataFormat_"
+        );
+    }
+
+    /// ⛔ AND THE `nodeType_` DISPATCH IS TOTAL: a node this tree does not hold is
+    /// [`tr::HoistParent::Other`], the arm the reference's own `continue` takes — NOT a stop.
+    #[test]
+    fn hoist_parent_of_a_node_this_tree_does_not_hold_is_other() {
+        let sdsc = SuperDsc::new(
+            DscList::new(a_dsc(), Vec::new()),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let l3 = DscState::seeded(&sdsc);
+        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()], &[v1::StorageName("d".to_owned())]);
+        let store = Dsc2Store::new(&state, DscIdx(0), AddressFoldCoords::flat());
+        assert_eq!(
+            tr::HoistTransfers::hoist_parent(&store, NodeId(9_999)),
+            tr::HoistParent::Other,
+            "an id this tree issued no node for"
+        );
+    }
+
+    /// ⛔ A REFERENCE TO `NodeKind` KEEPS THIS MODULE'S IMPORT LIVE — the census kinds the mint above
+    /// produces, asserted so the fixture cannot silently stop minting them.
+    #[test]
+    fn the_fixture_mints_the_kinds_the_answers_read() {
+        let sdsc = SuperDsc::new(
+            DscList::new(a_dsc(), Vec::new()),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let l3 = DscState::seeded(&sdsc);
+        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()], &[v1::StorageName("d".to_owned())]);
+        let head = l3
+            .dsc(DscIdx(0))
+            .expect("the one DSC's tree")
+            .with(|tree| tree.head())
+            .expect("a seeded tree has a head");
+        {
+            let mut ddl = Dsc2Ddl::new(&state, DscIdx(0));
+            conv::ScheduleWrites::add_compute(
+                &mut ddl,
+                head,
+                ComputeNode {
+                    name: NodeName("mm".to_owned()),
+                    op: DdlComputeType::Fma16,
+                    ex_unit: SenComponent::Pe,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    num_folds_engaged: NumFolds::ONE,
+                    data_format: None,
+                    instr_attribute: InstrAttribute::default(),
+                },
+            )
+            .expect("the tree took the compute");
+        }
+        // ⭐ `compute: 1` — the census that used to read `compute: 0` because the DDL walk minted into
+        // a dropped copy (`5ee670017`).
+        assert_eq!(
+            l3.dsc(DscIdx(0)).expect("the one DSC").kinds().get(&NodeKind::Compute),
+            Some(&1),
+            "Kind::Compute reaches the LIVE tree"
+        );
+    }
+}
