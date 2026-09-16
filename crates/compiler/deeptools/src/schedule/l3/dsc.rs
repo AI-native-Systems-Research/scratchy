@@ -868,7 +868,7 @@ impl SuperDsc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PadElems(pub u32);
 
-/// A DIM'S FRONT AND BACK PADDING — `padFront_`/`padBack_` (`dsc/dims.h:100`), whose paired `-1` is
+/// A DIM'S FRONT AND BACK PADDING — `padFront_`/`padBack_` (`dsc/dims.h:135-136`), whose paired `-1`
 /// not a size but the statement that CHUNKING VOIDED THEM (`L3DlOpsScheduler.cpp:137`).
 ///
 /// ⭐ `if (padBack_ != 0 || padFront_ != 0)` IS THIS ENUM: voiding an unpadded dim is not a case the
@@ -1163,11 +1163,11 @@ pub struct StageDims {
     ///
     /// ⛔ THE OUTER KEY IS THE CORELET AND ONLY THE CORELETS THE SPLIT NAMES ARE PRESENT, which is
     /// what makes `primaryDimToVal_st`'s `clId = -1` arm read the FIRST corelet and not the core
-    /// (`dsc/dims.cpp:668-675`).
+    /// (`dsc/dims.cpp:673-675`).
     pub row_split: BTreeMap<PrimaryDim, BTreeMap<Corelet, Vec<Extent>>>,
     /// `peSfpSplit_` (`dsc/dims.h:210-214`) — per corelet, the PE's and the SFP's shares.
     ///
-    /// ⭐ BOTH SIDES ARE ALWAYS PRESENT, so `.at(peOrSfp)`'s throw (`dsc/dims.cpp:686`) is
+    /// ⭐ BOTH SIDES ARE ALWAYS PRESENT, so `.at(peOrSfp)`'s throw (`dsc/dims.cpp:687`, `:691`, `:694`) is
     /// discharged by [`PeSfpShares`] rather than checked; its own doc names the three writers.
     pub pe_sfp_split: BTreeMap<PrimaryDim, BTreeMap<Corelet, PeSfpShares>>,
 }
@@ -1195,6 +1195,10 @@ impl StageDims {
     /// [`Self::calculate_padded`]. `DT_CHECK(dimDensity > 0.0 && dimDensity <= 1.0)`
     /// (`dsc/dims.cpp:558`) is discharged by [`ScaleBlock`], whose reciprocal cannot leave that
     /// range.
+    ///
+    /// ⭐ AND THE BODY'S THIRD ABORT, `DT_ERROR("Invalid PrimaryDim")` (`dsc/dims.cpp:553-556`), IS
+    /// DISCHARGED BY THE ENUM AS IT ALREADY IS IN THE REFERENCE: the twelve arms cover every
+    /// `PrimaryDimTypes` but the `PrimaryDimTypesCount` terminator (`dsc/dims.h:34-48`).
     ///
     /// ⛔ DIVERGENCE: INTEGER DIVISION where the reference multiplies by the `double` `1.0/blkSize`
     /// and truncates — equal for every power-of-two block, one short for a block of three.
@@ -1339,7 +1343,7 @@ impl StageDims {
 
     /// `rowSplit_.at(dim)` READ AT ONE ROW — one named corelet's share, else the SUM over the
     /// corelets the split names when `coreletSplit_` names the dim too, else the FIRST corelet's
-    /// share alone (`dsc/dims.cpp:665-675`).
+    /// share alone (`dsc/dims.cpp:666-676`).
     fn row_share(
         &self,
         dim: PrimaryDim,
@@ -1362,7 +1366,7 @@ impl StageDims {
     }
 
     /// `peSfpSplit_.at(dim)` READ ON ONE SIDE — the same three-way over the PE's or the SFP's half
-    /// (`dsc/dims.cpp:684-694`).
+    /// (`dsc/dims.cpp:686-696`).
     fn pe_sfp_share(
         &self,
         dim: PrimaryDim,
@@ -1389,15 +1393,15 @@ impl StageDims {
     /// re-expressed in granularity units where asked, density-scaled, then rewritten by
     /// [`Self::calculate_padded`] — the same tail as the corelet view.
     ///
-    /// ⛔ `clId = -1` IS A SUM ONLY WHERE THE DIM IS ALSO CORELET-SPLIT (`dsc/dims.cpp:668-674`);
+    /// ⛔ `clId = -1` IS A SUM ONLY WHERE THE DIM IS ALSO CORELET-SPLIT (`dsc/dims.cpp:669-675`);
     /// otherwise it is the FIRST corelet's share alone. Summing unconditionally would multiply a
     /// single-corelet stage's extent by the corelet count.
     ///
     /// ⛔ EVERY `.at` IS A STOP, NOT A FALL-THROUGH, exactly as in [`Self::corelet_extent`]: a
-    /// corelet the split does not name (`:666`) and a row past the end of its vector both throw, and
+    /// corelet the split does not name (`:667`) and a row past the end of its vector both throw, and
     /// answering the whole core there hands one row the core's extent.
     ///
-    /// ⛔ AND `rowSplit_.at(d).begin()` ON AN EMPTY INNER MAP (`:672`) IS [`None`] — the reference
+    /// ⛔ AND `rowSplit_.at(d).begin()` ON AN EMPTY INNER MAP (`:674`) IS [`None`] — the reference
     /// dereferences its end iterator there.
     ///
     /// ⭐ `PELRF -> PE` AND `SFPLRF -> SFP` (`:659-663`) ARE DISCHARGED BY THE TYPE: [`VectorComp`]
@@ -3116,6 +3120,67 @@ mod tests_e009_e010 {
             None
         );
     }
+
+    /// e009 — CONSTRUCTED, no g0 entry states a non-zero pad count: the NON-WINDOW span
+    /// `val + padFront_ + padBack_ (+ unneededPad_)` (`dsc/dims.cpp:584-588`), and its two-arm
+    /// `else` (`:589-592`).
+    ///
+    /// ⛔ WITHOUT THIS THE FORMULA IS UNPINNED. `sdsc_14`'s 18 `paddingSizes_` entries are all-zero
+    /// on every count, so the reference's own `totalSize_` export equals the bare extent, and
+    /// reducing this arm to `val` leaves every other assertion in this module green.
+    #[test]
+    fn the_non_window_span_is_the_extent_plus_both_edges_and_then_the_unneeded_pad() {
+        let mut padded = core_stage();
+        padded.extents.insert(PrimaryDim::Out, Extent(100));
+        padded.padding.insert(
+            PrimaryDim::Out,
+            DimPadding {
+                sizes: PadSizes::of(PadElems(3), PadElems(5)),
+                unneeded: UnneededPad {
+                    total: PadElems(7),
+                    front: PadElems(2),
+                    back: PadElems(5),
+                },
+                ..DimPadding::default()
+            },
+        );
+
+        // `PADDED_FULLSPAN` is the two edges alone (`:587-588`): 100 + 3 + 5 = 108.
+        assert_eq!(
+            padded.padded_extent(PrimaryDim::Out, PadType::PaddedFullSpan),
+            Some(Extent(108))
+        );
+        // `PADDED_FULLSPAN_WUNNEEDED` adds `unneededPad_` and NOT its two halves (`:584-586`):
+        // 108 + 7 = 115, not 108 + 2 + 5.
+        assert_eq!(
+            padded.padded_extent(PrimaryDim::Out, PadType::PaddedFullSpanWUnneeded),
+            Some(Extent(115))
+        );
+        // *"Unsupported padding type requested for padded non-window operation"* (`:589-592`) — the
+        // three window spellings have no non-window formula at all.
+        for pad in [
+            PadType::PaddedWZeroPad,
+            PadType::PaddedNoZeroPad,
+            PadType::LoweredPadded,
+        ] {
+            assert_eq!(padded.padded_extent(PrimaryDim::Out, pad), None);
+        }
+
+        // ⭐ AND `stride_` IS NOT READ HERE (`:584-588` against `:599-609`): a stride of 4 on the
+        // same dim leaves both spans exactly where they were.
+        let edges = padded.padding[&PrimaryDim::Out];
+        padded.padding.insert(
+            PrimaryDim::Out,
+            DimPadding {
+                stride: Stride::new(4).expect("a moving stride"),
+                ..edges
+            },
+        );
+        assert_eq!(
+            padded.padded_extent(PrimaryDim::Out, PadType::PaddedFullSpan),
+            Some(Extent(108))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3358,7 +3423,7 @@ mod tests_e012 {
     //! is empty on all 4,850 — so the SUM arm and the PE/SFP arm are CONSTRUCTED from the
     //! reference's own code and marked as such.
 
-    use super::StageDims;
+    use super::{Granularity, MaxSize, StageDims, Symbolic, SymbolicDimInfo};
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
         Extent, PrimaryDim, VectorComp,
     };
@@ -3366,6 +3431,7 @@ mod tests_e012 {
     use crate::schedule::ddc::v1::{DimSample, PeSfpShares};
     use crate::units::{Corelet, Row};
     use std::collections::BTreeMap;
+    use std::num::NonZeroU32;
 
     /// `g0/debug/sdsc_100/sdsc.json`'s `dataStageParam_["0"].ss_` — `name_: "core"`, `in_: 64`,
     /// `out_: 64`, `mb_: 1`, `y_: 1`, `i_: -1`, `rowSplit_: {"in": {"0": [8, 8, 8, 8, 8, 8, 8, 8]}}`
@@ -3377,6 +3443,7 @@ mod tests_e012 {
                 (PrimaryDim::Out, Extent(64)),
                 (PrimaryDim::Mb, Extent(1)),
                 (PrimaryDim::Y, Extent(1)),
+                (PrimaryDim::I, Extent(-1)),
             ]),
             row_split: BTreeMap::from([(
                 PrimaryDim::In,
@@ -3429,7 +3496,7 @@ mod tests_e012 {
         );
 
         // ⛔ THE NEGATIVE CONTROL — corelet 1 is not a key of that inner map, and the reference is
-        // already committed to `.at(clId)` (`dsc/dims.cpp:666`). It does NOT come back with `in_`.
+        // already committed to `.at(clId)` (`dsc/dims.cpp:667`). It does NOT come back with `in_`.
         assert_eq!(
             stage.sampled_extent(
                 PrimaryDim::In,
@@ -3472,7 +3539,7 @@ mod tests_e012 {
 
     /// e012 — CONSTRUCTED, no g0 export states a `peSfpSplit_` or a row-split dim that
     /// `coreletSplit_` names too: the PE/SFP side, the conditional `clId = -1` sum and the arm order
-    /// (`dsc/dims.cpp:665-694`).
+    /// (`dsc/dims.cpp:664-702`).
     #[test]
     fn the_pe_sfp_side_and_the_conditional_corelet_sum_follow_the_reference_s_arms() {
         let plain = PaddingForm::default();
@@ -3512,7 +3579,7 @@ mod tests_e012 {
                 Some(Extent(share))
             );
         }
-        // The same stop as the row arm — corelet 1 is not a key (`dsc/dims.cpp:685`).
+        // The same stop as the row arm — corelet 1 is not a key (`dsc/dims.cpp:687`).
         assert_eq!(
             vector.sampled_extent(
                 PrimaryDim::In,
@@ -3525,7 +3592,7 @@ mod tests_e012 {
         );
 
         // ⛔ THE SUM IS CONDITIONAL: `clId = -1` adds the corelets' row shares only where
-        // `coreletSplit_` names the dim as well (`:668-674`); otherwise it is the FIRST corelet's
+        // `coreletSplit_` names the dim as well (`:669-675`); otherwise it is the FIRST corelet's
         // share alone, and summing unconditionally doubles this stage's answer.
         let mut two = row_split_stage();
         two.row_split.insert(
@@ -3557,7 +3624,7 @@ mod tests_e012 {
             Some(Extent(4))
         );
 
-        // ⭐ THE ROW ARM IS TESTED FIRST (`:665` before `:682`), so a sample naming both a row and a
+        // ⭐ THE ROW ARM IS TESTED FIRST (`:664` before `:683`), so a sample naming both a row and a
         // component reads `rowSplit_`.
         let mut both = two.clone();
         both.pe_sfp_split = BTreeMap::from([(
@@ -3581,7 +3648,7 @@ mod tests_e012 {
     }
 
     /// e013 — the one-argument spelling answers `in_: 64` on the very export whose `rowSplit_` makes
-    /// the row view answer 8, and `i_: -1` as an absence.
+    /// the row view answer 8, `i_: -1` as an absence and a symbolic `out` as its `maxSize_`.
     #[test]
     fn the_one_argument_spelling_answers_the_reference_s_whole_dim_not_its_row_share() {
         let stage = row_split_stage();
@@ -3592,7 +3659,28 @@ mod tests_e012 {
         assert_eq!(stage.whole_extent(PrimaryDim::Out), Some(Extent(64)));
         assert_eq!(stage.whole_extent(PrimaryDim::Mb), Some(Extent(1)));
         assert_eq!(stage.whole_extent(PrimaryDim::Y), Some(Extent(1)));
-        // `i_: -1` in that export — the `-1` this reads back as an absence.
+        // `i_: -1` in that export, STATED as such above — `calculate_padded`'s `val < 0` short-circuit
+        // is the `-1` read back as an absence, not as a size.
         assert_eq!(stage.whole_extent(PrimaryDim::I), None);
+        // ⛔ AND THE RAW SLOT IS NOT THAT ANSWER: `extent` hands the `-1` straight back, which is
+        // what makes these two functions distinguishable at all.
+        assert_eq!(stage.extent(PrimaryDim::I), Some(Extent(-1)));
+
+        // ⛔ THE SECOND DISTINCTION, CONSTRUCTED — `symbolicDimInfo_` is empty on all 4,850 g0 dim
+        // blocks, so only the reference's own code states this: a symbolic dim answers `maxSize_`
+        // (`dsc/dims.cpp:521-527`) and NOT the `out_: 64` slot sitting beside it.
+        let mut symbolic = row_split_stage();
+        symbolic.symbolic = Symbolic::new(
+            BTreeMap::from([(
+                PrimaryDim::Out,
+                SymbolicDimInfo {
+                    max_size: MaxSize(256),
+                    granularity: Granularity::new(NonZeroU32::new(32).expect("a positive step")),
+                },
+            )]),
+            BTreeMap::new(),
+        );
+        assert_eq!(symbolic.whole_extent(PrimaryDim::Out), Some(Extent(256)));
+        assert_eq!(symbolic.extent(PrimaryDim::Out), Some(Extent(64)));
     }
 }

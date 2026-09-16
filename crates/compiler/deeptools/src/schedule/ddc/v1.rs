@@ -3731,7 +3731,7 @@ pub struct LoopStaging {
 }
 
 /// WHERE ONE DIM'S EXTENT IS SAMPLED — `primaryDimToVal_st`'s `peOrSfp`, `ptrowId` and `clId`
-/// (`dsc/dims.h:250-255`), each of whose `-1` is the WHOLE of that axis rather than its first slot.
+/// (`dsc/dims.h:269-273`), each of whose `-1` is the WHOLE of that axis rather than its first slot.
 ///
 /// ⛔ NOT [`Sample`], WHOSE CORELET IS NON-OPTIONAL: entry 307 reads `clId = -1` at `:1613` and
 /// `:1723`, which [`Sample`] cannot spell.
@@ -3739,9 +3739,12 @@ pub struct LoopStaging {
 pub struct DimSample {
     /// `peOrSfp` — [`None`] is `NO_COMPONENT`.
     pub comp: Option<VectorComp>,
-    /// `ptrowId` — [`None`] is `-1`, the sum over every row.
+    /// `ptrowId` — [`None`] is `-1`, which SKIPS the `rowSplit_` arm outright (`dsc/dims.cpp:664`)
+    /// rather than summing the rows — the read falls through to `primaryDimToVal_clView_st` (`:704`).
     pub row: Option<Row>,
-    /// `clId` — [`None`] is `-1`, the sum over every corelet.
+    /// `clId` — [`None`] is `-1`: inside a split arm it sums the corelets ONLY where
+    /// `coreletSplit_` names the dim too, else reads the FIRST one (`dsc/dims.cpp:669-675`); in
+    /// the fall-through it is the whole-core base read and never a sum (`:634`, `:644`).
     pub corelet: Option<Corelet>,
 }
 
@@ -3766,7 +3769,7 @@ impl DimSample {
 }
 
 /// WHICH NUMBER A SYMBOLIC DIM ANSWERS WITH — `primaryDimToVal_st`'s `getSymbolicGranularity`
-/// (`dsc/dims.h:255`).
+/// (`dsc/dims.h:273`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolicRead {
     /// `false` — the symbol's `maxSize_`, which is the extent the size search bounds itself by.
@@ -3775,7 +3778,7 @@ pub enum SymbolicRead {
     Granularity,
 }
 
-/// ONE CORELET'S PE AND SFP SHARES OF A DIM — `peSfpSplit_.at(dim).at(cl)` (`dsc/dims.h:208`).
+/// ONE CORELET'S PE AND SFP SHARES OF A DIM — `peSfpSplit_.at(dim).at(cl)` (`dsc/dims.h:212-214`).
 ///
 /// ⛔ NOT A MAP KEYED BY [`VectorComp`], WHICH IS NOT `Ord`: both keys are written by every one of
 /// entry 307's three writers (`ddc/ddcv1.cpp:1108`, `:1401`, `:1553`), so a pair is the shape the
