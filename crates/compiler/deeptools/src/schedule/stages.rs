@@ -862,7 +862,8 @@ mod tests {
 
     /// ⭐⭐ `rmsq_o728`'s WHOLE `computeOp_`, TRANSCRIBED FROM `g0/sdsc_0.json`:
     /// `[{exUnit: "sfp", opFuncName: "mul", attributes_.dataFormat_: "SEN169_FP16",
-    /// inputLabeledDs: ["Tensor0-idx0", "Tensor1-idx1"], outputLabeledDs: ["Tensor2-idx2"]}]`.
+    /// inputLabeledDs: ["Tensor0-idx0", "Tensor1-idx1"], interimLabeledDs: [],
+    /// outputLabeledDs: ["Tensor2-idx2"]}]`.
     ///
     /// ⛔ IT IS A CONSTRUCTION ARGUMENT AND NOT A FIELD OF [`l3::dsc::DesignSpaceConfig`] — see
     /// [`run_ddc`]. ⭐ AND IT IS A REAL FIELD, NOT A CONSTANT: over the first forty fixtures the
@@ -876,6 +877,7 @@ mod tests {
             ex_unit: SenComponent::Sfp,
             format: Some(crate::formats::DataFormat::Sen169Fp16),
             inputs: vec![LdsIdx(0), LdsIdx(1)],
+            interim: Vec::new(),
             outputs: vec![LdsIdx(2)],
         }]
     }

@@ -1335,11 +1335,25 @@ impl Density {
     }
 }
 
-/// ONE DIM'S PADDING PARAMETERS — `AllocateNode::paddingSizes_.at(dim)` (`dsc/dsc2.h:1000`) narrowed
-/// to the five fields entries 259 and 260 read.
+/// ONE DIM'S PADDING PARAMETERS — `DimPaddingSizes` (`dsc/dims.h:134-146`) as
+/// `DataStructDims::paddingSizes_.at(dim)` (`dsc/dims.h:219`) holds it, narrowed to the five fields
+/// entries 259 and 260 read.
 ///
-/// ⛔ `stride_` IS NON-ZERO BY TYPE: the reference's `if (stride_ > 0)` (`ddc/ddcv1.cpp:1996`) is the
-/// whole of its handling, and a zero stride multiplies an offset to nothing.
+/// ⛔ IT IS A DATASTAGE'S MAP AND NEVER AN ALLOCATION'S. `AllocateNode` (`dsc/dsc2.h:974-1011`) has
+/// no `paddingSizes_` — it has `padding_`, a `PaddingFormType` (`:981`), which is what
+/// [`ExploreTree::alloc_padding`] reads. EVERY `paddingSizes_` in `ddc/ddcv1.cpp` is on a
+/// `DataStructDims`: `:580` `coreDs.ss_`, `:1961`/`:1965`/`:1968` `dsChunk`, `:2437`
+/// `dataStageParam_.at(loopPtr->denId_).ss_`, `:2512`-onwards `ds`. A citation naming
+/// `AllocateNode::paddingSizes_` names a field that does not exist.
+///
+/// ⛔ `stride_` IS NON-ZERO BY TYPE: `DT_CHECK_MSG(dsChunk.paddingSizes_.at(dim).stride_ > 0)`
+/// (`ddc/ddcv1.cpp:1965`) is the whole of its handling, and a zero stride multiplies an offset to
+/// nothing.
+///
+/// ⚠️ `padFront_`/`padBack_` ARE `int` AND THE REFERENCE WRITES `-1` INTO THEM
+/// (`ddc/ddcv1.cpp:1172`), which [`Elements`] cannot spell — deliberately: both readers of a negative
+/// one `DT_ERROR` on the spot (`:2657-2660`, `:2674-2677`), so [`None`] rather than a value is the
+/// faithful answer for that dim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaddingSizes {
     /// `windowDim_`.
@@ -1440,7 +1454,18 @@ pub struct TrackerSite {
     pub row: Row,
 }
 
-/// THE MEMORY TRACKERS — `DsTrackInMem` (`ddc/memTracker.h`), outside this campaign's file list.
+/// THE MEMORY TRACKERS — `DsTrackInMem`, declared at `util/memtracker/mem_track.h:24` with its bodies
+/// in `util/memtracker/mem_track.cpp`, and held per site by `MemTrackBundle`
+/// (`sys-arch-spec/memtracker/mem_track_bundle.h:17-32`).
+///
+/// ⛔ THERE IS NO `ddc/memTracker.h` IN THE AUTHORITY AND THE ALLOCATOR IS NOT UNPORTED. This doc used
+/// to name that file and call it *"an UNPORTED 703-line C++ allocator"*; the file does not exist, and
+/// `DsTrackInMem` together with `MemTrackBundle` is ported as `e003`..`e038` in
+/// `schedule/memtrack/{tracker,bundle,memory}.rs`, gated by an oracle
+/// (`schedule/stages/carriers/lx_oracle.rs`) that reproduces all 588 LX addresses of the reference's
+/// own 187 placed programs. Nothing here is waiting on that work; this trait is the SEAM onto it, and
+/// `stages::Trackers` is what answers it. ⚠️ A cost estimate carried the phantom 703-line line-item —
+/// do not put it back.
 ///
 /// ⛔ [`None`] FROM EITHER `check_and_add` IS THE `EXISTS` ANSWER, which entry 258 `DT_CHECK`s: a
 /// name already in the tracker means this set is being placed twice over itself.
@@ -1547,10 +1572,24 @@ pub trait StageSizes {
     fn dim_density(&self, lds: LdsIdx, dim: PrimaryDim) -> Density;
     /// `dsNode.coreletSplit_.at(dim)` — how many elements each corelet takes of that dim.
     fn corelet_split(&self, stage: DatastageId, dim: PrimaryDim) -> Option<Vec<Elements>>;
-    /// `allocNode->paddingSizes_.at(dim)`.
+    /// ⛔⛔ DELETE THIS METHOD — IT NAMES A FIELD THAT DOES NOT EXIST AND HAS NO CALLER. Its old
+    /// citation, `allocNode->paddingSizes_.at(dim)`, is invented: `AllocateNode`
+    /// (`dsc/dsc2.h:974-1011`) carries `padding_`, a `PaddingFormType` (`:981`) — already answered by
+    /// [`ExploreTree::alloc_padding`] — and nothing named `paddingSizes_` (`:1000`, the line the doc
+    /// cited, is the continuation of `relatedIndirectAccessAlloc_`). Every `paddingSizes_` in
+    /// `ddc/ddcv1.cpp` is on a `DataStructDims`, i.e. a STAGE, which
+    /// [`Self::stage_padding_sizes`] already answers; there is no allocation-versus-stage distinction
+    /// to draw and no reader in the ported scheduler asks for one.
+    ///
+    /// ⛔ IT SURVIVES ONLY BECAUSE REMOVING IT IS `E0407` IN THREE FILES THIS CHANGE MAY NOT TOUCH —
+    /// `schedule/stages/ddc_reads.rs:568`, `schedule/stages/offsets.rs:384` and
+    /// `schedule/l3/dl_ops.rs:18791`. Delete the declaration, those three impls, and the two
+    /// `#[cfg(test)]` doubles in this file, in ONE commit.
     fn alloc_padding_sizes(&self, alloc: AllocId, dim: PrimaryDim) -> Option<PaddingSizes>;
-    /// `dataStageParam_.at(stage).ss_.paddingSizes_.at(dim)` — ⚠️ A DIFFERENT MAP FROM THE ONE ABOVE,
-    /// and entry 259 reads the stage's while entry 260 reads the allocation's.
+    /// `dataStageParam_.at(stage).ss_.paddingSizes_.at(dim)` — THE ONLY `paddingSizes_` THERE IS, and
+    /// ⚠️ BOTH ENTRIES READ THIS ONE: entry 259 through `dsChunk` (`ddc/ddcv1.cpp:1961-1968`) and
+    /// entry 260 through `dataStageParam_.at(loopPtr->denId_).ss_` (`:2437`) and `ds` (`:2512`
+    /// onwards). Neither reads an allocation's.
     fn stage_padding_sizes(&self, stage: DatastageId, dim: PrimaryDim) -> Option<PaddingSizes>;
     /// `getSizeDataStageForNode(node, node)` — which datastage sizes this allocation.
     fn size_stage(&self, alloc: AllocId) -> DatastageId;
@@ -2199,7 +2238,11 @@ pub trait ScheduleNodes: ScheduleWalk {
     fn nodes(&self) -> Vec<NodeId>;
     /// `nodeType_`, absent for a node this tree does not hold.
     fn kind(&self, node: NodeId) -> Option<NodeKind>;
-    /// `isParametricLoop()` (`dsc/dsc2.h:596`).
+    /// `isParametricLoop()` (`dsc/dsc2.h:599`), which returns the plain `bool isParametricLoop_`
+    /// (`:617`) — ⚠️ NOT `parametricLdsIdx_` (`:618`), a different field with a different writer
+    /// (`setParametricLdsIdx`, `:604`) read by `parametricLdsIdx()` (`:603`). ⛔ AND `:596`, which
+    /// this doc used to cite, is the body of `isDimSymbolic` (`:595-597`) — a different predicate over
+    /// `loopCountSymbolIds_`.
     fn is_parametric(&self, at: LoopId) -> bool;
     /// `numId_` and `denId_` — TOTAL: every loop node carries both.
     fn loop_stages(&self, at: LoopId) -> LoopStages;
@@ -3790,7 +3833,7 @@ impl StickRepl {
     pub const ONE: Self = Self(1);
 }
 
-/// ONE `computeOp_` ENTRY AS ENTRIES 307 AND 308 READ IT — the four fields beyond
+/// ONE `computeOp_` ENTRY AS ENTRIES 307 AND 308 READ IT — the five fields beyond
 /// [`ComputeOp`]'s two that the reduction sweep and the size sweep need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DscComputeOp {
@@ -3802,6 +3845,24 @@ pub struct DscComputeOp {
     pub format: Option<DataFormat>,
     /// `inputLabeledDs`, as the indices those pointers carry.
     pub inputs: Vec<LdsIdx>,
+    /// `interimLabeledDs` (`dsc/dscdefn.h:508`) — *"for partial results and other tensors that live
+    /// only within the dataflow"* — the SAME `std::vector<LabeledDsInfo*>` as [`Self::inputs`] and
+    /// [`Self::outputs`], so it carries the same indices those pointers do.
+    ///
+    /// ⭐ FOUR LIVE READERS, AND ONE OF THEM IS THE WIRE: `dsc/designSpaceConfig.cpp:6738-6741`
+    /// writes it into the SDSC JSON (`:7495-7496` reads it back), `dsc/superdsc.cpp:1585` folds it
+    /// into the lds-index set the super-DSC renumbers, and
+    /// `ddc/ddc_transformation_util.cpp:1842` plus `ddc/ddl/ddl_conversion.cpp:523` sweep it beside
+    /// the other two operand lists. An op that drops it is an op whose interim tensors never reach
+    /// the backend.
+    ///
+    /// ⛔ THE ONE WRITER IS THE DDL EXPANSION'S OWN SEAM:
+    /// `dsc.computeOp_.at(computeOpIdx).interimLabeledDs.push_back(newLdsPtr)`
+    /// (`ddc/ddl/ddl_conversion.cpp:530`), which is what
+    /// `ddl::conversion::InternalTensorSite::add_interim_lds` carries. ⚠️ ENTRY 307/308 THEMSELVES
+    /// NEVER READ IT: `interimLabeledDs` appears ZERO times in `ddc/ddcv1.cpp`, so this field is a
+    /// pass-through here and the port must not invent a reader for it.
+    pub interim: Vec<LdsIdx>,
     /// `outputLabeledDs`.
     pub outputs: Vec<LdsIdx>,
 }
@@ -3987,9 +4048,16 @@ pub trait ExploreTree: ScheduleWalk {
     /// AND NOT TWO: `updateSizePerDim`'s multiple check is order-dependent (sizes 4, 6, 12 refuse as
     /// `(4, 6, …)` and pass as `(4, 12, 6)`), so the interleaving is load-bearing.
     fn transfers_and_computes_under(&self, from: NodeId) -> Vec<NodeId>;
-    /// `computeNode->isOpaqueOp_` — ⚠️ NOT `metadata.opaqueOps_.count(node)`: the reference reads the
-    /// flag and then `opaqueOps_.at(node)`, so a flagged compute with no entry is a throw and not a
-    /// second answer.
+    /// `computeNode->isOpaqueOp_` (`dsc/dsc2.h:941`).
+    ///
+    /// ⛔⛔ DEAD — DELETE THIS METHOD AND ITS TWO IMPLS. It has NO READER: entry 307's one caller now
+    /// asks `metadata.opaque_ops.contains_key(&child)` instead, because in this crate the flag IS
+    /// membership in that map — `ddc/ddl/ddl_conversion.cpp:1575-1578` sets `isOpaqueOp_ = true` and
+    /// inserts `metadata_.opaqueOps_[newNode]` in the same breath, and `ddl/conversion.rs:3708` ports
+    /// it that way, so a tree view has no flag to answer with and the caller holds the only spelling
+    /// of it. The declaration survives only because removing it is `E0407` in
+    /// `schedule/stages/ddc_tree.rs:338`, a file this change may not touch; delete it together with
+    /// that impl and the `#[cfg(test)]` double below in ONE commit.
     fn is_opaque_compute(&self, node: NodeId) -> bool;
     /// `getBlockTransferSizePerDim(transfer, unit, 0, false, false, true)` — the WHOLE map, because
     /// entry 307 reads it with `.at(dim)` where entry 260 reads it with `operator[]`.
@@ -3998,7 +4066,37 @@ pub trait ExploreTree: ScheduleWalk {
         node: NodeId,
         unit: SenComponent,
     ) -> BTreeMap<PrimaryDim, Extent>;
-    /// `computeOp_`'s entry for a COMPUTE node.
+    /// `compute->exUnit_` and `compute->outputsLdsAndLoopOffsets_.at(i).myLdsIdx_` — the ONLY two
+    /// things entry 307 reads off a COMPUTE node (`ddc/ddcv1.cpp:1092-1113`), and what the two live
+    /// readers below touch (`.ex_unit`, `.outputs`).
+    ///
+    /// ⛔⛔ THE RETURN TYPE MODELS THE WRONG OBJECT AND MUST BE NARROWED. [`DscComputeOp`] is a
+    /// `DesignSpaceConfig::computeOp_` entry (`dsc/dscdefn.h:490-513`): its `op_func`, `format`,
+    /// `inputs` and `interim` are `opFuncName`, `attributes_.dataFormat_`, `inputLabeledDs` and
+    /// `interimLabeledDs`. A `dsc2::ComputeNode` (`dsc/dsc2.h:900-962`) has NO `opFuncName` — it
+    /// carries `type_`, a `ComputeOpType` (`dsc/dsc2.h:933`), and that is a DIFFERENT CLOSED SET:
+    /// 70 arms (`dsc/dscdefn.h:134-207`) against `OpFuncs`' 151
+    /// (`sys-arch-spec/arch_enums.h:135-312`), and it has no arm at all for the DSC-level functions
+    /// this very file dispatches on — `GENERIC_PARTIAL_REDUCTION` (`arch_enums.h:303`, which entry
+    /// 308 mints at `ddc/ddcv1.cpp:2057`) and `BATCHMATMUL_MXFP4W_FWD` (`arch_enums.h:222`) are
+    /// `OpFuncs` only. So a `None` `op_func` synthesised here would say *"this compute has no op
+    /// func"* about a compute that has one, which is the wrong opcode the backend lowers happily.
+    ///
+    /// ⚠️ THE TWO SETS ARE NOT DISJOINT AND NOBODY SHOULD CLAIM THEY ARE: `RECIPROCAL` is in both
+    /// (`dscdefn.h:157`, `arch_enums.h:173`) and the layernorm scale is in both under two spellings
+    /// (`LAYERNORMSCALE`, `dscdefn.h:158`; `LAYERNORM_SCALE`, `arch_enums.h:169`). The defect is that
+    /// the sets are different and the node holds the other one, not that the overlap is empty.
+    ///
+    /// ⛔ AND THERE IS NO PAIRING TO LOOK THE ENTRY UP WITH: `opIdx_` appears ZERO times in the whole
+    /// authority, `computeOp_` is a `DesignSpaceConfig` member, and `ComputeNode` carries no
+    /// back-pointer of any kind. Any claim that the reference holds the pairing on the node is false.
+    ///
+    /// ⭐ THE CHANGE: return `Option<ComputeNodeWrites>` where
+    /// `ComputeNodeWrites { ex_unit: SenComponent, outputs: Vec<LdsIdx> }`, with `outputs` already
+    /// carrying the reference's `if (outputInfo.myLdsIdx_ < 0) continue` (`ddc/ddcv1.cpp:1107-1108`)
+    /// as a `filter_map` — a negative index is unspellable in [`LdsIdx`]. It is NOT made here because
+    /// it is `E0053` in `schedule/stages/ddc_tree.rs:391`, a file this change may not touch; both
+    /// halves land in ONE commit.
     fn compute_op(&self, node: NodeId) -> Option<DscComputeOp>;
     /// The transfer written back after entry 307 has shrunk its unit-time chunks.
     fn set_transfer(&mut self, node: NodeId, transfer: TransferNode) -> Option<()>;
@@ -4909,12 +5007,24 @@ where
                             )?;
                         }
                         TreeNode::Other(NodeKind::Compute) => {
-                            let unit = self.tree.compute_op(child)?.ex_unit;
+                            let compute = self.tree.compute_op(child)?;
+                            let unit = compute.ex_unit;
                             // ⚠️ THE INPUT SWEEP IS COMMENTED OUT AT `:1094-1100` and stays out.
-                            let outputs = if self.tree.is_opaque_compute(child) {
+                            //
+                            // ⭐ `compute->isOpaqueOp_` IS ASKED OF `metadata` AND NOT OF THE TREE,
+                            // because in this crate the flag IS membership in
+                            // [`Metadata::opaque_ops`]: `ddl_conversion.cpp:1575-1578` sets
+                            // `isOpaqueOp_ = true` and inserts `metadata_.opaqueOps_[newNode]` in the
+                            // same breath, and the port models it that way
+                            // (`ddl/conversion.rs:3708`). The reference's own reader
+                            // (`ddc/ddcv1.cpp:1101-1102`) reads the flag and then `opaqueOps_.at()`,
+                            // which is the very map the next line already reads — so a flagged
+                            // compute with no entry stays unspellable rather than becoming a second
+                            // answer.
+                            let outputs = if self.metadata.opaque_ops.contains_key(&child) {
                                 vec![self.metadata.opaque_ops.get(&child)?.lds_idx?]
                             } else {
-                                self.tree.compute_op(child)?.outputs
+                                compute.outputs
                             };
                             for lds in outputs {
                                 let sizes = self.stick_size_per_dim(lds)?;
@@ -5767,6 +5877,10 @@ where
                 ex_unit: SenComponent::Hbm,
                 format: op.format,
                 inputs: vec![lds],
+                // `emplace` sets `opFuncName`, `dataFormat_`, `inputLabeledDs` and
+                // `outputLabeledDs` and NOTHING ELSE (`ddc/ddcv1.cpp:2057-2061`), so the minted op's
+                // `interimLabeledDs` stays value-initialized — empty.
+                interim: Vec::new(),
                 outputs: vec![lds],
             },
         )?;
@@ -9043,6 +9157,7 @@ mod tests_e307_e309 {
                 ex_unit: SenComponent::Pt,
                 format: None,
                 inputs: vec![LDS0],
+                interim: Vec::new(),
                 outputs: vec![LDS0],
             },
         );
@@ -9292,6 +9407,7 @@ mod tests_e307_e309 {
                 ex_unit: SenComponent::Pt,
                 format: None,
                 inputs: vec![LDS0],
+                interim: Vec::new(),
                 outputs: vec![LDS1],
             }],
             dsc2_corelets: None,
@@ -9501,6 +9617,7 @@ mod tests_e379_e381 {
             ex_unit: SenComponent::Pe,
             format: None,
             inputs: Vec::new(),
+            interim: Vec::new(),
             outputs: Vec::new(),
         }
     }
