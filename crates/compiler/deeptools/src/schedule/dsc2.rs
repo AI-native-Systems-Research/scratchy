@@ -23,13 +23,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 
 use crate::arch::{Bytes, Elements, Sticks};
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+    Extent, PrimaryDim, StickPart, cumulative_stick_sizes,
+};
 use crate::formats::DataFormat;
 use crate::generated::{DataConnect, Mode, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{ConstIdx, NodeId, PadType};
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::LoopId;
+use crate::schedule::ddc::v1::LdsSticks;
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::l3::dl_ops::{GtrGroupId, Shares};
 use crate::schedule::l3::dsc::{IndirectAlloc, WkSlice};
@@ -2457,5 +2460,121 @@ mod tests_e007 {
         // `NO_INDIRECTION` returns BEFORE `layoutDimOrder_` is touched (`dsc/dsc2.cpp:4483-4485`), so
         // a bounded 64x16 layout still pages nothing — 64 and 16 must not appear.
         assert_eq!(hbm_alloc().page_sizes(None), BTreeMap::new());
+    }
+}
+
+impl LoopNode {
+    /// Replaces: e014_parametricStride
+    ///
+    /// A PARAMETRIC LOOP'S STRIDE — the CUMULATIVE STICK SIZE of its one dim in the labelled DS
+    /// `parametricLdsIdx_` names, or `1` for a dim that is not a stick dim but IS in that DS's layout
+    /// order.
+    ///
+    /// ⛔ [`None`] IS A STOP, NOT A STRIDE OF `1`: `DT_CHECK_MSG(ldsIdx != -1)` (`dsc/dsc2.cpp:4199`)
+    /// and the `DT_ERROR` for a dim in NEITHER set (`:4213`). `getSizeDataStageForNode` writes this
+    /// straight into a datastage extent (`:3660-3662`), so a fabricated `1` sizes the buffer wrong.
+    #[must_use]
+    pub fn parametric_stride(&self, dsc: &(impl LdsSticks + Dsc + ?Sized)) -> Option<Elements> {
+        let lds = self.parametric_lds?;
+        let stick_sizes = cumulative_stick_sizes(&dsc.stick_dims(lds), StickPart::Whole)?;
+        // `dims_[0]`, which this body indexes unguarded — `parametricIterCount` is where the
+        // reference states the arity, `DT_ERROR`ing on `dims_.size() != 1` (`dsc/dsc2.cpp:4129`).
+        let loop_dim = self.dims.first()?.dim;
+        if let Some(&(_, stride)) = stick_sizes.iter().find(|&&(dim, _)| dim == loop_dim) {
+            return Some(stride);
+        }
+        // Check if the dim at least exists in case this is not in stick dims.
+        dsc.layout_dims(lds)
+            .iter()
+            .any(|dim| dim == loop_dim)
+            .then_some(Elements(1))
+    }
+}
+
+#[cfg(test)]
+mod tests_e014 {
+    //! ⭐⭐ THE TWO STRIDES THE REFERENCE ITSELF WROTE — `g0/debug/sdsc_14/sdsc.json`, the ONE g0
+    //! program of 187 that holds a parametric loop.
+    //!
+    //! `ddc/ddcv1.cpp:2468` assigns `loopEleOffs = loopPtr->parametricStride(currDsc)`, so the export
+    //! carries this function's own answer: the `transfer_lds1_src:sfp_dst:lxsu` node's
+    //! `dstLdsAndLoopOffsets_[0].loopEleOffsets_["0"]` reads
+    //! `"parametric_loop_out(padded)__2": {"out": 128}` and `"parametric_loop_mb(padded)": {"mb": 1}`.
+    //!
+    //! Both of those loops carry `parametricLdsIdx_ = 1`; lds 1 is `dsType_ = OUTPUT`, whose
+    //! `primaryDsInfo_` states `stickDimOrder_ = ["out"]` with `stickSize_ = [128]` and
+    //! `layoutDimOrder_ = ["mb", "out", "y"]` — the order `allocate-Tensor1_hbm` and
+    //! `allocate_lds1_lx` BOTH carry, which is what `getLayoutDims(1)` answers.
+    //!
+    //! ⭐ SO ONE PROGRAM EXERCISES BOTH LIVE ARMS: `out` is the stick dim and takes 128, while `mb` is
+    //! not a stick dim at all and takes the `1` its place in the layout order earns it.
+
+    use super::{
+        BlockNode, Dsc, Elements, LayoutDims, LdsIdx, LdsSticks, LoopDim, LoopNode, MetaDimKind,
+        NodeName, PrimaryDim,
+    };
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
+
+    /// `sdsc_14`'s lds 1, through the two seams this reads a DSC by.
+    struct Sdsc14;
+
+    impl LdsSticks for Sdsc14 {
+        fn stick_dims(&self, _lds: LdsIdx) -> StickDims {
+            StickDims(vec![(PrimaryDim::Out, Elements(128))])
+        }
+    }
+
+    impl Dsc for Sdsc14 {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            LayoutDims::new(PrimaryDim::Mb, vec![PrimaryDim::Out, PrimaryDim::Y])
+        }
+    }
+
+    /// One `parametric_loop_<dim>(padded)`, with `numId_ = denId_ = -1` as its producer writes them.
+    fn parametric(dim: PrimaryDim, lds: Option<u32>) -> LoopNode {
+        LoopNode {
+            block: BlockNode {
+                name: NodeName(format!("parametric_loop_{}(padded)", dim.spelling())),
+                children: Vec::new(),
+            },
+            dims: vec![LoopDim {
+                dim,
+                kind: MetaDimKind::Padded,
+            }],
+            num: None,
+            den: None,
+            parametric_lds: lds.map(LdsIdx),
+        }
+    }
+
+    /// e014 — the two strides `sdsc_14`'s own `loopEleOffsets_` records.
+    #[test]
+    fn a_parametric_loops_stride_is_its_dims_cumulative_stick_size() {
+        // `"parametric_loop_out(padded)__2": {"out": 128}`.
+        assert_eq!(
+            parametric(PrimaryDim::Out, Some(1)).parametric_stride(&Sdsc14),
+            Some(Elements(128))
+        );
+        // `"parametric_loop_mb(padded)": {"mb": 1}` — the layout arm, so 128 must NOT appear here.
+        assert_eq!(
+            parametric(PrimaryDim::Mb, Some(1)).parametric_stride(&Sdsc14),
+            Some(Elements(1))
+        );
+    }
+
+    /// e014 — the two stops, and neither of them is a stride of `1`.
+    #[test]
+    fn a_dim_outside_both_sets_and_an_unset_index_are_stops() {
+        // `DT_ERROR` (`dsc/dsc2.cpp:4213-4216`): `x` is neither lds 1's stick dim nor in its
+        // `["mb", "out", "y"]` layout order, so the `int loopStride = 1` initializer never returns.
+        assert_eq!(
+            parametric(PrimaryDim::X, Some(1)).parametric_stride(&Sdsc14),
+            None
+        );
+        // `DT_CHECK_MSG(ldsIdx != -1)` (`:4199-4202`) — every other loop in every other g0 program.
+        assert_eq!(
+            parametric(PrimaryDim::Out, None).parametric_stride(&Sdsc14),
+            None
+        );
     }
 }
