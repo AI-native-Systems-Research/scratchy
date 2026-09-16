@@ -205,9 +205,21 @@
        "loc": 146,
        "deps": {
         "types": [
-         "e001_PaddingFormType",
-         "e002_DimPaddingSizes",
-         "e003_SymbolicDimInfo"
+         {
+          "name": "e001_PaddingFormType",
+          "defined_in": "crustify-types/cpp/dims.h",
+          "scope": "port"
+         },
+         {
+          "name": "e002_DimPaddingSizes",
+          "defined_in": "crustify-types/cpp/dims.h",
+          "scope": "port"
+         },
+         {
+          "name": "e003_SymbolicDimInfo",
+          "defined_in": "crustify-types/cpp/dims.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },
@@ -260,8 +272,16 @@
        "loc": 81,
        "deps": {
         "types": [
-         "e005_CoordinateType",
-         "e007_DataInfo"
+         {
+          "name": "e005_CoordinateType",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e007_DataInfo",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },
@@ -304,7 +324,11 @@
        "loc": 36,
        "deps": {
         "types": [
-         "e009_ScheduleNode"
+         {
+          "name": "e009_ScheduleNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },
@@ -324,7 +348,11 @@
        "loc": 9,
        "deps": {
         "types": [
-         "e009_ScheduleNode"
+         {
+          "name": "e009_ScheduleNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },
@@ -348,9 +376,21 @@
        "loc": 85,
        "deps": {
         "types": [
-         "e007_DataInfo",
-         "e008_TransferPadInfo",
-         "e009_ScheduleNode"
+         {
+          "name": "e007_DataInfo",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e008_TransferPadInfo",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e009_ScheduleNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },
@@ -401,8 +441,16 @@
        "loc": 63,
        "deps": {
         "types": [
-         "e007_DataInfo",
-         "e009_ScheduleNode"
+         {
+          "name": "e007_DataInfo",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e009_ScheduleNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },
@@ -454,8 +502,16 @@
        "loc": 57,
        "deps": {
         "types": [
-         "e009_ScheduleNode",
-         "e010_BlockNode"
+         {
+          "name": "e009_ScheduleNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e010_BlockNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },
@@ -482,8 +538,16 @@
        "loc": 35,
        "deps": {
         "types": [
-         "e009_ScheduleNode",
-         "e010_BlockNode"
+         {
+          "name": "e009_ScheduleNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e010_BlockNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },
@@ -516,8 +580,16 @@
        "loc": 32,
        "deps": {
         "types": [
-         "e009_ScheduleNode",
-         "e011_LoopNode"
+         {
+          "name": "e009_ScheduleNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e011_LoopNode",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },

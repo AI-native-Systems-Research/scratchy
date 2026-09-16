@@ -255,7 +255,8 @@
        "_comment": "9 unit(s) from ddc/ddc_metadata.h. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-ddc/cpp/ddc.cpp",
        "headers": [
-        "ddc/ddc_metadata.h"
+        "ddc/ddc_metadata.h",
+        "crustify-types/cpp/ddc_metadata.h"
        ],
        "members": {
         "functions": [
@@ -268,6 +269,10 @@
          "e102_print",
          "e103_getLoops",
          "e104_clear"
+        ],
+        "types": [
+         "e004_FailedAlloc",
+         "e017_Metadata"
         ]
        }
       },
@@ -386,7 +391,8 @@
        "_comment": "32 unit(s) from ddc/ddc_transformation_util.cpp. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-ddc/cpp/ddc.cpp",
        "headers": [
-        "ddc/ddc_transformation_util.cpp"
+        "ddc/ddc_transformation_util.cpp",
+        "crustify-types/cpp/dims.h"
        ],
        "members": {
         "functions": [
@@ -422,6 +428,9 @@
          "e340_insertComputeBetweenTransferAndReg",
          "e341_relatedToExternalNodes",
          "e361_relatedToExternalNodes"
+        ],
+        "types": [
+         "e001_PaddingFormType"
         ]
        }
       },
@@ -429,7 +438,8 @@
        "_comment": "24 unit(s) from ddc/ddcv1.cpp. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-ddc/cpp/ddc.cpp",
        "headers": [
-        "ddc/ddcv1.cpp"
+        "ddc/ddcv1.cpp",
+        "crustify-types/cpp/dims.h"
        ],
        "members": {
         "functions": [
@@ -457,6 +467,9 @@
          "e309_attachToPrefilledSchedule",
          "e379_run_v1",
          "e381_run"
+        ],
+        "types": [
+         "e002_DimPaddingSizes"
         ]
        }
       }
@@ -709,7 +722,9 @@
        "headers": [
         "dsc/dims.cpp",
         "dsc/dsc2.cpp",
-        "dsc/designSpaceConfig.cpp"
+        "dsc/designSpaceConfig.cpp",
+        "crustify-types/cpp/dims.h",
+        "crustify-types/cpp/designSpaceConfig.h"
        ],
        "members": {
         "functions": [
@@ -723,6 +738,11 @@
          "e011_primaryDimToVal_clView_st",
          "e012_primaryDimToVal_st",
          "e013_primaryDimToVal_st_1arg"
+        ],
+        "types": [
+         "e003_SymbolicDimInfo",
+         "e006_DataStructDims",
+         "e018_DesignSpaceConfig"
         ]
        }
       },
@@ -748,13 +768,27 @@
       "src/schedule/dsc2.rs": {
        "tu": "crustify-capacity/cpp/capacity.cpp",
        "headers": [
-        "dsc/dsc2.cpp"
+        "dsc/dsc2.cpp",
+        "crustify-types/cpp/dsc2.h"
        ],
        "members": {
         "functions": [
          "e006_getLayoutDims",
          "e007_getPageSize",
          "e014_parametricStride"
+        ],
+        "types": [
+         "e005_CoordinateType",
+         "e007_DataInfo",
+         "e008_TransferPadInfo",
+         "e009_ScheduleNode",
+         "e010_BlockNode",
+         "e011_LoopNode",
+         "e012_ConditionNode",
+         "e013_SyncNode",
+         "e014_TransferNode",
+         "e015_ComputeNode",
+         "e016_ScheduleTree"
         ]
        }
       }

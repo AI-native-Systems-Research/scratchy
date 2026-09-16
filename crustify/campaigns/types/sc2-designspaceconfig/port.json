@@ -103,9 +103,21 @@
        "loc": 650,
        "deps": {
         "types": [
-         "e001_PaddingFormType",
-         "e006_DataStructDims",
-         "e016_ScheduleTree"
+         {
+          "name": "e001_PaddingFormType",
+          "defined_in": "crustify-types/cpp/dims.h",
+          "scope": "port"
+         },
+         {
+          "name": "e006_DataStructDims",
+          "defined_in": "crustify-types/cpp/dims.h",
+          "scope": "port"
+         },
+         {
+          "name": "e016_ScheduleTree",
+          "defined_in": "crustify-types/cpp/dsc2.h",
+          "scope": "port"
+         }
         ],
         "symbols": []
        },

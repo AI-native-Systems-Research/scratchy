@@ -127,8 +127,24 @@ def item(u, by_entry):
         "source_kind": u["kind"],
         "layer": u["layer"],
         "loc": u["span"],
-        # Dep NAMES, in the same `eNNN_Name` form as `name`, so an identity check can resolve them.
-        "deps": {"types": [f"{d}_{by_entry[d]['name']}" for d in u["deps"]], "symbols": []},
+        # ⛔ A v3 DEP IS A DICT WITH A `scope`, NOT A BARE NAME. crustify's wave.py:84-90 rejects the
+        # whole schedule with "invalid dependency scope" unless every entry is a dict whose `scope` is
+        # one of wrap/port/ext — and wavefront's own examples/waves.json predates that field, so
+        # copying its `{name, defined_in}` shape is not enough. `capacity` never hit this because
+        # every one of its items had EMPTY deps.
+        # Every dep here is another unit of this campaign, so the scope is "port" — not "ext", which
+        # would say the type is supplied from outside and needs no unit.
+        "deps": {
+            "types": [
+                {
+                    "name": by_entry[d]["entry"],
+                    "defined_in": f"crustify-types/cpp/{by_entry[d]['header']}",
+                    "scope": "port",
+                }
+                for d in u["deps"]
+            ],
+            "symbols": [],
+        },
         "fallback": [],
         "back_fill": [],
         "generates": [],
@@ -176,7 +192,7 @@ def schedule(stage, entries, by_entry, objective):
     for w in waves:
         for b in w["batches"]:
             for i in b["items"]:
-                for d in i["deps"]["types"]:
+                for d in [x["name"] for x in i["deps"]["types"]]:
                     assert d in seen or d not in {x["name"] for x in order}, \
                         f"{stage}: {i['name']} depends on {d} scheduled in the same or a later wave"
         seen |= {i["name"] for b in w["batches"] for i in b["items"]}
