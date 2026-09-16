@@ -308,12 +308,27 @@ impl tr::TransferLoads for Dsc2Store<'_, '_> {
 
 impl tr::FixedSizeTransfers for Dsc2Store<'_, '_> {
     /// ⛔ `metadata.dataConnects_.find(dc)->second.consumers_` AS WHAT EACH CONSUMER IS — a
-    /// [`tr::ScopeNode`], whose COMPUTE arm this tree has no node for.
+    /// [`tr::ScopeNode`] per consumer.
+    ///
+    /// ⛔⛔ A RECORDED CORRECTION: THIS REFUSED BECAUSE *"its Compute arm needs a COMPUTE node, which
+    /// `super::tree::Kind` has no arm for"*, AND THAT IS FALSE — [`super::tree::Kind::Compute`] holds
+    /// the whole node and [`tr::ScopeTree::scope_node`] in the sibling file ALREADY answers that arm
+    /// off it. Classifying a consumer is not what blocks this.
+    ///
+    /// ⛔ WHAT BLOCKS IT IS THE CENSUS: `metadata.dataConnects_` (`ddc/ddc_metadata.h:194`) is a map
+    /// no carrier owns, and `consumers_` (`:145`) is the list inside it — the
+    /// [`crate::schedule::ddc::metadata::Metadata`] is `run_v1`'s own local and is not one of
+    /// `Dsc2Carriers`' borrows, the same seam [`tu::FifoResults::connect_consumers`] and
+    /// [`tu::TransferMoves::producer_loops`] name. ⛔ AND AN EMPTY LIST IS NOT ITS ABSENCE: the caller
+    /// sizes a transfer from what consumes its connect, so *"nothing consumes this"* is a different
+    /// transfer, not a narrower one.
     fn connect_consumers(&self, _connect: DataConnect) -> Vec<tr::ScopeNode> {
         todo!(
-            "tr::FixedSizeTransfers::connect_consumers: wants each consumer of that data connect AS \
-             A ScopeNode — its Compute arm needs a COMPUTE node, which super::tree::Kind has no arm \
-             for"
+            "tr::FixedSizeTransfers::connect_consumers: wants \
+             metadata.dataConnects_.find(dc)->second.consumers_ as ScopeNodes \
+             (ddc/ddc_metadata.h:194, the list at :145) — the Metadata's own census, which is \
+             run_v1's local and no carrier's borrow. NOT the Compute arm: Kind::Compute holds the \
+             node and ScopeTree::scope_node already classifies one"
         )
     }
 
@@ -441,13 +456,25 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
 }
 
 impl tu::FifoResults for Dsc2Store<'_, '_> {
-    /// ⛔ `metadata.dataConnects_[connect].consumers_` as [`tu::FifoConsumer`]s — its compute arm
-    /// again.
+    /// ⛔ `metadata.dataConnects_[connect].consumers_` (`ddc/ddc_metadata.h:194`, the list at `:145`)
+    /// as [`tu::FifoConsumer`]s — THE METADATA'S CENSUS, which `run_v1` holds as a local and does not
+    /// hand to this carrier.
+    ///
+    /// ⛔⛔ A RECORDED CORRECTION: THIS ALSO SAID *"whose compute arm needs a COMPUTE node"*, AND IT
+    /// DOES NOT — [`tu::FifoConsumer::Compute`] carries the node AND its whole
+    /// [`crate::schedule::dsc2::ComputeNode`], and [`Dsc2Store::compute_of`] reads exactly that off
+    /// [`super::tree::Kind::Compute`]. The classification is free; the map is the seam.
+    ///
+    /// ⛔ AND `operator[]` IS WHAT THE REFERENCE USES ON THE UNNAMED CONNECT, so `dataConnects_[""]`
+    /// DEFAULT-CONSTRUCTS a real entry with no consumers — which is why this trait's own doc takes
+    /// [`None`] as a connect and not as an error.
     fn connect_consumers(&self, _connect: Option<DataConnect>) -> Vec<tu::FifoConsumer> {
         todo!(
-            "tu::FifoResults::connect_consumers: wants metadata.dataConnects_[connect].consumers_ as \
-             FifoConsumers — the metadata's census, which no carrier owns, and whose compute arm \
-             needs a COMPUTE node"
+            "tu::FifoResults::connect_consumers: wants \
+             metadata.dataConnects_[connect].consumers_ as FifoConsumers \
+             (ddc/ddc_metadata.h:194, the list at :145) — the Metadata is run_v1's local and no \
+             carrier's borrow. NOT the Compute arm: FifoConsumer::Compute carries the whole \
+             dsc2::ComputeNode and Dsc2Store::compute_of reads it"
         )
     }
 
@@ -584,14 +611,16 @@ impl tu::SkipRegResults for Dsc2Store<'_, '_> {
         });
     }
 
-    /// ⛔ `allocNode->removeAllocUser(user)` (`dsc/dsc2.h:1024`) — [`super::tree::Org`] has
-    /// `add_user` and no remove, and its abort *"Schedule node is not in the user list"* is
-    /// [`tu::AllocationUse`] missing, which a silent no-op would swallow.
+    /// ⛔ `allocNode->removeAllocUser(user)` (`dsc/dsc2.h:1022` — ⛔ CITATION CORRECTED, `:1024` is a
+    /// line INSIDE its body and `:1012` is `addAllocUser`) — [`super::tree::Org`] has `add_user` and
+    /// no remove, and that function's abort *"RemoveAllocUser: Schedule node <n> is not in the user
+    /// list of allocate node <a>"* (`:1032`) is [`tu::AllocationUse`] being unconstructible, which a
+    /// silent no-op would swallow.
     fn remove_alloc_use(&mut self, _alloc_use: tu::AllocationUse) {
         todo!(
             "tu::SkipRegResults::remove_alloc_use: wants allocNode->removeAllocUser(user) \
-             (dsc/dsc2.h:1024) — super::tree::Org has no remove, and its abort for a user not in the \
-             list would be swallowed by a no-op"
+             (dsc/dsc2.h:1022, its abort at :1032) — super::tree::Org has add_user and no remove, \
+             and its abort for a user not in the list would be swallowed by a no-op"
         )
     }
 
@@ -1082,7 +1111,8 @@ impl tr::OffsetAdjustment for Dsc2Store<'_, '_> {
     ///
     /// ⛔ THE `memOrg_` KEY IS THE OUTPUT'S **UNIT** AND NOT ITS `storage`, which is what
     /// `memOrg_.at(outputs_.at(idx))` spells: `outputs_` is a `std::vector<SenComponents>`
-    /// (`dsc/dsc2.h:934`) and the trait's own doc names it.
+    /// (`dsc/dsc2.h:936` — ⛔ CITATION CORRECTED, `:934` is `dataFormat_`) and the trait's own doc
+    /// names it.
     ///
     /// ⛔ EVERY [`None`] IS ALREADY THE PORT'S STATED DIVERGENCE, not one added here: entry 108's own
     /// doc says *"an output whose `memOrg_` entry is missing or whose `allocateNode_` is null makes
@@ -1163,29 +1193,41 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
         (ops.len() == 1).then_some(crate::schedule::ddl::conversion::ComputeOpIdx(0))
     }
 
-    /// ⛔ `computeOp_.back().interimLabeledDs.push_back(&labeledDs_[lds])`
-    /// (`ddc/ddc_transformation.cpp:1909`) — `interimLabeledDs` (`dsc/dscdefn.h:508`, *"for partial
-    /// results and other tensors that live only"* inside the op) is not a field of
-    /// [`v1::DscComputeOp`], which projects the five entries 307/308 read.
+    /// `computeOp_.back().interimLabeledDs.push_back(&labeledDs_[lds])`
+    /// (`ddc/ddc_transformation.cpp:1909-1910`) — ⭐ ANSWERED through the shared `currDsc` cell, now
+    /// that [`v1::DscComputeOp::interim`] projects `interimLabeledDs` (`dsc/dscdefn.h:508`).
     ///
-    /// ⛔ THE MISSING FIELD IS THE WORK, AND IT IS LOAD-BEARING RATHER THAN BOOKKEEPING — four live
+    /// ⛔⛔ THE FIELD WAS THE WHOLE BLOCKER AND IT IS LOAD-BEARING RATHER THAN BOOKKEEPING — four live
     /// readers: `ddc/ddc_transformation_util.cpp:1842` and `ddc/ddl/ddl_conversion.cpp:523` walk it,
     /// `dsc/superdsc.cpp:1585` feeds it to `insertLdsIdx`, and `dsc/designSpaceConfig.cpp:6738-6741`
-    /// puts it ON THE WIRE (with `:7495-7496` reading it back). ⭐ SO THE PORT IS
-    /// `DscComputeOp::interim: Vec<LdsIdx>` beside its `inputs`/`outputs` — the SAME shape, since
-    /// those two are *"as the indices those pointers carry"* — plus the emitter row.
+    /// puts it ON THE WIRE (with `:7495-7496` reading it back).
+    ///
+    /// ⭐ IT IS A PUSH AND `interimLabeledDs` HOLDS THE INDEX, NOT THE POINTER, for the reason
+    /// [`v1::DscComputeOp::inputs`] states: all three operand lists are
+    /// `std::vector<LabeledDsInfo*>` (`dsc/dscdefn.h:506-510`) over one `labeledDs_`, so the index
+    /// those pointers carry IS the entry.
+    ///
+    /// ⛔ `.back()` ON AN EMPTY `computeOp_` IS UNDEFINED THERE AND THE INDEX IS ALREADY PROVED HERE:
+    /// [`Self::sole_compute_op`] hands out [`crate::schedule::ddl::conversion::ComputeOpIdx`] only
+    /// when `ops.len() == 1`, which is the `DT_CHECK(computeOp_.size() == 1)` one line above the push
+    /// (`:1908`). An index the list does not hold is therefore a defect in this port and is FILED,
+    /// not dropped — a silent no-op would leave the minted `autoshuffle_reg_` tensor off the op and
+    /// so out of the SDSC JSON entirely.
     fn add_interim_lds(
         &mut self,
-        _compute_op: crate::schedule::ddl::conversion::ComputeOpIdx,
-        _lds: LdsIdx,
+        compute_op: crate::schedule::ddl::conversion::ComputeOpIdx,
+        lds: LdsIdx,
     ) {
-        todo!(
-            "tr::AutoShuffling::add_interim_lds: wants \
-             computeOp_.back().interimLabeledDs.push_back(&labeledDs_[lds]) \
-             (ddc/ddc_transformation.cpp:1909) — interimLabeledDs (dsc/dscdefn.h:508) is not a field \
-             of v1::DscComputeOp; it has four live readers and goes on the wire \
-             (dsc/designSpaceConfig.cpp:6738)"
-        )
+        let pushed = self.dsc_facts().with_ops_mut(|ops| {
+            ops.get_mut(compute_op.0).map(|op| op.interim.push(lds))
+        });
+        if pushed.is_none() {
+            let _: Option<()> = self.refuse(
+                "AutoShuffling::add_interim_lds: computeOp_ holds no op at that index, so \
+                 interimLabeledDs has nothing to push onto — .back() is undefined there and the \
+                 interim tensor would never reach the wire",
+            );
+        }
     }
 
     /// An [`AllocId`] no allocation carries yet.
@@ -1401,7 +1443,7 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
         self.halves()
     }
 
-    /// `getTransferType()` (`dsc/dsc2.h:883-896`) WITH THE LABELLED DS THE MATCHING SIDE NAMES — ⭐
+    /// `getTransferType()` (`dsc/dsc2.h:884-896`) WITH THE LABELLED DS THE MATCHING SIDE NAMES — ⭐
     /// ANSWERED WHOLE.
     ///
     /// ⛔⛔ THE `constantInfo_` OBJECTION WAS WRONG, exactly as it was for

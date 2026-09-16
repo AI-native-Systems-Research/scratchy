@@ -584,15 +584,29 @@ impl tr::ComputeWalk for Dsc2Store<'_, '_> {
     /// ⛔ `type_` ON A COMPUTE NODE — AND THE ARM IS NOT WHAT BLOCKS IT. `Kind::Compute` holds the
     /// whole [`ComputeNode`], but the C++ field is `ComputeOpType type_ = ComputeOpType::COUNT`
     /// (`dsc/dsc2.h:933`) and [`ComputeNode::op`] projects a
-    /// [`crate::schedule::ddl::ops::DdlComputeType`] — the DDL's `computetype=` set, whose 34 arms
-    /// are `Macc`/`Fma16`/…/`And` and include NEITHER value [`tr::ComputeOp`] classifies. Answering
-    /// `Other` for a `RECIPROCAL` or a `LAYERNORMSCALE` is the wrong branch of entry 105, not a
-    /// default.
+    /// [`crate::schedule::ddl::ops::DdlComputeType`] instead.
+    ///
+    /// ⛔⛔ TWO CLOSED SETS, AND THE ONE THAT *CAN* SPELL BOTH IS THE ONE WE DROPPED — counted, not
+    /// inherited. `ComputeOpType` (`dsc/dscdefn.h:134-207`) has **70** arms and HOLDS BOTH:
+    /// `RECIPROCAL` at `:157` and `LAYERNORMSCALE` at `:158`, which is where
+    /// [`tr::ComputeOp`]'s own doc points. [`crate::schedule::ddl::ops::DdlComputeType`] is the
+    /// DDL's `computetype=` set — **33** arms, `Macc`/`Fma16`/…/`And`
+    /// (`ddl/ops.rs:628`, the thirty-three names `ComputeOp::verify` tests at `DdlOps.cpp:119-128`)
+    /// — and it holds NEITHER. So the two named arms are unreachable because this port narrowed
+    /// `type_` to the DDL census, not because the reference cannot express them.
+    ///
+    /// ⛔ AND `Other` IS THE WRONG BRANCH, NOT A DEFAULT: entry 105 picks the LAST `RECIPROCAL` or
+    /// `LAYERNORMSCALE` in the tree and how many inputs stick packing must then find for it, so
+    /// answering `Other` for one selects no compute and packs nothing. ⭐ THE WORK IS
+    /// `ComputeNode::op` carrying `ComputeOpType`'s range — the DDL set is a SUBSET of it, so the
+    /// widening is lossless and `From<DdlComputeType>` is the join.
     fn compute_op(&self, _node: NodeId) -> tr::ComputeOp {
         todo!(
             "tr::ComputeWalk::compute_op: wants ComputeNode::type_, a ComputeOpType \
-             (dsc/dsc2.h:933) — dsc2::ComputeNode::op projects DdlComputeType, which cannot spell \
-             RECIPROCAL or LAYERNORMSCALE, so tr::ComputeOp's two named arms are unreachable"
+             (dsc/dsc2.h:933) whose 70 arms include RECIPROCAL (dsc/dscdefn.h:157) and \
+             LAYERNORMSCALE (:158) — dsc2::ComputeNode::op projects DdlComputeType instead, the \
+             DDL's 33-arm computetype= set, which holds neither, so tr::ComputeOp's two named arms \
+             are unreachable"
         )
     }
 }
@@ -629,8 +643,9 @@ impl v1::ComputeMasks for Dsc2Store<'_, '_> {
 
 impl tr::ComputeMasking for Dsc2Store<'_, '_> {
     /// `compNode->name_` — ⭐ ANSWERED, AND IT NEVER NEEDED A COMPUTE NODE. `name_` is declared on
-    /// the BASE class: `std::string name_;` sits beside `const NodeType nodeType_` in `ScheduleNode`
-    /// (`dsc/dsc2.h:459`), which `ComputeNode` inherits through
+    /// the BASE class: `std::string name_;` (`dsc/dsc2.h:461`) sits beside
+    /// `const NodeType nodeType_ = INVALID` (`:460`) in `ScheduleNode`, which `ComputeNode` inherits
+    /// through
     /// `InheritWithClone<ScheduleNode, ComputeNode>` (`dsc/dsc2.h:900`). So `compNode->name_` and
     /// `node->name_` are ONE field, and [`tu::ScheduleSurgery::node_name`] already answers it —
     /// delegated rather than re-read so the two cannot give two names for one node.
@@ -881,7 +896,8 @@ fn as_util_cond(held: LoopCondComposite) -> tu::LoopCondComposite {
     }
 }
 
-/// `condOp_` (`dsc/dsc2.h:656`) read through `control_flow`'s spelling — the same eight arms.
+/// `condOp_` (`dsc/dsc2.h:661` — ⛔ CITATION CORRECTED, `:656` is `condValTypeToString`) read through
+/// `control_flow`'s spelling — the same eight arms.
 const fn as_util_op(
     op: crate::schedule::dsc2::CondOp,
 ) -> crate::bridges::superdsc_to_dataflow_ir::control_flow::CondOp {
