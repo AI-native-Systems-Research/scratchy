@@ -45,19 +45,22 @@
 //! something to inherit from whoever created the file.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, StickPart, cumulative_stick_sizes,
 };
 use crate::schedule::ddc::fold::PadType;
 use crate::schedule::ddc::metadata::DatastageId;
-use crate::schedule::ddc::transformation_util::StageName;
-use crate::schedule::ddc::v1::LdsSticks;
-use crate::schedule::dsc2::{AllocateNode, Dsc, LdsIdx, LoopNode, Padding};
+use crate::schedule::ddc::transformation::Scale;
+use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
+use crate::schedule::ddc::v1::{DimSample, LdsSticks, sampled_as, stick_divisor};
+use crate::schedule::dsc2::{AllocateNode, Coordinate, Dsc, LdsIdx, LoopNode, Padding};
+use crate::units::{Corelet, Row};
 
 use super::dsc::{
-    DataStage, DataStages, FilledDims, NamedDims, PadElems, SenComponent, StageDims, StatedVolumes,
-    Symbolic, SymbolicDimInfo, UnneededPad, VolumeLimit,
+    DataStage, DataStages, FilledDims, IndirectAlloc, LabeledDs, NamedDims, PadElems, SenComponent,
+    StageDims, StatedVolumes, Symbolic, SymbolicDimInfo, UnneededPad, VolumeLimit,
 };
 
 /// WHICH NODE IS BEING SIZED — the `nodeType_ == dsc2::ScheduleNode::ALLOCATE` test
@@ -788,6 +791,552 @@ mod tests_e016 {
                 &dsc,
             ),
             None
+        );
+    }
+}
+
+/// WHICH BUFFER, SAMPLED WHERE — `getBufferCapacityForNodePerDimCustomLocation`'s `ldsIdx`, `comp`,
+/// `corelet` and `row` (`dsc/dsc2.cpp:3757`), with `labeledDs_.at(ldsIdx)` already resolved beside
+/// the index and the component's forcing of the other two APPLIED BY THE CONSTRUCTOR.
+///
+/// ⛔ THE FORCING CANNOT BE A STEP INSIDE THE BODY, because the `row` it produces then SELECTS the
+/// coordinate (`:3774-3778`): a sample assembled any other way would read `sliceViewCoordinates_`
+/// where the reference reads `allocateCoordinates_`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SampledBuffer<'a> {
+    /// `ldsIdx`.
+    lds: LdsIdx,
+    /// `labeledDs_.at(ldsIdx)` — PAIRED WITH THE INDEX, which is what makes that `.at` unspellable,
+    /// exactly as [`LabeledDs`]'s own zip of `layoutDimOrder_` with `scale_` is.
+    info: &'a LabeledDs,
+    /// `comp`.
+    comp: SenComponent,
+    /// `corelet`, once forced.
+    corelet: Option<Corelet>,
+    /// `row`, once forced.
+    row: Option<Row>,
+}
+
+impl<'a> SampledBuffer<'a> {
+    /// `if (!is_any_of(comp, PTARF, PTIRF, PTXRF)) { row = -1; if (!is_any_of(comp, SFPLRF, PELRF,
+    /// L0, L0_SCALE, SFPSTATE, PESTATE)) corelet = -1; }` (`dsc/dsc2.cpp:3768-3772`).
+    #[must_use]
+    pub const fn of(
+        lds: LdsIdx,
+        info: &'a LabeledDs,
+        comp: SenComponent,
+        corelet: Option<Corelet>,
+        row: Option<Row>,
+    ) -> Self {
+        let (corelet, row) = match comp {
+            SenComponent::Ptarf | SenComponent::Ptirf | SenComponent::Ptxrf => (corelet, row),
+            SenComponent::Sfplrf
+            | SenComponent::Pelrf
+            | SenComponent::L0
+            | SenComponent::L0Scale
+            | SenComponent::Sfpstate
+            | SenComponent::Pestate => (corelet, None),
+            _ => (None, None),
+        };
+        Self {
+            lds,
+            info,
+            comp,
+            corelet,
+            row,
+        }
+    }
+}
+
+/// WHAT SIZING AN ALLOCATION READS OFF ITS NODE THAT [`AllocateNode`] HAS NO SLOT FOR — five
+/// `dsc2::AllocateNode` members the capacity walk touches (`dsc/dsc2.h:990-1006`).
+///
+/// ⛔ PARAMETERS AND NOT FIELDS, for the reason [`AllocateNode::page_sizes`] takes its indirection
+/// and e015 takes `nonUnifiedAllocInHBM_`: [`AllocateNode`] derives no [`Default`] and every one of
+/// its construction sites is an exhaustive struct literal, three of them in `schedule/ddl/
+/// conversion.rs`, which another agent owns this wave.
+#[derive(Debug, Clone, Copy)]
+pub struct AllocSizing<'a> {
+    /// `allocateCoordinates_`.
+    pub allocate_coordinates: &'a Coordinate,
+    /// `sliceViewCoordinates_` — ⛔ NEVER SERIALISED (`dsc/dsc2.cpp:1827` is a bare `// TO DO:
+    /// sliceview coordinate`), so [`None`] is what all 187 g0 reference exports state.
+    pub slice_view_coordinates: Option<&'a Coordinate>,
+    /// `ignoreSymbolicVolumeLimits_`.
+    pub ignore_symbolic_volume_limits: bool,
+    /// `indirectAllocType_`, as `getPageSize()` is asked with it.
+    pub indirect: Option<IndirectAlloc>,
+    /// `backGapCore_`'s KEYS ALONE. ⚠️ NARROWED TO WHAT THE DEFERRED GAP ARM NEEDS TO FIRE: the
+    /// per-core gap values (`dsc/dsc2.cpp:3941-3954`) land with that arm.
+    pub back_gap_dims: &'a BTreeSet<PrimaryDim>,
+}
+
+/// HOW THE CAPACITY IS ASKED FOR — the three trailing default arguments (`dsc/dsc2.cpp:3759-3761`).
+///
+/// ⛔ NO [`Default`] DERIVE: `includeGaps` DEFAULTS TRUE and `bool::default()` is false, so a derive
+/// would silently drop every back gap. [`Self::DEFAULTS`] is the signature's own three values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityForm {
+    /// `doNotRound` — leave each dim unrounded to full sticks.
+    pub do_not_round: bool,
+    /// `includeGaps` — add `backGapCore_`'s back gap to each dim.
+    pub include_gaps: bool,
+    /// `allowSymbolicVolumeLimit` — whether a symbolic volume limit over a layout dim is admitted
+    /// rather than aborted (`:3789-3791`).
+    pub allow_symbolic_volume_limit: bool,
+}
+
+impl CapacityForm {
+    /// The declaration's own three defaults, verbatim.
+    pub const DEFAULTS: Self = Self {
+        do_not_round: false,
+        include_gaps: true,
+        allow_symbolic_volume_limit: false,
+    };
+}
+
+/// Replaces: e017_getBufferCapacityForNodePerDimCustomLocation
+///
+/// HOW MANY ELEMENTS ONE BUFFER SPANS ALONG EACH LAYOUT DIM, sized at a location that need not be
+/// the allocation's own: a `-1` scale spans one element, a `-2` scale a whole stick, and every other
+/// dim the larger of the sizing stage's two halves read at this component, row and corelet — then MX
+/// block scaled, rounded up to full sticks, and spread over its stick gap.
+///
+/// ⛔ `Extent(-1)` IS A SIZE AND NOT AN ABSENCE (`dsc/dsc2.cpp:3818`): e019 folds each dim in as
+/// `max(size, 1)` (`:3987`), so a dim the sizing stage states nothing for contributes ONE. [`None`]
+/// is a stop — every `.at`, and the narrowing named on [`sampled_or_absent`].
+/// ⛔ THE COORDINATE SELECTOR IS NOT `v1::CoordinateOffsets::alloc_coordinate`, a DIFFERENT rule
+/// over the same two fields (`:3774-3778` against `ddc/v1.rs:2281`).
+/// ⛔ THE MX DIVIDE AND THE ROUNDING SIT INSIDE THE `scale >= 0` ARM (`:3830-3935`, brace-checked
+/// against the authority), so a `-1` or `-2` scale is neither divided nor rounded.
+#[must_use]
+pub fn buffer_capacity_per_dim_at(
+    node: SizedNode,
+    alloc: &AllocateNode,
+    sizing: AllocSizing<'_>,
+    at: SampledBuffer<'_>,
+    form: CapacityForm,
+    ancestors: &AncestorLoops<'_>,
+    dsc: &(impl SizeDsc + ?Sized),
+) -> Option<Vec<(PrimaryDim, Extent)>> {
+    let ldims = dsc.layout_dims(at.lds);
+    // ⛔ THE SIZING GOES THROUGH THE ALLOCATION'S OWN `ldsIdx_`, NOT `at.lds` (`:3765`): e016 forwards
+    // `myAllocNode->ldsIdx_`, and the two are a different lds wherever `node` is not the allocation.
+    let dstg = size_data_stage_of_alloc_at_node(node, alloc, ancestors, dsc)?;
+
+    // `(row != -1 && sliceViewCoordinates_.foldConstructed()) ? sliceView : allocate` (`:3774-3778`).
+    let effective = match (at.row, sizing.slice_view_coordinates) {
+        (Some(_), Some(slice_view)) if slice_view.fold_constructed() => slice_view,
+        _ => sizing.allocate_coordinates,
+    };
+    let has_coordinate = effective.fold_constructed();
+
+    // `if (!myAllocNode->ignoreSymbolicVolumeLimits_)` (`:3780-3802`). ⛔ THE STATE MACHINE UNDER IT
+    // (`:3809-3817`) IS INERT RATHER THAN SKIPPED, and that is why it needs no code: the only writer
+    // of `currentVolumeLimit` is this loop, so on every path that leaves it the limit is EMPTY,
+    // `dimInSymVolume`/`symVolumeInProgress`/`lastInSymVolume` are all false and the
+    // `DT_CHECK_MSG(!(symVolumeInProgress && !dimInSymVolume), ..)` cannot fire.
+    if !sizing.ignore_symbolic_volume_limits {
+        for keyed in dstg.ss.dims.dims().symbolic.volumes().keys() {
+            if ldims.iter().any(|entry| keyed.contains(&entry)) {
+                todo!(
+                    "capacity::buffer_capacity_per_dim_at: dsc/dsc2.cpp:3780-3802 and :3809-3817 — \
+                     {keyed:?} is a symbolic volume limit naming this tensor's layout dims \
+                     (allowSymbolicVolumeLimit = {allowed}), so the limit has to be carried DOWN \
+                     the layout order — every dim it names sized -1 until the last, which takes the \
+                     limit itself — and the two partial-match aborts raised on the way",
+                    allowed = form.allow_symbolic_volume_limit,
+                );
+            }
+        }
+    }
+
+    // `getCumulativeStickSizes(myLds.dsType_)` (`:3804`).
+    let stick_sizes = cumulative_stick_sizes(&dsc.stick_dims(at.lds), StickPart::Whole)?;
+    // `myAllocNode->getPageSize()` (`:3806`) — EMPTY for the `NO_INDIRECTION` every program states.
+    let page_size = alloc.page_sizes(sizing.indirect);
+    let padded = padding_form(&alloc.placement.padding);
+    let sample = DimSample {
+        comp: sampled_as(at.comp),
+        row: at.row,
+        corelet: at.corelet,
+    };
+
+    let mut size_per_dim: Vec<(PrimaryDim, Extent)> = Vec::new();
+    // `for (auto& entry : ldims)` (`:3808-3956`).
+    for entry in ldims.iter() {
+        let mut dim_size;
+        // `myLds.scale_.at(getDimIndexInLayoutOrder(myLds.dsType_, entry))` (`:3820-3822`) AS ONE
+        // LOOKUP, whose [`None`] is *"Invalid layoutDimOrder_ index."*.
+        match at.info.scale(entry)? {
+            // `scale == -1` (`:3824-3826`).
+            Scale::UnitStick => {
+                dim_size = Extent(1);
+                if page_size.contains_key(&entry) {
+                    return None;
+                }
+            }
+            // `scale == -2` (`:3827-3829`) — `stickSizePerDim.at(entry)`, and that `.at` throws for a
+            // dim the stick order does not name, where the rounding arm below reads 1 instead.
+            Scale::StickDim => {
+                let &(_, stick) = stick_sizes.iter().find(|&&(sized, _)| sized == entry)?;
+                dim_size = Extent(i64::try_from(stick.0).ok()?);
+                if page_size.contains_key(&entry) {
+                    return None;
+                }
+            }
+            Scale::Sized(_) => {
+                // `hasCoordinate && !effectiveCoord.coreIdToWkSlice_.empty()` (`:3833-3835`), the
+                // reference's own `FIXME` about using the coordinate only for a custom work slice.
+                if has_coordinate && effective.wk_slices().next().is_some() {
+                    todo!(
+                        "capacity::buffer_capacity_per_dim_at: dsc/dsc2.cpp:3833-3877 — {entry:?} \
+                         has a custom coreIdToWkSlice_, so its size is the PRODUCT of the \
+                         cardinalities of every ELEM_ARR_COORD fold, plus the corelet and dummy \
+                         rowsplit folds in LX and the core and dummy rowsplit folds in HBM; ⛔ \
+                         dsc2::FoldDim::cardinality_at CANNOT reach those positions — its \
+                         FoldPosition is the closed three, and this walks folds().enumerate()"
+                    );
+                }
+                // `std::max(ssVal, elVal)` over `primaryDimToVal_st(entry, comp, row, corelet,
+                // myAllocNode->padding_)` on both halves (`:3878-3891`).
+                let ss = sampled_or_absent(dstg.ss.dims.dims(), entry, sample, &padded)?;
+                let el = sampled_or_absent(dstg.el.dims.dims(), entry, sample, &padded)?;
+                dim_size = Extent(ss.0.max(el.0));
+                if page_size.contains_key(&entry) {
+                    todo!(
+                        "capacity::buffer_capacity_per_dim_at: dsc/dsc2.cpp:3893-3922 — {entry:?} \
+                         is paged: an INDEX_TENSOR counts the pages it addresses, a VALUE_TENSOR \
+                         takes one page (min for a fixed dim, the page itself for a symbolic one, \
+                         whose granularity then divides the volume limit down)"
+                    );
+                }
+                // `myLds.scaledLdsCategory_ == SCALE_TENSOR && entry == myLds.mxInfo_.dim`
+                // (`:3924-3929`), which [`LabeledDs::scale_tensor`] already reads as the ONE pair.
+                //
+                // ⭐ PORTED, NOT DEFERRED, though `mxInfo_.blkSize` is 0 on all 807 g0 labelled DSs:
+                // [`ScaleBlock`](crate::schedule::ddc::fold::ScaleBlock) is non-zero by construction,
+                // so the divide is total and the arm costs a `todo!` a bundle outside g0 could walk
+                // into — the reading [`StageDims::sampled_extent`] took for `peSfpSplit_`.
+                if let Some(mx) = at.info.scale_tensor()
+                    && mx.dim == entry
+                {
+                    dim_size = Extent(dim_size.0 / i64::try_from(mx.blk_size.count().0).ok()?);
+                    // `DT_CHECK(dimSize != 0)` (`:3928`) — a block wider than the dim is a stop.
+                    if dim_size.0 == 0 {
+                        return None;
+                    }
+                }
+                // `if (!doNotRound) if (auto it = stickSizePerDim.find(entry); ..)` (`:3930-3935`) —
+                // and a dim the sticks do not name divides by 1, which is the identity.
+                if !form.do_not_round {
+                    dim_size = rounded_to_sticks(dim_size, stick_divisor(&stick_sizes, entry)?)?;
+                }
+            }
+        }
+        // `if (includeGaps && myAllocNode->backGapCore_.count(entry))` (`:3937-3955`).
+        if form.include_gaps && sizing.back_gap_dims.contains(&entry) {
+            todo!(
+                "capacity::buffer_capacity_per_dim_at: dsc/dsc2.cpp:3937-3955 — {entry:?} carries a \
+                 backGapCore_ gap to add to its size: HBM reads the `-1` key and every other \
+                 component the first core's, which every core of coreIdsUsed_ must then agree with"
+            );
+        }
+        // `sizePerDim.emplace_back(entry, dimSize + gap)` (`:3956`), whose `gap` is 0 until that arm
+        // lands.
+        size_per_dim.push((entry, dim_size));
+    }
+
+    // `for (auto gapStickSpread : myAllocNode->gapStickSpread_) for (auto& sizeDim : sizePerDim)`
+    // (`:3958-3961`) — a TRUNCATING integer divide, as the reference's `int /=` is.
+    for (&dim, &spread) in &alloc.gap_stick_spread {
+        let spread = i64::try_from(NonZeroU64::new(spread.0)?.get()).ok()?;
+        for sized in &mut size_per_dim {
+            if sized.0 == dim {
+                sized.1 = Extent(sized.1.0 / spread);
+            }
+        }
+    }
+    Some(size_per_dim)
+}
+
+/// `myAllocNode->padding_` AS `primaryDimToVal_st`'s `padding` ARGUMENT — one `PaddingFormType`
+/// reached through the two Rust wrappers of it, [`Padding`] on the allocate node and [`PaddingForm`]
+/// on the dims being read. Both answer `NOPAD` for a dim they do not name, so the copy is total.
+fn padding_form(padding: &Padding) -> PaddingForm {
+    let mut form = PaddingForm::default();
+    for dim in padding.dims() {
+        form.set_padding(dim, padding.get(dim));
+    }
+    form
+}
+
+/// `primaryDimToVal_st(entry, comp, row, corelet, myAllocNode->padding_)` (`dsc/dsc2.cpp:3885-3890`)
+/// with the reference's `-1` TOLD APART FROM ITS THROWS, as [`full_span_with_unneeded`] does for e015.
+///
+/// ⛔ `-1` IS THE ANSWER THIS CALLER NEEDS AS A VALUE. Where no split and no symbol names `dim`,
+/// [`StageDims::sampled_extent`] provably reduces to the raw slot through `calculate_padded`'s `if
+/// (val < 0) return -1` (`dsc/dims.cpp:566-567`), so its [`None`] is unambiguously that `-1` — and
+/// e015 writes exactly that slot for a dim its den stage stated nothing for.
+///
+/// ⚠️ A NARROWING, IN THE SAFE DIRECTION: where a split DOES name `dim` the [`None`] stays a stop,
+/// because the `.at`s under it throw and the reference's `-1` is then unreachable anyway.
+fn sampled_or_absent(
+    dims: &StageDims,
+    dim: PrimaryDim,
+    at: DimSample,
+    padded: &PaddingForm,
+) -> Option<Extent> {
+    if !dims.row_split.contains_key(&dim)
+        && !dims.pe_sfp_split.contains_key(&dim)
+        && !dims.corelet_split.contains_key(&dim)
+        && !dims.symbolic.info().contains_key(&dim)
+        && dims.extent(dim).is_none_or(|slot| slot.0 < 0)
+    {
+        return Some(Extent(-1));
+    }
+    dims.sampled_extent(dim, at, padded, None, false)
+}
+
+/// `std::ceil(float(dimSize) / it->second) * it->second` (`dsc/dsc2.cpp:3933`) IN INTEGERS.
+///
+/// ⭐ IT ROUNDS `-1` UP TO ZERO for any stick wider than one element, exactly as the reference's
+/// `std::ceil(-0.015625) * 64` does, and e019 then reads both as `max(size, 1)`.
+///
+/// ⚠️ DIVERGENCE, AND IT IS THE EXACT DIRECTION: the reference rounds through a 32-bit `float`, which
+/// cannot hold a stick count past 2^24 — this is exact for every size.
+fn rounded_to_sticks(size: Extent, sticks: NonZeroU64) -> Option<Extent> {
+    let sticks = i64::try_from(sticks.get()).ok()?;
+    let up = size.0.saturating_neg().div_euclid(sticks).saturating_neg();
+    Some(Extent(up.saturating_mul(sticks)))
+}
+
+#[cfg(test)]
+mod tests_e017 {
+    //! ⭐⭐ TWO CAPACITIES THE REFERENCE ITSELF RECORDED — `/Users/nickm/tmp/bridge1-fixtures/g0/
+    //! debug/sdsc_1/sdsc.json`, DSC `rmmean_o728`, exported after ITS OWN L3/ddc/dcg ran.
+    //!
+    //! ⭐ WHERE THE REFERENCE WROTE ITS ANSWER DOWN, so nothing here is hand-transcribed:
+    //! `bufferOffsetCoreCorelet_[core][cl] = kv.second / numBuffers_` where `kv.second == numBuffers_
+    //! * getBufferCapacityForNode(allocNode, ldsIdx, component_, corelet, row)`
+    //! (`ddc/ddcv1.cpp:244`, `:352-357`; `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5556-5561`,
+    //! `:5658`). For an allocate node with `ldsIdx_ >= 0` and `numBuffers_ != -1` the EXPORTED OFFSET
+    //! IS THE CAPACITY. (`numBuffers_ == -1` is excluded because `ddcv1.cpp:230` raises its size to
+    //! the whole memory first; both nodes below state 2.)
+    //!
+    //! The export states `primaryDsInfo_["OUTPUT"] = {layoutDimOrder_: ["mb","out","y"],
+    //! stickDimOrder_: ["out"], stickSize_: [64]}`, `dataStageParam_["1"]` (`name_: "chunk"`) `=
+    //! {out_: 2048, mb_: 1, y_: 1}` with every split, symbol, volume and padding map EMPTY,
+    //! `scheduleTreeHeadDenId_: 0`, and the tree `loop_ds0_ds1_y` (ROOT, `prev_: ""`, `denId_: 1`) →
+    //! `loop_ds0_ds1_mb` (`denId_: 1`) → {`allocate_lds1_lx`, `loop_ds0_ds1_out` (`denId_: 1`) →
+    //! `allocate_lds0_lx`}. So all three layout dims are sized by datastage 1.
+    //!
+    //! * `allocate_lds1_lx` — `ldsIdx_: 2`, `scale_: [1,-2,1]`, `wordLength: 2`, `numBuffers_: 2`,
+    //!   `bufferOffsetCoreCorelet_: {"0": {"0": 256}}`. Per dim `[(mb,1),(out,64),(y,1)]`: `out` takes
+    //!   the STICK, 64, and is NOT rounded. e019 then reads `64 * 2 = 128` bytes — an ODD number of
+    //!   128-byte sticks, so L3's `forceEvenNumSticks` adds one (`dsc2.cpp:3996-4003`): **256**.
+    //! * `allocate_lds0_lx` — `ldsIdx_: 0`, `scale_: [1,1,1]`, `wordLength: 2`, `numBuffers_: 2`,
+    //!   `bufferOffsetCoreCorelet_: {"0": {"0": 4096}}`. Per dim `[(mb,1),(out,2048),(y,1)]`: `out`
+    //!   comes from the CHUNK stage, `max(2048, 2048)`. e019 reads `2048 * 2 = 4096` — an even 32
+    //!   sticks, so no bump: **4096**.
+    //!
+    //! ⭐ THE TWO DISCRIMINATE THE TWO LIVE SCALE ARMS AGAINST EACH OTHER: 64 is unreachable from the
+    //! data-stage path and 2048 unreachable from the stick path, on the SAME stage and the SAME stick
+    //! order — only `scale_` differs.
+    //!
+    //! ⚠️ WHAT THIS DOES NOT PIN: the rounding runs on all three `Sized` dims here and is the IDENTITY
+    //! on each (1, 2048 and 1 are whole stick counts), so its ceiling is unwitnessed by g0 — no
+    //! program of the 187 rounds a capacity dim UP.
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::arch::Elements;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+        Extent, PrimaryDim, StickDims,
+    };
+    use crate::schedule::ddc::metadata::DatastageId;
+    use crate::schedule::ddc::transformation::{DsType, Scale};
+    use crate::schedule::ddc::transformation_util::StageName;
+    use crate::schedule::dsc2::{
+        AllocLayout, AllocPlacement, Coordinate, LayoutDims, MaxDimSize, NodeName, NumBuffers,
+        StartAddress,
+    };
+
+    use super::super::dsc::{
+        DataStage, DataStages, FilledDims, LabeledDs, NamedDims, Pinning, SenComponent, StageDims,
+    };
+    use super::tests_e015::dividing;
+    use super::{
+        AllocSizing, AllocateNode, AncestorLoops, CapacityForm, Dsc, LdsIdx, LdsSticks, Padding,
+        SampledBuffer, SizeDsc, SizedNode, buffer_capacity_per_dim_at,
+    };
+
+    const MB: PrimaryDim = PrimaryDim::Mb;
+    const OUT: PrimaryDim = PrimaryDim::Out;
+    const Y: PrimaryDim = PrimaryDim::Y;
+
+    /// One half of a stage — sdsc_1 states nothing but the three slots.
+    fn half(name: &str, out: i64) -> NamedDims {
+        let mut dims = StageDims::default();
+        dims.extents.insert(OUT, Extent(out));
+        dims.extents.insert(MB, Extent(1));
+        dims.extents.insert(Y, Extent(1));
+        NamedDims {
+            name: StageName(name.to_owned()),
+            dims: FilledDims::of(dims).expect("a stage stating three dims"),
+        }
+    }
+
+    /// `sdsc_1`'s DSC through the five seams the capacity walk reads it by.
+    struct Sdsc1 {
+        stages: DataStages,
+        tensor0: LabeledDs,
+        tensor1: LabeledDs,
+    }
+
+    impl Sdsc1 {
+        /// `dataStageParam_["0"]` (`core`) and `["1"]` (`chunk`) both `{out_: 2048, mb_: 1, y_: 1}`,
+        /// plus `labeledDs_[0]` (`scale_: [1,1,1]`) and `labeledDs_[2]` (`scale_: [1,-2,1]`), each
+        /// zipped onto `layoutDimOrder_: ["mb","out","y"]`.
+        fn of() -> Self {
+            let stage = |name: &str| DataStage {
+                ss: half(name, 2048),
+                el: half(name, 2048),
+            };
+            Self {
+                stages: DataStages::new(stage("core"), stage("chunk")),
+                tensor0: LabeledDs::new(
+                    DsType::Output,
+                    vec![
+                        (MB, Scale::Sized(1.0)),
+                        (OUT, Scale::Sized(1.0)),
+                        (Y, Scale::Sized(1.0)),
+                    ],
+                    LdsIdx(0),
+                    Pinning::default(),
+                ),
+                tensor1: LabeledDs::new(
+                    DsType::Output,
+                    vec![
+                        (MB, Scale::Sized(1.0)),
+                        (OUT, Scale::StickDim),
+                        (Y, Scale::Sized(1.0)),
+                    ],
+                    LdsIdx(2),
+                    Pinning::default(),
+                ),
+            }
+        }
+    }
+
+    impl LdsSticks for Sdsc1 {
+        /// `primaryDsInfo_["OUTPUT"]` — `stickDimOrder_: ["out"]`, `stickSize_: [64]`, no slice flags.
+        fn stick_dims(&self, _lds: LdsIdx) -> StickDims {
+            StickDims(vec![(OUT, Elements(64))])
+        }
+    }
+
+    impl Dsc for Sdsc1 {
+        /// `getLayoutDims(..)` — `["mb","out","y"]`, which both allocate nodes carry.
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            LayoutDims::new(MB, vec![OUT, Y])
+        }
+    }
+
+    impl SizeDsc for Sdsc1 {
+        /// `N_ = {"name_": "n", "out_": 2048, "mb_": 1, "y_": 1}` — unread here, since neither node
+        /// is the HBM arm.
+        fn whole_data_structure(&self) -> Option<NamedDims> {
+            Some(half("n", 2048))
+        }
+
+        fn layout_dim_set(&self, _lds: LdsIdx) -> Option<BTreeSet<PrimaryDim>> {
+            Some(BTreeSet::from([MB, OUT, Y]))
+        }
+
+        fn data_stages(&self) -> &DataStages {
+            &self.stages
+        }
+    }
+
+    /// `allocate_lds<n>_lx` as the export prints it: `component_: "lx"`, `numBuffers_: 2`,
+    /// `padding_: {}`, `gapStickSpread_: {}`, `maxDimSizes_: [-1,-1,-1]`.
+    fn lds_lx(name: &str, lds: LdsIdx) -> AllocateNode {
+        AllocateNode {
+            name: NodeName(name.to_owned()),
+            component: SenComponent::Lx,
+            lds: Some(lds),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new(
+                (MB, MaxDimSize::Unset),
+                vec![(OUT, MaxDimSize::Unset), (Y, MaxDimSize::Unset)],
+            ),
+            start_address: StartAddress::default(),
+            placement: AllocPlacement {
+                num_buffers: NumBuffers::Double,
+                padding: Padding::default(),
+                buffer_offset: BTreeMap::new(),
+                is_start_addr_symbolic: false,
+            },
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        }
+    }
+
+    /// e017 — the two per-dim sizings behind `sdsc_1`'s own two exported buffer offsets.
+    #[test]
+    fn the_stick_scaled_dim_takes_the_stick_and_the_plain_one_takes_the_datastage() {
+        let dsc = Sdsc1::of();
+        // `allocateCoordinates_` with `foldConstructed_: 0` and `coreIdToWkSlice_: {}`, which is what
+        // all 1745 serialised coordinate blocks of g0 state.
+        let coordinates = Coordinate::default();
+        let no_gaps = BTreeSet::new();
+        let sizing = AllocSizing {
+            allocate_coordinates: &coordinates,
+            slice_view_coordinates: None,
+            ignore_symbolic_volume_limits: false,
+            indirect: None,
+            back_gap_dims: &no_gaps,
+        };
+        let head = Some(DatastageId(1));
+        let mb_loop = dividing("loop_ds0_ds1_mb", MB, DatastageId(1));
+        let out_loop = dividing("loop_ds0_ds1_out", OUT, DatastageId(1));
+
+        // `allocate_lds1_lx`, whose `scale_.at(1)` is `-2`: `out` is the STICK.
+        let lds1 = lds_lx("allocate_lds1_lx", LdsIdx(2));
+        assert_eq!(
+            buffer_capacity_per_dim_at(
+                SizedNode::Allocate {
+                    component: SenComponent::Lx,
+                    non_unified_in_hbm: false,
+                },
+                &lds1,
+                sizing,
+                SampledBuffer::of(LdsIdx(2), &dsc.tensor1, SenComponent::Lx, None, None),
+                CapacityForm::DEFAULTS,
+                &AncestorLoops::of(vec![&mb_loop], head),
+                &dsc,
+            ),
+            Some(vec![(MB, Extent(1)), (OUT, Extent(64)), (Y, Extent(1))])
+        );
+
+        // `allocate_lds0_lx`, whose `scale_` is all ones: `out` is the CHUNK stage's 2048.
+        let lds0 = lds_lx("allocate_lds0_lx", LdsIdx(0));
+        assert_eq!(
+            buffer_capacity_per_dim_at(
+                SizedNode::Allocate {
+                    component: SenComponent::Lx,
+                    non_unified_in_hbm: false,
+                },
+                &lds0,
+                sizing,
+                SampledBuffer::of(LdsIdx(0), &dsc.tensor0, SenComponent::Lx, None, None),
+                CapacityForm::DEFAULTS,
+                &AncestorLoops::of(vec![&out_loop, &mb_loop], head),
+                &dsc,
+            ),
+            Some(vec![(MB, Extent(1)), (OUT, Extent(2048)), (Y, Extent(1))])
         );
     }
 }
