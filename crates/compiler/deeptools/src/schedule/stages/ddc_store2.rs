@@ -95,6 +95,90 @@ impl Dsc2Store<'_, '_> {
             (None, None) => None,
         }
     }
+
+    /// `labeledDs_.at(ldsIdx)` NARROWED TO THE THREE FIELDS ENTRY 126 READS — `dsType_` as stick
+    /// dims, `scale_`'s `-2` positions, and `dataFormat_`.
+    ///
+    /// ⛔ THE `-2` SET IS READ IN LAYOUT ORDER, which is what `is_any_of(-2, lds.scale_)` means:
+    /// `scale_` is indexed by a dim's position in layout order (`getDimIndexInLayoutOrder`), so
+    /// every entry of it names a layout dim — [`v1::SplatDims`](crate::schedule::ddc::v1::SplatDims)'
+    /// own note.
+    ///
+    /// ⛔ TOTAL, AND BOTH STOPS ARE `.at()`s: an lds this list does not hold, and the
+    /// `dataFormat_` of `INVALID` [`v1::TransferLds`](crate::schedule::ddc::v1::TransferLds) has no
+    /// spelling for. See [`v1::Dsc2Store::transfer_operands`] for why neither may be an absent lds
+    /// instead.
+    fn transfer_lds(&self, lds: LdsIdx, transfer: NodeId) -> v1::TransferLds {
+        self.dsc_facts().with_dsc(|dsc| {
+            let held = dsc.labeled_ds.at(lds).unwrap_or_else(|| {
+                panic!(
+                    "v1::Dsc2Store::transfer_operands: labeledDs_.at({lds:?}) throws for the end \
+                     {transfer:?} names"
+                )
+            });
+            v1::TransferLds {
+                stick: ddc_state::stick_dims_of(dsc, lds).unwrap_or_default(),
+                splat_dims: crate::schedule::ddc::v1::SplatDims(
+                    dsc.layout_dims
+                        .get(&lds)
+                        .map(|layout| {
+                            layout
+                                .iter()
+                                .filter(|dim| held.scale(*dim) == Some(tr::Scale::StickDim))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
+                format: held.record().data_format.unwrap_or_else(|| {
+                    panic!(
+                        "v1::Dsc2Store::transfer_operands: labeledDs_.at({lds:?}).dataFormat_ is \
+                         DataFormats::INVALID and v1::TransferLds::format is not an Option — see \
+                         that method's third stop"
+                    )
+                }),
+            }
+        })
+    }
+
+    /// `constantInfo_.at(constantId_)` AS A CONSTANT-TO-CONSTANT TRANSFER READS IT —
+    /// `data_.getSingleData().size()` and `dataFormat_`.
+    ///
+    /// ⛔ TOTAL ON THREE COUNTS, all three of them `.at()`/divisor facts the type already carries: a
+    /// `constantId_` the table does not hold, an EMPTY `data_` (the element count is the reference's
+    /// `numElemInConst` DIVISOR at `ddc/ddcv1.cpp:456-458`, and
+    /// [`v1::ConstantData`](crate::schedule::ddc::v1::ConstantData)`::elements` is a [`NonZeroU64`]
+    /// *"both divisors non-zero by type"*), and a `dataFormat_` of `INVALID` — whose width is the
+    /// reference's OTHER divisor and `dataFormatsToBitWidth.at(INVALID) == -1`.
+    fn constant_data(
+        &self,
+        constant: crate::schedule::ddc::fold::ConstIdx,
+        transfer: NodeId,
+    ) -> v1::ConstantData {
+        self.dsc_facts().with_dsc(|dsc| {
+            let held = dsc.ddc.constants.get(&constant).unwrap_or_else(|| {
+                panic!(
+                    "v1::Dsc2Store::transfer_operands: constantInfo_.at({constant:?}) throws for \
+                     the source {transfer:?} names"
+                )
+            });
+            v1::ConstantData {
+                elements: std::num::NonZeroU64::new(held.data.len() as u64).unwrap_or_else(|| {
+                    panic!(
+                        "v1::Dsc2Store::transfer_operands: \
+                         constantInfo_.at({constant:?}).data_.getSingleData().size() is nought, and \
+                         it is entry 126's replicationFactor_ divisor (ddc/ddcv1.cpp:456-458)"
+                    )
+                }),
+                format: held.data_format.unwrap_or_else(|| {
+                    panic!(
+                        "v1::Dsc2Store::transfer_operands: \
+                         constantInfo_.at({constant:?}).dataFormat_ is DataFormats::INVALID, whose \
+                         dataFormatsToBitWidth.at() is -1 and is entry 126's other divisor"
+                    )
+                }),
+            }
+        })
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -988,15 +1072,85 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
         self.halves()
     }
 
-    /// ⛔ `getTransferType()` with the labelled DS the matching side names — `getTransferType`
-    /// classifies the transfer by BOTH ends' `dsType_` and by whether either end is a constant, and
-    /// the constant half reads `constantInfo_`.
-    fn transfer_operands(&self, _transfer: NodeId) -> v1::TransferOperands {
-        todo!(
-            "v1::Dsc2Store::transfer_operands: wants getTransferType() with the labelled DS the \
-             matching side names — its constant arm reads constantInfo_, which l3::dsc does not \
-             project"
-        )
+    /// `getTransferType()` (`dsc/dsc2.h:883-896`) WITH THE LABELLED DS THE MATCHING SIDE NAMES — ⭐
+    /// ANSWERED WHOLE.
+    ///
+    /// ⛔⛔ THE `constantInfo_` OBJECTION WAS WRONG, exactly as it was for
+    /// [`tu::TransferMoves::destination_allocation`]: `l3::dsc` DOES project it, and
+    /// [`crate::schedule::l3::dsc::ConstantInfo`] carries both halves
+    /// [`v1::ConstantData`](crate::schedule::ddc::v1::ConstantData) asks for — `data` for
+    /// `data_.getSingleData().size()` and `data_format` for `dataFormat_`.
+    ///
+    /// ⛔ THE DESTINATION SIDE IS `dstLdsAndLoopOffsets_.front()` AND ITS EMPTINESS TEST IS
+    /// DISCHARGED: `isDstLabeledDs()`/`isDstConstant()` are both guarded by
+    /// `!dstLdsAndLoopOffsets_.empty()`, and [`crate::schedule::dsc2::Dsts`] is non-empty by type.
+    ///
+    /// ⛔ WHICH SIDE SUPPLIES THE LDS IS THE ARM'S OWN ANSWER and it is the reference's own ternary
+    /// `((constantToTensor || noTransToTensor) ? dstLdsAndLoopOffsets_.front().myLdsIdx_ :
+    /// srcLdsAndLoopOffsets_.myLdsIdx_)` (`ddc/ddcv1.cpp:481-484`). Each arm's own predicate proves
+    /// that index PRESENT, so the [`Option`] the type keeps for the reference's `ldsIdx < 0` skip is
+    /// filled on every arm here rather than being a place to put a different absence.
+    ///
+    /// # ⛔ THREE STOPS, AND EACH IS NAMED
+    ///
+    /// * **BOTH INDICES SET** is `DT_CHECK_MSG(!(myLdsIdx_ >= 0 && constantId_ >= 0), "Cannot be
+    ///   both labeledDs and constant.")` (`dsc/dsc2.h:742`, `:747`) — `isLabeledDs()` and
+    ///   `isConstant()` each assert it before answering, so this is the reference's abort and not one
+    ///   added here.
+    /// * **`INVALID_TRANSFER_TYPE`** has no arm, which is [`v1::TransferOperands`]' own statement, and
+    ///   the one caller's `DT_CHECK_MSG(.., "Unexpected transfer type.")` (`ddc/ddcv1.cpp:479`) is
+    ///   that same abort reached from the other side.
+    /// * **`dataFormat_` OF `INVALID`** on the selected labelled DS cannot be spelled:
+    ///   [`v1::TransferLds`](crate::schedule::ddc::v1::TransferLds)`::format` is a
+    ///   [`DataFormat`] and not an [`Option`]. ⛔ AND [`None`] WOULD BE THE WRONG ANSWER, not a
+    ///   conservative one: the consumer takes a [`None`] lds as *"skip this transfer"* and returns
+    ///   having pushed NO `unitTimeTransferChunkSize_`, so a transfer the reference chunks would move
+    ///   nothing. This is the same reading [`tr::AutoShuffling::operand_element_bits`] states, and a
+    ///   ⚠️ DIVERGENCE: the reference reads `dataFormat_` only under `do2BSplat` and aborts there
+    ///   (*"No system in place for splatting of data formats with <16b"*), so it processes an
+    ///   INVALID-format transfer on every other path and this stops one.
+    fn transfer_operands(&self, transfer: NodeId) -> v1::TransferOperands {
+        let held = tu::ScheduleSurgery::transfer(self, transfer);
+        let src = held.src.data;
+        let dst = held.dsts.first().data;
+        let both_set = |data: DataInfo| {
+            assert!(
+                !(data.my_lds_idx.is_some() && data.constant_id.is_some()),
+                "v1::Dsc2Store::transfer_operands: {transfer:?} has an end that is both a labelled \
+                 DS and a constant — DT_CHECK_MSG(\"Cannot be both labeledDs and constant.\") \
+                 (dsc/dsc2.h:742)"
+            );
+        };
+        both_set(src);
+        both_set(dst);
+        match (src.my_lds_idx, src.constant_id, dst.my_lds_idx, dst.constant_id) {
+            // `isSrcConstant() && isDstConstant()`.
+            (_, Some(constant), _, Some(_)) => {
+                v1::TransferOperands::ConstantToConstant(self.constant_data(constant, transfer))
+            }
+            // `isSrcConstant() && isDstLabeledDs()`.
+            (_, Some(_), Some(lds), _) => {
+                v1::TransferOperands::ConstantToTensor(Some(self.transfer_lds(lds, transfer)))
+            }
+            // `isSrcLabeledDs() && isDstLabeledDs()`.
+            (Some(lds), _, Some(_), _) => {
+                v1::TransferOperands::TensorToTensor(Some(self.transfer_lds(lds, transfer)))
+            }
+            // `(!isSrcLabeledDs() && !isSrcConstant()) && isDstLabeledDs()`.
+            (None, None, Some(lds), _) => {
+                v1::TransferOperands::NoTransferToTensor(Some(self.transfer_lds(lds, transfer)))
+            }
+            // `isSrcLabeledDs() && (!isDstLabeledDs() && !isDstConstant())`.
+            (Some(lds), _, None, None) => {
+                v1::TransferOperands::NoTransferFromTensor(Some(self.transfer_lds(lds, transfer)))
+            }
+            // `INVALID_TRANSFER_TYPE` — the caller's own `DT_CHECK_MSG("Unexpected transfer type.")`.
+            _ => panic!(
+                "v1::Dsc2Store::transfer_operands: {transfer:?} is INVALID_TRANSFER_TYPE — neither \
+                 end is a labelled DS or a constant, which is entry 126's own \
+                 DT_CHECK_MSG(\"Unexpected transfer type.\") (ddc/ddcv1.cpp:479)"
+            ),
+        }
     }
 
     /// ⛔ `traverseTreeDFSMutable(nullptr, {COMPUTE, TRANSFER})` as entry 002 censuses it — the
