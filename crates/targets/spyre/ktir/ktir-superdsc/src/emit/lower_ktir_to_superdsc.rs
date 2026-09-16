@@ -267,6 +267,48 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
                 Some((rs as u32, cs as u32, tr, tc))
             })
             .unwrap_or((0, 0, rows, cols));
+        // ⛔⛔⛔ A WINDOW STATED INSIDE AN `scf.for` IS NOT A WINDOW THIS WALK CAN SEE, AND THE
+        // FALLBACK ABOVE IS SILENT ABOUT IT.
+        //
+        // Every reader here — the `find` above, `param_tiles`, `r_cover` below — walks
+        // `f.operations`, which is the TOP LEVEL only. `IRFunction::ops_deep`'s own doc says what
+        // that costs: "a time-tiled op puts its whole computation inside an `scf.for` body, so
+        // anything asking 'what does this program do' and reading `operations` alone sees a loop and
+        // nothing else — and reports the tiled case as empty rather than as tiled". Here the empty
+        // case is not reported at all: `unwrap_or((0, 0, rows, cols))` says "the window is the whole
+        // buffer", which is the ONE answer a K-blocked program never means. A `[128, 256]` weight
+        // read `[128, 64]` per trip is then described at `[128, 256]`, and the descriptor computes a
+        // tile four times the width of the one the program states — well-formed, and wrong.
+        //
+        // ⭐ INERT FOR A STRAIGHT-LINE PRODUCER, WHICH IS EVERY PROGRAM THIS CRATE HAS SEEN. Neither
+        // this crate nor `KtirFunc` mentions `scf.for` anywhere (`grep -rn ScfFor` is empty in both),
+        // so the guard fires only for a program shape that has never reached here — a Triton front
+        // end's K-blocked MLP, whose windows all live in the loop body. It changes nothing for a
+        // program whose tiles are at the top level, and nothing for one with no tiles at all.
+        // ⛔ AND IT IS `deep > top`, NOT `top == 0`. A parameter loaded whole ABOVE a loop and
+        // re-blocked INSIDE it has a top-level tile, so a "no window at the top level" test passes it
+        // — and then `r_cover` silently omits every in-loop window from the span it hands
+        // [`node_rows`], which is the same unaccounted-window defect with a first block in front of
+        // it. Counting both sides means the guard asks the real question: is there a window this walk
+        // cannot see? Equal counts is the straight-line case and stays free.
+        let top = param_tiles(&k.func, ptr).count();
+        let deep = param_tiles_deep(&k.func, ptr);
+        if deep > top {
+            return err(format!(
+                "{}: parameter {i} (t{tid}) states {} of its {deep} `ktdp.construct_access_tile` \
+                 window(s) INSIDE a region (an `scf.for` body), and every reader here walks the \
+                 function's TOP LEVEL — so {} and every body below would describe a tile the program \
+                 never takes. A time-tiled program has to be split into one node per trip, or its \
+                 windows hoisted, before a descriptor can span it.",
+                k.func.name,
+                deep - top,
+                if top == 0 {
+                    format!("the window would fall back to the whole `[{rows}, {cols}]` view")
+                } else {
+                    format!("the {top} visible window(s) would stand for all {deep} of them")
+                },
+            ));
+        }
         // ⛔⛔⛔ EVERY access tile's ROW SPAN, because "the FIRST" is not "the program's". A producer
         // arm that ROW-BLOCKS its region for the emulator's LX (`KtirFunc::silu_mul`,
         // `lower_elementwise_node_rows`, `lower_scalarmul_node`'s `by_row`) states one access tile per
@@ -737,8 +779,9 @@ pub fn rmsnorm(
     let eps = program_rmsnorm_eps(&k.func).ok_or_else(|| Error {
         message: format!(
             "RmsNorm {name}: the program states no epsilon. `KtirFunc::rms_norm` splats it into the \
-             `arith.addf` that feeds its one `math.sqrt` (`1/sqrt(mean + eps)`), and the descriptor's \
-             `[1,1]` const is resolved from that value, so a program without it cannot be lowered."
+             `arith.addf` that feeds its one root op — `math.sqrt` there, `math.rsqrt` in a producer \
+             that spells `1/sqrt` as one op (`1/sqrt(mean + eps)`) — and the descriptor's `[1,1]` \
+             const is resolved from that value, so a program without it cannot be lowered."
         ),
     })?;
     let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
@@ -1107,6 +1150,28 @@ fn param_tiles<'f>(
     })
 }
 
+/// [`param_tiles`] over `ops_deep()` — REGIONS INCLUDED.
+///
+/// ⭐ IT EXISTS ONLY TO BE COMPARED WITH `param_tiles`, in [`regions`]. Nothing here reads a nested
+/// tile's extents, because a body that spans one descriptor over a time-tiled program would be
+/// describing the trip and calling it the node. The comparison turns "no window at the top level"
+/// into a refusal that says WHY, instead of the silent whole-view fallback.
+fn param_tiles_deep(f: &IRFunction<'static>, ptr: &Ssa) -> usize {
+    let views: Vec<Ssa> = f
+        .ops_deep()
+        .into_iter()
+        .filter(|o| o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr))
+        .filter_map(|o| o.result)
+        .collect();
+    f.ops_deep()
+        .into_iter()
+        .filter(|o| {
+            o.op_type == OpKind::KtdpConstructAccessTile
+                && o.operands.first().is_some_and(|v| views.contains(v))
+        })
+        .count()
+}
+
 /// The attention multiplier the PROGRAM states, as an immediate: the `arith.constant` splatted into
 /// the `arith.mulf` that scales a `linalg.matmul`'s scores.
 ///
@@ -1123,7 +1188,40 @@ fn param_tiles<'f>(
 ///
 /// `f32_splat` emits `arith.constant` (scalar) then `tensor.splat`, so the value is one hop behind the
 /// operand.
-fn program_rmsnorm_eps(f: &IRFunction<'static>) -> Option<f32> {
+///
+/// ⭐ AND THE ROOT IS EITHER `math.sqrt` OR `math.rsqrt`, because a third-party producer states
+/// `1/sqrt(x)` as ONE op. `KtirFunc::rms_norm` spells it `math.sqrt` then `arith.divf(1.0, ·)`; a
+/// Triton front end spells the same value `math.rsqrt`, which `OpKind::MathRsqrt` already admits and
+/// which this crate already emits on card as a first-class pointwise (`Elementwise::Rsqrt =>
+/// ("rsqrt", 1)`). The epsilon is the SAME fact under both spellings — the splat into the add that
+/// feeds the root — so the reading takes both roots and stays exactly as structural: one root op in
+/// the whole program, exactly one splat among the two operands of the add that feeds it.
+///
+/// ⭐⭐⭐ AND THE DESCRIPTOR THIS PROGRAM LOWERS TO ALREADY SPELLS IT `rsqrt`. Step 4 of
+/// [`assemble_rmsnorm`] is
+/// `pw1("rmrsqrt_…", "rsqrt", …)`, and its own comment says "ONE native `rsqrt` (torch.rsqrt), NOT
+/// sqrt+reciprocal". So a program that states `math.rsqrt` matches what this crate EMITS more
+/// closely than `KtirFunc`'s `math.sqrt` + `arith.divf` does, and the reader was the only thing in
+/// the path narrower than both. (Step 2 lines up the same way: it is one native `mean` reduce that
+/// "folds 1/N into the reduce scale", which is exactly a producer that multiplies by a splatted
+/// `1/cols` rather than dividing — see the mean's operand below.)
+///
+/// ⛔ THE ALTERNATIVE WAS TO NORMALISE `math.rsqrt` AWAY IN THE PRODUCER, AND IT IS UNSOUND HERE.
+/// [`elementwise`] takes its kind as an ARGUMENT and never reads the program's op, so rewriting every
+/// `math.rsqrt` into `math.sqrt` + a reciprocal would leave an `Elementwise(Rsqrt)` node whose program
+/// says "sqrt then divide" while its descriptor computes `rsqrt` — the program/descriptor divergence
+/// the epsilon door itself exists to prevent. Rewriting only inside an rmsnorm requires recognising an
+/// rmsnorm, which is the pattern-matching this file's readings are written to avoid. So the reader is
+/// what widens, and no descriptor changes: a program that spells the root `math.sqrt` takes the
+/// identical path and emits the identical bytes.
+///
+/// ⭐ `pub` BECAUSE THE CALLER HAS TO REGISTER WHAT THIS READS. The value is looked up in
+/// [`BundleLayout::scalarmul_scales`] BY BITS (`scale_slot`), so a caller building that registry must
+/// put in exactly the float this function returns — and a caller that cannot call it has to restate
+/// the reading instead. That is two matchers for one fact, which is the defect family this file's
+/// other comments are a record of. The three `program_*` readers are the registry's contract, so they
+/// are part of the door.
+pub fn program_rmsnorm_eps(f: &IRFunction<'static>) -> Option<f32> {
     let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
     let splat_value = |s: Ssa| -> Option<f64> {
         let sp = def_of(s)?;
@@ -1139,11 +1237,13 @@ fn program_rmsnorm_eps(f: &IRFunction<'static>) -> Option<f32> {
             _ => None,
         })
     };
-    // ONE `math.sqrt`, or this is not the shape this reading assumes.
+    // ONE root op — `math.sqrt` or `math.rsqrt` — or this is not the shape this reading assumes. Two
+    // roots means two rmsnorms in one program (or something that is not one at all), and picking
+    // either one's epsilon would be a guess about which node is being lowered.
     let mut sqrts = f
         .operations
         .iter()
-        .filter(|o| o.op_type == OpKind::MathSqrt);
+        .filter(|o| matches!(o.op_type, OpKind::MathSqrt | OpKind::MathRsqrt));
     let sqrt = sqrts.next()?;
     if sqrts.next().is_some() {
         return None;
@@ -1152,7 +1252,9 @@ fn program_rmsnorm_eps(f: &IRFunction<'static>) -> Option<f32> {
     if add.op_type != OpKind::ArithAddf {
         return None;
     }
-    // The other operand is the `arith.divf` mean, so exactly one of the two is a splat.
+    // The other operand is the mean — `arith.divf` here, `arith.mulf` by a splatted `1/cols` in a
+    // producer that folds the divisor — and NEITHER is a splat, so exactly one of the two is. That is
+    // the whole discriminator, and it holds for any spelling of the mean.
     let mut splats = add.operands.iter().filter_map(|&s| splat_value(s));
     let eps = splats.next()?;
     if splats.next().is_some() {
@@ -1168,7 +1270,10 @@ fn program_rmsnorm_eps(f: &IRFunction<'static>) -> Option<f32> {
 /// for the LX — so a program states the same multiplier one or many times, never two different ones.
 /// Reading all of them and requiring agreement is what makes the many-block form safe to lower from
 /// the program rather than from a record.
-fn program_scalarmul_scale(f: &IRFunction<'static>) -> Option<f32> {
+/// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds the registry this
+/// value is looked up in, by bits, so it must be able to read the same value rather than restate the
+/// reading.
+pub fn program_scalarmul_scale(f: &IRFunction<'static>) -> Option<f32> {
     let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
     let splat_value = |s: Ssa| -> Option<f64> {
         let sp = def_of(s)?;
@@ -1216,7 +1321,10 @@ fn scale_slot(layout: Option<&BundleLayout>, value: f32) -> Option<usize> {
     })
 }
 
-fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
+/// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds the registry this
+/// value is looked up in, by bits, so it must be able to read the same value rather than restate the
+/// reading.
+pub fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
     let const_of: std::collections::HashMap<Ssa, f64> = f
         .operations
         .iter()
