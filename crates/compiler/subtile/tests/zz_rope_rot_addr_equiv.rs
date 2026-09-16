@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! DOES THE `y`-BATCHED ROTATE ADDRESS THE SAME BYTES AS THE PER-HEAD ONE? Differenced out of the
 //! EMITTED per-core start addresses, never predicted — the rule this file exists to obey.
 //!

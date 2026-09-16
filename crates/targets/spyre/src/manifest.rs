@@ -143,14 +143,19 @@ impl Manifest {
     }
 }
 
-/// One emitted KTIR bundle's data, baked into the binary as `&'static` const
-/// data by the `#[forward]` macro under `-Fspyre` — no disk paths.
-/// `manifest_json` is the manifest text; `nodes[i]` is `(func_name, mlir_text)`
-/// for `manifest.nodes[i]` (1:1, same emit order). The worker reaches this via
-/// the fingerprint-matched `ScratchyWeights::ktir_bundle()` — never from disk.
+/// One emitted KTIR bundle, named by the FINGERPRINT its programs are registered under.
+///
+/// ⭐ A NAME, NOT A COPY. `#[forward]` bakes the programs themselves through `inventory::submit!`
+/// as a `bundle_code::BundleCode`; this says WHICH one, and `bundle_code::bundle(fp)` resolves it —
+/// the same registry the ladder rungs and re-rolled siblings already resolve through, so there is
+/// one set of programs and one resolver.
+///
+/// ⛔ IT CARRIED THE PROGRAMS AS TEXT: a manifest string plus one `(func_name, mlir)` per node,
+/// rendered by the emitter and parsed back by the runner in the same process. Both ends of that
+/// round trip are gone — the programs are values, and the IO contract they need is the generated
+/// `wiring::Wiring`, not a re-parsed manifest.
 pub struct KtirBundleData {
-    pub manifest_json: &'static str,
-    pub nodes: &'static [(&'static str, &'static str)],
+    pub fp: &'static str,
 }
 
 /// The per-model embedded bundles: one m=1 decode bundle PER static cap bucket
@@ -337,6 +342,25 @@ pub fn attn_mask_fill(capacity: usize, decode_position: usize) -> Vec<f32> {
     let mut m = vec![0.0f32; capacity];
     for x in m.iter_mut().skip(keep) {
         *x = -1.0e38;
+    }
+    m
+}
+
+/// THE PREFILL CHUNK'S CAUSAL MASK, `[mq, mq]` row-major: `0` where row `r` may attend column `c`,
+/// a large negative elsewhere so it leaves the softmax through `exp(-inf) = 0`.
+///
+/// ⭐ THE TRIANGLE IS NOT RESTATED HERE. `prefill_causal_col_valid` is the SSOT — a prompt chunk's
+/// rows are consecutive positions of ONE sequence, so row `r` legitimately attends every earlier
+/// row. (A decode BATCH's rows are independent requests and take the diagonal instead; that is a
+/// different predicate, and confusing the two is fluent output that read another request's tokens.)
+pub fn attn_causal_mask_fill(mq: usize) -> Vec<f32> {
+    let mut m = vec![0.0f32; mq * mq];
+    for r in 0..mq {
+        for c in 0..mq {
+            if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, r) {
+                m[r * mq + c] = -1.0e38;
+            }
+        }
     }
     m
 }

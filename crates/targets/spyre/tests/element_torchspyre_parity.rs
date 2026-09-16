@@ -11,13 +11,14 @@
 //!  • coordInfo alpha_ = iteration extents + the (stk,1) stick fold — NOT physical strides.
 //!  • maxDimSizes_ = -1 for EVERY non-indirect tensor (card reconstructs device_size from N_/layout/stick).
 
+use emit::In;
+use ktir_superdsc::emit;
 use scratchy_subtile::sdsc_abstract::{
     BlockCols, KernelTag, RowBlockedTag, RowCount, SpyreTensorLayout, Staged, StickKind,
     StickLayout, Stk, stage_2d,
 };
 use scratchy_subtile::superdsc_opspec::Df;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
-use superdsc::In;
 
 /// Typed matmul operands — the compile-time addressing guard: a matmul's A/O are RowBlocked, W is a
 /// Kernel. Passing a `&str` (or a wrong-kind handle) here is now a `cargo build` error.
@@ -28,7 +29,7 @@ fn mm_w(name: &str, k: u32, n: u32) -> Stk<KernelTag> {
     Stk::<KernelTag>::kernel(k as usize, n as usize, name)
 }
 
-fn dsc(op: &superdsc::EmittedOp, name: &str) -> serde_json::Value {
+fn dsc(op: &emit::EmittedOp, name: &str) -> serde_json::Value {
     serde_json::to_value(&op.op).unwrap()["dscs_"][0][name].clone()
 }
 
@@ -36,7 +37,7 @@ fn dsc(op: &superdsc::EmittedOp, name: &str) -> serde_json::Value {
 fn pointwise_31x2048_matches_torchspyre() {
     let (rows, cols) = (31u32, 2048u32);
     let mut sid = 0i64;
-    let op = superdsc::assemble_pointwise_broadcast(
+    let op = emit::assemble_pointwise_broadcast(
         "pw",
         "multiply",
         RowCount::of_token_rows(rows),
@@ -303,7 +304,7 @@ fn per_core_start_derives_from_spyre_layout() {
 
     let (rows, cols) = (31u32, 2048u32);
     let mut sid = 0i64;
-    let op = superdsc::assemble_pointwise_broadcast(
+    let op = emit::assemble_pointwise_broadcast(
         "pw",
         "multiply",
         RowCount::of_token_rows(rows),
@@ -344,7 +345,7 @@ fn coordinfo_reconstructs_spyre_device_size() {
     let ds = &stl.device_size;
     let (rows, cols) = (31u32, 2048u32);
     let mut sid = 0i64;
-    let op = superdsc::assemble_pointwise_broadcast(
+    let op = emit::assemble_pointwise_broadcast(
         "pw",
         "multiply",
         RowCount::of_token_rows(rows),

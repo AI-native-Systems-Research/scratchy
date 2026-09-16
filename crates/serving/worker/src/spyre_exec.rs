@@ -5,30 +5,26 @@
 //! equivalent is `gpu_worker`'s own `impl Worker`, which is larger) and model-neutral in CONTENT:
 //! every model-specific decision was resolved at bake and reaches here as generated data.
 
+// ⭐ THE POOL/SLOT VOCABULARY IS CARD-ONLY, so its imports carry the same cfg as the blocks that
+// use it. `PagedKvPool` is the exception — it sizes the resident cache on both paths.
+#[cfg(feature = "spyre-hw")]
 use std::collections::HashMap;
 
 use scratchy_serving_engine::executor::ModelRunnerOutput;
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
-use scratchy_subtile::sdsc_abstract::{PagedKvPool, RowPages, SlotCount, SlotMap, SlotMapError};
+use scratchy_subtile::sdsc_abstract::PagedKvPool;
+#[cfg(feature = "spyre-hw")]
+use scratchy_subtile::sdsc_abstract::{RowPages, SlotCount, SlotMap, SlotMapError};
+#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::manifest::argmax;
-// ⭐ THE CARD PATH NO LONGER PARSES A MANIFEST. `Manifest` survives only for
-// the KTIR-emulator session, whose `new_multi` takes `&Manifest` to thread its
-// HBM buffers. Under `sendnn` every fact it carried comes from the GENERATED
-// `SUPERDSC_WIRINGS` static instead, so the type is not even in scope.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::Manifest;
-// `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
-// runner; the bundle type + session type are cfg-selected, everything else
-// (weight load, dynamic sources, KV loop, sampling) is shared.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::KtirBundle;
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::runner::SpyreSession;
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::{IntRepStride, MaskRepStride};
 
-use crate::error::{ExecutorError, ExecutorResult};
+#[cfg(feature = "spyre-hw")]
+use crate::error::ExecutorError;
+use crate::error::ExecutorResult;
 use crate::spyre_forward::*;
+#[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
@@ -118,7 +114,7 @@ impl Worker for SpyreWorker {
     /// exactly this: "the on-card pool is exactly `nblk` blocks, so the scheduler's block allocator must
     /// not exceed it".
     fn kv_cache_num_blocks_override(&self) -> Option<usize> {
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         {
             // ⭐ THE HOST RANGE, NOT THE WHOLE POOL. The pages above it back the batched write's hole
             // (`PoolPartition`) and the host must never name one — that separation is the reason a page
@@ -131,7 +127,7 @@ impl Worker for SpyreWorker {
                 _ => None,
             });
         }
-        #[cfg(not(feature = "sendnn"))]
+        #[cfg(not(feature = "spyre-hw"))]
         None
     }
 
@@ -148,7 +144,7 @@ impl Worker for SpyreWorker {
     /// lengths, and diffs caching-on/off/reversed. An ad-hoc concurrent probe cannot, which is how
     /// uniform-length prose continuations once got read as corruption.
     fn max_num_seqs_override(&self) -> Option<usize> {
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         {
             return self.model.as_ref().and_then(|m| match &m.session {
                 SendnnSession::SuperDsc(sb) if sb.decode.is_paged() => {
@@ -157,7 +153,7 @@ impl Worker for SpyreWorker {
                 _ => None,
             });
         }
-        #[cfg(not(feature = "sendnn"))]
+        #[cfg(not(feature = "spyre-hw"))]
         None
     }
 
@@ -168,7 +164,7 @@ impl Worker for SpyreWorker {
     /// single launch writing every row at the same slot. Every other session here is token-addressed, and
     /// saying otherwise would make the scheduler over-allocate for no reason.
     fn kv_addressing(&self) -> scratchy_core_common::KvAddressing {
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         {
             if let Some(m) = self.model.as_ref()
                 && matches!(&m.session, SendnnSession::SuperDsc(sb) if sb.decode.is_paged())
@@ -193,7 +189,7 @@ impl Worker for SpyreWorker {
         // ONE derivation of the pool's owner split for the whole step: the same value the block count
         // reported to the scheduler came from, so a derived page map can never name a page the host may
         // also hand out.
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         let part = {
             let SendnnSession::SuperDsc(sb) = &model.session;
             pool_partition(&sb)?
@@ -224,7 +220,7 @@ impl Worker for SpyreWorker {
             // to free — it refcounts them, which is what keeps a cached prefix alive after the request
             // that wrote it is gone.
             requests.remove(fid);
-            #[cfg(feature = "sendnn")]
+            #[cfg(feature = "spyre-hw")]
             input_batch.remove_request(fid);
         }
 
@@ -240,7 +236,7 @@ impl Worker for SpyreWorker {
                 .unwrap_or(0);
             let start = nr.num_computed_tokens as usize;
             let prompt = nr.prompt_token_ids.clone().unwrap_or_default();
-            #[cfg(not(feature = "sendnn"))]
+            #[cfg(not(feature = "spyre-hw"))]
             let nlayers = model.decode[0].layers.len();
             requests.insert(
                 nr.req_id.clone(),
@@ -249,9 +245,9 @@ impl Worker for SpyreWorker {
                     // prefix-cache hit otherwise): it has not shared a step with anyone yet, so its
                     // slots and its tokens are still the same set.
                     kv_hist: scratchy_subtile::sdsc_abstract::KvHistory::contiguous(start),
-                    #[cfg(not(feature = "sendnn"))]
+                    #[cfg(not(feature = "spyre-hw"))]
                     kv_k: vec![Vec::new(); nlayers],
-                    #[cfg(not(feature = "sendnn"))]
+                    #[cfg(not(feature = "spyre-hw"))]
                     kv_v: vec![Vec::new(); nlayers],
                 },
             );
@@ -274,6 +270,8 @@ impl Worker for SpyreWorker {
             // ⭐ AND THE TOKENS THEMSELVES, in the same store as the block table. `ReqState` used to hold
             // `tokens` + `prompt_len`; the length is now derived from this one value.
             input_batch.set_prompt(&nr.req_id, &prompt);
+            // Only the paged (card) install below reads it.
+            #[cfg(feature = "spyre-hw")]
             let host_now: Vec<usize> = input_batch
                 .block_table(&nr.req_id)
                 .map(|t| t.to_vec())
@@ -288,7 +286,7 @@ impl Worker for SpyreWorker {
             // gets the same ids (`kv_cache_manager`: "In the common single-group case, all groups share
             // the same block IDs"), so group 0 is the list. A hybrid model would need a group per
             // attention class, which this backend does not bake.
-            #[cfg(feature = "sendnn")]
+            #[cfg(feature = "spyre-hw")]
             install_host_blocks(
                 &mut model.session,
                 req,
@@ -305,9 +303,9 @@ impl Worker for SpyreWorker {
                 input_batch,
                 start,
                 n,
-                #[cfg(feature = "sendnn")]
+                #[cfg(feature = "spyre-hw")]
                 host_now.as_slice(),
-                #[cfg(feature = "sendnn")]
+                #[cfg(feature = "spyre-hw")]
                 part,
             )?;
             order.push(nr.req_id.clone());
@@ -325,7 +323,7 @@ impl Worker for SpyreWorker {
         // has to check that the grant reaches the shared write slot — it can no longer draw a page to
         // make that true, which is what let the worker's idea of a request's pages diverge from the
         // scheduler's.
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         for (i, id) in cr.req_ids.iter().enumerate() {
             let ids: &[usize] = cr
                 .new_block_ids
@@ -384,7 +382,7 @@ impl Worker for SpyreWorker {
         // ⛔ THIS IS THE "SECOND STORE" HAZARD IN ITS SMALLEST FORM: a snapshot of a store is a copy, and a
         // copy read before the store is updated is a different value. Reading it AFTER is what makes it a
         // read rather than a store — it must be taken downstream of every `update_blocks` for the step.
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         let hosts: HashMap<String, Vec<usize>> = cr
             .req_ids
             .iter()
@@ -414,9 +412,9 @@ impl Worker for SpyreWorker {
         //
         // A continuation chunk (n > 1) is not a decode step and keeps the per-request path below, as
         // does every request when no ladder was baked or the live count exceeds the widest rung.
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         let mut batched: std::collections::HashSet<String> = std::collections::HashSet::new();
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         {
             let decode_ids: Vec<(String, usize)> = cr
                 .req_ids
@@ -1012,7 +1010,7 @@ impl Worker for SpyreWorker {
             }
         }
         for (i, req_id) in cr.req_ids.iter().enumerate() {
-            #[cfg(feature = "sendnn")]
+            #[cfg(feature = "spyre-hw")]
             if batched.contains(req_id) {
                 continue;
             }
@@ -1029,7 +1027,7 @@ impl Worker for SpyreWorker {
             // Sized by the KV SPAN, not the token count — a request that has been in a batch holds a
             // hole, so its keys reach further than `start` and the page it writes into is the one past
             // its span.
-            #[cfg(feature = "sendnn")]
+            #[cfg(feature = "spyre-hw")]
             install_host_blocks(
                 &mut model.session,
                 req,
@@ -1046,9 +1044,9 @@ impl Worker for SpyreWorker {
                 input_batch,
                 start,
                 n,
-                #[cfg(feature = "sendnn")]
+                #[cfg(feature = "spyre-hw")]
                 hosts.get(req_id).map_or(&[], |v| v.as_slice()),
-                #[cfg(feature = "sendnn")]
+                #[cfg(feature = "spyre-hw")]
                 part,
             )?;
             order.push(req_id.clone());
@@ -1081,7 +1079,7 @@ impl Worker for SpyreWorker {
         // the prefix a token-indexed cache may claim. Over ALL live requests, not just the ones that
         // forwarded: a batched step advances the shared write slot past every live history, so a request
         // that only PADDED this step still had its span moved and needs the allocation to follow.
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         {
             // THE DEEPEST ANY LIVE REQUEST WILL REACH, over the same live set the next step's
             // `BatchSlot::of` runs over — but bounded by each one's PROMPT rather than by the history it

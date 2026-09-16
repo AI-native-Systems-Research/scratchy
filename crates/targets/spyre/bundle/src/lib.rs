@@ -42,7 +42,6 @@ pub mod correction;
 pub use inventory;
 
 use std::borrow::Cow;
-use std::fmt;
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  The two axes of the rung grid
@@ -130,176 +129,17 @@ pub const NUM_SEGMENTS: usize = 7;
 /// `audit_layout_addresses`.
 pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-/// What a synthetic intermediate IS — the role it plays for the tensor it derives from.
+/// ⭐ THE OPERAND IDENTITY — declared in the lowering's own scratchy-free leaf and re-exported here,
+/// so every `bundle::PlaceId` / `bundle::SynthRole` path in the tree resolves unchanged. See
+/// [`ktir_superdsc::place`] for both types and for why a [`SynthRole`] belongs to the lowering that
+/// invents the intermediate rather than to the bake that places it.
 ///
-/// ⛔ THESE ARE NOT NAME SUFFIXES. Every one of these was a `format!("{out}_rot")`-style
-/// string built at one site and matched at another, which is a join on a spelling. The role
-/// is a fact about the lowering, so it is a value; the spelling exists only in [`Display`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SynthRole {
-    // ── rope ──
-    Rot,
-    Xc,
-    Rs,
-    // ── ffn ──
-    Silu,
-    // ── attention scratch ──
-    Qs,
-    KRep,
-    VRep,
-    NewKRep,
-    NewVRep,
-    NewKScaled,
-    // ── fp8 activation quantization ──
-    FqAbsX,
-    FqAfp8,
-    FqAmax,
-    FqAmaxFl,
-    FqAscale,
-    FqChi,
-    FqCl,
-    FqInvS,
-    FqSc,
-    FqDqA,
-    FqMm,
-    FqRaw,
-    // ── rmsnorm scratch ──
-    Sq16,
-    Mean,
-    Meps,
-    Rinv,
-    Xn,
-    // ── flash-attention online-softmax state ──
-    NewKt,
-    Sc,
-    BMax,
-    NewM,
-    Corr,
-    CorrSubT,
-    ExpB,
-    ESubT,
-    BSum,
-    OTmp,
-    LTmp,
-    RunM,
-    RunL,
-    RunO,
-    // ── K-split / down-projection blocking (the only INDEXED roles) ──
-    Blk(u32),
-    Acc(u32),
-    LBlk(u32),
-    LAcc(u32),
-}
-
-impl fmt::Display for SynthRole {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Rot => f.write_str("rot"),
-            Self::Xc => f.write_str("xc"),
-            Self::Rs => f.write_str("rs"),
-            Self::Silu => f.write_str("silu"),
-            Self::Qs => f.write_str("qs"),
-            Self::KRep => f.write_str("krep"),
-            Self::VRep => f.write_str("vrep"),
-            Self::NewKRep => f.write_str("newkrep"),
-            Self::NewVRep => f.write_str("newvrep"),
-            Self::NewKScaled => f.write_str("newkscaled"),
-            Self::FqAbsX => f.write_str("fq_absx"),
-            Self::FqAfp8 => f.write_str("fq_afp8"),
-            Self::FqAmax => f.write_str("fq_amax"),
-            Self::FqAmaxFl => f.write_str("fq_amaxfl"),
-            Self::FqAscale => f.write_str("fq_ascale"),
-            Self::FqChi => f.write_str("fq_chi"),
-            Self::FqCl => f.write_str("fq_cl"),
-            Self::FqInvS => f.write_str("fq_invs"),
-            Self::FqSc => f.write_str("fq_sc"),
-            Self::FqDqA => f.write_str("fq_dqa"),
-            Self::FqMm => f.write_str("fq_mm"),
-            Self::FqRaw => f.write_str("fq_raw"),
-            Self::Sq16 => f.write_str("sq16"),
-            Self::Mean => f.write_str("mean"),
-            Self::Meps => f.write_str("meps"),
-            Self::Rinv => f.write_str("rinv"),
-            Self::Xn => f.write_str("xn"),
-            Self::NewKt => f.write_str("newkt"),
-            Self::Sc => f.write_str("sc"),
-            Self::BMax => f.write_str("bmax"),
-            Self::NewM => f.write_str("newm"),
-            Self::Corr => f.write_str("corr"),
-            Self::CorrSubT => f.write_str("corrsubt"),
-            Self::ExpB => f.write_str("expb"),
-            Self::ESubT => f.write_str("esubt"),
-            Self::BSum => f.write_str("bsum"),
-            Self::OTmp => f.write_str("otmp"),
-            Self::LTmp => f.write_str("ltmp"),
-            Self::RunM => f.write_str("m"),
-            Self::RunL => f.write_str("l"),
-            Self::RunO => f.write_str("o"),
-            Self::Blk(i) => write!(f, "blk{i}"),
-            Self::Acc(i) => write!(f, "acc{i}"),
-            Self::LBlk(i) => write!(f, "lblk{i}"),
-            Self::LAcc(i) => write!(f, "lacc{i}"),
-        }
-    }
-}
-
-/// A placed tensor's IDENTITY — the join key between what the bake placed and what the host binds.
-///
-/// ⛔ THIS REPLACES `t{tid}`. The old form carried `name: Cow<str>` *and* `tid: Option<u32>`: the
-/// name was `format!("t{tid}")` for a real tensor, so one field was a rendering of the other, and
-/// every bind was a string round-trip through a spelling both ends had to agree on by convention.
-/// Nothing ever PARSED it back — the string existed only to be a map key — so the key is now the
-/// number it was always standing in for.
-///
-/// [`Synth`] keeps a place here because a synthetic occupies segment space and the alias-equality
-/// check must see it; it is never bound, which is why it needs no separate tid.
-///
-/// [`Synth`]: Self::Synth
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PlaceId {
-    /// A SubtileIR tensor — the only kind the host ever binds.
-    Act(u32),
-    /// An intermediate the lowering invented, derived from `of`. Device-internal.
-    Synth { of: u32, role: SynthRole },
-}
-
-impl PlaceId {
-    /// The SubtileIR tensor this names, or that it derives from.
-    pub fn tid(self) -> u32 {
-        match self {
-            Self::Act(t) | Self::Synth { of: t, .. } => t,
-        }
-    }
-    /// Is this a tensor the host may bind? False for a device-internal synthetic.
-    pub fn is_bindable(self) -> bool {
-        matches!(self, Self::Act(_))
-    }
-    /// The id the host binds under, or `None` for a device-internal synthetic.
-    pub fn bindable(self) -> Option<u32> {
-        match self {
-            Self::Act(t) => Some(t),
-            Self::Synth { .. } => None,
-        }
-    }
-    /// Derive a synthetic from this tensor.
-    pub fn synth(self, role: SynthRole) -> Self {
-        Self::Synth {
-            of: self.tid(),
-            role,
-        }
-    }
-}
-
-impl fmt::Display for PlaceId {
-    /// THE ONE SPELLING SITE. For diagnostics and the emitted program's own operand references;
-    /// nothing parses this back, so it is a rendering, not an encoding.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Act(t) => write!(f, "t{t}"),
-            Self::Synth { of, role } => write!(f, "t{of}_{role}"),
-        }
-    }
-}
+/// ⚠️ THIS CRATE'S HEADER SAYS IT MAY "DEPEND ON NOTHING EITHER END OWNS", AND THIS IS A DEPENDENCY.
+/// `ktir-superdsc` is neither end: it is a leaf BELOW all three crates that header names, with no
+/// scratchy dependency of its own, and all three still reach these types through this crate.
+/// Recorded rather than reworded: the rule stands as written, and this note is the exception it does
+/// not name.
+pub use ktir_superdsc::place::{PlaceId, SynthRole};
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -489,11 +329,37 @@ impl KvShifts {
 /// constructible, and the refusal was the proof it was constructible. There is no index to dangle now.
 ///
 /// `SCRATCHY_SUPERDSC_GROUP_SIZE=1` makes this one trip per program, which is the fault-isolation end of
+
+/// One program of a launch group: the function, and which PLACED tensor each of its parameters
+/// points at.
+///
+/// ⛔ A PARAMETER IS AN `index` — A START ADDRESS. `ktdp.construct_memory_view`'s first operand is
+/// that offset and the memref is its result, so a launch binds an ADDRESS per parameter: the
+/// segment's base, plus that launch's shift, plus the placement's offset. Nothing here is a shape
+/// or a name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LaunchProgram<'a> {
+    /// The constructed program.
+    pub func: ktir_core::ir::IRFunction<'a>,
+    /// Parameter -> the tensor it carries, in parameter order. Carried from the construction that
+    /// minted the parameter, never re-derived from a name.
+    pub args: Cow<'a, [(ktir_core::ir::Ssa, PlaceId)]>,
+}
+
 /// that knob — not a different mode.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+// NOT `Eq`: a group carries its PROGRAMS, and a program carries float constants.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaunchGroup<'a> {
     /// What the launch shifts this program's segment bases by.
     pub kv: KvShifts,
+    /// ⭐⭐⭐ THE PROGRAMS THIS LAUNCH RUNS, IN ORDER — the group's KTIR, constructed by the lowering
+    /// and baked here as const data. A launch group IS its programs.
+    ///
+    /// ⛔ NOTHING PARSES THESE. They are `IRFunction` values from end to end: the lowering builds
+    /// them, `#[forward]` submits them, and the device executes them. On the emulator that is
+    /// direct; on a card the device image below is compiled FROM these, and is their artifact
+    /// rather than a second source of truth.
+    pub programs: Cow<'a, [LaunchProgram<'a>]>,
     /// dxp's device image. Empty for a group dxp compiled to a job plan alone.
     pub init_binary: Cow<'a, [u8]>,
     /// The device VA execution starts at. The launch passes `job_bin_ptr - PROG_OFFSET_BASE` as the
@@ -747,6 +613,31 @@ mod tests {
     /// the load path refusing when an index did not resolve — i.e. a bundle with a dangling program
     /// reference was constructible, and the refusal was the proof of it. Launch order is slice order
     /// now, so there is no index to dangle and no refusal to write.
+    /// The KTIR the two launches below carry, in the CONST form `#[forward]` bakes: a program is
+    /// data, so a test can hold one the same way the binary does.
+    const F_A: ktir_core::ir::IRFunction<'static> = ktir_core::ir::IRFunction {
+        name: "a",
+        arguments: &[],
+        operations: &[],
+        grid: (1, 1, 1),
+        return_type: None,
+    };
+    const F_B: ktir_core::ir::IRFunction<'static> = ktir_core::ir::IRFunction {
+        name: "b",
+        arguments: &[],
+        operations: &[],
+        grid: (2, 1, 1),
+        return_type: None,
+    };
+    const PROGS_A: &[LaunchProgram<'static>] = &[LaunchProgram {
+        func: F_A,
+        args: Cow::Borrowed(&[]),
+    }];
+    const PROGS_B: &[LaunchProgram<'static>] = &[LaunchProgram {
+        func: F_B,
+        args: Cow::Borrowed(&[]),
+    }];
+
     #[test]
     fn a_launch_carries_its_own_program() {
         let code = BundleCode {
@@ -758,12 +649,14 @@ mod tests {
                         slot_stride_bytes: 128,
                         ..KvShifts::default()
                     },
+                    programs: Cow::Borrowed(PROGS_A),
                     init_binary: Cow::Borrowed(&[1, 2, 3]),
                     job_bin_ptr: 64,
                     correction: Cow::Borrowed(&[]),
                 },
                 LaunchGroup {
                     kv: KvShifts::default(),
+                    programs: Cow::Borrowed(PROGS_B),
                     init_binary: Cow::Borrowed(&[4]),
                     job_bin_ptr: 128,
                     correction: Cow::Borrowed(&[]),
@@ -771,8 +664,13 @@ mod tests {
             ]),
             reroll: None,
         };
-        // Every launch has a program, by construction — there is nothing to resolve.
+        // Every launch has a program, by construction — there is nothing to resolve. The program is
+        // reached through the launch ITSELF, with no index and no registry lookup in between, which
+        // is the whole claim: `groups[i].programs` cannot name a program some other slice holds.
         assert_eq!(code.groups.len(), 2);
+        assert_eq!(code.groups[0].programs[0].func.name, "a");
+        assert_eq!(code.groups[1].programs[0].func.name, "b");
+        assert_eq!(code.groups[1].programs[0].func.grid, (2, 1, 1));
         assert_eq!(code.groups[0].job_bin_ptr, 64);
         assert_eq!(code.groups[1].init_binary.as_ref(), &[4]);
         // The write predicates are DERIVED from the strides, so a stride and its flag cannot disagree.

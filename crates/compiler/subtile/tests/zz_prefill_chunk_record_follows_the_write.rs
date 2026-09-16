@@ -1,4 +1,4 @@
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! ⛔⛔⛔ A PREFILL CHUNK'S RECORD MUST FOLLOW ITS WRITE ACROSS A PAGE BOUNDARY.
 //!
 //! THE SEAM THIS SPANS: `PagedKvPool::chunk_write_start` decides WHERE a chunk writes and may step it

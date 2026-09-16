@@ -38,7 +38,7 @@
 
 #![allow(dead_code)]
 
-use crate::model_geometry::{HeadDim, ModelAttnGeometry};
+use ktir_superdsc::head_counts::{HeadDim, ModelAttnGeometry};
 use std::marker::PhantomData;
 
 // ── Identifiers & geometry ─────────────────────────────────────────
@@ -2569,7 +2569,7 @@ mod tests {
     /// arms consuming the per-K-chunk predecessor pages a tiled
     /// producer now emits — is the next frontier (Patch 1 step (f)).
     #[test]
-    #[cfg(any(feature = "spyre", feature = "superdsc"))]
+    #[cfg(feature = "spyre")]
     fn subtile_tape_nb128_builds_from_fixture() {
         use crate::lower::fuse_silu_mul;
         use crate::subtile_tape::lower_dag_to_tape;

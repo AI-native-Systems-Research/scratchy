@@ -22,22 +22,19 @@ nccl = ["cuda", "scratchy-forward-compiler/nccl", "scratchy-target-cuda/nccl", "
 # neutral `GpuWeights` comes from scratchy-layers, the registry/`try_load` +
 # `ScratchyWeights` from the compiler, `DType` from scratchy-tensors, and the host
 # `SpyreAllocator` + bundle runner from target-spyre.
-spyre = ["dep:scratchy-target-spyre", "dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-layers", "dep:scratchy-tensors", "dep:scratchy-subtile", "scratchy-target-spyre/runner", "scratchy-forward-compiler/spyre", "scratchy-models/spyre"]
-# `--target sendnn`: on-silicon path. Same scratchy machinery as `spyre` but the
-# session backend is target-spyre's sendnn GraphLoader runner (links the IBM
-# Spyre SDK) — and crucially does NOT pull `runner`/ktir-emulator (whose `metal`
-# feature drags in Apple-only objc2, breaking the Linux Spyre build).
-sendnn = ["dep:rayon", "dep:scratchy-target-spyre", "dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-layers", "dep:scratchy-tensors", "dep:scratchy-builder-spyre", "dep:scratchy-subtile", "scratchy-builder-spyre/sendnn", "scratchy-target-spyre/sendnn", "scratchy-forward-compiler/spyre", "scratchy-models/spyre"]
-# SuperDSC on-silicon path: the full `sendnn` runtime (shim + builder + SDK) PLUS
-# the SuperDSC emit selection forwarded to the models/compiler. A cargo feature
-# (`--features superdsc`), NOT an env var — the macro emits the work-divided
-# SuperDSC bundle and the worker routes it via the SUPERDSC_BUNDLE sentinel.
-superdsc = ["sendnn", "scratchy-models/superdsc", "scratchy-forward-compiler/superdsc"]
+spyre = ["dep:rayon", "dep:scratchy-target-spyre", "dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-layers", "dep:scratchy-tensors", "dep:scratchy-subtile", "scratchy-forward-compiler/spyre", "scratchy-models/spyre"]
+# A CARD, any revision — the SDK and the builder, over the shared machinery below. It does NOT pull
+# `spyre-emu`/ktir-emulator, whose `metal` feature drags in Apple-only objc2 and would break a Linux
+# card build.
+spyre-hw = ["spyre", "dep:scratchy-builder-spyre", "scratchy-builder-spyre/spyre-hw", "scratchy-target-spyre/spyre-hw", "scratchy-models/spyre-hw"]
+# THE EMULATOR — a SIBLING of the card, not its absence. Same bundles, same launch sequence; what
+# differs is the device underneath.
+spyre-emu = ["spyre", "scratchy-target-spyre/spyre-emu"]
 guided-decoding = ["scratchy-core-model/guided-decoding", "scratchy-target-cuda?/guided-decoding"]
 
 [dependencies]
-# Only the sendnn weight-load path fans the bf16→f16 narrowing across cores; pulled
-# in by the `sendnn` feature, absent from the host/cuda/metal builds.
+# The weight-load path fans the bf16→f16 narrowing across cores; pulled in by `spyre` (see the
+# feature above), absent from the host/cuda/metal builds.
 rayon = { workspace = true, optional = true }
 scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
@@ -49,8 +46,8 @@ scratchy-core-model = { workspace = true }
 scratchy-quantizations = { workspace = true }
 scratchy-forward-compiler = { path = "../../compiler", optional = true }
 scratchy-models = { path = "../../models/arch", optional = true, default-features = false }
-# SuperDSC weight staging shares the emitter's TYPE-SAFE `DeviceWidth` (padding/alignment lock-down) so the
-# staged weight width == the emitted device width by construction. Optional; enabled by spyre/sendnn.
+# Weight staging shares the emitter's TYPE-SAFE `DeviceWidth` (padding/alignment lock-down) so the
+# staged weight width == the emitted device width by construction. Optional; enabled by `spyre`.
 scratchy-subtile = { path = "../../compiler/subtile", optional = true, features = ["spyre"] }
 # Spyre rides the neutral seam directly (never target-cuda): GpuWeights from
 # scratchy-layers, DType from scratchy-tensors.
@@ -61,10 +58,8 @@ scratchy-tensors = { path = "../../tensors", optional = true }
 # against), and `gpu_worker.rs`'s `extern crate scratchy_builder_cuda as _`
 # keeps it in the link graph. No code is imported from it.
 scratchy-builder-cuda = { path = "../../targets/cuda/builder", optional = true }
-# Build-time AoT g2 bake (peer of scratchy-builder-cuda): pulled in by the
-# worker's `sendnn` feature so its build.rs CompileGraphs the sengraphs on the
-# card at `cargo build` and bakes the g2 blobs. The worker calls its
-# `baked_g2(fp)` lookup at session-create to load `already_compiled=true`.
+# Build-time bake on the CARD (peer of scratchy-builder-cuda): pulled in by the worker's `spyre-hw`
+# feature (see the feature list above), so its build.rs runs at `cargo build` rather than at load.
 scratchy-builder-spyre = { path = "../../targets/spyre/builder", optional = true }
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
 objc2 = { version = "0.6", optional = true }

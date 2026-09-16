@@ -11,11 +11,11 @@
 //! model that works and the model that degrades, and because if a future change makes 2b time-tile too,
 //! that is a fact worth failing on rather than discovering downstream.
 
-use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
-use scratchy_subtile::superdsc_opspec::{Df, Fp16};
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::{
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
     SharedKernelBmmForm, matmul_opspec_off_operands,
 };
+use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
+use scratchy_subtile::superdsc_opspec::{Df, Fp16};
 
 fn time_tiled(m: u32, n: u32, k: u32) -> bool {
     matmul_opspec_off_operands::<Fp16>(

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! THE POOL'S SLOT AXIS, AT ANY HEAD DIM — what the deleted request dimension turned into.
 //!
 //! ⛔⛔⛔ THIS FILE REPLACES `kv_addr_request_dim.rs`, WHICH HAD BEEN BREAKING THE WHOLE TEST BUILD.

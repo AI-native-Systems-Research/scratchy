@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 
 //! ⭐ THE PAGES A REQUEST HOLDS COME FROM THE HOST, AND THE CACHEABLE PREFIX STOPS AT THE FIRST HOLE.
 //!

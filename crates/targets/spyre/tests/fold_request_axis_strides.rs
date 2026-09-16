@@ -15,14 +15,14 @@
 //! steps a quarter of a page. That is the content of this file: which dim to declare, and that
 //! declaring it works.
 
+use ktir_superdsc::emit;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
+    SharedKernelBmmForm, assemble_matmul_batched_off, assemble_matmul_off_phys_m,
+};
 use scratchy_subtile::sdsc_abstract::{
     BlockCols, KernelTag, MatK, MatM, MatN, MatY, OperandPlacement, PagedKvPool, PerRequestRows,
     QueryRowCount, RowBlockedTag, SlotWindow, StickLayout, Stk,
 };
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::{
-    SharedKernelBmmForm, assemble_matmul_batched_off, assemble_matmul_off_phys_m,
-};
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 
 const HD: u32 = 64;
 const MQ: u32 = 8; // requests = the batch axis
@@ -38,7 +38,7 @@ fn ker(n: &str, rows: u32, cols: u32) -> Stk<KernelTag> {
 
 /// The per-core start addresses of operand `arg` (0=input, 1=kernel, 2=output), in ELEMENTS from the
 /// operand's own base, indexed by core.
-fn per_core_elems(e: &superdsc::EmittedOp, op_name: &str, arg: usize) -> Vec<i64> {
+fn per_core_elems(e: &emit::EmittedOp, op_name: &str, arg: usize) -> Vec<i64> {
     let v = serde_json::to_value(&e.op).unwrap();
     let data = &v["dscs_"][0][op_name]["scheduleTree_"][arg]["startAddressCoreCorelet_"]["data_"];
     let mut rows: Vec<(u32, i64)> = data
@@ -185,7 +185,7 @@ const GQA: u32 = 4;
 /// The input operand's DECLARED on-card walk (`maxDimSizes_`): `[-1; rank]` = "reconstruct the
 /// stick-blocked walk from N_/layoutDimOrder_/stickSize_", pinned extents = "walk row-major over a
 /// buffer this many rows deep".
-fn max_dim_sizes(e: &superdsc::EmittedOp, op_name: &str, arg: usize) -> Vec<i64> {
+fn max_dim_sizes(e: &emit::EmittedOp, op_name: &str, arg: usize) -> Vec<i64> {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0][op_name]["scheduleTree_"][arg]["maxDimSizes_"]
         .as_array()
@@ -197,7 +197,7 @@ fn max_dim_sizes(e: &superdsc::EmittedOp, op_name: &str, arg: usize) -> Vec<i64>
 
 /// The operand's `layoutDimOrder_` — WHICH axis owns which stride is set by nothing but this order,
 /// so the walk pin above is only meaningful together with it.
-fn layout_dim_order(e: &superdsc::EmittedOp, op_name: &str, arg: usize) -> Vec<String> {
+fn layout_dim_order(e: &emit::EmittedOp, op_name: &str, arg: usize) -> Vec<String> {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0][op_name]["scheduleTree_"][arg]["layoutDimOrder_"]
         .as_array()

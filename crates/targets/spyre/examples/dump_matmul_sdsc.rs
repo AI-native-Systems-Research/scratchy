@@ -5,10 +5,9 @@
 //!
 //!   cargo run -p scratchy-subtile --features spyre --example dump_matmul_sdsc
 
+use ktir_superdsc::emit::{In, assemble_pointwise_broadcast};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_matmul;
 use scratchy_subtile::sdsc_abstract::{KernelTag, RowBlockedTag, StickLayout, Stk};
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
-    In, assemble_matmul, assemble_pointwise_broadcast,
-};
 // Typed handles (dims annotation-only for the pointwise input path; matmul reads its own shape).
 fn rbh(n: &str, r: u32, c: u32) -> Stk<RowBlockedTag> {
     Stk::<RowBlockedTag>::new(n, StickLayout::row_blocked(r as usize, c as usize)).unwrap()

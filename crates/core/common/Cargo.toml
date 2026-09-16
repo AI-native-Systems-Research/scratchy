@@ -34,7 +34,7 @@ tracing-opentelemetry = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 
 # ⛔ THE KV ARITHMETIC PROOFS IN `kv.rs` LIVE BEHIND `cfg(kani)` AND NEED NO FEATURE FLAG — unlike
-# scratchy-subtile's, which are invisible without `--features superdsc` (see that crate's manifest, and
+# scratchy-subtile's, which are invisible without `--features spyre` (see that crate's manifest, and
 # `kani-proofs-died-silently-in-the-rebuild`). Run them with:
 #     KANI_PKG=scratchy-core-common ~/.claude/bin/kani-safe.sh <harness>
 # Check the HARNESS COUNT and the UNDETERMINED COUNT, never just the verdict: `cargo check` does not compile

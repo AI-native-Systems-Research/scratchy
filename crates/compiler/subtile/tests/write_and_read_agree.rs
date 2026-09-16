@@ -1,4 +1,4 @@
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! ⛔ ONE LAW OR TWO? The prefill WRITE and the fold READ must address the same byte.
 //!
 //! Isolated on the card 2026-08-09: 200 tokens of context reached by DECODING reads back correctly, while a

@@ -19,11 +19,10 @@
 //! a DIFFERENT dataspace and reported every trip starting at 0. Keying on the output's `ldsIdx_` is
 //! what makes it a gate rather than a false alarm.)
 
+use ktir_superdsc::emit::rb;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_off};
 use scratchy_subtile::sdsc_abstract::{KernelTag, MatK, MatM, MatN, MatY, QueryRowCount, Stk};
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::{
-    SharedKernelBmmForm, assemble_matmul_off,
-};
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{concrete_trips, rb};
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::concrete_trips;
 
 /// Core-0 start address of each trip's OUTPUT dataspace, in elements.
 fn trip_output_starts(m: u32, n: u32, k: u32) -> Vec<i64> {

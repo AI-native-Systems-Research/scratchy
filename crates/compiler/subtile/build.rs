@@ -137,19 +137,19 @@ fn emit_config_geometry() {
     }
     out.push_str("];\n\n");
 
-    // The attention-geometry door has exactly one consumer, `with_config_attn_geometry`, and it is
-    // `#[cfg(feature = "superdsc")]`. Emitting the macro on a metal/cuda build leaves it dead, which
-    // `-D warnings` rejects as `unused_macros`, so generate it under the same condition its caller
-    // compiles under. The head-dim door below is unconditional because its consumer is.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SUPERDSC");
-    if std::env::var_os("CARGO_FEATURE_SUPERDSC").is_some() {
-        out.push_str("macro_rules! for_each_config_attn_geometry {\n");
-        out.push_str("    ($emit:ident) => {\n        $emit! {\n");
-        for (nqh, nkvh, hd) in &geometries {
-            out.push_str(&format!("            ({nqh}, {nkvh}, {hd}),\n"));
-        }
-        out.push_str("        }\n    };\n}\n\n");
+    // ⭐ BOTH DOORS ARE UNCONDITIONAL, BECAUSE BOTH CONSUMERS ARE. The attention-geometry macro was
+    // generated only under the emit-mode feature, to match a `with_config_attn_geometry` that
+    // compiled under the same one — otherwise `-D warnings` rejected the macro as `unused_macros`
+    // on a metal/cuda build. There is no emit mode now: `model_geometry` is "always compiled: the
+    // tape carries a `ModelAttnGeometry` on every attention node, whatever the target"
+    // (`src/lib.rs:32-34`), so its door compiles on every target and the macro it expands must be
+    // there on every target too.
+    out.push_str("macro_rules! for_each_config_attn_geometry {\n");
+    out.push_str("    ($emit:ident) => {\n        $emit! {\n");
+    for (nqh, nkvh, hd) in &geometries {
+        out.push_str(&format!("            ({nqh}, {nkvh}, {hd}),\n"));
     }
+    out.push_str("        }\n    };\n}\n\n");
 
     out.push_str("macro_rules! for_each_config_head_dim {\n");
     out.push_str("    ($emit:ident) => {\n        $emit! {\n");

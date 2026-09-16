@@ -47,9 +47,10 @@ metal = ["scratchy-ir/metal", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundat
 # decoupled from every target crate; spyre rides the compiler-owned arch
 # registry + scratchy-layers `GpuWeights`, and the host `SpyreAllocator` comes
 # from `scratchy-target-spyre` at the worker, never through target-cuda.
+spyre-hw = ["spyre"]
 spyre = ["scratchy-ir/spyre", "dep:scratchy-subtile", "scratchy-subtile/spyre"]
 # SuperDSC perf path (rides on spyre). Cargo feature, not an env var.
-superdsc = ["spyre", "scratchy-subtile/superdsc"]
+
 # Pulls in the Hub downloader, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the

@@ -4,29 +4,22 @@
 //! Target-specific because the addressing is (`bind_launch_slot`, `PageMapCtx`, the fold's page
 //! maps), model-NEUTRAL because a page is a page: none of this changes when the architecture does.
 
+// ⭐ THIS WHOLE MODULE IS THE CARD'S PAGED-KV PLUMBING, so every import carries the cfg of the
+// blocks that use it — on the emulator the file contributes nothing.
+#[cfg(feature = "spyre-hw")]
 use scratchy_subtile::sdsc_abstract::{
     BlockTable, LaunchSlot, PagedKvPool, PoolPages, PoolPartition, RowPages, SlotCount,
 };
-// ⭐ THE CARD PATH NO LONGER PARSES A MANIFEST. `Manifest` survives only for
-// the KTIR-emulator session, whose `new_multi` takes `&Manifest` to thread its
-// HBM buffers. Under `sendnn` every fact it carried comes from the GENERATED
-// `SUPERDSC_WIRINGS` static instead, so the type is not even in scope.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::Manifest;
-// `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
-// runner; the bundle type + session type are cfg-selected, everything else
-// (weight load, dynamic sources, KV loop, sampling) is shared.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::KtirBundle;
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::manifest::SengraphBundle;
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::runner::SpyreSession;
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::SuperDscSession;
 
+#[cfg(feature = "spyre-hw")]
 use crate::error::ExecutorResult;
+#[cfg(feature = "spyre-hw")]
 use crate::spyre_types::*;
+#[cfg(feature = "spyre-hw")]
 use crate::spyre_worker::*;
 
 /// ⭐ INSTALL THE PAGES THE HOST GAVE `req`, and refuse if they do not reach the slot the forward is
@@ -44,7 +37,7 @@ use crate::spyre_worker::*;
 /// the two disagree about how many slots a request occupies, which is one number the worker reports every
 /// step ([`ReqState::kv_extent`]) — so a refusal here names a reporting bug, and it is a bug report
 /// instead of a request reading a page nobody wrote.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn install_host_blocks(
     session: &mut SendnnSession,
     req: &mut ReqState,
@@ -143,7 +136,7 @@ pub(crate) fn install_host_blocks(
 /// One parameter rather than two because they are only ever correct TOGETHER: `map_row` bounds every host
 /// id by `part.host_blocks()`, so a list from one pool checked against another partition would admit an id
 /// that names a reserved hole page. Threading them separately is what lets those two drift.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 #[derive(Clone, Copy)]
 pub(crate) struct PageMapCtx<'a> {
     /// The scheduler's block ids for this request, block `j` = its TOKEN page `j`.
@@ -154,7 +147,7 @@ pub(crate) struct PageMapCtx<'a> {
 /// THE POOL'S OWNER SPLIT for the loaded bundle: which pages the host allocates from, and which back the
 /// batched write's hole. One derivation, so the count reported to the host
 /// (`kv_cache_num_blocks_override`) and the bound `map_row` checks ids against cannot disagree.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn pool_partition(sb: &SuperDscBundle) -> ExecutorResult<PoolPartition> {
     let pool = PoolPages::of_pool(sb.pool_pages)
         .ok_or_else(|| werr("superdsc paged: the pool has no pages — nothing can be served"))?;
@@ -172,7 +165,7 @@ pub(crate) fn pool_partition(sb: &SuperDscBundle) -> ExecutorResult<PoolPartitio
 
 /// Point ONE session at the pages a request owns. Needed for EVERY session that forwards for it:
 /// prefill rungs are separate sessions sharing seg2 by alias, each with its own page map.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn bind_request_pages(
     session: &mut SuperDscSession,
     req: &ReqState,
@@ -190,7 +183,7 @@ pub(crate) fn bind_request_pages(
 /// bundle actually does is what lets `fold_plan::LaunchPages` see a single stride and collapse the
 /// fold's passes; installing live 0's row for the padding made the row list `row0, row0+1, …, row0`,
 /// which admits no stride and refuses the collapse with no symptom but the missing speed.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 /// EVERY PRINT-ONLY FLAG THIS FILE READS ON A PER-STEP OR PER-LAUNCH PATH, RESOLVED ONCE PER PROCESS.
 ///
 /// ⛔⛔⛔ `std::env::var_os` LOCKS THE ENVIRONMENT AND WALKS IT, and these sit in `bind_request_pages_at` (per
@@ -205,7 +198,7 @@ pub(crate) fn bind_request_pages(
 // ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
 // these gates, and resolving the rebase conflict in favour of the split took the whole
 // file — which discarded them. They are what makes the KTIR-only build compile.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) struct Flags {
     pub(crate) phase_time: bool,
     pub(crate) timing: bool,
@@ -214,7 +207,7 @@ pub(crate) struct Flags {
 // ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
 // these gates, and resolving the rebase conflict in favour of the split took the whole
 // file — which discarded them. They are what makes the KTIR-only build compile.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn flags() -> &'static Flags {
     static F: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
     F.get_or_init(|| {
@@ -229,7 +222,7 @@ pub(crate) fn flags() -> &'static Flags {
 // ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
 // these gates, and resolving the rebase conflict in favour of the split took the whole
 // file — which discarded them. They are what makes the KTIR-only build compile.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn bind_launch_slot(
     session: &mut SuperDscSession,
     slot: LaunchSlot,
@@ -274,7 +267,7 @@ pub(crate) fn bind_launch_slot(
 /// binds every one of its requests at the SAME slot — a launch resolves one slot shift for every trip
 /// inside it, so per-request slots mean one launch per request — and `BatchSlot` is the value that can
 /// only have come from the live requests' own histories.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn bind_request_pages_at(
     session: &mut SuperDscSession,
     req: &ReqState,
@@ -312,7 +305,7 @@ pub(crate) fn bind_request_pages_at(
 
 /// Index of the SMALLEST prefill rung that can hold `real` query rows. `rungs` is ascending, and the
 /// caller caps its chunk at the top rung, so this only returns `None` for an EMPTY ladder.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn prefill_rung_for(rungs: &[(usize, SuperDscSession)], real: usize) -> Option<usize> {
     rungs
         .iter()
@@ -323,7 +316,7 @@ pub(crate) fn prefill_rung_for(rungs: &[(usize, SuperDscSession)], real: usize) 
 /// The decode-slot sentinel prefix the SuperDSC codegen stamps into
 /// `group.decode.graph_json` in place of a real sengraph JSON. The bytes after the
 /// prefix are the dxp-bundle fingerprint `fp` (the `bundle_code` registry key).
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) const SUPERDSC_SENTINEL: &str = "SUPERDSC_BUNDLE:";
 
 /// True iff the baked bundle is the SUPERDSC dxp bundle. The SuperDSC emitter does
@@ -334,7 +327,7 @@ pub(crate) const SUPERDSC_SENTINEL: &str = "SUPERDSC_BUNDLE:";
 /// [`is_superdsc_bundle`]: the sentinel is not a
 /// real graph, so those predicates' `PagedAttn` / `prefill==decode` substring tests
 /// would misclassify it (e.g. default-mode also has one group with prefill==decode).
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn is_superdsc_bundle(bundle: &SengraphBundle) -> bool {
     bundle.groups.len() == 1
         && bundle

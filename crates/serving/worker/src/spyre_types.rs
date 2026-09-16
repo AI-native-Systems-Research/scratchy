@@ -11,25 +11,19 @@
 use std::path::PathBuf;
 
 use scratchy_core_model::weight::HfModelConfig;
-use scratchy_subtile::sdsc_abstract::{
-    BlockTable, PagedKvPool, PoolRows, PoolSplit, RowPages, SlotCount,
-};
-// ⭐ THE CARD PATH NO LONGER PARSES A MANIFEST. `Manifest` survives only for
-// the KTIR-emulator session, whose `new_multi` takes `&Manifest` to thread its
-// HBM buffers. Under `sendnn` every fact it carried comes from the GENERATED
-// `SUPERDSC_WIRINGS` static instead, so the type is not even in scope.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::Manifest;
+// `SlotCount` sizes the resident cache on BOTH paths; the paging vocabulary around it is card-only.
+use scratchy_subtile::sdsc_abstract::SlotCount;
+#[cfg(feature = "spyre-hw")]
+use scratchy_subtile::sdsc_abstract::{BlockTable, PagedKvPool, PoolRows, PoolSplit, RowPages};
 // `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
 // runner; the bundle type + session type are cfg-selected, everything else
 // (weight load, dynamic sources, KV loop, sampling) is shared.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::KtirBundle;
-#[cfg(not(feature = "sendnn"))]
+#[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::SuperDscSession;
 
+#[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
 
 /// Per-layer wiring the decode loop needs: the prefix-KV cache source tensors
@@ -38,7 +32,7 @@ use crate::spyre_pool::*;
 pub(crate) struct LayerWiring {
     /// Source tensor id of `prefix_k[layer]` (filled with the KV cache).
     pub(crate) prefix_k_src: usize,
-    #[cfg(not(feature = "sendnn"))]
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prefix_v_src: usize,
     /// Op-output tensor id of the new token's roped K (AttnDecode's seg-1 K).
     pub(crate) new_k_id: usize,
@@ -52,8 +46,14 @@ pub(crate) struct LayerWiring {
 /// only the per-phase wiring + the program index to address `run_step`.
 pub(crate) struct BundleMeta {
     /// Program index in the shared session (see [`SpyreSession::run_step`]).
-    #[cfg(not(feature = "sendnn"))]
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prog: usize,
+    /// The attention length-mask source, when this bundle has one.
+    ///
+    /// ⭐ A FACT OF THE WIRING, NOT OF A MANIFEST. The prefix cache tensor spans the full
+    /// structural capacity while only `decode_position` of its rows are valid at run time, so the
+    /// host fills this `[1, capacity]` source per step and the masked columns leave the softmax.
+    pub(crate) attn_mask_src: Option<usize>,
     /// Prefix capacity (mask cols) — max context length this bundle serves.
     pub(crate) capacity: usize,
     /// Baked query-row count: 1 (decode) or M (batched prefill).
@@ -68,14 +68,29 @@ pub(crate) struct BundleMeta {
     pub(crate) layers: Vec<LayerWiring>,
     /// Tensors read back from each forward, in a stable order: `result_id`
     /// then every layer's `new_k_id`, `new_v_id`.
-    #[cfg(not(feature = "sendnn"))]
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) output_ids: Vec<usize>,
+    /// Every compile-time scalar this bundle's KTIR reads, in registry order — entry `i` is bound at
+    /// `scalarmul_scale_tid(i)` as a `[1,1]` tile.
+    ///
+    /// ⛔ THE EMULATOR MUST BIND THESE OR THE OUTPUT IS SILENTLY WRONG. `KtirFunc::splat_scale`
+    /// reads a model constant (a scale, an RMSNorm epsilon or divisor) and the algebraic identities
+    /// `0`/`1` off reserved tids rather than baking them as KTIR immediates, because
+    /// `dxp_standalone` has no immediate operand and the card path needs a real address. Those tids
+    /// are ordinary `func.arguments` of the program the emulator runs too, so an unbound one is a
+    /// zero — which turns `x/(1+e)` into `x/e` and every scaled residual into nothing. The card
+    /// binds the same list through `wiring::constant_steps`; this is the emulator's copy of it.
+    #[cfg(not(feature = "spyre-hw"))]
+    pub(crate) scalarmul_scales: &'static [f32],
     /// What the bake placed — asked ONCE, in the target crate, off the generated layout.
+    /// Read only by the card launch path, so it carries that cfg like `prog`/`output_ids` above.
+    #[cfg(feature = "spyre-hw")]
     pub(crate) facts: scratchy_target_spyre::wiring::BakeFacts,
     /// ⭐ THE GENERATED scratchy_target_spyre::wiring::IRING THIS BUNDLE scratchy_target_spyre::wiring::AS BAKED scratchy_target_spyre::wiring::ITH. Everything above it is a copy taken
     /// out of this static on the way through `Parsed`; the forward tape is read straight off it
     /// (`Wiring::forward_shape`) so the shape a forward plays cannot be a second opinion about
     /// what the bake decided.
+    #[cfg(feature = "spyre-hw")]
     pub(crate) wiring: &'static scratchy_target_spyre::wiring::Wiring,
 }
 
@@ -93,11 +108,13 @@ pub(crate) struct BundleMeta {
 /// At `rows == 1` that formula collapses to `c`, which is why the one-request path can slice
 /// `..vocab` straight off the buffer — and why the same slice at `r * vocab` for `r > 0` reads
 /// mostly request 0's logits instead of request `r`'s. Fluent, wrong, and per-request.
+#[cfg(feature = "spyre-hw")]
 pub(crate) struct LogitsGeom {
     pub(crate) rows: usize,
     pub(crate) width: usize,
 }
 
+#[cfg(feature = "spyre-hw")]
 impl LogitsGeom {
     /// From the result tensor's baked `bundle_layout.json` placement (BYTES) and the rung's row
     /// count — the BAKED width, because the tail runs unfolded at the rung's `m` whatever is live.
@@ -148,7 +165,7 @@ impl LogitsGeom {
 // ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
 // these gates, and resolving the rebase conflict in favour of the split took the whole
 // file — which discarded them. They are what makes the KTIR-only build compile.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) struct DecodeRung {
     /// The row count this rung's bundle was BAKED at — every launch on it binds exactly this many
     /// rows, live or padding, and every mask/fold/logits extent below derives from it.
@@ -178,6 +195,7 @@ pub(crate) struct DecodeRung {
     pub(crate) logits: LogitsGeom,
 }
 
+#[cfg(feature = "spyre-hw")]
 pub(crate) enum LogitsWanted<'a> {
     /// Nothing — every prompt chunk but the last, which skips the whole-segment D2H.
     None,
@@ -196,7 +214,7 @@ pub(crate) enum LogitsWanted<'a> {
 /// runs on silicon. The sengraph families (offline_decoder `GroupedSession`, the static-paged and
 /// default-mode single-graph sessions) are GONE — they were the pre-SuperDSC bring-up path and the
 /// router sent nothing to them.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) enum SendnnSession {
     /// SUPERDSC (the typed-Rust SuperDSC OpSpec emitter path). The lowering owns the
     /// 32-core work-division and emits a dxp bundle (a DIRECTORY of per-supernode dxp
@@ -226,7 +244,7 @@ pub(crate) enum SendnnSession {
 /// activations / seg3 intermediates are m-larger, so they cannot share all segments); their
 /// seg2 KV layout is byte-identical, so the worker hands the prompt's KV from `prefill` to
 /// `decode` via a raw seg2 copy after the batched-prefill forward.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) struct SuperDscBundle {
     pub(crate) decode: SuperDscSession,
     /// PREFILL WIDTH LADDER — ASCENDING by baked query-row count `mq`; the last entry is the widest.
@@ -299,7 +317,7 @@ pub(crate) struct SuperDscBundle {
     pub(crate) pool_pages: usize,
 }
 
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 impl SuperDscBundle {
     /// The widest baked prefill width = the largest chunk ONE batched forward can take. 0 = no ladder.
     pub(crate) fn prefill_top_m(&self) -> usize {
@@ -400,11 +418,11 @@ pub(crate) struct Loaded {
     pub(crate) vocab: usize,
     pub(crate) rope_theta: f32,
     /// KTIR path: ONE resident session holding both programs (weights once).
-    #[cfg(not(feature = "sendnn"))]
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) session: SpyreSession,
     /// sendnn path: the SuperDSC dxp-bundle session or the offline_decoder
     /// layer-group split — selected from the baked bundle shape.
-    #[cfg(feature = "sendnn")]
+    #[cfg(feature = "spyre-hw")]
     pub(crate) session: SendnnSession,
     /// m=1 decode program metas, one per static cap bucket, ASCENDING by
     /// capacity. The generation loop runs the smallest bucket whose capacity
@@ -464,14 +482,14 @@ pub(crate) struct ReqState {
     /// ⛔ A HOST MIRROR OF THE KV — and it does not exist on the sendnn path at all.
     ///
     /// Per-layer, row-major `[n_computed, kv_dim]`, grown one row per step by the KTIR EMULATOR's
-    /// `forward_chunk` (`#[cfg(not(feature = "sendnn"))]`), which threads the prefix KV from the host. On
+    /// `forward_chunk` (`#[cfg(not(feature = "spyre-hw"))]`), which threads the prefix KV from the host. On
     /// the on-silicon paged path the KV is resident on card and addressed by [`PagedKv`] + the host block
     /// table, so this was allocated per request (`vec![Vec::new(); nlayers]`) and never read — a dead
     /// mirror of the thing `d6906140` removed. `cfg`-ed out rather than documented as unused: an empty
     /// mirror is one `extend_from_slice` away from being a real one again.
-    #[cfg(not(feature = "sendnn"))]
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) kv_k: Vec<Vec<f32>>,
-    #[cfg(not(feature = "sendnn"))]
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) kv_v: Vec<Vec<f32>>,
     // ⛔⛔⛔ THERE IS NO `kv: Option<PagedKv>` ANY MORE, AND THAT IS THE END OF REQUEST IDENTITY BELOW THE
     // HOST. It held the request's POOL ROW — the pages that backed its batched write past its own keys. The
@@ -489,7 +507,7 @@ impl ReqState {
     /// ⛔ IT TOOK A `KvRow` TOO, and that argument was the last per-request address below the host: the write
     /// page came from a run of pool pages reserved for that row. The scheduler allocates the write page now,
     /// so this is a function of the request's HISTORY and the HOST'S LIST — nothing else.
-    #[cfg(feature = "sendnn")]
+    #[cfg(feature = "spyre-hw")]
     pub(crate) fn page_map(&self, ctx: PageMapCtx<'_>, want: RowPages) -> Option<BlockTable> {
         BlockTable::map_row(&self.kv_hist, ctx.host, want, ctx.part)
     }

@@ -19,8 +19,8 @@
 //! Slated for deletion in plan §4 commit 7 (when `to_wavefront.rs`
 //! builds [`crate::subtile_ir::SubtileIR`] directly).
 
-use crate::model_geometry::{HeadDim, ModelAttnGeometry};
 use crate::subtile_ir::SourceShape;
+use ktir_superdsc::head_counts::{HeadDim, ModelAttnGeometry};
 
 /// One input edge of an op: a prior op's output, or an external source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

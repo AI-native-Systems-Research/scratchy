@@ -8,18 +8,18 @@
 //! refuting the "wide scalar reads 0 for m>1" descriptor hypothesis. The on-card
 //! fp16-stickmajor-R2 behavior of `out=RedStick` is a separate (bake-only) question.
 
+use emit::In;
+use ktir_superdsc::emit;
 use scratchy_subtile::sdsc_abstract::{
     BlockCols, Lanes, RowBlockedTag, RowCount, StickLayout, Stk,
 };
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
-use superdsc::In;
 fn h(n: &str) -> Stk<RowBlockedTag> {
     Stk::<RowBlockedTag>::new(n, StickLayout::row_blocked(1, 64)).unwrap()
 }
 
 /// The 2nd input (the broadcast operand) of a 2-input pointwise op is `scheduleTree_[1]`.
 /// Return its per-dim coordInfo (`{mb:…, out:…}`).
-fn broadcast_operand_coordinfo(e: &superdsc::EmittedOp, op_name: &str) -> serde_json::Value {
+fn broadcast_operand_coordinfo(e: &emit::EmittedOp, op_name: &str) -> serde_json::Value {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0][op_name]["scheduleTree_"][1]["coordinates_"]["coordInfo"].clone()
 }
@@ -35,7 +35,7 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
     let stk = BlockCols::of_one_stick(Lanes::FP16);
 
     let mut s = 0i64;
-    let wide_scalar = superdsc::assemble_pointwise_broadcast(
+    let wide_scalar = emit::assemble_pointwise_broadcast(
         "wide_scalar",
         "mul",
         m,
@@ -46,7 +46,7 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         None,
     );
     let mut s = 0i64;
-    let wide_col = superdsc::assemble_pointwise_broadcast(
+    let wide_col = emit::assemble_pointwise_broadcast(
         "wide_col",
         "mul",
         m,
@@ -57,7 +57,7 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         None,
     );
     let mut s = 0i64;
-    let wide_mb = superdsc::assemble_pointwise_broadcast(
+    let wide_mb = emit::assemble_pointwise_broadcast(
         "wide_mb",
         "mul",
         m,
@@ -68,7 +68,7 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         None,
     );
     let mut s = 0i64;
-    let narrow_scalar = superdsc::assemble_pointwise_broadcast(
+    let narrow_scalar = emit::assemble_pointwise_broadcast(
         "narrow_scalar",
         "mul",
         m,

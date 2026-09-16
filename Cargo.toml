@@ -22,6 +22,14 @@ members = [
     "crates/targets/spyre",
     "crates/targets/spyre/bundle",
     "crates/targets/spyre/builder",
+    # The vendored KTIR crates — IBM's IR + emulator, in-tree so the IR types are CONSTRUCTIBLE from
+    # the lowering rather than reached through a text round trip.
+    "crates/targets/spyre/ktir/ktir-core",
+    "crates/targets/spyre/ktir/ktir-emulator",
+    "crates/targets/spyre/ktir/ktir-optimizer",
+    # KTIR -> SuperDSC as a leaf: the typed SuperDSC IR, with no scratchy dependency, so a
+    # third-party KTIR producer can consume the lowering.
+    "crates/targets/spyre/ktir/ktir-superdsc",
     "crates/models/arch",
     "crates/models/vision",
     "crates/models/quantization",

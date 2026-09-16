@@ -51,8 +51,21 @@ fn feature_keys(cargo_toml: &str) -> BTreeSet<String> {
 /// (`cuda`/`metal`/...) are real, independent declarations on each crate —
 /// `scratchy-cli`'s versions do more than forward (they also gate
 /// `scratchy-serving-api`/-worker deps), not hand-forwarded scope features.
+///
+/// The admission rule, so this list cannot become a dumping ground: a name
+/// belongs here ONLY if it is not a model scope — i.e. it is not a checked-in
+/// `configs/<arch>/<stem>.json` stem, an `<arch>` directory name, `arch-<name>`,
+/// or `all`. Backend tiers (`spyre-hw`) and capability features
+/// (`hf-completions`) pass that rule; a model or arch name never does, which is
+/// the duplication this test exists to catch.
 const SHARED_NON_SCOPE_FEATURES: &[&str] = &[
-    "default", "cuda", "metal", "nccl", "spyre", "ktir", "sendnn", "superdsc",
+    "default",
+    "cuda",
+    "metal",
+    "nccl",
+    "spyre",
+    "spyre-hw",
+    "hf-completions",
 ];
 
 #[test]

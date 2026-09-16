@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! THE NEW-BLOCK MASK LAWS, and the fact that they are not interchangeable.
 //!
-//! Lives here rather than beside the functions because the crate's `--lib` test target does not
-//! build (23 pre-existing errors, unrelated to any of this), so a `#[cfg(test)]` module next to them
-//! could not be run.
+//! Lives here rather than beside the functions as an integration test, which is also what keeps it
+//! honest about the PUBLIC surface: every law below is reached through `sdsc_abstract`'s exported
+//! types, so a lock cannot quietly come to depend on something the crate does not expose.
 
 const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
 

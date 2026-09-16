@@ -8,28 +8,27 @@
 
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_layers::weights::GpuWeights;
+// The pool/slot vocabulary is CARD-ONLY, so its imports carry the cfg of the blocks that use it.
+#[cfg(feature = "spyre-hw")]
 use scratchy_subtile::sdsc_abstract::{PagedKvPool, PoolPages, PoolPartition, PoolRows};
 use scratchy_target_spyre::SpyreAllocator;
 use scratchy_target_spyre::manifest::bytes_to_f32;
-// ⭐ THE CARD PATH NO LONGER PARSES A MANIFEST. `Manifest` survives only for
-// the KTIR-emulator session, whose `new_multi` takes `&Manifest` to thread its
-// HBM buffers. Under `sendnn` every fact it carried comes from the GENERATED
-// `SUPERDSC_WIRINGS` static instead, so the type is not even in scope.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::Manifest;
 // `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
 // runner; the bundle type + session type are cfg-selected, everything else
 // (weight load, dynamic sources, KV loop, sampling) is shared.
-#[cfg(not(feature = "sendnn"))]
+#[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::manifest::KtirBundle;
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::manifest::SengraphBundle;
-#[cfg(not(feature = "sendnn"))]
+#[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::SuperDscSession;
 use scratchy_tensors::DType as SDType;
-use tracing::{debug, info, warn};
+use tracing::info;
+// `debug`/`warn` are only reached from the card blocks below.
+#[cfg(feature = "spyre-hw")]
+use tracing::{debug, warn};
 
 /// ⭐ THE RESIDENT SEGMENTS EVERY BORROWER ADOPTS, AS ONE LIST. Four sites alias these (the
 /// prefix-capable prefill, the prefill ladder rungs, the decode batch rungs, and the top prefill
@@ -38,6 +37,9 @@ use tracing::{debug, info, warn};
 /// one rung only. Mirrors `superdsc_exec::SEG_RESIDENT`, which is what the executor's own
 /// placeholder/H2D skips read; seg5 is empty for every model whose weights fit one segment, and
 /// aliasing an empty segment is a no-op the size/placement checks accept.
+///
+/// Card-only, like [`adopt_from_owner`], its only reader.
+#[cfg(feature = "spyre-hw")]
 const RESIDENT_SEGS: [(i64, &str); 2] = [(1, "resident WEIGHTS"), (2, "resident KV")];
 
 /// ⭐ EVERYTHING A BORROWING SESSION NEEDS FROM THE OWNER, AS ONE CALL: the resident segments it
@@ -59,6 +61,10 @@ const RESIDENT_SEGS: [(i64, &str); 2] = [(1, "resident WEIGHTS"), (2, "resident 
 /// The IMAGE is taken from the owner AFTER its prepare, so it is the converted, re-tiled device bytes
 /// and not the host weight layout, which is why this copies a segment rather than re-staging a
 /// tensor.
+///
+/// Carries the cfg of the `SuperDscSession` it takes: that type — and every session-borrowing site
+/// below — is CARD-ONLY, so the emulator build has no owner for anything to adopt from.
+#[cfg(feature = "spyre-hw")]
 fn adopt_from_owner(
     borrower: &mut SuperDscSession,
     owner: &SuperDscSession,
@@ -94,6 +100,9 @@ fn adopt_from_owner(
 /// bytes on top of the borrower's zero-initialised scratch — turning a zeroed slot into arbitrary
 /// non-zero data for any tensor read before it is written. Bounding the copy to the tail's own
 /// `[0, len)` leaves every borrower's scratch exactly as `prepare` zeroed it.
+///
+/// Card-only: the emulator path builds no borrowing session, so nothing reads this work list.
+#[cfg(feature = "spyre-hw")]
 fn spilled_weight_spans(
     layout: &scratchy_target_spyre::bundle_code::BundleLayout<'static>,
     weight_ids: impl IntoIterator<Item = usize>,
@@ -115,6 +124,7 @@ fn spilled_weight_spans(
 }
 
 use crate::error::ExecutorResult;
+#[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
@@ -124,13 +134,9 @@ use crate::worker_factory::resolve_model_path;
 /// session) + model-level dims. No weights, no session — the caller builds those
 /// ONCE across both programs (decode + prefill share weight tensor ids).
 pub(crate) struct Parsed {
-    /// ⛔ KTIR-EMULATOR ONLY. `SpyreSession::new_multi` takes `&Manifest` to
-    /// thread its HBM buffers, so that path still needs the parsed JSON. The
-    /// SENDNN (card) path does not: it is built from the GENERATED
-    /// `SUPERDSC_WIRINGS` static and never parses anything.
-    #[cfg(not(feature = "sendnn"))]
-    pub(crate) manifest: Manifest,
     pub(crate) embed_src: usize,
+    /// The attention length-mask source, when the wiring names one.
+    pub(crate) attn_mask_src: Option<usize>,
     /// cos / sin runtime sources as `(source id, full column width)`. GQA gives
     /// more than one width (Q vs K); each is filled by tiling the per-position
     /// rotary row across heads (the sendnn rope consumes them full-width).
@@ -143,10 +149,11 @@ pub(crate) struct Parsed {
     pub(crate) kv_dim: usize,
     pub(crate) vocab: usize,
     pub(crate) layers: Vec<LayerWiring>,
-    #[cfg(not(feature = "sendnn"))]
-    pub(crate) extra_results: Vec<usize>,
-    #[cfg(not(feature = "sendnn"))]
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) output_ids: Vec<usize>,
+    /// See [`crate::spyre_types::BundleMeta::scalarmul_scales`].
+    #[cfg(not(feature = "spyre-hw"))]
+    pub(crate) scalarmul_scales: &'static [f32],
 }
 
 /// Parse one embedded [`KtirBundleData`]: manifest + runtime source ids +
@@ -160,7 +167,6 @@ pub(crate) struct Parsed {
 /// steps are gone: roles are an ENUM (so a new one is a compile error, not an
 /// unmatched `_`), and per-layer AttnDecode ids are read rather than inferred
 /// from "the argument after the prefix-K argument".
-#[cfg(feature = "sendnn")]
 pub(crate) fn wiring_to_parsed(
     w: &'static scratchy_target_spyre::wiring::Wiring,
 ) -> ExecutorResult<Parsed> {
@@ -176,6 +182,10 @@ pub(crate) fn wiring_to_parsed(
         .iter()
         .map(|l| LayerWiring {
             prefix_k_src: l.prefix_k as usize,
+            // Emulator-only, like the field itself: the card keeps the K/V cache RESIDENT and writes
+            // this step's V device-side, so no host binding names prefix-V there.
+            #[cfg(not(feature = "spyre-hw"))]
+            prefix_v_src: l.prefix_v as usize,
             new_k_id: l.new_k as usize,
             new_v_id: l.new_v as usize,
         })
@@ -198,148 +208,35 @@ pub(crate) fn wiring_to_parsed(
         kv_dim: w.geometry.kv_dim as usize,
         vocab: w.geometry.vocab as usize,
         layers,
-    })
-}
-
-#[cfg(not(feature = "sendnn"))]
-pub(crate) fn parse_bundle(manifest_json: &str) -> ExecutorResult<Parsed> {
-    let manifest =
-        Manifest::from_json(manifest_json).map_err(|e| werr(format!("manifest: {e}")))?;
-
-    // ── runtime source ids by role + per-layer prefix-KV sources ──
-    let mut embed_src = None;
-    let mut cos_srcs: Vec<(usize, usize)> = Vec::new();
-    let mut sin_srcs: Vec<(usize, usize)> = Vec::new();
-    let mut pk: Vec<(u64, usize)> = Vec::new();
-    let mut pv: Vec<(u64, usize)> = Vec::new();
-    for s in &manifest.sources {
-        match s.role.as_str() {
-            "embed" => embed_src = Some(s.id),
-            "cos" => cos_srcs.push((s.id, manifest.tensors[s.id].cols)),
-            "sin" => sin_srcs.push((s.id, manifest.tensors[s.id].cols)),
-            "prefix_k" => pk.push((s.layer.unwrap_or(0), s.id)),
-            "prefix_v" => pv.push((s.layer.unwrap_or(0), s.id)),
-            _ => {}
-        }
-    }
-    let embed_src = embed_src.ok_or_else(|| werr("bundle has no embed source"))?;
-    if cos_srcs.is_empty() || sin_srcs.is_empty() {
-        return Err(werr("bundle has no cos/sin source"));
-    }
-    pk.sort_by_key(|x| x.0);
-    pv.sort_by_key(|x| x.0);
-    let n_layers = pk.len();
-    if n_layers == 0 || pv.len() != n_layers {
-        return Err(werr(format!(
-            "bad prefix-KV layout: prefix_k ({n_layers}) / prefix_v ({})",
-            pv.len()
-        )));
-    }
-
-    let result_id = manifest.result;
-    let capacity = manifest
-        .attn_mask
-        .map(|m| manifest.tensors[m].cols)
-        .ok_or_else(|| werr("bundle has no attn_mask (re-emit with the length mask)"))?;
-    let m_cap = (manifest.tensors[embed_src].rows).max(1);
-
-    // ── per-layer AttnDecode wiring (new_k/new_v op-output ids) ──
-    let mask_id = manifest.attn_mask.unwrap();
-    let pk_layer: std::collections::HashMap<usize, u64> =
-        pk.iter().map(|&(l, id)| (id, l)).collect();
-    let pv_set: std::collections::HashMap<usize, ()> = pv.iter().map(|&(_, id)| (id, ())).collect();
-    let mut wiring: std::collections::HashMap<u64, LayerWiring> = std::collections::HashMap::new();
-    for node in &manifest.nodes {
-        if !node.args.iter().any(|a| a.tensor == mask_id) {
-            continue;
-        }
-        let mut layer = None;
-        let (mut prefix_k_src, mut new_k_id) = (None, None);
-        let (mut prefix_v_src, mut new_v_id) = (None, None);
-        for (i, a) in node.args.iter().enumerate() {
-            if let Some(&l) = pk_layer.get(&a.tensor) {
-                layer = Some(l);
-                prefix_k_src = Some(a.tensor);
-                new_k_id = node.args.get(i + 1).map(|x| x.tensor);
-            }
-            if pv_set.contains_key(&a.tensor) {
-                prefix_v_src = Some(a.tensor);
-                new_v_id = node.args.get(i + 1).map(|x| x.tensor);
-            }
-        }
-        // V wiring (`prefix_v_src`) is required for the node to be a valid AttnDecode site
-        // even where nothing downstream reads its tensor id (sendnn stores only the K side).
-        if let (Some(l), Some(pks), Some(nk), Some(_), Some(nv)) =
-            (layer, prefix_k_src, new_k_id, prefix_v_src, new_v_id)
-        {
-            wiring.insert(
-                l,
-                LayerWiring {
-                    prefix_k_src: pks,
-                    #[cfg(not(feature = "sendnn"))]
-                    prefix_v_src: prefix_v_src.unwrap(),
-                    new_k_id: nk,
-                    new_v_id: nv,
-                },
-            );
-        }
-    }
-    let mut layers = Vec::with_capacity(n_layers);
-    for (l, _) in &pk {
-        layers.push(
-            wiring
-                .remove(l)
-                .ok_or_else(|| werr(format!("no AttnDecode wiring found for layer {l}")))?,
-        );
-    }
-
-    // Tensors read back each forward: the logits + every layer's new roped-K /
-    // new-V (lifted into the host KV cache). The K/V ids double as the program's
-    // `results` so whole-program fusion keeps them HBM-materialized. KTIR-only:
-    // sendnn routes results per group inside `forward`, not via this list.
-    #[cfg(not(feature = "sendnn"))]
-    let (extra_results, output_ids): (Vec<usize>, Vec<usize>) = {
-        let extra_results: Vec<usize> = layers
-            .iter()
-            .flat_map(|lw| [lw.new_k_id, lw.new_v_id])
-            .collect();
-        let mut output_ids = Vec::with_capacity(1 + extra_results.len());
-        output_ids.push(result_id);
-        output_ids.extend_from_slice(&extra_results);
-        (extra_results, output_ids)
-    };
-
-    // Model-level dims, read from this bundle's manifest before it is borrowed
-    // into the session (all bundles agree on these).
-    let hidden = manifest.tensors[embed_src].cols;
-    // NOTE: head_dim is NOT derived from a cos source any more — those are now
-    // full rope width (heads*head_dim). The caller sets head_dim from the HF
-    // config (`HfModelConfig::head_dim`).
-    let kv_dim = manifest.tensors[layers[0].prefix_k_src].cols;
-    let vocab = manifest.tensors[result_id].cols;
-
-    Ok(Parsed {
-        manifest,
-        embed_src,
-        cos_srcs,
-        sin_srcs,
-        result_id,
-        capacity,
-        m_cap,
-        hidden,
-        kv_dim,
-        vocab,
-        layers,
-        #[cfg(not(feature = "sendnn"))]
-        extra_results,
-        #[cfg(not(feature = "sendnn"))]
-        output_ids,
+        #[cfg(not(feature = "spyre-hw"))]
+        scalarmul_scales: w.scalarmul_scales,
+        // The tensors the host reads back after a pass: the result, plus each layer's new K/V,
+        // which is how the KV is threaded when the device holds no cache of its own. Carries the
+        // field's own `cfg` for exactly that reason — the card DOES hold a cache of its own, so there
+        // is no per-layer readback to name there.
+        #[cfg(not(feature = "spyre-hw"))]
+        output_ids: std::iter::once(w.result as usize)
+            .chain(
+                w.layers
+                    .iter()
+                    .flat_map(|l| [l.new_k as usize, l.new_v as usize]),
+            )
+            .collect(),
+        attn_mask_src: w.attn_mask.map(|m| m as usize),
     })
 }
 
 /// The host bytes behind a tensor. Spyre's allocator is a HOST allocator, so a
 /// `GpuTensor`'s pointer is host memory and this is a plain view — no copy, no
 /// device transfer.
+///
+/// ⛔ NOT `cfg(not(spyre-hw))`, AND IT NEVER COULD BE. This carried an emulator-only gate while its
+/// sole caller, [`stage_bound_weights`], is ungated and needs the bytes on BOTH tiers — the card
+/// branch immediately below the call re-binds `bytes` to physically transpose `[n,k]` → `[k,n]` before
+/// staging. So the gate made the card build reference a function that did not exist there
+/// (`cannot find function gpu_tensor_bytes`, twice), which is why no `spyre-hw` binary has ever linked
+/// on this branch. Host bytes are correct at both tiers: the allocator is a host allocator either way,
+/// and the card path uploads FROM this buffer rather than reading device memory through it.
 pub(crate) fn gpu_tensor_bytes(t: &scratchy_tensors::GpuTensor) -> &[u8] {
     // SAFETY: `t` was produced by the generated binding from a `Weights` field,
     // whose buffer the `GpuWeights` allocator owns and keeps alive for the
@@ -374,6 +271,7 @@ pub(crate) fn gpu_tensor_bytes(t: &scratchy_tensors::GpuTensor) -> &[u8] {
 /// device's own cachewr, so `Executor::require_sources_filled` must know to skip them or it
 /// refuses every launch. Derived from the wiring rather than listed by hand, so a model with a
 /// different layer count cannot desync it.
+#[cfg(feature = "spyre-hw")]
 fn resident_source_ids(
     w: &scratchy_target_spyre::wiring::Wiring,
     // ⛔ THE SPILLED WEIGHT TAIL BELONGS HERE, and leaving it out is a REFUSED LAUNCH, not a silent
@@ -398,7 +296,8 @@ fn resident_source_ids(
 
 /// The tensor ids of the spilled weight tail — the companion of [`spilled_weight_spans`], which
 /// carries the same decision as byte ranges. Both read it off the layout so neither can drift from
-/// the emitter.
+/// the emitter. Card-only, for the same reason [`spilled_weight_spans`] is.
+#[cfg(feature = "spyre-hw")]
 fn spilled_weight_tail_tids(
     layout: &scratchy_target_spyre::bundle_code::BundleLayout<'static>,
     weight_ids: impl IntoIterator<Item = usize>,
@@ -459,7 +358,8 @@ pub(crate) fn stage_bound_weights(
         };
         // The tensor's own bytes and dtype — the generated binding already
         // resolved WHICH tensor, so this is a copy out of the field's buffer
-        // and nothing else. `raw_name` survives only for diagnostics below.
+        // and nothing else. `raw_name` survives only for the card path's size diagnostic below.
+        #[cfg(feature = "spyre-hw")]
         let raw_name = scratchy_target_spyre::bundle_code::PlaceId::Act((s_id) as u32);
         let bytes = gpu_tensor_bytes(&bw.tensor).to_vec();
         let dt = bw.tensor.dtype();
@@ -474,7 +374,7 @@ pub(crate) fn stage_bound_weights(
         // the dd2-PROVEN M5 graph (which binds each weight `.T`). Norms (`[1, hidden]`,
         // `is_gemm=false`) stay verbatim. lm_head reuses the embed buffer and is a
         // GEMM weight, so it is transposed to `embed.T = [hidden, vocab]` here too.
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         let (bytes, shape) = if is_gemm {
             // on-disk `[n, k]` = `[cols, rows]`; transpose to `[k, n]` = `[rows, cols]`.
             let elem = dt.size_bytes();
@@ -532,7 +432,7 @@ pub(crate) fn stage_bound_weights(
         } else {
             (bytes, vec![rows, cols])
         };
-        #[cfg(not(feature = "sendnn"))]
+        #[cfg(not(feature = "spyre-hw"))]
         let shape = if is_gemm {
             vec![cols, rows]
         } else {
@@ -547,7 +447,7 @@ pub(crate) fn stage_bound_weights(
     //    single-threaded. Byte-identical: the exact `f32_to_f16_le(bytes_to_f32(..))`
     //    the bind used, just relocated + parallelized. The host-weight DBG dump above
     //    ran on the pre-narrowing bytes, so its numbers are unchanged. ──
-    #[cfg(feature = "sendnn")]
+    #[cfg(feature = "spyre-hw")]
     {
         use rayon::prelude::*;
         let _t_cvt = std::time::Instant::now();
@@ -612,7 +512,7 @@ impl SpyreWorker {
         // host-side weight load below by kicking it off on a background thread NOW.
         // std::call_once makes prepare's own init block only on the remainder — a pure
         // latency win with no change to the bytes that reach the device.
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         SuperDscSession::prewarm_runtime();
 
         let model_dir = resolve_model_path(
@@ -628,8 +528,15 @@ impl SpyreWorker {
         // arch through scratchy's registry (fingerprint) — exactly like the
         // cuda/metal workers. NO stem-glob, NO ~/.cache read: the matched
         // ScratchyWeights carries the macro-embedded KTIR bundle.
+        let _t_gw = std::time::Instant::now();
         let mut gw = GpuWeights::from_dir(&model_dir, SpyreAllocator::new())
             .map_err(|e| werr(format!("GpuWeights::from_dir: {e}")))?;
+        // Startup is dominated by how many times the checkpoint's bytes are moved, so each
+        // move is timed separately: this one is disk/page-cache -> host.
+        tracing::debug!(
+            "[timing] GpuWeights::from_dir took {:.2}s",
+            _t_gw.elapsed().as_secs_f64()
+        );
 
         let arch = hf_config.architectures.first().cloned().unwrap_or_default();
         let hf_fp = scratchy_forward_compiler::HfFingerprint {
@@ -666,6 +573,7 @@ impl SpyreWorker {
         // `try_load` runs the GENERATED `Weights::load` — the same loader
         // cuda/metal use — and the bundle, the weight binding and the embed
         // table are all read off THAT model.
+        let _t_try = std::time::Instant::now();
         let model = scratchy_forward_compiler::try_load(
             &mut gw,
             (),
@@ -683,12 +591,19 @@ impl SpyreWorker {
                  (e.g. --features spyre,model/llama-3.2-1b)"
             ))
         })?;
-        #[cfg(not(feature = "sendnn"))]
+        // `try_load` runs the GENERATED loader over every tensor, so it is a whole pass
+        // across the checkpoint in its own right — timed apart from the raw byte extraction
+        // that follows it.
+        tracing::debug!(
+            "[timing] try_load ({arch}) took {:.2}s",
+            _t_try.elapsed().as_secs_f64()
+        );
+        #[cfg(not(feature = "spyre-hw"))]
         let bundle: &'static KtirBundle = model
             .ktir_bundle()
             .and_then(|b| b.downcast_ref::<KtirBundle>())
             .ok_or_else(|| werr("the matched model carries no KTIR bundle"))?;
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         let bundle: &'static SengraphBundle = model
             .sengraph_bundle()
             .and_then(|b| b.downcast_ref::<SengraphBundle>())
@@ -702,7 +617,15 @@ impl SpyreWorker {
             .superdsc_embed()
             .ok_or_else(|| werr("the matched model exposes no embedding table"))?
             .map_err(|e| werr(format!("embed table: {e}")))?;
+        let _t_embed = std::time::Instant::now();
         let embed_tokens = bytes_to_f32(gpu_tensor_bytes(&embed_t), embed_t.dtype());
+        // The embed table is `[vocab, hidden]` and this widens ALL of it to f32 up front,
+        // so it is sized by the vocabulary, not by the prompt.
+        tracing::debug!(
+            "[timing] embed table -> f32 ({} elems) took {:.2}s",
+            embed_tokens.len(),
+            _t_embed.elapsed().as_secs_f64()
+        );
 
         // Parse the decode + prefill manifests (sources/wiring/dims). For KTIR the
         // bundle carries decode + optional prefill directly; for sendnn the
@@ -710,22 +633,6 @@ impl SpyreWorker {
         // per-group), so parse group 0's decode/prefill manifest (== the full one).
         // KTIR bakes one decode program PER CAP BUCKET (all share weight ids — same graph,
         // different prefix cap), so parse every one. sendnn bakes a single group-0 program.
-        #[cfg(not(feature = "sendnn"))]
-        let (dparsed_all, pparsed) = {
-            let d: Vec<Parsed> = bundle
-                .decode
-                .iter()
-                .map(|b| parse_bundle(b.manifest_json))
-                .collect::<ExecutorResult<_>>()?;
-            if d.is_empty() {
-                return Err(werr("bundle carries no decode programs"));
-            }
-            let p = match &bundle.prefill {
-                Some(p) => Some(parse_bundle(p.manifest_json)?),
-                None => None,
-            };
-            (d, p)
-        };
         // ⭐ NO PARSING. The wiring is a GENERATED static on the loaded model —
         // the same facts the `manifest_json` string carried, as typed values.
         // ⛔ NOT `sendnn`-GATED. The wiring is GENERATED data, emitted for every spyre build, and
@@ -736,7 +643,6 @@ impl SpyreWorker {
             .superdsc_wiring()
             .and_then(|w| w.downcast_ref::<scratchy_target_spyre::wiring::Wirings>())
             .ok_or_else(|| werr("the matched model exposes no launch wiring"))?;
-        #[cfg(feature = "sendnn")]
         let (dparsed_all, pparsed) = {
             let d = vec![wiring_to_parsed(&wirings.decode)?];
             // A model with no batched-prefill program simply has none; the
@@ -766,7 +672,16 @@ impl SpyreWorker {
             .superdsc_weights()
             .ok_or_else(|| werr("the matched model exposes no weight binding"))?
             .map_err(|e| werr(format!("weight binding: {e}")))?;
+        tracing::info!(
+            "[weights] superdsc_weights returned {} bound weight(s); wiring has {} tensor shape(s)",
+            bound.len(),
+            wirings.decode.tensor_shapes.len()
+        );
         let weights = stage_bound_weights(&bound, &wirings.decode)?;
+        tracing::info!(
+            "[weights] staged {} weight(s) for the session",
+            weights.len()
+        );
         // NOTE: the RoPE rotate-half permutation P (ROPE_P_TID) is NOT a load-time weight.
         // It is a synthetic seg0 ACTIVATION re-bound per step in `superdsc_forward_chunk`
         // (see the `acts` block there) — a seg1 weight would only be H2D'd at PrepareModel,
@@ -776,29 +691,60 @@ impl SpyreWorker {
         // [prefill, decode] sessions (the host threads the hidden state group→group).
         // Program order: prefill first (index 0) when present, then the decode cap buckets in
         // ascending-cap order — so a bucket's program index is `decode_prog_base + i`.
-        #[cfg(not(feature = "sendnn"))]
+        #[cfg(not(feature = "spyre-hw"))]
         let (session, decode_prog_base) = {
-            let mut programs: Vec<ProgramInput> = Vec::new();
+            // ⭐ THE PROGRAMS COME OUT OF THE REGISTRY, BY FINGERPRINT. `#[forward]` submitted them
+            // as const data; the bundle names which set is this model's. That is the same resolver
+            // the ladder rungs and the re-rolled siblings already use, so a program is found in one
+            // place.
+            let groups = |fp: &str| -> ExecutorResult<
+                &'static [scratchy_target_spyre::bundle_code::LaunchGroup<'static>],
+            > {
+                let code = scratchy_target_spyre::bundle_code::bundle(fp).ok_or_else(|| {
+                    werr(format!(
+                        "no KTIR programs compiled into this binary for fp={fp} — the emit ran for \
+                         a different model, or without the lowering. Registered: {:?}",
+                        scratchy_target_spyre::bundle_code::registered_fps(),
+                    ))
+                })?;
+                Ok(&code.groups)
+            };
+            let mut programs: Vec<(
+                &[scratchy_target_spyre::bundle_code::LaunchGroup<'static>],
+                Vec<u64>,
+            )> = Vec::new();
             if let (Some(pp), Some(pb)) = (pparsed.as_ref(), bundle.prefill.as_ref()) {
-                programs.push((pb.nodes, &pp.manifest, pp.extra_results.as_slice()));
-            }
-            let base = programs.len();
-            for (i, dp) in dparsed_all.iter().enumerate() {
                 programs.push((
-                    bundle.decode[i].nodes,
-                    &dp.manifest,
-                    dp.extra_results.as_slice(),
+                    groups(pb.fp)?,
+                    pp.output_ids.iter().map(|i| *i as u64).collect(),
                 ));
             }
-            let s = SpyreSession::new_multi(&programs, weights)
+            let base = programs.len();
+            for dp in dparsed_all.iter() {
+                programs.push((
+                    groups(bundle.decode[0].fp)?,
+                    dp.output_ids.iter().map(|i| *i as u64).collect(),
+                ));
+            }
+            let refs: Vec<(
+                &[scratchy_target_spyre::bundle_code::LaunchGroup<'static>],
+                &[u64],
+            )> = programs.iter().map(|(g, o)| (*g, o.as_slice())).collect();
+            let _t_sess = std::time::Instant::now();
+            let s = SpyreSession::new_multi(&refs, weights)
                 .map_err(|e| werr(format!("build resident session: {e}")))?;
+            // The SECOND move of the checkpoint: host bytes -> resident HBM sticks.
+            tracing::debug!(
+                "[timing] SpyreSession::new_multi took {:.2}s",
+                _t_sess.elapsed().as_secs_f64()
+            );
             (s, base)
         };
         // ⭐ scratchy_target_spyre::wiring::HAT THE BAKE PLACED, per bundle — one value each, not six locals.
         //
         // These were `scalarmul_scales_v`, `prefill_uses_ones`, `prefill_ones_len`,
         // `prefill_uses_identity`, `decode_uses_identity` and `baked_lm_head_ksplit`: declared
-        // here, assigned ~350 lines below inside a `#[cfg(feature = "sendnn")]` branch, and read
+        // here, assigned ~350 lines below inside a `#[cfg(feature = "spyre-hw")]` branch, and read
         // ~600 lines below that. Each needed `#[allow(unused_mut, unused_assignments)]` to
         // compile, and that allow is what let one of them go on being derived for a bind that had
         // stopped existing. `BakeFacts::of` asks the layout once.
@@ -807,9 +753,17 @@ impl SpyreWorker {
         // problem: a value computed inside `cfg(sendnn)` and consumed outside it must be declared
         // before the branch, so its initialiser is dead in exactly the build that assigns it.
         // `None` IS read on the non-sendnn path, and what it feeds is one call away.
-        #[allow(unused_assignments)]
+        // ⛔ THE MUTABILITY IS THE CARD PATH'S, so it carries that cfg rather than an
+        // `#[allow(unused_mut)]`: only the branch below assigns these, and on the emulator the
+        // binding is a plain `None` that is read once.
+        #[cfg(feature = "spyre-hw")]
         let mut decode_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        #[cfg(not(feature = "spyre-hw"))]
+        let decode_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        #[cfg(feature = "spyre-hw")]
         let mut prefill_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
+        #[cfg(not(feature = "spyre-hw"))]
+        let prefill_facts: Option<scratchy_target_spyre::wiring::BakeFacts> = None;
         // The KV byte budget the paged pool gets sized against — the card's real capacity ×
         // `--gpu-memory-utilization` − the bundle's non-KV segments. Declared out here for the same reason
         // `scalarmul_scales_v` is: it is computed in the SuperDsc branch below (sendnn only) but has to
@@ -817,7 +771,7 @@ impl SpyreWorker {
         // ENGINE sizes the scheduler's block allocator off the SAME number the pool was cut from.
         #[allow(unused_mut, unused_assignments)]
         let mut kv_budget_bytes_v: Option<u64> = None;
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
             // graph_json means the lowering REFUSED to emit it (the split still
@@ -1948,9 +1902,9 @@ impl SpyreWorker {
         };
         // KTIR program routing (prefill=0, decode=1). sendnn routes per group inside
         // forward; keep these for the BundleMeta (decode/prefill phase index).
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         let (decode_prog_base, prefill_prog) = (1usize, Some(0usize));
-        #[cfg(not(feature = "sendnn"))]
+        #[cfg(not(feature = "spyre-hw"))]
         let prefill_prog = if pparsed.is_some() {
             Some(0usize)
         } else {
@@ -1966,8 +1920,9 @@ impl SpyreWorker {
              prog: usize,
              facts: scratchy_target_spyre::wiring::BakeFacts,
              wiring: &'static scratchy_target_spyre::wiring::Wiring| BundleMeta {
-                #[cfg(not(feature = "sendnn"))]
+                #[cfg(not(feature = "spyre-hw"))]
                 prog,
+                attn_mask_src: p.attn_mask_src,
                 capacity: p.capacity,
                 m_cap: p.m_cap,
                 embed_src: p.embed_src,
@@ -1975,9 +1930,13 @@ impl SpyreWorker {
                 sin_srcs: p.sin_srcs,
                 result_id: p.result_id,
                 layers: p.layers,
-                #[cfg(not(feature = "sendnn"))]
+                #[cfg(not(feature = "spyre-hw"))]
                 output_ids: p.output_ids,
+                #[cfg(not(feature = "spyre-hw"))]
+                scalarmul_scales: p.scalarmul_scales,
+                #[cfg(feature = "spyre-hw")]
                 facts,
+                #[cfg(feature = "spyre-hw")]
                 wiring,
             };
 
@@ -2034,13 +1993,13 @@ impl SpyreWorker {
         // `model.prefill` is nulled for Default/Paged/SuperDsc (every forward drives the decode meta). BUT
         // the batched-prefill path binds the prefill meta to the DISTINCT prefill SESSION (via
         // run_prefill_batch), where the ids DO match — so preserve it in `batched_prefill` (SuperDsc only).
-        #[cfg(feature = "sendnn")]
+        #[cfg(feature = "spyre-hw")]
         let (prefill, batched_prefill) = if matches!(session, SendnnSession::SuperDsc(_)) {
             (None, prefill)
         } else {
             (prefill, None)
         };
-        #[cfg(not(feature = "sendnn"))]
+        #[cfg(not(feature = "spyre-hw"))]
         let batched_prefill: Option<BundleMeta> = None;
 
         let caps: Vec<usize> = decode.iter().map(|b| b.capacity).collect();

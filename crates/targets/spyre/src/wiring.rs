@@ -23,18 +23,11 @@
 use crate::bundle_code as bundle;
 use scratchy_tensors::GpuTensor;
 
-/// The emitted PROGRAM's operand spelling for tensor `tid`.
-///
-/// ⛔ THIS IS A RENDERING, NOT AN IDENTITY. The identity is
-/// [`bundle::PlaceId`], and that is what the bake and the host now join on —
-/// nothing parses this string back. It survives only because a SuperDSC op
-/// references its operands by name, so the emitted program needs a spelling;
-/// [`bundle::PlaceId`]'s `Display` is where that spelling is decided, and this
-/// is the one call to it.
-#[inline]
-pub fn act_name(tid: u32) -> String {
-    bundle::PlaceId::Act(tid).to_string()
-}
+// ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
+// whole body was `bundle::PlaceId::Act(tid).to_string()`, and that module's header already claimed
+// to hold "the ONE site that spells an operand" — so this was simply left behind when `PlaceId` and
+// the `SynthRole` vocabulary went. Its 22 call sites are all in the lowering, which is now in that
+// crate too.
 
 /// The staged tensor of a linear layer, whatever its quant variant.
 ///
@@ -85,7 +78,7 @@ pub fn fp8_scale(l: &scratchy_layers::layers::Fp8AnyLinear) -> GpuTensor {
 /// ⛔ THE WORKER USED TO ASK THE ARTIFACT, ONE QUESTION AT A TIME. `load_inner` carried six
 /// mutable locals — `prefill_uses_ones`, `prefill_ones_len`, `prefill_uses_identity`,
 /// `decode_uses_identity`, `scalarmul_scales_v`, `baked_lm_head_ksplit` — each declared next to
-/// the others, assigned inside a `#[cfg(feature = "sendnn")]` branch, and read somewhere else
+/// the others, assigned inside a `#[cfg(feature = "spyre-hw")]` branch, and read somewhere else
 /// entirely. Every one of them needed `#[allow(unused_mut, unused_assignments)]` to compile,
 /// which is the shape of the problem: an `#[allow]` was load-bearing, and it is what let
 /// `baked_lm_head_ksplit` go on being derived for a bind that no longer existed.
@@ -431,6 +424,23 @@ pub struct Wiring {
     /// `1/hidden` broadcast over one stick — the mq>1 sum-based amax pre-scale. A pure function of
     /// `hidden`, formerly `vec![1.0 / h as f32; 64]` per forward.
     pub rms_invcols: &'static [f32],
+    /// EVERY compile-time scalar this program's KTIR reads, in registry order: entry `i` is bound at
+    /// `lower_subtile_tape_to_superdsc::scalarmul_scale_tid(i)` as a `[1,1]` fp16 — the model's own
+    /// multipliers and RMSNorm epsilons, exactly the set and order `subtile→superdsc` registers.
+    ///
+    /// ⛔ NOTHING IS SEEDED AND NOTHING EXTRA IS PUSHED, because the INDEX IS THE DEVICE TID. Two
+    /// algebraic identities were once seeded at the front for this construction's `linalg.*` `outs`
+    /// seeds; those are immediates now, and so are the rmsnorm epsilon and the attention multiplier
+    /// that the PROGRAM states (`f32_splat`, `self.scalar`) — the descriptor still reads the epsilon
+    /// from this registry, via a carried slot.
+    ///
+    /// ⛔ IT IS HERE BECAUSE A ScalarMul SCALE REACHES THE DEVICE AS A BOUND `[1,1]` CONST — that is
+    /// `subtile→superdsc`'s own mechanism, so those constants appear in `func.arguments` like any
+    /// other buffer and BOTH consumers must fill them: the card through [`constant_steps`], the
+    /// emulator through its own source binding. `BakeFacts` carries the same list for the card off the
+    /// `BundleLayout`; this is the copy the emulator path has, on a program it resolved by fingerprint
+    /// rather than through a layout it never asks for.
+    pub scalarmul_scales: &'static [f32],
 }
 
 /// The per-model wiring set: one [`Wiring`] per baked PROGRAM.

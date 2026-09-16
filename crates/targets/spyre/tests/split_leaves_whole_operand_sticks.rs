@@ -29,10 +29,10 @@
 //! already divide evenly. A future change that makes granite's splits depend on this is a regression
 //! this file cannot see — the fingerprint diff is the check for that.
 
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands;
 use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY};
 use scratchy_subtile::superdsc_opspec::Df;
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands;
 
 /// The split the emitter chose for one matmul, as `{axis: cores}`.
 fn splits(m: u32, n: u32, k: u32, df: Df) -> std::collections::BTreeMap<String, u32> {

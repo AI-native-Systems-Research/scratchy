@@ -30,12 +30,13 @@
 //! not co-compile the crate's feature-gated inline `cpu_golden` test modules,
 //! which do not build on a plain `cargo test` here.
 
+use ktir_superdsc::emit;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm};
 use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
 use scratchy_subtile::superdsc_opspec::{
     Allocation, DataFormat, Df, FP16_BYTES, Fp16, ItDim, MAX_CORES, MaxCores, OpFunc, Role, Scale,
     TensorArg, USABLE_LX_BYTES, WorkPlan,
 };
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 use std::collections::BTreeMap;
 
@@ -67,7 +68,25 @@ fn opfunc_names_are_dxp_recognized() {
         "sum",
         "max",
         "mean",
+        // ⛔ THESE FOUR WERE MISSING WHILE LIVE ON-CARD BODIES EMIT THEM. Added with the emitters that
+        // make them de-facto card-proven: `realdiv` (attention's softmax finalize), `abs`, `maximum` and
+        // `minimum` (the fp8 activation-quantize chain's amax/clamp, plus attention's running max). They
+        // ride in every baked bundle that runs today, so their absence here was a hole in the guard, not
+        // a statement that they are unrecognized.
+        "realdiv",
+        "abs",
+        "maximum",
+        "minimum",
     ];
+    // ⚠️ THIS LIST IS HAND-PICKED, WHICH IS WHY THE FOUR ABOVE COULD GO MISSING. `OpFunc` has 27
+    // variants; this loop names 21. A new variant is NOT an E0004 here, so it joins the emitter
+    // unguarded — exactly how `realdiv`/`abs`/`maximum`/`minimum` did. Making it exhaustive is the real
+    // fix and is deliberately NOT done here: the six left out (`Transpose`, `Restickify`, `Identity`,
+    // `Qfp8ch`, `Dl16ToFp32`, `Fp32ToDl16`) would each need their dxp name confirmed against
+    // `dscdefn.cpp opFuncsToString`, and asserting a name I have not verified would make this guard lie.
+    // Two of the six now have vendor-fixture evidence and are the cheapest to close:
+    // `interslicetranspose_fp16` appears in `ddc/ddl_templates/test/sdsc_interslicetranspose.json`, and
+    // `identity` in `dxp/test/test_gather_1core/sdsc_1.json`.
     for f in [
         OpFunc::Matmul,
         OpFunc::BatchMatmul,
@@ -86,6 +105,10 @@ fn opfunc_names_are_dxp_recognized() {
         OpFunc::Sum,
         OpFunc::Max,
         OpFunc::Mean,
+        OpFunc::RealDiv,
+        OpFunc::Abs,
+        OpFunc::Maximum,
+        OpFunc::Minimum,
     ] {
         assert!(
             RECOGNIZED.contains(&f.name()),
@@ -159,8 +182,8 @@ fn reduce_and_multiop_invariants() {
         "mean",
         64,
         576,
-        &superdsc::rb("r_x", 64, 576),
-        &superdsc::rb("r_acc", 64, 1),
+        &emit::rb("r_x", 64, 576),
+        &emit::rb("r_acc", 64, 1),
         None,
     );
     let j: serde_json::Value =
@@ -221,7 +244,7 @@ fn reduce_and_multiop_invariants() {
 //    `n·2` bytes. Pins that the offset reaches the emitted startAddr.
 #[test]
 fn slice_operand_offsets_startaddr() {
-    let e = superdsc::assemble_slice_add_gate("slice_g", 64, 64, "sx", "so");
+    let e = emit::assemble_slice_add_gate("slice_g", 64, 64, "sx", "so");
     let j: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&e.op).unwrap()).unwrap();
     let nodes = &j["dscs_"][0]["slice_g"]["scheduleTree_"];
@@ -249,7 +272,7 @@ fn slice_operand_offsets_startaddr() {
 // (3) an unsplit (reduction-resident) operand shares one address across cores.
 
 /// Parse the per-core startAddr map of allocate node `ldsidx` of op `op_name`.
-fn per_core_addrs(emitted: &superdsc::EmittedOp, op_name: &str, ldsidx: u32) -> Vec<u64> {
+fn per_core_addrs(emitted: &emit::EmittedOp, op_name: &str, ldsidx: u32) -> Vec<u64> {
     let j: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&emitted.op).unwrap()).unwrap();
     let nodes = j["dscs_"][0][op_name]["scheduleTree_"]
@@ -285,9 +308,9 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
         384,
         64,
         16,
-        &superdsc::rb("a", 384, 64),
+        &emit::rb("a", 384, 64),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "w"),
-        &superdsc::rb("o", 384, 384),
+        &emit::rb("o", 384, 384),
         None,
     );
     assert_eq!(e.time, 1, "bmm fits LX in one trip");
@@ -348,26 +371,43 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
 #[test]
 fn tiled_matmul_trips_do_not_alias_and_advance() {
     // 64×16384×2048 batch1 → time>1 (proven tiled in tiled_bundle_mlir test).
-    let e = superdsc::assemble_matmul(
-        "matmul_o7",
-        64,
-        16384,
-        2048,
-        1,
-        &superdsc::rb("a", 64, 2048),
-        &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
-        &superdsc::rb("o", 64, 16384),
-        None,
-    );
+    //
+    // ⛔ THROUGH THE REAL CHAIN, BECAUSE A HAND-BUILT DESCRIPTOR IS NO LONGER A BUNDLE. This used to
+    // call `assemble_matmul` and hand the descriptor straight to `emit_bundle`; after the
+    // `SubtileIR → KTIR → SuperDSC` split a bundle is built from PROGRAMS (`ktir_groups` on
+    // `-Fspyre-emu`, `ktir_groups_via_superdsc` on `-Fspyre-hw`), and an op carrying a descriptor and
+    // no program is refused by both — deliberately, since the only path to SuperDSC is through a KTIR
+    // program. So the fixture is the SubtileIR node the descriptor came from, and the two halves are
+    // read where each now exists: `time`/trips off the LOWERED descriptor, the bundle off the
+    // PROGRAMS. Nothing about the assertions changes.
+    //
+    // `rows_are_requests` is TRUE for exactly the reason this test exists: 64 rows that are 64
+    // separate requests may NOT fold to the last row (every row's logits are sampled), so the
+    // vocab-wide tail time-tiles at m=64 — which is addressable only because these trips advance
+    // instead of aliasing.
+    let ir = single_matmul_ir(64, 16384, 2048);
+    let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
+    let (programs, layout) =
+        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
+            .expect("KTIR for a 64x16384x2048 matmul");
+    let (dscs, _) =
+        superdsc::lower_graph_to_superdsc(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
+            .expect("SuperDSC for a 64x16384x2048 matmul");
+    let [e] = &dscs[..] else {
+        panic!(
+            "one matmul node lowers to one descriptor, got {:?}",
+            dscs.iter().map(|o| &o.op_name).collect::<Vec<_>>()
+        )
+    };
     assert!(e.time > 1);
     // Concrete trips: every OUTPUT per-core address is UNIQUE across all trips
     // (#50 — real per-core bases + per-trip stride mean trips never alias).
-    let trips = superdsc::concrete_trips(&e);
+    let trips = superdsc::concrete_trips(e);
     let mut out_addrs: Vec<u64> = Vec::new();
     for trip in &trips {
         let j: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(trip).unwrap()).unwrap();
-        for node in j["dscs_"][0]["matmul_o7"]["scheduleTree_"]
+        for node in j["dscs_"][0][&e.op_name]["scheduleTree_"]
             .as_array()
             .unwrap()
         {
@@ -399,15 +439,51 @@ fn tiled_matmul_trips_do_not_alias_and_advance() {
     // SAFETY: single-threaded test; set the multi-op (stitch) opt-in only.
     unsafe { std::env::set_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP", "1") };
     let r = superdsc::emit_bundle(
-        std::slice::from_ref(&e),
-        None,
+        &programs,
+        Some(&layout),
         superdsc::FoldGrouping::Split,
+        // A single tiled matmul: no attention node, so nothing for the four attention facts
+        // to describe.
+        None,
     );
     unsafe { std::env::remove_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP") };
     assert!(
         r.is_ok(),
         "tiled bundle no longer refused for tiling (GUARD #14 lifted by #50): {r:?}"
     );
+}
+
+/// `hidden[m, k] @ W[k, n] -> out[m, n]` as a one-node [`SubtileIR`] — the graph the tiled-matmul
+/// descriptors under test are lowered from. t0 = activation source, t1 = weight source, t2 = result.
+fn single_matmul_ir(m: u32, n: u32, k: u32) -> scratchy_subtile::subtile_ir::SubtileIR {
+    use scratchy_subtile::subtile_ir::{
+        SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
+    };
+    let tensors = vec![
+        TensorShape { rows: m, cols: k },
+        TensorShape { rows: k, cols: n },
+        TensorShape { rows: m, cols: n },
+    ];
+    let whole = |t: usize, ts: &[TensorShape]| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: ts[t].whole(),
+    };
+    let node = SubtileNode {
+        id: SubtileId::from_index(0),
+        op: SubOp::MatmulTile {
+            weight: scratchy_subtile::lower::GemmWeight::Dense,
+        },
+        inputs: vec![whole(0, &tensors), whole(1, &tensors)],
+        output: whole(2, &tensors),
+    };
+    SubtileIR {
+        tensors,
+        num_sources: 2,
+        nodes: vec![node],
+        result: TensorId::from_index(2),
+        // Hand-authored fixture: there is no source op list to be the provenance of.
+        op_output: Vec::new(),
+    }
 }
 
 /// Build a validated matmul WorkPlan with an explicit split (mb×out).
@@ -535,9 +611,9 @@ fn tiled_bundle_mlir_is_concrete_unroll() {
         16384,
         2048,
         1,
-        &superdsc::rb("a", 64, 2048),
+        &emit::rb("a", 64, 2048),
         &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
-        &superdsc::rb("o", 64, 16384),
+        &emit::rb("o", 64, 16384),
         None,
     );
     let n = emitted.time;
@@ -591,9 +667,9 @@ fn time1_bundle_mlir_is_byte_identical_to_flat() {
         384,
         64,
         16,
-        &superdsc::rb("act", 384, 64),
+        &emit::rb("act", 384, 64),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "wt"),
-        &superdsc::rb("out", 384, 384),
+        &emit::rb("out", 384, 384),
         None,
     );
     assert_eq!(emitted.time, 1, "bmm must NOT time-tile");
@@ -623,9 +699,9 @@ fn dump_gate_bundles() {
         64,
         64,
         1,
-        &superdsc::rb("g1_a", 64, 64),
+        &emit::rb("g1_a", 64, 64),
         &Stk::<KernelTag>::kernel(64_usize, 64_usize, "g1_w"),
-        &superdsc::rb("g1_o", 64, 64),
+        &emit::rb("g1_o", 64, 64),
         None,
     );
     assert_eq!(fit.time, 1, "64^3 must fit LX in one trip");
@@ -658,9 +734,9 @@ fn dump_gate_bundles() {
                 n,
                 k,
                 b,
-                &superdsc::rb("gb_a", m, k),
+                &emit::rb("gb_a", m, k),
                 &Stk::<KernelTag>::kernel(k as usize, n as usize, "gb_w"),
-                &superdsc::rb("gb_o", m, n),
+                &emit::rb("gb_o", m, n),
                 None,
             );
             assert!(ov.time > 1, "{label} must time-tile");
@@ -678,7 +754,7 @@ fn dump_gate_bundles() {
     // (C) BROADCAST gate: multiply(x[m,cols], v[m,1 broadcast-over-cols]) — the
     //     RmsNorm/RoPE/Attn prerequisite. v's `out`=RedStick → alpha_=0 stick fold
     //     (broadcast read). Tests whether dxp accepts a broadcast operand.
-    let bc = superdsc::assemble_broadcast_mul_gate(
+    let bc = emit::assemble_broadcast_mul_gate(
         "bcast_mul",
         scratchy_subtile::sdsc_abstract::RowCount::of_token_rows(64),
         scratchy_subtile::sdsc_abstract::BlockCols::of_feature_cols(256),
@@ -706,7 +782,7 @@ fn dump_gate_bundles() {
     eprintln!("→ BAKING rmsnorm gate: {} ops", rms.len());
     superdsc::write_dxp_input(&root.join("rmsnorm"), &rms, superdsc::FoldGrouping::Split).unwrap();
     // (E) SLICE gate: add(x[:,0:64], x[:,64:128]) — the RoPE slice-operand probe.
-    let sl = superdsc::assemble_slice_add_gate("slice_add", 64, 64, "sl_x", "sl_o");
+    let sl = emit::assemble_slice_add_gate("slice_add", 64, 64, "sl_x", "sl_o");
     eprintln!("→ BAKING slice-add gate: time={}", sl.time);
     superdsc::write_dxp_input(&root.join("slice"), &[sl], superdsc::FoldGrouping::Split).unwrap();
     eprintln!("wrote fit64, ov_tiled, bcast, rmsnorm, slice");

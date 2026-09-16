@@ -15,15 +15,15 @@
 //! must never be handed the corrected order. Only the card can accept the mq>1 emit; these pins keep
 //! the proven emit out of its blast radius.
 
+use ktir_superdsc::emit;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
+    SharedKernelBmmForm, assemble_attn, assemble_matmul_off,
+};
 use scratchy_subtile::addr::DevOff;
 use scratchy_subtile::sdsc_abstract::{
     BlockCols, KernelTag, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement, PaddedMq,
     PerRequestRows, QueryRowCount, RowBlockedTag, RungWidth, SlotWindow, StickLayout, Stk,
 };
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::{
-    SharedKernelBmmForm, assemble_attn, assemble_matmul_off,
-};
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 
 const HD: u32 = 64; // the g-form exists only where a head is one stick
 const GQA: u32 = 4;
@@ -38,7 +38,7 @@ fn ker(n: &str, rows: u32, cols: u32) -> Stk<KernelTag> {
 }
 
 /// The operand's `layoutDimOrder_` — the field that IS the stride assignment.
-fn layout_dim_order(e: &superdsc::EmittedOp, op_name: &str, arg: usize) -> Vec<String> {
+fn layout_dim_order(e: &emit::EmittedOp, op_name: &str, arg: usize) -> Vec<String> {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0][op_name]["scheduleTree_"][arg]["layoutDimOrder_"]
         .as_array()
@@ -50,7 +50,7 @@ fn layout_dim_order(e: &superdsc::EmittedOp, op_name: &str, arg: usize) -> Vec<S
 
 /// The operand's `maxDimSizes_`: `[-1; rank]` = "reconstruct the stick-blocked walk", pinned
 /// extents = "walk row-major over exactly these extents, in `layoutDimOrder_` order".
-fn max_dim_sizes(e: &superdsc::EmittedOp, op_name: &str, arg: usize) -> Vec<i64> {
+fn max_dim_sizes(e: &emit::EmittedOp, op_name: &str, arg: usize) -> Vec<i64> {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0][op_name]["scheduleTree_"][arg]["maxDimSizes_"]
         .as_array()
@@ -64,7 +64,7 @@ fn max_dim_sizes(e: &superdsc::EmittedOp, op_name: &str, arg: usize) -> Vec<i64>
 /// never an assumed enumeration order, which once transposed the grid and cancelled the swapped
 /// strides into "correct" numbers.
 fn per_core_by_slice(
-    e: &superdsc::EmittedOp,
+    e: &emit::EmittedOp,
     op_name: &str,
     arg: usize,
 ) -> std::collections::BTreeMap<(u32, u32), i64> {
@@ -104,7 +104,7 @@ fn per_core_by_slice(
 
 /// The g-form score op exactly as `assemble_attn_block` emits it for one kv-head group, with the
 /// form the given row kind + count thread through the emitter's boundary.
-fn score_op(mq: u32, rows_are_requests: bool) -> superdsc::EmittedOp {
+fn score_op(mq: u32, rows_are_requests: bool) -> emit::EmittedOp {
     let mut s = 0i64;
     assemble_matmul_off(
         "sc_pin",

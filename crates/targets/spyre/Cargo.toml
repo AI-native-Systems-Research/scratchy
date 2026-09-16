@@ -6,30 +6,36 @@ license.workspace = true
 description = "IBM Spyre (KTIR) backend for scratchy: host allocator + KTIR target. No GPU toolchain."
 
 [features]
-# Links the `ktir_emulator` crate for actually executing a bundle (the `runner`
-# module). OFF by default so emit-only / weight-loading builds — and the
-# `#[forward]` macro's compile, which only needs the f32 `eval_dag` reference —
-# never depend on ktir-emulator (a separately-developed sibling repo).
-runner = ["dep:ktir-emulator"]
-# `--target sendnn`: link the IBM Spyre sendnn runtime (build.rs cc-compiles
-# `csrc/sdsc_shim.cpp` + links libsendnn_*/flex) so `sdsc_runner` compiles a
-# sengraph in-process and runs it on the AIU via `GraphLoader::Predict`. No GPU
-# toolchain; the SDK is only present/linked on a Spyre host. Pulls in
-# `scratchy-subtile` because the session setters take its `sdsc_abstract` law
-# types (mask stride / fold pages / mask blocks / int stride) rather than u64s.
-# Also owns the `flex-rs` dependency (the SuperDSC on-silicon path — `sendnn` is
-# synonymous with `superdsc` today): flex-rs's build.rs cc-compiles its senlib
-# shim, which only exists on a Spyre host, so flex-rs must NOT be pulled into a
-# cuda/metal/emit-only build. `fxa_rust_abi`, the only module that touches
-# flex-rs, is gated on this same feature.
-sendnn = ["dep:flex-rs"]
+# THE CARD: link the IBM Spyre runtime so a bundle runs on the AIU. No GPU toolchain; the SDK is
+# only present/linked on a Spyre host. Pulls in `scratchy-subtile` because the session setters take
+# its `sdsc_abstract` law types (mask stride / fold pages / mask blocks / int stride) rather than
+# u64s, and owns the `flex-rs` dependency — flex-rs's build.rs cc-compiles its senlib shim, which
+# only exists on a Spyre host, so flex-rs must NOT be pulled into a cuda/metal/emit-only build.
+# `fxa_rust_abi`, the only module that touches flex-rs, is gated on this same feature.
+#
+# THE FEATURE TIERS. Cargo features are ADDITIVE, so a device is chosen by naming it, never by
+# turning something off. One hidden tier carries the shared facts; the two a user names are SIBLINGS.
+#
+#   spyre        — hidden. Everything target-neutral: the IR types, the lowering, the bundle.
+#   spyre-hw     — a card, ANY revision. This is what every `cfg` in the tree gates the SDK on.
+#                  There is exactly one revision today (`flex-rs/cxx-shim` ships `senlib/1p0` and
+#                  nothing else) and it does NOT get a feature of its own: a per-revision name
+#                  (`spyre-sen1p0`) gated no `cfg` anywhere, so it bought nothing and cost a forked
+#                  card tier in four manifests. A second revision lands as one more user-facing
+#                  feature ON TOP of this one, and still changes no `cfg`.
+#   spyre-emu    — the emulator. NOT "spyre without hardware": its own device, its own memory, its
+#                  own f16 encoding, its own launch. Neither sibling implies the other, and neither
+#                  is a fallback for the other.
+spyre = []
+spyre-hw = ["spyre", "dep:flex-rs"]
+spyre-emu = ["spyre", "dep:ktir-emulator"]
 
 [dependencies]
 # ⭐ THE BAKED BUNDLE ITSELF — re-exported from this crate's root as `bundle_code`, which is the path
 # the `#[forward]` macro's `inventory::submit!` tokens name. UNCONDITIONAL and feature-free on
-# purpose: those tokens land in the arch crate under `spyre`/`superdsc`, which do NOT turn on this
-# crate's `sendnn`, so a gate here would make them fail to resolve in a build that has the target but
-# not the runtime.
+# purpose: those tokens land in the arch crate under `spyre`, which does NOT turn on this crate's
+# `spyre-hw`, so a gate here would make them fail to resolve in a build that has the target but not
+# the card runtime.
 scratchy-spyre-bundle = { path = "bundle" }
 scratchy-tensors = { path = "../../tensors" }
 # `kill(-pid, SIGKILL)` on a `dxp_standalone` process group — see `superdsc_bake`'s worker pool.
@@ -43,24 +49,33 @@ scratchy-quantizations = { path = "../../models/quantization" }
 half = { workspace = true }
 # Native Rust port of flex. In-tree crate; the ONLY fxa_* implementation
 # (see fxa_rust_abi.rs) — pure Rust so it compiles on any host regardless
-# of `sendnn`; its own cxx-shim only compiles/links when built on a real
+# of `spyre-hw`; its own cxx-shim only compiles/links when built on a real
 # Spyre host (gated by FLEX_RS_BUILD_CXX_SHIM, not a Cargo feature).
 flex-rs = { path = "flex-rs", optional = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# The KTIR emulator (RFC 0682) — Spyre's hardware-free execution path, only
-# pulled when `runner` is enabled. (Repo is still named `ktir-cpu`; the crate it
-# publishes was renamed `ktir-cpu` -> `ktir-emulator`.)
-ktir-emulator = { git = "https://github.com/starpit/ktir-cpu", branch = "rust", optional = true, features = ["metal"] }
+# The KTIR emulator (RFC 0682) — Spyre's hardware-free execution path, only pulled by `spyre-emu`.
+# (Repo is still named `ktir-cpu`; the crate it publishes was renamed `ktir-cpu` -> `ktir-emulator`.)
+# VENDORED IN-TREE, not fetched: the lowering constructs ktir-core's `Operation`/`IRFunction` and
+# `#[forward]` bakes them as const data, so the IR types must be a path dependency. `ktir-core` is
+# dependency-free and unconditional; the emulator is a DEVICE, and only its own build links it.
+ktir-core = { path = "ktir/ktir-core" }
+# ⭐⭐⭐ THE KTIR->SUPERDSC LOWERING, AS A SCRATCHY-FREE LEAF. The destination of the extraction: a
+# crate a third-party KTIR producer (IBM, `triton-spyre`) can consume without pulling scratchy in.
+# This edge is the dependency inversion arriving early -- the moment any moved module is named by a
+# path OTHER than a `scratchy-subtile` re-export, this crate must name it directly. Feature-free and
+# unconditional, like `ktir-core`: the lowering is not a device.
+ktir-superdsc = { path = "ktir/ktir-superdsc" }
+ktir-emulator = { path = "ktir/ktir-emulator", optional = true, features = ["metal"] }
 # The sdsc session laws (`sdsc_abstract`): `PrefixMaskShape` / `FoldPages` /
-# `MaskBlocks` / `FoldRowRegime` — the only mints for the values the sendnn
-# session setters accept. Optional: only the `sendnn` run path binds a session.
-scratchy-subtile = { path = "../../compiler/subtile", features = ["superdsc"] }
+# `MaskBlocks` / `FoldRowRegime` — the only mints for the values the card's
+# session setters accept. Optional: only the `spyre-hw` run path binds a session.
+scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
 
-# Compiles the `-Fsendnn` C++ launcher shim (csrc/sdsc_shim.cpp). Unconditional
-# build-dep (tiny); build.rs only invokes it under the `sendnn` feature.
+# Compiles the card's C++ launcher shim (csrc/sdsc_shim.cpp). Unconditional
+# build-dep (tiny); build.rs only invokes it under the `spyre-hw` feature.
 [build-dependencies]
 cc = "1"
 
@@ -68,7 +83,7 @@ cc = "1"
 # intermediate rep strides) through the same `sdsc_abstract` laws production
 # uses, so a fixture cannot encode a relationship production can't.
 [dev-dependencies]
-scratchy-subtile = { path = "../../compiler/subtile", features = ["superdsc"] }
+scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
 
 # The proof harnesses in this crate compile only under the model checker, so `cfg(kani)` is a real name a
 # normal build never defines. DECLARED rather than silenced: an undeclared cfg is how ~100 commits of "the

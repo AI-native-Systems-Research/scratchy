@@ -14,7 +14,7 @@
 //! `SenlibQueueCapacity`) and a real `FlexAllocator` whose CB address
 //! resolution goes through `FlexAllocatorAddressResolver` — the piece that
 //! previously had no construction call site anywhere in scratchy.
-#![cfg(feature = "sendnn")]
+#![cfg(feature = "spyre-hw")]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
