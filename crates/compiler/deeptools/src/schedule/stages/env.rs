@@ -979,6 +979,13 @@ impl TemporalLoopDistribution for CoordSeam {
         )
     }
 
+    /// ⛔ PAIRED WITH [`TemporalLoopDistribution::distribute`] AND NOT SEPARATELY ANSWERABLE:
+    /// `loopParamsAfterDistribution` is that call's OUT-PARAMETER, and [`Self::LoopParams`] is `()`
+    /// because nothing fills it here. ⛔ [`None`] WOULD BE A FALSE ANSWER, not a refusal — the
+    /// reference's distribution states an entry for EVERY loop it was handed
+    /// (`L3DlOpsScheduler.cpp:7484`, `:7691`), so *"no such loop"* is a sentence about the
+    /// distribution that this seam has not run, and its callers would build a coordinate with a fold
+    /// silently missing.
     fn distributed(
         &self,
         _loop_params: &Self::LoopParams,
@@ -987,7 +994,8 @@ impl TemporalLoopDistribution for CoordSeam {
     ) -> Option<DistributedLoop> {
         todo!(
             "TemporalLoopDistribution::distributed: wants \
-             loopParamsAfterDistribution.at(loopNode).at(dim)"
+             loopParamsAfterDistribution.at(loopNode).at(dim), which \
+             dsc2::distributeElemArrToTemporalLoops (dsc/dsc2.cpp:5934) is what fills"
         )
     }
 }
