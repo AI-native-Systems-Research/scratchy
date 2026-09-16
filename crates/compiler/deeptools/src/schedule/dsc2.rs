@@ -1666,7 +1666,18 @@ impl LayoutDims {
         Self { first, rest }
     }
 
-    /// The outermost dim — `getLayoutDims(...).at(0)`, total because the order is NON-EMPTY.
+    /// THE INNERMOST DIM — `getLayoutDims(...).at(0)`, total because the order is NON-EMPTY.
+    ///
+    /// ⛔ INDEX 0 IS THE INNERMOST, NOT THE OUTERMOST. `getNonBroadcastLdsDims` walks
+    /// `getLayoutDims(ldsIdx)` FORWARD (`dsc/dsc2.cpp:4044`) and both callers of that walk call it
+    /// "from the innermost to outer dimensions in `layoutDimOrder_`"
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5038-5039`; `ddc/ddcv1.cpp:1937-1938` says the same
+    /// over `allocNode->layoutDimOrder_` directly), and the `DataOpDsc` twin field spells it out —
+    /// `// idx 0 means innermost` (`dsc/dataOpDsc.h:347`). `primaryDsInfo_`'s order shares the
+    /// direction, being copied onto the node UNREVERSED
+    /// (`dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1234`), so this holds for both of the lists
+    /// [`Self::index_of`]'s banner keeps apart. Agrees with [`Self::iter`] and with
+    /// [`AllocLayout::innermost_dim`].
     #[must_use]
     pub const fn first(&self) -> PrimaryDim {
         self.first

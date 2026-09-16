@@ -1130,6 +1130,15 @@ impl Symbolic {
     /// `pruneMaxSymbolicVolumes(refDstg)` UNFUSED — THIS stage's OWN limits re-keyed onto the dims it
     /// still calls symbolic, which is what `ddc/ddcv1.cpp:1424`, `:1425` and `dsc/dsc2.cpp:3719` ask
     /// for; adopting `reference`'s map there DISCARDS the stage's own limits for the core's.
+    ///
+    /// ⛔ AND IT IS THE IDENTITY UNDER [`Symbolic`]'S OWN INVARIANT. `needPruning` is
+    /// `any_of(symDims, !symbolicDimInfo_.count(dim))` (`dsc/dims.cpp:732-734`), [`Symbolic::new`]
+    /// DROPS exactly those keys, and no mutator here can re-create one — so at the one production
+    /// caller (`stages/ddc_sites.rs:663`) every entry short-circuits and the map comes back unchanged.
+    /// The reference reaches the pre-prune state through `makeDimNotSymbolic`, which erases from
+    /// `symbolicDimInfo_` and leaves `maxSymbolicVolume_` alone (`dsc/dims.cpp:781-787`); ours STOPS
+    /// there instead. The walk does real work only through [`Self::prune_volumes_from`] and entry
+    /// 015's direct [`StatedVolumes::pruned_against`] (`l3/capacity.rs:425`).
     pub fn prune_volumes(&mut self, reference: &Symbolic) {
         let stated = StatedVolumes::new(std::mem::take(&mut self.volumes));
         let pruned = stated.pruned_against(self, reference);
@@ -1533,10 +1542,17 @@ impl FilledDims {
 
     /// Replaces: e002_primaryDimToValHandler_st
     ///
-    /// THE ADDRESSABLE SLOT OF ONE PRIMARY DIM — `double&` for the field naming `d`, which every
-    /// caller assigns through (`ddc/ddc_transformation_util.cpp:1270`). Adding an extent cannot empty
-    /// the map, so [`FilledDims`]' non-emptiness survives it; the READ half is [`StageDims::extent`],
-    /// whose [`None`] is the `-1` an unwritten field carries.
+    /// THE ADDRESSABLE SLOT OF ONE PRIMARY DIM — `double&` for the field naming `d`. Adding an extent
+    /// cannot empty the map, so [`FilledDims`]' non-emptiness survives it; the READ half is
+    /// [`StageDims::extent`], whose [`None`] is the `-1` an unwritten field carries.
+    ///
+    /// ⛔ A BARE SETTER IS FAITHFUL ONLY BECAUSE THIS CLOSURE'S ONLY CALLER ASSIGNS. Entry 015's four
+    /// calls are plain assignments (`dsc/dsc2.cpp:3661-3662`, `:3685-3688`), as is
+    /// `ddc/ddc_transformation_util.cpp:1270`. REPO-WIDE THE `double&` IS ALSO READ AND
+    /// READ-MODIFY-WRITTEN: `dsDim *= numCoreletsPerCore` (`ddc/ddcv1.cpp:1141`), `std::ceil(dsDim …)`
+    /// (`:956`), `if (wDim < 0)` (`:1182`), `int origValue = dsDim` then `dsDim == origValue` (`:1187`,
+    /// `:1195`), and it is handed to `setValueInDs` as an out-parameter (`:1176`). A caller from
+    /// outside this closure needs [`StageDims::extent`] alongside it, not a second setter.
     ///
     /// ⭐ TOTAL: its 12 arms are exactly the 12 `PrimaryDimTypes` (`dsc/dims.h:34-47`), spelled without
     /// `PrimaryDimTypesCount`, so `DT_ERROR("Invalid PrimaryDim")` is unspellable.
@@ -2496,6 +2512,12 @@ impl LayoutDims {
     /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:69-70`, and the same check again at `:4272`).
     /// ⛔ SO THE `1` IS NOT THIS FUNCTION'S ANSWER AND IT IS NOT UNIFORM: a port of a SUBSCRIPTING
     /// site must NOT default an absent dim to `1`.
+    ///
+    /// ⛔ AND A THIRD CLASS, NEITHER GUARDED NOR THROWING: at `ddc/ddcv1.cpp:1588-1591` the answer is
+    /// an ARITHMETIC OFFSET, `sizeIdx += tensorSizes.size()`, into `unitTimeTransferChunkSize_` and
+    /// not a subscript of `scale_` at all — a `-1` there silently becomes `tensorSizes.size() - 1`, a
+    /// valid index onto the wrong dim. A port of THAT site must treat [`None`] as neither a `1` nor a
+    /// stop, but as its own case.
     #[must_use]
     pub fn index_of(&self, dim: PrimaryDim) -> Option<LayoutPos> {
         self.iter().position(|named| named == dim).map(LayoutPos)
@@ -2859,6 +2881,37 @@ mod tests_e008 {
         assert_eq!(
             *fused.volumes(),
             BTreeMap::from([(BTreeSet::from([B, C]), VolumeLimit(512))])
+        );
+    }
+
+    /// e008 — ⛔ THE UNFUSED WALK IS THE IDENTITY FOR EVERY [`Symbolic`] THAT EXISTS, so
+    /// `stages/ddc_sites.rs:663` prunes nothing. `needPruning` (`dsc/dims.cpp:732-734`) needs a key
+    /// naming a dim `info` does NOT; [`Symbolic::new`] drops exactly those, and `add_dim` only ever
+    /// WIDENS `info`. The reference arms the walk through `makeDimNotSymbolic`, which erases from
+    /// `symbolicDimInfo_` and leaves `maxSymbolicVolume_` alone (`dsc/dims.cpp:781-787`) — a state
+    /// this type has no method to reach.
+    #[test]
+    fn the_unfused_prune_has_no_reachable_input_it_reduces() {
+        // (1) the constructor refuses to hold the very limit the walk exists to re-key.
+        let dropped = Symbolic::new(
+            BTreeMap::from([(B, info(64, 16))]),
+            BTreeMap::from([(BTreeSet::from([A, B]), VolumeLimit(2048))]),
+        );
+        assert!(dropped.volumes().is_empty());
+
+        // (2) the one mutator WIDENS `info`, so a surviving key stays fully named and the walk
+        // `ddc/ddcv1.cpp:1424` asks for hands back the map it was given.
+        let mut stage = Symbolic::new(
+            BTreeMap::from([(B, info(64, 16)), (C, info(64, 16))]),
+            BTreeMap::from([(BTreeSet::from([B, C]), VolumeLimit(256))]),
+        );
+        stage.add_dim(A, info(64, 4));
+        let before = stage.volumes().clone();
+        stage.prune_volumes(&core());
+        assert_eq!(*stage.volumes(), before);
+        assert_eq!(
+            before,
+            BTreeMap::from([(BTreeSet::from([B, C]), VolumeLimit(256))])
         );
     }
 }
