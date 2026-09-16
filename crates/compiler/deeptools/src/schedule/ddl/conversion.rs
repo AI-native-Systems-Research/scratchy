@@ -2870,7 +2870,44 @@ fn set_data_loc_and_info<S: DdlSite + ?Sized>(
                             else {
                                 return None;
                             };
-                            let alloc = *state.lds_memory.get(&(lds, storage))?;
+                            // ⭐⭐⭐ THE PRE-FILLED ALLOCATION IS THE TREE'S, NOT THIS CONVERSION'S.
+                            // `ddl_conversion.cpp:917-925` reads
+                            // `dsc.labeledDs_.at(lds).memOrg_[storage].allocateNode_` and its miss is
+                            // *"Missing pre-filled allocation in schedule tree for this
+                            // tensor-memory combination"* — **in schedule tree**, which is the whole
+                            // point of a `ddl.get_external_data_transfer_allocation`: the node was
+                            // minted by the L3 scheduler, not here.
+                            //
+                            // ⛔⛔ THIS READ `state.lds_memory`, WHICH ONLY EVER HOLDS WHAT *THIS*
+                            // WALK MINTED (`process_allocation`, `op_opaque`). On the real
+                            // `rmsq_o728` fixture that map is EMPTY at this statement, so the very
+                            // first `ddl.data_transfer` of `broadcast_ops.ddl`'s dataflow refused and
+                            // the whole expansion stopped one node in. [`AllocationSite`] is the
+                            // reference's own read — `Dsc2Ddl::lds_allocation` is literally
+                            // `labeledDs_.at(lds).memOrg_.at(unit).allocateNode_` off the live tree —
+                            // and asking it takes the fixture from 24 nodes to 30, minting
+                            // `transfer_lds1_src:lxlu_dst:sfp`, `transfer_lds0_src:lxlu_dst:sfp`,
+                            // `compute_sfp_fma16` and three `loop_ds2_ds3_out_mb_y` by name.
+                            //
+                            // ⚠️ AND THE [`AllocId`] IT ANSWERS IS THE **TREE'S**, not
+                            // [`DdlConversion::mint_alloc`]'s: `state.add_alloc_user` below and every
+                            // later `state.allocations` lookup of the id this arm files in
+                            // `interface.alloc_storage` therefore MISS. Measured on `rmsq_o728`: the
+                            // tree answers `AllocId(4)`/`AllocId(5)` while this walk's own counter is
+                            // at 0, no `ddl.force_innermost_dimensions` or `ddl.implicit_sync` in any
+                            // of the 32 vendored templates names an external allocation (they all
+                            // name a `ddl.allocate`), and the memo above fires once, for a
+                            // `ddl.allocate`. So nothing reads it wrongly TODAY — but the two id
+                            // spaces are not disjoint by construction, which is the `AllocArena`
+                            // defect [`DdlConversion::allocations`] names.
+                            let alloc = site.lds_allocation(lds, storage)?;
+                            // ⛔ DROPPED, MEASURED: `myAllocNode->addAllocUser(userNode)` (`:926`)
+                            // lands on the PRE-FILLED node, which lives in the tree — so this call
+                            // writes nothing. `g0/debug/sdsc_0/sdsc.json` shows what is owed:
+                            // `allocate_lds0_lx`'s `allocUsers_` there is
+                            // `{transfer_lds0_src:hbm_dst:lx, transfer_lds0_src:lxlu_dst:sfp}` and
+                            // ours will hold only the first. Closing it needs a `ScheduleWrites` hook
+                            // onto an ALLOCATE, which this seam does not have.
                             state.add_alloc_user(alloc, user);
                             // ⭐ WRITING THROUGH THE SLOT IS THE REFERENCE'S `*prefilledIt->second =
                             // getDataConnect()`: the locator names the transfer end that was left
@@ -6244,12 +6281,13 @@ mod unit_tests {
         EmittedAllocate, EmittedDdl, EmittedOp, EmittedStage, EmittedTensor, ExprValue,
         GlobalLayoutRefs, InternalTensor, InternalTensorSite, LabeledDsTail, LdsSlot, LoopCount,
         MatchSite, OpContext, OpOutcome, OperationBind, OperationProp, PaddedDimension, RegionId,
-        RegionOp, RegionTree, ScheduleReads, ScheduleWrites, StyledDims, SyncLabel,
+        RegionOp, RegionTree, ResolvedEnd, ScheduleReads, ScheduleWrites, StyledDims, SyncLabel,
         TensorAndAllocation, TensorProp, TypeDefinition, add_internal_tensor, allocation_pad_type,
         check_meta_dimensions, convert_dsc2_ddl, corelet, export_to_ddl, match_ddl2_dsc,
         op_core_to_core, pad_type_spelling, process_access_patterns, process_condition,
         process_dimension_op, process_expression, process_op, process_region, process_types,
-        tensor, tensor_and_allocation, tensor_prop, transfer_access_pattern, verify_ddl_constraint,
+        set_data_loc_and_info, tensor, tensor_and_allocation, tensor_prop, transfer_access_pattern,
+        verify_ddl_constraint,
     };
     use crate::arch::{Dd2, Elements, IsaGen};
     use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
@@ -6258,8 +6296,8 @@ mod unit_tests {
     };
     use crate::formats::{Bits, DataFormat};
     use crate::generated::{
-        AccessPattern, Attrs, DataType, DimProperty, LoopLabel, NameId, Operand, PROGRAMS, Program,
-        Stmt, StmtKind, Strategy,
+        AccessPattern, Attrs, DataConnect, DataType, DimProperty, LoopLabel, Memory, NameId,
+        Operand, PROGRAMS, Program, Stmt, StmtKind, Strategy, Unit, Via as DdlVia,
     };
     use crate::schedule::ddc::fold::{AllocId, ConstIdx, DataOrigin, NodeId, PadType};
     use crate::schedule::ddc::metadata::{
@@ -6270,9 +6308,10 @@ mod unit_tests {
     use crate::schedule::ddc::transformation_util::{LoopCond, StageName};
     use crate::schedule::ddc::v1::CoreClSet;
     use crate::schedule::dsc2::{
-        AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeNode, ConditionNode,
-        LayoutDims, LdsIdx, LoopDim, LoopNode, MaxDimSize, NodeName, NumBuffers, SchedNode,
-        StartAddress, SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, WordLength,
+        AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeNode, ConditionNode, DataInfo,
+        Dsts, LayoutDims, LdsIdx, LoopDim, LoopNode, MaxDimSize, NodeName, NumBuffers, NumChunks,
+        Operand as DscOperand, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode,
+        SyncStrength, SyncUnits, TransferNode, TransferPadding, WordLength,
     };
     use crate::schedule::l3::dsc::{
         CoreCount, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DimPadding,
@@ -7918,6 +7957,11 @@ mod unit_tests {
         work: BTreeMap<Core, WkSlice>,
         /// `dsc.scheduleTree_` — the tree the conversion mints into and this test reads back.
         tree: TestTree,
+        /// `labeledDs_.at(lds).memOrg_.at(unit).allocateNode_` — the allocations ANOTHER stage placed
+        /// in this tree. Empty is the reference's null `allocateNode_`.
+        placed: BTreeMap<(LdsIdx, SenComponent), AllocId>,
+        /// `senComponentsCanReach` — false by default, which is what every other test here wants.
+        reaches: bool,
     }
 
     impl ScheduleReads for Match {
@@ -7978,8 +8022,8 @@ mod unit_tests {
     }
 
     impl AllocationSite for Match {
-        fn lds_allocation(&self, _lds: LdsIdx, _unit: SenComponent) -> Option<AllocId> {
-            None
+        fn lds_allocation(&self, lds: LdsIdx, unit: SenComponent) -> Option<AllocId> {
+            self.placed.get(&(lds, unit)).copied()
         }
         fn constant_allocation(&self, _constant: ConstIdx, _unit: SenComponent) -> Option<AllocId> {
             None
@@ -8014,7 +8058,7 @@ mod unit_tests {
             Some(DataFormat::Sen169Fp16)
         }
         fn unit_reaches(&self, _unit: SenComponent, _storage: SenComponent) -> bool {
-            false
+            self.reaches
         }
         fn dim_in_layout_order(&self, _lds: LdsIdx, _dim: PrimaryDim) -> bool {
             false
@@ -8229,6 +8273,176 @@ mod unit_tests {
             ),
             "and a bind PRESENT with an empty `coreClCond_` resolves TRUE, so it descends region 0 — \
              the THEN — and still mints no node"
+        );
+    }
+
+    /// ⭐⭐⭐ A `ddl.get_external_data_transfer_allocation` RESOLVES AGAINST THE **TREE'S** `memOrg_`,
+    /// NOT THIS CONVERSION'S OWN ARENA — `ddl_conversion.cpp:917-925` reads
+    /// `dsc.labeledDs_.at(lds).memOrg_[storage].allocateNode_` and its miss is *"Missing pre-filled
+    /// allocation in schedule tree for this tensor-memory combination"*.
+    ///
+    /// ⛔⛔ THE ARM READ `state.lds_memory`, WHICH ONLY EVER HOLDS WHAT THIS WALK ITSELF MINTED
+    /// (`process_allocation`, `op_opaque`) — never an L3-prefilled allocation. On the real
+    /// `rmsq_o728` fixture that map is EMPTY here, so the FIRST `ddl.data_transfer` of
+    /// `broadcast_ops.ddl`'s dataflow refused and the whole expansion stopped one node in.
+    ///
+    /// 🛑 SO THE SECOND ARM SEEDS `lds_memory` AND LEAVES THE SITE EMPTY, AND THAT IS THE POINT: a
+    /// reading that went back to the arena would still answer `Some` there. An assertion on the first
+    /// arm alone would pass on either reading.
+    #[test]
+    fn an_external_allocation_reads_the_prefilled_node_off_the_tree_and_not_the_ddl_arena() {
+        // `%t = ddl.tensor(..)`, `%a = ddl.get_external_data_transfer_allocation(%t) {memory="lx",
+        // data_connect="l3_lx_input2"}`, `%u = ddl.unit(%t, %a) {unit="lxlu",
+        // data_connect="l3_lx_input2"}` — the exact shape `broadcast_ops.ddl:55-56` and `:154` state.
+        static ENDS: &[Stmt] = &[
+            Stmt {
+                kind: StmtKind::Tensor,
+                depth: 0,
+                attrs: Attrs::Bare(StmtKind::Tensor),
+                results: &[NameId(0)],
+                operands: &[],
+                path: &[],
+            },
+            Stmt {
+                kind: StmtKind::GetExternalDataTransferAllocation,
+                depth: 0,
+                attrs: Attrs::ExternalAllocation {
+                    data_connect: DataConnect::L3LxInput2,
+                    memory: Memory::Lx,
+                },
+                results: &[NameId(1)],
+                operands: &[Operand::One(NameId(0))],
+                path: &[],
+            },
+            Stmt {
+                kind: StmtKind::Unit,
+                depth: 0,
+                attrs: Attrs::Unit {
+                    unit: Unit::Lxlu,
+                    data_connect: DataConnect::L3LxInput2,
+                    via: DdlVia::Direct,
+                    stick_offset: None,
+                },
+                results: &[NameId(2)],
+                operands: &[Operand::One(NameId(0)), Operand::One(NameId(1))],
+                path: &[],
+            },
+        ];
+
+        /// One resolution of `%u`, with the prefilled allocation stated on the SITE, on the
+        /// conversion's own arena, or on neither. Answers the resolved end and the data connect the
+        /// prefilled transfer ended up carrying.
+        fn resolve(on_site: bool, on_arena: bool) -> (Option<ResolvedEnd>, Option<DataConnect>) {
+            let program = synthetic(&["%t", "%a", "%u"], ENDS);
+            let mut tree = TestTree::headed("head");
+            let head = tree.head().expect("the head block");
+            // The transfer `attach_to_prefilled_schedule` left with an UNFILLED source connect —
+            // `prefilledExternalTransferToDataConnectToFill_`'s locator points at it.
+            let end = |unit: SenComponent| DscOperand {
+                unit,
+                storage: SenComponent::NoComponent,
+                data: DataInfo::default(),
+            };
+            let slot = tree
+                .add_transfer(
+                    head,
+                    TransferNode {
+                        name: NodeName("transfer_lds0_src:hbm_dst:lx".to_owned()),
+                        src: end(SenComponent::L3lu),
+                        dsts: Dsts::new(end(SenComponent::Lxlu), Vec::new()),
+                        replication_factor: ReplicationFactor::ONE,
+                        unit_time_transfer_chunk_size: Vec::new(),
+                        unit_time_transfer_num_chunks: NumChunks::ONE,
+                        padding: TransferPadding::default(),
+                        src_indirect: None,
+                        dst_indirect: None,
+                        core_id_to_gtr_info: BTreeMap::new(),
+                        transfer_size: BTreeMap::new(),
+                    },
+                )
+                .expect("the prefilled transfer");
+            let mut site = Match {
+                tree,
+                // ⭐ `senComponentsCanReach(LXLU, LX)` — true in the arch table, and the arm reads it
+                // before it ever looks at the allocation.
+                reaches: true,
+                placed: if on_site {
+                    BTreeMap::from([((LdsIdx(0), SenComponent::Lx), AllocId(7))])
+                } else {
+                    BTreeMap::new()
+                },
+                ..Match::default()
+            };
+            let mut state = DdlConversion::new();
+            if on_arena {
+                state
+                    .lds_memory
+                    .insert((LdsIdx(0), SenComponent::Lx), AllocId(3));
+            }
+            let mut interface = DdlInterface::default();
+            // `tensor_definition_` as `matchDdl2Dsc` leaves it — `%t` is labelled DS 0.
+            interface.tensor_definition.insert(
+                NameId(0),
+                TensorProp {
+                    lds: Some(LdsIdx(0)),
+                },
+            );
+            let mut metadata = Metadata::default();
+            metadata.prefilled_external_transfer_data_connects.insert(
+                (LdsIdx(0), ExternalStorage::Lx),
+                DataConnectSlot {
+                    transfer: slot,
+                    end: TransferEnd::Src,
+                },
+            );
+            let dsc = config(Pinning::default(), None);
+            let resolved = set_data_loc_and_info(
+                &program,
+                &mut state,
+                &mut interface,
+                &mut metadata,
+                &dsc,
+                &mut site,
+                NameId(2),
+                head,
+                None,
+                false,
+            );
+            let filled = site
+                .transfer(slot)
+                .and_then(|held| held.src.data.data_connect);
+            (resolved, filled)
+        }
+
+        // ⭐ THE SITE ANSWERS — the end resolves, the allocation is filed under the `ddl.unit`'s
+        // allocation operand, and the prefilled transfer's source connect is WRITTEN.
+        let (end, filled) = resolve(true, false);
+        let end = end.expect("the prefilled allocation is on the tree, so the end resolves");
+        assert_eq!(end.operand.unit, SenComponent::Lxlu);
+        assert_eq!(end.operand.storage, SenComponent::Lx);
+        assert_eq!(end.operand.data.my_lds_idx, Some(LdsIdx(0)));
+        assert_eq!(
+            end.operand.data.data_connect,
+            Some(DataConnect::L3LxInput2)
+        );
+        assert_eq!(
+            filled,
+            Some(DataConnect::L3LxInput2),
+            "`*prefilledIt->second = myExtAlloc.getDataConnect()` (`:938`) landed on the transfer \
+             the locator names"
+        );
+
+        // ⛔ AND THE ARENA DOES NOT — this is the falsifiable half. `state.lds_memory` states the
+        // pair and the tree states nothing, which is exactly the real fixture's shape.
+        assert!(
+            resolve(false, true).0.is_none(),
+            "`memOrg_` is the TREE's; a reading that went back to `state.lds_memory` would resolve \
+             here and the expansion would be reading an allocation no stage placed"
+        );
+        assert!(
+            resolve(false, false).0.is_none(),
+            "and with neither stating it, the arm is the reference's *\"Missing pre-filled \
+             allocation in schedule tree\"*"
         );
     }
 
