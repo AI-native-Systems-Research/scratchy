@@ -43,7 +43,7 @@ use crate::arch::Elements;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PaddedExtent, PrimaryDim, Sample,
 };
-use crate::schedule::ddc::fold::PadType;
+use crate::schedule::ddc::fold::{self, PadType};
 use crate::schedule::ddc::transformation_util::{
     DataStage as UtilDataStage, DataStages as UtilDataStages, DimSplit, PaddingForm,
     StageDims as UtilStageDims, StageExtents as UtilStageExtents, StageName,
@@ -175,6 +175,25 @@ impl crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Stage for Dsc2D
     /// FOLD stops on (a corelet or row the split does not name, an aborted `calculate_padded`) is a
     /// `todo!`, because the trait's return type is TOTAL and a substituted extent is a fabricated
     /// one.
+    ///
+    /// ⚠️⚠️ ONE RESIDUAL DIVERGENCE, RECORDED AND NOT PAPERED OVER — [`Self::raw_slot`] guards on
+    /// *"no split names the dim"*, but the authority's guard is *"this SAMPLE did not enter that
+    /// split's arm"*. `primaryDimToVal_st` takes the row arm only when `ptrowId >= 0 &&
+    /// rowSplit_.count(d)` (`dsc/dims.cpp:665`) and the PE/SFP arm only when the component is one of
+    /// the two (`:682-683`); otherwise it falls through to `primaryDimToVal_clView_st` and, with the
+    /// dim absent from `coreletSplit_`, to `primaryDimToVal_base_st`'s `-1`. So a dim that IS
+    /// row- or PE/SFP-split, is NOT corelet-split, has NO stated extent and is not symbolic, read at
+    /// a sample naming neither a row nor a component, `todo!`s here where the authority answers
+    /// `-1`.
+    ///
+    /// ⛔ IT IS LEFT AS A STOP DELIBERATELY, on two grounds. Closing it means re-stating
+    /// [`StageDims::sampled_extent`]'s three-way dispatch at this call site — a SECOND HOME for the
+    /// decision, which is the defect this file's own header records against `rowSplit_`/
+    /// `peSfpSplit_` — and the case is unproven on the corpus: a stage that splits a dim across rows
+    /// but states no size for it. A loud stop is recoverable; a substituted extent is the
+    /// fabricated extent this crate ranks worse than a stop. ⛔ AND [`Self::raw_slot`] MUST NOT BE
+    /// WIDENED to fix it: three other carriers read it as the *"provably the stored slot"*
+    /// predicate.
     fn extent(&self, dim: PrimaryDim, at: Sample) -> Extent {
         if let Some(extent) =
             self.dims
@@ -251,17 +270,31 @@ impl UtilStageExtents for Dsc2Dims {
         }
     }
 
-    /// ⛔⛔ NOT AN ERASE. `makeDimNotSymbolic` (`dsc/dims.cpp:781-803`) erases the entry AND THEN
+    /// ⛔⛔ NOT AN ERASE. `makeDimNotSymbolic` (`dsc/dims.cpp:781-804`) erases the entry AND THEN
     /// DIVIDES every stated size for that dim — `primaryDimToValHandler_st(dim)`, every
     /// `coreletSplit_` share, every `rowSplit_` share and every `peSfpSplit_` side — by
     /// `maxSize_ / granularity_`. Dropping the divide leaves every extent that factor too LARGE, and
     /// an extent that large becomes an oversized buffer and a wrong address. So the divide is named
     /// rather than skipped.
+    ///
+    /// ⭐ EVERY MAP IT WRITES IS ALREADY HERE — [`StageDims`]'s `symbolic`, `extents`,
+    /// `corelet_split`, `row_split` and `pe_sfp_split`. What is missing is the 22-line
+    /// TRANSFORMATION, which is a port and not a field read, so it is named rather than written
+    /// here: three `DT_CHECK`s (`maxSize_ % granularity_ == 0`, `factor != 0`, and `val % factor == 0`
+    /// per divide) are refusals a `&mut self` returning `()` has nowhere to put.
+    ///
+    /// ⭐ AND THIS IMPL IS ITS ONE HOME, beside its four sibling map writers. The same question at
+    /// `v1::ExploreStages::make_dim_not_symbolic` (`stages/ddc_sites.rs`) reaches this very
+    /// [`Dsc2Dims`] through [`Dsc2Facts::with_stages_mut`], so it delegates here rather than holding
+    /// a second copy — which is what this file's own header says about `rowSplit_`/`peSfpSplit_`.
+    /// ⚠️ `transformation_util::StageExtents::make_dim_not_symbolic` cites `dsc/dims.cpp:717`; the
+    /// function is at `:781`.
     fn make_dim_not_symbolic(&mut self, _dim: PrimaryDim) {
         todo!(
             "UtilStageExtents::make_dim_not_symbolic: wants makeDimNotSymbolic \
-             (dsc/dims.cpp:781-803) — it ERASES symbolicDimInfo_[dim] and then divides the dim \
-             value and every corelet/row/PE-SFP share by maxSize_/granularity_. A bare erase leaves \
+             (dsc/dims.cpp:781-804), UNPORTED — it ERASES symbolicDimInfo_[dim] and then divides the \
+             dim value and every corelet/row/PE-SFP share by maxSize_/granularity_. Every map it \
+             writes is on this StageDims already; the transformation is not. A bare erase leaves \
              every extent that factor too large."
         )
     }
@@ -304,8 +337,12 @@ impl UtilStageExtents for Dsc2Dims {
                 .unwrap_or_default(),
             DimSplit::PeSfp => todo!(
                 "UtilStageExtents::split_sizes: peSfpSplit_.at(dim) is keyed by corelet AND by \
-                 VectorComp (dsc/dims.h:208); a flat Vec<Elements> cannot say which side a size \
-                 belongs to, and entry 300 reads .at(0)/.at(1) positionally"
+                 VectorComp (dsc/dims.h:212-214); a flat Vec<Elements> cannot say which side a size \
+                 belongs to, and entry 300 reads .at(0)/.at(1) positionally. NOT a missing fact — \
+                 pe_sfp_split holds both sides; the RETURN TYPE cannot spell them, and no caller \
+                 asks: entry 300's only split_sizes call is DimSplit::Corelet \
+                 (schedule/ddc/transformation.rs:1759, ddc/ddc_transformation.cpp:920-922). \
+                 An empty Vec here would read as `not split`, which pe_sfp_split refutes"
             ),
             DimSplit::Padding => Vec::new(),
         }
@@ -567,13 +604,36 @@ fn seed_stages(dsc: &DesignSpaceConfig) -> UtilDataStages<Dsc2Dims> {
 }
 
 /// `M` — `memTrackers` as stage 2b reaches them, which is a DIFFERENT trait from stage 2a's
-/// [`crate::schedule::l3::dl_ops::ExPhaseTrackers`] over the SAME unported C++ allocator.
+/// [`crate::schedule::l3::dl_ops::ExPhaseTrackers`] over the SAME allocator.
 ///
-/// ⛔⛔ WANTS `ddc::DsTrackInMem`, AN UNPORTED 703-LINE C++ ALLOCATOR — `util/memtracker/
-/// mem_track.{h,cpp}`, outside every campaign's file list, being ported separately. Every method
-/// here is a `todo!` NAMING its call, and that is the whole point: `check_and_add` and
-/// `check_and_add_at` DECIDE the byte offset of every allocation, and an invented [`v1::Placed`] is
-/// a fabricated address.
+/// ⛔⛔ THE ALLOCATOR IS PORTED. THIS TYPE'S OWN `todo!`s SAID OTHERWISE FOR SEVEN METHODS AND THAT
+/// WAS FALSE — `util/memtracker/mem_track.{h,cpp}` is
+/// [`crate::schedule::memtrack::tracker::DsTrackInMem`], ported unit by unit (`e003`..`e038`) by the
+/// `crustify-memtrack` campaign, and `sys-arch-spec/memtracker/mem_track_bundle.{h,cpp}` is
+/// [`crate::schedule::memtrack::bundle::MemTrackBundle`], which IS
+/// `getTracker(comp, core, corelet, row)`. All seven of this trait's questions have a ported answer:
+/// `memCapacity` is the tracker's own field (`e032_initMemTrack`), `backupEps` is `e023`,
+/// `restoreEps` `e035`, `removeDs` `e019`, `addDsAtStartAddr` `e031`, `checkAndAddDs` `e037` and
+/// `checkAndAddDsAtAddr` `e038`. ⚠️ `v1::MemTrackers`' own doc still says *"outside this campaign's
+/// file list"*; that is the same stale claim one file up.
+///
+/// ⛔⛔ SO EVERY `todo!` BELOW IS A WIRING GAP, AND ALL SEVEN HAVE ONE CAUSE: this is a UNIT struct.
+/// [`super::Dsc2Provider`] holds it as a FIELD and states `type Trackers = ddc_state::DdcTrackers`
+/// (`stages/ddc_sites.rs`), and `Dsc2Provider::new` has no `A: Arch` — so nothing there can seed a
+/// bundle, and giving this type the `MemTrackBundle` field it needs stops that file compiling.
+/// [`super::Trackers`](super::carriers::Trackers) is the shape to reach: it already owns a real
+/// `MemTrackBundle<DsTrackInMem>` and answers the SAME seven questions for stage 2a.
+///
+/// ⛔⛔ AND A SECOND FACT NO FIELD ON THIS TYPE FIXES: `run_l3` builds its
+/// [`super::Trackers`](super::carriers::Trackers) as a LOCAL and drops it (`schedule/stages.rs`,
+/// `run_l3`). One bundle must be threaded from stage 2a into stage 2b, because a fresh bundle here
+/// would place stage 2b's allocations OVER stage 2a's — the same LX bytes handed out twice.
+///
+/// ⚠️ AND EVEN WIRED, A NON-LX SITE STILL STOPS: the bundle holds the LX family only, because
+/// `initializeMemoryTrackers` reads `regInfoPerUnit.at(LXLU).at(RegType::SCALE)` and
+/// `sys_arch_spec::regfile::RegType` has no `SCALE` arm — see
+/// [`super::Trackers`](super::carriers::Trackers). Stage 2b is the stage that places the
+/// register-file and L0 nodes, so that gap is on its path, not stage 2a's.
 ///
 /// ⭐ THE ORACLE IS ALREADY RECORDED, on stage 2a's own tracker
 /// ([`super::Trackers`](super::carriers::Trackers)): `g0/debug/sdsc_0/sdsc.json`'s three LX
@@ -585,24 +645,32 @@ pub struct DdcTrackers;
 impl v1::MemTrackers for DdcTrackers {
     fn capacity(&self, _at: v1::TrackerSite) -> crate::arch::Bytes {
         todo!(
-            "v1::MemTrackers::capacity: wants memCapacity off ddc::DsTrackInMem — an UNPORTED \
-             703-line C++ allocator (util/memtracker/mem_track.{{h,cpp}})"
+            "v1::MemTrackers::capacity: memCapacity IS PORTED — DsTrackInMem::mem_capacity, set by \
+             e032_initMemTrack (schedule/memtrack/tracker.rs). This unit struct holds no \
+             MemTrackBundle to read it from; see DdcTrackers"
         )
     }
 
     fn backup(&mut self, _at: v1::TrackerSite) {
-        todo!("v1::MemTrackers::backup: wants backupEps(exphase) on ddc::DsTrackInMem")
+        todo!(
+            "v1::MemTrackers::backup: backupEps(exphase) IS PORTED — e023_backupEps \
+             (schedule/memtrack/tracker.rs); this unit struct holds no bundle. See DdcTrackers"
+        )
     }
 
     fn restore_all(&mut self) {
         todo!(
-            "v1::MemTrackers::restore_all: wants restoreEps(exphase, backupInfo) on \
-             ddc::DsTrackInMem"
+            "v1::MemTrackers::restore_all: restoreEps(exphase, backupInfo) IS PORTED — \
+             e035_restoreEps; and the snapshot map this replays is state a unit struct cannot keep. \
+             See DdcTrackers"
         )
     }
 
     fn remove(&mut self, _at: v1::TrackerSite, _name: &v1::StorageName) {
-        todo!("v1::MemTrackers::remove: wants removeDs(name, seps) on ddc::DsTrackInMem")
+        todo!(
+            "v1::MemTrackers::remove: removeDs(name, seps) IS PORTED — e019_removeDs; this unit \
+             struct holds no bundle. See DdcTrackers"
+        )
     }
 
     fn add_at(
@@ -613,8 +681,8 @@ impl v1::MemTrackers for DdcTrackers {
         _address: crate::arch::Bytes,
     ) {
         todo!(
-            "v1::MemTrackers::add_at: wants addDsAtStartAddr(name, size, seps, addr) on \
-             ddc::DsTrackInMem"
+            "v1::MemTrackers::add_at: addDsAtStartAddr(name, size, seps, addr) IS PORTED — \
+             e031_addDsAtStartAddr; this unit struct holds no bundle. See DdcTrackers"
         )
     }
 
@@ -625,9 +693,11 @@ impl v1::MemTrackers for DdcTrackers {
         _size: crate::arch::Bytes,
     ) -> Option<v1::Placed> {
         todo!(
-            "v1::MemTrackers::check_and_add: wants checkAndAddDs(name, size, seps) on \
-             ddc::DsTrackInMem — THIS CALL IS THE PLACEMENT AUTHORITY; an invented Placed is a \
-             fabricated address"
+            "v1::MemTrackers::check_and_add: checkAndAddDs(name, size, seps) IS PORTED — \
+             e037_checkAndAddDs, and stage 2a already drives it (carriers::Trackers, whose \
+             lx_oracle test reproduces all 588 LX addresses of the 187 reference programs). THIS \
+             CALL IS THE PLACEMENT AUTHORITY and it COMMITS, so it must run on the SAME bundle \
+             stage 2a placed into — run_l3 drops its own. See DdcTrackers"
         )
     }
 
@@ -639,8 +709,9 @@ impl v1::MemTrackers for DdcTrackers {
         _address: crate::arch::Bytes,
     ) -> Option<v1::Placed> {
         todo!(
-            "v1::MemTrackers::check_and_add_at: wants checkAndAddDsAtAddr(name, size, seps, addr) \
-             on ddc::DsTrackInMem"
+            "v1::MemTrackers::check_and_add_at: checkAndAddDsAtAddr(name, size, seps, addr) IS \
+             PORTED — e038_checkAndAddDsAtAddr; this unit struct holds no bundle, and it commits on \
+             the same bundle stage 2a placed into. See DdcTrackers"
         )
     }
 }
@@ -735,10 +806,30 @@ impl v1::Symbols for DdcSymbols {
 /// `C` — the coordinate and work-slice tables entry 260's coordinate-based constant offset reaches
 /// through.
 ///
-/// ⛔⛔ THE LAST TWO METHODS ARE `util/foldManager/foldInfrastructure.h`, OUTSIDE THIS CAMPAIGN'S
-/// FILE LIST, and both are fold ALGEBRA over an address: `single_beta` evaluates a fold dim at one
-/// `(core, corelet, row)` and `distance_in_steps` solves a lexicographic affine distance. A guessed
-/// coefficient is a wrong address, so neither is answered.
+/// ⛔⛔ THE FOUR TABLE READERS ARE BLOCKED BY THIS TYPE'S OWN SHAPE, NOT BY A MISSING PORT, and the
+/// distinction decides who fixes them. This is a UNIT struct: `Dsc2Provider` holds it as
+/// `trackers`/`coords` FIELDS and states `type Coords = ddc_state::DdcCoords`
+/// (`stages/ddc_sites.rs`, `Dsc2Provider::new` and its `impl v1::Dsc2Sites`), so it owns nothing and
+/// borrows nothing, while every one of those four reads needs the state:
+/// * `sdsc_->coreIdToWkSlice_`, the fallback BOTH work-slice readers take — already held, by
+///   [`Dsc2State::core_wk_slices`].
+/// * `allocNode->allocateCoordinates_` — already held, by `TreeData::coordinate` at
+///   `TreeData::node_of_alloc`'s node (`stages/tree.rs`).
+/// So `alloc_work_slices` and `alloc_coordinate` are a CONSTRUCTION-SITE change (hand this carrier
+/// `&Dsc2State` and the [`DscIdx`] whose tree it reads, exactly as [`super::Dsc2Store`] and
+/// [`super::Dsc2Stages`] are handed them), and adding a field here without that change stops
+/// `ddc_sites.rs` compiling. ⛔ IT IS NOT DONE HERE: that file is not this file.
+///
+/// ⛔ AND TWO FACTS ARE GENUINELY ABSENT, not merely unreachable — `sliceViewCoordinates_`, which
+/// `alloc_coordinate` prefers over `allocateCoordinates_` when non-empty, and the per-node
+/// `transferCoordinates_`/`inputCoordinates_`/`outputCoordinate_` `node_coordinate` wants. The tree
+/// carries ONE coordinate map and only `clear_allocate_coordinates`/`clear_transfer_coordinates`
+/// (`schedule/ddc/mod.rs:178-180`) and `resize_input_coordinates` (`schedule/ddc/fold.rs:7507`) name
+/// the others, so nothing writes them yet.
+///
+/// ⛔ ONE METHOD IS STILL FOLD ALGEBRA OUTSIDE THIS CAMPAIGN'S FILE LIST — see
+/// [`Self::distance_in_steps`]. ⭐ `single_beta` IS NOT, and the prose that grouped the two was
+/// wrong: [`fold::single_data`] is `getSingleData` and is already in this crate.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DdcCoords;
 
@@ -750,8 +841,10 @@ impl v1::CoordinateOffsets for DdcCoords {
     ) -> Option<BTreeMap<PrimaryDim, v1::WorkSlice>> {
         todo!(
             "v1::CoordinateOffsets::node_work_slices: wants coordinates.coreIdToWkSlice_ on the \
-             node's own Coordinate, falling back to sdsc_->coreIdToWkSlice_ — a per-node table \
-             entry 375's coordinate capture is what fills"
+             node's own Coordinate (ddc/ddcv1.cpp:2690-2692), falling back to \
+             sdsc_->coreIdToWkSlice_. THE FALLBACK IS HELD (Dsc2State::core_wk_slices); the node's \
+             own Coordinate is NOT — see Self::node_coordinate — and this carrier is a unit struct \
+             that cannot reach either. Wiring it is a change in stages/ddc_sites.rs"
         )
     }
 
@@ -762,7 +855,10 @@ impl v1::CoordinateOffsets for DdcCoords {
     ) -> Option<BTreeMap<PrimaryDim, v1::WorkSlice>> {
         todo!(
             "v1::CoordinateOffsets::alloc_work_slices: wants the same off the allocation's \
-             sliceViewCoordinates_/allocateCoordinates_"
+             sliceViewCoordinates_/allocateCoordinates_ (ddc/ddcv1.cpp:2696-2700) — i.e. \
+             Self::alloc_coordinate's core_id_to_wk_slice, else Dsc2State::core_wk_slices. BOTH \
+             HALVES ARE HELD once this carrier can reach the state; it is a unit struct, so wiring \
+             it is a change in stages/ddc_sites.rs"
         )
     }
 
@@ -773,8 +869,11 @@ impl v1::CoordinateOffsets for DdcCoords {
     ) -> crate::schedule::dsc2::Coordinate {
         todo!(
             "v1::CoordinateOffsets::node_coordinate: wants transferCoordinates_/\
-             inputCoordinates_.at(i)/outputCoordinate_ on that node — the coordinates entry 375 \
-             captures"
+             inputCoordinates_.at(i)/outputCoordinate_ on that node — a MISSING FIELD, not a \
+             borrow: TreeData holds one coordinate map (allocateCoordinates_) and only \
+             clear_transfer_coordinates (schedule/ddc/mod.rs:180) and resize_input_coordinates \
+             (schedule/ddc/fold.rs:7507) name these, so nothing writes them. The field belongs on \
+             the tree's node record (stages/tree.rs)"
         )
     }
 
@@ -784,28 +883,75 @@ impl v1::CoordinateOffsets for DdcCoords {
     ) -> crate::schedule::dsc2::Coordinate {
         todo!(
             "v1::CoordinateOffsets::alloc_coordinate: wants sliceViewCoordinates_ where its \
-             coordinates_ is non-empty, else allocateCoordinates_"
+             coordinates_ is non-empty, else allocateCoordinates_ (ddc/ddcv1.cpp:2696-2698). \
+             allocateCoordinates_ IS HELD (TreeData::coordinate at node_of_alloc(alloc)) and \
+             sliceViewCoordinates_ is NOT MODELLED AT ALL, so answering with the one we have would \
+             silently prefer the wrong table wherever a slice view exists"
         )
     }
 
+    /// ⛔ AN UNPORTED PASS AND A MISSING NODE FIELD, AND BOTH ARE ONE THING. `getRelevantCoreCl()`
+    /// (`dsc/dsc2.h:471`) reads `ScheduleNode::relevantComps_`, and the only writer is
+    /// `DesignSpaceConfig::setRelevantCompCoreCl()` (`dsc/dsc2.cpp:2647-2712`) — a whole DFS over
+    /// `scheduleTree_` that seeds the head with `{coreIdsUsed_} x {0..numCoreletsUsed_DSC2_}`, then
+    /// INTERSECTS each `CONDITION`'s then-region with its `coreClCond_` and SUBTRACTS it from the
+    /// else-region, then unions the per-component views upward. Nothing in this crate carries
+    /// `relevantComps_`, so the answer cannot be read off a field.
+    ///
+    /// ⛔ THE WHOLE-CORE SET IS NOT THE ANSWER, which is why nothing is substituted: the caller uses
+    /// it to SKIP sites (`schedule/ddc/v1.rs:2868`), so widening it writes a constant offset at a
+    /// `(core, corelet)` the conditionals exclude.
+    ///
+    /// ⚠️ THE SAME QUESTION STANDS TWICE — `v1::ConditionSimplification::relevant_core_cl`
+    /// (`stages/ddc_store.rs`) is the same `getRelevantCoreCl()` on the tree carrier, so ONE port of
+    /// that pass answers both.
     fn relevant_core_cl(&self, _node: crate::schedule::ddc::fold::NodeId) -> v1::CoreClSet {
         todo!(
-            "v1::CoordinateOffsets::relevant_core_cl: wants getRelevantCoreCl() (dsc/dsc2.h:471), \
-             which dsc.setRelevantCompCoreCl() (dsc/dsc2.cpp:2647) is what fills — a `dsc/` seam"
+            "v1::CoordinateOffsets::relevant_core_cl: wants getRelevantCoreCl() (dsc/dsc2.h:471) \
+             off ScheduleNode::relevantComps_, which ONLY setRelevantCompCoreCl \
+             (dsc/dsc2.cpp:2647-2712) fills — an unported tree pass AND a node field this crate \
+             does not carry. The whole-core set is not a substitute: the caller SKIPS sites by it"
         )
     }
 
+    /// `dimCoord.getSingleData({{Core, core}, {Corelet, corelet}, {RowSplit, row}})`
+    /// (`ddc/ddcv1.cpp:2761-2768`) — the node's own fold value at ONE spatial site, which is the
+    /// `beta` `lexiAffineSolve` is then asked to hit.
+    ///
+    /// ⭐⭐ IT IS ALREADY IN THIS CRATE, AND THE PROSE THAT SAID OTHERWISE WAS WRONG.
+    /// [`fold::single_data`] IS `getSingleData` (`util/foldManager/foldInfrastructure.h:1934`) — a
+    /// `getData` over a deque holding the named positions and zero everywhere else — written out as
+    /// the all-affine sum `Σ_i (α_i·idx_i + β_i)`, and entry 237 already reads it exactly this way
+    /// (`schedule/ddc/fold.rs:3300`). [`crate::schedule::dsc2::FoldDim`] implements
+    /// [`fold::AffineFoldDims`] (`schedule/ddc/fold.rs:1877`), so no walk and no new type is needed.
+    ///
+    /// ⭐ THE THREE ARGUMENTS ARRIVE ALREADY SELECTED. The reference fixes `Core` at
+    /// `useCoreIdNode ? sliceIdNode : 0`, `Corelet` at `useClIdNode ? clId : 0` and `RowSplit` at
+    /// `rowIdNode`; the caller performs those three choices (`schedule/ddc/v1.rs:2894-2900`) and
+    /// hands the results down, so this reader fixes the three positions and nothing else.
+    ///
+    /// ⛔ TOTAL WHERE `fold_dim_indices.at(dim)` THROWS — a coordinate with fewer than three fold
+    /// levels. That is not a decision made here: the sum runs over the levels the dim HAS, so a
+    /// fixed position past the last one contributes nothing, which is
+    /// [`fold::AffineFoldDims`]'s own recorded stance for this type (*"an index past the last level
+    /// answers `FoldParamInfoType`'s own defaults"*).
     fn single_beta(
         &self,
-        _folds: &crate::schedule::dsc2::FoldDim,
-        _core: i64,
-        _corelet: i64,
-        _row: i64,
+        folds: &crate::schedule::dsc2::FoldDim,
+        core: i64,
+        corelet: i64,
+        row: i64,
     ) -> crate::schedule::dsc2::FoldCoeff {
-        todo!(
-            "v1::CoordinateOffsets::single_beta: wants getSingleData({{Core, core}}, {{Corelet, \
-             corelet}}, {{RowSplit, row}}) — fold algebra in util/foldManager/\
-             foldInfrastructure.h, outside this campaign's file list"
+        crate::schedule::dsc2::FoldCoeff(
+            fold::single_data(
+                folds,
+                &[
+                    (fold::FoldPosition::Core, core),
+                    (fold::FoldPosition::Corelet, corelet),
+                    (fold::FoldPosition::RowSplit, row),
+                ],
+            )
+            .0,
         )
     }
 
@@ -817,8 +963,13 @@ impl v1::CoordinateOffsets for DdcCoords {
     ) -> v1::ConstEleOffset {
         todo!(
             "v1::CoordinateOffsets::distance_in_steps: wants \
-             FoldInfraUtils::lexiAffineSolveDistanceInSteps(folds, beta, fixed) — \
-             util/foldManager/foldInfrastructure.h, outside this campaign's file list"
+             FoldInfraUtils::lexiAffineSolveDistanceInSteps (foldInfrastructure.h:3023) — THREE \
+             unported units, and a SOLVER rather than an evaluation, which is why single_beta's \
+             fix does not reach it: lexiAffineSolve (:2965) calls \
+             LexiAffineSolver(alphas, factors, beta).solve(target) (util/utils.h:184), a pruned DFS \
+             for the lexicographically smallest coordinate hitting the target, then \
+             coordDistanceInSteps (:3001) walks it back to a step count. Both headers are outside \
+             this campaign's file list"
         )
     }
 }
@@ -828,15 +979,22 @@ impl v1::CoordinateOffsets for DdcCoords {
 pub(super) fn ds_type_of(dsc: &DesignSpaceConfig, lds: LdsIdx) -> Option<
     crate::schedule::ddc::transformation::DsType,
 > {
-    dsc.labeled_ds
-        .indexed()
-        .find(|(at, _)| *at == lds)
-        .map(|(_, held)| held.ds_type())
+    // `labeledDs_.at(lds)` — ⛔ THE POSITION AND NOT `LabeledDs::recorded`, which is what
+    // `LabeledDsList::at` already spells; the two can drift.
+    dsc.labeled_ds.at(lds).map(|held| held.ds_type())
 }
 
 /// ⛔ AND THE STICK DIMS THAT `dsType_` NAMES — `primaryDsInfo_.at(dsType_)`'s `stickDimOrder_`
 /// zipped with its `stickSize_`, which is exactly what [`crate::schedule::l3::dsc::PrimaryDsInfo`]
 /// already holds.
+///
+/// ⭐ ITS TWO EMPTIES ARE DISTINGUISHABLE, AND THAT WAS CHECKED RATHER THAN ASSUMED. [`None`] is a
+/// THROW and only a throw — `labeledDs_.at(lds)`'s (through [`ds_type_of`]) or
+/// `primaryDsInfo_.at(dsType_)`'s — while `Some(`empty [`StickDims`]`)` is a `dsType_` whose
+/// `stickDimOrder_` is genuinely empty. So a caller CAN tell the two apart, and neither is a
+/// swallowed refusal. Contrast [`non_broadcast_dims_of`], whose total return type cannot.
+///
+/// [`StickDims`]: crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims
 pub(super) fn stick_dims_of(
     dsc: &DesignSpaceConfig,
     lds: LdsIdx,
@@ -848,15 +1006,32 @@ pub(super) fn stick_dims_of(
 }
 
 /// ⛔ `getNonBroadcastLdsDimSet(lds)` (`dsc/dsc2.cpp:4050`) as
-/// [`DesignSpaceConfig::non_broadcast_lds_dims`] answers it — EMPTY for an index the DSC does not
-/// hold, which is the reference's own `ldsIdx < 0` arm.
+/// [`DesignSpaceConfig::non_broadcast_lds_dim_set`] answers it — the labelled DS's OWN
+/// `primaryDsInfo_.at(dsType_).layoutDimOrder_` filtered to `scale_ > 0`.
+///
+/// ⛔⛔ IT USED TO CALL [`DesignSpaceConfig::non_broadcast_lds_dims`], WHICH IS A DIFFERENT FUNCTION
+/// AND A SMALLER SET. `getNonBroadcastLdsDims` (`dsc/dsc2.cpp:4039-4048`) is this set INTERSECTED
+/// with `getLayoutDims(ldsIdx)` — the ALLOCATE node's `layoutDimOrder_` (`:4007-4025`) — so every
+/// non-broadcast dim the allocate node does not name was silently DROPPED. Both callers ask for the
+/// set: `v1::…::non_broadcast_dims` (`schedule/ddc/v1.rs:3370`) and
+/// `tr::ScopeTree::non_broadcast_lds_dims` (`schedule/ddc/transformation.rs:958`) each cite
+/// `getNonBroadcastLdsDimSet`, and so do the reference sites they stand on
+/// (`ddc/ddc_transformation.cpp:238`, `:1457`, both of which take a `std::set`).
+/// ⭐ `l3::dsc` ALREADY NAMED THIS TRAP — [`DesignSpaceConfig::non_broadcast_lds_dim_set`]'s own doc
+/// says *"THIS IS NOT `non_broadcast_lds_dims`, which intersects this set with the ALLOCATE node's
+/// order"*. Seven `dl_ops` sites already ask for the right one.
+///
+/// ⚠️ THE EMPTY IS STILL INDISTINGUISHABLE FOR ONE CASE, AND THAT IS RECORDED RATHER THAN HIDDEN:
+/// [`None`] here is `labeledDs_.at(ldsIdx)` THROWING, and the reference guards only `ldsIdx < 0` —
+/// which [`LdsIdx`]'s unsignedness makes unspellable. Both trait returns are a bare
+/// `BTreeSet<PrimaryDim>`, so there is nowhere to put that throw; a caller cannot tell it from a
+/// wholly broadcast structure's genuine `{}`. ⛔ THE ONE THING THAT WOULD FIX IT is those two trait
+/// returns becoming [`Option`], which is not this file's to change.
 pub(super) fn non_broadcast_dims_of(
     dsc: &DesignSpaceConfig,
     lds: LdsIdx,
 ) -> BTreeSet<PrimaryDim> {
-    dsc.non_broadcast_lds_dims(lds)
-        .map(|dims| dims.into_iter().collect())
-        .unwrap_or_default()
+    dsc.non_broadcast_lds_dim_set(lds).unwrap_or_default()
 }
 
 /// Every `labeledDs_` position, in order — `LabeledDsList::indexed`'s keys.
@@ -867,5 +1042,122 @@ pub(super) fn lds_positions(dsc: &DesignSpaceConfig) -> Vec<LdsIdx> {
 /// The corelets `numCoreletsUsed_` names, as corelets rather than a count.
 pub(super) fn corelets_of(count: u32) -> Vec<Corelet> {
     (0..count).filter_map(Corelet::checked).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::schedule::ddc::transformation::{DsType, Scale};
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, CoreletsUsed, DataStage, DataStages, FilledDims, LabeledDs, LabeledDsList,
+        NamedDims, Pinning,
+    };
+
+    /// One stated dim, which is all [`FilledDims::of`] asks for.
+    fn stage(name: &str) -> DataStage {
+        let mut dims = StageDims::default();
+        dims.extents.insert(PrimaryDim::I, Extent(1));
+        let half = || NamedDims {
+            name: StageName(name.to_owned()),
+            dims: FilledDims::of(dims.clone()).expect("a stage that states a dim"),
+        };
+        DataStage {
+            ss: half(),
+            el: half(),
+        }
+    }
+
+    /// A DSC holding exactly the two labelled structures the assertions below read, and NO
+    /// `layout_dims` entry for either — which is `getLayoutDims`' `DT_CHECK(allocNode)`
+    /// (`dsc/dsc2.cpp:4022`), the abort that separates the two reference functions.
+    fn dsc_without_layouts() -> DesignSpaceConfig {
+        // `scale_ = 0` is broadcast, `scale_ > 0` is not (`dsc/dsc2.cpp:4058`).
+        let broadcast = LabeledDs::new(
+            DsType::Input,
+            vec![
+                (PrimaryDim::I, Scale::Sized(0.0)),
+                (PrimaryDim::J, Scale::Sized(0.0)),
+            ],
+            LdsIdx(0),
+            Pinning::default(),
+        );
+        let mixed = LabeledDs::new(
+            DsType::Input,
+            vec![
+                (PrimaryDim::I, Scale::Sized(1.0)),
+                (PrimaryDim::J, Scale::Sized(0.0)),
+            ],
+            LdsIdx(1),
+            Pinning::default(),
+        );
+        DesignSpaceConfig {
+            ddc: crate::schedule::l3::dsc::DdcFacts::default(),
+            gtr_ids_used: BTreeSet::new(),
+            corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: Some(CoreletsUsed::ONE),
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(
+                crate::units::Core::checked(0).expect("core 0"),
+                vec![],
+            ),
+            layout_dims: BTreeMap::new(),
+            labeled_ds: LabeledDsList::new(broadcast, vec![mixed]),
+            data_stages: DataStages::new(stage("core"), stage("chunk")),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+            full_padding: BTreeMap::new(),
+        }
+    }
+
+    /// ⭐⭐ THE TWO REFERENCE FUNCTIONS ARE NOT INTERCHANGEABLE, AND THIS CARRIES THE DIM RATHER THAN
+    /// A COUNT. `getNonBroadcastLdsDimSet(1)` (`dsc/dsc2.cpp:4050-4065`) reads the labelled DS's OWN
+    /// `layoutDimOrder_` filtered to `scale_ > 0` and NEVER calls `getLayoutDims`, so its answer is
+    /// `{I}`. `getNonBroadcastLdsDims(1)` (`:4039-4048`) intersects that with `getLayoutDims(1)`,
+    /// which on this DSC hits `DT_CHECK(allocNode)` — so the WRONG choice presents a structure that
+    /// does carry a non-broadcast dim as one that carries none.
+    ///
+    /// ⛔ THIS IS THE ASSERTION THAT WOULD HAVE CAUGHT IT. [`non_broadcast_dims_of`] called the
+    /// intersecting flavour while both of its callers cite the set
+    /// (`schedule/ddc/v1.rs:3370`, `schedule/ddc/transformation.rs:958`); every test stayed green,
+    /// because nothing named the dim that went missing.
+    #[test]
+    fn the_non_broadcast_set_is_the_lds_own_order_and_not_the_allocate_nodes() {
+        let dsc = dsc_without_layouts();
+
+        // The reference's own two answers for the SAME index, side by side.
+        assert_eq!(
+            dsc.non_broadcast_lds_dim_set(LdsIdx(1)),
+            Some(BTreeSet::from([PrimaryDim::I])),
+            "getNonBroadcastLdsDimSet reads the lds' own order and needs no allocate node"
+        );
+        assert_eq!(
+            dsc.non_broadcast_lds_dims(LdsIdx(1)),
+            None,
+            "getNonBroadcastLdsDims stops at getLayoutDims' DT_CHECK(allocNode)"
+        );
+
+        // ⭐ THE CARRIER ANSWERS THE SET — the dim itself, not its absence.
+        assert_eq!(
+            non_broadcast_dims_of(&dsc, LdsIdx(1)),
+            BTreeSet::from([PrimaryDim::I])
+        );
+
+        // ⭐ AND A WHOLLY BROADCAST STRUCTURE IS STILL GENUINELY EMPTY, so the fix widened the
+        // answer only where a dim was being dropped: every `scale_` is 0 here.
+        assert_eq!(non_broadcast_dims_of(&dsc, LdsIdx(0)), BTreeSet::new());
+    }
+
+    /// ⚠️ THE ONE EMPTY A CALLER CANNOT TELL APART, asserted so the gap is measured rather than
+    /// believed: position 2 is past `labeledDs_`, which is `labeledDs_.at(ldsIdx)`'s THROW — and it
+    /// reads back identical to position 0's genuine `{}` above, because both trait returns are a bare
+    /// `BTreeSet`.
+    #[test]
+    fn a_position_the_dsc_does_not_hold_reads_back_as_a_genuine_empty() {
+        let dsc = dsc_without_layouts();
+        assert_eq!(dsc.non_broadcast_lds_dim_set(LdsIdx(2)), None);
+        assert_eq!(non_broadcast_dims_of(&dsc, LdsIdx(2)), BTreeSet::new());
+    }
 }
 
