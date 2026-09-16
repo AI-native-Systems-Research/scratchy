@@ -1140,7 +1140,8 @@ impl Symbolic {
 /// A DATA STAGE'S DIMS — `DataStructDims` (`dsc/dims.h:158`) reduced to what this batch reads.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StageDims {
-    /// The primary dims this stage states, as `primaryDimToVal_st(dim)` answers them.
+    /// The `i_`/`j_`/… slots this stage states, which [`StageDims::extent`] reads RAW and
+    /// [`StageDims::whole_extent`] is the `primaryDimToVal_st(dim)` reading of.
     pub extents: BTreeMap<PrimaryDim, Extent>,
     /// `paddingSizes_`.
     pub padding: BTreeMap<PrimaryDim, DimPadding>,
@@ -1163,8 +1164,12 @@ pub struct StageDims {
 }
 
 impl StageDims {
-    /// `primaryDimToVal_st(dim)`, `None` for a dim the stage does not state — its `-1` default,
-    /// which compares equal only to another absence.
+    /// THE RAW SLOT of one primary dim — the `i_`/`j_`/… field naming `dim`, [`None`] for the `-1`
+    /// an unwritten field carries. `compound()` (`dsc/dims.cpp:84`) and [`Self::scaled_extent`]'s
+    /// fall-through each read the FIELD, which is why this stays.
+    ///
+    /// ⛔ NOT `primaryDimToVal_st(dim)` — that is [`Self::whole_extent`], which answers a symbolic
+    /// dim's `maxSize_` instead of its slot and refuses a negative one.
     #[must_use]
     pub fn extent(&self, dim: PrimaryDim) -> Option<Extent> {
         self.extents.get(&dim).copied()
@@ -1424,6 +1429,19 @@ impl StageDims {
         self.calculate_padded(dim, Extent(scaled), padded, granularity)
     }
 
+    /// Replaces: e013_primaryDimToVal_st_1arg
+    ///
+    /// ONE DIM AS THE STAGE STATES IT — [`Self::sampled_extent`] at [`DimSample::WHOLE`]: unpadded,
+    /// full density, the max symbolic size, and no row, corelet or component named.
+    ///
+    /// ⛔ NOT [`Self::extent`], WHICH IS THE RAW SLOT: a row-split dim answers the WHOLE here because
+    /// `ptrowId`/`clId` default to `-1` (`dsc/dims.cpp:647-649`), a symbolic dim answers `maxSize_`
+    /// rather than its slot, and a negative slot is [`None`].
+    #[must_use]
+    pub fn whole_extent(&self, dim: PrimaryDim) -> Option<Extent> {
+        self.sampled_extent(dim, DimSample::WHOLE, &PaddingForm::default(), None, false)
+    }
+
     /// `primaryDimToVal_st(dim, NO_COMPONENT, -1, -1, {dim, pad})` — [`Self::scaled_extent`] with the
     /// default density and the max symbolic size, which is what every caller that names one padding
     /// type asks for.
@@ -1439,12 +1457,16 @@ impl StageDims {
     ///
     /// ⛔ [`None`] IS [`Self::padded_extent`]'s ABORT SET. ⭐ AN UNSTATED DIM IS `Some(false)`, NOT an
     /// abort — `val < 0` short-circuits to `-1` on both sides of the comparison.
+    ///
+    /// ⛔ THE PLAIN SIDE IS `primaryDimToVal_st(dim)` ([`Self::whole_extent`]), NOT THE RAW SLOT
+    /// (`L3DlOpsScheduler.cpp:1075`): a symbolic dim compares its `maxSize_` on BOTH sides, and a
+    /// negative slot is the `-1` both sides short-circuit to rather than an abort.
     #[must_use]
     pub fn has_padding(&self, dim: PrimaryDim) -> Option<bool> {
         if !self.padding.contains_key(&dim) {
             return Some(false);
         }
-        let Some(plain) = self.extent(dim) else {
+        let Some(plain) = self.whole_extent(dim) else {
             return Some(false);
         };
         Some(self.padded_extent(dim, PadType::PaddedFullSpanWUnneeded)? != plain)
@@ -2052,10 +2074,12 @@ impl DataStage {
         self.el.name = name;
     }
 
-    /// `ss_.primaryDimToVal_st(dim)`, `None` for a dim the stick side does not state.
+    /// `ss_.primaryDimToVal_st(dim)` ([`StageDims::whole_extent`]), `None` for a dim the stick side
+    /// does not state — the spelling of its three readers
+    /// (`L3DlOpsScheduler.h:490-492`, `ddc/ddl/ddl_conversion.cpp:3070-3071`).
     #[must_use]
     pub fn ss_extent(&self, dim: PrimaryDim) -> Option<Extent> {
-        self.ss.dims.dims().extent(dim)
+        self.ss.dims.dims().whole_extent(dim)
     }
 }
 
@@ -3487,5 +3511,21 @@ mod tests_e012 {
             ),
             Some(Extent(4))
         );
+    }
+
+    /// e013 — the one-argument spelling answers `in_: 64` on the very export whose `rowSplit_` makes
+    /// the row view answer 8, and `i_: -1` as an absence.
+    #[test]
+    fn the_one_argument_spelling_answers_the_reference_s_whole_dim_not_its_row_share() {
+        let stage = row_split_stage();
+
+        // `g0/debug/sdsc_100/sdsc.json` states `in_: 64` AND `rowSplit_["in"]["0"] = [8; 8]` together.
+        // ⛔ THE NEGATIVE CONTROL IS THE 8: `ptrowId` defaults to `-1`, so this must NOT be a share.
+        assert_eq!(stage.whole_extent(PrimaryDim::In), Some(Extent(64)));
+        assert_eq!(stage.whole_extent(PrimaryDim::Out), Some(Extent(64)));
+        assert_eq!(stage.whole_extent(PrimaryDim::Mb), Some(Extent(1)));
+        assert_eq!(stage.whole_extent(PrimaryDim::Y), Some(Extent(1)));
+        // `i_: -1` in that export — the `-1` this reads back as an absence.
+        assert_eq!(stage.whole_extent(PrimaryDim::I), None);
     }
 }
