@@ -11,14 +11,17 @@
 //! that does not gets a RECORDED REFUSAL naming the fact rather than a plausible byte count.
 //!
 //! ⛔ A FABRICATED CAPACITY IS THE ONE THING RANKED WORSE THAN A STOP by this crate's own
-//! `CLAUDE.md`: `alloc_all_mem` would place every allocation against it and commit, and the
+//! `CLAUDE.md`: `alloc_all_mem` places every allocation against it and commits, and the
 //! resulting program reads memory nothing filled.
 //!
-//! ⛔⛔ AND THE REFUSAL IS AN [`Option`], NOT A `todo!`, BECAUSE THIS IS NOW THE FRONTIER. A `todo!`
-//! is loud, which is right for a COLD path — but entry 222's capacity question is on the hot path of
-//! every one of the 24,363 programs, and a panic there unwinds the [`DscState`] the whole node census
-//! is read off. `spyre`'s `run_stages` catches it and reports `Ran::Stopped`, which carries no
-//! artifacts, so a panicking frontier costs the measurement as well as the answer.
+//! ⭐⭐ `P` NO LONGER REFUSES THE CAPACITY EITHER, AND THAT WAS THE LAST CARRIER REFUSAL ON THE HOT
+//! PATH. [`Placement::buffer_capacity_even_sticks`] walks
+//! [`crate::schedule::l3::capacity::buffer_capacity`] on the `&DesignSpaceConfig` the reference calls
+//! `getBufferCapacityForNode` **on**, so `alloc_all_mem` commits and `DscState::refusals()` is EMPTY
+//! for a program that reaches it. Its [`Option`] is still an [`Option`] and NOT a `todo!`: the stops
+//! left inside the ported walk are on the hot path of all 24,363 programs, and a panic there unwinds
+//! the [`DscState`] the whole node census is read off — `spyre`'s `run_stages` catches it and reports
+//! `Ran::Stopped`, which carries no artifacts, so a panicking frontier costs the measurement too.
 //!
 //! ⭐⭐ `M` IS NO LONGER ONE OF THEM. [`Trackers`] owns a real [`MemTrackBundle`] of ported
 //! [`DsTrackInMem`] trackers, so every capacity it reports and every address it hands out comes off
@@ -28,17 +31,20 @@
 mod lx_oracle;
 
 use std::collections::BTreeMap;
-use std::num::NonZeroI64;
+use std::num::{NonZeroI64, NonZeroU64};
 
 use crate::arch::{Arch, Bytes};
 use crate::schedule::ddc::fold::{AllocId, NodeId};
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::v1;
-use crate::schedule::dsc2::{LdsIdx, StartAddress};
-use crate::schedule::l3::dsc::DscIdx;
+use crate::schedule::dsc2::{LdsIdx, LoopDim, LoopNode, StartAddress};
+use crate::schedule::l3::capacity::{
+    AllocSizing, AncestorLoops, BytesForm, DscSizing, SampledBuffer, StickRounding, buffer_capacity,
+};
+use crate::schedule::l3::dsc::{DesignSpaceConfig, DscIdx};
 use crate::schedule::l3::dl_ops::{
     AddressFoldCoords, ExPhase, ExPhaseTrackers, L3DataInfoSink, L3Fill, L3Placement,
-    L3TrackerSite, SymbolOp, SymbolOperand, SymbolTable, VariableSymbol,
+    L3TrackerSite, SymbolOp, SymbolOperand, SymbolTable, VariableSymbol, parent_loop_nodes,
 };
 use crate::schedule::memtrack::bundle::{BundleSite, MemTrackBundle};
 use crate::schedule::memtrack::memory::{Address, Capacity};
@@ -57,24 +63,89 @@ use super::state::DscState;
 /// its own doc says so, and the coordinate count is that same list's length. Two answers from ONE
 /// value, so the fold space this places along and the fold space entry 292 walks cannot disagree.
 ///
-/// ⭐⭐ IT HOLDS THE SAME `&'s DscState` [`super::Reads`] AND [`super::Env`] DO, FOR ONE REASON: so the
-/// capacity it cannot answer is RECORDED as a refusal rather than raised as a `todo!`. A panic here
-/// unwinds every frame of stage 2a, and the [`DscState`] the measurement is read off is built by the
-/// caller — so a panicking carrier costs the node census as well as the answer.
+/// ⭐⭐ IT HOLDS THE SAME `&'s DscState` [`super::Reads`] AND [`super::Env`] DO, so the allocate node
+/// and the loop chain the capacity walk needs come off the very tree the growers minted — the one
+/// cell per `memOrg_` entry, not a second map that could disagree with it.
 #[derive(Debug, Clone)]
 pub struct Placement<'s> {
     state: &'s DscState,
     coords: AddressFoldCoords,
+    /// `dscGlobal.sysDef.bytesPerStick` (`L3DlOpsScheduler.cpp:5559`, `:5657`) — [`Arch::BYTES_PER_STICK`].
+    bytes_per_stick: NonZeroU64,
 }
 
 impl<'s> Placement<'s> {
     /// The placement over the fold manager's own address coordinates — the same value
-    /// [`crate::schedule::l3::dl_ops::L3RunInputs::coords`] carries — and the state its refusals land
-    /// in.
+    /// [`crate::schedule::l3::dl_ops::L3RunInputs::coords`] carries — the state its refusals land in,
+    /// and the stick width its LX capacities round to an EVEN count of.
+    ///
+    /// ⛔⛔ `bytes_per_stick` IS A CONSTRUCTION ARGUMENT AND NOT A TYPE PARAMETER ON THIS CARRIER.
+    /// `dscGlobal.sysDef.bytesPerStick` is a member of the scheduler's OWN construction argument
+    /// (`L3DlOpsScheduler(dscGlobal, memTrackers, {executionStep}, verbose)`), exactly like the
+    /// [`Trackers::at_step`] granularity beside it — and a `Placement<'s, A>` cannot work here:
+    /// `l3::dl_ops::run` takes `A` explicitly and `P` freely with nothing tying the two, so the arch
+    /// is unconstrained at the call site (E0283) and a defaulted parameter would silently resolve to
+    /// one arch's stick width on every target. The caller states the width, so a wrong one is a
+    /// visible argument rather than an inferred fabrication.
     #[must_use]
-    pub const fn of(state: &'s DscState, coords: AddressFoldCoords) -> Self {
-        Self { state, coords }
+    pub const fn of(
+        state: &'s DscState,
+        coords: AddressFoldCoords,
+        bytes_per_stick: NonZeroU64,
+    ) -> Self {
+        Self {
+            state,
+            coords,
+            bytes_per_stick,
+        }
     }
+}
+
+/// THE ENCLOSING LOOPS OF ONE NODE AS `dsc2::LoopNode`s — `node->getOwnerLoop()` applied until the
+/// loop that has no parent block, which is [`parent_loop_nodes`] (entry 015), each id resolved to the
+/// loop the tree minted at it.
+///
+/// ⛔ THE TWO `LoopNode`s ARE TWO VOCABULARIES OF ONE C++ TYPE AND THE CONVERSION IS THE SAME ONE
+/// [`super::ddc_store2`]'s `sched_node_of` ALREADY MAKES: the tree stores
+/// [`crate::schedule::ddc::transformation_util::LoopNode`] (name, `numId_`, `denId_`, `dims_`) and
+/// [`AncestorLoops`] reads `dsc2::LoopNode`, whose extra field is `isParametricLoop_` /
+/// `parametricLdsIdx_`.
+///
+/// ⛔ `parametric_lds: None` IS THE AUTHORITY'S OWN MEMBER INITIALIZER AND NOT A DROPPED FACT
+/// (`dsc/dsc2.h:617-618`). Exactly two things in the reference ever write it — the `ParametricLoopOp`
+/// arm of the DDL conversion (`ddc/ddl/ddl_conversion.cpp:1126-1161`) and the JSON importer reading a
+/// SERIALISED super-DSC back (`dsc/dsc2.cpp:1409-1416`) — and neither has run: every loop in this
+/// tree was minted in memory by the L3 scheduler's own `createLoopNode`
+/// (`L3DlOpsScheduler.cpp:625-645`), which writes `name_`, `numId_`, `denId_` and `dims_` and nothing
+/// else. ⭐ THE ANSWER MATTERS: `getSizeDataStageForNode` sizes a parametric loop's dim by
+/// `parametricStride` and every other loop's by its `denId_` datastage (`dsc/dsc2.cpp:3652-3668`), so
+/// a wrongly parametric loop writes an invented extent straight into the buffer size.
+///
+/// ⭐ THE BLOCK IS THE REAL SUBTREE, not an empty stand-in: `head_block_of` materialises it, so
+/// nothing here states a child list the tree does not have.
+fn ancestor_loop_nodes(tree: &super::state::DscTree, node: NodeId) -> Vec<LoopNode> {
+    parent_loop_nodes(tree, node)
+        .into_iter()
+        .filter_map(|at| {
+            tree.with(|held| {
+                let minted = held.loop_node(at)?;
+                Some(LoopNode {
+                    block: super::ddc_store2::head_block_of(held, at.0),
+                    dims: minted
+                        .dims
+                        .iter()
+                        .map(|entry| LoopDim {
+                            dim: entry.dim,
+                            kind: entry.kind,
+                        })
+                        .collect(),
+                    num: Some(minted.num),
+                    den: Some(minted.den),
+                    parametric_lds: None,
+                })
+            })
+        })
+        .collect()
 }
 
 impl L3Placement for Placement<'_> {
@@ -92,66 +163,99 @@ impl L3Placement for Placement<'_> {
     /// [`crate::schedule::l3::dsc::DesignSpaceConfig`] — proved against `sdsc_1`'s own two exported
     /// buffer offsets, 256 and 4096.
     ///
-    /// ⛔⛔ WHAT IS MISSING IS **THREE CONSTRUCTION FACTS, NONE OF THEM A PORT**, and the carrier can
-    /// already reach everything else: the allocate node is
-    /// `TreeData::node_of_alloc(alloc)` → `DscTree::placed(node)`, and the
-    /// `AncestorLoops` chain is `TreeData::owner_loop`/`loop_node` from that node with
-    /// `DscTree::head_den` for the head — both off the [`DscState`] this carrier already holds.
+    /// ⭐⭐ **IT ANSWERS.** The five reads it takes to ask are all off state this carrier already
+    /// holds, and none of them is a derivation:
     ///
-    /// 1. **`currDsc` ITSELF.** The reference calls a `DesignSpaceConfig` METHOD —
-    ///    `currDsc->getBufferCapacityForNode(..)` (`L3DlOpsScheduler.cpp:5560`) — and this trait
-    ///    method is handed only the [`DscIdx`]. An index names WHICH DSC; it does not carry
-    ///    `labeledDs_`, `primaryDsInfo_`, `getLayoutDims` or `dataStageParam_`, and [`DscState`]
-    ///    holds trees and `memOrg_`s alone. ⛔ AND IT CANNOT BE A FIELD ON THIS CARRIER: a borrow of
-    ///    the super-DSC cannot live across `l3::dl_ops::run`'s own `&mut SuperDsc`, and a CLONE would
-    ///    freeze `dataStageParam_` — which is precisely the map [`size_data_stage_for_node`] reads
-    ///    each enclosing loop's `denId_` out of. ⭐ THE FIX IS THE REFERENCE'S OWN SHAPE:
-    ///    `try_alloc_l3` ALREADY HOLDS `dsc: &DesignSpaceConfig` two statements above the call, so the
-    ///    trait method takes it as an argument beside the index.
-    /// 2. **`sysDef.bytesPerStick`** — `dscGlobal.sysDef.bytesPerStick` (`:5559`), which is
-    ///    [`Arch::BYTES_PER_STICK`] at both L3 sites. `try_alloc_l3` carries no `A: Arch` bound, so it
-    ///    is this carrier's to state.
-    /// 3. **THREE `dsc2::AllocateNode` MEMBERS THE RUST MODEL HAS NO SLOT FOR** —
-    ///    `ignoreSymbolicVolumeLimits_` (`dsc/dsc2.h:1002`), `backGapCore_` (`:989`) and
-    ///    `indirectAllocType_` (`:994`), which [`crate::schedule::l3::capacity::AllocSizing`] takes as
-    ///    parameters for exactly that reason. ⚠️ THEIR DECLARED INITIALIZERS ARE `false`, EMPTY AND
-    ///    `NO_INDIRECTION`, AND NO SCHEDULER UNIT WRITES THE FIRST TWO (their only writers are the
-    ///    SDSC parser `dsc/dsc2.cpp:1786`/`:1803`, the DSM translator
-    ///    `dsm/translators/perfDscToSdsc/perfDscToSdsc.cpp:2188`, and the reference-DSC copy
-    ///    `dsc/designSpaceConfig.cpp:94`/`:129`) — but that makes them WIRE FACTS the l3 projection
-    ///    drops, not facts this carrier may assume. `includeGaps` DEFAULTS TRUE, so an assumed-empty
-    ///    `backGapCore_` silently omits every back gap from the capacity.
-    /// ⛔ `DesignSpaceConfig::lx_chunk_capacity` IS A PRECOMPUTED FIELD, not this call: it is that
-    /// call already made for the CHUNK stage at one site, so reusing it answers a different question
-    /// with the same number. ⚠️ AND IT IS EMPTY IN EVERY SCRATCHY BUNDLE ANYWAY — the projection
-    /// states so (`crates/targets/spyre/src/superdsc_to_l3_sdsc.rs:764-772`), because no labelled DS
-    /// has an LX allocate node before stage 2a mints one.
-    /// ⛔⛔ IT REFUSES AND NO LONGER PANICS, AND THAT IS A RATCHET DOWN RATHER THAN A SOFTENING. This
-    /// was a `todo!` while it was UNREACHABLE — entry 222 stopped one statement earlier, at an
-    /// allocate-node map the port had invented and no unit ever wrote. That map is gone, so this is
-    /// now the frontier of stage 2a on EVERY program, and a panic at the frontier unwinds the
-    /// [`DscState`] the census is read off: `spyre`'s `run_stages` reports a panicking program as
-    /// `Ran::Stopped`, which carries no artifacts at all. A recorded refusal names the same missing
-    /// fact, `try_alloc_l3` propagates it as its own [`None`], and the tree the growers minted stays
-    /// readable — which is what makes the next frontier measurable rather than merely reported.
+    /// * **`currDsc`** is the ARGUMENT, because the reference's call is a `DesignSpaceConfig` METHOD
+    ///   (`currDsc->getBufferCapacityForNode(..)`, `L3DlOpsScheduler.cpp:5560`) and `try_alloc_l3`
+    ///   already holds that borrow. It cannot be a FIELD here: a borrow of the super-DSC cannot live
+    ///   across `l3::dl_ops::run`'s own `&mut SuperDsc`, and a CLONE would freeze `dataStageParam_` —
+    ///   precisely the map `size_data_stage_for_node` reads each enclosing loop's `denId_` out of.
+    /// * **the allocate node** is `TreeData::node_of_alloc(alloc)` → `DscTree::placed(node)`, the ONE
+    ///   `labeledDs_.at(lds).memOrg_.at(storage).allocateNode_` cell entry 353's mint fills and
+    ///   [`crate::schedule::l3::dl_ops::AllocationReads`] reads — so this and `try_alloc_l3`'s own
+    ///   `node` cannot be two different nodes.
+    /// * **the ancestor loops** are [`ancestor_loop_nodes`], which is entry 015's own
+    ///   `parent_loop_nodes` walk, with [`crate::schedule::stages::DscTree::head_den`] as the head's
+    ///   `denId_` — `ScheduleTree::head_` is itself a `LoopNode` and is the loop that ends the
+    ///   reference's `getPrev() == nullptr` walk (`dsc/dsc2.h:623`, `:629`).
+    /// * **`allocateCoordinates_`** is `TreeData::coordinate(node)`. ⭐ ITS ABSENCE IS THE
+    ///   DEFAULT-CONSTRUCTED COORDINATE AND NOT A REFUSAL: the reference holds
+    ///   `CoordinateType<CoordinateBaseType> allocateCoordinates_` BY VALUE (`dsc/dsc2.h:1007`), so a
+    ///   node no coordinate pass has reached carries an empty one whose `foldConstructed()` is false —
+    ///   which is exactly what `hasCoordinate` then reads (`dsc/dsc2.cpp:3777-3778`).
+    ///   `sliceViewCoordinates_` is [`None`] because it is NEVER SERIALISED (`dsc/dsc2.cpp:1827` is a
+    ///   bare `// TO DO: sliceview coordinate`).
+    /// * **`bytesPerStick`** is [`Self::of`]'s construction argument, per that constructor's note.
+    ///
+    /// ⛔ THE COMPONENT IS THE NODE'S OWN `component_` AND NOT AN ARGUMENT: the reference passes
+    /// `allocNode->component_` (`:5562`) and `try_alloc_l3` has already proved it is `LX` two
+    /// statements above (`:5551`'s *"Expect only LX."*).
+    /// ⛔ `corelet` AND `row` GO THROUGH AS THE `0`/`0` THE REFERENCE PASSES, not as `-1`:
+    /// [`SampledBuffer::of`] applies the component's own forcing (`:3768-3772`), and doing it here
+    /// instead would read `sliceViewCoordinates_` where the reference reads `allocateCoordinates_`.
+    /// ⛔ `allowSymbolicVolumeLimit` IS ABSENT FROM [`BytesForm`] BY DESIGN — e019 hands its callee a
+    /// HARDCODED `true` (`:3990`), so a caller able to state it would be stating something the
+    /// reference overrides.
+    /// ⛔ `nonUnifiedAllocInHBM_` (`dsc/dsc2.h:1004`) IS `false` TWICE OVER: no unit of the L3
+    /// scheduler writes it (its only writers are `perfDscToSdsc.cpp:1870` and the SDSC parser
+    /// `dsc/dsc2.cpp:1805`), and it is read ONLY inside the `component_ == HBM` arm
+    /// (`dsc/dsc2.cpp:3626`), which the LX proof above makes unreachable.
+    /// ⛔ `DesignSpaceConfig::lx_chunk_capacity` IS NOT THIS CALL: it is the same call already made
+    /// for the CHUNK stage at one fixed site, so reusing it would answer a different question with the
+    /// same number.
+    /// ⛔⛔ AND [`None`] IS STILL NEVER A CAPACITY. It is a stop of the ported walk — a `.at` the
+    /// reference throws from, or one of the four arms of
+    /// `getBufferCapacityForNodePerDimCustomLocation` still carrying a `todo!` — propagated by
+    /// `try_alloc_l3` unchanged. A fabricated byte count would commit a fabricated placement, which
+    /// this crate ranks worse than any stop.
     fn buffer_capacity_even_sticks(
         &self,
-        _dsc: DscIdx,
-        _alloc: AllocId,
-        _lds: LdsIdx,
-        _corelet: Corelet,
-        _row: Row,
+        dsc: &DesignSpaceConfig,
+        dsc_idx: DscIdx,
+        alloc: AllocId,
+        lds: LdsIdx,
+        corelet: Corelet,
+        row: Row,
     ) -> Option<Bytes> {
-        self.state.refuse(
-            "L3Placement::buffer_capacity_even_sticks: getBufferCapacityForNode \
-             (dsc/dsc2.cpp:3977) IS PORTED, as l3::capacity::buffer_capacity, and \
-             l3::capacity::DscSizing answers its SizeDsc seam — \
-             this carrier lacks the &DesignSpaceConfig the reference calls it ON \
-             (L3DlOpsScheduler.cpp:5560; the DscIdx names a DSC but carries no labeledDs_, \
-             primaryDsInfo_ or dataStageParam_), sysDef.bytesPerStick (:5559), and the three \
-             AllocateNode members AllocSizing needs — ignoreSymbolicVolumeLimits_ (dsc/dsc2.h:1002), \
-             backGapCore_ (:989) and indirectAllocType_ (:994) — which the l3 projection drops; \
-             a fabricated capacity would commit a fabricated placement",
+        let tree = self.state.dsc(dsc_idx)?;
+        let node = tree.with(|held| held.node_of_alloc(alloc))?;
+        // `allocNode` — the ddc view of that one `memOrg_` cell.
+        let allocation = tree.placed(node)?;
+        // The two `dsc2::AllocateNode` members `AllocSizing` needs that the ddc view has no slot for,
+        // read off the L3 mint's own node rather than stated here — see
+        // [`crate::schedule::l3::dl_ops::L3AllocateNode::back_gap_dims`].
+        let (_, minted) = tree.with(|held| held.allocate(node))?;
+        let coordinates = tree.with(|held| held.coordinate(node)).unwrap_or_default();
+        let above = ancestor_loop_nodes(tree, node);
+        let ancestors = AncestorLoops::of(above.iter().collect(), tree.head_den());
+        let sizing = AllocSizing {
+            allocate_coordinates: &coordinates,
+            slice_view_coordinates: None,
+            ignore_symbolic_volume_limits: minted.ignore_symbolic_volume_limits,
+            indirect: minted.indirect,
+            back_gap_dims: &minted.back_gap_dims,
+        };
+        let view = DscSizing::of(dsc)?;
+        let at = SampledBuffer::of(
+            lds,
+            view.labeled_ds(lds)?,
+            allocation.component,
+            Some(corelet),
+            Some(row),
+        );
+        buffer_capacity(
+            &allocation,
+            sizing,
+            false,
+            at,
+            BytesForm {
+                do_not_round: false,
+                include_gaps: true,
+                rounding: StickRounding::EvenSticks(self.bytes_per_stick),
+            },
+            &ancestors,
+            &view,
         )
     }
 

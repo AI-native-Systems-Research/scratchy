@@ -898,6 +898,34 @@ pub struct L3AllocateNode {
     pub indirect: Option<IndirectAlloc>,
     /// `relatedIndirectAccessAlloc_` — the allocation on the other side of that indirection.
     pub related_indirect: Option<AllocId>,
+    /// `ignoreSymbolicVolumeLimits_` (`dsc/dsc2.h:1002`) — *"force this allocation to be 'ghost
+    /// rectangular'"*, which is the whole of `getBufferCapacityForNodePerDimCustomLocation`'s
+    /// symbolic-volume-limit arm (`dsc/dsc2.cpp:3782`).
+    ///
+    /// ⭐ A FIELD AND NOT A CONSTANT IN THE CARRIER, EVEN THOUGH EVERY MINT LEAVES IT `false`:
+    /// [`crate::schedule::l3::capacity::AllocSizing`] takes it as a parameter precisely because this
+    /// projection had no slot for it, and a capacity walk reading a constant beside the node cannot be
+    /// told from one reading the node. `createAllocateNode` (`L3DlOpsScheduler.cpp:544-594`) writes
+    /// `name_`, `ldsIdx_`, `component_`, `numBuffers_`, `layoutDimOrder_`, `maxDimSizes_` and
+    /// `padding_` and NOTHING ELSE, so a freshly minted node carries the `dsc/dsc2.h:1002` member
+    /// initializer — and the only writers anywhere are the SDSC parser (`dsc/dsc2.cpp:1803`), the
+    /// reference-DSC copy (`dsc/designSpaceConfig.cpp:129`) and `ProgramCorrection.cpp:1227`, which
+    /// writes `false` itself. Measured `0` on all 1,899 allocate nodes of
+    /// `/Users/nickm/tmp/bridge1-fixtures/g0/debug/sdsc_*/sdsc.json`.
+    pub ignore_symbolic_volume_limits: bool,
+    /// `backGapCore_`'s KEYS ALONE (`dsc/dsc2.h:989`) — the dims that carry a back gap, which is what
+    /// `includeGaps` adds to each dim's size (`dsc/dsc2.cpp:3937-3955`).
+    ///
+    /// ⛔⛔ THE KEYS ARE THE LOAD-BEARING HALF AND AN EMPTY SET IS NOT A SAFE DEFAULT: `includeGaps`
+    /// DEFAULTS TRUE, so a dim silently dropped from here is a buffer sized SHORT by its whole gap.
+    /// The per-core gap VALUES land with the deferred arm that reads them —
+    /// [`crate::schedule::l3::capacity::AllocSizing::back_gap_dims`] states the same narrowing.
+    /// ⭐ EMPTY AT EVERY MINT, PROVED THE SAME WAY AS [`Self::ignore_symbolic_volume_limits`]: no unit
+    /// of the L3 scheduler writes `backGapCore_` at all — its only writers are the SDSC parser
+    /// (`dsc/dsc2.cpp:1786`), the perf-DSC translator
+    /// (`dsm/translators/perfDscToSdsc/perfDscToSdsc.cpp:2188`) and the reference-DSC copy
+    /// (`dsc/designSpaceConfig.cpp:94`). Measured `{}` on all 1,899 g0 allocate nodes.
+    pub back_gap_dims: BTreeSet<PrimaryDim>,
 }
 
 /// `Metadata::Allocation` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:161`) reduced to the one map
@@ -1162,6 +1190,12 @@ pub fn create_allocate_node(
         padding,
         indirect: None,
         related_indirect: None,
+        // ⭐ THE MINT'S OWN TWO, VERBATIM: `createAllocateNode` writes seven fields
+        // (`L3DlOpsScheduler.cpp:547-575`) and neither of these is among them, so a node it issues
+        // carries `dsc/dsc2.h:1002`'s `false` and `:989`'s empty map. See the fields' own notes for
+        // the exhaustive writer list that makes this the value and not a default.
+        ignore_symbolic_volume_limits: false,
+        back_gap_dims: BTreeSet::new(),
     })
 }
 
@@ -1476,6 +1510,8 @@ mod tests_e009_e016 {
                 padding: node.padding.clone(),
                 indirect: None,
                 related_indirect: None,
+                ignore_symbolic_volume_limits: false,
+                back_gap_dims: BTreeSet::new(),
             }
         );
         assert_eq!(
@@ -9210,22 +9246,28 @@ pub trait L3Placement {
     /// `currDsc->getBufferCapacityForNode(node, lds, comp, corelet, row, bytesPerStick,
     /// /*forceEvenNumSticks*/ true)` — the L3 rounds to an EVEN stick count for ring polarity.
     ///
-    /// ⛔ `dsc` IS THE `currDsc` THE CALL IS MADE ON (`L3DlOpsScheduler.cpp:5560-5563`): it is a
-    /// `DesignSpaceConfig` METHOD, so which DSC is asked decides `labeledDs_`, `primaryDsInfo_` and
-    /// the layout the capacity is walked over. A carrier answering without it names no DSC at all.
+    /// ⛔⛔ `dsc` IS THE `currDsc` THE CALL IS MADE **ON** (`L3DlOpsScheduler.cpp:5560-5563`), AND IT
+    /// IS AN ARGUMENT AND NOT A FIELD OF THE CARRIER. `getBufferCapacityForNode` is a
+    /// `DesignSpaceConfig` METHOD, so which DSC is asked decides `labeledDs_`, `primaryDsInfo_`,
+    /// `getLayoutDims` and the live `dataStageParam_` the sizing walk reads each enclosing loop's
+    /// `denId_` out of; the [`DscIdx`] beside it names WHICH tree, and names none of that. ⭐ AND
+    /// `try_alloc_l3` ALREADY HOLDS THIS VERY BORROW two statements above the call — it hands it to
+    /// `get_lds_or_const_name_of_alloc_node` — so passing it costs nothing and a borrow of the
+    /// super-DSC never has to outlive `run`'s own `&mut SuperDsc`.
     ///
-    /// ⛔⛔ [`None`] IS *"THIS CARRIER CANNOT ANSWER"*, NOT A REFERENCE REFUSAL — the vendor's method
-    /// returns an `int` and never fails. It is an [`Option`] for the same reason
-    /// [`DscOffsetFacts::offset_sizes`] is: `getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`)
-    /// accumulates `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3755-3963`) over
-    /// eight further unported accessors, and a carrier that cannot walk it must SAY SO rather than
+    /// ⛔ [`None`] IS *"THIS CARRIER CANNOT ANSWER"* OR A CALLEE'S OWN STOP, NOT A REFERENCE REFUSAL —
+    /// the vendor's method returns an `int` and never fails. It is an [`Option`] for the same reason
+    /// [`DscOffsetFacts::offset_sizes`] is: [`crate::schedule::l3::capacity::buffer_capacity`] stops
+    /// on the arms of `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3754-3963`) whose
+    /// `.at`s the reference throws from, and a carrier that cannot walk it must SAY SO rather than
     /// panic — a `todo!` here unwinds the whole stage, taking the [`crate::schedule::stages::DscState`]
     /// the measurement is read off with it, and a fabricated capacity would commit a fabricated
     /// placement, which this crate ranks worse than either. A refusing carrier records WHICH fact it
     /// lacked, and entry 222 propagates the stop unchanged.
     fn buffer_capacity_even_sticks(
         &self,
-        dsc: DscIdx,
+        dsc: &DesignSpaceConfig,
+        dsc_idx: DscIdx,
         alloc: AllocId,
         lds: LdsIdx,
         corelet: Corelet,
@@ -9477,8 +9519,10 @@ where
                     return None;
                 }
                 // The LX buffer must be an even number of sticks for ring polarity (refer to DSI).
-                let capacity =
-                    placement.buffer_capacity_even_sticks(dsc_idx, alloc, lds, at.corelet, at.row)?;
+                // ⭐ ON `dsc` — `currDsc->getBufferCapacityForNode(..)` (`:5560`), the same borrow
+                // `get_lds_or_const_name_of_alloc_node` is handed below.
+                let capacity = placement
+                    .buffer_capacity_even_sticks(dsc, dsc_idx, alloc, lds, at.corelet, at.row)?;
                 let buffers = node.placement.num_buffers.reserved();
                 node_and_size.push((site, Bytes(capacity.0.checked_mul(buffers.get())?)));
             }
@@ -11019,7 +11063,8 @@ mod tests_e221_e228 {
         impl L3Placement for Placement {
             fn buffer_capacity_even_sticks(
                 &self,
-                _dsc: DscIdx,
+                _dsc: &DesignSpaceConfig,
+                _dsc_idx: DscIdx,
                 _alloc: AllocId,
                 _lds: LdsIdx,
                 _corelet: Corelet,
@@ -11368,7 +11413,8 @@ mod tests_e221_e228 {
         impl L3Placement for Placement {
             fn buffer_capacity_even_sticks(
                 &self,
-                _dsc: DscIdx,
+                _dsc: &DesignSpaceConfig,
+                _dsc_idx: DscIdx,
                 _alloc: AllocId,
                 _lds: LdsIdx,
                 _corelet: Corelet,
@@ -11572,7 +11618,8 @@ mod tests_e221_e228 {
     impl L3Placement for PagedPlacement {
         fn buffer_capacity_even_sticks(
             &self,
-            _dsc: DscIdx,
+            _dsc: &DesignSpaceConfig,
+            _dsc_idx: DscIdx,
             _alloc: AllocId,
             _lds: LdsIdx,
             _corelet: Corelet,
@@ -12180,6 +12227,8 @@ mod tests_e221_e228 {
                 padding: PaddingForm::default(),
                 indirect: Some(IndirectAlloc::ValueTensor),
                 related_indirect: Some(index),
+                ignore_symbolic_volume_limits: false,
+                back_gap_dims: BTreeSet::new(),
             },
         );
         tree.link(value_node, InsertionPoint::LastIn(root));
@@ -12194,6 +12243,8 @@ mod tests_e221_e228 {
                 padding: PaddingForm::default(),
                 indirect: Some(IndirectAlloc::IndexTensor(IndexTensor::Index)),
                 related_indirect: Some(value),
+                ignore_symbolic_volume_limits: false,
+                back_gap_dims: BTreeSet::new(),
             },
         );
         tree.link(index_node, InsertionPoint::LastIn(root));
@@ -14892,7 +14943,8 @@ mod tests_e283_e295 {
     impl L3Placement for Placement {
         fn buffer_capacity_even_sticks(
             &self,
-            _dsc: DscIdx,
+            _dsc: &DesignSpaceConfig,
+            _dsc_idx: DscIdx,
             _alloc: AllocId,
             _lds: LdsIdx,
             _corelet: Corelet,

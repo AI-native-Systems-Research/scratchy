@@ -1166,6 +1166,14 @@ fn set_dst_lds(dsts: &mut Dsts, index: usize, lds: LdsIdx) {
 
 /// A fresh L3 allocate node over the layout dims a DSC states for that labelled DS, with every
 /// `maxDimSizes_` entry UNBOUNDED — the reference's `resize(n, -1)` (`dsc/dsc2.h:982`).
+///
+/// ⛔ `ignoreSymbolicVolumeLimits_` AND `backGapCore_` ARE THE MEMBER INITIALIZERS AND NOT A CHOICE
+/// MADE HERE (`dsc/dsc2.h:1002`, `:989`). This seed stands for the HBM allocate node an input
+/// super-DSC already carries, and the SDSC parser is one of the three things in the reference that
+/// EVER writes those two (`dsc/dsc2.cpp:1786`, `:1803`) — measured `{}` and `0` on all 1,899 allocate
+/// nodes of `/Users/nickm/tmp/bridge1-fixtures/g0/debug/sdsc_*/sdsc.json`, so the wire states the
+/// initializer on every one. ⭐ AND NO SEEDED NODE REACHES THE CAPACITY WALK ANYWAY: entry 222 sizes
+/// only what `newAllocations_` holds, which `create_allocate_node` fills with nodes IT minted.
 pub(super) fn seed_allocate_node(
     name: NodeName,
     lds: LdsIdx,
@@ -1186,6 +1194,8 @@ pub(super) fn seed_allocate_node(
         padding: PaddingForm::default(),
         indirect: None,
         related_indirect: None,
+        ignore_symbolic_volume_limits: false,
+        back_gap_dims: BTreeSet::new(),
     }
 }
 

@@ -32,15 +32,30 @@
 //! order and with the arguments entry 222 uses (`L3DlOpsScheduler.cpp:5537-5645`). The ADDRESS is
 //! the port's own answer; the footprint and the expected address are the reference's.
 //!
-//! ⛔ IT DOES NOT VERIFY THE FOOTPRINT. `getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`) IS PORTED —
-//! [`crate::schedule::l3::capacity::buffer_capacity`], with
-//! [`crate::schedule::l3::capacity::DscSizing`] answering its `SizeDsc` seam — but
-//! [`crate::schedule::l3::dl_ops::L3Placement::buffer_capacity_even_sticks`] is not handed the
-//! `&DesignSpaceConfig` the reference calls it on, so [`super::Placement`] refuses and the SIZE of
-//! each request is taken from the reference's output rather than computed. ⭐ THAT REFUSAL IS NOW
-//! STAGE 2A'S FRONTIER ON EVERY PROGRAM: entry 222 finds
-//! its allocate node (the port's separate allocate-node map is gone) and stops on the capacity
-//! instead. This test says nothing about it.
+//! ⛔⛔ IT STILL DOES NOT VERIFY THE FOOTPRINT, AND THAT IS THE ONE GAP LEFT IN THIS FILE.
+//! `getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`) is ported as
+//! [`crate::schedule::l3::capacity::buffer_capacity`] and
+//! [`crate::schedule::l3::dl_ops::L3Placement::buffer_capacity_even_sticks`] now ANSWERS it —
+//! [`super::Placement`] takes the `&DesignSpaceConfig` the reference calls it on and the whole
+//! corpus's capacity refusal is gone — but the SIZE of each request in the table below is still taken
+//! from the reference's output rather than computed. So this test gates the ALLOCATOR against the
+//! reference's addresses given the reference's sizes, and says nothing about whether the carrier
+//! reproduces those sizes.
+//!
+//! ⭐⭐⭐ IT HAS BEEN MEASURED ONCE, BY HAND, AND IT MATCHES EXACTLY — WHAT IS MISSING IS THE
+//! ASSERTION, NOT THE ANSWER. Instrumenting `try_alloc_l3`'s `(lds, capacity, numBuffers_)` and
+//! running `schedule/stages.rs`'s own `0_rmsq_o728` composition through
+//! [`super::Placement::buffer_capacity_even_sticks`] on the tree the growers grew prints
+//! `capacity = 256, numBuffers_ = 2` for **each of lds 0, 1 and 2** — a footprint of `512, 512, 512`,
+//! which is [`ORACLE`]'s row 0 (`0_rmsq_o728`) byte for byte, off the reference's own
+//! `numBuffers_ * bufferOffsetCoreCorelet_`.
+//!
+//! ⛔ SO WHY IS THE TEST NOT HERE: the assertion needs the DSC and the grown tree, whose only fixtures
+//! are `a_rmsq_super_dsc`/`the_rmsq_compute_ops` — private to `schedule/stages.rs`'s own test module,
+//! where the composition tests live. Asserting `[512, 512, 512]` there beside those fixtures is what
+//! turns the hand measurement above into a gate. ⭐ The other end-to-end value behind the carrier is
+//! [`crate::schedule::l3::capacity::buffer_capacity`]'s own `tests_e019`, which reproduces `sdsc_1`'s
+//! exported `256` and `4096` through the full call on a real DSC.
 //!
 //! ⛔ AND WHAT THE 187 DO NOT EXERCISE, so a green run here is not a verified allocator: every one
 //! packs consecutively from the base with zero gaps, so there is no fragmented free list, no

@@ -92,30 +92,53 @@
 //! placements back through `AllocationSites::place_allocation`, so the arena has no production reader
 //! or writer on the placement path at all.
 //!
-//! ⛔ 0 of 24,363 STILL COMPLETE, FOR A NEW AND NAMED REASON: `L3Placement::buffer_capacity_even_sticks`
-//! (`deeptools stages/carriers.rs`) is the NEXT statement, and the carrier REFUSES it — it wants
-//! `DesignSpaceConfig::getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`) accumulating
-//! `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3755-3963`, ~210 lines over eight
-//! further unported accessors). A fabricated capacity would commit a fabricated placement, so the stop
-//! stands — but it is a RECORDED refusal rather than the `todo!` it used to be, so it prints as
-//! `stage2a-refusal:` and the node census below survives it. ⭐ THE ONE-LINE CONSEQUENCE: porting
-//! `getBufferCapacityForNode` is entry 222's frontier now; nothing else has to change here.
+//! ⭐⭐⭐ THE CAPACITY IS ANSWERED AND THE LX PLACEMENTS ARE COMMITTED — READ THIS BEFORE ANY OLDER
+//! ACCOUNT OF THE STOP. `L3Placement::buffer_capacity_even_sticks` (`deeptools stages/carriers.rs`)
+//! used to REFUSE, on every one of the 24,363 programs, for want of the `&DesignSpaceConfig` the
+//! reference calls `getBufferCapacityForNode` ON. It now takes that borrow as an argument — the one
+//! `try_alloc_l3` already holds — and walks `deeptools`' `l3::capacity::buffer_capacity`
+//! (`dsc/dsc2.cpp:3977` and its ~210-line `getBufferCapacityForNodePerDimCustomLocation`), so entry
+//! 222's `alloc_all_mem` — the ONE committing call of the whole stage — runs and writes every LX start
+//! address and buffer offset onto `memOrg_.allocateNode_`.
+//!
+//! ⛔⛔ AND THE STOP MOVED AGAIN, TO A DEFECT OF EXACTLY THE SHAPE ENTRY 222 JUST SHED. On the real
+//! emitted matmul this file's own test converts, stage 2a now runs `set_lx_buffer_type` through
+//! `alloc_all_mem`, `fill_transfer_zero_padding_info`, `fill_transfer_multicast_info`,
+//! `fill_allocation_start_addr_and_offset` and entry 333's `offset_sizes`/`offset_nodes`/`offset_facts`
+//! — 4 -> 23 nodes, **zero** carrier refusals — and stops inside entry 333's `fillDataInfo`
+//! (`deeptools`' `schedule/l3/dl_ops.rs:17872`) at `inputs.allocs.get(&alloc)?`: the `v1::AllocArena`
+//! that `deeptools`' `schedule/stages.rs` hands `run` EMPTY, whose own comment says *"the only reader
+//! left is entry 333's constant-allocation conflation, which is unreachable while
+//! `Reads::offset_sizes` refuses"*. `offset_sizes` no longer refuses, so that reader IS reached. ⭐ THE
+//! ONE-LINE CONSEQUENCE: entry 333 must read the placed allocation off the ONE
+//! `memOrg_.allocateNode_` cell (`AllocationReads`/`L3OffsetFacts`), exactly as entry 222 now does;
+//! nothing else has to change here.
 //!
 //! ⛔⛔ AND THAT STOP IS WHY STAGE 2B IS NOT **REACHED** ON THE CORPUS, WHICH IS NOT THE SAME FACT AS
 //! STAGE 2B BEING UNCALLED. [`run_stages`] composes 2a then 2b through `stages::run_stages_2a_2b`,
-//! which gates 2b on 2a completing — an abandoned stage 2a leaves the LX allocations MINTED BUT NOT
-//! PLACED and 2b computes offsets FROM those placements, so running it there would compute addresses
-//! from half a placement. So `stage2b:` reports `0 reached` for as long as `completed` is 0.
+//! which gates 2b on 2a completing — an abandoned stage 2a leaves entry 333's operands UNFILLED and 2b
+//! computes offsets FROM them, so running it there would compute addresses from half a fill. So
+//! `stage2b:` reports `0 reached` for as long as `completed` is 0.
 //!
 //! ⛔⛔ NOT VERIFIED, AND HERE IS EXACTLY WHAT A RE-MEASUREMENT IS EXPECTED TO CHANGE. The whole-build
-//! census has NOT been re-run since the arena was removed — the acceptance bake needs a card and
-//! `dbo-opt`, neither of which this worktree has. The node counts above should stand (the stop moved
-//! ONE statement and nothing is minted between them, exactly as when the tracker landed), `stage-stop:`
-//! should stay absent because the new stop returns rather than panics, and where there were ZERO
-//! `stage2a-refusal:` lines there should now be `stage2a-refusal: 24363 x
-//! L3Placement::buffer_capacity_even_sticks: wants DesignSpaceConfig::getBufferCapacityForNode ..`.
-//! That refusal line appearing is the whole observable effect of this change on the corpus; it was
-//! confirmed directly, with the id, on `0_rmsq_o728`.
+//! census has NOT been re-run since the capacity landed — the acceptance bake needs a card and
+//! `dbo-opt`, neither of which this worktree has. The node counts above are now a FLOOR and not the
+//! reading: `sync` and `compute` were ZERO *"because `create_synchronization` runs AFTER the stop"*,
+//! and it no longer does — the two programs measured directly grew a full sync band
+//! (`sync_{send,receive}_{l3lu,lxlu,l3su,lxsu}...`, eight nodes) and a `lx_below_schedule` block, so
+//! `sync` should become non-zero and `nodes` should rise well past 347,939. ⭐ THE TWO DIRECT
+//! MEASUREMENTS, BOTH IN-REPO: this file's own
+//! [`tests::a_real_emitted_matmul_converts_and_stage_2a_grows_its_tree`] on a real emitted matmul wire
+//! SDSC (4 -> 23 nodes, zero refusals, stopping at entry 333's arena), and `deeptools`' own
+//! `schedule/stages.rs` fixture for `0_rmsq_o728` (4 -> 22 nodes — which is
+//! `REFERENCE_STAGE_2A_TREE.len()`, the reference's whole stage-2a tree for that program, node for
+//! node). ⚠️ THE FIXTURE STOPS EARLIER THAN THE WIRE DOES AND THE REASON IS THE FIXTURE: its
+//! `SuperDsc::new(.., BTreeMap::new(), BTreeMap::new())` states an EMPTY `coreIdToWkSlice_`, which
+//! entry 291's `sdsc.core_id_to_wk_slice.get(&core)?` refuses — a map [`superdsc_to_l3_sdsc`] fills
+//! from the wire, which is why the wire program gets past it and the fixture does not.
+//! ⛔ `stage2a-refusal:` should now be ABSENT from the corpus print where the previous account expected
+//! `24363 x L3Placement::buffer_capacity_even_sticks`, and `stage-stop:` should stay absent too — the
+//! new stop returns rather than panics.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -1826,33 +1849,52 @@ mod tests {
         // `backup`/`remove`/`check_and_add` and reaches no `todo!` at all. A `Ran::Stopped` would have
         // failed the `let` above, which is that assertion carried by the type.
         //
-        // ⛔⛔ AND STAGE 2A STILL DOES NOT COMPLETE, BUT THE STOP HAS MOVED AND NOW NAMES ITSELF. It
-        // used to be a bare `None`: entry 222 looked its own freshly minted allocate node up in a
-        // `v1::AllocArena` that no unit of stage 2a ever wrote, because the port had split the
-        // reference's ONE `dsc2::AllocateNode *` into a tree node AND an arena entry and wrote only the
-        // tree. Entry 222 now reads that node through `deeptools`' `AllocationReads` seam — the cell
-        // entry 353's mint fills — and stops ONE STATEMENT LATER, on the CAPACITY: the `L3Placement`
-        // carrier cannot answer `DesignSpaceConfig::getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`,
-        // ~210 unported lines) and refuses, which is what the assertion below reads.
-        //
-        // ⭐ THE REFUSAL IS THE ASSERTION, NOT ITS ABSENCE, AND THAT IS THE CHANGE: `first_refusal`
-        // was `None` here while the stop was a silent map lookup. A carrier that names the vendor unit
-        // it lacks is what makes this frontier a work item rather than a mystery.
-        assert!(
-            effect
-                .first_refusal
-                .is_some_and(|said| said.contains("getBufferCapacityForNode")),
-            "the stop is the capacity carrier's recorded refusal, naming the unported vendor unit: \
-             {:?}",
-            effect.first_refusal
+        // ⭐⭐⭐ THE CAPACITY QUESTION IS ANSWERED AND THE LX PLACEMENTS ARE COMMITTED. `L3Placement::
+        // buffer_capacity_even_sticks` now walks `DesignSpaceConfig::getBufferCapacityForNode`
+        // (`dsc/dsc2.cpp:3977`) through `deeptools`' `l3::capacity::buffer_capacity` on the very
+        // `&DesignSpaceConfig` the reference calls it on, so entry 222's `alloc_all_mem` — *the one
+        // committing call of the whole stage* — RAN and wrote every LX start address and buffer offset
+        // onto `memOrg_.allocateNode_`. `refusals()` is EMPTY: NO carrier of `deeptools`' `stages` was
+        // asked for a fact it could not give, where the whole corpus used to stop on this one.
+        assert_eq!(
+            scheduled.scheduling.state().refusals(),
+            Vec::<&str>::new(),
+            "no stage-2a carrier refuses on this program any more — the capacity carrier was the \
+             last one that did, on every program of the corpus"
         );
-        assert!(!effect.l3, "so stage 2a did not complete");
+        // ⛔⛔ SO THE STOP MOVED, AND WHERE IT MOVED TO IS A DROPPED-EFFECT DEFECT OF THE SAME SHAPE
+        // ENTRY 222 JUST SHED. The frontier is now entry 333's `fillDataInfo`
+        // (`deeptools`' `schedule/l3/dl_ops.rs:17872`, `l3_fill_data_info`), whose
+        // `inputs.allocs.get(&alloc)?` looks the allocation up in the `v1::AllocArena` that
+        // `deeptools`' `schedule/stages.rs` hands `run` EMPTY — the map whose own comment says *"the
+        // only reader left is entry 333's constant-allocation conflation, which is unreachable while
+        // `Reads::offset_sizes` refuses"*. `offset_sizes` no longer refuses, so that reader IS reached,
+        // on `AllocId(1)`, for the src operand of `transfer_lds0_src:hbm_dst:lx`. ⭐ THE FIX IS THE ONE
+        // ALREADY APPLIED TO ENTRY 222: read the allocation off the ONE `memOrg_.allocateNode_` cell
+        // (`AllocationReads` / `L3OffsetFacts`) instead of a second map keyed by identity.
+        //
+        // ⛔ EVERY STEP BEFORE IT RAN, MEASURED BY TRACING `run` STATEMENT BY STATEMENT:
+        // `set_lx_buffer_type`, `create_chunk_loops`, `create_allocation_and_transfer`,
+        // `set_chunk_data_stage_params`, `set_super_chunk_data_stage_params`,
+        // `optimize_hbm_lds_output_in_schedule_tree`, `optimize_hbm_transfers`,
+        // `create_synchronization`, `alloc_all_mem`, `fill_transfer_zero_padding_info`,
+        // `fill_transfer_multicast_info`, `fill_allocation_start_addr_and_offset`, and entry 333's own
+        // `offset_sizes`/`offset_nodes`/`offset_facts`.
+        assert!(
+            !effect.l3,
+            "so stage 2a does not complete YET — see above for where it stops"
+        );
+        assert_eq!(
+            effect.first_refusal, None,
+            "and the stop is a PORTED unit's own `None`, not a carrier refusal — which is what makes \
+             the next work item entry 333's arena rather than a vendor unit to port"
+        );
         // ⛔⛔ SO STAGE 2B IS NOT **REACHED** ON THIS PROGRAM, AND THAT IS STATED AS A CONSEQUENCE
         // RATHER THAN AS THE PORT'S BEHAVIOUR. `run_stages_2a_2b` gates stage 2b on stage 2a
-        // completing, because `run_l3`'s `None` leaves the LX allocations MINTED BUT NOT PLACED and
-        // stage 2b computes offsets FROM those placements — running it over an abandoned tree would
-        // compute addresses from half a placement. When `getBufferCapacityForNode` lands, `l3` becomes
-        // true and stage 2b runs with the list asserted above; nothing else has to change.
+        // completing, because `run_l3`'s `None` leaves entry 333's operands unfilled and stage 2b
+        // computes offsets FROM them — running it over an abandoned tree would compute addresses from
+        // half a fill. When entry 333 reads the placed allocation off `memOrg_`, `l3` becomes true and
+        // stage 2b runs with the list asserted above; nothing else has to change.
         assert_eq!(
             (effect.ddc, scheduled.scheduling.filled()),
             (false, None),

@@ -1174,6 +1174,8 @@ mod tests {
                 padding: PaddingForm::default(),
                 indirect: None,
                 related_indirect: None,
+                ignore_symbolic_volume_limits: false,
+                back_gap_dims: std::collections::BTreeSet::new(),
             };
             tree.add(
                 NodeName("allocate_lds0_lx".to_owned()),
