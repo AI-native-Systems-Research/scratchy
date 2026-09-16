@@ -2082,9 +2082,39 @@ mod live_tree_tests {
         use crate::schedule::ddl::conversion::DdlTemplateSet;
         use crate::schedule::ddl::templates::DdlTemplates;
 
+        /// `dim_association_` AS `matchDdl2Dsc` LEAVES IT — the six `ddl.dimension` results
+        /// `broadcast_ops.ddl`'s loops name, each bound to a dim. That map is filled by the MATCH
+        /// (`ddl_conversion.cpp:2110`), which these walks do not run, so seeding it is how the loop's
+        /// own refusal is told apart from the datastage one.
+        fn seed_dim_association(interface: &mut DdlInterface) {
+            for (at, dim) in [
+                PrimaryDim::Mb,
+                PrimaryDim::Y,
+                PrimaryDim::X,
+                PrimaryDim::In,
+                PrimaryDim::Out,
+                PrimaryDim::I,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let prop = interface
+                    .dim_association
+                    .entry(NameId(u16::try_from(at).expect("six dims")))
+                    .or_default();
+                prop.dim = Some(dim);
+            }
+        }
+
         /// One run of the vendored `broadcast_ops.ddl` dataflow over a fresh tree, with the two ids
         /// as given — the node count the LIVE tree ends with, and whether the walk refused.
-        fn walk(ids: Option<(crate::schedule::ddc::metadata::DatastageId, crate::schedule::ddc::metadata::DatastageId)>) -> (usize, bool) {
+        fn walk(
+            ids: Option<(
+                crate::schedule::ddc::metadata::DatastageId,
+                crate::schedule::ddc::metadata::DatastageId,
+            )>,
+            dims: bool,
+        ) -> (usize, bool) {
             let sdsc = SuperDsc::new(
                 DscList::new(a_bare_dsc(), Vec::new()),
                 BTreeMap::new(),
@@ -2113,6 +2143,9 @@ mod live_tree_tests {
                 conversion.core_datastage = Some(core);
                 conversion.chunk_datastage = Some(chunk);
             }
+            if dims {
+                seed_dim_association(&mut interface);
+            }
             let said = parse_ddl2_dsc(
                 stated.program,
                 &mut conversion,
@@ -2127,7 +2160,7 @@ mod live_tree_tests {
 
         // ⛔ THE STATE AS IT SHIPS: both ids [`None`], so the first `ddl.get_external_datastage` of
         // the dataflow refuses and the tree keeps only `root_level_operations`.
-        let (unset_nodes, unset_refused) = walk(None);
+        let (unset_nodes, unset_refused) = walk(None, true);
         assert!(
             unset_refused,
             "the walk refuses with the ids unset — `op_get_external_datastage` reads \
@@ -2144,10 +2177,22 @@ mod live_tree_tests {
         // before it — two `ddl.get_external_datastage`, two `ddl.datastage` and five `ddl.if` — mints
         // nothing: a resolved `ddl.if` descends one region and creates no `CONDITION`. So both walks
         // above end at 2 nodes and the DIFFERENCE is *which statement they die on*.
-        let (set_nodes, _) = walk(Some((Metadata::CORE_DSTGID, Metadata::CHUNK_DSTGID)));
+        let (set_nodes, set_refused) =
+            walk(Some((Metadata::CORE_DSTGID, Metadata::CHUNK_DSTGID)), true);
         assert_eq!(
-            set_nodes, unset_nodes,
-            "the ops before the `ddl.loop` mint nothing either way — see this assertion's own note"
+            set_nodes, 3,
+            "with the two ids set the RECURSIVE walk reaches and mints the `ddl.loop` — \
+             `root_level_operations` plus one LOOP on top of the seeded root block, against \
+             {unset_nodes} without them"
+        );
+        // ⚠️ IT STILL REFUSES BELOW THAT LOOP, and this test does not claim otherwise — this DSC
+        // states no compute op and pins nothing, so the nested regions have no operand to resolve.
+        // ⛔ AND 3 IS NOT THE REFERENCE'S COUNT FOR ANYTHING: this fixture has no
+        // `g0/debug/sdsc_N/sdsc.json` counterpart. What is pinned is WHICH STATEMENT each walk dies
+        // on, and that the two ids move it from the first one to the tenth.
+        assert!(
+            set_refused,
+            "and it still refuses further down on a DSC this bare — see this assertion's own note"
         );
 
         // ⭐⭐ THE TRAIL, OP BY OP, WITH THE IDS SET — `process_op` per row of region 1.
@@ -2202,27 +2247,7 @@ mod live_tree_tests {
                 conversion.chunk_datastage = Some(Metadata::CHUNK_DSTGID);
             }
             if dims {
-                // `dim_association_` AS `matchDdl2Dsc` LEAVES IT — the six `ddl.dimension` results the
-                // loop names, each bound to a dim. That map is filled by the MATCH
-                // (`ddl_conversion.cpp:2110`), which this walk does not run, so seeding it is how the
-                // loop's own refusal is told apart from the datastage one.
-                for (at, dim) in [
-                    PrimaryDim::Mb,
-                    PrimaryDim::Y,
-                    PrimaryDim::X,
-                    PrimaryDim::In,
-                    PrimaryDim::Out,
-                    PrimaryDim::I,
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let prop = interface
-                        .dim_association
-                        .entry(NameId(u16::try_from(at).expect("six dims")))
-                        .or_default();
-                    prop.dim = Some(dim);
-                }
+                seed_dim_association(&mut interface);
             }
             for (at, held) in region.iter().enumerate() {
                 if crate::schedule::ddl::conversion::process_op(
