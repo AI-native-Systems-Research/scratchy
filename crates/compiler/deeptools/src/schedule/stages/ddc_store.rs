@@ -18,24 +18,34 @@
 //!
 //! # ⛔ WHAT IT DOES NOT, AND THE THREE REASONS
 //!
-//! 1. **THIS TREE HOLDS NO COMPUTE NODES — AND THAT IS A MISSING WRITER, NOT A MISSING ARM.**
+//! 1. **THE COMPUTE ARM IS PRESENT, CONSTRUCTED, READ *AND* WRITTEN — DO NOT REFUSE ON IT AGAIN.**
 //!
-//!    ⛔⛔ A RECORDED CORRECTION. This note used to say *"[`super::tree::Kind`] has `Block`, `Loop`,
-//!    `Transfer`, `Allocate`, `Sync` and `Condition` — and no `Compute`"*, and every stub below cited
-//!    it as *"no Compute arm"*. **[`super::tree::Kind::Compute`] EXISTS** and holds the whole
-//!    [`ComputeNode`] (`stages/tree.rs:96`, beside a `StickMask` arm the same sentence omitted), and
+//!    ⛔⛔ TWO RECORDED CORRECTIONS, THE SECOND OF WHICH THIS NOTE ITSELF WAS. It first said
+//!    *"[`super::tree::Kind`] has `Block`, `Loop`, `Transfer`, `Allocate`, `Sync` and `Condition` —
+//!    and no `Compute`"*, and every stub below cited it as *"no Compute arm"*.
+//!    **[`super::tree::Kind::Compute`] EXISTS** and holds the whole [`ComputeNode`]
+//!    (`stages/tree.rs:96`, beside a `StickMask` arm the same sentence omitted), and
 //!    [`super::tree::TreeData::kind_of`] is `pub`, so a compute node is READABLE from here.
 //!
-//!    What is true is that NOTHING CONSTRUCTS ONE: `Kind::Compute(..)` appears at no callsite in the
-//!    crate, because stage 2a mints none (the 24,363-program census reads `compute: 0`) and entry
-//!    345's DDL parse is what mints them. So the walks below find none — a READING, not an absence.
+//!    ⛔⛔ IT THEN SAID *"NOTHING CONSTRUCTS ONE: `Kind::Compute(..)` appears at no callsite in the
+//!    crate"*, AND THAT IS FALSE — 21 stubs across the tree cited the stale claim.
+//!    [`super::ddc_sites`]' `conv::ScheduleWrites::add_compute` and `mint_compute`
+//!    (`stages/ddc_sites.rs:1416` and `:1424`) BOTH construct `Kind::Compute` into the live tree for
+//!    the DDL expansion. The corpus count is a separate fact: it reads `compute: 0` because
+//!    `schedule_head_block` hands the conversion a `BlockNode` BY VALUE, so what those two mint is
+//!    dropped — a WRITE-BACK seam (`stages/tree.rs`'s own note), not a missing writer.
 //!
-//!    Each remaining compute stub therefore names its OWN blocker rather than the arm:
+//!    ⭐ SO THE TREE IS BOTH READ AND WRITTEN FROM HERE: [`Dsc2Store::compute_body`] is the one
+//!    downcast every whole-node reader shares, [`Dsc2Store::edit_compute`] the one read-modify-write
+//!    beside [`Dsc2Store::edit_transfer`], and [`Dsc2Store::mint_compute`] the minter — which is
+//!    what [`super::ddc_store2`]'s header calls *"THE ONE MISSING DOOR"*, now open.
+//!
+//!    Each remaining compute stub therefore names its OWN blocker, and none of them is the arm:
 //!    [`tr::ComputeWalk::compute_op`] wants a `ComputeOpType` our [`ComputeNode`] does not project,
-//!    [`v1::ComputeMasks::computes_under_mask`] wants an [`crate::schedule::dsc2::InstrAttribute`]
-//!    field, and the two whole-node getters want one `TreeData` accessor. Three that cited the arm
-//!    and never needed it — `compute_name`, `set_compute_name` and `parent_dim_loop` — are answered,
-//!    because all three read `ScheduleNode`'s BASE fields and not `ComputeNode`'s at all.
+//!    and [`v1::ComputeMasks::computes_under_mask`] wants an
+//!    [`crate::schedule::dsc2::InstrAttribute`] field. Five that cited the arm and never needed it —
+//!    `compute_name`, `set_compute_name`, `parent_dim_loop` and the two whole-node getters — are
+//!    answered; the first three read `ScheduleNode`'s BASE fields and not `ComputeNode`'s at all.
 //! 2. **`l3::dsc` DROPS SEVEN `DesignSpaceConfig` FIELDS** — `dsName_`, `dataFormat_`,
 //!    `wordLength`, `constantInfo_`, `scaledLdsCategory_`'s non-scale arms, `dimToSymbolMapping_`
 //!    and `l0TetheredMode_`. A conversion gap, not a data gap; see [`super::Dsc2Reads`].
@@ -143,6 +153,14 @@ impl<'s, 'l> Dsc2Store<'s, 'l> {
         v1::Placement::cores_used(&self.reads)
     }
 
+    /// ⭐ [`Dsc2State::refuse`], REACHABLE FROM [`super::ddc_store2`] — `state` is this module's
+    /// field, so the other half of one carrier had no way to file a position it could not answer and
+    /// had to choose between a fabricated empty and a stop. Both halves now file into ONE list, which
+    /// is what makes `Dsc2State::refusals` a census of the whole carrier.
+    pub(super) fn refuse<T>(&self, what: &'static str) -> Option<T> {
+        self.state.refuse(what)
+    }
+
     /// `node->nodeType_`.
     pub(super) fn node_kind_of(&self, node: NodeId) -> Option<NodeKind> {
         self.with_tree(|tree| tree.node_kind(node))
@@ -157,6 +175,107 @@ impl<'s, 'l> Dsc2Store<'s, 'l> {
                 tree.set_transfer(node, held);
             }
         });
+    }
+
+    /// ⭐ ONE READ-MODIFY-WRITE OF A COMPUTE BODY — a NO-OP on a node that is not a compute, which
+    /// is the reference's own `dynamic_cast` of one, exactly as [`Self::edit_transfer`] is for a
+    /// non-TRANSFER.
+    ///
+    /// ⭐⭐ THIS IS *"THE ONE MISSING DOOR"* [`super::ddc_store2`]'S HEADER NAMES. `with_tree_mut` is
+    /// private to this module, so every compute WRITE in that file routed through here rather than
+    /// through a second view of `currDsc`.
+    pub(super) fn edit_compute(&self, node: NodeId, edit: impl FnOnce(&mut ComputeNode)) {
+        self.with_tree_mut(|tree| {
+            if let Some(mut held) = tree.compute(node) {
+                edit(&mut held);
+                tree.set_compute(node, held);
+            }
+        });
+    }
+
+    /// `static_cast<dsc2::ComputeNode *>(node)` — THE WHOLE BODY, and ⛔ TOTAL exactly as
+    /// [`tu::ScheduleSurgery::transfer`] is for the transfer half.
+    ///
+    /// ⭐⭐ ONE STOP FOR EVERY WHOLE-NODE COMPUTE READER — [`tr::ComputeNodes::compute`],
+    /// [`tu::ComputeCloning::compute`] and [`super::ddc_store2`]'s `v1::LoopOffsets::compute` all
+    /// come through here, so the three of them cannot state the same downcast three ways.
+    ///
+    /// ⛔ THE STOP IS THE REFERENCE'S OWN UNDEFINED BEHAVIOUR AND NOT A REFUSAL WE ADDED: every
+    /// caller reaches this off a `traverseTreeDFSMutable(.., {COMPUTE})` walk (entry 108's is
+    /// `ddc/ddc_transformation.cpp:1386-1390`) and then `static_cast`s without a check, so a node
+    /// that is not a COMPUTE is a defect in THIS port. There is nothing to answer with either:
+    /// [`ComputeNode`] has no default, and a stand-in body would name an `exUnit_`, a `type_` and an
+    /// operand list nothing declared.
+    pub(super) fn compute_body(&self, node: NodeId) -> ComputeNode {
+        self.with_tree(|tree| match tree.kind_of(node) {
+            Some(Kind::Compute(held)) => held.clone(),
+            _ => panic!(
+                "Dsc2Store::compute_body: {node:?} is not a COMPUTE of this DSC's scheduleTree_ — \
+                 the reference's static_cast there is undefined"
+            ),
+        })
+    }
+
+    /// `new dsc2::ComputeNode(body)` — [`super::tree::TreeData::add`] with NO parent, then the one
+    /// link. ⭐ [`super::ddc_sites`]' `mint_compute` (`stages/ddc_sites.rs:1424`) is this same shape
+    /// for the DDL expansion; `at` is [`None`] where the reference leaves the copy DETACHED.
+    pub(super) fn mint_compute(
+        &self,
+        name: NodeName,
+        held: ComputeNode,
+        at: Option<tu::InsertionPoint>,
+    ) -> NodeId {
+        self.with_tree_mut(|tree| {
+            let minted = tree.add(name, Kind::Compute(held), None);
+            if let Some(at) = at {
+                tree.link(minted, at);
+            }
+            minted
+        })
+    }
+
+    /// `condNode->clone()` — a DETACHED copy carrying BOTH guards and NEITHER region.
+    ///
+    /// ⛔⛔ THE EMPTY REGIONS ARE THE AUTHORITY'S OWN BEHAVIOUR AND NOT A CHOICE.
+    /// `ConditionNode::clone()` is `new ConditionNode(*this)` (`util/utils.h:104-106`), whose
+    /// implicit copy runs `BlockNode`'s, and `BlockNode::next_` is a `VectorOfChildren` whose copy
+    /// constructor is `VectorOfChildren(const VectorOfChildren&) {}` — *"do nothing on purpose …
+    /// when copying, it is up to the caller to manually insert copies of the children"*
+    /// (`dsc/dsc2.h:529-537`). Entry 249 fills both regions with fresh blocks immediately afterwards
+    /// (`ddc/transformation_util.rs:3115-3119`).
+    ///
+    /// ⛔ AND BOTH GUARDS ARE COPIED, NOT ONE. `loopCond_` (`dsc/dsc2.h:690`) and `coreClCond_`
+    /// (`:691-692`) are plain members of one struct, so the implicit copy takes both — which is why
+    /// this cannot be [`Self::new_core_cl_condition`], whose `cores: Some(..)` would make
+    /// [`v1::ConditionSimplification::has_core_cl_cond`] — `core_cl_cond(..).is_some()` — answer
+    /// TRUE for a LOOP-guarded clone. `Some(empty)` is not [`None`].
+    ///
+    /// ⛔ A NO-OP-SHAPED FALLBACK IS UNSPELLABLE HERE because the trait returns a [`NodeId`], so a
+    /// node that is not a CONDITION mints a bare `BLOCK`-shaped condition with neither guard — the
+    /// reference's `static_cast` on the wrong `nodeType_`, recorded as a refusal rather than
+    /// silently carrying a guard it did not read.
+    pub(super) fn clone_condition_node(&self, condition: NodeId) -> NodeId {
+        let held = self.with_tree(|tree| match tree.kind_of(condition) {
+            Some(Kind::Condition(cond)) => Some((
+                tree.name(condition).unwrap_or_default(),
+                super::tree::Cond {
+                    loop_cond: cond.loop_cond.clone(),
+                    cores: cond.cores.clone(),
+                    then_region: Vec::new(),
+                    else_region: Vec::new(),
+                },
+            )),
+            _ => None,
+        });
+        let (name, cond) = held.unwrap_or_else(|| {
+            let _: Option<()> = self.state.refuse(
+                "Dsc2Store::clone_condition_node: the node is not a CONDITION of this DSC's \
+                 scheduleTree_, so condNode->clone()'s loopCond_ and coreClCond_ are UNKNOWN and \
+                 not absent — the clone carries neither guard",
+            );
+            (NodeName::default(), super::tree::Cond::default())
+        });
+        self.with_tree_mut(|tree| tree.add(name, Kind::Condition(cond), None))
     }
 
     /// ⭐ ONE DESTINATION OF A TRANSFER, READ-MODIFY-WRITTEN — [`crate::schedule::dsc2::Dsts`] keeps
@@ -395,14 +514,36 @@ impl v1::CoreletShapes for Dsc2Store<'_, '_> {
 }
 
 impl v1::DataStages for Dsc2Store<'_, '_> {
-    /// `dataStageParam_.at(stage).ss_.coreletSplit_`'s keys — ⭐ THE SHARED MAP; EMPTY where the
-    /// reference's `.at()` finds no such data stage, which is its own arm.
+    /// `dataStageParam_.at(stage).ss_.coreletSplit_`'s keys — ⭐ THE SHARED MAP, with its TWO EMPTIES
+    /// SEPARATED.
+    ///
+    /// ⛔⛔ A RECORDED CORRECTION: THIS DOC SAID *"EMPTY where the reference's `.at()` finds no such
+    /// data stage, which is its own arm"*, AND `.at()` HAS NO SUCH ARM — IT THROWS.
+    /// `initGlobalData` is `if (!(currDsc->dataStageParam_.at(metadata.core_dstgid).ss_
+    /// .coreletSplit_.empty()))` (`ddc/ddcv1.cpp:3673-3681`): the `.empty()` test is on the INNER map,
+    /// and the `.at()` outside it has no `count()` guard anywhere on the path.
+    ///
+    /// ⛔ AND THE TWO EMPTIES DECIDE DIFFERENT THINGS. A data stage that exists and splits nothing is
+    /// the reference's own `coreletSplitDim = PrimaryDimTypesCount`, i.e. UNSET — a true empty. A
+    /// stage the map does not hold is UNKNOWN, and answering it empty makes
+    /// [`v1::init_global_data`](crate::schedule::ddc::v1::init_global_data) reset the split dim to
+    /// [`None`] and entry 137 add NOTHING to `metadata.cl_split_dims`
+    /// (`ddc/v1.rs:1298-1302`, `:5799-5801`) — a corelet split silently unsplit. So the second is
+    /// filed rather than returned.
     fn corelet_split_dims(&self, stage: DatastageId) -> BTreeSet<PrimaryDim> {
-        self.facts().with_stages(|stages| {
+        let held = self.facts().with_stages(|stages| {
             stages
                 .0
                 .get(&stage)
                 .map(|held| held.ss.dims.dims.corelet_split.keys().copied().collect())
+        });
+        held.unwrap_or_else(|| {
+            self.state
+                .refuse(
+                    "DataStages::corelet_split_dims: dataStageParam_ holds no such data stage — \
+                     .at(stage) throws there (ddc/ddcv1.cpp:3675) — so its coreletSplit_ is UNKNOWN \
+                     and not unsplit",
+                )
                 .unwrap_or_default()
         })
     }
@@ -457,18 +598,16 @@ impl tr::ComputeWalk for Dsc2Store<'_, '_> {
 }
 
 impl tr::ComputeNodes for Dsc2Store<'_, '_> {
-    /// ⛔ THE WHOLE `dsc2::ComputeNode` — READABLE, awaiting ONE accessor.
-    /// [`super::tree::Kind::Compute`] holds it and [`super::tree::TreeData::kind_of`] is `pub`, so
-    /// this is `tree.kind_of(node)` matched on that arm. What is missing is the pairing
-    /// [`super::tree::TreeData::transfer`] has: a by-kind reader plus this trait's TOTAL return,
-    /// which for a non-COMPUTE node is the reference's own `static_cast` and therefore a stop. Left
-    /// as one stub rather than a second `panic!` for a node no writer mints.
-    fn compute(&self, _compute: NodeId) -> ComputeNode {
-        todo!(
-            "tr::ComputeNodes::compute: wants the whole dsc2::ComputeNode — Kind::Compute HOLDS it \
-             (stages/tree.rs:96); needs a TreeData::compute reader beside TreeData::transfer and a \
-             stop for the non-COMPUTE node the reference static_casts"
-        )
+    /// THE WHOLE `dsc2::ComputeNode` — ⭐ ANSWERED off [`super::tree::Kind::Compute`], through the
+    /// one stop [`Dsc2Store::compute_body`] is.
+    ///
+    /// ⛔⛔ A RECORDED CORRECTION. This refused saying it *"needs a `TreeData::compute` reader"* and
+    /// that it was *"left as one stub rather than a second `panic!` for a node no writer mints"* —
+    /// BOTH halves are stale. [`super::tree::TreeData::compute`] is that reader, and writers DO mint
+    /// computes: [`super::ddc_sites`]' `add_compute`/`mint_compute` (`stages/ddc_sites.rs:1416`,
+    /// `:1424`) write `Kind::Compute` into the live tree for the DDL expansion.
+    fn compute(&self, compute: NodeId) -> ComputeNode {
+        self.compute_body(compute)
     }
 }
 
@@ -537,10 +676,30 @@ impl tr::ComputeMasking for Dsc2Store<'_, '_> {
     fn corelets(&self) -> Vec<Corelet> {
         v1::Placement::corelets_used(&self.reads)
     }
+    /// `loopNode->dims_` (`dsc/dsc2.h:575`), inner to outer — ⛔⛔ AND ITS EMPTY IS A REFUSAL, NOT AN
+    /// ANSWER.
+    ///
+    /// `dims_` is read off a live `LoopNode*` and [`tu::LoopDims`] is NON-EMPTY BY CONSTRUCTION
+    /// (entry 114's *"Cannot construct loop with no dimensions"* made unspellable), so *"this loop
+    /// bands no dims"* is a state the reference cannot be in. What an empty here actually means is
+    /// that this tree holds no LOOP at that id — and its caller loops
+    /// `for corelet { for dim in loop_dims(..) { set_compute_mask_loop_offset(..) } }`
+    /// (`ddc/transformation.rs:677-687`), so an empty writes NO mask offset on ANY corelet and
+    /// entry 109's whole masking silently does not happen. ⭐ [`tu::ScheduleSurgery::loop_dims`]
+    /// below states the same fact as an `expect`; this one is filed on the state because the trait
+    /// returns a plain [`Vec`].
     fn loop_dims(&self, dim_loop: tr::LoopId) -> Vec<PrimaryDim> {
-        self.with_tree(|tree| {
+        let held = self.with_tree(|tree| {
             tree.loop_node(dim_loop)
                 .map(|held| held.dims.iter().map(|pair| pair.dim).collect())
+        });
+        held.unwrap_or_else(|| {
+            self.state
+                .refuse(
+                    "ComputeMasking::loop_dims: no LOOP of this DSC's scheduleTree_ is at that id, \
+                     so loopNode->dims_ is UNKNOWN and not empty — LoopDims is non-empty by \
+                     construction, so entry 109 would write no mask offset at all",
+                )
                 .unwrap_or_default()
         })
     }
@@ -1054,26 +1213,71 @@ impl tu::DscAllocations for Dsc2Store<'_, '_> {
         )
     }
 
-    /// The nodes in `allocUsers_` — ⭐ ANSWERED off the labelled DS's own `memOrg_`.
+    /// The nodes in `allocUsers_` (`dsc/dsc2.h:1007`) — ⭐ ANSWERED off the labelled DS's own
+    /// `memOrg_`, with ⛔⛔ EVERY UNKNOWN NOW FILED INSTEAD OF RETURNED EMPTY.
+    ///
+    /// ⛔⛔ WHAT AN UNQUESTIONED EMPTY COSTS. `allocUsers_` lives on a live `AllocateNode*`, so *"this
+    /// allocation has no users"* is a real state — but its ONE caller is
+    /// [`tu::AllocationUse::of`], which is `alloc_users(alloc).contains(&user)`
+    /// (`ddc/transformation_util.rs:348`): an empty list therefore reads as *"this node is NOT a
+    /// user"*, which is `removeAllocUser`'s own abort *"Schedule node <n> is not in the user list of
+    /// allocate node <a>"* (`dsc/dsc2.h:1032`). Entry 111 and entry 340 then SKIP the user removal
+    /// they exist to perform. So a true empty and an unanswerable position must not be one value.
+    ///
+    /// ⛔ THE FOURTH ONE IS A REAL PROJECTION GAP, NOT A DEFECT: [`super::tree::Org`] files
+    /// `add_user` under ANY `SenComponent`, but [`crate::schedule::l3::dsc::MemOrg`] exposes only
+    /// `hbm_alloc_users` and `lx_alloc_users` — so an allocation whose home is `L0`, a register file
+    /// or any other storage HAS a user list that cannot be read back. The old `_ =>` arm asked LX for
+    /// it and took LX's [`None`] as *"no users"*.
     fn alloc_users(&self, alloc: AllocId) -> Vec<NodeId> {
         let Some(tree) = self.state.tree(self.dsc) else {
-            return Vec::new();
+            return self
+                .state
+                .refuse(
+                    "DscAllocations::alloc_users: this state holds no scheduleTree_ for the DSC, so \
+                     allocUsers_ is UNKNOWN and not empty",
+                )
+                .unwrap_or_default();
         };
         let Some(node) = tree.with(|held| held.node_of_alloc(alloc)) else {
-            return Vec::new();
+            return self
+                .state
+                .refuse(
+                    "DscAllocations::alloc_users: the AllocId names no ALLOCATE of this DSC's \
+                     scheduleTree_, so its allocUsers_ is UNKNOWN and not empty — AllocationUse::of \
+                     reads that as 'the node is not a user' and skips the removal",
+                )
+                .unwrap_or_default();
         };
         let Some((lds, storage)) = tree.home_of(node) else {
-            return Vec::new();
+            return self
+                .state
+                .refuse(
+                    "DscAllocations::alloc_users: no memOrg_ of this tree names that ALLOCATE node, \
+                     so the users list it carries is UNKNOWN and not empty",
+                )
+                .unwrap_or_default();
         };
-        match storage {
+        // ⭐ ONLY THE TWO STORAGES `MemOrg` PROJECTS A USERS LIST FOR, each `None` being an
+        // organisation that does not name a node there at all.
+        let held = match storage {
             SenComponent::Hbm => tree
                 .org(lds)
                 .and_then(crate::schedule::l3::dsc::MemOrg::hbm_alloc_users),
-            _ => tree
+            SenComponent::Lx => tree
                 .org(lds)
                 .and_then(crate::schedule::l3::dsc::MemOrg::lx_alloc_users),
-        }
-        .unwrap_or_default()
+            _ => None,
+        };
+        held.unwrap_or_else(|| {
+            self.state
+                .refuse(
+                    "DscAllocations::alloc_users: l3::dsc::MemOrg projects a users list only for HBM \
+                     and LX, so allocUsers_ on an allocation homed in any other storage is UNKNOWN \
+                     and not empty — super::tree::Org files them but cannot read them back",
+                )
+                .unwrap_or_default()
+        })
     }
 
     /// `allocNode->component_` — ⭐ ANSWERED off the L3 view the tree holds, through the one closed
@@ -1385,13 +1589,10 @@ impl tu::AllocateCloning for Dsc2Store<'_, '_> {
 }
 
 impl tu::ComputeCloning for Dsc2Store<'_, '_> {
-    /// ⛔ THE SAME ONE ACCESSOR [`tr::ComputeNodes::compute`] names — the arm is present, the by-kind
-    /// reader is not.
-    fn compute(&self, _node: NodeId) -> ComputeNode {
-        todo!(
-            "tu::ComputeCloning::compute: wants the whole dsc2::ComputeNode — Kind::Compute HOLDS \
-             it (stages/tree.rs:96); see tr::ComputeNodes::compute for the reader it needs"
-        )
+    /// The body `node->clone()` copies — ⭐ ANSWERED through the same [`Dsc2Store::compute_body`]
+    /// stop [`tr::ComputeNodes::compute`] reads, so the two cannot downcast one node two ways.
+    fn compute(&self, node: NodeId) -> ComputeNode {
+        self.compute_body(node)
     }
 
     /// `node->clone()` with `body`, placed IMMEDIATELY AFTER `node` — ⭐ ANSWERED, and it needs no

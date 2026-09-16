@@ -356,13 +356,13 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
     /// behaviour there, so the stop names the node exactly as
     /// [`tu::ScheduleSurgery::transfer`](crate::schedule::ddc::transformation_util::ScheduleSurgery::transfer)
     /// does for the transfer half.
+    ///
+    /// ⭐ AND IT IS THE *SAME* STOP — [`Dsc2Store::compute_body`], which
+    /// [`tr::ComputeNodes::compute`] and [`tu::ComputeCloning::compute`] also read. This method used
+    /// to spell its own `panic!` beside theirs; three statements of one `static_cast` are three
+    /// places it can drift.
     fn compute(&self, node: NodeId) -> ComputeNode {
-        self.compute_of(node).unwrap_or_else(|| {
-            panic!(
-                "v1::LoopOffsets::compute: {node:?} is not a COMPUTE of this DSC's scheduleTree_ — \
-                 the reference's static_cast there is undefined"
-            )
-        })
+        self.compute_body(node)
     }
 
     /// `getStickDims(lds)`.
@@ -526,13 +526,26 @@ impl tu::FifoResults for Dsc2Store<'_, '_> {
     /// `inputsLdsAndLoopOffsets_`, so the FACT is present and READABLE
     /// ([`Dsc2Store::compute_of`]).
     ///
-    /// ⛔ WHAT IS MISSING IS THE WRITE DOOR — see this file's header, *"THE ONE MISSING DOOR"*.
-    fn set_compute_input_unit(&mut self, _compute: NodeId, _input: usize, _unit: SenComponent) {
-        todo!(
-            "tu::FifoResults::set_compute_input_unit: wants computeConsumer->inputs_[i] = unit \
-             (dsc/dsc2.h:935) — the fact is on Kind::Compute and readable; what is missing is a \
-             pub(super) compute WRITE door on Dsc2Store (this file's header names it)"
-        )
+    /// ⭐ ANSWERED through [`Dsc2Store::edit_compute`], the door this file's header used to call
+    /// missing.
+    ///
+    /// ⛔ ONLY `inputs_` IS WRITTEN, WHICH IS WHY THE PARAMETER IS THE OPERAND'S `unit` AND NOT ITS
+    /// `storage`: the reference assigns into a `std::vector<SenComponents>` and touches no
+    /// `inputsLdsAndLoopOffsets_` entry here (`ddc/ddc_transformation_util.cpp:893`, `:1005`), so the
+    /// paired [`Operand`]'s other two fields are carried over unchanged.
+    ///
+    /// ⛔ AN OUT-OF-RANGE `input` IS UNREACHABLE FROM THE PORT'S OWN CALLERS AND SO NOT A REFUSAL:
+    /// both of them index by `compute.inputs.iter().enumerate()` on the very node they then write
+    /// (`ddc/transformation_util.rs:1990-1997`, `:3325-3329`), which is the reference's own
+    /// `for (i = 0, e = inputsLdsAndLoopOffsets_.size(); i < e; ++i)`. ⭐ AND THE THROW IT COULD
+    /// OTHERWISE HAVE IS ALREADY UNSPELLABLE: `inputs_` and `inputsLdsAndLoopOffsets_` are two
+    /// independent lengths there and ONE [`Operand`] list here, which is that type's own point.
+    fn set_compute_input_unit(&mut self, compute: NodeId, input: usize, unit: SenComponent) {
+        self.edit_compute(compute, |held| {
+            if let Some(operand) = held.inputs.get_mut(input) {
+                operand.unit = unit;
+            }
+        });
     }
 
     /// `allocNode->addAllocUser(user)` — ⭐ ANSWERED off the labelled DS's own `memOrg_`, which is
@@ -555,22 +568,20 @@ impl tu::SkipRegResults for Dsc2Store<'_, '_> {
         self.edit_transfer(transfer, |held| held.src.data.latch_data_id = Some(id));
     }
 
-    /// ⛔ `inputsLdsAndLoopOffsets_.at(i).latchDataId_ = id` (`dsc/dsc2.h:937`, `:725`) — the FIELD IS
-    /// CARRIED ([`crate::schedule::dsc2::DataInfo::latch_data_id`], on
-    /// [`crate::schedule::dsc2::ComputeNode::inputs`]); only the write door is missing. See this
-    /// file's header, *"THE ONE MISSING DOOR"*.
-    fn set_compute_input_latch_data_id(
-        &mut self,
-        _compute: NodeId,
-        _input: usize,
-        _id: LatchDataId,
-    ) {
-        todo!(
-            "tu::SkipRegResults::set_compute_input_latch_data_id: wants \
-             inputsLdsAndLoopOffsets_.at(i).latchDataId_ = id (dsc/dsc2.h:937, :725) — the field is \
-             on Kind::Compute's own node; what is missing is a pub(super) compute WRITE door on \
-             Dsc2Store"
-        )
+    /// `inputsLdsAndLoopOffsets_.at(i).latchDataId_ = id` (`dsc/dsc2.h:937`, `:725`) — ⭐ ANSWERED
+    /// through [`Dsc2Store::edit_compute`].
+    ///
+    /// ⛔ THE `.at(i)` IS THE SAME INDEX [`tu::FifoResults::set_compute_input_unit`] JUST WROTE, from
+    /// one enumeration of one operand list (`ddc/transformation_util.rs:1997-1999`), and the
+    /// reference writes the two through the same `i` two statements apart
+    /// (`ddc/ddc_transformation_util.cpp:1005-1007`) — so an absent position here is that method's
+    /// unreachable case and not a second one.
+    fn set_compute_input_latch_data_id(&mut self, compute: NodeId, input: usize, id: LatchDataId) {
+        self.edit_compute(compute, |held| {
+            if let Some(operand) = held.inputs.get_mut(input) {
+                operand.data.latch_data_id = Some(id);
+            }
+        });
     }
 
     /// ⛔ `allocNode->removeAllocUser(user)` (`dsc/dsc2.h:1024`) — [`super::tree::Org`] has
@@ -584,34 +595,81 @@ impl tu::SkipRegResults for Dsc2Store<'_, '_> {
         )
     }
 
-    /// ⛔ `computeNode->outputs_.resize(1)` (`dsc/dsc2.h:936`) THEN `at(0) = (unit, data)` alongside
-    /// `outputsLdsAndLoopOffsets_` (`:938`) — both halves are
-    /// [`crate::schedule::dsc2::ComputeNode::outputs`], which zips them. Only the write door is
-    /// missing; see this file's header.
-    fn set_sole_compute_output(&mut self, _compute: NodeId, _unit: SenComponent, _data: DataInfo) {
-        todo!(
-            "tu::SkipRegResults::set_sole_compute_output: wants computeNode->outputs_.resize(1) \
-             (dsc/dsc2.h:936) then at(0) = (unit, data) with outputsLdsAndLoopOffsets_ (:938) — \
-             ComputeNode::outputs zips both; what is missing is a pub(super) compute WRITE door on \
-             Dsc2Store"
-        )
+    /// `computeNode->outputs_.resize(1)` (`dsc/dsc2.h:936`) THEN `at(0) = unit` alongside
+    /// `outputsLdsAndLoopOffsets_.resize(1)` and its own `at(0) = data` (`:938`) — ⭐ ANSWERED
+    /// through [`Dsc2Store::edit_compute`]; both halves are one
+    /// [`crate::schedule::dsc2::ComputeNode::outputs`] entry, which is why the two `resize`s cannot
+    /// leave the vectors different lengths (`ddc/ddc_transformation_util.cpp:1075-1077`, `:1086`).
+    ///
+    /// ⛔ THE OPERAND'S `storage` IS CARRIED OVER, NOT WRITTEN, AND THAT IS NOT A DROPPED EFFECT:
+    /// `outputs_` is a `std::vector<SenComponents>` with NO storage half, so a compute operand's
+    /// `storage` has no `ComputeNode` counterpart to be faithful to — the reference writes the
+    /// TRANSFER destination's `loc_.storage_` into `outputs_`, i.e. into this operand's `unit`, which
+    /// is what [`tu::SkipRegResults`]' own doc means by *"`unit` is an `outputs_` entry"*. A slot
+    /// that did not exist takes `NO_COMPONENT`, the `DataLocation` default (`arch_enums.h:390-391`).
+    fn set_sole_compute_output(&mut self, compute: NodeId, unit: SenComponent, data: DataInfo) {
+        self.edit_compute(compute, |held| {
+            // `resize(1)` — every output past the first is DROPPED, which is the trait's own ⚠️.
+            held.outputs.truncate(1);
+            match held.outputs.first_mut() {
+                Some(operand) => {
+                    operand.unit = unit;
+                    operand.data = data;
+                }
+                None => held.outputs.push(Operand {
+                    unit,
+                    storage: SenComponent::NoComponent,
+                    data,
+                }),
+            }
+        });
     }
 
-    /// ⛔ `computeNode->inputs_.resize(i + 1)` (`dsc/dsc2.h:935`) THEN `at(i) = (unit, data)` with
-    /// `inputsLdsAndLoopOffsets_` (`:937`) — the same zipped pair, and the same missing write door.
+    /// `computeNode->inputs_.resize(i + 1)` (`dsc/dsc2.h:935`) THEN `at(i) = unit` with
+    /// `inputsLdsAndLoopOffsets_.resize(i + 1)` and its `at(i) = data` (`:937`) — ⭐ ANSWERED, the
+    /// same zipped pair (`ddc/ddc_transformation_util.cpp:1083-1088`).
+    ///
+    /// ⛔⛔ THE GAP FILL IS `HBM`, NOT `NO_COMPONENT` — A CORRECTION TO [`tu::SkipRegResults`]' OWN
+    /// DOC, which says *"a gap below it is `NO_COMPONENT` against a default-constructed `DataInfo`"*.
+    /// `std::vector<SenComponents>::resize` VALUE-INITIALISES the elements it appends, and
+    /// `SenComponents : int` opens `NO_COMPONENT = -1, HBM = 0`
+    /// (`sys-arch-spec/arch_enums.h:13-15`) — so a value-initialised entry is `HBM`, and
+    /// `NO_COMPONENT` is the one value `resize` cannot produce. The [`DataInfo`] half of the doc is
+    /// right: `std::vector<DataInfo>::resize` default-constructs, which is [`DataInfo::default`].
+    ///
+    /// ⛔ AND NO GAP IS EVER PRODUCED IN PRACTICE, which is why this is reproduced rather than
+    /// refused: the reference's ONLY callsite passes `computeInputIndex = 0` on a `new
+    /// dsc2::ComputeNode()` whose `inputs_` is empty (`ddc/ddc_transformation.cpp:1833-1841`), so the
+    /// resize only ever grows 0 → 1. The port's caller passes the same `InputIdx(0)`
+    /// (`ddc/transformation.rs:2991`).
     fn resize_compute_inputs_to(
         &mut self,
-        _compute: NodeId,
-        _input: tu::InputIdx,
-        _unit: SenComponent,
-        _data: DataInfo,
+        compute: NodeId,
+        input: tu::InputIdx,
+        unit: SenComponent,
+        data: DataInfo,
     ) {
-        todo!(
-            "tu::SkipRegResults::resize_compute_inputs_to: wants computeNode->inputs_.resize(i + 1) \
-             (dsc/dsc2.h:935) then at(i) = (unit, data) with inputsLdsAndLoopOffsets_ (:937) — \
-             ComputeNode::inputs zips both; what is missing is a pub(super) compute WRITE door on \
-             Dsc2Store"
-        )
+        self.edit_compute(compute, |held| {
+            // ⭐ THE SLOT'S OWN `storage` SURVIVES A RE-WRITE, for the reason
+            // [`Self::set_sole_compute_output`] states: `inputs_` has no storage half to overwrite.
+            let held_storage = held.inputs.get(input.0).map(|operand| operand.storage);
+            // `resize(i + 1)`, both ways: inputs at and past `i` are dropped, a gap below it is
+            // value-initialised.
+            held.inputs.truncate(input.0);
+            held.inputs.resize(
+                input.0,
+                Operand {
+                    unit: SenComponent::Hbm,
+                    storage: SenComponent::NoComponent,
+                    data: DataInfo::default(),
+                },
+            );
+            held.inputs.push(Operand {
+                unit,
+                storage: held_storage.unwrap_or(SenComponent::NoComponent),
+                data,
+            });
+        });
     }
 }
 
@@ -727,7 +785,8 @@ impl tu::TransferMoves for Dsc2Store<'_, '_> {
         self.with_tree(|tree| tree.node_of_alloc(alloc))
     }
 
-    /// ⛔ `condNode->clone()` — a DETACHED copy with its regions still to be added.
+    /// `condNode->clone()` — a DETACHED copy with its regions still to be added. ⭐ ANSWERED through
+    /// [`Dsc2Store::clone_condition_node`], which is the minter this note asked for.
     ///
     /// ⛔⛔ THE OBJECTION WAS WRONG AND THE AUTHORITY SETTLES IT OUTRIGHT. This used to refuse saying
     /// *"cloning one means deciding what the copy's regions name, which is entry 249's decision and
@@ -745,17 +804,13 @@ impl tu::TransferMoves for Dsc2Store<'_, '_> {
     /// so the clone must carry `cores: None` — and `Some(CoreClSet::default())` is NOT the same
     /// state: [`v1::ConditionSimplification::has_core_cl_cond`] is `core_cl_cond(..).is_some()` in the
     /// sibling file, so an empty-but-present set would answer *"this is core/corelet-guarded"* for a
-    /// loop-guarded clone. ⛔ THE FIX IS A `clone_condition_node` BESIDE `new_core_cl_condition` that
-    /// copies the whole [`super::tree::Cond`] with both regions empty.
-    fn clone_condition(&mut self, _condition: NodeId) -> NodeId {
-        todo!(
-            "tu::TransferMoves::clone_condition: the copy's regions are EMPTY, not a decision — \
-             VectorOfChildren's copy ctor is `{{}}`, \"do nothing on purpose … it is up to the caller \
-             to manually insert copies of the children\" (dsc/dsc2.h:529-537). What is missing is a \
-             pub(super) minter that copies the whole tree::Cond with empty regions: \
-             new_core_cl_condition forces `cores: Some(..)`, and Some(empty) makes \
-             has_core_cl_cond answer true for a LOOP-guarded clone"
-        )
+    /// loop-guarded clone. ⛔ THE FIX WAS A `clone_condition_node` BESIDE `new_core_cl_condition`
+    /// that copies the whole [`super::tree::Cond`] with both regions empty, and that is what
+    /// [`Dsc2Store::clone_condition_node`] now is — `cores` COPIED, so a loop-guarded clone keeps
+    /// [`None`] there and [`v1::ConditionSimplification::has_core_cl_cond`] keeps answering `false`
+    /// for it.
+    fn clone_condition(&mut self, condition: NodeId) -> NodeId {
+        self.clone_condition_node(condition)
     }
 
     /// `new dsc2::ConditionNode()` with its `name_` and `coreClCond_`, and no loop condition — ⭐
@@ -849,17 +904,20 @@ impl tr::Splat4bRead for Dsc2Store<'_, '_> {
         })
     }
 
-    /// ⛔ `new dsc2::ComputeNode()` UNPARENTED — ⛔⛔ NOT *"no Compute arm"*: the arm holds the whole
-    /// node and [`super::ddc_sites`]' `conv::ScheduleWrites::mint_compute` ALREADY DOES EXACTLY THIS
-    /// (`TreeData::add` with no parent) for the DDL expansion. Only the door is missing from
-    /// [`Dsc2Store`]; see this file's header.
-    fn mint_compute(&mut self, _node: ComputeNode) -> NodeId {
-        todo!(
-            "tr::Splat4bRead::mint_compute: wants new dsc2::ComputeNode() unparented — Kind::Compute \
-             holds it and ddc_sites' conv::ScheduleWrites::mint_compute already mints one this way; \
-             what is missing is that same door on Dsc2Store, whose with_tree_mut is private to \
-             ddc_store"
-        )
+    /// `new dsc2::ComputeNode()` UNPARENTED — ⭐ ANSWERED through [`Dsc2Store::mint_compute`], the
+    /// same `TreeData::add`-with-no-parent [`super::ddc_sites`]' `conv::ScheduleWrites::mint_compute`
+    /// makes for the DDL expansion (`stages/ddc_sites.rs:1424`).
+    ///
+    /// ⛔ DETACHED IS THE POINT AND NOT AN OMISSION: the reference mints the node, sets its
+    /// `exUnit_`/`name_`/`type_`/`dataFormat_` and only then hands it to
+    /// `insertComputeBetweenTransferAndReg`, which `DT_CHECK(computeNode->getPrev() == nullptr)`
+    /// before splicing it (`ddc/ddc_transformation.cpp:1833-1841`,
+    /// `ddc/ddc_transformation_util.cpp:1035`). That check is
+    /// [`tu::UnplacedNode`](crate::schedule::ddc::transformation_util::UnplacedNode) here, which reads
+    /// `parent(node).is_none()` — so linking it would make the witness unconstructible.
+    fn mint_compute(&mut self, node: ComputeNode) -> NodeId {
+        let name = node.name.clone();
+        Dsc2Store::mint_compute(self, name, node, None)
     }
 
     /// The tree's own next free allocation identity.
@@ -972,15 +1030,28 @@ impl tr::OffsetAdjustment for Dsc2Store<'_, '_> {
         )
     }
 
-    /// ⛔ `node->clone()` placed after `node` — the CLONE is the missing door, not the arm:
-    /// [`tu::NodeCloning`] in the sibling file already answers this shape for a TRANSFER. See this
-    /// file's header, *"THE ONE MISSING DOOR"*.
-    fn clone_compute_after(&mut self, _node: NodeId) -> NodeId {
-        todo!(
-            "tr::OffsetAdjustment::clone_compute_after: wants node->clone() placed after node — \
-             Kind::Compute holds the body to clone; what is missing is a pub(super) compute mint/\
-             insert door on Dsc2Store, beside the transfer one tu::NodeCloning already uses"
-        )
+    /// `static_cast<dsc2::ComputeNode *>(node->clone())` then
+    /// `node->getMutableParent()->addChildNode(newNode, false, node)`
+    /// (`ddc/ddc_transformation.cpp:1362-1364`) — ⭐ ANSWERED as TWO calls that already exist:
+    /// [`tu::ComputeCloning::compute`] reads the body through the one downcast
+    /// [`Dsc2Store::compute_body`] is, and [`tu::ComputeCloning::clone_compute_after`] mints and
+    /// splices it. ⛔ NOTHING IS RE-DERIVED HERE, so this cannot clone a compute differently from the
+    /// way entry 340's own cloner does.
+    ///
+    /// ⛔ A PARENTLESS `node` IS RECORDED: the reference dereferences `getMutableParent()` and this
+    /// tree's `link` no-ops, which would leave the clone out of the tree while the caller goes on to
+    /// set its repetition, record it under the original and bump the allocation's users
+    /// (`ddc/transformation.rs:645-648`).
+    fn clone_compute_after(&mut self, node: NodeId) -> NodeId {
+        if tu::ScheduleSurgery::parent(self, node).is_none() {
+            let _: Option<()> = self.refuse(
+                "OffsetAdjustment::clone_compute_after: the compute has no parent, so \
+                 node->getMutableParent()->addChildNode(clone, false, node) has no block to insert \
+                 into — the clone stays OUT of the tree",
+            );
+        }
+        let body = tu::ComputeCloning::compute(self, node);
+        tu::ComputeCloning::clone_compute_after(self, node, body)
     }
 
     /// ⛔ `repetitionWithOffset_.forOutputs_.at(idx) = reps` (`dsc/dsc2.h:954`) — BOTH halves are
@@ -1136,16 +1207,29 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
         self.add_user_to(alloc, user);
     }
 
-    /// ⛔ `new dsc2::ComputeNode(*assign)` PLACED BEFORE `assign` — ⛔⛔ NOT *"no Compute arm"*: the
-    /// caller HANDS the whole [`crate::schedule::dsc2::ComputeNode`] in, and
-    /// [`tu::InsertionPoint::Before`] is a placement [`super::tree::TreeData::link`] already makes.
-    /// Only the write door is missing; see this file's header.
-    fn insert_compute_before(&mut self, _node: ComputeNode, _before: NodeId) -> NodeId {
-        todo!(
-            "tr::AutoShuffling::insert_compute_before: wants new dsc2::ComputeNode(*assign) placed \
-             before `assign` — the body is handed in and TreeData::link already places Before; what \
-             is missing is a pub(super) compute mint/insert door on Dsc2Store"
-        )
+    /// `new dsc2::ComputeNode(*assign)` PLACED BEFORE `assign` — ⭐ ANSWERED through
+    /// [`Dsc2Store::mint_compute`], because the caller HANDS the whole
+    /// [`crate::schedule::dsc2::ComputeNode`] in and [`tu::InsertionPoint::Before`] is a placement
+    /// [`super::tree::TreeData::link`] already makes.
+    ///
+    /// ⭐ THE PARENT IS THE SIBLING'S, which is what naming the sibling already says: the reference
+    /// spells it `assign_parent->addChildNode(packmerge_node, /*addBefore=*/true, assign)`
+    /// (`ddc/ddc_transformation.cpp:1992`).
+    ///
+    /// ⛔ A `before` WITH NO PARENT IS RECORDED RATHER THAN SILENTLY DROPPED. There
+    /// `assign_parent` is a captured pointer and the insert happens regardless; here
+    /// [`super::tree::TreeData::link`] resolves the parent THROUGH the sibling and no-ops when it has
+    /// none, which would leave the packmerge minted, returned, given alloc users — and in no block.
+    fn insert_compute_before(&mut self, node: ComputeNode, before: NodeId) -> NodeId {
+        if tu::ScheduleSurgery::parent(self, before).is_none() {
+            let _: Option<()> = self.refuse(
+                "AutoShuffling::insert_compute_before: the node to insert before has no parent, so \
+                 assign_parent->addChildNode(node, true, assign) has no block to insert into — the \
+                 minted packmerge stays OUT of the tree",
+            );
+        }
+        let name = node.name.clone();
+        Dsc2Store::mint_compute(self, name, node, Some(tu::InsertionPoint::Before(before)))
     }
 
     /// `node->getMutableParent()->deleteChildNode(currDsc, node)`.
