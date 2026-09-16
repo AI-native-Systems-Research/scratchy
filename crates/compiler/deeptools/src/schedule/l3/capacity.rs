@@ -53,7 +53,7 @@ use crate::schedule::ddc::fold::PadType;
 use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation_util::StageName;
 use crate::schedule::ddc::v1::LdsSticks;
-use crate::schedule::dsc2::{Dsc, LdsIdx, LoopNode, Padding};
+use crate::schedule::dsc2::{AllocateNode, Dsc, LdsIdx, LoopNode, Padding};
 
 use super::dsc::{
     DataStage, DataStages, FilledDims, NamedDims, PadElems, SenComponent, StageDims, StatedVolumes,
@@ -446,7 +446,7 @@ mod tests_e015 {
     }
 
     /// `parametric_loop_<dim>(padded)` — `parametricLdsIdx_: 1`, no `numId_` and no `denId_`.
-    fn parametric(name: &str, dim: PrimaryDim) -> LoopNode {
+    pub(super) fn parametric(name: &str, dim: PrimaryDim) -> LoopNode {
         LoopNode {
             block: BlockNode {
                 name: NodeName(name.to_owned()),
@@ -463,7 +463,7 @@ mod tests_e015 {
     }
 
     /// `loop_ds1_ds<den>_<dim>` — an ordinary loop dividing `dim` by datastage `den`.
-    fn dividing(name: &str, dim: PrimaryDim, den: DatastageId) -> LoopNode {
+    pub(super) fn dividing(name: &str, dim: PrimaryDim, den: DatastageId) -> LoopNode {
         LoopNode {
             block: BlockNode {
                 name: NodeName(name.to_owned()),
@@ -480,14 +480,14 @@ mod tests_e015 {
     }
 
     /// `sdsc_14`'s DSC through the four seams this unit reads it by.
-    struct Sdsc14 {
+    pub(super) struct Sdsc14 {
         stages: DataStages,
     }
 
     impl Sdsc14 {
         /// `dataStageParam_` as the export prints it: `"0"` is `core`, `"1"` is `chunk`, `"2"` is the
         /// stage `loop_ds1_ds2_y` divides by — whose `paddingSizes_` the export voids.
-        fn of() -> Self {
+        pub(super) fn of() -> Self {
             let unpadded = padding_of(&[(OUT, PadSizes::Unpadded), (MB, PadSizes::Unpadded)]);
             let voided = padding_of(&[(OUT, PadSizes::Voided), (MB, PadSizes::Voided)]);
             let core = &[(OUT, 128), (MB, 1), (Y, 1)];
@@ -619,6 +619,172 @@ mod tests_e015 {
                 LdsIdx(1),
                 &Padding::default(),
                 &AncestorLoops::of(vec![&y_loop], None),
+                &dsc,
+            ),
+            None
+        );
+    }
+}
+
+/// Replaces: e016_getSizeDataStageForNode_2arg
+///
+/// [`size_data_stage_for_node`] ASKED WITH THE ALLOCATION ITSELF, which is where the `ldsIdx_` and the
+/// `padding_` come from (`dsc/dsc2.cpp:3611-3614`).
+///
+/// ⛔ THE TWO ARGUMENTS ARE NOT THE SAME NODE, AND THAT IS THE WHOLE CONTENT OF THE FOUR LINES: `node`
+/// says WHERE the sizing happens — the loops above it, plus its own `nodeType_`/`component_`/
+/// `nonUnifiedAllocInHBM_` for the HBM arm (`:3625-3627`) — while `alloc` supplies ONLY the labelled
+/// DS and the padding form. `ddc/ddc_transformation.cpp:1695` hands over a TRANSFER beside a reference
+/// tensor's allocate node, and `dsc/dsc2.cpp:3541` and `:3765` a `nodeForLocation` different again.
+/// Taking the component off `alloc` would size a transfer under three loops as whole HBM.
+///
+/// ⛔ [`None`] FOR AN ALLOCATION WITH NO LABELLED DS IS `DT_ERROR("Cannot get datastage for node
+/// without an allocation for lds")` (`:3620`), which [`AllocateNode::lds`]'s [`Option`] brings forward
+/// into the forwarder — 85 of g0's 1899 allocate nodes are constant allocations stating `ldsIdx_: -1`.
+/// Plus every stop of [`size_data_stage_for_node`].
+#[must_use]
+pub fn size_data_stage_of_alloc_at_node(
+    node: SizedNode,
+    alloc: &AllocateNode,
+    ancestors: &AncestorLoops<'_>,
+    dsc: &(impl SizeDsc + ?Sized),
+) -> Option<DataStage> {
+    size_data_stage_for_node(node, alloc.lds?, &alloc.placement.padding, ancestors, dsc)
+}
+
+#[cfg(test)]
+mod tests_e016 {
+    //! ⭐⭐ THE THREE FORWARDINGS `sdsc_14`'s OWN EXPORT PINS — `/Users/nickm/tmp/bridge1-fixtures/g0/
+    //! debug/sdsc_14/sdsc.json`, DSC `14_t729_fq_afp8_op`, over [`super::tests_e015::Sdsc14`]'s four
+    //! seams and the same three loops that module documents.
+    //!
+    //! * `getSizeDataStageForNode(allocate-Tensor1_hbm, allocate-Tensor1_hbm)` — the
+    //!   `ddc/ddcv1.cpp:1924` and `L3DlOpsScheduler.cpp:4848` spelling, where the two arguments ARE one
+    //!   node: `out` is **2048**, `N_`.
+    //! * `getSizeDataStageForNode(transfer_lds1_src:sfp_dst:lxsu, allocate-Tensor1_hbm)` — the
+    //!   `ddc/ddc_transformation.cpp:1695` spelling, a transfer beside a tensor's allocate node: `out`
+    //!   is **128**, the parametric stride the export's own `loopEleOffsets_` records. ⭐ THIS IS THE
+    //!   DISCRIMINATOR FOR THE TRAP: the alloc handed over is `component_: "hbm"` with
+    //!   `nonUnifiedAllocInHBM_: 0`, so a forwarder reading the component off `alloc` rather than
+    //!   `node` would answer 2048 — and, one loop down, stop outright on the root check.
+    //! * `allocate_const0_pelrf` (`constIdx_: 0`, `ldsIdx_: -1`) — the `dsc/dsc2.cpp:3620` `DT_ERROR`,
+    //!   a stop and not a size.
+    //!
+    //! ⚠️ MEASURED, AND IT SAYS THIS PATH CARRIES NO PADDING TODAY: `padding_` is EMPTY on all 1899
+    //! allocate nodes of all 187 g0 reference exports, so every dim forwards `NOPAD` and e015's second
+    //! padding pass (`dsc/dsc2.cpp:3711-3735`) is skipped for every one of them. `ldsIdx_ == -1` on 85
+    //! of those 1899. Both counts are a 187-program sample of 134 bundles, not a proof.
+
+    use std::collections::BTreeMap;
+
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+    use crate::schedule::ddc::fold::ConstIdx;
+    use crate::schedule::ddc::metadata::DatastageId;
+    use crate::schedule::dsc2::{
+        AllocLayout, AllocPlacement, MaxDimSize, NodeName, NumBuffers, StartAddress,
+    };
+
+    use super::super::dsc::SenComponent;
+    use super::tests_e015::{Sdsc14, dividing, parametric};
+    use super::{
+        AllocateNode, AncestorLoops, LdsIdx, Padding, SizedNode, size_data_stage_of_alloc_at_node,
+    };
+
+    const MB: PrimaryDim = PrimaryDim::Mb;
+    const OUT: PrimaryDim = PrimaryDim::Out;
+    const Y: PrimaryDim = PrimaryDim::Y;
+
+    /// `allocate-Tensor1_hbm` as the export prints it: `ldsIdx_: 1`, `component_: "hbm"`, `padding_:
+    /// {}`, `numBuffers_: 1`, `layoutDimOrder_: ["mb","out","y"]` with `maxDimSizes_: [-1,-1,-1]`.
+    fn tensor1_hbm() -> AllocateNode {
+        AllocateNode {
+            name: NodeName("allocate-Tensor1_hbm".to_owned()),
+            component: SenComponent::Hbm,
+            lds: Some(LdsIdx(1)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new(
+                (MB, MaxDimSize::Unset),
+                vec![(OUT, MaxDimSize::Unset), (Y, MaxDimSize::Unset)],
+            ),
+            start_address: StartAddress::default(),
+            placement: AllocPlacement {
+                num_buffers: NumBuffers::Single,
+                padding: Padding::default(),
+                buffer_offset: BTreeMap::new(),
+                is_start_addr_symbolic: false,
+            },
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        }
+    }
+
+    /// `allocate_const0_pelrf` as the export prints it — `constIdx_: 0` and `ldsIdx_: -1`.
+    ///
+    /// ⚠️ ITS `layoutDimOrder_` IS `[]` IN THE EXPORT AND CANNOT BE SPELLED HERE: [`AllocLayout`] is
+    /// non-empty by construction, discharging a DIFFERENT reference abort —
+    /// `gapStickSpread_[layoutDimOrder_.at(0)]` (`ddc/ddcv1.cpp:1704`). e016 reads no layout at all, so
+    /// the dims this fixture borrows from `allocate-Tensor1_hbm` are unread by the call under test, as
+    /// are the `startAddressCoreCorelet_` and `allocUsers_` it borrows with them.
+    fn const0_pelrf() -> AllocateNode {
+        AllocateNode {
+            name: NodeName("allocate_const0_pelrf".to_owned()),
+            component: SenComponent::Pelrf,
+            lds: None,
+            const_idx: Some(ConstIdx(0)),
+            ..tensor1_hbm()
+        }
+    }
+
+    /// e016 — the allocation's own `ldsIdx_`/`padding_` reaching the sizing, and the node still
+    /// deciding which arm sizes it.
+    #[test]
+    fn the_alloc_states_the_lds_and_the_node_states_the_arm() {
+        let dsc = Sdsc14::of();
+        let head = Some(DatastageId(0));
+        let alloc = tensor1_hbm();
+
+        // `getSizeDataStageForNode(allocNode, allocNode)` on an HBM allocation hanging off the tree
+        // head: `N_`, and neither the core stage's 128 nor datastage 2's 64.
+        let whole = size_data_stage_of_alloc_at_node(
+            SizedNode::Allocate {
+                component: SenComponent::Hbm,
+                non_unified_in_hbm: false,
+            },
+            &alloc,
+            &AncestorLoops::of(Vec::new(), head),
+            &dsc,
+        )
+        .expect("`allocate-Tensor1_hbm`, whose `ldsIdx_` is 1 and not -1");
+        assert_eq!(whole.ss.dims.dims().extent(OUT), Some(Extent(2048)));
+        assert_eq!(whole.el.dims.dims().extent(OUT), Some(Extent(2048)));
+
+        // `getSizeDataStageForNode(transferNode, refTensorAllocNode)`: the SAME hbm allocate node,
+        // three loops down, sizing a TRANSFER. The HBM arm keys off the node, so `out` is the
+        // parametric stride 128 — a component read off `alloc` would say 2048 here.
+        let out_loop = parametric("parametric_loop_out(padded)__2", OUT);
+        let mb_loop = parametric("parametric_loop_mb(padded)", MB);
+        let y_loop = dividing("loop_ds1_ds2_y", Y, DatastageId(2));
+        let sized = size_data_stage_of_alloc_at_node(
+            SizedNode::Other,
+            &alloc,
+            &AncestorLoops::of(vec![&out_loop, &mb_loop, &y_loop], head),
+            &dsc,
+        )
+        .expect("`transfer_lds1_src:sfp_dst:lxsu`, sized by the loops above it");
+        assert_eq!(sized.ss.dims.dims().extent(OUT), Some(Extent(128)));
+        assert_eq!(sized.ss.dims.dims().extent(Y), Some(Extent(1)));
+
+        // `DT_ERROR("Cannot get datastage for node without an allocation for lds")` (`:3620`) — the
+        // constant allocation, at the very same position the 2048 came from.
+        assert_eq!(
+            size_data_stage_of_alloc_at_node(
+                SizedNode::Allocate {
+                    component: SenComponent::Pelrf,
+                    non_unified_in_hbm: false,
+                },
+                &const0_pelrf(),
+                &AncestorLoops::of(Vec::new(), head),
                 &dsc,
             ),
             None
