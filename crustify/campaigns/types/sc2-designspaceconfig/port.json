@@ -1,0 +1,172 @@
+{
+ "schema_version": 3,
+ "oracle_config": {
+  "path": "crustify/campaigns/types/sc2-designspaceconfig/wavefront-config.json",
+  "sha256": "95ab9df45c55c8f91b11aa04ece8bd65d984f057e6876eb9cea5c019a1c132fd"
+ },
+ "api_headers_only": false,
+ "budgets": {
+  "max_syms": 8,
+  "max_loc": 320,
+  "max_types": 5,
+  "min_fields": 20
+ },
+ "summary": {
+  "unit_count": 2,
+  "layer_count": 2,
+  "batch_count": 2,
+  "file_count": 2
+ },
+ "waves": [
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/ddc_metadata.h",
+     "items": [
+      {
+       "name": "e017_Metadata",
+       "defined_in": "crustify-types/cpp/ddc_metadata.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 0,
+       "loc": 209,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "TransferNodesInterSliceTranspose_",
+        "accessPatternPerDim_",
+        "allocate_",
+        "allowEpilogue_",
+        "cannotBeSymbolic_",
+        "clSplitDims_",
+        "constraints_",
+        "consumers_",
+        "dataConnects_",
+        "datastages_",
+        "datatransfers_",
+        "dimToCoreChunkLoops_",
+        "discardAboveLxSchedule_",
+        "externalNodes_",
+        "externalTransfers_",
+        "implicitSyncs_",
+        "inOutRegAllocs_",
+        "internalRegAlloc_",
+        "internalRegsWithUnroll_",
+        "internalRegs_",
+        "ldsIdx_",
+        "loopDimKind_",
+        "max_",
+        "min_",
+        "mustBeMultiple_",
+        "name_",
+        "nearestNumeratorIdx_",
+        "newAllocations_",
+        "nodeCloningMap_",
+        "opFuncBackup_",
+        "opaqueOps_",
+        "peSfpSplitDims_",
+        "prefilledExternalTransferToDataConnectToFill_",
+        "producers_",
+        "relevantDimsAndNumerator_",
+        "replicated_",
+        "shadowAllocations_",
+        "strategyMinimize_",
+        "transfer_",
+        "transformationConfig_",
+        "values_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/designSpaceConfig.h",
+     "items": [
+      {
+       "name": "e018_DesignSpaceConfig",
+       "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+       "kind": "type",
+       "source_kind": "class",
+       "layer": 5,
+       "loc": 650,
+       "deps": {
+        "types": [
+         "e001_PaddingFormType",
+         "e006_DataStructDims",
+         "e016_ScheduleTree"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "B_",
+        "ChipD_",
+        "ChipletD_",
+        "CoreD_",
+        "CoreletD_",
+        "N_",
+        "P_",
+        "Pel_",
+        "T_",
+        "Tel_",
+        "auxLoopOrder_",
+        "c_",
+        "computeOp_",
+        "constantInfo_",
+        "coordinateMasking_",
+        "coreIdsUsed_",
+        "dataStageParam_",
+        "dimToSymbolMapping_",
+        "dscN_",
+        "gtrIdsUsed_",
+        "i_",
+        "ij_",
+        "j_",
+        "l0TetheredMode_",
+        "labeledDs_",
+        "loopOrder_",
+        "loopProperties_",
+        "maskingConstId_",
+        "mb_",
+        "name_",
+        "numCoreletsUsed_",
+        "numCoresUsed_",
+        "out_",
+        "pcfg_",
+        "pdsRelation_",
+        "primaryDsInfo_",
+        "ptr_",
+        "r_",
+        "rc_",
+        "sc_",
+        "scheduleTree_",
+        "size_",
+        "stickDimOrder_",
+        "target_",
+        "unpadN_",
+        "x_",
+        "y_",
+        "zi_",
+        "zj_"
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

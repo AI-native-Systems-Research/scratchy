@@ -1,0 +1,537 @@
+{
+ "schema_version": 3,
+ "oracle_config": {
+  "path": "crustify/campaigns/types/sc1-node-hierarchy/wavefront-config.json",
+  "sha256": "554fc0810f15171ebc473c1c8241bd389baa0cbbf124036407f9269d6877cf99"
+ },
+ "api_headers_only": false,
+ "budgets": {
+  "max_syms": 8,
+  "max_loc": 320,
+  "max_types": 5,
+  "min_fields": 20
+ },
+ "summary": {
+  "unit_count": 16,
+  "layer_count": 5,
+  "batch_count": 9,
+  "file_count": 3
+ },
+ "waves": [
+  {
+   "unit_count": 7,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/dims.h",
+     "items": [
+      {
+       "name": "e001_PaddingFormType",
+       "defined_in": "crustify-types/cpp/dims.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 0,
+       "loc": 27,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "padding_"
+       ]
+      },
+      {
+       "name": "e002_DimPaddingSizes",
+       "defined_in": "crustify-types/cpp/dims.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 0,
+       "loc": 13,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "dilation_",
+        "padBack_",
+        "padFront_",
+        "stride_",
+        "unneededPadBack_",
+        "unneededPadFront_",
+        "unneededPad_",
+        "windowDim_"
+       ]
+      },
+      {
+       "name": "e003_SymbolicDimInfo",
+       "defined_in": "crustify-types/cpp/dims.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 0,
+       "loc": 8,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "granularity_",
+        "maxSize_"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/ddc_metadata.h",
+     "items": [
+      {
+       "name": "e004_FailedAlloc",
+       "defined_in": "crustify-types/cpp/ddc_metadata.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 0,
+       "loc": 6,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/dsc2.h",
+     "items": [
+      {
+       "name": "e005_CoordinateType",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "class",
+       "layer": 0,
+       "loc": 365,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "coordinates_",
+        "coreIdToWkSlice_",
+        "foldConstructed_",
+        "numOfElemArrFolds_",
+        "numOfSpatialFolds_",
+        "numOfTemporalFolds_",
+        "padding_"
+       ]
+      },
+      {
+       "name": "e007_DataInfo",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 0,
+       "loc": 33,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "bufferAddrOffset_",
+        "bufferSwitchPosition_",
+        "constEleOffsets_",
+        "constantId_",
+        "dataConnect_",
+        "isStartAddrSymbolic_",
+        "latchDataId_",
+        "loopEleOffsets_",
+        "myLdsIdx_",
+        "startAddr_"
+       ]
+      },
+      {
+       "name": "e008_TransferPadInfo",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "class",
+       "layer": 0,
+       "loc": 58,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "transferPadBackSize_",
+        "transferPadFrontSize_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 2,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/dims.h",
+     "items": [
+      {
+       "name": "e006_DataStructDims",
+       "defined_in": "crustify-types/cpp/dims.h",
+       "kind": "type",
+       "source_kind": "class",
+       "layer": 1,
+       "loc": 146,
+       "deps": {
+        "types": [
+         "e001_PaddingFormType",
+         "e002_DimPaddingSizes",
+         "e003_SymbolicDimInfo"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "c_",
+        "coreletSplit_",
+        "i_",
+        "ij_",
+        "in_",
+        "j_",
+        "ki_",
+        "kij_",
+        "kj_",
+        "maxSymbolicVolume_",
+        "mb_",
+        "name_",
+        "out_",
+        "paddingSizes_",
+        "peSfpSplit_",
+        "r_",
+        "rc_",
+        "rowSplit_",
+        "si_",
+        "sij_",
+        "sj_",
+        "symbolicDimInfo_",
+        "x1_",
+        "x_",
+        "y_",
+        "zi_",
+        "zij_",
+        "zj_"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/dsc2.h",
+     "items": [
+      {
+       "name": "e009_ScheduleNode",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "class",
+       "layer": 1,
+       "loc": 81,
+       "deps": {
+        "types": [
+         "e005_CoordinateType",
+         "e007_DataInfo"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "compositeLoops_",
+        "dim_",
+        "elemOffset_",
+        "loop_",
+        "name_",
+        "nodeType_",
+        "outerLoops_",
+        "prev_",
+        "relevantComps_",
+        "sizeIdx_",
+        "size_",
+        "sizesNoGaps_",
+        "sizesWithGaps_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 4,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/dsc2.h",
+     "items": [
+      {
+       "name": "e010_BlockNode",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "class",
+       "layer": 2,
+       "loc": 36,
+       "deps": {
+        "types": [
+         "e009_ScheduleNode"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "next_"
+       ]
+      },
+      {
+       "name": "e013_SyncNode",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 2,
+       "loc": 9,
+       "deps": {
+        "types": [
+         "e009_ScheduleNode"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "implicitSyncRefTransfer_",
+        "isReceive_",
+        "isSoft_",
+        "otherEndOfTheSignals_",
+        "units_"
+       ]
+      },
+      {
+       "name": "e014_TransferNode",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 2,
+       "loc": 85,
+       "deps": {
+        "types": [
+         "e007_DataInfo",
+         "e008_TransferPadInfo",
+         "e009_ScheduleNode"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "coreIdToGTRInfo_",
+        "coreletViews_",
+        "dstIndirectLdsAndLoopOffsets_",
+        "dstIndirectLoopsAndSizes_",
+        "dstReps_",
+        "dstSizeIdx_",
+        "dstVias_",
+        "lastFusableParentLoopDst_",
+        "lastFusableParentLoopSrc_",
+        "locIndirect_",
+        "paddingInfo_",
+        "repetition_",
+        "replicationFactor_",
+        "rotateNumElements_",
+        "sizeDim_",
+        "srcIndirectLdsAndLoopOffsets_",
+        "srcIndirectLoopsAndSize_",
+        "srcIndirect_",
+        "srcRep_",
+        "srcSizeIdx_",
+        "transferCoordinates_",
+        "transferSize_",
+        "unitTimeTransferChunkSize_",
+        "unitTimeTransferChunkStride_",
+        "unitTimeTransferNumChunks_",
+        "via_"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/dsc2.h",
+     "items": [
+      {
+       "name": "e015_ComputeNode",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 2,
+       "loc": 63,
+       "deps": {
+        "types": [
+         "e007_DataInfo",
+         "e009_ScheduleNode"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "computeMaskLoopOffsets_",
+        "coreletViews_",
+        "dataFormat_",
+        "exUnit_",
+        "forInputs_",
+        "forOutputs_",
+        "indices_",
+        "inputCoordinates_",
+        "inputsLdsAndLoopOffsets_",
+        "inputsLoopsAndSizes_",
+        "inputs_",
+        "instrAttribute_",
+        "isOpaqueOp_",
+        "loopEleOffsets_",
+        "mode_",
+        "outputCoordinate_",
+        "outputsLdsAndLoopOffsets_",
+        "outputsLoopsAndSizes_",
+        "outputs_",
+        "repetitionWithOffset_",
+        "repetition_",
+        "type_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 2,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/dsc2.h",
+     "items": [
+      {
+       "name": "e011_LoopNode",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 3,
+       "loc": 57,
+       "deps": {
+        "types": [
+         "e009_ScheduleNode",
+         "e010_BlockNode"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "denId_",
+        "dim_",
+        "dims_",
+        "isParametricLoop_",
+        "kind_",
+        "loopCountSymbolIds_",
+        "numId_",
+        "parametricLdsIdx_"
+       ]
+      },
+      {
+       "name": "e012_ConditionNode",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 3,
+       "loc": 35,
+       "deps": {
+        "types": [
+         "e009_ScheduleNode",
+         "e010_BlockNode"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "coreClCond_",
+        "loopCond_",
+        "next_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/dsc2.h",
+     "items": [
+      {
+       "name": "e016_ScheduleTree",
+       "defined_in": "crustify-types/cpp/dsc2.h",
+       "kind": "type",
+       "source_kind": "class",
+       "layer": 4,
+       "loc": 32,
+       "deps": {
+        "types": [
+         "e009_ScheduleNode",
+         "e011_LoopNode"
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "denId_",
+        "head_"
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "Narrow inventory for sub-campaign `sc1-node-hierarchy`: the SCHEDULE TREE's own types, levels 0-4",
+    "— 16 of the campaign's 18 units, across dsc2.h (the node hierarchy), dims.h (the dim/padding value",
+    "types) and ddc_metadata.h's FailedAlloc.",
+    "",
+    "impl_files is a SUBSET of the campaign-wide config's four headers: designSpaceConfig.h is excluded",
+    "here and appears only in sc2, because DesignSpaceConfig is level 5 and depends on this stage's",
+    "ScheduleTree, DataStructDims and PaddingFormType. The NARROWING is that level range.",
+    "",
+    "READ crustify-types/AGENT-BRIEF.md IN FULL BEFORE EDITING ANYTHING."
+  ],
+  "campaign_objective": "port",
+  "impl_files": [
+    "crustify-types/cpp/dsc2.h",
+    "crustify-types/cpp/dims.h",
+    "crustify-types/cpp/ddc_metadata.h"
+  ],
+  "api_headers": [],
+  "out_of_scope": {
+    "paths": [],
+    "features": []
+  },
+  "_comment_authority": [
+    "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE VENDORED COPY AND NOT A RUST COMMENT:",
+    "  /Users/nickm/git/deeptools-src   revision a0d29abbed",
+    "The vendored headers are byte-identical to it (verified with `cmp` at staging). Cite the AUTHORITY",
+    "path — `dsc/dsc2.h:444`, never `crustify-types/cpp/dsc2.h:444`.",
+    "⛔ /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it."
+  ],
+  "_comment_levels": [
+    "LEVELS ARE DEPENDENCY DEPTH, MEASURED FROM EACH CLASS BODY — not size, and not authored by hand",
+    "without checking. Every edge below was counted by grepping the class's own body in the vendored",
+    "header, and THREE EDGES AN EARLIER DRAFT ASSERTED TURNED OUT TO BE ZERO:",
+    "  DesignSpaceConfig -> Metadata        0 references (so e018 does NOT depend on e017)",
+    "  Metadata -> FailedAlloc              0 references (FailedAlloc is not Metadata's failure record)",
+    "  ScheduleTree -> BlockNode            0 references (it is ScheduleNode x8 and LoopNode x3)",
+    "",
+    "  level 0  e001 PaddingFormType, e002 DimPaddingSizes, e003 SymbolicDimInfo, e004 FailedAlloc,",
+    "           e005 CoordinateType",
+    "  level 1  e006 DataStructDims (-> e001,e002,e003), e007 DataInfo, e008 TransferPadInfo",
+    "  level 2  e009 ScheduleNode (the BASE, and the one unit with NO Rust type at all),",
+    "           e010 BlockNode (-> e009)",
+    "  level 3  e011 LoopNode, e012 ConditionNode (both -> e010), e013 SyncNode, e014 TransferNode,",
+    "           e015 ComputeNode (all -> e009)",
+    "  level 4  e016 ScheduleTree (-> e009,e011)",
+    "",
+    "⛔ e009 IS THE STAGE'S LOAD-BEARING UNIT. Its 13 fields are inherited by all five node types in",
+    "C++; the Rust port flattened the hierarchy and carries NONE of them, and eight have zero mentions",
+    "anywhere in schedule/dsc2.rs. outerLoops_/prev_/loop_ are the tree's parent and sibling links, so",
+    "three carrier stubs are UNANSWERABLE until this unit lands. Do not schedule e011-e016 ahead of it."
+  ]
+}

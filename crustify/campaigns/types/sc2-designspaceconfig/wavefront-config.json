@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Narrow inventory for sub-campaign `sc2-designspaceconfig`: the two WIDEST types in the campaign —",
+    "e017 Metadata (41 declared fields, 18 carried) and e018 DesignSpaceConfig (49 declared, 9 carried,",
+    "the biggest single gap in the crate).",
+    "",
+    "⚠ THEY ARE SCHEDULED TOGETHER BECAUSE THEY ARE WIDE, NOT BECAUSE ONE DEPENDS ON THE OTHER.",
+    "Measured: DesignSpaceConfig's class body references Metadata ZERO times. e017 is level 0 and e018",
+    "is level 5; the stage therefore has TWO distinct layers, and `layer_count` must say 2.",
+    "",
+    "READ crustify-types/AGENT-BRIEF.md IN FULL BEFORE EDITING ANYTHING."
+  ],
+  "campaign_objective": "port",
+  "impl_files": [
+    "crustify-types/cpp/designSpaceConfig.h",
+    "crustify-types/cpp/ddc_metadata.h"
+  ],
+  "api_headers": [],
+  "out_of_scope": {
+    "paths": [],
+    "features": []
+  },
+  "_comment_authority": [
+    "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE VENDORED COPY AND NOT A RUST COMMENT:",
+    "  /Users/nickm/git/deeptools-src   revision a0d29abbed",
+    "Cite `dsc/designSpaceConfig.h:51`, never the vendored path.",
+    "⛔ /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it."
+  ],
+  "_comment_levels": [
+    "  level 0  e017 Metadata — INDEPENDENT of everything else in this campaign (FailedAlloc,",
+    "           DataStructDims and PrimaryDimAndKind: zero references each, measured from its body).",
+    "           Its nested Datastage/Constraints/DataTransfer/Allocation/ExternalTransfer/DataConnect/",
+    "           OpaqueOp structs are part of the unit.",
+    "  level 5  e018 DesignSpaceConfig — measured edges from its own body: DataStructDims x15,",
+    "           DataStage x3, ScheduleTree x1, ConstantInfo x1, PaddingFormType x1. It therefore",
+    "           REQUIRES sc1's e006 and e016 to have landed.",
+    "",
+    "⛔ THE THREE FIELDS THAT MATTER MOST HERE ARE ALREADY 'CARRIED ELSEWHERE', AND THAT IS THE DEFECT:",
+    "scheduleTree_, name_ (designSpaceConfig.h:60) and computeOp_ are handed to stages/ddc_state.rs as",
+    "CONSTRUCTION ARGUMENTS because `l3::dsc does not carry` them — that file's own header says so, and",
+    "that is why run_v1 clones currDsc and drops the writes. Carrying them HERE is the point of e018.",
+    "⚠ Some of the 40 absent fields ARE the documented StageDims::compound narrowing (zi_/zj_/si_/sj_/",
+    "r_/c_ unspellable as PrimaryDim). DEFER each with its citation. Do not count them ported, do not",
+    "drop them, and do not invent a PrimaryDim variant to make one spellable."
+  ]
+}
