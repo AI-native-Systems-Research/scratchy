@@ -1168,10 +1168,30 @@ impl v1::ConditionSimplification for Dsc2Store<'_, '_> {
 
 impl tu::DscAllocations for Dsc2Store<'_, '_> {
     /// `labeledDs_.at(lds).ldsIdx_` — ⛔ THE ENTRY'S OWN self-index, and NOT `referenceLdsIdx_`.
+    ///
+    /// ⛔⛔ `unwrap_or(lds)` IS A FABRICATION AND IS NOW FILED, THOUGH STILL RETURNED. `.at(lds)`
+    /// THROWS for an index the list does not hold, and answering the index it was looked up UNDER
+    /// asserts *"that entry exists and self-indexes"* — the one thing this method exists to deny.
+    /// `ldsIdx_` and the position diverge as soon as anything writes it: `set_recorded` and
+    /// [`tu::add_new_lds`]'s bump are exactly that, which is why its caller reads the layout through
+    /// this answer rather than through the position (`ddc/transformation_util.rs:314`, `:625`). So a
+    /// wrong one selects ANOTHER labelled DS's layout dims.
+    ///
+    /// ⛔ THE INDEX IS STILL RETURNED because [`LdsIdx`] has no absent spelling and the trait's return
+    /// is bare — a `panic!` here would be this port stopping where the reference's own callers reach
+    /// it on proved indices — but `Dsc2State::refusals` now names it instead of the answer looking
+    /// healthy.
     fn own_lds_idx(&self, lds: LdsIdx) -> LdsIdx {
         self.facts()
             .with_lds(lds, crate::schedule::l3::dsc::LabeledDs::recorded)
-            .unwrap_or(lds)
+            .unwrap_or_else(|| {
+                let _: Option<()> = self.state.refuse(
+                    "DscAllocations::own_lds_idx: labeledDs_.at(lds) throws for an index the list \
+                     does not hold, so its ldsIdx_ is UNKNOWN — the position is returned, which \
+                     asserts the entry self-indexes and can select another labelled DS's layout",
+                );
+                lds
+            })
     }
 
     /// `getAllocation(di, storage, allowMissingAlloc=true)` (`dsc/dsc2.cpp:2586-2625`) — ⭐ ANSWERED
