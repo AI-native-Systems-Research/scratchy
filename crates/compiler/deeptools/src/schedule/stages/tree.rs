@@ -22,9 +22,10 @@ use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::transformation_util::{InsertionPoint, LoopDims, LoopNode, PaddingForm};
 use crate::schedule::ddc::v1;
+use crate::schedule::ddl::conversion::LdsSlot;
 use crate::schedule::dsc2::{
-    AllocateNode, ComputeNode, Coordinate, LayoutDims, LdsIdx, LoopCondComposite, NodeName,
-    StickMaskNode, SyncNode, TransferNode,
+    AllocateNode, ComputeNode, Coordinate, Dsts, Hops, LayoutDims, LdsIdx, LoopCondComposite,
+    NodeName, Operand, StickMaskNode, SyncNode, TransferNode,
 };
 use crate::schedule::l3::dl_ops::{
     GtrGroupId, L3AllocateNode, L3Sync, L3WalkNode, LX_BELOW_BLOCK_NODE_NAME,
@@ -58,19 +59,20 @@ use crate::units::{Core, Corelet};
 /// `BLOCK`, `LOOP`, `TRANSFER`, `COMPUTE`, `SYNC`, `CONDITION`, `ALLOCATE`, `STICKMASK`) less
 /// `INVALID`, which is an absence and has no variant.
 ///
-/// ⛔⛔ `Compute` AND `StickMask` EXIST HERE BUT NOTHING CONSTRUCTS THEM YET, AND THAT MUST NOT BE READ
-/// AS "COMPUTES APPEAR". The type gap is closed — [`Self::node_kind`] can now return
-/// `NodeKind::Compute`, which stage 2b already switches on (`schedule/ddc/v1.rs:2416`, `:4911`) — but
-/// the DDL walk that mints computes writes into a **detached copy**: `ddc/v1.rs:6489` is
-/// `DdlConversion::new(store.schedule_head_block())` and `schedule_head_block`
-/// (`stages/ddc_store2.rs`) hands back a `BlockNode` **by value**, while the reference's
-/// `DdlConversion` holds a `DesignSpaceConfig&` (`ddc/ddl/ddl_conversion.h:511`) and `parseDdl2Dsc`
-/// starts from `dsc.scheduleTree_.getHeadMutable()` (`ddl_conversion.cpp:2774`). Until that seam
-/// writes back, `op_compute`/`op_opaque` mint into a value that is dropped and this variant has no
-/// producer.
+/// ⛔⛔ `Compute` AND `StickMask` HAVE PRODUCERS — THE SENTENCE THAT STOOD HERE, *"NOTHING CONSTRUCTS
+/// THEM YET"*, WAS STALE AND IS WITHDRAWN. `Kind::Compute` is constructed at four callsites, all of
+/// them writing the tree this file holds: `add_compute` (`stages/ddc_sites.rs:1440`, parented under a
+/// given block) and `mint_compute` (`:1448`, unparented), reached from the DDL walk's `op_compute`
+/// (`schedule/ddl/conversion.rs:3541`) and `op_opaque` (`:3748`); and `mint_compute`
+/// (`stages/ddc_store.rs:188`) with the clone beside it (`:1485`). `Kind::StickMask` is constructed by
+/// `mint_sched_node` (`stages/ddc_tree.rs:701`). ⛔ `stages/ddc_store.rs:29-31` still carries the
+/// withdrawn claim in its own header.
 ///
-/// ⛔ SO NOTHING HERE FABRICATES A NODE TO MOVE A CENSUS. The corpus compute count stays 0 after this,
-/// and a stand-in node is the fabricated-placement failure this crate ranks worse than a stop.
+/// ⛔ WHAT REMAINS TRUE IS A READING AND NOT AN ABSENCE, AND IT IS THE SCRATCHY SIDE THAT IS MEASURED:
+/// `sync 0, compute 0` over 24,363 programs
+/// (`crates/targets/spyre/src/superdsc_to_l3_sdsc.rs`'s corpus report), so nothing on that corpus
+/// reaches those sites. ⛔ AND NOTHING HERE FABRICATES A NODE TO MOVE A CENSUS: a stand-in node is the
+/// fabricated-placement failure this crate ranks worse than a stop.
 ///
 /// ⛔ AND THE "+2,834 COMPUTES ACROSS 187 PROGRAMS" THIS DOC USED TO CITE IS **UNSOURCED** — it traces
 /// to a comment and a build log, not to a census anyone ran, so it is not repeated as a number. What
@@ -168,6 +170,23 @@ pub struct TreeData {
     node_of_alloc: BTreeMap<AllocId, NodeId>,
     /// `allocNode->allocateCoordinates_`.
     coordinates: BTreeMap<NodeId, Coordinate>,
+    /// ⭐⭐ `relevantComps_` (`dsc/dsc2.h:517`) — the per-node `comp -> core -> corelets` map, held
+    /// BESIDE the entries because it is a field of EVERY `ScheduleNode` and of no one kind.
+    ///
+    /// ⛔⛔ AN ABSENT ENTRY IS `relevantComps_.empty()`, WHICH IS NOT THE SAME FACT AS "THIS
+    /// COMPONENT IS NOT RELEVANT". The reference's map starts empty on every node and stays empty
+    /// until `dsc.setRelevantCompCoreCl()` (`dsc/dsc2.cpp:2647-2712`) runs — the reference's own
+    /// serialisation shows exactly that state, `"relevantComps_" : {}` on every one of the three
+    /// nodes of `ddc/test/int64_arith/add_i32_to_i32/sdsc_alxs_input_Add.json`'s `scheduleTree_` —
+    /// and `isNodeRelevant(comp, -1, -1)` answers FALSE for every component while it is
+    /// (`dsc/dsc2.cpp:1921-1932`). [`Self::relevant_comps`] hands back [`None`] for a node in that
+    /// state and `Some(map)` for one the pass has stated, so a reader can tell the two apart rather
+    /// than reading a constant off either.
+    ///
+    /// ⛔ AND NEITHER CONSTANT IS A SAFE FILLER FOR THE MISSING PASS: `last_fusable_loop`
+    /// (`ddc/v1.rs:3144`) turns `is_relevant`'s answer straight into which loop a transfer fuses
+    /// under, so `true` and `false` each state a fact about every node in the tree.
+    relevant_comps: BTreeMap<NodeId, BTreeMap<SenComponent, v1::CoreClSet>>,
 }
 
 impl TreeData {
@@ -195,22 +214,34 @@ impl TreeData {
         id
     }
 
-    /// `scheduleTree_.getHead()` — the root block, set once when the tree is seeded.
+    /// `scheduleTree_.getHead()->next_.at(0)` — the root block, set once when the tree is seeded.
     pub(super) fn set_head(&mut self, head: NodeId) {
         self.head = Some(head);
     }
 
-    /// `scheduleTree_.getHead()`.
+    /// ⭐⭐ THE FIRST **REAL** NODE OF `scheduleTree_`, WHICH IS NOT `getHead()`. `ScheduleTree` holds
+    /// `LoopNode head_` BY VALUE (`dsc/dsc2.h:622`) as an UNNAMED SENTINEL — `empty()` is
+    /// `head_.next_.empty()` (`:626`), `getHead()` hands back `&head_` (`:636`), and its `name_` is
+    /// `""`, which is why every top-level node serialises with `"prev_" : ""`
+    /// (`dsc/designSpaceConfig.cpp:379-380`: `prevName = node->prev_ ? node->prev_->name_ : ""`).
+    /// This id is the sentinel's first child — the `block "root_level_operations"` that is entry `[0]`
+    /// of a scheduled `scheduleTree_` array.
+    ///
+    /// ⛔ THE SENTINEL HAS NO ENTRY IN THIS TREE AND NEEDS NONE: nothing reads a name, a kind, a
+    /// parent or children off it, and its one field anything asks for is its `denId_`, which is
+    /// [`Self::head_den`] — a field of the tree and not of a node.
     pub const fn head(&self) -> Option<NodeId> {
         self.head
     }
 
-    /// `getHeadMutable()->denId_ = den`.
+    /// `getHeadMutable()->denId_ = den` — the SENTINEL's `denId_`, per [`Self::head`].
     pub(super) fn set_head_den(&mut self, den: DatastageId) {
         self.head_den = Some(den);
     }
 
-    /// `getHead()->denId_`.
+    /// `getHead()->denId_` — the SENTINEL's, which serialises as `scheduleTreeHeadDenId_`
+    /// (`dsc/designSpaceConfig.cpp:368`) and which `ScheduleTree()` initialises to the core datastage
+    /// (`dsc/dsc2.h:628`).
     pub(super) const fn head_den(&self) -> Option<DatastageId> {
         self.head_den
     }
@@ -253,6 +284,45 @@ impl TreeData {
     /// `allocNode->allocateCoordinates_`.
     pub(super) fn coordinate(&self, node: NodeId) -> Option<Coordinate> {
         self.coordinates.get(&node).cloned()
+    }
+
+    /// ⭐⭐ `node->relevantComps_` (`dsc/dsc2.h:517`) — [`None`] where that map is EMPTY, which is
+    /// every node of this tree until `dsc.setRelevantCompCoreCl()` (`dsc/dsc2.cpp:2647-2712`) has
+    /// stated it. See the field for why the two are different answers and not one default.
+    ///
+    /// ⭐ EVERY QUESTION THE REFERENCE ASKS OF THAT MAP IS A READ OF THIS ONE VALUE, AND THAT IS WHY
+    /// none of them is ported here: `isNodeRelevant(comp, clId, coreId)` (`dsc/dsc2.cpp:1916-1932`)
+    /// is `get(comp)` and then `get(coreId)` and then `contains(clId)`; `getRelevantComps(coreId,
+    /// clId)` (`:1947-1975`) is the components whose entry survives that same filter; and
+    /// `getRelevantCoreCl(comp)` (`:1934-1945`) is the union of the entries it keeps. Each has its
+    /// own `DT_ERROR` arms for the argument combinations its caller may not pass, so each belongs to
+    /// the unit that calls it — this is the map they all read.
+    pub fn relevant_comps(&self, node: NodeId) -> Option<BTreeMap<SenComponent, v1::CoreClSet>> {
+        self.relevant_comps.get(&node).cloned()
+    }
+
+    /// `node->relevantComps_[comp] = core_cl` — the ONE write `setRelevantCompCoreCl`
+    /// (`dsc/dsc2.cpp:2647-2712`) performs, per node per component.
+    ///
+    /// ⭐ ONE COMPONENT'S ENTRY, REPLACED, IS THE WHOLE WRITE SURFACE THAT PASS NEEDS. Its head seed
+    /// (`:2655`), its `relevantComps_[NO_COMPONENT] = prev_->relevantComps_.at(NO_COMPONENT)`
+    /// inheritance (`:2659-2661`), the `emplace`/`set_intersect` on the then arm and the
+    /// `set_diff`/`erase` on the else arm (`:2666-2683`), and the `relCoreCls[core].insert(..)` union
+    /// walked up `prev_` (`:2687-2697`) each take ONE component's `core -> corelets` map, change it
+    /// and put it back — which [`Self::relevant_comps`] hands out by value and this puts back.
+    ///
+    /// ⛔ AND IT NEVER MINTS AN EMPTY MAP: a node becomes stated by naming a component, so
+    /// [`Self::relevant_comps`]' [`None`] stays the single spelling of `relevantComps_.empty()`.
+    pub(super) fn set_relevant_comps(
+        &mut self,
+        node: NodeId,
+        comp: SenComponent,
+        core_cl: v1::CoreClSet,
+    ) {
+        self.relevant_comps
+            .entry(node)
+            .or_default()
+            .insert(comp, core_cl);
     }
 
     /// `node->getPrev()` — the PARENT block, absent at the root.
@@ -406,7 +476,22 @@ impl TreeData {
         }
     }
 
-    /// `traverseTreeDFS()` from the head — every node in pre-order, PARENT BEFORE CHILDREN.
+    /// `traverseTreeDFS()` — every node in pre-order, PARENT BEFORE CHILDREN.
+    ///
+    /// ⭐⭐ IT STARTS AT THE SAME NODE THE REFERENCE DOES, AND THE MATCH IS NOT A COINCIDENCE.
+    /// `traverseTreeDFS(nullptr, ..)` seeds its queue from `head_.next_` and so **EXCLUDES** the head
+    /// (`dsc/dsc2.cpp:2231-2234`), while this seeds from [`Self::head`] and INCLUDES it — and the two
+    /// agree because that id is `head_.next_.at(0)` and not `getHead()`: the reference's head is the
+    /// unnamed `LoopNode` sentinel this tree holds no entry for. Its ordering is the same too — a
+    /// `deque` with the children `push_front`ed in reverse (`:2259-2261`) against this stack with the
+    /// children pushed in reverse — so a node's subtree is walked before its next sibling on both.
+    ///
+    /// ⛔ WHAT THIS IS **NOT** IS `traverseTreeDFS`'S FILTERS. That body drops a node whose
+    /// `isNodeRelevant(comp, clId, coreId)` is false and does not descend into it (`:2245-2247`), skips
+    /// an `excludeList` member, keeps only the requested `nodeTypes`, and stops descending a `LOOP`
+    /// past `maxLoopDepth` (`:2255-2256`). This is the unfiltered walk; each projection above states
+    /// which of those it reduces to, and the relevance filter needs
+    /// [`Self::relevant_comps`] — see that field.
     pub fn dfs(&self) -> Vec<NodeId> {
         let mut order = Vec::new();
         let Some(head) = self.head else {
@@ -474,6 +559,99 @@ impl TreeData {
         if let Some(entry) = self.nodes.get_mut(&node) {
             entry.name = transfer.name.clone();
             entry.kind = Kind::Transfer(transfer);
+        }
+    }
+
+    /// The compute node held at that id — `static_cast<dsc2::ComputeNode *>(node)`, [`None`] for
+    /// any other `nodeType_`.
+    pub(super) fn compute(&self, node: NodeId) -> Option<ComputeNode> {
+        match &self.nodes.get(&node)?.kind {
+            Kind::Compute(held) => Some(held.clone()),
+            _ => None,
+        }
+    }
+
+    /// The same node written back — `name_` follows the body exactly as [`Self::set_transfer`]'s
+    /// does, because `name_` is ONE `ScheduleNode` field and not a second copy of it.
+    pub(super) fn set_compute(&mut self, node: NodeId, compute: ComputeNode) {
+        if let Some(entry) = self.nodes.get_mut(&node) {
+            entry.name = compute.name.clone();
+            entry.kind = Kind::Compute(compute);
+        }
+    }
+
+    /// ⭐⭐ ONE OPERAND SLOT'S `myLdsIdx_`, WRITTEN — a COMPUTE's
+    /// `inputsLdsAndLoopOffsets_.at(i).myLdsIdx_` / `outputsLdsAndLoopOffsets_.at(i).myLdsIdx_`
+    /// (`dsc/dsc2.h:722` on `:935-938`), a TRANSFER's `srcLdsAndLoopOffsets_.myLdsIdx_` /
+    /// `dstLdsAndLoopOffsets_.at(i).myLdsIdx_` (`:820`), and an ALLOCATE's `ldsIdx_` (`:979`) — which
+    /// is the write half of [`super::Dsc2Ddl`]'s `slot_lds` (`stages/ddc_sites.rs:1111`).
+    ///
+    /// ⛔⛔ TOTAL OVER [`LdsSlot`], WHICH IS WHAT MAKES A PARTIAL RETAG UNSPELLABLE. Entry 173
+    /// renumbers `labeledDs_` and then retags EVERY slot naming the old last index
+    /// (`schedule/ddl/conversion.rs:445-457`); retagging only the transfer slots would leave every
+    /// compute naming the old index against a renumbered list, which is a silently wrong operand and
+    /// not a missing one. The match below is exhaustive on the enum, so a slot kind added later is an
+    /// E0004 here and not a silent skip.
+    ///
+    /// ⛔ [`LdsSlot::OpaqueCompute`] IS THE ONE ARM THIS TREE DOES NOT HOLD, BY THE TRAIT'S OWN
+    /// CONTRACT AND NOT BY OMISSION: it is `metadata_.opaqueOps_.at(cn).ldsIdx_`, `slot_lds` answers
+    /// [`None`] for it, and its one caller retags it through `metadata.opaque_ops` itself and reaches
+    /// this method only in the `else` arm (`schedule/ddl/conversion.rs:446-456`) — so no write is
+    /// dropped here.
+    ///
+    /// ⛔ A NODE THIS TREE DOES NOT HOLD, A KIND THAT DOES NOT MATCH THE SLOT, AND AN INDEX PAST THE
+    /// END ARE EACH NO WRITE — the reference reaches each slot from a walk of this same tree
+    /// (`lds_slots`, `stages/ddc_sites.rs:1070`), so none of the three is constructible from one.
+    pub(super) fn set_slot_lds(&mut self, slot: LdsSlot, lds: LdsIdx) {
+        match slot {
+            LdsSlot::OpaqueCompute(_) => {}
+            LdsSlot::ComputeInput(node, at) => {
+                if let Some(Entry {
+                    kind: Kind::Compute(held),
+                    ..
+                }) = self.nodes.get_mut(&node)
+                    && let Some(operand) = held.inputs.get_mut(at)
+                {
+                    operand.data.my_lds_idx = Some(lds);
+                }
+            }
+            LdsSlot::ComputeOutput(node, at) => {
+                if let Some(Entry {
+                    kind: Kind::Compute(held),
+                    ..
+                }) = self.nodes.get_mut(&node)
+                    && let Some(operand) = held.outputs.get_mut(at)
+                {
+                    operand.data.my_lds_idx = Some(lds);
+                }
+            }
+            LdsSlot::TransferSrc(node) => {
+                if let Some(Entry {
+                    kind: Kind::Transfer(held),
+                    ..
+                }) = self.nodes.get_mut(&node)
+                {
+                    held.src.data.my_lds_idx = Some(lds);
+                }
+            }
+            LdsSlot::TransferDst(node, at) => {
+                if let Some(Entry {
+                    kind: Kind::Transfer(held),
+                    ..
+                }) = self.nodes.get_mut(&node)
+                {
+                    set_dst_lds(&mut held.dsts, at, lds);
+                }
+            }
+            LdsSlot::Allocate(node) => {
+                if let Some(Entry {
+                    kind: Kind::Allocate(_, held),
+                    ..
+                }) = self.nodes.get_mut(&node)
+                {
+                    held.lds = lds;
+                }
+            }
         }
     }
 
@@ -661,6 +839,10 @@ impl TreeData {
                 self.node_of_alloc.remove(&alloc);
             }
             self.coordinates.remove(&at);
+            // ⛔ `relevantComps_` IS A FIELD OF THE DELETED NODE AND GOES WITH IT — the reference's
+            // `deleteChildNode` destroys the `unique_ptr` and the map inside it, so a later node
+            // reissued at this id must not inherit a dead node's relevance.
+            self.relevant_comps.remove(&at);
             doomed.extend(entry.children);
         }
     }
@@ -704,8 +886,24 @@ struct OrgData {
     minted: BTreeMap<SenComponent, L3AllocateNode>,
     /// The ddc view of the same node.
     placed: BTreeMap<SenComponent, AllocateNode>,
-    /// `memOrg_[storage].isZeroPadded != NOZEROPAD`.
-    zero_padded: BTreeSet<SenComponent>,
+    /// `memOrg_[storage].isZeroPadded != ZpType::NOZEROPAD` (`dsc/dscdefn.h:232`, `:310`) — and
+    /// **ABSENT WHERE NOTHING HAS STATED IT**, which is the whole point of the map.
+    ///
+    /// ⛔⛔ IT IS AN INPUT AND THIS BRIDGE HAS NO WRITER FOR IT. Every assignment to `isZeroPadded` in
+    /// the reference is in `dsm/` — `dsm/dsm.cpp:6661`, `:6700`, `:7657`, `dsm/dsmperf.cpp:1143`,
+    /// `dsm/translators/perfDscToSdsc/perfDscToSdsc.cpp:1255-1274` — or in the SDSC parse that reads
+    /// it back (`dsc/designSpaceConfig.cpp:7092`, against the emit at `:6439`). `dcg/` and `ddc/` only
+    /// READ it (`L3DlOpsScheduler.cpp:3854`, `:5324`). So it belongs to the parsed super-DSC,
+    /// [`crate::schedule::l3::dsc::Pinning`] carries `isPadded` and not this, and a `false` filled in
+    /// here would be a fact about every organisation that nothing stated.
+    ///
+    /// ⛔ THIS USED TO BE A `BTreeSet<SenComponent>` WITH NO WRITER ANYWHERE IN THE CRATE, so
+    /// [`MemOrg::lx_zero_padded`] answered `Some(false)` for every organisation the stages build while
+    /// `schedule/l3/dl_ops.rs:9301` and `:13597` branched on it — a fabricated value reaching live
+    /// code. A [`bool`] per component makes "stated NOZEROPAD" and "nobody said" different answers;
+    /// [`super::state::DscState::seeded`] states the ones the reference's own check pins and leaves the
+    /// rest unstated.
+    zero_padded: BTreeMap<SenComponent, bool>,
 }
 
 impl Org {
@@ -743,7 +941,16 @@ impl Org {
             .map(|(storage, _)| *storage)
     }
 
-    /// `allocNode->addAllocUser(user)`.
+    /// `allocNode->allocUsers_.push_back({user, 1})` — the RAW PUSH its caller performs
+    /// (`super::Dsc2Store`'s `add_alloc_user`, `stages/ddc_store2.rs:1026-1030`), so a repeat user is
+    /// a SECOND entry and not a bumped count.
+    ///
+    /// ⭐ WHICH IS WHY THE COUNT IS MULTIPLICITY HERE. `allocUsers_` is
+    /// `vector<pair<const ScheduleNode*, int>>` (`dsc/dsc2.h:1012`), and this list holds each
+    /// reference as one element: `[{user, 1}, {user, 1}]` there is `[user, user]` here, and
+    /// `addAllocUser`'s `refCount++` on an existing entry (`:1017-1024`) is the same one-more-element.
+    /// Both readers of the field in scope — `getNextView`-free walks over `allocUsers_`
+    /// (`L3DlOpsScheduler.cpp:5343`) and `hasAllocUsers()` — see the same thing either way.
     pub(super) fn add_user(&self, storage: SenComponent, user: NodeId) {
         self.data
             .borrow_mut()
@@ -751,6 +958,39 @@ impl Org {
             .entry(storage)
             .or_default()
             .push(user);
+    }
+
+    /// `allocNode->removeAllocUser(user)` (`dsc/dsc2.h:1022-1034`) — ONE reference dropped, and the
+    /// user gone with its last one.
+    ///
+    /// ⭐ REMOVING ONE OCCURRENCE **IS** THAT DECREMENT under [`Self::add_user`]'s multiplicity
+    /// encoding: the reference finds the FIRST entry naming the node, does `--(it->second)` and
+    /// `erase`s it at zero, which on `[{user, 2}]` leaves `[{user, 1}]` and on
+    /// `[{user, 1}, {user, 1}]` leaves `[{user, 1}]` — one reference fewer in both, which is one
+    /// element fewer here.
+    ///
+    /// ⛔ ITS *"RemoveAllocUser: Schedule node <n> is not in the user list of allocate node <a>"* IS
+    /// AN ABSENT ENTRY, AND THAT IS NO WRITE — the same reading
+    /// [`crate::schedule::ddc::transformation_util::DdcAllocateNode::remove_alloc_user`] already
+    /// states of the same body: a node that was never a user cannot lose a reference.
+    pub(super) fn remove_alloc_user(&self, storage: SenComponent, user: NodeId) {
+        let mut data = self.data.borrow_mut();
+        if let Some(users) = data.users.get_mut(&storage)
+            && let Some(at) = users.iter().position(|held| *held == user)
+        {
+            users.remove(at);
+        }
+    }
+
+    /// `memOrg_[storage].isZeroPadded`, AS THE ONE QUESTION ITS READERS ASK — `!= ZpType::NOZEROPAD`
+    /// (`L3DlOpsScheduler.cpp:3854`, `:5324`). ⛔ The three-way `ZpType` is deliberately not projected:
+    /// `ALLZEROPAD` and `ROWZEROPAD` are told apart only in `dsi/` and `dm/`, neither of which is on
+    /// this bridge, and a variant nothing here can construct would be a filler with no source.
+    pub(super) fn set_zero_padded(&self, storage: SenComponent, zero_padded: bool) {
+        self.data
+            .borrow_mut()
+            .zero_padded
+            .insert(storage, zero_padded);
     }
 
     /// The ddc view of the node at that storage.
@@ -851,8 +1091,18 @@ impl MemOrg for Org {
         ))
     }
 
+    /// ⛔ [`None`] WHERE NOTHING HAS STATED `memOrg_.at(LX).isZeroPadded`, WHICH IS NOT `Some(false)`.
+    /// The trait already gives [`None`] a meaning — the `DT_CHECK_MSG(isPadded, ..)` beside the read
+    /// failing (`L3DlOpsScheduler.cpp:5325`) — and an unstated value lands on the same answer for the
+    /// same reason: neither is a program this bridge can carry on lowering by guessing a flag for.
+    /// See [`OrgData::zero_padded`] for why nothing here can state it, and
+    /// [`super::state::DscState::seeded`] for the ones it can.
     fn lx_zero_padded(&self) -> Option<bool> {
-        Some(self.data.borrow().zero_padded.contains(&SenComponent::Lx))
+        self.data
+            .borrow()
+            .zero_padded
+            .get(&SenComponent::Lx)
+            .copied()
     }
 
     fn hbm_page_sizes(&self) -> Option<BTreeMap<PrimaryDim, Extent>> {
@@ -894,6 +1144,26 @@ impl MemOrg for Org {
     }
 }
 
+/// `dstLdsAndLoopOffsets_.at(index).myLdsIdx_ = lds` — one destination of one transfer, in place, and
+/// NO WRITE for an index past the end (which is [`Dsts::get`]'s own *"absent past the end"*).
+///
+/// ⭐ THROUGH A REBUILD BECAUSE THAT IS THIS CRATE'S ONE SPELLING FOR IT. [`Dsts`] holds its first
+/// destination and the rest privately and exposes `first_mut()` and no `get_mut`, so
+/// `clone_transfer_for_pe_sfp_work_split` (`schedule/ddc/transformation_util.rs:1668-1677`) already
+/// writes every destination of a transfer by collecting `routes()` and `iter()`, changing the
+/// operands and putting a fresh [`Dsts`] back — the same three lines, for one destination.
+fn set_dst_lds(dsts: &mut Dsts, index: usize, lds: LdsIdx) {
+    let hops: Vec<Hops> = dsts.routes().map(|(_, hops)| Hops(hops.to_vec())).collect();
+    let mut operands: Vec<Operand> = dsts.iter().copied().collect();
+    let Some(operand) = operands.get_mut(index) else {
+        return;
+    };
+    operand.data.my_lds_idx = Some(lds);
+    if let Some((first, rest)) = operands.split_first() {
+        *dsts = Dsts::new(*first, rest.to_vec()).with_hops(hops);
+    }
+}
+
 /// A fresh L3 allocate node over the layout dims a DSC states for that labelled DS, with every
 /// `maxDimSizes_` entry UNBOUNDED — the reference's `resize(n, -1)` (`dsc/dsc2.h:982`).
 pub(super) fn seed_allocate_node(
@@ -916,5 +1186,258 @@ pub(super) fn seed_allocate_node(
         padding: PaddingForm::default(),
         indirect: None,
         related_indirect: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schedule::ddl::ops::DdlComputeType;
+    use crate::schedule::dsc2::{
+        DataInfo, InstrAttribute, NumChunks, ReplicationFactor, TransferPadding,
+    };
+    use crate::units::NumFolds;
+
+    fn core_zero() -> Core {
+        Core::checked(0).expect("core 0")
+    }
+
+    fn operand(lds: Option<u32>) -> Operand {
+        Operand {
+            unit: SenComponent::Lx,
+            storage: SenComponent::NoComponent,
+            data: DataInfo {
+                my_lds_idx: lds.map(LdsIdx),
+                ..DataInfo::default()
+            },
+        }
+    }
+
+    fn seeded_root() -> (TreeData, NodeId) {
+        let mut tree = TreeData::default();
+        let root = tree.add(
+            NodeName("root_level_operations".to_owned()),
+            Kind::Block,
+            None,
+        );
+        tree.set_head(root);
+        (tree, root)
+    }
+
+    /// ⭐ THE READ THAT TELLS "NOBODY STATED IT" FROM "STATED, AND THIS COMPONENT IS NOT IN IT".
+    ///
+    /// The first is the reference's `relevantComps_.empty()` — the state every node of
+    /// `ddc/test/int64_arith/add_i32_to_i32/sdsc_alxs_input_Add.json`'s `scheduleTree_` serialises as
+    /// `"relevantComps_" : {}` — and the second is what `setRelevantCompCoreCl`'s head seed leaves
+    /// (`dsc/dsc2.cpp:2653-2656`: `relevantComps_[NO_COMPONENT] = {core -> {0}}` at
+    /// `numCoreletsUsed_DSC2_ == 1`). `isNodeRelevant(comp, -1, -1)` reads FALSE on both
+    /// (`dsc/dsc2.cpp:1921-1926`), which is exactly why they must not be one answer here.
+    #[test]
+    fn an_unstated_relevance_is_not_a_stated_absence() {
+        let (mut tree, root) = seeded_root();
+        assert_eq!(tree.relevant_comps(root), None);
+
+        let seed = v1::CoreClSet(BTreeMap::from([(
+            core_zero(),
+            BTreeSet::from([Corelet::at::<0>()]),
+        )]));
+        tree.set_relevant_comps(root, SenComponent::NoComponent, seed.clone());
+
+        let stated = tree.relevant_comps(root);
+        assert_eq!(
+            stated
+                .as_ref()
+                .and_then(|held| held.get(&SenComponent::NoComponent)),
+            Some(&seed)
+        );
+        // ⭐ `Some(false)` AND NOT `false`: the node IS stated, and the component it was asked about is
+        // not in its map — which is the answer `None` above is not.
+        assert_eq!(
+            stated.map(|held| held.contains_key(&SenComponent::Lx)),
+            Some(false)
+        );
+    }
+
+    /// ⛔ `relevantComps_` DIES WITH ITS NODE — the reference's `deleteChildNode` destroys the
+    /// `unique_ptr` and the map inside it, so a node reissued at this id must not inherit it.
+    #[test]
+    fn deleting_a_node_drops_its_relevance() {
+        let (mut tree, root) = seeded_root();
+        let child = tree.add(NodeName("b".to_owned()), Kind::Block, Some(root));
+        tree.set_relevant_comps(child, SenComponent::Lx, v1::CoreClSet::default());
+        assert!(tree.relevant_comps(child).is_some());
+
+        tree.delete(child);
+        assert_eq!(tree.relevant_comps(child), None);
+        // The parent's own entry is untouched: only the deleted subtree loses its fields.
+        assert_eq!(tree.relevant_comps(root), None);
+    }
+
+    /// ⭐⭐ EVERY SLOT KIND THIS TREE HOLDS IS RETAGGED BY ONE CALL — the whole point of
+    /// [`TreeData::set_slot_lds`] being total, because entry 173 renumbers `labeledDs_` and a slot it
+    /// misses names the OLD last index against the new list.
+    ///
+    /// ⭐ EACH ONE IS READ BACK THROUGH THE SAME FIELD `slot_lds` READS (`stages/ddc_sites.rs:1111`),
+    /// and the fixture deliberately gives the compute TWO inputs and the transfer TWO destinations so
+    /// that neither `at` is 0 and a first-only write would fail.
+    #[test]
+    fn every_slot_kind_is_retagged() {
+        let (mut tree, root) = seeded_root();
+        let old = LdsIdx(7);
+        let new = LdsIdx(9);
+
+        let compute = tree.add(
+            NodeName("c".to_owned()),
+            Kind::Compute(ComputeNode {
+                name: NodeName("c".to_owned()),
+                op: DdlComputeType::Macc,
+                ex_unit: SenComponent::Ptrow0,
+                inputs: vec![operand(None), operand(Some(old.0))],
+                outputs: vec![operand(None), operand(Some(old.0))],
+                num_folds_engaged: NumFolds::ONE,
+                data_format: None,
+                instr_attribute: InstrAttribute::default(),
+            }),
+            Some(root),
+        );
+        let transfer = tree.add(
+            NodeName("t".to_owned()),
+            Kind::Transfer(TransferNode {
+                name: NodeName("t".to_owned()),
+                src: operand(Some(old.0)),
+                dsts: Dsts::new(operand(None), vec![operand(Some(old.0))])
+                    .with_hops(vec![Hops(vec![SenComponent::L0]), Hops::default()]),
+                replication_factor: ReplicationFactor::ONE,
+                unit_time_transfer_chunk_size: Vec::new(),
+                unit_time_transfer_num_chunks: NumChunks::ONE,
+                padding: TransferPadding::default(),
+                src_indirect: None,
+                dst_indirect: None,
+                core_id_to_gtr_info: BTreeMap::new(),
+                transfer_size: BTreeMap::new(),
+            }),
+            Some(root),
+        );
+        let alloc = tree.fresh_alloc();
+        let allocate = tree.add(
+            NodeName("a".to_owned()),
+            Kind::Allocate(
+                alloc,
+                seed_allocate_node(
+                    NodeName("a".to_owned()),
+                    old,
+                    SenComponent::Lx,
+                    &LayoutDims::new(PrimaryDim::Out, Vec::new()),
+                ),
+            ),
+            Some(root),
+        );
+
+        for slot in [
+            LdsSlot::ComputeInput(compute, 1),
+            LdsSlot::ComputeOutput(compute, 1),
+            LdsSlot::TransferSrc(transfer),
+            LdsSlot::TransferDst(transfer, 1),
+            LdsSlot::Allocate(allocate),
+        ] {
+            tree.set_slot_lds(slot, new);
+        }
+
+        // ⭐ EVERY ASSERTION BELOW IS A VALUE LIST AND NOT A GUARDED ARM: a kind that failed to match
+        // reads as an EMPTY list here and fails, rather than skipping the assertions silently.
+        let (inputs, outputs) = match tree.kind_of(compute) {
+            Some(Kind::Compute(held)) => (
+                held.inputs
+                    .iter()
+                    .map(|held| held.data.my_lds_idx)
+                    .collect::<Vec<_>>(),
+                held.outputs
+                    .iter()
+                    .map(|held| held.data.my_lds_idx)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
+        // ⛔ AND THE SLOT THAT NAMED NO LDS IS UNTOUCHED: the retag walk asks `slot_lds == old` first
+        // (`schedule/ddl/conversion.rs:454`), so a write is per slot and not per node.
+        assert_eq!(inputs, vec![None, Some(new)]);
+        assert_eq!(outputs, vec![None, Some(new)]);
+
+        let (src, dsts, hops) = match tree.kind_of(transfer) {
+            Some(Kind::Transfer(held)) => (
+                held.src.data.my_lds_idx,
+                held.dsts
+                    .iter()
+                    .map(|held| held.data.my_lds_idx)
+                    .collect::<Vec<_>>(),
+                (0..held.dsts.len())
+                    .map(|at| held.dsts.hops(at).to_vec())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => (None, Vec::new(), Vec::new()),
+        };
+        assert_eq!(src, Some(new));
+        assert_eq!(dsts, vec![None, Some(new)]);
+        // ⛔ THE REBUILD KEEPS EVERY OTHER FIELD OF THE DESTINATION LIST — `dstVias_.at(i).via_` above
+        // all, which it carries through `routes()`.
+        assert_eq!(hops, vec![vec![SenComponent::L0], Vec::new()]);
+
+        assert_eq!(tree.allocate(allocate).map(|(_, held)| held.lds), Some(new));
+    }
+
+    /// ⭐ `removeAllocUser` IS ONE REFERENCE, NOT THE USER — `--(it->second)` with the `erase` only at
+    /// zero (`dsc/dsc2.h:1022-1034`), against [`Org::add_user`]'s raw `push_back({user, 1})`, whose
+    /// multiplicity IS that count.
+    #[test]
+    fn removing_an_alloc_user_drops_one_reference() {
+        let org = Org::default();
+        let (a, b) = (NodeId(1), NodeId(2));
+        org.set_node(
+            SenComponent::Hbm,
+            NodeId(0),
+            seed_allocate_node(
+                NodeName("a".to_owned()),
+                LdsIdx(0),
+                SenComponent::Hbm,
+                &LayoutDims::new(PrimaryDim::Out, Vec::new()),
+            ),
+        );
+        org.add_user(SenComponent::Hbm, a);
+        org.add_user(SenComponent::Hbm, a);
+        org.add_user(SenComponent::Hbm, b);
+        assert_eq!(MemOrg::hbm_alloc_users(&org), Some(vec![a, a, b]));
+
+        org.remove_alloc_user(SenComponent::Hbm, a);
+        assert_eq!(MemOrg::hbm_alloc_users(&org), Some(vec![a, b]));
+        org.remove_alloc_user(SenComponent::Hbm, a);
+        assert_eq!(MemOrg::hbm_alloc_users(&org), Some(vec![b]));
+
+        // ⛔ *"RemoveAllocUser: Schedule node <n> is not in the user list"* IS NO WRITE.
+        org.remove_alloc_user(SenComponent::Hbm, a);
+        assert_eq!(MemOrg::hbm_alloc_users(&org), Some(vec![b]));
+        // ⛔ AND IT NEVER REACHES ANOTHER STORAGE'S LIST.
+        org.remove_alloc_user(SenComponent::Lx, b);
+        assert_eq!(MemOrg::hbm_alloc_users(&org), Some(vec![b]));
+    }
+
+    /// ⛔⛔ AN ORGANISATION NOBODY STATED `isZeroPadded` FOR ANSWERS [`None`], NOT `Some(false)` —
+    /// the defect this slot used to ship, with `schedule/l3/dl_ops.rs:9301` and `:13597` branching on
+    /// the fabricated `false`.
+    #[test]
+    fn an_unstated_zero_pad_is_not_a_stated_no_zero_pad() {
+        let org = Org::default();
+        assert_eq!(MemOrg::lx_zero_padded(&org), None);
+
+        org.set_zero_padded(SenComponent::Lx, false);
+        assert_eq!(MemOrg::lx_zero_padded(&org), Some(false));
+
+        // `ZpType::ALLZEROPAD`/`ROWZEROPAD` both reach the readers as the one question they ask.
+        org.set_zero_padded(SenComponent::Lx, true);
+        assert_eq!(MemOrg::lx_zero_padded(&org), Some(true));
+
+        // ⛔ AND HBM'S ENTRY IS NOT LX'S: `memOrg_` states one per component.
+        let other = Org::default();
+        other.set_zero_padded(SenComponent::Hbm, true);
+        assert_eq!(MemOrg::lx_zero_padded(&other), None);
     }
 }

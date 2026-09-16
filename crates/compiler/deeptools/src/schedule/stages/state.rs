@@ -35,9 +35,16 @@ use crate::schedule::l3::dsc::{DesignSpaceConfig, DscIdx, NodeParents, ScheduleN
 
 use super::tree::{Kind, Org, TreeData, seed_allocate_node};
 
-/// `scheduleTree_.getHead()->name_` on scratchy's own staged bundle — node `[0]` of every scheduled
-/// program in `/Users/nickm/tmp/bridge1-fixtures/g0/debug/sdsc_*/sdsc.json` is a `block` of this
-/// name with `prev_ = ""`.
+/// `scheduleTree_.getHead()->next_.at(0)->name_` on scratchy's own staged bundle — node `[0]` of every
+/// scheduled program in `/Users/nickm/tmp/bridge1-fixtures/g0/debug/sdsc_*/sdsc.json` is a `block` of
+/// this name with `prev_ = ""`.
+///
+/// ⛔ IT IS NOT `getHead()->name_`, WHICH IS `""` — the doc that said so was wrong about which node
+/// this is. `ScheduleTree` holds `LoopNode head_` by value as an unnamed sentinel (`dsc/dsc2.h:622`)
+/// and `traverseTreeDFS()` seeds from `head_.next_` (`dsc/dsc2.cpp:2231-2234`), so the sentinel never
+/// reaches the serialised array and `"prev_" : ""` on entry `[0]` is *"my parent is the sentinel"* and
+/// not *"I have no parent"* (`dsc/designSpaceConfig.cpp:379-380`). The block this names is the first
+/// REAL node, which is what [`crate::schedule::stages::TreeData::head`] holds.
 const ROOT_BLOCK_NAME: &str = "root_level_operations";
 
 /// ⭐ ONE DSC'S SCHEDULE TREE AND `memOrg_`s — the object [`crate::schedule::l3::dl_ops::DscTrees`]
@@ -339,10 +346,28 @@ fn seed_dsc(dsc: &DesignSpaceConfig) -> DscTree {
                 let node = tree.add(name, Kind::Allocate(alloc, held.clone()), Some(root));
                 (node, held)
             });
-        orgs.push(match seeded {
+        let org = match seeded {
             Some((node, held)) => Org::seeded(SenComponent::Hbm, node, held),
             None => Org::default(),
-        });
+        };
+        // ⭐⭐ `memOrg_.at(LX).isZeroPadded` WHERE THE REFERENCE'S OWN CHECK PINS IT, AND NOWHERE ELSE.
+        // Both readers of that flag guard it with the `isPadded` beside it:
+        // `L3DlOpsScheduler.cpp:5324-5326` reads `isZeroPadded != NOZEROPAD` and then
+        // `DT_CHECK_MSG(memOrg_.at(LX).isPadded, "Expect memOrg_ LX isPadded is true.")`, and
+        // `:3853-3871` asserts `isPresent && isPadded` on the same pair. So an LX organisation that is
+        // NOT padded cannot be zero-padded in any program the reference compiles, and
+        // `Pinning::lx_padded` IS `memOrg_.count(LX) && memOrg_.at(LX).isPadded`. Both of its false
+        // arms land on the trait's own `Some(false)`: no LX entry at all, and an LX entry that
+        // zero-pads nothing.
+        //
+        // ⛔ AND WHERE IT **IS** PADDED THE VALUE IS LEFT UNSTATED RATHER THAN GUESSED. `isZeroPadded`
+        // is written only by `dsm/` and read back by the SDSC parse (`dsc/designSpaceConfig.cpp:7092`),
+        // and `Pinning` drops it — so this seed does not know it, and `lx_zero_padded()` answers
+        // `None` instead of a confident `false`. See `tree::OrgData::zero_padded`.
+        if !lds.pinning().lx_padded {
+            org.set_zero_padded(SenComponent::Lx, false);
+        }
+        orgs.push(org);
     }
     DscTree {
         tree: RefCell::new(tree),
