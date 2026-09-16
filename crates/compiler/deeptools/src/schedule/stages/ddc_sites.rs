@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::arch_enums::SenComponent;
 
 use crate::arch::Elements;
+use crate::bridges::superdsc_to_dataflow_ir::dsc_lowering::DataLocation;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, StickDims,
 };
@@ -62,6 +63,80 @@ use super::ddc_store::Dsc2Store;
 pub struct Dsc2Stages<'s, 'l> {
     state: &'s Dsc2State<'l>,
     dsc: DscIdx,
+}
+
+/// ⭐⭐ WHICH ROW OF `addressGranularityScalePerUnit` A `{unit, storage}` PAIR NAMES —
+/// `sys-arch-spec/sysdef.cpp:531-554`, all twenty-three, as the [`DataLocation`] that already holds
+/// their granularities.
+///
+/// ⛔⛔ THE POINT IS THAT THE KEY SET AND THE VALUES STAY ONE FACT. [`DataLocation`]'s own doc says
+/// *"the table's keys are the whole domain, and that is why this is an enum"* — so the honest answer
+/// to `count({unit, storage})` is *which variant that pair is*, not a second listing of the pairs
+/// beside the granularities. ⚠️ REPORTED: this belongs as `DataLocation::of(unit, storage)` in
+/// `bridges/superdsc_to_dataflow_ir/dsc_lowering.rs`, where the granularities live and where
+/// `v1::OffsetSizes::address_scale` (`stages/offsets.rs:171`, `stages/ddc_reads.rs:580`) would read
+/// it too; it is written here because that file is not this agent's to edit.
+///
+/// ⛔ `LRFREG` IS `SenComponent::Lrfreg` AND NOT `PeLrfreg`/`SfpLrfreg`/`PtLrfreg`. Those three are
+/// separate components (`sys-arch-spec/arch_enums.rs`, 102-104) and the table names none of them:
+/// `{SFP, LRFREG}` and `{SFP, SFPLRF}` are the two keys assigned in one statement (`:546-547`).
+///
+/// ⛔ AND THE PAIRS ARE THE **GENERIC** COMPONENTS: the reference keys on
+/// `senCompToGenericComp.at(unit)`, so `LXLU0`/`LXLU1` arrive as `LXLU` and every PT row as `PT`.
+fn address_location(unit: SenComponent, storage: SenComponent) -> Option<DataLocation> {
+    Some(match (unit, storage) {
+        (SenComponent::L3lu, SenComponent::Hbm) => DataLocation::L3luHbm,
+        (SenComponent::L3lu, SenComponent::Lx) => DataLocation::L3luLx,
+        (SenComponent::L3lu, SenComponent::L3luibr) => DataLocation::L3luIbr,
+        (SenComponent::L3su, SenComponent::Hbm) => DataLocation::L3suHbm,
+        (SenComponent::L3su, SenComponent::Lx) => DataLocation::L3suLx,
+        (SenComponent::L3su, SenComponent::L3suibr) => DataLocation::L3suIbr,
+        (SenComponent::Lxlu, SenComponent::Lx) => DataLocation::LxluLx,
+        (SenComponent::Lxlu, SenComponent::Lxluscalereg) => DataLocation::LxluScaleReg,
+        (SenComponent::Lxlu, SenComponent::Lxluvalue) => DataLocation::LxluValue,
+        (SenComponent::Lxsu, SenComponent::Lx) => DataLocation::LxsuLx,
+        (SenComponent::L0lu, SenComponent::L0) => DataLocation::L0luL0,
+        (SenComponent::L0su, SenComponent::L0) => DataLocation::L0suL0,
+        (SenComponent::L0lu, SenComponent::L0Scale) => DataLocation::L0luL0Scale,
+        (SenComponent::L0su, SenComponent::L0Scale) => DataLocation::L0suL0Scale,
+        (SenComponent::Sfp, SenComponent::Lrfreg) => DataLocation::SfpLrfReg,
+        (SenComponent::Sfp, SenComponent::Sfplrf) => DataLocation::SfpLrf,
+        (SenComponent::Sfp, SenComponent::Sfpstate) => DataLocation::SfpState,
+        (SenComponent::Pe, SenComponent::Lrfreg) => DataLocation::PeLrfReg,
+        (SenComponent::Pe, SenComponent::Pelrf) => DataLocation::PeLrf,
+        (SenComponent::Pe, SenComponent::Pestate) => DataLocation::PeState,
+        (SenComponent::Pt, SenComponent::Lrfreg) => DataLocation::PtLrfReg,
+        (SenComponent::Pt, SenComponent::Ptarf) => DataLocation::PtArf,
+        (SenComponent::Pt, SenComponent::Ptxrf) => DataLocation::PtXrf,
+        _ => return None,
+    })
+}
+
+/// `ceil(a / double(b))` — the FLOATING-POINT ceiling the reference reaches through
+/// `float(numPTRows)` and `double totalWork`, over integers.
+///
+/// ⛔ NOT `i64::div_ceil`, WHICH PANICS ON A NEGATIVE OPERAND AND WOULD ROUND IT THE OTHER WAY. An
+/// unstated dim is `-1` (`dsc/dims.h:161-193`) and the reference happily halves it: `ceil(-0.5)` is
+/// `0`, which `(-1 + 1).div_euclid(2)` answers and `(-1i64).div_ceil(2)` does not.
+const fn div_ceil_i64(value: i64, by: i64) -> i64 {
+    (value + by - 1).div_euclid(by)
+}
+
+/// `floor(a / double(b))` — the other half of the PE/SFP split, and `-1` for `floor(-0.5)`.
+const fn div_floor_i64(value: i64, by: i64) -> i64 {
+    value.div_euclid(by)
+}
+
+/// ONE DIM'S PADDING AS A `PaddingFormType` — the argument `primaryDimToVal_st` takes, built from
+/// the one dim and one [`PadType`] every caller of [`v1::ExploreStages::extent`] states.
+///
+/// ⛔ [`PadType::NoPad`] IS STILL WRITTEN RATHER THAN LEFT ABSENT, and the two agree: `getPadding`
+/// answers `NOPAD` for a dim the form does not name (`dsc/dims.cpp:806`), which is what
+/// [`tu::PaddingForm::padding`] does.
+fn padding_form(dim: PrimaryDim, padding: PadType) -> tu::PaddingForm {
+    let mut form = tu::PaddingForm::default();
+    form.set_padding(dim, padding);
+    form
 }
 
 impl<'s, 'l> Dsc2Stages<'s, 'l> {
@@ -121,13 +196,30 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         })
     }
 
-    /// ⛔ `isExternalDs(stage)` — a `DesignSpaceConfig` predicate over the whole DSC (it compares the
-    /// stage's sizes against the TENSOR's rather than a tile's), not a field of the stage.
+    /// ⛔⛔ `isExternalDs` DOES NOT EXIST IN THE AUTHORITY — grepped over the whole of
+    /// `/Users/nickm/git/deeptools-src` and the identifier appears ZERO times. So the sentence this
+    /// stub used to carry (*"a `DesignSpaceConfig` predicate comparing the stage's sizes against the
+    /// whole tensor's, and it DECIDES whether finalize_external_stage runs"*) named a function that is
+    /// not there, and its second half is refuted twice over: [`Self::finalize_external_stage`] is
+    /// called on EVERY stage of `dataStageParam_` (`ddc/ddcv1.cpp:2085-2088`), and its own body is
+    /// three independently guarded blocks with no external test in any of them.
+    ///
+    /// ⛔ WHAT THE REFERENCE ACTUALLY MEANS BY "EXTERNAL" IS `!metadata.datastages_.count(id)` — a
+    /// stage the DDL walk did NOT mint (`ddc/ddcv1.cpp:934-937`, and the two `continue // external`
+    /// lines `run_v1` already carries at `ddc/v1.rs:5084`, `:5087`). That is a [`Metadata`] fact, and
+    /// [`Metadata`] is a borrow DISJOINT from this carrier: the caller holds it, which is why both of
+    /// those `continue`s are written at the CALL SITE and not asked of the stages.
+    ///
+    /// ⭐ AND NOTHING CALLS THIS. `v1::ExploreStages::is_external` has no caller anywhere in the crate
+    /// — only the trait declaration (`ddc/v1.rs:3880`) and a test double (`:8566`) — so this `todo!`
+    /// is unreachable rather than blocking. It is left NAMED rather than answered `false`, because a
+    /// carrier answering a predicate it cannot see is how a fabricated fact gets in.
     fn is_external(&self, _stage: DatastageId) -> bool {
         todo!(
-            "v1::ExploreStages::is_external: wants isExternalDs(stage) — a DesignSpaceConfig \
-             predicate comparing the stage's sizes against the whole tensor's, and it DECIDES \
-             whether finalize_external_stage runs on that stage"
+            "v1::ExploreStages::is_external: `isExternalDs` is NOT a symbol of the authority (zero \
+             hits in deeptools-src); the reference's own test is !metadata.datastages_.count(id) \
+             (ddc/ddcv1.cpp:934-937), a Metadata fact this carrier does not borrow. No caller exists \
+             — see this method's doc"
         )
     }
 
@@ -136,8 +228,24 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         self.half(at)
     }
 
-    /// `primaryDimToVal_st(dim, comp, row, cl, padded, density, symbolic)` — ⭐ THE PLAIN SLOT where
-    /// the authority's own control flow is a field read; see [`Dsc2Dims::raw_slot`].
+    /// ⭐⭐ `primaryDimToVal_st(dim, comp, row, cl, padded, density, symbolic)` — THE PORTED FOLD,
+    /// [`crate::schedule::l3::dsc::StageDims::sampled_extent`] (entry 012, `dsc/dims.cpp:653-704`),
+    /// which is the SAME map this carrier holds: `rowSplit_` first, then `peSfpSplit_`, then the
+    /// corelet view (`:631-645`) and `calculate_padded` (`:563-616`).
+    ///
+    /// ⛔⛔ THIS USED TO REACH ONLY [`Dsc2Dims::raw_slot`] AND `todo!` ON EVERY SAMPLED AXIS, while
+    /// the fold sat ported one module away — the same composition
+    /// [`Dsc2Dims`]'s own `Stage::extent` (`stages/ddc_state.rs`) already makes. So every read at a
+    /// corelet, a PT row or a PE/SFP half stopped the stage, and `finalize_external_stage` below
+    /// could not compute a share at all.
+    ///
+    /// ⛔ `dimDensity` IS THE REFERENCE'S OWN DEFAULT `1.0` and not a dropped argument: the trait
+    /// states no density, so [`None`] is what every caller of this method asks for
+    /// (`dsc/dims.h:269-273`).
+    ///
+    /// ⛔ AND [`Dsc2Dims::raw_slot`] STAYS THE SECOND ARM, because the fold's [`None`] cannot tell
+    /// the reference's own `-1` from the reference ABORTING: an unstated slot is `-1` on 187 of 187
+    /// g0 programs, and only the abort is a stop.
     fn extent(
         &self,
         at: v1::StageSite,
@@ -146,18 +254,25 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         padding: PadType,
         symbolic: v1::SymbolicRead,
     ) -> Extent {
-        if sample.comp.is_none()
-            && sample.row.is_none()
-            && sample.corelet.is_none()
-            && let Some(half) = self.half(at)
-            && let Some(extent) = half.raw_slot(dim, padding, symbolic)
-        {
-            return extent;
+        if let Some(half) = self.half(at) {
+            if let Some(extent) = half.dims.sampled_extent(
+                dim,
+                sample,
+                &padding_form(dim, padding),
+                None,
+                symbolic == v1::SymbolicRead::Granularity,
+            ) {
+                return extent;
+            }
+            if let Some(extent) = half.raw_slot(dim, padding, symbolic) {
+                return extent;
+            }
         }
         todo!(
-            "v1::ExploreStages::extent: wants primaryDimToVal_st (dsc/dims.cpp:653-704) to fold a \
-             SAMPLED axis, or calculate_padded (:563-616) for {padding:?}, on stage {at:?} dim \
-             {dim:?} — a hand-rolled fold is a fabricated extent"
+            "v1::ExploreStages::extent: primaryDimToVal_st (dsc/dims.cpp:653-704) STOPS on stage \
+             {at:?} dim {dim:?} at {sample:?} — the split names neither that corelet nor that row, \
+             or calculate_padded (:563-616) aborted on {padding:?}. Substituting the whole core's \
+             extent there would be a fabricated extent."
         )
     }
 
@@ -271,26 +386,245 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         self.edit(at, |half| half.dims.symbolic.add_dim(dim, info));
     }
 
-    /// ⛔ `makeDimSymbolic(refDs, dim)` (`dsc/dims.cpp:764-780`) is NOT an insert: after the
-    /// `emplace` it OVERWRITES `primaryDimToValHandler_st(dim)` with the reference stage's value AND
+    /// ⭐⭐ `makeDimSymbolic(refDs, dim)` (`dsc/dims.cpp:764-780`) WHOLE — NOT an insert: after the
+    /// `emplace` it OVERWRITES `primaryDimToValHandler_st(dim)` with the REFERENCE stage's value and
     /// re-copies whichever of `coreletSplit_`/`rowSplit_`/`peSfpSplit_` already named the dim. An
     /// insert alone leaves this stage's own extent in place beside a symbol that does not describe it.
-    fn make_dim_symbolic(&mut self, _at: v1::StageSite, _from: v1::StageSite, _dim: PrimaryDim) {
-        todo!(
-            "v1::ExploreStages::make_dim_symbolic: wants makeDimSymbolic(refDs, dim) \
-             (dsc/dims.cpp:764-780) — it also overwrites primaryDimToValHandler_st(dim) from the \
-             reference stage and re-copies every split that named the dim"
-        )
+    ///
+    /// ⛔⛔ `emplace(*symIt).second` IS A NO-OP RETURN, NOT AN OVERWRITE (`:768`): a dim this stage
+    /// already calls symbolic keeps its OWN info and its own extent, and every statement below is
+    /// skipped. [`crate::schedule::l3::dsc::Symbolic::add_dim`] is an `insert`, so the
+    /// already-symbolic test has to be made here.
+    ///
+    /// ⛔ THE VALUE COPIED IS `refDs.primaryDimToVal_st(dim)` — read on the REFERENCE half and read
+    /// with the symbol in place, so it is that stage's `maxSize_` and not its stored slot
+    /// (`dsc/dims.cpp:522-527`). Recomputing it from this stage would be a fabricated extent.
+    ///
+    /// ⛔ `DT_CHECK(refDs.symbolicDimInfo_.count(dim))` (`:766`) IS NOT DISCHARGED BY THE CALL SITE:
+    /// `calculate_epilogues` guards on `symbolic_dims(den_ss)` (`ddc/v1.rs:5095`) — the stage's own
+    /// STEADY-STATE half — while the check is on `core`, the reference half. So it stays a stop, and
+    /// so do the three `.at(dim)` throws (`:771`, `:774`, `:777`), each of which is a split THIS
+    /// stage names and the reference does not.
+    ///
+    /// ⛔ EVERY ABORT IS DECIDED **BEFORE** THE FIRST WRITE — one stop for the method, and a half that
+    /// is either wholly rewritten or wholly untouched. A `todo!` reached mid-edit would leave the
+    /// symbol added and the splits stale.
+    fn make_dim_symbolic(&mut self, at: v1::StageSite, from: v1::StageSite, dim: PrimaryDim) {
+        // ⛔ THE ALREADY-SYMBOLIC TEST FIRST, WHICH IS THE `emplace(..).second` RETURN — and it comes
+        // before every abort because the reference returns there without reading `refDs` again.
+        if self
+            .half(at)
+            .is_some_and(|half| half.dims.symbolic.info().contains_key(&dim))
+        {
+            return;
+        }
+        // `refDs` READ WHOLE — the reference half is a different datastage in every caller, and all
+        // of these are reads of its pre-existing state.
+        let planned = self.half(from).and_then(|reference| {
+            let info = reference.dims.symbolic.info().get(&dim).copied()?;
+            // `refDs.primaryDimToVal_st(dim)`, with the symbol in place: `maxSize_`.
+            let value = reference.dims.sampled_extent(
+                dim,
+                v1::DimSample::WHOLE,
+                &tu::PaddingForm::default(),
+                None,
+                false,
+            )?;
+            // ⛔ EACH SPLIT IS `refDs.<map>.at(dim)` AND ONLY WHERE **THIS** HALF NAMES THE DIM, so a
+            // reference that does not name it is the `.at()` throw and not an absent copy.
+            let mine = self.half(at)?;
+            let corelet = if mine.dims.corelet_split.contains_key(&dim) {
+                Some(reference.dims.corelet_split.get(&dim).cloned()?)
+            } else {
+                None
+            };
+            let rows = if mine.dims.row_split.contains_key(&dim) {
+                Some(reference.dims.row_split.get(&dim).cloned()?)
+            } else {
+                None
+            };
+            let pe_sfp = if mine.dims.pe_sfp_split.contains_key(&dim) {
+                Some(reference.dims.pe_sfp_split.get(&dim).cloned()?)
+            } else {
+                None
+            };
+            Some((info, value, corelet, rows, pe_sfp))
+        });
+        let Some((info, value, corelet, rows, pe_sfp)) = planned else {
+            todo!(
+                "v1::ExploreStages::make_dim_symbolic: makeDimSymbolic (dsc/dims.cpp:764-780) \
+                 ABORTED writing {dim:?} onto {at:?} from {from:?} — one of \
+                 dataStageParam_.at({from:?}), DT_CHECK(refDs.symbolicDimInfo_.count({dim:?})) \
+                 (:766), refDs.primaryDimToVal_st({dim:?}) (:769), or a \
+                 refDs.coreletSplit_/rowSplit_/peSfpSplit_.at({dim:?}) throw (:771-778) for a split \
+                 {at:?} states and {from:?} does not. Every one of those carries a VALUE the \
+                 reference owns, and none of them has a substitute"
+            )
+        };
+        self.edit(at, |half| {
+            half.dims.symbolic.add_dim(dim, info);
+            half.dims.extents.insert(dim, value);
+            if let Some(shares) = &corelet {
+                half.dims.corelet_split.insert(dim, shares.clone());
+            }
+            if let Some(shares) = &rows {
+                half.dims.row_split.insert(dim, shares.clone());
+            }
+            if let Some(shares) = &pe_sfp {
+                half.dims.pe_sfp_split.insert(dim, shares.clone());
+            }
+        });
     }
 
-    /// ⛔ `makeDimNotSymbolic(dim)` (`dsc/dims.cpp:781-803`) — the DIVIDE-BY-FACTOR that follows the
-    /// erase; see [`Dsc2Dims`]'s own note.
-    fn make_dim_not_symbolic(&mut self, _at: v1::StageSite, _dim: PrimaryDim) {
-        todo!(
-            "v1::ExploreStages::make_dim_not_symbolic: wants makeDimNotSymbolic(dim) \
-             (dsc/dims.cpp:781-803) — it erases the entry AND divides the dim value and every \
-             corelet/row/PE-SFP share by maxSize_/granularity_"
-        )
+    /// ⭐⭐ `makeDimNotSymbolic(dim)` (`dsc/dims.cpp:781-803`) — the erase AND the DIVIDE-BY-FACTOR
+    /// that follows it, over the dim value and every corelet, row and PE/SFP share.
+    ///
+    /// ⛔⛔ THE DIVIDE IS THE WHOLE POINT AND IT IS NOT `scaleFromMaxToGranularity`. That helper is a
+    /// no-op for a dim `symbolicDimInfo_` does not name (`:619-621`), and the erase happens FIRST —
+    /// so the factor has to be taken from the info before it goes, and the value read back AFTER, off
+    /// the now-plain slot. Dropping the divide leaves every share expressed in `maxSize_` units while
+    /// the dim is no longer symbolic, which multiplies every one of them by `maxSize_/granularity_`.
+    ///
+    /// ⛔ `symIt == end` IS A NO-OP RETURN (`:783`) and is what the size search's own guard already
+    /// tests (`ddc/v1.rs:5325`), so it is answered here rather than stopped.
+    ///
+    /// ⛔ WHAT STOPS: the two `DT_CHECK`s on the factor (`:784`, `:786`) and every
+    /// `DT_CHECK(val % factor == 0)` inside `divideByFactor` (`:789`) — a share the factor does not
+    /// divide, which is an extent this cannot round.
+    ///
+    /// ⛔ AND A VOLUME LIMIT KEYED ON THE DIM STOPS TOO, because the reference's plain
+    /// `symbolicDimInfo_.erase` leaves `maxSymbolicVolume_` untouched while
+    /// [`crate::schedule::l3::dsc::Symbolic`] holds *"every dim a volume limit is keyed on is named
+    /// by `info`"* as a type invariant — a state the reference reaches and this type cannot spell.
+    /// `Symbolic` needs its own `remove_dim` to decide that; rebuilding through `Symbolic::new` here
+    /// would silently DROP the limit.
+    /// ⛔ AND EVERY ABORT IS DECIDED BEFORE THE FIRST WRITE, as in [`Self::make_dim_symbolic`]: one
+    /// stop, and a half either wholly rewritten or wholly untouched.
+    fn make_dim_not_symbolic(&mut self, at: v1::StageSite, dim: PrimaryDim) {
+        use crate::schedule::l3::dsc::Symbolic;
+
+        let Some(half) = self.half(at) else {
+            return;
+        };
+        // `if (symIt == symbolicDimInfo_.end()) return;` — already not symbolic.
+        let Some(info) = half.dims.symbolic.info().get(&dim).copied() else {
+            return;
+        };
+        let granularity = i64::from(info.granularity.get());
+        let max = i64::from(info.max_size.0);
+        let planned = (|| {
+            // `DT_CHECK(maxSize_ % granularity_ == 0)` (`:784`) then `DT_CHECK(factor != 0)` (`:786`).
+            if granularity == 0 || max % granularity != 0 {
+                return None;
+            }
+            let factor = max / granularity;
+            if factor == 0 {
+                return None;
+            }
+            // ⛔ A VOLUME LIMIT KEYED ON THE DIM — see this method's own note.
+            if half
+                .dims
+                .symbolic
+                .volumes()
+                .keys()
+                .any(|dims| dims.contains(&dim))
+            {
+                return None;
+            }
+            // `divideByFactor`, whose `DT_CHECK(val % factor == 0)` is the [`None`].
+            let divided = |val: Extent| -> Option<Extent> {
+                (val.0 % factor == 0).then(|| Extent(val.0 / factor))
+            };
+            // The erase, exactly — every volume limit survives because none names this dim.
+            let mut info_after = half.dims.symbolic.info().clone();
+            info_after.remove(&dim);
+            let symbolic = Symbolic::new(info_after, half.dims.symbolic.volumes().clone());
+            // `primaryDimToValHandler_st(dim) = divideByFactor(primaryDimToVal_st(dim))`, read AFTER
+            // the erase — so off the plain slot and not off `maxSize_`.
+            let mut plain = half.dims.clone();
+            plain.symbolic = symbolic.clone();
+            let value = divided(plain.sampled_extent(
+                dim,
+                v1::DimSample::WHOLE,
+                &tu::PaddingForm::default(),
+                None,
+                false,
+            )?)?;
+            let corelet = match half.dims.corelet_split.get(&dim) {
+                Some(shares) => Some(
+                    shares
+                        .iter()
+                        .map(|share| divided(*share))
+                        .collect::<Option<Vec<Extent>>>()?,
+                ),
+                None => None,
+            };
+            let rows = match half.dims.row_split.get(&dim) {
+                Some(per_corelet) => Some(
+                    per_corelet
+                        .iter()
+                        .map(|(corelet, rows)| {
+                            Some((
+                                *corelet,
+                                rows.iter()
+                                    .map(|share| divided(*share))
+                                    .collect::<Option<Vec<Extent>>>()?,
+                            ))
+                        })
+                        .collect::<Option<BTreeMap<Corelet, Vec<Extent>>>>()?,
+                ),
+                None => None,
+            };
+            let pe_sfp = match half.dims.pe_sfp_split.get(&dim) {
+                Some(per_corelet) => Some(
+                    per_corelet
+                        .iter()
+                        .map(|(corelet, shares)| {
+                            Some((
+                                *corelet,
+                                v1::PeSfpShares {
+                                    pe: divided(shares.pe)?,
+                                    sfp: divided(shares.sfp)?,
+                                },
+                            ))
+                        })
+                        .collect::<Option<BTreeMap<Corelet, v1::PeSfpShares>>>()?,
+                ),
+                None => None,
+            };
+            Some((symbolic, value, corelet, rows, pe_sfp))
+        })();
+        let Some((symbolic, value, corelet, rows, pe_sfp)): Option<(
+            Symbolic,
+            Extent,
+            Option<Vec<Extent>>,
+            Option<BTreeMap<Corelet, Vec<Extent>>>,
+            Option<BTreeMap<Corelet, v1::PeSfpShares>>,
+        )> = planned
+        else {
+            todo!(
+                "v1::ExploreStages::make_dim_not_symbolic: makeDimNotSymbolic (dsc/dims.cpp:781-803) \
+                 ABORTED on {at:?} {dim:?} (maxSize_={max}, granularity_={granularity}) — one of \
+                 DT_CHECK(maxSize_ % granularity_ == 0) (:784), DT_CHECK(factor != 0) (:786), a \
+                 DT_CHECK(val % factor == 0) inside divideByFactor (:789) on the slot or on a \
+                 corelet/row/PE-SFP share, or a maxSymbolicVolume_ keyed on {dim:?} — which \
+                 symbolicDimInfo_.erase (:788) leaves in place and l3::dsc::Symbolic holds as a type \
+                 invariant it has no remove_dim to break. A rounded share is a fabricated extent"
+            )
+        };
+        self.edit(at, |half| {
+            half.dims.symbolic = symbolic.clone();
+            half.dims.extents.insert(dim, value);
+            if let Some(shares) = &corelet {
+                half.dims.corelet_split.insert(dim, shares.clone());
+            }
+            if let Some(shares) = &rows {
+                half.dims.row_split.insert(dim, shares.clone());
+            }
+            if let Some(shares) = &pe_sfp {
+                half.dims.pe_sfp_split.insert(dim, shares.clone());
+            }
+        });
     }
 
     /// `pruneMaxSymbolicVolumes(refDstg)` (`dsc/dims.cpp:729-760`) — ⭐ ALREADY PORTED, as
@@ -359,48 +693,215 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
     /// one of its 313 sampled SuperDSCs — `crustify-ddc/EXCLUSIONS.tsv`), and the other two are
     /// ARGUMENTS.
     ///
-    /// ⛔ AND EVERY OTHER CASE IS A `todo!` NAMING THE WRITES. Each of the three blocks computes an
-    /// EXTENT — a corelet's share, a PT row's share, a PE/SFP half — and every one of those becomes a
-    /// buffer size and an address. A hand-rolled `ceil(extent / 2)` here would be a fabricated extent,
-    /// and it would also need `primaryDimToVal_st` at a SAMPLED corelet, which
-    /// [`Dsc2Dims::raw_slot`] refuses for the same reason.
+    /// ⭐⭐ ALL THREE BLOCKS ARE NOW PORTED, because the extent each one halves is
+    /// `primaryDimToVal_st` AT A SAMPLED CORELET and [`Self::extent`] above now folds it — that read
+    /// is what used to make this a `todo!`, not the arithmetic.
+    ///
+    /// ⛔⛔ BLOCK 1'S `ceil` IS A NO-OP AND REPRODUCING THAT IS THE POINT.
+    /// `ceil(ds.ss_.primaryDimToVal_st(dim) / 2)` (`:1758`) divides an `int` by the `int` `2`, so C++
+    /// has already truncated toward zero before `ceil` ever sees the value — the corelet share is
+    /// `extent / 2` ROUNDED DOWN. Rust's `/` on `i64` truncates the same way, so the expression is
+    /// written the same way and NOT "corrected" to a `div_ceil`, which would hand each corelet one
+    /// element more than the reference gives it on every odd extent.
+    ///
+    /// ⭐ BLOCKS 2 AND 3 ARE REAL ROUNDING, and for the opposite reason: `float(numPTRows)` (`:1771`)
+    /// and the `double totalWork` (`:1783`) make those divisions floating point. So the PT row share
+    /// is a true `ceil` and the PE/SFP halves are a true `ceil`/`floor` — including on a NEGATIVE
+    /// extent, where `ceil(-0.5)` is `0` and `floor(-0.5)` is `-1`. [`div_ceil_i64`]/[`div_floor_i64`]
+    /// are those two, exactly.
+    ///
+    /// ⛔ `{clWork, clWork}` IS TWO ENTRIES WHATEVER `numCoreletsUsed_DSC2_` SAYS (`:1759`) — the
+    /// reference hard-codes the pair — while blocks 2 and 3 loop `0 .. numCoreletsUsed_DSC2_`. That
+    /// asymmetry is the authority's and is carried.
+    ///
+    /// ⛔ `numPTRows` IS `Target::PT_ROWS`, the same identity the landed
+    /// [`DataLocation::granularity`] already stands on for the `{L0SU, L0}` row: the arch is a cargo
+    /// feature, so `dscGlobal.sysDef.numPTRows` is a literal here and not a threaded argument.
+    ///
+    /// ⛔ WHAT STILL STOPS: a `doPTSplit` with NO `rowSplitDim`, which the reference spells as the
+    /// out-of-range `PrimaryDimTypesCount` default (`ddc/ddcv1.cpp:1753`) and writes
+    /// `rowSplit_[PrimaryDimTypesCount]` under — a key outside the closed twelve [`PrimaryDim`] that
+    /// this type cannot spell; a corelet index past the arch's own corelet count; and either half's
+    /// extent read aborting.
     fn finalize_external_stage(
         &mut self,
         stage: DatastageId,
-        _cl_split: &BTreeSet<PrimaryDim>,
+        cl_split: &BTreeSet<PrimaryDim>,
         use_pt: v1::UsePt,
-        _row_split: Option<PrimaryDim>,
+        row_split: Option<PrimaryDim>,
         pe_sfp_split: &BTreeSet<PrimaryDim>,
     ) -> Option<()> {
+        use crate::arch::{Arch, Target};
+
         // `numCoreletsUsed_DSC2_` — [`None`] is the `-1` a DSC is built with, which the reference
         // compares as `> 1` and so takes as "no corelet split" too.
         let corelets = self.facts().corelets_dsc2().unwrap_or(1);
         if corelets <= 1 && use_pt == v1::UsePt::No && pe_sfp_split.is_empty() {
             return Some(());
         }
-        todo!(
-            "v1::ExploreStages::finalize_external_stage: finalizeExternalDataStage \
-             (ddc/ddcv1.cpp:1748-1797) reaches a live block on stage {stage:?} — \
-             numCoreletsUsed_DSC2_={corelets}, usePt={use_pt:?}, peSfpSplitDims={pe_sfp_split:?}. \
-             Each block writes an EXTENT (ceil(extent/2) into coreletSplit_, ceil(extent/numPTRows) \
-             into rowSplit_, ceil/floor halves into peSfpSplit_) off primaryDimToVal_st at a SAMPLED \
-             corelet, which is a placement input and not a carrier's to invent."
-        )
+        let ss = v1::StageSite::ss(stage);
+        let el = v1::StageSite::el(stage);
+        // `0 .. numCoreletsUsed_DSC2_`, as corelets, AND the row-split dim where a PT split is asked
+        // for — the two facts every live block below needs, both decided before the first write.
+        let planned: Option<(Vec<Corelet>, Option<PrimaryDim>)> = (0..corelets)
+            .map(Corelet::checked)
+            .collect::<Option<Vec<Corelet>>>()
+            .and_then(|used| match use_pt {
+                v1::UsePt::Yes => Some((used, Some(row_split?))),
+                v1::UsePt::No => Some((used, None)),
+            });
+        let Some((used, pt_dim)) = planned else {
+            todo!(
+                "v1::ExploreStages::finalize_external_stage: finalizeExternalDataStage \
+                 (ddc/ddcv1.cpp:1748-1797) cannot name what it must write on {stage:?} — either \
+                 numCoreletsUsed_DSC2_={corelets} names a corelet this arch does not have \
+                 (Target::CORELETS_PER_CORE), and every share below is written per corelet (:1768, \
+                 :1780); or doPTSplit is set with no rowSplitDim, whose reference default is the \
+                 out-of-range PrimaryDimTypesCount (:1753) that it writes rowSplit_ under and that \
+                 the closed twelve PrimaryDim cannot spell"
+            )
+        };
+
+        // ── 1. `if (dsc.numCoreletsUsed_DSC2_ > 1)` (`:1755`) ─────────────────────────────────────
+        if corelets > 1 {
+            for dim in cl_split {
+                // ⛔ THE WHOLE-CORE EXTENT, TRUNCATED — see this method's own note on the `ceil`.
+                let shares = if self
+                    .half(ss)
+                    .is_some_and(|half| half.dims.corelet_split.contains_key(dim))
+                {
+                    None
+                } else {
+                    let work = v1::ExploreStages::extent(
+                        self,
+                        ss,
+                        *dim,
+                        v1::DimSample::WHOLE,
+                        PadType::NoPad,
+                        v1::SymbolicRead::Max,
+                    );
+                    Some(vec![Extent(work.0 / 2), Extent(work.0 / 2)])
+                };
+                if let Some(shares) = shares {
+                    self.edit(ss, |half| {
+                        half.dims.corelet_split.insert(*dim, shares.clone());
+                    });
+                }
+                // `ds.el_.coreletSplit_[dim] = ds.ss_.coreletSplit_[dim]` — the STEADY STATE'S final
+                // value, whether this call wrote it or it was already there.
+                let from_ss = self
+                    .half(ss)
+                    .and_then(|half| half.dims.corelet_split.get(dim).cloned())
+                    .unwrap_or_default();
+                if self
+                    .half(el)
+                    .is_some_and(|half| !half.dims.corelet_split.contains_key(dim))
+                {
+                    self.edit(el, |half| {
+                        half.dims.corelet_split.insert(*dim, from_ss.clone());
+                    });
+                }
+            }
+        }
+
+        // ── 2. `if (doPTSplit)` (`:1767`) ─────────────────────────────────────────────────────────
+        if let Some(dim) = pt_dim {
+            let rows = i64::from(Target::PT_ROWS);
+            let mut per_corelet: BTreeMap<Corelet, Vec<Extent>> = BTreeMap::new();
+            for corelet in &used {
+                // `ceil(primaryDimToVal_st(dim, NO_COMPONENT, -1, cl) / float(numPTRows))`.
+                let work = v1::ExploreStages::extent(
+                    self,
+                    ss,
+                    dim,
+                    v1::DimSample::at_corelet(*corelet),
+                    PadType::NoPad,
+                    v1::SymbolicRead::Max,
+                );
+                let share = Extent(div_ceil_i64(work.0, rows));
+                per_corelet.insert(
+                    *corelet,
+                    std::iter::repeat_n(share, Target::PT_ROWS as usize).collect(),
+                );
+            }
+            self.edit(ss, |half| {
+                half.dims.row_split.insert(dim, per_corelet.clone());
+            });
+            // `ds.el_.rowSplit_[dim] = ds.ss_.rowSplit_[dim]` — UNGUARDED in the reference, unlike
+            // the corelet and PE/SFP blocks.
+            let from_ss = self
+                .half(ss)
+                .and_then(|half| half.dims.row_split.get(&dim).cloned())
+                .unwrap_or_default();
+            self.edit(el, |half| {
+                half.dims.row_split.insert(dim, from_ss.clone());
+            });
+        }
+
+        // ── 3. `for (auto dim : peSfpSplitDims)` (`:1778`) ────────────────────────────────────────
+        for dim in pe_sfp_split {
+            for at in [ss, el] {
+                if self
+                    .half(at)
+                    .is_some_and(|half| half.dims.pe_sfp_split.contains_key(dim))
+                {
+                    continue;
+                }
+                let mut per_corelet: BTreeMap<Corelet, v1::PeSfpShares> = BTreeMap::new();
+                for corelet in &used {
+                    let work = v1::ExploreStages::extent(
+                        self,
+                        at,
+                        *dim,
+                        v1::DimSample::at_corelet(*corelet),
+                        PadType::NoPad,
+                        v1::SymbolicRead::Max,
+                    );
+                    per_corelet.insert(
+                        *corelet,
+                        v1::PeSfpShares {
+                            pe: Extent(div_ceil_i64(work.0, 2)),
+                            sfp: Extent(div_floor_i64(work.0, 2)),
+                        },
+                    );
+                }
+                self.edit(at, |half| {
+                    half.dims.pe_sfp_split.insert(*dim, per_corelet.clone());
+                });
+            }
+        }
+        Some(())
     }
 }
 
 impl tr::StageExtents for Dsc2Stages<'_, '_> {
-    /// One stage's stick-view extent for one dim — ⭐ THE PLAIN SLOT of its steady-state half.
+    /// ⭐ One stage's stick-view extent for one dim — `primaryDimToVal_st(dim)`
+    /// (`dsc/dims.cpp:647`), whose five defaults are all the WHOLE of their axis, folded by the same
+    /// [`crate::schedule::l3::dsc::StageDims::sampled_extent`] [`v1::ExploreStages::extent`] uses.
+    ///
+    /// ⛔ SO A STAGE THAT STATES A SPLIT ON `dim` NO LONGER STOPS ENTRY 242: `clId = -1` is the first
+    /// corelet's share where the dim is row-split and the SUM over corelets where it is also
+    /// corelet-split (`:668-674`), which is a distinction only the ported fold makes.
     fn stage_extent(&self, stage: DatastageId, dim: PrimaryDim) -> Extent {
-        if let Some(half) = self.half(v1::StageSite::ss(stage))
-            && let Some(extent) = half.raw_slot(dim, PadType::NoPad, v1::SymbolicRead::Max)
-        {
-            return extent;
+        let at = v1::StageSite::ss(stage);
+        if let Some(half) = self.half(at) {
+            if let Some(extent) = half.dims.sampled_extent(
+                dim,
+                v1::DimSample::WHOLE,
+                &tu::PaddingForm::default(),
+                None,
+                false,
+            ) {
+                return extent;
+            }
+            if let Some(extent) = half.raw_slot(dim, PadType::NoPad, v1::SymbolicRead::Max) {
+                return extent;
+            }
         }
         todo!(
-            "tr::StageExtents::stage_extent: wants \
-             dataStageParam_.at(stage).ss_.primaryDimToVal_st(dim) (dsc/dims.cpp:647) folded over a \
-             split this stage states on {dim:?}"
+            "tr::StageExtents::stage_extent: dataStageParam_.at({stage:?}).ss_\
+             .primaryDimToVal_st({dim:?}) (dsc/dims.cpp:647) ABORTED — an empty inner rowSplit_ map \
+             (:672) or calculate_padded's own stop, neither of which is a number to substitute"
         )
     }
 }
@@ -521,26 +1022,116 @@ impl conv::InternalTensorSite for Dsc2Ddl<'_, '_> {
         )
     }
 
-    /// ⛔ The `{ALLOCATE, TRANSFER, COMPUTE}` walk PROJECTED ONTO EVERY LDS SLOT — its
-    /// [`conv::LdsSlot::ComputeInput`]/`ComputeOutput`/`OpaqueCompute` arms all need a COMPUTE node,
-    /// and a PARTIAL walk would leave entry 173's retagging half done.
+    /// ⭐⭐ `traverseTreeDFSMutable(nullptr, {ALLOCATE, TRANSFER, COMPUTE})` PROJECTED ONTO EVERY LDS
+    /// SLOT (`ddc/ddl/ddl_conversion.cpp:531-556`), IN THE WALK'S OWN ORDER — ANSWERED.
+    ///
+    /// ⛔⛔ THE DOC THAT USED TO STAND HERE SAID *"three of its six arms need a COMPUTE node, which
+    /// `super::tree::Kind` has no arm for"* AND THAT IS NO LONGER TRUE: [`super::tree::Kind::Compute`]
+    /// holds a whole [`ComputeNode`], and [`conv::ScheduleWrites::add_compute`]/`mint_compute` on this
+    /// very type are what put them there. The `DT_ERROR("the node has to be either compute, transfer
+    /// or allocate.")` (`:557`) is unspellable because the walk is filtered to those three and every
+    /// other [`super::tree::Kind`] is simply not projected.
+    ///
+    /// ⛔ [`conv::LdsSlot::OpaqueCompute`] IS EMITTED FOR EVERY COMPUTE, AND THAT IS NOT A WIDENING.
+    /// `isOpaqueOp_` is not projected onto [`ComputeNode`] — membership in `Metadata::opaque_ops` IS
+    /// that flag ([`conv::op_opaque`]'s own doc) — and the [`Metadata`] is a borrow DISJOINT from this
+    /// site. But [`conv::add_internal_tensor`] guards that arm with
+    /// `metadata.opaque_ops.get_mut(&node)`, which is the reference's own `opaqueOps_.at(cn)` and is
+    /// [`None`] for exactly the computes whose `isOpaqueOp_` is clear. So the pair of them applies the
+    /// reference's predicate; a site that tried to apply it alone would have to guess.
+    ///
+    /// ⛔ AND THE OPAQUE SLOT COMES FIRST, PER NODE, BESIDE the inputs and outputs and not instead of
+    /// them: the reference retags `opaqueOps_.at(cn).ldsIdx_` and THEN walks
+    /// `inputsLdsAndLoopOffsets_` and `outputsLdsAndLoopOffsets_` on the same node (`:534-544`).
     fn lds_slots(&self) -> Vec<conv::LdsSlot> {
+        let Some(tree) = self.state.tree(self.dsc) else {
+            return Vec::new();
+        };
+        tree.with(|held| {
+            let mut slots = Vec::new();
+            for node in held.dfs() {
+                match held.kind_of(node) {
+                    Some(super::tree::Kind::Compute(compute)) => {
+                        slots.push(conv::LdsSlot::OpaqueCompute(node));
+                        slots.extend(
+                            (0..compute.inputs.len())
+                                .map(|at| conv::LdsSlot::ComputeInput(node, at)),
+                        );
+                        slots.extend(
+                            (0..compute.outputs.len())
+                                .map(|at| conv::LdsSlot::ComputeOutput(node, at)),
+                        );
+                    }
+                    Some(super::tree::Kind::Transfer(transfer)) => {
+                        slots.push(conv::LdsSlot::TransferSrc(node));
+                        slots.extend(
+                            (0..transfer.dsts.len())
+                                .map(|at| conv::LdsSlot::TransferDst(node, at)),
+                        );
+                    }
+                    Some(super::tree::Kind::Allocate(..)) => {
+                        slots.push(conv::LdsSlot::Allocate(node));
+                    }
+                    _ => {}
+                }
+            }
+            slots
+        })
+    }
+
+    /// ⭐ The read half of the same walk — `myLdsIdx_` of that slot, [`None`] for the reference's `-1`.
+    ///
+    /// ⛔ [`conv::LdsSlot::OpaqueCompute`] IS [`None`] BY CONTRACT, not by omission: the trait's own
+    /// doc says *"that slot lives in the [`Metadata`], and the port reads and writes it there"*, and
+    /// [`conv::add_internal_tensor`] never asks this method for one.
+    fn slot_lds(&self, slot: conv::LdsSlot) -> Option<LdsIdx> {
+        let tree = self.state.tree(self.dsc)?;
+        tree.with(|held| match slot {
+            conv::LdsSlot::OpaqueCompute(_) => None,
+            conv::LdsSlot::ComputeInput(node, at) => match held.kind_of(node)? {
+                super::tree::Kind::Compute(compute) => compute.inputs.get(at)?.data.my_lds_idx,
+                _ => None,
+            },
+            conv::LdsSlot::ComputeOutput(node, at) => match held.kind_of(node)? {
+                super::tree::Kind::Compute(compute) => compute.outputs.get(at)?.data.my_lds_idx,
+                _ => None,
+            },
+            conv::LdsSlot::TransferSrc(node) => match held.kind_of(node)? {
+                super::tree::Kind::Transfer(transfer) => transfer.src.data.my_lds_idx,
+                _ => None,
+            },
+            conv::LdsSlot::TransferDst(node, at) => match held.kind_of(node)? {
+                super::tree::Kind::Transfer(transfer) => {
+                    transfer.dsts.get(at)?.data.my_lds_idx
+                }
+                _ => None,
+            },
+            conv::LdsSlot::Allocate(node) => match held.kind_of(node)? {
+                super::tree::Kind::Allocate(_, minted) => Some(minted.lds),
+                _ => None,
+            },
+        })
+    }
+
+    /// ⛔ And its write half — the one of the three that STILL STOPS.
+    ///
+    /// ⛔⛔ [`super::tree::TreeData`] HAS NO PER-SLOT LDS SETTER. `set_transfer` replaces a whole
+    /// transfer node, but a COMPUTE's `inputsLdsAndLoopOffsets_.at(i).myLdsIdx_` and an ALLOCATE's
+    /// `ldsIdx_` have no mutator at all — and every mutator of that type is `pub(super)`, so the
+    /// setter belongs there and not here.
+    ///
+    /// ⛔ AND A PARTIAL WRITE IS WORSE THAN THIS STOP. Retagging only the transfer slots would leave
+    /// every compute still naming the OLD last index while the LDS list has already been renumbered,
+    /// which is a silently wrong operand and not a missing one.
+    fn set_slot_lds(&mut self, slot: conv::LdsSlot, lds: LdsIdx) {
         todo!(
-            "conv::InternalTensorSite::lds_slots: wants the {{ALLOCATE, TRANSFER, COMPUTE}} walk \
-             projected onto every slot naming a labeled DS — three of its six arms need a COMPUTE \
-             node, which super::tree::Kind has no arm for, and a partial walk leaves entry 173's \
-             retagging half done"
+            "conv::InternalTensorSite::set_slot_lds: {slot:?} := {lds:?} — \
+             super::tree::TreeData has no per-slot LDS setter (a COMPUTE's \
+             inputsLdsAndLoopOffsets_.at(i).myLdsIdx_ and an ALLOCATE's ldsIdx_ have no mutator), and \
+             writing only the TRANSFER slots would leave every compute naming the old last index. \
+             lds_slots and slot_lds above are ANSWERED; this is the one half that needs a `stages` \
+             mutator"
         )
-    }
-
-    /// ⛔ The read half of the same walk.
-    fn slot_lds(&self, _slot: conv::LdsSlot) -> Option<LdsIdx> {
-        todo!("conv::InternalTensorSite::slot_lds: see lds_slots")
-    }
-
-    /// ⛔ And its write half.
-    fn set_slot_lds(&mut self, _slot: conv::LdsSlot, _lds: LdsIdx) {
-        todo!("conv::InternalTensorSite::set_slot_lds: see lds_slots")
     }
 
     /// `compAndAllocNode`'s own `allocNode->ldsIdx_` — ⭐ ANSWERED off the L3 view.
@@ -580,14 +1171,21 @@ impl conv::DdlSite for Dsc2Ddl<'_, '_> {
             .flatten()
     }
 
-    /// ⛔ `addressGranularityScalePerUnit.count({senCompToGenericComp.at(unit), storage})` — the
-    /// system-definition table [`v1::OffsetSizes::address_scale`] also wants.
-    fn unit_reaches(&self, _unit: SenComponent, _storage: SenComponent) -> bool {
-        todo!(
-            "conv::DdlSite::unit_reaches: wants \
-             addressGranularityScalePerUnit.count({{generic, storage}}) — the scheduler's own \
-             sysDef construction argument, not a super-DSC fact"
-        )
+    /// ⭐⭐ `addressGranularityScalePerUnit.count({senCompToGenericComp.at(unit), storage})` —
+    /// ANSWERED, and answered as the VENDOR'S OWN TYPE: [`address_location`] hands back the
+    /// [`DataLocation`] row that pair names, so this is `count() == 1` and not a re-listed table.
+    ///
+    /// ⛔⛔ IT IS ON THE DDL EXPANSION'S CRITICAL PATH AND A `todo!` HERE STOPPED IT.
+    /// `setDataLocAndInfo` returns [`None`] the moment this answers false for a memory storage
+    /// (`ddl/conversion.rs:2913`), so every `ddl.data_transfer` and every `ddl.compute` end that
+    /// names an LX, an L0 or the HBM asks this — the four transfers and the one compute
+    /// `g0/debug/sdsc_0/sdsc.json` still owes below `lx_below_schedule` among them.
+    ///
+    /// ⭐ THE `senCompToGenericComp` HALF IS THE CALLER'S: `conv::generic_component(own)` is applied
+    /// at the call site (`ddl/conversion.rs:2911`), so what arrives here is already generic and
+    /// mapping it again would be a second answer.
+    fn unit_reaches(&self, unit: SenComponent, storage: SenComponent) -> bool {
+        address_location(unit, storage).is_some()
     }
 
     /// `dsc.getDimIndexInLayoutOrder(labeledDs_.at(lds).dsType_, dim) >= 0` — ⭐ ANSWERED off
@@ -1453,6 +2051,242 @@ mod live_tree_tests {
                 .collect::<Vec<_>>()),
             vec![RegionId(1), RegionId(2)],
             "and each arm's region names its OWN minted block"
+        );
+    }
+
+    /// ⭐⭐⭐ WHAT STOPS THE DDL EXPANSION ON THE VENDOR'S OWN `broadcast_ops.ddl` — AND IT IS NOT A
+    /// CARRIER. `metadata_.core_dstgid` and `metadata_.chunk_dstgid` are `const int` MEMBERS of the
+    /// reference's `Metadata`, fixed at `0` and `1` (`ddc/ddc_metadata.h:210-211`), and this crate
+    /// already carries them as [`Metadata::CORE_DSTGID`]/[`Metadata::CHUNK_DSTGID`]. But
+    /// [`DdlConversion`] states them as its OWN `Option<DatastageId>` fields
+    /// (`ddl/conversion.rs:2014-2016`) and **nothing in the crate ever writes either one** — grepped:
+    /// the only mentions outside `conversion.rs` are none at all.
+    ///
+    /// ⛔⛔ SO `op_get_external_datastage` REFUSES ON EVERY TEMPLATE, and it is the **first op of
+    /// `broadcast_ops.ddl`'s `ddl.dataflow`** (`MODULES`' `BroadcastOps` region 1 opens with two
+    /// `ddl.get_external_datastage` statements and then two `ddl.datastage`s). That is why the whole
+    /// expansion mints exactly ONE node — `root_level_operations` — and stops: the very next statement
+    /// asks for the core datastage id and gets [`None`].
+    ///
+    /// ⭐ THE TEST CARRIES BOTH ARMS, so it is a value and not an observation: the same walk over the
+    /// same template and the same DSC is run twice, and the ONLY difference is the two ids. Setting
+    /// them is what moves the census.
+    ///
+    /// ⚠️ NOT ESTABLISHED: that the second arm's node count is the reference's. This DSC pins nothing
+    /// and states no compute, so `g0/debug/sdsc_N/sdsc.json` has no counterpart to diff against —
+    /// what is measured is which STATEMENT the walk reaches, not that its output is right. The fix
+    /// itself belongs in `ddl/conversion.rs`, which this file's agent does not own.
+    #[test]
+    fn the_ddl_dataflow_walk_stops_on_the_unset_core_and_chunk_datastage_ids() {
+        use crate::generated::Template;
+        use crate::schedule::ddl::conversion::DdlTemplateSet;
+        use crate::schedule::ddl::templates::DdlTemplates;
+
+        /// One run of the vendored `broadcast_ops.ddl` dataflow over a fresh tree, with the two ids
+        /// as given — the node count the LIVE tree ends with, and whether the walk refused.
+        fn walk(ids: Option<(crate::schedule::ddc::metadata::DatastageId, crate::schedule::ddc::metadata::DatastageId)>) -> (usize, bool) {
+            let sdsc = SuperDsc::new(
+                DscList::new(a_bare_dsc(), Vec::new()),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
+            let l3_state = DscState::seeded(&sdsc);
+            let state2 = Dsc2State::seeded(
+                &sdsc,
+                &l3_state,
+                &[Vec::new()],
+                &[v1::StorageName("bare".to_owned())],
+            );
+            let mut site = Dsc2Ddl::new(&state2, DscIdx(0));
+            let templates = DdlTemplates::new();
+            let stated = DdlTemplateSet::stated(&templates, Template::BroadcastOps)
+                .expect("`broadcast_ops.ddl` is one of the 32 vendored modules");
+            let mut metadata = Metadata {
+                below_lx_schedule_insert_block: BlockId::of(&OneBlock, NodeId(1)),
+                ..Metadata::default()
+            };
+            let mut interface = DdlInterface::default();
+            let mut dsc = a_bare_dsc();
+            let mut conversion = DdlConversion::new();
+            if let Some((core, chunk)) = ids {
+                conversion.core_datastage = Some(core);
+                conversion.chunk_datastage = Some(chunk);
+            }
+            let said = parse_ddl2_dsc(
+                stated.program,
+                &mut conversion,
+                &mut interface,
+                &mut metadata,
+                &mut dsc,
+                &mut site,
+                &stated.root,
+            );
+            (l3_state.node_count(), said.is_none())
+        }
+
+        // ⛔ THE STATE AS IT SHIPS: both ids [`None`], so the first `ddl.get_external_datastage` of
+        // the dataflow refuses and the tree keeps only `root_level_operations`.
+        let (unset_nodes, unset_refused) = walk(None);
+        assert!(
+            unset_refused,
+            "the walk refuses with the ids unset — `op_get_external_datastage` reads \
+             `ctx.state.core_datastage?`"
+        );
+        assert_eq!(
+            unset_nodes, 2,
+            "the seeded root block plus `root_level_operations`, and NOTHING the dataflow region \
+             states — which is the 22-to-23 delta stage 2b measures on the real `rmsq_o728` tree"
+        );
+
+        // ⛔⛔ AND THE COUNT ALONE CANNOT SHOW THE FIX, WHICH IS WHY THIS TEST WALKS THE OPS. The
+        // first node-MINTING op of `broadcast_ops.ddl`'s dataflow is its `ddl.loop`, and everything
+        // before it — two `ddl.get_external_datastage`, two `ddl.datastage` and five `ddl.if` — mints
+        // nothing: a resolved `ddl.if` descends one region and creates no `CONDITION`. So both walks
+        // above end at 2 nodes and the DIFFERENCE is *which statement they die on*.
+        let (set_nodes, _) = walk(Some((Metadata::CORE_DSTGID, Metadata::CHUNK_DSTGID)));
+        assert_eq!(
+            set_nodes, unset_nodes,
+            "the ops before the `ddl.loop` mint nothing either way — see this assertion's own note"
+        );
+
+        // ⭐⭐ THE TRAIL, OP BY OP, WITH THE IDS SET — `process_op` per row of region 1.
+        let sdsc = SuperDsc::new(
+            DscList::new(a_bare_dsc(), Vec::new()),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let l3_state = DscState::seeded(&sdsc);
+        let state2 = Dsc2State::seeded(
+            &sdsc,
+            &l3_state,
+            &[Vec::new()],
+            &[v1::StorageName("bare".to_owned())],
+        );
+        let mut site = Dsc2Ddl::new(&state2, DscIdx(0));
+        let templates = DdlTemplates::new();
+        let stated = DdlTemplateSet::stated(&templates, Template::BroadcastOps)
+            .expect("`broadcast_ops.ddl` is one of the 32 vendored modules");
+        let head = l3_state
+            .dsc(DscIdx(0))
+            .expect("the one DSC's tree")
+            .with(|tree| tree.head())
+            .expect("a seeded tree has a head");
+        let region = stated
+            .root
+            .regions
+            .ops
+            .get(&RegionId(1))
+            .expect("`ddl.dataflow`'s own region");
+
+        /// How far down `region` `process_op` gets before one of them answers [`None`], with the two
+        /// datastage ids as given.
+        fn reached(
+            stated: &crate::schedule::ddl::conversion::StatedTemplate<
+                '_,
+                crate::schedule::ddl::templates::TemplateSource,
+            >,
+            region: &[RegionOp],
+            site: &mut Dsc2Ddl<'_, '_>,
+            head: NodeId,
+            ids: bool,
+            dims: bool,
+        ) -> usize {
+            let mut metadata = Metadata::default();
+            let mut interface = DdlInterface::default();
+            let mut dsc = a_bare_dsc();
+            let mut conversion = DdlConversion::new();
+            if ids {
+                conversion.core_datastage = Some(Metadata::CORE_DSTGID);
+                conversion.chunk_datastage = Some(Metadata::CHUNK_DSTGID);
+            }
+            if dims {
+                // `dim_association_` AS `matchDdl2Dsc` LEAVES IT — the six `ddl.dimension` results the
+                // loop names, each bound to a dim. That map is filled by the MATCH
+                // (`ddl_conversion.cpp:2110`), which this walk does not run, so seeding it is how the
+                // loop's own refusal is told apart from the datastage one.
+                for (at, dim) in [
+                    PrimaryDim::Mb,
+                    PrimaryDim::Y,
+                    PrimaryDim::X,
+                    PrimaryDim::In,
+                    PrimaryDim::Out,
+                    PrimaryDim::I,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let prop = interface
+                        .dim_association
+                        .entry(NameId(u16::try_from(at).expect("six dims")))
+                        .or_default();
+                    prop.dim = Some(dim);
+                }
+            }
+            for (at, held) in region.iter().enumerate() {
+                if crate::schedule::ddl::conversion::process_op(
+                    stated.program,
+                    &mut conversion,
+                    &mut interface,
+                    &mut metadata,
+                    &mut dsc,
+                    site,
+                    &held.op,
+                    head,
+                )
+                .is_none()
+                {
+                    return at;
+                }
+            }
+            region.len()
+        }
+
+        // ⛔⛔ WITH THE IDS UNSET THE WALK DIES ON OP 0, WHICH IS `ddl.get_external_datastage`.
+        assert_eq!(
+            reached(&stated, region, &mut site, head, false, true),
+            0,
+            "the FIRST op of the vendored dataflow refuses — `op_get_external_datastage` reads \
+             `ctx.state.core_datastage?` and nothing in the crate ever writes it"
+        );
+        assert!(
+            matches!(
+                region.first().map(|held| &held.op),
+                Some(DdlOp::GetExternalDatastage(_))
+            ),
+            "and that op IS a `ddl.get_external_datastage`, so the refusal is that read and not \
+             some other arm's: {:?}",
+            region.first().map(|held| &held.op)
+        );
+
+        // ⭐⭐ WITH THEM SET IT WALKS NINE OPS AND STOPS AT THE `ddl.loop` — the first op that would
+        // mint a node.
+        let with_ids = reached(&stated, region, &mut site, head, true, false);
+        assert_eq!(
+            with_ids, 9,
+            "both `ddl.get_external_datastage`s, both `ddl.datastage`s and all five `ddl.if`s answer"
+        );
+        assert!(
+            matches!(region.get(with_ids).map(|held| &held.op), Some(DdlOp::Loop(_))),
+            "and op 9 is the `ddl.loop`: {:?}",
+            region.get(with_ids).map(|held| &held.op)
+        );
+
+        // ⛔ THAT LAST STOP IS **THIS TEST'S** OWN MISSING `matchDdl2Dsc` AND NOT A CARRIER GAP, and
+        // this is the assertion that proves it rather than asserting it: `op_loop` reads
+        // `dim_association.get(&dim)?` for each of the six `ddl.dimension` operands
+        // (`ddl/conversion.rs:3057`), a map the MATCH fills; seed it and the loop answers too.
+        assert_eq!(
+            reached(&stated, region, &mut site, head, true, true),
+            region.len(),
+            "with `dim_association` seeded as the match leaves it, every op of the dataflow region \
+             answers — so the datastage ids are the only gap this walk has"
+        );
+        assert!(
+            state2.refusals().is_empty(),
+            "and no carrier refused at any point: {:?}",
+            state2.refusals()
         );
     }
 
