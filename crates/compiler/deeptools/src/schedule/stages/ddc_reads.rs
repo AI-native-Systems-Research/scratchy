@@ -315,6 +315,21 @@ impl v1::Placement for Dsc2Reads<'_, '_> {
     /// rounds to an even stick count. [`crate::schedule::l3::dsc::DesignSpaceConfig::lx_chunk_capacity`]
     /// is that SAME call already made for the CHUNK stage and one specific site, so reusing it here
     /// would answer a different question with the same number.
+    ///
+    /// ⭐ THE CALLEE IS PORTED — [`crate::schedule::l3::capacity::buffer_capacity`], with
+    /// [`crate::schedule::l3::capacity::DscSizing`] over this carrier's own `currDsc` answering its
+    /// `SizeDsc` seam and `BytesForm::DEFAULTS` being the `bytesPerStick = 0,
+    /// forceEvenNumSticks = false` this ddc site passes (`ddc/ddcv1.cpp:150-151`, `:244-246`).
+    /// ⛔⛔ WHAT STOPS IT HERE IS **THIS SIGNATURE**, NOT THE PORT. The trait returns a TOTAL
+    /// [`Bytes`], so a refusal has nowhere to go, and the three facts
+    /// [`crate::schedule::l3::capacity::AllocSizing`] needs — `ignoreSymbolicVolumeLimits_`
+    /// (`dsc/dsc2.h:1002`), `backGapCore_` (`:989`) and `indirectAllocType_` (`:994`) — are members
+    /// the l3 projection of [`crate::schedule::dsc2::AllocateNode`] has no slot for. ⛔ ANSWERING
+    /// `Bytes(0)` FOR THEM WOULD BE THE FABRICATION THIS FILE EXISTS TO AVOID: `includeGaps` defaults
+    /// TRUE, so an assumed-empty `backGapCore_` drops every back gap and undersizes the buffer.
+    /// ⛔ AND [`Self::buffer_capacity`] IS THE SHARED HALF, WHICH HOLDS NO TREE — the allocate node
+    /// behind `alloc` and the `AncestorLoops` chain above it both live on
+    /// [`super::Dsc2Tree`]'s exclusive side.
     fn buffer_capacity(
         &self,
         _alloc: AllocId,
@@ -322,9 +337,14 @@ impl v1::Placement for Dsc2Reads<'_, '_> {
         _at: Option<(Corelet, Row)>,
     ) -> Bytes {
         todo!(
-            "v1::Placement::buffer_capacity: wants getBufferCapacityForNode(node, ldsIdx, comp, \
-             corelet, row) (dsc/dsc2.cpp:3977) over the live super-DSC's stick sizes — \
-             lx_chunk_capacity is the same call at ONE site and answers a different question"
+            "v1::Placement::buffer_capacity: l3::capacity::buffer_capacity (dsc/dsc2.cpp:3977) IS \
+             PORTED and l3::capacity::DscSizing answers its SizeDsc seam off this carrier's own \
+             currDsc — what is missing is the allocate node and its ancestor loop chain (both on the \
+             EXCLUSIVE tree half, not this shared one) and the three AllocateNode members \
+             AllocSizing needs: ignoreSymbolicVolumeLimits_ (dsc/dsc2.h:1002), backGapCore_ (:989) \
+             and indirectAllocType_ (:994). This signature returns a total Bytes, so there is no \
+             refusal to return: Bytes(0) would drop every includeGaps back gap and undersize the \
+             buffer"
         )
     }
 

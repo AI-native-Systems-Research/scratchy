@@ -1513,10 +1513,34 @@ impl conv::DdlSizes for Dsc2Ddl<'_, '_> {
 
     /// ⛔ `getBufferCapacityForNode(allocatenode, ldsIdx_, component_, 0, 0)` — the SAME capacity
     /// call [`v1::Placement::buffer_capacity`] names.
+    ///
+    /// ⭐ THE CALLEE IS PORTED — [`crate::schedule::l3::capacity::buffer_capacity`] with
+    /// [`crate::schedule::l3::capacity::DscSizing`] over this site's own `currDsc`, and THIS carrier
+    /// can reach both halves the shared stage-2b one cannot: `TreeData::node_of_alloc(alloc)` for the
+    /// allocate node and `owner_loop`/`loop_node` for the `AncestorLoops` chain, exactly as
+    /// [`conv::AllocationSite::lds_allocation`] above already walks the tree.
+    /// ⛔⛔ TWO THINGS STILL BLOCK IT, AND BOTH ARE DECISIONS RATHER THAN PORTS.
+    /// 1. **THE UNIT IS WRONG IN THE TRAIT.** `getBufferCapacityForNode` returns `int64_t` **BYTES**
+    ///    (`dsc/dsc2.cpp:3988-4004`: it multiplies `myLds.wordLength` in and compares against
+    ///    `bytesPerStick`), and [`conv::DdlSizes::buffer_capacity`] declares [`Elements`]. Handing
+    ///    bytes back as elements would stamp a DDL `allocation_size=` too large by `wordLength`.
+    /// 2. **THE THREE `dsc2::AllocateNode` MEMBERS** [`crate::schedule::l3::capacity::AllocSizing`]
+    ///    needs — `ignoreSymbolicVolumeLimits_` (`dsc/dsc2.h:1002`), `backGapCore_` (`:989`) and
+    ///    `indirectAllocType_` (`:994`) — have no slot on our [`crate::schedule::dsc2::AllocateNode`].
+    /// ⛔ AND [`None`] IS NOT AVAILABLE AS THE REFUSAL: `convert_dsc2_ddl` writes
+    /// `allocation_size: node.lds.and_then(|_| self.site.buffer_capacity(alloc))`
+    /// (`schedule/ddl/conversion.rs:5231`), so [`None`] EMITS A DDL ALLOCATE OP WITH NO
+    /// `allocation_size=` AT ALL — a silent omission where the reference always states one. The
+    /// `todo!` is louder and therefore correct.
     fn buffer_capacity(&self, _alloc: AllocId) -> Option<Elements> {
         todo!(
-            "conv::DdlSizes::buffer_capacity: wants getBufferCapacityForNode(alloc, ldsIdx_, \
-             component_, 0, 0) (dsc/dsc2.cpp:3977) over the live super-DSC's stick sizes"
+            "conv::DdlSizes::buffer_capacity: l3::capacity::buffer_capacity (dsc/dsc2.cpp:3977) IS \
+             PORTED and this site can reach the node and its loop chain — blocked on (1) this trait \
+             declaring Elements where the reference returns BYTES (it multiplies wordLength in at \
+             :3999) and (2) the three AllocateNode members AllocSizing needs: \
+             ignoreSymbolicVolumeLimits_ (dsc/dsc2.h:1002), backGapCore_ (:989), indirectAllocType_ \
+             (:994). None is not the refusal here: conversion.rs:5231 turns it into a DDL allocate \
+             op stating no allocation_size at all"
         )
     }
 }

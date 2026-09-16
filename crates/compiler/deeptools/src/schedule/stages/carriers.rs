@@ -81,24 +81,51 @@ impl L3Placement for Placement<'_> {
     /// ⛔ NEVER A CONSTANT. `getBufferCapacityForNode(node, lds, comp, corelet, row, bytesPerStick,
     /// forceEvenNumSticks=true)` (`dsc/dsc2.cpp:3977`) walks the allocate node's layout against the
     /// DSC's stick sizes and rounds to an EVEN stick count. It is a `dsc/` seam over the live
-    /// super-DSC; `DesignSpaceConfig::lx_chunk_capacity` is the SAME call already made for the CHUNK
-    /// stage, and reusing it for an arbitrary `(alloc, lds, corelet, row)` would answer a different
-    /// question with the same number.
-    /// ⛔⛔ NOT A THREADING GAP — THE CALLEE IS UNPORTED, AND `dsc` NOW PROVES IT. The index reaches
-    /// this method, so it can say WHICH DSC is asked; the body still cannot answer, because
-    /// `getBufferCapacityForNode` (`dsc/dsc2.cpp:3977`) is a thin wrapper that accumulates
-    /// `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3755-3963`, ~210 lines) over the
-    /// layout dims — and THAT is not ported. It needs `getLayoutDims`, `getSizeDataStageForNode`,
-    /// `getCumulativeStickSizes`, `getDimIndexInLayoutOrder`, `primaryDimToVal_st` with padding and
-    /// granularity, `maxSymbolicVolume_`/`symbolicDimInfo_`, the fold-coordinate arm
-    /// (`coreIdToWkSlice_`, `getCoordinateCategoryOfPos`, `getFoldDimSize`), `getPageSize`'s two
-    /// indirect arms, `mxInfo_`, `backGapCore_` and `gapStickSpread_`.
-    /// ⭐ THE PROOF THAT NO ARGUMENT UNBLOCKS IT: the SAME `todo!` stands at
-    /// [`super::Dsc2Reads`]'s `v1::Placement::buffer_capacity` (`stages/ddc_reads.rs:298`), a carrier
-    /// bound to ONE DSC by construction — it already has what this one was missing and still refuses.
+    /// super-DSC, and it is [`crate::schedule::l3::capacity::buffer_capacity`].
+    /// ⛔⛔⛔ **THE CALLEE IS PORTED. THIS IS A THREADING GAP, AND THE THREE SENTENCES THAT USED TO
+    /// STAND HERE SAYING OTHERWISE WERE FALSE** — they would send the next reader to re-port 1,881
+    /// lines that already exist. `getBufferCapacityForNode` and its whole closure landed as
+    /// [`crate::schedule::l3::capacity`]: `buffer_capacity` (e019), `buffer_capacity_per_dim` (e018),
+    /// `buffer_capacity_per_dim_at` (e017, the ~210-line body), `size_data_stage_of_alloc_at_node`
+    /// (e016) and `size_data_stage_for_node` (e015), and
+    /// [`crate::schedule::l3::capacity::DscSizing`] answers its `SizeDsc` seam off a REAL
+    /// [`crate::schedule::l3::dsc::DesignSpaceConfig`] — proved against `sdsc_1`'s own two exported
+    /// buffer offsets, 256 and 4096.
+    ///
+    /// ⛔⛔ WHAT IS MISSING IS **THREE CONSTRUCTION FACTS, NONE OF THEM A PORT**, and the carrier can
+    /// already reach everything else: the allocate node is
+    /// `TreeData::node_of_alloc(alloc)` → `DscTree::placed(node)`, and the
+    /// `AncestorLoops` chain is `TreeData::owner_loop`/`loop_node` from that node with
+    /// `DscTree::head_den` for the head — both off the [`DscState`] this carrier already holds.
+    ///
+    /// 1. **`currDsc` ITSELF.** The reference calls a `DesignSpaceConfig` METHOD —
+    ///    `currDsc->getBufferCapacityForNode(..)` (`L3DlOpsScheduler.cpp:5560`) — and this trait
+    ///    method is handed only the [`DscIdx`]. An index names WHICH DSC; it does not carry
+    ///    `labeledDs_`, `primaryDsInfo_`, `getLayoutDims` or `dataStageParam_`, and [`DscState`]
+    ///    holds trees and `memOrg_`s alone. ⛔ AND IT CANNOT BE A FIELD ON THIS CARRIER: a borrow of
+    ///    the super-DSC cannot live across `l3::dl_ops::run`'s own `&mut SuperDsc`, and a CLONE would
+    ///    freeze `dataStageParam_` — which is precisely the map [`size_data_stage_for_node`] reads
+    ///    each enclosing loop's `denId_` out of. ⭐ THE FIX IS THE REFERENCE'S OWN SHAPE:
+    ///    `try_alloc_l3` ALREADY HOLDS `dsc: &DesignSpaceConfig` two statements above the call, so the
+    ///    trait method takes it as an argument beside the index.
+    /// 2. **`sysDef.bytesPerStick`** — `dscGlobal.sysDef.bytesPerStick` (`:5559`), which is
+    ///    [`Arch::BYTES_PER_STICK`] at both L3 sites. `try_alloc_l3` carries no `A: Arch` bound, so it
+    ///    is this carrier's to state.
+    /// 3. **THREE `dsc2::AllocateNode` MEMBERS THE RUST MODEL HAS NO SLOT FOR** —
+    ///    `ignoreSymbolicVolumeLimits_` (`dsc/dsc2.h:1002`), `backGapCore_` (`:989`) and
+    ///    `indirectAllocType_` (`:994`), which [`crate::schedule::l3::capacity::AllocSizing`] takes as
+    ///    parameters for exactly that reason. ⚠️ THEIR DECLARED INITIALIZERS ARE `false`, EMPTY AND
+    ///    `NO_INDIRECTION`, AND NO SCHEDULER UNIT WRITES THE FIRST TWO (their only writers are the
+    ///    SDSC parser `dsc/dsc2.cpp:1786`/`:1803`, the DSM translator
+    ///    `dsm/translators/perfDscToSdsc/perfDscToSdsc.cpp:2188`, and the reference-DSC copy
+    ///    `dsc/designSpaceConfig.cpp:94`/`:129`) — but that makes them WIRE FACTS the l3 projection
+    ///    drops, not facts this carrier may assume. `includeGaps` DEFAULTS TRUE, so an assumed-empty
+    ///    `backGapCore_` silently omits every back gap from the capacity.
     /// ⛔ `DesignSpaceConfig::lx_chunk_capacity` IS A PRECOMPUTED FIELD, not this call: it is that
     /// call already made for the CHUNK stage at one site, so reusing it answers a different question
-    /// with the same number.
+    /// with the same number. ⚠️ AND IT IS EMPTY IN EVERY SCRATCHY BUNDLE ANYWAY — the projection
+    /// states so (`crates/targets/spyre/src/superdsc_to_l3_sdsc.rs:764-772`), because no labelled DS
+    /// has an LX allocate node before stage 2a mints one.
     /// ⛔⛔ IT REFUSES AND NO LONGER PANICS, AND THAT IS A RATCHET DOWN RATHER THAN A SOFTENING. This
     /// was a `todo!` while it was UNREACHABLE — entry 222 stopped one statement earlier, at an
     /// allocate-node map the port had invented and no unit ever wrote. That map is gone, so this is
@@ -116,9 +143,14 @@ impl L3Placement for Placement<'_> {
         _row: Row,
     ) -> Option<Bytes> {
         self.state.refuse(
-            "L3Placement::buffer_capacity_even_sticks: wants \
-             DesignSpaceConfig::getBufferCapacityForNode (dsc/dsc2.cpp:3977) accumulating \
-             getBufferCapacityForNodePerDimCustomLocation (dsc/dsc2.cpp:3755), which is UNPORTED — \
+            "L3Placement::buffer_capacity_even_sticks: getBufferCapacityForNode \
+             (dsc/dsc2.cpp:3977) IS PORTED, as l3::capacity::buffer_capacity, and \
+             l3::capacity::DscSizing answers its SizeDsc seam — \
+             this carrier lacks the &DesignSpaceConfig the reference calls it ON \
+             (L3DlOpsScheduler.cpp:5560; the DscIdx names a DSC but carries no labeledDs_, \
+             primaryDsInfo_ or dataStageParam_), sysDef.bytesPerStick (:5559), and the three \
+             AllocateNode members AllocSizing needs — ignoreSymbolicVolumeLimits_ (dsc/dsc2.h:1002), \
+             backGapCore_ (:989) and indirectAllocType_ (:994) — which the l3 projection drops; \
              a fabricated capacity would commit a fabricated placement",
         )
     }
