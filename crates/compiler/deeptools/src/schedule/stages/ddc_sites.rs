@@ -48,7 +48,7 @@ use crate::schedule::dsc2::{
     TransferNode, WordLength,
 };
 use crate::schedule::l3::dl_ops::AddressFoldCoords;
-use crate::schedule::l3::dsc::{DscIdx, SymbolicDimInfo, WkSlice};
+use crate::schedule::l3::dsc::{DscIdx, Symbolic, SymbolicDimInfo, WkSlice};
 use crate::units::{Core, Corelet};
 
 use super::ddc_state::{self, Dsc2Dims, Dsc2State};
@@ -110,6 +110,26 @@ fn address_location(unit: SenComponent, storage: SenComponent) -> Option<DataLoc
         (SenComponent::Pt, SenComponent::Ptxrf) => DataLocation::PtXrf,
         _ => return None,
     })
+}
+
+/// WHAT `makeDimNotSymbolic` WILL WRITE ONTO ONE HALF — computed WHOLE before the first write, so
+/// that its one stop cannot leave a half with the symbol erased and the shares still in `maxSize_`
+/// units.
+///
+/// ⛔ EACH SPLIT IS AN [`Option`] BECAUSE ABSENT AND EMPTY ARE DIFFERENT: `coreletSplit_.find(dim) ==
+/// end()` skips the divide entirely (`dsc/dims.cpp:793`), while a stated split with no shares is a
+/// map the reference walks and leaves alone.
+struct NotSymbolic {
+    /// `symbolicDimInfo_` with the dim erased, `maxSymbolicVolume_` untouched.
+    symbolic: Symbolic,
+    /// `primaryDimToValHandler_st(dim) = divideByFactor(primaryDimToVal_st(dim))`.
+    value: Extent,
+    /// `coreletSplit_.at(dim)`, each share divided.
+    corelet: Option<Vec<Extent>>,
+    /// `rowSplit_.at(dim)`, likewise.
+    rows: Option<BTreeMap<Corelet, Vec<Extent>>>,
+    /// `peSfpSplit_.at(dim)`, likewise, both halves.
+    pe_sfp: Option<BTreeMap<Corelet, v1::PeSfpShares>>,
 }
 
 /// `ceil(a / double(b))` — the FLOATING-POINT ceiling the reference reaches through
@@ -501,8 +521,6 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
     /// ⛔ AND EVERY ABORT IS DECIDED BEFORE THE FIRST WRITE, as in [`Self::make_dim_symbolic`]: one
     /// stop, and a half either wholly rewritten or wholly untouched.
     fn make_dim_not_symbolic(&mut self, at: v1::StageSite, dim: PrimaryDim) {
-        use crate::schedule::l3::dsc::Symbolic;
-
         let Some(half) = self.half(at) else {
             return;
         };
@@ -512,7 +530,7 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         };
         let granularity = i64::from(info.granularity.get());
         let max = i64::from(info.max_size.0);
-        let planned = (|| {
+        let planned = (|| -> Option<NotSymbolic> {
             // `DT_CHECK(maxSize_ % granularity_ == 0)` (`:784`) then `DT_CHECK(factor != 0)` (`:786`).
             if granularity == 0 || max % granularity != 0 {
                 return None;
@@ -592,15 +610,21 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
                 ),
                 None => None,
             };
-            Some((symbolic, value, corelet, rows, pe_sfp))
+            Some(NotSymbolic {
+                symbolic,
+                value,
+                corelet,
+                rows,
+                pe_sfp,
+            })
         })();
-        let Some((symbolic, value, corelet, rows, pe_sfp)): Option<(
-            Symbolic,
-            Extent,
-            Option<Vec<Extent>>,
-            Option<BTreeMap<Corelet, Vec<Extent>>>,
-            Option<BTreeMap<Corelet, v1::PeSfpShares>>,
-        )> = planned
+        let Some(NotSymbolic {
+            symbolic,
+            value,
+            corelet,
+            rows,
+            pe_sfp,
+        }) = planned
         else {
             todo!(
                 "v1::ExploreStages::make_dim_not_symbolic: makeDimNotSymbolic (dsc/dims.cpp:781-803) \
