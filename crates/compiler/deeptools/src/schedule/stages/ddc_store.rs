@@ -371,23 +371,25 @@ impl v1::CoreletShapes for Dsc2Store<'_, '_> {
     }
 
     /// ⛔ `CoreD_.primaryDimToVal_st(dim)` — `CoreD_` is a `DataStructDims` member of
-    /// `DesignSpaceConfig` beside `dataStageParam_` (`dsc/designSpaceConfig.h:102`), and
+    /// `DesignSpaceConfig` (`dsc/designSpaceConfig.h:97`, with `CoreletD_` at `:98`), and
     /// [`crate::schedule::l3::dsc::DesignSpaceConfig`] projects only the CORE DATA STAGE, which is a
     /// different object: `corelet_shares` is derived from `dataStageParam_.at(0)` *where the core
     /// data stage exists, else `CoreletD_` against `CoreD_`* — a RATIO, not either extent.
+    ///
+    /// ⛔ CITATION CORRECTED: `:102` names `coordinateMasking_`, four members past these two.
     fn core_extent(&self, _dim: PrimaryDim) -> crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent {
         todo!(
             "v1::CoreletShapes::core_extent: wants CoreD_.primaryDimToVal_st(dim) \
-             (dsc/designSpaceConfig.h:102) — l3::dsc::DesignSpaceConfig projects only the RATIO \
+             (dsc/designSpaceConfig.h:97) — l3::dsc::DesignSpaceConfig projects only the RATIO \
              CoreletD_/CoreD_ as corelet_shares, never either extent"
         )
     }
 
-    /// ⛔ `CoreletD_.primaryDimToVal_st(dim)` — the same gap.
+    /// ⛔ `CoreletD_.primaryDimToVal_st(dim)` (`dsc/designSpaceConfig.h:98`) — the same gap.
     fn corelet_extent(&self, _dim: PrimaryDim) -> crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent {
         todo!(
             "v1::CoreletShapes::corelet_extent: wants CoreletD_.primaryDimToVal_st(dim) \
-             (dsc/designSpaceConfig.h:102) — see core_extent"
+             (dsc/designSpaceConfig.h:98) — see core_extent"
         )
     }
 }
@@ -848,25 +850,66 @@ impl tr::TransferWalk for Dsc2Store<'_, '_> {
 }
 
 impl tr::ScopeTree for Dsc2Store<'_, '_> {
-    /// ⛔ `getInnermostCommonAncestor(a, b, pathToA, pathToB)` — the two PATHS are what
-    /// [`tr::Ancestry`] carries, and building them is a `dsc/dsc2.cpp` walk that also classifies
-    /// every node on each path.
+    /// ⛔ `getInnermostCommonAncestor(a, b, pathToA, pathToB)` — THE WALK IS PORTABLE; THE
+    /// PER-LOOP CLASSIFICATION IS THE ONE MISSING `bool`.
+    ///
+    /// ⭐ THE WALK NEEDS NOTHING THIS CARRIER LACKS. `dsc/dsc2.cpp:4243-4281` is two `getPrev()`
+    /// chains and a prune: push `consumer`'s ancestors, then `transfer`'s until one is already on
+    /// that list, then erase the consumer path past that node — all of which is
+    /// [`super::tree::TreeData::parent`], which this file already reads. Its `DT_ERROR` *"Failed to
+    /// find the common ancestor"* is unspellable in [`tr::Ancestry`] by construction, as that type's
+    /// own doc says.
+    ///
+    /// ⛔⛔ WHAT STOPS IT IS [`tr::PathLoop::parametric`] = `isParametricLoop_`, THE SAME `bool`
+    /// [`tu::ScheduleSurgery::is_parametric`] names. It is not cosmetic: [`tr::PathNode::unsupported`]
+    /// is *"a CONDITION, or a LOOP that `isParametricLoop()`"*, so classifying every loop as
+    /// non-parametric would answer `false` for a parametric ancestor and PERMIT a FIFO both entries
+    /// 242 and 243 refuse. That is a wrong program, not a missing diagnostic, so the walk waits on the
+    /// field rather than assuming its default.
     fn ancestry(&self, _transfer: NodeId, _consumer: NodeId) -> tr::Ancestry {
         todo!(
-            "tr::ScopeTree::ancestry: wants getInnermostCommonAncestor(transfer, consumer, \
-             pathToTransfer, pathToConsumer) — a `dsc/dsc2.cpp` walk that also classifies every node \
-             on both paths"
+            "tr::ScopeTree::ancestry: the getInnermostCommonAncestor walk (dsc/dsc2.cpp:4243-4281) \
+             is portable off TreeData::parent, but tr::PathLoop::parametric is \
+             LoopNode::isParametricLoop_ (dsc/dsc2.h:617), which transformation_util::LoopNode does \
+             not carry — defaulting it to false permits a FIFO entries 242/243 refuse"
         )
     }
 
-    /// ⛔ `getNextView(ALL)` PLUS the node's own classification as a [`tr::ScopeNode`], whose
-    /// COMPUTE arm this tree has no node for.
-    fn scope_node(&self, _node: NodeId) -> tr::ScopeNode {
-        todo!(
-            "tr::ScopeTree::scope_node: wants the node classified as a ScopeNode with its \
-             getNextView(ALL) children — its Compute arm needs a COMPUTE node, which \
-             super::tree::Kind has no arm for"
-        )
+    /// `getNextView(ALL)` PLUS the node's own classification — ⭐ ANSWERED, and BOTH halves are
+    /// closed readings of the authority rather than a model of it.
+    ///
+    /// ⭐ `getNextView(ALL)` IS EVERY CHILD, UNFILTERED. `BlockNode::getNextView` keeps each of
+    /// `next_` for which `isNodeRelevant(comp, clId, coreId)` holds (`dsc/dsc2.cpp:1984-1993`), and
+    /// `isNodeRelevant` RETURNS TRUE UNCONDITIONALLY for `ALL` — `if (comp == ALL) { ...; return
+    /// true; }`, whose only guard is a `DT_ERROR` for a `clId`/`coreId` filter, and both are `-1` here
+    /// (`dsc/dsc2.cpp:1916-1923`). `ConditionNode::getNextView` overrides it only to force `ALL` on a
+    /// loop-guarded node and otherwise delegates (`:1995-2001`), so at `ALL` both arms reduce to the
+    /// same list. ⛔ THIS IS WHY `relevantComps_` IS NOT NEEDED HERE while
+    /// [`v1::ConditionSimplification::relevant_comps`] still stops on it: that trait asks for the map
+    /// itself, and `ALL` is the one component value that never consults it.
+    ///
+    /// ⭐ THE `Nest` ARM IS EXACTLY THE `dynamic_cast<const BlockNode*>` SET, read off the class
+    /// hierarchy: `LoopNode` (`dsc/dsc2.h:563`) and `ConditionNode` (`:685`) both derive from
+    /// `BlockNode`, while `TransferNode` (`:814`), `SyncNode` (`:964`), `AllocateNode` (`:974`) and
+    /// `StickMaskNode` (`:1059`) derive from `ScheduleNode` directly — the same three-kind set
+    /// `isBlockNode()` names (`:479`).
+    ///
+    /// ⛔ A NODE THIS TREE DOES NOT HOLD IS [`tr::ScopeNode::Other`], which is the reference's own
+    /// fall-through and the CONSERVATIVE answer at both callsites: `children_of` maps it to no
+    /// children and `uses_communication_channel` to *"does not drive the FIFO"*
+    /// (`ddc/transformation.rs:1011-1016`, `:1042`).
+    fn scope_node(&self, node: NodeId) -> tr::ScopeNode {
+        self.with_tree(|tree| match tree.kind_of(node) {
+            Some(Kind::Compute(held)) => tr::ScopeNode::Compute(held.clone()),
+            Some(Kind::Transfer(held)) => tr::ScopeNode::Transfer(held.clone()),
+            // BLOCK, LOOP and CONDITION — the `dynamic_cast<const BlockNode*>` that succeeds.
+            Some(Kind::Block | Kind::Loop(_) | Kind::Condition(_)) => {
+                tr::ScopeNode::Nest(tree.children(node))
+            }
+            Some(Kind::Allocate(..) | Kind::Sync(_) | Kind::StickMask(_)) | None => {
+                tr::ScopeNode::Other
+            }
+        })
     }
 
     fn parent(&self, node: NodeId) -> Option<NodeId> {
@@ -1078,18 +1121,35 @@ impl tu::DscAllocations for Dsc2Store<'_, '_> {
             SenComponent::Ptirf => DdcMemory::PtiRf,
             SenComponent::L0 => DdcMemory::L0,
             SenComponent::L0Scale => DdcMemory::L0Scale,
+            // ⛔ NOT A GAP TO CLOSE: the eight arms above are `ddc::memories`
+            // (`ddc/ddc_metadata.h:20-21`) plus `L0_SCALE` as its own `newAllocations_` key. A
+            // component outside that set is a `component_` no `ddc` memory tracks, and mapping it to
+            // a neighbouring memory would file the allocation in one it does not live in.
             other => todo!(
-                "tu::DscAllocations::alloc_component: {other:?} has no DdcMemory arm — ddc tracks \
-                 nine memories (ddc/metadata.rs:840-861) and this component is not one of them"
+                "tu::DscAllocations::alloc_component: {other:?} is not one of the eight \
+                 ddc::memories (ddc/ddc_metadata.h:20-21) nor L0_SCALE, so it has no DdcMemory arm"
             ),
         }
     }
 
-    /// ⛔ `allocNode->ldsIdx_`/`constIdx_` — [`DataOrigin`]'s constant arm again.
+    /// ⛔ `allocNode->ldsIdx_`/`constIdx_` AS ONE ORIGIN — ONE `int` TO PROJECT, and its absence is
+    /// not substitutable.
+    ///
+    /// ⭐ THE TWO ARE SIBLING FIELDS: `int ldsIdx_ = -1` (`dsc/dsc2.h:976`) beside `int constIdx_ =
+    /// -1` (`:977`), and exactly one of them is set on any allocation.
+    /// [`crate::schedule::l3::dl_ops::L3AllocateNode`] projects `lds` as a bare (non-optional)
+    /// [`LdsIdx`] and no `constIdx_` at all, so a CONSTANT allocation reads back as
+    /// [`DataOrigin::LabeledDs`] of whatever `-1` became — a labelled DS that is not its origin.
+    ///
+    /// ⭐ THE ddc VIEW ALREADY CARRIES BOTH ([`AllocateNode::lds`] and [`AllocateNode::const_idx`],
+    /// both [`Option`]), but it exists only for an allocation the memory tracker PLACED, so reading it
+    /// here would answer for some allocations and silently mis-answer for the rest. The projection
+    /// belongs on `L3AllocateNode`.
     fn alloc_origin(&self, _alloc: AllocId) -> DataOrigin {
         todo!(
-            "tu::DscAllocations::alloc_origin: wants allocNode->ldsIdx_/constIdx_ as a DataOrigin — \
-             its constant arm reads constIdx_, which l3::dl_ops::L3AllocateNode does not carry"
+            "tu::DscAllocations::alloc_origin: wants allocNode->ldsIdx_ (dsc/dsc2.h:976) / \
+             constIdx_ (:977) as a DataOrigin — l3::dl_ops::L3AllocateNode carries lds as a bare \
+             LdsIdx and no constIdx_, so a constant allocation cannot be told from a labelled one"
         )
     }
 
@@ -1290,11 +1350,22 @@ impl tu::AllocateCloning for Dsc2Store<'_, '_> {
         )
     }
 
+    /// ⛔ `allocNode->tempStorageForCompute_ = compute` — ONE FIELD, AND THE ddc VIEW IS THE WRONG
+    /// PLACE TO PUT IT.
+    ///
+    /// ⭐ `const ComputeNode* tempStorageForCompute_ = nullptr` (`dsc/dsc2.h:978`) is a sibling of
+    /// `ldsIdx_`/`constIdx_` on the node itself, so the reference writes it on ALLOCATIONS THAT ARE
+    /// NOT PLACED YET. [`AllocateNode::temp_storage_for_compute`] projects it, but that is the ddc
+    /// view [`super::tree::Org`] files only for a placed allocation — and its one caller
+    /// (`ddc/transformation_util.rs:1241`) writes it on a freshly cloned one. So routing the write
+    /// there would drop it for exactly the allocations it is written for; the field belongs on
+    /// [`crate::schedule::l3::dl_ops::L3AllocateNode`] beside `lds`.
     fn set_temp_storage_for_compute(&mut self, _alloc: AllocId, _compute: NodeName) {
         todo!(
             "tu::AllocateCloning::set_temp_storage_for_compute: wants \
-             allocNode->tempStorageForCompute_ = compute (dsc/dsc2.h:978) — a field \
-             l3::dl_ops::L3AllocateNode does not carry"
+             allocNode->tempStorageForCompute_ = compute (dsc/dsc2.h:978) — \
+             l3::dl_ops::L3AllocateNode does not carry it, and the ddc view that does exists only \
+             for a PLACED allocation while its caller writes an unplaced clone"
         )
     }
 }
@@ -1454,14 +1525,27 @@ impl tu::NewLabeledDs for Dsc2Store<'_, '_> {
         )
     }
 
-    /// ⛔ Every `{ALLOCATE, TRANSFER, COMPUTE, LOOP}` slot WITH its lds index — the COMPUTE and the
-    /// parametric-LOOP arms are both unspellable here (no Compute arm, no `parametricLdsIdx_`).
+    /// ⛔ Every `{ALLOCATE, TRANSFER, COMPUTE, LOOP}` slot WITH its lds index — THREE OF THE FOUR ARMS
+    /// ARE READABLE NOW; the fourth is the blocker.
+    ///
+    /// ⭐ [`tu::TreeLdsSlot::Allocate`] is [`super::tree::TreeData::allocate`]'s `lds`,
+    /// [`tu::TreeLdsSlot::Transfer`] is the transfer's `src`/`dsts` `my_lds_idx`, and
+    /// [`tu::TreeLdsSlot::Compute`] is the compute's `inputs`/`outputs` `my_lds_idx` — reachable since
+    /// [`super::tree::Kind::Compute`] holds the node and `kind_of` is `pub` (see the module note).
+    ///
+    /// ⛔⛔ [`tu::TreeLdsSlot::ParametricLoop`] IS BOTH HALVES OF THE SAME GAP. It carries
+    /// `loopNode->parametricLdsIdx_` (`dsc/dsc2.h:618`) — which [`tu::LoopNode`] does not project —
+    /// AND it is emitted *"ONLY where `isParametricLoop()` holds"* (`:599`), which is
+    /// `isParametricLoop_` (`:617`), the same `bool` [`tu::ScheduleSurgery::is_parametric`] and
+    /// [`tr::ScopeTree::ancestry`] wait on. So the walk cannot even decide whether to emit the slot.
+    /// A PARTIAL walk would silently leave entry 308's repointing half done, which is why all four
+    /// arms stop together.
     fn tree_lds_slots(&self) -> Vec<(tu::TreeLdsSlot, Option<LdsIdx>)> {
         todo!(
-            "tu::NewLabeledDs::tree_lds_slots: wants every ALLOCATE/TRANSFER/COMPUTE/LOOP slot \
-             naming a labelled DS — its Compute arm needs a COMPUTE node and its ParametricLoop arm \
-             needs LoopNode::parametricLdsIdx_, neither of which this tree carries. A PARTIAL walk \
-             would silently leave entry 308's repointing half done."
+            "tu::NewLabeledDs::tree_lds_slots: its ALLOCATE/TRANSFER/COMPUTE arms are all readable \
+             off this tree now, but ParametricLoop needs BOTH LoopNode::parametricLdsIdx_ \
+             (dsc/dsc2.h:618) and isParametricLoop_ (:617) to decide whether the slot exists at all \
+             — a partial walk leaves entry 308's repointing half done"
         )
     }
 
@@ -1537,12 +1621,27 @@ impl v1::PrepDsc for Dsc2Store<'_, '_> {
         })
     }
 
-    /// ⛔ `computeOp_.at(at).opConsts.at("useZeroMean")[0] == 1`.
+    /// ⛔ `computeOp_.at(at).opConsts.find("useZeroMean")->second[0] == 1` — ONE MAP TO PROJECT, AND
+    /// IT IS A SECOND, INDEPENDENT TRIGGER.
+    ///
+    /// ⭐ THE FIELD IS `std::map<std::string, std::array<uint32_t, 4>> opConsts`
+    /// (`dsc/dscdefn.h:505`), which [`v1::DscComputeOp`] does not project — it carries `op_func`,
+    /// `ex_unit`, `format`, `inputs` and `outputs`. ⛔ AND `[0]` CANNOT THROW THERE, because the value
+    /// is a FIXED four-element array and not a vector: unlike
+    /// [`Self::declares_zero_mean_constant`]'s `getSingleDataStrict(constinfo.data_).at(0)`, no
+    /// emptiness arm exists to port.
+    ///
+    /// ⛔⛔ WHAT A `false` HERE COSTS. `ddc/ddcv1.cpp:2064-2078` runs TWO checks in sequence under
+    /// `opFuncName == EXX2`, each swapping to `EXX2_ZEROMEAN` on its own: the `constantInfo_` scan
+    /// (`:2065-2072`, which [`Self::declares_zero_mean_constant`] answers) and this `opConsts` lookup
+    /// (`:2073-2077`). So a program whose constant declares the switch still swaps — but one that
+    /// declares it ONLY on the op keeps `EXX2` and computes a different mean. That is why this stops
+    /// rather than answering the map's absence as `false`.
     fn op_declares_zero_mean(&self, _at: usize) -> bool {
         todo!(
-            "v1::PrepDsc::op_declares_zero_mean: wants computeOp_.at(at).opConsts.at(\
-             \"useZeroMean\")[0] == 1 (ddc/ddcv1.cpp:2074-2078) — opConsts is not a field of \
-             v1::DscComputeOp, and this DECIDES an op-func swap"
+            "v1::PrepDsc::op_declares_zero_mean: wants computeOp_.at(at).opConsts[\"useZeroMean\"][0] \
+             == 1 (ddc/ddcv1.cpp:2073-2077) — opConsts (dsc/dscdefn.h:505) is not a field of \
+             v1::DscComputeOp, and this is the SECOND independent trigger of the EXX2_ZEROMEAN swap"
         )
     }
 
