@@ -1340,3 +1340,254 @@ mod tests_e017 {
         );
     }
 }
+
+/// WHICH ALLOCATION ONE NODE SIZES WHEN IT IS BOTH THE LOCATION AND THE SUBJECT — `node->nodeType_ ==
+/// ALLOCATE ? node : myLds.memOrg_.at(comp).allocateNode_` (`dsc/dsc2.cpp:3762-3764`) reached with
+/// `nodeForLocation == node` (`:3972-3974`), which is what collapses e017's two nodes into one.
+///
+/// ⛔ THE `.at(comp)` AND A NULL `allocateNode_` ARE THE CALLER'S STOP: [`MemOrg`] hands back no
+/// `dsc2::AllocateNode` for an arbitrary component, so the caller resolves that cell and NAMES which
+/// of the two it resolved by picking a variant — the same reason [`AllocSizing`] is a parameter.
+///
+/// [`MemOrg`]: super::dsc::MemOrg
+#[derive(Debug, Clone, Copy)]
+pub enum CapacityNode<'a> {
+    /// `nodeType_ == ALLOCATE`, where `static_cast<const dsc2::AllocateNode*>(node)` IS the node
+    /// stating the location, so the sizing arm reads this very allocation's own `component_`.
+    Allocation {
+        /// The allocation, which is also the node.
+        alloc: &'a AllocateNode,
+        /// The five members [`AllocSizing`] carries for it.
+        sizing: AllocSizing<'a>,
+        /// `nonUnifiedAllocInHBM_`, measured `false` on all 1899 allocate nodes of g0.
+        non_unified_in_hbm: bool,
+    },
+    /// Every other `nodeType_` — a transfer, compute, loop, sync or condition states the location and
+    /// `myLds.memOrg_.at(comp).allocateNode_` is the allocation sized there.
+    MemOrgOf {
+        /// `myLds.memOrg_.at(comp).allocateNode_`, A DIFFERENT NODE from the one stating the location,
+        /// which is why its `component_` is never the sizing arm.
+        alloc: &'a AllocateNode,
+        /// The five members [`AllocSizing`] carries for it.
+        sizing: AllocSizing<'a>,
+    },
+}
+
+/// Replaces: e018_getBufferCapacityForNodePerDim
+///
+/// [`buffer_capacity_per_dim_at`] SIZED AT THE NODE'S OWN LOCATION — the ordinary spelling, where the
+/// single node handed over both says where the sizing happens and which allocation is sized.
+///
+/// ⛔ THE SIZING ARM IS DERIVED AND NOT SUPPLIED, AND THAT IS THE WHOLE CONTENT OF THE TEN LINES
+/// (`dsc/dsc2.cpp:3966-3975`): only an ALLOCATE node reaches the HBM arm, off its OWN `component_`
+/// (`:3626`), so an HBM allocation at the tree root is sized whole as `N_` while every other node kind
+/// sizes its memOrg allocation by the loops above ITSELF. Handing that memOrg node's component over as
+/// the arm would size a transfer at the root as whole HBM, and one loop deeper would stop outright on
+/// *"HBM allocation should be at root of schedule tree"* (`:3628`).
+/// ⛔ [`None`] IS EVERY STOP OF [`buffer_capacity_per_dim_at`], and `Extent(-1)` is still a size.
+#[must_use]
+pub fn buffer_capacity_per_dim(
+    node: CapacityNode<'_>,
+    at: SampledBuffer<'_>,
+    form: CapacityForm,
+    ancestors: &AncestorLoops<'_>,
+    dsc: &(impl SizeDsc + ?Sized),
+) -> Option<Vec<(PrimaryDim, Extent)>> {
+    let (sized, alloc, sizing) = match node {
+        CapacityNode::Allocation {
+            alloc,
+            sizing,
+            non_unified_in_hbm,
+        } => (
+            SizedNode::Allocate {
+                component: alloc.component,
+                non_unified_in_hbm,
+            },
+            alloc,
+            sizing,
+        ),
+        CapacityNode::MemOrgOf { alloc, sizing } => (SizedNode::Other, alloc, sizing),
+    };
+    buffer_capacity_per_dim_at(sized, alloc, sizing, at, form, ancestors, dsc)
+}
+
+#[cfg(test)]
+mod tests_e018 {
+    //! ⭐⭐ THE CAPACITY `sdsc_14`'s OWN EXPORT RECORDED, ASKED THE ORDINARY WAY —
+    //! `/Users/nickm/tmp/bridge1-fixtures/g0/debug/sdsc_14/sdsc.json`, DSC `14_t729_fq_afp8_op`, over
+    //! [`super::tests_e015::Sdsc14`]'s four seams and its own `scheduleTreeHeadDenId_: 0`. All four
+    //! cases are ONE labelled DS, `labeledDs_[1]` — `dsType_: "OUTPUT"`, `scale_: [1,1,1]`,
+    //! `wordLength: 1`, `primaryDsInfo_["OUTPUT"].stickSize_: [128]` — so nothing but the node moves.
+    //!
+    //! * `allocate_lds1_lx` (`component_: "lx"`, `numBuffers_: 2`, hanging off `loop_ds0_ds1_mb` →
+    //!   `loop_ds0_ds1_out` → `loop_ds0_ds1_y`, each `denId_: 1`) is `[(mb,1),(out,128),(y,1)]`: `out`
+    //!   is the CHUNK stage, already a whole stick. ⭐ WHERE THE REFERENCE WROTE THAT DOWN: e019 reads
+    //!   `128 * wordLength 1 = 128` bytes, an ODD number of 128-byte sticks, so L3's
+    //!   `forceEvenNumSticks` adds one (`dsc/dsc2.cpp:3996-4003`) — **256**, which is exactly the
+    //!   `bufferOffsetCoreCorelet_` the export prints on that node for all 16 cores.
+    //! * `allocate-Tensor1_hbm` (`component_: "hbm"`, `prev_: ""`) is `[(mb,1),(out,2048),(y,1)]`:
+    //!   `out` is `N_`, and `N_.out_` is 2048 in that same export.
+    //! * that same HBM node sampled at `SenComponent::Lx` — the `L3DlOpsScheduler.cpp:5886` spelling,
+    //!   where the sampled component is NOT the one the allocation sits in — is STILL
+    //!   `[(mb,1),(out,2048),(y,1)]`, because the sizing arm is the allocation's OWN `component_`.
+    //!
+    //! ⭐⭐ THE NEGATIVE CONTROL IS THE DERIVATION ITSELF, not a second fixture: the last case hands
+    //! `allocate-Tensor1_hbm` over as a memOrg allocation at the SAME root position with the SAME
+    //! sample, and `out` drops from 2048 to the CORE stage's 128 — `dataStageParam_["0"].ss_.out_`,
+    //! which the head's own `denId_: 0` selects. Only the variant differs, and neither number is
+    //! reachable from the other arm.
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+    use crate::schedule::ddc::metadata::DatastageId;
+    use crate::schedule::ddc::transformation::{DsType, Scale};
+    use crate::schedule::dsc2::{
+        AllocLayout, AllocPlacement, Coordinate, MaxDimSize, NodeName, NumBuffers, StartAddress,
+    };
+
+    use super::super::dsc::{LabeledDs, Pinning, SenComponent};
+    use super::tests_e015::{Sdsc14, dividing};
+    use super::{
+        AllocSizing, AllocateNode, AncestorLoops, CapacityForm, CapacityNode, LdsIdx, Padding,
+        SampledBuffer, buffer_capacity_per_dim,
+    };
+
+    const MB: PrimaryDim = PrimaryDim::Mb;
+    const OUT: PrimaryDim = PrimaryDim::Out;
+    const Y: PrimaryDim = PrimaryDim::Y;
+
+    /// One of `sdsc_14`'s `labeledDs_[1]` allocate nodes as the export prints it: `layoutDimOrder_:
+    /// ["mb","out","y"]` with `maxDimSizes_: [-1,-1,-1]`, `padding_: {}` and `gapStickSpread_: {}`.
+    fn tensor1(name: &str, component: SenComponent, num_buffers: NumBuffers) -> AllocateNode {
+        AllocateNode {
+            name: NodeName(name.to_owned()),
+            component,
+            lds: Some(LdsIdx(1)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new(
+                (MB, MaxDimSize::Unset),
+                vec![(OUT, MaxDimSize::Unset), (Y, MaxDimSize::Unset)],
+            ),
+            start_address: StartAddress::default(),
+            placement: AllocPlacement {
+                num_buffers,
+                padding: Padding::default(),
+                buffer_offset: BTreeMap::new(),
+                is_start_addr_symbolic: false,
+            },
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        }
+    }
+
+    /// e018 — the two positions `sdsc_14` states for one labelled DS, and the arm the node picks.
+    #[test]
+    fn one_node_states_both_the_location_and_the_allocation_it_sizes() {
+        let dsc = Sdsc14::of();
+        // `labeledDs_[1]`: `scale_: [1,1,1]` zipped onto `layoutDimOrder_: ["mb","out","y"]`.
+        let tensor1_lds = LabeledDs::new(
+            DsType::Output,
+            vec![
+                (MB, Scale::Sized(1.0)),
+                (OUT, Scale::Sized(1.0)),
+                (Y, Scale::Sized(1.0)),
+            ],
+            LdsIdx(1),
+            Pinning::default(),
+        );
+        // `allocateCoordinates_` with `foldConstructed_: 0`, `ignoreSymbolicVolumeLimits_: 0`,
+        // `indirectAllocType_: "no_indirection"` and `backGapCore_: {}` — all four nodes state these.
+        let coordinates = Coordinate::default();
+        let no_gaps = BTreeSet::new();
+        let sizing = AllocSizing {
+            allocate_coordinates: &coordinates,
+            slice_view_coordinates: None,
+            ignore_symbolic_volume_limits: false,
+            indirect: None,
+            back_gap_dims: &no_gaps,
+        };
+        let head = Some(DatastageId(0));
+
+        // `getBufferCapacityForNodePerDim(allocate_lds1_lx, 1, LX, -1, -1)`, three `denId_: 1` loops
+        // above it: the CHUNK stage's 128, which the exported offset 256 is `forceEvenNumSticks` of.
+        let mb_loop = dividing("loop_ds0_ds1_mb", MB, DatastageId(1));
+        let out_loop = dividing("loop_ds0_ds1_out", OUT, DatastageId(1));
+        let y_loop = dividing("loop_ds0_ds1_y", Y, DatastageId(1));
+        let lx = tensor1("allocate_lds1_lx", SenComponent::Lx, NumBuffers::Double);
+        assert_eq!(
+            buffer_capacity_per_dim(
+                CapacityNode::Allocation {
+                    alloc: &lx,
+                    sizing,
+                    non_unified_in_hbm: false,
+                },
+                SampledBuffer::of(LdsIdx(1), &tensor1_lds, SenComponent::Lx, None, None),
+                CapacityForm::DEFAULTS,
+                &AncestorLoops::of(vec![&mb_loop, &out_loop, &y_loop], head),
+                &dsc,
+            ),
+            Some(vec![(MB, Extent(1)), (OUT, Extent(128)), (Y, Extent(1))])
+        );
+
+        // `getBufferCapacityForNodePerDim(allocate-Tensor1_hbm, 1, HBM, -1, -1)` at the tree root:
+        // `N_`, because THIS node is the allocation and its own `component_` is `hbm`.
+        let hbm = tensor1(
+            "allocate-Tensor1_hbm",
+            SenComponent::Hbm,
+            NumBuffers::Single,
+        );
+        let at_hbm = SampledBuffer::of(LdsIdx(1), &tensor1_lds, SenComponent::Hbm, None, None);
+        assert_eq!(
+            buffer_capacity_per_dim(
+                CapacityNode::Allocation {
+                    alloc: &hbm,
+                    sizing,
+                    non_unified_in_hbm: false,
+                },
+                at_hbm,
+                CapacityForm::DEFAULTS,
+                &AncestorLoops::of(Vec::new(), head),
+                &dsc,
+            ),
+            Some(vec![(MB, Extent(1)), (OUT, Extent(2048)), (Y, Extent(1))])
+        );
+
+        // ⭐ THE SECOND CONTROL, AND A REAL SPELLING: `getBufferCapacityForNodePerDim(indAllocation,
+        // indexLdsIdx, indirectLoc->storage_, -1, -1, true)` (`L3DlOpsScheduler.cpp:5886`) samples at a
+        // component the allocation itself is NOT in. The arm comes off `component_` (`dsc2.cpp:3626`),
+        // so the SAME hbm node sampled at LX is still `N_` — reading the arm off the sample says 128.
+        assert_eq!(
+            buffer_capacity_per_dim(
+                CapacityNode::Allocation {
+                    alloc: &hbm,
+                    sizing,
+                    non_unified_in_hbm: false,
+                },
+                SampledBuffer::of(LdsIdx(1), &tensor1_lds, SenComponent::Lx, None, None),
+                CapacityForm::DEFAULTS,
+                &AncestorLoops::of(Vec::new(), head),
+                &dsc,
+            ),
+            Some(vec![(MB, Extent(1)), (OUT, Extent(2048)), (Y, Extent(1))])
+        );
+
+        // THE CONTROL: the SAME allocation, the SAME position, the SAME sample — reached as
+        // `myLds.memOrg_.at(HBM).allocateNode_` beside a node that is NOT an allocate. The HBM arm is
+        // out of reach, so `out` is the head's own datastage 0, the CORE stage: 128 and not 2048.
+        assert_eq!(
+            buffer_capacity_per_dim(
+                CapacityNode::MemOrgOf {
+                    alloc: &hbm,
+                    sizing,
+                },
+                at_hbm,
+                CapacityForm::DEFAULTS,
+                &AncestorLoops::of(Vec::new(), head),
+                &dsc,
+            ),
+            Some(vec![(MB, Extent(1)), (OUT, Extent(128)), (Y, Extent(1))])
+        );
+    }
+}
