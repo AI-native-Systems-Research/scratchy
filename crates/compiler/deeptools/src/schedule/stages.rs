@@ -1113,28 +1113,36 @@ mod tests {
         // `AllocateNode` projections) and `ddl.parametric_loop` (`numId_ = denId_ = -1`,
         // `ddl_conversion.cpp:1127-1128`, which our total `DatastageId` cannot spell, so it REFUSES).
         //
-        // ⚠️ NOT ESTABLISHED: whether this block IS the reference's head node or a SECOND node
-        // sharing its name. The seed's own head is also called `root_level_operations`, which is why
-        // the conversion's parent lookup had to become a `NodeId` rather than a `NodeName`.
-        // ⭐⭐ 24, AND THE +1 OVER 23 IS THE DATASTAGE-ID FIX. `DdlConversion::{core,chunk}_datastage`
-        // were `Option<DatastageId>` that NOTHING in the crate ever wrote, so
-        // `op_get_external_datastage` refused on **op 0 of every vendored template** —
-        // `broadcast_ops.ddl`'s dataflow region opens with two `ddl.get_external_datastage`. They are
-        // `const int core_dstgid = 0; const int chunk_dstgid = 1;` in the authority
-        // (`ddc/ddc_metadata.h:210-211`) and this crate already carried both as
-        // `Metadata::{CORE,CHUNK}_DSTGID`; stating them is the whole change.
+        // ⭐⭐⭐ 30, AND THE DDL EXPANSION IS WHAT PUT SEVEN OF THEM HERE. Two fixes got it: the
+        // core/chunk datastage ids, which were `Option<DatastageId>` NOTHING ever wrote so
+        // `op_get_external_datastage` refused on op 0 of every template (they are
+        // `const int core_dstgid = 0; const int chunk_dstgid = 1;`, `ddc/ddc_metadata.h:210-211`); and
+        // `set_data_loc_and_info`'s external arm, which read the DDL walk's OWN arena
+        // (`state.lds_memory`) where the reference reads `labeledDs_.at(..).memOrg_[storage]
+        // .allocateNode_` off the SCHEDULE TREE (`ddc/ddl/ddl_conversion.cpp:917-925`) — an allocation
+        // another stage already placed, so the walk's arena is empty there by construction.
         //
-        // ⛔ 24 IS NOT 30, AND THE GAP IS THE POINT. `g0/debug/sdsc_0/sdsc.json` — IBM's own scheduled
-        // output for this program, counted — holds **30** nodes, and still owes six below
-        // `lx_below_schedule`: `transfer_lds1_src:lxlu_dst:sfp`, `loop_ds2_ds3_out_mb_y`,
-        // `transfer_lds0_src:lxlu_dst:sfp`, `loop_ds2_ds3_out_mb_y__1`, `compute_sfp_fma16`,
-        // `transfer_lds2_src:sfp_dst:lxsu`. So this asserts a MEASURED WAYPOINT, not completion, and
-        // whoever moves it next should move it toward 30 by name — not to whatever our run reports.
+        // ⛔⛔ 30 == 30 IS A COINCIDENCE AND MUST NOT BE READ AS COMPLETION. We hold **29 of the
+        // reference's 30**; `node_count()` reads 30 only because it also counts OUR head, which the
+        // reference never dumps (`ScheduleTree::head_` is an unnamed `LoopNode`, `dsc/dsc2.h:623`).
+        // Two off-by-ones cancelling. ⭐ STILL OWED, by name: `transfer_lds2_src:sfp_dst:lxsu`.
+        //
+        // ⭐ AND THIS SETTLES THE OLD "NOT ESTABLISHED" NOTE HERE. The reference's 30 split **9 DDL /
+        // 21 stage-2a**, not 8/22: `root_level_operations` occurs at exactly ONE place in the whole
+        // C++ tree (`ddl_conversion.cpp:2782`), so it is DDL-minted, not the seed's. Our node 23 IS
+        // that node; our node 0 is the reference's undumped `head_` wearing a name it never gives it.
+        //
+        // ⛔ WHAT STOPS IT NOW IS A REPRESENTATION DEFECT IN `build.rs`, not a wiring gap:
+        // `Names::intern` (`:503`) interns SSA names per PROGRAM by text and `Program::definition`
+        // (`:1528`) takes the FIRST statement holding one, so the two arms of a `ddl.if` shadow each
+        // other — the else arm's `%src_out_sfplx` resolves to the then arm's `ddl.unit`. Measured on
+        // `broadcast_ops` alone: 10 names are bound by more than one statement, `%sfp_state` by seven.
+        // In MLIR each region is its own scope, which is why the reference has no such problem.
         assert_eq!(
             l3_state.node_count(),
-            24,
-            "the stage-2a tree (22), `root_level_operations`, and the first node the dataflow region \
-             states now that the core/chunk datastage ids are the authority's constants"
+            30,
+            "our head, the 21 stage-2a nodes, and the 8 the DDL expansion mints — 29 of the \
+             reference's 30, one `transfer_lds2_src:sfp_dst:lxsu` short"
         );
     }
 
