@@ -710,7 +710,17 @@ impl v1::OffsetSizes for Dsc2Reads<'_, '_> {
             .unwrap_or_default()
     }
 
-    /// ⛔ Wants `getBlockTransferSizePerDim(transfer, unit, corelet)[dim]`.
+    /// ⛔ Wants `getBlockTransferSizePerDim(transfer, unit, corelet)[dim]` — the real body is
+    /// `getBlockTransferSizePerDimCustomLocation` (`dsc/dsc2.cpp:3474`, some 130 lines), which picks
+    /// a REFERENCE data location by which end is the smaller unit, walks four fallbacks to find a
+    /// `memOrg_` entry, and then reads the layout off `getSizeDataStageForNode(nodeForLocation,
+    /// allocation)` (`:3539-3541`).
+    ///
+    /// ⛔ SO IT IS BLOCKED BEHIND THE SAME SEAM [`v1::StageSizes::size_stage`] IS, and the fix is the
+    /// same one: that call returns a SYNTHESISED `dsc2::DataStage` by value.
+    /// ⚠️ AND THE SAME FACT HAS A SECOND TRAIT SPELLING —
+    /// [`crate::schedule::l3::dl_ops::DscTransferSizes::block_transfer_size_per_dim`] stands on the
+    /// same citation; whichever port lands should land once.
     fn block_transfer_size(
         &self,
         _node: NodeId,
@@ -726,8 +736,22 @@ impl v1::OffsetSizes for Dsc2Reads<'_, '_> {
     }
 
     /// ⛔ Wants `loopDistributionParamInfo.at(node).at(alloc).at(loop).at(dim)`'s
-    /// `temporalStridePostDistribution` — the METADATA's fold-distribution table, which entry 292
-    /// fills and which no carrier owns.
+    /// `temporalStridePostDistribution` — the fold-distribution table, which NO carrier owns.
+    ///
+    /// ⛔⛔ AND ENTRY 292 DOES NOT FILL IT, WHICH THIS DOC USED TO SAY. Entry 292 READS it
+    /// (`ddc/ddcv1.cpp:2455-2460`, straight into `di.loopEleOffsets_`); the WRITER is
+    /// `dsc2::computeLoopElemOffsetsFromCoordinates` (`dsc/dsc2.cpp:6694-6790`,
+    /// `temporalStridePostDistribution = innerCard * temporalAlpha / allocAlpha`), called from the
+    /// FOLD — `ddc/ddc_fold.cpp:1937`, `:3779`, `:4640`. So the fact is produced a whole stage
+    /// earlier, by the entries this file's peer carriers drive.
+    ///
+    /// ⛔⛔ AND IT IS PRODUCED NOWHERE IN THIS TREE. That call is
+    /// [`crate::schedule::ddc::fold::LoopElemOffsets`], declared as a CAPABILITY *"and not a drop"*
+    /// (`ddc/fold.rs:5128-5145`) — and its ONLY implementor is a `#[cfg(test)]` double inside
+    /// `mod tests_e356_e358` (`ddc/fold.rs:10732`). Entries 356-358's ALLOCATE arms therefore perform
+    /// their second effect in tests and in no real run, so there is no table for this method to read
+    /// and answering a stride here would be answering one nothing computed. A production implementor
+    /// of that trait is the prerequisite, and it is not this file's.
     fn temporal_stride(
         &self,
         _node: NodeId,
