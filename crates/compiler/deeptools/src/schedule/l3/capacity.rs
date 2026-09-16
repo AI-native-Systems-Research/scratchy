@@ -66,7 +66,7 @@ use super::dsc::{
 };
 
 /// WHICH NODE IS BEING SIZED — the `nodeType_ == dsc2::ScheduleNode::ALLOCATE` test
-/// (`dsc/dsc2.cpp:3625`) together with the two allocate fields the HBM arm reads.
+/// (`dsc/dsc2.cpp:3624`) together with the two allocate fields the HBM arm reads.
 ///
 /// ⛔ AN ARGUMENT AND NOT `AllocateNode`: `nonUnifiedAllocInHBM_` (`dsc/dsc2.h:1004`) has no field
 /// here, and every struct-literal site of [`crate::schedule::dsc2::AllocateNode`] lives in a fenced
@@ -84,8 +84,8 @@ pub enum SizedNode {
     Other,
 }
 
-/// THE LOOPS ABOVE A NODE — `getOwnerLoop()` applied until `getPrev()` is null (`dsc/dsc2.cpp:3645`,
-/// `:3648`, `:3676`), innermost first and WITHOUT the tree head, plus the head's own `denId_`.
+/// THE LOOPS ABOVE A NODE — `getOwnerLoop()` applied until `getPrev()` is null (`dsc/dsc2.cpp:3648`,
+/// `:3650`, `:3679`), innermost first and WITHOUT the tree head, plus the head's own `denId_`.
 ///
 /// ⛔ THE CHAIN IS AN ARGUMENT AND NOT A WALK: `ScheduleTree::head_` is itself a `LoopNode` seeded
 /// with `denId_ = 0` (`dsc/dsc2.h:623`, `:629`), so the loop that ends the reference's walk is the
@@ -132,9 +132,9 @@ pub trait SizeDsc: LdsSticks + Dsc {
 
 /// ⭐⭐ THE PRODUCTION [`SizeDsc`] — `currDsc` ITSELF, WHICH IS WHAT EVERY REFERENCE CALL SITE MAKES
 /// THIS CALL **ON**: `getBufferCapacityForNode` is a `DesignSpaceConfig` METHOD
-/// (`dsc/dsc2.cpp:3988`), and all three of its schedulers reach it through the very
+/// (`dsc/dsc2.cpp:3977`), and all three of its schedulers reach it through the very
 /// `DesignSpaceConfig *currDsc` they already hold
-/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5560`, `ddc/ddcv1.cpp:150`, `:245`).
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5558`, `ddc/ddcv1.cpp:150`, `:244`).
 ///
 /// ⛔⛔ IT EXISTS BECAUSE THE TRAIT OTHERWISE HAD ONLY TEST DOUBLES, WHICH IS THE DEFECT THAT LEFT
 /// 30,743 LINES OF PORTED LOGIC UNCALLABLE. [`SizeDsc`]'s three implementors were `Sdsc14` and two
@@ -162,7 +162,7 @@ pub struct DscSizing<'d> {
 impl<'d> DscSizing<'d> {
     /// The sizing view over that `currDsc`, [`None`] where the DSC labels a data structure it states
     /// no `getLayoutDims` order or no `primaryDsInfo_` entry for — the two `.at()`s the capacity walk
-    /// would abort on (`dsc/dsc2.cpp:4022`, `:3634`), asked ONCE here rather than per dim.
+    /// would abort on (`dsc/dsc2.cpp:4022`, `:3636`), asked ONCE here rather than per dim.
     #[must_use]
     pub fn of(dsc: &'d DesignSpaceConfig) -> Option<Self> {
         for (lds, held) in dsc.labeled_ds.indexed() {
@@ -222,7 +222,7 @@ impl LdsSticks for DscSizing<'_> {
             Some(sticks) => sticks,
             None => panic!(
                 "LdsSticks::stick_dims: primaryDsInfo_.at(labeledDs_.at({lds:?}).dsType_) throws \
-                 for an index outside labeledDs_ (dsc/dsc2.cpp:3634) — an empty stick order would \
+                 for an index outside labeledDs_ (dsc/dsc2.cpp:3636) — an empty stick order would \
                  make every stick divisor 1 and oversize the buffer by a stick"
             ),
         }
@@ -243,7 +243,7 @@ impl SizeDsc for DscSizing<'_> {
     /// THEREFORE THE ONE ARM OF THE CAPACITY WALK THIS VIEW CANNOT ANSWER, and the fix is a field on
     /// [`DesignSpaceConfig`] filled by the super-DSC projection — not a value chosen here.
     /// ⭐ THE L3 CALLER IS UNAFFECTED: `tryAlloc` proves `allocNode->component_ == LX`
-    /// (`L3DlOpsScheduler.cpp:5550-5551`) before asking, and the HBM arm needs
+    /// (`L3DlOpsScheduler.cpp:5551-5552`) before asking, and the HBM arm needs
     /// `component_ == HBM` (`dsc/dsc2.cpp:3626`).
     fn whole_data_structure(&self) -> Option<NamedDims> {
         None
@@ -274,7 +274,7 @@ impl SizeDsc for DscSizing<'_> {
 /// symbolic bounds and padding across, pruning the volume limits against the core, and recompounding.
 ///
 /// ⛔ [`None`] IS A STOP AND NEVER A SIZE: the HBM `DT_CHECK_MSG` (`dsc/dsc2.cpp:3628`), an unseeded
-/// `denId_` reaching `dataStageParam_.at(-1)` (`:3672`), a `paddingSizes_` entry the den stage does
+/// `denId_` reaching `dataStageParam_.at(-1)` (`:3684`), a `paddingSizes_` entry the den stage does
 /// not state (`:3727`), and every stop of the four callees. A fabricated extent here sizes a buffer
 /// the card then reads past.
 #[must_use]
@@ -303,15 +303,15 @@ pub fn size_data_stage_for_node(
         });
     }
 
-    // `getCumulativeStickSizes(labeledDs_.at(ldsIdx).dsType_)` (`:3634`), read unconditionally so
+    // `getCumulativeStickSizes(labeledDs_.at(ldsIdx).dsType_)` (`:3636`), read unconditionally so
     // its stop lands where the reference's does even though only the non-allocate arm uses it.
     let stick_sizes = cumulative_stick_sizes(&dsc.stick_dims(lds), StickPart::Whole)?;
     let mut remaining = dsc.layout_dim_set(lds)?;
-    // `dataStageParam_.at(0).ss_` with `DT_CHECK(coreDs.name_ == "core")` (`:3637-3638`), discharged
+    // `dataStageParam_.at(0).ss_` with `DT_CHECK(coreDs.name_ == "core")` (`:3638-3639`), discharged
     // by [`DataStages`] holding the core stage as a field rather than at an index.
     let core = dsc.data_stages().core().ss.dims.dims();
 
-    // `for (auto& [dim, padInfo] : coreDs.paddingSizes_)` (`:3639-3643`). ⛔ THE SET IS WIDENED IN
+    // `for (auto& [dim, padInfo] : coreDs.paddingSizes_)` (`:3640-3644`). ⛔ THE SET IS WIDENED IN
     // PLACE: the reference inserts into the container it is testing, so a window dim added for an
     // earlier key can satisfy a later key's own `targetDims.count(dim)` and a collect-then-extend
     // would lose that cascade.
@@ -328,10 +328,10 @@ pub fn size_data_stage_for_node(
     let mut el = StageDims::default();
     let mut den_for_dim: BTreeMap<PrimaryDim, DatastageId> = BTreeMap::new();
     let mut above = ancestors.nested.iter();
-    // `while (!targetDims.empty())` (`:3646-3669`).
+    // `while (!targetDims.empty())` (`:3649-3680`).
     while !remaining.is_empty() {
         let Some(enclosing) = above.next() else {
-            // `myParentLoop->getPrev() == nullptr` (`:3648`): the head takes every dim still left,
+            // `myParentLoop->getPrev() == nullptr` (`:3650`): the head takes every dim still left,
             // and neither its own `dims_` nor its parametric flag is ever read.
             let den = ancestors.root_den?;
             for dim in std::mem::take(&mut remaining) {
@@ -340,7 +340,7 @@ pub fn size_data_stage_for_node(
             break;
         };
         if enclosing.parametric_lds.is_some() {
-            // `myParentLoop->dims_[0].dim_` (`:3653`).
+            // `myParentLoop->dims_[0].dim_` (`:3658`).
             let Some(loop_dim) = enclosing.dims.first().map(|entry| entry.dim) else {
                 continue;
             };
@@ -348,7 +348,7 @@ pub fn size_data_stage_for_node(
                 let stride = Extent(i64::try_from(enclosing.parametric_stride(dsc)?.0).ok()?);
                 ss.extents.insert(loop_dim, stride);
                 el.extents.insert(loop_dim, stride);
-                // `newDstg.ss_.paddingSizes_[loopDim];` (`:3659-3660`) — a bare `operator[]`, whose
+                // `newDstg.ss_.paddingSizes_[loopDim];` (`:3665-3666`) — a bare `operator[]`, whose
                 // whole effect is the ZERO entry it default-inserts.
                 if core.padding.contains_key(&loop_dim) {
                     ss.padding.entry(loop_dim).or_default();
@@ -359,7 +359,7 @@ pub fn size_data_stage_for_node(
         } else {
             for entry in &enclosing.dims {
                 if remaining.remove(&entry.dim) {
-                    // `denDsForDim[ldim] = myParentLoop->denId_` (`:3667`), whose `-1` is the
+                    // `denDsForDim[ldim] = myParentLoop->denId_` (`:3673`), whose `-1` is the
                     // `dataStageParam_.at(dsIdx)` throw below brought forward.
                     den_for_dim.insert(entry.dim, enclosing.den?);
                 }
@@ -367,7 +367,7 @@ pub fn size_data_stage_for_node(
         }
     }
 
-    // `for (auto& [dim, dsIdx] : denDsForDim)` (`:3673-3706`).
+    // `for (auto& [dim, dsIdx] : denDsForDim)` (`:3683-3717`).
     let mut ss_info: BTreeMap<PrimaryDim, SymbolicDimInfo> = BTreeMap::new();
     let mut el_info: BTreeMap<PrimaryDim, SymbolicDimInfo> = BTreeMap::new();
     let mut stated: BTreeMap<BTreeSet<PrimaryDim>, VolumeLimit> = BTreeMap::new();
@@ -375,15 +375,15 @@ pub fn size_data_stage_for_node(
         let den_stage = dsc.data_stages().at(den)?;
         let den_ss = den_stage.ss.dims.dims();
         let den_el = den_stage.el.dims.dims();
-        // `primaryDimToValHandler_st(dim) = myDenDstg.<half>.primaryDimToVal_st(dim)` (`:3675-3677`).
+        // `primaryDimToValHandler_st(dim) = myDenDstg.<half>.primaryDimToVal_st(dim)` (`:3685-3688`).
         // ⭐ `Extent(-1)` IS THE REFERENCE'S OWN ANSWER, NOT A FABRICATION: with every padding type
         // `NOPAD`, `calculate_padded` reaches no `DT_ERROR`, so the only [`None`] the whole-extent
-        // reading has is the `-1` of an unstated slot (`dsc/dims.cpp:563-566`).
+        // reading has is the `-1` of an unstated slot (`dsc/dims.cpp:567-568`).
         ss.extents
             .insert(dim, den_ss.whole_extent(dim).unwrap_or(Extent(-1)));
         el.extents
             .insert(dim, den_el.whole_extent(dim).unwrap_or(Extent(-1)));
-        // ⛔ THE GUARD IS ON THE SS SIDE AND THE EL COPY IS AN `.at` (`:3679-3697`): a stage whose
+        // ⛔ THE GUARD IS ON THE SS SIDE AND THE EL COPY IS AN `.at` (`:3689-3706`): a stage whose
         // two halves disagree about a split is a real throw, so it is a stop and not an absence.
         if let Some(shares) = den_ss.corelet_split.get(&dim) {
             ss.corelet_split.insert(dim, shares.clone());
@@ -404,7 +404,7 @@ pub fn size_data_stage_for_node(
             ss_info.insert(dim, info);
             el_info.insert(dim, *den_el.symbolic.info().get(&dim)?);
         }
-        // `for (const auto& [symDims, volumeLimit] : myDenDstg.ss_.maxSymbolicVolume_)` (`:3699`) —
+        // `for (const auto& [symDims, volumeLimit] : myDenDstg.ss_.maxSymbolicVolume_)` (`:3707`) —
         // only keys naming `dim`, and the SMALLER of two limits two den stages state for one key.
         for (sym_dims, &limit) in den_ss.symbolic.volumes() {
             if !sym_dims.contains(&dim) {
@@ -415,7 +415,7 @@ pub fn size_data_stage_for_node(
         }
     }
 
-    // `newDstg.ss_.pruneMaxSymbolicVolumes(coreDs)` (`:3709`) — the UNFUSED prune, which is what
+    // `newDstg.ss_.pruneMaxSymbolicVolumes(coreDs)` (`:3719`) — the UNFUSED prune, which is what
     // [`Symbolic::prune_volumes`]'s own doc cites this line for.
     //
     // ⛔ NOT `Symbolic::new(ss_info, stated)` DIRECTLY: that filter DROPS a limit keyed on a dim no
@@ -424,17 +424,17 @@ pub fn size_data_stage_for_node(
     let volumes = StatedVolumes::new(stated)
         .pruned_against(&Symbolic::new(ss_info.clone(), BTreeMap::new()), &core.symbolic);
     ss.symbolic = Symbolic::new(ss_info, volumes.clone());
-    // `newDstg.el_.maxSymbolicVolume_ = newDstg.ss_.maxSymbolicVolume_` (`:3710`).
+    // `newDstg.el_.maxSymbolicVolume_ = newDstg.ss_.maxSymbolicVolume_` (`:3720`).
     el.symbolic = Symbolic::new(el_info, volumes);
 
     // ⭐ A SECOND PASS, `// run in a separate loop so that all symbolic, unpadded, window dims are
-    // set` (`:3711-3735`).
+    // set` (`:3722-3747`).
     for (&dim, &den) in &den_for_dim {
         if padding.get(dim) == PadType::NoPad {
             continue;
         }
         let den_ss = dsc.data_stages().at(den)?.ss.dims.dims();
-        // `DT_ERROR("Dim with padding is missing padding info")` (`:3716-3718`), raised BEFORE the
+        // `DT_ERROR("Dim with padding is missing padding info")` (`:3727-3729`), raised BEFORE the
         // emplace and so regardless of what `newDstg` already states.
         let from_den = *den_ss.padding.get(&dim)?;
         // `emplace` DOES NOT OVERWRITE. Only the parametric arm could have put an entry here, and it
@@ -445,7 +445,7 @@ pub fn size_data_stage_for_node(
             && let Some(pad) = ss.padding.get_mut(&dim)
         {
             // The three counts are zeroed FIRST, because the span is then read off the very half
-            // being built (`:3721-3726`).
+            // being built (`:3735-3739`).
             pad.unneeded = UnneededPad::NONE;
             let total = full_span_with_unneeded(&ss, dim)?;
             if let Some(&(_, stick)) = stick_sizes.iter().find(|&&(sized, _)| sized == dim) {
@@ -457,7 +457,7 @@ pub fn size_data_stage_for_node(
                 }
             }
         }
-        // `newDstg.el_.paddingSizes_.emplace(dim, padInfo)` (`:3733`) — the FINAL ss_ entry, after
+        // `newDstg.el_.paddingSizes_.emplace(dim, padInfo)` (`:3745`) — the FINAL ss_ entry, after
         // the unneeded counts were rewritten in it.
         let Some(&settled) = ss.padding.get(&dim) else {
             continue;
@@ -465,7 +465,7 @@ pub fn size_data_stage_for_node(
         el.padding.entry(dim).or_insert(settled);
     }
 
-    // `newDstg.ss_.compound(); newDstg.el_.compound();` (`:3737-3738`). ⛔ THE RAW
+    // `newDstg.ss_.compound(); newDstg.el_.compound();` (`:3749-3750`). ⛔ THE RAW
     // [`StageDims::compound`] AND NOT [`FilledDims::compound`], whose restore-if-emptied guard is a
     // documented divergence this body must not inherit.
     ss.compound();
@@ -485,10 +485,10 @@ pub fn size_data_stage_for_node(
 }
 
 /// `newDstg.ss_.primaryDimToVal_st(dim, NO_COMPONENT, -1, -1, {dim, PADDED_FULLSPAN_WUNNEEDED})`
-/// (`dsc/dsc2.cpp:3723-3725`) with the reference's `-1` TOLD APART FROM ITS THROWS.
+/// (`dsc/dsc2.cpp:3737-3739`) with the reference's `-1` TOLD APART FROM ITS THROWS.
 ///
 /// ⛔ [`StageDims::padded_extent`] answers [`None`] both for `if (val < 0) return -1`
-/// (`dsc/dims.cpp:564`) and for the four `DT_ERROR`s under it, and this one caller needs the first as
+/// (`dsc/dims.cpp:567-568`) and for the four `DT_ERROR`s under it, and this caller needs the first as
 /// a VALUE: a dim whose den stage stated nothing was just written `-1`, and the reference goes on to
 /// compute `stickSize + 1` of unneeded pad from it. A blanket `?` would stop there instead.
 fn full_span_with_unneeded(ss: &StageDims, dim: PrimaryDim) -> Option<Extent> {
@@ -752,7 +752,7 @@ mod tests_e015 {
             None
         );
 
-        // `dataStageParam_.at(denDsForDim[dim])` for the head's own `denId_` (`:3672`): `mb` and `out`
+        // `dataStageParam_.at(denDsForDim[dim])` for the head's own `denId_` (`:3684`): `mb` and `out`
         // reach the head, and a tree the scheduler never seeded states no `denId_` there.
         assert_eq!(
             size_data_stage_for_node(
@@ -774,13 +774,13 @@ mod tests_e015 {
 ///
 /// ⛔ THE TWO ARGUMENTS ARE NOT THE SAME NODE, AND THAT IS THE WHOLE CONTENT OF THE FOUR LINES: `node`
 /// says WHERE the sizing happens — the loops above it, plus its own `nodeType_`/`component_`/
-/// `nonUnifiedAllocInHBM_` for the HBM arm (`:3625-3627`) — while `alloc` supplies ONLY the labelled
+/// `nonUnifiedAllocInHBM_` for the HBM arm (`:3624-3626`) — while `alloc` supplies ONLY the labelled
 /// DS and the padding form. `ddc/ddc_transformation.cpp:1695` hands over a TRANSFER beside a reference
 /// tensor's allocate node, and `dsc/dsc2.cpp:3541` and `:3765` a `nodeForLocation` different again.
 /// Taking the component off `alloc` would size a transfer under three loops as whole HBM.
 ///
 /// ⛔ [`None`] FOR AN ALLOCATION WITH NO LABELLED DS IS `DT_ERROR("Cannot get datastage for node
-/// without an allocation for lds")` (`:3620`), which [`AllocateNode::lds`]'s [`Option`] brings forward
+/// without an allocation for lds")` (`:3621`), which [`AllocateNode::lds`]'s [`Option`] brings forward
 /// into the forwarder — 85 of g0's 1899 allocate nodes are constant allocations stating `ldsIdx_: -1`.
 /// Plus every stop of [`size_data_stage_for_node`].
 #[must_use]
@@ -808,12 +808,12 @@ mod tests_e016 {
     //!   DISCRIMINATOR FOR THE TRAP: the alloc handed over is `component_: "hbm"` with
     //!   `nonUnifiedAllocInHBM_: 0`, so a forwarder reading the component off `alloc` rather than
     //!   `node` would answer 2048 — and, one loop down, stop outright on the root check.
-    //! * `allocate_const0_pelrf` (`constIdx_: 0`, `ldsIdx_: -1`) — the `dsc/dsc2.cpp:3620` `DT_ERROR`,
+    //! * `allocate_const0_pelrf` (`constIdx_: 0`, `ldsIdx_: -1`) — the `dsc/dsc2.cpp:3621` `DT_ERROR`,
     //!   a stop and not a size.
     //!
     //! ⚠️ MEASURED, AND IT SAYS THIS PATH CARRIES NO PADDING TODAY: `padding_` is EMPTY on all 1899
     //! allocate nodes of all 187 g0 reference exports, so every dim forwards `NOPAD` and e015's second
-    //! padding pass (`dsc/dsc2.cpp:3711-3735`) is skipped for every one of them. `ldsIdx_ == -1` on 85
+    //! padding pass (`dsc/dsc2.cpp:3722-3747`) is skipped for every one of them. `ldsIdx_ == -1` on 85
     //! of those 1899. Both counts are a 187-program sample of 134 bundles, not a proof.
 
     use std::collections::BTreeMap;
@@ -916,7 +916,7 @@ mod tests_e016 {
         assert_eq!(sized.ss.dims.dims().extent(OUT), Some(Extent(128)));
         assert_eq!(sized.ss.dims.dims().extent(Y), Some(Extent(1)));
 
-        // `DT_ERROR("Cannot get datastage for node without an allocation for lds")` (`:3620`) — the
+        // `DT_ERROR("Cannot get datastage for node without an allocation for lds")` (`:3621`) — the
         // constant allocation, at the very same position the 2048 came from.
         assert_eq!(
             size_data_stage_of_alloc_at_node(
@@ -987,7 +987,7 @@ impl<'a> SampledBuffer<'a> {
 }
 
 /// WHAT SIZING AN ALLOCATION READS OFF ITS NODE THAT [`AllocateNode`] HAS NO SLOT FOR — five
-/// `dsc2::AllocateNode` members the capacity walk touches (`dsc/dsc2.h:990-1006`).
+/// `dsc2::AllocateNode` members the capacity walk touches (`dsc/dsc2.h:989-1009`).
 ///
 /// ⛔ PARAMETERS AND NOT FIELDS, for the reason [`AllocateNode::page_sizes`] takes its indirection
 /// and e015 takes `nonUnifiedAllocInHBM_`: [`AllocateNode`] derives no [`Default`] and every one of
@@ -997,7 +997,7 @@ impl<'a> SampledBuffer<'a> {
 pub struct AllocSizing<'a> {
     /// `allocateCoordinates_`.
     pub allocate_coordinates: &'a Coordinate,
-    /// `sliceViewCoordinates_` — ⛔ NEVER SERIALISED (`dsc/dsc2.cpp:1827` is a bare `// TO DO:
+    /// `sliceViewCoordinates_` — ⛔ NEVER SERIALISED (`dsc/dsc2.cpp:1828` is a bare `// TO DO:
     /// sliceview coordinate`), so [`None`] is what all 187 g0 reference exports state.
     pub slice_view_coordinates: Option<&'a Coordinate>,
     /// `ignoreSymbolicVolumeLimits_`.
@@ -1009,7 +1009,7 @@ pub struct AllocSizing<'a> {
     pub back_gap_dims: &'a BTreeSet<PrimaryDim>,
 }
 
-/// HOW THE CAPACITY IS ASKED FOR — the three trailing default arguments (`dsc/dsc2.cpp:3759-3761`).
+/// HOW THE CAPACITY IS ASKED FOR — the three trailing default arguments (`dsc/dsc2.cpp:3758-3759`).
 ///
 /// ⛔ NO [`Default`] DERIVE: `includeGaps` DEFAULTS TRUE and `bool::default()` is false, so a derive
 /// would silently drop every back gap. [`Self::DEFAULTS`] is the signature's own three values.
@@ -1020,7 +1020,7 @@ pub struct CapacityForm {
     /// `includeGaps` — add `backGapCore_`'s back gap to each dim.
     pub include_gaps: bool,
     /// `allowSymbolicVolumeLimit` — whether a symbolic volume limit over a layout dim is admitted
-    /// rather than aborted (`:3789-3791`).
+    /// rather than aborted (`:3791-3793`).
     pub allow_symbolic_volume_limit: bool,
 }
 
@@ -1040,8 +1040,8 @@ impl CapacityForm {
 /// dim the larger of the sizing stage's two halves read at this component, row and corelet — then MX
 /// block scaled, rounded up to full sticks, and spread over its stick gap.
 ///
-/// ⛔ `Extent(-1)` IS A SIZE AND NOT AN ABSENCE (`dsc/dsc2.cpp:3818`): e019 folds each dim in as
-/// `max(size, 1)` (`:3987`), so a dim the sizing stage states nothing for contributes ONE. [`None`]
+/// ⛔ `Extent(-1)` IS A SIZE AND NOT AN ABSENCE (`dsc/dsc2.cpp:3819`): e019 folds each dim in as
+/// `max(size, 1)` (`:3994`), so a dim the sizing stage states nothing for contributes ONE. [`None`]
 /// is a stop — every `.at`, and the narrowing named on [`sampled_or_absent`].
 /// ⛔ THE COORDINATE SELECTOR IS NOT `v1::CoordinateOffsets::alloc_coordinate`, a DIFFERENT rule
 /// over the same two fields (`:3774-3778` against `ddc/v1.rs:2281`).
@@ -1104,7 +1104,7 @@ pub fn buffer_capacity_per_dim_at(
     // `for (auto& entry : ldims)` (`:3808-3956`).
     for entry in ldims.iter() {
         let mut dim_size;
-        // `myLds.scale_.at(getDimIndexInLayoutOrder(myLds.dsType_, entry))` (`:3820-3822`) AS ONE
+        // `myLds.scale_.at(getDimIndexInLayoutOrder(myLds.dsType_, entry))` (`:3820-3821`) AS ONE
         // LOOKUP, whose [`None`] is *"Invalid layoutDimOrder_ index."*.
         match at.info.scale(entry)? {
             // `scale == -1` (`:3824-3826`).
@@ -1209,12 +1209,12 @@ fn padding_form(padding: &Padding) -> PaddingForm {
     form
 }
 
-/// `primaryDimToVal_st(entry, comp, row, corelet, myAllocNode->padding_)` (`dsc/dsc2.cpp:3885-3890`)
+/// `primaryDimToVal_st(entry, comp, row, corelet, myAllocNode->padding_)` (`dsc/dsc2.cpp:3887-3890`)
 /// with the reference's `-1` TOLD APART FROM ITS THROWS, as [`full_span_with_unneeded`] does for e015.
 ///
 /// ⛔ `-1` IS THE ANSWER THIS CALLER NEEDS AS A VALUE. Where no split and no symbol names `dim`,
 /// [`StageDims::sampled_extent`] provably reduces to the raw slot through `calculate_padded`'s `if
-/// (val < 0) return -1` (`dsc/dims.cpp:566-567`), so its [`None`] is unambiguously that `-1` — and
+/// (val < 0) return -1` (`dsc/dims.cpp:567-568`), so its [`None`] is unambiguously that `-1` — and
 /// e015 writes exactly that slot for a dim its den stage stated nothing for.
 ///
 /// ⚠️ A NARROWING, IN THE SAFE DIRECTION: where a split DOES name `dim` the [`None`] stays a stop,
@@ -1236,7 +1236,7 @@ fn sampled_or_absent(
     dims.sampled_extent(dim, at, padded, None, false)
 }
 
-/// `std::ceil(float(dimSize) / it->second) * it->second` (`dsc/dsc2.cpp:3933`) IN INTEGERS.
+/// `std::ceil(float(dimSize) / it->second) * it->second` (`dsc/dsc2.cpp:3934`) IN INTEGERS.
 ///
 /// ⭐ IT ROUNDS `-1` UP TO ZERO for any stick wider than one element, exactly as the reference's
 /// `std::ceil(-0.015625) * 64` does, and e019 then reads both as `max(size, 1)`.
@@ -1257,10 +1257,10 @@ mod tests_e017 {
     //! ⭐ WHERE THE REFERENCE WROTE ITS ANSWER DOWN, so nothing here is hand-transcribed:
     //! `bufferOffsetCoreCorelet_[core][cl] = kv.second / numBuffers_` where `kv.second == numBuffers_
     //! * getBufferCapacityForNode(allocNode, ldsIdx, component_, corelet, row)`
-    //! (`ddc/ddcv1.cpp:244`, `:352-357`; `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5556-5561`,
-    //! `:5658`). For an allocate node with `ldsIdx_ >= 0` and `numBuffers_ != -1` the EXPORTED OFFSET
-    //! IS THE CAPACITY. (`numBuffers_ == -1` is excluded because `ddcv1.cpp:230` raises its size to
-    //! the whole memory first; both nodes below state 2.)
+    //! (`ddc/ddcv1.cpp:244`, `:353-356`; `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5556-5561`,
+    //! `:5658-5659`). For an allocate node with `ldsIdx_ >= 0` the EXPORTED OFFSET IS THE CAPACITY.
+    //! ⛔ `numBuffers_ == -1` IS NOT EXCLUDED: the multiply and the divide BOTH raise it to 2
+    //! (`ddc/ddcv1.cpp:225-226`, `:353-354`; `L3DlOpsScheduler.cpp:5553-5555`, `:5656-5657`).
     //!
     //! The export states `primaryDsInfo_["OUTPUT"] = {layoutDimOrder_: ["mb","out","y"],
     //! stickDimOrder_: ["out"], stickSize_: [64]}`, `dataStageParam_["1"]` (`name_: "chunk"`) `=
@@ -1272,7 +1272,7 @@ mod tests_e017 {
     //! * `allocate_lds1_lx` — `ldsIdx_: 2`, `scale_: [1,-2,1]`, `wordLength: 2`, `numBuffers_: 2`,
     //!   `bufferOffsetCoreCorelet_: {"0": {"0": 256}}`. Per dim `[(mb,1),(out,64),(y,1)]`: `out` takes
     //!   the STICK, 64, and is NOT rounded. e019 then reads `64 * 2 = 128` bytes — an ODD number of
-    //!   128-byte sticks, so L3's `forceEvenNumSticks` adds one (`dsc2.cpp:3996-4003`): **256**.
+    //!   128-byte sticks, so L3's `forceEvenNumSticks` adds one (`dsc2.cpp:3997-4003`): **256**.
     //! * `allocate_lds0_lx` — `ldsIdx_: 0`, `scale_: [1,1,1]`, `wordLength: 2`, `numBuffers_: 2`,
     //!   `bufferOffsetCoreCorelet_: {"0": {"0": 4096}}`. Per dim `[(mb,1),(out,2048),(y,1)]`: `out`
     //!   comes from the CHUNK stage, `max(2048, 2048)`. e019 reads `2048 * 2 = 4096` — an even 32
@@ -1561,7 +1561,7 @@ mod tests_e018 {
     //!   `loop_ds0_ds1_out` → `loop_ds0_ds1_y`, each `denId_: 1`) is `[(mb,1),(out,128),(y,1)]`: `out`
     //!   is the CHUNK stage, already a whole stick. ⭐ WHERE THE REFERENCE WROTE THAT DOWN: e019 reads
     //!   `128 * wordLength 1 = 128` bytes, an ODD number of 128-byte sticks, so L3's
-    //!   `forceEvenNumSticks` adds one (`dsc/dsc2.cpp:3996-4003`) — **256**, which is exactly the
+    //!   `forceEvenNumSticks` adds one (`dsc/dsc2.cpp:3997-4003`) — **256**, which is exactly the
     //!   `bufferOffsetCoreCorelet_` the export prints on that node for all 16 cores.
     //! * `allocate-Tensor1_hbm` (`component_: "hbm"`, `prev_: ""`) is `[(mb,1),(out,2048),(y,1)]`:
     //!   `out` is `N_`, and `N_.out_` is 2048 in that same export.
@@ -1731,8 +1731,8 @@ mod tests_e018 {
 }
 
 /// HOW A BUFFER'S BYTES ARE ROUNDED — `bytesPerStick` and `forceEvenNumSticks`
-/// (`dsc/dsc2.cpp:3980-3981`) AS ONE VALUE, which is what makes `DT_CHECK_MSG(bytesPerStick > 0,
-/// "Invalid bytes per stick.")` (`:3999`) unspellable: the forcing cannot be asked for without the
+/// (`dsc/dsc2.cpp:3979-3980`) AS ONE VALUE, which is what makes `DT_CHECK_MSG(bytesPerStick > 0,
+/// "Invalid bytes per stick.")` (`:4001`) unspellable: the forcing cannot be asked for without the
 /// width it divides by, and the declaration's own `bytesPerStick = 0` is reachable only beside
 /// `forceEvenNumSticks = false`, where the reference never reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1740,8 +1740,8 @@ pub enum StickRounding {
     /// `forceEvenNumSticks = false`, the default — the capacity is whatever the dims fold to.
     AsSized,
     /// `forceEvenNumSticks = true` with `sysDef.bytesPerStick`, which is
-    /// [`crate::arch::Arch::BYTES_PER_STICK`] at both of L3's own call sites
-    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5559`, `:5657`).
+    /// [`crate::arch::Arch::BYTES_PER_STICK`] at L3's ONE forcing call site
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5560-5561`).
     EvenSticks(NonZeroU64),
 }
 
@@ -2016,7 +2016,7 @@ mod tests_e019 {
         let y_loop = dividing("loop_ds0_ds1_y", Y, DatastageId(1));
         let mb_loop = dividing("loop_ds0_ds1_mb", MB, DatastageId(1));
         let out_loop = dividing("loop_ds0_ds1_out", OUT, DatastageId(1));
-        // L3 asks with `sysDef.bytesPerStick` and `forceEvenNumSticks = true` (`:5559`, `:5657`).
+        // L3 asks with `sysDef.bytesPerStick` and `forceEvenNumSticks = true` (`:5560-5561`).
         let forced = BytesForm {
             rounding: StickRounding::EvenSticks(Sen1p5::BYTES_PER_STICK),
             ..BytesForm::DEFAULTS
