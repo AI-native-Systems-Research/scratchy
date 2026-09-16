@@ -49,19 +49,20 @@ use std::num::NonZeroU64;
 
 use crate::arch::Bytes;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
-    Extent, PrimaryDim, StickPart, cumulative_stick_sizes,
+    Extent, PrimaryDim, StickDims, StickPart, cumulative_stick_sizes,
 };
 use crate::schedule::ddc::fold::PadType;
 use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::Scale;
 use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
 use crate::schedule::ddc::v1::{DimSample, LdsSticks, sampled_as, stick_divisor};
-use crate::schedule::dsc2::{AllocateNode, Coordinate, Dsc, LdsIdx, LoopNode, Padding};
+use crate::schedule::dsc2::{AllocateNode, Coordinate, Dsc, LayoutDims, LdsIdx, LoopNode, Padding};
 use crate::units::{Corelet, Row};
 
 use super::dsc::{
-    DataStage, DataStages, FilledDims, IndirectAlloc, LabeledDs, NamedDims, PadElems, SenComponent,
-    StageDims, StatedVolumes, Symbolic, SymbolicDimInfo, UnneededPad, VolumeLimit,
+    DataStage, DataStages, DesignSpaceConfig, FilledDims, IndirectAlloc, LabeledDs, NamedDims,
+    PadElems, SenComponent, StageDims, StatedVolumes, Symbolic, SymbolicDimInfo, UnneededPad,
+    VolumeLimit,
 };
 
 /// WHICH NODE IS BEING SIZED — the `nodeType_ == dsc2::ScheduleNode::ALLOCATE` test
@@ -127,6 +128,142 @@ pub trait SizeDsc: LdsSticks + Dsc {
 
     /// `dataStageParam_`.
     fn data_stages(&self) -> &DataStages;
+}
+
+/// ⭐⭐ THE PRODUCTION [`SizeDsc`] — `currDsc` ITSELF, WHICH IS WHAT EVERY REFERENCE CALL SITE MAKES
+/// THIS CALL **ON**: `getBufferCapacityForNode` is a `DesignSpaceConfig` METHOD
+/// (`dsc/dsc2.cpp:3988`), and all three of its schedulers reach it through the very
+/// `DesignSpaceConfig *currDsc` they already hold
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5560`, `ddc/ddcv1.cpp:150`, `:245`).
+///
+/// ⛔⛔ IT EXISTS BECAUSE THE TRAIT OTHERWISE HAD ONLY TEST DOUBLES, WHICH IS THE DEFECT THAT LEFT
+/// 30,743 LINES OF PORTED LOGIC UNCALLABLE. [`SizeDsc`]'s three implementors were `Sdsc14` and two
+/// `Sdsc1`s, every one inside a `#[cfg(test)]` module of this file, so a correct 1,881-line port had
+/// no production caller and no production caller could be written without first naming a real type.
+/// This is that type, and it is a BORROW rather than a snapshot: a copy of `currDsc` is a second
+/// answer that can disagree with the one the stage writes.
+///
+/// ⛔ NOT AN `impl SizeDsc for DesignSpaceConfig`. [`Dsc`] and [`LdsSticks`] are the DDC's OWN
+/// vocabulary over a `currDsc` (`schedule/dsc2.rs:1693`, `schedule/ddc/v1.rs:231`) and three carriers
+/// already answer them their own way ([`super::super::stages`]' `Dsc2Reads`, `Dsc2Store`, `Layout`);
+/// stating them for the DSC type itself would put a fourth, competing answer on a type this file does
+/// not own.
+///
+/// ⛔ [`Self::of`] VALIDATES `getLayoutDims` AND `primaryDsInfo_.at(dsType_)` FOR EVERY LABELLED DS
+/// UP FRONT, so neither of the two TOTAL trait methods below can be reached for an lds the DSC labels
+/// without an answer — the reference's own `DT_CHECK(allocNode)` (`dsc/dsc2.cpp:4022`) and
+/// `primaryDsInfo_.at()` become a construction-time [`None`] instead of a mid-walk abort.
+#[derive(Debug, Clone, Copy)]
+pub struct DscSizing<'d> {
+    /// `currDsc`.
+    dsc: &'d DesignSpaceConfig,
+}
+
+impl<'d> DscSizing<'d> {
+    /// The sizing view over that `currDsc`, [`None`] where the DSC labels a data structure it states
+    /// no `getLayoutDims` order or no `primaryDsInfo_` entry for — the two `.at()`s the capacity walk
+    /// would abort on (`dsc/dsc2.cpp:4022`, `:3634`), asked ONCE here rather than per dim.
+    #[must_use]
+    pub fn of(dsc: &'d DesignSpaceConfig) -> Option<Self> {
+        for (lds, held) in dsc.labeled_ds.indexed() {
+            dsc.layout_dims.get(&lds)?;
+            dsc.primary_ds_info.get(&held.ds_type())?;
+        }
+        Some(Self { dsc })
+    }
+
+    /// `labeledDs_.at(lds)` — the entry [`SampledBuffer::of`] is paired with, so a caller cannot
+    /// resolve it off a different DSC than the one sizing reads.
+    #[must_use]
+    pub fn labeled_ds(&self, lds: LdsIdx) -> Option<&'d LabeledDs> {
+        self.dsc.labeled_ds.at(lds)
+    }
+}
+
+impl Dsc for DscSizing<'_> {
+    /// `getLayoutDims(ldsIdx)` — ⭐ A READ OF [`DesignSpaceConfig::layout_dims`], which is the answer
+    /// that walk (entry 006) already landed on; re-deriving it here would be a second answer.
+    ///
+    /// ⛔ THE PANIC IS `getLayoutDims`' OWN `DT_CHECK(allocNode)` (`dsc/dsc2.cpp:4022`) AND NOTHING
+    /// ELSE, and [`DscSizing::of`] has already proved it unreachable for every lds this DSC LABELS.
+    /// It stands only for an index outside `labeledDs_`, where the reference aborts too. ⛔ THERE IS
+    /// NO HONEST FALLBACK: [`crate::schedule::dsc2::LayoutDims`] is non-empty by construction, so an
+    /// invented order would be an invented layout and the buffer would be sized along dims the
+    /// allocation does not have.
+    fn layout_dims(&self, lds: LdsIdx) -> LayoutDims {
+        match self.dsc.layout_dims.get(&lds) {
+            Some(order) => order.clone(),
+            None => panic!(
+                "Dsc::layout_dims: getLayoutDims({lds:?}) aborts for an lds this DSC states no \
+                 layoutDimOrder_ for (dsc/dsc2.cpp:4022) — DscSizing::of proved every labelled DS \
+                 states one, so this index is outside labeledDs_"
+            ),
+        }
+    }
+}
+
+impl LdsSticks for DscSizing<'_> {
+    /// `primaryDsInfo_.at(labeledDs_.at(lds).dsType_)`'s `stickDimOrder_` zipped with its
+    /// `stickSize_`, which is exactly what [`super::dsc::PrimaryDsInfo`] holds.
+    ///
+    /// ⛔ THE PANIC IS THAT PAIR OF `.at()`s, unreachable for every lds this DSC labels by
+    /// [`DscSizing::of`]. ⛔ AND `StickDims::default()` IS NOT AVAILABLE AS A FALLBACK, unlike the
+    /// `unwrap_or_default()` the stage-2b carrier uses: an EMPTY stick order makes
+    /// [`stick_divisor`] answer `1` for every dim, which does not stop the walk — it silently
+    /// divides no dim and returns a capacity too large by the whole stick size.
+    fn stick_dims(&self, lds: LdsIdx) -> StickDims {
+        let sticks = self
+            .dsc
+            .labeled_ds
+            .at(lds)
+            .and_then(|held| self.dsc.primary_ds_info.get(&held.ds_type()))
+            .map(|info| info.stick.clone());
+        match sticks {
+            Some(sticks) => sticks,
+            None => panic!(
+                "LdsSticks::stick_dims: primaryDsInfo_.at(labeledDs_.at({lds:?}).dsType_) throws \
+                 for an index outside labeledDs_ (dsc/dsc2.cpp:3634) — an empty stick order would \
+                 make every stick divisor 1 and oversize the buffer by a stick"
+            ),
+        }
+    }
+}
+
+impl SizeDsc for DscSizing<'_> {
+    /// ⛔⛔ [`None`] HERE IS A MISSING FIELD AND NOT AN EMPTY `N_`, AND THAT DISTINCTION IS THE WHOLE
+    /// CONTENT OF THIS METHOD. [`DesignSpaceConfig`] carries `N_.paddingSizes_` ALONE, as
+    /// [`DesignSpaceConfig::full_padding`], whose own doc says *"THE PADDING ALONE AND NOT THE `N_`
+    /// STAGE"* (`schedule/l3/dsc.rs:550-554`) — the extents were deliberately left out so they could
+    /// not disagree with [`DesignSpaceConfig::data_stages`]. So this view cannot tell an all-`-1`
+    /// `DataStructDims` from one stating every dim.
+    ///
+    /// ⭐ AND [`None`] IS THE SAFE SIDE OF THAT AMBIGUITY, because e015 treats it as a STOP and never
+    /// as a size: [`size_data_stage_for_node`]'s HBM arm is `dsc.whole_data_structure()?`, so an HBM
+    /// allocation at the tree root REFUSES rather than being sized by an invented `N_`. ⛔ IT IS
+    /// THEREFORE THE ONE ARM OF THE CAPACITY WALK THIS VIEW CANNOT ANSWER, and the fix is a field on
+    /// [`DesignSpaceConfig`] filled by the super-DSC projection — not a value chosen here.
+    /// ⭐ THE L3 CALLER IS UNAFFECTED: `tryAlloc` proves `allocNode->component_ == LX`
+    /// (`L3DlOpsScheduler.cpp:5550-5551`) before asking, and the HBM arm needs
+    /// `component_ == HBM` (`dsc/dsc2.cpp:3626`).
+    fn whole_data_structure(&self) -> Option<NamedDims> {
+        None
+    }
+
+    /// `getLayoutDimSet(ldsIdx)` — `primaryDsInfo_.at(labeledDs_.at(ldsIdx).dsType_).layoutDimOrder_`
+    /// as a set, whose [`None`] is that pair of `.at()`s.
+    ///
+    /// ⛔ THE LABELLED DS'S ORDER AND NOT THE ALLOCATE NODE'S: [`Dsc::layout_dims`] above is
+    /// `getLayoutDims`, a different function over a different field, and the two orders stay two.
+    fn layout_dim_set(&self, lds: LdsIdx) -> Option<BTreeSet<PrimaryDim>> {
+        let held = self.dsc.labeled_ds.at(lds)?;
+        let info = self.dsc.primary_ds_info.get(&held.ds_type())?;
+        Some(info.layout.iter().collect())
+    }
+
+    /// `dataStageParam_` — the LIVE map, so a stage the run has minted is visible here.
+    fn data_stages(&self) -> &DataStages {
+        &self.dsc.data_stages
+    }
 }
 
 /// Replaces: e015_getSizeDataStageForNode
@@ -1725,9 +1862,11 @@ mod tests_e019 {
     };
 
     use super::super::dsc::{
-        DataStage, DataStages, FilledDims, LabeledDs, LdsRecord, NamedDims, Pinning, SenComponent,
-        StageDims,
+        CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DdcFacts, FilledDims, LabeledDs,
+        LabeledDsList, LdsRecord, NamedDims, Pinning, PrimaryDsInfo, SenComponent, StageDims,
     };
+    use crate::units::Core;
+
     use super::tests_e015::dividing;
     use super::{
         AllocSizing, AllocateNode, AncestorLoops, BytesForm, Dsc, LdsIdx, LdsSticks, Padding,
@@ -1922,5 +2061,153 @@ mod tests_e019 {
             ),
             Some(Bytes(128))
         );
+    }
+
+    /// `sdsc_1`'s SAME FOUR SEAMS AS A REAL [`DesignSpaceConfig`] — `primaryDsInfo_["OUTPUT"]` with
+    /// `layoutDimOrder_: ["mb","out","y"]` and `stickDimOrder_/stickSize_: ["out"]/[64]`,
+    /// `getLayoutDims` for all three positions, and `labeledDs_` THREE ENTRIES LONG so that position
+    /// `2` — which is the `ldsIdx_` `allocate_lds1_lx` states — resolves at all.
+    fn sdsc1_as_a_real_dsc() -> super::DesignSpaceConfig {
+        let order = || LayoutDims::new(MB, vec![OUT, Y]);
+        let fp16 = || LdsRecord {
+            word_length: WordLength(2),
+            ..LdsRecord::default()
+        };
+        let entry = |scales: Vec<(PrimaryDim, Scale)>, recorded: LdsIdx| {
+            LabeledDs::new(DsType::Output, scales, recorded, Pinning::default()).with_record(fp16())
+        };
+        let sized = || {
+            vec![
+                (MB, Scale::Sized(1.0)),
+                (OUT, Scale::Sized(1.0)),
+                (Y, Scale::Sized(1.0)),
+            ]
+        };
+        let stage = |name: &str| DataStage {
+            ss: half(name, 2048),
+            el: half(name, 2048),
+        };
+        super::DesignSpaceConfig {
+            ddc: DdcFacts::default(),
+            corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: None,
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::from([(
+                DsType::Output,
+                PrimaryDsInfo {
+                    layout: order(),
+                    stick: StickDims(vec![(OUT, Elements(64))]),
+                },
+            )]),
+            core_ids_used: CoreIdsUsed::new(
+                Core::checked(0).expect("core 0 is in range"),
+                Vec::new(),
+            ),
+            layout_dims: BTreeMap::from([
+                (LdsIdx(0), order()),
+                (LdsIdx(1), order()),
+                (LdsIdx(2), order()),
+            ]),
+            labeled_ds: LabeledDsList::new(
+                entry(sized(), LdsIdx(0)),
+                vec![
+                    entry(sized(), LdsIdx(1)),
+                    entry(
+                        vec![
+                            (MB, Scale::Sized(1.0)),
+                            (OUT, Scale::StickDim),
+                            (Y, Scale::Sized(1.0)),
+                        ],
+                        LdsIdx(2),
+                    ),
+                ],
+            ),
+            data_stages: DataStages::new(stage("core"), stage("chunk")),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+            full_padding: BTreeMap::new(),
+            gtr_ids_used: BTreeSet::new(),
+        }
+    }
+
+    /// ⭐⭐ THE PRODUCTION [`super::DscSizing`] REACHES `sdsc_1`'S OWN TWO EXPORTED OFFSETS — the
+    /// SAME 256 and 4096 the test above asserts through the `#[cfg(test)]` `Sdsc1` double, over a REAL
+    /// [`DesignSpaceConfig`] instead.
+    ///
+    /// ⛔⛔ THIS IS THE CONTROL THAT SAYS THE TRAIT IS NOT DOUBLE-ONLY. [`super::SizeDsc`] had three
+    /// implementors and every one of them was a fixture inside this file, which is the shape that left
+    /// a correct port uncallable: a double can agree with the export because it was WRITTEN from the
+    /// export, and only a view over the real `currDsc` proves the four seams RESOLVE — that
+    /// `getLayoutDimSet` finds `primaryDsInfo_.at(dsType_)`, that `labeledDs_.at(2)` is a POSITION and
+    /// not the recorded `ldsIdx_`, and that `wordLength` comes off the entry the sample is paired with.
+    ///
+    /// ⚠️ WHAT IT DOES **NOT** PROVE: that any production carrier ASKS. Nothing in stage 2a hands a
+    /// `&DesignSpaceConfig` to [`crate::schedule::stages::Placement`], so
+    /// `L3Placement::buffer_capacity_even_sticks` still refuses — see its own note.
+    #[test]
+    fn the_production_size_dsc_answers_sdsc1s_own_exported_offsets() {
+        let held = sdsc1_as_a_real_dsc();
+        let dsc = super::DscSizing::of(&held)
+            .expect("every labelled DS states a layout order and a primaryDsInfo_ entry");
+
+        let coordinates = Coordinate::default();
+        let no_gaps = BTreeSet::new();
+        let sizing = AllocSizing {
+            allocate_coordinates: &coordinates,
+            slice_view_coordinates: None,
+            ignore_symbolic_volume_limits: false,
+            indirect: None,
+            back_gap_dims: &no_gaps,
+        };
+        let head = Some(DatastageId(0));
+        let y_loop = dividing("loop_ds0_ds1_y", Y, DatastageId(1));
+        let mb_loop = dividing("loop_ds0_ds1_mb", MB, DatastageId(1));
+        let out_loop = dividing("loop_ds0_ds1_out", OUT, DatastageId(1));
+        let forced = BytesForm {
+            rounding: StickRounding::EvenSticks(Sen1p5::BYTES_PER_STICK),
+            ..BytesForm::DEFAULTS
+        };
+
+        // `allocate_lds1_lx` — `labeledDs_` POSITION 2, whose `scale_` is `[1,-2,1]`.
+        let lds1 = lds_lx("allocate_lds1_lx", LdsIdx(2));
+        let tensor1 = dsc
+            .labeled_ds(LdsIdx(2))
+            .expect("labeledDs_ holds three entries");
+        assert_eq!(
+            buffer_capacity(
+                &lds1,
+                sizing,
+                false,
+                SampledBuffer::of(LdsIdx(2), tensor1, SenComponent::Lx, None, None),
+                forced,
+                &AncestorLoops::of(vec![&mb_loop, &y_loop], head),
+                &dsc,
+            ),
+            Some(Bytes(256))
+        );
+
+        // `allocate_lds0_lx` — position 0, `scale_: [1,1,1]`, an even 32 sticks and so unbumped.
+        let lds0 = lds_lx("allocate_lds0_lx", LdsIdx(0));
+        let tensor0 = dsc
+            .labeled_ds(LdsIdx(0))
+            .expect("labeledDs_ holds three entries");
+        assert_eq!(
+            buffer_capacity(
+                &lds0,
+                sizing,
+                false,
+                SampledBuffer::of(LdsIdx(0), tensor0, SenComponent::Lx, None, None),
+                forced,
+                &AncestorLoops::of(vec![&out_loop, &mb_loop, &y_loop], head),
+                &dsc,
+            ),
+            Some(Bytes(4096))
+        );
+
+        // ⛔ THE NEGATIVE CONTROL THE VIEW ITSELF DECIDES: `N_` is not a field of
+        // [`DesignSpaceConfig`], so the HBM arm REFUSES rather than being sized by an invented whole
+        // data structure. This is the one arm of the walk `DscSizing` cannot answer, and it must read
+        // as a stop.
+        assert_eq!(SizeDsc::whole_data_structure(&dsc), None);
     }
 }
