@@ -168,12 +168,28 @@ impl v1::ComputeOps for Reads<'_> {
 impl SysFlopsPerByte for Reads<'_> {
     /// ⛔ NOT A SUPER-DSC FACT AT ALL: `sysFlopsPerByte` is a `dscGlobal.sysDef` table — a SYSTEM
     /// DEFINITION handed to the scheduler's constructor, per data format. It is read only under
-    /// `CHUNK_EXPLORE`, by `find_best_params_for_arithmetic_intensity`.
+    /// `CHUNK_EXPLORE`, by `find_best_params_for_arithmetic_intensity`
+    /// ([`crate::schedule::l3::dl_ops::run`] reaches it at `dl_ops.rs:20947`), and every
+    /// [`super::run_l3`] call site in this crate passes `CHUNK_EXPLORE = false` — so this stop is
+    /// unreachable today by a const generic that REMOVES the op, not merely unexercised.
+    ///
+    /// ⛔ AND IT IS NOT A LOOKUP BUT AN ARITHMETIC IDENTITY THIS FILE CANNOT SPELL YET —
+    /// `sysFlopsPerByte[fmt] = numCores * numCoreletsPerCore * numPTRows * numPTCols * numSimdPerPT *
+    /// numSubSimdPerPT.at(fmt) * coreFreq * 2 / hbmBw` (`sys-arch-spec/sysdef.cpp:297-307`,
+    /// *"1 MAC = 2 FLOPs"*). Five of those eight are already [`crate::arch::Arch`] consts
+    /// ([`crate::arch::Arch::CORES`], [`crate::arch::Arch::CORELETS_PER_CORE`],
+    /// [`crate::arch::Arch::PT_ROWS`], [`crate::arch::Arch::PT_COLS`],
+    /// [`crate::arch::Arch::SIMD_PER_PT`]); the THREE that are missing are `numSubSimdPerPT` per
+    /// format (`:231-234`), `coreFreq = 1.5` (`:222`) and `hbmBw` (`:242-244`, which is `32` for a
+    /// one-core system and otherwise `170`/`1024` by generation). ⭐ SO THE FACT IS DECLARED DATA AND
+    /// NOT A CONSTRUCTION ARGUMENT — three consts on `crate::arch::Arch`, and this method becomes the
+    /// product. That edit is `arch.rs`', which this file does not own.
     fn sys_flops_per_byte(&self, _format: OpFuncDataFormat) -> FlopPerByte {
         todo!(
-            "SysFlopsPerByte::sys_flops_per_byte: wants dscGlobal.sysDef.sysFlopsPerByte.at(format), \
-             a system-definition table handed to the scheduler's constructor and not carried by the \
-             super-DSC"
+            "SysFlopsPerByte::sys_flops_per_byte: wants dscGlobal.sysDef.sysFlopsPerByte.at(format) \
+             = cores * corelets * ptRows * ptCols * simdPerPt * subSimdPerPt(format) * coreFreq * 2 \
+             / hbmBw (sys-arch-spec/sysdef.cpp:297-307) — three of those (numSubSimdPerPT, coreFreq, \
+             hbmBw) are not yet crate::arch::Arch consts"
         )
     }
 }
@@ -196,8 +212,19 @@ impl DscStages for Reads<'_> {
 
 /// ONE `DataStructDims` THIS CARRIER CANNOT REACH — [`DscStages::dim_stage`] refuses before any
 /// method here can be asked.
+///
+/// ⭐⭐ UNINHABITED, AND THAT IS THE SEVERING AS A TYPE RATHER THAN AS FOUR STOPS. `DscStages::Stage`
+/// is bounded by `DimStage + ?Sized` and NOTHING MORE — an associated type has to be NAMED before
+/// the carrier compiles, not INHABITED — so an empty enum satisfies it while making *"no method here
+/// is ever called"* a fact the compiler checks instead of one a reader has to confirm by going and
+/// reading [`DscStages::dim_stage`]. Four `todo!`s that could only be reached by minting a value of
+/// this type are four stops that cannot exist at all.
+///
+/// ⛔ THE RECORD OF WHAT IS MISSING STAYS, on each method below: an uninhabited body is
+/// `match *self {}`, and the doc above it still names the one field that method wants. What is gone
+/// is the stop, not the note.
 #[derive(Debug, Clone, Copy)]
-pub struct SeveredStage;
+pub enum SeveredStage {}
 
 impl DimStage for SeveredStage {
     /// ⛔ Wants `primaryDimToVal_st(dim, comp, -1, corelet, padded)` on the live data stage.
@@ -208,24 +235,22 @@ impl DimStage for SeveredStage {
         _corelet: Corelet,
         _padded: &PaddingForm,
     ) -> Option<Extent> {
-        todo!(
-            "DimStage::corelet_dim_val: wants primaryDimToVal_st on the live dataStageParam_ entry"
-        )
+        match *self {}
     }
 
     /// ⛔ Wants `coreletSplit_.count(dim)` on the live data stage.
     fn is_corelet_split(&self, _dim: PrimaryDim) -> bool {
-        todo!("DimStage::is_corelet_split: wants coreletSplit_ on the live dataStageParam_ entry")
+        match *self {}
     }
 
     /// ⛔ Wants `coreletSplit_.at(dim).at(corelet)` on the live data stage.
     fn corelet_split(&self, _dim: PrimaryDim, _corelet: Corelet) -> Option<Extent> {
-        todo!("DimStage::corelet_split: wants coreletSplit_ on the live dataStageParam_ entry")
+        match *self {}
     }
 
     /// ⛔ Wants `paddingSizes_.at(dim).stride_` on the live data stage.
     fn pad_stride(&self, _dim: PrimaryDim) -> Option<Stride> {
-        todo!("DimStage::pad_stride: wants paddingSizes_ on the live dataStageParam_ entry")
+        match *self {}
     }
 }
 

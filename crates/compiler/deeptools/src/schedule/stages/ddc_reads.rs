@@ -22,33 +22,50 @@
 //! and every read of the shared datastage map in the ONE case the authority's own control flow makes
 //! a plain field read (see [`super::ddc_state::Dsc2Dims`]).
 //!
-//! Not answered, each naming its field: `dsName_`, `dataFormat_`, `constantInfo_`,
-//! `coordinateMasking_`, `dimToSymbolMapping_`, `l0TetheredMode_` and `opConsts` — SEVEN fields of
-//! `DesignSpaceConfig` that [`crate::schedule::l3::dsc::DesignSpaceConfig`] does not project. ⛔ THAT
-//! IS A CONVERSION GAP AND NOT A DATA GAP: `g0/sdsc_0.json` carries `dataFormat_` and `dsName_` on
-//! every `labeledDs_` entry, so the facts exist in what scratchy writes and the l3 projection is
-//! where they are dropped.
+//! ⚠️ AND THE LIST OF WHAT IS NOT ANSWERED IS **TWO** FIELDS, NOT SEVEN — the seven this header used
+//! to name include `dsName_`, `dataFormat_`, `constantInfo_`, `dimToSymbolMapping_` and
+//! `l0TetheredMode_`, every one of which [`v1::StorageNames`], [`v1::Masking`] and
+//! [`v1::Placement`] below now read off [`crate::schedule::l3::dsc::LdsRecord`] and
+//! [`crate::schedule::l3::dsc::DdcFacts`]. A stale refusal list is what sends the next reader
+//! looking for a fact that is already in hand, so it is corrected rather than annotated.
+//!
+//! Not answered, each naming its field:
+//!
+//! - `coordinateMasking_` (`dsc/designSpaceConfig.h:100`) — ⛔ A CONVERSION GAP AND NOT A DATA GAP,
+//!   and this one is checkable: the SuperDSC wire type CARRIES it
+//!   (`lower_subtile_tape_to_superdsc.rs:1249`, `coordinateMasking_: BTreeMap<String, Vec<[i64; 2]>>`)
+//!   and the l3 projection drops it (`superdsc_to_l3_sdsc.rs:614`). ⛔ SO THE EMPTY MAP IS NOT OURS
+//!   TO ASSUME: it is a real state of the field (entry 262's first arm) *and* the state today's
+//!   emitter writes (`:5294`), and the emitter's own guard already says the day it stops being so —
+//!   *"emit masking or pad K"* (`:8304-8310`). Answering empty from here pins "no masking" for a DSC
+//!   that fills it, which emits a program reading the unmasked tail.
+//! - `opConsts` — the `DscComputeOp` map (wire: `lower_subtile_tape_to_superdsc.rs:1083`,
+//!   `Option<serde_json::Value>`), which [`v1::DscComputeOp`] does not project either.
+//!
+//! ⭐ BOTH ARE ONE FIELD EACH ON A TYPE OUTSIDE THIS FILE — [`crate::schedule::l3::dsc::DdcFacts`]
+//! and [`v1::DscComputeOp`] — plus the conversion arm that fills it. Neither is a scheduler fact
+//! this carrier could derive.
 
 use core::num::NonZeroU64;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
-use crate::arch::{Bytes, Elements};
+use crate::arch::{Arch, Bytes, Elements, Target};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, StickDims,
 };
 use crate::formats::DataFormat;
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{
-    AllocId, Cardinality, ConstIdx, NodeId, PadType, ScaleBlock, ScaledLds,
+    AllocId, Cardinality, ConstIdx, NodeId, PadType, ScaleBlock, ScaledLds, comp_row_id,
 };
 use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::transformation_util::PaddingForm;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{LayoutDims, LdsIdx, LdsScale};
-use crate::schedule::l3::dl_ops::AddressFoldCoords;
+use crate::schedule::l3::dl_ops::{AddressFoldCoords, UNSTATED_EXTENT};
 use crate::schedule::l3::dsc::DscIdx;
 use crate::units::{Corelet, Row};
 
@@ -328,13 +345,22 @@ impl v1::Placement for Dsc2Reads<'_, '_> {
         self.facts().with_dsc(|dsc| dsc.ddc.l0_tethered)
     }
 
-    /// ⛔ Wants `coreIdToTetheredCoreCoord(core).subcoreId`.
-    fn subcore(&self, _core: crate::units::Core) -> u32 {
-        todo!(
-            "v1::Placement::subcore: wants coreIdToTetheredCoreCoord(core).subcoreId — a \
-             sys-arch-spec topology lookup, not a super-DSC field, and it multiplies into an L0 \
-             address"
-        )
+    /// `coreIdToTetheredCoreCoord(core).subcoreId` — ⭐ ANSWERED, AND IT IS ONE `%`:
+    /// `coreCoord.subcoreId = flattenedSubcore % tetheredCoreUnitSize`
+    /// (`sys-arch-spec/sysdef.cpp:573-578`), whose divisor is the arch's own
+    /// [`Arch::TETHERED_CORE_UNIT`] — `1` before SEN1P5 and `2` from it (`sysdef.cpp:200-205`).
+    ///
+    /// ⭐ NOT A CONSTRUCTION ARGUMENT AFTER ALL, WHICH IS WHY IT IS NOT SEVERED LIKE
+    /// [`v1::OffsetSizes::address_scale`]: the other two `SenSystemDef` reads this file wants are
+    /// TABLES keyed by things the arch does not state, while this one is a pure function of the core
+    /// id and a number [`crate::arch`] already declares. [`crate::units::Core`] is
+    /// `CoreId<{ Target::CORES }>`, so the id in hand is already THIS arch's — reading the divisor
+    /// off any other arch would be reading it for a core that does not exist.
+    ///
+    /// ⛔ `1` IS THE UNTETHERED ANSWER AND NOT AN ABSENCE: every core on DD2 is subcore `0`, which
+    /// is what `tetheredCoreUnitSize = 1` says, and entry 258 reads that as *"the top half of L0"*.
+    fn subcore(&self, core: crate::units::Core) -> u32 {
+        core.get() % Target::TETHERED_CORE_UNIT
     }
 
     /// `{coreFoldProp_, coreletFoldProp_} ++ sdscFoldProps_`'s size, which is
@@ -355,6 +381,21 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
     /// ⛔ THE UNSTATED SLOT IS THE REFERENCE'S OWN `-1` AND NOT A REFUSAL, so `plain_slot` still
     /// answers it. Only what the FOLD stops on — a corelet the split does not name, an aborted
     /// `calculate_padded` — is a `todo!`, because a substituted extent is a fabricated one.
+    ///
+    /// ⛔⛔ AND THAT FALL-THROUGH IS GATED, WHICH IT WAS NOT: `plain_slot` reads at
+    /// [`PadType::NoPad`], so taking it for a PADDED read answered the caller's padded extent with
+    /// the dim's UNPADDED one. `calculate_padded` aborts for a padded dim `paddingSizes_` names no
+    /// entry for (*"Padded dimension without padding sizes information in datastage"*,
+    /// `dsc/dims.cpp:575-578`), and that stop was reachable straight through here. What DOES fall
+    /// through under a pad type is the reference's own `-1`: `calculate_padded` short-circuits on
+    /// `val < 0` BEFORE any abort (`:567-568`), so an UNSTATED slot answers `-1` whatever the
+    /// padding — which is exactly [`UNSTATED_EXTENT`] and nothing else.
+    ///
+    /// ⚠️ RECORDED DIVERGENCE ON THE UNSTATED SLOT AT A DENSITY BELOW ONE: the reference scales the
+    /// `-1` as a `double` and truncates, so `primaryDimToVal_base_st` reaches `calculate_padded`
+    /// with `0` rather than `-1` (`:557-559`) and then either returns `0` or aborts on the padded
+    /// arm. `plain_slot` ignores the density and answers `-1`, which is the absence sentinel every
+    /// consumer skips (`isValidDimParam` is `param > 0.0`) where `0` is a zero-sized buffer.
     fn dim_extent(
         &self,
         stage: DatastageId,
@@ -378,7 +419,9 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
             if let Some(extent) = half.dims.sampled_extent(dim, at, &form, density, false) {
                 return extent;
             }
-            if let Some(extent) = plain_slot(&half, dim) {
+            if let Some(extent) = plain_slot(&half, dim)
+                && (padding == PadType::NoPad || extent == UNSTATED_EXTENT)
+            {
                 return extent;
             }
         }
@@ -393,6 +436,20 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
     /// `dataStageDimToVal_compView_st(dim, unit, corelet, padding, density)` — ⛔ IT DERIVES THE PT
     /// ROW FROM THE COMPONENT (`EnumsConversion::senCompToRowId`, `dsc/dims.cpp:707-714`) and then
     /// calls `primaryDimToVal_st` with it, so a sampled row is always in play.
+    ///
+    /// ⭐⭐ WHICH IS THE WHOLE OF IT, AND IT IS [`v1::StageSizes::dim_extent`]'S BODY WITH THE ROW
+    /// FILLED IN: `rowId = senCompToRowId.count(comp) ? .at(comp) : -1` and then the SAME
+    /// `primaryDimToVal_st` — already ported as
+    /// [`StageDims::sampled_extent`](crate::schedule::l3::dsc::StageDims::sampled_extent) (entry
+    /// 012) — so this reads the shared datastage map rather than deferring. The narrow
+    /// no-row-split/no-padding fast path that used to stand here answered a STRICT SUBSET of the
+    /// same question and refused the `rowSplit_` fold that is this method's entire reason to exist.
+    ///
+    /// ⛔ THE ROW IS [`sampled_row`]'S, NOT `Row::checked`'S DIRECTLY, and its outer [`None`] is a
+    /// stop rather than the reference's `-1`; see its own doc for why the two cannot be folded.
+    ///
+    /// ⛔ THE `plain_slot` FALL-THROUGH IS GATED EXACTLY AS `dim_extent`'S IS — the reference's own
+    /// `-1`, and a padded read may not be answered with the unpadded slot.
     fn comp_view_scaled(
         &self,
         stage: DatastageId,
@@ -402,22 +459,34 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
         padding: PadType,
         density: v1::Density,
     ) -> Extent {
-        let plain = corelet.is_none()
-            && padding == PadType::NoPad
-            && density == v1::Density::FULL;
-        if plain
-            && let Some(half) = self.steady(stage)
-            && half.dims.row_split.is_empty()
-            && !matches!(unit, SenComponent::Pe | SenComponent::Sfp | SenComponent::Pelrf | SenComponent::Sfplrf)
-            && let Some(extent) = plain_slot(&half, dim)
+        if let Some(half) = self.steady(stage)
+            && let Some(row) = sampled_row(&half, dim, unit)
         {
-            return extent;
+            let mut form = PaddingForm::default();
+            form.set_padding(dim, padding);
+            let at = v1::DimSample {
+                comp: v1::sampled_as(unit),
+                row,
+                corelet,
+            };
+            // The same divisor `dim_extent` states: `dimDensity` is `1.0` or `1.0 / mxInfo_.blkSize`.
+            let density = ScaleBlock::of(Cardinality(density.get().get()));
+            if let Some(extent) = half.dims.sampled_extent(dim, at, &form, density, false) {
+                return extent;
+            }
+            if let Some(extent) = plain_slot(&half, dim)
+                && (padding == PadType::NoPad || extent == UNSTATED_EXTENT)
+            {
+                return extent;
+            }
         }
         todo!(
-            "v1::StageSizes::comp_view_scaled: wants dataStageDimToVal_compView_st \
-             (dsc/dims.cpp:707-714), which derives ptrowId from {unit:?} via \
-             EnumsConversion::senCompToRowId and then folds rowSplit_/peSfpSplit_/coreletSplit_ for \
-             stage {stage:?} dim {dim:?}"
+            "v1::StageSizes::comp_view_scaled: dataStageDimToVal_compView_st \
+             (dsc/dims.cpp:707-714) STOPS for stage {stage:?} dim {dim:?} unit {unit:?} corelet \
+             {corelet:?} padding {padding:?} — either dataStageParam_ states no such stage, or \
+             senCompToRowId puts that unit on a row this arch does not have while rowSplit_ names \
+             the dim, or the split names that corelet nowhere, or calculate_padded (:563-616) \
+             aborted"
         )
     }
 
@@ -477,14 +546,26 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
             })
     }
 
-    /// ⛔ Wants `allocNode->paddingSizes_.at(dim)` (`dsc/dsc2.h:1000`) — ⚠️ NOT the `padding_`
-    /// [`crate::schedule::l3::dl_ops::L3AllocateNode`] carries: `paddingSizes_` is the five-number
-    /// per-dim record and `padding_` is the [`PadType`] form.
+    /// ⛔⛔ THERE IS NO SUCH FIELD, AND THE STUB THIS REPLACES CITED ONE. `allocNode->paddingSizes_`
+    /// does not exist: `paddingSizes_` is a member of `DataStructDims` (`dsc/dims.h:219`) and
+    /// `dsc/dsc2.h` — the `AllocateNode` header the old citation named at `:1000` — declares no
+    /// `paddingSizes_` anywhere. The reference reads it off the DATASTAGE every time, including at
+    /// the two sites the trait attributes to the allocation: `ds` at `ddc/ddcv1.cpp:2512` and `:2554`
+    /// is `dataStageParam_.at(loopPtr->denId_).ss_`, bound eighteen lines above at `:2490-2491`, and
+    /// entry 260's own corelet-offset walk reads `dsChunk.paddingSizes_` (`:1961-1968`), the CHUNK
+    /// stage's. So [`v1::StageSizes::stage_padding_sizes`] is the whole of that fact.
+    ///
+    /// ⛔ AND NOTHING CALLS THIS. No caller exists for `alloc_padding_sizes` in the ported scheduler,
+    /// so the stub is unreachable as well as unanswerable — it is a trait method to RETIRE from
+    /// [`v1::StageSizes`], not a fact to find. Retiring it is `ddc/v1.rs`' own edit, and the two
+    /// `#[cfg(test)]` doubles that answer it [`None`] go with it.
     fn alloc_padding_sizes(&self, _alloc: AllocId, _dim: PrimaryDim) -> Option<v1::PaddingSizes> {
         todo!(
-            "v1::StageSizes::alloc_padding_sizes: wants allocNode->paddingSizes_.at(dim) \
-             (dsc/dsc2.h:1000) — the ALLOCATION's five-number record, which \
-             l3::dl_ops::L3AllocateNode does not carry (it holds padding_, the PadType form)"
+            "v1::StageSizes::alloc_padding_sizes: NAMES A FIELD THAT DOES NOT EXIST — \
+             allocNode->paddingSizes_ is nowhere in dsc/dsc2.h; paddingSizes_ is a DataStructDims \
+             member (dsc/dims.h:219) that the reference reads off the datastage \
+             (ddc/ddcv1.cpp:2490-2512), which stage_padding_sizes already answers. And nothing calls \
+             this: retire the trait method"
         )
     }
 
@@ -520,12 +601,28 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
         })
     }
 
-    /// ⛔ Wants `getSizeDataStageForNode(node, node)` (`dsc/designSpaceConfig.h:264`).
+    /// ⛔⛔ NOT A `dataStageParam_` INDEX AT ALL, WHICH IS WHY NO CARRIER CAN ANSWER IT.
+    /// `getSizeDataStageForNode(node, alloc)` (`dsc/designSpaceConfig.h:264`, defined
+    /// `dsc/dsc2.cpp:3611-3616`) SYNTHESISES A FRESH `dsc2::DataStage` and returns it BY VALUE: it
+    /// walks the allocation's owner loops outward, records a SEPARATE denominator stage id per
+    /// relevant dim (`denDsForDim`, `:3646-3679`), and then copies each dim's extent and its
+    /// `coreletSplit_`/`rowSplit_`/`peSfpSplit_` share out of THAT dim's own stage (`:3681-3700`) —
+    /// plus a parametric loop's stride written straight in (`:3661-3668`) and an unconditional
+    /// `ss_ = el_ = N_` for a unified HBM allocation (`:3624-3633`). The reference then reads
+    /// `dsNode.primaryDimToVal_st(..)` off that VALUE (`ddc/ddcv1.cpp:1923-1924`, `:1983`).
+    ///
+    /// ⛔ SO THE SIGNATURE IS THE DEFECT AND NOT THE CARRIER: a [`DatastageId`] can only name one
+    /// EXISTING entry, and this stage is composed from several. Every caller —
+    /// [`v1::StageSizes::dim_extent`] and [`v1::StageSizes::corelet_split`] keyed by the returned id
+    /// (`ddc/v1.rs:1935-1972`) — reads a per-dim answer that only the synthesised value has, so no
+    /// value returned here is right for more than one dim. The fix is a `Stage` VALUE on
+    /// [`v1::StageSizes`], and that is `ddc/v1.rs`' edit.
     fn size_stage(&self, _alloc: AllocId) -> DatastageId {
         todo!(
-            "v1::StageSizes::size_stage: wants getSizeDataStageForNode(node, node) \
-             (dsc/designSpaceConfig.h:264) — WHICH dataStageParam_ entry sizes this allocation; a \
-             substituted id would size every buffer off the wrong stage"
+            "v1::StageSizes::size_stage: getSizeDataStageForNode(node, alloc) \
+             (dsc/dsc2.cpp:3611-3700) SYNTHESISES a dsc2::DataStage per-dim from several denominator \
+             stages and returns it BY VALUE — a DatastageId cannot name it, so a substituted id \
+             would size every dim off one stage. The trait wants a Stage value, not an index"
         )
     }
 
@@ -651,4 +748,165 @@ impl v1::OffsetSizes for Dsc2Reads<'_, '_> {
 /// a free function beside its two callers so both stand on the same citation.
 fn plain_slot(half: &Dsc2Dims, dim: PrimaryDim) -> Option<Extent> {
     half.raw_slot(dim, PadType::NoPad, v1::SymbolicRead::Max)
+}
+
+/// ⭐ WHICH PT ROW A COMPONENT SAMPLES — `rowId = senCompToRowId.count(comp) ? .at(comp) : -1`
+/// (`dsc/dims.cpp:712-714`), which [`comp_row_id`] already ports, narrowed to a row THIS arch has.
+///
+/// ⛔⛔ THE OUTER [`None`] IS A STOP AND NOT THE REFERENCE'S `-1`, AND THAT IS THE WHOLE POINT OF
+/// THE TWO LAYERS. `senCompToRowId` names rows `0..7` whatever the arch's row count — the table is
+/// arch-blind, which is why [`crate::schedule::ddc::fold::PtRowId`] is not a
+/// [`Row`](crate::units::Row) — so a `PTROW5` on a four-row arch has an id the table states and no
+/// row to be. `rowSplit_.at(d).at(ptrowId)` then indexes a per-corelet vector sized by the arch's
+/// own row count and THROWS (`dsc/dims.cpp:666-673`). `Some(None)` is the reference's `-1`, which
+/// SUMS every row, so answering that here would hand ONE row the whole core's extent.
+///
+/// ⭐ AND THE STOP IS NARROWED TO A ROW-SPLIT DIM, because `ptrowId >= 0 && rowSplit_.count(d) > 0`
+/// (`:664`) is the only place the id is read: for a dim no `rowSplit_` names, the reference carries
+/// that same out-of-range id straight past into the PE/SFP and corelet views without ever indexing
+/// with it, and `Some(None)` reaches the identical answer there.
+fn sampled_row(half: &Dsc2Dims, dim: PrimaryDim, unit: SenComponent) -> Option<Option<Row>> {
+    match comp_row_id(unit) {
+        // `senCompToRowId.count(comp) == 0` — the reference's own `-1`.
+        None => Some(None),
+        Some(named) => match Row::checked(u32::from(named.ordinal())) {
+            Some(row) => Some(Some(row)),
+            None if half.dims.row_split.contains_key(&dim) => None,
+            None => Some(None),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{Dsc2Dims, PadType, PrimaryDim, Row, Target, plain_slot, sampled_row};
+    use crate::arch::Arch;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent;
+    use crate::schedule::ddc::transformation_util::PaddingForm;
+    use crate::schedule::l3::dl_ops::UNSTATED_EXTENT;
+    use crate::units::Corelet;
+    use sys_arch_spec::arch_enums::SenComponent;
+
+    /// THE DIM EVERY CASE BELOW READS.
+    const DIM: PrimaryDim = PrimaryDim::In;
+
+    /// One steady-state half stating `in_ = 64` and NOTHING else — no split, no padding entry.
+    fn a_stated_slot() -> Dsc2Dims {
+        let mut half = Dsc2Dims::default();
+        half.dims.extents.insert(DIM, Extent(64));
+        half
+    }
+
+    /// The same, with `rowSplit_.at(IN)` naming corelet 0's four rows.
+    fn a_row_split() -> Dsc2Dims {
+        let mut half = a_stated_slot();
+        half.dims.row_split.insert(
+            DIM,
+            BTreeMap::from([(
+                Corelet::checked(0).expect("every arch has corelet 0"),
+                vec![Extent(16), Extent(16), Extent(16), Extent(16)],
+            )]),
+        );
+        half
+    }
+
+    /// ⭐ WHY [`super::v1::StageSizes::dim_extent`]'S AND
+    /// [`super::v1::StageSizes::comp_view_scaled`]'S `plain_slot` FALL-THROUGH IS GATED, carrying both
+    /// values rather than the rule: the SAME stage answers the stored `64` to `plain_slot` while
+    /// `primaryDimToVal_st` REFUSES the padded read of the same dim, so an ungated fall-through hands
+    /// a padded caller the unpadded extent.
+    #[test]
+    fn the_unpadded_slot_is_not_an_answer_to_a_padded_read_the_reference_aborts() {
+        let half = a_stated_slot();
+
+        // `primaryDimToVal_base_st` with `NOPAD`: the stored `in_` (`dsc/dims.cpp:529-530`).
+        assert_eq!(
+            plain_slot(&half, DIM),
+            Some(Extent(64)),
+            "the stored slot, which is what `plain_slot` is for"
+        );
+
+        // ⛔ AND THE PADDED READ OF THAT SAME DIM IS THE REFERENCE'S `DT_ERROR` — *"Padded dimension
+        // without padding sizes information in datastage"* (`dsc/dims.cpp:575-578`), because
+        // `paddingSizes_` names no entry for it.
+        let mut padded = PaddingForm::default();
+        padded.set_padding(DIM, PadType::PaddedFullSpanWUnneeded);
+        assert_eq!(
+            half.dims.sampled_extent(DIM, super::v1::DimSample::WHOLE, &padded, None, false),
+            None,
+            "calculate_padded aborts for a padded dim paddingSizes_ does not name"
+        );
+
+        // ⭐ WHAT *DOES* FALL THROUGH UNDER A PAD TYPE IS THE REFERENCE'S OWN `-1`: `calculate_padded`
+        // short-circuits on `val < 0` BEFORE any abort (`:567-568`), and an unstated slot is that.
+        assert_eq!(
+            plain_slot(&Dsc2Dims::default(), DIM),
+            Some(UNSTATED_EXTENT),
+            "an unstated slot is the reference's -1 under every pad type"
+        );
+    }
+
+    /// ⭐ THE ROW A COMPONENT SAMPLES, AND THE STOP THAT IS NOT THE REFERENCE'S `-1`.
+    #[test]
+    fn a_row_this_arch_lacks_stops_only_where_the_split_would_index_with_it() {
+        let split = a_row_split();
+        let plain = a_stated_slot();
+
+        // `senCompToRowId.count(LXLU) == 0` (`sys-arch-spec/arch_enums.cpp:296-320` names only the PT
+        // and L0LU row spellings) — the reference's `-1`, on either stage.
+        assert_eq!(
+            sampled_row(&split, DIM, SenComponent::Lxlu),
+            Some(None),
+            "a component on no row at all is ptrowId = -1"
+        );
+
+        // `senCompToRowId.at(PTROW3) = 3` (`:299`), and row 3 exists on BOTH generations —
+        // `numPTRows` is 8 then 4 (`sys-arch-spec/sysdef.cpp:224`).
+        assert_eq!(
+            sampled_row(&split, DIM, SenComponent::Ptrow3).map(|row| row.map(Row::get)),
+            Some(Some(3)),
+            "PTROW3 samples row 3 on every arch this crate emits for"
+        );
+
+        // ⛔⛔ `senCompToRowId.at(PTROW5) = 5` (`:301`) WHATEVER THE ARCH'S ROW COUNT — the table is
+        // arch-blind. The two stages then part company, and that is the whole narrowing.
+        let at_split = sampled_row(&split, DIM, SenComponent::Ptrow5);
+        let at_plain = sampled_row(&plain, DIM, SenComponent::Ptrow5);
+        if Target::PT_ROWS > 5 {
+            assert_eq!(
+                at_split.map(|row| row.map(Row::get)),
+                Some(Some(5)),
+                "an arch with 8 rows has row 5, so rowSplit_.at(IN).at(5) is a real share"
+            );
+            assert_eq!(
+                at_plain.map(|row| row.map(Row::get)),
+                Some(Some(5)),
+                "and the id is carried past a dim rowSplit_ does not name, as the reference carries it"
+            );
+        } else {
+            assert_eq!(
+                at_split, None,
+                "rowSplit_.at(IN).at(5) indexes a 4-row vector and THROWS (dsc/dims.cpp:666-673); \
+                 `Some(None)` here would sum every row and hand one row the whole core"
+            );
+            assert_eq!(
+                at_plain.map(|row| row.map(Row::get)),
+                Some(None),
+                "`ptrowId >= 0 && rowSplit_.count(d) > 0` (:664) never reads the id for this dim, so \
+                 it is the reference's -1 and not a stop"
+            );
+        }
+    }
+
+    // ⛔ NO TEST FOR [`super::v1::Placement::subcore`], AND THE REASON IS THAT ONE WOULD BE A
+    // TAUTOLOGY FROM HERE. Reaching it means a `Dsc2Reads`, which means a `Dsc2State`, which means a
+    // whole `l3::dsc::SuperDsc` — `DesignSpaceConfig` has no `Default` and `super::super::stages`'
+    // own `#[cfg(test)]` fixture is what builds one. Re-deriving `core.get() %
+    // Target::TETHERED_CORE_UNIT` beside the method that computes it would assert the expression
+    // against itself. What DOES stand behind it is checked one compilation earlier: `crate::arch`'s
+    // const block asserts `Dd2::TETHERED_CORE_UNIT == 1` and
+    // `Sen1p5::CORES % Sen1p5::TETHERED_CORE_UNIT == 0`, which is `sysdef.cpp:200-205` verbatim, so
+    // the divisor is both non-zero and the reference's.
 }
