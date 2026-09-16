@@ -38,6 +38,66 @@ use super::ddc_state;
 use super::ddc_store::Dsc2Store;
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⭐⭐ THE TWO LOOKUPS SEVERAL IMPLS BELOW SHARE — reached through [`Dsc2Store::with_tree`] and the
+// already-answered [`tu::ComponentAllocations`], so this file holds NO second view of `currDsc`.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+impl Dsc2Store<'_, '_> {
+    /// `static_cast<dsc2::ComputeNode *>(node)` — the COMPUTE this node IS, [`None`] for any other
+    /// `nodeType_`.
+    ///
+    /// ⭐⭐ THE ARM IS THERE NOW. [`super::tree::Kind::Compute`] holds the whole
+    /// [`crate::schedule::dsc2::ComputeNode`] (landed in `c1f5c63fa`, filled by the DDL expansion's
+    /// `conv::ScheduleWrites::add_compute`/`mint_compute` from `5ee670017` onward), so every reader
+    /// below that used to refuse for *"no Compute arm"* and asks only for fields
+    /// [`crate::schedule::dsc2::ComputeNode`] carries is answered from the live tree.
+    fn compute_of(&self, node: NodeId) -> Option<ComputeNode> {
+        self.with_tree(|tree| match tree.kind_of(node) {
+            Some(super::tree::Kind::Compute(held)) => Some(held.clone()),
+            _ => None,
+        })
+    }
+
+    /// `getAllocation(di, storage, /*allowMissingAlloc=*/true)` (`dsc/dsc2.cpp:2586-2631`) — ⭐
+    /// ANSWERED ON BOTH ARMS, and each `nullptr` path below is one of its four.
+    ///
+    /// ⛔⛔ THE CONSTANT ARM IS PROJECTED AFTER ALL. Two `todo!`s in this file used to refuse because
+    /// *"its constant arm reads `constantInfo_`, which `l3::dsc::DesignSpaceConfig` does not
+    /// project"* — it DOES: [`crate::schedule::l3::dsc::ConstantInfo::allocations`] is
+    /// `allocations_` as arena handles, and [`tu::DscAllocations::allocation_in`] already answers
+    /// the same call through it.
+    ///
+    /// ⛔ THE LABELLED DS WINS WHERE BOTH INDICES ARE SET, which is the reference's own closing
+    /// ternary `di.myLdsIdx_ >= 0 ? labeledDs_... : constantInfo_...` (`:2629-2631`) and NOT an order
+    /// chosen here.
+    fn allocation_at(
+        &self,
+        data: DataInfo,
+        storage: SenComponent,
+    ) -> Option<crate::schedule::ddc::fold::AllocId> {
+        // `dsc2::memories.count(storage) == 0` (`:2597-2603`).
+        if !tu::is_memory(storage) {
+            return None;
+        }
+        match (data.my_lds_idx, data.constant_id) {
+            // `labeledDs_.at(myLdsIdx_).memOrg_.at(storage).allocateNode_` (`:2605-2615`).
+            (Some(lds), _) => tu::ComponentAllocations::mem_org_allocation(self, lds, storage),
+            // `constantInfo_.at(constantId_).allocations_.at(storage)` (`:2617-2625`).
+            (None, Some(constant)) => self.dsc_facts().with_dsc(|dsc| {
+                dsc.ddc
+                    .constants
+                    .get(&constant)?
+                    .allocations
+                    .get(&storage)
+                    .copied()
+            }),
+            // *"One of myLdsIdx or constantId must be set"* (`:2589-2596`).
+            (None, None) => None,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 // THE LABELLED DS LIST AS THE TRANSFORMATIONS READ IT — ⭐ ANSWERED WHOLE.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -148,12 +208,21 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
         tr::ComputeWalk::computes(self)
     }
 
-    /// ⛔ No COMPUTE arm.
-    fn compute(&self, _node: NodeId) -> ComputeNode {
-        todo!(
-            "v1::LoopOffsets::compute: wants type_, exUnit_ and inputs_ zipped with \
-             inputsLdsAndLoopOffsets_ — super::tree::Kind has no Compute arm"
-        )
+    /// `static_cast<dsc2::ComputeNode *>(node)`, whose `type_`, `exUnit_` and `inputs_` zipped with
+    /// `inputsLdsAndLoopOffsets_` are what entry 260 reads — ⭐ ANSWERED off
+    /// [`super::tree::Kind::Compute`].
+    ///
+    /// ⛔ TOTAL, AS THE REFERENCE'S DOWNCAST IS: a node that is not a COMPUTE is its own undefined
+    /// behaviour there, so the stop names the node exactly as
+    /// [`tu::ScheduleSurgery::transfer`](crate::schedule::ddc::transformation_util::ScheduleSurgery::transfer)
+    /// does for the transfer half.
+    fn compute(&self, node: NodeId) -> ComputeNode {
+        self.compute_of(node).unwrap_or_else(|| {
+            panic!(
+                "v1::LoopOffsets::compute: {node:?} is not a COMPUTE of this DSC's scheduleTree_ — \
+                 the reference's static_cast there is undefined"
+            )
+        })
     }
 
     /// `getStickDims(lds)`.
@@ -423,14 +492,22 @@ impl tu::TransferMoves for Dsc2Store<'_, '_> {
         )
     }
 
-    /// ⛔ `currDsc->getMutableAllocation(dstLdsAndLoopOffsets_.at(i), dstVias_.at(i).loc_.storage_)`
-    /// — the constant arm reads `constantInfo_`.
-    fn destination_allocation(&self, _dst: &Operand) -> Option<NodeId> {
-        todo!(
-            "tu::TransferMoves::destination_allocation: wants getMutableAllocation(dst operand, \
-             dst storage) as a schedule node — its constant arm reads constantInfo_, which \
-             l3::dsc::DesignSpaceConfig does not project"
-        )
+    /// `currDsc->getAllocation(dstLdsAndLoopOffsets_.at(i), dstVias_.at(i).loc_.storage_, true)`
+    /// (`ddc/ddc_transformation.cpp:1487-1489`) AS THAT ALLOCATION'S SCHEDULE NODE — ⭐ ANSWERED
+    /// through [`Dsc2Store::allocation_at`].
+    ///
+    /// ⛔⛔ THE `constantInfo_` OBJECTION WAS WRONG. This method used to refuse saying *"its constant
+    /// arm reads `constantInfo_`, which `l3::dsc::DesignSpaceConfig` does not project"* — the
+    /// projection is [`crate::schedule::l3::dsc::ConstantInfo::allocations`], and
+    /// [`tu::DscAllocations::allocation_in`] beside it already answers the same `getAllocation` on
+    /// both arms.
+    ///
+    /// ⛔ [`None`] IS THE REFERENCE'S OWN `nullptr` AND NOT A REFUSAL: the one caller takes it as
+    /// *"this destination has no allocation to own a loop"* and skips the destination
+    /// (`ddc/transformation.rs:2467-2469`), which is what `allowMissingAlloc = true` buys there.
+    fn destination_allocation(&self, dst: &Operand) -> Option<NodeId> {
+        let alloc = self.allocation_at(dst.data, dst.storage)?;
+        self.with_tree(|tree| tree.node_of_alloc(alloc))
     }
 
     /// ⛔ `condNode->clone()` — a DETACHED copy with its regions still to be added, and
@@ -463,13 +540,31 @@ impl tu::TransferMoves for Dsc2Store<'_, '_> {
 }
 
 impl tr::HoistTransfers for Dsc2Store<'_, '_> {
-    /// ⛔ Which kind of node the walk is standing on, as a [`tr::HoistParent`] — its arms name the
-    /// same COMPUTE node [`tr::ScopeTree::scope_node`] wants.
-    fn hoist_parent(&self, _node: NodeId) -> tr::HoistParent {
-        todo!(
-            "tr::HoistTransfers::hoist_parent: wants the node as a HoistParent — the same COMPUTE \
-             arm ScopeTree::scope_node wants, and super::tree::Kind has none"
-        )
+    /// `currParent->nodeType_` AS THE ONE THREE-WAY DISPATCH ENTRY 301'S PARENT WALK MAKES — ⭐
+    /// ANSWERED WHOLE off `nodeType_` alone.
+    ///
+    /// ⛔⛔ THIS DOC USED TO SAY *"its arms name the same COMPUTE node [`tr::ScopeTree::scope_node`]
+    /// wants"* AND THE AUTHORITY REFUTES IT: [`tr::HoistParent`] HAS NO COMPUTE ARM, and neither does
+    /// the walk it feeds. `hoistTransfersUpForReuse` tests exactly two `nodeType_`s on the way up —
+    /// `if (currParent->nodeType_ == CONDITION) { collectLoopReferences(..); continue; }` then
+    /// `if (currParent->nodeType_ != LOOP) { continue; }`
+    /// (`ddc/ddc_transformation.cpp:1497-1505`) — so a COMPUTE parent takes the same `continue` a
+    /// BLOCK, ALLOCATE, TRANSFER, SYNC or STICKMASK parent takes, which is
+    /// [`tr::HoistParent::Other`]'s own *"every other kind, which the walk passes through"*.
+    ///
+    /// ⛔ [`tr::HoistParent::Other`] FOR A NODE THIS TREE DOES NOT HOLD, and that is not a fabricated
+    /// answer: the only caller reaches this through [`tu::ScheduleSurgery::parent`]
+    /// (`ddc/transformation.rs:2481-2482`), whose every answer is a node of this tree, and the
+    /// reference's own loop condition ends at the `nullptr` parent rather than classifying one.
+    fn hoist_parent(&self, node: NodeId) -> tr::HoistParent {
+        match self.node_kind_of(node) {
+            // `nodeType_ == CONDITION` — the walk collects the loops the condition names.
+            Some(NodeKind::Condition) => tr::HoistParent::Condition,
+            // `nodeType_ == LOOP` — `static_cast<dsc2::LoopNode *>(currParent)`, whose identity IS
+            // the node's: [`tr::LoopId`] is a `NodeId` newtype and the kind is what proves it.
+            Some(NodeKind::Loop) => tr::HoistParent::Loop(tr::LoopId(node)),
+            _ => tr::HoistParent::Other,
+        }
     }
 
     /// `dataStageParam_.at(core).ss_.paddingSizes_.at(dim).windowDim_` — ⭐ THE SHARED MAP, and
@@ -621,13 +716,25 @@ impl tr::OffsetAdjustment for Dsc2Store<'_, '_> {
         )
     }
 
-    /// ⛔ No COMPUTE arm — the output's lds index lives on `outputsLdsAndLoopOffsets_`.
-    fn output_allocation(&self, _node: NodeId, _idx: tr::OutputIdx) -> Option<AllocId> {
-        todo!(
-            "tr::OffsetAdjustment::output_allocation: wants \
-             labeledDs_.at(outputsLdsAndLoopOffsets_.at(idx).myLdsIdx_).memOrg_.at(outputs_.at(idx))\
-             .allocateNode_ — no Compute arm to read either half from"
-        )
+    /// `labeledDs_.at(outputsLdsAndLoopOffsets_.at(idx).myLdsIdx_).memOrg_.at(outputs_.at(idx))`
+    /// `.allocateNode_` — ⭐ ANSWERED, both halves off [`super::tree::Kind::Compute`]'s own node:
+    /// [`crate::schedule::dsc2::Operand`] zips `outputs_.at(idx)` (its `unit`) with
+    /// `outputsLdsAndLoopOffsets_.at(idx)` (its `data`), so the two `.at()`s cannot select different
+    /// positions.
+    ///
+    /// ⛔ THE `memOrg_` KEY IS THE OUTPUT'S **UNIT** AND NOT ITS `storage`, which is what
+    /// `memOrg_.at(outputs_.at(idx))` spells: `outputs_` is a `std::vector<SenComponents>`
+    /// (`dsc/dsc2.h:934`) and the trait's own doc names it.
+    ///
+    /// ⛔ EVERY [`None`] IS ALREADY THE PORT'S STATED DIVERGENCE, not one added here: entry 108's own
+    /// doc says *"an output whose `memOrg_` entry is missing or whose `allocateNode_` is null makes
+    /// the reference throw or dereference null (`ddc/ddc_transformation.cpp:1370-1373`); here the
+    /// clone is still made and recorded and only the user bump and the spread are skipped"*.
+    fn output_allocation(&self, node: NodeId, idx: tr::OutputIdx) -> Option<AllocId> {
+        let held = self.compute_of(node)?;
+        let output = held.outputs.get(idx.0)?;
+        let lds = output.data.my_lds_idx?;
+        tu::ComponentAllocations::mem_org_allocation(self, lds, output.unit)
     }
 
     /// `alloc->allocUsers_.push_back({user, 1})` — ⛔ THE RAW PUSH, not `addAllocUser`: a repeat user
