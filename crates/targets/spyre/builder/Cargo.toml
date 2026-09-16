@@ -4,14 +4,14 @@ name = "scratchy-builder-spyre"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Build-graph placeholder. The SuperDSC dxp compile moved into the #[forward] emit, which submits the compiled device code to scratchy-forward-compiler::superdsc_registry; nothing is compiled or baked here."
+description = "Build-graph placeholder. The dxp compile moved into the #[forward] emit, which submits the compiled device code to the bundle registry; nothing is compiled or baked here."
 
 [features]
 default = []
-# Kept so the feature wiring that names `scratchy-builder-spyre/sendnn` keeps resolving. It no longer
-# turns anything on: the dxp compile happens inside the `#[forward]` emit
-# (`scratchy_subtile::superdsc_bake`) and its output goes into the binary via inventory.
-sendnn = []
+# Kept so the feature wiring that names `scratchy-builder-spyre/spyre-hw` keeps resolving. It no
+# longer turns anything on: the dxp compile happens inside the `#[forward]` emit and its output goes
+# into the binary via inventory.
+spyre-hw = []
 
 # ⛔ NO BUILD-DEPENDENCY ON `scratchy-models`. It used to live here as an ORDERING LEVER — a
 # build-dependency is the only edge cargo fully builds before a build script runs, so depending on the

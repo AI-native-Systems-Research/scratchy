@@ -18,12 +18,11 @@
 //! Reverting the stick basis to a hardcoded 64 (or dropping the `::<Fp8>` residency stamp) turns
 //! (1)/(2) RED; deleting the `StickExtent<Fp8>` witness turns (3) RED.
 
+use ktir_superdsc::emit::{assemble_convert, rb};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
 use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
 use scratchy_subtile::superdsc_opspec::{Df, Fp8, Fp16, Role};
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
-    assemble_convert, matmul_opspec_off, rb,
-};
 
 /// These probes emit decode-shaped projections: one token row, projection feature widths, no batch.
 fn mm(m: u32) -> MatM {
@@ -242,12 +241,13 @@ fn qfp8ch_convert_splits_on_128_fp8_output() {
             &mut sym,
             None,
         );
-        let split =
-            e.op.numWkSlicesPerDim_
-                .get("out")
-                .copied()
-                .unwrap_or(1)
-                .max(1);
+        let split = e
+            .dsc()
+            .numWkSlicesPerDim_
+            .get("out")
+            .copied()
+            .unwrap_or(1)
+            .max(1);
         let per_core = cols / split;
         assert_eq!(
             per_core % 128,

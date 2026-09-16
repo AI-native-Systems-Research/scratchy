@@ -33,7 +33,7 @@ fn main() {
     // CHECK-ONLY ESCAPE HATCH (`SCRATCHY_SKIP_SENDNN_CXX=1`), mirroring `SCRATCHY_PLAN_ONLY_BAKE`
     // and `SCRATCHY_SKIP_CUDA_KERNELS`: skip compiling the adapter so the sendnn-gated RUST can be
     // typechecked on a machine with no SDK. Without it, `cargo check --features sendnn` dies HERE,
-    // before any Rust typechecking — which means the whole `#[cfg(feature = "sendnn")]` worker could
+    // before any Rust typechecking — which means the whole `#[cfg(feature = "spyre-hw")]` worker could
     // only ever be compiled on the pod, and compile errors would reach it instead of being caught.
     // Link flags are still emitted, so a real build with this set fails loudly at link time rather
     // than producing a binary with no adapter.

@@ -575,17 +575,12 @@ nccl = [
     "scratchy-target-cuda/nccl",
     "scratchy-vision?/nccl",
 ]
+# A CARD: the macro compiles the device image from the bundle's KTIR at bake time.
+spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
 spyre = [
     "scratchy-forward-compiler-macro/spyre",
     "scratchy-forward-compiler/spyre",
     "dep:scratchy-target-spyre",
-]
-# SuperDSC emit path — the bundle that owns the 32-core split instead of the
-# sengraph. A cargo feature, NOT an env var: `cfg!(feature="superdsc")` in codegen.
-superdsc = [
-    "spyre",
-    "scratchy-forward-compiler-macro/superdsc",
-    "scratchy-forward-compiler/superdsc",
 ]
 # Shell tab-completion over REAL HuggingFace model ids. Off by default, and
 # deliberately so: the build script resolves the candidate list by querying
@@ -597,7 +592,8 @@ superdsc = [
 # degradation. With the feature off the registry is emitted EMPTY (never
 # absent: `src/lib.rs` includes it unconditionally and `compiled_hf_registry()`
 # is public API), and `scr` completes models from the local hf-hub cache alone.
-# A cargo feature, NOT an env var — same reasoning as `superdsc` above.
+# A cargo feature, NOT an env var — the build script reads `cfg!(feature = ...)`,
+# so the choice is recorded in the artifact rather than in a shell's environment.
 hf-completions = ["dep:ureq"]
 [dependencies]
 scratchy-layers = { path = "../../layers" }

@@ -8,25 +8,19 @@
 //! Split out of `spyre_worker` because the worker is PLUMBING: it looks the model up and invokes
 //! it, and this is the invoking.
 
+// The pool/slot vocabulary is CARD-ONLY, so its imports carry the cfg of the blocks that use it.
+#[cfg(feature = "spyre-hw")]
 use scratchy_subtile::sdsc_abstract::{PoolPartition, SlotCount};
 use scratchy_target_spyre::manifest::argmax;
-// ⭐ THE CARD PATH NO LONGER PARSES A MANIFEST. `Manifest` survives only for
-// the KTIR-emulator session, whose `new_multi` takes `&Manifest` to thread its
-// HBM buffers. Under `sendnn` every fact it carried comes from the GENERATED
-// `SUPERDSC_WIRINGS` static instead, so the type is not even in scope.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::Manifest;
-// `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
-// runner; the bundle type + session type are cfg-selected, everything else
-// (weight load, dynamic sources, KV loop, sampling) is shared.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::KtirBundle;
-#[cfg(not(feature = "sendnn"))]
+// The runner type is cfg-selected: the KTIR emulator's session on the host, the sendnn one on
+// silicon. Everything around it (weight load, dynamic sources, KV loop, sampling) is shared.
+#[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::SuperDscSession;
 
 use crate::error::ExecutorResult;
+#[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
@@ -44,7 +38,7 @@ use crate::spyre_worker::*;
 /// forward instead of two, and the second one's ~29 ms weight-stream floor disappears. Every earlier
 /// chunk leaves it false and passes a NULL out-pointer, so the shim skips the ~3 MB logits D2H and the
 /// sen→IEEE convert. Returns `None` exactly when `want_logits` is false.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn run_prefill_batch(
     // ⛔ THE NEW-BLOCK LAW IS NOT A PARAMETER ANY MORE. It was `causal_col_valid: fn(usize, usize) ->
     // bool` — the row KIND travelling as a runtime value, which is the shape `QueryRows` exists to
@@ -503,7 +497,7 @@ pub(crate) fn run_prefill_batch(
     // |x|>65504 flags actual fp16 overflow, zero-count flags uninitialized/underflow.
     Ok(logits)
 }
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 
 /// Every activation a forward binds, against what the BAKE says that tensor is — one line, at
 /// `debug`, per launch.
@@ -561,6 +555,7 @@ fn log_binds(
 /// crate, because none of it touches a session; what is left here is stage → h2d → launch. That
 /// is the whole reason the split exists, and it is why one launcher serves both the decode and
 /// the batched-prefill regimes — they differ only in the `ForwardInputs` they hand it.
+#[cfg(feature = "spyre-hw")]
 pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
     pub(crate) shape: &'a scratchy_target_spyre::forward_tape::ForwardShape,
     pub(crate) steps: &'a [scratchy_target_spyre::forward_tape::ForwardStep],
@@ -576,6 +571,7 @@ pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
     pub(crate) launched: bool,
 }
 
+#[cfg(feature = "spyre-hw")]
 impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLauncher<'_, V> {
     type Error = String;
 
@@ -642,7 +638,7 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
 // between this `#[cfg]` and the fn it guarded and the attribute attached to the launcher instead.
 // Invisible under `-Fsendnn`; it broke the KTIR-only build, which is exactly what `8bd5c755b` had
 // just repaired.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn superdsc_forward_chunk(
     sh: &Shared<'_>,
     session: &mut SuperDscSession,
@@ -1278,7 +1274,7 @@ pub(crate) fn superdsc_forward_chunk(
 /// against `req`'s KV cache (m=toks.len() query rows in one forward). `start` is
 /// the valid-prefix count AND the runtime `decode_position`. Appends the new
 /// roped-K/V rows and returns the per-row logits `[n, vocab]`. n <= b.m_cap.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn forward_chunk(
     sh: &Shared<'_>,
     session: &mut SendnnSession,
@@ -1331,7 +1327,7 @@ pub(crate) fn forward_chunk(
 
 /// The KTIR-emulator twin of [`forward_chunk`]: one fused forward through the resident session,
 /// with the prefix KV threaded from the host cache.
-#[cfg(not(feature = "sendnn"))]
+#[cfg(not(feature = "spyre-hw"))]
 pub(crate) fn forward_chunk(
     sh: &Shared<'_>,
     session: &mut SpyreSession,
@@ -1412,15 +1408,28 @@ pub(crate) fn forward_chunk(
     // KTIR builds ONE dynamic-source list (embed + cos/sin + per-layer prefix-KV)
     // for the single fused forward. sendnn builds per-GROUP lists below (it threads
     // the hidden state group→group), reusing `emb`/`cos_rows`/`sin_rows` directly.
-    let mut dynamic: Vec<(usize, Vec<f32>)> = {
+    let mut dynamic: Vec<(u64, Vec<f32>, Vec<usize>)> = {
         let mut dynamic =
             Vec::with_capacity(1 + b.cos_srcs.len() + b.sin_srcs.len() + 2 * b.layers.len());
-        dynamic.push((b.embed_src, emb));
+        // The embedding is this chunk's rows of the hidden state.
+        dynamic.push((b.embed_src as u64, emb, vec![n, sh.hidden]));
+        // ⭐ THE COMPILE-TIME SCALARS, AT THEIR RESERVED TIDS. `KtirFunc::splat_scale` reads each
+        // model constant (a ScalarMul multiplier, an RMSNorm epsilon or divisor) and the algebraic
+        // identities `0`/`1` from a bound `[1,1]` tile rather than a KTIR immediate, so that ONE
+        // program serves both consumers: `dxp_standalone` has no immediate operand, and an
+        // `arith.constant` the card cannot read is not a constant the card has. They are ordinary
+        // `func.arguments` here, so leaving one unbound is a zero, and a zero in this position is
+        // silent — `x/(1+e)` becomes `x/e` and every scaled residual vanishes.
+        for (i, v) in b.scalarmul_scales.iter().enumerate() {
+            let tid = scratchy_target_spyre::lower_subtile_tape_to_superdsc::scalarmul_scale_tid(i);
+            dynamic.push((u64::from(tid), vec![*v], vec![1, 1]));
+        }
+        // Each rope table is tiled to the width its consumer reads.
         for &(cid, w) in &b.cos_srcs {
-            dynamic.push((cid, tile(&cos_rows, w)));
+            dynamic.push((cid as u64, tile(&cos_rows, w), vec![n, w as usize]));
         }
         for &(sid, w) in &b.sin_srcs {
-            dynamic.push((sid, tile(&sin_rows, w)));
+            dynamic.push((sid as u64, tile(&sin_rows, w), vec![n, w as usize]));
         }
         dynamic
     };
@@ -1435,22 +1444,74 @@ pub(crate) fn forward_chunk(
             let mut vbuf = vec![0.0f32; cap * kvd];
             kbuf[..req.kv_k[li].len()].copy_from_slice(&req.kv_k[li]);
             vbuf[..req.kv_v[li].len()].copy_from_slice(&req.kv_v[li]);
-            dynamic.push((lw.prefix_k_src, kbuf));
-            dynamic.push((lw.prefix_v_src, vbuf));
+            dynamic.push((lw.prefix_k_src as u64, kbuf, vec![cap, kvd]));
+            dynamic.push((lw.prefix_v_src as u64, vbuf, vec![cap, kvd]));
         }
+        // ⭐ THE LENGTH MASK IS FILLED BY WHOEVER KNOWS THE DECODE POSITION. The prefix cache tensor
+        // spans the full structural capacity while only `start` of its rows are valid this step, so
+        // the mask zeroes the valid columns and drives the rest to a large negative — they leave the
+        // softmax through `exp(-inf) = 0`. It is a source like any other.
+        if let Some(mask) = b.attn_mask_src {
+            // ⭐ TWO MASKS, ONE SOURCE, TOLD APART BY THE BUNDLE'S OWN ROW COUNT. A `m_cap == 1`
+            // bundle masks the resident PREFIX: `[1, capacity]`, valid up to `start`. A prompt
+            // chunk (`m_cap > 1`) has no resident prefix — its bundle is baked `ActiveCap::NONE` —
+            // and instead needs the `[mq, mq]` CAUSAL triangle over its own keys, which is what
+            // lets the attention run all `mq` rows in one pass instead of unrolling them.
+            let (fill, shape) = if b.m_cap > 1 {
+                (
+                    scratchy_target_spyre::manifest::attn_causal_mask_fill(b.m_cap),
+                    vec![b.m_cap, b.m_cap],
+                )
+            } else {
+                (
+                    scratchy_target_spyre::manifest::attn_mask_fill(cap, start),
+                    vec![1, cap],
+                )
+            };
+            dynamic.push((mask as u64, fill, shape));
+        }
+        // ⭐ ASK FOR THE ROWS THIS FORWARD WROTE, NOT THE WHOLE RESIDENT TENSOR. Decode and prefill
+        // share one session, so every tensor is resident at the WIDEST program's row count: a
+        // one-row decode step had its outputs decoded at the prefill's `m`. The counts are the ones
+        // the reads below already slice to — `vocab` of the result, `n * kvd` of each new K/V.
+        let wanted: std::collections::HashMap<u64, usize> =
+            std::iter::once((b.result_id as u64, vocab))
+                .chain(
+                    b.layers.iter().flat_map(|lw| {
+                        [(lw.new_k_id as u64, n * kvd), (lw.new_v_id as u64, n * kvd)]
+                    }),
+                )
+                .collect();
+        let outputs: Vec<(u64, usize)> = b
+            .output_ids
+            .iter()
+            .map(|id| (*id as u64, wanted.get(&(*id as u64)).copied().unwrap_or(0)))
+            .collect();
         let out = session
-            .run_step(b.prog, &dynamic, start as u32, n, &b.output_ids)
+            .run_step(b.prog, dynamic, &outputs)
             .map_err(|e| werr(format!("run_step: {e}")))?;
         tokens.set_tokens_in_pool(id, start + n);
         for (li, lw) in b.layers.iter().enumerate() {
-            req.kv_k[li].extend_from_slice(&out[&lw.new_k_id][..n * kvd]);
-            req.kv_v[li].extend_from_slice(&out[&lw.new_v_id][..n * kvd]);
+            req.kv_k[li].extend_from_slice(&out[&(lw.new_k_id as u64)][..n * kvd]);
+            req.kv_v[li].extend_from_slice(&out[&(lw.new_v_id as u64)][..n * kvd]);
         }
-        let res = &out[&b.result_id];
-        let logits: Vec<Vec<f32>> = (0..n)
-            .map(|i| res[i * vocab..(i + 1) * vocab].to_vec())
-            .collect();
-        Ok(logits)
+        let res = &out[&(b.result_id as u64)];
+        // ⭐⭐⭐ ONE LOGITS ROW, AT ROW 0 — because that is what the bundle COMPUTES.
+        //
+        // A prefill bundle does not run its vocab-wide lm_head at `mq`. `lower_one_node`'s
+        // `is_prefill_lm_head_tail` arm folds it to the m=1 tail it really is
+        // (`lower_prefill_lm_head_at_m1`): the activation is sliced to the LAST prompt row and the
+        // output is narrowed by `node_at_one_row` to `Range::new(rows.start, 1)` — row 0. Only that
+        // row's logits are ever read, and computing all `mq` rows of a 128k-column output would be
+        // `mq`× the work for one row of answer.
+        //
+        // ⛔ SO `(0..n)` WAS A CLAIM THE BUNDLE NEVER MADE. Rows 1..n are never written, and the
+        // caller takes the LAST of what it gets (`next_back()`), so a prompt chunk with n > 1
+        // sampled an unwritten row — zeros — and generation continued from a token the model never
+        // chose. It coincided with row 0 only at n == 1, which is why decode looked correct and a
+        // prompt that fit ONE chunk looked correct. MEASURED: the result tensor comes back with
+        // ~one row of `vocab` nonzeros and every argmax below `vocab`, i.e. in row 0.
+        Ok(vec![res[..vocab].to_vec()])
     }
 }
 
@@ -1482,15 +1543,15 @@ pub(crate) fn run_request_step(
     n: usize,
     // The host's block list for this request, read from `InputBatch` by the caller, and the pool's owner
     // split. Passed in rather than looked up here so there is one read of the store per step.
-    #[cfg(feature = "sendnn")] host: &[usize],
-    #[cfg(feature = "sendnn")] part: PoolPartition,
+    #[cfg(feature = "spyre-hw")] host: &[usize],
+    #[cfg(feature = "spyre-hw")] part: PoolPartition,
 ) -> ExecutorResult<Option<u32>> {
     if n == 0 {
         return Ok(None);
     }
     // The map context for this request's whole step: the host's list (read from `InputBatch` by the
     // caller) and the pool's owner split, derived once.
-    #[cfg(feature = "sendnn")]
+    #[cfg(feature = "spyre-hw")]
     let ctx = PageMapCtx { host, part };
     let toks: Vec<usize> = (start..start + n)
         .map(|p| {
@@ -1525,10 +1586,10 @@ pub(crate) fn run_request_step(
     // for normal operation. Gate it behind SCRATCHY_SUPERDSC_DBG (the existing verbose-diagnostic
     // toggle this file already uses elsewhere) so it's there when actually debugging the prefill
     // path, silent otherwise.
-    #[cfg(feature = "sendnn")]
+    #[cfg(feature = "spyre-hw")]
     // KTIR forwards at most m_cap rows/chunk. The sendnn layer-group path runs the
     // whole scheduled chunk in one forward.
-    #[cfg(feature = "sendnn")]
+    #[cfg(feature = "spyre-hw")]
     let chunk_w = match &model.session {
         // SUPERDSC: with a batched-prefill session, feed the whole prompt in ONE chunk
         // (superdsc_forward_chunk runs all of it through the m=N prefill session, whose final chunk
@@ -1624,7 +1685,7 @@ pub(crate) fn run_request_step(
             }
         }
     };
-    #[cfg(not(feature = "sendnn"))]
+    #[cfg(not(feature = "spyre-hw"))]
     let chunk_w = b.m_cap;
     // SEQUENTIAL PREFILL (revived, user-directed 2026-07-11): a SuperDSC multi-token prompt with no
     // batched prefill session is walked one token at a time (chunk_w=1) through the decode bundle's
@@ -1645,7 +1706,7 @@ pub(crate) fn run_request_step(
             tokens,
             pos,
             chunk,
-            #[cfg(feature = "sendnn")]
+            #[cfg(feature = "spyre-hw")]
             ctx,
         )?;
         last = rows.into_iter().next_back().unwrap_or_default();

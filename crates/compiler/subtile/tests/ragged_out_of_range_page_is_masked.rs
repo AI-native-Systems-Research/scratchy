@@ -17,7 +17,7 @@
 //! against the public API alone, so the check is runnable TODAY instead of after that cleanup.
 //!
 //! Milliseconds. Every on-card trial of this profile costs ~5 minutes.
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 
 use scratchy_subtile::sdsc_abstract::*;
 

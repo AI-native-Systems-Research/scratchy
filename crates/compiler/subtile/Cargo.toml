@@ -12,26 +12,30 @@ default = []
 # (`lower_subtile_tape_to_ktir` + `lower_subtile_tape_to_sengraph`). Pure-Rust
 # emission, no extra deps — so a cuda/metal-only build never compiles them.
 # Consumers forward their own `spyre` into `scratchy-subtile/spyre`.
-spyre = []
-# SuperDSC (SDSC) perf path — the tile-level work-divided dxp bundle. Gates the sdsc
-# modules (lower_subtile_tape_to_superdsc / sdsc_abstract / superdsc_{error,opspec} +
-# subtile_tape reroll). Independent of `spyre` (ktir) — an sdsc build compiles ZERO
-# sengraph and only the ktir MANIFEST builder (lower_subtile_tape_to_ktir, shared).
-superdsc = ["dep:scratchy-spyre-bundle"]
+spyre = ["dep:scratchy-spyre-bundle"]
+
 
 [dependencies]
-# ⭐ THE BAKED-BUNDLE TYPE FAMILY, which the `superdsc` lowering CONSTRUCTS and hands to the
+# ⭐ THE TYPED SuperDSC IR, WHICH USED TO BE THIS CRATE'S `superdsc_opspec`/`superdsc_error`.
+# Those two modules moved to a leaf crate with no scratchy dependency, so a third-party KTIR producer
+# (IBM, `triton-spyre`) can eventually consume the `ktir -> superdsc` lowering without pulling
+# scratchy in. `lib.rs` re-exports both modules from this crate's root, so every
+# `scratchy_subtile::superdsc_opspec::…` path in the tree — and `sdsc_abstract`
+# and `addr`'s own `crate::superdsc_opspec::…` — resolve unchanged. UNGATED, matching what the two
+# modules were: `sdsc_abstract` and `addr` name `Df`/`DataFormat`/`Fp16` on every target.
+ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
+# ⭐ THE BAKED-BUNDLE TYPE FAMILY, which the lowering CONSTRUCTS and hands to the
 # `#[forward]` macro — see that crate's header. A leaf below both ends of the Spyre pipeline, so this
 # edge does not make the generic scheduling layer depend on the Spyre target. OPTIONAL and gated on
-# `superdsc` for the same reason every other Spyre-only piece here is: a cuda/metal build compiles
+# `spyre` for the same reason every other Spyre-only piece here is: a cuda/metal build compiles
 # none of it.
 scratchy-spyre-bundle = { path = "../../targets/spyre/bundle", optional = true }
-# Emit the IBM Spyre sendnn op-graph as JSON (the `--device sdsc` path) — a
+# Emit the IBM Spyre op-graph as JSON — a
 # pure-Rust serde model serialized to the graph schema `compile_graph` consumes.
 # No SDK linkage: the graph is plain JSON; the SDK compiles it downstream.
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-# f16 encoding for embedded `ConstInput` tensors in the sendnn graph (e.g. the
+# f16 encoding for embedded `ConstInput` tensors in that graph (e.g. the
 # RMSNorm mean-reduction `ones/h` vector + the eps scalar).
 half = { workspace = true }
 
@@ -58,13 +62,13 @@ scratchy-forward-compiler = { path = ".." }
 # conversion to compare on equal terms.
 half = { workspace = true }
 
-# ⛔⛔⛔ RUNNING THIS CRATE'S KANI PROOFS REQUIRES `--features superdsc`. EVERY HARNESS IN
-# `sdsc_abstract.rs` LIVES BEHIND `#[cfg(feature = "superdsc")] pub mod sdsc_abstract;`, and `default = []`,
+# ⛔⛔⛔ RUNNING THIS CRATE'S KANI PROOFS REQUIRES `--features spyre`. EVERY HARNESS IN
+# `sdsc_abstract.rs` LIVES BEHIND `#[cfg(feature = "spyre")] pub mod sdsc_abstract;`, and `default = []`,
 # so `cargo kani -p scratchy-subtile <harness>` compiles the crate, finds ZERO harnesses, and reports
 #     error: no harnesses matched the harness filter: `<name>`
 # — which reads like a typo in the name, not like "this file was never compiled". MEASURED 2026-08-14: a
 # harness resident in that file for weeks reported no-match without the flag and verified 27 checks with it.
-# So:  KANI_PKG=scratchy-subtile ~/.claude/bin/kani-safe.sh <harness> --features superdsc
+# So:  KANI_PKG=scratchy-subtile ~/.claude/bin/kani-safe.sh <harness> --features spyre
 # This is the THIRD time proofs in this repo have been silently vacuous (see the note below, and
 # `kani-proofs-died-silently-in-the-rebuild`). A proof that does not run is worse than no proof, because it
 # is quoted in commit messages as if it did.

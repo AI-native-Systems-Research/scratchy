@@ -35,8 +35,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use scratchy_subtile::lower::{AffineInt4, GemmWeight, InputRef, LoweredOp, LoweringInput, OpDesc};
-use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use scratchy_subtile::subtile_ir::SourceShape;
 
 use crate::assignment::Assignment;

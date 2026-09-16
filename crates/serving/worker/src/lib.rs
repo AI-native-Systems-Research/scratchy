@@ -24,17 +24,17 @@ pub mod metal_info;
 #[cfg(feature = "nccl")]
 pub mod multinode;
 pub mod parallel;
-#[cfg(any(feature = "spyre", feature = "sendnn"))]
+#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
 pub mod spyre_exec;
-#[cfg(any(feature = "spyre", feature = "sendnn"))]
+#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
 pub mod spyre_forward;
-#[cfg(any(feature = "spyre", feature = "sendnn"))]
+#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
 pub mod spyre_load;
-#[cfg(any(feature = "spyre", feature = "sendnn"))]
+#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
 pub mod spyre_pool;
-#[cfg(any(feature = "spyre", feature = "sendnn"))]
+#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
 pub mod spyre_types;
-#[cfg(any(feature = "spyre", feature = "sendnn"))]
+#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
 pub mod spyre_worker;
 pub mod threadpool;
 pub mod uniproc;

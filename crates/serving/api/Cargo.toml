@@ -23,8 +23,9 @@ cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda", "dep:s
 nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
 metal = ["scratchy-serving-worker/metal", "scratchy-forward-compiler/metal"]
 spyre = ["scratchy-serving-worker/spyre"]
-sendnn = ["scratchy-serving-worker/sendnn"]
-superdsc = ["scratchy-serving-worker/superdsc"]
+# A card, and the emulator — siblings, forwarded to the worker's own tiers.
+spyre-hw = ["scratchy-serving-worker/spyre-hw"]
+spyre-emu = ["scratchy-serving-worker/spyre-emu"]
 guided-decoding = ["scratchy-serving-worker/guided-decoding"]
 multimodal = ["scratchy-core-model/multimodal", "dep:image", "dep:scratchy-vision", "scratchy-forward-compiler/vision", "scratchy-serving-worker/vision"]
 # axum-server is the TLS listener ONLY — the plain-HTTP path binds a

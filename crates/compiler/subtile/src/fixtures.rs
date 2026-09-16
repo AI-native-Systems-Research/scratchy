@@ -6,8 +6,8 @@
 //! `LoweringInput` directly from a solved decode FUF via the proc-macro.
 
 use crate::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
-use crate::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use crate::subtile_ir::SourceShape;
+use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 
 /// Minimal one-layer Llama-3.2-1B-style decode forward.
 ///

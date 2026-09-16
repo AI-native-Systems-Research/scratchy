@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! A BATCHED-DECODE logits row is not where a reader assumes it is.
 //!
 //! The lm-head tail of a batched-decode bundle runs unfolded at `m = requests`, so its output is a

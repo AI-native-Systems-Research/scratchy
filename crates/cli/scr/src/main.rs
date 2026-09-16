@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // ⛔ GATED ON THE FEATURE THAT LOADS SENLIB. metal and cuda have no such library and their `atexit` is
     // fine; skipping it there would silence a real bug rather than route around someone else's.
-    #[cfg(any(feature = "sendnn", feature = "superdsc"))]
+    #[cfg(feature = "spyre-hw")]
     {
         use std::io::Write;
         let code = match &r {
@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         // memory and file descriptors, both reclaimed by the kernel.
         unsafe { libc::_exit(code) };
     }
-    #[cfg(not(any(feature = "sendnn", feature = "superdsc")))]
+    #[cfg(not(feature = "spyre-hw"))]
     r
 }
 

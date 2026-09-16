@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! The RoPE head-major collapse is valid at ANY row count — the law batched decode now rests on.
 //!
 //! RoPE used to emit one block per (row, head): ~40 ops per op-type, ~150 a layer, and its own

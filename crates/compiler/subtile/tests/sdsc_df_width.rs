@@ -12,7 +12,7 @@
 //!   (2) fp8 is a real 128-lane / 1-byte packed residency whose address actually differs ⇒ the width
 //!       bit reaches addressing (real substrate for W8A8, not a cosmetic field).
 //! Re-hardcoding the stick back to 64 makes the fp8 asserts go RED.
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 
 use scratchy_subtile::sdsc_abstract::{StickLayout, dev_off, dev_off_stk};
 use scratchy_subtile::superdsc_opspec::Df;

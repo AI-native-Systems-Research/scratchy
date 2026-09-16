@@ -30,23 +30,9 @@ extern crate scratchy_models as _;
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::spyre_types::*;
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_subtile::sdsc_abstract::PagedKvPool;
-// ⭐ THE CARD PATH NO LONGER PARSES A MANIFEST. `Manifest` survives only for
-// the KTIR-emulator session, whose `new_multi` takes `&Manifest` to thread its
-// HBM buffers. Under `sendnn` every fact it carried comes from the GENERATED
-// `SUPERDSC_WIRINGS` static instead, so the type is not even in scope.
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::Manifest;
-// `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
-// runner; the bundle type + session type are cfg-selected, everything else
-// (weight load, dynamic sources, KV loop, sampling) is shared.
-use crate::spyre_types::*;
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::manifest::KtirBundle;
-
-#[cfg(not(feature = "sendnn"))]
-use scratchy_target_spyre::runner::SpyreSession;
 
 use crate::error::ExecutorError;
 use crate::worker::{Worker, WorkerConfig};
@@ -54,12 +40,6 @@ use crate::worker::{Worker, WorkerConfig};
 pub(crate) fn werr(msg: impl Into<String>) -> ExecutorError {
     ExecutorError::WorkerExecution(msg.into())
 }
-
-/// One program's inputs to [`SpyreSession::new_multi`]: its node `(func, mlir)`
-/// pairs, its manifest, and its extra result ids. The shared session is built
-/// over one of these per phase (prefill + one per decode cap bucket).
-#[cfg(not(feature = "sendnn"))]
-pub(crate) type ProgramInput<'a> = (&'a [(&'a str, &'a str)], &'a Manifest, &'a [usize]);
 
 /// Host-only KTIR serving worker.
 pub struct SpyreWorker {
@@ -190,10 +170,11 @@ pub struct SpyreWorkerFactory;
 
 impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFactory {
     fn matches(&self, device: &str) -> bool {
-        // `sendnn` = the on-silicon target (this worker, built with -Fsendnn,
-        // routes through sdsc_runner). `spyre` = the KTIR emulator path. `auto`
-        // resolves to whichever backend this binary was built with.
-        device == "spyre" || device == "sendnn" || device == "auto"
+        // ⭐ ONE DEVICE NAME. The target is `spyre`; WHICH spyre — the card or the emulator — is a
+        // build-time fact (`spyre-hw` / `spyre-emu`), not something a runtime string selects,
+        // so there is no second name to accept. `auto` resolves to whichever backend this binary
+        // was built with.
+        device == "spyre" || device == "auto"
     }
 
     /// ⭐ TRUE, AND THE THREE THINGS THAT MAKE IT TRUE.

@@ -33,130 +33,28 @@
 // parsed out of the model configs. Included before the doors below, which invoke them.
 include!(concat!(env!("OUT_DIR"), "/config_geometry.rs"));
 
-/// A COUNT along one head axis of a model. Distinct types, so a query-head count cannot be handed
-/// to something that wanted a kv-head count — under GQA they are different numbers, and passing one
-/// where the other belongs addresses another head's keys, which is fluent wrong output rather than
-/// a fault. The same discipline as `addr::shape`'s `Rows`/`PadRows`/`Slabs`, and this is where
-/// [`Gqa`] — the group size those two counts determine — lives too.
-macro_rules! head_counts {
-    ($($t:ident => $doc:literal),* $(,)?) => { $(
-        #[doc = $doc]
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-        pub struct $t(u32);
-        impl $t {
-            /// The count as the config declares it.
-            pub const fn new(v: u32) -> Self { Self(v) }
-            /// The count as a value, for the derivations that need one.
-            pub const fn get(self) -> u32 { self.0 }
-        }
-    )* };
-}
-
-head_counts! {
-    QueryHeads => "How many QUERY heads the model has — `num_attention_heads`.",
-    KvHeads    => "How many KEY/VALUE heads the model has — `num_key_value_heads`. Equal to \
-                   [`QueryHeads`] only for a non-GQA model, which is exactly why it is a different \
-                   type.",
-    HeadDim    => "How wide ONE head is — `head_dim`. Not a hidden size, not a stick width, not a \
-                   lane count: the three quantities a head dim is most often confused with, all of \
-                   which are also small powers of two.",
-    Gqa        => "Query heads per kv head. Never written by a call site: it is \
-                   [`ModelAttnGeometry`]'s own division, performed once at the mint where the \
-                   divisibility is proven.",
-}
-
-/// ⭐⭐⭐⭐⭐ ONE MODEL'S ATTENTION GEOMETRY AS A VALUE, WITH ITS GQA PROOF SPENT AT THE MINT.
-///
-/// The tape carries this — not three adjacent `u32` fields — so the head counts cannot be
-/// transposed in a struct literal, a head dim from another op cannot be paired with them, and the
-/// group size cannot be recomputed anywhere downstream.
-///
-/// [`mint`](Self::mint) is the ONE place divisibility is decided. `None` there is a config whose
-/// kv-head count does not divide its query-head count: such a model has no GQA grouping at all, and
-/// the arithmetic that used to paper over it — `(nqh / nkvh.max(1)).max(1)` — yields a plausible
-/// group size whose attention reads another head's keys. Holding a `ModelAttnGeometry` IS holding
-/// the fact that its [`gqa`](Self::gqa) is exact, so no consumer checks again.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ModelAttnGeometry {
-    nqh: QueryHeads,
-    nkvh: KvHeads,
-    hd: HeadDim,
-    gqa: Gqa,
-}
-
-impl ModelAttnGeometry {
-    /// THE MINT — and the one evaluation of the GQA division in the whole pipeline.
-    ///
-    /// `None` for a zero count, a zero head dim, or a kv-head count that does not divide the
-    /// query-head count. The caller is the parse boundary from the model config (the macro's
-    /// wavefront bridge), so a `None` there is a build error naming the model, not a runtime arm.
-    pub const fn mint(nqh: QueryHeads, nkvh: KvHeads, hd: HeadDim) -> Option<ModelAttnGeometry> {
-        if nqh.get() == 0 || nkvh.get() == 0 || hd.get() == 0 {
-            return None;
-        }
-        if !nqh.get().is_multiple_of(nkvh.get()) {
-            return None;
-        }
-        Some(ModelAttnGeometry {
-            nqh,
-            nkvh,
-            hd,
-            gqa: Gqa::new(nqh.get() / nkvh.get()),
-        })
-    }
-
-    /// The query-head count.
-    pub const fn nqh(self) -> QueryHeads {
-        self.nqh
-    }
-
-    /// The kv-head count.
-    pub const fn nkvh(self) -> KvHeads {
-        self.nkvh
-    }
-
-    /// The head dim.
-    pub const fn hd(self) -> HeadDim {
-        self.hd
-    }
-
-    /// The GQA group size, divided out at the mint. Exact by construction — there is no rounding
-    /// and no `max(1)` here, because a non-dividing pair never became a value of this type.
-    pub const fn gqa(self) -> Gqa {
-        self.gqa
-    }
-
-    /// The `[rows, nqh*hd]` token-stream width — the query projection's and the attention output's
-    /// column count. The ONE place this product is written.
-    pub const fn q_width(self) -> u32 {
-        self.nqh.get() * self.hd.get()
-    }
-
-    /// The `[rows, nkvh*hd]` kv-stream width — one K or V projection's column count, narrower than
-    /// [`q_width`](Self::q_width) by exactly the GQA group size.
-    pub const fn kv_width(self) -> u32 {
-        self.nkvh.get() * self.hd.get()
-    }
-}
-
-impl std::fmt::Display for ModelAttnGeometry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "nqh={} nkvh={} head_dim={}",
-            self.nqh.get(),
-            self.nkvh.get(),
-            self.hd.get()
-        )
-    }
-}
+// ⭐ THE FOUR HEAD COUNTS NOW LIVE IN `ktir-superdsc`, RE-EXPORTED HERE SO EVERY PATH STILL RESOLVES.
+// The extraction moved `sdsc_abstract` + `addr` (the typed device facts)
+// into that leaf crate, and they cannot go without `Gqa`: `addr::shape::Shape::gqa` calls
+// `Gqa::new` and `sdsc_abstract`'s `KvHead::of_query`/`group_first_query` take one. It was the ONLY
+// unresolved path when those two moved.
+//
+// ⛔ ONLY THE COUNTS AND THE VALUE SIDE WENT. Everything in this file that knows about MODELS
+// stayed: the `include!` of the build script's arms, both value→const doors, and
+// `geometry_sources()`. That is the line the extraction must not cross — a door's arm set is the
+// CONSUMER's model inventory, so no model inventory reached the leaf crate. `ModelAttnGeometry` and
+// its mint (where the GQA divisibility is still the one place it is decided) followed the counts,
+// because the lowering's own request type names it.
+pub use ktir_superdsc::head_counts::{Gqa, HeadDim, KvHeads, QueryHeads};
+// The VALUE side, named directly rather than re-exported: this module's two doors take one as a
+// parameter, and every other call site in the tree names `ktir_superdsc::head_counts` itself.
+use ktir_superdsc::head_counts::ModelAttnGeometry;
 
 /// What the SDSC lowering runs once its geometry is a const — the consumer side of
 /// [`with_config_attn_geometry`]. The method is generic over the three consts because that is the
 /// whole point of the door: the body receives the geometry AS CONSTS, with the
 /// [`AttnGeometry`](crate::sdsc_abstract::AttnGeometry) witness that spends the divisibility proof,
 /// so every layout term it derives is the compiler's arithmetic.
-#[cfg(feature = "superdsc")]
 pub trait OnAttnGeometry {
     /// What the dispatch produces.
     type Out;
@@ -173,7 +71,6 @@ pub trait OnAttnGeometry {
 /// `None` is a geometry no config in this workspace declares — the caller refuses the bake, loudly,
 /// naming the geometry and the configs that were read. The fix is a `config.json`, never an edit
 /// here: there is no list in this file to grow.
-#[cfg(feature = "superdsc")]
 pub fn with_config_attn_geometry<C: OnAttnGeometry>(
     geometry: ModelAttnGeometry,
     consumer: C,

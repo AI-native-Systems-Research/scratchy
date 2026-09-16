@@ -1953,11 +1953,11 @@ pub fn play_skeleton(tape: &SubtileTape) -> Vec<PlayStep> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
     use crate::subtile_ir::{
         EwKind, KvCacheLayout, KvCacheProducer, NeoX, Range, Region, SoftmaxStateId, SubOp,
         SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
     };
+    use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 
     /// A minimal SubtileIR: source[1,4] → silu → result[1,4].
     fn tiny_graph() -> SubtileIR<NeoX> {

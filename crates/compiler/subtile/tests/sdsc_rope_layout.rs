@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // The abstract interpreter (`sdsc_abstract`) is gated behind `scratchy-subtile/spyre`.
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! ROPE LOWERING PROOF (compile-time, via the abstract interpreter).
 //!
 //! The emitter lowers `RopeRotate` to the permutation-matmul form (`lower_rope_node`):

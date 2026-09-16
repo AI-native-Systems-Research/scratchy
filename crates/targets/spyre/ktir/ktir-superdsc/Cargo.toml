@@ -1,0 +1,66 @@
+[package]
+name = "ktir-superdsc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "KTIR -> SuperDSC (SDSC): the typed SuperDSC IR value types. No scratchy dependency."
+
+[lib]
+
+# ⛔ NO FEATURES, AND THAT IS THE POINT. This crate is the destination of the `ktir->superdsc`
+# extraction: a leaf a third-party KTIR producer (IBM, `triton-spyre`) can consume without pulling
+# scratchy in. A feature here would be a place for a scratchy-shaped fact to hide, so there is
+# none — and `--no-default-features` is already the whole build.
+
+[dependencies]
+# ⭐ INTRINSIC, BECAUSE SUPERDSC IS A JSON FORMAT. What this crate produces is the `sdsc_*.json` a
+# `dxp` bake compiles, so a serializer is the output format rather than a borrowed convenience:
+# `wire.rs` carries 14 of the 20 `#[derive(Serialize)]` in the crate. `SliceIndex` additionally
+# hand-writes `impl serde::Serialize`, so a per-core slice index can sit inside
+# `SdscOp::coreIdToWkSlice_` as a bare integer while still being provably minted by
+# `core_to_wk_slice`'s decomposition — the alternative was widening that field to `u32` and losing
+# the witness.
+#
+# ⛔ THIS COMMENT USED TO SAY THE EDGE EXISTED ONLY FOR THAT ONE HAND-WRITTEN IMPL, "until the wire
+# layer itself moves in". The wire layer HAS moved in; it is `src/wire.rs`. The dependency is
+# load-bearing for the whole `Dsc`/`SdscOp` family now, not an orphan-rule stopgap.
+#
+# NOTHING HERE DESERIALIZES — zero `Deserialize` in the crate. This writes descriptors; it does not
+# read them back.
+serde = { workspace = true, features = ["derive"] }
+# ⭐ FOR THE PLACES DXP'S OWN SCHEMA IS UNTYPED. Three wire fields (`constantInfo_`, `coordinates_`,
+# `backGapCore_`) are `serde_json::Value` because dxp accepts EITHER a dict or the string "{}" there
+# — see `Dsc::constantInfo_`, where getting that wrong collapsed every transcendental to its seed.
+# The three fp8 nested-fold generators build their folds with `json!`.
+#
+# ⚖️ REMOVABLE IN PRINCIPLE, AND DELIBERATELY NOT REMOVED. Since nothing deserializes, this could go
+# by hand-rolling an enum for that dict-or-"{}" union. It stays because `Value` is honest about a
+# schema that genuinely is untyped at those fields, and hand-rolling a JSON value type to shed one
+# dependency is how a second `constantInfo_` bug gets written.
+serde_json = { workspace = true }
+# f16 encoding for the mask sentinel / eps scalars `sdsc_abstract` bakes into a descriptor.
+half = { workspace = true }
+# ⭐ THE INPUT LANGUAGE. `KtirNode.func` is a `ktir_core::ir::IRFunction<'static>` — the program this
+# crate lowers — so the request type cannot be named without it. VENDORED IN-TREE and
+# dependency-free, which is what lets it join a leaf crate at all.
+#
+# ⛔ NEVER `ktir-emulator`. Its default features pull Apple-only `objc2`, which would put this crate
+# (and CI's `--workspace` linux-cuda job, which builds every member as a root) on a Mac-only
+# dependency. The lowering needs the IR types, never a device.
+ktir-core = { path = "../ktir-core" }
+
+# ⛔⛔⛔ THE KANI HARNESSES IN `sdsc_abstract.rs` CAME WITH IT, AND THEY NEED THIS DECLARATION.
+# They compile only under the model checker, so `cfg(kani)` is a real name a normal build never
+# defines. DECLARED rather than silenced: an undeclared cfg is how ~100 commits of "the proofs hold"
+# turned out to be vacuous — a normal build skipped the module and said nothing — and declaring it
+# keeps a typo in the name an error while stopping the lint complaining about the name itself.
+#
+# ⚠️ RUNNING THEM NO LONGER NEEDS `--features spyre`, AND THE OLD INSTRUCTION IS NOW WRONG TWICE OVER.
+# `scratchy-subtile`'s manifest says every harness here "LIVES BEHIND
+# `#[cfg(feature = "spyre")] pub mod sdsc_abstract;`" and that the invocation is
+# `KANI_PKG=scratchy-subtile … --features spyre`. That gate did not exist even before this move
+# (`lib.rs` declared the module unconditionally), and the harnesses are now in THIS crate, which has
+# no features at all. So the invocation is `KANI_PKG=ktir-superdsc … <harness>` with no flag. This
+# matters because all 11 superdsc proofs have been found unreachable once already.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

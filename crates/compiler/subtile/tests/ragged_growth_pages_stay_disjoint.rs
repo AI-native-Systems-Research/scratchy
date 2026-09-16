@@ -22,7 +22,7 @@
 //! of the loop — a change that looks like a harmless CSE, and which the original indentation made it look
 //! like someone already had — makes every grown row draw the same pages. A test is the only thing that
 //! notices, because the result is a fluent wrong answer with no fault.
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 
 use scratchy_subtile::sdsc_abstract::PagedKvPool;
 use std::collections::HashSet;

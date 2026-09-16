@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! MODEL PARAMS DRIVE ADDRESSING — the property, not an instance of it.
 //!
 //! Every addressing bug this week was a stride written by hand from the one model that had ever run:

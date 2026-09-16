@@ -12,6 +12,10 @@
 //! toolchain pulled in.
 
 pub mod allocator;
+/// The KTIR types the emitted programs are made of. Re-exported because the `#[forward]` macro
+/// renders those programs as const tokens naming THIS crate's path — the same reason `bundle_code`
+/// is re-exported, so a consumer needs no direct dependency on the IR crate to hold a program.
+pub use ktir_core as ktir;
 /// ⭐ THE BAKED SuperDSC BUNDLE — `scratchy-spyre-bundle`, re-exported here so ONE path names it.
 ///
 /// The `#[forward]` macro emits against this path
@@ -25,12 +29,23 @@ pub mod fold_plan;
 /// The real `fxa_*` C-ABI entrypoints, natively over `flex-rs`. `csrc/spyre_sdk_abi.cpp`
 /// only still provides the two deeptools functions out of flex-rs's scope; this module
 /// provides every other `fxa_*` symbol `sdk_abi.rs` declares.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub mod fxa_rust_abi;
 pub mod ir;
-/// KTIR emission — MOVED here from `scratchy-subtile` (M3): target
-/// emission belongs in the target crate; the shared crate keeps only
-/// the SubtileIR substrate both backends consume.
+/// THE MODEL-GEOMETRY DOOR — all that is left of KTIR → SuperDSC on this side, and it is NOT the
+/// lowering. `lower()`'s name-keyed dispatch (our naming convention, so ours to read), the two arms
+/// that monomorphise a model's head geometry — whose match arms `scratchy-subtile`'s `build.rs`
+/// generates from the configs in scope, i.e. OUR model inventory — the two orphan-rule newtypes those
+/// arms need, and `BundleAttnParams`. Everything else — the emitter, the assemblers, main's eight
+/// `lower_*_node` bodies, the fp8 W8A8 descriptors — is `ktir_superdsc::emit`.
+///
+/// ⛔ IT WAS CALLED `lower_ktir_to_superdsc`, THE SAME NAME AS THE CRATE MODULE THAT HOLDS THE ACTUAL
+/// LOWERING, so the tree had two files by that name and this one read as though the lowering lived
+/// here. It does not, and none of what is here can move: an arm set generated from the consumer's
+/// configs cannot live in a leaf crate, and it cannot arrive as data either, because the point is that
+/// the values become `const` parameters.
+pub mod ktir_superdsc_door;
+/// SubtileIR → KTIR: the producer half. One KTIR program per node, and no descriptors.
 pub mod lower_subtile_tape_to_ktir;
 pub mod lower_subtile_tape_to_superdsc;
 mod op_abi;
@@ -52,14 +67,14 @@ pub mod forward_tape;
 pub mod manifest;
 /// Bundle execution on the `ktir_emulator` emulator — behind the `runner` feature
 /// (it links the emulator). Emit/weight-load paths use [`manifest`] alone.
-#[cfg(feature = "runner")]
+#[cfg(feature = "spyre-emu")]
 pub mod runner;
 /// The ONE C-ABI seam to the IBM Spyre SDK (flex device runtime + the deeptools host functions) —
 /// everything above it is Rust. Behind `sendnn` (it links the SDK via `build.rs`).
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub mod sdk_abi;
 /// The worker-facing session wrapper over [`superdsc_exec`] (f32 in, f32 logits out).
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub mod sdsc_runner;
 /// IEEE-fp16 ⟷ SEN169 (DLF16) device-format conversion + the device-tile weight staging walk —
 /// ported verbatim from the shim's C++ (which now calls these via `extern "C"`, same link unit).
@@ -68,7 +83,7 @@ pub mod sen_convert;
 pub mod stage_weight;
 /// The resident SuperDSC executor: allocate the bundle's program + weights + KV pool once, then
 /// launch each per-op kernel against the shared resident segments. The `--target sendnn` run path.
-#[cfg(feature = "sendnn")]
+#[cfg(feature = "spyre-hw")]
 pub mod superdsc_exec;
 /// The per-model launch wiring as spyre's OWN types, emitted by `#[forward]`
 /// as a `static` — the typed replacement for parsing `manifest.json` at load.

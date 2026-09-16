@@ -43,13 +43,18 @@ profiling = ["cuda"]
 # <backend>), not the HTTP server — a backend is only meaningful with local
 # inference.
 metal = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
-# IBM Spyre / KTIR host emulator backend (no GPU toolchain). `ktir` is an alias.
+# IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
+# GPU toolchain and NO device — neither a card nor the host emulator. On its own it
+# builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
+# get something that can actually run a model.
 spyre = ["scratchy-serving-api/spyre", "scratchy-serving-worker/spyre"]
-ktir = ["spyre"]
-sendnn = ["scratchy-serving-api/sendnn", "scratchy-serving-worker/sendnn"]
-# SuperDSC on-silicon path (`scr chat --device sendnn` built `--features superdsc`):
-# the full sendnn runtime + the SuperDSC work-divided emit. Cargo feature, NO env var.
-superdsc = ["scratchy-serving-api/superdsc", "scratchy-serving-worker/superdsc"]
+# ANY CARD — the ONE card tier, the same name the api, worker and target crates use. This crate
+# REFERENCES it: `main.rs`'s `libc::_exit` (senlib's atexit resets the device, so the process must
+# not run it) is `#[cfg(feature = "spyre-hw")]`, and without the declaration here that cfg is never
+# true, so a real-card build silently shipped WITHOUT the guard and rustc reported an
+# `unexpected cfg value`. The emulator does not imply it.
+spyre-hw = ["spyre", "scratchy-serving-api/spyre-hw", "scratchy-serving-worker/spyre-hw"]
+spyre-emu = ["scratchy-serving-api/spyre-emu", "scratchy-serving-worker/spyre-emu"]
 # Server-side modifiers: no-op without `serve` (`?/` only forwards when
 # scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to

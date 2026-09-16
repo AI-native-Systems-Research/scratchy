@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! MLP + RESIDUAL BRIDGE PROOF (staged-lowering verification, ≤3-fan-out).
 //!
 //! The symptom is the residual dominated by a linearly-growing channel (`ch247`), injected by the

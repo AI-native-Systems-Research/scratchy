@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 
 //! ⭐⭐⭐ REPLAY OF THE PARTIAL-CACHE-HIT SEQUENCE, THROUGH THE REAL PAGE MAP.
 //!

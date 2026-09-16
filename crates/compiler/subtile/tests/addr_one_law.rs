@@ -5,7 +5,7 @@
 //! the four transcriptions are exactly where the bugs lived. Each is checked ELEMENT BY ELEMENT at
 //! head_dim 64, 128 and 256 and at mq 1 and 31, i.e. on both sides of the two degeneracies
 //! (`hd == lanes` and `m == 1`) that hid every one of them.
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 
 use scratchy_subtile::addr::{Head, Idx, Nest, Slot};
 use scratchy_subtile::sdsc_abstract::{dev_off_stk, kcache_kt_write_offset, vcache_write_offset};

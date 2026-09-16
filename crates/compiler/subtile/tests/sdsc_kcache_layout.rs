@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // The abstract interpreter (`sdsc_abstract`) is gated behind `scratchy-subtile/spyre`; without it this
 // whole test crate compiles to nothing (run with `--features spyre`).
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! K-CACHE PRODUCER/CONSUMER LAYOUT PROOF (the missing guard for the multi-day attention bug).
 //!
 //! The SuperDSC decode score matmul reads the resident K cache `kc` as a `[hd, cap]` **cap-sticked

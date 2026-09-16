@@ -32,12 +32,11 @@ metal = ["dep:scratchy-ir", "scratchy-ir/metal",
 # at build time and the spyre worker runs it. Forwards into the compiler's
 # `spyre` gate (registry + IR); NEVER target-cuda — spyre rides the
 # compiler-owned registry, not the cuda crate.
-spyre = ["scratchy-forward-compiler/spyre", "scratchy-subtile/spyre", "dep:scratchy-target-spyre"]
-# SuperDSC perf path: the macro walks the SubtileIR straight to a work-divided
-# SuperDSC bundle (`lower_graph_to_superdsc`) that owns the 32-core split instead
-# of the sengraph. A cargo feature (NOT an env var) — `cfg!(feature="superdsc")`
-# in codegen selects the emit; rides on `spyre`.
-superdsc = ["spyre", "scratchy-subtile/superdsc"]
+spyre = ["scratchy-forward-compiler/spyre", "scratchy-subtile/spyre", "dep:scratchy-target-spyre", "dep:ktir-core"]
+
+# A CARD. The device image is compiled from the KTIR at bake time, so this build has a device
+# compiler to drain; the emulator build has nothing to compile and nothing to wait for.
+spyre-hw = ["spyre", "scratchy-target-spyre/spyre-hw"]
 # Tensor-parallel fanout. When any consumer crate forwards its `nccl`
 # feature into `scratchy-forward-compiler-macro/nccl` (every per-arch crate
 # does — see their `nccl = [..., "scratchy-forward-compiler-macro/nccl"]`),
@@ -61,6 +60,12 @@ scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 # proc-macro crate can't export the IR types, so they live in a normal
 # crate it calls.
 scratchy-subtile = { path = "../subtile" }
+# The KTIR→SuperDSC leaf crate, named DIRECTLY rather than through a `scratchy-subtile` re-export:
+# `to_wavefront.rs` mints the model's `ModelAttnGeometry` from the parsed config, and that type lives
+# in `ktir_superdsc::head_counts`. Unconditional and free —
+# `scratchy-subtile` above already pulls it in on every backend, so this only lets the path be spelled
+# honestly instead of laundered through a re-export.
+ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
@@ -87,6 +92,9 @@ scratchy-target-metal-compiler = { path = "../../targets/metal/compiler", option
 # emission belongs to its target, and the macro bakes the bundle at
 # expansion, so it consumes the emitter from there.
 scratchy-target-spyre = { path = "../../targets/spyre", default-features = false, optional = true }
+# The IR types the baked program is CONSTRUCTED from — this crate renders them as const tokens, so
+# it names the same types the lowering built. Dependency-free.
+ktir-core = { path = "../../targets/spyre/ktir/ktir-core", optional = true }
 
 [dev-dependencies]
 trybuild = "1"

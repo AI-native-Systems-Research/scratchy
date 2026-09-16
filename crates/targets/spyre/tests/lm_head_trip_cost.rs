@@ -5,11 +5,10 @@
 //! launches. The lm-head is the one op in the decode suffix that always time-tiles, so its trip
 //! count — not its op count — is what a batched decode step actually pays for the tail.
 
+use ktir_superdsc::emit::rb;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_off};
 use scratchy_subtile::sdsc_abstract::{KernelTag, MatK, MatM, MatN, MatY, QueryRowCount, Stk};
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::{
-    SharedKernelBmmForm, assemble_matmul_off,
-};
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{concrete_trips, rb};
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::concrete_trips;
 
 /// granite-3.1-2b's tail: hidden 2048 -> the padded 51200-wide logits placement.
 fn lm_head_trips(m: u32) -> usize {

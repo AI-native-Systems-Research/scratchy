@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "superdsc")]
+#![cfg(feature = "spyre")]
 //! THE DECODE LADDER AS TYPES — documentation of the law `PaddedMq::of_bundle` / `Rung<MQ>` carry.
 //!
 //! The load-bearing enforcement is the TYPE, not these tests: a non-ladder decode width cannot name

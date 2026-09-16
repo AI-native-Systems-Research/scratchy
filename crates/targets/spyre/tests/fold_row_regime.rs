@@ -10,15 +10,15 @@
 //! Without it the value lives twice — `per_req` in the emitter and a constant in the worker — with a
 //! comment as the only tie.
 
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use scratchy_subtile::sdsc_abstract::FoldRowRegime;
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
     FoldGrouping, bundle, bundle_fingerprint, launch_index,
 };
 
 /// A decode-batch attention emission (rows are requests), the shape whose fold groups the regime
 /// describes. granite-3.1-8b's head geometry at hd=64, batch width 4.
-fn batch_decode_ops() -> Vec<scratchy_target_spyre::lower_subtile_tape_to_superdsc::EmittedOp> {
+fn batch_decode_ops() -> Vec<ktir_superdsc::emit::EmittedOp> {
     let mut sym = 0i64;
     let geom = scratchy_subtile::sdsc_abstract::AttnGeometry::<32, 8, 64>::minted();
     let width = scratchy_subtile::sdsc_abstract::attn_bundle_rows(geom, 4, true)

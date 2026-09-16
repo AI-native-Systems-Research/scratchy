@@ -12,15 +12,13 @@
 //! on either of my two readings. Recording the numbers here so the next attempt starts from measured
 //! semantics instead of a comment.
 
+use ktir_superdsc::emit;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_off};
 use scratchy_subtile::addr::DevOff;
 use scratchy_subtile::sdsc_abstract::{
     BlockCols, KernelTag, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement, QueryRowCount,
     RowBlockedTag, RungWidth, SlotWindow, StickLayout, Stk,
 };
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::{
-    SharedKernelBmmForm, assemble_matmul_off,
-};
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 
 const HD: u32 = 64;
 const STICK: u32 = 64; // the fold sweeps one 64-slot block at a time
@@ -64,7 +62,7 @@ struct PerCore {
 
 impl PerCore {
     /// Read operand `arg` (0=input, 1=kernel, 2=output) of an emitted op.
-    fn of(e: &superdsc::EmittedOp, op: &str, arg: usize, y_extent: u32, mb_extent: u32) -> PerCore {
+    fn of(e: &emit::EmittedOp, op: &str, arg: usize, y_extent: u32, mb_extent: u32) -> PerCore {
         let v = serde_json::to_value(&e.op).unwrap();
         let wk = v["coreIdToWkSlice_"]
             .as_object()

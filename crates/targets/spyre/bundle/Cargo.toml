@@ -8,7 +8,7 @@ description = "The baked SuperDSC bundle, as Rust structs — the one artifact t
 [lib]
 
 # ⛔ A LEAF, AND DELIBERATELY SO. This crate is named by BOTH ends of the Spyre pipeline: the emitter
-# (`scratchy-subtile`'s `superdsc` lowering, which builds these values), the `#[forward]` macro (which
+# (the lowering in `scratchy-target-spyre`, which builds these values), the `#[forward]` macro (which
 # bakes them into the binary), and `scratchy-target-spyre` (which reads them back). It can therefore
 # depend on nothing either end owns.
 #
@@ -20,6 +20,15 @@ description = "The baked SuperDSC bundle, as Rust structs — the one artifact t
 # The registry: one `inventory::submit!` per emitted bundle from the arch crate, looked up by
 # fingerprint at load. `collect!` implements a trait FOR the type, so it lives with the type.
 inventory = { workspace = true }
+# THE IR ITSELF. A launch group carries the PROGRAMS it runs, as constructed `IRFunction`s baked by
+# `#[forward]` — so this crate names the same types the lowering built. Dependency-free, and no
+# feature gates it: a bundle IS its KTIR on every target.
+ktir-core = { path = "../ktir/ktir-core" }
+# ⭐ THE OPERAND IDENTITY (`PlaceId`/`SynthRole`), re-exported from this crate's root. A leaf BELOW
+# this one — no scratchy dependency, no features — so it does not breach the "depend on nothing
+# either end owns" rule above: the lowering that MINTS a synthetic and the bake that PLACES it now
+# name one declaration instead of two.
+ktir-superdsc = { path = "../ktir/ktir-superdsc" }
 # dxp's `spyrecode.json` is the ONE input to this crate that is not ours — it is the DeepTools
 # compiler's output, parsed here ONCE at build time so nothing downstream ever sees JSON.
 serde = { workspace = true, features = ["derive"] }

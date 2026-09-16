@@ -25,16 +25,14 @@
 //! `maxDimSizes_` / the per-core start addresses out of the op the builder emitted. A lock that
 //! recomputes the address it checks is testing its own arithmetic.
 
+use ktir_superdsc::emit;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_placed};
 use scratchy_subtile::addr::{DevOff, Head, Idx, Nest, Row, Shape, Slabs};
 use scratchy_subtile::sdsc_abstract::{
     KernelTag, Lanes, MatK, MatM, MatN, MatY, OperandPlacement, PagedKvPool, QueryRowCount,
     RowBlockedTag, StickLayout, Stk,
 };
 use scratchy_subtile::superdsc_opspec::Df;
-use scratchy_target_spyre::ir::bridge::tiled_op_sdsc_op::{
-    SharedKernelBmmForm, assemble_matmul_placed,
-};
-use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 
 const NKVH: u32 = 8;
 const STICK: u32 = 64;
@@ -53,7 +51,7 @@ fn dst_nest(hd: u32) -> Nest {
 
 /// The cache write EXACTLY as `lower_attn_node` emits it: one op per (request, slab, tensor), `y`
 /// over this slab's kv heads, one-stick identity contraction, head-outermost walk.
-fn cachewr_op(mq: u32, hd: u32, per_request: bool, req: u32, s: u32) -> superdsc::EmittedOp {
+fn cachewr_op(mq: u32, hd: u32, per_request: bool, req: u32, s: u32) -> emit::EmittedOp {
     let (src, dst) = (src_nest(mq, hd), dst_nest(hd));
     let n = slabs(hd);
     let a_place = OperandPlacement::of_plane_walk_by_head(&src, Idx::<Row>::n(req), s, n);
@@ -81,7 +79,7 @@ fn cachewr_op(mq: u32, hd: u32, per_request: bool, req: u32, s: u32) -> superdsc
     )
 }
 
-fn layout_dim_order(e: &superdsc::EmittedOp, arg: usize) -> Vec<String> {
+fn layout_dim_order(e: &emit::EmittedOp, arg: usize) -> Vec<String> {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0]["cachewr_pin"]["scheduleTree_"][arg]["layoutDimOrder_"]
         .as_array()
@@ -91,7 +89,7 @@ fn layout_dim_order(e: &superdsc::EmittedOp, arg: usize) -> Vec<String> {
         .collect()
 }
 
-fn max_dim_sizes(e: &superdsc::EmittedOp, arg: usize) -> Vec<i64> {
+fn max_dim_sizes(e: &emit::EmittedOp, arg: usize) -> Vec<i64> {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0]["cachewr_pin"]["scheduleTree_"][arg]["maxDimSizes_"]
         .as_array()
@@ -103,7 +101,7 @@ fn max_dim_sizes(e: &superdsc::EmittedOp, arg: usize) -> Vec<i64> {
 
 /// The op's own base address for one operand, in elements — the minimum over the per-core start
 /// addresses, so it is the emitter's answer and not a re-derivation of the placement.
-fn base_addr_elems(e: &superdsc::EmittedOp, arg: usize) -> i64 {
+fn base_addr_elems(e: &emit::EmittedOp, arg: usize) -> i64 {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0]["cachewr_pin"]["scheduleTree_"][arg]["startAddressCoreCorelet_"]["data_"]
         .as_object()
