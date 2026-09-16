@@ -147,6 +147,12 @@ pub fn run_stages_with(sdsc: &mut l3::dsc::SuperDsc, state: &DscState) -> Stages
         // caller holding no op func can state, and the ported min-param units refuse on it exactly
         // as the reference's `.at(0)` throws. A caller that HAS the op func calls [`run_l3`].
         v1::OpFuncs::new(None, Vec::new()),
+        // ⛔ AND NO `computeOp_` LIST EITHER, FOR THE SAME REASON — this entry point exists for a
+        // caller that holds neither. `Reads` then REFUSES BY NAME wherever the sweep is needed
+        // (`DscOffsetFacts::offset_sizes`), which is the faithful answer: an empty sweep reporting
+        // `false` would cancel a corelet split and hand out a corelet start address. A caller that
+        // HAS the ops calls [`run_l3`] or [`run_stages_2a_2b`].
+        Vec::new(),
         // ⛔ `sdscFoldProps_` IS NOT A FIELD OF [`l3::dsc::SuperDsc`] EITHER, and
         // [`l3::dl_ops::AddressFoldCoords::flat`] is *"the ONE coordinate a super-DSC declaring no
         // folds of its own has"* — which is literally true of the value in hand. A caller holding
@@ -169,13 +175,24 @@ pub fn run_stages_with(sdsc: &mut l3::dsc::SuperDsc, state: &DscState) -> Stages
 /// reading off the super-DSC.
 ///
 /// ⛔ [`None`] IS A CALLEE'S REFUSAL, propagated; `state.refusals()` says which provider made it.
+/// ⭐ `computes` IS THE `computeOp_` LIST IN THE SHAPE `Reads` NEEDS, and it is a second argument
+/// rather than a derivation of `ops` because [`v1::OpFuncs`] carries only `opFuncName` — it cannot
+/// answer `is_sole_partial_reduction_input`'s `inputLabeledDs` sweep, which is what
+/// [`l3::dl_ops::DscOffsetFacts::offset_sizes`] refuses without.
+///
+/// ⛔ AN EMPTY LIST IS A STATE THE REFERENCE CANNOT BE IN, not a benign default: `computeOp_.at(0)`
+/// throws on an op-less DSC, and `is_sole_partial_reduction_input` answering `false` off an empty
+/// sweep **cancels a corelet split** (`ddc/v1.rs:1931` → `split = None` → a corelet start address).
+/// So a caller that holds no ops states none and the carrier refuses by name; it does not sweep an
+/// empty list and call the answer `false`.
 pub fn run_l3<const CHUNK_EXPLORE: bool, A: crate::arch::Arch>(
     sdsc: &mut l3::dsc::SuperDsc,
     state: &DscState,
     ops: v1::OpFuncs,
+    computes: Vec<v1::DscComputeOp>,
     coords: &l3::dl_ops::AddressFoldCoords,
 ) -> Option<()> {
-    let reads = Reads::new(state, ops);
+    let reads = Reads::new(state, ops).with_compute_ops(computes);
     let placement = Placement::of(state, coords.clone());
     let inputs = l3::dl_ops::L3RunInputs {
         reads: &reads,
@@ -357,7 +374,20 @@ pub fn run_stages_2a_2b<A: crate::arch::Arch>(
     let nodes_before = state.node_count();
     let coords = l3::dl_ops::AddressFoldCoords::flat();
 
-    let l3 = run_l3::<false, A>(&mut sdsc, &state, ops, &coords).is_some();
+    // ⭐ STAGE 2A GETS THE SAME `computeOp_` LIST STAGE 2B DOES — `dsc_ops` is already positional
+    // beside `sdsc.dscs()`, so the first DSC's ops are this super-DSC's ops for every program
+    // scratchy emits (all 187 of `g0/` hold exactly one DSC). ⛔ A super-DSC with two DSCs would need
+    // `Reads.computes` keyed by `DscIdx` rather than flat; it is flat today, so this states the first
+    // and nothing else. Absent ⇒ empty ⇒ the carrier refuses BY NAME rather than sweeping nothing and
+    // answering `false`, which would cancel a corelet split.
+    let l3 = run_l3::<false, A>(
+        &mut sdsc,
+        &state,
+        ops,
+        dsc_ops.first().cloned().unwrap_or_default(),
+        &coords,
+    )
+    .is_some();
 
     // ⭐ THE SAME `state`, HANDED ON. This is the line the composition is.
     let (fill, ddc_refusal) = if l3 {
@@ -1344,6 +1374,7 @@ mod tests {
             &mut sdsc,
             &state,
             an_op_func(),
+            the_rmsq_compute_ops(),
             &l3::dl_ops::AddressFoldCoords::flat(),
         );
 
