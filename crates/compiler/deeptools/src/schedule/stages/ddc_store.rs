@@ -1557,9 +1557,35 @@ impl tu::NewLabeledDs for Dsc2Store<'_, '_> {
         )
     }
 
-    /// The `isOpaqueOp_` computes that walk reaches — ⭐ EMPTY, because there are no COMPUTE nodes.
+    /// The `isOpaqueOp_` computes that same walk reaches (`ddc/ddc_transformation_util.cpp:1884-1887`)
+    /// — ⭐ THE WALK IS REAL NOW, AND ITS EMPTY IS EITHER A READING OR A RECORDED REFUSAL.
+    ///
+    /// ⛔⛔ THIS USED TO BE A BARE `Vec::new()` DOCUMENTED AS *"EMPTY, because there are no COMPUTE
+    /// NODES"*, AND THAT WAS A FABRICATED EMPTY ON BOTH COUNTS. It consulted no tree at all, and the
+    /// premise was wrong: [`super::tree::Kind::Compute`] exists (see the module note), so a compute
+    /// node is representable and this answer would have stayed empty once one was minted. Its caller
+    /// repoints `metadata.opaque_ops[compute].lds_idx` from the vacated index to the new one
+    /// (`ddc/transformation_util.rs:2341-2347`), so an empty it cannot question leaves an opaque op
+    /// pointing at a labelled DS index that no longer names it — silently, and it compiles.
+    ///
+    /// ⛔ `isOpaqueOp_` IS ONE OF THE FIELDS RUST'S NODE DROPPED. `bool isOpaqueOp_ = false`
+    /// (`dsc/dsc2.h:941`, beside `numFoldsEngaged` at `:940`) has no
+    /// [`crate::schedule::dsc2::ComputeNode`] projection, so the filter cannot be applied. The two
+    /// cases are therefore kept apart: NO computes in the tree is the reference's own walk finding
+    /// none, and computes present but unclassifiable is a refusal filed on the state.
     fn opaque_computes(&self) -> Vec<NodeId> {
-        Vec::new()
+        let computes = tr::ComputeWalk::computes(self);
+        if computes.is_empty() {
+            // The walk reached no COMPUTE node, which is the reference's answer over such a tree.
+            return Vec::new();
+        }
+        self.state
+            .refuse(
+                "NewLabeledDs::opaque_computes: the tree holds COMPUTE nodes but dsc2::ComputeNode \
+                 projects no isOpaqueOp_ (dsc/dsc2.h:941), so which of them are opaque is UNKNOWN \
+                 and not none — entry 257's opaque_ops repointing is skipped",
+            )
+            .unwrap_or_default()
     }
 }
 
