@@ -1220,10 +1220,24 @@ impl crate::schedule::ddc::fold::Allocations for Dsc2Store<'_, '_> {
 impl tu::AllocationPaddings for Dsc2Store<'_, '_> {
     /// `allocNode->padding_` — ⭐ ANSWERED: it is exactly the [`tu::PaddingForm`] the L3 allocate
     /// node carries.
+    ///
+    /// ⛔⛔ ITS FALLBACK IS NOW RECORDED, BECAUSE A DEFAULT `PaddingForm` IS A CLAIM. `padding_` is
+    /// read off a live `dsc2::AllocateNode*` (`dsc/dsc2.h:981`), so the reference has no absent case;
+    /// an [`AllocId`] naming no ALLOCATE of this tree is a defect, and `unwrap_or_default()` answered
+    /// it as *"NO DIM IS PADDED"* — a padding fact that decides window extents and addresses.
+    /// [`tu::PaddingForm::default`] is still what is returned, because the trait cannot spell absence
+    /// and inventing a pad would be worse, but the state now names the ask.
     fn padding(&self, alloc: AllocId) -> tu::PaddingForm {
-        self.with_tree(|tree| tree.node_of_alloc(alloc).and_then(|node| tree.allocate(node)))
-            .map(|(_, held)| held.padding)
-            .unwrap_or_default()
+        match self.with_tree(|tree| tree.node_of_alloc(alloc).and_then(|node| tree.allocate(node))) {
+            Some((_, held)) => held.padding,
+            None => self
+                .state
+                .refuse(
+                    "AllocationPaddings::padding: the AllocId names no ALLOCATE of this DSC's \
+                     scheduleTree_, so its padding_ is UNKNOWN and not unpadded",
+                )
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -1492,12 +1506,32 @@ impl tu::NewLabeledDs for Dsc2Store<'_, '_> {
     }
 
     /// The `allocateNode_`s of `labeledDs_.at(pos).memOrg_` — ⭐ ANSWERED off the tree's `Org`.
+    ///
+    /// ⛔ AN ORGANISATION THAT NAMES NO STORAGE IS A TRUE EMPTY — `memOrg_` is a map and a labelled DS
+    /// with nothing allocated has no entries — BUT A `pos` THE TREE HOLDS NO ORGANISATION FOR IS NOT.
+    /// The reference's `labeledDs_.at(pos)` THROWS there, and its caller loops
+    /// `for alloc in mem_org_allocations(new_last) { set_alloc_lds_idx(alloc, new_last) }`
+    /// (`ddc/transformation_util.rs:2329-2331`), so an unrecorded empty silently skips entry 257's
+    /// repointing of every allocation the shifted entry owns. The two are separated below.
     fn mem_org_allocations(&self, pos: LdsIdx) -> Vec<AllocId> {
         let Some(tree) = self.state.tree(self.dsc) else {
-            return Vec::new();
+            return self
+                .state
+                .refuse(
+                    "NewLabeledDs::mem_org_allocations: this state holds no scheduleTree_ for the \
+                     DSC, so memOrg_'s allocations are UNKNOWN and not none",
+                )
+                .unwrap_or_default();
         };
         let Some(org) = tree.org(pos) else {
-            return Vec::new();
+            return self
+                .state
+                .refuse(
+                    "NewLabeledDs::mem_org_allocations: the tree holds no memOrg_ at that \
+                     labeledDs_ position — labeledDs_.at(pos) throws there — so its allocations are \
+                     UNKNOWN and not none",
+                )
+                .unwrap_or_default();
         };
         // Every storage this organisation names, as the allocations those nodes are.
         tree.with(|held| {
