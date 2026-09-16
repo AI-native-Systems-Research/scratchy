@@ -240,15 +240,31 @@ impl Dsc2Store<'_, '_> {
 impl tr::LabeledDs for Dsc2Store<'_, '_> {
     /// `labeledDs_.at(lds).scale_`, one entry per layout dim — IN LAYOUT ORDER, which is what the
     /// reference's positional `scale_.at(i)` means.
+    ///
+    /// ⛔⛔ ITS TWO EMPTIES ARE BOTH THROWS AND ARE NOW FILED. This returned `Vec::new()` for an lds
+    /// the list does not hold — the `.at()` throw [`Self::ds_type`] PANICS on, one method below, for
+    /// the very same index — and again for an lds with no layout order, which is `getLayoutDims`'
+    /// own `DT_CHECK` that the order is non-empty (`dsc/dsc2.cpp:4007`).
+    ///
+    /// ⛔ AND AN EMPTY IS THE WRONG BRANCH, NOT A NARROWER ONE: every caller asks
+    /// `scale(lds).contains(&Scale::StickDim)` and SKIPS the transfer when it does not
+    /// (`ddc/transformation.rs:574-575`, `:2902-2903`), so an unanswerable position silently declines
+    /// to pack a stick or to splat a 4-byte read. An empty `scale_` on a labelled DS that HAS a
+    /// layout order stays a true empty.
     fn scale(&self, lds: LdsIdx) -> Vec<tr::Scale> {
-        self.dsc_facts().with_dsc(|dsc| {
-            let Some(held) = dsc.labeled_ds.at(lds) else {
-                return Vec::new();
-            };
-            dsc.layout_dims
-                .get(&lds)
-                .map(|layout| layout.iter().filter_map(|dim| held.scale(dim)).collect())
-                .unwrap_or_default()
+        let held = self.dsc_facts().with_dsc(|dsc| {
+            let held = dsc.labeled_ds.at(lds)?;
+            let layout = dsc.layout_dims.get(&lds)?;
+            Some(layout.iter().filter_map(|dim| held.scale(dim)).collect())
+        });
+        held.unwrap_or_else(|| {
+            self.refuse(
+                "LabeledDs::scale: labeledDs_.at(lds) throws for an index the list does not hold, \
+                 and getLayoutDims DT_CHECKs a non-empty layoutDimOrder_ (dsc/dsc2.cpp:4007) — so \
+                 scale_ is UNKNOWN and not unscaled, and every caller reads an empty as 'not a \
+                 stick dim' and skips the transfer",
+            )
+            .unwrap_or_default()
         })
     }
 
@@ -265,10 +281,29 @@ impl tr::LabeledDs for Dsc2Store<'_, '_> {
 
 impl tr::DsSticks for Dsc2Store<'_, '_> {
     /// `labeledDs_.at(lds).dsType_`'s `stickDimOrder_` zipped with its `stickSize_`.
+    ///
+    /// ⛔⛔ ITS EMPTY IS THE `primaryDsInfo_.at(dsType_)` THROW AND IS NOW FILED — the SAME throw
+    /// [`Dsc2Store::transfer_lds`] in this file panics on (`dsc/dsc2.cpp:4077`), which is why the two
+    /// must not answer one fact two ways. `stick_dims_of` is [`None`] for an lds the list does not
+    /// hold OR a `dsType_` `primaryDsInfo_` has no row for; a labelled DS whose row IS there and
+    /// carries no stick dim is a true empty and still returns one.
+    ///
+    /// ⛔ AN EMPTY IS AGAIN THE WRONG BRANCH: entry 372's 4-byte splat read matches
+    /// `ds_stick_dims(lds).0.as_slice()` against exactly ONE `(dim, _)` and declines otherwise
+    /// (`ddc/transformation.rs:2905-2907`), and entries 106/107 hand it to `stick_sizes(..,
+    /// StickPart::Whole)` (`:1365`, `:1402-1403`), which then measures a stick of no elements.
     fn ds_stick_dims(&self, lds: LdsIdx) -> StickDims {
-        self.dsc_facts()
-            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
+        let held = self
+            .dsc_facts()
+            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds));
+        held.unwrap_or_else(|| {
+            self.refuse(
+                "DsSticks::ds_stick_dims: primaryDsInfo_.at(that labelled DS's dsType_) throws \
+                 (dsc/dsc2.cpp:4077), so its stickDimOrder_/stickSize_ are UNKNOWN and not empty — \
+                 an empty declines the 4B splat and measures a stick of no elements",
+            )
             .unwrap_or_default()
+        })
     }
 }
 
@@ -380,12 +415,24 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
         self.compute_body(node)
     }
 
-    /// `getStickDims(lds)`.
+    /// `getStickDims(lds)` — ⛔ THE SAME `primaryDsInfo_.at(dsType_)` THROW
+    /// [`tr::DsSticks::ds_stick_dims`] states, filed for the same reason: entry 264 matches this
+    /// against exactly ONE `[dim]` to find the broadcast dim and answers [`None`] otherwise
+    /// (`ddc/v1.rs:1145-1148`), and four other readers feed it to `cumulative_stick_sizes`, so an
+    /// unanswerable position reads as *"this labelled DS has no sticks"*.
     fn stick_dims(&self, lds: LdsIdx) -> Vec<PrimaryDim> {
-        self.dsc_facts()
-            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
-            .map(|dims| dims.0.iter().map(|(dim, _)| *dim).collect())
-            .unwrap_or_default()
+        let held = self
+            .dsc_facts()
+            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds));
+        match held {
+            Some(dims) => dims.0.iter().map(|(dim, _)| *dim).collect(),
+            None => self
+                .refuse(
+                    "LoopOffsets::stick_dims: primaryDsInfo_.at(that labelled DS's dsType_) throws \
+                     (dsc/dsc2.cpp:4077), so its stickDimOrder_ is UNKNOWN and not empty",
+                )
+                .unwrap_or_default(),
+        }
     }
 
     /// `node->getOwnerLoop()`.
@@ -1538,15 +1585,22 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
     /// ⛔ `traverseTreeDFSMutable(nullptr, {COMPUTE, TRANSFER})` as entry 002 censuses it
     /// (`ddc/ddcv1.cpp:3283-3317`).
     ///
-    /// ⛔⛔ BOTH OF THE OLD REASONS ARE GONE AND THE REAL ONE IS AN `Option`. This said *"a generated
-    /// closed set no transfer of this tree carries a variant of yet, and its Compute arm needs a
-    /// COMPUTE node"*: the arm exists, and the DDL conversion DOES fill
-    /// [`crate::schedule::dsc2::DataInfo::data_connect`] — `ddl/conversion.rs:2929` writes
-    /// `resolved.operand.data.data_connect = Some(data_connect)`, and
-    /// [`crate::schedule::dsc2::InstrAttribute`] already carries both opaque port lists
-    /// (`dsc/dsc2.h:936-939`) the Compute arm's `opaque_reads`/`opaque_writes` want.
+    /// ⛔⛔ THE OLD *"no Compute arm"* REASON IS GONE: the arm exists, and the DDL conversion DOES
+    /// fill [`crate::schedule::dsc2::DataInfo::data_connect`] — `ddl/conversion.rs:2929` writes
+    /// `resolved.operand.data.data_connect = Some(data_connect)`.
     ///
-    /// ⛔ WHAT BLOCKS IT IS THAT
+    /// ⛔⛔ BUT THIS DOC ALSO CLAIMED *"[`crate::schedule::dsc2::InstrAttribute`] already carries both
+    /// opaque port lists (`dsc/dsc2.h:936-939`) the Compute arm's `opaque_reads`/`opaque_writes`
+    /// want"*, AND THAT IS FALSE ON BOTH HALVES — A SECOND BLOCKER, NOT A CLEARED ONE. Our
+    /// `InstrAttribute` carries `unroll`, `precision`, `read_write_regs`, `read_only_regs`, `mode`,
+    /// `compute_mask`, `repetition` and `indices`, and NEITHER `input_data_connects_` nor
+    /// `output_data_connects_`; and `:936-939` names `outputs_`/`inputsLdsAndLoopOffsets_`/
+    /// `outputsLdsAndLoopOffsets_`/`instrAttribute_`, while the two port lists are `:926-927` and
+    /// `:928-929` INSIDE `InstrAttribute`. So the walk needs those two `Vec<DataConnect>`s projected
+    /// as well, and an opaque compute censused with empty port lists declares an opaque body that
+    /// reads and writes nothing.
+    ///
+    /// ⛔ THE OTHER BLOCKER IS THAT
     /// [`crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Reads::data_connect`] IS A BARE
     /// [`DataConnect`] WHILE `dsc2::DataInfo`'S IS AN [`Option`], and the DDL's own
     /// `data_connect=` is optional too (`ddl/conversion.rs:4431-4432`). The reference keys the
@@ -1561,10 +1615,13 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
     fn census_nodes(&self) -> Vec<ScheduleNode> {
         todo!(
             "v1::Dsc2Store::census_nodes: the {{COMPUTE, TRANSFER}} walk is over kinds this tree \
-             holds and the DDL fills data_connect (ddl/conversion.rs:2929); what blocks it is \
-             shape_constraints::Reads::data_connect being a bare DataConnect while dsc2::DataInfo's \
+             holds and the DDL fills data_connect (ddl/conversion.rs:2929); TWO things block it. \
+             (1) shape_constraints::Reads::data_connect is a bare DataConnect while dsc2::DataInfo's \
              is an Option — the reference keys dcMap[\"\"] and REPORTS on it \
-             (ddc/ddcv1.cpp:3319-3325), so dropping unnamed operands deletes that diagnostic"
+             (ddc/ddcv1.cpp:3319-3325), so dropping unnamed operands deletes that diagnostic. \
+             (2) dsc2::InstrAttribute projects NEITHER input_data_connects_ (dsc/dsc2.h:926-927) nor \
+             output_data_connects_ (:928-929), which the Compute arm's opaque_reads/opaque_writes \
+             are — empty lists there declare an opaque body that reads and writes nothing"
         )
     }
 
