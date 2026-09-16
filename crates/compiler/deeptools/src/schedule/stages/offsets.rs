@@ -19,16 +19,20 @@
 //! `&'a DscTree` and `&'a DscState` — the same objects `run` is holding — and every method below is a
 //! read THROUGH that borrow, at the moment it is asked.
 //!
-//! # ⛔⛔ THE ONE THING STILL SEVERED, AND IT IS ONE LINE IN [`super::Reads`]
+//! # ⭐ HOW THE BORROW REACHES THEM, SINCE THE CARRIER MAY NOT HOLD IT
 //!
 //! `run` takes `sdsc: &mut SuperDsc` while the read carrier arrives as `&'a F`, so [`super::Reads`]
-//! may not hold the `&DesignSpaceConfig` these surfaces want; it therefore names the `'static`
-//! spellings [`OffsetSizes`]/[`OffsetNodes`]/[`OffsetFacts`], which NOTHING can construct, and its
-//! three getters answer [`None`]. Pointing `DscOffsetFacts::Sizes`/`Nodes`/`Facts` at
-//! `OffsetSizesOf<'s>`/`OffsetNodesOf<'s>`/`OffsetFactsOf<'s>` — and giving `Reads` the DSC borrow
-//! that entry 382 already holds at the `L3OffsetInputs` site (`l3/dl_ops.rs:21301`, whose `sdsc` is a
-//! shared reborrow) — is what wires them, and that is review 382's own cross-entry work over entries
-//! 050/219/220/222/292/333. The types, the citations and the reads are here; the borrow is not.
+//! may not hold the `&DesignSpaceConfig` these surfaces want — a getter answering `Option<&Self::Sizes>`
+//! forced exactly that. So `DscOffsetFacts`' three getters TAKE the super-DSC (entry 382's own shared
+//! reborrow, the same one it puts in `L3OffsetInputs`) and hand a surface back BY VALUE; all four
+//! surfaces are [`Copy`] projections of that borrow, so the DSC borrow lives at the call site and the
+//! carrier holds none.
+//!
+//! ⛔⛔ ONE CONSTRUCTION ARGUMENT IS STILL MISSING, AND IT IS NOT A BORROW: [`OffsetSizesOf`]'s `ops` is
+//! `computeOp_` in the [`v1::DscComputeOp`] shape, which [`super::run_l3`] does not take —
+//! [`super::Reads`] holds [`v1::OpFuncs`], and that carries `opFuncName` per entry and nothing else.
+//! `DscOffsetFacts::offset_sizes` refuses on it by name, so entry 333 is not entered until it is
+//! threaded ([`super::Reads::with_compute_ops`] is the seam it lands on).
 //!
 //! ⛔ AND NEVER A PLAUSIBLE CONSTANT. Every method here hands back an extent, an address scale, a
 //! stride or a page size that a PLACEMENT is computed from, and a fabricated placement is the failure
@@ -95,19 +99,11 @@ pub struct OffsetSizesOf<'a> {
     ops: &'a [v1::DscComputeOp],
 }
 
-/// ⛔ THE SEVERED SPELLING [`super::Reads`] NAMES — `'static` because a carrier that may not alias the
-/// `&mut SuperDsc` has no DSC borrow to build one from, so `DscOffsetFacts::offset_sizes` answers
-/// [`None`] and nothing of this type is ever constructed. See this module's header.
-pub type OffsetSizes = OffsetSizesOf<'static>;
-
 /// THE DSC'S OWN `scheduleTree_` AS ENTRY 333 WALKS IT.
 #[derive(Debug, Clone, Copy)]
 pub struct OffsetNodesOf<'a> {
     tree: &'a DscTree,
 }
-
-/// ⛔ THE SEVERED SPELLING [`super::Reads`] NAMES — see [`OffsetSizes`].
-pub type OffsetNodes = OffsetNodesOf<'static>;
 
 /// THE FOUR `dsc2`/`DesignSpaceConfig` SEAMS AND THE TWO DATA STAGES ENTRY 333 NEEDS BESIDE
 /// [`v1::OffsetSizes`].
@@ -128,18 +124,15 @@ pub struct OffsetFactsOf<'a> {
     chunk: OffsetStageOf<'a>,
 }
 
-/// ⛔ THE SEVERED SPELLING [`super::Reads`] NAMES — see [`OffsetSizes`].
-pub type OffsetFacts = OffsetFactsOf<'static>;
-
 /// ONE `DataStructDims` — `dataStageParam_.at(id).ss_`, borrowed live.
 #[derive(Debug, Clone, Copy)]
 pub struct OffsetStageOf<'a> {
     dims: &'a StageDims,
 }
 
-// ⭐ NO `'static` SPELLING FOR THE STAGE, AND THAT IS THE POINT: `L3OffsetFacts::Stage` is named
-// through `OffsetFactsOf<'a>`'s own impl, so the stage surface is reached only from a surface that
-// already holds the DSC borrow. The three above need one because `super::Reads` names them directly.
+// ⭐ ALL FOUR ARE `Copy` PROJECTIONS OF ONE BORROW, AND THAT IS WHAT LETS THEM BE HANDED BACK BY
+// VALUE: `DscOffsetFacts::Sizes<'x>`/`Nodes<'x>`/`Facts<'x>` and `DscStages::Stage<'x>` are these
+// types over the super-DSC borrow their getter was ASKED with, so no carrier has to own one.
 
 impl<'a> OffsetSizesOf<'a> {
     /// The extents and tables of ONE DSC, borrowed from the super-DSC entry 382 is holding.
@@ -999,7 +992,7 @@ mod tests {
     use crate::schedule::ddc::transformation::DsType;
     use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
     use crate::schedule::dsc2::{LdsIdx, NodeName, WordLength};
-    use crate::schedule::l3::dl_ops::L3AllocateNode;
+    use crate::schedule::l3::dl_ops::{DscOffsetFacts, DscStages, L3AllocateNode};
     use crate::schedule::l3::dsc::{
         Buffering, CoreIdsUsed, CoreletsUsed, DATA_STAGE_CHUNK, DATA_STAGE_CORE, DataStage,
         DataStages, DdcFacts, DscIdx, DscList, EmptyStage, FilledDims, LabeledDs, LabeledDsList,
@@ -1235,6 +1228,136 @@ mod tests {
             dsc.data_stages.at(DATA_STAGE_CHUNK).map(DataStage::name),
             Some(&StageName::default()),
             "the chunk stage the facts surface borrows is this DSC's own"
+        );
+    }
+
+    /// ⭐⭐⭐ THE SEAM, MEASURED ON THE ONE VALUE A SNAPSHOT CANNOT CARRY. [`DscStages::dim_stage`] used
+    /// to answer `state.refuse(..)` because it returned `Option<&Self::Stage>` — a borrow OF THE
+    /// CARRIER — while `run` holds the super-DSC as `&mut`, so no `F` may own that borrow. It now TAKES
+    /// the super-DSC the caller is already holding and hands a [`Copy`] projection back BY VALUE.
+    ///
+    /// ⛔⛔ AND WHY A SNAPSHOT WAS NEVER THE ANSWER EITHER: the rewrite below is entries 380/351's own
+    /// `dataStageParam_[dataStageChunkIdx] = ..` through `sdsc.dscs_mut()`, made AFTER this carrier
+    /// exists. A copy taken at construction would still read `Y = 2` here; the borrow reads `Y = 5`.
+    /// ⭐ SO THE TWO ANSWERS DIFFER BY THE REWRITE ALONE, which is the whole property the severing was
+    /// recorded for.
+    #[test]
+    fn the_carrier_reads_the_chunk_stage_a_later_rewrite_left_and_not_the_one_it_was_built_over() {
+        let mut sdsc = a_sdsc();
+        let state = DscState::seeded(&sdsc);
+        let reads = crate::schedule::stages::Reads::new(&state, v1::OpFuncs::new(None, Vec::new()));
+
+        let chunk_y = |held: &SuperDsc| {
+            let stage = DscStages::dim_stage(&reads, held, DscIdx(0), DATA_STAGE_CHUNK)
+                .expect("the chunk data stage is a FIELD of DataStages");
+            DimStage::corelet_dim_val(
+                &stage,
+                PrimaryDim::Y,
+                SenComponent::NoComponent,
+                corelet(),
+                &PaddingForm::default(),
+            )
+        };
+        assert_eq!(
+            chunk_y(&sdsc),
+            Some(Extent(2)),
+            "the slot this DSC's chunk stage states"
+        );
+
+        let mut dims = StageDims::default();
+        dims.extents.insert(PrimaryDim::Y, Extent(5));
+        let named = NamedDims {
+            name: StageName::default(),
+            dims: FilledDims::of(dims).expect("a stage that states a dim"),
+        };
+        sdsc.dscs_mut()
+            .at_mut(DscIdx(0))
+            .expect("the one DSC")
+            .data_stages
+            .set(
+                DATA_STAGE_CHUNK,
+                DataStage {
+                    ss: named.clone(),
+                    el: named,
+                },
+            );
+        assert_eq!(
+            chunk_y(&sdsc),
+            Some(Extent(5)),
+            "read THROUGH the borrow, so entries 380/351's rewrite is seen"
+        );
+
+        assert_eq!(
+            DscStages::dim_stage(&reads, &sdsc, DscIdx(0), super::DatastageId(9)).map(|_| ()),
+            None,
+            "an index this DSC states no stage under is dataStageParam_.at()'s throw"
+        );
+        assert_eq!(
+            DscStages::dim_stage(&reads, &sdsc, DscIdx(3), DATA_STAGE_CORE).map(|_| ()),
+            None,
+            "and so is a dscs_ position the super-DSC holds no DSC for"
+        );
+    }
+
+    /// ⭐⭐ THE THREE SURFACES ENTRY 333 IS HANDED, ANSWERED OFF THE SAME BORROW — two of them used to
+    /// refuse for the identical reason [`DscStages::dim_stage`] did, and now project the DSC and the
+    /// tree the growers filed into.
+    ///
+    /// ⛔⛔ THE THIRD STILL REFUSES, AND ON A CONSTRUCTION ARGUMENT RATHER THAN A BORROW: `computeOp_`
+    /// in the [`v1::DscComputeOp`] shape, which [`crate::schedule::stages::run_l3`] does not take. An
+    /// empty sweep would answer `false` for `is_sole_partial_reduction_input`
+    /// (`ddc/ddcv1.cpp:1915-1921`) off a `computeOp_` the reference cannot have, and that `false`
+    /// cancels a corelet split — so it refuses by name instead.
+    #[test]
+    fn the_offset_surfaces_answer_off_the_super_dsc_and_only_the_compute_ops_are_missing() {
+        let sdsc = a_sdsc();
+        let state = DscState::seeded(&sdsc);
+        let reads = crate::schedule::stages::Reads::new(&state, v1::OpFuncs::new(None, Vec::new()));
+
+        let nodes = DscOffsetFacts::offset_nodes(&reads, &sdsc, DscIdx(0))
+            .expect("the state holds a tree for dscs_[0]");
+        assert_eq!(
+            v1::ScheduleNodes::nodes(&nodes),
+            Vec::new(),
+            "the seed's head is never visited (dsc/dsc2.cpp:2232-2234), so an unheaded tree walks to \
+             nothing"
+        );
+
+        let facts = DscOffsetFacts::offset_facts(&reads, &sdsc, DscIdx(0))
+            .expect("the state holds a tree for dscs_[0]");
+        assert_eq!(
+            L3OffsetFacts::word_length(&facts, LdsIdx(0)),
+            Some(WordLength(2)),
+            "labeledDs_.at(0).wordLength, read through the projection rather than refused"
+        );
+        assert_eq!(
+            DimStage::corelet_dim_val(
+                L3OffsetFacts::chunk_stage(&facts),
+                PrimaryDim::Y,
+                SenComponent::NoComponent,
+                corelet(),
+                &PaddingForm::default(),
+            ),
+            Some(Extent(2)),
+            "and *\"Expect chunk data stage.\"* is discharged by the field it borrows"
+        );
+        assert_eq!(
+            DscOffsetFacts::offset_facts(&reads, &sdsc, DscIdx(3)).map(|_| ()),
+            None,
+            "a dscs_ position with no tree is that .at()'s throw"
+        );
+
+        assert!(
+            DscOffsetFacts::offset_sizes(&reads, &sdsc, DscIdx(0)).is_none(),
+            "computeOp_ in the DscComputeOp shape is not a construction argument of run_l3"
+        );
+        assert!(
+            state
+                .refusals()
+                .iter()
+                .any(|said| said.contains("v1::DscComputeOp")),
+            "and the refusal NAMES that one argument rather than the borrow: {:?}",
+            state.refusals()
         );
     }
 

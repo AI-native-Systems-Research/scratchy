@@ -14539,10 +14539,15 @@ mod tests_e283_e295 {
     struct Stages;
 
     impl DscStages for Stages {
-        type Stage = Stage;
+        type Stage<'x> = Stage;
 
-        fn dim_stage(&self, _dsc: DscIdx, stage: DatastageId) -> Option<&Stage> {
-            (stage == DATA_STAGE_CORE || stage == DATA_STAGE_CHUNK).then_some(&Stage)
+        fn dim_stage<'x>(
+            &'x self,
+            _sdsc: &'x SuperDsc,
+            _dsc: DscIdx,
+            stage: DatastageId,
+        ) -> Option<Stage> {
+            (stage == DATA_STAGE_CORE || stage == DATA_STAGE_CHUNK).then_some(Stage)
         }
     }
 
@@ -16758,12 +16763,26 @@ mod tests_e283_e295 {
 ///
 /// ⛔ [`None`] IS THAT `.at()`'s THROW, which is every *"Expect valid .. data stage."* the placement
 /// states.
+///
+/// ⭐⭐ THE SUPER-DSC IS AN ARGUMENT AND NOT A FIELD OF THE CARRIER, WHICH IS THE WHOLE SEAM: `mySDsc`
+/// is the object [`run`] holds as `&mut` and WRITES through (entries 380/351 rewrite the chunk stage),
+/// so no carrier built before the call may hold a borrow of it and no snapshot of it can be live. The
+/// stage therefore arrives BY VALUE over the caller's own shared reborrow — the one
+/// [`fill_allocation_start_addr_and_offset`] already takes — and is read at the moment it is asked.
 pub trait DscStages {
-    /// One data stage's corelet-split view, however the caller holds it.
-    type Stage: DimStage + ?Sized;
+    /// One data stage's corelet-split view, however the caller holds it, over the borrow it was asked
+    /// with.
+    type Stage<'x>: DimStage
+    where
+        Self: 'x;
 
     /// `dscs_.at(dsc).dataStageParam_.at(stage)`.
-    fn dim_stage(&self, dsc: DscIdx, stage: DatastageId) -> Option<&Self::Stage>;
+    fn dim_stage<'x>(
+        &'x self,
+        sdsc: &'x SuperDsc,
+        dsc: DscIdx,
+        stage: DatastageId,
+    ) -> Option<Self::Stage<'x>>;
 }
 
 /// WHAT ENTRY 295 ASKS OF ONE DSC — `getBlockTransferSizePerDim` (`dsc/dsc2.cpp:3474`), which lives
@@ -16929,8 +16948,8 @@ where
     for dsc_idx in dsc_indices(sdsc) {
         let dsc = sdsc.dscs().at(dsc_idx)?;
         let corelet_split_dims = corelet_split_dimensions(dsc);
-        let core_stage = stages.dim_stage(dsc_idx, DATA_STAGE_CORE)?;
-        let chunk_stage = stages.dim_stage(dsc_idx, DATA_STAGE_CHUNK)?;
+        let core_stage = stages.dim_stage(sdsc, dsc_idx, DATA_STAGE_CORE)?;
+        let chunk_stage = stages.dim_stage(sdsc, dsc_idx, DATA_STAGE_CHUNK)?;
         for entry in dsc.labeled_ds.iter() {
             let lds = entry.recorded();
             let mem = orgs.mem_org(dsc_idx, lds)?;
@@ -16945,8 +16964,8 @@ where
                         dsc,
                         lds,
                         mem,
-                        core_stage,
-                        chunk_stage,
+                        &core_stage,
+                        &chunk_stage,
                         &corelet_split_dims,
                         coords,
                         node,
@@ -21007,20 +21026,34 @@ where
 
 /// WHAT ENTRY 333 IS ASKED PER DSC — the three read-only surfaces [`L3OffsetInputs`] carries beside
 /// the super-DSC, keyed by `dscs_` position because entry 382 fills EVERY DSC in turn.
+///
+/// ⭐⭐ EACH SURFACE ARRIVES **BY VALUE OVER A BORROW OF THE SUPER-DSC THE CALLER PASSES IN**, and that
+/// is the seam rather than a style: `mySDsc` is the object [`run`] holds as `&mut` and writes through,
+/// so a carrier constructed before the call may not hold a borrow of it — and every fact these three
+/// answer (`dataStageParam_` rewritten by entries 380/351, `scheduleTree_` grown by 290/353/368) is
+/// stale the moment it is copied. Returning `&Self::Sizes` forced the borrow to live INSIDE the
+/// carrier, which is exactly what `run`'s signature forbids; a projection handed the caller's own
+/// shared reborrow does not. All three are read at the moment they are asked.
 pub trait DscOffsetFacts {
     /// That DSC's datastage extents and its address granularity table.
-    type Sizes: v1::StageSizes + v1::OffsetSizes + ?Sized;
+    type Sizes<'x>: v1::StageSizes + v1::OffsetSizes
+    where
+        Self: 'x;
     /// `dscs_.at(dsc).scheduleTree_` as entry 333 walks it.
-    type Nodes: v1::ScheduleNodes + ?Sized;
+    type Nodes<'x>: v1::ScheduleNodes
+    where
+        Self: 'x;
     /// The accessors outside this campaign's file list.
-    type Facts: L3OffsetFacts + ?Sized;
+    type Facts<'x>: L3OffsetFacts
+    where
+        Self: 'x;
 
     /// [`L3OffsetInputs::sizes`] for that DSC.
-    fn offset_sizes(&self, dsc: DscIdx) -> Option<&Self::Sizes>;
+    fn offset_sizes<'x>(&'x self, sdsc: &'x SuperDsc, dsc: DscIdx) -> Option<Self::Sizes<'x>>;
     /// [`L3OffsetInputs::tree`] for that DSC.
-    fn offset_nodes(&self, dsc: DscIdx) -> Option<&Self::Nodes>;
+    fn offset_nodes<'x>(&'x self, sdsc: &'x SuperDsc, dsc: DscIdx) -> Option<Self::Nodes<'x>>;
     /// [`L3OffsetInputs::facts`] for that DSC.
-    fn offset_facts(&self, dsc: DscIdx) -> Option<&Self::Facts>;
+    fn offset_facts<'x>(&'x self, sdsc: &'x SuperDsc, dsc: DscIdx) -> Option<Self::Facts<'x>>;
 }
 
 /// `dsc2::transformLxZeroPadInfoInScheduleTree(mySDsc)` — a whole pass over the super-DSC's trees
@@ -21297,13 +21330,20 @@ where
         &mut *surgery.env,
     )?;
     for dsc_idx in dsc_indices(sdsc) {
+        // ⭐ THE THREE SURFACES OVER THIS `&mut`'s OWN SHARED REBORROW — held as locals because they
+        // are projections of `sdsc` rather than fields of the read carrier, which is what lets them be
+        // LIVE: entries 380/351 rewrote `dataStageParam_` and 290/353/368 grew `scheduleTree_` above,
+        // and both are read here through the borrow rather than out of a copy.
+        let sizes = inputs.reads.offset_sizes(sdsc, dsc_idx)?;
+        let nodes = inputs.reads.offset_nodes(sdsc, dsc_idx)?;
+        let facts = inputs.reads.offset_facts(sdsc, dsc_idx)?;
         fill_loop_offsets_and_addresses::<A, _, _, _, _, _>(
             &L3OffsetInputs {
                 sdsc,
                 dsc_idx,
-                sizes: inputs.reads.offset_sizes(dsc_idx)?,
-                tree: inputs.reads.offset_nodes(dsc_idx)?,
-                facts: inputs.reads.offset_facts(dsc_idx)?,
+                sizes: &sizes,
+                tree: &nodes,
+                facts: &facts,
                 allocs: &*surgery.allocs,
                 metadata: metadata.get(&dsc_idx)?,
                 unpadded: v1::UnpaddedIndexing::Allowed,

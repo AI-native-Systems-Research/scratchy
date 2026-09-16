@@ -12,17 +12,19 @@
 //! `env` exclusively borrowed for the tree it is rewriting — so the probe reads the allocate nodes
 //! through THIS carrier, which is the same cell `Env`'s write seam places into.
 //!
-//! ⛔⛔ WHAT THIS CARRIER CANNOT SEE, AND WHY. `run` takes `sdsc: &mut SuperDsc` AND
-//! `inputs: &L3RunInputs<'_, F, P>`, so `F` may not alias the super-DSC — every fact that lives in
-//! `dscs_.at(i).dataStageParam_` is out of reach here, and stage 2a REWRITES the chunk stage
-//! (entries 380/351), so a snapshot taken before the call would be stale by the time entry 292 reads
-//! it. That is [`DscStages`] and half of [`DscOffsetFacts`], and it is review 382's cross-entry work
-//! over entries 050/219/220/222/292/333 — not a fact scratchy fails to write.
+//! ⭐⭐ AND THE SUPER-DSC IS NOT A FIELD OF IT BUT AN **ARGUMENT** TO FOUR OF ITS METHODS. `run` takes
+//! `sdsc: &mut SuperDsc` AND `inputs: &L3RunInputs<'_, F, P>`, so `F` may not alias the super-DSC and
+//! every fact in `dscs_.at(i).dataStageParam_` was out of reach while [`DscStages::dim_stage`] and
+//! [`DscOffsetFacts`]' three getters answered `Option<&Self::Sizes>` — a borrow OF THE CARRIER, which
+//! is the one thing this carrier cannot own. ⛔ AND A SNAPSHOT WAS NEVER THE ANSWER EITHER: stage 2a
+//! REWRITES the chunk stage (entries 380/351) and GROWS the schedule tree (290/353/368), so a copy
+//! taken at construction is stale by the time entry 292 or 333 reads it. Both now take the super-DSC
+//! the caller is already holding — `run` builds `L3OffsetInputs` from a shared reborrow of its own
+//! `&mut` (`l3/dl_ops.rs`), and [`crate::schedule::l3::dl_ops::fill_allocation_start_addr_and_offset`]
+//! takes `sdsc: &SuperDsc` outright — and hand back a projection BY VALUE, so the DSC borrow lives at
+//! the call site and never in `F`.
 
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
-use crate::schedule::ddc::fold::Stride;
 use crate::schedule::ddc::metadata::DatastageId;
-use crate::schedule::ddc::transformation_util::PaddingForm;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::LdsIdx;
 use crate::schedule::l3::dl_ops::{
@@ -30,11 +32,10 @@ use crate::schedule::l3::dl_ops::{
     OpFuncDataFormat, SysFlopsPerByte,
 };
 use crate::schedule::l3::dsc::{
-    DimStage, DscIdx, L3Transfer, MemOrgs, PlacedAllocation, ScheduleTrees, TransferNodes,
+    DscIdx, L3Transfer, MemOrgs, PlacedAllocation, ScheduleTrees, SuperDsc, TransferNodes,
 };
-use crate::units::Corelet;
 
-use super::offsets::{OffsetFacts, OffsetNodes, OffsetSizes};
+use super::offsets::{OffsetFactsOf, OffsetNodesOf, OffsetSizesOf, OffsetStageOf};
 use super::state::{DscState, DscTree};
 use super::tree::{Org, TreeData};
 
@@ -53,13 +54,38 @@ pub struct Reads<'s> {
     /// is *"a `computeOp_` entry whose `opFuncName` is unset"*, on which the ported min-param units
     /// refuse exactly as the reference's `.at(0)` throws.
     ops: v1::OpFuncs,
+    /// `computeOp_` IN FULL — the five fields [`v1::DscComputeOp`] projects, which is what
+    /// [`super::offsets::OffsetSizesOf`] needs and what [`Self::ops`] cannot supply:
+    /// `v1::StageSizes::is_sole_partial_reduction_input` sweeps `inputLabeledDs`, and [`v1::OpFuncs`]
+    /// carries `opFuncName` per entry and nothing else.
+    ///
+    /// ⛔⛔ EMPTY IS *"NOT HANDED TO STAGE 2A"* AND NOT A DSC WITH NO COMPUTE, which is why
+    /// [`DscOffsetFacts::offset_sizes`] REFUSES on it rather than sweeping it: [`v1::OpFuncs`]' own
+    /// non-emptiness states that `computeOp_.at(0)` throws on an op-less DSC, so an empty list is a
+    /// state the reference cannot be in and a `false` swept out of it would be invented. This is the
+    /// same min-param refusal [`Self::ops`] documents, on the one argument
+    /// [`super::run_l3`] does not yet take.
+    computes: Vec<v1::DscComputeOp>,
 }
 
 impl<'s> Reads<'s> {
     /// The carrier over one seeded state and the compute ops the caller holds.
     #[must_use]
     pub const fn new(state: &'s DscState, ops: v1::OpFuncs) -> Self {
-        Self { state, ops }
+        Self {
+            state,
+            ops,
+            computes: Vec::new(),
+        }
+    }
+
+    /// THE SAME CARRIER WITH `computeOp_` IN FULL — the one construction argument entry 333's size
+    /// surface needs beyond [`v1::OpFuncs`], for a caller that holds it (the `rmsq_o728` fixture
+    /// states one `SFP_FMA16` op over `lds0`/`lds1`).
+    #[must_use]
+    pub fn with_compute_ops(mut self, computes: Vec<v1::DscComputeOp>) -> Self {
+        self.computes = computes;
+        self
     }
 
     /// That DSC's tree, [`None`] for a `dscs_` position the state holds none for.
@@ -195,97 +221,78 @@ impl SysFlopsPerByte for Reads<'_> {
 }
 
 impl DscStages for Reads<'_> {
-    type Stage = SeveredStage;
+    type Stage<'x>
+        = OffsetStageOf<'x>
+    where
+        Self: 'x;
 
-    /// ⛔ REFUSES, AND WHAT IT WANTS: `dscs_.at(dsc).dataStageParam_.at(stage)`. `run` holds the
-    /// super-DSC as `&mut` and this carrier is `&'a F`, so it cannot alias that field — AND a
-    /// snapshot would not do: entries 380 and 351 REWRITE the chunk stage before entry 292 reads it
-    /// here, so the answer must come from the live super-DSC. Unifying the two carriers is review
-    /// 382's own cross-entry work over entries 050/219/220/222/292/333.
-    fn dim_stage(&self, _dsc: DscIdx, _stage: DatastageId) -> Option<&Self::Stage> {
-        self.state.refuse(
-            "DscStages::dim_stage: wants dscs_.at(dsc).dataStageParam_.at(stage) LIVE — a snapshot \
-             is stale once entries 380/351 rewrite the chunk stage",
-        )
-    }
-}
-
-/// ONE `DataStructDims` THIS CARRIER CANNOT REACH — [`DscStages::dim_stage`] refuses before any
-/// method here can be asked.
-///
-/// ⭐⭐ UNINHABITED, AND THAT IS THE SEVERING AS A TYPE RATHER THAN AS FOUR STOPS. `DscStages::Stage`
-/// is bounded by `DimStage + ?Sized` and NOTHING MORE — an associated type has to be NAMED before
-/// the carrier compiles, not INHABITED — so an empty enum satisfies it while making *"no method here
-/// is ever called"* a fact the compiler checks instead of one a reader has to confirm by going and
-/// reading [`DscStages::dim_stage`]. Four `todo!`s that could only be reached by minting a value of
-/// this type are four stops that cannot exist at all.
-///
-/// ⛔ THE RECORD OF WHAT IS MISSING STAYS, on each method below: an uninhabited body is
-/// `match *self {}`, and the doc above it still names the one field that method wants. What is gone
-/// is the stop, not the note.
-#[derive(Debug, Clone, Copy)]
-pub enum SeveredStage {}
-
-impl DimStage for SeveredStage {
-    /// ⛔ Wants `primaryDimToVal_st(dim, comp, -1, corelet, padded)` on the live data stage.
-    fn corelet_dim_val(
-        &self,
-        _dim: PrimaryDim,
-        _comp: sys_arch_spec::arch_enums::SenComponent,
-        _corelet: Corelet,
-        _padded: &PaddingForm,
-    ) -> Option<Extent> {
-        match *self {}
-    }
-
-    /// ⛔ Wants `coreletSplit_.count(dim)` on the live data stage.
-    fn is_corelet_split(&self, _dim: PrimaryDim) -> bool {
-        match *self {}
-    }
-
-    /// ⛔ Wants `coreletSplit_.at(dim).at(corelet)` on the live data stage.
-    fn corelet_split(&self, _dim: PrimaryDim, _corelet: Corelet) -> Option<Extent> {
-        match *self {}
-    }
-
-    /// ⛔ Wants `paddingSizes_.at(dim).stride_` on the live data stage.
-    fn pad_stride(&self, _dim: PrimaryDim) -> Option<Stride> {
-        match *self {}
+    /// `dscs_.at(dsc).dataStageParam_.at(stage).ss_`, READ THROUGH THE CALLER'S OWN BORROW — so
+    /// entries 380 and 351 rewriting the chunk stage above are seen here, which a snapshot taken when
+    /// this carrier was built could not be.
+    ///
+    /// ⛔ [`None`] IS THAT `.at()`'s THROW AND NOTHING ELSE: a `dscs_` position the super-DSC holds no
+    /// DSC for, and a `dataStageParam_` index that DSC states no stage under — which
+    /// [`crate::schedule::l3::dsc::DataStages::at`] answers for its own
+    /// [`crate::schedule::l3::dsc::EmptyStage`] too, an entry the reference holds but states no extent
+    /// in. ⭐ THE TWO IDS ENTRY 292 ASKS FOR ARE FIELDS of that type, so neither of them can be it.
+    fn dim_stage<'x>(
+        &'x self,
+        sdsc: &'x SuperDsc,
+        dsc: DscIdx,
+        stage: DatastageId,
+    ) -> Option<Self::Stage<'x>> {
+        Some(OffsetStageOf::new(
+            sdsc.dscs().at(dsc)?.data_stages.at(stage)?.ss.dims.dims(),
+        ))
     }
 }
 
 impl DscOffsetFacts for Reads<'_> {
-    type Sizes = OffsetSizes;
-    type Nodes = OffsetNodes;
-    type Facts = OffsetFacts;
+    type Sizes<'x>
+        = OffsetSizesOf<'x>
+    where
+        Self: 'x;
+    type Nodes<'x>
+        = OffsetNodesOf<'x>
+    where
+        Self: 'x;
+    type Facts<'x>
+        = OffsetFactsOf<'x>
+    where
+        Self: 'x;
 
-    /// ⛔ REFUSES: [`v1::StageSizes`] and [`v1::OffsetSizes`] are the datastage extents and the
-    /// address-granularity table, both severed with [`DscStages::dim_stage`].
-    fn offset_sizes(&self, _dsc: DscIdx) -> Option<&Self::Sizes> {
-        self.state.refuse(
-            "DscOffsetFacts::offset_sizes: wants v1::StageSizes + v1::OffsetSizes — the live \
-             dataStageParam_ extents and dscGlobal.sysDef.addressGranularityScalePerUnit",
-        )
+    /// [`super::offsets::OffsetSizesOf`] over this DSC's live `dataStageParam_`/`labeledDs_` and the
+    /// tree the growers filed every allocation in.
+    ///
+    /// ⛔ REFUSES ON ONE MISSING CONSTRUCTION ARGUMENT AND NOTHING ELSE — `computeOp_` in the
+    /// [`v1::DscComputeOp`] shape, which [`Self::with_compute_ops`] takes and [`super::run_l3`] does
+    /// not yet pass. ⛔ NOT A SUBSTITUTED EMPTY SWEEP: see this carrier's own `computes` field.
+    fn offset_sizes<'x>(&'x self, sdsc: &'x SuperDsc, dsc: DscIdx) -> Option<Self::Sizes<'x>> {
+        if self.computes.is_empty() {
+            return self.state.refuse(
+                "DscOffsetFacts::offset_sizes: wants computeOp_ as v1::DscComputeOp (opFuncName + \
+                 exUnit + dataFormat_ + inputLabeledDs + outputLabeledDs), which run_l3 does not \
+                 take — v1::OpFuncs carries only opFuncName, so the inputLabeledDs sweep of \
+                 is_sole_partial_reduction_input (ddc/ddcv1.cpp:1915-1921) has nothing to read",
+            );
+        }
+        Some(OffsetSizesOf::new(
+            sdsc.dscs().at(dsc)?,
+            self.dsc(dsc)?,
+            &self.computes,
+        ))
     }
 
-    /// ⛔ REFUSES: [`v1::ScheduleNodes`] is a WIDER walk than this state answers — parametric
-    /// strides, per-unit relevance and the compute node's operands, none of which the L3 tree arena
-    /// holds.
-    fn offset_nodes(&self, _dsc: DscIdx) -> Option<&Self::Nodes> {
-        self.state.refuse(
-            "DscOffsetFacts::offset_nodes: wants v1::ScheduleNodes (parametricStride, \
-             isNodeRelevant, getNextView, the ComputeNode operands) over the DSC's own tree",
-        )
+    /// [`super::offsets::OffsetNodesOf`] over `dscs_.at(dsc).scheduleTree_` — ⭐ THE STATE'S OWN TREE
+    /// AND NOT THE SUPER-DSC'S, which is where entries 290/353/368 minted every node this walk visits;
+    /// the super-DSC carries no `scheduleTree_` of its own for this stage to read.
+    fn offset_nodes<'x>(&'x self, _sdsc: &'x SuperDsc, dsc: DscIdx) -> Option<Self::Nodes<'x>> {
+        Some(OffsetNodesOf::new(self.dsc(dsc)?))
     }
 
-    /// ⛔ REFUSES: [`crate::schedule::l3::dl_ops::L3OffsetFacts`] is `getPageSize`,
-    /// `getBufferCapacityForNodePerDim`, `wordLength`, `dimToSymbolMapping_` and the two size
-    /// stages — the `dsc2` seams plus the live data stages.
-    fn offset_facts(&self, _dsc: DscIdx) -> Option<&Self::Facts> {
-        self.state.refuse(
-            "DscOffsetFacts::offset_facts: wants L3OffsetFacts — getPageSize, \
-             getBufferCapacityForNodePerDim, labeledDs_.wordLength, dimToSymbolMapping_ and the live \
-             size/chunk data stages",
-        )
+    /// [`super::offsets::OffsetFactsOf`] over every DSC's `memOrg_`s, this DSC's `labeledDs_` and
+    /// `dimToSymbolMapping_`, its tree's ALLOCATE nodes, and its LIVE chunk data stage.
+    fn offset_facts<'x>(&'x self, sdsc: &'x SuperDsc, dsc: DscIdx) -> Option<Self::Facts<'x>> {
+        OffsetFactsOf::new(self.state, dsc, sdsc.dscs().at(dsc)?)
     }
 }
