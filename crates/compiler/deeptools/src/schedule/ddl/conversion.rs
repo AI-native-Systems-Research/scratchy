@@ -2011,8 +2011,24 @@ pub struct DdlConversion {
     /// a top-level walk, which is why its dims are stated here and not on a [`DdlOp`] variant.
     pub padding_dims: BTreeMap<NameId, Vec<NameId>>,
     /// `chunk_dstgid` — which datastage `ddl.get_external_datastage property="chunk"` names.
+    ///
+    /// ⛔⛔ THESE ARE COMPILE-TIME CONSTANTS IN THE AUTHORITY, NOT STATE, AND A `None` HERE SILENTLY
+    /// KILLS THE ENTIRE EXPANSION. `ddc/ddc_metadata.h:210-211` is
+    /// `const int core_dstgid = 0; const int chunk_dstgid = 1;`, and this crate already carries both as
+    /// [`crate::schedule::ddc::metadata::Metadata::CORE_DSTGID`] / `CHUNK_DSTGID`. Nothing in the crate
+    /// ever WROTE these two fields — measured, zero assignments outside this file — so
+    /// `op_get_external_datastage` answered [`None`] on **op 0 of every vendored template**
+    /// (`broadcast_ops.ddl`'s dataflow region opens with two `ddl.get_external_datastage`). The whole
+    /// DDL expansion therefore minted `root_level_operations` and stopped, which is 11,218 of the
+    /// reference's 14,711 schedule-tree nodes not appearing, and it presented as "the expansion is
+    /// unported" rather than as two unset fields.
+    ///
+    /// ⚠️ OWED: the [`Option`] is now vestigial and should be deleted so "unset" is UNSPELLABLE rather
+    /// than merely initialised — the five read sites (`:3076`, `:3565`, `:3599`, `:3600`, `:4053`) use
+    /// `?`, so it is a typed change and not a rename. Left as-is only because eight agents share this
+    /// worktree tonight.
     pub chunk_datastage: Option<DatastageId>,
-    /// `core_dstgid`.
+    /// `core_dstgid`. See [`Self::chunk_datastage`] — same constant, same hazard.
     pub core_datastage: Option<DatastageId>,
     /// Which region a `ddl.allocate` was written in, which is the block it lands in —
     /// `myAlloc->getParentRegion()`, an identity the generated tables do not record.
@@ -2044,8 +2060,13 @@ impl DdlConversion {
             rotate_elements: BTreeMap::new(),
             padding_dims: BTreeMap::new(),
             alloc_regions: BTreeMap::new(),
-            chunk_datastage: None,
-            core_datastage: None,
+            // ⛔⛔ THE AUTHORITY'S CONSTANTS, NOT `None` — see the field docs. `ddc_metadata.h:210-211`
+            // is `const int core_dstgid = 0; const int chunk_dstgid = 1;`, so there is no state to
+            // set and no moment before it is set. A `None` here made
+            // `op_get_external_datastage` refuse on **op 0 of every vendored template**, which is why
+            // the whole DDL expansion minted `root_level_operations` and stopped.
+            chunk_datastage: Some(Metadata::CHUNK_DSTGID),
+            core_datastage: Some(Metadata::CORE_DSTGID),
             next_alloc: 0,
         }
     }

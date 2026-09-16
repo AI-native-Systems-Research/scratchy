@@ -1084,10 +1084,25 @@ mod tests {
         // ⚠️ NOT ESTABLISHED: whether this block IS the reference's head node or a SECOND node
         // sharing its name. The seed's own head is also called `root_level_operations`, which is why
         // the conversion's parent lookup had to become a `NodeId` rather than a `NodeName`.
+        // ⭐⭐ 24, AND THE +1 OVER 23 IS THE DATASTAGE-ID FIX. `DdlConversion::{core,chunk}_datastage`
+        // were `Option<DatastageId>` that NOTHING in the crate ever wrote, so
+        // `op_get_external_datastage` refused on **op 0 of every vendored template** —
+        // `broadcast_ops.ddl`'s dataflow region opens with two `ddl.get_external_datastage`. They are
+        // `const int core_dstgid = 0; const int chunk_dstgid = 1;` in the authority
+        // (`ddc/ddc_metadata.h:210-211`) and this crate already carried both as
+        // `Metadata::{CORE,CHUNK}_DSTGID`; stating them is the whole change.
+        //
+        // ⛔ 24 IS NOT 30, AND THE GAP IS THE POINT. `g0/debug/sdsc_0/sdsc.json` — IBM's own scheduled
+        // output for this program, counted — holds **30** nodes, and still owes six below
+        // `lx_below_schedule`: `transfer_lds1_src:lxlu_dst:sfp`, `loop_ds2_ds3_out_mb_y`,
+        // `transfer_lds0_src:lxlu_dst:sfp`, `loop_ds2_ds3_out_mb_y__1`, `compute_sfp_fma16`,
+        // `transfer_lds2_src:sfp_dst:lxsu`. So this asserts a MEASURED WAYPOINT, not completion, and
+        // whoever moves it next should move it toward 30 by name — not to whatever our run reports.
         assert_eq!(
             l3_state.node_count(),
-            23,
-            "the stage-2a tree (22) plus the DDL expansion's first live mint"
+            24,
+            "the stage-2a tree (22), `root_level_operations`, and the first node the dataflow region \
+             states now that the core/chunk datastage ids are the authority's constants"
         );
     }
 

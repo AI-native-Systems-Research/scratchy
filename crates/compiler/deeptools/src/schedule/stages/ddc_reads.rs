@@ -359,8 +359,14 @@ impl v1::Placement for Dsc2Reads<'_, '_> {
     ///
     /// ⛔ `1` IS THE UNTETHERED ANSWER AND NOT AN ABSENCE: every core on DD2 is subcore `0`, which
     /// is what `tetheredCoreUnitSize = 1` says, and entry 258 reads that as *"the top half of L0"*.
+    /// ⛔ THE UNTETHERED ARM IS SPELLED OUT RATHER THAN LEFT TO `% 1`, and not for style: on an arch
+    /// whose `TETHERED_CORE_UNIT` is `1` — DD2, per `sys-arch-spec/sysdef.cpp:200-205` — the modulo is
+    /// a constant `0`, which clippy's `modulo_one` denies at the crate's `-D warnings` gate. Writing
+    /// the arm keeps the answer IDENTICAL for every arch (`x % 1 == 0` for all `x`) while leaving the
+    /// divisor a real one from SEN1P5 on, and it does it without an `#[allow]`, which this crate bans.
     fn subcore(&self, core: crate::units::Core) -> u32 {
-        core.get() % Target::TETHERED_CORE_UNIT
+        let unit = Target::TETHERED_CORE_UNIT;
+        if unit <= 1 { 0 } else { core.get() % unit }
     }
 
     /// `{coreFoldProp_, coreletFoldProp_} ++ sdscFoldProps_`'s size, which is

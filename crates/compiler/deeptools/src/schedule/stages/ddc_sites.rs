@@ -2163,9 +2163,20 @@ mod live_tree_tests {
             let mut interface = DdlInterface::default();
             let mut dsc = a_bare_dsc();
             let mut conversion = DdlConversion::new();
-            if let Some((core, chunk)) = ids {
-                conversion.core_datastage = Some(core);
-                conversion.chunk_datastage = Some(chunk);
+            // ⭐ BOTH ARMS ARE NOW EXPLICIT, because `DdlConversion::new` no longer leaves these
+            // [`None`]: it states the authority's own constants (`ddc_metadata.h:210-211`), which is
+            // what this test's second arm proved was the fix. So the refusal arm has to WRITE `None`
+            // rather than rely on the default — otherwise it silently stops testing the refusal and
+            // becomes a second copy of the other arm.
+            match ids {
+                Some((core, chunk)) => {
+                    conversion.core_datastage = Some(core);
+                    conversion.chunk_datastage = Some(chunk);
+                }
+                None => {
+                    conversion.core_datastage = None;
+                    conversion.chunk_datastage = None;
+                }
             }
             if dims {
                 seed_dim_association(&mut interface);
@@ -2266,9 +2277,15 @@ mod live_tree_tests {
             let mut interface = DdlInterface::default();
             let mut dsc = a_bare_dsc();
             let mut conversion = DdlConversion::new();
+            // ⭐ BOTH ARMS EXPLICIT — `DdlConversion::new` now states the authority's constants, so the
+            // refusal arm must WRITE `None` instead of relying on the default. Relying on it would make
+            // this arm silently agree with the other one and stop testing the refusal at all.
             if ids {
                 conversion.core_datastage = Some(Metadata::CORE_DSTGID);
                 conversion.chunk_datastage = Some(Metadata::CHUNK_DSTGID);
+            } else {
+                conversion.core_datastage = None;
+                conversion.chunk_datastage = None;
             }
             if dims {
                 seed_dim_association(&mut interface);
