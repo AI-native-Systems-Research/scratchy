@@ -18,10 +18,24 @@
 //!
 //! # ⛔ WHAT IT DOES NOT, AND THE THREE REASONS
 //!
-//! 1. **THERE ARE NO COMPUTE NODES IN THIS TREE.** [`super::tree::Kind`] has `Block`, `Loop`,
-//!    `Transfer`, `Allocate`, `Sync` and `Condition` — and no `Compute`, because stage 2a mints none
-//!    (the 24,363-program census reads `compute: 0`) and entry 345's DDL parse is what mints them.
-//!    Every `ComputeNode` reader and every compute clone names that.
+//! 1. **THIS TREE HOLDS NO COMPUTE NODES — AND THAT IS A MISSING WRITER, NOT A MISSING ARM.**
+//!
+//!    ⛔⛔ A RECORDED CORRECTION. This note used to say *"[`super::tree::Kind`] has `Block`, `Loop`,
+//!    `Transfer`, `Allocate`, `Sync` and `Condition` — and no `Compute`"*, and every stub below cited
+//!    it as *"no Compute arm"*. **[`super::tree::Kind::Compute`] EXISTS** and holds the whole
+//!    [`ComputeNode`] (`stages/tree.rs:96`, beside a `StickMask` arm the same sentence omitted), and
+//!    [`super::tree::TreeData::kind_of`] is `pub`, so a compute node is READABLE from here.
+//!
+//!    What is true is that NOTHING CONSTRUCTS ONE: `Kind::Compute(..)` appears at no callsite in the
+//!    crate, because stage 2a mints none (the 24,363-program census reads `compute: 0`) and entry
+//!    345's DDL parse is what mints them. So the walks below find none — a READING, not an absence.
+//!
+//!    Each remaining compute stub therefore names its OWN blocker rather than the arm:
+//!    [`tr::ComputeWalk::compute_op`] wants a `ComputeOpType` our [`ComputeNode`] does not project,
+//!    [`v1::ComputeMasks::computes_under_mask`] wants an [`crate::schedule::dsc2::InstrAttribute`]
+//!    field, and the two whole-node getters want one `TreeData` accessor. Three that cited the arm
+//!    and never needed it — `compute_name`, `set_compute_name` and `parent_dim_loop` — are answered,
+//!    because all three read `ScheduleNode`'s BASE fields and not `ComputeNode`'s at all.
 //! 2. **`l3::dsc` DROPS SEVEN `DesignSpaceConfig` FIELDS** — `dsName_`, `dataFormat_`,
 //!    `wordLength`, `constantInfo_`, `scaledLdsCategory_`'s non-scale arms, `dimToSymbolMapping_`
 //!    and `l0TetheredMode_`. A conversion gap, not a data gap; see [`super::Dsc2Reads`].
@@ -424,46 +438,97 @@ impl tr::ComputeWalk for Dsc2Store<'_, '_> {
         })
     }
 
-    /// ⛔ `type_` on a COMPUTE node — see the module note (1).
+    /// ⛔ `type_` ON A COMPUTE NODE — AND THE ARM IS NOT WHAT BLOCKS IT. `Kind::Compute` holds the
+    /// whole [`ComputeNode`], but the C++ field is `ComputeOpType type_ = ComputeOpType::COUNT`
+    /// (`dsc/dsc2.h:933`) and [`ComputeNode::op`] projects a
+    /// [`crate::schedule::ddl::ops::DdlComputeType`] — the DDL's `computetype=` set, whose 34 arms
+    /// are `Macc`/`Fma16`/…/`And` and include NEITHER value [`tr::ComputeOp`] classifies. Answering
+    /// `Other` for a `RECIPROCAL` or a `LAYERNORMSCALE` is the wrong branch of entry 105, not a
+    /// default.
     fn compute_op(&self, _node: NodeId) -> tr::ComputeOp {
         todo!(
-            "tr::ComputeWalk::compute_op: wants ComputeNode::type_ — super::tree::Kind has no \
-             Compute arm, so this tree cannot hold one"
+            "tr::ComputeWalk::compute_op: wants ComputeNode::type_, a ComputeOpType \
+             (dsc/dsc2.h:933) — dsc2::ComputeNode::op projects DdlComputeType, which cannot spell \
+             RECIPROCAL or LAYERNORMSCALE, so tr::ComputeOp's two named arms are unreachable"
         )
     }
 }
 
 impl tr::ComputeNodes for Dsc2Store<'_, '_> {
+    /// ⛔ THE WHOLE `dsc2::ComputeNode` — READABLE, awaiting ONE accessor.
+    /// [`super::tree::Kind::Compute`] holds it and [`super::tree::TreeData::kind_of`] is `pub`, so
+    /// this is `tree.kind_of(node)` matched on that arm. What is missing is the pairing
+    /// [`super::tree::TreeData::transfer`] has: a by-kind reader plus this trait's TOTAL return,
+    /// which for a non-COMPUTE node is the reference's own `static_cast` and therefore a stop. Left
+    /// as one stub rather than a second `panic!` for a node no writer mints.
     fn compute(&self, _compute: NodeId) -> ComputeNode {
         todo!(
-            "tr::ComputeNodes::compute: wants the whole dsc2::ComputeNode — super::tree::Kind has \
-             no Compute arm"
+            "tr::ComputeNodes::compute: wants the whole dsc2::ComputeNode — Kind::Compute HOLDS it \
+             (stages/tree.rs:96); needs a TreeData::compute reader beside TreeData::transfer and a \
+             stop for the non-COMPUTE node the reference static_casts"
         )
     }
 }
 
 impl v1::ComputeMasks for Dsc2Store<'_, '_> {
+    /// ⛔ `instrAttribute_.computeMaskLoopOffsets_` — A FIELD, and the arm is not what blocks it.
+    /// The C++ `InstrAttribute` carries `std::map<int, unordered_map<const LoopNode*,
+    /// unordered_map<PrimaryDimTypes, int>>> computeMaskLoopOffsets_` (`dsc/dsc2.h:925`), and
+    /// [`crate::schedule::dsc2::InstrAttribute`] projects `compute_mask_` (`:916`) — a DIFFERENT
+    /// field — and not this one. Its absence is what both this and
+    /// [`tr::ComputeMasking::set_compute_mask_loop_offset`] want.
     fn computes_under_mask(&self, _node: NodeId) -> bool {
         todo!(
             "v1::ComputeMasks::computes_under_mask: wants \
-             ComputeNode::instrAttribute_.computeMaskLoopOffsets_ — a COMPUTE-node field this tree \
-             has no arm for"
+             instrAttribute_.computeMaskLoopOffsets_ (dsc/dsc2.h:925) — dsc2::InstrAttribute \
+             projects compute_mask_ (:916) and not this map; Kind::Compute itself is present"
         )
     }
 }
 
 impl tr::ComputeMasking for Dsc2Store<'_, '_> {
-    fn compute_name(&self, _compute: NodeId) -> NodeName {
-        todo!("tr::ComputeMasking::compute_name: wants compNode->name_ — no Compute arm")
+    /// `compNode->name_` — ⭐ ANSWERED, AND IT NEVER NEEDED A COMPUTE NODE. `name_` is declared on
+    /// the BASE class: `std::string name_;` sits beside `const NodeType nodeType_` in `ScheduleNode`
+    /// (`dsc/dsc2.h:459`), which `ComputeNode` inherits through
+    /// `InheritWithClone<ScheduleNode, ComputeNode>` (`dsc/dsc2.h:900`). So `compNode->name_` and
+    /// `node->name_` are ONE field, and [`tu::ScheduleSurgery::node_name`] already answers it —
+    /// delegated rather than re-read so the two cannot give two names for one node.
+    fn compute_name(&self, compute: NodeId) -> NodeName {
+        tu::ScheduleSurgery::node_name(self, compute)
     }
-    fn set_compute_name(&mut self, _compute: NodeId, _name: NodeName) {
-        todo!("tr::ComputeMasking::set_compute_name: wants compNode->name_ = name — no Compute arm")
+    /// `compNode->name_ = name` — the same base field, written.
+    fn set_compute_name(&mut self, compute: NodeId, name: NodeName) {
+        self.with_tree_mut(|tree| tree.set_name(compute, name));
     }
-    fn parent_dim_loop(&self, _compute: NodeId, _dim: PrimaryDim) -> Option<tr::LoopId> {
-        todo!(
-            "tr::ComputeMasking::parent_dim_loop: wants compNode->getParentDimLoop(dim) \
-             (dsc/dsc2.h:467) — no Compute arm"
-        )
+    /// `compNode->getParentDimLoop(dim)` — ⭐ ANSWERED, AND ALSO A BASE-CLASS METHOD:
+    /// `getParentDimLoop` is declared on `ScheduleNode` (`dsc/dsc2.h:467`) and its body reads no
+    /// `ComputeNode` state at all (`dsc/dsc2.cpp:1906-1914`):
+    ///
+    /// ```text
+    /// const LoopNode* loop = getOwnerLoop();
+    /// while (loop != nullptr && !loop->hasLoopDim(dim)) loop = loop->getOwnerLoop();
+    /// return loop;
+    /// ```
+    ///
+    /// ⭐ `getOwnerLoop()` STARTS AT `prev_`, NOT AT THE NODE — `auto parent = prev_;` then walks
+    /// `prev_` for the nearest `LOOP` (`dsc/dsc2.cpp:1896-1900`) — so the walk below re-asks
+    /// [`super::tree::TreeData::owner_loop`] from the loop's OWN id and can never return that loop
+    /// itself. `hasLoopDim(dim)` is `dims_` scanned for the dim and nothing more
+    /// (`dsc/dsc2.cpp:4223-4228`).
+    fn parent_dim_loop(&self, compute: NodeId, dim: PrimaryDim) -> Option<tr::LoopId> {
+        self.with_tree(|tree| {
+            let mut at = tree.owner_loop(compute);
+            while let Some(held) = at {
+                if tree
+                    .loop_node(held)
+                    .is_some_and(|node| node.dims.iter().any(|pair| pair.dim == dim))
+                {
+                    return Some(held);
+                }
+                at = tree.owner_loop(held.0);
+            }
+            None
+        })
     }
     /// `0 .. numCoreletsUsed_DSC2_` as corelets — ⭐ ANSWERED, and it is the DSC2 count and not the
     /// total.
@@ -487,8 +552,9 @@ impl tr::ComputeMasking for Dsc2Store<'_, '_> {
     ) {
         todo!(
             "tr::ComputeMasking::set_compute_mask_loop_offset: wants \
-             compNode->instrAttribute_.computeMaskLoopOffsets_[cl][loop][dim] = offset — no Compute \
-             arm"
+             instrAttribute_.computeMaskLoopOffsets_[cl][loop][dim] = offset (dsc/dsc2.h:925) — \
+             dsc2::InstrAttribute does not project that map, and TreeData has no by-kind writer for \
+             a Kind::Compute body; the arm itself is present"
         )
     }
 }
@@ -555,12 +621,20 @@ impl tu::ScheduleSurgery for Dsc2Store<'_, '_> {
         })
     }
 
-    /// ⛔ `isParametricLoop()` — the same `LoopNode::parametricLdsIdx_` gap
-    /// [`v1::ExploreTree::is_parametric_loop`] names.
+    /// ⛔ `isParametricLoop()` — A ONE-`bool` FIELD GAP, AND NOT THE ONE THIS USED TO CITE.
+    ///
+    /// ⛔⛔ A RECORDED CORRECTION. The message here said it *"reads `LoopNode::parametricLdsIdx_`"*.
+    /// It does not: `bool isParametricLoop() const { return isParametricLoop_; }` (`dsc/dsc2.h:599`)
+    /// returns `bool isParametricLoop_ = false` (`dsc/dsc2.h:617`), which is a SEPARATE member from
+    /// `int parametricLdsIdx_ = -1` (`:618`) — the two are set by different writers
+    /// (`markAsParametricLoop()` at `:600` against `setParametricLdsIdx(idx)` at `:604`), so a loop
+    /// can be parametric with no parametric lds and vice versa. [`tu::LoopNode`] carries `name`,
+    /// `num`, `den` and `dims` and neither of them, so this is ONE `bool` to project, not the index.
     fn is_parametric(&self, _loop_node: tr::LoopId) -> bool {
         todo!(
             "tu::ScheduleSurgery::is_parametric: wants isParametricLoop() (dsc/dsc2.h:599) reading \
-             LoopNode::parametricLdsIdx_, which transformation_util::LoopNode does not carry"
+             LoopNode::isParametricLoop_ (dsc/dsc2.h:617) — a bool member distinct from \
+             parametricLdsIdx_ (:618), and transformation_util::LoopNode carries neither"
         )
     }
 
@@ -910,14 +984,30 @@ impl tu::DscAllocations for Dsc2Store<'_, '_> {
         }
     }
 
-    /// `labeledDs_.at(lds).memOrg_[storage] = { isPresent, allocateNode_ }` — ⛔ THE NODE THE
-    /// `AllocId` NAMES must already be in this tree, because [`super::tree::Org`] files a
-    /// [`NodeId`] and the L3 view of it, not a bare id.
+    /// `labeledDs_.at(lds).memOrg_[storage] = { isPresent, allocateNode_ }` — ⛔ AN ORDERING GAP, AND
+    /// LOOKING THE NODE UP IS THE WRONG FIX.
+    ///
+    /// ⛔⛔ THE NODE DOES NOT EXIST YET AT THIS CALL, which is why an impl reading
+    /// `node_of_alloc(alloc)` would answer `None` and SILENTLY DROP the registration. Its one caller
+    /// is [`tu::construct_allocation`], which calls this and then RETURNS the allocate-node body for
+    /// its own caller to splice: at `ddc/transformation.rs:3316-3325` the id comes from
+    /// `free_alloc()` — [`Self::next_free_alloc`], *"the identity a freshly minted node WOULD
+    /// take"* — and the node is only minted by the `insert_allocate` / `held.insert` that follows
+    /// (`ddc/transformation_util.rs:3308-3315`). In the reference the id IS the node (`new
+    /// dsc2::AllocateNode()`'s pointer), so `memOrg_[storage].allocateNode_ = alloc` is total there
+    /// and unspellable here.
+    ///
+    /// ⭐ THE REPAIR IS IN [`super::tree`], NOT HERE: either [`super::tree::Org`] files the pending
+    /// [`AllocId`] per storage (splitting `isPresent` off the node identity, which
+    /// [`tu::ComponentAllocations::copy_mem_org_without_allocation`] needs anyway), or
+    /// [`super::tree::TreeData::fresh_alloc`] registers the id before the node. Answering it from
+    /// here without one of those inserts an allocation nothing filled.
     fn set_allocation_in(&mut self, _lds: LdsIdx, _storage: DdcMemory, _alloc: AllocId) {
         todo!(
             "tu::DscAllocations::set_allocation_in: wants memOrg_[storage] = {{isPresent=true, \
-             allocateNode_=alloc}} — super::tree::Org files a (NodeId, L3AllocateNode) pair, so it \
-             needs the node the AllocId names and its layout, not the id alone"
+             allocateNode_=alloc}} — the node the AllocId names is minted AFTER this call \
+             (ddc/transformation_util.rs:661 then :3315), so super::tree::Org must file the pending \
+             AllocId; a node lookup here answers None and drops the registration"
         )
     }
 
@@ -1109,13 +1199,39 @@ impl tu::ComponentAllocations for Dsc2Store<'_, '_> {
         tree.with(|held| held.allocate(node).map(|(alloc, _)| alloc))
     }
 
-    /// ⛔ THE SAME FUSION [`Self::copy_mem_org_without_allocation`] names.
-    fn set_mem_org_allocation(&mut self, _lds: LdsIdx, _storage: SenComponent, _alloc: AllocId) {
-        todo!(
-            "tu::ComponentAllocations::set_mem_org_allocation: wants \
-             memOrg_.at(storage).allocateNode_ = alloc — super::tree::Org::set_node needs the node \
-             the AllocId names and its L3AllocateNode, not the id alone"
-        )
+    /// `memOrg_.at(storage).allocateNode_ = alloc` — ⭐ ANSWERED, and the pair
+    /// [`super::tree::Org::set_node`] wants is READ OFF THE ALLOCATION rather than asked of the
+    /// caller: the [`NodeId`] is [`super::tree::TreeData::node_of_alloc`] and the L3 view is that
+    /// node's own [`super::tree::TreeData::allocate`], so nothing here is supplied and nothing is
+    /// invented.
+    ///
+    /// ⛔ THIS IS NOT [`tu::DscAllocations::set_allocation_in`], AND THE DIFFERENCE IS THE ORDER. Its
+    /// one caller reaches it with `clone`, the id
+    /// [`tu::AllocateCloning::clone_allocate_after`] returned for a node it has already SPLICED into
+    /// the tree (`ddc/transformation_util.rs:1069` then `:1090`) — so the lookup is total here where
+    /// on `set_allocation_in`'s caller it would find nothing. An id naming no ALLOCATE is therefore a
+    /// defect and not a state, and it is RECORDED as a refusal rather than dropped: the write is the
+    /// only thing that files the clone in `memOrg_`, and a silent no-op would leave the clone
+    /// unreachable from the labelled DS that owns it.
+    fn set_mem_org_allocation(&mut self, lds: LdsIdx, storage: SenComponent, alloc: AllocId) {
+        let Some(tree) = self.state.tree(self.dsc) else {
+            return;
+        };
+        let held = tree.with(|held| {
+            let node = held.node_of_alloc(alloc)?;
+            let (_, minted) = held.allocate(node)?;
+            Some((node, minted))
+        });
+        let Some((node, minted)) = held else {
+            let _: Option<()> = self.state.refuse(
+                "ComponentAllocations::set_mem_org_allocation: the AllocId names no ALLOCATE of \
+                 this DSC's scheduleTree_, so memOrg_ cannot name its node",
+            );
+            return;
+        };
+        if let Some(org) = tree.org(lds) {
+            org.set_node(storage, node, minted);
+        }
     }
 
     /// `constantInfo_.at(constant).allocations_.count(storage)` — ⭐ ANSWERED off
@@ -1184,15 +1300,29 @@ impl tu::AllocateCloning for Dsc2Store<'_, '_> {
 }
 
 impl tu::ComputeCloning for Dsc2Store<'_, '_> {
+    /// ⛔ THE SAME ONE ACCESSOR [`tr::ComputeNodes::compute`] names — the arm is present, the by-kind
+    /// reader is not.
     fn compute(&self, _node: NodeId) -> ComputeNode {
-        todo!("tu::ComputeCloning::compute: wants the whole dsc2::ComputeNode — no Compute arm")
+        todo!(
+            "tu::ComputeCloning::compute: wants the whole dsc2::ComputeNode — Kind::Compute HOLDS \
+             it (stages/tree.rs:96); see tr::ComputeNodes::compute for the reader it needs"
+        )
     }
 
-    fn clone_compute_after(&mut self, _node: NodeId, _body: ComputeNode) -> NodeId {
-        todo!(
-            "tu::ComputeCloning::clone_compute_after: wants node->clone() with a ComputeNode body — \
-             no Compute arm"
-        )
+    /// `node->clone()` with `body`, placed IMMEDIATELY AFTER `node` — ⭐ ANSWERED, and it needs no
+    /// reader: the body is HANDED IN, so this only mints and links, exactly as
+    /// [`tu::NodeCloning::clone_transfer_after`] does for a transfer.
+    ///
+    /// ⛔ NOTHING ELSE IN THE CRATE CONSTRUCTS A [`super::tree::Kind::Compute`], so this is the first
+    /// writer of that arm. That is why the census reads `compute: 0` and why every compute WALK in
+    /// this file answers empty: the arm was always spellable and never spelled.
+    fn clone_compute_after(&mut self, node: NodeId, body: ComputeNode) -> NodeId {
+        self.with_tree_mut(|tree| {
+            let name = body.name.clone();
+            let clone = tree.add(name, Kind::Compute(body), None);
+            tree.link(clone, tu::InsertionPoint::After(node));
+            clone
+        })
     }
 }
 
@@ -1485,64 +1615,163 @@ impl v1::PrepDsc for Dsc2Store<'_, '_> {
     }
 
     /// `primaryDsInfo_.at(lds's dsType_).stickDimOrder_` — ⭐ ANSWERED.
+    ///
+    /// ⛔⛔ ITS EMPTY VECTOR IS NOW RECORDED, AND THAT IS THE POINT. `.at(dsType_)` THROWS where the
+    /// map holds no such type (`ddc/ddcv1.cpp:2112`), and this used to answer `unwrap_or_default()` —
+    /// an EMPTY dim order indistinguishable, at the callsite, from a labelled DS that genuinely has
+    /// no stick dims. Its caller `extend`s two vectors with the answer (`ddc/v1.rs:5868-5877`), so a
+    /// silent empty builds an internal tensor with NO sticks and reports nothing. The vector stays
+    /// empty — the trait cannot spell absence and must not invent a dim — but the refusal is filed on
+    /// the state, so `Dsc2State::refusals` names it instead of the count looking healthy.
     fn stick_order(&self, lds: LdsIdx) -> Vec<PrimaryDim> {
-        self.facts()
-            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
-            .map(|dims| dims.0.iter().map(|(dim, _)| *dim).collect())
-            .unwrap_or_default()
+        match self.facts().with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds)) {
+            Some(dims) => dims.0.iter().map(|(dim, _)| *dim).collect(),
+            None => self
+                .state
+                .refuse(
+                    "PrepDsc::stick_order: primaryDsInfo_ holds no entry for that labelled DS's \
+                     dsType_, so its stickDimOrder_ is UNKNOWN and not empty",
+                )
+                .unwrap_or_default(),
+        }
     }
 
-    /// `primaryDsInfo_.at(lds's dsType_).stickSize_` — ⭐ ANSWERED.
+    /// `primaryDsInfo_.at(lds's dsType_).stickSize_` — ⭐ ANSWERED, and its empty is recorded for the
+    /// same reason [`Self::stick_order`]'s is.
     fn stick_sizes_of(&self, lds: LdsIdx) -> Vec<Elements> {
-        self.facts()
-            .with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds))
-            .map(|dims| dims.0.iter().map(|(_, size)| *size).collect())
-            .unwrap_or_default()
+        match self.facts().with_dsc(|dsc| ddc_state::stick_dims_of(dsc, lds)) {
+            Some(dims) => dims.0.iter().map(|(_, size)| *size).collect(),
+            None => self
+                .state
+                .refuse(
+                    "PrepDsc::stick_sizes_of: primaryDsInfo_ holds no entry for that labelled DS's \
+                     dsType_, so its stickSize_ is UNKNOWN and not empty",
+                )
+                .unwrap_or_default(),
+        }
     }
 
-    /// ⛔ `primaryDsInfo_[INTERNAL].layoutDimOrder_ = ...` — the DSC clone's `primary_ds_info` is
-    /// not behind a cell.
-    fn set_internal_layout_from(&mut self, _from: LdsIdx) {
-        todo!(
-            "v1::PrepDsc::set_internal_layout_from: wants primaryDsInfo_[INTERNAL].layoutDimOrder_ \
-             = primaryDsInfo_.at(from's dsType_).layoutDimOrder_ — \
-             DesignSpaceConfig::primary_ds_info is not behind a cell in Dsc2Facts"
-        )
+    /// `internalDsInfo.layoutDimOrder_ = inputDsInfo.layoutDimOrder_` (`ddc/ddcv1.cpp:2115`) — ⭐
+    /// ANSWERED THROUGH THE SHARED `currDsc` CELL.
+    ///
+    /// ⛔⛔ A RECORDED CORRECTION: this said *"`DesignSpaceConfig::primary_ds_info` is not behind a
+    /// cell in `Dsc2Facts`"*. The WHOLE `DesignSpaceConfig` is — `Dsc2Facts::dsc` is a
+    /// `RefCell<DesignSpaceConfig>` and [`super::ddc_state::Dsc2Facts::with_dsc_mut`] hands out
+    /// `&mut` to it off a `&self` (`stages/ddc_state.rs:335`, `:359`), which is the same cell every
+    /// `set_lds_*` on this trait already writes through. `primary_ds_info` is a plain field of it.
+    ///
+    /// ⭐ THE `from` IS READ THROUGH ITS OWN `dsType_`, not as a position: the reference indexes
+    /// `primaryDsInfo_.at(inputLds->dsType_)` (`ddc/ddcv1.cpp:2112`), so the source layout is the one
+    /// filed under the SOURCE'S TYPE and two labelled DSes of one type share it.
+    ///
+    /// ⛔ THE TWO ARMS ARE THE REFERENCE'S TWO OPERATORS AND NOT A DEFAULT. `.at(dsType)` on the
+    /// source THROWS where no such type is filed — recorded here as a refusal, because writing
+    /// nothing would leave `INTERNAL` carrying whatever layout a previous op left — while
+    /// `primaryDsInfo_[INTERNAL]` is `operator[]`, which DEFAULT-CONSTRUCTS the entry, so the vacant
+    /// arm inserts the copied layout with the EMPTY stick order that entry 308 then pushes into.
+    fn set_internal_layout_from(&mut self, from: LdsIdx) {
+        let recorded = self.facts().with_dsc_mut(|dsc| {
+            let Some(ds_type) = ddc_state::ds_type_of(dsc, from) else {
+                return false;
+            };
+            let Some(layout) = dsc
+                .primary_ds_info
+                .get(&ds_type)
+                .map(|held| held.layout.clone())
+            else {
+                return false;
+            };
+            match dsc
+                .primary_ds_info
+                .entry(crate::schedule::ddc::transformation::DsType::Internal)
+            {
+                std::collections::btree_map::Entry::Occupied(mut held) => {
+                    held.get_mut().layout = layout;
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(crate::schedule::l3::dsc::PrimaryDsInfo {
+                        layout,
+                        stick: StickDims(Vec::new()),
+                    });
+                }
+            }
+            true
+        });
+        if !recorded {
+            let _: Option<()> = self.state.refuse(
+                "PrepDsc::set_internal_layout_from: the source labelled DS names no dsType_ with a \
+                 primaryDsInfo_ entry, so INTERNAL's layoutDimOrder_ has nothing to copy",
+            );
+        }
     }
 
-    /// ⛔ `primaryDsInfo_[INTERNAL].stickDimOrder_.push_back(dim)` with `stickRepl_` — and
-    /// [`crate::schedule::l3::dsc::PrimaryDsInfo`] carries no `stickRepl_` at all.
+    /// ⛔ `primaryDsInfo_[INTERNAL].stickDimOrder_.push_back(dim)` WITH
+    /// `stickRepl_.push_back(repl)` — TWO FIELD GAPS, and the cell is not one of them (see
+    /// [`Self::set_internal_layout_from`], which writes the same map).
+    ///
+    /// 1. **`stickRepl_` IS NOT PROJECTED.** The reference pushes one per dim and always `1` at this
+    ///    site (`ddc/ddcv1.cpp:2117-2122`), but [`crate::schedule::l3::dsc::PrimaryDsInfo`] carries
+    ///    `layout` and `stick` and nothing else, so [`v1::StickRepl`] has nowhere to land. Pushing
+    ///    the dim and discarding the replication is an effect DROPPED silently.
+    /// 2. **`stickDimOrder_` AND `stickSize_` ARE FUSED HERE AND SEPARATE THERE.** `PrimaryDsInfo`
+    ///    holds one [`StickDims`] — a `Vec<(PrimaryDim, Elements)>` — while the reference pushes the
+    ///    dims in one loop and the sizes in another, over DIFFERENT lengths in the general case
+    ///    (`:2117-2135`: two dim loops, then two size loops each cutting its first entry by the slice
+    ///    count). A `(dim, size)` pair cannot be formed from either call alone, so the arrival of a
+    ///    dim with no size yet is unspellable rather than merely unwritten.
+    ///
+    /// ⭐ THE REPAIR IS IN `l3/dsc.rs`: `PrimaryDsInfo` splitting `stick` into `stick_dim_order`,
+    /// `stick_size` and `stick_repl` the way `dsc/dscdefn.h:474` holds them. Until then BOTH halves
+    /// stop, so entry 308 cannot half-fill the internal tensor's sticks.
     fn push_internal_stick_dim(&mut self, _dim: PrimaryDim, _repl: v1::StickRepl) {
         todo!(
             "v1::PrepDsc::push_internal_stick_dim: wants \
              primaryDsInfo_[INTERNAL].stickDimOrder_.push_back(dim) with stickRepl_.push_back(repl) \
-             — l3::dsc::PrimaryDsInfo carries no stickRepl_ and is not behind a cell"
+             (ddc/ddcv1.cpp:2117-2122) — l3::dsc::PrimaryDsInfo projects no stickRepl_ and fuses \
+             stickDimOrder_ with stickSize_ as one StickDims, so a dim cannot be pushed alone"
         )
     }
 
-    /// ⛔ Likewise.
+    /// ⛔ `primaryDsInfo_[INTERNAL].stickSize_.push_back(size)` — the other half of the same fusion.
     fn push_internal_stick_size(&mut self, _size: Elements) {
         todo!(
             "v1::PrepDsc::push_internal_stick_size: wants \
-             primaryDsInfo_[INTERNAL].stickSize_.push_back(size) — see push_internal_stick_dim"
+             primaryDsInfo_[INTERNAL].stickSize_.push_back(size) (ddc/ddcv1.cpp:2124-2135) — see \
+             push_internal_stick_dim: StickDims pairs the size with a dim this call does not carry"
         )
     }
 
-    /// ⛔ `labeledDs_.at(to).memOrg_[LX] = labeledDs_.at(from).memOrg_.at(LX)` — the same
-    /// `Org`-fusion gap [`tu::ComponentAllocations::set_mem_org_allocation`] names.
-    fn copy_lx_mem_org(&mut self, _to: LdsIdx, _from: LdsIdx) -> Option<AllocId> {
-        todo!(
-            "v1::PrepDsc::copy_lx_mem_org: wants memOrg_[LX] copied from another lds — \
-             super::tree::Org files a (NodeId, L3AllocateNode) pair per storage and has no copy"
-        )
+    /// `labeledDs_.at(to).memOrg_[LX] = labeledDs_.at(from).memOrg_.at(LX)` then
+    /// `memOrg_.at(LX).allocateNode_` read back (`ddc/ddcv1.cpp:2137-2138`) — ⭐ ANSWERED, and it is
+    /// the SOURCE's node copied BY IDENTITY, which is what the reference's pointer copy is.
+    ///
+    /// ⛔ THE COPY ALIASES ONE NODE ACROSS TWO `memOrg_` ENTRIES, AND THAT IS THE REFERENCE'S OWN
+    /// STATE — `newLds->memOrg_[LX]` holds the very `allocInput0` pointer `inputLds` holds, which is
+    /// why the next thing it does is clone that node and overwrite the slot
+    /// (`ddc/ddcv1.cpp:2141-2156`, then [`Self::set_lx_alloc`]). ⚠️ WHILE THE ALIAS STANDS,
+    /// [`super::state::DscTree::home_of`] — a reverse scan of the organisations, so FIRST match wins
+    /// — can name either labelled DS as the node's home, and with it either one's `placed` and
+    /// `allocUsers_`. Nothing in entry 308 reads those between the two calls (the users it needs come
+    /// from the caller's own `allocs` map), so this is recorded rather than worked around; a caller
+    /// that DID read them would need `Org` keyed by node identity.
+    ///
+    /// ⛔ `isZeroPadded` IS NOT COPIED AND CANNOT BE: [`super::tree::Org`] files it as a
+    /// `SenComponent` set with no writer anywhere in the crate, so `lx_zero_padded()` is constantly
+    /// `Some(false)` for every organisation this tree builds and the copy of it is the identity.
+    fn copy_lx_mem_org(&mut self, to: LdsIdx, from: LdsIdx) -> Option<AllocId> {
+        let tree = self.state.tree(self.dsc)?;
+        let node = tree.org(from)?.node(SenComponent::Lx)?;
+        let (alloc, minted) = tree.with(|held| held.allocate(node))?;
+        tree.org(to)?.set_node(SenComponent::Lx, node, minted);
+        Some(alloc)
     }
 
-    /// ⛔ `memOrg_.at(LX).allocateNode_ = alloc` — see above.
-    fn set_lx_alloc(&mut self, _lds: LdsIdx, _alloc: AllocId) {
-        todo!(
-            "v1::PrepDsc::set_lx_alloc: wants memOrg_.at(LX).allocateNode_ = alloc — \
-             super::tree::Org::set_node needs the node and its L3AllocateNode, not the id alone"
-        )
+    /// `memOrg_.at(LX).allocateNode_ = alloc` (`ddc/ddcv1.cpp:2156`) — ⭐ ANSWERED the way
+    /// [`tu::ComponentAllocations::set_mem_org_allocation`] is, and for the same reason: its caller
+    /// reaches it with the id [`Self::insert_alloc_before`] returned for a node ALREADY spliced in
+    /// (`ddc/v1.rs:5931`), so the `(NodeId, L3AllocateNode)` pair is read off the allocation itself.
+    fn set_lx_alloc(&mut self, lds: LdsIdx, alloc: AllocId) {
+        tu::ComponentAllocations::set_mem_org_allocation(self, lds, SenComponent::Lx, alloc);
     }
 
     /// ⛔ `memOrg_.at(LX).isPresent = present` — [`super::tree::Org`] FUSES presence with the node,
