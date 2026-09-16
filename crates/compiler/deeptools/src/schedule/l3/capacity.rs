@@ -47,6 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
+use crate::arch::Bytes;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, StickPart, cumulative_stick_sizes,
 };
@@ -1588,6 +1589,338 @@ mod tests_e018 {
                 &dsc,
             ),
             Some(vec![(MB, Extent(1)), (OUT, Extent(128)), (Y, Extent(1))])
+        );
+    }
+}
+
+/// HOW A BUFFER'S BYTES ARE ROUNDED — `bytesPerStick` and `forceEvenNumSticks`
+/// (`dsc/dsc2.cpp:3980-3981`) AS ONE VALUE, which is what makes `DT_CHECK_MSG(bytesPerStick > 0,
+/// "Invalid bytes per stick.")` (`:3999`) unspellable: the forcing cannot be asked for without the
+/// width it divides by, and the declaration's own `bytesPerStick = 0` is reachable only beside
+/// `forceEvenNumSticks = false`, where the reference never reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickRounding {
+    /// `forceEvenNumSticks = false`, the default — the capacity is whatever the dims fold to.
+    AsSized,
+    /// `forceEvenNumSticks = true` with `sysDef.bytesPerStick`, which is
+    /// [`crate::arch::Arch::BYTES_PER_STICK`] at both of L3's own call sites
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5559`, `:5657`).
+    EvenSticks(NonZeroU64),
+}
+
+/// HOW A CAPACITY IN BYTES IS ASKED FOR — `getBufferCapacityForNode`'s four trailing defaults
+/// (`dsc/dsc2.cpp:3979-3982`).
+///
+/// ⛔ THERE IS NO `allowSymbolicVolumeLimit` HERE, AND ITS ABSENCE IS THE FACT: this call hands
+/// [`buffer_capacity_per_dim`] a HARDCODED `true` (`:3990`) where [`CapacityForm::DEFAULTS`] states
+/// false, so a caller able to state it would be stating something the reference overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BytesForm {
+    /// `doNotRound`.
+    pub do_not_round: bool,
+    /// `includeGaps`.
+    pub include_gaps: bool,
+    /// `bytesPerStick` and `forceEvenNumSticks` together.
+    pub rounding: StickRounding,
+}
+
+impl BytesForm {
+    /// The declaration's own four defaults, verbatim — `bytesPerStick = 0` beside
+    /// `forceEvenNumSticks = false` IS [`StickRounding::AsSized`].
+    pub const DEFAULTS: Self = Self {
+        do_not_round: false,
+        include_gaps: true,
+        rounding: StickRounding::AsSized,
+    };
+}
+
+/// Replaces: e019_getBufferCapacityForNode
+///
+/// HOW MANY BYTES ONE BUFFER HOLDS — every dim of [`buffer_capacity_per_dim`] folded in as
+/// `max(size, 1)`, times the labelled DS's `wordLength`, and on LX under `forceEvenNumSticks` one
+/// stick more wherever that lands on an ODD number of sticks.
+///
+/// ⛔ THE RESOLVED ALLOCATION IS THE LOCATION TOO (`dsc/dsc2.cpp:3984-3990`), so this is NOT
+/// [`buffer_capacity_per_dim`] of the node handed in and it takes no [`CapacityNode`]: asked about a
+/// TRANSFER over an HBM allocation at the root, the reference sizes that ALLOCATION whole as `N_`,
+/// where e018 sizes the transfer by the loops above it. The caller resolves `node->nodeType_ ==
+/// ALLOCATE ? node : myLds.memOrg_.at(comp).allocateNode_` and hands the answer over.
+/// ⛔ `numBuffers_ >= 1` (`:3997`) IS SINGLE *AND* DOUBLE. The comment beside it says *"if it is
+/// double buffering on LX"* and the code does not; only `STREAMING`'s `-1` is out.
+/// ⛔ [`None`] is every stop of [`buffer_capacity_per_dim`], and a product past [`u64`].
+#[must_use]
+pub fn buffer_capacity(
+    alloc: &AllocateNode,
+    sizing: AllocSizing<'_>,
+    non_unified_in_hbm: bool,
+    at: SampledBuffer<'_>,
+    form: BytesForm,
+    ancestors: &AncestorLoops<'_>,
+    dsc: &(impl SizeDsc + ?Sized),
+) -> Option<Bytes> {
+    let per_dim = buffer_capacity_per_dim(
+        CapacityNode::Allocation {
+            alloc,
+            sizing,
+            non_unified_in_hbm,
+        },
+        at,
+        CapacityForm {
+            do_not_round: form.do_not_round,
+            include_gaps: form.include_gaps,
+            allow_symbolic_volume_limit: true,
+        },
+        ancestors,
+        dsc,
+    )?;
+    let mut cap: u64 = 1;
+    for (_, size) in per_dim {
+        // `std::max(size, 1)` — non-negative by construction, so the absolute value is the cast.
+        cap = cap.checked_mul(size.0.max(1).unsigned_abs())?;
+    }
+    cap = cap.checked_mul(u64::from(at.info.record().word_length.0))?;
+    let rounded = match (form.rounding, at.comp) {
+        (StickRounding::EvenSticks(per_stick), SenComponent::Lx)
+            if !alloc.placement.num_buffers.is_streaming() && (cap / per_stick.get()) % 2 == 1 =>
+        {
+            cap.checked_add(per_stick.get())?
+        }
+        _ => cap,
+    };
+    Some(Bytes(rounded))
+}
+
+#[cfg(test)]
+mod tests_e019 {
+    //! ⭐⭐ THE TWO BUFFER OFFSETS `sdsc_1` ITSELF EXPORTED, IN BYTES — `/Users/nickm/tmp/
+    //! bridge1-fixtures/g0/debug/sdsc_1/sdsc.json`, DSC `rmmean_o728`, whose per-dim halves
+    //! [`super::tests_e017`] pins. `bufferOffsetCoreCorelet_[core][cl] = kv.second / numBuffers_`
+    //! where `kv.second == numBuffers_ * getBufferCapacityForNode(allocNode, ldsIdx, component_,
+    //! corelet, row, bytesPerStick, /*forceEvenNumSticks*/ true)`
+    //! (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5556-5561`, `:5654-5659`), so for an allocate node
+    //! with `ldsIdx_ >= 0` and `numBuffers_ != -1` THE EXPORTED OFFSET IS THIS CALL'S ANSWER.
+    //!
+    //! * `allocate_lds1_lx` (`ldsIdx_: 2`, `scale_: [1,-2,1]`, `wordLength: 2`, `numBuffers_: 2`,
+    //!   `prev_: loop_ds0_ds1_mb`) is `[(mb,1),(out,64),(y,1)]` — the STICK — so `64 * 2 = 128`
+    //!   bytes, ONE 128-byte stick and therefore ODD: `:4002` adds one and the export prints **256**.
+    //! * `allocate_lds0_lx` (`ldsIdx_: 0`, `scale_: [1,1,1]`, `wordLength: 2`, `numBuffers_: 2`,
+    //!   `prev_: loop_ds0_ds1_out`) is `[(mb,1),(out,2048),(y,1)]`, so `2048 * 2 = **4096**` — an even
+    //!   32 sticks, unbumped, and that is the offset the export prints on it.
+    //!
+    //! ⭐⭐ THE NEGATIVE CONTROL IS THE SAME NODE UNFORCED: **128**, which the export's 256 is
+    //! unreachable from — and it is 128 rather than 64 only because `wordLength` is multiplied in.
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::arch::{Arch, Bytes, Elements, Sen1p5};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+        Extent, PrimaryDim, StickDims,
+    };
+    use crate::schedule::ddc::metadata::DatastageId;
+    use crate::schedule::ddc::transformation::{DsType, Scale};
+    use crate::schedule::ddc::transformation_util::StageName;
+    use crate::schedule::dsc2::{
+        AllocLayout, AllocPlacement, Coordinate, LayoutDims, MaxDimSize, NodeName, NumBuffers,
+        StartAddress, WordLength,
+    };
+
+    use super::super::dsc::{
+        DataStage, DataStages, FilledDims, LabeledDs, LdsRecord, NamedDims, Pinning, SenComponent,
+        StageDims,
+    };
+    use super::tests_e015::dividing;
+    use super::{
+        AllocSizing, AllocateNode, AncestorLoops, BytesForm, Dsc, LdsIdx, LdsSticks, Padding,
+        SampledBuffer, SizeDsc, StickRounding, buffer_capacity,
+    };
+
+    const MB: PrimaryDim = PrimaryDim::Mb;
+    const OUT: PrimaryDim = PrimaryDim::Out;
+    const Y: PrimaryDim = PrimaryDim::Y;
+
+    /// One half of a stage — `sdsc_1` states nothing but the three slots.
+    fn half(name: &str, out: i64) -> NamedDims {
+        let mut dims = StageDims::default();
+        dims.extents.insert(OUT, Extent(out));
+        dims.extents.insert(MB, Extent(1));
+        dims.extents.insert(Y, Extent(1));
+        NamedDims {
+            name: StageName(name.to_owned()),
+            dims: FilledDims::of(dims).expect("a stage stating three dims"),
+        }
+    }
+
+    /// `sdsc_1`'s DSC through the five seams the capacity walk reads it by — ⭐ WITH THE
+    /// `wordLength: 2` BOTH LABELLED DSs STATE, which [`super::tests_e017`]'s own double leaves at
+    /// the field's `0` initializer because e017 never multiplies by it.
+    struct Sdsc1 {
+        stages: DataStages,
+        tensor0: LabeledDs,
+        tensor1: LabeledDs,
+    }
+
+    impl Sdsc1 {
+        /// `dataStageParam_["0"]` (`core`) and `["1"]` (`chunk`) both `{out_: 2048, mb_: 1, y_: 1}`,
+        /// plus `labeledDs_[0]` (`scale_: [1,1,1]`) and `labeledDs_[2]` (`scale_: [1,-2,1]`), each
+        /// zipped onto `layoutDimOrder_: ["mb","out","y"]` and each `wordLength: 2` for `SEN169_FP16`.
+        fn of() -> Self {
+            let stage = |name: &str| DataStage {
+                ss: half(name, 2048),
+                el: half(name, 2048),
+            };
+            let fp16 = || LdsRecord {
+                word_length: WordLength(2),
+                ..LdsRecord::default()
+            };
+            Self {
+                stages: DataStages::new(stage("core"), stage("chunk")),
+                tensor0: LabeledDs::new(
+                    DsType::Output,
+                    vec![
+                        (MB, Scale::Sized(1.0)),
+                        (OUT, Scale::Sized(1.0)),
+                        (Y, Scale::Sized(1.0)),
+                    ],
+                    LdsIdx(0),
+                    Pinning::default(),
+                )
+                .with_record(fp16()),
+                tensor1: LabeledDs::new(
+                    DsType::Output,
+                    vec![
+                        (MB, Scale::Sized(1.0)),
+                        (OUT, Scale::StickDim),
+                        (Y, Scale::Sized(1.0)),
+                    ],
+                    LdsIdx(2),
+                    Pinning::default(),
+                )
+                .with_record(fp16()),
+            }
+        }
+    }
+
+    impl LdsSticks for Sdsc1 {
+        /// `primaryDsInfo_["OUTPUT"]` — `stickDimOrder_: ["out"]`, `stickSize_: [64]`.
+        fn stick_dims(&self, _lds: LdsIdx) -> StickDims {
+            StickDims(vec![(OUT, Elements(64))])
+        }
+    }
+
+    impl Dsc for Sdsc1 {
+        /// `getLayoutDims(..)` — `["mb","out","y"]`, which both allocate nodes carry.
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            LayoutDims::new(MB, vec![OUT, Y])
+        }
+    }
+
+    impl SizeDsc for Sdsc1 {
+        /// `N_ = {"name_": "n", "out_": 2048, "mb_": 1, "y_": 1}` — unread, since neither node is the
+        /// HBM arm.
+        fn whole_data_structure(&self) -> Option<NamedDims> {
+            Some(half("n", 2048))
+        }
+
+        fn layout_dim_set(&self, _lds: LdsIdx) -> Option<BTreeSet<PrimaryDim>> {
+            Some(BTreeSet::from([MB, OUT, Y]))
+        }
+
+        fn data_stages(&self) -> &DataStages {
+            &self.stages
+        }
+    }
+
+    /// `allocate_lds<n>_lx` as the export prints it: `component_: "lx"`, `numBuffers_: 2`,
+    /// `padding_: {}`, `gapStickSpread_: {}`, `backGapCore_: {}`, `maxDimSizes_: [-1,-1,-1]`.
+    fn lds_lx(name: &str, lds: LdsIdx) -> AllocateNode {
+        AllocateNode {
+            name: NodeName(name.to_owned()),
+            component: SenComponent::Lx,
+            lds: Some(lds),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new(
+                (MB, MaxDimSize::Unset),
+                vec![(OUT, MaxDimSize::Unset), (Y, MaxDimSize::Unset)],
+            ),
+            start_address: StartAddress::default(),
+            placement: AllocPlacement {
+                num_buffers: NumBuffers::Double,
+                padding: Padding::default(),
+                buffer_offset: BTreeMap::new(),
+                is_start_addr_symbolic: false,
+            },
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        }
+    }
+
+    /// e019 — the two buffer offsets `sdsc_1`'s own export prints, and the same node unforced.
+    #[test]
+    fn a_buffer_holds_its_dims_times_its_word_length_rounded_up_to_an_even_stick_count() {
+        let dsc = Sdsc1::of();
+        // `allocateCoordinates_` with `foldConstructed_: 0` and `coreIdToWkSlice_: {}`, and the
+        // `ignoreSymbolicVolumeLimits_: 0`, `indirectAllocType_: "no_indirection"`, `backGapCore_: {}`
+        // both nodes state.
+        let coordinates = Coordinate::default();
+        let no_gaps = BTreeSet::new();
+        let sizing = AllocSizing {
+            allocate_coordinates: &coordinates,
+            slice_view_coordinates: None,
+            ignore_symbolic_volume_limits: false,
+            indirect: None,
+            back_gap_dims: &no_gaps,
+        };
+        // `scheduleTreeHeadDenId_: 0`, and the tree `loop_ds0_ds1_y` (ROOT) → `loop_ds0_ds1_mb` →
+        // {`allocate_lds1_lx`, `loop_ds0_ds1_out` → `allocate_lds0_lx`}, every loop `denId_: 1`.
+        let head = Some(DatastageId(0));
+        let y_loop = dividing("loop_ds0_ds1_y", Y, DatastageId(1));
+        let mb_loop = dividing("loop_ds0_ds1_mb", MB, DatastageId(1));
+        let out_loop = dividing("loop_ds0_ds1_out", OUT, DatastageId(1));
+        // L3 asks with `sysDef.bytesPerStick` and `forceEvenNumSticks = true` (`:5559`, `:5657`).
+        let forced = BytesForm {
+            rounding: StickRounding::EvenSticks(Sen1p5::BYTES_PER_STICK),
+            ..BytesForm::DEFAULTS
+        };
+
+        // `allocate_lds1_lx`: `64 * 2 = 128` bytes, ONE stick and so odd — the export prints 256.
+        let lds1 = lds_lx("allocate_lds1_lx", LdsIdx(2));
+        let at_lds1 = SampledBuffer::of(LdsIdx(2), &dsc.tensor1, SenComponent::Lx, None, None);
+        let above_lds1 = AncestorLoops::of(vec![&mb_loop, &y_loop], head);
+        assert_eq!(
+            buffer_capacity(&lds1, sizing, false, at_lds1, forced, &above_lds1, &dsc),
+            Some(Bytes(256))
+        );
+
+        // `allocate_lds0_lx`: `2048 * 2 = 4096`, an even 32 sticks — the export prints 4096.
+        let lds0 = lds_lx("allocate_lds0_lx", LdsIdx(0));
+        assert_eq!(
+            buffer_capacity(
+                &lds0,
+                sizing,
+                false,
+                SampledBuffer::of(LdsIdx(0), &dsc.tensor0, SenComponent::Lx, None, None),
+                forced,
+                &AncestorLoops::of(vec![&out_loop, &mb_loop, &y_loop], head),
+                &dsc,
+            ),
+            Some(Bytes(4096))
+        );
+
+        // THE CONTROL: the SAME node, the SAME sample, `forceEvenNumSticks = false`. 128 is the
+        // number the export's 256 is `:4002` OF, and it is 128 and not 64 only because `wordLength`
+        // is multiplied in — so dropping either the bump or the multiply moves an asserted value.
+        assert_eq!(
+            buffer_capacity(
+                &lds1,
+                sizing,
+                false,
+                at_lds1,
+                BytesForm::DEFAULTS,
+                &above_lds1,
+                &dsc,
+            ),
+            Some(Bytes(128))
         );
     }
 }
