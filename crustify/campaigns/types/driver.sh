@@ -78,11 +78,13 @@ mkdir -p $STATE
 # bridge-1 and ddc entry numbers on entirely different functions. A counter that can never read
 # 17-of-18 can never trip the ANCHOR LOSS alarm below, which is the safeguard that catches a stage
 # silently dropping units. The home list is exactly UNITS.tsv's rust_home column.
-HOMES="$ROOT/crates/compiler/deeptools/src/schedule/l3/dsc.rs
-$ROOT/crates/compiler/deeptools/src/schedule/dsc2.rs
-$ROOT/crates/compiler/deeptools/src/schedule/l3/dims.rs"
-# The portable unit names, read from UNITS.tsv so the driver and the schedule cannot drift.
+# ⛔⛔ DERIVED FROM UNITS.tsv'S rust_home COLUMN, NEVER HAND-LISTED. A home missing from this list is
+# the one bad-anchor-filter case that LOSES WORK rather than misreporting it: `count` never sees that
+# unit's anchor, `remainders` therefore never drops it, and it is re-ported on every restart forever.
+# The first hand-written version of this line named l3/dims.rs (which does not exist) and omitted
+# ddc/transformation_util.rs, ddc/v1.rs and ddc/metadata.rs — three of the five real homes.
 UNITS_TSV=$ROOT/crustify-types/UNITS.tsv
+HOMES=$(awk -F'\t' 'NR>1 {sub(/:.*/,"",$6); sub(/ \(NEW\)/,"",$6); if ($6!="") print "'"$ROOT"'/crates/compiler/deeptools/src/" $6}' $UNITS_TSV | sort -u)
 NAMES=$(awk -F'\t' 'NR>1 && $2!="-" {print $1}' $UNITS_TSV | sort -u)
 NUNITS=$(printf '%s\n' "$NAMES" | grep -c .)
 LAST_FILLED=-1
