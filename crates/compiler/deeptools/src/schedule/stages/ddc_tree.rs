@@ -181,8 +181,9 @@ impl v1::ScheduleWalk for Dsc2Tree<'_, '_> {
         self.tree().with(|tree| tree.owner_loop(node))
     }
 
-    /// `LoopNode::dims_` (`dsc/dsc2.h:570`) — EMPTY for a node that is not a loop, which is what
-    /// the reference's downcast then reads as nothing.
+    /// `LoopNode::dims_` (`dsc/dsc2.h:575` — ⚠️ NOT `:570`, which is inside the COMMENTED-OUT
+    /// `PrimaryDimAndKind` block above it) — EMPTY for a node that is not a loop, which is what the
+    /// reference's downcast then reads as nothing.
     fn loop_dims(&self, at: LoopId) -> Vec<(PrimaryDim, MetaDimKind)> {
         self.tree().with(|tree| {
             tree.loop_node(at)
