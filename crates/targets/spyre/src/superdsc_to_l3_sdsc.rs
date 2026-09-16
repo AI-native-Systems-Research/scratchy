@@ -844,13 +844,15 @@ fn lds_by_operand_name(dsc: &WireDsc) -> BTreeMap<String, LdsIdx> {
 ///   operand type it would then bind by. The emitter writes only `DataFormat` spellings
 ///   (`lower_subtile_tape_to_superdsc.rs:5326-5348`), so the stop is unreachable on scratchy's own
 ///   programs and is here because the wire type is a `&'static str`.
-/// * `inputs` / `outputs` — `inputLabeledDs` / `outputLabeledDs` through [`lds_by_operand_name`].
+/// * `inputs` / `interim` / `outputs` — `inputLabeledDs` / `interimLabeledDs` / `outputLabeledDs`,
+///   all three through [`lds_by_operand_name`], because all three are the same
+///   `std::vector<LabeledDsInfo*>` (`dsc/dscdefn.h:506-510`) and the writer spells all three
+///   identically as `{dsName_}-idx{ldsIdx_}` (`dsc/designSpaceConfig.cpp:6730-6753`, interim at
+///   `:6738-6741`).
 ///
-/// ⛔ `interimLabeledDs` AND `indirectAccessIndexLabeledDs` ARE NOT ON [`DscComputeOp`] — its
-/// five fields are *"the four beyond [`ComputeOp`]'s two that the reduction sweep and the size sweep
-/// need"* (`ddc/v1.rs:3795`), and the indirect list reaches the stage through
-/// `DesignSpaceConfig::indirect_access_index_lds` instead, which [`design_space_config`] now fills
-/// off the same map.
+/// ⛔ `indirectAccessIndexLabeledDs` IS STILL NOT ON [`DscComputeOp`] — the indirect list reaches the
+/// stage through `DesignSpaceConfig::indirect_access_index_lds` instead, which
+/// [`design_space_config`] fills off the same map.
 #[must_use]
 pub fn dsc_compute_ops(dsc: &WireDsc) -> Option<Vec<DscComputeOp>> {
     let by_name = lds_by_operand_name(dsc);
@@ -873,6 +875,7 @@ pub fn dsc_compute_ops(dsc: &WireDsc) -> Option<Vec<DscComputeOp>> {
                 ex_unit: ex_unit_of(compute.exUnit)?,
                 format,
                 inputs: operands(&compute.inputLabeledDs)?,
+                interim: operands(&compute.interimLabeledDs)?,
                 outputs: operands(&compute.outputLabeledDs)?,
             })
         })
