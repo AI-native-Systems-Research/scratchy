@@ -1572,20 +1572,23 @@ pub trait StageSizes {
     fn dim_density(&self, lds: LdsIdx, dim: PrimaryDim) -> Density;
     /// `dsNode.coreletSplit_.at(dim)` — how many elements each corelet takes of that dim.
     fn corelet_split(&self, stage: DatastageId, dim: PrimaryDim) -> Option<Vec<Elements>>;
-    /// ⛔⛔ DELETE THIS METHOD — IT NAMES A FIELD THAT DOES NOT EXIST AND HAS NO CALLER. Its old
-    /// citation, `allocNode->paddingSizes_.at(dim)`, is invented: `AllocateNode`
-    /// (`dsc/dsc2.h:974-1011`) carries `padding_`, a `PaddingFormType` (`:981`) — already answered by
-    /// [`ExploreTree::alloc_padding`] — and nothing named `paddingSizes_` (`:1000`, the line the doc
-    /// cited, is the continuation of `relatedIndirectAccessAlloc_`). Every `paddingSizes_` in
-    /// `ddc/ddcv1.cpp` is on a `DataStructDims`, i.e. a STAGE, which
-    /// [`Self::stage_padding_sizes`] already answers; there is no allocation-versus-stage distinction
-    /// to draw and no reader in the ported scheduler asks for one.
-    ///
-    /// ⛔ IT SURVIVES ONLY BECAUSE REMOVING IT IS `E0407` IN THREE FILES THIS CHANGE MAY NOT TOUCH —
-    /// `schedule/stages/ddc_reads.rs:568`, `schedule/stages/offsets.rs:384` and
-    /// `schedule/l3/dl_ops.rs:18791`. Delete the declaration, those three impls, and the two
-    /// `#[cfg(test)]` doubles in this file, in ONE commit.
-    fn alloc_padding_sizes(&self, alloc: AllocId, dim: PrimaryDim) -> Option<PaddingSizes>;
+    // ⛔⛔ `alloc_padding_sizes` WAS HERE AND IS DELETED — IT NAMED A FIELD THAT DOES NOT EXIST.
+    //
+    // Its citation, `allocNode->paddingSizes_.at(dim)`, was invented. `AllocateNode`
+    // (`dsc/dsc2.h:974-1011`) carries `padding_`, a `PaddingFormType` (`:981`) — already answered by
+    // `ExploreTree::alloc_padding` — and `grep paddingSizes_ dsc/dsc2.h` is ZERO hits; `:1000`, the
+    // line the doc cited, is the `nullptr;  // in case of indirect access...` continuation of
+    // `relatedIndirectAccessAlloc_`.
+    //
+    // ⭐ THE TYPE SETTLES IT MORE CHEAPLY THAN ANY RECEIVER LIST: `paddingSizes_` is declared on
+    // exactly ONE type, `DataStructDims` (`dsc/dims.h:219`), so EVERY read of it is a stage read BY
+    // TYPE whatever the local is called — all 24 of them in `ddcv1.cpp`. `stage_padding_sizes` below
+    // already answers that, so there was never an allocation-versus-stage distinction to draw. ⛔ And
+    // naming a SUBSET of those reads is what let the false claim survive review twice.
+    //
+    // It had zero production callers — only this declaration, two `#[cfg(test)]` doubles here, and
+    // three impls (`stages/ddc_reads.rs`, `stages/offsets.rs`, a test double in `l3/dl_ops.rs`). All
+    // six sites go together, because removing one alone is `E0407`.
     /// `dataStageParam_.at(stage).ss_.paddingSizes_.at(dim)` — THE ONLY `paddingSizes_` THERE IS, and
     /// ⚠️ BOTH ENTRIES READ THIS ONE: entry 259 through `dsChunk` (`ddc/ddcv1.cpp:1961-1968`) and
     /// entry 260 through `dataStageParam_.at(loopPtr->denId_).ss_` (`:2437`) and `ds` (`:2512`
@@ -7962,9 +7965,6 @@ mod tests_e258_e263 {
         fn corelet_split(&self, _stage: DatastageId, _dim: PrimaryDim) -> Option<Vec<Elements>> {
             None
         }
-        fn alloc_padding_sizes(&self, _alloc: AllocId, _dim: PrimaryDim) -> Option<PaddingSizes> {
-            None
-        }
         fn stage_padding_sizes(
             &self,
             _stage: DatastageId,
@@ -9016,9 +9016,6 @@ mod tests_e307_e309 {
             Density::FULL
         }
         fn corelet_split(&self, _stage: DatastageId, _dim: PrimaryDim) -> Option<Vec<Elements>> {
-            None
-        }
-        fn alloc_padding_sizes(&self, _alloc: AllocId, _dim: PrimaryDim) -> Option<PaddingSizes> {
             None
         }
         fn stage_padding_sizes(

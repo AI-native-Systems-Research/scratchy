@@ -18807,13 +18807,6 @@ mod tests_e328_e335 {
         fn corelet_split(&self, _stage: DatastageId, _dim: PrimaryDim) -> Option<Vec<Elements>> {
             None
         }
-        fn alloc_padding_sizes(
-            &self,
-            _alloc: AllocId,
-            _dim: PrimaryDim,
-        ) -> Option<v1::PaddingSizes> {
-            None
-        }
         fn stage_padding_sizes(
             &self,
             _stage: DatastageId,

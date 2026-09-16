@@ -295,8 +295,12 @@ impl v1::ExploreTree for Dsc2Tree<'_, '_> {
     /// [`crate::schedule::l3::dl_ops::L3AllocateNode`], whose `padding` IS `padding_`.
     ///
     /// ⚠️ STILL A DIFFERENT FIELD FROM `paddingSizes_`, which is the DATASTAGE's padding —
-    /// [`v1::ExploreStages::alloc_padding_sizes`] — and which the one caller (`ddc/v1.rs:4427-4436`)
+    /// [`v1::StageSizes::stage_padding_sizes`] — and which the one caller (`ddc/v1.rs:4427-4436`)
     /// reads BESIDE this one, exactly as `ddcv1.cpp:679-683` does.
+    ///
+    /// ⛔ THE OLD LINK HERE NAMED `v1::ExploreStages::alloc_padding_sizes`, WHICH WAS WRONG TWICE:
+    /// that trait never declared the method (it was on `StageSizes`), and the method itself named a
+    /// field that does not exist — `grep paddingSizes_ dsc/dsc2.h` is zero hits. It is now deleted.
     fn alloc_padding(&self, alloc: AllocId, dim: PrimaryDim) -> PadType {
         self.tree().with(|tree| alloc_padding_of(tree, alloc, dim))
     }

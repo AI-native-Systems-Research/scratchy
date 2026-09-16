@@ -49,8 +49,9 @@
 //! a read of a datastage BY TYPE, whatever the local is called (`coreDs.ss_` at `:580`, `dsChunk` at
 //! `:1961-1968`, `dataStageParam_.at(denId_).ss_` at `:2437`, `ds` at `:2512-2674`). That map is
 //! [`v1::StageSizes::stage_padding_sizes`], which is answered. So the gap was never a missing borrow
-//! or a missing field: [`v1::StageSizes::alloc_padding_sizes`] describes nothing, has zero production
-//! callers, and is to be DELETED from the trait in `ddc/v1.rs` rather than answered.
+//! or a missing field: `v1::StageSizes::alloc_padding_sizes` described nothing and had zero production
+//! callers, and has now been DELETED from the trait — declaration, two `#[cfg(test)]` doubles and all
+//! three impls, in one commit, because removing any one alone is `E0407`.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -369,29 +370,11 @@ impl v1::StageSizes for OffsetSizesOf<'_> {
             })
     }
 
-    /// ⛔⛔ THE FIELD THIS METHOD NAMES DOES NOT EXIST, AND THE METHOD HAS NO CALLER. Read
-    /// `dsc/dsc2.h:974-1011`: `dsc2::AllocateNode` carries `padding_` (a `PaddingFormType`, i.e. one
-    /// [`PadType`] per dim) and NOTHING called `paddingSizes_`; `dsc2.h:1000` is
-    /// `relatedIndirectAccessAlloc_`. Every `paddingSizes_` read in `ddc/ddcv1.cpp` is on a
-    /// `DataStructDims` — `coreDs.ss_` (`:580`), `dsChunk` (`:1961`),
-    /// `dataStageParam_.at(loopPtr->denId_).ss_` (`:2437`, `:2512`) — which is a STAGE map and is
-    /// [`Self::stage_padding_sizes`]. So the trait's *"a DIFFERENT map from the one above, the
-    /// ALLOCATION's"* is a distinction the authority does not draw, and `v1::StageSizes` declares this
-    /// method with ZERO production callers (`ddc/v1.rs:1551`; the only other mentions are two
-    /// `#[cfg(test)]` doubles).
-    ///
-    /// ⛔ IT THEREFORE STAYS A STOP ON PURPOSE. Answering it would mean inventing a seam — either a
-    /// five-number record no allocate node holds, or a silent re-read of the stage map under a name
-    /// that says otherwise. The work is to DELETE the method from [`v1::StageSizes`], which is
-    /// `ddc/v1.rs`'s to do.
-    fn alloc_padding_sizes(&self, _alloc: AllocId, _dim: PrimaryDim) -> Option<v1::PaddingSizes> {
-        todo!(
-            "v1::StageSizes::alloc_padding_sizes: NO SUCH FIELD and NO CALLER — dsc2::AllocateNode \
-             (dsc/dsc2.h:974-1011) has padding_ (a PaddingFormType) and no paddingSizes_; every \
-             paddingSizes_ in ddc/ddcv1.cpp is a DataStructDims (stage) map, which is \
-             stage_padding_sizes. Delete this method from v1::StageSizes rather than answer it"
-        )
-    }
+    // ⛔ `alloc_padding_sizes` WAS HERE AND THE TRAIT METHOD IS DELETED — it named a field that does
+    // not exist. `dsc2::AllocateNode` (`dsc/dsc2.h:974-1011`) carries `padding_`, a `PaddingFormType`,
+    // and `grep paddingSizes_ dsc/dsc2.h` is ZERO hits; `:1000` is `relatedIndirectAccessAlloc_`.
+    // ⭐ `paddingSizes_` is declared on exactly ONE type, `DataStructDims` (`dsc/dims.h:219`), so all
+    // 24 reads of it in `ddcv1.cpp` are stage reads BY TYPE — which is `stage_padding_sizes` below.
 
     /// `dataStageParam_.at(stage).ss_.paddingSizes_.at(dim)` (`dsc/dims.h:219`) — converted field for
     /// field from [`crate::schedule::l3::dsc::DimPadding`].

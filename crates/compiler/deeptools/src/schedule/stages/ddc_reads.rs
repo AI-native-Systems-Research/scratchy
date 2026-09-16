@@ -552,28 +552,12 @@ impl v1::StageSizes for Dsc2Reads<'_, '_> {
             })
     }
 
-    /// ⛔⛔ THERE IS NO SUCH FIELD, AND THE STUB THIS REPLACES CITED ONE. `allocNode->paddingSizes_`
-    /// does not exist: `paddingSizes_` is a member of `DataStructDims` (`dsc/dims.h:219`) and
-    /// `dsc/dsc2.h` — the `AllocateNode` header the old citation named at `:1000` — declares no
-    /// `paddingSizes_` anywhere. The reference reads it off the DATASTAGE every time, including at
-    /// the two sites the trait attributes to the allocation: `ds` at `ddc/ddcv1.cpp:2512` and `:2554`
-    /// is `dataStageParam_.at(loopPtr->denId_).ss_`, bound eighteen lines above at `:2490-2491`, and
-    /// entry 260's own corelet-offset walk reads `dsChunk.paddingSizes_` (`:1961-1968`), the CHUNK
-    /// stage's. So [`v1::StageSizes::stage_padding_sizes`] is the whole of that fact.
-    ///
-    /// ⛔ AND NOTHING CALLS THIS. No caller exists for `alloc_padding_sizes` in the ported scheduler,
-    /// so the stub is unreachable as well as unanswerable — it is a trait method to RETIRE from
-    /// [`v1::StageSizes`], not a fact to find. Retiring it is `ddc/v1.rs`' own edit, and the two
-    /// `#[cfg(test)]` doubles that answer it [`None`] go with it.
-    fn alloc_padding_sizes(&self, _alloc: AllocId, _dim: PrimaryDim) -> Option<v1::PaddingSizes> {
-        todo!(
-            "v1::StageSizes::alloc_padding_sizes: NAMES A FIELD THAT DOES NOT EXIST — \
-             allocNode->paddingSizes_ is nowhere in dsc/dsc2.h; paddingSizes_ is a DataStructDims \
-             member (dsc/dims.h:219) that the reference reads off the datastage \
-             (ddc/ddcv1.cpp:2490-2512), which stage_padding_sizes already answers. And nothing calls \
-             this: retire the trait method"
-        )
-    }
+    // ⛔ `alloc_padding_sizes` WAS HERE AND THE TRAIT METHOD IS DELETED — it named a field that does
+    // not exist. `grep paddingSizes_ dsc/dsc2.h` is ZERO hits, and `:1000` — the line the old citation
+    // named — is `relatedIndirectAccessAlloc_`.
+    // ⭐ `paddingSizes_` is declared on exactly ONE type, `DataStructDims` (`dsc/dims.h:219`), so every
+    // read of it is a stage read BY TYPE whatever the local is named. `stage_padding_sizes` below is
+    // the whole of that fact, and this method had zero production callers.
 
     /// `dataStageParam_.at(stage).ss_.paddingSizes_.at(dim)` — ⭐ THE SHARED MAP, converted field for
     /// field from [`crate::schedule::l3::dsc::DimPadding`].
