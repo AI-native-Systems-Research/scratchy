@@ -67,7 +67,14 @@ say "LOCK acquired by pid $$ on $BRANCH"
 # ⛔⛔ (2) THE .done MARKERS LIVE OUTSIDE THE CAMPAIGN DIR. crustify's `link_shared` symlinks the
 # campaign directory into each agent worktree, which turned every .done-<tag> into a SYMLINK POINTING
 # AT ITSELF: `[ -f ]` then failed, 7 batches died in 7 seconds.
-STATE=$ROOT/.campaign-done
+# ⛔⛔ AND THE MARKER DIRECTORY IS PER-CAMPAIGN, BECAUSE THE STAGE TAGS ARE NOT UNIQUE. Every campaign
+# names its stages sc1-port, sc2-port, sc1-review… so a shared $ROOT/.campaign-done makes two
+# campaigns collide on one filename. MEASURED, not theoretical: on this campaign's first launch
+# (2026-09-16 19:32) the types driver read capacity's `.done-sc1-port`, called it stale because ITS
+# remainder had 16 units, and `rm -f`'d ANOTHER CAMPAIGN'S COMPLETION RECORD — then did the same to
+# `.done-sc2-port`. Capacity had finished, so nothing was lost; had it been mid-run, its next launch
+# would have silently re-ported two finished waves.
+STATE=$ROOT/.campaign-done/types
 mkdir -p $STATE
 
 # ⭐ (3) ANCHOR CENSUS — A PROGRESS SIGNAL, NEVER THE GATE. "1,076 units ported" once meant 238
@@ -105,10 +112,18 @@ count() {
   # in as construction arguments). So this counts fields ON THE STRUCT ITSELF, never crate-wide.
   # ⚠ The denominator is C++'s, re-derived each run from the VENDORED header so it cannot drift from
   # the authority; the vendored copy is byte-identical to dsc/designSpaceConfig.h (checked at staging).
-  cppf=$(awk '/^class DesignSpaceConfig/,/^};/' $ROOT/crustify-types/cpp/designSpaceConfig.h 2>/dev/null \
-           | grep -oE '\b[a-zA-Z][a-zA-Z0-9]*_\b *[;=[]' | grep -oE '^[a-zA-Z][a-zA-Z0-9]*_' | sort -u | wc -l | tr -d ' ')
-  rustf=$(awk '/pub struct DesignSpaceConfig/,/^}/' $ROOT/crates/compiler/deeptools/src/schedule/l3/dsc.rs 2>/dev/null \
-            | grep -cE '^\s+pub [a-z_]+:' | tr -d ' ')
+  # ⛔ COUNT C++ FIELDS **CITED** IN THE RUST BODY, NOT RUST `pub` LINES. The first version counted
+  # `^\s+pub [a-z_]+:` and printed "12 of 49" where the answer is 9: a Rust field is not necessarily
+  # one of the C++ 49 (`ddc: DdcFacts` is a grouping of four), so that ratio silently flatters itself
+  # and would keep doing so as groupings were added. The citation IS the evidence the field was ported.
+  cppf_list=$(awk '/^class DesignSpaceConfig/,/^};/' $ROOT/crustify-types/cpp/designSpaceConfig.h 2>/dev/null \
+           | grep -oE '\b[a-zA-Z][a-zA-Z0-9]*_\b *[;=[]' | grep -oE '^[a-zA-Z][a-zA-Z0-9]*_' | sort -u)
+  cppf=$(printf '%s\n' "$cppf_list" | grep -c .)
+  rbody=$(awk '/pub struct DesignSpaceConfig/,/^}/' $ROOT/crates/compiler/deeptools/src/schedule/l3/dsc.rs 2>/dev/null)
+  rustf=0
+  for f in $cppf_list; do
+    printf '%s' "$rbody" | grep -q "\`$f\`" && rustf=$((rustf+1))
+  done
   say "ANCHORS: filled=$filled of $NUNITS   todo! under stages/=${todos:-0}   DesignSpaceConfig fields: ${rustf:-0} of ${cppf:-0}"
   # ⛔⛔ ANCHOR LOSS. A stage that ends with FEWER anchors than it started with has dropped landed
   # work — a bad rebase, a promote that took the wrong branch, an agent that rewrote a file whole.
