@@ -651,7 +651,7 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
         });
     }
 
-    /// `pruneMaxSymbolicVolumes(refDstg)` (`dsc/dims.cpp:729-760`) — ⭐ ALREADY PORTED, as
+    /// `pruneMaxSymbolicVolumes(refDstg)` (`dsc/dims.cpp:729-762`) — ⭐ ALREADY PORTED, as
     /// [`crate::schedule::l3::dsc::Symbolic::prune_volumes`], the UNFUSED shape `ddc/ddcv1.cpp:1424`
     /// and `:1425` call: THIS stage keeps its own `maxSymbolicVolume_`, re-keyed onto the dims it still
     /// calls symbolic, and does not adopt the core's.

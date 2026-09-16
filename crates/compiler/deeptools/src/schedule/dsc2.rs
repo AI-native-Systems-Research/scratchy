@@ -2157,9 +2157,11 @@ pub trait LabeledDsAllocations {
 ///
 /// ⭐ THE `LX`/`HBM` PREFERENCE CANNOT BE REORDERED AWAY, AND THE `break` IS STILL LOAD-BEARING.
 /// `memOrg_` is a `std::map<SenComponents, MemOrg>` (`dsc/dscdefn.h:337`), so it iterates in ordinal
-/// order, and `HBM = 0`/`LX = 1` are the two lowest keys any entry can hold
-/// (`sys-arch-spec/arch_enums.h:13-17`) — nothing PRECEDES them to be overwritten. What can FOLLOW
-/// them is a register file, and the `break` is what stops it overwriting them (`dsc/dsc2.cpp:4016`).
+/// order, and `HBM = 0`/`LX = 1` are the two lowest keys a NAMED component can hold — only
+/// `NO_COMPONENT = -1` sorts below them (`sys-arch-spec/arch_enums.h:13-17`), and an entry keyed on
+/// it is OVERWRITTEN by the `hbm`/`lx` hit rather than kept, because the scan REASSIGNS on every
+/// entry that holds a node. What can FOLLOW them is a register file, and the `break` is what stops
+/// it overwriting them (`dsc/dsc2.cpp:4016`).
 /// ⛔ SO IT IS NOT "ONLY AN EARLY EXIT". MEASURED over all 807 labelled DSs of
 /// `g0/debug/sdsc_*/sdsc.json`: 238 hold BOTH an `hbm`/`lx` node and a register-file node, and in all
 /// 238 dropping the `break` selects a DIFFERENT node. It reaches the same ANSWER — the two nodes'
@@ -2173,9 +2175,9 @@ pub trait LabeledDsAllocations {
 /// NON-HBM resolution and not this arm's count). 12 of the 219 name TWO register files, and in all 12
 /// their orders are equal — an arm the corpus ENTERS, not a choice the corpus EXERCISES.
 /// ⛔ NEITHER THAT ARM NOR THE `referenceLdsIdx_` HOP IS REACHABLE THROUGH THE ONE PRODUCTION CARRIER.
-/// `WireAllocations` (`crates/targets/spyre/src/superdsc_to_l3_sdsc.rs:557`) REFUSES a `component_`
-/// outside `{hbm, lx}` and answers [`LabeledDsAllocations::reference_lds`] with [`None`], so on our
-/// wire this walk stops inside its first lap every time.
+/// `WireAllocations` (`crates/targets/spyre/src/superdsc_to_l3_sdsc.rs:580`, its seam impl at `:607`)
+/// REFUSES a `component_` outside `{hbm, lx}` and answers [`LabeledDsAllocations::reference_lds`]
+/// with [`None`], so on our wire this walk stops inside its first lap every time.
 ///
 /// ⛔ [`None`] IS `DT_CHECK(allocNode)` (`dsc/dsc2.cpp:4022`), an unheld index, and a
 /// `referenceLdsIdx_` CYCLE — which the reference does not terminate on at all.
@@ -2411,7 +2413,7 @@ impl AllocateNode {
             Some(through) => todo!(
                 "dsc2::AllocateNode::page_sizes: dsc/dsc2.cpp:4486-4511 — {through:?} wants the \
                  REFERENCE allocation (this node for VALUE_TENSOR, relatedIndirectAccessAlloc_ for \
-                 INDEX_TENSOR, whose DT_CHECK at :4492 is its presence) and then that node's \
+                 INDEX_TENSOR, whose DT_CHECK at :4491 is its presence) and then that node's \
                  layoutDimOrder_/maxDimSizes_ walk, where a NEGATIVE max size UNBOUNDS the dim and \
                  ERASES the page size it had"
             ),

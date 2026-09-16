@@ -1050,7 +1050,7 @@ impl VolumeLimit {
 /// with `maxSymbolicVolume_` (`:202`), ONE value because the pruner reads the second against the
 /// first and neither is well formed without the other.
 ///
-/// ⭐ THE INVARIANT IS `DT_CHECK(refDstg.symbolicDimInfo_.count(symDim))` (`dsc/dims.cpp:745`):
+/// ⭐ THE INVARIANT IS `DT_CHECK(refDstg.symbolicDimInfo_.count(symDim))` (`dsc/dims.cpp:746`):
 /// every dim a volume limit is keyed on is named by `info`, so a stage handed to the pruner as the
 /// reference always has the granularity the pruner asks it for.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1119,7 +1119,7 @@ impl Symbolic {
     /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:171-172`); the other three are UNFUSED and take
     /// [`Self::prune_volumes`].
     ///
-    /// ⭐ `DT_CHECK(refDstg.symbolicDimInfo_.count(symDim))` (`dsc/dims.cpp:745`) CANNOT FIRE HERE:
+    /// ⭐ `DT_CHECK(refDstg.symbolicDimInfo_.count(symDim))` (`dsc/dims.cpp:746`) CANNOT FIRE HERE:
     /// the limits are `reference`'s own, and its own `info` names their keys by construction.
     pub fn prune_volumes_from(&mut self, reference: &Symbolic) {
         let stated = StatedVolumes::new(reference.volumes.clone());
@@ -2479,9 +2479,23 @@ impl LayoutDims {
     /// THE POSITION OF ONE DIM IN THE LAYOUT ORDER — a linear scan of
     /// `primaryDsInfo_.at(dstype).layoutDimOrder_` for `dim`, first match winning.
     ///
-    /// ⛔ [`None`] IS THE REFERENCE'S `-1`, A REAL ANSWER AND NOT AN ABORT: entry 017 branches on it
-    /// (`dsc/dsc2.cpp:3820`) and `isLabeledDsDimensionBroadcast` asks only `>= 0`
-    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:68`).
+    /// ⛔ [`None`] IS THE REFERENCE'S `-1`, A REAL ANSWER AND NOT AN ABORT — and the evidence is the
+    /// `int scale = dimIdx < 0 ? 1 : lds.scale_.at(dimIdx);` idiom, at SIXTEEN sites
+    /// (`ddc/ddc_fold.cpp:1391`, `:2298`, `:2536`, `:3001`, `:3161`, `:3366`, `:3965`, `:3981`,
+    /// `:4280`, `:4290`, `ddc/ddcv1.cpp:2451`, `:2632`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6033`, `:6203`, `:7400`, `:7542`), plus the
+    /// `dimIdx < 0 ||` guard at `ddc/ddc_transformation.cpp:1793` and the `>= 0` test at
+    /// `ddc/ddl/ddl_conversion.cpp:1305`: there an ABSENT dim reads as an ORDINARY dim of scale `1`.
+    ///
+    /// ⛔⛔ BUT EIGHT OTHER SUBSCRIPTS TAKE THE ANSWER UNGUARDED, so THERE the `-1` THROWS out of
+    /// `scale_.at()` and [`None`] IS A STOP AND NOT A `1`: `dsc/dsc2.cpp:3559` and `:3821` — ENTRY
+    /// 017'S OWN READ, one line below its call at `:3820` — `ddc/ddcv1.cpp:500`, `:1502`, `:1528`,
+    /// `:1904`, and `ddc/ddc_transformation.cpp:929` with `:931`.
+    /// `isLabeledDsDimensionBroadcast` refuses it outright instead, with a
+    /// `DT_CHECK_MSG(scaleIdx >= 0 && scaleIdx < lds.scale_.size())`
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:69-70`, and the same check again at `:4272`).
+    /// ⛔ SO THE `1` IS NOT THIS FUNCTION'S ANSWER AND IT IS NOT UNIFORM: a port of a SUBSCRIPTING
+    /// site must NOT default an absent dim to `1`.
     #[must_use]
     pub fn index_of(&self, dim: PrimaryDim) -> Option<LayoutPos> {
         self.iter().position(|named| named == dim).map(LayoutPos)
@@ -2701,7 +2715,7 @@ impl StatedVolumes {
     /// ⭐ Every write the reference makes is `min`-guarded and no erased key is ever a write target,
     /// so rebuilding the map with a `min`-insert is its in-place erase-and-insert walk exactly.
     ///
-    /// ⛔ BOTH `DT_CHECK`s THROW (`dsc/dims.cpp:745`, `:748`) AND SO DO THESE: keeping an entry the
+    /// ⛔ BOTH `DT_CHECK`s THROW (`dsc/dims.cpp:746`, `:748`) AND SO DO THESE: keeping an entry the
     /// prune could not reduce would state a volume limit no stage asked for.
     #[must_use]
     pub fn pruned_against(
