@@ -39,8 +39,18 @@
 //! this crate ranks worse than a stop. What is still missing is named on the method that wants it —
 //! `getSizeDataStageForNode` (e015/e016), `getBufferCapacityForNodePerDim` (e018),
 //! `getBlockTransferSizePerDim`, `addressGranularityScalePerUnit`, `loopDistributionParamInfo`, and
-//! the two `dsc2` FIELDS our ported nodes drop (`AllocateNode::paddingSizes_`,
-//! `LoopNode::isParametricLoop_`'s two accessors).
+//! the one `dsc2` FIELD our ported nodes drop (`LoopNode::isParametricLoop_`'s two accessors).
+//!
+//! ⛔⛔ AND ONE OF THEM IS NOT A DROPPED FIELD BUT AN INVENTED ONE. `AllocateNode::paddingSizes_` was
+//! listed here as a sixth gap; **there is no such field**. `dsc2::AllocateNode` (`dsc/dsc2.h:974-1011`)
+//! carries `PaddingFormType padding_` (`:981`) and nothing else padding-shaped, and `paddingSizes_` is
+//! declared ONLY on `DataStructDims` (`dsc/dims.h:219`,
+//! `std::map<PrimaryDimTypes, DimPaddingSizes>`) — so EVERY ONE of its 24 reads in `ddc/ddcv1.cpp` is
+//! a read of a datastage BY TYPE, whatever the local is called (`coreDs.ss_` at `:580`, `dsChunk` at
+//! `:1961-1968`, `dataStageParam_.at(denId_).ss_` at `:2437`, `ds` at `:2512-2674`). That map is
+//! [`v1::StageSizes::stage_padding_sizes`], which is answered. So the gap was never a missing borrow
+//! or a missing field: [`v1::StageSizes::alloc_padding_sizes`] describes nothing, has zero production
+//! callers, and is to be DELETED from the trait in `ddc/v1.rs` rather than answered.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -383,8 +393,14 @@ impl v1::StageSizes for OffsetSizesOf<'_> {
         )
     }
 
-    /// `dataStageParam_.at(stage).ss_.paddingSizes_.at(dim)` — ⚠️ A DIFFERENT MAP FROM THE ONE ABOVE,
-    /// converted field for field from [`crate::schedule::l3::dsc::DimPadding`].
+    /// `dataStageParam_.at(stage).ss_.paddingSizes_.at(dim)` (`dsc/dims.h:219`) — converted field for
+    /// field from [`crate::schedule::l3::dsc::DimPadding`].
+    ///
+    /// ⭐⭐ THE **ONLY** `paddingSizes_` MAP THERE IS, which is why [`Self::alloc_padding_sizes`] above
+    /// is not "a different map" but no map at all: `paddingSizes_` is declared solely on
+    /// `DataStructDims`, so every read of it in `ddc/ddcv1.cpp` is a read of a STAGE by type. ⛔ AND
+    /// BOTH READERS READ A STAGE'S — the trait's doc used to draw a stage-vs-allocation split between
+    /// entries 259 and 260 and there is none, so no stop here turns on it.
     ///
     /// ⛔ [`None`] ALSO WHERE THE ENTRY NAMES NO WINDOW DIM: [`v1::PaddingSizes::window_dim`] is a bare
     /// [`PrimaryDim`] with no absent state, and the reference's `PrimaryDimTypesCount` IS the absence
