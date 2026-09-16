@@ -8,11 +8,35 @@
 //! their read-modify-write updates, the condition regions, the sync units under a loop, the corelet
 //! and core sets, the layout scales, the fresh allocation identity.
 //!
-//! ⛔ WHAT IS NOT falls into the same three buckets [`super::ddc_store`]'s header names — no COMPUTE
-//! arm, seven `l3::dsc`-dropped fields, and the `dsc/`/`util/foldManager/` seams — plus one more that
-//! is worth stating on its own: **[`crate::generated::DataConnect`] IS A CLOSED GENERATED SET**
-//! censused from `ddl_templates/*.ddl` at build time, so [`tu::MintedConnects::intern_connect`]
-//! cannot mint a connect the templates did not already name.
+//! ⛔ WHAT IS NOT falls into the same three buckets [`super::ddc_store`]'s header names — seven
+//! `l3::dsc`-dropped fields and the `dsc/`/`util/foldManager/` seams — plus one more that is worth
+//! stating on its own: **[`crate::generated::DataConnect`] IS A CLOSED GENERATED SET** censused from
+//! `ddl_templates/*.ddl` at build time, so [`tu::MintedConnects::intern_connect`] cannot mint a
+//! connect the templates did not already name.
+//!
+//! # ⛔⛔ *"NO COMPUTE ARM"* WAS THE THIRD BUCKET AND IT IS GONE — DO NOT WRITE IT AGAIN
+//!
+//! [`super::tree::Kind::Compute`] holds the whole [`crate::schedule::dsc2::ComputeNode`]
+//! (`stages/tree.rs:96`, landed in `c1f5c63fa`), and since `5ee670017` the DDL expansion mints into
+//! the **live** tree through [`super::ddc_sites`]' `add_compute`/`mint_compute`. Sixteen `todo!`s in
+//! this file refused *"no Compute arm"*; the arm was already being MATCHED at the bottom of this same
+//! file (`sched_node_of`). Every one of them has been reclassified in place. What is left splits into
+//! exactly three, and each remaining message says which:
+//!
+//! 1. **⛔ A FIELD OUR `dsc2::ComputeNode` DROPPED** — `isOpaqueOp_` (`dsc/dsc2.h:941`),
+//!    `repetitionWithOffset_` (`:954`), `inputCoordinates_`/`outputCoordinate_` (`:948-949`) — and on
+//!    `dsc2::DataInfo`, `loopEleOffsets_` (`:730-734`) and `constEleOffsets_` (`:727-729`). The FIELD
+//!    is the work; adding one is a `schedule/dsc2.rs` change, not a carrier change.
+//! 2. **⛔ THE ONE MISSING DOOR** — a `pub(super)` compute READ-MODIFY-WRITE on [`Dsc2Store`], the
+//!    exact shape [`Dsc2Store::edit_transfer`] already is for a transfer, plus a mint. `with_tree_mut`
+//!    is PRIVATE to [`super::ddc_store`] and [`Dsc2Store`]'s `state`/`dsc` fields are that module's,
+//!    so this file can READ the tree ([`Dsc2Store::with_tree`] is `pub(super)`) and cannot write a
+//!    compute into it. ⛔ THE FIX IS `edit_compute`/`mint_compute` BESIDE `edit_transfer`, NOT a
+//!    second view of `currDsc` here and NOT a new trait: every write-blocked `todo!` below names this.
+//! 3. **⛔ A SEAM** — `metadata.dataConnects_`/`externalNodes_`/`nodeCloningMap_` (the `Metadata` is
+//!    `run_v1`'s own local and is not one of `Dsc2Carriers`' borrows), and the `dsc/`,
+//!    `util/foldManager/` and `ddc/transformations/automatic_shuffle/` files outside this campaign's
+//!    list.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -234,13 +258,17 @@ impl tr::TransferLoads for Dsc2Store<'_, '_> {
         self.dsc2_corelets()
     }
 
-    /// ⛔ `getBlockTransferSize(*transferNode, src_.unit_, clId, false, true)` — a
-    /// `DesignSpaceConfig` accessor over the transfer's layout and the DSC's stick sizes.
+    /// ⛔ `getBlockTransferSize(*transferNode, src_.unit_, clId, false, true)`
+    /// (`dsc/designSpaceConfig.h:225`) — a `DesignSpaceConfig` accessor over the transfer's layout and
+    /// the DSC's stick sizes, and the SAME seam `conv::DdlSizes::block_transfer_size` and
+    /// `v1::ExploreTree::block_transfer_sizes` stop on. ⛔ UNPORTED, and it belongs to crustify: it is
+    /// a `dsc/` function outside this campaign's file list, not a fact this carrier is withholding.
     fn block_transfer_loads(&self, _transfer: NodeId, _corelet: Corelet) -> tr::Loads {
         todo!(
             "tr::TransferLoads::block_transfer_loads: wants \
-             getBlockTransferSize(transfer, src_.unit_, clId, false, true) — a DesignSpaceConfig \
-             accessor over the live super-DSC's stick sizes, a `dsc/` seam"
+             getBlockTransferSize(transfer, src_.unit_, clId, false, true) \
+             (dsc/designSpaceConfig.h:225) — a `dsc/` accessor over the live super-DSC's stick \
+             sizes, UNPORTED and outside this campaign's file list"
         )
     }
 }
@@ -337,7 +365,8 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
     ) -> Vec<(tr::LoopId, Vec<PrimaryDim>)> {
         todo!(
             "v1::LoopOffsets::src_loop_ele_offsets: wants \
-             srcLdsAndLoopOffsets_.loopEleOffsets_.at(corelet) — dsc2::DataInfo projects only \
+             srcLdsAndLoopOffsets_.loopEleOffsets_.at(corelet) (dsc/dsc2.h:730-734) — \
+             dsc2::DataInfo projects only \
              dataConnect_/myLdsIdx_/constantId_/latchDataId_, and loopEleOffsets_ lives on \
              v1::DataInfoFill (ddc/v1.rs:2127), which entry 260 writes into the SINK and not onto \
              the transfer node"
@@ -360,7 +389,11 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
         )
     }
 
-    /// ⛔ No COMPUTE arm — `inputsLdsAndLoopOffsets_` lives on the compute node.
+    /// ⛔ THE SAME SPLIT ON THE COMPUTE SIDE — `inputsLdsAndLoopOffsets_` (`dsc/dsc2.h:937`) IS
+    /// [`crate::schedule::dsc2::ComputeNode::inputs`], so this is NOT *"no Compute arm"*: it is
+    /// `loopEleOffsets_` (`dsc/dsc2.h:730-734`) missing from
+    /// [`crate::schedule::dsc2::DataInfo`], plus the write door. See
+    /// [`Self::src_loop_ele_offsets`].
     fn set_input_loop_ele_offset(
         &mut self,
         _node: NodeId,
@@ -373,7 +406,8 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
         todo!(
             "v1::LoopOffsets::set_input_loop_ele_offset: wants \
              inputsLdsAndLoopOffsets_.at(input).loopEleOffsets_[cl][dim_loop][dim] = offset — \
-             super::tree::Kind has no Compute arm"
+             loopEleOffsets_ (dsc/dsc2.h:730-734) is not a field of dsc2::DataInfo and there is no \
+             compute WRITE door; the Compute arm itself is present"
         )
     }
 }
@@ -389,21 +423,50 @@ impl tu::FifoResults for Dsc2Store<'_, '_> {
         )
     }
 
-    /// ⛔ `computeNode->isOpaqueOp_`.
+    /// ⛔ `computeNode->isOpaqueOp_` (`dsc/dsc2.h:941`) — ⛔⛔ A FIELD OUR
+    /// [`crate::schedule::dsc2::ComputeNode`] DROPPED, and NOT *"no Compute arm"*: the arm holds the
+    /// node, and this is the one bit of it this method wants.
+    ///
+    /// ⛔ AND IT MUST NOT BE INFERRED FROM `instrAttribute_`. An opaque body is the only thing that
+    /// fills `input_data_connects`/`output_data_connects` and the two register maps, so those look
+    /// like a proxy — but they are a CONSEQUENCE of opaqueness and `isOpaqueOp_` is the fact:
+    /// `dsc/dsc2.h:941` is its own `bool` beside them, an opaque with no declared ports is
+    /// spellable, and `false` here routes a FIFO result the reference repoints as an opaque input.
+    /// ⭐ THE WORK IS THE FIELD, cited, plus `op_opaque`'s own `true`
+    /// (`ddc/ddl/ddl_conversion.cpp` mints the node there).
     fn is_opaque(&self, _compute: NodeId) -> bool {
         todo!(
-            "tu::FifoResults::is_opaque: wants computeNode->isOpaqueOp_ (dsc/dsc2.h:941) — no \
-             Compute arm"
+            "tu::FifoResults::is_opaque: wants computeNode->isOpaqueOp_ (dsc/dsc2.h:941) — a \
+             dsc2::ComputeNode field OUR ComputeNode dropped; Kind::Compute holds the node. ⛔ Do \
+             not infer it from instrAttribute_'s port lists: those are a consequence of opaqueness, \
+             not the fact"
         )
     }
 
-    /// ⛔ The transfer's two ends AS ALLOCATION LOOKUPS — the lookup is
-    /// `getMutableAllocation(operand, storage)`, which reads `constantInfo_` on a constant end.
+    /// ⛔ The transfer's two ends AS [`crate::schedule::ddc::fold::StoredStream`]s.
+    ///
+    /// ⛔⛔ THE STATED REASON WAS WRONG AND THE BLOCKER IS A TYPE, NOT A PROJECTION. This used to
+    /// refuse because *"`getMutableAllocation(operand, storage)` reads `constantInfo_` … which
+    /// `l3::dsc::DesignSpaceConfig` does not project"*: it DOES project it
+    /// ([`crate::schedule::l3::dsc::ConstantInfo`]), [`Dsc2Store::allocation_at`] answers that call
+    /// on both arms, and [`tu::TransferEnds`] does not perform the lookup at all — it carries the two
+    /// ends and the ported unit looks them up.
+    ///
+    /// ⛔ WHAT ACTUALLY BLOCKS IT IS `StoredStream::storage`, WHICH IS A [`crate::units::DfirUnit`]
+    /// WHILE AN [`Operand`]'s IS A `SenComponents` — the same mismatch
+    /// [`crate::schedule::ddc::fold::Allocations::allocation`] names in the sibling file. [`DfirUnit`]
+    /// is the DataflowIR-bound SUBSET and spells no register file: `PELRF`, `SFPLRF`, `PTARF`,
+    /// `PTXRF`, `PTIRF` and `LRFREG` are all `dsc2::memories` a transfer end may live in and none has
+    /// a `DfirUnit` arm — and a FIFO result is exactly the register case this unit is about, so the
+    /// end that matters most is the one that cannot be spelled. `TransferEnds`' fields are not
+    /// optional, so there is nowhere to put that absence either.
     fn transfer_ends(&self, _transfer: NodeId) -> tu::TransferEnds {
         todo!(
-            "tu::FifoResults::transfer_ends: wants the transfer's ends as allocation lookups — \
-             getMutableAllocation(operand, storage) reads constantInfo_ on a constant end, which \
-             l3::dsc::DesignSpaceConfig does not project"
+            "tu::FifoResults::transfer_ends: wants the transfer's ends as fold::StoredStreams, whose \
+             `storage` is a units::DfirUnit while dsc2::Operand's is a SenComponent — DfirUnit \
+             spells no register file (PELRF/SFPLRF/PTARF/PTXRF/PTIRF/LRFREG are dsc2::memories with \
+             no arm), which is the very case a FIFO result lives in. NOT the constantInfo_ \
+             projection: l3::dsc::ConstantInfo carries it and Dsc2Store::allocation_at reads it"
         )
     }
 
@@ -428,11 +491,19 @@ impl tu::FifoResults for Dsc2Store<'_, '_> {
         self.edit_transfer(transfer, |held| held.src.storage = storage);
     }
 
-    /// ⛔ `computeConsumer->inputs_[i] = unit`.
+    /// ⛔ `computeConsumer->inputs_[i] = unit` (`dsc/dsc2.h:935`) — ⛔⛔ NOT *"no Compute arm"*, AND
+    /// THE CITATION WAS 29 LINES OFF: this said `dsc/dsc2.h:906`, which is
+    /// `InstrAttribute::indices_`. [`super::tree::Kind::Compute`] holds the node and
+    /// [`crate::schedule::dsc2::ComputeNode::inputs`] IS `inputs_` zipped with
+    /// `inputsLdsAndLoopOffsets_`, so the FACT is present and READABLE
+    /// ([`Dsc2Store::compute_of`]).
+    ///
+    /// ⛔ WHAT IS MISSING IS THE WRITE DOOR — see this file's header, *"THE ONE MISSING DOOR"*.
     fn set_compute_input_unit(&mut self, _compute: NodeId, _input: usize, _unit: SenComponent) {
         todo!(
             "tu::FifoResults::set_compute_input_unit: wants computeConsumer->inputs_[i] = unit \
-             (dsc/dsc2.h:906) — no Compute arm"
+             (dsc/dsc2.h:935) — the fact is on Kind::Compute and readable; what is missing is a \
+             pub(super) compute WRITE door on Dsc2Store (this file's header names it)"
         )
     }
 
@@ -456,7 +527,10 @@ impl tu::SkipRegResults for Dsc2Store<'_, '_> {
         self.edit_transfer(transfer, |held| held.src.data.latch_data_id = Some(id));
     }
 
-    /// ⛔ No COMPUTE arm.
+    /// ⛔ `inputsLdsAndLoopOffsets_.at(i).latchDataId_ = id` (`dsc/dsc2.h:937`, `:725`) — the FIELD IS
+    /// CARRIED ([`crate::schedule::dsc2::DataInfo::latch_data_id`], on
+    /// [`crate::schedule::dsc2::ComputeNode::inputs`]); only the write door is missing. See this
+    /// file's header, *"THE ONE MISSING DOOR"*.
     fn set_compute_input_latch_data_id(
         &mut self,
         _compute: NodeId,
@@ -465,7 +539,9 @@ impl tu::SkipRegResults for Dsc2Store<'_, '_> {
     ) {
         todo!(
             "tu::SkipRegResults::set_compute_input_latch_data_id: wants \
-             inputsLdsAndLoopOffsets_.at(i).latchDataId_ = id — no Compute arm"
+             inputsLdsAndLoopOffsets_.at(i).latchDataId_ = id (dsc/dsc2.h:937, :725) — the field is \
+             on Kind::Compute's own node; what is missing is a pub(super) compute WRITE door on \
+             Dsc2Store"
         )
     }
 
@@ -480,15 +556,21 @@ impl tu::SkipRegResults for Dsc2Store<'_, '_> {
         )
     }
 
-    /// ⛔ No COMPUTE arm.
+    /// ⛔ `computeNode->outputs_.resize(1)` (`dsc/dsc2.h:936`) THEN `at(0) = (unit, data)` alongside
+    /// `outputsLdsAndLoopOffsets_` (`:938`) — both halves are
+    /// [`crate::schedule::dsc2::ComputeNode::outputs`], which zips them. Only the write door is
+    /// missing; see this file's header.
     fn set_sole_compute_output(&mut self, _compute: NodeId, _unit: SenComponent, _data: DataInfo) {
         todo!(
-            "tu::SkipRegResults::set_sole_compute_output: wants computeNode->outputs_.resize(1) then \
-             at(0) = (unit, data) — no Compute arm"
+            "tu::SkipRegResults::set_sole_compute_output: wants computeNode->outputs_.resize(1) \
+             (dsc/dsc2.h:936) then at(0) = (unit, data) with outputsLdsAndLoopOffsets_ (:938) — \
+             ComputeNode::outputs zips both; what is missing is a pub(super) compute WRITE door on \
+             Dsc2Store"
         )
     }
 
-    /// ⛔ No COMPUTE arm.
+    /// ⛔ `computeNode->inputs_.resize(i + 1)` (`dsc/dsc2.h:935`) THEN `at(i) = (unit, data)` with
+    /// `inputsLdsAndLoopOffsets_` (`:937`) — the same zipped pair, and the same missing write door.
     fn resize_compute_inputs_to(
         &mut self,
         _compute: NodeId,
@@ -497,8 +579,10 @@ impl tu::SkipRegResults for Dsc2Store<'_, '_> {
         _data: DataInfo,
     ) {
         todo!(
-            "tu::SkipRegResults::resize_compute_inputs_to: wants \
-             computeNode->inputs_.resize(i + 1) then at(i) = (unit, data) — no Compute arm"
+            "tu::SkipRegResults::resize_compute_inputs_to: wants computeNode->inputs_.resize(i + 1) \
+             (dsc/dsc2.h:935) then at(i) = (unit, data) with inputsLdsAndLoopOffsets_ (:937) — \
+             ComputeNode::inputs zips both; what is missing is a pub(super) compute WRITE door on \
+             Dsc2Store"
         )
     }
 }
@@ -518,8 +602,27 @@ impl tu::MintedConnects for Dsc2Store<'_, '_> {
 }
 
 impl tu::ExternalStreams for Dsc2Store<'_, '_> {
-    /// ⛔ `storageOrDatastreamIsExternal(dataInfo, storage, isIncoming)` — reads
-    /// `externalDataStreams_`, a `DesignSpaceConfig` field `l3::dsc` does not project.
+    /// ⛔ `storageOrDatastreamIsExternal(dataInfo, storage, isIncoming)`
+    /// (`ddc/ddc_transformation_util.cpp:1651-1683`).
+    ///
+    /// ⛔⛔ THERE IS NO `externalDataStreams_` — THAT FIELD DOES NOT EXIST. This used to refuse
+    /// naming it as *"a `DesignSpaceConfig` field `l3::dsc` does not project"*; the spelling has ZERO
+    /// occurrences in the whole reference. The function reads exactly two things, and neither is it:
+    ///
+    ///   * `getAllocation(dataInfo, storage, true)` then `isExternalNode(allocNode)` (`:1657-1658`) —
+    ///     ⭐ THE FIRST HALF IS ANSWERED, by [`Dsc2Store::allocation_at`];
+    ///   * `metadata.dataConnects_.at(dc)`'s `producers_` or `consumers_`, each tested against
+    ///     `externalNodes_` (`:1668-1681`).
+    ///
+    /// ⛔ SO THE BLOCKER IS THE `Metadata`, AND IT IS ALREADY PORTED ELSEWHERE:
+    /// [`tu::storage_or_datastream_is_external`] IS entry 120
+    /// (`ddc/transformation_util.rs:1290`), it takes `&Metadata` and a
+    /// [`tu::CensusNodes`], and this trait's own doc says a carrier *"states [`tu::CensusNodes`]
+    /// beside its allocations and delegates"*. `Dsc2Store` is handed no `Metadata` — it is `run_v1`'s
+    /// own local — so the one line that would answer this cannot be written yet. ⛔ AND A `false`
+    /// HERE WOULD NOT BE CONSERVATIVE: entries 253-256/305/306/341/361 take it as *"this stream is
+    /// internal, transform it"*, so it would transform the external nodes another stage already
+    /// filled.
     fn storage_or_datastream_is_external(
         &self,
         _data: DataInfo,
@@ -527,9 +630,11 @@ impl tu::ExternalStreams for Dsc2Store<'_, '_> {
         _direction: tu::StreamDirection,
     ) -> bool {
         todo!(
-            "tu::ExternalStreams::storage_or_datastream_is_external: wants \
-             storageOrDatastreamIsExternal(dataInfo, storage, isIncoming), which reads \
-             externalDataStreams_ — not projected onto l3::dsc::DesignSpaceConfig"
+            "tu::ExternalStreams::storage_or_datastream_is_external: entry 120 is ALREADY PORTED as \
+             tu::storage_or_datastream_is_external (ddc/transformation_util.rs:1290) and this impl \
+             need only delegate — but it takes &Metadata for externalNodes_/dataConnects_ \
+             (ddc/ddc_transformation_util.cpp:1657-1681) and Dsc2Store is handed none; the Metadata \
+             is run_v1's own local. NOT `externalDataStreams_`, which does not exist"
         )
     }
 }
@@ -594,15 +699,34 @@ impl tu::TransferMoves for Dsc2Store<'_, '_> {
         self.with_tree(|tree| tree.node_of_alloc(alloc))
     }
 
-    /// ⛔ `condNode->clone()` — a DETACHED copy with its regions still to be added, and
-    /// [`super::tree::Cond`] holds its regions as links INTO this tree, so a detached clone of one
-    /// has no state to carry.
+    /// ⛔ `condNode->clone()` — a DETACHED copy with its regions still to be added.
+    ///
+    /// ⛔⛔ THE OBJECTION WAS WRONG AND THE AUTHORITY SETTLES IT OUTRIGHT. This used to refuse saying
+    /// *"cloning one means deciding what the copy's regions name, which is entry 249's decision and
+    /// not this carrier's"*. IT IS NOT A DECISION: `BlockNode::next_` is a
+    /// `VectorOfChildren`, whose COPY CONSTRUCTOR IS `VectorOfChildren(const VectorOfChildren&) {}`
+    /// — *"do nothing on purpose … when copying, it is up to the caller to manually insert copies of
+    /// the children"* (`dsc/dsc2.h:529-537`). So `clone()` yields `loopCond_` and `coreClCond_`
+    /// copied and `next_` EMPTY, and entry 249 fills both regions with fresh blocks immediately
+    /// afterwards (`ddc/transformation_util.rs:3115-3119`).
+    ///
+    /// ⛔ WHAT BLOCKS IT IS THE MINTER, AND IT IS ONE LINE IN THE SIBLING FILE.
+    /// [`Dsc2Store::new_core_cl_condition`] is the only `pub(super)` condition minter and it hardcodes
+    /// `loop_cond: None` / `cores: Some(..)`. Every condition entry 249 clones is LOOP-guarded (they
+    /// come out of its `loop_conditions` list and it negates their `loopCond_` two statements later),
+    /// so the clone must carry `cores: None` — and `Some(CoreClSet::default())` is NOT the same
+    /// state: [`v1::ConditionSimplification::has_core_cl_cond`] is `core_cl_cond(..).is_some()` in the
+    /// sibling file, so an empty-but-present set would answer *"this is core/corelet-guarded"* for a
+    /// loop-guarded clone. ⛔ THE FIX IS A `clone_condition_node` BESIDE `new_core_cl_condition` that
+    /// copies the whole [`super::tree::Cond`] with both regions empty.
     fn clone_condition(&mut self, _condition: NodeId) -> NodeId {
         todo!(
-            "tu::TransferMoves::clone_condition: wants condNode->clone() as a DETACHED copy — \
-             super::tree::Cond holds its then/else regions as NodeIds of this tree, so cloning one \
-             means deciding what the copy's regions name, which is entry 249's decision and not this \
-             carrier's"
+            "tu::TransferMoves::clone_condition: the copy's regions are EMPTY, not a decision — \
+             VectorOfChildren's copy ctor is `{{}}`, \"do nothing on purpose … it is up to the caller \
+             to manually insert copies of the children\" (dsc/dsc2.h:529-537). What is missing is a \
+             pub(super) minter that copies the whole tree::Cond with empty regions: \
+             new_core_cl_condition forces `cores: Some(..)`, and Some(empty) makes \
+             has_core_cl_cond answer true for a LOOP-guarded clone"
         )
     }
 
@@ -697,11 +821,16 @@ impl tr::Splat4bRead for Dsc2Store<'_, '_> {
         })
     }
 
-    /// ⛔ No COMPUTE arm.
+    /// ⛔ `new dsc2::ComputeNode()` UNPARENTED — ⛔⛔ NOT *"no Compute arm"*: the arm holds the whole
+    /// node and [`super::ddc_sites`]' `conv::ScheduleWrites::mint_compute` ALREADY DOES EXACTLY THIS
+    /// (`TreeData::add` with no parent) for the DDL expansion. Only the door is missing from
+    /// [`Dsc2Store`]; see this file's header.
     fn mint_compute(&mut self, _node: ComputeNode) -> NodeId {
         todo!(
-            "tr::Splat4bRead::mint_compute: wants new dsc2::ComputeNode() unparented — \
-             super::tree::Kind has no Compute arm"
+            "tr::Splat4bRead::mint_compute: wants new dsc2::ComputeNode() unparented — Kind::Compute \
+             holds it and ddc_sites' conv::ScheduleWrites::mint_compute already mints one this way; \
+             what is missing is that same door on Dsc2Store, whose with_tree_mut is private to \
+             ddc_store"
         )
     }
 
@@ -712,14 +841,35 @@ impl tr::Splat4bRead for Dsc2Store<'_, '_> {
 }
 
 impl tr::SpreadTransfers for Dsc2Store<'_, '_> {
-    /// ⛔ `allocNode->gapStickSpread_.empty()` negated (`dsc/dsc2.h:995`) — a `ddc`-view
-    /// `AllocateNode` field, and entry 300 (its only writer) has its single callsite inside `#if 0`
-    /// (`ddc/ddcv1.cpp:3735-3752`), so nothing in this pipeline ever fills it.
+    /// ⛔ `allocNode->gapStickSpread_.empty()` negated (`dsc/dsc2.h:1006`) — a `ddc`-view
+    /// `AllocateNode` field [`crate::schedule::l3::dl_ops::L3AllocateNode`] does not carry.
+    ///
+    /// ⛔⛔ TWO CORRECTIONS, AND THE SECOND ONE MATTERS: THE FIELD IS **NOT DEAD**. This used to say
+    /// *"entry 300 (its only writer) has its single callsite inside `#if 0`
+    /// (`ddc/ddcv1.cpp:3735-3752`), so nothing in this pipeline ever fills it"*. That `#if 0` block is
+    /// real, but it wraps `packStickDim()` and the `peSfpSplit_` clearing — NOT this field's writer.
+    /// `gapStickSpread_` has FOUR live writers:
+    ///
+    ///   * `ddc/ddc_transformation.cpp:1380` — entry 108's `alloc->gapStickSpread_[dim] = spread`,
+    ///     reached from `cloneForOffsetAdjustment()` at `ddc/ddcv1.cpp:3732`, one line ABOVE the
+    ///     `#if 0`; it is [`tr::OffsetAdjustment::set_gap_stick_spread`] in this same file;
+    ///   * `ddc/ddc_transformation.cpp:1132-1135` — three more, on an intrinsic's in/out/internal
+    ///     allocations;
+    ///   * `ddc/ddcv1.cpp:1704` — `gapStickSpread_[layoutDimOrder_.at(0)] = 8`.
+    ///
+    /// ⛔ AND IT SCALES EXTENTS, so a dropped one is not a dropped annotation: `dsc/dsc2.cpp:3958-3961`
+    /// DIVIDES each `sizePerDim` entry by the spread and `:2882-2892` MULTIPLIES
+    /// `unitView.sizesNoGaps_` and each loop's `elemOffset_` by it, and `dsc/dsc2.cpp:926` puts it on
+    /// the wire. ⛔ SO A `false` HERE WOULD BE A FABRICATED EXTENT: entry 341 reads it to decide
+    /// whether a transfer's two ends agree, and answering *"no spread"* for an allocation entry 108
+    /// spread would move the wrong element count.
     fn has_gap_stick_spread(&self, _alloc: AllocId) -> bool {
         todo!(
             "tr::SpreadTransfers::has_gap_stick_spread: wants allocNode->gapStickSpread_ \
-             (dsc/dsc2.h:995) — a ddc-view AllocateNode field that l3::dl_ops::L3AllocateNode does \
-             not carry; its only writer (entry 300) is behind `#if 0` at ddc/ddcv1.cpp:3735-3752"
+             (dsc/dsc2.h:1006) — a ddc-view AllocateNode field l3::dl_ops::L3AllocateNode does not \
+             carry, and it is LIVE: four writers (ddc/ddc_transformation.cpp:1380 is entry 108's, \
+             reached from ddcv1.cpp:3732; :1132-1135; ddcv1.cpp:1704) and it scales extents at \
+             dsc/dsc2.cpp:3958-3961 and :2882-2892"
         )
     }
 }
@@ -754,39 +904,64 @@ impl tr::PeSfpWorkSplit for Dsc2Store<'_, '_> {
     }
 
     /// ⛔ `traverseTreeDFSMutable(nullptr, {ALLOCATE, TRANSFER, COMPUTE}, ..)` as
-    /// [`tr::PeSfpSplitNode`]s — a PARTIAL walk that omitted the compute arm would silently split
-    /// only half the nodes, so the absence is named rather than narrowed.
+    /// [`tr::PeSfpSplitNode`]s.
+    ///
+    /// ⛔⛔ THE COMPUTE ARM IS NO LONGER WHAT BLOCKS THIS — all three kinds are kinds this tree holds,
+    /// and the walk is one DFS over [`super::tree::TreeData::dfs`]. What is missing is the ALLOCATE
+    /// arm's SECOND field: [`tr::PeSfpSplitNode::Allocate`] carries a
+    /// [`tr::SkipMetadataUpdate`], which is `allocNode->tempStorageForCompute_ != nullptr`
+    /// (`dsc/dsc2.h:978`), and [`crate::schedule::l3::dl_ops::L3AllocateNode`] does not carry that
+    /// pointer — the same field [`tu::AllocateCloning::set_temp_storage_for_compute`] stops on in the
+    /// sibling file. ⛔ AND `SkipMetadataUpdate::No` WOULD NOT BE A SAFE DEFAULT: it is what makes
+    /// entry 118 REGISTER the clone in `metadata.newAllocations_`, so guessing it for a temp-storage
+    /// allocation would file an allocation the reference deliberately keeps out of the tracker.
     fn split_candidates(&self) -> Vec<tr::PeSfpSplitNode> {
         todo!(
-            "tr::PeSfpWorkSplit::split_candidates: wants the {{ALLOCATE, TRANSFER, COMPUTE}} walk as \
-             PeSfpSplitNodes — super::tree::Kind has no Compute arm, and a walk that dropped that \
-             arm would split only some of the nodes"
+            "tr::PeSfpWorkSplit::split_candidates: the {{ALLOCATE, TRANSFER, COMPUTE}} walk is now \
+             one DFS over kinds this tree holds; what is missing is PeSfpSplitNode::Allocate's \
+             SkipMetadataUpdate, which is allocNode->tempStorageForCompute_ != nullptr \
+             (dsc/dsc2.h:978) and l3::dl_ops::L3AllocateNode does not carry it"
         )
     }
 }
 
 impl tr::OffsetAdjustment for Dsc2Store<'_, '_> {
-    /// ⛔ `node->repetitionWithOffset_.forOutputs_` — a COMPUTE-node field.
+    /// ⛔ `node->repetitionWithOffset_.forOutputs_` (`dsc/dsc2.h:954`, the struct at `:950-953`) — ⛔⛔
+    /// A FIELD OUR [`crate::schedule::dsc2::ComputeNode`] DROPPED, and NOT *"no Compute arm"*: the
+    /// arm holds the node and this is the one field of it entry 108 reads that is not there.
+    ///
+    /// ⛔ AN EMPTY VECTOR IS THE ONE ANSWER THAT MUST NOT BE GIVEN: entry 108 loops `1..spread` over
+    /// each entry, so empty means *"no output repeats"* and the whole pass does nothing — no clones,
+    /// no `gapStickSpread_`, and the spread that scales extents at `dsc/dsc2.cpp:3958` never
+    /// happens. ⭐ THE WORK IS `RepetitionWithOffset` ON `dsc2::ComputeNode` (`forInputs_` and
+    /// `forOutputs_`, both `std::vector<int>`), plus the DDL conversion's own default.
     fn output_repetitions(&self, _node: NodeId) -> Vec<tr::Repetition> {
         todo!(
             "tr::OffsetAdjustment::output_repetitions: wants \
-             node->repetitionWithOffset_.forOutputs_ (dsc/dsc2.h:950) — no Compute arm"
+             node->repetitionWithOffset_.forOutputs_ (dsc/dsc2.h:954) — a dsc2::ComputeNode field \
+             OUR ComputeNode dropped; Kind::Compute holds the node. An empty vector would make \
+             entry 108 do nothing at all"
         )
     }
 
-    /// ⛔ No COMPUTE arm.
+    /// ⛔ `node->clone()` placed after `node` — the CLONE is the missing door, not the arm:
+    /// [`tu::NodeCloning`] in the sibling file already answers this shape for a TRANSFER. See this
+    /// file's header, *"THE ONE MISSING DOOR"*.
     fn clone_compute_after(&mut self, _node: NodeId) -> NodeId {
         todo!(
-            "tr::OffsetAdjustment::clone_compute_after: wants node->clone() placed after node — no \
-             Compute arm"
+            "tr::OffsetAdjustment::clone_compute_after: wants node->clone() placed after node — \
+             Kind::Compute holds the body to clone; what is missing is a pub(super) compute mint/\
+             insert door on Dsc2Store, beside the transfer one tu::NodeCloning already uses"
         )
     }
 
-    /// ⛔ No COMPUTE arm.
+    /// ⛔ `repetitionWithOffset_.forOutputs_.at(idx) = reps` (`dsc/dsc2.h:954`) — BOTH halves are
+    /// missing: the field ([`Self::output_repetitions`]) and the write door.
     fn set_output_repetition(&mut self, _node: NodeId, _idx: tr::OutputIdx, _reps: tr::Repetition) {
         todo!(
             "tr::OffsetAdjustment::set_output_repetition: wants \
-             repetitionWithOffset_.forOutputs_.at(idx) = reps — no Compute arm"
+             repetitionWithOffset_.forOutputs_.at(idx) = reps (dsc/dsc2.h:954) — the field is not on \
+             our dsc2::ComputeNode (see output_repetitions) and there is no compute WRITE door"
         )
     }
 
@@ -839,12 +1014,16 @@ impl tr::OffsetAdjustment for Dsc2Store<'_, '_> {
         })
     }
 
-    /// ⛔ `alloc->gapStickSpread_[dim] = spread` — the same field
-    /// [`tr::SpreadTransfers::has_gap_stick_spread`] names, whose only writer is behind `#if 0`.
+    /// ⛔ `alloc->gapStickSpread_[dim] = spread` (`ddc/ddc_transformation.cpp:1380`,
+    /// `dsc/dsc2.h:1006`) — ⭐ THIS IS THE LIVE WRITER
+    /// [`tr::SpreadTransfers::has_gap_stick_spread`]'s corrected note names, reached from
+    /// `cloneForOffsetAdjustment()` (`ddc/ddcv1.cpp:3732`) and NOT from anything behind `#if 0`.
+    /// [`crate::schedule::l3::dl_ops::L3AllocateNode`] does not carry the map.
     fn set_gap_stick_spread(&mut self, _alloc: AllocId, _dim: PrimaryDim, _spread: tr::StickSpread) {
         todo!(
             "tr::OffsetAdjustment::set_gap_stick_spread: wants allocNode->gapStickSpread_[dim] = \
-             spread (dsc/dsc2.h:995) — a ddc-view field l3::dl_ops::L3AllocateNode does not carry"
+             spread (ddc/ddc_transformation.cpp:1380, dsc/dsc2.h:1006) — a ddc-view field \
+             l3::dl_ops::L3AllocateNode does not carry, and this callsite IS live"
         )
     }
 }
@@ -885,8 +1064,17 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
         (ops.len() == 1).then_some(crate::schedule::ddl::conversion::ComputeOpIdx(0))
     }
 
-    /// ⛔ `computeOp_.back().interimLabeledDs.push_back(..)` — `interimLabeledDs` is not a field of
+    /// ⛔ `computeOp_.back().interimLabeledDs.push_back(&labeledDs_[lds])`
+    /// (`ddc/ddc_transformation.cpp:1909`) — `interimLabeledDs` (`dsc/dscdefn.h:508`, *"for partial
+    /// results and other tensors that live only"* inside the op) is not a field of
     /// [`v1::DscComputeOp`], which projects the five entries 307/308 read.
+    ///
+    /// ⛔ THE MISSING FIELD IS THE WORK, AND IT IS LOAD-BEARING RATHER THAN BOOKKEEPING — four live
+    /// readers: `ddc/ddc_transformation_util.cpp:1842` and `ddc/ddl/ddl_conversion.cpp:523` walk it,
+    /// `dsc/superdsc.cpp:1585` feeds it to `insertLdsIdx`, and `dsc/designSpaceConfig.cpp:6738-6741`
+    /// puts it ON THE WIRE (with `:7495-7496` reading it back). ⭐ SO THE PORT IS
+    /// `DscComputeOp::interim: Vec<LdsIdx>` beside its `inputs`/`outputs` — the SAME shape, since
+    /// those two are *"as the indices those pointers carry"* — plus the emitter row.
     fn add_interim_lds(
         &mut self,
         _compute_op: crate::schedule::ddl::conversion::ComputeOpIdx,
@@ -894,8 +1082,10 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
     ) {
         todo!(
             "tr::AutoShuffling::add_interim_lds: wants \
-             computeOp_.back().interimLabeledDs.push_back(&labeledDs_[lds]) — interimLabeledDs is \
-             not a field of v1::DscComputeOp"
+             computeOp_.back().interimLabeledDs.push_back(&labeledDs_[lds]) \
+             (ddc/ddc_transformation.cpp:1909) — interimLabeledDs (dsc/dscdefn.h:508) is not a field \
+             of v1::DscComputeOp; it has four live readers and goes on the wire \
+             (dsc/designSpaceConfig.cpp:6738)"
         )
     }
 
@@ -908,7 +1098,8 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
     fn insert_allocate(&mut self, _alloc: AllocId, _node: tu::DdcAllocateNode, _at: tu::InsertionPoint) {
         todo!(
             "tr::AutoShuffling::insert_allocate: wants the held DdcAllocateNode handed to the tree \
-             (shuffle.h:175) — super::tree::Kind::Allocate holds the L3 view"
+             (ddc/transformations/automatic_shuffle/shuffle.h:175, DataEdge::insert_before) — \
+             super::tree::Kind::Allocate holds the L3 view"
         )
     }
 
@@ -917,11 +1108,15 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
         self.add_user_to(alloc, user);
     }
 
-    /// ⛔ No COMPUTE arm.
+    /// ⛔ `new dsc2::ComputeNode(*assign)` PLACED BEFORE `assign` — ⛔⛔ NOT *"no Compute arm"*: the
+    /// caller HANDS the whole [`crate::schedule::dsc2::ComputeNode`] in, and
+    /// [`tu::InsertionPoint::Before`] is a placement [`super::tree::TreeData::link`] already makes.
+    /// Only the write door is missing; see this file's header.
     fn insert_compute_before(&mut self, _node: ComputeNode, _before: NodeId) -> NodeId {
         todo!(
             "tr::AutoShuffling::insert_compute_before: wants new dsc2::ComputeNode(*assign) placed \
-             before `assign` — no Compute arm"
+             before `assign` — the body is handed in and TreeData::link already places Before; what \
+             is missing is a pub(super) compute mint/insert door on Dsc2Store"
         )
     }
 
@@ -964,21 +1159,24 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
 
     /// ⛔⛔ THE `dataFormat_` HALF IS NOW CARRIED AND `stickRepl_` IS WHAT IS LEFT.
     /// [`crate::schedule::ddc::shuffle::OperandSticks::primary_stick_repl`] is
-    /// `primaryDsInfo_.at(dsType_).stickRepl_` (`shuffle.cpp:805-813`), which
+    /// `primaryDsInfo_.at(dsType_).stickRepl_`
+    /// (`ddc/transformations/automatic_shuffle/shuffle.cpp:805-813`), which
     /// [`crate::schedule::l3::dsc::PrimaryDsInfo`] projects as neither of its two fields and which
     /// scratchy emits nowhere — `primaryDsInfo_` on the wire is `layoutDimOrder_`/`stickDimOrder_`/
     /// `stickSize_` and nothing else.
     ///
     /// ⛔ AND AN EMPTY LIST WOULD NOT BE ITS ABSENCE: `all_one` (entry 159) is
     /// [`crate::schedule::ddc::shuffle::AutoShuffler::infer_layouts`]' own `DT_CHECK`
-    /// (`shuffle.cpp:1043-1045`), which an empty `stickRepl_` PASSES — so a fresh empty vector here
-    /// would assert *"nothing is replicated"* for an operand that may well be, and it would compile.
+    /// (`ddc/transformations/automatic_shuffle/shuffle.cpp:1043-1045`), which an empty `stickRepl_`
+    /// PASSES — so a fresh empty vector here would assert *"nothing is replicated"* for an operand
+    /// that may well be, and it would compile.
     fn operand_sticks(&self, _dinfo: DataInfo) -> Option<crate::schedule::ddc::shuffle::OperandSticks> {
         todo!(
             "tr::AutoShuffling::operand_sticks: wants primaryDsInfo_.at(dsType_).stickRepl_ \
-             (shuffle.cpp:805-813), which l3::dsc::PrimaryDsInfo does not project and scratchy's \
-             primaryDsInfo_ does not emit — an EMPTY stickRepl_ PASSES all_one's DT_CHECK, so it \
-             would assert 'nothing is replicated' for an operand that may be"
+             (ddc/transformations/automatic_shuffle/shuffle.cpp:805-813), which \
+             l3::dsc::PrimaryDsInfo does not project and scratchy's primaryDsInfo_ does not emit — \
+             an EMPTY stickRepl_ PASSES all_one's DT_CHECK, so it would assert 'nothing is \
+             replicated' for an operand that may be"
         )
     }
 
@@ -997,7 +1195,12 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
         self.alloc_has_parent(alloc)
     }
 
-    /// ⛔ No COMPUTE arm — `{inputs,outputs}LdsAndLoopOffsets_` live on the compute node.
+    /// ⛔ `node->{inputs,outputs}LdsAndLoopOffsets_[pos].constEleOffsets_ = offsets`
+    /// (`ddc/transformations/automatic_shuffle/shuffle.cpp:881-896`) — ⛔⛔ NOT *"no Compute arm"*:
+    /// the arm holds the node and `{inputs,outputs}LdsAndLoopOffsets_` (`dsc/dsc2.h:937-938`) are
+    /// [`crate::schedule::dsc2::ComputeNode`]'s own `inputs`/`outputs`. BOTH other halves are
+    /// missing: `constEleOffsets_` (`dsc/dsc2.h:727-729`, per core AND corelet) is not a field of
+    /// [`crate::schedule::dsc2::DataInfo`], which projects four, and there is no compute write door.
     fn set_const_ele_offsets(
         &mut self,
         _node: NodeId,
@@ -1007,7 +1210,9 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
         todo!(
             "tr::AutoShuffling::set_const_ele_offsets: wants \
              node->{{inputs,outputs}}LdsAndLoopOffsets_[pos].constEleOffsets_ = offsets \
-             (shuffle.cpp:881-896) — no Compute arm"
+             (ddc/transformations/automatic_shuffle/shuffle.cpp:881-896) — constEleOffsets_ \
+             (dsc/dsc2.h:727-729) is not a field of dsc2::DataInfo, and there is no compute WRITE \
+             door; the Compute arm itself is present"
         )
     }
 }
@@ -1027,12 +1232,24 @@ impl crate::schedule::ddc::fold::FoldConstruction for Dsc2Store<'_, '_> {
 
 impl crate::schedule::ddc::fold::CoordinateCapture for Dsc2Store<'_, '_> {
     /// ⛔ `traverseTreeDFSMutable(nullptr, {ALLOCATE, COMPUTE, TRANSFER})` as
-    /// [`crate::schedule::ddc::fold::CapturedNode`]s — its compute arm again.
+    /// [`crate::schedule::ddc::fold::CapturedNode`]s.
+    ///
+    /// ⛔⛔ NOT THE COMPUTE ARM — all three kinds are kinds this tree holds. What is missing is the
+    /// COMPUTE arm's COORDINATES: it carries `inputs: Vec<Coordinate>` for `inputCoordinates_`
+    /// (`dsc/dsc2.h:948`) and `output: Coordinate` for `outputCoordinate_` (`:949`), which are PER
+    /// OPERAND, while [`super::tree::TreeData::coordinate`] holds exactly ONE coordinate per node —
+    /// the shape an `allocateCoordinates_` or a `transferCoordinates_` needs. ⛔ A ONE-ENTRY `inputs`
+    /// OR A DEFAULT `output` WOULD BE A FABRICATED FOLD COORDINATE, which is what entry 375 reports
+    /// against.
+    ///
+    /// ⛔ AND THIS SITS BEHIND [`crate::schedule::ddc::fold::FoldConstruction::build_and_propagate_fold`]
+    /// ANYWAY: nothing has built the fold space these coordinates would come out of.
     fn captured_nodes(&self) -> Vec<crate::schedule::ddc::fold::CapturedNode> {
         todo!(
-            "fold::CoordinateCapture::captured_nodes: wants the {{ALLOCATE, COMPUTE, TRANSFER}} walk \
-             as CapturedNodes — no Compute arm, and a walk missing that arm would report a capture \
-             over only part of the tree"
+            "fold::CoordinateCapture::captured_nodes: the {{ALLOCATE, COMPUTE, TRANSFER}} walk is \
+             over kinds this tree holds; what is missing is the Compute arm's PER-OPERAND \
+             inputCoordinates_ (dsc/dsc2.h:948) and outputCoordinate_ (:949) — TreeData::coordinate \
+             holds one per NODE — and buildAndPropagateFold has not run"
         )
     }
 
@@ -1153,15 +1370,36 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
         }
     }
 
-    /// ⛔ `traverseTreeDFSMutable(nullptr, {COMPUTE, TRANSFER})` as entry 002 censuses it — the
-    /// census keys every operand by its `dataConnect_`, and [`DataConnect`] is the generated closed
-    /// set [`tu::MintedConnects::intern_connect`] names.
+    /// ⛔ `traverseTreeDFSMutable(nullptr, {COMPUTE, TRANSFER})` as entry 002 censuses it
+    /// (`ddc/ddcv1.cpp:3283-3317`).
+    ///
+    /// ⛔⛔ BOTH OF THE OLD REASONS ARE GONE AND THE REAL ONE IS AN `Option`. This said *"a generated
+    /// closed set no transfer of this tree carries a variant of yet, and its Compute arm needs a
+    /// COMPUTE node"*: the arm exists, and the DDL conversion DOES fill
+    /// [`crate::schedule::dsc2::DataInfo::data_connect`] — `ddl/conversion.rs:2929` writes
+    /// `resolved.operand.data.data_connect = Some(data_connect)`, and
+    /// [`crate::schedule::dsc2::InstrAttribute`] already carries both opaque port lists
+    /// (`dsc/dsc2.h:936-939`) the Compute arm's `opaque_reads`/`opaque_writes` want.
+    ///
+    /// ⛔ WHAT BLOCKS IT IS THAT
+    /// [`crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Reads::data_connect`] IS A BARE
+    /// [`DataConnect`] WHILE `dsc2::DataInfo`'S IS AN [`Option`], and the DDL's own
+    /// `data_connect=` is optional too (`ddl/conversion.rs:4431-4432`). The reference keys the
+    /// UNNAMED case: `dataConnect_` is a `std::string` defaulting to `""`, `dcMap[""]` is a real
+    /// entry, and the census' closing check then reports
+    /// `DT_ERROR("Illegal DDL: data_connect  does not have any producer.")` for it
+    /// (`ddc/ddcv1.cpp:3319-3325`). ⛔ SO DROPPING THE UNNAMED OPERANDS IS NOT A NARROWING — it
+    /// deletes the one diagnostic the census exists to produce, and
+    /// [`crate::bridges::superdsc_to_dataflow_ir::shape_constraints::DataConnects::NoProducer`] has no
+    /// value to name the offender with. ⭐ THE FIX IS `Reads::data_connect: Option<DataConnect>`
+    /// (and the same on both `dsts`/`outputs` lists), in `shape_constraints.rs`.
     fn census_nodes(&self) -> Vec<ScheduleNode> {
         todo!(
-            "v1::Dsc2Store::census_nodes: wants the {{COMPUTE, TRANSFER}} walk as \
-             shape_constraints::ScheduleNodes — every operand keyed by its dataConnect_, which is a \
-             generated closed set no transfer of this tree carries a variant of yet, and its Compute \
-             arm needs a COMPUTE node"
+            "v1::Dsc2Store::census_nodes: the {{COMPUTE, TRANSFER}} walk is over kinds this tree \
+             holds and the DDL fills data_connect (ddl/conversion.rs:2929); what blocks it is \
+             shape_constraints::Reads::data_connect being a bare DataConnect while dsc2::DataInfo's \
+             is an Option — the reference keys dcMap[\"\"] and REPORTS on it \
+             (ddc/ddcv1.cpp:3319-3325), so dropping unnamed operands deletes that diagnostic"
         )
     }
 
