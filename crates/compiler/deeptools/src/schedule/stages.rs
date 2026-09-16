@@ -193,7 +193,7 @@ pub fn run_l3<const CHUNK_EXPLORE: bool, A: crate::arch::Arch>(
     coords: &l3::dl_ops::AddressFoldCoords,
 ) -> Option<()> {
     let reads = Reads::new(state, ops).with_compute_ops(computes);
-    let placement = Placement::of(state, coords.clone());
+    let placement = Placement::of(state, coords.clone(), A::BYTES_PER_STICK);
     let inputs = l3::dl_ops::L3RunInputs {
         reads: &reads,
         placement: &placement,
