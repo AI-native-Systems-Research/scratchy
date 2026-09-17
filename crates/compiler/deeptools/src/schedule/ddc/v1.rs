@@ -1362,8 +1362,9 @@ impl Density {
 /// and `stage_padding_dims`, and reaches no other way. The two must merge, and the merge is
 /// DELETING THIS ONE along with the carrier layer — not widening it. What it drops is the
 /// `unneededPad` triple, and that triple is not optional: `carryUnneededPadToChunk` is `true`
-/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:48`), so the one place that would clear it (`:144`)
-/// never runs and the counts travel from the core data stage to the chunk one intact.
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:48`), which stills that file's clear (`:144`) — but
+/// `ddc/ddcv1.cpp:1170-1171` clears the triple UNGUARDED, so the counts a chunk stage carries are a
+/// fact of its own and not a copy of the core stage's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaddingSizes {
     /// `windowDim_`.

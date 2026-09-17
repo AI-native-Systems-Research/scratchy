@@ -869,11 +869,12 @@ impl SuperDsc {
 pub struct PadElems(pub u32);
 
 /// A DIM'S FRONT AND BACK PADDING — `padFront_`/`padBack_` (`dsc/dims.h:135-136`), whose paired `-1`
-/// is not a size but the statement that CHUNKING VOIDED THEM
-/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:138`).
+/// is not a size but the statement that THE PADDING BELONGS TO NO CHUNK
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:138`, `ddc/ddcv1.cpp:1172`).
 ///
-/// ⭐ `if (padBack_ != 0 || padFront_ != 0)` IS THIS ENUM: voiding an unpadded dim is not a case the
-/// scheduler has to test for, because [`PadSizes::Unpadded`] has nothing to void.
+/// ⛔ THE TWO WRITERS OF THAT `-1` DISAGREE ON A GUARD, so they are TWO operations here:
+/// `voidPaddingIfChunking` tests `if (padBack_ != 0 || padFront_ != 0)` first
+/// ([`Self::voided_if_padded`]); `exploreAssignDataStages` does not ([`Self::voided`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PadSizes {
     /// `padFront_ == 0 && padBack_ == 0`.
@@ -901,9 +902,23 @@ impl PadSizes {
         }
     }
 
-    /// `padBack_ = padFront_ = -1`, guarded as the reference guards it.
+    /// `padBack_ = padFront_ = -1` UNCONDITIONALLY — `ddc/ddcv1.cpp:1172` voids the entry it just
+    /// emplaced whatever that entry held, and a DEFAULT-CONSTRUCTED one reaches it
+    /// (`dsc/dsc2.cpp:3665` and `ddc/ddl/ddl_conversion.cpp:2520` both mint one with `operator[]`).
+    /// The `-1` is then `calculate_padded`'s *"Padded access is not valid in datastage"*
+    /// (`dsc/dims.cpp:581-582`), so voiding an unpadded dim is OBSERVABLE.
     #[must_use]
     pub const fn voided(self) -> Self {
+        match self {
+            Self::Unpadded | Self::Sized { .. } | Self::Voided => Self::Voided,
+        }
+    }
+
+    /// `if (padBack_ != 0 || padFront_ != 0) padBack_ = padFront_ = -1` — the GUARDED void, whose
+    /// guard belongs to `voidPaddingIfChunking` alone
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:137-138`).
+    #[must_use]
+    pub const fn voided_if_padded(self) -> Self {
         match self {
             Self::Unpadded => Self::Unpadded,
             Self::Sized { .. } | Self::Voided => Self::Voided,
@@ -938,7 +953,7 @@ impl UnneededPad {
 ///
 /// ⚠ [`crate::schedule::ddc::v1::PaddingSizes`] IS A SECOND, LOSSY SPELLING of this same C++ struct
 /// — five fields, no `unneededPad` counts — and it is reachable ONLY through the carrier-trait
-/// methods `stage_padding_sizes` (`ddc/v1.rs:1596`) and `stage_padding_dims` (`:2284`), both of
+/// methods `stage_padding_sizes` (`ddc/v1.rs:1625`) and `stage_padding_dims` (`:2319`), both of
 /// which BUILD one out of THIS type. It retires when that layer does, which is why the anchor sits
 /// here, on the type that STORES the fields, and not where the scheduler filed the TODO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -947,10 +962,11 @@ pub struct DimPadding {
     ///
     /// Field: e002_DimPaddingSizes.padBack_
     ///
-    /// `padFront_` (`dsc/dims.h:135`) AND `padBack_` (`:136`) AS ONE VALUE, because the only writer
-    /// that is not a constructor sets them in a single
+    /// `padFront_` (`dsc/dims.h:135`) AND `padBack_` (`:136`) AS ONE VALUE, because BOTH writers
+    /// that are not a constructor set them in a single
     /// `padInfo.padBack_ = padInfo.padFront_ = -1`
-    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:138`), and a `-1` edge is not a size on its own.
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:138` and `ddc/ddcv1.cpp:1172`), and a `-1` edge
+    /// is not a size on its own. Only the first tests `!= 0` first — see [`PadSizes::voided`].
     pub sizes: PadSizes,
     /// Field: e002_DimPaddingSizes.windowDim_
     ///
@@ -965,9 +981,12 @@ pub struct DimPadding {
     /// Field: e002_DimPaddingSizes.unneededPadBack_
     ///
     /// `unneededPad_` (`dsc/dims.h:137`), `unneededPadFront_` (`:138`) and `unneededPadBack_`
-    /// (`:139`) AS ONE TRIPLE, because that writer clears all three in a single assignment
-    /// (`L3DlOpsScheduler.cpp:144`) — under a `carryUnneededPadToChunk` whose value is `true`
-    /// (`:48`), so the clear is dead today and the triple is carried whole.
+    /// (`:139`) AS ONE TRIPLE, because every writer clears all three in a single assignment.
+    ///
+    /// ⛔ ONE OF THE TWO CLEARS IS LIVE: `L3DlOpsScheduler.cpp:144` sits behind a
+    /// `carryUnneededPadToChunk` whose value is `true` (`:48`), but `ddc/ddcv1.cpp:1170-1171`
+    /// clears the triple with NO such guard, so a chunk stage's counts do not always arrive from
+    /// the core stage's intact.
     pub unneeded: UnneededPad,
     /// Field: e002_DimPaddingSizes.stride_
     ///
@@ -980,7 +999,7 @@ pub struct DimPadding {
 }
 
 impl DimPadding {
-    /// `getMetaDimVal(kind)` (`dsc/dims.cpp:59-73`) — the one stored number a meta dim kind names
+    /// `getMetaDimVal(kind)` (`dsc/dims.cpp:59-72`) — the one stored number a meta dim kind names
     /// directly.
     ///
     /// ⛔ [`None`] IS *"Impossible to get the direct value of MetaDimKind"*: only four of the eight
@@ -1023,8 +1042,10 @@ impl Default for DimPadding {
 /// `DataStructDims::symbolicDimInfo_` stores one of them per symbolic dim.
 ///
 /// ⛔ NEITHER FIELD CAN SPELL ITS OWN `-1` INITIALISER, AND THAT IS A GUARD AND NOT A GAP: a `-1`
-/// here is not a bound, it is a field nobody set, and three readers consume it as though it were
-/// one. See [`MaxSize`] and [`Granularity`] for the reads.
+/// here is not a bound, it is a field nobody set, and SIX read sites in `dsc/dims.cpp` consume it
+/// as though it were one — `:524` and `:526` as the dim's own value, `:744` and `:747` in the
+/// volume pruner, `:623` and `:784` as the `maxSize_ / granularity_` factor. See [`MaxSize`] and
+/// [`Granularity`] for the reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SymbolicDimInfo {
     /// Field: e003_SymbolicDimInfo.maxSize_
@@ -3833,5 +3854,23 @@ mod tests_e006_data_struct_dims {
         dims.compound();
         assert_eq!(dims.extent(PrimaryDim::Ij), None);
         assert_eq!(dims.extent(PrimaryDim::Kij), Some(Extent(21)));
+    }
+}
+
+#[cfg(test)]
+mod tests_e002_dim_padding_sizes {
+    use super::*;
+
+    /// THE TWO WRITERS OF `padBack_ = padFront_ = -1` PART ON AN UNPADDED DIM:
+    /// `ddc/ddcv1.cpp:1172` voids the entry it emplaced whatever it held, while
+    /// `L3DlOpsScheduler.cpp:137` first tests `padBack_ != 0 || padFront_ != 0` — and a
+    /// default-constructed `paddingSizes_` entry (`dsc/dsc2.cpp:3665`) is `0`/`0`.
+    #[test]
+    fn only_the_guarded_void_leaves_an_unpadded_dim_alone() {
+        assert_eq!(PadSizes::Unpadded.voided(), PadSizes::Voided);
+        assert_eq!(PadSizes::Unpadded.voided_if_padded(), PadSizes::Unpadded);
+        let sized = PadSizes::of(PadElems(1), PadElems(0));
+        assert_eq!(sized.voided(), PadSizes::Voided);
+        assert_eq!(sized.voided_if_padded(), PadSizes::Voided);
     }
 }

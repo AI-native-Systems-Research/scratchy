@@ -385,7 +385,7 @@ pub fn void_padding_if_chunking<const CARRY_UNNEEDED_PAD: bool>(
         .collect();
     for dim in chunked {
         if let Some(pad) = ds.padding_mut().get_mut(&dim) {
-            pad.sizes = pad.sizes.voided();
+            pad.sizes = pad.sizes.voided_if_padded();
             if !CARRY_UNNEEDED_PAD {
                 pad.unneeded = UnneededPad::NONE;
             }
