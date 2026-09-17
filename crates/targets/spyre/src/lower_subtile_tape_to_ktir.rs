@@ -130,9 +130,6 @@ fn sub_rows(tr: &TensorRegion, off: u32, h: u32) -> TensorRegion {
     }
 }
 
-/// The node's declared output `[rows, cols]` — the one read of `node.output.region`, so every
-/// program states the same fact the same way. See [`KtirNode::out_shape`].
-
 /// The stem a program's name takes for an [`EwKind`] — the node kind the consumer's dispatch reads.
 ///
 /// ⛔ ENUMERATED, NEVER `_`, so a new `EwKind` is an E0004 here rather than a program whose name
@@ -439,16 +436,20 @@ fn lower_rope_node<F: RopeForm, const HD: u32>(
     let mut st = KtirFunc::new(ir);
     let name = Arena::global().str(format!("rope_s{}", node.id.index()));
     st.rope(
-        node.inputs[0].tensor,
-        node.inputs[1].tensor,
-        node.inputs[2].tensor,
-        node.output.tensor,
-        total,
-        HD,
-        node.output.region.rows.len,
-        // The cos/sin tables are pre-tiled to the rope's full width by the host, so position `ri`'s
-        // row starts at `ri · tbl_cols` — the table's OWN column count, not the head dim.
-        node.inputs[1].region.cols.len,
+        RopeTensors {
+            x_t: node.inputs[0].tensor,
+            cos_t: node.inputs[1].tensor,
+            sin_t: node.inputs[2].tensor,
+            out_t: node.output.tensor,
+        },
+        RopeGeometry {
+            cols: total,
+            hd: HD,
+            rows: node.output.region.rows.len,
+            // The cos/sin tables are pre-tiled to the rope's full width by the host, so position
+            // `ri`'s row starts at `ri · tbl_cols` — the table's OWN column count, not the head dim.
+            tbl_cols: node.inputs[1].region.cols.len,
+        },
     );
     let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::Rope);
     let mut e = EmittedOp::bare(name.to_string());
@@ -472,22 +473,24 @@ fn lower_rope_node<F: RopeForm, const HD: u32>(
 /// so every decision it drives must be a branch on a const, not on a value. The value becomes a const at
 /// ONE dispatch in `lower_one_node`.
 fn lower_attn_node<F: RopeForm, const NQH: u32, const NKVH: u32, const HD: u32>(
-    node: &SubtileNode<F>,
-    // The graph the node belongs to — the shapes its program's views state.
-    ir: &SubtileIR<F>,
+    attn: LowerAttn<'_, F>,
     // The geometry witness the door minted, carrying the GQA divisibility proof. Every head count
     // and head dim this function uses is read off it, so none of them is a value the node handed
     // over and there is nothing here to check against the consts.
     geom: scratchy_subtile::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-    cap: u32,
-    active_cap: ActiveCap,
-    // TRUE when this bundle's query rows are separate requests (a batched decode) rather than
-    // consecutive positions of one sequence (a prefill chunk). Only the KV writes care: a prompt's
-    // rows share a page and differ in slot, requests differ in both.
-    rows_are_requests: bool,
-    _sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
+    let LowerAttn {
+        node,
+        ir,
+        cap,
+        active_cap,
+        // TRUE when this bundle's query rows are separate requests (a batched decode) rather than
+        // consecutive positions of one sequence (a prefill chunk). Only the KV writes care: a
+        // prompt's rows share a page and differ in slot, requests differ in both.
+        rows_are_requests,
+        sym_id_base: _sym_id_base,
+        layout,
+    } = attn;
     // ⭐ THE GEOMETRY IS THE COMPILER'S HERE, NOT THE NODE'S. `lower_one_node`'s door instantiated
     // this function FROM the node's own `ModelAttnGeometry`, so there is no second copy of the head
     // counts in scope to disagree with the consts. What the node is still asked for is its scale,
@@ -914,12 +917,12 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
             }
         }
     }
-    Ok(found.map(|(geom, _)| {
-        crate::ktir_superdsc_door::BundleAttnParams {
+    Ok(
+        found.map(|(geom, _)| crate::ktir_superdsc_door::BundleAttnParams {
             geom,
             rows_are_requests,
-        }
-    }))
+        }),
+    )
 }
 
 /// The rotary lowering, waiting for its head dim to become a const — the consumer side of
@@ -967,16 +970,7 @@ impl<F: RopeForm> scratchy_subtile::model_geometry::OnAttnGeometry for LowerAttn
         self,
         geom: scratchy_subtile::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     ) -> Self::Out {
-        lower_attn_node::<F, NQH, NKVH, HD>(
-            self.node,
-            self.ir,
-            geom,
-            self.cap,
-            self.active_cap,
-            self.rows_are_requests,
-            self.sym_id_base,
-            self.layout,
-        )
+        lower_attn_node::<F, NQH, NKVH, HD>(self, geom)
     }
 }
 
@@ -1204,12 +1198,10 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(e) => Unhandled(e.0),
             }
         }
-        SubOp::ScalarMul { scale } => {
-            match lower_scalarmul_node(node, ir, *scale, sym_id_base) {
-                Ok(o) => Ops(vec![o]),
-                Err(e) => Unhandled(e.0),
-            }
-        }
+        SubOp::ScalarMul { scale } => match lower_scalarmul_node(node, ir, *scale, sym_id_base) {
+            Ok(o) => Ops(vec![o]),
+            Err(e) => Unhandled(e.0),
+        },
     }
 }
 /// The PRODUCER half over a whole UNROLLED graph: one KTIR program per node, plus the bundle layout
@@ -1448,9 +1440,8 @@ pub fn graph_wiring<F: RopeForm>(
                 // `ktdp.construct_memory_view` states `[1, capacity]`, so the number this pass needs to
                 // size the host buffer is read where every other extent is read. It used to ride on
                 // `KtirNode::mask` as the second half of a pair the LOWERING never looked at.
-                let regs =
-                    ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
-                        .map_err(|e| SuperDscError(e.message))?;
+                let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
+                    .map_err(|e| SuperDscError(e.message))?;
                 let cap = regs
                     .iter()
                     .find(|r| r.tid == mid.get())
@@ -2205,6 +2196,22 @@ const KTIR_ELEM: ktir_core::dtypes::DType = ktir_core::dtypes::DType::F16;
 
 /// The one spelling `MemorySpace::parse` demands — it has no reverse renderer.
 const KTIR_MEMORY_SPACE: &str = "HBM";
+
+/// The four tensor identities [`KtirFunc::rope`] reads and writes.
+struct RopeTensors {
+    x_t: TensorId,
+    cos_t: TensorId,
+    sin_t: TensorId,
+    out_t: TensorId,
+}
+
+/// The shape facts [`KtirFunc::rope`] tiles over. See that method's doc for `tbl_cols`.
+struct RopeGeometry {
+    cols: u32,
+    hd: u32,
+    rows: u32,
+    tbl_cols: u32,
+}
 
 /// Per-func construction state. No cross-op SSA threading: each node's func is self-contained —
 /// inputs loaded from HBM, output stored to HBM — so LX is bounded to one op's working set.
@@ -3517,20 +3524,22 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         self.store_tile(out_view, a_row, zero, m, n, scaled);
     }
 
-    fn rope(
-        &mut self,
-        x_t: TensorId,
-        cos_t: TensorId,
-        sin_t: TensorId,
-        out_t: TensorId,
-        cols: u32,
-        hd: u32,
-        rows: u32,
+    fn rope(&mut self, tensors: RopeTensors, geom: RopeGeometry) {
+        let RopeTensors {
+            x_t,
+            cos_t,
+            sin_t,
+            out_t,
+        } = tensors;
         // The cos/sin tables are pre-tiled to the rope's full width by the host, so position `ri`'s
         // row starts at `ri · tbl_cols`; the first `half` of each row holds the rotary values, and
         // every head's slice is identical.
-        tbl_cols: u32,
-    ) {
+        let RopeGeometry {
+            cols,
+            hd,
+            rows,
+            tbl_cols,
+        } = geom;
         let heads = cols / hd;
         let half = hd / 2;
         let mh = rows * heads;
@@ -3664,7 +3673,9 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
                 .collect(),
             // Only WHICH buffer: the capacity this builder also knows is stated by that parameter's own
             // view, so the lowering reads it there rather than being told twice.
-            mask: self.mask.map(|(t, _)| ktir_superdsc::ktir_node::BufferId::new(t)),
+            mask: self
+                .mask
+                .map(|(t, _)| ktir_superdsc::ktir_node::BufferId::new(t)),
             // A program writes its own node's output unless its builder says otherwise, and only the
             // prefill lm-head extraction does (see `lower_prefill_lm_head_at_m1`).
             node_out_tid: None,

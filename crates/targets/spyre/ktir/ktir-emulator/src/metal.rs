@@ -23,6 +23,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+mod mtl4;
+
 use crate::attrkey::AttrKey;
 use crate::dtypes::DType;
 use crate::ir::{Attr, IRFunction, Operation, Ssa};
@@ -1608,14 +1610,11 @@ fn run_reduce_kernel(
     cols: usize,
     identity: f32,
 ) -> Result<Vec<f32>, String> {
-    use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
-    };
+    use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize};
     use std::ffi::c_void;
     use std::ptr::NonNull;
 
-    let (device, queue, pipeline) = cached_dispatch(kernel)?;
+    let (device, _queue, pipeline) = cached_dispatch(kernel)?;
     let res = MTLResourceOptions::StorageModeShared;
     let in_dtype = kernel.buffers[0].dtype;
     let out_dtype = kernel.buffers[1].dtype;
@@ -1631,49 +1630,34 @@ fn run_reduce_kernel(
             )
             .ok_or("metal: reduce input buffer alloc failed")?
     };
+    let out_len = rows * out_dtype.bytes_per_elem();
     let out_buf = device
-        .newBufferWithLength_options((rows * out_dtype.bytes_per_elem()).max(1), res)
+        .newBufferWithLength_options(out_len.max(1), res)
         .ok_or("metal: reduce output buffer alloc failed")?;
 
-    let cb = queue.commandBuffer().ok_or("metal: commandBuffer nil")?;
-    let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
-    enc.setComputePipelineState(&pipeline);
     let cols_u = cols as u32;
-    unsafe {
-        enc.setBuffer_offset_atIndex(Some(&in_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
-        enc.setBytes_length_atIndex(
-            NonNull::new(&cols_u as *const u32 as *mut c_void).unwrap(),
-            std::mem::size_of::<u32>(),
-            2,
-        );
-        enc.setBytes_length_atIndex(
-            NonNull::new(&identity as *const f32 as *mut c_void).unwrap(),
-            std::mem::size_of::<f32>(),
-            3,
-        );
-    }
     let tg = pipeline.maxTotalThreadsPerThreadgroup().min(rows).max(1);
-    enc.dispatchThreads_threadsPerThreadgroup(
-        MTLSize {
+    let (raw, _elapsed) = mtl4::dispatch_readback(
+        &device,
+        &pipeline,
+        &[
+            mtl4::Arg::Buffer(&in_buf),
+            mtl4::Arg::Buffer(&out_buf),
+            mtl4::Arg::Bytes(&cols_u.to_ne_bytes()),
+            mtl4::Arg::Bytes(&identity.to_ne_bytes()),
+        ],
+        mtl4::Extent::Threads(MTLSize {
             width: rows,
             height: 1,
             depth: 1,
-        },
+        }),
         MTLSize {
             width: tg,
             height: 1,
             depth: 1,
         },
-    );
-    enc.endEncoding();
-    cb.commit();
-    cb.waitUntilCompleted();
-
-    let nbytes = rows * out_dtype.bytes_per_elem();
-    let raw =
-        unsafe { std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const u8, nbytes) }
-            .to_vec();
+        Some((1, out_len)),
+    )?;
     Ok(crate::codec::decode(&raw, rows, out_dtype))
 }
 
@@ -1799,14 +1783,11 @@ fn run_transpose_kernel(
     out_strides: &[u32],
     src_in_strides: &[u32],
 ) -> Result<Vec<f32>, String> {
-    use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
-    };
+    use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize};
     use std::ffi::c_void;
     use std::ptr::NonNull;
 
-    let (device, queue, pipeline) = cached_dispatch(kernel)?;
+    let (device, _queue, pipeline) = cached_dispatch(kernel)?;
     let res = MTLResourceOptions::StorageModeShared;
     let in_dtype = kernel.buffers[0].dtype;
     let out_dtype = kernel.buffers[1].dtype;
@@ -1822,8 +1803,9 @@ fn run_transpose_kernel(
             )
             .ok_or("metal: transpose input buffer alloc failed")?
     };
+    let out_len_bytes = out_len * out_dtype.bytes_per_elem();
     let out_buf = device
-        .newBufferWithLength_options((out_len * out_dtype.bytes_per_elem()).max(1), res)
+        .newBufferWithLength_options(out_len_bytes.max(1), res)
         .ok_or("metal: transpose output buffer alloc failed")?;
     let stride_buf = |arr: &[u32]| -> Result<_, String> {
         let nbytes = std::mem::size_of_val(arr).max(4);
@@ -1841,42 +1823,30 @@ fn run_transpose_kernel(
     let out_strides_buf = stride_buf(out_strides)?;
     let src_in_strides_buf = stride_buf(src_in_strides)?;
 
-    let cb = queue.commandBuffer().ok_or("metal: commandBuffer nil")?;
-    let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
-    enc.setComputePipelineState(&pipeline);
     let rank = out_strides.len() as u32;
-    unsafe {
-        enc.setBuffer_offset_atIndex(Some(&in_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
-        enc.setBytes_length_atIndex(
-            NonNull::new(&rank as *const u32 as *mut c_void).unwrap(),
-            std::mem::size_of::<u32>(),
-            2,
-        );
-        enc.setBuffer_offset_atIndex(Some(&out_strides_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&src_in_strides_buf), 0, 4);
-    }
     let tg = pipeline.maxTotalThreadsPerThreadgroup().min(out_len).max(1);
-    enc.dispatchThreads_threadsPerThreadgroup(
-        MTLSize {
+    let (raw, _elapsed) = mtl4::dispatch_readback(
+        &device,
+        &pipeline,
+        &[
+            mtl4::Arg::Buffer(&in_buf),
+            mtl4::Arg::Buffer(&out_buf),
+            mtl4::Arg::Bytes(&rank.to_ne_bytes()),
+            mtl4::Arg::Buffer(&out_strides_buf),
+            mtl4::Arg::Buffer(&src_in_strides_buf),
+        ],
+        mtl4::Extent::Threads(MTLSize {
             width: out_len,
             height: 1,
             depth: 1,
-        },
+        }),
         MTLSize {
             width: tg,
             height: 1,
             depth: 1,
         },
-    );
-    enc.endEncoding();
-    cb.commit();
-    cb.waitUntilCompleted();
-
-    let nbytes = out_len * out_dtype.bytes_per_elem();
-    let raw =
-        unsafe { std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const u8, nbytes) }
-            .to_vec();
+        Some((1, out_len_bytes)),
+    )?;
     Ok(crate::codec::decode(&raw, out_len, out_dtype))
 }
 
@@ -3186,23 +3156,22 @@ pub fn run_kernel(
     inputs: &[Vec<f32>],
     out_len: usize,
 ) -> Result<Vec<f32>, String> {
-    use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
-    };
+    use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize};
     use std::ffi::c_void;
     use std::ptr::NonNull;
 
     // Cached device/queue/pipeline — compiled once per distinct MSL source.
-    let (device, queue, pipeline) = cached_dispatch(kernel)?;
+    let (device, _queue, pipeline) = cached_dispatch(kernel)?;
 
     let res = MTLResourceOptions::StorageModeShared;
     let mut gpu_buffers = Vec::with_capacity(kernel.buffers.len());
     let mut input_iter = inputs.iter();
     let mut out_dtype = DType::F16;
-    for b in &kernel.buffers {
+    let mut out_index = 0;
+    for (i, b) in kernel.buffers.iter().enumerate() {
         let buf = if b.is_output {
             out_dtype = b.dtype;
+            out_index = i;
             let len = (out_len * b.dtype.bytes_per_elem()).max(1);
             device
                 .newBufferWithLength_options(len, res)
@@ -3226,38 +3195,25 @@ pub fn run_kernel(
         gpu_buffers.push(buf);
     }
 
-    let cb = queue
-        .commandBuffer()
-        .ok_or("metal: commandBuffer returned nil")?;
-    let enc = cb
-        .computeCommandEncoder()
-        .ok_or("metal: computeCommandEncoder returned nil")?;
-    enc.setComputePipelineState(&pipeline);
-    for (i, buf) in gpu_buffers.iter().enumerate() {
-        unsafe { enc.setBuffer_offset_atIndex(Some(buf), 0, i) };
-    }
+    let args: Vec<mtl4::Arg<'_>> = gpu_buffers.iter().map(mtl4::Arg::Buffer).collect();
     let tg = pipeline.maxTotalThreadsPerThreadgroup().min(out_len).max(1);
-    enc.dispatchThreads_threadsPerThreadgroup(
-        MTLSize {
+    let out_len_bytes = out_len * out_dtype.bytes_per_elem();
+    let (raw, _elapsed) = mtl4::dispatch_readback(
+        &device,
+        &pipeline,
+        &args,
+        mtl4::Extent::Threads(MTLSize {
             width: out_len,
             height: 1,
             depth: 1,
-        },
+        }),
         MTLSize {
             width: tg,
             height: 1,
             depth: 1,
         },
-    );
-    enc.endEncoding();
-    cb.commit();
-    cb.waitUntilCompleted();
-
-    // Read the output buffer (last) back and decode to f32.
-    let out = gpu_buffers.last().unwrap();
-    let nbytes = out_len * out_dtype.bytes_per_elem();
-    let raw = unsafe { std::slice::from_raw_parts(out.contents().as_ptr() as *const u8, nbytes) }
-        .to_vec();
+        Some((out_index, out_len_bytes)),
+    )?;
     Ok(crate::codec::decode(&raw, out_len, out_dtype))
 }
 
@@ -3380,7 +3336,6 @@ using namespace metal;
 pub fn run_nax_matmul_tile(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
     use objc2_foundation::NSString;
     use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
         MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode,
         MTLResourceOptions, MTLSize,
     };
@@ -3404,9 +3359,6 @@ pub fn run_nax_matmul_tile(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
     let pipeline = device
         .newComputePipelineStateWithFunction_error(&function)
         .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
-    let queue = device
-        .newCommandQueue()
-        .ok_or("metal: newCommandQueue returned nil")?;
 
     let res = MTLResourceOptions::StorageModeShared;
     let mk_in = |data: &[f32]| -> Result<_, String> {
@@ -3424,42 +3376,35 @@ pub fn run_nax_matmul_tile(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
     };
     let a_buf = mk_in(a)?;
     let b_buf = mk_in(b)?;
+    let out_len_bytes = out_len * 4;
     let c_buf = device
-        .newBufferWithLength_options(out_len * 4, res)
+        .newBufferWithLength_options(out_len_bytes, res)
         .ok_or("metal: output buffer alloc failed")?;
 
-    let cb = queue
-        .commandBuffer()
-        .ok_or("metal: commandBuffer returned nil")?;
-    let enc = cb
-        .computeCommandEncoder()
-        .ok_or("metal: computeCommandEncoder returned nil")?;
-    enc.setComputePipelineState(&pipeline);
-    unsafe {
-        enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
-    }
     // One simdgroup (32 threads), one threadgroup.
-    enc.dispatchThreads_threadsPerThreadgroup(
+    let (raw, _elapsed) = mtl4::dispatch_readback(
+        &device,
+        &pipeline,
+        &[
+            mtl4::Arg::Buffer(&a_buf),
+            mtl4::Arg::Buffer(&b_buf),
+            mtl4::Arg::Buffer(&c_buf),
+        ],
+        mtl4::Extent::Threads(MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        }),
         MTLSize {
             width: 32,
             height: 1,
             depth: 1,
         },
-        MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
-    );
-    enc.endEncoding();
-    cb.commit();
-    cb.waitUntilCompleted();
-
-    let raw =
-        unsafe { std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len) };
-    Ok(raw.to_vec())
+        Some((2, out_len_bytes)),
+    )?;
+    // `raw` is a `Vec<u8>` with no f32 alignment guarantee, so decode via
+    // `from_ne_bytes` rather than reinterpreting the pointer.
+    Ok(decode_f32_ne(&raw))
 }
 
 /// Reinterpret an `&[f32]` as bytes without a dependency. (The runtime copies
@@ -3474,6 +3419,16 @@ fn bytemuck_cast(data: &[f32]) -> &[u8] {
 fn bytemuck_u32(data: &[u32]) -> &[u8] {
     // SAFETY: u32 is plain-old-data; same bytes, same lifetime.
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
+}
+
+/// Decode a native-endian byte buffer (an MTL4 dispatch's `Vec<u8>` readback,
+/// with no f32 alignment guarantee) into `f32`s.
+fn decode_f32_ne(raw: &[u8]) -> Vec<f32> {
+    raw.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_ne_bytes(*c))
+        .collect()
 }
 
 /// One step of a batched matmul chain ([`NaxGemm::run_chain`]): multiply the
@@ -3927,7 +3882,6 @@ pub struct NaxGemm {
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
         >,
     >,
-    queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
     scratch: std::cell::RefCell<Scratch>,
     /// Output block this kernel computes per threadgroup, and its thread count.
     block_m: usize,
@@ -4343,9 +4297,6 @@ impl NaxGemm {
         // and bind it to a `half` buffer — silently wrong results, not an error.
         let gemv_pipeline_f16b = build_f16b(NAX_GEMV_SRC, "nax_gemv", 0)?;
         let gemv_pipeline_bt_f16b = build_f16b(NAX_GEMV_SRC, "nax_gemv", 1)?;
-        let queue = device
-            .newCommandQueue()
-            .ok_or("metal: newCommandQueue returned nil")?;
         Ok(Self {
             device,
             pipeline,
@@ -4361,7 +4312,6 @@ impl NaxGemm {
             pipeline_bt_f16b,
             pipeline_sm_f16b,
             pipeline_sm_bt_f16b,
-            queue,
             scratch: std::cell::RefCell::new(Scratch::default()),
             block_m,
             block_n,
@@ -4447,12 +4397,7 @@ impl NaxGemm {
         e: Option<&[f32]>,
         epi: Epilogue,
     ) -> Result<Vec<f32>, String> {
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
-        };
-        use std::ffi::c_void;
-        use std::ptr::NonNull;
+        use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 
         assert_eq!(a.len(), m * k, "A must be m×k");
         assert_eq!(b.len(), k * n, "B must be k×n");
@@ -4492,13 +4437,6 @@ impl NaxGemm {
         let dims = [m as u32, n as u32, k as u32];
         let codes = [epi.binop, epi.act];
 
-        let cb = self
-            .queue
-            .commandBuffer()
-            .ok_or("metal: commandBuffer returned nil")?;
-        let enc = cb
-            .computeCommandEncoder()
-            .ok_or("metal: computeCommandEncoder returned nil")?;
         // SMALL-M selection (see pick_small_m): 32-tall block kernel for small-m,
         // wide-N GEMMs. run_epi is plain-B only, so never the transpose-B variant.
         let (pipe, blk_m, threads) = if self.pick_small_m(m, n) {
@@ -4510,46 +4448,34 @@ impl NaxGemm {
         } else {
             (&self.pipeline, self.block_m, self.threads)
         };
-        enc.setComputePipelineState(pipe);
-        // Small uniforms via setBytes — no per-call buffer allocation.
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
-            enc.setBytes_length_atIndex(
-                NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
-                std::mem::size_of_val(&dims),
-                3,
-            );
-            enc.setBuffer_offset_atIndex(Some(&e_buf), 0, 4);
-            enc.setBytes_length_atIndex(
-                NonNull::new(codes.as_ptr() as *mut c_void).unwrap(),
-                std::mem::size_of_val(&codes),
-                5,
-            );
-        }
         // One threadgroup per output block (kernel-specific block + thread count).
         let m_blocks = m.div_ceil(blk_m);
         let n_blocks = n.div_ceil(self.block_n);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
+        let out_len_bytes = out_len * 4;
+        let (raw, _elapsed) = mtl4::dispatch_readback(
+            &self.device,
+            pipe,
+            &[
+                mtl4::Arg::Buffer(&a_buf),
+                mtl4::Arg::Buffer(&b_buf),
+                mtl4::Arg::Buffer(&c_buf),
+                mtl4::Arg::Bytes(bytemuck_u32(&dims)),
+                mtl4::Arg::Buffer(&e_buf),
+                mtl4::Arg::Bytes(bytemuck_u32(&codes)),
+            ],
+            mtl4::Extent::Threadgroups(MTLSize {
                 width: n_blocks,
                 height: m_blocks,
                 depth: 1,
-            },
+            }),
             MTLSize {
                 width: threads,
                 height: 1,
                 depth: 1,
             },
-        );
-        enc.endEncoding();
-        cb.commit();
-        cb.waitUntilCompleted();
-
-        let raw =
-            unsafe { std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len) };
-        Ok(raw.to_vec())
+            Some((2, out_len_bytes)),
+        )?;
+        Ok(decode_f32_ne(&raw))
     }
 
     /// Zero-copy matmul: `C = act(A·B BINOP E)` where A, B, C (and optional E)
@@ -4574,11 +4500,7 @@ impl NaxGemm {
         epi: Epilogue,
         transpose_b: bool,
     ) -> Result<(), String> {
-        use objc2_metal::{
-            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-        };
-        use std::ffi::c_void;
-        use std::ptr::NonNull;
+        use objc2_metal::MTLSize;
         assert_eq!(a.len, m * k, "A must be m×k");
         assert_eq!(
             b.len,
@@ -4589,11 +4511,6 @@ impl NaxGemm {
 
         let dims = [m as u32, n as u32, k as u32];
         let codes = [epi.binop, epi.act];
-        let cb = self
-            .queue
-            .commandBuffer()
-            .ok_or("metal: commandBuffer nil")?;
-        let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
         // SMALL-M selection (opt-in, KTIR_SMALL_M=1): when m fits the 32-tall block,
         // dispatch the small-M NAX variant — computes only the real rows instead of
         // padding to 128. Bit-identical output (same fragment math + edge guards).
@@ -4655,44 +4572,35 @@ impl NaxGemm {
             (false, true) => (self.block_n, self.small_block_m, self.small_threads),
             (false, false) => (self.block_n, self.block_m, self.threads),
         };
-        enc.setComputePipelineState(pipe);
         let e_mtl = e.unwrap_or(b); // dummy when binop==0 (never dereferenced)
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&a.mtl), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&b.mtl), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&c.mtl), 0, 2);
-            enc.setBytes_length_atIndex(
-                NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
-                std::mem::size_of_val(&dims),
-                3,
-            );
-            enc.setBuffer_offset_atIndex(Some(&e_mtl.mtl), 0, 4);
-            enc.setBytes_length_atIndex(
-                NonNull::new(codes.as_ptr() as *mut c_void).unwrap(),
-                std::mem::size_of_val(&codes),
-                5,
-            );
-        }
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
+        // A/B/C/E are already resident `UnifiedBuffer`s — no readback, the caller
+        // reads `c` directly. See [`mtl4::dispatch`]'s doc for why this returns
+        // wall-clock elapsed rather than `GPUStartTime`/`GPUEndTime` (MTL4 command
+        // buffers don't expose those).
+        let elapsed = mtl4::dispatch(
+            &self.device,
+            pipe,
+            &[
+                mtl4::Arg::Buffer(&a.mtl),
+                mtl4::Arg::Buffer(&b.mtl),
+                mtl4::Arg::Buffer(&c.mtl),
+                mtl4::Arg::Bytes(bytemuck_u32(&dims)),
+                mtl4::Arg::Buffer(&e_mtl.mtl),
+                mtl4::Arg::Bytes(bytemuck_u32(&codes)),
+            ],
+            mtl4::Extent::Threadgroups(MTLSize {
                 width: n.div_ceil(blk_n),
                 height: m.div_ceil(blk_m),
                 depth: 1,
-            },
+            }),
             MTLSize {
                 width: threads,
                 height: 1,
                 depth: 1,
             },
-        );
-        enc.endEncoding();
-        cb.commit();
-        cb.waitUntilCompleted();
-        // The GPU's own execution window, vs the wall time the caller measures. If
-        // these differ sharply the cost is the serialized commit/wait ROUND TRIP (fix:
-        // batch dispatches); if they agree the KERNEL itself is slow at this shape.
+        )?;
         GEMM_GPU_EXEC_NS.fetch_add(
-            ((cb.GPUEndTime() - cb.GPUStartTime()) * 1e9) as u64,
+            elapsed.as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
         Ok(())
@@ -4716,12 +4624,7 @@ impl NaxGemm {
         epi: Epilogue,
         transpose_b: bool,
     ) -> Result<(), String> {
-        use objc2_metal::{
-            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-            MTLComputePipelineState, MTLSize,
-        };
-        use std::ffi::c_void;
-        use std::ptr::NonNull;
+        use objc2_metal::{MTLComputePipelineState, MTLSize};
         assert_eq!(x.len, k, "x must be length k");
         assert_eq!(
             b.len,
@@ -4732,57 +4635,46 @@ impl NaxGemm {
 
         let dims = [1u32, n as u32, k as u32];
         let codes = [epi.binop, epi.act];
-        let cb = self
-            .queue
-            .commandBuffer()
-            .ok_or("metal: commandBuffer nil")?;
-        let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
-        enc.setComputePipelineState(match (transpose_b, b.is_f16()) {
+        let pipe = match (transpose_b, b.is_f16()) {
             (true, true) => &self.gemv_pipeline_bt_f16b,
             (true, false) => &self.gemv_pipeline_bt,
             (false, true) => &self.gemv_pipeline_f16b,
             (false, false) => &self.gemv_pipeline,
-        });
+        };
         let e_mtl = e.unwrap_or(b); // dummy when binop==0 (never dereferenced)
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&x.mtl), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&b.mtl), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&y.mtl), 0, 2);
-            enc.setBytes_length_atIndex(
-                NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
-                std::mem::size_of_val(&dims),
-                3,
-            );
-            enc.setBuffer_offset_atIndex(Some(&e_mtl.mtl), 0, 4);
-            enc.setBytes_length_atIndex(
-                NonNull::new(codes.as_ptr() as *mut c_void).unwrap(),
-                std::mem::size_of_val(&codes),
-                5,
-            );
-        }
         // One thread per output column (the kernel guards gid >= N).
         let tg = self
             .gemv_pipeline
             .maxTotalThreadsPerThreadgroup()
             .min(n)
             .max(1);
-        enc.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
+        // x/B/y/E are already resident `UnifiedBuffer`s — no readback, the caller
+        // reads `y` directly. See [`matmul_unified`]'s comment on the elapsed-time
+        // proxy this returns instead of `GPUStartTime`/`GPUEndTime`.
+        let elapsed = mtl4::dispatch(
+            &self.device,
+            pipe,
+            &[
+                mtl4::Arg::Buffer(&x.mtl),
+                mtl4::Arg::Buffer(&b.mtl),
+                mtl4::Arg::Buffer(&y.mtl),
+                mtl4::Arg::Bytes(bytemuck_u32(&dims)),
+                mtl4::Arg::Buffer(&e_mtl.mtl),
+                mtl4::Arg::Bytes(bytemuck_u32(&codes)),
+            ],
+            mtl4::Extent::Threads(MTLSize {
                 width: n,
                 height: 1,
                 depth: 1,
-            },
+            }),
             MTLSize {
                 width: tg,
                 height: 1,
                 depth: 1,
             },
-        );
-        enc.endEncoding();
-        cb.commit();
-        cb.waitUntilCompleted();
+        )?;
         GEMM_GPU_EXEC_NS.fetch_add(
-            ((cb.GPUEndTime() - cb.GPUStartTime()) * 1e9) as u64,
+            elapsed.as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
         Ok(())
@@ -4846,12 +4738,7 @@ impl NaxGemm {
         a: &[f32],
         steps: &[ChainStep<'_>],
     ) -> Result<Vec<f32>, String> {
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
-        };
-        use std::ffi::c_void;
-        use std::ptr::NonNull;
+        use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
         assert!(!steps.is_empty(), "chain needs at least one step");
 
         let res = MTLResourceOptions::StorageModeShared;
@@ -4869,84 +4756,81 @@ impl NaxGemm {
             );
         };
 
-        // Allocate the pool ONCE (sized to the chain's maxima) and reuse it for
-        // every step — no per-step allocation. Two ping-pong result buffers hold
-        // the running product; A, B, and E are refilled in place.
-        let max_b = steps.iter().map(|s| s.b.len()).max().unwrap_or(1);
-        let max_e = steps
-            .iter()
-            .map(|s| s.e.map_or(1, <[f32]>::len))
-            .max()
-            .unwrap_or(1);
+        // Two ping-pong result buffers hold the running product. B and E get
+        // ONE buffer PER STEP (not reused/refilled in place): the whole chain
+        // is one command buffer submitted only after every step is encoded, so
+        // a single shared B/E buffer refilled step-by-step on the CPU would
+        // hold only the LAST step's contents by the time the GPU actually runs
+        // the FIRST step's dispatch — every step silently reading the wrong
+        // weight. (This was a real bug in the classic-MTL3 version of this
+        // function too — reusing one buffer across steps within a single
+        // uncommitted command buffer was never safe.)
         let max_out = steps.iter().map(|s| rows * s.n).max().unwrap_or(1);
         let a_buf = alloc(a.len() * 4)?;
         fill(&a_buf, a);
         let ping = [alloc(max_out * 4)?, alloc(max_out * 4)?];
-        let b_buf = alloc(max_b * 4)?;
-        let e_buf = alloc(max_e * 4)?;
+        let mut step_bufs = Vec::with_capacity(steps.len());
+        for s in steps {
+            let b_buf = alloc(s.b.len() * 4)?;
+            fill(&b_buf, s.b);
+            let e_buf = alloc(s.e.map_or(1, <[f32]>::len) * 4)?;
+            if let Some(e) = s.e {
+                fill(&e_buf, e);
+            }
+            step_bufs.push((b_buf, e_buf));
+        }
 
-        let cb = self
-            .queue
-            .commandBuffer()
-            .ok_or("metal: commandBuffer returned nil")?;
+        let mut batch = mtl4::Batch::begin(&self.device)?;
         let mut final_len = 0usize;
         for (i, s) in steps.iter().enumerate() {
             assert_eq!(s.b.len(), s.k * s.n, "chain step B must be k×n");
             let out_len = rows * s.n;
-            let prev = if i == 0 { &a_buf } else { &ping[(i - 1) % 2] };
-            let out = &ping[i % 2];
-            fill(&b_buf, s.b);
             if let Some(e) = s.e {
                 assert_eq!(e.len(), out_len, "chain step E must be m×n");
-                fill(&e_buf, e);
             }
+            let prev = if i == 0 { &a_buf } else { &ping[(i - 1) % 2] };
+            let out = &ping[i % 2];
+            let (b_buf, e_buf) = &step_bufs[i];
             let dims = [rows as u32, s.n as u32, s.k as u32];
             let codes = [s.epi.binop, s.epi.act];
 
-            let enc = cb
-                .computeCommandEncoder()
-                .ok_or("metal: chain encoder nil")?;
-            enc.setComputePipelineState(&self.pipeline);
-            // Small uniforms go through setBytes (no buffer allocation).
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(prev), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
-                enc.setBuffer_offset_atIndex(Some(out), 0, 2);
-                enc.setBytes_length_atIndex(
-                    NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
-                    std::mem::size_of_val(&dims),
-                    3,
-                );
-                enc.setBuffer_offset_atIndex(Some(&e_buf), 0, 4);
-                enc.setBytes_length_atIndex(
-                    NonNull::new(codes.as_ptr() as *mut c_void).unwrap(),
-                    std::mem::size_of_val(&codes),
-                    5,
-                );
+            // A step after the first reads `prev` (the previous step's OUTPUT
+            // buffer, written by a dispatch earlier in this same encoder), so it
+            // needs the intra-encoder barrier — MTL4 does not auto-serialize
+            // same-encoder dispatches.
+            if i > 0 {
+                batch.barrier();
             }
-            enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
+            batch.encode(
+                &self.pipeline,
+                &[
+                    mtl4::Arg::Buffer(prev),
+                    mtl4::Arg::Buffer(b_buf),
+                    mtl4::Arg::Buffer(out),
+                    mtl4::Arg::Bytes(bytemuck_u32(&dims)),
+                    mtl4::Arg::Buffer(e_buf),
+                    mtl4::Arg::Bytes(bytemuck_u32(&codes)),
+                ],
+                mtl4::Extent::Threadgroups(MTLSize {
                     width: s.n.div_ceil(self.block_n),
                     height: rows.div_ceil(self.block_m),
                     depth: 1,
-                },
+                }),
                 MTLSize {
                     width: self.threads,
                     height: 1,
                     depth: 1,
                 },
-            );
-            enc.endEncoding();
+            )?;
             final_len = out_len;
         }
+        batch.commit()?;
 
-        cb.commit();
-        cb.waitUntilCompleted();
         let last = &ping[(steps.len() - 1) % 2];
         let raw = unsafe {
-            std::slice::from_raw_parts(last.contents().as_ptr() as *const f32, final_len)
+            std::slice::from_raw_parts(last.contents().as_ptr() as *const u8, final_len * 4)
         };
-        Ok(raw.to_vec())
+        Ok(decode_f32_ne(raw))
     }
 
     /// **Combine** many small matmuls that share the weight `b` into ONE tall
@@ -4986,10 +4870,7 @@ impl NaxGemm {
         a: &[f32],
         b: &[f32],
     ) -> Result<Vec<f32>, String> {
-        use objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
-        };
+        use objc2_metal::{MTLDevice, MTLResourceOptions, MTLSize};
         use std::ffi::c_void;
         use std::ptr::NonNull;
         assert_eq!(a.len(), batch * m * k, "A must be batch×m×k");
@@ -5018,55 +4899,45 @@ impl NaxGemm {
             .ok_or("metal: batched output alloc failed")?;
         let dims = [m as u32, n as u32, k as u32];
         let codes = [0u32, 0u32];
+        let out_len_bytes = out_len * 4;
 
-        let cb = self
-            .queue
-            .commandBuffer()
-            .ok_or("metal: commandBuffer returned nil")?;
-        let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
-        enc.setComputePipelineState(&self.pipeline);
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
-            enc.setBytes_length_atIndex(
-                NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
-                std::mem::size_of_val(&dims),
-                3,
-            );
-            enc.setBuffer_offset_atIndex(Some(&e_buf), 0, 4);
-            enc.setBytes_length_atIndex(
-                NonNull::new(codes.as_ptr() as *mut c_void).unwrap(),
-                std::mem::size_of_val(&codes),
-                5,
-            );
-        }
         // Grid z = batch: all `batch` GEMMs dispatched together, run concurrently.
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
+        let (raw, _elapsed) = mtl4::dispatch_readback(
+            &self.device,
+            &self.pipeline,
+            &[
+                mtl4::Arg::Buffer(&a_buf),
+                mtl4::Arg::Buffer(&b_buf),
+                mtl4::Arg::Buffer(&c_buf),
+                mtl4::Arg::Bytes(bytemuck_u32(&dims)),
+                mtl4::Arg::Buffer(&e_buf),
+                mtl4::Arg::Bytes(bytemuck_u32(&codes)),
+            ],
+            mtl4::Extent::Threadgroups(MTLSize {
                 width: n.div_ceil(self.block_n),
                 height: m.div_ceil(self.block_m),
                 depth: batch,
-            },
+            }),
             MTLSize {
                 width: self.threads,
                 height: 1,
                 depth: 1,
             },
-        );
-        enc.endEncoding();
-        cb.commit();
-        cb.waitUntilCompleted();
-        let raw =
-            unsafe { std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len) };
-        Ok(raw.to_vec())
+            Some((2, out_len_bytes)),
+        )?;
+        Ok(decode_f32_ne(&raw))
     }
 
-    /// Pure GPU kernel time (seconds) for one GEMM, from the command buffer's
-    /// hardware timestamps — excludes buffer allocation, host→device copies,
-    /// and readback. Buffers are allocated once and reused across `iters`
-    /// dispatches (one command buffer), so this isolates kernel throughput from
-    /// per-call CPU overhead. Returns the *total* GPU time over `iters`.
+    /// GEMM kernel time (seconds) for one GEMM shape, from a single
+    /// submit→complete wall-clock window around `iters` dispatches sharing one
+    /// command buffer — excludes buffer allocation, host→device copies, and
+    /// readback, and amortizes per-call CPU submit overhead over `iters`
+    /// repeats. Returns the *total* time over `iters`.
+    ///
+    /// ⛔ MTL4 command buffers drop the classic `GPUStartTime`/`GPUEndTime`
+    /// hardware counters this used to isolate PURE GPU busy time with; this is
+    /// now the coarser submit→complete wall-clock window (still one window for
+    /// all `iters`, so still amortized, just no longer hardware-exact).
     pub fn gpu_time_seconds(
         &self,
         m: usize,
@@ -5076,10 +4947,7 @@ impl NaxGemm {
         b: &[f32],
         iters: u32,
     ) -> Result<f64, String> {
-        use objc2_metal::{
-            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-            MTLDevice, MTLResourceOptions, MTLSize,
-        };
+        use objc2_metal::{MTLDevice, MTLResourceOptions, MTLSize};
         use std::ffi::c_void;
         use std::ptr::NonNull;
 
@@ -5121,36 +4989,36 @@ impl NaxGemm {
         let m_blocks = m.div_ceil(self.block_m);
         let n_blocks = n.div_ceil(self.block_n);
 
-        let cb = self.queue.commandBuffer().ok_or("cb")?;
+        // Every iteration writes the SAME values to the SAME `c_buf` addresses
+        // (identical inputs, identical shape), so — unlike `run_chain`, where
+        // each step reads the previous step's output — no inter-dispatch
+        // barrier is needed: whatever order the GPU actually runs them in, the
+        // written result is the same.
+        let mut batch = mtl4::Batch::begin(&self.device)?;
         for _ in 0..iters {
-            let enc = cb.computeCommandEncoder().ok_or("enc")?;
-            enc.setComputePipelineState(&self.pipeline);
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
-                enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
-                enc.setBuffer_offset_atIndex(Some(&dims_buf), 0, 3);
-                enc.setBuffer_offset_atIndex(Some(&e_buf), 0, 4);
-                enc.setBuffer_offset_atIndex(Some(&codes_buf), 0, 5);
-            }
-            enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
+            batch.encode(
+                &self.pipeline,
+                &[
+                    mtl4::Arg::Buffer(&a_buf),
+                    mtl4::Arg::Buffer(&b_buf),
+                    mtl4::Arg::Buffer(&c_buf),
+                    mtl4::Arg::Buffer(&dims_buf),
+                    mtl4::Arg::Buffer(&e_buf),
+                    mtl4::Arg::Buffer(&codes_buf),
+                ],
+                mtl4::Extent::Threadgroups(MTLSize {
                     width: n_blocks,
                     height: m_blocks,
                     depth: 1,
-                },
+                }),
                 MTLSize {
                     width: self.threads,
                     height: 1,
                     depth: 1,
                 },
-            );
-            enc.endEncoding();
+            )?;
         }
-        cb.commit();
-        cb.waitUntilCompleted();
-        // Hardware GPU timestamps (CFTimeInterval seconds) for the whole buffer.
-        Ok(cb.GPUEndTime() - cb.GPUStartTime())
+        Ok(batch.commit()?.as_secs_f64())
     }
 }
 

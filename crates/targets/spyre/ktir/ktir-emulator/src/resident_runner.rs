@@ -27,9 +27,9 @@
 //! marshalled-arg `ProgramSpec` and is reported as not-drivable (see the diff
 //! CLI), not faked.
 
+use crate::attrkey::AttrKey;
 use crate::dtypes::DType;
 use crate::interpreter::{Arg, Output};
-use crate::attrkey::AttrKey;
 use crate::ir::{Attr, IRFunction, Operation, Scalar, Ssa};
 use crate::irtype::IrType;
 use crate::opkind::OpKind;
@@ -135,8 +135,11 @@ impl ResidentRunner {
             .collect();
         let mut operations: Vec<Operation<'static>> = Vec::new();
         for s in &scalars {
-            let op = Operation::new(a, Some(s.arg), OpKind::ArithConstant, &[])
-                .with_attr(a, AttrKey::Value, scalar_value_attr(&s.value));
+            let op = Operation::new(a, Some(s.arg), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                scalar_value_attr(&s.value),
+            );
             operations.push(Operation {
                 result_type: Some(scalar_result_type(&s.value)),
                 ..op

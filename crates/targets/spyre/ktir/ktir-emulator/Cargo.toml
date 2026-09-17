@@ -71,6 +71,10 @@ path = "examples/bench.rs"
 name = "ktir_diff_run"
 path = "examples/ktir_diff_run.rs"
 
+[[example]]
+name = "mtl4_smoke"
+path = "examples/mtl4_smoke.rs"
+
 [[test]]
 name = "bench_amx_vs_metal"
 path = "tests/bench_amx_vs_metal.rs"
@@ -225,6 +229,17 @@ optional = true
 [dependencies.objc2-metal]
 version = "0.3"
 optional = true
+features = [
+    "MTL4ArgumentTable",
+    "MTL4CommandAllocator",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+    "MTLAllocation",
+    "MTLResidencySet",
+]
 
 [dependencies.openblas-src]
 version = "0.10"
@@ -238,7 +253,20 @@ serde_json = "1"
 cblas-sys = "0.1"
 objc2 = "0.6"
 objc2-foundation = "0.3"
-objc2-metal = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-metal]
+version = "0.3"
+features = [
+    "MTL4ArgumentTable",
+    "MTL4CommandAllocator",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+    "MTLAllocation",
+    "MTLResidencySet",
+]
 
 [target.'cfg(target_os = "macos")'.dependencies.blas-src]
 version = "0.10"

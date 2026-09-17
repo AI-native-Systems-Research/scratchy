@@ -320,16 +320,6 @@ impl KvShifts {
 //  A launch: the shifts and the program they apply to, as ONE value
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// ONE LAUNCH: a contiguous run of up to `group_size()` trips that dxp compiled into a single device
-/// program, together with the address shifts the launch applies to it.
-///
-/// ⛔ THE SHIFTS AND THE PROGRAM ARE ONE STRUCT, AND LAUNCH ORDER IS SLICE ORDER. They were two
-/// parallel slices joined by a `group: u32` stored in BOTH, rejoined by a linear search, with the load
-/// path refusing when an index did not resolve. A bundle naming a program it does not carry was
-/// constructible, and the refusal was the proof it was constructible. There is no index to dangle now.
-///
-/// `SCRATCHY_SUPERDSC_GROUP_SIZE=1` makes this one trip per program, which is the fault-isolation end of
-
 /// One program of a launch group: the function, and which PLACED tensor each of its parameters
 /// points at.
 ///
@@ -346,6 +336,15 @@ pub struct LaunchProgram<'a> {
     pub args: Cow<'a, [(ktir_core::ir::Ssa, PlaceId)]>,
 }
 
+/// ONE LAUNCH: a contiguous run of up to `group_size()` trips that dxp compiled into a single device
+/// program, together with the address shifts the launch applies to it.
+///
+/// ⛔ THE SHIFTS AND THE PROGRAM ARE ONE STRUCT, AND LAUNCH ORDER IS SLICE ORDER. They were two
+/// parallel slices joined by a `group: u32` stored in BOTH, rejoined by a linear search, with the load
+/// path refusing when an index did not resolve. A bundle naming a program it does not carry was
+/// constructible, and the refusal was the proof it was constructible. There is no index to dangle now.
+///
+/// `SCRATCHY_SUPERDSC_GROUP_SIZE=1` makes this one trip per program, which is the fault-isolation end of
 /// that knob — not a different mode.
 // NOT `Eq`: a group carries its PROGRAMS, and a program carries float constants.
 #[derive(Clone, Debug, Default, PartialEq)]

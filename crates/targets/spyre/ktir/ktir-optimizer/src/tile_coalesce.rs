@@ -495,7 +495,7 @@ pub fn recognize_coalesce<'a>(
 
     // Prologue: reshape any memory view that a coalesced access tile reads.
     for op in prologue {
-        let mut nop = op.clone();
+        let mut nop = *op;
         if op.op_type == OpKind::KtdpConstructMemoryView
             && let Some(res) = op.result
             && let Some(&s) = view_lead_stride.get(&res)
@@ -507,14 +507,14 @@ pub fn recognize_coalesce<'a>(
 
     // Block 0: prepend a leading K dim to every value.
     for op in blocks[0] {
-        let mut nop = op.clone();
+        let mut nop = *op;
         let lead_stride = op.result.and_then(|r| view_lead_stride.get(&r).copied());
         prepend_op_dim(a, &mut nop, k_i64, lead_stride)?;
         new_ops.push(nop);
     }
 
     if has_return {
-        new_ops.push(ops[body_end].clone());
+        new_ops.push(ops[body_end]);
     }
     Some(new_ops)
 }
@@ -571,8 +571,7 @@ fn split_view_leading_dim<'a>(
         .collect();
     let strides = std::iter::once(s).chain(strides.iter().copied()).collect();
 
-    let mut next = op
-        .clone()
+    let mut next = (*op)
         .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(shape)))
         .with_attr(a, AttrKey::Strides, Attr::IntList(a.ints(strides)));
     if let Some(Attr::AffineSet(set)) = op.attr(AttrKey::CoordinateSet) {
@@ -653,7 +652,7 @@ fn prepend_op_dim<'a>(
 
         let mut next = Operation {
             operands: a.ssa(operands),
-            ..op.clone()
+            ..*op
         }
         .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(shape)))
         .with_attr(a, AttrKey::BaseMap, Attr::AffineMap(base_map));
@@ -687,18 +686,14 @@ fn prepend_op_dim<'a>(
         && let Some(Attr::IntList(dims)) = op.attr(AttrKey::Dimensions)
     {
         let shifted: Vec<i64> = dims.iter().map(|d| d + 1).collect();
-        *op = op
-            .clone()
-            .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(shifted)));
+        *op = (*op).with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(shifted)));
     }
 
     // Any op: prepend K to a `shape` attr (tensor.empty / broadcast outs) and to a shaped tensor
     // result type, when present.
     if let Some(Attr::IntList(shape)) = op.attr(AttrKey::Shape) {
         let shape = std::iter::once(k).chain(shape.iter().copied()).collect();
-        *op = op
-            .clone()
-            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(shape)));
+        *op = (*op).with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(shape)));
     }
     if let Some(rt @ IrType::Tensor { .. }) = op.result_type
         && let Some(dims) = rt.dims()

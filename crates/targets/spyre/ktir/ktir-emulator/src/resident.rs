@@ -472,7 +472,17 @@ impl ResidentExecutor {
         let vd = read_arg(island.vd_arg, kv_cols)?;
 
         let mut o = vec![0.0f32; q_cols];
-        island.compute_f32(&q, &mask, &kc, &kd, &vc, &vd, &mut o);
+        island.compute_f32(
+            ktir_optimizer::head_rewrite::DecodeAttnInputs {
+                q: &q,
+                mask: &mask,
+                kc: &kc,
+                kd: &kd,
+                vc: &vc,
+                vd: &vd,
+            },
+            &mut o,
+        );
 
         // Write the output row back to the O tensor's stick as f16.
         let o_tid = *arg_tid
@@ -864,7 +874,7 @@ impl ResidentExecutor {
                     // node), fall through to the decomposed grid run below.
                     let fused = if self.fuse_attn {
                         if let Some(island) =
-                            ktir_optimizer::head_rewrite::recognize_head_attention_decode(&func)
+                            ktir_optimizer::head_rewrite::recognize_head_attention_decode(func)
                         {
                             self.run_fused_decode_attention(node, &island)?;
                             true
@@ -981,6 +991,7 @@ impl ResidentExecutor {
                 crate::metal::WEIGHT_CACHE_DROP_UNRESOLVED
                     .swap(0, std::sync::atomic::Ordering::Relaxed),
             );
+            #[cfg(metal)]
             {
                 // Which offloads actually FIRED this forward — a path that is compiled but never
                 // reached looks identical to a slow one from the outside.
@@ -991,6 +1002,7 @@ impl ResidentExecutor {
                 );
                 crate::metal::reset_offload_proof();
             }
+            #[cfg(metal)]
             eprintln!(
                 "    [gemm] {} gemms, mean M {:.1} | operand resolve {:.1}ms | compute {:.1}ms \
                  (gpu {:.1}ms [exec {:.1}ms] / amx {:.1}ms)",
@@ -1422,7 +1434,6 @@ fn rewrite_last_token_func<'a>(
     fn rewrite<'a>(
         a: &'a Arena,
         ops: &[Operation<'a>],
-        m: usize,
         act_views: &std::collections::HashSet<Ssa>,
         result_views: &std::collections::HashSet<Ssa>,
         row_const: Ssa,
@@ -1460,7 +1471,6 @@ fn rewrite_last_token_func<'a>(
                         a.ops(rewrite(
                             a,
                             rg,
-                            m,
                             act_views,
                             result_views,
                             row_const,
@@ -1478,7 +1488,6 @@ fn rewrite_last_token_func<'a>(
     let mut body = rewrite(
         a,
         ops,
-        m,
         &act_views,
         &result_views,
         row_const,

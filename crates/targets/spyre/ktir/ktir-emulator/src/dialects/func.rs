@@ -9,11 +9,11 @@
 //! it's observable only by a direct handler/`execute_op` call (matching how the
 //! Python `func.return` returns its operand values).
 
-use crate::opkind::OpKind;
 use super::{Dispatch, LatencyCategory};
 use crate::context::CoreContext;
 use crate::env::ExecutionEnv;
 use crate::ir::{Operation, Value};
+use crate::opkind::OpKind;
 
 pub fn register(d: &mut Dispatch) {
     d.register(OpKind::FuncReturn, LatencyCategory::Zero, ret);
