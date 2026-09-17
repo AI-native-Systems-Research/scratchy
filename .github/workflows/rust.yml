@@ -93,6 +93,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: linux-cuda
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy is a superset of `cargo check`, so we run only clippy. The
       # metal crates depend unconditionally on `objc2` (Apple-only) and can't
@@ -136,6 +137,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-metal
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy is a superset of `cargo check`, so we run only clippy + test.
       - name: Clippy
