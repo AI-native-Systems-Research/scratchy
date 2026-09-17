@@ -5197,6 +5197,29 @@ mod tests {
     use super::*;
     use crate::test_support::Ops;
 
+    /// True when there is no GPU here fit for these MTL4-backed tests: no Metal
+    /// device at all, or a device present but unable to mint an MTL4 command
+    /// queue (observed on GitHub's hosted macOS runners — a real Apple-Silicon
+    /// GPU, but the virtualized/shared device rejects `newMTL4CommandQueue()`).
+    /// A real capability probe (mirrors what `NaxGemm::new`/`Batch::begin`
+    /// actually need), not a guess from matching an error string after a
+    /// dispatch already failed.
+    fn no_gpu_here() -> bool {
+        use objc2_metal::MTLCreateSystemDefaultDevice;
+        match MTLCreateSystemDefaultDevice() {
+            None => true,
+            Some(device) => !mtl4::mtl4_available(&device),
+        }
+    }
+
+    /// True when there is no Metal device at all — for tests (library compile
+    /// probes) that don't touch an MTL4 command queue, so [`no_gpu_here`]'s
+    /// extra MTL4 check would be over-broad.
+    fn no_metal_device() -> bool {
+        use objc2_metal::MTLCreateSystemDefaultDevice;
+        MTLCreateSystemDefaultDevice().is_none()
+    }
+
     /// On a build that embedded the AOT metallibs (`cfg(metal_aot)`), assert the
     /// runtime reports AOT active AND that the engine still builds + reduces full K
     /// (the embedded NAX metallibs were compiled `-mmacosx-version-min=26.2`, so a
@@ -5204,24 +5227,22 @@ mod tests {
     /// AOT (toolchain/flag unavailable) the runtime falls back to JIT and this test
     /// simply records that AOT is off — never a failure.
     #[test]
-    fn aot_active_matches_build_cfg() {
-        assert_eq!(
-            NaxGemm::aot_active(),
-            cfg!(metal_aot),
-            "aot_active() must mirror cfg(metal_aot)"
-        );
-        if NaxGemm::aot_active() {
-            // AOT is on for THIS build — prove the embedded GEMM loads and is full-K.
-            match NaxGemm::new() {
-                Ok(_) => eprintln!("AOT active: embedded metallibs loaded, full-K verified"),
-                Err(e) if e.contains("no Metal device") => {
-                    eprintln!("no Metal device — skipping AOT load check");
-                }
-                Err(e) => panic!("AOT build but NaxGemm::new failed: {e}"),
-            }
-        } else {
-            eprintln!("AOT not active on this build (JIT fallback) — cfg(metal_aot) off");
+    fn aot_active_matches_build_cfg() -> Result<(), String> {
+        if NaxGemm::aot_active() != cfg!(metal_aot) {
+            return Err("aot_active() must mirror cfg(metal_aot)".into());
         }
+        if !NaxGemm::aot_active() {
+            eprintln!("AOT not active on this build (JIT fallback) — cfg(metal_aot) off");
+            return Ok(());
+        }
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping AOT load check");
+            return Ok(());
+        }
+        // AOT is on for THIS build — prove the embedded GEMM loads and is full-K.
+        NaxGemm::new()?;
+        eprintln!("AOT active: embedded metallibs loaded, full-K verified");
+        Ok(())
     }
 
     /// Minimal Metal Performance Primitives probe — confirms the M5 NAX
@@ -5247,14 +5268,14 @@ kernel void mpp_probe(
 ";
 
     #[test]
-    fn mpp_tensor_ops_compiles_as_metal4() {
-        match compile_metal4(MPP_PROBE) {
-            Ok(()) => eprintln!("MPP (mpp::tensor_ops) compiles as Metal 4 on this device ✓"),
-            Err(e) if e.contains("no Metal device") => {
-                eprintln!("no Metal device — skipping MPP compile probe");
-            }
-            Err(e) => panic!("MPP shader failed to compile as Metal 4:\n{e}"),
+    fn mpp_tensor_ops_compiles_as_metal4() -> Result<(), String> {
+        if no_metal_device() {
+            eprintln!("no Metal device — skipping MPP compile probe");
+            return Ok(());
         }
+        compile_metal4(MPP_PROBE)?;
+        eprintln!("MPP (mpp::tensor_ops) compiles as Metal 4 on this device ✓");
+        Ok(())
     }
 
     /// The NAX tensor engine produces a correct GEMM through our runtime.
@@ -5264,7 +5285,7 @@ kernel void mpp_probe(
     /// `B[k,n] = k` must yield `C[m,n] = m` (row mapping) — together these catch
     /// any cooperative-tensor axis swap or scramble in the BaseNAXFrag layout.
     #[test]
-    fn nax_matmul_tile_matches_oracle() {
+    fn nax_matmul_tile_matches_oracle() -> Result<(), String> {
         // The `matmul2d` MPP cooperative-tensor kernel only builds on M5+ (the
         // `Nax` tier); pre-M5 GPUs reject it at pipeline-build time. Skip there —
         // the simdgroup path is covered by the other `nax_matmul_*` tests.
@@ -5273,7 +5294,7 @@ kernel void mpp_probe(
             match MTLCreateSystemDefaultDevice() {
                 None => {
                     eprintln!("no Metal device — skipping NAX matmul tile test");
-                    return;
+                    return Ok(());
                 }
                 Some(device)
                     if device_matmul_tier(&device.name().to_string()) < MatmulTier::Nax =>
@@ -5282,10 +5303,14 @@ kernel void mpp_probe(
                         "device {:?} is not NAX(matmul2d)-capable (needs M5+) — skipping",
                         device.name().to_string()
                     );
-                    return;
+                    return Ok(());
                 }
                 Some(_) => {}
             }
+        }
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping NAX matmul tile test");
+            return Ok(());
         }
         // A[m,k] = (m + k) % 3, B[k,n] = (k + 2*n) % 4  — products ≤ 6, sums
         // over K=16 ≤ 96: all exact in f16 and f32, and distinct per (m,n).
@@ -5296,16 +5321,11 @@ kernel void mpp_probe(
             .map(|i| ((i / 32 + 2 * (i % 32)) % 4) as f32)
             .collect();
 
-        let got = match run_nax_matmul_tile(&a, &b) {
-            Ok(v) => v,
-            Err(e) if e.contains("no Metal device") => {
-                eprintln!("no Metal device — skipping NAX matmul test");
-                return;
-            }
-            Err(e) => panic!("NAX matmul failed: {e}"),
-        };
+        let got = run_nax_matmul_tile(&a, &b)?;
         let want = crate::blas::naive_sgemm(NAX_TILE_M, NAX_TILE_K, NAX_TILE_N, &a, &b);
-        assert_eq!(got, want, "NAX tile must match the naive oracle exactly");
+        if got != want {
+            return Err("NAX tile must match the naive oracle exactly".into());
+        }
 
         // Identity probes — A = I; column then row coordinate.
         let mut ai = vec![0.0f32; NAX_TILE_M * NAX_TILE_K];
@@ -5317,30 +5337,25 @@ kernel void mpp_probe(
             &(0..NAX_TILE_K * NAX_TILE_N)
                 .map(|i| (i % NAX_TILE_N) as f32)
                 .collect::<Vec<_>>(),
-        )
-        .unwrap();
+        )?;
         let row_probe = run_nax_matmul_tile(
             &ai,
             &(0..NAX_TILE_K * NAX_TILE_N)
                 .map(|i| (i / NAX_TILE_N) as f32)
                 .collect::<Vec<_>>(),
-        )
-        .unwrap();
+        )?;
         for m in 0..NAX_TILE_M {
             for n in 0..NAX_TILE_N {
-                assert_eq!(
-                    col_probe[m * NAX_TILE_N + n],
-                    n as f32,
-                    "column map at ({m},{n})"
-                );
-                assert_eq!(
-                    row_probe[m * NAX_TILE_N + n],
-                    m as f32,
-                    "row map at ({m},{n})"
-                );
+                if col_probe[m * NAX_TILE_N + n] != n as f32 {
+                    return Err(format!("column map at ({m},{n})"));
+                }
+                if row_probe[m * NAX_TILE_N + n] != m as f32 {
+                    return Err(format!("row map at ({m},{n})"));
+                }
             }
         }
         eprintln!("NAX matmul2d tile matches the oracle exactly (+ row/col layout) ✓");
+        Ok(())
     }
 
     /// The general tiled NAX GEMM is correct across shapes — including ragged
@@ -5348,15 +5363,12 @@ kernel void mpp_probe(
     /// accumulation. Small-integer inputs are exact in f16, so we assert exact
     /// equality with the naive oracle.
     #[test]
-    fn nax_matmul_general_matches_oracle() {
-        let ctx = match NaxGemm::new() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => {
-                eprintln!("no Metal device — skipping general NAX GEMM test");
-                return;
-            }
-            Err(e) => panic!("NAX GEMM compile failed: {e}"),
-        };
+    fn nax_matmul_general_matches_oracle() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping general NAX GEMM test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
         // Exact tile (16,16,32); ragged in every dim; multi-K; K not /16; thin.
         let shapes = [
             (16usize, 16usize, 32usize),
@@ -5380,6 +5392,7 @@ kernel void mpp_probe(
             "general NAX GEMM matches the oracle across {} shapes ✓",
             shapes.len()
         );
+        Ok(())
     }
 
     /// Shape sweep shared by the transpose-B oracle tests: exact tile, ragged in
@@ -5400,15 +5413,12 @@ kernel void mpp_probe(
     /// `A·Bᵀ` oracle. A wrong staging index would compute a plausible-but-wrong
     /// product the GPU-vs-CPU self-check can't catch, so we pin it to the oracle.
     #[test]
-    fn nax_matmul_unified_transpose_b_matches_oracle() {
-        let ctx = match NaxGemm::new() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => {
-                eprintln!("no Metal device — skipping NAX transpose-B test");
-                return;
-            }
-            Err(e) => panic!("NAX GEMM compile failed: {e}"),
-        };
+    fn nax_matmul_unified_transpose_b_matches_oracle() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping NAX transpose-B test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
         for (m, k, n) in TRANSPOSE_B_SHAPES {
             // a in 0..3, b in 0..4 — exact in f16; f32 accumulation keeps the
             // integer dot products exact, so assert_eq is valid (as in the plain
@@ -5441,20 +5451,18 @@ kernel void mpp_probe(
             "NAX transpose-B (matmul_unified) matches the bt oracle across {} shapes ✓",
             TRANSPOSE_B_SHAPES.len()
         );
+        Ok(())
     }
 
     /// Same guard for the pre-NAX simdgroup "metal matmul" kernel (forced via
     /// `new_simdgroup`), so transpose-B is covered on non-M5 GPUs too.
     #[test]
-    fn simdgroup_matmul_unified_transpose_b_matches_oracle() {
-        let ctx = match NaxGemm::new_simdgroup() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => {
-                eprintln!("no Metal device — skipping simdgroup transpose-B test");
-                return;
-            }
-            Err(e) => panic!("simdgroup GEMM compile failed: {e}"),
-        };
+    fn simdgroup_matmul_unified_transpose_b_matches_oracle() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping simdgroup transpose-B test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new_simdgroup()?;
         for (m, k, n) in TRANSPOSE_B_SHAPES {
             let a: Vec<f32> = (0..m * k).map(|i| (i % 3) as f32).collect();
             let b: Vec<f32> = (0..n * k).map(|i| (i % 4) as f32).collect();
@@ -5484,6 +5492,7 @@ kernel void mpp_probe(
             "simdgroup transpose-B matches the bt oracle across {} shapes ✓",
             TRANSPOSE_B_SHAPES.len()
         );
+        Ok(())
     }
 
     /// f16-B on the pre-NAX simdgroup kernel: with the `KTIR_B_F16` read path the
@@ -5493,15 +5502,12 @@ kernel void mpp_probe(
     /// pins `has_f16_b_pipelines()` true on the simdgroup tier (the gate the GEMM
     /// resolver checks before handing the kernel an f16 B buffer).
     #[test]
-    fn simdgroup_matmul_unified_f16_b_matches_f32() {
-        let ctx = match NaxGemm::new_simdgroup() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => {
-                eprintln!("no Metal device — skipping simdgroup f16-B test");
-                return;
-            }
-            Err(e) => panic!("simdgroup GEMM compile failed: {e}"),
-        };
+    fn simdgroup_matmul_unified_f16_b_matches_f32() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping simdgroup f16-B test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new_simdgroup()?;
         assert!(
             ctx.has_f16_b_pipelines(),
             "simdgroup tier must compile the f16-B pipelines"
@@ -5562,6 +5568,7 @@ kernel void mpp_probe(
             "simdgroup f16-B matches f32-B within f16 tol across {} shapes x {{plain, tb}} ✓",
             TRANSPOSE_B_SHAPES.len()
         );
+        Ok(())
     }
 
     /// The GPU GEMV (m=1 decode fast path) must match the naive oracle EXACTLY,
@@ -5571,15 +5578,12 @@ kernel void mpp_probe(
     /// oracle tests use. The GEMV kernel is plain MSL (no MPP/`matmul2d`), so it
     /// runs on EVERY Apple GPU tier — no NAX gate needed; only the no-device skip.
     #[test]
-    fn metal_gemv_matches_oracle() {
-        let ctx = match NaxGemm::new() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => {
-                eprintln!("no Metal device — skipping GPU GEMV oracle test");
-                return;
-            }
-            Err(e) => panic!("GEMV GEMM compile failed: {e}"),
-        };
+    fn metal_gemv_matches_oracle() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping GPU GEMV oracle test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
         // (k, n) shapes: thin, exact-tile-ish, ragged N, deep K, wide N, n=1.
         let shapes = [
             (1usize, 1usize),
@@ -5642,18 +5646,19 @@ kernel void mpp_probe(
             );
         }
         eprintln!("GPU GEMV matches the oracle (plain + transpose-B + fused) ✓");
+        Ok(())
     }
 
     /// A batched matmul chain (one command buffer, one sync) computes the same
     /// result as the matmuls run separately, and amortizes the per-dispatch
     /// latency: a chain of N small matmuls should be far faster than N calls.
     #[test]
-    fn matmul_chain_matches_and_amortizes() {
-        let ctx = match NaxGemm::new() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => return,
-            Err(e) => panic!("{e}"),
-        };
+    fn matmul_chain_matches_and_amortizes() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping matmul chain test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
         // x (m×k0) · W1 (k0×k1) · W2 (k1×k2) · W3 (k2×k3), with a bias+relu epilogue.
         let (m, k0, k1, k2, k3) = (128usize, 128, 128, 128, 128);
         // Positive inputs: chained f16 matmuls don't cancel, so the f32 oracle
@@ -5733,6 +5738,7 @@ kernel void mpp_probe(
             separate * 1e6,
             separate / chained
         );
+        Ok(())
     }
 
     /// **Combining** many small same-weight matmuls into one tall GEMM is both
@@ -5741,12 +5747,12 @@ kernel void mpp_probe(
     /// many small matmuls on the GPU. Measured speedups: ~1.25× at K=512 up to
     /// ~1.74× at K=2048 (see the module bench).
     #[test]
-    fn combined_matmul_matches_and_wins() {
-        let ctx = match NaxGemm::new() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => return,
-            Err(e) => panic!("{e}"),
-        };
+    fn combined_matmul_matches_and_wins() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping combined matmul test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
         // 16 cores each multiply their 512 rows by the SAME 1024×1024 weights.
         let (count, m, k, n) = (16usize, 512usize, 1024usize, 1024usize);
         let a: Vec<f32> = (0..count * m * k)
@@ -5791,17 +5797,18 @@ kernel void mpp_probe(
             amx_loop * 1e6,
             amx_loop / combined
         );
+        Ok(())
     }
 
     /// Zero-copy unified-memory matmul: correct, and free of the host↔device
     /// fill/readback the copy-based `run` pays (CPU and GPU share the bytes).
     #[test]
-    fn unified_matmul_zero_copy_matches_and_is_faster() {
-        let ctx = match NaxGemm::new() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => return,
-            Err(e) => panic!("{e}"),
-        };
+    fn unified_matmul_zero_copy_matches_and_is_faster() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping zero-copy matmul test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
         let (m, k, n) = (4096usize, 1024usize, 1024usize);
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.02).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.02).collect();
@@ -5840,18 +5847,19 @@ kernel void mpp_probe(
             copied * 1e6,
             copied / zc
         );
+        Ok(())
     }
 
     /// A batched dispatch (independent same-shape GEMMs in one submission)
     /// matches running them separately. (For *shared*-weight matmuls,
     /// `run_combined` is the faster path — see `combined_matmul_matches_and_wins`.)
     #[test]
-    fn batched_matmul_matches_oracle() {
-        let ctx = match NaxGemm::new() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => return,
-            Err(e) => panic!("{e}"),
-        };
+    fn batched_matmul_matches_oracle() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping batched matmul test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
         let (batch, m, k, n) = (64usize, 256usize, 256usize, 256usize);
         let a: Vec<f32> = (0..batch * m * k)
             .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
@@ -5875,18 +5883,19 @@ kernel void mpp_probe(
             }
         }
         assert!(max_rel < 0.05, "batched mismatch, max rel err {max_rel}");
+        Ok(())
     }
 
     /// The pre-M5 `simdgroup_float8x8` GEMM is correct across shapes (incl.
     /// ragged) and supports the same fused epilogue. Forced on the M5 so we can
     /// validate that code path here.
     #[test]
-    fn simdgroup_matmul_matches_oracle() {
-        let ctx = match NaxGemm::new_simdgroup() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => return,
-            Err(e) => panic!("simdgroup compile failed: {e}"),
-        };
+    fn simdgroup_matmul_matches_oracle() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping simdgroup matmul test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new_simdgroup()?;
         // Plain matmul across shapes (small ints exact in f32).
         for (m, k, n) in [
             (8usize, 8usize, 8usize),
@@ -5917,17 +5926,18 @@ kernel void mpp_probe(
             );
         }
         eprintln!("simdgroup_float8x8 GEMM (+fused epilogue) matches the oracle ✓");
+        Ok(())
     }
 
     /// Fused matmul→elementwise epilogue (`D = act(A·B BINOP E)`) computed in one
     /// kernel matches doing the matmul then the elementwise op separately.
     #[test]
-    fn nax_matmul_fused_epilogue_matches_oracle() {
-        let ctx = match NaxGemm::new() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => return,
-            Err(e) => panic!("{e}"),
-        };
+    fn nax_matmul_fused_epilogue_matches_oracle() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping fused epilogue test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
         let (m, k, n) = (130usize, 40usize, 200usize); // ragged, multi-block
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 5) as f32 - 2.0) * 0.5).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
@@ -5960,17 +5970,18 @@ kernel void mpp_probe(
             "fused matmul→elementwise epilogue matches oracle across {} ops ✓",
             cases.len()
         );
+        Ok(())
     }
 
     /// Random (non-f16-exact) data: the NAX GEMM agrees with the f32 oracle to
     /// f16 tolerance. Documents the precision the engine actually delivers.
     #[test]
-    fn nax_matmul_general_f16_tolerance() {
-        let ctx = match NaxGemm::new() {
-            Ok(c) => c,
-            Err(e) if e.contains("no Metal device") => return,
-            Err(e) => panic!("{e}"),
-        };
+    fn nax_matmul_general_f16_tolerance() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping NAX f16-tolerance test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
         let (m, k, n) = (64usize, 48usize, 96usize);
         // Deterministic pseudo-random in [-1, 1].
         let prng = |i: usize| ((i.wrapping_mul(2654435761) % 2000) as f32 / 1000.0) - 1.0;
@@ -5989,6 +6000,7 @@ kernel void mpp_probe(
             "max relative error {max_rel} exceeds f16 tolerance"
         );
         eprintln!("NAX GEMM vs f32 oracle: max relative error {max_rel:.4} (f16) ✓");
+        Ok(())
     }
 
     /// Real benchmark: NAX vs naive vs the linked BLAS (Accelerate on macOS) on
