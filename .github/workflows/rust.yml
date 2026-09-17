@@ -53,7 +53,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Cache CUDA toolkit
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /usr/local/cuda-12.6
           key: ${{ runner.os }}-cuda-12.6
@@ -172,7 +172,7 @@ jobs:
       # default, so we opt in with `--ignored` and filter to the SmolLM tier.
       # The model (~100 MB) is cached across runs keyed on its id.
       - name: Cache HF models
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           # Covers SmolLM-135M (~100 MB) AND gemma-4-12B-it-4bit (~6.3 GB, used by the
