@@ -44,6 +44,38 @@ pub fn assemble_matmul_seeded(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    try_assemble_matmul_seeded(op_name, m, n, k, batch, a, w, o, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"))
+}
+
+/// [`assemble_matmul_seeded`] AS A `Result` — the form a producer-facing entry point needs, exactly as
+/// [`crate::emit::try_assemble_transpose`] is that form for the transpose door.
+///
+/// ⛔ THE PANIC IS RIGHT FOR THE ASSEMBLERS AND WRONG FOR THE DOOR, and this matmul is now the second
+/// op to show why. Inside a `#[forward]` expansion a panic IS the build error, which is what
+/// `assemble_matmul`'s own doc means by "a panic here is a true internal-consistency bug, not
+/// reachable from model input" — true of the SUB-STICK witness it names. It is NOT true of the
+/// PLACEMENT-FOOTPRINT refusal `resolve_seg_base` raises, which is reachable from the caller's own
+/// buffer SIZING and was reached twice this session by a KTIR producer whose parameters are a Triton
+/// kernel's descriptors. Reported as a panic it exits 101 with no stage label, so a driver that
+/// tabulates its own `REFUSED <stage> <message>` lines shows a footprint mismatch as a BLANK ROW
+/// rather than as a failure — a reporting hole precisely where the report has to be trusted.
+///
+/// The panicking form keeps its signature and its panic for every existing caller, and now delegates
+/// here so there is ONE emission path rather than two that could drift.
+#[allow(clippy::too_many_arguments)]
+pub fn try_assemble_matmul_seeded(
+    op_name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+    batch: u32,
+    a: &Stk<crate::sdsc_abstract::RowBlockedTag>,
+    w: &Stk<crate::sdsc_abstract::KernelTag>,
+    o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
     // ⛔ THE OCCUPANCY PAD IS ONLY REAL IF SOMETHING RESERVED IT — see
     // [`out_width_the_weight_holds`]. A no-op for every caller whose layout reserves the padded
     // weight; it drops the pad for a producer whose weight is the CALLER'S OWN tensor.
@@ -52,11 +84,9 @@ pub fn assemble_matmul_seeded(
     // is a Kernel, its output is RowBlocked — a `cargo build` type error otherwise (you cannot hand a
     // `Flat`/`RowScalar` tensor here). The handles carry only the emitter NAME into `matmul_opspec`
     // (which owns df/shape), so the emit is byte-identical — the types are a pure addressing guard.
-    let op = matmul_opspec(m, n, k, batch, a.name(), w.name(), o.name())
-        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    let op = matmul_opspec(m, n, k, batch, a.name(), w.name(), o.name())?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
 
 /// ⛔⛔⛔ THE `out` WIDTH THE LAYOUT ACTUALLY RESERVED FOR THIS MATMUL'S WEIGHT — because an
