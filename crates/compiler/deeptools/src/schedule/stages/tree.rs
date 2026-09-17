@@ -220,10 +220,10 @@ impl TreeData {
     }
 
     /// ⭐⭐ THE FIRST **REAL** NODE OF `scheduleTree_`, WHICH IS NOT `getHead()`. `ScheduleTree` holds
-    /// `LoopNode head_` BY VALUE (`dsc/dsc2.h:622`) as an UNNAMED SENTINEL — `empty()` is
-    /// `head_.next_.empty()` (`:626`), `getHead()` hands back `&head_` (`:636`), and its `name_` is
+    /// `LoopNode head_` BY VALUE (`dsc/dsc2.h:623`) as an UNNAMED SENTINEL — `empty()` is
+    /// `head_.next_.empty()` (`:627`), `getHead()` hands back `&head_` (`:637`), and its `name_` is
     /// `""`, which is why every top-level node serialises with `"prev_" : ""`
-    /// (`dsc/designSpaceConfig.cpp:379-380`: `prevName = node->prev_ ? node->prev_->name_ : ""`).
+    /// (`dsc/dsc2.cpp:379-380`: `prevName = node->prev_ ? node->prev_->name_ : ""`).
     /// This id is the sentinel's first child — the `block "root_level_operations"` that is entry `[0]`
     /// of a scheduled `scheduleTree_` array.
     ///
@@ -240,8 +240,8 @@ impl TreeData {
     }
 
     /// `getHead()->denId_` — the SENTINEL's, which serialises as `scheduleTreeHeadDenId_`
-    /// (`dsc/designSpaceConfig.cpp:368`) and which `ScheduleTree()` initialises to the core datastage
-    /// (`dsc/dsc2.h:628`).
+    /// (`dsc/dsc2.cpp:367-368`) and which `ScheduleTree()` initialises to the core datastage
+    /// (`dsc/dsc2.h:629`).
     pub(super) const fn head_den(&self) -> Option<DatastageId> {
         self.head_den
     }
@@ -480,7 +480,7 @@ impl TreeData {
     ///
     /// ⭐⭐ IT STARTS AT THE SAME NODE THE REFERENCE DOES, AND THE MATCH IS NOT A COINCIDENCE.
     /// `traverseTreeDFS(nullptr, ..)` seeds its queue from `head_.next_` and so **EXCLUDES** the head
-    /// (`dsc/dsc2.cpp:2231-2234`), while this seeds from [`Self::head`] and INCLUDES it — and the two
+    /// (`dsc/dsc2.cpp:2232-2234`), while this seeds from [`Self::head`] and INCLUDES it — and the two
     /// agree because that id is `head_.next_.at(0)` and not `getHead()`: the reference's head is the
     /// unnamed `LoopNode` sentinel this tree holds no entry for. Its ordering is the same too — a
     /// `deque` with the children `push_front`ed in reverse (`:2259-2261`) against this stack with the
@@ -489,7 +489,7 @@ impl TreeData {
     /// ⛔ WHAT THIS IS **NOT** IS `traverseTreeDFS`'S FILTERS. That body drops a node whose
     /// `isNodeRelevant(comp, clId, coreId)` is false and does not descend into it (`:2245-2247`), skips
     /// an `excludeList` member, keeps only the requested `nodeTypes`, and stops descending a `LOOP`
-    /// past `maxLoopDepth` (`:2255-2256`). This is the unfiltered walk; each projection above states
+    /// past `maxLoopDepth` (`:2253-2254`). This is the unfiltered walk; each projection above states
     /// which of those it reduces to, and the relevance filter needs
     /// [`Self::relevant_comps`] — see that field.
     pub fn dfs(&self) -> Vec<NodeId> {

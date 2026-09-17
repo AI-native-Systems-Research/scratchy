@@ -3006,10 +3006,13 @@ pub struct ChildPos(usize);
 /// (`:1159`), `setRelevantCompCoreCl` writes its `relevantComps_` (`:2656`) and erases it (`:2977`),
 /// and `getOwnerLoop()` hands it out as the owner loop of every top-level node (`:5035`).
 ///
-/// ⛔ `Clone` DEEP-COPIES WHERE `copyFrom` REFUSES. `ScheduleTree::copyFrom` (`dsc/dsc2.cpp:2267`)
-/// raises *"Not yet able to deep copy a schedule tree"* for any non-empty tree, with the deep copy it
-/// means commented out directly above the raise; nothing in the reference tree copies a filled one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// ⛔ NOT [`Clone`], AND THE REFERENCE HAS NO COPY TO BE FAITHFUL TO. `copyFrom` (`dsc/dsc2.cpp:2267`)
+/// raises *"Not yet able to deep copy a schedule tree"* for a non-empty tree (`:2285-2287`) with the
+/// deep copy it means commented out above it, and for an EMPTY one it copies nothing at all — so the
+/// copy constructor's own `head_` is default-constructed and its `denId_` is the `LoopNode` `-1`
+/// (`dsc/dsc2.h:574`, `:633`), not the `0` the source carries. `operator=` is deleted *"so that copy
+/// needs to be more voluntary"* (`:635-636`). Moving is `= default` (`:631`) and is Rust's own move.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ScheduleTree {
     /// Field: e016_ScheduleTree.head_
     ///
@@ -3095,9 +3098,12 @@ impl ScheduleTree {
         find_block_mut(&mut self.head.block, accepts)
     }
 
-    /// The same search over the `CONDITION` nodes, which [`Self::find_block_mut`] descends THROUGH
-    /// and never yields — `dsc2::ConditionNode` is a `BlockNode` in the reference and this type holds
-    /// its two children in [`ConditionNode::next`], so reaching one by name is its own search.
+    /// The same search over the TWO-REGION `CONDITION` nodes, which [`Self::find_block_mut`] descends
+    /// THROUGH and never yields — `dsc2::ConditionNode` is a `BlockNode` in the reference and this
+    /// type holds its two children in [`ConditionNode::next`], so reaching one by name is its own
+    /// search. ⛔ NOT THE REFERENCE'S `{CONDITION}` WALKS, which take EVERY condition below a start
+    /// node (`ddc/ddc_transformation_util.cpp:261`, `:308`) or in reverse tree order
+    /// (`ddc/ddcv1.cpp:3461`); each of those belongs to the pass that walks.
     pub fn find_guarded_mut(
         &mut self,
         accepts: impl Fn(&ConditionNode) -> bool + Copy,
@@ -3139,12 +3145,37 @@ impl ScheduleTree {
     }
 }
 
+/// THE BLOCK A NODE HANGS OFF — `getPrev()` (`dsc/dsc2.h:463`), which is a `BlockNode*` in the
+/// reference AND SO NAMES EITHER FORM: `ConditionNode` derives from `BlockNode` (`dsc/dsc2.h:685`),
+/// so a `..._then_region` block minted under one has that condition as its `prev_`
+/// (`ddc/ddc_transformation_util.cpp:583-588`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentBlock<'a> {
+    /// A `BLOCK` node, or a `CONDITION` node holding one child vector.
+    Block(&'a BlockNode),
+    /// A `CONDITION` node whose children are its two regions.
+    Guarded(&'a ConditionNode),
+}
+
+impl<'a> ParentBlock<'a> {
+    /// `prev_->name_` and `prev_->relevantComps_` — the `ScheduleNode` part every parent has, which
+    /// is what a serialised `"prev_"` (`dsc/dsc2.cpp:379-380`) and `setRelevantCompCoreCl`'s
+    /// `prev_->relevantComps_.at(NO_COMPONENT)` (`:2660`) each read off it.
+    #[must_use]
+    pub const fn base(self) -> &'a NodeBase {
+        match self {
+            Self::Block(block) => &block.base,
+            Self::Guarded(cond) => &cond.base,
+        }
+    }
+}
+
 /// WHAT A NODE'S `prev_` CHAIN ANSWERS — the block whose child list holds it, and the loops that
 /// enclose it, innermost first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ancestors<'a> {
-    /// `getPrev()` (`dsc/dsc2.h:462`).
-    pub parent: &'a BlockNode,
+    /// `getPrev()` (`dsc/dsc2.h:463`).
+    pub parent: ParentBlock<'a>,
     /// The same chain filtered to `LOOP`, innermost first — the loops BELOW the sentinel, which is
     /// the chain the reference's outward walks take (`while (currNode != getHead())`).
     pub loops: Vec<&'a LoopNode>,
@@ -3179,7 +3210,7 @@ impl<'a> Ancestors<'a> {
 
 /// The parent and enclosing loops of the node named `name` below `parent`, with `loops` the enclosing
 /// loops so far — the sentinel is [`ScheduleTree::ancestors`]'s to add.
-type Ancestry<'a> = (&'a BlockNode, Vec<&'a LoopNode>);
+type Ancestry<'a> = (ParentBlock<'a>, Vec<&'a LoopNode>);
 
 fn ancestors_in<'a>(
     parent: &'a BlockNode,
@@ -3188,7 +3219,7 @@ fn ancestors_in<'a>(
 ) -> Option<Ancestry<'a>> {
     for child in &parent.children {
         if child.name() == name {
-            return Some((parent, loops.clone()));
+            return Some((ParentBlock::Block(parent), loops.clone()));
         }
         let found = match child {
             SchedNode::Block(inner) | SchedNode::Condition(inner) => {
@@ -3200,11 +3231,16 @@ fn ancestors_in<'a>(
                 loops.remove(0);
                 found
             }
-            SchedNode::Guarded(cond) => cond
-                .next
-                .regions()
-                .into_iter()
-                .find_map(|region| ancestors_in(region, loops, name)),
+            // ⭐ A REGION IS A NAMED `BLOCK` NODE OF THE TREE AND NOT AN ANONYMOUS SLOT: entry 249
+            // mints `<cond>_then_region`/`_else_region` (`ddc/ddc_transformation_util.cpp:583-588`),
+            // which [`ScheduleTree::find_block_mut`] hands back by name, so its `prev_` — this
+            // condition — has to be answerable too.
+            SchedNode::Guarded(cond) => cond.next.regions().iter().find_map(|region| {
+                if &region.base.name == name {
+                    return Some((ParentBlock::Guarded(cond), loops.clone()));
+                }
+                ancestors_in(region, loops, name)
+            }),
             SchedNode::StickMask(_) | SchedNode::Sync(_) | SchedNode::Leaf(_) => None,
         };
         if found.is_some() {
@@ -4183,7 +4219,7 @@ mod tests_e009_schedule_node {
         let found = tree
             .ancestors(&NodeName("transfer".to_owned()))
             .expect("the transfer is in the tree");
-        assert_eq!(found.parent.base.name, NodeName("block".to_owned()));
+        assert_eq!(found.parent.base().name, NodeName("block".to_owned()));
         assert_eq!(
             found.owner_loop().block.base.name,
             NodeName("loop_y".to_owned())
@@ -4805,6 +4841,105 @@ mod tests_e016_schedule_tree {
         tree.clear();
         assert!(tree.is_empty());
         assert_eq!(tree.head_den(), Some(DatastageId(3)));
+    }
+
+    /// A CONDITION'S REGIONS ARE NAMED `BLOCK` NODES OF THE TREE — entry 249 mints
+    /// `<cond>_then_region`/`_else_region` (`ddc/ddc_transformation_util.cpp:583-588`), so a `{BLOCK}`
+    /// walk yields them, `getPrev()` on one is the CONDITION (`dsc/dsc2.h:463`) and `getOwnerLoop()`
+    /// is the loop above it — all three for the region itself AND for a node inside it.
+    #[test]
+    fn a_conditions_named_regions_are_blocks_of_the_tree_whose_prev_is_the_condition() {
+        let mut cond = ConditionNode {
+            base: NodeBase::named(NodeName("cond_y".to_owned())),
+            ..ConditionNode::default()
+        };
+        assert_eq!(
+            cond.add_region(BlockNode {
+                base: NodeBase::named(NodeName("cond_y_then_region".to_owned())),
+                children: vec![SchedNode::Sync(SyncNode {
+                    base: NodeBase::named(NodeName("sync_lxsu_send_lxlu".to_owned())),
+                    units: SyncUnits::new(SenComponent::L3su, [SenComponent::L3lu]),
+                    direction: SyncDirection::Send,
+                    strength: SyncStrength::Hard,
+                    implicit_sync_ref_transfer: None,
+                    other_ends: Vec::new(),
+                })],
+            }),
+            Some(())
+        );
+        assert_eq!(
+            cond.add_region(BlockNode {
+                base: NodeBase::named(NodeName("cond_y_else_region".to_owned())),
+                children: Vec::new(),
+            }),
+            Some(())
+        );
+        let mut enclosing = LoopNode::bare(BlockNode {
+            base: NodeBase::named(NodeName("loop_ds0_ds1_y".to_owned())),
+            children: vec![SchedNode::Guarded(Box::new(cond))],
+        });
+        enclosing.band = LoopBand::Counted(vec![LoopDim {
+            dim: PrimaryDim::Y,
+            kind: MetaDimKind::Unpadded,
+        }]);
+        let mut tree = ScheduleTree::new(BlockNode {
+            base: NodeBase::default(),
+            children: vec![SchedNode::Loop(Box::new(enclosing))],
+        });
+
+        assert_eq!(
+            tree.blocks_dfs()
+                .iter()
+                .map(|block| block.base.name.0.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "cond_y_then_region".to_owned(),
+                "cond_y_else_region".to_owned()
+            ],
+            "`traverseTreeDFS(nullptr, {{BLOCK}})` yields both regions, in `next_` order"
+        );
+
+        let region = tree
+            .ancestors(&NodeName("cond_y_then_region".to_owned()))
+            .expect("a region is a named node of the tree");
+        assert!(
+            matches!(region.parent, ParentBlock::Guarded(_)),
+            "`prev_` of a region is the ConditionNode that owns it"
+        );
+        assert_eq!(region.parent.base().name, NodeName("cond_y".to_owned()));
+        assert_eq!(
+            region.owner_loop().block.base.name,
+            NodeName("loop_ds0_ds1_y".to_owned())
+        );
+        assert_eq!(
+            region
+                .parent_dim_loop(PrimaryDim::Y)
+                .map(|held| held.block.base.name.clone()),
+            Some(NodeName("loop_ds0_ds1_y".to_owned()))
+        );
+
+        let inside = tree
+            .ancestors(&NodeName("sync_lxsu_send_lxlu".to_owned()))
+            .expect("the sync inside the then-region");
+        assert_eq!(
+            inside.parent.base().name,
+            NodeName("cond_y_then_region".to_owned())
+        );
+        assert_eq!(
+            inside.owner_loop().block.base.name,
+            NodeName("loop_ds0_ds1_y".to_owned())
+        );
+
+        assert!(
+            tree.find_guarded_mut(|held| held.base.name.0 == "cond_y")
+                .is_some(),
+            "the two-region condition is reachable by name"
+        );
+        assert!(
+            tree.find_sync_mut(|held| held.direction == SyncDirection::Send)
+                .is_some(),
+            "and so is a sync held inside one of its regions"
+        );
     }
 }
 

@@ -40,10 +40,10 @@ use super::tree::{Kind, Org, TreeData, seed_allocate_node};
 /// this name with `prev_ = ""`.
 ///
 /// ⛔ IT IS NOT `getHead()->name_`, WHICH IS `""` — the doc that said so was wrong about which node
-/// this is. `ScheduleTree` holds `LoopNode head_` by value as an unnamed sentinel (`dsc/dsc2.h:622`)
-/// and `traverseTreeDFS()` seeds from `head_.next_` (`dsc/dsc2.cpp:2231-2234`), so the sentinel never
+/// this is. `ScheduleTree` holds `LoopNode head_` by value as an unnamed sentinel (`dsc/dsc2.h:623`)
+/// and `traverseTreeDFS()` seeds from `head_.next_` (`dsc/dsc2.cpp:2232-2234`), so the sentinel never
 /// reaches the serialised array and `"prev_" : ""` on entry `[0]` is *"my parent is the sentinel"* and
-/// not *"I have no parent"* (`dsc/designSpaceConfig.cpp:379-380`). The block this names is the first
+/// not *"I have no parent"* (`dsc/dsc2.cpp:379-380`). The block this names is the first
 /// REAL node, which is what [`crate::schedule::stages::TreeData::head`] holds.
 const ROOT_BLOCK_NAME: &str = "root_level_operations";
 
