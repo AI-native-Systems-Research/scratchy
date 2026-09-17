@@ -21,6 +21,9 @@ serve = ["dep:axum", "dep:tower-http"]
 otel = ["scratchy-core-common/otel"]
 cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda", "scratchy-target-cuda/cuda"]
 nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
+# Test-only: see scratchy-serving-worker/test-model-smollm2. Enables one model so
+# `chat_template`'s compiled-path tests have a registration to assert against.
+test-compiled-chat = ["metal", "scratchy-serving-worker/test-model-smollm2"]
 metal = ["scratchy-serving-worker/metal", "scratchy-forward-compiler/metal"]
 spyre = ["scratchy-serving-worker/spyre"]
 # A card, and the emulator — siblings, forwarded to the worker's own tiers.
@@ -46,6 +49,8 @@ scratchy-core-model = { workspace = true }
 scratchy-quantizations = { workspace = true }
 scratchy-vision = { workspace = true, optional = true }
 scratchy-forward-compiler = { workspace = true }
+# Runtime half only: the CompiledTemplate contract. No minijinja via this edge.
+scratchy-chat-template-compiler = { workspace = true }
 # The cross-arch MM registry (`resolve_mm_metadata`) relocated below the
 # neutral `ScratchyWeights` trait into `scratchy-target-cuda`; multimodal.rs
 # resolves arch metadata through it. Optional + backend-gated like the rest.

@@ -44,6 +44,16 @@ use std::fmt::Write as _;
 
 use serde_json::Value as Json;
 
+/// Re-exported so GENERATED CODE has exactly one crate to name.
+///
+/// ⛔ LOAD-BEARING FOR CONSUMERS. The emitted file refers to JSON types through
+/// this re-export, never through `::serde_json`. Otherwise every crate that
+/// `include!`s generated code would need its own `serde_json` dependency — a
+/// hidden requirement that shows up as a confusing "cannot find `serde_json` in
+/// the crate root" error in a file the consumer never wrote. Generated code must
+/// only name paths it can guarantee.
+pub use serde_json;
+
 /// A Jinja value.
 ///
 /// `Undefined` is a distinct state from JSON `null`: Jinja renders a missing

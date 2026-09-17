@@ -21,6 +21,11 @@
 // network call, no local hf-hub cache read.
 include!(concat!(env!("OUT_DIR"), "/hf_registry.rs"));
 
+// Compiled chat templates: one `pub mod chat_<stem>` plus its
+// `inventory::submit!` per enabled model that has a vendored
+// `configs/<arch>/<stem>.chat.jinja`. Empty when none do.
+include!(concat!(env!("OUT_DIR"), "/chat_templates.rs"));
+
 /// The compiled-in HF model registry — see [`COMPILED_HF_REGISTRY`].
 pub fn compiled_hf_registry() -> &'static [&'static str] {
     COMPILED_HF_REGISTRY

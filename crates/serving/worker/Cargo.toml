@@ -12,6 +12,12 @@ default = []
 forward-telemetry = ["scratchy-target-metal?/forward-telemetry", "scratchy-core-common/forward-telemetry"]
 sampler-telemetry = ["scratchy-target-metal?/sampler-telemetry", "scratchy-core-common/sampler-telemetry"]
 cuda = ["cudarc", "dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-target-cuda", "dep:scratchy-builder-cuda", "scratchy-builder-cuda/cuda", "scratchy-forward-compiler/cuda", "scratchy-models/cuda", "scratchy-target-cuda/cuda"]
+# ⛔ TEST-ONLY, NOT A PRODUCT FEATURE. Compiles one small model in so the
+# compiled-chat-template path is actually exercised by tests instead of being
+# skipped by an empty registry. serving-worker owns this because it is the only
+# crate on the path with a DIRECT scratchy-models dependency, so it is the only
+# one that can name a model feature.
+test-model-smollm2 = ["metal", "scratchy-models/smollm2-135m"]
 metal = ["dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-target-metal", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "scratchy-forward-compiler/metal", "scratchy-models/metal"]
 # Multimodal capability, forwarded from `scr`'s `multimodal` feature via
 # scratchy-serving-api. No-op unless a backend that has one is also active.

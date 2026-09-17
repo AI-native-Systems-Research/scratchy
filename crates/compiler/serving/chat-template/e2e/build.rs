@@ -37,8 +37,11 @@ fn main() {
 
         let file = out.join(format!("{stem}_chat.rs"));
         std::fs::write(&file, &code).unwrap();
+        // The generated file imports what it needs itself, so the wrapper is a
+        // bare `pub mod` — no glob import, and no serde_json dependency required
+        // of the including crate.
         modules.push_str(&format!(
-            "pub mod {stem} {{\n    use scratchy_chat_template_compiler::*;\n    include!(concat!(env!(\"OUT_DIR\"), \"/{stem}_chat.rs\"));\n}}\n"
+            "pub mod {stem} {{\n    include!(concat!(env!(\"OUT_DIR\"), \"/{stem}_chat.rs\"));\n}}\n"
         ));
     }
     std::fs::write(out.join("templates.rs"), modules).unwrap();
