@@ -38,6 +38,20 @@ use crate::tool_parser::{
     DeltaToolCall, StreamingToolParserState, ToolCallParser, ToolParserDelta,
 };
 
+/// Upper bound on `n` (completions per request), matching the OpenAI API's own limit. Without
+/// this, a client-supplied `n` feeds `Vec::with_capacity(n)`/`Vec::with_capacity(prompts*n)`
+/// directly — an attacker-controlled allocation size (CWE-789).
+const MAX_N: u32 = 128;
+
+fn validate_n(n: u32) -> ServeResult<usize> {
+    if n > MAX_N {
+        return Err(ServeError::Validation(format!(
+            "n={n} exceeds the maximum of {MAX_N}"
+        )));
+    }
+    Ok(n.max(1) as usize)
+}
+
 // ---------------------------------------------------------------------------
 // Parallel detokenization type aliases
 // ---------------------------------------------------------------------------
@@ -611,7 +625,7 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = request.n.max(1) as usize;
+        let n = validate_n(request.n)?;
 
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
 
@@ -948,7 +962,7 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = request.n.max(1) as usize;
+        let n = validate_n(request.n)?;
 
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
         let mut ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
@@ -1077,7 +1091,7 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = request.n.max(1) as usize;
+        let n = validate_n(request.n)?;
 
         let sampling_params = self.build_sampling_params_from_completion(&request)?;
 
@@ -1265,7 +1279,7 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = request.n.max(1) as usize;
+        let n = validate_n(request.n)?;
 
         let sampling_params = self.build_sampling_params_from_completion(&request)?;
 

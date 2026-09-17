@@ -401,7 +401,9 @@ mod tests {
         let _ctx = init_cuda();
         unsafe {
             let ptr = mem_alloc_host(4096).expect("alloc host");
-            assert!(!ptr.is_null());
+            if ptr.is_null() {
+                panic!("alloc host returned a null pointer");
+            }
             // Write to pinned memory to verify it's usable.
             std::ptr::write_bytes(ptr, 0xAB, 4096);
             mem_free_host(ptr).expect("free host");
@@ -554,6 +556,9 @@ mod tests {
             memcpy_dtoh_async(host, gpu, 256, s2).expect("dtoh");
             stream_synchronize(s2).expect("sync");
 
+            if host.is_null() {
+                panic!("host pointer is null");
+            }
             assert_eq!(*host, 0x42);
 
             event_destroy(event).unwrap();
@@ -592,6 +597,9 @@ mod tests {
             memcpy_dtoh_async(host, gpu, 256, stream).expect("dtoh");
             stream_synchronize(stream).expect("sync2");
 
+            if host.is_null() {
+                panic!("host pointer is null");
+            }
             assert_eq!(*host, 0xAB);
 
             graph_exec_destroy(exec).unwrap();
