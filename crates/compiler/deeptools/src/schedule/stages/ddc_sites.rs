@@ -44,8 +44,8 @@ use crate::schedule::ddc::transformation_util as tu;
 use crate::schedule::ddc::v1;
 use crate::schedule::ddl::conversion as conv;
 use crate::schedule::dsc2::{
-    BlockNode, ComputeNode, CondRegions, ConditionNode, LdsIdx, LoopNode, NodeName, SyncNode,
-    SyncUnits, TransferNode, WordLength,
+    BlockNode, ComputeNode, CondRegions, ConditionNode, LdsIdx, LoopBand, LoopNode, NodeName,
+    SyncNode, SyncUnits, TransferNode, WordLength,
 };
 use crate::schedule::l3::dl_ops::AddressFoldCoords;
 use crate::schedule::l3::dsc::{DscIdx, Symbolic, SymbolicDimInfo, WkSlice};
@@ -1385,9 +1385,11 @@ impl conv::ScheduleWrites for Dsc2Ddl<'_, '_> {
     /// [`None`] here is that same fact, reached from the other side.
     fn add_loop(&mut self, parent: NodeId, held: LoopNode) -> Option<NodeId> {
         let (num, den) = (held.num?, held.den?);
-        if held.parametric_lds.is_some() {
+        // ⛔ TWO REFUSALS, NOT THREE: [`LoopBand::Parametric`] IS `isParametricLoop_` AND the
+        // `parametricLdsIdx_` it is minted with, so no half-parametric loop can reach the arm below.
+        let LoopBand::Counted(dims) = &held.band else {
             return None;
-        }
+        };
         let name = held.block.base.name.clone();
         // `dims_`, IN THE LOOP'S OWN ORDER — non-empty by [`tu::LoopDims`]' construction, which is
         // entry 114's *"Cannot construct loop with no dimensions"* made unspellable. The DDL arm has
@@ -1396,7 +1398,7 @@ impl conv::ScheduleWrites for Dsc2Ddl<'_, '_> {
             dim: dim.dim,
             kind: dim.kind,
         };
-        let (first, rest) = held.dims.split_first()?;
+        let (first, rest) = dims.split_first()?;
         let minted = tu::LoopNode {
             name: name.clone(),
             num,
@@ -1458,15 +1460,22 @@ impl conv::ScheduleWrites for Dsc2Ddl<'_, '_> {
         if !matches!(held.next, CondRegions::Empty) {
             return None;
         }
+        let (loop_cond, cores) = if held.has_core_cl_cond() {
+            (None, Some(v1::CoreClSet(held.core_cl_cond.clone())))
+        } else {
+            (Some(held.loop_cond.clone()), None)
+        };
         let tree = self.state.tree(self.dsc)?;
         let cond = super::tree::Cond {
             // ⭐ `hasCoreClCond()` DECIDES WHICH HALF IS STATED — an empty `twoLevelOrOfAnds_` IS the
             // core/corelet-guarded case (`dsc/dsc2.h:693-695`), so the empty composite is [`None`]
             // here rather than a stated-empty guard.
-            loop_cond: (!held.loop_cond.two_level_or_of_ands.is_empty())
-                .then(|| held.loop_cond.clone()),
-            cores: (!held.core_cl_cond.is_empty())
-                .then(|| v1::CoreClSet(held.core_cl_cond.clone())),
+            // ⛔ ONE GUARD, NEVER BOTH — *"only loopCond_ or coreClCond_ is filled, not both"*
+            // (`:689`). Probing the two halves INDEPENDENTLY stated both for a node carrying both,
+            // and it is the same carrier field [`super::ddc_tree`]'s `mint_condition` writes off this
+            // selector, so the two writers must not disagree on which half guards a condition.
+            loop_cond,
+            cores,
             then_region: Vec::new(),
             else_region: Vec::new(),
         };

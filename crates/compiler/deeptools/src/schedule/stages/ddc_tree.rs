@@ -42,7 +42,7 @@ use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::transformation_util::InsertionPoint;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{
-    ComputeNode, CondRegions, ConditionNode, NodeName, SchedNode, TransferNode,
+    ComputeNode, CondRegions, ConditionNode, LoopBand, NodeName, SchedNode, TransferNode,
 };
 use crate::units::Corelet;
 
@@ -682,14 +682,14 @@ fn mint_sched_node(tree: &mut TreeData, held: &SchedNode, at: InsertionPoint) ->
         // construct loop with no dimensions"* unspellable.
         SchedNode::Loop(node) => {
             let (num, den) = (node.num?, node.den?);
-            if node.parametric_lds.is_some() {
+            let LoopBand::Counted(dims) = &node.band else {
                 return None;
-            }
+            };
             let kinded = |dim: &crate::schedule::dsc2::LoopDim| PrimaryDimAndKind {
                 dim: dim.dim,
                 kind: dim.kind,
             };
-            let (first, rest) = node.dims.split_first()?;
+            let (first, rest) = dims.split_first()?;
             (
                 node.block.base.name.clone(),
                 Kind::Loop(HeldLoop {
@@ -1069,6 +1069,7 @@ mod tests {
     /// refuses one rather than dropping the flag, exactly as `Dsc2Store`'s `add_loop` does.
     #[test]
     fn a_parametric_loop_is_refused_rather_than_minted_with_its_flag_dropped() {
+        use crate::schedule::dsc2::LoopBand as Band;
         use crate::schedule::dsc2::{LoopDim, LoopNode, NodeBase};
 
         let (mut tree, root) = a_rooted_tree();
@@ -1081,7 +1082,7 @@ mod tests {
             children: Vec::new(),
         };
         let plain = LoopNode {
-            dims: dims.clone(),
+            band: Band::Counted(dims.clone()),
             num: Some(crate::schedule::ddc::metadata::DatastageId(0)),
             den: Some(crate::schedule::ddc::metadata::DatastageId(1)),
             ..LoopNode::bare(block)
@@ -1094,13 +1095,16 @@ mod tests {
         .expect("a loop with a real numId_/denId_ pair is spliceable");
         assert_eq!(tree.node_kind(minted), Some(NodeKind::Loop));
 
-        // ⛔ THE PARAMETRIC TWIN IS REFUSED — both for its `parametricLdsIdx_` and, on the other side,
-        // for the `-1` pair it would carry.
+        // ⛔ THE PARAMETRIC TWIN IS REFUSED — the [`Band::Parametric`] arm, which is the flag and its
+        // `parametricLdsIdx_` at once; the `-1` pair a real one also carries is refused below.
         assert_eq!(
             mint_sched_node(
                 &mut tree,
                 &SchedNode::Loop(Box::new(LoopNode {
-                    parametric_lds: Some(LdsIdx(0)),
+                    band: Band::Parametric {
+                        dim: dims[0],
+                        lds: LdsIdx(0),
+                    },
                     ..plain.clone()
                 })),
                 InsertionPoint::LastIn(root),

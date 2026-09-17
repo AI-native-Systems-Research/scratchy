@@ -190,7 +190,7 @@ use crate::schedule::ddl::{DdlModuleOp, DdlSource};
 use crate::schedule::dsc2::{
     AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeMask, ComputeNode,
     CondOp as DscCondOp, CondRegions, ConditionNode, Coordinate, DataInfo, Dsts, Hops,
-    InstrAttribute, LdsIdx, LoopBound, LoopCond as DscLoopCond,
+    InstrAttribute, LdsIdx, LoopBand, LoopBound, LoopCond as DscLoopCond,
     LoopCondComposite as DscLoopCondComposite, LoopDim, LoopNode, MaxDimSize, NodeBase, NodeName,
     NumBuffers, NumChunks, Operand as DscOperand, OperandRepetition, PackIndex, Repetition,
     RepetitionWithOffset, ReplicationFactor, SchedNode, SignExtend, StartAddress, SyncDirection,
@@ -3161,7 +3161,7 @@ fn op_loop<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
     let node = ctx.site.add_loop(
         ctx.curr_parent,
         LoopNode {
-            dims,
+            band: LoopBand::Counted(dims),
             num: Some(num),
             den: Some(den),
             ..LoopNode::bare(BlockNode {
@@ -4943,7 +4943,7 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
         let num = self.stage(node.num);
         let den = self.stage(node.den);
         let mut dims = Vec::new();
-        for held in &node.dims {
+        for held in node.dims() {
             // The `DT_CHECK` that every loop dim resolved: a `WindowDim` loop dim is answered by an
             // UNPADDED association too, and nothing else crosses kinds.
             let (name, _) = interface.dim_association.iter().find(|(_, prop)| {
@@ -4957,7 +4957,7 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
         let num_stage = dsc.data_stages.at(node.num?)?;
         let den_stage = dsc.data_stages.at(node.den?)?;
         let mut ss_loop_count = Vec::new();
-        for held in &node.dims {
+        for held in node.dims() {
             let numerator = u64::try_from(num_stage.ss_extent(held.dim)?.0).ok()?;
             let denominator = u64::try_from(den_stage.ss_extent(held.dim)?.0).ok()?;
             if denominator == 0 {
@@ -6352,10 +6352,11 @@ mod unit_tests {
     use crate::schedule::ddc::v1::CoreClSet;
     use crate::schedule::dsc2::{
         AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeNode, CondRegions,
-        ConditionNode, Coordinate, DataInfo, Dsts, LayoutDims, LdsIdx, LeafKind, LeafNode, LoopDim,
-        LoopNode, MaxDimSize, NodeBase, NodeName, NumBuffers, NumChunks, Operand as DscOperand,
-        OperandRepetition, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode,
-        SyncStrength, SyncUnits, TransferNode, TransferPadding, TransferRepetition, WordLength,
+        ConditionNode, Coordinate, DataInfo, Dsts, LayoutDims, LdsIdx, LeafKind, LeafNode,
+        LoopBand, LoopDim, LoopNode, MaxDimSize, NodeBase, NodeName, NumBuffers, NumChunks,
+        Operand as DscOperand, OperandRepetition, ReplicationFactor, SchedNode, StartAddress,
+        SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, TransferPadding,
+        TransferRepetition, WordLength,
     };
     use crate::schedule::l3::dsc::{
         CoreCount, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DimPadding,
@@ -7707,10 +7708,10 @@ mod unit_tests {
             .add_loop(
                 head,
                 LoopNode {
-                    dims: vec![LoopDim {
+                    band: LoopBand::Counted(vec![LoopDim {
                         dim: PrimaryDim::X,
                         kind: MetaDimKind::Unpadded,
-                    }],
+                    }]),
                     num: Some(Metadata::CORE_DSTGID),
                     den: Some(Metadata::CHUNK_DSTGID),
                     ..LoopNode::bare(BlockNode {

@@ -56,7 +56,9 @@ use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::Scale;
 use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
 use crate::schedule::ddc::v1::{DimSample, LdsSticks, sampled_as, stick_divisor};
-use crate::schedule::dsc2::{AllocateNode, Coordinate, Dsc, LayoutDims, LdsIdx, LoopNode};
+use crate::schedule::dsc2::{
+    AllocateNode, Coordinate, Dsc, LayoutDims, LdsIdx, LoopBand, LoopNode,
+};
 use crate::units::{Corelet, Row};
 
 use super::dsc::{
@@ -339,29 +341,33 @@ pub fn size_data_stage_for_node(
             }
             break;
         };
-        if enclosing.parametric_lds.is_some() {
-            // `myParentLoop->dims_[0].dim_` (`:3658`).
-            let Some(loop_dim) = enclosing.dims.first().map(|entry| entry.dim) else {
-                continue;
-            };
-            if remaining.contains(&loop_dim) {
-                let stride = Extent(i64::try_from(enclosing.parametric_stride(dsc)?.0).ok()?);
-                ss.extents.insert(loop_dim, stride);
-                el.extents.insert(loop_dim, stride);
-                // `newDstg.ss_.paddingSizes_[loopDim];` (`:3665-3666`) — a bare `operator[]`, whose
-                // whole effect is the ZERO entry it default-inserts.
-                if core.padding.contains_key(&loop_dim) {
-                    ss.padding.entry(loop_dim).or_default();
-                    el.padding.entry(loop_dim).or_default();
+        // `if (myParentLoop->isParametricLoop())` (`:3656`) — ONE match, because the flag this
+        // selects on and the `dims_[0]` its arm reads are one field ([`LoopBand`]).
+        match &enclosing.band {
+            LoopBand::Parametric { dim, .. } => {
+                // `myParentLoop->dims_[0].dim_` (`:3658`), an UNGUARDED index in the reference and
+                // the dim this variant carries here — so this arm has no arity to fall back on.
+                let loop_dim = dim.dim;
+                if remaining.contains(&loop_dim) {
+                    let stride = Extent(i64::try_from(enclosing.parametric_stride(dsc)?.0).ok()?);
+                    ss.extents.insert(loop_dim, stride);
+                    el.extents.insert(loop_dim, stride);
+                    // `newDstg.ss_.paddingSizes_[loopDim];` (`:3665-3666`) — a bare `operator[]`,
+                    // whose whole effect is the ZERO entry it default-inserts.
+                    if core.padding.contains_key(&loop_dim) {
+                        ss.padding.entry(loop_dim).or_default();
+                        el.padding.entry(loop_dim).or_default();
+                    }
+                    remaining.remove(&loop_dim);
                 }
-                remaining.remove(&loop_dim);
             }
-        } else {
-            for entry in &enclosing.dims {
-                if remaining.remove(&entry.dim) {
-                    // `denDsForDim[ldim] = myParentLoop->denId_` (`:3673`), whose `-1` is the
-                    // `dataStageParam_.at(dsIdx)` throw below brought forward.
-                    den_for_dim.insert(entry.dim, enclosing.den?);
+            LoopBand::Counted(dims) => {
+                for entry in dims {
+                    if remaining.remove(&entry.dim) {
+                        // `denDsForDim[ldim] = myParentLoop->denId_` (`:3673`), whose `-1` is the
+                        // `dataStageParam_.at(dsIdx)` throw below brought forward.
+                        den_for_dim.insert(entry.dim, enclosing.den?);
+                    }
                 }
             }
         }
@@ -533,7 +539,7 @@ mod tests_e015 {
         DataStage, DataStages, DimPadding, FilledDims, NamedDims, PadSizes, SenComponent, StageDims,
     };
     use super::{
-        AncestorLoops, Dsc, LdsIdx, LdsSticks, LoopNode, PaddingForm, SizeDsc, SizedNode,
+        AncestorLoops, Dsc, LdsIdx, LdsSticks, LoopBand, LoopNode, PaddingForm, SizeDsc, SizedNode,
         size_data_stage_for_node,
     };
 
@@ -589,11 +595,13 @@ mod tests_e015 {
     /// `parametric_loop_<dim>(padded)` — `parametricLdsIdx_: 1`, no `numId_` and no `denId_`.
     pub(super) fn parametric(name: &str, dim: PrimaryDim) -> LoopNode {
         LoopNode {
-            dims: vec![LoopDim {
-                dim,
-                kind: MetaDimKind::Padded,
-            }],
-            parametric_lds: Some(LdsIdx(1)),
+            band: LoopBand::Parametric {
+                dim: LoopDim {
+                    dim,
+                    kind: MetaDimKind::Padded,
+                },
+                lds: LdsIdx(1),
+            },
             ..LoopNode::bare(BlockNode {
                 base: NodeBase::named(NodeName(name.to_owned())),
                 children: Vec::new(),
@@ -604,10 +612,10 @@ mod tests_e015 {
     /// `loop_ds1_ds<den>_<dim>` — an ordinary loop dividing `dim` by datastage `den`.
     pub(super) fn dividing(name: &str, dim: PrimaryDim, den: DatastageId) -> LoopNode {
         LoopNode {
-            dims: vec![LoopDim {
+            band: LoopBand::Counted(vec![LoopDim {
                 dim,
                 kind: MetaDimKind::Unpadded,
-            }],
+            }]),
             num: Some(DatastageId(1)),
             den: Some(den),
             ..LoopNode::bare(BlockNode {

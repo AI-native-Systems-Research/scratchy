@@ -1225,7 +1225,8 @@ mod tests {
         // only two writers of it (`ddl_conversion.cpp:1126-1161`, `dsc/dsc2.cpp:1409-1416`) are the DDL
         // conversion this call OPENS and the JSON importer, neither of which has run.
         assert_eq!(
-            outer.parametric_lds, None,
+            outer.parametric_lds(),
+            None,
             "a loop stage 2a minted is not parametric"
         );
         let mid = outer

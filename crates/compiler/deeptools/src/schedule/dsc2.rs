@@ -2247,23 +2247,84 @@ pub struct LoopDim {
     pub kind: MetaDimKind,
 }
 
+/// WHAT A LOOP COUNTS — `dims_` (`dsc/dsc2.h:575`) FUSED WITH `isParametricLoop_` (`:617`) and
+/// `parametricLdsIdx_` (`:618`), because on a parametric loop those three are ONE fact.
+///
+/// ⛔ A PARAMETRIC LOOP HAS EXACTLY ONE DIM AND AN INDEX, and neither half is a judgement call:
+/// `parametricIterCount` opens `DT_ERROR` on `!isParametricLoop() || dims_.size() != 1`
+/// (`dsc/dsc2.cpp:4126-4131`) and `parametricStride` reads `dims_[0]` UNGUARDED (`:4206`) behind
+/// `DT_CHECK_MSG(ldsIdx != -1)` (`:4199-4202`). The one arm that mints one states the dim and the
+/// index together (`ddc/ddl/ddl_conversion.cpp:1126-1161`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopBand {
+    /// Field: e011_LoopNode.dims_
+    ///
+    /// `dims_` (`dsc/dsc2.h:575`) — *"ordered inner to outer"* — with `isParametricLoop_` at its
+    /// member initializer of `false` (`:617`). EMPTY is `ScheduleTree::head_` (`:623`), the one loop
+    /// the reference mints with no dims and never reads them of; the `LoopOp` arm DELETES any other
+    /// dimless loop instead of inserting it (`ddc/ddl/ddl_conversion.cpp:1111-1113`).
+    Counted(Vec<LoopDim>),
+    /// Field: e011_LoopNode.isParametricLoop_
+    ///
+    /// Field: e011_LoopNode.parametricLdsIdx_
+    ///
+    /// `isParametricLoop_ == true` (`:617`) with the ONE `dims_` entry it is minted with — a single
+    /// `emplace_back` on a fresh node (`ddc/ddl/ddl_conversion.cpp:1146-1147`) — and the
+    /// `parametricLdsIdx_` (`:618`) of its reference tensor.
+    Parametric {
+        /// `dims_[0]`, the dim `parametricStride` and `parametricIterCount` both read.
+        dim: LoopDim,
+        /// `parametricLdsIdx_`, the labelled DS whose sticks give the stride.
+        lds: LdsIdx,
+    },
+}
+
+impl Default for LoopBand {
+    /// `LoopNode()`'s member initializers: no dims and `isParametricLoop_ = false`
+    /// (`dsc/dsc2.h:580`, `:617`).
+    fn default() -> Self {
+        Self::Counted(Vec::new())
+    }
+}
+
+impl LoopBand {
+    /// `dims_`, inner to outer — ONE entry for a parametric loop.
+    #[must_use]
+    pub fn dims(&self) -> &[LoopDim] {
+        match self {
+            Self::Counted(dims) => dims,
+            Self::Parametric { dim, .. } => core::slice::from_ref(dim),
+        }
+    }
+
+    /// `parametricLdsIdx()` (`dsc/dsc2.h:603`) for a parametric loop, and its `-1` for every other.
+    #[must_use]
+    pub const fn parametric_lds(&self) -> Option<LdsIdx> {
+        match self {
+            Self::Counted(_) => None,
+            Self::Parametric { lds, .. } => Some(*lds),
+        }
+    }
+}
+
 /// Replaces: e011_LoopNode
 ///
 /// A LOOP NODE — `dsc2::LoopNode` (`dsc/dsc2.h:563`): a block, the dims it divides, the two
 /// datastages whose extents give its trip count, and the symbols a SYMBOLIC dim counts by.
 ///
-/// ⭐ THE PARAMETRIC FLAG AND ITS INDEX ARE ONE FIELD. `markAsParametricLoop()` and
-/// `setParametricLdsIdx(lds)` are called together and only together (`ddl_conversion.cpp:1093-1101`),
-/// so a parametric loop with no index — and an index on a non-parametric loop — are both unspellable.
+/// ⭐ THE PARAMETRIC FLAG, ITS INDEX AND THE DIMS ARE ONE FIELD — [`LoopBand`]. The reference's only
+/// two writers of `isParametricLoop_` are the DDL's `ParametricLoopOp` arm, which `DT_ERROR`s BETWEEN
+/// the two setters when the reference tensor has no `ldsIdx_` (`ddc/ddl/ddl_conversion.cpp:1126-1161`),
+/// and the JSON importer, whose independent `else if` branches (`dsc/dsc2.cpp:1409-1416`) can only
+/// read back an export that already survived `parametricStride` (`:415-418`, `:4199-4202`). No caller
+/// anywhere passes `isParametricLoop = true` to the four-argument constructor (`dsc/dsc2.h:586-593`).
 /// ⛔ `numId_`/`denId_` ABSENT IS THE REFERENCE'S `-1`, which a parametric loop sets for both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopNode {
     /// The loop's own block part: the `name_` and `next_` it inherits (`dsc/dsc2.h:526`).
     pub block: BlockNode,
-    /// Field: e011_LoopNode.dims_
-    ///
-    /// `dims_` (`dsc/dsc2.h:575`) — *"ordered inner to outer"*.
-    pub dims: Vec<LoopDim>,
+    /// `dims_` with `isParametricLoop_` and `parametricLdsIdx_` — see [`LoopBand`].
+    pub band: LoopBand,
     /// Field: e011_LoopNode.numId_
     ///
     /// `numId_` (`:573`) — the datastage the trip count divides.
@@ -2272,12 +2333,6 @@ pub struct LoopNode {
     ///
     /// `denId_` (`:574`) — the datastage it divides by.
     pub den: Option<DatastageId>,
-    /// Field: e011_LoopNode.isParametricLoop_
-    ///
-    /// Field: e011_LoopNode.parametricLdsIdx_
-    ///
-    /// `isParametricLoop_` (`:617`) TOGETHER WITH `parametricLdsIdx_` (`:618`).
-    pub parametric_lds: Option<LdsIdx>,
     /// Field: e011_LoopNode.loopCountSymbolIds_
     ///
     /// `loopCountSymbolIds_` (`:576-578`) — *"single value for pure symbolic and pivot dims, multiple
@@ -2292,18 +2347,30 @@ impl LoopNode {
     pub const fn bare(block: BlockNode) -> Self {
         Self {
             block,
-            dims: Vec::new(),
+            band: LoopBand::Counted(Vec::new()),
             num: None,
             den: None,
-            parametric_lds: None,
             loop_count_symbol_ids: BTreeMap::new(),
         }
+    }
+
+    /// `dims_`, inner to outer — [`LoopBand::dims`], which is ONE entry for a parametric loop.
+    #[must_use]
+    pub fn dims(&self) -> &[LoopDim] {
+        self.band.dims()
+    }
+
+    /// `parametricLdsIdx()` (`dsc/dsc2.h:603`), and [`None`] for a loop that is not parametric —
+    /// which is `isParametricLoop()` (`:599`) read through the one field that carries both.
+    #[must_use]
+    pub const fn parametric_lds(&self) -> Option<LdsIdx> {
+        self.band.parametric_lds()
     }
 
     /// The dims it iterates, without their meta kinds.
     #[must_use]
     pub fn primary_dims(&self) -> Vec<PrimaryDim> {
-        self.dims.iter().map(|entry| entry.dim).collect()
+        self.dims().iter().map(|entry| entry.dim).collect()
     }
 
     /// `isDimSymbolic(dim)` (`dsc/dsc2.h:595-597`) — `loopCountSymbolIds_.count(dim) != 0`, which is
@@ -2318,7 +2385,7 @@ impl LoopNode {
     /// `dim_` half of each pair only, so a dim named at another `kind_` still matches.
     #[must_use]
     pub fn has_loop_dim(&self, dim: PrimaryDim) -> bool {
-        self.dims.iter().any(|entry| entry.dim == dim)
+        self.dims().iter().any(|entry| entry.dim == dim)
     }
 }
 
@@ -2472,13 +2539,15 @@ pub struct LoopCondComposite {
     pub negated: bool,
 }
 
-/// THE TWO REGIONS A CONDITION HOLDS — `ConditionNode`'s inherited `next_` (`dsc/dsc2.h:529`) under
+/// THE TWO REGIONS A CONDITION HOLDS — `ConditionNode`'s inherited `next_` (`dsc/dsc2.h:538`) under
 /// this node's own documented assumption, *"max 2 children in next_, of type BLOCK: the 'then' and
 /// 'else' regions"* (`:688`).
 ///
-/// ⛔ ALL THREE `DT_ERROR` ARMS OF `ConditionNode::addChildNode` (`dsc/dsc2.cpp:2143-2166`) ARE
-/// UNSPELLABLE HERE, not refused: a child that is not a `BLOCK`, a third child, and an
-/// `addElseRegion` with `next_` still empty.
+/// ⛔ THREE OF THE FOUR `DT_ERROR`s ACROSS `addChildNode`, `addThenRegion` AND `addElseRegion` HAVE NO
+/// SPELLING HERE: a child that is not a `BLOCK` (`dsc/dsc2.cpp:2146`, by the field type), a second
+/// `addThenRegion` (`:2153-2154`) and an `addElseRegion` with `next_` still empty (`:2163-2164`). The
+/// FOURTH — a third child, which is `:2146`'s other disjunct and `addElseRegion`'s *"already has an
+/// 'else' region"* (`:2160-2161`) — is [`ConditionNode::add_region`]'s [`None`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CondRegions {
     /// `next_` EMPTY — `new dsc2::ConditionNode()` (`dsc/dsc2.h:686`) before either region is added.
@@ -2492,7 +2561,8 @@ pub enum CondRegions {
 
 impl CondRegions {
     /// `next_` IN ORDER, which is what `ConditionNode::getNextView` returns UNFILTERED for a
-    /// loop-guarded condition (`dsc/dsc2.cpp:1995-2011`).
+    /// loop-guarded condition: `BlockNode::getNextView(ALL, -1, -1)` (`dsc/dsc2.cpp:1998-1999`), and
+    /// `isNodeRelevant(ALL, -1, -1)` is `return true` (`:1918-1922`).
     #[must_use]
     pub fn regions(&self) -> &[BlockNode] {
         match self {
@@ -2551,7 +2621,7 @@ pub struct ConditionNode {
     pub core_cl_cond: BTreeMap<Core, BTreeSet<Corelet>>,
     /// Field: e012_ConditionNode.next_
     ///
-    /// `next_` (`:529`) — the base's child vector, under this node's two-`BLOCK` assumption (`:688`).
+    /// `next_` (`:538`) — the base's child vector, under this node's two-`BLOCK` assumption (`:688`).
     pub next: CondRegions,
 }
 
@@ -2559,8 +2629,12 @@ impl ConditionNode {
     /// `ConditionNode::addChildNode` (`dsc/dsc2.cpp:2143`) — the THEN region while none is stated and
     /// the ELSE region after, which is how the two blocks a `ddl.if` opens land in order.
     ///
-    /// ⛔ [`None`] IS *"ConditionNode only accepts 2 BlockNodes as children"* AND IS NOW ITS ONLY
-    /// SPELLABLE ARM — the other two are discharged by the argument type and by [`CondRegions`].
+    /// ⛔ [`None`] IS *"ConditionNode only accepts 2 BlockNodes as children"* (`dsc/dsc2.cpp:2146`) on
+    /// its `next_.size() >= 2` disjunct, which is also `addElseRegion`'s *"already has an 'else'
+    /// region"* (`:2160-2161`). THE OTHER THREE ARMS ARE UNSPELLABLE: the `nodeType_ != BLOCK`
+    /// disjunct by the argument type, and `addThenRegion`'s *"already has a 'then' region"*
+    /// (`:2153-2154`) and `addElseRegion`'s *"does not have a 'then' region"* (`:2163-2164`) because
+    /// this dispatches on [`CondRegions`] instead of on a caller naming which region it wants.
     pub fn add_region(&mut self, block: BlockNode) -> Option<()> {
         match core::mem::take(&mut self.next) {
             CondRegions::Empty => self.next = CondRegions::Then(block),
@@ -3643,16 +3717,20 @@ impl LoopNode {
     /// `parametricLdsIdx_` names, or `1` for a dim that is not a stick dim but IS in that DS's layout
     /// order.
     ///
-    /// ⛔ [`None`] IS A STOP, NOT A STRIDE OF `1`: `DT_CHECK_MSG(ldsIdx != -1)` (`dsc/dsc2.cpp:4199`)
-    /// and the `DT_ERROR` for a dim in NEITHER set (`:4213`). `getSizeDataStageForNode` writes this
-    /// straight into a datastage extent (`:3660-3662`), so a fabricated `1` sizes the buffer wrong.
+    /// ⛔ [`None`] IS A STOP, NOT A STRIDE OF `1`: the `DT_ERROR` for a dim in NEITHER set (`:4213`),
+    /// and a loop that is not parametric at all — which is the `DT_CHECK_MSG(ldsIdx != -1)`
+    /// (`:4199-4202`) reached through [`LoopBand`], where a parametric loop WITHOUT an index is
+    /// unspellable. `getSizeDataStageForNode` writes this straight into a datastage extent
+    /// (`:3660-3662`), so a fabricated `1` sizes the buffer wrong.
     #[must_use]
     pub fn parametric_stride(&self, dsc: &(impl LdsSticks + Dsc + ?Sized)) -> Option<Elements> {
-        let lds = self.parametric_lds?;
+        // `dims_[0]` AND `parametricLdsIdx_` from one match, which is why this body needs neither the
+        // reference's `DT_CHECK` on the index nor a guard on the arity it indexes past (`:4206`).
+        let &LoopBand::Parametric { dim, lds } = &self.band else {
+            return None;
+        };
         let stick_sizes = cumulative_stick_sizes(&dsc.stick_dims(lds), StickPart::Whole)?;
-        // `dims_[0]`, which this body indexes unguarded — `parametricIterCount` is where the
-        // reference states the arity, `DT_ERROR`ing on `dims_.size() != 1` (`dsc/dsc2.cpp:4129`).
-        let loop_dim = self.dims.first()?.dim;
+        let loop_dim = dim.dim;
         if let Some(&(_, stride)) = stick_sizes.iter().find(|&&(dim, _)| dim == loop_dim) {
             return Some(stride);
         }
@@ -3683,8 +3761,8 @@ mod tests_e014 {
     //! not a stick dim at all and takes the `1` its place in the layout order earns it.
 
     use super::{
-        BlockNode, Dsc, Elements, LayoutDims, LdsIdx, LdsSticks, LoopDim, LoopNode, MetaDimKind,
-        NodeBase, NodeName, PrimaryDim,
+        BlockNode, Dsc, Elements, LayoutDims, LdsIdx, LdsSticks, LoopBand, LoopDim, LoopNode,
+        MetaDimKind, NodeBase, NodeName, PrimaryDim,
     };
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
 
@@ -3704,13 +3782,33 @@ mod tests_e014 {
     }
 
     /// One `parametric_loop_<dim>(padded)`, with `numId_ = denId_ = -1` as its producer writes them.
-    fn parametric(dim: PrimaryDim, lds: Option<u32>) -> LoopNode {
-        LoopNode {
-            dims: vec![LoopDim {
+    fn parametric(dim: PrimaryDim, lds: u32) -> LoopNode {
+        band_of(
+            dim,
+            LoopBand::Parametric {
+                dim: LoopDim {
+                    dim,
+                    kind: MetaDimKind::Padded,
+                },
+                lds: LdsIdx(lds),
+            },
+        )
+    }
+
+    /// The same loop as an ORDINARY one over that dim — `isParametricLoop_ = false`.
+    fn counted(dim: PrimaryDim) -> LoopNode {
+        band_of(
+            dim,
+            LoopBand::Counted(vec![LoopDim {
                 dim,
                 kind: MetaDimKind::Padded,
-            }],
-            parametric_lds: lds.map(LdsIdx),
+            }]),
+        )
+    }
+
+    fn band_of(dim: PrimaryDim, band: LoopBand) -> LoopNode {
+        LoopNode {
+            band,
             ..LoopNode::bare(BlockNode {
                 base: NodeBase::named(NodeName(format!("parametric_loop_{}(padded)", dim.spelling()))),
                 children: Vec::new(),
@@ -3723,30 +3821,31 @@ mod tests_e014 {
     fn a_parametric_loops_stride_is_its_dims_cumulative_stick_size() {
         // `"parametric_loop_out(padded)__2": {"out": 128}`.
         assert_eq!(
-            parametric(PrimaryDim::Out, Some(1)).parametric_stride(&Sdsc14),
+            parametric(PrimaryDim::Out, 1).parametric_stride(&Sdsc14),
             Some(Elements(128))
         );
         // `"parametric_loop_mb(padded)": {"mb": 1}` — the layout arm, so 128 must NOT appear here.
         assert_eq!(
-            parametric(PrimaryDim::Mb, Some(1)).parametric_stride(&Sdsc14),
+            parametric(PrimaryDim::Mb, 1).parametric_stride(&Sdsc14),
             Some(Elements(1))
         );
     }
 
     /// e014 — the two stops, and neither of them is a stride of `1`.
     #[test]
-    fn a_dim_outside_both_sets_and_an_unset_index_are_stops() {
+    fn a_dim_outside_both_sets_and_an_ordinary_loop_are_stops() {
         // `DT_ERROR` (`dsc/dsc2.cpp:4213-4216`): `x` is neither lds 1's stick dim nor in its
         // `["mb", "out", "y"]` layout order, so the `int loopStride = 1` initializer never returns.
         assert_eq!(
-            parametric(PrimaryDim::X, Some(1)).parametric_stride(&Sdsc14),
+            parametric(PrimaryDim::X, 1).parametric_stride(&Sdsc14),
             None
         );
-        // `DT_CHECK_MSG(ldsIdx != -1)` (`:4199-4202`) — every other loop in every other g0 program.
-        assert_eq!(
-            parametric(PrimaryDim::Out, None).parametric_stride(&Sdsc14),
-            None
-        );
+        // ⛔ AND THE OTHER STOP IS NOW A DIFFERENT STATE. `DT_CHECK_MSG(ldsIdx != -1)`
+        // (`:4199-4202`) fires on a loop that is parametric with `parametricLdsIdx_ = -1`, and
+        // [`LoopBand`] makes that pair unspellable — the ONE arm that mints a parametric loop states
+        // the index with the flag (`ddc/ddl/ddl_conversion.cpp:1126-1161`). What is left to answer
+        // for is the loop this stop actually reaches in every g0 program: an ORDINARY one.
+        assert_eq!(counted(PrimaryDim::Out).parametric_stride(&Sdsc14), None);
     }
 }
 
@@ -3761,7 +3860,8 @@ mod tests_e011 {
     //! `dims_` comparing the `dim_` half of each pair only.
 
     use super::{
-        BlockNode, LoopDim, LoopNode, MetaDimKind, NodeBase, NodeName, PrimaryDim, VariableSymbol,
+        BlockNode, LdsIdx, LoopBand, LoopDim, LoopNode, MetaDimKind, NodeBase, NodeName,
+        PrimaryDim, VariableSymbol,
     };
 
     /// e011 — the map answers per dim, and `hasLoopDim` is blind to the `kind_` half of the pair.
@@ -3771,7 +3871,7 @@ mod tests_e011 {
             base: NodeBase::named(NodeName("loop_ds0_ds1_out_y".to_owned())),
             children: Vec::new(),
         });
-        held.dims = vec![
+        held.band = LoopBand::Counted(vec![
             LoopDim {
                 dim: PrimaryDim::Out,
                 kind: MetaDimKind::Unpadded,
@@ -3780,7 +3880,7 @@ mod tests_e011 {
                 dim: PrimaryDim::Y,
                 kind: MetaDimKind::Padded,
             },
-        ];
+        ]);
         // A max-pivot dim carries MORE THAN ONE symbol, which is why the value is a list.
         held.loop_count_symbol_ids
             .insert(PrimaryDim::Out, vec![VariableSymbol(7), VariableSymbol(8)]);
@@ -3800,6 +3900,34 @@ mod tests_e011 {
             "padded, and still `dims_.first == y`"
         );
         assert!(!held.has_loop_dim(PrimaryDim::X));
+    }
+
+    /// e011 — ⛔ THE FLAG, ITS INDEX AND THE ONE DIM ARE ONE FIELD: a parametric band answers `dims_`
+    /// AND `parametricLdsIdx_`, and the `dims_.size() != 1` half of `parametricIterCount`'s `DT_ERROR`
+    /// (`dsc/dsc2.cpp:4126-4131`) has no spelling left to reach it with.
+    #[test]
+    fn a_parametric_loops_one_dim_and_its_lds_are_the_same_field() {
+        let block = BlockNode {
+            base: NodeBase::named(NodeName("parametric_loop_out(padded)".to_owned())),
+            children: Vec::new(),
+        };
+        let dim = LoopDim {
+            dim: PrimaryDim::Out,
+            kind: MetaDimKind::Padded,
+        };
+        let held = LoopNode {
+            band: LoopBand::Parametric {
+                dim,
+                lds: LdsIdx(1),
+            },
+            ..LoopNode::bare(block.clone())
+        };
+        assert_eq!(held.dims(), [dim], "`dims_[0]`, and there is no `dims_[1]`");
+        assert_eq!(held.parametric_lds(), Some(LdsIdx(1)));
+        assert!(held.has_loop_dim(PrimaryDim::Out));
+        // ⛔ AND AN ORDINARY LOOP HAS NO INDEX — `parametricLdsIdx_ = -1` (`dsc/dsc2.h:618`), which is
+        // the state `bare` starts in and the one every stage-2a loop stays in.
+        assert_eq!(LoopNode::bare(block).parametric_lds(), None);
     }
 }
 
@@ -4035,18 +4163,18 @@ mod tests_e009_schedule_node {
                 children: vec![leaf],
             })],
         });
-        inner.dims.push(LoopDim {
+        inner.band = LoopBand::Counted(vec![LoopDim {
             dim: PrimaryDim::Y,
             kind: MetaDimKind::Unpadded,
-        });
+        }]);
         let mut outer = LoopNode::bare(BlockNode {
             base: NodeBase::named(NodeName("loop_x".to_owned())),
             children: vec![SchedNode::Loop(Box::new(inner))],
         });
-        outer.dims.push(LoopDim {
+        outer.band = LoopBand::Counted(vec![LoopDim {
             dim: PrimaryDim::X,
             kind: MetaDimKind::Unpadded,
-        });
+        }]);
         let tree = ScheduleTree::new(BlockNode {
             base: NodeBase::named(NodeName("head".to_owned())),
             children: vec![SchedNode::Loop(Box::new(outer))],

@@ -37,7 +37,7 @@ use crate::arch::{Arch, Bytes};
 use crate::schedule::ddc::fold::{AllocId, NodeId};
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::v1;
-use crate::schedule::dsc2::{LdsIdx, LoopNode, StartAddress};
+use crate::schedule::dsc2::{LdsIdx, LoopBand, LoopNode, StartAddress};
 use crate::schedule::l3::capacity::{
     AllocSizing, AncestorLoops, BytesForm, DscSizing, SampledBuffer, StickRounding, buffer_capacity,
 };
@@ -111,7 +111,7 @@ impl<'s> Placement<'s> {
 /// [`AncestorLoops`] reads `dsc2::LoopNode`, whose extra field is `isParametricLoop_` /
 /// `parametricLdsIdx_`.
 ///
-/// ⛔ `parametric_lds: None` IS THE AUTHORITY'S OWN MEMBER INITIALIZER AND NOT A DROPPED FACT
+/// ⛔ [`LoopBand::Counted`] IS THE AUTHORITY'S OWN MEMBER INITIALIZER AND NOT A DROPPED FACT
 /// (`dsc/dsc2.h:617-618`). Exactly two things in the reference ever write it — the `ParametricLoopOp`
 /// arm of the DDL conversion (`ddc/ddl/ddl_conversion.cpp:1126-1161`) and the JSON importer reading a
 /// SERIALISED super-DSC back (`dsc/dsc2.cpp:1409-1416`) — and neither has run: every loop in this
@@ -132,7 +132,7 @@ fn ancestor_loop_nodes(tree: &super::state::DscTree, node: NodeId) -> Vec<LoopNo
                 Some(LoopNode {
                     // ⭐ `dims_` NEEDS NO CONVERSION: `tu::PrimaryDimAndKind` IS
                     // [`crate::schedule::dsc2::LoopDim`], one Rust type for `dsc/dims.h:76`.
-                    dims: minted.dims.iter().collect(),
+                    band: LoopBand::Counted(minted.dims.iter().collect()),
                     num: Some(minted.num),
                     den: Some(minted.den),
                     ..LoopNode::bare(super::ddc_store2::head_block_of(held, at.0))

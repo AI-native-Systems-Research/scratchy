@@ -1651,7 +1651,8 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
     /// conversion is what this call OPENS. So every loop of it is non-parametric by the authority's own
     /// default, and [`tu::LoopNode`] — the view the tree stores — correspondingly has no such field to
     /// lose. ⭐ A loop the DDL conversion later mints as parametric carries the flag on ITS node, which
-    /// is why the field stays on [`crate::schedule::dsc2::LoopNode`] rather than being dropped.
+    /// is why [`crate::schedule::dsc2::LoopBand::Parametric`] stays on that type rather than being
+    /// dropped.
     ///
     /// ⛔ AN EMPTY-CHILDREN BLOCK IS STILL THE ONE THING THAT MUST NOT HAPPEN — it would say the DSC's
     /// schedule tree is empty and the conversion would splice the whole parsed template into nothing —
@@ -1751,16 +1752,17 @@ fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule:
                 // `dims_` — the SAME order [`tu::LoopDims`] states, which is the order the loop's own
                 // name spells them in, AND NO CONVERSION: `tu::PrimaryDimAndKind` IS
                 // [`crate::schedule::dsc2::LoopDim`], one Rust type for `dsc/dims.h:76`.
-                dims: held.dims.iter().collect(),
+                // ⛔ COUNTED IS `isParametricLoop_ = false` / `parametricLdsIdx_ = -1`, the member
+                // initializers of `dsc/dsc2.h:617-618`, and it is stated here rather than defaulted.
+                // See [`v1::Dsc2Store::schedule_head_block`] for the two — and only two — writers of
+                // them, neither of which has run.
+                band: crate::schedule::dsc2::LoopBand::Counted(held.dims.iter().collect()),
                 // ⭐ `numId_`/`denId_` ARE NOT OPTIONAL ON THE STORED VIEW — *"every callsite of the
                 // constructor passes a real pair"* ([`tu::LoopNode`]) — so both are `Some` here and the
                 // `-1` a `dsc2::LoopNode` admits is the DDL's parametric loop, not this one.
                 num: Some(held.num),
                 den: Some(held.den),
-                // ⛔ `isParametricLoop_ = false` / `parametricLdsIdx_ = -1`, the member initializers of
-                // `dsc/dsc2.h:617-618`. See [`v1::Dsc2Store::schedule_head_block`] for the two — and
-                // only two — writers, neither of which has run. `loopCountSymbolIds_` (`:576`) is empty
-                // for the same reason: its one writer is `finalizeScheduleTree`
+                // ⛔ `loopCountSymbolIds_` (`:576`) IS EMPTY: its one writer is `finalizeScheduleTree`
                 // (`dsc/dsc2.cpp:2999-3005`), which this path does not reach.
                 ..crate::schedule::dsc2::LoopNode::bare(head_block_of(tree, node))
             }))

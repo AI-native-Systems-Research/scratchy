@@ -625,11 +625,14 @@ impl ScheduleSurgery for PagedCursor<'_> {
         self.minted(loop_node).dims
     }
 
-    /// ⭐ FALSE FOR EVERY LOOP THIS ARENA HOLDS, AND NOT A DEFAULT: `isParametricLoop()` is
-    /// `parametricLds_ != -1` on a `dsc2::LoopNode`, and every loop in this tree was minted by
+    /// ⭐ FALSE FOR EVERY LOOP THIS ARENA HOLDS, AND NOT A DEFAULT: `isParametricLoop()` reads the
+    /// `bool isParametricLoop_` (`dsc/dsc2.h:599`, field `:617`) — ⚠️ NOT `parametricLdsIdx_`
+    /// (`:618`, read by `parametricLdsIdx()`, `:603`), a different field with a different writer —
+    /// and every loop in this tree was minted by
     /// [`crate::schedule::l3::dl_ops::create_loop_node`] or
-    /// [`crate::schedule::ddc::transformation_util::construct_loop_node`], neither of which states
-    /// one — which is why [`LoopNode`] does not carry the field at all.
+    /// [`crate::schedule::ddc::transformation_util::construct_loop_node`], neither of which is the
+    /// `ParametricLoopOp` arm that sets it (`ddc/ddl/ddl_conversion.cpp:1126-1161`) — which is why
+    /// [`LoopNode`] carries neither field.
     fn is_parametric(&self, _loop_node: LoopId) -> bool {
         false
     }
@@ -1008,8 +1011,10 @@ impl AllocCoordinateSeam for CoordSeam {
     /// not parametric has no count to answer, and the caller's other arm is
     /// [`AllocCoordinateSeam::comp_view`], which this carrier answers.
     ///
-    /// ⛔ AND NO LOOP HERE IS PARAMETRIC, BY THE TYPE: `isParametricLoop()` is `parametricLds_ != -1`
-    /// on a `dsc2::LoopNode`, and [`LoopNode`] does not carry that field at all — the same fact
+    /// ⛔ AND NO LOOP HERE IS PARAMETRIC, BY THE TYPE: `isParametricLoop()` reads the `bool`
+    /// `isParametricLoop_` (`dsc/dsc2.h:599`, field `:617`), which only the DDL's `ParametricLoopOp`
+    /// arm and the JSON importer ever set, and [`LoopNode`] carries neither it nor the
+    /// `parametricLdsIdx_` (`:618`) the count would need — the same fact
     /// [`ScheduleSurgery::is_parametric`] answers `false` with, for the same reason.
     fn parametric_iter_count(
         &self,
@@ -1667,7 +1672,8 @@ mod tests {
         assert_eq!(
             seam(DataStages::default()).parametric_iter_count(&loop_node(0, 1, PrimaryDim::Out)),
             None,
-            "`isParametricLoop()` is `parametricLds_ != -1` and `LoopNode` carries no such field"
+            "`isParametricLoop()` is the `bool isParametricLoop_` (`dsc/dsc2.h:617`) and this \
+             `LoopNode` carries neither it nor `parametricLdsIdx_` (`:618`)"
         );
     }
 }
