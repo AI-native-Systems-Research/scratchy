@@ -976,6 +976,14 @@ impl WorkPlan {
             Err(e) => e,
         };
 
+        // ⚠️ THIS REPAIR CAN STILL PRODUCE AN `in > 1` SPLIT, AND ON THE CURRENT DXP IMAGE THAT IS
+        // UNSCHEDULABLE — but it is NOT constrained here, deliberately. Two of this crate's own tests
+        // assert that the ladder is what PLACES granite-8b's down projection at two decode rows, so
+        // gating it here would break a shape the model path depends on for a reason that is about one
+        // dxp image. The seal lives instead where the FINAL split is known and a refusal can name the
+        // op: `matmul_opspec`'s post-plan check. See [`crate::work::matmul_split_plan`] for the
+        // two-sided fixture evidence.
+        //
         // The reduction axis is the ONLY per-core extent left to shrink (see the doc above). A
         // non-stick or absent reduction dim has no divisor ladder to walk, so the refusal stands.
         let Some(red) = dims.iter().find(|d| d.is_reduction && d.is_stick) else {

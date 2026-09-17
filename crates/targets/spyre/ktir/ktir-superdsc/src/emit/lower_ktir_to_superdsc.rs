@@ -39,7 +39,7 @@ use super::{
     pointwise_chunk_out_offset, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_attn, assemble_matmul_off, assemble_matmul_seeded,
+    assemble_attn, assemble_matmul_off, try_assemble_matmul_seeded,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
@@ -3018,7 +3018,15 @@ pub fn matmul(
         ));
     }
     let op_name = format!("matmul_o{}", out.tid);
-    let op = assemble_matmul_seeded(
+    // ⭐ THE `try_` FORM, WHICH IS WHAT IT WAS BUILT FOR. `assemble_matmul_seeded` unwraps the
+    // builder's `Err` into a `panic!` — right for the sub-stick witness its doc names ("not reachable
+    // from model input"), wrong for a refusal that depends on the CALLER's shapes. Two now do:
+    // `resolve_seg_base`'s placement-footprint check, and `refuse_reduction_core_split`'s
+    // unschedulable-`in`-split seal. As a panic either exits 101 with NO stage label, so a driver
+    // tabulating `REFUSED <stage> <message>` shows it as a blank row — which is exactly how
+    // `swiglu_mlp_granite_flat`'s reduction split first surfaced. The `Result` form was added for this
+    // and had no caller; this is that caller.
+    let op = try_assemble_matmul_seeded(
         &op_name,
         m,
         n_dev,
@@ -3029,7 +3037,10 @@ pub fn matmul(
         &rb(&out.name(), m, n_dev),
         sym_id_base,
         layout,
-    );
+    )
+    .map_err(|message| Error {
+        message: format!("MatmulTile t{}: {message}", out.tid),
+    })?;
     // Default path: one f16 matmul.
     Ok(vec![op])
 }

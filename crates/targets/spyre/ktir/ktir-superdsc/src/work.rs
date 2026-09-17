@@ -586,7 +586,9 @@ pub fn matmul_split_plan(
     shared_weight: bool,
 ) -> MatmulSplit {
     let n_sticks = n_elems.div_ceil(stick).max(1);
-    let k_sticks = k_elems.div_ceil(stick).max(1);
+    // KEPT, unused, and deliberately not deleted: it is the value `divisors(k_sticks)` needs the day
+    // the reversal below is taken, and computing it here is where the reader will look for it.
+    let _k_sticks = k_elems.div_ceil(stick).max(1);
     // K-SPLIT RE-ENABLED (2026-07-28) now that its blocker is fixed. It was disabled because
     // splitting the reduction dim emitted a DESCRIPTOR THAT CONTRADICTED ITS OWN ADDRESSING for fp8
     // operands: `gen_fp8_kernel_in_fold` / `gen_fp8_input_in_fold` hardcoded
@@ -602,7 +604,47 @@ pub fn matmul_split_plan(
     // core; the cost model picks (n=8, k=4) for every major granite projection when allowed to.
     // Only mb>1 is affected -- decode's m=1 takes the out-split-only branch of `matmul_split_map`,
     // where k is 1 regardless, so decode's emission is unchanged either way.
-    let k_divs = divisors(k_sticks);
+    // ⛔⛔⛔ THE REDUCTION AXIS IS NOT SPLIT, AND THAT IS A SCHEDULABILITY FACT WITH A TWO-SIDED
+    // CONTROL IN THE VENDOR'S OWN TREE — not a cost-model preference and not a guess.
+    //
+    // A `k > 1` split makes each core contract a K-slice into a PARTIAL product that dxp must
+    // PSUM-accumulate into the shared output tile. On pod image `dev-2026_09_11-150524` the SDSC
+    // scheduler has NO MAPPING for that, and the discriminating variable is `in` alone. MEASURED, the
+    // scheduler's own bmm fixtures (`dcg/dcg_fe/scheduler/test/sdsc_bmm*.json`, `//` comments stripped
+    // so the strict reader accepts them, each wrapped in a one-SDSC operand-less bundle and run through
+    // `dxp_standalone -d <dir> -b sentient`, SENARCH=MPW4):
+    //
+    //   | fixture                      | numWkSlicesPerDim_                            | exit |
+    //   |------------------------------|-----------------------------------------------|------|
+    //   | sdsc_bmm_autoBuffer          | {in: 1, out: 2,  mb: 16, x: 1, y: 1}          |  0   |
+    //   | sdsc_bmm_spatialDoubleBuffer | {in: 1, out: 2,  mb: 16, x: 1, y: 1}          |  0   |
+    //   | sdsc_bmm_psum                | {in: 4, out: 1,  mb: 6,  y: 1}                |  1   |
+    //   | sdsc_bmm_lxopt_psum          | {in: 4, out: 1,  mb: 6,  y: 1}                |  1   |
+    //
+    // Both failures are `DtException: Scheduler failed to find a suitable op mapping for sdsc:
+    // MatMul_1477` — the SAME message, verbatim, that our own `{in: 2, mb: 4, out: 4}` swiglu matmul
+    // produced. So the vendor's own PSUM fixtures are unschedulable on this image, and the two that
+    // schedule are exactly the two with `in: 1`. (`sdsc_bmm_lxopt`, also `in: 1`, aborts at exit 134 —
+    // a DIFFERENT failure, so it neither supports nor weakens the pattern.)
+    //
+    // ⭐ THE HISTORY THIS REPLACES IS KEPT, BECAUSE IT WAS NOT WRONG ABOUT ITS OWN QUESTION. K-split
+    // was disabled here originally, then RE-ENABLED (2026-07-28) once the fp8 fold generators stopped
+    // hardcoding `core_fold: 1` for `in` — so the DESCRIPTOR and its ADDRESSING agree again, and that
+    // fix stands. Its motivation was real and measured: prefill is compute-bound (75.4 GMAC in 82.9 ms
+    // = 909 GMAC/s), with `k` unsplit `down_proj` runs its whole k=8192 reduction on one core, and the
+    // cost model picks `(n=8, k=4)` for every major granite projection when allowed to. NONE of that is
+    // retracted. What the re-enable never established is a SEPARATE question — whether the scheduler
+    // can MAP the split it now describes correctly — and the fixtures above answer it: on this image,
+    // no.
+    //
+    // ⭐ SO THIS IS A ONE-LINE REVERSAL POINT, NOT A DELETION. Restore `divisors(k_sticks)` the day a
+    // dxp image maps `sdsc_bmm_psum` at exit 0; that fixture IS the acceptance test, and it ships in
+    // their tree. Until then an emitted `in > 1` is a descriptor that looks well-formed and fails late
+    // in `sbf-ddc`, which is the defect class every other guard in this crate exists to prevent.
+    //
+    // Nothing else here produces an `in` split: [`matmul_cost_split`] already pins `ks = 1` for the
+    // batched path, so constraining the search here covers both.
+    let k_divs = vec![1u32];
     // NOTE on a DISPROVEN theory, recorded so it is not re-derived: batched prefill is coherent at
     // prefill_m=31 and 17 (both PRIME) and garbage at 16 (composite), which looks like "the cost
     // model only mb-splits at composite m, so mb-split is broken". That premise is FALSE. mb-split

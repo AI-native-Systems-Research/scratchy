@@ -153,6 +153,71 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
     )
 }
 
+/// ⛔⛔⛔ THE FINAL SEAL: NO EMITTED MATMUL SPLITS THE REDUCTION AXIS ACROSS CORES.
+///
+/// An `in > 1` split makes each core contract a K-slice into a PARTIAL product for dxp to
+/// PSUM-accumulate into the shared output tile. On dxp image `dev-2026_09_11-150524` the SDSC
+/// scheduler has NO MAPPING for that, and the discriminating variable is `in` alone. MEASURED, on the
+/// SCHEDULER'S OWN bmm fixtures (`dcg/dcg_fe/scheduler/test/sdsc_bmm*.json`, `//` comments stripped so
+/// the strict reader accepts them, each wrapped in a one-SDSC operand-less bundle and run through
+/// `dxp_standalone -d <dir> -b sentient`, SENARCH=MPW4):
+///
+/// | fixture                      | `numWkSlicesPerDim_`                   | exit |
+/// |------------------------------|----------------------------------------|------|
+/// | sdsc_bmm_autoBuffer          | {in: 1, out: 2, mb: 16, x: 1, y: 1}    |  0   |
+/// | sdsc_bmm_spatialDoubleBuffer | {in: 1, out: 2, mb: 16, x: 1, y: 1}    |  0   |
+/// | sdsc_bmm_psum                | {in: 4, out: 1, mb: 6,  y: 1}          |  1   |
+/// | sdsc_bmm_lxopt_psum          | {in: 4, out: 1, mb: 6,  y: 1}          |  1   |
+///
+/// Both failures read `DtException: Scheduler failed to find a suitable op mapping for sdsc:
+/// MatMul_1477` — the same message, verbatim, our own `{in: 2, mb: 4, out: 4}` swiglu matmul produced.
+/// So the two PSUM fixtures are unschedulable on this image and the two at `in: 1` are fine.
+/// (`sdsc_bmm_lxopt`, also `in: 1`, aborts at exit 134 — a DIFFERENT failure, so it neither supports
+/// nor weakens the pattern.)
+///
+/// # WHY THE CHECK IS *HERE* AND NOT AT EITHER PRODUCER
+///
+/// Two things can set `in > 1`, and they want different treatment:
+///
+/// 1. the cost model's own search ([`crate::work::matmul_split_plan`]) — constrained AT SOURCE there,
+///    because a split the model merely PREFERS has a free alternative and `k = 1` is always in range;
+/// 2. [`crate::superdsc_opspec::WorkPlan::divide_and_time_tile_for_lx`]'s reduction ladder — NOT
+///    constrained, because two of this crate's own tests assert that ladder is what PLACES granite-8b's
+///    down projection at two decode rows. Gating it there would break a shape the model path depends
+///    on, for a reason that is about one dxp image.
+///
+/// So the seal sits where the FINAL split is known — after the plan and its LX repair — and refuses by
+/// name. That is strictly better than the alternative it replaces: a descriptor that bakes, looks
+/// well-formed, and dies late in `sbf-ddc` with a message naming an SDSC rather than a shape.
+///
+/// ⭐ ONE LINE TO REVERSE, deliberately: delete the call sites the day a dxp image maps
+/// `sdsc_bmm_psum` at exit 0. That fixture IS the acceptance test and it ships in their tree.
+fn refuse_reduction_core_split(
+    plan: &crate::superdsc_opspec::WorkPlan,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), String> {
+    let in_split = plan.split_of(InAxis::NAME);
+    if in_split <= 1 {
+        return Ok(());
+    }
+    Err(format!(
+        "matmul {m}x{n}x{k}: the work division splits the REDUCTION axis `in` {in_split} ways \
+         (numWkSlicesPerDim_ would carry `in: {in_split}`), and that descriptor is not schedulable on \
+         dxp image `dev-2026_09_11-150524`. Each of those cores contracts a K-slice into a partial \
+         product for dxp to PSUM-accumulate, and the SDSC scheduler has no mapping for it: the \
+         scheduler's OWN `sdsc_bmm_psum` and `sdsc_bmm_lxopt_psum` fixtures (`in: 4`) fail with \
+         `Scheduler failed to find a suitable op mapping`, while `sdsc_bmm_autoBuffer` and \
+         `sdsc_bmm_spatialDoubleBuffer` (`in: 1`) exit 0. Refused HERE rather than emitted, because an \
+         emitted one bakes, looks well-formed, and fails late in `sbf-ddc` naming an SDSC instead of a \
+         shape. This split came from the LX-fit repair \
+         (`WorkPlan::divide_and_time_tile_for_lx`'s reduction ladder), not from the cost model — which \
+         is pinned to `k = 1` — so the shape needs K-TIME accumulation or a smaller tile, not more K \
+         cores. See `refuse_reduction_core_split` for the fixture table and the reversal point."
+    ))
+}
+
 /// [`matmul_opspec_off`] with an INJECTABLE work-division `splitter` — the SEAM the Kani-verified tower
 /// (`scratchy-sdsc`) drives: it passes a `CoreSplit`-derived splitter so the emitted SDSC uses the PROVEN
 /// 32-core partition (disjoint+covering, #50-free by proof), while this fn keeps owning the ABI OpSpec /
@@ -248,6 +313,7 @@ where
         .tile(MaxCores::<MAX_CORES>, splitter, OutAxis::NAME)
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    refuse_reduction_core_split(&plan, m, n, k)?;
 
     // The CANONICAL matmul dim set is EXACTLY {mb(M), in(K), out(N), x(batch)} — NO
     // phantom `y` (verified against torch-spyre's own test_coarse_tiling.py:1330-1343:
@@ -673,6 +739,7 @@ pub fn matmul_opspec_batched_off(
         .tile(MaxCores::<MAX_CORES>, matmul_split_map, OutAxis::NAME)
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    refuse_reduction_core_split(&plan, plan.extent(MbAxis::NAME), plan.extent(OutAxis::NAME), plan.extent(InAxis::NAME))?;
     // INPUT [y,mb,in] stick=in (batch-outermost; reduction = OMIT `in` from OUTPUT).
     let input_walk = Walk3::input_head_outermost();
     let input = TensorArg::<3>::new(
