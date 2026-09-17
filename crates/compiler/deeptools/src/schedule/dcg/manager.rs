@@ -665,10 +665,10 @@ pub struct DlDsc {
     /// not reach that core's index, which is `dsc.pcfg_.size() > coreIDX` answering false
     /// (`dcg_manager.cpp:760`) and what sends entry 282 to the pcfg-pool arm instead.
     pcfgs: BTreeMap<Core, Option<SenPcfg>>,
-    /// `computeOp_.at(0).opFuncName` (`dsc/designSpaceConfig.h:118`) — [`None`] is
+    /// `computeOp_.at(0).opFuncName` (`dsc/designSpaceConfig.h:89`) — [`None`] is
     /// `DT_CHECK(dsc.computeOp_.size() > 0)` (`dcg_manager.cpp:310`) throwing.
     first_compute_op: Option<OpFunc>,
-    /// `labeledDs_` (`:106`), EACH REDUCED TO ITS `pinnedComponent()`: that is the one thing entry
+    /// `labeledDs_` (`:86`), EACH REDUCED TO ITS `pinnedComponent()`: that is the one thing entry
     /// 348's sfp-ring arm asks of one (`:319-324`), and [`Pinning`] already answers it.
     labeled_ds: Vec<Pinning>,
 }

@@ -1379,7 +1379,7 @@ pub struct PaddingSizes {
     pub pad_back: Elements,
 }
 
-/// THE CORES A DSC USES — `coreIdsUsed_` (`dsc/designSpaceConfig.h:120`), NON-EMPTY because
+/// THE CORES A DSC USES — `coreIdsUsed_` (`dsc/designSpaceConfig.h:75`), NON-EMPTY because
 /// `coreIdsUsed_.front()` is entry 258's proxy site for every per-core memory and a DSC on no core
 /// has nothing to place.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6394,7 +6394,7 @@ pub trait Dsc2Sites {
     /// The coordinate tables.
     type Coords: CoordinateOffsets;
 
-    /// `dsc.name_` (`dsc/designSpaceConfig.h:60`), which only the two verbose lines read.
+    /// `dsc.name_` (`dsc/designSpaceConfig.h:72`), which only the two verbose lines read.
     fn dsc_name(&self, dsc: DscIdx) -> StorageName;
 
     /// Every store of that DSC at once — ⛔ [`None`] is `dscs_.at(idx)`'s own throw.

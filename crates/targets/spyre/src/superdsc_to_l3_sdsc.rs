@@ -519,7 +519,7 @@ fn constant_info_of(value: &serde_json::Value) -> Option<BTreeMap<ConstIdx, Cons
                     ),
                     data_format,
                     data,
-                    // `isDataSymbolic_` (`dsc/dsc2.h:50`) — the emitter writes no such key on any of
+                    // `isDataSymbolic_` (`dsc/dsc2.h:51`) — the emitter writes no such key on any of
                     // the twelve constants of `g0/`, which is the declared `false`.
                     is_data_symbolic: entry
                         .get("isDataSymbolic_")
@@ -772,10 +772,11 @@ pub fn design_space_config(dsc: &WireDsc) -> Option<DesignSpaceConfig> {
         },
         corelets_used,
         // 2. `numCoreletsUsed_DSC2_` — ⭐ [`None`] IS THE REFERENCE'S `-1`, VERBATIM. The field is
-        //    declared `-1` (`dsc/designSpaceConfig.h:118`) and `prepDsc` (entry 054) is the only
+        //    declared `-1` (`dsc/designSpaceConfig.h:104`) and `prepDsc` (entry 054) is the only
         //    thing that ever replaces it; the reference SIZES a `std::vector` with it
-        //    (`L3DlOpsScheduler.cpp:4844`), so the unprepared state is UB there and absence is the
-        //    only honest reading here. A `Some(ONE)` would be inventing that `prepDsc` had run.
+        //    (`L3DlOpsScheduler.cpp:4844`), where the `-1` becomes a `size_type` of `SIZE_MAX` and
+        //    the construction THROWS, so absence is the only honest reading here. A `Some(ONE)`
+        //    would be inventing that `prepDsc` had run.
         corelets_used_dsc2: None,
         corelet_shares,
         primary_ds_info,
@@ -925,7 +926,7 @@ pub fn compute_ops_of(op: &SdscOp) -> Option<Vec<Vec<DscComputeOp>>> {
 ///
 /// ⭐ `dsc.name_` IS THE `dscs_` MAP **KEY**. The wire's `dscs_` is a `Vec<BTreeMap<String, Dsc>>`
 /// (`lower_subtile_tape_to_superdsc.rs:1300`) whose key is the program name the emitter states
-/// (`"MatMul_0"`, `"rmsq_o728"` in `g0/sdsc_0.json`), and `dsc/designSpaceConfig.h:60`'s `name_` is
+/// (`"MatMul_0"`, `"rmsq_o728"` in `g0/sdsc_0.json`), and `dsc/designSpaceConfig.h:72`'s `name_` is
 /// the same fact — so this is a READ and not the positional `dsc{at}` spelling
 /// `Dsc2State::seeded` falls back to.
 ///

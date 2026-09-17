@@ -22,7 +22,7 @@
 //!    could not state the op list would silently skip every DSC and answer [`v1::DscFilled::Yes`]
 //!    having done nothing — a false green. [`DesignSpaceConfig`] does not hold `computeOp_`, so the
 //!    list is handed in, exactly as stage 2a is handed [`v1::OpFuncs`] ([`super::run_l3`]).
-//! 2. **`dsc.name_`** — `dsc/designSpaceConfig.h:60`, which [`DesignSpaceConfig`] does not carry
+//! 2. **`dsc.name_`** — `dsc/designSpaceConfig.h:72`, which [`DesignSpaceConfig`] does not carry
 //!    either, and which only [`v1::Dsc2Fill::said`]'s two verbose lines read.
 //! 3. **`numWkSlicesPerDim_`** — a [`SuperDsc`] field, and `run_v1` takes the super-DSC as
 //!    `&mut`, so no provider may alias it. It is copied in at construction.
@@ -352,7 +352,7 @@ impl UtilStageExtents for Dsc2Dims {
 /// ⭐ ONE DSC'S FACTS BEYOND ITS TREE — what `currDsc` answers that [`DscTree`] does not.
 #[derive(Debug)]
 pub struct Dsc2Facts {
-    /// `dsc.name_` (`dsc/designSpaceConfig.h:60`) — a construction argument; see the module note.
+    /// `dsc.name_` (`dsc/designSpaceConfig.h:72`) — a construction argument; see the module note.
     name: v1::StorageName,
     /// ⛔⛔ A CLONE OF `sdsc.dscs_.at(idx)`, AND THAT IS `run_v1`'S OWN CUT. The reference's
     /// `currDsc` IS that entry; `run_v1` takes `sdsc: &mut SuperDsc` beside `sites: &mut P`, so no

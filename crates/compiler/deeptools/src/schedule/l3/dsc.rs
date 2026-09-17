@@ -325,7 +325,14 @@ impl CoreletShare {
 ///
 /// ⛔ NOT A FIELD, BECAUSE IT IS NOT A SECOND FACT: `DT_CHECK(coreIdsUsed_.size() == numCoresUsed_)`
 /// (`dsc/designSpaceConfig.cpp:1033`, `dsc/dsc2Pcfg.cpp:21`) says the two agree, so
-/// [`CoreIdsUsed::count`] derives it and the pair cannot disagree.
+/// [`CoreIdsUsed::count`] derives it.
+///
+/// ⚠️ AND BOTH OF THOSE CHECKS ARE GUARDED — `if (coreIdsUsed_.size() > 0)` (`:1032`) and
+/// `if (!dsc.coreIdsUsed_.empty())` (`:20`) — so neither says anything about an EMPTY list: the
+/// reference tolerates an empty `coreIdsUsed_` beside a non-zero `numCoresUsed_` and loops
+/// `numCoresUsed_` times without reading it. WHAT MAKES THE PAIR INSEPARABLE HERE IS [`CoreIdsUsed`]
+/// ADMITTING NO EMPTY VALUE, and that is what the bare `coreIdsUsed_[0]` reads prove is required
+/// (`L3DlOpsScheduler.cpp:187`, `:423`, `ddc/ddcv1.cpp:2752`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CoreCount(pub u32);
 
@@ -380,7 +387,7 @@ pub struct PrimaryDsInfo {
 /// A DSC'S LABELLED DATA STRUCTURES, NON-EMPTY — `labeledDs_` (`dsc/designSpaceConfig.h:86`).
 ///
 /// ⭐ NON-EMPTY BECAUSE THE REFERENCE NEVER GUARDS IT: the min-param units reach `.front()`/`.back()`
-/// with no check, and `isLastLds` compares against the UNSIGNED `labeledDs_.size() - 1`
+/// with no check, and `isOutputLabeledDs` compares against the UNSIGNED `labeledDs_.size() - 1`
 /// (`L3DlOpsScheduler.h:229`), which on an empty list is `SIZE_MAX`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LabeledDsList {
@@ -454,7 +461,7 @@ impl LabeledDsList {
     }
 }
 
-/// ONE CONSTANT OF A DSC — `dsc2::ConstantInfo` (`dsc/dsc2.h:46-62`).
+/// ONE CONSTANT OF A DSC — `dsc2::ConstantInfo` (`dsc/dsc2.h:46-61`).
 ///
 /// ⛔ `data_` IS A `FoldManager<std::vector<int64_t>>` AND THIS IS ITS SINGLE FOLD, which is the ONE
 /// reading the ported units make: `FoldInfraUtils::getSingleDataStrict(constinfo.data_)`
@@ -474,21 +481,31 @@ pub struct ConstantInfo {
     pub data_format: Option<DataFormat>,
     /// `getSingleDataStrict(data_)` (`:49`) — the one fold's values, in the stated format.
     pub data: Vec<i64>,
-    /// `isDataSymbolic_` (`:50`).
+    /// `isDataSymbolic_` (`:51`).
     pub is_data_symbolic: bool,
-    /// `allocations_` (`:51`) as arena handles.
+    /// `allocations_` (`:52`) as arena handles.
     pub allocations: BTreeMap<SenComponent, AllocId>,
 }
 
-/// ⭐⭐ THE FOUR `DesignSpaceConfig` FIELDS **ONLY STAGE 2B** READS — `constantInfo_`
+/// ⭐⭐ THE FOUR `DesignSpaceConfig` FIELDS **THE DSM AND THE DM FILL** — `constantInfo_`
 /// (`dsc/designSpaceConfig.h:90`), `maskingConstId_` (`:101`), `dimToSymbolMapping_` (`:76-77`) and
-/// `l0TetheredMode_` (`:117`).
+/// `l0TetheredMode_` (`:117`), which is the header's OWN banner over each of them: *"To be filled by
+/// DSM (graph modifier)"* (`:71`), *"filled by DSM/DM"* (`:88`), *"To be filled by DSM"* (`:92`) and
+/// *"To be filled by DM"* (`:103`).
 ///
-/// ⛔ ONE VALUE AND NOT FOUR FIELDS OF [`DesignSpaceConfig`], AND THAT IS WHAT KEEPS THE MODULE'S OWN
-/// RULE VISIBLE: `l3::dsc` is *"a reduced per-module projection … each module states the fields its own
-/// units touch and nothing else"*, and no L3 unit reads any of these — [`crate::schedule::ddc::v1`]'s
-/// do. Grouping them says which stage they belong to, and it means every stage-2a construction site
-/// states [`Default::default`], which is each field's OWN C++ initializer and not a value chosen here.
+/// ⚠️ AND NOT *"the four fields only stage 2b READS"*, WHICH IS WHAT THIS HEADING USED TO SAY AND IS
+/// FALSE OF TWO OF THEM. `currDsc->constantInfo_.at(...)` is entry 051's third arm
+/// (`L3DlOpsScheduler.cpp:5500`) and entry 333's constant-allocation arm (`:5814`), and
+/// `currDsc->dimToSymbolMapping_.count(dim)` is entry 333's index-symbol arm (`:5904-5906`) — so
+/// [`crate::schedule::l3::dl_ops::DscNames::constant_name`], an L3 unit in this very module tree,
+/// reads [`Self::constants`] off this value and the refusal never held. ONLY `maskingConstId_`
+/// (`ddc/ddcv1.cpp:3526`, `:3531`) and `l0TetheredMode_` (`:299`, `:324`) are read by stage 2b alone.
+///
+/// ⛔ ONE VALUE AND NOT FOUR FIELDS OF [`DesignSpaceConfig`] BECAUSE THE SAME PAIR OF UPSTREAM PASSES
+/// *WRITES* ALL FOUR, and naming the filler is what keeps the module's own rule visible: `l3::dsc` is
+/// *"a reduced per-module projection … each module states the fields its own units touch and nothing
+/// else"*. Grouping them says who states them, and it means every stage-2a construction site states
+/// [`Default::default`], which is each field's OWN C++ initializer and not a value chosen here.
 ///
 /// ⛔⛔ AND EVERY ONE OF THOSE INITIALIZERS IS THE STATE SCRATCHY'S SuperDSC ACTUALLY LEAVES.
 /// `dimToSymbolMapping_`, `gtrIdsUsed_` and `l0TetheredMode_` are *"all scheduler outputs — DROPPED"*
@@ -509,20 +526,22 @@ pub struct DdcFacts {
     pub l0_tethered: L0Tethered,
 }
 
-/// ONE DESIGN SPACE CONFIG — `DesignSpaceConfig` (`dsc/designSpaceConfig.h:74`) reduced to the
+/// ONE DESIGN SPACE CONFIG — `DesignSpaceConfig` (`dsc/designSpaceConfig.h:51`) reduced to the
 /// fields this batch reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesignSpaceConfig {
-    /// The four fields only stage 2b reads — see [`DdcFacts`].
+    /// The four fields the DSM and the DM fill — see [`DdcFacts`].
     pub ddc: DdcFacts,
     /// `numCoreletsUsed_`.
     pub corelets_used: CoreletsUsed,
-    /// `numCoreletsUsed_DSC2_` (`dsc/designSpaceConfig.h:118`).
+    /// `numCoreletsUsed_DSC2_` (`dsc/designSpaceConfig.h:104`).
     ///
     /// ⛔⛔ [`None`] IS THE `-1` A DSC IS BUILT WITH, and `prepDsc` (entry 054) is the only thing
     /// that replaces it. The reference SIZES A `std::vector` WITH IT — `std::vector<int64_t>
-    /// coreletOffsets(dsc.numCoreletsUsed_DSC2_, 0)` (`L3DlOpsScheduler.cpp:4844`) — so the
-    /// unprepared state is undefined behaviour there and absence is the honest answer here.
+    /// coreletOffsets(dsc.numCoreletsUsed_DSC2_, 0)` (`L3DlOpsScheduler.cpp:4844`) — where the `-1`
+    /// converts to a `size_type` of `SIZE_MAX` and the construction THROWS. ⚠️ A THROW AND NOT
+    /// UNDEFINED BEHAVIOUR, and the `numCoreletsUsed_DSC2_ < 2` early-out on the NEXT line (`:4845`)
+    /// does not save it: the vector is sized first. Absence is the honest answer here either way.
     pub corelets_used_dsc2: Option<CoreletsUsed>,
     /// Per dim, corelet 0's share against the whole — `dataStageParam_.at(0).ss_` where the core
     /// data stage exists, else `CoreletD_` against `CoreD_`.
@@ -545,8 +564,9 @@ pub struct DesignSpaceConfig {
     /// ⭐ ABSENCE IS THE TWO `DT_CHECK`s: `memOrg_` naming no `LX`, or its entry carrying no allocate
     /// node (`L3DlOpsScheduler.cpp:1705-1709`), are one missing entry here.
     pub lx_chunk_capacity: BTreeMap<LdsIdx, Bytes>,
-    /// `N_.paddingSizes_` (`dsc/designSpaceConfig.h:103`) — the WHOLE data structure's padding, which
-    /// is where the window a padded dim belongs to is stated. EMPTY where nothing is padded.
+    /// `N_` (`dsc/designSpaceConfig.h:81`) `.paddingSizes_` (`dsc/dims.h:219`, a `DataStructDims`
+    /// member) — the WHOLE data structure's padding, which is where the window a padded dim belongs
+    /// to is stated. EMPTY where nothing is padded.
     ///
     /// ⭐ THE PADDING ALONE AND NOT THE `N_` STAGE: entries 215 and 221 read this map and nothing else
     /// of it, and a second copy of the extents is a second answer that can disagree with
@@ -3915,5 +3935,28 @@ mod tests_e002_dim_padding_sizes {
         let sized = PadSizes::of(PadElems(1), PadElems(0));
         assert_eq!(sized.voided(), PadSizes::Voided);
         assert_eq!(sized.voided_if_padded(), PadSizes::Voided);
+    }
+}
+
+#[cfg(test)]
+mod tests_e018_design_space_config {
+    use super::*;
+
+    /// `numCoresUsed_` IS DERIVED, AND THE GUARDED `DT_CHECK` IS NOT WHY. Both
+    /// `DT_CHECK(coreIdsUsed_.size() == numCoresUsed_)` sites sit inside a non-empty guard
+    /// (`dsc/designSpaceConfig.cpp:1032-1033`, `dsc/dsc2Pcfg.cpp:20-21`), so the reference can hold
+    /// an empty `coreIdsUsed_` beside any `numCoresUsed_`. [`CoreIdsUsed`] admitting no empty value
+    /// is what makes [`CoreIdsUsed::count`] total and the pair inseparable.
+    #[test]
+    fn the_core_count_is_the_non_empty_list_and_never_a_second_field() {
+        let core = |at| Core::checked(at).expect("a core of this arch");
+        let one = CoreIdsUsed::new(core(0), Vec::new());
+        assert_eq!(one.count(), CoreCount(1));
+        assert_eq!(one.count().0 as usize, one.iter().count());
+
+        let four = CoreIdsUsed::new(core(0), vec![core(1), core(2), core(3)]);
+        assert_eq!(four.count(), CoreCount(4));
+        assert_eq!(four.count().0 as usize, four.iter().count());
+        assert_eq!(four.first(), core(0));
     }
 }

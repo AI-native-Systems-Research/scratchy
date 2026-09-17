@@ -12469,8 +12469,8 @@ mod tests_e221_e228 {
     }
 }
 
-/// THE TWO CORELET COUNTS ONE DSC CARRIES — `numCoreletsUsed_` and `numCoreletsUsed_DSC2_`
-/// (`dsc/designSpaceConfig.h:74`), which entry 229 uses for DIFFERENT things: the first halves the
+/// THE TWO CORELET COUNTS ONE DSC CARRIES — `numCoreletsUsed_` (`dsc/designSpaceConfig.h:74`) and
+/// `numCoreletsUsed_DSC2_` (`:104`), which entry 229 uses for DIFFERENT things: the first halves the
 /// data stage, the second scales the work-slice cardinality and divides the temporal alphas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoreletCounts {
@@ -20344,7 +20344,7 @@ where
         total_cores += sdsc.dscs().at(at)?.core_ids_used.count().0;
     }
     // ⛔ `f * (c * t)`, NOT `(f * c) * t`: the reference (`:2521-2525`) parenthesises an `int * int`
-    // product on each side (both counts are `int`, `dsc/designSpaceConfig.h:72-74`), and `system` is
+    // product on each side (both counts are `int`, `dsc/designSpaceConfig.h:73-74`), and `system` is
     // the threshold of the three-case heuristic below, so one extra rounding flips a selection.
     let used = u64::from(sdsc.dscs().first().corelets_used.get()) * u64::from(total_cores);
     let whole = u64::from(A::CORELETS_PER_CORE) * u64::from(A::CORES);

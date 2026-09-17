@@ -46,9 +46,14 @@
 //!    [`crate::schedule::dsc2::InstrAttribute`] field. Five that cited the arm and never needed it —
 //!    `compute_name`, `set_compute_name`, `parent_dim_loop` and the two whole-node getters — are
 //!    answered; the first three read `ScheduleNode`'s BASE fields and not `ComputeNode`'s at all.
-//! 2. **`l3::dsc` DROPS SEVEN `DesignSpaceConfig` FIELDS** — `dsName_`, `dataFormat_`,
-//!    `wordLength`, `constantInfo_`, `scaledLdsCategory_`'s non-scale arms, `dimToSymbolMapping_`
-//!    and `l0TetheredMode_`. A conversion gap, not a data gap; see [`super::Dsc2Reads`].
+//! 2. ⚠️ **THE SEVEN FIELDS THIS ITEM USED TO REFUSE ARE ALL CARRIED, AND FOUR WERE NEVER
+//!    `DesignSpaceConfig` FIELDS AT ALL** — `dsName_` (`dsc/dscdefn.h:326`), `wordLength` (`:334`),
+//!    `dataFormat_` (`:335`) and `scaledLdsCategory_` (`:352-356`) are `LabeledDsInfo` members, and
+//!    they are answered off [`crate::schedule::l3::dsc::LdsRecord`] and
+//!    [`crate::schedule::l3::dsc::LabeledDs::scaled_category`]; `constantInfo_`,
+//!    `dimToSymbolMapping_` and `l0TetheredMode_` are answered off
+//!    [`crate::schedule::l3::dsc::DdcFacts`]. A stale refusal list sends the next reader looking for
+//!    a fact already in hand, so it is corrected — [`super::ddc_reads`] carries the same correction.
 //! 3. **`dsc/` AND `util/foldManager/` SEAMS** — `getBufferCapacityForNode`,
 //!    `getBlockTransferSize*`, `getPadding`, `buildAndPropagateFold`, `setRelevantCompCoreCl` and
 //!    `finalizeScheduleTree` are all outside this campaign's file list and are REACHED, not
