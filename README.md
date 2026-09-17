@@ -1,9 +1,19 @@
 # Scratchy: A Hyper-specializing Inference Stack Compiler
 
-This repository is an experiment in leveraging the awesomeness of Rust
-to build a **full-stack compiler**. **Scratchy** is such a compiler,
-one that builds inference runtimes *from scratch* — or as close to
-that as is possible. Scratchy takes as input a triple:
+Fifty years of software reuse let the compiler delete and specialize,
+but never **restructure**. The generality of your dependencies was your
+generality, whether or not you ever wanted it.
+
+AI knocks that wall down — not by making compilers smarter, but by
+making faithful transcription cheap. When you can re-express someone's
+*algorithm* inside your own structure in an afternoon instead of over
+two quarters of pull requests, the unit of reuse stops being the
+module. It becomes the idea. And once ideas are the unit, every project
+gets to be bespoke.
+
+**Scratchy is what that looks like for inference**: a full-stack
+compiler that builds inference runtimes *from scratch* — or as close to
+that as is possible. It takes as input a triple:
 
 - a [DSL](https://en.wikipedia.org/wiki/Domain-specific_language) for
   the entire forward of a model architecture;
@@ -22,15 +32,31 @@ everything is a constant. This turns complex analysis into arithmetic,
 greatly simplifying our code. It also can enable more constant-prop
 optimizations, reducing register pressure in key kernels.
 
+The whole point is that ideas are cheap to carry and generality is
+not. 25 model architectures fit in 1,580 lines of DSL — LLaMA is 22 of
+them — because the specializer absorbed everything that was ever
+generic about them. The serving algorithms are
+[vLLM](https://github.com/vllm-project/vllm)'s, transcribed into Rust
+and credited by file and line at each site: seventy citations to a
+repository that isn't in our build graph.
+
 Scratchy's initial design point is [IBM Spyre
-AIU](https://research.ibm.com/blog/spyre-for-z), but also supports
-NVIDIA CUDA and Apple Silicon.
+AIU](https://research.ibm.com/blog/spyre-for-z) — the real test, because
+novel silicon is where the library era has nothing to offer you. Each
+Spyre core has a 2Mi scratchpad, of which 1,677,721 bytes are yours,
+and every tile of every operation must fit. Overflow it and you don't
+get an error message; you get `DtException 1535` on the card, minutes
+later, about a tile you can no longer inspect. Because scratchy knows
+every tile size at compile time, that fault is a `cargo build` error on
+your laptop instead. CUDA and Apple Silicon are also supported, and
+were the easier cases.
 
 ## Key Numbers
 
 - Very small AoT binaries, e.g. 30Mi for Metal, 100Mi for Spyre, 250Mi for Cuda.
 - Very small docker images, e.g. 330Mi for Spyre.
 - Fast startup time, e.g. 300ms warm startup on Apple Silicon *independent of model size*; 12s for 8B on Spyre.
+- 25 architectures in 1,580 lines of DSL; Spyre support is ~129k lines and cost *zero* lines of model code.
 
 ## Getting Started
 
@@ -66,6 +92,7 @@ Note the convention for selecting models and quants:
 
 ### Deep Dives
 
+- See [`docs/WHY.md`](docs/WHY.md) for the argument above at full length.
 - See [`docs/BUILD.md`](docs/BUILD.md) for the full feature-scoping
 mechanics.
 - See [`docs/COMPILER.md`](docs/COMPILER.md) for more information on the procmacro approach.
