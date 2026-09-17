@@ -201,8 +201,8 @@ use crate::schedule::ddc::transformation_util::{
 use crate::schedule::ddc::v1::{CoreClSet, StorageName};
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::dsc2::{
-    DataInfo, Dsts, InstrAttribute, LayoutDims, ReplicationFactor, SyncDirection, SyncNode,
-    SyncStrength, TransferPadding,
+    DataInfo, Dsts, InstrAttribute, LayoutDims, NodeBase, ReplicationFactor, SyncDirection,
+    SyncNode, SyncStrength, TransferPadding,
 };
 use crate::schedule::l3::dsc::PrimaryDsInfo;
 use crate::units::{Core, NumFolds};
@@ -2320,7 +2320,7 @@ fn minted_sync_pair<S: PackStickDim + ?Sized>(tree: &mut S) -> (NodeId, NodeId) 
     let send_name = NodeName("sync_lxsu_send_lxlu".to_owned());
     let recv_name = NodeName("sync_lxlu_recv_lxsu".to_owned());
     let send = tree.new_sync(SyncNode {
-        name: send_name.clone(),
+        base: NodeBase::named(send_name.clone()),
         units: SyncUnits::new(SenComponent::Lxsu, []),
         direction: SyncDirection::Send,
         strength: SyncStrength::Hard,
@@ -2328,7 +2328,7 @@ fn minted_sync_pair<S: PackStickDim + ?Sized>(tree: &mut S) -> (NodeId, NodeId) 
         other_ends: vec![recv_name.clone()],
     });
     let recv = tree.new_sync(SyncNode {
-        name: recv_name,
+        base: NodeBase::named(recv_name),
         units: SyncUnits::new(SenComponent::Lxlu, []),
         direction: SyncDirection::Receive,
         strength: SyncStrength::Hard,

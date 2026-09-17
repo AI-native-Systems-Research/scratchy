@@ -1196,18 +1196,73 @@ impl Symbolic {
     }
 }
 
-/// A DATA STAGE'S DIMS — `DataStructDims` (`dsc/dims.h:158`) reduced to what this batch reads.
+/// Replaces: e006_DataStructDims
+///
+/// A DATA STAGE'S DIMS — `DataStructDims` (`dsc/dims.h:158`), 19 of its 28 declared members; the
+/// remaining nine are its DEPRECATED block and they are absent BY MEASUREMENT, not by narrowing.
+///
+/// ⛔⛔ `r_` `c_` `rc_` `si_` `sj_` `sij_` `zi_` `zj_` `zij_` (`dsc/dims.h:166`, `:175-176`,
+/// `:181-182`, `:185-186`, `:192-193`) ARE CLEARED TO `-1` FOR EVERY DATA STAGE BEFORE DDC READS
+/// ONE — `clearDeprecatedFields` assigns all nine in one statement over `dataStageParam_`'s `ss_`
+/// and `el_` (`ddc/ddcv1.cpp:2081-2090`), and the header marks two of them *"to be removed in
+/// future.."* (`:174`). Nothing on this campaign's path names any of the nine: neither the L3
+/// scheduler (`dcg/dcg_fe/scheduler/`) nor `ddc/ddl/` mentions one, and the only writers tree-wide
+/// are `dcg/dcg_fe/pcfg_gen/dlOpsNew.cpp:314-346`, off this path. So [`Self::compound`] computing
+/// TWO of the reference's five products is complete, not short.
+///
+/// ⭐ `name_` (`dsc/dims.h:160`) IS CARRIED, by [`NamedDims`] — the half of this same C++ class that
+/// pairs the name with these dims.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StageDims {
-    /// The `i_`/`j_`/… slots this stage states, which [`StageDims::extent`] reads RAW and
-    /// [`StageDims::whole_extent`] is the `primaryDimToVal_st(dim)` reading of.
+    /// Field: e006_DataStructDims.in_
+    ///
+    /// Field: e006_DataStructDims.out_
+    ///
+    /// Field: e006_DataStructDims.mb_
+    ///
+    /// Field: e006_DataStructDims.ij_
+    ///
+    /// Field: e006_DataStructDims.kij_
+    ///
+    /// Field: e006_DataStructDims.y_
+    ///
+    /// Field: e006_DataStructDims.x_
+    ///
+    /// Field: e006_DataStructDims.x1_
+    ///
+    /// Field: e006_DataStructDims.i_
+    ///
+    /// Field: e006_DataStructDims.j_
+    ///
+    /// Field: e006_DataStructDims.ki_
+    ///
+    /// Field: e006_DataStructDims.kj_
+    ///
+    /// THE TWELVE SLOTS `PrimaryDimTypes` NAMES, AS ONE MAP — `primaryDimToValHandler_st`
+    /// (`dsc/dims.cpp:485-514`) is the dim-to-field switch, and its twelve arms are exactly these
+    /// twelve members with `DT_ERROR("Invalid PrimaryDim")` for every other. So a key here IS the
+    /// field, and no `DataStructDims` member reachable by a `PrimaryDimTypes` is outside this map.
+    ///
+    /// [`StageDims::extent`] reads one RAW; [`StageDims::whole_extent`] is the
+    /// `primaryDimToVal_st(dim)` reading of it.
     pub extents: BTreeMap<PrimaryDim, Extent>,
-    /// `paddingSizes_`.
+    /// Field: e006_DataStructDims.paddingSizes_
+    ///
+    /// `paddingSizes_` (`dsc/dims.h:219`).
     pub padding: BTreeMap<PrimaryDim, DimPadding>,
-    /// `symbolicDimInfo_` with `maxSymbolicVolume_`.
+    /// Field: e006_DataStructDims.symbolicDimInfo_
+    ///
+    /// Field: e006_DataStructDims.maxSymbolicVolume_
+    ///
+    /// `symbolicDimInfo_` (`:197`) with `maxSymbolicVolume_` (`:202`) — see [`Symbolic`] for why the
+    /// pruner makes them one value.
     pub symbolic: Symbolic,
-    /// `coreletSplit_` — per corelet-split dim, one extent per corelet of the core.
+    /// Field: e006_DataStructDims.coreletSplit_
+    ///
+    /// `coreletSplit_` (`:206`) — per corelet-split dim, one extent per corelet of the core.
     pub corelet_split: BTreeMap<PrimaryDim, Vec<Extent>>,
+    /// Field: e006_DataStructDims.rowSplit_
+    ///
     /// `rowSplit_` (`dsc/dims.h:209`) — per corelet, that corelet's share of the dim broken up
     /// across the PT's rows, indexed BY ROW.
     ///
@@ -1215,6 +1270,8 @@ pub struct StageDims {
     /// what makes `primaryDimToVal_st`'s `clId = -1` arm read the FIRST corelet and not the core
     /// (`dsc/dims.cpp:673-675`).
     pub row_split: BTreeMap<PrimaryDim, BTreeMap<Corelet, Vec<Extent>>>,
+    /// Field: e006_DataStructDims.peSfpSplit_
+    ///
     /// `peSfpSplit_` (`dsc/dims.h:210-214`) — per corelet, the PE's and the SFP's shares.
     ///
     /// ⭐ BOTH SIDES ARE ALWAYS PRESENT, so `.at(peOrSfp)`'s throw (`dsc/dims.cpp:687`, `:691`, `:694`) is
@@ -1539,9 +1596,11 @@ impl StageDims {
     /// with an absent or negative operand is the compound dim's OWN absence, which is the `-1` the
     /// reference writes.
     ///
-    /// ⛔ THE REFERENCE ALSO WRITES `zij_`, `sij_` AND `rc_`: no `PrimaryDimTypes` value names those
-    /// six operands or their three products (`dsc/dims.cpp:485`), so they are unspellable here — and
-    /// no unit of this file reads them.
+    /// ⛔ THE REFERENCE ALSO WRITES `zij_`, `sij_` AND `rc_`, AND ALL THREE ARE ALWAYS `-1` HERE.
+    /// Their six operands are the deprecated block `clearDeprecatedFields` sets to `-1` for every
+    /// data stage before DDC reads one (`ddc/ddcv1.cpp:2081-2090`), so each product's guard fails on
+    /// both sides and each lands on the reference's own `-1`. No `PrimaryDimTypes` value names any of
+    /// the nine either (`dsc/dims.cpp:485-514`). TWO PRODUCTS IS THE WHOLE OF IT ON THIS PATH.
     pub fn compound(&mut self) {
         for (product, left, right) in [
             (PrimaryDim::Ij, PrimaryDim::I, PrimaryDim::J),
@@ -2110,11 +2169,19 @@ impl StageName {
     }
 }
 
-/// ONE HALF OF A DATA STAGE — a `DataStructDims` with its `name_`, which is the field the two halves
-/// of a `dsc2::DataStage` differ in.
+/// ONE HALF OF A DATA STAGE — a `DataStructDims` (`dsc/dims.h:158`) with its `name_`, which is the
+/// member the two halves of a `dsc2::DataStage` differ in.
+///
+/// ⭐ THIS AND [`StageDims`] ARE ONE C++ CLASS SPELLED IN TWO LAYERS, NOT TWO HOMES: `name_` sits
+/// here, the other 18 carried members sit on [`StageDims`], and [`FilledDims`] between them is the
+/// `!empty()` witness. ⚠️ `ddc::transformation_util::StageDims<D>` is a THIRD spelling — the SAME
+/// class kept generic in its extents payload for the ddc side — so it carries `name_` too. The
+/// collapse is ~70 sites across twelve files and belongs with the carrier deletion, not here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NamedDims {
-    /// `name_`.
+    /// Field: e006_DataStructDims.name_
+    ///
+    /// `name_` (`dsc/dims.h:160`).
     pub name: StageName,
     /// The dims themselves.
     pub dims: FilledDims,
@@ -3732,5 +3799,39 @@ mod tests_e012 {
         );
         assert_eq!(symbolic.whole_extent(PrimaryDim::Out), Some(Extent(256)));
         assert_eq!(symbolic.extent(PrimaryDim::Out), Some(Extent(64)));
+    }
+}
+
+#[cfg(test)]
+mod tests_e006_data_struct_dims {
+    use super::*;
+
+    /// `compound()` (`dsc/dims.cpp:84-111`) OVER ITS FIVE PAIRS: `IJ = I·J` and `KIJ = KI·KJ` land,
+    /// a pair with one operand missing removes its product, and the three deprecated products
+    /// (`rc_`, `sij_`, `zij_`) stay absent because `clearDeprecatedFields` (`ddc/ddcv1.cpp:2081`)
+    /// has already put `-1` in all six of their operands.
+    #[test]
+    fn compound_computes_the_two_live_products_and_no_deprecated_one() {
+        let mut dims = StageDims::default();
+        for (dim, extent) in [
+            (PrimaryDim::I, 4),
+            (PrimaryDim::J, 5),
+            (PrimaryDim::Ki, 3),
+            (PrimaryDim::Kj, 7),
+        ] {
+            dims.extents.insert(dim, Extent(extent));
+        }
+        dims.compound();
+        assert_eq!(dims.extent(PrimaryDim::Ij), Some(Extent(20)));
+        assert_eq!(dims.extent(PrimaryDim::Kij), Some(Extent(21)));
+        // Every dim the map now names is one of `primaryDimToValHandler_st`'s twelve, so no
+        // deprecated product can have been written.
+        assert_eq!(dims.extents.len(), 6);
+
+        // `else { ij_ = -1; }` — the product's own absence.
+        dims.extents.remove(&PrimaryDim::J);
+        dims.compound();
+        assert_eq!(dims.extent(PrimaryDim::Ij), None);
+        assert_eq!(dims.extent(PrimaryDim::Kij), Some(Extent(21)));
     }
 }

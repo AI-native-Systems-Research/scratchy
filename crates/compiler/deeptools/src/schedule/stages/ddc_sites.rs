@@ -1401,7 +1401,7 @@ impl conv::ScheduleWrites for Dsc2Ddl<'_, '_> {
         if held.parametric_lds.is_some() {
             return None;
         }
-        let name = held.block.name.clone();
+        let name = held.block.base.name.clone();
         // `dims_`, IN THE LOOP'S OWN ORDER — non-empty by [`tu::LoopDims`]' construction, which is
         // entry 114's *"Cannot construct loop with no dimensions"* made unspellable. The DDL arm has
         // already refused an empty band before reaching here.
@@ -1458,7 +1458,7 @@ impl conv::ScheduleWrites for Dsc2Ddl<'_, '_> {
     /// `currParent->addChildNode(new dsc2::SyncNode())`.
     fn add_sync(&mut self, parent: NodeId, held: SyncNode) -> Option<NodeId> {
         let tree = self.state.tree(self.dsc)?;
-        let name = held.name.clone();
+        let name = held.base.name.clone();
         Some(tree.with_mut(|tree| tree.add(name, super::tree::Kind::Sync(held), Some(parent))))
     }
 
@@ -1483,7 +1483,7 @@ impl conv::ScheduleWrites for Dsc2Ddl<'_, '_> {
             then_region: Vec::new(),
             else_region: Vec::new(),
         };
-        let name = held.name.clone();
+        let name = held.base.name.clone();
         Some(tree.with_mut(|tree| tree.add(name, super::tree::Kind::Condition(cond), Some(parent))))
     }
 

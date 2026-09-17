@@ -1132,10 +1132,78 @@ pub struct StickDimIdx(pub u32);
 /// UNSET. Every size entry 126 pushes is a positive element count, so this one is not optional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
-    /// `dim_`.
+    /// Field: e009_ScheduleNode.dim_
+    ///
+    /// `dim_` (`dsc/dsc2.h:487`).
     pub dim: PrimaryDim,
-    /// `size_`.
+    /// Field: e009_ScheduleNode.size_
+    ///
+    /// `size_` (`:488`).
     pub size: Elements,
+}
+
+/// A POSITION IN A UNIT VIEW'S SIZE LIST — the `sizeIdx_` a [`LoopInfo`] holds (`dsc/dsc2.h:503`),
+/// an index into [`UnitView::sizes_no_gaps`] and NOT a [`StickDimIdx`] into the stick order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ViewSizeIdx(pub usize);
+
+/// ONE ENCLOSING LOOP OF A UNIT VIEW — `ScheduleNode::UnitView::LoopInfo` (`dsc/dsc2.h:500-505`).
+///
+/// ⭐ `loop_` IS A NAME HERE. A view is STORED on its node (`TransferNode::srcLoopsAndSize_`,
+/// `dsc/dsc2.h:848`; `ComputeNode::inputsLoopsAndSizes_`, `:944`), so its `const LoopNode*` crosses
+/// ownership — and a name is the link a tree of owned nodes can hold, as [`SyncNode::other_ends`]
+/// already does for a sync's other end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopInfo {
+    /// Field: e009_ScheduleNode.loop_
+    ///
+    /// `loop_` (`:501`), by that [`LoopNode`]'s own `name_`.
+    pub loop_name: NodeName,
+    /// `dim_` (`:502`), whose `PrimaryDimTypesCount` default is unspellable.
+    pub dim: PrimaryDim,
+    /// Field: e009_ScheduleNode.sizeIdx_
+    ///
+    /// `sizeIdx_` — [`None`] for the `-1` a loop unrelated to the lds dims gets
+    /// (`dsc/dsc2.cpp:2872`).
+    pub size_idx: Option<ViewSizeIdx>,
+    /// Field: e009_ScheduleNode.elemOffset_
+    ///
+    /// `elemOffset_` — elements per iteration of that loop, [`None`] for the same `-1`.
+    pub elem_offset: Option<Elements>,
+}
+
+/// WHAT ONE UNIT SEES OF A LABELLED DS — `ScheduleNode::UnitView` (`dsc/dsc2.h:499-511`): the sizes
+/// a transfer or a compute steps through, and the loops that step them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnitView {
+    /// Field: e009_ScheduleNode.sizesNoGaps_
+    ///
+    /// `sizesNoGaps_` — the stick dims first, then the layout dims (`dsc/dsc2.cpp:2775`, `:2791`).
+    pub sizes_no_gaps: Vec<Size>,
+    /// Field: e009_ScheduleNode.compositeLoops_
+    ///
+    /// `compositeLoops_` — the loops fusable into the unit's own stepping, innermost first.
+    pub composite_loops: Vec<LoopInfo>,
+    /// Field: e009_ScheduleNode.outerLoops_
+    ///
+    /// `outerLoops_` — the rest of the nest above those.
+    pub outer_loops: Vec<LoopInfo>,
+    /// Field: e009_ScheduleNode.sizesWithGaps_
+    ///
+    /// `sizesWithGaps_`, *"per core"*, whose `-1` key is the entry standing for every core.
+    pub sizes_with_gaps: BTreeMap<Option<Core>, Vec<Size>>,
+}
+
+impl UnitView {
+    /// `getSizesForCoreId(coreId)` (`dsc/dsc2.cpp:2398-2405`) — this core's gapped sizes, else the
+    /// every-core entry, else the ungapped ones.
+    #[must_use]
+    pub fn sizes_for_core(&self, core: Option<Core>) -> &[Size] {
+        self.sizes_with_gaps
+            .get(&core)
+            .or_else(|| self.sizes_with_gaps.get(&None))
+            .unwrap_or(&self.sizes_no_gaps)
+    }
 }
 
 /// ONE CHUNK OF A UNIT-TIME TRANSFER — `TransferNode::SizeAndIndex` (`dsc/dsc2.h:820`). Both of its
@@ -1417,6 +1485,240 @@ impl TransferNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct WordLength(pub u32);
 
+/// WHICH KIND OF NODE A TREE POSITION IS — `ScheduleNode::NodeType` (`dsc/dsc2.h:446-456`), the set
+/// `traverseTreeDFS`'s `nodeTypes` filter is drawn from.
+///
+/// ⛔ NO `INVALID` ARM. It is the base class's own `nodeType_ = INVALID` default (`:460`), and every
+/// subclass hands its own kind to the constructor at `:481`, so no node in a tree carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NodeType {
+    /// `BLOCK`.
+    Block,
+    /// `LOOP`.
+    Loop,
+    /// `TRANSFER`.
+    Transfer,
+    /// `COMPUTE`.
+    Compute,
+    /// `SYNC`.
+    Sync,
+    /// `CONDITION`.
+    Condition,
+    /// `ALLOCATE`.
+    Allocate,
+    /// `STICKMASK`.
+    StickMask,
+}
+
+impl NodeType {
+    /// `isBlockNode()` (`dsc/dsc2.h:479`) — whether a traversal descends into a node of this kind.
+    #[must_use]
+    pub const fn is_block_node(self) -> bool {
+        matches!(self, Self::Block | Self::Loop | Self::Condition)
+    }
+}
+
+/// WHICH OF THE THREE CHILDLESS KINDS A [`SchedNode::Leaf`] IS, so that a node the tree holds only
+/// as a position still answers `nodeType_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LeafKind {
+    /// `ALLOCATE`.
+    Allocate,
+    /// `COMPUTE`.
+    Compute,
+    /// `TRANSFER`.
+    Transfer,
+}
+
+impl LeafKind {
+    /// The `nodeType_` a leaf of this kind carries.
+    #[must_use]
+    pub const fn node_type(self) -> NodeType {
+        match self {
+            Self::Allocate => NodeType::Allocate,
+            Self::Compute => NodeType::Compute,
+            Self::Transfer => NodeType::Transfer,
+        }
+    }
+}
+
+/// WHAT `isNodeRelevant` IS ASKED — the four legal shapes of its `(comp, clId, coreId)`
+/// (`dsc/dsc2.cpp:1916-1932`). Its two `DT_ERROR`s are the shapes this enum cannot spell: a corelet
+/// with no core, and a core or corelet filter under `comp == ALL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relevance {
+    /// `(ALL, -1, -1)`.
+    Any,
+    /// `(comp, -1, -1)`.
+    Comp(SenComponent),
+    /// `(comp, -1, coreId)`.
+    CompCore(SenComponent, Core),
+    /// `(comp, clId, coreId)`.
+    CompCoreCl(SenComponent, Core, Corelet),
+}
+
+/// HOW FAR A COMPONENT QUERY IS NARROWED — the `(coreId, clId)` `getRelevantComps` takes
+/// (`dsc/dsc2.cpp:1949-1975`), whose one `DT_ERROR` is again a corelet with no core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreSel {
+    /// `(-1, -1)`.
+    Any,
+    /// `(coreId, -1)`.
+    Core(Core),
+    /// `(coreId, clId)`.
+    Corelet(Core, Corelet),
+}
+
+/// WHICH CORELETS OF WHICH CORES OF WHICH COMPONENTS A NODE IS FOR — `relevantComps_`
+/// (`dsc/dsc2.h:516`), the filter `getNextView` selects a node by.
+///
+/// ⛔ A COMPONENT PRESENT WITH AN EMPTY CORE MAP IS NOT AN ABSENT ONE: [`Self::relevant_comps`]
+/// skips it (`dsc/dsc2.cpp:1963`, `:1972`) while [`Self::is_node_relevant`] accepts it as long as no
+/// core is named (`:1923-1926`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RelevantComps(BTreeMap<SenComponent, BTreeMap<Core, BTreeSet<Corelet>>>);
+
+impl RelevantComps {
+    /// `relevantComps_[comp][coreId].insert(clId)` — the write a sequence makes when it decides a
+    /// node belongs to a unit (`dsc/dsc2.cpp:2692`).
+    pub fn mark(&mut self, comp: SenComponent, core: Core, corelet: Corelet) {
+        self.0
+            .entry(comp)
+            .or_default()
+            .entry(core)
+            .or_default()
+            .insert(corelet);
+    }
+
+    /// `relevantComps_.erase(comp)` (`dsc/dsc2.cpp:2977-2980`) — dropping `NO_COMPONENT` once the
+    /// per-component marking it seeded is in place.
+    pub fn forget(&mut self, comp: SenComponent) {
+        self.0.remove(&comp);
+    }
+
+    /// `relevantComps_.empty()`, which `DT_CHECK(!..)` reads on the head (`ddc/ddcv1.cpp:3458`).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `isNodeRelevant(comp, clId, coreId)` (`dsc/dsc2.cpp:1916-1932`).
+    #[must_use]
+    pub fn is_node_relevant(&self, of: Relevance) -> bool {
+        let (comp, core, corelet) = match of {
+            Relevance::Any => return true,
+            Relevance::Comp(comp) => (comp, None, None),
+            Relevance::CompCore(comp, core) => (comp, Some(core), None),
+            Relevance::CompCoreCl(comp, core, corelet) => (comp, Some(core), Some(corelet)),
+        };
+        let Some(cores) = self.0.get(&comp) else {
+            return false;
+        };
+        let Some(core) = core else {
+            return true;
+        };
+        let Some(corelets) = cores.get(&core) else {
+            return false;
+        };
+        corelet.is_none_or(|corelet| corelets.contains(&corelet))
+    }
+
+    /// `getRelevantCoreCl(comp)` (`dsc/dsc2.cpp:1934-1947`) — [`None`] is its `ALL` default, which
+    /// unions every component's cores; a core with no corelets contributes nothing either way.
+    #[must_use]
+    pub fn relevant_core_cl(
+        &self,
+        comp: Option<SenComponent>,
+    ) -> BTreeMap<Core, BTreeSet<Corelet>> {
+        let mut all: BTreeMap<Core, BTreeSet<Corelet>> = BTreeMap::new();
+        for (relevant, cores) in &self.0 {
+            if comp.is_some_and(|comp| comp != *relevant) {
+                continue;
+            }
+            for (core, corelets) in cores {
+                if !corelets.is_empty() {
+                    all.entry(*core).or_default().extend(corelets.iter().copied());
+                }
+            }
+        }
+        all
+    }
+
+    /// `getRelevantComps(coreId, clId)` (`dsc/dsc2.cpp:1949-1975`) — which components reach the core
+    /// and corelet `at` names.
+    #[must_use]
+    pub fn relevant_comps(&self, at: CoreSel) -> BTreeSet<SenComponent> {
+        let mut all = BTreeSet::new();
+        for (comp, cores) in &self.0 {
+            let reaches = match at {
+                CoreSel::Any => !cores.is_empty(),
+                CoreSel::Core(core) => cores.get(&core).is_some_and(|cls| !cls.is_empty()),
+                CoreSel::Corelet(core, corelet) => {
+                    cores.get(&core).is_some_and(|cls| cls.contains(&corelet))
+                }
+            };
+            if reaches {
+                all.insert(*comp);
+            }
+        }
+        all
+    }
+}
+
+/// Replaces: e009_ScheduleNode
+///
+/// WHAT EVERY SCHEDULE-TREE NODE CARRIES — `dsc2::ScheduleNode`'s own state (`dsc/dsc2.h:444-517`),
+/// held BY COMPOSITION on each node kind exactly as [`LoopNode`] holds its [`BlockNode`] part.
+///
+/// ⭐ FOUR DECLARED FIELDS, TWO OF THEM HERE. `nodeType_` (`:460`) IS the [`SchedNode`] discriminant,
+/// spelled back by [`SchedNode::node_type`]; `prev_` (`:515`) is a parent POINTER, which an owned
+/// tree answers by walking DOWN instead ([`ScheduleTree::ancestors`]). Its two nested structs are
+/// types rather than fields: [`Size`] and [`UnitView`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeBase {
+    /// Field: e009_ScheduleNode.name_
+    ///
+    /// `name_` (`dsc/dsc2.h:461`).
+    pub name: NodeName,
+    /// Field: e009_ScheduleNode.relevantComps_
+    ///
+    /// `relevantComps_` (`:516`), empty until a sequence marks the node.
+    pub relevant_comps: RelevantComps,
+}
+
+impl NodeBase {
+    /// A node known only by its name, which is every mint site — `relevantComps_` is filled by a
+    /// later pass over the tree (`dsc/dsc2.cpp:2656-2692`).
+    #[must_use]
+    pub const fn named(name: NodeName) -> Self {
+        Self {
+            name,
+            relevant_comps: RelevantComps(BTreeMap::new()),
+        }
+    }
+}
+
+/// AN ALLOCATE, COMPUTE OR TRANSFER NODE'S TREE POSITION — `isBlockNode()` is false and it has no
+/// children, so a walk neither yields nor descends into it; its payload lives with its own unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafNode {
+    /// The `ScheduleNode` part.
+    pub base: NodeBase,
+    /// Which of the three kinds it is.
+    pub kind: LeafKind,
+}
+
+impl LeafNode {
+    /// A named leaf of kind `kind`.
+    #[must_use]
+    pub const fn new(kind: LeafKind, name: NodeName) -> Self {
+        Self {
+            base: NodeBase::named(name),
+            kind,
+        }
+    }
+}
+
 /// `dsc2::BlockNode` (`dsc/dsc2.h:526`) narrowed to the `name_` a block is looked up by and the
 /// `next_` children a traversal descends into.
 ///
@@ -1424,8 +1726,8 @@ pub struct WordLength(pub u32);
 /// `addChildNode`/`moveChildNode` are the units that fill it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlockNode {
-    /// `name_`.
-    pub name: NodeName,
+    /// The `ScheduleNode` part.
+    pub base: NodeBase,
     /// `next_`, in order.
     pub children: Vec<SchedNode>,
 }
@@ -1605,8 +1907,8 @@ impl SyncUnits {
 /// binds onto it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncNode {
-    /// `name_`.
-    pub name: NodeName,
+    /// The `ScheduleNode` part.
+    pub base: NodeBase,
     /// `units_`.
     pub units: SyncUnits,
     /// `isReceive_`.
@@ -1751,8 +2053,8 @@ impl CondRegions {
 /// it answers "the core/corelet set is what guards this", not "the set is non-empty".
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConditionNode {
-    /// `name_` of the `BlockNode` base (`dsc/dsc2.h:526`).
-    pub name: NodeName,
+    /// The `ScheduleNode` part, reached through the `BlockNode` base (`dsc/dsc2.h:526`).
+    pub base: NodeBase,
     /// Field: e012_ConditionNode.loopCond_
     ///
     /// `loopCond_` (`dsc/dsc2.h:690`).
@@ -1796,8 +2098,8 @@ impl ConditionNode {
 /// naming the constant that holds the mask value and the transfers it applies to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StickMaskNode {
-    /// `name_`.
-    pub name: NodeName,
+    /// The `ScheduleNode` part.
+    pub base: NodeBase,
     /// `maskValConstId_` (`:1063`), whose `-1` default is [`None`].
     pub mask_val_const_id: Option<ConstIdx>,
     /// `dataFormat_` (`:1064`), whose `INVALID` default is [`None`].
@@ -2075,20 +2377,55 @@ pub enum SchedNode {
     Sync(SyncNode),
     /// An allocate, compute or transfer node — `isBlockNode()` is false and it has no children, so the
     /// walk neither yields nor descends.
-    Leaf(NodeName),
+    Leaf(LeafNode),
 }
 
 impl SchedNode {
+    /// The `ScheduleNode` part, whichever kind of node this is.
+    #[must_use]
+    pub const fn base(&self) -> &NodeBase {
+        match self {
+            Self::Block(block) | Self::Condition(block) => &block.base,
+            Self::Loop(node) => &node.block.base,
+            Self::Guarded(cond) => &cond.base,
+            Self::StickMask(mask) => &mask.base,
+            Self::Sync(sync) => &sync.base,
+            Self::Leaf(leaf) => &leaf.base,
+        }
+    }
+
+    /// The same part, exclusively, which is how a pass over the tree marks `relevantComps_`
+    /// (`dsc/dsc2.cpp:2656-2692`).
+    pub const fn base_mut(&mut self) -> &mut NodeBase {
+        match self {
+            Self::Block(block) | Self::Condition(block) => &mut block.base,
+            Self::Loop(node) => &mut node.block.base,
+            Self::Guarded(cond) => &mut cond.base,
+            Self::StickMask(mask) => &mut mask.base,
+            Self::Sync(sync) => &mut sync.base,
+            Self::Leaf(leaf) => &mut leaf.base,
+        }
+    }
+
     /// `ScheduleNode::name_`, whichever kind of node this is.
     #[must_use]
     pub const fn name(&self) -> &NodeName {
+        &self.base().name
+    }
+
+    /// Field: e009_ScheduleNode.nodeType_
+    ///
+    /// `nodeType_` (`dsc/dsc2.h:460`) — the discriminant this enum already is, spelled back out for
+    /// the `nodeTypes` filter `traverseTreeDFS` takes (`dsc/dsc2.cpp:2222`).
+    #[must_use]
+    pub const fn node_type(&self) -> NodeType {
         match self {
-            Self::Block(block) | Self::Condition(block) => &block.name,
-            Self::Loop(node) => &node.block.name,
-            Self::Guarded(cond) => &cond.name,
-            Self::StickMask(mask) => &mask.name,
-            Self::Sync(sync) => &sync.name,
-            Self::Leaf(name) => name,
+            Self::Block(_) => NodeType::Block,
+            Self::Loop(_) => NodeType::Loop,
+            Self::Condition(_) | Self::Guarded(_) => NodeType::Condition,
+            Self::StickMask(_) => NodeType::StickMask,
+            Self::Sync(_) => NodeType::Sync,
+            Self::Leaf(leaf) => leaf.kind.node_type(),
         }
     }
 }
@@ -2186,6 +2523,85 @@ impl ScheduleTree {
     ) -> Option<&mut SyncNode> {
         find_sync_mut(&mut self.head, accepts)
     }
+
+    /// Field: e009_ScheduleNode.prev_
+    ///
+    /// `prev_` (`dsc/dsc2.h:515`) FOR THE NODE NAMED `name`, WALKED DOWN: an owned tree cannot hold a
+    /// parent pointer, and a chain rebuilt by the search that reached the node cannot go stale.
+    ///
+    /// ⛔ THE HEAD IS A BLOCK HERE, NOT A LOOP. The reference's `head_` is a `LoopNode`
+    /// (`dsc/dsc2.cpp:2233`), so a top-level child's `getOwnerLoop()` is that head there and [`None`]
+    /// here; every scheduler caller asks after a loop it tiled itself, which is below the head.
+    #[must_use]
+    pub fn ancestors(&self, name: &NodeName) -> Option<Ancestors<'_>> {
+        let mut loops = Vec::new();
+        ancestors_in(&self.head, &mut loops, name)
+    }
+}
+
+/// WHAT A NODE'S `prev_` CHAIN ANSWERS — the block whose child list holds it, and the loops that
+/// enclose it, innermost first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ancestors<'a> {
+    /// `getPrev()` (`dsc/dsc2.h:462`).
+    pub parent: &'a BlockNode,
+    /// The same chain filtered to `LOOP`, which is the only kind either loop walk looks for.
+    pub loops: Vec<&'a LoopNode>,
+}
+
+impl<'a> Ancestors<'a> {
+    /// `getOwnerLoop()` (`dsc/dsc2.cpp:1896-1900`) — the innermost enclosing loop.
+    #[must_use]
+    pub fn owner_loop(&self) -> Option<&'a LoopNode> {
+        self.loops.first().copied()
+    }
+
+    /// `getParentDimLoop(dim)` (`dsc/dsc2.cpp:1906-1914`) — the innermost enclosing loop that tiles
+    /// `dim`, which is [`Self::owner_loop`] continued outwards.
+    #[must_use]
+    pub fn parent_dim_loop(&self, dim: PrimaryDim) -> Option<&'a LoopNode> {
+        self.loops
+            .iter()
+            .copied()
+            .find(|enclosing| enclosing.has_loop_dim(dim))
+    }
+}
+
+/// The ancestry of the node named `name` below `parent`, with `loops` the enclosing loops so far.
+fn ancestors_in<'a>(
+    parent: &'a BlockNode,
+    loops: &mut Vec<&'a LoopNode>,
+    name: &NodeName,
+) -> Option<Ancestors<'a>> {
+    for child in &parent.children {
+        if child.name() == name {
+            return Some(Ancestors {
+                parent,
+                loops: loops.clone(),
+            });
+        }
+        let found = match child {
+            SchedNode::Block(inner) | SchedNode::Condition(inner) => {
+                ancestors_in(inner, loops, name)
+            }
+            SchedNode::Loop(node) => {
+                loops.insert(0, node);
+                let found = ancestors_in(&node.block, loops, name);
+                loops.remove(0);
+                found
+            }
+            SchedNode::Guarded(cond) => cond
+                .next
+                .regions()
+                .into_iter()
+                .find_map(|region| ancestors_in(region, loops, name)),
+            SchedNode::StickMask(_) | SchedNode::Sync(_) | SchedNode::Leaf(_) => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
 }
 
 /// Pre-order DFS over the `BLOCK` nodes below `block`, which is itself never yielded.
@@ -2732,7 +3148,7 @@ mod tests_e014 {
 
     use super::{
         BlockNode, Dsc, Elements, LayoutDims, LdsIdx, LdsSticks, LoopDim, LoopNode, MetaDimKind,
-        NodeName, PrimaryDim,
+        NodeBase, NodeName, PrimaryDim,
     };
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
 
@@ -2760,7 +3176,7 @@ mod tests_e014 {
             }],
             parametric_lds: lds.map(LdsIdx),
             ..LoopNode::bare(BlockNode {
-                name: NodeName(format!("parametric_loop_{}(padded)", dim.spelling())),
+                base: NodeBase::named(NodeName(format!("parametric_loop_{}(padded)", dim.spelling()))),
                 children: Vec::new(),
             })
         }
@@ -2808,13 +3224,15 @@ mod tests_e011 {
     //! (`dsc/dsc2.h:595-597`) reads that map, while `hasLoopDim` (`dsc/dsc2.cpp:4223-4228`) scans
     //! `dims_` comparing the `dim_` half of each pair only.
 
-    use super::{BlockNode, LoopDim, LoopNode, MetaDimKind, NodeName, PrimaryDim, VariableSymbol};
+    use super::{
+        BlockNode, LoopDim, LoopNode, MetaDimKind, NodeBase, NodeName, PrimaryDim, VariableSymbol,
+    };
 
     /// e011 — the map answers per dim, and `hasLoopDim` is blind to the `kind_` half of the pair.
     #[test]
     fn a_loops_count_is_symbolic_only_on_the_dims_its_symbol_map_names() {
         let mut held = LoopNode::bare(BlockNode {
-            name: NodeName("loop_ds0_ds1_out_y".to_owned()),
+            base: NodeBase::named(NodeName("loop_ds0_ds1_out_y".to_owned())),
             children: Vec::new(),
         });
         held.dims = vec![
@@ -2857,12 +3275,12 @@ mod tests_e012 {
 
     use std::collections::BTreeMap;
 
-    use super::{BlockNode, CondRegions, ConditionNode, LoopCondComposite, NodeName};
+    use super::{BlockNode, CondRegions, ConditionNode, LoopCondComposite, NodeBase, NodeName};
 
     /// One region block, named as `coordinate_masking` names them (`ddc/ddcv1.cpp:3539-3560`).
     fn region(name: &str) -> BlockNode {
         BlockNode {
-            name: NodeName(name.to_owned()),
+            base: NodeBase::named(NodeName(name.to_owned())),
             children: Vec::new(),
         }
     }
@@ -2871,7 +3289,7 @@ mod tests_e012 {
     #[test]
     fn a_condition_takes_a_then_region_then_an_else_and_refuses_a_third() {
         let mut held = ConditionNode {
-            name: NodeName("condition_SAMV_dim_out".to_owned()),
+            base: NodeBase::named(NodeName("condition_SAMV_dim_out".to_owned())),
             loop_cond: LoopCondComposite::default(),
             core_cl_cond: BTreeMap::new(),
             next: CondRegions::Empty,
@@ -3057,5 +3475,110 @@ mod tests_e007_data_info {
             via,
             "a `dstVias_` entry read back off an operand is the end it was minted from"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_e009_schedule_node {
+    use super::*;
+
+    /// `getOwnerLoop()` (`dsc/dsc2.cpp:1896`) AND `getParentDimLoop()` (`:1906`) WALKED DOWN over a
+    /// nest whose inner loop tiles `Y` and whose outer one tiles `X`: a leaf's parent is the block it
+    /// hangs off, its owner loop is the innermost enclosing one, and asking for `X` continues past
+    /// that loop to the one that tiles it.
+    #[test]
+    fn a_prev_chain_answers_the_owner_loop_and_the_dim_loop() {
+        let leaf = SchedNode::Leaf(LeafNode::new(
+            LeafKind::Transfer,
+            NodeName("transfer".to_owned()),
+        ));
+        let mut inner = LoopNode::bare(BlockNode {
+            base: NodeBase::named(NodeName("loop_y".to_owned())),
+            children: vec![SchedNode::Block(BlockNode {
+                base: NodeBase::named(NodeName("block".to_owned())),
+                children: vec![leaf],
+            })],
+        });
+        inner.dims.push(LoopDim {
+            dim: PrimaryDim::Y,
+            kind: MetaDimKind::Unpadded,
+        });
+        let mut outer = LoopNode::bare(BlockNode {
+            base: NodeBase::named(NodeName("loop_x".to_owned())),
+            children: vec![SchedNode::Loop(Box::new(inner))],
+        });
+        outer.dims.push(LoopDim {
+            dim: PrimaryDim::X,
+            kind: MetaDimKind::Unpadded,
+        });
+        let tree = ScheduleTree::new(BlockNode {
+            base: NodeBase::named(NodeName("head".to_owned())),
+            children: vec![SchedNode::Loop(Box::new(outer))],
+        });
+
+        let found = tree
+            .ancestors(&NodeName("transfer".to_owned()))
+            .expect("the transfer is in the tree");
+        assert_eq!(found.parent.base.name, NodeName("block".to_owned()));
+        assert_eq!(
+            found.owner_loop().map(|held| &held.block.base.name),
+            Some(&NodeName("loop_y".to_owned()))
+        );
+        assert_eq!(
+            found.parent_dim_loop(PrimaryDim::X).map(|held| &held.block.base.name),
+            Some(&NodeName("loop_x".to_owned()))
+        );
+        // `getParentDimLoop` runs out of loops rather than refusing.
+        assert!(found.parent_dim_loop(PrimaryDim::I).is_none());
+        // ⛔ The head is a block here, so a top-level child has no owner loop at all.
+        assert!(
+            tree.ancestors(&NodeName("loop_x".to_owned()))
+                .expect("the outer loop is in the tree")
+                .owner_loop()
+                .is_none()
+        );
+    }
+
+    /// `isNodeRelevant` (`dsc/dsc2.cpp:1916`), `getRelevantCoreCl` (`:1934`) and `getRelevantComps`
+    /// (`:1949`) OVER ONE MARKED CORELET: the component, core and corelet that were marked answer
+    /// yes, a neighbouring corelet answers no, and each of the two summaries names what was marked.
+    #[test]
+    fn a_marked_corelet_is_the_only_one_the_three_relevance_reads_report() {
+        let core = Core::checked(0).expect("core 0");
+        let corelet = Corelet::at::<0>();
+        let mut comps = RelevantComps::default();
+        assert!(comps.is_empty());
+        comps.mark(SenComponent::L3lu, core, corelet);
+
+        assert!(comps.is_node_relevant(Relevance::Any));
+        assert!(comps.is_node_relevant(Relevance::CompCoreCl(
+            SenComponent::L3lu,
+            core,
+            corelet
+        )));
+        assert!(!comps.is_node_relevant(Relevance::Comp(SenComponent::Lxlu0)));
+        assert!(
+            !comps.is_node_relevant(Relevance::CompCore(
+                SenComponent::L3lu,
+                Core::checked(1).expect("core 1")
+            ))
+        );
+
+        assert_eq!(
+            comps.relevant_core_cl(None),
+            BTreeMap::from([(core, BTreeSet::from([corelet]))])
+        );
+        assert_eq!(
+            comps.relevant_core_cl(Some(SenComponent::Lxlu0)),
+            BTreeMap::new()
+        );
+        assert_eq!(
+            comps.relevant_comps(CoreSel::Core(core)),
+            BTreeSet::from([SenComponent::L3lu])
+        );
+        assert_eq!(comps.relevant_comps(CoreSel::Any).len(), 1);
+
+        comps.forget(SenComponent::L3lu);
+        assert!(comps.is_empty());
     }
 }

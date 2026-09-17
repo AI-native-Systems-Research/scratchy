@@ -288,9 +288,10 @@ use crate::schedule::ddc::v1::{self, ComputeOps};
 use crate::schedule::dsc2::{
     AddressFold, AllocateNode, BlockNode, ChildPos, CondOp, Coordinate, CoordinateCategory, Dsc,
     Dsts, Fold, FoldCardinality, FoldCoeff, FoldDim, FoldLabel, FoldPosition, GroupTagRegInfo,
-    LdsIdx, LoopBound, LoopCond, LoopCondComposite, Node, NodeName, NumBuffers, NumChunks, Operand,
-    PadFold, ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength,
-    SyncUnits, TransferNode, TransferPadding, Via, WordLength, ZeroPadFolds, generic_comp,
+    LdsIdx, LoopBound, LoopCond, LoopCondComposite, Node, NodeBase, NodeName, NumBuffers,
+    NumChunks, Operand, PadFold, ReplicationFactor, SchedNode, ScheduleTree, SyncDirection,
+    SyncNode, SyncStrength, SyncUnits, TransferNode, TransferPadding, Via, WordLength,
+    ZeroPadFolds, generic_comp,
 };
 use crate::schedule::l3::dsc::{
     AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare, CoreletsUsed,
@@ -1691,7 +1692,7 @@ pub fn create_loop_node(
 #[must_use]
 pub fn create_block_node(name: NodeName) -> BlockNode {
     BlockNode {
-        name,
+        base: NodeBase::named(name),
         children: Vec::new(),
     }
 }
@@ -1711,7 +1712,7 @@ pub fn create_sync_node(
     strength: SyncStrength,
 ) -> SyncNode {
     SyncNode {
-        name,
+        base: NodeBase::named(name),
         units,
         direction,
         strength,
@@ -2804,7 +2805,7 @@ pub const LX_BELOW_BLOCK_NODE_NAME: &str = "lx_below_schedule";
 /// check, while `:3129`, `:3611` and `:7599` each `DT_CHECK_MSG` it. Here that case is a [`None`]
 /// the caller has to name.
 pub fn lx_below_block_node(tree: &mut ScheduleTree) -> Option<&mut BlockNode> {
-    tree.find_block_mut(|block| block.name.0 == LX_BELOW_BLOCK_NODE_NAME)
+    tree.find_block_mut(|block| block.base.name.0 == LX_BELOW_BLOCK_NODE_NAME)
 }
 
 /// Replaces: e047_collectAllDimensionsForLoopOrder
@@ -2960,7 +2961,9 @@ mod tests_e041_e048 {
     use crate::arch::Bytes;
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent;
     use crate::schedule::ddc::metadata::DatastageId;
-    use crate::schedule::dsc2::{LayoutDims, LoopNode, NodeName, SchedNode};
+    use crate::schedule::dsc2::{
+        LayoutDims, LeafKind, LeafNode, LoopNode, NodeBase, NodeName, SchedNode,
+    };
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DscList, LabeledDsList, NamedDims,
         SelectedCandidate, StageDims, WkSliceId,
@@ -3145,20 +3148,23 @@ mod tests_e041_e048 {
     #[test]
     fn the_lx_below_block_node_is_found_under_a_loop() {
         let named = BlockNode {
-            name: NodeName(LX_BELOW_BLOCK_NODE_NAME.to_owned()),
+            base: NodeBase::named(NodeName(LX_BELOW_BLOCK_NODE_NAME.to_owned())),
             children: vec![],
         };
         let mut tree = ScheduleTree::new(BlockNode {
-            name: NodeName("head".to_owned()),
+            base: NodeBase::named(NodeName("head".to_owned())),
             children: vec![SchedNode::Loop(Box::new(LoopNode::bare(BlockNode {
-                name: NodeName("loop_ds0_ds1".to_owned()),
+                base: NodeBase::named(NodeName("loop_ds0_ds1".to_owned())),
                 children: vec![SchedNode::Block(named)],
             })))],
         });
         let found = lx_below_block_node(&mut tree).expect("the lx-below block");
         found
             .children
-            .push(SchedNode::Leaf(NodeName("t".to_owned())));
+            .push(SchedNode::Leaf(LeafNode::new(
+                LeafKind::Transfer,
+                NodeName("t".to_owned()),
+            )));
         assert_eq!(tree.blocks_dfs().len(), 1);
         assert_eq!(tree.blocks_dfs()[0].children.len(), 1);
         assert_eq!(lx_below_block_node(&mut ScheduleTree::default()), None);
@@ -6868,7 +6874,7 @@ mod tests_e205_e212 {
     use super::*;
     use crate::arch::Sen1p5;
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
-    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::dsc2::{LayoutDims, LeafKind, LeafNode};
     use crate::schedule::l3::dsc::{
         Candidates, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DscList, LabeledDsList,
         NamedDims, PrimaryDsInfo, StageDims,
@@ -7281,8 +7287,11 @@ mod tests_e205_e212 {
     #[test]
     fn the_sync_sequence_adds_four_cross_linked_nodes_to_the_tree() {
         let mut parent = BlockNode {
-            name: NodeName("block".to_owned()),
-            children: vec![SchedNode::Leaf(NodeName("transfer".to_owned()))],
+            base: NodeBase::named(NodeName("block".to_owned())),
+            children: vec![SchedNode::Leaf(LeafNode::new(
+                LeafKind::Transfer,
+                NodeName("transfer".to_owned()),
+            ))],
         };
         let at = parent
             .child_pos(&NodeName("transfer".to_owned()))
@@ -7859,7 +7868,7 @@ mod tests_e213_e217 {
     use super::*;
 
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
-    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::dsc2::{LayoutDims, LeafKind, LeafNode};
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, DataStage, DscList, LabeledDsList, PrimaryDsInfo, StageDims,
     };
@@ -8335,7 +8344,7 @@ mod tests_e213_e217 {
         }
 
         fn add_block(&mut self, dsc: DscIdx, parent: NodeId, node: BlockNode) -> Option<NodeId> {
-            self.link(dsc, parent, node.name)
+            self.link(dsc, parent, node.base.name)
         }
     }
 
@@ -8344,8 +8353,11 @@ mod tests_e213_e217 {
     #[test]
     fn the_soft_sync_sequence_adds_two_cross_linked_soft_nodes() {
         let mut parent = BlockNode {
-            name: NodeName("block".to_owned()),
-            children: vec![SchedNode::Leaf(NodeName("transfer".to_owned()))],
+            base: NodeBase::named(NodeName("block".to_owned())),
+            children: vec![SchedNode::Leaf(LeafNode::new(
+                LeafKind::Transfer,
+                NodeName("transfer".to_owned()),
+            ))],
         };
         let at = parent
             .child_pos(&NodeName("transfer".to_owned()))
@@ -10776,7 +10788,7 @@ mod tests_e221_e228 {
         }
 
         fn new_sync(&mut self, node: SyncNode) -> NodeId {
-            let name = node.name.0.clone();
+            let name = node.base.name.0.clone();
             self.add(&name, Kind::Sync(node), None)
         }
 
@@ -14415,7 +14427,7 @@ mod tests_e283_e295 {
 
     impl DscTreeSurgery for Tree {
         fn insert_sync(&mut self, _dsc: DscIdx, sync: SyncNode, at: InsertionPoint) -> NodeId {
-            let name = sync.name.0.clone();
+            let name = sync.base.name.0.clone();
             let id = self.add(&name, Kind::Sync, None);
             self.link(id, at);
             id
@@ -21511,7 +21523,7 @@ mod unit_tests {
     #[test]
     fn a_block_node_carries_the_name_it_was_minted_with() {
         let node = create_block_node(NodeName("block_lds3".to_owned()));
-        assert_eq!(node.name, NodeName("block_lds3".to_owned()));
+        assert_eq!(node.base.name, NodeName("block_lds3".to_owned()));
     }
 
     #[test]

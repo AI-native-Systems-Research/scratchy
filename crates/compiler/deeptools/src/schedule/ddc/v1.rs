@@ -194,7 +194,7 @@ use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::dsc2::{
     AddressFold, AllocateNode, BlockNode, CondOp, CondRegions, ComputeNode, ConditionNode,
     Coordinate, DataInfo, Dsc, Dsts, FoldCoeff, FoldDim, FoldPosition, LdsIdx, LdsScale, LoopBound,
-    LoopCond, LoopCondComposite, MaxDimSize, NodeName, NumBuffers, NumChunks, Operand, Precision,
+    LoopCond, LoopCondComposite, MaxDimSize, NodeBase, NodeName, NumBuffers, NumChunks, Operand, Precision,
     RegSlot, ReplicationFactor, SchedNode, Size, SizeAndIndex, StartAddress, StickDimIdx,
     StickMaskNode, SyncNode, TransferKind, TransferNode, TransferPadding, Unroll, Via, WordLength,
     generic_comp,
@@ -3511,7 +3511,7 @@ where
         }
     }
     let mut mask = StickMaskNode {
-        name: NodeName("SAMV".to_owned()),
+        base: NodeBase::named(NodeName("SAMV".to_owned())),
         mask_val_const_id: Some(dsc.masking_constant()?),
         data_format: None,
         stick_layout: Vec::new(),
@@ -3614,14 +3614,14 @@ where
         }
         let spelling = dim.spelling();
         let reset = StickMaskNode {
-            name: NodeName("SAMV_reset".to_owned()),
+            base: NodeBase::named(NodeName("SAMV_reset".to_owned())),
             first_stick_coord_to_mask_per_dim: BTreeMap::new(),
             ..mask.clone()
         };
         tree.insert_condition_before(
             last_seen,
             ConditionNode {
-                name: NodeName(format!("condition_SAMV_dim_{spelling}")),
+                base: NodeBase::named(NodeName(format!("condition_SAMV_dim_{spelling}"))),
                 loop_cond: LoopCondComposite {
                     two_level_or_of_ands: vec![ands],
                     negated: false,
@@ -3631,11 +3631,11 @@ where
                 // (`dsc/dsc2.h:698-699`), which is the only order the reference admits.
                 next: CondRegions::ThenElse([
                     BlockNode {
-                        name: NodeName(format!("block_SAMV_dim_{spelling}")),
+                        base: NodeBase::named(NodeName(format!("block_SAMV_dim_{spelling}"))),
                         children: vec![SchedNode::StickMask(Box::new(mask.clone()))],
                     },
                     BlockNode {
-                        name: NodeName("block_SAMV_reset".to_owned()),
+                        base: NodeBase::named(NodeName("block_SAMV_reset".to_owned())),
                         children: vec![SchedNode::StickMask(Box::new(reset))],
                     },
                 ]),
@@ -8552,7 +8552,7 @@ mod tests_e258_e263 {
         let mut syncs = BTreeMap::from([(
             NodeId(3),
             SyncNode {
-                name: NodeName("s".to_owned()),
+                base: NodeBase::named(NodeName("s".to_owned())),
                 units: SyncUnits::new(SenComponent::L0su, []),
                 direction: SyncDirection::Send,
                 strength: SyncStrength::Hard,

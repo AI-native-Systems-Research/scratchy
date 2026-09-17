@@ -527,7 +527,7 @@ mod tests_e015 {
     };
     use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
     use crate::schedule::ddc::transformation_util::StageName;
-    use crate::schedule::dsc2::{BlockNode, LayoutDims, LoopDim, NodeName};
+    use crate::schedule::dsc2::{BlockNode, LayoutDims, LoopDim, NodeBase, NodeName};
 
     use super::super::dsc::{
         DataStage, DataStages, DimPadding, FilledDims, NamedDims, PadSizes, SenComponent, StageDims,
@@ -595,7 +595,7 @@ mod tests_e015 {
             }],
             parametric_lds: Some(LdsIdx(1)),
             ..LoopNode::bare(BlockNode {
-                name: NodeName(name.to_owned()),
+                base: NodeBase::named(NodeName(name.to_owned())),
                 children: Vec::new(),
             })
         }
@@ -611,7 +611,7 @@ mod tests_e015 {
             num: Some(DatastageId(1)),
             den: Some(den),
             ..LoopNode::bare(BlockNode {
-                name: NodeName(name.to_owned()),
+                base: NodeBase::named(NodeName(name.to_owned())),
                 children: Vec::new(),
             })
         }

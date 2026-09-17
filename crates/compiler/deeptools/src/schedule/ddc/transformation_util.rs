@@ -5864,8 +5864,9 @@ mod tests_e118_e123 {
     use crate::generated::RegName;
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
-        AllocLayout, AllocPlacement, FoldDim, InstrAttribute, LayoutDims, MaxDimSize, NumChunks,
-        ReplicationFactor, StartAddress, SyncDirection, SyncStrength, SyncUnits, TransferPadding,
+        AllocLayout, AllocPlacement, FoldDim, InstrAttribute, LayoutDims, MaxDimSize, NodeBase,
+        NumChunks, ReplicationFactor, StartAddress, SyncDirection, SyncStrength, SyncUnits,
+        TransferPadding,
     };
     use crate::units::NumFolds;
 
@@ -6488,7 +6489,7 @@ mod tests_e118_e123 {
             (far.clone(), NodeId(2)),
         ]));
         let node = SyncNode {
-            name: NodeName("s0".to_string()),
+            base: NodeBase::named(NodeName("s0".to_string())),
             units: SyncUnits::new(SenComponent::Pe, []),
             direction: SyncDirection::Receive,
             strength: SyncStrength::Hard,

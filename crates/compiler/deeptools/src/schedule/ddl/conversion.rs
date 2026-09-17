@@ -191,7 +191,8 @@ use crate::schedule::dsc2::{
     AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeMask, ComputeNode,
     CondOp as DscCondOp, CondRegions, ConditionNode, DataInfo, Dsts, Hops, InstrAttribute, LdsIdx,
     LoopBound, LoopCond as DscLoopCond, LoopCondComposite as DscLoopCondComposite, LoopDim,
-    LoopNode, MaxDimSize, NodeName, NumBuffers, NumChunks, Operand as DscOperand, PackIndex,
+    LoopNode, MaxDimSize, NodeBase, NodeName, NumBuffers, NumChunks, Operand as DscOperand,
+    PackIndex,
     Repetition, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode, SyncStrength,
     SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
 };
@@ -3163,7 +3164,7 @@ fn op_loop<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
             num: Some(num),
             den: Some(den),
             ..LoopNode::bare(BlockNode {
-                name: name.clone(),
+                base: NodeBase::named(name.clone()),
                 children: Vec::new(),
             })
         },
@@ -3716,7 +3717,7 @@ fn op_if<S: DdlSite + ?Sized>(
     let node = ctx.site.add_condition(
         ctx.curr_parent,
         ConditionNode {
-            name: name.clone(),
+            base: NodeBase::named(name.clone()),
             loop_cond: dsc_loop_cond(&prop.loop_cond),
             core_cl_cond: prop.core_cl_cond.0.clone(),
             next: CondRegions::Empty,
@@ -3948,7 +3949,7 @@ fn op_sync<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
     }
     name.push_str(if receive { "_receive" } else { "_send" });
     let node = SyncNode {
-        name: NodeName(name.clone()),
+        base: NodeBase::named(NodeName(name.clone())),
         units: SyncUnits::new(*first, rest.to_vec()),
         direction,
         strength: SyncStrength::Hard,
@@ -3963,10 +3964,10 @@ fn op_sync<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
         let then_name = NodeName(format!("{name}_then_region"));
         let else_name = NodeName(format!("{name}_else_region"));
         let mut cl0 = node.clone();
-        cl0.name = NodeName(format!("{name}_cl0"));
+        cl0.base.name = NodeName(format!("{name}_cl0"));
         let mut cl1 = node.clone();
-        cl1.name = NodeName(format!("{name}_cl1"));
-        for (corelet, held_name) in [(corelet(0)?, &cl0.name), (corelet(1)?, &cl1.name)] {
+        cl1.base.name = NodeName(format!("{name}_cl1"));
+        for (corelet, held_name) in [(corelet(0)?, &cl0.base.name), (corelet(1)?, &cl1.base.name)] {
             let ends = ctx
                 .interface
                 .sync_definitions
@@ -3992,7 +3993,7 @@ fn op_sync<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
         let guard_node = ctx.site.add_condition(
             ctx.curr_parent,
             ConditionNode {
-                name: guard.clone(),
+                base: NodeBase::named(guard.clone()),
                 loop_cond: DscLoopCondComposite::default(),
                 core_cl_cond,
                 next: CondRegions::Empty,
@@ -4001,12 +4002,12 @@ fn op_sync<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
         ctx.state.record(&guard, guard_node);
         let then_block = ctx.site.add_block(guard_node, then_name.clone())?;
         ctx.state.record(&then_name, then_block);
-        let cl0_name = cl0.name.clone();
+        let cl0_name = cl0.base.name.clone();
         let cl0_node = ctx.site.add_sync(then_block, cl0)?;
         ctx.state.record(&cl0_name, cl0_node);
         let else_block = ctx.site.add_block(guard_node, else_name.clone())?;
         ctx.state.record(&else_name, else_block);
-        let cl1_name = cl1.name.clone();
+        let cl1_name = cl1.base.name.clone();
         let cl1_node = ctx.site.add_sync(else_block, cl1)?;
         ctx.state.record(&cl1_name, cl1_node);
     } else {
@@ -4018,11 +4019,11 @@ fn op_sync<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
             .entry(None)
             .or_default();
         if receive {
-            ends.receivers.push(node.name.clone());
+            ends.receivers.push(node.base.name.clone());
         } else {
-            ends.senders.push(node.name.clone());
+            ends.senders.push(node.base.name.clone());
         }
-        let sync_name = node.name.clone();
+        let sync_name = node.base.name.clone();
         let sync_node = ctx.site.add_sync(ctx.curr_parent, node)?;
         ctx.state.record(&sync_name, sync_node);
     }
@@ -4054,7 +4055,7 @@ fn op_implicit_sync<S: DdlSite + ?Sized>(
     let node = ctx.site.add_sync(
         ctx.curr_parent,
         SyncNode {
-            name: name.clone(),
+            base: NodeBase::named(name.clone()),
             units: SyncUnits::new(*first, rest.to_vec()),
             direction: SyncDirection::Send,
             strength: SyncStrength::Hard,
@@ -4801,7 +4802,7 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
                         None => Vec::new(),
                     };
                     out.push(EmittedOp::If {
-                        name: held.name.clone(),
+                        name: held.base.name.clone(),
                         cond,
                         then_region,
                         else_region,
@@ -4811,9 +4812,9 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
                 SchedNode::Block(block) => out.extend(self.region(&block.children)?),
                 SchedNode::Sync(sync) => out.push(self.sync(sync)?),
                 SchedNode::StickMask(mask) => out.push(EmittedOp::Generic {
-                    name: mask.name.clone(),
+                    name: mask.base.name.clone(),
                 }),
-                SchedNode::Leaf(name) => self.leaf(name, &mut out)?,
+                SchedNode::Leaf(leaf) => self.leaf(&leaf.base.name, &mut out)?,
             }
         }
         Some(out)
@@ -4840,7 +4841,7 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
             }
         }
         out.push(EmittedOp::If {
-            name: block.name.clone(),
+            name: block.base.name.clone(),
             cond: EmittedCond::CoreCorelet(BTreeMap::new()),
             then_region: then_region.unwrap_or_default(),
             else_region: else_region.unwrap_or_default(),
@@ -4887,7 +4888,7 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
     /// One `ddl.loop` and its body.
     fn loop_op(&mut self, node: &LoopNode) -> Option<EmittedOp> {
         let (interface, dsc) = (self.interface, self.dsc);
-        let id = self.state.node_ids.get(&node.block.name).copied();
+        let id = self.state.node_ids.get(&node.block.base.name).copied();
         // ⛔ EVERY LOOP LABEL IS COMPARED AND NONE BREAKS, so the LAST match wins.
         let label = interface
             .loop_labels
@@ -4923,7 +4924,7 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
         }
         let body = self.region(&node.block.children)?;
         Some(EmittedOp::Loop {
-            name: node.block.name.clone(),
+            name: node.block.base.name.clone(),
             label,
             num,
             den,
@@ -4959,7 +4960,7 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
             let dst = self.site.transfer(transfer)?.dsts.first().clone();
             let pair = self.pair(dst.storage, &dst.data)?;
             return Some(EmittedOp::ImplicitSync {
-                name: node.name.clone(),
+                name: node.base.name.clone(),
                 allocation: pair.allocate,
             });
         }
@@ -4967,29 +4968,29 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
             .interface
             .sync_definitions
             .iter()
-            .find(|(signal, _)| node.name.0.contains(signal.spelling()))
+            .find(|(signal, _)| node.base.name.0.contains(signal.spelling()))
             .map(|(signal, prop)| (*signal, prop.separate_corelets));
         let (label, separate_corelets) = match stated {
             Some((signal, separate)) => (SyncLabel::Signal(signal), separate),
             None => {
                 // `emplace` KEEPS THE FIRST ENTRY, which is what makes the other end share this name.
-                if !self.external_syncs.contains_key(&node.name) {
+                if !self.external_syncs.contains_key(&node.base.name) {
                     self.external_syncs
-                        .insert(node.name.clone(), node.name.clone());
+                        .insert(node.base.name.clone(), node.base.name.clone());
                     for other in &node.other_ends {
                         self.external_syncs
                             .entry(other.clone())
-                            .or_insert_with(|| node.name.clone());
+                            .or_insert_with(|| node.base.name.clone());
                     }
                 }
                 (
-                    SyncLabel::External(self.external_syncs.get(&node.name)?.clone()),
+                    SyncLabel::External(self.external_syncs.get(&node.base.name)?.clone()),
                     false,
                 )
             }
         };
         Some(EmittedOp::Sync {
-            name: node.name.clone(),
+            name: node.base.name.clone(),
             units: node.units.iter().collect(),
             direction: node.direction,
             label,
@@ -6307,7 +6308,8 @@ mod unit_tests {
     use crate::schedule::ddc::v1::CoreClSet;
     use crate::schedule::dsc2::{
         AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeNode, CondRegions,
-        ConditionNode, DataInfo, Dsts, LayoutDims, LdsIdx, LoopDim, LoopNode, MaxDimSize, NodeName,
+        ConditionNode, DataInfo, Dsts, LayoutDims, LdsIdx, LeafKind, LeafNode, LoopDim, LoopNode,
+        MaxDimSize, NodeBase, NodeName,
         NumBuffers, NumChunks, Operand as DscOperand, ReplicationFactor, SchedNode, StartAddress,
         SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, TransferPadding,
         WordLength,
@@ -6355,7 +6357,7 @@ mod unit_tests {
         let twin = NodeName("send_twin".to_owned());
         let receiver = NodeName("recv".to_owned());
         let sync = |name: &NodeName, direction| SyncNode {
-            name: name.clone(),
+            base: NodeBase::named(name.clone()),
             units: SyncUnits::new(SenComponent::Lxsu, []),
             direction,
             strength: SyncStrength::Hard,
@@ -7515,7 +7517,7 @@ mod unit_tests {
                     num: Some(Metadata::CORE_DSTGID),
                     den: Some(Metadata::CHUNK_DSTGID),
                     ..LoopNode::bare(BlockNode {
-                        name: held.clone(),
+                        base: NodeBase::named(held.clone()),
                         children: Vec::new(),
                     })
                 },
@@ -7525,7 +7527,7 @@ mod unit_tests {
         tree.add_sync(
             loop_node,
             SyncNode {
-                name: signal.clone(),
+                base: NodeBase::named(signal.clone()),
                 units: SyncUnits::new(SenComponent::L0, []),
                 direction: SyncDirection::Receive,
                 strength: SyncStrength::Hard,
@@ -7774,11 +7776,11 @@ mod unit_tests {
         fn name(&self) -> NodeName {
             match self {
                 Self::Block(name) | Self::Allocate(name) => name.clone(),
-                Self::Loop(held) => held.block.name.clone(),
+                Self::Loop(held) => held.block.base.name.clone(),
                 Self::Transfer(held) => held.name.clone(),
                 Self::Compute(held) => held.name.clone(),
-                Self::Sync(held) => held.name.clone(),
-                Self::Condition(held) => held.name.clone(),
+                Self::Sync(held) => held.base.name.clone(),
+                Self::Condition(held) => held.base.name.clone(),
             }
         }
     }
@@ -7813,7 +7815,7 @@ mod unit_tests {
         /// One node and everything under it, as `dsc2::` nodes — what a `getHead()` read hands back.
         fn block_of(&self, at: NodeId) -> BlockNode {
             BlockNode {
-                name: self.nodes.get(&at).map(TestNode::name).unwrap_or_default(),
+                base: NodeBase::named(self.nodes.get(&at).map(TestNode::name).unwrap_or_default()),
                 children: self
                     .children
                     .get(&at)
@@ -7852,9 +7854,15 @@ mod unit_tests {
                     SchedNode::Guarded(Box::new(cond))
                 }
                 TestNode::Sync(held) => SchedNode::Sync((**held).clone()),
-                TestNode::Transfer(held) => SchedNode::Leaf(held.name.clone()),
-                TestNode::Compute(held) => SchedNode::Leaf(held.name.clone()),
-                TestNode::Allocate(name) => SchedNode::Leaf(name.clone()),
+                TestNode::Transfer(held) => {
+                    SchedNode::Leaf(LeafNode::new(LeafKind::Transfer, held.name.clone()))
+                }
+                TestNode::Compute(held) => {
+                    SchedNode::Leaf(LeafNode::new(LeafKind::Compute, held.name.clone()))
+                }
+                TestNode::Allocate(name) => {
+                    SchedNode::Leaf(LeafNode::new(LeafKind::Allocate, name.clone()))
+                }
             })
         }
     }
@@ -8522,7 +8530,7 @@ mod unit_tests {
             cond.next
                 .regions()
                 .iter()
-                .map(|block| block.name.clone())
+                .map(|block| block.base.name.clone())
                 .collect::<Vec<_>>(),
             vec![
                 NodeName("condition_region0".to_owned()),

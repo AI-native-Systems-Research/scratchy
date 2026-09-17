@@ -195,7 +195,7 @@ impl DscTreeSurgery for Env<'_> {
             return NodeId(u32::MAX);
         };
         held.with_mut(|tree| {
-            let node = tree.add(sync.name.clone(), Kind::Sync(sync), None);
+            let node = tree.add(sync.base.name.clone(), Kind::Sync(sync), None);
             tree.link(node, at);
             node
         })
@@ -507,7 +507,7 @@ impl ChunkLoopNest for Env<'_> {
         let held = self.dsc(dsc)?;
         held.with_mut(|tree| {
             tree.name(parent)?;
-            Some(tree.add(node.name, Kind::Block, Some(parent)))
+            Some(tree.add(node.base.name, Kind::Block, Some(parent)))
         })
     }
 }
@@ -757,7 +757,7 @@ impl L3TreeSurgery for PagedCursor<'_> {
     }
 
     fn new_sync(&mut self, node: SyncNode) -> NodeId {
-        self.with_mut(|tree| tree.add(node.name.clone(), Kind::Sync(node), None))
+        self.with_mut(|tree| tree.add(node.base.name.clone(), Kind::Sync(node), None))
             .unwrap_or(NodeId(u32::MAX))
     }
 

@@ -55,8 +55,8 @@ use crate::schedule::ddc::transformation as tr;
 use crate::schedule::ddc::transformation_util as tu;
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{
-    BlockNode, ComputeNode, DataInfo, LatchDataId, LdsIdx, NodeName, Operand, OperandPos, SyncUnits,
-    TransferNode, WordLength,
+    BlockNode, ComputeNode, DataInfo, LatchDataId, LdsIdx, NodeBase, NodeName, Operand, OperandPos,
+    SyncUnits, TransferNode, WordLength,
 };
 use crate::units::{Core, Corelet};
 
@@ -1707,7 +1707,7 @@ impl<'s, 'l> v1::Dsc2Store for Dsc2Store<'s, 'l> {
 /// position, so a reordering here would move where the parsed template lands.
 pub(super) fn head_block_of(tree: &super::tree::TreeData, block: NodeId) -> BlockNode {
     BlockNode {
-        name: tree.name(block).unwrap_or_default(),
+        base: NodeBase::named(tree.name(block).unwrap_or_default()),
         children: tree
             .children(block)
             .into_iter()
@@ -1742,7 +1742,7 @@ pub(super) fn head_block_of(tree: &super::tree::TreeData, block: NodeId) -> Bloc
 /// restate what the match already proved. Three stops came off this function that way.
 fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule::dsc2::SchedNode {
     use super::tree::Kind;
-    use crate::schedule::dsc2::{CondRegions, SchedNode};
+    use crate::schedule::dsc2::{CondRegions, LeafKind, LeafNode, NodeBase, SchedNode};
 
     match tree.kind_of(node) {
         Some(Kind::Block) => SchedNode::Block(head_block_of(tree, node)),
@@ -1769,7 +1769,7 @@ fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule:
             // ⭐ THE TWO REGIONS AS `addThenRegion`/`addElseRegion` FILLED THEM, each a BLOCK
             // (`dsc/dsc2.cpp:2143`'s *"ConditionNode only accepts 2 BlockNodes as children"*).
             SchedNode::Guarded(Box::new(crate::schedule::dsc2::ConditionNode {
-                name: tree.name(node).unwrap_or_default(),
+                base: NodeBase::named(tree.name(node).unwrap_or_default()),
                 // ⛔ THE EMPTY COMPOSITE IS `hasCoreClCond()`, WHICH IS THE REFERENCE'S OWN TEST:
                 // *"`loopCond_.twoLevelOrOfAnds_.empty()`… answers 'the core/corelet set is what guards
                 // this'"* ([`crate::schedule::dsc2::ConditionNode`]), so a core/corelet-guarded
@@ -1806,9 +1806,18 @@ fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule:
         // `ComputeNode`, and this function materialises the BLOCK the DDL conversion is handed — which
         // reaches a compute through the arena by identity, not through this block, exactly as the
         // comment above says of an allocation and a transfer.
-        Some(Kind::Allocate(..) | Kind::Transfer(_) | Kind::Compute(_)) => {
-            SchedNode::Leaf(tree.name(node).unwrap_or_default())
-        }
+        Some(Kind::Allocate(..)) => SchedNode::Leaf(LeafNode::new(
+            LeafKind::Allocate,
+            tree.name(node).unwrap_or_default(),
+        )),
+        Some(Kind::Transfer(_)) => SchedNode::Leaf(LeafNode::new(
+            LeafKind::Transfer,
+            tree.name(node).unwrap_or_default(),
+        )),
+        Some(Kind::Compute(_)) => SchedNode::Leaf(LeafNode::new(
+            LeafKind::Compute,
+            tree.name(node).unwrap_or_default(),
+        )),
         None => panic!(
             "v1::Dsc2Store::schedule_head_block: {node:?} is a child of this tree with no \
              nodeType_ — the walk came out of tree.children, so this is a defect in the tree"
@@ -1840,8 +1849,8 @@ mod authority_tests {
     use crate::schedule::ddl::conversion as conv;
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
-        ComputeNode, DataInfo, Dsts, InstrAttribute, LayoutDims, LdsIdx, NodeName, NumChunks,
-        Operand, ReplicationFactor, TransferNode, TransferPadding,
+        ComputeNode, DataInfo, Dsts, InstrAttribute, LayoutDims, LdsIdx, NodeBase, NodeName,
+        NumChunks, Operand, ReplicationFactor, TransferNode, TransferPadding,
     };
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DscIdx, DscList,
@@ -2089,7 +2098,7 @@ mod authority_tests {
                 &mut ddl,
                 head,
                 crate::schedule::dsc2::ConditionNode {
-                    name: NodeName("cond".to_owned()),
+                    base: NodeBase::named(NodeName("cond".to_owned())),
                     loop_cond: crate::schedule::dsc2::LoopCondComposite::default(),
                     core_cl_cond: BTreeMap::from([(
                         core(0),

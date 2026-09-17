@@ -657,7 +657,7 @@ fn mint_condition(tree: &mut TreeData, held: &ConditionNode, at: InsertionPoint)
         (Some(held.loop_cond.clone()), None)
     };
     let condition = tree.add(
-        held.name.clone(),
+        held.base.name.clone(),
         Kind::Condition(Cond {
             loop_cond,
             cores,
@@ -674,7 +674,7 @@ fn mint_condition(tree: &mut TreeData, held: &ConditionNode, at: InsertionPoint)
         let Some(block) = region else {
             continue;
         };
-        let node = tree.add(block.name.clone(), Kind::Block, None);
+        let node = tree.add(block.base.name.clone(), Kind::Block, None);
         tree.add_region(condition, node, then_region);
         for child in &block.children {
             mint_sched_node(tree, child, InsertionPoint::LastIn(node))?;
@@ -701,13 +701,13 @@ fn mint_sched_node(tree: &mut TreeData, held: &SchedNode, at: InsertionPoint) ->
     };
 
     let (name, kind, children) = match held {
-        SchedNode::Block(block) => (block.name.clone(), Kind::Block, block.children.as_slice()),
+        SchedNode::Block(block) => (block.base.name.clone(), Kind::Block, block.children.as_slice()),
         SchedNode::StickMask(mask) => (
-            mask.name.clone(),
+            mask.base.name.clone(),
             Kind::StickMask((**mask).clone()),
             [].as_slice(),
         ),
-        SchedNode::Sync(sync) => (sync.name.clone(), Kind::Sync(sync.clone()), [].as_slice()),
+        SchedNode::Sync(sync) => (sync.base.name.clone(), Kind::Sync(sync.clone()), [].as_slice()),
         // ⛔ THE SAME THREE REFUSALS [`super::Dsc2Store`]'s `add_loop` STANDS ON, and for the same
         // reasons: [`HeldLoop`]'s `numId_`/`denId_` pair is non-optional, a parametric loop carries
         // `-1` for both (`ddc/ddl/ddl_conversion.cpp:1129-1130`), and [`LoopDims`] makes *"Cannot
@@ -723,9 +723,9 @@ fn mint_sched_node(tree: &mut TreeData, held: &SchedNode, at: InsertionPoint) ->
             };
             let (first, rest) = node.dims.split_first()?;
             (
-                node.block.name.clone(),
+                node.block.base.name.clone(),
                 Kind::Loop(HeldLoop {
-                    name: node.block.name.clone(),
+                    name: node.block.base.name.clone(),
                     num,
                     den,
                     dims: LoopDims::new(kinded(first), rest.iter().map(kinded).collect()),
@@ -758,14 +758,15 @@ mod tests {
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
         BlockNode, ComputeNode, CondOp, CondRegions, ConditionNode, DataInfo, InstrAttribute,
-        LayoutDims, LdsIdx, LoopBound, LoopCond, LoopCondComposite, NodeName, Operand, SchedNode,
-        StickMaskNode,
+        LayoutDims, LdsIdx, LeafKind, LeafNode, LoopBound, LoopCond, LoopCondComposite, NodeBase,
+        NodeName, Operand, SchedNode, StickMaskNode,
     };
     use crate::units::{Core, Corelet, NumFolds};
 
     use super::super::tree::{Kind, TreeData, seed_allocate_node};
     use super::{
-        alloc_padding_of, compute_of, insert_condition_before_of, mint_condition, mint_sched_node,
+        alloc_padding_of, compute_of, insert_condition_before_of,
+        mint_condition, mint_sched_node,
     };
 
     /// A tree with just its `root_level_operations` head, which is the one node
@@ -866,7 +867,7 @@ mod tests {
     /// One SAMV mask node, and its `firstStickCoordToMaskPerDim_`-cleared reset twin.
     fn a_mask(name: &str, masked: bool) -> StickMaskNode {
         StickMaskNode {
-            name: NodeName(name.to_owned()),
+            base: NodeBase::named(NodeName(name.to_owned())),
             mask_val_const_id: None,
             data_format: None,
             stick_layout: Vec::new(),
@@ -882,7 +883,7 @@ mod tests {
     /// Entry 262's condition, exactly as `coordinate_masking` builds it (`ddc/v1.rs:3539-3560`).
     fn a_samv_condition(at: LoopId) -> ConditionNode {
         ConditionNode {
-            name: NodeName("condition_SAMV_dim_out".to_owned()),
+            base: NodeBase::named(NodeName("condition_SAMV_dim_out".to_owned())),
             loop_cond: LoopCondComposite {
                 two_level_or_of_ands: vec![vec![LoopCond {
                     loop_comp: at,
@@ -895,11 +896,11 @@ mod tests {
             core_cl_cond: BTreeMap::new(),
             next: CondRegions::ThenElse([
                 BlockNode {
-                    name: NodeName("block_SAMV_dim_out".to_owned()),
+                    base: NodeBase::named(NodeName("block_SAMV_dim_out".to_owned())),
                     children: vec![SchedNode::StickMask(Box::new(a_mask("SAMV_out", true)))],
                 },
                 BlockNode {
-                    name: NodeName("block_SAMV_reset".to_owned()),
+                    base: NodeBase::named(NodeName("block_SAMV_reset".to_owned())),
                     children: vec![SchedNode::StickMask(Box::new(a_mask("SAMV_reset", false)))],
                 },
             ]),
@@ -995,12 +996,12 @@ mod tests {
         };
         let then_mask = mask_of(regions[0]).expect("the then region holds a STICKMASK");
         let else_mask = mask_of(regions[1]).expect("the else region holds a STICKMASK");
-        assert_eq!(then_mask.name, NodeName("SAMV_out".to_owned()));
+        assert_eq!(then_mask.base.name, NodeName("SAMV_out".to_owned()));
         assert_eq!(
             then_mask.first_stick_coord_to_mask_per_dim,
             BTreeMap::from([(PrimaryDim::Out, Elements(7))])
         );
-        assert_eq!(else_mask.name, NodeName("SAMV_reset".to_owned()));
+        assert_eq!(else_mask.base.name, NodeName("SAMV_reset".to_owned()));
         assert!(
             else_mask.first_stick_coord_to_mask_per_dim.is_empty(),
             "samvReset->firstStickCoordToMaskPerDim_.clear()"
@@ -1032,11 +1033,11 @@ mod tests {
         let condition = mint_condition(
             &mut tree,
             &ConditionNode {
-                name: NodeName("condition_core3".to_owned()),
+                base: NodeBase::named(NodeName("condition_core3".to_owned())),
                 loop_cond: LoopCondComposite::default(),
                 core_cl_cond: cores.clone(),
                 next: CondRegions::Then(BlockNode {
-                    name: NodeName("block_core3".to_owned()),
+                    base: NodeBase::named(NodeName("block_core3".to_owned())),
                     children: Vec::new(),
                 }),
             },
@@ -1062,7 +1063,7 @@ mod tests {
         let before = mint_sched_node(
             &mut tree,
             &SchedNode::Block(BlockNode {
-                name: NodeName("host".to_owned()),
+                base: NodeBase::named(NodeName("host".to_owned())),
                 children: Vec::new(),
             }),
             InsertionPoint::LastIn(root),
@@ -1070,9 +1071,12 @@ mod tests {
         .expect("a block is spliceable");
 
         for arm in [
-            SchedNode::Leaf(NodeName("allocate_lds0_lx".to_owned())),
+            SchedNode::Leaf(LeafNode::new(
+                LeafKind::Allocate,
+                NodeName("allocate_lds0_lx".to_owned()),
+            )),
             SchedNode::Condition(BlockNode {
-                name: NodeName("condition_unguarded".to_owned()),
+                base: NodeBase::named(NodeName("condition_unguarded".to_owned())),
                 children: Vec::new(),
             }),
         ] {
@@ -1091,7 +1095,7 @@ mod tests {
     /// refuses one rather than dropping the flag, exactly as `Dsc2Store`'s `add_loop` does.
     #[test]
     fn a_parametric_loop_is_refused_rather_than_minted_with_its_flag_dropped() {
-        use crate::schedule::dsc2::{LoopDim, LoopNode};
+        use crate::schedule::dsc2::{LoopDim, LoopNode, NodeBase};
 
         let (mut tree, root) = a_rooted_tree();
         let dims = vec![LoopDim {
@@ -1099,7 +1103,7 @@ mod tests {
             kind: crate::schedule::ddc::metadata::MetaDimKind::Unpadded,
         }];
         let block = BlockNode {
-            name: NodeName("loop_ds0_ds1_out".to_owned()),
+            base: NodeBase::named(NodeName("loop_ds0_ds1_out".to_owned())),
             children: Vec::new(),
         };
         let plain = LoopNode {

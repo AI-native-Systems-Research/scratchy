@@ -1188,7 +1188,7 @@ mod tests {
 
         /// Every name under one block, in the order its `next_` holds them, depth first.
         fn names(block: &BlockNode, into: &mut Vec<String>) {
-            into.push(block.name.0.clone());
+            into.push(block.base.name.0.clone());
             for child in &block.children {
                 match child {
                     SchedNode::Block(held) | SchedNode::Condition(held) => names(held, into),
@@ -1210,7 +1210,7 @@ mod tests {
             .children
             .iter()
             .find_map(|child| match child {
-                SchedNode::Loop(held) if held.block.name.0 == "loop_ds0_ds1_y" => Some(held),
+                SchedNode::Loop(held) if held.block.base.name.0 == "loop_ds0_ds1_y" => Some(held),
                 _ => None,
             })
             .expect("`loop_ds0_ds1_y` is a child of the root block");
@@ -1233,7 +1233,7 @@ mod tests {
             .children
             .iter()
             .find_map(|child| match child {
-                SchedNode::Loop(held) if held.block.name.0 == "loop_ds0_ds1_out" => Some(held),
+                SchedNode::Loop(held) if held.block.base.name.0 == "loop_ds0_ds1_out" => Some(held),
                 _ => None,
             })
             .expect("`loop_ds0_ds1_out` is INSIDE `loop_ds0_ds1_y` and not beside it");
@@ -1242,7 +1242,7 @@ mod tests {
             .children
             .iter()
             .find_map(|child| match child {
-                SchedNode::Loop(held) if held.block.name.0 == "loop_ds0_ds1_mb" => Some(held),
+                SchedNode::Loop(held) if held.block.base.name.0 == "loop_ds0_ds1_mb" => Some(held),
                 _ => None,
             })
             .expect("`loop_ds0_ds1_mb` is INSIDE `loop_ds0_ds1_out`");
