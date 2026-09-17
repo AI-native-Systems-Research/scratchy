@@ -162,6 +162,27 @@ jobs:
       - name: Kernel tests
         run: cargo test -p scratchy-target-metal
 
+      # KTIR (Spyre IR) test suites: the emulator's dialect/interpreter/Metal-
+      # backend unit + integration tests, and the optimizer's IR->IR pass
+      # tests (fusion, tile-coalesce, head-rewrite, flash-attn). Both crates'
+      # tests were silently rotted (888 compile errors) behind an MTL3->MTL4
+      # migration that never updated them; this locks them back into CI so
+      # that can't happen again. `--features metal` runs the real
+      # Metal-4-backed emulator tests (nax/amx/simdgroup matmul vs oracle) on
+      # this runner's GPU, not just the CPU interpreter path.
+      # `--lib --tests` (not a plain `cargo test`): ktir-emulator's two
+      # examples (bench, ktir_diff_run) still call the deleted textual MLIR
+      # parser and a couple of now-pub(crate) executor entry points — a
+      # pre-existing gap from the MTL3->MTL4 migration, out of scope for this
+      # lockdown (fixing it means either resurrecting the parser or widening
+      # the executor's public surface, both real design calls). Excluding
+      # them from `cargo test` here does not skip any test coverage.
+      - name: KTIR emulator tests
+        run: cargo test -p ktir-emulator --features metal --lib --tests
+
+      - name: KTIR optimizer tests
+        run: cargo test -p ktir-optimizer
+
       # Tool-call parser logic (Hermes / Llama / Kimi / Mistral / Jamba /
       # Granite / Gemma-4). Pure-logic unit tests with no GPU dependency —
       # don't need a real model at runtime, but scratchy-models has no

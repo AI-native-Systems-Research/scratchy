@@ -2283,12 +2283,10 @@ fn causal_mask_mm<'a>(a: &'a Arena, res: Ssa, m: i64, ninf: f32, dt: DType) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir_builder::Ops;
 
-    // The canonical naive-attention builder reused by the recognizer unit tests
-    // (the EXECUTION-equivalence golden lives in the ktir-cpu test crate, where
-    // the interpreter is available).
-    pub fn naive_attention(m: i64, cap: i64, d: i64, scale: f32, causal: bool) -> IRFunction {
-        super::test_support::naive_attention(m, cap, d, scale, causal)
+    fn naive_attention(m: i64, cap: i64, d: i64, scale: f32, causal: bool) -> IRFunction<'static> {
+        test_support::naive_attention(Arena::global(), m, cap, d, scale, causal)
     }
 
     #[test]
@@ -2300,10 +2298,10 @@ mod tests {
         assert_eq!(isl.d, 2);
         assert!((isl.scale - 0.5).abs() < 1e-6);
         assert!(isl.causal);
-        assert_eq!(isl.q_arg, "%q_ptr");
-        assert_eq!(isl.k_arg, "%k_ptr");
-        assert_eq!(isl.v_arg, "%v_ptr");
-        assert_eq!(isl.o_arg, "%o_ptr");
+        assert_eq!(isl.q_arg, f.arguments[0].0);
+        assert_eq!(isl.k_arg, f.arguments[1].0);
+        assert_eq!(isl.v_arg, f.arguments[2].0);
+        assert_eq!(isl.o_arg, f.arguments[3].0);
     }
 
     #[test]
@@ -2317,27 +2315,28 @@ mod tests {
     #[test]
     fn rejects_non_attention() {
         // A plain copy node: load -> exp -> store. No QKᵀ/softmax/AV.
-        let f = IRFunction {
-            name: "copy".into(),
-            arguments: vec![
-                ("%in".into(), "index".into()),
-                ("%out".into(), "index".into()),
-            ],
-            grid: (1, 1, 1),
-            return_type: None,
-            operations: vec![
-                mk_view("%vi", "%in", &[4, 4], "f16"),
-                Operation::new(Some("%ti"), "ktdp.construct_access_tile", &["%vi"])
-                    .with_attr("shape", Attr::IntList(vec![4, 4])),
-                Operation::new(Some("%l"), "ktdp.load", &["%ti"]),
-                Operation::new(Some("%y"), "math.exp", &["%l"]),
-                mk_view("%vo", "%out", &[4, 4], "f16"),
-                Operation::new(Some("%to"), "ktdp.construct_access_tile", &["%vo"])
-                    .with_attr("shape", Attr::IntList(vec![4, 4])),
-                Operation::new(None, "ktdp.store", &["%y", "%to"]),
-                Operation::new(None, "func.return", &[]),
-            ],
-        };
+        let mut ops = Ops::new();
+        let vi = ops.op(Some("%vi"), OpKind::KtdpConstructMemoryView, &["%in"]);
+        let vi = ops.attr(vi, AttrKey::Shape, ops.int_list(vec![4, 4]));
+        let vi = ops.attr(vi, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let ti = ops.op(Some("%ti"), OpKind::KtdpConstructAccessTile, &["%vi"]);
+        let ti = ops.attr(ti, AttrKey::Shape, ops.int_list(vec![4, 4]));
+        let l = ops.op(Some("%l"), OpKind::KtdpLoad, &["%ti"]);
+        let y = ops.op(Some("%y"), OpKind::MathExp, &["%l"]);
+        let vo = ops.op(Some("%vo"), OpKind::KtdpConstructMemoryView, &["%out"]);
+        let vo = ops.attr(vo, AttrKey::Shape, ops.int_list(vec![4, 4]));
+        let vo = ops.attr(vo, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let to = ops.op(Some("%to"), OpKind::KtdpConstructAccessTile, &["%vo"]);
+        let to = ops.attr(to, AttrKey::Shape, ops.int_list(vec![4, 4]));
+        let store = ops.op(None, OpKind::KtdpStore, &["%y", "%to"]);
+        let ret = ops.op(None, OpKind::FuncReturn, &[]);
+        let body = vec![vi, ti, l, y, vo, to, store, ret];
+        let f = ops.func(
+            "copy",
+            &[("%in", IrType::Index), ("%out", IrType::Index)],
+            body,
+            (1, 1, 1),
+        );
         assert!(
             recognize_attention(&f).is_none(),
             "copy node must not be recognized"
@@ -2348,9 +2347,13 @@ mod tests {
     fn rejects_region_bearing() {
         // A function that already contains an scf.for is not the flat idiom.
         let mut f = naive_attention(2, 4, 2, 0.5, false);
-        let mut forop = Operation::new(None, "scf.for", &["%x", "%y", "%z"]);
-        forop.regions = vec![vec![Operation::new(None, "scf.yield", &[])]];
-        f.operations.insert(0, forop);
+        let ops = Ops::new();
+        let yield_op = Operation::new(ops.arena(), None, OpKind::ScfYield, &[]);
+        let forop = Operation::new(ops.arena(), None, OpKind::ScfFor, &[]);
+        let forop = ops.with_region(forop, vec![yield_op]);
+        let mut new_ops = vec![forop];
+        new_ops.extend_from_slice(f.operations);
+        f.operations = ops.arena().ops(new_ops);
         assert!(
             recognize_attention(&f).is_none(),
             "region-bearing func bails"
@@ -2362,14 +2365,15 @@ mod tests {
         // Two stores (the real unrolled per-query-row lowering) -> not canonical.
         let mut f = naive_attention(2, 4, 2, 0.5, false);
         // duplicate the store op.
-        let store = f
+        let store = *f
             .operations
             .iter()
-            .find(|o| o.op_type == "ktdp.store")
-            .cloned()
+            .find(|o| o.op_type == OpKind::KtdpStore)
             .unwrap();
         let idx = f.operations.len() - 1; // before func.return
-        f.operations.insert(idx, store);
+        let mut new_ops = f.operations.to_vec();
+        new_ops.insert(idx, store);
+        f.operations = Arena::global().ops(new_ops);
         assert!(recognize_attention(&f).is_none(), "multi-store bails");
     }
 
@@ -2377,48 +2381,52 @@ mod tests {
     fn tile_emits_scf_for_and_no_insert_slice() {
         let f = naive_attention(4, 256, 8, 0.125, true);
         let isl = recognize_attention(&f).unwrap();
-        let tiled = tile_attention(&isl);
+        let mut g = NameGen::after(&f);
+        let tiled = tile_attention(Arena::global(), &isl, &mut g);
 
         // Exactly one scf.for at top level, carrying 3 iter-args (m, l, acc).
         let fors: Vec<&Operation> = tiled
             .operations
             .iter()
-            .filter(|o| o.op_type == "scf.for")
+            .filter(|o| o.op_type == OpKind::ScfFor)
             .collect();
         assert_eq!(fors.len(), 1, "one KV loop");
         let f0 = fors[0];
-        match f0.attributes.get("iter_args") {
-            Some(Attr::StrList(v)) => assert_eq!(v.len(), 3, "m, l, acc iter-args"),
+        match f0.attr(AttrKey::IterArgs) {
+            Some(Attr::Ssas(v)) => assert_eq!(v.len(), 3, "m, l, acc iter-args"),
             other => panic!("iter_args not a 3-list: {other:?}"),
         }
-        match f0.attributes.get("result_names") {
-            Some(Attr::StrList(v)) => assert_eq!(v.len(), 3),
+        match f0.attr(AttrKey::ResultNames) {
+            Some(Attr::Ssas(v)) => assert_eq!(v.len(), 3),
             other => panic!("result_names not a 3-list: {other:?}"),
         }
 
         // NO tensor.insert_slice anywhere (it is UNREGISTERED in this emulator).
         fn has_insert(ops: &[Operation]) -> bool {
             ops.iter().any(|o| {
-                o.op_type == "tensor.insert_slice" || o.regions.iter().any(|r| has_insert(r))
+                o.op_type == OpKind::TensorInsertSlice || o.regions.iter().any(|r| has_insert(r))
             })
         }
-        assert!(!has_insert(&tiled.operations), "must not emit insert_slice");
+        assert!(!has_insert(tiled.operations), "must not emit insert_slice");
 
         // The loop body reads each KV block via a `ktdp.construct_access_tile` at
         // the dynamic block offset + a `ktdp.load` (Kj and Vj) — the KTIR-native,
         // fusion-safe analogue of an extract_slice of the block.
-        let body = &f0.regions[0];
+        let body = f0.regions[0];
         let block_tiles = body
             .iter()
-            .filter(|o| o.op_type == "ktdp.construct_access_tile")
+            .filter(|o| o.op_type == OpKind::KtdpConstructAccessTile)
             .count();
-        let block_loads = body.iter().filter(|o| o.op_type == "ktdp.load").count();
+        let block_loads = body
+            .iter()
+            .filter(|o| o.op_type == OpKind::KtdpLoad)
+            .count();
         assert_eq!(block_tiles, 2, "Kj and Vj access tiles per block");
         assert_eq!(block_loads, 2, "Kj and Vj loads per block");
         // No tensor.extract_slice in the body either (we use ktdp block loads).
         let slices = body
             .iter()
-            .filter(|o| o.op_type == "tensor.extract_slice")
+            .filter(|o| o.op_type == OpKind::TensorExtractSlice)
             .count();
         assert_eq!(
             slices, 0,
@@ -2427,9 +2435,12 @@ mod tests {
 
         // online-softmax kernels present: two matmuls (QKᵀ and P·V), an exp for P
         // and an exp for alpha.
-        let matmuls = body.iter().filter(|o| o.op_type == "linalg.matmul").count();
+        let matmuls = body
+            .iter()
+            .filter(|o| o.op_type == OpKind::LinalgMatmul)
+            .count();
         assert_eq!(matmuls, 2, "QKᵀ and P·V");
-        let exps = body.iter().filter(|o| o.op_type == "math.exp").count();
+        let exps = body.iter().filter(|o| o.op_type == OpKind::MathExp).count();
         assert_eq!(exps, 2, "exp(P) and exp(alpha)");
     }
 
@@ -2437,9 +2448,10 @@ mod tests {
     fn tile_preserves_args_and_grid() {
         let f = naive_attention(2, 8, 4, 0.5, false);
         let isl = recognize_attention(&f).unwrap();
-        let tiled = tile_attention(&isl);
-        let names: Vec<&str> = tiled.arguments.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["%q_ptr", "%k_ptr", "%v_ptr", "%o_ptr"]);
+        let mut g = NameGen::after(&f);
+        let tiled = tile_attention(Arena::global(), &isl, &mut g);
+        let ssas: Vec<Ssa> = tiled.arguments.iter().map(|(v, _)| *v).collect();
+        assert_eq!(ssas, vec![isl.q_arg, isl.k_arg, isl.v_arg, isl.o_arg]);
         assert_eq!(
             tiled.grid,
             (1, 1, 1),
@@ -2465,14 +2477,15 @@ mod tests {
     /// cap=64). `rewrite_head_attention` turns it into the EXACT re-rolled IR the
     /// real node produces, which `recognize_rerolled_attention` must match.
     fn smollm_head_island(cap: i64) -> HeadAttnIsland {
+        let mut ops = Ops::new();
         HeadAttnIsland {
-            q_arg: "%q".into(),
-            o_arg: "%o".into(),
-            mask_arg: "%mask".into(),
-            kc_arg: "%kc".into(),
-            kd_arg: "%kd".into(),
-            vc_arg: "%vc".into(),
-            vd_arg: "%vd".into(),
+            q_arg: ops.ssa("%q"),
+            o_arg: ops.ssa("%o"),
+            mask_arg: ops.ssa("%mask"),
+            kc_arg: ops.ssa("%kc"),
+            kd_arg: ops.ssa("%kd"),
+            vc_arg: ops.ssa("%vc"),
+            vd_arg: ops.ssa("%vd"),
             q_cols: 576,
             kv_cols: 192,
             m: 8,
@@ -2483,8 +2496,23 @@ mod tests {
             h: 9,
             scale: 0.125,
             ninf: -1.0e38,
-            dtype: "f16".into(),
+            dtype: DType::F16,
         }
+    }
+
+    fn rewrite(head: &HeadAttnIsland) -> IRFunction<'static> {
+        let mut g = NameGen::above([
+            head.q_arg,
+            head.o_arg,
+            head.mask_arg,
+            head.kc_arg,
+            head.kd_arg,
+            head.vc_arg,
+            head.vd_arg,
+        ]);
+        let mut f = rewrite_head_attention(Arena::global(), head, &mut g);
+        f.name = Arena::global().str(String::from("attn"));
+        f
     }
 
     #[test]
@@ -2493,8 +2521,7 @@ mod tests {
         // recognizer must match (this is exactly what head_rewrite emits for the
         // real node111). All fields must round-trip.
         let head = smollm_head_island(64);
-        let mut rerolled = rewrite_head_attention(&head);
-        rerolled.name = "attn".into();
+        let rerolled = rewrite(&head);
         let isl = recognize_rerolled_attention(&rerolled)
             .expect("re-rolled head output must be recognized");
         assert_eq!(isl.m, head.m);
@@ -2505,9 +2532,9 @@ mod tests {
         assert_eq!(isl.q_cols, head.q_cols);
         assert_eq!(isl.kv_cols, head.kv_cols);
         assert!((isl.scale - head.scale).abs() < 1e-6);
-        assert_eq!(isl.q_arg, "%q");
-        assert_eq!(isl.kc_arg, "%kc");
-        assert_eq!(isl.kd_arg, "%kd");
+        assert_eq!(isl.q_arg, head.q_arg);
+        assert_eq!(isl.kc_arg, head.kc_arg);
+        assert_eq!(isl.kd_arg, head.kd_arg);
         // scores_bytes must EQUAL HeadAttnIsland::scores_bytes (disjoint partition).
         assert_eq!(isl.scores_bytes(), head.scores_bytes());
         assert_eq!(isl.scores_bytes(), 8 * 64 * 2);
@@ -2516,7 +2543,7 @@ mod tests {
     #[test]
     fn rerolled_recognizer_rejects_single_core() {
         let head = smollm_head_island(64);
-        let mut rerolled = rewrite_head_attention(&head);
+        let mut rerolled = rewrite(&head);
         rerolled.grid = (1, 1, 1); // not head-parallel
         assert!(recognize_rerolled_attention(&rerolled).is_none());
     }
@@ -2525,43 +2552,58 @@ mod tests {
     fn rerolled_recognizer_rejects_region_bearing() {
         // A body that already contains an scf.for is the already-tiled form.
         let head = smollm_head_island(64);
-        let mut rerolled = rewrite_head_attention(&head);
-        let mut forop = Operation::new(None, "scf.for", &["%x", "%y", "%z"]);
-        forop.regions = vec![vec![Operation::new(None, "scf.yield", &[])]];
-        rerolled.operations.insert(0, forop);
+        let mut rerolled = rewrite(&head);
+        let ops = Ops::new();
+        let yield_op = Operation::new(ops.arena(), None, OpKind::ScfYield, &[]);
+        let forop = Operation::new(ops.arena(), None, OpKind::ScfFor, &[]);
+        let forop = ops.with_region(forop, vec![yield_op]);
+        let mut new_ops = vec![forop];
+        new_ops.extend_from_slice(rerolled.operations);
+        rerolled.operations = ops.arena().ops(new_ops);
         assert!(recognize_rerolled_attention(&rerolled).is_none());
     }
 
     #[test]
     fn rerolled_recognizer_rejects_single_block_naive() {
         // The single-block canonical idiom is NOT the two-block re-rolled form.
-        let naive = test_support::naive_attention(4, 8, 2, 0.5, true);
+        let naive = test_support::naive_attention(Arena::global(), 4, 8, 2, 0.5, true);
         assert!(recognize_rerolled_attention(&naive).is_none());
     }
 
     #[test]
     fn tile_rerolled_emits_one_scf_for_no_insert_slice() {
         let head = smollm_head_island(256); // cap=256 so real tiling happens
-        let mut rerolled = rewrite_head_attention(&head);
-        rerolled.name = "attn".into();
+        let rerolled = rewrite(&head);
         let isl = recognize_rerolled_attention(&rerolled).unwrap();
         let blk = choose_block_budgeted(isl.m, isl.cap, isl.d, 2, &|sb| sb >= 1024);
-        let tiled = tile_rerolled_attention(&isl, blk);
+        let mut g = NameGen::after(&rerolled);
+        let tiled = tile_rerolled_attention(Arena::global(), &isl, blk, &mut g);
 
         // Grid + args preserved (7 args, [H,1,1]).
         assert_eq!(tiled.grid, (9, 1, 1));
-        let names: Vec<&str> = tiled.arguments.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["%q", "%o", "%mask", "%kc", "%kd", "%vc", "%vd"]);
+        let ssas: Vec<Ssa> = tiled.arguments.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            ssas,
+            vec![
+                isl.q_arg,
+                isl.o_arg,
+                isl.mask_arg,
+                isl.kc_arg,
+                isl.kd_arg,
+                isl.vc_arg,
+                isl.vd_arg
+            ]
+        );
 
         // Exactly one scf.for, 3 iter-args (mC, lC, accC).
         let fors: Vec<&Operation> = tiled
             .operations
             .iter()
-            .filter(|o| o.op_type == "scf.for")
+            .filter(|o| o.op_type == OpKind::ScfFor)
             .collect();
         assert_eq!(fors.len(), 1, "one CONTEXT KV loop");
-        match fors[0].attributes.get("iter_args") {
-            Some(Attr::StrList(v)) => assert_eq!(v.len(), 3),
+        match fors[0].attr(AttrKey::IterArgs) {
+            Some(Attr::Ssas(v)) => assert_eq!(v.len(), 3),
             other => panic!("iter_args not a 3-list: {other:?}"),
         }
 
@@ -2569,13 +2611,13 @@ mod tests {
         fn has_bad(ops: &[Operation]) -> bool {
             ops.iter().any(|o| {
                 matches!(
-                    o.op_type.as_str(),
-                    "tensor.insert_slice" | "tensor.extract_slice"
+                    o.op_type,
+                    OpKind::TensorInsertSlice | OpKind::TensorExtractSlice
                 ) || o.regions.iter().any(|r| has_bad(r))
             })
         }
         assert!(
-            !has_bad(&tiled.operations),
+            !has_bad(tiled.operations),
             "must not emit insert/extract_slice"
         );
 
@@ -2584,9 +2626,14 @@ mod tests {
             tiled
                 .operations
                 .iter()
-                .any(|o| o.op_type == "ktdp.get_compute_tile_id")
+                .any(|o| o.op_type == OpKind::KtdpGetComputeTileId)
         );
-        assert!(tiled.operations.iter().any(|o| o.op_type == "arith.divui"));
+        assert!(
+            tiled
+                .operations
+                .iter()
+                .any(|o| o.op_type == OpKind::ArithDivui)
+        );
     }
 
     #[test]
@@ -2595,8 +2642,7 @@ mod tests {
         // is BELOW the forced budget AND strictly smaller than the full [m, cap]
         // tile — proven for a long cap (cap=512).
         let head = smollm_head_island(512);
-        let mut rerolled = rewrite_head_attention(&head);
-        rerolled.name = "attn".into();
+        let rerolled = rewrite(&head);
         let isl = recognize_rerolled_attention(&rerolled).unwrap();
         let bytes = 2usize;
         let budget = 4096usize; // full tile 8*512*2=8192 overflows; sub-blocks fit.
@@ -2617,14 +2663,15 @@ mod tests {
 
         // Walk the emitted scf.for body: every 2-D static-shape tile op is [m, blk]
         // or smaller in the cap axis (never the full [m, cap]).
-        let tiled = tile_rerolled_attention(&isl, blk);
+        let mut g = NameGen::after(&rerolled);
+        let tiled = tile_rerolled_attention(Arena::global(), &isl, blk, &mut g);
         let forop = tiled
             .operations
             .iter()
-            .find(|o| o.op_type == "scf.for")
+            .find(|o| o.op_type == OpKind::ScfFor)
             .unwrap();
-        for op in &forop.regions[0] {
-            if let Some(Attr::IntList(s)) = op.attributes.get("shape")
+        for op in forop.regions[0] {
+            if let Some(Attr::IntList(s)) = op.attr(AttrKey::Shape)
                 && s.len() == 2
                 && s[0] == isl.m
             {

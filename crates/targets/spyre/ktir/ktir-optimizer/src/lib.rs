@@ -14,5 +14,7 @@
 pub mod flash_attn;
 pub mod fusion;
 pub mod head_rewrite;
+#[cfg(test)]
+pub(crate) mod ir_builder;
 pub mod matmul_tile;
 pub mod tile_coalesce;

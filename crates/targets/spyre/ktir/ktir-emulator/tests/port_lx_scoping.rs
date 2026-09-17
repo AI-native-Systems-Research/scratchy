@@ -41,14 +41,31 @@
 //!   Rust scope map holds `Value`. Sentinel ints/strings become distinct
 //!   `Value::Index` markers — identity/visibility is what the tests check.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use ktir_emulator::context::CoreContext;
 use ktir_emulator::dtypes::DType;
-use ktir_emulator::ir::Value;
+use ktir_emulator::ir::{Ssa, Value};
 use ktir_emulator::memory::{HBMSimulator, LXScratchpad, STICK_BYTES, UnsafeShared};
 use ktir_emulator::tile::Tile;
+
+thread_local! {
+    static NAMES: RefCell<HashMap<&'static str, Ssa>> = RefCell::new(HashMap::new());
+}
+
+/// The [`Ssa`] a `%name` refers to — minted on first use, stable after. Scope
+/// tests only need a stable per-name identity, not arena-owned IR, so this is
+/// a plain name table rather than the `Ops` builder used elsewhere.
+fn ssa(name: &'static str) -> Ssa {
+    NAMES.with(|n| {
+        let mut n = n.borrow_mut();
+        let next = Ssa(n.len() as u32);
+        *n.entry(name).or_insert(next)
+    })
+}
 
 // ===========================================================================
 // helpers (port of _make_context / _make_tile)
@@ -114,36 +131,39 @@ fn test_function_scope_is_always_present() {
 #[test]
 fn test_inner_scope_sees_outer_values() {
     let mut ctx = make_context(2);
-    ctx.set_value("%x", Value::Index(42));
+    ctx.set_value(ssa("%x"), Value::Index(42));
     ctx.push_scope();
-    assert!(matches!(ctx.get_value("%x").unwrap(), Value::Index(42)));
+    assert!(matches!(
+        ctx.get_value(ssa("%x")).unwrap(),
+        Value::Index(42)
+    ));
 }
 
 #[test]
 fn test_outer_scope_does_not_see_inner_values() {
     let mut ctx = make_context(2);
     ctx.push_scope();
-    ctx.set_value("%body_local", Value::Index(99));
+    ctx.set_value(ssa("%body_local"), Value::Index(99));
     assert!(matches!(
-        ctx.get_value("%body_local").unwrap(),
+        ctx.get_value(ssa("%body_local")).unwrap(),
         Value::Index(99)
     ));
     ctx.pop_scope();
     // Python: KeyError. Rust: get_value returns Err for an undefined name.
-    assert!(ctx.get_value("%body_local").is_err());
+    assert!(ctx.get_value(ssa("%body_local")).is_err());
 }
 
 #[test]
 fn test_has_value_searches_all_scopes() {
     let mut ctx = make_context(2);
-    ctx.set_value("%outer", Value::Index(1));
+    ctx.set_value(ssa("%outer"), Value::Index(1));
     ctx.push_scope();
-    ctx.set_value("%inner", Value::Index(2));
-    assert!(ctx.has_value("%outer"));
-    assert!(ctx.has_value("%inner"));
+    ctx.set_value(ssa("%inner"), Value::Index(2));
+    assert!(ctx.has_value(ssa("%outer")));
+    assert!(ctx.has_value(ssa("%inner")));
     ctx.pop_scope();
-    assert!(ctx.has_value("%outer"));
-    assert!(!ctx.has_value("%inner"));
+    assert!(ctx.has_value(ssa("%outer")));
+    assert!(!ctx.has_value(ssa("%inner")));
 }
 
 #[test]
@@ -151,33 +171,33 @@ fn test_nested_scopes() {
     // Three levels: function -> for -> nested for. Sentinel ints stand in for the
     // Python "f"/"o"/"i" string markers (identity/visibility is what matters).
     let mut ctx = make_context(2);
-    ctx.set_value("%func_val", Value::Index(0)); // "f"
+    ctx.set_value(ssa("%func_val"), Value::Index(0)); // "f"
     ctx.push_scope(); // outer for
-    ctx.set_value("%outer_val", Value::Index(1)); // "o"
+    ctx.set_value(ssa("%outer_val"), Value::Index(1)); // "o"
     ctx.push_scope(); // inner for
-    ctx.set_value("%inner_val", Value::Index(2)); // "i"
+    ctx.set_value(ssa("%inner_val"), Value::Index(2)); // "i"
 
     // All visible from innermost.
     assert!(matches!(
-        ctx.get_value("%func_val").unwrap(),
+        ctx.get_value(ssa("%func_val")).unwrap(),
         Value::Index(0)
     ));
     assert!(matches!(
-        ctx.get_value("%outer_val").unwrap(),
+        ctx.get_value(ssa("%outer_val")).unwrap(),
         Value::Index(1)
     ));
     assert!(matches!(
-        ctx.get_value("%inner_val").unwrap(),
+        ctx.get_value(ssa("%inner_val")).unwrap(),
         Value::Index(2)
     ));
 
     ctx.pop_scope(); // exit inner for
-    assert!(ctx.has_value("%outer_val"));
-    assert!(!ctx.has_value("%inner_val"));
+    assert!(ctx.has_value(ssa("%outer_val")));
+    assert!(!ctx.has_value(ssa("%inner_val")));
 
     ctx.pop_scope(); // exit outer for
-    assert!(ctx.has_value("%func_val"));
-    assert!(!ctx.has_value("%outer_val"));
+    assert!(ctx.has_value(ssa("%func_val")));
+    assert!(!ctx.has_value(ssa("%outer_val")));
 }
 
 // ===========================================================================
@@ -188,7 +208,8 @@ fn test_nested_scopes() {
 fn test_track_increments_used() {
     let mut ctx = make_context(2);
     let tile = make_tile(&[32, 1024]); // 32*1024*2 = 65536 bytes
-    ctx.track_lx("%tile", tile.size_bytes() as i64).unwrap();
+    ctx.track_lx(ssa("%tile"), tile.size_bytes() as i64)
+        .unwrap();
     assert_eq!(used(&ctx), 65536);
 }
 
@@ -196,15 +217,16 @@ fn test_track_increments_used() {
 fn test_untrack_decrements_used() {
     let mut ctx = make_context(2);
     let tile = make_tile(&[32, 1024]);
-    ctx.track_lx("%tile", tile.size_bytes() as i64).unwrap();
-    ctx.untrack_lx("%tile");
+    ctx.track_lx(ssa("%tile"), tile.size_bytes() as i64)
+        .unwrap();
+    ctx.untrack_lx(ssa("%tile"));
     assert_eq!(used(&ctx), 0);
 }
 
 #[test]
 fn test_untrack_nonexistent_is_noop() {
     let mut ctx = make_context(2);
-    ctx.untrack_lx("%does_not_exist"); // must not panic
+    ctx.untrack_lx(ssa("%does_not_exist")); // must not panic
     assert_eq!(used(&ctx), 0);
 }
 
@@ -213,8 +235,9 @@ fn test_pop_scope_frees_lx() {
     let mut ctx = make_context(2);
     ctx.push_scope();
     let tile = make_tile(&[32, 1024]); // 65536 bytes
-    ctx.set_value("%tile", Value::Tile(tile.clone()));
-    ctx.track_lx("%tile", tile.size_bytes() as i64).unwrap();
+    ctx.set_value(ssa("%tile"), Value::Tile(tile.clone()));
+    ctx.track_lx(ssa("%tile"), tile.size_bytes() as i64)
+        .unwrap();
     assert_eq!(used(&ctx), 65536);
 
     ctx.pop_scope();
@@ -225,14 +248,14 @@ fn test_pop_scope_frees_lx() {
 fn test_pop_scope_does_not_free_outer_lx() {
     let mut ctx = make_context(2);
     let outer_tile = make_tile(&[4, 64]); // 512 bytes
-    ctx.set_value("%outer", Value::Tile(outer_tile.clone()));
-    ctx.track_lx("%outer", outer_tile.size_bytes() as i64)
+    ctx.set_value(ssa("%outer"), Value::Tile(outer_tile.clone()));
+    ctx.track_lx(ssa("%outer"), outer_tile.size_bytes() as i64)
         .unwrap();
 
     ctx.push_scope();
     let inner_tile = make_tile(&[32, 1024]); // 65536 bytes
-    ctx.set_value("%inner", Value::Tile(inner_tile.clone()));
-    ctx.track_lx("%inner", inner_tile.size_bytes() as i64)
+    ctx.set_value(ssa("%inner"), Value::Tile(inner_tile.clone()));
+    ctx.track_lx(ssa("%inner"), inner_tile.size_bytes() as i64)
         .unwrap();
     assert_eq!(used(&ctx), 512 + 65536);
 
@@ -244,11 +267,11 @@ fn test_pop_scope_does_not_free_outer_lx() {
 fn test_lx_overflow_raises() {
     // 1 MB = 1048576 bytes. Two 512 KB tiles fit; one more byte overflows.
     let mut ctx = make_context(1);
-    ctx.track_lx("%a", 512 * 1024).unwrap();
-    ctx.track_lx("%b", 512 * 1024).unwrap();
+    ctx.track_lx(ssa("%a"), 512 * 1024).unwrap();
+    ctx.track_lx(ssa("%b"), 512 * 1024).unwrap();
     assert_eq!(used(&ctx), 1048576);
     // Python: MemoryError("LX scratchpad overflow"). Rust: Err, allocation rejected.
-    let r = ctx.track_lx("%c", 1);
+    let r = ctx.track_lx(ssa("%c"), 1);
     assert!(r.is_err());
     assert_eq!(used(&ctx), 1048576); // unchanged
 }
@@ -256,11 +279,12 @@ fn test_lx_overflow_raises() {
 #[test]
 fn test_clear_values_resets_everything() {
     let mut ctx = make_context(2);
-    ctx.set_value("%x", Value::Index(1));
+    ctx.set_value(ssa("%x"), Value::Index(1));
     ctx.push_scope();
-    ctx.set_value("%y", Value::Index(2));
+    ctx.set_value(ssa("%y"), Value::Index(2));
     let tile = make_tile(&[8, 64]);
-    ctx.track_lx("%tile", tile.size_bytes() as i64).unwrap();
+    ctx.track_lx(ssa("%tile"), tile.size_bytes() as i64)
+        .unwrap();
 
     ctx.clear_values();
 
@@ -268,8 +292,8 @@ fn test_clear_values_resets_everything() {
     // Those fields are private in Rust; check the equivalent observable state.
     assert_eq!(used(&ctx), 0); // _lx_bytes cleared -> used reset
     assert_eq!(next_ptr(&ctx), 0); // lx cleared
-    assert!(!ctx.has_value("%x")); // all scopes wiped
-    assert!(!ctx.has_value("%y"));
+    assert!(!ctx.has_value(ssa("%x"))); // all scopes wiped
+    assert!(!ctx.has_value(ssa("%y")));
     // Only the function-body scope remains: a single pop must panic.
     let r = catch_unwind(AssertUnwindSafe(|| ctx.pop_scope()));
     assert!(r.is_err());
@@ -287,8 +311,9 @@ fn test_iter_arg_tiles_persist_body_local_freed() {
 
     // Initial iter_arg: tensor<4x1xf16> = 8 bytes.
     let iter_tile = make_tile(&[4, 1]);
-    ctx.set_value("%acc", Value::Tile(iter_tile.clone()));
-    ctx.track_lx("%acc", iter_tile.size_bytes() as i64).unwrap();
+    ctx.set_value(ssa("%acc"), Value::Tile(iter_tile.clone()));
+    ctx.track_lx(ssa("%acc"), iter_tile.size_bytes() as i64)
+        .unwrap();
     assert_eq!(used(&ctx), 8);
 
     for _ in 0..3 {
@@ -296,14 +321,14 @@ fn test_iter_arg_tiles_persist_body_local_freed() {
 
         // Body-local: tensor<4x256xf16> = 2048 bytes.
         let body_tile = make_tile(&[4, 256]);
-        ctx.set_value("%body_tile", Value::Tile(body_tile.clone()));
-        ctx.track_lx("%body_tile", body_tile.size_bytes() as i64)
+        ctx.set_value(ssa("%body_tile"), Value::Tile(body_tile.clone()));
+        ctx.track_lx(ssa("%body_tile"), body_tile.size_bytes() as i64)
             .unwrap();
 
         // New iter_arg value (created in body, will be yielded): 8 bytes.
         let new_acc = make_tile(&[4, 1]);
-        ctx.set_value("%new_acc", Value::Tile(new_acc.clone()));
-        ctx.track_lx("%new_acc", new_acc.size_bytes() as i64)
+        ctx.set_value(ssa("%new_acc"), Value::Tile(new_acc.clone()));
+        ctx.track_lx(ssa("%new_acc"), new_acc.size_bytes() as i64)
             .unwrap();
 
         assert_eq!(used(&ctx), 8 + 2048 + 8); // old acc + body + new acc
@@ -313,9 +338,10 @@ fn test_iter_arg_tiles_persist_body_local_freed() {
         assert_eq!(used(&ctx), 8); // only old %acc remains
 
         // Re-bind iter_arg: untrack old, set + track new.
-        ctx.untrack_lx("%acc");
-        ctx.set_value("%acc", Value::Tile(new_acc.clone()));
-        ctx.track_lx("%acc", new_acc.size_bytes() as i64).unwrap();
+        ctx.untrack_lx(ssa("%acc"));
+        ctx.set_value(ssa("%acc"), Value::Tile(new_acc.clone()));
+        ctx.track_lx(ssa("%acc"), new_acc.size_bytes() as i64)
+            .unwrap();
         assert_eq!(used(&ctx), 8); // back to steady state
     }
 }
@@ -337,10 +363,10 @@ fn test_issue_26_reproducer_next_ptr_bounded_in_loop() {
         // Mirrors the interpreter's per-op load sequence: write into LX, set the
         // SSA value, track its bytes. pop_scope frees it via untrack_lx.
         write_to_lx_f16(&mut ctx, 4 * 256); // 2 KB
-        let name = format!("%tile_iter{i}");
+        let name = ssa(Box::leak(format!("%tile_iter{i}").into_boxed_str()));
         let tile = make_tile(&[4, 256]);
-        ctx.set_value(&name, Value::Tile(tile.clone()));
-        ctx.track_lx(&name, tile.size_bytes() as i64).unwrap();
+        ctx.set_value(name, Value::Tile(tile.clone()));
+        ctx.track_lx(name, tile.size_bytes() as i64).unwrap();
 
         ctx.pop_scope();
 
@@ -413,7 +439,10 @@ fn test_legitimate_overflow_still_raises() {
         write_to_lx_f16(&mut ctx, 1024); // 2 KB each
         let tile = make_tile(&[1024]);
         if ctx
-            .track_lx(&format!("%t{i}"), tile.size_bytes() as i64)
+            .track_lx(
+                ssa(Box::leak(format!("%t{i}").into_boxed_str())),
+                tile.size_bytes() as i64,
+            )
             .is_err()
         {
             overflowed = true; // Python: MemoryError("LX scratchpad overflow")

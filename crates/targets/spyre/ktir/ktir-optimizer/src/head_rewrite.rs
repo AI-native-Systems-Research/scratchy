@@ -1678,18 +1678,28 @@ pub fn rewrite_head_attention<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir_builder::Ops;
+    use ktir_core::opkind::Dialect;
+
+    /// Leak a formatted per-iteration SSA/op name to `&'static str` — test-only;
+    /// [`Ops`] needs `'static` names. Two leaks of equal content hash/compare
+    /// equal in `Ops`' name table (`&str` (Partial)Eq/Hash is by content).
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
 
     /// A synthetic island matching the smollm shape (H=9, m=8, gqac=3, d=64,
     /// cap=64). Used to exercise the rewrite emitter structurally.
     fn smollm_island() -> HeadAttnIsland {
+        let mut ops = Ops::new();
         HeadAttnIsland {
-            q_arg: "%q".into(),
-            o_arg: "%o".into(),
-            mask_arg: "%mask".into(),
-            kc_arg: "%kc".into(),
-            kd_arg: "%kd".into(),
-            vc_arg: "%vc".into(),
-            vd_arg: "%vd".into(),
+            q_arg: ops.ssa("%q"),
+            o_arg: ops.ssa("%o"),
+            mask_arg: ops.ssa("%mask"),
+            kc_arg: ops.ssa("%kc"),
+            kd_arg: ops.ssa("%kd"),
+            vc_arg: ops.ssa("%vc"),
+            vd_arg: ops.ssa("%vd"),
             q_cols: 576,
             kv_cols: 192,
             m: 8,
@@ -1700,34 +1710,49 @@ mod tests {
             h: 9,
             scale: 0.125,
             ninf: -1.0e38,
-            dtype: "f16".into(),
+            dtype: DType::F16,
         }
     }
 
     #[test]
     fn rewrite_preserves_grid_and_args() {
         let isl = smollm_island();
-        let f = rewrite_head_attention(&isl);
+        let mut g = NameGen::above(isl.arg_ssas());
+        let f = rewrite_head_attention(Arena::global(), &isl, &mut g);
         // Grid stays [H, 1, 1] — every core still runs the body once for its head.
         assert_eq!(f.grid, (9, 1, 1));
-        let names: Vec<&str> = f.arguments.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["%q", "%o", "%mask", "%kc", "%kd", "%vc", "%vd"]);
+        let ssas: Vec<Ssa> = f.arguments.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            ssas,
+            vec![
+                isl.q_arg,
+                isl.o_arg,
+                isl.mask_arg,
+                isl.kc_arg,
+                isl.kd_arg,
+                isl.vc_arg,
+                isl.vd_arg
+            ]
+        );
     }
 
     #[test]
     fn rewrite_emits_no_control_flow_and_one_store() {
         let isl = smollm_island();
-        let f = rewrite_head_attention(&isl);
+        let mut g = NameGen::above(isl.arg_ssas());
+        let f = rewrite_head_attention(Arena::global(), &isl, &mut g);
         // Pure re-roll: NO scf.* (region-free, never trips the batched gate).
         assert!(
-            !f.operations.iter().any(|o| o.op_type.starts_with("scf.")),
+            !f.operations
+                .iter()
+                .any(|o| o.op_type.dialect() == Dialect::Scf),
             "re-roll must be region-free"
         );
         // Exactly ONE store (the whole [m,d] output) instead of m stores.
         let stores = f
             .operations
             .iter()
-            .filter(|o| o.op_type == "ktdp.store")
+            .filter(|o| o.op_type == OpKind::KtdpStore)
             .count();
         assert_eq!(stores, 1, "one whole-row store");
         // Four matmuls total (context QKᵀ, diagonal QKᵀ, context AV, diagonal AV)
@@ -1735,20 +1760,20 @@ mod tests {
         let mms = f
             .operations
             .iter()
-            .filter(|o| o.op_type == "linalg.matmul")
+            .filter(|o| o.op_type == OpKind::LinalgMatmul)
             .count();
         assert_eq!(mms, 4, "two QKᵀ + two AV, once");
         // Preserves the per-head selection arithmetic as SSA.
         assert!(
             f.operations
                 .iter()
-                .any(|o| o.op_type == "ktdp.get_compute_tile_id")
+                .any(|o| o.op_type == OpKind::KtdpGetComputeTileId)
         );
-        assert!(f.operations.iter().any(|o| o.op_type == "arith.divui"));
+        assert!(f.operations.iter().any(|o| o.op_type == OpKind::ArithDivui));
         let muls = f
             .operations
             .iter()
-            .filter(|o| o.op_type == "arith.muli")
+            .filter(|o| o.op_type == OpKind::ArithMuli)
             .count();
         assert_eq!(muls, 2, "qcol = hpid*hdc and kvcol = (hpid/gqac)*hdc");
     }
@@ -1756,9 +1781,10 @@ mod tests {
     #[test]
     fn causal_mask_is_lower_triangular() {
         // mask[r,k] = 0 for k<=r (visible), ninf for k>r (masked).
-        let op = causal_mask_mm("%tri", 4, -1.0e38, "f16");
-        let vals = match op.attributes.get("value") {
-            Some(Attr::FloatList(v)) => v.clone(),
+        let mut ops = Ops::new();
+        let op = causal_mask_mm(Arena::global(), ops.ssa("%tri"), 4, -1.0e38, DType::F16);
+        let vals = match op.attr(AttrKey::Value) {
+            Some(Attr::FloatList(v)) => v.to_vec(),
             other => panic!("mask value not a FloatList: {other:?}"),
         };
         assert_eq!(vals.len(), 16);
@@ -1777,55 +1803,49 @@ mod tests {
     #[test]
     fn rejects_single_core_grid() {
         // grid = [1,1,1] is not head-parallel -> None.
-        let f = IRFunction {
-            name: "x".into(),
-            arguments: vec![],
-            operations: vec![Operation::new(None, "ktdp.store", &["%a", "%b"])],
-            grid: (1, 1, 1),
-            return_type: None,
-        };
+        let mut ops = Ops::new();
+        let store = ops.op(None, OpKind::KtdpStore, &["%a", "%b"]);
+        let f = ops.func("x", &[], vec![store], (1, 1, 1));
         assert!(recognize_head_attention(&f).is_none());
     }
 
     #[test]
     fn rejects_region_bearing() {
         // A top-level scf.for disqualifies (the FA-tiled regime, not the head one).
-        let mut forop = Operation::new(None, "scf.for", &["%x", "%y", "%z"]);
-        forop.regions = vec![vec![Operation::new(None, "scf.yield", &[])]];
-        let f = IRFunction {
-            name: "x".into(),
-            arguments: vec![],
-            operations: vec![forop, Operation::new(None, "ktdp.store", &["%a", "%b"])],
-            grid: (9, 1, 1),
-            return_type: None,
-        };
+        let mut ops = Ops::new();
+        let yield_op = ops.op(None, OpKind::ScfYield, &[]);
+        let forop = ops.op(None, OpKind::ScfFor, &["%x", "%y", "%z"]);
+        let forop = ops.with_region(forop, vec![yield_op]);
+        let store = ops.op(None, OpKind::KtdpStore, &["%a", "%b"]);
+        let f = ops.func("x", &[], vec![forop, store], (9, 1, 1));
         assert!(recognize_head_attention(&f).is_none());
     }
 
     #[test]
     fn rejects_plain_copy() {
         // A multi-core copy node (no QKᵀ/softmax/AV) -> None.
-        let f = IRFunction {
-            name: "copy".into(),
-            arguments: vec![
-                ("%in".into(), "index".into()),
-                ("%out".into(), "index".into()),
-            ],
-            grid: (9, 1, 1),
-            return_type: None,
-            operations: vec![
-                mk_view("%vi", "%in", &[8, 64], "f16"),
-                Operation::new(Some("%ti"), "ktdp.construct_access_tile", &["%vi"])
-                    .with_attr("shape", Attr::IntList(vec![8, 64])),
-                Operation::new(Some("%l"), "ktdp.load", &["%ti"]),
-                Operation::new(Some("%y"), "math.exp", &["%l"]),
-                mk_view("%vo", "%out", &[8, 64], "f16"),
-                Operation::new(Some("%to"), "ktdp.construct_access_tile", &["%vo"])
-                    .with_attr("shape", Attr::IntList(vec![8, 64])),
-                Operation::new(None, "ktdp.store", &["%y", "%to"]),
-                Operation::new(None, "func.return", &[]),
-            ],
-        };
+        let mut ops = Ops::new();
+        let vi = ops.op(Some("%vi"), OpKind::KtdpConstructMemoryView, &["%in"]);
+        let vi = ops.attr(vi, AttrKey::Shape, ops.int_list(vec![8, 64]));
+        let vi = ops.attr(vi, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let ti = ops.op(Some("%ti"), OpKind::KtdpConstructAccessTile, &["%vi"]);
+        let ti = ops.attr(ti, AttrKey::Shape, ops.int_list(vec![8, 64]));
+        let l = ops.op(Some("%l"), OpKind::KtdpLoad, &["%ti"]);
+        let y = ops.op(Some("%y"), OpKind::MathExp, &["%l"]);
+        let vo = ops.op(Some("%vo"), OpKind::KtdpConstructMemoryView, &["%out"]);
+        let vo = ops.attr(vo, AttrKey::Shape, ops.int_list(vec![8, 64]));
+        let vo = ops.attr(vo, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let to = ops.op(Some("%to"), OpKind::KtdpConstructAccessTile, &["%vo"]);
+        let to = ops.attr(to, AttrKey::Shape, ops.int_list(vec![8, 64]));
+        let store = ops.op(None, OpKind::KtdpStore, &["%y", "%to"]);
+        let ret = ops.op(None, OpKind::FuncReturn, &[]);
+        let body = vec![vi, ti, l, y, vo, to, store, ret];
+        let f = ops.func(
+            "copy",
+            &[("%in", IrType::Index), ("%out", IrType::Index)],
+            body,
+            (9, 1, 1),
+        );
         assert!(recognize_head_attention(&f).is_none());
     }
 
@@ -1840,14 +1860,15 @@ mod tests {
 
     fn decode_island(h: i64, gqac: i64, d: i64, cap: i64) -> DecodeAttnIsland {
         let kv_heads = h / gqac;
+        let mut ops = Ops::new();
         DecodeAttnIsland {
-            q_arg: "%q".into(),
-            o_arg: "%o".into(),
-            mask_arg: "%mask".into(),
-            kc_arg: "%kc".into(),
-            kd_arg: "%kd".into(),
-            vc_arg: "%vc".into(),
-            vd_arg: "%vd".into(),
+            q_arg: ops.ssa("%q"),
+            o_arg: ops.ssa("%o"),
+            mask_arg: ops.ssa("%mask"),
+            kc_arg: ops.ssa("%kc"),
+            kd_arg: ops.ssa("%kd"),
+            vc_arg: ops.ssa("%vc"),
+            vd_arg: ops.ssa("%vd"),
             q_cols: h * d,
             kv_cols: kv_heads * d,
             cap,
@@ -1856,7 +1877,7 @@ mod tests {
             gqac,
             hdc: d,
             scale: 0.125,
-            dtype: "f16".into(),
+            dtype: DType::F16,
         }
     }
 
@@ -1948,242 +1969,266 @@ mod tests {
     /// EXACT op shape the real decode emit uses, so `recognize_head_attention_decode`
     /// exercises the real recognition path (constants, addi-folded kvcol, the two-
     /// block QKᵀ/softmax/AV chain).
-    fn build_decode_func(h: i64, gqac: i64, d: i64, cap: i64) -> IRFunction {
+    fn build_decode_func(h: i64, gqac: i64, d: i64, cap: i64) -> IRFunction<'static> {
+        let a = Arena::global();
         let kv_cols = (h / gqac) * d;
         let q_cols = h * d;
-        let mut ops: Vec<Operation> = Vec::new();
-        let v = |n: &str| n.to_string();
-        ops.push(
-            Operation::new(Some("%c0"), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
-        );
-        ops.push(mk_view("%view0", "%q", &[1, q_cols], "f16"));
-        ops.push(mk_view("%view1", "%o", &[1, q_cols], "f16"));
-        ops.push(mk_view("%view2", "%mask", &[1, cap], "f16"));
-        ops.push(mk_view("%view5", "%kc", &[cap, kv_cols], "f16"));
-        ops.push(mk_view("%view6", "%kd", &[1, kv_cols], "f16"));
-        ops.push(mk_view("%view7", "%vc", &[cap, kv_cols], "f16"));
-        ops.push(mk_view("%view8", "%vd", &[1, kv_cols], "f16"));
-        ops.push(
-            Operation::new(Some("%scale"), "arith.constant", &[])
-                .with_attr("value", Attr::Float(0.125)),
-        );
-        ops.push(
-            Operation::new(Some("%ninf"), "arith.constant", &[])
-                .with_attr("value", Attr::Float(-1.0e38)),
-        );
+        let mut ops = Ops::new();
+        let mut body: Vec<Operation> = Vec::new();
+
+        let c0 = ops.ssa("%c0");
+        let c0_op = ops.op(Some("%c0"), OpKind::ArithConstant, &[]);
+        body.push(ops.attr(c0_op, AttrKey::Value, Attr::Int(0)));
+        let view0 = ops.ssa("%view0");
+        body.push(mk_view(a, view0, ops.ssa("%q"), &[1, q_cols], DType::F16));
+        let view1 = ops.ssa("%view1");
+        body.push(mk_view(a, view1, ops.ssa("%o"), &[1, q_cols], DType::F16));
+        let view2 = ops.ssa("%view2");
+        body.push(mk_view(a, view2, ops.ssa("%mask"), &[1, cap], DType::F16));
+        let view5 = ops.ssa("%view5");
+        body.push(mk_view(
+            a,
+            view5,
+            ops.ssa("%kc"),
+            &[cap, kv_cols],
+            DType::F16,
+        ));
+        let view6 = ops.ssa("%view6");
+        body.push(mk_view(a, view6, ops.ssa("%kd"), &[1, kv_cols], DType::F16));
+        let view7 = ops.ssa("%view7");
+        body.push(mk_view(
+            a,
+            view7,
+            ops.ssa("%vc"),
+            &[cap, kv_cols],
+            DType::F16,
+        ));
+        let view8 = ops.ssa("%view8");
+        body.push(mk_view(a, view8, ops.ssa("%vd"), &[1, kv_cols], DType::F16));
+        let scale = ops.ssa("%scale");
+        let scale_op = ops.op(Some("%scale"), OpKind::ArithConstant, &[]);
+        body.push(ops.attr(scale_op, AttrKey::Value, Attr::Float(0.125)));
+        let ninf = ops.ssa("%ninf");
+        let ninf_op = ops.op(Some("%ninf"), OpKind::ArithConstant, &[]);
+        body.push(ops.attr(ninf_op, AttrKey::Value, Attr::Float(-1.0e38)));
         // shared mask load.
-        ops.push(
-            Operation::new(
-                Some("%macc"),
-                "ktdp.construct_access_tile",
-                &["%view2", "%c0", "%c0"],
-            )
-            .with_attr("shape", Attr::IntList(vec![1, cap])),
+        let macc = ops.op(
+            Some("%macc"),
+            OpKind::KtdpConstructAccessTile,
+            &["%view2", "%c0", "%c0"],
         );
-        ops.push(Operation::new(Some("%mload"), "ktdp.load", &["%macc"]));
-        let mut id = 0usize;
-        let nm = |tag: &str, id: &mut usize| {
-            *id += 1;
-            format!("%{tag}{id}")
-        };
+        body.push(ops.attr(macc, AttrKey::Shape, ops.int_list(vec![1, cap])));
+        let mload = ops.ssa("%mload");
+        body.push(ops.op(Some("%mload"), OpKind::KtdpLoad, &["%macc"]));
+
         for hh in 0..h {
             let qcol = hh * d;
             let kvcol = (hh / gqac) * d;
-            let qc = nm("qcol", &mut id);
-            ops.push(
-                Operation::new(Some(&qc), "arith.constant", &[])
-                    .with_attr("value", Attr::Int(qcol)),
-            );
-            let kvc = nm("kvcol", &mut id);
-            ops.push(
-                Operation::new(Some(&kvc), "arith.constant", &[])
-                    .with_attr("value", Attr::Int(kvcol)),
-            );
+            let qc = leak(format!("%qcol{hh}"));
+            let qc_op = ops.op(Some(qc), OpKind::ArithConstant, &[]);
+            body.push(ops.attr(qc_op, AttrKey::Value, Attr::Int(qcol)));
+            let kvc = leak(format!("%kvcol{hh}"));
+            let kvc_op = ops.op(Some(kvc), OpKind::ArithConstant, &[]);
+            body.push(ops.attr(kvc_op, AttrKey::Value, Attr::Int(kvcol)));
+
             // Q load.
-            let qacc = nm("qacc", &mut id);
-            ops.push(
-                Operation::new(
-                    Some(&qacc),
-                    "ktdp.construct_access_tile",
-                    &["%view0", "%c0", &qc],
-                )
-                .with_attr("shape", Attr::IntList(vec![1, d])),
+            let qacc = leak(format!("%qacc{hh}"));
+            let qacc_op = ops.op(
+                Some(qacc),
+                OpKind::KtdpConstructAccessTile,
+                &["%view0", "%c0", qc],
             );
-            let q = nm("q", &mut id);
-            ops.push(Operation::new(Some(&q), "ktdp.load", &[&qacc]));
+            body.push(ops.attr(qacc_op, AttrKey::Shape, ops.int_list(vec![1, d])));
+            let q = leak(format!("%q{hh}"));
+            let _q_ssa = ops.ssa(q);
+            body.push(ops.op(Some(q), OpKind::KtdpLoad, &[qacc]));
+
             // CONTEXT: Kc [cap,d] at [0, kvcol] (folded as addi(0, kvcol)).
-            let kcs = nm("kcs", &mut id);
-            ops.push(
-                Operation::new(Some(&kcs), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
+            let kcs = leak(format!("%kcs{hh}"));
+            let kcs_op = ops.op(Some(kcs), OpKind::ArithConstant, &[]);
+            body.push(ops.attr(kcs_op, AttrKey::Value, Attr::Int(0)));
+            let kcc = leak(format!("%kcc{hh}"));
+            body.push(ops.op(Some(kcc), OpKind::ArithAddi, &[kcs, kvc]));
+            let kcacc = leak(format!("%kcacc{hh}"));
+            let kcacc_op = ops.op(
+                Some(kcacc),
+                OpKind::KtdpConstructAccessTile,
+                &["%view5", "%c0", kcc],
             );
-            let kcc = nm("kcc", &mut id);
-            ops.push(Operation::new(Some(&kcc), "arith.addi", &[&kcs, &kvc]));
-            let kcacc = nm("kcacc", &mut id);
-            ops.push(
-                Operation::new(
-                    Some(&kcacc),
-                    "ktdp.construct_access_tile",
-                    &["%view5", "%c0", &kcc],
-                )
-                .with_attr("shape", Attr::IntList(vec![cap, d])),
-            );
-            let kc = nm("kc", &mut id);
-            ops.push(Operation::new(Some(&kc), "ktdp.load", &[&kcacc]));
-            let kct = nm("kct", &mut id);
-            ops.push(
-                Operation::new(Some(&kct), "linalg.transpose", &[&kc, &kc])
-                    .with_attr("permutation", Attr::IntList(vec![1, 0])),
-            );
-            let scr = nm("scr", &mut id);
-            ops.push(Operation::new(Some(&scr), "linalg.matmul", &[&q, &kct, &q]));
-            let scsp = nm("scsp", &mut id);
-            ops.push(mk_splat(&scsp, "%scale", &[1, cap], "f16"));
-            let scl = nm("scl", &mut id);
-            ops.push(Operation::new(Some(&scl), "arith.mulf", &[&scr, &scsp]));
-            let scm = nm("scm", &mut id);
-            ops.push(Operation::new(Some(&scm), "arith.addf", &[&scl, "%mload"]));
-            let mi = nm("mi", &mut id);
-            ops.push(mk_splat(&mi, "%ninf", &[1], "f16"));
-            let mx = nm("mx", &mut id);
-            ops.push(mk_reduce(&mx, &scm, &mi, "arith.maximumf"));
+            body.push(ops.attr(kcacc_op, AttrKey::Shape, ops.int_list(vec![cap, d])));
+            let kc = leak(format!("%kc{hh}"));
+            body.push(ops.op(Some(kc), OpKind::KtdpLoad, &[kcacc]));
+            let kct = leak(format!("%kct{hh}"));
+            let kct_op = ops.op(Some(kct), OpKind::LinalgTranspose, &[kc, kc]);
+            body.push(ops.attr(kct_op, AttrKey::Permutation, ops.int_list(vec![1, 0])));
+            let scr = leak(format!("%scr{hh}"));
+            body.push(ops.op(Some(scr), OpKind::LinalgMatmul, &[q, kct, q]));
+            let scsp = leak(format!("%scsp{hh}"));
+            let scsp_ssa = ops.ssa(scsp);
+            body.push(mk_splat(a, scsp_ssa, scale, &[1, cap], DType::F16));
+            let scl = leak(format!("%scl{hh}"));
+            body.push(ops.op(Some(scl), OpKind::ArithMulf, &[scr, scsp]));
+            let scm = leak(format!("%scm{hh}"));
+            let scm_ssa = ops.ssa(scm);
+            body.push(ops.op(Some(scm), OpKind::ArithAddf, &[scl, "%mload"]));
+            let mi = leak(format!("%mi{hh}"));
+            let mi_ssa = ops.ssa(mi);
+            body.push(mk_splat(a, mi_ssa, ninf, &[1], DType::F16));
+            let mx = leak(format!("%mx{hh}"));
+            let mx_ssa = ops.ssa(mx);
+            body.push(mk_reduce(a, mx_ssa, scm_ssa, mi_ssa, OpKind::ArithMaximumf));
+
             // DIAGONAL: Kd [1,d] at [0, kvcol].
-            let kds = nm("kds", &mut id);
-            ops.push(
-                Operation::new(Some(&kds), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
+            let kds = leak(format!("%kds{hh}"));
+            let kds_op = ops.op(Some(kds), OpKind::ArithConstant, &[]);
+            body.push(ops.attr(kds_op, AttrKey::Value, Attr::Int(0)));
+            let kdc = leak(format!("%kdc{hh}"));
+            body.push(ops.op(Some(kdc), OpKind::ArithAddi, &[kds, kvc]));
+            let kdacc = leak(format!("%kdacc{hh}"));
+            let kdacc_op = ops.op(
+                Some(kdacc),
+                OpKind::KtdpConstructAccessTile,
+                &["%view6", "%c0", kdc],
             );
-            let kdc = nm("kdc", &mut id);
-            ops.push(Operation::new(Some(&kdc), "arith.addi", &[&kds, &kvc]));
-            let kdacc = nm("kdacc", &mut id);
-            ops.push(
-                Operation::new(
-                    Some(&kdacc),
-                    "ktdp.construct_access_tile",
-                    &["%view6", "%c0", &kdc],
-                )
-                .with_attr("shape", Attr::IntList(vec![1, d])),
-            );
-            let kd = nm("kd", &mut id);
-            ops.push(Operation::new(Some(&kd), "ktdp.load", &[&kdacc]));
-            let kdt = nm("kdt", &mut id);
-            ops.push(
-                Operation::new(Some(&kdt), "linalg.transpose", &[&kd, &kd])
-                    .with_attr("permutation", Attr::IntList(vec![1, 0])),
-            );
-            let sdr = nm("sdr", &mut id);
-            ops.push(Operation::new(Some(&sdr), "linalg.matmul", &[&q, &kdt, &q]));
-            let sdsp = nm("sdsp", &mut id);
-            ops.push(mk_splat(&sdsp, "%scale", &[1, 1], "f16"));
-            let sdl = nm("sdl", &mut id);
-            ops.push(Operation::new(Some(&sdl), "arith.mulf", &[&sdr, &sdsp]));
-            let mdi = nm("mdi", &mut id);
-            ops.push(mk_splat(&mdi, "%ninf", &[1], "f16"));
-            let mxd = nm("mxd", &mut id);
-            ops.push(mk_reduce(&mxd, &sdl, &mdi, "arith.maximumf"));
-            // combine + exp + sums.
-            let gm = nm("gm", &mut id);
-            ops.push(Operation::new(Some(&gm), "arith.maximumf", &[&mx, &mxd]));
-            let gmb = nm("gmb", &mut id);
-            ops.push(mk_splat(&gmb, &gm, &[1, cap], "f16"));
-            let sh = nm("sh", &mut id);
-            ops.push(Operation::new(Some(&sh), "arith.subf", &[&scm, &gmb]));
-            let ex = nm("ex", &mut id);
-            ops.push(Operation::new(Some(&ex), "math.exp", &[&sh]));
-            let zi = nm("zi", &mut id);
-            ops.push(mk_splat(&zi, "%ninf", &[1], "f16"));
-            let su = nm("su", &mut id);
-            ops.push(mk_reduce(&su, &ex, &zi, "arith.addf"));
-            let gmbd = nm("gmbd", &mut id);
-            ops.push(mk_splat(&gmbd, &gm, &[1, 1], "f16"));
-            let shd = nm("shd", &mut id);
-            ops.push(Operation::new(Some(&shd), "arith.subf", &[&sdl, &gmbd]));
-            let exd = nm("exd", &mut id);
-            ops.push(Operation::new(Some(&exd), "math.exp", &[&shd]));
-            let zid = nm("zid", &mut id);
-            ops.push(mk_splat(&zid, "%ninf", &[1], "f16"));
-            let sud = nm("sud", &mut id);
-            ops.push(mk_reduce(&sud, &exd, &zid, "arith.addf"));
-            let gs = nm("gs", &mut id);
-            ops.push(Operation::new(Some(&gs), "arith.addf", &[&su, &sud]));
-            let gsb = nm("gsb", &mut id);
-            ops.push(mk_splat(&gsb, &gs, &[1, cap], "f16"));
-            let w = nm("w", &mut id);
-            ops.push(Operation::new(Some(&w), "arith.divf", &[&ex, &gsb]));
-            let gsbd = nm("gsbd", &mut id);
-            ops.push(mk_splat(&gsbd, &gs, &[1, 1], "f16"));
-            let wd = nm("wd", &mut id);
-            ops.push(Operation::new(Some(&wd), "arith.divf", &[&exd, &gsbd]));
-            // AV.
-            let vcs = nm("vcs", &mut id);
-            ops.push(
-                Operation::new(Some(&vcs), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
-            );
-            let vcc = nm("vcc", &mut id);
-            ops.push(Operation::new(Some(&vcc), "arith.addi", &[&vcs, &kvc]));
-            let vcacc = nm("vcacc", &mut id);
-            ops.push(
-                Operation::new(
-                    Some(&vcacc),
-                    "ktdp.construct_access_tile",
-                    &["%view7", "%c0", &vcc],
-                )
-                .with_attr("shape", Attr::IntList(vec![cap, d])),
-            );
-            let vc = nm("vc", &mut id);
-            ops.push(Operation::new(Some(&vc), "ktdp.load", &[&vcacc]));
-            let ov = nm("ov", &mut id);
-            ops.push(Operation::new(Some(&ov), "linalg.matmul", &[&w, &vc, &w]));
-            let vds = nm("vds", &mut id);
-            ops.push(
-                Operation::new(Some(&vds), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
-            );
-            let vdc = nm("vdc", &mut id);
-            ops.push(Operation::new(Some(&vdc), "arith.addi", &[&vds, &kvc]));
-            let vdacc = nm("vdacc", &mut id);
-            ops.push(
-                Operation::new(
-                    Some(&vdacc),
-                    "ktdp.construct_access_tile",
-                    &["%view8", "%c0", &vdc],
-                )
-                .with_attr("shape", Attr::IntList(vec![1, d])),
-            );
-            let vd = nm("vd", &mut id);
-            ops.push(Operation::new(Some(&vd), "ktdp.load", &[&vdacc]));
-            let ovd = nm("ovd", &mut id);
-            ops.push(Operation::new(
-                Some(&ovd),
-                "linalg.matmul",
-                &[&wd, &vd, &wd],
+            body.push(ops.attr(kdacc_op, AttrKey::Shape, ops.int_list(vec![1, d])));
+            let kd = leak(format!("%kd{hh}"));
+            body.push(ops.op(Some(kd), OpKind::KtdpLoad, &[kdacc]));
+            let kdt = leak(format!("%kdt{hh}"));
+            let kdt_op = ops.op(Some(kdt), OpKind::LinalgTranspose, &[kd, kd]);
+            body.push(ops.attr(kdt_op, AttrKey::Permutation, ops.int_list(vec![1, 0])));
+            let sdr = leak(format!("%sdr{hh}"));
+            body.push(ops.op(Some(sdr), OpKind::LinalgMatmul, &[q, kdt, q]));
+            let sdsp = leak(format!("%sdsp{hh}"));
+            let sdsp_ssa = ops.ssa(sdsp);
+            body.push(mk_splat(a, sdsp_ssa, scale, &[1, 1], DType::F16));
+            let sdl = leak(format!("%sdl{hh}"));
+            let sdl_ssa = ops.ssa(sdl);
+            body.push(ops.op(Some(sdl), OpKind::ArithMulf, &[sdr, sdsp]));
+            let mdi = leak(format!("%mdi{hh}"));
+            let mdi_ssa = ops.ssa(mdi);
+            body.push(mk_splat(a, mdi_ssa, ninf, &[1], DType::F16));
+            let mxd = leak(format!("%mxd{hh}"));
+            let mxd_ssa = ops.ssa(mxd);
+            body.push(mk_reduce(
+                a,
+                mxd_ssa,
+                sdl_ssa,
+                mdi_ssa,
+                OpKind::ArithMaximumf,
             ));
-            let oa = nm("oa", &mut id);
-            ops.push(Operation::new(Some(&oa), "arith.addf", &[&ov, &ovd]));
-            let oacc = nm("oacc", &mut id);
-            ops.push(
-                Operation::new(
-                    Some(&oacc),
-                    "ktdp.construct_access_tile",
-                    &["%view1", "%c0", &qc],
-                )
-                .with_attr("shape", Attr::IntList(vec![1, d])),
+
+            // combine + exp + sums.
+            let gm = leak(format!("%gm{hh}"));
+            let gm_ssa = ops.ssa(gm);
+            body.push(ops.op(Some(gm), OpKind::ArithMaximumf, &[mx, mxd]));
+            let gmb = leak(format!("%gmb{hh}"));
+            let gmb_ssa = ops.ssa(gmb);
+            body.push(mk_splat(a, gmb_ssa, gm_ssa, &[1, cap], DType::F16));
+            let sh = leak(format!("%sh{hh}"));
+            body.push(ops.op(Some(sh), OpKind::ArithSubf, &[scm, gmb]));
+            let ex = leak(format!("%ex{hh}"));
+            body.push(ops.op(Some(ex), OpKind::MathExp, &[sh]));
+            let zi = leak(format!("%zi{hh}"));
+            let zi_ssa = ops.ssa(zi);
+            body.push(mk_splat(a, zi_ssa, ninf, &[1], DType::F16));
+            let su = leak(format!("%su{hh}"));
+            let su_ssa = ops.ssa(su);
+            body.push(mk_reduce(a, su_ssa, ops.ssa(ex), zi_ssa, OpKind::ArithAddf));
+            let gmbd = leak(format!("%gmbd{hh}"));
+            let gmbd_ssa = ops.ssa(gmbd);
+            body.push(mk_splat(a, gmbd_ssa, gm_ssa, &[1, 1], DType::F16));
+            let shd = leak(format!("%shd{hh}"));
+            body.push(ops.op(Some(shd), OpKind::ArithSubf, &[sdl, gmbd]));
+            let exd = leak(format!("%exd{hh}"));
+            body.push(ops.op(Some(exd), OpKind::MathExp, &[shd]));
+            let zid = leak(format!("%zid{hh}"));
+            let zid_ssa = ops.ssa(zid);
+            body.push(mk_splat(a, zid_ssa, ninf, &[1], DType::F16));
+            let sud = leak(format!("%sud{hh}"));
+            let sud_ssa = ops.ssa(sud);
+            body.push(mk_reduce(
+                a,
+                sud_ssa,
+                ops.ssa(exd),
+                zid_ssa,
+                OpKind::ArithAddf,
+            ));
+            let gs = leak(format!("%gs{hh}"));
+            let gs_ssa = ops.ssa(gs);
+            body.push(ops.op(Some(gs), OpKind::ArithAddf, &[su, sud]));
+            let gsb = leak(format!("%gsb{hh}"));
+            let gsb_ssa = ops.ssa(gsb);
+            body.push(mk_splat(a, gsb_ssa, gs_ssa, &[1, cap], DType::F16));
+            let w = leak(format!("%w{hh}"));
+            body.push(ops.op(Some(w), OpKind::ArithDivf, &[ex, gsb]));
+            let gsbd = leak(format!("%gsbd{hh}"));
+            let gsbd_ssa = ops.ssa(gsbd);
+            body.push(mk_splat(a, gsbd_ssa, gs_ssa, &[1, 1], DType::F16));
+            let wd = leak(format!("%wd{hh}"));
+            body.push(ops.op(Some(wd), OpKind::ArithDivf, &[exd, gsbd]));
+
+            // AV.
+            let vcs = leak(format!("%vcs{hh}"));
+            let vcs_op = ops.op(Some(vcs), OpKind::ArithConstant, &[]);
+            body.push(ops.attr(vcs_op, AttrKey::Value, Attr::Int(0)));
+            let vcc = leak(format!("%vcc{hh}"));
+            body.push(ops.op(Some(vcc), OpKind::ArithAddi, &[vcs, kvc]));
+            let vcacc = leak(format!("%vcacc{hh}"));
+            let vcacc_op = ops.op(
+                Some(vcacc),
+                OpKind::KtdpConstructAccessTile,
+                &["%view7", "%c0", vcc],
             );
-            ops.push(Operation::new(None, "ktdp.store", &[&oa, &oacc]));
+            body.push(ops.attr(vcacc_op, AttrKey::Shape, ops.int_list(vec![cap, d])));
+            let vc = leak(format!("%vc{hh}"));
+            body.push(ops.op(Some(vc), OpKind::KtdpLoad, &[vcacc]));
+            let ov = leak(format!("%ov{hh}"));
+            body.push(ops.op(Some(ov), OpKind::LinalgMatmul, &[w, vc, w]));
+            let vds = leak(format!("%vds{hh}"));
+            let vds_op = ops.op(Some(vds), OpKind::ArithConstant, &[]);
+            body.push(ops.attr(vds_op, AttrKey::Value, Attr::Int(0)));
+            let vdc = leak(format!("%vdc{hh}"));
+            body.push(ops.op(Some(vdc), OpKind::ArithAddi, &[vds, kvc]));
+            let vdacc = leak(format!("%vdacc{hh}"));
+            let vdacc_op = ops.op(
+                Some(vdacc),
+                OpKind::KtdpConstructAccessTile,
+                &["%view8", "%c0", vdc],
+            );
+            body.push(ops.attr(vdacc_op, AttrKey::Shape, ops.int_list(vec![1, d])));
+            let vd = leak(format!("%vd{hh}"));
+            body.push(ops.op(Some(vd), OpKind::KtdpLoad, &[vdacc]));
+            let ovd = leak(format!("%ovd{hh}"));
+            body.push(ops.op(Some(ovd), OpKind::LinalgMatmul, &[wd, vd, wd]));
+            let oa = leak(format!("%oa{hh}"));
+            body.push(ops.op(Some(oa), OpKind::ArithAddf, &[ov, ovd]));
+            let oacc = leak(format!("%oacc{hh}"));
+            let oacc_op = ops.op(
+                Some(oacc),
+                OpKind::KtdpConstructAccessTile,
+                &["%view1", "%c0", qc],
+            );
+            body.push(ops.attr(oacc_op, AttrKey::Shape, ops.int_list(vec![1, d])));
+            body.push(ops.op(None, OpKind::KtdpStore, &[oa, oacc]));
         }
-        ops.push(Operation::new(None, "func.return", &[]));
-        IRFunction {
-            name: "decode_attn".into(),
-            arguments: vec![
-                (v("%q"), "index".into()),
-                (v("%o"), "index".into()),
-                (v("%mask"), "index".into()),
-                (v("%kc"), "index".into()),
-                (v("%kd"), "index".into()),
-                (v("%vc"), "index".into()),
-                (v("%vd"), "index".into()),
+        body.push(ops.op(None, OpKind::FuncReturn, &[]));
+        let _ = (
+            view0, view1, view2, view5, view6, view7, view8, scale, ninf, mload, c0,
+        );
+        ops.func(
+            "decode_attn",
+            &[
+                ("%q", IrType::Index),
+                ("%o", IrType::Index),
+                ("%mask", IrType::Index),
+                ("%kc", IrType::Index),
+                ("%kd", IrType::Index),
+                ("%vc", IrType::Index),
+                ("%vd", IrType::Index),
             ],
-            operations: ops,
-            grid: (1, 1, 1),
-            return_type: None,
-        }
+            body,
+            (1, 1, 1),
+        )
     }
 
     #[test]
@@ -2199,8 +2244,8 @@ mod tests {
         assert_eq!(isl.q_cols, 9 * 64);
         assert_eq!(isl.kv_cols, 3 * 64);
         assert_eq!(isl.scale, 0.125);
-        assert_eq!(isl.q_arg, "%q");
-        assert_eq!(isl.o_arg, "%o");
+        assert_eq!(isl.q_arg, f.arguments[0].0);
+        assert_eq!(isl.o_arg, f.arguments[1].0);
     }
 
     #[test]
@@ -2222,33 +2267,34 @@ mod tests {
     #[test]
     fn decode_recognizer_rejects_non_attention() {
         // A plain copy func (no QKᵀ/softmax/AV) -> None.
-        let f = IRFunction {
-            name: "copy".into(),
-            arguments: vec![
-                ("%in".into(), "index".into()),
-                ("%out".into(), "index".into()),
-            ],
-            grid: (1, 1, 1),
-            return_type: None,
-            operations: vec![
-                mk_view("%vi", "%in", &[1, 64], "f16"),
-                Operation::new(
-                    Some("%ti"),
-                    "ktdp.construct_access_tile",
-                    &["%vi", "%c0", "%c0"],
-                )
-                .with_attr("shape", Attr::IntList(vec![1, 64])),
-                Operation::new(Some("%l"), "ktdp.load", &["%ti"]),
-                mk_view("%vo", "%out", &[1, 64], "f16"),
-                Operation::new(
-                    Some("%to"),
-                    "ktdp.construct_access_tile",
-                    &["%vo", "%c0", "%c0"],
-                )
-                .with_attr("shape", Attr::IntList(vec![1, 64])),
-                Operation::new(None, "ktdp.store", &["%l", "%to"]),
-            ],
-        };
+        let mut ops = Ops::new();
+        let vi = ops.op(Some("%vi"), OpKind::KtdpConstructMemoryView, &["%in"]);
+        let vi = ops.attr(vi, AttrKey::Shape, ops.int_list(vec![1, 64]));
+        let vi = ops.attr(vi, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let ti = ops.op(
+            Some("%ti"),
+            OpKind::KtdpConstructAccessTile,
+            &["%vi", "%c0", "%c0"],
+        );
+        let ti = ops.attr(ti, AttrKey::Shape, ops.int_list(vec![1, 64]));
+        let l = ops.op(Some("%l"), OpKind::KtdpLoad, &["%ti"]);
+        let vo = ops.op(Some("%vo"), OpKind::KtdpConstructMemoryView, &["%out"]);
+        let vo = ops.attr(vo, AttrKey::Shape, ops.int_list(vec![1, 64]));
+        let vo = ops.attr(vo, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let to = ops.op(
+            Some("%to"),
+            OpKind::KtdpConstructAccessTile,
+            &["%vo", "%c0", "%c0"],
+        );
+        let to = ops.attr(to, AttrKey::Shape, ops.int_list(vec![1, 64]));
+        let store = ops.op(None, OpKind::KtdpStore, &["%l", "%to"]);
+        let body = vec![vi, ti, l, vo, to, store];
+        let f = ops.func(
+            "copy",
+            &[("%in", IrType::Index), ("%out", IrType::Index)],
+            body,
+            (1, 1, 1),
+        );
         assert!(recognize_head_attention_decode(&f).is_none());
     }
 }

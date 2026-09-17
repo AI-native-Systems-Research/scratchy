@@ -960,9 +960,10 @@ mod tests {
     use crate::dtypes::DType;
     use crate::env::{ExecutionEnv, GridExecutor};
     use crate::ir::{Attr, Operation, Scalar};
+    use crate::test_support::Ops;
     use crate::tile::Tile;
 
-    fn run(ops: &[Operation]) -> CoreContext {
+    fn run(ops: &[Operation<'static>]) -> CoreContext {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
@@ -973,14 +974,16 @@ mod tests {
 
     #[test]
     fn scalar_constant_fold_chain() {
-        let ops = vec![
-            Operation::new(Some("%a"), "arith.constant", &[]).with_attr("value", Attr::Float(2.0)),
-            Operation::new(Some("%b"), "arith.constant", &[]).with_attr("value", Attr::Float(3.0)),
-            Operation::new(Some("%c"), "arith.addf", &["%a", "%b"]),
-            Operation::new(Some("%d"), "arith.mulf", &["%c", "%a"]),
-        ];
-        let ctx = run(&ops);
-        match ctx.get_value("%d").unwrap() {
+        let mut ops = Ops::new();
+        let a = ops.op(Some("%a"), OpKind::ArithConstant, &[]);
+        let a = ops.attr(a, AttrKey::Value, Attr::Float(2.0));
+        let b = ops.op(Some("%b"), OpKind::ArithConstant, &[]);
+        let b = ops.attr(b, AttrKey::Value, Attr::Float(3.0));
+        let c = ops.op(Some("%c"), OpKind::ArithAddf, &["%a", "%b"]);
+        let d = ops.ssa("%d");
+        let dop = ops.op(Some("%d"), OpKind::ArithMulf, &["%c", "%a"]);
+        let ctx = run(&[a, b, c, dop]);
+        match ctx.get_value(d).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 10.0),
             other => panic!("expected F32(10.0), got {other:?}"),
         }
@@ -988,21 +991,23 @@ mod tests {
 
     #[test]
     fn elementwise_tile_add_tracks_lx() {
+        let mut ops = Ops::new();
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
         ctx.set_value(
-            "%x",
+            ops.ssa("%x"),
             Value::Tile(Tile::compute(vec![1.0, 2.0, 3.0], DType::F32, vec![3])),
         );
         ctx.set_value(
-            "%y",
+            ops.ssa("%y"),
             Value::Tile(Tile::compute(vec![10.0, 20.0, 30.0], DType::F32, vec![3])),
         );
-        let ops = vec![Operation::new(Some("%z"), "arith.addf", &["%x", "%y"])];
-        execute_ops(&ops, &mut ctx, &env).unwrap();
-        match ctx.get_value("%z").unwrap() {
+        let z = ops.ssa("%z");
+        let stmts = vec![ops.op(Some("%z"), OpKind::ArithAddf, &["%x", "%y"])];
+        execute_ops(&stmts, &mut ctx, &env).unwrap();
+        match ctx.get_value(z).unwrap() {
             Value::Tile(t) => assert_eq!(t.as_f32().to_vec(), vec![11.0, 22.0, 33.0]),
             other => panic!("expected tile, got {other:?}"),
         }
@@ -1012,12 +1017,14 @@ mod tests {
 
     #[test]
     fn unknown_op_errors() {
+        let mut ops = Ops::new();
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
-        let ops = vec![Operation::new(Some("%z"), "ktdp.not_yet", &[])];
-        let err = execute_ops(&ops, &mut ctx, &env).unwrap_err();
+        // KtdpNotYet is a real OpKind with deliberately no registered handler.
+        let stmts = vec![ops.op(Some("%z"), OpKind::KtdpNotYet, &[])];
+        let err = execute_ops(&stmts, &mut ctx, &env).unwrap_err();
         assert!(err.contains("no handler registered"));
     }
 }

@@ -1531,14 +1531,15 @@ fn encode(data: &[f32], dtype: DType) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
+    use crate::attrkey::AttrKey;
     use crate::dialects::Dispatch;
     use crate::env::{ExecutionEnv, GridExecutor};
     use crate::interpreter::{execute_ops, single_core_context};
     use crate::ir::Attr;
     use crate::memref::{MemRef, MemorySpace};
-    use std::rc::Rc;
+    use crate::test_support::Ops;
 
-    fn run(ops: &[Operation], ctx: &mut CoreContext) -> Result<(), String> {
+    fn run(ops: &[Operation<'static>], ctx: &mut CoreContext) -> Result<(), String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
@@ -1757,12 +1758,9 @@ mod tests {
 
     // ---- end-to-end: load -> addf -> store through the dispatch table ----
 
-    fn ident1() -> Attr {
-        Attr::AffineMap(AffineMap::identity(1))
-    }
-
     #[test]
     fn vector_add_load_addf_store_end_to_end() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
 
         // Two input vectors of length 4 in HBM, plus an output region.
@@ -1789,37 +1787,51 @@ mod tests {
         // address is base_ptr*4 (f32), so elem = stick*STICK_BYTES/4 lands the
         // view at the seeded stick.
         let elem = |stick: i64| Value::Index(stick * STICK_BYTES / 4);
-        ctx.set_value("%pa", elem(a_stick));
-        ctx.set_value("%pb", elem(b_stick));
-        ctx.set_value("%pout", elem(out_stick));
-        ctx.set_value("%i", Value::Index(0));
+        ctx.set_value(ops.ssa("%pa"), elem(a_stick));
+        ctx.set_value(ops.ssa("%pb"), elem(b_stick));
+        ctx.set_value(ops.ssa("%pout"), elem(out_stick));
+        ctx.set_value(ops.ssa("%i"), Value::Index(0));
 
-        let view = |res: &str, ptr: &str| {
-            Operation::new(Some(res), "ktdp.construct_memory_view", &[ptr])
-                .with_attr("shape", Attr::IntList(vec![n as i64]))
-                .with_attr("strides", Attr::IntList(vec![1]))
-                .with_attr("memory_space", Attr::Str("HBM".into()))
-                .with_attr("dtype", Attr::Str("f32".into()))
-        };
-        let access = |res: &str, view: &str| {
-            Operation::new(Some(res), "ktdp.construct_access_tile", &[view, "%i"])
-                .with_attr("shape", Attr::IntList(vec![n as i64]))
-                .with_attr("base_map", ident1())
-        };
+        fn view(
+            ops: &mut Ops,
+            res: &'static str,
+            ptr: &'static str,
+            n: usize,
+        ) -> Operation<'static> {
+            let op = ops.op(Some(res), OpKind::KtdpConstructMemoryView, &[ptr]);
+            let shape = ops.int_list(vec![n as i64]);
+            let op = ops.attr(op, AttrKey::Shape, shape);
+            let strides = ops.int_list(vec![1]);
+            let op = ops.attr(op, AttrKey::Strides, strides);
+            let op = ops.attr(op, AttrKey::MemorySpace, Attr::Str("HBM"));
+            ops.attr(op, AttrKey::Dtype, Attr::Dtype(DType::F32))
+        }
+        fn access(
+            ops: &mut Ops,
+            res: &'static str,
+            view: &'static str,
+            n: usize,
+        ) -> Operation<'static> {
+            let op = ops.op(Some(res), OpKind::KtdpConstructAccessTile, &[view, "%i"]);
+            let shape = ops.int_list(vec![n as i64]);
+            let op = ops.attr(op, AttrKey::Shape, shape);
+            let ident = Attr::AffineMap(ops.identity_map(1));
+            ops.attr(op, AttrKey::BaseMap, ident)
+        }
 
-        let ops = vec![
-            view("%va", "%pa"),
-            view("%vb", "%pb"),
-            view("%vout", "%pout"),
-            access("%aa", "%va"),
-            access("%ab", "%vb"),
-            access("%aout", "%vout"),
-            Operation::new(Some("%ta"), "ktdp.load", &["%aa"]),
-            Operation::new(Some("%tb"), "ktdp.load", &["%ab"]),
-            Operation::new(Some("%tc"), "arith.addf", &["%ta", "%tb"]),
-            Operation::new(None, "ktdp.store", &["%tc", "%aout"]),
+        let stmts = vec![
+            view(&mut ops, "%va", "%pa", n),
+            view(&mut ops, "%vb", "%pb", n),
+            view(&mut ops, "%vout", "%pout", n),
+            access(&mut ops, "%aa", "%va", n),
+            access(&mut ops, "%ab", "%vb", n),
+            access(&mut ops, "%aout", "%vout", n),
+            ops.op(Some("%ta"), OpKind::KtdpLoad, &["%aa"]),
+            ops.op(Some("%tb"), OpKind::KtdpLoad, &["%ab"]),
+            ops.op(Some("%tc"), OpKind::ArithAddf, &["%ta", "%tb"]),
+            ops.op(None, OpKind::KtdpStore, &["%tc", "%aout"]),
         ];
-        run(&ops, &mut ctx).unwrap();
+        run(&stmts, &mut ctx).unwrap();
 
         // The stored output region should hold the element-wise sum.
         let raw = ctx.hbm.borrow().read_bytes(out_stick * STICK_BYTES, n * 4);
@@ -1831,6 +1843,7 @@ mod tests {
 
     #[test]
     fn load_via_coordinate_set_through_handler() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         let n = 4usize;
         let stick = ctx.hbm.borrow_mut().allocate((n * 4) as i64);
@@ -1843,34 +1856,39 @@ mod tests {
             .write_bytes(stick * STICK_BYTES, &payload);
 
         // base_ptr is an element index (RFC #110): elem = stick*STICK_BYTES/4 (f32).
-        ctx.set_value("%p", Value::Index(stick * STICK_BYTES / 4));
-        ctx.set_value("%i", Value::Index(0));
+        ctx.set_value(ops.ssa("%p"), Value::Index(stick * STICK_BYTES / 4));
+        ctx.set_value(ops.ssa("%i"), Value::Index(0));
 
         // coordinate_set { d0 : d0 >= 0 } over shape [4] selects all coords in
         // order -> behaves like a full contiguous gather.
         let css = AffineSet {
             num_dims: 1,
             num_syms: 0,
-            constraints: vec![Constraint {
+            constraints: ops.arena().constraints(vec![Constraint {
                 expr: AffineExpr::Dim(0),
                 kind: ConstraintKind::GreaterEq,
-            }],
+            }]),
         };
 
-        let ops = vec![
-            Operation::new(Some("%v"), "ktdp.construct_memory_view", &["%p"])
-                .with_attr("shape", Attr::IntList(vec![n as i64]))
-                .with_attr("strides", Attr::IntList(vec![1]))
-                .with_attr("memory_space", Attr::Str("HBM".into()))
-                .with_attr("dtype", Attr::Str("f32".into())),
-            Operation::new(Some("%a"), "ktdp.construct_access_tile", &["%v", "%i"])
-                .with_attr("shape", Attr::IntList(vec![n as i64]))
-                .with_attr("base_map", ident1())
-                .with_attr("coordinate_set", Attr::AffineSet(css)),
-            Operation::new(Some("%t"), "ktdp.load", &["%a"]),
-        ];
-        run(&ops, &mut ctx).unwrap();
-        match ctx.get_value("%t").unwrap() {
+        let v = ops.op(Some("%v"), OpKind::KtdpConstructMemoryView, &["%p"]);
+        let shape = ops.int_list(vec![n as i64]);
+        let v = ops.attr(v, AttrKey::Shape, shape);
+        let strides = ops.int_list(vec![1]);
+        let v = ops.attr(v, AttrKey::Strides, strides);
+        let v = ops.attr(v, AttrKey::MemorySpace, Attr::Str("HBM"));
+        let v = ops.attr(v, AttrKey::Dtype, Attr::Dtype(DType::F32));
+
+        let a = ops.op(Some("%a"), OpKind::KtdpConstructAccessTile, &["%v", "%i"]);
+        let shape = ops.int_list(vec![n as i64]);
+        let a = ops.attr(a, AttrKey::Shape, shape);
+        let ident = Attr::AffineMap(ops.identity_map(1));
+        let a = ops.attr(a, AttrKey::BaseMap, ident);
+        let a = ops.attr(a, AttrKey::CoordinateSet, Attr::AffineSet(css));
+
+        let t = ops.ssa("%t");
+        let load = ops.op(Some("%t"), OpKind::KtdpLoad, &["%a"]);
+        run(&[v, a, load], &mut ctx).unwrap();
+        match ctx.get_value(t).unwrap() {
             Value::Tile(t) => assert_eq!(t.as_f32().to_vec(), vec![5.0, 6.0, 7.0, 8.0]),
             other => panic!("expected Tile, got {other:?}"),
         }
@@ -1878,10 +1896,11 @@ mod tests {
 
     #[test]
     fn store_rejects_non_tile_first_operand() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%x", Value::Index(3));
-        ctx.set_value("%y", Value::Index(4));
-        let op = Operation::new(None, "ktdp.store", &["%x", "%y"]);
+        ctx.set_value(ops.ssa("%x"), Value::Index(3));
+        ctx.set_value(ops.ssa("%y"), Value::Index(4));
+        let op = ops.op(None, OpKind::KtdpStore, &["%x", "%y"]);
         let err = run(&[op], &mut ctx).unwrap_err();
         assert!(err.contains("Tile"), "unexpected error: {err}");
     }
@@ -1905,49 +1924,24 @@ mod tests {
         CoordinateSet, DimSubscript, DistributedMemRef, IndirectAccessTile, ParentRef,
     };
 
-    /// Inclusive box `[lo, hi]` as an `AffineSet`: for each axis i,
-    /// `d_i - lo_i >= 0` and `hi_i - d_i >= 0`.
-    fn box_affine(lo: &[i64], hi: &[i64]) -> AffineSet {
-        let mut constraints = Vec::new();
-        for i in 0..lo.len() {
-            constraints.push(Constraint {
-                expr: AffineExpr::Sub(
-                    Rc::new(AffineExpr::Dim(i)),
-                    Rc::new(AffineExpr::Const(lo[i])),
-                ),
-                kind: ConstraintKind::GreaterEq,
-            });
-            constraints.push(Constraint {
-                expr: AffineExpr::Sub(
-                    Rc::new(AffineExpr::Const(hi[i])),
-                    Rc::new(AffineExpr::Dim(i)),
-                ),
-                kind: ConstraintKind::GreaterEq,
-            });
-        }
-        AffineSet {
-            num_dims: lo.len(),
-            num_syms: 0,
-            constraints,
-        }
-    }
-
     // ---- lower_to_box ----
 
     #[test]
     fn lower_to_box_is_inclusive() {
+        let ops = Ops::new();
         // affine [2,5] on one axis -> inclusive BoxSet lo=2 hi=5.
-        let b = lower_to_box(&box_affine(&[2], &[5])).expect("lowerable");
+        let b = lower_to_box(&ops.box_set(&[2], &[5])).expect("lowerable");
         assert_eq!(b.lo, vec![2]);
         assert_eq!(b.hi, vec![5]);
         // non-axis-aligned -> None.
+        let diag_expr = ops.add_expr(AffineExpr::Dim(0), AffineExpr::Dim(1));
         let diag = AffineSet {
             num_dims: 2,
             num_syms: 0,
-            constraints: vec![Constraint {
-                expr: AffineExpr::Add(Rc::new(AffineExpr::Dim(0)), Rc::new(AffineExpr::Dim(1))),
+            constraints: ops.arena().constraints(vec![Constraint {
+                expr: diag_expr,
                 kind: ConstraintKind::GreaterEq,
-            }],
+            }]),
         };
         assert!(lower_to_box(&diag).is_none());
     }
@@ -1956,7 +1950,7 @@ mod tests {
 
     /// Two HBM partitions of a 1-D length-8 f32 tensor: B_0 owns coords [0,3],
     /// B_1 owns [4,7]. Each partition's data lives at its own stick.
-    fn two_partition_dist(ctx: &mut CoreContext) -> (DistributedMemRef, i64, i64) {
+    fn two_partition_dist(ops: &Ops, ctx: &mut CoreContext) -> (DistributedMemRef, i64, i64) {
         let s0 = ctx.hbm.borrow_mut().allocate(4 * 4);
         let s1 = ctx.hbm.borrow_mut().allocate(4 * 4);
         // Partition 0 holds global coords 0..3 -> values 0,1,2,3.
@@ -1980,7 +1974,7 @@ mod tests {
             strides: vec![1],
             space: MemorySpace::Hbm,
             dtype: DType::F32,
-            coordinate_set: Some(box_affine(&[lo], &[hi])),
+            coordinate_set: Some(ops.box_set(&[lo], &[hi])),
         };
         let dist =
             DistributedMemRef::new(vec![mk(s0, 0, 3), mk(s1, 4, 7)], vec![8], DType::F32).unwrap();
@@ -1989,11 +1983,11 @@ mod tests {
 
     #[test]
     fn distributed_tile_access_survivors_box_fastpath() {
+        let ops = Ops::new();
         let mut ctx = single_core_context();
-        let (dist, _, _) = two_partition_dist(&mut ctx);
+        let (dist, _, _) = two_partition_dist(&ops, &mut ctx);
         // Access the full [0,8) window: x=0, access_shape=8, both partitions survive.
-        let dtr =
-            distributed_tile_access(&dist, &[8], &AffineMap::identity(1), &[0], None).unwrap();
+        let dtr = distributed_tile_access(&dist, &[8], &ops.identity_map(1), &[0], None).unwrap();
         assert_eq!(dtr.partitions.len(), 2);
         assert_eq!(dtr.global_base, Some(vec![0]));
         // Each survivor carries a Box coordinate_set and partition origin.
@@ -2010,11 +2004,11 @@ mod tests {
 
     #[test]
     fn distributed_tile_access_partial_window_drops_partition() {
+        let ops = Ops::new();
         let mut ctx = single_core_context();
-        let (dist, _, _) = two_partition_dist(&mut ctx);
+        let (dist, _, _) = two_partition_dist(&ops, &mut ctx);
         // Access window [0,3) only -> only partition 0 survives.
-        let dtr =
-            distributed_tile_access(&dist, &[3], &AffineMap::identity(1), &[0], None).unwrap();
+        let dtr = distributed_tile_access(&dist, &[3], &ops.identity_map(1), &[0], None).unwrap();
         assert_eq!(dtr.partitions.len(), 1);
         match &dtr.partitions[0].coordinate_set {
             Some(CoordinateSet::Box(b)) => {
@@ -2027,11 +2021,12 @@ mod tests {
 
     #[test]
     fn distributed_tile_access_no_coverage_errors() {
+        let ops = Ops::new();
         let mut ctx = single_core_context();
-        let (dist, _, _) = two_partition_dist(&mut ctx);
+        let (dist, _, _) = two_partition_dist(&ops, &mut ctx);
         // Window starting at global 100 covers no partition.
-        let err = distributed_tile_access(&dist, &[2], &AffineMap::identity(1), &[100], None)
-            .unwrap_err();
+        let err =
+            distributed_tile_access(&dist, &[2], &ops.identity_map(1), &[100], None).unwrap_err();
         assert!(err.contains("no partition"), "unexpected: {err}");
     }
 
@@ -2039,10 +2034,10 @@ mod tests {
 
     #[test]
     fn distributed_load_gathers_across_two_partitions() {
+        let ops = Ops::new();
         let mut ctx = single_core_context();
-        let (dist, _, _) = two_partition_dist(&mut ctx);
-        let dtr =
-            distributed_tile_access(&dist, &[8], &AffineMap::identity(1), &[0], None).unwrap();
+        let (dist, _, _) = two_partition_dist(&ops, &mut ctx);
+        let dtr = distributed_tile_access(&dist, &[8], &ops.identity_map(1), &[0], None).unwrap();
         let tile = distributed_load(&mut ctx, &dtr, Some(vec![8])).unwrap();
         // Concatenation of both partitions in global-coord order.
         assert_eq!(
@@ -2056,10 +2051,10 @@ mod tests {
 
     #[test]
     fn distributed_store_then_load_roundtrips_two_partitions() {
+        let ops = Ops::new();
         let mut ctx = single_core_context();
-        let (dist, _, _) = two_partition_dist(&mut ctx);
-        let dtr =
-            distributed_tile_access(&dist, &[8], &AffineMap::identity(1), &[0], None).unwrap();
+        let (dist, _, _) = two_partition_dist(&ops, &mut ctx);
+        let dtr = distributed_tile_access(&dist, &[8], &ops.identity_map(1), &[0], None).unwrap();
 
         // Scatter a fresh 8-vector across both partitions.
         let tile = Tile::compute(
@@ -2071,8 +2066,7 @@ mod tests {
         assert_eq!(sticks, 2); // one HBM stick per partition
 
         // Re-resolve (survivor TileRefs are consumed) and read back.
-        let dtr2 =
-            distributed_tile_access(&dist, &[8], &AffineMap::identity(1), &[0], None).unwrap();
+        let dtr2 = distributed_tile_access(&dist, &[8], &ops.identity_map(1), &[0], None).unwrap();
         let back = distributed_load(&mut ctx, &dtr2, Some(vec![8])).unwrap();
         assert_eq!(
             back.as_f32().to_vec(),
@@ -2084,22 +2078,23 @@ mod tests {
 
     #[test]
     fn distributed_load_through_access_tile_parent() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        let (dist, _, _) = two_partition_dist(&mut ctx);
-        let dtr =
-            distributed_tile_access(&dist, &[8], &AffineMap::identity(1), &[0], None).unwrap();
+        let (dist, _, _) = two_partition_dist(&ops, &mut ctx);
+        let dtr = distributed_tile_access(&dist, &[8], &ops.identity_map(1), &[0], None).unwrap();
         // Wrap the DistributedTileRef in an AccessTile and load via the handler.
         let access = AccessTile {
             parent_ref: ParentRef::Dist(dtr),
             shape: vec![8],
-            base_map: AffineMap::identity(1),
+            base_map: ops.identity_map(1),
             coordinate_set: None,
             coordinate_order: None,
         };
-        ctx.set_value("%a", Value::AccessTile(access));
-        let op = Operation::new(Some("%t"), "ktdp.load", &["%a"]);
+        ctx.set_value(ops.ssa("%a"), Value::AccessTile(access));
+        let t = ops.ssa("%t");
+        let op = ops.op(Some("%t"), OpKind::KtdpLoad, &["%a"]);
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%t").unwrap() {
+        match ctx.get_value(t).unwrap() {
             Value::Tile(t) => assert_eq!(
                 t.as_f32().to_vec(),
                 vec![0.0, 1.0, 2.0, 3.0, 40.0, 50.0, 60.0, 70.0]
@@ -2111,19 +2106,20 @@ mod tests {
     // ---- indirect gather ----
 
     /// 1-D vss over a single intermediate var (length 4), trivially satisfiable.
-    fn vss_1d() -> AffineSet {
+    fn vss_1d(ops: &Ops) -> AffineSet<'static> {
         AffineSet {
             num_dims: 1,
             num_syms: 0,
-            constraints: vec![Constraint {
+            constraints: ops.arena().constraints(vec![Constraint {
                 expr: AffineExpr::Dim(0),
                 kind: ConstraintKind::GreaterEq,
-            }],
+            }]),
         }
     }
 
     #[test]
     fn indirect_gather_reads_through_index_view() {
+        let ops = Ops::new();
         let mut ctx = single_core_context();
         // Parent X: 8 f32 values in LX at byte 0 -> 10,11,...,17.
         let x_data: Vec<u8> = (0..8)
@@ -2165,7 +2161,7 @@ mod tests {
                 idx_exprs: vec![],
             }],
             index_views: vec![idx_view],
-            variables_space_set: vss_1d(),
+            variables_space_set: vss_1d(&ops),
             variables_space_order: None,
             extra: std::collections::HashMap::new(),
         };
@@ -2179,6 +2175,7 @@ mod tests {
 
     #[test]
     fn indirect_gather_negative_index_rejected() {
+        let ops = Ops::new();
         let mut ctx = single_core_context();
         let x_data: Vec<u8> = (0..8).flat_map(|i| (i as f32).to_le_bytes()).collect();
         ctx.lx.borrow_mut().write_bytes(0, &x_data);
@@ -2214,7 +2211,7 @@ mod tests {
                 idx_exprs: vec![],
             }],
             index_views: vec![idx_view],
-            variables_space_set: vss_1d(),
+            variables_space_set: vss_1d(&ops),
             variables_space_order: None,
             extra: std::collections::HashMap::new(),
         };
@@ -2224,6 +2221,7 @@ mod tests {
 
     #[test]
     fn indirect_scatter_then_direct_load_roundtrips() {
+        let ops = Ops::new();
         let mut ctx = single_core_context();
         // Destination X: 8 f32 zeros in HBM.
         let xs = ctx.hbm.borrow_mut().allocate(8 * 4);
@@ -2264,7 +2262,7 @@ mod tests {
                 idx_exprs: vec![],
             }],
             index_views: vec![idx_view],
-            variables_space_set: vss_1d(),
+            variables_space_set: vss_1d(&ops),
             variables_space_order: None,
             extra: std::collections::HashMap::new(),
         };
@@ -2285,6 +2283,7 @@ mod tests {
 
     #[test]
     fn indirect_load_rejects_non_permutation_vso() {
+        let ops = Ops::new();
         let mut ctx = single_core_context();
         let x_view = MemRef {
             base_ptr: 0,
@@ -2295,20 +2294,18 @@ mod tests {
             coordinate_set: None,
         };
         // vso (d0) -> (2*d0) is a scaling, not a permutation.
+        let mul_expr = ops.mul(AffineExpr::Const(2), AffineExpr::Dim(0));
         let bad = AffineMap {
             num_dims: 1,
             num_syms: 0,
-            exprs: vec![AffineExpr::Mul(
-                Rc::new(AffineExpr::Const(2)),
-                Rc::new(AffineExpr::Dim(0)),
-            )],
+            exprs: ops.arena().exprs(vec![mul_expr]),
         };
         let iat = IndirectAccessTile {
             parent_ref: x_view,
             shape: vec![4],
             dim_subscripts: vec![DimSubscript::Direct { var_index: 0 }],
             index_views: vec![],
-            variables_space_set: vss_1d(),
+            variables_space_set: vss_1d(&ops),
             variables_space_order: Some(bad),
             extra: std::collections::HashMap::new(),
         };

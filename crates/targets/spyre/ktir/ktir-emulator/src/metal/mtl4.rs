@@ -35,6 +35,23 @@ pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
 
+/// Whether `device` can actually mint an MTL4 command queue — a real
+/// capability probe, not string-matching a `dispatch`/`Batch::begin` error
+/// after the fact. `newMTL4CommandQueue()` returns `None` on some hosted CI
+/// runners even though `MTLCreateSystemDefaultDevice` succeeds (a real GPU,
+/// but the virtualized/shared device rejects MTL4 queues) — callers that
+/// need to skip in that environment should check this BEFORE dispatching,
+/// not classify the error string a failed dispatch produced.
+///
+/// `#[cfg(test)]`: currently only the test suite's skip-guards need this: the
+/// crate's own dispatch/`Batch::begin` paths propagate a real `Err` on
+/// failure to mint a queue instead of pre-checking, since a queue that stops
+/// working mid-run there is a real bug to surface, not a skip condition.
+#[cfg(test)]
+pub(crate) fn mtl4_available(device: &Device) -> bool {
+    device.newMTL4CommandQueue().is_some()
+}
+
 /// One kernel argument: a buffer already on the device, or scalar bytes that
 /// [`dispatch`] turns into a tiny address-bound `StorageModeShared` buffer —
 /// MTL4 has no `setBytes`, every binding is an address.

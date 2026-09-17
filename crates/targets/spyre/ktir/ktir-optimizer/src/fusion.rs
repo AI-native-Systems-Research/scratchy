@@ -1209,91 +1209,95 @@ fn emit_ops<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir_builder::Ops;
+    use ktir_core::attrkey::AttrKey;
+    use ktir_core::dtypes::DType;
     use ktir_core::ir::Attr;
 
-    /// Build a node function: load whole tensor from `in_arg`, "compute"
-    /// (identity copy via op `%out = <op> %loaded`), store whole to `out_arg`.
-    /// `whole` toggles whether the access-tile shape matches the view (full) or
-    /// is a sub-tile (forces the HBM fallback).
-    fn copy_node(name: &str, in_arg: &str, out_arg: &str, shape: i64, whole: bool) -> IRFunction {
+    /// Build a node function: load whole tensor from `%in`, "compute" (identity
+    /// copy via `math.exp`), store whole to `%out`. `whole` toggles whether the
+    /// access-tile shape matches the view (full) or is a sub-tile (forces the
+    /// HBM fallback). Returns `(func, in_ssa, out_ssa)` so callers can build
+    /// [`Binding`]s against this function's own argument identities.
+    fn copy_node(name: &str, shape: i64, whole: bool) -> (IRFunction<'static>, Ssa, Ssa) {
         let tile_shape = if whole { shape } else { shape / 2 };
-        let mk_view = |res: &str, arg: &str| {
-            Operation::new(Some(res), "ktdp.construct_memory_view", &[arg])
-                .with_attr("shape", Attr::IntList(vec![shape]))
-                .with_attr("strides", Attr::IntList(vec![1]))
-                .with_attr("memory_space", Attr::Str("HBM".into()))
-                .with_attr("dtype", Attr::Str("f16".into()))
+        let mut ops = Ops::new();
+        let mk_view = |ops: &mut Ops, res: &'static str, arg: &'static str| {
+            let o = ops.op(Some(res), OpKind::KtdpConstructMemoryView, &[arg]);
+            let o = ops.attr(o, AttrKey::Shape, ops.int_list(vec![shape]));
+            let o = ops.attr(o, AttrKey::Strides, ops.int_list(vec![1]));
+            let o = ops.attr(o, AttrKey::MemorySpace, Attr::Str("HBM"));
+            ops.attr(o, AttrKey::Dtype, Attr::Dtype(DType::F16))
         };
-        let mk_tile = |res: &str, view: &str| {
-            Operation::new(Some(res), "ktdp.construct_access_tile", &[view])
-                .with_attr("shape", Attr::IntList(vec![tile_shape]))
+        let mk_tile = |ops: &mut Ops, res: &'static str, view: &'static str| {
+            let o = ops.op(Some(res), OpKind::KtdpConstructAccessTile, &[view]);
+            ops.attr(o, AttrKey::Shape, ops.int_list(vec![tile_shape]))
         };
-        IRFunction {
-            name: name.to_string(),
-            arguments: vec![
-                (in_arg.to_string(), "index".into()),
-                (out_arg.to_string(), "index".into()),
-            ],
-            grid: (1, 1, 1),
-            return_type: None,
-            operations: vec![
-                mk_view("%vin", in_arg),
-                mk_tile("%tin", "%vin"),
-                Operation::new(Some("%loaded"), "ktdp.load", &["%tin"]),
-                Operation::new(Some("%y"), "math.exp", &["%loaded"]),
-                mk_view("%vout", out_arg),
-                mk_tile("%tout", "%vout"),
-                Operation::new(None, "ktdp.store", &["%y", "%tout"]),
-                Operation::new(None, "func.return", &[]),
-            ],
-        }
+        let body = vec![
+            mk_view(&mut ops, "%vin", "%in"),
+            mk_tile(&mut ops, "%tin", "%vin"),
+            ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]),
+            ops.op(Some("%y"), OpKind::MathExp, &["%loaded"]),
+            mk_view(&mut ops, "%vout", "%out"),
+            mk_tile(&mut ops, "%tout", "%vout"),
+            ops.op(None, OpKind::KtdpStore, &["%y", "%tout"]),
+            ops.op(None, OpKind::FuncReturn, &[]),
+        ];
+        let in_ssa = ops.ssa("%in");
+        let out_ssa = ops.ssa("%out");
+        let func = ops.func(
+            name,
+            &[("%in", IrType::Index), ("%out", IrType::Index)],
+            body,
+            (1, 1, 1),
+        );
+        (func, in_ssa, out_ssa)
     }
 
-    /// Consumer that reads a contiguous sub-tile of `in_arg` at a dynamic offset
+    /// Consumer that reads a contiguous sub-tile of `%in` at a dynamic offset
     /// (`construct_access_tile %vin[%c0]`, identity base_map) — the tiled edge
-    /// increment 2 forwards via `tensor.extract_slice`. Produces a `tile`-sized
-    /// result stored whole to `out_arg`.
-    fn tiled_consumer(
-        name: &str,
-        in_arg: &str,
-        out_arg: &str,
-        shape: i64,
-        tile: i64,
-    ) -> IRFunction {
-        IRFunction {
-            name: name.to_string(),
-            arguments: vec![
-                (in_arg.to_string(), "index".into()),
-                (out_arg.to_string(), "index".into()),
-            ],
-            grid: (1, 1, 1),
-            return_type: None,
-            operations: vec![
-                Operation::new(Some("%c0"), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
-                Operation::new(Some("%vin"), "ktdp.construct_memory_view", &[in_arg])
-                    .with_attr("shape", Attr::IntList(vec![shape]))
-                    .with_attr("strides", Attr::IntList(vec![1]))
-                    .with_attr("memory_space", Attr::Str("HBM".into()))
-                    .with_attr("dtype", Attr::Str("f16".into())),
-                // access tile at offset %c0, size `tile` (a sub-tile of the view).
-                Operation::new(Some("%tin"), "ktdp.construct_access_tile", &["%vin", "%c0"])
-                    .with_attr("shape", Attr::IntList(vec![tile])),
-                Operation::new(Some("%loaded"), "ktdp.load", &["%tin"]),
-                Operation::new(Some("%y"), "math.exp", &["%loaded"]),
-                Operation::new(Some("%vout"), "ktdp.construct_memory_view", &[out_arg])
-                    .with_attr("shape", Attr::IntList(vec![tile]))
-                    .with_attr("strides", Attr::IntList(vec![1]))
-                    .with_attr("memory_space", Attr::Str("HBM".into()))
-                    .with_attr("dtype", Attr::Str("f16".into())),
-                Operation::new(Some("%tout"), "ktdp.construct_access_tile", &["%vout"])
-                    .with_attr("shape", Attr::IntList(vec![tile])),
-                Operation::new(None, "ktdp.store", &["%y", "%tout"]),
-                Operation::new(None, "func.return", &[]),
-            ],
-        }
+    /// forwards via `tensor.extract_slice`. Produces a `tile`-sized result
+    /// stored whole to `%out`.
+    fn tiled_consumer(name: &str, shape: i64, tile: i64) -> (IRFunction<'static>, Ssa, Ssa) {
+        let mut ops = Ops::new();
+        let c0 = ops.op(Some("%c0"), OpKind::ArithConstant, &[]);
+        let c0 = ops.attr(c0, AttrKey::Value, Attr::Int(0));
+        let vin = ops.op(Some("%vin"), OpKind::KtdpConstructMemoryView, &["%in"]);
+        let vin = ops.attr(vin, AttrKey::Shape, ops.int_list(vec![shape]));
+        let vin = ops.attr(vin, AttrKey::Strides, ops.int_list(vec![1]));
+        let vin = ops.attr(vin, AttrKey::MemorySpace, Attr::Str("HBM"));
+        let vin = ops.attr(vin, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        // access tile at offset %c0, size `tile` (a sub-tile of the view).
+        let tin = ops.op(
+            Some("%tin"),
+            OpKind::KtdpConstructAccessTile,
+            &["%vin", "%c0"],
+        );
+        let tin = ops.attr(tin, AttrKey::Shape, ops.int_list(vec![tile]));
+        let loaded = ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]);
+        let y = ops.op(Some("%y"), OpKind::MathExp, &["%loaded"]);
+        let vout = ops.op(Some("%vout"), OpKind::KtdpConstructMemoryView, &["%out"]);
+        let vout = ops.attr(vout, AttrKey::Shape, ops.int_list(vec![tile]));
+        let vout = ops.attr(vout, AttrKey::Strides, ops.int_list(vec![1]));
+        let vout = ops.attr(vout, AttrKey::MemorySpace, Attr::Str("HBM"));
+        let vout = ops.attr(vout, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let tout = ops.op(Some("%tout"), OpKind::KtdpConstructAccessTile, &["%vout"]);
+        let tout = ops.attr(tout, AttrKey::Shape, ops.int_list(vec![tile]));
+        let store = ops.op(None, OpKind::KtdpStore, &["%y", "%tout"]);
+        let ret = ops.op(None, OpKind::FuncReturn, &[]);
+        let body = vec![c0, vin, tin, loaded, y, vout, tout, store, ret];
+        let in_ssa = ops.ssa("%in");
+        let out_ssa = ops.ssa("%out");
+        let func = ops.func(
+            name,
+            &[("%in", IrType::Index), ("%out", IrType::Index)],
+            body,
+            (1, 1, 1),
+        );
+        (func, in_ssa, out_ssa)
     }
 
-    fn module(funcs: Vec<IRFunction>) -> IRModule {
+    fn module(funcs: Vec<IRFunction<'static>>) -> IRModule<'static> {
         let mut m = IRModule::default();
         for f in funcs {
             m.add_function(f);
@@ -1302,19 +1306,19 @@ mod tests {
     }
 
     /// a: src(1) -> t(2);  b: t(2) -> result(3).  t is a whole-tensor edge.
-    fn two_node_spec() -> ProgramSpec {
+    fn two_node_spec(a_in: Ssa, a_out: Ssa, b_in: Ssa, b_out: Ssa) -> ProgramSpec {
         ProgramSpec {
             nodes: vec![
                 NodeSpec {
                     func: "a".into(),
                     bindings: vec![
                         Binding {
-                            arg: "%in".into(),
+                            arg: a_in,
                             tensor: 1,
                             is_output: false,
                         },
                         Binding {
-                            arg: "%out".into(),
+                            arg: a_out,
                             tensor: 2,
                             is_output: true,
                         },
@@ -1324,12 +1328,12 @@ mod tests {
                     func: "b".into(),
                     bindings: vec![
                         Binding {
-                            arg: "%in".into(),
+                            arg: b_in,
                             tensor: 2,
                             is_output: false,
                         },
                         Binding {
-                            arg: "%out".into(),
+                            arg: b_out,
                             tensor: 3,
                             is_output: true,
                         },
@@ -1341,45 +1345,47 @@ mod tests {
         }
     }
 
+    /// The two `math.exp` ops in a fused function, in program order.
+    fn exp_ops<'a>(fused: &'a IRFunction<'a>) -> Vec<&'a Operation<'a>> {
+        fused
+            .operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::MathExp)
+            .collect()
+    }
+
     #[test]
     fn whole_tensor_edge_is_forwarded_no_hbm() {
-        let m = module(vec![
-            copy_node("a", "%in", "%out", 16, true),
-            copy_node("b", "%in", "%out", 16, true),
-        ]);
-        let fused = fuse_program(&m, &two_node_spec()).unwrap();
+        let (fa, a_in, a_out) = copy_node("a", 16, true);
+        let (fb, b_in, b_out) = copy_node("b", 16, true);
+        let m = module(vec![fa, fb]);
+        let spec = two_node_spec(a_in, a_out, b_in, b_out);
+        let (fused, arg_tensors) = fuse_program(Arena::global(), &m, &spec).unwrap();
 
         // The intermediate t2's store AND load are gone: no HBM round-trip.
         let loads = fused
             .operations
             .iter()
-            .filter(|o| o.op_type == "ktdp.load")
+            .filter(|o| o.op_type == OpKind::KtdpLoad)
             .count();
         let stores = fused
             .operations
             .iter()
-            .filter(|o| o.op_type == "ktdp.store")
+            .filter(|o| o.op_type == OpKind::KtdpStore)
             .count();
         assert_eq!(loads, 1, "only the source load survives");
         assert_eq!(stores, 1, "only the result store survives");
 
         // The fused function only needs the source (t1) + result (t3) pointers.
-        let arg_names: Vec<&str> = fused.arguments.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(
-            arg_names,
-            vec!["%t1_ptr", "%t3_ptr"],
-            "no pointer for intermediate t2"
-        );
+        let arg_tensor_ids: Vec<u64> = arg_tensors.iter().map(|&(_, t)| t).collect();
+        assert_eq!(arg_tensor_ids, vec![1, 3], "no pointer for intermediate t2");
 
         // b's exp consumes a's exp result directly (SSA forwarded).
-        let b_exp = fused
-            .operations
-            .iter()
-            .find(|o| o.op_type == "math.exp" && o.result.as_deref() == Some("%n1_y"))
-            .expect("b's exp present");
+        let exps = exp_ops(&fused);
+        assert_eq!(exps.len(), 2, "both node exps present");
         assert_eq!(
-            b_exp.operands,
-            vec!["%n0_y"],
+            exps[1].operands,
+            &[exps[0].result.unwrap()],
             "b's exp reads a's stored SSA value"
         );
     }
@@ -1388,25 +1394,25 @@ mod tests {
     fn unsliceable_tiled_edge_falls_back_to_hbm() {
         // b reads a sub-tile with NO index operands (offsets empty) — not a
         // contiguous extract_slice we can place, so it stays an HBM round-trip.
-        let m = module(vec![
-            copy_node("a", "%in", "%out", 16, true),
-            copy_node("b", "%in", "%out", 16, false),
-        ]);
-        let fused = fuse_program(&m, &two_node_spec()).unwrap();
+        let (fa, a_in, a_out) = copy_node("a", 16, true);
+        let (fb, b_in, b_out) = copy_node("b", 16, false);
+        let m = module(vec![fa, fb]);
+        let spec = two_node_spec(a_in, a_out, b_in, b_out);
+        let (fused, arg_tensors) = fuse_program(Arena::global(), &m, &spec).unwrap();
         let loads = fused
             .operations
             .iter()
-            .filter(|o| o.op_type == "ktdp.load")
+            .filter(|o| o.op_type == OpKind::KtdpLoad)
             .count();
         let stores = fused
             .operations
             .iter()
-            .filter(|o| o.op_type == "ktdp.store")
+            .filter(|o| o.op_type == OpKind::KtdpStore)
             .count();
         let slices = fused
             .operations
             .iter()
-            .filter(|o| o.op_type == "tensor.extract_slice")
+            .filter(|o| o.op_type == OpKind::TensorExtractSlice)
             .count();
         // a still stores t2, b still loads it (resident HBM within the fused fn).
         assert_eq!(loads, 2, "source + tiled intermediate load both kept");
@@ -1416,10 +1422,9 @@ mod tests {
             "no extract_slice emitted for the unsliceable edge"
         );
         // The intermediate pointer is still a fused-function arg.
-        let arg_names: Vec<&str> = fused.arguments.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
-            arg_names.contains(&"%t2_ptr"),
-            "intermediate kept as HBM arg: {arg_names:?}"
+            arg_tensors.iter().any(|&(_, t)| t == 2),
+            "intermediate kept as HBM arg: {arg_tensors:?}"
         );
     }
 
@@ -1428,66 +1433,58 @@ mod tests {
         // a writes t2 whole; b reads a contiguous sub-tile of t2 at offset %c0.
         // The edge forwards: a's store and b's load are gone, replaced by a
         // tensor.extract_slice of a's resident SSA value — no HBM round-trip.
-        let m = module(vec![
-            copy_node("a", "%in", "%out", 16, true),
-            tiled_consumer("b", "%in", "%out", 16, 8),
-        ]);
-        let fused = fuse_program(&m, &two_node_spec()).unwrap();
+        let (fa, a_in, a_out) = copy_node("a", 16, true);
+        let (fb, b_in, b_out) = tiled_consumer("b", 16, 8);
+        let m = module(vec![fa, fb]);
+        let spec = two_node_spec(a_in, a_out, b_in, b_out);
+        let (fused, arg_tensors) = fuse_program(Arena::global(), &m, &spec).unwrap();
 
         // Only the source load (a) and the result store (b) survive.
         let loads = fused
             .operations
             .iter()
-            .filter(|o| o.op_type == "ktdp.load")
+            .filter(|o| o.op_type == OpKind::KtdpLoad)
             .count();
         let stores = fused
             .operations
             .iter()
-            .filter(|o| o.op_type == "ktdp.store")
+            .filter(|o| o.op_type == OpKind::KtdpStore)
             .count();
         assert_eq!(loads, 1, "intermediate load replaced by extract_slice");
         assert_eq!(stores, 1, "intermediate store dropped (producer resident)");
 
-        // The extract_slice reads a's stored value at the tile offset/size.
+        // The extract_slice reads a's stored (exp) value at the tile offset/size.
+        let exps = exp_ops(&fused);
+        assert_eq!(exps.len(), 2, "both node exps present");
         let slice = fused
             .operations
             .iter()
-            .find(|o| o.op_type == "tensor.extract_slice")
+            .find(|o| o.op_type == OpKind::TensorExtractSlice)
             .expect("extract_slice emitted for the tiled edge");
         assert_eq!(
             slice.operands,
-            vec!["%n0_y"],
+            &[exps[0].result.unwrap()],
             "slices a's resident producer SSA"
         );
-        assert_eq!(slice.result.as_deref(), Some("%n1_loaded"));
-        assert_eq!(
-            slice.attributes.get("slice_offsets"),
-            Some(&Attr::StrList(vec!["%n1_c0".into()])),
-            "offset is b's renamed index operand"
+        assert!(
+            matches!(slice.attr(AttrKey::SliceOffsets), Some(Attr::Ssas(o)) if o.len() == 1),
+            "offset is a single dynamic SSA"
         );
+        assert_eq!(slice.attr(AttrKey::SliceSizes), Some(&Attr::IntList(&[8])));
         assert_eq!(
-            slice.attributes.get("slice_sizes"),
-            Some(&Attr::StrList(vec!["8".into()]))
-        );
-        assert_eq!(
-            slice.attributes.get("slice_strides"),
-            Some(&Attr::StrList(vec!["1".into()]))
+            slice.attr(AttrKey::SliceStrides),
+            Some(&Attr::IntList(&[1]))
         );
 
         // b's exp consumes the slice (downstream SSA lines up).
-        let b_exp = fused
-            .operations
-            .iter()
-            .find(|o| o.op_type == "math.exp" && o.result.as_deref() == Some("%n1_y"))
-            .expect("b's exp present");
-        assert_eq!(b_exp.operands, vec!["%n1_loaded"]);
+        assert_eq!(exps[1].operands, &[slice.result.unwrap()]);
 
         // No HBM pointer for the forwarded intermediate t2.
-        let arg_names: Vec<&str> = fused.arguments.iter().map(|(n, _)| n.as_str()).collect();
+        let arg_tensor_ids: Vec<u64> = arg_tensors.iter().map(|&(_, t)| t).collect();
         assert_eq!(
-            arg_names,
-            vec!["%t1_ptr", "%t3_ptr"],
-            "no t2 pointer: {arg_names:?}"
+            arg_tensor_ids,
+            vec![1, 3],
+            "no t2 pointer: {arg_tensor_ids:?}"
         );
     }
 
@@ -1495,18 +1492,17 @@ mod tests {
     fn ssa_renaming_avoids_collisions() {
         // Both nodes use identical internal SSA names (%loaded, %y); after fusion
         // they must be distinct (prefixed).
-        let m = module(vec![
-            copy_node("a", "%in", "%out", 16, true),
-            copy_node("b", "%in", "%out", 16, true),
-        ]);
-        let fused = fuse_program(&m, &two_node_spec()).unwrap();
-        let exps: Vec<&str> = fused
-            .operations
-            .iter()
-            .filter(|o| o.op_type == "math.exp")
-            .filter_map(|o| o.result.as_deref())
-            .collect();
-        assert_eq!(exps, vec!["%n0_y", "%n1_y"], "node-prefixed, no collision");
+        let (fa, a_in, a_out) = copy_node("a", 16, true);
+        let (fb, b_in, b_out) = copy_node("b", 16, true);
+        let m = module(vec![fa, fb]);
+        let spec = two_node_spec(a_in, a_out, b_in, b_out);
+        let (fused, _) = fuse_program(Arena::global(), &m, &spec).unwrap();
+        let exps = exp_ops(&fused);
+        assert_eq!(exps.len(), 2);
+        assert_ne!(
+            exps[0].result, exps[1].result,
+            "node-prefixed, no collision"
+        );
     }
 
     // --- partial fusion: segment plan keeps attention nodes native ----------
@@ -1516,86 +1512,112 @@ mod tests {
     /// arith.maximumf }`). Reads `in_arg`, writes `out_arg`. Mirrors the model's
     /// `get_compute_tile_id` head select; the body is just enough to trip the
     /// detector.
-    fn attn_node(name: &str, in_arg: &str, out_arg: &str, heads: usize) -> IRFunction {
-        IRFunction {
-            name: name.to_string(),
-            arguments: vec![
-                (in_arg.to_string(), "index".into()),
-                (out_arg.to_string(), "index".into()),
-            ],
-            grid: (heads, 1, 1),
-            return_type: None,
-            operations: vec![
-                Operation::new(Some("%hpid"), "ktdp.get_compute_tile_id", &[]),
-                Operation::new(Some("%vin"), "ktdp.construct_memory_view", &[in_arg])
-                    .with_attr("shape", Attr::IntList(vec![16]))
-                    .with_attr("dtype", Attr::Str("f16".into())),
-                Operation::new(Some("%tin"), "ktdp.construct_access_tile", &["%vin"])
-                    .with_attr("shape", Attr::IntList(vec![16])),
-                Operation::new(Some("%loaded"), "ktdp.load", &["%tin"]),
-                Operation::new(Some("%kt"), "linalg.transpose", &["%loaded"]),
-                Operation::new(Some("%mx"), "linalg.reduce", &["%kt"])
-                    .with_attr("reduce_fn", Attr::Str("arith.maximumf".into())),
-                Operation::new(Some("%vout"), "ktdp.construct_memory_view", &[out_arg])
-                    .with_attr("shape", Attr::IntList(vec![16]))
-                    .with_attr("dtype", Attr::Str("f16".into())),
-                Operation::new(Some("%tout"), "ktdp.construct_access_tile", &["%vout"])
-                    .with_attr("shape", Attr::IntList(vec![16])),
-                Operation::new(None, "ktdp.store", &["%mx", "%tout"]),
-                Operation::new(None, "func.return", &[]),
-            ],
-        }
+    fn attn_node(name: &str, heads: usize) -> (IRFunction<'static>, Ssa, Ssa) {
+        let mut ops = Ops::new();
+        let hpid = ops.op(Some("%hpid"), OpKind::KtdpGetComputeTileId, &[]);
+        let vin = ops.op(Some("%vin"), OpKind::KtdpConstructMemoryView, &["%in"]);
+        let vin = ops.attr(vin, AttrKey::Shape, ops.int_list(vec![16]));
+        let vin = ops.attr(vin, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let tin = ops.op(Some("%tin"), OpKind::KtdpConstructAccessTile, &["%vin"]);
+        let tin = ops.attr(tin, AttrKey::Shape, ops.int_list(vec![16]));
+        let loaded = ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]);
+        let kt = ops.op(Some("%kt"), OpKind::LinalgTranspose, &["%loaded"]);
+        let mx = ops.op(Some("%mx"), OpKind::LinalgReduce, &["%kt"]);
+        let mx = ops.attr(mx, AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaximumf));
+        let vout = ops.op(Some("%vout"), OpKind::KtdpConstructMemoryView, &["%out"]);
+        let vout = ops.attr(vout, AttrKey::Shape, ops.int_list(vec![16]));
+        let vout = ops.attr(vout, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let tout = ops.op(Some("%tout"), OpKind::KtdpConstructAccessTile, &["%vout"]);
+        let tout = ops.attr(tout, AttrKey::Shape, ops.int_list(vec![16]));
+        let store = ops.op(None, OpKind::KtdpStore, &["%mx", "%tout"]);
+        let ret = ops.op(None, OpKind::FuncReturn, &[]);
+        let body = vec![hpid, vin, tin, loaded, kt, mx, vout, tout, store, ret];
+        let in_ssa = ops.ssa("%in");
+        let out_ssa = ops.ssa("%out");
+        let func = ops.func(
+            name,
+            &[("%in", IrType::Index), ("%out", IrType::Index)],
+            body,
+            (heads, 1, 1),
+        );
+        (func, in_ssa, out_ssa)
     }
 
     /// A token-parallel matmul node: a multi-core grid but NO transpose/softmax —
     /// the GPU GEMM reconstruction runs it correctly at grid [1,1], so it must
     /// NOT be treated as attention.
-    fn matmul_node(name: &str, in_arg: &str, out_arg: &str, cores: usize) -> IRFunction {
-        let mut f = copy_node(name, in_arg, out_arg, 16, true);
-        f.grid = (cores, 1, 1);
-        f.operations.insert(
-            0,
-            Operation::new(Some("%pid"), "ktdp.get_compute_tile_id", &[]),
+    fn matmul_node(name: &str, cores: usize) -> (IRFunction<'static>, Ssa, Ssa) {
+        let mut ops = Ops::new();
+        let pid = ops.op(Some("%pid"), OpKind::KtdpGetComputeTileId, &[]);
+        let vin = ops.op(Some("%vin"), OpKind::KtdpConstructMemoryView, &["%in"]);
+        let vin = ops.attr(vin, AttrKey::Shape, ops.int_list(vec![16]));
+        let vin = ops.attr(vin, AttrKey::Strides, ops.int_list(vec![1]));
+        let vin = ops.attr(vin, AttrKey::MemorySpace, Attr::Str("HBM"));
+        let vin = ops.attr(vin, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let tin = ops.op(Some("%tin"), OpKind::KtdpConstructAccessTile, &["%vin"]);
+        let tin = ops.attr(tin, AttrKey::Shape, ops.int_list(vec![16]));
+        let loaded = ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]);
+        // A linalg.matmul-shaped op — no transpose/softmax, so NOT attention.
+        let y = ops.op(Some("%y"), OpKind::LinalgMatmul, &["%loaded"]);
+        let vout = ops.op(Some("%vout"), OpKind::KtdpConstructMemoryView, &["%out"]);
+        let vout = ops.attr(vout, AttrKey::Shape, ops.int_list(vec![16]));
+        let vout = ops.attr(vout, AttrKey::Strides, ops.int_list(vec![1]));
+        let vout = ops.attr(vout, AttrKey::MemorySpace, Attr::Str("HBM"));
+        let vout = ops.attr(vout, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let tout = ops.op(Some("%tout"), OpKind::KtdpConstructAccessTile, &["%vout"]);
+        let tout = ops.attr(tout, AttrKey::Shape, ops.int_list(vec![16]));
+        let store = ops.op(None, OpKind::KtdpStore, &["%y", "%tout"]);
+        let ret = ops.op(None, OpKind::FuncReturn, &[]);
+        let body = vec![pid, vin, tin, loaded, y, vout, tout, store, ret];
+        let in_ssa = ops.ssa("%in");
+        let out_ssa = ops.ssa("%out");
+        let func = ops.func(
+            name,
+            &[("%in", IrType::Index), ("%out", IrType::Index)],
+            body,
+            (cores, 1, 1),
         );
-        // Replace the math.exp with a linalg.matmul-shaped op (no softmax).
-        for op in &mut f.operations {
-            if op.op_type == "math.exp" {
-                op.op_type = "linalg.matmul".to_string();
-            }
-        }
-        f
+        (func, in_ssa, out_ssa)
     }
 
     #[test]
     fn detects_head_parallel_attention_node() {
         // Multi-head grid + transpose + softmax reduce = attention.
-        assert!(is_attention_node(&attn_node("a", "%in", "%out", 9)));
+        assert!(is_attention_node(&attn_node("a", 9).0));
         // Multi-core matmul (no transpose/softmax) = NOT attention.
-        assert!(!is_attention_node(&matmul_node("m", "%in", "%out", 8)));
+        assert!(!is_attention_node(&matmul_node("m", 8).0));
         // Plain elementwise copy at grid [1,1] = NOT attention.
-        assert!(!is_attention_node(&copy_node("c", "%in", "%out", 16, true)));
+        assert!(!is_attention_node(&copy_node("c", 16, true).0));
         // Even WITH the attention op signature, a [1,1] grid (decode attention,
         // single token) stays fused — grid clause gates it out.
-        let mut decode_attn = attn_node("d", "%in", "%out", 1);
+        let mut decode_attn = attn_node("d", 1).0;
         decode_attn.grid = (1, 1, 1);
         assert!(!is_attention_node(&decode_attn));
     }
 
     /// Program: src(1) -[copy a]-> t(2) -[attn b]-> t(3) -[copy c]-> result(4).
     /// The attention node sits between two non-attention nodes.
-    fn three_node_attn_spec() -> ProgramSpec {
+    #[allow(clippy::too_many_arguments)]
+    fn three_node_attn_spec(
+        a_in: Ssa,
+        a_out: Ssa,
+        b_in: Ssa,
+        b_out: Ssa,
+        c_in: Ssa,
+        c_out: Ssa,
+    ) -> ProgramSpec {
         ProgramSpec {
             nodes: vec![
                 NodeSpec {
                     func: "a".into(),
                     bindings: vec![
                         Binding {
-                            arg: "%in".into(),
+                            arg: a_in,
                             tensor: 1,
                             is_output: false,
                         },
                         Binding {
-                            arg: "%out".into(),
+                            arg: a_out,
                             tensor: 2,
                             is_output: true,
                         },
@@ -1605,12 +1627,12 @@ mod tests {
                     func: "b".into(),
                     bindings: vec![
                         Binding {
-                            arg: "%in".into(),
+                            arg: b_in,
                             tensor: 2,
                             is_output: false,
                         },
                         Binding {
-                            arg: "%out".into(),
+                            arg: b_out,
                             tensor: 3,
                             is_output: true,
                         },
@@ -1620,12 +1642,12 @@ mod tests {
                     func: "c".into(),
                     bindings: vec![
                         Binding {
-                            arg: "%in".into(),
+                            arg: c_in,
                             tensor: 3,
                             is_output: false,
                         },
                         Binding {
-                            arg: "%out".into(),
+                            arg: c_out,
                             tensor: 4,
                             is_output: true,
                         },
@@ -1639,12 +1661,12 @@ mod tests {
 
     #[test]
     fn plan_isolates_attention_into_native_segment() {
-        let m = module(vec![
-            copy_node("a", "%in", "%out", 16, true),
-            attn_node("b", "%in", "%out", 9),
-            copy_node("c", "%in", "%out", 16, true),
-        ]);
-        let segs = plan_segments(&m, &three_node_attn_spec()).unwrap();
+        let (fa, a_in, a_out) = copy_node("a", 16, true);
+        let (fb, b_in, b_out) = attn_node("b", 9);
+        let (fc, c_in, c_out) = copy_node("c", 16, true);
+        let m = module(vec![fa, fb, fc]);
+        let spec = three_node_attn_spec(a_in, a_out, b_in, b_out, c_in, c_out);
+        let segs = plan_segments(Arena::global(), &m, &spec).unwrap();
         // Three segments: [fused a], [native b], [fused c].
         assert_eq!(
             segs.len(),
@@ -1663,15 +1685,10 @@ mod tests {
         let Segment::Fused(seg_a) = &segs[0] else {
             unreachable!()
         };
-        let a_args: Vec<&str> = seg_a
-            .func
-            .arguments
-            .iter()
-            .map(|(n, _)| n.as_str())
-            .collect();
         assert!(
-            a_args.contains(&"%t2_ptr"),
-            "t2 stays HBM out of segment a: {a_args:?}"
+            seg_a.args.iter().any(|&(_, t)| t == 2),
+            "t2 stays HBM out of segment a: {:?}",
+            seg_a.args
         );
         // t2 is a's boundary OUTPUT (consumed by the native attn node).
         assert!(
@@ -1685,15 +1702,10 @@ mod tests {
         let Segment::Fused(seg_c) = &segs[2] else {
             unreachable!()
         };
-        let c_args: Vec<&str> = seg_c
-            .func
-            .arguments
-            .iter()
-            .map(|(n, _)| n.as_str())
-            .collect();
         assert!(
-            c_args.contains(&"%t3_ptr"),
-            "t3 stays HBM into segment c: {c_args:?}"
+            seg_c.args.iter().any(|&(_, t)| t == 3),
+            "t3 stays HBM into segment c: {:?}",
+            seg_c.args
         );
         // t3 is c's boundary INPUT (produced by the native attn node); t4 output.
         assert!(
@@ -1716,12 +1728,12 @@ mod tests {
     fn consecutive_non_attention_nodes_fuse_into_one_segment() {
         // a -> b -> c all non-attention: a single fused segment, with the
         // intermediate edges forwarded as SSA (no t2/t3 HBM pointers).
-        let m = module(vec![
-            copy_node("a", "%in", "%out", 16, true),
-            copy_node("b", "%in", "%out", 16, true),
-            copy_node("c", "%in", "%out", 16, true),
-        ]);
-        let segs = plan_segments(&m, &three_node_attn_spec()).unwrap();
+        let (fa, a_in, a_out) = copy_node("a", 16, true);
+        let (fb, b_in, b_out) = copy_node("b", 16, true);
+        let (fc, c_in, c_out) = copy_node("c", 16, true);
+        let m = module(vec![fa, fb, fc]);
+        let spec = three_node_attn_spec(a_in, a_out, b_in, b_out, c_in, c_out);
+        let segs = plan_segments(Arena::global(), &m, &spec).unwrap();
         assert_eq!(
             segs.len(),
             1,
@@ -1730,13 +1742,13 @@ mod tests {
         let Segment::Fused(seg) = &segs[0] else {
             panic!("expected fused")
         };
-        let args: Vec<&str> = seg.func.arguments.iter().map(|(n, _)| n.as_str()).collect();
         // Only the true source (t1) and result (t4) survive as HBM pointers; the
         // intra-segment edges t2/t3 forward as SSA.
+        let tensor_ids: Vec<u64> = seg.args.iter().map(|&(_, t)| t).collect();
         assert_eq!(
-            args,
-            vec!["%t1_ptr", "%t4_ptr"],
-            "intra-run edges forwarded: {args:?}"
+            tensor_ids,
+            vec![1, 4],
+            "intra-run edges forwarded: {tensor_ids:?}"
         );
     }
 

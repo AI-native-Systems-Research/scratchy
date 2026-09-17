@@ -1286,25 +1286,34 @@ mod tests {
     use crate::dialects::Dispatch;
     use crate::env::{ExecutionEnv, GridExecutor};
     use crate::interpreter::single_core_context;
-    use std::collections::HashMap;
+    use crate::irtype::IrType;
+    use crate::test_support::Ops;
 
-    /// Build an env + ctx, seed operands, run one op, return its produced value.
-    fn run_op(op: &Operation, seed: &[(&str, Value)]) -> Value {
+    /// Build an env + ctx, seed operands (against the SAME `Ops` %-name table
+    /// `op` was built from), run one op, return its produced value.
+    fn run(ops: &mut Ops, op: Operation<'static>, seed: &[(&'static str, Value)]) -> Value {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
         for (n, v) in seed {
-            ctx.set_value(n, v.clone());
+            ctx.set_value(ops.ssa(n), v.clone());
         }
-        let handler = dispatch.handler(&op.op_type).expect("handler registered");
-        handler(op, &mut ctx, &env)
+        let handler = dispatch.handler(op.op_type).expect("handler registered");
+        handler(&op, &mut ctx, &env)
             .unwrap()
             .expect("op produced a value")
     }
 
-    fn f32s(name: &str, op_ty: &str, ops: &[&str]) -> Operation {
-        Operation::new(Some(name), op_ty, ops)
+    /// `%r = kind operands...`, run against `seed`.
+    fn run_op(
+        ops: &mut Ops,
+        kind: OpKind,
+        operands: &[&'static str],
+        seed: &[(&'static str, Value)],
+    ) -> Value {
+        let op = ops.op(Some("%r"), kind, operands);
+        run(ops, op, seed)
     }
 
     fn sf(x: f32) -> Value {
@@ -1346,59 +1355,63 @@ mod tests {
 
     #[test]
     fn float_binops_scalar() {
+        let mut ops = Ops::new();
         let seed = [("%a", sf(6.0)), ("%b", sf(4.0))];
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.addf", &["%a", "%b"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithAddf, &["%a", "%b"], &seed)),
             10.0
         );
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.subf", &["%a", "%b"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithSubf, &["%a", "%b"], &seed)),
             2.0
         );
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.mulf", &["%a", "%b"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithMulf, &["%a", "%b"], &seed)),
             24.0
         );
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.divf", &["%a", "%b"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithDivf, &["%a", "%b"], &seed)),
             1.5
         );
     }
 
     #[test]
     fn remf_takes_divisor_sign() {
+        let mut ops = Ops::new();
         let seed = [("%a", sf(-7.0)), ("%b", sf(3.0))];
         // numpy mod: -7 % 3 == 2.0
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.remf", &["%a", "%b"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithRemf, &["%a", "%b"], &seed)),
             2.0
         );
     }
 
     #[test]
     fn float_binop_elementwise_tile() {
+        let mut ops = Ops::new();
         let seed = [
             ("%a", tile(vec![1.0, 2.0, 3.0], DType::F32, vec![3])),
             ("%b", tile(vec![10.0, 20.0, 30.0], DType::F32, vec![3])),
         ];
-        let r = run_op(&f32s("%r", "arith.addf", &["%a", "%b"]), &seed);
+        let r = run_op(&mut ops, OpKind::ArithAddf, &["%a", "%b"], &seed);
         assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![11.0, 22.0, 33.0]);
     }
 
     #[test]
     fn float_binop_mixed_scalar_tile_broadcasts() {
+        let mut ops = Ops::new();
         let seed = [
             ("%a", tile(vec![1.0, 2.0, 3.0], DType::F32, vec![3])),
             ("%b", sf(10.0)),
         ];
-        let r = run_op(&f32s("%r", "arith.addf", &["%a", "%b"]), &seed);
+        let r = run_op(&mut ops, OpKind::ArithAddf, &["%a", "%b"], &seed);
         assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![11.0, 12.0, 13.0]);
         // scalar-on-left broadcasts too
         let seed2 = [
             ("%a", sf(10.0)),
             ("%b", tile(vec![1.0, 2.0], DType::F32, vec![2])),
         ];
-        let r2 = run_op(&f32s("%r", "arith.subf", &["%a", "%b"]), &seed2);
+        let r2 = run_op(&mut ops, OpKind::ArithSubf, &["%a", "%b"], &seed2);
         assert_eq!(expect_tile(&r2).as_f32().to_vec(), vec![9.0, 8.0]);
     }
 
@@ -1406,17 +1419,18 @@ mod tests {
 
     #[test]
     fn negf_and_absf() {
+        let mut ops = Ops::new();
         let seed = [("%a", sf(-3.5))];
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.negf", &["%a"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithNegf, &["%a"], &seed)),
             3.5
         );
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.absf", &["%a"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithAbsf, &["%a"], &seed)),
             3.5
         );
         let tseed = [("%a", tile(vec![-1.0, 2.0, -3.0], DType::F32, vec![3]))];
-        let r = run_op(&f32s("%r", "arith.absf", &["%a"]), &tseed);
+        let r = run_op(&mut ops, OpKind::ArithAbsf, &["%a"], &tseed);
         assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![1.0, 2.0, 3.0]);
     }
 
@@ -1424,81 +1438,126 @@ mod tests {
 
     #[test]
     fn maxf_minf_propagate_nan() {
+        let mut ops = Ops::new();
         let seed = [("%a", sf(f32::NAN)), ("%b", sf(1.0))];
-        assert!(expect_f32(&run_op(&f32s("%r", "arith.maximumf", &["%a", "%b"]), &seed)).is_nan());
-        assert!(expect_f32(&run_op(&f32s("%r", "arith.minimumf", &["%a", "%b"]), &seed)).is_nan());
+        assert!(
+            expect_f32(&run_op(
+                &mut ops,
+                OpKind::ArithMaximumf,
+                &["%a", "%b"],
+                &seed
+            ))
+            .is_nan()
+        );
+        assert!(
+            expect_f32(&run_op(
+                &mut ops,
+                OpKind::ArithMinimumf,
+                &["%a", "%b"],
+                &seed
+            ))
+            .is_nan()
+        );
         // numf variants ignore NaN
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.maxnumf", &["%a", "%b"]), &seed)),
+            expect_f32(&run_op(
+                &mut ops,
+                OpKind::ArithMaxnumf,
+                &["%a", "%b"],
+                &seed
+            )),
             1.0
         );
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.minnumf", &["%a", "%b"]), &seed)),
+            expect_f32(&run_op(
+                &mut ops,
+                OpKind::ArithMinnumf,
+                &["%a", "%b"],
+                &seed
+            )),
             1.0
         );
     }
 
     #[test]
     fn maxf_minf_pick_extreme() {
+        let mut ops = Ops::new();
         let seed = [("%a", sf(2.0)), ("%b", sf(5.0))];
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.maxf", &["%a", "%b"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithMaxf, &["%a", "%b"], &seed)),
             5.0
         );
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.minf", &["%a", "%b"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithMinf, &["%a", "%b"], &seed)),
             2.0
         );
     }
 
     // --- cmpf --------------------------------------------------------------
 
-    fn cmpf_op(pred: &str, ops: &[&str]) -> Operation {
-        Operation::new(Some("%r"), "arith.cmpf", ops).with_attr("predicate", Attr::Str(pred.into()))
+    fn cmpf_op(ops: &mut Ops, pred: &'static str, operands: &[&'static str]) -> Operation<'static> {
+        let op = ops.op(Some("%r"), OpKind::ArithCmpf, operands);
+        ops.attr(op, AttrKey::Predicate, Attr::Str(pred))
     }
 
     #[test]
     fn cmpf_ordered_predicates() {
+        let mut ops = Ops::new();
         let seed = [("%a", sf(1.0)), ("%b", sf(2.0))];
-        assert!(expect_bool(&run_op(&cmpf_op("olt", &["%a", "%b"]), &seed)));
-        assert!(!expect_bool(&run_op(&cmpf_op("ogt", &["%a", "%b"]), &seed)));
-        assert!(!expect_bool(&run_op(&cmpf_op("oeq", &["%a", "%b"]), &seed)));
-        assert!(expect_bool(&run_op(&cmpf_op("one", &["%a", "%b"]), &seed)));
+        let op = cmpf_op(&mut ops, "olt", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpf_op(&mut ops, "ogt", &["%a", "%b"]);
+        assert!(!expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpf_op(&mut ops, "oeq", &["%a", "%b"]);
+        assert!(!expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpf_op(&mut ops, "one", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
     }
 
     #[test]
     fn cmpf_nan_ordered_vs_unordered() {
+        let mut ops = Ops::new();
         let seed = [("%a", sf(f32::NAN)), ("%b", sf(1.0))];
         // ordered comparisons with NaN are false
-        assert!(!expect_bool(&run_op(&cmpf_op("oeq", &["%a", "%b"]), &seed)));
-        assert!(!expect_bool(&run_op(&cmpf_op("olt", &["%a", "%b"]), &seed)));
-        assert!(!expect_bool(&run_op(&cmpf_op("one", &["%a", "%b"]), &seed)));
+        let op = cmpf_op(&mut ops, "oeq", &["%a", "%b"]);
+        assert!(!expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpf_op(&mut ops, "olt", &["%a", "%b"]);
+        assert!(!expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpf_op(&mut ops, "one", &["%a", "%b"]);
+        assert!(!expect_bool(&run(&mut ops, op, &seed)));
         // unordered comparisons with NaN are true
-        assert!(expect_bool(&run_op(&cmpf_op("ult", &["%a", "%b"]), &seed)));
-        assert!(expect_bool(&run_op(&cmpf_op("ueq", &["%a", "%b"]), &seed)));
-        assert!(expect_bool(&run_op(&cmpf_op("uno", &["%a", "%b"]), &seed)));
-        assert!(!expect_bool(&run_op(&cmpf_op("ord", &["%a", "%b"]), &seed)));
+        let op = cmpf_op(&mut ops, "ult", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpf_op(&mut ops, "ueq", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpf_op(&mut ops, "uno", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpf_op(&mut ops, "ord", &["%a", "%b"]);
+        assert!(!expect_bool(&run(&mut ops, op, &seed)));
         // une is true even with NaN
-        assert!(expect_bool(&run_op(&cmpf_op("une", &["%a", "%b"]), &seed)));
+        let op = cmpf_op(&mut ops, "une", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
     }
 
     #[test]
     fn cmpf_true_false_constants() {
+        let mut ops = Ops::new();
         let seed = [("%a", sf(1.0)), ("%b", sf(2.0))];
-        assert!(expect_bool(&run_op(&cmpf_op("true", &["%a", "%b"]), &seed)));
-        assert!(!expect_bool(&run_op(
-            &cmpf_op("false", &["%a", "%b"]),
-            &seed
-        )));
+        let op = cmpf_op(&mut ops, "true", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpf_op(&mut ops, "false", &["%a", "%b"]);
+        assert!(!expect_bool(&run(&mut ops, op, &seed)));
     }
 
     #[test]
     fn cmpf_tile_produces_i1_tile() {
+        let mut ops = Ops::new();
         let seed = [
             ("%a", tile(vec![1.0, 5.0, 3.0], DType::F32, vec![3])),
             ("%b", tile(vec![2.0, 2.0, 3.0], DType::F32, vec![3])),
         ];
-        let r = run_op(&cmpf_op("olt", &["%a", "%b"]), &seed);
+        let op = cmpf_op(&mut ops, "olt", &["%a", "%b"]);
+        let r = run(&mut ops, op, &seed);
         let t = expect_tile(&r);
         assert_eq!(t.dtype, DType::Bool);
         assert_eq!(t.as_f32().to_vec(), vec![1.0, 0.0, 0.0]);
@@ -1508,50 +1567,55 @@ mod tests {
 
     #[test]
     fn int_binops_scalar() {
+        let mut ops = Ops::new();
         let seed = [("%a", si(17)), ("%b", si(5))];
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.addi", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithAddi, &["%a", "%b"], &seed)),
             22
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.subi", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithSubi, &["%a", "%b"], &seed)),
             12
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.muli", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithMuli, &["%a", "%b"], &seed)),
             85
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.divsi", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithDivsi, &["%a", "%b"], &seed)),
             3
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.remsi", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithRemsi, &["%a", "%b"], &seed)),
             2
         );
     }
 
     #[test]
     fn divsi_truncates_toward_zero_remsi_matches() {
+        let mut ops = Ops::new();
         // -7 / 2: divsi truncates -> -3 ; remsi = -7 - (-3*2) = -1
         let seed = [("%a", si(-7)), ("%b", si(2))];
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.divsi", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithDivsi, &["%a", "%b"], &seed)),
             -3
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.remsi", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithRemsi, &["%a", "%b"], &seed)),
             -1
         );
     }
 
     #[test]
     fn floordivsi_floors_toward_neg_inf() {
+        let mut ops = Ops::new();
         // -7 // 2 floors -> -4
         let seed = [("%a", si(-7)), ("%b", si(2))];
         assert_eq!(
             expect_i64(&run_op(
-                &f32s("%r", "arith.floordivsi", &["%a", "%b"]),
+                &mut ops,
+                OpKind::ArithFloordivsi,
+                &["%a", "%b"],
                 &seed
             )),
             -4
@@ -1560,30 +1624,36 @@ mod tests {
 
     #[test]
     fn divui_remui_nonneg() {
+        let mut ops = Ops::new();
         let seed = [("%a", si(17)), ("%b", si(5))];
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.divui", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithDivui, &["%a", "%b"], &seed)),
             3
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.remui", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithRemui, &["%a", "%b"], &seed)),
             2
         );
     }
 
     #[test]
     fn ceildiv_rounds_up() {
+        let mut ops = Ops::new();
         let seed = [("%a", si(7)), ("%b", si(2))];
         assert_eq!(
             expect_i64(&run_op(
-                &f32s("%r", "arith.ceildivsi", &["%a", "%b"]),
+                &mut ops,
+                OpKind::ArithCeildivsi,
+                &["%a", "%b"],
                 &seed
             )),
             4
         );
         assert_eq!(
             expect_i64(&run_op(
-                &f32s("%r", "arith.ceildivui", &["%a", "%b"]),
+                &mut ops,
+                OpKind::ArithCeildivui,
+                &["%a", "%b"],
                 &seed
             )),
             4
@@ -1592,39 +1662,41 @@ mod tests {
 
     #[test]
     fn int_min_max() {
+        let mut ops = Ops::new();
         let seed = [("%a", si(3)), ("%b", si(8))];
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.minsi", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithMinsi, &["%a", "%b"], &seed)),
             3
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.maxsi", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithMaxsi, &["%a", "%b"], &seed)),
             8
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.minui", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithMinui, &["%a", "%b"], &seed)),
             3
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.maxui", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithMaxui, &["%a", "%b"], &seed)),
             8
         );
     }
 
     #[test]
     fn int_binop_elementwise_and_broadcast() {
+        let mut ops = Ops::new();
         let seed = [
             ("%a", tile(vec![1.0, 2.0, 3.0], DType::I32, vec![3])),
             ("%b", tile(vec![4.0, 5.0, 6.0], DType::I32, vec![3])),
         ];
-        let r = run_op(&f32s("%r", "arith.addi", &["%a", "%b"]), &seed);
+        let r = run_op(&mut ops, OpKind::ArithAddi, &["%a", "%b"], &seed);
         assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![5.0, 7.0, 9.0]);
         // scalar broadcast
         let seed2 = [
             ("%a", tile(vec![1.0, 2.0, 3.0], DType::I32, vec![3])),
             ("%b", si(10)),
         ];
-        let r2 = run_op(&f32s("%r", "arith.muli", &["%a", "%b"]), &seed2);
+        let r2 = run_op(&mut ops, OpKind::ArithMuli, &["%a", "%b"], &seed2);
         assert_eq!(expect_tile(&r2).as_f32().to_vec(), vec![10.0, 20.0, 30.0]);
     }
 
@@ -1632,67 +1704,76 @@ mod tests {
 
     #[test]
     fn bitwise_ops() {
+        let mut ops = Ops::new();
         let seed = [("%a", si(0b1100)), ("%b", si(0b1010))];
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.andi", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithAndi, &["%a", "%b"], &seed)),
             0b1000
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.ori", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithOri, &["%a", "%b"], &seed)),
             0b1110
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.xori", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithXori, &["%a", "%b"], &seed)),
             0b0110
         );
     }
 
     #[test]
     fn shift_ops() {
+        let mut ops = Ops::new();
         let seed = [("%a", si(1)), ("%b", si(4))];
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.shli", &["%a", "%b"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithShli, &["%a", "%b"], &seed)),
             16
         );
         let seed2 = [("%a", si(256)), ("%b", si(2))];
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.shrsi", &["%a", "%b"]), &seed2)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithShrsi, &["%a", "%b"], &seed2)),
             64
         );
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.shrui", &["%a", "%b"]), &seed2)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithShrui, &["%a", "%b"], &seed2)),
             64
         );
     }
 
     // --- cmpi --------------------------------------------------------------
 
-    fn cmpi_op(pred: &str, ops: &[&str]) -> Operation {
-        Operation::new(Some("%r"), "arith.cmpi", ops).with_attr("predicate", Attr::Str(pred.into()))
+    fn cmpi_op(ops: &mut Ops, pred: &'static str, operands: &[&'static str]) -> Operation<'static> {
+        let op = ops.op(Some("%r"), OpKind::ArithCmpi, operands);
+        ops.attr(op, AttrKey::Predicate, Attr::Str(pred))
     }
 
     #[test]
     fn cmpi_predicates_scalar() {
+        let mut ops = Ops::new();
         let seed = [("%a", si(3)), ("%b", si(5))];
-        assert!(expect_bool(&run_op(&cmpi_op("slt", &["%a", "%b"]), &seed)));
-        assert!(expect_bool(&run_op(&cmpi_op("ult", &["%a", "%b"]), &seed)));
-        assert!(!expect_bool(&run_op(&cmpi_op("sge", &["%a", "%b"]), &seed)));
-        assert!(expect_bool(&run_op(&cmpi_op("ne", &["%a", "%b"]), &seed)));
+        let op = cmpi_op(&mut ops, "slt", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpi_op(&mut ops, "ult", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpi_op(&mut ops, "sge", &["%a", "%b"]);
+        assert!(!expect_bool(&run(&mut ops, op, &seed)));
+        let op = cmpi_op(&mut ops, "ne", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &seed)));
         let eqseed = [("%a", si(5)), ("%b", si(5))];
-        assert!(expect_bool(&run_op(&cmpi_op("eq", &["%a", "%b"]), &eqseed)));
-        assert!(expect_bool(&run_op(
-            &cmpi_op("sle", &["%a", "%b"]),
-            &eqseed
-        )));
+        let op = cmpi_op(&mut ops, "eq", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &eqseed)));
+        let op = cmpi_op(&mut ops, "sle", &["%a", "%b"]);
+        assert!(expect_bool(&run(&mut ops, op, &eqseed)));
     }
 
     #[test]
     fn cmpi_tile_produces_i1_tile() {
+        let mut ops = Ops::new();
         let seed = [
             ("%a", tile(vec![1.0, 5.0, 3.0], DType::I32, vec![3])),
             ("%b", tile(vec![2.0, 2.0, 3.0], DType::I32, vec![3])),
         ];
-        let r = run_op(&cmpi_op("sge", &["%a", "%b"]), &seed);
+        let op = cmpi_op(&mut ops, "sge", &["%a", "%b"]);
+        let r = run(&mut ops, op, &seed);
         let t = expect_tile(&r);
         assert_eq!(t.dtype, DType::Bool);
         assert_eq!(t.as_f32().to_vec(), vec![0.0, 1.0, 1.0]);
@@ -1702,42 +1783,46 @@ mod tests {
 
     #[test]
     fn select_scalar_cond() {
-        let t = Operation::new(Some("%r"), "arith.select", &["%c", "%t", "%f"]);
+        let mut ops = Ops::new();
+        let t = ops.op(Some("%r"), OpKind::ArithSelect, &["%c", "%t", "%f"]);
         let seed_true = [
             ("%c", Value::Scalar(Scalar::Bool(true))),
             ("%t", si(1)),
             ("%f", si(2)),
         ];
-        assert_eq!(expect_i64(&run_op(&t, &seed_true)), 1);
+        assert_eq!(expect_i64(&run(&mut ops, t, &seed_true)), 1);
+        let t = ops.op(Some("%r"), OpKind::ArithSelect, &["%c", "%t", "%f"]);
         let seed_false = [
             ("%c", Value::Scalar(Scalar::Bool(false))),
             ("%t", si(1)),
             ("%f", si(2)),
         ];
-        assert_eq!(expect_i64(&run_op(&t, &seed_false)), 2);
+        assert_eq!(expect_i64(&run(&mut ops, t, &seed_false)), 2);
     }
 
     #[test]
     fn select_tile_cond_elementwise() {
-        let op = Operation::new(Some("%r"), "arith.select", &["%c", "%t", "%f"]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::ArithSelect, &["%c", "%t", "%f"]);
         let seed = [
             ("%c", tile(vec![1.0, 0.0, 1.0], DType::Bool, vec![3])),
             ("%t", tile(vec![10.0, 20.0, 30.0], DType::F32, vec![3])),
             ("%f", tile(vec![-1.0, -2.0, -3.0], DType::F32, vec![3])),
         ];
-        let r = run_op(&op, &seed);
+        let r = run(&mut ops, op, &seed);
         assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![10.0, -2.0, 30.0]);
     }
 
     #[test]
     fn select_tile_cond_scalar_branches_broadcast() {
-        let op = Operation::new(Some("%r"), "arith.select", &["%c", "%t", "%f"]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::ArithSelect, &["%c", "%t", "%f"]);
         let seed = [
             ("%c", tile(vec![1.0, 0.0], DType::Bool, vec![2])),
             ("%t", sf(7.0)),
             ("%f", sf(9.0)),
         ];
-        let r = run_op(&op, &seed);
+        let r = run(&mut ops, op, &seed);
         assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![7.0, 9.0]);
     }
 
@@ -1745,33 +1830,28 @@ mod tests {
 
     #[test]
     fn constant_scalar_forms() {
-        let cf =
-            Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Float(2.5));
-        assert_eq!(expect_f32(&run_op(&cf, &[])), 2.5);
-        let ci =
-            Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Int(42));
-        assert_eq!(expect_i64(&run_op(&ci, &[])), 42);
-        let cb =
-            Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Bool(true));
-        assert!(expect_bool(&run_op(&cb, &[])));
+        let mut ops = Ops::new();
+        let cf = ops.op(Some("%r"), OpKind::ArithConstant, &[]);
+        let cf = ops.attr(cf, AttrKey::Value, Attr::Float(2.5));
+        assert_eq!(expect_f32(&run(&mut ops, cf, &[])), 2.5);
+        let ci = ops.op(Some("%r"), OpKind::ArithConstant, &[]);
+        let ci = ops.attr(ci, AttrKey::Value, Attr::Int(42));
+        assert_eq!(expect_i64(&run(&mut ops, ci, &[])), 42);
+        let cb = ops.op(Some("%r"), OpKind::ArithConstant, &[]);
+        let cb = ops.attr(cb, AttrKey::Value, Attr::Bool(true));
+        assert!(expect_bool(&run(&mut ops, cb, &[])));
     }
 
     #[test]
     fn constant_splat_tensor() {
-        let mut attrs = HashMap::new();
-        attrs.insert("value".to_string(), Attr::Float(3.0));
-        attrs.insert("is_tensor".to_string(), Attr::Bool(true));
-        attrs.insert("shape".to_string(), Attr::IntList(vec![4]));
-        attrs.insert("dtype".to_string(), Attr::Str("f16".into()));
-        let op = Operation {
-            result: Some("%r".into()),
-            op_type: "arith.constant".into(),
-            operands: vec![],
-            attributes: attrs,
-            result_type: None,
-            regions: vec![],
-        };
-        let r = run_op(&op, &[]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::ArithConstant, &[]);
+        let op = ops.attr(op, AttrKey::Value, Attr::Float(3.0));
+        let op = ops.attr(op, AttrKey::IsTensor, Attr::Bool(true));
+        let shape = ops.int_list(vec![4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("f16"));
+        let r = run(&mut ops, op, &[]);
         let t = expect_tile(&r);
         assert_eq!(t.as_f32().to_vec(), vec![3.0, 3.0, 3.0, 3.0]);
         assert_eq!(t.dtype, DType::F16);
@@ -1780,21 +1860,16 @@ mod tests {
 
     #[test]
     fn constant_dense_list_tensor() {
-        let mut attrs = HashMap::new();
-        attrs.insert("value".to_string(), Attr::IntList(vec![16, 32]));
-        attrs.insert("is_tensor".to_string(), Attr::Bool(true));
-        attrs.insert("dense_list".to_string(), Attr::Bool(true));
-        attrs.insert("shape".to_string(), Attr::IntList(vec![2]));
-        attrs.insert("dtype".to_string(), Attr::Str("index".into()));
-        let op = Operation {
-            result: Some("%r".into()),
-            op_type: "arith.constant".into(),
-            operands: vec![],
-            attributes: attrs,
-            result_type: None,
-            regions: vec![],
-        };
-        let t = run_op(&op, &[]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::ArithConstant, &[]);
+        let value = ops.int_list(vec![16, 32]);
+        let op = ops.attr(op, AttrKey::Value, value);
+        let op = ops.attr(op, AttrKey::IsTensor, Attr::Bool(true));
+        let op = ops.attr(op, AttrKey::DenseList, Attr::Bool(true));
+        let shape = ops.int_list(vec![2]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("index"));
+        let t = run(&mut ops, op, &[]);
         assert_eq!(expect_tile(&t).as_f32().to_vec(), vec![16.0, 32.0]);
     }
 
@@ -1802,77 +1877,85 @@ mod tests {
 
     #[test]
     fn extf_truncf_roundtrip() {
+        let mut ops = Ops::new();
         // extf scalar passes value through (widening is a no-op on f32 storage).
         let seed = [("%a", sf(1.5))];
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.extf", &["%a"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithExtf, &["%a"], &seed)),
             1.5
         );
         // truncf on a representable f16 value is exact.
         assert_eq!(
-            expect_f32(&run_op(&f32s("%r", "arith.truncf", &["%a"]), &seed)),
+            expect_f32(&run_op(&mut ops, OpKind::ArithTruncf, &["%a"], &seed)),
             1.5
         );
     }
 
     #[test]
     fn truncf_rounds_to_f16_precision() {
+        let mut ops = Ops::new();
         // 1 + 1/2048 is the exact midpoint between 1.0 and 1+1/1024 and ties to
         // even -> 1.0; 1 + 1/1024 is exactly representable.
         let seed = [("%a", sf(1.0 + 1.0 / 2048.0))];
-        let r = expect_f32(&run_op(&f32s("%r", "arith.truncf", &["%a"]), &seed));
+        let r = expect_f32(&run_op(&mut ops, OpKind::ArithTruncf, &["%a"], &seed));
         assert_eq!(r, 1.0);
         let seed2 = [("%a", sf(1.0 + 1.0 / 1024.0))];
-        let r2 = expect_f32(&run_op(&f32s("%r", "arith.truncf", &["%a"]), &seed2));
+        let r2 = expect_f32(&run_op(&mut ops, OpKind::ArithTruncf, &["%a"], &seed2));
         assert_eq!(r2, 1.0 + 1.0 / 1024.0);
     }
 
     #[test]
     fn extsi_extui_trunci_tiles() {
+        let mut ops = Ops::new();
         let seed = [("%a", tile(vec![1.0, 2.0, 3.0], DType::I32, vec![3]))];
-        let r = run_op(&f32s("%r", "arith.extsi", &["%a"]), &seed);
+        let r = run_op(&mut ops, OpKind::ArithExtsi, &["%a"], &seed);
         assert_eq!(expect_tile(&r).dtype, DType::I64);
-        let r2 = run_op(&f32s("%r", "arith.trunci", &["%a"]), &seed);
+        let r2 = run_op(&mut ops, OpKind::ArithTrunci, &["%a"], &seed);
         assert_eq!(expect_tile(&r2).dtype, DType::I32);
         assert_eq!(expect_tile(&r2).as_f32().to_vec(), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
     fn sitofp_with_result_type() {
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::ArithSitofp, &["%a"]);
         let op = Operation {
-            result: Some("%r".into()),
-            op_type: "arith.sitofp".into(),
-            operands: vec!["%a".into()],
-            attributes: HashMap::new(),
-            result_type: Some("f32".into()),
-            regions: vec![],
+            result_type: Some(IrType::Scalar(DType::F32)),
+            ..op
         };
         let seed = [("%a", tile(vec![5.0, 7.0], DType::I32, vec![2]))];
-        let r = run_op(&op, &seed);
+        let r = run(&mut ops, op, &seed);
         assert_eq!(expect_tile(&r).dtype, DType::F32);
         assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![5.0, 7.0]);
         // scalar path
+        let op = ops.op(Some("%r"), OpKind::ArithSitofp, &["%a"]);
+        let op = Operation {
+            result_type: Some(IrType::Scalar(DType::F32)),
+            ..op
+        };
         let sseed = [("%a", si(9))];
-        assert_eq!(expect_f32(&run_op(&op, &sseed)), 9.0);
+        assert_eq!(expect_f32(&run(&mut ops, op, &sseed)), 9.0);
     }
 
     #[test]
     fn fptosi_truncates_toward_zero() {
+        let mut ops = Ops::new();
         let seed = [("%a", sf(-2.7))];
         assert_eq!(
-            expect_i64(&run_op(&f32s("%r", "arith.fptosi", &["%a"]), &seed)),
+            expect_i64(&run_op(&mut ops, OpKind::ArithFptosi, &["%a"], &seed)),
             -2
         );
         let tseed = [("%a", tile(vec![1.9, -1.9, 2.5], DType::F32, vec![3]))];
-        let r = run_op(&f32s("%r", "arith.fptosi", &["%a"]), &tseed);
+        let r = run_op(&mut ops, OpKind::ArithFptosi, &["%a"], &tseed);
         assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![1.0, -1.0, 2.0]);
         assert_eq!(expect_tile(&r).dtype, DType::I32);
     }
 
     #[test]
     fn index_cast_coerces_to_index() {
+        let mut ops = Ops::new();
         let seed = [("%a", si(7))];
-        match run_op(&f32s("%r", "arith.index_cast", &["%a"]), &seed) {
+        match run_op(&mut ops, OpKind::ArithIndexCast, &["%a"], &seed) {
             Value::Index(7) => {}
             other => panic!("expected Index(7), got {other:?}"),
         }
@@ -1880,13 +1963,14 @@ mod tests {
 
     #[test]
     fn convertf_tile_direction() {
+        let mut ops = Ops::new();
         // f16 tile widens to f32
         let seed = [("%a", tile(vec![1.0, 2.0], DType::F16, vec![2]))];
-        let r = run_op(&f32s("%r", "arith.convertf", &["%a"]), &seed);
+        let r = run_op(&mut ops, OpKind::ArithConvertf, &["%a"], &seed);
         assert_eq!(expect_tile(&r).dtype, DType::F32);
         // f32 tile narrows to f16
         let seed2 = [("%a", tile(vec![1.0, 2.0], DType::F32, vec![2]))];
-        let r2 = run_op(&f32s("%r", "arith.convertf", &["%a"]), &seed2);
+        let r2 = run_op(&mut ops, OpKind::ArithConvertf, &["%a"], &seed2);
         assert_eq!(expect_tile(&r2).dtype, DType::F16);
     }
 

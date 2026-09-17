@@ -367,29 +367,35 @@ mod tests {
     use crate::dialects::Dispatch;
     use crate::env::{ExecutionEnv, GridExecutor};
     use crate::interpreter::{execute_ops, single_core_context};
+    use crate::test_support::Ops;
 
-    fn run(ops: &[Operation], ctx: &mut CoreContext) -> Result<(), String> {
+    fn run(ops: &[Operation<'static>], ctx: &mut CoreContext) -> Result<(), String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
         execute_ops(ops, ctx, &env)
     }
 
-    fn build_view() -> Operation {
-        // %v = construct_memory_view %p {shape=[64,32], strides=[32,1], HBM, f16}
-        Operation::new(Some("%v"), "ktdp.construct_memory_view", &["%p"])
-            .with_attr("shape", Attr::IntList(vec![64, 32]))
-            .with_attr("strides", Attr::IntList(vec![32, 1]))
-            .with_attr("memory_space", Attr::Str("HBM".into()))
-            .with_attr("dtype", Attr::Str("f16".into()))
+    // %v = construct_memory_view %p {shape=[64,32], strides=[32,1], HBM, f16}
+    fn build_view(ops: &mut Ops) -> Operation<'static> {
+        let op = ops.op(Some("%v"), OpKind::KtdpConstructMemoryView, &["%p"]);
+        let shape = ops.int_list(vec![64, 32]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let strides = ops.int_list(vec![32, 1]);
+        let op = ops.attr(op, AttrKey::Strides, strides);
+        let op = ops.attr(op, AttrKey::MemorySpace, Attr::Str("HBM"));
+        ops.attr(op, AttrKey::Dtype, Attr::Dtype(DType::F16))
     }
 
     #[test]
     fn construct_view_builds_memref() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%p", Value::Index(4)); // element index 4 (base_ptr is an element index)
-        run(&[build_view()], &mut ctx).unwrap();
-        match ctx.get_value("%v").unwrap() {
+        ctx.set_value(ops.ssa("%p"), Value::Index(4)); // element index 4 (base_ptr is an element index)
+        let v = ops.ssa("%v");
+        let view = build_view(&mut ops);
+        run(&[view], &mut ctx).unwrap();
+        match ctx.get_value(v).unwrap() {
             Value::MemRef(m) => {
                 assert_eq!(m.shape, vec![64, 32]);
                 // base_ptr=4 element index at f16 (2 bytes) -> byte 8.
@@ -402,20 +408,25 @@ mod tests {
 
     #[test]
     fn access_tile_offset_via_base_map() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%p", Value::Index(0)); // base at byte 0 for a clean offset check
-        ctx.set_value("%i", Value::Index(2));
-        ctx.set_value("%j", Value::Index(3));
+        ctx.set_value(ops.ssa("%p"), Value::Index(0)); // base at byte 0 for a clean offset check
+        ctx.set_value(ops.ssa("%i"), Value::Index(2));
+        ctx.set_value(ops.ssa("%j"), Value::Index(3));
+        let view = build_view(&mut ops);
         // identity base_map over (i, j); offset = (2*32 + 3*1) elems * 2 bytes
-        let at = Operation::new(
+        let t = ops.ssa("%t");
+        let at = ops.op(
             Some("%t"),
-            "ktdp.construct_access_tile",
+            OpKind::KtdpConstructAccessTile,
             &["%v", "%i", "%j"],
-        )
-        .with_attr("shape", Attr::IntList(vec![1, 1]))
-        .with_attr("base_map", Attr::AffineMap(AffineMap::identity(2)));
-        run(&[build_view(), at], &mut ctx).unwrap();
-        match ctx.get_value("%t").unwrap() {
+        );
+        let shape = ops.int_list(vec![1, 1]);
+        let at = ops.attr(at, AttrKey::Shape, shape);
+        let ident = Attr::AffineMap(ops.identity_map(2));
+        let at = ops.attr(at, AttrKey::BaseMap, ident);
+        run(&[view, at], &mut ctx).unwrap();
+        match ctx.get_value(t).unwrap() {
             Value::AccessTile(a) => match &a.parent_ref {
                 ParentRef::Tile(tr) => assert_eq!(tr.base_ptr, (2 * 32 + 3) * 2),
                 _ => panic!("expected single-allocation TileRef parent"),
@@ -426,12 +437,15 @@ mod tests {
 
     #[test]
     fn distributed_parent_is_flagged_unported() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // assert the single-allocation path rejects a non-memref parent.
-        ctx.set_value("%v", Value::Index(7));
-        let at = Operation::new(Some("%t"), "ktdp.construct_access_tile", &["%v"])
-            .with_attr("shape", Attr::IntList(vec![1]))
-            .with_attr("base_map", Attr::AffineMap(AffineMap::identity(0)));
+        ctx.set_value(ops.ssa("%v"), Value::Index(7));
+        let at = ops.op(Some("%t"), OpKind::KtdpConstructAccessTile, &["%v"]);
+        let shape = ops.int_list(vec![1]);
+        let at = ops.attr(at, AttrKey::Shape, shape);
+        let ident = Attr::AffineMap(ops.identity_map(0));
+        let at = ops.attr(at, AttrKey::BaseMap, ident);
         let err = run(&[at], &mut ctx).unwrap_err();
         assert!(err.contains("expected MemRef"));
     }

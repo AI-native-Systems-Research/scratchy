@@ -38,15 +38,30 @@
 //!   cargo test --release -p ktir-emulator --test flash_attn_timing -- --ignored \
 //!     --nocapture --test-threads=1
 
+use ktir_emulator::attrkey::AttrKey;
 use ktir_emulator::dtypes::DType;
-use ktir_emulator::interpreter::{Arg, Output, execute_function};
-use ktir_emulator::ir::{IRFunction, IRModule};
+use ktir_emulator::interpreter::{Arg, Output, execute_function_with_latency};
+use ktir_emulator::ir::{Attr, IRFunction, IRModule, Ssa};
+use ktir_emulator::latency::HardwareConfig;
+use ktir_emulator::opkind::OpKind;
 use ktir_optimizer::flash_attn::{
     apply_flash_attention, recognize_rerolled_attention, tile_rerolled_attention,
 };
 use ktir_optimizer::fusion::attention_needs_flash;
-use ktir_optimizer::head_rewrite::{HeadAttnIsland, rewrite_head_attention};
+use ktir_optimizer::head_rewrite::{HeadAttnIsland, NameGen, rewrite_head_attention};
 use std::collections::HashMap;
+
+/// The seven pointer args' fixed identities, shared between [`island_at_cap`]
+/// (which builds the island's arg fields from them) and [`build_args`] (which
+/// keys the marshalled inputs the same way) — Ssa carries no string identity,
+/// so both sides must mint from the same table.
+const Q: Ssa = Ssa(0);
+const O: Ssa = Ssa(1);
+const MASK: Ssa = Ssa(2);
+const KC: Ssa = Ssa(3);
+const KD: Ssa = Ssa(4);
+const VC: Ssa = Ssa(5);
+const VD: Ssa = Ssa(6);
 
 // ---------------------------------------------------------------------------
 // Knobs
@@ -87,13 +102,13 @@ const LX_BUDGET: usize = 16384;
 /// emits on the real model node — the un-tiled long-context body we measure.
 fn island_at_cap(cap: i64) -> HeadAttnIsland {
     HeadAttnIsland {
-        q_arg: "%q".into(),
-        o_arg: "%o".into(),
-        mask_arg: "%mask".into(),
-        kc_arg: "%kc".into(),
-        kd_arg: "%kd".into(),
-        vc_arg: "%vc".into(),
-        vd_arg: "%vd".into(),
+        q_arg: Q,
+        o_arg: O,
+        mask_arg: MASK,
+        kc_arg: KC,
+        kd_arg: KD,
+        vc_arg: VC,
+        vd_arg: VD,
         q_cols: H * D,
         kv_cols: (H / GQAC) * D,
         m: M,
@@ -104,14 +119,16 @@ fn island_at_cap(cap: i64) -> HeadAttnIsland {
         h: H,
         scale: 1.0 / (D as f32).sqrt(),
         ninf: -1.0e38,
-        dtype: "f16".into(),
+        dtype: DType::F16,
     }
 }
 
 /// The un-tiled re-rolled module (one function `attn`, grid `[H,1,1]`).
-fn untiled_module(cap: i64) -> (IRModule, String) {
-    let mut f = rewrite_head_attention(&island_at_cap(cap));
-    f.name = "attn".into();
+fn untiled_module(cap: i64) -> (IRModule<'static>, String) {
+    let isl = island_at_cap(cap);
+    let mut g = NameGen::above([Q, O, MASK, KC, KD, VC, VD]);
+    let mut f = rewrite_head_attention(ktir_emulator::arena::Arena::global(), &isl, &mut g);
+    f.name = "attn";
     let mut m = IRModule::default();
     m.add_function(f);
     (m, "attn".into())
@@ -121,9 +138,11 @@ fn untiled_module(cap: i64) -> (IRModule, String) {
 /// cap-tile its context block with a budget-chosen block (blk=128 in this regime).
 /// Uses the SAME public `apply_flash_attention` entrypoint the program pipeline
 /// uses, with a realistic LX budget — NOT a pathological tiny forced budget.
-fn flash_module(cap: i64) -> (IRModule, String, bool) {
+fn flash_module(cap: i64) -> (IRModule<'static>, String, bool) {
     let (mut module, name) = untiled_module(cap);
-    let fired = apply_flash_attention(&mut module, |sb| attention_needs_flash(sb, LX_BUDGET));
+    let fired = apply_flash_attention(ktir_emulator::arena::Arena::global(), &mut module, |sb| {
+        attention_needs_flash(sb, LX_BUDGET)
+    });
     (module, name, fired > 0)
 }
 
@@ -142,7 +161,7 @@ fn arb(n: usize, seed: usize) -> Vec<f32> {
 /// The seven pointer args for the re-rolled function, sized from the island:
 ///   %q,%o   [m, H*d]    %mask [1, cap]
 ///   %kc,%vc [cap, kv_cols]   %kd,%vd [m, kv_cols]
-fn build_args(cap: i64) -> Vec<(&'static str, Arg)> {
+fn build_args(cap: i64) -> Vec<(Ssa, Arg)> {
     let m = M as usize;
     let d = D as usize;
     let h = H as usize;
@@ -150,9 +169,9 @@ fn build_args(cap: i64) -> Vec<(&'static str, Arg)> {
     let kv_cols = (H / GQAC) as usize * d;
     let qcols = h * d;
     let f16 = DType::F16;
-    let mk = |name: &'static str, rows: usize, cols: usize, seed: usize| {
+    let mk = |ssa: Ssa, rows: usize, cols: usize, seed: usize| {
         (
-            name,
+            ssa,
             Arg::Tensor {
                 data: arb(rows * cols, seed),
                 shape: vec![rows, cols],
@@ -161,23 +180,23 @@ fn build_args(cap: i64) -> Vec<(&'static str, Arg)> {
         )
     };
     vec![
-        mk("q", m, qcols, 1),
+        mk(Q, m, qcols, 1),
         // %o is an output; seed it too (overwritten by the store).
-        mk("o", m, qcols, 2),
+        mk(O, m, qcols, 2),
         // per-head context mask [1, cap]: 0 (visible) everywhere here (weight-free;
         // semantics equivalence holds for ANY mask since both paths read the same).
         (
-            "mask",
+            MASK,
             Arg::Tensor {
                 data: vec![0.0; cap],
                 shape: vec![1, cap],
                 dtype: f16,
             },
         ),
-        mk("kc", cap, kv_cols, 3),
-        mk("kd", m, kv_cols, 4),
-        mk("vc", cap, kv_cols, 5),
-        mk("vd", m, kv_cols, 6),
+        mk(KC, cap, kv_cols, 3),
+        mk(KD, m, kv_cols, 4),
+        mk(VC, cap, kv_cols, 5),
+        mk(VD, m, kv_cols, 6),
     ]
 }
 
@@ -185,29 +204,30 @@ fn build_args(cap: i64) -> Vec<(&'static str, Arg)> {
 // Timing + semantics
 // ---------------------------------------------------------------------------
 
-fn run(module: &IRModule, name: &str, args: &[(&str, Arg)]) -> HashMap<String, Output> {
-    execute_function(module, name, args).expect("attention run")
+fn run(module: &IRModule<'static>, name: &str, args: &[(Ssa, Arg)]) -> HashMap<Ssa, Output> {
+    try_run(module, name, args).expect("attention run")
 }
 
 /// Fallible run: at very long context the UN-TILED full-`[m,cap]` intermediates
 /// overflow the interpreter's real 2 MB LX budget (`SpyreMemoryHierarchy`) and
-/// `execute_function` returns `Err(..)`. That is itself the decisive long-context
-/// result (un-tiled CANNOT run; flash can) — so we surface it instead of panicking.
+/// this returns `Err(..)`. That is itself the decisive long-context result
+/// (un-tiled CANNOT run; flash can) — so we surface it instead of panicking.
 fn try_run(
-    module: &IRModule,
+    module: &IRModule<'static>,
     name: &str,
-    args: &[(&str, Arg)],
-) -> Result<HashMap<String, Output>, String> {
-    execute_function(module, name, args)
+    args: &[(Ssa, Arg)],
+) -> Result<HashMap<Ssa, Output>, String> {
+    let func = module.get_function(name)?;
+    execute_function_with_latency(func, args, HardwareConfig::default()).map(|(out, _)| out)
 }
 
 /// Best-of-N wall-clock, propagating an LX-overflow `Err` from the FIRST run so the
 /// caller can report "overflowed LX" rather than fabricate a number.
 fn best_of_n(
-    module: &IRModule,
+    module: &IRModule<'static>,
     name: &str,
-    args: &[(&str, Arg)],
-) -> Result<(f64, HashMap<String, Output>), String> {
+    args: &[(Ssa, Arg)],
+) -> Result<(f64, HashMap<Ssa, Output>), String> {
     // One warm-up (page-in, allocator warm) outside the timing; also where an LX
     // overflow surfaces.
     let _ = try_run(module, name, args)?;
@@ -275,7 +295,7 @@ fn flash_vs_untiled_wall_clock_sweep() {
                 for (k, o) in &un_out {
                     let r = fl_out
                         .get(k)
-                        .unwrap_or_else(|| panic!("flash missing output {k}"));
+                        .unwrap_or_else(|| panic!("flash missing output {k:?}"));
                     worst = worst.max(max_abs_diff(&o.data, &r.data));
                 }
                 assert!(
@@ -335,13 +355,12 @@ fn flash_vs_untiled_wall_clock_sweep() {
 
 /// Read the chosen KV block size off the emitted `scf.for` body: the per-head
 /// context MASK slice `[1, blk]` uniquely encodes `blk` (first dim is 1).
-fn recover_blk(module: &IRModule, name: &str) -> Option<i64> {
-    use ktir_emulator::ir::Attr;
+fn recover_blk(module: &IRModule<'static>, name: &str) -> Option<i64> {
     let f: &IRFunction = module.functions.get(name)?;
-    let forop = f.operations.iter().find(|o| o.op_type == "scf.for")?;
+    let forop = f.operations.iter().find(|o| o.op_type == OpKind::ScfFor)?;
     forop.regions[0]
         .iter()
-        .filter_map(|o| match o.attributes.get("shape") {
+        .filter_map(|o| match o.attr(AttrKey::Shape) {
             Some(Attr::IntList(v)) if v.len() == 2 && v[0] == 1 => Some(v[1]),
             _ => None,
         })
@@ -382,8 +401,10 @@ fn direct_tiler_matches_untiled_long_cap() {
     let (un_mod, un_name) = untiled_module(cap);
     let isl = recognize_rerolled_attention(un_mod.functions.get(&un_name).unwrap())
         .expect("recognize re-rolled");
-    let mut tiled = tile_rerolled_attention(&isl, 128);
-    tiled.name = un_name.clone();
+    let mut g = NameGen::above([Q, O, MASK, KC, KD, VC, VD]);
+    let mut tiled =
+        tile_rerolled_attention(ktir_emulator::arena::Arena::global(), &isl, 128, &mut g);
+    tiled.name = ktir_emulator::arena::Arena::global().str(un_name.clone());
     let mut fl_mod = IRModule::default();
     fl_mod.add_function(tiled);
 
@@ -392,7 +413,9 @@ fn direct_tiler_matches_untiled_long_cap() {
     let fl_out = run(&fl_mod, &un_name, &args);
     let mut worst = 0.0f32;
     for (k, o) in &un_out {
-        let r = fl_out.get(k).unwrap_or_else(|| panic!("flash missing {k}"));
+        let r = fl_out
+            .get(k)
+            .unwrap_or_else(|| panic!("flash missing {k:?}"));
         worst = worst.max(max_abs_diff(&o.data, &r.data));
     }
     eprintln!("direct tiler cap=1024: max-abs {worst:.6}");
