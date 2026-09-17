@@ -72,7 +72,7 @@ jobs:
 
       - name: Install CUDA toolkit
         if: steps.cuda.outputs.present != 'true'
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: "12.6.0"
           method: "network"
