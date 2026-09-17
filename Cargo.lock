@@ -3634,6 +3634,23 @@ name = "scratchy-builder-spyre"
 version = "0.1.0"
 
 [[package]]
+name = "scratchy-chat-template-compiler"
+version = "0.1.0"
+dependencies = [
+ "minijinja",
+ "serde_json",
+]
+
+[[package]]
+name = "scratchy-chat-template-e2e"
+version = "0.1.0"
+dependencies = [
+ "minijinja",
+ "scratchy-chat-template-compiler",
+ "serde_json",
+]
+
+[[package]]
 name = "scratchy-cli"
 version = "0.1.0"
 dependencies = [

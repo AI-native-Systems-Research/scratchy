@@ -36,6 +36,8 @@ members = [
     "crates/compiler",
     "crates/compiler/macros",
     "crates/compiler/subtile",
+    "crates/compiler/serving/chat-template",
+    "crates/compiler/serving/chat-template/e2e",
     "crates/targets/cuda/cost-sweep",
     "crates/targets/metal",
     "crates/targets/metal/compiler",
@@ -202,6 +204,7 @@ hf-hub-downloader = { path = "crates/core/hf-hub-downloader" }
 scratchy-quantizations = { path = "crates/models/quantization" }
 scratchy-vision = { path = "crates/models/vision" }
 scratchy-forward-compiler = { path = "crates/compiler" }
+scratchy-chat-template-compiler = { path = "crates/compiler/serving/chat-template" }
 scratchy-serving-transport = { path = "crates/serving/transport" }
 scratchy-bench = { path = "crates/benches" }
 scratchy-cli = { path = "crates/cli/scr" }
