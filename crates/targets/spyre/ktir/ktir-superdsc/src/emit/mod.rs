@@ -48,6 +48,12 @@ pub mod ktir_matmul_fp8;
 /// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
 pub mod lower_ktir_to_superdsc;
 
+/// ONE FUNCTION, MANY OPS — the door for a producer whose KTIR function is a whole kernel, which is
+/// the shape IBM's C++ reference producer emits (3 `linalg.matmul` in one `func.func` for a SwiGLU
+/// MLP, 12 for a decoder layer). Purely additive: it changes no entry point, no assembler and not
+/// `split_out`. See the module docs.
+pub mod whole_function;
+
 /// REAL per-core HBM start addresses for one tensor's allocate node (task #50 —
 /// replaces the former same-base-for-all-cores stub). Each core `c` gets:
 ///
