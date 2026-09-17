@@ -374,6 +374,58 @@ enum Lowering {
     Silu,
     /// A bare `linalg.reduce`, whose combiner is an attribute rather than an op kind.
     Reduce(ReduceKind),
+    /// `tile * <splatted constant>` — the multiplier read off THIS op, not the whole function. See
+    /// [`splat_scale_of`] for the discriminator and why it cannot be per-function here.
+    ScalarMul(f32),
+}
+
+/// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
+///
+/// ⭐ THE DISCRIMINATOR IS THE CRATE'S OWN, NOT AN INVENTION. [`Program`]'s doc names it: "Elementwise
+/// `Mul` and `ScalarMul` are the one pair that needs a tiebreak, and it already exists:
+/// `program_scalarmul_scale` tells them apart by whether an operand is a `tensor.splat`." So an
+/// `arith.mulf` with exactly one splatted-constant operand IS a scalar multiply — there is no other
+/// kind it could be, because `Elementwise(Mul)` needs two tensor operands and the splat is not one.
+/// Choosing it is applying a documented rule, not picking a node kind on the producer's behalf.
+///
+/// ⛔ AND IT MUST BE PER-OP, NOT PER-FUNCTION. `program_scalarmul_scale` reads every `arith.mulf` and
+/// requires them all to agree, which is exact for a one-node function. ONE decoder layer holds 21
+/// `arith.mulf`: most have no splat, and the splatted ones carry FOUR DIFFERENT constants — `INV_D`
+/// (the rmsnorm reduction divisor), `QK_SCALE` (the score scale), and `RM` twice (the residual
+/// multipliers). The whole-function reader returns `None` there by construction, so the scale has to
+/// be read from the op that uses it.
+///
+/// Returns `(scale, the tensor operand)`. `None` when this is not a scalar multiply at all:
+///
+/// * NEITHER operand is a splat — an ordinary two-tensor `Elementwise(Mul)`, which the 1:1 map handles.
+/// * BOTH are splats — a multiply of two compile-time constants. That is not a scalarmul (there is no
+///   tensor to scale) and emitting one would invent an operand; it belongs to constant folding
+///   upstream, so it falls through to be refused by name.
+fn splat_scale_of(f: &IRFunction<'static>, op: &ktir_core::ir::Operation<'static>) -> Option<(f32, Ssa)> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    // A splatted compile-time FLOAT. `arith.constant` → `tensor.splat` is the only spelling this
+    // crate's producers use, and it is the one `program_scalarmul_scale` already reads.
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(k, v)| match (k, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    let [a, b] = op.operands[..] else { return None };
+    match (splat_value(a), splat_value(b)) {
+        (Some(v), None) => Some((v as f32, b)),
+        (None, Some(v)) => Some((v as f32, a)),
+        // Both or neither: not a scalar multiply. See the doc above.
+        _ => None,
+    }
 }
 
 /// The [`ReduceKind`] a `linalg.reduce` states, read off its own `ReduceFn` attribute.
@@ -577,9 +629,17 @@ pub fn lower_function(
         let reduce = (op.op_type == OpKind::LinalgReduce)
             .then(|| reduce_kind_of(op))
             .flatten();
+        // `arith.mulf` by a SPLATTED CONSTANT is a scalar multiply, not an `Elementwise(Mul)` — the
+        // tiebreak `Program`'s own doc names. Read per-op, because one decoder layer states four
+        // different multipliers. Checked BEFORE the 1:1 map, which would otherwise route it to
+        // `Elementwise(Mul)` and then fail on the splat operand having no `Region`.
+        let scalar = (op.op_type == OpKind::ArithMulf)
+            .then(|| splat_scale_of(f, op))
+            .flatten();
         let Some(program) = terminal
             .map(|_| Lowering::Silu)
             .or(reduce.map(Lowering::Reduce))
+            .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
             .or_else(|| program_of(op.op_type).map(Lowering::Node))
         else {
             return err(format!(
@@ -606,6 +666,9 @@ pub fn lower_function(
             // `linalg.reduce`'s operands are `(data, init)`: the init is the SEED, which the reduce
             // op-func carries itself, so only the data is an input.
             Lowering::Reduce(_) => 1,
+            // The splat is not an operand of the descriptor — it rides in the op as a bound `[1,1]`
+            // const — so a scalar multiply reads ONE tensor.
+            Lowering::ScalarMul(_) => 1,
             Lowering::Node(Program::Matmul) => 2,
             Lowering::Node(Program::Elementwise(e)) => {
                 match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
@@ -618,9 +681,12 @@ pub fn lower_function(
         };
 
         // A fused chain's inputs are the ones the RECOGNISER proved, not the terminal op's operands.
-        let in_values: Vec<Ssa> = match terminal {
-            Some(c) => vec![c.gate, c.up],
-            None => op.operands.iter().copied().take(n_in).collect(),
+        let in_values: Vec<Ssa> = match (terminal, scalar) {
+            (Some(c), _) => vec![c.gate, c.up],
+            // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
+            // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
+            (None, Some((_, tensor))) => vec![tensor],
+            (None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
         let mut per_op: Vec<Region> = Vec::with_capacity(n_in + 1);
@@ -668,15 +734,25 @@ pub fn lower_function(
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
                     [dims[0] as u32, dims[1] as u32]
                 }
-                // A ROW REDUCTION'S RESULT IS RANK-1 IN KTIR AND `[rows, 1]` ON DEVICE, and that is
-                // the one rank-1 intermediate whose 2-D footprint is not a guess: `linalg.reduce`
-                // over the trailing axis of `[rows, cols]` yields `[rows]`, one value per row, which
-                // is exactly the `[rows, 1]` accumulator `assemble_reduce_seeded` writes. Restricted
-                // to the reduce arm on purpose — a rank-1 intermediate from anything else could as
-                // easily be a `[cols]` row vector, and reading it as `[cols, 1]` would size the
-                // buffer right and address it wrong, so that case keeps the refusal below.
+                // A RANK-1 INTERMEDIATE IS `[rows, 1]` WHEN ITS VALUE CAME FROM A ROW REDUCTION, and
+                // that is decided by PROVENANCE rather than by this op's kind.
+                //
+                // `linalg.reduce` over the trailing axis of `[rows, cols]` yields `[rows]` — one value
+                // per row, exactly the `[rows, 1]` accumulator `assemble_reduce_seeded` writes. A
+                // decoder's rmsnorm then keeps that column shape through `ms = sum(x*x) * INV_D` and
+                // `rsqrt(ms + eps)`, so the SAME footprint is right for every pointwise op along that
+                // chain — but for the same reason it is NOT right for a rank-1 value that is a `[cols]`
+                // ROW vector (a broadcast source), where `[cols, 1]` would size the buffer correctly
+                // and address it wrong.
+                //
+                // The discriminator is therefore the INPUT's own column extent, which is already known
+                // here: a reduce writes `c_len == 1`, so anything reading a one-column tile is on the
+                // reduction's side of the program. A reduce's own result qualifies by its kind because
+                // it has no such input to consult.
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. })
-                    if dims.len() == 1 && matches!(program, Lowering::Reduce(_)) =>
+                    if dims.len() == 1
+                        && (matches!(program, Lowering::Reduce(_))
+                            || per_op.iter().any(|r| !r.is_out && r.c_len == 1)) =>
                 {
                     [dims[0] as u32, 1]
                 }
@@ -774,6 +850,14 @@ fn emit_one(
         // the measured device defect that makes that a correctness matter rather than a limitation.
         Lowering::Reduce(kind) => {
             return super::lower_ktir_to_superdsc::reduce(name, kind, per_op, sym_id_base, layout);
+        }
+        // `tile * <constant>`, with the multiplier this op's own — `scalarmul_at` is the shared body
+        // the per-`Program` door reaches through `scalarmul`, so the two cannot drift about what a
+        // scalar multiply emits.
+        Lowering::ScalarMul(scale) => {
+            return super::lower_ktir_to_superdsc::scalarmul_at(
+                name, scale, per_op, sym_id_base, layout,
+            );
         }
         Lowering::Node(p) => p,
     };
