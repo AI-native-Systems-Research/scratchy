@@ -1453,7 +1453,7 @@ pub enum Placed {
 
 /// Replaces: e004_FailedAlloc
 ///
-/// ONE MEMORY TRACKER — `memTrackers->getTracker(comp, core, corelet, row)` (`ddc/ddcv1.cpp:187`).
+/// ONE MEMORY TRACKER — `memTrackers->getTracker(comp, core, corelet, row)` (`ddc/ddcv1.cpp:215`).
 ///
 /// ⭐ THIS IS ALSO `FailedAlloc` (`ddc/ddc_metadata.h:24`), FIELD FOR FIELD, AND A SECOND STRUCT FOR
 /// IT WOULD BE DEAD CODE. `FailedAlloc`'s four members ARE the tracker site an allocation was
@@ -8701,6 +8701,128 @@ mod tests_e258_e263 {
         assert_eq!(
             global.loops_below_chunk_boundary,
             BTreeSet::from([LOOP, LoopId(NodeId(2))])
+        );
+    }
+
+    /// A tracker that keeps every site the placement asked it about, in the order it was asked.
+    #[derive(Default)]
+    struct Sites(Vec<TrackerSite>);
+
+    impl MemTrackers for Sites {
+        fn capacity(&self, _at: TrackerSite) -> Bytes {
+            Bytes(4096)
+        }
+        fn backup(&mut self, at: TrackerSite) {
+            self.0.push(at);
+        }
+        fn restore_all(&mut self) {}
+        fn remove(&mut self, _at: TrackerSite, _name: &StorageName) {}
+        fn add_at(&mut self, _at: TrackerSite, _name: &StorageName, _size: Bytes, _addr: Bytes) {}
+        fn check_and_add(
+            &mut self,
+            _at: TrackerSite,
+            _name: &StorageName,
+            _size: Bytes,
+        ) -> Option<Placed> {
+            Some(Placed::At(Bytes(0)))
+        }
+        fn check_and_add_at(
+            &mut self,
+            _at: TrackerSite,
+            _name: &StorageName,
+            _size: Bytes,
+            address: Bytes,
+        ) -> Option<Placed> {
+            Some(Placed::At(address))
+        }
+    }
+
+    /// `FailedAlloc`'s four members (`ddc/ddc_metadata.h:25-28`) are the four
+    /// `getTracker(comp, core, corelet, row)` is keyed by (`ddc/ddcv1.cpp:215`), so the site the
+    /// placement probes is the memory it is walking at the reference's `0` corelet and row proxies
+    /// (`:205`, `:211`) — and the corelet stops being a proxy exactly when L0 splits.
+    #[test]
+    fn a_tracker_site_is_the_memory_and_the_core_corelet_and_row_the_placement_walks() {
+        use crate::arch::Sen1p5;
+
+        fn one(memory: DdcMemory) -> Metadata {
+            let mut metadata = Metadata::default();
+            metadata.new_allocations.insert(
+                memory,
+                Allocation {
+                    lds_idx_and_alloc_node: BTreeMap::from([(LdsIdx(0), AllocId(0))]),
+                    ..Allocation::default()
+                },
+            );
+            metadata.shadow_allocations = vec![vec![AllocId(0)]];
+            metadata
+        }
+        let tree = Tree {
+            alloc_prev: BTreeMap::from([(AllocId(0), ROOT)]),
+            ..Tree::default()
+        };
+        let row = Row::at::<0>();
+
+        // An unsplit memory is probed at ONE site, and it is corelet 0 and row 0.
+        let mut allocs = AllocArena::from([(AllocId(0), alloc_node(SenComponent::Lx, Some(0)))]);
+        let mut sites = Sites::default();
+        assert_eq!(
+            alloc_all_mem::<Dd2, _, _, _>(
+                &Space::default(),
+                &tree,
+                &mut one(DdcMemory::Lx),
+                &mut allocs,
+                &mut sites,
+                LxTrackers::True,
+                Commit::No,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            sites.0,
+            vec![TrackerSite {
+                memory: DdcMemory::Lx,
+                core: core0(),
+                corelet: cl0(),
+                row,
+            }]
+        );
+
+        // A split L0 moves the corelet axis and leaves the other three where they were.
+        let dsc = Space {
+            corelets: vec![cl0(), cl1()],
+            ..Space::default()
+        };
+        let mut allocs = AllocArena::from([(AllocId(0), alloc_node(SenComponent::L0, Some(0)))]);
+        let mut sites = Sites::default();
+        assert_eq!(
+            alloc_all_mem::<Sen1p5, _, _, _>(
+                &dsc,
+                &tree,
+                &mut one(DdcMemory::L0),
+                &mut allocs,
+                &mut sites,
+                LxTrackers::True,
+                Commit::No,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            sites.0,
+            vec![
+                TrackerSite {
+                    memory: DdcMemory::L0,
+                    core: core0(),
+                    corelet: cl0(),
+                    row,
+                },
+                TrackerSite {
+                    memory: DdcMemory::L0,
+                    core: core0(),
+                    corelet: cl1(),
+                    row,
+                },
+            ]
         );
     }
 }
