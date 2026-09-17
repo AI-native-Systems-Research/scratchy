@@ -832,6 +832,95 @@ pub fn rmsnorm_at(
     ))
 }
 
+/// THE POINTWISE DEVICE-WIDTH PAD, CAPPED AT THE WIDTH THE OUTPUT'S PLACEMENT ACTUALLY HOLDS.
+///
+/// # THE SECOND INSTANCE OF A NAMED CLASS, NOT A ONE-OFF
+///
+/// [`DeviceWidth::for_pointwise`] pads a ScalarMul's column count to a stick count the gemm can split
+/// across cores. That pad is width a SECOND PARTY has to make real: for the lm-head logits it IS real,
+/// because the producer matmul emitted the padded width and the bundle layout reserved the padded
+/// footprint. For a whole-function INTERMEDIATE, minted by `whole_function::lower_function` at its
+/// logical 2-D shape, nobody reserved it — so the descriptor addresses past the buffer.
+///
+/// This is exactly the defect `2c5abe0a5` fixed for the matmul's `out` width
+/// ([`super::super::ir::bridge::tiled_op_sdsc_op::matmul::assemble`]'s `out_width_the_weight_holds`),
+/// and W1's invented-width audit PREDICTED this site before any config reached it: "`for_pointwise` …
+/// INVENTED, and WORSE than the matmul's: it is UNCONDITIONAL — no `macs >= 2^20` gate, so it pads
+/// every ScalarMul. NOT REACHABLE TODAY … Same fix shape (cap at the OUTPUT placement's whole-stick
+/// width) … the width is chosen at the read-only call site and I cannot construct a config that
+/// reaches it, so I did not change it."
+///
+/// MEASURED, and it is that config: `decoder_layer_one_flat`'s `qk · QK_SCALE` writes a `[64, 64]`
+/// intermediate, `for_pointwise` bumps 64 columns to 512 (eight sticks), and the emission asked for
+/// `0B + 65536B` of a buffer declared `8192B` — caught by `resolve_seg_base`'s footprint guard as
+/// "would alias the next intermediate".
+///
+/// # WHY HERE AND NOT IN THE ASSEMBLER
+///
+/// W1 named `assemble_pointwise_broadcast_off_from_tile` because the call site was read-only to it.
+/// Both are ours now, and the width is CHOSEN here — it is baked into the `TileOp` two lines below, so
+/// capping at the point of choice keeps the `TileOp` and the assembler in agreement by construction
+/// rather than by two matching adjustments.
+///
+/// # ⛔ IT ONLY EVER DROPS A PAD IT CAN PROVE IS THIS RULE'S OWN
+///
+/// The same discipline that makes the matmul's version safe: the reserved width is re-padded and must
+/// REPRODUCE the width handed in. So a genuine over-run — an emission wider than the placement for any
+/// other reason — still reaches the footprint guard and is refused BY NAME, rather than quietly
+/// satisfied by a narrower descriptor that computes fewer columns than the program states. And it is a
+/// no-op wherever the layout does reserve the pad, which is the lm-head logits case the rule exists
+/// for.
+fn pointwise_width_the_output_holds(
+    layout: Option<&BundleLayout>,
+    names: &[&str],
+    rows: u32,
+    cols: u32,
+) -> u32 {
+    let Some(l) = layout else { return cols };
+    if rows == 0 {
+        return cols;
+    }
+    // ⭐ EVERY TENSOR THE OP ADDRESSES AT `cols`, NOT JUST THE OUTPUT. `cols` sizes the input view and
+    // the output view alike, so the pad is only real if BOTH hold it — and MEASURED, the one that did
+    // not was the INPUT: the guard fired on `synth 't32'` (the `qk` intermediate this op reads) while
+    // the output `t33` was a separate buffer. Taking the narrowest is what makes the check about the
+    // emission rather than about one operand of it.
+    //
+    // ⛔ AND IT READS THE SYNTH ALLOCATOR AS WELL AS `placements`. A whole-function INTERMEDIATE is
+    // declared through `BundleLayout::synth`, which records its footprint in `SynthAlloc::sizes` and
+    // NOT in `placements` — `resolve_seg_base`'s case 2, "the name is in the synth allocator's map".
+    // Reading only `placements` found nothing for exactly the tensors this cap exists for, so the cap
+    // silently did not fire; the first version of this function had that bug and the decoder's own
+    // footprint guard caught it.
+    let held_of = |name: &str| -> Option<u32> {
+        let bytes = match l.id_of(name) {
+            Some(crate::place::PlaceId::Act(tid)) => l
+                .placements
+                .get(&tid)
+                .map(|p| p.size)
+                .or_else(|| l.synth.borrow().sizes.get(name).copied()),
+            _ => l.synth.borrow().sizes.get(name).copied(),
+        }?;
+        // A footprint is `synth_footprint_bytes`: the INNER (column) axis stick-rounded, the outer
+        // multiplied. So one row costs a stick-rounded column count, and the width the buffer holds is
+        // its size divided by the rows, in whole fp16 sticks.
+        let row_bytes = (bytes / rows as u64).max(1);
+        Some(((row_bytes / 2) as u32 / FP16_ELEMS_PER_STICK) * FP16_ELEMS_PER_STICK)
+    };
+    let Some(held) = names.iter().filter_map(|n| held_of(n)).min() else {
+        return cols;
+    };
+    // THE PROOF: re-pad what the layout holds and require it to REPRODUCE the width we were about to
+    // emit. Only then is the excess demonstrably this rule's own pad; anything else is a genuine
+    // over-run and must still reach the footprint guard and be refused BY NAME, rather than be quietly
+    // satisfied by a narrower descriptor computing fewer columns than the program states.
+    if held > 0 && held < cols && DeviceWidth::for_pointwise(held).get() == cols {
+        held
+    } else {
+        cols
+    }
+}
+
 /// main's `lower_scalarmul_node` (main 10376-10441): an on-device pointwise `mul` by the bound
 /// `[1,1]` scale const.
 ///
@@ -902,7 +991,15 @@ pub fn scalarmul_at(
     // device width its producer matmul emitted (49664), not the logical 49159 (whose sub-stick 7 the dxp
     // scheduler rejects). `for_pointwise` == the producer's `for_output` for macs≥2^20 producers. A no-op
     // for 64-aligned tensors (residual/embedding [.,4096]).
-    let cols = DeviceWidth::for_pointwise(out.c_len).get();
+    //
+    // ⛔ AND THE PAD IS ONLY REAL IF SOMETHING RESERVED IT — capped at the width the OUTPUT's placement
+    // actually holds. See [`pointwise_width_the_output_holds`].
+    let cols = pointwise_width_the_output_holds(
+        layout,
+        &[&out_name, &x],
+        rows,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    );
     let scale_name = crate::place::act_name(scalarmul_scale_tid(idx));
     let op_name = format!("scalarmul_o{}", out.tid);
     let x_h = rbo(&x);
