@@ -3034,6 +3034,225 @@ pub fn matmul(
     Ok(vec![op])
 }
 
+
+/// A BARE ROW REDUCTION — `[rows, cols]` → `[rows, 1]`, one `sfp` op along the stick axis.
+///
+/// ⭐ THE ASSEMBLER WAS ALREADY WRITTEN; WHAT WAS MISSING WAS A DOOR — the same story as
+/// [`transpose`]. `assemble_reduce` / `assemble_reduce_seeded` have carried the `sum`/`max`/`mean`
+/// reduce since the SubtileIR path, and `assemble_rmsnorm` calls them, but only from INSIDE a fused
+/// kind. A producer whose program states a bare `linalg.reduce` — every Triton `tl.sum(x, 1)` or
+/// `tl.max(x, 1)` that is not part of a recognised rmsnorm — had no entry point at all.
+///
+/// # ⛔⛔⛔ A MULTI-ROW MAX IS REFUSED, AND IT IS THE SHARPEST SILENT WRONG ANSWER IN THIS FILE
+///
+/// [`reduce.rs`](crate::ir::bridge::tiled_op_sdsc_op::reduce) records a MEASURED device defect at its
+/// own code, above `reduce_opspec_off`:
+///
+/// > The on-card reduce-**MAX** returns 0 (the seed) when `rows>1` (PROVEN via attn diag: mxp=0 over
+/// > [nqh,cap]) but is CORRECT at rows=1 (the rmsnorm `rmamax` works). reduce-SUM is fine multi-row
+/// > (the score reduce gives sane scores), so only the softmax max-reduce needs splitting into nqh
+/// > single-row reduces.
+///
+/// So a `max` over more than one row LOWERS, BAKES, produces a well-formed descriptor, exits 0 under
+/// `dxp_standalone` — and returns ZERO for every row. Nothing in the compile path can see it, because
+/// `dxp_standalone` executes no arithmetic. A decoder's softmax is `m = tl.max(qk, 1)` over BLOCK_M
+/// rows (64 in every configuration this backend compiles), so this is not a corner: it is the exact
+/// shape the target kernel states.
+///
+/// It is refused BY NAME rather than emitted, and the refusal names the remedy `reduce.rs` itself
+/// records — one single-row reduce per row. That splitting is NOT done here: it is `rows` descriptors
+/// instead of one, so it is an emission-shape decision with its own cost (64 SuperDSCs per softmax)
+/// and its own addressing (a per-row element offset, which is what `reduce_opspec_off` exists for).
+/// Choosing it silently on the producer's behalf is exactly what this door does not do.
+///
+/// `Sum` is unaffected at any row count, and `Max` at `rows == 1` is the case the shipped rmsnorm
+/// `rmamax` proves, so both are lowered.
+pub fn reduce(
+    name: &str,
+    kind: crate::ktir_node::ReduceKind,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ktir_node::ReduceKind;
+    let (ins, out) = split_out(name, r, layout, 1)?;
+    let data = ins[0];
+    // The REDUCED extent is the data's column span and the result is one column per row. Read the
+    // shape off the DATA rather than the output, so `rows` and `cols` cannot both come from the same
+    // region and agree vacuously.
+    let (rows, cols) = (data.r_len, data.c_len);
+    if rows == 0 || cols == 0 {
+        return err(format!(
+            "{name}: reducing t{} `[{rows}, {cols}]` — a reduce needs a non-empty tile",
+            data.tid
+        ));
+    }
+    // ⛔⛔⛔ THE MEASURED DEVICE DEFECT, FIRST, so no other complaint can mask it.
+    if matches!(kind, ReduceKind::Max) && rows > 1 {
+        return err(format!(
+            "{name}: a `max` reduce over t{}'s {rows} rows is REFUSED, and not because it cannot be \
+             described. `ir/bridge/tiled_op_sdsc_op/reduce.rs` records, at its own code and proven by \
+             an attention diagnostic (mxp=0 over [nqh,cap]), that the ON-CARD reduce-MAX returns 0 — \
+             THE SEED — whenever `rows > 1`, and is correct only at `rows == 1`. So this would emit a \
+             well-formed descriptor, bake, exit 0 under `dxp_standalone` (which executes no \
+             arithmetic), and hand back ZERO for all {rows} rows. A softmax built on it computes \
+             `exp(x - 0)`, silently. THE REMEDY, which `reduce.rs` names: split it into {rows} \
+             single-row reduces, one per row, addressed through `reduce_opspec_off`'s per-operand \
+             element offsets. That is {rows} descriptors instead of one and an addressing decision \
+             this door will not take on the producer's behalf — state it, or reduce with `sum`, which \
+             is correct multi-row.",
+            data.tid
+        ));
+    }
+    // A `[rows, 1]` accumulator: the reduce writes one value per row.
+    if out.c_len != 1 {
+        return err(format!(
+            "{name}: the reduce's output t{} is `[{}, {}]`, but a row reduction along the stick axis \
+             writes ONE value per row — `[{rows}, 1]`. An output wider than one column would leave \
+             every column but the first holding whatever the buffer held.",
+            out.tid, out.r_len, out.c_len
+        ));
+    }
+    if out.r_len != rows {
+        return err(format!(
+            "{name}: the reduce reads {rows} row(s) of t{} and writes {} row(s) of t{} — a row \
+             reduction writes exactly one value per row it reads",
+            data.tid, out.r_len, out.tid
+        ));
+    }
+    let op_name = format!("{}_o{}", kind.op_func(), out.tid);
+    Ok(vec![
+        crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_seeded(
+            &op_name,
+            kind.op_func(),
+            rows,
+            cols,
+            &rb(&data.name(), rows, cols),
+            &rb(&out.name(), rows, 1),
+            sym_id_base,
+            layout,
+        ),
+    ])
+}
+
+/// THE REDUCE DOOR'S FAIL-CLOSED HALF, and the multi-row `max` is the reason this module exists.
+///
+/// ⛔⛔⛔ The refusal these tests pin is the ONLY thing standing between a decoder's softmax and a
+/// silent wrong answer. `ir/bridge/tiled_op_sdsc_op/reduce.rs` records, at its own code and proven by
+/// an attention diagnostic, that the on-card reduce-MAX returns 0 — the SEED — whenever `rows > 1`.
+/// A multi-row max therefore emits a well-formed descriptor, bakes, and exits 0 under
+/// `dxp_standalone`, which executes no arithmetic. NOTHING in the compile path can see it. So the
+/// guard is tested before it is trusted, and every case carries its accepting control.
+#[cfg(test)]
+mod reduce_tests {
+    use super::*;
+    use crate::ktir_node::ReduceKind;
+
+    /// A whole-buffer operand: the view IS the window and the store windows tile it.
+    fn reg(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
+        Region {
+            tid,
+            v_rows: rows,
+            v_cols: cols,
+            r_start: 0,
+            c_start: 0,
+            r_len: rows,
+            c_len: cols,
+            r_cover: (0, rows),
+            is_out,
+            is_fp8: false,
+        }
+    }
+
+    /// `[data, out]` — the parameter list a reduce's `split_out(.., 1)` reads.
+    fn parms(rows: u32, cols: u32) -> Vec<Region> {
+        vec![reg(1, rows, cols, false), reg(2, rows, 1, true)]
+    }
+
+    fn lower(kind: ReduceKind, rows: u32, cols: u32) -> Result<Vec<EmittedOp>, Error> {
+        let mut sid = 0i64;
+        reduce("probe", kind, &parms(rows, cols), &mut sid, None)
+    }
+
+    /// The refusal message, or a panic naming that something was emitted. Hand-written because
+    /// `EmittedOp` is deliberately not `Debug`, so `expect_err` cannot be used — and a test that reads
+    /// a refusal must fail loudly when there is none.
+    fn refusal(kind: ReduceKind, rows: u32, cols: u32) -> String {
+        match lower(kind, rows, cols) {
+            Ok(ops) => panic!(
+                "expected a refusal, but {} descriptor(s) were emitted for a {rows}-row {:?} reduce",
+                ops.len(),
+                kind
+            ),
+            Err(e) => e.message,
+        }
+    }
+
+    /// ⛔⛔⛔ THE MEASURED DEVICE DEFECT. A `max` over more than one row must be refused, and the
+    /// refusal must name the seed, the row count and the remedy — a reader who only sees "refused"
+    /// will reach for the extents.
+    #[test]
+    fn a_multi_row_max_is_refused_and_the_refusal_names_the_seed() {
+        let m = refusal(ReduceKind::Max, 64, 128);
+        for want in ["THE SEED", "64", "single-row"] {
+            assert!(
+                m.contains(want),
+                "the refusal must name `{want}` — it is the difference between a reader fixing the \
+                 shape and a reader understanding that the device returns zero. Got: {m}"
+            );
+        }
+    }
+
+    /// THE CONTROL THAT MAKES THE ABOVE MEAN SOMETHING: the same shape with `sum` is fine, because
+    /// `reduce.rs` records reduce-SUM as correct multi-row. If this ever refuses too, the test above is
+    /// passing for the wrong reason.
+    #[test]
+    fn a_multi_row_sum_is_lowered_because_only_max_is_affected() {
+        let ops = lower(ReduceKind::Sum, 64, 128)
+            .expect("reduce-SUM is correct multi-row; only the max returns the seed");
+        assert_eq!(ops.len(), 1, "a row reduction is one descriptor");
+    }
+
+    /// THE SECOND CONTROL: `max` at `rows == 1` is the case the shipped rmsnorm `rmamax` proves on
+    /// card, so the guard must be about the ROW COUNT and not about `max` itself.
+    #[test]
+    fn a_single_row_max_is_lowered_because_that_is_the_case_the_device_gets_right() {
+        let ops = lower(ReduceKind::Max, 1, 128)
+            .expect("`max` at rows == 1 is correct on card — the rmsnorm `rmamax` uses it");
+        assert_eq!(ops.len(), 1, "a row reduction is one descriptor");
+    }
+
+    /// An output wider than one column would leave every column but the first holding whatever the
+    /// buffer held, so it is named rather than emitted.
+    #[test]
+    fn an_output_that_is_not_one_column_per_row_is_refused() {
+        let mut sid = 0i64;
+        let parms = vec![reg(1, 64, 128, false), reg(2, 64, 8, true)];
+        let e = reduce("probe", ReduceKind::Sum, &parms, &mut sid, None)
+            .err()
+            .expect("a reduce writes exactly one value per row");
+        assert!(
+            e.message.contains("ONE value per row"),
+            "the refusal must say what a row reduction writes; got: {}",
+            e.message
+        );
+    }
+
+    /// And a row count that disagrees between the data and the accumulator.
+    #[test]
+    fn a_row_count_that_disagrees_between_data_and_output_is_refused() {
+        let mut sid = 0i64;
+        let parms = vec![reg(1, 64, 128, false), reg(2, 32, 1, true)];
+        let e = reduce("probe", ReduceKind::Sum, &parms, &mut sid, None)
+            .err()
+            .expect("a reduce writes one value per row it reads");
+        assert!(
+            e.message.contains("one value per row it reads"),
+            "the refusal must name the disagreement; got: {}",
+            e.message
+        );
+    }
+}
 /// A WHOLE-TENSOR 2-D TRANSPOSE — `[mb, out]` → `[out, mb]`, one `interslicetranspose_fp16` on the PT
 /// unit, via [`super::assemble_transpose`].
 ///

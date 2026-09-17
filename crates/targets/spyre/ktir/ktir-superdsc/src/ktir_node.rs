@@ -131,6 +131,44 @@ impl Elementwise {
     ];
 }
 
+/// WHICH row reduction — the two `sfp` reduce op-funcs a KTIR `linalg.reduce` can name.
+///
+/// `mean` is deliberately absent: it is the SAME device op with `1/N` folded into the reduce scale,
+/// and `assemble_rmsnorm` reaches it directly. A producer that spells the mean as `sum` then a
+/// multiply by a splatted `1/N` — which is what a Triton `tl.sum(x, 1) * INV_D` states — gets `Sum`
+/// here and keeps its own multiply, so no `1/N` is folded on its behalf.
+///
+/// ⭐ DELIBERATELY *NOT* A [`Program`] VARIANT, and the reason is a real cost rather than taste.
+/// [`Program`] is matched EXHAUSTIVELY by consumers outside this crate (a caller's layout planner has
+/// one arm per kind), so a new variant is a breaking change to every one of them for a kind that only
+/// the whole-function door can reach — `linalg.reduce` never arrives as a per-`Program` node, because
+/// a producer stating one node per model-graph op states the FUSED kind that contains it
+/// (`Program::RmsNorm`), not the bare reduce. So the kind travels as an argument to
+/// [`crate::emit::lower_ktir_to_superdsc::reduce`] and the door that reads it dispatches locally.
+///
+/// ⛔⛔⛔ AND `Max` IS NOT SYMMETRIC WITH `Sum`, WHICH IS WHY THIS IS A TYPE AND NOT A STRING.
+/// `ir/bridge/tiled_op_sdsc_op/reduce.rs` records a MEASURED device defect at its own code: the
+/// on-card reduce-MAX returns 0 — the SEED — whenever `rows > 1`, proven by an attention diagnostic,
+/// and is correct only at `rows == 1`; reduce-SUM is fine multi-row. A multi-row max therefore
+/// lowers, bakes, exits 0, and returns zero for every row. The entry point refuses it by name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReduceKind {
+    /// `arith.addf` as the combiner. Correct multi-row on card.
+    Sum,
+    /// `arith.maxnumf` as the combiner. ⛔ CORRECT ONLY AT `rows == 1` — see [`Program::Reduce`].
+    Max,
+}
+
+impl ReduceKind {
+    /// The `opFuncName` this kind emits. `sfp` for both.
+    pub const fn op_func(self) -> &'static str {
+        match self {
+            ReduceKind::Sum => "sum",
+            ReduceKind::Max => "max",
+        }
+    }
+}
+
 /// WHAT THIS PROGRAM COMPUTES — the node kind, as a type.
 ///
 /// ⛔⛔⛔ IT WAS A SUBSTRING OF `func.name`, AND THAT IS A STRINGY CONTRACT THIS CRATE OWNS. The

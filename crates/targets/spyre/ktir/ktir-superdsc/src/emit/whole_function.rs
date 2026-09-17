@@ -47,7 +47,7 @@ use ktir_core::ir::{Attr, IRFunction, Ssa};
 use ktir_core::opkind::OpKind;
 
 use super::lower_ktir_to_superdsc::{Error, Region, err, regions};
-use crate::ktir_node::{Elementwise, KtirNode, Program};
+use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
 use crate::placement::BundleLayout;
 
 /// THE SILU LONGHAND, as the ONE fused op it is — `out = silu(gate) · up`.
@@ -357,6 +357,44 @@ pub fn program_of(op: OpKind) -> Option<Program> {
     })
 }
 
+/// WHAT THIS DOOR WILL LOWER ONE OP AS — a `Program` the crate already has, or one of the two kinds
+/// that are reachable ONLY from here.
+///
+/// ⭐ A LOCAL ENUM RATHER THAN TWO MORE [`Program`] VARIANTS, and that is a deliberate cost trade.
+/// `Program` is matched exhaustively by consumers outside this crate — a caller's layout planner has
+/// one arm per kind — so every variant added there is a breaking change for them. `Silu` and `Reduce`
+/// are reachable only through the whole-function walk (a per-`Program` producer states the FUSED kind
+/// that contains them), so keeping them here costs those callers nothing.
+#[derive(Clone, Copy, Debug)]
+enum Lowering {
+    /// A kind the crate's `Program` already names, lowered by its existing entry point.
+    Node(Program),
+    /// The five-op silu longhand, PROVEN by [`program_silu_mul_chains`] and lowered as one
+    /// `silumul`.
+    Silu,
+    /// A bare `linalg.reduce`, whose combiner is an attribute rather than an op kind.
+    Reduce(ReduceKind),
+}
+
+/// The [`ReduceKind`] a `linalg.reduce` states, read off its own `ReduceFn` attribute.
+///
+/// ⭐ NOT A 1:1 OP-KIND MAP, WHICH IS WHY IT IS NOT IN [`program_of`]. `OpKind::LinalgReduce` says
+/// "a reduction happens here" and nothing about WHICH one; the combiner is an attribute
+/// (`ReduceFn = Op(ArithAddf)` for a sum, `Op(ArithMaxnumf)` for a max), so the kind has to be read
+/// from the op rather than derived from its kind. `program_of` takes an `OpKind` alone by design, so
+/// this sits beside it and [`lower_function`] consults both.
+///
+/// A combiner outside the two the device has is `None`, and the caller refuses it by name — a
+/// `linalg.reduce` combining with `arith.mulf` (a product reduction) has no `sfp` reduce op-func, and
+/// lowering it as the nearest one would compute a different function.
+fn reduce_kind_of(op: &ktir_core::ir::Operation<'static>) -> Option<ReduceKind> {
+    op.attributes.iter().find_map(|(k, v)| match (k, v) {
+        (AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf)) => Some(ReduceKind::Sum),
+        (AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaxnumf)) => Some(ReduceKind::Max),
+        _ => None,
+    })
+}
+
 /// Is this op addressing or bookkeeping rather than computation?
 fn is_plumbing(op: OpKind) -> bool {
     matches!(
@@ -531,7 +569,18 @@ pub fn lower_function(
         // rather than its own operands (which are `silu(gate)` and up). Everything else keeps the
         // 1:1 map exactly as before.
         let terminal = silus.iter().copied().find(|c| op.result == Some(c.mul));
-        let Some(program) = terminal.map(|_| Program::SiluMul).or_else(|| program_of(op.op_type))
+        // A `linalg.reduce`'s combiner is an ATTRIBUTE, not its op kind, so the kind is read off the op
+        // beside the 1:1 map rather than from it — and it is carried HERE rather than as a `Program`
+        // variant, because `Program` is matched exhaustively by consumers outside this crate and a bare
+        // reduce is reachable only through this door. An unrecognised combiner falls through to the
+        // refusal below and is named there.
+        let reduce = (op.op_type == OpKind::LinalgReduce)
+            .then(|| reduce_kind_of(op))
+            .flatten();
+        let Some(program) = terminal
+            .map(|_| Lowering::Silu)
+            .or(reduce.map(Lowering::Reduce))
+            .or_else(|| program_of(op.op_type).map(Lowering::Node))
         else {
             return err(format!(
                 "{}: `{:?}` has no 1:1 `Program`, so this door cannot lower it without choosing a \
@@ -545,21 +594,27 @@ pub fn lower_function(
         // [`matmul_weight_is_transpose_b`]: the extent guards downstream cannot distinguish the two
         // orientations when k == n, so a square weight would otherwise lower to a descriptor
         // contracting the other way round.
-        if matches!(program, Program::Matmul) {
+        if matches!(program, Lowering::Node(Program::Matmul)) {
             matmul_weight_is_transpose_b(f, op)?;
         }
 
         // THIS OP'S INPUTS. `linalg.matmul`'s last operand is its `outs` accumulator init, not an
         // input, and the result is the output — so the inputs are the leading operands.
         let n_in = match program {
-            Program::Matmul => 2,
-            Program::SiluMul => 2,
-            Program::Elementwise(e) => match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
-                Ok((_, arity)) => arity,
-                Err(e) => return Err(e),
-            },
-            Program::Transpose => 1,
-            _ => op.operands.len(),
+            // The silu's two inputs are the chain's gate and up, which the recogniser proved.
+            Lowering::Silu => 2,
+            // `linalg.reduce`'s operands are `(data, init)`: the init is the SEED, which the reduce
+            // op-func carries itself, so only the data is an input.
+            Lowering::Reduce(_) => 1,
+            Lowering::Node(Program::Matmul) => 2,
+            Lowering::Node(Program::Elementwise(e)) => {
+                match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
+                    Ok((_, arity)) => arity,
+                    Err(e) => return Err(e),
+                }
+            }
+            Lowering::Node(Program::Transpose) => 1,
+            Lowering::Node(_) => op.operands.len(),
         };
 
         // A fused chain's inputs are the ones the RECOGNISER proved, not the terminal op's operands.
@@ -612,6 +667,18 @@ pub fn lower_function(
             let dims = match op.result_type {
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
                     [dims[0] as u32, dims[1] as u32]
+                }
+                // A ROW REDUCTION'S RESULT IS RANK-1 IN KTIR AND `[rows, 1]` ON DEVICE, and that is
+                // the one rank-1 intermediate whose 2-D footprint is not a guess: `linalg.reduce`
+                // over the trailing axis of `[rows, cols]` yields `[rows]`, one value per row, which
+                // is exactly the `[rows, 1]` accumulator `assemble_reduce_seeded` writes. Restricted
+                // to the reduce arm on purpose — a rank-1 intermediate from anything else could as
+                // easily be a `[cols]` row vector, and reading it as `[cols, 1]` would size the
+                // buffer right and address it wrong, so that case keeps the refusal below.
+                Some(ktir_core::irtype::IrType::Tensor { dims, .. })
+                    if dims.len() == 1 && matches!(program, Lowering::Reduce(_)) =>
+                {
+                    [dims[0] as u32, 1]
                 }
                 _ => {
                     return err(format!(
@@ -691,11 +758,25 @@ pub fn lower_function(
 /// inputs, so its arity check passes for the reason it was written to.
 fn emit_one(
     name: &str,
-    program: Program,
+    program: Lowering,
     per_op: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
+    // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
+    // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
+    // `split_out(.., 2)` reads.
+    let program = match program {
+        Lowering::Silu => {
+            return super::lower_ktir_to_superdsc::silumul(name, per_op, sym_id_base, layout);
+        }
+        // A BARE ROW REDUCTION. The entry point refuses a multi-row `max` by name — see its doc for
+        // the measured device defect that makes that a correctness matter rather than a limitation.
+        Lowering::Reduce(kind) => {
+            return super::lower_ktir_to_superdsc::reduce(name, kind, per_op, sym_id_base, layout);
+        }
+        Lowering::Node(p) => p,
+    };
     Ok(match program {
         Program::Matmul => {
             // The fp8 activation-quantize dedup set is per-BUNDLE. One op at a time here, so a
@@ -709,12 +790,6 @@ fn emit_one(
         }
         Program::Transpose => {
             super::lower_ktir_to_superdsc::transpose(name, per_op, sym_id_base, layout)?
-        }
-        // THE FUSED SILU. Reached only through [`program_silu_mul_chain`], which PROVED the five-op
-        // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
-        // `split_out(.., 2)` reads.
-        Program::SiluMul => {
-            super::lower_ktir_to_superdsc::silumul(name, per_op, sym_id_base, layout)?
         }
         other => {
             return err(format!(
