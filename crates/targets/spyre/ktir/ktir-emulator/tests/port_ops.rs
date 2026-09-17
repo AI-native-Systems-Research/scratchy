@@ -55,6 +55,10 @@
 //! * `ControlOps.while_op` (`scf.while`) is NOT implemented in the Rust crate
 //!   (no `scf.while` handler is registered). That case is an `#[ignore]` GAP.
 
+mod common;
+
+use common::Ops;
+use ktir_emulator::attrkey::AttrKey;
 use ktir_emulator::context::CoreContext;
 use ktir_emulator::dialects::Dispatch;
 use ktir_emulator::dtypes::DType;
@@ -62,6 +66,7 @@ use ktir_emulator::env::{ExecutionEnv, GridExecutor};
 use ktir_emulator::interpreter::{execute_op, execute_ops, single_core_context};
 use ktir_emulator::ir::{Attr, Operation, Scalar, Value};
 use ktir_emulator::memory::SpyreMemoryHierarchy;
+use ktir_emulator::opkind::OpKind;
 use ktir_emulator::tile::Tile;
 use std::rc::Rc;
 
@@ -70,20 +75,22 @@ use std::rc::Rc;
 // ===========================================================================
 
 /// Dispatch a single op's handler directly, seeding operands first.
-fn run_op(op: &Operation, seed: &[(&str, Value)]) -> Value {
+fn run_op(kind: OpKind, operands: &[&'static str], seed: &[(&'static str, Value)]) -> Value {
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), kind, operands);
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     for (n, v) in seed {
-        ctx.set_value(n, v.clone());
+        ctx.set_value(ir_ops.ssa(n), v.clone());
     }
     let handler = dispatch
-        .handler(&op.op_type)
-        .unwrap_or_else(|| panic!("no handler for {:?}", op.op_type));
-    handler(op, &mut ctx, &env)
-        .unwrap_or_else(|e| panic!("op {:?} failed: {e}", op.op_type))
-        .unwrap_or_else(|| panic!("op {:?} produced no value", op.op_type))
+        .handler(o.op_type)
+        .unwrap_or_else(|| panic!("no handler for {:?}", o.op_type));
+    handler(&o, &mut ctx, &env)
+        .unwrap_or_else(|e| panic!("op {:?} failed: {e}", o.op_type))
+        .unwrap_or_else(|| panic!("op {:?} produced no value", o.op_type))
 }
 
 /// Build a `CoreContext` for a specific core_id / grid_pos over a fresh memory
@@ -97,10 +104,6 @@ fn ctx_at(core_id: usize, grid_pos: (usize, usize, usize), num_cores: usize) -> 
         mem.get_lx(core_id),
         mem.lx_scratchpads.clone(),
     )
-}
-
-fn op(name: &str, operands: &[&str]) -> Operation {
-    Operation::new(Some("%r"), name, operands)
 }
 
 fn sf(x: f32) -> Value {
@@ -169,7 +172,8 @@ fn data_close(a: &[f32], b: &[f32], tol: f32) {
 fn test_addf() {
     // element-wise addition of two tiles
     let r = run_op(
-        &op("arith.addf", &["%a", "%b"]),
+        OpKind::ArithAddf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 2.0, 3.0, 4.0])),
             ("%b", f16_tile(&[5.0, 6.0, 7.0, 8.0])),
@@ -181,7 +185,8 @@ fn test_addf() {
 #[test]
 fn test_subf() {
     let r = run_op(
-        &op("arith.subf", &["%a", "%b"]),
+        OpKind::ArithSubf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[5.0, 6.0, 7.0, 8.0])),
             ("%b", f16_tile(&[1.0, 2.0, 3.0, 4.0])),
@@ -193,7 +198,8 @@ fn test_subf() {
 #[test]
 fn test_mulf() {
     let r = run_op(
-        &op("arith.mulf", &["%a", "%b"]),
+        OpKind::ArithMulf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 2.0, 3.0, 4.0])),
             ("%b", f16_tile(&[5.0, 6.0, 7.0, 8.0])),
@@ -205,7 +211,8 @@ fn test_mulf() {
 #[test]
 fn test_divf() {
     let r = run_op(
-        &op("arith.divf", &["%a", "%b"]),
+        OpKind::ArithDivf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[4.0, 6.0, 8.0, 10.0])),
             ("%b", f16_tile(&[2.0, 2.0, 2.0, 2.0])),
@@ -217,7 +224,8 @@ fn test_divf() {
 #[test]
 fn test_maxf() {
     let r = run_op(
-        &op("arith.maxf", &["%a", "%b"]),
+        OpKind::ArithMaxf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0, 8.0])),
             ("%b", f16_tile(&[4.0, 2.0, 6.0, 7.0])),
@@ -229,7 +237,8 @@ fn test_maxf() {
 #[test]
 fn test_minf() {
     let r = run_op(
-        &op("arith.minf", &["%a", "%b"]),
+        OpKind::ArithMinf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0, 8.0])),
             ("%b", f16_tile(&[4.0, 2.0, 6.0, 7.0])),
@@ -242,7 +251,8 @@ fn test_minf() {
 fn test_maxnumf() {
     // NaN-aware max; same as maxf for non-NaN inputs
     let r = run_op(
-        &op("arith.maxnumf", &["%a", "%b"]),
+        OpKind::ArithMaxnumf,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 5.0])), ("%b", f16_tile(&[4.0, 2.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![4.0, 5.0]);
@@ -252,7 +262,8 @@ fn test_maxnumf() {
 fn test_maxnumf_nan() {
     // fmax(NaN,2)=2 ; fmax(3,NaN)=3 ; fmax(NaN,NaN)=NaN (NaN non-propagating)
     let r = run_op(
-        &op("arith.maxnumf", &["%a", "%b"]),
+        OpKind::ArithMaxnumf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[f32::NAN, 3.0, f32::NAN])),
             ("%b", f16_tile(&[2.0, f32::NAN, f32::NAN])),
@@ -267,7 +278,8 @@ fn test_maxnumf_nan() {
 #[test]
 fn test_minnumf() {
     let r = run_op(
-        &op("arith.minnumf", &["%a", "%b"]),
+        OpKind::ArithMinnumf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0, 8.0])),
             ("%b", f16_tile(&[4.0, 2.0, 6.0, 7.0])),
@@ -280,7 +292,8 @@ fn test_minnumf() {
 fn test_minnumf_nan() {
     // fmin(NaN,2)=2 ; fmin(3,NaN)=3 ; fmin(NaN,NaN)=NaN (NaN non-propagating)
     let r = run_op(
-        &op("arith.minnumf", &["%a", "%b"]),
+        OpKind::ArithMinnumf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[f32::NAN, 3.0, f32::NAN])),
             ("%b", f16_tile(&[2.0, f32::NAN, f32::NAN])),
@@ -299,7 +312,8 @@ fn test_addf_2d_tiles() {
     let data2 = vec![1.0f32; 16];
     let expected: Vec<f32> = data1.iter().zip(&data2).map(|(a, b)| a + b).collect();
     let r = run_op(
-        &op("arith.addf", &["%a", "%b"]),
+        OpKind::ArithAddf,
+        &["%a", "%b"],
         &[
             ("%a", tile_with(&data1, DType::F16, &[4, 4])),
             ("%b", tile_with(&data2, DType::F16, &[4, 4])),
@@ -317,7 +331,8 @@ fn test_mulf_2d_tiles() {
     let data2 = vec![2.0f32; 16];
     let expected: Vec<f32> = data1.iter().map(|a| a * 2.0).collect();
     let r = run_op(
-        &op("arith.mulf", &["%a", "%b"]),
+        OpKind::ArithMulf,
+        &["%a", "%b"],
         &[
             ("%a", tile_with(&data1, DType::F16, &[4, 4])),
             ("%b", tile_with(&data2, DType::F16, &[4, 4])),
@@ -332,7 +347,8 @@ fn test_mulf_2d_tiles() {
 fn test_extf_promotes_f32() {
     // extf widens f16 -> f32 (tile path)
     let r = run_op(
-        &op("arith.extf", &["%a"]),
+        OpKind::ArithExtf,
+        &["%a"],
         &[("%a", f16_tile(&[1.0, 2.0, 3.0]))],
     );
     let t = as_tile(&r);
@@ -346,7 +362,8 @@ fn test_extf_promotes_f32() {
 fn test_truncf_passthrough() {
     // truncf is a no-op in simulation; values round-trip unchanged.
     let r = run_op(
-        &op("arith.truncf", &["%a"]),
+        OpKind::ArithTruncf,
+        &["%a"],
         &[("%a", f16_tile(&[1.0, 2.0, 3.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![1.0, 2.0, 3.0]);
@@ -359,7 +376,8 @@ fn test_truncf_passthrough() {
 #[test]
 fn test_addi_scalars() {
     let r = run_op(
-        &op("arith.addi", &["%a", "%b"]),
+        OpKind::ArithAddi,
+        &["%a", "%b"],
         &[("%a", si(3)), ("%b", si(4))],
     );
     assert_eq!(as_i64(&r), 7);
@@ -369,12 +387,14 @@ fn test_addi_scalars() {
 fn test_addi_tile_scalar() {
     // tile + scalar and scalar + tile broadcast
     let r1 = run_op(
-        &op("arith.addi", &["%a", "%b"]),
+        OpKind::ArithAddi,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", si(10))],
     );
     assert_eq!(as_tile(&r1).as_f32().to_vec(), vec![11.0, 12.0, 13.0]);
     let r2 = run_op(
-        &op("arith.addi", &["%a", "%b"]),
+        OpKind::ArithAddi,
+        &["%a", "%b"],
         &[("%a", si(10)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))],
     );
     assert_eq!(as_tile(&r2).as_f32().to_vec(), vec![11.0, 12.0, 13.0]);
@@ -383,7 +403,8 @@ fn test_addi_tile_scalar() {
 #[test]
 fn test_addi_tile_tile() {
     let r = run_op(
-        &op("arith.addi", &["%a", "%b"]),
+        OpKind::ArithAddi,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 2.0, 3.0])),
             ("%b", f16_tile(&[4.0, 5.0, 6.0])),
@@ -395,7 +416,8 @@ fn test_addi_tile_tile() {
 #[test]
 fn test_muli_scalars() {
     let r = run_op(
-        &op("arith.muli", &["%a", "%b"]),
+        OpKind::ArithMuli,
+        &["%a", "%b"],
         &[("%a", si(3)), ("%b", si(4))],
     );
     assert_eq!(as_i64(&r), 12);
@@ -404,12 +426,14 @@ fn test_muli_scalars() {
 #[test]
 fn test_muli_tile_scalar() {
     let r1 = run_op(
-        &op("arith.muli", &["%a", "%b"]),
+        OpKind::ArithMuli,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", si(3))],
     );
     assert_eq!(as_tile(&r1).as_f32().to_vec(), vec![3.0, 6.0, 9.0]);
     let r2 = run_op(
-        &op("arith.muli", &["%a", "%b"]),
+        OpKind::ArithMuli,
+        &["%a", "%b"],
         &[("%a", si(3)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))],
     );
     assert_eq!(as_tile(&r2).as_f32().to_vec(), vec![3.0, 6.0, 9.0]);
@@ -418,7 +442,8 @@ fn test_muli_tile_scalar() {
 #[test]
 fn test_muli_tile_tile() {
     let r = run_op(
-        &op("arith.muli", &["%a", "%b"]),
+        OpKind::ArithMuli,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 2.0, 3.0])),
             ("%b", f16_tile(&[4.0, 5.0, 6.0])),
@@ -430,7 +455,8 @@ fn test_muli_tile_tile() {
 #[test]
 fn test_subi() {
     let r = run_op(
-        &op("arith.subi", &["%a", "%b"]),
+        OpKind::ArithSubi,
+        &["%a", "%b"],
         &[("%a", si(10)), ("%b", si(3))],
     );
     assert_eq!(as_i64(&r), 7);
@@ -440,7 +466,8 @@ fn test_subi() {
 fn test_divui() {
     // unsigned integer floor division: 10 / 3 == 3
     let r = run_op(
-        &op("arith.divui", &["%a", "%b"]),
+        OpKind::ArithDivui,
+        &["%a", "%b"],
         &[("%a", si(10)), ("%b", si(3))],
     );
     assert_eq!(as_i64(&r), 3);
@@ -450,7 +477,8 @@ fn test_divui() {
 fn test_remui() {
     // unsigned integer remainder: 10 % 3 == 1
     let r = run_op(
-        &op("arith.remui", &["%a", "%b"]),
+        OpKind::ArithRemui,
+        &["%a", "%b"],
         &[("%a", si(10)), ("%b", si(3))],
     );
     assert_eq!(as_i64(&r), 1);
@@ -460,8 +488,27 @@ fn test_remui() {
 // ArithOps (cmpi) — TestArithOpsCmpi
 // ===========================================================================
 
-fn cmpi_op(pred: &str, ops: &[&str]) -> Operation {
-    op("arith.cmpi", ops).with_attr("predicate", Attr::Str(pred.into()))
+fn run_cmpi(
+    pred: &'static str,
+    operands: &[&'static str],
+    seed: &[(&'static str, Value)],
+) -> Value {
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::ArithCmpi, operands);
+    let o = ir_ops.attr(o, AttrKey::Predicate, Attr::Str(pred));
+    let dispatch = Dispatch::new();
+    let grid = GridExecutor::new((1, 1, 1));
+    let env = ExecutionEnv::new(&dispatch, &grid);
+    let mut ctx = single_core_context();
+    for (n, v) in seed {
+        ctx.set_value(ir_ops.ssa(n), v.clone());
+    }
+    let handler = dispatch
+        .handler(o.op_type)
+        .unwrap_or_else(|| panic!("no handler for {:?}", o.op_type));
+    handler(&o, &mut ctx, &env)
+        .unwrap_or_else(|e| panic!("op {:?} failed: {e}", o.op_type))
+        .unwrap_or_else(|| panic!("op {:?} produced no value", o.op_type))
 }
 
 #[test]
@@ -480,10 +527,7 @@ fn test_scalar_predicates() {
         (1, 1, "uge", true),
     ];
     for &(a, b, pred, expected) in cases {
-        let r = run_op(
-            &cmpi_op(pred, &["%a", "%b"]),
-            &[("%a", si(a)), ("%b", si(b))],
-        );
+        let r = run_cmpi(pred, &["%a", "%b"], &[("%a", si(a)), ("%b", si(b))]);
         assert_eq!(as_bool(&r), expected, "cmpi({a},{b},{pred})");
     }
 }
@@ -491,8 +535,9 @@ fn test_scalar_predicates() {
 #[test]
 fn test_cmpi_tile_tile() {
     // element-wise comparison returns i1 tile (stored as 0/1 f32 in Rust)
-    let r = run_op(
-        &cmpi_op("slt", &["%a", "%b"]),
+    let r = run_cmpi(
+        "slt",
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[2.0, 4.0, 3.0])),
@@ -506,13 +551,15 @@ fn test_cmpi_tile_tile() {
 #[test]
 fn test_cmpi_tile_scalar() {
     // tile compared against a scalar, and scalar against a tile
-    let r1 = run_op(
-        &cmpi_op("slt", &["%a", "%b"]),
+    let r1 = run_cmpi(
+        "slt",
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", si(3))],
     );
     assert_eq!(as_tile(&r1).as_f32().to_vec(), vec![1.0, 0.0, 0.0]); // [1,5,3] < 3
-    let r2 = run_op(
-        &cmpi_op("sgt", &["%a", "%b"]),
+    let r2 = run_cmpi(
+        "sgt",
+        &["%a", "%b"],
         &[("%a", si(3)), ("%b", f16_tile(&[1.0, 5.0, 3.0]))],
     );
     assert_eq!(as_tile(&r2).as_f32().to_vec(), vec![1.0, 0.0, 0.0]); // 3 > [1,5,3]
@@ -525,7 +572,8 @@ fn test_cmpi_tile_scalar() {
 #[test]
 fn test_select_scalar() {
     let rt = run_op(
-        &op("arith.select", &["%c", "%t", "%f"]),
+        OpKind::ArithSelect,
+        &["%c", "%t", "%f"],
         &[
             ("%c", Value::Scalar(Scalar::Bool(true))),
             ("%t", si(10)),
@@ -534,7 +582,8 @@ fn test_select_scalar() {
     );
     assert_eq!(as_i64(&rt), 10);
     let rf = run_op(
-        &op("arith.select", &["%c", "%t", "%f"]),
+        OpKind::ArithSelect,
+        &["%c", "%t", "%f"],
         &[
             ("%c", Value::Scalar(Scalar::Bool(false))),
             ("%t", si(10)),
@@ -548,7 +597,8 @@ fn test_select_scalar() {
 fn test_select_tile() {
     // element-wise select via boolean tile condition [T,F,T]
     let r = run_op(
-        &op("arith.select", &["%c", "%t", "%f"]),
+        OpKind::ArithSelect,
+        &["%c", "%t", "%f"],
         &[
             ("%c", tile_with(&[1.0, 0.0, 1.0], DType::Bool, &[3])),
             ("%t", f16_tile(&[1.0, 2.0, 3.0])),
@@ -565,7 +615,8 @@ fn test_select_tile() {
 #[test]
 fn test_exp_tile() {
     let r = run_op(
-        &op("math.exp", &["%x"]),
+        OpKind::MathExp,
+        &["%x"],
         &[("%x", f16_tile(&[0.0, 1.0, 2.0]))],
     );
     data_close(
@@ -578,14 +629,15 @@ fn test_exp_tile() {
 #[test]
 fn test_exp_scalar() {
     // scalar exp: exp(1) == e
-    let r = run_op(&op("math.exp", &["%x"]), &[("%x", sf(1.0))]);
+    let r = run_op(OpKind::MathExp, &["%x"], &[("%x", sf(1.0))]);
     close(as_f32(&r), std::f32::consts::E, 1e-2);
 }
 
 #[test]
 fn test_sqrt_tile() {
     let r = run_op(
-        &op("math.sqrt", &["%x"]),
+        OpKind::MathSqrt,
+        &["%x"],
         &[("%x", f16_tile(&[1.0, 4.0, 9.0, 16.0]))],
     );
     data_close(&as_tile(&r).as_f32(), &[1.0, 2.0, 3.0, 4.0], 1e-2);
@@ -594,7 +646,7 @@ fn test_sqrt_tile() {
 #[test]
 fn test_sqrt_scalar() {
     // scalar sqrt: sqrt(4) == 2
-    let r = run_op(&op("math.sqrt", &["%x"]), &[("%x", sf(4.0))]);
+    let r = run_op(OpKind::MathSqrt, &["%x"], &[("%x", sf(4.0))]);
     close(as_f32(&r), 2.0, 1e-2);
 }
 
@@ -618,15 +670,16 @@ fn test_gridid() {
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut c = ctx_at(5, (5, 0, 0), 8);
 
-    let single = Operation::new(Some("%g"), "ktdp.get_compute_tile_id", &[]);
-    let r = dispatch.handler("ktdp.get_compute_tile_id").unwrap()(&single, &mut c, &env)
+    let mut ir_ops = Ops::new();
+    let single = ir_ops.op(Some("%g"), OpKind::KtdpGetComputeTileId, &[]);
+    let r = dispatch.handler(OpKind::KtdpGetComputeTileId).unwrap()(&single, &mut c, &env)
         .unwrap()
         .unwrap();
     assert_eq!(as_i64(&r), 5);
 
-    let multi = Operation::new(Some("%g"), "ktdp.get_compute_tile_id", &[])
-        .with_attr("num_results", Attr::Int(3));
-    let rt = dispatch.handler("ktdp.get_compute_tile_id").unwrap()(&multi, &mut c, &env)
+    let multi = ir_ops.op(Some("%g"), OpKind::KtdpGetComputeTileId, &[]);
+    let multi = ir_ops.attr(multi, AttrKey::NumResults, Attr::Int(3));
+    let rt = dispatch.handler(OpKind::KtdpGetComputeTileId).unwrap()(&multi, &mut c, &env)
         .unwrap()
         .unwrap();
     match rt {
@@ -648,16 +701,17 @@ fn test_coreid_wildcard() {
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = ctx_at(0, (0, 0, 0), 8);
 
-    let wild = Operation::new(Some("%ids"), "ktdp.coreid", &["%x"]);
-    ctx.set_value("%x", idx(-1));
-    let r = dispatch.handler("ktdp.coreid").unwrap()(&wild, &mut ctx, &env)
+    let mut ir_ops = Ops::new();
+    let wild = ir_ops.op(Some("%ids"), OpKind::KtdpCoreid, &["%x"]);
+    ctx.set_value(ir_ops.ssa("%x"), idx(-1));
+    let r = dispatch.handler(OpKind::KtdpCoreid).unwrap()(&wild, &mut ctx, &env)
         .unwrap()
         .unwrap();
     assert_eq!(as_ids(&r).len(), 8);
 
-    let exact = Operation::new(Some("%ids"), "ktdp.coreid", &["%x"]);
-    ctx.set_value("%x", idx(3));
-    let r = dispatch.handler("ktdp.coreid").unwrap()(&exact, &mut ctx, &env)
+    let exact = ir_ops.op(Some("%ids"), OpKind::KtdpCoreid, &["%x"]);
+    ctx.set_value(ir_ops.ssa("%x"), idx(3));
+    let r = dispatch.handler(OpKind::KtdpCoreid).unwrap()(&exact, &mut ctx, &env)
         .unwrap()
         .unwrap();
     assert_eq!(as_ids(&r), vec![3]);
@@ -670,9 +724,10 @@ fn test_coreid_pads_to_3d() {
     let grid = GridExecutor::new((4, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = ctx_at(0, (0, 0, 0), 4);
-    ctx.set_value("%x", idx(2));
-    let o = Operation::new(Some("%ids"), "ktdp.coreid", &["%x"]);
-    let r = dispatch.handler("ktdp.coreid").unwrap()(&o, &mut ctx, &env)
+    let mut ir_ops = Ops::new();
+    ctx.set_value(ir_ops.ssa("%x"), idx(2));
+    let o = ir_ops.op(Some("%ids"), OpKind::KtdpCoreid, &["%x"]);
+    let r = dispatch.handler(OpKind::KtdpCoreid).unwrap()(&o, &mut ctx, &env)
         .unwrap()
         .unwrap();
     assert_eq!(as_ids(&r), vec![2]);
@@ -682,41 +737,47 @@ fn test_coreid_pads_to_3d() {
 // ControlOps — TestControlOps
 // ===========================================================================
 
-/// Build a scf.for op with a body region (and optional iter_args).
+/// Build a scf.for op with a body region (and optional iter_args), minting
+/// through `ir_ops` so its `%name`s resolve consistently with the caller's.
 #[allow(clippy::too_many_arguments)]
 fn for_op_ir(
-    result: Option<&str>,
-    lb: &str,
-    ub: &str,
-    step: &str,
-    iter_var: &str,
-    iter_inits: &[&str],
-    iter_args: &[&str],
-    body: Vec<Operation>,
-) -> Operation {
+    ir_ops: &mut Ops,
+    result: Option<&'static str>,
+    lb: &'static str,
+    ub: &'static str,
+    step: &'static str,
+    iter_var: &'static str,
+    iter_inits: &[&'static str],
+    iter_args: &[&'static str],
+    body: Vec<Operation<'static>>,
+) -> Operation<'static> {
     let mut operands = vec![lb, ub, step];
     operands.extend_from_slice(iter_inits);
-    let mut o = Operation::new(result, "scf.for", &operands)
-        .with_attr("iter_var", Attr::Str(iter_var.into()));
-    if !iter_args.is_empty() {
-        o = o.with_attr(
-            "iter_args",
-            Attr::StrList(iter_args.iter().map(|s| s.to_string()).collect()),
-        );
-    }
-    o.regions = vec![body];
-    o
+    let o = ir_ops.op(result, OpKind::ScfFor, &operands);
+    let iv = ir_ops.ssas_attr(&[iter_var]);
+    let o = ir_ops.attr(o, AttrKey::IterVar, iv);
+    let o = if !iter_args.is_empty() {
+        let ia = ir_ops.ssas_attr(iter_args);
+        ir_ops.attr(o, AttrKey::IterArgs, ia)
+    } else {
+        o
+    };
+    ir_ops.with_region(o, body)
 }
 
 /// Run a single op via execute_op against a fresh single-core context, seeding
 /// operands first. Used to drive region-bodied scf ops through the real registry.
-fn run_seeded(o: &Operation, seed: &[(&str, Value)]) -> CoreContext {
+fn run_seeded(
+    ir_ops: &mut Ops,
+    o: &Operation<'static>,
+    seed: &[(&'static str, Value)],
+) -> CoreContext {
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     for (n, v) in seed {
-        ctx.set_value(n, v.clone());
+        ctx.set_value(ir_ops.ssa(n), v.clone());
     }
     execute_op(o, &mut ctx, &env)
         .unwrap_or_else(|e| panic!("execute_op {:?} failed: {e}", o.op_type));
@@ -727,35 +788,45 @@ fn run_seeded(o: &Operation, seed: &[(&str, Value)]) -> CoreContext {
 fn test_if_then_branch() {
     // condition=True runs then_region. We observe the branch by which constant
     // value surfaces as the op result (then=1, else=0).
-    let then_r = vec![
-        Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Int(1)),
-        Operation::new(None, "scf.yield", &["%t"]),
-    ];
-    let else_r = vec![
-        Operation::new(Some("%e"), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
-        Operation::new(None, "scf.yield", &["%e"]),
-    ];
-    let mut iff = Operation::new(Some("%r"), "scf.if", &["%cond"]);
-    iff.regions = vec![then_r, else_r];
-    let ctx = run_seeded(&iff, &[("%cond", Value::Scalar(Scalar::Bool(true)))]);
-    assert_eq!(as_i64(ctx.get_value("%r").unwrap()), 1); // then branch ran
+    let mut ir_ops = Ops::new();
+    let t = ir_ops.op(Some("%t"), OpKind::ArithConstant, &[]);
+    let t = ir_ops.attr(t, AttrKey::Value, Attr::Int(1));
+    let yt = ir_ops.op(None, OpKind::ScfYield, &["%t"]);
+    let then_r = vec![t, yt];
+    let e = ir_ops.op(Some("%e"), OpKind::ArithConstant, &[]);
+    let e = ir_ops.attr(e, AttrKey::Value, Attr::Int(0));
+    let ye = ir_ops.op(None, OpKind::ScfYield, &["%e"]);
+    let else_r = vec![e, ye];
+    let iff = ir_ops.op(Some("%r"), OpKind::ScfIf, &["%cond"]);
+    let iff = ir_ops.regions(iff, vec![then_r, else_r]);
+    let ctx = run_seeded(
+        &mut ir_ops,
+        &iff,
+        &[("%cond", Value::Scalar(Scalar::Bool(true)))],
+    );
+    assert_eq!(as_i64(ctx.get_value(ir_ops.ssa("%r")).unwrap()), 1); // then branch ran
 }
 
 #[test]
 fn test_if_else_branch() {
     // condition=False runs else_region.
-    let then_r = vec![
-        Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Int(1)),
-        Operation::new(None, "scf.yield", &["%t"]),
-    ];
-    let else_r = vec![
-        Operation::new(Some("%e"), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
-        Operation::new(None, "scf.yield", &["%e"]),
-    ];
-    let mut iff = Operation::new(Some("%r"), "scf.if", &["%cond"]);
-    iff.regions = vec![then_r, else_r];
-    let ctx = run_seeded(&iff, &[("%cond", Value::Scalar(Scalar::Bool(false)))]);
-    assert_eq!(as_i64(ctx.get_value("%r").unwrap()), 0); // else branch ran
+    let mut ir_ops = Ops::new();
+    let t = ir_ops.op(Some("%t"), OpKind::ArithConstant, &[]);
+    let t = ir_ops.attr(t, AttrKey::Value, Attr::Int(1));
+    let yt = ir_ops.op(None, OpKind::ScfYield, &["%t"]);
+    let then_r = vec![t, yt];
+    let e = ir_ops.op(Some("%e"), OpKind::ArithConstant, &[]);
+    let e = ir_ops.attr(e, AttrKey::Value, Attr::Int(0));
+    let ye = ir_ops.op(None, OpKind::ScfYield, &["%e"]);
+    let else_r = vec![e, ye];
+    let iff = ir_ops.op(Some("%r"), OpKind::ScfIf, &["%cond"]);
+    let iff = ir_ops.regions(iff, vec![then_r, else_r]);
+    let ctx = run_seeded(
+        &mut ir_ops,
+        &iff,
+        &[("%cond", Value::Scalar(Scalar::Bool(false)))],
+    );
+    assert_eq!(as_i64(ctx.get_value(ir_ops.ssa("%r")).unwrap()), 0); // else branch ran
 }
 
 #[test]
@@ -767,13 +838,14 @@ fn test_if_empty_region() {
     let grid = GridExecutor::new((1, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
-    ctx.set_value("%cond", Value::Scalar(Scalar::Bool(true)));
-    let mut iff = Operation::new(None, "scf.if", &["%cond"]);
-    iff.regions = vec![vec![], vec![]];
+    let mut ir_ops = Ops::new();
+    ctx.set_value(ir_ops.ssa("%cond"), Value::Scalar(Scalar::Bool(true)));
+    let iff = ir_ops.op(None, OpKind::ScfIf, &["%cond"]);
+    let iff = ir_ops.regions(iff, vec![vec![], vec![]]);
     let out = execute_op(&iff, &mut ctx, &env).unwrap();
     assert!(out.is_none());
     // Drive the handler directly too, to assert the None return for empty regions.
-    let direct = dispatch.handler("scf.if").unwrap()(&iff, &mut ctx, &env).unwrap();
+    let direct = dispatch.handler(OpKind::ScfIf).unwrap()(&iff, &mut ctx, &env).unwrap();
     assert!(direct.is_none());
 }
 
@@ -782,11 +854,12 @@ fn test_for_op() {
     // body runs once per step with the correct iteration variable. Python checks
     // iterations == [0,1,2,3,4]; we encode visiting each i via a running sum of
     // the induction variable: sum(0..5) == 10 over 5 iterations.
-    let body = vec![
-        Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]),
-        Operation::new(None, "scf.yield", &["%s"]),
-    ];
+    let mut ir_ops = Ops::new();
+    let s = ir_ops.op(Some("%s"), OpKind::ArithAddi, &["%acc", "%i"]);
+    let y = ir_ops.op(None, OpKind::ScfYield, &["%s"]);
+    let body = vec![s, y];
     let f = for_op_ir(
+        &mut ir_ops,
         Some("%r"),
         "%lb",
         "%ub",
@@ -797,6 +870,7 @@ fn test_for_op() {
         body,
     );
     let ctx = run_seeded(
+        &mut ir_ops,
         &f,
         &[
             ("%lb", idx(0)),
@@ -806,20 +880,22 @@ fn test_for_op() {
         ],
     );
     // 0+1+2+3+4 == 10  (proves i took values 0,1,2,3,4 across the 5 iterations)
-    assert_eq!(as_i64(ctx.get_value("%r").unwrap()), 10);
+    assert_eq!(as_i64(ctx.get_value(ir_ops.ssa("%r")).unwrap()), 10);
 }
 
 #[test]
 fn test_for_op_step_2() {
     // scf.for with step=2 visits only even indices in 0..6: i in {0,2,4}.
     // running sum == 6, and the iteration count is 3.
-    let body = vec![
-        Operation::new(Some("%one"), "arith.constant", &[]).with_attr("value", Attr::Int(1)),
-        Operation::new(Some("%cnt"), "arith.addi", &["%count", "%one"]),
-        Operation::new(Some("%sum"), "arith.addi", &["%acc", "%i"]),
-        Operation::new(None, "scf.yield", &["%sum", "%cnt"]),
-    ];
+    let mut ir_ops = Ops::new();
+    let one = ir_ops.op(Some("%one"), OpKind::ArithConstant, &[]);
+    let one = ir_ops.attr(one, AttrKey::Value, Attr::Int(1));
+    let cnt = ir_ops.op(Some("%cnt"), OpKind::ArithAddi, &["%count", "%one"]);
+    let sum = ir_ops.op(Some("%sum"), OpKind::ArithAddi, &["%acc", "%i"]);
+    let y = ir_ops.op(None, OpKind::ScfYield, &["%sum", "%cnt"]);
+    let body = vec![one, cnt, sum, y];
     let f = for_op_ir(
+        &mut ir_ops,
         Some("%r"),
         "%lb",
         "%ub",
@@ -830,6 +906,7 @@ fn test_for_op_step_2() {
         body,
     );
     let ctx = run_seeded(
+        &mut ir_ops,
         &f,
         &[
             ("%lb", idx(0)),
@@ -839,7 +916,7 @@ fn test_for_op_step_2() {
             ("%c0", si(0)),
         ],
     );
-    match ctx.get_value("%r").unwrap() {
+    match ctx.get_value(ir_ops.ssa("%r")).unwrap() {
         Value::Tuple(vals) => {
             assert_eq!(as_i64(&vals[0]), 6); // 0+2+4
             assert_eq!(as_i64(&vals[1]), 3); // 3 iterations
@@ -851,11 +928,12 @@ fn test_for_op_step_2() {
 #[test]
 fn test_for_op_iter_args_running_sum() {
     // iter_args carry a running scalar sum across iterations: sum(0+1+2+3) == 6.
-    let body = vec![
-        Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]),
-        Operation::new(None, "scf.yield", &["%s"]),
-    ];
+    let mut ir_ops = Ops::new();
+    let s = ir_ops.op(Some("%s"), OpKind::ArithAddi, &["%acc", "%i"]);
+    let y = ir_ops.op(None, OpKind::ScfYield, &["%s"]);
+    let body = vec![s, y];
     let f = for_op_ir(
+        &mut ir_ops,
         Some("%r"),
         "%lb",
         "%ub",
@@ -866,6 +944,7 @@ fn test_for_op_iter_args_running_sum() {
         body,
     );
     let ctx = run_seeded(
+        &mut ir_ops,
         &f,
         &[
             ("%lb", idx(0)),
@@ -874,7 +953,7 @@ fn test_for_op_iter_args_running_sum() {
             ("%init", si(0)),
         ],
     );
-    assert_eq!(as_i64(ctx.get_value("%r").unwrap()), 6);
+    assert_eq!(as_i64(ctx.get_value(ir_ops.ssa("%r")).unwrap()), 6);
 }
 
 #[test]
@@ -920,17 +999,18 @@ fn matmul_add_fusion_matches_separate() {
         ktir_emulator::memory::HBMSimulator::default(),
     ));
     let mut ctx = CoreContext::new(0, (0, 0, 0), hbm, Rc::clone(&big_lx), vec![big_lx]);
-    ctx.set_value("%A", tile_with(&a, DType::F32, &[m, k]));
-    ctx.set_value("%B", tile_with(&b, DType::F32, &[k, n]));
-    ctx.set_value("%E", tile_with(&e, DType::F32, &[m, n]));
+    let mut ir_ops = Ops::new();
+    ctx.set_value(ir_ops.ssa("%A"), tile_with(&a, DType::F32, &[m, k]));
+    ctx.set_value(ir_ops.ssa("%B"), tile_with(&b, DType::F32, &[k, n]));
+    ctx.set_value(ir_ops.ssa("%E"), tile_with(&e, DType::F32, &[m, n]));
 
     let ops = vec![
-        Operation::new(Some("%C"), "linalg.matmul", &["%A", "%B"]),
-        Operation::new(Some("%D"), "linalg.add", &["%C", "%E"]),
+        ir_ops.op(Some("%C"), OpKind::LinalgMatmul, &["%A", "%B"]),
+        ir_ops.op(Some("%D"), OpKind::LinalgAdd, &["%C", "%E"]),
     ];
     execute_ops(&ops, &mut ctx, &env).expect("execute fused ops");
 
-    let Value::Tile(d) = ctx.get_value("%D").expect("result %D") else {
+    let Value::Tile(d) = ctx.get_value(ir_ops.ssa("%D")).expect("result %D") else {
         panic!("%D is not a tile");
     };
     assert_eq!(d.shape, vec![m, n]);

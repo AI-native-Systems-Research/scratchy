@@ -554,9 +554,10 @@ mod tests {
     use crate::dtypes::DType;
     use crate::env::{ExecutionEnv, GridExecutor};
     use crate::interpreter::{execute_ops, single_core_context};
+    use crate::test_support::Ops;
     use crate::tile::Tile;
 
-    fn run(ops: &[Operation], ctx: &mut CoreContext) -> Result<(), String> {
+    fn run(ops: &[Operation<'static>], ctx: &mut CoreContext) -> Result<(), String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
@@ -566,45 +567,49 @@ mod tests {
     /// A `scf.for` op with a body region (and optional iter_args).
     #[allow(clippy::too_many_arguments)]
     fn for_op_ir(
-        result: Option<&str>,
-        lb: &str,
-        ub: &str,
-        step: &str,
-        iter_var: &str,
-        iter_inits: &[&str],
-        iter_args: &[&str],
-        body: Vec<Operation>,
-    ) -> Operation {
+        ops: &mut Ops,
+        result: Option<&'static str>,
+        lb: &'static str,
+        ub: &'static str,
+        step: &'static str,
+        iter_var: &'static str,
+        iter_inits: &[&'static str],
+        iter_args: &[&'static str],
+        body: Vec<Operation<'static>>,
+    ) -> Operation<'static> {
         let mut operands = vec![lb, ub, step];
         operands.extend_from_slice(iter_inits);
-        let mut op = Operation::new(result, "scf.for", &operands)
-            .with_attr("iter_var", Attr::Str(iter_var.into()));
-        if !iter_args.is_empty() {
-            op = op.with_attr(
-                "iter_args",
-                Attr::StrList(iter_args.iter().map(|s| s.to_string()).collect()),
-            );
-        }
-        op.regions = vec![body];
-        op
+        let op = ops.op(result, OpKind::ScfFor, &operands);
+        let iv = ops.ssas_attr(&[iter_var]);
+        let op = ops.attr(op, AttrKey::IterVar, iv);
+        let op = if !iter_args.is_empty() {
+            let ia = ops.ssas_attr(iter_args);
+            ops.attr(op, AttrKey::IterArgs, ia)
+        } else {
+            op
+        };
+        ops.with_region(op, body)
     }
 
     // --- scf.for: counting ------------------------------------------------
 
     #[test]
     fn for_counts_iterations_via_iter_arg() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%lb", Value::Index(0));
-        ctx.set_value("%ub", Value::Index(5));
-        ctx.set_value("%step", Value::Index(1));
-        ctx.set_value("%init", Value::Scalar(Scalar::I64(0)));
+        ctx.set_value(ops.ssa("%lb"), Value::Index(0));
+        ctx.set_value(ops.ssa("%ub"), Value::Index(5));
+        ctx.set_value(ops.ssa("%step"), Value::Index(1));
+        ctx.set_value(ops.ssa("%init"), Value::Scalar(Scalar::I64(0)));
         // body: %s = addi %acc %one ; yield %s   (counts iterations)
-        let one =
-            Operation::new(Some("%one"), "arith.constant", &[]).with_attr("value", Attr::Int(1));
-        let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%one"]);
-        let yld = Operation::new(None, "scf.yield", &["%s"]);
+        let one = ops.op(Some("%one"), OpKind::ArithConstant, &[]);
+        let one = ops.attr(one, AttrKey::Value, Attr::Int(1));
+        let add = ops.op(Some("%s"), OpKind::ArithAddi, &["%acc", "%one"]);
+        let yld = ops.op(None, OpKind::ScfYield, &["%s"]);
         let body = vec![one, add, yld];
+        let r = ops.ssa("%r");
         let f = for_op_ir(
+            &mut ops,
             Some("%r"),
             "%lb",
             "%ub",
@@ -615,7 +620,7 @@ mod tests {
             body,
         );
         run(&[f], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::I64(v)) => assert_eq!(*v, 5), // 5 iterations
             other => panic!("expected I64(5), got {other:?}"),
         }
@@ -624,16 +629,19 @@ mod tests {
     #[test]
     fn for_step_2_visits_three_times() {
         // 0..6 step 2 -> 3 iterations.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%lb", Value::Index(0));
-        ctx.set_value("%ub", Value::Index(6));
-        ctx.set_value("%step", Value::Index(2));
-        ctx.set_value("%init", Value::Scalar(Scalar::I64(0)));
-        let one =
-            Operation::new(Some("%one"), "arith.constant", &[]).with_attr("value", Attr::Int(1));
-        let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%one"]);
-        let yld = Operation::new(None, "scf.yield", &["%s"]);
+        ctx.set_value(ops.ssa("%lb"), Value::Index(0));
+        ctx.set_value(ops.ssa("%ub"), Value::Index(6));
+        ctx.set_value(ops.ssa("%step"), Value::Index(2));
+        ctx.set_value(ops.ssa("%init"), Value::Scalar(Scalar::I64(0)));
+        let one = ops.op(Some("%one"), OpKind::ArithConstant, &[]);
+        let one = ops.attr(one, AttrKey::Value, Attr::Int(1));
+        let add = ops.op(Some("%s"), OpKind::ArithAddi, &["%acc", "%one"]);
+        let yld = ops.op(None, OpKind::ScfYield, &["%s"]);
+        let r = ops.ssa("%r");
         let f = for_op_ir(
+            &mut ops,
             Some("%r"),
             "%lb",
             "%ub",
@@ -644,7 +652,7 @@ mod tests {
             vec![one, add, yld],
         );
         run(&[f], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::I64(v)) => assert_eq!(*v, 3),
             other => panic!("expected I64(3), got {other:?}"),
         }
@@ -653,15 +661,18 @@ mod tests {
     #[test]
     fn for_induction_var_is_visible_in_body() {
         // running sum of the induction variable: acc += i over 0..4.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%lb", Value::Index(0));
-        ctx.set_value("%ub", Value::Index(4));
-        ctx.set_value("%step", Value::Index(1));
-        ctx.set_value("%init", Value::Scalar(Scalar::I64(0)));
+        ctx.set_value(ops.ssa("%lb"), Value::Index(0));
+        ctx.set_value(ops.ssa("%ub"), Value::Index(4));
+        ctx.set_value(ops.ssa("%step"), Value::Index(1));
+        ctx.set_value(ops.ssa("%init"), Value::Scalar(Scalar::I64(0)));
         // %s = addi %acc %i ; yield %s   (i is an Index, addi accepts it)
-        let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]);
-        let yld = Operation::new(None, "scf.yield", &["%s"]);
+        let add = ops.op(Some("%s"), OpKind::ArithAddi, &["%acc", "%i"]);
+        let yld = ops.op(None, OpKind::ScfYield, &["%s"]);
+        let r = ops.ssa("%r");
         let f = for_op_ir(
+            &mut ops,
             Some("%r"),
             "%lb",
             "%ub",
@@ -672,7 +683,7 @@ mod tests {
             vec![add, yld],
         );
         run(&[f], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             // 0 + (0+1+2+3) = 6
             Value::Scalar(Scalar::I64(v)) => assert_eq!(*v, 6),
             other => panic!("expected I64(6), got {other:?}"),
@@ -684,14 +695,17 @@ mod tests {
     #[test]
     fn for_iter_args_running_sum() {
         // Mirrors test_for_op_iter_args_running_sum: acc starts 0, += i, 0..4.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%lb", Value::Index(0));
-        ctx.set_value("%ub", Value::Index(4));
-        ctx.set_value("%step", Value::Index(1));
-        ctx.set_value("%init", Value::Scalar(Scalar::I64(0)));
-        let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]);
-        let yld = Operation::new(None, "scf.yield", &["%s"]);
+        ctx.set_value(ops.ssa("%lb"), Value::Index(0));
+        ctx.set_value(ops.ssa("%ub"), Value::Index(4));
+        ctx.set_value(ops.ssa("%step"), Value::Index(1));
+        ctx.set_value(ops.ssa("%init"), Value::Scalar(Scalar::I64(0)));
+        let add = ops.op(Some("%s"), OpKind::ArithAddi, &["%acc", "%i"]);
+        let yld = ops.op(None, OpKind::ScfYield, &["%s"]);
+        let r = ops.ssa("%r");
         let f = for_op_ir(
+            &mut ops,
             Some("%r"),
             "%lb",
             "%ub",
@@ -702,7 +716,7 @@ mod tests {
             vec![add, yld],
         );
         run(&[f], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::I64(v)) => assert_eq!(*v, 6),
             other => panic!("expected I64(6), got {other:?}"),
         }
@@ -711,31 +725,36 @@ mod tests {
     #[test]
     fn for_no_iters_returns_none_and_leaves_no_result() {
         // ub == lb: zero iterations, no iter_args, no result binding.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%lb", Value::Index(3));
-        ctx.set_value("%ub", Value::Index(3));
-        ctx.set_value("%step", Value::Index(1));
-        let body = vec![Operation::new(None, "scf.yield", &[])];
-        let f = for_op_ir(None, "%lb", "%ub", "%step", "%i", &[], &[], body);
+        ctx.set_value(ops.ssa("%lb"), Value::Index(3));
+        ctx.set_value(ops.ssa("%ub"), Value::Index(3));
+        ctx.set_value(ops.ssa("%step"), Value::Index(1));
+        let body = vec![ops.op(None, OpKind::ScfYield, &[])];
+        let i = ops.ssa("%i");
+        let f = for_op_ir(&mut ops, None, "%lb", "%ub", "%step", "%i", &[], &[], body);
         run(&[f], &mut ctx).unwrap();
-        assert!(ctx.get_value("%i").is_err()); // induction var scope is gone
+        assert!(ctx.get_value(i).is_err()); // induction var scope is gone
     }
 
     #[test]
     fn for_multi_iter_args_yields_tuple() {
         // Two scalar accumulators advanced independently.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%lb", Value::Index(0));
-        ctx.set_value("%ub", Value::Index(3));
-        ctx.set_value("%step", Value::Index(1));
-        ctx.set_value("%a0", Value::Scalar(Scalar::I64(0)));
-        ctx.set_value("%b0", Value::Scalar(Scalar::I64(10)));
-        let one =
-            Operation::new(Some("%one"), "arith.constant", &[]).with_attr("value", Attr::Int(1));
-        let na = Operation::new(Some("%na"), "arith.addi", &["%a", "%one"]);
-        let nb = Operation::new(Some("%nb"), "arith.addi", &["%b", "%one"]);
-        let yld = Operation::new(None, "scf.yield", &["%na", "%nb"]);
+        ctx.set_value(ops.ssa("%lb"), Value::Index(0));
+        ctx.set_value(ops.ssa("%ub"), Value::Index(3));
+        ctx.set_value(ops.ssa("%step"), Value::Index(1));
+        ctx.set_value(ops.ssa("%a0"), Value::Scalar(Scalar::I64(0)));
+        ctx.set_value(ops.ssa("%b0"), Value::Scalar(Scalar::I64(10)));
+        let one = ops.op(Some("%one"), OpKind::ArithConstant, &[]);
+        let one = ops.attr(one, AttrKey::Value, Attr::Int(1));
+        let na = ops.op(Some("%na"), OpKind::ArithAddi, &["%a", "%one"]);
+        let nb = ops.op(Some("%nb"), OpKind::ArithAddi, &["%b", "%one"]);
+        let yld = ops.op(None, OpKind::ScfYield, &["%na", "%nb"]);
+        let r = ops.ssa("%r");
         let f = for_op_ir(
+            &mut ops,
             Some("%r"),
             "%lb",
             "%ub",
@@ -746,7 +765,7 @@ mod tests {
             vec![one, na, nb, yld],
         );
         run(&[f], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Tuple(vals) => {
                 assert_eq!(vals.len(), 2);
                 assert!(matches!(vals[0], Value::Scalar(Scalar::I64(3)))); // 0+3
@@ -760,22 +779,25 @@ mod tests {
     fn for_tile_iter_arg_lx_is_conserved() {
         // A Tile iter_arg: LX usage after the loop equals exactly one tile's
         // worth — the per-iteration body tile and old iter_arg tiles are freed.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%lb", Value::Index(0));
-        ctx.set_value("%ub", Value::Index(3));
-        ctx.set_value("%step", Value::Index(1));
+        ctx.set_value(ops.ssa("%lb"), Value::Index(0));
+        ctx.set_value(ops.ssa("%ub"), Value::Index(3));
+        ctx.set_value(ops.ssa("%step"), Value::Index(1));
         // init tile: 4 x f32 = 16 bytes. Charge via the alias-aware `track_lx_tile`
         // (the #118 path: the iter_arg binding is an ALIAS of this allocation, so it
         // must NOT charge a second 16 bytes).
         let init = Tile::compute(vec![0.0; 4], DType::F32, vec![4]);
-        ctx.set_value("%init", Value::Tile(init.clone()));
-        ctx.track_lx_tile("%init", &init).unwrap();
-        let one = Operation::new(Some("%one"), "arith.constant", &[])
-            .with_attr("value", Attr::Float(1.0));
+        let init_ssa = ops.ssa("%init");
+        ctx.set_value(init_ssa, Value::Tile(init.clone()));
+        ctx.track_lx_tile(init_ssa, &init).unwrap();
+        let one = ops.op(Some("%one"), OpKind::ArithConstant, &[]);
+        let one = ops.attr(one, AttrKey::Value, Attr::Float(1.0));
         // each iteration yields a fresh tile via addf %acc %acc.
-        let add = Operation::new(Some("%s"), "arith.addf", &["%acc", "%acc"]);
-        let yld = Operation::new(None, "scf.yield", &["%s"]);
+        let add = ops.op(Some("%s"), OpKind::ArithAddf, &["%acc", "%acc"]);
+        let yld = ops.op(None, OpKind::ScfYield, &["%s"]);
         let f = for_op_ir(
+            &mut ops,
             Some("%r"),
             "%lb",
             "%ub",
@@ -801,18 +823,20 @@ mod tests {
 
     #[test]
     fn if_true_runs_then_branch() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%cond", Value::Scalar(Scalar::Bool(true)));
-        let c =
-            Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Float(7.0));
-        let yld = Operation::new(None, "scf.yield", &["%t"]);
-        let e =
-            Operation::new(Some("%f"), "arith.constant", &[]).with_attr("value", Attr::Float(9.0));
-        let eyld = Operation::new(None, "scf.yield", &["%f"]);
-        let mut iff = Operation::new(Some("%r"), "scf.if", &["%cond"]);
-        iff.regions = vec![vec![c, yld], vec![e, eyld]];
+        ctx.set_value(ops.ssa("%cond"), Value::Scalar(Scalar::Bool(true)));
+        let c = ops.op(Some("%t"), OpKind::ArithConstant, &[]);
+        let c = ops.attr(c, AttrKey::Value, Attr::Float(7.0));
+        let yld = ops.op(None, OpKind::ScfYield, &["%t"]);
+        let e = ops.op(Some("%f"), OpKind::ArithConstant, &[]);
+        let e = ops.attr(e, AttrKey::Value, Attr::Float(9.0));
+        let eyld = ops.op(None, OpKind::ScfYield, &["%f"]);
+        let r = ops.ssa("%r");
+        let iff = ops.op(Some("%r"), OpKind::ScfIf, &["%cond"]);
+        let iff = ops.regions(iff, vec![vec![c, yld], vec![e, eyld]]);
         run(&[iff], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 7.0),
             other => panic!("expected F32(7.0), got {other:?}"),
         }
@@ -820,18 +844,20 @@ mod tests {
 
     #[test]
     fn if_false_runs_else_branch() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%cond", Value::Scalar(Scalar::Bool(false)));
-        let c =
-            Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Float(7.0));
-        let yld = Operation::new(None, "scf.yield", &["%t"]);
-        let e =
-            Operation::new(Some("%f"), "arith.constant", &[]).with_attr("value", Attr::Float(9.0));
-        let eyld = Operation::new(None, "scf.yield", &["%f"]);
-        let mut iff = Operation::new(Some("%r"), "scf.if", &["%cond"]);
-        iff.regions = vec![vec![c, yld], vec![e, eyld]];
+        ctx.set_value(ops.ssa("%cond"), Value::Scalar(Scalar::Bool(false)));
+        let c = ops.op(Some("%t"), OpKind::ArithConstant, &[]);
+        let c = ops.attr(c, AttrKey::Value, Attr::Float(7.0));
+        let yld = ops.op(None, OpKind::ScfYield, &["%t"]);
+        let e = ops.op(Some("%f"), OpKind::ArithConstant, &[]);
+        let e = ops.attr(e, AttrKey::Value, Attr::Float(9.0));
+        let eyld = ops.op(None, OpKind::ScfYield, &["%f"]);
+        let r = ops.ssa("%r");
+        let iff = ops.op(Some("%r"), OpKind::ScfIf, &["%cond"]);
+        let iff = ops.regions(iff, vec![vec![c, yld], vec![e, eyld]]);
         run(&[iff], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 9.0),
             other => panic!("expected F32(9.0), got {other:?}"),
         }
@@ -839,49 +865,54 @@ mod tests {
 
     #[test]
     fn if_empty_branch_returns_none() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%cond", Value::Scalar(Scalar::Bool(false)));
+        ctx.set_value(ops.ssa("%cond"), Value::Scalar(Scalar::Bool(false)));
         // then has a body, else is empty -> condition false selects empty -> None.
-        let c =
-            Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Float(7.0));
-        let yld = Operation::new(None, "scf.yield", &["%t"]);
+        let c = ops.op(Some("%t"), OpKind::ArithConstant, &[]);
+        let c = ops.attr(c, AttrKey::Value, Attr::Float(7.0));
+        let yld = ops.op(None, OpKind::ScfYield, &["%t"]);
+        let t = ops.ssa("%t");
         // no result name: op produces None, nothing bound.
-        let mut iff = Operation::new(None, "scf.if", &["%cond"]);
-        iff.regions = vec![vec![c, yld]]; // only a then-region
+        let iff = ops.op(None, OpKind::ScfIf, &["%cond"]);
+        let iff = ops.with_region(iff, vec![c, yld]); // only a then-region
         run(&[iff], &mut ctx).unwrap();
         // no panic, and no stray binding leaked from the (unrun) then-branch.
-        assert!(ctx.get_value("%t").is_err());
+        assert!(ctx.get_value(t).is_err());
     }
 
     #[test]
     fn if_branch_local_lx_is_freed() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%cond", Value::Scalar(Scalar::Bool(true)));
+        ctx.set_value(ops.ssa("%cond"), Value::Scalar(Scalar::Bool(true)));
         ctx.set_value(
-            "%x",
+            ops.ssa("%x"),
             Value::Tile(Tile::compute(vec![1.0, 2.0], DType::F32, vec![2])),
         );
         // then: %y = addf %x %x ; yield nothing (no result) -> body-local tile freed.
-        let add = Operation::new(Some("%y"), "arith.addf", &["%x", "%x"]);
-        let yld = Operation::new(None, "scf.yield", &[]);
-        let mut iff = Operation::new(None, "scf.if", &["%cond"]);
-        iff.regions = vec![vec![add, yld]];
+        let add = ops.op(Some("%y"), OpKind::ArithAddf, &["%x", "%x"]);
+        let yld = ops.op(None, OpKind::ScfYield, &[]);
+        let y = ops.ssa("%y");
+        let iff = ops.op(None, OpKind::ScfIf, &["%cond"]);
+        let iff = ops.with_region(iff, vec![add, yld]);
         let before = ctx.lx.borrow().used;
         run(&[iff], &mut ctx).unwrap();
         // %y (body-local) was freed on pop_scope; LX usage unchanged.
         assert_eq!(ctx.lx.borrow().used, before);
-        assert!(ctx.get_value("%y").is_err());
+        assert!(ctx.get_value(y).is_err());
     }
 
     #[test]
     fn yield_gathers_multiple_operands() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", Value::Scalar(Scalar::I64(1)));
-        ctx.set_value("%b", Value::Scalar(Scalar::I64(2)));
+        ctx.set_value(ops.ssa("%a"), Value::Scalar(Scalar::I64(1)));
+        ctx.set_value(ops.ssa("%b"), Value::Scalar(Scalar::I64(2)));
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
-        let op = Operation::new(None, "scf.yield", &["%a", "%b"]);
+        let op = ops.op(None, OpKind::ScfYield, &["%a", "%b"]);
         let out = scf_yield(&op, &mut ctx, &env).unwrap();
         match out {
             Some(Value::Tuple(vals)) => {
@@ -896,15 +927,17 @@ mod tests {
     #[test]
     fn nested_for_inside_if() {
         // if(true) { %r = for ... acc += i ; yield acc } yield %r
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%cond", Value::Scalar(Scalar::Bool(true)));
-        ctx.set_value("%lb", Value::Index(0));
-        ctx.set_value("%ub", Value::Index(4));
-        ctx.set_value("%step", Value::Index(1));
-        ctx.set_value("%init", Value::Scalar(Scalar::I64(0)));
-        let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]);
-        let fyld = Operation::new(None, "scf.yield", &["%s"]);
+        ctx.set_value(ops.ssa("%cond"), Value::Scalar(Scalar::Bool(true)));
+        ctx.set_value(ops.ssa("%lb"), Value::Index(0));
+        ctx.set_value(ops.ssa("%ub"), Value::Index(4));
+        ctx.set_value(ops.ssa("%step"), Value::Index(1));
+        ctx.set_value(ops.ssa("%init"), Value::Scalar(Scalar::I64(0)));
+        let add = ops.op(Some("%s"), OpKind::ArithAddi, &["%acc", "%i"]);
+        let fyld = ops.op(None, OpKind::ScfYield, &["%s"]);
         let inner_for = for_op_ir(
+            &mut ops,
             Some("%r"),
             "%lb",
             "%ub",
@@ -914,11 +947,12 @@ mod tests {
             &["%acc"],
             vec![add, fyld],
         );
-        let oyld = Operation::new(None, "scf.yield", &["%r"]);
-        let mut iff = Operation::new(Some("%out"), "scf.if", &["%cond"]);
-        iff.regions = vec![vec![inner_for, oyld]];
+        let oyld = ops.op(None, OpKind::ScfYield, &["%r"]);
+        let out = ops.ssa("%out");
+        let iff = ops.op(Some("%out"), OpKind::ScfIf, &["%cond"]);
+        let iff = ops.with_region(iff, vec![inner_for, oyld]);
         run(&[iff], &mut ctx).unwrap();
-        match ctx.get_value("%out").unwrap() {
+        match ctx.get_value(out).unwrap() {
             Value::Scalar(Scalar::I64(v)) => assert_eq!(*v, 6),
             other => panic!("expected I64(6), got {other:?}"),
         }

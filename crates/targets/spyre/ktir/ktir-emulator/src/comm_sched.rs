@@ -1991,6 +1991,7 @@ pub fn execute_function_single_tile(
 mod tests {
     use super::*;
     use crate::dtypes::DType;
+    use crate::test_support::Ops as TestOps;
 
     /// Run a scheduler over per-core seed bindings, returning each core's final
     /// scope value for `result_name`. A test harness that keeps the contexts so
@@ -1999,9 +2000,9 @@ mod tests {
     fn run_capturing(
         grid: &GridExecutor,
         mem: &SpyreMemoryHierarchy,
-        ops: &[Operation],
-        seeds: &[Vec<(String, Value)>],
-        result_name: &str,
+        ops: &[Operation<'static>],
+        seeds: &[Vec<(Ssa, Value)>],
+        result_name: Ssa,
     ) -> Vec<Option<Value>> {
         let dispatch = Dispatch::new();
         let env = ExecutionEnv::new(&dispatch, grid);
@@ -2020,7 +2021,7 @@ mod tests {
                     mem.lx_scratchpads.clone(),
                 );
                 for (name, val) in &seeds[core_id] {
-                    ctx.set_value(name, val.clone());
+                    ctx.set_value(*name, val.clone());
                 }
                 CoreRunner {
                     ctx,
@@ -2113,24 +2114,27 @@ mod tests {
     #[test]
     fn ring_reduce_4_cores_sums_to_all() {
         // Worked example from RingReduceBackend: starting 1,2,3,4 -> every core 10.
+        let mut ops = TestOps::new();
         let grid = GridExecutor::new((4, 1, 1));
         let mem = SpyreMemoryHierarchy::new(4);
         let group = Value::Tuple((0..4i64).map(Value::Index).collect());
-        let seeds: Vec<Vec<(String, Value)>> = (0..4)
+        let (t, g) = (ops.ssa("%t"), ops.ssa("%g"));
+        let seeds: Vec<Vec<(Ssa, Value)>> = (0..4)
             .map(|c| {
                 vec![
                     (
-                        "t".into(),
+                        t,
                         Value::Tile(Tile::compute(vec![(c + 1) as f32], DType::F32, vec![1])),
                     ),
-                    ("g".into(), group.clone()),
+                    (g, group.clone()),
                 ]
             })
             .collect();
-        let ops = vec![Operation::new(Some("%r"), "ktdp.reduce", &["%t", "%g"])];
-        let results = run_capturing(&grid, &mem, &ops, &seeds, "%r");
-        for (c, r) in results.iter().enumerate() {
-            match r {
+        let r = ops.ssa("%r");
+        let stmts = vec![ops.op(Some("%r"), OpKind::KtdpReduce, &["%t", "%g"])];
+        let results = run_capturing(&grid, &mem, &stmts, &seeds, r);
+        for (c, res) in results.iter().enumerate() {
+            match res {
                 Some(Value::Tile(t)) => assert_eq!(t.as_f32().to_vec(), vec![10.0], "core {c}"),
                 other => panic!("core {c}: expected Tile([10]), got {other:?}"),
             }
@@ -2140,25 +2144,28 @@ mod tests {
     #[test]
     fn ring_reduce_3_cores_vectors() {
         // 3 cores, 2-element tiles: [1,10],[2,20],[3,30] -> all [6,60].
+        let mut ops = TestOps::new();
         let grid = GridExecutor::new((3, 1, 1));
         let mem = SpyreMemoryHierarchy::new(3);
         let group = Value::Tuple((0..3i64).map(Value::Index).collect());
         let starts = [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]];
-        let seeds: Vec<Vec<(String, Value)>> = (0..3)
+        let (t, g) = (ops.ssa("%t"), ops.ssa("%g"));
+        let seeds: Vec<Vec<(Ssa, Value)>> = (0..3)
             .map(|c| {
                 vec![
                     (
-                        "t".into(),
+                        t,
                         Value::Tile(Tile::compute(starts[c].to_vec(), DType::F32, vec![2])),
                     ),
-                    ("g".into(), group.clone()),
+                    (g, group.clone()),
                 ]
             })
             .collect();
-        let ops = vec![Operation::new(Some("%r"), "ktdp.reduce", &["%t", "%g"])];
-        let results = run_capturing(&grid, &mem, &ops, &seeds, "%r");
-        for (c, r) in results.iter().enumerate() {
-            match r {
+        let r = ops.ssa("%r");
+        let stmts = vec![ops.op(Some("%r"), OpKind::KtdpReduce, &["%t", "%g"])];
+        let results = run_capturing(&grid, &mem, &stmts, &seeds, r);
+        for (c, res) in results.iter().enumerate() {
+            match res {
                 Some(Value::Tile(t)) => {
                     assert_eq!(t.as_f32().to_vec(), vec![6.0, 60.0], "core {c}")
                 }
@@ -2169,37 +2176,40 @@ mod tests {
 
     #[test]
     fn no_comm_ops_runs_each_core_to_completion() {
+        let mut ops = TestOps::new();
         let grid = GridExecutor::new((3, 1, 1));
         let mem = SpyreMemoryHierarchy::new(3);
         let dispatch = Dispatch::new();
-        let ops = vec![
-            Operation::new(Some("%a"), "arith.constant", &[])
-                .with_attr("value", crate::ir::Attr::Int(7)),
-            Operation::new(Some("%b"), "arith.addi", &["%a", "%a"]),
-        ];
-        execute_with_communication(&grid, &mem, &ops, &[], &dispatch, None, None).unwrap();
+        let a = ops.op(Some("%a"), OpKind::ArithConstant, &[]);
+        let a = ops.attr(a, AttrKey::Value, crate::ir::Attr::Int(7));
+        let b = ops.op(Some("%b"), OpKind::ArithAddi, &["%a", "%a"]);
+        let stmts = vec![a, b];
+        execute_with_communication(&grid, &mem, &stmts, &[], &dispatch, None, None).unwrap();
     }
 
     #[test]
     fn core_outside_group_is_identity() {
         // 2-core grid, group = {0} only; core 1 isn't in the group -> identity,
         // core 0 is a singleton group -> identity. Neither blocks.
+        let mut ops = TestOps::new();
         let grid = GridExecutor::new((2, 1, 1));
         let mem = SpyreMemoryHierarchy::new(2);
         let group = Value::Tuple(vec![Value::Index(0)]);
-        let seeds: Vec<Vec<(String, Value)>> = (0..2)
+        let (t, g) = (ops.ssa("%t"), ops.ssa("%g"));
+        let seeds: Vec<Vec<(Ssa, Value)>> = (0..2)
             .map(|c| {
                 vec![
                     (
-                        "t".into(),
+                        t,
                         Value::Tile(Tile::compute(vec![(c + 1) as f32], DType::F32, vec![1])),
                     ),
-                    ("g".into(), group.clone()),
+                    (g, group.clone()),
                 ]
             })
             .collect();
-        let ops = vec![Operation::new(Some("%r"), "ktdp.reduce", &["%t", "%g"])];
-        let results = run_capturing(&grid, &mem, &ops, &seeds, "%r");
+        let r = ops.ssa("%r");
+        let stmts = vec![ops.op(Some("%r"), OpKind::KtdpReduce, &["%t", "%g"])];
+        let results = run_capturing(&grid, &mem, &stmts, &seeds, r);
         // each core keeps its own value (no reduction)
         match &results[0] {
             Some(Value::Tile(t)) => assert_eq!(t.as_f32().to_vec(), vec![1.0]),

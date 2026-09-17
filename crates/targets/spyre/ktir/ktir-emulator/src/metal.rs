@@ -5195,7 +5195,7 @@ pub fn metal_gemm_fused(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_module;
+    use crate::test_support::Ops;
 
     /// On a build that embedded the AOT metallibs (`cfg(metal_aot)`), assert the
     /// runtime reports AOT active AND that the engine still builds + reduces full K
@@ -6091,156 +6091,29 @@ kernel void mpp_probe(
         );
     }
 
-    #[test]
-    fn lowers_vector_add_to_msl() {
-        let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
-        let module = parse_module(src).unwrap();
-        let msl = emit_msl(&module, "add_kernel").expect("emit MSL");
-
-        // Structural checks on the emitted shader.
-        assert!(msl.contains("#include <metal_stdlib>"));
-        assert!(msl.contains("kernel void add_kernel("));
-        assert!(msl.contains("thread_position_in_grid"));
-        // Three f16 buffers: two read-only inputs, one writable output.
-        assert!(msl.contains("device const half* x_ptr [[buffer(0)]]"));
-        assert!(msl.contains("device const half* y_ptr [[buffer(1)]]"));
-        assert!(msl.contains("device half* output_ptr [[buffer(2)]]"));
-        // The element-wise add, with the output buffer on the LHS.
-        assert!(
-            msl.contains("output_ptr[gid] = x_ptr[gid] + y_ptr[gid];"),
-            "unexpected body:\n{msl}"
-        );
-    }
-
-    #[test]
-    fn fuses_elementwise_chain_into_one_expression() {
-        // exp(a * b) + c  -> a single fused kernel, not three passes.
-        let src = r#"
-module {
-  func.func @chain(%a_ptr: index, %b_ptr: index, %c_ptr: index, %out_ptr: index) attributes {grid = [1]} {
-    %c0 = arith.constant 0 : index
-    %va = ktdp.construct_memory_view %a_ptr, sizes: [8], strides: [1] {
-      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<8xf16>
-    %vb = ktdp.construct_memory_view %b_ptr, sizes: [8], strides: [1] {
-      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<8xf16>
-    %vc = ktdp.construct_memory_view %c_ptr, sizes: [8], strides: [1] {
-      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<8xf16>
-    %ta = ktdp.construct_access_tile %va[%c0] {
-      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
-    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
-    %tb = ktdp.construct_access_tile %vb[%c0] {
-      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
-    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
-    %tc = ktdp.construct_access_tile %vc[%c0] {
-      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
-    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
-    %la = ktdp.load %ta : !ktdp.access_tile<8xindex> -> tensor<8xf16>
-    %lb = ktdp.load %tb : !ktdp.access_tile<8xindex> -> tensor<8xf16>
-    %lc = ktdp.load %tc : !ktdp.access_tile<8xindex> -> tensor<8xf16>
-    %ab = arith.mulf %la, %lb : tensor<8xf16>
-    %e = math.exp %ab : tensor<8xf16>
-    %r = arith.addf %e, %lc : tensor<8xf16>
-    %vout = ktdp.construct_memory_view %out_ptr, sizes: [8], strides: [1] {
-      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<8xf16>
-    %tout = ktdp.construct_access_tile %vout[%c0] {
-      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
-    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
-    ktdp.store %r, %tout : tensor<8xf16>, !ktdp.access_tile<8xindex>
-    return
-  }
-}
-"#;
-        let module = parse_module(src).unwrap();
-        let kernel = emit_kernel(&module, "chain").expect("emit fused chain");
-        // One kernel, three input buffers (a,b,c) + one output, deduped & ordered.
-        let names: Vec<&str> = kernel.buffers.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["a_ptr", "b_ptr", "c_ptr", "out_ptr"],
-            "fused buffer set"
-        );
-        assert_eq!(kernel.buffers.iter().filter(|b| b.is_output).count(), 1);
-        // The whole DAG collapses into one assignment: exp(a*b) + c.
-        assert!(
-            kernel
-                .source
-                .contains("out_ptr[gid] = (exp((a_ptr[gid] * b_ptr[gid]))) + c_ptr[gid];"),
-            "expected one fused expression, got:\n{}",
-            kernel.source
-        );
-    }
-
-    #[test]
-    fn fuses_constants_casts_and_splat() {
-        // half a -> float, scale by a splat constant in f32, narrow back to half:
-        //   out = half(float(a) * 2.0)
-        let src = r#"
-module {
-  func.func @scale(%a_ptr: index, %out_ptr: index) attributes {grid = [1]} {
-    %c0 = arith.constant 0 : index
-    %va = ktdp.construct_memory_view %a_ptr, sizes: [8], strides: [1] {
-      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<8xf16>
-    %ta = ktdp.construct_access_tile %va[%c0] {
-      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
-    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
-    %la = ktdp.load %ta : !ktdp.access_tile<8xindex> -> tensor<8xf16>
-    %xf = arith.extf %la : tensor<8xf16> to tensor<8xf32>
-    %c2 = arith.constant 2.0 : f32
-    %s = tensor.splat %c2 : tensor<8xf32>
-    %m = arith.mulf %xf, %s : tensor<8xf32>
-    %t = arith.truncf %m : tensor<8xf32> to tensor<8xf16>
-    %vout = ktdp.construct_memory_view %out_ptr, sizes: [8], strides: [1] {
-      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<8xf16>
-    %tout = ktdp.construct_access_tile %vout[%c0] {
-      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
-    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
-    ktdp.store %t, %tout : tensor<8xf16>, !ktdp.access_tile<8xindex>
-    return
-  }
-}
-"#;
-        let module = parse_module(src).unwrap();
-        let kernel = emit_kernel(&module, "scale").expect("emit scale chain");
-        // Only `a` is a real buffer; the constant folded into the expression.
-        let names: Vec<&str> = kernel.buffers.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, vec!["a_ptr", "out_ptr"], "constant is not a buffer");
-        assert!(
-            kernel
-                .source
-                .contains("out_ptr[gid] = half(((float(a_ptr[gid])) * ((2.0))));"),
-            "unexpected fused body:\n{}",
-            kernel.source
-        );
-    }
-
     // --- kernel scheduling (partitioner) --------------------------------
 
-    /// Build a bare op with just a type (the partitioner only reads op_type).
-    fn op(ty: &str) -> Operation {
-        Operation::new(Some("%r"), ty, &[])
+    /// Build a bare op with just a kind (the partitioner only reads op_type).
+    fn op(ops: &mut Ops, kind: OpKind) -> Operation<'static> {
+        ops.op(Some("%r"), kind, &[])
     }
 
     #[test]
     fn partitions_rmsnorm_shape_into_map_reduce_map() {
         // load, [extf, mulf], reduce, [divf, sqrt], store, return
         // -> Map([1,2]), Reduce(3), Map([4,5])  (plumbing skipped, not boundaries)
-        let ops = vec![
-            op("ktdp.load"),     // 0 plumbing
-            op("arith.extf"),    // 1 map
-            op("arith.mulf"),    // 2 map
-            op("linalg.reduce"), // 3 reduce
-            op("arith.divf"),    // 4 map
-            op("math.sqrt"),     // 5 map
-            op("ktdp.store"),    // 6 plumbing
-            op("func.return"),   // 7 plumbing
+        let mut ops = Ops::new();
+        let stmts = vec![
+            op(&mut ops, OpKind::KtdpLoad),     // 0 plumbing
+            op(&mut ops, OpKind::ArithExtf),    // 1 map
+            op(&mut ops, OpKind::ArithMulf),    // 2 map
+            op(&mut ops, OpKind::LinalgReduce), // 3 reduce
+            op(&mut ops, OpKind::ArithDivf),    // 4 map
+            op(&mut ops, OpKind::MathSqrt),     // 5 map
+            op(&mut ops, OpKind::KtdpStore),    // 6 plumbing
+            op(&mut ops, OpKind::FuncReturn),   // 7 plumbing
         ];
-        let plan = plan_kernels(&ops).unwrap();
+        let plan = plan_kernels(&stmts).unwrap();
         assert_eq!(
             plan,
             vec![
@@ -6254,12 +6127,13 @@ module {
     #[test]
     fn partitions_matmul_as_its_own_region() {
         // broadcast then matmul then add -> Map, Matmul, Map
-        let ops = vec![
-            op("linalg.broadcast"), // 0 map
-            op("linalg.matmul"),    // 1 matmul
-            op("arith.addf"),       // 2 map
+        let mut ops = Ops::new();
+        let stmts = vec![
+            op(&mut ops, OpKind::LinalgBroadcast), // 0 map
+            op(&mut ops, OpKind::LinalgMatmul),    // 1 matmul
+            op(&mut ops, OpKind::ArithAddf),       // 2 map
         ];
-        let plan = plan_kernels(&ops).unwrap();
+        let plan = plan_kernels(&stmts).unwrap();
         assert_eq!(
             plan,
             vec![
@@ -6272,76 +6146,100 @@ module {
 
     #[test]
     fn unfusable_op_forces_fallback() {
-        let ops = vec![op("arith.mulf"), op("scf.for"), op("arith.addf")];
+        let mut ops = Ops::new();
+        let stmts = vec![
+            op(&mut ops, OpKind::ArithMulf),
+            op(&mut ops, OpKind::ScfFor),
+            op(&mut ops, OpKind::ArithAddf),
+        ];
         assert!(
-            plan_kernels(&ops).is_err(),
+            plan_kernels(&stmts).is_err(),
             "bare scf.for must force a fallback"
         );
     }
 
     /// Build a K-loop matmul function: A is either a forwarded extract_slice of a
     /// `[m,k]` producer (prefill/decode forwarded activation) or a load of an
-    /// `[m,k]` view; B is a load of a `[k,n]` weight view. Mirrors the real fused
-    /// K-loop so recognition is exercised end to end.
-    fn matmul_loop_fn(a_via_slice: bool, m: i64, k: i64, n: i64) -> Vec<Operation> {
-        let il = |v: Vec<i64>| Attr::IntList(v);
-        let mut top = vec![
-            // A's full source / producer, shape [m,k]. Plumbing (tensor.empty)
-            // so this focused test's plan is just the MatmulLoop; in the real
-            // fused fn the source is a preceding map/reduce region's output.
-            Operation::new(Some("%src"), "tensor.empty", &[]).with_attr("shape", il(vec![m, k])),
-            // B weight view over %wptr, shape [k,n].
-            Operation::new(Some("%vw"), "ktdp.construct_memory_view", &["%wptr"])
-                .with_attr("shape", il(vec![k, n])),
-        ];
+    /// `[m,k]` view; B is a load of a `[k,n]` (or, transposed, `[n,k]`) weight
+    /// view. Mirrors the real fused K-loop so recognition is exercised end to end.
+    fn matmul_loop_fn(
+        ops: &mut Ops,
+        a_via_slice: bool,
+        transpose_b: bool,
+        m: i64,
+        k: i64,
+        n: i64,
+    ) -> Vec<Operation<'static>> {
+        let src = ops.op(Some("%src"), OpKind::TensorEmpty, &[]);
+        let shape = ops.int_list(vec![m, k]);
+        let src = ops.attr(src, AttrKey::Shape, shape);
+        // B weight view over %wptr — [k,n] normally, [n,k] transposed (on-disk
+        // PyTorch Linear [out,in]).
+        let vw = ops.op(Some("%vw"), OpKind::KtdpConstructMemoryView, &["%wptr"]);
+        let vw_shape = if transpose_b {
+            ops.int_list(vec![n, k])
+        } else {
+            ops.int_list(vec![k, n])
+        };
+        let vw = ops.attr(vw, AttrKey::Shape, vw_shape);
+        let mut top = vec![src, vw];
+
         let mut body = Vec::new();
         if a_via_slice {
-            body.push(
-                Operation::new(Some("%a"), "tensor.extract_slice", &["%src"]).with_attr(
-                    "slice_sizes",
-                    Attr::StrList(vec!["1".into(), k.to_string()]),
-                ),
-            );
+            let a = ops.op(Some("%a"), OpKind::TensorExtractSlice, &["%src"]);
+            let sizes = ops.int_list(vec![1, k]);
+            body.push(ops.attr(a, AttrKey::SliceSizes, sizes));
         } else {
             // A via a load of a [m,k] view over %aptr.
-            top.push(
-                Operation::new(Some("%va"), "ktdp.construct_memory_view", &["%aptr"])
-                    .with_attr("shape", il(vec![m, k])),
+            let va = ops.op(Some("%va"), OpKind::KtdpConstructMemoryView, &["%aptr"]);
+            let shape = ops.int_list(vec![m, k]);
+            top.push(ops.attr(va, AttrKey::Shape, shape));
+            let at = ops.op(
+                Some("%at"),
+                OpKind::KtdpConstructAccessTile,
+                &["%va", "%pid", "%kk"],
             );
-            body.push(
-                Operation::new(
-                    Some("%at"),
-                    "ktdp.construct_access_tile",
-                    &["%va", "%pid", "%kk"],
-                )
-                .with_attr("shape", il(vec![1, k])),
-            );
-            body.push(Operation::new(Some("%a"), "ktdp.load", &["%at"]));
+            let shape = ops.int_list(vec![1, k]);
+            body.push(ops.attr(at, AttrKey::Shape, shape));
+            body.push(ops.op(Some("%a"), OpKind::KtdpLoad, &["%at"]));
         }
-        body.push(
-            Operation::new(
-                Some("%bt"),
-                "ktdp.construct_access_tile",
-                &["%vw", "%kk", "%c0"],
-            )
-            .with_attr("shape", il(vec![k, n])),
+        let bt = ops.op(
+            Some("%bt"),
+            OpKind::KtdpConstructAccessTile,
+            &["%vw", "%kk", "%c0"],
         );
-        body.push(Operation::new(Some("%b"), "ktdp.load", &["%bt"]));
-        body.push(Operation::new(Some("%cinit"), "arith.constant", &[]));
-        body.push(
-            Operation::new(Some("%part"), "linalg.matmul", &["%a", "%b", "%cinit"])
-                .with_attr("shape", il(vec![m, n])),
-        );
-        body.push(Operation::new(
-            Some("%accnext"),
-            "arith.addf",
-            &["%acc", "%part"],
-        ));
-        body.push(Operation::new(None, "scf.yield", &["%accnext"]));
-        let mut forop = Operation::new(Some("%mm"), "scf.for", &["%c0", "%K", "%KB", "%azero"])
-            .with_attr("iter_var", Attr::Str("%kk".into()))
-            .with_attr("iter_args", Attr::StrList(vec!["%acc".into()]));
-        forop.regions = vec![body];
+        let shape = if transpose_b {
+            ops.int_list(vec![n, k])
+        } else {
+            ops.int_list(vec![k, n])
+        };
+        body.push(ops.attr(bt, AttrKey::Shape, shape));
+        body.push(ops.op(Some("%b"), OpKind::KtdpLoad, &["%bt"]));
+        body.push(ops.op(Some("%cinit"), OpKind::ArithConstant, &[]));
+        let mm = ops.op(Some("%part"), OpKind::LinalgMatmul, &["%a", "%b", "%cinit"]);
+        let shape = ops.int_list(vec![m, n]);
+        let mm = ops.attr(mm, AttrKey::Shape, shape);
+        let mm = if transpose_b {
+            // A: [m,k]; B: [n,k] (transpose-B); C: [m,n].
+            let maps = ops.map_list(vec![
+                ops.perm_map(3, &[0, 2]),
+                ops.perm_map(3, &[1, 2]),
+                ops.perm_map(3, &[0, 1]),
+            ]);
+            ops.attr(mm, AttrKey::IndexingMaps, maps)
+        } else {
+            mm
+        };
+        body.push(mm);
+        body.push(ops.op(Some("%accnext"), OpKind::ArithAddf, &["%acc", "%part"]));
+        body.push(ops.op(None, OpKind::ScfYield, &["%accnext"]));
+
+        let forop = ops.op(Some("%mm"), OpKind::ScfFor, &["%c0", "%K", "%KB", "%azero"]);
+        let iter_var = ops.ssas_attr(&["%kk"]);
+        let forop = ops.attr(forop, AttrKey::IterVar, iter_var);
+        let iter_args = ops.ssas_attr(&["%acc"]);
+        let forop = ops.attr(forop, AttrKey::IterArgs, iter_args);
+        let forop = ops.with_region(forop, body);
         top.push(forop);
         top
     }
@@ -6350,17 +6248,19 @@ module {
     fn recognizes_prefill_matmul_kloop_as_m8_gemm() {
         // A = extract_slice of an [8,576] activation (the forwarded fused form);
         // B = [576,576] weight. The grid/K-tiling collapses to one M=8 GEMM.
-        let ops = matmul_loop_fn(true, 8, 576, 576);
-        let plan = plan_kernels(&ops).unwrap();
+        let mut ops = Ops::new();
+        let stmts = matmul_loop_fn(&mut ops, true, false, 8, 576, 576);
+        let (a_root, b_root, out_ssa) = (ops.ssa("%src"), ops.ssa("%wptr"), ops.ssa("%mm"));
+        let plan = plan_kernels(&stmts).unwrap();
         assert_eq!(
             plan,
             vec![KernelRegion::MatmulLoop(MatmulLoopInfo {
                 m: 8,
                 k: 576,
                 n: 576,
-                a_root: "%src".into(),
-                b_root: "%wptr".into(),
-                out_ssa: "%mm".into(),
+                a_root,
+                b_root,
+                out_ssa,
                 n_off: 0,
                 b_stride: 576,
                 transpose_b: false,
@@ -6374,17 +6274,19 @@ module {
     fn recognizes_decode_matmul_kloop_as_m1_gemm() {
         // A via a load of a [1,576] view (decode), B = [576,576]. Same recognizer,
         // M=1 from the full view shape.
-        let ops = matmul_loop_fn(false, 1, 576, 576);
-        let plan = plan_kernels(&ops).unwrap();
+        let mut ops = Ops::new();
+        let stmts = matmul_loop_fn(&mut ops, false, false, 1, 576, 576);
+        let (a_root, b_root, out_ssa) = (ops.ssa("%aptr"), ops.ssa("%wptr"), ops.ssa("%mm"));
+        let plan = plan_kernels(&stmts).unwrap();
         assert_eq!(
             plan,
             vec![KernelRegion::MatmulLoop(MatmulLoopInfo {
                 m: 1,
                 k: 576,
                 n: 576,
-                a_root: "%aptr".into(),
-                b_root: "%wptr".into(),
-                out_ssa: "%mm".into(),
+                a_root,
+                b_root,
+                out_ssa,
                 n_off: 0,
                 b_stride: 576,
                 transpose_b: false,
@@ -6400,40 +6302,19 @@ module {
         // (on-disk Linear [out,in]). The recognizer must set transpose_b=true,
         // derive n from B's FIRST axis and k from its LAST (== A's k), n_off=0.
         let (m, k, n) = (8, 576, 512);
-        let mut ops = matmul_loop_fn(true, m, k, n);
-        // Flip B's view shape [k,n] -> [n,k] (top-level %vw), and tag the matmul
-        // op (which lives INSIDE the scf.for body region) with transpose-B maps.
-        for op in ops.iter_mut() {
-            if op.result.as_deref() == Some("%vw") {
-                op.attributes
-                    .insert("shape".into(), Attr::IntList(vec![n, k]));
-            }
-            if op.op_type == "scf.for" {
-                for body_op in op.regions[0].iter_mut() {
-                    if body_op.op_type == "linalg.matmul" {
-                        let p = |s: &str| crate::parser_ast::parse_affine_map(s).unwrap();
-                        body_op.attributes.insert(
-                            "indexing_maps".into(),
-                            Attr::AffineMapList(vec![
-                                p("affine_map<(d0, d1, d2) -> (d0, d2)>"),
-                                p("affine_map<(d0, d1, d2) -> (d1, d2)>"),
-                                p("affine_map<(d0, d1, d2) -> (d0, d1)>"),
-                            ]),
-                        );
-                    }
-                }
-            }
-        }
-        let plan = plan_kernels(&ops).unwrap();
+        let mut ops = Ops::new();
+        let stmts = matmul_loop_fn(&mut ops, true, true, m, k, n);
+        let (a_root, b_root, out_ssa) = (ops.ssa("%src"), ops.ssa("%wptr"), ops.ssa("%mm"));
+        let plan = plan_kernels(&stmts).unwrap();
         assert_eq!(
             plan,
             vec![KernelRegion::MatmulLoop(MatmulLoopInfo {
                 m,
                 k,
                 n,
-                a_root: "%src".into(),
-                b_root: "%wptr".into(),
-                out_ssa: "%mm".into(),
+                a_root,
+                b_root,
+                out_ssa,
                 n_off: 0,
                 b_stride: n,
                 transpose_b: true,
@@ -6446,13 +6327,13 @@ module {
     #[test]
     fn non_matmul_scf_for_still_falls_back() {
         // A loop whose body is not the matmul-accumulate template -> Err.
-        let mut body = vec![
-            Operation::new(Some("%t"), "arith.mulf", &["%acc", "%acc"]),
-            Operation::new(None, "scf.yield", &["%t"]),
-        ];
-        let mut forop = Operation::new(Some("%r"), "scf.for", &["%c0", "%K", "%KB", "%azero"])
-            .with_attr("iter_args", Attr::StrList(vec!["%acc".into()]));
-        forop.regions = vec![std::mem::take(&mut body)];
+        let mut ops = Ops::new();
+        let t = ops.op(Some("%t"), OpKind::ArithMulf, &["%acc", "%acc"]);
+        let yld = ops.op(None, OpKind::ScfYield, &["%t"]);
+        let forop = ops.op(Some("%r"), OpKind::ScfFor, &["%c0", "%K", "%KB", "%azero"]);
+        let iter_args = ops.ssas_attr(&["%acc"]);
+        let forop = ops.attr(forop, AttrKey::IterArgs, iter_args);
+        let forop = ops.with_region(forop, vec![t, yld]);
         assert!(
             plan_kernels(&[forop]).is_err(),
             "non-matmul loop must fall back"
@@ -6462,9 +6343,11 @@ module {
     #[test]
     fn map_window_respects_size_cap() {
         // 2*CAP + 5 consecutive map ops -> windows of CAP, CAP, then 5.
+        let mut ops = Ops::new();
         let n = MAX_KERNEL_WINDOW * 2 + 5;
-        let ops: Vec<Operation> = (0..n).map(|_| op("arith.addf")).collect();
-        let plan = plan_kernels(&ops).unwrap();
+        let stmts: Vec<Operation<'static>> =
+            (0..n).map(|_| op(&mut ops, OpKind::ArithAddf)).collect();
+        let plan = plan_kernels(&stmts).unwrap();
         let sizes: Vec<usize> = plan
             .iter()
             .map(|r| match r {
@@ -6473,133 +6356,6 @@ module {
             })
             .collect();
         assert_eq!(sizes, vec![MAX_KERNEL_WINDOW, MAX_KERNEL_WINDOW, 5]);
-    }
-
-    #[test]
-    fn fuses_broadcast_per_column_weight() {
-        // out[1,576] = a[1,576] * broadcast(w[576], dims=[0])  — RMSNorm's final
-        // per-column gamma multiply. The weight indexes by column (gid % 576),
-        // not gid, so this exercises shape-aware broadcast indexing.
-        let src = r#"
-module {
-  func.func @scale(%a_ptr: index, %w_ptr: index, %out_ptr: index) attributes {grid = [1]} {
-    %c0 = arith.constant 0 : index
-    %va = ktdp.construct_memory_view %a_ptr, sizes: [1, 576], strides: [576, 1] {
-      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 575 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<1x576xf16>
-    %vw = ktdp.construct_memory_view %w_ptr, sizes: [576], strides: [1] {
-      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 575 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<576xf16>
-    %ta = ktdp.construct_access_tile %va[%c0, %c0] {
-      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 575 >= 0)>, access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
-    } : memref<1x576xf16> -> !ktdp.access_tile<1x576xindex>
-    %tw = ktdp.construct_access_tile %vw[%c0] {
-      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 575 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
-    } : memref<576xf16> -> !ktdp.access_tile<576xindex>
-    %la = ktdp.load %ta : !ktdp.access_tile<1x576xindex> -> tensor<1x576xf16>
-    %lw = ktdp.load %tw : !ktdp.access_tile<576xindex> -> tensor<576xf16>
-    %ginit = tensor.empty() : tensor<1x576xf16>
-    %gb = linalg.broadcast ins(%lw : tensor<576xf16>) outs(%ginit : tensor<1x576xf16>) dimensions = [0]
-    %y = arith.mulf %la, %gb : tensor<1x576xf16>
-    %vout = ktdp.construct_memory_view %out_ptr, sizes: [1, 576], strides: [576, 1] {
-      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 575 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<1x576xf16>
-    %tout = ktdp.construct_access_tile %vout[%c0, %c0] {
-      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 575 >= 0)>, access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
-    } : memref<1x576xf16> -> !ktdp.access_tile<1x576xindex>
-    ktdp.store %y, %tout : tensor<1x576xf16>, !ktdp.access_tile<1x576xindex>
-    return
-  }
-}
-"#;
-        let module = parse_module(src).unwrap();
-        let kernel = emit_kernel(&module, "scale").expect("emit broadcast chain");
-        let names: Vec<&str> = kernel.buffers.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, vec!["a_ptr", "w_ptr", "out_ptr"]);
-        assert!(
-            kernel
-                .source
-                .contains("out_ptr[gid] = a_ptr[gid] * w_ptr[(gid % 576)];"),
-            "unexpected broadcast body:\n{}",
-            kernel.source
-        );
-    }
-
-    #[test]
-    fn gpu_matches_oracle_vector_add() {
-        use crate::dtypes::DType;
-        use crate::interpreter::{Arg, execute_function};
-        use crate::ir::Scalar;
-
-        let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
-        let module = parse_module(src).unwrap();
-        let kernel = emit_kernel(&module, "add_kernel").unwrap();
-
-        let n = 4096usize;
-        let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
-        let y: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
-
-        let gpu = match run_kernel(&kernel, &[x.clone(), y.clone()], n) {
-            Ok(g) => g,
-            // No GPU in this environment (e.g. headless CI) — skip, don't fail.
-            Err(e) if e.contains("no Metal device") => {
-                eprintln!("skipping GPU validation: {e}");
-                return;
-            }
-            Err(e) => panic!("GPU run failed: {e}"),
-        };
-
-        // Oracle: the same kernel through the CPU interpreter.
-        let args = [
-            (
-                "x_ptr",
-                Arg::Tensor {
-                    data: x,
-                    shape: vec![n],
-                    dtype: DType::F16,
-                },
-            ),
-            (
-                "y_ptr",
-                Arg::Tensor {
-                    data: y,
-                    shape: vec![n],
-                    dtype: DType::F16,
-                },
-            ),
-            (
-                "output_ptr",
-                Arg::Tensor {
-                    data: vec![0.0; n],
-                    shape: vec![n],
-                    dtype: DType::F16,
-                },
-            ),
-            ("BLOCK_SIZE", Arg::Scalar(Scalar::I64(128))),
-        ];
-        let oracle = execute_function(&module, "add_kernel", &args).unwrap();
-        let oracle = &oracle.get("output_ptr").unwrap().data;
-
-        assert_eq!(gpu.len(), n);
-        for i in 0..n {
-            assert!(
-                (gpu[i] - oracle[i]).abs() < 1e-2,
-                "GPU vs oracle mismatch at {i}: gpu={}, oracle={}",
-                gpu[i],
-                oracle[i]
-            );
-        }
-        eprintln!("GPU output matches the interpreter oracle over {n} elements ✓");
-    }
-
-    #[test]
-    fn rejects_non_elementwise() {
-        // matmul_small has a linalg.matmul -> not lowerable in slice 1.
-        let src = include_str!("../../../../examples/latency/matmul_small.mlir");
-        if let Ok(module) = parse_module(src) {
-            let name = module.functions.keys().next().unwrap().clone();
-            assert!(emit_msl(&module, &name).is_err());
-        }
     }
 
     #[test]

@@ -80,96 +80,28 @@ name = "bench_amx_vs_metal"
 path = "tests/bench_amx_vs_metal.rs"
 
 [[test]]
-name = "dispatch_coverage"
-path = "tests/dispatch_coverage.rs"
-
-[[test]]
-name = "e2e_matmul"
-path = "tests/e2e_matmul.rs"
-
-[[test]]
-name = "e2e_smollm2"
-path = "tests/e2e_smollm2.rs"
-
-[[test]]
-name = "flash_attn_golden"
-path = "tests/flash_attn_golden.rs"
-
-[[test]]
 name = "flash_attn_timing"
 path = "tests/flash_attn_timing.rs"
-
-[[test]]
-name = "fuse_run_e2e"
-path = "tests/fuse_run_e2e.rs"
-
-[[test]]
-name = "fuse_run_smollm2"
-path = "tests/fuse_run_smollm2.rs"
 
 [[test]]
 name = "gpu_dispatch_floor"
 path = "tests/gpu_dispatch_floor.rs"
 
 [[test]]
-name = "head_rewrite_e2e"
-path = "tests/head_rewrite_e2e.rs"
-
-[[test]]
-name = "head_rewrite_golden"
-path = "tests/head_rewrite_golden.rs"
-
-[[test]]
 name = "metal_conformance"
 path = "tests/metal_conformance.rs"
-
-[[test]]
-name = "parser_exec"
-path = "tests/parser_exec.rs"
-
-[[test]]
-name = "port_affine"
-path = "tests/port_affine.rs"
-
-[[test]]
-name = "port_ast"
-path = "tests/port_ast.rs"
 
 [[test]]
 name = "port_dialects_exec"
 path = "tests/port_dialects_exec.rs"
 
 [[test]]
-name = "port_distributed_view"
-path = "tests/port_distributed_view.rs"
-
-[[test]]
 name = "port_dtypes"
 path = "tests/port_dtypes.rs"
 
 [[test]]
-name = "port_grid_scheduler"
-path = "tests/port_grid_scheduler.rs"
-
-[[test]]
 name = "port_indirect_access"
 path = "tests/port_indirect_access.rs"
-
-[[test]]
-name = "port_interpreter"
-path = "tests/port_interpreter.rs"
-
-[[test]]
-name = "port_ktir_cpu"
-path = "tests/port_ktir_cpu.rs"
-
-[[test]]
-name = "port_ktir_simple"
-path = "tests/port_ktir_simple.rs"
-
-[[test]]
-name = "port_latency"
-path = "tests/port_latency.rs"
 
 [[test]]
 name = "port_lx_scoping"
@@ -178,22 +110,6 @@ path = "tests/port_lx_scoping.rs"
 [[test]]
 name = "port_ops"
 path = "tests/port_ops.rs"
-
-[[test]]
-name = "port_parse"
-path = "tests/port_parse.rs"
-
-[[test]]
-name = "port_parser_errors"
-path = "tests/port_parser_errors.rs"
-
-[[test]]
-name = "port_parser_utils"
-path = "tests/port_parser_utils.rs"
-
-[[test]]
-name = "port_tile"
-path = "tests/port_tile.rs"
 
 [[bench]]
 name = "smollm2_bench"

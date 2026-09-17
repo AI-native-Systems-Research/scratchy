@@ -465,25 +465,31 @@ mod tests {
     use crate::env::{ExecutionEnv, GridExecutor};
     use crate::interpreter::single_core_context;
     use crate::ir::{Operation, Scalar, Value};
+    use crate::test_support::Ops;
 
-    /// Run a single op through the real dispatch table, binding `inputs` first.
-    fn run(op: &Operation, inputs: &[(&str, Value)]) -> Result<Value, String> {
+    /// Run a single op through the real dispatch table, binding `inputs`
+    /// against the SAME `Ops` %-name table `op` was built from.
+    fn run(
+        ops: &mut Ops,
+        op: Operation<'static>,
+        inputs: &[(&'static str, Value)],
+    ) -> Result<Value, String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
         for (name, v) in inputs {
-            ctx.set_value(name, v.clone());
+            ctx.set_value(ops.ssa(name), v.clone());
         }
         let handler = env
             .dispatch
-            .handler(&op.op_type)
+            .handler(op.op_type)
             .expect("handler registered");
-        handler(op, &mut ctx, &env).map(|o| o.expect("op produces a result"))
+        handler(&op, &mut ctx, &env).map(|o| o.expect("op produces a result"))
     }
 
-    fn ok(op: &Operation, inputs: &[(&str, Value)]) -> Value {
-        run(op, inputs).unwrap()
+    fn ok(ops: &mut Ops, op: Operation<'static>, inputs: &[(&'static str, Value)]) -> Value {
+        run(ops, op, inputs).unwrap()
     }
 
     fn tile(data: Vec<f32>) -> Value {
@@ -519,38 +525,38 @@ mod tests {
     #[test]
     fn all_ops_register_with_expected_latency() {
         let d = Dispatch::new();
-        for name in [
-            "math.exp",
-            "math.sqrt",
-            "math.rsqrt",
-            "math.log",
-            "math.log2",
-            "math.log1p",
-            "math.tanh",
-            "math.sin",
-            "math.cos",
-            "math.erf",
-            "math.powf",
+        for kind in [
+            OpKind::MathExp,
+            OpKind::MathSqrt,
+            OpKind::MathRsqrt,
+            OpKind::MathLog,
+            OpKind::MathLog2,
+            OpKind::MathLog1p,
+            OpKind::MathTanh,
+            OpKind::MathSin,
+            OpKind::MathCos,
+            OpKind::MathErf,
+            OpKind::MathPowf,
         ] {
-            assert!(d.handler(name).is_some(), "{name} missing");
+            assert!(d.handler(kind).is_some(), "{kind:?} missing");
             assert_eq!(
-                d.latency_category(name),
+                d.latency_category(kind),
                 LatencyCategory::ComputeTranscendental,
-                "{name}"
+                "{kind:?}"
             );
         }
-        for name in [
-            "math.absf",
-            "math.absi",
-            "math.ceil",
-            "math.floor",
-            "math.fma",
+        for kind in [
+            OpKind::MathAbsf,
+            OpKind::MathAbsi,
+            OpKind::MathCeil,
+            OpKind::MathFloor,
+            OpKind::MathFma,
         ] {
-            assert!(d.handler(name).is_some(), "{name} missing");
+            assert!(d.handler(kind).is_some(), "{kind:?} missing");
             assert_eq!(
-                d.latency_category(name),
+                d.latency_category(kind),
                 LatencyCategory::ComputeFloat,
-                "{name}"
+                "{kind:?}"
             );
         }
     }
@@ -559,8 +565,9 @@ mod tests {
 
     #[test]
     fn exp_tile_elementwise() {
-        let op = Operation::new(Some("%r"), "math.exp", &["%x"]);
-        let r = ok(&op, &[("%x", tile(vec![0.0, 1.0, 2.0]))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathExp, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![0.0, 1.0, 2.0]))]);
         let t = as_tile(&r);
         close(t.as_f32()[0], 1.0);
         close(t.as_f32()[1], std::f32::consts::E);
@@ -569,8 +576,9 @@ mod tests {
 
     #[test]
     fn exp_scalar_preserves_kind() {
-        let op = Operation::new(Some("%r"), "math.exp", &["%x"]);
-        let r = ok(&op, &[("%x", Value::Scalar(Scalar::F32(1.0)))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathExp, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", Value::Scalar(Scalar::F32(1.0)))]);
         close(f32_scalar(&r), std::f32::consts::E);
     }
 
@@ -578,8 +586,9 @@ mod tests {
 
     #[test]
     fn sqrt_tile() {
-        let op = Operation::new(Some("%r"), "math.sqrt", &["%x"]);
-        let r = ok(&op, &[("%x", tile(vec![4.0, 9.0, 16.0]))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathSqrt, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![4.0, 9.0, 16.0]))]);
         let t = as_tile(&r);
         close(t.as_f32()[0], 2.0);
         close(t.as_f32()[1], 3.0);
@@ -588,8 +597,9 @@ mod tests {
 
     #[test]
     fn rsqrt_tile_is_reciprocal_sqrt() {
-        let op = Operation::new(Some("%r"), "math.rsqrt", &["%x"]);
-        let r = ok(&op, &[("%x", tile(vec![4.0, 16.0]))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathRsqrt, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![4.0, 16.0]))]);
         let t = as_tile(&r);
         close(t.as_f32()[0], 0.5);
         close(t.as_f32()[1], 0.25);
@@ -597,8 +607,9 @@ mod tests {
 
     #[test]
     fn sqrt_scalar() {
-        let op = Operation::new(Some("%r"), "math.sqrt", &["%x"]);
-        let r = ok(&op, &[("%x", Value::Scalar(Scalar::F32(4.0)))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathSqrt, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", Value::Scalar(Scalar::F32(4.0)))]);
         close(f32_scalar(&r), 2.0);
     }
 
@@ -606,23 +617,18 @@ mod tests {
 
     #[test]
     fn log_family() {
+        let mut ops = Ops::new();
         let e = std::f32::consts::E;
-        let r = ok(
-            &Operation::new(Some("%r"), "math.log", &["%x"]),
-            &[("%x", tile(vec![e]))],
-        );
+        let op = ops.op(Some("%r"), OpKind::MathLog, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![e]))]);
         close(as_tile(&r).as_f32()[0], 1.0);
 
-        let r = ok(
-            &Operation::new(Some("%r"), "math.log2", &["%x"]),
-            &[("%x", tile(vec![8.0]))],
-        );
+        let op = ops.op(Some("%r"), OpKind::MathLog2, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![8.0]))]);
         close(as_tile(&r).as_f32()[0], 3.0);
 
-        let r = ok(
-            &Operation::new(Some("%r"), "math.log1p", &["%x"]),
-            &[("%x", tile(vec![0.0]))],
-        );
+        let op = ops.op(Some("%r"), OpKind::MathLog1p, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![0.0]))]);
         close(as_tile(&r).as_f32()[0], 0.0);
     }
 
@@ -630,27 +636,22 @@ mod tests {
 
     #[test]
     fn trig_and_tanh() {
+        let mut ops = Ops::new();
         let pi = std::f32::consts::PI;
-        let r = ok(
-            &Operation::new(Some("%r"), "math.sin", &["%x"]),
-            &[("%x", tile(vec![0.0, pi / 2.0]))],
-        );
+        let op = ops.op(Some("%r"), OpKind::MathSin, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![0.0, pi / 2.0]))]);
         let t = as_tile(&r);
         close(t.as_f32()[0], 0.0);
         close(t.as_f32()[1], 1.0);
 
-        let r = ok(
-            &Operation::new(Some("%r"), "math.cos", &["%x"]),
-            &[("%x", tile(vec![0.0, pi]))],
-        );
+        let op = ops.op(Some("%r"), OpKind::MathCos, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![0.0, pi]))]);
         let t = as_tile(&r);
         close(t.as_f32()[0], 1.0);
         close(t.as_f32()[1], -1.0);
 
-        let r = ok(
-            &Operation::new(Some("%r"), "math.tanh", &["%x"]),
-            &[("%x", tile(vec![0.0]))],
-        );
+        let op = ops.op(Some("%r"), OpKind::MathTanh, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![0.0]))]);
         close(as_tile(&r).as_f32()[0], 0.0);
     }
 
@@ -658,8 +659,9 @@ mod tests {
 
     #[test]
     fn absf_tile() {
-        let op = Operation::new(Some("%r"), "math.absf", &["%x"]);
-        let r = ok(&op, &[("%x", tile(vec![-1.5, 2.0, -0.0]))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathAbsf, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![-1.5, 2.0, -0.0]))]);
         let t = as_tile(&r);
         close(t.as_f32()[0], 1.5);
         close(t.as_f32()[1], 2.0);
@@ -668,28 +670,27 @@ mod tests {
 
     #[test]
     fn absi_scalar_keeps_integer_kind() {
-        let op = Operation::new(Some("%r"), "math.absi", &["%x"]);
-        let r = ok(&op, &[("%x", Value::Scalar(Scalar::I64(-7)))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathAbsi, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", Value::Scalar(Scalar::I64(-7)))]);
         assert!(matches!(r, Value::Scalar(Scalar::I64(7))));
 
-        let r = ok(&op, &[("%x", Value::Index(-3))]);
+        let op = ops.op(Some("%r"), OpKind::MathAbsi, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", Value::Index(-3))]);
         assert!(matches!(r, Value::Index(3)));
     }
 
     #[test]
     fn floor_and_ceil() {
-        let r = ok(
-            &Operation::new(Some("%r"), "math.floor", &["%x"]),
-            &[("%x", tile(vec![1.7, -1.2]))],
-        );
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathFloor, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![1.7, -1.2]))]);
         let t = as_tile(&r);
         close(t.as_f32()[0], 1.0);
         close(t.as_f32()[1], -2.0);
 
-        let r = ok(
-            &Operation::new(Some("%r"), "math.ceil", &["%x"]),
-            &[("%x", tile(vec![1.2, -1.7]))],
-        );
+        let op = ops.op(Some("%r"), OpKind::MathCeil, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![1.2, -1.7]))]);
         let t = as_tile(&r);
         close(t.as_f32()[0], 2.0);
         close(t.as_f32()[1], -1.0);
@@ -699,8 +700,9 @@ mod tests {
 
     #[test]
     fn erf_matches_known_values() {
-        let op = Operation::new(Some("%r"), "math.erf", &["%x"]);
-        let r = ok(&op, &[("%x", tile(vec![0.0, 1.0, -1.0]))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathErf, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", tile(vec![0.0, 1.0, -1.0]))]);
         let t = as_tile(&r);
         close(t.as_f32()[0], 0.0);
         // erf(1) ≈ 0.8427007
@@ -711,8 +713,9 @@ mod tests {
 
     #[test]
     fn erf_scalar() {
-        let op = Operation::new(Some("%r"), "math.erf", &["%x"]);
-        let r = ok(&op, &[("%x", Value::Scalar(Scalar::F32(1.0)))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathErf, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", Value::Scalar(Scalar::F32(1.0)))]);
         close(f32_scalar(&r), 0.8427007);
     }
 
@@ -720,9 +723,11 @@ mod tests {
 
     #[test]
     fn powf_tile() {
-        let op = Operation::new(Some("%r"), "math.powf", &["%b", "%e"]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathPowf, &["%b", "%e"]);
         let r = ok(
-            &op,
+            &mut ops,
+            op,
             &[
                 ("%b", tile(vec![2.0, 3.0, 4.0])),
                 ("%e", tile(vec![2.0, 2.0, 0.5])),
@@ -736,9 +741,11 @@ mod tests {
 
     #[test]
     fn powf_scalar() {
-        let op = Operation::new(Some("%r"), "math.powf", &["%b", "%e"]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathPowf, &["%b", "%e"]);
         let r = ok(
-            &op,
+            &mut ops,
+            op,
             &[
                 ("%b", Value::Scalar(Scalar::F32(2.0))),
                 ("%e", Value::Scalar(Scalar::F32(10.0))),
@@ -751,9 +758,11 @@ mod tests {
 
     #[test]
     fn fma_tile() {
-        let op = Operation::new(Some("%r"), "math.fma", &["%a", "%b", "%c"]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathFma, &["%a", "%b", "%c"]);
         let r = ok(
-            &op,
+            &mut ops,
+            op,
             &[
                 ("%a", tile(vec![2.0, 3.0])),
                 ("%b", tile(vec![4.0, 5.0])),
@@ -767,9 +776,11 @@ mod tests {
 
     #[test]
     fn fma_scalar() {
-        let op = Operation::new(Some("%r"), "math.fma", &["%a", "%b", "%c"]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathFma, &["%a", "%b", "%c"]);
         let r = ok(
-            &op,
+            &mut ops,
+            op,
             &[
                 ("%a", Value::Scalar(Scalar::F32(2.0))),
                 ("%b", Value::Scalar(Scalar::F32(3.0))),
@@ -802,8 +813,9 @@ mod tests {
     fn f16_tile_results_are_rounded_and_typed() {
         // A transcendental result on an f16 tile lands on an f16 grid point and
         // keeps the f16 dtype, mirroring `.astype(tile.data.dtype)`.
-        let op = Operation::new(Some("%r"), "math.exp", &["%x"]);
-        let r = ok(&op, &[("%x", f16_tile(vec![1.0]))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathExp, &["%x"]);
+        let r = ok(&mut ops, op, &[("%x", f16_tile(vec![1.0]))]);
         let t = as_tile(&r);
         assert_eq!(t.dtype, DType::F16);
         assert_eq!(f16_round(t.as_f32()[0]), t.as_f32()[0]);
@@ -819,9 +831,11 @@ mod tests {
 
     #[test]
     fn powf_mixed_kinds_errors() {
-        let op = Operation::new(Some("%r"), "math.powf", &["%b", "%e"]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathPowf, &["%b", "%e"]);
         let err = run(
-            &op,
+            &mut ops,
+            op,
             &[
                 ("%b", tile(vec![2.0])),
                 ("%e", Value::Scalar(Scalar::F32(2.0))),
@@ -832,16 +846,23 @@ mod tests {
 
     #[test]
     fn unary_wrong_arity_errors() {
-        let op = Operation::new(Some("%r"), "math.exp", &["%x", "%y"]);
-        let err = run(&op, &[("%x", tile(vec![1.0])), ("%y", tile(vec![1.0]))]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathExp, &["%x", "%y"]);
+        let err = run(
+            &mut ops,
+            op,
+            &[("%x", tile(vec![1.0])), ("%y", tile(vec![1.0]))],
+        );
         assert!(err.is_err());
     }
 
     #[test]
     fn powf_shape_mismatch_errors() {
-        let op = Operation::new(Some("%r"), "math.powf", &["%b", "%e"]);
+        let mut ops = Ops::new();
+        let op = ops.op(Some("%r"), OpKind::MathPowf, &["%b", "%e"]);
         let err = run(
-            &op,
+            &mut ops,
+            op,
             &[("%b", tile(vec![2.0, 3.0])), ("%e", tile(vec![2.0]))],
         );
         assert!(err.is_err());

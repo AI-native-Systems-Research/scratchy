@@ -658,18 +658,19 @@ mod tests {
     use crate::dialects::Dispatch;
     use crate::env::{ExecutionEnv, GridExecutor};
     use crate::interpreter::{execute_ops, single_core_context};
+    use crate::test_support::Ops;
 
-    fn run(ops: &[Operation], ctx: &mut CoreContext) -> Result<(), String> {
+    fn run(ops: &[Operation<'static>], ctx: &mut CoreContext) -> Result<(), String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
         execute_ops(ops, ctx, &env)
     }
 
-    fn tile(ctx: &CoreContext, name: &str) -> Tile {
-        match ctx.get_value(name).unwrap() {
+    fn tile(ctx: &CoreContext, ssa: Ssa) -> Tile {
+        match ctx.get_value(ssa).unwrap() {
             Value::Tile(t) => t.clone(),
-            other => panic!("expected tile for {name}, got {other:?}"),
+            other => panic!("expected tile, got {other:?}"),
         }
     }
 
@@ -677,12 +678,15 @@ mod tests {
 
     #[test]
     fn empty_zeros_with_shape_and_dtype() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        let op = Operation::new(Some("%t"), "tensor.empty", &[])
-            .with_attr("shape", Attr::IntList(vec![2, 3]))
-            .with_attr("dtype", Attr::Str("f32".into()));
+        let t = ops.ssa("%t");
+        let op = ops.op(Some("%t"), OpKind::TensorEmpty, &[]);
+        let shape = ops.int_list(vec![2, 3]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("f32"));
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%t");
+        let t = tile(&ctx, t);
         assert_eq!(t.shape, vec![2, 3]);
         assert_eq!(t.dtype, DType::F32);
         assert_eq!(t.as_f32().to_vec(), vec![0.0; 6]);
@@ -690,10 +694,12 @@ mod tests {
 
     #[test]
     fn empty_defaults_to_unit_shape_f16() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        let op = Operation::new(Some("%t"), "tensor.empty", &[]);
+        let t = ops.ssa("%t");
+        let op = ops.op(Some("%t"), OpKind::TensorEmpty, &[]);
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%t");
+        let t = tile(&ctx, t);
         assert_eq!(t.shape, vec![1]);
         assert_eq!(t.dtype, DType::F16);
         assert_eq!(t.as_f32().to_vec(), vec![0.0]);
@@ -703,13 +709,16 @@ mod tests {
 
     #[test]
     fn splat_broadcasts_float_scalar() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%s", Value::Scalar(Scalar::F32(2.5)));
-        let op = Operation::new(Some("%t"), "tensor.splat", &["%s"])
-            .with_attr("shape", Attr::IntList(vec![1, 4]))
-            .with_attr("dtype", Attr::Str("f16".into()));
+        ctx.set_value(ops.ssa("%s"), Value::Scalar(Scalar::F32(2.5)));
+        let t = ops.ssa("%t");
+        let op = ops.op(Some("%t"), OpKind::TensorSplat, &["%s"]);
+        let shape = ops.int_list(vec![1, 4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("f16"));
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%t");
+        let t = tile(&ctx, t);
         assert_eq!(t.shape, vec![1, 4]);
         assert_eq!(t.as_f32().to_vec(), vec![2.5; 4]);
         assert_eq!(t.dtype, DType::F16);
@@ -717,13 +726,16 @@ mod tests {
 
     #[test]
     fn splat_integer_scalar_forces_i32() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%s", Value::Index(7));
-        let op = Operation::new(Some("%t"), "tensor.splat", &["%s"])
-            .with_attr("shape", Attr::IntList(vec![3]))
-            .with_attr("dtype", Attr::Str("f16".into()));
+        ctx.set_value(ops.ssa("%s"), Value::Index(7));
+        let t = ops.ssa("%t");
+        let op = ops.op(Some("%t"), OpKind::TensorSplat, &["%s"]);
+        let shape = ops.int_list(vec![3]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("f16"));
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%t");
+        let t = tile(&ctx, t);
         // integer scalar overrides dtype to i32 (mirrors np.int32 branch)
         assert_eq!(t.dtype, DType::I32);
         assert_eq!(t.as_f32().to_vec(), vec![7.0, 7.0, 7.0]);
@@ -731,26 +743,31 @@ mod tests {
 
     #[test]
     fn splat_tile_operand_takes_first_element() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         ctx.set_value(
-            "%src",
+            ops.ssa("%src"),
             Value::Tile(Tile::compute(vec![9.0, 1.0, 2.0], DType::F32, vec![3])),
         );
-        let op = Operation::new(Some("%t"), "tensor.splat", &["%src"])
-            .with_attr("shape", Attr::IntList(vec![2]))
-            .with_attr("dtype", Attr::Str("f32".into()));
+        let t = ops.ssa("%t");
+        let op = ops.op(Some("%t"), OpKind::TensorSplat, &["%src"]);
+        let shape = ops.int_list(vec![2]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("f32"));
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%t");
+        let t = tile(&ctx, t);
         assert_eq!(t.as_f32().to_vec(), vec![9.0, 9.0]);
     }
 
     #[test]
     fn splat_no_shape_defaults_to_unit() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%s", Value::Scalar(Scalar::F32(4.0)));
-        let op = Operation::new(Some("%t"), "tensor.splat", &["%s"]);
+        ctx.set_value(ops.ssa("%s"), Value::Scalar(Scalar::F32(4.0)));
+        let t = ops.ssa("%t");
+        let op = ops.op(Some("%t"), OpKind::TensorSplat, &["%s"]);
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%t");
+        let t = tile(&ctx, t);
         assert_eq!(t.shape, vec![1]);
         assert_eq!(t.as_f32().to_vec(), vec![4.0]);
     }
@@ -759,18 +776,20 @@ mod tests {
 
     #[test]
     fn extract_reads_row_major_element() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // 2x3 tile: [[0,1,2],[3,4,5]]
         let data = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
         ctx.set_value(
-            "%t",
+            ops.ssa("%t"),
             Value::Tile(Tile::compute(data, DType::F32, vec![2, 3])),
         );
-        ctx.set_value("%i", Value::Index(1));
-        ctx.set_value("%j", Value::Index(2));
-        let op = Operation::new(Some("%s"), "tensor.extract", &["%t", "%i", "%j"]);
+        ctx.set_value(ops.ssa("%i"), Value::Index(1));
+        ctx.set_value(ops.ssa("%j"), Value::Index(2));
+        let s = ops.ssa("%s");
+        let op = ops.op(Some("%s"), OpKind::TensorExtract, &["%t", "%i", "%j"]);
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%s").unwrap() {
+        match ctx.get_value(s).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 5.0), // [1][2]
             other => panic!("expected F32, got {other:?}"),
         }
@@ -778,14 +797,16 @@ mod tests {
 
     #[test]
     fn extract_zero_d_returns_only_element() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         ctx.set_value(
-            "%t",
+            ops.ssa("%t"),
             Value::Tile(Tile::compute(vec![42.0], DType::F32, vec![1])),
         );
-        let op = Operation::new(Some("%s"), "tensor.extract", &["%t"]);
+        let s = ops.ssa("%s");
+        let op = ops.op(Some("%s"), OpKind::TensorExtract, &["%t"]);
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%s").unwrap() {
+        match ctx.get_value(s).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 42.0),
             other => panic!("expected F32, got {other:?}"),
         }
@@ -793,15 +814,17 @@ mod tests {
 
     #[test]
     fn extract_index_tile_returns_index_scalar() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         ctx.set_value(
-            "%t",
+            ops.ssa("%t"),
             Value::Tile(Tile::compute(vec![3.0, 8.0], DType::I32, vec![2])),
         );
-        ctx.set_value("%i", Value::Index(1));
-        let op = Operation::new(Some("%s"), "tensor.extract", &["%t", "%i"]);
+        ctx.set_value(ops.ssa("%i"), Value::Index(1));
+        let s = ops.ssa("%s");
+        let op = ops.op(Some("%s"), OpKind::TensorExtract, &["%t", "%i"]);
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%s").unwrap() {
+        match ctx.get_value(s).unwrap() {
             Value::Index(i) => assert_eq!(*i, 8),
             other => panic!("expected Index, got {other:?}"),
         }
@@ -809,11 +832,13 @@ mod tests {
 
     #[test]
     fn extract_passthrough_non_tile() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%s", Value::Scalar(Scalar::F32(1.5)));
-        let op = Operation::new(Some("%out"), "tensor.extract", &["%s"]);
+        ctx.set_value(ops.ssa("%s"), Value::Scalar(Scalar::F32(1.5)));
+        let out = ops.ssa("%out");
+        let op = ops.op(Some("%out"), OpKind::TensorExtract, &["%s"]);
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%out").unwrap() {
+        match ctx.get_value(out).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 1.5),
             other => panic!("expected F32, got {other:?}"),
         }
@@ -821,39 +846,50 @@ mod tests {
 
     #[test]
     fn extract_out_of_bounds_errors() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         ctx.set_value(
-            "%t",
+            ops.ssa("%t"),
             Value::Tile(Tile::compute(vec![0.0, 1.0], DType::F32, vec![2])),
         );
-        ctx.set_value("%i", Value::Index(5));
-        let op = Operation::new(Some("%s"), "tensor.extract", &["%t", "%i"]);
+        ctx.set_value(ops.ssa("%i"), Value::Index(5));
+        let op = ops.op(Some("%s"), OpKind::TensorExtract, &["%t", "%i"]);
         assert!(run(&[op], &mut ctx).is_err());
     }
 
     // --- extract_slice ---------------------------------------------------
 
-    fn slice_op(src: &str, offsets: &[&str], sizes: &[i64], strides: &[i64]) -> Operation {
-        let strs = |xs: &[&str]| Attr::StrList(xs.iter().map(|s| s.to_string()).collect());
-        let ints = |xs: &[i64]| Attr::StrList(xs.iter().map(|n| n.to_string()).collect());
-        Operation::new(Some("%slice"), "tensor.extract_slice", &[src])
-            .with_attr("slice_offsets", strs(offsets))
-            .with_attr("slice_sizes", ints(sizes))
-            .with_attr("slice_strides", ints(strides))
+    /// Static offsets/sizes/strides — all three attrs `IntList`.
+    fn slice_op_static(
+        ops: &mut Ops,
+        src: &'static str,
+        offsets: Vec<i64>,
+        sizes: Vec<i64>,
+        strides: Vec<i64>,
+    ) -> Operation<'static> {
+        let op = ops.op(Some("%slice"), OpKind::TensorExtractSlice, &[src]);
+        let offsets = ops.int_list(offsets);
+        let op = ops.attr(op, AttrKey::SliceOffsets, offsets);
+        let sizes = ops.int_list(sizes);
+        let op = ops.attr(op, AttrKey::SliceSizes, sizes);
+        let strides = ops.int_list(strides);
+        ops.attr(op, AttrKey::SliceStrides, strides)
     }
 
     #[test]
     fn extract_slice_static_2d_block() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // 4x4 with values 0..16, take [1,1][2,2][1,1] -> rows 1..2, cols 1..2.
         let data: Vec<f32> = (0..16).map(|x| x as f32).collect();
         ctx.set_value(
-            "%t",
+            ops.ssa("%t"),
             Value::Tile(Tile::compute(data, DType::F32, vec![4, 4])),
         );
-        let op = slice_op("%t", &["1", "1"], &[2, 2], &[1, 1]);
+        let slice = ops.ssa("%slice");
+        let op = slice_op_static(&mut ops, "%t", vec![1, 1], vec![2, 2], vec![1, 1]);
         run(&[op], &mut ctx).unwrap();
-        let s = tile(&ctx, "%slice");
+        let s = tile(&ctx, slice);
         assert_eq!(s.shape, vec![2, 2]);
         // row1 = [4,5,6,7], row2 = [8,9,10,11] -> cols 1,2 -> [5,6,9,10]
         assert_eq!(s.as_f32().to_vec(), vec![5.0, 6.0, 9.0, 10.0]);
@@ -862,41 +898,61 @@ mod tests {
 
     #[test]
     fn extract_slice_strided_1d() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         let data: Vec<f32> = (0..8).map(|x| x as f32).collect();
-        ctx.set_value("%t", Value::Tile(Tile::compute(data, DType::F32, vec![8])));
+        ctx.set_value(
+            ops.ssa("%t"),
+            Value::Tile(Tile::compute(data, DType::F32, vec![8])),
+        );
         // offset 1, size 3, stride 2 -> elements 1,3,5
-        let op = slice_op("%t", &["1"], &[3], &[2]);
+        let slice = ops.ssa("%slice");
+        let op = slice_op_static(&mut ops, "%t", vec![1], vec![3], vec![2]);
         run(&[op], &mut ctx).unwrap();
-        let s = tile(&ctx, "%slice");
+        let s = tile(&ctx, slice);
         assert_eq!(s.as_f32().to_vec(), vec![1.0, 3.0, 5.0]);
     }
 
     #[test]
     fn extract_slice_dynamic_offset_row() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // 4x4; the tiled K-loop edge passes its induction var as a dynamic row
-        // offset and reads a 1x4 sub-tile.
+        // offset and reads a 1x4 sub-tile. `slice_offsets` is either wholly
+        // static or wholly dynamic (no per-element mix), so the static col
+        // offset rides along as a second dynamic operand bound to 0.
         let data: Vec<f32> = (0..16).map(|x| x as f32).collect();
         ctx.set_value(
-            "%t",
+            ops.ssa("%t"),
             Value::Tile(Tile::compute(data, DType::F32, vec![4, 4])),
         );
-        ctx.set_value("%k", Value::Index(2));
-        let op = slice_op("%t", &["%k", "0"], &[1, 4], &[1, 1]);
+        ctx.set_value(ops.ssa("%k"), Value::Index(2));
+        ctx.set_value(ops.ssa("%zero"), Value::Index(0));
+        let slice = ops.ssa("%slice");
+        let op = ops.op(Some("%slice"), OpKind::TensorExtractSlice, &["%t"]);
+        let offsets = ops.ssas_attr(&["%k", "%zero"]);
+        let op = ops.attr(op, AttrKey::SliceOffsets, offsets);
+        let sizes = ops.int_list(vec![1, 4]);
+        let op = ops.attr(op, AttrKey::SliceSizes, sizes);
+        let strides = ops.int_list(vec![1, 1]);
+        let op = ops.attr(op, AttrKey::SliceStrides, strides);
         run(&[op], &mut ctx).unwrap();
-        let s = tile(&ctx, "%slice");
+        let s = tile(&ctx, slice);
         assert_eq!(s.shape, vec![1, 4]);
         assert_eq!(s.as_f32().to_vec(), vec![8.0, 9.0, 10.0, 11.0]); // row 2
     }
 
     #[test]
     fn extract_slice_out_of_bounds_errors() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         let data: Vec<f32> = (0..4).map(|x| x as f32).collect();
-        ctx.set_value("%t", Value::Tile(Tile::compute(data, DType::F32, vec![4])));
+        ctx.set_value(
+            ops.ssa("%t"),
+            Value::Tile(Tile::compute(data, DType::F32, vec![4])),
+        );
         // offset 3, size 2, stride 1 -> would read index 4 (out of bounds).
-        let op = slice_op("%t", &["3"], &[2], &[1]);
+        let op = slice_op_static(&mut ops, "%t", vec![3], vec![2], vec![1]);
         assert!(run(&[op], &mut ctx).is_err());
     }
 
@@ -904,62 +960,71 @@ mod tests {
 
     #[test]
     fn reshape_reinterprets_row_major() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         let data = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
         ctx.set_value(
-            "%src",
+            ops.ssa("%src"),
             Value::Tile(Tile::compute(data.clone(), DType::F32, vec![6])),
         );
         // shape operand is ignored; target_shape attr drives the result
         ctx.set_value(
-            "%shape",
+            ops.ssa("%shape"),
             Value::Tile(Tile::compute(vec![2.0, 3.0], DType::I32, vec![2])),
         );
-        let op = Operation::new(Some("%out"), "tensor.reshape", &["%src", "%shape"])
-            .with_attr("target_shape", Attr::IntList(vec![2, 3]))
-            .with_attr("dtype", Attr::Str("f32".into()));
+        let out = ops.ssa("%out");
+        let op = ops.op(Some("%out"), OpKind::TensorReshape, &["%src", "%shape"]);
+        let target = ops.int_list(vec![2, 3]);
+        let op = ops.attr(op, AttrKey::TargetShape, target);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("f32"));
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%out");
+        let t = tile(&ctx, out);
         assert_eq!(t.shape, vec![2, 3]);
         assert_eq!(t.as_f32().to_vec(), data); // same flat buffer, row-major
     }
 
     #[test]
     fn reshape_missing_target_errors() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         ctx.set_value(
-            "%src",
+            ops.ssa("%src"),
             Value::Tile(Tile::compute(vec![1.0], DType::F32, vec![1])),
         );
-        let op = Operation::new(Some("%out"), "tensor.reshape", &["%src", "%shape"]);
+        let op = ops.op(Some("%out"), OpKind::TensorReshape, &["%src", "%shape"]);
         let err = run(&[op], &mut ctx).unwrap_err();
         assert!(err.contains("target_shape"));
     }
 
     #[test]
     fn reshape_wrong_count_errors() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         ctx.set_value(
-            "%src",
+            ops.ssa("%src"),
             Value::Tile(Tile::compute(vec![1.0, 2.0], DType::F32, vec![2])),
         );
-        let op = Operation::new(Some("%out"), "tensor.reshape", &["%src"])
-            .with_attr("target_shape", Attr::IntList(vec![3]));
+        let op = ops.op(Some("%out"), OpKind::TensorReshape, &["%src"]);
+        let target = ops.int_list(vec![3]);
+        let op = ops.attr(op, AttrKey::TargetShape, target);
         assert!(run(&[op], &mut ctx).is_err());
     }
 
     #[test]
     fn expand_shape_keeps_dtype_and_data() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         let data = vec![1.0, 2.0, 3.0, 4.0];
         ctx.set_value(
-            "%src",
+            ops.ssa("%src"),
             Value::Tile(Tile::compute(data.clone(), DType::F16, vec![4])),
         );
-        let op = Operation::new(Some("%out"), "tensor.expand_shape", &["%src"])
-            .with_attr("target_shape", Attr::IntList(vec![2, 2]));
+        let out = ops.ssa("%out");
+        let op = ops.op(Some("%out"), OpKind::TensorExpandShape, &["%src"]);
+        let target = ops.int_list(vec![2, 2]);
+        let op = ops.attr(op, AttrKey::TargetShape, target);
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%out");
+        let t = tile(&ctx, out);
         assert_eq!(t.shape, vec![2, 2]);
         assert_eq!(t.dtype, DType::F16); // source dtype preserved
         assert_eq!(t.as_f32().to_vec(), data);
@@ -967,42 +1032,51 @@ mod tests {
 
     #[test]
     fn collapse_shape_flattens() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         ctx.set_value(
-            "%src",
+            ops.ssa("%src"),
             Value::Tile(Tile::compute(data.clone(), DType::F32, vec![2, 3])),
         );
-        let op = Operation::new(Some("%out"), "tensor.collapse_shape", &["%src"])
-            .with_attr("target_shape", Attr::IntList(vec![6]));
+        let out = ops.ssa("%out");
+        let op = ops.op(Some("%out"), OpKind::TensorCollapseShape, &["%src"]);
+        let target = ops.int_list(vec![6]);
+        let op = ops.attr(op, AttrKey::TargetShape, target);
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%out");
+        let t = tile(&ctx, out);
         assert_eq!(t.shape, vec![6]);
         assert_eq!(t.as_f32().to_vec(), data);
     }
 
     #[test]
     fn reshape_passthrough_non_tile() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%src", Value::Index(9));
-        let op = Operation::new(Some("%out"), "tensor.reshape", &["%src"])
-            .with_attr("target_shape", Attr::IntList(vec![1]));
+        ctx.set_value(ops.ssa("%src"), Value::Index(9));
+        let out = ops.ssa("%out");
+        let op = ops.op(Some("%out"), OpKind::TensorReshape, &["%src"]);
+        let target = ops.int_list(vec![1]);
+        let op = ops.attr(op, AttrKey::TargetShape, target);
         run(&[op], &mut ctx).unwrap();
-        assert!(matches!(ctx.get_value("%out").unwrap(), Value::Index(9)));
+        assert!(matches!(ctx.get_value(out).unwrap(), Value::Index(9)));
     }
 
     // --- from_elements ---------------------------------------------------
 
     #[test]
     fn from_elements_stacks_scalars() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", Value::Index(16));
-        ctx.set_value("%b", Value::Index(32));
-        let op = Operation::new(Some("%shape"), "tensor.from_elements", &["%a", "%b"])
-            .with_attr("shape", Attr::IntList(vec![2]))
-            .with_attr("dtype", Attr::Str("index".into()));
+        ctx.set_value(ops.ssa("%a"), Value::Index(16));
+        ctx.set_value(ops.ssa("%b"), Value::Index(32));
+        let shape_ssa = ops.ssa("%shape");
+        let op = ops.op(Some("%shape"), OpKind::TensorFromElements, &["%a", "%b"]);
+        let shape = ops.int_list(vec![2]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("index"));
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%shape");
+        let t = tile(&ctx, shape_ssa);
         assert_eq!(t.shape, vec![2]);
         assert_eq!(t.dtype, DType::I32); // index lowers to i32
         assert_eq!(t.as_f32().to_vec(), vec![16.0, 32.0]);
@@ -1010,30 +1084,36 @@ mod tests {
 
     #[test]
     fn from_elements_reshapes_to_declared_shape() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        for (n, v) in ["%a", "%b", "%c", "%d"].iter().zip([1.0, 2.0, 3.0, 4.0]) {
-            ctx.set_value(n, Value::Scalar(Scalar::F32(v)));
+        for (n, v) in ["%a", "%b", "%c", "%d"].iter().zip([1.0f32, 2.0, 3.0, 4.0]) {
+            let ssa = ops.ssa(n);
+            ctx.set_value(ssa, Value::Scalar(Scalar::F32(v)));
         }
-        let op = Operation::new(
+        let t = ops.ssa("%t");
+        let op = ops.op(
             Some("%t"),
-            "tensor.from_elements",
+            OpKind::TensorFromElements,
             &["%a", "%b", "%c", "%d"],
-        )
-        .with_attr("shape", Attr::IntList(vec![2, 2]))
-        .with_attr("dtype", Attr::Str("f32".into()));
+        );
+        let shape = ops.int_list(vec![2, 2]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("f32"));
         run(&[op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%t");
+        let t = tile(&ctx, t);
         assert_eq!(t.shape, vec![2, 2]);
         assert_eq!(t.as_f32().to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
     fn from_elements_count_mismatch_errors() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", Value::Index(1));
-        let op = Operation::new(Some("%t"), "tensor.from_elements", &["%a"])
-            .with_attr("shape", Attr::IntList(vec![2]))
-            .with_attr("dtype", Attr::Str("index".into()));
+        ctx.set_value(ops.ssa("%a"), Value::Index(1));
+        let op = ops.op(Some("%t"), OpKind::TensorFromElements, &["%a"]);
+        let shape = ops.int_list(vec![2]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Str("index"));
         assert!(run(&[op], &mut ctx).is_err());
     }
 
@@ -1067,17 +1147,21 @@ mod tests {
     fn generate_yields_index_grid_sum() {
         // %t = tensor.generate { ^bb0(%i,%j): %s = addf %i,%j; yield %s } : 2x2
         // addf works element-wise on the index grids -> i + j at each position.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        let bb0 = Operation::new(None, "region.bb0_args", &[])
-            .with_attr("names", Attr::StrList(vec!["%i".into(), "%j".into()]));
-        let add = Operation::new(Some("%s"), "arith.addf", &["%i", "%j"]);
-        let yld = Operation::new(None, "tensor.yield", &["%s"]);
-        let mut gen_op = Operation::new(Some("%t"), "tensor.generate", &[])
-            .with_attr("shape", Attr::IntList(vec![2, 2]))
-            .with_attr("dtype", Attr::Str("f32".into()));
-        gen_op.regions = vec![vec![bb0, add, yld]];
+        let names = ops.ssas_attr(&["%i", "%j"]);
+        let bb0 = ops.op(None, OpKind::RegionBb0Args, &[]);
+        let bb0 = ops.attr(bb0, AttrKey::Names, names);
+        let add = ops.op(Some("%s"), OpKind::ArithAddf, &["%i", "%j"]);
+        let yld = ops.op(None, OpKind::TensorYield, &["%s"]);
+        let t = ops.ssa("%t");
+        let gen_op = ops.op(Some("%t"), OpKind::TensorGenerate, &[]);
+        let shape = ops.int_list(vec![2, 2]);
+        let gen_op = ops.attr(gen_op, AttrKey::Shape, shape);
+        let gen_op = ops.attr(gen_op, AttrKey::Dtype, Attr::Str("f32"));
+        let gen_op = ops.with_region(gen_op, vec![bb0, add, yld]);
         run(&[gen_op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%t");
+        let t = tile(&ctx, t);
         assert_eq!(t.shape, vec![2, 2]);
         // i+j over (i,j) in 2x2: [[0,1],[1,2]]
         assert_eq!(t.as_f32().to_vec(), vec![0.0, 1.0, 1.0, 2.0]);
@@ -1087,35 +1171,44 @@ mod tests {
     #[test]
     fn generate_scalar_yield_broadcasts() {
         // body yields a constant scalar -> full tensor of that value.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        let bb0 = Operation::new(None, "region.bb0_args", &[])
-            .with_attr("names", Attr::StrList(vec!["%i".into()]));
-        let c =
-            Operation::new(Some("%v"), "arith.constant", &[]).with_attr("value", Attr::Float(7.0));
-        let yld = Operation::new(None, "tensor.yield", &["%v"]);
-        let mut gen_op = Operation::new(Some("%t"), "tensor.generate", &[])
-            .with_attr("shape", Attr::IntList(vec![3]))
-            .with_attr("dtype", Attr::Str("f32".into()));
-        gen_op.regions = vec![vec![bb0, c, yld]];
+        let names = ops.ssas_attr(&["%i"]);
+        let bb0 = ops.op(None, OpKind::RegionBb0Args, &[]);
+        let bb0 = ops.attr(bb0, AttrKey::Names, names);
+        let c = ops.op(Some("%v"), OpKind::ArithConstant, &[]);
+        let c = ops.attr(c, AttrKey::Value, Attr::Float(7.0));
+        let yld = ops.op(None, OpKind::TensorYield, &["%v"]);
+        let t = ops.ssa("%t");
+        let gen_op = ops.op(Some("%t"), OpKind::TensorGenerate, &[]);
+        let shape = ops.int_list(vec![3]);
+        let gen_op = ops.attr(gen_op, AttrKey::Shape, shape);
+        let gen_op = ops.attr(gen_op, AttrKey::Dtype, Attr::Str("f32"));
+        let gen_op = ops.with_region(gen_op, vec![bb0, c, yld]);
         run(&[gen_op], &mut ctx).unwrap();
-        let t = tile(&ctx, "%t");
+        let t = tile(&ctx, t);
         assert_eq!(t.as_f32().to_vec(), vec![7.0, 7.0, 7.0]);
     }
 
     #[test]
     fn generate_body_scope_is_popped() {
         // Block-arg bindings must not leak past the generate op.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        let bb0 = Operation::new(None, "region.bb0_args", &[])
-            .with_attr("names", Attr::StrList(vec!["%i".into()]));
-        let yld = Operation::new(None, "tensor.yield", &["%i"]);
-        let mut gen_op = Operation::new(Some("%t"), "tensor.generate", &[])
-            .with_attr("shape", Attr::IntList(vec![2]))
-            .with_attr("dtype", Attr::Str("index".into()));
-        gen_op.regions = vec![vec![bb0, yld]];
+        let names = ops.ssas_attr(&["%i"]);
+        let bb0 = ops.op(None, OpKind::RegionBb0Args, &[]);
+        let bb0 = ops.attr(bb0, AttrKey::Names, names);
+        let yld = ops.op(None, OpKind::TensorYield, &["%i"]);
+        let i = ops.ssa("%i");
+        let t = ops.ssa("%t");
+        let gen_op = ops.op(Some("%t"), OpKind::TensorGenerate, &[]);
+        let shape = ops.int_list(vec![2]);
+        let gen_op = ops.attr(gen_op, AttrKey::Shape, shape);
+        let gen_op = ops.attr(gen_op, AttrKey::Dtype, Attr::Str("index"));
+        let gen_op = ops.with_region(gen_op, vec![bb0, yld]);
         run(&[gen_op], &mut ctx).unwrap();
-        assert!(!ctx.has_value("%i")); // popped
-        let t = tile(&ctx, "%t");
+        assert!(!ctx.has_value(i)); // popped
+        let t = tile(&ctx, t);
         assert_eq!(t.as_f32().to_vec(), vec![0.0, 1.0]); // identity index grid
     }
 
@@ -1123,12 +1216,13 @@ mod tests {
 
     #[test]
     fn yield_returns_operand() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%v", Value::Scalar(Scalar::F32(3.0)));
+        ctx.set_value(ops.ssa("%v"), Value::Scalar(Scalar::F32(3.0)));
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
-        let op = Operation::new(None, "tensor.yield", &["%v"]);
+        let op = ops.op(None, OpKind::TensorYield, &["%v"]);
         let out = execute_op(&op, &mut ctx, &env).unwrap();
         match out {
             Some(Value::Scalar(Scalar::F32(v))) => assert_eq!(v, 3.0),

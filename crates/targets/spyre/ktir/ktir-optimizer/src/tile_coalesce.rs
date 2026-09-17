@@ -707,139 +707,163 @@ fn prepend_op_dim<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ktir_core::affine::Constraint;
+    use crate::ir_builder::Ops;
+    use ktir_core::dtypes::DType;
 
-    fn const_idx(name: &str, v: i64) -> Operation {
-        Operation::new(Some(name), "arith.constant", &[])
-            .with_attr("value", Attr::Int(v))
-            .with_attr_rt("index")
+    /// Leak a formatted per-block SSA/op name to `&'static str` — test-only;
+    /// [`Ops`] needs `'static` names, and these are minted at a runtime-known
+    /// block index. Two leaks of equal content hash/compare equal in `Ops`'
+    /// name table (`&str` (Partial)Eq/Hash is by content), so re-leaking the
+    /// same name later still resolves to the same [`Ssa`].
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
     }
 
-    trait WithRt {
-        fn with_attr_rt(self, rt: &str) -> Self;
-    }
-    impl WithRt for Operation {
-        fn with_attr_rt(mut self, rt: &str) -> Self {
-            self.result_type = Some(rt.to_string());
-            self
-        }
+    fn const_idx(ops: &mut Ops, name: &'static str, v: i64) -> Operation<'static> {
+        let o = ops.op(Some(name), OpKind::ArithConstant, &[]);
+        let o = ops.attr(o, AttrKey::Value, Attr::Int(v));
+        ops.ty(o, IrType::Index)
     }
 
     /// dim0 box set `-d0 + (h-1) >= 0 & d0 >= 0`.
-    fn tile_set(h: i64) -> Attr {
-        Attr::AffineSet(AffineSet {
-            num_dims: 1,
-            num_syms: 0,
-            constraints: vec![
-                Constraint {
-                    expr: AffineExpr::Dim(0),
-                    kind: ConstraintKind::GreaterEq,
-                },
-                Constraint {
-                    expr: AffineExpr::Add(
-                        Rc::new(AffineExpr::Neg(Rc::new(AffineExpr::Dim(0)))),
-                        Rc::new(AffineExpr::Const(h - 1)),
-                    ),
-                    kind: ConstraintKind::GreaterEq,
-                },
-            ],
-        })
+    fn tile_set(ops: &Ops, h: i64) -> AffineSet<'static> {
+        ops.box_set(&[0], &[h - 1])
     }
 
-    fn view_1d(name: &str, ptr: &str, n: i64) -> Operation {
-        Operation::new(Some(name), "ktdp.construct_memory_view", &[ptr])
-            .with_attr("shape", Attr::IntList(vec![n]))
-            .with_attr("strides", Attr::IntList(vec![1]))
-            .with_attr_rt(&format!("memref<{n}xf16>"))
+    fn view_1d(ops: &mut Ops, name: &'static str, ptr: &'static str, n: i64) -> Operation<'static> {
+        let o = ops.op(Some(name), OpKind::KtdpConstructMemoryView, &[ptr]);
+        let o = ops.attr(o, AttrKey::Shape, ops.int_list(vec![n]));
+        let o = ops.attr(o, AttrKey::Strides, ops.int_list(vec![1]));
+        ops.ty(
+            o,
+            IrType::MemRef {
+                dims: ops.arena().ints(vec![n]),
+                elem: DType::F16,
+            },
+        )
     }
 
     /// One block of a 1-D copy at row offset `off` (height `h`):
     /// load view_in[off] -> exp -> store view_out[off].
-    fn block(off_name: &str, h: i64, tag: usize) -> Vec<Operation> {
-        let at_in = format!("%ati{tag}");
-        let ld = format!("%ld{tag}");
-        let ex = format!("%ex{tag}");
-        let at_out = format!("%ato{tag}");
-        vec![
-            Operation::new(
-                Some(&at_in),
-                "ktdp.construct_access_tile",
-                &["%vin", off_name],
-            )
-            .with_attr("shape", Attr::IntList(vec![h]))
-            .with_attr("base_map", Attr::AffineMap(AffineMap::identity(1)))
-            .with_attr("coordinate_set", tile_set(h))
-            .with_attr_rt(&format!("!ktdp.access_tile<{h}xindex>")),
-            Operation::new(Some(&ld), "ktdp.load", &[&at_in])
-                .with_attr_rt(&format!("tensor<{h}xf16>")),
-            Operation::new(Some(&ex), "math.exp", &[&ld]).with_attr_rt(&format!("tensor<{h}xf16>")),
-            Operation::new(
-                Some(&at_out),
-                "ktdp.construct_access_tile",
-                &["%vout", off_name],
-            )
-            .with_attr("shape", Attr::IntList(vec![h]))
-            .with_attr("base_map", Attr::AffineMap(AffineMap::identity(1)))
-            .with_attr("coordinate_set", tile_set(h))
-            .with_attr_rt(&format!("!ktdp.access_tile<{h}xindex>")),
-            Operation::new(None, "ktdp.store", &[&ex, &at_out]),
-        ]
+    fn block(ops: &mut Ops, off_name: &'static str, h: i64, tag: usize) -> Vec<Operation<'static>> {
+        let at_in = leak(format!("%ati{tag}"));
+        let ld = leak(format!("%ld{tag}"));
+        let ex = leak(format!("%ex{tag}"));
+        let at_out = leak(format!("%ato{tag}"));
+
+        let ati = ops.op(
+            Some(at_in),
+            OpKind::KtdpConstructAccessTile,
+            &["%vin", off_name],
+        );
+        let ati = ops.attr(ati, AttrKey::Shape, ops.int_list(vec![h]));
+        let ati = ops.attr(ati, AttrKey::BaseMap, Attr::AffineMap(ops.identity_map(1)));
+        let ati = ops.attr(
+            ati,
+            AttrKey::CoordinateSet,
+            Attr::AffineSet(tile_set(ops, h)),
+        );
+        let ati = ops.ty(
+            ati,
+            IrType::AccessTile {
+                dims: ops.arena().ints(vec![h]),
+            },
+        );
+
+        let ld_op = ops.op(Some(ld), OpKind::KtdpLoad, &[at_in]);
+        let ld_op = ops.ty(
+            ld_op,
+            IrType::Tensor {
+                dims: ops.arena().ints(vec![h]),
+                elem: DType::F16,
+            },
+        );
+
+        let ex_op = ops.op(Some(ex), OpKind::MathExp, &[ld]);
+        let ex_op = ops.ty(
+            ex_op,
+            IrType::Tensor {
+                dims: ops.arena().ints(vec![h]),
+                elem: DType::F16,
+            },
+        );
+
+        let ato = ops.op(
+            Some(at_out),
+            OpKind::KtdpConstructAccessTile,
+            &["%vout", off_name],
+        );
+        let ato = ops.attr(ato, AttrKey::Shape, ops.int_list(vec![h]));
+        let ato = ops.attr(ato, AttrKey::BaseMap, Attr::AffineMap(ops.identity_map(1)));
+        let ato = ops.attr(
+            ato,
+            AttrKey::CoordinateSet,
+            Attr::AffineSet(tile_set(ops, h)),
+        );
+        let ato = ops.ty(
+            ato,
+            IrType::AccessTile {
+                dims: ops.arena().ints(vec![h]),
+            },
+        );
+
+        let store = ops.op(None, OpKind::KtdpStore, &[ex, at_out]);
+        vec![ati, ld_op, ex_op, ato, store]
     }
 
-    fn copy_func(offsets: &[i64], h: i64) -> IRFunction {
-        let mut ops = vec![
-            view_1d("%vin", "%pin", 4096),
-            view_1d("%vout", "%pout", 4096),
+    fn copy_func(offsets: &[i64], h: i64) -> (IRFunction<'static>, Ops) {
+        // The view must be an EXACT k-way partition of dim-0 (split_view_leading_dim
+        // requires d0/k * stride == the observed per-block step) — so its width is
+        // exactly `h * offsets.len()`, not an arbitrary larger buffer.
+        let n = h * offsets.len() as i64;
+        let mut ops = Ops::new();
+        let mut body = vec![
+            view_1d(&mut ops, "%vin", "%pin", n),
+            view_1d(&mut ops, "%vout", "%pout", n),
         ];
         for (j, &off) in offsets.iter().enumerate() {
-            ops.push(const_idx(&format!("%off{j}"), off));
+            let name = leak(format!("%off{j}"));
+            body.push(const_idx(&mut ops, name, off));
         }
         for (j, _) in offsets.iter().enumerate() {
-            ops.extend(block(&format!("%off{j}"), h, j));
+            let off_name = leak(format!("%off{j}"));
+            body.extend(block(&mut ops, off_name, h, j));
         }
-        ops.push(Operation::new(None, "func.return", &[]));
-        IRFunction {
-            name: "copy".into(),
-            arguments: vec![],
-            operations: ops,
-            grid: (1, 1, 1),
-            return_type: None,
-        }
+        body.push(ops.op(None, OpKind::FuncReturn, &[]));
+        let func = ops.func("copy", &[], body, (1, 1, 1));
+        (func, ops)
     }
 
     #[test]
     fn coalesces_two_contiguous_blocks() {
-        let f = copy_func(&[0, 32], 32);
-        let new_ops = recognize_coalesce(&f).expect("should coalesce");
+        let (f, mut ops) = copy_func(&[0, 32], 32);
+        let new_ops = recognize_coalesce(Arena::global(), &f, usize::MAX).expect("should coalesce");
         // Stores: exactly one (K blocks collapsed to one).
         assert_eq!(
-            new_ops.iter().filter(|o| o.op_type == "ktdp.store").count(),
+            new_ops
+                .iter()
+                .filter(|o| o.op_type == OpKind::KtdpStore)
+                .count(),
             1
         );
         // Access tile shape prepends K=2: [32] -> [2, 32].
         let at = new_ops
             .iter()
-            .find(|o| o.op_type == "ktdp.construct_access_tile")
+            .find(|o| o.op_type == OpKind::KtdpConstructAccessTile)
             .unwrap();
-        assert_eq!(
-            at.attributes.get("shape"),
-            Some(&Attr::IntList(vec![2, 32]))
-        );
-        assert_eq!(
-            at.result_type.as_deref(),
-            Some("!ktdp.access_tile<2x32xindex>")
-        );
+        assert_eq!(at.attr(AttrKey::Shape), Some(&Attr::IntList(&[2, 32])));
+        assert_eq!(at.result_type, Some(IrType::AccessTile { dims: &[2, 32] }));
         // Leading index operand 0 inserted (view, idx0, idx_inner).
         assert_eq!(at.operands.len(), 3);
         // base_map prepends identity leading dim -> rank 2, first result Dim(0).
-        if let Some(Attr::AffineMap(m)) = at.attributes.get("base_map") {
+        if let Some(Attr::AffineMap(m)) = at.attr(AttrKey::BaseMap) {
             assert_eq!(m.num_dims, 2);
             assert_eq!(m.exprs[0], AffineExpr::Dim(0));
         } else {
             panic!("missing base_map");
         }
         // coordinate_set gains leading 0..1 box, inner shifted.
-        if let Some(Attr::AffineSet(set)) = at.attributes.get("coordinate_set") {
+        if let Some(Attr::AffineSet(set)) = at.attr(AttrKey::CoordinateSet) {
             assert_eq!(set.num_dims, 2);
             // leading upper bound -d0 + 1 >= 0 (k-1 == 1).
             let (c, k) = linearize_probe(&set.constraints[1].expr);
@@ -848,22 +872,23 @@ mod tests {
             panic!("missing coordinate_set");
         }
         // Loaded tensor prepends K: tensor<32xf16> -> tensor<2x32xf16>.
-        let ld = new_ops.iter().find(|o| o.op_type == "ktdp.load").unwrap();
-        assert_eq!(ld.result_type.as_deref(), Some("tensor<2x32xf16>"));
-        // The input view is reshaped: shape [4096] -> [2, 4096], stride [1] ->
-        // [S, 1] where S = delta(32) * stride(1) = 32.
-        let vin = new_ops
+        let ld = new_ops
             .iter()
-            .find(|o| o.result.as_deref() == Some("%vin"))
+            .find(|o| o.op_type == OpKind::KtdpLoad)
             .unwrap();
         assert_eq!(
-            vin.attributes.get("shape"),
-            Some(&Attr::IntList(vec![2, 4096]))
+            ld.result_type,
+            Some(IrType::Tensor {
+                dims: &[2, 32],
+                elem: DType::F16
+            })
         );
-        assert_eq!(
-            vin.attributes.get("strides"),
-            Some(&Attr::IntList(vec![32, 1]))
-        );
+        // The input view is reshaped: shape [4096] -> [2, 4096], stride [1] ->
+        // [S, 1] where S = delta(32) * stride(1) = 32.
+        let vin_ssa = ops.ssa("%vin");
+        let vin = new_ops.iter().find(|o| o.result == Some(vin_ssa)).unwrap();
+        assert_eq!(vin.attr(AttrKey::Shape), Some(&Attr::IntList(&[2, 32])));
+        assert_eq!(vin.attr(AttrKey::Strides), Some(&Attr::IntList(&[32, 1])));
     }
 
     /// Linearize a `-d0 + c` style expr into (dim_coeffs, const) by probing.
@@ -879,223 +904,276 @@ mod tests {
     /// This must now COALESCE: the cos view reshapes to leading stride 64, the
     /// row view to leading stride 32*stride. Asserts the strided load reads the
     /// right elements via the reshaped view.
-    fn rope_func(k: usize) -> IRFunction {
-        // row view: [1024, 64] strides [64,1]; cos view: [2048] stride [1].
-        let mut ops = vec![
-            Operation::new(Some("%vrow"), "ktdp.construct_memory_view", &["%prow"])
-                .with_attr("shape", Attr::IntList(vec![1024, 64]))
-                .with_attr("strides", Attr::IntList(vec![64, 1]))
-                .with_attr_rt("memref<1024x64xf16>"),
-            Operation::new(Some("%vout"), "ktdp.construct_memory_view", &["%pout"])
-                .with_attr("shape", Attr::IntList(vec![1024, 64]))
-                .with_attr("strides", Attr::IntList(vec![64, 1]))
-                .with_attr_rt("memref<1024x64xf16>"),
-        ];
-        // constants: c0, and per-block row off (32*j) and cos off (64*j).
-        ops.push(const_idx("%c0", 0));
+    fn rope_func(k: usize) -> (IRFunction<'static>, Ops) {
+        // Views must be an EXACT k-way partition of dim-0 (split_view_leading_dim
+        // requires d0/k * stride == the observed per-block step): row blocks step
+        // by 32 rows, cos blocks step by 64 elements, so row/cos dim-0 is exactly
+        // `32*k` / `64*k` — not an arbitrarily larger buffer.
+        let row_rows = 32 * k as i64;
+        let cos_n = 64 * k as i64;
+        let mut ops = Ops::new();
+        let vrow = ops.op(Some("%vrow"), OpKind::KtdpConstructMemoryView, &["%prow"]);
+        let vrow = ops.attr(vrow, AttrKey::Shape, ops.int_list(vec![row_rows, 64]));
+        let vrow = ops.attr(vrow, AttrKey::Strides, ops.int_list(vec![64, 1]));
+        let vrow = ops.ty(
+            vrow,
+            IrType::MemRef {
+                dims: ops.arena().ints(vec![row_rows, 64]),
+                elem: DType::F16,
+            },
+        );
+        let vout = ops.op(Some("%vout"), OpKind::KtdpConstructMemoryView, &["%pout"]);
+        let vout = ops.attr(vout, AttrKey::Shape, ops.int_list(vec![row_rows, 64]));
+        let vout = ops.attr(vout, AttrKey::Strides, ops.int_list(vec![64, 1]));
+        let vout = ops.ty(
+            vout,
+            IrType::MemRef {
+                dims: ops.arena().ints(vec![row_rows, 64]),
+                elem: DType::F16,
+            },
+        );
+        let vcos = ops.op(Some("%vcos"), OpKind::KtdpConstructMemoryView, &["%pcos"]);
+        let vcos = ops.attr(vcos, AttrKey::Shape, ops.int_list(vec![cos_n]));
+        let vcos = ops.attr(vcos, AttrKey::Strides, ops.int_list(vec![1]));
+        let vcos = ops.ty(
+            vcos,
+            IrType::MemRef {
+                dims: ops.arena().ints(vec![cos_n]),
+                elem: DType::F16,
+            },
+        );
+        let mut body = vec![vrow, vout, vcos];
+
+        let c0 = const_idx(&mut ops, "%c0", 0);
+        body.push(c0);
         for j in 0..k {
-            ops.push(const_idx(&format!("%row{j}"), 32 * j as i64));
-            ops.push(const_idx(&format!("%cos{j}"), 64 * j as i64));
+            let rk = leak(format!("%row{j}"));
+            let ck = leak(format!("%cos{j}"));
+            body.push(const_idx(&mut ops, rk, 32 * j as i64));
+            body.push(const_idx(&mut ops, ck, 64 * j as i64));
         }
-        let row_set = || {
-            Attr::AffineSet(AffineSet {
-                num_dims: 2,
-                num_syms: 0,
-                constraints: vec![
-                    Constraint {
-                        expr: AffineExpr::Dim(0),
-                        kind: ConstraintKind::GreaterEq,
-                    },
-                    Constraint {
-                        expr: AffineExpr::Add(
-                            Rc::new(AffineExpr::Neg(Rc::new(AffineExpr::Dim(0)))),
-                            Rc::new(AffineExpr::Const(31)),
-                        ),
-                        kind: ConstraintKind::GreaterEq,
-                    },
-                    Constraint {
-                        expr: AffineExpr::Dim(1),
-                        kind: ConstraintKind::GreaterEq,
-                    },
-                    Constraint {
-                        expr: AffineExpr::Add(
-                            Rc::new(AffineExpr::Neg(Rc::new(AffineExpr::Dim(1)))),
-                            Rc::new(AffineExpr::Const(31)),
-                        ),
-                        kind: ConstraintKind::GreaterEq,
-                    },
-                ],
-            })
-        };
+        let row_set = |ops: &Ops| ops.box_set(&[0, 0], &[31, 31]);
+
         for j in 0..k {
-            let rk = format!("%row{j}");
-            let ck = format!("%cos{j}");
-            ops.extend(vec![
-                // row load [32,32] at [32j, 0]
-                Operation::new(
-                    Some(&format!("%rl{j}")),
-                    "ktdp.construct_access_tile",
-                    &["%vrow", &rk, "%c0"],
-                )
-                .with_attr("shape", Attr::IntList(vec![32, 32]))
-                .with_attr("base_map", Attr::AffineMap(AffineMap::identity(2)))
-                .with_attr("coordinate_set", row_set())
-                .with_attr_rt("!ktdp.access_tile<32x32xindex>"),
-                Operation::new(Some(&format!("%rv{j}")), "ktdp.load", &[&format!("%rl{j}")])
-                    .with_attr_rt("tensor<32x32xf16>"),
-                // cos load [32] at [64j]
-                Operation::new(
-                    Some(&format!("%cl{j}")),
-                    "ktdp.construct_access_tile",
-                    &["%vcos", &ck],
-                )
-                .with_attr("shape", Attr::IntList(vec![32]))
-                .with_attr("base_map", Attr::AffineMap(AffineMap::identity(1)))
-                .with_attr("coordinate_set", tile_set(32))
-                .with_attr_rt("!ktdp.access_tile<32xindex>"),
-                Operation::new(Some(&format!("%cv{j}")), "ktdp.load", &[&format!("%cl{j}")])
-                    .with_attr_rt("tensor<32xf16>"),
-                // broadcast cos [32] -> [32,32] along dim 0
-                Operation::new(Some(&format!("%ci{j}")), "tensor.empty", &[])
-                    .with_attr("shape", Attr::IntList(vec![32, 32]))
-                    .with_attr_rt("tensor<32x32xf16>"),
-                Operation::new(
-                    Some(&format!("%cb{j}")),
-                    "linalg.broadcast",
-                    &[&format!("%cv{j}"), &format!("%ci{j}")],
-                )
-                .with_attr("dimensions", Attr::IntList(vec![0]))
-                .with_attr_rt("tensor<32x32xf16>"),
-                // out = row * cosb
-                Operation::new(
-                    Some(&format!("%o{j}")),
-                    "arith.mulf",
-                    &[&format!("%rv{j}"), &format!("%cb{j}")],
-                )
-                .with_attr_rt("tensor<32x32xf16>"),
-                // store
-                Operation::new(
-                    Some(&format!("%sl{j}")),
-                    "ktdp.construct_access_tile",
-                    &["%vout", &rk, "%c0"],
-                )
-                .with_attr("shape", Attr::IntList(vec![32, 32]))
-                .with_attr("base_map", Attr::AffineMap(AffineMap::identity(2)))
-                .with_attr("coordinate_set", row_set())
-                .with_attr_rt("!ktdp.access_tile<32x32xindex>"),
-                Operation::new(None, "ktdp.store", &[&format!("%o{j}"), &format!("%sl{j}")]),
+            let rk = leak(format!("%row{j}"));
+            let ck = leak(format!("%cos{j}"));
+            let rl = leak(format!("%rl{j}"));
+            let rv = leak(format!("%rv{j}"));
+            let cl = leak(format!("%cl{j}"));
+            let cv = leak(format!("%cv{j}"));
+            let ci = leak(format!("%ci{j}"));
+            let cb = leak(format!("%cb{j}"));
+            let o = leak(format!("%o{j}"));
+            let sl = leak(format!("%sl{j}"));
+
+            // row load [32,32] at [32j, 0]
+            let rl_op = ops.op(
+                Some(rl),
+                OpKind::KtdpConstructAccessTile,
+                &["%vrow", rk, "%c0"],
+            );
+            let rl_op = ops.attr(rl_op, AttrKey::Shape, ops.int_list(vec![32, 32]));
+            let rl_op = ops.attr(
+                rl_op,
+                AttrKey::BaseMap,
+                Attr::AffineMap(ops.identity_map(2)),
+            );
+            let rl_op = ops.attr(
+                rl_op,
+                AttrKey::CoordinateSet,
+                Attr::AffineSet(row_set(&ops)),
+            );
+            let rl_op = ops.ty(
+                rl_op,
+                IrType::AccessTile {
+                    dims: ops.arena().ints(vec![32, 32]),
+                },
+            );
+            let rv_op = ops.op(Some(rv), OpKind::KtdpLoad, &[rl]);
+            let rv_op = ops.ty(
+                rv_op,
+                IrType::Tensor {
+                    dims: ops.arena().ints(vec![32, 32]),
+                    elem: DType::F16,
+                },
+            );
+
+            // cos load [32] at [64j]
+            let cl_op = ops.op(Some(cl), OpKind::KtdpConstructAccessTile, &["%vcos", ck]);
+            let cl_op = ops.attr(cl_op, AttrKey::Shape, ops.int_list(vec![32]));
+            let cl_op = ops.attr(
+                cl_op,
+                AttrKey::BaseMap,
+                Attr::AffineMap(ops.identity_map(1)),
+            );
+            let cl_op = ops.attr(
+                cl_op,
+                AttrKey::CoordinateSet,
+                Attr::AffineSet(tile_set(&ops, 32)),
+            );
+            let cl_op = ops.ty(
+                cl_op,
+                IrType::AccessTile {
+                    dims: ops.arena().ints(vec![32]),
+                },
+            );
+            let cv_op = ops.op(Some(cv), OpKind::KtdpLoad, &[cl]);
+            let cv_op = ops.ty(
+                cv_op,
+                IrType::Tensor {
+                    dims: ops.arena().ints(vec![32]),
+                    elem: DType::F16,
+                },
+            );
+
+            // broadcast cos [32] -> [32,32] along dim 0
+            let ci_op = ops.op(Some(ci), OpKind::TensorEmpty, &[]);
+            let ci_op = ops.attr(ci_op, AttrKey::Shape, ops.int_list(vec![32, 32]));
+            let ci_op = ops.ty(
+                ci_op,
+                IrType::Tensor {
+                    dims: ops.arena().ints(vec![32, 32]),
+                    elem: DType::F16,
+                },
+            );
+            let cb_op = ops.op(Some(cb), OpKind::LinalgBroadcast, &[cv, ci]);
+            let cb_op = ops.attr(cb_op, AttrKey::Dimensions, ops.int_list(vec![0]));
+            let cb_op = ops.ty(
+                cb_op,
+                IrType::Tensor {
+                    dims: ops.arena().ints(vec![32, 32]),
+                    elem: DType::F16,
+                },
+            );
+
+            // out = row * cosb
+            let o_op = ops.op(Some(o), OpKind::ArithMulf, &[rv, cb]);
+            let o_op = ops.ty(
+                o_op,
+                IrType::Tensor {
+                    dims: ops.arena().ints(vec![32, 32]),
+                    elem: DType::F16,
+                },
+            );
+
+            // store
+            let sl_op = ops.op(
+                Some(sl),
+                OpKind::KtdpConstructAccessTile,
+                &["%vout", rk, "%c0"],
+            );
+            let sl_op = ops.attr(sl_op, AttrKey::Shape, ops.int_list(vec![32, 32]));
+            let sl_op = ops.attr(
+                sl_op,
+                AttrKey::BaseMap,
+                Attr::AffineMap(ops.identity_map(2)),
+            );
+            let sl_op = ops.attr(
+                sl_op,
+                AttrKey::CoordinateSet,
+                Attr::AffineSet(row_set(&ops)),
+            );
+            let sl_op = ops.ty(
+                sl_op,
+                IrType::AccessTile {
+                    dims: ops.arena().ints(vec![32, 32]),
+                },
+            );
+            let store = ops.op(None, OpKind::KtdpStore, &[o, sl]);
+
+            body.extend(vec![
+                rl_op, rv_op, cl_op, cv_op, ci_op, cb_op, o_op, sl_op, store,
             ]);
         }
-        // cos view declared once in prologue (shared).
-        ops.insert(
-            2,
-            Operation::new(Some("%vcos"), "ktdp.construct_memory_view", &["%pcos"])
-                .with_attr("shape", Attr::IntList(vec![2048]))
-                .with_attr("strides", Attr::IntList(vec![1]))
-                .with_attr_rt("memref<2048xf16>"),
-        );
-        ops.push(Operation::new(None, "func.return", &[]));
-        IRFunction {
-            name: "rope".into(),
-            arguments: vec![],
-            operations: ops,
-            grid: (1, 1, 1),
-            return_type: None,
-        }
+        body.push(ops.op(None, OpKind::FuncReturn, &[]));
+        let func = ops.func("rope", &[], body, (1, 1, 1));
+        (func, ops)
     }
 
     #[test]
     fn coalesces_strided_cos_operand() {
-        let f = rope_func(4);
-        let new_ops = recognize_coalesce(&f).expect("RoPE strided case should coalesce");
+        let (f, mut ops) = rope_func(4);
+        let new_ops = recognize_coalesce(Arena::global(), &f, usize::MAX)
+            .expect("RoPE strided case should coalesce");
         // One store run (4 blocks -> 1).
         assert_eq!(
-            new_ops.iter().filter(|o| o.op_type == "ktdp.store").count(),
+            new_ops
+                .iter()
+                .filter(|o| o.op_type == OpKind::KtdpStore)
+                .count(),
             1
         );
         // cos view reshaped: [2048] strides [1] -> [4, 2048] strides [64, 1].
         // (delta=64, view stride=1 -> S=64).
-        let vcos = new_ops
-            .iter()
-            .find(|o| o.result.as_deref() == Some("%vcos"))
-            .unwrap();
-        assert_eq!(
-            vcos.attributes.get("shape"),
-            Some(&Attr::IntList(vec![4, 2048]))
-        );
-        assert_eq!(
-            vcos.attributes.get("strides"),
-            Some(&Attr::IntList(vec![64, 1]))
-        );
+        let vcos_ssa = ops.ssa("%vcos");
+        let vcos = new_ops.iter().find(|o| o.result == Some(vcos_ssa)).unwrap();
+        assert_eq!(vcos.attr(AttrKey::Shape), Some(&Attr::IntList(&[4, 64])));
+        assert_eq!(vcos.attr(AttrKey::Strides), Some(&Attr::IntList(&[64, 1])));
         // The cos access tile became [4, 32] (row j reads cos[64j : 64j+32]).
-        let cos_at = new_ops
-            .iter()
-            .find(|o| o.result.as_deref() == Some("%cl0"))
-            .unwrap();
+        let cl0_ssa = ops.ssa("%cl0");
+        let cos_at = new_ops.iter().find(|o| o.result == Some(cl0_ssa)).unwrap();
+        assert_eq!(cos_at.attr(AttrKey::Shape), Some(&Attr::IntList(&[4, 32])));
         assert_eq!(
-            cos_at.attributes.get("shape"),
-            Some(&Attr::IntList(vec![4, 32]))
-        );
-        assert_eq!(
-            cos_at.result_type.as_deref(),
-            Some("!ktdp.access_tile<4x32xindex>")
+            cos_at.result_type,
+            Some(IrType::AccessTile { dims: &[4, 32] })
         );
         // row view reshaped: [1024,64] strides [64,1] -> [4,1024,64] strides
         // [2048,64,1] (delta=[32,0] dot strides = 32*64 = 2048).
-        let vrow = new_ops
-            .iter()
-            .find(|o| o.result.as_deref() == Some("%vrow"))
-            .unwrap();
+        let vrow_ssa = ops.ssa("%vrow");
+        let vrow = new_ops.iter().find(|o| o.result == Some(vrow_ssa)).unwrap();
         assert_eq!(
-            vrow.attributes.get("strides"),
-            Some(&Attr::IntList(vec![2048, 64, 1]))
+            vrow.attr(AttrKey::Strides),
+            Some(&Attr::IntList(&[2048, 64, 1]))
         );
         // The broadcast shifts its dimensions [0] -> [1] (new leading axis).
         let bc = new_ops
             .iter()
-            .find(|o| o.op_type == "linalg.broadcast")
+            .find(|o| o.op_type == OpKind::LinalgBroadcast)
+            .unwrap();
+        assert_eq!(bc.attr(AttrKey::Dimensions), Some(&Attr::IntList(&[1])));
+        // The mulf result prepends K: tensor<32x32xf16> -> tensor<4x32x32xf16>.
+        let mul = new_ops
+            .iter()
+            .find(|o| o.op_type == OpKind::ArithMulf)
             .unwrap();
         assert_eq!(
-            bc.attributes.get("dimensions"),
-            Some(&Attr::IntList(vec![1]))
+            mul.result_type,
+            Some(IrType::Tensor {
+                dims: &[4, 32, 32],
+                elem: DType::F16
+            })
         );
-        // The mulf result prepends K: tensor<32x32xf16> -> tensor<4x32x32xf16>.
-        let mul = new_ops.iter().find(|o| o.op_type == "arith.mulf").unwrap();
-        assert_eq!(mul.result_type.as_deref(), Some("tensor<4x32x32xf16>"));
     }
 
     #[test]
     fn rejects_non_uniform_offset() {
         // Block 1 offset jumps non-linearly across 3 blocks -> bail.
         // offsets 0, 32, 96 (not an arithmetic progression: deltas 32 then 64).
-        let f = copy_func(&[0, 32, 96], 32);
-        assert!(recognize_coalesce(&f).is_none());
+        let (f, _) = copy_func(&[0, 32, 96], 32);
+        assert!(recognize_coalesce(Arena::global(), &f, usize::MAX).is_none());
     }
 
     #[test]
     fn rejects_single_block() {
-        let f = copy_func(&[0], 32);
-        assert!(recognize_coalesce(&f).is_none());
+        let (f, _) = copy_func(&[0], 32);
+        assert!(recognize_coalesce(Arena::global(), &f, usize::MAX).is_none());
     }
 
     #[test]
     fn rejects_multicore_grid() {
-        let mut f = copy_func(&[0, 32], 32);
+        let (mut f, _) = copy_func(&[0, 32], 32);
         f.grid = (9, 1, 1);
-        assert!(recognize_coalesce(&f).is_none());
+        assert!(recognize_coalesce(Arena::global(), &f, usize::MAX).is_none());
     }
 
     #[test]
     fn coalesces_three_blocks() {
-        let f = copy_func(&[0, 32, 64], 32);
-        let new_ops = recognize_coalesce(&f).expect("should coalesce");
+        let (f, _) = copy_func(&[0, 32, 64], 32);
+        let new_ops = recognize_coalesce(Arena::global(), &f, usize::MAX).expect("should coalesce");
         let at = new_ops
             .iter()
-            .find(|o| o.op_type == "ktdp.construct_access_tile")
+            .find(|o| o.op_type == OpKind::KtdpConstructAccessTile)
             .unwrap();
-        assert_eq!(
-            at.attributes.get("shape"),
-            Some(&Attr::IntList(vec![3, 32]))
-        );
+        assert_eq!(at.attr(AttrKey::Shape), Some(&Attr::IntList(&[3, 32])));
     }
 }

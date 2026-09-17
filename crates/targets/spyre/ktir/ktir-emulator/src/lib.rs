@@ -49,6 +49,8 @@ pub use machine_state::{context, memory};
 #[cfg(metal)]
 pub mod metal;
 pub mod ops_memory;
+#[cfg(test)]
+pub(crate) mod test_support;
 // The fused/serving execution drivers depend on the optimizer's ProgramSpec.
 #[cfg(feature = "optimizer")]
 pub mod resident;

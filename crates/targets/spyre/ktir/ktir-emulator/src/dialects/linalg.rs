@@ -1347,8 +1347,9 @@ mod tests {
     use crate::dialects::Dispatch;
     use crate::env::{ExecutionEnv, GridExecutor};
     use crate::interpreter::{execute_ops, single_core_context};
+    use crate::test_support::Ops;
 
-    fn run(ops: &[Operation], ctx: &mut CoreContext) -> Result<(), String> {
+    fn run(ops: &[Operation<'static>], ctx: &mut CoreContext) -> Result<(), String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
@@ -1359,8 +1360,8 @@ mod tests {
         Value::Tile(Tile::compute(data, DType::F32, shape))
     }
 
-    fn get_tile(ctx: &CoreContext, name: &str) -> Tile {
-        match ctx.get_value(name).unwrap() {
+    fn get_tile(ctx: &CoreContext, ssa: Ssa) -> Tile {
+        match ctx.get_value(ssa).unwrap() {
             Value::Tile(t) => t.clone(),
             other => panic!("expected tile, got {other:?}"),
         }
@@ -1370,73 +1371,89 @@ mod tests {
 
     #[test]
     fn fill_broadcasts_scalar() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%s", Value::Scalar(Scalar::F32(7.0)));
-        ctx.set_value("%init", tile(vec![0.0; 6], vec![2, 3]));
+        ctx.set_value(ops.ssa("%s"), Value::Scalar(Scalar::F32(7.0)));
+        ctx.set_value(ops.ssa("%init"), tile(vec![0.0; 6], vec![2, 3]));
+        let r = ops.ssa("%r");
         run(
-            &[Operation::new(Some("%r"), "linalg.fill", &["%s", "%init"])],
+            &[ops.op(Some("%r"), OpKind::LinalgFill, &["%s", "%init"])],
             &mut ctx,
         )
         .unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.as_f32().to_vec(), vec![7.0; 6]);
         assert_eq!(t.shape, vec![2, 3]);
     }
 
     #[test]
     fn fill_from_index_scalar() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%s", Value::Index(3));
-        ctx.set_value("%init", tile(vec![0.0; 2], vec![2]));
+        ctx.set_value(ops.ssa("%s"), Value::Index(3));
+        ctx.set_value(ops.ssa("%init"), tile(vec![0.0; 2], vec![2]));
+        let r = ops.ssa("%r");
         run(
-            &[Operation::new(Some("%r"), "linalg.fill", &["%s", "%init"])],
+            &[ops.op(Some("%r"), OpKind::LinalgFill, &["%s", "%init"])],
             &mut ctx,
         )
         .unwrap();
-        assert_eq!(get_tile(&ctx, "%r").as_f32().to_vec(), vec![3.0, 3.0]);
+        assert_eq!(get_tile(&ctx, r).as_f32().to_vec(), vec![3.0, 3.0]);
     }
 
     // --- transpose --------------------------------------------------------
 
     #[test]
     fn transpose_2d() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // [[1,2,3],[4,5,6]] -> transpose [1,0] -> [[1,4],[2,5],[3,6]]
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
-        ctx.set_value("%y", tile(vec![0.0; 6], vec![3, 2]));
-        let op = Operation::new(Some("%r"), "linalg.transpose", &["%x", "%y"])
-            .with_attr("permutation", Attr::IntList(vec![1, 0]));
+        ctx.set_value(
+            ops.ssa("%x"),
+            tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
+        );
+        ctx.set_value(ops.ssa("%y"), tile(vec![0.0; 6], vec![3, 2]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgTranspose, &["%x", "%y"]);
+        let attr = ops.int_list(vec![1, 0]);
+        let op = ops.attr(op, AttrKey::Permutation, attr);
         run(&[op], &mut ctx).unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![3, 2]);
         assert_eq!(t.as_f32().to_vec(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
 
     #[test]
     fn transpose_identity_permutation() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
-        ctx.set_value("%y", tile(vec![0.0; 4], vec![2, 2]));
-        let op = Operation::new(Some("%r"), "linalg.transpose", &["%x", "%y"])
-            .with_attr("permutation", Attr::IntList(vec![0, 1]));
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%y"), tile(vec![0.0; 4], vec![2, 2]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgTranspose, &["%x", "%y"]);
+        let attr = ops.int_list(vec![0, 1]);
+        let op = ops.attr(op, AttrKey::Permutation, attr);
         run(&[op], &mut ctx).unwrap();
         assert_eq!(
-            get_tile(&ctx, "%r").as_f32().to_vec(),
+            get_tile(&ctx, r).as_f32().to_vec(),
             vec![1.0, 2.0, 3.0, 4.0]
         );
     }
 
     #[test]
     fn transpose_3d_permutation() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // shape [2,1,3], permute [1,2,0] -> shape [1,3,2]; out[a,b,c]=in[c,a,b].
         let data: Vec<f32> = (0..6).map(|x| x as f32).collect();
-        ctx.set_value("%x", tile(data, vec![2, 1, 3]));
-        ctx.set_value("%y", tile(vec![0.0; 6], vec![1, 3, 2]));
-        let op = Operation::new(Some("%r"), "linalg.transpose", &["%x", "%y"])
-            .with_attr("permutation", Attr::IntList(vec![1, 2, 0]));
+        ctx.set_value(ops.ssa("%x"), tile(data, vec![2, 1, 3]));
+        ctx.set_value(ops.ssa("%y"), tile(vec![0.0; 6], vec![1, 3, 2]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgTranspose, &["%x", "%y"]);
+        let attr = ops.int_list(vec![1, 2, 0]);
+        let op = ops.attr(op, AttrKey::Permutation, attr);
         run(&[op], &mut ctx).unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![1, 3, 2]);
         // in[i,j,k] at i*3+k (j=0). out flat: (0,0,0)->in[0,0,0]=0 (0,0,1)->in[1,0,0]=3
         // (0,1,0)->in[0,0,1]=1 (0,1,1)->in[1,0,1]=4 (0,2,0)->in[0,0,2]=2 (0,2,1)->in[1,0,2]=5
@@ -1447,14 +1464,17 @@ mod tests {
 
     #[test]
     fn broadcast_along_dim() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // ins [3], broadcast dim 1 -> expand to [3,1] -> [3,4]: rows constant.
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0], vec![3]));
-        ctx.set_value("%y", tile(vec![0.0; 12], vec![3, 4]));
-        let op = Operation::new(Some("%r"), "linalg.broadcast", &["%x", "%y"])
-            .with_attr("dimensions", Attr::IntList(vec![1]));
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0], vec![3]));
+        ctx.set_value(ops.ssa("%y"), tile(vec![0.0; 12], vec![3, 4]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgBroadcast, &["%x", "%y"]);
+        let attr = ops.int_list(vec![1]);
+        let op = ops.attr(op, AttrKey::Dimensions, attr);
         run(&[op], &mut ctx).unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![3, 4]);
         assert_eq!(
             t.as_f32().to_vec(),
@@ -1464,14 +1484,17 @@ mod tests {
 
     #[test]
     fn broadcast_leading_dim() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // ins [4], broadcast dim 0 -> [1,4] -> [3,4]: each row identical.
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0], vec![4]));
-        ctx.set_value("%y", tile(vec![0.0; 12], vec![3, 4]));
-        let op = Operation::new(Some("%r"), "linalg.broadcast", &["%x", "%y"])
-            .with_attr("dimensions", Attr::IntList(vec![0]));
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![4]));
+        ctx.set_value(ops.ssa("%y"), tile(vec![0.0; 12], vec![3, 4]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgBroadcast, &["%x", "%y"]);
+        let attr = ops.int_list(vec![0]);
+        let op = ops.attr(op, AttrKey::Dimensions, attr);
         run(&[op], &mut ctx).unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(
             t.as_f32().to_vec(),
             vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
@@ -1482,54 +1505,59 @@ mod tests {
 
     #[test]
     fn matmul_plain() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // A=[[1,2],[3,4]], B=[[5,6],[7,8]] -> [[19,22],[43,50]]
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
-        ctx.set_value("%b", tile(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%b"), tile(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]));
+        let r = ops.ssa("%r");
         run(
-            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])],
+            &[ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"])],
             &mut ctx,
         )
         .unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![2, 2]);
         assert_eq!(t.as_f32().to_vec(), vec![19.0, 22.0, 43.0, 50.0]);
     }
 
     #[test]
     fn matmul_accumulates_outs() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
-        ctx.set_value("%b", tile(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]));
-        ctx.set_value("%c", tile(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%b"), tile(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%c"), tile(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]));
+        let r = ops.ssa("%r");
         run(
-            &[Operation::new(
-                Some("%r"),
-                "linalg.matmul",
-                &["%a", "%b", "%c"],
-            )],
+            &[ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b", "%c"])],
             &mut ctx,
         )
         .unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.as_f32().to_vec(), vec![20.0, 23.0, 44.0, 51.0]);
     }
 
     #[test]
     fn matmul_nonsquare() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // A [2x3], B [3x2] -> [2x2]
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
         ctx.set_value(
-            "%b",
+            ops.ssa("%a"),
+            tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
+        );
+        ctx.set_value(
+            ops.ssa("%b"),
             tile(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]),
         );
+        let r = ops.ssa("%r");
         run(
-            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])],
+            &[ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"])],
             &mut ctx,
         )
         .unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![2, 2]);
         // row0: [58, 64], row1: [139, 154]
         assert_eq!(t.as_f32().to_vec(), vec![58.0, 64.0, 139.0, 154.0]);
@@ -1537,11 +1565,12 @@ mod tests {
 
     #[test]
     fn matmul_rejects_inner_dim_mismatch() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", tile(vec![1.0, 2.0], vec![1, 2]));
-        ctx.set_value("%b", tile(vec![1.0, 2.0, 3.0], vec![3, 1]));
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0], vec![1, 2]));
+        ctx.set_value(ops.ssa("%b"), tile(vec![1.0, 2.0, 3.0], vec![3, 1]));
         let err = run(
-            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])],
+            &[ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"])],
             &mut ctx,
         )
         .unwrap_err();
@@ -1552,18 +1581,20 @@ mod tests {
     /// the same result the GEMM would. A [1x3] · B [3x2] -> [1x2].
     #[test]
     fn matmul_m1_routes_through_gemv() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0], vec![1, 3]));
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0, 3.0], vec![1, 3]));
         ctx.set_value(
-            "%b",
+            ops.ssa("%b"),
             tile(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]),
         );
+        let r = ops.ssa("%r");
         run(
-            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])],
+            &[ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"])],
             &mut ctx,
         )
         .unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![1, 2]);
         // [1,2,3]·B = [1·7+2·9+3·11, 1·8+2·10+3·12] = [58, 64].
         assert_eq!(t.as_f32().to_vec(), vec![58.0, 64.0]);
@@ -1573,16 +1604,16 @@ mod tests {
     /// a [1x2] · B[n,k]=[[5,7],[6,8]]ᵀ -> [1x2].
     #[test]
     fn matmul_bt_m1_routes_through_gemv() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", tile(vec![1.0, 2.0], vec![1, 2]));
-        ctx.set_value("%b", tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
-        run(
-            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])
-                .with_attr("indexing_maps", tb_maps())],
-            &mut ctx,
-        )
-        .unwrap();
-        let t = get_tile(&ctx, "%r");
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0], vec![1, 2]));
+        ctx.set_value(ops.ssa("%b"), tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"]);
+        let maps = tb_maps(&ops);
+        let op = ops.attr(op, AttrKey::IndexingMaps, maps);
+        run(&[op], &mut ctx).unwrap();
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![1, 2]);
         // y[j] = Σ_k a[k]·B[j,k]: [1·5+2·7, 1·6+2·8] = [19, 22].
         assert_eq!(t.as_f32().to_vec(), vec![19.0, 22.0]);
@@ -1590,141 +1621,137 @@ mod tests {
 
     #[test]
     fn matmul_bt_basic() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // A=[[1,2],[3,4]]. B stored [n,k]=[[5,7],[6,8]] (= Bᵀ of [[5,6],[7,8]]).
         // A·Bᵀ contracts the LAST axis: C[m,n]=Σ_k A[m,k]·B[n,k] = [[19,22],[43,50]].
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
-        ctx.set_value("%b", tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
-        run(
-            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])
-                .with_attr("indexing_maps", tb_maps())],
-            &mut ctx,
-        )
-        .unwrap();
-        let t = get_tile(&ctx, "%r");
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%b"), tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"]);
+        let maps = tb_maps(&ops);
+        let op = ops.attr(op, AttrKey::IndexingMaps, maps);
+        run(&[op], &mut ctx).unwrap();
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![2, 2]);
         assert_eq!(t.as_f32().to_vec(), vec![19.0, 22.0, 43.0, 50.0]);
     }
 
     #[test]
     fn matmul_bt_nonsquare_matches_plain() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // A [2x3]; B stored [n,k]=[2x3]=[[7,9,11],[8,10,12]] (= Bᵀ of the [3x2] in
         // matmul_nonsquare). A·Bᵀ must equal that plain result [58,64,139,154].
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
         ctx.set_value(
-            "%b",
+            ops.ssa("%a"),
+            tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
+        );
+        ctx.set_value(
+            ops.ssa("%b"),
             tile(vec![7.0, 9.0, 11.0, 8.0, 10.0, 12.0], vec![2, 3]),
         );
-        run(
-            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])
-                .with_attr("indexing_maps", tb_maps())],
-            &mut ctx,
-        )
-        .unwrap();
-        let t = get_tile(&ctx, "%r");
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"]);
+        let maps = tb_maps(&ops);
+        let op = ops.attr(op, AttrKey::IndexingMaps, maps);
+        run(&[op], &mut ctx).unwrap();
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![2, 2]);
         assert_eq!(t.as_f32().to_vec(), vec![58.0, 64.0, 139.0, 154.0]);
     }
 
     #[test]
     fn matmul_bt_accumulates_outs() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
-        ctx.set_value("%b", tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
-        ctx.set_value("%c", tile(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]));
-        run(
-            &[
-                Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b", "%c"])
-                    .with_attr("indexing_maps", tb_maps()),
-            ],
-            &mut ctx,
-        )
-        .unwrap();
-        let t = get_tile(&ctx, "%r");
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%b"), tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%c"), tile(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b", "%c"]);
+        let maps = tb_maps(&ops);
+        let op = ops.attr(op, AttrKey::IndexingMaps, maps);
+        run(&[op], &mut ctx).unwrap();
+        let t = get_tile(&ctx, r);
         assert_eq!(t.as_f32().to_vec(), vec![20.0, 23.0, 44.0, 51.0]);
     }
 
     #[test]
     fn matmul_bt_rejects_contraction_mismatch() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // A [1x2] (k=2), B [n,k]=[1x3] (k=3) — last axes disagree.
-        ctx.set_value("%a", tile(vec![1.0, 2.0], vec![1, 2]));
-        ctx.set_value("%b", tile(vec![1.0, 2.0, 3.0], vec![1, 3]));
-        let err = run(
-            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])
-                .with_attr("indexing_maps", tb_maps())],
-            &mut ctx,
-        )
-        .unwrap_err();
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0], vec![1, 2]));
+        ctx.set_value(ops.ssa("%b"), tile(vec![1.0, 2.0, 3.0], vec![1, 3]));
+        let op = ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"]);
+        let maps = tb_maps(&ops);
+        let op = ops.attr(op, AttrKey::IndexingMaps, maps);
+        let err = run(&[op], &mut ctx).unwrap_err();
         assert!(err.contains("contraction dims disagree"));
     }
 
     // --- linalg.matmul + indexing_maps (upstream transpose encoding) ---------
 
-    /// Build a matmul `indexing_maps` AffineMapList over `(m, n, k)`.
-    fn imaps(a: &str, b: &str, c: &str) -> Attr {
-        let p = |s: &str| crate::parser_ast::parse_affine_map(s).unwrap();
-        Attr::AffineMapList(vec![p(a), p(b), p(c)])
+    /// Build a matmul `indexing_maps` AffineMapList over `(m, n, k)` from each
+    /// operand's `(A, B, C)` dim SELECTION (indices into `d0..d2`) — e.g. A's
+    /// normal layout `[m,k]` is `sel [0, 2]`; transpose-B `[n,k]` is `[1, 2]`.
+    fn imaps(ops: &Ops, a: &[usize], b: &[usize], c: &[usize]) -> Attr<'static> {
+        ops.map_list(vec![
+            ops.perm_map(3, a),
+            ops.perm_map(3, b),
+            ops.perm_map(3, c),
+        ])
     }
 
     /// Transpose-B `indexing_maps`: A `[m,k]`, B `[n,k]`, C `[m,n]`.
-    fn tb_maps() -> Attr {
-        imaps(
-            "affine_map<(d0, d1, d2) -> (d0, d2)>",
-            "affine_map<(d0, d1, d2) -> (d1, d2)>",
-            "affine_map<(d0, d1, d2) -> (d0, d1)>",
-        )
+    fn tb_maps(ops: &Ops) -> Attr<'static> {
+        imaps(ops, &[0, 2], &[1, 2], &[0, 1])
     }
 
     /// Identity-layout `indexing_maps` (B map `(d2, d1)`) is a plain `A·B`.
     #[test]
     fn matmul_indexing_maps_normal_is_plain() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // A=[[1,2,3]] [1x3], B=[[7,8],[9,10],[11,12]] [3x2] -> [58, 64].
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0], vec![1, 3]));
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0, 3.0], vec![1, 3]));
         ctx.set_value(
-            "%b",
+            ops.ssa("%b"),
             tile(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]),
         );
-        let op = Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"]).with_attr(
-            "indexing_maps",
-            imaps(
-                "affine_map<(d0, d1, d2) -> (d0, d2)>", // A: [m, k]
-                "affine_map<(d0, d1, d2) -> (d2, d1)>", // B: [k, n]  (normal)
-                "affine_map<(d0, d1, d2) -> (d0, d1)>", // C: [m, n]
-            ),
-        );
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"]);
+        // A: [m, k]; B: [k, n] (normal); C: [m, n].
+        let maps = imaps(&ops, &[0, 2], &[2, 1], &[0, 1]);
+        let op = ops.attr(op, AttrKey::IndexingMaps, maps);
         run(&[op], &mut ctx).unwrap();
-        assert_eq!(get_tile(&ctx, "%r").as_f32().to_vec(), vec![58.0, 64.0]);
+        assert_eq!(get_tile(&ctx, r).as_f32().to_vec(), vec![58.0, 64.0]);
     }
 
     /// Transpose-A `indexing_maps` (A map `(d2, d0)`) is rejected, not guessed.
     #[test]
     fn matmul_indexing_maps_rejects_transpose_a() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
-        ctx.set_value("%b", tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
-        let op = Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"]).with_attr(
-            "indexing_maps",
-            imaps(
-                "affine_map<(d0, d1, d2) -> (d2, d0)>", // A: [k, m]  (transpose-A)
-                "affine_map<(d0, d1, d2) -> (d2, d1)>",
-                "affine_map<(d0, d1, d2) -> (d0, d1)>",
-            ),
-        );
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%b"), tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
+        let op = ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"]);
+        // A: [k, m] (transpose-A); B: [k, n]; C: [m, n].
+        let maps = imaps(&ops, &[2, 0], &[2, 1], &[0, 1]);
+        let op = ops.attr(op, AttrKey::IndexingMaps, maps);
         let err = run(&[op], &mut ctx).unwrap_err();
         assert!(err.contains("transpose-A"), "got: {err}");
     }
 
     #[test]
     fn classify_matmul_maps_detects_layouts() {
-        let p = |s: &str| crate::parser_ast::parse_affine_map(s).unwrap();
-        let a = p("affine_map<(d0, d1, d2) -> (d0, d2)>");
-        let at = p("affine_map<(d0, d1, d2) -> (d2, d0)>");
-        let b = p("affine_map<(d0, d1, d2) -> (d2, d1)>");
-        let bt = p("affine_map<(d0, d1, d2) -> (d1, d2)>");
-        let c = p("affine_map<(d0, d1, d2) -> (d0, d1)>");
+        let ops = Ops::new();
+        let a = ops.perm_map(3, &[0, 2]);
+        let at = ops.perm_map(3, &[2, 0]);
+        let b = ops.perm_map(3, &[2, 1]);
+        let bt = ops.perm_map(3, &[1, 2]);
+        let c = ops.perm_map(3, &[0, 1]);
         assert_eq!(
             classify_matmul_maps(&[a.clone(), b.clone(), c.clone()]),
             Ok((false, false))
@@ -1739,23 +1766,24 @@ mod tests {
         );
         // Wrong arity and a bad C map both error.
         assert!(classify_matmul_maps(&[a.clone(), b.clone()]).is_err());
-        assert!(classify_matmul_maps(&[a, bt, p("affine_map<(d0, d1, d2) -> (d1, d0)>")]).is_err());
+        assert!(classify_matmul_maps(&[a, bt, ops.perm_map(3, &[1, 0])]).is_err());
     }
 
     /// A map referencing an out-of-range dim (`d3` with only 3 dims) must error
     /// gracefully via classify, not panic in the affine linearizer.
     #[test]
     fn classify_matmul_maps_out_of_range_dim_errors_not_panics() {
-        use crate::affine::{AffineExpr, AffineMap};
+        use crate::affine::AffineExpr;
+        let ops = Ops::new();
         let bad = AffineMap {
             num_dims: 3,
             num_syms: 0,
-            exprs: vec![AffineExpr::Dim(3), AffineExpr::Dim(0)],
+            exprs: ops
+                .arena()
+                .exprs(vec![AffineExpr::Dim(3), AffineExpr::Dim(0)]),
         };
-        let c =
-            crate::parser_ast::parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1)>").unwrap();
-        let b =
-            crate::parser_ast::parse_affine_map("affine_map<(d0, d1, d2) -> (d2, d1)>").unwrap();
+        let c = ops.perm_map(3, &[0, 1]);
+        let b = ops.perm_map(3, &[2, 1]);
         assert_eq!(bad.result_dims(), None); // no panic
         assert!(classify_matmul_maps(&[bad, b, c]).is_err());
     }
@@ -1764,39 +1792,37 @@ mod tests {
     /// StrList shorthand) is rejected, not silently treated as plain `A·B`.
     #[test]
     fn matmul_rejects_non_affine_indexing_maps() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
-        ctx.set_value("%b", tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
-        let op = Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"]).with_attr(
-            "indexing_maps",
-            Attr::StrList(vec!["0,2".into(), "1,2".into(), "0,1".into()]),
-        );
+        ctx.set_value(ops.ssa("%a"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%b"), tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
+        let op = ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"]);
+        let bad = ops.str_list(&["0,2", "1,2", "0,1"]);
+        let op = ops.attr(op, AttrKey::IndexingMaps, bad);
         let err = run(&[op], &mut ctx).unwrap_err();
         assert!(err.contains("affine-map list"), "got: {err}");
     }
 
     #[test]
     fn batch_matmul_two_batches() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // batch0: [[1,2],[3,4]] @ I = same. batch1: I @ [[5,6],[7,8]] = same.
         ctx.set_value(
-            "%a",
+            ops.ssa("%a"),
             tile(vec![1.0, 2.0, 3.0, 4.0, 1.0, 0.0, 0.0, 1.0], vec![2, 2, 2]),
         );
         ctx.set_value(
-            "%b",
+            ops.ssa("%b"),
             tile(vec![1.0, 0.0, 0.0, 1.0, 5.0, 6.0, 7.0, 8.0], vec![2, 2, 2]),
         );
+        let r = ops.ssa("%r");
         run(
-            &[Operation::new(
-                Some("%r"),
-                "linalg.batch_matmul",
-                &["%a", "%b"],
-            )],
+            &[ops.op(Some("%r"), OpKind::LinalgBatchMatmul, &["%a", "%b"])],
             &mut ctx,
         )
         .unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![2, 2, 2]);
         assert_eq!(
             t.as_f32().to_vec(),
@@ -1806,22 +1832,25 @@ mod tests {
 
     // --- reduce -----------------------------------------------------------
 
-    fn addf_combiner_region() -> Vec<Operation> {
-        // (%in, %out) { %s = arith.addf %in, %out ; linalg.yield %s }
+    /// (%in, %out) { %s = arith.addf %in, %out ; linalg.yield %s }
+    fn addf_combiner_region(ops: &mut Ops) -> Vec<Operation<'static>> {
         vec![
-            Operation::new(Some("%s"), "arith.addf", &["%in", "%out"]),
-            Operation::new(None, "linalg.yield", &["%s"]),
+            ops.op(Some("%rs"), OpKind::ArithAddf, &["%rin", "%rout"]),
+            ops.op(None, OpKind::LinalgYield, &["%rs"]),
         ]
     }
 
     #[test]
     fn reduce_all_to_scalar_explicit_region() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0], vec![4]));
-        let mut op = Operation::new(Some("%r"), "linalg.reduce", &["%x"]);
-        op.regions.push(addf_combiner_region());
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![4]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let body = addf_combiner_region(&mut ops);
+        let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 10.0),
             other => panic!("expected scalar 10.0, got {other:?}"),
         }
@@ -1829,13 +1858,16 @@ mod tests {
 
     #[test]
     fn reduce_all_odd_length() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // 5 elements exercises the odd-carry path in the tree fold.
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5]));
-        let mut op = Operation::new(Some("%r"), "linalg.reduce", &["%x"]);
-        op.regions.push(addf_combiner_region());
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let body = addf_combiner_region(&mut ops);
+        let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 15.0),
             other => panic!("expected scalar 15.0, got {other:?}"),
         }
@@ -1843,53 +1875,73 @@ mod tests {
 
     #[test]
     fn reduce_along_dim_keeps_other_axis() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // [[1,2,3],[4,5,6]] reduce dim=1 -> [6, 15]
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
-        let mut op =
-            Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(1));
-        op.regions.push(addf_combiner_region());
+        ctx.set_value(
+            ops.ssa("%x"),
+            tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
+        );
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let op = ops.attr(op, AttrKey::Dim, Attr::Int(1));
+        let body = addf_combiner_region(&mut ops);
+        let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![2]);
         assert_eq!(t.as_f32().to_vec(), vec![6.0, 15.0]);
     }
 
     #[test]
     fn reduce_along_dim0() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // [[1,2,3],[4,5,6]] reduce dim=0 -> [5,7,9]
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
-        let mut op =
-            Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(0));
-        op.regions.push(addf_combiner_region());
+        ctx.set_value(
+            ops.ssa("%x"),
+            tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
+        );
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let op = ops.attr(op, AttrKey::Dim, Attr::Int(0));
+        let body = addf_combiner_region(&mut ops);
+        let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![3]);
         assert_eq!(t.as_f32().to_vec(), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
     fn reduce_dim1_odd_extent() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // [[1,2,3],[4,5,6]] dim=1 odd extent 3 -> [6,15] exercises odd carry on a 2-D fold.
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
-        let mut op =
-            Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(1));
-        op.regions.push(addf_combiner_region());
+        ctx.set_value(
+            ops.ssa("%x"),
+            tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
+        );
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let op = ops.attr(op, AttrKey::Dim, Attr::Int(1));
+        let body = addf_combiner_region(&mut ops);
+        let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
-        assert_eq!(get_tile(&ctx, "%r").as_f32().to_vec(), vec![6.0, 15.0]);
+        assert_eq!(get_tile(&ctx, r).as_f32().to_vec(), vec![6.0, 15.0]);
     }
 
     #[test]
     fn reduce_shorthand_synthesizes_region() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%x", tile(vec![2.0, 4.0, 6.0, 8.0], vec![4]));
+        ctx.set_value(ops.ssa("%x"), tile(vec![2.0, 4.0, 6.0, 8.0], vec![4]));
+        let r = ops.ssa("%r");
         // Shorthand: reduce_fn attribute, no region.
-        let op = Operation::new(Some("%r"), "linalg.reduce", &["%x"])
-            .with_attr("reduce_fn", Attr::Str("arith.addf".into()));
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let op = ops.attr(op, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 20.0),
             other => panic!("expected 20.0, got {other:?}"),
         }
@@ -1897,12 +1949,14 @@ mod tests {
 
     #[test]
     fn reduce_mul_combiner() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0], vec![4]));
-        let op = Operation::new(Some("%r"), "linalg.reduce", &["%x"])
-            .with_attr("reduce_fn", Attr::Str("arith.mulf".into()));
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![4]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let op = ops.attr(op, AttrKey::ReduceFn, Attr::Op(OpKind::ArithMulf));
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 24.0),
             other => panic!("expected 24.0, got {other:?}"),
         }
@@ -1910,14 +1964,17 @@ mod tests {
 
     #[test]
     fn reduce_binds_outs_var() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0], vec![3]));
-        let op = Operation::new(Some("%r"), "linalg.reduce", &["%x"])
-            .with_attr("reduce_fn", Attr::Str("arith.addf".into()))
-            .with_attr("outs_var", Attr::Str("%acc".into()));
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0], vec![3]));
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let op = ops.attr(op, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+        let outs_var = ops.ssas_attr(&["%acc"]);
+        let op = ops.attr(op, AttrKey::OutsVar, outs_var);
+        let acc = ops.ssa("%acc");
         run(&[op], &mut ctx).unwrap();
         // Both %r and %acc resolve to the reduced scalar.
-        match ctx.get_value("%acc").unwrap() {
+        match ctx.get_value(acc).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 6.0),
             other => panic!("expected 6.0 via outs_var, got {other:?}"),
         }
@@ -1929,34 +1986,38 @@ mod tests {
         // non-identity `outs` init of 100 is 110, not 10 — the Rust port of the
         // Python `test_reduce_folds_outs_init` (tests/test_dialects_exec.py). Folds
         // a GENUINELY non-identity outs (no identity-only guard), matching the oracle.
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // [[1,2,3,4]] f16 reduced along dim=1 → 10, then + outs init 100 → 110.
         ctx.set_value(
-            "%x",
+            ops.ssa("%x"),
             Value::Tile(Tile::compute(
                 vec![1.0, 2.0, 3.0, 4.0],
                 DType::F16,
                 vec![1, 4],
             )),
         );
+        let init = ops.ssa("%init");
         ctx.set_value(
-            "%init",
+            init,
             Value::Tile(Tile::compute(vec![100.0], DType::F16, vec![1])),
         );
-        let op = Operation::new(Some("%r"), "linalg.reduce", &["%x"])
-            .with_attr("reduce_fn", Attr::Str("arith.addf".into()))
-            .with_attr("dim", Attr::Int(1))
-            .with_attr("outs_var", Attr::Str("%init".into()));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let op = ops.attr(op, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+        let op = ops.attr(op, AttrKey::Dim, Attr::Int(1));
+        let outs_var = ops.ssas_attr(&["%init"]);
+        let op = ops.attr(op, AttrKey::OutsVar, outs_var);
         run(&[op], &mut ctx).unwrap();
         // dim=1 reduce of a [1,4] tile keeps the leading axis → shape [1], value 110.
-        let val = match ctx.get_value("%r").unwrap() {
+        let val = match ctx.get_value(r).unwrap() {
             Value::Tile(t) => t.as_f32()[0],
             Value::Scalar(Scalar::F32(v)) => *v,
             other => panic!("expected 110.0, got {other:?}"),
         };
         assert!((val - 110.0).abs() < 1e-1, "expected ~110.0, got {val}");
         // Bound back to outs_var too.
-        match ctx.get_value("%init").unwrap() {
+        match ctx.get_value(init).unwrap() {
             Value::Tile(t) => assert!((t.as_f32()[0] - 110.0).abs() < 1e-1),
             Value::Scalar(Scalar::F32(v)) => assert!((*v - 110.0).abs() < 1e-1),
             other => panic!("expected outs_var bound to 110.0, got {other:?}"),
@@ -1965,12 +2026,14 @@ mod tests {
 
     #[test]
     fn reduce_scalar_input_passthrough() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%x", Value::Scalar(Scalar::F32(42.0)));
-        let op = Operation::new(Some("%r"), "linalg.reduce", &["%x"])
-            .with_attr("reduce_fn", Attr::Str("arith.addf".into()));
+        ctx.set_value(ops.ssa("%x"), Value::Scalar(Scalar::F32(42.0)));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+        let op = ops.attr(op, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
         run(&[op], &mut ctx).unwrap();
-        match ctx.get_value("%r").unwrap() {
+        match ctx.get_value(r).unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 42.0),
             other => panic!("expected 42.0 passthrough, got {other:?}"),
         }
@@ -1980,64 +2043,71 @@ mod tests {
 
     #[test]
     fn generic_elementwise_add() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        // ^bb0(%a, %b, %out): %s = addf %a, %b ; yield %s
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0], vec![3]));
-        ctx.set_value("%y", tile(vec![10.0, 20.0, 30.0], vec![3]));
-        ctx.set_value("%init", tile(vec![0.0; 3], vec![3]));
-        let mut op = Operation::new(Some("%r"), "linalg.generic", &["%x", "%y", "%init"])
-            .with_attr("n_ins", Attr::Int(2))
-            .with_attr(
-                "bb0_names",
-                Attr::StrList(vec!["%a".into(), "%b".into(), "%out".into()]),
-            );
-        op.regions.push(vec![
-            Operation::new(Some("%s"), "arith.addf", &["%a", "%b"]),
-            Operation::new(None, "linalg.yield", &["%s"]),
-        ]);
+        // ^bb0(%ga, %gb, %gout): %s = addf %ga, %gb ; yield %s
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0], vec![3]));
+        ctx.set_value(ops.ssa("%y"), tile(vec![10.0, 20.0, 30.0], vec![3]));
+        ctx.set_value(ops.ssa("%init"), tile(vec![0.0; 3], vec![3]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgGeneric, &["%x", "%y", "%init"]);
+        let op = ops.attr(op, AttrKey::NIns, Attr::Int(2));
+        let bb0 = ops.ssas_attr(&["%ga", "%gb", "%gout"]);
+        let op = ops.attr(op, AttrKey::Bb0Names, bb0);
+        let body = vec![
+            ops.op(Some("%gs"), OpKind::ArithAddf, &["%ga", "%gb"]),
+            ops.op(None, OpKind::LinalgYield, &["%gs"]),
+        ];
+        let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.as_f32().to_vec(), vec![11.0, 22.0, 33.0]);
     }
 
     #[test]
     fn generic_uses_outs_block_arg() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        // ^bb0(%a, %out): %s = addf %a, %out ; yield %s  — accumulate into outs.
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0], vec![3]));
-        ctx.set_value("%init", tile(vec![100.0, 200.0, 300.0], vec![3]));
-        let mut op = Operation::new(Some("%r"), "linalg.generic", &["%x", "%init"])
-            .with_attr("n_ins", Attr::Int(1))
-            .with_attr("bb0_names", Attr::StrList(vec!["%a".into(), "%out".into()]));
-        op.regions.push(vec![
-            Operation::new(Some("%s"), "arith.addf", &["%a", "%out"]),
-            Operation::new(None, "linalg.yield", &["%s"]),
-        ]);
+        // ^bb0(%ga, %gout): %s = addf %ga, %gout ; yield %s — accumulate into outs.
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0], vec![3]));
+        ctx.set_value(ops.ssa("%init"), tile(vec![100.0, 200.0, 300.0], vec![3]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgGeneric, &["%x", "%init"]);
+        let op = ops.attr(op, AttrKey::NIns, Attr::Int(1));
+        let bb0 = ops.ssas_attr(&["%ga", "%gout"]);
+        let op = ops.attr(op, AttrKey::Bb0Names, bb0);
+        let body = vec![
+            ops.op(Some("%gs"), OpKind::ArithAddf, &["%ga", "%gout"]),
+            ops.op(None, OpKind::LinalgYield, &["%gs"]),
+        ];
+        let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.as_f32().to_vec(), vec![101.0, 202.0, 303.0]);
     }
 
     #[test]
     fn generic_broadcasts_input_via_indexing_map() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // out [2,3]. input %x shape [3] maps to dim 1 only (indexing_maps "1"),
         // so it broadcasts across rows. addf with the [2,3] outs (all zero).
-        ctx.set_value("%x", tile(vec![10.0, 20.0, 30.0], vec![3]));
-        ctx.set_value("%init", tile(vec![0.0; 6], vec![2, 3]));
-        let mut op = Operation::new(Some("%r"), "linalg.generic", &["%x", "%init"])
-            .with_attr("n_ins", Attr::Int(1))
-            .with_attr("bb0_names", Attr::StrList(vec!["%a".into(), "%out".into()]))
-            .with_attr(
-                "indexing_maps",
-                Attr::StrList(vec!["1".into(), "0,1".into()]),
-            );
-        op.regions.push(vec![
-            Operation::new(Some("%s"), "arith.addf", &["%a", "%out"]),
-            Operation::new(None, "linalg.yield", &["%s"]),
-        ]);
+        ctx.set_value(ops.ssa("%x"), tile(vec![10.0, 20.0, 30.0], vec![3]));
+        ctx.set_value(ops.ssa("%init"), tile(vec![0.0; 6], vec![2, 3]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgGeneric, &["%x", "%init"]);
+        let op = ops.attr(op, AttrKey::NIns, Attr::Int(1));
+        let bb0 = ops.ssas_attr(&["%ga", "%gout"]);
+        let op = ops.attr(op, AttrKey::Bb0Names, bb0);
+        let idx = ops.str_list(&["1", "0,1"]);
+        let op = ops.attr(op, AttrKey::IndexingMaps, idx);
+        let body = vec![
+            ops.op(Some("%gs"), OpKind::ArithAddf, &["%ga", "%gout"]),
+            ops.op(None, OpKind::LinalgYield, &["%gs"]),
+        ];
+        let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
-        let t = get_tile(&ctx, "%r");
+        let t = get_tile(&ctx, r);
         assert_eq!(t.shape, vec![2, 3]);
         // Each row is [10,20,30].
         assert_eq!(
@@ -2048,29 +2118,33 @@ mod tests {
 
     #[test]
     fn generic_yield_passthrough() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
         // body just yields the input arg unchanged.
-        ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
-        ctx.set_value("%init", tile(vec![0.0; 4], vec![2, 2]));
-        let mut op = Operation::new(Some("%r"), "linalg.generic", &["%x", "%init"])
-            .with_attr("n_ins", Attr::Int(1))
-            .with_attr("bb0_names", Attr::StrList(vec!["%a".into(), "%out".into()]));
-        op.regions
-            .push(vec![Operation::new(None, "linalg.yield", &["%a"])]);
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value(ops.ssa("%init"), tile(vec![0.0; 4], vec![2, 2]));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgGeneric, &["%x", "%init"]);
+        let op = ops.attr(op, AttrKey::NIns, Attr::Int(1));
+        let bb0 = ops.ssas_attr(&["%ga", "%gout"]);
+        let op = ops.attr(op, AttrKey::Bb0Names, bb0);
+        let body = vec![ops.op(None, OpKind::LinalgYield, &["%ga"])];
+        let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
         assert_eq!(
-            get_tile(&ctx, "%r").as_f32().to_vec(),
+            get_tile(&ctx, r).as_f32().to_vec(),
             vec![1.0, 2.0, 3.0, 4.0]
         );
     }
 
     #[test]
     fn generic_requires_bb0_names() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value("%x", tile(vec![1.0], vec![1]));
-        ctx.set_value("%init", tile(vec![0.0], vec![1]));
-        let op = Operation::new(Some("%r"), "linalg.generic", &["%x", "%init"])
-            .with_attr("n_ins", Attr::Int(1));
+        ctx.set_value(ops.ssa("%x"), tile(vec![1.0], vec![1]));
+        ctx.set_value(ops.ssa("%init"), tile(vec![0.0], vec![1]));
+        let op = ops.op(Some("%r"), OpKind::LinalgGeneric, &["%x", "%init"]);
+        let op = ops.attr(op, AttrKey::NIns, Attr::Int(1));
         // No region, no bb0_names -> error.
         let err = run(&[op], &mut ctx).unwrap_err();
         assert!(err.contains("cannot determine bb0"));
@@ -2080,15 +2154,14 @@ mod tests {
 
     #[test]
     fn index_builds_arange() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value(
-            SHAPE_KEY,
-            Value::Tuple(vec![Value::Index(2), Value::Index(3)]),
-        );
+        ctx.push_index_shape(vec![2, 3]);
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
-        let op = Operation::new(Some("%i"), "linalg.index", &[]).with_attr("dim", Attr::Int(1));
+        let op = ops.op(Some("%i"), OpKind::LinalgIndex, &[]);
+        let op = ops.attr(op, AttrKey::Dim, Attr::Int(1));
         let v = super::index(&op, &mut ctx, &env).unwrap().unwrap();
         match v {
             Value::Tile(t) => {
@@ -2102,15 +2175,14 @@ mod tests {
 
     #[test]
     fn index_dim0() {
+        let mut ops = Ops::new();
         let mut ctx = single_core_context();
-        ctx.set_value(
-            SHAPE_KEY,
-            Value::Tuple(vec![Value::Index(4), Value::Index(2)]),
-        );
+        ctx.push_index_shape(vec![4, 2]);
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
-        let op = Operation::new(Some("%i"), "linalg.index", &[]).with_attr("dim", Attr::Int(0));
+        let op = ops.op(Some("%i"), OpKind::LinalgIndex, &[]);
+        let op = ops.attr(op, AttrKey::Dim, Attr::Int(0));
         let v = super::index(&op, &mut ctx, &env).unwrap().unwrap();
         match v {
             Value::Tile(t) => {

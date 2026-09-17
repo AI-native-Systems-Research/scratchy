@@ -412,482 +412,6 @@ fn scalar_i64(v: &Value, ctx: &str) -> Result<i64, String> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
-    use crate::dialects::Dispatch;
-    use crate::env::{ExecutionEnv, GridExecutor};
-    use crate::interpreter::{execute_ops, single_core_context};
-    use crate::memref::{CoordinateSet, MemorySpace};
-    use std::rc::Rc;
-
-    fn run_on(
-        ops: &[Operation],
-        ctx: &mut CoreContext,
-        grid: (usize, usize, usize),
-    ) -> Result<(), String> {
-        let dispatch = Dispatch::new();
-        let grid = GridExecutor::new(grid);
-        let env = ExecutionEnv::new(&dispatch, &grid);
-        execute_ops(ops, ctx, &env)
-    }
-
-    /// Inclusive box `[lo, hi]` as an `AffineSet` over `lo.len()` dims:
-    /// for each axis i, `d_i - lo_i >= 0` and `hi_i - d_i >= 0`.
-    fn box_set(lo: &[i64], hi: &[i64]) -> AffineSet {
-        let mut constraints = Vec::new();
-        for i in 0..lo.len() {
-            constraints.push(Constraint {
-                expr: AffineExpr::Sub(
-                    Rc::new(AffineExpr::Dim(i)),
-                    Rc::new(AffineExpr::Const(lo[i])),
-                ),
-                kind: ConstraintKind::GreaterEq,
-            });
-            constraints.push(Constraint {
-                expr: AffineExpr::Sub(
-                    Rc::new(AffineExpr::Const(hi[i])),
-                    Rc::new(AffineExpr::Dim(i)),
-                ),
-                kind: ConstraintKind::GreaterEq,
-            });
-        }
-        AffineSet {
-            num_dims: lo.len(),
-            num_syms: 0,
-            constraints,
-        }
-    }
-
-    fn hbm_part(base_stick: i64, lo: &[i64], hi: &[i64]) -> MemRef {
-        MemRef {
-            base_ptr: base_stick,
-            shape: vec![4, 4],
-            strides: vec![4, 1],
-            space: MemorySpace::Hbm,
-            dtype: DType::F16,
-            coordinate_set: Some(box_set(lo, hi)),
-        }
-    }
-
-    fn lx_view(shape: Vec<usize>) -> MemRef {
-        MemRef {
-            base_ptr: 0,
-            shape,
-            strides: vec![1],
-            space: MemorySpace::Lx { core_id: None },
-            dtype: DType::F16,
-            coordinate_set: None,
-        }
-    }
-
-    fn vss_2d() -> AffineSet {
-        // 2-d variable space, trivially satisfiable constraint.
-        AffineSet {
-            num_dims: 2,
-            num_syms: 0,
-            constraints: vec![Constraint {
-                expr: AffineExpr::Dim(0),
-                kind: ConstraintKind::GreaterEq,
-            }],
-        }
-    }
-
-    // --- get_compute_tile_id -------------------------------------------------
-
-    #[test]
-    fn compute_tile_id_single_returns_grid_x() {
-        // core 5 in a (4,2,1) grid => x = 5 % 4 = 1.
-        let g = GridExecutor::new((4, 2, 1));
-        let (gx, gy, gz) = g.linear_to_grid(5);
-        let mut ctx = single_core_context();
-        ctx.grid_pos = (gx, gy, gz);
-
-        let op = Operation::new(Some("%g"), "ktdp.get_compute_tile_id", &[]);
-        run_on(&[op], &mut ctx, (4, 2, 1)).unwrap();
-        match ctx.get_value("%g").unwrap() {
-            Value::Index(i) => assert_eq!(*i, gx as i64),
-            other => panic!("expected Index, got {other:?}"),
-        }
-        assert_eq!(gx, 1);
-    }
-
-    #[test]
-    fn compute_tile_id_multi_returns_tuple_of_coords() {
-        let mut ctx = single_core_context();
-        ctx.grid_pos = (1, 2, 3);
-        let op = Operation::new(Some("%g"), "ktdp.get_compute_tile_id", &[])
-            .with_attr("num_results", Attr::Int(3));
-        run_on(&[op], &mut ctx, (4, 4, 4)).unwrap();
-        match ctx.get_value("%g").unwrap() {
-            Value::Tuple(t) => {
-                let got: Vec<i64> = t
-                    .iter()
-                    .map(|v| match v {
-                        Value::Index(i) => *i,
-                        o => panic!("expected Index, got {o:?}"),
-                    })
-                    .collect();
-                assert_eq!(got, vec![1, 2, 3]);
-            }
-            other => panic!("expected Tuple, got {other:?}"),
-        }
-    }
-
-    // --- coreid -------------------------------------------------------------
-
-    #[test]
-    fn coreid_wildcard_x_returns_full_row() {
-        // grid (4, 2, 1); mask (-1, 1, 0) => all x with y=1, z=0.
-        let mut ctx = single_core_context();
-        ctx.set_value("%x", Value::Index(-1));
-        ctx.set_value("%y", Value::Index(1));
-        ctx.set_value("%z", Value::Index(0));
-        let op = Operation::new(Some("%ids"), "ktdp.coreid", &["%x", "%y", "%z"]);
-        run_on(&[op], &mut ctx, (4, 2, 1)).unwrap();
-
-        // y=1 => linear ids 4,5,6,7 (z*(nx*ny)+y*nx+x = 0 + 4 + x).
-        let g = GridExecutor::new((4, 2, 1));
-        let expect: Vec<i64> = (0..4).map(|x| g.grid_to_linear(x, 1, 0) as i64).collect();
-        match ctx.get_value("%ids").unwrap() {
-            Value::Tuple(t) => {
-                let got: Vec<i64> = t
-                    .iter()
-                    .map(|v| match v {
-                        Value::Index(i) => *i,
-                        o => panic!("expected Index, got {o:?}"),
-                    })
-                    .collect();
-                assert_eq!(got, expect);
-                assert_eq!(got, vec![4, 5, 6, 7]);
-            }
-            other => panic!("expected Tuple, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn coreid_exact_match_is_single_core() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%x", Value::Index(2));
-        ctx.set_value("%y", Value::Index(0));
-        let op = Operation::new(Some("%ids"), "ktdp.coreid", &["%x", "%y"]);
-        // only 2 operands: padded to (2, 0, 0).
-        run_on(&[op], &mut ctx, (4, 2, 1)).unwrap();
-        match ctx.get_value("%ids").unwrap() {
-            Value::Tuple(t) => {
-                assert_eq!(t.len(), 1);
-                // grid_to_linear(2, 0, 0) = 2.
-                assert!(matches!(t[0], Value::Index(2)));
-            }
-            other => panic!("expected Tuple, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn coreid_all_wildcards_returns_every_core() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%x", Value::Index(-1));
-        ctx.set_value("%y", Value::Index(-1));
-        ctx.set_value("%z", Value::Index(-1));
-        let op = Operation::new(Some("%ids"), "ktdp.coreid", &["%x", "%y", "%z"]);
-        run_on(&[op], &mut ctx, (2, 2, 1)).unwrap();
-        match ctx.get_value("%ids").unwrap() {
-            Value::Tuple(t) => assert_eq!(t.len(), 4),
-            other => panic!("expected Tuple, got {other:?}"),
-        }
-    }
-
-    // --- construct_distributed_memory_view ----------------------------------
-
-    #[test]
-    fn distributed_view_composes_partitions() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%a", Value::MemRef(hbm_part(0, &[0, 0], &[3, 3])));
-        ctx.set_value("%b", Value::MemRef(hbm_part(16, &[4, 0], &[7, 3])));
-
-        let op = Operation::new(
-            Some("%R"),
-            "ktdp.construct_distributed_memory_view",
-            &["%a", "%b"],
-        )
-        .with_attr("shape", Attr::IntList(vec![8, 4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
-        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
-
-        match ctx.get_value("%R").unwrap() {
-            Value::DistMemRef(d) => {
-                assert_eq!(d.partitions.len(), 2);
-                assert_eq!(d.shape, vec![8, 4]);
-                assert_eq!(d.dtype, DType::F16);
-                // partition routing: global coord [1,1] -> partition 0.
-                let (i0, _) = d.find_partition(&[1, 1], &[]).unwrap();
-                assert_eq!(i0, 0);
-                // global coord [5,1] -> partition 1.
-                let (i1, _) = d.find_partition(&[5, 1], &[]).unwrap();
-                assert_eq!(i1, 1);
-            }
-            other => panic!("expected DistMemRef, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn distributed_view_rejects_non_memref_operand() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%a", Value::MemRef(hbm_part(0, &[0, 0], &[3, 3])));
-        ctx.set_value("%b", Value::Index(7));
-        let op = Operation::new(
-            Some("%R"),
-            "ktdp.construct_distributed_memory_view",
-            &["%a", "%b"],
-        )
-        .with_attr("shape", Attr::IntList(vec![8, 4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
-        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
-        assert!(err.contains("expected MemRef"));
-    }
-
-    #[test]
-    fn distributed_view_requires_coordinate_set() {
-        // A partition without a coordinate_set is rejected by DistributedMemRef::new.
-        let mut ctx = single_core_context();
-        let mut p = hbm_part(0, &[0, 0], &[3, 3]);
-        p.coordinate_set = None;
-        ctx.set_value("%a", Value::MemRef(p));
-        let op = Operation::new(
-            Some("%R"),
-            "ktdp.construct_distributed_memory_view",
-            &["%a"],
-        )
-        .with_attr("shape", Attr::IntList(vec![4, 4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
-        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
-        assert!(err.contains("coordinate_set"));
-    }
-
-    #[test]
-    fn distributed_view_dtype_mismatch_is_rejected() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%a", Value::MemRef(hbm_part(0, &[0, 0], &[3, 3])));
-        let op = Operation::new(
-            Some("%R"),
-            "ktdp.construct_distributed_memory_view",
-            &["%a"],
-        )
-        .with_attr("shape", Attr::IntList(vec![4, 4]))
-        // partition is f16 but the view claims f32.
-        .with_attr("dtype", Attr::Str("f32".into()));
-        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
-        assert!(err.contains("dtype"));
-    }
-
-    // --- construct_indirect_access_tile -------------------------------------
-
-    #[test]
-    fn indirect_tile_builds_descriptor() {
-        // X[ind(IDX[%m,%k]), (%k)] over intermediate vars (%m, %k).
-        let mut ctx = single_core_context();
-        ctx.set_value("%X", Value::MemRef(lx_view(vec![16, 16])));
-        ctx.set_value("%IDX", Value::MemRef(lx_view(vec![4, 4])));
-
-        let op = Operation::new(
-            Some("%t"),
-            "ktdp.construct_indirect_access_tile",
-            &["%X", "%IDX"],
-        )
-        .with_attr("shape", Attr::IntList(vec![4, 4]))
-        .with_attr("variables_space_set", Attr::AffineSet(vss_2d()))
-        .with_attr(
-            "dim_kinds",
-            Attr::StrList(vec!["indirect".into(), "direct".into()]),
-        )
-        // dim 0: indirect via index_view 0; dim 1: direct via var index 1.
-        .with_attr("dim_data", Attr::IntList(vec![0, 1]));
-
-        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
-
-        match ctx.get_value("%t").unwrap() {
-            Value::IndirectAccessTile(iat) => {
-                assert_eq!(iat.shape, vec![4, 4]);
-                assert_eq!(iat.index_views.len(), 1);
-                assert_eq!(iat.dim_subscripts.len(), 2);
-                assert!(matches!(
-                    iat.dim_subscripts[0],
-                    DimSubscript::Indirect { view: 0, .. }
-                ));
-                assert!(matches!(
-                    iat.dim_subscripts[1],
-                    DimSubscript::Direct { var_index: 1 }
-                ));
-                assert!(iat.variables_space_order.is_none());
-                assert_eq!(iat.parent_ref.shape, vec![16, 16]);
-            }
-            other => panic!("expected IndirectAccessTile, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn indirect_tile_direct_expr_pulls_map() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%X", Value::MemRef(lx_view(vec![16])));
-
-        let op = Operation::new(Some("%t"), "ktdp.construct_indirect_access_tile", &["%X"])
-            .with_attr("shape", Attr::IntList(vec![4]))
-            .with_attr("variables_space_set", Attr::AffineSet(vss_2d()))
-            .with_attr("dim_kinds", Attr::StrList(vec!["direct_expr".into()]))
-            .with_attr("dim_data", Attr::IntList(vec![0]))
-            .with_attr("dim_map_0", Attr::AffineMap(AffineMap::identity(1)));
-
-        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
-        match ctx.get_value("%t").unwrap() {
-            Value::IndirectAccessTile(iat) => {
-                assert_eq!(iat.dim_subscripts.len(), 1);
-                match &iat.dim_subscripts[0] {
-                    DimSubscript::DirectExpr { map } => assert!(map.is_identity()),
-                    other => panic!("expected DirectExpr, got {other:?}"),
-                }
-            }
-            other => panic!("expected IndirectAccessTile, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn indirect_tile_nonidentity_order_is_kept() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%X", Value::MemRef(lx_view(vec![16, 16])));
-        ctx.set_value("%IDX", Value::MemRef(lx_view(vec![4, 4])));
-
-        // swap order (d0,d1) -> (d1,d0) is not identity, so it must be retained.
-        let swap = AffineMap {
-            num_dims: 2,
-            num_syms: 0,
-            exprs: vec![AffineExpr::Dim(1), AffineExpr::Dim(0)],
-        };
-        let op = Operation::new(
-            Some("%t"),
-            "ktdp.construct_indirect_access_tile",
-            &["%X", "%IDX"],
-        )
-        .with_attr("shape", Attr::IntList(vec![4, 4]))
-        .with_attr("variables_space_set", Attr::AffineSet(vss_2d()))
-        .with_attr("variables_space_order", Attr::AffineMap(swap.clone()))
-        .with_attr(
-            "dim_kinds",
-            Attr::StrList(vec!["indirect".into(), "direct".into()]),
-        )
-        .with_attr("dim_data", Attr::IntList(vec![0, 1]));
-
-        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
-        match ctx.get_value("%t").unwrap() {
-            Value::IndirectAccessTile(iat) => {
-                assert_eq!(iat.variables_space_order.as_ref().unwrap(), &swap);
-            }
-            other => panic!("expected IndirectAccessTile, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn indirect_tile_identity_order_normalized_to_none() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%X", Value::MemRef(lx_view(vec![16])));
-        let op = Operation::new(Some("%t"), "ktdp.construct_indirect_access_tile", &["%X"])
-            .with_attr("shape", Attr::IntList(vec![4]))
-            .with_attr("variables_space_set", Attr::AffineSet(vss_2d()))
-            .with_attr(
-                "variables_space_order",
-                Attr::AffineMap(AffineMap::identity(2)),
-            )
-            .with_attr("dim_kinds", Attr::StrList(vec!["direct".into()]))
-            .with_attr("dim_data", Attr::IntList(vec![0]));
-        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
-        match ctx.get_value("%t").unwrap() {
-            Value::IndirectAccessTile(iat) => assert!(iat.variables_space_order.is_none()),
-            other => panic!("expected IndirectAccessTile, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn indirect_tile_rejects_unknown_kind() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%X", Value::MemRef(lx_view(vec![16])));
-        let op = Operation::new(Some("%t"), "ktdp.construct_indirect_access_tile", &["%X"])
-            .with_attr("shape", Attr::IntList(vec![4]))
-            .with_attr("variables_space_set", Attr::AffineSet(vss_2d()))
-            .with_attr("dim_kinds", Attr::StrList(vec!["bogus".into()]));
-        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
-        assert!(err.contains("unknown kind"));
-    }
-
-    #[test]
-    fn indirect_tile_dim_kinds_count_must_match_shape() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%X", Value::MemRef(lx_view(vec![16, 16])));
-        let op = Operation::new(Some("%t"), "ktdp.construct_indirect_access_tile", &["%X"])
-            .with_attr("shape", Attr::IntList(vec![4, 4]))
-            .with_attr("variables_space_set", Attr::AffineSet(vss_2d()))
-            // one kind but shape has two dims.
-            .with_attr("dim_kinds", Attr::StrList(vec!["direct".into()]))
-            .with_attr("dim_data", Attr::IntList(vec![0]));
-        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
-        assert!(err.contains("dim_kinds"));
-    }
-
-    #[test]
-    fn indirect_tile_rejects_non_memref_parent() {
-        let mut ctx = single_core_context();
-        ctx.set_value("%X", Value::Index(3));
-        let op = Operation::new(Some("%t"), "ktdp.construct_indirect_access_tile", &["%X"])
-            .with_attr("shape", Attr::IntList(vec![4]))
-            .with_attr("variables_space_set", Attr::AffineSet(vss_2d()))
-            .with_attr("dim_kinds", Attr::StrList(vec!["direct".into()]));
-        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
-        assert!(err.contains("expected MemRef"));
-    }
-
-    #[test]
-    fn coordinate_set_import_surface_is_available() {
-        // Smoke test that CoordinateSet is the right import surface for memref.
-        let cs = CoordinateSet::Points(vec![vec![0, 0]]);
-        assert!(matches!(cs, CoordinateSet::Points(_)));
-    }
-
-    #[test]
-    fn subscript_parses_floordiv_and_mod() {
-        // The paged-tensor-copy fixture indexes pages via `%tkv floordiv 64`
-        // and tokens within a page via `%tkv mod 64`. These are MLIR-affine
-        // multiplicative-precedence ops (Euclidean). Bind `%tkv` as the sole
-        // iteration var (Dim 0) and evaluate at a few points.
-        let ctx = single_core_context();
-        let vars = vec!["tkv".to_string()];
-        let fd = parse_sub_expr("%tkv floordiv 64", &vars, &ctx).unwrap();
-        let md = parse_sub_expr("%tkv mod 64", &vars, &ctx).unwrap();
-        for tkv in [0i64, 63, 64, 130, 2047] {
-            assert_eq!(
-                fd.expr.eval(&[tkv], &fd.syms),
-                tkv.div_euclid(64),
-                "floordiv at tkv={tkv}"
-            );
-            assert_eq!(
-                md.expr.eval(&[tkv], &md.syms),
-                tkv.rem_euclid(64),
-                "mod at tkv={tkv}"
-            );
-        }
-    }
-
-    #[test]
-    fn subscript_floordiv_mod_bind_tighter_than_add() {
-        // `%a + %b floordiv 4` parses as `%a + (%b floordiv 4)` (mul-precedence),
-        // not `(%a + %b) floordiv 4`.
-        let ctx = single_core_context();
-        let vars = vec!["a".to_string(), "b".to_string()];
-        let e = parse_sub_expr("%a + %b floordiv 4", &vars, &ctx).unwrap();
-        // a=1, b=7 -> 1 + (7 floordiv 4) = 1 + 1 = 2 (NOT (1+7) floordiv 4 = 2…
-        // pick values that distinguish: a=1,b=10 -> 1 + 2 = 3 vs 11//4 = 2).
-        assert_eq!(e.expr.eval(&[1, 10], &e.syms), 3);
-    }
-}
-
 /// Split an indirect-access subscript into tokens.
 ///
 /// This came from `ktir-core`'s affine TEXT PARSER, which is deleted — KTIR is constructed, never
@@ -972,4 +496,476 @@ pub fn tokenise(text: &str) -> Vec<String> {
 
 fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::affine::{AffineExpr, AffineSet, Constraint, ConstraintKind};
+    use crate::dialects::Dispatch;
+    use crate::env::{ExecutionEnv, GridExecutor};
+    use crate::interpreter::{execute_ops, single_core_context};
+    use crate::memref::{CoordinateSet, MemorySpace};
+    use crate::test_support::Ops;
+
+    fn run_on(
+        ops: &[Operation<'static>],
+        ctx: &mut CoreContext,
+        grid: (usize, usize, usize),
+    ) -> Result<(), String> {
+        let dispatch = Dispatch::new();
+        let grid = GridExecutor::new(grid);
+        let env = ExecutionEnv::new(&dispatch, &grid);
+        execute_ops(ops, ctx, &env)
+    }
+
+    fn hbm_part(ops: &Ops, base_stick: i64, lo: &[i64], hi: &[i64]) -> MemRef {
+        MemRef {
+            base_ptr: base_stick,
+            shape: vec![4, 4],
+            strides: vec![4, 1],
+            space: MemorySpace::Hbm,
+            dtype: DType::F16,
+            coordinate_set: Some(ops.box_set(lo, hi)),
+        }
+    }
+
+    fn lx_view(shape: Vec<usize>) -> MemRef {
+        MemRef {
+            base_ptr: 0,
+            shape,
+            strides: vec![1],
+            space: MemorySpace::Lx { core_id: None },
+            dtype: DType::F16,
+            coordinate_set: None,
+        }
+    }
+
+    /// 2-d variable space, trivially satisfiable constraint.
+    fn vss_2d(ops: &Ops) -> AffineSet<'static> {
+        AffineSet {
+            num_dims: 2,
+            num_syms: 0,
+            constraints: ops.arena().constraints(vec![Constraint {
+                expr: AffineExpr::Dim(0),
+                kind: ConstraintKind::GreaterEq,
+            }]),
+        }
+    }
+
+    // --- get_compute_tile_id -------------------------------------------------
+
+    #[test]
+    fn compute_tile_id_single_returns_grid_x() {
+        // core 5 in a (4,2,1) grid => x = 5 % 4 = 1.
+        let g = GridExecutor::new((4, 2, 1));
+        let (gx, gy, gz) = g.linear_to_grid(5);
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.grid_pos = (gx, gy, gz);
+
+        let g_ssa = ops.ssa("%g");
+        let op = ops.op(Some("%g"), OpKind::KtdpGetComputeTileId, &[]);
+        run_on(&[op], &mut ctx, (4, 2, 1)).unwrap();
+        match ctx.get_value(g_ssa).unwrap() {
+            Value::Index(i) => assert_eq!(*i, gx as i64),
+            other => panic!("expected Index, got {other:?}"),
+        }
+        assert_eq!(gx, 1);
+    }
+
+    #[test]
+    fn compute_tile_id_multi_returns_tuple_of_coords() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.grid_pos = (1, 2, 3);
+        let g = ops.ssa("%g");
+        let op = ops.op(Some("%g"), OpKind::KtdpGetComputeTileId, &[]);
+        let op = ops.attr(op, AttrKey::NumResults, Attr::Int(3));
+        run_on(&[op], &mut ctx, (4, 4, 4)).unwrap();
+        match ctx.get_value(g).unwrap() {
+            Value::Tuple(t) => {
+                let got: Vec<i64> = t
+                    .iter()
+                    .map(|v| match v {
+                        Value::Index(i) => *i,
+                        o => panic!("expected Index, got {o:?}"),
+                    })
+                    .collect();
+                assert_eq!(got, vec![1, 2, 3]);
+            }
+            other => panic!("expected Tuple, got {other:?}"),
+        }
+    }
+
+    // --- coreid -------------------------------------------------------------
+
+    #[test]
+    fn coreid_wildcard_x_returns_full_row() {
+        // grid (4, 2, 1); mask (-1, 1, 0) => all x with y=1, z=0.
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%x"), Value::Index(-1));
+        ctx.set_value(ops.ssa("%y"), Value::Index(1));
+        ctx.set_value(ops.ssa("%z"), Value::Index(0));
+        let ids = ops.ssa("%ids");
+        let op = ops.op(Some("%ids"), OpKind::KtdpCoreid, &["%x", "%y", "%z"]);
+        run_on(&[op], &mut ctx, (4, 2, 1)).unwrap();
+
+        // y=1 => linear ids 4,5,6,7 (z*(nx*ny)+y*nx+x = 0 + 4 + x).
+        let g = GridExecutor::new((4, 2, 1));
+        let expect: Vec<i64> = (0..4).map(|x| g.grid_to_linear(x, 1, 0) as i64).collect();
+        match ctx.get_value(ids).unwrap() {
+            Value::Tuple(t) => {
+                let got: Vec<i64> = t
+                    .iter()
+                    .map(|v| match v {
+                        Value::Index(i) => *i,
+                        o => panic!("expected Index, got {o:?}"),
+                    })
+                    .collect();
+                assert_eq!(got, expect);
+                assert_eq!(got, vec![4, 5, 6, 7]);
+            }
+            other => panic!("expected Tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coreid_exact_match_is_single_core() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%x"), Value::Index(2));
+        ctx.set_value(ops.ssa("%y"), Value::Index(0));
+        let ids = ops.ssa("%ids");
+        let op = ops.op(Some("%ids"), OpKind::KtdpCoreid, &["%x", "%y"]);
+        // only 2 operands: padded to (2, 0, 0).
+        run_on(&[op], &mut ctx, (4, 2, 1)).unwrap();
+        match ctx.get_value(ids).unwrap() {
+            Value::Tuple(t) => {
+                assert_eq!(t.len(), 1);
+                // grid_to_linear(2, 0, 0) = 2.
+                assert!(matches!(t[0], Value::Index(2)));
+            }
+            other => panic!("expected Tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coreid_all_wildcards_returns_every_core() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%x"), Value::Index(-1));
+        ctx.set_value(ops.ssa("%y"), Value::Index(-1));
+        ctx.set_value(ops.ssa("%z"), Value::Index(-1));
+        let ids = ops.ssa("%ids");
+        let op = ops.op(Some("%ids"), OpKind::KtdpCoreid, &["%x", "%y", "%z"]);
+        run_on(&[op], &mut ctx, (2, 2, 1)).unwrap();
+        match ctx.get_value(ids).unwrap() {
+            Value::Tuple(t) => assert_eq!(t.len(), 4),
+            other => panic!("expected Tuple, got {other:?}"),
+        }
+    }
+
+    // --- construct_distributed_memory_view ----------------------------------
+
+    #[test]
+    fn distributed_view_composes_partitions() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        let a_part = hbm_part(&ops, 0, &[0, 0], &[3, 3]);
+        ctx.set_value(ops.ssa("%a"), Value::MemRef(a_part));
+        let b_part = hbm_part(&ops, 16, &[4, 0], &[7, 3]);
+        ctx.set_value(ops.ssa("%b"), Value::MemRef(b_part));
+
+        let r = ops.ssa("%R");
+        let op = ops.op(
+            Some("%R"),
+            OpKind::KtdpConstructDistributedMemoryView,
+            &["%a", "%b"],
+        );
+        let shape = ops.int_list(vec![8, 4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
+
+        match ctx.get_value(r).unwrap() {
+            Value::DistMemRef(d) => {
+                assert_eq!(d.partitions.len(), 2);
+                assert_eq!(d.shape, vec![8, 4]);
+                assert_eq!(d.dtype, DType::F16);
+                // partition routing: global coord [1,1] -> partition 0.
+                let (i0, _) = d.find_partition(&[1, 1], &[]).unwrap();
+                assert_eq!(i0, 0);
+                // global coord [5,1] -> partition 1.
+                let (i1, _) = d.find_partition(&[5, 1], &[]).unwrap();
+                assert_eq!(i1, 1);
+            }
+            other => panic!("expected DistMemRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distributed_view_rejects_non_memref_operand() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        let a_part = hbm_part(&ops, 0, &[0, 0], &[3, 3]);
+        ctx.set_value(ops.ssa("%a"), Value::MemRef(a_part));
+        ctx.set_value(ops.ssa("%b"), Value::Index(7));
+        let op = ops.op(
+            Some("%R"),
+            OpKind::KtdpConstructDistributedMemoryView,
+            &["%a", "%b"],
+        );
+        let shape = ops.int_list(vec![8, 4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
+        assert!(err.contains("expected MemRef"));
+    }
+
+    #[test]
+    fn distributed_view_requires_coordinate_set() {
+        // A partition without a coordinate_set is rejected by DistributedMemRef::new.
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        let mut p = hbm_part(&ops, 0, &[0, 0], &[3, 3]);
+        p.coordinate_set = None;
+        ctx.set_value(ops.ssa("%a"), Value::MemRef(p));
+        let op = ops.op(
+            Some("%R"),
+            OpKind::KtdpConstructDistributedMemoryView,
+            &["%a"],
+        );
+        let shape = ops.int_list(vec![4, 4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
+        assert!(err.contains("coordinate_set"));
+    }
+
+    #[test]
+    fn distributed_view_dtype_mismatch_is_rejected() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        let a_part = hbm_part(&ops, 0, &[0, 0], &[3, 3]);
+        ctx.set_value(ops.ssa("%a"), Value::MemRef(a_part));
+        let op = ops.op(
+            Some("%R"),
+            OpKind::KtdpConstructDistributedMemoryView,
+            &["%a"],
+        );
+        let shape = ops.int_list(vec![4, 4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        // partition is f16 but the view claims f32.
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Dtype(DType::F32));
+        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
+        assert!(err.contains("dtype"));
+    }
+
+    // --- construct_indirect_access_tile -------------------------------------
+
+    #[test]
+    fn indirect_tile_builds_descriptor() {
+        // X[ind(IDX[%m,%k]), (%k)] over intermediate vars (%m, %k).
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%X"), Value::MemRef(lx_view(vec![16, 16])));
+        ctx.set_value(ops.ssa("%IDX"), Value::MemRef(lx_view(vec![4, 4])));
+
+        let t = ops.ssa("%t");
+        let op = ops.op(
+            Some("%t"),
+            OpKind::KtdpConstructIndirectAccessTile,
+            &["%X", "%IDX"],
+        );
+        let shape = ops.int_list(vec![4, 4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let vss = vss_2d(&ops);
+        let op = ops.attr(op, AttrKey::VariablesSpaceSet, Attr::AffineSet(vss));
+        let kinds = ops.str_list(&["indirect", "direct"]);
+        let op = ops.attr(op, AttrKey::DimKinds, kinds);
+        // dim 0: indirect via index_view 0; dim 1: direct via var index 1.
+        let data = ops.int_list(vec![0, 1]);
+        let op = ops.attr(op, AttrKey::DimData, data);
+
+        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
+
+        match ctx.get_value(t).unwrap() {
+            Value::IndirectAccessTile(iat) => {
+                assert_eq!(iat.shape, vec![4, 4]);
+                assert_eq!(iat.index_views.len(), 1);
+                assert_eq!(iat.dim_subscripts.len(), 2);
+                assert!(matches!(
+                    iat.dim_subscripts[0],
+                    DimSubscript::Indirect { view: 0, .. }
+                ));
+                assert!(matches!(
+                    iat.dim_subscripts[1],
+                    DimSubscript::Direct { var_index: 1 }
+                ));
+                assert!(iat.variables_space_order.is_none());
+                assert_eq!(iat.parent_ref.shape, vec![16, 16]);
+            }
+            other => panic!("expected IndirectAccessTile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indirect_tile_direct_expr_pulls_map() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%X"), Value::MemRef(lx_view(vec![16])));
+
+        let t = ops.ssa("%t");
+        let op = ops.op(Some("%t"), OpKind::KtdpConstructIndirectAccessTile, &["%X"]);
+        let shape = ops.int_list(vec![4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let vss = vss_2d(&ops);
+        let op = ops.attr(op, AttrKey::VariablesSpaceSet, Attr::AffineSet(vss));
+        let kinds = ops.str_list(&["direct_expr"]);
+        let op = ops.attr(op, AttrKey::DimKinds, kinds);
+        let data = ops.int_list(vec![0]);
+        let op = ops.attr(op, AttrKey::DimData, data);
+        let op = ops.attr(op, AttrKey::DimMap0, Attr::AffineMap(ops.identity_map(1)));
+
+        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
+        match ctx.get_value(t).unwrap() {
+            Value::IndirectAccessTile(iat) => {
+                assert_eq!(iat.dim_subscripts.len(), 1);
+                match &iat.dim_subscripts[0] {
+                    DimSubscript::DirectExpr { map } => assert!(map.is_identity()),
+                    other => panic!("expected DirectExpr, got {other:?}"),
+                }
+            }
+            other => panic!("expected IndirectAccessTile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indirect_tile_nonidentity_order_is_kept() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%X"), Value::MemRef(lx_view(vec![16, 16])));
+        ctx.set_value(ops.ssa("%IDX"), Value::MemRef(lx_view(vec![4, 4])));
+
+        // swap order (d0,d1) -> (d1,d0) is not identity, so it must be retained.
+        let swap = ops.perm_map(2, &[1, 0]);
+        let t = ops.ssa("%t");
+        let op = ops.op(
+            Some("%t"),
+            OpKind::KtdpConstructIndirectAccessTile,
+            &["%X", "%IDX"],
+        );
+        let shape = ops.int_list(vec![4, 4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let vss = vss_2d(&ops);
+        let op = ops.attr(op, AttrKey::VariablesSpaceSet, Attr::AffineSet(vss));
+        let op = ops.attr(
+            op,
+            AttrKey::VariablesSpaceOrder,
+            Attr::AffineMap(swap.clone()),
+        );
+        let kinds = ops.str_list(&["indirect", "direct"]);
+        let op = ops.attr(op, AttrKey::DimKinds, kinds);
+        let data = ops.int_list(vec![0, 1]);
+        let op = ops.attr(op, AttrKey::DimData, data);
+
+        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
+        match ctx.get_value(t).unwrap() {
+            Value::IndirectAccessTile(iat) => {
+                assert_eq!(iat.variables_space_order.as_ref().unwrap(), &swap);
+            }
+            other => panic!("expected IndirectAccessTile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indirect_tile_identity_order_normalized_to_none() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%X"), Value::MemRef(lx_view(vec![16])));
+        let t = ops.ssa("%t");
+        let op = ops.op(Some("%t"), OpKind::KtdpConstructIndirectAccessTile, &["%X"]);
+        let shape = ops.int_list(vec![4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let vss = vss_2d(&ops);
+        let op = ops.attr(op, AttrKey::VariablesSpaceSet, Attr::AffineSet(vss));
+        let identity = ops.identity_map(2);
+        let op = ops.attr(op, AttrKey::VariablesSpaceOrder, Attr::AffineMap(identity));
+        let kinds = ops.str_list(&["direct"]);
+        let op = ops.attr(op, AttrKey::DimKinds, kinds);
+        let data = ops.int_list(vec![0]);
+        let op = ops.attr(op, AttrKey::DimData, data);
+        run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
+        match ctx.get_value(t).unwrap() {
+            Value::IndirectAccessTile(iat) => assert!(iat.variables_space_order.is_none()),
+            other => panic!("expected IndirectAccessTile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indirect_tile_rejects_unknown_kind() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%X"), Value::MemRef(lx_view(vec![16])));
+        let op = ops.op(Some("%t"), OpKind::KtdpConstructIndirectAccessTile, &["%X"]);
+        let shape = ops.int_list(vec![4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let vss = vss_2d(&ops);
+        let op = ops.attr(op, AttrKey::VariablesSpaceSet, Attr::AffineSet(vss));
+        let kinds = ops.str_list(&["bogus"]);
+        let op = ops.attr(op, AttrKey::DimKinds, kinds);
+        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
+        assert!(err.contains("unknown kind"));
+    }
+
+    #[test]
+    fn indirect_tile_dim_kinds_count_must_match_shape() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%X"), Value::MemRef(lx_view(vec![16, 16])));
+        let op = ops.op(Some("%t"), OpKind::KtdpConstructIndirectAccessTile, &["%X"]);
+        let shape = ops.int_list(vec![4, 4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let vss = vss_2d(&ops);
+        let op = ops.attr(op, AttrKey::VariablesSpaceSet, Attr::AffineSet(vss));
+        // one kind but shape has two dims.
+        let kinds = ops.str_list(&["direct"]);
+        let op = ops.attr(op, AttrKey::DimKinds, kinds);
+        let data = ops.int_list(vec![0]);
+        let op = ops.attr(op, AttrKey::DimData, data);
+        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
+        assert!(err.contains("dim_kinds"));
+    }
+
+    #[test]
+    fn indirect_tile_rejects_non_memref_parent() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        ctx.set_value(ops.ssa("%X"), Value::Index(3));
+        let op = ops.op(Some("%t"), OpKind::KtdpConstructIndirectAccessTile, &["%X"]);
+        let shape = ops.int_list(vec![4]);
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let vss = vss_2d(&ops);
+        let op = ops.attr(op, AttrKey::VariablesSpaceSet, Attr::AffineSet(vss));
+        let kinds = ops.str_list(&["direct"]);
+        let op = ops.attr(op, AttrKey::DimKinds, kinds);
+        let err = run_on(&[op], &mut ctx, (1, 1, 1)).unwrap_err();
+        assert!(err.contains("expected MemRef"));
+    }
+
+    #[test]
+    fn coordinate_set_import_surface_is_available() {
+        // Smoke test that CoordinateSet is the right import surface for memref.
+        let cs = CoordinateSet::Points(vec![vec![0, 0]]);
+        assert!(matches!(cs, CoordinateSet::Points(_)));
+    }
+
+    // NOTE: the old `subscript_parses_floordiv_and_mod` /
+    // `subscript_floordiv_mod_bind_tighter_than_add` tests exercised
+    // `parse_sub_expr`, a text-expression parser that no longer exists
+    // anywhere in this crate (KTIR is constructed, never parsed) — deleted
+    // along with the rest of the retired textual-MLIR-parser surface, not
+    // ported.
 }

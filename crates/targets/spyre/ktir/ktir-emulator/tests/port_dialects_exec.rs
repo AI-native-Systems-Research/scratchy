@@ -42,6 +42,10 @@
 //! * `arith.bitcast` is not registered in the Rust crate; its three cases are
 //!   noted skipped.
 
+mod common;
+
+use common::Ops;
+use ktir_emulator::attrkey::AttrKey;
 use ktir_emulator::context::CoreContext;
 use ktir_emulator::dialects::Dispatch;
 use ktir_emulator::dtypes::DType;
@@ -49,6 +53,7 @@ use ktir_emulator::env::{ExecutionEnv, GridExecutor};
 use ktir_emulator::interpreter::{execute_op, single_core_context};
 use ktir_emulator::ir::{Attr, Operation, Scalar, Value};
 use ktir_emulator::memory::{STICK_BYTES, SpyreMemoryHierarchy};
+use ktir_emulator::opkind::OpKind;
 use ktir_emulator::tile::Tile;
 use std::rc::Rc;
 
@@ -56,50 +61,66 @@ use std::rc::Rc;
 // Harness
 // ===========================================================================
 
-/// Dispatch a single op's handler directly (the Python `_call` path), seeding
-/// operands first. Returns the produced `Value`.
-fn run_op(op: &Operation, seed: &[(&str, Value)]) -> Value {
-    run_op_try(op, seed).unwrap_or_else(|e| panic!("op {:?} failed: {e}", op.op_type))
+/// Build `%r = kind operands...` and dispatch its handler directly (the Python
+/// `_call` path), seeding operands first. Returns the produced `Value`.
+fn run_op(kind: OpKind, operands: &[&'static str], seed: &[(&'static str, Value)]) -> Value {
+    run_op_try(kind, operands, seed).unwrap_or_else(|e| panic!("op {kind:?} failed: {e}"))
 }
 
 /// Like [`run_op`] but surfaces the handler's `Result` (for error-path cases).
-fn run_op_try(op: &Operation, seed: &[(&str, Value)]) -> Result<Value, String> {
+fn run_op_try(
+    kind: OpKind,
+    operands: &[&'static str],
+    seed: &[(&'static str, Value)],
+) -> Result<Value, String> {
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), kind, operands);
+    run_built_try(&mut ir_ops, &o, seed)
+}
+
+/// Like [`run_op_try`], but against an already-built op (for attr/region-bearing
+/// cases the caller assembled with its own [`Ops`]).
+fn run_built_try(
+    ir_ops: &mut Ops,
+    o: &Operation<'static>,
+    seed: &[(&'static str, Value)],
+) -> Result<Value, String> {
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     for (n, v) in seed {
-        ctx.set_value(n, v.clone());
+        ctx.set_value(ir_ops.ssa(n), v.clone());
     }
     let handler = dispatch
-        .handler(&op.op_type)
-        .unwrap_or_else(|| panic!("no handler for {:?}", op.op_type));
-    handler(op, &mut ctx, &env)
-        .map(|o| o.unwrap_or_else(|| panic!("op {:?} produced no value", op.op_type)))
+        .handler(o.op_type)
+        .unwrap_or_else(|| panic!("no handler for {:?}", o.op_type));
+    handler(o, &mut ctx, &env)
+        .map(|out| out.unwrap_or_else(|| panic!("op {:?} produced no value", o.op_type)))
+}
+
+fn run_built(ir_ops: &mut Ops, o: &Operation<'static>, seed: &[(&'static str, Value)]) -> Value {
+    run_built_try(ir_ops, o, seed).unwrap_or_else(|e| panic!("op {:?} failed: {e}", o.op_type))
 }
 
 /// Run a region-bodied op through `execute_op`, which threads nested ops through
 /// the real registry (the Python `_exec_region` override). Returns the produced
 /// value.
-fn run_op_execute(op: &Operation, seed: &[(&str, Value)]) -> Value {
+fn run_op_execute(
+    ir_ops: &mut Ops,
+    o: &Operation<'static>,
+    seed: &[(&'static str, Value)],
+) -> Value {
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     for (n, v) in seed {
-        ctx.set_value(n, v.clone());
+        ctx.set_value(ir_ops.ssa(n), v.clone());
     }
-    execute_op(op, &mut ctx, &env)
-        .unwrap_or_else(|e| panic!("execute_op {:?} failed: {e}", op.op_type))
-        .unwrap_or_else(|| panic!("op {:?} produced no value", op.op_type))
-}
-
-fn op(name: &str, operands: &[&str]) -> Operation {
-    Operation::new(Some("%r"), name, operands)
-}
-
-fn op_noresult(name: &str, operands: &[&str]) -> Operation {
-    Operation::new(None, name, operands)
+    execute_op(o, &mut ctx, &env)
+        .unwrap_or_else(|e| panic!("execute_op {:?} failed: {e}", o.op_type))
+        .unwrap_or_else(|| panic!("op {:?} produced no value", o.op_type))
 }
 
 fn sf(x: f32) -> Value {
@@ -161,7 +182,8 @@ fn data_close(a: &[f32], b: &[f32], tol: f32) {
 #[test]
 fn addf_tiles() {
     let r = run_op(
-        &op("arith.addf", &["%a", "%b"]),
+        OpKind::ArithAddf,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 2.0])), ("%b", f16_tile(&[3.0, 4.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![4.0, 6.0]);
@@ -170,7 +192,8 @@ fn addf_tiles() {
 #[test]
 fn addf_scalars() {
     let r = run_op(
-        &op("arith.addf", &["%a", "%b"]),
+        OpKind::ArithAddf,
+        &["%a", "%b"],
         &[("%a", sf(2.0)), ("%b", sf(3.0))],
     );
     close(as_f32(&r), 5.0, 1e-2);
@@ -179,7 +202,8 @@ fn addf_scalars() {
 #[test]
 fn addf_scalar_tile() {
     let r = run_op(
-        &op("arith.addf", &["%a", "%b"]),
+        OpKind::ArithAddf,
+        &["%a", "%b"],
         &[("%a", sf(1.0)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![2.0, 3.0, 4.0]);
@@ -188,7 +212,8 @@ fn addf_scalar_tile() {
 #[test]
 fn addf_tile_scalar() {
     let r = run_op(
-        &op("arith.addf", &["%a", "%b"]),
+        OpKind::ArithAddf,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", sf(1.0))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![2.0, 3.0, 4.0]);
@@ -197,7 +222,8 @@ fn addf_tile_scalar() {
 #[test]
 fn subf_scalar_tile() {
     let r = run_op(
-        &op("arith.subf", &["%a", "%b"]),
+        OpKind::ArithSubf,
+        &["%a", "%b"],
         &[("%a", sf(10.0)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![9.0, 8.0, 7.0]);
@@ -206,7 +232,8 @@ fn subf_scalar_tile() {
 #[test]
 fn mulf_tile_scalar() {
     let r = run_op(
-        &op("arith.mulf", &["%a", "%b"]),
+        OpKind::ArithMulf,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", sf(2.0))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![2.0, 4.0, 6.0]);
@@ -215,7 +242,8 @@ fn mulf_tile_scalar() {
 #[test]
 fn mulf_scalar_tile() {
     let r = run_op(
-        &op("arith.mulf", &["%a", "%b"]),
+        OpKind::ArithMulf,
+        &["%a", "%b"],
         &[("%a", sf(3.0)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![3.0, 6.0, 9.0]);
@@ -224,7 +252,8 @@ fn mulf_scalar_tile() {
 #[test]
 fn divf_tile_scalar() {
     let r = run_op(
-        &op("arith.divf", &["%a", "%b"]),
+        OpKind::ArithDivf,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[4.0, 6.0, 8.0])), ("%b", sf(2.0))],
     );
     data_close(&as_tile(&r).as_f32(), &[2.0, 3.0, 4.0], 1e-2);
@@ -233,7 +262,8 @@ fn divf_tile_scalar() {
 #[test]
 fn divf_scalar_tile() {
     let r = run_op(
-        &op("arith.divf", &["%a", "%b"]),
+        OpKind::ArithDivf,
+        &["%a", "%b"],
         &[("%a", sf(12.0)), ("%b", f16_tile(&[2.0, 3.0, 4.0]))],
     );
     data_close(&as_tile(&r).as_f32(), &[6.0, 4.0, 3.0], 1e-2);
@@ -242,7 +272,8 @@ fn divf_scalar_tile() {
 #[test]
 fn maxf() {
     let r = run_op(
-        &op("arith.maxf", &["%a", "%b"]),
+        OpKind::ArithMaxf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[4.0, 2.0, 6.0])),
@@ -254,7 +285,8 @@ fn maxf() {
 #[test]
 fn maxnumf() {
     let r = run_op(
-        &op("arith.maxnumf", &["%a", "%b"]),
+        OpKind::ArithMaxnumf,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 5.0])), ("%b", f16_tile(&[4.0, 2.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![4.0, 5.0]);
@@ -263,7 +295,8 @@ fn maxnumf() {
 #[test]
 fn maximumf_tiles() {
     let r = run_op(
-        &op("arith.maximumf", &["%a", "%b"]),
+        OpKind::ArithMaximumf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[4.0, 2.0, 6.0])),
@@ -275,7 +308,8 @@ fn maximumf_tiles() {
 #[test]
 fn minimumf() {
     let r = run_op(
-        &op("arith.minimumf", &["%a", "%b"]),
+        OpKind::ArithMinimumf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[4.0, 2.0, 6.0])),
@@ -287,7 +321,8 @@ fn minimumf() {
 #[test]
 fn minnumf() {
     let r = run_op(
-        &op("arith.minnumf", &["%a", "%b"]),
+        OpKind::ArithMinnumf,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 5.0])), ("%b", f16_tile(&[4.0, 2.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![1.0, 2.0]);
@@ -297,7 +332,8 @@ fn minnumf() {
 fn minnumf_nan() {
     // fmin(NaN, 2) -> 2 ; fmin(3, NaN) -> 3 (NaN non-propagating)
     let r = run_op(
-        &op("arith.minnumf", &["%a", "%b"]),
+        OpKind::ArithMinnumf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[f32::NAN, 3.0])),
             ("%b", f16_tile(&[2.0, f32::NAN])),
@@ -310,7 +346,7 @@ fn minnumf_nan() {
 
 #[test]
 fn extf_promotes_to_f32() {
-    let r = run_op(&op("arith.extf", &["%a"]), &[("%a", f16_tile(&[1.0, 2.0]))]);
+    let r = run_op(OpKind::ArithExtf, &["%a"], &[("%a", f16_tile(&[1.0, 2.0]))]);
     let t = as_tile(&r);
     assert_eq!(t.dtype, DType::F32);
     assert_eq!(t.as_f32().to_vec(), vec![1.0, 2.0]);
@@ -321,7 +357,8 @@ fn truncf_passthrough_values() {
     // Python returns the same Tile object; in Rust we check the values round-trip
     // through f16 unchanged (1.0, 2.0 are exactly representable).
     let r = run_op(
-        &op("arith.truncf", &["%a"]),
+        OpKind::ArithTruncf,
+        &["%a"],
         &[("%a", f16_tile(&[1.0, 2.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![1.0, 2.0]);
@@ -334,7 +371,8 @@ fn truncf_passthrough_values() {
 #[test]
 fn addi_tile_broadcast() {
     let r = run_op(
-        &op("arith.addi", &["%a", "%b"]),
+        OpKind::ArithAddi,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", idx(5))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![6.0, 7.0, 8.0]);
@@ -343,7 +381,8 @@ fn addi_tile_broadcast() {
 #[test]
 fn addi_broadcast_tile() {
     let r = run_op(
-        &op("arith.addi", &["%a", "%b"]),
+        OpKind::ArithAddi,
+        &["%a", "%b"],
         &[("%a", idx(10)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))],
     );
     assert!(matches!(r, Value::Tile(_)));
@@ -352,7 +391,8 @@ fn addi_broadcast_tile() {
 #[test]
 fn muli_tile_broadcast() {
     let r = run_op(
-        &op("arith.muli", &["%a", "%b"]),
+        OpKind::ArithMuli,
+        &["%a", "%b"],
         &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", idx(3))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![3.0, 6.0, 9.0]);
@@ -361,7 +401,8 @@ fn muli_tile_broadcast() {
 #[test]
 fn muli_broadcast_tile() {
     let r = run_op(
-        &op("arith.muli", &["%a", "%b"]),
+        OpKind::ArithMuli,
+        &["%a", "%b"],
         &[("%a", idx(2)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))],
     );
     assert!(matches!(r, Value::Tile(_)));
@@ -370,7 +411,8 @@ fn muli_broadcast_tile() {
 #[test]
 fn subi() {
     let r = run_op(
-        &op("arith.subi", &["%a", "%b"]),
+        OpKind::ArithSubi,
+        &["%a", "%b"],
         &[("%a", idx(10)), ("%b", idx(3))],
     );
     assert_eq!(as_i64(&r), 7);
@@ -379,7 +421,8 @@ fn subi() {
 #[test]
 fn remui() {
     let r = run_op(
-        &op("arith.remui", &["%a", "%b"]),
+        OpKind::ArithRemui,
+        &["%a", "%b"],
         &[("%a", idx(10)), ("%b", idx(3))],
     );
     assert_eq!(as_i64(&r), 1);
@@ -388,7 +431,8 @@ fn remui() {
 #[test]
 fn divsi_scalar() {
     let r = run_op(
-        &op("arith.divsi", &["%a", "%b"]),
+        OpKind::ArithDivsi,
+        &["%a", "%b"],
         &[("%a", idx(7)), ("%b", idx(2))],
     );
     assert_eq!(as_i64(&r), 3);
@@ -397,7 +441,8 @@ fn divsi_scalar() {
 #[test]
 fn divsi_truncates_toward_zero() {
     let r = run_op(
-        &op("arith.divsi", &["%a", "%b"]),
+        OpKind::ArithDivsi,
+        &["%a", "%b"],
         &[("%a", si(-7)), ("%b", si(2))],
     );
     assert_eq!(as_i64(&r), -3);
@@ -406,7 +451,8 @@ fn divsi_truncates_toward_zero() {
 #[test]
 fn remsi_scalar() {
     let r = run_op(
-        &op("arith.remsi", &["%a", "%b"]),
+        OpKind::ArithRemsi,
+        &["%a", "%b"],
         &[("%a", idx(7)), ("%b", idx(3))],
     );
     assert_eq!(as_i64(&r), 1);
@@ -416,7 +462,8 @@ fn remsi_scalar() {
 fn remsi_negative() {
     // -7 % 3 = -1 (truncating), matching MLIR remsi sign-of-dividend.
     let r = run_op(
-        &op("arith.remsi", &["%a", "%b"]),
+        OpKind::ArithRemsi,
+        &["%a", "%b"],
         &[("%a", si(-7)), ("%b", si(3))],
     );
     assert_eq!(as_i64(&r), -1);
@@ -425,7 +472,8 @@ fn remsi_negative() {
 #[test]
 fn ceildivsi_scalar() {
     let r = run_op(
-        &op("arith.ceildivsi", &["%a", "%b"]),
+        OpKind::ArithCeildivsi,
+        &["%a", "%b"],
         &[("%a", idx(7)), ("%b", idx(2))],
     );
     assert_eq!(as_i64(&r), 4);
@@ -434,7 +482,8 @@ fn ceildivsi_scalar() {
 #[test]
 fn ceildivui_scalar() {
     let r = run_op(
-        &op("arith.ceildivui", &["%a", "%b"]),
+        OpKind::ArithCeildivui,
+        &["%a", "%b"],
         &[("%a", idx(7)), ("%b", idx(2))],
     );
     assert_eq!(as_i64(&r), 4);
@@ -443,7 +492,8 @@ fn ceildivui_scalar() {
 #[test]
 fn minsi_scalar() {
     let r = run_op(
-        &op("arith.minsi", &["%a", "%b"]),
+        OpKind::ArithMinsi,
+        &["%a", "%b"],
         &[("%a", idx(3)), ("%b", idx(7))],
     );
     assert_eq!(as_i64(&r), 3);
@@ -452,7 +502,8 @@ fn minsi_scalar() {
 #[test]
 fn minsi_negative() {
     let r = run_op(
-        &op("arith.minsi", &["%a", "%b"]),
+        OpKind::ArithMinsi,
+        &["%a", "%b"],
         &[("%a", si(-5)), ("%b", si(2))],
     );
     assert_eq!(as_i64(&r), -5);
@@ -461,7 +512,8 @@ fn minsi_negative() {
 #[test]
 fn maxsi_scalar() {
     let r = run_op(
-        &op("arith.maxsi", &["%a", "%b"]),
+        OpKind::ArithMaxsi,
+        &["%a", "%b"],
         &[("%a", idx(3)), ("%b", idx(7))],
     );
     assert_eq!(as_i64(&r), 7);
@@ -470,7 +522,8 @@ fn maxsi_scalar() {
 #[test]
 fn minsi_tiles() {
     let r = run_op(
-        &op("arith.minsi", &["%a", "%b"]),
+        OpKind::ArithMinsi,
+        &["%a", "%b"],
         &[
             ("%a", tile_with(&[1.0, 5.0, 3.0], DType::I32, &[3])),
             ("%b", tile_with(&[4.0, 2.0, 6.0], DType::I32, &[3])),
@@ -482,7 +535,8 @@ fn minsi_tiles() {
 #[test]
 fn maxsi_tiles() {
     let r = run_op(
-        &op("arith.maxsi", &["%a", "%b"]),
+        OpKind::ArithMaxsi,
+        &["%a", "%b"],
         &[
             ("%a", tile_with(&[1.0, 5.0, 3.0], DType::I32, &[3])),
             ("%b", tile_with(&[4.0, 2.0, 6.0], DType::I32, &[3])),
@@ -494,7 +548,8 @@ fn maxsi_tiles() {
 #[test]
 fn minui_scalar() {
     let r = run_op(
-        &op("arith.minui", &["%a", "%b"]),
+        OpKind::ArithMinui,
+        &["%a", "%b"],
         &[("%a", idx(3)), ("%b", idx(7))],
     );
     assert_eq!(as_i64(&r), 3);
@@ -503,7 +558,8 @@ fn minui_scalar() {
 #[test]
 fn maxui_scalar() {
     let r = run_op(
-        &op("arith.maxui", &["%a", "%b"]),
+        OpKind::ArithMaxui,
+        &["%a", "%b"],
         &[("%a", idx(3)), ("%b", idx(7))],
     );
     assert_eq!(as_i64(&r), 7);
@@ -512,7 +568,8 @@ fn maxui_scalar() {
 #[test]
 fn floordivsi_scalar() {
     let r = run_op(
-        &op("arith.floordivsi", &["%a", "%b"]),
+        OpKind::ArithFloordivsi,
+        &["%a", "%b"],
         &[("%a", idx(7)), ("%b", idx(2))],
     );
     assert_eq!(as_i64(&r), 3);
@@ -521,7 +578,8 @@ fn floordivsi_scalar() {
 #[test]
 fn andi_scalar() {
     let r = run_op(
-        &op("arith.andi", &["%a", "%b"]),
+        OpKind::ArithAndi,
+        &["%a", "%b"],
         &[("%a", idx(0b1010)), ("%b", idx(0b1100))],
     );
     assert_eq!(as_i64(&r), 0b1000);
@@ -530,7 +588,8 @@ fn andi_scalar() {
 #[test]
 fn ori_scalar() {
     let r = run_op(
-        &op("arith.ori", &["%a", "%b"]),
+        OpKind::ArithOri,
+        &["%a", "%b"],
         &[("%a", idx(0b1010)), ("%b", idx(0b1100))],
     );
     assert_eq!(as_i64(&r), 0b1110);
@@ -539,7 +598,8 @@ fn ori_scalar() {
 #[test]
 fn xori_scalar() {
     let r = run_op(
-        &op("arith.xori", &["%a", "%b"]),
+        OpKind::ArithXori,
+        &["%a", "%b"],
         &[("%a", idx(0b1010)), ("%b", idx(0b1100))],
     );
     assert_eq!(as_i64(&r), 0b0110);
@@ -548,7 +608,8 @@ fn xori_scalar() {
 #[test]
 fn shli_scalar() {
     let r = run_op(
-        &op("arith.shli", &["%a", "%b"]),
+        OpKind::ArithShli,
+        &["%a", "%b"],
         &[("%a", idx(1)), ("%b", idx(3))],
     );
     assert_eq!(as_i64(&r), 8);
@@ -557,7 +618,8 @@ fn shli_scalar() {
 #[test]
 fn shrsi_scalar() {
     let r = run_op(
-        &op("arith.shrsi", &["%a", "%b"]),
+        OpKind::ArithShrsi,
+        &["%a", "%b"],
         &[("%a", idx(8)), ("%b", idx(2))],
     );
     assert_eq!(as_i64(&r), 2);
@@ -566,7 +628,8 @@ fn shrsi_scalar() {
 #[test]
 fn shrui_scalar() {
     let r = run_op(
-        &op("arith.shrui", &["%a", "%b"]),
+        OpKind::ArithShrui,
+        &["%a", "%b"],
         &[("%a", idx(8)), ("%b", idx(2))],
     );
     assert_eq!(as_i64(&r), 2);
@@ -575,7 +638,8 @@ fn shrui_scalar() {
 #[test]
 fn andi_tile() {
     let r = run_op(
-        &op("arith.andi", &["%a", "%b"]),
+        OpKind::ArithAndi,
+        &["%a", "%b"],
         &[
             (
                 "%a",
@@ -600,14 +664,15 @@ fn andi_tile() {
 
 #[test]
 fn negf_scalar() {
-    let r = run_op(&op("arith.negf", &["%a"]), &[("%a", sf(3.0))]);
+    let r = run_op(OpKind::ArithNegf, &["%a"], &[("%a", sf(3.0))]);
     close(as_f32(&r), -3.0, 1e-2);
 }
 
 #[test]
 fn negf_tile() {
     let r = run_op(
-        &op("arith.negf", &["%a"]),
+        OpKind::ArithNegf,
+        &["%a"],
         &[("%a", f16_tile(&[1.0, -2.0, 3.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![-1.0, 2.0, -3.0]);
@@ -615,14 +680,15 @@ fn negf_tile() {
 
 #[test]
 fn absf_scalar() {
-    let r = run_op(&op("arith.absf", &["%a"]), &[("%a", sf(-5.0))]);
+    let r = run_op(OpKind::ArithAbsf, &["%a"], &[("%a", sf(-5.0))]);
     close(as_f32(&r), 5.0, 1e-2);
 }
 
 #[test]
 fn absf_tile() {
     let r = run_op(
-        &op("arith.absf", &["%a"]),
+        OpKind::ArithAbsf,
+        &["%a"],
         &[("%a", f16_tile(&[-1.0, 2.0, -3.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![1.0, 2.0, 3.0]);
@@ -631,7 +697,8 @@ fn absf_tile() {
 #[test]
 fn remf_scalars() {
     let r = run_op(
-        &op("arith.remf", &["%a", "%b"]),
+        OpKind::ArithRemf,
+        &["%a", "%b"],
         &[("%a", sf(5.0)), ("%b", sf(3.0))],
     );
     close(as_f32(&r), 2.0, 1e-2);
@@ -640,7 +707,8 @@ fn remf_scalars() {
 #[test]
 fn minf_tiles() {
     let r = run_op(
-        &op("arith.minf", &["%a", "%b"]),
+        OpKind::ArithMinf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[2.0, 4.0, 3.0])),
@@ -652,7 +720,8 @@ fn minf_tiles() {
 #[test]
 fn minimumf_tiles() {
     let r = run_op(
-        &op("arith.minimumf", &["%a", "%b"]),
+        OpKind::ArithMinimumf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[2.0, 4.0, 3.0])),
@@ -661,14 +730,24 @@ fn minimumf_tiles() {
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![1.0, 4.0, 3.0]);
 }
 
-fn cmpf_op(pred: &str, ops: &[&str]) -> Operation {
-    op("arith.cmpf", ops).with_attr("predicate", Attr::Str(pred.into()))
+fn run_predicated(
+    kind: OpKind,
+    pred: &'static str,
+    operands: &[&'static str],
+    seed: &[(&'static str, Value)],
+) -> Value {
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), kind, operands);
+    let o = ir_ops.attr(o, AttrKey::Predicate, Attr::Str(pred));
+    run_built(&mut ir_ops, &o, seed)
 }
 
 #[test]
 fn cmpf_olt_scalar() {
-    let r = run_op(
-        &cmpf_op("olt", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpf,
+        "olt",
+        &["%a", "%b"],
         &[("%a", sf(1.0)), ("%b", sf(2.0))],
     );
     assert!(as_bool(&r));
@@ -676,8 +755,10 @@ fn cmpf_olt_scalar() {
 
 #[test]
 fn cmpf_ogt_scalar() {
-    let r = run_op(
-        &cmpf_op("ogt", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpf,
+        "ogt",
+        &["%a", "%b"],
         &[("%a", sf(3.0)), ("%b", sf(2.0))],
     );
     assert!(as_bool(&r));
@@ -685,8 +766,10 @@ fn cmpf_ogt_scalar() {
 
 #[test]
 fn cmpf_oeq_tile() {
-    let r = run_op(
-        &cmpf_op("oeq", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpf,
+        "oeq",
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 2.0, 3.0])),
             ("%b", f16_tile(&[1.0, 0.0, 3.0])),
@@ -701,38 +784,39 @@ fn cmpf_oeq_tile() {
 
 #[test]
 fn extui_scalar() {
-    let r = run_op(&op("arith.extui", &["%a"]), &[("%a", idx(5))]);
+    let r = run_op(OpKind::ArithExtui, &["%a"], &[("%a", idx(5))]);
     assert_eq!(as_i64(&r), 5);
 }
 
 #[test]
 fn trunci_scalar() {
-    let r = run_op(&op("arith.trunci", &["%a"]), &[("%a", idx(300))]);
+    let r = run_op(OpKind::ArithTrunci, &["%a"], &[("%a", idx(300))]);
     assert_eq!(as_i64(&r), 300);
 }
 
 #[test]
 fn uitofp_scalar() {
-    let r = run_op(&op("arith.uitofp", &["%a"]), &[("%a", idx(4))]);
+    let r = run_op(OpKind::ArithUitofp, &["%a"], &[("%a", idx(4))]);
     close(as_f32(&r), 4.0, 1e-2);
 }
 
 #[test]
 fn fptosi_scalar() {
-    let r = run_op(&op("arith.fptosi", &["%a"]), &[("%a", sf(3.7))]);
+    let r = run_op(OpKind::ArithFptosi, &["%a"], &[("%a", sf(3.7))]);
     assert_eq!(as_i64(&r), 3);
 }
 
 #[test]
 fn fptoui_scalar() {
-    let r = run_op(&op("arith.fptoui", &["%a"]), &[("%a", sf(2.9))]);
+    let r = run_op(OpKind::ArithFptoui, &["%a"], &[("%a", sf(2.9))]);
     assert_eq!(as_i64(&r), 2);
 }
 
 #[test]
 fn extui_tile() {
     let r = run_op(
-        &op("arith.extui", &["%a"]),
+        OpKind::ArithExtui,
+        &["%a"],
         &[("%a", tile_with(&[1.0, 2.0, 3.0], DType::I32, &[3]))],
     );
     let t = as_tile(&r);
@@ -742,7 +826,8 @@ fn extui_tile() {
 #[test]
 fn fptosi_tile() {
     let r = run_op(
-        &op("arith.fptosi", &["%a"]),
+        OpKind::ArithFptosi,
+        &["%a"],
         &[("%a", f16_tile(&[1.7, 2.3, -3.9]))],
     );
     let t = as_tile(&r);
@@ -756,19 +841,22 @@ fn fptosi_tile() {
 
 #[test]
 fn constant_scalar() {
-    let o = Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Int(42));
-    let r = run_op(&o, &[]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::ArithConstant, &[]);
+    let o = ir_ops.attr(o, AttrKey::Value, Attr::Int(42));
+    let r = run_built(&mut ir_ops, &o, &[]);
     assert_eq!(as_i64(&r), 42);
 }
 
 #[test]
 fn constant_tensor() {
-    let o = Operation::new(Some("%r"), "arith.constant", &[])
-        .with_attr("value", Attr::Float(0.0))
-        .with_attr("is_tensor", Attr::Bool(true))
-        .with_attr("shape", Attr::IntList(vec![4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
-    let r = run_op(&o, &[]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::ArithConstant, &[]);
+    let o = ir_ops.attr(o, AttrKey::Value, Attr::Float(0.0));
+    let o = ir_ops.attr(o, AttrKey::IsTensor, Attr::Bool(true));
+    let o = ir_ops.attr(o, AttrKey::Shape, ir_ops.int_list(vec![4]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Dtype(DType::F16));
+    let r = run_built(&mut ir_ops, &o, &[]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![4]);
     assert!(t.as_f32().iter().all(|&x| x == 0.0));
@@ -777,13 +865,14 @@ fn constant_tensor() {
 #[test]
 fn constant_dense_list() {
     // dense<[16, 32]> materializes the list element-by-element.
-    let o = Operation::new(Some("%r"), "arith.constant", &[])
-        .with_attr("value", Attr::IntList(vec![16, 32]))
-        .with_attr("shape", Attr::IntList(vec![2]))
-        .with_attr("dtype", Attr::Str("index".into()))
-        .with_attr("is_tensor", Attr::Bool(true))
-        .with_attr("dense_list", Attr::Bool(true));
-    let r = run_op(&o, &[]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::ArithConstant, &[]);
+    let o = ir_ops.attr(o, AttrKey::Value, ir_ops.int_list(vec![16, 32]));
+    let o = ir_ops.attr(o, AttrKey::Shape, ir_ops.int_list(vec![2]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Dtype(DType::I32));
+    let o = ir_ops.attr(o, AttrKey::IsTensor, Attr::Bool(true));
+    let o = ir_ops.attr(o, AttrKey::DenseList, Attr::Bool(true));
+    let r = run_built(&mut ir_ops, &o, &[]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![2]);
     assert_eq!(t.as_f32().to_vec(), vec![16.0, 32.0]);
@@ -791,26 +880,27 @@ fn constant_dense_list() {
 
 #[test]
 fn extsi() {
-    let r = run_op(&op("arith.extsi", &["%a"]), &[("%a", idx(5))]);
+    let r = run_op(OpKind::ArithExtsi, &["%a"], &[("%a", idx(5))]);
     assert_eq!(as_i64(&r), 5);
 }
 
 #[test]
 fn index_cast() {
-    let r = run_op(&op("arith.index_cast", &["%a"]), &[("%a", idx(7))]);
+    let r = run_op(OpKind::ArithIndexCast, &["%a"], &[("%a", idx(7))]);
     assert_eq!(as_i64(&r), 7);
 }
 
 #[test]
 fn index_castui() {
-    let r = run_op(&op("arith.index_castui", &["%a"]), &[("%a", idx(7))]);
+    let r = run_op(OpKind::ArithIndexCastui, &["%a"], &[("%a", idx(7))]);
     assert_eq!(as_i64(&r), 7);
 }
 
 #[test]
 fn convertf_f16_to_f32() {
     let r = run_op(
-        &op("arith.convertf", &["%a"]),
+        OpKind::ArithConvertf,
+        &["%a"],
         &[("%a", f16_tile(&[1.0, 2.0]))],
     );
     assert_eq!(as_tile(&r).dtype, DType::F32);
@@ -819,7 +909,8 @@ fn convertf_f16_to_f32() {
 #[test]
 fn convertf_f32_to_f16() {
     let r = run_op(
-        &op("arith.convertf", &["%a"]),
+        OpKind::ArithConvertf,
+        &["%a"],
         &[("%a", tile_with(&[1.0, 2.0], DType::F32, &[2]))],
     );
     assert_eq!(as_tile(&r).dtype, DType::F16);
@@ -827,24 +918,30 @@ fn convertf_f32_to_f16() {
 
 #[test]
 fn sitofp_scalar() {
-    let r = run_op(&op("arith.sitofp", &["%a"]), &[("%a", idx(3))]);
+    let r = run_op(OpKind::ArithSitofp, &["%a"], &[("%a", idx(3))]);
     close(as_f32(&r), 3.0, 1e-2);
 }
 
 #[test]
 fn sitofp_respects_result_type_f16() {
-    let mut o = op("arith.sitofp", &["%a"]);
-    o.result_type = Some("f16".into());
-    let r = run_op(&o, &[("%a", idx(3))]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::ArithSitofp, &["%a"]);
+    let o = ir_ops.ty(o, ktir_emulator::irtype::IrType::Scalar(DType::F16));
+    let r = run_built(&mut ir_ops, &o, &[("%a", idx(3))]);
     // Scalar path returns an F32 scalar; the dtype is carried on tiles only.
     close(as_f32(&r), 3.0, 1e-2);
 }
 
 #[test]
 fn sitofp_respects_result_type_f32() {
-    let mut o = op("arith.sitofp", &["%a"]);
-    o.result_type = Some("f32".into());
-    let r = run_op(&o, &[("%a", tile_with(&[1.0, -2.0], DType::I32, &[2]))]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::ArithSitofp, &["%a"]);
+    let o = ir_ops.ty(o, ktir_emulator::irtype::IrType::Scalar(DType::F32));
+    let r = run_built(
+        &mut ir_ops,
+        &o,
+        &[("%a", tile_with(&[1.0, -2.0], DType::I32, &[2]))],
+    );
     let t = as_tile(&r);
     assert_eq!(t.dtype, DType::F32);
     assert_eq!(t.as_f32().to_vec(), vec![1.0, -2.0]);
@@ -854,14 +951,12 @@ fn sitofp_respects_result_type_f32() {
 // arith cmpi / select (TestArithCmpiSelect)
 // ===========================================================================
 
-fn cmpi_op(pred: &str, ops: &[&str]) -> Operation {
-    op("arith.cmpi", ops).with_attr("predicate", Attr::Str(pred.into()))
-}
-
 #[test]
 fn cmpi_scalar() {
-    let r = run_op(
-        &cmpi_op("slt", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpi,
+        "slt",
+        &["%a", "%b"],
         &[("%a", idx(1)), ("%b", idx(2))],
     );
     assert!(as_bool(&r));
@@ -869,8 +964,10 @@ fn cmpi_scalar() {
 
 #[test]
 fn cmpi_tile() {
-    let r = run_op(
-        &cmpi_op("slt", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpi,
+        "slt",
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[2.0, 4.0, 3.0])),
@@ -881,8 +978,10 @@ fn cmpi_tile() {
 
 #[test]
 fn cmpi_ult() {
-    let r = run_op(
-        &cmpi_op("ult", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpi,
+        "ult",
+        &["%a", "%b"],
         &[("%a", idx(1)), ("%b", idx(2))],
     );
     assert!(as_bool(&r));
@@ -890,8 +989,10 @@ fn cmpi_ult() {
 
 #[test]
 fn cmpi_uge_tile() {
-    let r = run_op(
-        &cmpi_op("uge", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpi,
+        "uge",
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[2.0, 4.0, 3.0])),
@@ -903,7 +1004,8 @@ fn cmpi_uge_tile() {
 #[test]
 fn select_scalar() {
     let r = run_op(
-        &op("arith.select", &["%cond", "%t", "%f"]),
+        OpKind::ArithSelect,
+        &["%cond", "%t", "%f"],
         &[
             ("%cond", Value::Scalar(Scalar::Bool(true))),
             ("%t", idx(10)),
@@ -916,7 +1018,8 @@ fn select_scalar() {
 #[test]
 fn select_tile() {
     let r = run_op(
-        &op("arith.select", &["%cond", "%t", "%f"]),
+        OpKind::ArithSelect,
+        &["%cond", "%t", "%f"],
         &[
             ("%cond", tile_with(&[1.0, 0.0, 1.0], DType::Bool, &[3])),
             ("%t", f16_tile(&[1.0, 2.0, 3.0])),
@@ -932,8 +1035,10 @@ fn select_tile() {
 
 #[test]
 fn cmpf_olt_tile() {
-    let r = run_op(
-        &cmpf_op("olt", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpf,
+        "olt",
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[2.0, 4.0, 3.0])),
@@ -944,8 +1049,10 @@ fn cmpf_olt_tile() {
 
 #[test]
 fn cmpf_oge_tile() {
-    let r = run_op(
-        &cmpf_op("oge", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpf,
+        "oge",
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[1.0, 5.0, 3.0])),
             ("%b", f16_tile(&[2.0, 4.0, 3.0])),
@@ -957,8 +1064,10 @@ fn cmpf_oge_tile() {
 #[test]
 fn cmpf_olt_nan() {
     // Ordered predicates are false when either operand is NaN.
-    let r = run_op(
-        &cmpf_op("olt", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpf,
+        "olt",
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[f32::NAN, 1.0])),
             ("%b", f16_tile(&[2.0, f32::NAN])),
@@ -970,8 +1079,10 @@ fn cmpf_olt_nan() {
 #[test]
 fn cmpf_ueq_nan() {
     // Unordered predicates return true when either operand is NaN.
-    let r = run_op(
-        &cmpf_op("ueq", &["%a", "%b"]),
+    let r = run_predicated(
+        OpKind::ArithCmpf,
+        "ueq",
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[f32::NAN, 3.0])),
             ("%b", f16_tile(&[2.0, 3.0])),
@@ -984,12 +1095,19 @@ fn cmpf_ueq_nan() {
 fn cmpf_ord_uno() {
     let a = f16_tile(&[f32::NAN, 3.0]);
     let b = f16_tile(&[2.0, 4.0]);
-    let r_ord = run_op(
-        &cmpf_op("ord", &["%a", "%b"]),
+    let r_ord = run_predicated(
+        OpKind::ArithCmpf,
+        "ord",
+        &["%a", "%b"],
         &[("%a", a.clone()), ("%b", b.clone())],
     );
     assert_eq!(as_tile(&r_ord).as_f32().to_vec(), vec![0.0, 1.0]);
-    let r_uno = run_op(&cmpf_op("uno", &["%a", "%b"]), &[("%a", a), ("%b", b)]);
+    let r_uno = run_predicated(
+        OpKind::ArithCmpf,
+        "uno",
+        &["%a", "%b"],
+        &[("%a", a), ("%b", b)],
+    );
     assert_eq!(as_tile(&r_uno).as_f32().to_vec(), vec![1.0, 0.0]);
 }
 
@@ -999,20 +1117,21 @@ fn cmpf_ord_uno() {
 
 #[test]
 fn math_exp_tile() {
-    let r = run_op(&op("math.exp", &["%x"]), &[("%x", f16_tile(&[0.0, 1.0]))]);
+    let r = run_op(OpKind::MathExp, &["%x"], &[("%x", f16_tile(&[0.0, 1.0]))]);
     data_close(&as_tile(&r).as_f32(), &[1.0, std::f32::consts::E], 1e-2);
 }
 
 #[test]
 fn math_exp_scalar() {
-    let r = run_op(&op("math.exp", &["%x"]), &[("%x", sf(0.0))]);
+    let r = run_op(OpKind::MathExp, &["%x"], &[("%x", sf(0.0))]);
     close(as_f32(&r), 1.0, 1e-2);
 }
 
 #[test]
 fn math_sqrt_tile() {
     let r = run_op(
-        &op("math.sqrt", &["%x"]),
+        OpKind::MathSqrt,
+        &["%x"],
         &[("%x", f16_tile(&[4.0, 9.0, 16.0]))],
     );
     data_close(&as_tile(&r).as_f32(), &[2.0, 3.0, 4.0], 1e-2);
@@ -1020,14 +1139,15 @@ fn math_sqrt_tile() {
 
 #[test]
 fn math_sqrt_scalar() {
-    let r = run_op(&op("math.sqrt", &["%x"]), &[("%x", sf(4.0))]);
+    let r = run_op(OpKind::MathSqrt, &["%x"], &[("%x", sf(4.0))]);
     close(as_f32(&r), 2.0, 1e-2);
 }
 
 #[test]
 fn math_log_tile() {
     let r = run_op(
-        &op("math.log", &["%x"]),
+        OpKind::MathLog,
+        &["%x"],
         &[("%x", f16_tile(&[1.0, 2.0, 4.0]))],
     );
     data_close(
@@ -1039,14 +1159,15 @@ fn math_log_tile() {
 
 #[test]
 fn math_log_scalar() {
-    let r = run_op(&op("math.log", &["%x"]), &[("%x", sf(1.0))]);
+    let r = run_op(OpKind::MathLog, &["%x"], &[("%x", sf(1.0))]);
     close(as_f32(&r), 0.0, 1e-2);
 }
 
 #[test]
 fn math_rsqrt_tile() {
     let r = run_op(
-        &op("math.rsqrt", &["%x"]),
+        OpKind::MathRsqrt,
+        &["%x"],
         &[("%x", f16_tile(&[1.0, 4.0, 16.0]))],
     );
     data_close(&as_tile(&r).as_f32(), &[1.0, 0.5, 0.25], 1e-2);
@@ -1054,14 +1175,15 @@ fn math_rsqrt_tile() {
 
 #[test]
 fn math_rsqrt_scalar() {
-    let r = run_op(&op("math.rsqrt", &["%x"]), &[("%x", sf(4.0))]);
+    let r = run_op(OpKind::MathRsqrt, &["%x"], &[("%x", sf(4.0))]);
     close(as_f32(&r), 0.5, 1e-2);
 }
 
 #[test]
 fn math_log2_tile() {
     let r = run_op(
-        &op("math.log2", &["%x"]),
+        OpKind::MathLog2,
+        &["%x"],
         &[("%x", f16_tile(&[1.0, 2.0, 8.0]))],
     );
     data_close(&as_tile(&r).as_f32(), &[0.0, 1.0, 3.0], 1e-2);
@@ -1069,14 +1191,15 @@ fn math_log2_tile() {
 
 #[test]
 fn math_log2_scalar() {
-    let r = run_op(&op("math.log2", &["%x"]), &[("%x", sf(8.0))]);
+    let r = run_op(OpKind::MathLog2, &["%x"], &[("%x", sf(8.0))]);
     close(as_f32(&r), 3.0, 1e-2);
 }
 
 #[test]
 fn math_log1p_tile() {
     let r = run_op(
-        &op("math.log1p", &["%x"]),
+        OpKind::MathLog1p,
+        &["%x"],
         &[("%x", f16_tile(&[0.0, 1.0, 2.0]))],
     );
     data_close(
@@ -1088,14 +1211,15 @@ fn math_log1p_tile() {
 
 #[test]
 fn math_log1p_scalar() {
-    let r = run_op(&op("math.log1p", &["%x"]), &[("%x", sf(0.0))]);
+    let r = run_op(OpKind::MathLog1p, &["%x"], &[("%x", sf(0.0))]);
     close(as_f32(&r), 0.0, 1e-2);
 }
 
 #[test]
 fn math_tanh_tile() {
     let r = run_op(
-        &op("math.tanh", &["%x"]),
+        OpKind::MathTanh,
+        &["%x"],
         &[("%x", f16_tile(&[0.0, 1.0, -1.0]))],
     );
     data_close(
@@ -1107,14 +1231,15 @@ fn math_tanh_tile() {
 
 #[test]
 fn math_tanh_scalar() {
-    let r = run_op(&op("math.tanh", &["%x"]), &[("%x", sf(0.0))]);
+    let r = run_op(OpKind::MathTanh, &["%x"], &[("%x", sf(0.0))]);
     close(as_f32(&r), 0.0, 1e-2);
 }
 
 #[test]
 fn math_sin_tile() {
     let r = run_op(
-        &op("math.sin", &["%x"]),
+        OpKind::MathSin,
+        &["%x"],
         &[("%x", f16_tile(&[0.0, 1.5708, 3.1416]))],
     );
     data_close(
@@ -1126,14 +1251,15 @@ fn math_sin_tile() {
 
 #[test]
 fn math_sin_scalar() {
-    let r = run_op(&op("math.sin", &["%x"]), &[("%x", sf(0.0))]);
+    let r = run_op(OpKind::MathSin, &["%x"], &[("%x", sf(0.0))]);
     close(as_f32(&r), 0.0, 1e-2);
 }
 
 #[test]
 fn math_cos_tile() {
     let r = run_op(
-        &op("math.cos", &["%x"]),
+        OpKind::MathCos,
+        &["%x"],
         &[("%x", f16_tile(&[0.0, 1.5708, 3.1416]))],
     );
     data_close(
@@ -1145,14 +1271,15 @@ fn math_cos_tile() {
 
 #[test]
 fn math_cos_scalar() {
-    let r = run_op(&op("math.cos", &["%x"]), &[("%x", sf(0.0))]);
+    let r = run_op(OpKind::MathCos, &["%x"], &[("%x", sf(0.0))]);
     close(as_f32(&r), 1.0, 1e-2);
 }
 
 #[test]
 fn math_absf_tile() {
     let r = run_op(
-        &op("math.absf", &["%x"]),
+        OpKind::MathAbsf,
+        &["%x"],
         &[("%x", f16_tile(&[-2.0, 0.0, 3.0]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![2.0, 0.0, 3.0]);
@@ -1160,14 +1287,15 @@ fn math_absf_tile() {
 
 #[test]
 fn math_absf_scalar() {
-    let r = run_op(&op("math.absf", &["%x"]), &[("%x", sf(-5.0))]);
+    let r = run_op(OpKind::MathAbsf, &["%x"], &[("%x", sf(-5.0))]);
     assert_eq!(as_f32(&r), 5.0);
 }
 
 #[test]
 fn math_ceil_tile() {
     let r = run_op(
-        &op("math.ceil", &["%x"]),
+        OpKind::MathCeil,
+        &["%x"],
         &[("%x", f16_tile(&[1.2, 2.7, -0.5]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![2.0, 3.0, 0.0]);
@@ -1175,14 +1303,15 @@ fn math_ceil_tile() {
 
 #[test]
 fn math_ceil_scalar() {
-    let r = run_op(&op("math.ceil", &["%x"]), &[("%x", sf(1.3))]);
+    let r = run_op(OpKind::MathCeil, &["%x"], &[("%x", sf(1.3))]);
     assert_eq!(as_f32(&r), 2.0);
 }
 
 #[test]
 fn math_floor_tile() {
     let r = run_op(
-        &op("math.floor", &["%x"]),
+        OpKind::MathFloor,
+        &["%x"],
         &[("%x", f16_tile(&[1.2, 2.7, -0.5]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![1.0, 2.0, -1.0]);
@@ -1190,14 +1319,15 @@ fn math_floor_tile() {
 
 #[test]
 fn math_floor_scalar() {
-    let r = run_op(&op("math.floor", &["%x"]), &[("%x", sf(1.7))]);
+    let r = run_op(OpKind::MathFloor, &["%x"], &[("%x", sf(1.7))]);
     assert_eq!(as_f32(&r), 1.0);
 }
 
 #[test]
 fn math_powf_tile() {
     let r = run_op(
-        &op("math.powf", &["%a", "%b"]),
+        OpKind::MathPowf,
+        &["%a", "%b"],
         &[
             ("%a", f16_tile(&[2.0, 3.0, 4.0])),
             ("%b", f16_tile(&[2.0, 2.0, 0.5])),
@@ -1209,7 +1339,8 @@ fn math_powf_tile() {
 #[test]
 fn math_fma_tile() {
     let r = run_op(
-        &op("math.fma", &["%a", "%b", "%c"]),
+        OpKind::MathFma,
+        &["%a", "%b", "%c"],
         &[
             ("%a", f16_tile(&[2.0, 3.0])),
             ("%b", f16_tile(&[4.0, 5.0])),
@@ -1222,7 +1353,8 @@ fn math_fma_tile() {
 #[test]
 fn math_erf_tile() {
     let r = run_op(
-        &op("math.erf", &["%x"]),
+        OpKind::MathErf,
+        &["%x"],
         &[("%x", f16_tile(&[0.0, 1.0, -1.0]))],
     );
     data_close(&as_tile(&r).as_f32(), &[0.0, 0.8427, -0.8427], 1e-2);
@@ -1230,14 +1362,15 @@ fn math_erf_tile() {
 
 #[test]
 fn math_erf_scalar() {
-    let r = run_op(&op("math.erf", &["%x"]), &[("%x", sf(0.0))]);
+    let r = run_op(OpKind::MathErf, &["%x"], &[("%x", sf(0.0))]);
     close(as_f32(&r), 0.0, 1e-2);
 }
 
 #[test]
 fn math_absi_tile() {
     let r = run_op(
-        &op("math.absi", &["%x"]),
+        OpKind::MathAbsi,
+        &["%x"],
         &[("%x", tile_with(&[-3.0, 0.0, 5.0], DType::I32, &[3]))],
     );
     assert_eq!(as_tile(&r).as_f32().to_vec(), vec![3.0, 0.0, 5.0]);
@@ -1246,7 +1379,8 @@ fn math_absi_tile() {
 #[test]
 fn math_absi_scalar() {
     let r = run_op(
-        &op("math.absi", &["%x"]),
+        OpKind::MathAbsi,
+        &["%x"],
         &[("%x", Value::Scalar(Scalar::I32(-7)))],
     );
     assert_eq!(as_i64(&r), 7);
@@ -1255,7 +1389,8 @@ fn math_absi_scalar() {
 #[test]
 fn math_powf_scalar() {
     let r = run_op(
-        &op("math.powf", &["%a", "%b"]),
+        OpKind::MathPowf,
+        &["%a", "%b"],
         &[("%a", sf(2.0)), ("%b", sf(3.0))],
     );
     assert_eq!(as_f32(&r), 8.0);
@@ -1264,7 +1399,8 @@ fn math_powf_scalar() {
 #[test]
 fn math_fma_scalar() {
     let r = run_op(
-        &op("math.fma", &["%a", "%b", "%c"]),
+        OpKind::MathFma,
+        &["%a", "%b", "%c"],
         &[("%a", sf(3.0)), ("%b", sf(4.0)), ("%c", sf(1.0))],
     );
     assert_eq!(as_f32(&r), 13.0);
@@ -1277,11 +1413,14 @@ fn math_fma_scalar() {
 #[test]
 fn reduce_along_dim() {
     // reduce a 1x4 tile along dim 1 -> sum 10.
-    let o = op("linalg.reduce", &["%x"])
-        .with_attr("reduce_fn", Attr::Str("arith.addf".into()))
-        .with_attr("dim", Attr::Int(1))
-        .with_attr("outs_var", Attr::Str("%init".into()));
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+    let o = ir_ops.attr(o, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+    let o = ir_ops.attr(o, AttrKey::Dim, Attr::Int(1));
+    let outs_var = ir_ops.ssas_attr(&["%init"]);
+    let o = ir_ops.attr(o, AttrKey::OutsVar, outs_var);
     let r = run_op_execute(
+        &mut ir_ops,
         &o,
         &[
             ("%x", tile_with(&[1.0, 2.0, 3.0, 4.0], DType::F16, &[1, 4])),
@@ -1298,30 +1437,36 @@ fn reduce_along_dim() {
 
 #[test]
 fn reduce_full_collapse() {
-    let o = op("linalg.reduce", &["%x"]).with_attr("reduce_fn", Attr::Str("arith.addf".into()));
-    let r = run_op_execute(&o, &[("%x", f16_tile(&[1.0, 2.0, 3.0, 4.0]))]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+    let o = ir_ops.attr(o, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+    let r = run_op_execute(&mut ir_ops, &o, &[("%x", f16_tile(&[1.0, 2.0, 3.0, 4.0]))]);
     close(as_f32(&r), 10.0, 0.1);
 }
 
 #[test]
 fn reduce_scalar_input() {
-    let o = op("linalg.reduce", &["%x"]).with_attr("reduce_fn", Attr::Str("arith.addf".into()));
-    let r = run_op_execute(&o, &[("%x", sf(5.0))]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+    let o = ir_ops.attr(o, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+    let r = run_op_execute(&mut ir_ops, &o, &[("%x", sf(5.0))]);
     close(as_f32(&r), 5.0, 1e-2);
 }
 
 #[test]
 fn reduce_explicit_region_single_op() {
     // (%in, %out) { %s = addf %in,%out ; yield %s } over a 1x4 tile, dim 1.
-    let region = vec![
-        Operation::new(Some("%s"), "arith.addf", &["%in", "%out"]),
-        Operation::new(None, "linalg.yield", &["%s"]),
-    ];
-    let mut o = op("linalg.reduce", &["%x"])
-        .with_attr("dim", Attr::Int(1))
-        .with_attr("outs_var", Attr::Str("%init".into()));
-    o.regions = vec![region];
+    let mut ir_ops = Ops::new();
+    let s = ir_ops.op(Some("%s"), OpKind::ArithAddf, &["%in", "%out"]);
+    let y = ir_ops.op(None, OpKind::LinalgYield, &["%s"]);
+    let region = vec![s, y];
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+    let o = ir_ops.attr(o, AttrKey::Dim, Attr::Int(1));
+    let outs_var = ir_ops.ssas_attr(&["%init"]);
+    let o = ir_ops.attr(o, AttrKey::OutsVar, outs_var);
+    let o = ir_ops.with_region(o, region);
     let r = run_op_execute(
+        &mut ir_ops,
         &o,
         &[
             ("%x", tile_with(&[1.0, 2.0, 3.0, 4.0], DType::F16, &[1, 4])),
@@ -1340,17 +1485,19 @@ fn reduce_explicit_region_single_op() {
 fn reduce_multiop_combiner() {
     // MULTI-OP combiner: max via cmpf(ogt) + select. The tree fold runs BOTH ops.
     let data = [0.1f32, 0.9, 0.3, 0.2, 0.5, 0.05, 0.7, 0.05];
-    let region = vec![
-        Operation::new(Some("%cmp"), "arith.cmpf", &["%in", "%out"])
-            .with_attr("predicate", Attr::Str("ogt".into())),
-        Operation::new(Some("%m"), "arith.select", &["%cmp", "%in", "%out"]),
-        Operation::new(None, "linalg.yield", &["%m"]),
-    ];
-    let mut o = op("linalg.reduce", &["%x"])
-        .with_attr("dim", Attr::Int(1))
-        .with_attr("outs_var", Attr::Str("%init".into()));
-    o.regions = vec![region];
+    let mut ir_ops = Ops::new();
+    let cmp = ir_ops.op(Some("%cmp"), OpKind::ArithCmpf, &["%in", "%out"]);
+    let cmp = ir_ops.attr(cmp, AttrKey::Predicate, Attr::Str("ogt"));
+    let m = ir_ops.op(Some("%m"), OpKind::ArithSelect, &["%cmp", "%in", "%out"]);
+    let y = ir_ops.op(None, OpKind::LinalgYield, &["%m"]);
+    let region = vec![cmp, m, y];
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+    let o = ir_ops.attr(o, AttrKey::Dim, Attr::Int(1));
+    let outs_var = ir_ops.ssas_attr(&["%init"]);
+    let o = ir_ops.attr(o, AttrKey::OutsVar, outs_var);
+    let o = ir_ops.with_region(o, region);
     let r = run_op_execute(
+        &mut ir_ops,
         &o,
         &[
             ("%x", tile_with(&data, DType::F16, &[1, 8])),
@@ -1370,11 +1517,14 @@ fn reduce_multiop_combiner() {
 fn reduce_multi_axis() {
     // #106: dimensions=[0,1] reduces BOTH axes of a 2x3 tile -> scalar 15.
     // Mirrors the now-passing Python `test_reduce_multi_axis`.
-    let o = op("linalg.reduce", &["%x"])
-        .with_attr("reduce_fn", Attr::Str("arith.addf".into()))
-        .with_attr("dimensions", Attr::IntList(vec![0, 1]))
-        .with_attr("outs_var", Attr::Str("%init".into()));
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+    let o = ir_ops.attr(o, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+    let o = ir_ops.attr(o, AttrKey::Dimensions, ir_ops.int_list(vec![0, 1]));
+    let outs_var = ir_ops.ssas_attr(&["%init"]);
+    let o = ir_ops.attr(o, AttrKey::OutsVar, outs_var);
     let r = run_op_execute(
+        &mut ir_ops,
         &o,
         &[
             (
@@ -1402,11 +1552,14 @@ fn reduce_multi_axis_3d_disjoint() {
             }
         }
     }
-    let o = op("linalg.reduce", &["%x"])
-        .with_attr("reduce_fn", Attr::Str("arith.addf".into()))
-        .with_attr("dimensions", Attr::IntList(vec![0, 2]))
-        .with_attr("outs_var", Attr::Str("%init".into()));
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+    let o = ir_ops.attr(o, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+    let o = ir_ops.attr(o, AttrKey::Dimensions, ir_ops.int_list(vec![0, 2]));
+    let outs_var = ir_ops.ssas_attr(&["%init"]);
+    let o = ir_ops.attr(o, AttrKey::OutsVar, outs_var);
     let r = run_op_execute(
+        &mut ir_ops,
         &o,
         &[
             ("%x", tile_with(&data, DType::F16, &[3, 4, 2])),
@@ -1423,11 +1576,14 @@ fn reduce_multi_axis_zero_dims_identity() {
     // #106: dimensions=[] reduces ZERO axes — identity (shape & values unchanged).
     // Mirrors Python `test_reduce_multi_axis_3d_0d`.
     let data: Vec<f32> = (0..24).map(|x| x as f32).collect();
-    let o = op("linalg.reduce", &["%x"])
-        .with_attr("reduce_fn", Attr::Str("arith.addf".into()))
-        .with_attr("dimensions", Attr::IntList(vec![]))
-        .with_attr("outs_var", Attr::Str("%init".into()));
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+    let o = ir_ops.attr(o, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+    let o = ir_ops.attr(o, AttrKey::Dimensions, ir_ops.int_list(vec![]));
+    let outs_var = ir_ops.ssas_attr(&["%init"]);
+    let o = ir_ops.attr(o, AttrKey::OutsVar, outs_var);
     let r = run_op_execute(
+        &mut ir_ops,
         &o,
         &[
             ("%x", tile_with(&data, DType::F16, &[3, 4, 2])),
@@ -1449,10 +1605,13 @@ fn reduce_identity_outs_is_a_noop() {
     // matching the Python oracle. The resident executor stays bit-exact because the
     // fusion prefixes each reduce's `outs_var` to its own per-node identity splat
     // (`rename_attrs` in ktir-optimizer), so no stale shared accumulator is folded.
-    let o = op("linalg.reduce", &["%x"])
-        .with_attr("reduce_fn", Attr::Str("arith.addf".into()))
-        .with_attr("outs_var", Attr::Str("%init".into()));
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgReduce, &["%x"]);
+    let o = ir_ops.attr(o, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+    let outs_var = ir_ops.ssas_attr(&["%init"]);
+    let o = ir_ops.attr(o, AttrKey::OutsVar, outs_var);
     let r = run_op_execute(
+        &mut ir_ops,
         &o,
         &[
             ("%x", f16_tile(&[1.0, 2.0, 3.0, 4.0])),
@@ -1465,7 +1624,8 @@ fn reduce_identity_outs_is_a_noop() {
 #[test]
 fn fill() {
     let r = run_op(
-        &op("linalg.fill", &["%val", "%out"]),
+        OpKind::LinalgFill,
+        &["%val", "%out"],
         &[
             ("%val", sf(3.0)),
             ("%out", tile_with(&[0.0; 4], DType::F16, &[4])),
@@ -1478,9 +1638,11 @@ fn fill() {
 
 #[test]
 fn broadcast() {
-    let o =
-        op("linalg.broadcast", &["%inp", "%out"]).with_attr("dimensions", Attr::IntList(vec![0]));
-    let r = run_op(
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgBroadcast, &["%inp", "%out"]);
+    let o = ir_ops.attr(o, AttrKey::Dimensions, ir_ops.int_list(vec![0]));
+    let r = run_built(
+        &mut ir_ops,
         &o,
         &[
             ("%inp", tile_with(&[1.0, 2.0, 3.0, 4.0], DType::F16, &[4])),
@@ -1497,7 +1659,8 @@ fn broadcast() {
 fn matmul() {
     // identity @ B == B.
     let r = run_op(
-        &op("linalg.matmul", &["%a", "%b"]),
+        OpKind::LinalgMatmul,
+        &["%a", "%b"],
         &[
             ("%a", tile_with(&[1.0, 0.0, 0.0, 1.0], DType::F16, &[2, 2])),
             ("%b", tile_with(&[1.0, 2.0, 3.0, 4.0], DType::F16, &[2, 2])),
@@ -1512,7 +1675,8 @@ fn batch_matmul() {
     let eye: Vec<f32> = (0..3).flat_map(|_| vec![1.0, 0.0, 0.0, 1.0]).collect();
     let bdata: Vec<f32> = (0..12).map(|x| x as f32).collect();
     let r = run_op(
-        &op("linalg.batch_matmul", &["%a", "%b"]),
+        OpKind::LinalgBatchMatmul,
+        &["%a", "%b"],
         &[
             ("%a", tile_with(&eye, DType::F16, &[3, 2, 2])),
             ("%b", tile_with(&bdata, DType::F16, &[3, 2, 2])),
@@ -1526,20 +1690,16 @@ fn batch_matmul() {
 #[test]
 fn generic_reads_outs_arg() {
     // linalg.generic body reads outs bb0 arg: outs (1,2) + ins (10,20) = (11,22).
-    let bb0 = Operation::new(None, "region.bb0_args", &[]).with_attr(
-        "names",
-        Attr::StrList(vec!["%in_arg".into(), "%out_arg".into()]),
-    );
-    let add = Operation::new(Some("%sum"), "arith.addf", &["%in_arg", "%out_arg"]);
-    let yld = Operation::new(None, "linalg.yield", &["%sum"]);
-    let mut o = op("linalg.generic", &["%ins", "%outs"])
-        .with_attr("n_ins", Attr::Int(1))
-        .with_attr(
-            "bb0_names",
-            Attr::StrList(vec!["%in_arg".into(), "%out_arg".into()]),
-        );
-    o.regions = vec![vec![bb0, add, yld]];
+    let mut ir_ops = Ops::new();
+    let add = ir_ops.op(Some("%sum"), OpKind::ArithAddf, &["%in_arg", "%out_arg"]);
+    let yld = ir_ops.op(None, OpKind::LinalgYield, &["%sum"]);
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgGeneric, &["%ins", "%outs"]);
+    let o = ir_ops.attr(o, AttrKey::NIns, Attr::Int(1));
+    let bb0 = ir_ops.ssas_attr(&["%in_arg", "%out_arg"]);
+    let o = ir_ops.attr(o, AttrKey::Bb0Names, bb0);
+    let o = ir_ops.with_region(o, vec![add, yld]);
     let r = run_op_execute(
+        &mut ir_ops,
         &o,
         &[
             ("%ins", f16_tile(&[10.0, 20.0])),
@@ -1556,11 +1716,10 @@ fn linalg_index() {
     let grid = GridExecutor::new((1, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
-    ctx.set_value(
-        "__linalg_shape__",
-        Value::Tuple(vec![Value::Index(4), Value::Index(3)]),
-    );
-    let o = Operation::new(Some("%r"), "linalg.index", &[]).with_attr("dim", Attr::Int(0));
+    ctx.push_index_shape(vec![4, 3]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::LinalgIndex, &[]);
+    let o = ir_ops.attr(o, AttrKey::Dim, Attr::Int(0));
     let r = execute_op(&o, &mut ctx, &env).unwrap().unwrap();
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![4, 1]);
@@ -1569,18 +1728,16 @@ fn linalg_index() {
 
 #[test]
 fn linalg_yield() {
-    // linalg.yield parks its operand under the yield sentinel; the handler
-    // returns None (no SSA result). Drive it directly and check the parked value.
+    // linalg.yield returns its operand's value directly (no SSA result binding).
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
-    ctx.set_value("%v", idx(42));
-    let o = Operation::new(None, "linalg.yield", &["%v"]);
-    let produced = dispatch.handler("linalg.yield").unwrap()(&o, &mut ctx, &env).unwrap();
-    assert!(produced.is_none());
-    // The parked yield value is recoverable under the sentinel key.
-    assert_eq!(as_i64(ctx.get_value("__linalg_yield__").unwrap()), 42);
+    let mut ir_ops = Ops::new();
+    ctx.set_value(ir_ops.ssa("%v"), idx(42));
+    let o = ir_ops.op(None, OpKind::LinalgYield, &["%v"]);
+    let produced = dispatch.handler(OpKind::LinalgYield).unwrap()(&o, &mut ctx, &env).unwrap();
+    assert_eq!(as_i64(&produced.unwrap()), 42);
 }
 
 // ===========================================================================
@@ -1589,20 +1746,22 @@ fn linalg_yield() {
 
 #[test]
 fn tensor_empty() {
-    let o = Operation::new(Some("%r"), "tensor.empty", &[])
-        .with_attr("shape", Attr::IntList(vec![2, 4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
-    let r = run_op(&o, &[]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorEmpty, &[]);
+    let o = ir_ops.attr(o, AttrKey::Shape, ir_ops.int_list(vec![2, 4]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("f16"));
+    let r = run_built(&mut ir_ops, &o, &[]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![2, 4]);
 }
 
 #[test]
 fn tensor_splat() {
-    let o = op("tensor.splat", &["%val"])
-        .with_attr("shape", Attr::IntList(vec![4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
-    let r = run_op(&o, &[("%val", sf(7.0))]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorSplat, &["%val"]);
+    let o = ir_ops.attr(o, AttrKey::Shape, ir_ops.int_list(vec![4]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("f16"));
+    let r = run_built(&mut ir_ops, &o, &[("%val", sf(7.0))]);
     let t = as_tile(&r);
     assert!(t.as_f32().iter().all(|&x| x == 7.0));
 }
@@ -1611,7 +1770,8 @@ fn tensor_splat() {
 fn tensor_extract() {
     // 2x2 tile [[1,2],[3,4]] at [1,0] -> 3.
     let r = run_op(
-        &op("tensor.extract", &["%t", "%i", "%j"]),
+        OpKind::TensorExtract,
+        &["%t", "%i", "%j"],
         &[
             ("%t", tile_with(&[1.0, 2.0, 3.0, 4.0], DType::F16, &[2, 2])),
             ("%i", idx(1)),
@@ -1623,8 +1783,11 @@ fn tensor_extract() {
 
 #[test]
 fn tensor_expand_shape() {
-    let o = op("tensor.expand_shape", &["%t"]).with_attr("target_shape", Attr::IntList(vec![1, 4]));
-    let r = run_op(
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorExpandShape, &["%t"]);
+    let o = ir_ops.attr(o, AttrKey::TargetShape, ir_ops.int_list(vec![1, 4]));
+    let r = run_built(
+        &mut ir_ops,
         &o,
         &[("%t", tile_with(&[1.0, 2.0, 3.0, 4.0], DType::F16, &[4]))],
     );
@@ -1633,8 +1796,11 @@ fn tensor_expand_shape() {
 
 #[test]
 fn tensor_collapse_shape() {
-    let o = op("tensor.collapse_shape", &["%t"]).with_attr("target_shape", Attr::IntList(vec![4]));
-    let r = run_op(
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorCollapseShape, &["%t"]);
+    let o = ir_ops.attr(o, AttrKey::TargetShape, ir_ops.int_list(vec![4]));
+    let r = run_built(
+        &mut ir_ops,
         &o,
         &[("%t", tile_with(&[1.0, 2.0, 3.0, 4.0], DType::F16, &[2, 2]))],
     );
@@ -1645,11 +1811,13 @@ fn tensor_collapse_shape() {
 
 #[test]
 fn tensor_reshape() {
-    let o = op("tensor.reshape", &["%t", "%s"])
-        .with_attr("target_shape", Attr::IntList(vec![2, 4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorReshape, &["%t", "%s"]);
+    let o = ir_ops.attr(o, AttrKey::TargetShape, ir_ops.int_list(vec![2, 4]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("f16"));
     let data: Vec<f32> = (0..8).map(|x| x as f32).collect();
-    let r = run_op(
+    let r = run_built(
+        &mut ir_ops,
         &o,
         &[
             ("%t", tile_with(&data, DType::F16, &[8])),
@@ -1663,11 +1831,13 @@ fn tensor_reshape() {
 
 #[test]
 fn tensor_reshape_non_square_target() {
-    let o = op("tensor.reshape", &["%t", "%s"])
-        .with_attr("target_shape", Attr::IntList(vec![3, 4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorReshape, &["%t", "%s"]);
+    let o = ir_ops.attr(o, AttrKey::TargetShape, ir_ops.int_list(vec![3, 4]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("f16"));
     let data: Vec<f32> = (0..12).map(|x| x as f32).collect();
-    let r = run_op(
+    let r = run_built(
+        &mut ir_ops,
         &o,
         &[
             ("%t", tile_with(&data, DType::F16, &[12])),
@@ -1682,11 +1852,13 @@ fn tensor_reshape_non_square_target() {
 #[test]
 fn tensor_reshape_size_mismatch_raises() {
     // 7 elements cannot fill (3,3)=9. Must error, not silently truncate.
-    let o = op("tensor.reshape", &["%t", "%s"])
-        .with_attr("target_shape", Attr::IntList(vec![3, 3]))
-        .with_attr("dtype", Attr::Str("f16".into()));
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorReshape, &["%t", "%s"]);
+    let o = ir_ops.attr(o, AttrKey::TargetShape, ir_ops.int_list(vec![3, 3]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("f16"));
     let data: Vec<f32> = (0..7).map(|x| x as f32).collect();
-    let err = run_op_try(
+    let err = run_built_try(
+        &mut ir_ops,
         &o,
         &[
             ("%t", tile_with(&data, DType::F16, &[7])),
@@ -1699,11 +1871,13 @@ fn tensor_reshape_size_mismatch_raises() {
 
 #[test]
 fn tensor_reshape_to_3d() {
-    let o = op("tensor.reshape", &["%t", "%s"])
-        .with_attr("target_shape", Attr::IntList(vec![2, 3, 4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorReshape, &["%t", "%s"]);
+    let o = ir_ops.attr(o, AttrKey::TargetShape, ir_ops.int_list(vec![2, 3, 4]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("f16"));
     let data: Vec<f32> = (0..24).map(|x| x as f32).collect();
-    let r = run_op(
+    let r = run_built(
+        &mut ir_ops,
         &o,
         &[
             ("%t", tile_with(&data, DType::F16, &[24])),
@@ -1717,10 +1891,11 @@ fn tensor_reshape_to_3d() {
 
 #[test]
 fn tensor_from_elements() {
-    let o = op("tensor.from_elements", &["%a", "%b"])
-        .with_attr("shape", Attr::IntList(vec![2]))
-        .with_attr("dtype", Attr::Str("index".into()));
-    let r = run_op(&o, &[("%a", idx(16)), ("%b", idx(32))]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorFromElements, &["%a", "%b"]);
+    let o = ir_ops.attr(o, AttrKey::Shape, ir_ops.int_list(vec![2]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("index"));
+    let r = run_built(&mut ir_ops, &o, &[("%a", idx(16)), ("%b", idx(32))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![2]);
     assert_eq!(t.as_f32().to_vec(), vec![16.0, 32.0]);
@@ -1728,10 +1903,11 @@ fn tensor_from_elements() {
 
 #[test]
 fn tensor_from_elements_n1() {
-    let o = op("tensor.from_elements", &["%a"])
-        .with_attr("shape", Attr::IntList(vec![1]))
-        .with_attr("dtype", Attr::Str("index".into()));
-    let r = run_op(&o, &[("%a", idx(128))]);
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%r"), OpKind::TensorFromElements, &["%a"]);
+    let o = ir_ops.attr(o, AttrKey::Shape, ir_ops.int_list(vec![1]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("index"));
+    let r = run_built(&mut ir_ops, &o, &[("%a", idx(128))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![1]);
     assert_eq!(t.as_f32().to_vec(), vec![128.0]);
@@ -1744,15 +1920,17 @@ fn tensor_from_elements_n1() {
 #[test]
 fn generate_1d() {
     // ^bb0(%i): %val = muli %i, %c2 ; yield %val  over shape [4] -> [0,2,4,6].
-    let bb0 = Operation::new(None, "region.bb0_args", &[])
-        .with_attr("names", Attr::StrList(vec!["%i".into()]));
-    let mul = Operation::new(Some("%val"), "arith.muli", &["%i", "%c2"]);
-    let yld = Operation::new(None, "tensor.yield", &["%val"]);
-    let mut o = Operation::new(Some("%r"), "tensor.generate", &[])
-        .with_attr("shape", Attr::IntList(vec![4]))
-        .with_attr("dtype", Attr::Str("f16".into()));
-    o.regions = vec![vec![bb0, mul, yld]];
-    let r = run_op_execute(&o, &[("%c2", idx(2))]);
+    let mut ir_ops = Ops::new();
+    let names = ir_ops.ssas_attr(&["%i"]);
+    let bb0 = ir_ops.op(None, OpKind::RegionBb0Args, &[]);
+    let bb0 = ir_ops.attr(bb0, AttrKey::Names, names);
+    let mul = ir_ops.op(Some("%val"), OpKind::ArithMuli, &["%i", "%c2"]);
+    let yld = ir_ops.op(None, OpKind::TensorYield, &["%val"]);
+    let o = ir_ops.op(Some("%r"), OpKind::TensorGenerate, &[]);
+    let o = ir_ops.attr(o, AttrKey::Shape, ir_ops.int_list(vec![4]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("f16"));
+    let o = ir_ops.with_region(o, vec![bb0, mul, yld]);
+    let r = run_op_execute(&mut ir_ops, &o, &[("%c2", idx(2))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![4]);
     assert_eq!(t.as_f32().to_vec(), vec![0.0, 2.0, 4.0, 6.0]);
@@ -1761,16 +1939,18 @@ fn generate_1d() {
 #[test]
 fn generate_2d() {
     // ^bb0(%i, %j): %cmp = cmpi sge %i,%j ; yield %cmp  over 3x3.
-    let bb0 = Operation::new(None, "region.bb0_args", &[])
-        .with_attr("names", Attr::StrList(vec!["%i".into(), "%j".into()]));
-    let cmp = Operation::new(Some("%cmp"), "arith.cmpi", &["%i", "%j"])
-        .with_attr("predicate", Attr::Str("sge".into()));
-    let yld = Operation::new(None, "tensor.yield", &["%cmp"]);
-    let mut o = Operation::new(Some("%r"), "tensor.generate", &[])
-        .with_attr("shape", Attr::IntList(vec![3, 3]))
-        .with_attr("dtype", Attr::Str("f16".into()));
-    o.regions = vec![vec![bb0, cmp, yld]];
-    let r = run_op_execute(&o, &[]);
+    let mut ir_ops = Ops::new();
+    let names = ir_ops.ssas_attr(&["%i", "%j"]);
+    let bb0 = ir_ops.op(None, OpKind::RegionBb0Args, &[]);
+    let bb0 = ir_ops.attr(bb0, AttrKey::Names, names);
+    let cmp = ir_ops.op(Some("%cmp"), OpKind::ArithCmpi, &["%i", "%j"]);
+    let cmp = ir_ops.attr(cmp, AttrKey::Predicate, Attr::Str("sge"));
+    let yld = ir_ops.op(None, OpKind::TensorYield, &["%cmp"]);
+    let o = ir_ops.op(Some("%r"), OpKind::TensorGenerate, &[]);
+    let o = ir_ops.attr(o, AttrKey::Shape, ir_ops.int_list(vec![3, 3]));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Str("f16"));
+    let o = ir_ops.with_region(o, vec![bb0, cmp, yld]);
+    let r = run_op_execute(&mut ir_ops, &o, &[]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![3, 3]);
     // i >= j lower-triangular (incl diagonal): [[1,0,0],[1,1,0],[1,1,1]]
@@ -1788,7 +1968,8 @@ fn generate_2d() {
 fn scf_yield() {
     // scf.yield wraps operands in a Value::Tuple (the _YieldResult analogue).
     let r = run_op(
-        &op_noresult("scf.yield", &["%a", "%b"]),
+        OpKind::ScfYield,
+        &["%a", "%b"],
         &[("%a", idx(5)), ("%b", idx(6))],
     );
     match r {
@@ -1808,51 +1989,65 @@ fn return_no_value() {
     let grid = GridExecutor::new((1, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
-    let o = Operation::new(None, "func.return", &[]);
-    let out = dispatch.handler("func.return").unwrap()(&o, &mut ctx, &env).unwrap();
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(None, OpKind::FuncReturn, &[]);
+    let out = dispatch.handler(OpKind::FuncReturn).unwrap()(&o, &mut ctx, &env).unwrap();
     assert!(out.is_none());
 }
 
 #[test]
 fn if_then_branch() {
     // condition=true runs the then-region; its yielded value surfaces as %r.
-    let then = vec![
-        Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Int(1)),
-        Operation::new(None, "scf.yield", &["%t"]),
-    ];
-    let els: Vec<Operation> = vec![
-        Operation::new(Some("%f"), "arith.constant", &[]).with_attr("value", Attr::Int(2)),
-        Operation::new(None, "scf.yield", &["%f"]),
-    ];
-    let mut o = Operation::new(Some("%r"), "scf.if", &["%cond"]);
-    o.regions = vec![then, els];
-    let r = run_op_execute(&o, &[("%cond", Value::Scalar(Scalar::Bool(true)))]);
+    let mut ir_ops = Ops::new();
+    let t = ir_ops.op(Some("%t"), OpKind::ArithConstant, &[]);
+    let t = ir_ops.attr(t, AttrKey::Value, Attr::Int(1));
+    let yt = ir_ops.op(None, OpKind::ScfYield, &["%t"]);
+    let then = vec![t, yt];
+    let f = ir_ops.op(Some("%f"), OpKind::ArithConstant, &[]);
+    let f = ir_ops.attr(f, AttrKey::Value, Attr::Int(2));
+    let yf = ir_ops.op(None, OpKind::ScfYield, &["%f"]);
+    let els = vec![f, yf];
+    let o = ir_ops.op(Some("%r"), OpKind::ScfIf, &["%cond"]);
+    let o = ir_ops.regions(o, vec![then, els]);
+    let r = run_op_execute(
+        &mut ir_ops,
+        &o,
+        &[("%cond", Value::Scalar(Scalar::Bool(true)))],
+    );
     assert_eq!(as_i64(&r), 1);
 }
 
 #[test]
 fn if_else_branch() {
-    let then = vec![
-        Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Int(1)),
-        Operation::new(None, "scf.yield", &["%t"]),
-    ];
-    let els: Vec<Operation> = vec![
-        Operation::new(Some("%f"), "arith.constant", &[]).with_attr("value", Attr::Int(2)),
-        Operation::new(None, "scf.yield", &["%f"]),
-    ];
-    let mut o = Operation::new(Some("%r"), "scf.if", &["%cond"]);
-    o.regions = vec![then, els];
-    let r = run_op_execute(&o, &[("%cond", Value::Scalar(Scalar::Bool(false)))]);
+    let mut ir_ops = Ops::new();
+    let t = ir_ops.op(Some("%t"), OpKind::ArithConstant, &[]);
+    let t = ir_ops.attr(t, AttrKey::Value, Attr::Int(1));
+    let yt = ir_ops.op(None, OpKind::ScfYield, &["%t"]);
+    let then = vec![t, yt];
+    let f = ir_ops.op(Some("%f"), OpKind::ArithConstant, &[]);
+    let f = ir_ops.attr(f, AttrKey::Value, Attr::Int(2));
+    let yf = ir_ops.op(None, OpKind::ScfYield, &["%f"]);
+    let els = vec![f, yf];
+    let o = ir_ops.op(Some("%r"), OpKind::ScfIf, &["%cond"]);
+    let o = ir_ops.regions(o, vec![then, els]);
+    let r = run_op_execute(
+        &mut ir_ops,
+        &o,
+        &[("%cond", Value::Scalar(Scalar::Bool(false)))],
+    );
     assert_eq!(as_i64(&r), 2);
 }
 
 #[test]
 fn if_then_else_yield_result() {
     // A yielding then-branch returns the unwrapped value (not a tuple wrapper).
-    let then = vec![Operation::new(None, "scf.yield", &["%val"])];
-    let mut o = Operation::new(Some("%res"), "scf.if", &["%cond"]);
-    o.regions = vec![then, vec![]];
+    let mut ir_ops = Ops::new();
+    let yv = ir_ops.op(None, OpKind::ScfYield, &["%val"]);
+    let then = vec![yv];
+    let o = ir_ops.op(Some("%res"), OpKind::ScfIf, &["%cond"]);
+    let o = ir_ops.regions(o, vec![then, vec![]]);
     let r = run_op_execute(
+        &mut ir_ops,
         &o,
         &[
             ("%cond", Value::Scalar(Scalar::Bool(true))),
@@ -1880,8 +2075,9 @@ fn get_compute_tile_id_single() {
         mem.get_lx(3),
         mem.lx_scratchpads.clone(),
     );
-    let o = Operation::new(Some("%id"), "ktdp.get_compute_tile_id", &[]);
-    let r = dispatch.handler("ktdp.get_compute_tile_id").unwrap()(&o, &mut ctx, &env)
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%id"), OpKind::KtdpGetComputeTileId, &[]);
+    let r = dispatch.handler(OpKind::KtdpGetComputeTileId).unwrap()(&o, &mut ctx, &env)
         .unwrap()
         .unwrap();
     assert_eq!(as_i64(&r), 3);
@@ -1902,9 +2098,10 @@ fn get_compute_tile_id_multi() {
         mem.get_lx(core),
         mem.lx_scratchpads.clone(),
     );
-    let o = Operation::new(Some("%x"), "ktdp.get_compute_tile_id", &[])
-        .with_attr("num_results", Attr::Int(2));
-    let r = dispatch.handler("ktdp.get_compute_tile_id").unwrap()(&o, &mut ctx, &env)
+    let mut ir_ops = Ops::new();
+    let o = ir_ops.op(Some("%x"), OpKind::KtdpGetComputeTileId, &[]);
+    let o = ir_ops.attr(o, AttrKey::NumResults, Attr::Int(2));
+    let r = dispatch.handler(OpKind::KtdpGetComputeTileId).unwrap()(&o, &mut ctx, &env)
         .unwrap()
         .unwrap();
     match r {
@@ -1928,12 +2125,13 @@ fn construct_memory_view() {
     // The pointer SSA value is an ELEMENT index (RFC #110): elem = stick*128/2 (f16)
     // so the view's byte_address lands on stick*STICK_BYTES.
     let elem = stick * STICK_BYTES / DType::F16.bytes_per_elem() as i64;
-    ctx.set_value("%ptr", Value::Index(elem));
-    let o = Operation::new(Some("%view"), "ktdp.construct_memory_view", &["%ptr"])
-        .with_attr("shape", Attr::IntList(vec![256]))
-        .with_attr("strides", Attr::IntList(vec![1]))
-        .with_attr("memory_space", Attr::Str("HBM".into()))
-        .with_attr("dtype", Attr::Str("f16".into()));
+    let mut ir_ops = Ops::new();
+    ctx.set_value(ir_ops.ssa("%ptr"), Value::Index(elem));
+    let o = ir_ops.op(Some("%view"), OpKind::KtdpConstructMemoryView, &["%ptr"]);
+    let o = ir_ops.attr(o, AttrKey::Shape, ir_ops.int_list(vec![256]));
+    let o = ir_ops.attr(o, AttrKey::Strides, ir_ops.int_list(vec![1]));
+    let o = ir_ops.attr(o, AttrKey::MemorySpace, Attr::Str("HBM"));
+    let o = ir_ops.attr(o, AttrKey::Dtype, Attr::Dtype(DType::F16));
     let r = execute_op(&o, &mut ctx, &env).unwrap().unwrap();
     match r {
         Value::MemRef(m) => {
@@ -1950,7 +2148,6 @@ fn load_store_roundtrip() {
     // load reads from HBM; store writes a modified tile back. Drive the full
     // construct_memory_view + construct_access_tile + load/store chain so we use
     // the real MemRef/AccessTile types rather than hand-building them.
-    use ktir_emulator::affine::AffineMap;
     use ktir_emulator::interpreter::execute_ops;
 
     let dispatch = Dispatch::new();
@@ -1969,32 +2166,28 @@ fn load_store_roundtrip() {
     // The pointer SSA value is an ELEMENT index (RFC #110): elem = stick*128/2 (f16)
     // so the view's byte_address lands on the seeded stick*STICK_BYTES.
     let elem = stick * STICK_BYTES / DType::F16.bytes_per_elem() as i64;
-    ctx.set_value("%p", Value::Index(elem));
-    ctx.set_value("%i", Value::Index(0));
+    let mut ir_ops = Ops::new();
+    ctx.set_value(ir_ops.ssa("%p"), Value::Index(elem));
+    ctx.set_value(ir_ops.ssa("%i"), Value::Index(0));
 
-    let view = Operation::new(Some("%v"), "ktdp.construct_memory_view", &["%p"])
-        .with_attr("shape", Attr::IntList(vec![n as i64]))
-        .with_attr("strides", Attr::IntList(vec![1]))
-        .with_attr("memory_space", Attr::Str("HBM".into()))
-        .with_attr("dtype", Attr::Str("f16".into()));
-    let access = |res: &str| {
-        Operation::new(Some(res), "ktdp.construct_access_tile", &["%v", "%i"])
-            .with_attr("shape", Attr::IntList(vec![n as i64]))
-            .with_attr("base_map", Attr::AffineMap(AffineMap::identity(1)))
-    };
+    let view = ir_ops.op(Some("%v"), OpKind::KtdpConstructMemoryView, &["%p"]);
+    let view = ir_ops.attr(view, AttrKey::Shape, ir_ops.int_list(vec![n as i64]));
+    let view = ir_ops.attr(view, AttrKey::Strides, ir_ops.int_list(vec![1]));
+    let view = ir_ops.attr(view, AttrKey::MemorySpace, Attr::Str("HBM"));
+    let view = ir_ops.attr(view, AttrKey::Dtype, Attr::Dtype(DType::F16));
+
+    let acc = ir_ops.op(Some("%acc"), OpKind::KtdpConstructAccessTile, &["%v", "%i"]);
+    let acc = ir_ops.attr(acc, AttrKey::Shape, ir_ops.int_list(vec![n as i64]));
+    let acc = ir_ops.attr(
+        acc,
+        AttrKey::BaseMap,
+        Attr::AffineMap(ir_ops.identity_map(1)),
+    );
+    let load = ir_ops.op(Some("%t"), OpKind::KtdpLoad, &["%acc"]);
 
     // Load and verify.
-    execute_ops(
-        &[
-            view.clone(),
-            access("%acc"),
-            Operation::new(Some("%t"), "ktdp.load", &["%acc"]),
-        ],
-        &mut ctx,
-        &env,
-    )
-    .unwrap();
-    match ctx.get_value("%t").unwrap() {
+    execute_ops(&[view, acc, load], &mut ctx, &env).unwrap();
+    match ctx.get_value(ir_ops.ssa("%t")).unwrap() {
         Value::Tile(t) => assert_eq!(t.as_f32().to_vec(), data),
         other => panic!("expected Tile, got {other:?}"),
     }
@@ -2002,18 +2195,22 @@ fn load_store_roundtrip() {
     // Store data*2 back through the same access tile and verify HBM.
     let doubled: Vec<f32> = data.iter().map(|&x| x * 2.0).collect();
     ctx.set_value(
-        "%tile",
+        ir_ops.ssa("%tile"),
         Value::Tile(Tile::compute(doubled.clone(), DType::F16, vec![n])),
     );
-    execute_ops(
-        &[
-            access("%acc2"),
-            Operation::new(None, "ktdp.store", &["%tile", "%acc2"]),
-        ],
-        &mut ctx,
-        &env,
-    )
-    .unwrap();
+    let acc2 = ir_ops.op(
+        Some("%acc2"),
+        OpKind::KtdpConstructAccessTile,
+        &["%v", "%i"],
+    );
+    let acc2 = ir_ops.attr(acc2, AttrKey::Shape, ir_ops.int_list(vec![n as i64]));
+    let acc2 = ir_ops.attr(
+        acc2,
+        AttrKey::BaseMap,
+        Attr::AffineMap(ir_ops.identity_map(1)),
+    );
+    let store = ir_ops.op(None, OpKind::KtdpStore, &["%tile", "%acc2"]);
+    execute_ops(&[acc2, store], &mut ctx, &env).unwrap();
     let raw = ctx.hbm.borrow().read_bytes(stick * STICK_BYTES, n * 2);
     let got = ktir_emulator::codec::decode(&raw, n, DType::F16);
     assert_eq!(got, doubled);

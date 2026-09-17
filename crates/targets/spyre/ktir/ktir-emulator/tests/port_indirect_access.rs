@@ -46,9 +46,9 @@
 //!   exist in the crate. Both cases are `#[ignore]`d with that reason.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use ktir_emulator::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
+use ktir_emulator::arena::Arena;
 use ktir_emulator::codec;
 use ktir_emulator::context::CoreContext;
 use ktir_emulator::dtypes::DType;
@@ -65,7 +65,8 @@ use ktir_emulator::tile::Tile;
 /// Row-major box affine set `[0, n-1]` per axis (`d_i >= 0`, `n_i-1 - d_i >= 0`).
 /// Its `enumerate(&shape, &[])` yields the row-major variable-space point order
 /// the Python `vss.enumerate` iterates.
-fn box_set(sizes: &[i64]) -> AffineSet {
+fn box_set(sizes: &[i64]) -> AffineSet<'static> {
+    let a = Arena::global();
     let mut constraints = Vec::new();
     for (i, &n) in sizes.iter().enumerate() {
         constraints.push(Constraint {
@@ -73,26 +74,24 @@ fn box_set(sizes: &[i64]) -> AffineSet {
             kind: ConstraintKind::GreaterEq,
         });
         constraints.push(Constraint {
-            expr: AffineExpr::Sub(
-                Rc::new(AffineExpr::Const(n - 1)),
-                Rc::new(AffineExpr::Dim(i)),
-            ),
+            expr: AffineExpr::Sub(a.expr(AffineExpr::Const(n - 1)), a.expr(AffineExpr::Dim(i))),
             kind: ConstraintKind::GreaterEq,
         });
     }
     AffineSet {
         num_dims: sizes.len(),
         num_syms: 0,
-        constraints,
+        constraints: a.constraints(constraints),
     }
 }
 
 /// Affine map `(d0,..) -> (perm[0], perm[1], ..)` over `perm.len()` dims.
-fn perm_map(perm: &[usize]) -> AffineMap {
+fn perm_map(perm: &[usize]) -> AffineMap<'static> {
+    let a = Arena::global();
     AffineMap {
         num_dims: perm.len(),
         num_syms: 0,
-        exprs: perm.iter().map(|&d| AffineExpr::Dim(d)).collect(),
+        exprs: a.exprs(perm.iter().map(|&d| AffineExpr::Dim(d)).collect()),
     }
 }
 
@@ -139,8 +138,8 @@ fn make_iat(
     shape: Vec<usize>,
     dims: &[(&str, usize)],
     index_views: Vec<MemRef>,
-    vss: AffineSet,
-    vso: Option<AffineMap>,
+    vss: AffineSet<'static>,
+    vso: Option<AffineMap<'static>>,
 ) -> IndirectAccessTile {
     let dim_subscripts = dims
         .iter()
