@@ -66,11 +66,25 @@ for d in [
         units = [i for b in w["batches"] for i in b["items"] if i["name"] not in filled]
         if not units:
             continue
-        proto = {k: v for k, v in w["batches"][0].items() if k != "items"}
-        waves.append({
-            "unit_count": len(units),
-            "batches": [dict(proto, items=b) for b in batch(units)],
-        })
+        # ⛔⛔ REGROUP BY SOURCE FILE, AND NEVER STAMP ONE BATCH'S `source_file` ONTO ANOTHER'S UNITS.
+        # The first version flattened a wave's batches into one list, re-cut it on MAX_SYMS alone, and
+        # copied `proto` from `w["batches"][0]` — so layer 0's seven surviving units became ONE batch
+        # labelled `dims.h` even though it held `ddc_metadata.h`'s FailedAlloc and `dsc2.h`'s DataInfo,
+        # CoordinateType and TransferPadInfo. Two consequences, measured on the 2026-09-16 sc1 wave:
+        #   1. `source_file` was a LIE. Per-item `defined_in` stayed right, which is what crustify
+        #      resolves a home from, so nothing failed and nothing warned.
+        #   2. ALL PARALLELISM WAS LOST. port.json's 9 batches collapsed to 4 — one per layer — and
+        #      because a wave IS a barrier, batches never overlapped: `--parallel-max 3` was never
+        #      exercised and 14 units ran strictly serially, one agent at a time, for 3h49m.
+        # `defined_in` is the truthful key: it is what the schedule already says each unit came from.
+        groups: dict[str, list] = {}
+        for u in units:
+            groups.setdefault(u["defined_in"], []).append(u)
+        bs = []
+        for src, gunits in groups.items():
+            for b in batch(gunits):
+                bs.append({"kind": "type", "source_file": src, "items": b})
+        waves.append({"unit_count": len(units), "batches": bs})
     nb = sum(len(w["batches"]) for w in waves)
     nu = sum(w["unit_count"] for w in waves)
     # ⛔ `layer_count` IS THE NUMBER OF DISTINCT `layer` VALUES, **NOT** THE NUMBER OF WAVES.
