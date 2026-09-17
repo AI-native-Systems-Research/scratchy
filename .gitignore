@@ -1,0 +1,6 @@
+# Chapters copied from docs/ by build.sh, plus mdBook output.
+/book/
+/_site/
+/src/*
+!/src/SUMMARY.md
+!/src/introduction.md
