@@ -117,7 +117,7 @@ path = "benches/smollm2_bench.rs"
 harness = false
 
 [dependencies.blas-src]
-version = "0.10"
+version = "0.13"
 optional = true
 default-features = false
 
