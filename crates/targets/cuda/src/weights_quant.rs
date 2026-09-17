@@ -2920,10 +2920,11 @@ mod tests {
             // Verify data roundtrip: read back from GPU.
             let host = unsafe { driver::mem_alloc_host(a.size_bytes()).unwrap() };
             unsafe {
-                driver::memcpy_dtoh_async(host, a.raw_ptr(), a.size_bytes(), stream).unwrap();
+                driver::memcpy_dtoh_async(host.as_ptr(), a.raw_ptr(), a.size_bytes(), stream)
+                    .unwrap();
                 driver::stream_synchronize(stream).unwrap();
             }
-            let gpu_data = unsafe { std::slice::from_raw_parts(host as *const f32, 6) };
+            let gpu_data = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const f32, 6) };
             for (i, (got, exp)) in gpu_data.iter().zip(data_a.iter()).enumerate() {
                 assert!(
                     (got - exp).abs() < 1e-6,
@@ -3105,10 +3106,11 @@ mod tests {
             // Verify roundtrip.
             let host = unsafe { driver::mem_alloc_host(total_bytes).unwrap() };
             unsafe {
-                driver::memcpy_dtoh_async(host, gpu_buf as *mut u8, total_bytes, stream).unwrap();
+                driver::memcpy_dtoh_async(host.as_ptr(), gpu_buf as *mut u8, total_bytes, stream)
+                    .unwrap();
                 driver::stream_synchronize(stream).unwrap();
             }
-            let gpu_data = unsafe { std::slice::from_raw_parts(host as *const f32, 8) };
+            let gpu_data = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const f32, 8) };
             let expected: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
             for (i, (got, exp)) in gpu_data.iter().zip(expected.iter()).enumerate() {
                 assert!(

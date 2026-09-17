@@ -85,20 +85,20 @@ unsafe fn upload_combined_cos_sin(
     let host = crate::driver::mem_alloc_host(nbytes)?;
     match dtype {
         DType::F32 => {
-            std::ptr::copy_nonoverlapping(cache.as_ptr() as *const u8, host, nbytes);
+            std::ptr::copy_nonoverlapping(cache.as_ptr() as *const u8, host.as_ptr(), nbytes);
         }
         DType::F16 => {
             let f16_data: Vec<half::f16> = cache.iter().map(|&v| half::f16::from_f32(v)).collect();
-            std::ptr::copy_nonoverlapping(f16_data.as_ptr() as *const u8, host, nbytes);
+            std::ptr::copy_nonoverlapping(f16_data.as_ptr() as *const u8, host.as_ptr(), nbytes);
         }
         DType::BF16 => {
             let bf16_data: Vec<half::bf16> =
                 cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
-            std::ptr::copy_nonoverlapping(bf16_data.as_ptr() as *const u8, host, nbytes);
+            std::ptr::copy_nonoverlapping(bf16_data.as_ptr() as *const u8, host.as_ptr(), nbytes);
         }
         _ => anyhow::bail!("unsupported dtype for RoPE cache: {:?}", dtype),
     }
-    crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, stream)?;
+    crate::driver::memcpy_htod_async(gpu_ptr, host.as_ptr(), nbytes, stream)?;
     crate::driver::stream_synchronize(stream)?;
     crate::driver::mem_free_host(host)?;
     Ok(GpuTensor::new(gpu_ptr, &[max_pos, rotary_dim], dtype))
@@ -128,8 +128,12 @@ unsafe fn build_separate_cos_sin(
     macro_rules! upload {
         ($data:expr, $gpu:expr, $T:ty) => {{
             let converted: Vec<$T> = $data.iter().map(|&v| <$T>::from_f32(v)).collect();
-            std::ptr::copy_nonoverlapping(converted.as_ptr() as *const u8, host, half_nbytes);
-            crate::driver::memcpy_htod_async($gpu, host, half_nbytes, stream)?;
+            std::ptr::copy_nonoverlapping(
+                converted.as_ptr() as *const u8,
+                host.as_ptr(),
+                half_nbytes,
+            );
+            crate::driver::memcpy_htod_async($gpu, host.as_ptr(), half_nbytes, stream)?;
         }};
     }
 
@@ -143,10 +147,18 @@ unsafe fn build_separate_cos_sin(
             upload!(sin_data, sin_gpu, half::bf16);
         }
         DType::F32 => {
-            std::ptr::copy_nonoverlapping(cos_data.as_ptr() as *const u8, host, half_nbytes);
-            crate::driver::memcpy_htod_async(cos_gpu, host, half_nbytes, stream)?;
-            std::ptr::copy_nonoverlapping(sin_data.as_ptr() as *const u8, host, half_nbytes);
-            crate::driver::memcpy_htod_async(sin_gpu, host, half_nbytes, stream)?;
+            std::ptr::copy_nonoverlapping(
+                cos_data.as_ptr() as *const u8,
+                host.as_ptr(),
+                half_nbytes,
+            );
+            crate::driver::memcpy_htod_async(cos_gpu, host.as_ptr(), half_nbytes, stream)?;
+            std::ptr::copy_nonoverlapping(
+                sin_data.as_ptr() as *const u8,
+                host.as_ptr(),
+                half_nbytes,
+            );
+            crate::driver::memcpy_htod_async(sin_gpu, host.as_ptr(), half_nbytes, stream)?;
         }
         _ => anyhow::bail!("unsupported dtype for RoPE cache: {:?}", dtype),
     }
@@ -433,8 +445,8 @@ impl CudaRotaryExt for RotaryCache {
         match dtype {
             DType::F32 => {
                 let host = crate::driver::mem_alloc_host(nbytes)?;
-                std::ptr::copy_nonoverlapping(cache.as_ptr() as *const u8, host, nbytes);
-                crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, stream)?;
+                std::ptr::copy_nonoverlapping(cache.as_ptr() as *const u8, host.as_ptr(), nbytes);
+                crate::driver::memcpy_htod_async(gpu_ptr, host.as_ptr(), nbytes, stream)?;
                 crate::driver::stream_synchronize(stream)?;
                 crate::driver::mem_free_host(host)?;
             }
@@ -442,8 +454,12 @@ impl CudaRotaryExt for RotaryCache {
                 let f16_data: Vec<half::f16> =
                     cache.iter().map(|&v| half::f16::from_f32(v)).collect();
                 let host = crate::driver::mem_alloc_host(nbytes)?;
-                std::ptr::copy_nonoverlapping(f16_data.as_ptr() as *const u8, host, nbytes);
-                crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, stream)?;
+                std::ptr::copy_nonoverlapping(
+                    f16_data.as_ptr() as *const u8,
+                    host.as_ptr(),
+                    nbytes,
+                );
+                crate::driver::memcpy_htod_async(gpu_ptr, host.as_ptr(), nbytes, stream)?;
                 crate::driver::stream_synchronize(stream)?;
                 crate::driver::mem_free_host(host)?;
             }
@@ -451,8 +467,12 @@ impl CudaRotaryExt for RotaryCache {
                 let bf16_data: Vec<half::bf16> =
                     cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
                 let host = crate::driver::mem_alloc_host(nbytes)?;
-                std::ptr::copy_nonoverlapping(bf16_data.as_ptr() as *const u8, host, nbytes);
-                crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, stream)?;
+                std::ptr::copy_nonoverlapping(
+                    bf16_data.as_ptr() as *const u8,
+                    host.as_ptr(),
+                    nbytes,
+                );
+                crate::driver::memcpy_htod_async(gpu_ptr, host.as_ptr(), nbytes, stream)?;
                 crate::driver::stream_synchronize(stream)?;
                 crate::driver::mem_free_host(host)?;
             }

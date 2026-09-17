@@ -273,10 +273,10 @@ mod tests {
             dev.sync_compute().expect("sync");
 
             let host = driver::mem_alloc_host(256).expect("host");
-            driver::memcpy_dtoh_async(host, ptr, 256, dev.compute_stream).expect("dtoh");
+            driver::memcpy_dtoh_async(host.as_ptr(), ptr, 256, dev.compute_stream).expect("dtoh");
             driver::stream_synchronize(dev.compute_stream).expect("sync");
 
-            let bytes = std::slice::from_raw_parts(host, 256);
+            let bytes = std::slice::from_raw_parts(host.as_ptr(), 256);
             for (i, &b) in bytes.iter().enumerate() {
                 assert_eq!(b, 0, "not zero at byte {i}");
             }
@@ -294,20 +294,27 @@ mod tests {
             let dst = dev.alloc_persistent(128).expect("dst");
 
             let host = driver::mem_alloc_host(128).expect("host");
-            for i in 0..128 {
-                *host.add(i) = (i * 5) as u8;
+            for (i, b) in std::slice::from_raw_parts_mut(host.as_ptr(), 128)
+                .iter_mut()
+                .enumerate()
+            {
+                *b = (i * 5) as u8;
             }
-            driver::memcpy_htod_async(src, host, 128, dev.compute_stream).expect("htod");
+            driver::memcpy_htod_async(src, host.as_ptr(), 128, dev.compute_stream).expect("htod");
 
             dev.copy_dtod(dst, src, 128).expect("dtod");
             dev.sync_compute().expect("sync");
 
             let host_out = driver::mem_alloc_host(128).expect("host_out");
-            driver::memcpy_dtoh_async(host_out, dst, 128, dev.compute_stream).expect("dtoh");
+            driver::memcpy_dtoh_async(host_out.as_ptr(), dst, 128, dev.compute_stream)
+                .expect("dtoh");
             driver::stream_synchronize(dev.compute_stream).expect("sync");
 
-            for i in 0..128 {
-                assert_eq!(*host_out.add(i), (i * 5) as u8, "mismatch at {i}");
+            for (i, &b) in std::slice::from_raw_parts(host_out.as_ptr(), 128)
+                .iter()
+                .enumerate()
+            {
+                assert_eq!(b, (i * 5) as u8, "mismatch at {i}");
             }
 
             driver::mem_free_host(host).unwrap();
@@ -323,15 +330,15 @@ mod tests {
         unsafe {
             let host_a = driver::mem_alloc_host(16).unwrap();
             let host_b = driver::mem_alloc_host(16).unwrap();
-            std::slice::from_raw_parts_mut(host_a as *mut f32, 4)
+            std::slice::from_raw_parts_mut(host_a.as_ptr() as *mut f32, 4)
                 .copy_from_slice(&[1.0, 0.0, 0.0, 1.0]);
-            std::slice::from_raw_parts_mut(host_b as *mut f32, 4)
+            std::slice::from_raw_parts_mut(host_b.as_ptr() as *mut f32, 4)
                 .copy_from_slice(&[2.0, 3.0, 4.0, 5.0]);
 
             let gpu_a = driver::mem_alloc(16).unwrap();
             let gpu_b = driver::mem_alloc(16).unwrap();
-            driver::memcpy_htod_async(gpu_a, host_a, 16, dev.compute_stream).unwrap();
-            driver::memcpy_htod_async(gpu_b, host_b, 16, dev.compute_stream).unwrap();
+            driver::memcpy_htod_async(gpu_a, host_a.as_ptr(), 16, dev.compute_stream).unwrap();
+            driver::memcpy_htod_async(gpu_b, host_b.as_ptr(), 16, dev.compute_stream).unwrap();
 
             let a = GpuTensor::new(gpu_a, &[2, 2], DType::F32);
             let b = GpuTensor::new(gpu_b, &[2, 2], DType::F32);
@@ -339,11 +346,16 @@ mod tests {
             let c = dev.cublas.gemm(a, b, &mut dev.caching);
 
             let host_c = driver::mem_alloc_host(16).unwrap();
-            driver::memcpy_dtoh_async(host_c, c.as_gpu_tensor().raw_ptr(), 16, dev.compute_stream)
-                .unwrap();
+            driver::memcpy_dtoh_async(
+                host_c.as_ptr(),
+                c.as_gpu_tensor().raw_ptr(),
+                16,
+                dev.compute_stream,
+            )
+            .unwrap();
             driver::stream_synchronize(dev.compute_stream).unwrap();
 
-            let result = std::slice::from_raw_parts(host_c as *const f32, 4);
+            let result = std::slice::from_raw_parts(host_c.as_ptr() as *const f32, 4);
             let expected = [2.0, 4.0, 3.0, 5.0];
             for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
                 assert!(

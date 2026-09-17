@@ -119,21 +119,21 @@ mod tests {
 
                 // Weight [2, 3] = [[1,0,0],[0,1,0]] (identity-ish)
                 let host_w = driver::mem_alloc_host(24).unwrap();
-                std::slice::from_raw_parts_mut(host_w as *mut f32, 6)
+                std::slice::from_raw_parts_mut(host_w.as_ptr() as *mut f32, 6)
                     .copy_from_slice(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
                 let gpu_w = driver::mem_alloc(24).unwrap();
-                driver::memcpy_htod_async(gpu_w, host_w, 24, stream).unwrap();
+                driver::memcpy_htod_async(gpu_w, host_w.as_ptr(), 24, stream).unwrap();
 
                 let w = GpuTensor::new(gpu_w, &[2, 3], DType::F32);
                 let linear = Linear::new(w, None);
 
                 // Input [4, 3] = [[1,2,3],[4,5,6],[7,8,9],[10,11,12]]
                 let host_x = driver::mem_alloc_host(48).unwrap();
-                std::slice::from_raw_parts_mut(host_x as *mut f32, 12).copy_from_slice(&[
+                std::slice::from_raw_parts_mut(host_x.as_ptr() as *mut f32, 12).copy_from_slice(&[
                     1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
                 ]);
                 let gpu_x = driver::mem_alloc(48).unwrap();
-                driver::memcpy_htod_async(gpu_x, host_x, 48, stream).unwrap();
+                driver::memcpy_htod_async(gpu_x, host_x.as_ptr(), 48, stream).unwrap();
                 let x = GpuTensor::new(gpu_x, &[4, 3], DType::F32);
                 let x_view = TensorView::from_raw(x);
 
@@ -144,10 +144,10 @@ mod tests {
                 assert_eq!(y.dim(1), 2);
 
                 let host_y = driver::mem_alloc_host(32).unwrap();
-                driver::memcpy_dtoh_async(host_y, y.raw_ptr(), 32, stream).unwrap();
+                driver::memcpy_dtoh_async(host_y.as_ptr(), y.raw_ptr(), 32, stream).unwrap();
                 driver::stream_synchronize(stream).unwrap();
 
-                let result = std::slice::from_raw_parts(host_y as *const f32, 8);
+                let result = std::slice::from_raw_parts(host_y.as_ptr() as *const f32, 8);
                 let expected = [1.0, 2.0, 4.0, 5.0, 7.0, 8.0, 10.0, 11.0];
                 for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
                     assert!(
@@ -337,10 +337,12 @@ mod tests {
                 // Read back output.
                 let out_bytes = out_features * 2;
                 let host_out = driver::mem_alloc_host(out_bytes).unwrap();
-                driver::memcpy_dtoh_async(host_out, out_t.raw_ptr(), out_bytes, stream).unwrap();
+                driver::memcpy_dtoh_async(host_out.as_ptr(), out_t.raw_ptr(), out_bytes, stream)
+                    .unwrap();
                 driver::stream_synchronize(stream).unwrap();
 
-                let out_bf16 = std::slice::from_raw_parts(host_out as *const u16, out_features);
+                let out_bf16 =
+                    std::slice::from_raw_parts(host_out.as_ptr() as *const u16, out_features);
                 let actual: Vec<f32> = out_bf16
                     .iter()
                     .map(|&bits| half::bf16::from_bits(bits).to_f32())
@@ -364,7 +366,7 @@ mod tests {
                 let dequant_bytes = num_elements * 2;
                 let host_dequant = driver::mem_alloc_host(dequant_bytes).unwrap();
                 driver::memcpy_dtoh_async(
-                    host_dequant,
+                    host_dequant.as_ptr(),
                     dequant_scratch.raw_ptr(),
                     dequant_bytes,
                     stream,
@@ -373,7 +375,7 @@ mod tests {
                 driver::stream_synchronize(stream).unwrap();
 
                 let dequant_bf16 =
-                    std::slice::from_raw_parts(host_dequant as *const u16, num_elements);
+                    std::slice::from_raw_parts(host_dequant.as_ptr() as *const u16, num_elements);
                 let dequant_f32: Vec<f32> = dequant_bf16
                     .iter()
                     .map(|&bits| half::bf16::from_bits(bits).to_f32())
@@ -525,10 +527,12 @@ mod tests {
                 // Read back.
                 let out_bytes = total_out * 2;
                 let host_out = driver::mem_alloc_host(out_bytes).unwrap();
-                driver::memcpy_dtoh_async(host_out, out_t.raw_ptr(), out_bytes, stream).unwrap();
+                driver::memcpy_dtoh_async(host_out.as_ptr(), out_t.raw_ptr(), out_bytes, stream)
+                    .unwrap();
                 driver::stream_synchronize(stream).unwrap();
 
-                let out_bf16 = std::slice::from_raw_parts(host_out as *const u16, total_out);
+                let out_bf16 =
+                    std::slice::from_raw_parts(host_out.as_ptr() as *const u16, total_out);
                 let actual: Vec<f32> = out_bf16
                     .iter()
                     .map(|&b| half::bf16::from_bits(b).to_f32())
@@ -637,10 +641,10 @@ mod tests {
 
                 // Read back.
                 let host = driver::mem_alloc_host(8).unwrap();
-                driver::memcpy_dtoh_async(host, out_ptr, 8, stream).unwrap();
+                driver::memcpy_dtoh_async(host.as_ptr(), out_ptr, 8, stream).unwrap();
                 driver::stream_synchronize(stream).unwrap();
 
-                let out_bf16 = std::slice::from_raw_parts(host as *const u16, 4);
+                let out_bf16 = std::slice::from_raw_parts(host.as_ptr() as *const u16, 4);
                 let actual: Vec<f32> = out_bf16
                     .iter()
                     .map(|&b| half::bf16::from_bits(b).to_f32())
@@ -931,11 +935,16 @@ mod fp8_block_tests {
             assert_eq!(out.as_gpu_tensor().dim(1), n);
 
             let host_out = driver::mem_alloc_host(n * 2).unwrap();
-            driver::memcpy_dtoh_async(host_out, out.as_gpu_tensor().raw_ptr(), n * 2, stream)
-                .unwrap();
+            driver::memcpy_dtoh_async(
+                host_out.as_ptr(),
+                out.as_gpu_tensor().raw_ptr(),
+                n * 2,
+                stream,
+            )
+            .unwrap();
             driver::stream_synchronize(stream).unwrap();
 
-            let out_bf16 = std::slice::from_raw_parts(host_out as *const u16, n);
+            let out_bf16 = std::slice::from_raw_parts(host_out.as_ptr() as *const u16, n);
             let actual: Vec<f32> = out_bf16
                 .iter()
                 .map(|&bits| half::bf16::from_bits(bits).to_f32())

@@ -11620,9 +11620,9 @@ mod tests_fp8_quant {
     unsafe fn download_u8(tensor: GpuTensor, stream: CUstream) -> Vec<u8> {
         let count = tensor.numel();
         let host = driver::mem_alloc_host(count).expect("host alloc");
-        driver::memcpy_dtoh_async(host, tensor.raw_ptr(), count, stream).expect("D2H");
+        driver::memcpy_dtoh_async(host.as_ptr(), tensor.raw_ptr(), count, stream).expect("D2H");
         driver::stream_synchronize(stream).expect("sync");
-        let result = std::slice::from_raw_parts(host, count).to_vec();
+        let result = std::slice::from_raw_parts(host.as_ptr(), count).to_vec();
         driver::mem_free_host(host).expect("free");
         result
     }
@@ -11630,9 +11630,9 @@ mod tests_fp8_quant {
     unsafe fn download_f32(ptr: *mut u8, count: usize, stream: CUstream) -> Vec<f32> {
         let bytes = count * 4;
         let host = driver::mem_alloc_host(bytes).expect("host alloc");
-        driver::memcpy_dtoh_async(host, ptr, bytes, stream).expect("D2H");
+        driver::memcpy_dtoh_async(host.as_ptr(), ptr, bytes, stream).expect("D2H");
         driver::stream_synchronize(stream).expect("sync");
-        let result = std::slice::from_raw_parts(host as *const f32, count).to_vec();
+        let result = std::slice::from_raw_parts(host.as_ptr() as *const f32, count).to_vec();
         driver::mem_free_host(host).expect("free");
         result
     }

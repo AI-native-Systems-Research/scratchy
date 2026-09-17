@@ -1539,7 +1539,7 @@ impl GgufGpuWeights {
             let mut written = 0usize;
             for (rel_off, n) in &slice_reads {
                 reader.seek(SeekFrom::Start(tensor_data_offset + info.offset + *rel_off))?;
-                let host_slice = std::slice::from_raw_parts_mut(host_buf.add(written), *n);
+                let host_slice = std::slice::from_raw_parts_mut(host_buf.as_ptr().add(written), *n);
                 reader.read_exact(host_slice)?;
                 written += *n;
             }
@@ -1585,7 +1585,7 @@ impl GgufGpuWeights {
                     // within a head, so works on any whole-head set.
                     let _ = head_count_for_this;
                     let mut tmp = vec![0u8; sliced_size_bytes];
-                    let src = std::slice::from_raw_parts(host_buf, sliced_size_bytes);
+                    let src = std::slice::from_raw_parts(host_buf.as_ptr(), sliced_size_bytes);
                     for head in 0..heads_local {
                         for pos_hf in 0..head_dim {
                             let r_hf = head * head_dim + pos_hf;
@@ -1600,7 +1600,7 @@ impl GgufGpuWeights {
                                 .copy_from_slice(&src[src_off..src_off + row_bytes_local]);
                         }
                     }
-                    let dst = std::slice::from_raw_parts_mut(host_buf, sliced_size_bytes);
+                    let dst = std::slice::from_raw_parts_mut(host_buf.as_ptr(), sliced_size_bytes);
                     dst.copy_from_slice(&tmp);
                 }
             }
@@ -1627,7 +1627,12 @@ impl GgufGpuWeights {
                         || (source_dtype == DType::F32 && target_dtype == DType::F32)
                     {
                         let gpu_ptr = crate::driver::mem_alloc(size_bytes)?;
-                        crate::driver::memcpy_htod_async(gpu_ptr, host_buf, size_bytes, stream)?;
+                        crate::driver::memcpy_htod_async(
+                            gpu_ptr,
+                            host_buf.as_ptr(),
+                            size_bytes,
+                            stream,
+                        )?;
                         let tensor = GpuTensor::new(gpu_ptr, dims, source_dtype);
                         weights.insert(hf_name, GgufWeight::Dense(tensor));
                     } else {
@@ -1636,8 +1641,10 @@ impl GgufGpuWeights {
                         // Simplest approach: upload f32 to GPU, then convert via a kernel.
                         // Since QK norms are tiny, do CPU conversion.
                         if source_dtype == DType::F32 {
-                            let f32_slice =
-                                std::slice::from_raw_parts(host_buf as *const f32, elem_count);
+                            let f32_slice = std::slice::from_raw_parts(
+                                host_buf.as_ptr() as *const f32,
+                                elem_count,
+                            );
                             let out_size = elem_count * target_dtype.size_bytes();
                             let conv_buf = crate::driver::mem_alloc_host(out_size)?;
                             // Subtract per-arch baked offset only on rmsnorm
@@ -1647,7 +1654,7 @@ impl GgufGpuWeights {
                             match target_dtype {
                                 DType::BF16 => {
                                     let out = std::slice::from_raw_parts_mut(
-                                        conv_buf as *mut u16,
+                                        conv_buf.as_ptr() as *mut u16,
                                         elem_count,
                                     );
                                     for (i, &v) in f32_slice.iter().enumerate() {
@@ -1656,7 +1663,7 @@ impl GgufGpuWeights {
                                 }
                                 DType::F16 => {
                                     let out = std::slice::from_raw_parts_mut(
-                                        conv_buf as *mut u16,
+                                        conv_buf.as_ptr() as *mut u16,
                                         elem_count,
                                     );
                                     for (i, &v) in f32_slice.iter().enumerate() {
@@ -1668,7 +1675,12 @@ impl GgufGpuWeights {
                                 ),
                             }
                             let gpu_ptr = crate::driver::mem_alloc(out_size)?;
-                            crate::driver::memcpy_htod_async(gpu_ptr, conv_buf, out_size, stream)?;
+                            crate::driver::memcpy_htod_async(
+                                gpu_ptr,
+                                conv_buf.as_ptr(),
+                                out_size,
+                                stream,
+                            )?;
                             crate::driver::stream_synchronize(stream)?;
                             crate::driver::mem_free_host(conv_buf)?;
                             let tensor = GpuTensor::new(gpu_ptr, dims, target_dtype);
@@ -1678,7 +1690,10 @@ impl GgufGpuWeights {
                             // cast src → f32 → target via existing kernels.
                             let src_ptr = crate::driver::mem_alloc(size_bytes)?;
                             crate::driver::memcpy_htod_async(
-                                src_ptr, host_buf, size_bytes, stream,
+                                src_ptr,
+                                host_buf.as_ptr(),
+                                size_bytes,
+                                stream,
                             )?;
                             let src_tensor = GpuTensor::new(src_ptr, dims, source_dtype);
                             let f32_tmp =
@@ -1702,7 +1717,12 @@ impl GgufGpuWeights {
                 } else if let Some(our_dt) = our_dtype {
                     // Quantized norm/embedding: upload raw bytes, then dequant on GPU.
                     let gpu_raw = crate::driver::mem_alloc(size_bytes)?;
-                    crate::driver::memcpy_htod_async(gpu_raw, host_buf, size_bytes, stream)?;
+                    crate::driver::memcpy_htod_async(
+                        gpu_raw,
+                        host_buf.as_ptr(),
+                        size_bytes,
+                        stream,
+                    )?;
                     crate::driver::stream_synchronize(stream)?;
 
                     let storage = GgmlStorage {
@@ -1731,7 +1751,7 @@ impl GgufGpuWeights {
             } else if let Some(our_dt) = our_dtype {
                 // Quantized linear: raw H2D copy, keep compressed.
                 let gpu_ptr = crate::driver::mem_alloc(size_bytes)?;
-                crate::driver::memcpy_htod_async(gpu_ptr, host_buf, size_bytes, stream)?;
+                crate::driver::memcpy_htod_async(gpu_ptr, host_buf.as_ptr(), size_bytes, stream)?;
 
                 // For 3D tensors (fused MoE experts), flatten first dims:
                 // [num_experts, output_dim, input_dim] → nrows = num_experts * output_dim.
