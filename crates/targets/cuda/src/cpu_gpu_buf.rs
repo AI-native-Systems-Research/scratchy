@@ -10,12 +10,13 @@ use crate::dtype::DType;
 use crate::tensor::GpuTensor;
 use anyhow::Result;
 use cudarc::driver::sys::CUstream;
+use std::ptr::NonNull;
 
 /// Paired pinned-host + device buffer for async H2D/D2H transfers.
 ///
 /// Pre-allocated at init, reused every engine step. Zero allocation on hot path.
 pub struct CpuGpuBuf {
-    cpu: *mut u8,
+    cpu: NonNull<u8>,
     gpu: *mut u8,
     capacity_elements: usize,
     dtype: DType,
@@ -60,7 +61,7 @@ impl CpuGpuBuf {
 
     /// Raw pointer to pinned CPU buffer.
     pub fn cpu_ptr(&self) -> *mut u8 {
-        self.cpu
+        self.cpu.as_ptr()
     }
 
     /// Raw pointer to GPU buffer.
@@ -75,7 +76,7 @@ impl CpuGpuBuf {
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn cpu_slice_mut<T>(&self, n: usize) -> &mut [T] {
         debug_assert!(n <= self.capacity_elements);
-        std::slice::from_raw_parts_mut(self.cpu as *mut T, n)
+        std::slice::from_raw_parts_mut(self.cpu.as_ptr() as *mut T, n)
     }
 
     /// CPU buffer as a typed slice.
@@ -85,7 +86,7 @@ impl CpuGpuBuf {
     /// and the first `n` elements have been initialized.
     pub unsafe fn cpu_slice<T>(&self, n: usize) -> &[T] {
         debug_assert!(n <= self.capacity_elements);
-        std::slice::from_raw_parts(self.cpu as *const T, n)
+        std::slice::from_raw_parts(self.cpu.as_ptr() as *const T, n)
     }
 
     /// Get a `GpuTensor` view of the first `n` elements as a 1D tensor.
@@ -109,7 +110,7 @@ impl CpuGpuBuf {
     pub unsafe fn copy_to_gpu(&self, n: usize, stream: CUstream) -> Result<()> {
         debug_assert!(n <= self.capacity_elements);
         let bytes = n * self.dtype.size_bytes();
-        driver::memcpy_htod_async(self.gpu, self.cpu, bytes, stream)
+        driver::memcpy_htod_async(self.gpu, self.cpu.as_ptr(), bytes, stream)
     }
 
     /// Async copy first `n` elements from GPU to CPU on `stream`.
@@ -120,7 +121,7 @@ impl CpuGpuBuf {
     pub unsafe fn copy_to_cpu(&self, n: usize, stream: CUstream) -> Result<()> {
         debug_assert!(n <= self.capacity_elements);
         let bytes = n * self.dtype.size_bytes();
-        driver::memcpy_dtoh_async(self.cpu, self.gpu, bytes, stream)
+        driver::memcpy_dtoh_async(self.cpu.as_ptr(), self.gpu, bytes, stream)
     }
 }
 
@@ -139,7 +140,10 @@ impl Drop for CpuGpuBuf {
 /// GPU destination is managed elsewhere (e.g., CUDA graph persistent buffers).
 /// Provides zero-copy async DMA when passed to `memcpy_htod_async`.
 pub struct PinnedBuf {
-    ptr: *mut u8,
+    /// `None` exactly when `capacity_bytes == 0` — a zero-capacity buffer
+    /// owns no pinned allocation, and that is the only reason this is an
+    /// `Option` rather than a plain [`NonNull`].
+    ptr: Option<NonNull<u8>>,
     capacity_bytes: usize,
 }
 
@@ -153,9 +157,9 @@ impl PinnedBuf {
     /// Must be called with an active CUDA context.
     pub unsafe fn new(capacity_bytes: usize) -> Result<Self> {
         let ptr = if capacity_bytes > 0 {
-            driver::mem_alloc_host(capacity_bytes)?
+            Some(driver::mem_alloc_host(capacity_bytes)?)
         } else {
-            std::ptr::null_mut()
+            None
         };
         Ok(Self {
             ptr,
@@ -163,9 +167,20 @@ impl PinnedBuf {
         })
     }
 
-    /// Raw pointer to the pinned host memory.
+    /// Raw pointer to the pinned host memory, null for a zero-capacity
+    /// buffer — the only transfer it can feed is a zero-byte one.
     pub fn ptr(&self) -> *mut u8 {
-        self.ptr
+        self.ptr.map_or(std::ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    /// Base pointer for a slice view. A zero-capacity buffer yields a
+    /// dangling-but-aligned pointer: `slice::from_raw_parts` accepts that
+    /// for a length of 0, and would be undefined behavior given null.
+    fn base<T>(&self) -> *mut T {
+        match self.ptr {
+            Some(ptr) => ptr.as_ptr().cast::<T>(),
+            None => NonNull::<T>::dangling().as_ptr(),
+        }
     }
 
     /// Capacity in bytes.
@@ -181,7 +196,7 @@ impl PinnedBuf {
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn slice_mut<T>(&self, n: usize) -> &mut [T] {
         debug_assert!(n * std::mem::size_of::<T>() <= self.capacity_bytes);
-        std::slice::from_raw_parts_mut(self.ptr as *mut T, n)
+        std::slice::from_raw_parts_mut(self.base::<T>(), n)
     }
 
     /// Get a typed slice of the first `n` elements.
@@ -190,15 +205,15 @@ impl PinnedBuf {
     /// `T` must be compatible and elements must be initialized.
     pub unsafe fn slice<T>(&self, n: usize) -> &[T] {
         debug_assert!(n * std::mem::size_of::<T>() <= self.capacity_bytes);
-        std::slice::from_raw_parts(self.ptr as *const T, n)
+        std::slice::from_raw_parts(self.base::<T>().cast_const(), n)
     }
 }
 
 impl Drop for PinnedBuf {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if let Some(ptr) = self.ptr {
             unsafe {
-                let _ = driver::mem_free_host(self.ptr);
+                let _ = driver::mem_free_host(ptr);
             }
         }
     }

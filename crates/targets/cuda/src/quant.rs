@@ -779,9 +779,9 @@ mod tests {
         ) -> Vec<u32> {
             let nbytes = count * 4;
             let host = driver::mem_alloc_host(nbytes).expect("host alloc");
-            driver::memcpy_dtoh_async(host, ptr, nbytes, stream).expect("d2h");
+            driver::memcpy_dtoh_async(host.as_ptr(), ptr, nbytes, stream).expect("d2h");
             driver::stream_synchronize(stream).expect("sync");
-            let result = std::slice::from_raw_parts(host as *const u32, count).to_vec();
+            let result = std::slice::from_raw_parts(host.as_ptr() as *const u32, count).to_vec();
             driver::mem_free_host(host).expect("free host");
             result
         }
@@ -918,10 +918,12 @@ mod tests {
                 // Read output
                 let out_nbytes = size_m * size_n * 2;
                 let host = driver::mem_alloc_host(out_nbytes).expect("host alloc");
-                driver::memcpy_dtoh_async(host, out.raw_ptr(), out_nbytes, stream).expect("d2h");
+                driver::memcpy_dtoh_async(host.as_ptr(), out.raw_ptr(), out_nbytes, stream)
+                    .expect("d2h");
                 driver::stream_synchronize(stream).expect("sync");
 
-                let result = std::slice::from_raw_parts(host as *const u16, size_m * size_n);
+                let result =
+                    std::slice::from_raw_parts(host.as_ptr() as *const u16, size_m * size_n);
                 // Zero weights → output should be zero (or close)
                 for &bits in result {
                     let val = half::f16::from_bits(bits).to_f32();
@@ -1029,10 +1031,12 @@ mod tests {
                 // 7. Read output and verify
                 let out_nbytes = size_m * size_n * 2;
                 let host = driver::mem_alloc_host(out_nbytes).expect("host alloc");
-                driver::memcpy_dtoh_async(host, out.raw_ptr(), out_nbytes, stream).expect("d2h");
+                driver::memcpy_dtoh_async(host.as_ptr(), out.raw_ptr(), out_nbytes, stream)
+                    .expect("d2h");
                 driver::stream_synchronize(stream).expect("sync");
 
-                let result = std::slice::from_raw_parts(host as *const u16, size_m * size_n);
+                let result =
+                    std::slice::from_raw_parts(host.as_ptr() as *const u16, size_m * size_n);
                 let expected = size_k as f32; // each output = sum of K * 1.0 * 1.0 = K
 
                 let mut max_err: f32 = 0.0;
@@ -1159,10 +1163,12 @@ mod tests {
 
                 let out_nbytes = size_m * size_n * 2;
                 let host = driver::mem_alloc_host(out_nbytes).expect("host");
-                driver::memcpy_dtoh_async(host, out.raw_ptr(), out_nbytes, stream).expect("d2h");
+                driver::memcpy_dtoh_async(host.as_ptr(), out.raw_ptr(), out_nbytes, stream)
+                    .expect("d2h");
                 driver::stream_synchronize(stream).expect("sync");
 
-                let result = std::slice::from_raw_parts(host as *const u16, size_m * size_n);
+                let result =
+                    std::slice::from_raw_parts(host.as_ptr() as *const u16, size_m * size_n);
                 let expected = 128.0 * 2.0 + 128.0 * 3.0; // = 640.0
 
                 let mut max_err: f32 = 0.0;
@@ -1337,13 +1343,15 @@ mod tests {
 
                 let out_nbytes = size_n * 2;
                 let host = driver::mem_alloc_host(out_nbytes).expect("host");
-                driver::memcpy_dtoh_async(host, out.raw_ptr(), out_nbytes, stream).expect("d2h");
+                driver::memcpy_dtoh_async(host.as_ptr(), out.raw_ptr(), out_nbytes, stream)
+                    .expect("d2h");
                 driver::stream_synchronize(stream).expect("sync");
 
-                let gpu_output: Vec<f32> = std::slice::from_raw_parts(host as *const u16, size_n)
-                    .iter()
-                    .map(|&b| half::f16::from_bits(b).to_f32())
-                    .collect();
+                let gpu_output: Vec<f32> =
+                    std::slice::from_raw_parts(host.as_ptr() as *const u16, size_n)
+                        .iter()
+                        .map(|&b| half::f16::from_bits(b).to_f32())
+                        .collect();
 
                 eprintln!("GPU output first8:   {:?}", &gpu_output[..8]);
 
@@ -1517,13 +1525,15 @@ mod tests {
 
                 let out_nbytes = size_n * 2;
                 let host = driver::mem_alloc_host(out_nbytes).expect("host");
-                driver::memcpy_dtoh_async(host, out.raw_ptr(), out_nbytes, stream).expect("d2h");
+                driver::memcpy_dtoh_async(host.as_ptr(), out.raw_ptr(), out_nbytes, stream)
+                    .expect("d2h");
                 driver::stream_synchronize(stream).expect("sync");
 
-                let gpu_output: Vec<f32> = std::slice::from_raw_parts(host as *const u16, size_n)
-                    .iter()
-                    .map(|&b| half::f16::from_bits(b).to_f32())
-                    .collect();
+                let gpu_output: Vec<f32> =
+                    std::slice::from_raw_parts(host.as_ptr() as *const u16, size_n)
+                        .iter()
+                        .map(|&b| half::f16::from_bits(b).to_f32())
+                        .collect();
 
                 eprintln!("GPU output first8:   {:?}", &gpu_output[..8]);
 
@@ -1686,13 +1696,15 @@ mod tests {
 
                 let out_nbytes = size_n * 2;
                 let host = driver::mem_alloc_host(out_nbytes).expect("host");
-                driver::memcpy_dtoh_async(host, out.raw_ptr(), out_nbytes, stream).expect("d2h");
+                driver::memcpy_dtoh_async(host.as_ptr(), out.raw_ptr(), out_nbytes, stream)
+                    .expect("d2h");
                 driver::stream_synchronize(stream).expect("sync");
 
-                let gpu_output: Vec<f32> = std::slice::from_raw_parts(host as *const u16, size_n)
-                    .iter()
-                    .map(|&b| half::f16::from_bits(b).to_f32())
-                    .collect();
+                let gpu_output: Vec<f32> =
+                    std::slice::from_raw_parts(host.as_ptr() as *const u16, size_n)
+                        .iter()
+                        .map(|&b| half::f16::from_bits(b).to_f32())
+                        .collect();
 
                 eprintln!("GPU output first8:   {:?}", &gpu_output[..8]);
 
@@ -1939,9 +1951,10 @@ mod tests {
                 let read_gpu = |t: &crate::alloc::OwnedTensor, n: usize| -> Vec<f32> {
                     let nbytes = n * 2;
                     let host = driver::mem_alloc_host(nbytes).expect("host");
-                    driver::memcpy_dtoh_async(host, t.raw_ptr(), nbytes, stream).expect("d2h");
+                    driver::memcpy_dtoh_async(host.as_ptr(), t.raw_ptr(), nbytes, stream)
+                        .expect("d2h");
                     driver::stream_synchronize(stream).expect("sync");
-                    let vals: Vec<f32> = std::slice::from_raw_parts(host as *const u16, n)
+                    let vals: Vec<f32> = std::slice::from_raw_parts(host.as_ptr() as *const u16, n)
                         .iter()
                         .map(|&b| half::f16::from_bits(b).to_f32())
                         .collect();
@@ -2127,10 +2140,12 @@ mod tests {
                 // 9. Read output and verify
                 let out_nbytes = size_m * size_n * 2;
                 let host = driver::mem_alloc_host(out_nbytes).expect("host alloc");
-                driver::memcpy_dtoh_async(host, out.raw_ptr(), out_nbytes, stream).expect("d2h");
+                driver::memcpy_dtoh_async(host.as_ptr(), out.raw_ptr(), out_nbytes, stream)
+                    .expect("d2h");
                 driver::stream_synchronize(stream).expect("sync");
 
-                let result = std::slice::from_raw_parts(host as *const u16, size_m * size_n);
+                let result =
+                    std::slice::from_raw_parts(host.as_ptr() as *const u16, size_m * size_n);
                 let expected = size_k as f32; // each output = sum of K * 1.0 * 1.0 = K
 
                 let mut max_err: f32 = 0.0;

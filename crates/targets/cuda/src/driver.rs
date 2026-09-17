@@ -6,6 +6,7 @@
 
 use anyhow::{Result, bail};
 use cudarc::driver::sys::{self, CUcontext, CUdevice, CUdeviceptr, CUevent, CUresult, CUstream};
+use std::ptr::NonNull;
 
 // ---------------------------------------------------------------------------
 // Error checking
@@ -126,15 +127,24 @@ pub unsafe fn mem_free(ptr: *mut u8) -> Result<()> {
 }
 
 /// Allocate pinned (page-locked) host memory for async transfers.
-pub unsafe fn mem_alloc_host(size: usize) -> Result<*mut u8> {
+///
+/// Returns a [`NonNull`] because this is the one CUDA allocation the host
+/// dereferences: every caller reads or writes the bytes through it. A
+/// successful `cuMemAllocHost_v2` never yields null, so the check below is
+/// unreachable in practice — it is what makes that guarantee a *type*, so
+/// no caller has to re-test it.
+pub unsafe fn mem_alloc_host(size: usize) -> Result<NonNull<u8>> {
     let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     check(sys::cuMemAllocHost_v2(&mut ptr, size))?;
-    Ok(ptr as *mut u8)
+    match NonNull::new(ptr as *mut u8) {
+        Some(ptr) => Ok(ptr),
+        None => bail!("cuMemAllocHost_v2 succeeded but returned a null pointer for {size} bytes"),
+    }
 }
 
 /// Free pinned host memory.
-pub unsafe fn mem_free_host(ptr: *mut u8) -> Result<()> {
-    check(sys::cuMemFreeHost(ptr as *mut std::ffi::c_void))
+pub unsafe fn mem_free_host(ptr: NonNull<u8>) -> Result<()> {
+    check(sys::cuMemFreeHost(ptr.as_ptr() as *mut std::ffi::c_void))
 }
 
 /// Query free and total device memory in bytes.
@@ -359,6 +369,23 @@ mod tests {
         }
     }
 
+    /// The first `len` bytes of a pinned host allocation, mutably.
+    ///
+    /// # Safety
+    /// `len` must not exceed the size the allocation was made with, and the
+    /// borrow must end before the allocation is freed.
+    unsafe fn pinned_mut<'a>(ptr: NonNull<u8>, len: usize) -> &'a mut [u8] {
+        std::slice::from_raw_parts_mut(ptr.as_ptr(), len)
+    }
+
+    /// The first `len` bytes of a pinned host allocation.
+    ///
+    /// # Safety
+    /// As [`pinned_mut`], and the bytes must have been initialized.
+    unsafe fn pinned<'a>(ptr: NonNull<u8>, len: usize) -> &'a [u8] {
+        std::slice::from_raw_parts(ptr.as_ptr(), len)
+    }
+
     #[test]
     fn test_init_and_device_count() {
         unsafe {
@@ -401,11 +428,9 @@ mod tests {
         let _ctx = init_cuda();
         unsafe {
             let ptr = mem_alloc_host(4096).expect("alloc host");
-            if ptr.is_null() {
-                panic!("alloc host returned a null pointer");
-            }
-            // Write to pinned memory to verify it's usable.
-            std::ptr::write_bytes(ptr, 0xAB, 4096);
+            // Write to pinned memory and read it back to verify it's usable.
+            pinned_mut(ptr, 4096).fill(0xAB);
+            assert!(pinned(ptr, 4096).iter().all(|&b| b == 0xAB));
             mem_free_host(ptr).expect("free host");
         }
     }
@@ -431,19 +456,19 @@ mod tests {
             let host_dst = mem_alloc_host(256).expect("host dst");
 
             // Fill source with known pattern.
-            for i in 0..256 {
-                *host_src.add(i) = i as u8;
+            for (i, b) in pinned_mut(host_src, 256).iter_mut().enumerate() {
+                *b = i as u8;
             }
 
             // H2D
-            memcpy_htod_async(gpu, host_src, 256, stream).expect("htod");
+            memcpy_htod_async(gpu, host_src.as_ptr(), 256, stream).expect("htod");
             // D2H
-            memcpy_dtoh_async(host_dst, gpu, 256, stream).expect("dtoh");
+            memcpy_dtoh_async(host_dst.as_ptr(), gpu, 256, stream).expect("dtoh");
             stream_synchronize(stream).expect("sync");
 
             // Verify roundtrip.
-            for i in 0..256 {
-                assert_eq!(*host_dst.add(i), i as u8, "mismatch at byte {i}");
+            for (i, &b) in pinned(host_dst, 256).iter().enumerate() {
+                assert_eq!(b, i as u8, "mismatch at byte {i}");
             }
 
             mem_free_host(host_src).expect("free src");
@@ -463,21 +488,21 @@ mod tests {
             let gpu_b = mem_alloc(128).expect("gpu_b");
 
             // Fill host, copy to gpu_a.
-            for i in 0..128 {
-                *host.add(i) = (i * 3) as u8;
+            for (i, b) in pinned_mut(host, 128).iter_mut().enumerate() {
+                *b = (i * 3) as u8;
             }
-            memcpy_htod_async(gpu_a, host, 128, stream).expect("htod");
+            memcpy_htod_async(gpu_a, host.as_ptr(), 128, stream).expect("htod");
 
             // D2D: gpu_a → gpu_b.
             memcpy_dtod_async(gpu_b, gpu_a, 128, stream).expect("dtod");
 
             // Read back from gpu_b.
             let host_out = mem_alloc_host(128).expect("host_out");
-            memcpy_dtoh_async(host_out, gpu_b, 128, stream).expect("dtoh");
+            memcpy_dtoh_async(host_out.as_ptr(), gpu_b, 128, stream).expect("dtoh");
             stream_synchronize(stream).expect("sync");
 
-            for i in 0..128 {
-                assert_eq!(*host_out.add(i), (i * 3) as u8, "mismatch at {i}");
+            for (i, &b) in pinned(host_out, 128).iter().enumerate() {
+                assert_eq!(b, (i * 3) as u8, "mismatch at {i}");
             }
 
             mem_free_host(host).unwrap();
@@ -499,11 +524,11 @@ mod tests {
             memset_d8(gpu, 0, 512, stream).expect("memset");
 
             let host = mem_alloc_host(512).expect("host");
-            memcpy_dtoh_async(host, gpu, 512, stream).expect("dtoh");
+            memcpy_dtoh_async(host.as_ptr(), gpu, 512, stream).expect("dtoh");
             stream_synchronize(stream).expect("sync");
 
-            for i in 0..512 {
-                assert_eq!(*host.add(i), 0, "not zeroed at {i}");
+            for (i, &b) in pinned(host, 512).iter().enumerate() {
+                assert_eq!(b, 0, "not zeroed at {i}");
             }
 
             mem_free_host(host).unwrap();
@@ -522,11 +547,11 @@ mod tests {
             memset_d8(gpu, 0xFF, 256, stream).expect("memset");
 
             let host = mem_alloc_host(256).expect("host");
-            memcpy_dtoh_async(host, gpu, 256, stream).expect("dtoh");
+            memcpy_dtoh_async(host.as_ptr(), gpu, 256, stream).expect("dtoh");
             stream_synchronize(stream).expect("sync");
 
-            for i in 0..256 {
-                assert_eq!(*host.add(i), 0xFF, "wrong value at {i}");
+            for (i, &b) in pinned(host, 256).iter().enumerate() {
+                assert_eq!(b, 0xFF, "wrong value at {i}");
             }
 
             mem_free_host(host).unwrap();
@@ -553,13 +578,10 @@ mod tests {
 
             // D2H on s2 — should see the memset data.
             let host = mem_alloc_host(256).expect("host");
-            memcpy_dtoh_async(host, gpu, 256, s2).expect("dtoh");
+            memcpy_dtoh_async(host.as_ptr(), gpu, 256, s2).expect("dtoh");
             stream_synchronize(s2).expect("sync");
 
-            if host.is_null() {
-                panic!("host pointer is null");
-            }
-            assert_eq!(*host, 0x42);
+            assert!(pinned(host, 256).iter().all(|&b| b == 0x42));
 
             event_destroy(event).unwrap();
             mem_free_host(host).unwrap();
@@ -594,13 +616,10 @@ mod tests {
 
             // Verify.
             let host = mem_alloc_host(256).expect("host");
-            memcpy_dtoh_async(host, gpu, 256, stream).expect("dtoh");
+            memcpy_dtoh_async(host.as_ptr(), gpu, 256, stream).expect("dtoh");
             stream_synchronize(stream).expect("sync2");
 
-            if host.is_null() {
-                panic!("host pointer is null");
-            }
-            assert_eq!(*host, 0xAB);
+            assert!(pinned(host, 256).iter().all(|&b| b == 0xAB));
 
             graph_exec_destroy(exec).unwrap();
             graph_destroy(graph).unwrap();

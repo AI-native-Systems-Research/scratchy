@@ -11,6 +11,7 @@ use anyhow::{Result, bail};
 use cudarc::driver::sys::CUstream;
 use std::collections::HashMap;
 use std::path::Path;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -330,7 +331,7 @@ unsafe fn stage_to_device(
     data: &[u8],
     dtype: DType,
     target_dtype: Option<DType>,
-    slot: *mut u8,
+    slot: NonNull<u8>,
     slot_bytes: usize,
     progress_bytes: &std::sync::atomic::AtomicUsize,
 ) -> Result<PrecastEntry> {
@@ -363,11 +364,11 @@ unsafe fn stage_to_device(
             cast_slice_into(slot, src, dtype, target, n)?;
         } else {
             unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), slot, n * src_elem);
+                std::ptr::copy_nonoverlapping(src.as_ptr(), slot.as_ptr(), n * src_elem);
             }
         }
         unsafe {
-            driver::memcpy_htod(gpu.ptr().add(done * dst_elem), slot, n * dst_elem)?;
+            driver::memcpy_htod(gpu.ptr().add(done * dst_elem), slot.as_ptr(), n * dst_elem)?;
         }
         progress_bytes.fetch_add(n * dst_elem, Ordering::Relaxed);
         done += n;
@@ -382,7 +383,7 @@ unsafe fn stage_to_device(
 
 /// Scalar cast of `numel` elements from `src` (`src_dtype`) into `dst` (`target`).
 fn cast_slice_into(
-    dst: *mut u8,
+    dst: NonNull<u8>,
     src: &[u8],
     src_dtype: DType,
     target: DType,
@@ -391,42 +392,42 @@ fn cast_slice_into(
     match (src_dtype, target) {
         (DType::F32, DType::BF16) => {
             let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
-            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut u16, numel) };
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 *d = half::bf16::from_f32(*s).to_bits();
             }
         }
         (DType::F32, DType::F16) => {
             let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
-            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut u16, numel) };
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 *d = half::f16::from_f32(*s).to_bits();
             }
         }
         (DType::F16, DType::BF16) => {
             let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
-            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut u16, numel) };
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 *d = half::bf16::from_f32(half::f16::from_bits(*s).to_f32()).to_bits();
             }
         }
         (DType::BF16, DType::F16) => {
             let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
-            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut u16, numel) };
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 *d = half::f16::from_f32(half::bf16::from_bits(*s).to_f32()).to_bits();
             }
         }
         (DType::BF16, DType::F32) => {
             let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
-            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut f32, numel) };
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 *d = half::bf16::from_bits(*s).to_f32();
             }
         }
         (DType::F16, DType::F32) => {
             let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
-            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut f32, numel) };
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 *d = half::f16::from_bits(*s).to_f32();
             }

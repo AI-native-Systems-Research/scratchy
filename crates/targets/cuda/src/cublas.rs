@@ -1246,19 +1246,19 @@ mod tests {
 
             // Prepare A on host: [[1, 2, 3], [4, 5, 6]]
             let host_a = driver::mem_alloc_host(m * k * 4).unwrap();
-            let a_slice = std::slice::from_raw_parts_mut(host_a as *mut f32, m * k);
+            let a_slice = std::slice::from_raw_parts_mut(host_a.as_ptr() as *mut f32, m * k);
             a_slice.copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
             // Prepare B (identity) on host: [[1,0,0],[0,1,0],[0,0,1]]
             let host_b = driver::mem_alloc_host(n * k * 4).unwrap();
-            let b_slice = std::slice::from_raw_parts_mut(host_b as *mut f32, n * k);
+            let b_slice = std::slice::from_raw_parts_mut(host_b.as_ptr() as *mut f32, n * k);
             b_slice.copy_from_slice(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
 
             // Upload to GPU.
             let gpu_a = driver::mem_alloc(m * k * 4).unwrap();
             let gpu_b = driver::mem_alloc(n * k * 4).unwrap();
-            driver::memcpy_htod_async(gpu_a, host_a, m * k * 4, stream).unwrap();
-            driver::memcpy_htod_async(gpu_b, host_b, n * k * 4, stream).unwrap();
+            driver::memcpy_htod_async(gpu_a, host_a.as_ptr(), m * k * 4, stream).unwrap();
+            driver::memcpy_htod_async(gpu_b, host_b.as_ptr(), n * k * 4, stream).unwrap();
 
             let a = GpuTensor::new(gpu_a, &[m, k], DType::F32);
             let b = GpuTensor::new(gpu_b, &[n, k], DType::F32);
@@ -1269,10 +1269,10 @@ mod tests {
 
             // Read back.
             let host_c = driver::mem_alloc_host(m * n * 4).unwrap();
-            driver::memcpy_dtoh_async(host_c, c.raw_ptr(), m * n * 4, stream).unwrap();
+            driver::memcpy_dtoh_async(host_c.as_ptr(), c.raw_ptr(), m * n * 4, stream).unwrap();
             driver::stream_synchronize(stream).unwrap();
 
-            let c_slice = std::slice::from_raw_parts(host_c as *const f32, m * n);
+            let c_slice = std::slice::from_raw_parts(host_c.as_ptr() as *const f32, m * n);
             // A @ I = A → [[1,2,3],[4,5,6]]
             let expected = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
             for (i, (got, exp)) in c_slice.iter().zip(expected.iter()).enumerate() {
@@ -1305,25 +1305,25 @@ mod tests {
             //             = [[17, 23], [39, 53]]
             let host_a = driver::mem_alloc_host(16).unwrap();
             let host_b = driver::mem_alloc_host(16).unwrap();
-            std::slice::from_raw_parts_mut(host_a as *mut f32, 4)
+            std::slice::from_raw_parts_mut(host_a.as_ptr() as *mut f32, 4)
                 .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
-            std::slice::from_raw_parts_mut(host_b as *mut f32, 4)
+            std::slice::from_raw_parts_mut(host_b.as_ptr() as *mut f32, 4)
                 .copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
 
             let gpu_a = driver::mem_alloc(16).unwrap();
             let gpu_b = driver::mem_alloc(16).unwrap();
-            driver::memcpy_htod_async(gpu_a, host_a, 16, stream).unwrap();
-            driver::memcpy_htod_async(gpu_b, host_b, 16, stream).unwrap();
+            driver::memcpy_htod_async(gpu_a, host_a.as_ptr(), 16, stream).unwrap();
+            driver::memcpy_htod_async(gpu_b, host_b.as_ptr(), 16, stream).unwrap();
 
             let a = GpuTensor::new(gpu_a, &[2, 2], DType::F32);
             let b = GpuTensor::new(gpu_b, &[2, 2], DType::F32);
             let c = handle.gemm(a, b, &mut arena);
 
             let host_c = driver::mem_alloc_host(16).unwrap();
-            driver::memcpy_dtoh_async(host_c, c.raw_ptr(), 16, stream).unwrap();
+            driver::memcpy_dtoh_async(host_c.as_ptr(), c.raw_ptr(), 16, stream).unwrap();
             driver::stream_synchronize(stream).unwrap();
 
-            let result = std::slice::from_raw_parts(host_c as *const f32, 4);
+            let result = std::slice::from_raw_parts(host_c.as_ptr() as *const f32, 4);
             let expected = [17.0, 23.0, 39.0, 53.0];
             for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
                 assert!(
@@ -1369,10 +1369,10 @@ mod tests {
 
             // Verify output shape and that it's all zeros.
             let host_c = driver::mem_alloc_host(m * n * 4).unwrap();
-            driver::memcpy_dtoh_async(host_c, c.raw_ptr(), m * n * 4, stream).unwrap();
+            driver::memcpy_dtoh_async(host_c.as_ptr(), c.raw_ptr(), m * n * 4, stream).unwrap();
             driver::stream_synchronize(stream).unwrap();
 
-            let result = std::slice::from_raw_parts(host_c as *const f32, m * n);
+            let result = std::slice::from_raw_parts(host_c.as_ptr() as *const f32, m * n);
             for (i, v) in result.iter().enumerate() {
                 assert!(v.abs() < 1e-6, "expected 0 at {i}, got {v}");
             }
@@ -1427,18 +1427,19 @@ mod tests {
             let host_a = driver::mem_alloc_host(16).unwrap();
             let host_b = driver::mem_alloc_host(16).unwrap();
             let host_bias = driver::mem_alloc_host(8).unwrap();
-            std::slice::from_raw_parts_mut(host_a as *mut f32, 4)
+            std::slice::from_raw_parts_mut(host_a.as_ptr() as *mut f32, 4)
                 .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
-            std::slice::from_raw_parts_mut(host_b as *mut f32, 4)
+            std::slice::from_raw_parts_mut(host_b.as_ptr() as *mut f32, 4)
                 .copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
-            std::slice::from_raw_parts_mut(host_bias as *mut f32, 2).copy_from_slice(&[10.0, 20.0]);
+            std::slice::from_raw_parts_mut(host_bias.as_ptr() as *mut f32, 2)
+                .copy_from_slice(&[10.0, 20.0]);
 
             let gpu_a = driver::mem_alloc(16).unwrap();
             let gpu_b = driver::mem_alloc(16).unwrap();
             let gpu_bias = driver::mem_alloc(8).unwrap();
-            driver::memcpy_htod_async(gpu_a, host_a, 16, stream).unwrap();
-            driver::memcpy_htod_async(gpu_b, host_b, 16, stream).unwrap();
-            driver::memcpy_htod_async(gpu_bias, host_bias, 8, stream).unwrap();
+            driver::memcpy_htod_async(gpu_a, host_a.as_ptr(), 16, stream).unwrap();
+            driver::memcpy_htod_async(gpu_b, host_b.as_ptr(), 16, stream).unwrap();
+            driver::memcpy_htod_async(gpu_bias, host_bias.as_ptr(), 8, stream).unwrap();
 
             let a = GpuTensor::new(gpu_a, &[2, 2], DType::F32);
             let b = GpuTensor::new(gpu_b, &[2, 2], DType::F32);
@@ -1446,10 +1447,10 @@ mod tests {
             let c = handle.gemm_bias(a, b, bias, &mut arena);
 
             let host_c = driver::mem_alloc_host(16).unwrap();
-            driver::memcpy_dtoh_async(host_c, c.raw_ptr(), 16, stream).unwrap();
+            driver::memcpy_dtoh_async(host_c.as_ptr(), c.raw_ptr(), 16, stream).unwrap();
             driver::stream_synchronize(stream).unwrap();
 
-            let result = std::slice::from_raw_parts(host_c as *const f32, 4);
+            let result = std::slice::from_raw_parts(host_c.as_ptr() as *const f32, 4);
             let expected = [27.0, 43.0, 49.0, 73.0];
             for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
                 assert!(
@@ -1569,11 +1570,16 @@ mod tests {
             // Read output: each element should be K (=8) since dot(ones, ones) = K
             let nbytes = m * n * DType::BF16.size_bytes();
             let host = driver::mem_alloc_host(nbytes).unwrap();
-            driver::memcpy_dtoh_async(host, output.as_gpu_tensor().raw_ptr(), nbytes, stream)
-                .unwrap();
+            driver::memcpy_dtoh_async(
+                host.as_ptr(),
+                output.as_gpu_tensor().raw_ptr(),
+                nbytes,
+                stream,
+            )
+            .unwrap();
             driver::stream_synchronize(stream).unwrap();
 
-            let result = std::slice::from_raw_parts(host as *const half::bf16, m * n);
+            let result = std::slice::from_raw_parts(host.as_ptr() as *const half::bf16, m * n);
             for val in result {
                 let f = val.to_f32();
                 assert!((f - k as f32).abs() < 0.5, "expected ~{k}, got {f}");
