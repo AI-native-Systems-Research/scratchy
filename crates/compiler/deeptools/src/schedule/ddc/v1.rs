@@ -3821,9 +3821,14 @@ pub enum SymbolicRead {
 
 /// ONE CORELET'S PE AND SFP SHARES OF A DIM — `peSfpSplit_.at(dim).at(cl)` (`dsc/dims.h:212-214`).
 ///
-/// ⛔ NOT A MAP KEYED BY [`VectorComp`], WHICH IS NOT `Ord`: both keys are written by every one of
-/// entry 307's three writers (`ddc/ddcv1.cpp:1108`, `:1401`, `:1553`), so a pair is the shape the
-/// reference's map is always in and a missing half is not a state.
+/// ⛔ NOT A MAP KEYED BY [`VectorComp`], WHICH IS NOT `Ord`: both keys are written TOGETHER by every
+/// writer in the code (`ddc/ddcv1.cpp:1130-1131`, `:1784-1785`, `:1792-1793`) and every copy moves
+/// the pair whole (`:964`, `:1369`, `ddc/ddc_transformation_util.cpp:1283-1284`,
+/// `dsc/dsc2.cpp:3698-3699`), so a missing half is not a state any of them can leave behind.
+///
+/// ⭐ THE ONE WRITER THAT COULD LEAVE ONE IS THE JSON IMPORT — `peSfpSplit_[dim][cl][comp]` per
+/// component the object names (`dsc/dims.cpp:383-393`) — and nothing here goes through it: the wire
+/// path refuses a stated `peSfpSplit_` outright (`targets/spyre/superdsc_to_l3_sdsc.rs:328`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeSfpShares {
     /// `.at(PE)`.

@@ -512,12 +512,11 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
     /// `DT_CHECK(val % factor == 0)` inside `divideByFactor` (`:789`) — a share the factor does not
     /// divide, which is an extent this cannot round.
     ///
-    /// ⛔ AND A VOLUME LIMIT KEYED ON THE DIM STOPS TOO, because the reference's plain
-    /// `symbolicDimInfo_.erase` leaves `maxSymbolicVolume_` untouched while
-    /// [`crate::schedule::l3::dsc::Symbolic`] holds *"every dim a volume limit is keyed on is named
-    /// by `info`"* as a type invariant — a state the reference reaches and this type cannot spell.
-    /// `Symbolic` needs its own `remove_dim` to decide that; rebuilding through `Symbolic::new` here
-    /// would silently DROP the limit.
+    /// ⛔ AND A VOLUME LIMIT KEYED ON THE DIM SURVIVES THE ERASE, which is why this goes through
+    /// [`crate::schedule::l3::dsc::Symbolic::remove_dim`] and NOT `Symbolic::new`, whose filter would
+    /// silently DROP it: the reference's plain `symbolicDimInfo_.erase` (`:787`) leaves
+    /// `maxSymbolicVolume_` untouched, and `pruneMaxSymbolicVolumes` is what re-keys it — the pairing
+    /// `ddc/ddcv1.cpp:1385` then `:1424` performs, and `ddc_transformation_util.cpp:1286` too.
     /// ⛔ AND EVERY ABORT IS DECIDED BEFORE THE FIRST WRITE, as in [`Self::make_dim_symbolic`]: one
     /// stop, and a half either wholly rewritten or wholly untouched.
     fn make_dim_not_symbolic(&mut self, at: v1::StageSite, dim: PrimaryDim) {
@@ -539,24 +538,14 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
             if factor == 0 {
                 return None;
             }
-            // ⛔ A VOLUME LIMIT KEYED ON THE DIM — see this method's own note.
-            if half
-                .dims
-                .symbolic
-                .volumes()
-                .keys()
-                .any(|dims| dims.contains(&dim))
-            {
-                return None;
-            }
             // `divideByFactor`, whose `DT_CHECK(val % factor == 0)` is the [`None`].
             let divided = |val: Extent| -> Option<Extent> {
                 (val.0 % factor == 0).then(|| Extent(val.0 / factor))
             };
-            // The erase, exactly — every volume limit survives because none names this dim.
-            let mut info_after = half.dims.symbolic.info().clone();
-            info_after.remove(&dim);
-            let symbolic = Symbolic::new(info_after, half.dims.symbolic.volumes().clone());
+            // `symbolicDimInfo_.erase(symIt)` (`:787`) and NOTHING else: a `maxSymbolicVolume_` keyed
+            // on this dim stays, for `prune_max_symbolic_volumes` to re-key.
+            let mut symbolic = half.dims.symbolic.clone();
+            symbolic.remove_dim(dim);
             // `primaryDimToValHandler_st(dim) = divideByFactor(primaryDimToVal_st(dim))`, read AFTER
             // the erase — so off the plain slot and not off `maxSize_`.
             let mut plain = half.dims.clone();
@@ -629,11 +618,9 @@ impl v1::ExploreStages for Dsc2Stages<'_, '_> {
             todo!(
                 "v1::ExploreStages::make_dim_not_symbolic: makeDimNotSymbolic (dsc/dims.cpp:781-803) \
                  ABORTED on {at:?} {dim:?} (maxSize_={max}, granularity_={granularity}) — one of \
-                 DT_CHECK(maxSize_ % granularity_ == 0) (:784), DT_CHECK(factor != 0) (:786), a \
+                 DT_CHECK(maxSize_ % granularity_ == 0) (:784), DT_CHECK(factor != 0) (:786), or a \
                  DT_CHECK(val % factor == 0) inside divideByFactor (:789) on the slot or on a \
-                 corelet/row/PE-SFP share, or a maxSymbolicVolume_ keyed on {dim:?} — which \
-                 symbolicDimInfo_.erase (:788) leaves in place and l3::dsc::Symbolic holds as a type \
-                 invariant it has no remove_dim to break. A rounded share is a fabricated extent"
+                 corelet/row/PE-SFP share. A rounded share is a fabricated extent"
             )
         };
         self.edit(at, |half| {
