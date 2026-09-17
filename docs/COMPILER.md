@@ -126,4 +126,4 @@ All arches share the one `scratchy-models` crate (`crates/models/arch/`):
    `crates/models/arch/Cargo.toml`, plus a gated `pub mod <arch>` in
    `crates/models/arch/src/lib.rs`.
 
-See [`docs/MODELS.md`](docs/MODELS.md) for the full recipe.
+See [`MODELS.md`](MODELS.md) for the full recipe.
