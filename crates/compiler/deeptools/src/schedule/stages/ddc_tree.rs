@@ -757,9 +757,10 @@ mod tests {
     use crate::schedule::ddc::transformation_util::{InsertionPoint, PaddingForm};
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
-        BlockNode, ComputeNode, CondOp, CondRegions, ConditionNode, DataInfo, InstrAttribute,
-        LayoutDims, LdsIdx, LeafKind, LeafNode, LoopBound, LoopCond, LoopCondComposite, NodeBase,
-        NodeName, Operand, SchedNode, StickMaskNode,
+        BlockNode, ComputeNode, CondOp, CondRegions, ConditionNode, Coordinate, DataInfo,
+        InstrAttribute, LayoutDims, LdsIdx, LeafKind, LeafNode, LoopBound, LoopCond,
+        LoopCondComposite, NodeBase, NodeName, Operand, RepetitionWithOffset, SchedNode,
+        StickMaskNode,
     };
     use crate::units::{Core, Corelet, NumFolds};
 
@@ -833,6 +834,11 @@ mod tests {
             },
         };
         let held = ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("compute_pe_fma16".to_owned()),
             op: DdlComputeType::Fma16,
             ex_unit: SenComponent::Pe,

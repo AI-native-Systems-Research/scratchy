@@ -3648,8 +3648,8 @@ mod tests_e110_e117 {
     use crate::schedule::ddc::fold::{ConstIdx, DataStream};
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
-        DataInfo, Dsts, InstrAttribute, LayoutDims, NumChunks, Operand, ReplicationFactor,
-        TransferPadding,
+        Coordinate, DataInfo, Dsts, InstrAttribute, LayoutDims, NumChunks, Operand,
+        RepetitionWithOffset, ReplicationFactor, TransferPadding, TransferRepetition,
     };
     use crate::units::{DfirUnit, NumFolds};
 
@@ -4079,6 +4079,13 @@ mod tests_e110_e117 {
     #[test]
     fn a_transfer_and_a_compute_carry_their_data_connects_and_any_other_kind_is_just_its_name() {
         let transfer = TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
@@ -4097,6 +4104,11 @@ mod tests_e110_e117 {
         );
 
         let compute = ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("c0".to_string()),
             op: DdlComputeType::Macc,
             ex_unit: SenComponent::Pe,
@@ -4126,7 +4138,9 @@ mod tests_e255_e257 {
 
     use super::super::metadata::{Allocation, OpaqueOp};
     use crate::schedule::ddl::ops::DdlComputeType;
-    use crate::schedule::dsc2::{DataInfo, InstrAttribute, Operand, OperandPos};
+    use crate::schedule::dsc2::{
+        Coordinate, DataInfo, InstrAttribute, Operand, OperandPos, RepetitionWithOffset,
+    };
     use crate::units::NumFolds;
 
     /// THE ONE DATASTREAM THIS STAND-IN CALLS EXTERNAL — entry 120's answer, as the seam the port
@@ -4162,6 +4176,11 @@ mod tests_e255_e257 {
 
     fn compute() -> ComputeNode {
         ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("c0".to_string()),
             op: DdlComputeType::Macc,
             ex_unit: SenComponent::Pe,
@@ -4503,7 +4522,8 @@ mod tests_e247_e254 {
     use crate::schedule::ddc::fold::DataStream;
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
-        Dsts, InstrAttribute, LayoutDims, NumChunks, ReplicationFactor, TransferPadding,
+        Coordinate, Dsts, InstrAttribute, LayoutDims, NumChunks, RepetitionWithOffset,
+        ReplicationFactor, TransferPadding, TransferRepetition,
     };
     use crate::schedule::l3::dsc::{Granularity, MaxSize};
     use crate::units::{DfirUnit, NumFolds};
@@ -5103,6 +5123,13 @@ mod tests_e247_e254 {
 
     fn transfer_node(name: &str, src: Operand, dsts: Dsts) -> TransferNode {
         TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
@@ -5393,6 +5420,11 @@ mod tests_e247_e254 {
             FifoConsumer::Compute(
                 consuming_compute,
                 ComputeNode {
+                    is_opaque_op: false,
+                    corelet_views: BTreeMap::new(),
+                    input_coordinates: Vec::new(),
+                    output_coordinate: Coordinate::default(),
+                    repetition_with_offset: RepetitionWithOffset::default(),
                     name: NodeName("c0".to_string()),
                     op: DdlComputeType::Macc,
                     ex_unit: SenComponent::Sfp,
@@ -5699,6 +5731,11 @@ mod tests_e247_e254 {
             FifoConsumer::Compute(
                 computing,
                 ComputeNode {
+                    is_opaque_op: false,
+                    corelet_views: BTreeMap::new(),
+                    input_coordinates: Vec::new(),
+                    output_coordinate: Coordinate::default(),
+                    repetition_with_offset: RepetitionWithOffset::default(),
                     name: NodeName("c0".to_string()),
                     op: DdlComputeType::Macc,
                     ex_unit: SenComponent::Sfp,
@@ -5864,9 +5901,9 @@ mod tests_e118_e123 {
     use crate::generated::RegName;
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
-        AllocLayout, AllocPlacement, FoldDim, InstrAttribute, LayoutDims, MaxDimSize, NodeBase,
-        NumChunks, ReplicationFactor, StartAddress, SyncDirection, SyncStrength, SyncUnits,
-        TransferPadding,
+        AllocLayout, AllocPlacement, Coordinate, FoldDim, InstrAttribute, LayoutDims, MaxDimSize,
+        NodeBase, NumChunks, RepetitionWithOffset, ReplicationFactor, StartAddress, SyncDirection,
+        SyncStrength, SyncUnits, TransferPadding, TransferRepetition,
     };
     use crate::units::NumFolds;
 
@@ -6180,6 +6217,11 @@ mod tests_e118_e123 {
 
     fn compute(ex_unit: SenComponent, inputs: Vec<Operand>, outputs: Vec<Operand>) -> ComputeNode {
         ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("c0".to_string()),
             op: DdlComputeType::Macc,
             ex_unit,
@@ -6524,6 +6566,13 @@ mod tests_e118_e123 {
 
         // A transfer's SOURCE is asked first, then each destination in turn.
         let transfer = TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             name: NodeName("t0".to_string()),
             src: operand(SenComponent::Lx, None, None),
             dsts: Dsts::new(
@@ -6728,7 +6777,10 @@ mod tests_e361 {
 
     use super::super::fold::{NodeKind, ScheduleTree};
     use crate::schedule::ddl::ops::DdlComputeType;
-    use crate::schedule::dsc2::{InstrAttribute, NumChunks, ReplicationFactor, TransferPadding};
+    use crate::schedule::dsc2::{
+        Coordinate, InstrAttribute, NumChunks, RepetitionWithOffset, ReplicationFactor,
+        TransferPadding, TransferRepetition,
+    };
     use crate::units::NumFolds;
     use sys_arch_spec::arch_enums::SenComponent;
 
@@ -6787,6 +6839,11 @@ mod tests_e361 {
         SubtreeNode::Compute(
             node,
             ComputeNode {
+                is_opaque_op: false,
+                corelet_views: BTreeMap::new(),
+                input_coordinates: Vec::new(),
+                output_coordinate: Coordinate::default(),
+                repetition_with_offset: RepetitionWithOffset::default(),
                 name: NodeName("c0".to_string()),
                 op: DdlComputeType::Macc,
                 ex_unit: SenComponent::Pe,
@@ -6803,6 +6860,13 @@ mod tests_e361 {
         SubtreeNode::Transfer(
             node,
             TransferNode {
+                repetition: TransferRepetition::default(),
+                last_fusable_parent_loop_src: None,
+                last_fusable_parent_loop_dst: Vec::new(),
+                unit_time_transfer_chunk_stride: Vec::new(),
+                rotate_num_elements: None,
+                corelet_views: BTreeMap::new(),
+                transfer_coordinates: Coordinate::default(),
                 name: NodeName("t0".to_string()),
                 src: operand(connect, SenComponent::L0),
                 dsts: Dsts::new(operand(DataConnect::ArfPt, SenComponent::Lx), Vec::new()),

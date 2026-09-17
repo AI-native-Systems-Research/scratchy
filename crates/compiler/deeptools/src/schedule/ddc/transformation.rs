@@ -201,8 +201,9 @@ use crate::schedule::ddc::transformation_util::{
 use crate::schedule::ddc::v1::{CoreClSet, StorageName};
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::dsc2::{
-    DataInfo, Dsts, InstrAttribute, LayoutDims, NodeBase, ReplicationFactor, SyncDirection,
-    SyncNode, SyncStrength, TransferPadding,
+    Coordinate, DataInfo, Dsts, InstrAttribute, LayoutDims, NodeBase, ReplicationFactor,
+    RepetitionWithOffset, SyncDirection, SyncNode, SyncStrength, TransferPadding,
+    TransferRepetition,
 };
 use crate::schedule::l3::dsc::PrimaryDsInfo;
 use crate::units::{Core, NumFolds};
@@ -2276,6 +2277,13 @@ where
 /// at the value a `new dsc2::TransferNode()` carries.
 fn minted_transfer(name: NodeName, src: Operand, dst: Operand) -> TransferNode {
     TransferNode {
+        repetition: TransferRepetition::default(),
+        last_fusable_parent_loop_src: None,
+        last_fusable_parent_loop_dst: Vec::new(),
+        unit_time_transfer_chunk_stride: Vec::new(),
+        rotate_num_elements: None,
+        corelet_views: BTreeMap::new(),
+        transfer_coordinates: Coordinate::default(),
         name,
         src,
         dsts: Dsts::new(dst, Vec::new()),
@@ -2299,6 +2307,11 @@ fn dummy_fma(name: NodeName, input: DataInfo, constant: DataInfo, output: DataIn
         data,
     };
     ComputeNode {
+        is_opaque_op: false,
+        corelet_views: BTreeMap::new(),
+        input_coordinates: Vec::new(),
+        output_coordinate: Coordinate::default(),
+        repetition_with_offset: RepetitionWithOffset::default(),
         name,
         op: DdlComputeType::Fma16,
         ex_unit: SenComponent::Sfp,
@@ -2975,6 +2988,11 @@ where
                 continue;
             }
             let compute = dsc.mint_compute(ComputeNode {
+                is_opaque_op: false,
+                corelet_views: BTreeMap::new(),
+                input_coordinates: Vec::new(),
+                output_coordinate: Coordinate::default(),
+                repetition_with_offset: RepetitionWithOffset::default(),
                 name: NodeName(format!("compute_splat_4B_lxlu_{}", dst.unit.spelling())),
                 op: DdlComputeType::Splat,
                 ex_unit: dst.unit,
@@ -3542,6 +3560,11 @@ mod tests_e376 {
 
     fn tree() -> Tree {
         let assign = ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("assign".to_owned()),
             op: DdlComputeType::Assign,
             ex_unit: SenComponent::Pe,
@@ -3976,6 +3999,11 @@ mod tests_e105_e109 {
 
     fn compute_on(ex_unit: SenComponent, connect: DataConnect) -> ComputeNode {
         ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("recip".to_owned()),
             op: DdlComputeType::Macc,
             ex_unit,
@@ -4010,6 +4038,13 @@ mod tests_e105_e109 {
         let ex = SenComponent::Ptrow3;
         let compute = compute_on(ex, DataConnect::PeHtOut);
         let taken = TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
@@ -4259,6 +4294,11 @@ mod tests_e242_e246 {
         outputs: Vec<Operand>,
     ) -> ComputeNode {
         ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("c".to_owned()),
             op: DdlComputeType::Macc,
             ex_unit,
@@ -4272,6 +4312,13 @@ mod tests_e242_e246 {
 
     fn transfer_node(src: Operand, dsts: Dsts) -> TransferNode {
         TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
@@ -4818,6 +4865,11 @@ mod tests_e300 {
     impl ComputeNodes for Packing {
         fn compute(&self, _compute: NodeId) -> ComputeNode {
             ComputeNode {
+                is_opaque_op: false,
+                corelet_views: BTreeMap::new(),
+                input_coordinates: Vec::new(),
+                output_coordinate: Coordinate::default(),
+                repetition_with_offset: RepetitionWithOffset::default(),
                 name: NodeName("recip".to_owned()),
                 op: DdlComputeType::Macc,
                 ex_unit: SenComponent::Sfp,
@@ -5010,6 +5062,13 @@ mod tests_e300 {
 
     fn transfer(src: Operand, dst: Operand) -> TransferNode {
         TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             name: NodeName("t".to_owned()),
             src,
             dsts: Dsts::new(dst, Vec::new()),
@@ -5114,6 +5173,13 @@ mod tests_e338 {
         }
         fn transfer(&self, _node: NodeId) -> TransferNode {
             TransferNode {
+                repetition: TransferRepetition::default(),
+                last_fusable_parent_loop_src: None,
+                last_fusable_parent_loop_dst: Vec::new(),
+                unit_time_transfer_chunk_stride: Vec::new(),
+                rotate_num_elements: None,
+                corelet_views: BTreeMap::new(),
+                transfer_coordinates: Coordinate::default(),
                 name: NodeName("lxlu_to_lxsu".to_owned()),
                 src: operand(SenComponent::Lxlu),
                 dsts: Dsts::new(operand(SenComponent::Lxsu), Vec::new()),
@@ -5377,6 +5443,11 @@ mod tests_e359_e360 {
 
     fn compute_node(inputs: Vec<Operand>) -> ComputeNode {
         ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("c".to_owned()),
             op: DdlComputeType::Macc,
             ex_unit: SenComponent::Sfp,
@@ -5390,6 +5461,13 @@ mod tests_e359_e360 {
 
     fn transfer_node(src: Operand, dsts: Dsts, replication: u64) -> TransferNode {
         TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             name: NodeName("t".to_owned()),
             src,
             dsts,

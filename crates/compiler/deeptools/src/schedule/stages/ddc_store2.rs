@@ -1849,8 +1849,9 @@ mod authority_tests {
     use crate::schedule::ddl::conversion as conv;
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
-        ComputeNode, DataInfo, Dsts, InstrAttribute, LayoutDims, LdsIdx, NodeBase, NodeName,
-        NumChunks, Operand, ReplicationFactor, TransferNode, TransferPadding,
+        ComputeNode, Coordinate, DataInfo, Dsts, InstrAttribute, LayoutDims, LdsIdx, NodeBase,
+        NodeName, NumChunks, Operand, RepetitionWithOffset, ReplicationFactor, TransferNode,
+        TransferPadding, TransferRepetition,
     };
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DscIdx, DscList,
@@ -2000,6 +2001,13 @@ mod authority_tests {
     /// A fresh `dsc2::TransferNode` between two ends — every other field its own initializer.
     fn a_transfer(name: &str, src: Operand, dst: Operand) -> TransferNode {
         TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             name: NodeName(name.to_owned()),
             src,
             dsts: Dsts::new(dst, Vec::new()),
@@ -2078,6 +2086,11 @@ mod authority_tests {
                 &mut ddl,
                 head,
                 ComputeNode {
+                    is_opaque_op: false,
+                    corelet_views: BTreeMap::new(),
+                    input_coordinates: Vec::new(),
+                    output_coordinate: Coordinate::default(),
+                    repetition_with_offset: RepetitionWithOffset::default(),
                     name: NodeName("mm".to_owned()),
                     op: DdlComputeType::Fma16,
                     ex_unit: SenComponent::Pe,
@@ -2351,6 +2364,11 @@ mod authority_tests {
                 &mut ddl,
                 head,
                 ComputeNode {
+                    is_opaque_op: false,
+                    corelet_views: BTreeMap::new(),
+                    input_coordinates: Vec::new(),
+                    output_coordinate: Coordinate::default(),
+                    repetition_with_offset: RepetitionWithOffset::default(),
                     name: NodeName("mm".to_owned()),
                     op: DdlComputeType::Fma16,
                     ex_unit: SenComponent::Pe,

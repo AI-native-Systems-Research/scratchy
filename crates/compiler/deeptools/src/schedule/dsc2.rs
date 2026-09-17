@@ -31,7 +31,7 @@ use crate::generated::{DataConnect, Mode, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{ConstIdx, NodeId, PadType};
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
-use crate::schedule::ddc::transformation::LoopId;
+use crate::schedule::ddc::transformation::{LoopId, MaskLoopOffset};
 use crate::schedule::ddc::transformation_util::PaddingForm;
 use crate::schedule::ddc::v1::{ConstEleOffset, LdsSticks, LoopEleOffset};
 use crate::schedule::ddl::ops::DdlComputeType;
@@ -476,11 +476,13 @@ pub struct Hops(pub Vec<SenComponent>);
 pub struct Dsts {
     first: Operand,
     rest: Vec<Operand>,
-    /// `dstVias_.at(i).via_`, per destination.
+    /// Field: e014_TransferNode.via_
+    ///
+    /// `dstVias_.at(i).via_` (`dsc/dsc2.h:818`), per destination.
     ///
     /// ⭐ SHORT OR ABSENT IS EMPTY, AND THAT IS THE TRUTH RATHER THAN A GAP: a freshly minted
-    /// `DstVia` carries an empty `via_` (`dsc/dsc2.h:818`), so a site that states no route for a
-    /// destination has stated the route it has.
+    /// `DstVia` carries an empty `via_`, so a site that states no route for a destination has stated
+    /// the route it has.
     hops: Vec<Hops>,
 }
 
@@ -1072,13 +1074,19 @@ pub struct InstrAttribute {
     pub read_write_regs: BTreeMap<RegName, RegSlot>,
     /// `read_only_reg_map_` — the input/output registers.
     pub read_only_regs: BTreeMap<RegName, RegSlot>,
-    /// `mode_` (`dsc/dsc2.h:930`) — the general SRC1/IMM field, once its `-1` default is an [`Option`].
+    /// Field: e015_ComputeNode.mode_
+    ///
+    /// `mode_` (`dsc/dsc2.h:915`) — the general SRC1/IMM field, once its `-1` default is an [`Option`].
     pub mode: Option<Mode>,
     /// `compute_mask_` (`dsc/dsc2.h:916`) — `mask=` where a template states one.
     pub compute_mask: ComputeMask,
-    /// `repetition_` (`dsc/dsc2.h:923`).
+    /// Field: e015_ComputeNode.repetition_
+    ///
+    /// `repetition_` (`dsc/dsc2.h:907`), *"default 8 slices works the same"*.
     pub repetition: Repetition,
-    /// `indices_` (`dsc/dsc2.h:922`) — the PACK/MERGE mapping, empty where the op states none.
+    /// Field: e015_ComputeNode.indices_
+    ///
+    /// `indices_` (`dsc/dsc2.h:906`) — the PACK/MERGE mapping, empty where the op states none.
     pub indices: Vec<PackIndex>,
     /// `param_map_` MINUS its two fixed keys — a `ddl.opaque`'s `params=`, copied through
     /// (`ddc/ddl/ddl_conversion.cpp:2674-2690`).
@@ -1087,9 +1095,23 @@ pub struct InstrAttribute {
     /// `"prec"`, which entry 261 writes from the compute's own state, and no vendored template
     /// spells either as a `params=` key.
     pub params: BTreeMap<ParamKey, ParamValue>,
-    /// `input_data_connects_` (`dsc/dsc2.h:936`) — which ports a spliced opaque body reads.
+    /// Field: e015_ComputeNode.computeMaskLoopOffsets_
+    ///
+    /// Field: e015_ComputeNode.loopEleOffsets_
+    ///
+    /// `computeMaskLoopOffsets_` (`dsc/dsc2.h:923-925`), *"Per corelet"* — how many elements of each
+    /// dim one trip of that loop steps the compute's MASK by. EMPTY is the state entry 242 tests
+    /// (`ddc/ddcv1.cpp:1696-1698`), so an absent entry is static masking and not a missing value.
+    ///
+    /// ⛔ `loopEleOffsets_` (`:917-922`) IS THIS FIELD AND NOT [`DataInfo::loop_ele_offsets`]: the
+    /// reference declares it COMMENTED OUT immediately above the live member, which carries its inner
+    /// two maps under a corelet key. The `loopEleOffsets_` that IS live belongs to [`DataInfo`]
+    /// (`:730-734`) — a different type's field of the same name.
+    pub compute_mask_loop_offsets:
+        BTreeMap<Corelet, BTreeMap<LoopId, BTreeMap<PrimaryDim, MaskLoopOffset>>>,
+    /// `input_data_connects_` (`dsc/dsc2.h:927`) — which ports a spliced opaque body reads.
     pub input_data_connects: Vec<DataConnect>,
-    /// `output_data_connects_` (`dsc/dsc2.h:938`).
+    /// `output_data_connects_` (`dsc/dsc2.h:929`).
     pub output_data_connects: Vec<DataConnect>,
 }
 
@@ -1100,27 +1122,137 @@ impl Default for Unroll {
     }
 }
 
-/// `dsc2::ComputeNode` (`dsc/dsc2.h:900`) narrowed to what the fold units read.
+/// WHAT ONE CORELET SEES OF A COMPUTE'S OPERANDS — `ComputeNode::CoreletView`
+/// (`dsc/dsc2.h:943-946`), one [`UnitView`] per input and one per output.
+///
+/// ⭐ ONE ENTRY PER OPERAND IN OPERAND ORDER: both lists are `push_back`ed while walking `inputs_`
+/// and `outputs_` (`dsc/dsc2.cpp:3021-3031`), so position `i` here is operand `i` of
+/// [`ComputeNode::inputs`] / [`ComputeNode::outputs`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ComputeCoreletView {
+    /// Field: e015_ComputeNode.inputsLoopsAndSizes_
+    ///
+    /// `inputsLoopsAndSizes_` (`dsc/dsc2.h:944`).
+    pub inputs_loops_and_sizes: Vec<UnitView>,
+    /// Field: e015_ComputeNode.outputsLoopsAndSizes_
+    ///
+    /// `outputsLoopsAndSizes_` (`dsc/dsc2.h:945`).
+    pub outputs_loops_and_sizes: Vec<UnitView>,
+}
+
+/// WHICH OF A CLONED COMPUTE'S OPERANDS TAKE A REPETITION OFFSET —
+/// `ComputeNode::RepetitionWithOffset` (`dsc/dsc2.h:950-953`), whose two lists are BOTH declared
+/// empty.
+///
+/// ⭐ EMPTY IS THE ANSWER "NONE DO", and it is the answer entry 108 acts on: it reads
+/// `forOutputs_.size()` to decide how many clones to mint and then writes `forOutputs_.at(idx)`
+/// (`ddc/ddc_transformation.cpp:1373`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepetitionWithOffset {
+    /// Field: e015_ComputeNode.forInputs_
+    ///
+    /// `forInputs_ = {}` (`dsc/dsc2.h:951`), in [`ComputeNode::inputs`] order.
+    pub for_inputs: Vec<Repetition>,
+    /// Field: e015_ComputeNode.forOutputs_
+    ///
+    /// `forOutputs_ = {}` (`dsc/dsc2.h:952`), in [`ComputeNode::outputs`] order.
+    pub for_outputs: Vec<Repetition>,
+}
+
+/// Replaces: e015_ComputeNode
+///
+/// `dsc2::ComputeNode` (`dsc/dsc2.h:900-962`) carrying ALL FOURTEEN of its declared fields, plus the
+/// `name_` this projection needs from the `ScheduleNode` base.
+///
+/// ⭐ AN OPERAND AND ITS OFFSETS ARE ONE VALUE: `inputs_`/`inputsLdsAndLoopOffsets_` and
+/// `outputs_`/`outputsLdsAndLoopOffsets_` are four parallel vectors in the reference, and fusing each
+/// pair into an [`Operand`] is what makes `dbgPrint`'s length mismatch unspellable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputeNode {
     /// `name_`.
     pub name: NodeName,
-    /// `type_` — the dialect's whole recognised compute set, because the MACC resolution entry 323
-    /// performs names `IMA4`/`IMA8`/`FMA8`/`FMA4`, which no `computetype=` spells and the census
-    /// therefore cannot express.
+    /// Field: e015_ComputeNode.type_
+    ///
+    /// `type_` (`dsc/dsc2.h:933`) — the dialect's whole recognised compute set, because the MACC
+    /// resolution entry 323 performs names `IMA4`/`IMA8`/`FMA8`/`FMA4`, which no `computetype=`
+    /// spells and the census therefore cannot express.
+    ///
+    /// ⛔ NO `ComputeOpType::COUNT` ARM. The reference's initialiser is that past-the-end sentinel
+    /// (`:933`), so a node minted and never given an op is unspellable here rather than carrying a
+    /// value no reader handles.
     pub op: DdlComputeType,
-    /// `exUnit_`.
+    /// Field: e015_ComputeNode.exUnit_
+    ///
+    /// `exUnit_` (`dsc/dsc2.h:932`).
     pub ex_unit: SenComponent,
-    /// `inputs_` zipped with `inputsLdsAndLoopOffsets_`.
+    /// Field: e015_ComputeNode.inputs_
+    ///
+    /// Field: e015_ComputeNode.inputsLdsAndLoopOffsets_
+    ///
+    /// `inputs_` (`:935`) zipped with `inputsLdsAndLoopOffsets_` (`:937`).
     pub inputs: Vec<Operand>,
-    /// `outputs_` zipped with `outputsLdsAndLoopOffsets_`.
+    /// Field: e015_ComputeNode.outputs_
+    ///
+    /// Field: e015_ComputeNode.outputsLdsAndLoopOffsets_
+    ///
+    /// `outputs_` (`:936`) zipped with `outputsLdsAndLoopOffsets_` (`:938`).
     pub outputs: Vec<Operand>,
     /// `numFoldsEngaged` (`dsc/dsc2.h:940`), whose default is ONE and not zero.
     pub num_folds_engaged: NumFolds,
-    /// `dataFormat_` (`dsc/dsc2.h:945`), once its `DataFormats::INVALID` default is an [`Option`].
+    /// Field: e015_ComputeNode.dataFormat_
+    ///
+    /// `dataFormat_` (`dsc/dsc2.h:934`), whose reference initialiser is `SEN169_FP16` — so [`None`]
+    /// is *"nobody chose one"* and [`ComputeNode::effective_data_format`] is what turns that back
+    /// into the format the reference would have read.
     pub data_format: Option<DataFormat>,
+    /// Field: e015_ComputeNode.instrAttribute_
+    ///
     /// `instrAttribute_` (`dsc/dsc2.h:939`).
     pub instr_attribute: InstrAttribute,
+    /// Field: e015_ComputeNode.isOpaqueOp_
+    ///
+    /// `isOpaqueOp_` (`dsc/dsc2.h:941`) — whether the compute is a `ddl.opaque` whose body is
+    /// spliced in rather than a recognised op. FALSE on a fresh node; the DDL conversion sets it
+    /// (`ddc/ddl/ddl_conversion.cpp:1575-1578`).
+    pub is_opaque_op: bool,
+    /// Field: e015_ComputeNode.coreletViews_
+    ///
+    /// `coreletViews_` (`dsc/dsc2.h:947`), EMPTY until the tree is finalised: `dsc/dsc2.cpp:3020`
+    /// fills one entry per corelet in `0 .. numCoreletsUsed_DSC2_`, so no `-1` ever keys it.
+    pub corelet_views: BTreeMap<Corelet, ComputeCoreletView>,
+    /// Field: e015_ComputeNode.inputCoordinates_
+    ///
+    /// `inputCoordinates_` (`dsc/dsc2.h:948`), which may be SHORTER than an opaque op's input list.
+    pub input_coordinates: Vec<Coordinate>,
+    /// Field: e015_ComputeNode.outputCoordinate_
+    ///
+    /// `outputCoordinate_` (`dsc/dsc2.h:949`) — ONE coordinate however many outputs, which is the
+    /// reference's own declaration and not a narrowing.
+    pub output_coordinate: Coordinate,
+    /// Field: e015_ComputeNode.repetitionWithOffset_
+    ///
+    /// `repetitionWithOffset_` (`dsc/dsc2.h:954`).
+    pub repetition_with_offset: RepetitionWithOffset,
+}
+
+impl ComputeNode {
+    /// The format this compute reads and writes, which a fresh node HAS rather than lacks:
+    /// `dataFormat_`'s reference initialiser is `DataFormats::SEN169_FP16` (`dsc/dsc2.h:934`).
+    #[must_use]
+    pub fn effective_data_format(&self) -> DataFormat {
+        self.data_format.unwrap_or(DataFormat::Sen169Fp16)
+    }
+
+    /// `coreletViews_.at(corelet_id_)`, or `coreletViews_.begin()->second` where the executing unit
+    /// has no corelet of its own (`SNComputeLowering.cpp:549-571`) — [`None`] reads the FIRST entry,
+    /// which is what the reference's `-1` does, and absent where nothing has been finalised yet.
+    #[must_use]
+    pub fn corelet_view(&self, corelet: Option<Corelet>) -> Option<&ComputeCoreletView> {
+        match corelet {
+            Some(corelet) => self.corelet_views.get(&corelet),
+            None => self.corelet_views.values().next(),
+        }
+    }
 }
 
 /// A POSITION IN A STICK'S DIM ORDER — `srcSizeIdx_`/`dstSizeIdx_` (`dsc/dsc2.h:821`), an index into
@@ -1210,11 +1342,17 @@ impl UnitView {
 /// `-1` indices are filled with the same stick-dim position at the one site that pushes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SizeAndIndex {
-    /// `sizeDim_`.
+    /// Field: e014_TransferNode.sizeDim_
+    ///
+    /// `sizeDim_` (`dsc/dsc2.h:821`).
     pub size_dim: Size,
-    /// `srcSizeIdx_`.
+    /// Field: e014_TransferNode.srcSizeIdx_
+    ///
+    /// `srcSizeIdx_` (`dsc/dsc2.h:822`).
     pub src_size_idx: StickDimIdx,
-    /// `dstSizeIdx_`.
+    /// Field: e014_TransferNode.dstSizeIdx_
+    ///
+    /// `dstSizeIdx_` (`dsc/dsc2.h:822`).
     pub dst_size_idx: StickDimIdx,
 }
 
@@ -1363,38 +1501,183 @@ pub struct GroupTagRegInfo {
     pub group: Option<GtrGroupId>,
 }
 
-/// `dsc2::TransferNode` (`dsc/dsc2.h:814`) narrowed to what the ported units read and write.
+/// HOW MANY TIMES ONE END OF A TRANSFER READS ITS ALLOCATION — `repetition_.srcRep_` or one
+/// `dstReps_` entry (`dsc/dsc2.h:827-828`), which is a `ddl.allocate`'s `replication=`.
+///
+/// ⛔ NOT [`Repetition`], WHOSE DEFAULT IS EIGHT. This one's only writer hands back `1` at all four
+/// of its early exits and where the allocation states no `replication=`
+/// (`ddc/ddl/ddl_conversion.cpp:858-870`) — and `srcRep_` is declared with NO initialiser at all, so
+/// ONE is the value that cannot be the reference's uninitialised read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OperandRepetition(pub u32);
+
+impl OperandRepetition {
+    /// `getRepetitionIfExists`' own `return 1`.
+    pub const ONE: Self = Self(1);
+}
+
+impl Default for OperandRepetition {
+    /// The writer's fallback, and the only value a reader of an unwritten `srcRep_` could soundly
+    /// see.
+    fn default() -> Self {
+        Self::ONE
+    }
+}
+
+/// HOW OFTEN EACH END OF A TRANSFER REPEATS — the anonymous `repetition_` struct
+/// (`dsc/dsc2.h:826-829`), one factor for the source and one per destination.
+///
+/// ⛔ WRITTEN AND NEVER READ AT `a0d29abbed`: `ddc/ddl/ddl_conversion.cpp:1171` and `:1189` fill it,
+/// no reader anywhere in the reference tree consults it, and the schedule serialiser does not emit
+/// it. It is carried because dropping a declared field is not this port's call to make.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransferRepetition {
+    /// Field: e014_TransferNode.srcRep_
+    ///
+    /// `srcRep_` (`dsc/dsc2.h:827`).
+    pub src: OperandRepetition,
+    /// Field: e014_TransferNode.dstReps_
+    ///
+    /// `dstReps_` (`dsc/dsc2.h:828`), in [`Dsts`] order.
+    pub dsts: Vec<OperandRepetition>,
+}
+
+/// WHAT ONE CORELET SEES OF A TRANSFER'S ENDS — `TransferNode::CoreletView` (`dsc/dsc2.h:847-850`).
+///
+/// ⭐ AN INDIRECT VIEW IS EMPTY UNLESS THAT END IS INDIRECT: `dsc/dsc2.cpp:3066` and `:3075` guard
+/// both fills with `isSrcIndirect()` / `isDstIndirect()`, so a default [`UnitView`] here says
+/// *"direct"* rather than *"not built yet"*.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransferCoreletView {
+    /// `srcLoopsAndSize_` (`dsc/dsc2.h:848`).
+    pub src_loops_and_size: UnitView,
+    /// Field: e014_TransferNode.srcIndirectLoopsAndSize_
+    ///
+    /// `srcIndirectLoopsAndSize_` (`dsc/dsc2.h:848`).
+    pub src_indirect_loops_and_size: UnitView,
+    /// `dstLoopsAndSizes_` (`dsc/dsc2.h:849`), in [`Dsts`] order.
+    pub dst_loops_and_sizes: Vec<UnitView>,
+    /// Field: e014_TransferNode.dstIndirectLoopsAndSizes_
+    ///
+    /// `dstIndirectLoopsAndSizes_` (`dsc/dsc2.h:849`), pushed only for an indirect destination.
+    pub dst_indirect_loops_and_sizes: Vec<UnitView>,
+}
+
+/// Replaces: e014_TransferNode
+///
+/// `dsc2::TransferNode` (`dsc/dsc2.h:814-898`) carrying ALL TWENTY of its declared fields, plus the
+/// `name_` this projection needs from the `ScheduleNode` base.
+///
+/// ⭐ AN END AND ITS OFFSETS ARE ONE VALUE: `src_`/`srcLdsAndLoopOffsets_` and
+/// `dstVias_`/`dstLdsAndLoopOffsets_` are parallel in the reference, and `ddc/ddcv1.cpp:2867` is the
+/// `DT_ERROR` that fires when the two destination vectors disagree — fusing each pair into an
+/// [`Operand`] is what makes that error unspellable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferNode {
     /// `name_`.
     pub name: NodeName,
-    /// `src_.unit_` zipped with `srcLdsAndLoopOffsets_`.
+    /// `src_.unit_` zipped with `srcLdsAndLoopOffsets_` (`dsc/dsc2.h:824`, `:832`).
     pub src: Operand,
-    /// `dstVias_` zipped with `dstLdsAndLoopOffsets_`.
+    /// Field: e014_TransferNode.dstVias_
+    ///
+    /// `dstVias_` (`dsc/dsc2.h:825`) zipped with `dstLdsAndLoopOffsets_` (`:833`).
     pub dsts: Dsts,
-    /// `replicationFactor_` (`:834`).
+    /// Field: e014_TransferNode.replicationFactor_
+    ///
+    /// `replicationFactor_` (`dsc/dsc2.h:834`).
     pub replication_factor: ReplicationFactor,
-    /// `unitTimeTransferChunkSize_` (`:836`) — the continuous elements within a stick boundary.
+    /// Field: e014_TransferNode.unitTimeTransferChunkSize_
+    ///
+    /// `unitTimeTransferChunkSize_` (`dsc/dsc2.h:836`) — the continuous elements within a stick
+    /// boundary.
     pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
-    /// `unitTimeTransferNumChunks_` (`:835`) — how many of those chunks one unit time moves.
+    /// Field: e014_TransferNode.unitTimeTransferNumChunks_
+    ///
+    /// `unitTimeTransferNumChunks_` (`dsc/dsc2.h:837`) — how many of those chunks one unit time
+    /// moves.
     pub unit_time_transfer_num_chunks: NumChunks,
-    /// `paddingInfo_` (`:836`) — EMPTY on a fresh node; entry 221 is what fills it.
+    /// Field: e014_TransferNode.unitTimeTransferChunkStride_
+    ///
+    /// `unitTimeTransferChunkStride_` (`dsc/dsc2.h:838`) — the dims a chunk-strided load skips over,
+    /// EMPTY for a contiguous one.
+    ///
+    /// ⛔ A `Vec` AND NOT ONE ENTRY, BECAUSE THE REFERENCE DOES NOT GUARANTEE ONE: its reader
+    /// `DT_CHECK`s `size() <= 1` (`dsc/dsc2.cpp:3555`) while the writer `push_back`s once per
+    /// remaining dim (`ddc/ddcv1.cpp:1636-1641`). Narrowing it to a single entry would assert a
+    /// contract the writer does not hold to. ⭐ That writer is a lambda whose only call site is
+    /// COMMENTED OUT (`ddc/ddcv1.cpp:1649-1650`), so on this path only a deserialised schedule
+    /// (`dsc/dsc2.cpp:1573`) fills it at all.
+    pub unit_time_transfer_chunk_stride: Vec<SizeAndIndex>,
+    /// Field: e014_TransferNode.rotateNumElements_
+    ///
+    /// `rotateNumElements_` (`dsc/dsc2.h:839`) — how far the LXLU rotates what it moves, absent for
+    /// the reference's `0`.
+    ///
+    /// ⭐ ZERO AND ABSENT ARE THE SAME STATE HERE, not a lost distinction: every reader guards on
+    /// `rotateNumElements_ > 0` (`SNTransferLowering.cpp:991`, `:1097`, `:2239`, `:2277`) and the one
+    /// consumer that reads it unguarded substitutes `0` for a non-LXLU unit (`dsc/dsc2Pcfg.cpp:1233`).
+    pub rotate_num_elements: Option<Elements>,
+    /// Field: e014_TransferNode.paddingInfo_
+    ///
+    /// `paddingInfo_` (`dsc/dsc2.h:845`) — EMPTY on a fresh node; entry 221 is what fills it.
     pub padding: TransferPadding,
-    /// `srcIndirect_` FUSED WITH `srcIndirectLdsAndLoopOffsets_.myLdsIdx_` — the index tensor this
-    /// transfer gathers its SOURCE addresses through, [`None`] for a direct transfer.
+    /// Field: e014_TransferNode.repetition_
+    ///
+    /// `repetition_` (`dsc/dsc2.h:826-829`).
+    pub repetition: TransferRepetition,
+    /// Field: e014_TransferNode.srcIndirect_
+    ///
+    /// Field: e014_TransferNode.srcIndirectLdsAndLoopOffsets_
+    ///
+    /// `srcIndirect_` (`dsc/dsc2.h:824`) FUSED WITH `srcIndirectLdsAndLoopOffsets_.myLdsIdx_` (`:832`)
+    /// — the index tensor this transfer gathers its SOURCE addresses through, [`None`] for a direct
+    /// transfer, which is `isSrcIndirect()`'s own `unit_ != NO_COMPONENT` test (`:877`).
     pub src_indirect: Option<Via>,
-    /// `dstVias_.front().locIndirect_` FUSED WITH `dstIndirectLdsAndLoopOffsets_.front().myLdsIdx_`.
+    /// Field: e014_TransferNode.locIndirect_
+    ///
+    /// Field: e014_TransferNode.dstIndirectLdsAndLoopOffsets_
+    ///
+    /// `dstVias_.front().locIndirect_` (`dsc/dsc2.h:817`) FUSED WITH
+    /// `dstIndirectLdsAndLoopOffsets_.front().myLdsIdx_` (`:833`).
     ///
     /// ⛔ ONE END AND NOT A VECTOR, WHICH IS THE REFERENCE'S OWN TWO `DT_CHECK`s: entry 227 demands
     /// `dstVias_.size() == 1` before it writes, and then that `dstIndirectLdsAndLoopOffsets_` was
     /// empty and holds exactly one entry after.
     pub dst_indirect: Option<Via>,
-    /// `coreIdToGTRInfo_` (`:840`) — the multicast group each transferring core belongs to, EMPTY
-    /// on a fresh node. Entry 291 is what fills it and entry 218 is what fills a condition arm's.
+    /// Field: e014_TransferNode.lastFusableParentLoopSrc_
+    ///
+    /// `lastFusableParentLoopSrc_` (`dsc/dsc2.h:830`) — the outermost enclosing loop the SOURCE end
+    /// can fuse into its own stepping, absent for the reference's `nullptr`, which is the state
+    /// `compLoop = lastFusableParentLoop != nullptr` reads (`dsc/dsc2.cpp:2843`).
+    pub last_fusable_parent_loop_src: Option<LoopId>,
+    /// Field: e014_TransferNode.lastFusableParentLoopDst_
+    ///
+    /// `lastFusableParentLoopDst_` (`dsc/dsc2.h:831`), ONE ENTRY PER DESTINATION in [`Dsts`] order —
+    /// `ddc/ddcv1.cpp:2871-2878` clears it and pushes once per `dstVias_` entry, and `dsc/dsc2.cpp
+    /// :3074` indexes it by the same `i`. Each entry is absent for its own `nullptr`.
+    pub last_fusable_parent_loop_dst: Vec<Option<LoopId>>,
+    /// Field: e014_TransferNode.coreIdToGTRInfo_
+    ///
+    /// `coreIdToGTRInfo_` (`dsc/dsc2.h:840`) — the multicast group each transferring core belongs to,
+    /// EMPTY on a fresh node. Entry 291 is what fills it and entry 218 is what fills a condition
+    /// arm's.
     pub core_id_to_gtr_info: BTreeMap<Core, GroupTagRegInfo>,
-    /// `transferSize_` (`:843`) — an EXPLICIT per-dim size that overrides the one derived from the
-    /// data stage (`dsc/dsc2.cpp:3474` reads it), EMPTY on a fresh node. Entry 295 fills it.
+    /// Field: e014_TransferNode.transferSize_
+    ///
+    /// `transferSize_` (`dsc/dsc2.h:843`) — an EXPLICIT per-dim size that overrides the one derived
+    /// from the data stage (`dsc/dsc2.cpp:3474` reads it), EMPTY on a fresh node. Entry 295 fills it.
     pub transfer_size: BTreeMap<PrimaryDim, Elements>,
+    /// Field: e014_TransferNode.coreletViews_
+    ///
+    /// `coreletViews_` (`dsc/dsc2.h:851`), EMPTY until the tree is finalised: `dsc/dsc2.cpp:3062`
+    /// fills one entry per corelet in `0 .. numCoreletsUsed_DSC2_`, so no `-1` ever keys it.
+    pub corelet_views: BTreeMap<Corelet, TransferCoreletView>,
+    /// Field: e014_TransferNode.transferCoordinates_
+    ///
+    /// `transferCoordinates_` (`dsc/dsc2.h:852`) — ONE coordinate shared by every end of the
+    /// transfer, which `fillDataInfo` threads through both the source and each destination
+    /// (`ddc/ddcv1.cpp:2863-2875`).
+    pub transfer_coordinates: Coordinate,
 }
 
 /// WHAT A TRANSFER MOVES BETWEEN — `dsc2::TransferNode::getTransferType()` (`dsc/dsc2.h:882-900`),
@@ -1471,6 +1754,17 @@ impl TransferNode {
             (false, false, true, _) => TransferKind::NoTransferToTensor,
             (true, _, false, false) => TransferKind::NoTransferFromTensor,
             _ => TransferKind::Invalid,
+        }
+    }
+
+    /// `coreletViews_.at(corelet_id_)`, or `coreletViews_.begin()->second` where the transferring
+    /// unit has no corelet of its own (`SNTransferLowering.cpp:861-863`) — [`None`] reads the FIRST
+    /// entry, which is what the reference's `-1` does, and absent where nothing has been finalised.
+    #[must_use]
+    pub fn corelet_view(&self, corelet: Option<Corelet>) -> Option<&TransferCoreletView> {
+        match corelet {
+            Some(corelet) => self.corelet_views.get(&corelet),
+            None => self.corelet_views.values().next(),
         }
     }
 }
@@ -1719,16 +2013,28 @@ impl LeafNode {
     }
 }
 
-/// `dsc2::BlockNode` (`dsc/dsc2.h:526`) narrowed to the `name_` a block is looked up by and the
-/// `next_` children a traversal descends into.
+/// Replaces: e010_BlockNode
+///
+/// `dsc2::BlockNode` (`dsc/dsc2.h:526-561`) carrying its ONE declared field, plus the `name_` a block
+/// is looked up by.
 ///
 /// ⛔ A FRESH BLOCK HAS NO CHILDREN: `new dsc2::BlockNode()` leaves the child vector empty, and
 /// `addChildNode`/`moveChildNode` are the units that fill it.
+///
+/// ⭐ `Clone` COPIES THE CHILDREN WHERE THE REFERENCE'S COPY CONSTRUCTOR DROPS THEM —
+/// `VectorOfChildren(const VectorOfChildren&) {}`, *"do nothing on purpose"*, leaving it *"up to the
+/// caller to manually insert copies of the children"* (`dsc/dsc2.h:533-535`). That divergence is not
+/// live: no site in the reference tree copy-constructs a `BlockNode`, so nothing observes the
+/// empty-child copy, and a `Clone` that silently emptied a subtree is the harder defect of the two.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlockNode {
     /// The `ScheduleNode` part.
     pub base: NodeBase,
-    /// `next_`, in order.
+    /// Field: e010_BlockNode.next_
+    ///
+    /// `next_` (`dsc/dsc2.h:538`), in order — OWNED INLINE rather than held by index, because the
+    /// reference's `VectorOfChildren` is a `vector<unique_ptr<ScheduleNode>>` (`:529`) and owns them
+    /// too.
     pub children: Vec<SchedNode>,
 }
 
@@ -1903,22 +2209,34 @@ impl SyncUnits {
     }
 }
 
-/// `dsc2::SyncNode` (`dsc/dsc2.h:964`) narrowed to what minting one writes and what entry 261 then
-/// binds onto it.
+/// Replaces: e013_SyncNode
+///
+/// `dsc2::SyncNode` (`dsc/dsc2.h:964-972`) carrying ALL FIVE of its declared fields, plus the
+/// `name_` this projection needs from the `ScheduleNode` base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncNode {
     /// The `ScheduleNode` part.
     pub base: NodeBase,
-    /// `units_`.
+    /// Field: e013_SyncNode.units_
+    ///
+    /// `units_` (`dsc/dsc2.h:966`), *"all to all signals"*.
     pub units: SyncUnits,
-    /// `isReceive_`.
+    /// Field: e013_SyncNode.isReceive_
+    ///
+    /// `isReceive_` (`dsc/dsc2.h:967`).
     pub direction: SyncDirection,
-    /// `isSoft_`.
+    /// Field: e013_SyncNode.isSoft_
+    ///
+    /// `isSoft_` (`dsc/dsc2.h:967`).
     pub strength: SyncStrength,
-    /// `implicitSyncRefTransfer_` (`dsc/dsc2.h:969`) — `nullptr` until entry 261 picks the transfer
+    /// Field: e013_SyncNode.implicitSyncRefTransfer_
+    ///
+    /// `implicitSyncRefTransfer_` (`dsc/dsc2.h:968`) — `nullptr` until entry 261 picks the transfer
     /// this sync stands in for.
     pub implicit_sync_ref_transfer: Option<NodeId>,
-    /// `otherEndOfTheSignals_` (`dsc/dsc2.h:970`) BY NAME, empty on a fresh node: a sequence that
+    /// Field: e013_SyncNode.otherEndOfTheSignals_
+    ///
+    /// `otherEndOfTheSignals_` (`dsc/dsc2.h:969`) BY NAME, empty on a fresh node: a sequence that
     /// mints both ends pairs them, and a name is the link a tree of owned nodes can hold.
     pub other_ends: Vec<NodeName>,
 }
@@ -3580,5 +3898,359 @@ mod tests_e009_schedule_node {
 
         comps.forget(SenComponent::L3lu);
         assert!(comps.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests_e010_block_node {
+    //! `dsc2::BlockNode` (`dsc/dsc2.h:526-561`) and its ONE declared field. What a field list cannot
+    //! state on its own: `next_` is EMPTY on a fresh block and keeps insertion order, which is the
+    //! order every `getNextView` and `siblingRefNode` read is answered off.
+
+    use super::*;
+
+    #[test]
+    fn a_block_owns_its_children_in_the_order_they_were_added() {
+        let mut block = BlockNode::default();
+        assert!(
+            block.children.is_empty(),
+            "`new dsc2::BlockNode()` leaves `next_` empty (`dsc/dsc2.h:554`)"
+        );
+
+        for name in ["t0", "c0", "t1"] {
+            block.add_child(SchedNode::Leaf(LeafNode::new(
+                LeafKind::Transfer,
+                NodeName(name.to_owned()),
+            )));
+        }
+        assert_eq!(
+            block
+                .children
+                .iter()
+                .map(|child| child.name().0.as_str())
+                .collect::<Vec<_>>(),
+            ["t0", "c0", "t1"],
+            "`addChildNode(node, /*addBefore=*/false)` appends"
+        );
+
+        let at = block
+            .child_pos(&NodeName("c0".to_owned()))
+            .expect("`c0` is a child");
+        block.insert_after(
+            at,
+            SchedNode::Leaf(LeafNode::new(
+                LeafKind::Compute,
+                NodeName("c1".to_owned()),
+            )),
+        );
+        assert_eq!(
+            block
+                .children
+                .iter()
+                .map(|child| child.name().0.as_str())
+                .collect::<Vec<_>>(),
+            ["t0", "c0", "c1", "t1"],
+            "`siblingRefNode` lands the new node immediately after the one it names"
+        );
+        assert!(
+            block.child_pos(&NodeName("absent".to_owned())).is_none(),
+            "a name no child carries runs out rather than refusing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e013_sync_node {
+    //! `dsc2::SyncNode` (`dsc/dsc2.h:964-972`) and its five declared fields. What the field list
+    //! cannot state: a fresh sync is a HARD SEND standing in for no transfer with no other end bound,
+    //! and `units_` cannot be empty at all — [`SyncUnits`] takes a first component by value, so the
+    //! reference's *"all to all signals"* set with nobody in it is unspellable.
+
+    use super::*;
+
+    #[test]
+    fn a_fresh_sync_is_a_hard_send_with_no_partner_bound() {
+        let mut sync = SyncNode {
+            base: NodeBase::named(NodeName("sync0".to_owned())),
+            units: SyncUnits::new(SenComponent::L0lu, [SenComponent::Ptrow0]),
+            direction: SyncDirection::Send,
+            strength: SyncStrength::Hard,
+            implicit_sync_ref_transfer: None,
+            other_ends: Vec::new(),
+        };
+        assert_eq!(
+            sync.units.iter().collect::<Vec<_>>().len(),
+            2,
+            "`units_` holds every component the sync signals between"
+        );
+        assert!(
+            sync.implicit_sync_ref_transfer.is_none(),
+            "`implicitSyncRefTransfer_ = nullptr` (`dsc/dsc2.h:968`)"
+        );
+        assert!(
+            sync.other_ends.is_empty(),
+            "`otherEndOfTheSignals_` is empty until a sequence pairs both ends"
+        );
+
+        // Entry 261 binds the transfer this sync stands in for, and pairs the two ends by name.
+        sync.implicit_sync_ref_transfer = Some(NodeId(4));
+        sync.other_ends.push(NodeName("sync1".to_owned()));
+        let receive = SyncNode {
+            base: NodeBase::named(NodeName("sync1".to_owned())),
+            direction: SyncDirection::Receive,
+            strength: SyncStrength::Soft,
+            other_ends: vec![sync.base.name.clone()],
+            ..sync.clone()
+        };
+        assert_eq!(receive.other_ends, vec![NodeName("sync0".to_owned())]);
+        assert_ne!(
+            receive.direction, sync.direction,
+            "`isReceive_` is the one flag that distinguishes the two ends"
+        );
+        assert_eq!(receive.implicit_sync_ref_transfer, Some(NodeId(4)));
+    }
+}
+
+#[cfg(test)]
+mod tests_e014_transfer_node {
+    //! `dsc2::TransferNode` (`dsc/dsc2.h:814-898`) and its twenty declared fields. What the field
+    //! list cannot state: the reference's own non-zero initialisers (`replicationFactor_ = 1`,
+    //! `unitTimeTransferNumChunks_ = 1`, `srcRep_` with no initialiser at all), that
+    //! `rotateNumElements_ = 0` and *"no rotation"* are ONE state, and that `coreletViews_` answers a
+    //! corelet-less unit off its FIRST entry rather than off a `-1` key.
+
+    use super::*;
+
+    fn operand(unit: SenComponent, storage: SenComponent) -> Operand {
+        Operand {
+            unit,
+            storage,
+            data: DataInfo::EMPTY,
+        }
+    }
+
+    fn fresh() -> TransferNode {
+        TransferNode {
+            name: NodeName("t0".to_owned()),
+            src: operand(SenComponent::L0lu, SenComponent::L0),
+            dsts: Dsts::new(operand(SenComponent::Ptrow0, SenComponent::NoComponent), Vec::new()),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: NumChunks::ONE,
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            padding: TransferPadding::default(),
+            repetition: TransferRepetition::default(),
+            src_indirect: None,
+            dst_indirect: None,
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_transfer_carries_the_references_own_initialisers() {
+        let mut node = fresh();
+        assert_eq!(
+            node.replication_factor,
+            ReplicationFactor::ONE,
+            "`replicationFactor_ = 1` (`dsc/dsc2.h:834`)"
+        );
+        assert_eq!(
+            node.unit_time_transfer_num_chunks,
+            NumChunks::ONE,
+            "`unitTimeTransferNumChunks_ = 1` (`:837`)"
+        );
+        assert_eq!(
+            node.repetition.src,
+            OperandRepetition::ONE,
+            "`srcRep_` has NO initialiser, and its writer's fallback is 1"
+        );
+        assert!(
+            node.repetition.dsts.is_empty(),
+            "`dstReps_` gains one entry per destination the DDL conversion walks"
+        );
+        assert!(
+            node.rotate_num_elements.is_none(),
+            "`rotateNumElements_ = 0` (`:839`) IS *no rotation*"
+        );
+        assert!(
+            node.unit_time_transfer_chunk_stride.is_empty(),
+            "a contiguous unit-time transfer skips nothing (`:838`)"
+        );
+        assert!(
+            node.last_fusable_parent_loop_src.is_none(),
+            "`lastFusableParentLoopSrc_ = nullptr` (`:830`)"
+        );
+        assert!(
+            node.corelet_view(None).is_none(),
+            "`coreletViews_` is empty until the tree is finalised"
+        );
+
+        // `dsc/dsc2.cpp:3061-3082` fills one view per corelet, source-then-destinations, and the
+        // indirect halves stay default because neither end is indirect.
+        for (idx, corelet) in [Corelet::at::<0>(), Corelet::at::<1>()].into_iter().enumerate() {
+            node.corelet_views.insert(
+                corelet,
+                TransferCoreletView {
+                    src_loops_and_size: UnitView {
+                        sizes_no_gaps: vec![Size {
+                            dim: PrimaryDim::Mb,
+                            size: Elements(4 + idx as u64),
+                        }],
+                        ..UnitView::default()
+                    },
+                    dst_loops_and_sizes: vec![UnitView::default()],
+                    ..TransferCoreletView::default()
+                },
+            );
+        }
+        node.last_fusable_parent_loop_dst
+            .push(Some(LoopId(NodeId(9))));
+        assert_eq!(
+            node.last_fusable_parent_loop_dst.len(),
+            1,
+            "one entry per destination, which `dsc/dsc2.cpp:3074` indexes by the same `i`"
+        );
+        assert_eq!(
+            node.corelet_view(Some(Corelet::at::<1>()))
+                .expect("corelet 1 was filled")
+                .src_loops_and_size
+                .sizes_no_gaps[0]
+                .size,
+            Elements(5),
+            "`coreletViews_.at(corelet_id_)`"
+        );
+        // ⭐ A CORELET-LESS UNIT READS THE FIRST ENTRY, not a `-1` key — `coreletViews_.begin()`
+        // (`SNTransferLowering.cpp:861`).
+        assert_eq!(
+            node.corelet_view(None).expect("some view was filled"),
+            node.corelet_view(Some(Corelet::at::<0>()))
+                .expect("corelet 0 was filled")
+        );
+        assert!(
+            node.corelet_view(None)
+                .is_some_and(|view| view.src_indirect_loops_and_size == UnitView::default()
+                    && view.dst_indirect_loops_and_sizes.is_empty()),
+            "an indirect view is filled only for an indirect end (`dsc/dsc2.cpp:3066`, `:3075`)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e015_compute_node {
+    //! `dsc2::ComputeNode` (`dsc/dsc2.h:900-962`) and its fourteen declared fields. What the field
+    //! list cannot state: `dataFormat_`'s initialiser is `SEN169_FP16` and NOT `INVALID`, so an
+    //! unstated format still has a value; `repetitionWithOffset_`'s two lists are BOTH empty, which is
+    //! the *"no operand takes one"* entry 108 counts; and `computeMaskLoopOffsets_` empty is STATIC
+    //! MASKING rather than a missing value.
+
+    use super::*;
+
+    fn fresh() -> ComputeNode {
+        ComputeNode {
+            name: NodeName("c0".to_owned()),
+            op: DdlComputeType::Macc,
+            ex_unit: SenComponent::Ptrow0,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            num_folds_engaged: NumFolds::ONE,
+            data_format: None,
+            instr_attribute: InstrAttribute::default(),
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_compute_carries_the_references_own_initialisers() {
+        let mut node = fresh();
+        assert!(
+            !node.is_opaque_op,
+            "`isOpaqueOp_ = false` (`dsc/dsc2.h:941`)"
+        );
+        assert_eq!(
+            node.effective_data_format(),
+            DataFormat::Sen169Fp16,
+            "`dataFormat_ = DataFormats::SEN169_FP16` (`:934`) — an unstated format is FP16, not absent"
+        );
+        assert_eq!(
+            node.instr_attribute.repetition,
+            Repetition::ALL_SLICES,
+            "`repetition_ = 8` (`:907`), *default 8 slices works the same*"
+        );
+        assert!(
+            node.instr_attribute.compute_mask_loop_offsets.is_empty(),
+            "empty `computeMaskLoopOffsets_` is STATIC masking (`ddc/ddcv1.cpp:1696-1698`)"
+        );
+        assert!(
+            node.repetition_with_offset.for_inputs.is_empty()
+                && node.repetition_with_offset.for_outputs.is_empty(),
+            "`forInputs_ = {{}}` and `forOutputs_ = {{}}` (`:951-952`)"
+        );
+        assert!(
+            node.input_coordinates.is_empty()
+                && node.output_coordinate == Coordinate::default(),
+            "no fold has been constructed on either side yet"
+        );
+        assert!(node.corelet_view(None).is_none());
+
+        // Entry 109 writes one mask offset per corelet, loop and dim; entry 108 gives one output a
+        // repetition offset of its own.
+        node.instr_attribute
+            .compute_mask_loop_offsets
+            .entry(Corelet::at::<0>())
+            .or_default()
+            .entry(LoopId(NodeId(3)))
+            .or_default()
+            .insert(PrimaryDim::Mb, MaskLoopOffset::ADVANCE);
+        node.repetition_with_offset
+            .for_outputs
+            .push(Repetition::ALL_SLICES);
+        node.data_format = Some(DataFormat::IeeeFp32);
+        node.corelet_views.insert(
+            Corelet::at::<1>(),
+            ComputeCoreletView {
+                inputs_loops_and_sizes: vec![UnitView::default(), UnitView::default()],
+                outputs_loops_and_sizes: vec![UnitView::default()],
+            },
+        );
+
+        assert_eq!(
+            node.instr_attribute.compute_mask_loop_offsets[&Corelet::at::<0>()]
+                [&LoopId(NodeId(3))][&PrimaryDim::Mb],
+            MaskLoopOffset::ADVANCE,
+            "`computeMaskLoopOffsets_[corelet][loop][dim]` — the reference's own key ladder"
+        );
+        assert_eq!(
+            node.repetition_with_offset.for_outputs.len(),
+            1,
+            "`forOutputs_.size()` is what entry 108 counts clones by"
+        );
+        assert_eq!(
+            node.effective_data_format(),
+            DataFormat::IeeeFp32,
+            "a stated format is the one that is read back"
+        );
+        // ⭐ CORELET 1 IS THE ONLY ENTRY, so a corelet-less unit reads IT — `coreletViews_.begin()`
+        // (`SNComputeLowering.cpp:549`).
+        assert_eq!(
+            node.corelet_view(None)
+                .expect("corelet 1 was filled")
+                .inputs_loops_and_sizes
+                .len(),
+            2
+        );
+        assert!(
+            node.corelet_view(Some(Corelet::at::<0>())).is_none(),
+            "an unfilled corelet is absent rather than empty"
+        );
     }
 }

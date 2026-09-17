@@ -290,7 +290,8 @@ use crate::schedule::dsc2::{
     Dsts, Fold, FoldCardinality, FoldCoeff, FoldDim, FoldLabel, FoldPosition, GroupTagRegInfo,
     LdsIdx, LoopBound, LoopCond, LoopCondComposite, Node, NodeBase, NodeName, NumBuffers,
     NumChunks, Operand, PadFold, ReplicationFactor, SchedNode, ScheduleTree, SyncDirection,
-    SyncNode, SyncStrength, SyncUnits, TransferNode, TransferPadding, Via, WordLength,
+    SyncNode, SyncStrength, SyncUnits, TransferNode, TransferPadding, TransferRepetition, Via,
+    WordLength,
     ZeroPadFolds, generic_comp,
 };
 use crate::schedule::l3::dsc::{
@@ -1590,6 +1591,13 @@ mod tests_e009_e016 {
 #[must_use]
 pub fn create_transfer_node(src: Via, dst: Via, more_dsts: &[Via], name: NodeName) -> TransferNode {
     TransferNode {
+        repetition: TransferRepetition::default(),
+        last_fusable_parent_loop_src: None,
+        last_fusable_parent_loop_dst: Vec::new(),
+        unit_time_transfer_chunk_stride: Vec::new(),
+        rotate_num_elements: None,
+        corelet_views: BTreeMap::new(),
+        transfer_coordinates: Coordinate::default(),
         padding: TransferPadding::default(),
         src_indirect: None,
         dst_indirect: None,
@@ -18519,7 +18527,7 @@ mod tests_e328_e335 {
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
         AddressFold, AllocLayout, AllocPlacement, ComputeNode, DataInfo, InstrAttribute, LayoutDims,
-        LdsScale, MaxDimSize, StartAddress,
+        LdsScale, MaxDimSize, RepetitionWithOffset, StartAddress,
     };
     use crate::schedule::l3::dsc::{
         CoreIdsUsed, DataStage, DscList, LabeledDsList, NamedDims, PrimaryDsInfo, SelectedCandidate,
@@ -19040,6 +19048,11 @@ mod tests_e328_e335 {
         );
         let input = operand(SenComponent::L3lu, SenComponent::Lx, Some(0));
         let tree = Tree(ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("compute".to_owned()),
             op: DdlComputeType::Macc,
             ex_unit: SenComponent::L3lu,

@@ -196,7 +196,8 @@ use crate::schedule::dsc2::{
     Coordinate, DataInfo, Dsc, Dsts, FoldCoeff, FoldDim, FoldPosition, LdsIdx, LdsScale, LoopBound,
     LoopCond, LoopCondComposite, MaxDimSize, NodeBase, NodeName, NumBuffers, NumChunks, Operand, Precision,
     RegSlot, ReplicationFactor, SchedNode, Size, SizeAndIndex, StartAddress, StickDimIdx,
-    StickMaskNode, SyncNode, TransferKind, TransferNode, TransferPadding, Unroll, Via, WordLength,
+    StickMaskNode, SyncNode, TransferKind, TransferNode, TransferPadding, TransferRepetition,
+    Unroll, Via, WordLength,
     generic_comp,
 };
 use crate::schedule::l3::dsc::{DimPadding, DscIdx, SuperDsc, SymbolicDimInfo, UnneededPad};
@@ -6049,6 +6050,13 @@ where
     clone.alloc_users.clear();
     clone.lds = Some(new_lds);
     let transfer = TransferNode {
+        repetition: TransferRepetition::default(),
+        last_fusable_parent_loop_src: None,
+        last_fusable_parent_loop_dst: Vec::new(),
+        unit_time_transfer_chunk_stride: Vec::new(),
+        rotate_num_elements: None,
+        corelet_views: BTreeMap::new(),
+        transfer_coordinates: Coordinate::default(),
         name: NodeName(format!("dummy_transfer_to_lx{}", kind.suffix())),
         src: Operand {
             unit: SenComponent::NoComponent,
@@ -6881,7 +6889,8 @@ mod tests_e132_e136 {
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
     use crate::schedule::dsc2::{
-        DataInfo, Dsts, InstrAttribute, NodeName, Operand, ReplicationFactor, TransferPadding,
+        DataInfo, Dsts, InstrAttribute, NodeName, Operand, RepetitionWithOffset, ReplicationFactor,
+        TransferPadding,
     };
     use crate::units::NumFolds;
 
@@ -6967,6 +6976,13 @@ mod tests_e132_e136 {
                 (SenComponent::L0lu, SenComponent::Ptrow3)
             };
             TransferNode {
+                repetition: TransferRepetition::default(),
+                last_fusable_parent_loop_src: None,
+                last_fusable_parent_loop_dst: Vec::new(),
+                unit_time_transfer_chunk_stride: Vec::new(),
+                rotate_num_elements: None,
+                corelet_views: BTreeMap::new(),
+                transfer_coordinates: Coordinate::default(),
                 padding: TransferPadding::default(),
                 src_indirect: None,
                 dst_indirect: None,
@@ -6985,6 +7001,11 @@ mod tests_e132_e136 {
         }
         fn compute(&self, _node: NodeId) -> ComputeNode {
             ComputeNode {
+                is_opaque_op: false,
+                corelet_views: BTreeMap::new(),
+                input_coordinates: Vec::new(),
+                output_coordinate: Coordinate::default(),
+                repetition_with_offset: RepetitionWithOffset::default(),
                 name: NodeName("mul".to_owned()),
                 op: DdlComputeType::Fmul,
                 ex_unit: SenComponent::Lxlu,
@@ -7196,7 +7217,7 @@ mod tests_e132_e136 {
 
 #[cfg(test)]
 mod tests_e124_e131 {
-    use crate::schedule::dsc2::NumChunks;
+    use crate::schedule::dsc2::{NumChunks, RepetitionWithOffset, TransferRepetition};
     use super::{
         AllocArena, AllocLive, ComputeArena, ComputeMasks, ComputeOp, ConstantData, CoreletShapes,
         DfsIndex,
@@ -7397,6 +7418,13 @@ mod tests_e124_e131 {
     #[test]
     fn e126_splats_a_constant_source_one_element_at_a_time() {
         let mut transfer = TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
@@ -7432,6 +7460,13 @@ mod tests_e124_e131 {
     #[test]
     fn e126_replicates_a_constant_to_constant_transfer_across_the_stick() {
         let mut transfer = TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
@@ -7684,6 +7719,11 @@ mod tests_e124_e131 {
     #[test]
     fn e131_folds_the_pe_only_when_a_pt_compute_is_present() {
         let compute = |unit: SenComponent| ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("c".to_owned()),
             op: crate::schedule::ddl::ops::DdlComputeType::Fmul,
             ex_unit: unit,
@@ -8302,6 +8342,13 @@ mod tests_e258_e263 {
         node.start_address.insert(core0(), cl0(), Bytes(0x200));
         let allocs = AllocArena::from([(AllocId(0), node)]);
         let transfer = TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
@@ -8434,6 +8481,13 @@ mod tests_e258_e263 {
         node.start_address.insert(core0(), cl0(), Bytes(0x40));
         let allocs = AllocArena::from([(AllocId(0), node)]);
         let transfer = TransferNode {
+            repetition: TransferRepetition::default(),
+            last_fusable_parent_loop_src: None,
+            last_fusable_parent_loop_dst: Vec::new(),
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: None,
+            corelet_views: BTreeMap::new(),
+            transfer_coordinates: Coordinate::default(),
             padding: TransferPadding::default(),
             src_indirect: None,
             dst_indirect: None,
@@ -8529,6 +8583,13 @@ mod tests_e258_e263 {
             transfers: BTreeMap::from([(
                 NodeId(0),
                 TransferNode {
+                    repetition: TransferRepetition::default(),
+                    last_fusable_parent_loop_src: None,
+                    last_fusable_parent_loop_dst: Vec::new(),
+                    unit_time_transfer_chunk_stride: Vec::new(),
+                    rotate_num_elements: None,
+                    corelet_views: BTreeMap::new(),
+                    transfer_coordinates: Coordinate::default(),
                     padding: TransferPadding::default(),
                     src_indirect: None,
                     dst_indirect: None,
@@ -9502,6 +9563,13 @@ mod tests_e307_e309 {
         tree.transfers.insert(
             TRANSFER,
             TransferNode {
+                repetition: TransferRepetition::default(),
+                last_fusable_parent_loop_src: None,
+                last_fusable_parent_loop_dst: Vec::new(),
+                unit_time_transfer_chunk_stride: Vec::new(),
+                rotate_num_elements: None,
+                corelet_views: BTreeMap::new(),
+                transfer_coordinates: Coordinate::default(),
                 name: NodeName("prefilled".to_owned()),
                 src: Operand {
                     unit: SenComponent::NoComponent,
@@ -9598,6 +9666,13 @@ mod tests_e307_e309 {
             tree.transfers.insert(
                 TRANSFER,
                 TransferNode {
+                    repetition: TransferRepetition::default(),
+                    last_fusable_parent_loop_src: None,
+                    last_fusable_parent_loop_dst: Vec::new(),
+                    unit_time_transfer_chunk_stride: Vec::new(),
+                    rotate_num_elements: None,
+                    corelet_views: BTreeMap::new(),
+                    transfer_coordinates: Coordinate::default(),
                     name: NodeName("prefilled".to_owned()),
                     src: Operand {
                         unit: SenComponent::NoComponent,

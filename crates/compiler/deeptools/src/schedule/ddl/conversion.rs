@@ -189,12 +189,12 @@ use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::ddl::{DdlModuleOp, DdlSource};
 use crate::schedule::dsc2::{
     AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeMask, ComputeNode,
-    CondOp as DscCondOp, CondRegions, ConditionNode, DataInfo, Dsts, Hops, InstrAttribute, LdsIdx,
-    LoopBound, LoopCond as DscLoopCond, LoopCondComposite as DscLoopCondComposite, LoopDim,
-    LoopNode, MaxDimSize, NodeBase, NodeName, NumBuffers, NumChunks, Operand as DscOperand,
-    PackIndex,
-    Repetition, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode, SyncStrength,
-    SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
+    CondOp as DscCondOp, CondRegions, ConditionNode, Coordinate, DataInfo, Dsts, Hops,
+    InstrAttribute, LdsIdx, LoopBound, LoopCond as DscLoopCond,
+    LoopCondComposite as DscLoopCondComposite, LoopDim, LoopNode, MaxDimSize, NodeBase, NodeName,
+    NumBuffers, NumChunks, Operand as DscOperand, PackIndex, Repetition, ReplicationFactor,
+    RepetitionWithOffset, SchedNode, StartAddress, SyncDirection, SyncNode, SyncStrength, SyncUnits,
+    TransferNode, TransferPadding, TransferRepetition, Unroll, WordLength, generic_comp,
 };
 use crate::schedule::l3::dsc::{
     CoreCount, CoreletsUsed, DesignSpaceConfig, EmptyStage, PadSizes, WkSlice, WkSliceId,
@@ -3331,6 +3331,13 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
         (ends.next()?, ends.collect::<Vec<_>>())
     };
     let mut transfer = TransferNode {
+        repetition: TransferRepetition::default(),
+        last_fusable_parent_loop_src: None,
+        last_fusable_parent_loop_dst: Vec::new(),
+        unit_time_transfer_chunk_stride: Vec::new(),
+        rotate_num_elements: None,
+        corelet_views: BTreeMap::new(),
+        transfer_coordinates: Coordinate::default(),
         name: name.clone(),
         src: src_operand,
         dsts: Dsts::new(first, rest)
@@ -3563,6 +3570,7 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
         params: BTreeMap::new(),
         input_data_connects: Vec::new(),
         output_data_connects: Vec::new(),
+        compute_mask_loop_offsets: BTreeMap::new(),
     };
     for (row, ex_unit) in unroll_row_units(unit).into_iter().enumerate() {
         if inputs
@@ -3580,6 +3588,11 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
         let node = ctx.site.add_compute(
             ctx.curr_parent,
             ComputeNode {
+                is_opaque_op: false,
+                corelet_views: BTreeMap::new(),
+                input_coordinates: Vec::new(),
+                output_coordinate: Coordinate::default(),
+                repetition_with_offset: RepetitionWithOffset::default(),
                 name: name.clone(),
                 op,
                 ex_unit,
@@ -3784,6 +3797,11 @@ fn op_opaque<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Op
     // `new` on its `DT_ERROR` paths. The DSC is abandoned either way (`DscFilled::No`), so it is an
     // orphan of a run that produced no schedule and not a node any walk reaches.
     let node = ctx.site.mint_compute(ComputeNode {
+        is_opaque_op: false,
+        corelet_views: BTreeMap::new(),
+        input_coordinates: Vec::new(),
+        output_coordinate: Coordinate::default(),
+        repetition_with_offset: RepetitionWithOffset::default(),
         name: name.clone(),
         op,
         ex_unit,
@@ -3803,6 +3821,7 @@ fn op_opaque<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Op
             params: params.iter().copied().collect(),
             input_data_connects: reads.to_vec(),
             output_data_connects: writes.to_vec(),
+            compute_mask_loop_offsets: BTreeMap::new(),
         },
     })?;
     ctx.state.record(&name, node);
@@ -6308,11 +6327,10 @@ mod unit_tests {
     use crate::schedule::ddc::v1::CoreClSet;
     use crate::schedule::dsc2::{
         AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeNode, CondRegions,
-        ConditionNode, DataInfo, Dsts, LayoutDims, LdsIdx, LeafKind, LeafNode, LoopDim, LoopNode,
-        MaxDimSize, NodeBase, NodeName,
-        NumBuffers, NumChunks, Operand as DscOperand, ReplicationFactor, SchedNode, StartAddress,
-        SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, TransferPadding,
-        WordLength,
+        ConditionNode, Coordinate, DataInfo, Dsts, LayoutDims, LdsIdx, LeafKind, LeafNode, LoopDim,
+        LoopNode, MaxDimSize, NodeBase, NodeName, NumBuffers, NumChunks, Operand as DscOperand,
+        ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode, SyncStrength,
+        SyncUnits, TransferNode, TransferPadding, TransferRepetition, WordLength,
     };
     use crate::schedule::l3::dsc::{
         CoreCount, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DimPadding,
@@ -8357,6 +8375,13 @@ mod unit_tests {
                 .add_transfer(
                     head,
                     TransferNode {
+                        repetition: TransferRepetition::default(),
+                        last_fusable_parent_loop_src: None,
+                        last_fusable_parent_loop_dst: Vec::new(),
+                        unit_time_transfer_chunk_stride: Vec::new(),
+                        rotate_num_elements: None,
+                        corelet_views: BTreeMap::new(),
+                        transfer_coordinates: Coordinate::default(),
                         name: NodeName("transfer_lds0_src:hbm_dst:lx".to_owned()),
                         src: end(SenComponent::L3lu),
                         dsts: Dsts::new(end(SenComponent::Lxlu), Vec::new()),

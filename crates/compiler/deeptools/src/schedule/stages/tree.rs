@@ -1204,7 +1204,8 @@ mod tests {
     use super::*;
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
-        DataInfo, InstrAttribute, NumChunks, ReplicationFactor, TransferPadding,
+        DataInfo, InstrAttribute, NumChunks, RepetitionWithOffset, ReplicationFactor,
+        TransferPadding, TransferRepetition,
     };
     use crate::units::NumFolds;
 
@@ -1299,6 +1300,11 @@ mod tests {
         let compute = tree.add(
             NodeName("c".to_owned()),
             Kind::Compute(ComputeNode {
+                is_opaque_op: false,
+                corelet_views: BTreeMap::new(),
+                input_coordinates: Vec::new(),
+                output_coordinate: Coordinate::default(),
+                repetition_with_offset: RepetitionWithOffset::default(),
                 name: NodeName("c".to_owned()),
                 op: DdlComputeType::Macc,
                 ex_unit: SenComponent::Ptrow0,
@@ -1313,6 +1319,13 @@ mod tests {
         let transfer = tree.add(
             NodeName("t".to_owned()),
             Kind::Transfer(TransferNode {
+                repetition: TransferRepetition::default(),
+                last_fusable_parent_loop_src: None,
+                last_fusable_parent_loop_dst: Vec::new(),
+                unit_time_transfer_chunk_stride: Vec::new(),
+                rotate_num_elements: None,
+                corelet_views: BTreeMap::new(),
+                transfer_coordinates: Coordinate::default(),
                 name: NodeName("t".to_owned()),
                 src: operand(Some(old.0)),
                 dsts: Dsts::new(operand(None), vec![operand(Some(old.0))])

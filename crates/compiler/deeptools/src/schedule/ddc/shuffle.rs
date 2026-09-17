@@ -3923,9 +3923,11 @@ mod tests_e161_e164 {
     use crate::schedule::ddc::fold::AllocId;
     use crate::schedule::ddc::metadata::OwnedAllocateNode;
     use crate::schedule::ddl::ops::DdlComputeType;
-    use crate::schedule::dsc2::{ComputeNode, DataInfo, InstrAttribute, NodeName};
+    use crate::schedule::dsc2::{
+        ComputeNode, Coordinate, DataInfo, InstrAttribute, NodeName, RepetitionWithOffset,
+    };
     use crate::units::NumFolds;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use sys_arch_spec::arch_enums::SenComponent;
 
     /// Symbols 1, 2, 3 — `getDefaultSymbol()` and its successors.
@@ -4031,6 +4033,11 @@ mod tests_e161_e164 {
     fn insert_before_adds_the_allocation_once() {
         let allocation = AllocId(4);
         let mut point = InsertPoint::new(ComputeNode {
+            is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
+            input_coordinates: Vec::new(),
+            output_coordinate: Coordinate::default(),
+            repetition_with_offset: RepetitionWithOffset::default(),
             name: NodeName("packmerge".to_owned()),
             op: DdlComputeType::Packmerge,
             ex_unit: SenComponent::Ptrow0,
