@@ -116,8 +116,17 @@ count() {
   # `^\s+pub [a-z_]+:` and printed "12 of 49" where the answer is 9: a Rust field is not necessarily
   # one of the C++ 49 (`ddc: DdcFacts` is a grouping of four), so that ratio silently flatters itself
   # and would keep doing so as groupings were added. The citation IS the evidence the field was ported.
+  # ⛔⛔ DECLARATIONS ONLY. The first version matched any `name_` followed by `;`, `=` or `[` inside the
+  # class span, which swept up MEMBER ACCESSES in the class's own method bodies and inflated the
+  # denominator from 36 to 49: `paramNameToVal["ni"] = &N_.i_;` (designSpaceConfig.h:618) contributed
+  # i_, and `return primaryDsInfo_.at(dsType).stickDimOrder_;` (:242) contributed stickDimOrder_ —
+  # thirteen names in total (c_ i_ ij_ j_ mb_ out_ r_ rc_ stickDimOrder_ x_ y_ zi_ zj_) that belong to
+  # NESTED types, not to DesignSpaceConfig. A burndown whose denominator counts other types' fields
+  # reports a gap that does not exist; this one was quoted as "9 of 49" for a whole session.
   cppf_list=$(awk '/^class DesignSpaceConfig/,/^};/' $ROOT/crustify-types/cpp/designSpaceConfig.h 2>/dev/null \
-           | grep -oE '\b[a-zA-Z][a-zA-Z0-9]*_\b *[;=[]' | grep -oE '^[a-zA-Z][a-zA-Z0-9]*_' | sort -u)
+           | grep -vE 'return|\(|\.|->|&|\["|^\s*//' \
+           | grep -oE '\b[a-zA-Z][a-zA-Z0-9]*_\b\s*(\[[^]]*\])?\s*(=[^;]*)?;' \
+           | grep -oE '^[a-zA-Z][a-zA-Z0-9]*_' | sort -u)
   cppf=$(printf '%s\n' "$cppf_list" | grep -c .)
   rbody=$(awk '/pub struct DesignSpaceConfig/,/^}/' $ROOT/crates/compiler/deeptools/src/schedule/l3/dsc.rs 2>/dev/null)
   rustf=0
