@@ -767,9 +767,6 @@ pub fn rmsnorm(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    // x, gamma and the output — the parameters `KtirFunc::rmsnorm` mints. Its constants are
-    // immediates, so none of them is a parameter.
-    let (tensors, out) = split_out(name, r, layout, 2)?;
     // ⭐⭐⭐ THE EPSILON COMES FROM THE PROGRAM. It was `KtirNode::rmsnorm_eps_idx`, a slot the producer
     // resolved and hung on the node, so the value the emulator adds and the value the descriptor reads
     // were two facts with nothing obliging them to agree — and a third-party producer had to hand over
@@ -784,6 +781,28 @@ pub fn rmsnorm(
              const is resolved from that value, so a program without it cannot be lowered."
         ),
     })?;
+    rmsnorm_at(name, eps, r, sym_id_base, layout)
+}
+
+/// [`rmsnorm`] with the epsilon SUPPLIED rather than read off the whole function.
+///
+/// ⭐ WHY THE SPLIT EXISTS — the same reason as [`scalarmul_at`]'s. [`program_rmsnorm_eps`] enforces
+/// ONE root `math.sqrt`/`math.rsqrt` in the function, which is exact for a function that IS one
+/// rmsnorm node and returns `None` for any whole kernel with two of them. `decoder_layer_fwd` has
+/// exactly two rmsnorms, so its epsilons can only be read PER CHAIN — which is what
+/// [`super::whole_function::program_rmsnorm_chains`] does, at the `arith.addf` each chain owns.
+///
+/// The body below is shared, so the two doors cannot drift about what an rmsnorm EMITS.
+pub fn rmsnorm_at(
+    name: &str,
+    eps: f32,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x, gamma and the output — the parameters `KtirFunc::rmsnorm` mints. Its constants are
+    // immediates, so none of them is a parameter.
+    let (tensors, out) = split_out(name, r, layout, 2)?;
     let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
         message: format!(
             "RmsNorm {name}: epsilon {eps}, read off the program, is absent from \
