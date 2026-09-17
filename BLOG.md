@@ -1,29 +1,31 @@
 # What Does "Reuse" Mean in the Age of AI?
 
-For fifty years, software reuse has meant depending on someone else's code. Each
-era changed the packaging, and each one let the toolchain specialize a little
-more:
+Every generation of programmers has been told the same thing: don't write it,
+reuse it. What quietly changes, generation to generation, is how much of
+somebody else's decisions you have to carry along with the part you wanted.
 
-| Era | Unit of reuse | Who specializes |
-| --- | --- | --- |
-| Shared libraries | `.so` + header | nobody — the linker just resolves symbols |
-| Source modules | a package | nobody; you carry the whole tree |
-| Bundlers | a module graph | the bundler, syntactically |
-| Rust / Go | a crate | the compiler, semantically |
-| **AI** | **an idea** | **you, structurally** |
+It used to be all of them. A shared library arrived as a compiled `.so` and a
+header file — an opaque box whose insides your compiler couldn't see, let alone
+improve. Source-level languages like Python and JavaScript opened the box, but
+you still hauled the whole thing around; a `node_modules` directory is a
+monument to that. Bundlers were the first tools allowed to throw some of it
+away, though tree-shaking only deletes code nobody mentions by name. Then Rust
+and Go pushed specialization down into the semantics, and you get the fact that
+makes the era legible: a Go binary has no shared-library dependencies. Not
+because it's statically linked — because every capability arrived as *source*
+and left as machine code specialized for that one program.
 
-A Go binary has no shared-library dependencies — not because it's statically
-linked, but because every capability arrived as *source* and left as machine
-code specialized for that one program. That's as far as fifty years of compiler
-engineering got us, and it stops at a wall nobody named: **the code itself is
-sacred.** Compilers may delete and specialize. They may never restructure. So
-the generality of your dependencies is your generality, whether you wanted it or
-not.
+Fifty years of compiler engineering, and it all stops at a wall nobody thought
+to name. The code itself is sacred. A compiler may delete your dependency's
+unused parts and specialize its generic ones, but it may never restructure it.
+So the generality of the libraries you depend on is your generality too, whether
+or not you ever wanted it.
 
-AI breaks that, by making faithful transcription cheap. Once you can re-express
-someone's *algorithm* inside your own structure in hours rather than quarters,
-the thing you're reusing is no longer the module. It's the idea — and every
-project becomes bespoke.
+That's the wall AI knocks down — not by making compilers smarter, but by making
+faithful transcription cheap. When you can re-express someone's *algorithm*
+inside your own structure in an afternoon instead of over two quarters of pull
+requests, the thing you're reusing stops being the module. It's the idea. And
+once ideas are the unit, every project gets to be bespoke.
 
 ## Scratchy
 
