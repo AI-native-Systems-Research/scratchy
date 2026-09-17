@@ -251,6 +251,12 @@ h2 {
 .idea-text .punch { color: var(--fg); }
 .idea-code { min-width: 0; }
 
+/* why / spyre — prose-only sections, held to a readable measure */
+
+.why-body, .spyre .idea-text { max-width: 46rem; }
+.why-body p { color: var(--muted); }
+.why-body .why-punch { color: var(--fg); }
+
 /* targets */
 
 .tgrid {
@@ -305,6 +311,13 @@ footer {
   text-align: center;
   color: var(--muted);
   font-size: 0.88rem;
+}
+
+footer .credit {
+  max-width: 44rem;
+  margin: 1rem auto 0;
+  font-size: 0.82rem;
+  line-height: 1.6;
 }
 
 @media (max-width: 800px) {

@@ -14,6 +14,7 @@ root="$(dirname "$here")"
 
 # Chapter sources, in the order SUMMARY.md lists them: <repo path>:<src path>
 chapters=(
+  "docs/WHY.md:why.md"
   "docs/BUILD.md:BUILD.md"
   "docs/COMPILER.md:COMPILER.md"
   "docs/MODELS.md:MODELS.md"

@@ -16,6 +16,7 @@
   <nav>
     <span class="brand">scratchy</span>
     <div class="navlinks">
+      <a href="book/why.html">Why</a>
       <a href="book/index.html">Docs</a>
       <a href="book/COMPILER.html">Compiler</a>
       <a href="https://github.com/AI-native-Systems-Research/scratchy">GitHub</a>
@@ -25,9 +26,10 @@
   <div class="hero-body">
     <h1>A hyper-specializing<br><span class="accent">inference stack compiler</span></h1>
     <p class="lede">
-      Scratchy builds inference runtimes <em>from scratch</em> — or as close to that
-      as is possible. Give it a triple, get back a server specialized for exactly
-      that triple, and nothing else.
+      Fifty years of software reuse let the compiler delete and specialize, but
+      never <em>restructure</em>. Scratchy asks what an inference stack looks
+      like once that constraint is gone: give it a triple, get back a server
+      specialized for exactly that triple, and nothing else.
     </p>
 
     <div class="triple">
@@ -81,6 +83,39 @@
   </div>
 </section>
 
+<section class="why">
+  <h2>Why build it this way</h2>
+  <div class="why-body">
+    <p>
+      Every generation of programmers has been told the same thing: don't write
+      it, reuse it. What quietly changes is how much of somebody else's
+      decisions you have to carry along with the part you wanted. A shared
+      library arrived as an opaque <code>.so</code> your compiler couldn't see
+      into. Source-level languages opened the box but made you haul the whole
+      thing around. Bundlers were the first tools allowed to throw some of it
+      away. Rust and Go pushed specialization into the semantics — which is why
+      a Go binary has no shared-library dependencies, not because it is
+      statically linked, but because every capability arrived as source and left
+      as machine code specialized for one program.
+    </p>
+    <p>
+      And it all stops at a wall nobody thought to name. The code itself is
+      sacred: a compiler may delete a dependency's unused parts and specialize
+      its generic ones, but it may never restructure it. So the generality of
+      the libraries you depend on is your generality too, whether or not you
+      ever wanted it.
+    </p>
+    <p class="why-punch">
+      <strong>That is the wall AI knocks down</strong> — not by making compilers
+      smarter, but by making faithful transcription cheap. When you can
+      re-express someone's <em>algorithm</em> inside your own structure in an
+      afternoon instead of over two quarters of pull requests, the unit of reuse
+      stops being the module. It becomes the idea.
+    </p>
+    <a class="more" href="book/why.html">Read the argument in full →</a>
+  </div>
+</section>
+
 <section class="idea">
   <div class="idea-text">
     <h2>Write the math once</h2>
@@ -128,11 +163,50 @@
   </div>
 </section>
 
+<section class="spyre">
+  <div class="idea-text">
+    <h2>The hard case: IBM Spyre</h2>
+    <p>
+      Scratchy's first target is not CUDA. It is the
+      <a href="https://research.ibm.com/blog/spyre-for-z">IBM Spyre AIU</a> —
+      and that is the real test, because novel silicon is where the library era
+      has nothing to offer you.
+    </p>
+    <p>
+      Each Spyre core has a 2&#8239;MiB scratchpad, of which 1,677,721 bytes are
+      yours. Every tile of every operation in the forward pass must fit.
+      Overflow it and you do not get an error message: you get
+      <code>DtException 1535</code> on the card, minutes later, about a tile you
+      can no longer inspect. The dominant cost of new hardware isn't writing
+      kernels — it's the feedback loop from a nameless on-card fault back to the
+      line of math that caused it.
+    </p>
+    <p class="punch">
+      Because scratchy knows every tile size at compile time, that fault becomes
+      a <strong><code>cargo build</code> error on your laptop</strong>. A
+      general-purpose runtime structurally cannot do this: it doesn't know the
+      shapes until it is already running, on the card, where the only channel
+      back to you is an integer.
+    </p>
+    <p>
+      Spyre support is roughly 129,000 lines of Rust — twice the size of the
+      CUDA backend — and it cost <em>zero lines of model code</em>. The same 25
+      architectures, the same 1,580 lines of DSL, the same 22-line LLaMA. An 8B
+      model boots in 12&#8239;s from a 330&#8239;Mi image.
+    </p>
+    <p class="punch">
+      Reuse-by-code quietly puts a <em>population threshold</em> on what
+      hardware is allowed to exist — &ldquo;support&rdquo; means a vendor
+      maintaining a general backend inside someone else's general framework
+      until the market justifies the headcount. Reuse-by-idea drops that
+      threshold to one team with a compiler.
+    </p>
+  </div>
+</section>
+
 <section class="targets">
   <h2>Targets</h2>
   <p class="sub">
-    Scratchy's initial design point is
-    <a href="https://research.ibm.com/blog/spyre-for-z">IBM Spyre AIU</a>.
     Pick one backend per build; they are mutually exclusive.
   </p>
   <div class="tgrid">
@@ -203,6 +277,14 @@ cargo build -F metal,model/llama-3.2-3b,quant/mlx --release
     Apache License 2.0 · an
     <a href="https://ai-native-systems-research.github.io/ai-native-systems-research/">AI-native Systems Research</a>
     project
+  </p>
+  <p class="credit">
+    Practising what it argues: scratchy's serving algorithms — paged KV cache,
+    continuous batching, prefix caching — derive from
+    <a href="https://github.com/vllm-project/vllm">vLLM</a>, and its Spyre
+    hardware model from IBM's <code>torch-spyre</code> and KTIR. Both are
+    Apache&nbsp;2.0, and both are credited by file and line at each derivation
+    site rather than in a NOTICE file nobody reads.
   </p>
 </footer>
 

@@ -22,6 +22,7 @@ CUDA and Apple Silicon.
 
 | If you want to… | Read |
 | --- | --- |
+| know why any of this is a good idea | [Why build it this way](why.md) |
 | build and run the CLI | [Building](BUILD.md) |
 | understand the proc-macro approach | [The compiler](COMPILER.md) |
 | teach scratchy a new architecture | [Adding a model architecture](MODELS.md) |
