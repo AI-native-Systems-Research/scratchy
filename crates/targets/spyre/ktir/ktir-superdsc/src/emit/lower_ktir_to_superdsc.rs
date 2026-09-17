@@ -832,7 +832,6 @@ pub fn scalarmul(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    let (ins, out) = split_out(name, r, layout, 1)?;
     // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, like the epsilon and the attention scale. It was
     // `KtirNode::scalarmul_scale_idx`, a slot the producer resolved and hung on the node — so the
     // number the emulator multiplies by and the number the descriptor multiplies by were two facts
@@ -846,6 +845,30 @@ pub fn scalarmul(
              by the same value."
         ),
     })?;
+    scalarmul_at(name, scale, r, sym_id_base, layout)
+}
+
+/// [`scalarmul`] with the multiplier SUPPLIED rather than read off the whole function.
+///
+/// ⭐ WHY THE SPLIT EXISTS. [`program_scalarmul_scale`] reads EVERY `arith.mulf` in the function and
+/// requires them all to agree — exact for a function that IS one scalarmul node, which is what
+/// `KtirFunc` emits. A whole-kernel function is a different shape: one decoder layer holds 21
+/// `arith.mulf`, most with no splat at all and the splatted ones carrying FOUR different constants
+/// (`INV_D`, `QK_SCALE`, and `RM` twice). The whole-function reader necessarily returns `None` there,
+/// so a per-op caller must state the scale it PROVED for THAT op. The proving stays with the caller
+/// ([`super::whole_function::splat_scale_of`]), which is where the op is; this body's job is the
+/// descriptor.
+///
+/// Everything below is unchanged and shared, so the two doors cannot drift about what a scalarmul
+/// EMITS — only about where its number came from.
+pub fn scalarmul_at(
+    name: &str,
+    scale: f32,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (ins, out) = split_out(name, r, layout, 1)?;
     let idx = scale_slot(layout, scale).ok_or_else(|| Error {
         message: format!(
             "ScalarMul {name}: multiplier {scale}, read off the program, is absent from \
