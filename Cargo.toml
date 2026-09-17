@@ -101,7 +101,7 @@ inventory = "0.3"
 libc = "0.2"
 core-foundation = "0.10"
 fs2 = "0.4"
-dirs = "6"
+dirs = "7"
 
 # Parallelism
 rayon = "1"
