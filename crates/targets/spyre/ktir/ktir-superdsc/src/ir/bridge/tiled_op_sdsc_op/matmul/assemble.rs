@@ -44,6 +44,10 @@ pub fn assemble_matmul_seeded(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    // ⛔ THE OCCUPANCY PAD IS ONLY REAL IF SOMETHING RESERVED IT — see
+    // [`out_width_the_weight_holds`]. A no-op for every caller whose layout reserves the padded
+    // weight; it drops the pad for a producer whose weight is the CALLER'S OWN tensor.
+    let n = out_width_the_weight_holds(layout, w.name(), m, n, k);
     // TYPED OPERANDS (compile-time addressing safety): a matmul's activation is RowBlocked, its weight
     // is a Kernel, its output is RowBlocked — a `cargo build` type error otherwise (you cannot hand a
     // `Flat`/`RowScalar` tensor here). The handles carry only the emitter NAME into `matmul_opspec`
@@ -53,6 +57,69 @@ pub fn assemble_matmul_seeded(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"))
+}
+
+/// ⛔⛔⛔ THE `out` WIDTH THE LAYOUT ACTUALLY RESERVED FOR THIS MATMUL'S WEIGHT — because an
+/// OCCUPANCY PAD IS ONLY REAL IF SOMETHING MADE IT REAL.
+///
+/// `DeviceWidth::for_output` pads a FLOP-heavy matmul's `out` stick count so the gemm fills cores
+/// (`bump_sticks_to_splittable`), and the emitted kernel then MAC's over `[in, out_padded]`. Those
+/// invented columns are legal only because a SECOND party makes them exist: the worker zero-pads the
+/// staged weight by this same rule (`spyre_load`'s `n_dev`) and the bundle layout reserves the padded
+/// footprint for it, so the placement is as wide as the access.
+///
+/// A KTIR producer whose parameters are the CALLER'S OWN TENSORS has no staging pass. A Triton
+/// kernel's `desc_wg` is a `[D_FF, D_MODEL]` buffer the host hands over as-is, and the layout sizes
+/// its placement from exactly that view. The pad is then width nobody made, and the kernel reads past
+/// the weight — MEASURED as `resolve_seg_base`'s own refusal, at both blockings of the SwiGLU MLP:
+///
+/// ```text
+///   m=64  n=256   k=128   → n_dev 512    t1: 0B + 131072B    exceeds footprint 65536B    (seg1)
+///   m=64  n=12800 k=4096  → n_dev 14336  t1: 0B + 117440512B exceeds footprint 104857600B (seg1)
+/// ```
+///
+/// (Not a constant factor — 2× and 1.12× — because the two shapes take DIFFERENT arms of the bump:
+/// 4 sticks is rounded to the ≥8-core floor, 200 sticks takes the full-occupancy arm to 224.)
+///
+/// ⛔ AND IT ONLY EVER DROPS A PAD IT CAN PROVE IS THIS RULE'S OWN. `held` is the whole-stick width
+/// the reserved footprint holds; it is used ONLY when re-applying the padding rule to `held`
+/// reproduces the `n` we were handed. Any other shortfall is a REAL over-run — a wrong shape, a
+/// mis-sized placement — and `n` is returned UNCHANGED so the footprint guard still refuses it BY
+/// NAME instead of being quietly satisfied by a narrower emission. The util floor is re-checked at
+/// `held` for the same reason: the caller's guard #11 measured the PADDED width, so a `held` that
+/// would strand the gemm is left to that refusal rather than emitted below the floor.
+///
+/// A no-op wherever the layout reserves the padded weight (`held == n`), so the full-model path —
+/// including the granite lm_head, the one weight whose stick count needs the pad — is byte-identical.
+fn out_width_the_weight_holds(
+    layout: Option<&BundleLayout>,
+    w_name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> u32 {
+    use crate::work::{CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK};
+    let Some(l) = layout else { return n };
+    let Some(crate::place::PlaceId::Act(tid)) = l.id_of(w_name) else {
+        return n;
+    };
+    let Some(p) = l.placements.get(&tid) else {
+        return n;
+    };
+    // The weight buffer is the `out`-major `[n, k]` one this door's `KtirFunc::matmul` views (the
+    // transposed-weight `indexing_maps`), and a placement is sized by `synth_footprint_bytes`: the
+    // INNER axis stick-rounded, the outer multiplied. So one `out` row costs a stick-rounded `k`.
+    let row_bytes = k.next_multiple_of(FP16_ELEMS_PER_STICK) as u64 * 2; // fp16 kernel
+    if row_bytes == 0 {
+        return n;
+    }
+    let held = ((p.size / row_bytes) as u32 / FP16_ELEMS_PER_STICK) * FP16_ELEMS_PER_STICK;
+    let floor_ok = CoreSplit::plan(m, held).ncores() >= 8;
+    if held < n && held > 0 && floor_ok && DeviceWidth::for_output(m, held, k).get() == n {
+        held
+    } else {
+        n
+    }
 }
 
 /// [`assemble_matmul_seeded`] with an INJECTABLE work-division `splitter` — the Kani-verified tower's
