@@ -30,7 +30,7 @@ use crate::formats::DataFormat;
 use crate::generated::{DataConnect, Mode, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{ConstIdx, NodeId, PadType};
-use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
+use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, Metadata};
 use crate::schedule::ddc::transformation::{LoopId, MaskLoopOffset};
 use crate::schedule::ddc::transformation_util::PaddingForm;
 use crate::schedule::ddc::v1::{ConstEleOffset, LdsSticks, LoopEleOffset};
@@ -2754,49 +2754,80 @@ impl SchedNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChildPos(usize);
 
-/// A DSC'S SCHEDULE TREE — `dsc2::ScheduleTree` (`dsc/dsc2.h:621`) reduced to `head_`, whose
-/// children are the frontier every traversal starts from.
+/// Replaces: e016_ScheduleTree
 ///
-/// ⭐ `head_` IS NEVER VISITED BY A TRAVERSAL. `traverseTreeDFS(nullptr, ..)` seeds the queue with
-/// `head_.next_` (`dsc/dsc2.cpp:2233`), and `head_` is a `LoopNode`, so a `{BLOCK}` filter could not
-/// name it — but its `denId_` IS OBSERVED: `writeToJson` serialises it as `"scheduleTreeHeadDenId_"`
-/// (`dsc/dsc2.cpp:368`) and the parser reads it straight back onto the head (`:1159`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// A DSC'S SCHEDULE TREE — `dsc2::ScheduleTree` (`dsc/dsc2.h:621`) carrying its ONE declared field.
+///
+/// ⭐ `head_` IS NEVER *YIELDED* BY A TRAVERSAL AND IS OBSERVED ANYWAY. `traverseTreeDFS(nullptr, ..)`
+/// seeds the queue with `head_.next_` (`dsc/dsc2.cpp:2233`), yet `writeToJson` serialises the
+/// sentinel's `denId_` as `"scheduleTreeHeadDenId_"` (`:368`) and the parser reads it straight back
+/// (`:1159`), `setRelevantCompCoreCl` writes its `relevantComps_` (`:2656`) and erases it (`:2977`),
+/// and `getOwnerLoop()` hands it out as the owner loop of every top-level node (`:5035`).
+///
+/// ⛔ `Clone` DEEP-COPIES WHERE `copyFrom` REFUSES. `ScheduleTree::copyFrom` (`dsc/dsc2.cpp:2267`)
+/// raises *"Not yet able to deep copy a schedule tree"* for any non-empty tree, with the deep copy it
+/// means commented out directly above the raise; nothing in the reference tree copies a filled one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleTree {
-    head: BlockNode,
-    head_den: Option<DatastageId>,
+    /// Field: e016_ScheduleTree.head_
+    ///
+    /// `head_` (`dsc/dsc2.h:623`) — the UNNAMED `LoopNode` sentinel whose children are the frontier
+    /// every traversal starts from, and which no `name_` lookup can reach.
+    head: LoopNode,
+}
+
+impl Default for ScheduleTree {
+    /// `ScheduleTree()` (`dsc/dsc2.h:629`) — an empty tree over a sentinel naming the core datastage.
+    fn default() -> Self {
+        Self::new(BlockNode::default())
+    }
 }
 
 impl ScheduleTree {
-    /// A tree over `head_`'s children, whose head names no denominator data stage yet.
+    /// A tree over `head_`'s children, with the `head_.denId_ = 0` the constructor states.
     #[must_use]
-    pub const fn new(head: BlockNode) -> Self {
-        Self {
-            head,
-            head_den: None,
-        }
+    pub fn new(head: BlockNode) -> Self {
+        let mut sentinel = LoopNode::bare(head);
+        sentinel.den = Some(Metadata::CORE_DSTGID);
+        Self { head: sentinel }
     }
 
-    /// `getHead()->denId_`, [`None`] for the `-1` an unwritten head carries.
+    /// `clear()` (`dsc/dsc2.h:626`) — `head_.next_.clear()`, which drops every node and leaves the
+    /// sentinel's own fields alone.
+    pub fn clear(&mut self) {
+        self.head.block.children.clear();
+    }
+
+    /// `empty()` (`dsc/dsc2.h:627`) — `head_.next_.empty()`, which is also what `isDSC2()` reads to
+    /// decide a DSC carries a DSC2 schedule at all (`dsc/designSpaceConfig.cpp:31`).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.head.block.children.is_empty()
+    }
+
+    /// Field: e016_ScheduleTree.denId_
+    ///
+    /// `getHead()->denId_` — `0`, the core datastage, from construction (`dsc/dsc2.h:629`), and
+    /// [`None`] only where an imported `scheduleTreeHeadDenId_` states the reference's `-1`.
     #[must_use]
     pub const fn head_den(&self) -> Option<DatastageId> {
-        self.head_den
+        self.head.den
     }
 
     /// `getHeadMutable()->denId_ = den` — the write entry 217 makes onto the root before it chains
-    /// the chunk loops under it.
+    /// the chunk loops under it, and the one the importer makes (`dsc/dsc2.cpp:1159`).
     pub fn set_head_den(&mut self, den: DatastageId) {
-        self.head_den = Some(den);
+        self.head.den = Some(den);
     }
 
-    /// `getHead()` — the root's block part.
+    /// `getHead()` (`dsc/dsc2.h:637`) — the sentinel, which IS a `LoopNode`.
     #[must_use]
-    pub const fn head(&self) -> &BlockNode {
+    pub const fn head(&self) -> &LoopNode {
         &self.head
     }
 
-    /// `getHeadMutable()`.
-    pub const fn head_mut(&mut self) -> &mut BlockNode {
+    /// `getHeadMutable()` (`:638`).
+    pub const fn head_mut(&mut self) -> &mut LoopNode {
         &mut self.head
     }
 
@@ -2805,7 +2836,7 @@ impl ScheduleTree {
     #[must_use]
     pub fn blocks_dfs(&self) -> Vec<&BlockNode> {
         let mut found = Vec::new();
-        collect_blocks(&self.head, &mut found);
+        collect_blocks(&self.head.block, &mut found);
         found
     }
 
@@ -2819,7 +2850,7 @@ impl ScheduleTree {
         &mut self,
         accepts: impl Fn(&BlockNode) -> bool + Copy,
     ) -> Option<&mut BlockNode> {
-        find_block_mut(&mut self.head, accepts)
+        find_block_mut(&mut self.head.block, accepts)
     }
 
     /// The same search over the `CONDITION` nodes, which [`Self::find_block_mut`] descends THROUGH
@@ -2829,7 +2860,7 @@ impl ScheduleTree {
         &mut self,
         accepts: impl Fn(&ConditionNode) -> bool + Copy,
     ) -> Option<&mut ConditionNode> {
-        find_guarded_mut(&mut self.head, accepts)
+        find_guarded_mut(&mut self.head.block, accepts)
     }
 
     /// The same search over the `SYNC` nodes, which neither [`Self::find_block_mut`] nor
@@ -2839,7 +2870,7 @@ impl ScheduleTree {
         &mut self,
         accepts: impl Fn(&SyncNode) -> bool + Copy,
     ) -> Option<&mut SyncNode> {
-        find_sync_mut(&mut self.head, accepts)
+        find_sync_mut(&mut self.head.block, accepts)
     }
 
     /// Field: e009_ScheduleNode.prev_
@@ -2847,13 +2878,18 @@ impl ScheduleTree {
     /// `prev_` (`dsc/dsc2.h:515`) FOR THE NODE NAMED `name`, WALKED DOWN: an owned tree cannot hold a
     /// parent pointer, and a chain rebuilt by the search that reached the node cannot go stale.
     ///
-    /// ⛔ THE HEAD IS A BLOCK HERE, NOT A LOOP. The reference's `head_` is a `LoopNode`
-    /// (`dsc/dsc2.cpp:2233`), so a top-level child's `getOwnerLoop()` is that head there and [`None`]
-    /// here; every scheduler caller asks after a loop it tiled itself, which is below the head.
+    /// ⭐ THE SENTINEL TERMINATES THE CHAIN. `head_` is a `LoopNode`, so `getOwnerLoop()` on a
+    /// top-level node hands the head back rather than `nullptr`, which is why the reference's own
+    /// outward walks stop on `currNode != getHead()` (`dsc/dsc2.cpp:5035`).
     #[must_use]
     pub fn ancestors(&self, name: &NodeName) -> Option<Ancestors<'_>> {
         let mut loops = Vec::new();
-        ancestors_in(&self.head, &mut loops, name)
+        let (parent, loops) = ancestors_in(&self.head.block, &mut loops, name)?;
+        Some(Ancestors {
+            parent,
+            loops,
+            head: &self.head,
+        })
     }
 }
 
@@ -2863,40 +2899,50 @@ impl ScheduleTree {
 pub struct Ancestors<'a> {
     /// `getPrev()` (`dsc/dsc2.h:462`).
     pub parent: &'a BlockNode,
-    /// The same chain filtered to `LOOP`, which is the only kind either loop walk looks for.
+    /// The same chain filtered to `LOOP`, innermost first — the loops BELOW the sentinel, which is
+    /// the chain the reference's outward walks take (`while (currNode != getHead())`).
     pub loops: Vec<&'a LoopNode>,
+    /// `ScheduleTree::getHead()` — the sentinel every `prev_` chain ends at, and so the owner loop of
+    /// a top-level node.
+    pub head: &'a LoopNode,
 }
 
 impl<'a> Ancestors<'a> {
     /// `getOwnerLoop()` (`dsc/dsc2.cpp:1896-1900`) — the innermost enclosing loop.
+    ///
+    /// ⛔ TOTAL, AND THE REFERENCE'S IS TOO FOR EVERY NAMED NODE: the walk stops at the first `LOOP`
+    /// in the `prev_` chain, and every chain ends at the sentinel head, which is one. Only `head_`
+    /// itself has `prev_ == nullptr`, and no name reaches it.
     #[must_use]
-    pub fn owner_loop(&self) -> Option<&'a LoopNode> {
-        self.loops.first().copied()
+    pub fn owner_loop(&self) -> &'a LoopNode {
+        self.loops.first().copied().unwrap_or(self.head)
     }
 
     /// `getParentDimLoop(dim)` (`dsc/dsc2.cpp:1906-1914`) — the innermost enclosing loop that tiles
-    /// `dim`, which is [`Self::owner_loop`] continued outwards.
+    /// `dim`, which is [`Self::owner_loop`] continued outwards. The sentinel's `dims_` is empty, so
+    /// the walk runs out at it exactly where the reference returns `nullptr`.
     #[must_use]
     pub fn parent_dim_loop(&self, dim: PrimaryDim) -> Option<&'a LoopNode> {
         self.loops
             .iter()
             .copied()
+            .chain(std::iter::once(self.head))
             .find(|enclosing| enclosing.has_loop_dim(dim))
     }
 }
 
-/// The ancestry of the node named `name` below `parent`, with `loops` the enclosing loops so far.
+/// The parent and enclosing loops of the node named `name` below `parent`, with `loops` the enclosing
+/// loops so far — the sentinel is [`ScheduleTree::ancestors`]'s to add.
+type Ancestry<'a> = (&'a BlockNode, Vec<&'a LoopNode>);
+
 fn ancestors_in<'a>(
     parent: &'a BlockNode,
     loops: &mut Vec<&'a LoopNode>,
     name: &NodeName,
-) -> Option<Ancestors<'a>> {
+) -> Option<Ancestry<'a>> {
     for child in &parent.children {
         if child.name() == name {
-            return Some(Ancestors {
-                parent,
-                loops: loops.clone(),
-            });
+            return Some((parent, loops.clone()));
         }
         let found = match child {
             SchedNode::Block(inner) | SchedNode::Condition(inner) => {
@@ -3839,8 +3885,8 @@ mod tests_e009_schedule_node {
             .expect("the transfer is in the tree");
         assert_eq!(found.parent.base.name, NodeName("block".to_owned()));
         assert_eq!(
-            found.owner_loop().map(|held| &held.block.base.name),
-            Some(&NodeName("loop_y".to_owned()))
+            found.owner_loop().block.base.name,
+            NodeName("loop_y".to_owned())
         );
         assert_eq!(
             found.parent_dim_loop(PrimaryDim::X).map(|held| &held.block.base.name),
@@ -3848,12 +3894,15 @@ mod tests_e009_schedule_node {
         );
         // `getParentDimLoop` runs out of loops rather than refusing.
         assert!(found.parent_dim_loop(PrimaryDim::I).is_none());
-        // ⛔ The head is a block here, so a top-level child has no owner loop at all.
-        assert!(
+        // ⭐ A top-level child's owner loop is the SENTINEL, which this tree named "head".
+        assert_eq!(
             tree.ancestors(&NodeName("loop_x".to_owned()))
                 .expect("the outer loop is in the tree")
                 .owner_loop()
-                .is_none()
+                .block
+                .base
+                .name,
+            NodeName("head".to_owned())
         );
     }
 
@@ -4252,5 +4301,42 @@ mod tests_e015_compute_node {
             node.corelet_view(Some(Corelet::at::<0>())).is_none(),
             "an unfilled corelet is absent rather than empty"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_e016_schedule_tree {
+    use super::*;
+
+    /// `ScheduleTree()`, `empty()`, `clear()` and the sentinel head: a fresh tree is empty with
+    /// `head_.denId_ = 0`, a top-level loop makes it non-empty, THAT loop's `getOwnerLoop()` is the
+    /// sentinel and not `nullptr`, and `clear()` drops the children while keeping the head's `denId_`.
+    #[test]
+    fn a_fresh_tree_is_empty_and_its_sentinel_head_owns_every_top_level_node() {
+        let mut tree = ScheduleTree::default();
+        assert!(tree.is_empty());
+        assert_eq!(tree.head_den(), Some(Metadata::CORE_DSTGID));
+        assert_eq!(tree.head().block.base.name, NodeName::default());
+
+        tree.head_mut()
+            .block
+            .add_child(SchedNode::Loop(Box::new(LoopNode::bare(BlockNode {
+                base: NodeBase::named(NodeName("loop_ds0_ds1_y".to_owned())),
+                children: Vec::new(),
+            }))));
+        assert!(!tree.is_empty());
+
+        let found = tree
+            .ancestors(&NodeName("loop_ds0_ds1_y".to_owned()))
+            .expect("the loop just added");
+        assert!(found.loops.is_empty(), "nothing encloses a top-level node");
+        assert_eq!(found.owner_loop().den, Some(Metadata::CORE_DSTGID));
+        // The sentinel tiles no dim, so the outward walk runs out at it.
+        assert!(found.parent_dim_loop(PrimaryDim::Y).is_none());
+
+        tree.set_head_den(DatastageId(3));
+        tree.clear();
+        assert!(tree.is_empty());
+        assert_eq!(tree.head_den(), Some(DatastageId(3)));
     }
 }
