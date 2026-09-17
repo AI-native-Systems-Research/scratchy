@@ -753,12 +753,12 @@ impl v1::ScheduleNodes for OffsetNodesOf<'_> {
     }
 
     /// `TransferNode::paddingInfo_.isEmpty() == false` (`dsc/dsc2.h:845`), whose `isEmpty()` is
-    /// `transferPadFrontSize_.empty() && transferPadBackSize_.empty()` (`:774-776`) — the two maps
-    /// [`crate::schedule::dsc2::TransferPadding::dims`] walks.
+    /// `transferPadFrontSize_.empty() && transferPadBackSize_.empty()` (`:774-776`), spelled by
+    /// [`crate::schedule::dsc2::TransferPadding::is_empty`].
     fn transfer_has_padding(&self, node: NodeId) -> bool {
         self.tree.with(|tree| {
             tree.transfer(node)
-                .is_some_and(|held| held.padding.dims().next().is_some())
+                .is_some_and(|held| !held.padding.is_empty())
         })
     }
 

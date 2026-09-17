@@ -255,7 +255,7 @@ impl Coordinate {
 
     /// `CoordinateType::addFold(dim, cat, card, label, alpha, beta, 0)` (`dsc/dsc2.h:120`) — the
     /// `pos == 0` case, which inserts at the FRONT of the dim's fold list
-    /// (`foldInfrastructure.h:1349`) and is the only position the fold builders in this module use.
+    /// (`foldInfrastructure.h:1348`, `:1371`) and is the only position the fold builders here use.
     ///
     /// ⛔ Front insertion is TOTAL; a positional insert is not (`buildDim` `DT_CHECK`s `pos == 0`
     /// on an empty list and `insertAlphaBeta` `DT_CHECK`s `pos <= size - 1`), so the units that
@@ -283,7 +283,7 @@ impl Coordinate {
         }
     }
 
-    /// `clearFoldForDim(dim)` (`dsc/dsc2.h:99-114`) — empties the dim's folds and zeroes its three
+    /// `clearFoldForDim(dim)` (`dsc/dsc2.h:103-116`) — empties the dim's folds and zeroes its three
     /// counts.
     ///
     /// ⛔⛔ THE DIM STAYS COVERED. The reference `reset()`s the fold manager in place and leaves the
@@ -351,7 +351,7 @@ impl Coordinate {
     }
 
     /// `fm.insertBeta(offset + fm.getBeta(fm.getNumDims() - 1), fm.getNumDims() - 1)` — the ONE
-    /// positional beta write in the fold builders (`ddc/ddc_fold.cpp:4576-4578`), which adds an
+    /// positional beta write in the fold builders (`ddc/ddc_fold.cpp:4714-4716`), which adds an
     /// offset to the INNERMOST level of a dim's fold list.
     ///
     /// ⛔ THE READ AND THE WRITE ARE ONE OPERATION, which is what makes this total: the reference's
@@ -389,9 +389,9 @@ pub struct NodeName(pub String);
 /// bound should hide at the use site.
 ///
 /// ⚠️ [`super::ddc::fold::DataStream`] carries `myLdsIdx_` and `constantId_` as ONE
-/// [`super::ddc::fold::DataOrigin`], which is the stronger statement (`isLabeledDs`/`isConstant`
-/// `DT_CHECK` that both are not set). Converging the two spellings is a review pass's, not this
-/// batch's: `fold.rs` already carries the same note about the fold vocabulary.
+/// [`super::ddc::fold::DataOrigin`], which is the stronger statement: `isLabeledDs` and `isConstant`
+/// both `DT_CHECK` that the two are not set together (`dsc/dsc2.h:742-743`, `:747-748`). Converging
+/// the spellings rewrites 162 call sites of these two fields, so it is its own unit, not a doc edit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DataInfo {
     /// Field: e007_DataInfo.dataConnect_
@@ -1358,7 +1358,7 @@ pub struct SizeAndIndex {
 
 /// ONE POSITION OF A TRANSFER'S ZERO-PAD FOLD — the `(size, alpha, beta)` triple that ONE
 /// `TransferPadInfo::FoldDimPosition` slot of `buildPadFrontSizes`' and `buildPadBackSizes`' three
-/// parallel `std::vector<int>`s holds (`dsc/dsc2.h:849`).
+/// parallel `std::vector<int>`s holds (`dsc/dsc2.h:777-782`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PadFold {
     /// `sizes[pos]` — how many steps that fold axis walks.
@@ -1369,12 +1369,14 @@ pub struct PadFold {
     pub beta: FoldCoeff,
 }
 
-/// ONE DIM'S ZERO-PAD FOLD SPACE — the two `TransferPadInfo::FoldDimPosition` slots that are ever
-/// written, `WORK_SLICE_FOLDDIM` and `CHUNK_FOLDDIM`.
+/// ONE DIM'S ZERO-PAD FOLD SPACE — both `TransferPadInfo::FoldDimPosition` slots,
+/// `WORK_SLICE_FOLDDIM = 0` then `CHUNK_FOLDDIM = 1` (`dsc/dsc2.h:768-772`), which
+/// `buildTransferFoldDim` folds *"from outer to inner"* in that order (`dsc/dsc2.cpp:4652-4654`).
 ///
-/// ⛔ THE REMAINING `TOTAL_FOLDDIM_NUM` SLOTS ARE UNSPELLABLE, AND THAT IS THE TRUTH: entry 221 is the
-/// only writer of `paddingInfo_`, it sets exactly these two, and every other slot keeps the zero its
-/// `std::vector<int>` was sized with.
+/// ⭐ `TOTAL_FOLDDIM_NUM` IS THE COUNT, NOT A THIRD SLOT: it is `2`, it is the length
+/// `buildTransferFoldDim` resizes each dim's `FoldDimProp` arena to (`dsc/dsc2.cpp:4664`), and it is
+/// what `buildPadSizes` `DT_CHECK`s all three `std::vector<int>` lengths against (`:4612-4615`). A
+/// pair carries the whole fold space, so that length check is what this shape makes unspellable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZeroPadFolds {
     /// `WORK_SLICE_FOLDDIM`.
@@ -1408,12 +1410,20 @@ pub struct TransferPadding {
 }
 
 impl TransferPadding {
-    /// `buildPadFrontSizes(dim, sizes, alphas, betas)`.
+    /// `buildPadFrontSizes(dim, sizes, alphas, betas)` (`dsc/dsc2.h:777-779`), the three parallel
+    /// vectors carried as the one [`ZeroPadFolds`] their positions index.
+    ///
+    /// ⚠️ A SECOND BUILD OF ONE DIM REPLACES THE FIRST WHERE THE REFERENCE ABORTS:
+    /// `buildTransferFoldDim` `DT_CHECK`s `!foldProps.count(dim)`, *"Expect empty fold properties."*
+    /// (`dsc/dsc2.cpp:4662`). Entry 221 reaches each padded dim exactly once, from a per-dim loop
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5380`), so no reachable path distinguishes the two
+    /// and refusing here would be a runtime abort standing in for an unreachable state.
     pub fn build_pad_front(&mut self, dim: PrimaryDim, folds: ZeroPadFolds) {
         self.front.insert(dim, folds);
     }
 
-    /// `buildPadBackSizes(dim, sizes, alphas, betas)`.
+    /// `buildPadBackSizes(dim, sizes, alphas, betas)` (`dsc/dsc2.h:780-782`), under the same
+    /// single-build contract as [`Self::build_pad_front`].
     pub fn build_pad_back(&mut self, dim: PrimaryDim, folds: ZeroPadFolds) {
         self.back.insert(dim, folds);
     }
@@ -1430,9 +1440,21 @@ impl TransferPadding {
         self.back.get(&dim).copied()
     }
 
-    /// Every dim either builder has been handed, in dim order.
+    /// `getPadFrontOrBackDimsSet` (`dsc/dsc2.h:783-788`) with both ends unioned — each dim ONCE and
+    /// in dim order, as the `std::set<PrimaryDimTypes>` its `getAllKeys()` returns.
     pub fn dims(&self) -> impl Iterator<Item = PrimaryDim> + '_ {
-        self.front.keys().chain(self.back.keys()).copied()
+        self.front
+            .keys()
+            .chain(self.back.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+    }
+
+    /// `isEmpty()` (`dsc/dsc2.h:774-776`) — neither end has been handed any dim.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.front.is_empty() && self.back.is_empty()
     }
 }
 
@@ -4338,5 +4360,338 @@ mod tests_e016_schedule_tree {
         tree.clear();
         assert!(tree.is_empty());
         assert_eq!(tree.head_den(), Some(DatastageId(3)));
+    }
+}
+
+#[cfg(test)]
+mod tests_e005_coordinate {
+    //! HOW A COORDINATE IS BUILT AND UNBUILT — [`Coordinate`] (`dsc/dsc2.h:76`). Three facts here a
+    //! field list cannot state on its own: `addFold(.., pos = 0)` inserts at the FRONT, so the fold
+    //! added LAST is the outermost (`foldInfrastructure.h:1348`, `:1371`); `clearFoldForDim` leaves
+    //! the dim COVERED and its padding standing — *"Note: Padding is not cleared."*
+    //! (`dsc/dsc2.h:100-102`); and the one positional beta write is TOTAL where the reference's
+    //! `getNumDims() - 1` underflows (`ddc/ddc_fold.cpp:4714-4716`).
+
+    use super::{
+        Coordinate, CoordinateCategory, Core, FoldCardinality, FoldCoeff, FoldDim, FoldLabel,
+        FoldPosition, PadType, PaddingForm, PrimaryDim, WkSlice,
+    };
+    use crate::schedule::l3::dsc::WkSliceId;
+
+    fn label(name: &str) -> FoldLabel {
+        FoldLabel(name.to_owned())
+    }
+
+    /// `addFold(OUT, cat, card, name, 1, 0, 0)` — one fold onto the same dim every time.
+    fn add(coord: &mut Coordinate, category: CoordinateCategory, card: u32, name: &str) {
+        coord.add_fold_front(
+            PrimaryDim::Out,
+            category,
+            FoldCardinality(card),
+            label(name),
+            FoldCoeff(1),
+            FoldCoeff(0),
+        );
+    }
+
+    /// e005 — front insertion, and each category counting ONLY its own arm.
+    #[test]
+    fn add_fold_front_puts_the_last_fold_added_outermost() {
+        let mut coord = Coordinate::default();
+        assert!(
+            !coord.covers(PrimaryDim::Out),
+            "`coordinates_.count(dim)` before the first fold"
+        );
+
+        add(&mut coord, CoordinateCategory::Temporal, 3, "inner");
+        add(&mut coord, CoordinateCategory::Spatial, 2, "outer");
+
+        let dim = coord.fold_dim(PrimaryDim::Out).expect("the dim is covered");
+        assert_eq!(
+            dim.folds().map(|one| one.label.clone()).collect::<Vec<_>>(),
+            vec![label("outer"), label("inner")],
+            "position 0 is the fold added LAST"
+        );
+        assert_eq!(
+            dim.cardinality_at(FoldPosition::Core),
+            Some(FoldCardinality(2)),
+            "`getFoldDimSize(0)`"
+        );
+        assert_eq!(
+            dim.cardinality_at(FoldPosition::Corelet),
+            Some(FoldCardinality(3)),
+            "`getFoldDimSize(1)`"
+        );
+        assert_eq!(
+            dim.cardinality_at(FoldPosition::RowSplit),
+            None,
+            "the dim is only two folds deep"
+        );
+
+        assert_eq!(dim.spatial_folds(), 1, "`numOfSpatialFolds_`");
+        assert_eq!(dim.temporal_folds(), 1, "`numOfTemporalFolds_`");
+        assert_eq!(
+            dim.elem_arr_folds(),
+            0,
+            "`numOfElemArrFolds_` is absent-is-zero, never bumped by another arm"
+        );
+    }
+
+    /// e005 — `clearFoldForDim` resets the fold space in place; the dim and its padding survive.
+    #[test]
+    fn clear_fold_for_dim_keeps_the_dim_and_its_padding() {
+        let mut coord = Coordinate::default();
+        coord.set_padding(PrimaryDim::Out, PadType::PaddedWZeroPad);
+        add(&mut coord, CoordinateCategory::ElemArr, 4, "elem");
+
+        coord.clear_fold_for_dim(PrimaryDim::Out);
+
+        assert!(
+            coord.covers(PrimaryDim::Out),
+            "the `coordinates_` entry is reset, not erased"
+        );
+        let dim = coord.fold_dim(PrimaryDim::Out).expect("still covered");
+        assert_eq!(dim, &FoldDim::EMPTY, "`reset()` in place");
+        assert_eq!(
+            dim.elem_arr_folds(),
+            0,
+            "the count goes back with the folds it counted"
+        );
+        assert_eq!(
+            coord.padding(PrimaryDim::Out),
+            PadType::PaddedWZeroPad,
+            "*\"Note: Padding is not cleared.\"*"
+        );
+
+        // ⛔ Clearing a dim the coordinate does not cover does not mint one.
+        coord.clear_fold_for_dim(PrimaryDim::Mb);
+        assert!(!coord.covers(PrimaryDim::Mb));
+    }
+
+    /// e005 — the positional beta write lands on the INNERMOST fold, and on none where there is none.
+    #[test]
+    fn add_to_innermost_beta_lands_on_the_last_fold_only() {
+        let mut coord = Coordinate::default();
+        add(&mut coord, CoordinateCategory::Temporal, 3, "inner");
+        add(&mut coord, CoordinateCategory::Spatial, 2, "outer");
+
+        coord.add_to_innermost_beta(PrimaryDim::Out, FoldCoeff(5));
+
+        assert_eq!(
+            coord
+                .fold_dim(PrimaryDim::Out)
+                .expect("covered")
+                .folds()
+                .map(|one| one.beta)
+                .collect::<Vec<_>>(),
+            vec![FoldCoeff(0), FoldCoeff(5)],
+            "`getNumDims() - 1` is the innermost level, not position 0"
+        );
+
+        // ⛔ NO INNERMOST LEVEL: nothing to add to, and nothing to refuse either.
+        coord.clear_fold_for_dim(PrimaryDim::Out);
+        coord.add_to_innermost_beta(PrimaryDim::Out, FoldCoeff(7));
+        coord.add_to_innermost_beta(PrimaryDim::Mb, FoldCoeff(7));
+        assert_eq!(
+            coord
+                .fold_dim(PrimaryDim::Out)
+                .expect("covered")
+                .folds()
+                .count(),
+            0
+        );
+        assert!(!coord.covers(PrimaryDim::Mb));
+    }
+
+    /// e005 — `setPadding(const PaddingFormType&)` (`dsc/dsc2.h:240`) REPLACES the form, which the
+    /// per-dim `setPadding` (`:236`) does not.
+    #[test]
+    fn setting_the_whole_padding_form_replaces_it() {
+        let mut coord = Coordinate::default();
+        coord.set_padding(PrimaryDim::Out, PadType::PaddedFullSpan);
+        coord.set_padding(PrimaryDim::In, PadType::LoweredPadded);
+
+        let mut replacement = PaddingForm::default();
+        replacement.set_padding(PrimaryDim::In, PadType::PaddedNoZeroPad);
+        coord.set_padding_form(replacement);
+
+        assert_eq!(coord.padding(PrimaryDim::In), PadType::PaddedNoZeroPad);
+        assert_eq!(
+            coord.padding(PrimaryDim::Out),
+            PadType::NoPad,
+            "the old form is gone, not merged into the new one"
+        );
+        assert_eq!(
+            coord.padding_form().stated().collect::<Vec<_>>(),
+            vec![(PrimaryDim::In, PadType::PaddedNoZeroPad)],
+            "`getPadding()` (`dsc/dsc2.h:245`) names only the dims the form states"
+        );
+    }
+
+    /// e005 — `foldConstructed_` is the one-way latch its only setter makes it, and
+    /// `coreIdToWkSlice_` is absent for a core it does not name.
+    #[test]
+    fn fold_construction_latches_and_wk_slices_are_stated_per_core() {
+        let mut coord = Coordinate::default();
+        assert!(!coord.fold_constructed(), "`foldConstructed_ = false`");
+        coord.complete_fold_construction();
+        coord.complete_fold_construction();
+        assert!(coord.fold_constructed(), "the latch does not toggle back");
+
+        let core = Core::checked(0).expect("core 0");
+        assert!(
+            coord.wk_slice_mut(core).is_none(),
+            "*\"Core ID not found.\"*"
+        );
+
+        coord.set_wk_slice(core, WkSlice::default());
+        coord
+            .wk_slice_mut(core)
+            .expect("stated now")
+            .0
+            .insert(PrimaryDim::Out, WkSliceId(2));
+
+        assert_eq!(
+            coord
+                .wk_slices()
+                .map(|(at, slice)| (at, slice.at(PrimaryDim::Out)))
+                .collect::<Vec<_>>(),
+            vec![(core, Some(WkSliceId(2)))],
+            "the mutable borrow writes THIS coordinate's own map"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e008_transfer_padding {
+    //! A TRANSFER'S ZERO-PAD INFO — [`TransferPadding`] (`dsc/dsc2.h:755`). What its shape asserts:
+    //! `isEmpty()` is the AND of both maps (`:774-776`), `getPadFrontOrBackDimsSet` returns a
+    //! `std::set` so a dim built at BOTH ends is named once (`:783-788`), and the two
+    //! `FoldDimPosition` slots are the whole fold space because `TOTAL_FOLDDIM_NUM` is the count `2`
+    //! (`:768-772`).
+
+    use super::{FoldCardinality, FoldCoeff, PadFold, PrimaryDim, TransferPadding, ZeroPadFolds};
+
+    /// The `(sizes, alphas, betas)` triple `buildPadSizes` is handed, as the two slots index it.
+    fn folds(work_slice: u32, chunk: u32) -> ZeroPadFolds {
+        ZeroPadFolds {
+            work_slice: PadFold {
+                cardinality: FoldCardinality(work_slice),
+                alpha: FoldCoeff(1),
+                beta: FoldCoeff(0),
+            },
+            chunk: PadFold {
+                cardinality: FoldCardinality(chunk),
+                alpha: FoldCoeff(1),
+                beta: FoldCoeff(0),
+            },
+        }
+    }
+
+    /// e008 — a default-constructed one states nothing at either end.
+    #[test]
+    fn a_default_transfer_padding_is_empty_at_both_ends() {
+        let fresh = TransferPadding::default();
+        assert!(fresh.is_empty(), "`isEmpty()` on two empty maps");
+        assert_eq!(fresh.dims().count(), 0, "`getAllKeys()` on both is empty");
+        assert_eq!(fresh.pad_front(PrimaryDim::Out), None);
+        assert_eq!(fresh.pad_back(PrimaryDim::Out), None);
+    }
+
+    /// e008 — `isEmpty()` is an AND, so ONE built end already makes it false.
+    #[test]
+    fn one_built_end_is_enough_to_be_non_empty() {
+        let mut front_only = TransferPadding::default();
+        front_only.build_pad_front(PrimaryDim::Out, folds(2, 3));
+        assert!(!front_only.is_empty(), "a front-only pad is not empty");
+
+        let mut back_only = TransferPadding::default();
+        back_only.build_pad_back(PrimaryDim::Out, folds(2, 3));
+        assert!(!back_only.is_empty(), "nor is a back-only one");
+    }
+
+    /// e008 — the union names each dim ONCE, in `PrimaryDimTypes` order, and the two ends stay
+    /// independent maps.
+    #[test]
+    fn dims_unions_both_ends_once_and_in_dim_order() {
+        let mut padding = TransferPadding::default();
+        padding.build_pad_front(PrimaryDim::Mb, folds(2, 3));
+        padding.build_pad_front(PrimaryDim::In, folds(4, 5));
+        padding.build_pad_back(PrimaryDim::In, folds(6, 7));
+        padding.build_pad_back(PrimaryDim::Out, folds(8, 9));
+
+        assert_eq!(
+            padding.dims().collect::<Vec<_>>(),
+            vec![PrimaryDim::In, PrimaryDim::Out, PrimaryDim::Mb],
+            "`In` is built at BOTH ends and is still named once"
+        );
+
+        assert_eq!(
+            padding.pad_back(PrimaryDim::Mb),
+            None,
+            "building the front end never states the back"
+        );
+        assert_eq!(padding.pad_front(PrimaryDim::Out), None);
+        assert_eq!(padding.pad_front(PrimaryDim::In), Some(folds(4, 5)));
+        assert_eq!(padding.pad_back(PrimaryDim::In), Some(folds(6, 7)));
+    }
+
+    /// e008 — both `FoldDimPosition` slots round-trip, work slice OUTER and chunk INNER, the order
+    /// `buildTransferFoldDim` builds them in (`dsc/dsc2.cpp:4652-4654`).
+    #[test]
+    fn both_folddim_slots_round_trip_outer_to_inner() {
+        let mut padding = TransferPadding::default();
+        padding.build_pad_front(
+            PrimaryDim::Out,
+            ZeroPadFolds {
+                work_slice: PadFold {
+                    cardinality: FoldCardinality(2),
+                    alpha: FoldCoeff(16),
+                    beta: FoldCoeff(-3),
+                },
+                chunk: PadFold {
+                    cardinality: FoldCardinality(5),
+                    alpha: FoldCoeff(1),
+                    beta: FoldCoeff(7),
+                },
+            },
+        );
+
+        let built = padding.pad_front(PrimaryDim::Out).expect("just built");
+        assert_eq!(
+            built.work_slice,
+            PadFold {
+                cardinality: FoldCardinality(2),
+                alpha: FoldCoeff(16),
+                beta: FoldCoeff(-3),
+            },
+            "`WORK_SLICE_FOLDDIM = 0`, the outer fold"
+        );
+        assert_eq!(
+            built.chunk,
+            PadFold {
+                cardinality: FoldCardinality(5),
+                alpha: FoldCoeff(1),
+                beta: FoldCoeff(7),
+            },
+            "`CHUNK_FOLDDIM = 1`, the inner fold"
+        );
+    }
+
+    /// e008 — a second build of one dim REPLACES the first, where the reference `DT_CHECK`s
+    /// *"Expect empty fold properties."* (`dsc/dsc2.cpp:4662`) on a path entry 221 cannot reach
+    /// twice.
+    #[test]
+    fn a_second_build_of_one_dim_replaces_the_first() {
+        let mut padding = TransferPadding::default();
+        padding.build_pad_front(PrimaryDim::Out, folds(2, 3));
+        padding.build_pad_front(PrimaryDim::Out, folds(4, 5));
+
+        assert_eq!(padding.pad_front(PrimaryDim::Out), Some(folds(4, 5)));
+        assert_eq!(
+            padding.dims().collect::<Vec<_>>(),
+            vec![PrimaryDim::Out],
+            "one entry per dim, never a second"
+        );
     }
 }

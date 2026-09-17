@@ -518,12 +518,12 @@ impl v1::ScheduleNodes for Dsc2Tree<'_, '_> {
             .with(|tree| tree.owner_loop(tree.node_of_alloc(alloc)?))
     }
 
-    /// `TransferNode::paddingInfo_.isEmpty() == false` (`dsc/dsc2.h:838`) — the transfer's OWN
+    /// `TransferNode::paddingInfo_.isEmpty() == false` (`dsc/dsc2.h:845`) — the transfer's OWN
     /// padding, which [`crate::schedule::dsc2::TransferNode::padding`] carries.
     fn transfer_has_padding(&self, node: NodeId) -> bool {
         self.tree().with(|tree| {
             tree.transfer(node)
-                .is_some_and(|held| held.padding.dims().next().is_some())
+                .is_some_and(|held| !held.padding.is_empty())
         })
     }
 
