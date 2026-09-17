@@ -34,7 +34,7 @@ use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::v1::LdsSticks;
 use crate::schedule::ddl::ops::DdlComputeType;
-use crate::schedule::l3::dl_ops::{GtrGroupId, Shares};
+use crate::schedule::l3::dl_ops::{GtrGroupId, Shares, VariableSymbol};
 use crate::schedule::l3::dsc::{IndirectAlloc, WkSlice};
 use crate::units::{Core, Corelet, NumFolds};
 
@@ -1364,18 +1364,28 @@ impl BlockNode {
     }
 }
 
-/// ONE DIM A LOOP ITERATES — `LoopNode::dims_`, paired with the META KIND the DDL dim it came from
-/// carried, because that pair is what `convertDsc2Ddl` matches a loop back to its DDL dims by.
+/// ONE DIM A LOOP ITERATES — `PrimaryDimAndKind` (`dsc/dims.h:76`), the element type of
+/// `LoopNode::dims_`: a primary dim paired with the META KIND the DDL dim it came from carried,
+/// because that pair is what `convertDsc2Ddl` matches a loop back to its DDL dims by.
+///
+/// ⭐ ONE C++ DECLARATION, ONE RUST TYPE — `transformation_util::PrimaryDimAndKind` IS this type
+/// under its C++ name, so a pair crosses the `ddc` and `dsc2` halves of the port unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoopDim {
-    /// The primary dim.
+    /// Field: e011_LoopNode.dim_
+    ///
+    /// `dim_` (`dsc/dims.h:77`), whose `PrimaryDimTypesCount` default this type does not admit.
     pub dim: PrimaryDim,
-    /// `metaDimKind_` of the DDL dim that named it.
+    /// Field: e011_LoopNode.kind_
+    ///
+    /// `kind_` (`dsc/dims.h:78`) — the meta kind of the DDL dim that named this one.
     pub kind: MetaDimKind,
 }
 
-/// A LOOP NODE — `dsc2::LoopNode`: a block, the dims it divides, and the two datastages whose
-/// extents give its trip count.
+/// Replaces: e011_LoopNode
+///
+/// A LOOP NODE — `dsc2::LoopNode` (`dsc/dsc2.h:563`): a block, the dims it divides, the two
+/// datastages whose extents give its trip count, and the symbols a SYMBOLIC dim counts by.
 ///
 /// ⭐ THE PARAMETRIC FLAG AND ITS INDEX ARE ONE FIELD. `markAsParametricLoop()` and
 /// `setParametricLdsIdx(lds)` are called together and only together (`ddl_conversion.cpp:1093-1101`),
@@ -1383,16 +1393,32 @@ pub struct LoopDim {
 /// ⛔ `numId_`/`denId_` ABSENT IS THE REFERENCE'S `-1`, which a parametric loop sets for both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopNode {
-    /// The loop's own block: its name and its children.
+    /// The loop's own block part: the `name_` and `next_` it inherits (`dsc/dsc2.h:526`).
     pub block: BlockNode,
-    /// `dims_`, in the order the loop states them.
+    /// Field: e011_LoopNode.dims_
+    ///
+    /// `dims_` (`dsc/dsc2.h:575`) — *"ordered inner to outer"*.
     pub dims: Vec<LoopDim>,
-    /// `numId_` — the datastage the trip count divides.
+    /// Field: e011_LoopNode.numId_
+    ///
+    /// `numId_` (`:573`) — the datastage the trip count divides.
     pub num: Option<DatastageId>,
-    /// `denId_` — the datastage it divides by.
+    /// Field: e011_LoopNode.denId_
+    ///
+    /// `denId_` (`:574`) — the datastage it divides by.
     pub den: Option<DatastageId>,
-    /// `isParametricLoop_` together with `parametricLdsIdx_`.
+    /// Field: e011_LoopNode.isParametricLoop_
+    ///
+    /// Field: e011_LoopNode.parametricLdsIdx_
+    ///
+    /// `isParametricLoop_` (`:617`) TOGETHER WITH `parametricLdsIdx_` (`:618`).
     pub parametric_lds: Option<LdsIdx>,
+    /// Field: e011_LoopNode.loopCountSymbolIds_
+    ///
+    /// `loopCountSymbolIds_` (`:576-578`) — *"single value for pure symbolic and pivot dims, multiple
+    /// entries (max-pivot) for irregular dims"*, so a dim's entry is a LIST and an absent dim is the
+    /// `count(dim) == 0` [`Self::is_dim_symbolic`] reads.
+    pub loop_count_symbol_ids: BTreeMap<PrimaryDim, Vec<VariableSymbol>>,
 }
 
 impl LoopNode {
@@ -1405,6 +1431,7 @@ impl LoopNode {
             num: None,
             den: None,
             parametric_lds: None,
+            loop_count_symbol_ids: BTreeMap::new(),
         }
     }
 
@@ -1412,6 +1439,21 @@ impl LoopNode {
     #[must_use]
     pub fn primary_dims(&self) -> Vec<PrimaryDim> {
         self.dims.iter().map(|entry| entry.dim).collect()
+    }
+
+    /// `isDimSymbolic(dim)` (`dsc/dsc2.h:595-597`) — `loopCountSymbolIds_.count(dim) != 0`, which is
+    /// what decides whether the V3 lowering gives the `scf.for` a symbolic upper bound instead of a
+    /// counted one (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:918-937`).
+    #[must_use]
+    pub fn is_dim_symbolic(&self, dim: PrimaryDim) -> bool {
+        self.loop_count_symbol_ids.contains_key(&dim)
+    }
+
+    /// `hasLoopDim(dim)` (`dsc/dsc2.cpp:4223-4228`) — a linear scan of `dims_` that compares the
+    /// `dim_` half of each pair only, so a dim named at another `kind_` still matches.
+    #[must_use]
+    pub fn has_loop_dim(&self, dim: PrimaryDim) -> bool {
+        self.dims.iter().any(|entry| entry.dim == dim)
     }
 }
 
@@ -1542,38 +1584,103 @@ pub struct LoopCondComposite {
     pub negated: bool,
 }
 
-/// `dsc2::ConditionNode` (`dsc/dsc2.h:685`) — a block whose children are split into a then-region and
-/// an else-region, guarded by a loop predicate or a core/corelet set.
+/// THE TWO REGIONS A CONDITION HOLDS — `ConditionNode`'s inherited `next_` (`dsc/dsc2.h:529`) under
+/// this node's own documented assumption, *"max 2 children in next_, of type BLOCK: the 'then' and
+/// 'else' regions"* (`:688`).
 ///
-/// ⛔ `hasCoreClCond()` IS `loopCond_.twoLevelOrOfAnds_.empty()` IN THE REFERENCE, i.e. it answers
-/// "the core/corelet set is what guards this", not "the set is non-empty".
+/// ⛔ ALL THREE `DT_ERROR` ARMS OF `ConditionNode::addChildNode` (`dsc/dsc2.cpp:2143-2166`) ARE
+/// UNSPELLABLE HERE, not refused: a child that is not a `BLOCK`, a third child, and an
+/// `addElseRegion` with `next_` still empty.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CondRegions {
+    /// `next_` EMPTY — `new dsc2::ConditionNode()` (`dsc/dsc2.h:686`) before either region is added.
+    #[default]
+    Empty,
+    /// `next_.size() == 1` — a `getThenBranchNode()` with no else branch beside it.
+    Then(BlockNode),
+    /// `next_.size() == 2` — `next_[0]` and `next_[1]` (`dsc/dsc2.h:707`, `:713`).
+    ThenElse([BlockNode; 2]),
+}
+
+impl CondRegions {
+    /// `next_` IN ORDER, which is what `ConditionNode::getNextView` returns UNFILTERED for a
+    /// loop-guarded condition (`dsc/dsc2.cpp:1995-2011`).
+    #[must_use]
+    pub fn regions(&self) -> &[BlockNode] {
+        match self {
+            Self::Empty => &[],
+            Self::Then(then) => core::slice::from_ref(then),
+            Self::ThenElse(both) => both,
+        }
+    }
+
+    /// The same list, borrowed for the in-place edits a splice into a region performs.
+    pub fn regions_mut(&mut self) -> &mut [BlockNode] {
+        match self {
+            Self::Empty => &mut [],
+            Self::Then(then) => core::slice::from_mut(then),
+            Self::ThenElse(both) => both,
+        }
+    }
+
+    /// `getThenBranchNode()` (`dsc/dsc2.h:707`) — `next_[0]`, and its `nullptr` for an empty `next_`.
+    #[must_use]
+    pub const fn then_branch(&self) -> Option<&BlockNode> {
+        match self {
+            Self::Empty => None,
+            Self::Then(then) | Self::ThenElse([then, _]) => Some(then),
+        }
+    }
+
+    /// `getElseBranchNode()` (`:713`) — `next_[1]`, and its `nullptr` for `next_.size() < 2`.
+    #[must_use]
+    pub const fn else_branch(&self) -> Option<&BlockNode> {
+        match self {
+            Self::Empty | Self::Then(_) => None,
+            Self::ThenElse([_, otherwise]) => Some(otherwise),
+        }
+    }
+}
+
+/// Replaces: e012_ConditionNode
+///
+/// `dsc2::ConditionNode` (`dsc/dsc2.h:685`) — a block whose children ARE its then-region and its
+/// else-region, guarded by a loop predicate or by a core/corelet set.
+///
+/// ⛔ `hasCoreClCond()` IS `loopCond_.twoLevelOrOfAnds_.empty()` IN THE REFERENCE (`:693-695`), i.e.
+/// it answers "the core/corelet set is what guards this", not "the set is non-empty".
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConditionNode {
-    /// `name_`.
+    /// `name_` of the `BlockNode` base (`dsc/dsc2.h:526`).
     pub name: NodeName,
-    /// `loopCond_`.
+    /// Field: e012_ConditionNode.loopCond_
+    ///
+    /// `loopCond_` (`dsc/dsc2.h:690`).
     pub loop_cond: LoopCondComposite,
-    /// `coreClCond_`.
+    /// Field: e012_ConditionNode.coreClCond_
+    ///
+    /// `coreClCond_` (`:691-692`) — *"list of core/corelets the 'then' region applies to"*.
     pub core_cl_cond: BTreeMap<Core, BTreeSet<Corelet>>,
-    /// `addThenRegion(block)` — the children taken when the predicate holds.
-    pub then_region: Vec<SchedNode>,
-    /// `addElseRegion(block)` — the children taken otherwise.
-    pub else_region: Vec<SchedNode>,
+    /// Field: e012_ConditionNode.next_
+    ///
+    /// `next_` (`:529`) — the base's child vector, under this node's two-`BLOCK` assumption (`:688`).
+    pub next: CondRegions,
 }
 
 impl ConditionNode {
     /// `ConditionNode::addChildNode` (`dsc/dsc2.cpp:2143`) — the THEN region while none is stated and
     /// the ELSE region after, which is how the two blocks a `ddl.if` opens land in order.
     ///
-    /// ⛔ [`None`] IS *"ConditionNode only accepts 2 BlockNodes as children"*. The `nodeType_ != BLOCK`
-    /// half of that refusal is discharged by the argument type.
+    /// ⛔ [`None`] IS *"ConditionNode only accepts 2 BlockNodes as children"* AND IS NOW ITS ONLY
+    /// SPELLABLE ARM — the other two are discharged by the argument type and by [`CondRegions`].
     pub fn add_region(&mut self, block: BlockNode) -> Option<()> {
-        if self.then_region.is_empty() {
-            self.then_region.push(SchedNode::Block(block));
-        } else if self.else_region.is_empty() {
-            self.else_region.push(SchedNode::Block(block));
-        } else {
-            return None;
+        match core::mem::take(&mut self.next) {
+            CondRegions::Empty => self.next = CondRegions::Then(block),
+            CondRegions::Then(then) => self.next = CondRegions::ThenElse([then, block]),
+            both @ CondRegions::ThenElse(_) => {
+                self.next = both;
+                return None;
+            }
         }
         Some(())
     }
@@ -1961,9 +2068,8 @@ impl ScheduleTree {
     }
 
     /// The same search over the `CONDITION` nodes, which [`Self::find_block_mut`] descends THROUGH
-    /// and never yields — `dsc2::ConditionNode` is a `BlockNode` in the reference and this type
-    /// splits its two children into [`ConditionNode::then_region`] and
-    /// [`ConditionNode::else_region`], so reaching one by name is its own search.
+    /// and never yields — `dsc2::ConditionNode` is a `BlockNode` in the reference and this type holds
+    /// its two children in [`ConditionNode::next`], so reaching one by name is its own search.
     pub fn find_guarded_mut(
         &mut self,
         accepts: impl Fn(&ConditionNode) -> bool + Copy,
@@ -1998,8 +2104,10 @@ fn collect_blocks_in<'a>(children: &'a [SchedNode], found: &mut Vec<&'a BlockNod
             SchedNode::Loop(node) => collect_blocks(&node.block, found),
             SchedNode::Condition(inner) => collect_blocks(inner, found),
             SchedNode::Guarded(cond) => {
-                collect_blocks_in(&cond.then_region, found);
-                collect_blocks_in(&cond.else_region, found);
+                for region in cond.next.regions() {
+                    found.push(region);
+                    collect_blocks(region, found);
+                }
             }
             SchedNode::StickMask(_) | SchedNode::Sync(_) | SchedNode::Leaf(_) => {}
         }
@@ -2040,11 +2148,13 @@ fn find_block_mut_in(
                 }
             }
             SchedNode::Guarded(cond) => {
-                if let Some(found) = find_block_mut_in(&mut cond.then_region, accepts) {
-                    return Some(found);
-                }
-                if let Some(found) = find_block_mut_in(&mut cond.else_region, accepts) {
-                    return Some(found);
+                for region in cond.next.regions_mut() {
+                    if accepts(region) {
+                        return Some(region);
+                    }
+                    if let Some(found) = find_block_mut(region, accepts) {
+                        return Some(found);
+                    }
                 }
             }
             SchedNode::StickMask(_) | SchedNode::Sync(_) | SchedNode::Leaf(_) => {}
@@ -2082,11 +2192,10 @@ fn find_guarded_mut_in(
                 if accepts(cond) {
                     return Some(cond.as_mut());
                 }
-                if let Some(found) = find_guarded_mut_in(&mut cond.then_region, accepts) {
-                    return Some(found);
-                }
-                if let Some(found) = find_guarded_mut_in(&mut cond.else_region, accepts) {
-                    return Some(found);
+                for region in cond.next.regions_mut() {
+                    if let Some(found) = find_guarded_mut(region, accepts) {
+                        return Some(found);
+                    }
                 }
             }
             SchedNode::StickMask(_) | SchedNode::Sync(_) | SchedNode::Leaf(_) => {}
@@ -2126,11 +2235,10 @@ fn find_sync_mut_in(
                 }
             }
             SchedNode::Guarded(cond) => {
-                if let Some(found) = find_sync_mut_in(&mut cond.then_region, accepts) {
-                    return Some(found);
-                }
-                if let Some(found) = find_sync_mut_in(&mut cond.else_region, accepts) {
-                    return Some(found);
+                for region in cond.next.regions_mut() {
+                    if let Some(found) = find_sync_mut(region, accepts) {
+                        return Some(found);
+                    }
                 }
             }
             SchedNode::StickMask(_) | SchedNode::Leaf(_) => {}
@@ -2546,17 +2654,15 @@ mod tests_e014 {
     /// One `parametric_loop_<dim>(padded)`, with `numId_ = denId_ = -1` as its producer writes them.
     fn parametric(dim: PrimaryDim, lds: Option<u32>) -> LoopNode {
         LoopNode {
-            block: BlockNode {
-                name: NodeName(format!("parametric_loop_{}(padded)", dim.spelling())),
-                children: Vec::new(),
-            },
             dims: vec![LoopDim {
                 dim,
                 kind: MetaDimKind::Padded,
             }],
-            num: None,
-            den: None,
             parametric_lds: lds.map(LdsIdx),
+            ..LoopNode::bare(BlockNode {
+                name: NodeName(format!("parametric_loop_{}(padded)", dim.spelling())),
+                children: Vec::new(),
+            })
         }
     }
 
@@ -2588,6 +2694,112 @@ mod tests_e014 {
         assert_eq!(
             parametric(PrimaryDim::Out, None).parametric_stride(&Sdsc14),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e011 {
+    //! ⭐ A LOOP'S COUNT IS SYMBOLIC PER DIM — `loopCountSymbolIds_` (`dsc/dsc2.h:576-578`) is a map
+    //! from dim to a LIST of symbols, *"single value for pure symbolic and pivot dims, multiple
+    //! entries (max-pivot) for irregular dims"*.
+    //!
+    //! ⭐ AND THE TWO QUESTIONS THE REFERENCE ASKS READ DIFFERENT HALVES: `isDimSymbolic`
+    //! (`dsc/dsc2.h:595-597`) reads that map, while `hasLoopDim` (`dsc/dsc2.cpp:4223-4228`) scans
+    //! `dims_` comparing the `dim_` half of each pair only.
+
+    use super::{BlockNode, LoopDim, LoopNode, MetaDimKind, NodeName, PrimaryDim, VariableSymbol};
+
+    /// e011 — the map answers per dim, and `hasLoopDim` is blind to the `kind_` half of the pair.
+    #[test]
+    fn a_loops_count_is_symbolic_only_on_the_dims_its_symbol_map_names() {
+        let mut held = LoopNode::bare(BlockNode {
+            name: NodeName("loop_ds0_ds1_out_y".to_owned()),
+            children: Vec::new(),
+        });
+        held.dims = vec![
+            LoopDim {
+                dim: PrimaryDim::Out,
+                kind: MetaDimKind::Unpadded,
+            },
+            LoopDim {
+                dim: PrimaryDim::Y,
+                kind: MetaDimKind::Padded,
+            },
+        ];
+        // A max-pivot dim carries MORE THAN ONE symbol, which is why the value is a list.
+        held.loop_count_symbol_ids
+            .insert(PrimaryDim::Out, vec![VariableSymbol(7), VariableSymbol(8)]);
+
+        assert!(held.is_dim_symbolic(PrimaryDim::Out));
+        assert_eq!(
+            held.loop_count_symbol_ids
+                .get(&PrimaryDim::Out)
+                .map(Vec::len),
+            Some(2)
+        );
+        // ⛔ AN ABSENT DIM IS `count(dim) == 0`, i.e. a COUNTED loop, not a missing fact: `y` is a dim
+        // of this loop and still has no symbolic bound.
+        assert!(!held.is_dim_symbolic(PrimaryDim::Y));
+        assert!(
+            held.has_loop_dim(PrimaryDim::Y),
+            "padded, and still `dims_.first == y`"
+        );
+        assert!(!held.has_loop_dim(PrimaryDim::X));
+    }
+}
+
+#[cfg(test)]
+mod tests_e012 {
+    //! ⭐ `next_` IS THE THEN REGION THEN THE ELSE REGION — `addThenRegion` `DT_ERROR`s on a non-empty
+    //! `next_`, `addElseRegion` on an empty one *"ConditionNode does not have a 'then' region"* and on
+    //! a full one (`dsc/dsc2.cpp:2153-2167`), so ORDER IS THE ONLY WAY IN.
+
+    use std::collections::BTreeMap;
+
+    use super::{BlockNode, CondRegions, ConditionNode, LoopCondComposite, NodeName};
+
+    /// One region block, named as `coordinate_masking` names them (`ddc/ddcv1.cpp:3539-3560`).
+    fn region(name: &str) -> BlockNode {
+        BlockNode {
+            name: NodeName(name.to_owned()),
+            children: Vec::new(),
+        }
+    }
+
+    /// e012 — two regions land in order, and the third is the one refusal left.
+    #[test]
+    fn a_condition_takes_a_then_region_then_an_else_and_refuses_a_third() {
+        let mut held = ConditionNode {
+            name: NodeName("condition_SAMV_dim_out".to_owned()),
+            loop_cond: LoopCondComposite::default(),
+            core_cl_cond: BTreeMap::new(),
+            next: CondRegions::Empty,
+        };
+        assert_eq!(
+            held.next.then_branch(),
+            None,
+            "`new ConditionNode()` has no region"
+        );
+
+        assert_eq!(held.add_region(region("block_SAMV_dim_out")), Some(()));
+        assert_eq!(
+            held.next.then_branch(),
+            Some(&region("block_SAMV_dim_out")),
+            "the first region added IS `getThenBranchNode()`"
+        );
+        assert_eq!(held.next.else_branch(), None);
+
+        assert_eq!(held.add_region(region("block_SAMV_reset")), Some(()));
+        assert_eq!(held.next.else_branch(), Some(&region("block_SAMV_reset")));
+        assert_eq!(held.next.regions().len(), 2);
+
+        // ⛔ *"ConditionNode only accepts 2 BlockNodes as children"* (`dsc/dsc2.cpp:2143-2146`).
+        assert_eq!(held.add_region(region("block_third")), None);
+        assert_eq!(
+            held.next.regions().len(),
+            2,
+            "the refusal left both regions where they were"
         );
     }
 }

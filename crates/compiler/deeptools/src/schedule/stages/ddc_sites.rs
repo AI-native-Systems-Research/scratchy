@@ -44,8 +44,8 @@ use crate::schedule::ddc::transformation_util as tu;
 use crate::schedule::ddc::v1;
 use crate::schedule::ddl::conversion as conv;
 use crate::schedule::dsc2::{
-    BlockNode, ComputeNode, ConditionNode, LdsIdx, LoopNode, NodeName, SyncNode, SyncUnits,
-    TransferNode, WordLength,
+    BlockNode, ComputeNode, CondRegions, ConditionNode, LdsIdx, LoopNode, NodeName, SyncNode,
+    SyncUnits, TransferNode, WordLength,
 };
 use crate::schedule::l3::dl_ops::AddressFoldCoords;
 use crate::schedule::l3::dsc::{DscIdx, Symbolic, SymbolicDimInfo, WkSlice};
@@ -1468,7 +1468,7 @@ impl conv::ScheduleWrites for Dsc2Ddl<'_, '_> {
     /// ([`conv::op_if`], [`conv::op_sync`]'s corelet split), and the blocks that fill them are minted
     /// under this node by [`Self::add_block`] — which is where the tree records them.
     fn add_condition(&mut self, parent: NodeId, held: ConditionNode) -> Option<NodeId> {
-        if !held.then_region.is_empty() || !held.else_region.is_empty() {
+        if !matches!(held.next, CondRegions::Empty) {
             return None;
         }
         let tree = self.state.tree(self.dsc)?;

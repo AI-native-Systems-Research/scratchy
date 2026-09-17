@@ -37,7 +37,7 @@ use crate::arch::{Arch, Bytes};
 use crate::schedule::ddc::fold::{AllocId, NodeId};
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::v1;
-use crate::schedule::dsc2::{LdsIdx, LoopDim, LoopNode, StartAddress};
+use crate::schedule::dsc2::{LdsIdx, LoopNode, StartAddress};
 use crate::schedule::l3::capacity::{
     AllocSizing, AncestorLoops, BytesForm, DscSizing, SampledBuffer, StickRounding, buffer_capacity,
 };
@@ -130,18 +130,12 @@ fn ancestor_loop_nodes(tree: &super::state::DscTree, node: NodeId) -> Vec<LoopNo
             tree.with(|held| {
                 let minted = held.loop_node(at)?;
                 Some(LoopNode {
-                    block: super::ddc_store2::head_block_of(held, at.0),
-                    dims: minted
-                        .dims
-                        .iter()
-                        .map(|entry| LoopDim {
-                            dim: entry.dim,
-                            kind: entry.kind,
-                        })
-                        .collect(),
+                    // ⭐ `dims_` NEEDS NO CONVERSION: `tu::PrimaryDimAndKind` IS
+                    // [`crate::schedule::dsc2::LoopDim`], one Rust type for `dsc/dims.h:76`.
+                    dims: minted.dims.iter().collect(),
                     num: Some(minted.num),
                     den: Some(minted.den),
-                    parametric_lds: None,
+                    ..LoopNode::bare(super::ddc_store2::head_block_of(held, at.0))
                 })
             })
         })

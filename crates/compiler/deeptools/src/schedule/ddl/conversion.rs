@@ -187,11 +187,11 @@ use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::ddl::{DdlModuleOp, DdlSource};
 use crate::schedule::dsc2::{
     AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeMask, ComputeNode,
-    CondOp as DscCondOp, ConditionNode, DataInfo, Dsts, Hops, InstrAttribute, LdsIdx, LoopBound,
-    LoopCond as DscLoopCond, LoopCondComposite as DscLoopCondComposite, LoopDim, LoopNode,
-    MaxDimSize, NodeName, NumBuffers, NumChunks, Operand as DscOperand, PackIndex, Padding,
-    Repetition, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode, SyncStrength,
-    SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
+    CondOp as DscCondOp, CondRegions, ConditionNode, DataInfo, Dsts, Hops, InstrAttribute, LdsIdx,
+    LoopBound, LoopCond as DscLoopCond, LoopCondComposite as DscLoopCondComposite, LoopDim,
+    LoopNode, MaxDimSize, NodeName, NumBuffers, NumChunks, Operand as DscOperand, PackIndex,
+    Padding, Repetition, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode,
+    SyncStrength, SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
 };
 use crate::schedule::l3::dsc::{
     CoreCount, CoreletsUsed, DesignSpaceConfig, EmptyStage, PadSizes, WkSlice, WkSliceId,
@@ -3157,14 +3157,13 @@ fn op_loop<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
     let node = ctx.site.add_loop(
         ctx.curr_parent,
         LoopNode {
-            block: BlockNode {
-                name: name.clone(),
-                children: Vec::new(),
-            },
             dims,
             num: Some(num),
             den: Some(den),
-            parametric_lds: None,
+            ..LoopNode::bare(BlockNode {
+                name: name.clone(),
+                children: Vec::new(),
+            })
         },
     )?;
     ctx.state.record(&name, node);
@@ -3718,8 +3717,7 @@ fn op_if<S: DdlSite + ?Sized>(
             name: name.clone(),
             loop_cond: dsc_loop_cond(&prop.loop_cond),
             core_cl_cond: prop.core_cl_cond.0.clone(),
-            then_region: Vec::new(),
-            else_region: Vec::new(),
+            next: CondRegions::Empty,
         },
     )?;
     ctx.state.record(&name, node);
@@ -3995,8 +3993,7 @@ fn op_sync<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Opti
                 name: guard.clone(),
                 loop_cond: DscLoopCondComposite::default(),
                 core_cl_cond,
-                then_region: Vec::new(),
-                else_region: Vec::new(),
+                next: CondRegions::Empty,
             },
         )?;
         ctx.state.record(&guard, guard_node);
@@ -4790,8 +4787,17 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
                 SchedNode::Loop(held) => out.push(self.loop_op(held)?),
                 SchedNode::Guarded(held) => {
                     let cond = self.cond(held);
-                    let then_region = self.region(&held.then_region)?;
-                    let else_region = self.region(&held.else_region)?;
+                    // ⭐ EACH REGION'S OWN CHILDREN — `getThenBranchNode()`/`getElseBranchNode()`
+                    // (`dsc/dsc2.h:707`, `:713`) are the two `BLOCK`s, and a region a
+                    // `new ConditionNode()` never got is EMPTY here, exactly as their `nullptr` is.
+                    let then_region = match held.next.then_branch() {
+                        Some(block) => self.region(&block.children)?,
+                        None => Vec::new(),
+                    };
+                    let else_region = match held.next.else_branch() {
+                        Some(block) => self.region(&block.children)?,
+                        None => Vec::new(),
+                    };
                     out.push(EmittedOp::If {
                         name: held.name.clone(),
                         cond,
@@ -6308,10 +6314,11 @@ mod unit_tests {
     use crate::schedule::ddc::transformation_util::{LoopCond, StageName};
     use crate::schedule::ddc::v1::CoreClSet;
     use crate::schedule::dsc2::{
-        AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeNode, ConditionNode, DataInfo,
-        Dsts, LayoutDims, LdsIdx, LoopDim, LoopNode, MaxDimSize, NodeName, NumBuffers, NumChunks,
-        Operand as DscOperand, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode,
-        SyncStrength, SyncUnits, TransferNode, TransferPadding, WordLength,
+        AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeNode, CondRegions,
+        ConditionNode, DataInfo, Dsts, LayoutDims, LdsIdx, LoopDim, LoopNode, MaxDimSize, NodeName,
+        NumBuffers, NumChunks, Operand as DscOperand, ReplicationFactor, SchedNode, StartAddress,
+        SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, TransferPadding,
+        WordLength,
     };
     use crate::schedule::l3::dsc::{
         CoreCount, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DimPadding,
@@ -7509,17 +7516,16 @@ mod unit_tests {
             .add_loop(
                 head,
                 LoopNode {
-                    block: BlockNode {
-                        name: held.clone(),
-                        children: Vec::new(),
-                    },
                     dims: vec![LoopDim {
                         dim: PrimaryDim::X,
                         kind: MetaDimKind::Unpadded,
                     }],
                     num: Some(Metadata::CORE_DSTGID),
                     den: Some(Metadata::CHUNK_DSTGID),
-                    parametric_lds: None,
+                    ..LoopNode::bare(BlockNode {
+                        name: held.clone(),
+                        children: Vec::new(),
+                    })
                 },
             )
             .expect("the loop");
@@ -7837,16 +7843,20 @@ mod unit_tests {
                 }
                 TestNode::Condition(held) => {
                     let mut cond = (**held).clone();
-                    let regions: Vec<SchedNode> = self
+                    // ⭐ EACH REGION IS A `BLOCK` — `getThenBranchNode()`/`getElseBranchNode()`
+                    // (`dsc/dsc2.h:707`, `:713`) name `next_[0]` and `next_[1]`, so the tree's two
+                    // region children read back as blocks and a third child is unspellable.
+                    let mut regions = self
                         .children
                         .get(&at)
                         .map_or(&[][..], Vec::as_slice)
                         .iter()
-                        .filter_map(|child| self.sched_of(*child))
-                        .collect();
-                    let mut regions = regions.into_iter();
-                    cond.then_region = regions.next().into_iter().collect();
-                    cond.else_region = regions.collect();
+                        .map(|child| self.block_of(*child));
+                    cond.next = match (regions.next(), regions.next()) {
+                        (None, _) => CondRegions::Empty,
+                        (Some(then), None) => CondRegions::Then(then),
+                        (Some(then), Some(otherwise)) => CondRegions::ThenElse([then, otherwise]),
+                    };
                     SchedNode::Guarded(Box::new(cond))
                 }
                 TestNode::Sync(held) => SchedNode::Sync((**held).clone()),
@@ -8517,10 +8527,10 @@ mod unit_tests {
             panic!("the condition node the unresolved `ddl.if` minted");
         };
         assert_eq!(
-            cond.then_region
+            cond.next
+                .regions()
                 .iter()
-                .chain(cond.else_region.iter())
-                .map(|child| child.name().clone())
+                .map(|block| block.name.clone())
                 .collect::<Vec<_>>(),
             vec![
                 NodeName("condition_region0".to_owned()),

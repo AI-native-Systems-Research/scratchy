@@ -192,12 +192,12 @@ use crate::schedule::ddl::conversion::{
 };
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::dsc2::{
-    AddressFold, AllocateNode, BlockNode, CondOp, ComputeNode, ConditionNode, Coordinate,
-    DataInfo, Dsc, Dsts, FoldCoeff, FoldDim, FoldPosition, LdsIdx, LdsScale, LoopBound, LoopCond,
-    LoopCondComposite, MaxDimSize, NodeName, NumBuffers, NumChunks, Operand, Padding, Precision,
-    RegSlot, ReplicationFactor, SchedNode, Size, SizeAndIndex, StartAddress, StickDimIdx,
-    StickMaskNode, SyncNode, TransferKind, TransferNode, TransferPadding, Unroll, Via, WordLength,
-    generic_comp,
+    AddressFold, AllocateNode, BlockNode, CondOp, CondRegions, ComputeNode, ConditionNode,
+    Coordinate, DataInfo, Dsc, Dsts, FoldCoeff, FoldDim, FoldPosition, LdsIdx, LdsScale, LoopBound,
+    LoopCond, LoopCondComposite, MaxDimSize, NodeName, NumBuffers, NumChunks, Operand, Padding,
+    Precision, RegSlot, ReplicationFactor, SchedNode, Size, SizeAndIndex, StartAddress,
+    StickDimIdx, StickMaskNode, SyncNode, TransferKind, TransferNode, TransferPadding, Unroll, Via,
+    WordLength, generic_comp,
 };
 use crate::schedule::l3::dsc::{DimPadding, DscIdx, SuperDsc, SymbolicDimInfo, UnneededPad};
 use crate::units::{Core, Corelet, Row};
@@ -3592,14 +3592,18 @@ where
                     negated: false,
                 },
                 core_cl_cond: BTreeMap::new(),
-                then_region: vec![SchedNode::Block(BlockNode {
-                    name: NodeName(format!("block_SAMV_dim_{spelling}")),
-                    children: vec![SchedNode::StickMask(Box::new(mask.clone()))],
-                })],
-                else_region: vec![SchedNode::Block(BlockNode {
-                    name: NodeName("block_SAMV_reset".to_owned()),
-                    children: vec![SchedNode::StickMask(Box::new(reset))],
-                })],
+                // ⭐ BOTH REGIONS AT ONCE — `addThenRegion(maskBlock)` then `addElseRegion(resetBlock)`
+                // (`dsc/dsc2.h:698-699`), which is the only order the reference admits.
+                next: CondRegions::ThenElse([
+                    BlockNode {
+                        name: NodeName(format!("block_SAMV_dim_{spelling}")),
+                        children: vec![SchedNode::StickMask(Box::new(mask.clone()))],
+                    },
+                    BlockNode {
+                        name: NodeName("block_SAMV_reset".to_owned()),
+                        children: vec![SchedNode::StickMask(Box::new(reset))],
+                    },
+                ]),
             },
         )?;
     }

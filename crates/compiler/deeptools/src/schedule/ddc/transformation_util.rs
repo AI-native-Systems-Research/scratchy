@@ -482,14 +482,12 @@ impl<D> DataStages<D> {
     }
 }
 
-/// ONE LOOP DIM AND WHAT KIND OF EXTENT IT WALKS — `PrimaryDimAndKind` (`dsc/dims.h:76`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PrimaryDimAndKind {
-    /// `dim_`, whose `PrimaryDimTypesCount` default this type does not admit.
-    pub dim: PrimaryDim,
-    /// `kind_`.
-    pub kind: MetaDimKind,
-}
+/// ONE LOOP DIM AND WHAT KIND OF EXTENT IT WALKS — `PrimaryDimAndKind` (`dsc/dims.h:76`) under its
+/// C++ name.
+///
+/// ⭐ ONE C++ DECLARATION, ONE RUST TYPE: this IS [`crate::schedule::dsc2::LoopDim`], so the pair
+/// this half of the port builds is the pair `LoopNode::dims_` holds on the other.
+pub use crate::schedule::dsc2::LoopDim as PrimaryDimAndKind;
 
 /// A LOOP'S DIMS, NON-EMPTY — entry 114's *"Cannot construct loop with no dimensions"*
 /// (`ddc/ddc_transformation_util.cpp:141`) made unspellable.

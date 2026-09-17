@@ -42,7 +42,9 @@ use crate::schedule::ddc::metadata::MetaDimKind;
 use crate::schedule::ddc::transformation::LoopId;
 use crate::schedule::ddc::transformation_util::InsertionPoint;
 use crate::schedule::ddc::v1;
-use crate::schedule::dsc2::{ComputeNode, ConditionNode, NodeName, SchedNode, TransferNode};
+use crate::schedule::dsc2::{
+    ComputeNode, CondRegions, ConditionNode, NodeName, SchedNode, TransferNode,
+};
 use crate::units::Corelet;
 
 use super::ddc_state::Dsc2State;
@@ -646,9 +648,10 @@ fn compute_of(tree: &TreeData, node: NodeId) -> Option<ComputeNode> {
 /// [`super::Dsc2Store`]'s `sched_node_of` performs, so a condition minted here and read back reports
 /// the same guard.
 ///
-/// ⛔ A REGION ENTRY THAT IS NOT A BLOCK IS THE REFERENCE'S OWN *"ConditionNode only accepts 2
-/// BlockNodes as children"* (`dsc/dsc2.cpp:2143`), already ported as
-/// [`crate::schedule::dsc2::ConditionNode::add_region`]'s [`None`].
+/// ⛔ A REGION THE CONDITION NEVER GOT IS SKIPPED, not minted empty: [`CondRegions::then_branch`] and
+/// [`CondRegions::else_branch`] are the reference's own `nullptr`-returning getters (`dsc/dsc2.h:707`,
+/// `:713`), and *"ConditionNode only accepts 2 BlockNodes as children"* (`dsc/dsc2.cpp:2143`) is
+/// discharged by that type rather than refused here.
 fn mint_condition(tree: &mut TreeData, held: &ConditionNode, at: InsertionPoint) -> Option<NodeId> {
     let (loop_cond, cores) = if held.has_core_cl_cond() {
         (None, Some(v1::CoreClSet(held.core_cl_cond.clone())))
@@ -666,16 +669,17 @@ fn mint_condition(tree: &mut TreeData, held: &ConditionNode, at: InsertionPoint)
         None,
     );
     tree.link(condition, at);
-    for (region, then_region) in [(&held.then_region, true), (&held.else_region, false)] {
-        for entry in region {
-            let SchedNode::Block(block) = entry else {
-                return None;
-            };
-            let node = tree.add(block.name.clone(), Kind::Block, None);
-            tree.add_region(condition, node, then_region);
-            for child in &block.children {
-                mint_sched_node(tree, child, InsertionPoint::LastIn(node))?;
-            }
+    for (region, then_region) in [
+        (held.next.then_branch(), true),
+        (held.next.else_branch(), false),
+    ] {
+        let Some(block) = region else {
+            continue;
+        };
+        let node = tree.add(block.name.clone(), Kind::Block, None);
+        tree.add_region(condition, node, then_region);
+        for child in &block.children {
+            mint_sched_node(tree, child, InsertionPoint::LastIn(node))?;
         }
     }
     Some(condition)
@@ -755,8 +759,8 @@ mod tests {
     use crate::schedule::ddc::transformation_util::{InsertionPoint, PaddingForm};
     use crate::schedule::ddl::ops::DdlComputeType;
     use crate::schedule::dsc2::{
-        BlockNode, ComputeNode, CondOp, ConditionNode, DataInfo, InstrAttribute, LayoutDims,
-        LdsIdx, LoopBound, LoopCond, LoopCondComposite, NodeName, Operand, SchedNode,
+        BlockNode, ComputeNode, CondOp, CondRegions, ConditionNode, DataInfo, InstrAttribute,
+        LayoutDims, LdsIdx, LoopBound, LoopCond, LoopCondComposite, NodeName, Operand, SchedNode,
         StickMaskNode,
     };
     use crate::units::{Core, Corelet, NumFolds};
@@ -891,14 +895,16 @@ mod tests {
                 negated: false,
             },
             core_cl_cond: BTreeMap::new(),
-            then_region: vec![SchedNode::Block(BlockNode {
-                name: NodeName("block_SAMV_dim_out".to_owned()),
-                children: vec![SchedNode::StickMask(Box::new(a_mask("SAMV_out", true)))],
-            })],
-            else_region: vec![SchedNode::Block(BlockNode {
-                name: NodeName("block_SAMV_reset".to_owned()),
-                children: vec![SchedNode::StickMask(Box::new(a_mask("SAMV_reset", false)))],
-            })],
+            next: CondRegions::ThenElse([
+                BlockNode {
+                    name: NodeName("block_SAMV_dim_out".to_owned()),
+                    children: vec![SchedNode::StickMask(Box::new(a_mask("SAMV_out", true)))],
+                },
+                BlockNode {
+                    name: NodeName("block_SAMV_reset".to_owned()),
+                    children: vec![SchedNode::StickMask(Box::new(a_mask("SAMV_reset", false)))],
+                },
+            ]),
         }
     }
 
@@ -1031,11 +1037,10 @@ mod tests {
                 name: NodeName("condition_core3".to_owned()),
                 loop_cond: LoopCondComposite::default(),
                 core_cl_cond: cores.clone(),
-                then_region: vec![SchedNode::Block(BlockNode {
+                next: CondRegions::Then(BlockNode {
                     name: NodeName("block_core3".to_owned()),
                     children: Vec::new(),
-                })],
-                else_region: Vec::new(),
+                }),
             },
             InsertionPoint::Before(before),
         )
@@ -1079,22 +1084,6 @@ mod tests {
                 "{arm:?} names a node whose payload this tree would have to invent"
             );
         }
-        // ⛔ AND A REGION ENTRY THAT IS NOT A BLOCK IS *"ConditionNode only accepts 2 BlockNodes as
-        // children"* (`dsc/dsc2.cpp:2143`).
-        assert_eq!(
-            mint_condition(
-                &mut tree,
-                &ConditionNode {
-                    name: NodeName("condition_bad_region".to_owned()),
-                    loop_cond: LoopCondComposite::default(),
-                    core_cl_cond: BTreeMap::new(),
-                    then_region: vec![SchedNode::StickMask(Box::new(a_mask("SAMV_out", true)))],
-                    else_region: Vec::new(),
-                },
-                InsertionPoint::LastIn(before),
-            ),
-            None
-        );
     }
 
     /// ⭐ `isParametricLoop()` IS `false` FOR EVERY LOOP THIS TREE CAN HOLD, and the reason is a TYPE and
@@ -1116,11 +1105,10 @@ mod tests {
             children: Vec::new(),
         };
         let plain = LoopNode {
-            block: block.clone(),
             dims: dims.clone(),
             num: Some(crate::schedule::ddc::metadata::DatastageId(0)),
             den: Some(crate::schedule::ddc::metadata::DatastageId(1)),
-            parametric_lds: None,
+            ..LoopNode::bare(block)
         };
         let minted = mint_sched_node(
             &mut tree,

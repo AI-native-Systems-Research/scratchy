@@ -589,34 +589,31 @@ mod tests_e015 {
     /// `parametric_loop_<dim>(padded)` — `parametricLdsIdx_: 1`, no `numId_` and no `denId_`.
     pub(super) fn parametric(name: &str, dim: PrimaryDim) -> LoopNode {
         LoopNode {
-            block: BlockNode {
-                name: NodeName(name.to_owned()),
-                children: Vec::new(),
-            },
             dims: vec![LoopDim {
                 dim,
                 kind: MetaDimKind::Padded,
             }],
-            num: None,
-            den: None,
             parametric_lds: Some(LdsIdx(1)),
+            ..LoopNode::bare(BlockNode {
+                name: NodeName(name.to_owned()),
+                children: Vec::new(),
+            })
         }
     }
 
     /// `loop_ds1_ds<den>_<dim>` — an ordinary loop dividing `dim` by datastage `den`.
     pub(super) fn dividing(name: &str, dim: PrimaryDim, den: DatastageId) -> LoopNode {
         LoopNode {
-            block: BlockNode {
-                name: NodeName(name.to_owned()),
-                children: Vec::new(),
-            },
             dims: vec![LoopDim {
                 dim,
                 kind: MetaDimKind::Unpadded,
             }],
             num: Some(DatastageId(1)),
             den: Some(den),
-            parametric_lds: None,
+            ..LoopNode::bare(BlockNode {
+                name: NodeName(name.to_owned()),
+                children: Vec::new(),
+            })
         }
     }
 

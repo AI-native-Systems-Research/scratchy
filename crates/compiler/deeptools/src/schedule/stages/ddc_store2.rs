@@ -1736,23 +1736,16 @@ pub(super) fn head_block_of(tree: &super::tree::TreeData, block: NodeId) -> Bloc
 /// restate what the match already proved. Three stops came off this function that way.
 fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule::dsc2::SchedNode {
     use super::tree::Kind;
-    use crate::schedule::dsc2::{LoopDim, SchedNode};
+    use crate::schedule::dsc2::{CondRegions, SchedNode};
 
     match tree.kind_of(node) {
         Some(Kind::Block) => SchedNode::Block(head_block_of(tree, node)),
         Some(Kind::Loop(held)) => {
             SchedNode::Loop(Box::new(crate::schedule::dsc2::LoopNode {
-                block: head_block_of(tree, node),
                 // `dims_` — the SAME order [`tu::LoopDims`] states, which is the order the loop's own
-                // name spells them in.
-                dims: held
-                    .dims
-                    .iter()
-                    .map(|entry| LoopDim {
-                        dim: entry.dim,
-                        kind: entry.kind,
-                    })
-                    .collect(),
+                // name spells them in, AND NO CONVERSION: `tu::PrimaryDimAndKind` IS
+                // [`crate::schedule::dsc2::LoopDim`], one Rust type for `dsc/dims.h:76`.
+                dims: held.dims.iter().collect(),
                 // ⭐ `numId_`/`denId_` ARE NOT OPTIONAL ON THE STORED VIEW — *"every callsite of the
                 // constructor passes a real pair"* ([`tu::LoopNode`]) — so both are `Some` here and the
                 // `-1` a `dsc2::LoopNode` admits is the DDL's parametric loop, not this one.
@@ -1760,12 +1753,14 @@ fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule:
                 den: Some(held.den),
                 // ⛔ `isParametricLoop_ = false` / `parametricLdsIdx_ = -1`, the member initializers of
                 // `dsc/dsc2.h:617-618`. See [`v1::Dsc2Store::schedule_head_block`] for the two — and
-                // only two — writers, neither of which has run.
-                parametric_lds: None,
+                // only two — writers, neither of which has run. `loopCountSymbolIds_` (`:576`) is empty
+                // for the same reason: its one writer is `finalizeScheduleTree`
+                // (`dsc/dsc2.cpp:2999-3005`), which this path does not reach.
+                ..crate::schedule::dsc2::LoopNode::bare(head_block_of(tree, node))
             }))
         }
         Some(Kind::Condition(held)) => {
-            // ⭐ THE TWO REGIONS AS `addThenRegion`/`addElseRegion` FILLED THEM, each a list of BLOCKS
+            // ⭐ THE TWO REGIONS AS `addThenRegion`/`addElseRegion` FILLED THEM, each a BLOCK
             // (`dsc/dsc2.cpp:2143`'s *"ConditionNode only accepts 2 BlockNodes as children"*).
             SchedNode::Guarded(Box::new(crate::schedule::dsc2::ConditionNode {
                 name: tree.name(node).unwrap_or_default(),
@@ -1779,16 +1774,18 @@ fn sched_node_of(tree: &super::tree::TreeData, node: NodeId) -> crate::schedule:
                     .as_ref()
                     .map(|set| set.0.clone())
                     .unwrap_or_default(),
-                then_region: held
-                    .then_region
-                    .iter()
-                    .map(|child| SchedNode::Block(head_block_of(tree, *child)))
-                    .collect(),
-                else_region: held
-                    .else_region
-                    .iter()
-                    .map(|child| SchedNode::Block(head_block_of(tree, *child)))
-                    .collect(),
+                // ⭐ `next_[0]` AND `next_[1]` — `getThenBranchNode()`/`getElseBranchNode()`
+                // (`dsc/dsc2.h:707`, `:713`). AN ELSE WITH NO THEN NAMES NO REFERENCE STATE: it is the
+                // arm `addElseRegion` itself `DT_ERROR`s on, *"ConditionNode does not have a 'then'
+                // region"* (`dsc/dsc2.cpp:2163-2164`).
+                next: match (held.then_region.first(), held.else_region.first()) {
+                    (None, _) => CondRegions::Empty,
+                    (Some(then), None) => CondRegions::Then(head_block_of(tree, *then)),
+                    (Some(then), Some(otherwise)) => CondRegions::ThenElse([
+                        head_block_of(tree, *then),
+                        head_block_of(tree, *otherwise),
+                    ]),
+                },
             }))
         }
         Some(Kind::Sync(held)) => SchedNode::Sync(held.clone()),
@@ -2090,8 +2087,7 @@ mod authority_tests {
                         core(0),
                         BTreeSet::from([crate::units::Corelet::at::<0>()]),
                     )]),
-                    then_region: Vec::new(),
-                    else_region: Vec::new(),
+                    next: crate::schedule::dsc2::CondRegions::Empty,
                 },
             )
             .expect("the tree took the condition");
