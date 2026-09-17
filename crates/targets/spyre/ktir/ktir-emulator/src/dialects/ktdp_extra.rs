@@ -97,10 +97,7 @@ fn coreid(
     let mut coords: Vec<i64> = op
         .operands
         .iter()
-        .map(|&v| {
-            ctx.get_value(v)
-                .and_then(|v| scalar_i64(v, "coreid coord"))
-        })
+        .map(|&v| ctx.get_value(v).and_then(|v| scalar_i64(v, "coreid coord")))
         .collect::<Result<_, _>>()?;
 
     // Pad to 3 dims with trailing zeros, then read (x, y, z).

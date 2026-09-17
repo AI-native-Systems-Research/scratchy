@@ -248,8 +248,8 @@ pub fn node_partition_dims(func: &IRFunction, node: &NodeSpec) -> PartitionDims 
     let mut writes: Vec<(u64, Option<usize>)> = Vec::new();
 
     #[allow(clippy::too_many_arguments)]
-    fn walk<'a>(
-        ops: &'a [Operation],
+    fn walk(
+        ops: &[Operation],
         arg_tensor: &HashMap<Ssa, u64>,
         pid: &mut Option<Ssa>,
         view_arg: &mut HashMap<Ssa, Ssa>,
@@ -762,7 +762,7 @@ pub fn fuse_program<'a>(
         // Stores on dropped tiles: drop the store itself.
         for st in &an.stores {
             if drop_results.contains(&st.tile) {
-                drop_store_tiles.insert(st.tile.clone());
+                drop_store_tiles.insert(st.tile);
             }
         }
 
@@ -1019,10 +1019,10 @@ fn collect_loads_stores(
                         && !ti.offsets.is_empty()
                         && ti.offsets.len() == ti.shape.len();
                     loads.push(LoadChain {
-                        arg: arg.clone(),
-                        loaded: loaded.clone(),
-                        view: ti.view.clone(),
-                        tile: tile_ssa.clone(),
+                        arg: *arg,
+                        loaded,
+                        view: ti.view,
+                        tile: *tile_ssa,
                         whole_tensor: whole,
                         offsets: ti.offsets.clone(),
                         tile_shape: ti.shape.clone(),
@@ -1038,9 +1038,9 @@ fn collect_loads_stores(
                 {
                     let whole = !ti.shape.is_empty() && &ti.shape == vshape;
                     stores.push(StoreChain {
-                        arg: arg.clone(),
-                        stored: stored.clone(),
-                        tile: tile_ssa.clone(),
+                        arg: *arg,
+                        stored: *stored,
+                        tile: *tile_ssa,
                         whole_tensor: whole,
                         view_shape: vshape.clone(),
                     });

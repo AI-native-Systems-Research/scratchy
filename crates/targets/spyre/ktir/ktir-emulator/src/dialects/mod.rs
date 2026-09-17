@@ -97,7 +97,10 @@ impl Dispatch {
 
     /// Latency category, defaulting to `Zero` — mirrors `get_latency_category`.
     pub fn latency_category(&self, op: OpKind) -> LatencyCategory {
-        self.latency.get(&op).copied().unwrap_or(LatencyCategory::Zero)
+        self.latency
+            .get(&op)
+            .copied()
+            .unwrap_or(LatencyCategory::Zero)
     }
 }
 

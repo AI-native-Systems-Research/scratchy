@@ -23,13 +23,13 @@
 //! `_YieldResult` analogue). It has no SSA result name, so the value is not
 //! bound into scope — it is observed only by the enclosing for/if driver.
 
-use crate::attrkey::AttrKey;
-use crate::opkind::OpKind;
 use super::{Dispatch, LatencyCategory};
+use crate::attrkey::AttrKey;
 use crate::context::CoreContext;
 use crate::env::ExecutionEnv;
 use crate::interpreter::execute_op;
 use crate::ir::{Attr, Operation, Scalar, Ssa, Value};
+use crate::opkind::OpKind;
 
 pub fn register(d: &mut Dispatch) {
     d.register(OpKind::ScfFor, LatencyCategory::Zero, scf_for);
@@ -40,7 +40,11 @@ pub fn register(d: &mut Dispatch) {
     // linalg.reduce / tensor.generate) binds the block-arg names to its values.
     // Mirrors Python `region__bb0_args`. A registered no-op keeps it out of the
     // dispatch-coverage "no handler" set when a region body runs op-by-op.
-    d.register(OpKind::RegionBb0Args, LatencyCategory::Zero, region_bb0_args);
+    d.register(
+        OpKind::RegionBb0Args,
+        LatencyCategory::Zero,
+        region_bb0_args,
+    );
 }
 
 /// No-op handler for the synthetic `region.bb0_args` op. See [`register`].

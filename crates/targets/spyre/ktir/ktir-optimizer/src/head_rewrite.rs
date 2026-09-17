@@ -822,6 +822,17 @@ fn recognize_head_decode(
     })
 }
 
+/// The ROW-MAJOR f32 buffers [`DecodeAttnIsland::compute_f32`] reads, already decoded from HBM.
+/// See that method's doc for each field's shape.
+pub struct DecodeAttnInputs<'a> {
+    pub q: &'a [f32],
+    pub mask: &'a [f32],
+    pub kc: &'a [f32],
+    pub kd: &'a [f32],
+    pub vc: &'a [f32],
+    pub vd: &'a [f32],
+}
+
 impl DecodeAttnIsland {
     /// Compute the fused m=1 attention into `o` (the `[1, q_cols]` output row), in
     /// f32, reproducing the decomposed path's exact arithmetic per head:
@@ -841,7 +852,7 @@ impl DecodeAttnIsland {
     ///
     /// f32 accumulation throughout — TIGHTER than the decomposed f16-intermediate
     /// path, so well inside the golden band.
-    #[allow(clippy::too_many_arguments)]
+    ///
     /// One past the LAST context row that can affect the result — the rest are dead.
     ///
     /// A `-inf` mask entry makes `sc[j] = scale*dot + mask[j]` exactly `-inf` (the dot is
@@ -861,16 +872,15 @@ impl DecodeAttnIsland {
             .map_or(0, |i| i + 1)
     }
 
-    pub fn compute_f32(
-        &self,
-        q: &[f32],
-        mask: &[f32],
-        kc: &[f32],
-        kd: &[f32],
-        vc: &[f32],
-        vd: &[f32],
-        o: &mut [f32],
-    ) {
+    pub fn compute_f32(&self, inputs: DecodeAttnInputs<'_>, o: &mut [f32]) {
+        let DecodeAttnInputs {
+            q,
+            mask,
+            kc,
+            kd,
+            vc,
+            vd,
+        } = inputs;
         let d = self.d as usize;
         // The DEAD tail of the context is skipped, so `kc`/`vc` need only hold this many
         // rows — which is what lets the caller avoid decoding the whole capacity.
@@ -1914,7 +1924,17 @@ mod tests {
         let vd: Vec<f32> = (0..dn).map(|i| f(i, 6)).collect();
 
         let mut got = vec![0.0f32; qn];
-        isl.compute_f32(&q, &mask, &kc, &kd, &vc, &vd, &mut got);
+        isl.compute_f32(
+            DecodeAttnInputs {
+                q: &q,
+                mask: &mask,
+                kc: &kc,
+                kd: &kd,
+                vc: &vc,
+                vd: &vd,
+            },
+            &mut got,
+        );
         let want = ref_decode(&isl, &q, &mask, &kc, &kd, &vc, &vd);
         let max_abs = got
             .iter()

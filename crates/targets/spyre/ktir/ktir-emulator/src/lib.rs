@@ -25,7 +25,9 @@
 extern crate blas_src;
 
 // Re-export the core IR/parse/codec layer at this crate's root.
-pub use ktir_core::{affine, arena, attrkey, codec, dtypes, fxhash, ir, irtype, memref, opkind, tile};
+pub use ktir_core::{
+    affine, arena, attrkey, codec, dtypes, fxhash, ir, irtype, memref, opkind, tile,
+};
 
 // Re-export the optimizer (whole-program fusion / ProgramSpec / plan_segments)
 // when the `optimizer` feature is on, so consumers reach it through ktir-emulator
