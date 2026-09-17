@@ -1271,6 +1271,11 @@ pub struct Size {
     /// Field: e009_ScheduleNode.size_
     ///
     /// `size_` (`:488`).
+    ///
+    /// ⚠️ ONE LIST, TWO DENOMINATIONS in the `sizesNoGaps_` `buildUnitView` fills: the leading
+    /// `getStickSizes` entries are element counts (`dsc/dsc2.cpp:2776-2780`), and each layout entry
+    /// after them is divided by `getCumulativeStickSizes` (`:2803-2805`), so it counts STICKS of its
+    /// own dim. [`Elements`] is exact for [`SizeAndIndex::size_dim`] and a conflation for that tail.
     pub size: Elements,
 }
 
@@ -1279,19 +1284,37 @@ pub struct Size {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ViewSizeIdx(pub usize);
 
+/// A LOOP'S STEP IN ONE VIEW-SIZE ENTRY — the `elemOffset_` of a [`LoopInfo`] (`dsc/dsc2.h:504`),
+/// COUNTED IN STEPS OF `sizes_no_gaps[size_idx]` AND NOT IN [`Elements`].
+///
+/// ⛔ `calculateSizeIdxAndOffset` DIVIDES. The raw element offset `DataInfo::loopEleOffsets_` holds
+/// goes in and `offset / dimSizeSoFar` comes out, over the same-dim entries inner to `size_idx`
+/// (`dsc/dsc2.cpp:2745`). The gap fix-up pins that denomination: rescaling `sizesNoGaps_[i].size_`
+/// rescales every offset whose `sizeIdx_` is `i` by the same `gapStickSpread` (`:2885-2894`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ViewElemOffset(pub u32);
+
 /// ONE ENCLOSING LOOP OF A UNIT VIEW — `ScheduleNode::UnitView::LoopInfo` (`dsc/dsc2.h:500-505`).
 ///
 /// ⭐ `loop_` IS A NAME HERE. A view is STORED on its node (`TransferNode::srcLoopsAndSize_`,
 /// `dsc/dsc2.h:848`; `ComputeNode::inputsLoopsAndSizes_`, `:944`), so its `const LoopNode*` crosses
 /// ownership — and a name is the link a tree of owned nodes can hold, as [`SyncNode::other_ends`]
 /// already does for a sync's other end.
+///
+/// ⛔ BOTH OF THOSE HOLD FOR THE VIEWS `buildUnitView` MINTS, WHOSE LOOPS ARE TREE ANCESTORS
+/// (`dsc/dsc2.cpp:2848-2868`), AND NOT FOR THE C++ FIELD.
+/// `constructImplicitLoopsForContiguousTransfer` builds `LoopInfo`s over `new LoopNode`s that are in
+/// no tree and so carry no name, the outer one of them leaving `dim_` at `PrimaryDimTypesCount`
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:733-737`, `:765-769`). Those reach
+/// the bridge as `transfer::CompositeLoop` and `control_flow::SamvLoop`, which model both states;
+/// this type is the tree's own list and models neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopInfo {
     /// Field: e009_ScheduleNode.loop_
     ///
     /// `loop_` (`:501`), by that [`LoopNode`]'s own `name_`.
     pub loop_name: NodeName,
-    /// `dim_` (`:502`), whose `PrimaryDimTypesCount` default is unspellable.
+    /// `dim_` (`:502`) — a dim of the enclosing loop, so never the unset default.
     pub dim: PrimaryDim,
     /// Field: e009_ScheduleNode.sizeIdx_
     ///
@@ -1300,8 +1323,10 @@ pub struct LoopInfo {
     pub size_idx: Option<ViewSizeIdx>,
     /// Field: e009_ScheduleNode.elemOffset_
     ///
-    /// `elemOffset_` — elements per iteration of that loop, [`None`] for the same `-1`.
-    pub elem_offset: Option<Elements>,
+    /// `elemOffset_` — one iteration's step in [`ViewElemOffset`]'s own unit, [`None`] for the same
+    /// `-1`. INDEPENDENT OF `size_idx`: the dummy outer loop at `SNTransferLowering.cpp:765-769`
+    /// pairs `sizeIdx_ = -1` with `elemOffset_ = 1`, so the two are not one optional pair.
+    pub elem_offset: Option<ViewElemOffset>,
 }
 
 /// WHAT ONE UNIT SEES OF A LABELLED DS — `ScheduleNode::UnitView` (`dsc/dsc2.h:499-511`): the sizes
@@ -2903,6 +2928,10 @@ impl ScheduleTree {
     /// ⭐ THE SENTINEL TERMINATES THE CHAIN. `head_` is a `LoopNode`, so `getOwnerLoop()` on a
     /// top-level node hands the head back rather than `nullptr`, which is why the reference's own
     /// outward walks stop on `currNode != getHead()` (`dsc/dsc2.cpp:5035`).
+    ///
+    /// ⛔ THE NAME MUST BE UNIQUE, AND ONLY `finalizeScheduleTree` MAKES IT SO — it appends `__<i>`
+    /// to each repeat, REWRITING `name_` in place (`dsc/dsc2.cpp:2986-2991`). Before that pass a
+    /// duplicate resolves to whichever node this pre-order walk reaches first.
     #[must_use]
     pub fn ancestors(&self, name: &NodeName) -> Option<Ancestors<'_>> {
         let mut loops = Vec::new();
@@ -3926,6 +3955,40 @@ mod tests_e009_schedule_node {
                 .name,
             NodeName("head".to_owned())
         );
+    }
+
+    /// `getSizesForCoreId` (`dsc/dsc2.cpp:2398-2405`) OVER ALL THREE OF ITS ARMS: a core with its
+    /// own gapped list gets it, a core without one falls back to the shared `-1` entry, and a view
+    /// that never ran the gap pass falls back to `sizesNoGaps_`.
+    #[test]
+    fn a_cores_view_sizes_fall_back_through_the_shared_entry_to_the_gapless_list() {
+        let zero = Core::checked(0).expect("core 0");
+        let one = Core::checked(1).expect("core 1");
+        let entry = |size| {
+            [Size {
+                dim: PrimaryDim::X,
+                size: Elements(size),
+            }]
+        };
+
+        let mut view = UnitView {
+            sizes_no_gaps: entry(4).to_vec(),
+            ..UnitView::default()
+        };
+        // `sizesWithGaps_` is empty until the gap pass runs, and every core reads the gapless list.
+        assert_eq!(view.sizes_for_core(Some(zero)), entry(4).as_slice());
+
+        view.sizes_with_gaps.insert(None, entry(8).to_vec());
+        assert_eq!(
+            view.sizes_for_core(Some(one)),
+            entry(8).as_slice(),
+            "the shared `-1` entry answers for a core with none of its own"
+        );
+
+        view.sizes_with_gaps.insert(Some(zero), entry(12).to_vec());
+        assert_eq!(view.sizes_for_core(Some(zero)), entry(12).as_slice());
+        // ⭐ One core's own list does NOT displace the shared one for the others.
+        assert_eq!(view.sizes_for_core(Some(one)), entry(8).as_slice());
     }
 
     /// `isNodeRelevant` (`dsc/dsc2.cpp:1916`), `getRelevantCoreCl` (`:1934`) and `getRelevantComps`
