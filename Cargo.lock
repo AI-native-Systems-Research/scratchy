@@ -573,9 +573,9 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "blas-src"
-version = "0.10.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b95e83dc868db96e69795c0213143095f03de9dd3252f205d4ac716e4076a7e0"
+checksum = "064819740611306487e11bb146c4f154cb63be923458d7cad4b2ce78085e2a1d"
 dependencies = [
  "accelerate-src",
  "blis-src",
