@@ -770,16 +770,6 @@ impl v1::ScheduleNodes for OffsetNodesOf<'_> {
             _ => None,
         })
     }
-
-    /// `repetitionWithOffset_.forOutputs_.size()` (`dsc/dsc2.h:950-954`) — ⭐ `0` OVER A STAGE-2A
-    /// TREE, on the same footing as [`relevant`]: the vector is default-EMPTY and its only writers
-    /// are `ddl_conversion.cpp:1405` and `ddc_transformation.cpp:1366`, both stage 2b.
-    ///
-    /// ⛔ THE FIELD IS ABSENT FROM [`ComputeNode`] BY AGREEMENT WITH THAT, so a caller that runs this
-    /// walk over a tree stage 2b has minted into must add it.
-    fn repetition_with_offset_outputs(&self, _node: NodeId) -> usize {
-        0
-    }
 }
 
 /// `traverseTreeDFS(startNode, {}, comp)` (`dsc/dsc2.cpp:2222-2265`) — pre-order, parent before

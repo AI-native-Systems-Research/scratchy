@@ -29,7 +29,6 @@
 //! [`v1::ExploreTree::is_opaque_compute`] (this crate models `isOpaqueOp_` as membership in
 //! `Metadata::opaque_ops`, which the caller already holds one line away) and
 //! [`v1::ExploreTree::compute_op`], whose return type describes `computeOp_` and not a node.
-//! [`v1::ScheduleNodes::repetition_with_offset_outputs`] wants a field the DDL conversion drops.
 //! Each `todo!` below names its field, its authority line and what would answer it.
 
 use std::collections::BTreeMap;
@@ -546,37 +545,6 @@ impl v1::ScheduleNodes for Dsc2Tree<'_, '_> {
     /// [`super::Dsc2Store`]'s `schedule_head_block` seam, NOT a reason to fabricate a node here.
     fn compute(&self, node: NodeId) -> Option<ComputeNode> {
         self.tree().with(|tree| compute_of(tree, node))
-    }
-
-    /// ⛔⛔ `repetitionWithOffset_.forOutputs_.size()` (`dsc/dsc2.h:950-954`) — A FIELD WITH NO PORTED
-    /// HOME ANYWHERE IN THIS CRATE, and the gap is upstream of this file.
-    ///
-    /// ⭐ THE REFERENCE FILLS IT AT EXACTLY ONE PLACE: `ComputeOp`'s arm of the DDL conversion pushes
-    /// `getRepetitionIfExists(entry)` ONCE PER OUTPUT, in the same loop that pushes `outputs_`
-    /// (`ddc/ddl/ddl_conversion.cpp:1395-1407`, the helper at `:858-869` reading a
-    /// `ddl.allocate replication=`). ⛔ OUR `op_compute` (`schedule/ddl/conversion.rs:3426-3520`)
-    /// pushes the operand and DROPS the repetition, and
-    /// [`crate::schedule::dsc2::ComputeNode`] has no slot for it — so there is nothing to read, on
-    /// the node or beside it.
-    ///
-    /// ⛔ AND `outputs.len()` IS NOT IT. The two are equal at fill time, but
-    /// `insertComputeBetweenTransferAndReg` (`ddc/ddc_transformation_util.cpp:1074-1086`) resizes
-    /// `outputs_` and `outputsLdsAndLoopOffsets_` to ONE and leaves `forOutputs_` alone, so answering
-    /// one with the other states a length the reference can contradict — and this count drives which
-    /// clone gets which const element offset (`ddc/ddcv1.cpp:3057-3081`).
-    ///
-    /// ⭐ WHAT ANSWERS IT: a `ReplicationFactor` per operand on
-    /// [`crate::schedule::dsc2::ComputeNode`] — the newtype the TRANSFER side already carries for the
-    /// same `getRepetitionIfExists` (`schedule/ddl/conversion.rs:3278`) — filled in that same output
-    /// loop. Then this reads it off [`super::tree::Kind::Compute`].
-    fn repetition_with_offset_outputs(&self, _node: NodeId) -> usize {
-        todo!(
-            "v1::ScheduleNodes::repetition_with_offset_outputs: wants \
-             repetitionWithOffset_.forOutputs_.size() (dsc/dsc2.h:950-954) on that COMPUTE node — a \
-             field dsc2::ComputeNode does not carry and ddl/conversion.rs's op_compute drops, whose \
-             only filler is ddl_conversion.cpp:1405; NOT outputs.len(), which \
-             ddc_transformation_util.cpp:1074-1086 can shrink out from under it"
-        )
     }
 }
 

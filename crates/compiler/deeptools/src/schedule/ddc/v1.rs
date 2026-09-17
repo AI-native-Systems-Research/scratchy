@@ -2299,9 +2299,6 @@ pub trait ScheduleNodes: ScheduleWalk {
     fn transfer_has_padding(&self, node: NodeId) -> bool;
     /// `type_`, `exUnit_`, `inputs_` and `outputs_`, each zipped with its offsets vector.
     fn compute(&self, node: NodeId) -> Option<ComputeNode>;
-    /// `repetitionWithOffset_.forOutputs_.size()` (`dsc/dsc2.h:950-953`) — how many outputs of a
-    /// cloned compute take a repetition offset.
-    fn repetition_with_offset_outputs(&self, node: NodeId) -> usize;
 }
 
 /// WHAT ENTRY 260 READS OFF THE DESIGN SPACE — the allocation behind each storage, the address
@@ -3182,7 +3179,9 @@ where
 {
     let dsc = inputs.dsc;
     let clones = inputs.metadata.node_cloning_map.get(&node)?;
-    for index in 0..inputs.tree.repetition_with_offset_outputs(node) {
+    // `compute->repetitionWithOffset_.forOutputs_.size()` (`ddc/ddcv1.cpp:3059`), read off THE NODE'S
+    // OWN state — one entry per output operand, not a count of the outputs that repeat.
+    for index in 0..compute.repetition_with_offset.for_outputs.len() {
         let output = compute.outputs.get(index)?;
         let lds = output.data.my_lds_idx?;
         // A store unit writes the memory behind it, and that is where the allocation lives.
@@ -7915,9 +7914,6 @@ mod tests_e258_e263 {
         }
         fn compute(&self, _node: NodeId) -> Option<ComputeNode> {
             None
-        }
-        fn repetition_with_offset_outputs(&self, _node: NodeId) -> usize {
-            0
         }
     }
 

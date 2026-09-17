@@ -979,7 +979,7 @@ pub struct AllocateNode {
 }
 
 /// HOW MANY TIMES AN OPAQUE OP'S BODY IS UNROLLED — `param_map_["unroll"]`, which the reference
-/// keeps as the DECIMAL SPELLING of a power of two (`ddc/ddcv1.cpp:3352`).
+/// keeps as the DECIMAL SPELLING of a power of two (`ddc/ddcv1.cpp:3343`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Unroll(pub u32);
 
@@ -989,7 +989,7 @@ impl Unroll {
 }
 
 /// AN OPAQUE OP'S ARITHMETIC PRECISION — `param_map_["prec"]`, whose two spellings are the whole of
-/// the closed set (`ddc/ddcv1.cpp:3400-3403`).
+/// the closed set (`ddc/ddcv1.cpp:3394-3397`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Precision {
     /// `"fp32"` — `dataFormat_ == IEEE_FP32`.
@@ -999,7 +999,8 @@ pub enum Precision {
 }
 
 /// WHICH PHYSICAL REGISTER — the `n` of the reference's `"R" + std::to_string(n)`
-/// (`ddc/ddcv1.cpp:3358`), which is a stick index into the allocation's own memory and not a byte.
+/// (`ddc/ddcv1.cpp:3350`, and `:3354-3355` for the per-index run an `_unroll` name expands to),
+/// which is a stick index into the allocation's own memory and not a byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RegSlot(pub u64);
 
@@ -1012,7 +1013,10 @@ impl RegSlot {
 }
 
 /// HOW MANY SLICES A COMPUTE INSTRUCTION REPEATS OVER — `InstrAttribute::repetition_`
-/// (`dsc/dsc2.h:923`), whose default EIGHT is *"default 8 slices works the same"* and not zero.
+/// (`dsc/dsc2.h:907`), whose default EIGHT is *"default 8 slices works the same"* and not zero.
+///
+/// ⛔ NOT [`OperandRepetition`], WHICH IS [`RepetitionWithOffset`]'S ENTRY TYPE: that one comes from
+/// `getRepetitionIfExists`, whose floor is ONE (`ddc/ddl/ddl_conversion.cpp:858-870`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Repetition(pub u32);
 
@@ -1028,14 +1032,60 @@ impl Default for Repetition {
     }
 }
 
-/// ONE ENTRY OF A PACK/MERGE MAPPING — one `InstrAttribute::indices_` element (`dsc/dsc2.h:922`),
+/// ONE ENTRY OF A PACK/MERGE MAPPING — one `InstrAttribute::indices_` element (`dsc/dsc2.h:906`),
 /// whose `-1` is the reference's own *"zero/sign extend"* marker and NOT a slice position.
+///
+/// ⛔ WHICH OF THE TWO EXTENSIONS IT IS BELONGS TO [`SignExtend`], not to this arm: the indices reach
+/// `vectorchain::PackOp` as one array attribute and `sign_extend_` reaches it as the separate
+/// `extend_attr` beside them (`SNComputeLowering.cpp:1123-1132`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PackIndex {
-    /// `-1` — zero- or sign-extend rather than take a slice.
+    /// `-1` — extend rather than take a slice, in whichever direction [`SignExtend`] states.
     Extend,
     /// A slice of the source stick.
     Slice(u32),
+}
+
+/// THE PACK/SPLAT EXTEND BIT — `InstrAttribute::sign_extend_` (`dsc/dsc2.h:908`).
+///
+/// ⛔ ITS TWO READERS GIVE THE SAME BIT OPPOSITE SENSES, so it is carried as the reference's own bit
+/// and read through the predicate that names one. PACKMERGE hands it to `vectorchain::PackOp` as
+/// `extend_attr`, where SET means SIGN-extend rather than zero-extend
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1122-1132`); SPLAT branches on it,
+/// where SET keeps lane 0 and ZERO-FILLS the rest from an `arith.constant 0` and CLEAR broadcasts
+/// lane 0 into every lane (`:1406-1450`). The reference's own *"PACK/MERGE mapping"* comment
+/// therefore describes only the first reader. The PCFG path reads it the same two ways and INVERTS it
+/// for the second — `packMergeInfo.signExtend = sign_extend_` (`dsc/dsc2Pcfg.cpp:1641`) beside
+/// `immOrMode = sign_extend_ == 0 ? 1 : 0` (`:1644`).
+///
+/// The SPLAT reader's third arm, *"sign_extend has to be either 0 or 1"* (`:1449`), is unreachable
+/// from a `bool` and is UNREPRESENTABLE here rather than a refusal.
+///
+/// ⚠️ NO DDL WRITER: the only writer tree-wide is the schedule deserialiser
+/// (`dsc/dsc2.cpp:1170-1171`), so a compute the DDL conversion mints always carries [`Self::Clear`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SignExtend {
+    /// `sign_extend_ = false` (`dsc/dsc2.h:908`).
+    #[default]
+    Clear,
+    /// `sign_extend_ = true`.
+    Set,
+}
+
+impl SignExtend {
+    /// `extend_attr` on `vectorchain::PackOp` — whether a `-1` [`PackIndex`] sign-extends rather than
+    /// zero-extends (`SNComputeLowering.cpp:1123-1124`).
+    #[must_use]
+    pub fn pack_sign_extends(self) -> bool {
+        matches!(self, Self::Set)
+    }
+
+    /// Whether a SPLAT zero-fills the lanes after lane 0 instead of broadcasting into them
+    /// (`SNComputeLowering.cpp:1410`, `:1426`).
+    #[must_use]
+    pub fn splat_zero_fills(self) -> bool {
+        matches!(self, Self::Set)
+    }
 }
 
 /// WHICH LANES OF A COMPUTE INSTRUCTION ARE LIVE — `InstrAttribute::compute_mask_`
@@ -1055,8 +1105,8 @@ impl Default for ComputeMask {
     }
 }
 
-/// AN OPAQUE OP'S BOUND INSTRUCTION STATE — `ComputeNode::instrAttribute_` (`dsc/dsc2.h:905-939`)
-/// narrowed to the four things entry 261 writes, plus the three `ddl.compute` states entry 323 sets.
+/// AN OPAQUE OP'S BOUND INSTRUCTION STATE — `ComputeNode::instrAttribute_`, declared at
+/// `dsc/dsc2.h:905-930` and held at `:939`. All eleven of its declared members are carried.
 ///
 /// ⛔ NO CENSUSED `ddl.compute` STATES A `mask=`, so [`Self::compute_mask`] is invariably the
 /// reference's own 255 initialiser — but entry 323 writes the slot and entry 325 reads it back out,
@@ -1066,18 +1116,28 @@ impl Default for ComputeMask {
 /// unroll factor and a precision under fixed keys, and both are closed values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InstrAttribute {
+    /// Field: e015_ComputeNode.param_map_
+    ///
     /// `param_map_["unroll"]`.
     pub unroll: Unroll,
+    /// Field: e015_ComputeNode.param_map_
+    ///
     /// `param_map_["prec"]`, absent until entry 261 decides it.
     pub precision: Option<Precision>,
+    /// Field: e015_ComputeNode.read_write_reg_map_
+    ///
     /// `read_write_reg_map_` — the internal registers.
     pub read_write_regs: BTreeMap<RegName, RegSlot>,
+    /// Field: e015_ComputeNode.read_only_reg_map_
+    ///
     /// `read_only_reg_map_` — the input/output registers.
     pub read_only_regs: BTreeMap<RegName, RegSlot>,
     /// Field: e015_ComputeNode.mode_
     ///
     /// `mode_` (`dsc/dsc2.h:915`) — the general SRC1/IMM field, once its `-1` default is an [`Option`].
     pub mode: Option<Mode>,
+    /// Field: e015_ComputeNode.compute_mask_
+    ///
     /// `compute_mask_` (`dsc/dsc2.h:916`) — `mask=` where a template states one.
     pub compute_mask: ComputeMask,
     /// Field: e015_ComputeNode.repetition_
@@ -1088,6 +1148,13 @@ pub struct InstrAttribute {
     ///
     /// `indices_` (`dsc/dsc2.h:906`) — the PACK/MERGE mapping, empty where the op states none.
     pub indices: Vec<PackIndex>,
+    /// Field: e015_ComputeNode.sign_extend_
+    ///
+    /// `sign_extend_` (`dsc/dsc2.h:908`) — which direction a `-1` [`Self::indices`] entry extends in,
+    /// and separately which of the two SPLAT shuffles is built.
+    pub sign_extend: SignExtend,
+    /// Field: e015_ComputeNode.param_map_
+    ///
     /// `param_map_` MINUS its two fixed keys — a `ddl.opaque`'s `params=`, copied through
     /// (`ddc/ddl/ddl_conversion.cpp:2674-2690`).
     ///
@@ -1096,8 +1163,6 @@ pub struct InstrAttribute {
     /// spells either as a `params=` key.
     pub params: BTreeMap<ParamKey, ParamValue>,
     /// Field: e015_ComputeNode.computeMaskLoopOffsets_
-    ///
-    /// Field: e015_ComputeNode.loopEleOffsets_
     ///
     /// `computeMaskLoopOffsets_` (`dsc/dsc2.h:923-925`), *"Per corelet"* — how many elements of each
     /// dim one trip of that loop steps the compute's MASK by. EMPTY is the state entry 242 tests
@@ -1109,8 +1174,12 @@ pub struct InstrAttribute {
     /// (`:730-734`) — a different type's field of the same name.
     pub compute_mask_loop_offsets:
         BTreeMap<Corelet, BTreeMap<LoopId, BTreeMap<PrimaryDim, MaskLoopOffset>>>,
+    /// Field: e015_ComputeNode.input_data_connects_
+    ///
     /// `input_data_connects_` (`dsc/dsc2.h:927`) — which ports a spliced opaque body reads.
     pub input_data_connects: Vec<DataConnect>,
+    /// Field: e015_ComputeNode.output_data_connects_
+    ///
     /// `output_data_connects_` (`dsc/dsc2.h:929`).
     pub output_data_connects: Vec<DataConnect>,
 }
@@ -1140,23 +1209,32 @@ pub struct ComputeCoreletView {
     pub outputs_loops_and_sizes: Vec<UnitView>,
 }
 
-/// WHICH OF A CLONED COMPUTE'S OPERANDS TAKE A REPETITION OFFSET —
-/// `ComputeNode::RepetitionWithOffset` (`dsc/dsc2.h:950-953`), whose two lists are BOTH declared
-/// empty.
+/// HOW MANY TIMES EACH OF A COMPUTE'S OPERANDS READS ITS ALLOCATION —
+/// `ComputeNode::RepetitionWithOffset` (`dsc/dsc2.h:950-953`).
 ///
-/// ⭐ EMPTY IS THE ANSWER "NONE DO", and it is the answer entry 108 acts on: it reads
-/// `forOutputs_.size()` to decide how many clones to mint and then writes `forOutputs_.at(idx)`
-/// (`ddc/ddc_transformation.cpp:1373`).
+/// ⭐ ONE ENTRY PER OPERAND IN OPERAND ORDER, NOT A LIST OF THE OPERANDS THAT REPEAT: both lists are
+/// `push_back`ed once per `ddl.compute` operand from `getRepetitionIfExists`
+/// (`ddc/ddl/ddl_conversion.cpp:1393-1394` and `:1405-1406`), so a length is an OPERAND COUNT and a
+/// non-repeating operand carries [`OperandRepetition::ONE`]. The `= {}` initialisers say *"no
+/// operands resolved yet"*, not *"none repeat"*.
+///
+/// ⛔ THE CLONE COUNT IS AN ENTRY MINUS ONE AND NOT A LENGTH: `cloneComputeForOffsetAdjustment` walks
+/// `forOutputs_` by OPERAND INDEX (`ddc/ddc_transformation.cpp:1358`), mints `forOutputs_.at(idx) - 1`
+/// clones for each (`:1360`), resets the CLONE's own entry to `1` (`:1366`), and publishes the
+/// original entry as that output's allocation [`AllocateNode::gap_stick_spread`] (`:1379-1380`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RepetitionWithOffset {
     /// Field: e015_ComputeNode.forInputs_
     ///
-    /// `forInputs_ = {}` (`dsc/dsc2.h:951`), in [`ComputeNode::inputs`] order.
-    pub for_inputs: Vec<Repetition>,
+    /// `forInputs_ = {}` (`dsc/dsc2.h:951`), one entry per [`ComputeNode::inputs`] operand in that
+    /// order. No reader anywhere in the reference tree consults it.
+    pub for_inputs: Vec<OperandRepetition>,
     /// Field: e015_ComputeNode.forOutputs_
     ///
-    /// `forOutputs_ = {}` (`dsc/dsc2.h:952`), in [`ComputeNode::outputs`] order.
-    pub for_outputs: Vec<Repetition>,
+    /// `forOutputs_ = {}` (`dsc/dsc2.h:952`), one entry per [`ComputeNode::outputs`] operand in that
+    /// order. Read by the clone pass above and by entry 108's loop over the cloned node's outputs
+    /// (`ddc/ddcv1.cpp:3059`), both of which use the LENGTH as the operand count.
+    pub for_outputs: Vec<OperandRepetition>,
 }
 
 /// Replaces: e015_ComputeNode
@@ -1197,6 +1275,8 @@ pub struct ComputeNode {
     ///
     /// `outputs_` (`:936`) zipped with `outputsLdsAndLoopOffsets_` (`:938`).
     pub outputs: Vec<Operand>,
+    /// Field: e015_ComputeNode.numFoldsEngaged
+    ///
     /// `numFoldsEngaged` (`dsc/dsc2.h:940`), whose default is ONE and not zero.
     pub num_folds_engaged: NumFolds,
     /// Field: e015_ComputeNode.dataFormat_
@@ -1243,9 +1323,18 @@ impl ComputeNode {
         self.data_format.unwrap_or(DataFormat::Sen169Fp16)
     }
 
-    /// `coreletViews_.at(corelet_id_)`, or `coreletViews_.begin()->second` where the executing unit
-    /// has no corelet of its own (`SNComputeLowering.cpp:549-571`) — [`None`] reads the FIRST entry,
-    /// which is what the reference's `-1` does, and absent where nothing has been finalised yet.
+    /// `coreletViews_.at(corelet_id_)`, or `coreletViews_.begin()->second` where the lowering is
+    /// emitting uniformized code (`SNComputeLowering.cpp:543`, `:549-571` and `:822`, `:827`).
+    ///
+    /// ⛔ THE SELECTOR IS `needsUniform()` — *"uniformization enabled_ || num_folds_ > 1"*
+    /// (`SNDSCLowering.hpp:259-261`) — AND NOT "this unit has no corelet of its own". [`None`] is that
+    /// uniform arm, where the reference reads the FIRST entry under its own standing TODO *"we assume
+    /// that unit_views are same for all cores/corelets of a DSC"* (`:546-547`), so the first entry is
+    /// an approximation the reference states rather than a corelet-independent view.
+    ///
+    /// ⛔ `corelet_id_ == -1` IS NOT THIS ARM: its one reader maps it to corelet ZERO, a real key
+    /// (`:636`). The [`None`] returned here is a `coreletViews_` the reference would have thrown on,
+    /// since its `.at()` is unguarded (`:568`, `:571`).
     #[must_use]
     pub fn corelet_view(&self, corelet: Option<Corelet>) -> Option<&ComputeCoreletView> {
         match corelet {
@@ -4460,7 +4549,7 @@ mod tests_e015_compute_node {
         assert!(node.corelet_view(None).is_none());
 
         // Entry 109 writes one mask offset per corelet, loop and dim; entry 108 gives one output a
-        // repetition offset of its own.
+        // repetition of THREE, which is two clones and a gap stick spread of three.
         node.instr_attribute
             .compute_mask_loop_offsets
             .entry(Corelet::at::<0>())
@@ -4470,7 +4559,7 @@ mod tests_e015_compute_node {
             .insert(PrimaryDim::Mb, MaskLoopOffset::ADVANCE);
         node.repetition_with_offset
             .for_outputs
-            .push(Repetition::ALL_SLICES);
+            .push(OperandRepetition(3));
         node.data_format = Some(DataFormat::IeeeFp32);
         node.corelet_views.insert(
             Corelet::at::<1>(),
@@ -4489,15 +4578,22 @@ mod tests_e015_compute_node {
         assert_eq!(
             node.repetition_with_offset.for_outputs.len(),
             1,
-            "`forOutputs_.size()` is what entry 108 counts clones by"
+            "`forOutputs_.size()` is the OUTPUT OPERAND COUNT — entry 108's outer loop bound \
+             (`ddc/ddc_transformation.cpp:1358`)"
+        );
+        assert_eq!(
+            node.repetition_with_offset.for_outputs[0],
+            OperandRepetition(3),
+            "the ENTRY is what entry 108 counts clones by, `at(idx) - 1` of them \
+             (`ddc/ddc_transformation.cpp:1360`)"
         );
         assert_eq!(
             node.effective_data_format(),
             DataFormat::IeeeFp32,
             "a stated format is the one that is read back"
         );
-        // ⭐ CORELET 1 IS THE ONLY ENTRY, so a corelet-less unit reads IT — `coreletViews_.begin()`
-        // (`SNComputeLowering.cpp:549`).
+        // ⭐ CORELET 1 IS THE ONLY ENTRY, so the uniformized arm reads IT — `coreletViews_.begin()`
+        // under `needsUniform()` (`SNComputeLowering.cpp:543`, `:549`).
         assert_eq!(
             node.corelet_view(None)
                 .expect("corelet 1 was filled")
@@ -4508,6 +4604,41 @@ mod tests_e015_compute_node {
         assert!(
             node.corelet_view(Some(Corelet::at::<0>())).is_none(),
             "an unfilled corelet is absent rather than empty"
+        );
+    }
+
+    /// ⭐⭐ `sign_extend_ = false` (`dsc/dsc2.h:908`) AND ITS TWO OPPOSED READERS. The bit is carried
+    /// as the reference's own bit and read through a predicate that names one reader, because SET means
+    /// *sign*-extend to `vectorchain::PackOp` (`SNComputeLowering.cpp:1123-1124`) and *zero*-fill to
+    /// the SPLAT shuffle (`:1426`), and the PCFG path inverts it a third time
+    /// (`dsc/dsc2Pcfg.cpp:1644`).
+    ///
+    /// ⛔ AND THE THIRD ARM IS UNREPRESENTABLE: *"sign_extend has to be either 0 or 1"*
+    /// (`SNComputeLowering.cpp:1449`) is unreachable from a `bool`, so it is a missing enum variant
+    /// here and not a refusal.
+    #[test]
+    fn a_fresh_computes_extend_bit_is_clear_and_its_two_readers_disagree() {
+        assert_eq!(
+            fresh().instr_attribute.sign_extend,
+            SignExtend::Clear,
+            "`sign_extend_ = false` (`dsc/dsc2.h:908`)"
+        );
+        assert_eq!(SignExtend::default(), SignExtend::Clear);
+        assert!(
+            !SignExtend::Clear.pack_sign_extends() && SignExtend::Set.pack_sign_extends(),
+            "`extend_attr` is the bit verbatim (`SNComputeLowering.cpp:1123-1124`)"
+        );
+        assert!(
+            !SignExtend::Clear.splat_zero_fills() && SignExtend::Set.splat_zero_fills(),
+            "SPLAT broadcasts lane 0 at ZERO (`SNComputeLowering.cpp:1410-1412`) and zero-fills the \
+             lanes after it at ONE (`:1426-1432`)"
+        );
+        // ⭐ THE SENSES ARE OPPOSED: the same value asks PACK to widen a slice and asks SPLAT to STOP
+        // broadcasting, which is why neither reader's verb names the field.
+        assert_eq!(
+            SignExtend::Set.pack_sign_extends(),
+            SignExtend::Set.splat_zero_fills(),
+            "one bit, and both readers branch on it being SET"
         );
     }
 }

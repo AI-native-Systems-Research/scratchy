@@ -18830,9 +18830,6 @@ mod tests_e328_e335 {
         fn compute(&self, _node: NodeId) -> Option<ComputeNode> {
             Some(self.0.clone())
         }
-        fn repetition_with_offset_outputs(&self, _node: NodeId) -> usize {
-            0
-        }
     }
 
     /// The datastage extents and the address granularity entry 333 divides by.

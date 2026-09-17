@@ -192,9 +192,10 @@ use crate::schedule::dsc2::{
     CondOp as DscCondOp, CondRegions, ConditionNode, Coordinate, DataInfo, Dsts, Hops,
     InstrAttribute, LdsIdx, LoopBound, LoopCond as DscLoopCond,
     LoopCondComposite as DscLoopCondComposite, LoopDim, LoopNode, MaxDimSize, NodeBase, NodeName,
-    NumBuffers, NumChunks, Operand as DscOperand, PackIndex, Repetition, ReplicationFactor,
-    RepetitionWithOffset, SchedNode, StartAddress, SyncDirection, SyncNode, SyncStrength, SyncUnits,
-    TransferNode, TransferPadding, TransferRepetition, Unroll, WordLength, generic_comp,
+    NumBuffers, NumChunks, Operand as DscOperand, OperandRepetition, PackIndex, Repetition,
+    RepetitionWithOffset, ReplicationFactor, SchedNode, SignExtend, StartAddress, SyncDirection,
+    SyncNode, SyncStrength, SyncUnits, TransferNode, TransferPadding, TransferRepetition, Unroll,
+    WordLength, generic_comp,
 };
 use crate::schedule::l3::dsc::{
     CoreCount, CoreletsUsed, DesignSpaceConfig, EmptyStage, PadSizes, WkSlice, WkSliceId,
@@ -2764,10 +2765,10 @@ fn process_allocation<S: DdlSite + ?Sized>(
 }
 
 /// `getRepetitionIfExists` — the `replication=` on the allocation a unit names, ONE where the unit
-/// names no allocation or the allocation states none.
+/// names no allocation or the allocation states none (`ddc/ddl/ddl_conversion.cpp:858-869`).
 #[must_use]
-fn repetition_if_exists(program: &Program, unit: NameId) -> ReplicationFactor {
-    let stated = || -> Option<u64> {
+fn repetition_if_exists(program: &Program, unit: NameId) -> OperandRepetition {
+    let stated = || -> Option<u32> {
         let stmt = program.definition(unit)?;
         if !matches!(stmt.attrs, Attrs::Unit { .. }) {
             return None;
@@ -2777,9 +2778,9 @@ fn repetition_if_exists(program: &Program, unit: NameId) -> ReplicationFactor {
         else {
             return None;
         };
-        u64::try_from(replication?).ok()
+        u32::try_from(replication?).ok()
     };
-    ReplicationFactor(stated().unwrap_or(1))
+    stated().map_or(OperandRepetition::ONE, OperandRepetition)
 }
 
 /// ONE END OF A NODE, RESOLVED — what `setDataLocAndInfo` fills in and hands back.
@@ -3331,7 +3332,15 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
         (ends.next()?, ends.collect::<Vec<_>>())
     };
     let mut transfer = TransferNode {
-        repetition: TransferRepetition::default(),
+        // `repetition_.srcRep_` and `repetition_.dstReps_`, one entry per destination in `dsts` order
+        // (`ddc/ddl/ddl_conversion.cpp:1171-1172` and `:1189`).
+        repetition: TransferRepetition {
+            src: repetition_if_exists(ctx.program, src_name),
+            dsts: dst_names
+                .iter()
+                .map(|name| repetition_if_exists(ctx.program, *name))
+                .collect(),
+        },
         last_fusable_parent_loop_src: None,
         last_fusable_parent_loop_dst: Vec::new(),
         unit_time_transfer_chunk_stride: Vec::new(),
@@ -3342,7 +3351,11 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
         src: src_operand,
         dsts: Dsts::new(first, rest)
             .with_hops(dsts.iter().map(|dst| Hops(dst.vias.clone())).collect()),
-        replication_factor: repetition_if_exists(ctx.program, src_name),
+        // ⛔ THE CLASS DEFAULT, AND NOT `getRepetitionIfExists`: `replicationFactor_ = 1`
+        // (`dsc/dsc2.h:834`) is never written by the DDL conversion. Its writers are entry 227's four
+        // arms and entry 244 (`ddc/ddcv1.cpp:455`, `:530-534`, `:1664`), which read it back multiplied
+        // from ONE.
+        replication_factor: ReplicationFactor::ONE,
         unit_time_transfer_chunk_size: Vec::new(),
         // The class default — the DDL states no chunk count for a `ddl.datatransfer`.
         unit_time_transfer_num_chunks: NumChunks::ONE,
@@ -3504,7 +3517,13 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     let mut ends = Vec::new();
-    for (slot, group) in [(0_usize, &mut inputs), (1, &mut outputs)] {
+    // `repetitionWithOffset_`, filled ONE ENTRY PER OPERAND beside the operand itself
+    // (`ddc/ddl/ddl_conversion.cpp:1393-1394` for the inputs and `:1405-1406` for the outputs).
+    let mut repetition_with_offset = RepetitionWithOffset::default();
+    for (slot, group, reps) in [
+        (0_usize, &mut inputs, &mut repetition_with_offset.for_inputs),
+        (1, &mut outputs, &mut repetition_with_offset.for_outputs),
+    ] {
         let names = match stmt.operands.get(slot)? {
             DdlOperand::List(names) => names.to_vec(),
             DdlOperand::One(name) => vec![*name],
@@ -3527,6 +3546,7 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
                 end.operand.storage = generic_component(end.operand.unit);
             }
             group.push(end.operand.clone());
+            reps.push(repetition_if_exists(ctx.program, name));
             ends.push(end);
         }
     }
@@ -3567,6 +3587,9 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
             .iter()
             .map(|index| u32::try_from(*index).map_or(PackIndex::Extend, PackIndex::Slice))
             .collect(),
+        // The class default — no `ddl.compute` states an extend direction, and the reference's only
+        // writer of `sign_extend_` is the schedule deserialiser (`dsc/dsc2.cpp:1170-1171`).
+        sign_extend: SignExtend::Clear,
         params: BTreeMap::new(),
         input_data_connects: Vec::new(),
         output_data_connects: Vec::new(),
@@ -3592,7 +3615,7 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
                 corelet_views: BTreeMap::new(),
                 input_coordinates: Vec::new(),
                 output_coordinate: Coordinate::default(),
-                repetition_with_offset: RepetitionWithOffset::default(),
+                repetition_with_offset: repetition_with_offset.clone(),
                 name: name.clone(),
                 op,
                 ex_unit,
@@ -3818,6 +3841,8 @@ fn op_opaque<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Op
             compute_mask: ComputeMask::ALL,
             repetition: Repetition::ALL_SLICES,
             indices: Vec::new(),
+            // The class default — a `ddl.opaque` states no PACK/MERGE mapping to extend.
+            sign_extend: SignExtend::Clear,
             params: params.iter().copied().collect(),
             input_data_connects: reads.to_vec(),
             output_data_connects: writes.to_vec(),
@@ -6304,8 +6329,8 @@ mod unit_tests {
         check_meta_dimensions, convert_dsc2_ddl, corelet, export_to_ddl, match_ddl2_dsc,
         op_core_to_core, pad_type_spelling, process_access_patterns, process_condition,
         process_dimension_op, process_expression, process_op, process_region, process_types,
-        set_data_loc_and_info, tensor, tensor_and_allocation, tensor_prop, transfer_access_pattern,
-        verify_ddl_constraint,
+        repetition_if_exists, set_data_loc_and_info, tensor, tensor_and_allocation, tensor_prop,
+        transfer_access_pattern, verify_ddl_constraint,
     };
     use crate::arch::{Dd2, Elements, IsaGen};
     use crate::bridges::superdsc_to_dataflow_ir::control_flow::{CondOp, CondValType};
@@ -6314,8 +6339,8 @@ mod unit_tests {
     };
     use crate::formats::{Bits, DataFormat};
     use crate::generated::{
-        AccessPattern, Attrs, DataConnect, DataType, DimProperty, LoopLabel, Memory, NameId,
-        Operand, PROGRAMS, Program, Stmt, StmtKind, Strategy, Unit, Via as DdlVia,
+        AccessPattern, Attrs, Buffers, DataConnect, DataType, DimProperty, LoopLabel, Memory,
+        NameId, Operand, PROGRAMS, Program, Stmt, StmtKind, Strategy, Unit, Via as DdlVia,
     };
     use crate::schedule::ddc::fold::{AllocId, ConstIdx, DataOrigin, NodeId, PadType};
     use crate::schedule::ddc::metadata::{
@@ -6329,8 +6354,8 @@ mod unit_tests {
         AllocLayout, AllocPlacement, AllocateNode, BlockNode, ComputeNode, CondRegions,
         ConditionNode, Coordinate, DataInfo, Dsts, LayoutDims, LdsIdx, LeafKind, LeafNode, LoopDim,
         LoopNode, MaxDimSize, NodeBase, NodeName, NumBuffers, NumChunks, Operand as DscOperand,
-        ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode, SyncStrength,
-        SyncUnits, TransferNode, TransferPadding, TransferRepetition, WordLength,
+        OperandRepetition, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode,
+        SyncStrength, SyncUnits, TransferNode, TransferPadding, TransferRepetition, WordLength,
     };
     use crate::schedule::l3::dsc::{
         CoreCount, CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DesignSpaceConfig, DimPadding,
@@ -6482,6 +6507,160 @@ mod unit_tests {
             roles: &[],
             names,
         }
+    }
+
+    /// ⭐⭐ `getRepetitionIfExists` (`ddc/ddl/ddl_conversion.cpp:858-869`) — the `replication=` of the
+    /// allocation a `ddl.unit` names, and ONE at every one of the reference's four early exits: the
+    /// name is not a `ddl.unit`, the unit names no allocation, the operand it names is not an
+    /// allocation, and the allocation states no `replication=`.
+    ///
+    /// ⛔ ONE IS NOT EIGHT. This one value fills BOTH `repetitionWithOffset_` on a compute and
+    /// `repetition_` on a transfer, and typing it as [`crate::schedule::dsc2::Repetition`] — the
+    /// instruction's slice count, whose default IS eight — would silently promote every absent
+    /// `replication=` to a repeat of eight.
+    #[test]
+    fn the_operand_repetition_is_the_named_allocations_replication() {
+        /// `%ds` is the datastage every unit and allocation here hangs off; the names above 5 are
+        /// undefined on purpose.
+        const STMTS: &[Stmt] = &[
+            // `%rep = ddl.allocate(%ds) {replication = 8}`.
+            Stmt {
+                kind: StmtKind::Allocate,
+                depth: 0,
+                attrs: Attrs::Allocate {
+                    memory: Memory::Sfplrf,
+                    buffers: Buffers::Single,
+                    padding: &[],
+                    replication: Some(8),
+                },
+                results: &[NameId(1)],
+                operands: &[Operand::One(NameId(0))],
+                path: &[],
+            },
+            // `%plain = ddl.allocate(%ds)`, stating no `replication=`.
+            Stmt {
+                kind: StmtKind::Allocate,
+                depth: 0,
+                attrs: Attrs::Allocate {
+                    memory: Memory::Sfplrf,
+                    buffers: Buffers::Single,
+                    padding: &[],
+                    replication: None,
+                },
+                results: &[NameId(2)],
+                operands: &[Operand::One(NameId(0))],
+                path: &[],
+            },
+            // `%on_rep = ddl.unit(%ds, %rep)`.
+            Stmt {
+                kind: StmtKind::Unit,
+                depth: 0,
+                attrs: Attrs::Unit {
+                    unit: Unit::Sfp,
+                    data_connect: DataConnect::ZeroSfpLrf,
+                    via: DdlVia::Direct,
+                    stick_offset: None,
+                },
+                results: &[NameId(3)],
+                operands: &[Operand::One(NameId(0)), Operand::One(NameId(1))],
+                path: &[],
+            },
+            // `%on_plain = ddl.unit(%ds, %plain)`.
+            Stmt {
+                kind: StmtKind::Unit,
+                depth: 0,
+                attrs: Attrs::Unit {
+                    unit: Unit::Sfp,
+                    data_connect: DataConnect::ZeroSfpLrf,
+                    via: DdlVia::Direct,
+                    stick_offset: None,
+                },
+                results: &[NameId(4)],
+                operands: &[Operand::One(NameId(0)), Operand::One(NameId(2))],
+                path: &[],
+            },
+            // `%bare = ddl.unit(%ds)` — `llvm::detail::isPresent(getAllocation())` is false.
+            Stmt {
+                kind: StmtKind::Unit,
+                depth: 0,
+                attrs: Attrs::Unit {
+                    unit: Unit::Sfp,
+                    data_connect: DataConnect::ZeroSfpLrf,
+                    via: DdlVia::Direct,
+                    stick_offset: None,
+                },
+                results: &[NameId(5)],
+                operands: &[Operand::One(NameId(0))],
+                path: &[],
+            },
+            // `%not_alloc = ddl.unit(%ds, %bare)` — the second operand resolves to a UNIT.
+            Stmt {
+                kind: StmtKind::Unit,
+                depth: 0,
+                attrs: Attrs::Unit {
+                    unit: Unit::Sfp,
+                    data_connect: DataConnect::ZeroSfpLrf,
+                    via: DdlVia::Direct,
+                    stick_offset: None,
+                },
+                results: &[NameId(6)],
+                operands: &[Operand::One(NameId(0)), Operand::One(NameId(5))],
+                path: &[],
+            },
+        ];
+        let program = synthetic(&[], STMTS);
+        assert_eq!(
+            repetition_if_exists(&program, NameId(3)),
+            OperandRepetition(8),
+            "`alloc.getReplication().value()`"
+        );
+        for (name, why) in [
+            (NameId(4), "the allocation states no `replication=`"),
+            (NameId(5), "the unit names no allocation"),
+            (NameId(6), "the named operand is not a `ddl.allocate`"),
+            (NameId(1), "the name is an allocation and not a `ddl.unit`"),
+            (NameId(9), "the name has no definition at all"),
+        ] {
+            assert_eq!(
+                repetition_if_exists(&program, name),
+                OperandRepetition::ONE,
+                "{why}"
+            );
+        }
+    }
+
+    /// ⭐⭐ THE NON-ONE ARM IS LIVE ON THE VENDORED CORPUS, so which FIELD the value lands in is a
+    /// behavioural question and not a bookkeeping one: `replicationFactor_` (`dsc/dsc2.h:834`) is read
+    /// against EIGHT by entry 227 and by `unrollTransfer` (`ddc/ddc_transformation.cpp:1774`), and the
+    /// DDL conversion writing it would decide those comparisons before their own writers ran.
+    #[test]
+    fn the_vendored_corpus_states_a_replication_and_it_reaches_the_units_that_name_it() {
+        let mut stated = 0;
+        let mut plain = 0;
+        for program in PROGRAMS {
+            for stmt in program.stmts {
+                if !matches!(stmt.attrs, Attrs::Unit { .. }) {
+                    continue;
+                }
+                let name = *stmt.results.first().expect("a `ddl.unit` names its result");
+                match repetition_if_exists(program, name) {
+                    OperandRepetition::ONE => plain += 1,
+                    OperandRepetition(8) => stated += 1,
+                    other => panic!(
+                        "{} {}: a `replication=` outside the corpus's closed set: {other:?}",
+                        program.op_func, program.bind
+                    ),
+                }
+            }
+        }
+        assert_eq!(
+            stated, 12,
+            "`ddl.unit`s whose allocation states `replication=8`"
+        );
+        assert!(
+            plain > stated,
+            "`ddl.unit`s that resolve to the reference's ONE: {plain}"
+        );
     }
 
     /// ⭐⭐ EVERY `ddl.type` OF EVERY VENDORED PROGRAM, AGAINST ITS OWN ATTRIBUTES — the widths come
