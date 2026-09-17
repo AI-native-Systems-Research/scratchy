@@ -50,7 +50,7 @@ jobs:
       # escape hatch both build scripts document for exactly this case.
       SCRATCHY_SKIP_SENDNN_CXX: "1"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Cache CUDA toolkit
         uses: actions/cache@v4
@@ -129,7 +129,7 @@ jobs:
     name: macos-arm64 (metal)
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -229,7 +229,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
