@@ -122,6 +122,16 @@ fn is_plumbing(op: OpKind) -> bool {
 /// Returns `Ok(None)` when the value is not a load of a parameter at all (a splat constant, a
 /// previous op's result). Those are the caller's two other cases: a constant operand, and an
 /// intermediate.
+///
+/// ⛔ AN INDIRECT ACCESS TILE IS REFUSED BY NAME HERE RATHER THAN REPORTED AS `None`, and that is
+/// a correctness fix to a DIAGNOSTIC. `Ok(None)` means "not a load of a parameter", and the caller
+/// turns it into "then it is a constant (a `tensor.splat`)" — a sound deduction only while the two
+/// tile kinds are the one this walk matches. A `ktdp.construct_indirect_access_tile` IS a load of a
+/// parameter, so falling through named the wrong cause for every gathered operand: a Triton
+/// embedding's `arith.mulf` reads a gathered `[64, 4096]` row tile and was reported as reading a
+/// splat, sending a reader to look for a constant that is not there. MEASURED on
+/// `test/fixtures/embedding.py`, whose `%34 = arith.mulf(%30, %33)` has the gathered load at
+/// input 0 and the splat at input 1 — and the refusal named input 0.
 pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error> {
     // The parameter-rooted walk already computes every field of a `Region` correctly; the only
     // thing wrong for a multi-op function is WHICH parameter and WHICH tile. So find the parameter
@@ -131,6 +141,24 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
     let load = f.operations.iter().find(|o| o.result == Some(v) && o.op_type == OpKind::KtdpLoad);
     let Some(load) = load else { return Ok(None) };
     let tile_v = load.operands.first().copied();
+    if f
+        .operations
+        .iter()
+        .any(|o| o.result == tile_v && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+    {
+        return err(format!(
+            "{}: this operand is loaded through a `ktdp.construct_indirect_access_tile` — a \
+             GATHER, whose row index is data rather than an affine function of the tile id. It IS \
+             a load of a parameter, so it is named here rather than falling through to the \
+             caller's \"then it is a constant\" arm. No `Program` in this crate carries an index \
+             operand, and the descriptor a gather needs is a pair of `allocate` nodes \
+             (`indirectAllocType_` `index_tensor`/`value_tensor` cross-linked by \
+             `relatedIndirectAccessAlloc_`) plus `computeOp_.indirectAccessIndexLabeledDs` — none \
+             of which this lowering emits. Lower an indirect access tile elsewhere, or add that \
+             assembler.",
+            f.name
+        ));
+    }
     let tile = f
         .operations
         .iter()
