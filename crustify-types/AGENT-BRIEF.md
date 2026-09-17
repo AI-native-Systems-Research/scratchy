@@ -64,6 +64,32 @@ algorithms take `&mut SuperDsc` as the reference does, and
 not completed**. A further 54 stubs are already unreachable behind four getters in `reads.rs` that
 `return None`; deleting the layer retires those too.
 
+## ⛔⛔ BUT THAT DELETION IS **NOT YOUR UNIT**, AND NOT IN THIS CAMPAIGN
+
+The sentence above says where the architecture is going. It is **not** a licence to delete carrier
+code, and `run_v1`'s signature is not yours to change either: `Ddc::run_v1` lives in
+`ddc/ddcv1.cpp`, outside this campaign's oracle target, and the de-severing needs every type landed
+first. It gets its own campaign.
+
+**What that means for you concretely.** Changing a type's shape breaks the carriers that read its old
+fields — the first wave hit exactly this, `error[E0560]: struct ConditionNode has no field named
+then_region` in `stages/ddc_tree.rs` and `stages/ddc_store2.rs`. You must leave the crate compiling,
+and the ONLY acceptable way is to **adapt the call site to the new shape, carrying every effect
+across**. Never by deleting the logic, never by making a live call `todo!()`, never by leaving a
+branch out because the new shape made it awkward.
+
+⭐ **THE STANDARD TO MATCH, from this campaign's own first wave** (`acdf5a01b`, `e012_ConditionNode`):
+the old `then_region: Vec<SchedNode>` forced a runtime refusal — `let SchedNode::Block(block) = entry
+else { return None }`. The port replaced it with `CondRegions`, which encodes the reference's own
+*"ConditionNode only accepts 2 BlockNodes as children"* (`dsc/dsc2.cpp:2143`) in the type, so the
+refusal became UNREPRESENTABLE rather than deleted, and the missing-region case cites the
+nullptr-returning getters at `dsc/dsc2.h:707` and `:713`. Every caller was rewritten to the new shape
+with its loop intact. That is what "adapt, don't delete" means.
+
+⛔ Your report must state, for every carrier file you touched, what you changed and why the effect is
+preserved. A shrinking line count in `stages/*.rs` is not progress in this campaign; it is the thing
+a reviewer will come looking for.
+
 ⭐ **A filled carrier method is a port of the wrong thing.** If your unit's only effect is to give a
 trait method a body, stop and say so in your report.
 
