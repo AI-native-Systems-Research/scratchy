@@ -164,6 +164,303 @@ fn matmul_weight_is_transpose_b(
     ))
 }
 
+/// THE RMSNORM CHAIN, as the ONE fused op it is — `out = x · rsqrt(mean(x²) + eps) · gamma`.
+///
+/// # WHY THIS IS THE FIX AND FILLING THE SCALE REGISTRY WAS NOT
+///
+/// The chain's `ms = sum(x²) · INV_D` is an `arith.mulf` by a splatted constant, so
+/// [`splat_scale_of`] classifies it as a `ScalarMul` and `scalarmul_at` then asks for its multiplier's
+/// registry slot. That request is the one thing that must NOT be granted:
+/// `triton-ktir-superdsc/src/layout.rs`'s `scales_for` records, at its own code, that registering
+/// `1/cols` WAS TRIED and is a divergence — "THE EPSILON ONLY — the mean-of-squares divisor is NOT a
+/// registry scale. `1/cols` is bound at the reserved `RMS_INVCOLS_TID` as a `[1, stick]` row with its
+/// own placement". The registry index IS the device tid (`SCALARMUL_SCALE_BASE - i`), so a spurious
+/// slot MOVES THE ADDRESS every later constant reaches the card at.
+///
+/// So the divisor must stop being a standalone multiply rather than be registered around it. Fusing
+/// the chain does exactly that: `INV_D` becomes chain-interior, the epsilon goes to the registry
+/// (which is what `scales_for` already provides for `Program::RmsNorm`), and `1/cols` goes to the
+/// reserved tid inside `assemble_rmsnorm`, which is where the shipped path reads it.
+///
+/// # IT PROVES THE MATCH; IT DOES NOT PATTERN-MATCH
+///
+/// Four discriminators, and none of them is structural bookkeeping:
+///
+/// * **the square's two operands are the SAME value.** `mean(x²)` is `x·x`; `x·y` with the same op
+///   kinds is a different function.
+/// * **the value the normaliser scales is the value that was squared.** `x · rsqrt(mean(x²)+eps)`
+///   reads `x` TWICE, and that is what makes it a normalisation rather than a scale by an unrelated
+///   reciprocal.
+/// * **the reduction is a SUM.** A max-reduce in that slot is not a mean of squares.
+/// * **the divisor is exactly `1/cols` for THIS tile's column extent.** `mean` is `sum/N`, so a
+///   multiplier that is not `1/N` makes it something else — checked numerically against the operand's
+///   own width, not assumed.
+///
+/// A chain that almost matches is REFUSED BY NAME, never lowered as the nearest thing.
+#[derive(Clone, Debug)]
+pub struct RmsNormChain {
+    /// The normalised tensor — squared, reduced, and scaled.
+    pub x: Ssa,
+    /// The learned gain the chain's last multiply applies (`n1` / `gamma`).
+    pub gamma: Ssa,
+    /// The final `arith.mulf`'s result: what the fused program produces.
+    pub out: Ssa,
+    /// The epsilon this chain's own `arith.addf` adds — read per chain, because
+    /// `program_rmsnorm_eps` requires ONE root in the whole function and a decoder has two.
+    pub eps: f32,
+    /// Every intermediate the fused op never materialises, so `lower_function` lowers NOTHING for
+    /// them. The final multiply is not here: it is the op that BECOMES the fused program.
+    pub consumed: Vec<Ssa>,
+}
+
+/// Read EVERY rmsnorm chain off the program, or say why what is there is not one.
+///
+/// One chain per `math.rsqrt`. An empty `Vec` means the program states none.
+pub fn program_rmsnorm_chains(f: &IRFunction<'static>) -> Result<Vec<RmsNormChain>, Error> {
+    let mut out = Vec::new();
+    for root in f.operations.iter().filter(|o| o.op_type == OpKind::MathRsqrt) {
+        if let Some(c) = rmsnorm_chain_from(f, root)? {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// The one chain rooted at `root` (a `math.rsqrt`), proven link by link.
+///
+/// `Ok(None)` where the shape around the root is not an rmsnorm at all AND says so unambiguously — a
+/// bare `rsqrt` of a loaded tile is a legitimate `Elementwise(Rsqrt)` and must fall through to the 1:1
+/// map rather than be refused. `Err` where it is RECOGNISABLY an attempt at one and a link does not
+/// close, because then the 1:1 map would silently lower a mis-shaped normalisation as separate ops.
+fn rmsnorm_chain_from(
+    f: &IRFunction<'static>,
+    root: &ktir_core::ir::Operation<'static>,
+) -> Result<Option<RmsNormChain>, Error> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(k, v)| match (k, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    // `rsqrt(add)`. A root whose operand is not an `arith.addf` is not this shape and is not an
+    // attempt at it — a plain `Elementwise(Rsqrt)`, so `Ok(None)`.
+    let Some(add) = root.operands.first().copied().and_then(def_of) else {
+        return Ok(None);
+    };
+    if add.op_type != OpKind::ArithAddf {
+        return Ok(None);
+    }
+    // `mean + eps`: exactly one operand is a splatted constant, the other the mean.
+    let (Some(eps), Some(ms)) = ({
+        let mut e = None;
+        let mut m = None;
+        for &s in add.operands.iter() {
+            match splat_value(s) {
+                Some(v) => e = Some(v),
+                None => m = Some(s),
+            }
+        }
+        (e, m)
+    }) else {
+        return Ok(None);
+    };
+    // `ms = <reduce> · INV_D`.
+    let Some(scale) = def_of(ms) else { return Ok(None) };
+    if scale.op_type != OpKind::ArithMulf {
+        return Ok(None);
+    }
+    let (Some(inv_d), Some(red_v)) = ({
+        let mut d = None;
+        let mut r = None;
+        for &s in scale.operands.iter() {
+            match splat_value(s) {
+                Some(v) => d = Some(v),
+                None => r = Some(s),
+            }
+        }
+        (d, r)
+    }) else {
+        return Ok(None);
+    };
+    let Some(red) = def_of(red_v) else { return Ok(None) };
+    if red.op_type != OpKind::LinalgReduce {
+        return Ok(None);
+    }
+    // From here the shape IS an attempt at an rmsnorm — a reduce feeding `·c + c` feeding `rsqrt` is
+    // not something else — so every remaining failure is an `Err`, not a fall-through.
+    if reduce_kind_of(red) != Some(ReduceKind::Sum) {
+        return err(format!(
+            "{}: an rmsnorm's mean-of-squares reduces with `arith.addf`; this one reduces with \
+             `{:?}`, which is a different function",
+            f.name,
+            red.attributes.iter().find_map(|(k, v)| match (k, v) {
+                (AttrKey::ReduceFn, Attr::Op(o)) => Some(*o),
+                _ => None,
+            })
+        ));
+    }
+    // ⛔ THE SQUARE'S TWO OPERANDS MUST BE THE SAME VALUE. `mean(x²)` is `x·x`; `x·y` has the same op
+    // kinds and is a different function.
+    let Some(sq) = red.operands.first().copied().and_then(def_of) else {
+        return err(format!("{}: the rmsnorm reduce reads nothing", f.name));
+    };
+    if sq.op_type != OpKind::ArithMulf {
+        return err(format!(
+            "{}: an rmsnorm reduces the SQUARE of its input; this reduce reads a `{:?}`",
+            f.name, sq.op_type
+        ));
+    }
+    let [sa, sb] = sq.operands[..] else {
+        return err(format!("{}: the rmsnorm square is not binary", f.name));
+    };
+    if sa != sb {
+        return err(format!(
+            "{}: the rmsnorm's `arith.mulf` under the reduce multiplies TWO DIFFERENT values, so it \
+             is not `x·x` and the reduction is not a mean of squares. Refused rather than lowered as \
+             an rmsnorm, whose descriptor squares one operand.",
+            f.name
+        ));
+    }
+    let x = sa;
+
+    // FORWARD from the root to the two multiplies, through the rank plumbing the broadcast needs
+    // (`expand_shape` -> `collapse_shape` -> `linalg.broadcast`), which the fused op absorbs.
+    let mut consumed = vec![add.result, scale.result, red.result, sq.result]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let Some(root_v) = root.result else {
+        return err(format!("{}: `math.rsqrt` with no result", f.name));
+    };
+    consumed.push(root_v);
+    let deep = f.ops_deep();
+    let sole_reader = |v: Ssa| -> Option<&ktir_core::ir::Operation<'static>> {
+        let mut it = deep.iter().copied().filter(|o| o.operands.contains(&v));
+        let first = it.next()?;
+        it.next().is_none().then_some(first)
+    };
+    // The rank walk is OPTIONAL in shape but its ops are consumed when present: a producer that
+    // broadcasts `r` to `[rows, cols]` states expand/collapse/broadcast, and one that keeps it rank-2
+    // states none of them.
+    let mut cursor = root_v;
+    for _ in 0..3 {
+        let Some(next) = sole_reader(cursor) else { break };
+        if !matches!(
+            next.op_type,
+            OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
+        ) {
+            break;
+        }
+        let Some(r) = next.result else { break };
+        consumed.push(r);
+        cursor = r;
+    }
+    // `x · r` — and ⛔ IT MUST READ THE SAME `x` THAT WAS SQUARED. That is what makes this a
+    // normalisation of `x` rather than a scale by an unrelated reciprocal.
+    let Some(scale_mul) = sole_reader(cursor) else {
+        return err(format!(
+            "{}: nothing reads the rmsnorm's `rsqrt` result (through its rank plumbing), so the \
+             normalising multiply is missing",
+            f.name
+        ));
+    };
+    if scale_mul.op_type != OpKind::ArithMulf || !scale_mul.operands.contains(&x) {
+        return err(format!(
+            "{}: the rmsnorm's normalising multiply is `{:?}` and {} the value that was squared. \
+             `x · rsqrt(mean(x²)+eps)` reads `x` TWICE; a multiply of something else by the same \
+             reciprocal is a different function.",
+            f.name,
+            scale_mul.op_type,
+            if scale_mul.operands.contains(&x) { "reads" } else { "does NOT read" }
+        ));
+    }
+    let Some(scaled) = scale_mul.result else {
+        return err(format!("{}: the rmsnorm's normalising multiply has no result", f.name));
+    };
+    consumed.push(scaled);
+    // `· gamma` — the learned gain, itself reached through its own rank plumbing.
+    let Some(gain_mul) = sole_reader(scaled) else {
+        return err(format!(
+            "{}: nothing reads `x · rsqrt(...)`. `Program::RmsNorm` applies a learned gain; a \
+             normalisation with none is not the shape this door lowers.",
+            f.name
+        ));
+    };
+    if gain_mul.op_type != OpKind::ArithMulf {
+        return err(format!(
+            "{}: `x · rsqrt(...)` is read by `{:?}` rather than by the gain multiply",
+            f.name, gain_mul.op_type
+        ));
+    }
+    let Some(gain_src) = gain_mul.operands.iter().copied().find(|&s| s != scaled) else {
+        return err(format!("{}: the rmsnorm's gain multiply squares its input", f.name));
+    };
+    // Walk BACK through the gain's rank plumbing to the value a `Region` can be found for.
+    let mut gamma = gain_src;
+    for _ in 0..3 {
+        let Some(d) = def_of(gamma) else { break };
+        if !matches!(
+            d.op_type,
+            OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
+        ) {
+            break;
+        }
+        consumed.push(gamma);
+        let Some(src) = d.operands.first().copied() else { break };
+        gamma = src;
+    }
+    let Some(out) = gain_mul.result else {
+        return err(format!("{}: the rmsnorm's gain multiply has no result", f.name));
+    };
+
+    // ⛔ THE DIVISOR IS `1/cols` FOR THIS TILE, CHECKED NUMERICALLY. `mean` is `sum/N`; a multiplier
+    // that is not `1/N` makes the program something other than a mean of squares, and lowering it as
+    // one would emit `assemble_rmsnorm`'s own `1/cols` at the reserved tid — silently substituting a
+    // different constant for the one the program states. `cols` is the reduced extent, which is the
+    // square's own trailing dim.
+    let cols = match sq.result_type {
+        Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if !dims.is_empty() => {
+            dims[dims.len() - 1] as f64
+        }
+        _ => {
+            return err(format!(
+                "{}: the rmsnorm square states no tensor shape, so `1/cols` cannot be checked \
+                 against its divisor",
+                f.name
+            ));
+        }
+    };
+    // fp32-representable reciprocals of powers of two are exact, and every `D_MODEL` here is one; the
+    // comparison is done in f32 so a producer that splatted an f32 `1/N` matches bit-for-bit.
+    if (inv_d as f32) != (1.0f64 / cols) as f32 {
+        return err(format!(
+            "{}: the rmsnorm's divisor is {inv_d}, but this tile reduces {cols} columns and a mean \
+             needs 1/{cols} = {}. `assemble_rmsnorm` binds `1/cols` itself at the reserved \
+             `RMS_INVCOLS_TID`, so lowering this as an rmsnorm would substitute a DIFFERENT constant \
+             for the one the program states.",
+            f.name,
+            1.0f64 / cols
+        ));
+    }
+
+    Ok(Some(RmsNormChain {
+        x,
+        gamma,
+        out,
+        eps: eps as f32,
+        consumed,
+    }))
+}
+
 /// Read EVERY silu longhand off the program, or say why one of them is not one.
 ///
 /// ⭐ ONE CHAIN PER `arith.negf`, NOT ONE PER FUNCTION, and the difference is a real configuration:
@@ -377,6 +674,9 @@ enum Lowering {
     /// `tile * <splatted constant>` — the multiplier read off THIS op, not the whole function. See
     /// [`splat_scale_of`] for the discriminator and why it cannot be per-function here.
     ScalarMul(f32),
+    /// A fused `x · rsqrt(mean(x²)+eps) · gamma`, with the epsilon this chain's own. See
+    /// [`program_rmsnorm_chains`] for why fusing it is the fix and filling the scale registry was not.
+    RmsNorm(f32),
 }
 
 /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
@@ -401,7 +701,7 @@ enum Lowering {
 /// * BOTH are splats — a multiply of two compile-time constants. That is not a scalarmul (there is no
 ///   tensor to scale) and emitting one would invent an operand; it belongs to constant folding
 ///   upstream, so it falls through to be refused by name.
-fn splat_scale_of(f: &IRFunction<'static>, op: &ktir_core::ir::Operation<'static>) -> Option<(f32, Ssa)> {
+pub fn splat_scale_of(f: &IRFunction<'static>, op: &ktir_core::ir::Operation<'static>) -> Option<(f32, Ssa)> {
     let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
     // A splatted compile-time FLOAT. `arith.constant` → `tensor.splat` is the only spelling this
     // crate's producers use, and it is the one `program_scalarmul_scale` already reads.
@@ -439,7 +739,7 @@ fn splat_scale_of(f: &IRFunction<'static>, op: &ktir_core::ir::Operation<'static
 /// A combiner outside the two the device has is `None`, and the caller refuses it by name — a
 /// `linalg.reduce` combining with `arith.mulf` (a product reduction) has no `sfp` reduce op-func, and
 /// lowering it as the nearest one would compute a different function.
-fn reduce_kind_of(op: &ktir_core::ir::Operation<'static>) -> Option<ReduceKind> {
+pub fn reduce_kind_of(op: &ktir_core::ir::Operation<'static>) -> Option<ReduceKind> {
     op.attributes.iter().find_map(|(k, v)| match (k, v) {
         (AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf)) => Some(ReduceKind::Sum),
         (AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaxnumf)) => Some(ReduceKind::Max),
@@ -602,6 +902,13 @@ pub fn lower_function(
     // device has `OpFunc::Silu` and KTIR has no op for it, so the longhand is the only spelling a
     // producer HAS — and lowering it op-by-op computes a different algorithm, not a slower one.
     let silus = program_silu_mul_chains(f)?;
+    // THE RMSNORM CHAINS, read before the walk for the same reason the silus are. ⭐ AND THIS ONE IS
+    // LOAD-BEARING FOR MORE THAN FUSION: its `ms = sum(x²)·INV_D` would otherwise be classified as a
+    // `ScalarMul` and ask for `1/cols`'s registry slot — the exact divergence
+    // `triton-ktir-superdsc`'s `scales_for` documents as refused, because the registry index IS the
+    // device tid and a spurious slot moves every later constant's address. Recognising the chain makes
+    // that multiply chain-interior, so the divisor never reaches the registry at all.
+    let rmsnorms = program_rmsnorm_chains(f)?;
 
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
@@ -611,10 +918,10 @@ pub fn lower_function(
         // `Program::SiluMul` below stands for all five ops, and the device primitive never
         // materialises these values. Skipped BEFORE `program_of`, which would otherwise refuse the
         // `arith.negf` for having no 1:1 mapping (correctly, in isolation).
-        if op
-            .result
-            .is_some_and(|r| silus.iter().any(|c| c.consumed.contains(&r)))
-        {
+        if op.result.is_some_and(|r| {
+            silus.iter().any(|c| c.consumed.contains(&r))
+                || rmsnorms.iter().any(|c| c.consumed.contains(&r))
+        }) {
             continue;
         }
         // The terminal `arith.mulf` IS the fused program, and its inputs are the chain's gate and up
@@ -636,8 +943,12 @@ pub fn lower_function(
         let scalar = (op.op_type == OpKind::ArithMulf)
             .then(|| splat_scale_of(f, op))
             .flatten();
+        // An rmsnorm chain's TERMINAL gain multiply becomes the one fused program. Checked before the
+        // splat arm and before the 1:1 map, both of which would otherwise claim it.
+        let rms = rmsnorms.iter().find(|c| op.result == Some(c.out));
         let Some(program) = terminal
             .map(|_| Lowering::Silu)
+            .or(rms.map(|c| Lowering::RmsNorm(c.eps)))
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
             .or_else(|| program_of(op.op_type).map(Lowering::Node))
@@ -669,6 +980,8 @@ pub fn lower_function(
             // The splat is not an operand of the descriptor — it rides in the op as a bound `[1,1]`
             // const — so a scalar multiply reads ONE tensor.
             Lowering::ScalarMul(_) => 1,
+            // x and gamma; the epsilon and `1/cols` are the fused body's own.
+            Lowering::RmsNorm(_) => 2,
             Lowering::Node(Program::Matmul) => 2,
             Lowering::Node(Program::Elementwise(e)) => {
                 match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
@@ -682,6 +995,12 @@ pub fn lower_function(
 
         // A fused chain's inputs are the ones the RECOGNISER proved, not the terminal op's operands.
         let in_values: Vec<Ssa> = match (terminal, scalar) {
+            // The two tensors the rmsnorm recogniser proved, walked back through the rank plumbing to
+            // values a `Region` exists for.
+            _ if rms.is_some() => {
+                let c = rms.expect("just matched");
+                vec![c.x, c.gamma]
+            }
             (Some(c), _) => vec![c.gate, c.up],
             // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
             // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
@@ -857,6 +1176,14 @@ fn emit_one(
         Lowering::ScalarMul(scale) => {
             return super::lower_ktir_to_superdsc::scalarmul_at(
                 name, scale, per_op, sym_id_base, layout,
+            );
+        }
+        // THE FUSED RMSNORM. `per_op` is `[x, gamma, out]`, which is `rmsnorm_at`'s own
+        // `split_out(.., 2)` order. The epsilon is THIS chain's, read at its own `arith.addf`, because
+        // `program_rmsnorm_eps` requires one root per FUNCTION and a decoder layer has two.
+        Lowering::RmsNorm(eps) => {
+            return super::lower_ktir_to_superdsc::rmsnorm_at(
+                name, eps, per_op, sym_id_base, layout,
             );
         }
         Lowering::Node(p) => p,
