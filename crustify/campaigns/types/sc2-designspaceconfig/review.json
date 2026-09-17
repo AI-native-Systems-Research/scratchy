@@ -98,7 +98,7 @@
        "name": "e018_DesignSpaceConfig",
        "defined_in": "crustify-types/cpp/designSpaceConfig.h",
        "kind": "type",
-       "source_kind": "class",
+       "source_kind": "struct",
        "layer": 5,
        "loc": 650,
        "deps": {

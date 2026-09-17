@@ -12,9 +12,9 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 16,
-  "layer_count": 5,
-  "batch_count": 9,
+  "unit_count": 14,
+  "layer_count": 4,
+  "batch_count": 4,
   "file_count": 3
  },
  "waves": [
@@ -86,13 +86,7 @@
         "granularity_",
         "maxSize_"
        ]
-      }
-     ]
-    },
-    {
-     "kind": "type",
-     "source_file": "crustify-types/cpp/ddc_metadata.h",
-     "items": [
+      },
       {
        "name": "e004_FailedAlloc",
        "defined_in": "crustify-types/cpp/ddc_metadata.h",
@@ -108,13 +102,7 @@
        "back_fill": [],
        "generates": [],
        "field_anchors": []
-      }
-     ]
-    },
-    {
-     "kind": "type",
-     "source_file": "crustify-types/cpp/dsc2.h",
-     "items": [
+      },
       {
        "name": "e005_CoordinateType",
        "defined_in": "crustify-types/cpp/dsc2.h",
@@ -256,13 +244,7 @@
         "zij_",
         "zj_"
        ]
-      }
-     ]
-    },
-    {
-     "kind": "type",
-     "source_file": "crustify-types/cpp/dsc2.h",
-     "items": [
+      },
       {
        "name": "e009_ScheduleNode",
        "defined_in": "crustify-types/cpp/dsc2.h",
@@ -425,13 +407,7 @@
         "unitTimeTransferNumChunks_",
         "via_"
        ]
-      }
-     ]
-    },
-    {
-     "kind": "type",
-     "source_file": "crustify-types/cpp/dsc2.h",
-     "items": [
+      },
       {
        "name": "e015_ComputeNode",
        "defined_in": "crustify-types/cpp/dsc2.h",
@@ -480,84 +456,6 @@
         "repetitionWithOffset_",
         "repetition_",
         "type_"
-       ]
-      }
-     ]
-    }
-   ]
-  },
-  {
-   "unit_count": 2,
-   "batches": [
-    {
-     "kind": "type",
-     "source_file": "crustify-types/cpp/dsc2.h",
-     "items": [
-      {
-       "name": "e011_LoopNode",
-       "defined_in": "crustify-types/cpp/dsc2.h",
-       "kind": "type",
-       "source_kind": "struct",
-       "layer": 3,
-       "loc": 57,
-       "deps": {
-        "types": [
-         {
-          "name": "e009_ScheduleNode",
-          "defined_in": "crustify-types/cpp/dsc2.h",
-          "scope": "port"
-         },
-         {
-          "name": "e010_BlockNode",
-          "defined_in": "crustify-types/cpp/dsc2.h",
-          "scope": "port"
-         }
-        ],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": [
-        "denId_",
-        "dim_",
-        "dims_",
-        "isParametricLoop_",
-        "kind_",
-        "loopCountSymbolIds_",
-        "numId_",
-        "parametricLdsIdx_"
-       ]
-      },
-      {
-       "name": "e012_ConditionNode",
-       "defined_in": "crustify-types/cpp/dsc2.h",
-       "kind": "type",
-       "source_kind": "struct",
-       "layer": 3,
-       "loc": 35,
-       "deps": {
-        "types": [
-         {
-          "name": "e009_ScheduleNode",
-          "defined_in": "crustify-types/cpp/dsc2.h",
-          "scope": "port"
-         },
-         {
-          "name": "e010_BlockNode",
-          "defined_in": "crustify-types/cpp/dsc2.h",
-          "scope": "port"
-         }
-        ],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": [
-        "coreClCond_",
-        "loopCond_",
-        "next_"
        ]
       }
      ]

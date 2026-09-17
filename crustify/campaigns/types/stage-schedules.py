@@ -58,6 +58,16 @@ def cpp_class(header: str, name: str) -> tuple[str, int, int, list[str]]:
             break
     if start is None:
         raise SystemExit(f"⛔ {name} not found in {header} — UNITS.tsv and the vendored header disagree")
+    # ⛔⛔ crustify's TranslateAgent TAXONOMY IS C'S: it accepts only struct/union/enum/macro and
+    # rejects a whole BATCH with `ValueError: unsupported type kind(s) ['class']`. That killed 14 of
+    # sc1's 16 units on the first real wave — every batch that contained one `class` failed wholesale,
+    # and 7 of these 18 units are declared `class` (DataStructDims, BlockNode, ScheduleTree,
+    # DesignSpaceConfig among them).
+    # A C++ `class` differs from `struct` ONLY in default member access, so for a port they are the
+    # same aggregate and "struct" is the honest kind to report. The vendored header remains the
+    # authority for the actual keyword; nothing about the C++ is restated.
+    if kind == "class":
+        kind = "struct"
     end = next(i for i in range(start, len(lines)) if lines[i].startswith("};"))
     body = "\n".join(lines[start:end + 1])
     fields = sorted({
