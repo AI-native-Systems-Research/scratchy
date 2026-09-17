@@ -1299,3 +1299,9 @@ mod tests_e104 {
         assert_eq!(Metadata::CHUNK_DSTGID.0, 1);
     }
 }
+
+// `FailedAlloc` (`ddc/ddc_metadata.h:24`) IS [`crate::schedule::ddc::v1::TrackerSite`], field for
+// field, and the anchor lives there because that is where the four values are load-bearing. Its
+// members are the tracker site an allocation was refused at — the same four `getTracker` is keyed by
+// — and its only container in the reference is read solely as `size() == 0` (`ddc/ddcv1.cpp:378`,
+// `:436`), so a second struct here would carry nothing that `success` does not already say.

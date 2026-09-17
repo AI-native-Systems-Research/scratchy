@@ -33,8 +33,7 @@ use crate::schedule::ddc::transformation_util::{
 use crate::schedule::ddc::v1;
 use crate::schedule::dsc2::{
     AllocLayout, AllocPlacement, AllocateNode, BlockNode, Coordinate, Dsc, LayoutDims, LdsIdx,
-    LoopCondComposite, MaxDimSize, NodeName, NumBuffers, Padding, StartAddress, SyncNode,
-    TransferNode,
+    LoopCondComposite, MaxDimSize, NodeName, NumBuffers, StartAddress, SyncNode, TransferNode,
 };
 use crate::schedule::l3::dl_ops::{
     AllocCoordinateSeam, AllocationReads, AllocationSites, AllocationView, ChunkLoopNest,
@@ -1283,7 +1282,7 @@ fn ddc_view(minted: &L3AllocateNode) -> Option<AllocateNode> {
                 Buffering::Double => NumBuffers::Double,
                 Buffering::Streaming => NumBuffers::Streaming,
             },
-            padding: Padding::default(),
+            padding: PaddingForm::default(),
             buffer_offset: BTreeMap::new(),
             is_start_addr_symbolic: false,
         },

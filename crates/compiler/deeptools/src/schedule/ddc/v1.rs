@@ -182,7 +182,7 @@ use crate::schedule::ddc::transformation::{
 use crate::schedule::ddc::transformation_util::{
     AllocateCloning, ComponentAllocations, ComputeCloning, DataStages as UtilDataStages,
     DatastageExploration, DscAllocations, ExternalStreams, FifoResults, LatchDataIds,
-    MintedConnects, NewLabeledDs, SkipRegResults, StageExtents as UtilStageExtents,
+    MintedConnects, NewLabeledDs, PaddingForm, SkipRegResults, StageExtents as UtilStageExtents,
     TransferUnrolling, add_new_lds,
 };
 use crate::schedule::ddl::DdlModuleOp;
@@ -194,10 +194,10 @@ use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::dsc2::{
     AddressFold, AllocateNode, BlockNode, CondOp, CondRegions, ComputeNode, ConditionNode,
     Coordinate, DataInfo, Dsc, Dsts, FoldCoeff, FoldDim, FoldPosition, LdsIdx, LdsScale, LoopBound,
-    LoopCond, LoopCondComposite, MaxDimSize, NodeName, NumBuffers, NumChunks, Operand, Padding,
-    Precision, RegSlot, ReplicationFactor, SchedNode, Size, SizeAndIndex, StartAddress,
-    StickDimIdx, StickMaskNode, SyncNode, TransferKind, TransferNode, TransferPadding, Unroll, Via,
-    WordLength, generic_comp,
+    LoopCond, LoopCondComposite, MaxDimSize, NodeName, NumBuffers, NumChunks, Operand, Precision,
+    RegSlot, ReplicationFactor, SchedNode, Size, SizeAndIndex, StartAddress, StickDimIdx,
+    StickMaskNode, SyncNode, TransferKind, TransferNode, TransferPadding, Unroll, Via, WordLength,
+    generic_comp,
 };
 use crate::schedule::l3::dsc::{DimPadding, DscIdx, SuperDsc, SymbolicDimInfo, UnneededPad};
 use crate::units::{Core, Corelet, Row};
@@ -1354,6 +1354,15 @@ impl Density {
 /// (`ddc/ddcv1.cpp:1172`), which [`Elements`] cannot spell — deliberately: both readers of a negative
 /// one `DT_ERROR` on the spot (`:2657-2660`, `:2674-2677`), so [`None`] rather than a value is the
 /// faithful answer for that dim.
+///
+/// ⚠ AND IT IS A SECOND, LOSSY SPELLING OF A TYPE THE CRATE ALREADY HAS.
+/// [`crate::schedule::l3::dsc::DimPadding`] carries ALL EIGHT declared fields of `DimPaddingSizes`
+/// and is where `StageDims` STORES them; this type is BUILT out of one, by `stage_padding_sizes`
+/// and `stage_padding_dims`, and reaches no other way. The two must merge, and the merge is
+/// DELETING THIS ONE along with the carrier layer — not widening it. What it drops is the
+/// `unneededPad` triple, and that triple is not optional: `carryUnneededPadToChunk` is `true`
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:48`), so the one place that would clear it (`:144`)
+/// never runs and the counts travel from the core data stage to the chunk one intact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaddingSizes {
     /// `windowDim_`.
@@ -1441,16 +1450,35 @@ pub enum Placed {
     DoesntFit,
 }
 
+/// Replaces: e004_FailedAlloc
+///
 /// ONE MEMORY TRACKER — `memTrackers->getTracker(comp, core, corelet, row)` (`ddc/ddcv1.cpp:187`).
+///
+/// ⭐ THIS IS ALSO `FailedAlloc` (`ddc/ddc_metadata.h:24`), FIELD FOR FIELD, AND A SECOND STRUCT FOR
+/// IT WOULD BE DEAD CODE. `FailedAlloc`'s four members ARE the tracker site an allocation was
+/// refused at — `comp` (`:25`), `core` (`:26`), `corelet` (`:27`), `row` (`:28`), the same four
+/// `getTracker` is keyed by. In the reference its only container, `Ddc::allocAllMem`'s
+/// `std::vector<FailedAlloc> failedAllocs` (`ddc/ddcv1.cpp:133`), is written once (`:363-368`) and
+/// read ONLY as `failedAllocs.size() == 0` (`:378`, `:436`): a write-only diagnostic whose single
+/// bit `success` already carries beside it. So the type is carried where the site is load-bearing,
+/// and `schedule/ddc/metadata.rs` holds a cross-reference at the header it is declared in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TrackerSite {
-    /// `comp`.
+    /// Field: e004_FailedAlloc.comp
+    ///
+    /// `comp` (`ddc/ddc_metadata.h:25`) — `SenComponents` narrowed to the memories a DDC places in.
     pub memory: DdcMemory,
-    /// `core`.
+    /// Field: e004_FailedAlloc.core
+    ///
+    /// `core` (`:26`).
     pub core: Core,
-    /// `corelet`.
+    /// Field: e004_FailedAlloc.corelet
+    ///
+    /// `corelet` (`:27`).
     pub corelet: Corelet,
-    /// `row`.
+    /// Field: e004_FailedAlloc.row
+    ///
+    /// `row` (`:28`).
     pub row: Row,
 }
 
@@ -1988,20 +2016,26 @@ where
                 let density = dsc.dim_density(lds, dim);
                 let stick = i64::try_from(cumulative_stick_size(&sticks, dim)?.get()).ok()?;
                 if dim != split_dim {
-                    let extent =
-                        dsc.dim_extent(size_stage, dim, unit, Some(previous), padding.get(dim), density);
+                    let extent = dsc.dim_extent(
+                        size_stage,
+                        dim,
+                        unit,
+                        Some(previous),
+                        padding.padding(dim),
+                        density,
+                    );
                     offset *= extent.0 / stick;
                     continue;
                 }
                 // Use the chunk data stage where the dim is corelet-split.
-                let span = match padding.get(dim) {
+                let span = match padding.padding(dim) {
                     PadType::NoPad => {
                         dsc.dim_extent(
                             Metadata::CHUNK_DSTGID,
                             dim,
                             unit,
                             Some(previous),
-                            padding.get(dim),
+                            padding.padding(dim),
                             density,
                         )
                         .0
@@ -2582,16 +2616,16 @@ where
         }
         let stages = tree.loop_stages(here);
         for (dim, kind) in tree.loop_dims(here) {
-            let mut alloc_padding = padding.get(dim);
+            let mut alloc_padding = padding.padding(dim);
             let mut relevant = layout.contains(&dim);
             let mut related_pad_dim = None;
             if !relevant && !tree.is_parametric(here) {
                 // Accessing a padded dim through the window dim that walks it — iterating within one
                 // window.
                 for (pad_dim, pad_info) in dsc.stage_padding_dims(stages.den) {
-                    if pad_info.window_dim == dim && padding.get(pad_dim) != PadType::NoPad {
+                    if pad_info.window_dim == dim && padding.padding(pad_dim) != PadType::NoPad {
                         relevant = true;
-                        alloc_padding = padding.get(pad_dim);
+                        alloc_padding = padding.padding(pad_dim);
                         related_pad_dim = Some(pad_dim);
                         break;
                     }
@@ -2672,7 +2706,7 @@ where
             {
                 continue;
             }
-            let alloc_padding = padding.get(dim);
+            let alloc_padding = padding.padding(dim);
             if !is_zero_padded(alloc_padding) {
                 continue;
             }
@@ -2698,7 +2732,7 @@ where
                             dim,
                             SenComponent::NoComponent,
                             None,
-                            padding.get(dim),
+                            padding.padding(dim),
                             Density::FULL,
                         )
                         .0;
@@ -2776,7 +2810,7 @@ pub fn padded_loop_offset<P: StageSizes + OffsetSizes + ?Sized>(
     kind: MetaDimKind,
     unit: SenComponent,
     view: Option<Corelet>,
-    padding: &Padding,
+    padding: &PaddingForm,
     alloc_padding: PadType,
     related_pad_dim: Option<PrimaryDim>,
     step: i64,
@@ -2805,7 +2839,8 @@ pub fn padded_loop_offset<P: StageSizes + OffsetSizes + ?Sized>(
                 // Indexing the padded dim directly, or its valid part — the zero-pad front is added
                 // as a constant offset by the climb above.
                 return Some(
-                    dsc.comp_view_scaled(stage, dim, unit, view, padding.get(dim), density).0,
+                    dsc.comp_view_scaled(stage, dim, unit, view, padding.padding(dim), density)
+                        .0,
                 );
             }
             if let Some(sizes) = dsc.stage_padding_sizes(stage, dim) {
@@ -6864,6 +6899,7 @@ mod tests_e132_e136 {
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -7715,6 +7751,7 @@ mod tests_e258_e263 {
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }

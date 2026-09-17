@@ -24,9 +24,11 @@
 //! exactly three, and each remaining message says which:
 //!
 //! 1. **⛔ A FIELD OUR `dsc2::ComputeNode` DROPPED** — `isOpaqueOp_` (`dsc/dsc2.h:941`),
-//!    `repetitionWithOffset_` (`:954`), `inputCoordinates_`/`outputCoordinate_` (`:948-949`) — and on
-//!    `dsc2::DataInfo`, `loopEleOffsets_` (`:730-734`) and `constEleOffsets_` (`:727-729`). The FIELD
-//!    is the work; adding one is a `schedule/dsc2.rs` change, not a carrier change.
+//!    `repetitionWithOffset_` (`:954`), `inputCoordinates_`/`outputCoordinate_` (`:948-949`). The
+//!    FIELD is the work; adding one is a `schedule/dsc2.rs` change, not a carrier change.
+//!    ⭐ `dsc2::DataInfo`'s `loopEleOffsets_` (`:730-734`) and `constEleOffsets_` (`:727-729`) HAVE
+//!    LEFT THIS CLASS: both are declared (`schedule/dsc2.rs:433`, `:428`), so those four `todo!`s are
+//!    case 2 — a write door — and their messages say so.
 //! 2. **⛔ THE ONE MISSING DOOR** — a `pub(super)` compute READ-MODIFY-WRITE on [`Dsc2Store`], the
 //!    exact shape [`Dsc2Store::edit_transfer`] already is for a transfer, plus a mint. `with_tree_mut`
 //!    is PRIVATE to [`super::ddc_store`] and [`Dsc2Store`]'s `state`/`dsc` fields are that module's,
@@ -96,7 +98,7 @@ impl Dsc2Store<'_, '_> {
     /// chosen here.
     fn allocation_at(
         &self,
-        data: DataInfo,
+        data: &DataInfo,
         storage: SenComponent,
     ) -> Option<crate::schedule::ddc::fold::AllocId> {
         // `dsc2::memories.count(storage) == 0` (`:2597-2603`).
@@ -440,14 +442,14 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
         tu::ScheduleSurgery::owner_loop(self, node)
     }
 
-    /// ⛔⛔ `loopEleOffsets_` IS NOT ON THE NODE IN THIS PORT — AND THAT IS A FINDING, not a gap in
-    /// this carrier. `dsc2::DataInfo` (`schedule/dsc2.rs`) projects FOUR fields of
-    /// `LdsAndLoopOffsets` — `dataConnect_`, `myLdsIdx_`, `constantId_`, `latchDataId_` — and
-    /// `loopEleOffsets_`/`constEleOffsets_` live instead on [`v1::DataInfoFill`]
-    /// (`ddc/v1.rs:2121-2135`), which entry 260 WRITES INTO THE SINK rather than onto the transfer.
-    /// So the reference's read-back of an offset it wrote earlier has no node field to come from, and
-    /// answering EMPTY here would make entry 133's restickify fixup silently find no offsets to
-    /// adjust.
+    /// ⛔⛔ THE FIELD IS DECLARED AND STILL NOTHING WRITES THE NODE'S COPY — AND THAT IS THE FINDING,
+    /// not a gap in this carrier. `loopEleOffsets_` IS
+    /// [`crate::schedule::dsc2::DataInfo::loop_ele_offsets`] (`schedule/dsc2.rs:433`), as
+    /// `constEleOffsets_` is `:428`; what has no writer is the copy ON THE TRANSFER. Entry 260
+    /// (`v1::fill_data_info`, `ddc/v1.rs:2535`) hands both maps to a SINK as a [`v1::DataInfoFill`]
+    /// (`ddc/v1.rs:2203`) instead of onto the node, so the reference's read-back of an offset it
+    /// wrote earlier still has nothing to read, and answering EMPTY here would make entry 133's
+    /// restickify fixup silently find no offsets to adjust.
     fn src_loop_ele_offsets(
         &self,
         _node: NodeId,
@@ -455,11 +457,10 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
     ) -> Vec<(tr::LoopId, Vec<PrimaryDim>)> {
         todo!(
             "v1::LoopOffsets::src_loop_ele_offsets: wants \
-             srcLdsAndLoopOffsets_.loopEleOffsets_.at(corelet) (dsc/dsc2.h:730-734) — \
-             dsc2::DataInfo projects only \
-             dataConnect_/myLdsIdx_/constantId_/latchDataId_, and loopEleOffsets_ lives on \
-             v1::DataInfoFill (ddc/v1.rs:2127), which entry 260 writes into the SINK and not onto \
-             the transfer node"
+             srcLdsAndLoopOffsets_.loopEleOffsets_.at(corelet) (dsc/dsc2.h:730-734) — the field IS \
+             dsc2::DataInfo::loop_ele_offsets (schedule/dsc2.rs:433) and NOTHING writes the node's \
+             copy: entry 260 hands the map to a sink as v1::DataInfoFill (ddc/v1.rs:2203) instead \
+             of onto the transfer"
         )
     }
 
@@ -475,15 +476,16 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
         todo!(
             "v1::LoopOffsets::set_src_loop_ele_offset: wants \
              srcLdsAndLoopOffsets_.loopEleOffsets_[cl][loop][dim] = offset — see \
-             src_loop_ele_offsets: the map is on v1::DataInfoFill, not on dsc2::DataInfo"
+             src_loop_ele_offsets: the map is DECLARED on dsc2::DataInfo (schedule/dsc2.rs:433) and \
+             written only into a v1::DataInfoFill"
         )
     }
 
     /// ⛔ THE SAME SPLIT ON THE COMPUTE SIDE — `inputsLdsAndLoopOffsets_` (`dsc/dsc2.h:937`) IS
-    /// [`crate::schedule::dsc2::ComputeNode::inputs`], so this is NOT *"no Compute arm"*: it is
-    /// `loopEleOffsets_` (`dsc/dsc2.h:730-734`) missing from
-    /// [`crate::schedule::dsc2::DataInfo`], plus the write door. See
-    /// [`Self::src_loop_ele_offsets`].
+    /// [`crate::schedule::dsc2::ComputeNode::inputs`], so this is NOT *"no Compute arm"*, and it is
+    /// no longer the field either: `loopEleOffsets_` (`dsc/dsc2.h:730-734`) is
+    /// [`crate::schedule::dsc2::DataInfo::loop_ele_offsets`]. What is left is the WRITE DOOR alone.
+    /// See [`Self::src_loop_ele_offsets`].
     fn set_input_loop_ele_offset(
         &mut self,
         _node: NodeId,
@@ -496,8 +498,8 @@ impl v1::LoopOffsets for Dsc2Store<'_, '_> {
         todo!(
             "v1::LoopOffsets::set_input_loop_ele_offset: wants \
              inputsLdsAndLoopOffsets_.at(input).loopEleOffsets_[cl][dim_loop][dim] = offset — \
-             loopEleOffsets_ (dsc/dsc2.h:730-734) is not a field of dsc2::DataInfo and there is no \
-             compute WRITE door; the Compute arm itself is present"
+             loopEleOffsets_ (dsc/dsc2.h:730-734) IS dsc2::DataInfo::loop_ele_offsets and the \
+             Compute arm is present; what is missing is the compute WRITE door"
         )
     }
 }
@@ -787,7 +789,7 @@ impl tu::ExternalStreams for Dsc2Store<'_, '_> {
     /// filled.
     fn storage_or_datastream_is_external(
         &self,
-        _data: DataInfo,
+        _data: &DataInfo,
         _storage: SenComponent,
         _direction: tu::StreamDirection,
     ) -> bool {
@@ -857,7 +859,7 @@ impl tu::TransferMoves for Dsc2Store<'_, '_> {
     /// *"this destination has no allocation to own a loop"* and skips the destination
     /// (`ddc/transformation.rs:2467-2469`), which is what `allowMissingAlloc = true` buys there.
     fn destination_allocation(&self, dst: &Operand) -> Option<NodeId> {
-        let alloc = self.allocation_at(dst.data, dst.storage)?;
+        let alloc = self.allocation_at(&dst.data, dst.storage)?;
         self.with_tree(|tree| tree.node_of_alloc(alloc))
     }
 
@@ -1338,7 +1340,7 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
     /// than a throw — stated as a divergence, and a panic is the only honest reading of it — while the
     /// `.at()` on the width table IS the throw for a `dataFormat_` of `INVALID`. This is an ELEMENT
     /// WIDTH: a stand-in resizes every packmerge operand, so both stop.
-    fn operand_element_bits(&self, dinfo: DataInfo) -> crate::formats::Bits {
+    fn operand_element_bits(&self, dinfo: &DataInfo) -> crate::formats::Bits {
         let lds = dinfo.my_lds_idx.unwrap_or_else(|| {
             panic!(
                 "tr::AutoShuffling::operand_element_bits: labeledDs_[myLdsIdx_] on an operand whose \
@@ -1371,7 +1373,10 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
     /// (`ddc/transformations/automatic_shuffle/shuffle.cpp:1043-1045`), which an empty `stickRepl_`
     /// PASSES — so a fresh empty vector here would assert *"nothing is replicated"* for an operand
     /// that may well be, and it would compile.
-    fn operand_sticks(&self, _dinfo: DataInfo) -> Option<crate::schedule::ddc::shuffle::OperandSticks> {
+    fn operand_sticks(
+        &self,
+        _dinfo: &DataInfo,
+    ) -> Option<crate::schedule::ddc::shuffle::OperandSticks> {
         todo!(
             "tr::AutoShuffling::operand_sticks: wants primaryDsInfo_.at(dsType_).stickRepl_ \
              (ddc/transformations/automatic_shuffle/shuffle.cpp:805-813), which \
@@ -1399,9 +1404,10 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
     /// ⛔ `node->{inputs,outputs}LdsAndLoopOffsets_[pos].constEleOffsets_ = offsets`
     /// (`ddc/transformations/automatic_shuffle/shuffle.cpp:881-896`) — ⛔⛔ NOT *"no Compute arm"*:
     /// the arm holds the node and `{inputs,outputs}LdsAndLoopOffsets_` (`dsc/dsc2.h:937-938`) are
-    /// [`crate::schedule::dsc2::ComputeNode`]'s own `inputs`/`outputs`. BOTH other halves are
-    /// missing: `constEleOffsets_` (`dsc/dsc2.h:727-729`, per core AND corelet) is not a field of
-    /// [`crate::schedule::dsc2::DataInfo`], which projects four, and there is no compute write door.
+    /// [`crate::schedule::dsc2::ComputeNode`]'s own `inputs`/`outputs`. AND NOT THE FIELD EITHER:
+    /// `constEleOffsets_` (`dsc/dsc2.h:727-729`, per core AND corelet) IS
+    /// [`crate::schedule::dsc2::DataInfo::const_ele_offsets`] (`schedule/dsc2.rs:428`). THE COMPUTE
+    /// WRITE DOOR IS THE ONE HALF LEFT.
     fn set_const_ele_offsets(
         &mut self,
         _node: NodeId,
@@ -1412,8 +1418,8 @@ impl tr::AutoShuffling for Dsc2Store<'_, '_> {
             "tr::AutoShuffling::set_const_ele_offsets: wants \
              node->{{inputs,outputs}}LdsAndLoopOffsets_[pos].constEleOffsets_ = offsets \
              (ddc/transformations/automatic_shuffle/shuffle.cpp:881-896) — constEleOffsets_ \
-             (dsc/dsc2.h:727-729) is not a field of dsc2::DataInfo, and there is no compute WRITE \
-             door; the Compute arm itself is present"
+             (dsc/dsc2.h:727-729) IS dsc2::DataInfo::const_ele_offsets (schedule/dsc2.rs:428) and \
+             the Compute arm is present; what is missing is the compute WRITE door"
         )
     }
 }
@@ -1967,6 +1973,7 @@ mod authority_tests {
             my_lds_idx: Some(lds),
             constant_id: None,
             latch_data_id: None,
+            ..DataInfo::EMPTY
         }
     }
 
@@ -1977,6 +1984,7 @@ mod authority_tests {
             my_lds_idx: None,
             constant_id: Some(id),
             latch_data_id: None,
+            ..DataInfo::EMPTY
         }
     }
 

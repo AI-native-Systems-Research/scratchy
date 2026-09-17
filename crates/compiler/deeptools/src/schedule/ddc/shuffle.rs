@@ -2685,7 +2685,7 @@ pub trait ComputationBuilder {
     /// The four DSC reads `replace_assign` makes of ONE operand's labelled DS — `labeledDs_` (`:802`),
     /// `primaryDsInfo_.at(dsType_)` (`:805`), `getLayoutDims(ldsIdx_)` (`:873`) and
     /// `getStickSizes(dsType_)` (`:876`) — as one value, [`None`] for those `.at()`s.
-    fn operand_sticks(&self, dinfo: DataInfo) -> Option<OperandSticks>;
+    fn operand_sticks(&self, dinfo: &DataInfo) -> Option<OperandSticks>;
 
     /// `currDsc->coreIdsUsed_` (`:881`).
     fn cores_used(&self) -> CoresUsed;
@@ -2985,7 +2985,7 @@ impl<B: ComputationBuilder + ?Sized> DataEdgeCodegen<'_, B> {
     /// FIRST LAYOUT dim — 1 for a stick that does not name that dim, which is the reference's own
     /// initialiser.
     fn jump_to_stick(&mut self, edge: &mut DataEdge, stick: StickNumber) {
-        let Some(sticks) = self.builder.operand_sticks(edge.dinfo) else {
+        let Some(sticks) = self.builder.operand_sticks(&edge.dinfo) else {
             return;
         };
         let first_dim = sticks.layout_dims.first();
@@ -3102,10 +3102,10 @@ impl AssignReplacement for AutoShuffler {
         let Some(edges) = builder.assign_edges() else {
             return false;
         };
-        let Some(input) = builder.operand_sticks(edges.input.dinfo) else {
+        let Some(input) = builder.operand_sticks(&edges.input.dinfo) else {
             return false;
         };
-        let Some(output) = builder.operand_sticks(edges.output.dinfo) else {
+        let Some(output) = builder.operand_sticks(&edges.output.dinfo) else {
             return false;
         };
         let Some(in_sticks) = SubdividedSticks::new(&input.primary_sticks, &input.primary_stick_repl)
@@ -3248,7 +3248,7 @@ mod tests_e371 {
             })
         }
 
-        fn operand_sticks(&self, dinfo: DataInfo) -> Option<OperandSticks> {
+        fn operand_sticks(&self, dinfo: &DataInfo) -> Option<OperandSticks> {
             let primary_sticks = if dinfo.my_lds_idx == Some(LdsIdx(IN_LDS)) {
                 stick_dims(&[(PrimaryDim::Out, 32)])
             } else {

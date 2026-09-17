@@ -285,11 +285,9 @@ impl v1::ExploreTree for Dsc2Tree<'_, '_> {
     /// OBJECTION THIS DOC USED TO CARRY NAMED THE WRONG SEAM.
     ///
     /// ⭐ `getPadding` IS ALREADY PORTED, on that same citation:
-    /// [`crate::schedule::ddc::transformation_util::PaddingForm::padding`]. The `dsc/` seam is
-    /// translating a whole [`crate::schedule::ddc::transformation_util::PaddingForm`] into the OTHER
-    /// Rust spelling of `padding_` ([`crate::schedule::dsc2::Padding`]) — which is what
-    /// [`super::Dsc2Sites`]' `AllocArena` seed refuses to do, and why the ARENA cannot answer this —
-    /// and NOT reading one [`PadType`] out of one form.
+    /// [`crate::schedule::ddc::transformation_util::PaddingForm::padding`], and the SECOND Rust
+    /// spelling of `padding_` this doc used to name is GONE — [`super::Dsc2Sites`]' `AllocArena` seed
+    /// carries the form whole now, so the arena answers this rather than refusing it.
     ///
     /// ⭐ AND THE NODE HERE IS THE NODE THE REFERENCE READS: `ddcv1.cpp:677-681` takes `component_`,
     /// `ldsIdx_` and `padding_` off the SAME `an` that the `{ALLOCATE}` walk yielded, and

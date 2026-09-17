@@ -32,7 +32,8 @@ use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{ConstIdx, NodeId, PadType};
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
 use crate::schedule::ddc::transformation::LoopId;
-use crate::schedule::ddc::v1::LdsSticks;
+use crate::schedule::ddc::transformation_util::PaddingForm;
+use crate::schedule::ddc::v1::{ConstEleOffset, LdsSticks, LoopEleOffset};
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::l3::dl_ops::{GtrGroupId, Shares, VariableSymbol};
 use crate::schedule::l3::dsc::{IndirectAlloc, WkSlice};
@@ -145,12 +146,31 @@ pub struct Fold {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FoldDim {
     folds: VecDeque<Fold>,
+    /// Field: e005_CoordinateType.numOfSpatialFolds_
+    ///
+    /// THIS DIM'S ENTRY in `numOfSpatialFolds_` (`dsc/dsc2.h:436`). Absent from the reference's map
+    /// IS zero — `getNumOfSpatialFolds` (`:144`) says so outright — so the count is total here.
     spatial: u32,
+    /// Field: e005_CoordinateType.numOfTemporalFolds_
+    ///
+    /// This dim's entry in `numOfTemporalFolds_` (`dsc/dsc2.h:437`), zero when absent (`:147`).
     temporal: u32,
+    /// Field: e005_CoordinateType.numOfElemArrFolds_
+    ///
+    /// This dim's entry in `numOfElemArrFolds_` (`dsc/dsc2.h:438`), zero when absent (`:150`).
     elem_arr: u32,
 }
 
 impl FoldDim {
+    /// A DIM WITH NO FOLDS AND NO COUNTS — the entry a `CoordinateType` has not been given yet, and
+    /// the fold space a default-constructed `FoldManager` starts as.
+    pub const EMPTY: Self = Self {
+        folds: VecDeque::new(),
+        spatial: 0,
+        temporal: 0,
+        elem_arr: 0,
+    };
+
     /// This dim's folds, position 0 first — the order `getFoldDimSize(pos)` indexes.
     pub fn folds(&self) -> impl Iterator<Item = &Fold> {
         self.folds.iter()
@@ -182,14 +202,35 @@ impl FoldDim {
     }
 }
 
-/// A COORDINATE — `CoordinateType<CoordinateBaseType>` (`dsc/dsc2.h:76`) narrowed to its
-/// `coordinates_` map and the fold counts, which is what the fold builders read and write.
+/// Replaces: e005_CoordinateType
+///
+/// A COORDINATE — `CoordinateType<CoordinateBaseType>` (`dsc/dsc2.h:76`), carrying all SEVEN of its
+/// declared members: `coordinates_` with the three per-dim fold counts fused into it, plus
+/// `padding_`, `foldConstructed_` and `coreIdToWkSlice_`.
+///
+/// ⭐ THE THREE COUNT MAPS LIVE ON THE PER-DIM VALUE, NOT BESIDE IT. The reference keeps four
+/// independent `std::map`s keyed by the same dim, and `getCoordinateCategoryOfPos` (`:153`) reads
+/// three of them beside a `coordinates_.at(dim)` — so a dim named in one map and absent from another
+/// is a state it has to survive. Fusing them into [`FoldDim`] makes that state unspellable.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Coordinate {
+    /// Field: e005_CoordinateType.coordinates_
+    ///
+    /// `coordinates_` (`dsc/dsc2.h:431`), a `map<PrimaryDimTypes, FoldManager<Dtype>>`.
     dims: BTreeMap<PrimaryDim, FoldDim>,
-    padding: Padding,
+    /// Field: e005_CoordinateType.padding_
+    ///
+    /// `padding_` (`dsc/dsc2.h:439`) — how this coordinate READS each dim, which `clearFoldForDim`
+    /// deliberately leaves standing: *"Note: Padding is not cleared."* (`:100-102`).
+    padding: PaddingForm,
+    /// Field: e005_CoordinateType.foldConstructed_
+    ///
+    /// `foldConstructed_` (`dsc/dsc2.h:435`), which `completeFoldConstruction` (`:118`) sets and only
+    /// `clear` (`:97`) puts back.
     fold_constructed: bool,
-    /// `coreIdToWkSlice_` (`dsc/dsc2.h:81`) — WHICH WORK SLICE EACH CORE TAKES per dim as THIS
+    /// Field: e005_CoordinateType.coreIdToWkSlice_
+    ///
+    /// `coreIdToWkSlice_` (`dsc/dsc2.h:432`) — WHICH WORK SLICE EACH CORE TAKES per dim as THIS
     /// coordinate reads it, which entry 355 rewrites away from the super-DSC's own answer.
     core_id_to_wk_slice: BTreeMap<Core, WkSlice>,
 }
@@ -254,30 +295,24 @@ impl Coordinate {
         }
     }
 
-    /// `getPadding(dim)` (`dsc/dsc2.h:241`) — how this coordinate READS the dim, which is a
+    /// `getPadding(dim)` (`dsc/dsc2.h:242`) — how this coordinate READS the dim, which is a
     /// different fact from the allocation's own [`AllocPlacement::padding`] and survives
-    /// [`Self::clear_fold_for_dim`] as the reference's own note says (`:100`).
+    /// [`Self::clear_fold_for_dim`] as the reference's own note says (`:100-102`).
     #[must_use]
     pub fn padding(&self, dim: PrimaryDim) -> PadType {
-        self.padding.get(dim)
+        self.padding.padding(dim)
     }
 
     /// `setPadding(dim, pad)` (`dsc/dsc2.h:236`).
     pub fn set_padding(&mut self, dim: PrimaryDim, pad: PadType) {
-        self.padding.set(dim, pad);
+        self.padding.set_padding(dim, pad);
     }
 
     /// `setPadding(const PaddingFormType)` (`dsc/dsc2.h:240`) — REPLACES the whole form, which is a
     /// DIFFERENT operation from the per-dim [`Self::set_padding`]: a dim the form has no entry for
     /// goes back to reading `NOPAD`.
-    ///
-    /// ⛔ TAKES THE ENTRIES AND NOT A [`Padding`] so that the fold builders can hand over an
-    /// allocation's `padding_` without this module depending on theirs.
-    pub fn set_padding_form(&mut self, form: impl IntoIterator<Item = (PrimaryDim, PadType)>) {
-        self.padding = Padding::default();
-        for (dim, pad) in form {
-            self.padding.set(dim, pad);
-        }
+    pub fn set_padding_form(&mut self, form: PaddingForm) {
+        self.padding = form;
     }
 
     /// `coreIdToWkSlice_.at(core)` TO BE WRITTEN, [`None`] where the coordinate states no slice for
@@ -296,11 +331,12 @@ impl Coordinate {
         self.core_id_to_wk_slice.iter().map(|(&core, at)| (core, at))
     }
 
-    /// `getPadding()` (`dsc/dsc2.h:239`) — the WHOLE padding form, which entry 356 hands straight to
+    /// `getPadding()` (`dsc/dsc2.h:245`) — the WHOLE padding form, which entry 356 hands straight to
     /// another coordinate's [`Self::set_padding_form`]. Only the dims carrying a style are named;
     /// [`Self::padding`] already reads every other one as `NOPAD`.
-    pub fn padding_form(&self) -> impl Iterator<Item = (PrimaryDim, PadType)> + '_ {
-        self.padding.dims().map(|dim| (dim, self.padding.get(dim)))
+    #[must_use]
+    pub const fn padding_form(&self) -> &PaddingForm {
+        &self.padding
     }
 
     /// `foldConstructed()` (`dsc/dsc2.h:119`).
@@ -336,25 +372,75 @@ impl Coordinate {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct NodeName(pub String);
 
-/// WHAT AN OPERAND KNOWS ABOUT ITS DATA — `DataInfo` (`dsc/dsc2.h:721`) narrowed to the three fields
-/// the ported units read. `dataConnect_` is a closed set, so it is [`DataConnect`] and not a string;
-/// a default-constructed `DataInfo` leaves it EMPTY, which is the [`None`].
+/// Replaces: e007_DataInfo
+///
+/// WHAT AN OPERAND KNOWS ABOUT ITS DATA — `DataInfo` (`dsc/dsc2.h:721-739`), ALL TEN of its declared
+/// fields. `dataConnect_` is a closed set, so it is [`DataConnect`] and not a string; a
+/// default-constructed `DataInfo` leaves it EMPTY, which is the [`None`].
+///
+/// ⭐ THE SIX OFFSET AND ADDRESS FIELDS USED TO LIVE ONLY ON [`super::ddc::v1::DataInfoFill`], a
+/// payload handed to a carrier trait's `fill`, so no later unit could READ one back: four `todo!` stubs
+/// in `schedule/stages/ddc_store2.rs` state that against themselves. They are declared HERE, where
+/// the reference declares them, and `DataInfoFill` is the same six values in flight.
+///
+/// ⛔ NOT [`Copy`], AND THAT IS THE POINT OF DECLARING THEM. `constEleOffsets_`, `loopEleOffsets_`
+/// and `bufferAddrOffset_` are nested `std::map`s and `startAddr_` is a `FoldManager`; the C++ struct
+/// is not trivially copyable either, and a per-operand clone of four maps is not something a `Copy`
+/// bound should hide at the use site.
 ///
 /// ⚠️ [`super::ddc::fold::DataStream`] carries `myLdsIdx_` and `constantId_` as ONE
 /// [`super::ddc::fold::DataOrigin`], which is the stronger statement (`isLabeledDs`/`isConstant`
 /// `DT_CHECK` that both are not set). Converging the two spellings is a review pass's, not this
 /// batch's: `fold.rs` already carries the same note about the fold vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DataInfo {
-    /// `dataConnect_`.
+    /// Field: e007_DataInfo.dataConnect_
+    ///
+    /// `dataConnect_` (`dsc/dsc2.h:739`).
     pub data_connect: Option<DataConnect>,
-    /// `myLdsIdx_`, once its `-1` is an [`Option`].
+    /// Field: e007_DataInfo.myLdsIdx_
+    ///
+    /// `myLdsIdx_` (`dsc/dsc2.h:722`), once its `-1` is an [`Option`].
     pub my_lds_idx: Option<LdsIdx>,
+    /// Field: e007_DataInfo.constantId_
+    ///
     /// `constantId_` (`dsc/dsc2.h:726`), once its `-1` is an [`Option`].
     pub constant_id: Option<ConstIdx>,
+    /// Field: e007_DataInfo.latchDataId_
+    ///
     /// `latchDataId_` (`dsc/dsc2.h:725`), *"used to link producer and consumer when using LATCH"*,
     /// once its `-1` is an [`Option`]. Entry 339 is the one unit that mints one.
     pub latch_data_id: Option<LatchDataId>,
+    /// Field: e007_DataInfo.startAddr_
+    ///
+    /// `startAddr_` (`dsc/dsc2.h:723`), *"per core, corelet, and sdsc folds"* — the same
+    /// `FoldManager<int64_t>` an allocation's `startAddressCoreCorelet_` is, so it is the same
+    /// [`StartAddress`] and not a second spelling of one.
+    pub start_addr: StartAddress,
+    /// Field: e007_DataInfo.isStartAddrSymbolic_
+    ///
+    /// `isStartAddrSymbolic_` (`dsc/dsc2.h:724`), copied off the allocation.
+    pub is_start_addr_symbolic: bool,
+    /// Field: e007_DataInfo.constEleOffsets_
+    ///
+    /// `constEleOffsets_` (`dsc/dsc2.h:727-729`) — *"constant offset on top of the start address. Per
+    /// core and corelet"*.
+    pub const_ele_offsets: BTreeMap<Core, BTreeMap<Corelet, BTreeMap<PrimaryDim, ConstEleOffset>>>,
+    /// Field: e007_DataInfo.loopEleOffsets_
+    ///
+    /// `loopEleOffsets_` (`dsc/dsc2.h:730-734`), *"Per corelet"*. The reference keys the middle map
+    /// by `const LoopNode*`; a [`LoopId`] is that pointer with no way to dangle.
+    pub loop_ele_offsets: BTreeMap<Corelet, BTreeMap<LoopId, BTreeMap<PrimaryDim, LoopEleOffset>>>,
+    /// Field: e007_DataInfo.bufferAddrOffset_
+    ///
+    /// `bufferAddrOffset_` (`dsc/dsc2.h:735-737`) — *"address offset to move to the next buffer (per
+    /// core and corelet)"*.
+    pub buffer_addr_offset: BTreeMap<Core, BTreeMap<Corelet, Bytes>>,
+    /// Field: e007_DataInfo.bufferSwitchPosition_
+    ///
+    /// `bufferSwitchPosition_` (`dsc/dsc2.h:738`) — the loop a multiply-buffered allocation switches
+    /// buffers at, whose `nullptr` default is the [`None`].
+    pub buffer_switch_position: Option<LoopId>,
 }
 
 /// WHICH LATCHED RESULT AN OPERAND IS LINKED TO — one `latchDataId_` (`dsc/dsc2.h:725`). Producer
@@ -368,7 +454,7 @@ pub struct LatchDataId(pub u32);
 /// `inputsLdsAndLoopOffsets_` (data) in two vectors of independent length, and `dbgPrint` bounds
 /// its loop by the second while indexing the first with `.at()`. Pairing them makes that throw
 /// unspellable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operand {
     /// `inputs_`/`outputs_` entry, `src_.unit_`, or `dstVias_.at(i).loc_.unit_`.
     pub unit: SenComponent,
@@ -561,6 +647,14 @@ pub struct StartAddress {
 }
 
 impl StartAddress {
+    /// The `FoldManager<int64_t>` A DEFAULT-CONSTRUCTED `DataInfo` OR `AllocateNode` CARRIES — no fold
+    /// space laid out, which is `hasZeroFoldDim()`, and nothing placed.
+    pub const EMPTY: Self = Self {
+        folds: FoldDim::EMPTY,
+        func_types: Vec::new(),
+        placed: BTreeMap::new(),
+    };
+
     /// An address whose fold space is one dim's folds and nothing placed in it yet.
     #[must_use]
     pub const fn new(folds: FoldDim) -> Self {
@@ -794,29 +888,6 @@ impl NumBuffers {
     }
 }
 
-/// AN ALLOCATION'S PER-DIM PADDING STYLE — `padding_`, a `PaddingFormType` (`dsc/dsc2.h:981`) whose
-/// `getPadding(dim)` answers `NOPAD` for every dim it has no entry for.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Padding(BTreeMap<PrimaryDim, PadType>);
-
-impl Padding {
-    /// `getPadding(dim)` — total, because the absent case IS `NOPAD`.
-    #[must_use]
-    pub fn get(&self, dim: PrimaryDim) -> PadType {
-        self.0.get(&dim).copied().unwrap_or(PadType::NoPad)
-    }
-
-    /// `setPadding(dim, pad)`.
-    pub fn set(&mut self, dim: PrimaryDim, pad: PadType) {
-        self.0.insert(dim, pad);
-    }
-
-    /// The dims that carry a style at all, in `std::map`'s order.
-    pub fn dims(&self) -> impl Iterator<Item = PrimaryDim> + '_ {
-        self.0.keys().copied()
-    }
-}
-
 /// WHERE AN ALLOCATION LANDED AND HOW IT IS BUFFERED — the four `dsc2::AllocateNode` fields the
 /// placement units read and write (`dsc/dsc2.h:981-988`), as ONE value.
 ///
@@ -828,7 +899,7 @@ pub struct AllocPlacement {
     /// `numBuffers_` (`:984`).
     pub num_buffers: NumBuffers,
     /// `padding_` (`:981`).
-    pub padding: Padding,
+    pub padding: PaddingForm,
     /// `bufferOffsetCoreCorelet_` (`:988`) — how far apart this allocation's buffers are.
     pub buffer_offset: BTreeMap<Core, BTreeMap<Corelet, Bytes>>,
     /// `isStartAddrSymbolic_` (`:987`).
@@ -854,15 +925,13 @@ impl Via {
     /// The operand this end becomes, with `dataConnect_` and `constantId_` EMPTY — the
     /// default-constructed `DataInfo` a freshly minted node carries (`dsc/dsc2.h:722`).
     #[must_use]
-    pub const fn operand(self) -> Operand {
+    pub fn operand(self) -> Operand {
         Operand {
             unit: self.loc.unit,
             storage: self.loc.storage,
             data: DataInfo {
-                data_connect: None,
                 my_lds_idx: self.lds,
-                constant_id: None,
-                latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -1108,11 +1177,27 @@ pub struct ZeroPadFolds {
     pub chunk: PadFold,
 }
 
-/// A TRANSFER'S ZERO-PAD INFO — `TransferNode::paddingInfo_`, a `TransferPadInfo` (`dsc/dsc2.h:836`),
-/// reduced to the two per-dim fold spaces its builders fill.
+/// Replaces: e008_TransferPadInfo
+///
+/// A TRANSFER'S ZERO-PAD INFO — `TransferNode::paddingInfo_` (`dsc/dsc2.h:845`), a `TransferPadInfo`
+/// (`:755`), as the two per-dim fold spaces its builders fill.
+///
+/// ⭐ FOUR OF THE SIX DECLARED MEMBERS ARE C++ POINTER PLUMBING WITH NOTHING TO CARRY.
+/// `transferPadFrontSizeHelper`/`transferPadBackSizeHelper` (`:808-809`) are `MapWithFMHelper` VIEWS
+/// the constructor binds to the two `*Size_` maps (`:757-759`), and the one thing read through either
+/// is `getAllKeys()` (`:787`) — [`Self::dims`]. `transferPadFrontFoldProps`/`transferPadBackFoldProps`
+/// (`:806-807`) are the `FoldDimProp` ARENAS those fold managers point into, which [`ZeroPadFolds`]
+/// owns inline. That plumbing is why the reference's copy constructor *"Do[es] nothing on purpose"*
+/// (`:761-764`) and its assignment is `= delete` (`:766`) — a hazard this type does not have.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TransferPadding {
+    /// Field: e008_TransferPadInfo.transferPadFrontSize_
+    ///
+    /// `transferPadFrontSize_` (`dsc/dsc2.h:810`), one `FoldManager<int>` per dim.
     front: BTreeMap<PrimaryDim, ZeroPadFolds>,
+    /// Field: e008_TransferPadInfo.transferPadBackSize_
+    ///
+    /// `transferPadBackSize_` (`dsc/dsc2.h:811`).
     back: BTreeMap<PrimaryDim, ZeroPadFolds>,
 }
 
@@ -1264,7 +1349,22 @@ pub enum TransferKind {
 }
 
 impl DataInfo {
-    /// `isLabeledDs()` (`dsc/dsc2.h:737`) — `myLdsIdx_ >= 0`.
+    /// A DEFAULT-CONSTRUCTED `DataInfo` (`dsc/dsc2.h:721-739`) — every `-1` and the one `nullptr`
+    /// absent, every map empty, and the start address a fold space nothing is laid out in.
+    pub const EMPTY: Self = Self {
+        data_connect: None,
+        my_lds_idx: None,
+        constant_id: None,
+        latch_data_id: None,
+        start_addr: StartAddress::EMPTY,
+        is_start_addr_symbolic: false,
+        const_ele_offsets: BTreeMap::new(),
+        loop_ele_offsets: BTreeMap::new(),
+        buffer_addr_offset: BTreeMap::new(),
+        buffer_switch_position: None,
+    };
+
+    /// `isLabeledDs()` (`dsc/dsc2.h:741`) — `myLdsIdx_ >= 0`.
     ///
     /// ⛔ THE REFERENCE'S `DT_CHECK_MSG(!(labeledDs && constant), "Cannot be both labeledDs and
     /// constant.")` IS UNSPELLABLE HERE and needs no runtime guard: `my_lds_idx` and `constant_id`
@@ -1275,7 +1375,7 @@ impl DataInfo {
         self.my_lds_idx.is_some()
     }
 
-    /// `isConstant()` (`dsc/dsc2.h:742`) — `constantId_ >= 0`.
+    /// `isConstant()` (`dsc/dsc2.h:746`) — `constantId_ >= 0`.
     #[must_use]
     pub const fn is_constant(&self) -> bool {
         self.constant_id.is_some()
@@ -2548,7 +2648,7 @@ mod tests_e007 {
 
     use super::{
         AllocLayout, AllocPlacement, AllocateNode, BTreeMap, Elements, LdsIdx, MaxDimSize,
-        NodeName, NumBuffers, Padding, PrimaryDim, SenComponent, StartAddress,
+        NodeName, NumBuffers, PaddingForm, PrimaryDim, SenComponent, StartAddress,
     };
 
     /// An HBM allocation with a BOUNDED two-dim layout, so an answer keyed on a layout dim would show.
@@ -2566,7 +2666,7 @@ mod tests_e007 {
             start_address: StartAddress::default(),
             placement: AllocPlacement {
                 num_buffers: NumBuffers::Single,
-                padding: Padding::default(),
+                padding: PaddingForm::default(),
                 buffer_offset: BTreeMap::new(),
                 is_start_addr_symbolic: false,
             },
@@ -2800,6 +2900,162 @@ mod tests_e012 {
             held.next.regions().len(),
             2,
             "the refusal left both regions where they were"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e007_data_info {
+    //! WHAT AN OPERAND KNOWS ABOUT ITS DATA — [`DataInfo`] (`dsc/dsc2.h:721-739`), whose ten declared
+    //! fields this batch put where the reference declares them. Two facts here a field list cannot
+    //! state on its own: a default-constructed one is absent in every field, and the three nested maps
+    //! keep the reference's OWN key ladders, which are not the same ladder — `constEleOffsets_` is
+    //! core-outermost (`dsc/dsc2.h:727-729`) and `loopEleOffsets_` is corelet-outermost (`:730-734`),
+    //! the one asymmetry a reader is likely to normalise away.
+
+    use super::{
+        Bytes, ConstEleOffset, Core, Corelet, DataInfo, DataLocation, LdsIdx, LoopEleOffset,
+        LoopId, NodeId, PrimaryDim, SenComponent, StartAddress, Via,
+    };
+
+    fn core0() -> Core {
+        Core::checked(0).expect("core 0")
+    }
+
+    fn cl0() -> Corelet {
+        Corelet::at::<0>()
+    }
+
+    /// e007 — `DataInfo()` leaves all ten fields at the reference's own default.
+    #[test]
+    fn a_default_data_info_is_absent_in_all_ten_fields() {
+        let fresh = DataInfo::default();
+        assert_eq!(
+            fresh,
+            DataInfo::EMPTY,
+            "`Default` and `EMPTY` are one value"
+        );
+
+        assert_eq!(
+            fresh.data_connect, None,
+            "`dataConnect_` is the empty string"
+        );
+        assert_eq!(fresh.my_lds_idx, None, "`myLdsIdx_ = -1`");
+        assert_eq!(fresh.constant_id, None, "`constantId_ = -1`");
+        assert_eq!(fresh.latch_data_id, None, "`latchDataId_ = -1`");
+        assert_eq!(
+            fresh.start_addr,
+            StartAddress::EMPTY,
+            "`startAddr_` folds nothing"
+        );
+        assert!(
+            !fresh.is_start_addr_symbolic,
+            "`isStartAddrSymbolic_ = false`"
+        );
+        assert!(fresh.const_ele_offsets.is_empty(), "`constEleOffsets_`");
+        assert!(fresh.loop_ele_offsets.is_empty(), "`loopEleOffsets_`");
+        assert!(fresh.buffer_addr_offset.is_empty(), "`bufferAddrOffset_`");
+        assert_eq!(
+            fresh.buffer_switch_position, None,
+            "`bufferSwitchPosition_ = nullptr`"
+        );
+
+        // ⛔ NEITHER, so the reference's *"Cannot be both labeledDs and constant."* never arises.
+        assert!(
+            !fresh.is_labeled_ds(),
+            "`isLabeledDs()` on `myLdsIdx_ = -1`"
+        );
+        assert!(!fresh.is_constant(), "`isConstant()` on `constantId_ = -1`");
+    }
+
+    /// e007 — the three nested maps keep the reference's own key ladders, one of which skips the core.
+    #[test]
+    fn the_offset_maps_keep_the_references_own_key_ladders() {
+        let switch_at = LoopId(NodeId(7));
+        let mut data = DataInfo::EMPTY;
+
+        data.const_ele_offsets
+            .entry(core0())
+            .or_default()
+            .entry(cl0())
+            .or_default()
+            .insert(PrimaryDim::Mb, ConstEleOffset(4));
+        data.loop_ele_offsets
+            .entry(cl0())
+            .or_default()
+            .entry(switch_at)
+            .or_default()
+            .insert(PrimaryDim::Mb, LoopEleOffset(1));
+        data.buffer_addr_offset
+            .entry(core0())
+            .or_default()
+            .insert(cl0(), Bytes(4096));
+
+        // `constEleOffsets_` (`dsc/dsc2.h:727-729`) — core OUTERMOST, then corelet, then the dim.
+        assert_eq!(
+            data.const_ele_offsets[&core0()][&cl0()][&PrimaryDim::Mb],
+            ConstEleOffset(4)
+        );
+        assert_eq!(
+            data.const_ele_offsets[&core0()].len(),
+            1,
+            "one corelet stated under core 0"
+        );
+
+        // `loopEleOffsets_` (`:730-734`) — CORELET outermost, with NO core level to state at all.
+        assert_eq!(
+            data.loop_ele_offsets[&cl0()][&switch_at][&PrimaryDim::Mb],
+            LoopEleOffset(1),
+            "*\"put 1 if popping next element\"*"
+        );
+        assert_eq!(
+            data.loop_ele_offsets[&cl0()].len(),
+            1,
+            "one loop stated under corelet 0"
+        );
+
+        // `bufferAddrOffset_` (`:735-737`) — core then corelet, and the leaf is the address step.
+        assert_eq!(data.buffer_addr_offset[&core0()][&cl0()], Bytes(4096));
+
+        // A dim no offset is stated for is ABSENT, which is not the same answer as an offset of zero.
+        assert!(
+            !data.const_ele_offsets[&core0()][&cl0()].contains_key(&PrimaryDim::I),
+            "`unordered_map::count` on a dim the stage never offset"
+        );
+    }
+
+    /// e007 — a freshly minted end states `myLdsIdx_` and nothing else, and reading it back is the
+    /// same end.
+    #[test]
+    fn a_via_states_only_its_lds_and_round_trips_through_an_operand() {
+        let via = Via {
+            loc: DataLocation {
+                unit: SenComponent::Lxlu,
+                storage: SenComponent::Lx,
+            },
+            lds: Some(LdsIdx(3)),
+        };
+
+        let operand = via.operand();
+        assert_eq!(operand.unit, SenComponent::Lxlu);
+        assert_eq!(operand.storage, SenComponent::Lx);
+        assert!(
+            operand.data.is_labeled_ds(),
+            "an lds-carrying end IS a labeled ds"
+        );
+        assert_eq!(
+            operand.data,
+            DataInfo {
+                my_lds_idx: Some(LdsIdx(3)),
+                ..DataInfo::EMPTY
+            },
+            "a minted end states the lds and leaves the other nine fields default"
+        );
+
+        assert_eq!(
+            Via::of(&operand),
+            via,
+            "a `dstVias_` entry read back off an operand is the end it was minted from"
         );
     }
 }

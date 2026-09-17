@@ -869,7 +869,8 @@ impl SuperDsc {
 pub struct PadElems(pub u32);
 
 /// A DIM'S FRONT AND BACK PADDING — `padFront_`/`padBack_` (`dsc/dims.h:135-136`), whose paired `-1`
-/// not a size but the statement that CHUNKING VOIDED THEM (`L3DlOpsScheduler.cpp:137`).
+/// is not a size but the statement that CHUNKING VOIDED THEM
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:138`).
 ///
 /// ⭐ `if (padBack_ != 0 || padFront_ != 0)` IS THIS ENUM: voiding an unpadded dim is not a case the
 /// scheduler has to test for, because [`PadSizes::Unpadded`] has nothing to void.
@@ -930,19 +931,51 @@ impl UnneededPad {
     };
 }
 
-/// ONE DIM'S PADDING — `DimPaddingSizes` (`dsc/dims.h:134`) reduced to what `voidPaddingIfChunking`
-/// and `calculate_padded`'s full-span arm touch.
+/// Replaces: e002_DimPaddingSizes
+///
+/// ONE DIM'S PADDING — `DimPaddingSizes` (`dsc/dims.h:134`), ALL EIGHT of its declared fields, as
+/// `DataStructDims::paddingSizes_` (`dsc/dims.h:219`) stores one of them per dim.
+///
+/// ⚠ [`crate::schedule::ddc::v1::PaddingSizes`] IS A SECOND, LOSSY SPELLING of this same C++ struct
+/// — five fields, no `unneededPad` counts — and it is reachable ONLY through the carrier-trait
+/// methods `stage_padding_sizes` (`ddc/v1.rs:1596`) and `stage_padding_dims` (`:2284`), both of
+/// which BUILD one out of THIS type. It retires when that layer does, which is why the anchor sits
+/// here, on the type that STORES the fields, and not where the scheduler filed the TODO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DimPadding {
-    /// `padFront_`/`padBack_`.
+    /// Field: e002_DimPaddingSizes.padFront_
+    ///
+    /// Field: e002_DimPaddingSizes.padBack_
+    ///
+    /// `padFront_` (`dsc/dims.h:135`) AND `padBack_` (`:136`) AS ONE VALUE, because the only writer
+    /// that is not a constructor sets them in a single
+    /// `padInfo.padBack_ = padInfo.padFront_ = -1`
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:138`), and a `-1` edge is not a size on its own.
     pub sizes: PadSizes,
-    /// `windowDim_`, whose `PrimaryDimTypesCount` default is the absence of a window dim.
+    /// Field: e002_DimPaddingSizes.windowDim_
+    ///
+    /// `windowDim_` (`dsc/dims.h:142`), whose `PrimaryDimTypesCount` default is the absence of a
+    /// window dim — the sentinel that same writer tests for as
+    /// `padInfo.windowDim_ != PrimaryDimTypesCount` (`L3DlOpsScheduler.cpp:134`).
     pub window_dim: Option<PrimaryDim>,
-    /// The three `unneededPad` counts.
+    /// Field: e002_DimPaddingSizes.unneededPad_
+    ///
+    /// Field: e002_DimPaddingSizes.unneededPadFront_
+    ///
+    /// Field: e002_DimPaddingSizes.unneededPadBack_
+    ///
+    /// `unneededPad_` (`dsc/dims.h:137`), `unneededPadFront_` (`:138`) and `unneededPadBack_`
+    /// (`:139`) AS ONE TRIPLE, because that writer clears all three in a single assignment
+    /// (`L3DlOpsScheduler.cpp:144`) — under a `carryUnneededPadToChunk` whose value is `true`
+    /// (`:48`), so the clear is dead today and the triple is carried whole.
     pub unneeded: UnneededPad,
-    /// `stride_`, whose declared default is `1` and not `0`.
+    /// Field: e002_DimPaddingSizes.stride_
+    ///
+    /// `stride_` (`dsc/dims.h:140`), whose declared default is `1` and not `0`.
     pub stride: Stride,
-    /// `dilation_`, whose declared default is likewise `1`.
+    /// Field: e002_DimPaddingSizes.dilation_
+    ///
+    /// `dilation_` (`dsc/dims.h:141`), whose declared default is likewise `1`.
     pub dilation: Dilation,
 }
 
@@ -984,16 +1017,33 @@ impl Default for DimPadding {
     }
 }
 
-/// A SYMBOLIC DIM'S BOUNDS — `SymbolicDimInfo` (`dsc/dims.h:148`).
+/// Replaces: e003_SymbolicDimInfo
+///
+/// A SYMBOLIC DIM'S BOUNDS — `SymbolicDimInfo` (`dsc/dims.h:148`), both of its declared fields, as
+/// `DataStructDims::symbolicDimInfo_` stores one of them per symbolic dim.
+///
+/// ⛔ NEITHER FIELD CAN SPELL ITS OWN `-1` INITIALISER, AND THAT IS A GUARD AND NOT A GAP: a `-1`
+/// here is not a bound, it is a field nobody set, and three readers consume it as though it were
+/// one. See [`MaxSize`] and [`Granularity`] for the reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SymbolicDimInfo {
-    /// `maxSize_`.
+    /// Field: e003_SymbolicDimInfo.maxSize_
+    ///
+    /// `maxSize_` (`dsc/dims.h:149`) — the largest extent the dim may take.
     pub max_size: MaxSize,
-    /// `granularity_`.
+    /// Field: e003_SymbolicDimInfo.granularity_
+    ///
+    /// `granularity_` (`dsc/dims.h:150`) — the step it takes them in.
     pub granularity: Granularity,
 }
 
-/// A SYMBOLIC DIM'S LARGEST SIZE — `maxSize_`.
+/// A SYMBOLIC DIM'S LARGEST SIZE — `maxSize_` (`dsc/dims.h:149`).
+///
+/// ⛔ DIVERGENCE, AND THE FIELD'S DEFAULT IS A REFERENCE DEFECT, EXACTLY AS FOR [`Granularity`]:
+/// `primaryDimToVal_base_st` returns `maxSize_` AS the dim's value (`dsc/dims.cpp:526`), so an unset
+/// field reaches the caller as a NEGATIVE EXTENT; and `pruneMaxSymbolicVolumes` folds it into
+/// `mulOfMaxes *= symbolicDimInfo_.at(symDim).maxSize_` (`dsc/dims.cpp:744`), where one unset dim
+/// NEGATES the product every other dim contributed to. An unsigned count cannot spell either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MaxSize(pub u32);
 
@@ -1002,7 +1052,7 @@ pub struct MaxSize(pub u32);
 ///
 /// ⛔ DIVERGENCE, AND THE FIELD'S DEFAULT IS A REFERENCE DEFECT: `granularity_ = -1` makes
 /// `myVolumeLimit % dimGranularity == 0` pass for every value and `myVolumeLimit /= dimGranularity`
-/// NEGATE the limit (`dsc/dims.cpp:746-748`). A non-zero positive step cannot spell that.
+/// NEGATE the limit (`dsc/dims.cpp:748-749`). A non-zero positive step cannot spell that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Granularity(NonZeroU32);
 

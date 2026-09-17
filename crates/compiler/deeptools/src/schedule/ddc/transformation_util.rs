@@ -180,11 +180,27 @@ use crate::units::{Core, Corelet};
 // ⭐ TYPES FOR ENTRIES 110-117. Union this section with this file's other vocabulary when its other
 // entries land; each declaration is one C++ one narrowed to what the ported entries read and write.
 
+/// Replaces: e001_PaddingFormType
+///
 /// HOW EACH DIM OF AN ALLOCATION IS PADDED — `PaddingFormType` (`dsc/dims.h:94`), a
 /// `map<PrimaryDimTypes, PadType>` whose `getPadding` answers `NOPAD` for a dim it has no entry for
 /// (`dsc/dims.cpp:806`) and whose `setPadding` is an `insert_or_assign`.
+///
+/// ⭐ THIS IS THE CRATE'S ONE SPELLING OF `PaddingFormType`. There used to be a second,
+/// `dsc2::Padding`, carrying the identical map on the allocate node; two byte-identical converter
+/// functions in `l3/capacity.rs` and `l3/dl_ops.rs` existed only to move one into the other, and
+/// [`crate::schedule::stages::ddc_sites`]' `AllocArena` seed REFUSED any allocation with a stated
+/// padding rather than cross between them. Merging them deleted both converters and that refusal.
+///
+/// ⛔ `hasPaddingInfo()` (`dsc/dims.h:114`) IS NOT A METHOD HERE: it is `!padding_.empty()`, which is
+/// [`Self::stated`]`().next().is_some()` — the form `ddc/fold.rs` already reads it in.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PaddingForm(BTreeMap<PrimaryDim, PadType>);
+pub struct PaddingForm(
+    /// Field: e001_PaddingFormType.padding_
+    ///
+    /// `padding_` (`dsc/dims.h:119`), the `PerDimPaddingInfoT` (`:96`) this type is a total view over.
+    BTreeMap<PrimaryDim, PadType>,
+);
 
 impl PaddingForm {
     /// `getPadding(dim)` — total, because absent IS [`PadType::NoPad`].
@@ -1215,7 +1231,7 @@ where
             .iter()
             .chain(body.outputs.iter())
             .filter(|operand| toggle_pe_sfp(operand.unit).is_some())
-            .filter_map(|operand| data_origin(operand.data).zip(component_memory(operand.unit)))
+            .filter_map(|operand| data_origin(&operand.data).zip(component_memory(operand.unit)))
             .collect()
     } else {
         Vec::new()
@@ -1288,7 +1304,7 @@ pub trait CensusNodes {
 pub fn storage_or_datastream_is_external<D>(
     dsc: &D,
     metadata: &Metadata,
-    data: DataInfo,
+    data: &DataInfo,
     storage: SenComponent,
     direction: StreamDirection,
 ) -> bool
@@ -1667,12 +1683,12 @@ where
         .routes()
         .map(|(_, hops)| Hops(hops.to_vec()))
         .collect();
-    let mut dsts: Vec<Operand> = body.dsts.iter().copied().collect();
+    let mut dsts: Vec<Operand> = body.dsts.iter().cloned().collect();
     for dst in &mut dsts {
         toggle_for_split(tree, suffix, dst);
     }
     let (first, rest) = dsts.split_first()?;
-    body.dsts = Dsts::new(*first, rest.to_vec()).with_hops(hops);
+    body.dsts = Dsts::new(first.clone(), rest.to_vec()).with_hops(hops);
 
     let clone = tree.clone_transfer_after(transfer, body.clone());
 
@@ -1789,7 +1805,7 @@ impl LatchDataIds {
 /// external transferNode"* ([`InternalNode`]) and then
 /// `DT_CHECK(destIndex < dstLdsAndLoopOffsets_.size())`. Their `return false` paths are NOT here:
 /// those are each function's own answer and stay in the port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferDest {
     transfer: NodeId,
     dest: DestIdx,
@@ -1808,7 +1824,7 @@ impl TransferDest {
     ) -> Option<Self> {
         let internal = InternalNode::of(metadata, node)?;
         let index = dest.0 as usize;
-        let operand = *transfer.dsts.get(index)?;
+        let operand = transfer.dsts.get(index)?.clone();
         Some(Self {
             transfer: internal.node(),
             dest,
@@ -1824,26 +1840,26 @@ impl TransferDest {
 
     /// The transfer.
     #[must_use]
-    pub const fn transfer(self) -> NodeId {
+    pub const fn transfer(&self) -> NodeId {
         self.transfer
     }
 
     /// Which destination, as the reference's `dstVias_`/`dstLdsAndLoopOffsets_` index.
     #[must_use]
-    pub const fn index(self) -> usize {
+    pub const fn index(&self) -> usize {
         self.dest.0 as usize
     }
 
     /// `dstVias_.at(i).loc_` zipped with `dstLdsAndLoopOffsets_.at(i)`.
     #[must_use]
-    pub const fn operand(self) -> Operand {
-        self.operand
+    pub const fn operand(&self) -> &Operand {
+        &self.operand
     }
 
     /// `dstVias_.at(i).via_.back()`, else `src_.unit_` — the component this destination is REACHED
     /// FROM, which is what both entries repoint a skipped result at.
     #[must_use]
-    pub const fn reached_from(self) -> SenComponent {
+    pub const fn reached_from(&self) -> SenComponent {
         self.reached_from
     }
 }
@@ -1905,7 +1921,7 @@ pub trait SkipRegResults: FifoResults {
 fn reduce_users_of<D: SkipRegResults + DscAllocations + ?Sized>(
     dsc: &mut D,
     metadata: &mut Metadata,
-    data: DataInfo,
+    data: &DataInfo,
     storage: SenComponent,
     user: NodeId,
 ) {
@@ -1951,17 +1967,17 @@ where
     let connect = dst.data.data_connect;
 
     if !is_lxlu_value {
-        let keyed = data_origin(dst.data).zip(component_memory(dst.storage));
+        let keyed = data_origin(&dst.data).zip(component_memory(dst.storage));
         let Some((origin, memory)) = keyed else {
             return false;
         };
         if dsc.allocation_in(origin, memory).is_none() {
             return false;
         }
-        if dest_related_to_external_nodes(dsc, &dst) {
+        if dest_related_to_external_nodes(dsc, dst) {
             return false;
         }
-        reduce_users_of(dsc, metadata, dst.data, dst.storage, dest.transfer());
+        reduce_users_of(dsc, metadata, &dst.data, dst.storage, dest.transfer());
     }
 
     let (new_component, latch_id) = match target {
@@ -1978,7 +1994,7 @@ where
         match consumer {
             FifoConsumer::Transfer(node) => {
                 let src = dsc.transfer(node).src;
-                reduce_users_of(dsc, metadata, src.data, src.storage, node);
+                reduce_users_of(dsc, metadata, &src.data, src.storage, node);
                 dsc.set_src_storage(node, new_component);
                 if let Some(id) = latch_id {
                     dsc.set_src_latch_data_id(node, id);
@@ -1990,7 +2006,7 @@ where
                         continue;
                     }
                     if !is_lxlu_value {
-                        reduce_users_of(dsc, metadata, operand.data, operand.unit, node);
+                        reduce_users_of(dsc, metadata, &operand.data, operand.unit, node);
                     }
                     dsc.set_compute_input_unit(node, input, new_component);
                     if let Some(id) = latch_id {
@@ -2030,14 +2046,14 @@ where
     if !is_register(dst.storage) {
         return false;
     }
-    let keyed = data_origin(dst.data).zip(component_memory(dst.storage));
+    let keyed = data_origin(&dst.data).zip(component_memory(dst.storage));
     let Some((origin, memory)) = keyed else {
         return false;
     };
     let Some(alloc) = dsc.allocation_in(origin, memory) else {
         return false;
     };
-    if dest_related_to_external_nodes(dsc, &dst) {
+    if dest_related_to_external_nodes(dsc, dst) {
         return false;
     }
 
@@ -2046,10 +2062,10 @@ where
         dsc.remove_alloc_use(alloc_use);
     }
 
-    dsc.set_sole_compute_output(compute, dst.storage, dst.data);
+    dsc.set_sole_compute_output(compute, dst.storage, dst.data.clone());
     let new_component = dest.reached_from();
     dsc.set_dst_storage(dest.transfer(), dest.index(), new_component);
-    dsc.resize_compute_inputs_to(compute, input, new_component, dst.data);
+    dsc.resize_compute_inputs_to(compute, input, new_component, dst.data.clone());
 
     true
 }
@@ -2158,7 +2174,7 @@ pub trait ExternalStreams {
     /// `storageOrDatastreamIsExternal(dataInfo, storage, isIncoming)`.
     fn storage_or_datastream_is_external(
         &self,
-        data: DataInfo,
+        data: &DataInfo,
         storage: SenComponent,
         direction: StreamDirection,
     ) -> bool;
@@ -2178,7 +2194,11 @@ pub fn input_related_to_external_nodes<E: ExternalStreams + ?Sized>(
     compute: &ComputeNode,
 ) -> bool {
     compute.inputs.iter().any(|input| {
-        streams.storage_or_datastream_is_external(input.data, input.unit, StreamDirection::Incoming)
+        streams.storage_or_datastream_is_external(
+            &input.data,
+            input.unit,
+            StreamDirection::Incoming,
+        )
     })
 }
 
@@ -2195,7 +2215,7 @@ pub fn output_related_to_external_nodes<E: ExternalStreams + ?Sized>(
 ) -> bool {
     compute.outputs.iter().any(|output| {
         streams.storage_or_datastream_is_external(
-            output.data,
+            &output.data,
             output.unit,
             StreamDirection::Outgoing,
         )
@@ -2466,7 +2486,7 @@ pub const fn component_memory(storage: SenComponent) -> Option<DdcMemory> {
 /// (`dsc/dsc2.cpp:2589`), [`None`] where the reference has neither and answers *"One of myLdsIdx or
 /// constantId must be set"*.
 #[must_use]
-pub const fn data_origin(data: DataInfo) -> Option<DataOrigin> {
+pub const fn data_origin(data: &DataInfo) -> Option<DataOrigin> {
     match (data.my_lds_idx, data.constant_id) {
         (Some(lds), _) => Some(DataOrigin::LabeledDs(lds)),
         (None, Some(cons)) => Some(DataOrigin::Constant(cons)),
@@ -3273,7 +3293,7 @@ where
         if fifo.is_some() {
             return false;
         }
-        fifo = Some((index, *dst));
+        fifo = Some((index, dst.clone()));
     }
     let Some((index, dst)) = fifo else {
         return true;
@@ -3595,7 +3615,7 @@ pub fn src_related_to_external_nodes<E: ExternalStreams + ?Sized>(
     transfer: &TransferNode,
 ) -> bool {
     streams.storage_or_datastream_is_external(
-        transfer.src.data,
+        &transfer.src.data,
         transfer.src.storage,
         StreamDirection::Incoming,
     )
@@ -3613,7 +3633,7 @@ pub fn dest_related_to_external_nodes<E: ExternalStreams + ?Sized>(
     streams: &E,
     dst: &Operand,
 ) -> bool {
-    streams.storage_or_datastream_is_external(dst.data, dst.storage, StreamDirection::Outgoing)
+    streams.storage_or_datastream_is_external(&dst.data, dst.storage, StreamDirection::Outgoing)
 }
 
 #[cfg(test)]
@@ -3766,6 +3786,7 @@ mod tests_e110_e117 {
                 my_lds_idx: None,
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -4116,7 +4137,7 @@ mod tests_e255_e257 {
     impl ExternalStreams for External {
         fn storage_or_datastream_is_external(
             &self,
-            data: DataInfo,
+            data: &DataInfo,
             storage: SenComponent,
             direction: StreamDirection,
         ) -> bool {
@@ -4134,6 +4155,7 @@ mod tests_e255_e257 {
                 my_lds_idx: Some(LdsIdx(1)),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -4925,7 +4947,7 @@ mod tests_e247_e254 {
     impl ExternalStreams for Tree {
         fn storage_or_datastream_is_external(
             &self,
-            data: DataInfo,
+            data: &DataInfo,
             storage: SenComponent,
             direction: StreamDirection,
         ) -> bool {
@@ -5074,6 +5096,7 @@ mod tests_e247_e254 {
                 my_lds_idx: lds,
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -5567,7 +5590,7 @@ mod tests_e247_e254 {
     impl ExternalStreams for External {
         fn storage_or_datastream_is_external(
             &self,
-            data: DataInfo,
+            data: &DataInfo,
             storage: SenComponent,
             direction: StreamDirection,
         ) -> bool {
@@ -5787,7 +5810,7 @@ mod tests_e247_e254 {
             Kind::Transfer(transfer_node(
                 "t0",
                 operand(SenComponent::Pe, SenComponent::Lx, Some(LdsIdx(1))),
-                Dsts::new(dst, Vec::new())
+                Dsts::new(dst.clone(), Vec::new())
                     .with_hops(vec![Hops(vec![SenComponent::L0, SenComponent::Sfp])]),
             )),
             Some(root),
@@ -5821,7 +5844,7 @@ mod tests_e247_e254 {
         // on input 2, which is what the transfer now writes.
         assert_eq!(
             tree.compute_outputs,
-            vec![(computing, SenComponent::Sfplrf, dst.data)]
+            vec![(computing, SenComponent::Sfplrf, dst.data.clone())]
         );
         assert_eq!(
             tree.compute_input_writes,
@@ -6149,6 +6172,7 @@ mod tests_e118_e123 {
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -6392,6 +6416,7 @@ mod tests_e118_e123 {
             my_lds_idx: Some(lds),
             constant_id: None,
             latch_data_id: None,
+            ..DataInfo::EMPTY
         };
         let mut metadata = Metadata::default();
         let mut ends = Ends::default();
@@ -6403,7 +6428,7 @@ mod tests_e118_e123 {
         assert!(!storage_or_datastream_is_external(
             &dsc,
             &metadata,
-            data,
+            &data,
             SenComponent::Pelrf,
             StreamDirection::Incoming
         ));
@@ -6413,14 +6438,14 @@ mod tests_e118_e123 {
         assert!(storage_or_datastream_is_external(
             &dsc,
             &metadata,
-            data,
+            &data,
             SenComponent::Pelrf,
             StreamDirection::Incoming
         ));
         assert!(!storage_or_datastream_is_external(
             &dsc,
             &metadata,
-            data,
+            &data,
             SenComponent::Pelrf,
             StreamDirection::Outgoing
         ));
@@ -6430,7 +6455,7 @@ mod tests_e118_e123 {
         assert!(storage_or_datastream_is_external(
             &dsc,
             &metadata,
-            data,
+            &data,
             SenComponent::Pelrf,
             StreamDirection::Outgoing
         ));
@@ -6439,7 +6464,7 @@ mod tests_e118_e123 {
         assert!(!storage_or_datastream_is_external(
             &dsc,
             &metadata,
-            data,
+            &data,
             SenComponent::Sfplrf,
             StreamDirection::Outgoing
         ));
@@ -6729,7 +6754,7 @@ mod tests_e361 {
     impl ExternalStreams for Subtree {
         fn storage_or_datastream_is_external(
             &self,
-            data: DataInfo,
+            data: &DataInfo,
             storage: SenComponent,
             direction: StreamDirection,
         ) -> bool {
@@ -6752,6 +6777,7 @@ mod tests_e361 {
                 my_lds_idx: Some(LdsIdx(1)),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }

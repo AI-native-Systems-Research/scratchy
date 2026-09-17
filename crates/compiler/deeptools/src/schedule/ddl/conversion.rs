@@ -181,7 +181,9 @@ use crate::schedule::ddc::metadata::{
 };
 use crate::schedule::ddc::transformation::{DsType, LoopId, Scale};
 use crate::schedule::ddc::transformation_util::StageName;
-use crate::schedule::ddc::transformation_util::{LoopCond, LoopCondComposite, is_memory};
+use crate::schedule::ddc::transformation_util::{
+    LoopCond, LoopCondComposite, PaddingForm, data_origin, is_memory,
+};
 use crate::schedule::ddc::v1::{CoreClSet, Ln32};
 use crate::schedule::ddl::ops::DdlComputeType;
 use crate::schedule::ddl::{DdlModuleOp, DdlSource};
@@ -190,8 +192,8 @@ use crate::schedule::dsc2::{
     CondOp as DscCondOp, CondRegions, ConditionNode, DataInfo, Dsts, Hops, InstrAttribute, LdsIdx,
     LoopBound, LoopCond as DscLoopCond, LoopCondComposite as DscLoopCondComposite, LoopDim,
     LoopNode, MaxDimSize, NodeName, NumBuffers, NumChunks, Operand as DscOperand, PackIndex,
-    Padding, Repetition, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode,
-    SyncStrength, SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
+    Repetition, ReplicationFactor, SchedNode, StartAddress, SyncDirection, SyncNode, SyncStrength,
+    SyncUnits, TransferNode, TransferPadding, Unroll, WordLength, generic_comp,
 };
 use crate::schedule::l3::dsc::{
     CoreCount, CoreletsUsed, DesignSpaceConfig, EmptyStage, PadSizes, WkSlice, WkSliceId,
@@ -2115,7 +2117,7 @@ fn attribute_transfer_users<S: ScheduleReads + ?Sized>(
         return;
     };
     let ends: Vec<DscOperand> = core::iter::once(transfer.src)
-        .chain(transfer.dsts.iter().copied())
+        .chain(transfer.dsts.iter().cloned())
         .collect();
     for end in ends {
         let alloc = match (end.data.my_lds_idx, end.data.constant_id) {
@@ -2264,7 +2266,7 @@ const fn dsc_cond_op(op: CondOp) -> DscCondOp {
 /// both its length and its hops.
 fn dsts_parts(dsts: &Dsts) -> (Vec<DscOperand>, Vec<Hops>) {
     dsts.routes()
-        .map(|(end, hops)| (*end, Hops(hops.to_vec())))
+        .map(|(end, hops)| (end.clone(), Hops(hops.to_vec())))
         .unzip()
 }
 
@@ -2272,7 +2274,7 @@ fn dsts_parts(dsts: &Dsts) -> (Vec<DscOperand>, Vec<Hops>) {
 /// [`Dsts`] at all.
 fn dsts_from(ends: Vec<DscOperand>, hops: Vec<Hops>) -> Option<Dsts> {
     let (first, rest) = ends.split_first()?;
-    Some(Dsts::new(*first, rest.to_vec()).with_hops(hops))
+    Some(Dsts::new(first.clone(), rest.to_vec()).with_hops(hops))
 }
 
 // ⛔⛔ REVIEWED: `dsc2::memories` HAS SIXTEEN MEMBERS (`dsc/dscdefn.cpp:142-144`) and this file
@@ -2644,7 +2646,7 @@ fn process_allocation<S: DdlSite + ?Sized>(
             Buffers::Single => NumBuffers::Single,
             Buffers::SizeTwoReserveAll => NumBuffers::Double,
         },
-        padding: Padding::default(),
+        padding: PaddingForm::default(),
         buffer_offset: BTreeMap::new(),
         is_start_addr_symbolic: false,
     };
@@ -2672,7 +2674,7 @@ fn process_allocation<S: DdlSite + ?Sized>(
                 &mut form,
             )?;
             for (dim, pad) in form {
-                placement.padding.set(dim, pad);
+                placement.padding.set_padding(dim, pad);
             }
             if state.lds_memory.contains_key(&(lds, storage)) {
                 return None;
@@ -3324,7 +3326,7 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
     let units: Vec<SenComponent> = dsts.iter().map(|dst| dst.operand.unit).collect();
     let name = transfer_node_name(&src_operand, &units);
     let (first, rest) = {
-        let mut ends = dsts.iter().map(|dst| dst.operand);
+        let mut ends = dsts.iter().map(|dst| dst.operand.clone());
         (ends.next()?, ends.collect::<Vec<_>>())
     };
     let mut transfer = TransferNode {
@@ -3457,7 +3459,7 @@ fn op_data_transfer<S: DdlSite + ?Sized>(
             let mut held = ctx.site.transfer(node)?;
             let (mut ends, mut hops) = dsts_parts(&held.dsts);
             let mut route = hops.last().cloned().unwrap_or(Hops(Vec::new()));
-            let mut end = *ends.last()?;
+            let mut end = ends.last()?.clone();
             route.0.push(end.unit);
             end.unit = *unit;
             ends.push(end);
@@ -3516,7 +3518,7 @@ fn op_compute<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> O
             if end.operand.storage == SenComponent::NoComponent {
                 end.operand.storage = generic_component(end.operand.unit);
             }
-            group.push(end.operand);
+            group.push(end.operand.clone());
             ends.push(end);
         }
     }
@@ -3844,7 +3846,7 @@ fn op_opaque<S: DdlSite + ?Sized>(ctx: &mut OpContext<'_, S>, stmt: &Stmt) -> Op
                 start_address: StartAddress::default(),
                 placement: AllocPlacement {
                     num_buffers: NumBuffers::Single,
-                    padding: Padding::default(),
+                    padding: PaddingForm::default(),
                     buffer_offset: BTreeMap::new(),
                     is_start_addr_symbolic: false,
                 },
@@ -4954,7 +4956,7 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
     /// writes, and nothing else.
     fn sync(&mut self, node: &SyncNode) -> Option<EmittedOp> {
         if let Some(transfer) = node.implicit_sync_ref_transfer {
-            let dst = *self.site.transfer(transfer)?.dsts.first();
+            let dst = self.site.transfer(transfer)?.dsts.first().clone();
             let pair = self.pair(dst.storage, &dst.data)?;
             return Some(EmittedOp::ImplicitSync {
                 name: node.name.clone(),
@@ -5212,10 +5214,10 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
         };
         // ⛔ NO `break` ON THE INNER LOOP: every PADDED association of a padded dim states a style.
         let mut padding_styles = Vec::new();
-        for dim in node.placement.padding.dims() {
+        for (dim, style) in node.placement.padding.stated() {
             for (name, prop) in &self.interface.dim_association {
                 if prop.dim == Some(dim) && matches!(prop.meta_dim_kind, MetaDimKind::Padded) {
-                    padding_styles.push((*name, node.placement.padding.get(dim)));
+                    padding_styles.push((*name, style));
                 }
             }
         }
@@ -5276,16 +5278,6 @@ impl<S: DdlSizes + ?Sized> Emission<'_, S> {
             }
         }
         Some(None)
-    }
-}
-
-/// WHERE ONE END'S DATA COMES FROM — `myLdsIdx_` before `constantId_`, the order every reader of a
-/// [`DataInfo`] tests them in.
-const fn data_origin(data: &DataInfo) -> Option<DataOrigin> {
-    match (data.my_lds_idx, data.constant_id) {
-        (Some(lds), _) => Some(DataOrigin::LabeledDs(lds)),
-        (None, Some(constant)) => Some(DataOrigin::Constant(constant)),
-        (None, None) => None,
     }
 }
 

@@ -712,7 +712,7 @@ impl Loads {
 ///
 /// ⛔ THE TWO `.at()`s ARE THE THROW: both units index them repeatedly and neither ever checks
 /// `dstIndex`, so obtaining this value is where an out-of-range destination is refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferDst<'a> {
     /// The transfer node's identity.
     pub node: NodeId,
@@ -729,7 +729,7 @@ impl<'a> TransferDst<'a> {
     #[must_use]
     pub fn of(node: NodeId, transfer: &'a TransferNode, index: DestIdx) -> Option<Self> {
         let index = index.0 as usize;
-        let dst = *transfer.dsts.get(index)?;
+        let dst = transfer.dsts.get(index)?.clone();
         Some(Self {
             node,
             transfer,
@@ -1643,9 +1643,9 @@ impl<D: Clone + UtilStageExtents> PackStickDimSite<D> {
         let mut rest_of_final_data_info = Vec::new();
         for dst in TransferWalk::transfer(tree, output.node).dsts.iter() {
             if dst.storage == src_storage {
-                final_data_info = dst.data;
+                final_data_info = dst.data.clone();
             } else {
-                rest_of_final_data_info.push(dst.data);
+                rest_of_final_data_info.push(dst.data.clone());
             }
         }
 
@@ -2050,7 +2050,7 @@ where
         let from_lx_src = Operand {
             unit: SenComponent::Lxlu,
             storage: SenComponent::Lx,
-            data: data_info,
+            data: data_info.clone(),
         };
         data_info.data_connect =
             Some(tree.intern_connect(MintedConnect::SfpCompressInputComp(which)));
@@ -2060,7 +2060,7 @@ where
             Operand {
                 unit: SenComponent::Sfp,
                 storage: SenComponent::Sfp,
-                data: data_info,
+                data: data_info.clone(),
             },
         ));
         FifoResults::add_alloc_user(tree, allocate_in[idx], from_lx);
@@ -2068,21 +2068,21 @@ where
 
         // `inputs_.push_back(LXLU|ONE|ZERO)` is the UNIT vector; a compute operand's storage is its
         // own unit, which is the one `SenComponents` the reference states per input.
-        let fma_input = data_info;
+        let fma_input = data_info.clone();
         data_info.my_lds_idx = Some(new_lds_in[idx]);
         data_info.data_connect =
             Some(tree.intern_connect(MintedConnect::SfpCompressOutputComp(which)));
         let fma = tree.new_compute(dummy_fma(
             NodeName(format!("sfp_dummy_fma_comp{idx}")),
             fma_input,
-            data_info_const,
-            data_info,
+            data_info_const.clone(),
+            data_info.clone(),
         ));
 
         let to_lx_src = Operand {
             unit: SenComponent::Sfp,
             storage: SenComponent::Sfp,
-            data: data_info,
+            data: data_info.clone(),
         };
         data_info.data_connect =
             Some(tree.intern_connect(MintedConnect::LxCompressInputComp(which)));
@@ -2092,7 +2092,7 @@ where
             Operand {
                 unit: SenComponent::Lxsu,
                 storage: SenComponent::Lx,
-                data: data_info,
+                data: data_info.clone(),
             },
         ));
         tree.clear_alloc_users(intr_in[idx]);
@@ -2120,31 +2120,31 @@ where
     let exp_src = Operand {
         unit: SenComponent::Lxlu,
         storage: SenComponent::Lx,
-        data: data_info,
+        data: data_info.clone(),
     };
     let exp_connect = tree.intern_connect(MintedConnect::SfpCompressOutputExp);
     data_info.data_connect = Some(exp_connect);
     let from_lx_exp = tree.new_transfer(minted_transfer(
         NodeName("lx_sfp_compress_exp".to_owned()),
-        exp_src,
+        exp_src.clone(),
         Operand {
             unit: SenComponent::Sfp,
             storage: SenComponent::Sfp,
-            data: data_info,
+            data: data_info.clone(),
         },
     ));
     tree.clear_alloc_users(intr_out);
     FifoResults::add_alloc_user(tree, intr_out, from_lx_exp);
     FifoResults::add_alloc_user(tree, intr_out, output.node);
 
-    let fma_input = data_info;
+    let fma_input = data_info.clone();
     data_info.my_lds_idx = Some(lds_output);
     data_info.data_connect = Some(exp_connect);
     let fma_exp = tree.new_compute(dummy_fma(
         NodeName("sfp_dummy_fma_exp".to_owned()),
         fma_input,
-        data_info_const,
-        data_info,
+        data_info_const.clone(),
+        data_info.clone(),
     ));
 
     // ⛔ DELIBERATE DIVERGENCE: the reference pushes `releventFinalDataInfo` AND every
@@ -2159,7 +2159,7 @@ where
         Operand {
             unit: SenComponent::Sfp,
             storage: SenComponent::Sfp,
-            data: data_info,
+            data: data_info.clone(),
         },
         Operand {
             unit: SenComponent::Lxsu,
@@ -2304,7 +2304,7 @@ fn dummy_fma(name: NodeName, input: DataInfo, constant: DataInfo, output: DataIn
         ex_unit: SenComponent::Sfp,
         inputs: vec![
             operand(SenComponent::Lxlu, input),
-            operand(SenComponent::One, constant),
+            operand(SenComponent::One, constant.clone()),
             operand(SenComponent::Zero, constant),
         ],
         outputs: vec![operand(SenComponent::Lxsu, output)],
@@ -2813,7 +2813,7 @@ where
             let Some((first, rest)) = consumers.split_first() else {
                 continue;
             };
-            if dest_related_to_external_nodes(dsc, &dst) {
+            if dest_related_to_external_nodes(dsc, dst) {
                 continue;
             }
             if consumers
@@ -2968,7 +2968,7 @@ where
         let ends = ScheduleSurgery::transfer(dsc, transfer).dsts.len();
         for index in 0..ends {
             let body = ScheduleSurgery::transfer(dsc, transfer);
-            let Some(dst) = body.dsts.get(index).copied() else {
+            let Some(dst) = body.dsts.get(index).cloned() else {
                 continue;
             };
             if dst.storage != SenComponent::Sfplrf {
@@ -3116,12 +3116,12 @@ pub trait AutoShuffling:
     ///
     /// ⛔ TOTAL, AND IT STATES BOTH OF THE REFERENCE'S UNGUARDED LOOKUPS: a PACKMERGE input always
     /// names a labelled DS, and that DS always carries a format.
-    fn operand_element_bits(&self, dinfo: DataInfo) -> Bits;
+    fn operand_element_bits(&self, dinfo: &DataInfo) -> Bits;
 
     /// `labeledDs_[dinfo.myLdsIdx_]` with `primaryDsInfo_.at(dsType_)`, `getLayoutDims(ldsIdx_)` and
     /// `getStickSizes(dsType_)` — the four reads e371 makes of one operand (`shuffle.cpp:802-805`,
     /// `:873-876`), as one value because [`Self::Entry`] carries neither the DS type nor the format.
-    fn operand_sticks(&self, dinfo: DataInfo) -> Option<OperandSticks>;
+    fn operand_sticks(&self, dinfo: &DataInfo) -> Option<OperandSticks>;
 
     /// `currDsc->coreIdsUsed_`.
     fn cores_used(&self) -> CoresUsed;
@@ -3167,7 +3167,7 @@ impl<E: LabeledDsEntry> ShuffleAssign<E> {
             return None;
         }
         let unit = ShuffleUnit::of(body.ex_unit)?;
-        let dinfo_template = body.inputs.first()?.data;
+        let dinfo_template = body.inputs.first()?.data.clone();
         let dsinfo_template = dsc.lds_entry(dinfo_template.my_lds_idx?)?;
         Some(Self {
             node,
@@ -3303,7 +3303,7 @@ impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
             };
             self.dsc.add_interim_lds(compute_op, lds);
 
-            let mut dinfo = self.assign.dinfo_template;
+            let mut dinfo = self.assign.dinfo_template.clone();
             dinfo.data_connect = Some(
                 self.dsc
                     .intern_connect(MintedConnect::AutoshuffleEdge(suffix)),
@@ -3349,14 +3349,14 @@ impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
         let operand = |edge: &DataEdge| Operand {
             unit: edge.component,
             storage: edge.component,
-            data: edge.dinfo,
+            data: edge.dinfo.clone(),
         };
         let mut body = self.assign.body.clone();
         body.op = DdlComputeType::Packmerge;
         body.instr_attribute.indices = match packmerge.expansion {
             IndexExpansion::ByElementWidth => expand_indices(
                 &packmerge.indices,
-                self.dsc.operand_element_bits(in1.dinfo),
+                self.dsc.operand_element_bits(&in1.dinfo),
             ),
             IndexExpansion::AsWritten => packmerge
                 .indices
@@ -3409,12 +3409,12 @@ impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
             return None;
         }
         let edge = |operand: &Operand| DataEdge {
-            dinfo: operand.data,
+            dinfo: operand.data.clone(),
             component: operand.unit,
             // `if (alloc) input_edge.allocation = alloc;` — `allowMissingAlloc=true`, so absent stays
             // absent rather than aborting.
             allocation: component_memory(operand.unit).and_then(|storage| {
-                data_origin(operand.data)
+                data_origin(&operand.data)
                     .and_then(|origin| self.dsc.allocation_in(origin, storage))
             }),
             const_ele_offsets: ConstEleOffsets::default(),
@@ -3426,7 +3426,7 @@ impl<S: AutoShuffling + ?Sized> ComputationBuilder for ShuffleBuilder<'_, S> {
         })
     }
 
-    fn operand_sticks(&self, dinfo: DataInfo) -> Option<OperandSticks> {
+    fn operand_sticks(&self, dinfo: &DataInfo) -> Option<OperandSticks> {
         self.dsc.operand_sticks(dinfo)
     }
 
@@ -3535,6 +3535,7 @@ mod tests_e376 {
                 my_lds_idx: Some(LdsIdx(lds)),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -3741,11 +3742,11 @@ mod tests_e376 {
             self.deleted.push(node);
         }
 
-        fn operand_element_bits(&self, _dinfo: DataInfo) -> Bits {
+        fn operand_element_bits(&self, _dinfo: &DataInfo) -> Bits {
             Bits(16)
         }
 
-        fn operand_sticks(&self, _dinfo: DataInfo) -> Option<OperandSticks> {
+        fn operand_sticks(&self, _dinfo: &DataInfo) -> Option<OperandSticks> {
             todo!("tests_e376: the stand-in shufflers here infer no layout")
         }
 
@@ -3968,6 +3969,7 @@ mod tests_e105_e109 {
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -4246,6 +4248,7 @@ mod tests_e242_e246 {
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -5000,6 +5003,7 @@ mod tests_e300 {
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -5298,6 +5302,7 @@ mod tests_e338 {
                 my_lds_idx: None,
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -5365,6 +5370,7 @@ mod tests_e359_e360 {
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -5585,7 +5591,7 @@ mod tests_e359_e360 {
     impl ExternalStreams for Skipping {
         fn storage_or_datastream_is_external(
             &self,
-            _data: DataInfo,
+            _data: &DataInfo,
             _storage: SenComponent,
             _direction: StreamDirection,
         ) -> bool {

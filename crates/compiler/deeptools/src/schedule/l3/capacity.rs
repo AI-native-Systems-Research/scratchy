@@ -56,7 +56,7 @@ use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::Scale;
 use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
 use crate::schedule::ddc::v1::{DimSample, LdsSticks, sampled_as, stick_divisor};
-use crate::schedule::dsc2::{AllocateNode, Coordinate, Dsc, LayoutDims, LdsIdx, LoopNode, Padding};
+use crate::schedule::dsc2::{AllocateNode, Coordinate, Dsc, LayoutDims, LdsIdx, LoopNode};
 use crate::units::{Corelet, Row};
 
 use super::dsc::{
@@ -281,7 +281,7 @@ impl SizeDsc for DscSizing<'_> {
 pub fn size_data_stage_for_node(
     node: SizedNode,
     lds: LdsIdx,
-    padding: &Padding,
+    padding: &PaddingForm,
     ancestors: &AncestorLoops<'_>,
     dsc: &(impl SizeDsc + ?Sized),
 ) -> Option<DataStage> {
@@ -318,7 +318,7 @@ pub fn size_data_stage_for_node(
     for (&dim, pad_info) in &core.padding {
         if let Some(window) = pad_info.window_dim
             && remaining.contains(&dim)
-            && padding.get(dim) != PadType::NoPad
+            && padding.padding(dim) != PadType::NoPad
         {
             remaining.insert(window);
         }
@@ -430,7 +430,7 @@ pub fn size_data_stage_for_node(
     // ⭐ A SECOND PASS, `// run in a separate loop so that all symbolic, unpadded, window dims are
     // set` (`:3722-3747`).
     for (&dim, &den) in &den_for_dim {
-        if padding.get(dim) == PadType::NoPad {
+        if padding.padding(dim) == PadType::NoPad {
             continue;
         }
         let den_ss = dsc.data_stages().at(den)?.ss.dims.dims();
@@ -533,7 +533,7 @@ mod tests_e015 {
         DataStage, DataStages, DimPadding, FilledDims, NamedDims, PadSizes, SenComponent, StageDims,
     };
     use super::{
-        AncestorLoops, Dsc, LdsIdx, LdsSticks, LoopNode, Padding, SizeDsc, SizedNode,
+        AncestorLoops, Dsc, LdsIdx, LdsSticks, LoopNode, PaddingForm, SizeDsc, SizedNode,
         size_data_stage_for_node,
     };
 
@@ -689,7 +689,7 @@ mod tests_e015 {
                 non_unified_in_hbm: false,
             },
             LdsIdx(1),
-            &Padding::default(),
+            &PaddingForm::default(),
             &AncestorLoops::of(Vec::new(), Some(DatastageId(0))),
             &dsc,
         )
@@ -705,11 +705,8 @@ mod tests_e015 {
         let sized = size_data_stage_for_node(
             SizedNode::Other,
             LdsIdx(1),
-            &Padding::default(),
-            &AncestorLoops::of(
-                vec![&out_loop, &mb_loop, &y_loop],
-                Some(DatastageId(0)),
-            ),
+            &PaddingForm::default(),
+            &AncestorLoops::of(vec![&out_loop, &mb_loop, &y_loop], Some(DatastageId(0))),
             &dsc,
         )
         .expect("`transfer_lds1_src:sfp_dst:lxsu`, whose three dims the chain above it all divides");
@@ -742,7 +739,7 @@ mod tests_e015 {
                     non_unified_in_hbm: false,
                 },
                 LdsIdx(1),
-                &Padding::default(),
+                &PaddingForm::default(),
                 &AncestorLoops::of(vec![&y_loop], Some(DatastageId(0))),
                 &dsc,
             ),
@@ -755,7 +752,7 @@ mod tests_e015 {
             size_data_stage_for_node(
                 SizedNode::Other,
                 LdsIdx(1),
-                &Padding::default(),
+                &PaddingForm::default(),
                 &AncestorLoops::of(vec![&y_loop], None),
                 &dsc,
             ),
@@ -825,7 +822,8 @@ mod tests_e016 {
     use super::super::dsc::SenComponent;
     use super::tests_e015::{Sdsc14, dividing, parametric};
     use super::{
-        AllocateNode, AncestorLoops, LdsIdx, Padding, SizedNode, size_data_stage_of_alloc_at_node,
+        AllocateNode, AncestorLoops, LdsIdx, PaddingForm, SizedNode,
+        size_data_stage_of_alloc_at_node,
     };
 
     const MB: PrimaryDim = PrimaryDim::Mb;
@@ -848,7 +846,7 @@ mod tests_e016 {
             start_address: StartAddress::default(),
             placement: AllocPlacement {
                 num_buffers: NumBuffers::Single,
-                padding: Padding::default(),
+                padding: PaddingForm::default(),
                 buffer_offset: BTreeMap::new(),
                 is_start_addr_symbolic: false,
             },
@@ -1090,7 +1088,7 @@ pub fn buffer_capacity_per_dim_at(
     let stick_sizes = cumulative_stick_sizes(&dsc.stick_dims(at.lds), StickPart::Whole)?;
     // `myAllocNode->getPageSize()` (`:3806`) — EMPTY for the `NO_INDIRECTION` every program states.
     let page_size = alloc.page_sizes(sizing.indirect);
-    let padded = padding_form(&alloc.placement.padding);
+    let padded = &alloc.placement.padding;
     let sample = DimSample {
         comp: sampled_as(at.comp),
         row: at.row,
@@ -1135,8 +1133,8 @@ pub fn buffer_capacity_per_dim_at(
                 }
                 // `std::max(ssVal, elVal)` over `primaryDimToVal_st(entry, comp, row, corelet,
                 // myAllocNode->padding_)` on both halves (`:3878-3891`).
-                let ss = sampled_or_absent(dstg.ss.dims.dims(), entry, sample, &padded)?;
-                let el = sampled_or_absent(dstg.el.dims.dims(), entry, sample, &padded)?;
+                let ss = sampled_or_absent(dstg.ss.dims.dims(), entry, sample, padded)?;
+                let el = sampled_or_absent(dstg.el.dims.dims(), entry, sample, padded)?;
                 dim_size = Extent(ss.0.max(el.0));
                 if page_size.contains_key(&entry) {
                     todo!(
@@ -1193,17 +1191,6 @@ pub fn buffer_capacity_per_dim_at(
         }
     }
     Some(size_per_dim)
-}
-
-/// `myAllocNode->padding_` AS `primaryDimToVal_st`'s `padding` ARGUMENT — one `PaddingFormType`
-/// reached through the two Rust wrappers of it, [`Padding`] on the allocate node and [`PaddingForm`]
-/// on the dims being read. Both answer `NOPAD` for a dim they do not name, so the copy is total.
-fn padding_form(padding: &Padding) -> PaddingForm {
-    let mut form = PaddingForm::default();
-    for dim in padding.dims() {
-        form.set_padding(dim, padding.get(dim));
-    }
-    form
 }
 
 /// `primaryDimToVal_st(entry, comp, row, corelet, myAllocNode->padding_)` (`dsc/dsc2.cpp:3887-3890`)
@@ -1302,8 +1289,8 @@ mod tests_e017 {
     };
     use super::tests_e015::dividing;
     use super::{
-        AllocSizing, AllocateNode, AncestorLoops, CapacityForm, Dsc, LdsIdx, LdsSticks, Padding,
-        SampledBuffer, SizeDsc, SizedNode, buffer_capacity_per_dim_at,
+        AllocSizing, AllocateNode, AncestorLoops, CapacityForm, Dsc, LdsIdx, LdsSticks,
+        PaddingForm, SampledBuffer, SizeDsc, SizedNode, buffer_capacity_per_dim_at,
     };
 
     const MB: PrimaryDim = PrimaryDim::Mb;
@@ -1410,7 +1397,7 @@ mod tests_e017 {
             start_address: StartAddress::default(),
             placement: AllocPlacement {
                 num_buffers: NumBuffers::Double,
-                padding: Padding::default(),
+                padding: PaddingForm::default(),
                 buffer_offset: BTreeMap::new(),
                 is_start_addr_symbolic: false,
             },
@@ -1584,7 +1571,7 @@ mod tests_e018 {
     use super::super::dsc::{LabeledDs, Pinning, SenComponent};
     use super::tests_e015::{Sdsc14, dividing};
     use super::{
-        AllocSizing, AllocateNode, AncestorLoops, CapacityForm, CapacityNode, LdsIdx, Padding,
+        AllocSizing, AllocateNode, AncestorLoops, CapacityForm, CapacityNode, LdsIdx, PaddingForm,
         SampledBuffer, buffer_capacity_per_dim,
     };
 
@@ -1608,7 +1595,7 @@ mod tests_e018 {
             start_address: StartAddress::default(),
             placement: AllocPlacement {
                 num_buffers,
-                padding: Padding::default(),
+                padding: PaddingForm::default(),
                 buffer_offset: BTreeMap::new(),
                 is_start_addr_symbolic: false,
             },
@@ -1866,7 +1853,7 @@ mod tests_e019 {
 
     use super::tests_e015::dividing;
     use super::{
-        AllocSizing, AllocateNode, AncestorLoops, BytesForm, Dsc, LdsIdx, LdsSticks, Padding,
+        AllocSizing, AllocateNode, AncestorLoops, BytesForm, Dsc, LdsIdx, LdsSticks, PaddingForm,
         SampledBuffer, SizeDsc, StickRounding, buffer_capacity,
     };
 
@@ -1982,7 +1969,7 @@ mod tests_e019 {
             start_address: StartAddress::default(),
             placement: AllocPlacement {
                 num_buffers: NumBuffers::Double,
-                padding: Padding::default(),
+                padding: PaddingForm::default(),
                 buffer_offset: BTreeMap::new(),
                 is_start_addr_symbolic: false,
             },

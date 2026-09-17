@@ -289,9 +289,8 @@ use crate::schedule::dsc2::{
     AddressFold, AllocateNode, BlockNode, ChildPos, CondOp, Coordinate, CoordinateCategory, Dsc,
     Dsts, Fold, FoldCardinality, FoldCoeff, FoldDim, FoldLabel, FoldPosition, GroupTagRegInfo,
     LdsIdx, LoopBound, LoopCond, LoopCondComposite, Node, NodeName, NumBuffers, NumChunks, Operand,
-    PadFold, Padding, ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode,
-    SyncStrength, SyncUnits, TransferNode, TransferPadding, Via, WordLength, ZeroPadFolds,
-    generic_comp,
+    PadFold, ReplicationFactor, SchedNode, ScheduleTree, SyncDirection, SyncNode, SyncStrength,
+    SyncUnits, TransferNode, TransferPadding, Via, WordLength, ZeroPadFolds, generic_comp,
 };
 use crate::schedule::l3::dsc::{
     AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare, CoreletsUsed,
@@ -16354,7 +16353,7 @@ mod tests_e283_e295 {
         let mut placement = AllocPlacement::default();
         placement
             .padding
-            .set(PrimaryDim::I, PadType::PaddedNoZeroPad);
+            .set_padding(PrimaryDim::I, PadType::PaddedNoZeroPad);
         let alloc = AllocateNode {
             name: NodeName("allocate_lds1".to_owned()),
             component: SenComponent::Lx,
@@ -16419,7 +16418,7 @@ mod tests_e283_e295 {
             vec![(core(1), Some(WkSliceId(0))), (core(3), Some(WkSliceId(1)))]
         );
         assert_eq!(
-            coordinate.padding_form().collect::<Vec<_>>(),
+            coordinate.padding_form().stated().collect::<Vec<_>>(),
             vec![(PrimaryDim::I, PadType::PaddedNoZeroPad)]
         );
         let folds = coordinate
@@ -16638,7 +16637,7 @@ mod tests_e283_e295 {
         let mut placement = AllocPlacement::default();
         placement
             .padding
-            .set(PrimaryDim::I, PadType::PaddedNoZeroPad);
+            .set_padding(PrimaryDim::I, PadType::PaddedNoZeroPad);
         let over = |num, den, dim| {
             construct_loop_node(
                 DatastageId(num),
@@ -17897,7 +17896,7 @@ where
             inputs.facts.chunk_stage(),
             loc.data.my_lds_idx?,
             allocation.component,
-            &padding_form(&allocation.placement.padding),
+            &allocation.placement.padding,
         )?;
         let shift = offsets.get(&Corelet::checked(1)?)?.0;
         start_address.map_addresses(|core, corelet, addr| {
@@ -17970,16 +17969,16 @@ where
         }
         let stages = tree.loop_stages(here);
         for (dim, kind) in tree.loop_dims(here) {
-            let mut alloc_padding = padding.get(dim);
+            let mut alloc_padding = padding.padding(dim);
             let mut relevant = layout.contains(&dim);
             let mut related_pad_dim = None;
             if !relevant && !tree.is_parametric(here) {
                 // Accessing a padded dim through the window dim that walks it — iterating within
                 // one window.
                 for (pad_dim, pad_info) in inputs.sizes.stage_padding_dims(stages.den) {
-                    if pad_info.window_dim == dim && padding.get(pad_dim) != PadType::NoPad {
+                    if pad_info.window_dim == dim && padding.padding(pad_dim) != PadType::NoPad {
                         relevant = true;
-                        alloc_padding = padding.get(pad_dim);
+                        alloc_padding = padding.padding(pad_dim);
                         related_pad_dim = Some(pad_dim);
                         break;
                     }
@@ -18064,7 +18063,7 @@ where
             if !layout.contains(&dim) || !scaled(dim) {
                 continue;
             }
-            if !v1::is_zero_padded(padding.get(dim)) {
+            if !v1::is_zero_padded(padding.padding(dim)) {
                 continue;
             }
             // `metadata.core_dstgid`, which the L3 scheduler sets to `dataStageCoreIdx` (`:6420`).
@@ -18092,7 +18091,7 @@ where
                             dim,
                             SenComponent::NoComponent,
                             None,
-                            padding.get(dim),
+                            padding.padding(dim),
                             v1::Density::FULL,
                         )
                         .0;
@@ -18382,17 +18381,6 @@ fn dsc2_corelets(dsc: &DesignSpaceConfig) -> Option<Vec<Corelet>> {
     (0..dsc.corelets_used_dsc2?.get())
         .map(Corelet::checked)
         .collect()
-}
-
-/// `allocNode->padding_` AS [`calculate_corelet_offset_in_byte`] TAKES IT — [`Padding`] and
-/// [`PaddingForm`] are the same `PaddingFormType` reached through two carriers, and this is the one
-/// place the two meet.
-fn padding_form(padding: &Padding) -> PaddingForm {
-    let mut form = PaddingForm::default();
-    for dim in padding.dims() {
-        form.set_padding(dim, padding.get(dim));
-    }
-    form
 }
 
 /// Replaces: e334_addIbrDataStage
@@ -18710,6 +18698,7 @@ mod tests_e328_e335 {
                 latch_data_id: None,
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -20507,13 +20496,7 @@ where
         fill_coordinate_custom_wk_slice_id(sdsc, dsc, lds?, coordinate)?;
     }
 
-    let form: Vec<(PrimaryDim, PadType)> = alloc
-        .placement
-        .padding
-        .dims()
-        .map(|dim| (dim, alloc.placement.padding.get(dim)))
-        .collect();
-    coordinate.set_padding_form(form);
+    coordinate.set_padding_form(alloc.placement.padding.clone());
     match reference {
         CoordPropRefNode::Allocate(reference) => build_coordinate_from_allocation(
             Node::Allocate(alloc),
@@ -20653,7 +20636,7 @@ fn coord_prop_targets<T: CoordPropTree + ?Sized>(
         let Some(transfer) = tree.transfer(*user) else {
             continue;
         };
-        let (src, dst) = (transfer.src, *transfer.dsts.first());
+        let (src, dst) = (transfer.src, transfer.dsts.first().clone());
         let hbm_lx = matches!(
             (src.storage, dst.storage),
             (SenComponent::Hbm, SenComponent::Lx) | (SenComponent::Lx, SenComponent::Hbm)

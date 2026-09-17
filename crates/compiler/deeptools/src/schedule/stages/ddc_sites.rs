@@ -1749,11 +1749,10 @@ impl<'s, 'l> v1::Dsc2Sites for Dsc2Provider<'s, 'l> {
 /// (`g0/debug/sdsc_0/sdsc.json` puts it at 256 on every LX node and every core), and the tracker has
 /// not run.
 ///
-/// ⛔ AND A NON-DEFAULT `padding_` IS REFUSED RATHER THAN DROPPED. [`crate::schedule::dsc2::Padding`]
-/// is a per-dim [`PadType`] map and the L3 view carries a
-/// [`crate::schedule::ddc::transformation_util::PaddingForm`] — TWO Rust spellings of `padding_`
-/// (`dsc/dsc2.h:981`) whose relation is `getPadding(dim)` (`dsc/dims.cpp:806`), a `dsc/` seam. Reading
-/// one out of the other is that seam and not a copy, so a stated padding stops here instead.
+/// ⭐ `padding_` IS CARRIED, AND THE OBJECTION THIS DOC USED TO HOLD NAMED A DUPLICATION THAT IS GONE.
+/// The allocate node's `padding_` (`dsc/dsc2.h:981`) and the L3 view's are now ONE type,
+/// [`crate::schedule::ddc::transformation_util::PaddingForm`], so carrying it across is a move and
+/// not the `getPadding(dim)` (`dsc/dims.cpp:806`) seam a second spelling would have made of it.
 ///
 /// ⛔ AN ALLOCATION WHOSE `layoutDimOrder_` IS EMPTY IS LIKEWISE LEFT OUT:
 /// [`crate::schedule::dsc2::AllocLayout`] is non-empty by type, which is the reference's own
@@ -1777,24 +1776,14 @@ fn seed_arena(state: &Dsc2State<'_>, dsc: DscIdx) -> v1::AllocArena {
                 Buffering::Double => NumBuffers::Double,
                 Buffering::Streaming => NumBuffers::Streaming,
             };
-            // ⛔ `padding_` READ THROUGH THE OTHER SPELLING IS `getPadding(dim)`, a `dsc/` seam.
-            if minted.padding != tu::PaddingForm::default() {
-                let _: Option<()> = state.refuse(
-                    "Dsc2Provider: an allocation whose L3 padding_ (a PaddingForm) is non-default is \
-                     left out of the AllocArena — dsc2::Padding is a per-dim PadType map, and \
-                     reading one out of the other is getPadding(dim) (dsc/dims.cpp:806), a `dsc/` \
-                     seam and not a copy",
-                );
-                continue;
-            }
+            // `padding_` (`dsc/dsc2.h:981`) — ONE `PaddingFormType` on both sides, carried whole.
             // `layoutDimOrder_` zipped with `maxDimSizes_`, innermost first, and an UNBOUNDED entry is
             // the reference's own `resize(n, -1)` (`dsc/dsc2.h:982`) — which is `MaxDimSize::Unset`.
-            let mut layout = minted.layout.0.iter().map(|(dim, max)| {
-                (
-                    *dim,
-                    max.map_or(MaxDimSize::Unset, MaxDimSize::Resolved),
-                )
-            });
+            let mut layout = minted
+                .layout
+                .0
+                .iter()
+                .map(|(dim, max)| (*dim, max.map_or(MaxDimSize::Unset, MaxDimSize::Resolved)));
             let Some(first) = layout.next() else {
                 let _: Option<()> = state.refuse(
                     "Dsc2Provider: an allocation whose layoutDimOrder_ is EMPTY is left out of the \
@@ -1816,6 +1805,7 @@ fn seed_arena(state: &Dsc2State<'_>, dsc: DscIdx) -> v1::AllocArena {
                     start_address: crate::schedule::dsc2::StartAddress::default(),
                     placement: crate::schedule::dsc2::AllocPlacement {
                         num_buffers,
+                        padding: minted.padding.clone(),
                         ..crate::schedule::dsc2::AllocPlacement::default()
                     },
                     gap_stick_spread: BTreeMap::new(),

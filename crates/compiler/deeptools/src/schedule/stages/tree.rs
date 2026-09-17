@@ -1154,13 +1154,13 @@ impl MemOrg for Org {
 /// operands and putting a fresh [`Dsts`] back — the same three lines, for one destination.
 fn set_dst_lds(dsts: &mut Dsts, index: usize, lds: LdsIdx) {
     let hops: Vec<Hops> = dsts.routes().map(|(_, hops)| Hops(hops.to_vec())).collect();
-    let mut operands: Vec<Operand> = dsts.iter().copied().collect();
+    let mut operands: Vec<Operand> = dsts.iter().cloned().collect();
     let Some(operand) = operands.get_mut(index) else {
         return;
     };
     operand.data.my_lds_idx = Some(lds);
     if let Some((first, rest)) = operands.split_first() {
-        *dsts = Dsts::new(*first, rest.to_vec()).with_hops(hops);
+        *dsts = Dsts::new(first.clone(), rest.to_vec()).with_hops(hops);
     }
 }
 

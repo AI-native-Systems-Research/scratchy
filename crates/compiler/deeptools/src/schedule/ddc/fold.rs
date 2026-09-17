@@ -3735,7 +3735,7 @@ pub fn build_fold_for_external_allocation<'l, S, T>(
         return;
     }
 
-    coord.set_padding_form(alloc.padding.stated());
+    coord.set_padding_form(alloc.padding.clone());
 
     // Construct a foldManager for each relevant dimension.
     for &(curr_dim, dim_scale) in alloc.layout {
@@ -5608,9 +5608,9 @@ where
         .enclosing_loop_chain(prop.ref_node, lower_corelet_loop);
 
     if alloc.padding.stated().next().is_some() {
-        coord.set_padding_form(alloc.padding.stated());
+        coord.set_padding_form(alloc.padding.clone());
     } else {
-        let carried: Vec<(PrimaryDim, PadType)> = ref_coord.padding_form().collect();
+        let carried = ref_coord.padding_form().clone();
         coord.set_padding_form(carried);
     }
     // `loopDistributionParamInfo[refNode][allocNode]` (`:12621`) is the one `loop_params` the caller
@@ -6139,7 +6139,7 @@ where
             dest_pad.set_padding(dim, pad);
         }
     }
-    coord.set_padding_form(dest_pad.stated());
+    coord.set_padding_form(dest_pad.clone());
 
     // Record whether coordinates for the pe-sfp split dimensions are already constructed.
     let existing_pe_sfp: Vec<PrimaryDim> = ctx
@@ -6945,7 +6945,7 @@ where
     let mut can_proceed = true;
     {
         let compute_coord = selected_coord_mut(coords, selected.coord);
-        compute_coord.set_padding_form(ref_padding.stated());
+        compute_coord.set_padding_form(ref_padding.clone());
         match kind {
             FoldReferenceKind::Allocate {
                 node,
@@ -7154,7 +7154,7 @@ where
     let Some(output_padding) = compute.output_padding else {
         return true;
     };
-    coords.output.set_padding_form(output_padding.stated());
+    coords.output.set_padding_form(output_padding.clone());
 
     // ⭐ THE OPAQUE `outputDims` LDS *IS* `computeLdsIdx`: entry 238's opaque arm answers
     // `opaqueOps_.at(node).ldsIdx_` itself, and an absent one has already panicked above.
@@ -8636,6 +8636,7 @@ mod tests_e375 {
                 my_lds_idx: None,
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -8809,6 +8810,7 @@ mod tests_e078_e085 {
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -9969,6 +9971,7 @@ mod tests_e297_e299 {
                 my_lds_idx: lds.map(LdsIdx),
                 constant_id: None,
                 latch_data_id: None,
+                ..DataInfo::EMPTY
             },
         }
     }
@@ -10857,6 +10860,7 @@ mod tests_e356_e358 {
                     my_lds_idx: Some(LdsIdx(0)),
                     constant_id: None,
                     latch_data_id: None,
+                    ..DataInfo::EMPTY
                 },
             },
             alloc: None,
