@@ -208,7 +208,8 @@ impl NoEpilogueDimKind {
 /// ⛔ THE TWO `DT_ERROR`s ARE THE RELATIVE ARM'S ALONE: `mustBeMultiple_` with no kind
 /// (`ddc/ddcv1.cpp:857-859`) and with a kind outside `{Unpadded, Padded, WindowDim}` (`:881-886`) are
 /// both raised where the constraint is CHECKED against a reference stage — so on the ABSOLUTE arm,
-/// whose kind is never read, [`Self::Unkinded`] is the state entry 307 legitimately stores (`:1466`).
+/// whose kind is never read, [`Self::Unkinded`] is the state entry 307 legitimately stores: it keys
+/// the constraint absolute (`:1119`) and then sets `mustBeMultiple_` with no kind (`:1222-1226`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopMultiple {
     /// `mustBeMultiple_` false, with whatever `loopDimKind_` holds — [`None`] for `Count`.
@@ -466,7 +467,9 @@ pub struct Ends {
 }
 
 impl Ends {
-    /// The nodes that write this connect — NON-EMPTY in every completed census.
+    /// The nodes that write this connect — NON-EMPTY in every completed census, which
+    /// `DT_ERROR("Illegal DDL: data_connect ... does not have any producer.")`
+    /// (`ddc/ddcv1.cpp:3322-3325`) enforces after the walk and entry 002 answers as `NoProducer`.
     #[must_use]
     pub fn producers(&self) -> &[NodeIndex] {
         &self.producers
@@ -721,15 +724,20 @@ pub struct DataTransfer {
     /// `apply_pe_sfp_split_offset_dest_` — which destinations take the split offset
     /// (`ddc/ddc_transformation_util.cpp:1642`).
     pub apply_pe_sfp_split_offset_dest: Vec<DestIdx>,
-    /// `replicated_`.
+    /// `replicated_`. ⛔ NOTHING IN THE AUTHORITY TREE WRITES THIS FIELD: its ONE read is the `else
+    /// if` at `ddc/ddcv1.cpp:2913`, so on this revision the whole arm it gates is unreachable — and
+    /// that arm opens with a `DT_CHECK_MSG` (`:2914-2916`) nothing could have satisfied.
     pub replicated: bool,
-    /// `offset_src_`. ⛔ NOTHING IN THE AUTHORITY TREE WRITES THIS FIELD OR `offset_dest_`: both are
-    /// only ever READ, as `> 0` tests (`ddc/ddcv1.cpp:2914,2933,2948`), so on this revision they
-    /// hold their defaults throughout and the branches they gate are dead.
+    /// `offset_src_`. ⛔ NOR IS THIS FIELD OR `offset_dest_` EVER WRITTEN, and both are read ONLY
+    /// from inside that dead arm: `offset_src_ > 0` (`ddc/ddcv1.cpp:2914`, `:2933`),
+    /// `offset_dest_.size() > 0` (`:2915`), and a walk of `offset_dest_` (`:2948`) whose own `> 0`
+    /// is on the offset each entry carries (`:2950`).
     pub offset_src: Elements,
     /// `offset_dest_` — per destination, its offset.
     pub offset_dest: BTreeMap<DestIdx, Elements>,
-    /// `force_num_elements_` — `-1` is NOT FORCED (`ddc/ddl/ddl_conversion.cpp:3217`).
+    /// `force_num_elements_`, whose `-1` default is absence — ⛔ AND SO IS `0`: both readers test
+    /// `> 0` (`ddc/ddcv1.cpp:458`, `ddc/ddl/ddl_conversion.cpp:3217`) while the one writer
+    /// (`ddc/ddl/ddl_conversion.cpp:1237`) copies the DDL's attribute through unchecked.
     pub force_num_elements: Option<Elements>,
     /// `accessPatternPerDim_`, which the DDL's `access_pattern_style=` fills
     /// (`ddc/ddl/ddl_conversion.cpp:1219-1226`).
@@ -832,18 +840,22 @@ impl ExternalStorage {
     }
 }
 
-/// A MEMORY DDC ALLOCATES IN — `ddc::memories` (`ddc/ddc_metadata.h:20-21`).
+/// A MEMORY DDC ALLOCATES IN — the key of `newAllocations_` (`ddc/ddc_metadata.h:127`), which every
+/// writer takes from an allocate node's `component_` (`ddc/ddc_transformation_util.cpp:59`,
+/// `ddc/ddl/ddl_conversion.cpp:820`).
 ///
-/// ⛔ NOT [`crate::generated::Memory`]: that is the `ddl.allocate` census and has neither `HBM` nor
-/// `PTIRF`, so it cannot spell this key.
+/// ⛔ NOT `ddc::memories` (`ddc/ddc_metadata.h:20-21`): that set is eight components with no
+/// `L0_SCALE`, and its one use tree-wide is `ddc/ddc_fold.cpp:1752`, which is not this map.
+/// ⛔ NOT [`crate::generated::Memory`] either: that is the `ddl.allocate` census and has neither
+/// `HBM` nor `PTIRF`, so it cannot spell this key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DdcMemory {
     /// `LX`.
     Lx,
     /// `L0`.
     L0,
-    /// `L0_SCALE` — the scale half of a scaled L0 allocation, which entry 258 places alongside `L0`
-    /// but under a different tracker (`ddc/ddcv1.cpp:184-190`).
+    /// `L0_SCALE` — the scale half of a scaled L0 allocation, which entry 258 spreads over the same
+    /// cores as `L0` (`ddc/ddcv1.cpp:191-192`) and, above `RCUDD1A`, over its corelets too (`:202`).
     L0Scale,
     /// `PELRF`.
     PeLrf,
@@ -962,9 +974,12 @@ pub struct Metadata {
     pub below_lx_schedule_insert_block: Option<BlockId>,
     /// `opFuncBackup_` (:222) — `OpFuncs::NONE` is none.
     ///
-    /// ⛔ THE FULL `OpFuncs`, NOT [`crate::generated::OpFunc`]: the only value the reference ever
-    /// stores here is `EXX2` (`ddc/ddcv1.cpp:2064-2078`), which the DDL census does not carry, so the
-    /// censused enum cannot express what entry 132 puts back.
+    /// ⛔ THE FULL `OpFuncs`, NOT [`crate::generated::OpFunc`]: entry 308 backs up whatever name sits
+    /// on `computeOp_.at(0)` under its `EXX2` gate (`ddc/ddcv1.cpp:2064-2078`), and the DDL census
+    /// carries no `EXX2` at all, so the censused enum cannot express what entry 132 puts back.
+    /// ⛔ AND `EXX2` IS NOT THE ONLY NAME IT HOLDS: the `opConsts` arm (`:2073-2077`) has no `else`,
+    /// so where the `constantInfo_` arm (`:2065-2072`) already swapped in `EXX2_ZEROMEAN` the second
+    /// backup re-reads that (`:2075`) and `restoreDsc` puts `EXX2_ZEROMEAN` back.
     pub op_func_backup: Option<OpFunc>,
     /// `transformationConfig_` (:232).
     pub transformation_config: TransformationConfig,

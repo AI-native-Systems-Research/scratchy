@@ -173,7 +173,7 @@ pub fn cumulative_stick_sizes(
 // ═══ e001 — THE DATASTAGE CONSTRAINT CHECK ══════════════════════════════════════════════════════
 
 /// WHICH VECTOR UNIT A PE/SFP-SPLIT DIM IS SAMPLED ON — the reference's `comps` vector, which is
-/// either `{NO_COMPONENT}` or exactly `{PE, SFP}` (`ddc/ddcv1.cpp:817-823`).
+/// either `{NO_COMPONENT}` (`ddc/ddcv1.cpp:810`) or exactly `{PE, SFP}` (`:818-823`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorComp {
     /// `SenComponents::PE`.
@@ -183,10 +183,10 @@ pub enum VectorComp {
 }
 
 /// WHICH SPLIT A CONSTRAINT CHECK IS SAMPLING AT — the `(cl, row, comp)` triple
-/// `checkConstraintsImpl` is called with (`ddc/ddcv1.cpp:838`).
+/// `checkConstraintsImpl` is called with (`ddc/ddcv1.cpp:825`).
 ///
 /// ⛔ THE `-1`s AND `NO_COMPONENT` ARE ABSENCES, NOT INDEX ZERO. `row = -1` under
-/// `rowSplit_.empty()` (`:849-852`) and the `row = -1` of the PE/SFP loop (`:929`) both mean *the
+/// `rowSplit_.empty()` (`:831-834`) and the `row = -1` of the PE/SFP loop (`:916`) both mean *the
 /// whole dimension*, which a row 0 does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
@@ -202,23 +202,23 @@ pub struct Sample {
 ///
 /// ⛔ SIGNED, AND THAT IS NOT AN ERROR CHANNEL. Every dimension of `DataStructDims` defaults to `-1`
 /// (`dsc/dims.h:161-193`) and the reference reads that as *this stage has no such dim*: `if (dimSize
-/// > 0)` on the reference side (`:864`) is the entire handling of it, while the candidate side
-/// multiplies it in unchecked (`:857`).
+/// > 0)` on the reference side (`:842`) is the entire handling of it, while the candidate side
+/// multiplies it in unchecked (`:836`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent(pub i64);
 
 /// A PADDED EXTENT, POSITIVE BY TYPE — `primaryDimToVal_st(dim, comp, row, cl, padding)` with
-/// `PADDED_WZEROPAD` set on the dim (`:881-884`).
+/// `PADDED_WZEROPAD` set on the dim (`:871-874`).
 ///
 /// ⛔⛔ `DT_ERROR("Cannot check datastage no-epilogue constraint if dim not relevant for reference
-/// data stage")` (`:886-891`) IS THIS TYPE, AND ON THE REFERENCE SIDE IT WAS ALREADY UNREACHABLE.
+/// data stage")` (`:875-880`) IS THIS TYPE, AND ON THE REFERENCE SIDE IT WAS ALREADY UNREACHABLE.
 /// That line is reached only past `foundValidDim`, which for a single-dim key means the reference
 /// stage's UNPADDED extent is `> 0`; `calculate_padded`'s `PADDED_WZEROPAD` arm is then `wSize + (val
 /// - 1) * stride` with `wSize >= 1` enforced one line above (`dsc/dims.cpp:596-602`), which cannot
 /// come back non-positive.
 ///
 /// ⭐ ON THE CANDIDATE SIDE IT REMOVES A DIVISION BY ZERO — `min(sizeLoop, refSizeLoop)` is the
-/// divisor at `:902-904` and the reference tests nothing about it.
+/// divisor at `:888-890` and the reference tests nothing about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaddedExtent(core::num::NonZeroU64);
 
@@ -247,7 +247,7 @@ impl PaddedExtent {
 /// stage's own split tables; reaching an operand is the mechanism, and the constraint check is what
 /// this file owns.
 pub trait Stage {
-    /// `ds.symbolicDimInfo_.count(dim)` (`:803`).
+    /// `ds.symbolicDimInfo_.count(dim)` (`:806`).
     fn is_symbolic(&self, dim: PrimaryDim) -> bool;
     /// `ds.coreletSplit_.count(dim)` (`:812`).
     fn is_corelet_split(&self, dim: PrimaryDim) -> bool;
@@ -255,10 +255,10 @@ pub trait Stage {
     fn is_row_split(&self, dim: PrimaryDim) -> bool;
     /// `ds.peSfpSplit_.count(dim)` (`:818`).
     fn is_pe_sfp_split(&self, dim: PrimaryDim) -> bool;
-    /// `ds.rowSplit_.empty()` (`:849`) — whether the stage splits ANY dim across rows, which is a
+    /// `ds.rowSplit_.empty()` (`:831`) — whether the stage splits ANY dim across rows, which is a
     /// different question from [`Self::is_row_split`] on one dim.
     fn splits_any_row(&self) -> bool;
-    /// `primaryDimToVal_st(dim, comp, row, cl)` (`:857`, `:862`).
+    /// `primaryDimToVal_st(dim, comp, row, cl)` (`:836`, `:841`).
     fn extent(&self, dim: PrimaryDim, at: Sample) -> Extent;
     /// The same with `PADDED_WZEROPAD` on `dim`, or [`None`] where the dim is not relevant to this
     /// stage — see [`PaddedExtent`].
@@ -269,29 +269,29 @@ pub trait Stage {
 /// cannot be.
 ///
 /// ⛔⛔ TWO `DT_ERROR`s COLLAPSE INTO THIS. `MetaDimKind::Count` is the field's UNSET sentinel
-/// (`ddc/ddc_metadata.h:35`) and gives *"Datastage no-epilogue constraint without dim kind"*
-/// (`:871-874`); anything outside `{Unpadded, Padded, WindowDim}` gives *"Unhandled dim kind in
-/// no-epiloge datastage constraint"* (`:893-901`). Three of `MetaDimKind`'s nine are the whole
+/// (`ddc/ddc_metadata.h:36`) and gives *"Datastage no-epilogue constraint without dim kind"*
+/// (`:857-859`); anything outside `{Unpadded, Padded, WindowDim}` gives *"Unhandled dim kind in
+/// no-epiloge datastage constraint"* (`:881-887`). Three of `MetaDimKind`'s nine are the whole
 /// domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoEpilogueDimKind {
     /// `Unpadded` — the extents already computed.
     Unpadded,
-    /// `Padded` — BOTH extents re-read with `PADDED_WZEROPAD` on the single dim (`:877-892`).
+    /// `Padded` — BOTH extents re-read with `PADDED_WZEROPAD` on the single dim (`:867-874`).
     Padded,
     /// `WindowDim` — the extents already computed, exactly like `Unpadded`: the only thing that
-    /// distinguishes the two here is which of them the `DT_ERROR` at `:893` lets through.
+    /// distinguishes the two here is which of them the `DT_ERROR` at `:881` lets through.
     WindowDim,
 }
 
 /// AN ABSOLUTE CONSTRAINT'S `min_`, AND WHETHER THE SIZE MUST BE A MULTIPLE OF IT.
 ///
 /// ⛔⛔ ONE NUMBER, NOT TWO. On the absolute arm `min_` is read TWICE — as the multiple in
-/// `fmodf(size, *min_ * refSize)` (`:868`) and as the lower bound in `size < *min_ * refSize`
-/// (`:906-908`) — so a `must_be_multiple` field beside a `min` field would be two copies of one
+/// `fmodf(size, *min_ * refSize)` (`:854`) and as the lower bound in `size < *min_ * refSize`
+/// (`:898-900`) — so a `must_be_multiple` field beside a `min` field would be two copies of one
 /// number that could disagree.
 ///
-/// ⛔ AND `DT_ERROR("Must-be-multiple constraint but no min set")` (`:864-866`) IS THE MISSING FOURTH
+/// ⛔ AND `DT_ERROR("Must-be-multiple constraint but no min set")` (`:851-853`) IS THE MISSING FOURTH
 /// STATE: `mustBeMultiple_` with no `min_` is not one of these.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AbsoluteMin {
@@ -307,8 +307,8 @@ pub enum AbsoluteMin {
 /// (`ddc/ddc_metadata.h:73-75`) turned into the presence of a reference stage.
 ///
 /// ⛔⛔ THE KEY IS THE SPLIT, WHICH IS WHAT MAKES THE `DT_CHECK` UNNECESSARY. `refDsId < 0 ? nullptr
-/// : &currDsc->dataStageParam_.at(refDsId).ss_` (`:794-796`) already decides it, and
-/// `DT_CHECK(refDs == nullptr)` under `cannotBeSymbolic_` (`:801`) then asserts a pairing the key
+/// : &currDsc->dataStageParam_.at(refDsId).ss_` (`:796-798`) already decides it, and
+/// `DT_CHECK(refDs == nullptr)` under `cannotBeSymbolic_` (`:804`) then asserts a pairing the key
 /// fixed. Two variants say it instead — and each carries only the fields its own arm reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConstraintKind<'a, S> {
@@ -329,7 +329,7 @@ pub enum ConstraintKind<'a, S> {
         /// `min_` — a lower bound on `size / refSize`, with no multiple relationship.
         min: Option<f32>,
         /// `mustBeMultiple_` and `loopDimKind_`. ⛔ THE NO-EPILOGUE ARM IS STILL GATED BY
-        /// `allowEpilogue` at the call (`:870`).
+        /// `allowEpilogue` at the check (`:856`).
         multiple: LoopMultiple,
     },
 }
@@ -340,9 +340,9 @@ pub enum ConstraintKind<'a, S> {
 pub struct Constraint<'a, S> {
     /// Which side the sizes are compared against.
     pub kind: ConstraintKind<'a, S>,
-    /// `max_` — `size > *max_ * refSize` fails (`:903-905`).
+    /// `max_` — `size > *max_ * refSize` fails (`:895-897`).
     pub max: Option<f32>,
-    /// `values_` — the permitted `float(size) / refSize` ratios (`:909-912`).
+    /// `values_` — the permitted `float(size) / refSize` ratios (`:901-904`).
     ///
     /// ⛔ EXACT FLOAT EQUALITY, as the reference's `std::set<float>::count` is — and `count` cannot
     /// tell an order apart, so a list answers it identically.
@@ -354,7 +354,7 @@ pub struct Constraint<'a, S> {
 
 /// A NON-EMPTY, SORTED, DEDUPLICATED SET OF DIMS — the `std::set<PrimaryDimTypes>` inner key.
 ///
-/// ⛔ NON-EMPTY BECAUSE `*dims.begin()` (`:880`) DEREFERENCES IT, and sorted because that is what
+/// ⛔ NON-EMPTY BECAUSE `*dims.begin()` (`:869`) DEREFERENCES IT, and sorted because that is what
 /// `std::set` makes "begin" mean.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DimSet {
@@ -377,7 +377,7 @@ impl DimSet {
     }
 
     /// The ONE-DIM key `{dim}` — the `std::set<PrimaryDimTypes>` a braced single dim initialises
-    /// (`ddc/ddc_transformation.cpp:1044`, `:1085`), TOTAL because one dim is already non-empty.
+    /// (`ddc/ddc_transformation.cpp:974`, `:1033`), TOTAL because one dim is already non-empty.
     #[must_use]
     pub const fn single(dim: PrimaryDim) -> DimSet {
         DimSet {
@@ -414,7 +414,7 @@ impl DimSet {
 /// already established.
 ///
 /// ⛔⛔ `DT_ERROR("Cannot check datastage no-epilogue constraint on multiple dimensions")`
-/// (`:875-880`) IS THIS CONSTRUCTOR. The reference discovers the clash mid-check, once per
+/// (`:860-865`) IS THIS CONSTRUCTOR. The reference discovers the clash mid-check, once per
 /// (corelet, row, component) sample and after both sizes have been computed; here a multi-dim key and
 /// a no-epilogue constraint simply do not form a pair.
 #[derive(Debug, Clone, PartialEq)]
@@ -458,7 +458,7 @@ impl<'a, S> DimConstraint<'a, S> {
 /// WHETHER EVERY DATASTAGE CONSTRAINT MENTIONING ONE DIMENSION HOLDS — `ddc/ddcv1.cpp:792`.
 ///
 /// ⛔⛔ THE SAMPLES ARE TWO DIFFERENT NESTS, NOT ONE. Without a PE/SFP split it is corelets × rows at
-/// `NO_COMPONENT` (`:920-926`); with one it is corelets × `{PE, SFP}` at `row = -1` (`:927-933`) — so
+/// `NO_COMPONENT` (`:907-912`); with one it is corelets × `{PE, SFP}` at `row = -1` (`:913-919`) — so
 /// a dim split BOTH ways is never sampled per row, and the counts come from
 /// `dscGlobal.sysDef.numCoreletsPerCore` / `numPTRows`, which are this build's arch.
 ///
@@ -532,10 +532,10 @@ pub fn check_constraints<S: Stage>(
     true
 }
 
-/// `checkConstraintsImpl` — one constraint at one sample (`ddc/ddcv1.cpp:838`).
+/// `checkConstraintsImpl` — one constraint at one sample (`ddc/ddcv1.cpp:825`).
 ///
 /// ⛔ `row` IS CLEARED PER SAMPLE, NOT PER DIM SET: `ds.rowSplit_.empty() || (refDs &&
-/// refDs->rowSplit_.empty())` (`:849-852`) drops to the full-dimension extent whenever EITHER stage
+/// refDs->rowSplit_.empty())` (`:831-834`) drops to the full-dimension extent whenever EITHER stage
 /// has no row interaction, so a row-split candidate measured against a row-flat reference is compared
 /// whole.
 fn constraint_holds<S: Stage>(
@@ -570,7 +570,7 @@ fn constraint_holds<S: Stage>(
                 ref_size = ref_size.saturating_mul(dim_size);
             }
         }
-        // ⭐ NO DIM OF THE SET IS THE REFERENCE STAGE'S — the constraint does not apply (`:869`).
+        // ⭐ NO DIM OF THE SET IS THE REFERENCE STAGE'S — the constraint does not apply (`:847`).
         if !found_valid_dim {
             return true;
         }
@@ -626,7 +626,7 @@ fn constraint_holds<S: Stage>(
                 let hi = size_loop.max(ref_size_loop);
                 let lo = size_loop.min(ref_size_loop);
                 // ⛔ `checked_rem` BECAUSE THE REFERENCE DIVIDES BY `min(sizeLoop, refSizeLoop)`
-                // UNTESTED (`:902-904`): a candidate stage without the dim makes that zero.
+                // UNTESTED (`:888-890`): a candidate stage without the dim makes that zero.
                 if hi.checked_rem(lo).is_some_and(|rem| rem != 0) {
                     return false;
                 }
@@ -659,19 +659,19 @@ fn constraint_holds<S: Stage>(
 /// source.
 ///
 /// ⛔⛔ THE TWO LISTS ARE ONE FACT. The reference indexes `inputs_[ind]` by the length of
-/// `inputsLdsAndLoopOffsets_` (`ddc/ddcv1.cpp:3303-3310`), so a shorter `inputs_` reads past its end;
+/// `inputsLdsAndLoopOffsets_` (`ddc/ddcv1.cpp:3300-3306`), so a shorter `inputs_` reads past its end;
 /// pairing them removes the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reads {
     /// `di.dataConnect_`.
     pub data_connect: DataConnect,
-    /// `transfer->src_.unit_ == CONSTANT` (`:3292`) / `compute->inputs_[ind] == CONSTANT` (`:3306`) —
+    /// `transfer->src_.unit_ == CONSTANT` (`:3292`) / `compute->inputs_[ind] == CONSTANT` (`:3302`) —
     /// ⭐ A CONSTANT SOURCE CONSUMES NOTHING, so this end is not recorded at all.
     pub from_constant: bool,
 }
 
 /// ONE SCHEDULE NODE THE CENSUS VISITS — `traverseTreeDFSMutable(nullptr, {COMPUTE, TRANSFER})`
-/// (`:3287-3289`) keeps these two kinds and no others.
+/// (`:3286-3288`) keeps these two kinds and no others.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleNode {
     /// `dsc2::TransferNode`.
@@ -679,19 +679,19 @@ pub enum ScheduleNode {
         /// `srcLdsAndLoopOffsets_` — ONE source end, which CONSUMES.
         src: Reads,
         /// `dstLdsAndLoopOffsets_` — the destination ends, which PRODUCE. ⛔ NO CONSTANT TEST ON THIS
-        /// SIDE (`:3299-3300`).
+        /// SIDE (`:3296-3297`).
         dsts: Vec<DataConnect>,
     },
     /// `dsc2::ComputeNode`.
     Compute {
         /// `inputsLdsAndLoopOffsets_` zipped with `inputs_`.
         inputs: Vec<Reads>,
-        /// `outputsLdsAndLoopOffsets_` (`:3313-3314`).
+        /// `outputsLdsAndLoopOffsets_` (`:3307-3308`).
         outputs: Vec<DataConnect>,
-        /// `instrAttribute_.input_data_connects_` (`:3316-3318`) — an opaque body's read ports. ⛔ NO
+        /// `instrAttribute_.input_data_connects_` (`:3310-3312`) — an opaque body's read ports. ⛔ NO
         /// CONSTANT TEST HERE EITHER: the reference does not have one to make.
         opaque_reads: Vec<DataConnect>,
-        /// `instrAttribute_.output_data_connects_` (`:3319-3321`).
+        /// `instrAttribute_.output_data_connects_` (`:3313-3315`).
         opaque_writes: Vec<DataConnect>,
     },
 }
@@ -699,7 +699,7 @@ pub enum ScheduleNode {
 /// THE CENSUS' ANSWER — `metadata.dataConnects_`, or the label that has no producer.
 ///
 /// ⛔⛔ `DT_ERROR("Illegal DDL: data_connect " + label + " does not have any producer.")`
-/// (`:3324-3329`) IS THIS ENUM, AND IT NAMES THE OFFENDER. An [`Option`] would have thrown the label
+/// (`:3322-3325`) IS THIS ENUM, AND IT NAMES THE OFFENDER. An [`Option`] would have thrown the label
 /// away, which is the whole content of the diagnostic.
 ///
 /// ⭐ WHICH offender, where several qualify, is not the reference's to fix: `dataConnects_` is an
@@ -721,8 +721,8 @@ pub enum DataConnects {
 /// keys on [`DataConnect`] and the node is only ever a value in it.
 ///
 /// ⛔ THE CONSTANT TEST IS ON THE CONSUMER SIDE ONLY, AND NOT ON AN OPAQUE'S PORTS: a transfer's
-/// destinations, a compute's outputs and both opaque lists are recorded unconditionally (`:3299`,
-/// `:3313`, `:3316`, `:3319`).
+/// destinations, a compute's outputs and both opaque lists are recorded unconditionally (`:3297`,
+/// `:3308`, `:3311`, `:3314`).
 #[must_use]
 pub fn create_data_connect_metadata(nodes: &[ScheduleNode]) -> DataConnects {
     let mut census: Vec<(DataConnect, Ends)> = Vec::new();
@@ -936,10 +936,10 @@ mod unit_tests {
     }
 
     /// 🎯 001/110 A PE/SFP SPLIT REPLACES THE ROW NEST, AND BOTH COMPONENTS ARE SAMPLED —
-    /// `ddc/ddcv1.cpp:920-933`.
+    /// `ddc/ddcv1.cpp:907-919`.
     #[test]
     fn a_pe_sfp_split_is_sampled_per_component_and_never_per_row() {
-        // Split BOTH ways: the row nest is what the component nest displaces (`row = -1` at `:929`),
+        // Split BOTH ways: the row nest is what the component nest displaces (`row = -1` at `:916`),
         // so `out` is measured whole on PE and quartered on SFP, never divided by 8 rows.
         let ds = Table {
             row_split: vec![PrimaryDim::Out],
@@ -971,13 +971,13 @@ mod unit_tests {
         // ⛔ AND PE IS SAMPLED: only PE's 64 exceeds a max of 32.
         let pe_fails = of(AbsoluteMin::Unset, Some(32.0));
         assert!(!check_constraints(&ds, &[pe_fails], PrimaryDim::Out, true));
-        // A dim the constraint does not name is not this constraint's business (`:800`).
+        // A dim the constraint does not name is not this constraint's business (`:802`).
         let unnamed = of(AbsoluteMin::Multiple(32.0), None);
         assert!(check_constraints(&ds, &[unnamed], PrimaryDim::Mb, true));
     }
 
     /// 🎯 001/110 ⛔ A ROW-SPLIT STAGE MEASURED AGAINST A ROW-FLAT REFERENCE IS COMPARED WHOLE —
-    /// `ddc/ddcv1.cpp:849-852`, and it is what decides the no-epilogue divisibility.
+    /// `ddc/ddcv1.cpp:831-834`, and it is what decides the no-epilogue divisibility.
     #[test]
     fn a_row_flat_reference_clears_the_row_from_both_sides_of_the_no_epilogue_test() {
         let ds = Table {
@@ -1021,14 +1021,14 @@ mod unit_tests {
             PrimaryDim::Ij,
             false
         ));
-        // `allowEpilogue` skips the whole arm (`:870`).
+        // `allowEpilogue` skips the whole arm (`:856`).
         assert!(check_constraints(
             &ds,
             &[of(&epilogue)],
             PrimaryDim::Ij,
             true
         ));
-        // A dim the reference stage does not have is not a constraint on it at all (`:869`).
+        // A dim the reference stage does not have is not a constraint on it at all (`:847`).
         let elsewhere = refer(-1);
         assert!(check_constraints(
             &ds,
@@ -1052,7 +1052,7 @@ mod unit_tests {
     }
 
     /// 🎯 002/110 WHICH SIDE EACH END LANDS ON, AND THAT A CONSTANT SOURCE CONSUMES NOTHING —
-    /// `ddc/ddcv1.cpp:3290-3321`.
+    /// `ddc/ddcv1.cpp:3290-3316`.
     #[test]
     fn a_transfer_produces_what_a_compute_then_consumes() {
         let census = create_data_connect_metadata(&[
@@ -1087,7 +1087,7 @@ mod unit_tests {
     }
 
     /// 🎯 002/110 ⛔ A CONNECT NOTHING WRITES IS ILLEGAL DDL, AND THE ANSWER NAMES IT —
-    /// `ddc/ddcv1.cpp:3324-3329`.
+    /// `ddc/ddcv1.cpp:3322-3325`.
     #[test]
     fn an_opaque_body_reading_an_unwritten_connect_names_that_connect() {
         let census = create_data_connect_metadata(&[ScheduleNode::Compute {

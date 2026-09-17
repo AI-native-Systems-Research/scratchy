@@ -9470,6 +9470,10 @@ mod tests_e307_e309 {
     struct Prep {
         ops: Vec<DscComputeOp>,
         dsc2_corelets: Option<u32>,
+        /// `constantInfo_` carries a `useZeroMean` of `1` (`ddc/ddcv1.cpp:2065-2072`).
+        zero_mean_constant: bool,
+        /// The op's own `opConsts["useZeroMean"]` is `1` (`:2073-2077`).
+        op_zero_mean: bool,
     }
 
     impl NewLabeledDs for Prep {
@@ -9520,10 +9524,10 @@ mod tests_e307_e309 {
             }
         }
         fn declares_zero_mean_constant(&self) -> bool {
-            false
+            self.zero_mean_constant
         }
         fn op_declares_zero_mean(&self, _at: usize) -> bool {
-            false
+            self.op_zero_mean
         }
         fn lds_entry(&self, lds: LdsIdx) -> Option<Self::Entry> {
             Some(Entry(lds))
@@ -9637,6 +9641,7 @@ mod tests_e307_e309 {
                 outputs: vec![LDS1],
             }],
             dsc2_corelets: None,
+            ..Prep::default()
         };
         let (_, _, mut stages, mut metadata) = explore_fixture();
         prep_dsc::<Dd2, _, _>(
@@ -9662,6 +9667,53 @@ mod tests_e307_e309 {
         assert_eq!(dsc.ops[1].inputs, vec![LDS1]);
         assert_eq!(dsc.ops[1].outputs, vec![LDS1]);
         assert_eq!(stages.finalized, vec![CORE, CHUNK, EXT]);
+    }
+
+    // ⛔ BOTH ZERO-MEAN DECLARATIONS FIRING LEAVES `EXX2_ZEROMEAN` IN THE BACKUP AND NOT `EXX2`: the
+    // `opConsts` arm has no `else` (`ddc/ddcv1.cpp:2073-2077`), so it re-reads an `opFuncName` the
+    // `constantInfo_` arm (`:2065-2072`) already swapped, and entry 132 puts that name back.
+    #[test]
+    fn e308_backs_the_swapped_name_up_where_both_zero_mean_declarations_fire() {
+        let exx2 = |zero_mean_constant, op_zero_mean| Prep {
+            ops: vec![DscComputeOp {
+                op_func: Some(OpFunc::Exx2),
+                ex_unit: SenComponent::Hbm,
+                format: None,
+                inputs: vec![LDS1],
+                interim: Vec::new(),
+                outputs: vec![LDS1],
+            }],
+            zero_mean_constant,
+            op_zero_mean,
+            ..Prep::default()
+        };
+
+        // Only the `constantInfo_` declaration: one write, so the backup is the name it displaced.
+        let mut dsc = exx2(true, false);
+        let (_, _, mut stages, mut metadata) = explore_fixture();
+        prep_dsc::<Dd2, _, _>(
+            &mut dsc,
+            &mut stages,
+            &mut metadata,
+            &AllocArena::new(),
+            Ln32::Off,
+        )
+        .expect("an EXX2 op over one stick leaves every DT_CHECK unreached");
+        assert_eq!(dsc.ops[0].op_func, Some(OpFunc::Exx2Zeromean));
+        assert_eq!(metadata.op_func_backup, Some(OpFunc::Exx2));
+
+        // Both: the second write re-reads what the first left on the op.
+        let mut dsc = exx2(true, true);
+        let (_, _, mut stages, mut metadata) = explore_fixture();
+        prep_dsc::<Dd2, _, _>(
+            &mut dsc,
+            &mut stages,
+            &mut metadata,
+            &AllocArena::new(),
+            Ln32::Off,
+        )
+        .expect("an EXX2 op over one stick leaves every DT_CHECK unreached");
+        assert_eq!(metadata.op_func_backup, Some(OpFunc::Exx2Zeromean));
     }
 
     // ─── entry 309 ──────────────────────────────────────────────────────────────────────────────
