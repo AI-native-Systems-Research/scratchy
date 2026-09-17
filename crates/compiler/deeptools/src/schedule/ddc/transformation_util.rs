@@ -1337,6 +1337,11 @@ where
 
 /// THE SCHEDULE NODE ONE `name_` NAMES — [`SyncNode::other_ends`] holds names where the reference
 /// holds `SyncNode*`, and `isExternalNode` is asked of the node itself.
+///
+/// ⛔ SO THIS IS THE OTHER END ONLY WHILE THE NAME IS UNIQUE, AND IT IS NOT YET: `finalizeScheduleTree`
+/// is what makes tree names unique (`dsc/dsc2.cpp:2976-2991`), and entry 300 mints two sync pairs under
+/// ONE pair of names before it runs (`ddc/ddc_transformation.cpp:1199-1208`, `:1268-1277`). See
+/// [`SyncNode::other_ends`] for the whole obligation.
 pub trait SyncNodesByName {
     /// The node named `name`, [`None`] where the tree holds none.
     fn node_named(&self, name: &NodeName) -> Option<NodeId>;
@@ -2527,7 +2532,7 @@ pub enum DatastageExploration {
 }
 
 /// WHERE A NODE IS PLACED AMONG A PARENT'S CHILDREN — `addChildNode`'s `(addBefore,
-/// siblingRefNode)` pair (`dsc/dsc2.cpp:2010`).
+/// siblingRefNode)` pair (`dsc/dsc2.cpp:2013`).
 ///
 /// ⛔ *"Sibling reference node not found in parent node"* IS UNSPELLABLE: naming a sibling names its
 /// parent too, so the two cannot disagree.
@@ -2582,7 +2587,7 @@ pub trait ScheduleSurgery {
     /// `new dsc2::BlockNode()` with its `name_` — a fresh block has NO children.
     fn new_block(&mut self, name: NodeName) -> NodeId;
 
-    /// `addChildNode(node, ..)` (`dsc/dsc2.cpp:2010`).
+    /// `addChildNode(node, ..)` (`dsc/dsc2.cpp:2013`).
     fn add_child_node(&mut self, node: NodeId, at: InsertionPoint);
 
     /// `node->moveNode(currDsc, ..)` (`dsc/dsc2.cpp:1977`) — unlinked from its old parent first.
@@ -2606,7 +2611,7 @@ pub trait LoopBands: ScheduleSurgery {
     /// `loopNode->dims_ = dims`.
     fn set_loop_dims(&mut self, loop_node: LoopId, dims: LoopDims);
 
-    /// `from->moveChildren(to)` (`dsc/dsc2.cpp:2043`) — every child re-parented, in order.
+    /// `from->moveChildren(to)` (`dsc/dsc2.cpp:2053`) — every child re-parented, in order.
     fn move_children(&mut self, from: NodeId, to: NodeId);
 
     /// `base->insertPerfectlyNestedBlockNode(nested)` — [`Self::move_children`] and then the one

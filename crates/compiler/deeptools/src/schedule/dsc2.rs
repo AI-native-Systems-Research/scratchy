@@ -1612,13 +1612,22 @@ pub struct TransferCoreletView {
 
 /// Replaces: e014_TransferNode
 ///
-/// `dsc2::TransferNode` (`dsc/dsc2.h:814-898`) carrying ALL TWENTY of its declared fields, plus the
+/// `dsc2::TransferNode` (`dsc/dsc2.h:814-898`) carrying ALL TWENTY of its declared members, plus the
 /// `name_` this projection needs from the `ScheduleNode` base.
 ///
 /// ⭐ AN END AND ITS OFFSETS ARE ONE VALUE: `src_`/`srcLdsAndLoopOffsets_` and
 /// `dstVias_`/`dstLdsAndLoopOffsets_` are parallel in the reference, and `ddc/ddcv1.cpp:2867` is the
 /// `DT_ERROR` that fires when the two destination vectors disagree — fusing each pair into an
 /// [`Operand`] is what makes that error unspellable.
+///
+/// ⛔ AND AN INDIRECT END IS A WHOLE `DataInfo` AND NOT AN LDS INDEX. `fillDataInfo` writes
+/// `startAddr_` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5879-5880`, `:5986`),
+/// `isStartAddrSymbolic_` (`:5916`) and `loopEleOffsets_` (`:6182`) into
+/// `srcIndirectLdsAndLoopOffsets_`/`dstIndirectLdsAndLoopOffsets_`, and both readers take the whole
+/// record: `buildUnitView(tn->srcIndirect_, tn->srcIndirectLdsAndLoopOffsets_, ..)`
+/// (`dsc/dsc2.cpp:3067-3069`, `:3076-3079`) and `createTransferLocInfo(.., srcIndDtInfo, ..)`
+/// (`dsc/dsc2Pcfg.cpp:1182-1186`, `:1190-1195`). So each indirect end is an [`Operand`] like the
+/// direct one, and only its `myLdsIdx_` being carried would leave those three writes nowhere to land.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferNode {
     /// `name_`.
@@ -1676,21 +1685,22 @@ pub struct TransferNode {
     ///
     /// Field: e014_TransferNode.srcIndirectLdsAndLoopOffsets_
     ///
-    /// `srcIndirect_` (`dsc/dsc2.h:824`) FUSED WITH `srcIndirectLdsAndLoopOffsets_.myLdsIdx_` (`:832`)
+    /// `srcIndirect_` (`dsc/dsc2.h:824`) FUSED WITH THE WHOLE `srcIndirectLdsAndLoopOffsets_` (`:832`)
     /// — the index tensor this transfer gathers its SOURCE addresses through, [`None`] for a direct
     /// transfer, which is `isSrcIndirect()`'s own `unit_ != NO_COMPONENT` test (`:877`).
-    pub src_indirect: Option<Via>,
+    pub src_indirect: Option<Operand>,
     /// Field: e014_TransferNode.locIndirect_
     ///
     /// Field: e014_TransferNode.dstIndirectLdsAndLoopOffsets_
     ///
-    /// `dstVias_.front().locIndirect_` (`dsc/dsc2.h:817`) FUSED WITH
-    /// `dstIndirectLdsAndLoopOffsets_.front().myLdsIdx_` (`:833`).
+    /// `dstVias_.front().locIndirect_` (`dsc/dsc2.h:817`) FUSED WITH THE WHOLE
+    /// `dstIndirectLdsAndLoopOffsets_.front()` (`:833`).
     ///
-    /// ⛔ ONE END AND NOT A VECTOR, WHICH IS THE REFERENCE'S OWN TWO `DT_CHECK`s: entry 227 demands
-    /// `dstVias_.size() == 1` before it writes, and then that `dstIndirectLdsAndLoopOffsets_` was
-    /// empty and holds exactly one entry after.
-    pub dst_indirect: Option<Via>,
+    /// ⛔ ONE END AND NOT A VECTOR, WHICH IS THE REFERENCE'S OWN THREE `DT_CHECK`s: entry 227 demands
+    /// `dstVias_.size() == 1` before it writes (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7138`), and
+    /// that `dstIndirectLdsAndLoopOffsets_` was empty (`:7143`) and holds exactly one entry after
+    /// (`:7146`).
+    pub dst_indirect: Option<Operand>,
     /// Field: e014_TransferNode.lastFusableParentLoopSrc_
     ///
     /// `lastFusableParentLoopSrc_` (`dsc/dsc2.h:830`) — the outermost enclosing loop the SOURCE end
@@ -2068,11 +2078,19 @@ impl LeafNode {
 /// ⛔ A FRESH BLOCK HAS NO CHILDREN: `new dsc2::BlockNode()` leaves the child vector empty, and
 /// `addChildNode`/`moveChildNode` are the units that fill it.
 ///
-/// ⭐ `Clone` COPIES THE CHILDREN WHERE THE REFERENCE'S COPY CONSTRUCTOR DROPS THEM —
-/// `VectorOfChildren(const VectorOfChildren&) {}`, *"do nothing on purpose"*, leaving it *"up to the
-/// caller to manually insert copies of the children"* (`dsc/dsc2.h:533-535`). That divergence is not
-/// live: no site in the reference tree copy-constructs a `BlockNode`, so nothing observes the
-/// empty-child copy, and a `Clone` that silently emptied a subtree is the harder defect of the two.
+/// ⛔⛔ `Clone` IS A DEEP COPY AND IS NOT THE REFERENCE'S `clone()`, WHICH IS CHILDLESS.
+/// `VectorOfChildren(const VectorOfChildren&) {}` is *"do nothing on purpose"*, leaving it *"up to the
+/// caller to manually insert copies of the children"* (`dsc/dsc2.h:533-535`), and every Block-derived
+/// `clone()` is `new Derived(*this)` (`util/utils.h:105-107`), so it runs that copy constructor.
+///
+/// ⛔ AND THAT COPY IS LIVE, TWICE, BOTH TIMES RE-INSERTING THE CHILDREN BY HAND: entry 300 clones a
+/// loop band and re-adds the inner loop (`ddc/ddc_transformation.cpp:984-986`), and entry 249 clones a
+/// condition and adds two fresh regions (`ddc/ddc_transformation_util.cpp:580`, `:587-588`).
+///
+/// ⭐ SO A PORT OF `clone()` MINTS THE CHILDLESS NODE AND DOES NOT REACH FOR THIS `Clone` — that is
+/// what `PackStickDim::clone_loop` (`ddc/transformation.rs:1489`) and `Dsc2Store::clone_condition_node`
+/// (`stages/ddc_store.rs:257`) do. This `Clone` is the SNAPSHOT of an owned subtree, which is what
+/// `v1::Dsc2Store::schedule_head_block` (`ddc/v1.rs:6318`) answers with.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlockNode {
     /// The `ScheduleNode` part.
@@ -2104,15 +2122,18 @@ impl BlockNode {
         ChildPos(pos)
     }
 
-    /// `addChildNode(node, /*addFront=*/false)` — append, which is where a walk in program order puts
+    /// `addChildNode(node, /*addBefore=*/false)` — append, which is where a walk in program order puts
     /// every node it mints.
     pub fn add_child(&mut self, node: SchedNode) -> ChildPos {
         self.children.push(node);
         ChildPos(self.children.len() - 1)
     }
 
-    /// `addChildNode(node, /*addFront=*/true)` — the allocation case, whose node has to precede the
-    /// transfers already in the block it lands in (`ddl_conversion.cpp:713-716`).
+    /// `addChildNode(node, /*addBefore=*/true)` — the front insert, whose caller is the allocation
+    /// case: `allocParent->addChildNode(myAllocNode, allocParent != currParent)`
+    /// (`ddc/ddl/ddl_conversion.cpp:782`, and `:831` for an external constant's), which goes in FRONT
+    /// exactly when the allocation's region block is an ANCESTOR of the current parent rather than the
+    /// current parent itself.
     pub fn add_child_front(&mut self, node: SchedNode) -> ChildPos {
         self.children.insert(0, node);
         ChildPos(0)
@@ -2285,6 +2306,17 @@ pub struct SyncNode {
     ///
     /// `otherEndOfTheSignals_` (`dsc/dsc2.h:969`) BY NAME, empty on a fresh node: a sequence that
     /// mints both ends pairs them, and a name is the link a tree of owned nodes can hold.
+    ///
+    /// ⛔ AND THAT LINK IS EXACT ONLY WHILE THE NAMES ARE. The reference holds
+    /// `std::vector<dsc2::SyncNode*>`, so a duplicate name costs it nothing — and duplicates ARE
+    /// minted: entry 300 puts `sync_lxsu_send_lxlu`/`sync_lxlu_recv_lxsu` around BOTH halves of the
+    /// band it splits, cross-linking each pair by POINTER (`ddc/ddc_transformation.cpp:1199-1208` and
+    /// `:1268-1277`), and the port mints the same two names (`ddc/transformation.rs:2329`). Tree names
+    /// become unique only in `finalizeScheduleTree`, which appends `__N` (`dsc/dsc2.cpp:2976-2991`),
+    /// AFTER those transformations. Until it runs, a resolver keyed on this name answers with the
+    /// FIRST node carrying it (`stages/tree.rs:538`), so entry 121 can be asked of the wrong end
+    /// (`ddc/transformation_util.rs:1359`). `ddl/conversion.rs:6062` records the same narrowing from
+    /// the DDL side.
     pub other_ends: Vec<NodeName>,
 }
 
@@ -4091,6 +4123,47 @@ mod tests_e010_block_node {
             "a name no child carries runs out rather than refusing"
         );
     }
+
+    /// ⭐ THE FRONT INSERT IS THE ALLOCATION CASE — `allocParent->addChildNode(myAllocNode,
+    /// allocParent != currParent)` (`ddc/ddl/ddl_conversion.cpp:782`) — and the deep `Clone` beside it
+    /// is a SNAPSHOT of an owned subtree, ⛔ NOT the reference's `clone()`, whose copy constructor
+    /// drops every child (`dsc/dsc2.h:533-535`, `util/utils.h:105-107`).
+    #[test]
+    fn a_front_insert_precedes_every_child_already_there_and_clone_keeps_them_all() {
+        let leaf = |name: &str| {
+            SchedNode::Leaf(LeafNode::new(
+                LeafKind::Transfer,
+                NodeName(name.to_owned()),
+            ))
+        };
+        let mut block = BlockNode::default();
+        for name in ["t0", "t1"] {
+            block.add_child(leaf(name));
+        }
+        assert_eq!(
+            block.add_child_front(leaf("alloc")),
+            ChildPos(0),
+            "`addChildNode(node, /*addBefore=*/true)` lands in front of the transfers already there"
+        );
+
+        let names = |block: &BlockNode| {
+            block
+                .children
+                .iter()
+                .map(|child| child.name().0.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&block), ["alloc", "t0", "t1"]);
+
+        let snapshot = block.clone();
+        block.add_child(leaf("t2"));
+        assert_eq!(
+            names(&snapshot),
+            ["alloc", "t0", "t1"],
+            "`Clone` copied `next_` and the copy is INDEPENDENT of the block it came from"
+        );
+        assert_eq!(names(&block), ["alloc", "t0", "t1", "t2"]);
+    }
 }
 
 #[cfg(test)]
@@ -4271,6 +4344,56 @@ mod tests_e014_transfer_node {
                 .is_some_and(|view| view.src_indirect_loops_and_size == UnitView::default()
                     && view.dst_indirect_loops_and_sizes.is_empty()),
             "an indirect view is filled only for an indirect end (`dsc/dsc2.cpp:3066`, `:3075`)"
+        );
+    }
+
+    /// ⛔ AN INDIRECT END IS A WHOLE `DataInfo` AND NOT AN LDS INDEX: `fillDataInfo` writes
+    /// `isStartAddrSymbolic_` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5916`) and `loopEleOffsets_`
+    /// (`:6182`) into `srcIndirectLdsAndLoopOffsets_` beside the `myLdsIdx_` entry 227 set, and
+    /// `buildUnitView(tn->srcIndirect_, tn->srcIndirectLdsAndLoopOffsets_, ..)` (`dsc/dsc2.cpp
+    /// :3067-3069`) reads the record back WHOLE.
+    #[test]
+    fn an_indirect_end_carries_every_field_fill_data_info_writes_into_it() {
+        let mut node = fresh();
+        assert!(
+            node.src_indirect.is_none() && node.dst_indirect.is_none(),
+            "`srcIndirect_.unit_ == NO_COMPONENT` IS *not indirect* (`dsc/dsc2.h:877`)"
+        );
+
+        // Entry 227's own three writes (`L3DlOpsScheduler.cpp:7135-7137`), then entry 333's two.
+        let mut indirect = operand(SenComponent::L3lu, SenComponent::L3luibr);
+        indirect.data.my_lds_idx = Some(LdsIdx(5));
+        indirect.data.is_start_addr_symbolic = true;
+        indirect
+            .data
+            .loop_ele_offsets
+            .entry(Corelet::at::<0>())
+            .or_default()
+            .entry(LoopId(NodeId(9)))
+            .or_default()
+            .insert(PrimaryDim::Mb, LoopEleOffset(1));
+        node.src_indirect = Some(indirect);
+
+        let held = node.src_indirect.as_ref().expect("the source is indirect");
+        assert_eq!(
+            Via::of(held),
+            Via {
+                loc: DataLocation {
+                    unit: SenComponent::L3lu,
+                    storage: SenComponent::L3luibr,
+                },
+                lds: Some(LdsIdx(5)),
+            },
+            "`srcIndirect_` and its `myLdsIdx_` are still the pair a minting site hands in"
+        );
+        assert!(
+            held.data.is_start_addr_symbolic,
+            "`indirectDi->isStartAddrSymbolic_ = true` (`:5916`) has somewhere to land"
+        );
+        assert_eq!(
+            held.data.loop_ele_offsets[&Corelet::at::<0>()][&LoopId(NodeId(9))][&PrimaryDim::Mb],
+            LoopEleOffset(1),
+            "`indirectDi->loopEleOffsets_[clId][loopPtr][dim] = loopEleOffs` (`:6182`)"
         );
     }
 }

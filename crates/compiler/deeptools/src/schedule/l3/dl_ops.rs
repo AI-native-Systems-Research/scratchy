@@ -8672,8 +8672,8 @@ pub fn set_cond_gtr<E: DscGtrSurgery + ?Sized>(
         );
         // The four `locIndirect_`/`..IndirectLdsAndLoopOffsets_` copies, in the projection that holds
         // one indirection per END rather than one per destination.
-        duplicate.src_indirect = original.src_indirect;
-        duplicate.dst_indirect = original.dst_indirect;
+        duplicate.src_indirect = original.src_indirect.clone();
+        duplicate.dst_indirect = original.dst_indirect.clone();
         let group = match group {
             GroupName::Shared(id) => Some(id),
             GroupName::Unshared => None,
@@ -10055,8 +10055,8 @@ pub fn convert_transfer_direct_to_indirect<T: L3TreeSurgery + ?Sized>(
         lds: Some(index_lds),
     };
     match direction {
-        IbrDirection::In => node.src_indirect = Some(via),
-        IbrDirection::Out => node.dst_indirect = Some(via),
+        IbrDirection::In => node.src_indirect = Some(via.operand()),
+        IbrDirection::Out => node.dst_indirect = Some(via.operand()),
     }
     tree.set_transfer(transfer, node);
     Some(())
@@ -11591,13 +11591,16 @@ mod tests_e221_e228 {
         let node = tree.transfer(transfer);
         assert_eq!(
             node.src_indirect,
-            Some(Via {
-                loc: DataLocation {
-                    unit: SenComponent::L3lu,
-                    storage: SenComponent::L3luibr,
-                },
-                lds: Some(LdsIdx(5)),
-            })
+            Some(
+                Via {
+                    loc: DataLocation {
+                        unit: SenComponent::L3lu,
+                        storage: SenComponent::L3luibr,
+                    },
+                    lds: Some(LdsIdx(5)),
+                }
+                .operand(),
+            )
         );
         assert_eq!(node.dst_indirect, None);
     }
@@ -11825,10 +11828,13 @@ mod tests_e221_e228 {
         assert_eq!(tree.parent(over_store), Some(new_chunk.0));
         // The load reads its addresses through the load unit's IBR; the store writes through its own.
         let ibr = |unit, storage| {
-            Some(Via {
-                loc: DataLocation { unit, storage },
-                lds: Some(LdsIdx(1)),
-            })
+            Some(
+                Via {
+                    loc: DataLocation { unit, storage },
+                    lds: Some(LdsIdx(1)),
+                }
+                .operand(),
+            )
         };
         let loaded = tree.transfer(load);
         assert_eq!(
@@ -17781,12 +17787,12 @@ where
                     continue;
                 }
                 let src_site = v1::OperandSite::TransferSrc(node);
-                let indirect = transfer.src_indirect.map(Via::operand);
+                let indirect = transfer.src_indirect.as_ref();
                 if let Some(filled) = l3_fill_data_info::<A, _, _, _, _>(
                     inputs,
                     symbols,
                     &transfer.src,
-                    indirect.as_ref(),
+                    indirect,
                     owner_loop,
                 )? {
                     sink.fill(src_site, filled)?;
@@ -17807,13 +17813,12 @@ where
                         node,
                         DestIdx(u32::try_from(index).ok()?),
                     );
-                    let indirect =
-                        transfer.dst_indirect.filter(|_| index == 0).map(Via::operand);
+                    let indirect = transfer.dst_indirect.as_ref().filter(|_| index == 0);
                     if let Some(filled) = l3_fill_data_info::<A, _, _, _, _>(
                         inputs,
                         symbols,
                         dst,
-                        indirect.as_ref(),
+                        indirect,
                         owner_loop,
                     )? {
                         sink.fill(site, filled)?;
