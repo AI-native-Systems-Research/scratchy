@@ -20,6 +20,7 @@ chapters=(
   "docs/MODELS.md:MODELS.md"
   "docs/spyre/KUBERNETES.md:spyre/KUBERNETES.md"
   "CONTRIBUTING.md:CONTRIBUTING.md"
+  "docs/blogs/REUSE.md:blogs/REUSE.md"
 )
 
 # Links that are correct relative to the repo root (how GitHub renders them) but

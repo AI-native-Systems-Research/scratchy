@@ -93,6 +93,8 @@ Note the convention for selecting models and quants:
 ### Deep Dives
 
 - See [`docs/WHY.md`](docs/WHY.md) for the argument above at full length.
+- See [`docs/blogs/REUSE.md`](docs/blogs/REUSE.md) — *What does "reuse" mean in
+the age of AI?*
 - See [`docs/BUILD.md`](docs/BUILD.md) for the full feature-scoping
 mechanics.
 - See [`docs/COMPILER.md`](docs/COMPILER.md) for more information on the procmacro approach.
