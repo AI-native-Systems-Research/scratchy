@@ -310,11 +310,46 @@ pub fn assemble_reduce_seeded<D: KindTag, A: KindTag>(
         .unwrap_or_else(|e| panic!("assemble_reduce {op_name}: {e}"))
 }
 
-/// [`reduce_opspec`] with per-operand ELEMENT offsets — for PER-HEAD reduces (rows=1).
-/// The on-card reduce-**MAX** returns 0 (the seed) when `rows>1` (PROVEN via attn diag:
-/// mxp=0 over [nqh,cap]) but is CORRECT at rows=1 (the rmsnorm `rmamax` works). reduce-SUM
-/// is fine multi-row (the score reduce gives sane scores), so only the softmax max-reduce
-/// needs splitting into nqh single-row reduces.
+/// [`reduce_opspec`] with per-operand ELEMENT offsets — for per-head/offset reduce slices.
+///
+/// # ⛔⛔⛔ THE reduce-MAX DEFECT THIS DOC USED TO MISSTATE: IT IS THE CONJUNCTION
+///
+/// This doc previously said the on-card reduce-**MAX** returns 0 (the seed) "when `rows>1`" and is
+/// correct only at `rows=1`, and named the remedy as splitting the softmax max into nqh single-row
+/// reduces. **THAT ATTRIBUTED THE FAILURE TO THE WRONG AXIS, and it was believed downstream** — a
+/// KTIR-door guard was built on this sentence rather than on the code that had already corrected it,
+/// and it refused a CORRECT decoder softmax by name.
+///
+/// The correction, which is measurable in this tree and not a matter of opinion: the broken cell is
+/// `rows > 1` **AND** a reduced extent past ONE STICK. Exactly one diagnostic ever measured the defect
+/// — `mxp = 0` over `[nqh, cap]` — and that shape moved the row count AND the width off their safe
+/// values TOGETHER (rows = nqh > 1, cols = cap = many sticks), so on its own it cannot say which axis
+/// broke it. Each single-axis reading is refuted by a different piece of shipping, hardware-proven
+/// emission:
+///
+/// * **NOT `rows > 1`.** [`super::attn`] records a per-row split TRIED AND REVERTED (2026-07-28) after
+///   direct comparison against the old proven flash-decode's `attn_bmax{b}_o{t}`: that code reduces MAX
+///   at `rows = nqh` (> 1) with `width` one stick, on real hardware, at 31 tok/s — and the reverted
+///   split was measured as zero behavioural change. `assemble_attn_block`'s `width` parameter states the
+///   safe regime at the parameter itself.
+/// * **NOT the width alone.** [`crate::emit::ktir_matmul_fp8`]'s `fq_amax_op` reduces MAX over the FULL
+///   hidden width `k` (2048/4096 — many sticks) on every fp8 matmul of every layer; at decode `m == 1`
+///   and it is proven on card at 41 tok/s.
+///
+/// The conjunction is what the two have in common, and it is already named twice as such: the
+/// `stickmajor` branch in [`reduce_opspec_df`] and in this function fires at exactly
+/// `rows > 1 && cols > 64`, and `ktir_matmul_fp8.rs` calls that regime "scrambled at rows>1 AND
+/// cols>64" — which is the clue that the hazard there is ADDRESSING (a stick-major activation read as
+/// flat), not reduce-MAX arithmetic as such.
+///
+/// So the remedy for a genuinely wide max is to TILE THE REDUCTION to one stick and combine the
+/// partials (what `attention_flash.py` and `swiglu_mlp.py` pin `BLOCK_N = 64` for, as a correctness
+/// constraint), **not** to split it into one reduce per row. reduce-SUM combines correctly multi-row at
+/// any width and needs nothing.
+///
+/// None of this changes what THIS function is for: per-operand element offsets, so a per-head or
+/// otherwise offset slice of a shared buffer can be reduced in place. The offsets have callers of their
+/// own (`attn_dp`/`attn_dn`) and are unrelated to the defect above.
 #[allow(clippy::too_many_arguments)]
 pub fn reduce_opspec_off(
     op: OpFunc,
