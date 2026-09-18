@@ -117,7 +117,7 @@ jobs:
           -- -D warnings
 
   # ---------------------------------------------------------------------------
-  # macOS / arm64 — Metal backend.
+  # macOS / arm64 — Metal backend (unit tests + clippy).
   #
   # `scratchy-models` (built here with `all-arches`) is the umbrella that
   # compiles the whole Metal inference stack plus every per-arch model crate. The full
@@ -128,9 +128,69 @@ jobs:
   # `scratchy-target-metal` build script compiles shaders against the
   # MetalPerformancePrimitives framework, which ships only in the Xcode 26 /
   # macOS 26 SDK (absent on macos-14/15).
+  #
+  # Split into parallel jobs to reduce wall-clock time:
+  # - compute-model-shards: buckets scratchy-models' stem features into N groups
+  # - macos-metal-clippy-shard: `metal,all`'s clippy coverage, N-way sharded
+  # - macos-metal-unit: hf-completions clippy + kernel tests + KTIR tests + tool parser tests
+  # - macos-metal-e2e-smollm: SmolLM smoke + Gemma-4 tool parser (shares tiny model)
+  # - macos-metal-e2e-guards: gemma-4 continuation + long-context coherence
   # ---------------------------------------------------------------------------
-  macos-metal:
-    name: macos-arm64 (metal)
+
+  # Buckets scratchy-models' per-model-stem features into N shards so the
+  # `metal,all` clippy pass (the single biggest line item in this workflow —
+  # `#[forward]` forward-expands every config in scope at compile time) can run
+  # as N parallel jobs instead of one. Reads cargo metadata rather than a
+  # hand-maintained arch list: a stem feature's declared value is always exactly
+  # `["arch-<name>"]` (one dependency, itself prefixed `arch-`); every aggregate
+  # (bare arch names, `all`, `all-arches`, backend flags) has zero, multiple, or
+  # a non-`arch-` value. Filtering on that shape means there is nothing here to
+  # keep in sync with crates/models/arch/Cargo.toml by hand — add a model stem
+  # there and it's picked up (and bucketed) on the next run automatically.
+  compute-model-shards:
+    name: compute model-stem shards
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.split.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Split model stems into shards
+        id: split
+        run: |
+          SHARDS=4
+          cargo metadata --no-deps --format-version=1 \
+            | jq -c '.packages[] | select(.name == "scratchy-models") | .features
+                | to_entries
+                | map(select(.value | length == 1 and (.[0] | startswith("arch-"))))
+                | map(.key)
+                | sort' \
+            | jq -c --argjson n "$SHARDS" 'to_entries | group_by(.key % $n) | map([.[].value]) | to_entries | map({index: .key, stems: .value})' \
+            | sed 's/^/shards=/' >> "$GITHUB_OUTPUT"
+
+  macos-metal-clippy-shard:
+    name: macos-arm64 (metal) - clippy [shard ${{ matrix.shard.index }}]
+    needs: compute-model-shards
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.compute-model-shards.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-metal-clippy-shard-${{ matrix.shard.index }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clippy (shard)
+        run: cargo clippy -p scratchy-models --features "metal,${{ join(matrix.shard.stems, ',') }}" -- -D warnings
+
+  macos-metal-unit:
+    name: macos-arm64 (metal) - unit tests
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -139,18 +199,15 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-metal
+          key: macos-metal-unit
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Clippy is a superset of `cargo check`, so we run only clippy + test.
-      - name: Clippy
-        run: cargo clippy -p scratchy-models --features metal,all -- -D warnings
-
-      # `all` is model stems only, so the step above never turns
-      # `hf-completions` on and its build-script path (the huggingface.co query
-      # in hf_registry_build.rs) would otherwise go entirely unlinted. Scoped to
-      # the smallest stem: one arch, one Hub query. Runners have network; a Hub
-      # outage degrades to an empty registry rather than failing the build.
+      # The `metal,all` clippy pass runs sharded in macos-metal-clippy-shard
+      # above. This invocation is scoped to the smallest stem (one arch) with
+      # `hf-completions` on, which `all` never turns on — its build-script path
+      # (the huggingface.co query in hf_registry_build.rs) would otherwise go
+      # entirely unlinted. Runners have network; a Hub outage degrades to an
+      # empty registry rather than failing the build.
       - name: Clippy (hf-completions)
         run: cargo clippy -p scratchy-models --features metal,smollm2-135m,hf-completions -- -D warnings
 
@@ -187,23 +244,41 @@ jobs:
       # Granite / Gemma-4). Pure-logic unit tests with no GPU dependency —
       # don't need a real model at runtime, but scratchy-models has no
       # default model scope (build-time panic otherwise), so name the same
-      # tiny one the SmolLM e2e steps below use, to reuse that build.
+      # tiny one the SmolLM e2e steps use, to reuse that build.
       - name: Tool parser unit tests
         run: cargo test -p scratchy-serving-api -p scratchy-models
           --features metal,scratchy-models/smollm2-135m --lib tool_parser
 
-      # Real-model e2e smoke: boot the server on Metal against SmolLM-135M and
-      # generate. This exercises the full load → prefill → decode → HTTP path
-      # that kernel unit tests can't reach. The e2e tests are `#[ignore]` by
-      # default, so we opt in with `--ignored` and filter to the SmolLM tier.
-      # The model (~100 MB) is cached across runs keyed on its id.
+  # ---------------------------------------------------------------------------
+  # macOS / arm64 — Metal backend (e2e SmolLM tests).
+  #
+  # Real-model e2e smoke: boot the server on Metal against SmolLM-135M and
+  # generate. This exercises the full load → prefill → decode → HTTP path
+  # that kernel unit tests can't reach. The e2e tests are `#[ignore]` by
+  # default, so we opt in with `--ignored` and filter to the SmolLM tier.
+  # The model (~100 MB) is cached across runs keyed on its id.
+  #
+  # Runs in parallel with unit tests and regression guards to reduce wall-clock time.
+  # ---------------------------------------------------------------------------
+  macos-metal-e2e-smollm:
+    name: macos-arm64 (metal) - e2e SmolLM
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-metal-e2e-smollm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Cache HF models
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          # Covers SmolLM-135M (~100 MB) AND gemma-4-12B-it-4bit (~6.3 GB, used by the
-          # continuation regression guard below).
-          key: hf-models-smollm-gemma4-12b-llama1b-v1
+          # Covers SmolLM-135M (~100 MB) only. The large models (gemma-4-12B, llama-1b)
+          # are cached in the guards job.
+          key: hf-models-smollm-v1
+
       # `--test-threads=1`: each test boots an in-process server with its own
       # Metal worker pool; running them concurrently contends on GPU command
       # buffers (MTLCommandBufferStatusError). Serialize them.
@@ -216,20 +291,51 @@ jobs:
       # Gemma-4 tool-call parser server wiring: boot the server with the `gemma4`
       # parser configured and confirm chat/stream (with and without tools) stay
       # well-formed. SmolLM won't emit Gemma-format calls, so this covers the
-      # server wiring; the parse logic itself is unit-tested above. Kept next to
-      # the SmolLM smoke (shares the tiny model) and before the 6.3 GB gemma-12b
-      # guard below.
+      # server wiring; the parse logic itself is unit-tested in the unit job.
+      # Kept next to the SmolLM smoke (shares the tiny model).
       - name: E2E Gemma-4 tool parser (metal, SmolLM-135M)
         timeout-minutes: 15
         run: cargo test -p scratchy-e2e -p scratchy-models
           --features e2e,metal,scratchy-models/smollm2-135m
           --test e5_gemma4_tool_parser -- --ignored --test-threads=1
 
+  # ---------------------------------------------------------------------------
+  # macOS / arm64 — Metal backend (e2e regression guards).
+  #
+  # REGRESSION GUARDS — gemma-4 hd512 unfused attention on a chunked-prefill
+  # CONTINUATION (> 2048-token prompt → chunk 2 has lq != kv_len) and long-context
+  # coherence (chunked == single prefill). These are the ONLY tests that catch
+  # certain classes of bugs (NAX-gemm K-tail / padding-row, chunked/reused sequence
+  # past the 2048-tok/128-block bucket boundary). Do not remove or shorten.
+  #
+  # Runs in parallel with unit tests and SmolLM e2e to reduce wall-clock time.
+  # ---------------------------------------------------------------------------
+  macos-metal-e2e-guards:
+    name: macos-arm64 (metal) - e2e regression guards
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-metal-e2e-guards
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Cache HF models
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          # Covers gemma-4-12B-it-4bit (~6.3 GB) and llama-3.2-1b (~2.5 GB).
+          key: hf-models-gemma4-12b-llama1b-v1
+
       # REGRESSION GUARD — gemma-4 hd512 unfused attention on a chunked-prefill
       # CONTINUATION (> 2048-token prompt → chunk 2 has lq != kv_len). This is the ONLY
       # test that catches the NAX-gemm K-tail / padding-row class of bug: a short prompt
       # (single chunk, fresh scratch) and isolated kernel tests do NOT reproduce it — it
       # needs a real 2nd chunk that reuses the dense scratch. Do not remove or shorten.
+      # `--test-threads=1`: each test boots an in-process server with its own
+      # Metal worker pool; running them concurrently contends on GPU command
+      # buffers (MTLCommandBufferStatusError). Serialize them.
       - name: E2E gemma-4 continuation guard (hd512 unfused)
         timeout-minutes: 30
         run: cargo test -p scratchy-e2e -p scratchy-models
