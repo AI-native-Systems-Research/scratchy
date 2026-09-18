@@ -1189,9 +1189,9 @@ pub fn lower_function(
         };
 
         // THE WEIGHT'S ORIENTATION, PROVEN FROM THE MAPS before any extent is trusted. See
-        // [`matmul_weight_is_transpose_b`]: the extent guards downstream cannot distinguish the two
-        // orientations when k == n, so a square weight would otherwise lower to a descriptor
-        // contracting the other way round.
+        // [`BOrient`]: the extent guards downstream cannot distinguish the two framings when
+        // k == n, so a square weight would otherwise lower to a descriptor contracting the other
+        // way round. Threaded into `emit_one` as a value; never re-derived and never defaulted.
         let b_orient = if matches!(program, Lowering::Node(Program::Matmul)) {
             Some(matmul_b_orientation(f, op)?)
         } else {
@@ -1750,9 +1750,10 @@ mod matmul_orientation_tests {
         (Box::leak(Box::new(f)), Box::leak(Box::new(op)))
     }
 
-    /// ⭐ THE ASSUMED FORM: B's map ends in the reduction dim `d2`, so B is `[n, k]` and the contraction
-    /// reduces over k in place. scratchy's `KtirFunc::matmul` emits this unconditionally, which is why
-    /// every assembler here may assume it.
+    /// ⭐ THE PRESENTED-WEIGHT FORM: B's map ends in the reduction dim `d2`, so B's REGION is `[n, k]`
+    /// and the contraction reduces over k in place. scratchy's `KtirFunc::matmul` emits this
+    /// unconditionally, and the host stage is where such a weight's bytes are placed into the kernel
+    /// slot's `[k, n]` device order.
     #[test]
     fn the_transpose_b_triple_is_recognised() {
         let (f, op) = mm(Some([[0, 2], [1, 2], [0, 1]]));
@@ -1760,8 +1761,8 @@ mod matmul_orientation_tests {
     }
 
     /// ⭐ MLIR'S PLAIN FORM, and the SAME answer for an op stating NO maps — which is what `tl.dot(p, v)`
-    /// with no `.T` lowers to, and the reason both decoders reached this door at all. It is a real `[k, n]`
-    /// buffer, so it is LOWERED by transposing B rather than refused.
+    /// with no `.T` lowers to, and the reason both decoders reached this door at all. It is a real
+    /// `[k, n]` buffer, which IS the kernel slot's own device order, so it is contracted where it lies.
     #[test]
     fn the_plain_triple_and_a_missing_attribute_are_both_plain_b() {
         let (f, op) = mm(Some([[0, 2], [2, 1], [0, 1]]));
