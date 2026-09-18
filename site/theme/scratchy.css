@@ -35,6 +35,7 @@ body { font-size: 1.6rem; line-height: 1.5; }
   --links-hover: #a6c8ff;
   --background-hover: rgba(141, 141, 141, 0.16);
   --background-selected: rgba(141, 141, 141, 0.24);
+  --background-active: rgba(141, 141, 141, 0.4);
   --focus: #ffffff;
 
   --inline-code-color: #ff7eb6;
@@ -82,6 +83,7 @@ body { font-size: 1.6rem; line-height: 1.5; }
   --links-hover: #0043ce;
   --background-hover: rgba(141, 141, 141, 0.12);
   --background-selected: rgba(141, 141, 141, 0.2);
+  --background-active: rgba(141, 141, 141, 0.5);
   --focus: #0f62fe;
 
   --inline-code-color: #9f1853;
@@ -290,7 +292,24 @@ html.sidebar-visible #menu-bar {
 /* Kept in the DOM for book.js, which reads `.menu-title`. */
 #menu-bar .menu-title { display: none; }
 
-/* header__global */
+/* No theme picker: book.toml already tracks the reader's system preference
+ * (`default-theme` light, `preferred-dark-theme` navy), exactly as the landing
+ * page does through prefers-color-scheme. Offering six mdBook themes here
+ * would be a control the rest of the site does not have. Both elements stay in
+ * the DOM because book.js reads them on every page.
+ *
+ * Scoped through #menu-bar so this outweighs the header__action rule below,
+ * which is itself an id plus two classes. */
+#menu-bar #theme-toggle,
+#menu-bar #theme-list { display: none; }
+
+/* header__global. mdBook gives .left-buttons `margin: 0 5px` and
+ * .right-buttons `margin: 0 15px`; both have to go, or the brand starts 10px
+ * right of where it does on the landing page and the last icon never reaches
+ * the edge. */
+#menu-bar .left-buttons,
+#menu-bar .right-buttons { margin: 0; }
+
 #menu-bar .header-global {
   display: flex;
   flex: 1 1 0%;
@@ -299,6 +318,31 @@ html.sidebar-visible #menu-bar {
   block-size: 100%;
   margin: 0;
 }
+
+/* header__action: mini-units(6) square, 1px transparent border, hovers to
+ * $background-hover and takes $focus on the border. */
+#menu-bar .header-global .icon-button,
+#menu-bar .header-global > a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: 4.8rem;
+  block-size: 4.8rem;
+  padding: 0;
+  border: 1px solid transparent;
+  line-height: 1;
+  transition: background-color 110ms, border-color 110ms;
+}
+#menu-bar .header-global .icon-button:hover,
+#menu-bar .header-global > a:hover { background-color: var(--background-hover); }
+#menu-bar .header-global .icon-button:focus,
+#menu-bar .header-global > a:focus { outline: none; border-color: var(--focus); }
+#menu-bar .header-global .icon-button:active,
+#menu-bar .header-global > a:active { background-color: var(--background-active); }
+
+/* mdBook centres its icons with `line-height: var(--menu-bar-height)`, which
+ * double-counts against the flex centring above. */
+#menu-bar .header-global i { line-height: 1; }
 
 /* ------------------------------------------------------------------ *
  * Carbon breadcrumb — `breadcrumb/_breadcrumb.scss`
@@ -352,10 +396,15 @@ html[data-path^="blogs/"] .bc-docs { display: none; }
  * without them.
  * ------------------------------------------------------------------ */
 
+/* `.nav-wrapper` holds the mobile chapter arrows; `.nav-chapters` is the
+ * desktop pair, which mdBook fixes to the left and right viewport edges
+ * outside that wrapper. Both go — the previous-chapter chevron reads as a
+ * rail-collapse control sitting where the rail used to be. */
 #sidebar,
 #sidebar-resize-handle,
 #sidebar-toggle,
-.nav-wrapper { display: none; }
+.nav-wrapper,
+.nav-chapters { display: none; }
 
 /* mdBook offsets the page by the rail's width whenever the toggle is
  * checked, which it is by default. Nothing to make room for now. */
