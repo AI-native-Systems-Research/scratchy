@@ -136,6 +136,11 @@ byteorder = "1"
 # Tensor ops
 # CUDA (NVIDIA GPU)
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "f16"] }
+# BLAS source of choice (spyre-emu's cblas backend) — version centralized here
+# so a bump can't land on only one of the crate's several feature-gated
+# dependency sites (target-specific + non-default-features) like it did in
+# https://github.com/AI-native-Systems-Research/scratchy/pull/59.
+blas-src = { version = "0.14", default-features = false }
 safetensors = { version = "0.8", default-features = false, features = ["alloc"] }
 half = "2.7"
 memmap2 = "0.9"

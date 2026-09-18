@@ -45,7 +45,7 @@ metal = [
 mkl = [
     "dep:cblas-sys",
     "dep:blas-src",
-    "blas-src/intel-mkl",
+    "blas-src/intel-mkl-dynamic-sequential",
 ]
 openblas = [
     "dep:cblas-sys",
@@ -117,9 +117,8 @@ path = "benches/smollm2_bench.rs"
 harness = false
 
 [dependencies.blas-src]
-version = "0.13"
+workspace = true
 optional = true
-default-features = false
 
 [dependencies.cblas-sys]
 version = "0.1"
@@ -185,6 +184,5 @@ features = [
 ]
 
 [target.'cfg(target_os = "macos")'.dependencies.blas-src]
-version = "0.10"
+workspace = true
 features = ["accelerate"]
-default-features = false
