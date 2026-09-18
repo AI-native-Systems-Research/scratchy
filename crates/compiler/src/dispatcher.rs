@@ -476,4 +476,35 @@ pub struct HfFingerprint<'a> {
     /// disambiguation already catches every Phi-3-style
     /// long/short fork — `MPE` was redundant.
     pub rope_scaling_hash: Option<u64>,
+    /// The checkpoint's declared `rope_theta`.
+    ///
+    /// ⛔ THIS IS NOT REDUNDANT WITH THE TWO FIELDS ABOVE, AND ITS ABSENCE WAS A
+    /// SILENT-WRONG-OUTPUT BUG. `rope_theta` is baked as a compile-time literal
+    /// into the generated `RotaryCache::new_from_stream` call, so a checkpoint
+    /// that fingerprint-matches the wrong variant gets that variant's RoPE base
+    /// frequency. Nothing downstream can detect it: the shapes all agree, every
+    /// load succeeds, and the model emits fluent-looking token soup.
+    ///
+    /// Unlike the Phi-3 long/short forks, the colliding variants here declare NO
+    /// `rope_scaling` at all, so neither `rope_scaling_type` nor
+    /// `rope_scaling_hash` can separate them. These groups ship in-tree today and
+    /// are byte-identical on every other fingerprint axis (same
+    /// hidden/layers/vocab/heads/kv-heads, same quant format):
+    ///   - `granite-3.0-2b-instruct` (10⁴) vs `granite-3.1-2b-instruct` /
+    ///     `granite-3.2-2b-instruct` (5×10⁶) — and the same three-way split on
+    ///     `granite-3.{0,1,3}-2b-base`, `-8b-base` and `-8b-instruct` (10⁴ vs 10⁷);
+    ///   - `phi-4` (2.5×10⁵) vs `phi-4-reasoning` / `phi-4-reasoning-plus` (5×10⁵).
+    ///
+    /// Under `model/granite` — or `model/all`, which is CI's scope — whichever
+    /// variant `inventory` happened to register first won.
+    ///
+    /// `None` is permissive (the variant's baked value stays authoritative),
+    /// matching [`Self::rope_scaling_hash`]. A caller that cannot trust its
+    /// source's value passes `None` rather than a guess: the cuda worker does
+    /// exactly that for GGUF, whose metadata routinely disagrees with the
+    /// canonical `config.json`. Note this is the checkpoint's TOP-LEVEL
+    /// `rope_theta` only — arches that carry per-attention-class thetas nested
+    /// under `rope_parameters` (gemma3/gemma4/qwen3.5) declare no top-level value,
+    /// so they pass `None` here and are unaffected either way.
+    pub rope_theta: Option<f64>,
 }

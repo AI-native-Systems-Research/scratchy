@@ -1832,6 +1832,13 @@ fn collect_accessors(
 ///    fingerprint-match an AWQ variant of the same arch+width and
 ///    the emitted `load_awq` loader would panic in
 ///    `awq_to_marlin_zero_points`.
+/// 6. **RoPE base frequency** matches the `rope_theta` this variant
+///    baked, when the config declared one and the caller supplied
+///    one. The only discriminator for variant groups that are
+///    identical on every axis above AND declare no `rope_scaling`
+///    (granite 3.0 vs 3.1 vs 3.3; phi-4 vs phi-4-reasoning) — see
+///    the `rope_theta_check` comment for why guessing wrong here is
+///    silent rather than loud.
 fn emit_fingerprint_check(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
@@ -2093,6 +2100,58 @@ fn emit_fingerprint_check(
                 return false;
             }
         },
+    };
+
+    // RoPE base-frequency discriminator: reject a checkpoint whose declared
+    // `rope_theta` isn't the one this variant BAKED.
+    //
+    // ⛔ THE ONLY THING SEPARATING SEVERAL IN-TREE VARIANT GROUPS. `rope_theta`
+    // becomes a compile-time literal in `RotaryCache::new_from_stream` (see the
+    // `rotary_load` emission), so matching the wrong variant silently applies the
+    // wrong base frequency — every shape agrees, the load succeeds, and the model
+    // emits fluent-looking token soup. `granite-3.0-2b-instruct` (10⁴) and
+    // `granite-3.1-2b-instruct` (5×10⁶) are identical on every other axis here,
+    // as are `granite-3.{0,1,3}-{2b,8b}-{base,instruct}` and `phi-4` (2.5×10⁵) vs
+    // `phi-4-reasoning` (5×10⁵). None of them declare `rope_scaling`, so neither
+    // the type nor the hash check above can tell them apart; before this gate the
+    // winner was whichever `inventory` registered first.
+    //
+    // Emitted ONLY when this variant's config declares a theta. 19 in-tree configs
+    // don't (gemma3/gemma4/qwen3.5 carry per-attention-class thetas nested under
+    // `rope_parameters`; modernbert and llama-2-70b omit it and take HF's implicit
+    // 10⁴ default) — for those there is no declared value to compare against, and
+    // synthesizing the default here would invent a constraint the config never
+    // stated and false-reject a checkpoint that spells `10000.0` out.
+    //
+    // Resolution order mirrors `rotary_load`'s exactly, MINUS its
+    // `.unwrap_or(10000.0)` fallback, so the gate can never claim a value the
+    // config didn't state.
+    //
+    // The tolerance is relative and computed HERE, at expansion, so the emitted
+    // code is a single compare against two literals — and so a config spelling
+    // `1000000` where the checkpoint spells `1000000.0` cannot trip it. It is far
+    // tighter than any real theta gap (the closest in-tree pair differs by 2×).
+    let rope_theta_check: TokenStream = match model
+        .scalars
+        .get("rope_theta")
+        .copied()
+        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+    {
+        Some(theta) => {
+            let theta_lit = proc_macro2::Literal::f64_unsuffixed(theta);
+            let tol_lit = proc_macro2::Literal::f64_unsuffixed(theta.abs() * 1e-9);
+            quote! {
+                // Permissive on `None` (see `HfFingerprint::rope_theta`): a caller
+                // that cannot trust its source's value — the cuda worker for GGUF —
+                // leaves the variant's baked value authoritative.
+                if let Some(theta) = hf.rope_theta
+                    && (theta - #theta_lit).abs() > #tol_lit
+                {
+                    return false;
+                }
+            }
+        }
+        None => quote! {},
     };
 
     // Content-hash discriminator: reject checkpoints whose
@@ -2519,6 +2578,11 @@ fn emit_fingerprint_check(
             #max_pos_check
             #rope_scaling_check
             #rope_scaling_hash_check
+            // RoPE base frequency — the only discriminator for several in-tree
+            // variant groups (granite 3.0/3.1/3.3, phi-4 vs phi-4-reasoning),
+            // which declare no `rope_scaling` and so are invisible to both
+            // checks above. See `emit_fingerprint_check`.
+            #rope_theta_check
             true
         }
     }
@@ -15382,6 +15446,125 @@ mod fingerprint_tests {
         assert!(
             ts.contains("q_proj.weight_scale_inv"),
             "non-MLA FP8-block fingerprint should still use q_proj, got:\n{ts}",
+        );
+    }
+
+    /// Load ONE checked-in config as `ModelParams`.
+    ///
+    /// ⛔ NOT `load_dir`. `load_dir` filters every stem through
+    /// `CARGO_FEATURE_<STEM>`, which is right for a build and unstateable for a
+    /// unit test — a proc-macro crate has no model features, so it selects ZERO
+    /// configs and a test that iterates the result passes vacuously. (The
+    /// `fp8_block_disambiguation_*` tests above are in exactly that state.) The
+    /// subject here is `emit_fingerprint_check`, a pure function of
+    /// `ModelParams`, so name the file and skip the build's scope entirely.
+    fn config_of(arch: &str, stem: &str) -> crate::config::ModelParams {
+        let path = arch_configs(arch).join(format!("{stem}.json"));
+        crate::config::load_file(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()))
+    }
+
+    /// The `rope_theta` literal a variant's fingerprint gates on, if any.
+    /// Parsed back out of the emitted token stream so the assertion is about
+    /// what the generated code will actually compare, not about our intent.
+    fn emitted_rope_theta(model: &crate::config::ModelParams, arch: &str) -> Option<f64> {
+        let manifest = crate::weights_manifest::load_or_empty(&arch_configs(arch))
+            .expect("load weights manifest");
+        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
+        // `quote`'s stringification spaces tokens out: `theta - 100000.0`.
+        let tail = ts.split("theta - ").nth(1)?;
+        let lit: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == 'e')
+            .collect();
+        Some(lit.parse().expect("emitted theta literal parses"))
+    }
+
+    /// ⛔ THE REGRESSION THIS GATE EXISTS FOR. `granite-3.0-2b-instruct` and
+    /// `granite-3.1-2b-instruct` are byte-identical on every other fingerprint
+    /// axis — same hidden/layers/vocab/heads/kv-heads, same (absent) quant
+    /// config, and neither declares `rope_scaling`, so the type and hash checks
+    /// cannot see them apart. They differ ONLY in `rope_theta` (10⁴ vs 5×10⁶),
+    /// which is baked as a literal into each one's `RotaryCache`. Before the
+    /// theta gate, a build carrying both — `model/granite`, or `model/all`,
+    /// which is CI's scope — served whichever `inventory` registered first, and
+    /// a mismatch is silent: shapes agree, the load succeeds, and the model
+    /// emits fluent-looking token soup.
+    #[test]
+    fn granite_3_0_and_3_1_are_separated_by_the_rope_theta_gate() {
+        let v30 = config_of("granite", "granite-3.0-2b-instruct");
+        let v31 = config_of("granite", "granite-3.1-2b-instruct");
+
+        // The premise: they really are indistinguishable without theta.
+        for key in [
+            "hidden_size",
+            "num_hidden_layers",
+            "vocab_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+        ] {
+            assert_eq!(
+                v30.bounds.get(key),
+                v31.bounds.get(key),
+                "premise broken: granite 3.0 and 3.1 2b-instruct differ in {key}, so this test \
+                 is no longer exercising the collision the theta gate was added for",
+            );
+        }
+        assert!(
+            v30.rope_scaling.is_none() && v31.rope_scaling.is_none(),
+            "premise broken: one of these declares rope_scaling, so the pre-existing \
+             rope_scaling checks would already separate them",
+        );
+
+        let t30 = emitted_rope_theta(&v30, "granite").expect("granite 3.0 must gate on rope_theta");
+        let t31 = emitted_rope_theta(&v31, "granite").expect("granite 3.1 must gate on rope_theta");
+        assert_ne!(
+            t30, t31,
+            "granite 3.0 and 3.1 2b-instruct must gate on DIFFERENT rope_theta literals — \
+             equal literals mean both variants accept the other's checkpoint and the \
+             collision is back",
+        );
+    }
+
+    /// A config that declares no `rope_theta` must emit NO gate. 19 in-tree
+    /// configs are in this bucket (gemma3/gemma4/qwen3.5 carry per-attention-
+    /// class thetas nested under `rope_parameters`; modernbert and llama-2-70b
+    /// omit it and take HF's implicit 10⁴ default). Synthesizing that default
+    /// here would invent a constraint the config never stated and false-reject
+    /// a checkpoint that spells `10000.0` out.
+    #[test]
+    fn a_config_without_rope_theta_emits_no_theta_gate() {
+        let model = config_of("llama", "llama-2-70b");
+        assert!(
+            model.scalars.get("rope_theta").is_none() && model.bounds.get("rope_theta").is_none(),
+            "premise broken: llama-2-70b now declares a rope_theta, so it no longer exercises \
+             the no-gate case — repoint this test at another config that declares none",
+        );
+        assert!(
+            emitted_rope_theta(&model, "llama").is_none(),
+            "a config with no declared rope_theta must not gate on one",
+        );
+    }
+
+    /// The gate reads `hf.rope_theta` through `if let Some(..)`, so a caller
+    /// that supplies nothing stays on the variant's baked value rather than
+    /// being rejected. The cuda worker relies on this for GGUF, whose metadata
+    /// routinely disagrees with the canonical `config.json`.
+    #[test]
+    fn the_theta_gate_is_permissive_when_the_caller_supplies_none() {
+        let model = config_of("llama", "smollm2-135m");
+        let manifest =
+            crate::weights_manifest::load_or_empty(&arch_configs("llama")).expect("load manifest");
+        let ts = emit_fingerprint_check(&model, &manifest, 1).to_string();
+        let gate = ts
+            .split("rope_theta")
+            .nth(1)
+            .expect("smollm2-135m must gate on rope_theta");
+        // `if let Some (theta) = hf . rope_theta && ..` — the `Some` binding is
+        // what makes `None` fall through instead of rejecting.
+        assert!(
+            ts.contains("if let Some") && gate.contains("&&"),
+            "the theta gate must be an `if let Some(..) = hf.rope_theta && ..` so a `None` \
+             from the caller falls through, got:\n{ts}",
         );
     }
 

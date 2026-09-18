@@ -920,6 +920,7 @@ impl MetalWorker {
                 .extra
                 .get("rope_scaling")
                 .map(scratchy_forward_compiler::hash_json_value),
+            rope_theta: draft_hf_config.rope_theta,
         };
         let max_model_len = self
             .config
@@ -2827,6 +2828,7 @@ impl Worker for MetalWorker {
                 .extra
                 .get("rope_scaling")
                 .map(scratchy_forward_compiler::hash_json_value),
+            rope_theta: hf_config.rope_theta,
         };
 
         let max_model_len = self
