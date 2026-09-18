@@ -1139,7 +1139,16 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         // hardcoded 8 GiB it would have exhausted the pool.
         let reach = self.step_reach;
         let needed = match request.kv_extent {
-            Some(e) => e.blocks_needed(block, total_tokens, writing, reach),
+            // ⛔ AGED BY THE STEPS IN FLIGHT. The report is from the last FINALIZED step, which under async
+            // scheduling is not the step before this one — see `Request::kv_inflight_slots` and
+            // [`scratchy_core_common::InflightSlots`] for the card measurement this closes.
+            Some(e) => e.blocks_needed(
+                block,
+                total_tokens,
+                writing,
+                reach,
+                request.kv_inflight_slots(),
+            ),
             // ⭐ NO REPORT YET — SO USE THE POOL-WIDE ONE, IF THE BACKEND GAVE US ONE.
             //
             // A request being ADMITTED has no `kv_extent`: nothing has run it. Sizing it by its own token
@@ -2113,8 +2122,16 @@ impl SchedulerInterface for Scheduler {
                 .map(|r| {
                     // Where the row's keys end BEFORE this step: its reported span if the worker has run it,
                     // its token count otherwise — then the slots it is about to append.
+                    //
+                    // ⛔⛔⛔ THE SPAN IS AGED BY THE STEPS IN FLIGHT, AND WITHOUT THAT THIS WHOLE REACH IS
+                    // ONE SLOT SHALLOW. A report reaches the scheduler from the last FINALIZED step, and the
+                    // async loop schedules step `n+1` while step `n` is still on the card — so a reach built
+                    // from the raw report is the reach of the step BEFORE the one being scheduled, and its
+                    // page count is one short at every page boundary. The rescue arm in `blocks_this_step`
+                    // reads this same number, so nothing else caught it.
                     let end = r.kv_extent.map_or(r.num_tokens_with_spec(), |e| {
-                        (e.span().get() as usize).max(r.num_tokens_with_spec())
+                        (e.span_now(r.kv_inflight_slots()).get() as usize)
+                            .max(r.num_tokens_with_spec())
                     });
                     end.saturating_add(append_ub(r))
                 })

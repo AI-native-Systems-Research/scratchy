@@ -588,6 +588,21 @@ impl Request {
         self.all_token_ids.len() + self.spec_token_ids.len()
     }
 
+    /// ⭐⭐⭐ HOW FAR THIS REQUEST'S [`kv_extent`](Self::kv_extent) HAS AGED — the slots appended by steps
+    /// that are scheduled but whose report has not come back.
+    ///
+    /// ONE derivation, read by every site that turns a reported span into a page count: the step-reach max
+    /// and the per-request allocation both need it, and a second spelling of "how many tokens are in
+    /// flight" is exactly the two-sources-for-one-quantity shape that produced the defect
+    /// [`InflightSlots`](crate::kv::InflightSlots) documents.
+    ///
+    /// `num_output_placeholders` is already the count of tokens a scheduled-but-unfinalized step will
+    /// append (`1 + spec_tokens` per step), and a batched step appends one slot per token — so the two are
+    /// the same number, and this is the one place that says so. Zero on the synchronous path.
+    pub fn kv_inflight_slots(&self) -> crate::kv::InflightSlots {
+        crate::kv::InflightSlots::new(self.num_output_placeholders)
+    }
+
     /// The number of output tokens generated so far.
     pub fn num_output_tokens(&self) -> usize {
         self.output_token_ids.len()

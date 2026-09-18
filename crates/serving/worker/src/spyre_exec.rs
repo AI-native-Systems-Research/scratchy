@@ -93,9 +93,14 @@ use crate::worker::Worker;
 /// difference between measurements cannot explain the gap either.
 ///
 /// ⛔ TWO SEPARATE, LOUD DEFECTS FOUND ALONGSIDE — both fail closed, so neither is this silent one:
-/// * `superdsc paged: cannot map 257 slot(s) = 2 page(s): the host granted 1 block(s)` fires when a row's
-///   reach crosses a page boundary in a RAGGED batch, at width 8 too (1 of 3 trials), and at width 16 it
-///   killed 2 of 5 long-generation trials outright.
+/// * ✅ **FIXED.** `superdsc paged: cannot map N slot(s) = P page(s): the host granted P-1 block(s)` fired
+///   whenever a RAGGED batch's shared write slot landed on a page boundary — at the shipped width 8 (5 of 5
+///   trials on the 1-4-page ragged probe, 1 of 3 on the 1-page one), and it killed 2 of 5 long-generation
+///   trials at width 16. Every firing was `k*256 + 1` slots against exactly `k` blocks. The message blamed
+///   `ReqState::kv_extent`; the report was right and the ALLOCATION was short, because the async loop
+///   schedules step `n+1` while step `n` is on the card and the extent it sizes from is from step `n-1`
+///   ([`scratchy_core_common::InflightSlots`]). ⛔ RAGGED-ONLY because a hole-free row's own token count
+///   covers the missing page; that is why it read as a page-crossing bug for a whole round.
 /// * At width 32 a 3-page prompt hits the pmask guard — `needs 96 mask block(s) (3 page(s) x 32 row(s))
 ///   but the rung's baked pmask holds 64` — so every request fails. The guard is correct; the width is not
 ///   usable for multi-page contexts even if the silent corruption were fixed.
