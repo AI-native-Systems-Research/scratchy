@@ -207,6 +207,82 @@ pub fn matmul_b_orientation(
     ))
 }
 
+/// ⛔⛔⛔ A TRANSPOSE-B `B` HAS TO BE **PLACED** BY SOMEBODY, AND ONLY A PRESENTED BUFFER HAS ANYBODY
+/// TO DO IT. This is the seal on the one silent wrong answer this door used to compile.
+///
+/// # THE ARGUMENT, from the crate's own declarations
+///
+/// Stating `indexing_maps` LABELS which axis of `B` is `k`. It does not MOVE a byte. The kernel slot
+/// reads exactly ONE residency and it is `[k, n]`: [`super::lower_ktir_to_superdsc::matmul`] declares
+/// the operand `StickLayout::kernel(k_in, n_out)`, whose address law is `dev_off_stk`'s rank-2
+/// stick-blocked form with `dims[0] = in = K` as the ROW count, and `StickLayout::addr_eq` states the
+/// consequence in the crate's own words — "`RowBlocked` vs `Kernel` is the identical stick-block
+/// formula". So a `[n, k]` operand is bytes in the wrong order for that law, and the transposition is
+/// spent OUTSIDE the descriptor by one of exactly two agents:
+///
+///  * a PRESENTED weight — the HOST stage, once, at bake time (`stage_2d(&StickLayout::kernel(k, n),
+///    ..)`, `sdsc_abstract.rs:2124`). Free at inference, and the whole regression bar is this case.
+///  * a CACHE — the DEVICE, writing it already transposed (`kcache_kt_write_offset`), which is why the
+///    shipped attention pays for a third physical Kᵀ plane (`assemble_restickify_kt_2d`) rather than
+///    relabelling the one it has. **The relayout exists to MAKE a `[k, n]` buffer, never to consume
+///    one.**
+///
+/// An IN-REGISTER COMPUTED value is NEITHER. Nothing stages it, no cache write orders it, and nothing
+/// in this crate reads an access tile's `CoordinateOrder` (it occurs inside one comment and nowhere
+/// else), so the transposing order a front end can set on the tile is never honoured. The descriptor
+/// that comes out is well-formed and contracts `A @ B` instead of `A @ Bᵀ`.
+///
+/// ⛔ AND NO EXTENT GUARD CAN CATCH IT. `matmul`'s `w_k != k` / `w_n != n` checks read whichever of
+/// the region's two extents this orientation names, so at `k == n` both framings pass — which
+/// `decoder_block.py`'s two score matmuls (`tl.dot(q1r, k1r.T)` on `[64, 64]` RoPE results) are
+/// exactly. That is why the refusal is stated on PROVENANCE, which the extents cannot express.
+///
+/// # WHAT THE PRODUCER DOES INSTEAD, AND WHY THIS IS NOT A DEAD END
+///
+/// A front end holding a `tt.trans` of a computed value must emit a REAL relayout beside the matmul —
+/// a `linalg.transpose` reaching `Program::Transpose` — and then state NO maps, so the plain `[k, n]`
+/// form reads a buffer that is physically `[k, n]`. `triton-ktir`'s `dot_to_linalg` does exactly that
+/// as of this change: it folds a `.T` into the maps ONLY when the transposed value is a direct
+/// `tt.descriptor_load`.
+///
+/// ⛔ THAT COSTS AN ARCH FEATURE THIS PATH DOES NOT HAVE ON MPW4, AND THE REASON IS NOW MECHANICAL
+/// RATHER THAN OBSERVED. deeptools maps an opFunc to a DDL template per ISA
+/// (`ddc/ddl/ddl_conversion.h`'s `opFuncToDdlTemplate`): `BATCHMATMUL_FWD` has a
+/// `{"bmm_dd1.ddl", MPW4_ISA}` row and `bmm_dd1.ddl` carries NO `ddl.implicit_sync`, which is why
+/// every matmul in the passing suite schedules. Both relayouts map MPW4 to a template that DOES:
+/// `ReStickifyOpHBM` → `{"restickify.ddl", MPW4_ISA}` (`ddl.implicit_sync` at `restickify.ddl:80`,
+/// unconditional, inside `intraslice_loop`) and `INTERSLICETRANSPOSE_FP16` →
+/// `inter_slice_transpose.ddl` (`:75`, likewise). `Ddc::finalizeOps` then refuses ANY implicit sync
+/// below `RCUDD1A_ISA` (`ddcv1.cpp:3416`) and `MPW4_ISA < RCUDD1A_ISA` in `IsaCoreGen`. There is no
+/// `restickify_dd1.ddl`. So the refusal is a property of the TEMPLATE — not of the shape, the core
+/// division, the tile geometry, or which relayout primitive is picked — and swapping primitives
+/// cannot move it. A dxp refusal on a program that computes the right thing is nevertheless the
+/// outcome this guard exists to force: it is a build error, not a wrong number.
+fn transposed_b_is_placeable(
+    name: &str,
+    b: BOrient,
+    b_is_parameter_backed: bool,
+) -> Result<(), Error> {
+    if b == BOrient::PlainB || b_is_parameter_backed {
+        return Ok(());
+    }
+    err(format!(
+        "{name}: this `linalg.matmul` states the TRANSPOSE-B form \
+         (`[[d0,d2],[d1,d2],[d0,d1]]`, B's map ending in the reduction dim, so B's region is \
+         `[n, k]`) over a B that is a COMPUTED value — an intermediate this function produced, \
+         not a load of a parameter. The maps LABEL which axis is k; they do not PLACE it, and \
+         the kernel slot reads `[k, n]` (`StickLayout::kernel(k_in, n_out)`) whatever they say. \
+         A presented weight spends that transposition in the host stage \
+         (`stage_2d(&StickLayout::kernel(k, n), ..)`) and a cache in the device's \
+         already-transposed write (`kcache_kt_write_offset`); an in-register value has neither, \
+         and nothing here reads an access tile's `CoordinateOrder`. Lowering it would emit a \
+         well-formed descriptor computing `A @ B` instead of `A @ Bᵀ`, which NO extent guard can \
+         catch when k == n. So the producer must emit a real relayout beside this matmul (a \
+         `linalg.transpose` → `Program::Transpose`) and state the PLAIN `[k, n]` form over its \
+         result. Refused rather than contracted the wrong way round."
+    ))
+}
+
 /// THE RMSNORM CHAIN, as the ONE fused op it is — `out = x · rsqrt(mean(x²) + eps) · gamma`.
 ///
 /// # WHY THIS IS THE FIX AND FILLING THE SCALE REGISTRY WAS NOT
@@ -1250,11 +1326,19 @@ pub fn lower_function(
             .collect();
 
         let mut per_op: Vec<Region> = Vec::with_capacity(n_in + 1);
+        // ⭐ WHICH OPERANDS ARE PARAMETER-BACKED, kept BESIDE the regions because a `Region` cannot
+        // say. `region_for_operand` answers `Some` for a value the parameter-rooted walk reaches (a
+        // `ktdp.load` of a `ktdp.construct_access_tile` of a `ktdp.construct_memory_view` of a
+        // function argument) and `None` for one this function COMPUTED — and that is exactly the
+        // distinction [`transposed_b_is_placeable`] needs, so it is recorded here rather than
+        // re-derived from a footprint that is identical either way.
+        let mut from_parameter: Vec<bool> = Vec::with_capacity(n_in + 1);
         for (i, v) in in_values.iter().enumerate() {
             match region_for_operand(k, *v)? {
                 Some(mut r) => {
                     r.is_out = false;
                     per_op.push(r);
+                    from_parameter.push(true);
                 }
                 // A value the walk cannot reach is either an intermediate this function already
                 // minted a buffer for, or a constant. The first is looked up; the second is
@@ -1265,6 +1349,7 @@ pub fn lower_function(
                         let mut r = *r;
                         r.is_out = false;
                         per_op.push(r);
+                        from_parameter.push(false);
                     }
                     None => {
                         return err(format!(
@@ -1361,15 +1446,25 @@ pub fn lower_function(
         // its `lower_ktir_to_superdsc::transpose` door are left exactly as they were — they serve
         // `Program::Transpose`, a producer stating a `linalg.transpose` in its own right.
         //
-        // ⏭ ⛔ THE OTHER HALF OF THIS IS STILL A GAP, AND IT IS THE TRANSPOSE-B SIDE, NOT THIS ONE. A
-        // transpose-B B whose region is a COMPUTED value has no host stage to spend its transposition
-        // in: `dot_to_linalg` rewires B past the `tt.trans` and states the maps, nothing in this crate
-        // reads a tile's `CoordinateOrder` (`grep -rn CoordinateOrder src/` is empty), and the kernel
-        // slot reads `[k, n]` regardless — so `tl.dot(q, k.T)` on two in-register tiles contracts as
-        // `q @ k`. It is INVISIBLE to the guards below whenever the tile is square, which the decoder
-        // score matmuls (`[64, 64]`) are. The architecture's own answer is the shipped attention's:
-        // produce the operand already transposed at CACHE-WRITE time (`kcache_kt_write_offset`), which
-        // needs the relayout that this arch will not schedule. Named here rather than papered over.
+        // ⭐ AND THE OTHER HALF IS NO LONGER A GAP — IT IS THE REFUSAL DIRECTLY BELOW. A transpose-B B
+        // whose region is a COMPUTED value has nobody to place its bytes, so this door will not lower
+        // it. See [`transposed_b_is_placeable`], which states the whole argument.
+        if let Some(b) = b_orient {
+            // ⛔ FAIL CLOSED ON THE INDEX ITSELF. `n_in` is 2 for a matmul so operand 1 always
+            // exists, and defaulting a MISSING entry to "placeable" would make a malformed program
+            // lower silently — the exact shape of the defect this guard closes.
+            let Some(&b_from_parameter) = from_parameter.get(1) else {
+                return err(format!(
+                    "{}: `{:?}` states a contraction orientation but this door resolved {} \
+                     input region(s), so which operand is B — and therefore whether its \
+                     transposition can be placed — is unknown",
+                    f.name,
+                    op.op_type,
+                    from_parameter.len()
+                ));
+            };
+            transposed_b_is_placeable(f.name, b, b_from_parameter)?;
+        }
 
         // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
         let stored = f.operations.iter().find(|s| {
@@ -1774,6 +1869,56 @@ mod matmul_orientation_tests {
             "MLIR's default for `linalg.matmul` is the plain form; treating a missing attribute as the \
              ASSUMED form would silently contract the other way round"
         );
+    }
+
+    /// ⭐ THE ACCEPTING CASE FOR [`transposed_b_is_placeable`], AND IT IS THE WHOLE REGRESSION BAR:
+    /// a transpose-B weight that IS parameter-backed. `rmsnorm_granite`, both `swiglu_mlp_*` and
+    /// every projection in both decoders are this case, measured byte-identical, and they are correct
+    /// because the HOST stage places the bytes (`stage_2d(&StickLayout::kernel(k, n), ..)`). If this
+    /// case ever refused, the guard below would be indistinguishable from "refuse every `.T`".
+    #[test]
+    fn a_transpose_b_over_a_presented_weight_is_placeable() {
+        transposed_b_is_placeable("probe", BOrient::TransposeB, true)
+            .expect("a presented weight's transposition is spent by the host stage");
+    }
+
+    /// ⛔ THE REFUSAL, **ONE VARIABLE** FROM THE CASE ABOVE — the provenance of B and nothing else.
+    /// This is the decoders' two score matmuls (`tl.dot(q1r, k1r.T)` over RoPE'd `[64, 64]` tiles):
+    /// the maps say `[n, k]`, the kernel slot reads `[k, n]`, and no agent exists to move the bytes,
+    /// so lowering it emits a well-formed descriptor contracting `q1r @ k1r`. Delete the guard and
+    /// this test fails while every other test in the crate still passes — which is the point.
+    #[test]
+    fn a_transpose_b_over_a_computed_value_is_refused_by_name() {
+        let e = transposed_b_is_placeable("probe", BOrient::TransposeB, false)
+            .err()
+            .expect("an in-register value has no host stage and no cache write");
+        assert!(
+            e.message.contains("COMPUTED value"),
+            "names WHAT is wrong with the operand, not merely that it was rejected: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("k == n"),
+            "and says why no extent guard downstream can catch it: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("Program::Transpose"),
+            "and names what the producer must emit instead, so the refusal is actionable: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE OTHER SINGLE-VARIABLE CONTROL: the ORIENTATION moved alone, provenance held at
+    /// COMPUTED. `tl.dot(p, v)` — `v` is this kernel's own V projection, an in-register `[k, n]`
+    /// tile, and `[k, n]` IS the slot's device order, so it is contracted WHERE IT LIES. That is the
+    /// leg the shipped attention runs against its V cache at 41 tok/s (`vcache_write_offset`: "the
+    /// kernel is `[k=cap, n=hd]`"). A guard that refused every computed B would break it, and both
+    /// decoders would stop lowering for the wrong reason.
+    #[test]
+    fn a_plain_b_over_a_computed_value_is_contracted_where_it_lies() {
+        transposed_b_is_placeable("probe", BOrient::PlainB, false)
+            .expect("`p @ v`: a computed `[k, n]` tile is already in the kernel slot's own order");
     }
 
     /// ⛔ THE CONTROL THAT KEEPS THE TWO ABOVE HONEST: a triple that is NEITHER form — here C permuted
