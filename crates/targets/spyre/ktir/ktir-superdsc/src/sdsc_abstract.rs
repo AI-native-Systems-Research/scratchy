@@ -1018,6 +1018,27 @@ pub struct MatK(u32, KernelOrient);
 /// stick `out`, the resident Kᵀ plane) or on its STICKED axis (`[out, in]` stick `in`, the natural-K
 /// plane the cache write already produces).
 ///
+/// ⛔⛔⛔ `ContractionOnStick` IS REFUSED FOR AN fp16 KERNEL — measured on card, not inferred:
+/// `DtException: Could not find any suitable dimension mapping` (`ddl_conversion.cpp:2521`). `bmm.ddl`
+/// carries TWO kernel slice layouts, chosen by ELEMENT TYPE:
+/// ```text
+///   :22  %slice_layout_kernel       = ddl.layout(%in,%out) {is_order_fixed=true}  // int8/fp8/int4
+///   :23  %slice_layout_kernel_16bit = ddl.layout(%out)     {is_order_fixed=true}  // fp16
+/// ```
+/// An fp16 kernel's slice dim must be `out` (the score axis, slots); natural K sticks on `hd` = `in`, so
+/// `{out} ∩ {in} = {}`. The dim ORDER is not the constraint — line 25's global layout is `{}`, unfixed —
+/// and a transpose is not data movement here in general (`stride_map_disk_order` reads GEMM weights in
+/// their on-disk orientation as "two swapped strides, not a data movement").
+///
+/// ⭐ THE WAY IN IS THE **ACTIVATION** SIDE, which the same template makes legal for free:
+/// `:18 %slice_layout_input_16bit = ddl.layout(%in) {is_order_fixed=true}` — an fp16 ACTIVATION sticks on
+/// the CONTRACTION axis, which is exactly natural K's. So natural K `[slots, hd]` stick `hd` is already a
+/// legal activation `[mb=slots, in=hd]`, and inverting the leg to `Sᵀ[slots,m] = K_nat · Qᵀ[hd,m]` makes the
+/// cache the activation and the TINY Q the kernel. Transpose the small operand, not the cache.
+///
+/// `ContractionOnStick` stays: line 22's two-dim slice layout means an **fp8** KV cache CAN declare it as a
+/// kernel, and a door that refuses loudly on the card beats one nobody can ask for.
+///
 /// It rides on [`MatK`] because `MatK` already IS the contraction, and because putting it here means the
 /// nine `matmul_opspec*` callers need no new argument: the one site that wants the other orientation asks
 /// for it where it already names the contraction width.
