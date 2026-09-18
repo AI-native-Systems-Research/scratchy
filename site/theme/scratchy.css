@@ -1,103 +1,105 @@
-/* Dress mdBook in the landing page's palette and type.
+/* Dress mdBook in the landing page's Carbon palette and type.
  *
  * Only mdBook's own CSS custom properties are overridden, so its themes keep
- * working: `navy` is the dark face of the landing page, `light` the light one.
- * The palette values here are the same ones site/styles.css uses. */
+ * working: `navy` is Carbon's g100 theme, `light` is Carbon's white theme. The
+ * values here are the same published @carbon/themes tokens site/styles.css
+ * uses, so the book and the landing page never drift. */
+
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap");
 
 :root {
-  --mono-font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --scratchy-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  --mono-font: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --scratchy-sans: "IBM Plex Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   --content-max-width: 820px;
 }
 
-/* mdBook's stock body is 1.6rem (16px, since html is 62.5%). Match the landing
- * page's 17.5px, and widen the measure to keep the line length readable. */
-body { font-size: 1.75rem; }
+/* mdBook's html is 62.5%, so 1rem is 10px. Carbon body-02 is 16px/1.5. */
+body { font-size: 1.6rem; line-height: 1.5; }
 
 .navy {
-  --bg: #0d1117;
-  --fg: #d8e0ea;
+  --bg: #161616;
+  --fg: #f4f4f4;
 
-  --sidebar-bg: #0a0e14;
-  --sidebar-fg: #a7b3c4;
-  --sidebar-non-existant: #5a6779;
-  --sidebar-active: #ff8a4c;
-  --sidebar-spacer: #232c3b;
+  --sidebar-bg: #262626;
+  --sidebar-fg: #c6c6c6;
+  --sidebar-non-existant: #6f6f6f;
+  --sidebar-active: #78a9ff;
+  --sidebar-spacer: #525252;
 
-  --scrollbar: #3a4658;
+  --scrollbar: #6f6f6f;
 
-  --icons: #6c7a8d;
-  --icons-hover: #d8e0ea;
+  --icons: #8d8d8d;
+  --icons-hover: #f4f4f4;
 
-  --links: #63b3f5;
+  --links: #78a9ff;
 
-  --inline-code-color: #ff8a4c;
+  --inline-code-color: #ff7eb6;
 
-  --theme-popup-bg: #161d29;
-  --theme-popup-border: #232c3b;
-  --theme-hover: #1d2635;
+  --theme-popup-bg: #262626;
+  --theme-popup-border: #525252;
+  --theme-hover: #393939;
 
-  --quote-bg: #131a24;
-  --quote-border: #ff8a4c;
+  --quote-bg: #262626;
+  --quote-border: #78a9ff;
 
-  --table-border-color: #232c3b;
-  --table-header-bg: #1d2635;
-  --table-alternate-bg: #131a24;
+  --table-border-color: #525252;
+  --table-header-bg: #393939;
+  --table-alternate-bg: #262626;
 
-  --searchbar-border-color: #232c3b;
-  --searchbar-bg: #131a24;
-  --searchbar-fg: #d8e0ea;
-  --searchbar-shadow-color: #0a0e14;
-  --searchresults-header-fg: #8b98ab;
-  --searchresults-border-color: #232c3b;
-  --searchresults-li-bg: #131a24;
-  --search-mark-bg: #7a4a22;
+  --searchbar-border-color: #525252;
+  --searchbar-bg: #262626;
+  --searchbar-fg: #f4f4f4;
+  --searchbar-shadow-color: #161616;
+  --searchresults-header-fg: #a8a8a8;
+  --searchresults-border-color: #525252;
+  --searchresults-li-bg: #262626;
+  --search-mark-bg: #001d6c;
 
-  --footnote-highlight: #ff8a4c;
-  --overlay-bg: rgba(13, 17, 23, 0.55);
+  --footnote-highlight: #78a9ff;
+  --overlay-bg: rgba(22, 22, 22, 0.55);
 }
 
 .light {
-  --bg: #fbfcfd;
-  --fg: #1a2330;
+  --bg: #ffffff;
+  --fg: #161616;
 
-  --sidebar-bg: #f2f5f8;
-  --sidebar-fg: #2c3949;
-  --sidebar-non-existant: #a9b4c1;
-  --sidebar-active: #c2410c;
-  --sidebar-spacer: #dfe5ec;
+  --sidebar-bg: #f4f4f4;
+  --sidebar-fg: #525252;
+  --sidebar-non-existant: #8d8d8d;
+  --sidebar-active: #0f62fe;
+  --sidebar-spacer: #c6c6c6;
 
-  --scrollbar: #b4bfcb;
+  --scrollbar: #8d8d8d;
 
-  --icons: #8695a6;
-  --icons-hover: #1a2330;
+  --icons: #8d8d8d;
+  --icons-hover: #161616;
 
-  --links: #1d63b5;
+  --links: #0f62fe;
 
-  --inline-code-color: #a8360a;
+  --inline-code-color: #9f1853;
 
   --theme-popup-bg: #ffffff;
-  --theme-popup-border: #dfe5ec;
-  --theme-hover: #eef2f6;
+  --theme-popup-border: #c6c6c6;
+  --theme-hover: #e8e8e8;
 
-  --quote-bg: #f2f5f8;
-  --quote-border: #c2410c;
+  --quote-bg: #f4f4f4;
+  --quote-border: #0f62fe;
 
-  --table-border-color: #dfe5ec;
-  --table-header-bg: #eef2f6;
-  --table-alternate-bg: #f6f8fa;
+  --table-border-color: #c6c6c6;
+  --table-header-bg: #e0e0e0;
+  --table-alternate-bg: #f4f4f4;
 
-  --searchbar-border-color: #dfe5ec;
+  --searchbar-border-color: #c6c6c6;
   --searchbar-bg: #ffffff;
-  --searchbar-fg: #1a2330;
-  --searchbar-shadow-color: #dfe5ec;
-  --searchresults-header-fg: #5b6878;
-  --searchresults-border-color: #dfe5ec;
-  --searchresults-li-bg: #f6f8fa;
-  --search-mark-bg: #ffd9a8;
+  --searchbar-fg: #161616;
+  --searchbar-shadow-color: #c6c6c6;
+  --searchresults-header-fg: #6f6f6f;
+  --searchresults-border-color: #c6c6c6;
+  --searchresults-li-bg: #f4f4f4;
+  --search-mark-bg: #d0e2ff;
 
-  --footnote-highlight: #c2410c;
-  --overlay-bg: rgba(26, 35, 48, 0.35);
+  --footnote-highlight: #0f62fe;
+  --overlay-bg: rgba(22, 22, 22, 0.35);
 }
 
 html,
@@ -107,25 +109,39 @@ body,
   font-family: var(--scratchy-sans);
 }
 
+/* Carbon headings: no negative tracking, and light at display sizes. */
 .content h1,
 .content h2,
 .content h3,
 .content h4 {
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
+  font-weight: 400;
 }
 
-.content h1 { font-size: 1.9rem; }
-.content h2 { font-size: 1.45rem; }
+.content h1 { font-size: 2.8rem; line-height: 1.29; font-weight: 300; }
+.content h2 { font-size: 2rem; line-height: 1.4; }
+.content h3 { font-size: 1.6rem; font-weight: 600; }
 
-/* The landing page's panel treatment, for code blocks and tables. */
+/* Carbon surfaces are square planes separated by a 1px rule. */
 .content pre > .hljs {
   border: 1px solid var(--table-border-color);
-  border-radius: 8px;
+  border-radius: 0;
 }
 
 .content blockquote {
   border-inline-start-width: 3px;
-  border-radius: 0 6px 6px 0;
+  border-radius: 0;
+}
+
+.content table td,
+.content table th { border-radius: 0; }
+
+/* Carbon's focus ring. */
+.content a:focus-visible,
+.sidebar a:focus-visible,
+#menu-bar a:focus-visible {
+  outline: 2px solid var(--links);
+  outline-offset: -2px;
 }
 
 /* Menu bar: flat against the page, the way the landing nav is. */
@@ -136,14 +152,14 @@ body,
   box-shadow: none;
 }
 
-.menu-title { font-weight: 700; letter-spacing: -0.02em; }
+.menu-title { font-weight: 600; letter-spacing: 0; }
 
 /* "▚ scratchy" home link, injected by theme/scratchy.js. */
 #scratchy-home {
   color: var(--icons);
   font-family: var(--mono-font);
-  font-weight: 700;
-  font-size: 0.92rem;
+  font-weight: 600;
+  font-size: 1.4rem;
   text-decoration: none;
   padding: 0 0.5rem;
   line-height: var(--menu-bar-height);
@@ -151,4 +167,4 @@ body,
 #scratchy-home::before { content: "▚ "; color: var(--sidebar-active); }
 #scratchy-home:hover { color: var(--fg); }
 
-.sidebar .chapter li.chapter-item a.active { font-weight: 700; }
+.sidebar .chapter li.chapter-item a.active { font-weight: 600; }
