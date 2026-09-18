@@ -251,6 +251,43 @@ jobs:
           --features e2e,metal,scratchy-models/llama-3.2-1b
           --test e_long_prompt_metal long_prompt_metal_chunked_matches_single_prefill -- --test-threads=1
 
+  # ---------------------------------------------------------------------------
+  # Linux / amd64 — Spyre emulator, non-Accelerate BLAS backends.
+  #
+  # ktir-emulator's `blis`/`mkl`/`openblas` features (the real IBM Spyre
+  # deployment's BLAS choices, run on Linux) are otherwise never built or
+  # tested anywhere: linux-cuda only compiles ktir-emulator with default
+  # (no-BLAS) features, and macos-metal's `[target.'cfg(target_os =
+  # "macos")'.dependencies.blas-src]` block is unconditional (always
+  # Accelerate) — selecting `openblas`/`mkl` there collides with it. This job
+  # is the only place a non-Accelerate BLAS backend actually links and runs.
+  #
+  # `openblas-system` (dynamic link against the distro's libopenblas via
+  # pkg-config) rather than building OpenBLAS from source: minutes faster and
+  # doesn't need gfortran. `blis`/`mkl` aren't covered here yet — from-source
+  # BLIS already fails to build locally on aarch64 (a separate, pre-existing
+  # issue) and MKL needs a heavier Intel install; revisit if Spyre deploys
+  # actually depend on either.
+  # ---------------------------------------------------------------------------
+  linux-spyre-emu:
+    name: linux-amd64 (spyre-emu blas)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenBLAS
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-spyre-emu
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy (openblas-system)
+        run: cargo clippy -p ktir-emulator --no-default-features --features optimizer,openblas-system -- -D warnings
+      - name: Test (openblas-system)
+        run: cargo test -p ktir-emulator --no-default-features --features optimizer,openblas-system --lib --tests
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
