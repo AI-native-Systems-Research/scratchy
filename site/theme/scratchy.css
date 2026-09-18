@@ -206,6 +206,17 @@ body,
 
 :root { --menu-bar-height: 48px; }
 
+/* mdBook does not set `box-sizing: border-box`, and the landing page's
+ * stylesheet does it globally. Without it, the 2px transparent border that
+ * header__name and header__menu-item carry for their focus state is *added*
+ * to `block-size: 100%`, so the nav items render 52px tall inside a 48px bar
+ * and their labels sit 2.5px below the landing page's. The bar itself gains
+ * its 1px bottom border the same way, making it 49px. */
+#menu-bar,
+#menu-bar *,
+.cds-breadcrumb,
+.cds-breadcrumb * { box-sizing: border-box; }
+
 #menu-bar,
 #menu-bar.sticky,
 #menu-bar:hover,
