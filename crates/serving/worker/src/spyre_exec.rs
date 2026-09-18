@@ -30,6 +30,120 @@ use crate::spyre_types::*;
 use crate::spyre_worker::*;
 use crate::worker::Worker;
 
+/// ⛔⛔⛔ THE WIDEST BATCH THAT PRODUCES CORRECT TEXT — a CONTAINMENT for an open bug, NOT a fix for it.
+///
+/// The ladder bakes and loads rungs at `[2, 4, 8, 16, 32]` and every one of them RUNS. Widths above 8
+/// also produce plausible, fluent, *wrong* output: rows collapse into a repeated token, and the pool's
+/// throughput counters look fine while they do it.
+///
+/// 📊 RE-MEASURED 2026-09-17 ON CARD, FIVE INDEPENDENT TRIALS PER WIDTH, against the only gate that has
+/// ever survived review here: **every row compared against its OWN `--max-num-seqs 1` output over the
+/// identical probe file**. granite-3.1-2b fp8, `scr batch --no-prefix-caching`, one distinct subject per
+/// row and a DISJOINT prompt prefix per row (longest shared prefix <= 2 chars, so no prefix-cache hit can
+/// alias one row onto another). Rows whose text differs from their own solo text, one figure per trial:
+/// ```text
+///   admitted width          8            9           12               16                32
+///   rung selected           8           16           16               16                32
+///   short ctx, 8 tok    0,0,0,1,0   5,5,5,5,5   12,12,12,12,11   14,15,14,15,15   31,31,31,31,31
+///   2-page prompt       0,1,1,0,0   5,6,6,5,5   11,10,11,8,12    14,14,16,11,16     REFUSED x5
+///   ragged, 1 page      3,4,2,1,3   5,7,6,6,6   12,11,12,12,12   15,15,15,15,15   31,31,31,31,31
+///   420-tok generation  1,1,1,1,1       —            —           16,15,ERR,15,ERR       —
+/// ```
+/// ⭐⭐ AND THE TWO KINDS OF DIVERGENCE ARE NOT ONE KIND. At width 8 a diverging row is fluent, on-subject
+/// English that branched tens of characters in (`' Athens. The Eiffel Tower is in Paris, not New Orleans'`
+/// against solo's `'… not in Greece'`) and the HARD oracle — is the first word this row's own capital —
+/// matches solo EXACTLY in every trial of every probe. From width 9 up the diverging rows lose the answer
+/// itself: `' R  (uri,  Rome.'`, `' C,  (uri,'`, `' Os.<U+FFFD>,  (1)'`. A repetition detector scores most
+/// of those ZERO, which is why every earlier detector under-counted — 8-of-16 where it is really 15.
+/// ⭐ ONE COUNT NEEDS NO JUDGEMENT AT ALL: the ragged probe emits 1184 tokens solo and 666-873 at width 16,
+/// 2368 solo and 1919-2148 at width 32. A fifth to a third of the output vanishes into early EOS.
+///
+/// ⭐⭐⭐ THE BOUNDARY IS STILL THE RUNG, NOT THE LIVE COUNT. 8 live on rung 8 is clean; 9 live — which
+/// promotes to the 16-row rung — already loses 5 of 9, in 5 trials out of 5. `live=16` fills rung 16 with
+/// ZERO padding rows and still loses 14-16 of 16, so it is not the padding-row aliasing this file
+/// documents at the cache-write site either. **Rung 16's own bundle is wrong**, and rungs <= 8 are right.
+///
+/// ⛔ AND IT IS A RACE, RE-CONFIRMED BY REPETITION: the COUNT is stable per width while the MEMBERSHIP
+/// moves between otherwise identical trials — width 9's losers were `{0,1,4,5,8}` three times, then
+/// `{1,2,3,5,6}`, then `{0,1,2,5,7}`. So it is neither a row range nor a stride nor a deterministic map.
+///
+/// ⛔⛔⛔ AND HERE IS THE TRAP THAT ALMOST RAISED THIS NUMBER. `scr batch --max-num-seqs 16` runs CLEAN —
+/// 16 of 16 rows on their own distinct subjects, solo-diff 0,0,1 over three trials — because THIS CONSTANT
+/// CAPS IT: the run logs `Capping max_num_seqs 16 → 8` and executes two sequential 8-wide batches. A clean
+/// 16-REQUEST run is evidence FOR the cap, not against it.
+/// ⛔ AND THE POOL LINE IS NOT THE WIDTH. `At most 16 concurrent request (launch slots…)` prints on a
+/// CAPPED run too — the pool is cut from the REQUESTED `max_num_seqs`, before this cap is applied (257
+/// pages for a run that admits 8), so that line cannot tell a wide run from a capped one. The two things
+/// that can: the ABSENCE of the `Capping` line, and the step time — the same 16-row probe reports avg ITL
+/// 65.9 ms capped to 8 against 105.9 ms genuinely 16 wide.
+///
+/// ⛔ AND THE THROUGHPUT IT WOULD BUY IS 8%, NOT 1.9x — AND NEGATIVE PAST ONE PAGE. Per token, from the
+/// step time at each width on the same probe and binary:
+/// ```text
+///   1 resident page, 8 output tok    width 8: 57.0 ms/step = 7.13 ms/tok   width 16: 105.9 = 6.62  (+7.7%)
+///   2 resident pages, 420 output tok width 8: 87.5 ms/step = 10.94         width 16: 196.5 = 12.28 (-12%)
+/// ```
+/// The 420-token case in wall clock, no model of startup at all: 3360 tokens in 45.4 s (5/5 trials) at
+/// width 8 against 6720 in 92.5 s at width 16. The step nearly DOUBLES for twice the rows. The recorded
+/// "bs=16 = 3.44 ms/token off a 55.0 ms step" cannot be reproduced at any context length here, and 55.0 ms
+/// is within noise of the width-EIGHT step on the same short probe (57.0) — consistent with that figure
+/// having been an 8-wide step divided by 16 rows.
+/// ⛔ NOT the fusion knob: `SCRATCHY_SUPERDSC_GROUP_SIZE=512` against the default 128 gives avg ITL 87.5 vs
+/// 87.5 ms and wall 45.5 vs 45.4 s on the 420-token probe. Bit-for-bit the same speed, so a group-size
+/// difference between measurements cannot explain the gap either.
+///
+/// ⛔ TWO SEPARATE, LOUD DEFECTS FOUND ALONGSIDE — both fail closed, so neither is this silent one:
+/// * `superdsc paged: cannot map 257 slot(s) = 2 page(s): the host granted 1 block(s)` fires when a row's
+///   reach crosses a page boundary in a RAGGED batch, at width 8 too (1 of 3 trials), and at width 16 it
+///   killed 2 of 5 long-generation trials outright.
+/// * At width 32 a 3-page prompt hits the pmask guard — `needs 96 mask block(s) (3 page(s) x 32 row(s))
+///   but the rung's baked pmask holds 64` — so every request fails. The guard is correct; the width is not
+///   usable for multi-page contexts even if the silent corruption were fixed.
+///
+/// ⛔ RULED OUT ON CARD, so nobody re-runs these:
+/// * **Pool page supply.** Re-run at `SUPERDSC_POOL_PAGES=128` — 16 pages per row instead of 1 —
+///   still exactly 8 degenerate. Page allocation is not the mechanism.
+/// * **Per-rung pmask capacity.** The guard exists, returns `Err`, and correctly does not fire: every
+///   rung allows `pages*width <= 64` and a short prompt needs one page, so 32 <= 64.
+/// * **Mask pass stride.** Derived from the shared `PrefixMaskShape` law at the rung's own width, not
+///   spelled a second time here.
+/// * **The row-capacity wiring bug** fixed alongside this — that one made width >= 2 refuse outright
+///   rather than corrupt, so it was never this.
+///
+/// ⛔ AND THE INSTRUMENT THE COMMENTS PROMISE DOES NOT EXIST. `SCRATCHY_KCACHE_PROBE` is described in
+/// two comments (`spyre_exec.rs`, `spyre_forward.rs`) as reading back layer-0 Kᵀ per row with its block
+/// table and valid columns — there is no implementation and no env check. Diagnosing this needs that
+/// readback written first; guessing without it is what produced two wrong diagnoses in one session.
+///
+/// ▶️ THE NEXT STEP, NAMED PRECISELY. `attn.rs` already says how: *"the wide rungs are still the ones to
+/// distrust first … verify by DIFFING `layoutDimOrder_` / `maxDimSizes_` / `numWkSlicesPerDim_` per
+/// rung, not addresses — the previous attempt compared only start addresses, found them a strict
+/// subset, and shipped complete noise."* That diff is a LOCAL check, no card needed, and it now has a
+/// specific question to answer: what differs in those three fields between the rung-8 and rung-16
+/// emissions of the score and value legs.
+///
+/// ⛔ IT MUST BE THE SHIPPED OP, THOUGH. An attempt at this diff built the score leg with
+/// `MatY::of_requests`, which puts the BATCH on `y` (measured: `mq=8` gives `y=8, mb=1`), while shipped
+/// attention uses `MatY::of_gqa_group` — `y` is the GQA GROUP (4 here) and `mb` carries the batch. The
+/// improvised harness therefore measured a different op and was deleted rather than kept as a
+/// misleading green test. Reproduce `assemble_attn`'s own construction (`of_gqa_group` plus the
+/// `OperandPlacement` the shipped legs pass) and vary only `mq`.
+///
+/// ⭐ WHY CAPPING COSTS NOTHING MEASURABLE. Width 8 is already the throughput peak — see the wall-clock
+/// comparison above, where width 16 is slower in aggregate as well as wrong. The widths this forbids were
+/// never worth having: they trade correctness for no speed.
+///
+/// ⛔ AND CAPPING IS NOT VALIDATING. This makes the corruption UNREACHABLE instead of SILENT; it does
+/// not explain it. The root cause is open, the rungs stay baked and loaded so the day it is fixed the
+/// only change is this number, and nothing here should be read as evidence that width 8 is *proven* —
+/// only that it is the widest width measured clean. It now IS measured against a solo oracle rather than
+/// a signature detector (39 of 40 rows bit-identical to solo on the short probe, and every hard-oracle
+/// answer identical), which is a stronger claim than this comment could previously make; a detector whose
+/// predecessor was a literal `"(0"` match reported a fix that was not there, because the degenerate token
+/// differs per run.
+#[cfg(feature = "spyre-hw")]
+const CORRECT_BATCH_WIDTH: usize = 8;
+
 /// CONTINUOUS BATCHING (#45) execute_model for the sendnn PAGED session. Consumes
 /// the scheduler's batched `SchedulerOutput` like the cuda/metal gpu_worker:
 ///   • PREFILL (scheduled_new_reqs + cached chunks with n>1): each request's chunk
@@ -148,7 +262,7 @@ impl Worker for SpyreWorker {
         {
             return self.model.as_ref().and_then(|m| match &m.session {
                 SendnnSession::SuperDsc(sb) if sb.decode.is_paged() => {
-                    Some(sb.pool_rows.get().get() as usize)
+                    Some((sb.pool_rows.get().get() as usize).min(CORRECT_BATCH_WIDTH))
                 }
                 _ => None,
             });
