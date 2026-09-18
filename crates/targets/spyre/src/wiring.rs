@@ -257,7 +257,35 @@ impl Wiring {
         owns_prefix: bool,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
-        let cap = self.baked_row_capacity();
+        self.forward_shape_within(self.baked_row_capacity(), rows, owns_prefix, n_consts)
+    }
+
+    /// [`Self::forward_shape`] with the capacity supplied by the CALLER rather than read off this
+    /// wiring.
+    ///
+    /// ⭐ WHY A CALLER MAY KNOW BETTER. A decode batch rung is the same tape baked at `B` rows and is
+    /// addressed by fingerprint, not through a wiring — so `Wirings.decode` carries every rung's
+    /// tensor ids correctly while carrying only the single-request graph's ROW COUNT. A launch on the
+    /// `B`-row rung is legitimate and [`Self::baked_row_capacity`] answers 1 for it, so checking
+    /// against the wiring rejects a correct launch. The rung's width comes from its manifest's own
+    /// `RungSeqs`, which is a stronger authority than an embedding placement belonging to a different
+    /// bundle.
+    ///
+    /// ⛔ THE GUARD IS NOT WEAKENED, IT IS POINTED AT THE RIGHT NUMBER. `RowCapacity` still has no
+    /// integer door: the only way to obtain one is this wiring's own placement
+    /// ([`Self::baked_row_capacity`]) or a baked rung width
+    /// ([`RowCapacity::of_baked_rung`]) — both artifact-derived. A caller cannot widen the check by
+    /// arithmetic.
+    pub fn forward_shape_within(
+        &self,
+        // The rows the bundle ACTUALLY RUNNING was baked to hold. Equal to
+        // [`Self::baked_row_capacity`] whenever the wiring describes that bundle.
+        cap: RowCapacity,
+        // ⛔ THE ROWS THIS LAUNCH FILLS — 1 for a decode step, `mq` for a prompt chunk.
+        rows: StagedRows,
+        owns_prefix: bool,
+        n_consts: usize,
+    ) -> crate::forward_tape::ForwardShape {
         assert!(
             cap.admits(rows),
             "forward tape asked for {} row(s) from a bundle baked to hold {}: every host buffer \
@@ -335,6 +363,31 @@ impl RowCapacity {
     /// For diagnostics only — a message saying how wide the bundle is.
     pub const fn stated(self) -> usize {
         self.0
+    }
+
+    /// ⭐ THE CAPACITY OF A **BAKED LADDER RUNG**, which is NOT readable from the wiring it runs
+    /// through.
+    ///
+    /// A decode batch rung is the SAME TAPE baked at `B` rows, and the emitter says so outright:
+    /// *"a rung is the same tape baked at B rows and is addressed by FINGERPRINT, not through this
+    /// wiring"* (`codegen.rs`, the `slot.0` guard). So one `Wirings.decode` describes every rung's
+    /// tensor ids correctly while describing only the single-request graph's ROW COUNT — and
+    /// [`Wiring::baked_row_capacity`], which reads the embedding placement, therefore answers 1 for
+    /// a launch that is legitimately `B` rows wide.
+    ///
+    /// ⛔ THIS IS THE REGRESSION THAT BROKE BATCHED DECODE. Before the KTIR unification the wiring
+    /// slot was last-write-wins, and because rungs bake ASCENDING it happened to hold the WIDEST
+    /// rung's wiring — so a batched launch passed the check by accident. Tightening that slot to the
+    /// single-request graph (a correct fix: `ktir_decode_cb_*` was stamping `m_cap = 96`, making
+    /// every single-token decode compute 96 activation rows) left the batched path checking its
+    /// width against a wiring that no longer describes it, and a 2-row launch became
+    /// *"forward tape asked for 2 row(s) from a bundle baked to hold 1"*.
+    ///
+    /// Minted ONLY from a [`RungWidth`](scratchy_subtile::sdsc_abstract::RungWidth) — a width that
+    /// came from a manifest's own `RungSeqs`, i.e. from the artifact rather than from a host guess —
+    /// so this cannot become a door for waving an arbitrary integer past the guard.
+    pub fn of_baked_rung(width: scratchy_subtile::sdsc_abstract::RungWidth) -> RowCapacity {
+        RowCapacity(width.count())
     }
 }
 

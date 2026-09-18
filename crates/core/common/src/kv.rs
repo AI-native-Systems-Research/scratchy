@@ -10,7 +10,7 @@
 //!
 //! * a pool whose batched write appends EVERY row of a batch at ONE slot per step leaves a masked HOLE
 //!   in any request shorter than its batch-mates, so its keys spread over MORE slots than it has tokens
-//!   ([`KvExtent::span`]);
+//!   ([`KvExtent::span_now`]);
 //! * and past that hole, token `t` no longer lives at slot `t`, so the block covering it is not the
 //!   block the scheduler would hash it under — only the request's LEADING CONTIGUOUS run is
 //!   token-addressed and therefore cacheable ([`KvExtent::cacheable_tokens`]).
@@ -110,6 +110,54 @@ impl KvAddressing {
     /// Does a step's reach mean anything here? The one question the allocator asks of it.
     pub fn shares_one_write_slot(self) -> bool {
         matches!(self, KvAddressing::OneSharedWriteSlot)
+    }
+}
+
+/// ⭐⭐⭐ SLOTS APPENDED SINCE THE REPORT WAS MADE — how far a [`KvExtent`] has aged.
+///
+/// 🛑 **A REPORT IS A MEASUREMENT OF A PAST STEP, AND UNDER ASYNC SCHEDULING THE STEP BEING SCHEDULED IS
+/// NOT THE NEXT ONE.** The engine's async loop finalizes step `n-1`, then schedules step `n+1`, then waits
+/// for step `n`'s result (`gpu_in_flight < 2`, `crates/serving/api/src/engine.rs`). So the extent the
+/// allocator reads is one *finalized* step behind the step it is allocating for, and on a backend that
+/// appends every row at ONE shared slot each step, "one step behind" is "one slot short".
+///
+/// ⛔ MEASURED ON CARD, granite-3.1-2b fp8, `scr batch` at the SHIPPED width 8, ragged probe, 5 of 5 trials:
+/// ```text
+/// cannot map 513 slot(s) = 3 page(s): the host granted 2 block(s)
+/// cannot map 769 slot(s) = 4 page(s): the host granted 3 block(s)
+/// ```
+/// Both are `k*256 + 1` slots against exactly `k` blocks: the shared write slot had reached a page
+/// boundary, the launch needed the page past it, and the allocation had been sized from a span one slot
+/// shallower — so `own` came out `k` and the write-page arm did not fire either, because `step_reach` is
+/// derived from the same aged span. ⛔ IT FIRES ONLY ON RAGGED BATCHES because a row with no hole has
+/// `own_tokens == its slots`, and that term (the scheduler's own bookkeeping, never stale) covers the
+/// missing page; a row carrying a masked hole has fewer tokens than slots and nothing else to fall back
+/// on. `--max-num-seqs 1` cannot fire it at all — no shared slot, no hole.
+///
+/// ⭐ THE COUNT IS THE SCHEDULER'S OWN `num_output_placeholders`: one per step scheduled and not yet
+/// finalized, times the tokens that step appends. It is decremented in the same `update_from_output` that
+/// applies the extent (`set_kv_extent` first, `append_output_tokens` after), so the pair is always
+/// consistent — the span is as of the last FINALIZED step, and this counts the steps scheduled since.
+/// [`InflightSlots::NONE`] on the synchronous path and on every token-addressed backend, which makes the
+/// arithmetic there byte-identical to what it was.
+///
+/// ⛔ IT IS A REQUIRED ARGUMENT, NOT A DEFAULT, AND THAT IS THE GUARD. `KvExtent` has no `span()` any
+/// more: the only way to get a slot span out of a report is to say how far it has aged, so "used a stale
+/// span" stopped being a thing a call site can express. The bug was not a wrong formula anywhere — it was
+/// three call sites reading a value whose age nobody had to name.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Serialize, Deserialize)]
+pub struct InflightSlots(u32);
+
+impl InflightSlots {
+    /// Nothing is in flight — the synchronous path, and a request nothing has scheduled yet.
+    pub const NONE: InflightSlots = InflightSlots(0);
+
+    pub fn new(slots: u32) -> InflightSlots {
+        InflightSlots(slots)
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
     }
 }
 
@@ -222,9 +270,15 @@ impl KvExtent {
         KvExtent { span, cacheable }
     }
 
-    /// Slots to hold blocks for.
-    pub fn span(self) -> KvSlotSpan {
-        self.span
+    /// ⭐ SLOTS TO HOLD BLOCKS FOR, **AS OF NOW** — the span the worker reported, plus the slots appended
+    /// by the steps scheduled since that report.
+    ///
+    /// 🛑 IT WAS `span()`, AND EVERY CALLER READ IT AS CURRENT. See [`InflightSlots`] for the card
+    /// measurement: a report one finalized step behind is one slot shallow, and one slot is one PAGE
+    /// whenever the shared write slot lands on a page boundary. Naming the age is what makes the three
+    /// readers of this value agree about which step they are talking about.
+    pub fn span_now(self, inflight: InflightSlots) -> KvSlotSpan {
+        KvSlotSpan(self.span.0.saturating_add(inflight.0))
     }
 
     /// Leading tokens whose keys are at their token positions, and therefore the most a token-indexed
@@ -238,14 +292,18 @@ impl KvExtent {
     /// 🛑 IT WAS `cdiv(num_computed + num_new, block_size)` SPELLED AT THREE CALL SITES, and adding the span to
     /// one of them would have left the others sizing by tokens. It delegates to
     /// [`KvSlotSpan::blocks_this_step`] now, so the request-side and admission-side rules cannot drift apart.
+    ///
+    /// ⛔ `inflight` IS NOT OPTIONAL: the span this sizes from is [`Self::span_now`], because a request
+    /// allocated from a span one step stale is a request one PAGE short at every page boundary.
     pub fn blocks_needed(
         self,
         block: KvBlockTokens,
         tokens_through_this_step: usize,
         writing: usize,
         reach: KvSlotSpan,
+        inflight: InflightSlots,
     ) -> usize {
-        self.span
+        self.span_now(inflight)
             .blocks_this_step(block, reach, tokens_through_this_step, writing)
     }
 
@@ -428,7 +486,56 @@ mod tests {
         // knows only the span cannot construct one. If that constructor ever appears, this comment is
         // the record of why it must not.
         let e = KvExtent::new(KvSlotSpan::new(514), CacheableTokens::new(450));
-        assert_eq!(e.span().get(), 514);
+        assert_eq!(e.span_now(InflightSlots::NONE).get(), 514);
         assert_eq!(e.cacheable_tokens().get(), 450);
+    }
+
+    /// ⛔⛔⛔ THE CARD'S REFUSAL, AS ARITHMETIC: a report one finalized step behind is one PAGE short at
+    /// exactly the page boundaries — and only for a row carrying a masked hole.
+    ///
+    /// MEASURED, granite-3.1-2b fp8 at the shipped width 8, ragged probe, 5 of 5 trials:
+    /// `cannot map 513 slot(s) = 3 page(s): the host granted 2 block(s)`. The launch's demand (3) is the
+    /// number to reproduce; `span_now` is what makes the allocation agree with it.
+    #[test]
+    fn a_span_one_step_stale_is_a_page_short_at_the_page_boundary() {
+        let block = KvBlockTokens::new(256).expect("256 > 0");
+        // The card's state. The last FINALIZED report said 511 slots; one step is on the card, so the row's
+        // keys really end at 512 and the launch is about to write slot 512 — logical page 2. The row has a
+        // hole, so its own token count (250) is far short of its slots and cannot cover for the span.
+        let reported = KvExtent::new(KvSlotSpan::new(511), CacheableTokens::new(250));
+        let inflight = InflightSlots::new(1);
+        // `reach` is `end + the row's append`, derived from the same report — so it ages identically, which
+        // is why the write-page arm did not rescue this on the card.
+        let stale_reach = KvSlotSpan::new(reported.span_now(InflightSlots::NONE).get() + 1);
+        let fresh_reach = KvSlotSpan::new(reported.span_now(inflight).get() + 1);
+
+        assert_eq!(
+            reported.blocks_needed(block, 250, 1, stale_reach, InflightSlots::NONE),
+            2,
+            "the defect: 2 blocks for a launch that maps 3 pages — `cannot map 513 slot(s) = 3 page(s): \
+             the host granted 2 block(s)`"
+        );
+        assert_eq!(
+            reported.blocks_needed(block, 250, 1, fresh_reach, inflight),
+            3,
+            "aged by the one step in flight, the allocation reaches the page the launch writes"
+        );
+        // ⭐ AND IT DOES NOT DEPEND ON THE REACH BEING FRESH TOO: this row's own pages are its own
+        // arithmetic, not the pool-wide bound's.
+        assert_eq!(
+            reported.blocks_needed(block, 250, 1, stale_reach, inflight),
+            3,
+            "the aged span alone is enough — the reach is an upper bound, not this row's own page count"
+        );
+
+        // ⛔ THE CONTROL, AND IT IS WHY THIS ONLY EVER FIRED ON RAGGED BATCHES: give the same row a token
+        // count that matches its slots (no hole) and the stale span costs nothing, because
+        // `own_tokens` — the scheduler's own bookkeeping, never stale — already covers the page.
+        assert_eq!(
+            reported.blocks_needed(block, 513, 1, stale_reach, InflightSlots::NONE),
+            3,
+            "a hole-free row is sized by its tokens, so staleness in the span is invisible there — which is \
+             why this read as a page-crossing bug until the ragged probes separated the two"
+        );
     }
 }

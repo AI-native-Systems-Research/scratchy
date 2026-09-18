@@ -309,9 +309,33 @@ pub(crate) fn run_prefill_batch(
     // `kernel_values` ("PrefixMask step on a bundle with no mask"), but a SOURCE WITH NO STEP is a
     // mask the host computes and never uploads — an additive buffer the device reads as all-zero,
     // i.e. "every column valid", which is fluent, wrong, and looks like a model bug.
-    let shape = b
-        .wiring
-        .forward_shape(launch_rows, prefix_src.is_some(), consts.len());
+    // ⛔ THE CAPACITY COMES FROM `prefill_m`, NOT FROM `b.wiring`, AND THAT IS THE WHOLE BATCHED-DECODE
+    // FIX. `prefill_m` is documented one screen up as "the width the bundle being run was BAKED at" —
+    // it is this launch's authority for every other extent here (embeddings, masks, `run_step`'s m), so
+    // letting the row CHECK come from a different source is the one-quantity-computed-twice hazard,
+    // and the two sources genuinely disagree on the batched path:
+    //
+    // A decode batch rung is the same tape baked at `B` rows, addressed by FINGERPRINT rather than
+    // through a wiring, so `Wirings.decode` describes every rung's tensor ids but only the
+    // single-request graph's ROW COUNT. The batched caller passes the rung's own `seqs` as `prefill_m`
+    // and `model.decode.last()`'s wiring for the ids — correct, because it is the same tape — and the
+    // wiring then answers 1 for a launch that is legitimately `B` rows wide.
+    //
+    // Before the KTIR unification the wiring slot was last-write-wins and, because rungs bake
+    // ASCENDING, it happened to hold the WIDEST rung's wiring — so this check passed by accident.
+    // Tightening that slot to the single-request graph was itself a real fix (`ktir_decode_cb_*` was
+    // stamping `m_cap = 96`, so every single-token decode computed 96 activation rows) and it left
+    // this line comparing a batched width against a bundle that no longer described it:
+    // "forward tape asked for 2 row(s) from a bundle baked to hold 1", every width >= 2, 0 succeeded.
+    //
+    // The guard still bites: `real > mq` is refused above, and `RowCapacity` has no integer door — it
+    // is mintable only from a placement or from a manifest-derived `RungWidth`.
+    let shape = b.wiring.forward_shape_within(
+        scratchy_target_spyre::wiring::RowCapacity::of_baked_rung(prefill_m),
+        launch_rows,
+        prefix_src.is_some(),
+        consts.len(),
+    );
     let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
         hidden: h,
         head_dim: hd,

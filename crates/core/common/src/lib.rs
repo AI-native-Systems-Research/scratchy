@@ -31,7 +31,7 @@ pub use engine_io::{
     EmbeddingData, EngineCoreEvent, EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs,
     EngineCoreRequest, FinishReason, SchedulerStats, SpecDecodingStats, StopReason,
 };
-pub use kv::{CacheableTokens, KvAddressing, KvBlockTokens, KvExtent, KvSlotSpan};
+pub use kv::{CacheableTokens, InflightSlots, KvAddressing, KvBlockTokens, KvExtent, KvSlotSpan};
 pub use multimodal::MultimodalData;
 pub use request::{
     BlockAnnotations, BlockKind, Request, RequestStatus, compute_block_flags,

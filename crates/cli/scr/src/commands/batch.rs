@@ -163,6 +163,30 @@ pub async fn run_batch_from_config(
         elapsed.as_secs_f64()
     );
 
+    // ⛔ A FAILED BATCH MUST NOT EXIT 0. This returned `Ok(())` unconditionally, so a run where every
+    // single request errored still exited 0 with the failure only in a line of stdout — and the output
+    // JSONL still had one row per request, each with `error` set and an empty completion.
+    //
+    // That is not a cosmetic bug, it is a MEASUREMENT bug, and it has already produced a false result:
+    // a batch-scaling sweep read the wall clock at widths 2..32, saw a flat ~8 s at every width, and
+    // reported perfect scaling. The 8 s was engine startup; every request had panicked in the worker
+    // and generated nothing. A harness that trusts the exit code — which is the normal thing for a
+    // harness to do — cannot tell that from a win. The same shape once turned an all-requests-failed
+    // run into a reported "9x speedup".
+    //
+    // So the exit code carries the answer: any failure is a non-zero exit, and the message names the
+    // count rather than making the caller parse stdout for it. A partially-failed batch is also a
+    // failure — the output file is short of what was asked for, and rounding that to success is what
+    // let the total-failure case hide in the first place.
+    if failed > 0 {
+        anyhow::bail!(
+            "{failed} of {num_requests} request(s) FAILED — see the `error` field on those rows in \
+             {output_path}. Exiting non-zero so a harness cannot read this as a completed run: the \
+             wall clock of a failed batch is engine startup, not generation, and reading it as \
+             throughput reports a speedup for work that never happened."
+        );
+    }
+
     Ok(())
 }
 

@@ -219,9 +219,13 @@ impl KVCacheManager {
         // writes `num_new_tokens` more AT OR PAST it, so blocks sized by the span alone stop one slot
         // short — every time the span lands exactly on a block boundary, which for a decode loop is once
         // every `block_size` steps and always mid-generation.
+        // ⛔ AND AGED BY THE STEPS IN FLIGHT, for the same reason `SimpleBlockTracker` is: a report is a
+        // measurement of the last FINALIZED step, not of the step this is allocating for.
         let num_slots_need_block = request
             .kv_extent
-            .map_or(0, |e| e.span().get() as usize + num_new_tokens)
+            .map_or(0, |e| {
+                e.span_now(request.kv_inflight_slots()).get() as usize + num_new_tokens
+            })
             .max(num_computed_tokens + num_new_tokens);
         let num_tokens_need_slot = std::cmp::min(num_slots_need_block, self.max_model_len);
 

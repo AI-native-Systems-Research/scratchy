@@ -33,10 +33,17 @@ use crate::spyre_worker::*;
 /// constructor that does not take them.
 ///
 /// ⛔ SO THE FAILURE MODE MOVES, ON PURPOSE. Where the old code would silently draw another page, this
-/// refuses: the request's slot span has outrun the blocks the host allocated for it. That happens when
-/// the two disagree about how many slots a request occupies, which is one number the worker reports every
-/// step ([`ReqState::kv_extent`]) — so a refusal here names a reporting bug, and it is a bug report
-/// instead of a request reading a page nobody wrote.
+/// refuses: the request's slot span has outrun the blocks the host allocated for it — a bug report instead
+/// of a request reading a page nobody wrote.
+///
+/// ⛔⛔⛔ **THIS REFUSAL'S OWN MESSAGE USED TO ACCUSE `ReqState::kv_extent` OF A REPORTING BUG, AND THAT WAS
+/// WRONG.** It fired at the SHIPPED width 8 on ragged batches, 5 of 5 trials
+/// (`cannot map 513 slot(s) = 3 page(s): the host granted 2 block(s)`), and the report was correct every
+/// time: the row really did lack the page. The defect was in the ALLOCATION — the scheduler sized it from a
+/// report that had aged one finalized step under async scheduling
+/// ([`scratchy_core_common::InflightSlots`]). ⭐ SO THE AUTHORITATIVE NUMBER IS THE LAUNCH'S, and the
+/// message says so: the span here is what the card is about to write, and a grant short of it is the host's
+/// arithmetic to answer for.
 #[cfg(feature = "spyre-hw")]
 pub(crate) fn install_host_blocks(
     session: &mut SendnnSession,
@@ -118,10 +125,11 @@ pub(crate) fn install_host_blocks(
     // scheduler's rule is `KvSlotSpan::blocks_this_step` = own pages + one for the shared write page.
     if req.page_map(ctx, want).is_none() {
         return Err(werr(format!(
-            "superdsc paged: cannot map {} slot(s) = {} page(s): the host granted {} block(s). The pages a \
-             row holds keys in must all be host blocks — the scheduler allocates its own pages plus ONE for \
-             the batch's shared write page (`KvSlotSpan::blocks_this_step`), so this says that allocation \
-             and this launch's page count disagree, which is a reporting bug in `ReqState::kv_extent`",
+            "superdsc paged: cannot map {} slot(s) = {} page(s): the host granted {} block(s). THE SLOT \
+             COUNT IS AUTHORITATIVE — it is the slot this launch is about to write, so the shortfall is in \
+             the host's allocation (`KvSlotSpan::blocks_this_step` = own pages + ONE for the batch's shared \
+             write page) and not in what the worker reported. Look first at what aged the span the \
+             allocation was sized from (`KvExtent::span_now`, `Request::kv_inflight_slots`)",
             span.get(),
             want.get(),
             ctx.host.len(),
@@ -288,7 +296,8 @@ pub(crate) fn bind_request_pages_at(
         werr(format!(
             "superdsc paged: cannot map {} page(s): the host granted {} block(s). Every page holding a key \
              must be a host block — the scheduler allocates this request's own pages plus ONE for the \
-             batch's shared write page, so this says its allocation and this launch disagree",
+             batch's shared write page, so the PAGE COUNT here is authoritative and the shortfall is in \
+             that allocation (`KvExtent::span_now`, `Request::kv_inflight_slots`)",
             want.get(),
             ctx.host.len(),
         ))

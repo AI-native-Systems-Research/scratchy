@@ -24,6 +24,14 @@ use scratchy_serving_scheduler::scheduler::core::{KVCacheManagerOps, SimpleBlock
 
 const BLOCK: usize = 256;
 
+/// The tracker as the spyre pool declares it, with a step reach already set — the state every batched
+/// decode step allocates in.
+fn batched_tracker(step_reach: u32) -> SimpleBlockTracker {
+    let mut t = SimpleBlockTracker::with_caching(64, BLOCK).sharing_one_write_slot();
+    t.set_step_reach(KvSlotSpan::new(step_reach));
+    t
+}
+
 fn request_of(id: &str, tokens: usize, extent: Option<KvExtent>) -> Request {
     let mut r = Request::new(
         id.into(),
@@ -181,6 +189,104 @@ fn a_shallow_request_under_a_deep_step_reach_holds_blocks_for_the_reach() {
         blocks[0].len(),
         2,
         "without the declaration the reach means nothing: 441 slots + 1 = 2 blocks, exactly as before"
+    );
+}
+
+/// ⛔⛔⛔ THE REPORT IS ONE FINALIZED STEP OLD, AND AT A PAGE BOUNDARY THAT IS ONE PAGE SHORT.
+///
+/// MEASURED ON CARD at the SHIPPED, capped width 8 — not at an experimental width — granite-3.1-2b fp8,
+/// ragged probe, **5 of 5 trials**, and 1 of 3 on the shallower ragged probe:
+/// ```text
+/// cannot map 513 slot(s) = 3 page(s): the host granted 2 block(s)
+/// cannot map 769 slot(s) = 4 page(s): the host granted 3 block(s)
+/// ```
+/// Both are `k*256 + 1` slots against exactly `k` blocks. The engine's async loop finalizes step `n-1`,
+/// schedules step `n+1`, then waits for step `n` (`gpu_in_flight < 2`), so the extent the allocator reads
+/// describes the step BEFORE the one about to run — and a batched step advances the shared write slot by
+/// exactly one slot, which is one PAGE whenever it lands on a boundary.
+///
+/// ⭐ WHY IT NEEDS A RAGGED BATCH, WHICH IS WHAT MADE IT LOOK LIKE A PAGE-CROSSING BUG: `blocks_this_step`
+/// maxes the span against the request's own token count, and that term is the scheduler's own bookkeeping
+/// and never stale. A row with no masked hole has as many tokens as slots, so the token term covers the
+/// missing page and the staleness is invisible. Only a row carrying a hole — fewer tokens than slots — has
+/// nothing to fall back on. `--max-num-seqs 1` cannot produce a hole at all.
+///
+/// ⛔ AND THE `+1` WRITE-PAGE ARM CANNOT RESCUE IT, which is why nothing else caught this: `step_reach` is
+/// derived from the same reported span, so it ages by the same slot and its page count matches `own`
+/// exactly when `own` is the one that is short.
+#[test]
+fn an_extent_one_step_in_flight_is_allocated_for_the_slot_the_launch_will_write() {
+    // ⭐ THE TWO MEASURED FACTS, AND NOTHING DERIVED BY THE CODE UNDER TEST. At the failing step the last
+    // FINALIZED report said 511 slots and exactly one step was on the card, so the row's keys really end at
+    // 512 and the launch is about to write slot 512.
+    const REPORTED_SLOTS: u32 = 511;
+    const STEPS_IN_FLIGHT: u32 = 1;
+    let reported = KvExtent::new(KvSlotSpan::new(REPORTED_SLOTS), CacheableTokens::new(250));
+    let mut req = request_of("ragged", 250, Some(reported));
+    req.num_output_placeholders = STEPS_IN_FLIGHT;
+
+    // ⭐ AND THE EXPECTED PAGE COUNT IS THE WORKER'S OWN RULE, NOT A CONSTANT THIS TEST PICKED:
+    // `RowPages::holding(batch_slot + 1)` is `ceil((end + 1) / PAGE_SLOTS)`.
+    let current_end = (REPORTED_SLOTS + STEPS_IN_FLIGHT) as usize;
+    let launch_needs = (current_end + 1).div_ceil(BLOCK);
+    assert_eq!(
+        current_end % BLOCK,
+        0,
+        "the reproduction is the page BOUNDARY: off it, `own` rounds up to the same page anyway"
+    );
+
+    // ⭐ OVER **BOTH** REACHES, AND THAT IS THE POINT. The step reach is `end + the row's append`, so the
+    // aged-out scheduler produced `511 + 1` and the corrected one produces `512 + 1`. The per-request
+    // allocation must reach the launch's own slot either way: the reach is a pool-wide upper bound, and this
+    // row's own pages are not its to get right. Pinning only the corrected reach would pass on the defect —
+    // the write-page arm covers the missing page when the reach alone is fresh.
+    for reach in [REPORTED_SLOTS + 1, (current_end + 1) as u32] {
+        let mut t = batched_tracker(reach);
+        let blocks = t
+            .allocate_slots(&req, 1, 0, &[])
+            .expect("64 blocks is plenty");
+        assert_eq!(
+            blocks[0].len(),
+            launch_needs,
+            "the launch writes slot {current_end} and maps {launch_needs} pages; at step reach {reach} the \
+             allocation gave {} — {} is the count the card refused",
+            blocks[0].len(),
+            launch_needs - 1
+        );
+        assert_eq!(
+            t.get_blocks("ragged")[0].len(),
+            launch_needs,
+            "and the table the engine SHIPS must hold them — a grant the stored table does not carry is \
+             exactly how the worker ends up short"
+        );
+    }
+
+    // ⛔ THE CONTROL — THE SYNCHRONOUS PATH IS UNTOUCHED. With nothing in flight the report is already
+    // current, and the same true state must give the same allocation. A change here is a change to every
+    // non-async run.
+    let sync_report = KvExtent::new(
+        KvSlotSpan::new(current_end as u32),
+        CacheableTokens::new(250),
+    );
+    let sync_req = request_of("sync", 250, Some(sync_report));
+    assert_eq!(sync_req.num_output_placeholders, 0, "nothing in flight");
+    let mut sync_t = batched_tracker((current_end + 1) as u32);
+    assert_eq!(
+        sync_t.allocate_slots(&sync_req, 1, 0, &[]).expect("plenty")[0].len(),
+        launch_needs,
+        "an up-to-date report and an aged one describing the SAME state must allocate the same"
+    );
+
+    // ⛔ AND THE TOKEN-ADDRESSED CONTROL: cuda and metal report no extent at all, so nothing here can reach
+    // them. A regression on this line is a change to their allocation.
+    let mut plain = SimpleBlockTracker::with_caching(64, BLOCK);
+    plain.set_step_reach(KvSlotSpan::new((current_end + 1) as u32));
+    let mut fresh = request_of("plain-async", 300, None);
+    fresh.num_output_placeholders = 1;
+    assert_eq!(
+        plain.allocate_slots(&fresh, 300, 0, &[]).expect("plenty")[0].len(),
+        300usize.div_ceil(BLOCK),
+        "no extent and no shared write slot: the token count rules, exactly as before"
     );
 }
 
