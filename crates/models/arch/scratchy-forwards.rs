@@ -259,6 +259,84 @@ const CUDA_ONLY: &[&str] = &[
 /// is dropped by the `supported` gate below before its configs are read.
 const SPYRE_CAPABLE: &[&str] = &["llama", "granite"];
 
+/// Compile every vendored chat template for an enabled arch into `$OUT_DIR`,
+/// returning the module source that wraps them.
+///
+/// ⛔ PER MODEL, NOT PER ARCH. Unlike `weights.json`, chat templates are not
+/// shared within an arch: the single `llama` arch holds smollm2 (368 B),
+/// tinyllama (410 B) and llama-3.2 (3.8 KB), and their templates are unrelated.
+/// So this gates on the same per-stem feature `config.rs` uses
+/// (`CARGO_FEATURE_<STEM>`), and a model with no `<stem>.chat.jinja` simply
+/// contributes nothing — the serving side falls back to the interpreter.
+///
+/// ⛔ AN UNSUPPORTED CONSTRUCT PANICS THE BUILD. It does not warn and skip. The
+/// error names template, line, column and construct, so the build states exactly
+/// what to implement next. Skipping would silently ship the interpreter path and
+/// make the compiled path look like it worked.
+fn emit_chat_templates(configs_dir: &Path, out_dir: &Path, arch: &str) -> String {
+    let mut modules = String::new();
+    let Ok(rd) = std::fs::read_dir(configs_dir) else {
+        return modules;
+    };
+    let mut jinjas: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".chat.jinja"))
+        })
+        .collect();
+    jinjas.sort();
+
+    for path in jinjas {
+        let stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".chat.jinja"))
+            .expect("checked above")
+            .to_string();
+
+        // Same per-stem gate config.rs applies to `<stem>.json`.
+        let feat = format!("CARGO_FEATURE_{}", stem.to_uppercase().replace('-', "_"));
+        if std::env::var(&feat).is_err() {
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", path.display());
+
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let rel = format!("configs/{arch}/{stem}.chat.jinja");
+        let code = scratchy_chat_template_compiler::compile::compile(&src, &rel, "render")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "chat template did not compile.\n  {e}\n\
+                     This is a build error on purpose: implement the named construct in \
+                     crates/compiler/serving/chat-template, or remove {rel} to fall back \
+                     to the interpreter for this model."
+                )
+            });
+
+        let mod_name = format!("chat_{}", stem.replace(['-', '.'], "_"));
+        let file = out_dir.join(format!("{mod_name}.rs"));
+        std::fs::write(&file, &code).unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
+
+        modules.push_str(&format!(
+            "pub mod {mod_name} {{\n\
+             \x20   include!(concat!(env!(\"OUT_DIR\"), \"/{mod_name}.rs\"));\n\
+             }}\n\
+             ::scratchy_forward_compiler::inventory::submit! {{\n\
+             \x20   ::scratchy_forward_compiler::chat_registry::ChatTemplateRegistration {{\n\
+             \x20       arch: {arch:?},\n\
+             \x20       stem: {stem:?},\n\
+             \x20       compiled: &{mod_name}::COMPILED,\n\
+             \x20   }}\n\
+             }}\n"
+        ));
+    }
+    modules
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -368,6 +446,24 @@ fn main() {
         .for_each(|(dsl_path, mod_name, configs_dir)| {
             emit_arch(dsl_path, configs_dir, &out_dir, mod_name);
         });
+
+    // Compiled chat templates. Serial and cheap (a few KB of Jinja per model)
+    // next to the forward expansion, so it does not join the rayon fan-out.
+    //
+    // ALWAYS WRITTEN, even when empty — `src/lib.rs` includes this file with no
+    // cfg of its own, matching how `hf_registry.rs` is handled. A missing file is
+    // a build break; an empty one is a binary with no compiled templates, which
+    // is a valid state (the serving side falls back to the interpreter).
+    let mut chat_mods = String::new();
+    for (dsl_path, _mod_name, configs_dir) in &targets {
+        let arch = dsl_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".rs.in"))
+            .expect("arch name");
+        chat_mods.push_str(&emit_chat_templates(configs_dir, &out_dir, arch));
+    }
+    std::fs::write(out_dir.join("chat_templates.rs"), &chat_mods).expect("write chat_templates.rs");
 
     // Shell-completion registry. Resolving it needs the network, so it happens
     // only under `hf-completions`; WRITING it is unconditional, because

@@ -314,6 +314,7 @@ pub use mm::{EmbedPatch, PixelInput};
     feature = "vision"
 ))]
 pub mod arch_registry;
+pub mod chat_registry;
 /// SuperDSC device code as `&'static` bytes in the binary, submitted by the `#[forward]` emit after
 /// `dxp_standalone` compiles it. Replaces the fingerprint→directory table and the bundle cache it
 /// pointed at — nothing is cached; see the module docs.

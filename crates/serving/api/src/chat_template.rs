@@ -27,14 +27,29 @@ use crate::error::ServeError;
 /// The minijinja `Environment` (with the compiled template) is built once
 /// at construction time and reused on every `apply()` call.
 pub struct ChatTemplate {
-    /// Pre-compiled minijinja environment with the "chat" template loaded.
-    env: Environment<'static>,
+    /// How this template renders — compiled Rust, or the interpreter.
+    renderer: Renderer,
     /// Optional BOS token string (e.g. "<s>", "<|begin_of_text|>").
     bos_token: Option<String>,
     /// Optional EOS token string (e.g. "</s>", "<|end_of_text|>").
     eos_token: Option<String>,
     /// The raw Jinja2 template string (kept for `template_str()` accessor).
     template_str: String,
+}
+
+/// How a `ChatTemplate` renders.
+///
+/// ⛔ AN ENUM, NOT A TRAIT OBJECT. The choice is fixed when the template is
+/// resolved and never varies per request, so there is nothing to dispatch
+/// dynamically. Also note `Interpreted` is the only variant that holds an
+/// `Environment`: a model on the compiled path never constructs one, which is
+/// the difference between "we skip the interpreter" and "we still pay for it".
+enum Renderer {
+    /// Generated Rust for this exact template, found in the compiled registry.
+    Compiled(&'static scratchy_chat_template_compiler::CompiledTemplate),
+    /// minijinja. Still required: `--chat-template` accepts an arbitrary string,
+    /// GGUF files carry templates embedded, and un-vendored models are the norm.
+    Interpreted(Box<Environment<'static>>),
 }
 
 /// A single chat message for template rendering.
@@ -89,14 +104,42 @@ fn build_env(template_str: &str) -> Result<Environment<'static>, ServeError> {
 
 impl ChatTemplate {
     /// Create a `ChatTemplate` from a raw Jinja2 template string.
+    /// Create a `ChatTemplate` from a raw Jinja2 template string.
+    ///
+    /// ⛔ THE COMPILED-PATH DECISION HAPPENS HERE, ONCE, AND THE GATE IS BYTE
+    /// EQUALITY. `find_compiled` returns a generated renderer only if this build
+    /// compiled *these exact bytes*. Anything else — an upstream template update,
+    /// an operator-supplied `--chat-template`, a GGUF-embedded template — finds no
+    /// match and falls through to the interpreter.
+    ///
+    /// Putting the gate in the constructor is what lets every existing call site
+    /// stay untouched: they build a `ChatTemplate` from whatever string they
+    /// resolved, and get the fast path automatically when it is safe.
     pub fn new(template_str: String) -> Result<Self, ServeError> {
-        let env = build_env(&template_str)?;
+        let renderer = match scratchy_forward_compiler::chat_registry::find_compiled(&template_str)
+        {
+            Some(compiled) => {
+                tracing::debug!(
+                    template = compiled.name,
+                    "chat template: using compiled renderer"
+                );
+                Renderer::Compiled(compiled)
+            }
+            None => Renderer::Interpreted(Box::new(build_env(&template_str)?)),
+        };
         Ok(Self {
-            env,
+            renderer,
             bos_token: None,
             eos_token: None,
             template_str,
         })
+    }
+
+    /// Whether this template renders through generated Rust rather than the
+    /// interpreter. Exposed for the startup log and for tests that assert the
+    /// compiled path is actually being exercised.
+    pub fn is_compiled(&self) -> bool {
+        matches!(self.renderer, Renderer::Compiled(_))
     }
 
     /// Set the BOS token string used by the template.
@@ -244,11 +287,6 @@ impl ChatTemplate {
         tools: Option<&serde_json::Value>,
         extra_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> Result<String, ServeError> {
-        let tmpl = self
-            .env
-            .get_template("chat")
-            .map_err(|e| ServeError::Internal(format!("failed to get template: {e}")))?;
-
         // Today's date string — used by some templates (e.g. LLaMA 3.1).
         let date_string = {
             let now = std::time::SystemTime::now()
@@ -267,43 +305,60 @@ impl ChatTemplate {
             )
         };
 
-        // Build the base context.
-        let mut ctx_map = std::collections::BTreeMap::<String, minijinja::Value>::new();
+        // ⛔ ONE CONTEXT, BUILT ONCE, SHARED BY BOTH PATHS. Previously this was
+        // assembled directly as `BTreeMap<String, minijinja::Value>`. Building it
+        // as `serde_json` instead is not a style change: it means the compiled
+        // renderer and the interpreter see byte-identical input by construction,
+        // so the two can only ever diverge in rendering — which the golden tests
+        // cover. A second, path-specific context assembly would be a place for
+        // them to disagree silently.
+        //
+        // It is also the more natural shape: `messages`, `tools` and
+        // `extra_kwargs` all arrive as `serde_json` already.
+        let mut ctx_map = serde_json::Map::new();
         ctx_map.insert(
             "messages".into(),
-            minijinja::Value::from_serialize(messages),
+            serde_json::Value::Array(messages.to_vec()),
         );
         ctx_map.insert(
             "add_generation_prompt".into(),
-            minijinja::Value::from(add_generation_prompt),
+            serde_json::Value::Bool(add_generation_prompt),
         );
         ctx_map.insert(
             "bos_token".into(),
-            minijinja::Value::from(self.bos_token.as_deref().unwrap_or("")),
+            serde_json::Value::String(self.bos_token.clone().unwrap_or_default()),
         );
         ctx_map.insert(
             "eos_token".into(),
-            minijinja::Value::from(self.eos_token.as_deref().unwrap_or("")),
+            serde_json::Value::String(self.eos_token.clone().unwrap_or_default()),
         );
         if let Some(tools) = tools {
-            ctx_map.insert("tools".into(), minijinja::Value::from_serialize(tools));
+            ctx_map.insert("tools".into(), tools.clone());
         }
-        ctx_map.insert("date_string".into(), minijinja::Value::from(date_string));
+        ctx_map.insert("date_string".into(), serde_json::Value::String(date_string));
 
         // Merge extra kwargs (e.g. enable_thinking, reasoning_effort).
         if let Some(kwargs) = extra_kwargs {
             for (key, value) in kwargs {
-                ctx_map.insert(key.clone(), minijinja::Value::from_serialize(value));
+                ctx_map.insert(key.clone(), value.clone());
             }
         }
+        let ctx = serde_json::Value::Object(ctx_map);
 
-        let ctx = minijinja::Value::from_serialize(&ctx_map);
-
-        let rendered = tmpl
-            .render(ctx)
-            .map_err(|e| ServeError::Internal(format!("chat template render failed: {e}")))?;
-
-        Ok(rendered)
+        match &self.renderer {
+            Renderer::Compiled(compiled) => (compiled.render)(&ctx).map_err(|e| {
+                // A compiled template failing is the interpreter failing: the
+                // generated code raises exactly where minijinja would.
+                ServeError::Internal(format!("chat template render failed: {e}"))
+            }),
+            Renderer::Interpreted(env) => {
+                let tmpl = env
+                    .get_template("chat")
+                    .map_err(|e| ServeError::Internal(format!("failed to get template: {e}")))?;
+                tmpl.render(minijinja::Value::from_serialize(&ctx))
+                    .map_err(|e| ServeError::Internal(format!("chat template render failed: {e}")))
+            }
+        }
     }
 
     /// Convenience wrapper: apply with simple `TemplateMessage` slices and no tools.
@@ -826,5 +881,167 @@ mod tests {
         assert_eq!(day_of_year(1970, 1, 1), 1);
         assert_eq!(day_of_year(1970, 12, 31), 365);
         assert_eq!(day_of_year(2024, 12, 31), 366); // leap year
+    }
+
+    // -----------------------------------------------------------------------
+    // Compiled-path integration
+    // -----------------------------------------------------------------------
+
+    /// Every template this build compiled must actually take the compiled path.
+    ///
+    /// ⛔ SCOPE-INDEPENDENT ON PURPOSE. A build enabling models with no vendored
+    /// `.chat.jinja` legitimately has zero registrations, so this asserts a
+    /// property of each registration present rather than a count. It still fails
+    /// loudly if a template is compiled in but the gate rejects it — the
+    /// regression that would silently leave everyone on the interpreter.
+    #[test]
+    fn every_registered_template_takes_the_compiled_path() {
+        let mut n = 0;
+        for reg in scratchy_forward_compiler::chat_registry::compiled_templates() {
+            let tpl = ChatTemplate::new(reg.compiled.source.to_string())
+                .expect("a compiled template must construct");
+            assert!(
+                tpl.is_compiled(),
+                "{}/{} is compiled into this binary but ChatTemplate fell back to the \
+                 interpreter — the drift gate is rejecting its own source",
+                reg.arch,
+                reg.stem
+            );
+            n += 1;
+        }
+        eprintln!("compiled chat templates in this build: {n}");
+    }
+
+    /// The compiled renderer and the interpreter must agree, byte for byte, on
+    /// the same context — checked through the public `apply` surface, so this
+    /// covers the context assembly too, not just the renderer.
+    #[test]
+    fn compiled_and_interpreted_agree_through_apply() {
+        let matrix: Vec<Vec<TemplateMessage>> = vec![
+            vec![TemplateMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            }],
+            vec![
+                TemplateMessage {
+                    role: "system".into(),
+                    content: "Be terse".into(),
+                },
+                TemplateMessage {
+                    role: "user".into(),
+                    content: "Hi".into(),
+                },
+            ],
+            vec![
+                TemplateMessage {
+                    role: "user".into(),
+                    content: "a".into(),
+                },
+                TemplateMessage {
+                    role: "assistant".into(),
+                    content: "b".into(),
+                },
+                TemplateMessage {
+                    role: "user".into(),
+                    content: "c".into(),
+                },
+            ],
+            vec![TemplateMessage {
+                role: "user".into(),
+                content: String::new(),
+            }],
+            vec![TemplateMessage {
+                role: "user".into(),
+                content: "héllo 🌍\nx".into(),
+            }],
+            vec![],
+        ];
+
+        for reg in scratchy_forward_compiler::chat_registry::compiled_templates() {
+            let compiled = ChatTemplate::new(reg.compiled.source.to_string()).unwrap();
+            assert!(compiled.is_compiled());
+
+            // Force the interpreter on the same source by constructing the
+            // environment directly — `new()` would hand back the compiled path.
+            let interpreted = ChatTemplate {
+                renderer: Renderer::Interpreted(Box::new(build_env(reg.compiled.source).unwrap())),
+                bos_token: None,
+                eos_token: None,
+                template_str: reg.compiled.source.to_string(),
+            };
+
+            for msgs in &matrix {
+                for agp in [true, false] {
+                    let a = compiled.apply_simple(msgs, agp);
+                    let b = interpreted.apply_simple(msgs, agp);
+                    match (a, b) {
+                        (Ok(a), Ok(b)) => assert_eq!(
+                            a,
+                            b,
+                            "{}/{}: compiled and interpreted diverged (agp={agp}, {} msgs)",
+                            reg.arch,
+                            reg.stem,
+                            msgs.len()
+                        ),
+                        // "errors where the oracle errors" is part of the bar.
+                        (Err(_), Err(_)) => {}
+                        (a, b) => panic!(
+                            "{}/{}: one path errored and the other did not: {:?} vs {:?}",
+                            reg.arch,
+                            reg.stem,
+                            a.is_err(),
+                            b.is_err()
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A template this build did NOT compile must fall back, not render wrongly.
+    #[test]
+    fn unknown_template_falls_back_to_the_interpreter() {
+        let tpl =
+            ChatTemplate::new("{% for m in messages %}<{{ m['role'] }}>{% endfor %}".to_string())
+                .unwrap();
+        assert!(
+            !tpl.is_compiled(),
+            "an unvendored template must not claim a compiled renderer"
+        );
+        let out = tpl
+            .apply_simple(
+                &[TemplateMessage {
+                    role: "user".into(),
+                    content: "x".into(),
+                }],
+                false,
+            )
+            .unwrap();
+        assert_eq!(out, "<user>");
+    }
+
+    /// Byte-level drift must defeat the gate. Each mutation below changes the
+    /// rendered prompt, and therefore the tokenization.
+    #[test]
+    fn drift_defeats_the_gate() {
+        for reg in scratchy_forward_compiler::chat_registry::compiled_templates() {
+            let src = reg.compiled.source;
+            for (what, mutated) in [
+                ("trailing newline", format!("{src}\n")),
+                ("CRLF", src.replace('\n', "\r\n")),
+                ("leading space", format!(" {src}")),
+            ] {
+                if mutated == src {
+                    continue;
+                }
+                let tpl = ChatTemplate::new(mutated).unwrap();
+                assert!(
+                    !tpl.is_compiled(),
+                    "{}/{}: a {what} change still matched the compiled renderer",
+                    reg.arch,
+                    reg.stem
+                );
+            }
+        }
     }
 }

@@ -1,0 +1,26 @@
+[package]
+name = "scratchy-chat-template-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# ⛔ THIS CRATE EXISTS TO PROVE THE GENERATED CODE, NOT THE EMITTER.
+# The unit tests in the compiler crate check the runtime helpers against the
+# interpreter. They cannot check the *emitted Rust*, because that has to be
+# compiled to be run. So this crate wires the compiler up exactly the way
+# `crates/models/arch/scratchy-forwards.rs` will: build-dependency with the
+# `compile` feature, generated source written to OUT_DIR, `include!`d, then
+# rendered and compared byte-for-byte against the real interpreter.
+
+[build-dependencies]
+scratchy-chat-template-compiler = { workspace = true, features = ["compile"] }
+
+[dependencies]
+scratchy-chat-template-compiler = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The oracle. Feature set matches crates/serving/api so we validate the same
+# language production renders.
+minijinja = { version = "=2.24.0", features = ["builtins", "json", "loader"] }
