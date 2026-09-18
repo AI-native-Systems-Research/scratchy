@@ -1337,13 +1337,33 @@ pub fn lower_function(
         // `OpFunc::Restickify` (`restickify_kt_opspec_2d`, which realizes the transpose through
         // PER-OPERAND STICK AXES and `datastageBasedElemOff`) rather than with the transpose primitive.
         //
-        // So the arch-portable lowering for this operand is a RESTICKIFY, not a transpose, and that is
-        // the next step here: `[cap, hd]` -> `[hd, cap]` is exactly the shape relation `v` -> `vᵀ` needs.
-        // It is not taken in this change because the restickify's typed doors (`KtTileSlots`,
-        // `KtTileFeats`) are attention-shaped (`of_page`, `of_row_window`, `of_head_slab`,
-        // `of_head_dim`) and a general `[m, n]` operand needs a door of its own — an interface decision,
-        // not a widening. dxp REJECTS the transpose rather than mis-scheduling it, so this fails closed
-        // meanwhile.
+        // ⛔⛔⛔ AND THE RESTICKIFY IS NOT THE WAY OUT EITHER — MEASURED, so nobody repeats the probe.
+        // `OpFunc::Restickify` was substituted for the transpose at this exact site (same operand, same
+        // extents, `KtTileSlots`/`KtTileFeats` opened with a probe door) and dxp rejects it with the
+        // IDENTICAL DtException at the IDENTICAL program index. So the arch limit is not
+        // `interslicetranspose_fp16` specifically.
+        //
+        // What the two share is that their operands sit in DIFFERENT DATA STAGES — a relayout reads one
+        // stick order and writes another (`datastageBasedElemOff` is true ONLY for ReStickify, and the
+        // transpose carries its own `is_transpose_out` stick override), which is exactly the case that
+        // would need an implicit sync. Corroborating, and cheap to check: across ALL SIX gated fixtures
+        // the entire emitted op set is `add`, `batchmatmul`, `mean`, `mul`, `rsqrt`, `silu` — not one
+        // relayout primitive is exercised on MPW4 anywhere in the passing suite.
+        //
+        // SO A DEVICE RELAYOUT IS NOT AVAILABLE ON THIS ARCH, and the remaining ways out do not go
+        // through a second operand buffer at all:
+        //   * teach the KERNEL operand a SECOND WALK beside `Walk2::kernel_shared`, so a `[k, n]` buffer
+        //     is contracted where it lies — which is the option the original refusal named, and it needs
+        //     no relayout op and no arch feature. `matmul/**`.
+        //   * or have the producer hand `v` over already transposed, which for `tl.dot(p, v)` means the
+        //     FRONTEND choosing the projection's output layout (`v = h @ wvᵀ` could be emitted as
+        //     `vᵀ = wv @ hᵀ` only if `hᵀ` were free, which it is not) — so this one is not obviously
+        //     reachable and the kernel walk is the better bet.
+        // The algebra admits no reassociation that avoids it: `p @ (h @ wvᵀ)` and `(p @ h) @ wvᵀ` both
+        // leave a computed value in the kernel slot, and `aᵀ = vᵀ @ pᵀ` still needs `vᵀ`.
+        //
+        // dxp REJECTS this rather than mis-scheduling it, so the path fails closed meanwhile: exit 1 and
+        // no `init_binary.bin`, never a binary computing the transposed contraction.
         if b_orient == Some(BOrient::PlainB) {
             let b = per_op[1];
             let Some(l) = layout else {
