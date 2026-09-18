@@ -631,3 +631,220 @@ footer .credit {
   .hero-body { padding: var(--spacing-08) var(--spacing-06) var(--spacing-09); }
   section { padding: var(--spacing-09) 0; }
 }
+
+/* architectures page ---------------------------------------------------------
+   Diff accents come from Carbon's support ramps: Green 40/50 for what the
+   compared model adds, Red 50/60 for what it drops. Declared here rather than
+   in the token block above so this page's additions stay in one place. */
+
+:root {
+  --diff-add: #42be65;                      /* Green 40 */
+  --diff-add-bg: rgba(66, 190, 101, 0.16);
+  --diff-del: #fa4d56;                      /* Red 50 */
+  --diff-del-bg: rgba(250, 77, 86, 0.14);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --diff-add: #24a148;                    /* Green 50 */
+    --diff-add-bg: rgba(36, 161, 72, 0.12);
+    --diff-del: #da1e28;                    /* Red 60 */
+    --diff-del-bg: rgba(218, 30, 40, 0.10);
+  }
+}
+
+.archpage {
+  max-width: var(--wide);
+  margin: 0 auto;
+  padding: var(--spacing-09) var(--spacing-06) var(--spacing-10);
+}
+
+.archpage h1 {
+  margin: 0 0 var(--spacing-05);
+  font-size: 2.625rem;        /* fluid-heading-04 */
+  font-weight: 300;
+  line-height: 1.19;
+  letter-spacing: 0;
+}
+
+.archpage h2 {
+  margin: var(--spacing-10) 0 var(--spacing-03);
+  font-size: 1.25rem;         /* heading-03 */
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+/* controls */
+
+.archbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--spacing-05);
+  margin: var(--spacing-07) 0 var(--spacing-05);
+}
+
+.archbar label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-02);
+  font-size: 0.75rem;         /* label-01 */
+  letter-spacing: 0.32px;
+  color: var(--text-secondary);
+}
+
+.archbar select {
+  appearance: none;
+  font-family: var(--mono);
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  background: var(--layer-01);
+  border: none;
+  border-bottom: 1px solid var(--border-strong);
+  border-radius: 0;
+  padding: var(--spacing-03) var(--spacing-05);
+  min-width: 14rem;
+  cursor: pointer;
+}
+
+.archbar select:hover { background: var(--layer-hover-01); }
+.archbar select:focus { outline: 2px solid var(--focus); outline-offset: -2px; }
+
+.archbar .chk {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--spacing-03);
+  padding-bottom: var(--spacing-03);
+  cursor: pointer;
+}
+
+.archbar .chk input { accent-color: var(--accent); margin: 0; }
+
+.archbar #swap {
+  padding: var(--spacing-03) var(--spacing-05);
+  min-height: 0;
+  font-size: 1rem;
+  line-height: 1.25;
+}
+
+.tally {
+  margin-left: auto;
+  padding-bottom: var(--spacing-03);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.32px;
+  color: var(--text-helper);
+}
+
+/* panes */
+
+.archgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-05);
+  align-items: start;
+}
+
+.archpane { border: 1px solid var(--border-subtle); min-width: 0; }
+
+.archpane .codehead {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--spacing-05);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.archpane .cmeta { color: var(--text-helper); white-space: nowrap; }
+
+.archcode {
+  padding: var(--spacing-03) 0;
+  max-height: 32rem;
+  overflow: auto;
+  line-height: 1.5;
+}
+
+.archcode code { display: block; }
+
+.r {
+  display: flex;
+  width: max-content;
+  min-width: 100%;
+}
+
+.ln {
+  flex: 0 0 3rem;
+  padding-right: var(--spacing-04);
+  text-align: right;
+  color: var(--text-helper);
+  opacity: 0.6;
+  user-select: none;
+}
+
+.lx {
+  flex: 1 1 auto;
+  white-space: pre;
+  padding-right: var(--spacing-05);
+}
+
+.r.add { background: var(--diff-add-bg); box-shadow: inset 2px 0 0 var(--diff-add); }
+.r.del { background: var(--diff-del-bg); box-shadow: inset 2px 0 0 var(--diff-del); }
+.r.fill { background: var(--background-hover); }
+
+/* operations summary */
+
+.opsbox { margin: var(--spacing-06) 0 0; display: grid; gap: var(--spacing-03); }
+
+.opsrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--spacing-03);
+  font-size: 0.875rem;
+}
+
+.opslabel {
+  flex: 0 0 9rem;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.32px;
+  color: var(--text-helper);
+}
+
+.opsrow .none { color: var(--text-helper); }
+.opsrow .op { padding: 0 var(--spacing-03); }
+.opsrow .op.add { color: var(--diff-add); background: var(--diff-add-bg); }
+.opsrow .op.del { color: var(--diff-del); background: var(--diff-del-bg); }
+
+/* distance list */
+
+.archlist { display: grid; gap: 1px; background: var(--border-subtle); border: 1px solid var(--border-subtle); }
+
+.archrow {
+  display: grid;
+  grid-template-columns: 1fr 10rem 6rem 5rem;
+  gap: var(--spacing-05);
+  align-items: baseline;
+  width: 100%;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  background: var(--layer-01);
+  border: none;
+  border-radius: 0;
+  padding: var(--spacing-04) var(--spacing-05);
+  cursor: pointer;
+}
+
+.archrow:hover { background: var(--layer-hover-01); }
+.archrow:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.archrow .an { color: var(--link-primary); }
+.archrow .ad, .archrow .al, .archrow .ao { font-size: 0.75rem; color: var(--text-secondary); }
+.archrow .al, .archrow .ao { text-align: right; }
+
+@media (max-width: 900px) {
+  .archgrid { grid-template-columns: 1fr; }
+  .archbar .tally { margin-left: 0; }
+  .archrow { grid-template-columns: 1fr 8rem; row-gap: var(--spacing-02); }
+  .archrow .al, .archrow .ao { text-align: left; }
+}
